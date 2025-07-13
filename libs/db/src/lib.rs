@@ -51,8 +51,10 @@ use zerocopy::IntoBytes;
 pub use error::Error;
 
 pub mod append_log;
+mod arc_ring;
 mod arrow;
 pub mod axum;
+pub mod disruptor;
 mod error;
 mod msg_log;
 pub(crate) mod time_series;

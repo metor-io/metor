@@ -51,12 +51,16 @@ struct Header<E> {
 impl<E: IntoBytes + Immutable> AppendLog<E> {
     pub fn create(path: impl AsRef<Path>, extra: E) -> Result<Self, Error> {
         const FILE_SIZE: u64 = 1024 * 1024 * 1024 * 8; // 8gb
+        Self::with_size(FILE_SIZE, path, extra)
+    }
+
+    pub fn with_size(size: u64, path: impl AsRef<Path>, extra: E) -> Result<Self, Error> {
         let mut file = OpenOptions::new()
             .create_new(true)
             .write(true)
             .read(true)
             .open(path)?;
-        file.seek(SeekFrom::Start(FILE_SIZE))?;
+        file.seek(SeekFrom::Start(size))?;
         file.write_all(&[0])?;
         let map = Arc::new(memmap2::MmapRaw::map_raw(file.as_raw_fd())?);
         let map = Self {
