@@ -46,9 +46,11 @@ use stellarator::{
 use time_series::TimeSeries;
 use tracing::{debug, info, trace, warn};
 use vtable_stream::handle_vtable_stream;
-use zerocopy::IntoBytes;
+use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
 
 pub use error::Error;
+
+use crate::disruptor::Disruptor;
 
 pub mod append_log;
 mod arc_ring;
@@ -515,6 +517,7 @@ impl MetadataExt for MsgMetadata {}
 pub struct Component {
     pub component_id: ComponentId,
     pub time_series: TimeSeries,
+    pub wal: Disruptor,
     pub schema: ComponentSchema,
 }
 
@@ -536,11 +539,14 @@ impl Component {
             start_timestamp,
             schema.size() as u64,
         )?;
-        Ok(Component {
+        let this = Component {
+            wal: Disruptor::new(schema.size() * 1024),
             component_id,
             time_series,
             schema,
-        })
+        };
+        stellarator::spawn(this.clone().persist());
+        Ok(this)
     }
 
     pub fn open(
@@ -549,11 +555,35 @@ impl Component {
         schema: ComponentSchema,
     ) -> Result<Self, Error> {
         let time_series = TimeSeries::open(path)?;
-        Ok(Component {
+
+        let this = Component {
+            wal: Disruptor::new(schema.size() * 1024),
             component_id,
             time_series,
             schema,
-        })
+        };
+        stellarator::spawn(this.clone().persist());
+        Ok(this)
+    }
+
+    pub fn persist(self) -> impl Future<Output = ()> {
+        let mut reader = self.wal.reader();
+        async move {
+            let msg_size = self.schema.size() + size_of::<Timestamp>();
+            loop {
+                let buf = reader.next().await;
+                let mut buf = &buf[..];
+                'parse: while let Some(msg) = buf.get(..msg_size) {
+                    let Ok(msg) = WalMsg::ref_from_bytes(&msg) else {
+                        break 'parse;
+                    };
+                    if let Err(err) = self.time_series.push_buf(msg.timestamp, &msg.buf) {
+                        tracing::error!(?err, "failed to persist wal message");
+                    }
+                    buf = &buf[msg_size..];
+                }
+            }
+        }
     }
 
     fn as_vtable_op(&self) -> Arc<OpBuilder> {
@@ -571,6 +601,13 @@ impl Component {
     fn get_range(&self, range: Range<Timestamp>) -> Option<(&[Timestamp], &[u8])> {
         self.time_series.get_range(range)
     }
+}
+
+#[derive(FromBytes, Immutable, KnownLayout)]
+#[repr(C)]
+struct WalMsg {
+    timestamp: Timestamp,
+    buf: [u8],
 }
 
 struct DBSink<'a> {
@@ -593,13 +630,27 @@ impl Decomponentize for DBSink<'_> {
         let Some(component) = self.components.get(&component_id) else {
             return Err(Error::ComponentNotFound(component_id));
         };
+
+        let Ok(mut grant) = component
+            .wal
+            .try_grant(value_buf.len() + size_of::<Timestamp>())
+        else {
+            // TODO(sphw): we should probably wait here, log, or even error out
+            // not sure what is best
+            return Ok(());
+        };
+        grant[..size_of::<Timestamp>()].copy_from_slice(&timestamp.as_bytes());
+        grant[size_of::<Timestamp>()..].copy_from_slice(value_buf);
+        drop(grant);
+
         let time_series_empty = component.time_series.index().is_empty();
-        component.time_series.push_buf(timestamp, value_buf)?;
+        // component.time_series.push_buf(timestamp, value_buf)?;
         if time_series_empty {
             debug!("sunk new time series for component {}", component_id);
             self.sunk_new_time_series = true;
         }
         self.last_updated.update_max(timestamp);
+
         Ok(())
     }
 }

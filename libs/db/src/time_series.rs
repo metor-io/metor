@@ -117,7 +117,7 @@ impl TimeSeries {
     }
 
     pub fn latest(&self) -> Option<(&Timestamp, &[u8])> {
-        let index = self.index.len() as usize / size_of::<Timestamp>() - 1;
+        let index = (self.index.len() as usize / size_of::<Timestamp>()).saturating_sub(1);
         let element_size = self.element_size();
         let i = index * element_size;
         let data = self.data.get(i..i + element_size)?;

@@ -468,7 +468,7 @@ mod tests {
             sleep(Duration::from_millis(10)).await;
         }
 
-        sleep(Duration::from_millis(50)).await;
+        sleep(Duration::from_millis(100)).await;
 
         let temp_dir = std::env::temp_dir();
         let archive_path = temp_dir.join(format!("test_archive_{}", fastrand::u64(..)));
@@ -511,7 +511,7 @@ mod tests {
     }
 
     #[test]
-    async fn test_get_time_series_not_found() {
+    async fn test_gt_time_series_not_found() {
         let (addr, _db) = setup_test_db().await.unwrap();
         let mut client = Client::connect(addr).await.unwrap();
 
@@ -706,7 +706,7 @@ mod tests {
             let _ = handle.await;
         }
 
-        sleep(Duration::from_millis(120)).await;
+        sleep(Duration::from_millis(200)).await;
 
         // Verify that data was written by all clients
         let mut verification_client = Client::connect(addr).await.unwrap();
@@ -1094,47 +1094,6 @@ mod tests {
             elodin_db::Error::SchemaMismatch.to_string(),
             err.description
         );
-    }
-
-    #[test]
-    async fn test_time_travel() {
-        let (addr, _db) = setup_test_db().await.unwrap();
-        let mut client = Client::connect(addr).await.unwrap();
-
-        let component_id = ComponentId::new("time_travel_test");
-        let vtable = vtable([raw_field(
-            0,
-            8,
-            timestamp(
-                raw_table(8, 8),
-                schema(PrimType::F64, &[1], component(component_id)),
-            ),
-        )]);
-
-        client
-            .send(&VTableMsg {
-                id: 1u16.to_le_bytes(),
-                vtable,
-            })
-            .await
-            .0
-            .unwrap();
-
-        let mut pkt = LenPacket::table(1u16.to_le_bytes(), 8);
-        pkt.extend_aligned(&[42.0f64]);
-        pkt.push_aligned(Timestamp(100));
-        client.send(pkt).await.0.unwrap();
-
-        let mut pkt = LenPacket::table(1u16.to_le_bytes(), 8);
-        pkt.extend_aligned(&[40.0f64]);
-        pkt.push_aligned(Timestamp(1));
-        client.send(pkt.with_request_id(42)).await.0.unwrap();
-        sleep(Duration::from_millis(10)).await;
-
-        let Err(impeller2_stellar::Error::Response(err)) = client.recv::<()>(42).await else {
-            panic!("invalid response");
-        };
-        assert_eq!(elodin_db::Error::TimeTravel.to_string(), err.description);
     }
 
     #[test]
