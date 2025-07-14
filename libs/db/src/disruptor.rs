@@ -8,6 +8,7 @@ use std::{
 };
 use stellarator::sync::{Mutex, MutexGuard, WaitCell, WaitQueue};
 
+#[derive(Clone)]
 pub struct Disruptor {
     core: Arc<DistruptorCore>,
 }
@@ -19,7 +20,7 @@ impl Disruptor {
             write_head: WriteHead {
                 committed: AtomicU64::new(0),
                 high_water_mark: AtomicU64::new(0),
-                write_lock: Mutex::new(()),
+                write_lock: std::sync::Mutex::new(()),
             },
             readers: Readers::new(),
             buffer_full_cell: WaitCell::new(),
@@ -30,7 +31,7 @@ impl Disruptor {
 
     pub async fn grant(&self, len: usize) -> Result<WriteGrant<'_>, DisruptorError> {
         let Disruptor { core } = self;
-        let _lock_guard = core.write_head.write_lock.lock().await;
+        let _lock_guard = core.write_head.write_lock.lock().expect("poisoned lock");
         let mut write = (core.write_head.committed.load(Ordering::Acquire)
             % core.ringbuf.len() as u64) as usize;
         let max = core.ringbuf.len();
@@ -39,31 +40,39 @@ impl Disruptor {
         }
         let _ = core
             .buffer_full_cell
-            .wait_for(|| {
-                let mut buffer_full = false;
-                let mut cursor = core.readers.first();
-                'check_room: while let Some(node) = cursor {
-                    cursor = node.next();
-                    let read =
-                        (node.cursor.load(Ordering::Acquire) % core.ringbuf.len() as u64) as usize;
-                    // based on logic in https://github.com/jamesmunns/bbqueue/blob/8468029832ce2293cd93f8af10b7372be3c96ad0/core/src/bbbuffer.rs#L365C1-L397C1
-                    //
-                    // check the case where we are inverted, and the new write will overlap with a read
-                    if write < read && write + len >= read {
-                        buffer_full = true;
-                        break 'check_room;
-                    // check the case where we are not inverted,
-                    // but the next write will casue an inversion,
-                    // and that inversion will lead to an overlap with a read
-                    } else if write + len > max && len >= read {
-                        buffer_full = true;
-                        break 'check_room;
-                    }
-                }
-
-                !buffer_full
-            })
+            .wait_for(|| can_write(core, len, write, max))
             .await;
+
+        if write + len > max {
+            write = 0;
+            core.write_head
+                .high_water_mark
+                .store(write as u64, Ordering::Release);
+        } else if write + len > core.write_head.high_water_mark.load(Ordering::Acquire) as usize {
+            core.write_head
+                .high_water_mark
+                .store((write + len) as u64, Ordering::Release);
+        }
+
+        Ok(WriteGrant {
+            range: write..write + len,
+            disruptor: self.core.as_ref(),
+            _lock_guard,
+        })
+    }
+
+    pub fn try_grant(&self, len: usize) -> Result<WriteGrant<'_>, DisruptorError> {
+        let Disruptor { core } = self;
+        let mut write = (core.write_head.committed.load(Ordering::Acquire)
+            % core.ringbuf.len() as u64) as usize;
+        let _lock_guard = core.write_head.write_lock.lock().expect("poisoned");
+        let max = core.ringbuf.len();
+        if len > max {
+            return Err(DisruptorError::InsufficientCapacity);
+        }
+        if !can_write(core, len, write, max) {
+            return Err(DisruptorError::WouldBlock);
+        }
 
         if write + len > max {
             write = 0;
@@ -101,16 +110,40 @@ pub struct DistruptorCore {
     new_data_queue: WaitQueue,
 }
 
+pub fn can_write(core: &DistruptorCore, len: usize, write: usize, max: usize) -> bool {
+    let mut buffer_full = false;
+    let mut cursor = core.readers.first();
+    'check_room: while let Some(node) = cursor {
+        cursor = node.next();
+        let read = (node.cursor.load(Ordering::Acquire) % core.ringbuf.len() as u64) as usize;
+        // based on logic in https://github.com/jamesmunns/bbqueue/blob/8468029832ce2293cd93f8af10b7372be3c96ad0/core/src/bbbuffer.rs#L365C1-L397C1
+        //
+        // check the case where we are inverted, and the new write will overlap with a read
+        if write < read && write + len >= read {
+            buffer_full = true;
+            break 'check_room;
+        // check the case where we are not inverted,
+        // but the next write will casue an inversion,
+        // and that inversion will lead to an overlap with a read
+        } else if write + len > max && len >= read {
+            buffer_full = true;
+            break 'check_room;
+        }
+    }
+
+    !buffer_full
+}
+
 pub struct WriteHead {
     committed: AtomicU64,
     high_water_mark: AtomicU64,
-    write_lock: Mutex<()>,
+    write_lock: std::sync::Mutex<()>,
 }
 
 pub struct WriteGrant<'a> {
     range: Range<usize>,
     disruptor: &'a DistruptorCore,
-    _lock_guard: MutexGuard<'a, ()>,
+    _lock_guard: std::sync::MutexGuard<'a, ()>,
 }
 
 impl Deref for WriteGrant<'_> {
@@ -148,6 +181,7 @@ impl Drop for WriteGrant<'_> {
         write_head
             .committed
             .store(self.range.end as u64, Ordering::Release);
+        self.disruptor.new_data_queue.wake_all();
     }
 }
 
