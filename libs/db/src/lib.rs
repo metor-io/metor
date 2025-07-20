@@ -60,6 +60,7 @@ pub mod disruptor;
 mod error;
 mod msg_log;
 pub(crate) mod time_series;
+mod time_series_2;
 mod vtable_stream;
 
 pub struct DB {
