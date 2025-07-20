@@ -24,7 +24,7 @@ impl<T> AtomicRing<T> {
         self.buf[index].store(value, Ordering::Relaxed);
     }
 
-    pub fn iter(&self) -> impl Iterator<Item = &T> {
+    pub fn iter(&self) -> impl Iterator<Item = Arc<T>> {
         let head = self.head.load(Ordering::Acquire) % self.buf.len();
         let (end, start) = self.buf.split_at(head);
         start
@@ -43,13 +43,13 @@ mod tests {
         let ring = AtomicRing::new(10);
         for i in 0..10 {
             ring.push(Arc::new(i));
-            assert_eq!(ring.iter().next().unwrap(), &0);
+            assert_eq!(&*ring.iter().next().unwrap(), &0);
         }
         for i in 1..10 {
             ring.push(Arc::new(i));
-            assert_eq!(ring.iter().next().unwrap(), &i);
+            assert_eq!(&*ring.iter().next().unwrap(), &i);
         }
         ring.push(Arc::new(0));
-        assert_eq!(ring.iter().next().unwrap(), &1);
+        assert_eq!(&*ring.iter().next().unwrap(), &1);
     }
 }

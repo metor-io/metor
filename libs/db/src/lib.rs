@@ -598,7 +598,7 @@ impl Component {
         self.time_series.get_nearest(timestamp)
     }
 
-    fn get_range(&self, range: Range<Timestamp>) -> Option<(&[Timestamp], &[u8])> {
+    fn get_range(&self, range: Range<Timestamp>) -> impl Iterator<Item = (&[Timestamp], &[u8])> {
         self.time_series.get_range(range)
     }
 }
@@ -902,17 +902,48 @@ async fn handle_packet<A: AsyncWrite + 'static>(
                 };
                 Ok(component.clone())
             })?;
-            let Some((timestamps, data)) = component.get_range(range) else {
-                return Err(Error::TimeRangeOutOfBounds);
-            };
-            let size = component.schema.size();
-            let (timestamps, data) = if let Some(limit) = limit {
-                let len = timestamps.len().min(limit);
-                (&timestamps[..len], &data[..len * size])
-            } else {
-                (timestamps, data)
-            };
-            tx.send_time_series(id, timestamps, data).await?;
+
+            let req_id = tx.req_id;
+            tx.send_with_builder(move |pkt| {
+                let header = PacketHeader {
+                    packet_ty: impeller2::types::PacketTy::TimeSeries,
+                    id,
+                    req_id,
+                };
+                pkt.as_mut_packet().header = header;
+                pkt.clear();
+                let mut count = 0;
+                let size = component.schema.size();
+                for (timestamps, data) in component.get_range(range) {
+                    let (timestamps, data) = if let Some(limit) = limit {
+                        if count >= limit {
+                            break;
+                        }
+                        let len = dbg!(timestamps.len().min(limit - count));
+                        (&timestamps[..len], &data[..len * size])
+                    } else {
+                        (timestamps, data)
+                    };
+                    pkt.extend_from_slice(&(timestamps.len() as u64).to_le_bytes());
+                    pkt.extend_from_slice(timestamps.as_bytes());
+                    pkt.extend_from_slice(data);
+                    count += timestamps.len();
+                }
+                if count == 0 {
+                    Err(Error::TimeRangeOutOfBounds)
+                } else {
+                    Ok(())
+                }
+            })
+            .await?;
+            // let size = component.schema.size();
+            // let (timestamps, data) = if let Some(limit) = limit {
+            //     let len = timestamps.len().min(limit);
+            //     (&timestamps[..len], &data[..len * size])
+            // } else {
+            //     (timestamps, data)
+            // };
+            // tx.send_time_series(id, timestamps, data).await?;
         }
         Packet::Msg(m) if m.id == SetComponentMetadata::ID => {
             let SetComponentMetadata(metadata) = m.parse::<SetComponentMetadata>()?;

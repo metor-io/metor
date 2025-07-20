@@ -251,7 +251,7 @@ impl Readers {
         }
     }
 
-    pub fn first(&self) -> Option<&ReadNode> {
+    pub fn first(&self) -> Option<Arc<ReadNode>> {
         self.first.load_ref(Ordering::Acquire)
     }
 
@@ -272,7 +272,7 @@ pub struct ReadNode {
 }
 
 impl ReadNode {
-    pub fn next(&self) -> Option<&ReadNode> {
+    pub fn next(&self) -> Option<Arc<ReadNode>> {
         self.next.load_ref(Ordering::Acquire)
     }
 }
@@ -303,12 +303,15 @@ impl<T> ArcAtomic<T> {
         Some(unsafe { Arc::from_raw(ptr) })
     }
 
-    pub fn load_ref(&self, ordering: Ordering) -> Option<&T> {
+    pub fn load_ref(&self, ordering: Ordering) -> Option<Arc<T>> {
         let ptr = self.ptr.load(ordering);
         if ptr.is_null() {
             return None;
         }
-        Some(unsafe { &*ptr })
+        Some(unsafe {
+            Arc::increment_strong_count(ptr);
+            Arc::from_raw(ptr)
+        })
     }
 
     pub fn store(&self, arc: Arc<T>, ordering: Ordering) {

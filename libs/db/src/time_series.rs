@@ -48,15 +48,17 @@ impl TimeSeries {
 
     pub fn start_timestamp(&self) -> Timestamp {
         let index_ts = *self.index.extra();
-        match self.timestamps().first() {
+        match self.timestamps().next().and_then(|t| t.first()) {
             Some(first_ts) => index_ts.min(*first_ts),
             None => index_ts,
         }
     }
 
-    fn timestamps(&self) -> &[Timestamp] {
-        <[Timestamp]>::ref_from_bytes(self.index.get(..).expect("couldn't get full range"))
-            .expect("mmep unaligned")
+    fn timestamps(&self) -> impl Iterator<Item = &[Timestamp]> {
+        std::iter::once(
+            <[Timestamp]>::ref_from_bytes(self.index.get(..).expect("couldn't get full range"))
+                .expect("mmep unaligned"),
+        )
     }
 
     pub fn element_size(&self) -> usize {
@@ -65,14 +67,21 @@ impl TimeSeries {
 
     pub fn get(&self, timestamp: Timestamp) -> Option<&[u8]> {
         let timestamps = self.timestamps();
-        let index = timestamps.binary_search(&timestamp).ok()?;
-        let element_size = self.element_size();
-        let i = index * element_size;
-        self.data.get(i..i + element_size)
+        for timestamps in timestamps {
+            let index = timestamps.binary_search(&timestamp).ok()?;
+            let element_size = self.element_size();
+            let i = index * element_size;
+            if let Some(data) = self.data.get(i..i + element_size) {
+                return Some(data);
+            }
+        }
+        None
     }
 
     pub fn get_nearest(&self, timestamp: Timestamp) -> Option<(Timestamp, &[u8])> {
-        let timestamps = self.timestamps();
+        let timestamps =
+            <[Timestamp]>::ref_from_bytes(self.index.get(..).expect("couldn't get full range"))
+                .expect("mmep unaligned");
         let index = match timestamps.binary_search(&timestamp) {
             Ok(i) => i,
             Err(i) => i.saturating_sub(1),
@@ -84,28 +93,31 @@ impl TimeSeries {
         Some((*timestamp, buf))
     }
 
-    pub fn get_range(&self, range: Range<Timestamp>) -> Option<(&[Timestamp], &[u8])> {
-        let timestamps = self.timestamps();
+    pub fn get_range(
+        &self,
+        range: Range<Timestamp>,
+    ) -> impl Iterator<Item = (&[Timestamp], &[u8])> {
+        self.timestamps().filter_map(move |timestamps| {
+            let start = range.start;
+            let end = range.end;
+            let start_index = match timestamps.binary_search(&start) {
+                Ok(i) => i,
+                Err(i) => i,
+            };
 
-        let start = range.start;
-        let end = range.end;
-        let start_index = match timestamps.binary_search(&start) {
-            Ok(i) => i,
-            Err(i) => i,
-        };
+            let end_index = match timestamps.binary_search(&end) {
+                Ok(i) => i,
+                Err(i) => i.saturating_sub(1),
+            };
 
-        let end_index = match timestamps.binary_search(&end) {
-            Ok(i) => i,
-            Err(i) => i.saturating_sub(1),
-        };
+            let timestamps = timestamps.get(start_index..=end_index)?;
+            let element_size = self.element_size();
+            let data = self
+                .data
+                .get(start_index * element_size..end_index.saturating_add(1) * element_size)?;
 
-        let timestamps = timestamps.get(start_index..=end_index)?;
-        let element_size = self.element_size();
-        let data = self
-            .data
-            .get(start_index * element_size..end_index.saturating_add(1) * element_size)?;
-
-        Some((timestamps, data))
+            Some((timestamps, data))
+        })
     }
 
     pub async fn wait(&self) {
@@ -117,11 +129,14 @@ impl TimeSeries {
     }
 
     pub fn latest(&self) -> Option<(&Timestamp, &[u8])> {
+        let timestamps =
+            <[Timestamp]>::ref_from_bytes(self.index.get(..).expect("couldn't get full range"))
+                .expect("mmep unaligned");
         let index = (self.index.len() as usize / size_of::<Timestamp>()).saturating_sub(1);
         let element_size = self.element_size();
         let i = index * element_size;
         let data = self.data.get(i..i + element_size)?;
-        let timestamp = self.timestamps().get(index)?;
+        let timestamp = timestamps.get(index)?;
         Some((timestamp, data))
     }
 
