@@ -278,7 +278,7 @@ impl ReadNode {
 }
 
 pub struct ArcAtomic<T> {
-    ptr: AtomicPtr<T>,
+    pub(crate) ptr: AtomicPtr<T>,
 }
 
 impl<T> ArcAtomic<T> {
@@ -332,6 +332,15 @@ impl<T> ArcAtomic<T> {
             None
         } else {
             Some(unsafe { Arc::from_raw(old) })
+        }
+    }
+}
+
+impl<T> From<Arc<T>> for ArcAtomic<T> {
+    fn from(arc: Arc<T>) -> Self {
+        let ptr = Arc::into_raw(arc);
+        Self {
+            ptr: AtomicPtr::new(ptr as *mut _),
         }
     }
 }

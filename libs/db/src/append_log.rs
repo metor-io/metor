@@ -157,4 +157,8 @@ impl<E: IntoBytes + Immutable> AppendLog<E> {
         drop(guard);
         Ok(end - size_of::<Header<E>>())
     }
+
+    pub fn capacity(&self) -> usize {
+        self.map.len() - size_of::<Header<E>>()
+    }
 }

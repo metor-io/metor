@@ -179,3 +179,11 @@ impl TimeSeries {
         Ok(())
     }
 }
+
+//
+// a - push_buf
+// a data push
+// b push_buf
+// b data_push
+// b timestamp //oops
+// a timestamp

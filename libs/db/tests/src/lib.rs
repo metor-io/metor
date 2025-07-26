@@ -67,8 +67,8 @@ mod tests {
             let c = state
                 .get_component(ComponentId::new("test"))
                 .expect("missing component");
-            let (_, data) = c.time_series.latest().expect("missing latest value");
-            assert_eq!(data, floats.as_bytes());
+            let latest = c.time_series.latest().expect("missing latest value");
+            assert_eq!(latest.data(), floats.as_bytes());
         })
     }
 

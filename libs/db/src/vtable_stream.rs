@@ -277,13 +277,17 @@ impl FixedRateStage {
             return Ok(true);
         }
         let current_timestamp = self.state.current_timestamp();
-        let Some((timestamp, buf)) = self.component.time_series.get_nearest(current_timestamp)
+        let Some(nearest) = self
+            .component
+            .time_series
+            .binary_search_nearest(current_timestamp, true)
         else {
             return Ok(true);
         };
+        let timestamp = nearest.timestamp();
         shard
             .with_buf(|shard| {
-                shard.copy_from_slice(buf);
+                shard.copy_from_slice(nearest.data());
             })
             .await;
         if let Some(timestamp_shard) = timestamp_shard {
@@ -314,9 +318,11 @@ impl RealTimeStage {
             "real time stage waiting"
         );
         self.component.time_series.wait().await;
-        let Some((&timestamp, buf)) = self.component.time_series.latest() else {
+        let Some(latest) = self.component.time_series.latest() else {
             return Ok(true);
         };
+        let timestamp = latest.timestamp();
+        let buf = latest.data();
         shard
             .with_buf(|shard| {
                 shard.copy_from_slice(buf);

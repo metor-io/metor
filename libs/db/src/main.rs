@@ -79,11 +79,11 @@ async fn main() -> miette::Result<()> {
             let server = Server::new(path, addr).into_diagnostic()?;
             let axum_db = server.db.clone();
             let db = stellarator::spawn(server.run());
-            if let Some(http_addr) = http_addr {
-                stellarator::struc_con::tokio(move |_| async move {
-                    elodin_db::axum::serve(http_addr, axum_db).await.unwrap()
-                });
-            }
+            // if let Some(http_addr) = http_addr {
+            //     stellarator::struc_con::tokio(move |_| async move {
+            //         elodin_db::axum::serve(http_addr, axum_db).await.unwrap()
+            //     });
+            // }
             if let Some(lua_config) = config {
                 let args = impeller2_cli::Args {
                     path: Some(lua_config),

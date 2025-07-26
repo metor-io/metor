@@ -54,13 +54,15 @@ use crate::disruptor::Disruptor;
 
 pub mod append_log;
 mod arc_ring;
-mod arrow;
-pub mod axum;
+//mod arrow;
+//pub mod axum;
 pub mod disruptor;
 mod error;
 mod msg_log;
-pub(crate) mod time_series;
-mod time_series_2;
+//pub(crate) mod time_series;
+pub mod time_series_2;
+pub use time_series_2 as time_series;
+
 mod vtable_stream;
 
 pub struct DB {
@@ -170,10 +172,13 @@ impl DB {
             trace!("Opening component file {}", path.display());
 
             let component = Component::open(&path, component_id, schema.clone())?;
-            if let Some((timestamp, _)) = component.time_series.latest() {
+            if let Some(latest) = component.time_series.latest() {
+                let timestamp = latest.timestamp();
                 last_updated = timestamp.0.max(last_updated);
             };
-            start_timestamp = start_timestamp.min(component.time_series.start_timestamp().0);
+            if let Some(first_timestamp) = component.time_series.start_timestamp() {
+                start_timestamp = start_timestamp.min(first_timestamp.0);
+            };
             components.insert(component_id, component);
         }
         if let Ok(msgs_dir) = std::fs::read_dir(path.join("msgs")) {
@@ -535,11 +540,7 @@ impl Component {
         if !component_schema_path.exists() {
             schema.write(component_schema_path)?;
         }
-        let time_series = TimeSeries::create(
-            component_path.clone(),
-            start_timestamp,
-            schema.size() as u64,
-        )?;
+        let time_series = TimeSeries::create(component_path.clone())?;
         let this = Component {
             wal: Disruptor::new(schema.size() * 1024),
             component_id,
@@ -595,13 +596,13 @@ impl Component {
         )
     }
 
-    fn get_nearest(&self, timestamp: Timestamp) -> Option<(Timestamp, &[u8])> {
-        self.time_series.get_nearest(timestamp)
-    }
+    // fn get_nearest(&self, timestamp: Timestamp) -> Option<(Timestamp, &[u8])> {
+    //     self.time_series.get_nearest(timestamp)
+    // }
 
-    fn get_range(&self, range: Range<Timestamp>) -> impl Iterator<Item = (&[Timestamp], &[u8])> {
-        self.time_series.get_range(range)
-    }
+    // fn get_range(&self, range: Range<Timestamp>) -> impl Iterator<Item = (&[Timestamp], &[u8])> {
+    //     self.time_series.get_range(range)
+    // }
 }
 
 #[derive(FromBytes, Immutable, KnownLayout)]
@@ -644,7 +645,7 @@ impl Decomponentize for DBSink<'_> {
         grant[size_of::<Timestamp>()..].copy_from_slice(value_buf);
         drop(grant);
 
-        let time_series_empty = component.time_series.index().is_empty();
+        let time_series_empty = component.time_series.is_empty();
         // component.time_series.push_buf(timestamp, value_buf)?;
         if time_series_empty {
             debug!("sunk new time series for component {}", component_id);
@@ -913,38 +914,70 @@ async fn handle_packet<A: AsyncWrite + 'static>(
                 };
                 pkt.as_mut_packet().header = header;
                 pkt.clear();
-                let mut count = 0;
                 let size = component.schema.size();
-                for (timestamps, data) in component.get_range(range) {
-                    let (timestamps, data) = if let Some(limit) = limit {
-                        if count >= limit {
-                            break;
-                        }
-                        let len = dbg!(timestamps.len().min(limit - count));
-                        (&timestamps[..len], &data[..len * size])
-                    } else {
-                        (timestamps, data)
-                    };
-                    pkt.extend_from_slice(&(timestamps.len() as u64).to_le_bytes());
-                    pkt.extend_from_slice(timestamps.as_bytes());
-                    pkt.extend_from_slice(data);
-                    count += timestamps.len();
+                let range = component
+                    .time_series
+                    .get_range(range)
+                    .ok_or(Error::TimeRangeOutOfBounds)?;
+                let range_len = range.len();
+                let len = dbg!(range_len.min(limit.unwrap_or(usize::MAX)));
+                // we preallocate the space we need, because we are iterating over the range's chunks backwards
+                // So we want to starting writing from the end of the buffers
+                let timestamp_buf_len = dbg!(len * size_of::<Timestamp>());
+                let data_buf_len = dbg!(len * size);
+                pkt.extend_from_slice((len as u64).as_bytes());
+                pkt.inner.extend(std::iter::repeat_n(
+                    0u8,
+                    len * size_of::<Timestamp>() + len * size,
+                ));
+                let pkt_len: u32 = dbg!(
+                    (size_of::<u64>()
+                        + timestamp_buf_len
+                        + data_buf_len
+                        + size_of::<PacketHeader>()) as u32
+                );
+                pkt.inner[0..size_of::<u32>()].copy_from_slice(&pkt_len.to_le_bytes());
+                let pkt_mut = pkt.as_mut_packet();
+                println!("pkt_mut: {:?}", pkt_mut.body.len());
+                let pkt_mut_body = &mut pkt_mut.body[size_of::<u64>()..];
+                let (timestamps_dest, mut data_dest) = pkt_mut_body.split_at_mut(timestamp_buf_len);
+                println!(
+                    "timestamps_dest: {:?} data_dest: {:?}",
+                    timestamps_dest.len(),
+                    data_dest.len()
+                );
+                let mut timestamps_dest = <[Timestamp]>::mut_from_bytes(timestamps_dest)
+                    .expect("Failed to create mutable slice for timestamps");
+                println!(
+                    "timestamps_dest: {:?} data_dest: {:?}",
+                    timestamps_dest.len(),
+                    data_dest.len()
+                );
+
+                let mut to_skip = range_len - len;
+                for slice in range.as_iter() {
+                    let timestamps = slice.timestamps();
+                    let data = slice.data();
+                    println!("slice.data: {:?}", data.len());
+                    let timestamps_len = dbg!(timestamps.len().saturating_sub(to_skip));
+                    let timestamps = &timestamps[..timestamps_len];
+                    dbg!(data.len());
+                    let data = &data[..timestamps_len * size];
+                    to_skip = to_skip.saturating_sub(timestamps_len);
+                    if timestamps.is_empty() {
+                        continue;
+                    }
+                    let start = timestamps_dest.len() - timestamps_len;
+                    let end = timestamps_dest.len();
+                    timestamps_dest[start..end].copy_from_slice(timestamps);
+                    timestamps_dest = &mut timestamps_dest[..start];
+                    data_dest[start * size..end * size].copy_from_slice(data);
+                    data_dest = &mut data_dest[..start * size];
                 }
-                if count == 0 {
-                    Err(Error::TimeRangeOutOfBounds)
-                } else {
-                    Ok(())
-                }
+
+                Ok(())
             })
             .await?;
-            // let size = component.schema.size();
-            // let (timestamps, data) = if let Some(limit) = limit {
-            //     let len = timestamps.len().min(limit);
-            //     (&timestamps[..len], &data[..len * size])
-            // } else {
-            //     (timestamps, data)
-            // };
-            // tx.send_time_series(id, timestamps, data).await?;
         }
         Packet::Msg(m) if m.id == SetComponentMetadata::ID => {
             let SetComponentMetadata(metadata) = m.parse::<SetComponentMetadata>()?;
@@ -1068,37 +1101,37 @@ async fn handle_packet<A: AsyncWrite + 'static>(
             let settings = db.db_config();
             tx.send_msg(&settings).await?;
         }
-        Packet::Msg(m) if m.id == SQLQuery::ID => {
-            let SQLQuery(query) = m.parse::<SQLQuery>()?;
-            let db = db.clone();
-            let (tokio_tx, rx) = thingbuf::mpsc::channel::<Vec<u8>>(4);
-            let res = stellarator::struc_con::tokio(move |_| async move {
-                let mut ctx = db.as_session_context()?;
-                db.insert_views(&mut ctx).await?;
-                let df = ctx.sql(&query).await?;
-                let mut stream = df.execute_stream().await?;
+        // Packet::Msg(m) if m.id == SQLQuery::ID => {
+        //     let SQLQuery(query) = m.parse::<SQLQuery>()?;
+        //     let db = db.clone();
+        //     let (tokio_tx, rx) = thingbuf::mpsc::channel::<Vec<u8>>(4);
+        //     let res = stellarator::struc_con::tokio(move |_| async move {
+        //         let mut ctx = db.as_session_context()?;
+        //         db.insert_views(&mut ctx).await?;
+        //         let df = ctx.sql(&query).await?;
+        //         let mut stream = df.execute_stream().await?;
 
-                while let Some(batch) = stream.next().await {
-                    let batch = batch?;
-                    let mut buf = vec![];
-                    let mut writer =
-                        ::arrow::ipc::writer::StreamWriter::try_new(&mut buf, batch.schema_ref())?;
-                    writer.write(&batch)?;
-                    writer.finish()?;
-                    let _ = tokio_tx.send(buf).await;
-                }
-                Ok::<_, Error>(())
-            })
-            .join();
-            while let Some(batch) = rx.recv().await {
-                tx.send_msg(&ArrowIPC {
-                    batch: Some(Cow::Owned(batch)),
-                })
-                .await?;
-            }
-            res.await??;
-            tx.send_msg(&ArrowIPC { batch: None }).await?;
-        }
+        //         while let Some(batch) = stream.next().await {
+        //             let batch = batch?;
+        //             let mut buf = vec![];
+        //             let mut writer =
+        //                 ::arrow::ipc::writer::StreamWriter::try_new(&mut buf, batch.schema_ref())?;
+        //             writer.write(&batch)?;
+        //             writer.finish()?;
+        //             let _ = tokio_tx.send(buf).await;
+        //         }
+        //         Ok::<_, Error>(())
+        //     })
+        //     .join();
+        //     while let Some(batch) = rx.recv().await {
+        //         tx.send_msg(&ArrowIPC {
+        //             batch: Some(Cow::Owned(batch)),
+        //         })
+        //         .await?;
+        //     }
+        //     res.await??;
+        //     tx.send_msg(&ArrowIPC { batch: None }).await?;
+        // }
         Packet::Msg(m) if m.id == SetMsgMetadata::ID => {
             let SetMsgMetadata { id, metadata } = m.parse::<SetMsgMetadata>()?;
             db.with_state_mut(|s| s.set_msg_metadata(id, metadata, &db.path))?;
@@ -1153,11 +1186,11 @@ async fn handle_packet<A: AsyncWrite + 'static>(
             };
             tx.send_msg(&MsgBatch { data }).await?;
         }
-        Packet::Msg(m) if m.id == SaveArchive::ID => {
-            let SaveArchive { path, format } = m.parse()?;
-            db.save_archive(&path, format)?;
-            tx.send_msg(&ArchiveSaved { path }).await?;
-        }
+        // Packet::Msg(m) if m.id == SaveArchive::ID => {
+        //     let SaveArchive { path, format } = m.parse()?;
+        //     db.save_archive(&path, format)?;
+        //     tx.send_msg(&ArchiveSaved { path }).await?;
+        // }
         Packet::Msg(m) if m.id == VTableStream::ID => {
             let VTableStream { id } = m.parse::<VTableStream>()?;
             let vtable = db
@@ -1474,12 +1507,12 @@ async fn handle_real_time_component<A: AsyncWrite>(
     let mut table = LenPacket::table(vtable_id, 2048 - 16);
     loop {
         let _ = waiter.wait().await;
-        let Some((&timestamp, buf)) = component.time_series.latest() else {
+        let Some(latest) = component.time_series.latest() else {
             continue;
         };
-        table.push_aligned(timestamp);
+        table.push_aligned(latest.timestamp());
         table.pad_for_type(prim_type);
-        table.extend_from_slice(buf);
+        table.extend_from_slice(latest.data());
         {
             let stream = stream.lock().await;
             if let Err(err) = rent!(stream.send(table.with_request_id(req_id)).await, table) {
@@ -1550,7 +1583,7 @@ impl DBVisitor {
         let mut fields = vec![];
         let mut offset = 0;
         self.visit(components, |entity| {
-            if !entity.time_series.index().is_empty() {
+            if !entity.time_series.is_empty() {
                 offset += PrimType::U64.padding(offset);
                 let op = timestamp(builder::raw_table(offset as u16, 8), entity.as_vtable_op());
                 offset += size_of::<Timestamp>();
@@ -1572,13 +1605,16 @@ impl DBVisitor {
         timestamp: Timestamp,
     ) -> Result<(), Error> {
         self.visit(components, |entity| {
-            let tick = entity.time_series.start_timestamp().max(timestamp);
-            let Some((timestamp, buf)) = entity.get_nearest(tick) else {
+            let Some(start_timestamp) = entity.time_series.start_timestamp() else {
                 return Ok(());
             };
-            table.push_aligned(timestamp);
+            let tick = start_timestamp.max(timestamp);
+            let Some(nearest) = entity.time_series.binary_search_nearest(tick, true) else {
+                return Ok(());
+            };
+            table.push_aligned(nearest.timestamp());
             table.pad_for_type(entity.schema.prim_type);
-            table.extend_from_slice(buf);
+            table.extend_from_slice(nearest.data());
             Ok(())
         })
     }
