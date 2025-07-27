@@ -6,7 +6,6 @@ use std::{
 };
 
 use impeller2::types::Timestamp;
-use nox::ArrayBuf;
 use stellarator::sync::WaitQueue;
 use tracing::warn;
 use zerocopy::FromBytes;
@@ -14,21 +13,21 @@ use zerocopy::FromBytes;
 use crate::{
     Error,
     append_log::AppendLog,
-    arc_ring::{ArcProj, ArcProjExt, AtomicNode, AtomicRing, AtomicStack, AtomicStackIter},
+    arc_ring::{AtomicNode, AtomicStack, AtomicStackIter},
     disruptor::ArcAtomic,
 };
 
 #[derive(Clone)]
 pub struct TimeSeries {
-    list: Arc<AtomicStack<TimeSeriesNode>>,
+    pub list: Arc<AtomicStack<TimeSeriesNode>>,
     path: PathBuf,
     data_waker: Arc<WaitQueue>,
 }
 
 #[derive(Clone)]
 pub struct TimeSeriesNode {
-    index: AppendLog<Timestamp>,
-    data: AppendLog<u64>,
+    pub index: AppendLog<Timestamp>,
+    pub data: AppendLog<u64>,
 }
 
 impl Debug for TimeSeriesNode {
@@ -114,13 +113,24 @@ pub struct TimeSeriesNodeSlice {
 
 impl TimeSeriesNodeSlice {
     pub fn timestamps(&self) -> &[Timestamp] {
-        &self.node.timestamps()[self.range.clone()]
+        let start: usize = *self.range.start(); //.min(self.node.timestamps().len().saturating_sub(1));
+        let mut end = *self.range.end(); //.min(self.node.timestamps().len().saturating_sub(1));
+        if end >= self.node.timestamps().len() {
+            println!(
+                "End index out of bounds {end:?} >= {}",
+                self.node.timestamps().len()
+            );
+            end = self.node.timestamps().len().saturating_sub(1);
+        }
+        &self.node.timestamps()[start..=end]
     }
 
     pub fn data(&self) -> &[u8] {
-        let element_size = dbg!(self.node.element_size());
-        &self.node.data.data()
-            [self.range.start() * element_size..self.range.end().saturating_add(1) * element_size]
+        let element_size = self.node.element_size();
+        let data_len = self.node.data.data().len();
+        let start = (self.range.start() * element_size).min(data_len);
+        let end = (self.range.end().saturating_add(1) * element_size).min(data_len);
+        &self.node.data.data()[start..end]
     }
 }
 
@@ -142,7 +152,7 @@ impl TimeSeriesSlice {
             let end = if Arc::ptr_eq(&node, &self.end.node) {
                 self.end.index
             } else {
-                node.timestamps().len()
+                node.timestamps().len().saturating_sub(1)
             };
             TimeSeriesNodeSlice {
                 range: start..=end,
@@ -153,6 +163,10 @@ impl TimeSeriesSlice {
 
     pub fn len(&self) -> usize {
         self.as_iter().map(|node| node.timestamps().len()).sum()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
     }
 }
 
@@ -215,30 +229,19 @@ impl TimeSeries {
             .min()
     }
 
-    fn timestamps(&self) -> impl Iterator<Item = ArcProj<AtomicNode<TimeSeriesNode>, [Timestamp]>> {
-        self.list
-            .iter()
-            .map(|node| node.proj_fn(|node| node.value().timestamps()))
-    }
-
     pub fn push_buf(&self, timestamp: Timestamp, buf: &[u8]) -> Result<(), Error> {
         // TODO(sphw): have a lock for push_buf
         //  Or not, really there is just going to be one writer, maybe we do the split thing?
         // TODO(sphw): prevent time tavel
         loop {
             if self.try_push_buf(timestamp, buf)? {
-                println!("pushed buf");
                 break;
             }
-            dbg!(
-                self.list
-                    .try_push(TimeSeriesNode::create(
-                        self.path.join(timestamp.0.to_string()),
-                        timestamp,
-                        buf.len() as u64,
-                    )?)
-                    .is_ok()
-            );
+            let _ = self.list.try_push(TimeSeriesNode::create(
+                self.path.join(timestamp.0.to_string()),
+                timestamp,
+                buf.len() as u64,
+            )?);
         }
         self.data_waker.wake_all();
         Ok(())
@@ -246,10 +249,8 @@ impl TimeSeries {
 
     fn try_push_buf(&self, timestamp: Timestamp, buf: &[u8]) -> Result<bool, Error> {
         let Some(head) = self.list.head() else {
-            println!("head is None");
             return Ok(false);
         };
-        println!("head is Some pushing data");
         match head.data.write(buf) {
             Ok(_) => {}
             Err(Error::MapOverflow) => return Ok(false),
@@ -259,21 +260,22 @@ impl TimeSeries {
         Ok(true)
     }
 
-    pub fn get(
-        &self,
-        timestamp: Timestamp,
-    ) -> Option<
-        ArcProj<AtomicNode<TimeSeriesNode>, [u8], impl Fn(&AtomicNode<TimeSeriesNode>) -> &[u8]>,
-    > {
+    pub fn get(&self, timestamp: Timestamp) -> Option<TimestampRef> {
         for node in self.list.iter() {
             let timestamps = node.timestamps();
-            let index = timestamps.binary_search(&timestamp).ok()?;
+            let Ok(index) = timestamps.binary_search(&timestamp) else {
+                continue;
+            };
             let element_size = node.element_size();
             let i = index * element_size;
             if node.data.get(i..i + element_size).is_none() {
-                return None;
+                continue;
             }
-            return Some(node.proj(move |node| node.data.get(i..i + element_size).unwrap()));
+            return Some(TimestampRef {
+                node,
+                timestamp,
+                index,
+            });
         }
         None
     }
@@ -298,17 +300,16 @@ impl TimeSeries {
             let start = timestamps.first()?;
             let end = timestamps.last()?;
             if timestamp.0 > end.0 {
-                return if let Some(prev) = &prev_node
-                    && prev.timestamp.0.abs_diff(timestamp.0) < start.0.abs_diff(timestamp.0)
-                {
-                    prev_node
-                } else {
-                    Some(TimestampRef {
-                        timestamp: *start,
-                        index: node.timestamps().len().saturating_sub(inclusive as usize),
-                        node,
-                    })
-                };
+                if let Some(prev) = &prev_node {
+                    if prev.timestamp.0.abs_diff(timestamp.0) < start.0.abs_diff(timestamp.0) {
+                        return prev_node;
+                    }
+                }
+                return Some(TimestampRef {
+                    timestamp: *start,
+                    index: node.timestamps().len().saturating_sub(inclusive as usize),
+                    node,
+                });
             }
             if timestamp.0 < start.0 {
                 prev_node = Some(TimestampRef {
@@ -338,7 +339,6 @@ impl TimeSeries {
     pub fn get_range(&self, range: Range<Timestamp>) -> Option<TimeSeriesSlice> {
         let start = self.binary_search_nearest(range.start, false)?;
         let end = self.binary_search_nearest(range.end, true)?;
-        println!("start: {}, end: {}", start.index, end.index);
         Some(TimeSeriesSlice { start, end })
     }
 
@@ -351,8 +351,8 @@ impl TimeSeries {
     }
 
     pub fn latest(&self) -> Option<TimestampRef> {
-        let head = dbg!(self.list.head())?;
-        let index = dbg!(head.timestamps().len().checked_sub(1))?;
+        let head = self.list.head()?;
+        let index = head.timestamps().len().checked_sub(1)?;
         Some(TimestampRef {
             timestamp: head.timestamps()[index],
             node: head,

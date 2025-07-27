@@ -6,7 +6,7 @@ use std::{
         atomic::{AtomicPtr, AtomicU64, Ordering},
     },
 };
-use stellarator::sync::{Mutex, MutexGuard, WaitCell, WaitQueue};
+use stellarator::sync::WaitQueue;
 
 #[derive(Clone)]
 pub struct Disruptor {
@@ -23,43 +23,43 @@ impl Disruptor {
                 write_lock: std::sync::Mutex::new(()),
             },
             readers: Readers::new(),
-            buffer_full_cell: WaitCell::new(),
             new_data_queue: WaitQueue::new(),
         });
         Self { core }
     }
 
-    pub async fn grant(&self, len: usize) -> Result<WriteGrant<'_>, DisruptorError> {
-        let Disruptor { core } = self;
-        let _lock_guard = core.write_head.write_lock.lock().expect("poisoned lock");
-        let mut write = (core.write_head.committed.load(Ordering::Acquire)
-            % core.ringbuf.len() as u64) as usize;
-        let max = core.ringbuf.len();
-        if len > max {
-            return Err(DisruptorError::InsufficientCapacity);
-        }
-        let _ = core
-            .buffer_full_cell
-            .wait_for(|| can_write(core, len, write, max))
-            .await;
+    // TODO(sphw): this function "works", but can cause deadlocks due to the mutex lock
+    // pub async fn grant(&self, len: usize) -> Result<WriteGrant<'_>, DisruptorError> {
+    //     let Disruptor { core } = self;
+    //     let _lock_guard = core.write_head.write_lock.lock().expect("poisoned lock");
+    //     let mut write = (core.write_head.committed.load(Ordering::Acquire)
+    //         % core.ringbuf.len() as u64) as usize;
+    //     let max = core.ringbuf.len();
+    //     if len > max {
+    //         return Err(DisruptorError::InsufficientCapacity);
+    //     }
+    //     let _ = core
+    //         .buffer_full_cell
+    //         .wait_for(|| can_write(core, len, write, max))
+    //         .await;
 
-        if write + len > max {
-            write = 0;
-            core.write_head
-                .high_water_mark
-                .store(write as u64, Ordering::Release);
-        } else if write + len > core.write_head.high_water_mark.load(Ordering::Acquire) as usize {
-            core.write_head
-                .high_water_mark
-                .store((write + len) as u64, Ordering::Release);
-        }
+    //     if write + len > max {
+    //         write = 0;
+    //         core.write_head
+    //             .high_water_mark
+    //             .store(write as u64, Ordering::Release);
+    //     } else if write + len > core.write_head.high_water_mark.load(Ordering::Acquire) as usize {
+    //         core.write_head
+    //             .high_water_mark
+    //             .store((write + len) as u64, Ordering::Release);
+    //     }
 
-        Ok(WriteGrant {
-            range: write..write + len,
-            disruptor: self.core.as_ref(),
-            _lock_guard,
-        })
-    }
+    //     Ok(WriteGrant {
+    //         range: write..write + len,
+    //         disruptor: self.core.as_ref(),
+    //         _lock_guard,
+    //     })
+    // }
 
     pub fn try_grant(&self, len: usize) -> Result<WriteGrant<'_>, DisruptorError> {
         let Disruptor { core } = self;
@@ -106,7 +106,6 @@ pub struct DistruptorCore {
     ringbuf: Vec<u8>,
     write_head: WriteHead,
     readers: Readers,
-    buffer_full_cell: WaitCell,
     new_data_queue: WaitQueue,
 }
 
@@ -242,6 +241,12 @@ impl Drop for ReadGrant<'_> {
 
 pub struct Readers {
     first: ArcAtomic<ReadNode>,
+}
+
+impl Default for Readers {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl Readers {

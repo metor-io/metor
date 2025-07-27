@@ -26,7 +26,6 @@ use std::{
     collections::HashMap,
     ffi::OsStr,
     net::{SocketAddr, ToSocketAddrs},
-    ops::Range,
     path::{Path, PathBuf},
     sync::{
         Arc, RwLock,
@@ -54,7 +53,7 @@ use crate::disruptor::Disruptor;
 
 pub mod append_log;
 mod arc_ring;
-//mod arrow;
+mod arrow;
 //pub mod axum;
 pub mod disruptor;
 mod error;
@@ -316,7 +315,7 @@ impl State {
             name: component_id.to_string(),
             metadata: Default::default(),
         };
-        let component = Component::create(db_path, component_id, schema, Timestamp::now())?;
+        let component = Component::create(db_path, component_id, schema)?;
         if !self.component_metadata.contains_key(&component_id) {
             self.set_component_metadata(component_metadata, db_path)?;
         }
@@ -532,7 +531,6 @@ impl Component {
         db_path: &Path,
         component_id: ComponentId,
         schema: ComponentSchema,
-        start_timestamp: Timestamp,
     ) -> Result<Self, Error> {
         let component_path = db_path.join(component_id.to_string());
         std::fs::create_dir_all(&component_path)?;
@@ -576,7 +574,7 @@ impl Component {
                 let buf = reader.next().await;
                 let mut buf = &buf[..];
                 'parse: while let Some(msg) = buf.get(..msg_size) {
-                    let Ok(msg) = WalMsg::ref_from_bytes(&msg) else {
+                    let Ok(msg) = WalMsg::ref_from_bytes(msg) else {
                         break 'parse;
                     };
                     if let Err(err) = self.time_series.push_buf(msg.timestamp, &msg.buf) {
@@ -641,7 +639,7 @@ impl Decomponentize for DBSink<'_> {
             // not sure what is best
             return Ok(());
         };
-        grant[..size_of::<Timestamp>()].copy_from_slice(&timestamp.as_bytes());
+        grant[..size_of::<Timestamp>()].copy_from_slice(timestamp.as_bytes());
         grant[size_of::<Timestamp>()..].copy_from_slice(value_buf);
         drop(grant);
 
@@ -920,48 +918,42 @@ async fn handle_packet<A: AsyncWrite + 'static>(
                     .get_range(range)
                     .ok_or(Error::TimeRangeOutOfBounds)?;
                 let range_len = range.len();
-                let len = dbg!(range_len.min(limit.unwrap_or(usize::MAX)));
+                let len = range_len.min(limit.unwrap_or(usize::MAX));
                 // we preallocate the space we need, because we are iterating over the range's chunks backwards
                 // So we want to starting writing from the end of the buffers
-                let timestamp_buf_len = dbg!(len * size_of::<Timestamp>());
-                let data_buf_len = dbg!(len * size);
+                let timestamp_buf_len = len * size_of::<Timestamp>();
+                let data_buf_len = len * size;
                 pkt.extend_from_slice((len as u64).as_bytes());
                 pkt.inner.extend(std::iter::repeat_n(
                     0u8,
                     len * size_of::<Timestamp>() + len * size,
                 ));
-                let pkt_len: u32 = dbg!(
-                    (size_of::<u64>()
-                        + timestamp_buf_len
-                        + data_buf_len
-                        + size_of::<PacketHeader>()) as u32
-                );
+                let pkt_len: u32 = (size_of::<u64>()
+                    + timestamp_buf_len
+                    + data_buf_len
+                    + size_of::<PacketHeader>()) as u32;
                 pkt.inner[0..size_of::<u32>()].copy_from_slice(&pkt_len.to_le_bytes());
                 let pkt_mut = pkt.as_mut_packet();
-                println!("pkt_mut: {:?}", pkt_mut.body.len());
                 let pkt_mut_body = &mut pkt_mut.body[size_of::<u64>()..];
                 let (timestamps_dest, mut data_dest) = pkt_mut_body.split_at_mut(timestamp_buf_len);
-                println!(
-                    "timestamps_dest: {:?} data_dest: {:?}",
-                    timestamps_dest.len(),
-                    data_dest.len()
-                );
                 let mut timestamps_dest = <[Timestamp]>::mut_from_bytes(timestamps_dest)
                     .expect("Failed to create mutable slice for timestamps");
-                println!(
-                    "timestamps_dest: {:?} data_dest: {:?}",
-                    timestamps_dest.len(),
-                    data_dest.len()
-                );
 
                 let mut to_skip = range_len - len;
                 for slice in range.as_iter() {
                     let timestamps = slice.timestamps();
                     let data = slice.data();
-                    println!("slice.data: {:?}", data.len());
-                    let timestamps_len = dbg!(timestamps.len().saturating_sub(to_skip));
+                    let timestamps_len = timestamps.len().saturating_sub(to_skip);
+                    if timestamps.len() * size != data.len() {
+                        println!(
+                            "timestamps.len() != data.len(); timestamps = {:?} timestamps * size = {:?} data = {:?} timestamps_len = {:?}",
+                            timestamps.len(),
+                            timestamps.len() * size,
+                            data.len(),
+                            timestamps_len
+                        );
+                    }
                     let timestamps = &timestamps[..timestamps_len];
-                    dbg!(data.len());
                     let data = &data[..timestamps_len * size];
                     to_skip = to_skip.saturating_sub(timestamps_len);
                     if timestamps.is_empty() {
@@ -1101,37 +1093,37 @@ async fn handle_packet<A: AsyncWrite + 'static>(
             let settings = db.db_config();
             tx.send_msg(&settings).await?;
         }
-        // Packet::Msg(m) if m.id == SQLQuery::ID => {
-        //     let SQLQuery(query) = m.parse::<SQLQuery>()?;
-        //     let db = db.clone();
-        //     let (tokio_tx, rx) = thingbuf::mpsc::channel::<Vec<u8>>(4);
-        //     let res = stellarator::struc_con::tokio(move |_| async move {
-        //         let mut ctx = db.as_session_context()?;
-        //         db.insert_views(&mut ctx).await?;
-        //         let df = ctx.sql(&query).await?;
-        //         let mut stream = df.execute_stream().await?;
+        Packet::Msg(m) if m.id == SQLQuery::ID => {
+            let SQLQuery(query) = m.parse::<SQLQuery>()?;
+            let db = db.clone();
+            let (tokio_tx, rx) = thingbuf::mpsc::channel::<Vec<u8>>(4);
+            let res = stellarator::struc_con::tokio(move |_| async move {
+                let mut ctx = db.as_session_context()?;
+                db.insert_views(&mut ctx).await?;
+                let df = ctx.sql(&query).await?;
+                let mut stream = df.execute_stream().await?;
 
-        //         while let Some(batch) = stream.next().await {
-        //             let batch = batch?;
-        //             let mut buf = vec![];
-        //             let mut writer =
-        //                 ::arrow::ipc::writer::StreamWriter::try_new(&mut buf, batch.schema_ref())?;
-        //             writer.write(&batch)?;
-        //             writer.finish()?;
-        //             let _ = tokio_tx.send(buf).await;
-        //         }
-        //         Ok::<_, Error>(())
-        //     })
-        //     .join();
-        //     while let Some(batch) = rx.recv().await {
-        //         tx.send_msg(&ArrowIPC {
-        //             batch: Some(Cow::Owned(batch)),
-        //         })
-        //         .await?;
-        //     }
-        //     res.await??;
-        //     tx.send_msg(&ArrowIPC { batch: None }).await?;
-        // }
+                while let Some(batch) = stream.next().await {
+                    let batch = batch?;
+                    let mut buf = vec![];
+                    let mut writer =
+                        ::arrow::ipc::writer::StreamWriter::try_new(&mut buf, batch.schema_ref())?;
+                    writer.write(&batch)?;
+                    writer.finish()?;
+                    let _ = tokio_tx.send(buf).await;
+                }
+                Ok::<_, Error>(())
+            })
+            .join();
+            while let Some(batch) = rx.recv().await {
+                tx.send_msg(&ArrowIPC {
+                    batch: Some(Cow::Owned(batch)),
+                })
+                .await?;
+            }
+            res.await??;
+            tx.send_msg(&ArrowIPC { batch: None }).await?;
+        }
         Packet::Msg(m) if m.id == SetMsgMetadata::ID => {
             let SetMsgMetadata { id, metadata } = m.parse::<SetMsgMetadata>()?;
             db.with_state_mut(|s| s.set_msg_metadata(id, metadata, &db.path))?;
@@ -1186,11 +1178,11 @@ async fn handle_packet<A: AsyncWrite + 'static>(
             };
             tx.send_msg(&MsgBatch { data }).await?;
         }
-        // Packet::Msg(m) if m.id == SaveArchive::ID => {
-        //     let SaveArchive { path, format } = m.parse()?;
-        //     db.save_archive(&path, format)?;
-        //     tx.send_msg(&ArchiveSaved { path }).await?;
-        // }
+        Packet::Msg(m) if m.id == SaveArchive::ID => {
+            let SaveArchive { path, format } = m.parse()?;
+            db.save_archive(&path, format)?;
+            tx.send_msg(&ArchiveSaved { path }).await?;
+        }
         Packet::Msg(m) if m.id == VTableStream::ID => {
             let VTableStream { id } = m.parse::<VTableStream>()?;
             let vtable = db

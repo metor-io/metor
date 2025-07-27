@@ -152,7 +152,8 @@ pub fn copy_db_to_world(state: &State, world: &mut WorldExec<Compiled>) {
             let Some(component) = state.get_component(pair_id) else {
                 continue;
             };
-            let (_, head) = component.time_series.latest().unwrap();
+            let (head) = component.time_series.latest().unwrap();
+            let head = head.data();
             column.buffer[offset..offset + size].copy_from_slice(head);
         }
     }

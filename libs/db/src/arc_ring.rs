@@ -2,43 +2,10 @@ use std::{
     marker::PhantomData,
     mem::ManuallyDrop,
     ops::Deref,
-    sync::{
-        Arc,
-        atomic::{AtomicPtr, AtomicUsize, Ordering},
-    },
+    sync::{Arc, atomic::Ordering},
 };
 
 use crate::disruptor::ArcAtomic;
-
-#[derive(Clone)]
-pub struct AtomicRing<T> {
-    head: Arc<AtomicUsize>,
-    buf: Box<[ArcAtomic<T>]>,
-}
-
-impl<T> AtomicRing<T> {
-    pub fn new(capacity: usize) -> Self {
-        let buf = (0..capacity).map(|_| ArcAtomic::null()).collect();
-        AtomicRing {
-            buf,
-            head: Arc::new(AtomicUsize::new(0)),
-        }
-    }
-
-    pub fn push(&self, value: Arc<T>) {
-        let index = self.head.fetch_add(1, Ordering::Relaxed) % self.buf.len();
-        self.buf[index].store(value, Ordering::Relaxed);
-    }
-
-    pub fn iter(&self) -> impl Iterator<Item = Arc<T>> {
-        let head = self.head.load(Ordering::Acquire) % self.buf.len();
-        let (end, start) = self.buf.split_at(head);
-        start
-            .iter()
-            .chain(end.iter())
-            .filter_map(|arc| arc.load_ref(Ordering::Relaxed))
-    }
-}
 
 pub struct ArcProj<A, T: ?Sized, F = for<'a> fn(&'a A) -> &'a T> {
     arc: Arc<A>,
@@ -50,35 +17,18 @@ impl<A, T: ?Sized, F: Fn(&A) -> &T> std::ops::Deref for ArcProj<A, T, F> {
     type Target = T;
 
     fn deref(&self) -> &Self::Target {
-        (&self.proj)(&*self.arc)
-    }
-}
-
-pub trait ArcProjExt<A> {
-    fn proj<T: ?Sized, F: Fn(&A) -> &T>(self, proj: F) -> ArcProj<A, T, F>;
-    fn proj_fn<T: ?Sized>(self, proj: for<'a> fn(&'a A) -> &'a T) -> ArcProj<A, T>;
-}
-
-impl<A> ArcProjExt<A> for Arc<A> {
-    fn proj<T: ?Sized, F: Fn(&A) -> &T>(self, proj: F) -> ArcProj<A, T, F> {
-        ArcProj {
-            arc: self,
-            phantom: PhantomData,
-            proj,
-        }
-    }
-
-    fn proj_fn<T: ?Sized>(self, proj: for<'a> fn(&'a A) -> &'a T) -> ArcProj<A, T> {
-        ArcProj {
-            arc: self,
-            phantom: PhantomData,
-            proj,
-        }
+        (self.proj)(&*self.arc)
     }
 }
 
 pub struct AtomicStack<T> {
     head: ArcAtomic<AtomicNode<T>>,
+}
+
+impl<T> Default for AtomicStack<T> {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl<T> AtomicStack<T> {

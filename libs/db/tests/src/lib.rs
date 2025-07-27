@@ -183,6 +183,7 @@ mod tests {
 
         sleep(Duration::from_millis(100)).await;
 
+        println!("sending query");
         let sql = "SELECT * FROM cpu_temperature";
         let mut stream = client.stream(&SQLQuery(sql.to_string())).await.unwrap();
         let mut batches = vec![];

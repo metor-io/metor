@@ -53,17 +53,6 @@ impl Exec {
         self.exec.profile()
     }
 
-    pub fn save_archive(&self, path: String, format: String) -> Result<(), Error> {
-        let format = match format.as_str() {
-            "arrow_ipc" | "arrow" => ArchiveFormat::ArrowIpc,
-            "parquet" | "pq" => ArchiveFormat::Parquet,
-            "csv" => ArchiveFormat::Csv,
-            _ => return Err(Error::UnknownCommand(format)),
-        };
-        self.db.save_archive(path, format)?;
-        Ok(())
-    }
-
     pub fn history<'a>(
         &self,
         py: Python<'a>,
