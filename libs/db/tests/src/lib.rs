@@ -1189,7 +1189,8 @@ mod tests {
             let msg = state.get_or_insert_msg_log(TestMsg::ID, &temp_dir).unwrap();
             let msg_metadata = msg.metadata().unwrap();
             assert_eq!(msg_metadata, &set_msg_metadata.metadata);
-            let (_, msg_data) = msg.latest().expect("missing msg");
+            let latest = msg.latest().expect("missing msg");
+            let msg_data = latest.data().unwrap();
             assert_eq!(msg_data, postcard::to_allocvec(&test_msg).unwrap());
         });
     }

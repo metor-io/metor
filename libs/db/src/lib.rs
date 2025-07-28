@@ -18,7 +18,7 @@ use impeller2::{
 };
 use impeller2_stellar::{PacketSink, PacketStream};
 use impeller2_wkt::*;
-use msg_log::MsgLog;
+use msg_log_2::MsgLog;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use smallvec::SmallVec;
 use std::{
@@ -57,9 +57,11 @@ mod arrow;
 //pub mod axum;
 pub mod disruptor;
 mod error;
-mod msg_log;
+//mod msg_log;
+pub mod msg_log_2;
 //pub(crate) mod time_series;
 pub mod time_series_2;
+pub use msg_log_2 as msg_log;
 pub use time_series_2 as time_series;
 
 mod vtable_stream;
@@ -191,12 +193,12 @@ impl DB {
                     .and_then(|p| p.parse().ok())
                     .ok_or(Error::InvalidMsgId)?;
                 let msg_log = MsgLog::open(path)?;
-                if let Some(first_timestamp) = msg_log.timestamps().first() {
+                if let Some(first_timestamp) = msg_log.first_timestamp() {
                     start_timestamp = start_timestamp.min(first_timestamp.0);
                 }
 
-                if let Some((timestamp, _)) = msg_log.latest() {
-                    last_updated = timestamp.0.max(last_updated);
+                if let Some(msg_ref) = msg_log.latest() {
+                    last_updated = msg_ref.timestamp().0.max(last_updated);
                 };
                 msg_logs.insert(msg_id.to_le_bytes(), msg_log);
             }
@@ -1170,11 +1172,27 @@ async fn handle_packet<A: AsyncWrite + 'static>(
                     .ok_or(Error::MsgNotFound(msg_id))
                     .cloned()
             })?;
-            let iter = msg_log.get_range(range).map(|(t, b)| (t, b.to_vec()));
-            let data = if let Some(limit) = limit {
-                iter.take(limit).collect()
+            let slice = msg_log.get_range(range);
+            let data = if let Some(slice) = slice {
+                let mut collected = Vec::new();
+                for node_slice in slice.as_iter() {
+                    for (timestamp, msg) in node_slice.msgs() {
+                        collected.push((timestamp, msg.to_vec()));
+                        if let Some(limit) = limit {
+                            if collected.len() >= limit {
+                                break;
+                            }
+                        }
+                    }
+                    if let Some(limit) = limit {
+                        if collected.len() >= limit {
+                            break;
+                        }
+                    }
+                }
+                collected
             } else {
-                iter.collect()
+                Vec::new()
             };
             tx.send_msg(&MsgBatch { data }).await?;
         }
@@ -1246,11 +1264,14 @@ pub async fn handle_msg_stream<A: AsyncWrite>(
     let mut pkt = LenPacket::msg(msg_id, 64).with_request_id(req_id);
     loop {
         msg_log.wait().await;
-        let Some((_timestamp, msg)) = msg_log.latest() else {
+        let Some(msg_ref) = msg_log.latest() else {
             continue;
         };
         let tx = tx.lock().await;
         pkt.clear();
+        let Some(msg) = msg_ref.data() else {
+            continue;
+        };
         pkt.extend_from_slice(msg);
         rent!(tx.send(pkt).await, pkt)?;
     }
@@ -1271,9 +1292,13 @@ pub async fn handle_fixed_rate_msg_stream<A: AsyncWrite>(
         }
         let start = Instant::now();
         let current_timestamp = stream_state.current_timestamp();
-        let Some((msg_timestamp, msg)) = msg_log.get_nearest(current_timestamp) else {
+        let Some(msg_ref) = msg_log.get_nearest(current_timestamp) else {
             continue;
         };
+        let Some(msg) = msg_ref.data() else {
+            continue;
+        };
+        let msg_timestamp = msg_ref.timestamp();
 
         if Some(msg_timestamp) == last_sent_timestamp {
             stream_state

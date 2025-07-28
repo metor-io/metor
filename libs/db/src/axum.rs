@@ -11,7 +11,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use zerocopy::{Immutable, TryFromBytes};
 
-use crate::msg_log::MsgLog;
+use crate::msg_log_2::MsgLog;
 use crate::{Component, DB, Error};
 
 pub async fn serve(addr: SocketAddr, db: Arc<DB>) -> miette::Result<()> {
@@ -112,7 +112,8 @@ pub fn msg_stream(
     futures_lite::stream::unfold((msg_log, metadata), |(msg_log, metadata)| async move {
         let waiter = msg_log.waiter();
         let _ = waiter.wait().await;
-        let (_, buf) = msg_log.latest()?;
+        let msg_ref = msg_log.latest()?;
+        let buf = msg_ref.data()?;
         let json = match postcard_dyn::from_slice_dyn(&metadata.schema, buf) {
             Ok(v) => v,
 
