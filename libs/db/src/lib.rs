@@ -54,7 +54,6 @@ use crate::disruptor::Disruptor;
 pub mod append_log;
 mod arc_ring;
 mod arrow;
-//pub mod axum;
 pub mod disruptor;
 mod error;
 //mod msg_log;
@@ -720,8 +719,8 @@ async fn handle_conn_inner<A: AsyncRead + AsyncWrite + 'static>(
     mut rx: PacketStream<OwnedReader<A>>,
     db: Arc<DB>,
 ) -> Result<(), Error> {
-    let mut buf = vec![0u8; 8 * 1024 * 1024];
-    let mut resp_pkt = LenPacket::new(PacketTy::Msg, [0, 0], 8 * 1024 * 1024);
+    let mut buf = vec![0u8; 256 * 1024 * 1024];
+    let mut resp_pkt = LenPacket::new(PacketTy::Msg, [0, 0], 256 * 1024 * 1024);
     loop {
         let pkt = rx.next(buf).await?;
         let req_id = pkt.req_id();
@@ -946,15 +945,6 @@ async fn handle_packet<A: AsyncWrite + 'static>(
                     let timestamps = slice.timestamps();
                     let data = slice.data();
                     let timestamps_len = timestamps.len().saturating_sub(to_skip);
-                    if timestamps.len() * size != data.len() {
-                        println!(
-                            "timestamps.len() != data.len(); timestamps = {:?} timestamps * size = {:?} data = {:?} timestamps_len = {:?}",
-                            timestamps.len(),
-                            timestamps.len() * size,
-                            data.len(),
-                            timestamps_len
-                        );
-                    }
                     let timestamps = &timestamps[..timestamps_len];
                     let data = &data[..timestamps_len * size];
                     to_skip = to_skip.saturating_sub(timestamps_len);
@@ -1564,9 +1554,11 @@ async fn handle_fixed_stream<A: AsyncWrite>(
             let stream = stream.lock().await;
             let id: PacketId = state.stream_id.to_le_bytes()[..2].try_into().unwrap();
             table = LenPacket::table(id, 2048 - 16);
-            let vtable = DBVisitor.vtable(&components)?;
-            let msg = VTableMsg { id, vtable };
-            stream.send(msg.with_request_id(req_id)).await.0?;
+            for (i, vtable) in DBVisitor.vtable(&components)?.into_iter().enumerate() {
+                let id = (u16::from_le_bytes(id) + i as u16).to_le_bytes();
+                let msg = VTableMsg { id, vtable };
+                stream.send(msg.with_request_id(req_id)).await.0?;
+            }
             current_gen = vtable_gen;
         }
         table.clear();
@@ -1596,7 +1588,8 @@ async fn handle_fixed_stream<A: AsyncWrite>(
 struct DBVisitor;
 
 impl DBVisitor {
-    fn vtable(&self, components: &HashMap<ComponentId, Component>) -> Result<VTable, Error> {
+    fn vtable(&self, components: &HashMap<ComponentId, Component>) -> Result<Vec<VTable>, Error> {
+        let mut vtables = vec![];
         let mut fields = vec![];
         let mut offset = 0;
         self.visit(components, |entity| {
@@ -1612,7 +1605,8 @@ impl DBVisitor {
             }
             Ok(())
         })?;
-        Ok(vtable(fields))
+        vtables.push(vtable(fields));
+        Ok(vtables)
     }
 
     fn populate_table(
@@ -1633,7 +1627,8 @@ impl DBVisitor {
             table.pad_for_type(entity.schema.prim_type);
             table.extend_from_slice(nearest.data());
             Ok(())
-        })
+        })?;
+        Ok(())
     }
 
     fn visit(

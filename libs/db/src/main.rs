@@ -33,9 +33,6 @@ struct RunArgs {
     path: Option<PathBuf>,
     #[clap(long, help = "Path to the configuration file")]
     pub config: Option<PathBuf>,
-    #[cfg(feature = "axum")]
-    #[clap(long, help = "Address to bind the HTTP server to")]
-    http_addr: Option<SocketAddr>,
     #[clap(long, hide = true)]
     reset: bool,
 }
@@ -59,7 +56,6 @@ async fn main() -> miette::Result<()> {
     match args.command {
         Commands::Run(RunArgs {
             addr,
-            http_addr,
             path,
             config,
             reset,
@@ -77,13 +73,7 @@ async fn main() -> miette::Result<()> {
             }
             info!(?path, "starting db");
             let server = Server::new(path, addr).into_diagnostic()?;
-            let axum_db = server.db.clone();
             let db = stellarator::spawn(server.run());
-            // if let Some(http_addr) = http_addr {
-            //     stellarator::struc_con::tokio(move |_| async move {
-            //         elodin_db::axum::serve(http_addr, axum_db).await.unwrap()
-            //     });
-            // }
             if let Some(lua_config) = config {
                 let args = impeller2_cli::Args {
                     path: Some(lua_config),

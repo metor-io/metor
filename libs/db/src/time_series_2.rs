@@ -254,7 +254,10 @@ impl TimeSeries {
         match head.data.write(buf) {
             Ok(_) => {}
             Err(Error::MapOverflow) => return Ok(false),
-            Err(err) => return Err(err),
+            Err(err) => {
+                println!("{err:?}");
+                return Err(err);
+            }
         };
         head.index.write(&timestamp.to_le_bytes())?;
         Ok(true)

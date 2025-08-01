@@ -247,20 +247,17 @@ impl MsgLog {
             None
         };
 
-        // Scan directory for existing msg log nodes
-        if path.exists() {
-            let entries = std::fs::read_dir(path)?;
-            for entry in entries {
-                let entry = entry?;
-                let node_path = entry.path();
-                if node_path.is_dir() && node_path.file_name().unwrap_or_default() != "metadata" {
-                    match MsgLogNode::open(&node_path) {
-                        Ok(node) => {
-                            list.push(node);
-                        }
-                        Err(e) => {
-                            warn!(?node_path, ?e, "failed to open msg log node");
-                        }
+        let entries = std::fs::read_dir(path)?;
+        for entry in entries {
+            let entry = entry?;
+            let node_path = entry.path();
+            if node_path.is_dir() && node_path.file_name().unwrap_or_default() != "metadata" {
+                match MsgLogNode::open(&node_path) {
+                    Ok(node) => {
+                        list.push(node);
+                    }
+                    Err(e) => {
+                        warn!(?node_path, ?e, "failed to open msg log node");
                     }
                 }
             }
@@ -278,21 +275,21 @@ impl MsgLog {
     }
 
     pub fn push(&self, timestamp: Timestamp, msg: &[u8]) -> Result<(), Error> {
-        // Write to WAL instead of directly to append log
-        let msg_len = msg.len() as u32;
-        let total_size = size_of::<Timestamp>() + size_of::<u32>() + msg.len();
+        let grant_size = size_of::<Timestamp>() + size_of::<u32>() + msg.len();
 
-        let Ok(mut grant) = self.wal.try_grant(total_size) else {
+        let Ok(mut grant) = self.wal.try_grant(grant_size) else {
             // WAL is full, could handle this differently (wait, error, etc.)
             return Err(Error::MapOverflow);
         };
 
         let mut offset = 0;
+
         // Write timestamp
         grant[offset..offset + size_of::<Timestamp>()].copy_from_slice(timestamp.as_bytes());
         offset += size_of::<Timestamp>();
 
         // Write message length
+        let msg_len = msg.len() as u32;
         grant[offset..offset + size_of::<u32>()].copy_from_slice(&msg_len.to_le_bytes());
         offset += size_of::<u32>();
 
@@ -410,6 +407,7 @@ impl MsgLog {
 
     pub fn set_metadata(&mut self, metadata: MsgMetadata) -> Result<(), Error> {
         let metadata = self.metadata.insert(metadata);
+        std::fs::create_dir_all(&self.path)?;
         let metadata_path = self.path.join("metadata");
         metadata.write(&metadata_path)?;
         Ok(())
