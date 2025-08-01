@@ -1,7 +1,6 @@
-use convert_case::Casing;
 use std::{
     borrow::Cow,
-    collections::{BTreeSet, HashMap},
+    collections::{BTreeMap, BTreeSet, HashMap},
     str::FromStr,
     sync::Arc,
 };
@@ -351,7 +350,7 @@ pub struct ComponentPart {
     pub name: String,
     pub id: ComponentId,
     pub component: Option<Arc<Component>>,
-    pub children: HashMap<String, ComponentPart>,
+    pub children: BTreeMap<String, ComponentPart>,
 }
 
 #[derive(Clone, Debug)]
@@ -397,7 +396,7 @@ fn default_element_names(shape: &[u64]) -> Vec<String> {
 }
 
 pub struct Context {
-    pub component_parts: HashMap<String, ComponentPart>,
+    pub component_parts: BTreeMap<String, ComponentPart>,
     pub earliest_timestamp: Timestamp,
     pub last_timestamp: Timestamp,
 }
@@ -405,7 +404,7 @@ pub struct Context {
 impl Default for Context {
     fn default() -> Self {
         Context {
-            component_parts: HashMap::new(),
+            component_parts: BTreeMap::new(),
             earliest_timestamp: Timestamp(i64::MIN),
             last_timestamp: Timestamp(i64::MAX),
         }
@@ -418,7 +417,7 @@ impl Context {
         earliest_timestamp: Timestamp,
         last_timestamp: Timestamp,
     ) -> Self {
-        let mut component_parts = HashMap::new();
+        let mut component_parts = BTreeMap::new();
         for component in components.into_iter() {
             let path = ComponentPath::from_name(&component.name);
             let nodes = component.name.split('.');
@@ -429,23 +428,24 @@ impl Context {
                 .zip(nodes)
                 .take(path.path.len().saturating_sub(1))
             {
-                let part = component_parts
-                    .entry(node.to_case(convert_case::Case::Snake))
-                    .or_insert_with(|| ComponentPart {
-                        id: part.id,
-                        name: part.name.to_string(),
-                        children: HashMap::new(),
-                        component: None,
-                    });
+                let part =
+                    component_parts
+                        .entry(node.to_string())
+                        .or_insert_with(|| ComponentPart {
+                            id: part.id,
+                            name: part.name.to_string(),
+                            children: BTreeMap::new(),
+                            component: None,
+                        });
                 component_parts = &mut part.children;
             }
             let nodes = component.name.split('.');
             component_parts.insert(
-                nodes.last().unwrap().to_case(convert_case::Case::Snake),
+                nodes.last().unwrap().to_string(),
                 ComponentPart {
                     id: component.id,
                     name: component.name.clone(),
-                    children: HashMap::new(),
+                    children: BTreeMap::new(),
                     component: Some(component),
                 },
             );
@@ -462,7 +462,7 @@ impl Context {
     }
 
     pub fn new(
-        component_parts: HashMap<String, ComponentPart>,
+        component_parts: BTreeMap<String, ComponentPart>,
         earliest_timestamp: Timestamp,
         last_timestamp: Timestamp,
     ) -> Self {

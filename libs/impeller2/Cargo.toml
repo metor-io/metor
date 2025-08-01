@@ -17,7 +17,7 @@ nox = ["dep:nox"]
 
 [dependencies]
 # ser-des
-zerocopy.version = "0.8.2"
+zerocopy.version = "=0.8.14"
 zerocopy.features = ["derive"]
 serde.version = "1.0"
 serde.default-features = false

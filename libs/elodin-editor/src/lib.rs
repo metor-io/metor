@@ -1,6 +1,11 @@
 #![recursion_limit = "256"]
 
-use std::{collections::HashMap, ops::Range, sync::Arc, time::Duration};
+use std::{
+    collections::{BTreeMap, HashMap},
+    ops::Range,
+    sync::Arc,
+    time::Duration,
+};
 
 use crate::plugins::editor_cam_touch;
 use bevy::{
@@ -983,7 +988,7 @@ pub struct EqlContext(pub eql::Context);
 impl Default for EqlContext {
     fn default() -> Self {
         Self(eql::Context::new(
-            HashMap::new(),
+            BTreeMap::new(),
             Timestamp(i64::MIN),
             Timestamp(i64::MAX),
         ))

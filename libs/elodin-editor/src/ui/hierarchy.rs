@@ -7,7 +7,7 @@ use bevy::prelude::Res;
 use bevy_egui::egui;
 use fuzzy_matcher::{FuzzyMatcher, skim::SkimMatcherV2};
 use impeller2_bevy::EntityMap;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
 use crate::ui::{EntityFilter, EntityPair, SelectedObject, colors::get_scheme};
 
@@ -89,19 +89,22 @@ pub fn entity_list(
         .show(ui, |ui| {
             ui.vertical(|ui| {
                 let matcher = SkimMatcherV2::default().smart_case().use_cache(true);
-                let (parts, trailing) =
-                    filter_component_parts(&eql_ctx.0.component_parts, &matcher, entity_filter);
+                let parts = filter_component_parts_recurisve(
+                    &eql_ctx.0.component_parts,
+                    &matcher,
+                    entity_filter,
+                );
 
-                for (_, _, part) in parts {
+                let default_open = parts.len() <= 5;
+                for part in parts.values() {
                     component_part(
                         ui,
                         tree_rect,
                         &icons,
                         part,
                         entity_map,
-                        trailing,
-                        &matcher,
                         selected_object,
+                        default_open,
                     );
                 }
 
@@ -112,33 +115,32 @@ pub fn entity_list(
         .response
 }
 
-#[allow(clippy::too_many_arguments)]
 fn component_part(
     ui: &mut egui::Ui,
     tree_rect: egui::Rect,
     icons: &Hierarchy,
     part: &eql::ComponentPart,
     entity_map: &EntityMap,
-    filter: &str,
-    matcher: &SkimMatcherV2,
     selected_object: &mut SelectedObject,
+    default_open: bool,
 ) {
     let selected = selected_object.is_entity_selected(part.id);
-    let (filtered_entities, trailing) = filter_component_parts(&part.children, matcher, filter);
     let list_item = Branch::new(part.name.clone(), icons.entity, icons.chevron, tree_rect)
+        .id(part.id.0 + part.children.len() as u64)
         .selected(selected)
-        .leaf(filtered_entities.is_empty())
+        .leaf(part.children.is_empty())
+        .default_open(default_open)
         .show(ui, |ui| {
-            for (_, _, part) in filtered_entities {
+            let default_children = part.children.len() <= 5;
+            for part in part.children.values() {
                 component_part(
                     ui,
                     tree_rect,
                     icons,
                     part,
                     entity_map,
-                    trailing,
-                    matcher,
                     selected_object,
+                    default_children || part.children.len() == 1,
                 );
             }
         });
@@ -165,23 +167,28 @@ fn component_part(
     }
 }
 
-fn filter_component_parts<'a, 'b>(
-    children: &'b HashMap<String, eql::ComponentPart>,
+fn filter_component_parts_recurisve<'a, 'b>(
+    children: &'b BTreeMap<String, eql::ComponentPart>,
     matcher: &SkimMatcherV2,
-    str: &'a str,
-) -> (Vec<(i64, String, &'b eql::ComponentPart)>, &'a str) {
-    let (start, trailing) = str.split_once(".").unwrap_or((str, ""));
-    let mut children: Vec<_> = children
+    query: &'a str,
+) -> BTreeMap<String, eql::ComponentPart> {
+    if query.is_empty() {
+        return children.clone();
+    }
+    children
         .iter()
         .filter_map(|(name, child)| {
-            if start.is_empty() {
-                Some((0, name.to_string(), child))
+            let part = eql::ComponentPart {
+                name: child.name.clone(),
+                id: child.id,
+                component: child.component.clone(),
+                children: filter_component_parts_recurisve(&child.children, matcher, query),
+            };
+            if matcher.fuzzy_match(&child.name, query).is_none() && part.children.is_empty() {
+                None
             } else {
-                let score = matcher.fuzzy_match(name, start)?;
-                Some((score, name.to_string(), child))
+                Some((name.to_string(), part))
             }
         })
-        .collect();
-    children.sort_by_key(|(score, _, child)| (*score, child.id.0));
-    (children, trailing)
+        .collect()
 }

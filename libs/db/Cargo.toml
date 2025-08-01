@@ -19,8 +19,7 @@ license = false
 eula = false
 
 [features]
-default = ["axum", "parquet"]
-axum = ["dep:axum", "dep:axum-streams", "dep:serde_json", "dep:tokio"]
+default = ["parquet"]
 parquet = ["dep:parquet"]
 
 [dependencies]
@@ -72,28 +71,16 @@ directories = "5.0.1"
 
 
 # arrow
-arrow.version = "55.0"
+arrow.version = "54"
 arrow.features = ["canonical_extension_types", "csv"]
-arrow-schema.version = "55"
+arrow-schema.version = "54"
 arrow-schema.features = ["canonical_extension_types"]
-datafusion.version = "47"
+datafusion.version = "46"
+datafusion.default-features = false
 convert_case = "0.6.0"
 thingbuf.version = "0.1"
-parquet.version = "55"
+parquet.version = "54"
 parquet.optional = true
-
-
-# axum
-axum.version = "0.8.1"
-axum.features = ["ws", "macros"]
-axum.optional = true
-axum-streams.version = "0.20"
-axum-streams.features = ["json"]
-axum-streams.optional = true
-serde_json.version = "1"
-serde_json.optional = true
-tokio.version = "1"
-tokio.optional = true
 
 # codegen
 postcard-c-codegen.path = "../postcard-c/codegen"

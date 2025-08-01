@@ -1,4 +1,5 @@
 use std::f32;
+use std::hash::{Hash, Hasher};
 
 use crate::EqlContext;
 use crate::ui::SelectedObject;
@@ -381,6 +382,8 @@ pub struct Branch {
     pub tree_rect: egui::Rect,
     pub extra_icon: Option<egui::TextureId>,
     pub selected: bool,
+    pub id: u64,
+    pub default_open: bool,
 }
 
 impl Branch {
@@ -390,6 +393,9 @@ impl Branch {
         chevron: egui::TextureId,
         tree_rect: egui::Rect,
     ) -> Self {
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        label.hash(&mut hasher);
+        let id = hasher.finish();
         Self {
             label,
             icon,
@@ -398,7 +404,19 @@ impl Branch {
             tree_rect,
             extra_icon: None,
             selected: false,
+            id,
+            default_open: true,
         }
+    }
+
+    pub fn id(mut self, id: u64) -> Self {
+        self.id = id;
+        self
+    }
+
+    pub fn default_open(mut self, default_open: bool) -> Self {
+        self.default_open = default_open;
+        self
     }
 
     pub fn leaf(mut self, leaf: bool) -> Self {
@@ -425,10 +443,12 @@ impl Branch {
             tree_rect,
             selected,
             extra_icon,
+            id,
+            default_open,
         } = self;
 
-        let id = ui.make_persistent_id((&label, &selected));
-        let mut state = CollapsingState::load_with_default_open(ui.ctx(), id, true);
+        let id = ui.make_persistent_id(&id);
+        let mut state = CollapsingState::load_with_default_open(ui.ctx(), id, default_open);
         let chevron = SizedTexture::new(chevron, [18., 18.]);
         let icon = SizedTexture::new(icon, [12., 12.]);
         let extra_icon = extra_icon.map(|icon| SizedTexture::new(icon, [12., 12.]));

@@ -366,7 +366,9 @@ impl<Ops: Buf<Op>, Data: Buf<u8>, Fields: Buf<Field>> VTable<Ops, Data, Fields> 
         table: Option<&'a [u8]>,
     ) -> impl Iterator<Item = Result<RealizedField<'a>, Error>> + 'a {
         self.fields.iter().map(move |field| {
-            let mut realized_op = self.realize(field.arg, table)?;
+            let mut realized_op = self
+                .realize(field.arg, table)
+                .inspect_err(|err| println!("realize failed {err:?}"))?;
             let mut timestamp: Option<RealizedTimestamp> = None;
             let mut schema: Option<RealizedSchema<'_>> = None;
             loop {
@@ -378,12 +380,23 @@ impl<Ops: Buf<Op>, Data: Buf<u8>, Fields: Buf<Field>> VTable<Ops, Data, Fields> 
                         // NOTE(sphw): bogan version of zerocopy::transmute_ref
                         // In the future this will need to also support 32 bit systems
                         // remove when https://github.com/google/zerocopy/pull/2428 is merged and released
-                        let shape: &[usize] = <[usize]>::ref_from_bytes(schema.dim.as_bytes())?;
+                        let shape: &[usize] = <[usize]>::ref_from_bytes(schema.dim.as_bytes())
+                            .inspect_err(|err| {
+                                println!("bad shape {err:?}");
+                            })?;
                         let view = if let Some(table) = table {
                             let offset = field.offset.to_index();
                             let data = table
                                 .get(offset..offset + field.len as usize)
-                                .ok_or(Error::BufferUnderflow)?;
+                                .ok_or(Error::BufferUnderflow)
+                                .inspect_err(|_| {
+                                    print!(
+                                        "table.len = {:?} offset = {:?} field.len = {:?}",
+                                        table.len(),
+                                        offset,
+                                        field.len
+                                    )
+                                })?;
                             Some(ComponentView::try_from_bytes_shape(data, shape, schema.ty)?)
                         } else {
                             None

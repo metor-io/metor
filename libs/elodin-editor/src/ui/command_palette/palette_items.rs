@@ -297,12 +297,13 @@ pub fn create_graph(tile_id: Option<TileId>) -> PaletteItem {
 }
 
 fn graph_parts(
-    parts: &HashMap<String, eql::ComponentPart>,
+    parts: &BTreeMap<String, eql::ComponentPart>,
     tile_id: Option<TileId>,
 ) -> Vec<PaletteItem> {
     parts
         .iter()
         .map(|(name, part)| {
+            let name = name.clone();
             let part = part.clone();
             PaletteItem::new(
                 name.clone(),
@@ -339,7 +340,10 @@ fn graph_parts(
                         tile_state.create_graph_tile(tile_id, bundle);
                         PaletteEvent::Exit
                     } else {
-                        PalettePage::new(graph_parts(&part.children, tile_id)).into()
+                        PaletteEvent::NextPage {
+                            prev_page_label: Some(name.clone()),
+                            next_page: PalettePage::new(graph_parts(&part.children, tile_id)),
+                        }
                     }
                 },
             )
@@ -360,7 +364,7 @@ pub fn create_monitor(tile_id: Option<TileId>) -> PaletteItem {
 }
 
 fn monitor_parts(
-    parts: &HashMap<String, eql::ComponentPart>,
+    parts: &BTreeMap<String, eql::ComponentPart>,
     tile_id: Option<TileId>,
 ) -> Vec<PaletteItem> {
     parts

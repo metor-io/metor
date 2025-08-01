@@ -49,7 +49,7 @@ mod tcp;
 #[cfg(feature = "tcp")]
 pub use tcp::*;
 
-pub const QUEUE_LEN: usize = 64 * 1024 * 1024;
+pub const QUEUE_LEN: usize = 512 * 1024 * 1024;
 
 #[derive(Resource)]
 pub struct PacketRx(AsyncArcQueueRx);
@@ -669,11 +669,11 @@ pub fn new_connection_packets(stream_id: StreamId) -> impl Iterator<Item = LenPa
             id: stream_id,
         }
         .into_len_packet(),
-        Stream {
-            behavior: StreamBehavior::RealTime,
-            id: fastrand::u64(..),
-        }
-        .into_len_packet(),
+        // Stream {
+        //     behavior: StreamBehavior::RealTime,
+        //     id: fastrand::u64(..),
+        // }
+        // .into_len_packet(),
         GetEarliestTimestamp.into_len_packet(),
         DumpMetadata.into_len_packet(),
         GetDbSettings.into_len_packet(),

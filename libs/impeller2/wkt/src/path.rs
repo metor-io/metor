@@ -69,12 +69,8 @@ impl ComponentPath {
 
 impl Display for ComponentPath {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        for (i, part) in self.path.iter().enumerate() {
-            if i > 0 {
-                write!(f, ".{}", part.name)?;
-            } else {
-                write!(f, "{}", part.name)?;
-            }
+        if let Some(last) = self.path.last() {
+            write!(f, "{}", last.name)?;
         }
         Ok(())
     }
@@ -95,5 +91,11 @@ mod tests {
                 ComponentPart::new("a.b.c"),
             ]
         );
+    }
+
+    #[test]
+    fn test_component_path_display() {
+        let path = ComponentPath::from_name("a.b.c");
+        assert_eq!(path.to_string(), "a.b.c");
     }
 }

@@ -9,12 +9,16 @@ use bevy::{
 };
 use bevy_render::render_resource::{Buffer, BufferDescriptor, BufferSlice, BufferUsages};
 use bevy_render::renderer::{RenderDevice, RenderQueue};
-use impeller2::types::{ComponentId, ComponentView, OwnedPacket, PrimType, Timestamp};
+use impeller2::schema::Schema;
+use impeller2::types::{
+    ComponentId, ComponentView, IntoLenPacket, LenPacket, OwnedPacket, PrimType, Timestamp,
+};
+use impeller2::vtable::builder::raw_field;
 use impeller2_bevy::{
     CommandsExt, ComponentSchemaRegistry, ComponentValueMap, CurrentStreamId, EntityMap,
-    PacketGrantR, PacketHandlerInput, PacketHandlers,
+    PacketGrantR, PacketHandlerInput, PacketHandlers, PacketTx,
 };
-use impeller2_wkt::{CurrentTimestamp, EarliestTimestamp, GetTimeSeries};
+use impeller2_wkt::{CurrentTimestamp, EarliestTimestamp, GetTimeSeries, VTableMsg, VTableStream};
 use itertools::{Itertools, MinMaxResult};
 use nodit::NoditMap;
 use nodit::interval::ii;
@@ -41,6 +45,7 @@ pub struct PlotDataComponent {
     pub element_names: Vec<String>,
     pub lines: BTreeMap<usize, Handle<Line>>,
     request_states: HashMap<Timestamp, RequestState>,
+    pub real_time_started: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -59,6 +64,7 @@ impl PlotDataComponent {
             element_names,
             lines: BTreeMap::new(),
             request_states: HashMap::new(),
+            real_time_started: false,
         }
     }
 
@@ -396,6 +402,8 @@ pub fn queue_timestamp_read(
     mut commands: Commands,
     mut graph_data: ResMut<CollectedGraphData>,
     mut lines: ResMut<Assets<Line>>,
+    schemas: Res<ComponentSchemaRegistry>,
+    packet_tx: ResMut<PacketTx>,
 ) {
     if selected_range.0.end.0 == i64::MIN || selected_range.0.start.0 == i64::MAX {
         return;
@@ -405,6 +413,16 @@ pub fn queue_timestamp_read(
             .lines
             .first_key_value()
             .and_then(|(_k, v)| lines.get_mut(v));
+
+        if !component.real_time_started {
+            if let Some(schema) = schemas.get(&component_id) {
+                for msg in real_time_vtable(component_id, schema) {
+                    let _ = packet_tx.0.try_send(Some(msg));
+                }
+                println!("Real-time data started for component {}", component_id);
+                component.real_time_started = true;
+            }
+        }
 
         if let Some(last_queried) = line.as_ref().and_then(|l| l.last_queried.as_ref()) {
             if last_queried.elapsed() <= Duration::from_millis(250) {
@@ -510,6 +528,26 @@ fn next_range(
     current_range
 }
 
+fn real_time_vtable(component_id: ComponentId, s: &Schema<Vec<u64>>) -> [LenPacket; 2] {
+    use impeller2::vtable::builder::{component, raw_field, raw_table, schema, timestamp, vtable};
+    let time = raw_table(0, size_of::<Timestamp>() as u16);
+    let field = raw_field(
+        8,
+        s.size() as u16,
+        timestamp(
+            time,
+            schema(s.prim_type(), s.dim(), component(component_id)),
+        ),
+    );
+    let vtable = vtable([field]);
+    let id = fastrand::u16(..).to_le_bytes();
+
+    [
+        VTableMsg { id, vtable }.into_len_packet(),
+        VTableStream { id }.into_len_packet(),
+    ]
+}
+
 #[derive(Asset, TypePath, Default)]
 pub struct Line {
     pub label: String,
@@ -569,12 +607,24 @@ impl XYLine {
     }
 
     pub fn plot_bounds(&self) -> PlotBounds {
-        let (min_x, max_x) = match self.x_values.iter().flat_map(|c| c.cpu()).minmax() {
+        let (min_x, max_x) = match self
+            .x_values
+            .iter()
+            .flat_map(|c| c.cpu())
+            .filter(|x| x.is_finite())
+            .minmax()
+        {
             MinMaxResult::NoElements => (0.0, 1.0),
             MinMaxResult::OneElement(x) => (*x - 1.0, *x + 1.0),
             MinMaxResult::MinMax(min, max) => (*min, *max),
         };
-        let (min_y, max_y) = match self.y_values.iter().flat_map(|c| c.cpu()).minmax() {
+        let (min_y, max_y) = match self
+            .y_values
+            .iter()
+            .flat_map(|c| c.cpu())
+            .filter(|y| y.is_finite())
+            .minmax()
+        {
             MinMaxResult::NoElements => (0.0, 1.0),
             MinMaxResult::OneElement(y) => (*y - 1.0, *y + 1.0),
             MinMaxResult::MinMax(min, max) => (*min, *max),
