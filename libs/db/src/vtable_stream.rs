@@ -11,7 +11,7 @@ use std::{
 use impeller2::{
     types::{
         ComponentView, IntoLenPacket, LenPacket, Msg, PACKET_HEADER_LEN, PacketId, PrimType,
-        RequestId,
+        RequestId, Timestamp,
     },
     vtable::{Op, RealizedComponent, RealizedOp, VTable},
 };
@@ -23,8 +23,9 @@ use stellarator::{
     sync::{Mutex, WaitCell, WaitQueue},
 };
 use tracing::{trace, warn};
+use zerocopy::FromBytes;
 
-use crate::{Component, DB, Error, FixedRateStreamState};
+use crate::{Component, DB, Error, FixedRateStreamState, disruptor::Reader};
 
 pub async fn handle_vtable_stream<A: AsyncWrite + 'static>(
     id: [u8; 2],
@@ -58,7 +59,13 @@ pub async fn handle_vtable_stream<A: AsyncWrite + 'static>(
                         .with_state(|s| s.get_component(component_id).cloned())
                         .ok_or(Error::ComponentNotFound(component_id))?
                         .clone();
-                    plan.insert(0, StreamStage::RealTime(RealTimeStage { component }));
+                    plan.insert(
+                        0,
+                        StreamStage::RealTime(RealTimeStage {
+                            reader: component.wal.reader(),
+                            component,
+                        }),
+                    );
                     break 'find;
                 }
                 RealizedOp::Schema(s) => {
@@ -305,11 +312,12 @@ impl FixedRateStage {
 
 struct RealTimeStage {
     component: Component,
+    reader: Reader,
 }
 
 impl RealTimeStage {
     pub async fn next(
-        &self,
+        &mut self,
         shard: &Field,
         timestamp_shard: Option<&Field>,
     ) -> Result<bool, Error> {
@@ -317,15 +325,23 @@ impl RealTimeStage {
             component.id = ?self.component.component_id,
             "real time stage waiting"
         );
-        self.component.time_series.wait().await;
-        let Some(latest) = self.component.time_series.latest() else {
-            return Ok(true);
+        let buf = self.reader.next().await;
+        let msg_size = self.component.schema.size() + size_of::<Timestamp>();
+        let Some(msg) = buf.get(..msg_size) else {
+            return Ok(false);
         };
-        let timestamp = latest.timestamp();
-        let buf = latest.data();
+        let Some(timestamp) = msg.get(..size_of::<Timestamp>()) else {
+            return Err(Error::BadMessage);
+        };
+        let timestamp = Timestamp(i64::from_le_bytes(
+            timestamp.try_into().expect("wrong size"),
+        ));
+        let Some(data) = msg.get(size_of::<Timestamp>()..) else {
+            return Err(Error::BadMessage);
+        };
         shard
             .with_buf(|shard| {
-                shard.copy_from_slice(buf);
+                shard.copy_from_slice(data);
             })
             .await;
         if let Some(timestamp_shard) = timestamp_shard {

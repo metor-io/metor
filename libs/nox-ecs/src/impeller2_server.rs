@@ -92,7 +92,7 @@ pub fn init_db(
                 state.insert_component(pair_id, schema.clone(), &db.path)?;
                 let component = state.get_component(pair_id).unwrap();
                 let buf = &column.buffer[offset..offset + size];
-                component.time_series.push_buf(start_timestamp, buf)?;
+                component.push_buf(start_timestamp, buf)?;
             }
             if let Some(path) = &world.metadata.schematic_path {
                 state
@@ -152,7 +152,7 @@ pub fn copy_db_to_world(state: &State, world: &mut WorldExec<Compiled>) {
             let Some(component) = state.get_component(pair_id) else {
                 continue;
             };
-            let (head) = component.time_series.latest().unwrap();
+            let head = component.time_series.latest().unwrap();
             let head = head.data();
             column.buffer[offset..offset + size].copy_from_slice(head);
         }
@@ -187,7 +187,7 @@ pub fn commit_world_head(
                 continue;
             };
             let buf = &column.buffer[offset..offset + size];
-            component.time_series.push_buf(timestamp, buf)?;
+            component.push_buf(timestamp, buf)?;
         }
     }
     Ok(())
