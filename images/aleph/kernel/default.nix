@@ -22,7 +22,7 @@ buildLinux (args
     # postPatch. This is not very efficient.
     src = applyPatches {
       src = fetchFromGitHub {
-        owner = "elodin-sys";
+        owner = "metor-sys";
         repo = "aleph-orin-baseboard-kernel-5-10";
         rev = "4a1f9e19416ee5b70375e94889fe0398932320e1";
         hash = "sha256-a9v4Wecio+flFLmJHtFusPl0f8h7ojTz35aPHVn+/xM=";

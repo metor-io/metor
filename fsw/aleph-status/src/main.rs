@@ -121,8 +121,8 @@ fn print_hw_info() {
 fn print_os_info() {
     const COLOR: Color = Color::Green;
     print_header("OS Info", COLOR);
-    let elodin_version =
-        std::fs::read_to_string("/etc/elodin-version").unwrap_or("N/A".to_string());
+    let metor_version =
+        std::fs::read_to_string("/etc/metor-version").unwrap_or("N/A".to_string());
     let kernel_version = sysinfo::System::kernel_version();
     let kernel_version = kernel_version.as_deref().unwrap_or("N/A");
     let linux_version = sysinfo::System::os_version();
@@ -143,8 +143,8 @@ fn print_os_info() {
     println!(
         "{} {} {}",
         divider_line(COLOR),
-        COLOR.bold().paint("Elodin Version"),
-        elodin_version
+        COLOR.bold().paint("Metor Version"),
+        metor_version
     );
 }
 

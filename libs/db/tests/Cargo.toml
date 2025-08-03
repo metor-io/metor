@@ -1,10 +1,10 @@
 [package]
-name = "elodin-db-tests"
+name = "metor-db-tests"
 version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-elodin-db = { path = ".." }
+metor-db = { path = ".." }
 stellarator = { path = "../../stellarator" }
 impeller2 = { path = "../../impeller2" }
 impeller2-wkt = { path = "../../impeller2/wkt" }

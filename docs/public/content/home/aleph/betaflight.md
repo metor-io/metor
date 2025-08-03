@@ -16,10 +16,10 @@ icon = ""
 
 ### Betaflight Installation
 
-Download the patched Betaflight firmware [here](https://storage.googleapis.com/elodin-releases/betaflight/4.5/betaflight_STM32H743_ALEPH_FC.elf)
+Download the patched Betaflight firmware [here](https://storage.googleapis.com/metor-releases/betaflight/4.5/betaflight_STM32H743_ALEPH_FC.elf)
 
 {% alert(kind="notice") %}
-the Betaflight patches needed to support Aleph are trivial and [open source](https://github.com/betaflight/betaflight/compare/4.5-maintenance...elodin-sys:betaflight:4.5/aleph).
+the Betaflight patches needed to support Aleph are trivial and [open source](https://github.com/betaflight/betaflight/compare/4.5-maintenance...metor-sys:betaflight:4.5/aleph).
 {% end %}
 
 Flash the Betaflight firmware using the following command:

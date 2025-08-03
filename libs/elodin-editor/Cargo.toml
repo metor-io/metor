@@ -1,7 +1,7 @@
 [package]
-name = "elodin-editor"
+name = "metor-editor"
 license = "MIT OR Apache-2.0"
-description = "Elodin Editor"
+description = "Metor Editor"
 version.workspace = true
 edition = "2024"
 publish = false
@@ -29,7 +29,7 @@ winit.features = ["rwh_05"]
 raw-window-handle = "0.5"
 bevy_infinite_grid.git = "https://github.com/Cyannide/bevy_infinite_grid.git"
 bevy_infinite_grid.branch = "bevy-0.16"
-big_space.git = "https://github.com/elodin-sys/big_space.git"
+big_space.git = "https://github.com/metor-sys/big_space.git"
 big_space.branch = "no_prop_rot_v0.16"
 bevy_editor_cam.git = "https://github.com/tomara-x/bevy_editor_cam.git"
 bevy_editor_cam.branch = "bevy-0.16"
@@ -67,7 +67,7 @@ fuzzy-matcher = "0.3.7"
 roaring = "0.10.4"
 smallvec.version = "1.11.2"
 smallvec.features = ["const_generics", "union"]
-nodit.git = "https://github.com/elodin-sys/nodit.git"
+nodit.git = "https://github.com/metor-sys/nodit.git"
 nodit.rev = "cd284cd0f16d475786dae8629cebda4e14177ee1"
 heapless.version = "0.8"
 arc-swap = "1.7.1"

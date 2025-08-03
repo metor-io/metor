@@ -6,7 +6,7 @@
   ...
 }: let
   craneLib = (crane.mkLib pkgs).overrideToolchain rustToolchain;
-  pname = (craneLib.crateNameFromCargoToml {cargoToml = ../../apps/elodin/Cargo.toml;}).pname;
+  pname = (craneLib.crateNameFromCargoToml {cargoToml = ../../apps/metor/Cargo.toml;}).pname;
   version = (craneLib.crateNameFromCargoToml {cargoToml = ../../Cargo.toml;}).version;
   src = pkgs.nix-gitignore.gitignoreSource [] ../../.;
 

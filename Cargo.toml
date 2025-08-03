@@ -1,10 +1,10 @@
 [workspace]
 resolver = "2"
 members = [
-    "libs/elodin-editor",
+    "libs/metor-editor",
     "libs/nox",
     "libs/nox-frames",
-    "apps/elodin",
+    "apps/metor",
     "libs/roci",
     "libs/roci/macros",
     "libs/roci/adcs",
@@ -44,7 +44,7 @@ exclude = ["fsw/sensor-fw", "fsw/blackbox", "docs/memserve"]
 [workspace.package]
 version = "0.14.2"
 edition = "2024"
-repository = "https://github.com/elodin-sys/elodin"
+repository = "https://github.com/metor-sys/metor"
 
 [profile.wasm-release]
 inherits = "release"

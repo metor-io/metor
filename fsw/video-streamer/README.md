@@ -1,12 +1,12 @@
-# Video Streamer for Elodin
+# Video Streamer for Metor
 
-Video Streamer is a utility that loads video files from disk, re-encodes them to AV1, and sends the resulting Open Bitstream Units (OBUs) to an elodin-db instance as messages.
+Video Streamer is a utility that loads video files from disk, re-encodes them to AV1, and sends the resulting Open Bitstream Units (OBUs) to an metor-db instance as messages.
 
 ## Features
 
 - Loads video files using FFmpeg
 - Re-encodes video to AV1 format
-- Streams OBUs to elodin-db using the impeller2_stellar client
+- Streams OBUs to metor-db using the impeller2_stellar client
 - Configurable message IDs, bitrate, keyframe intervals, and encoding speed
 
 ## Requirements
@@ -45,8 +45,8 @@ video-streamer --input <VIDEO_FILE> --message-id <MESSAGE_ID> [OPTIONS]
 ### Options
 
 - `-i, --input <PATH>`: Path to the input video file (required)
-- `-m, --message-id <ID>`: Message ID to use for the OBUs in elodin-db (required)
-- `-d, --db-address <IP:PORT>`: Elodin DB address (default: 127.0.0.1:8080)
+- `-m, --message-id <ID>`: Message ID to use for the OBUs in metor-db (required)
+- `-d, --db-address <IP:PORT>`: Metor DB address (default: 127.0.0.1:8080)
 - `-b, --bitrate <KBPS>`: Output bitrate in kbps (default: 1000)
 - `-k, --keyframe-interval <FRAMES>`: Keyframe interval in frames (default: 60)
 - `-s, --speed <1-8>`: Speed preset (1 is highest quality, 8 is fastest) (default: 6)
@@ -67,16 +67,16 @@ video-streamer --input video.mp4 --message-id 12345 --db-address 192.168.1.100:9
 
 ## How It Works
 
-1. The application connects to the specified elodin-db instance
+1. The application connects to the specified metor-db instance
 2. It opens the input video file using FFmpeg
 3. The video is decoded and then re-encoded to AV1 format with the specified parameters
-4. Each encoded packet (OBU) is sent to elodin-db as a message with the specified message ID
+4. Each encoded packet (OBU) is sent to metor-db as a message with the specified message ID
 5. Progress is logged during the encoding and streaming process
 
 ## Troubleshooting
 
 - If you encounter "encoder not found" errors, ensure you have either libaom-av1 or libsvtav1 installed
-- For connection issues, verify that elodin-db is running and accessible at the specified address
+- For connection issues, verify that metor-db is running and accessible at the specified address
 - Use the RUST_LOG environment variable to control logging level (e.g., `RUST_LOG=info`)
 
 ## License

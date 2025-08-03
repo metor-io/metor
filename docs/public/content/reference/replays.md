@@ -12,20 +12,20 @@ icon = ""
 order = 5
 +++
 
-Elodin has built-in functionality to save simulation data to a directory. This data can be used to replay the simulation at a later time. This is useful for debugging, testing, and sharing simulations. Replays also enable running simulations in a headless environment, and then replaying them in a graphical environment.
+Metor has built-in functionality to save simulation data to a directory. This data can be used to replay the simulation at a later time. This is useful for debugging, testing, and sharing simulations. Replays also enable running simulations in a headless environment, and then replaying them in a graphical environment.
 
-To replay a simulation using the Elodin editor, run the following command:
+To replay a simulation using the Metor editor, run the following command:
 
 ```bash
-elodin editor <path to replay dir>
+metor editor <path to replay dir>
 ```
 
-You can download an example replay archive from the following url: [replay.tar.gz](https://storage.googleapis.com/elodin-releases/docs/replay.tar.gz).
+You can download an example replay archive from the following url: [replay.tar.gz](https://storage.googleapis.com/metor-releases/docs/replay.tar.gz).
 
 
 ## File Layout
 
-An Elodin replay directory contains:
+An Metor replay directory contains:
 - `metadata.json`
 - `assets.bin`
 - Component data Parquet files
@@ -90,7 +90,7 @@ In this simplified example, there is a single entity with two components: `world
 
 ### body
 
-`body` is a core archetype that's used in most Elodin simulations. It represents the state of a rigid body with six degrees of freedom, and is used by the built-in 6DOF integrators to propagate the simulation forward in time. It also contains most of the necessary information to render the body in a graphical environment. The components of the `Body` archetype are:
+`body` is a core archetype that's used in most Metor simulations. It represents the state of a rigid body with six degrees of freedom, and is used by the built-in 6DOF integrators to propagate the simulation forward in time. It also contains most of the necessary information to render the body in a graphical environment. The components of the `Body` archetype are:
 
 - `world_pos`: A [SpatialTransform] representing the body's position and orientation in the world frame.
 - `world_vel`: A [SpatialMotion] representing the body's linear and angular velocity in the world frame.
@@ -129,13 +129,13 @@ In this simplified example, there is a single entity with two components: `world
 
 ### Panel
 
-`Panel` assets describe the layout and contents of the Elodin GUI declaratively. They are used to configure viewports and graphs.
+`Panel` assets describe the layout and contents of the Metor GUI declaratively. They are used to configure viewports and graphs.
 
 [Archetype]: /reference/python-api#archetypes
-[SpatialTransform]: /reference/python-api#class-elodin-spatialtransform
-[SpatialMotion]: /reference/python-api#class-elodin-spatialmotion
-[SpatialForce]: /reference/python-api#class-elodin-spatialforce
-[SpatialInertia]: /reference/python-api#class-elodin-spatialinertia
+[SpatialTransform]: /reference/python-api#class-metor-spatialtransform
+[SpatialMotion]: /reference/python-api#class-metor-spatialmotion
+[SpatialForce]: /reference/python-api#class-metor-spatialforce
+[SpatialInertia]: /reference/python-api#class-metor-spatialinertia
 
 [Well-Known Assets]: #well-known-assets
 [Mesh]: #mesh

@@ -2,7 +2,7 @@
 mod tests {
 
     use arrow::{array::AsArray, datatypes::Float64Type};
-    use elodin_db::{DB, Error, Server};
+    use metor_db::{DB, Error, Server};
     use impeller2::{
         types::{ComponentId, IntoLenPacket, LenPacket, Msg, PrimType, Timestamp},
         vtable::builder::{component, raw_field, raw_table, schema, timestamp, vtable},
@@ -23,7 +23,7 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
 
-        let temp_dir = std::env::temp_dir().join(format!("elodin_db_test_{}", fastrand::u64(..)));
+        let temp_dir = std::env::temp_dir().join(format!("metor_db_test_{}", fastrand::u64(..)));
         if temp_dir.exists() {
             std::fs::remove_dir_all(&temp_dir).unwrap();
         }
@@ -576,7 +576,7 @@ mod tests {
             panic!("invalid error");
         };
         assert_eq!(
-            elodin_db::Error::ComponentNotFound(non_existent_component_id).to_string(),
+            metor_db::Error::ComponentNotFound(non_existent_component_id).to_string(),
             resp.description
         );
     }
@@ -598,7 +598,7 @@ mod tests {
             panic!("invalid error");
         };
         assert_eq!(
-            elodin_db::Error::ComponentNotFound(non_existent_component_id).to_string(),
+            metor_db::Error::ComponentNotFound(non_existent_component_id).to_string(),
             resp.description
         );
     }
@@ -617,7 +617,7 @@ mod tests {
             panic!("invalid error");
         };
         assert_eq!(
-            elodin_db::Error::MsgNotFound(msg_id).to_string(),
+            metor_db::Error::MsgNotFound(msg_id).to_string(),
             resp.description
         );
     }
@@ -726,7 +726,7 @@ mod tests {
     #[test]
     async fn test_database_restart() {
         let temp_dir =
-            std::env::temp_dir().join(format!("elodin_db_restart_test_{}", fastrand::u64(..)));
+            std::env::temp_dir().join(format!("metor_db_restart_test_{}", fastrand::u64(..)));
         let vtable_id = 1u16.to_le_bytes();
         let test_value = 42.0;
         let component_id = ComponentId::new("restart_test");
@@ -1092,7 +1092,7 @@ mod tests {
             panic!("invalid response");
         };
         assert_eq!(
-            elodin_db::Error::SchemaMismatch.to_string(),
+            metor_db::Error::SchemaMismatch.to_string(),
             err.description
         );
     }
@@ -1100,7 +1100,7 @@ mod tests {
     #[test]
     async fn test_db_reopen() {
         let temp_dir =
-            std::env::temp_dir().join(format!("elodin_db_persistence_test_{}", fastrand::u64(..)));
+            std::env::temp_dir().join(format!("metor_db_persistence_test_{}", fastrand::u64(..)));
 
         let component_id = ComponentId::new("subscription_test");
         let vtable_id = 1u16.to_le_bytes();
@@ -1176,7 +1176,7 @@ mod tests {
             sleep(Duration::from_millis(100)).await;
         }
 
-        let db = elodin_db::DB::open(temp_dir.clone()).unwrap();
+        let db = metor_db::DB::open(temp_dir.clone()).unwrap();
         db.with_state_mut(|state| {
             let component = state.get_component_metadata(component_id).unwrap();
             assert_eq!(&component.name, "Persistence Test Component");

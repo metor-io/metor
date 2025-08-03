@@ -9,7 +9,7 @@
 
 ### v0.14.2
 - **(feat)** Add a new plot type called SQL plot that allows you to graph arbitrary sql expressions
-- **(feat)** Add fft and fftfreq functions to elodin-db's sql dialect.
+- **(feat)** Add fft and fftfreq functions to metor-db's sql dialect.
   These functions allow you to perform an fft over some time series data for example:
   ```sql
   select fftfreq(time), fft(gyro[0]) from gyro_vehicle
@@ -21,9 +21,9 @@
 - **(feat)** Add right click menu to plots that sets the plot's visible time range as the editor's time range
 - **(feat)** Add command palette action that sets the time range of the editor
 - **(feat)** Allow user's to rename the graph's title in the inspector
-- **(feat)** Add vtable builder to elodin-db's C++ API. You can find an example of its usage in libs/db/cpp/example.cpp
+- **(feat)** Add vtable builder to metor-db's C++ API. You can find an example of its usage in libs/db/cpp/example.cpp
 - **(feat)** Add ability to manually specify y axis bounds on a plot
-- **(feat)** Add `UdpVTableStream` message type and `udp_vtable_stream(id, addr)` Lua function to construct it. This allows for static configuration of arbitrary VTable streams over UDP, which is useful for syncing data across instances of `elodin-db`.
+- **(feat)** Add `UdpVTableStream` message type and `udp_vtable_stream(id, addr)` Lua function to construct it. This allows for static configuration of arbitrary VTable streams over UDP, which is useful for syncing data across instances of `metor-db`.
 
 ### v0.14.0
 - **(breaking)** Switch vtables to use a new bytecode based format. This changes makes vtables simpler and more flexible. This change also effects the Lua format. You can now formulate a vtable with the `vtable_msg` function:
@@ -35,13 +35,13 @@
   })
 
   ```
-- **(feat)** Add VTableStream to elodin-db. VTableStream lets you specify a vtable for the database to populate, and have data streamed directly into it. You can also specify aggreator operations like `mean`. For example to setup a stream that calculates the mean of every 10 values:
+- **(feat)** Add VTableStream to metor-db. VTableStream lets you specify a vtable for the database to populate, and have data streamed directly into it. You can also specify aggreator operations like `mean`. For example to setup a stream that calculates the mean of every 10 values:
 
   ```lua
   client:vtable_stream({field(0, 4, mean(10, schema("f32", {}, pair(1, "temp"))))})
   ```
-- Add CSV as an archive data format. From `elodin-db lua`: `client:save_archive("path/to/dir", "csv")`.
-- Don't add "Globals" entity + "Tick" component on `elodin-db` initialization. This entity and component are only required for simulation purposes, not HITL.
+- Add CSV as an archive data format. From `metor-db lua`: `client:save_archive("path/to/dir", "csv")`.
+- Don't add "Globals" entity + "Tick" component on `metor-db` initialization. This entity and component are only required for simulation purposes, not HITL.
 
 ## v0.13
 
@@ -55,7 +55,7 @@
 - **(fix)** Fix a bug where the db wouldn't stream data to the editor correctly when there's a vtable that's registered but not used.
 
 ### v0.13.0
-- **(breaking)** Remove `exec.write_to_dir(path)`. This is made obsolete by the new `SaveArchive` method in elodin-db.
+- **(breaking)** Remove `exec.write_to_dir(path)`. This is made obsolete by the new `SaveArchive` method in metor-db.
 - **(fix)** Fix an issue where the component inspector would show incorrect data for some multi-dimensional components.
 
 ## v0.12
@@ -64,24 +64,24 @@
 - **(feat)** Add "presets" to the editor. Presets allow you to save your current editor layout (graphs, viewports, etc), and load them later
 - **(feat)** add `SaveArchive` method to db that allows saving arrow ipc or parquet archives
   `SaveArchive` will dump the current contents of the database to the file system at the specified path. By default this uses arrow-ipc as the file format, but it can be switched to use parquet
-- **(feat)** add C++ code generation to elodin-db
+- **(feat)** add C++ code generation to metor-db
 
 ### v0.12.2
-- **(breaking)** Make the elodin-db HTTP server optional. If an explicit `--http-addr` argument is not provided, the HTTP server will not be started.
-- Add UDP unicast support to elodin-db. Configure using the `UdpUnicast` message.
-- Add ability to mirror elodin-db over UDP unicast. Simply configure one db instance to stream data to another db instance's listen address.
+- **(breaking)** Make the metor-db HTTP server optional. If an explicit `--http-addr` argument is not provided, the HTTP server will not be started.
+- Add UDP unicast support to metor-db. Configure using the `UdpUnicast` message.
+- Add ability to mirror metor-db over UDP unicast. Simply configure one db instance to stream data to another db instance's listen address.
 
 ### v0.12.1
-- **(feat)** Add HTTP API to elodin-db.
+- **(feat)** Add HTTP API to metor-db.
 
 ### v0.12.0
 - **(breaking)** Add a request_id field to `PacketHeader` and shorten `PacketId` to `[u8; 3]`. In order to support better request-reply semantics, a u8 request_id was added to `PacketHeader`.
 - **(breaking)** The primitive types in the lua api have been lowercased so `F64` is now `f64` and so on.
 - **(breaking)** When using `send_msg` and `send_msgs` you no longer have to call `:msg()` on every msg. See the updated `examples/db-config.lua` for the new API
-- **(feat:db)** Add support for recording data at timestamps to elodin-db
-elodin-db now no longer operates on the concept of "ticks". Instead each new value is recorded as a pair of timestamp and value. This essentially makes elodin-db into a timer series database. It also fixes the problem where elodin-db would record a new entry, even when the value is unchanged.
-- **(feat)** Add support for SQL queries in elodin-db. These can be accessed from the CLI using the `:sql` command or through the editor using the new SQL pane. We used datafusion-sql to implement SQL support. You can find their docs here (https://datafusion.apache.org/user-guide/sql/index.html) for the syntax.
-- **(feat)** Add startup screen to editor that allows connecting to elodin-db or simulations, and running sims from files
+- **(feat:db)** Add support for recording data at timestamps to metor-db
+metor-db now no longer operates on the concept of "ticks". Instead each new value is recorded as a pair of timestamp and value. This essentially makes metor-db into a timer series database. It also fixes the problem where metor-db would record a new entry, even when the value is unchanged.
+- **(feat)** Add support for SQL queries in metor-db. These can be accessed from the CLI using the `:sql` command or through the editor using the new SQL pane. We used datafusion-sql to implement SQL support. You can find their docs here (https://datafusion.apache.org/user-guide/sql/index.html) for the syntax.
+- **(feat)** Add startup screen to editor that allows connecting to metor-db or simulations, and running sims from files
 - **(feat:editor)** The component monitor UI has been redesigned to be easier to read
 - **(feat)** Add touch screen support to plots
 - **(fix)** Fix plotting x axis tick marks placed in the wrong position
@@ -96,9 +96,9 @@ elodin-db now no longer operates on the concept of "ticks". Instead each new val
 - **(fix)** Fix an issue where a panic could be caused when a stellarator executor was dropped from a thread local. Now the executor is manually dropped when `stellarator::run` finished.
 
 ### v0.11.2
-- **(breaking)** Replace message-specific `elodin-db` Lua methods with generic `send_msg()` and `send_msgs()`.
+- **(breaking)** Replace message-specific `metor-db` Lua methods with generic `send_msg()` and `send_msgs()`.
 - **(breaking)** Reduce `impeller` packet header size from 16 bytes to 8 bytes. The `len` field is now a `u32` instead of a `u64`. The `req_id` field has also been removed.
-- Add a `--config` argument to `elodin-db run` to provide a custom Lua config file that can pre-configure the database with necessary vtables and metadata.
+- Add a `--config` argument to `metor-db run` to provide a custom Lua config file that can pre-configure the database with necessary vtables and metadata.
 
 ### v0.11.1
 - **(fix)** Fix bug where live reload would fail with an "Address already in use" error.
@@ -133,7 +133,7 @@ elodin-db now no longer operates on the concept of "ticks". Instead each new val
 
 ### v0.7.4
 - **(fix)** Fix bug where `editor run` would fail if the simulation file was in the current directory because it would attempt to get the parent directory without canonicalizing the path.
-- **(fix)** Fix `elodin login` in WSL. Previously, it would fail when attempting to open the browser. Now, it will print the URL to the console and you can copy and paste it into your browser.
+- **(fix)** Fix `metor login` in WSL. Previously, it would fail when attempting to open the browser. Now, it will print the URL to the console and you can copy and paste it into your browser.
 
 ### v0.7.2
 - Use logical scan codes for the editor's key bindings. This means that keyboard shortcuts will respect your keyboard layout. For example, if you remap your Caps Lock key to Ctrl, the editor will treat Caps Lock as Ctrl as well.
@@ -142,8 +142,8 @@ elodin-db now no longer operates on the concept of "ticks". Instead each new val
 - On Windows, use Ctrl instead of Super for launching the command palette (Ctrl + P).
 
 ### v0.7.0
-- **(breaking)** Replace `--watch` option with `elodin run`.
-As part of adding process supervision to Elodin, we refactored how watching a simulation works. Now instead of running `python3 sim.py run --watch`, you run `elodin run sim.py`.
+- **(breaking)** Replace `--watch` option with `metor run`.
+As part of adding process supervision to Metor, we refactored how watching a simulation works. Now instead of running `python3 sim.py run --watch`, you run `metor run sim.py`.
 - Add locking axis when panning and zooming plots.
   Now you can just move the x or y axis when panning or zooming a plot. Hold down Ctrl to only move along the x axis, and hold down Shift to only move along the y axis.
 - Add ability to run processes alongside simulations.
@@ -173,7 +173,7 @@ As part of adding process supervision to Elodin, we refactored how watching a si
 
 ### v0.4.0
 - **(fix)** Fix cutoff titlebar in editor on browser and windows.
-- **(fix)** Fix bug in the drone example's rate controller where the derivative term wasn't filtered correctly (https://github.com/elodin-sys/elodin/issues/18). It effectively caused the integral gain to amplified and the derivative gain to be suppressed.
+- **(fix)** Fix bug in the drone example's rate controller where the derivative term wasn't filtered correctly (https://github.com/metor-sys/metor/issues/18). It effectively caused the integral gain to amplified and the derivative gain to be suppressed.
 - **(breaking)** Replace `el.Time` and `el.advance_time` with `el.SimulationTick` and `el.SimulationTimeStep`.
   - The simulation tick is automatically advanced by a built-in system.
   - The simulation time step is set to the same value as the "sim_time_step" provided in `World.run`.
@@ -261,7 +261,7 @@ As part of adding process supervision to Elodin, we refactored how watching a si
 - Add better default names for viewports and graphs. E.g. Track: "\<entity
 name\>" for viewports and "\<entity name\>: \<component name\>" for graphs.
 - Add basic support for 3D plots/traces in the editor.
-  - Trace an entity's position by spawning in `elodin.Line3d` assets:
+  - Trace an entity's position by spawning in `metor.Line3d` assets:
     ```python
     # The entity id is required as the first positional argument.
     world.spawn(el.Line3d(rocket))
@@ -274,7 +274,7 @@ name\>" for viewports and "\<entity name\>: \<component name\>" for graphs.
     ```
 
 ### v0.3.24
-- Decouple simulation and playback running. You can now pause and rewind the editor without pausing the simulation. You can also change the playback speed by using `output_time_step` on `WorldBuilder.run`. We are deprecating the `time_step` parameter and replacing it with `sim_time_step`. This is to disambiguate it with `run_time_step`, which allows you to control the amount of time elodin waits between ticks of the simulation. Setting `run_time_step` to `0.0` effectively lets you simulate maximum speed.
+- Decouple simulation and playback running. You can now pause and rewind the editor without pausing the simulation. You can also change the playback speed by using `output_time_step` on `WorldBuilder.run`. We are deprecating the `time_step` parameter and replacing it with `sim_time_step`. This is to disambiguate it with `run_time_step`, which allows you to control the amount of time metor waits between ticks of the simulation. Setting `run_time_step` to `0.0` effectively lets you simulate maximum speed.
 - Add `max_ticks` parameter to `WorldBuilder.run`. The simulation will run until the specified number of ticks is reached.
 - Add body frame visualization option.
   To try it out, either open the command palette and type `Toggle Body Axes` or add the following code to your simulation file:
@@ -319,7 +319,7 @@ name\>" for viewports and "\<entity name\>: \<component name\>" for graphs.
 - Replace "Welcome" panel with a new UI for creating viewports and graphs.
 - Add "Save Replay" command to command palette (Cmd + P).
 - Show progress bar when executing `exec.run(ticks)` unless explicitly disabled with `exec.run(ticks, show_progress=False)`.
-- Add a create command for templates to the Elodin CLI
+- Add a create command for templates to the Metor CLI
 - Allowing naming of viewports and graphs from code.
   ```python
   el.Panel.graph(
@@ -332,7 +332,7 @@ name\>" for viewports and "\<entity name\>: \<component name\>" for graphs.
 - **(breaking)** Render the Z-axis as up in the editor (instead of the Y-axis). This is a purely visual change and does not affect simulation results, but it's recommended to update simulations to match the new visual orientation. Typically, this requires swapping the Y and Z axes when operating on spatial positions, velocities, and forces.
 - **(fix)** When a simulation file was changed, the associated pycache files would also be updated, causing the simulation to be re-built multiple times in some cases. This is now fixed.
 - Add Status Bar to the editor (currently shows FPS/TPS and basic version of the connection status).
-- `elodin editor <path/to/sim>` now watches the parent directory of the simulation file for changes in addition to the file itself. This is useful for multi-file projects. This is also the case when using the `--watch` flag directly. E.g. `python <path/to/sim> run --watch`.
+- `metor editor <path/to/sim>` now watches the parent directory of the simulation file for changes in addition to the file itself. This is useful for multi-file projects. This is also the case when using the `--watch` flag directly. E.g. `python <path/to/sim> run --watch`.
 - Export simulation data to a directory using `exec.write_to_dir(path)`.
 
 ### v0.3.22
@@ -342,9 +342,9 @@ name\>" for viewports and "\<entity name\>: \<component name\>" for graphs.
 ### v0.3.21
 - **(fix)** Fix missing 1/2 factor in angular velocity integration and `Quaternion::from_axis_angle` .
     - In `nox`, the constant `Field::two` returned a `1` constant. This constant was only used in the implementation of `Add` between `SpatialMotion` and `SpatialTransform` and in `Quaternion::from_axis_angle`. Unfortunately, this caused angular velocity integration to return incorrect results. This bug caused the applied angular velocity to be multiplied by a factor of 2.
-    - The most significant impact of this bug is on the stability of any attitude control system. This bug has led to an increase in small oscillations, potentially affecting the performance of PID controllers tuned to work with previous versions of Elodin. PID controllers tuned to work with earlier versions of Elodin will likely need to be re-tuned
+    - The most significant impact of this bug is on the stability of any attitude control system. This bug has led to an increase in small oscillations, potentially affecting the performance of PID controllers tuned to work with previous versions of Metor. PID controllers tuned to work with earlier versions of Metor will likely need to be re-tuned
     - We regret not catching this bug earlier. To prevent a bug like this happening ever again, we have taken the following steps:
-        1. We created a set of unit tests for the 6 DOF implementation that compare Elodin's results with Simulink. They have confirmed that our implementation now matched Simulink's [6DOF Quaternion block](https://www.mathworks.com/help/aeroblks/6dofquaternion.html).
+        1. We created a set of unit tests for the 6 DOF implementation that compare Metor's results with Simulink. They have confirmed that our implementation now matched Simulink's [6DOF Quaternion block](https://www.mathworks.com/help/aeroblks/6dofquaternion.html).
         2. We will expand our set of unit tests to have 100% coverage of our math modules. We will test each module against Simulink and other trusted implementations.
         3. We will publish documentation on our testing methodology and reports for each module.
 - **(fix)** Fix incorrect angular acceleration due to mismatched coordinate frames.
@@ -354,7 +354,7 @@ name\>" for viewports and "\<entity name\>: \<component name\>" for graphs.
     ```python
     # before:
     w.spawn(el.Body(pbr = w.insert_asset( el.Pbr(el.Mesh.sphere(0.2), el.Material.color(0.0, 10.0, 10.0)))))
-    w.spawn(el.Body(w.insert_asset(el.Pbr.from_url("https://storage.googleapis.com/elodin-assets/earth.glb"))))
+    w.spawn(el.Body(w.insert_asset(el.Pbr.from_url("https://storage.googleapis.com/metor-assets/earth.glb"))))
     # after
     w.spawn([
       el.Body(),
@@ -362,7 +362,7 @@ name\>" for viewports and "\<entity name\>: \<component name\>" for graphs.
     ])
     w.spawn([
       el.Body(),
-      w.glb("https://storage.googleapis.com/elodin-assets/earth.glb")
+      w.glb("https://storage.googleapis.com/metor-assets/earth.glb")
     ])
     ```
 - **(breaking)** Remove `SpatialInertia.from_mass()`.

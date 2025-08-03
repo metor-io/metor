@@ -1051,12 +1051,12 @@ impl Default for PalettePage {
             load_schematic(),
             set_color_scheme(),
             PaletteItem::new("Documentation", HELP_LABEL, |_: In<String>| {
-                let _ = opener::open("https://docs.elodin.systems");
+                let _ = opener::open("https://docs.metor.systems");
                 PaletteEvent::Exit
             })
             .icon(PaletteIcon::Link),
             PaletteItem::new("Release Notes", HELP_LABEL, |_: In<String>| {
-                let _ = opener::open("https://docs.elodin.systems/updates/changelog");
+                let _ = opener::open("https://docs.metor.systems/updates/changelog");
                 PaletteEvent::Exit
             })
             .icon(PaletteIcon::Link),

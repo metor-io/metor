@@ -69,7 +69,7 @@
       ruff
       python3Packages.pytest
       python3Packages.pytest-json-report
-      config.packages.elodin-py
+      config.packages.metor-py
     ];
   };
 

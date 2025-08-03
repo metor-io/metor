@@ -1,12 +1,12 @@
 +++
 title = "Quick Start"
-description = "Install Elodin and start simulating."
+description = "Install Metor and start simulating."
 draft = false
 weight = 101
 sort_by = "weight"
 
 [extra]
-lead = "Install Elodin and start simulating."
+lead = "Install Metor and start simulating."
 toc = true
 top = false
 order = 1
@@ -15,66 +15,66 @@ icon = ""
 
 ## Install
 
-Download the Elodin Client:
+Download the Metor Client:
 
 | File                                                    | Platform            | Checksum                        |
 | ------------------------------------------------------- | ------------------- | ------------------------------- |
-| [elodin-aarch64-apple-darwin.tar.gz][elodin-macos]      | Apple Silicon macOS | [sha256][elodin-macos-sha256]   |
-| [elodin-x86_64-unknown-linux-gnu.tar.gz][elodin-linux]  | x64 Linux           | [sha256][elodin-linux-sha256]   |
-| [elodin-x86_64-pc-windows-msvc.zip][elodin-windows]     | x64 Windows         | [sha256][elodin-windows-sha256] |
+| [metor-aarch64-apple-darwin.tar.gz][metor-macos]      | Apple Silicon macOS | [sha256][metor-macos-sha256]   |
+| [metor-x86_64-unknown-linux-gnu.tar.gz][metor-linux]  | x64 Linux           | [sha256][metor-linux-sha256]   |
+| [metor-x86_64-pc-windows-msvc.zip][metor-windows]     | x64 Windows         | [sha256][metor-windows-sha256] |
 
-[elodin-macos]: https://storage.googleapis.com/elodin-releases/latest/elodin-aarch64-apple-darwin.tar.gz
-[elodin-macos-sha256]: https://storage.googleapis.com/elodin-releases/latest/elodin-aarch64-apple-darwin.tar.gz.sha256
-[elodin-linux]: https://storage.googleapis.com/elodin-releases/latest/elodin-x86_64-unknown-linux-gnu.tar.gz
-[elodin-linux-sha256]: https://storage.googleapis.com/elodin-releases/latest/elodin-x86_64-unknown-linux-gnu.tar.gz.sha256
-[elodin-windows]: https://storage.googleapis.com/elodin-releases/latest/elodin-x86_64-pc-windows-msvc.zip
-[elodin-windows-sha256]: https://storage.googleapis.com/elodin-releases/latest/elodin-x86_64-pc-windows-msvc.zip.sha256
+[metor-macos]: https://storage.googleapis.com/metor-releases/latest/metor-aarch64-apple-darwin.tar.gz
+[metor-macos-sha256]: https://storage.googleapis.com/metor-releases/latest/metor-aarch64-apple-darwin.tar.gz.sha256
+[metor-linux]: https://storage.googleapis.com/metor-releases/latest/metor-x86_64-unknown-linux-gnu.tar.gz
+[metor-linux-sha256]: https://storage.googleapis.com/metor-releases/latest/metor-x86_64-unknown-linux-gnu.tar.gz.sha256
+[metor-windows]: https://storage.googleapis.com/metor-releases/latest/metor-x86_64-pc-windows-msvc.zip
+[metor-windows-sha256]: https://storage.googleapis.com/metor-releases/latest/metor-x86_64-pc-windows-msvc.zip.sha256
 
-Install the Elodin Python SDK using `pip`:
+Install the Metor Python SDK using `pip`:
 
 {% alert(kind="warning") %}
-The SDK is only supported on macOS and Linux distributions with glibc 2.35+ (Ubuntu 22.04+, Debian 12+, Fedora 35+, NixOS 21.11+). Windows users can still use Elodin by installing and running the simulation server in Windows Subsystem for Linux. Install the Elodin Python SDK in WSL, after [installing WSL.](https://docs.microsoft.com/en-us/windows/wsl/install)
+The SDK is only supported on macOS and Linux distributions with glibc 2.35+ (Ubuntu 22.04+, Debian 12+, Fedora 35+, NixOS 21.11+). Windows users can still use Metor by installing and running the simulation server in Windows Subsystem for Linux. Install the Metor Python SDK in WSL, after [installing WSL.](https://docs.microsoft.com/en-us/windows/wsl/install)
 {% end %}
 
 
 ```sh
-pip install -U elodin
+pip install -U metor
 ```
 
 ## Start Simulating
 
 ### Windows (WSL)
 
-To use Elodin on Windows, the simulation server must run in Windows Subsystem for Linux (WSL). The Elodin Client itself can run natively on Windows.
+To use Metor on Windows, the simulation server must run in Windows Subsystem for Linux (WSL). The Metor Client itself can run natively on Windows.
 
 [Video Walkthrough](https://www.loom.com/share/efcbf81e43074863807750d4ad2f8d7a?sid=9403e8c8-7893-4299-824e-2dacb6978120)
 
-In a Windows terminal launch the Elodin app.
+In a Windows terminal launch the Metor app.
 
 ```wsl
-.\elodin.exe
+.\metor.exe
 ```
 
-In a WSL terminal download and install `elodin` binary into your path then run:
+In a WSL terminal download and install `metor` binary into your path then run:
 
 1. Create a new simulation using the three-body orbit template.
     ```sh
-    elodin create --template three-body
+    metor create --template three-body
     ```
 2. Run the simulation server.
     ```sh
-    elodin run three-body.py
+    metor run three-body.py
     ```
 
 ### Linux / macOS
 
 1. Create a new simulation using the three-body orbit template.
     ```sh
-    elodin create --template three-body
+    metor create --template three-body
     ```
-2. Launch the simulation using the `elodin` CLI.
+2. Launch the simulation using the `metor` CLI.
     ```sh
-    elodin editor three-body.py
+    metor editor three-body.py
     ```
 
 ## Perform Analysis
@@ -92,7 +92,7 @@ pip install -U matplotlib
 
 Then create & run the ball template:
 ```sh
-elodin create --template ball
+metor create --template ball
 python3 ball/plot.py
 ```
 
@@ -101,7 +101,7 @@ For more information on data frames check out
 
 ## Next Steps
 
-Try out the following tutorials to learn how to build simulations using Elodin:
+Try out the following tutorials to learn how to build simulations using Metor:
 
 {% cardlink(title="Three-Body Orbit Tutorial", icon="planet", href="/home/3-body") %}
 Learn how to model a basic stable three-body problem

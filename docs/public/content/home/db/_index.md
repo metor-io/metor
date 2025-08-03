@@ -1,6 +1,6 @@
 +++
-title = "Elodin DB"
-description = "Documentation for Elodin DB"
+title = "Metor DB"
+description = "Documentation for Metor DB"
 sort_by = "weight"
 weight = 106
 draft = false

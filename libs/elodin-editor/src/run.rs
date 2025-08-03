@@ -18,7 +18,7 @@ pub async fn run_recipe(
             py
         } else {
             return Err(miette!(
-                "couldn't find a elodin config, please add either a main.py or s10.toml file to the directory"
+                "couldn't find a metor config, please add either a main.py or s10.toml file to the directory"
             ));
         }
     } else {

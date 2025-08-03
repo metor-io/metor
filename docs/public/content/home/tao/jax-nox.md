@@ -32,9 +32,9 @@ As a result, NumPy has become a staple for numerical computation across schools 
 
 ## JAX
 
-NumPy sounds great! So why not use it for Elodin?
+NumPy sounds great! So why not use it for Metor?
 
-Millions of simulations running in parallel is a common use case for Elodin. When you are trying to perform a large series of mathematical
+Millions of simulations running in parallel is a common use case for Metor. When you are trying to perform a large series of mathematical
 expressions, find a way to optimize becomes important. That's where [JAX](https://jax.readthedocs.io/en/latest/) comes in.
 
 JAX is like NumPy’s supercharged cousin. It gives you all the things you love about NumPy—fast, efficient array operations—but with some
@@ -89,7 +89,7 @@ A fun side-effect of this architecture is Nox allows you to write code for both 
 
 ## And The "Sharp Bits"
 
-While it's tempting dive in thinking the use of JAX/NOX in Elodin will be just like NumPy, the
+While it's tempting dive in thinking the use of JAX/NOX in Metor will be just like NumPy, the
 [Sharp Bits](https://jax.readthedocs.io/en/latest/notebooks/Common_Gotchas_in_JAX.html) still apply, namely:
 
 #### Immutable Arrays

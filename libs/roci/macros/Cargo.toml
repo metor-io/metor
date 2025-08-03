@@ -4,7 +4,7 @@ license = "MIT OR Apache-2.0"
 version.workspace = true
 edition = "2024"
 description = "Macros for roci."
-repository = "https://github.com/elodin-sys/elodin"
+repository = "https://github.com/metor-sys/metor"
 
 [lib]
 proc-macro = true

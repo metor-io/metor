@@ -1,7 +1,7 @@
 {pkgs, ...}: {
   systemd.services.tegrastats-bridge = with pkgs; {
     wantedBy = ["multi-user.target"];
-    after = ["network.target" "elodin-db.target"];
+    after = ["network.target" "metor-db.target"];
     description = "start tegrastats-bridge";
     serviceConfig = {
       Type = "exec";

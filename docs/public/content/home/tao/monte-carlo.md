@@ -29,7 +29,7 @@ Other solutions simply require large amounts of engineering effort and/or massiv
 
 ## Our Solution
 
-Elodin solves these problems by introducing a cloud-based simulation runner that can run up to 100,000 simulations simultaneously. We're able to do so in a cost-effective way by:
+Metor solves these problems by introducing a cloud-based simulation runner that can run up to 100,000 simulations simultaneously. We're able to do so in a cost-effective way by:
 
 - Using the [ECS](https://en.wikipedia.org/wiki/Entity_component_system) architecture to exploit the inherent parallelism in running the same compute kernel against different sets of data.
 - Leveraging [XLA](https://openxla.org/xla) to compile the simulation code to run on GPUs.

@@ -36,7 +36,7 @@
       inherit cargoArtifacts;
       postInstall = ''
         mkdir -p $out/lib/gstreamer-1.0
-        cp $out/lib/libgstelodin.so $out/lib/gstreamer-1.0/
+        cp $out/lib/libgstmetor.so $out/lib/gstreamer-1.0/
       '';
     });
 in

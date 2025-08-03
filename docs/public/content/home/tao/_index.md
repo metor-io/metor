@@ -1,6 +1,6 @@
 +++
-title = "The Tao of Elodin Sim"
-description = "Driving principles behind Elodin"
+title = "The Tao of Metor Sim"
+description = "Driving principles behind Metor"
 sort_by = "weight"
 weight = 200
 draft = false

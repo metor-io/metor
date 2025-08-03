@@ -2,7 +2,7 @@
 #! nix develop .#ops --command just --justfile
 
 k8s_overlays := "kubernetes/overlays"
-artifact_registry := "elodin.azurecr.io/elodin-infra"
+artifact_registry := "metor.azurecr.io/metor-infra"
 repo_docs := "elo-docs/x86_64"
 
 project := "dev"
@@ -25,26 +25,26 @@ re-tag-images-current new_tag:
 clean-dev-branch branch_codename:
   az login --identity
   az aks get-credentials --resource-group {{project}} --name {{cluster}} --overwrite-existing
-  kubectl get namespace elodin-app-{{branch_codename}} &> /dev/null && kubectl delete ns elodin-app-{{branch_codename}} || echo "elodin-app-{{branch_codename}} already deleted"
+  kubectl get namespace metor-app-{{branch_codename}} &> /dev/null && kubectl delete ns metor-app-{{branch_codename}} || echo "metor-app-{{branch_codename}} already deleted"
 
 sync-assets:
-  gsutil rsync -r assets gs://elodin-assets
+  gsutil rsync -r assets gs://metor-assets
 
 sync-open-source:
-  git filter-repo --refs main --path examples --path libs/roci --path libs/conduit --path libs/impeller2 --path libs/nox --path libs/nox-ecs --path libs/nox-ecs-macros --path libs/nox-py --path libs/xla-rs --path libs/noxla --path libs/s10 --path libs/stellarator --path fsw --path libs/db --path images --path rust-toolchain.toml --prune-empty always --target ../elodin
-  (cd ../elodin && \
+  git filter-repo --refs main --path examples --path libs/roci --path libs/conduit --path libs/impeller2 --path libs/nox --path libs/nox-ecs --path libs/nox-ecs-macros --path libs/nox-py --path libs/xla-rs --path libs/noxla --path libs/s10 --path libs/stellarator --path fsw --path libs/db --path images --path rust-toolchain.toml --prune-empty always --target ../metor
+  (cd ../metor && \
    git checkout -b old-main origin/main && \
    git rebase main --committer-date-is-author-date && \
    git checkout main && \
    git reset --hard old-main && \
    git branch -D old-main)
 
-[confirm("Are you sure you want to force push to elodin-sys/elodin?")]
+[confirm("Are you sure you want to force push to metor-sys/metor?")]
 force-push-open-source: sync-open-source
-  cd ../elodin; git push --force
+  cd ../metor; git push --force
 
 version:
-  @echo "v$(cargo metadata --format-version 1 | jq -r '.packages[] | select(.name == "elodin") | .version')"
+  @echo "v$(cargo metadata --format-version 1 | jq -r '.packages[] | select(.name == "metor") | .version')"
 
 auto-tag:
   #!/usr/bin/env sh
@@ -54,7 +54,7 @@ auto-tag:
     echo "Latest tag is already '$new_tag'"; exit 0
   fi
   echo "🏷️ Tagging HEAD with '$new_tag'"
-  git tag -a $new_tag -m "Elodin $new_tag"
+  git tag -a $new_tag -m "Metor $new_tag"
   git push origin $new_tag
   just re-tag-images $(git rev-parse HEAD) $new_tag
 
@@ -68,18 +68,18 @@ release tag:
   resources:
   - ../overlays/prod
   images:
-  - name: elodin-infra/elo-docs
-    newName: elodin.azurecr.io/elodin-infra/elo-docs/x86_64
+  - name: metor-infra/elo-docs
+    newName: metor.azurecr.io/metor-infra/elo-docs/x86_64
     newTag: {{tag}}
   EOF
-  kubectl kustomize kubernetes/deploy | kubectl --cluster gke_elodin-prod_us-central1_elodin-prod-gke apply -f -
+  kubectl kustomize kubernetes/deploy | kubectl --cluster gke_metor-prod_us-central1_metor-prod-gke apply -f -
 
 promote tag:
   #!/usr/bin/env sh
   dir=$(mktemp -d)
-  gh release download {{tag}} --pattern 'elodin-*' --dir $dir
-  gsutil -m cp -r "$dir/*" "gs://elodin-releases/{{tag}}/"
-  gsutil -m cp -r "gs://elodin-releases/{{tag}}/*" "gs://elodin-releases/latest/"
+  gh release download {{tag}} --pattern 'metor-*' --dir $dir
+  gsutil -m cp -r "$dir/*" "gs://metor-releases/{{tag}}/"
+  gsutil -m cp -r "gs://metor-releases/{{tag}}/*" "gs://metor-releases/latest/"
   uv publish "$dir/*.whl"
 
 public-changelog:
@@ -91,6 +91,6 @@ public-changelog:
   sed -i "" "s/$old_version/$new_version/g" docs/public/config.toml
 
 install:
-  @echo "🚧 Installing elodin and elodin-db to ~/.local/bin"
-  cargo build --release --package elodin --package elodin-db
-  cp target/release/elodin target/release/elodin-db ~/.local/bin
+  @echo "🚧 Installing metor and metor-db to ~/.local/bin"
+  cargo build --release --package metor --package metor-db
+  cp target/release/metor target/release/metor-db ~/.local/bin

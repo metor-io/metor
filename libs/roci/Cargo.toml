@@ -3,8 +3,8 @@ name = "roci"
 license = "MIT OR Apache-2.0"
 version.workspace = true
 edition = "2024"
-description = "Elodin flight software framework."
-repository = "https://github.com/elodin-sys/elodin"
+description = "Metor flight software framework."
+repository = "https://github.com/metor-sys/metor"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
@@ -35,7 +35,7 @@ impeller2-bbq.path = "../impeller2/bbq"
 impeller2-bbq.optional = true
 fastrand.version = "2.2.0"
 fastrand.optional = true
-bbq2.git = "https://github.com/elodin-sys/bbq2.git"
+bbq2.git = "https://github.com/metor-sys/bbq2.git"
 bbq2.rev = "b6e36706a5549d770ebf2dc122b39cef1368b06d"
 bbq2.features = ["std", "maitake-sync-0_2"]
 bbq2.default-features = false

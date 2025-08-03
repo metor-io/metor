@@ -119,6 +119,6 @@ in {
     (writeShellScriptBin "aleph-scan" (builtins.readFile ../scripts/aleph-scan.sh))
     aleph-status
     video-streamer
-    elodinsink
+    metorsink
   ];
 }

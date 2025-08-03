@@ -1,7 +1,7 @@
 import typing
 from dataclasses import field
 
-import elodin as el
+import metor as el
 import jax
 from jax import numpy as jnp
 from jax import random

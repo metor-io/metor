@@ -54,11 +54,11 @@ install_editor() {
   version=$3
 
   if [ "$os" = "Darwin" ] && [ "$arch" = "arm64" ]; then
-    download_url="https://storage.googleapis.com/elodin-releases/$version/elodin-aarch64-apple-darwin.tar.gz"
+    download_url="https://storage.googleapis.com/metor-releases/$version/metor-aarch64-apple-darwin.tar.gz"
   elif [ "$os" = "Linux" ] && [ "$arch" = "aarch64" ]; then
-    download_url="https://storage.googleapis.com/elodin-releases/$version/elodin-aarch64-unknown-linux-musl.tar.gz"
+    download_url="https://storage.googleapis.com/metor-releases/$version/metor-aarch64-unknown-linux-musl.tar.gz"
   elif [ "$os" = "Linux" ] && [ "$arch" = "x86_64" ]; then
-    download_url="https://storage.googleapis.com/elodin-releases/$version/elodin-x86_64-unknown-linux-musl.tar.gz"
+    download_url="https://storage.googleapis.com/metor-releases/$version/metor-x86_64-unknown-linux-musl.tar.gz"
   else
     echo "Unsupported (OS, arch): ($os, $arch)"
     exit 1
@@ -66,7 +66,7 @@ install_editor() {
 
   echo "Downloading $download_url"
   curl -L -# "$download_url" | tar xz --strip-components=1 -C "$HOME/.local/bin"
-  version=$("$HOME/.local/bin/elodin" --version)
+  version=$("$HOME/.local/bin/metor" --version)
   echo "Installed $version to \$HOME/.local/bin"
 }
 

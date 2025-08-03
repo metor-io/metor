@@ -105,7 +105,7 @@ This method installs a minimal base NixOS image on Aleph, returning the device t
 1. Download the latest OS image and decompress it.
    ```bash
    # This convenience script just runs:
-   # curl -L https://storage.googleapis.com/elodin-releases/latest/aleph-os.img.zst | zstd -d > aleph-os.img
+   # curl -L https://storage.googleapis.com/metor-releases/latest/aleph-os.img.zst | zstd -d > aleph-os.img
    ./justfile download-sdimage
    ```
 

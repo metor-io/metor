@@ -18,7 +18,7 @@
   };
   xla_path = builtins.getAttr system xla_path_map;
   xla_ext = fetchTarball {
-    url = "https://github.com/elodin-sys/xla/releases/download/v0.5.4/${xla_path}";
+    url = "https://github.com/metor-sys/xla/releases/download/v0.5.4/${xla_path}";
     sha256 = builtins.getAttr system xla_sha256_map;
   };
   craneLib = (crane.mkLib pkgs).overrideToolchain rustToolchain;
@@ -60,16 +60,16 @@
   };
   cargoArtifacts = craneLib.buildDepsOnly commonArgs;
 
-  wheelName = "elodin";
+  wheelName = "metor";
   wheelSuffix = "cp310-abi3-linux_${arch}";
   wheel = craneLib.buildPackage (commonArgs
     // {
       inherit cargoArtifacts;
-      pname = "elodin";
+      pname = "metor";
       buildPhase = "maturin build --offline --target-dir ./target -m libs/nox-py/Cargo.toml --release";
       installPhase = "install -D target/wheels/${wheelName}-${version}-${wheelSuffix}.whl -t $out/";
     });
-  elodin = ps:
+  metor = ps:
     ps.buildPythonPackage {
       pname = wheelName;
       format = "wheel";
@@ -80,4 +80,4 @@
       pythonImportsCheck = [wheelName];
     };
 in
-  elodin pkgs.python3Packages
+  metor pkgs.python3Packages

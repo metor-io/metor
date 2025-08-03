@@ -12,7 +12,7 @@ image = "0.25"
 sysinfo = "0.34"
 anyhow = "1"
 
-# elodin-db
+# metor-db
 stellarator.path = "../../libs/stellarator"
 stellarator.features = ["miette"]
 impeller2-stellar.path = "../../libs/impeller2/stellar"

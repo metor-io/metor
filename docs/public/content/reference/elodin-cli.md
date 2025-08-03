@@ -1,6 +1,6 @@
 +++
-title = "Elodin CLI"
-description = "Elodin CLI"
+title = "Metor CLI"
+description = "Metor CLI"
 draft = false
 weight = 104
 sort_by = "weight"
@@ -12,64 +12,50 @@ icon = ""
 order = 4
 +++
 
-# Command-Line Help for `elodin`
+# Command-Line Help for `metor`
 
-This document contains the help content for the `elodin` command-line program.
+This document contains the help content for the `metor` command-line program.
 
 **Command Overview:**
 
-* [`elodin`↴](#elodin)
-* [`elodin login`↴](#elodin-login)
-* [`elodin editor`↴](#elodin-editor)
-* [`elodin run`↴](#elodin-run)
-* [`elodin create`↴](#elodin-create)
+* [`metor`↴](#metor)
+* [`metor login`↴](#metor-login)
+* [`metor editor`↴](#metor-editor)
+* [`metor run`↴](#metor-run)
+* [`metor create`↴](#metor-create)
 
-## `elodin`
+## `metor`
 
-**Usage:** `elodin [OPTIONS] [COMMAND]`
+**Usage:** `metor [OPTIONS] [COMMAND]`
 
 ###### **Subcommands:**
 
 * `login` — Obtain access credentials for your user account
-* `editor` — Launch the Elodin editor (default)
-* `run` — Run an Elodin simulaton in headless mode
+* `editor` — Launch the Metor editor (default)
+* `run` — Run an Metor simulaton in headless mode
 * `create` — Create template
 
 ###### **Options:**
 
 * `-u`, `--url <URL>`
 
-  Default value: `https://app.elodin.systems`
+  Default value: `https://app.metor.systems`
 
 
 
-## `elodin login`
+## `metor login`
 
 Obtain access credentials for your user account
 
-**Usage:** `elodin login`
+**Usage:** `metor login`
 
 
 
-## `elodin editor`
+## `metor editor`
 
-Launch the Elodin editor (default)
+Launch the Metor editor (default)
 
-**Usage:** `elodin editor [addr/path]`
-
-###### **Arguments:**
-
-* `<addr/path>`
-
-  Default value: `127.0.0.1:2240`
-
-
-
-## `elodin run`
-
-Run an Elodin simulaton in headless mode
-
-**Usage:** `elodin run [addr/path]`
+**Usage:** `metor editor [addr/path]`
 
 ###### **Arguments:**
 
@@ -79,11 +65,25 @@ Run an Elodin simulaton in headless mode
 
 
 
-## `elodin create`
+## `metor run`
+
+Run an Metor simulaton in headless mode
+
+**Usage:** `metor run [addr/path]`
+
+###### **Arguments:**
+
+* `<addr/path>`
+
+  Default value: `127.0.0.1:2240`
+
+
+
+## `metor create`
 
 Create template
 
-**Usage:** `elodin create [OPTIONS] --template <TEMPLATE>`
+**Usage:** `metor create [OPTIONS] --template <TEMPLATE>`
 
 ###### **Options:**
 

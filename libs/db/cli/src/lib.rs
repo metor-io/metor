@@ -808,7 +808,7 @@ pub async fn run(args: Args) -> anyhow::Result<()> {
             validator: MatchingBracketValidator::new(),
         };
         let mut history = rustyline::history::FileHistory::with_config(config);
-        let dirs = directories::ProjectDirs::from("systems", "elodin", "impeller2-cli")
+        let dirs = directories::ProjectDirs::from("systems", "metor", "impeller2-cli")
             .ok_or_else(|| anyhow!("dir not found"))?;
         std::fs::create_dir_all(dirs.data_dir())?;
         let history_path = dirs.data_dir().join("impeller2-history");

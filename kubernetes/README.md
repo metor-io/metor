@@ -5,7 +5,7 @@
 
 ```sh
 # Login into the development cluster
-gcloud container clusters get-credentials "elodin-dev-gke" --region "us-central1" --project "elodin-dev" 
+gcloud container clusters get-credentials "metor-dev-gke" --region "us-central1" --project "metor-dev" 
 
 # Run following commands from the root of the repo
 
@@ -14,7 +14,7 @@ BUILDKITE_COMMIT=$(git rev-parse HEAD) envsubst < out.yaml > out-with-envs.yaml
 
 kubectl apply -f out-with-envs.yaml
 
-kubectl get all -n elodin-app-dev
+kubectl get all -n metor-app-dev
 
 # NOTE: Use following command before `terraform destroy` if you intend to fully remove all resources
 kubectl delete -f out-with-envs.yaml
@@ -24,7 +24,7 @@ kubectl delete -f out-with-envs.yaml
 
 ```sh
 # Login into the production cluster
-gcloud container clusters get-credentials "elodin-prod-gke" --region "us-central1" --project "elodin-prod"
+gcloud container clusters get-credentials "metor-prod-gke" --region "us-central1" --project "metor-prod"
 
 # Run following commands from the root of the repo
 
@@ -37,11 +37,11 @@ envsubst < out.yaml > out-with-envs.yaml
 
 kubectl apply -f out-with-envs.yaml
 
-kubectl get all -n elodin-app-prod
+kubectl get all -n metor-app-prod
 ```
 
 ## Project structure
 
 Kubernetes folder contains everything necessary to configure a cluster.
 
-`elodin-app` folders contains all resources that would be placed in namespaces with the respective names
+`metor-app` folders contains all resources that would be placed in namespaces with the respective names

@@ -1,10 +1,10 @@
 [package]
-name = "elodin"
+name = "metor"
 license = "MIT OR Apache-2.0"
 version.workspace = true
 repository.workspace = true
 edition = "2024"
-authors = ["sascha@elodin.systems", "akhil@elodin.systems", "van@elodin.systems"]
+authors = ["sascha@metor.systems", "akhil@metor.systems", "van@metor.systems"]
 
 [dependencies]
 thiserror = "2.0"
@@ -34,8 +34,8 @@ zstd = "0.13.0"
 bevy.version = "0.16"
 tracing-subscriber = { version = "0.3", features = ["chrono"] }
 
-elodin-editor.path = "../../libs/elodin-editor"
-elodin-editor.default-features = false
+metor-editor.path = "../../libs/metor-editor"
+metor-editor.default-features = false
 impeller2-bevy.path = "../../libs/impeller2/bevy"
 
 # crypto
@@ -53,17 +53,17 @@ tar = "0.4.40"
 zstd = "0.13.0"
 
 [package.metadata.deb]
-maintainer = "info@elodin.systems"
+maintainer = "info@metor.systems"
 
 [package.metadata.bundle]
-name = "Elodin"
-identifier = "systems.elodin.app"
-icon = ["apps/elodin/assets/512x512@2x.png"]
+name = "Metor"
+identifier = "systems.metor.app"
+icon = ["apps/metor/assets/512x512@2x.png"]
 version = "1.0.0"
 resources = []
-copyright = "Copyright (c) Elodin Systems, Inc. All rights reserved."
+copyright = "Copyright (c) Metor Systems, Inc. All rights reserved."
 category = "Developer Tool"
-short_description = "Elodin"
+short_description = "Metor"
 long_description = """ """
 deb_depends = []
 osx_frameworks = []

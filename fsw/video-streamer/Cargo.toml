@@ -2,7 +2,7 @@
 name = "video-streamer"
 version = "0.1.0"
 edition = "2024"
-description = "Streams video files to elodin-db after re-encoding to AV1"
+description = "Streams video files to metor-db after re-encoding to AV1"
 publish = false
 
 [dependencies]

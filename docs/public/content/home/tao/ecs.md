@@ -12,9 +12,9 @@ icon = ""
 order = 64
 +++
 
-At Elodin's core is a physics toolkit that utilizes the ECS design pattern.
+At Metor's core is a physics toolkit that utilizes the ECS design pattern.
 This toolkit allows our users to create incredibly efficient physics simulations easily.
-Elodin's ECS engine is unique in that it does all the computation using [XLA](https://openxla.org/xla), a compiler for linear algebra.
+Metor's ECS engine is unique in that it does all the computation using [XLA](https://openxla.org/xla), a compiler for linear algebra.
 Our engine allows your simulations to run on GPU, TPU, or CPU, all with no code changes.
 
 ## A History Lesson on ECS

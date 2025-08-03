@@ -12,7 +12,7 @@ spec:
       containers:
       - name: elo-docs
         imagePullPolicy: Always
-        image: elodin-infra/elo-docs:latest
+        image: metor-infra/elo-docs:latest
         ports:
         - containerPort: 8080
           name: http

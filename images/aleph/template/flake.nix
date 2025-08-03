@@ -1,13 +1,13 @@
 {
   nixConfig = {
-    extra-substituters = ["http://ci-arm1.elodin.dev:5000"];
+    extra-substituters = ["http://ci-arm1.metor.dev:5000"];
     extra-trusted-public-keys = [
       "builder-cache-1:q7rDGIQgkg1nsxNEg7mHN1kEDuxPmJhQpuIXCCwLj8E="
     ];
   };
 
   inputs = {
-    aleph.url = "github:elodin-sys/elodin/main?dir=images/aleph";
+    aleph.url = "github:metor-sys/metor/main?dir=images/aleph";
     nixpkgs.follows = "aleph/nixpkgs";
   };
   outputs = {
@@ -32,10 +32,10 @@
 
         minimal # strips down nixos to an even more minimal set of defaults
 
-        # elodin-db and integrations
-        elodin-db # brings in elodin-db as a default service
-        aleph-serial-bridge # pushes sensor data into elodin-db from the default expansion board firmware
-        tegrastats-bridge # pushes telemetry form the Orin SoC into elodin-db (i.e cpu usage, temps, etc)
+        # metor-db and integrations
+        metor-db # brings in metor-db as a default service
+        aleph-serial-bridge # pushes sensor data into metor-db from the default expansion board firmware
+        tegrastats-bridge # pushes telemetry form the Orin SoC into metor-db (i.e cpu usage, temps, etc)
 
         # default tooling
         aleph-setup # a setup tool that guides you through setting up wifi and a user on first login
@@ -46,7 +46,7 @@
         mekf # a basic attitude mekf that runs on the sensor data from the expansion board
       ];
 
-      # overlays required to get elodin and nvidia packages
+      # overlays required to get metor and nvidia packages
       nixpkgs.overlays = [
         aleph.overlays.default
         aleph.overlays.jetpack

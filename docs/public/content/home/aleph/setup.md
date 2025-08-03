@@ -110,7 +110,7 @@ Aleph ships with root access enabled by default. We recommend disabling root acc
 
 ### Accessing Sensor Data
 
-Aleph comes with a variety of sensors pre-installed. The simplest way to access them is through serial connecting to elodin-db using http
+Aleph comes with a variety of sensors pre-installed. The simplest way to access them is through serial connecting to metor-db using http
 
 ```sh
 # stream accel data
@@ -145,11 +145,11 @@ The carrier board runs a custom Linux distribution with a pre-installed SSH serv
 ssh root@fde1:2240:a1ef::1
 ```
 
-### Connect via Elodin Editor
+### Connect via Metor Editor
 
-First install Elodin Editor using the instructions in [Quick Start](/home/quickstart#install)
+First install Metor Editor using the instructions in [Quick Start](/home/quickstart#install)
 
-Next launch Elodin. You should be greeted with a startup window. You can connect to Aleph by selecting the "Connect to IP Address" option from the menu and entering `[fde1:2240:a1ef::1]:2240` in the IP address field.
+Next launch Metor. You should be greeted with a startup window. You can connect to Aleph by selecting the "Connect to IP Address" option from the menu and entering `[fde1:2240:a1ef::1]:2240` in the IP address field.
 
 
 <img src="/assets/aleph-connect.png" alt="screenshot of editor connecting to aleph"/>

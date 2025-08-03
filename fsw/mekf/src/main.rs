@@ -181,7 +181,7 @@ struct Args {
 }
 
 fn default_glb() -> String {
-    "https://storage.googleapis.com/elodin-marketing/models/aleph.glb".to_string()
+    "https://storage.googleapis.com/metor-marketing/models/aleph.glb".to_string()
 }
 
 fn main() -> anyhow::Result<()> {

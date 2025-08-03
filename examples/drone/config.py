@@ -3,7 +3,7 @@ import typing as ty
 from dataclasses import dataclass
 from enum import Enum
 
-import elodin as el
+import metor as el
 import numpy as np
 import util
 from numpy._typing import NDArray

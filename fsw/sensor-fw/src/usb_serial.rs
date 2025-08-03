@@ -49,7 +49,7 @@ impl<'a> UsbSerial<'a> {
 
         // Create USB device with VID/PID identifying as a CDC ACM serial port
         let device = UsbDeviceBuilder::new(usb_bus, UsbVidPid(0x16c0, 0x27dd))
-            .manufacturer("Elodin")
+            .manufacturer("Metor")
             .product("Aleph Carrier Serial Port")
             .serial_number("224C1")
             .device_class(usbd_serial::USB_CLASS_CDC)

@@ -10,4 +10,4 @@ resources:
   - deployment.yaml
   - service.yaml
 
-namespace: elodin-app
+namespace: metor-app

@@ -1,5 +1,5 @@
 +++
-title = "Elodin Documentation"
+title = "Metor Documentation"
 redirect_to = "/home"
 
 # Menu items

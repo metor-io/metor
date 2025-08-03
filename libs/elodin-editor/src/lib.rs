@@ -140,7 +140,7 @@ impl Plugin for EditorPlugin {
                     .set(WindowPlugin {
                         primary_window: Some(Window {
                             window_theme: Some(WindowTheme::Dark),
-                            title: "Elodin".into(),
+                            title: "Metor".into(),
                             present_mode: PresentMode::AutoVsync,
                             canvas: Some("#editor".to_string()),
                             resolution: self.window_resolution.clone(),
@@ -1029,5 +1029,5 @@ pub fn set_eql_context_range(time_range: Res<SelectedTimeRange>, mut eql: ResMut
 }
 
 pub fn dirs() -> directories::ProjectDirs {
-    directories::ProjectDirs::from("systems", "elodin", "editor").unwrap()
+    directories::ProjectDirs::from("systems", "metor", "editor").unwrap()
 }

@@ -1,6 +1,6 @@
 +++
 title = "Coordinate Systems"
-description = "Coordinate Systems in Elodin"
+description = "Coordinate Systems in Metor"
 draft = false
 weight = 102
 sort_by = "weight"
@@ -13,12 +13,12 @@ order = 2
 +++
 
 
-The default coordinate systems used in Elodin align with the editor's representation of the (X, Y, Z)
+The default coordinate systems used in Metor align with the editor's representation of the (X, Y, Z)
 axes as (red, green, blue) respectively. Also, all coordinate systems are right-handed.
 
 ### Local Geodetic World Frame
 
-{% image(href="/assets/coordinates") %}Elodin Default Coordinate System{% end %}
+{% image(href="/assets/coordinates") %}Metor Default Coordinate System{% end %}
 
 A local geodetic world frame is commonly used for terrestrial vehicles and is represented using
 the [East, North, Up (ENU)](https://en.wikipedia.org/wiki/Local_tangent_plane_coordinates#Local_east,_north,_up_(ENU)_coordinates)
@@ -65,7 +65,7 @@ Similar to ECEF, ECI itself is not a precise coordinate system. [GCRS](https://e
 {% alert(kind="info") %}
 "J2000" refers to 4 related but different frames: J2000 proper is barycentric, not earth centric; ICRF which is barycentric & offset from
 J2000 by 0.1 arc seconds; "J2000 earth-centric" is aligned with "J2000", but centered on earth; finally GCRS/GCRF is signed with ICRF but
-centered on Earth. We typically use ICRF as the default ECI frame in Elodin examples. References:
+centered on Earth. We typically use ICRF as the default ECI frame in Metor examples. References:
 [(1)](https://naif.jpl.nasa.gov/pub/naif/toolkit_docs/Tutorials/pdf/individual_docs/17_frames_and_coordinate_systems.pdf)
 [(2)](https://space.stackexchange.com/questions/26259/what-is-the-difference-between-gcrs-and-j2000-frames)
 [(3)](https://en.wikipedia.org/wiki/Barycentric_and_geocentric_celestial_reference_systems)

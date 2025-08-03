@@ -54,11 +54,11 @@ install_db() {
   version=$3
 
   if [ "$os" = "Darwin" ] && [ "$arch" = "arm64" ]; then
-    download_url="https://storage.googleapis.com/elodin-releases/$version/elodin-db-aarch64-apple-darwin.tar.gz"
+    download_url="https://storage.googleapis.com/metor-releases/$version/metor-db-aarch64-apple-darwin.tar.gz"
   elif [ "$os" = "Linux" ] && [ "$arch" = "aarch64" ]; then
-    download_url="https://storage.googleapis.com/elodin-releases/$version/elodin-db-aarch64-unknown-linux-musl.tar.gz"
+    download_url="https://storage.googleapis.com/metor-releases/$version/metor-db-aarch64-unknown-linux-musl.tar.gz"
   elif [ "$os" = "Linux" ] && [ "$arch" = "x86_64" ]; then
-    download_url="https://storage.googleapis.com/elodin-releases/$version/elodin-db-x86_64-unknown-linux-musl.tar.gz"
+    download_url="https://storage.googleapis.com/metor-releases/$version/metor-db-x86_64-unknown-linux-musl.tar.gz"
   else
     echo "Unsupported (OS, arch): ($os, $arch)"
     exit 1
@@ -66,7 +66,7 @@ install_db() {
 
   echo "Downloading $download_url"
   curl -L -# "$download_url" | tar xz --strip-components=1 -C "$HOME/.local/bin"
-  version=$("$HOME/.local/bin/elodin-db" --version)
+  version=$("$HOME/.local/bin/metor-db" --version)
   echo "Installed $version to \$HOME/.local/bin"
 }
 

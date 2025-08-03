@@ -1,7 +1,7 @@
 {pkgs, ...}: {
   systemd.services.mekf = with pkgs; {
     wantedBy = ["multi-user.target"];
-    after = ["elodin-db.service"];
+    after = ["metor-db.service"];
     description = "start mekf";
     serviceConfig = {
       Type = "exec";

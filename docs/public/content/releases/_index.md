@@ -1,6 +1,6 @@
 +++
 title = "Release Notes"
-description = "Notes about Elodin release changes."
+description = "Notes about Metor release changes."
 sort_by = "weight"
 weight = 1
 redirect_to = "/releases/changelog"

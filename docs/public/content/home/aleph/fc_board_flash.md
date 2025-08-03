@@ -14,18 +14,18 @@ icon = ""
 +++
 
 
-The expansion board has a built-in RP2040-based programmer that is pre-flashed with [debugprobe firmware](https://github.com/elodin-sys/debugprobe)
+The expansion board has a built-in RP2040-based programmer that is pre-flashed with [debugprobe firmware](https://github.com/metor-sys/debugprobe)
 that allows it to function as a CMSIS-DAP probe. This makes it easy to flash new firmware onto the FC board over USB using standard tools such as
 [probe-rs](https://probe.rs/docs/getting-started/installation) or [OpenOCD](https://openocd.org/). We recommend using probe-rs because it has less of a configuration burden, and
 has out-of-the-box support for RTT (Real-Time Transfer) logging.
 
 ### Building the expansion boards default firmware
 
-Clone the `elodin` repository and navigate to the `fsw` directory:
+Clone the `metor` repository and navigate to the `fsw` directory:
 
 ```sh
-git clone https://github.com/elodin-sys/elodin.git
-cd elodin/fsw
+git clone https://github.com/metor-sys/metor.git
+cd metor/fsw
 ```
 
 The `fsw` directory contains several example projects, navigate into the `sensor-fw` directory & follow the build instructions there. The

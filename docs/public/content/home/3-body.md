@@ -23,10 +23,10 @@ a few stable configurations of the three-body problem.
 In this tutorial, we will model one of the stable configurations from
 R. A. Broucke's technical report ["Period Orbits in the Restricted Three-Body Problem with Earth Moon Masses"](https://ntrs.nasa.gov/api/citations/19680013800/downloads/19680013800.pdf).
 
-#### Import Elodin and JAX
-Our first step is to import Elodin and Jax into our environment:
+#### Import Metor and JAX
+Our first step is to import Metor and Jax into our environment:
 ```python
-import elodin as el
+import metor as el
 from jax import numpy as jnp
 from jax.numpy import linalg as la
 
@@ -106,7 +106,7 @@ because we're working in a 3D space. Sometimes you may have to convert between t
 {% end %}
 
 Let's model this as a system that iterates over all gravity edges in a graph of connected bodies and calculates the forces between them.
-Modeling with graphs and edges is a more advanced Elodin API, review the documentation for it [here](/reference/python-api/#class-elodin-graphquery).
+Modeling with graphs and edges is a more advanced Metor API, review the documentation for it [here](/reference/python-api/#class-metor-graphquery).
 
 {% image(href="/assets/gravity-edge") %}Gravity Constraints{% end %}
 
@@ -260,7 +260,7 @@ Start the simulation again to see the gizmos in action.
 And that's it! You can now run the simulation and see the three bodies orbiting around each other in a stable configuration.
 If you'd like to check your work, you can use the following command to generate the matching template code:
 ```bash
-elodin create --template three-body
+metor create --template three-body
 ```
 
 #### Make it fancy
@@ -275,7 +275,7 @@ import random
 import json
 
 # URL of Bourke's stable orbits JSON data
-url = "https://docs.elodin.systems/assets/brouke-stable-orbits.json"
+url = "https://docs.metor.systems/assets/brouke-stable-orbits.json"
 
 # Fetch data and select a random orbit
 orbit = random.choice(json.loads(requests.get(url).text))
@@ -358,7 +358,7 @@ And voila, you have a randomly selected stable three-body system!
 You'll notice all of the simulations we've done here are in the x-y plane. As a further exercise, you could try to extend
 what you've learned here to find and apply the starting configurations for stable three-body systems in all three dimensions.
 
-Post what you discover in the [Elodin Discord](https://discord.gg/7vzr8j6)!
+Post what you discover in the [Metor Discord](https://discord.gg/7vzr8j6)!
 
 ## Next Steps
 

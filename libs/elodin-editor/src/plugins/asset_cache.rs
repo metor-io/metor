@@ -39,7 +39,7 @@ pub struct FsCache {
 impl FsCache {
     #[cfg(not(target_family = "wasm"))]
     pub fn new() -> Self {
-        let dirs = directories::ProjectDirs::from("systems", "elodin", "cli").unwrap();
+        let dirs = directories::ProjectDirs::from("systems", "metor", "cli").unwrap();
         let cache_dir = dirs.cache_dir().to_path_buf();
         std::fs::create_dir_all(&cache_dir).unwrap();
         Self { cache_dir }

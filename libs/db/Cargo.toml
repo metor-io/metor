@@ -1,15 +1,15 @@
 [package]
-name = "elodin-db"
+name = "metor-db"
 license = "MIT OR Apache-2.0"
 version.workspace = true
 repository.workspace = true
 edition = "2024"
 publish = true
-description = "Elodin Database"
+description = "Metor Database"
 authors = [
-    "sascha@elodin.systems",
-    "akhil@elodin.systems",
-    "van@elodin.systems",
+    "sascha@metor.systems",
+    "akhil@metor.systems",
+    "van@metor.systems",
 ]
 
 [package.metadata.wix]

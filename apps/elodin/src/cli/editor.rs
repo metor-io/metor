@@ -1,11 +1,8 @@
 use bevy::prelude::*;
 use bevy::window::{PrimaryWindow, WindowResized};
-use core::fmt;
-use elodin_editor::EditorPlugin;
-use miette::{IntoDiagnostic, miette};
+use metor_editor::EditorPlugin;
+use miette::IntoDiagnostic;
 use std::io::{Read, Seek, Write};
-use std::net::{Ipv6Addr, SocketAddr};
-use std::path::PathBuf;
 use stellarator::util::CancelToken;
 use tokio::runtime::Runtime;
 

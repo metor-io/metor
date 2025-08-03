@@ -11,7 +11,7 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::time::Duration;
 
-/// Video streamer that encodes video files to AV1 and sends OBUs to elodin-db
+/// Video streamer that encodes video files to AV1 and sends OBUs to metor-db
 #[derive(Parser, Debug)]
 #[clap(author, version, about)]
 struct Args {
@@ -19,7 +19,7 @@ struct Args {
 
     msg_name: String,
 
-    /// Elodin DB address in the format IP:PORT
+    /// Metor DB address in the format IP:PORT
     #[clap(short, long, default_value = "127.0.0.1:2240")]
     db_addr: SocketAddr,
 
@@ -43,7 +43,7 @@ impl Args {
     pub async fn run(&mut self) -> anyhow::Result<()> {
         let mut client = Client::connect(self.db_addr)
             .await
-            .context("Failed to connect to elodin-db")?;
+            .context("Failed to connect to metor-db")?;
         ffmpeg::init().context("Failed to initialize FFmpeg")?;
 
         let mut ictx = ffmpeg::format::input(&self.input).context("ffmpeg input not found")?;
@@ -161,7 +161,7 @@ impl Args {
                         if client.send(pkt).await.0.is_err() {
                             client = Client::connect(self.db_addr)
                                 .await
-                                .context("Failed to connect to elodin-db")?;
+                                .context("Failed to connect to metor-db")?;
                         }
                     }
                     pkt_timestamp.0 += 1;

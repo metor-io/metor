@@ -1,8 +1,8 @@
 [package]
-name = "gst-elodin-plugin"
+name = "gst-metor-plugin"
 version = "0.1.0"
 edition = "2021"
-description = "GStreamer plugin that streams Annex B NAL units to elodin-db"
+description = "GStreamer plugin that streams Annex B NAL units to metor-db"
 
 [dependencies]
 gstreamer = { version = "0.23", features = ["v1_18"] }
@@ -18,7 +18,7 @@ impeller2-wkt = { path = "../../libs/impeller2/wkt" }
 anyhow = "1.0"
 
 [lib]
-name = "gstelodin"
+name = "gstmetor"
 crate-type = ["cdylib"]
 path = "src/lib.rs"
 

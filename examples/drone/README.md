@@ -2,7 +2,7 @@
 
 ## Simulation Coordinate System
 
-This simulation uses a local geodetic world frame and the ["default" Elodin coordinate systems](https://docs.elodin.systems/reference/coords/) for both the body frame and the world frame:
+This simulation uses a local geodetic world frame and the ["default" Metor coordinate systems](https://docs.metor.systems/reference/coords/) for both the body frame and the world frame:
 - In body frame, (+X, +Y, +Z) axes correspond to (forward, left, up) respectively
 - In world frame, (+X, +Y, +Z) axes correspond to (East, North, Up) respectively
 
@@ -11,7 +11,7 @@ This simulation uses a local geodetic world frame and the ["default" Elodin coor
 ## Run simulation
 
 ```
-elodin editor main.py
+metor editor main.py
 ```
 
 ## Run INDI analysis notebook

@@ -1,6 +1,6 @@
 # Public Docs
 
-Elodin Documentation is statically built using:    
+Metor Documentation is statically built using:    
 
 [Zola](https://www.getzola.org/): Static site generator and server
 [Tera](https://keats.github.io/tera/): Templating engine for Zola

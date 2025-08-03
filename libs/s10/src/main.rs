@@ -56,7 +56,7 @@ impl Config {
 
     pub fn parse(path: Option<String>) -> Result<Self, Error> {
         let config_paths = [
-            std::env::var("S10_CONFIG").unwrap_or_else(|_| "/etc/elodin/s10.toml".to_string()),
+            std::env::var("S10_CONFIG").unwrap_or_else(|_| "/etc/metor/s10.toml".to_string()),
             "./s10.toml".to_string(),
         ];
         for path in path.into_iter().chain(config_paths) {

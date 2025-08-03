@@ -16,21 +16,21 @@
       cp -r ./public/* $out/
     '';
   };
-  cfg = config.services.elodin-docs;
+  cfg = config.services.metor-docs;
 in {
-  options.services.elodin-docs = {
+  options.services.metor-docs = {
     enable = lib.mkOption {
       type = lib.types.bool;
       default = true;
       description = ''
-        Whether to enable the elodin-docs service.
+        Whether to enable the metor-docs service.
       '';
     };
     port = lib.mkOption {
       type = lib.types.port;
       default = 80;
       description = ''
-        Specifies on which port the elodin-docs service listens.
+        Specifies on which port the metor-docs service listens.
       '';
     };
     openFirewall = lib.mkOption {
@@ -43,22 +43,22 @@ in {
   };
   config = lib.mkIf cfg.enable {
     # Create a dedicated user and group for the service
-    users.users.elodin-docs = {
+    users.users.metor-docs = {
       isSystemUser = true;
-      group = "elodin-docs";
-      description = "Elodin Documentation Server user";
+      group = "metor-docs";
+      description = "Metor Documentation Server user";
       home = "/var/empty";
     };
-    users.groups.elodin-docs = {};
+    users.groups.metor-docs = {};
 
-    systemd.services.elodin-docs = {
-      description = "Elodin Documentation Server";
+    systemd.services.metor-docs = {
+      description = "Metor Documentation Server";
       wantedBy = ["multi-user.target"];
       after = ["network.target"];
       serviceConfig = {
         # Basic service settings
-        User = "elodin-docs";
-        Group = "elodin-docs";
+        User = "metor-docs";
+        Group = "metor-docs";
         ExecStart = "${pkgs.memserve}/bin/memserve --bind-address [::]:${toString cfg.port} --log-level debug";
         WorkingDirectory = "${content}";
         Restart = "on-failure";

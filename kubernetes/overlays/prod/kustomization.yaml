@@ -7,21 +7,21 @@ resources:
 patches:
 - target:
     kind: Ingress
-    name: elodin
+    name: metor
   patch: |-
     - op: replace
       path: /spec/rules/0/host
-      value: docs.elodin.systems
+      value: docs.metor.systems
 - target:
-    namespace: elodin-app
+    namespace: metor-app
   patch: |-
     - op: replace
       path: /metadata/namespace
-      value: elodin-app-prod
+      value: metor-app-prod
 - target:
     kind: Namespace
-    name: elodin-app
+    name: metor-app
   patch: |-
     - op: replace
       path: /metadata/name
-      value: elodin-app-prod
+      value: metor-app-prod

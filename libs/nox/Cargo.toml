@@ -4,7 +4,7 @@ license = "MIT OR Apache-2.0"
 version.workspace = true
 edition = "2024"
 description = "Tensor library that compiles to XLA (like JAX, but for Rust)."
-repository = "https://github.com/elodin-sys/elodin"
+repository = "https://github.com/metor-sys/metor"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 

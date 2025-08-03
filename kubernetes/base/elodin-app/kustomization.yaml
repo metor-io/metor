@@ -6,4 +6,4 @@ resources:
 - ingress.yaml
 - ./elo-docs/
 
-namespace: elodin-app
+namespace: metor-app

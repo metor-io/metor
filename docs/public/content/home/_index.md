@@ -1,6 +1,6 @@
 +++
 title = "Overview"
-description = "Elodin Overview."
+description = "Metor Overview."
 sort_by = "weight"
 weight = 1
 redirect_to = "/home/quickstart"

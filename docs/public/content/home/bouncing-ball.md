@@ -25,13 +25,13 @@ In this tutorial, we'll model a bouncing ball in a windy environment. This will 
 
 As a starting point, let's first setup a world with just a ball and gravity.
 
-#### Import Elodin and JAX
+#### Import Metor and JAX
 First, let's import our required libraries:
 ```python
 import typing
 from dataclasses import field
 
-import elodin as el
+import metor as el
 import jax
 from jax import numpy as jnp
 from jax import random
@@ -70,8 +70,8 @@ def world() -> el.World:
     return world
 ```
 
-We create a new elodin world, spawn an entity named "Ball" with a sphere mesh shape component, and a body archetype
-which provides the ball with a position, velocity, and other aspects related to the Elodin 6DoF system
+We create a new metor world, spawn an entity named "Ball" with a sphere mesh shape component, and a body archetype
+which provides the ball with a position, velocity, and other aspects related to the Metor 6DoF system
 (see the [6DoF reference for more info](http://127.0.0.1:1111/reference/python-api/#6-degrees-of-freedom-model)).
 We also spawn a viewport and a line to visualize the ball's position.
 
@@ -85,7 +85,7 @@ def gravity(f: el.Force, inertia: el.Inertia) -> el.Force:
 ```
 
 {% alert(kind="info") %}
-Let's take a moment to understand the use of `@el.map`. This decorator creates an Elodin system from a function.
+Let's take a moment to understand the use of `@el.map`. This decorator creates an Metor system from a function.
 The inputs of the function acts a filter for which entities this applies to.  In this case, when the system is
 integrated, the entities that have a `Force` and `Inertia` component will have this function applied to them. The function returns the
 updated force, which is then used to update the velocity and position of the ball during integration in the system function below.
@@ -146,7 +146,7 @@ def system() -> el.System:
     return sys
 ```
 {% alert(kind="notice") %}
-Notice we use a pipe `|` to combine the systems. This is a powerful concept in Elodin that allows you to chain systems together.
+Notice we use a pipe `|` to combine the systems. This is a powerful concept in Metor that allows you to chain systems together.
 {% end %}
 
 {% alert(kind="info") %}
@@ -269,7 +269,7 @@ def apply_drag(w: el.Query[Wind],
 ```
 
 {% alert(kind="info") %}
-Let's take a moment to understand `@el.system`, a lower level API for composing raw systems in Elodin:
+Let's take a moment to understand `@el.system`, a lower level API for composing raw systems in Metor:
 ```python
 def apply_drag(w: el.Query[Wind],
                 q: el.Query[el.Force, el.WorldVel]) -> el.Query[el.Force]
@@ -277,7 +277,7 @@ def apply_drag(w: el.Query[Wind],
 When this system is run, it will query for entities with the `Wind` component and entities with both `Force` and `WorldVel` components. These
 are provided as arrays of matching entities to the function body as `w` and `q` respectively. The function body is then expected to return a
 new Query of `Force` component attached entities, which in this case the Query.map function provides. See
-[Query.map](reference/python-api/#class-elodin-query) for more details.
+[Query.map](reference/python-api/#class-metor-query) for more details.
 {% end %}
 
 #### Update the System Function
@@ -354,7 +354,7 @@ meaning the ball will lose 15% of its energy on each bounce.
 
 ### Make it Windy, Simpler
 
-Crafting a simulation in Elodin allows for approaching a problem in multiple ways. We can simplify our wind simulation
+Crafting a simulation in Metor allows for approaching a problem in multiple ways. We can simplify our wind simulation
 by considering the wind not as a global constant, but instead as a force that affects the ball directly, as experienced from the perspective
 of the ball entity. This will allow us to use the same `apply_drag` system, but using the `@el.map` decorator instead of `@el.system`,
 allowing for a simpler implementation.
@@ -418,7 +418,7 @@ Success! We've added a wind force to our simulation. The ball now bounces around
 affecting its trajectory, steadily blowing the ball in a single direction, losing energy as it bounces.
 If you'd like to check your work, you can use the following command to generate the matching template code:
 ```bash
-elodin create --template ball
+metor create --template ball
 ```
 
 {% alert(kind="notice") %}
@@ -428,6 +428,6 @@ You'll notice that the template code is broken into multiple files, this is mean
 
 ## Next Steps
 
-{% cardlink(title="The Tao of Elodin", icon="book", href="/home/tao/introduction") %}
-Learn about the design principles behind Elodin.
+{% cardlink(title="The Tao of Metor", icon="book", href="/home/tao/introduction") %}
+Learn about the design principles behind Metor.
 {% end %}

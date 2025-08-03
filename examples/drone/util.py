@@ -1,4 +1,4 @@
-import elodin as el
+import metor as el
 import jax
 import numpy as np
 from jax import numpy as jnp

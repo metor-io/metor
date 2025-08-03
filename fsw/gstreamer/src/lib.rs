@@ -2,23 +2,23 @@ use gstreamer as gst;
 use gstreamer::glib;
 
 fn plugin_init(plugin: &gst::Plugin) -> Result<(), glib::BoolError> {
-    elodinsink::ElodinSink::register(plugin)?;
+    metorsink::MetorSink::register(plugin)?;
     Ok(())
 }
 
 gst::plugin_define!(
-    elodin,
+    metor,
     env!("CARGO_PKG_DESCRIPTION"),
     plugin_init,
     env!("CARGO_PKG_VERSION"),
     "MIT",
-    "Elodin",
+    "Metor",
     env!("CARGO_PKG_NAME"),
-    "https://github.com/elodin-project/elodin",
+    "https://github.com/metor-project/metor",
     "2025-05-012" // dates make deterministic builds hard
 );
 
-mod elodinsink {
+mod metorsink {
     use gstreamer::{self as gst, glib};
     use gstreamer::{prelude::*, subclass::prelude::*};
     use gstreamer_base::subclass::prelude::*;
@@ -31,15 +31,15 @@ mod elodinsink {
     };
 
     glib::wrapper! {
-        pub struct ElodinSink(ObjectSubclass<imp::ElodinSink>)
+        pub struct MetorSink(ObjectSubclass<imp::MetorSink>)
             @extends gstreamer_base::BaseSink, gstreamer::Element, gstreamer::Object;
     }
 
-    impl ElodinSink {
+    impl MetorSink {
         pub fn register(plugin: &gst::Plugin) -> Result<(), glib::BoolError> {
             gst::Element::register(
                 Some(plugin),
-                "elodinsink",
+                "metorsink",
                 gst::Rank::NONE,
                 Self::static_type(),
             )
@@ -52,17 +52,17 @@ mod elodinsink {
 
         use super::*;
 
-        pub struct ElodinSink {
-            state: Mutex<ElodinSinkState>,
+        pub struct MetorSink {
+            state: Mutex<MetorSinkState>,
         }
 
-        pub struct ElodinSinkState {
+        pub struct MetorSinkState {
             pub db_addr: SocketAddr,
             pub connection: Option<TcpStream>,
             pub msg_name: String,
         }
 
-        impl Default for ElodinSinkState {
+        impl Default for MetorSinkState {
             fn default() -> Self {
                 Self {
                     db_addr: SocketAddr::new([127, 0, 0, 1].into(), 2240),
@@ -72,7 +72,7 @@ mod elodinsink {
             }
         }
 
-        impl ElodinSink {
+        impl MetorSink {
             fn connect(&self) -> Result<(), gst::ErrorMessage> {
                 let mut state = self.state.lock().unwrap();
 
@@ -92,7 +92,7 @@ mod elodinsink {
                     Err(err) => Err(gst::error_msg!(
                         gst::ResourceError::OpenRead,
                         [
-                            "failed to connect to elodin-db at {}: {}",
+                            "failed to connect to metor-db at {}: {}",
                             state.db_addr,
                             err
                         ]
@@ -124,7 +124,7 @@ mod elodinsink {
                 } else {
                     return Err(gst::error_msg!(
                         gst::ResourceError::NotFound,
-                        ["No connection to elodin-db"]
+                        ["No connection to metor-db"]
                     ));
                 }
 
@@ -133,25 +133,25 @@ mod elodinsink {
         }
 
         #[glib::object_subclass]
-        impl ObjectSubclass for ElodinSink {
-            const NAME: &'static str = "GstElodinSink";
-            type Type = super::ElodinSink;
+        impl ObjectSubclass for MetorSink {
+            const NAME: &'static str = "GstMetorSink";
+            type Type = super::MetorSink;
             type ParentType = gstreamer_base::BaseSink;
 
             fn new() -> Self {
                 Self {
-                    state: Mutex::new(ElodinSinkState::default()),
+                    state: Mutex::new(MetorSinkState::default()),
                 }
             }
         }
 
-        impl ObjectImpl for ElodinSink {
+        impl ObjectImpl for MetorSink {
             fn properties() -> &'static [glib::ParamSpec] {
                 static PROPERTIES: LazyLock<Vec<glib::ParamSpec>> = LazyLock::new(|| {
                     vec![
                         glib::ParamSpecString::builder("db-address")
-                            .nick("elodin-db addr")
-                            .blurb("The address of the elodin-db instance (e.g., 127.0.0.1:2240)")
+                            .nick("metor-db addr")
+                            .blurb("The address of the metor-db instance (e.g., 127.0.0.1:2240)")
                             .default_value(Some("127.0.0.1:2240"))
                             .readwrite()
                             .build(),
@@ -207,17 +207,17 @@ mod elodinsink {
             }
         }
 
-        impl GstObjectImpl for ElodinSink {}
+        impl GstObjectImpl for MetorSink {}
 
-        impl ElementImpl for ElodinSink {
+        impl ElementImpl for MetorSink {
             fn metadata() -> Option<&'static gst::subclass::ElementMetadata> {
                 static ELEMENT_METADATA: LazyLock<gst::subclass::ElementMetadata> =
                     LazyLock::new(|| {
                         gst::subclass::ElementMetadata::new(
-                            "Elodin Sink",
+                            "Metor Sink",
                             "Sink/Network",
-                            "Send H.264 NAL units to elodin-db",
-                            "Elodin",
+                            "Send H.264 NAL units to metor-db",
+                            "Metor",
                         )
                     });
 
@@ -246,7 +246,7 @@ mod elodinsink {
             }
         }
 
-        impl BaseSinkImpl for ElodinSink {
+        impl BaseSinkImpl for MetorSink {
             fn start(&self) -> Result<(), gst::ErrorMessage> {
                 self.connect()
             }

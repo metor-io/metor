@@ -14,17 +14,17 @@ order = 3
 
 ## World
 
-An Elodin simulation begins with a `World` object. The `World` object is the root of the simulation hierarchy and provides methods for composing
+An Metor simulation begins with a `World` object. The `World` object is the root of the simulation hierarchy and provides methods for composing
 and running the simulation. The `World` object also provides helper methods for displaying entities and graphs in the editor.
 
-### _class_ `elodin.World`
+### _class_ `metor.World`
 
-The Elodin simulation world.
-- `__init__()` -> [elodin.World]
+The Metor simulation world.
+- `__init__()` -> [metor.World]
 
     Create a new world object.
 
-- `spawn(archetypes, name)` -> [elodin.EntityId]
+- `spawn(archetypes, name)` -> [metor.EntityId]
 
     Spawn a new entity with the given archetypes and name.
     - `archetypes` : one or many [Archetypes],
@@ -33,46 +33,46 @@ The Elodin simulation world.
 - `insert(id, archetypes)` -> None
 
     Insert archetypes into an existing entity.
-    - `id` : [elodin.EntityId], the id of the entity to insert into.
+    - `id` : [metor.EntityId], the id of the entity to insert into.
     - `archetypes` : one or many [Archetypes]
 
 - `insert_asset(asset)` -> handle reference
 
     Insert a 3D asset into the world.
-    - `asset` [elodin.Mesh] | [elodin.Material] : the asset to insert, allows for loading the mesh once and using it in multiple shapes.
+    - `asset` [metor.Mesh] | [metor.Material] : the asset to insert, allows for loading the mesh once and using it in multiple shapes.
 
-- `shape(mesh, material)` -> [elodin.Shape]
+- `shape(mesh, material)` -> [metor.Shape]
 
-    Create a shape as an Elodin Shape Archetype.
+    Create a shape as an Metor Shape Archetype.
     - `mesh`: the mesh of the shape,
     - `material`: the material of the shape
 
-- `glb(url)` -> [elodin.Scene]
+- `glb(url)` -> [metor.Scene]
 
-    Load a GLB asset as an Elodin Scene Archetype.
+    Load a GLB asset as an Metor Scene Archetype.
     - `url`: the URL or filepath of the GLB asset
 
 - `run(system, sim_time_step, run_time_step, default_playback_speed, max_ticks, optimize)` -> None
 
     Run the simulation.
-    - `system` : [elodin.System], the systems to run, can be supplied as a list of systems delineated by pipes.
+    - `system` : [metor.System], the systems to run, can be supplied as a list of systems delineated by pipes.
     - `sim_time_step` : `float`, optional, the amount of simulated time between each tick, defaults to 1 / 120.0.
     - `run_time_step` : `float`, optional, the amount of real time between each tick, defaults to real-time playback by matching the `sim_time_step`.
-    - `default_playback_speed` : `float`, optional, the default playback speed of the Elodin client when running this simulation, defaults to 1.0 (real-time).
+    - `default_playback_speed` : `float`, optional, the default playback speed of the Metor client when running this simulation, defaults to 1.0 (real-time).
     - `max_ticks` : `integer`, optional, the maximum number of ticks to run the simulation for before stopping.
     - `optimize` : `bool`, optional flag to enable runtime optimizations for the simulation code, defaults to `False`. If optimizations are enabled, the simulation will start slower but run faster.
 
-### _class_ `elodin.EntityId`
-Integer reference identifier for entities in Elodin.
+### _class_ `metor.EntityId`
+Integer reference identifier for entities in Metor.
 
-### _class_ `elodin.Panel`
-A configuration object for creating a panel view in the Elodin Client UI.
+### _class_ `metor.Panel`
+A configuration object for creating a panel view in the Metor Client UI.
 
-- `Panel.viewport(track_entity, track_rotation, fov, active, pos, looking_at, show_grid, hdr, name)` -> [elodin.Panel]
+- `Panel.viewport(track_entity, track_rotation, fov, active, pos, looking_at, show_grid, hdr, name)` -> [metor.Panel]
 
     Create a viewport panel.
 
-    - `track_entity` : [elodin.EntityId], optional, the entity to track.
+    - `track_entity` : [metor.EntityId], optional, the entity to track.
     - `track_rotation` : `boolean`, whether to track the rotation of the entity, defaults to `True`.
     - `fov` : `float`, the field of view of the camera, defaults to `45.0`.
     - `active` : `boolean`, whether the panel is active, defaults to `False`.
@@ -82,78 +82,78 @@ A configuration object for creating a panel view in the Elodin Client UI.
     - `hdr` : `boolean`, whether to use HDR rendering, defaults to `False`.
     - `name` : `string`, optional, the name of the panel.
 
-- `Panel.graph(*entities, name)` -> [elodin.Panel]
+- `Panel.graph(*entities, name)` -> [metor.Panel]
 
     Create a graph panel.
 
-    - `*entities` : Sequence of [elodin.GraphEntity] objects to include in the graph.
+    - `*entities` : Sequence of [metor.GraphEntity] objects to include in the graph.
     - `name` : `string`, optional, the name of the panel.
 
-- `Panel.vsplit(*panels, active)` -> [elodin.Panel]
+- `Panel.vsplit(*panels, active)` -> [metor.Panel]
 
     Create a vertical split panel.
 
-    - `*panels` : Sequence of [elodin.Panel] objects to vertically split across.
+    - `*panels` : Sequence of [metor.Panel] objects to vertically split across.
     - `active` : `boolean`, whether the panel is active, defaults to `False`.
 
-- `Panel.hsplit(*panels, active)` -> [elodin.Panel]
+- `Panel.hsplit(*panels, active)` -> [metor.Panel]
 
     Create a horizontal split panel.
 
-    - `*panels` : Sequence of [elodin.Panel] objects to horizontally split across.
+    - `*panels` : Sequence of [metor.Panel] objects to horizontally split across.
     - `active` : `boolean`, whether the panel is active, defaults to `False`.
 
-### _class_ `elodin.GraphEntity`
+### _class_ `metor.GraphEntity`
 
-A configuration object for creating a graph entity in the Elodin Client UI.
+A configuration object for creating a graph entity in the Metor Client UI.
 
-- `__init__(entity_id, *components)` -> [elodin.GraphEntity]
+- `__init__(entity_id, *components)` -> [metor.GraphEntity]
 
     Create a graph entity.
 
-    - `entity_id` : [elodin.EntityId], the entity to graph.
-    - `*components` : Sequence of `elodin.ShapeIndexer` indexes of components to graph.
+    - `entity_id` : [metor.EntityId], the entity to graph.
+    - `*components` : Sequence of `metor.ShapeIndexer` indexes of components to graph.
 
-###  _class_ `elodin.Mesh`
+###  _class_ `metor.Mesh`
 
 A built in class for creating basic 3D meshes.
 
-- `Mesh.cuboid(x: float, y: float, z: float)` -> [elodin.Mesh]
+- `Mesh.cuboid(x: float, y: float, z: float)` -> [metor.Mesh]
 
     Create a cuboid mesh with dimensions `x`, `y`, and `z`.
 
-- `Mesh.sphere(radius: float)` -> [elodin.Mesh]
+- `Mesh.sphere(radius: float)` -> [metor.Mesh]
 
     Create a sphere mesh with radius `radius`.
 
-###  _class_ `elodin.Material`
+###  _class_ `metor.Material`
 
 A built in class for creating basic 3D materials.
 
-- `Material.color(r: float, g: float, b: float)` -> [elodin.Material]
+- `Material.color(r: float, g: float, b: float)` -> [metor.Material]
 
     Create a material with RGB color values.
 
-### _class_ `elodin.Shape`
+### _class_ `metor.Shape`
 
-`Shape` describes a basic entity for rendering 3D assets in Elodin.
+`Shape` describes a basic entity for rendering 3D assets in Metor.
 
-- `__init__(mesh, material)` -> [elodin.Shape]
+- `__init__(mesh, material)` -> [metor.Shape]
 
   Create a shape archetype initialized to the provided mesh and material.
 
-  - `mesh` : handle reference returned from `World.insert_asset()` using the [elodin.Mesh] class.
-  - `material` : handle reference returned from `World.insert_asset()` using the [elodin.Material] class.
+  - `mesh` : handle reference returned from `World.insert_asset()` using the [metor.Mesh] class.
+  - `material` : handle reference returned from `World.insert_asset()` using the [metor.Material] class.
 
-### _class_ `elodin.Scene`
+### _class_ `metor.Scene`
 
 `Scene` describes a complex scene entity loaded from a glb file.
 
-- `__init__(glb)` -> [elodin.Scene]
+- `__init__(glb)` -> [metor.Scene]
 
   Create a scene from a loaded file.
 
-  - `glb` : handle reference returned from `World.insert_asset()` using the `elodin.Glb` class.
+  - `glb` : handle reference returned from `World.insert_asset()` using the `metor.Glb` class.
 
 
 #### Example
@@ -161,7 +161,7 @@ A built in class for creating basic 3D materials.
 This example creates a simple simulation with a spinning cuboid body:
 
 ```python
-import elodin as el
+import metor as el
 import jax.numpy as jnp
 
 @el.map
@@ -189,78 +189,78 @@ sim = w.run(sys, sim_time_step=1.0 / 120.0)
 <br></br>
 ## 6 Degrees of Freedom Model
 
-Elodin has a built-in [6 Degrees of Freedom](https://en.wikipedia.org/wiki/Six_degrees_of_freedom) (6DoF) system
+Metor has a built-in [6 Degrees of Freedom](https://en.wikipedia.org/wiki/Six_degrees_of_freedom) (6DoF) system
 implementation for simulating [rigid bodies](https://en.m.wikipedia.org/wiki/Rigid_body), such as flight vehicles.
-You can review the implementation [here](https://github.com/elodin-sys/elodin/blob/332957c41f609e1ccee36dbc48750ea59001c817/libs/nox-ecs/src/six_dof.rs).
-Using the associated [elodin.Body] archetype and prebuilt components, we can create a 6DoF system that aligns closely with this
+You can review the implementation [here](https://github.com/metor-sys/metor/blob/332957c41f609e1ccee36dbc48750ea59001c817/libs/nox-ecs/src/six_dof.rs).
+Using the associated [metor.Body] archetype and prebuilt components, we can create a 6DoF system that aligns closely with this
 [familiar model](https://www.mathworks.com/help/aeroblks/6dofquaternion.html) from Simulink.
 
-### _function_ `elodin.six_dof`
-- `six_dof(time_step, sys, integrator)` -> [elodin.System]
+### _function_ `metor.six_dof`
+- `six_dof(time_step, sys, integrator)` -> [metor.System]
 
     Create a system that models the 6DoF dynamics of a rigid body in 3D space. The provided set of systems can be integrated
     as effectors using the provided `integrator` and simulated in a world with a given `time_step`.
 
     - `time_step` : `float`, The time step used when integrating a body's acceleration into its velocity and position. Defaults
     to the `sim_time_step` provided in World.run(...) if unset
-    - `sys` : one or more [elodin.System] instances used as effectors
-    - `integrator` : [elodin.Integrator], default is `Integrator.Rk4`
+    - `sys` : one or more [metor.System] instances used as effectors
+    - `integrator` : [metor.Integrator], default is `Integrator.Rk4`
 
-### _class_ `elodin.Integrator`
+### _class_ `metor.Integrator`
 
-- `elodin.Integrator.Rk4` -> [elodin.Integrator]
+- `metor.Integrator.Rk4` -> [metor.Integrator]
 
-    Runge-Kutta 4th Order (RK4) Integrator: Elodin provides a built-in implementation for a [4th order Runge-Kutta integrator](https://en.wikipedia.org/wiki/Runge%E2%80%93Kutta_methods).
-    The RK4 integrator is a numerical method used to solve ordinary differential equations. You can review the implementation [here](https://github.com/elodin-sys/elodin/blob/332957c41f609e1ccee36dbc48750ea59001c817/libs/nox-ecs/src/integrator/rk4.rs).
+    Runge-Kutta 4th Order (RK4) Integrator: Metor provides a built-in implementation for a [4th order Runge-Kutta integrator](https://en.wikipedia.org/wiki/Runge%E2%80%93Kutta_methods).
+    The RK4 integrator is a numerical method used to solve ordinary differential equations. You can review the implementation [here](https://github.com/metor-sys/metor/blob/332957c41f609e1ccee36dbc48750ea59001c817/libs/nox-ecs/src/integrator/rk4.rs).
 
-- `elodin.Integrator.SemiImplicit` -> [elodin.Integrator]
+- `metor.Integrator.SemiImplicit` -> [metor.Integrator]
 
-    Semi-Implicit Integrator: Elodin provides a built-in implementation for a [semi-implicit Euler integrator](https://en.wikipedia.org/wiki/Semi-implicit_Euler_method).
-    The semi-implicit integrator is a numerical method used to solve ordinary differential equations. You can review the implementation [here](https://github.com/elodin-sys/elodin/blob/332957c41f609e1ccee36dbc48750ea59001c817/libs/nox-ecs/src/integrator/semi_implicit.rs).
+    Semi-Implicit Integrator: Metor provides a built-in implementation for a [semi-implicit Euler integrator](https://en.wikipedia.org/wiki/Semi-implicit_Euler_method).
+    The semi-implicit integrator is a numerical method used to solve ordinary differential equations. You can review the implementation [here](https://github.com/metor-sys/metor/blob/332957c41f609e1ccee36dbc48750ea59001c817/libs/nox-ecs/src/integrator/semi_implicit.rs).
 
-### _class_ `elodin.Body`
+### _class_ `metor.Body`
 
-`Body` is an archetype that represents the state of a rigid body with six degrees of freedom. It provides all of the spatial information necessary for the [elodin.six_dof] system
+`Body` is an archetype that represents the state of a rigid body with six degrees of freedom. It provides all of the spatial information necessary for the [metor.six_dof] system
 
-- `__init__(world_pos, world_vel, inertia, force, world_accel)` -> [elodin.Body]
+- `__init__(world_pos, world_vel, inertia, force, world_accel)` -> [metor.Body]
 
   Create a body archetype initialized to the provided values.
 
-  - `world_pos` : [elodin.WorldPos], default is SpatialTransform()
-  - `world_vel` : [elodin.WorldVel], default is SpatialMotion()
-  - `inertia` : [elodin.Inertia], default is SpatialInertia(1.0)
-  - `force` : [elodin.Force], default is SpatialForce()
-  - `world_accel` : [elodin.WorldAccel], default is SpatialMotion()
+  - `world_pos` : [metor.WorldPos], default is SpatialTransform()
+  - `world_vel` : [metor.WorldVel], default is SpatialMotion()
+  - `inertia` : [metor.Inertia], default is SpatialInertia(1.0)
+  - `force` : [metor.Force], default is SpatialForce()
+  - `world_accel` : [metor.WorldAccel], default is SpatialMotion()
 
   {% alert(kind="warning") %}
   Inertia is in body frame, all other representations are in the world frame.
   {% end %}
 
-    #### _class_ `elodin.WorldPos`
+    #### _class_ `metor.WorldPos`
 
-    `WorldPos` is an annotated [elodin.SpatialTransform] component that represents the world frame position of a body in 3D space. See [elodin.SpatialTransform] for usage.
+    `WorldPos` is an annotated [metor.SpatialTransform] component that represents the world frame position of a body in 3D space. See [metor.SpatialTransform] for usage.
 
-    #### _class_ `elodin.WorldVel`
+    #### _class_ `metor.WorldVel`
 
-    `WorldVel` is an annotated [elodin.SpatialMotion] component that represents the world frame velocity of a body in 3D space. See [elodin.SpatialMotion] for usage.
+    `WorldVel` is an annotated [metor.SpatialMotion] component that represents the world frame velocity of a body in 3D space. See [metor.SpatialMotion] for usage.
 
-    #### _class_ `elodin.Inertia`
+    #### _class_ `metor.Inertia`
 
-    `Inertia` is an annotated [elodin.SpatialInertia] component that represents the body frame inertia of a body in 3D space. See [elodin.SpatialInertia] for usage.
+    `Inertia` is an annotated [metor.SpatialInertia] component that represents the body frame inertia of a body in 3D space. See [metor.SpatialInertia] for usage.
 
-    #### _class_ `elodin.Force`
+    #### _class_ `metor.Force`
 
-    `Force` is an annotated [elodin.SpatialForce] component that represents the world frame forces applied to a body in 3D space. See [elodin.SpatialForce] for usage.
+    `Force` is an annotated [metor.SpatialForce] component that represents the world frame forces applied to a body in 3D space. See [metor.SpatialForce] for usage.
 
-    #### _class_ `elodin.WorldAccel`
+    #### _class_ `metor.WorldAccel`
 
-    `WorldAccel` is an annotated [elodin.SpatialMotion] component that represents the world frame acceleration of a body. See [elodin.SpatialMotion] for usage.
+    `WorldAccel` is an annotated [metor.SpatialMotion] component that represents the world frame acceleration of a body. See [metor.SpatialMotion] for usage.
 
 #### Example
 A simple example of a 6DoF system that models gravity acting on a rigid body in 3D space.
 
 ```python
-import elodin as el
+import metor as el
 import jax.numpy as jnp
 
 SIM_TIME_STEP = 1.0 / 120.0
@@ -290,10 +290,10 @@ sim = w.run(sys, SIM_TIME_STEP)
 
 Components are containers of data that is associated with an entity. See [ECS Data Model](/reference/overview#ecs-data-model) for more context on entities and components.
 
-To define a new component, add [elodin.Component] as metadata to a base class using [typing.Annotated]. The base class can be [jax.Array] or some other container of array data. This is an example of a component that annotates [jax.Array]:
+To define a new component, add [metor.Component] as metadata to a base class using [typing.Annotated]. The base class can be [jax.Array] or some other container of array data. This is an example of a component that annotates [jax.Array]:
 
 ```python
-import elodin as el
+import metor as el
 
 Wind = typing.Annotated[
     jax.Array,
@@ -305,20 +305,20 @@ Wind = typing.Annotated[
 ]
 ```
 
-### _class_ `elodin.Component`
+### _class_ `metor.Component`
 
 A container of component metadata.
 
-- `__init__(name, type = None, asset = False, metadata = {})` -> [elodin.Component]
+- `__init__(name, type = None, asset = False, metadata = {})` -> [metor.Component]
 
     Create a new component with:
     - Unique name (e.g. "world_pos, "inertia").
-    - Component type information (via [elodin.ComponentType]). This is optional if the base class already provides component type information as part of `__metadata__`, which is the case for [elodin.Quaternion], [elodin.Edge], and all [spatial vector algebra](#spatial-vector-algebra) classes.
+    - Component type information (via [metor.ComponentType]). This is optional if the base class already provides component type information as part of `__metadata__`, which is the case for [metor.Quaternion], [metor.Edge], and all [spatial vector algebra](#spatial-vector-algebra) classes.
     - Flag indicating whether the component is an asset (e.g. a mesh, texture, etc.).
     - Other metadata that is optional (e.g. description, units, labels, etc.).
 
     ```python
-    import elodin as el
+    import metor as el
 
     el.Component(
         "wind",
@@ -333,38 +333,38 @@ A container of component metadata.
 
     The unique name of the component.
 
-- `Component.index(component)` -> `elodin.ShapeIndexer`
+- `Component.index(component)` -> `metor.ShapeIndexer`
 
     A shape indexer that can be used to access the component data.
 
 
-### _class_ `elodin.ComponentType`
+### _class_ `metor.ComponentType`
 
-`ComponentType` describes the shape and data type of a component. The shape is a tuple of integers that specifies the size of each dimension (e.g. `()` for scalars, `(3,)` for 3D vectors). The data type is an [elodin.PrimitiveType].
+`ComponentType` describes the shape and data type of a component. The shape is a tuple of integers that specifies the size of each dimension (e.g. `()` for scalars, `(3,)` for 3D vectors). The data type is an [metor.PrimitiveType].
 
-- `__init__(dtype, shape)` -> [elodin.ComponentType]
+- `__init__(dtype, shape)` -> [metor.ComponentType]
 
     Create a component type from a data type and shape.
 
-### _class_ `elodin.Edge`
+### _class_ `metor.Edge`
 
-An edge is a relationship between two entities. See [elodin.GraphQuery] for information on how to use edges in graph queries.
+An edge is a relationship between two entities. See [metor.GraphQuery] for information on how to use edges in graph queries.
 
-- `__init__(left, right)` -> [elodin.Edge]
+- `__init__(left, right)` -> [metor.Edge]
 
     Create an edge between two entities given their unique ids.
 
 <br></br>
 ## Archetypes
 
-An archetype is a combination of components with a unique name. To define a new archetype, create a subclass of `elodin.Archetype` with the desired components as fields. Here is an example of an archetype for a kalman filter:
+An archetype is a combination of components with a unique name. To define a new archetype, create a subclass of `metor.Archetype` with the desired components as fields. Here is an example of an archetype for a kalman filter:
 
 {% alert(kind="notice") %}
 To automatically generate `__init__()`, you can use the [@dataclass decorator.](https://docs.python.org/3/library/dataclasses.html)
 {% end %}
 
 ```python
-import elodin as el
+import metor as el
 from dataclasses import dataclass
 
 @dataclass
@@ -392,18 +392,18 @@ world.insert(
 <br></br>
 ## Systems
 
-Systems are the building blocks of simulation; they are functions that operate on a set of input components and produce a set of output components. Elodin provides decorators that allow for systems to be easily defined from functions.
+Systems are the building blocks of simulation; they are functions that operate on a set of input components and produce a set of output components. Metor provides decorators that allow for systems to be easily defined from functions.
 
-### `@elodin.system`
+### `@metor.system`
 
 {% alert(kind="notice") %}
-This is a lower-level primitive; for many cases `@elodin.map` – a wrapper around `@elodin.system` – is easier to use.
+This is a lower-level primitive; for many cases `@metor.map` – a wrapper around `@metor.system` – is easier to use.
 {% end %}
 
-This is a lower-level API for defining a system. A function decorated with `@elodin.system` accepts special parameter types (such as [elodin.Query] and [elodin.GraphQuery]) that specify what data the system needs access to. It returns an [elodin.Query] containing one or more [components]. Some examples of `@elodin.system` are:
+This is a lower-level API for defining a system. A function decorated with `@metor.system` accepts special parameter types (such as [metor.Query] and [metor.GraphQuery]) that specify what data the system needs access to. It returns an [metor.Query] containing one or more [components]. Some examples of `@metor.system` are:
 
 ```python
-import elodin as el
+import metor as el
 
 @el.system
 def gravity(
@@ -417,16 +417,16 @@ def apply_wind(
 ) -> el.Query[el.Force]: ...
 ```
 
-### `@elodin.map`
+### `@metor.map`
 
 {% alert(kind="notice") %}
-Graph queries cannot be used with `@elodin.map`. Use `@elodin.system` instead.
+Graph queries cannot be used with `@metor.map`. Use `@metor.system` instead.
 {% end %}
 
-This is a higher-level API for defining a system that reduces the boilerplate of `@elodin.system` by unpacking the input and output queries into individual components, and wrapping the body of the function in a `query.map(ret_type, ...)` call. It is useful for systems with simple data flow patterns. Some examples of `@elodin.map` are:
+This is a higher-level API for defining a system that reduces the boilerplate of `@metor.system` by unpacking the input and output queries into individual components, and wrapping the body of the function in a `query.map(ret_type, ...)` call. It is useful for systems with simple data flow patterns. Some examples of `@metor.map` are:
 
 ```python
-import elodin as el
+import metor as el
 
 @el.map
 def gravity(f: el.Force, inertia: el.Inertia) -> el.Force: ...
@@ -435,10 +435,10 @@ def gravity(f: el.Force, inertia: el.Inertia) -> el.Force: ...
 def gyro_omega(vel: el.WorldVel) -> GyroOmega: ...
 ```
 
-The following systems are equivalent as the `@elodin.map` definition effectively desugars to the `@elodin.system` one:
+The following systems are equivalent as the `@metor.map` definition effectively desugars to the `@metor.system` one:
 
 ```python
-import elodin as el
+import metor as el
 
 @el.map
 def gravity(f: el.Force, inertia: el.Inertia) -> el.Force:
@@ -452,16 +452,16 @@ def gravity(query: el.Query[el.Force, el.Inertia]) -> el.Query[el.Force]:
     )
 ```
 
-### _class_ `elodin.Query`
+### _class_ `metor.Query`
 
-`Query` is the primary mechanism for accessing data in Elodin. It is a view into the world state that is filtered by the components specified in the query. Only entities that have been spawned with all of the query's components will be selected for processing. For example, the query `Query[WorldPos, Inertia]` would only select entities that have both a `WorldPos` and an `Inertia` component (typically via the `Body` [archetype](#archetypes)).
+`Query` is the primary mechanism for accessing data in Metor. It is a view into the world state that is filtered by the components specified in the query. Only entities that have been spawned with all of the query's components will be selected for processing. For example, the query `Query[WorldPos, Inertia]` would only select entities that have both a `WorldPos` and an `Inertia` component (typically via the `Body` [archetype](#archetypes)).
 
-- `map(ret_type, map_fn)` -> [elodin.Query]
+- `map(ret_type, map_fn)` -> [metor.Query]
 
     Apply a function `map_fn` to the query's components and return a new query with the specified `ret_type` return type. `map_fn` should be a function that takes the query's components as arguments and returns a single value of type `ret_type`.
 
     ```python
-    import elodin as el
+    import metor as el
 
     @el.system
     def gravity(query: el.Query[el.Force, el.Inertia]) -> el.Query[el.Force]:
@@ -476,24 +476,24 @@ def gravity(query: el.Query[el.Force, el.Inertia]) -> el.Query[el.Force]:
 
     To return multiple components as output, `ret_type` must be a tuple:
     ```python
-    import elodin as el
+    import metor as el
 
     @el.system
     def multi_out_sys(query: el.Query[A]) -> el.Query[C, D]:
         return query.map((C, D), lambda a: ...)
     ```
 
-### _class_ `elodin.GraphQuery`
+### _class_ `metor.GraphQuery`
 
-`GraphQuery` is a special type of query for operating on edges in an entity graph. [Edges](#class-elodin-edge) represent relationships between entities and are fundamental for modeling physics systems such as gravity.
+`GraphQuery` is a special type of query for operating on edges in an entity graph. [Edges](#class-metor-edge) represent relationships between entities and are fundamental for modeling physics systems such as gravity.
 
-A `GraphQuery` requires exactly one type argument, which must be an annotated [elodin.Edge] component. For example, `GraphQuery[GravityEdge]` is a valid graph query if `GravityEdge` is a component with `Edge` as the base class:
+A `GraphQuery` requires exactly one type argument, which must be an annotated [metor.Edge] component. For example, `GraphQuery[GravityEdge]` is a valid graph query if `GravityEdge` is a component with `Edge` as the base class:
 
 ```python
-GravityEdge = typing.Annotated[elodin.Edge, elodin.Component("gravity_edge")]
+GravityEdge = typing.Annotated[metor.Edge, metor.Component("gravity_edge")]
 ```
 
-- `edge_fold(left_query, right_query, return_type, init_value, fold_fn)` -> [elodin.Query]
+- `edge_fold(left_query, right_query, return_type, init_value, fold_fn)` -> [metor.Query]
 
     For each edge, query the left and right entity components using `left_query` and `right_query`, respectively. Then, apply the `fold_fn` function to those input components to compute the `return_type` output component(s).
 
@@ -512,41 +512,41 @@ GravityEdge = typing.Annotated[elodin.Edge, elodin.Component("gravity_edge")]
 <br></br>
 ## Primitives
 
-### _class_ `elodin.PrimitiveType`
+### _class_ `metor.PrimitiveType`
 
-- `elodin.PrimitiveType.F64` -> [elodin.PrimitiveType]
+- `metor.PrimitiveType.F64` -> [metor.PrimitiveType]
 
     A constant representing the 64-bit floating point data type.
 
-- `elodin.PrimitiveType.U64` -> [elodin.PrimitiveType]
+- `metor.PrimitiveType.U64` -> [metor.PrimitiveType]
 
     A constant representing the 64-bit unsigned integer data type.
 
-### _class_ `elodin.Quaternion`
+### _class_ `metor.Quaternion`
 
 Unit quaternions are used to represent spatial orientations and rotations of bodies in 3D space.
 
-- `Quaternion.identity()` -> [elodin.Quaternion]
+- `Quaternion.identity()` -> [metor.Quaternion]
 
     Create a unit quaternion with no rotation.
 
-- `Quaternion.from_axis_angle()` -> [elodin.Quaternion]
+- `Quaternion.from_axis_angle()` -> [metor.Quaternion]
 
     Create a quaternion from an axis and an angle.
 
-- `inverse()` -> [elodin.Quaternion]
+- `inverse()` -> [metor.Quaternion]
 
     Compute the inverse of the quaternion.
 
-- `normalize()` -> [elodin.Quaternion]
+- `normalize()` -> [metor.Quaternion]
 
     Normalize to a unit quaternion.
 
-- `integrate_body(body_delta)` -> [elodin.Quaternion]
+- `integrate_body(body_delta)` -> [metor.Quaternion]
 
     Perform quaternion integration in body-frame with angular velocity `body_delta`, which must be a 3D vector.
 
-- `__add__(other)` -> [elodin.Quaternion]
+- `__add__(other)` -> [metor.Quaternion]
 
     Add two quaternions.
 
@@ -555,48 +555,48 @@ Unit quaternions are used to represent spatial orientations and rotations of bod
     {% end %}
 
 
-- `__mul__(other)` -> [elodin.Quaternion]
+- `__mul__(other)` -> [metor.Quaternion]
 
     Multiply two quaternions.
 
-- `__matmul__(vector)` -> [jax.Array] | [elodin.SpatialTransform] | [elodin.SpatialMotion] | [elodin.SpatialForce]
+- `__matmul__(vector)` -> [jax.Array] | [metor.SpatialTransform] | [metor.SpatialMotion] | [metor.SpatialForce]
 
-    Rotate `vector` by computing the matrix product. The vector can be a plain [jax.Array] or one of the following spatial objects: [elodin.SpatialTransform], [elodin.SpatialMotion], [elodin.SpatialForce]. The return type is the same as the input type.
+    Rotate `vector` by computing the matrix product. The vector can be a plain [jax.Array] or one of the following spatial objects: [metor.SpatialTransform], [metor.SpatialMotion], [metor.SpatialForce]. The return type is the same as the input type.
 
 <br></br>
 ## Spatial Vector Algebra
 
-Elodin uses Featherstone’s spatial vector algebra notation for rigid-body dynamics as it is a compact way of representing the state of a rigid body with six degrees of freedom. You can read a short into [here](https://homes.cs.washington.edu/~todorov/courses/amath533/FeatherstoneSlides.pdf) or in [Rigid Body Dynamics Algorithms (Featherstone - 2008)](https://link.springer.com/book/10.1007/978-1-4899-7560-7).
+Metor uses Featherstone’s spatial vector algebra notation for rigid-body dynamics as it is a compact way of representing the state of a rigid body with six degrees of freedom. You can read a short into [here](https://homes.cs.washington.edu/~todorov/courses/amath533/FeatherstoneSlides.pdf) or in [Rigid Body Dynamics Algorithms (Featherstone - 2008)](https://link.springer.com/book/10.1007/978-1-4899-7560-7).
 
-### _class_ `elodin.SpatialTransform`
+### _class_ `metor.SpatialTransform`
 
 A spatial transform is a 7D vector that represents a rigid body transformation in 3D space.
 
-- `__init__(arr, angular, linear)` -> [elodin.SpatialTransform]
+- `__init__(arr, angular, linear)` -> [metor.SpatialTransform]
 
     Create a spatial transform from either `arr` or `angular` **and** `linear`. If no arguments are provided, the spatial transform is initialized to the default values of the identity quaternion and the zero vector.
 
     - `arr` : [jax.Array] with shape (7)
-    - `angular` : [elodin.Quaternion], default is `Quaternion.identity()`
+    - `angular` : [metor.Quaternion], default is `Quaternion.identity()`
     - `linear` : [jax.Array] with shape (3), default is `[0, 0, 0]`
 
 - `linear()` -> [jax.Array]
 
     Get the linear part of the spatial transform as a vector with shape (3,).
 
-- `angular()` -> [elodin.Quaternion]
+- `angular()` -> [metor.Quaternion]
 
     Get the angular part of the spatial transform as a quaternion.
 
-- `__add__(other)` -> [elodin.SpatialTransform] | [elodin.SpatialMotion]
+- `__add__(other)` -> [metor.SpatialTransform] | [metor.SpatialMotion]
 
-    Add either a [elodin.SpatialTransform] or a [elodin.SpatialMotion] to the spatial transform. The return type is always a spatial transform.
+    Add either a [metor.SpatialTransform] or a [metor.SpatialMotion] to the spatial transform. The return type is always a spatial transform.
 
-### _class_ `elodin.SpatialMotion`
+### _class_ `metor.SpatialMotion`
 
 A spatial motion is a 6D vector that represents either the velocity or acceleration of a rigid body in 3D space.
 
-- `__init__(angular, linear)` -> [elodin.SpatialMotion]
+- `__init__(angular, linear)` -> [metor.SpatialMotion]
 
     Create a spatial motion from an angular and a linear vector. Both arguments are optional and default to zero vectors.
 
@@ -611,15 +611,15 @@ A spatial motion is a 6D vector that represents either the velocity or accelerat
 
     Get the angular part of the spatial motion as a vector with shape (3,).
 
-- `__add__(other)` -> [elodin.SpatialMotion]
+- `__add__(other)` -> [metor.SpatialMotion]
 
     Add two spatial motions.
 
-### _class_ `elodin.SpatialForce`
+### _class_ `metor.SpatialForce`
 
 A spatial force is a 6D vector that represents the linear force and torque applied to a rigid body in 3D space.
 
-- `__init__(arr, torque, force)` -> [elodin.SpatialForce]
+- `__init__(arr, torque, force)` -> [metor.SpatialForce]
 
     Create a spatial force from either `arr` or `torque` **and** `force`. If no arguments are provided, the spatial force is initialized to zero torque and force.
 
@@ -635,17 +635,17 @@ A spatial force is a 6D vector that represents the linear force and torque appli
 
     Get the torque part of the spatial force as a vector with shape (3,).
 
-- `__add__(other)` -> [elodin.SpatialForce]
+- `__add__(other)` -> [metor.SpatialForce]
 
     Add two spatial forces.
 
-### _class_ `elodin.SpatialInertia`
+### _class_ `metor.SpatialInertia`
 
 A spatial inertia is a 7D vector that represents the mass, moment of inertia, and momentum of a rigid body in 3D space. The moment of inertia is represented in its [diagonalized form] of $[I_1, I_2, I_3]$.
 
 [diagonalized form]: https://en.wikipedia.org/wiki/Moment_of_inertia#Principal_axes
 
-- `__init__(mass, inertia)` -> [elodin.SpatialInertia]
+- `__init__(mass, inertia)` -> [metor.SpatialInertia]
 
     Create a spatial tensor inertia from a scalar mass and an optional inertia tensor diagonal with shape (3,). If the inertia tensor is not provided, it is set to the same value as the mass along all axes.
 
@@ -657,42 +657,42 @@ A spatial inertia is a 7D vector that represents the mass, moment of inertia, an
 
     Get the inertia tensor diagonal of the spatial inertia with shape (3,).
 
-[elodin.World]: #class-elodin-world
-[elodin.EntityId]: #class-elodin-entityid
-[elodin.Panel]: #class-elodin-panel
-[elodin.GraphEntity]: #class-elodin-graphentity
-[elodin.Mesh]: #class-elodin-mesh
-[elodin.Material]: #class-elodin-material
-[elodin.Shape]: #class-elodin-shape
-[elodin.Scene]: #class-elodin-scene
+[metor.World]: #class-metor-world
+[metor.EntityId]: #class-metor-entityid
+[metor.Panel]: #class-metor-panel
+[metor.GraphEntity]: #class-metor-graphentity
+[metor.Mesh]: #class-metor-mesh
+[metor.Material]: #class-metor-material
+[metor.Shape]: #class-metor-shape
+[metor.Scene]: #class-metor-scene
 
-[elodin.six_dof]: #function-elodin-six-dof
-[elodin.Integrator]: #class-elodin-integrator
-[elodin.Body]: #class-elodin-body
-[elodin.WorldPos]: #class-elodin-worldpos
-[elodin.WorldVel]: #class-elodin-worldvel
-[elodin.Inertia]: #class-elodin-inertia
-[elodin.Force]: #class-elodin-force
-[elodin.WorldAccel]: #class-elodin-worldaccel
+[metor.six_dof]: #function-metor-six-dof
+[metor.Integrator]: #class-metor-integrator
+[metor.Body]: #class-metor-body
+[metor.WorldPos]: #class-metor-worldpos
+[metor.WorldVel]: #class-metor-worldvel
+[metor.Inertia]: #class-metor-inertia
+[metor.Force]: #class-metor-force
+[metor.WorldAccel]: #class-metor-worldaccel
 
 [Components]: #components
-[elodin.Component]: #class-elodin-component
-[elodin.ComponentType]: #class-elodin-componenttype
-[elodin.Edge]: #class-elodin-edge
+[metor.Component]: #class-metor-component
+[metor.ComponentType]: #class-metor-componenttype
+[metor.Edge]: #class-metor-edge
 [typing.Annotated]: https://docs.python.org/3/library/typing.html#typing.Annotated
 
 [Archetypes]: #archetypes
 
-[elodin.System]: #elodin-system
-[elodin.Query]: #class-elodin-query
-[elodin.GraphQuery]: #class-elodin-graphquery
+[metor.System]: #metor-system
+[metor.Query]: #class-metor-query
+[metor.GraphQuery]: #class-metor-graphquery
 
-[elodin.PrimitiveType]: #class-elodin-primitivetype
-[elodin.Quaternion]: #class-elodin-quaternion
+[metor.PrimitiveType]: #class-metor-primitivetype
+[metor.Quaternion]: #class-metor-quaternion
 
-[elodin.SpatialTransform]: #class-elodin-spatialtransform
-[elodin.SpatialMotion]: #class-elodin-spatialmotion
-[elodin.SpatialForce]: #class-elodin-spatialforce
-[elodin.SpatialInertia]: #class-elodin-spatialinertia
+[metor.SpatialTransform]: #class-metor-spatialtransform
+[metor.SpatialMotion]: #class-metor-spatialmotion
+[metor.SpatialForce]: #class-metor-spatialforce
+[metor.SpatialInertia]: #class-metor-spatialinertia
 [jax.Array]: https://jax.readthedocs.io/en/latest/_autosummary/jax.Array.html#jax.Array
 [jax.typing.ArrayLike]: https://jax.readthedocs.io/en/latest/_autosummary/jax.typing.ArrayLike.html#jax.typing.ArrayLike

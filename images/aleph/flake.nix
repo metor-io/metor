@@ -1,6 +1,6 @@
 {
   nixConfig = {
-    extra-substituters = ["http://ci-arm1.elodin.dev:5000"];
+    extra-substituters = ["http://ci-arm1.metor.dev:5000"];
     extra-trusted-public-keys = [
       "builder-cache-1:q7rDGIQgkg1nsxNEg7mHN1kEDuxPmJhQpuIXCCwLj8E="
     ];
@@ -56,7 +56,7 @@
       wifi = ./modules/wifi.nix;
     };
     fswModules = {
-      elodin-db = ./modules/elodin-db.nix;
+      metor-db = ./modules/metor-db.nix;
       aleph-serial-bridge = ./modules/aleph-serial-bridge.nix;
       tegrastats-bridge = ./modules/tegrastats-bridge.nix;
       mekf = ./modules/mekf.nix;

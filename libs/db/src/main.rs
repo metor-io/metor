@@ -1,7 +1,7 @@
 use std::{io::Write, net::SocketAddr, path::PathBuf};
 
 use clap::{Parser, Subcommand};
-use elodin_db::Server;
+use metor_db::Server;
 use impeller2::vtable;
 use miette::IntoDiagnostic;
 use postcard_c_codegen::SchemaExt;
@@ -17,7 +17,7 @@ pub struct Cli {
 
 #[derive(Subcommand, Clone)]
 enum Commands {
-    #[command(about = "Run the Elodin database server")]
+    #[command(about = "Run the Metor database server")]
     Run(RunArgs),
     #[command(about = "Run a Lua script or launch a REPL")]
     Lua(impeller2_cli::Args),
@@ -42,7 +42,7 @@ async fn main() -> miette::Result<()> {
     let filter = if std::env::var("RUST_LOG").is_ok() {
         EnvFilter::builder().from_env_lossy()
     } else {
-        EnvFilter::builder().parse_lossy("elodin_db=info")
+        EnvFilter::builder().parse_lossy("metor_db=info")
     };
 
     let _ = tracing_subscriber::fmt::fmt()
@@ -62,7 +62,7 @@ async fn main() -> miette::Result<()> {
         }) => {
             let path = path.unwrap_or_else(|| {
                 let dirs =
-                    directories::ProjectDirs::from("systems", "elodin", "db").expect("no dirs");
+                    directories::ProjectDirs::from("systems", "metor", "db").expect("no dirs");
                 dirs.data_dir().join("data")
             });
             if reset && path.exists() {

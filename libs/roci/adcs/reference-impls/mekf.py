@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 #
 
-import elodin as el
+import metor as el
 import jax
 import jax.numpy as np
-from elodin.elodin import Quaternion
+from metor.metor import Quaternion
 from jax.numpy import linalg as la
 
 

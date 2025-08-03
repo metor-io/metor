@@ -5,9 +5,9 @@
 //! Expressions can also contain metadata for the field, like the schema, location of the timestamp,
 //! or even the rate it should be populated at.
 //!
-//! VTables are used by `elodin-db` to let the user send data and receive data in the format and shape
+//! VTables are used by `metor-db` to let the user send data and receive data in the format and shape
 //! they expect. This let's you specify a struct in Rust and send it directly into the db, with no serialization step.
-//! `elodin-db` also allows you to subscribe to a particular VTable. The database will handle building tables from each of the fields
+//! `metor-db` also allows you to subscribe to a particular VTable. The database will handle building tables from each of the fields
 //! described in the VTable.
 //!
 //! At this point it is likely easier to see an example of how to formulate a VTable.
@@ -537,7 +537,7 @@ pub mod builder {
     /// Creates an extension operation builder from a message and an argument
     ///
     ///  Extensions are used to attache extra metadata to a field.
-    ///  For instance elodin-db uses extensions to specify the rate you want to receive a field at.
+    ///  For instance metor-db uses extensions to specify the rate you want to receive a field at.
     pub fn ext<D: crate::types::Msg>(data: D, arg: Arc<OpBuilder>) -> Arc<OpBuilder> {
         let data = postcard::to_allocvec(&data).expect("data serialize failed");
         let data = Arc::new(OpBuilder::Data { align: 1, data });

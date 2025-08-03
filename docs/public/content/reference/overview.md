@@ -15,7 +15,7 @@ order = 1
 
 ## Simulation Architecture
 
-An Elodin simulation consists of Entities are spawned with a list of archetypes rather than individual components.
+An Metor simulation consists of Entities are spawned with a list of archetypes rather than individual components.
 
 ### Systems
 Systems are reusable functions that operate on a set of components. Composing different systems allows for the creation of custom physics engines. Some examples of systems include gravity, aerodynamics, collision detection.
@@ -31,7 +31,7 @@ Flight software is a set of processes that run independent of the simulation. Us
 
 ## ECS Data Model
 
-Elodin uses the Entity Component System (ECS) pattern to manage simulation data. Entities are simply unique references to a collection of components. [Components] are individual properties associated with an entity like position, velocity, mass, etc.
+Metor uses the Entity Component System (ECS) pattern to manage simulation data. Entities are simply unique references to a collection of components. [Components] are individual properties associated with an entity like position, velocity, mass, etc.
 
 [Archetypes] are a unique combination of components that allow for efficient memory management and data access patterns. Entities are spawned with a list of archetypes rather than individual components.
 

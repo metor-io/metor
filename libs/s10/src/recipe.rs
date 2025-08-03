@@ -249,7 +249,7 @@ pub enum ProcessError {
     #[error("error while running `{cmd}` for recipe \"{recipe}\"")]
     #[diagnostic(
         help = "try checking the cmd and args for {recipe}",
-        code = "elodin::recipe_spawn_error"
+        code = "metor::recipe_spawn_error"
     )]
     Spawn {
         source: io::Error,

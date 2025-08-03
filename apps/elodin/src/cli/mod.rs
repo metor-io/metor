@@ -1,9 +1,5 @@
-use clap::{Parser, Subcommand};
-use miette::Context;
-use miette::IntoDiagnostic;
-use miette::miette;
+use clap::Parser;
 use std::net::SocketAddr;
-use stellarator::util::CancelToken;
 use tracing_subscriber::EnvFilter;
 
 mod editor;
@@ -24,7 +20,7 @@ impl Cli {
             EnvFilter::builder().from_env_lossy()
         } else {
             EnvFilter::builder().parse_lossy(
-                "s10=info,elodin=info,impeller=info,nox_ecs=info,impeller::bevy=error,error",
+                "s10=info,metor=info,impeller=info,nox_ecs=info,impeller::bevy=error,error",
             )
         };
 
@@ -44,7 +40,7 @@ impl Cli {
     }
 
     fn dirs(&self) -> Result<directories::ProjectDirs, std::io::Error> {
-        directories::ProjectDirs::from("systems", "elodin", "console").ok_or(std::io::Error::new(
+        directories::ProjectDirs::from("systems", "metor", "console").ok_or(std::io::Error::new(
             std::io::ErrorKind::NotFound,
             "failed to get data directory",
         ))

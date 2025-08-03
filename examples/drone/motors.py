@@ -1,7 +1,7 @@
 import typing as ty
 from dataclasses import dataclass, field
 
-import elodin as el
+import metor as el
 import jax
 import jax.numpy as jnp
 import params

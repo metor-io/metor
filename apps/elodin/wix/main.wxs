@@ -60,16 +60,16 @@
 
     <Product
         Id='*'
-        Name='elodin'
+        Name='metor'
         UpgradeCode='C55D292D-9DEC-4BAA-A279-D20321A8EC55'
-        Manufacturer='sascha@elodin.systems; akhil@elodin.systems; van@elodin.systems'
+        Manufacturer='sascha@metor.systems; akhil@metor.systems; van@metor.systems'
         Language='1033'
         Codepage='1252'
         Version='$(var.Version)'>
 
         <Package Id='*'
             Keywords='Installer'
-            Manufacturer='sascha@elodin.systems; akhil@elodin.systems; van@elodin.systems'
+            Manufacturer='sascha@metor.systems; akhil@metor.systems; van@metor.systems'
             InstallerVersion='450'
             Languages='1033'
             Compressed='yes'
@@ -82,11 +82,11 @@
             DowngradeErrorMessage='A newer version of [ProductName] is already installed. Setup will now exit.'/>
 
         <Media Id='1' Cabinet='media1.cab' EmbedCab='yes' DiskPrompt='CD-ROM #1'/>
-        <Property Id='DiskPrompt' Value='elodin Installation'/>
+        <Property Id='DiskPrompt' Value='metor Installation'/>
 
         <Directory Id='TARGETDIR' Name='SourceDir'>
             <Directory Id='$(var.PlatformProgramFilesFolder)' Name='PFiles'>
-                <Directory Id='APPLICATIONFOLDER' Name='elodin'>
+                <Directory Id='APPLICATIONFOLDER' Name='metor'>
                     
                     <!--
                       Enabling the license sidecar file in the installer is a four step process:
@@ -122,9 +122,9 @@
                         <Component Id='binary0' Guid='*'>
                             <File
                                 Id='exe0'
-                                Name='elodin.exe'
+                                Name='metor.exe'
                                 DiskId='1'
-                                Source='$(var.CargoTargetBinDir)\elodin.exe'
+                                Source='$(var.CargoTargetBinDir)\metor.exe'
                                 KeyPath='yes'/>
                         </Component>
                     </Directory>
@@ -172,7 +172,7 @@
         <!--<Icon Id='ProductICO' SourceFile='wix\Product.ico'/>-->
         <!--<Property Id='ARPPRODUCTICON' Value='ProductICO' />-->
 
-        <Property Id='ARPHELPLINK' Value='https://github.com/elodin-sys/elodin'/>
+        <Property Id='ARPHELPLINK' Value='https://github.com/metor-sys/metor'/>
         
         <UI>
             <UIRef Id='WixUI_FeatureTree'/>

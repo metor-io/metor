@@ -7,26 +7,26 @@ resources:
 patches:
 - target:
     kind: Ingress
-    name: elodin
+    name: metor
   patch: |-
     - op: replace
       path: /spec/rules/0/host
-      value: $CLUSTER_NAME-docs.elodin.dev
+      value: $CLUSTER_NAME-docs.metor.dev
 - target:
-    namespace: elodin-app
+    namespace: metor-app
   patch: |-
     - op: replace
       path: /metadata/namespace
-      value: elodin-app-$CLUSTER_NAME
+      value: metor-app-$CLUSTER_NAME
 - target:
     kind: Namespace
-    name: elodin-app
+    name: metor-app
   patch: |-
     - op: replace
       path: /metadata/name
-      value: elodin-app-$CLUSTER_NAME
+      value: metor-app-$CLUSTER_NAME
 
 images:
-- name: elodin-infra/elo-docs
-  newName: elodin.azurecr.io/elodin-infra/elo-docs/x86_64
+- name: metor-infra/elo-docs
+  newName: metor.azurecr.io/metor-infra/elo-docs/x86_64
   newTag: $BUILDKITE_COMMIT
