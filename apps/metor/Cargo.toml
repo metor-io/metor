@@ -34,8 +34,8 @@ zstd = "0.13.0"
 bevy.version = "0.16"
 tracing-subscriber = { version = "0.3", features = ["chrono"] }
 
-metor-editor.path = "../../libs/metor-editor"
-metor-editor.default-features = false
+metor-ui.path = "../../libs/metor-ui"
+metor-ui.default-features = false
 impeller2-bevy.path = "../../libs/impeller2/bevy"
 
 # crypto

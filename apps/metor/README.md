@@ -42,6 +42,6 @@ Run `three-body.py` example while watching for editor code changes (requires [ca
 
 ```sh
 # run from `libs/nox-py`
-cargo watch --watch ../../libs/metor-editor \
+cargo watch --watch ../../libs/metor-ui \
     -x 'run --manifest-path=../../apps/metor/Cargo.toml editor examples/three-body.py'
 ```

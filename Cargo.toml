@@ -1,10 +1,10 @@
 [workspace]
 resolver = "2"
 members = [
-    "libs/elodin-editor",
+    "libs/metor-ui",
     "libs/nox",
     "libs/nox-frames",
-    "apps/elodin",
+    "apps/metor",
     "libs/roci",
     "libs/roci/macros",
     "libs/roci/adcs",
@@ -38,7 +38,7 @@ exclude = ["fsw/sensor-fw", "fsw/blackbox", "docs/memserve"]
 [workspace.package]
 version = "0.14.2"
 edition = "2024"
-repository = "https://github.com/metor-sys/metor"
+repository = "https://github.com/metor-io/metor"
 
 [profile.wasm-release]
 inherits = "release"
@@ -59,16 +59,12 @@ inherits = "release"
 lto = "thin"
 
 [workspace.dependencies]
-# set workspace version as the version of xla
-xla.package = "noxla"
-xla.path = "libs/noxla"
 roci-macros.path = "libs/roci/macros"
 roci.path = "libs/roci"
 roci.default-features = false
 roci-adcs.path = "libs/roci/adcs"
 nox.path = "libs/nox"
 nox.default-features = false
-basilisk.path = "libs/basilisk-rs"
 nox-frames.path = "libs/nox-frames"
 wmm.path = "libs/wmm"
 
