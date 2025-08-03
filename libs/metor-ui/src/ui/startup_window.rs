@@ -185,30 +185,6 @@ impl StartupLayout<'_, '_> {
         }
     }
 
-    fn open_file(&mut self, file: PathBuf) {
-        let dirs = dirs();
-
-        let cache_dir = dirs.cache_dir().to_owned();
-        self.recent_files.push(
-            hifitime::Epoch::now().unwrap(),
-            RecentItem::File(file.clone()),
-        );
-        save_recent_files(&self.recent_files);
-
-        std::thread::spawn(move || {
-            let rt = tokio::runtime::Runtime::new().unwrap();
-            #[cfg(not(target_os = "windows"))]
-            rt.block_on(crate::run::run_recipe(
-                cache_dir,
-                file,
-                stellarator::util::CancelToken::default(),
-            ))
-            .unwrap();
-        });
-        self.connect(SocketAddr::new(Ipv6Addr::UNSPECIFIED.into(), 2240), true);
-        self.switch_to_main();
-    }
-
     fn start_connect(&mut self, addr: String) {
         let socket_addr = match addr.to_socket_addrs().map(|mut x| x.next()) {
             Ok(Some(addr)) => addr,
@@ -294,21 +270,6 @@ impl RootWidgetSystem for StartupLayout<'_, '_> {
                                 .color(get_scheme().text_secondary),
                         );
                         ui.add_space(75.0);
-                        if !cfg!(target_os = "windows") {
-                            if ui
-                                .add(startup_button("Open Existing Project", folder))
-                                .clicked()
-                            {
-                                if let Some(file) = rfd::FileDialog::new()
-                                    .add_filter("python", &["py"])
-                                    .add_filter("s10", &["toml"])
-                                    .pick_file()
-                                {
-                                    state.open_file(file);
-                                }
-                            }
-                            ui.add_space(10.0);
-                        }
                         if ui
                             .add(startup_button("Connect to IP Address", icon_ip_addr))
                             .clicked()
@@ -337,9 +298,7 @@ impl RootWidgetSystem for StartupLayout<'_, '_> {
                     for item in state.recent_files.recent_files.clone().into_values().rev() {
                         if ui.add(recent_item_button(item.clone(), arrow)).clicked() {
                             match item {
-                                RecentItem::File(path) => {
-                                    state.open_file(path.clone());
-                                }
+                                RecentItem::File(_) => {}
                                 RecentItem::Addr(addr) => {
                                     state.start_connect(addr);
                                 }

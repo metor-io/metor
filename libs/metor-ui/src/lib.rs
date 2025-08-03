@@ -50,9 +50,6 @@ mod offset_parse;
 mod plugins;
 pub mod ui;
 
-#[cfg(not(target_family = "wasm"))]
-pub mod run;
-
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 struct EmbeddedAssetPlugin;
