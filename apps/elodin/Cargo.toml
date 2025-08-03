@@ -44,8 +44,6 @@ ring = "0.17"
 # machine id
 machine-uid = "0.5.1"
 
-s10.path = "../../libs/s10"
-
 [build-dependencies]
 anyhow = "1.0.79"
 ignore = "0.4"

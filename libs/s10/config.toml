@@ -1,3 +1,0 @@
-[default]
-type = "sim"
-path = "../nox-py/examples/cube-sat.py"
