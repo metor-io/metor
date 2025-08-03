@@ -23,7 +23,6 @@ use stellarator::{
     sync::{Mutex, WaitCell, WaitQueue},
 };
 use tracing::{trace, warn};
-use zerocopy::FromBytes;
 
 use crate::{Component, DB, Error, FixedRateStreamState, disruptor::Reader};
 

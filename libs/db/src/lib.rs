@@ -45,7 +45,7 @@ use stellarator::{
 use time_series::TimeSeries;
 use tracing::{debug, info, trace, warn};
 use vtable_stream::handle_vtable_stream;
-use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
+use zerocopy::{FromBytes, IntoBytes};
 
 pub use error::Error;
 

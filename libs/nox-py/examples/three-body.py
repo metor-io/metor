@@ -16,7 +16,7 @@ a = w.spawn(
             inertia=el.Inertia(1.0 / G),
         ),
     ],
-    name="A",
+    name="a",
 )
 b = w.spawn(
     [
@@ -26,7 +26,7 @@ b = w.spawn(
             inertia=el.Inertia(1.0 / G),
         ),
     ],
-    name="B",
+    name="b",
 )
 c = w.spawn(
     [
@@ -36,7 +36,7 @@ c = w.spawn(
             inertia=el.Inertia(1.0 / G),
         ),
     ],
-    name="C",
+    name="c",
 )
 
 # Define a new "gravity edge" component type
