@@ -178,11 +178,6 @@ pub trait ConstDim {
 
     type DimArr: AsRef<[usize]> + AsMut<[usize]> + Clone;
     fn const_dim() -> Self::DimArr;
-
-    #[cfg(feature = "noxpr")]
-    fn xla_shape() -> smallvec::SmallVec<[i64; 4]> {
-        Self::DIM.iter().map(|&x| x as i64).collect()
-    }
 }
 
 /// Represents a scalar dimension, which is essentially dimensionless.

@@ -174,7 +174,6 @@ mod tests {
         let exec = match comp.compile(&client) {
             Ok(exec) => exec,
             Err(xla::Error::XlaError { msg, .. }) => {
-                println!("{}", msg);
                 panic!();
             }
             Err(e) => {
@@ -211,7 +210,6 @@ mod tests {
         let exec = match comp.compile(&client) {
             Ok(exec) => exec,
             Err(xla::Error::XlaError { msg, .. }) => {
-                println!("{}", msg);
                 panic!();
             }
             Err(e) => {

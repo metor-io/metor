@@ -11,10 +11,6 @@ repository = "https://github.com/elodin-sys/elodin"
 [features]
 default = []
 std = ["thiserror/std", "faer/std", "num-traits/std", "nox-array/std"]
-jax = ["pyo3", "pyo3-build-config", "numpy", "noxpr"]
-cuda = ["shared", "xla"]
-noxpr = ["xla", "boxcar", "paste", "itertools", "indent_write"]
-xla = ["dep:xla", "lapack-src", "std"]
 shared = []
 serde = ["dep:serde", "smallvec/serde"]
 
@@ -31,27 +27,8 @@ smallvec.version = "1.11.2"
 smallvec.features = ["const_generics", "union"]
 nox-array.path = "./array"
 
-# noxpr
-boxcar.version = "0.2"
-boxcar.optional = true
-paste.version = "1.0.14"
-paste.optional = true
-itertools.version = "0.12.0"
-itertools.optional = true
-indent_write.version = "2.2.0"
-indent_write.optional = true
-
 zerocopy.version = "0.8.2"
 zerocopy.features = ["derive"]
-
-# noxla - a wrapper around raw xla
-xla = { optional = true, workspace = true }
-
-# jax
-pyo3.version = "0.23.0"
-pyo3.optional = true
-numpy.version = "0.23.0"
-numpy.optional = true
 
 # debug
 approx = "0.5"
@@ -59,16 +36,3 @@ approx = "0.5"
 # serialize
 serde.version = "1"
 serde.optional = true
-
-[target.'cfg(not(target_os = "macos"))'.dependencies]
-lapack-src = { version = "0.10", features = ["netlib"], optional = true }
-netlib-src.version = "0.8"
-netlib-src.features = ["static"]
-netlib-src.optional = true
-[target.'cfg(target_os = "macos")'.dependencies]
-lapack-src = { version = "0.10", features = ["accelerate"], optional = true }
-
-[build-dependencies]
-which = "6.0.3"
-pyo3-build-config.version = "0.23.0"
-pyo3-build-config.optional = true

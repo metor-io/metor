@@ -4,9 +4,6 @@
 
 extern crate alloc;
 
-#[cfg(feature = "xla")]
-extern crate lapack_src as _;
-
 pub mod array;
 mod dim;
 mod error;
@@ -35,19 +32,4 @@ pub use spatial::*;
 pub use tensor::*;
 pub use vector::*;
 
-#[cfg(feature = "jax")]
-pub mod jax;
-
-#[cfg(feature = "noxpr")]
-mod noxpr;
-#[cfg(feature = "noxpr")]
-pub use noxpr::*;
-
-#[cfg(feature = "xla")]
-pub use xla;
-
-#[cfg(feature = "noxpr")]
-pub use crate::noxpr::Op as DefaultRepr;
-
-#[cfg(not(feature = "noxpr"))]
 pub use crate::array::ArrayRepr as DefaultRepr;
