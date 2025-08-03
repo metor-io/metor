@@ -1,6 +1,6 @@
 use bevy::prelude::*;
 use bevy::window::{PrimaryWindow, WindowResized};
-use metor_editor::EditorPlugin;
+use metor_ui::EditorPlugin;
 use miette::IntoDiagnostic;
 use std::io::{Read, Seek, Write};
 use stellarator::util::CancelToken;

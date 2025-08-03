@@ -261,7 +261,7 @@ impl RootWidgetSystem for StartupLayout<'_, '_> {
                         );
                         ui.add_space(87.);
                         ui.add(
-                            egui::Image::new(SizedTexture::new(logo_full, egui::vec2(113., 24.)))
+                            egui::Image::new(SizedTexture::new(logo_full, egui::vec2(292., 60.)))
                                 .tint(get_scheme().text_primary),
                         );
                         ui.add_space(10.0);

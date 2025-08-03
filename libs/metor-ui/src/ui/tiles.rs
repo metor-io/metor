@@ -551,8 +551,8 @@ impl ViewportPane {
 
         camera.insert(Bloom { ..default() });
         camera.insert(EnvironmentMapLight {
-            diffuse_map: asset_server.load("embedded://metor_editor/assets/diffuse.ktx2"),
-            specular_map: asset_server.load("embedded://metor_editor/assets/specular.ktx2"),
+            diffuse_map: asset_server.load("embedded://metor_ui/assets/diffuse.ktx2"),
+            specular_map: asset_server.load("embedded://metor_ui/assets/specular.ktx2"),
             intensity: 2000.0,
             ..Default::default()
         });
