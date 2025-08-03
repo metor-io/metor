@@ -331,6 +331,7 @@ impl<'a, T: RealField, R: OwnedRepr> Add<&'a Quaternion<T, R>> for Quaternion<T,
 mod tests {
 
     use approx::assert_relative_eq;
+    use core::f64::consts;
 
     use crate::{ArrayRepr, Vector3, tensor};
 
@@ -339,13 +340,9 @@ mod tests {
     #[test]
     fn test_angular_distance() {
         let q1 = Quaternion::from_axis_angle(Vector3::z_axis(), 0.0);
-        let q2 = Quaternion::from_axis_angle(Vector3::z_axis(), std::f64::consts::PI / 2.0);
+        let q2 = Quaternion::from_axis_angle(Vector3::z_axis(), consts::PI / 2.0);
         let distance = q1.angular_distance(&q2);
-        assert_relative_eq!(
-            distance.into_buf(),
-            std::f64::consts::PI / 2.0,
-            epsilon = 1e-6
-        );
+        assert_relative_eq!(distance.into_buf(), consts::PI / 2.0, epsilon = 1e-6);
     }
 
     #[test]
