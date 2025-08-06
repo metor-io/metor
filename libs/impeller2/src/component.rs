@@ -19,7 +19,7 @@ pub trait Component {
 }
 
 #[cfg(feature = "alloc")]
-pub(crate) trait PrimTypeElem {
+pub trait PrimTypeElem {
     const PRIM_TYPE: crate::types::PrimType;
 }
 

@@ -9,6 +9,9 @@ edition = "2024"
 [dependencies]
 nox.path = "../../nox"
 nox.default-features = false
+roci.path = ".."
+zerocopy.version = "0.8"
+zerocopy.features = ["derive"]
 
 [dev-dependencies]
 approx = "0.5"

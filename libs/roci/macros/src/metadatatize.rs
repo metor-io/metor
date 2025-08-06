@@ -30,32 +30,29 @@ pub fn metadatatize(input: TokenStream) -> TokenStream {
     let metadata_items = fields.fields.iter().map(|field| {
         let ty = &field.ty;
 
-        let name = field
-            .ident
-            .as_ref()
-            .expect("only named field allowed")
-            .to_string();
+        let name = field.component_name();
         if !field.nest {
-            let component_id = field.component_id();
-
             let component_id = if let Some(parent) = &parent {
-                format!("{parent}.{component_id}")
+                format!("{parent}.{name}")
             } else {
-                component_id.to_string()
+                name.to_string()
             };
-            let asset = field.asset.unwrap_or_default();
             quote! {
                 .chain(core::iter::once(#impeller_wkt::ComponentMetadata {
                     component_id: #impeller::types::ComponentId::new(#component_id),
                     name: #name.to_string(),
                     metadata: Default::default(),
-                    asset: #asset,
                 }))
             }
         } else {
+            let prefix = if let Some(parent) = &parent {
+                format!("{parent}.{name}")
+            } else {
+                name
+            };
             quote! {
                 .chain(<#ty as #crate_name::Metadatatize>::metadata().map(|mut metadata| {
-                    metadata.name = format!("{}.{}", #name, metadata.name);
+                    metadata.name = format!("{}.{}", #prefix, metadata.name);
                     metadata.component_id = #impeller::types::ComponentId::new(&metadata.name);
                     metadata
                 }))

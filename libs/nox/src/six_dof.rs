@@ -1,6 +1,6 @@
 use core::ops::{Add, Mul};
 
-use zerocopy::{Immutable, IntoBytes};
+use zerocopy::{Immutable, IntoBytes, KnownLayout};
 
 use crate::{
     Scalar, SpatialInertia, SpatialTransform,
@@ -8,7 +8,8 @@ use crate::{
     rk4,
 };
 
-#[derive(Debug, Clone, IntoBytes, Immutable)]
+#[derive(Debug, Clone, IntoBytes, Immutable, KnownLayout)]
+#[repr(C)]
 pub struct Body {
     pub pos: SpatialTransform<f64>,
     pub vel: SpatialMotion<f64>,
@@ -36,8 +37,8 @@ impl<'a> Add<DU> for &'a Body {
     fn add(self, du: DU) -> Body {
         Body {
             pos: self.pos.clone() + du.vel,
-            vel: self.vel.clone() + du.accel,
-            accel: self.accel.clone(),
+            vel: self.vel.clone() + du.accel.clone(),
+            accel: du.accel,
             inertia: self.inertia.clone(),
         }
     }

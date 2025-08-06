@@ -23,7 +23,7 @@ pub trait SinkExt {
 
 impl<W: AsyncWrite> SinkExt for impeller2_stellar::PacketSink<W> {
     async fn send_vtable<V: AsVTable>(&self, id: PacketId) -> Result<(), Error> {
-        let vtable = dbg!(V::as_vtable());
+        let vtable = V::as_vtable();
         self.send(&(VTableMsg { id, vtable })).await.0?;
         Ok(())
     }

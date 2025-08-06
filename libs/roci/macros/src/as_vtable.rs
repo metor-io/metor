@@ -27,44 +27,56 @@ pub fn as_vtable(input: TokenStream) -> TokenStream {
     let fields = data.take_struct().unwrap();
     let vtable_items = fields.fields.iter().map(|field| {
         let ty = &field.ty;
-        let component_id = field.component_id();
-        let component_id =
-            if let Some(parent) = &parent {
-                format!("{parent}.{component_id}")
-            }else {
-                component_id.to_string()
-            };
+        let name = field.component_name();
+        let name = if let Some(parent) = &parent {
+            format!("{parent}.{name}")
+        } else {
+            name
+        };
         let ident = &field.ident;
         if !field.nest {
             quote! {
-                {
-
+                .chain({
                     let schema = <#ty as #impeller::component::Component>::schema();
                     assert_eq!(schema.size(), #impeller::vtable::builder::field_size!(Self, #ident), "to cast to a vtable each field must be the same size as the component");
-                    builder.push(
-                        #impeller::vtable::builder::field!(
-                            Self::#ident,
-                            #impeller::vtable::builder::schema(
-                                schema.prim_type(),
-                                schema.dim(),
-                                #impeller::vtable::builder::component(#component_id)
-                            )
+                    [#impeller::vtable::builder::field!(
+                        Self::#ident,
+                        #impeller::vtable::builder::schema(
+                            schema.prim_type(),
+                            schema.dim(),
+                            component(#name)
                         )
-                    );
-                }
+                    )]
+                })
             }
         } else {
             quote! {
-                <#ty as #crate_name::AsVTable>::populate_vtable_fields(builder)?;
+                .chain(<#ty as #crate_name::AsVTable>::vtable_fields(
+                    if let Some(prefix) = &prefix {
+                        Some(std::borrow::Cow::Owned(format!("{}.{}", prefix, #name)))
+                    } else {
+                        Some(std::borrow::Cow::Borrowed(#name))
+                    }
+                )
+                    .map(|field| field.offset_by(core::mem::offset_of!(Self, #ident) as u16))
+                )
             }
         }
     });
     quote! {
         impl #crate_name::AsVTable for #ident #generics #where_clause {
-            fn populate_vtable_fields(builder: &mut Vec<#impeller::vtable::builder::FieldBuilder>) -> Result<(), #impeller::error::Error> {
+            fn vtable_fields(prefix: Option<std::borrow::Cow<'_, str>>) -> impl Iterator<Item = #impeller::vtable::builder::FieldBuilder> {
+                let component = |name: &str| {
+                    if let Some(prefix) = &prefix {
+                        #impeller::vtable::builder::component(dbg!(format!("{}.{}", prefix, name).as_str()))
+                    } else {
+                        #impeller::vtable::builder::component(dbg!(name))
+                    }
+                };
+                std::iter::empty()
                 #(#vtable_items)*
-                Ok(())
             }
         }
-    }.into()
+    }
+    .into()
 }

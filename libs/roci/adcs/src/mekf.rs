@@ -1,6 +1,8 @@
 use nox::{
     ArrayBuf, ArrayRepr, Field, Matrix, Matrix3, Matrix3x6, Matrix6, Quaternion, Vector, tensor,
 };
+use roci::{AsVTable, Metadatatize};
+use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
 
 pub fn calculate_covariance(
     sigma_g: Vector<f64, 3, ArrayRepr>,
@@ -73,7 +75,8 @@ fn propagate_state_covariance(
     phi.dot(&big_p).dot(&phi.transpose()) + yqy
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone, AsVTable, Metadatatize, IntoBytes, Immutable, KnownLayout)]
+#[repr(C)]
 pub struct State {
     pub q_hat: Quaternion<f64, ArrayRepr>,
     pub b_hat: Vector<f64, 3, ArrayRepr>,

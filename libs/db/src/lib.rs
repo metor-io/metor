@@ -696,6 +696,12 @@ impl Server {
     }
 }
 
+pub async fn serve_tmp_db(addr: SocketAddr) -> Result<(), Error> {
+    let path = std::env::temp_dir().join(format!("metor_db_{}", fastrand::u64(..)));
+    let server = Server::new(path, addr)?;
+    server.run().await
+}
+
 pub async fn handle_conn(stream: TcpStream, db: Arc<DB>) {
     let (rx, tx) = stream.split();
     let rx = PacketStream::new(rx);

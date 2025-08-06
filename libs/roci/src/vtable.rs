@@ -1,40 +1,30 @@
-use impeller2::{
-    error::Error,
-    vtable::{
-        VTable,
-        builder::{FieldBuilder, schema, vtable},
-    },
+use std::borrow::Cow;
+
+use impeller2::vtable::{
+    VTable,
+    builder::{FieldBuilder, schema, vtable},
 };
-use nox::Body;
 
 pub trait AsVTable {
-    fn populate_vtable_fields(builder: &mut Vec<FieldBuilder>) -> Result<(), Error>;
+    fn vtable_fields(prefix: Option<Cow<'_, str>>) -> impl Iterator<Item = FieldBuilder>;
     fn as_vtable() -> VTable {
-        let mut fields = vec![];
-        Self::populate_vtable_fields(&mut fields).expect("vtable failed to form");
-        vtable(fields)
+        vtable(Self::vtable_fields(None))
     }
 }
 
-impl AsVTable for Body {
-    fn populate_vtable_fields(builder: &mut Vec<FieldBuilder>) -> Result<(), Error> {
-        use impeller2::vtable::builder::{component, field};
-        builder.push(field!(
-            Body::pos,
-            schema(impeller2::types::PrimType::F64, &[7], component("pos"))
-        ));
-        builder.push(field!(
-            Body::vel,
-            schema(impeller2::types::PrimType::F64, &[6], component("vel"))
-        ));
-        builder.push(field!(
-            Body::accel,
-            schema(impeller2::types::PrimType::F64, &[6], component("accel"))
-        ));
-        builder.push(field!(
-            Body::inertia,
-            schema(impeller2::types::PrimType::F64, &[6], component("inertia"))
-        ));
-        Ok(())
+impl<const N: usize, T: AsVTable> AsVTable for [T; N] {
+    fn vtable_fields(prefix: Option<Cow<'_, str>>) -> impl Iterator<Item = FieldBuilder> {
+        (0..N)
+            .flat_map(|i| {
+                let prefix = if let Some(prefix) = &prefix {
+                    format!("{}.{}", prefix, i)
+                } else {
+                    format!("{}", i)
+                };
+                T::vtable_fields(Some(Cow::Owned(prefix)))
+                    .map(move |f| f.offset_by((i * size_of::<T>()) as u16))
+            })
+            .collect::<Vec<_>>()
+            .into_iter()
     }
 }

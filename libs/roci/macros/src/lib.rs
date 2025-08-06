@@ -22,6 +22,16 @@ struct Field {
 }
 
 impl Field {
+    pub fn component_name(&self) -> String {
+        match &self.component_id {
+            Some(c) => c.clone(),
+            None => {
+                let ident = self.ident.as_ref().expect("field must have ident");
+                ident.to_string()
+            }
+        }
+    }
+
     pub fn component_id(&self) -> proc_macro2::TokenStream {
         let crate_name = crate::roci_crate_name();
         match &self.component_id {

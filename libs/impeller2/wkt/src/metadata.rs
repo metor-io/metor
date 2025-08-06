@@ -19,6 +19,15 @@ impl ComponentMetadata {
             .map(|v| v.as_str())
             .unwrap_or_default()
     }
+
+    pub fn with_prefix(self, prefix: &str) -> Self {
+        let name = format!("{}.{}", prefix, self.name);
+        Self {
+            component_id: ComponentId::new(&name),
+            name,
+            metadata: HashMap::new(),
+        }
+    }
 }
 
 impl From<&str> for ComponentMetadata {

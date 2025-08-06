@@ -3370,11 +3370,10 @@ dependencies = [
  "impeller2",
  "impeller2-stellar",
  "impeller2-wkt",
- "mlua",
+ "metor-db",
  "nox",
  "roci",
  "roci-adcs",
- "serde",
  "stellarator",
  "zerocopy 0.8.14",
 ]
@@ -9628,6 +9627,8 @@ version = "0.1.0"
 dependencies = [
  "approx",
  "nox",
+ "roci",
+ "zerocopy 0.8.14",
 ]
 
 [[package]]

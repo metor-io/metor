@@ -498,6 +498,18 @@ pub mod builder {
         arg: Arc<OpBuilder>,
     }
 
+    impl FieldBuilder {
+        pub fn offset_by(self, offset: impl Into<Offset>) -> Self {
+            let offset = offset.into();
+            println!("offset {:?}", offset);
+            Self {
+                offset: Offset(self.offset.0 + offset.0),
+                len: self.len,
+                arg: self.arg,
+            }
+        }
+    }
+
     /// Creates a data operation builder from the provided data
     pub fn data<T: IntoBytes + Immutable + ?Sized>(data: &T) -> Arc<OpBuilder> {
         let align = core::mem::align_of_val(data);
