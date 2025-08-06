@@ -16,7 +16,7 @@ struct Field {
     ident: Option<syn::Ident>,
     ty: syn::Type,
     component_id: Option<String>,
-    #[darling(skip, default)]
+    #[darling(default)]
     nest: bool,
     asset: Option<bool>,
 }

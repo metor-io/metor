@@ -34,6 +34,11 @@ pub trait Field:
     where
         Self: Sized;
 
+    /// Returns a scalar tensor representing 6
+    fn six<R: OwnedRepr>() -> Scalar<Self, R>
+    where
+        Self: Sized;
+
     /// Returns the primitive type representing zero.
     fn zero_prim() -> Self
     where
@@ -163,7 +168,7 @@ impl_real_field!(f32);
 impl_real_field!(f64);
 
 macro_rules! impl_real_closed_field {
-    ($t:ty, $zero:tt, $one:tt, $two:tt) => {
+    ($t:ty, $zero:tt, $one:tt, $two:tt, $six:tt) => {
         impl Field for $t {
             fn zero<R: OwnedRepr>() -> Scalar<Self, R> {
                 let inner = R::scalar_from_const($zero);
@@ -189,6 +194,14 @@ macro_rules! impl_real_closed_field {
                 }
             }
 
+            fn six<R: OwnedRepr>() -> Scalar<Self, R> {
+                let inner = R::scalar_from_const($six);
+                Scalar {
+                    inner,
+                    phantom: PhantomData,
+                }
+            }
+
             fn zero_prim() -> Self {
                 $zero
             }
@@ -204,12 +217,12 @@ macro_rules! impl_real_closed_field {
     };
 }
 
-impl_real_closed_field!(f32, 0.0, 1.0, 2.0);
-impl_real_closed_field!(f64, 0.0, 1.0, 2.0);
+impl_real_closed_field!(f32, 0.0, 1.0, 2.0, 6.0);
+impl_real_closed_field!(f64, 0.0, 1.0, 2.0, 6.0);
 
-impl_real_closed_field!(i16, 0, 1, 2);
-impl_real_closed_field!(i32, 0, 1, 2);
-impl_real_closed_field!(i64, 0, 1, 2);
-impl_real_closed_field!(u16, 0, 1, 2);
-impl_real_closed_field!(u32, 0, 1, 2);
-impl_real_closed_field!(u64, 0, 1, 2);
+impl_real_closed_field!(i16, 0, 1, 2, 6);
+impl_real_closed_field!(i32, 0, 1, 2, 6);
+impl_real_closed_field!(i64, 0, 1, 2, 6);
+impl_real_closed_field!(u16, 0, 1, 2, 6);
+impl_real_closed_field!(u32, 0, 1, 2, 6);
+impl_real_closed_field!(u64, 0, 1, 2, 6);

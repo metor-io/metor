@@ -679,6 +679,8 @@ impl Server {
         stellarator::struc_con::stellar(move || Self::handle_udp(addr, udp_db));
         loop {
             let stream = listener.accept().await?;
+            let peer_addr = stream.peer_addr()?;
+            trace!(?peer_addr, "accepted connection");
             let conn_db = db.clone();
             stellarator::struc_con::stellar(move || handle_conn(stream, conn_db));
         }

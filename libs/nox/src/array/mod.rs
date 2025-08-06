@@ -415,6 +415,14 @@ impl<T1: Elem, D1: Dim> Array<T1, D1> {
         if !cobroadcast_dims(shape.as_mut(), d1.as_ref()) {
             todo!("handle broadcastable dims");
         }
+
+        if shape.as_ref().is_empty() {
+            out.buf
+                .as_mut_buf()
+                .copy_from_slice(&self.buf.as_buf()[..1]);
+            return out;
+        }
+
         for (a, out) in self
             .broadcast_iter(shape)
             .unwrap()

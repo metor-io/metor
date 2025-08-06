@@ -1,4 +1,7 @@
+use std::path::Component;
+
 use impeller2_wkt::ComponentMetadata;
+use nox::SpatialTransform;
 
 pub trait Metadatatize {
     fn metadata() -> impl Iterator<Item = ComponentMetadata> {
@@ -39,3 +42,11 @@ impl_metadatatize!(
 impl_metadatatize!(
     T1, T2, T3, T4, T5, T6, T7, T9, T10, T11, T12, T13, T14, T15, T16, T17, T18
 );
+
+impl Metadatatize for nox::Body {
+    fn metadata() -> impl Iterator<Item = ComponentMetadata> {
+        ["pos", "vel", "accel", "inertia"]
+            .map(ComponentMetadata::from)
+            .into_iter()
+    }
+}

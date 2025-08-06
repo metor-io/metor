@@ -29,12 +29,13 @@ pub fn metadatatize(input: TokenStream) -> TokenStream {
 
     let metadata_items = fields.fields.iter().map(|field| {
         let ty = &field.ty;
+
+        let name = field
+            .ident
+            .as_ref()
+            .expect("only named field allowed")
+            .to_string();
         if !field.nest {
-            let name = field
-                .ident
-                .as_ref()
-                .expect("only named field allowed")
-                .to_string();
             let component_id = field.component_id();
 
             let component_id = if let Some(parent) = &parent {
@@ -53,7 +54,11 @@ pub fn metadatatize(input: TokenStream) -> TokenStream {
             }
         } else {
             quote! {
-                .chain(<#ty as #crate_name::Metadatatize>::metadata())
+                .chain(<#ty as #crate_name::Metadatatize>::metadata().map(|mut metadata| {
+                    metadata.name = format!("{}.{}", #name, metadata.name);
+                    metadata.component_id = #impeller::types::ComponentId::new(&metadata.name);
+                    metadata
+                }))
             }
         }
     });

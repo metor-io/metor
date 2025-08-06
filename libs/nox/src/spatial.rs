@@ -257,6 +257,8 @@ impl<T: RealField, R: OwnedRepr> Add for SpatialForce<T, R> {
 
 /// A spatial inertia is a 7D vector that represents the mass, moment of inertia, and momentum of a rigid body in 3D space.
 /// The inertia matrix is assumed to be symmetric and represented in its diagonalized form.
+#[derive(zerocopy::IntoBytes, zerocopy::Immutable, zerocopy::KnownLayout)]
+#[repr(transparent)]
 pub struct SpatialInertia<T: TensorItem, R: OwnedRepr = DefaultRepr> {
     pub inner: Vector<T, 7, R>,
 }
@@ -383,6 +385,8 @@ where
 }
 
 /// A spatial motion is a 6D vector that represents the velocity of a rigid body in 3D space.
+#[derive(zerocopy::IntoBytes, zerocopy::Immutable, zerocopy::KnownLayout)]
+#[repr(transparent)]
 pub struct SpatialMotion<T: TensorItem, R: OwnedRepr = DefaultRepr> {
     pub inner: Vector<T, 6, R>,
 }
@@ -395,6 +399,15 @@ where
         Self {
             inner: self.inner.clone(),
         }
+    }
+}
+
+impl<T: Field, R: OwnedRepr> core::fmt::Debug for SpatialMotion<T, R>
+where
+    R::Inner<T, Const<6>>: core::fmt::Debug,
+{
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_tuple("SpatialMotion").field(&self.inner).finish()
     }
 }
 

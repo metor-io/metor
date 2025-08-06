@@ -21,6 +21,16 @@ impl ComponentMetadata {
     }
 }
 
+impl From<&str> for ComponentMetadata {
+    fn from(id: &str) -> Self {
+        Self {
+            component_id: ComponentId::new(id),
+            name: id.to_string(),
+            metadata: HashMap::new(),
+        }
+    }
+}
+
 #[derive(Clone, Serialize, Deserialize, Debug, PartialEq, Schema)]
 #[cfg_attr(feature = "bevy", derive(bevy::prelude::Component))]
 pub struct EntityMetadata {
