@@ -1,4 +1,6 @@
 use nox::{ArrayRepr, OwnedRepr, Quaternion, Repr, Vector};
+use roci::{AsVTable, Metadatatize};
+use zerocopy::{Immutable, IntoBytes};
 
 /// Calculates the LQR control matrices for a yang LQR controller.
 ///
@@ -43,11 +45,11 @@ pub fn control(
     k: Vector<f64, 3, ArrayRepr>,
 ) -> Vector<f64, 3, ArrayRepr> {
     let error = (att_est.inverse() * goal).0;
-    let sign = error.get(3);
-    let error_vector: Vector<f64, 3, _> = error.fixed_slice(&[0]);
+    let sign = error.into_buf()[3].signum();
+    let error: Vector<f64, 3, _> = error.fixed_slice(&[0]);
 
     let ang_vel_term = -1.0 * (ang_vel * d);
-    let error_term = sign * (error_vector * k);
+    let error_term = sign * error * k;
 
     ang_vel_term + error_term
 }
@@ -56,6 +58,7 @@ pub fn control(
 ///
 /// Based on the paper: "Analytic LQR Design for Spacecraft Control System Based on Quaternion Model"
 /// by Yang et al.
+#[derive(Debug, Clone, Copy, AsVTable, IntoBytes, Immutable, Metadatatize)]
 pub struct YangLQR {
     d: Vector<f64, 3, ArrayRepr>,
     k: Vector<f64, 3, ArrayRepr>,
@@ -130,7 +133,7 @@ mod tests {
     #[test]
     fn test_control() {
         let att_est = Quaternion::identity();
-        let ang_vel = tensor![0.1, -0.2, 0.3];
+        let ang_vel = tensor![0.1, -0.1, 0.3];
         let goal = Quaternion::from_axis_angle(tensor![0.0, 0.0, 1.0], 0.1);
 
         let (d, k) = test_cubesat_gains();

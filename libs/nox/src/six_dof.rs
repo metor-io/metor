@@ -25,7 +25,7 @@ pub struct DU {
 impl DU {
     pub fn from_body_force(body: &Body, force: SpatialForce<f64>) -> Self {
         DU {
-            vel: body.vel.clone() + body.accel.clone(),
+            vel: body.vel.clone(),
             accel: force / body.inertia.clone(),
         }
     }

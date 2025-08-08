@@ -154,7 +154,7 @@ impl<T: TensorItem, D: Dim, R: OwnedRepr> Tensor<T, D, R> {
 }
 
 impl<T: TensorItem + Elem, D: Dim> Tensor<T, D, ArrayRepr> {
-    pub fn from_buf(buf: D::Buf<T::Elem>) -> Self {
+    pub const fn from_buf(buf: D::Buf<T::Elem>) -> Self {
         Self {
             inner: Array { buf },
             phantom: PhantomData,

@@ -33,3 +33,7 @@ clap.features = ["derive"]
 
 # db
 metor-db.path = "../../libs/db"
+
+# rand
+rand = "0.9"
+rand_distr = "0.5"
