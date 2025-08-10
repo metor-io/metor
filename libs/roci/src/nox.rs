@@ -3,7 +3,7 @@ use impeller2::{
     vtable::builder::{self, FieldBuilder, raw_field, schema},
 };
 use impeller2_wkt::ComponentMetadata;
-use nox::{Body, Field, SpatialInertia, SpatialMotion, SpatialTransform};
+use nox::{Body, Field, SpatialForce, SpatialInertia, SpatialMotion, SpatialTransform};
 use std::{borrow::Cow, mem::offset_of};
 
 use crate::{AsVTable, Metadatatize};
@@ -21,6 +21,7 @@ impl AsVTable for Body {
         let vel = component("vel");
         let accel = component("accel");
         let inertia = component("inertia");
+        let force = component("force");
         SpatialTransform::<f64>::vtable_fields(Some(pos))
             .chain(
                 SpatialMotion::<f64>::vtable_fields(Some(vel))
@@ -33,6 +34,10 @@ impl AsVTable for Body {
             .chain(
                 SpatialInertia::<f64>::vtable_fields(Some(inertia))
                     .map(|field| field.offset_by(offset_of!(Body, inertia) as u16)),
+            )
+            .chain(
+                SpatialForce::<f64>::vtable_fields(Some(force))
+                    .map(|field| field.offset_by(offset_of!(Body, force) as u16)),
             )
     }
 }
@@ -49,6 +54,8 @@ impl Metadatatize for nox::Body {
             "inertia.mass",
             "inertia.moment_of_inertia",
             "inertia.momentum",
+            "force.angular",
+            "force.linear",
         ]
         .map(ComponentMetadata::from)
         .into_iter()
@@ -129,6 +136,31 @@ impl<T: PrimTypeElem + Field> AsVTable for SpatialInertia<T> {
                 6 * size_of::<T>() as u16,
                 (size_of::<T>()) as u16,
                 schema(T::PRIM_TYPE, &[1], component("mass")),
+            ),
+        ]
+        .into_iter()
+    }
+}
+
+impl<T: PrimTypeElem + Field> AsVTable for SpatialForce<T> {
+    fn vtable_fields(prefix: Option<Cow<'_, str>>) -> impl Iterator<Item = FieldBuilder> {
+        let component = |name| {
+            if let Some(prefix) = &prefix {
+                builder::component(format!("{}.{}", prefix, name).as_str())
+            } else {
+                builder::component(name)
+            }
+        };
+        [
+            raw_field(
+                0,
+                (3 * size_of::<T>()) as u16,
+                schema(T::PRIM_TYPE, &[3], component("angular")),
+            ),
+            raw_field(
+                3 * size_of::<T>() as u16,
+                (3 * size_of::<T>()) as u16,
+                schema(T::PRIM_TYPE, &[3], component("linear")),
             ),
         ]
         .into_iter()

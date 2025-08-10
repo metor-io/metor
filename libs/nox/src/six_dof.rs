@@ -15,18 +15,21 @@ pub struct Body {
     pub vel: SpatialMotion<f64>,
     pub accel: SpatialMotion<f64>,
     pub inertia: SpatialInertia<f64>,
+    pub force: SpatialForce<f64>,
 }
 
 pub struct DU {
     vel: SpatialMotion<f64>,
     accel: SpatialMotion<f64>,
+    force: SpatialForce<f64>,
 }
 
 impl DU {
     pub fn from_body_force(body: &Body, force: SpatialForce<f64>) -> Self {
         DU {
             vel: body.vel.clone(),
-            accel: force / body.inertia.clone(),
+            accel: force.clone() / body.inertia.clone(),
+            force,
         }
     }
 }
@@ -40,6 +43,7 @@ impl<'a> Add<DU> for &'a Body {
             vel: self.vel.clone() + du.accel.clone(),
             accel: du.accel,
             inertia: self.inertia.clone(),
+            force: du.force.clone(),
         }
     }
 }
@@ -51,6 +55,7 @@ impl Add<DU> for DU {
         DU {
             vel: self.vel + du.vel,
             accel: self.accel + du.accel,
+            force: self.force,
         }
     }
 }
@@ -62,6 +67,7 @@ impl<'a> Mul<&'a DU> for Scalar<f64> {
         DU {
             vel: du.vel.clone() * &self,
             accel: du.accel.clone() * &self,
+            force: du.force.clone(),
         }
     }
 }
@@ -86,6 +92,7 @@ mod tests {
             vel: SpatialMotion::zero(),
             accel: SpatialMotion::zero(),
             inertia: SpatialInertia::from_mass(1.0),
+            force: SpatialForce::zero(),
         };
         let k = 1.0;
         for _ in 0..10 {
@@ -95,5 +102,24 @@ mod tests {
             });
         }
         assert_eq!(body.pos.linear(), tensor![0.540302967116884, 0.0, 0.0]);
+    }
+
+    #[test]
+    fn test_gravity() {
+        let mut body = Body {
+            pos: SpatialTransform::new(Quaternion::identity(), tensor![0.0, 0.0, 0.0]),
+            vel: SpatialMotion::zero(),
+            accel: SpatialMotion::zero(),
+            inertia: SpatialInertia::from_mass(1.0),
+            force: SpatialForce::zero(),
+        };
+        let g = 9.81;
+        for _ in 0..20 {
+            body = six_dof_rk4(0.1, body, |_| {
+                let force = tensor![0.0, 0.0, -g];
+                SpatialForce::from_linear(force)
+            });
+        }
+        assert_eq!(body.pos.linear(), tensor![0.0, 0.0, -19.6]);
     }
 }

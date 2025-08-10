@@ -313,7 +313,7 @@ impl FSW {
         Quat::new(x, y, z, w)
     }
 
-    pub fn update(mut self, sensors: &Sensors, body: &Body) -> Self {
+    pub fn update(mut self, sensors: &Sensors) -> Self {
         self.nav = Nav::from_sensors(&sensors);
         self.mekf.omega = sensors.imu.gyro;
         self.mekf = self.mekf.estimate_attitude(
@@ -325,9 +325,8 @@ impl FSW {
 
         self.control.att_set_point = self.earth_point();
         self.control.torque_set_point = self.control.yang_lqr.control(
-            body.pos.angular(),
-            //self.mekf.q_hat,
-            body.pos.angular().inverse() * body.vel.angular(),
+            self.mekf.q_hat,
+            self.mekf.omega,
             self.control.att_set_point,
         );
 
@@ -335,30 +334,13 @@ impl FSW {
     }
 }
 
-impl<'a> Add<DU> for &'a CubeSat {
-    type Output = CubeSat;
+impl<'a> Add<DU> for &'a Sim {
+    type Output = Sim;
 
     fn add(self, du: DU) -> Self::Output {
-        let Sim {
-            body,
-            mut reaction_wheels,
-            ..
-        } = self.sim.clone();
-        let body = &body + du;
-
-        for rw in &mut reaction_wheels {
-            rw.update();
-        }
-        let sensors = Sensors::from_body(&body);
-        let control = self.fsw.clone().update(&sensors, &body).clone();
-        let mut sim = Sim {
-            body,
-            reaction_wheels,
-            sensors,
-            control_torque: Vec3::zeros(),
-        };
-        sim.set_reaction_wheel_torque(control.control.torque_set_point);
-        CubeSat { sim, fsw: control }
+        let mut new = self.clone();
+        new.body = &new.body + du;
+        new
     }
 }
 
@@ -377,9 +359,10 @@ impl CubeSat {
         let initial_velocity = (G * M / radius).sqrt();
         let body = Body {
             pos: SpatialTransform::from_linear(tensor![1.0, 0.0, 0.0] * radius),
-            vel: SpatialMotion::new(tensor![0.0, 10.0, 0.0], tensor![0.0, initial_velocity, 0.0]),
+            vel: SpatialMotion::new(tensor![0.0, 2.0, 0.0], tensor![0.0, initial_velocity, 0.0]),
             accel: SpatialMotion::zero(),
             inertia: SpatialInertia::new(J, Vec3::zeros(), MASS),
+            force: SpatialForce::zero(),
         };
         let sim = Sim {
             sensors: Sensors::from_body(&body),
@@ -412,23 +395,35 @@ impl Sim {
     }
 
     pub fn reaction_wheel_torque(&self) -> Vec3<f64> {
-        self.reaction_wheels.iter().map(|wheel| wheel.torque).sum()
-        //println!("rw torque {:?} vs {:?}", torque, self.control_torque);
-        //self.control_torque
-        //Vec3::from_buf(self.control_torque.into_buf().map(|x| x.clamp(-0.01, 0.01)))
+        Vec3::from_buf(self.control_torque.into_buf().map(|x| x.clamp(-0.01, 0.01)))
+        //self.reaction_wheels.iter().map(|wheel| wheel.torque).sum()
+    }
+
+    pub fn update(mut self) -> Self {
+        for rw in &mut self.reaction_wheels {
+            rw.update();
+        }
+        self.sensors = Sensors::from_body(&self.body);
+        self
     }
 
     pub fn du(&self) -> DU {
         let gravity_force = SpatialForce::from_linear(self.gravity());
         let rw_torque = self.reaction_wheel_torque();
         let rw_spatial_force = SpatialForce::from_torque(rw_torque);
-        let total_force = gravity_force + rw_spatial_force;
-        nox::DU::from_body_force(&self.body, total_force)
+        let force = gravity_force + rw_spatial_force;
+        DU::from_body_force(&self.body, force)
     }
 }
 
-fn tick(cubesat: CubeSat) -> CubeSat {
-    rk4::<f64, CubeSat, DU, _>(DT, &cubesat, |cubesat: &CubeSat| -> DU { cubesat.sim.du() })
+fn tick(mut cubesat: CubeSat) -> CubeSat {
+    cubesat.sim = cubesat.sim.update();
+    cubesat.sim = rk4::<f64, Sim, DU, _>(DT, &cubesat.sim, |sim: &Sim| -> DU { sim.du() });
+    cubesat.fsw = cubesat.fsw.update(&cubesat.sim.sensors);
+    cubesat
+        .sim
+        .set_reaction_wheel_torque(cubesat.fsw.control.torque_set_point);
+    cubesat
 }
 
 #[stellarator::main]
