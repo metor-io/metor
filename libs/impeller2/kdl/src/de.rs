@@ -372,15 +372,15 @@ fn parse_object_3d_mesh(
                 .entries()
                 .iter()
                 .find(|e| e.name().is_none())
+                .and_then(|e| e.value().as_string())
                 .ok_or_else(|| KdlSchematicError::MissingProperty {
                     property: "path".to_string(),
                     node: "glb".to_string(),
                     src: src.to_string(),
                     span: node.span(),
-                })?
-                .to_string();
+                })?;
 
-            Ok(Object3DMesh::Glb(path))
+            Ok(Object3DMesh::Glb(path.to_string()))
         }
         "sphere" => {
             let radius = node

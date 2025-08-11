@@ -187,14 +187,25 @@ pub fn set_viewport_pos(
         if let Some(compiled_expr) = &viewport.pos.compiled_expr {
             if let Ok(val) = compiled_expr.execute(&entity_map, &values) {
                 if let Some(world_pos) = val.as_world_pos() {
-                    *pos = world_pos;
+                    //*pos = world_pos;
+                    *pos = WorldPos {
+                        att: nox::Quaternion::identity(),
+                        pos: world_pos.pos,
+                    };
                 }
             }
             if let Some(compiled_expr) = &viewport.look_at.compiled_expr {
-                if let Ok(val) = compiled_expr.execute(&entity_map, &values) {
+                if let Ok(val) = compiled_expr
+                    .execute(&entity_map, &values)
+                    .inspect_err(|err| {
+                        println!("look at invalid {:?}", err);
+                    })
+                {
                     if let Some(look_at) = val.as_world_pos() {
                         let dir = (look_at.pos - pos.pos).normalize();
                         pos.att = nox::Quaternion::look_at_rh(dir, nox::Vec3::z_axis());
+                    } else {
+                        println!("look at invalid {:?}", val);
                     }
                 }
             }

@@ -1,0 +1,24 @@
+hsplit {
+    tabs {
+        hierarchy
+        schematic_tree
+    }
+    tabs {
+        vsplit {
+            tabs {
+                graph "cube_sat.sim.body.pos.angular, cube_sat.fsw.mekf.q_hat, cube_sat.fsw.control.att_set_point" name=cube_sat.sim.body.vel.angular
+                graph "cube_sat.sim.sensors.css.sun_vec, cube_sat.sim.sensors.mag.mag" name=cube_sat.sim.body.vel.angular
+            }
+            viewport name=Viewport pos="(0,0,0,1, cube_sat.sim.body.pos.linear + (10,0,0))" look_at="(0,0,0,1, cube_sat.sim.body.pos.linear)"
+        }
+    }
+    tabs {
+        inspector
+    }
+}
+object_3d "(cube_sat.sim.body.pos.angular, cube_sat.sim.body.pos.linear)" {
+    glb "https://storage.googleapis.com/elodin-assets/oresat-low.glb"
+}
+object_3d "(0,0,0,1, 0,0,0)" {
+    glb "https://storage.googleapis.com/elodin-assets/earth.glb"
+}

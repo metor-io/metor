@@ -156,7 +156,7 @@ impl Plugin for EditorPlugin {
                     })
                     .set(AssetPlugin {
                         unapproved_path_mode: UnapprovedPathMode::Allow,
-                        mode: AssetMode::Processed,
+                        mode: AssetMode::Unprocessed,
                         ..default()
                     })
                     .disable::<TransformPlugin>()
