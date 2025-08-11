@@ -1,4 +1,4 @@
-use nox::{ArrayRepr, OwnedRepr, Quaternion, Repr, Vector};
+use nox::{ArrayRepr, OwnedRepr, Quaternion, Repr, Vector, tensor};
 use roci::{AsVTable, Metadatatize};
 use zerocopy::{Immutable, IntoBytes};
 
@@ -44,14 +44,16 @@ pub fn control(
     d: Vector<f64, 3, ArrayRepr>,
     k: Vector<f64, 3, ArrayRepr>,
 ) -> Vector<f64, 3, ArrayRepr> {
-    let error = (att_est.inverse() * goal).0;
-    let sign = error.into_buf()[3].signum();
-    let error: Vector<f64, 3, _> = error.fixed_slice(&[0]);
+    let error = (goal * att_est.inverse()).0;
+    let [x, y, z, w] = error.into_buf();
+    let sign = w.signum();
+    let error: Vector<f64, 3, _> = tensor![x, y, z];
 
-    let ang_vel_term = -1.0 * (ang_vel * d);
+    let ang_vel_term = -1.0 * ang_vel * d;
+    //let ang_vel_term =0.0;
     let error_term = sign * error * k;
 
-    ang_vel_term + error_term
+    error_term + ang_vel_term
 }
 
 /// Yang LQR spacecraft attitude controller

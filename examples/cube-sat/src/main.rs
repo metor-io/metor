@@ -7,6 +7,7 @@ use std::{
 
 use impeller2::types::{LenPacket, PacketId};
 use impeller2_stellar::Client;
+use impeller2_wkt::SetDbConfig;
 use nox::{
     Body, DU, Quaternion, ReprMonad, Scalar, SpatialForce, SpatialInertia, SpatialMotion,
     SpatialTransform, Vec3, Vector, Vector3, array::Quat, rk4, tensor,
@@ -53,12 +54,11 @@ pub struct Sensors {
 }
 
 impl Sensors {
-    pub fn from_body(body: &Body) -> Self {
-        let imu = IMU::from_body(body);
-        let mag = Mag::from_body(body);
-        let css = CSS::from_body(body);
-        let gps = GPS::from_body(body);
-        Sensors { imu, mag, css, gps }
+    pub fn update(&mut self, body: &Body) {
+        self.imu.update(&body);
+        self.mag = Mag::from_body(body);
+        self.css = CSS::from_body(body);
+        self.gps = GPS::from_body(body);
     }
 }
 
@@ -66,20 +66,17 @@ impl Sensors {
 #[repr(C)]
 pub struct IMU {
     gyro: Vec3<f64>,
+    bias: Vec3<f64>,
 }
 
 impl IMU {
-    pub fn from_body(body: &Body) -> Self {
-        let dist = rand_distr::Normal::new(0.0, 3.16e-7).expect("dist failed to create");
+    pub fn update(&mut self, body: &Body) {
+        let bias_dist = rand_distr::Normal::new(0.0, 3.16e-7).expect("dist failed to create");
+        let dist = rand_distr::Normal::new(0.0, 3.16e-4).expect("dist failed to create");
         let mut rng = rand::rng();
-        let noise = Vec3::new(
-            dist.sample(&mut rng),
-            dist.sample(&mut rng),
-            dist.sample(&mut rng),
-        );
-        let gyro = (body.pos.angular().inverse() * body.vel.angular()) + noise;
-
-        IMU { gyro }
+        self.bias = self.bias + bias_dist.sample_tensor(&mut rng);
+        let noise = dist.sample_tensor(&mut rng) + self.bias;
+        self.gyro = (body.pos.angular().inverse() * body.vel.angular()) + noise;
     }
 }
 
@@ -95,7 +92,9 @@ impl Mag {
         let pos_norm = pos.norm().into_buf();
         let e_hat = pos.normalize();
         let b = ((EARTH_RADIUS / pos_norm).powi(3)) * (3.0 * K_0.dot(&e_hat) * e_hat - K_0);
-        let mag = body.pos.angular().inverse() * b; // TODO: add noise
+        let dist = rand_distr::Normal::new(0.0, 1e-10).expect("dist failed to create");
+        let mag = body.pos.angular().inverse() * b + dist.sample_tensor(&mut rand::rng());
+        let mag = mag.normalize();
 
         Mag { mag }
     }
@@ -111,7 +110,7 @@ pub struct CSS {
 impl CSS {
     pub fn from_body(body: &Body) -> Self {
         let att_ecef_body = body.pos.angular().inverse();
-        let sun_pos = body.pos.linear().normalize(); // NOTE(sphw): this is super fake make this more real
+        let sun_pos = tensor![0.0, 0.0, 1.0]; // NOTE(sphw): this is super fake make this more real
         let sun_pos_b = att_ecef_body * sun_pos;
         let dist = rand_distr::Normal::new(0.0, 0.01).expect("dist failed to create");
         let mut rng = rand::rng();
@@ -288,8 +287,9 @@ impl Nav {
     pub fn from_sensors(sensors: &Sensors) -> Self {
         let pos_norm = sensors.gps.pos.norm().into_buf();
         let e_hat = sensors.gps.pos.normalize();
-        let sun_pos = sensors.gps.pos.normalize(); // NOTE(sphw): this is super fake make this more real
+        let sun_pos = tensor![0.0, 0.0, 1.0]; // NOTE(sphw): this is super fake make this more real
         let mag = ((EARTH_RADIUS / pos_norm).powi(3)) * (3.0 * K_0.dot(&e_hat) * e_hat - K_0);
+        let mag = mag.normalize();
         Self { mag, sun_pos }
     }
 }
@@ -310,23 +310,27 @@ impl FSW {
         let body_axis = tensor![0.0, -1.0, 0.0];
         let [x, y, z] = body_axis.cross(&r).into_buf();
         let w = 1.0 + body_axis.dot(&r).into_buf();
-        Quat::new(x, y, z, w)
+        Quat::new(w, x, y, z).normalize()
     }
 
-    pub fn update(mut self, sensors: &Sensors) -> Self {
+    pub fn update(mut self, sensors: &Sensors, body: &Body) -> Self {
         self.nav = Nav::from_sensors(&sensors);
         self.mekf.omega = sensors.imu.gyro;
         self.mekf = self.mekf.estimate_attitude(
-            [sensors.css.sun_vec, sensors.mag.mag],
-            [self.nav.sun_pos, self.nav.mag],
+            [sensors.css.sun_vec, sensors.mag.mag.normalize()],
+            [self.nav.sun_pos, self.nav.mag.normalize()],
             [0.01, 0.01],
         );
         self.sensors = sensors.clone();
 
         self.control.att_set_point = self.earth_point();
         self.control.torque_set_point = self.control.yang_lqr.control(
-            self.mekf.q_hat,
-            self.mekf.omega,
+            //Quaternion::identity(),
+            body.pos.angular(),
+            body.pos.angular().inverse() * body.vel.angular(),
+            // self.mekf.q_hat,
+            // self.mekf.omega,
+            //Quaternion::identity().inverse(),
             self.control.att_set_point,
         );
 
@@ -359,13 +363,13 @@ impl CubeSat {
         let initial_velocity = (G * M / radius).sqrt();
         let body = Body {
             pos: SpatialTransform::from_linear(tensor![1.0, 0.0, 0.0] * radius),
-            vel: SpatialMotion::new(tensor![0.0, 2.0, 0.0], tensor![0.0, initial_velocity, 0.0]),
+            vel: SpatialMotion::new(tensor![0.0, 0.0, 0.0], tensor![0.0, initial_velocity, 0.0]),
             accel: SpatialMotion::zero(),
             inertia: SpatialInertia::new(J, Vec3::zeros(), MASS),
             force: SpatialForce::zero(),
         };
         let sim = Sim {
-            sensors: Sensors::from_body(&body),
+            sensors: Sensors::default(),
             reaction_wheels: [
                 ReactionWheel::new(tensor![1.0, 0.0, 0.0]),
                 ReactionWheel::new(tensor![0.0, 1.0, 0.0]),
@@ -395,7 +399,8 @@ impl Sim {
     }
 
     pub fn reaction_wheel_torque(&self) -> Vec3<f64> {
-        Vec3::from_buf(self.control_torque.into_buf().map(|x| x.clamp(-0.01, 0.01)))
+        //Vec3::from_buf(self.control_torque.into_buf().map(|x| x.clamp(-0.01, 0.01)))
+        Vec3::from_buf(self.control_torque.into_buf())
         //self.reaction_wheels.iter().map(|wheel| wheel.torque).sum()
     }
 
@@ -403,7 +408,7 @@ impl Sim {
         for rw in &mut self.reaction_wheels {
             rw.update();
         }
-        self.sensors = Sensors::from_body(&self.body);
+        self.sensors.update(&self.body);
         self
     }
 
@@ -419,7 +424,7 @@ impl Sim {
 fn tick(mut cubesat: CubeSat) -> CubeSat {
     cubesat.sim = cubesat.sim.update();
     cubesat.sim = rk4::<f64, Sim, DU, _>(DT, &cubesat.sim, |sim: &Sim| -> DU { sim.du() });
-    cubesat.fsw = cubesat.fsw.update(&cubesat.sim.sensors);
+    cubesat.fsw = cubesat.fsw.update(&cubesat.sim.sensors, &cubesat.sim.body);
     cubesat
         .sim
         .set_reaction_wheel_torque(cubesat.fsw.control.torque_set_point);
@@ -435,6 +440,12 @@ pub async fn main() -> anyhow::Result<()> {
         .map_err(anyhow::Error::from)?;
     let id: PacketId = fastrand::u16(..).to_le_bytes();
     client.init_world::<CubeSat>(id).await?;
+    client
+        .send(&SetDbConfig::schematic_content(
+            include_str!("./schematic.kdl").to_string(),
+        ))
+        .await
+        .0?;
     let mut cube_sat = CubeSat::new();
     let mut pkt = LenPacket::new(impeller2::types::PacketTy::Table, id, size_of::<CubeSat>());
     loop {
@@ -448,5 +459,14 @@ pub async fn main() -> anyhow::Result<()> {
         if sleep > Duration::ZERO {
             stellarator::sleep(sleep).await;
         }
+    }
+}
+
+pub trait NormalExt<T> {
+    fn sample_tensor(&self, rand: &mut impl rand::Rng) -> T;
+}
+impl NormalExt<Vec3<f64>> for rand_distr::Normal<f64> {
+    fn sample_tensor(&self, rand: &mut impl rand::Rng) -> Vec3<f64> {
+        Vec3::new(self.sample(rand), self.sample(rand), self.sample(rand))
     }
 }
