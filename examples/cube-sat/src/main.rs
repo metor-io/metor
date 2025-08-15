@@ -18,6 +18,15 @@ use roci_adcs::{mekf, yang_lqr::YangLQR};
 use stellarator::{rent, struc_con::stellar};
 use zerocopy::{Immutable, IntoBytes, KnownLayout};
 
+const G: f64 = 6.6743e-11; // Gravitational constant
+const M: f64 = 5.972e24; // Mass of Earth
+const MASS: f64 = 2825.2 / 1000.0;
+const J: Vec3<f64> = Vec3::from_buf([15204079.70002e-9, 14621352.61765e-9, 6237758.3131e-9]);
+const EARTH_RADIUS: f64 = 6378.1e3;
+const ALTITUDE: f64 = 400.0e3;
+const DT: f64 = 1.0 / 120.0;
+const K_0: Vec3<f64> = Vec3::from_buf([-30926.00e-9, 5817.00e-9, -2318.00e-9]);
+
 #[derive(AsVTable, Debug, Clone, Immutable, KnownLayout, Metadatatize, IntoBytes)]
 #[repr(C)]
 #[roci(parent = "cube_sat")]
@@ -76,7 +85,7 @@ impl IMU {
         let mut rng = rand::rng();
         self.bias = self.bias + bias_dist.sample_tensor(&mut rng);
         let noise = dist.sample_tensor(&mut rng) + self.bias;
-        self.gyro = (body.pos.angular().inverse() * body.vel.angular()) + noise;
+        self.gyro = body.pos.angular().inverse() * body.vel.angular();
     }
 }
 
@@ -93,7 +102,7 @@ impl Mag {
         let e_hat = pos.normalize();
         let b = ((EARTH_RADIUS / pos_norm).powi(3)) * (3.0 * K_0.dot(&e_hat) * e_hat - K_0);
         let dist = rand_distr::Normal::new(0.0, 1e-10).expect("dist failed to create");
-        let mag = body.pos.angular().inverse() * b + dist.sample_tensor(&mut rand::rng());
+        let mag = body.pos.angular().inverse() * b; // + dist.sample_tensor(&mut rand::rng());
         let mag = mag.normalize();
 
         Mag { mag }
@@ -143,12 +152,14 @@ impl CSS {
 #[repr(C)]
 pub struct GPS {
     pos: Vector<f64, 3>,
+    vel: Vector<f64, 3>,
 }
 
 impl GPS {
     pub fn from_body(body: &Body) -> Self {
         Self {
             pos: body.pos.linear(), // TODO: add noise
+            vel: body.vel.linear(), // TODO: add noise
         }
     }
 }
@@ -234,7 +245,7 @@ impl ReactionWheel {
 
         self.ang_momentum = self.ang_momentum + clamped_torque * DT;
         self.friction = self.friction_torque().into();
-        self.torque = torque; // TODO: add friction
+        self.torque = clamped_torque; // TODO: add friction
         self.update_speed();
     }
 }
@@ -258,6 +269,8 @@ pub struct Control {
     #[roci(nest = true)]
     yang_lqr: YangLQR,
     pub torque_set_point: Vec3<f64>,
+    pub error_term: Vec3<f64>,
+    pub ang_vel_term: Vec3<f64>,
     pub att_set_point: Quaternion<f64>,
 }
 
@@ -271,6 +284,8 @@ impl Default for Control {
                 tensor![8., 8., 8.],
             ),
             torque_set_point: Vec3::zeros(),
+            error_term: Vec3::zeros(),
+            ang_vel_term: Vec3::zeros(),
             att_set_point: Quaternion::identity(),
         }
     }
@@ -304,7 +319,7 @@ impl FSW {
         }
     }
 
-    pub fn earth_point(&self) -> Quat<f64> {
+    pub fn nadir_point(&self) -> Quat<f64> {
         let pos = self.sensors.gps.pos;
         let r = pos.normalize();
         let body_axis = tensor![0.0, -1.0, 0.0];
@@ -313,7 +328,16 @@ impl FSW {
         Quat::new(w, x, y, z).normalize()
     }
 
-    pub fn update(mut self, sensors: &Sensors, body: &Body) -> Self {
+    pub fn hil_point(&self) -> Quat<f64> {
+        let pos = self.sensors.gps.vel.normalize();
+        let r = pos.normalize();
+        let body_axis = tensor![0.0, -1.0, 0.0];
+        let [x, y, z] = body_axis.cross(&r).into_buf();
+        let w = 1.0 + body_axis.dot(&r).into_buf();
+        Quat::new(w, x, y, z).normalize()
+    }
+
+    pub fn update(mut self, sensors: &Sensors) -> Self {
         self.nav = Nav::from_sensors(&sensors);
         self.mekf.omega = sensors.imu.gyro;
         self.mekf = self.mekf.estimate_attitude(
@@ -323,14 +347,21 @@ impl FSW {
         );
         self.sensors = sensors.clone();
 
-        self.control.att_set_point = self.earth_point();
+        self.control.att_set_point = self.nadir_point();
+        if self
+            .control
+            .att_set_point
+            .0
+            .into_buf()
+            .iter()
+            .any(|f| !f.is_finite())
+        {
+            self.control.att_set_point = Quat::identity();
+        }
+
         self.control.torque_set_point = self.control.yang_lqr.control(
-            //Quaternion::identity(),
-            body.pos.angular(),
-            body.pos.angular().inverse() * body.vel.angular(),
-            // self.mekf.q_hat,
-            // self.mekf.omega,
-            //Quaternion::identity().inverse(),
+            self.mekf.q_hat,
+            self.mekf.q_hat * sensors.imu.gyro,
             self.control.att_set_point,
         );
 
@@ -348,22 +379,13 @@ impl<'a> Add<DU> for &'a Sim {
     }
 }
 
-const G: f64 = 6.6743e-11; // Gravitational constant
-const M: f64 = 5.972e24; // Mass of Earth
-const MASS: f64 = 2825.2 / 1000.0;
-const J: Vec3<f64> = Vec3::from_buf([15204079.70002e-9, 14621352.61765e-9, 6237758.3131e-9]);
-const EARTH_RADIUS: f64 = 6378.1e3;
-const ALTITUDE: f64 = 400.0e3;
-const DT: f64 = 1.0 / 120.0;
-const K_0: Vec3<f64> = Vec3::from_buf([-30926.00e-9, 5817.00e-9, -2318.00e-9]);
-
 impl CubeSat {
     pub fn new() -> Self {
         let radius = EARTH_RADIUS + ALTITUDE;
         let initial_velocity = (G * M / radius).sqrt();
         let body = Body {
             pos: SpatialTransform::from_linear(tensor![1.0, 0.0, 0.0] * radius),
-            vel: SpatialMotion::new(tensor![0.0, 0.0, 0.0], tensor![0.0, initial_velocity, 0.0]),
+            vel: SpatialMotion::new(tensor![0.0, 2.0, 0.0], tensor![0.0, initial_velocity, 0.0]),
             accel: SpatialMotion::zero(),
             inertia: SpatialInertia::new(J, Vec3::zeros(), MASS),
             force: SpatialForce::zero(),
@@ -392,16 +414,16 @@ impl Sim {
     }
 
     pub fn set_reaction_wheel_torque(&mut self, torque: Vec3<f64>) {
-        self.control_torque = self.body.pos.angular().inverse() * torque;
+        self.control_torque = torque;
         for wheel in &mut self.reaction_wheels {
-            wheel.torque_set_point = self.control_torque * wheel.axis;
+            wheel.torque_set_point = self.control_torque.dot(&wheel.axis) * wheel.axis;
         }
     }
 
     pub fn reaction_wheel_torque(&self) -> Vec3<f64> {
-        //Vec3::from_buf(self.control_torque.into_buf().map(|x| x.clamp(-0.01, 0.01)))
-        Vec3::from_buf(self.control_torque.into_buf())
-        //self.reaction_wheels.iter().map(|wheel| wheel.torque).sum()
+        //Vec3::from_buf(self.control_torque.into_buf().map(|x| x.clamp(-0.1, 0.1)))
+        //Vec3::from_buf(self.control_torque.into_buf())
+        self.reaction_wheels.iter().map(|wheel| wheel.torque).sum()
     }
 
     pub fn update(mut self) -> Self {
@@ -424,7 +446,7 @@ impl Sim {
 fn tick(mut cubesat: CubeSat) -> CubeSat {
     cubesat.sim = cubesat.sim.update();
     cubesat.sim = rk4::<f64, Sim, DU, _>(DT, &cubesat.sim, |sim: &Sim| -> DU { sim.du() });
-    cubesat.fsw = cubesat.fsw.update(&cubesat.sim.sensors, &cubesat.sim.body);
+    cubesat.fsw = cubesat.fsw.update(&cubesat.sim.sensors);
     cubesat
         .sim
         .set_reaction_wheel_torque(cubesat.fsw.control.torque_set_point);
