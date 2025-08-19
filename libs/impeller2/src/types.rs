@@ -499,6 +499,28 @@ impl ElementValue {
             }
         }
     }
+
+    pub fn as_usize(&self) -> usize {
+        match *self {
+            ElementValue::U8(x) => x as usize,
+            ElementValue::U16(x) => x as usize,
+            ElementValue::U32(x) => x as usize,
+            ElementValue::U64(x) => x as usize,
+            ElementValue::I8(x) => x as usize,
+            ElementValue::I16(x) => x as usize,
+            ElementValue::I32(x) => x as usize,
+            ElementValue::I64(x) => x as usize,
+            ElementValue::F64(x) => x as usize,
+            ElementValue::F32(x) => x as usize,
+            ElementValue::Bool(x) => {
+                if x {
+                    1
+                } else {
+                    0
+                }
+            }
+        }
+    }
 }
 
 #[derive(
@@ -881,6 +903,7 @@ impl<B: IoBuf> OwnedPacket<B> {
     IntoBytes,
     Immutable,
     FromBytes,
+    KnownLayout,
     Serialize,
     Deserialize,
     Default,
@@ -934,6 +957,14 @@ impl Sub<Duration> for Timestamp {
 
     fn sub(self, rhs: Duration) -> Self::Output {
         Timestamp(self.0 - rhs.as_micros() as i64)
+    }
+}
+
+impl Sub<Timestamp> for Timestamp {
+    type Output = Duration;
+
+    fn sub(self, rhs: Timestamp) -> Self::Output {
+        Duration::from_micros((self.0 - rhs.0) as u64)
     }
 }
 

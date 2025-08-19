@@ -29,7 +29,7 @@ use crate::{
     },
 };
 
-use super::{InspectorIcons, empty_inspector};
+use super::{InspectorIcons, empty_inspector, graph};
 
 #[derive(SystemParam)]
 pub struct InspectorEntity<'w, 's> {
@@ -146,15 +146,34 @@ impl WidgetSystem for InspectorEntity<'_, '_> {
 
             let mut create_graph = false;
 
-            inspector_item_multi(
-                ui,
-                &label,
-                element_names,
-                &mut component_value,
-                icon_chart,
-                &mut create_graph,
-                width,
-            );
+            if let Some(variants) = metadata.enum_variants() {
+                let [graph_clicked] = label::label_with_buttons(
+                    ui,
+                    [icon_chart],
+                    label,
+                    get_scheme().text_primary,
+                    egui::Margin::symmetric(0, 4).bottom(12.0),
+                );
+                if let Some(value) = component_value.get(0) {
+                    let value = value.as_usize();
+                    if let Some((_, variant)) = variants.enumerate().find(|(i, _)| *i == value) {
+                        ui.label(variant.to_string());
+                    } else {
+                        ui.label("Unknown Variant {value:?}");
+                    }
+                }
+                create_graph = graph_clicked;
+            } else {
+                inspector_item_multi(
+                    ui,
+                    &label,
+                    element_names,
+                    &mut component_value,
+                    icon_chart,
+                    &mut create_graph,
+                    width,
+                );
+            }
 
             if create_graph {
                 let values = default_component_values(component_id, &component_value);

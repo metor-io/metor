@@ -1,4 +1,4 @@
-use darling::FromField;
+use darling::{FromField, FromVariant};
 use proc_macro::TokenStream;
 use proc_macro_crate::{FoundCrate, crate_name};
 use proc_macro2::Span;
@@ -6,8 +6,6 @@ use quote::quote;
 use syn::Ident;
 
 mod as_vtable;
-mod componentize;
-mod decomponentize;
 mod metadatatize;
 
 #[derive(Debug, FromField)]
@@ -16,9 +14,6 @@ struct Field {
     ident: Option<syn::Ident>,
     ty: syn::Type,
     component_id: Option<String>,
-    #[darling(default)]
-    nest: bool,
-    asset: Option<bool>,
 }
 
 impl Field {
@@ -31,31 +26,6 @@ impl Field {
             }
         }
     }
-
-    pub fn component_id(&self) -> proc_macro2::TokenStream {
-        let crate_name = crate::roci_crate_name();
-        match &self.component_id {
-            Some(c) => quote! {
-                #crate_name::impeller2::types::ComponentId::new(#c)
-            },
-            None => {
-                let ident = self.ident.as_ref().expect("field must have ident");
-                quote! {
-                    #crate_name::impeller2::types::ComponentId::new(stringify!(#ident))
-                }
-            }
-        }
-    }
-}
-
-#[proc_macro_derive(Componentize, attributes(roci))]
-pub fn componentize(input: TokenStream) -> TokenStream {
-    componentize::componentize(input)
-}
-
-#[proc_macro_derive(Decomponentize, attributes(roci))]
-pub fn decomponentize(input: TokenStream) -> TokenStream {
-    decomponentize::decomponentize(input)
 }
 
 #[proc_macro_derive(Metadatatize, attributes(roci))]

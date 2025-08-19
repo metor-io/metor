@@ -18,7 +18,6 @@ pub trait Component {
     fn schema() -> Schema<Vec<u64>>;
 }
 
-#[cfg(feature = "alloc")]
 pub trait PrimTypeElem {
     const PRIM_TYPE: crate::types::PrimType;
 }
@@ -42,6 +41,7 @@ impl_prim_type_element!(u8, U8);
 impl_prim_type_element!(u16, U16);
 impl_prim_type_element!(u32, U32);
 impl_prim_type_element!(u64, U64);
+impl_prim_type_element!(bool, Bool);
 
 pub trait Asset: DeserializeOwned + Serialize {
     const NAME: &'static str;

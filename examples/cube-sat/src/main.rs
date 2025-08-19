@@ -1,16 +1,15 @@
 use std::{
     net::SocketAddr,
     ops::Add,
-    str::LinesAny,
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime},
 };
 
-use impeller2::types::{LenPacket, PacketId};
+use impeller2::types::{LenPacket, PacketId, Timestamp};
 use impeller2_stellar::Client;
 use impeller2_wkt::SetDbConfig;
 use nox::{
-    Body, DU, Quaternion, ReprMonad, Scalar, SpatialForce, SpatialInertia, SpatialMotion,
-    SpatialTransform, Vec3, Vector, Vector3, array::Quat, rk4, tensor,
+    Body, DU, Quaternion, Scalar, SpatialForce, SpatialInertia, SpatialMotion, SpatialTransform,
+    TensorItem, Vec3, Vector, Vector3, array::Quat, rk4, tensor,
 };
 use rand_distr::Distribution;
 use roci::{AsVTable, Metadatatize, tcp::SinkExt};
@@ -31,20 +30,15 @@ const K_0: Vec3<f64> = Vec3::from_buf([-30926.00e-9, 5817.00e-9, -2318.00e-9]);
 #[repr(C)]
 #[roci(parent = "cube_sat")]
 pub struct CubeSat {
-    #[roci(nest = true)]
     pub sim: Sim,
-    #[roci(nest = true)]
     pub fsw: FSW,
 }
 
 #[derive(AsVTable, Debug, Clone, Immutable, KnownLayout, Metadatatize, IntoBytes)]
 #[repr(C)]
 pub struct Sim {
-    #[roci(nest = true)]
     body: Body,
-    #[roci(nest = true)]
     reaction_wheels: [ReactionWheel; 3],
-    #[roci(nest = true)]
     sensors: Sensors,
     control_torque: Vec3<f64>,
 }
@@ -52,13 +46,9 @@ pub struct Sim {
 #[derive(AsVTable, Debug, Clone, Immutable, KnownLayout, Metadatatize, IntoBytes, Default)]
 #[repr(C)]
 pub struct Sensors {
-    #[roci(nest = true)]
     imu: IMU,
-    #[roci(nest = true)]
     mag: Mag,
-    #[roci(nest = true)]
     css: CSS,
-    #[roci(nest = true)]
     gps: GPS,
 }
 
@@ -253,20 +243,24 @@ impl ReactionWheel {
 #[derive(AsVTable, Debug, Clone, Immutable, KnownLayout, Metadatatize, IntoBytes)]
 #[repr(C)]
 pub struct FSW {
-    #[roci(nest = true)]
     pub mekf: mekf::State,
-    #[roci(nest = true)]
     pub sensors: Sensors,
-    #[roci(nest = true)]
     pub nav: Nav,
-    #[roci(nest = true)]
     pub control: Control,
+    pub mode: Mode,
+    pub start_epoch: Timestamp,
+}
+
+#[derive(AsVTable, Metadatatize, Debug, Clone, Copy, IntoBytes, KnownLayout, Immutable)]
+#[repr(u64)]
+pub enum Mode {
+    NadirPoint,
+    HilPoint,
 }
 
 #[derive(AsVTable, Debug, Clone, Immutable, KnownLayout, Metadatatize, IntoBytes)]
 #[repr(C)]
 pub struct Control {
-    #[roci(nest = true)]
     yang_lqr: YangLQR,
     pub torque_set_point: Vec3<f64>,
     pub error_term: Vec3<f64>,
@@ -316,6 +310,8 @@ impl FSW {
             sensors: Sensors::default(),
             nav: Nav::default(),
             control: Control::default(),
+            mode: Mode::HilPoint,
+            start_epoch: Timestamp::now(),
         }
     }
 
@@ -347,7 +343,17 @@ impl FSW {
         );
         self.sensors = sensors.clone();
 
-        self.control.att_set_point = self.nadir_point();
+        let elapsed = Timestamp::now() - self.start_epoch;
+        self.mode = match elapsed.as_secs() % 60 {
+            ..30 => Mode::NadirPoint,
+            _ => Mode::HilPoint,
+        };
+
+        self.control.att_set_point = match self.mode {
+            Mode::NadirPoint => self.nadir_point(),
+            Mode::HilPoint => self.hil_point(),
+        };
+
         if self
             .control
             .att_set_point

@@ -1,11 +1,12 @@
-use std::path::Component;
+use std::borrow::Cow;
 
 use impeller2_wkt::ComponentMetadata;
-use nox::SpatialTransform;
+
+use crate::path::ComponentPath;
 
 pub trait Metadatatize {
-    fn metadata() -> impl Iterator<Item = ComponentMetadata> {
-        std::iter::empty()
+    fn metadata(prefix: impl ComponentPath) -> impl Iterator<Item = ComponentMetadata> {
+        std::iter::once(prefix.to_metadata())
     }
 }
 
@@ -15,6 +16,12 @@ macro_rules! impl_metadatatize {
         where
             $($ty: Metadatatize),+
         {
+            fn metadata(p: impl ComponentPath) -> impl Iterator<Item = ComponentMetadata> {
+                std::iter::empty()
+                $(
+                .chain(<$ty>::metadata(p.clone()))
+                )*
+            }
         }
     };
 }
@@ -47,10 +54,11 @@ impl<const N: usize, T> Metadatatize for [T; N]
 where
     T: Metadatatize,
 {
-    fn metadata() -> impl Iterator<Item = ComponentMetadata> {
-        (0..N).flat_map(|i| {
+    fn metadata(path: impl ComponentPath) -> impl Iterator<Item = ComponentMetadata> {
+        (0..N).flat_map(move |i| {
             let prefix = i.to_string();
-            T::metadata().map(move |m| m.with_prefix(&prefix))
+            let path = path.clone().chain(prefix);
+            T::metadata(path)
         })
     }
 }

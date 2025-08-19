@@ -29,7 +29,7 @@ impl<W: AsyncWrite> SinkExt for impeller2_stellar::PacketSink<W> {
     }
 
     async fn send_metadata<V: Metadatatize>(&self) -> Result<(), Error> {
-        for metadata in V::metadata() {
+        for metadata in V::metadata(()) {
             println!("{metadata:?}");
             self.send(&impeller2_wkt::SetComponentMetadata(metadata))
                 .await

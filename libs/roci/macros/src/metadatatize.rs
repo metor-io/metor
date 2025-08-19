@@ -5,11 +5,11 @@ use quote::quote;
 use syn::{DeriveInput, Generics, Ident, parse_macro_input};
 
 #[derive(Debug, FromDeriveInput)]
-#[darling(attributes(roci), supports(struct_named))]
+#[darling(attributes(roci), supports(struct_named, enum_unit))]
 pub struct Metadatatize {
     ident: Ident,
     generics: Generics,
-    data: ast::Data<(), crate::Field>,
+    data: ast::Data<Ident, crate::Field>,
     parent: Option<String>,
 }
 
@@ -23,49 +23,45 @@ pub fn metadatatize(input: TokenStream) -> TokenStream {
         parent,
     } = Metadatatize::from_derive_input(&input).unwrap();
     let where_clause = &generics.where_clause;
-    let impeller = quote! { #crate_name::impeller2 };
     let impeller_wkt = quote! { #crate_name::impeller2_wkt };
-    let fields = data.take_struct().unwrap();
+    match data {
+        ast::Data::Enum(variants) => {
+            let variants = variants.iter().map(|v| v.to_string()).collect::<Vec<_>>();
 
-    let metadata_items = fields.fields.iter().map(|field| {
-        let ty = &field.ty;
-
-        let name = field.component_name();
-        if !field.nest {
-            let component_id = if let Some(parent) = &parent {
-                format!("{parent}.{name}")
-            } else {
-                name.to_string()
-            };
             quote! {
-                .chain(core::iter::once(#impeller_wkt::ComponentMetadata {
-                    component_id: #impeller::types::ComponentId::new(#component_id),
-                    name: #name.to_string(),
-                    metadata: Default::default(),
-                }))
+                impl #crate_name::Metadatatize for #ident #generics #where_clause {
+                    fn metadata(prefix: impl #crate_name::path::ComponentPath) -> impl Iterator<Item = #impeller_wkt::ComponentMetadata> {
+                        std::iter::once(prefix.to_metadata().with_enum([
+                            #(#variants),*
+                        ]))
+                    }
+                }
             }
-        } else {
-            let prefix = if let Some(parent) = &parent {
-                format!("{parent}.{name}")
-            } else {
-                name
-            };
-            quote! {
-                .chain(<#ty as #crate_name::Metadatatize>::metadata().map(|mut metadata| {
-                    metadata.name = format!("{}.{}", #prefix, metadata.name);
-                    metadata.component_id = #impeller::types::ComponentId::new(&metadata.name);
-                    metadata
-                }))
-            }
+            .into()
         }
-    });
-    quote! {
-        impl #crate_name::Metadatatize for #ident #generics #where_clause {
-            fn metadata() -> impl Iterator<Item = #impeller_wkt::ComponentMetadata> {
-                core::iter::empty()
-                #(#metadata_items)*
+        ast::Data::Struct(fields) => {
+            let metadata_items = fields.fields.iter().map(|field| {
+                let ty = &field.ty;
+
+                let name = field.component_name();
+                let name = if let Some(parent) = &parent {
+                    format!("{parent}.{name}")
+                } else {
+                    name.to_string()
+                };
+                quote! {
+                    .chain(<#ty>::metadata(prefix.clone().chain(#name)))
+                }
+            });
+            quote! {
+                impl #crate_name::Metadatatize for #ident #generics #where_clause {
+                    fn metadata(prefix: impl #crate_name::path::ComponentPath) -> impl Iterator<Item = #impeller_wkt::ComponentMetadata> {
+                        core::iter::empty()
+                        #(#metadata_items)*
+                    }
+                }
             }
+            .into()
         }
     }
-    .into()
 }

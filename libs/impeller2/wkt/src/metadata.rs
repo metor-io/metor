@@ -20,6 +20,10 @@ impl ComponentMetadata {
             .unwrap_or_default()
     }
 
+    pub fn enum_variants(&self) -> Option<impl Iterator<Item = &str>> {
+        self.metadata.get("enum_variants").map(|s| s.split(","))
+    }
+
     pub fn with_prefix(self, prefix: &str) -> Self {
         let name = format!("{}.{}", prefix, self.name);
         Self {
@@ -27,6 +31,26 @@ impl ComponentMetadata {
             name,
             metadata: HashMap::new(),
         }
+    }
+
+    pub fn with_element_names<'a>(
+        mut self,
+        element_names: impl IntoIterator<Item = &'a str>,
+    ) -> Self {
+        let element_names = element_names.into_iter();
+        self.metadata.insert(
+            "element_names".to_string(),
+            element_names.collect::<Vec<_>>().join(","),
+        );
+        self
+    }
+
+    pub fn with_enum<'s>(mut self, variants: impl IntoIterator<Item = &'s str>) -> Self {
+        self.metadata.insert(
+            "enum_variants".to_string(),
+            variants.into_iter().collect::<Vec<_>>().join(","),
+        );
+        self
     }
 }
 
