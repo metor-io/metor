@@ -712,6 +712,8 @@ pub fn set_color_scheme() -> PaletteItem {
             ("CATPPUCINI LATTE", &colors::CATPPUCINI_LATTE),
             ("CATPPUCINI MOCHA", &colors::CATPPUCINI_MOCHA),
             ("CATPPUCINI MACCHIATO", &colors::CATPPUCINI_MACCHIATO),
+            ("AYU DARK", &colors::AYU_DARK),
+            ("AYU LIGHT", &colors::AYU_LIGHT),
         ];
         let mut items = vec![];
         for (name, schema) in schemes {

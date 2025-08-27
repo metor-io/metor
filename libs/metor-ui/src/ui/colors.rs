@@ -378,8 +378,8 @@ pub static DARK: ColorScheme = ColorScheme {
 };
 
 pub static LIGHT: ColorScheme = ColorScheme {
-    bg_primary: Color32::from_rgb(0xFF, 0x8E, 0xED),
-    bg_secondary: Color32::from_rgb(0xFE, 0xF3, 0xE1),
+    bg_primary: Color32::from_rgb(0xFF, 0xFB, 0xF0),
+    bg_secondary: Color32::from_rgb(0xE6, 0xE2, 0xD8),
 
     text_primary: Color32::from_rgb(0x17, 0x16, 0x15),
     text_secondary: Color32::from_rgb(0x2E, 0x2D, 0x2C),
@@ -457,6 +457,48 @@ pub static CATPPUCINI_MACCHIATO: ColorScheme = ColorScheme {
     blue: Color32::from_rgb(0x8A, 0xAD, 0xF4),
     error: Color32::from_rgb(0xED, 0x87, 0x96),
     success: Color32::from_rgb(0xA6, 0xDA, 0x95),
+
+    shadow: Color32::BLACK,
+};
+
+pub static AYU_DARK: ColorScheme = ColorScheme {
+    bg_primary: Color32::from_rgb(0x0B, 0x0E, 0x14), // ui.bg
+    bg_secondary: Color32::from_rgb(0x0F, 0x13, 0x1A), // ui.panel.bg
+
+    text_primary: Color32::from_rgb(0xBF, 0xBD, 0xB6), // editor.fg
+    text_secondary: Color32::from_rgb(0x56, 0x5B, 0x66), // ui.fg
+    text_tertiary: Color32::from_rgb(0x6C, 0x73, 0x80), // gutter.active
+
+    icon_primary: Color32::from_rgb(0xBF, 0xBD, 0xB6), // editor.fg
+    icon_secondary: Color32::from_rgb(0x6C, 0x73, 0x80), // gutter.active
+
+    border_primary: Color32::from_rgb(0x11, 0x15, 0x1C), // ui.line
+
+    highlight: Color32::from_rgb(0x47, 0x52, 0x66), // ui.selection.normal
+    blue: Color32::from_rgb(0x59, 0xC2, 0xFF),      // syntax.entity
+    error: Color32::from_rgb(0xD9, 0x57, 0x57),     // common.error
+    success: Color32::from_rgb(0x7F, 0xD9, 0x62),   // vcs.added
+
+    shadow: Color32::BLACK,
+};
+
+pub static AYU_LIGHT: ColorScheme = ColorScheme {
+    bg_primary: Color32::from_rgb(0xF8, 0xF9, 0xFA), // ui.bg
+    bg_secondary: Color32::from_rgb(0xF3, 0xF4, 0xF5), // ui.panel.bg
+
+    text_primary: Color32::from_rgb(0x5C, 0x61, 0x66), // editor.fg
+    text_secondary: Color32::from_rgb(0x8A, 0x91, 0x99), // ui.fg
+    text_tertiary: Color32::from_rgb(0x8A, 0x91, 0x99), // gutter.active
+
+    icon_primary: Color32::from_rgb(0x5C, 0x61, 0x66), // editor.fg
+    icon_secondary: Color32::from_rgb(0x8A, 0x91, 0x99), // gutter.active
+
+    border_primary: Color32::from_rgb(0x6B, 0x7D, 0x8F), // ui.line (with alpha applied)
+
+    highlight: Color32::from_rgb(0x56, 0x72, 0x8F), // ui.selection.normal
+    blue: Color32::from_rgb(0x39, 0x9E, 0xE6),      // syntax.entity
+    error: Color32::from_rgb(0xE6, 0x50, 0x50),     // common.error
+    success: Color32::from_rgb(0x6C, 0xBF, 0x43),   // vcs.added
 
     shadow: Color32::BLACK,
 };
