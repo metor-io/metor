@@ -59,17 +59,17 @@ impl WidgetSystem for TimelineControls<'_> {
         } = state.get_mut(world);
 
         let mut tick_changed = false;
-        ui.set_height(50.0);
+        ui.set_height(36.0);
 
         egui::Frame::NONE
-            .inner_margin(egui::Margin::symmetric(8, 8))
+            .inner_margin(egui::Margin::symmetric(4, 8))
             .show(ui, |ui| {
                 ui.horizontal(|ui| {
                     ui.allocate_ui_with_layout(
-                        egui::vec2(ui.available_width(), 37.0),
+                        egui::vec2(ui.available_width(), 20.0),
                         egui::Layout::left_to_right(egui::Align::Center),
                         |ui| {
-                            let btn_scale = 1.4;
+                            let btn_scale = 1.3;
                             ui.spacing_mut().item_spacing.x = 8.0;
 
                             let jump_to_start_btn = ui.add(
@@ -150,6 +150,8 @@ impl WidgetSystem for TimelineControls<'_> {
                                         ui.memory_mut(|mem| mem.toggle_popup(popup_id));
                                     }
                                     configure_combo_box(ui.style_mut());
+                                    ui.style_mut().spacing.interact_size.y = 28.0;
+                                    ui.style_mut().spacing.button_padding = [8.0, 0.0].into();
                                     egui::popup::popup_above_or_below_widget(
                                         ui,
                                         popup_id,
@@ -195,7 +197,7 @@ fn time_range_selector_button(
         let behavior_string = behavior.to_string();
         let width = behavior_string.len() as f32 * 7.5;
         ui.allocate_ui_with_layout(
-            egui::vec2(width + 50.0, 34.0),
+            egui::vec2(width + 50.0, 28.0),
             egui::Layout::centered_and_justified(egui::Direction::LeftToRight),
             |ui| {
                 let font_id = egui::TextStyle::Button.resolve(ui.style());

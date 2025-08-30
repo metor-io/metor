@@ -103,7 +103,7 @@ impl<'a> Timeline<'a> {
             segments: 12,
             label_font_size: 10.0,
             fps: 60.0,
-            height: 40.0,
+            height: 28.0,
             width: 400.0,
         }
     }

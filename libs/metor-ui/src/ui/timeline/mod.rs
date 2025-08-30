@@ -234,7 +234,7 @@ impl WidgetSystem for TimelinePanel<'_, '_> {
 
                 let timeline_args = TimelineArgs {
                     available_width,
-                    line_height: 40.0,
+                    line_height: 32.0,
                     segment_count: (available_width / 90.0) as u8,
                     frames_per_second,
                     active_range,
