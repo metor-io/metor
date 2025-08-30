@@ -20,7 +20,9 @@ use bevy_infinite_grid::InfiniteGrid;
 use egui_tiles::TileId;
 use fuzzy_matcher::{FuzzyMatcher, skim::SkimMatcherV2};
 use impeller2::types::msg_id;
-use impeller2_bevy::{ComponentPathRegistry, CurrentStreamId, EntityMap, PacketTx};
+use impeller2_bevy::{
+    ComponentPathRegistry, ComponentSchemaRegistry, CurrentStreamId, EntityMap, PacketTx,
+};
 use impeller2_kdl::ToKdl;
 use impeller2_wkt::{
     ComponentPath, ComponentValue, IsRecording, Material, Mesh, Object3D, SetDbConfig,
@@ -36,7 +38,8 @@ use crate::{
         HdrEnabled, colors,
         plot::{GraphBundle, default_component_values},
         schematic::{
-            CurrentSchematic, LoadSchematicParams, SchematicLiveReloadRx, load_schematic_file,
+            CurrentSchematic, LoadSchematicParams, SchematicLiveReloadRx, eql_to_component_tree,
+            load_schematic_file,
         },
         tiles::{self, TileState},
     },
@@ -289,7 +292,7 @@ pub fn create_graph(tile_id: Option<TileId>) -> PaletteItem {
         "Create Graph",
         TILES_LABEL,
         move |_: In<String>, context: Res<EqlContext>| {
-            PalettePage::new(graph_parts(&context.0.component_parts, tile_id))
+            PalettePage::new(graph_parts(&context.0.component_parts, tile_id, vec![]))
                 .prompt("Select a component to graph")
                 .into()
         },
@@ -299,56 +302,64 @@ pub fn create_graph(tile_id: Option<TileId>) -> PaletteItem {
 fn graph_parts(
     parts: &BTreeMap<String, eql::ComponentPart>,
     tile_id: Option<TileId>,
+    mut eql_chain: Vec<String>,
 ) -> Vec<PaletteItem> {
-    parts
-        .iter()
-        .map(|(name, part)| {
-            let name = name.clone();
-            let part = part.clone();
+    let done = if !eql_chain.is_empty() {
+        let eql_chain = eql_chain.clone();
+        Some(PaletteItem::new("Create Graph", "", {
+            move |_: In<String>,
+                  mut render_layer_alloc: ResMut<RenderLayerAlloc>,
+                  mut tile_state: ResMut<tiles::TileState>,
+                  eql_ctx: Res<EqlContext>,
+                  schema_reg: Res<ComponentSchemaRegistry>| {
+                let eql = eql_chain.clone().join(",");
+                let components = match eql_to_component_tree(&eql_ctx, &schema_reg, &eql) {
+                    Ok(tree) => tree,
+                    Err(err) => return PaletteEvent::Error(err.to_string()),
+                };
+
+                let bundle =
+                    GraphBundle::new(&mut render_layer_alloc, components, "Graph".to_string());
+                tile_state.create_graph_tile(tile_id, bundle);
+                PaletteEvent::Exit
+            }
+        }))
+    } else {
+        None
+    };
+    let eql_chain = eql_chain.clone();
+    done.into_iter()
+        .chain(parts_iter(parts).map(|part| {
+            let name = part.name.clone();
+            let eql_chain = eql_chain.clone();
             PaletteItem::new(
                 name.clone(),
-                "Component",
-                move |_: In<String>,
-                      query: Query<&ComponentValue>,
-                      entity_map: Res<EntityMap>,
-                      mut render_layer_alloc: ResMut<RenderLayerAlloc>,
-                      mut tile_state: ResMut<tiles::TileState>,
-                      path_reg: Res<ComponentPathRegistry>| {
-                    if let Some(component) = &part.component {
-                        let component_id = component.id;
-                        let Some(entity) = entity_map.get(&component_id) else {
-                            return PaletteEvent::Exit;
-                        };
-                        let Ok(value) = query.get(*entity) else {
-                            return PaletteEvent::Exit;
-                        };
-
-                        let values = default_component_values(&component_id, value);
-
-                        let component_path = path_reg
-                            .get(&component_id)
-                            .cloned()
-                            .unwrap_or_else(|| ComponentPath::from_name(&component.name));
-
-                        let components =
-                            BTreeMap::from_iter(std::iter::once((component_path, values.clone())));
-                        let bundle = GraphBundle::new(
-                            &mut render_layer_alloc,
-                            components,
-                            "Graph".to_string(),
-                        );
-                        tile_state.create_graph_tile(tile_id, bundle);
-                        PaletteEvent::Exit
-                    } else {
-                        PaletteEvent::NextPage {
-                            prev_page_label: Some(name.clone()),
-                            next_page: PalettePage::new(graph_parts(&part.children, tile_id)),
-                        }
+                "EQL",
+                move |_: In<String>, eql_ctx: Res<EqlContext>| {
+                    let mut eql_chain = eql_chain.clone();
+                    eql_chain.push(name.clone());
+                    PaletteEvent::NextPage {
+                        prev_page_label: Some(name.clone()),
+                        next_page: PalettePage::new(graph_parts(
+                            &eql_ctx.0.component_parts,
+                            tile_id,
+                            eql_chain,
+                        )),
                     }
                 },
             )
-        })
+        }))
         .collect()
+}
+
+fn parts_iter(
+    parts: &BTreeMap<String, eql::ComponentPart>,
+) -> Box<dyn Iterator<Item = &eql::ComponentPart> + '_> {
+    Box::new(
+        parts
+            .iter()
+            .flat_map(|(_, part)| std::iter::once(part).chain(parts_iter(&part.children))),
+    )
 }
 
 pub fn create_monitor(tile_id: Option<TileId>) -> PaletteItem {

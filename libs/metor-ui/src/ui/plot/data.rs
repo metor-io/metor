@@ -417,7 +417,10 @@ pub fn queue_timestamp_read(
         if !component.real_time_started {
             if let Some(schema) = schemas.get(&component_id) {
                 for msg in real_time_vtable(component_id, schema) {
-                    let _ = packet_tx.0.try_send(Some(msg));
+                    if packet_tx.0.try_send(Some(msg)).is_err() {
+                        println!("error");
+                        return;
+                    }
                 }
                 println!("Real-time data started for component {}", component_id);
                 component.real_time_started = true;
@@ -907,7 +910,7 @@ impl<D: Clone + BoundOrd> Default for LineTree<D> {
     }
 }
 
-pub const CHUNK_COUNT: usize = 0x400;
+pub const CHUNK_COUNT: usize = 0x4000;
 pub const CHUNK_LEN: usize = 0xC00;
 
 impl<D: Clone + BoundOrd + Immutable + IntoBytes + Debug> LineTree<D> {

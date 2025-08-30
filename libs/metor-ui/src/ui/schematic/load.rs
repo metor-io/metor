@@ -76,6 +76,7 @@ pub fn load_schematic_file(
     let (tx, rx) = flume::bounded(1);
     live_reload_rx.0 = Some(rx);
     let watch_path = path.to_path_buf();
+    /*
     std::thread::spawn(move || {
         let cb_path = watch_path.clone();
         let mut debouncer = notify_debouncer_mini::new_debouncer(
@@ -105,7 +106,7 @@ pub fn load_schematic_file(
         loop {
             std::thread::park();
         }
-    });
+    });*/
     if let Ok(kdl) = std::fs::read_to_string(path) {
         let schematic = impeller2_wkt::Schematic::from_kdl(&kdl)?;
         params.load_schematic(&schematic);
@@ -223,33 +224,8 @@ impl LoadSchematicParams<'_, '_> {
                 tile_id
             }
             Panel::Graph(graph) => {
-                let eql = self
-                    .eql
-                    .0
-                    .parse_str(&graph.eql)
-                    .inspect_err(|err| {
-                        warn!(?err, "error parsing graph eql");
-                    })
-                    .ok()?;
-                let mut component_vec = eql.to_graph_components();
-                component_vec.sort();
-                let mut components_tree: BTreeMap<ComponentPath, Vec<(bool, Color32)>> =
-                    BTreeMap::new();
-                for (j, (component, i)) in component_vec.iter().enumerate() {
-                    if let Some(elements) = components_tree.get_mut(component) {
-                        elements[*i] = (true, colors::get_color_by_index_all(j));
-                    } else {
-                        let Some(schema) = self.schema_reg.0.get(&component.id) else {
-                            continue;
-                        };
-                        let len: usize = schema.shape().iter().copied().product();
-                        let mut elements: Vec<(bool, Color32)> = (0..len)
-                            .map(|_| (false, colors::get_color_by_index_all(j)))
-                            .collect();
-                        elements[*i] = (true, colors::get_color_by_index_all(j));
-                        components_tree.insert(component.clone(), elements);
-                    }
-                }
+                let components_tree =
+                    eql_to_component_tree(&self.eql, &self.schema_reg, &graph.eql).ok()?;
 
                 let graph_label = graph_label(graph);
                 let mut bundle = GraphBundle::new(
@@ -356,6 +332,35 @@ impl LoadSchematicParams<'_, '_> {
             }
         }
     }
+}
+
+pub fn eql_to_component_tree(
+    ctx: &EqlContext,
+    schema_reg: &ComponentSchemaRegistry,
+    eql: &str,
+) -> Result<BTreeMap<ComponentPath, Vec<(bool, Color32)>>, eql::Error> {
+    let eql = ctx.0.parse_str(&eql).inspect_err(|err| {
+        warn!(?err, "error parsing graph eql");
+    })?;
+    let mut component_vec = eql.to_graph_components();
+    component_vec.sort();
+    let mut components_tree: BTreeMap<ComponentPath, Vec<(bool, Color32)>> = BTreeMap::new();
+    for (j, (component, i)) in component_vec.iter().enumerate() {
+        if let Some(elements) = components_tree.get_mut(component) {
+            elements[*i] = (true, colors::get_color_by_index_all(j));
+        } else {
+            let Some(schema) = schema_reg.0.get(&component.id) else {
+                continue;
+            };
+            let len: usize = schema.shape().iter().copied().product();
+            let mut elements: Vec<(bool, Color32)> = (0..len)
+                .map(|_| (false, colors::get_color_by_index_all(j)))
+                .collect();
+            elements[*i] = (true, colors::get_color_by_index_all(j));
+            components_tree.insert(component.clone(), elements);
+        }
+    }
+    Ok(components_tree)
 }
 
 pub fn viewport_label(viewport: &Viewport) -> String {

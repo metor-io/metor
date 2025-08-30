@@ -447,6 +447,8 @@ impl Branch {
             default_open,
         } = self;
 
+        ui.spacing_mut().indent = 8.0;
+
         let id = ui.make_persistent_id(&id);
         let mut state = CollapsingState::load_with_default_open(ui.ctx(), id, default_open);
         let chevron = SizedTexture::new(chevron, [18., 18.]);
