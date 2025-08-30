@@ -100,6 +100,16 @@ impl Disruptor {
             core: self.core.clone(),
         }
     }
+
+    pub fn reader_count(&self) -> usize {
+        let mut count = 0;
+        let mut cursor = self.core.readers.0.next.clone();
+        while let Some(reader) = cursor.load_ref(Ordering::Relaxed) {
+            count += 1;
+            cursor = reader.next.clone();
+        }
+        count
+    }
 }
 
 pub struct DistruptorCore {
@@ -217,6 +227,57 @@ impl Reader {
     }
 }
 
+impl Drop for Reader {
+    fn drop(&mut self) {
+        enum ArcRef<'a> {
+            Arc(Arc<ReadNode>),
+            Ref(&'a ReadNode),
+        }
+
+        impl Deref for ArcRef<'_> {
+            type Target = ReadNode;
+
+            fn deref(&self) -> &Self::Target {
+                match self {
+                    ArcRef::Arc(read_node) => &*read_node,
+                    ArcRef::Ref(read_node) => read_node,
+                }
+            }
+        }
+
+        let mut cursor = ArcRef::Ref(&self.core.readers.0);
+        loop {
+            let Some(reader) = cursor.next.load_ref(Ordering::Acquire) else {
+                if cfg!(debug_assertions) {
+                    panic!("detached reader");
+                }
+                return;
+            };
+            let new = reader.next.ptr.load(Ordering::Relaxed);
+            if Arc::ptr_eq(&reader, &self.node) {
+                if cursor
+                    .next
+                    .ptr
+                    .compare_exchange(
+                        Arc::as_ptr(&reader) as *mut _,
+                        new,
+                        Ordering::Release,
+                        Ordering::Relaxed,
+                    )
+                    .is_ok()
+                {
+                    return;
+                }
+            } else {
+                let Some(next) = reader.next.load_ref(Ordering::Relaxed) else {
+                    return;
+                };
+                cursor = ArcRef::Arc(next);
+            }
+        }
+    }
+}
+
 pub struct ReadGrant<'a> {
     range: Range<usize>,
     reader: &'a mut Reader,
@@ -239,9 +300,7 @@ impl Drop for ReadGrant<'_> {
     }
 }
 
-pub struct Readers {
-    first: ArcAtomic<ReadNode>,
-}
+pub struct Readers(ReadNode);
 
 impl Default for Readers {
     fn default() -> Self {
@@ -251,23 +310,34 @@ impl Default for Readers {
 
 impl Readers {
     pub fn new() -> Self {
-        Self {
-            first: ArcAtomic::null(),
-        }
+        Self(ReadNode {
+            cursor: AtomicU64::default(),
+            next: ArcAtomic::null(),
+        })
     }
 
     pub fn first(&self) -> Option<Arc<ReadNode>> {
-        self.first.load_ref(Ordering::Acquire)
+        self.0.next.load_ref(Ordering::Acquire)
     }
 
     pub fn push(&self, cursor: AtomicU64) -> Arc<ReadNode> {
         let node = ReadNode {
             cursor,
-            next: self.first.clone(),
+            next: self.0.next.clone(),
         };
         let first = Arc::new(node);
-        self.first.swap(first.clone(), Ordering::AcqRel);
+        self.0.next.swap(first.clone(), Ordering::AcqRel);
         first
+    }
+
+    pub fn reader_count(&self) -> usize {
+        let mut count = 0;
+        let mut cursor = self.0.next.clone();
+        while let Some(reader) = cursor.load_ref(Ordering::Relaxed) {
+            count += 1;
+            cursor = reader.next.clone();
+        }
+        count
     }
 }
 

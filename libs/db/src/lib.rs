@@ -558,7 +558,7 @@ impl Component {
         let time_series = TimeSeries::open(path)?;
 
         let this = Component {
-            wal: Disruptor::new(schema.size() * 1024),
+            wal: Disruptor::new(schema.size() * 256),
             component_id,
             time_series,
             schema,
@@ -603,7 +603,8 @@ impl Component {
 
     pub fn push_buf(&self, timestamp: Timestamp, value_buf: &[u8]) -> Result<(), Error> {
         let Ok(mut grant) = self.wal.try_grant(value_buf.len() + size_of::<Timestamp>()) else {
-            warn!(?timestamp, "skipped buf due to overflow");
+            let reader_count = self.wal.reader_count();
+            warn!(?timestamp, ?reader_count, "skipped buf due to overflow");
             // TODO(sphw): we should probably wait here, log, or even error out
             // not sure what is best
             return Ok(());
