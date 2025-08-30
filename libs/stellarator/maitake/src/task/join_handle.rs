@@ -64,6 +64,9 @@ pub(crate) enum JoinErrorKind {
 
     /// The scheduler has been dropped.
     Shutdown,
+
+    /// An already completed JoinHandle was pulled
+    Completed,
 }
 
 impl<T> JoinHandle<T> {
@@ -172,7 +175,12 @@ impl<T> Future for JoinHandle<T> {
         let task = match core::mem::replace(&mut this.task, JoinHandleState::Empty) {
             JoinHandleState::Task(task) => task,
             JoinHandleState::Empty => {
-                panic!("`TaskRef` only taken while polling a `JoinHandle`; this is a bug")
+                //panic!("`TaskRef` only taken while polling a `JoinHandle`; this is a bug");
+                return Poll::Ready(Err(JoinError {
+                    kind: JoinErrorKind::Completed,
+                    id: this.id,
+                    output: None,
+                }));
             }
             JoinHandleState::Error(kind) => {
                 return Poll::Ready(Err(JoinError {
@@ -339,6 +347,7 @@ impl<T> JoinError<T> {
     pub fn is_completed(&self) -> bool {
         match self.kind {
             JoinErrorKind::Canceled { completed } => completed,
+            JoinErrorKind::Completed => true,
             _ => false,
         }
     }
@@ -369,6 +378,9 @@ impl<T> fmt::Display for JoinError<T> {
                 write!(f, "task {} was canceled{completed}", self.id)
             }
             JoinErrorKind::StubNever => f.write_str("the stub task can never join"),
+            JoinErrorKind::Completed => {
+                f.write_str("the join handlew was already completed, and is being pulled again")
+            }
             JoinErrorKind::Shutdown => f.write_str("the scheduler has already shut down"),
         }
     }

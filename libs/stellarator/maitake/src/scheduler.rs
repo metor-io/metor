@@ -1538,7 +1538,7 @@ feature! {
             F: Future + 'static,
             F::Output: 'static,
         {
-            let (task, join) = TaskRef::new(self.clone(), future);
+            let (task, join) = TaskRef::new(self.spawner(), future);
             self.core.spawn_inner(task);
             join
         }
@@ -1641,6 +1641,22 @@ feature! {
         #[must_use]
         fn current_task(&self) -> Option<TaskRef> {
             self.core.current_task()
+        }
+    }
+
+    impl Schedule for LocalSpawner {
+        fn schedule(&self, task: TaskRef) {
+            let (Some(core), Some(waker)) = (self.0.upgrade(), self.1.upgrade()) else {
+                return;
+            };
+            core.wake(task);
+            waker.wake();
+        }
+
+        #[must_use]
+        fn current_task(&self) -> Option<TaskRef> {
+            let core = self.0.upgrade()?;
+            core.current_task()
         }
     }
 

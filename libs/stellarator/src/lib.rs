@@ -109,17 +109,22 @@ impl<R: Reactor> Executor<R> {
         let mut main_task = pin!(main_task);
         let waker = self.reactor.borrow_mut().waker();
         let mut cx = Context::from_waker(&waker);
-        let mut output = None;
         let out = loop {
             self.timer.try_turn();
             self.reactor.borrow_mut().process_io()?;
             let tick = self.scheduler.tick();
             if let Poll::Ready(o) = main_task.as_mut().poll(&mut cx) {
-                output = Some(o.unwrap());
-            }
-            if !tick.has_remaining {
-                if let Some(output) = output {
-                    break output;
+                match o {
+                    Ok(o) => {
+                        if tick.has_remaining {
+                            self.scheduler.cancel_all();
+                        }
+                        break o;
+                    }
+                    Err(err) if err.is_completed() => {}
+                    Err(err) => {
+                        panic!("main task join failed {err:?}");
+                    }
                 }
             }
             let turn = self.timer.try_turn();
@@ -130,12 +135,7 @@ impl<R: Reactor> Executor<R> {
             }
         };
         unsafe {
-            EXEC.with(|exec| {
-                let exec = &mut *exec.get();
-                if let Some(exec) = &exec {
-                    exec.scheduler.cancel_all();
-                }
-            });
+            self.scheduler.cancel_all();
             let mut io_states = self.reactor.borrow_mut().drain_io();
             io_states.cancel();
             EXEC.with(|exec| {
