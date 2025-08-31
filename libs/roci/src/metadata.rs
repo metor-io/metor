@@ -1,5 +1,3 @@
-use std::borrow::Cow;
-
 use impeller2_wkt::ComponentMetadata;
 
 use crate::path::ComponentPath;

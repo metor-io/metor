@@ -1,23 +1,5 @@
 # `metor-db`
 
-### Install
-
-Install `metor-db` using the standalone installer script:
-
-```sh
-# Install the latest version
-curl -LsSf https://storage.googleapis.com/metor-releases/install-db.sh | sh
-
-# Install a specific version (e.g., 0.13.3)
-curl -LsSf https://storage.googleapis.com/metor-releases/install-db.sh | sh -s v0.13.3
-```
-
-Alternatively, you can download the latest portable binary for your platform:
-
-- [macOS (arm64)](https://storage.googleapis.com/metor-releases/latest/metor-db-aarch64-apple-darwin.tar.gz)
-- [Linux (x86_64)](https://storage.googleapis.com/metor-releases/latest/metor-db-x86_64-unknown-linux-musl.tar.gz)
-- [Linux (arm64)](https://storage.googleapis.com/metor-releases/latest/metor-db-aarch64-unknown-linux-musl.tar.gz)
-
 ### Run the database
 
 ```sh
@@ -69,14 +51,6 @@ Impeller Lua REPL
 - `Client:dump_metadata()`
    Dumps all metadata from the db
 ...
-```
-
-### Connect to the database using the Metor Editor
-
-Install the [Metor Editor](https://docs.metor.systems/hello/quickstart/#install) if you haven't already. Then, launch the editor by providing the database IP and port:
-
-```sh
-metor editor 127.0.0.1:2240
 ```
 
 The example C client just streams a sine wave component to entity "1". You can view this in the editor by creating a graph for entity "1" and selecting the only component available for that entity.

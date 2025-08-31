@@ -34,7 +34,7 @@ impl DU {
     }
 }
 
-impl<'a> Add<DU> for &'a Body {
+impl Add<DU> for &'_ Body {
     type Output = Body;
 
     fn add(self, du: DU) -> Body {
@@ -60,7 +60,7 @@ impl Add<DU> for DU {
     }
 }
 
-impl<'a> Mul<&'a DU> for Scalar<f64> {
+impl Mul<&'_ DU> for Scalar<f64> {
     type Output = DU;
 
     fn mul(self, du: &DU) -> DU {

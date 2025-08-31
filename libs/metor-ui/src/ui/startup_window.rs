@@ -14,7 +14,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::{
     collections::BTreeMap,
-    net::{Ipv6Addr, SocketAddr, ToSocketAddrs},
+    net::{SocketAddr, ToSocketAddrs},
     path::PathBuf,
     sync::Arc,
 };
@@ -235,9 +235,6 @@ impl RootWidgetSystem for StartupLayout<'_, '_> {
         let logo_full = state
             .contexts
             .add_image(state.images.logo_full.clone_weak());
-        let folder = state
-            .contexts
-            .add_image(state.images.icon_folder.clone_weak());
 
         let arrow = state
             .contexts

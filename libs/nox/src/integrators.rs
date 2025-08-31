@@ -1,6 +1,6 @@
 use core::ops::{Add, Mul};
 
-use crate::{Dim, Field, Scalar, Tensor};
+use crate::{Field, Scalar};
 
 pub fn rk4<DT: Field, U, DU, F>(dt: impl Into<Scalar<DT>>, state: &U, func: F) -> U
 where
@@ -12,8 +12,8 @@ where
     let dt = dt.into();
     let two = DT::two();
     let k1: DU = func(state);
-    let k2 = func(&(state + dt / &two * &k1));
-    let k3 = func(&(state + dt / &two * &k2));
+    let k2 = func(&(state + dt / two * &k1));
+    let k3 = func(&(state + dt / two * &k2));
     let k4 = func(&(state + dt * &k3));
 
     state + dt / DT::six() * &(k1 + (two * &k2) + two * &k3 + k4)

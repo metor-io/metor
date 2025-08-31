@@ -29,7 +29,7 @@ use crate::{
     },
 };
 
-use super::{InspectorIcons, empty_inspector, graph};
+use super::{InspectorIcons, empty_inspector};
 
 #[derive(SystemParam)]
 pub struct InspectorEntity<'w, 's> {

@@ -86,7 +86,7 @@ impl<T: PrimTypeElem + Field> AsVTable for SpatialInertia<T> {
         let component = |name| builder::component(path.chain(name).to_component_id());
         [
             raw_field(
-                0 * size_of::<T>() as u16,
+                0,
                 (3 * size_of::<T>()) as u16,
                 schema(T::PRIM_TYPE, &[3], component("moment_of_inertia")),
             ),

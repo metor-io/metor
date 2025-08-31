@@ -19,9 +19,7 @@ impl Cli {
         let filter = if std::env::var("RUST_LOG").is_ok() {
             EnvFilter::builder().from_env_lossy()
         } else {
-            EnvFilter::builder().parse_lossy(
-                "s10=info,metor=info,impeller=info,nox_ecs=info,impeller::bevy=error,error",
-            )
+            EnvFilter::builder().parse_lossy("metor=info,impeller=info,error")
         };
 
         let _ = tracing_subscriber::fmt::fmt()
@@ -31,16 +29,12 @@ impl Cli {
                 "%Y-%m-%d %H:%M:%S%.3f".to_string(),
             ))
             .try_init();
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .expect("tokio runtime failed to start");
 
-        self.editor(rt)
+        self.editor()
     }
 
     fn dirs(&self) -> Result<directories::ProjectDirs, std::io::Error> {
-        directories::ProjectDirs::from("systems", "metor", "console").ok_or(std::io::Error::new(
+        directories::ProjectDirs::from("io", "metor", "ui").ok_or(std::io::Error::new(
             std::io::ErrorKind::NotFound,
             "failed to get data directory",
         ))

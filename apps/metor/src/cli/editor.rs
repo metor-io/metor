@@ -4,7 +4,6 @@ use metor_ui::EditorPlugin;
 use miette::IntoDiagnostic;
 use std::io::{Read, Seek, Write};
 use stellarator::util::CancelToken;
-use tokio::runtime::Runtime;
 
 use super::Cli;
 
@@ -12,7 +11,7 @@ use super::Cli;
 struct WindowStateFile(std::fs::File);
 
 impl Cli {
-    pub fn editor(self, rt: Runtime) -> miette::Result<()> {
+    pub fn editor(self) -> miette::Result<()> {
         let cancel_token = CancelToken::new();
         let mut app = self.editor_app()?;
         app.add_plugins(impeller2_bevy::TcpImpellerPlugin::new(self.addr));

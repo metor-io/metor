@@ -4,33 +4,21 @@ license = "MIT OR Apache-2.0"
 version.workspace = true
 repository.workspace = true
 edition = "2024"
-authors = ["sascha@metor.systems", "akhil@metor.systems", "van@metor.systems"]
+authors = ["sascha@metor.io"]
 
 [dependencies]
 thiserror = "2.0"
 miette.version = "7.2"
 miette.features = ["fancy"]
-base64 = "0.22.1"
-chrono = { version = "0.4.33", features = ["serde"] }
 clap = { version = "4.4.18", features = ["derive"] }
-clap-markdown = "0.1.4"
-opener = "0.7.1"
-reqwest = { version = "0.12", default-features = false, features = ["rustls-tls-webpki-roots", "json", "stream"] }
 
 # serialization
 serde = { version = "1.0.196", features = ["derive"] }
-serde_json = "1.0.113"
 toml.version = "0.8"
 postcard = "1"
 
-ignore = "0.4"
-tar = "0.4.40"
-tokio = { version = "1.35.1", features = ["full"] }
-tonic = { version = "0.12", features = ["tls", "tls-webpki-roots"] }
 stellarator.path = "../../libs/stellarator"
-uuid = "1.7.0"
 directories = "5.0.1"
-zstd = "0.13.0"
 bevy.version = "0.16"
 tracing-subscriber = { version = "0.3", features = ["chrono"] }
 
@@ -38,37 +26,8 @@ metor-ui.path = "../../libs/metor-ui"
 metor-ui.default-features = false
 impeller2-bevy.path = "../../libs/impeller2/bevy"
 
-# crypto
-ring = "0.17"
-
-# machine id
-machine-uid = "0.5.1"
-
 [build-dependencies]
 anyhow = "1.0.79"
 ignore = "0.4"
 tar = "0.4.40"
 zstd = "0.13.0"
-
-[package.metadata.deb]
-maintainer = "info@metor.systems"
-
-[package.metadata.bundle]
-name = "Metor"
-identifier = "systems.metor.app"
-icon = ["apps/metor/assets/512x512@2x.png"]
-version = "1.0.0"
-resources = []
-copyright = "Copyright (c) Metor Systems, Inc. All rights reserved."
-category = "Developer Tool"
-short_description = "Metor"
-long_description = """ """
-deb_depends = []
-osx_frameworks = []
-osx_url_schemes = []
-
-[package.metadata.wix]
-upgrade-guid = "C55D292D-9DEC-4BAA-A279-D20321A8EC55"
-path-guid = "10286407-AC70-4A23-84E5-6F5BD9238C87"
-license = false
-eula = false

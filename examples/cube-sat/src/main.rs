@@ -15,6 +15,7 @@ use rand_distr::Distribution;
 use roci::{AsVTable, Metadatatize, tcp::SinkExt};
 use roci_adcs::{mekf, yang_lqr::YangLQR};
 use stellarator::{rent, struc_con::stellar};
+use tracing_subscriber::EnvFilter;
 use zerocopy::{Immutable, IntoBytes, KnownLayout};
 
 const G: f64 = 6.6743e-11; // Gravitational constant
@@ -375,7 +376,7 @@ impl FSW {
     }
 }
 
-impl<'a> Add<DU> for &'a Sim {
+impl Add<DU> for &'_ Sim {
     type Output = Sim;
 
     fn add(self, du: DU) -> Self::Output {
@@ -385,8 +386,8 @@ impl<'a> Add<DU> for &'a Sim {
     }
 }
 
-impl CubeSat {
-    pub fn new() -> Self {
+impl Default for CubeSat {
+    fn default() -> Self {
         let radius = EARTH_RADIUS + ALTITUDE;
         let initial_velocity = (G * M / radius).sqrt();
         let body = Body {
@@ -461,6 +462,11 @@ fn tick(mut cubesat: CubeSat) -> CubeSat {
 
 #[stellarator::main]
 pub async fn main() -> anyhow::Result<()> {
+    tracing_subscriber::fmt::fmt()
+        .with_target(false)
+        .with_env_filter(EnvFilter::from_default_env())
+        .try_init();
+
     stellar(move || metor_db::serve_tmp_db(SocketAddr::new([127, 0, 0, 1].into(), 2240)));
     stellarator::sleep(Duration::from_millis(50)).await;
     let mut client = Client::connect(SocketAddr::new([127, 0, 0, 1].into(), 2240))
@@ -474,7 +480,7 @@ pub async fn main() -> anyhow::Result<()> {
         ))
         .await
         .0?;
-    let mut cube_sat = CubeSat::new();
+    let mut cube_sat = CubeSat::default();
     let mut pkt = LenPacket::new(impeller2::types::PacketTy::Table, id, size_of::<CubeSat>());
     loop {
         let start = Instant::now();

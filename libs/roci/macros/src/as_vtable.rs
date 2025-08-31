@@ -1,8 +1,8 @@
 use darling::FromDeriveInput;
-use darling::ast::{self, NestedMeta};
+use darling::ast;
 use proc_macro::TokenStream;
 use quote::quote;
-use syn::{Attribute, Data, Lit, Meta, Path};
+use syn::{Attribute, Meta};
 use syn::{DeriveInput, Generics, Ident, parse_macro_input};
 
 #[derive(Debug, FromDeriveInput)]

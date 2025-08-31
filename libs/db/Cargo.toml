@@ -6,11 +6,7 @@ repository.workspace = true
 edition = "2024"
 publish = true
 description = "Metor Database"
-authors = [
-    "sascha@metor.systems",
-    "akhil@metor.systems",
-    "van@metor.systems",
-]
+authors = ["sascha@metor.io"]
 
 [package.metadata.wix]
 upgrade-guid = "154415C8-2D06-41C4-87DA-A9AB1842801B"

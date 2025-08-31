@@ -53,15 +53,13 @@ pub fn sync_schematic(
     }
     if let Some(path) = config.schematic_path() {
         let path = Path::new(path);
-        if path.exists() {
-            if load_schematic_file(&path, params, live_reload_rx).is_ok() {
-                return;
-            }
+        if path.exists() && load_schematic_file(path, params, live_reload_rx).is_ok() {
+            return;
         }
         return;
     }
     if let Some(content) = config.schematic_content() {
-        let Ok(schematic) = impeller2_wkt::Schematic::from_kdl(&content) else {
+        let Ok(schematic) = impeller2_wkt::Schematic::from_kdl(content) else {
             return;
         };
         params.load_schematic(&schematic);
@@ -76,7 +74,6 @@ pub fn load_schematic_file(
     let (tx, rx) = flume::bounded(1);
     live_reload_rx.0 = Some(rx);
     let watch_path = path.to_path_buf();
-    /*
     std::thread::spawn(move || {
         let cb_path = watch_path.clone();
         let mut debouncer = notify_debouncer_mini::new_debouncer(
@@ -106,7 +103,7 @@ pub fn load_schematic_file(
         loop {
             std::thread::park();
         }
-    });*/
+    });
     if let Ok(kdl) = std::fs::read_to_string(path) {
         let schematic = impeller2_wkt::Schematic::from_kdl(&kdl)?;
         params.load_schematic(&schematic);
@@ -339,7 +336,7 @@ pub fn eql_to_component_tree(
     schema_reg: &ComponentSchemaRegistry,
     eql: &str,
 ) -> Result<BTreeMap<ComponentPath, Vec<(bool, Color32)>>, eql::Error> {
-    let eql = ctx.0.parse_str(&eql).inspect_err(|err| {
+    let eql = ctx.0.parse_str(eql).inspect_err(|err| {
         warn!(?err, "error parsing graph eql");
     })?;
     let mut component_vec = eql.to_graph_components();

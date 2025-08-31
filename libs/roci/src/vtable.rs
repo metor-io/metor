@@ -1,5 +1,3 @@
-use std::borrow::Cow;
-
 use impeller2::vtable::{
     VTable,
     builder::{FieldBuilder, vtable},

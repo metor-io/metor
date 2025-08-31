@@ -13,7 +13,6 @@ use impeller2::schema::Schema;
 use impeller2::types::{
     ComponentId, ComponentView, IntoLenPacket, LenPacket, OwnedPacket, PrimType, Timestamp,
 };
-use impeller2::vtable::builder::raw_field;
 use impeller2_bevy::{
     CommandsExt, ComponentSchemaRegistry, ComponentValueMap, CurrentStreamId, EntityMap,
     PacketGrantR, PacketHandlerInput, PacketHandlers, PacketTx,

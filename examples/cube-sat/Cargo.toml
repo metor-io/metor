@@ -33,6 +33,7 @@ clap.features = ["derive"]
 
 # db
 metor-db.path = "../../libs/db"
+tracing-subscriber = { version = "0.3", features = ["chrono"] }
 
 # rand
 rand = "0.9"

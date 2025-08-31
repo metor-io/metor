@@ -6,6 +6,8 @@ hsplit {
     tabs {
         vsplit {
             tabs {
+                graph "cube_sat.fsw.control.torque_set_point"
+                graph "cube_sat.sim.sensors.imu.gyro, cube_sat.sim.body.vel.angular"
                 graph "cube_sat.sim.body.pos.angular, cube_sat.fsw.mekf.q_hat, cube_sat.fsw.control.att_set_point" name=cube_sat.sim.body.vel.angular
                 graph "cube_sat.sim.sensors.css.sun_vec, cube_sat.sim.sensors.mag.mag" name=cube_sat.sim.body.vel.angular
             }

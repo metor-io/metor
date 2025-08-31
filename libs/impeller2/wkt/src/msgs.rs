@@ -244,7 +244,7 @@ pub struct SetDbConfig {
 impl SetDbConfig {
     pub fn schematic_content(kdl: String) -> Self {
         SetDbConfig {
-            metadata: [(("schematic.content".to_string(), kdl))]
+            metadata: [("schematic.content".to_string(), kdl)]
                 .into_iter()
                 .collect(),
             ..Default::default()

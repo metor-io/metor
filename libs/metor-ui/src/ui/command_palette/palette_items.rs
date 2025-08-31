@@ -1,8 +1,4 @@
-use std::{
-    collections::{BTreeMap, HashMap},
-    str::FromStr,
-    time::Duration,
-};
+use std::{collections::BTreeMap, str::FromStr, time::Duration};
 
 use bevy::{
     asset::{AssetServer, Assets},
@@ -20,13 +16,10 @@ use bevy_infinite_grid::InfiniteGrid;
 use egui_tiles::TileId;
 use fuzzy_matcher::{FuzzyMatcher, skim::SkimMatcherV2};
 use impeller2::types::msg_id;
-use impeller2_bevy::{
-    ComponentPathRegistry, ComponentSchemaRegistry, CurrentStreamId, EntityMap, PacketTx,
-};
+use impeller2_bevy::{ComponentSchemaRegistry, CurrentStreamId, EntityMap, PacketTx};
 use impeller2_kdl::ToKdl;
 use impeller2_wkt::{
-    ComponentPath, ComponentValue, IsRecording, Material, Mesh, Object3D, SetDbConfig,
-    SetStreamState,
+    ComponentValue, IsRecording, Material, Mesh, Object3D, SetDbConfig, SetStreamState,
 };
 use miette::IntoDiagnostic;
 use nox::ArrayBuf;
@@ -36,7 +29,7 @@ use crate::{
     plugins::navigation_gizmo::RenderLayerAlloc,
     ui::{
         HdrEnabled, colors,
-        plot::{GraphBundle, default_component_values},
+        plot::GraphBundle,
         schematic::{
             CurrentSchematic, LoadSchematicParams, SchematicLiveReloadRx, eql_to_component_tree,
             load_schematic_file,
@@ -231,7 +224,6 @@ const VIEWPORT_LABEL: &str = "Viewport";
 const TILES_LABEL: &str = "Tiles";
 const SIMULATION_LABEL: &str = "Simulation";
 const TIME_LABEL: &str = "Time";
-const HELP_LABEL: &str = "Help";
 const PRESETS_LABEL: &str = "Presets";
 
 pub fn create_action(tile_id: Option<TileId>) -> PaletteItem {
@@ -302,7 +294,7 @@ pub fn create_graph(tile_id: Option<TileId>) -> PaletteItem {
 fn graph_parts(
     parts: &BTreeMap<String, eql::ComponentPart>,
     tile_id: Option<TileId>,
-    mut eql_chain: Vec<String>,
+    eql_chain: Vec<String>,
 ) -> Vec<PaletteItem> {
     let done = if !eql_chain.is_empty() {
         let eql_chain = eql_chain.clone();
@@ -1058,16 +1050,6 @@ impl Default for PalettePage {
             save_schematic_db(),
             load_schematic(),
             set_color_scheme(),
-            PaletteItem::new("Documentation", HELP_LABEL, |_: In<String>| {
-                let _ = opener::open("https://docs.metor.systems");
-                PaletteEvent::Exit
-            })
-            .icon(PaletteIcon::Link),
-            PaletteItem::new("Release Notes", HELP_LABEL, |_: In<String>| {
-                let _ = opener::open("https://docs.metor.systems/updates/changelog");
-                PaletteEvent::Exit
-            })
-            .icon(PaletteIcon::Link),
         ])
     }
 }

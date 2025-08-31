@@ -7,7 +7,7 @@ use bevy::prelude::Res;
 use bevy_egui::egui;
 use fuzzy_matcher::{FuzzyMatcher, skim::SkimMatcherV2};
 use impeller2_bevy::EntityMap;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::BTreeMap;
 
 use crate::ui::{EntityFilter, EntityPair, SelectedObject, colors::get_scheme};
 
@@ -167,10 +167,10 @@ fn component_part(
     }
 }
 
-fn filter_component_parts_recurisve<'a, 'b>(
-    children: &'b BTreeMap<String, eql::ComponentPart>,
+fn filter_component_parts_recurisve(
+    children: &BTreeMap<String, eql::ComponentPart>,
     matcher: &SkimMatcherV2,
-    query: &'a str,
+    query: &str,
 ) -> BTreeMap<String, eql::ComponentPart> {
     if query.is_empty() {
         return children.clone();
