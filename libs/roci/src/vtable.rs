@@ -17,7 +17,7 @@ impl<const N: usize, T: AsVTable> AsVTable for [T; N] {
         (0..N)
             .flat_map(|i| {
                 let path = path.clone().chain(i.to_string());
-                T::vtable_fields(path).map(move |f| f.offset_by((i * size_of::<T>()) as u16))
+                T::vtable_fields(path).map(move |f| f.offset_by((i * size_of::<T>()) as u32))
             })
             .collect::<Vec<_>>()
             .into_iter()

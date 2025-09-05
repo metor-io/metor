@@ -55,7 +55,7 @@ pub fn as_vtable(input: TokenStream) -> TokenStream {
                             #impeller::vtable::builder::component(path.to_component_id())
                         };
                         [
-                            #impeller::vtable::builder::raw_field(0, core::mem::size_of::<Self>() as u16, #impeller::vtable::builder::schema(
+                            #impeller::vtable::builder::raw_field(0, core::mem::size_of::<Self>() as u32, #impeller::vtable::builder::schema(
                                 <#repr_type as #impeller::component::PrimTypeElem>::PRIM_TYPE,
                                 &[],
                                 component
@@ -77,7 +77,7 @@ pub fn as_vtable(input: TokenStream) -> TokenStream {
                 let ident = &field.ident;
                 quote! {
                     .chain(<#ty as #crate_name::AsVTable>::vtable_fields(path.chain(#name))
-                        .map(|field| field.offset_by(core::mem::offset_of!(Self, #ident) as u16))
+                        .map(|field| field.offset_by(core::mem::offset_of!(Self, #ident) as u32))
                     )
                 }
             });

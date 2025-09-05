@@ -532,10 +532,10 @@ fn next_range(
 
 fn real_time_vtable(component_id: ComponentId, s: &Schema<Vec<u64>>) -> [LenPacket; 2] {
     use impeller2::vtable::builder::{component, raw_field, raw_table, schema, timestamp, vtable};
-    let time = raw_table(0, size_of::<Timestamp>() as u16);
+    let time = raw_table(0, size_of::<Timestamp>() as u32);
     let field = raw_field(
         8,
-        s.size() as u16,
+        s.size() as u32,
         timestamp(
             time,
             schema(s.prim_type(), s.dim(), component(component_id)),

@@ -66,11 +66,11 @@ use crate::{
 pub enum Op {
     Data {
         offset: Offset,
-        len: u16,
+        len: u32,
     },
     Table {
         offset: Offset,
-        len: u16,
+        len: u32,
     },
     None,
     Component {
@@ -100,12 +100,12 @@ pub enum Op {
 #[derive(Debug, Serialize, Deserialize, Clone, postcard_schema::Schema)]
 pub struct Field {
     pub offset: Offset,
-    pub len: u16,
+    pub len: u32,
     pub arg: OpRef,
 }
 
 const _ASSERT_OP_SIZE: () = const {
-    assert!(core::mem::size_of::<Op>() <= 8);
+    assert!(core::mem::size_of::<Op>() <= 64);
 };
 
 /// A reference to an operation in the VTable's operation list
@@ -113,7 +113,7 @@ const _ASSERT_OP_SIZE: () = const {
     Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, postcard_schema::Schema,
 )]
 #[repr(transparent)]
-pub struct OpRef(u16);
+pub struct OpRef(u32);
 
 impl OpRef {
     /// Converts the operation reference to a usable index
@@ -127,10 +127,10 @@ impl OpRef {
     Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, postcard_schema::Schema,
 )]
 #[repr(transparent)]
-pub struct Offset(u16);
+pub struct Offset(u32);
 
-impl From<u16> for Offset {
-    fn from(val: u16) -> Self {
+impl From<u32> for Offset {
+    fn from(val: u32) -> Self {
         Offset(val)
     }
 }
@@ -222,6 +222,7 @@ pub struct RealizedField<'a> {
     pub component_id: ComponentId,
     pub shape: &'a [usize],
     pub ty: PrimType,
+    pub offset: usize,
     pub view: Option<ComponentView<'a>>,
     pub timestamp: Option<Timestamp>,
 }
@@ -384,8 +385,8 @@ impl<Ops: Buf<Op>, Data: Buf<u8>, Fields: Buf<Field>> VTable<Ops, Data, Fields> 
                             .inspect_err(|err| {
                                 println!("bad shape {err:?}");
                             })?;
+                        let offset = field.offset.to_index();
                         let view = if let Some(table) = table {
-                            let offset = field.offset.to_index();
                             let data = table
                                 .get(offset..offset + field.len as usize)
                                 .ok_or(Error::BufferUnderflow)
@@ -405,6 +406,7 @@ impl<Ops: Buf<Op>, Data: Buf<u8>, Fields: Buf<Field>> VTable<Ops, Data, Fields> 
                             component_id,
                             view,
                             timestamp: timestamp.and_then(|t| t.timestamp),
+                            offset,
                             shape,
                             ty: schema.ty,
                         });
@@ -469,7 +471,7 @@ pub mod builder {
         },
         Table {
             offset: Offset,
-            len: u16,
+            len: u32,
         },
         Component {
             component_id: Arc<OpBuilder>,
@@ -494,7 +496,7 @@ pub mod builder {
     #[derive(Clone)]
     pub struct FieldBuilder {
         offset: Offset,
-        len: u16,
+        len: u32,
         arg: Arc<OpBuilder>,
     }
 
@@ -520,7 +522,7 @@ pub mod builder {
     }
 
     /// Creates a table operation builder with the specified offset and length
-    pub fn raw_table(offset: impl Into<Offset>, len: u16) -> Arc<OpBuilder> {
+    pub fn raw_table(offset: impl Into<Offset>, len: u32) -> Arc<OpBuilder> {
         Arc::new(OpBuilder::Table {
             offset: offset.into(),
             len,
@@ -561,7 +563,7 @@ pub mod builder {
     }
 
     /// Creates a field builder with the specified offset, length, and argument
-    pub fn raw_field(offset: impl Into<Offset>, len: u16, arg: Arc<OpBuilder>) -> FieldBuilder {
+    pub fn raw_field(offset: impl Into<Offset>, len: u32, arg: Arc<OpBuilder>) -> FieldBuilder {
         FieldBuilder {
             offset: offset.into(),
             len,
@@ -574,8 +576,8 @@ pub mod builder {
     macro_rules! table {
         ($t:tt::$field:ident $(,)?) => {{
             let offset = core::mem::offset_of!($t, $field);
-            let size = $crate::vtable::builder::field_size!($t, $field) as u16;
-            raw_table(offset as u16, size)
+            let size = $crate::vtable::builder::field_size!($t, $field) as u32;
+            raw_table(offset as u32, size)
         }};
     }
 
@@ -593,8 +595,8 @@ pub mod builder {
     macro_rules! field {
         ($t:tt::$field:ident, $arg: expr $(,)?) => {{
             let offset = core::mem::offset_of!($t, $field);
-            let size = $crate::vtable::builder::field_size!($t, $field) as u16;
-            $crate::vtable::builder::raw_field(offset as u16, size, $arg)
+            let size = $crate::vtable::builder::field_size!($t, $field) as u32;
+            $crate::vtable::builder::raw_field(offset as u32, size, $arg)
         }};
     }
 
@@ -648,13 +650,13 @@ pub mod builder {
             }
             let op = match op.as_ref() {
                 OpBuilder::Data { align, data } => {
-                    let len = data.len() as u16;
+                    let len = data.len() as u32;
                     let padding = (align - (self.vtable.data.len() % align)) % align;
 
                     for _ in 0..padding {
                         self.vtable.data.push(0);
                     }
-                    let offset = Offset(self.vtable.data.len() as u16);
+                    let offset = Offset(self.vtable.data.len() as u32);
                     self.vtable.data.extend_from_slice(data);
                     Op::Data { offset, len }
                 }
@@ -683,7 +685,7 @@ pub mod builder {
                     Op::Ext { id: *id, data, arg }
                 }
             };
-            let op_ref = OpRef(self.vtable.ops.len() as u16);
+            let op_ref = OpRef(self.vtable.ops.len() as u32);
             self.vtable.ops.push(op);
             self.visited.insert(id, op_ref);
             op_ref

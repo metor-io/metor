@@ -16,19 +16,19 @@ impl AsVTable for Body {
         SpatialTransform::<f64>::vtable_fields(path.chain("pos"))
             .chain(
                 SpatialMotion::<f64>::vtable_fields(path.chain("vel"))
-                    .map(|field| field.offset_by(offset_of!(Body, vel) as u16)),
+                    .map(|field| field.offset_by(offset_of!(Body, vel) as u32)),
             )
             .chain(
                 SpatialMotion::<f64>::vtable_fields(path.chain("accel"))
-                    .map(|field| field.offset_by(offset_of!(Body, accel) as u16)),
+                    .map(|field| field.offset_by(offset_of!(Body, accel) as u32)),
             )
             .chain(
                 SpatialInertia::<f64>::vtable_fields(path.chain("inertia"))
-                    .map(|field| field.offset_by(offset_of!(Body, inertia) as u16)),
+                    .map(|field| field.offset_by(offset_of!(Body, inertia) as u32)),
             )
             .chain(
                 SpatialForce::<f64>::vtable_fields(path.chain("force"))
-                    .map(|field| field.offset_by(offset_of!(Body, force) as u16)),
+                    .map(|field| field.offset_by(offset_of!(Body, force) as u32)),
             )
     }
 }
@@ -49,12 +49,12 @@ impl<T: PrimTypeElem + Field> AsVTable for SpatialTransform<T> {
         [
             raw_field(
                 0,
-                (4 * size_of::<T>()) as u16,
+                (4 * size_of::<T>()) as u32,
                 schema(T::PRIM_TYPE, &[4], component("angular")),
             ),
             raw_field(
-                4 * size_of::<T>() as u16,
-                (3 * size_of::<T>()) as u16,
+                4 * size_of::<T>() as u32,
+                (3 * size_of::<T>()) as u32,
                 schema(T::PRIM_TYPE, &[3], component("linear")),
             ),
         ]
@@ -68,12 +68,12 @@ impl<T: PrimTypeElem + Field> AsVTable for SpatialMotion<T> {
         [
             raw_field(
                 0,
-                (3 * size_of::<T>()) as u16,
+                (3 * size_of::<T>()) as u32,
                 schema(T::PRIM_TYPE, &[3], component("angular")),
             ),
             raw_field(
-                3 * size_of::<T>() as u16,
-                (3 * size_of::<T>()) as u16,
+                3 * size_of::<T>() as u32,
+                (3 * size_of::<T>()) as u32,
                 schema(T::PRIM_TYPE, &[3], component("linear")),
             ),
         ]
@@ -87,17 +87,17 @@ impl<T: PrimTypeElem + Field> AsVTable for SpatialInertia<T> {
         [
             raw_field(
                 0,
-                (3 * size_of::<T>()) as u16,
+                (3 * size_of::<T>()) as u32,
                 schema(T::PRIM_TYPE, &[3], component("moment_of_inertia")),
             ),
             raw_field(
-                3 * size_of::<T>() as u16,
-                (3 * size_of::<T>()) as u16,
+                3 * size_of::<T>() as u32,
+                (3 * size_of::<T>()) as u32,
                 schema(T::PRIM_TYPE, &[3], component("momentum")),
             ),
             raw_field(
-                6 * size_of::<T>() as u16,
-                (size_of::<T>()) as u16,
+                6 * size_of::<T>() as u32,
+                (size_of::<T>()) as u32,
                 schema(T::PRIM_TYPE, &[1], component("mass")),
             ),
         ]
@@ -111,12 +111,12 @@ impl<T: PrimTypeElem + Field> AsVTable for SpatialForce<T> {
         [
             raw_field(
                 0,
-                (3 * size_of::<T>()) as u16,
+                (3 * size_of::<T>()) as u32,
                 schema(T::PRIM_TYPE, &[3], component("angular")),
             ),
             raw_field(
-                3 * size_of::<T>() as u16,
-                (3 * size_of::<T>()) as u16,
+                3 * size_of::<T>() as u32,
+                (3 * size_of::<T>()) as u32,
                 schema(T::PRIM_TYPE, &[3], component("linear")),
             ),
         ]
@@ -173,7 +173,7 @@ macro_rules! impl_prim_component {
                 };
                 std::iter::once(raw_field(
                     0,
-                    size_of::<$ty>() as u16,
+                    size_of::<$ty>() as u32,
                     schema(<$ty>::PRIM_TYPE, &[], component),
                 ))
             }
@@ -209,7 +209,7 @@ impl<T: Field + PrimTypeElem, D: ConstDim + Dim> AsVTable for nox::Tensor<T, D> 
         let size = D::DIM.iter().product::<usize>() * size_of::<T>();
         iter::once(raw_field(
             0,
-            size as u16,
+            size as u32,
             builder::schema(T::PRIM_TYPE, &dim, component),
         ))
     }
@@ -225,7 +225,7 @@ impl<T: Field + PrimTypeElem> AsVTable for nox::Quaternion<T> {
         let size = size_of::<T>() * 4;
         iter::once(raw_field(
             0,
-            size as u16,
+            size as u32,
             builder::schema(T::PRIM_TYPE, &[4], component),
         ))
     }
@@ -240,7 +240,7 @@ impl AsVTable for Timestamp {
         };
         iter::once(raw_field(
             0,
-            size_of::<Timestamp>() as u16,
+            size_of::<Timestamp>() as u32,
             builder::schema(impeller2::types::PrimType::I64, &[], component),
         ))
     }
@@ -257,7 +257,7 @@ mod tests {
         let metadata = nox::Body::metadata("foo").collect::<Vec<_>>();
         assert_eq!(&metadata[0].name, "foo.pos.angular");
         assert_eq!(&metadata[1].name, "foo.pos.linear");
-        assert_eq!(&metadata[2].name, "foo.pos.angular");
-        assert_eq!(&metadata[3].name, "foo.pos.linear");
+        assert_eq!(&metadata[2].name, "foo.vel.angular");
+        assert_eq!(&metadata[3].name, "foo.vel.linear");
     }
 }
