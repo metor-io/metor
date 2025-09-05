@@ -59,14 +59,14 @@ impl WidgetSystem for TimelineControls<'_> {
         } = state.get_mut(world);
 
         let mut tick_changed = false;
-        ui.set_height(36.0);
+        ui.set_height(34.0);
 
         egui::Frame::NONE
-            .inner_margin(egui::Margin::symmetric(4, 8))
+            .inner_margin(egui::Margin::symmetric(4, 6))
             .show(ui, |ui| {
                 ui.horizontal(|ui| {
                     ui.allocate_ui_with_layout(
-                        egui::vec2(ui.available_width(), 20.0),
+                        egui::vec2(ui.available_width(), 22.0),
                         egui::Layout::left_to_right(egui::Align::Center),
                         |ui| {
                             let btn_scale = 1.3;
