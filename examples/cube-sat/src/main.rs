@@ -4,19 +4,24 @@ use std::{
     time::{Duration, Instant, SystemTime},
 };
 
-use impeller2::types::{LenPacket, PacketId, Timestamp};
-use impeller2_stellar::Client;
-use impeller2_wkt::SetDbConfig;
+use impeller2::types::{ComponentId, LenPacket, Msg, OwnedPacket, PacketId, Timestamp};
+use impeller2_bbq::RxExt;
+use impeller2_stellar::{Client, PacketSink, PacketStream, queue::spawn_recv};
+use impeller2_wkt::{ComponentValue, MsgStream, SetDbConfig, UpdateComponent};
 use nox::{
-    Body, DU, Quaternion, Scalar, SpatialForce, SpatialInertia, SpatialMotion, SpatialTransform,
-    TensorItem, Vec3, Vector, Vector3, array::Quat, rk4, tensor,
+    ArrayBuf, Body, DU, Quaternion, Scalar, SpatialForce, SpatialInertia, SpatialMotion,
+    SpatialTransform, TensorItem, Vec3, Vector, Vector3, array::Quat, rk4, tensor,
 };
 use rand_distr::Distribution;
-use roci::{AsVTable, Metadatatize, tcp::SinkExt};
+use roci::{
+    AsVTable, Metadatatize,
+    tcp::SinkExt,
+    update::{self, VTableSink, VTableSinkIndex},
+};
 use roci_adcs::{mekf, yang_lqr::YangLQR};
-use stellarator::{rent, struc_con::stellar};
+use stellarator::{io::SplitExt, net::TcpStream, rent, struc_con::stellar};
 use tracing_subscriber::EnvFilter;
-use zerocopy::{Immutable, IntoBytes, KnownLayout};
+use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
 
 const G: f64 = 6.6743e-11; // Gravitational constant
 const M: f64 = 5.972e24; // Mass of Earth
@@ -155,7 +160,7 @@ impl GPS {
     }
 }
 
-#[derive(AsVTable, Debug, Clone, Immutable, KnownLayout, Metadatatize, IntoBytes)]
+#[derive(AsVTable, Debug, Clone, Immutable, KnownLayout, Metadatatize, IntoBytes, Default)]
 #[repr(C)]
 pub struct ReactionWheel {
     axis: Vec3<f64>,
@@ -344,12 +349,6 @@ impl FSW {
         );
         self.sensors = sensors.clone();
 
-        let elapsed = Timestamp::now() - self.start_epoch;
-        self.mode = match elapsed.as_secs() % 60 {
-            ..30 => Mode::NadirPoint,
-            _ => Mode::HilPoint,
-        };
-
         self.control.att_set_point = match self.mode {
             Mode::NadirPoint => self.nadir_point(),
             Mode::HilPoint => self.hil_point(),
@@ -465,28 +464,60 @@ pub async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt::fmt()
         .with_target(false)
         .with_env_filter(EnvFilter::from_default_env())
-        .try_init();
+        .try_init()
+        .unwrap();
 
     stellar(move || metor_db::serve_tmp_db(SocketAddr::new([127, 0, 0, 1].into(), 2240)));
     stellarator::sleep(Duration::from_millis(50)).await;
-    let mut client = Client::connect(SocketAddr::new([127, 0, 0, 1].into(), 2240))
-        .await
-        .map_err(anyhow::Error::from)?;
+    let (rx, tx) = TcpStream::connect(SocketAddr::new([127, 0, 0, 1].into(), 2240))
+        .await?
+        .split();
+    let tx = PacketSink::new(tx);
+    let rx = PacketStream::new(rx);
+    let mut rx = spawn_recv(rx, 1024 * 1024);
     let id: PacketId = fastrand::u16(..).to_le_bytes();
-    client.init_world::<CubeSat>(id).await?;
-    client
-        .send(&SetDbConfig::schematic_content(
-            include_str!("./schematic.kdl").to_string(),
-        ))
-        .await
-        .0?;
+    tx.init_world::<CubeSat>(id).await?;
+    tx.send(&MsgStream {
+        msg_id: UpdateComponent::ID,
+    })
+    .await
+    .0?;
+    tx.send(&SetDbConfig::schematic_content(
+        include_str!("./schematic.kdl").to_string(),
+    ))
+    .await
+    .0?;
     let mut cube_sat = CubeSat::default();
     let mut pkt = LenPacket::new(impeller2::types::PacketTy::Table, id, size_of::<CubeSat>());
     loop {
         let start = Instant::now();
+        while let Some(pkt) = rx.try_recv_pkt() {
+            match pkt {
+                OwnedPacket::Msg(m) if m.id == UpdateComponent::ID => {
+                    println!("Received UpdateComponent message");
+                    let Ok(update_component) = m.parse::<UpdateComponent>().inspect_err(|err| {
+                        println!("{err:?}");
+                    }) else {
+                        continue;
+                    };
+                    println!("Received UpdateComponent message {:?}", update_component);
+                    if let ComponentValue::U64(value) = update_component.value {
+                        if update_component.id == ComponentId::new("cube_sat.fsw.mode") {
+                            let mode = value.buf.as_buf()[0];
+                            cube_sat.fsw.mode = match mode {
+                                0 => Mode::HilPoint,
+                                1 => Mode::NadirPoint,
+                                _ => continue,
+                            };
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
         cube_sat = tick(cube_sat);
         pkt.extend_from_slice(cube_sat.as_bytes());
-        rent!(client.send(pkt).await, pkt)?;
+        rent!(tx.send(pkt).await, pkt)?;
         pkt.clear();
 
         let sleep = Duration::from_secs_f64(DT).saturating_sub(start.elapsed());

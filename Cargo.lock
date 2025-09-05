@@ -700,10 +700,6 @@ name = "arrow-schema"
 version = "55.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7450c76ab7c5a6805be3440dc2e2096010da58f7cab301fdc996a4ee3ee74e49"
-dependencies = [
- "serde",
- "serde_json",
-]
 
 [[package]]
 name = "arrow-select"
@@ -3310,6 +3306,7 @@ dependencies = [
  "clap 4.5.37",
  "fastrand 2.2.0",
  "impeller2",
+ "impeller2-bbq",
  "impeller2-stellar",
  "impeller2-wkt",
  "metor-db",
@@ -7023,7 +7020,7 @@ name = "metor-ui"
 version = "0.14.2"
 dependencies = [
  "arc-swap",
- "arrow 55.0.0",
+ "arrow 54.3.1",
  "bevy",
  "bevy_color",
  "bevy_editor_cam",

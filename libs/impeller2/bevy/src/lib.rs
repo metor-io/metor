@@ -48,7 +48,7 @@ mod tcp;
 #[cfg(feature = "tcp")]
 pub use tcp::*;
 
-pub const QUEUE_LEN: usize = 512 * 1024 * 1024;
+pub const QUEUE_LEN: usize = 10 * 1024 * 1024 * 1024;
 
 #[derive(Resource)]
 pub struct PacketRx(AsyncArcQueueRx);
@@ -341,7 +341,9 @@ impl Decomponentize for WorldSink<'_, '_> {
         };
 
         if let Ok(mut value) = self.query.get_mut(e.id()) {
-            value.copy_from_view(view);
+            if value.copy_from_view(view).is_none() {
+                println!("{path:?} got invalid data")
+            };
         } else {
             e.insert(ComponentValue::from_view(view));
         }

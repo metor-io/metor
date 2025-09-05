@@ -188,7 +188,7 @@ impl Client {
         let size = shape.iter().product::<u64>() as usize * prim_type.size();
         let vtable = vtable([raw_field(
             0,
-            size as u16,
+            size as u32,
             schema(prim_type, &shape, component(component_id)),
         )]);
         let id: [u8; 2] = fastrand::u16(..).to_le_bytes();
@@ -701,8 +701,8 @@ pub fn lua() -> anyhow::Result<Lua> {
         "table_slice",
         lua.create_function(|_, (offset, len): (u64, u64)| {
             Ok(LuaOpBuilder(vtable::builder::raw_table(
-                offset as u16,
-                len as u16,
+                offset as u32,
+                len as u32,
             )))
         })?,
     )?;
@@ -713,8 +713,8 @@ pub fn lua() -> anyhow::Result<Lua> {
             |_, (offset, len, op): (u64, u64, UserDataRef<LuaOpBuilder>)| {
                 let op = op.deref().0.clone();
                 Ok(LuaFieldBuilder(vtable::builder::raw_field(
-                    offset as u16,
-                    len as u16,
+                    offset as u32,
+                    len as u32,
                     op,
                 )))
             },

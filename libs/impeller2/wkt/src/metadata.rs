@@ -52,6 +52,13 @@ impl ComponentMetadata {
         );
         self
     }
+
+    pub fn is_string(&self) -> bool {
+        self.metadata
+            .get("is_string")
+            .map(|v| v == "true")
+            .unwrap_or_default()
+    }
 }
 
 impl From<&str> for ComponentMetadata {

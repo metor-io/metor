@@ -541,3 +541,13 @@ pub enum ArchiveFormat {
 pub struct MeanOp {
     pub window: u16,
 }
+
+#[derive(Clone, Serialize, Deserialize, Debug)]
+pub struct UpdateComponent {
+    pub id: ComponentId,
+    pub value: crate::ComponentValue,
+}
+
+impl Msg for UpdateComponent {
+    const ID: PacketId = [224, 36];
+}

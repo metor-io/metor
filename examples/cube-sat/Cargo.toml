@@ -15,6 +15,7 @@ impeller2.path = "../../libs/impeller2"
 impeller2.features = ["std"]
 impeller2-wkt.path = "../../libs/impeller2/wkt"
 impeller2-wkt.features = ["gui", "std"]
+impeller2-bbq.path = "../../libs/impeller2/bbq"
 zerocopy.version = "0.8.2"
 roci.path = "../../libs/roci"
 roci-adcs.path = "../../libs/roci/adcs"
