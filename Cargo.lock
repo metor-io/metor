@@ -6716,25 +6716,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "lqr"
-version = "0.14.2"
-dependencies = [
- "anyhow",
- "clap 4.5.37",
- "fastrand 2.2.0",
- "impeller2",
- "impeller2-stellar",
- "impeller2-wkt",
- "mlua",
- "nox",
- "roci",
- "roci-adcs",
- "serde",
- "stellarator",
- "zerocopy 0.8.14",
-]
-
-[[package]]
 name = "lua-src"
 version = "547.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6874,26 +6855,6 @@ checksum = "8ea1f30cedd69f0a2954655f7188c6a834246d2bcf1e315e2ac40c4b24dc9519"
 dependencies = [
  "cfg-if",
  "rayon",
-]
-
-[[package]]
-name = "mekf"
-version = "0.14.2"
-dependencies = [
- "anyhow",
- "clap 4.5.37",
- "fastrand 2.2.0",
- "impeller2",
- "impeller2-stellar",
- "impeller2-wkt",
- "mlua",
- "nox",
- "roci",
- "roci-adcs",
- "serde",
- "stellarator",
- "wmm",
- "zerocopy 0.8.14",
 ]
 
 [[package]]

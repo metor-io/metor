@@ -503,7 +503,6 @@ pub mod builder {
     impl FieldBuilder {
         pub fn offset_by(self, offset: impl Into<Offset>) -> Self {
             let offset = offset.into();
-            println!("offset {:?}", offset);
             Self {
                 offset: Offset(self.offset.0 + offset.0),
                 len: self.len,

@@ -205,7 +205,7 @@ impl<T: Field + PrimTypeElem, D: ConstDim + Dim> AsVTable for nox::Tensor<T, D> 
         } else {
             builder::component(path.to_component_id())
         };
-        let dim = D::DIM.into_iter().map(|d| *d as u64).collect::<Vec<_>>();
+        let dim = D::DIM.iter().map(|d| *d as u64).collect::<Vec<_>>();
         let size = D::DIM.iter().product::<usize>() * size_of::<T>();
         iter::once(raw_field(
             0,

@@ -2,7 +2,7 @@ use nox::{
     ArrayBuf, ArrayRepr, Field, Matrix, Matrix3, Matrix3x6, Matrix6, Quaternion, Vector, tensor,
 };
 use roci::{AsVTable, Metadatatize};
-use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
+use zerocopy::{Immutable, IntoBytes, KnownLayout};
 
 pub fn calculate_covariance(
     sigma_g: Vector<f64, 3, ArrayRepr>,

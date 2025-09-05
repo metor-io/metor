@@ -6,7 +6,7 @@ use impeller2::{
     types::{ComponentId, ComponentView, PrimType},
 };
 use nox::{ArrayBuf, Dim, Tensor};
-use zerocopy::{FromBytes, Immutable, IntoByteSlice, IntoBytes, KnownLayout};
+use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
 
 use crate::AsVTable;
 
@@ -15,7 +15,7 @@ pub struct VTableSink<'a, T> {
     table: &'a mut T,
 }
 
-impl<'a, T: FromBytes + IntoBytes> VTableSink<'a, T> {
+impl<T: FromBytes + IntoBytes> VTableSink<'_, T> {
     pub fn apply_update(
         &mut self,
         update: &impeller2_wkt::UpdateComponent,
@@ -35,8 +35,8 @@ pub struct VTableSinkIndex<T> {
     _phantom_data: PhantomData<T>,
 }
 
-impl<T: AsVTable> VTableSinkIndex<T> {
-    pub fn new() -> Self {
+impl<T: AsVTable> Default for VTableSinkIndex<T> {
+    fn default() -> Self {
         let vtable = T::as_vtable();
         let fields = vtable
             .realize_fields(None)
@@ -52,7 +52,6 @@ impl<T: AsVTable> VTableSinkIndex<T> {
                 ))
             })
             .collect();
-        dbg!(&fields);
         Self {
             fields,
             _phantom_data: PhantomData,

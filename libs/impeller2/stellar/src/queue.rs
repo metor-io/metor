@@ -72,8 +72,7 @@ pub fn spawn_recv<R: AsyncRead + 'static>(
         loop {
             let grant_r = tx.wait_grant(512 * 1024).await;
             let grant_r = PacketGrantW::new(grant_r);
-            println!("waiting for packet");
-            let Ok(slice) = dbg!(stream.reader.recv(grant_r).await) else {
+            let Ok(slice) = stream.reader.recv(grant_r).await else {
                 continue;
             };
             let len = slice.range().len();

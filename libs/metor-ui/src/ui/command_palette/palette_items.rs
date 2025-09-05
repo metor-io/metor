@@ -15,7 +15,7 @@ use bevy::{
 use bevy_infinite_grid::InfiniteGrid;
 use egui_tiles::TileId;
 use fuzzy_matcher::{FuzzyMatcher, skim::SkimMatcherV2};
-use impeller2::types::{ComponentId, Packet, PrimType, msg_id};
+use impeller2::types::{ComponentId, PrimType, msg_id};
 use impeller2_bevy::{
     ComponentMetadataRegistry, ComponentSchemaRegistry, CurrentStreamId, EntityMap, PacketTx,
 };
@@ -393,10 +393,7 @@ fn update_component_parts(
                                             PaletteItem::new(
                                                 var.to_string(),
                                                 "Variant",
-                                                move |_: In<String>, tx: Res<PacketTx>, schema: Res<ComponentSchemaRegistry>| {
-                                                    let Some(schema) = schema.get(&id) else {
-                                                        return PaletteEvent::Exit;
-                                                    };
+                                                move |_: In<String>, tx: Res<PacketTx>| {
                                                     let value = ComponentValue::Bool(
                                                         Array::from_shape_vec(
                                                             smallvec::smallvec![],

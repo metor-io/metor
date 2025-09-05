@@ -1,27 +1,23 @@
 use std::{
     net::SocketAddr,
     ops::Add,
-    time::{Duration, Instant, SystemTime},
+    time::{Duration, Instant},
 };
 
 use impeller2::types::{ComponentId, LenPacket, Msg, OwnedPacket, PacketId, Timestamp};
 use impeller2_bbq::RxExt;
-use impeller2_stellar::{Client, PacketSink, PacketStream, queue::spawn_recv};
+use impeller2_stellar::{PacketSink, PacketStream, queue::spawn_recv};
 use impeller2_wkt::{ComponentValue, MsgStream, SetDbConfig, UpdateComponent};
 use nox::{
     ArrayBuf, Body, DU, Quaternion, Scalar, SpatialForce, SpatialInertia, SpatialMotion,
-    SpatialTransform, TensorItem, Vec3, Vector, Vector3, array::Quat, rk4, tensor,
+    SpatialTransform, Vec3, Vector, Vector3, array::Quat, rk4, tensor,
 };
 use rand_distr::Distribution;
-use roci::{
-    AsVTable, Metadatatize,
-    tcp::SinkExt,
-    update::{self, VTableSink, VTableSinkIndex},
-};
+use roci::{AsVTable, Metadatatize, tcp::SinkExt};
 use roci_adcs::{mekf, yang_lqr::YangLQR};
 use stellarator::{io::SplitExt, net::TcpStream, rent, struc_con::stellar};
 use tracing_subscriber::EnvFilter;
-use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
+use zerocopy::{Immutable, IntoBytes, KnownLayout};
 
 const G: f64 = 6.6743e-11; // Gravitational constant
 const M: f64 = 5.972e24; // Mass of Earth
@@ -60,7 +56,7 @@ pub struct Sensors {
 
 impl Sensors {
     pub fn update(&mut self, body: &Body) {
-        self.imu.update(&body);
+        self.imu.update(body);
         self.mag = Mag::from_body(body);
         self.css = CSS::from_body(body);
         self.gps = GPS::from_body(body);
@@ -81,7 +77,7 @@ impl IMU {
         let mut rng = rand::rng();
         self.bias = self.bias + bias_dist.sample_tensor(&mut rng);
         let noise = dist.sample_tensor(&mut rng) + self.bias;
-        self.gyro = body.pos.angular().inverse() * body.vel.angular();
+        self.gyro = body.pos.angular().inverse() * body.vel.angular() + noise;
     }
 }
 
@@ -98,7 +94,7 @@ impl Mag {
         let e_hat = pos.normalize();
         let b = ((EARTH_RADIUS / pos_norm).powi(3)) * (3.0 * K_0.dot(&e_hat) * e_hat - K_0);
         let dist = rand_distr::Normal::new(0.0, 1e-10).expect("dist failed to create");
-        let mag = body.pos.angular().inverse() * b; // + dist.sample_tensor(&mut rand::rng());
+        let mag = body.pos.angular().inverse() * b + dist.sample_tensor(&mut rand::rng());
         let mag = mag.normalize();
 
         Mag { mag }
@@ -309,8 +305,8 @@ impl Nav {
     }
 }
 
-impl FSW {
-    pub fn new() -> Self {
+impl Default for FSW {
+    fn default() -> Self {
         Self {
             mekf: mekf::State::new(tensor![0.01, 0.01, 0.01], tensor![0.01, 0.01, 0.01], DT),
             sensors: Sensors::default(),
@@ -320,7 +316,9 @@ impl FSW {
             start_epoch: Timestamp::now(),
         }
     }
+}
 
+impl FSW {
     pub fn nadir_point(&self) -> Quat<f64> {
         let pos = self.sensors.gps.pos;
         let r = pos.normalize();
@@ -340,7 +338,7 @@ impl FSW {
     }
 
     pub fn update(mut self, sensors: &Sensors) -> Self {
-        self.nav = Nav::from_sensors(&sensors);
+        self.nav = Nav::from_sensors(sensors);
         self.mekf.omega = sensors.imu.gyro;
         self.mekf = self.mekf.estimate_attitude(
             [sensors.css.sun_vec, sensors.mag.mag.normalize()],
@@ -406,7 +404,7 @@ impl Default for CubeSat {
             control_torque: Vec3::zeros(),
             body,
         };
-        let control = FSW::new();
+        let control = FSW::default();
         Self { sim, fsw: control }
     }
 }

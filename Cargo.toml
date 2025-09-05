@@ -24,8 +24,6 @@ members = [
     "libs/stellarator/maitake",
     "libs/stellarator/maitake/util",
     "libs/video-toolbox",
-    "fsw/mekf",
-    "fsw/lqr",
     "libs/postcard-c/codegen",
     "apps/inscriber",
     "fsw/video-streamer",
