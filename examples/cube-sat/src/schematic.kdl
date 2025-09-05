@@ -19,8 +19,8 @@ hsplit {
     }
 }
 object_3d "(cube_sat.sim.body.pos.angular, cube_sat.sim.body.pos.linear)" {
-    glb "https://storage.googleapis.com/elodin-assets/oresat-low.glb"
+    glb "https://r2.metor.io/oresat-low.glb"
 }
 object_3d "(0,0,0,1, 0,0,0)" {
-    glb "https://storage.googleapis.com/elodin-assets/earth.glb"
+    glb "https://r2.metor.io/earth.glb"
 }
