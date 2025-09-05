@@ -2,7 +2,10 @@ use std::{
     fmt::Debug,
     ops::{Range, RangeInclusive},
     path::{Path, PathBuf},
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
 };
 
 use impeller2::types::Timestamp;
@@ -22,6 +25,7 @@ pub struct TimeSeries {
     pub list: Arc<AtomicStack<TimeSeriesNode>>,
     path: PathBuf,
     data_waker: Arc<WaitQueue>,
+    has_writer: Arc<AtomicBool>,
 }
 
 #[derive(Clone)]
@@ -57,36 +61,6 @@ impl TimeSeriesNode {
         let data = AppendLog::open(path.join("data"))?;
         let time_series = Self { index, data };
         Ok(time_series)
-    }
-
-    pub fn push_buf(&self, timestamp: Timestamp, buf: &[u8]) -> Result<(), Error> {
-        let len = self.index.len() as usize;
-
-        // check if timestamp is greater than the last timestamp
-        // to ensure index is ordered
-        if len > 0 {
-            let last_timestamp = self
-                .index
-                .get(len - size_of::<i64>()..len)
-                .expect("couldn't find last timestamp");
-            let last_timestamp = Timestamp::from_le_bytes(
-                last_timestamp
-                    .try_into()
-                    .expect("last_timestamp was wrong size"),
-            );
-            if last_timestamp > timestamp {
-                warn!(?last_timestamp, ?timestamp, "time travel");
-                return Err(Error::TimeTravel);
-            }
-        }
-
-        // write new data to head of data writer
-        self.data.write(buf)?;
-
-        // always write index last so we get consistent reads
-        self.index.write(&timestamp.to_le_bytes())?;
-
-        Ok(())
     }
 
     pub fn timestamps(&self) -> &[Timestamp] {
@@ -189,6 +163,7 @@ impl TimeSeries {
             list: Arc::new(AtomicStack::new()),
             path: path.as_ref().to_path_buf(),
             data_waker: Arc::new(WaitQueue::new()),
+            has_writer: Arc::new(AtomicBool::new(false)),
         })
     }
 
@@ -219,6 +194,7 @@ impl TimeSeries {
             list,
             path: path.to_path_buf(),
             data_waker: Arc::new(WaitQueue::new()),
+            has_writer: Arc::new(AtomicBool::new(false)),
         })
     }
 
@@ -227,40 +203,6 @@ impl TimeSeries {
             .iter()
             .filter_map(|node| node.timestamps().first().copied())
             .min()
-    }
-
-    pub fn push_buf(&self, timestamp: Timestamp, buf: &[u8]) -> Result<(), Error> {
-        // TODO(sphw): have a lock for push_buf
-        //  Or not, really there is just going to be one writer, maybe we do the split thing?
-        // TODO(sphw): prevent time tavel
-        loop {
-            if self.try_push_buf(timestamp, buf)? {
-                break;
-            }
-            let _ = self.list.try_push(TimeSeriesNode::create(
-                self.path.join(timestamp.0.to_string()),
-                timestamp,
-                buf.len() as u64,
-            )?);
-        }
-        self.data_waker.wake_all();
-        Ok(())
-    }
-
-    fn try_push_buf(&self, timestamp: Timestamp, buf: &[u8]) -> Result<bool, Error> {
-        let Some(head) = self.list.head() else {
-            return Ok(false);
-        };
-        match head.data.write(buf) {
-            Ok(_) => {}
-            Err(Error::MapOverflow) => return Ok(false),
-            Err(err) => {
-                println!("{err:?}");
-                return Err(err);
-            }
-        };
-        head.index.write(&timestamp.to_le_bytes())?;
-        Ok(true)
     }
 
     pub fn get(&self, timestamp: Timestamp) -> Option<TimestampRef> {
@@ -365,5 +307,52 @@ impl TimeSeries {
 
     pub fn is_empty(&self) -> bool {
         self.list.head().is_none()
+    }
+
+    pub fn writer(&self) -> Option<TimerSeriesWriter> {
+        if self.has_writer.swap(true, Ordering::Acquire) {
+            None
+        } else {
+            Some(TimerSeriesWriter {
+                time_series: self.clone(),
+            })
+        }
+    }
+}
+
+pub struct TimerSeriesWriter {
+    time_series: TimeSeries,
+}
+
+impl TimerSeriesWriter {
+    pub fn push_buf(&self, timestamp: Timestamp, buf: &[u8]) -> Result<(), Error> {
+        loop {
+            if self.try_push_buf(timestamp, buf)? {
+                break;
+            }
+            let _ = self.time_series.list.try_push(TimeSeriesNode::create(
+                self.time_series.path.join(timestamp.0.to_string()),
+                timestamp,
+                buf.len() as u64,
+            )?);
+        }
+        self.time_series.data_waker.wake_all();
+        Ok(())
+    }
+
+    fn try_push_buf(&self, timestamp: Timestamp, buf: &[u8]) -> Result<bool, Error> {
+        let Some(head) = self.time_series.list.head() else {
+            return Ok(false);
+        };
+        match head.data.write(buf) {
+            Ok(_) => {}
+            Err(Error::MapOverflow) => return Ok(false),
+            Err(err) => {
+                println!("{err:?}");
+                return Err(err);
+            }
+        };
+        head.index.write(&timestamp.to_le_bytes())?;
+        Ok(true)
     }
 }

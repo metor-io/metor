@@ -225,6 +225,26 @@ impl Reader {
             reader: self,
         }
     }
+
+    pub fn try_next(&mut self) -> Option<ReadGrant<'_>> {
+        let node = self.node.as_ref();
+
+        let mut read = node.cursor.load(Ordering::Acquire);
+        let write = self.core.write_head.committed.load(Ordering::Acquire);
+        let high_water_mark = self.core.write_head.high_water_mark.load(Ordering::Acquire);
+        if read == high_water_mark && write < read {
+            read = 0;
+            node.cursor.store(0, Ordering::Release);
+        }
+        let len = if write < read { high_water_mark } else { write } - read;
+        let len = len as usize;
+        let read = read as usize;
+        let range = (len > 0).then(|| read..read + len)?;
+        Some(ReadGrant {
+            range,
+            reader: self,
+        })
+    }
 }
 
 impl Drop for Reader {
@@ -269,7 +289,7 @@ impl Drop for Reader {
                     return;
                 }
             } else {
-                let Some(next) = reader.next.load_ref(Ordering::Relaxed) else {
+                let Some(next) = cursor.next.load_ref(Ordering::Relaxed) else {
                     return;
                 };
                 cursor = ArcRef::Arc(next);

@@ -2,12 +2,12 @@
 mod tests {
 
     use arrow::{array::AsArray, datatypes::Float64Type};
-    use metor_db::{DB, Error, Server};
     use impeller2::{
         types::{ComponentId, IntoLenPacket, LenPacket, Msg, PrimType, Timestamp},
         vtable::builder::{component, raw_field, raw_table, schema, timestamp, vtable},
     };
     use impeller2_stellar::Client;
+    use metor_db::{DB, Error, Server};
     use postcard_schema::{Schema, schema::owned::OwnedNamedType};
     use std::{net::SocketAddr, sync::Arc, time::Duration};
     use stellarator::{net::TcpListener, sleep, spawn, struc_con::stellar, test};
@@ -1091,10 +1091,7 @@ mod tests {
         let Err(impeller2_stellar::Error::Response(err)) = client.recv::<()>(42).await else {
             panic!("invalid response");
         };
-        assert_eq!(
-            metor_db::Error::SchemaMismatch.to_string(),
-            err.description
-        );
+        assert_eq!(metor_db::Error::SchemaMismatch.to_string(), err.description);
     }
 
     #[test]

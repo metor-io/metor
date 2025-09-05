@@ -16,7 +16,7 @@ use crate::{
     Error, MetadataExt,
     append_log::AppendLog,
     arc_ring::{AtomicNode, AtomicStack, AtomicStackIter},
-    disruptor::{ArcAtomic, Disruptor},
+    disruptor::{ArcAtomic, Disruptor, Reader},
 };
 
 #[derive(Clone)]
@@ -484,4 +484,36 @@ impl MsgLog {
         }
         Ok(())
     }
+
+    pub fn wal_reader(&self) -> Reader {
+        self.wal.reader()
+    }
+}
+
+pub fn read_msg(mut buf: &[u8]) -> Option<(&[u8], Timestamp, &[u8])> {
+    if buf.len() < size_of::<Timestamp>() + size_of::<u32>() {
+        return None;
+    }
+    let timestamp_bytes = &buf[..size_of::<Timestamp>()];
+    let timestamp = Timestamp::from_le_bytes(
+        timestamp_bytes
+            .try_into()
+            .expect("timestamp bytes wrong size"),
+    );
+    buf = &buf[size_of::<Timestamp>()..];
+
+    if buf.len() < size_of::<u32>() {
+        return None;
+    }
+    let msg_len_bytes = &buf[..size_of::<u32>()];
+    let msg_len =
+        u32::from_le_bytes(msg_len_bytes.try_into().expect("msg_len bytes wrong size")) as usize;
+    buf = &buf[size_of::<u32>()..];
+
+    if buf.len() < msg_len {
+        return None;
+    }
+    let msg_data = &buf[..msg_len];
+    buf = &buf[msg_len..];
+    Some((buf, timestamp, msg_data))
 }

@@ -525,6 +525,7 @@ pub struct Component {
     pub time_series: TimeSeries,
     pub wal: Disruptor,
     pub schema: ComponentSchema,
+    pub last_timestamp: Arc<AtomicCell<Timestamp>>,
 }
 
 impl Component {
@@ -545,6 +546,7 @@ impl Component {
             component_id,
             time_series,
             schema,
+            last_timestamp: Arc::new(AtomicCell::new(Timestamp(i64::MIN))),
         };
         stellarator::spawn(this.clone().persist());
         Ok(this)
@@ -557,20 +559,26 @@ impl Component {
     ) -> Result<Self, Error> {
         let time_series = TimeSeries::open(path)?;
 
+        let last_timestamp = time_series
+            .latest()
+            .map(|t| t.timestamp())
+            .unwrap_or(Timestamp(i64::MIN));
         let this = Component {
             wal: Disruptor::new(schema.size() * 256),
             component_id,
             time_series,
             schema,
+            last_timestamp: Arc::new(AtomicCell::new(last_timestamp)),
         };
-        stellarator::spawn(this.clone().persist());
+        stellarator::spawn(this.persist());
         Ok(this)
     }
 
-    pub fn persist(self) -> impl Future<Output = ()> {
+    pub fn persist(&self) -> impl Future<Output = ()> + 'static {
         let mut reader = self.wal.reader();
+        let writer = self.time_series.writer().expect("writer already created");
+        let msg_size = self.schema.size() + size_of::<Timestamp>();
         async move {
-            let msg_size = self.schema.size() + size_of::<Timestamp>();
             loop {
                 let buf = reader.next().await;
                 let mut buf = &buf[..];
@@ -584,7 +592,7 @@ impl Component {
                     let Some(data) = msg.get(size_of::<Timestamp>()..) else {
                         break 'parse;
                     };
-                    if let Err(err) = self.time_series.push_buf(timestamp, &data) {
+                    if let Err(err) = writer.push_buf(timestamp, &data) {
                         tracing::error!(?err, "failed to persist wal message");
                     }
                     buf = &buf[msg_size..];
@@ -602,6 +610,9 @@ impl Component {
     }
 
     pub fn push_buf(&self, timestamp: Timestamp, value_buf: &[u8]) -> Result<(), Error> {
+        if timestamp < self.last_timestamp.latest() {
+            return Err(Error::TimeTravel);
+        }
         let Ok(mut grant) = self.wal.try_grant(value_buf.len() + size_of::<Timestamp>()) else {
             let reader_count = self.wal.reader_count();
             warn!(?timestamp, ?reader_count, "skipped buf due to overflow");
@@ -612,6 +623,7 @@ impl Component {
         grant[..size_of::<Timestamp>()].copy_from_slice(timestamp.as_bytes());
         grant[size_of::<Timestamp>()..].copy_from_slice(value_buf);
         drop(grant);
+        self.last_timestamp.update_max(timestamp);
         Ok(())
     }
 }
@@ -721,8 +733,8 @@ async fn handle_conn_inner<A: AsyncRead + AsyncWrite + 'static>(
     mut rx: PacketStream<OwnedReader<A>>,
     db: Arc<DB>,
 ) -> Result<(), Error> {
-    let mut buf = vec![0u8; 256 * 1024 * 1024];
-    let mut resp_pkt = LenPacket::new(PacketTy::Msg, [0, 0], 256 * 1024 * 1024);
+    let mut buf = vec![0u8; 1024 * 1024 * 1024];
+    let mut resp_pkt = LenPacket::new(PacketTy::Msg, [0, 0], 1024 * 1024 * 1024);
     loop {
         let pkt = rx.next(buf).await?;
         let req_id = pkt.req_id();
@@ -1490,11 +1502,11 @@ async fn handle_real_time_component<A: AsyncWrite>(
     component: Component,
     req_id: RequestId,
 ) -> Result<(), Error> {
-    let timestamp_loc = raw_table(0, size_of::<Timestamp>() as u16);
+    let timestamp_loc = raw_table(0, size_of::<Timestamp>() as u32);
     let prim_type = component.schema.prim_type;
     let vtable = vtable([raw_field(
-        (prim_type.padding(8) + size_of::<Timestamp>()) as u16,
-        component.schema.size() as u16,
+        (prim_type.padding(8) + size_of::<Timestamp>()) as u32,
+        component.schema.size() as u32,
         timestamp(timestamp_loc, component.as_vtable_op()),
     )]);
     let waiter = component.time_series.waiter();
@@ -1541,8 +1553,10 @@ async fn handle_fixed_stream<A: AsyncWrite>(
     state: Arc<FixedRateStreamState>,
     db: Arc<DB>,
 ) -> Result<(), Error> {
-    let mut current_gen = u64::MAX;
-    let mut table = LenPacket::table([0; 2], 2048 - 16);
+    let mut current_vtable_gen = db.vtable_gen.latest();
+    let mut current_field_count: Option<usize> = None;
+    let id: PacketId = state.stream_id.to_le_bytes()[..2].try_into().unwrap();
+    let mut table = LenPacket::table(id, 2048 - 16);
     let mut components = db.with_state(|state| state.components.clone());
     loop {
         if !state.wait_for_playing().await {
@@ -1551,21 +1565,29 @@ async fn handle_fixed_stream<A: AsyncWrite>(
         let start = Instant::now();
         let current_timestamp = state.current_timestamp();
         let vtable_gen = db.vtable_gen.latest();
-        if vtable_gen != current_gen {
+        if vtable_gen != current_vtable_gen {
             components = db.with_state(|state| state.components.clone());
             let stream = stream.lock().await;
-            let id: PacketId = state.stream_id.to_le_bytes()[..2].try_into().unwrap();
-            table = LenPacket::table(id, 2048 - 16);
-            for (i, vtable) in DBVisitor.vtable(&components)?.into_iter().enumerate() {
-                let id = (u16::from_le_bytes(id) + i as u16).to_le_bytes();
-                let msg = VTableMsg { id, vtable };
-                stream.send(msg.with_request_id(req_id)).await.0?;
-            }
-            current_gen = vtable_gen;
+            let vtable = DBVisitor.vtable(&components)?;
+            let msg = VTableMsg { id, vtable };
+            stream.send(msg.with_request_id(req_id)).await.0?;
+            current_vtable_gen = vtable_gen;
         }
         table.clear();
-        if let Err(err) = DBVisitor.populate_table(&components, &mut table, current_timestamp) {
-            warn!(?err, "failed to populate table");
+        match DBVisitor.populate_table(&components, &mut table, current_timestamp) {
+            Ok(fields) => {
+                if current_field_count
+                    .map(|current| current != fields)
+                    .unwrap_or(true)
+                {
+                    let stream = stream.lock().await;
+                    let vtable = DBVisitor.vtable(&components)?;
+                    let msg = VTableMsg { id, vtable };
+                    stream.send(msg.with_request_id(req_id)).await.0?;
+                }
+                current_field_count = Some(fields);
+            }
+            Err(err) => warn!(?err, "failed to populate table"),
         }
         {
             let stream = stream.lock().await;
@@ -1590,25 +1612,23 @@ async fn handle_fixed_stream<A: AsyncWrite>(
 struct DBVisitor;
 
 impl DBVisitor {
-    fn vtable(&self, components: &HashMap<ComponentId, Component>) -> Result<Vec<VTable>, Error> {
-        let mut vtables = vec![];
+    fn vtable(&self, components: &HashMap<ComponentId, Component>) -> Result<VTable, Error> {
         let mut fields = vec![];
         let mut offset = 0;
         self.visit(components, |entity| {
             if !entity.time_series.is_empty() {
                 offset += PrimType::U64.padding(offset);
-                let op = timestamp(builder::raw_table(offset as u16, 8), entity.as_vtable_op());
+                let op = timestamp(builder::raw_table(offset as u32, 8), entity.as_vtable_op());
                 offset += size_of::<Timestamp>();
                 offset += entity.schema.prim_type.padding(offset);
                 let len = entity.schema.size();
-                let size = len as u16;
-                fields.push(raw_field(offset as u16, size, op));
+                let size = len as u32;
+                fields.push(raw_field(offset as u32, size, op));
                 offset += len;
             }
             Ok(())
         })?;
-        vtables.push(vtable(fields));
-        Ok(vtables)
+        Ok(vtable(fields))
     }
 
     fn populate_table(
@@ -1616,7 +1636,8 @@ impl DBVisitor {
         components: &HashMap<ComponentId, Component>,
         table: &mut LenPacket,
         timestamp: Timestamp,
-    ) -> Result<(), Error> {
+    ) -> Result<usize, Error> {
+        let mut fields = 0;
         self.visit(components, |entity| {
             let Some(start_timestamp) = entity.time_series.start_timestamp() else {
                 return Ok(());
@@ -1628,9 +1649,10 @@ impl DBVisitor {
             table.push_aligned(nearest.timestamp());
             table.pad_for_type(entity.schema.prim_type);
             table.extend_from_slice(nearest.data());
+            fields += 1;
             Ok(())
         })?;
-        Ok(())
+        Ok(fields)
     }
 
     fn visit(
