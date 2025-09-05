@@ -1,7 +1,7 @@
 [package]
 name = "metor-ui"
 license = "MIT OR Apache-2.0"
-description = "Metor Editor"
+description = "Metor UI"
 version.workspace = true
 edition = "2024"
 publish = false
