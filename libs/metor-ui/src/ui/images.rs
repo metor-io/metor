@@ -48,14 +48,12 @@ impl FromWorld for Images {
             icon_play: asset_server.load("embedded://metor_ui/assets/icons/play.png"),
             icon_pause: asset_server.load("embedded://metor_ui/assets/icons/pause.png"),
             icon_scrub: asset_server.load("embedded://metor_ui/assets/icons/scrub.png"),
-            icon_jump_to_end: asset_server
-                .load("embedded://metor_ui/assets/icons/jump_to_end.png"),
+            icon_jump_to_end: asset_server.load("embedded://metor_ui/assets/icons/jump_to_end.png"),
             icon_jump_to_start: asset_server
                 .load("embedded://metor_ui/assets/icons/jump_to_start.png"),
             icon_frame_forward: asset_server
                 .load("embedded://metor_ui/assets/icons/frame_forward.png"),
-            icon_frame_back: asset_server
-                .load("embedded://metor_ui/assets/icons/frame_back.png"),
+            icon_frame_back: asset_server.load("embedded://metor_ui/assets/icons/frame_back.png"),
             icon_search: asset_server.load("embedded://metor_ui/assets/icons/search.png"),
             icon_add: asset_server.load("embedded://metor_ui/assets/icons/add.png"),
             icon_subtract: asset_server.load("embedded://metor_ui/assets/icons/subtract.png"),
@@ -65,19 +63,16 @@ impl FromWorld for Images {
                 .load("embedded://metor_ui/assets/icons/left-side-bar.png"),
             icon_side_bar_right: asset_server
                 .load("embedded://metor_ui/assets/icons/right-side-bar.png"),
-            icon_fullscreen: asset_server
-                .load("embedded://metor_ui/assets/icons/fullscreen.png"),
+            icon_fullscreen: asset_server.load("embedded://metor_ui/assets/icons/fullscreen.png"),
             icon_exit_fullscreen: asset_server
                 .load("embedded://metor_ui/assets/icons/exit-fullscreen.png"),
             icon_setting: asset_server.load("embedded://metor_ui/assets/icons/setting.png"),
-            icon_lightning: asset_server
-                .load("embedded://metor_ui/assets/icons/lightning.png"),
+            icon_lightning: asset_server.load("embedded://metor_ui/assets/icons/lightning.png"),
             icon_link: asset_server.load("embedded://metor_ui/assets/icons/link.png"),
             icon_loop: asset_server.load("embedded://metor_ui/assets/icons/loop.png"),
             icon_tile_3d_viewer: asset_server
                 .load("embedded://metor_ui/assets/icons/tile_3d_viewer.png"),
-            icon_tile_graph: asset_server
-                .load("embedded://metor_ui/assets/icons/tile_graph.png"),
+            icon_tile_graph: asset_server.load("embedded://metor_ui/assets/icons/tile_graph.png"),
             icon_ip_addr: asset_server.load("embedded://metor_ui/assets/icons/ip-addr.png"),
             icon_folder: asset_server.load("embedded://metor_ui/assets/icons/folder.png"),
             icon_chevron_right: asset_server
@@ -86,8 +81,7 @@ impl FromWorld for Images {
                 .load("embedded://metor_ui/assets/icons/vertical-chevrons.png"),
             icon_plot: asset_server.load("embedded://metor_ui/assets/icons/plot.png"),
             icon_viewport: asset_server.load("embedded://metor_ui/assets/icons/viewport.png"),
-            icon_container: asset_server
-                .load("embedded://metor_ui/assets/icons/container.png"),
+            icon_container: asset_server.load("embedded://metor_ui/assets/icons/container.png"),
             icon_entity: asset_server.load("embedded://metor_ui/assets/icons/entity.png"),
         }
     }

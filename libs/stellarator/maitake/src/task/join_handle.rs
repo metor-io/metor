@@ -175,7 +175,6 @@ impl<T> Future for JoinHandle<T> {
         let task = match core::mem::replace(&mut this.task, JoinHandleState::Empty) {
             JoinHandleState::Task(task) => task,
             JoinHandleState::Empty => {
-                //panic!("`TaskRef` only taken while polling a `JoinHandle`; this is a bug");
                 return Poll::Ready(Err(JoinError {
                     kind: JoinErrorKind::Completed,
                     id: this.id,
