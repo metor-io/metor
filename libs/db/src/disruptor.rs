@@ -259,7 +259,7 @@ impl Drop for Reader {
 
             fn deref(&self) -> &Self::Target {
                 match self {
-                    ArcRef::Arc(read_node) => &*read_node,
+                    ArcRef::Arc(read_node) => read_node,
                     ArcRef::Ref(read_node) => read_node,
                 }
             }

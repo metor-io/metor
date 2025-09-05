@@ -281,7 +281,7 @@ impl ComponentValue {
             (Self::F64(arr), ComponentView::F64(view)) => {
                 arr.buf.as_mut_buf().copy_from_slice(view.buf());
             }
-            (a, b) => {
+            _ => {
                 return None;
             }
         };

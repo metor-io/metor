@@ -1,6 +1,6 @@
 #[cfg(feature = "nox")]
 use impeller2::component::Component;
-use impeller2::types::{ComponentId, Timestamp};
+use impeller2::types::Timestamp;
 use serde::{Deserialize, Serialize};
 
 mod metadata;

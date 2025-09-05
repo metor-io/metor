@@ -592,7 +592,7 @@ impl Component {
                     let Some(data) = msg.get(size_of::<Timestamp>()..) else {
                         break 'parse;
                     };
-                    if let Err(err) = writer.push_buf(timestamp, &data) {
+                    if let Err(err) = writer.push_buf(timestamp, data) {
                         tracing::error!(?err, "failed to persist wal message");
                     }
                     buf = &buf[msg_size..];
