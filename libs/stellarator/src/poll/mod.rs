@@ -58,6 +58,7 @@ impl Reactor for PollingReactor {
                 *state = OpState::Ready;
             }
         }
+        self.events.clear();
         Ok(())
     }
 
