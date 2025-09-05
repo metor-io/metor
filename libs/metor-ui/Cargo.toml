@@ -84,7 +84,7 @@ stacker = "0.1.19"
 strum = "0.27"
 
 # arrow
-arrow.version = "55"
+arrow.version = "54"
 arrow.features = ["canonical_extension_types"]
 
 # lua
