@@ -15,17 +15,21 @@ use bevy::{
 use bevy_infinite_grid::InfiniteGrid;
 use egui_tiles::TileId;
 use fuzzy_matcher::{FuzzyMatcher, skim::SkimMatcherV2};
-use impeller2::types::msg_id;
-use impeller2_bevy::{ComponentSchemaRegistry, CurrentStreamId, EntityMap, PacketTx};
+use impeller2::types::{ComponentId, Packet, PrimType, msg_id};
+use impeller2_bevy::{
+    ComponentMetadataRegistry, ComponentSchemaRegistry, CurrentStreamId, EntityMap, PacketTx,
+};
 use impeller2_kdl::ToKdl;
 use impeller2_wkt::{
     ComponentValue, IsRecording, Material, Mesh, Object3D, SetDbConfig, SetStreamState,
+    UpdateComponent,
 };
 use miette::IntoDiagnostic;
-use nox::ArrayBuf;
+use nox::{Array, ArrayBuf};
 
 use crate::{
     EqlContext, Offset, SelectedTimeRange, TimeRangeBehavior,
+    object_3d::compile_eql_expr,
     plugins::navigation_gizmo::RenderLayerAlloc,
     ui::{
         HdrEnabled, colors,
@@ -352,6 +356,165 @@ fn parts_iter(
             .iter()
             .flat_map(|(_, part)| std::iter::once(part).chain(parts_iter(&part.children))),
     )
+}
+
+fn update_component() -> PaletteItem {
+    PaletteItem::new(
+        "Update Component",
+        "Components",
+        move |_: In<String>, context: Res<EqlContext>, schema: Res<ComponentSchemaRegistry>| {
+            PalettePage::new(update_component_parts(&context.0.component_parts, &schema))
+                .prompt("Select a component to update")
+                .into()
+        },
+    )
+}
+
+fn update_component_parts(
+    parts: &BTreeMap<String, eql::ComponentPart>,
+    schema: &ComponentSchemaRegistry,
+) -> Vec<PaletteItem> {
+    parts_iter(parts)
+        .filter_map(|part| Some((part, schema.get(&part.id)?)))
+        .map(|(part, schema)| {
+            let name = part.name.clone();
+            let id = part.id;
+            let is_bool = schema.prim_type() == PrimType::Bool && schema.size() == 1;
+            PaletteItem::new(
+                part.name.clone(),
+                "Component",
+                move |_: In<String>, metadata: Res<ComponentMetadataRegistry>| {
+                    if is_bool {
+                            return PaletteEvent::NextPage {
+                                prev_page_label: Some(name.clone()),
+                                next_page: PalettePage::new(
+                                    [(false, "false"), (true, "true")].into_iter()
+                                    .map(|(i, var)| {
+                                            PaletteItem::new(
+                                                var.to_string(),
+                                                "Variant",
+                                                move |_: In<String>, tx: Res<PacketTx>, schema: Res<ComponentSchemaRegistry>| {
+                                                    let Some(schema) = schema.get(&id) else {
+                                                        return PaletteEvent::Exit;
+                                                    };
+                                                    let value = ComponentValue::Bool(
+                                                        Array::from_shape_vec(
+                                                            smallvec::smallvec![],
+                                                            vec![i],
+                                                        )
+                                                        .unwrap(),
+                                                    );
+                                                    tx.send_msg(UpdateComponent { id, value });
+                                                    PaletteEvent::Exit
+                                                },
+                                            )
+                                        })
+                                        .collect(),
+                                ),
+                            };
+                    }
+                    else if let Some(metadata) = metadata.get(&id) {
+                        if let Some(vars) = metadata.enum_variants() {
+                            return PaletteEvent::NextPage {
+                                prev_page_label: Some(name.clone()),
+                                next_page: PalettePage::new(
+                                    vars.into_iter()
+                                        .enumerate()
+                                        .map(|(i, var)| {
+                                            PaletteItem::new(
+                                                var.to_string(),
+                                                "Variant",
+                                                move |_: In<String>, tx: Res<PacketTx>, schema: Res<ComponentSchemaRegistry>| {
+                                                    let Some(schema) = schema.get(&id) else {
+                                                        return PaletteEvent::Exit;
+                                                    };
+                                                    let value = ComponentValue::U64(
+                                                        Array::from_shape_vec(
+                                                            smallvec::smallvec![],
+                                                            vec![i as u64],
+                                                        )
+                                                        .unwrap(),
+                                                    );
+                                                    let value = value.cast(schema.prim_type());
+                                                    tx.send_msg(UpdateComponent { id, value });
+                                                    PaletteEvent::Exit
+                                                },
+                                            )
+                                        })
+                                        .collect(),
+                                ),
+                            };
+                        } else if metadata.is_string() {
+                            return PaletteEvent::NextPage {
+                                prev_page_label: Some(name.clone()),
+                                next_page: PalettePage::new(vec![
+                                     PaletteItem::new(
+                                         LabelSource::placeholder("Enter a valid string"),
+                                         "Content",
+                                         move |string: In<String>, tx: Res<PacketTx>, schema: Res<ComponentSchemaRegistry>| {
+                                             let Some(schema) = schema.get(&id) else {
+                                                 return PaletteEvent::Exit;
+                                             };
+                                             if string.len() > schema.size() {
+                                                 return PaletteEvent::Error(format!("This string is longer than the max length of {:?}", schema.size()));
+                                             }
+                                             let mut vec = vec![0u8; schema.size()];
+                                             vec[..string.len()].copy_from_slice(string.as_bytes());
+                                             let value = ComponentValue::U8(
+                                                 Array::from_shape_vec(schema.shape().into(), vec).unwrap()
+                                             );
+                                             tx.send_msg(dbg!(UpdateComponent { id, value }));
+                                             PaletteEvent::Exit
+                                         },
+                                     ).default()
+                                ]),
+                            };
+                        }
+                    }
+                    PaletteEvent::NextPage {
+                        prev_page_label: Some(name.clone()),
+                        next_page: PalettePage::new(update_component_eql(id)),
+                    }
+                },
+            )
+        })
+        .collect()
+}
+
+fn update_component_eql(component_id: ComponentId) -> Vec<PaletteItem> {
+    vec![
+        PaletteItem::new(
+            LabelSource::placeholder("Enter an eql expression"),
+            "Enter an eql expression",
+            move |eql: In<String>,
+                  ctx: Res<EqlContext>,
+                  entity_map: Res<EntityMap>,
+                  values: Query<&'static ComponentValue>,
+                  tx: Res<PacketTx>,
+                  schema: Res<ComponentSchemaRegistry>| {
+                match ctx.0.parse_str(&eql.0) {
+                    Ok(eql) => {
+                        let eql = compile_eql_expr(eql);
+                        let value = match dbg!(eql.execute(&entity_map, &values)) {
+                            Ok(result) => result,
+                            Err(err) => return PaletteEvent::Error(err.to_string()),
+                        };
+                        let Some(schema) = schema.get(&component_id) else {
+                            return PaletteEvent::Exit;
+                        };
+                        let value = value.cast(schema.prim_type());
+                        tx.send_msg(UpdateComponent {
+                            id: component_id,
+                            value,
+                        });
+                        PaletteEvent::Exit
+                    }
+                    Err(err) => PaletteEvent::Error(err.to_string()),
+                }
+            },
+        )
+        .default(),
+    ]
 }
 
 pub fn create_monitor(tile_id: Option<TileId>) -> PaletteItem {
@@ -1050,6 +1213,7 @@ impl Default for PalettePage {
             save_schematic_db(),
             load_schematic(),
             set_color_scheme(),
+            update_component(),
         ])
     }
 }

@@ -1,6 +1,6 @@
 use nox::{ArrayRepr, OwnedRepr, Quaternion, Repr, Vector, tensor};
 use roci::{AsVTable, Metadatatize};
-use zerocopy::{Immutable, IntoBytes};
+use zerocopy::{FromBytes, Immutable, IntoBytes};
 
 /// Calculates the LQR control matrices for a yang LQR controller.
 ///
@@ -60,7 +60,7 @@ pub fn control(
 ///
 /// Based on the paper: "Analytic LQR Design for Spacecraft Control System Based on Quaternion Model"
 /// by Yang et al.
-#[derive(Debug, Clone, Copy, AsVTable, IntoBytes, Immutable, Metadatatize)]
+#[derive(Debug, Clone, Copy, AsVTable, IntoBytes, Immutable, Metadatatize, FromBytes)]
 pub struct YangLQR {
     d: Vector<f64, 3, ArrayRepr>,
     k: Vector<f64, 3, ArrayRepr>,

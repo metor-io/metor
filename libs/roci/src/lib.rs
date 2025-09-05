@@ -6,6 +6,7 @@ pub use zerocopy;
 
 mod nox;
 pub mod path;
+pub mod update;
 mod vtable;
 
 #[cfg(feature = "stellar")]

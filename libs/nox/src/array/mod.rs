@@ -59,7 +59,6 @@ pub mod prelude {
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[derive(zerocopy::IntoBytes, zerocopy::Immutable, zerocopy::KnownLayout, zerocopy::FromBytes)]
 #[repr(transparent)]
-#[cfg_attr(feature = "serde", serde(transparent))]
 pub struct Array<T: Elem, D: ArrayDim> {
     #[cfg_attr(
         feature = "serde",
@@ -1579,7 +1578,7 @@ impl<T: Field, const D1: usize, const D2: usize, const D3: usize> From<[[[T; D3]
     }
 }
 
-impl<T: Field> Array<T, Dyn> {
+impl<T: Elem> Array<T, Dyn> {
     pub fn from_shape_vec(shape: SmallVec<[usize; 4]>, storage: Vec<T>) -> Option<Self> {
         dynamic::DynArray::from_shape_vec(shape, storage).map(|buf| Array { buf })
     }

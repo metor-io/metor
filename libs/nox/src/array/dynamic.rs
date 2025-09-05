@@ -19,6 +19,14 @@ impl<T: Elem, S> DynArray<T, S> {
     pub fn shape(&self) -> &[usize] {
         &self.shape
     }
+
+    pub fn into_storage(self) -> S {
+        self.storage
+    }
+
+    pub fn as_storage(&self) -> &S {
+        &self.storage
+    }
 }
 
 impl<T: Elem> DynArray<T, Vec<T>> {

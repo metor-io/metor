@@ -1,3 +1,4 @@
+use bbq2::{queue::ArcBBQueue, traits::storage::BoxedSlice};
 use futures_concurrency::future::Race;
 use impeller2::types::{LenPacket, Msg};
 use impeller2_bbq::*;
@@ -5,10 +6,12 @@ use impeller2_wkt::{NewConnection, StreamId};
 use miette::{IntoDiagnostic, miette};
 use std::net::SocketAddr;
 use stellarator::{
-    io::{LengthDelReader, SplitExt},
+    io::{AsyncRead, LengthDelReader, SplitExt},
     net::TcpStream,
 };
 use thingbuf::mpsc;
+
+use crate::PacketStream;
 
 pub async fn tcp_connect<I>(
     addr: SocketAddr,
@@ -57,4 +60,25 @@ where
         Ok::<_, miette::Error>(())
     };
     (rx, tx).race().await
+}
+
+pub fn spawn_recv<R: AsyncRead + 'static>(
+    mut stream: PacketStream<R>,
+    queue_len: usize,
+) -> AsyncArcQueueRx {
+    let queue = ArcBBQueue::new_with_storage(BoxedSlice::new(queue_len));
+    let (rx, tx) = queue.framed_split();
+    stellarator::spawn(async move {
+        loop {
+            let grant_r = tx.wait_grant(512 * 1024).await;
+            let grant_r = PacketGrantW::new(grant_r);
+            println!("waiting for packet");
+            let Ok(slice) = dbg!(stream.reader.recv(grant_r).await) else {
+                continue;
+            };
+            let len = slice.range().len();
+            slice.into_inner().commit(len + 4);
+        }
+    });
+    rx
 }
