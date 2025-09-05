@@ -23,6 +23,7 @@ pub enum AstNode<'input> {
     Tuple(Vec<AstNode<'input>>),
     StringLiteral(Cow<'input, str>),
     FloatLiteral(f64),
+    BoolLiteral(bool),
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -57,6 +58,11 @@ peg::parser! {
         rule ident_str() -> Cow<'input, str>
             = i:$([c if is_xid_start(c)] [c if is_xid_continue(c)]*) { Cow::Borrowed(i) }
 
+        rule bool() -> bool
+            = "true" {true}
+            / "false" { false }
+
+
         rule uint() -> usize
             = s:$(['0'..='9']+) { s.parse().unwrap() }
 
@@ -85,6 +91,8 @@ peg::parser! {
         --
         "(" _ e:expr() _ ")" { e }
         --
+        b:bool() { AstNode::BoolLiteral(b) }
+        --
         f:float() { AstNode::FloatLiteral(f) }
         --
         s:string_literal() { AstNode::StringLiteral(s) }
@@ -103,6 +111,7 @@ pub enum Expr {
     Tuple(Vec<Expr>),
     FloatLiteral(f64),
     StringLiteral(String),
+    BoolLiteral(bool),
 
     // ffts
     Fft(Box<Expr>),
@@ -553,6 +562,7 @@ impl Context {
                 Ok(Expr::BinaryOp(Box::new(left), Box::new(right), *op))
             }
             AstNode::FloatLiteral(f) => Ok(Expr::FloatLiteral(*f)),
+            AstNode::BoolLiteral(b) => Ok(Expr::BoolLiteral(*b)),
             AstNode::ArrayIndex(ast_node, index) => {
                 let expr = self.parse(ast_node)?;
                 match &expr {

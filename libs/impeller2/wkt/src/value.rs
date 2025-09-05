@@ -5,7 +5,6 @@ use zerocopy::IntoBytes;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[cfg_attr(feature = "bevy", derive(bevy::prelude::Component))]
-#[serde(tag = "type")]
 pub enum ComponentValue {
     U8(Array<u8, Dyn>),
     U16(Array<u16, Dyn>),
@@ -247,7 +246,7 @@ impl ComponentValue {
             }
         }
     }
-    pub fn copy_from_view(&mut self, view: ComponentView<'_>) {
+    pub fn copy_from_view(&mut self, view: ComponentView<'_>) -> Option<()> {
         match (self, view) {
             (Self::U8(arr), ComponentView::U8(view)) => {
                 arr.buf.as_mut_buf().copy_from_slice(view.buf());
@@ -282,8 +281,11 @@ impl ComponentValue {
             (Self::F64(arr), ComponentView::F64(view)) => {
                 arr.buf.as_mut_buf().copy_from_slice(view.buf());
             }
-            _ => panic!("Incompatible component value and view types"),
-        }
+            (a, b) => {
+                return None;
+            }
+        };
+        Some(())
     }
 
     pub fn from_view(view: ComponentView<'_>) -> Self {
@@ -386,6 +388,118 @@ impl ComponentValue {
             ComponentValue::F32(x) => x.buf.as_buf().as_bytes(),
             ComponentValue::F64(x) => x.buf.as_buf().as_bytes(),
         }
+    }
+
+    pub fn as_view(&self) -> ComponentView<'_> {
+        match self {
+            ComponentValue::U8(x) => ComponentView::U8(x.view()),
+            ComponentValue::U16(x) => ComponentView::U16(x.view()),
+            ComponentValue::U32(x) => ComponentView::U32(x.view()),
+            ComponentValue::U64(x) => ComponentView::U64(x.view()),
+            ComponentValue::I8(x) => ComponentView::I8(x.view()),
+            ComponentValue::I16(x) => ComponentView::I16(x.view()),
+            ComponentValue::I32(x) => ComponentView::I32(x.view()),
+            ComponentValue::I64(x) => ComponentView::I64(x.view()),
+            ComponentValue::Bool(x) => ComponentView::Bool(x.view()),
+            ComponentValue::F32(x) => ComponentView::F32(x.view()),
+            ComponentValue::F64(x) => ComponentView::F64(x.view()),
+        }
+    }
+
+    /// Casts the ComponentValue to a different primitive type
+    pub fn cast(&self, target_type: PrimType) -> Self {
+        if self.prim_type() == target_type {
+            return self.clone();
+        }
+
+        let shape = self.shape();
+
+        macro_rules! cast_from {
+            ($src_array:expr, $src_type:ty, Bool) => {{
+                let values = $src_array
+                    .buf
+                    .as_buf()
+                    .iter()
+                    .map(|src_val| *src_val as u8 != 0)
+                    .collect::<Vec<_>>();
+                ComponentValue::Bool(Array::from_shape_vec(shape.into(), values).unwrap())
+            }};
+            ($src_array:expr, bool, $target_type:ident) => {{
+                let values = $src_array
+                    .buf
+                    .as_buf()
+                    .iter()
+                    .map(|src_val| *src_val as u8 as _)
+                    .collect::<Vec<_>>();
+                ComponentValue::$target_type(Array::from_shape_vec(shape.into(), values).unwrap())
+            }};
+            ($src_array:expr, $src_type:ty, $target_type:ident) => {{
+                let values = $src_array
+                    .buf
+                    .as_buf()
+                    .iter()
+                    .map(|src_val| *src_val as _)
+                    .collect::<Vec<_>>();
+                ComponentValue::$target_type(Array::from_shape_vec(shape.into(), values).unwrap())
+            }};
+        }
+
+        macro_rules! cast_to_all {
+            ($src_array:expr, bool) => {
+                match target_type {
+                    PrimType::U8 => cast_from!($src_array, bool, U8),
+                    PrimType::U16 => cast_from!($src_array, bool, U16),
+                    PrimType::U32 => cast_from!($src_array, bool, U32),
+                    PrimType::U64 => cast_from!($src_array, bool, U64),
+                    PrimType::I8 => cast_from!($src_array, bool, I8),
+                    PrimType::I16 => cast_from!($src_array, bool, I16),
+                    PrimType::I32 => cast_from!($src_array, bool, I32),
+                    PrimType::I64 => cast_from!($src_array, bool, I64),
+                    PrimType::F32 => cast_from!($src_array, bool, F32),
+                    PrimType::F64 => cast_from!($src_array, bool, F64),
+                    PrimType::Bool => unreachable!(),
+                }
+            };
+            ($src_array:expr, $src_type:ty) => {
+                match target_type {
+                    PrimType::U8 => cast_from!($src_array, $src_type, U8),
+                    PrimType::U16 => cast_from!($src_array, $src_type, U16),
+                    PrimType::U32 => cast_from!($src_array, $src_type, U32),
+                    PrimType::U64 => cast_from!($src_array, $src_type, U64),
+                    PrimType::I8 => cast_from!($src_array, $src_type, I8),
+                    PrimType::I16 => cast_from!($src_array, $src_type, I16),
+                    PrimType::I32 => cast_from!($src_array, $src_type, I32),
+                    PrimType::I64 => cast_from!($src_array, $src_type, I64),
+                    PrimType::F32 => cast_from!($src_array, $src_type, F32),
+                    PrimType::F64 => cast_from!($src_array, $src_type, F64),
+                    PrimType::Bool => cast_from!($src_array, $src_type, Bool),
+                }
+            };
+        }
+
+        match self {
+            ComponentValue::U8(array) => cast_to_all!(array, u8),
+            ComponentValue::U16(array) => cast_to_all!(array, u16),
+            ComponentValue::U32(array) => cast_to_all!(array, u32),
+            ComponentValue::U64(array) => cast_to_all!(array, u64),
+            ComponentValue::I8(array) => cast_to_all!(array, i8),
+            ComponentValue::I16(array) => cast_to_all!(array, i16),
+            ComponentValue::I32(array) => cast_to_all!(array, i32),
+            ComponentValue::I64(array) => cast_to_all!(array, i64),
+            ComponentValue::Bool(array) => cast_to_all!(array, bool),
+            ComponentValue::F32(array) => cast_to_all!(array, f32),
+            ComponentValue::F64(array) => cast_to_all!(array, f64),
+        }
+    }
+
+    pub fn as_str(&self) -> Option<&str> {
+        let ComponentValue::U8(array) = self else {
+            return None;
+        };
+        let buf = array.buf.as_buf();
+        let len = buf.iter().position(|p| *p == 0).unwrap_or(buf.len());
+        let contents = buf.get(..len)?;
+        std::str::from_utf8(contents).ok()
     }
 }
 

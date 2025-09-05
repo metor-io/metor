@@ -163,6 +163,20 @@ impl WidgetSystem for InspectorEntity<'_, '_> {
                     }
                 }
                 create_graph = graph_clicked;
+            } else if metadata.is_string() {
+                let [graph_clicked] = label::label_with_buttons(
+                    ui,
+                    [icon_chart],
+                    label,
+                    get_scheme().text_primary,
+                    egui::Margin::symmetric(0, 4).bottom(12.0),
+                );
+                if let Some(s) = component_value.as_str() {
+                    ui.label(s);
+                } else {
+                    ui.label(format!("invalid str {:?}", component_value));
+                }
+                create_graph = graph_clicked;
             } else {
                 inspector_item_multi(
                     ui,

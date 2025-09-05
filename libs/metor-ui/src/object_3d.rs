@@ -181,6 +181,9 @@ pub fn compile_eql_expr(expression: eql::Expr) -> CompiledExpr {
             })
         }
         Expr::FloatLiteral(f) => CompiledExpr::Value(ComponentValue::F64(nox::array!(f).to_dyn())),
+        Expr::BoolLiteral(b) => CompiledExpr::Value(ComponentValue::Bool(
+            nox::Array::from_shape_vec(smallvec![], vec![b]).unwrap(),
+        )),
         expr => {
             let error = format!("{:?} can't be converted to a component value", expr);
             CompiledExpr::closure(move |_, _| Err(error.clone()))
