@@ -24,6 +24,7 @@ egui.version = "0.31"
 egui.features = ["rayon"]
 egui_tiles = "0.12"
 egui_table = "0.3"
+walkers = "0.42"
 winit.version = "0.30"
 winit.features = ["rwh_05"]
 raw-window-handle = "0.5"

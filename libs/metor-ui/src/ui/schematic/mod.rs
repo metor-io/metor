@@ -101,6 +101,7 @@ impl SchematicParam<'_, '_> {
                     let dashboard = self.dashboards.get(dash.entity).ok()?;
                     Some(Panel::Dashboard(Box::new(dashboard.clone())))
                 }
+                Pane::Map(_) => None,
             },
             Tile::Container(container) => match container {
                 egui_tiles::Container::Tabs(t) => {

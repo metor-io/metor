@@ -42,6 +42,7 @@ pub mod hierarchy;
 pub mod images;
 pub mod inspector;
 pub mod label;
+pub mod map;
 pub mod monitor;
 pub mod plot;
 pub mod plot_3d;
@@ -88,6 +89,9 @@ pub enum SelectedObject {
     DashboardNode {
         entity: Entity,
     },
+    Map {
+        entity: Entity,
+    },
 }
 
 impl SelectedObject {
@@ -104,6 +108,7 @@ impl SelectedObject {
             SelectedObject::Action { action_id } => Some(*action_id),
             SelectedObject::Object3D { entity } => Some(*entity),
             SelectedObject::DashboardNode { entity } => Some(*entity),
+            SelectedObject::Map { entity } => Some(*entity),
         }
     }
 }

@@ -18,6 +18,7 @@ pub mod action;
 pub mod dashboard;
 pub mod entity;
 pub mod graph;
+pub mod map;
 pub mod object3d;
 pub mod viewport;
 
@@ -26,7 +27,7 @@ pub use widgets::*;
 
 use self::{
     dashboard::InspectorDashboardNode, entity::InspectorEntity, graph::InspectorGraph,
-    object3d::InspectorObject3D, viewport::InspectorViewport,
+    map::InspectorMap, object3d::InspectorObject3D, viewport::InspectorViewport,
 };
 
 pub struct InspectorIcons {
@@ -139,6 +140,10 @@ impl WidgetSystem for InspectorContent<'_> {
                                     "inspector_dashboard_node",
                                     entity,
                                 );
+                                Default::default()
+                            }
+                            SelectedObject::Map { entity } => {
+                                ui.add_widget_with::<InspectorMap>(world, "inspector_map", entity);
                                 Default::default()
                             }
                         })

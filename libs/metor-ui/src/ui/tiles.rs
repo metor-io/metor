@@ -30,6 +30,7 @@ use super::{
     hierarchy::{Hierarchy, HierarchyContent},
     images,
     inspector::{InspectorContent, InspectorIcons},
+    map::{MapTile, MapTileState, MapTileWidget},
     monitor::{MonitorPane, MonitorWidget},
     plot::{GraphBundle, GraphState, PlotWidget},
     query_plot::QueryPlotData,
@@ -77,6 +78,12 @@ pub struct TileState {
 pub struct ViewportContainsPointer(pub bool);
 #[derive(Clone)]
 pub struct ActionTilePane {
+    pub entity: Entity,
+    pub label: String,
+}
+
+#[derive(Clone)]
+pub struct MapPane {
     pub entity: Entity,
     pub label: String,
 }
@@ -212,6 +219,10 @@ impl TileState {
             .push(TreeAction::AddSchematicTree(tile_id));
     }
 
+    pub fn create_map_tile(&mut self, eql: String, tile_id: Option<TileId>) {
+        self.tree_actions.push(TreeAction::AddMap(tile_id, eql));
+    }
+
     pub fn create_sidebars_layout(&mut self) {
         self.tree_actions.push(TreeAction::AddSidebars);
     }
@@ -254,6 +265,9 @@ impl TileState {
                 Tile::Pane(Pane::Dashboard(dashboard)) => {
                     commands.entity(dashboard.entity).despawn();
                 }
+                Tile::Pane(Pane::Map(map)) => {
+                    commands.entity(map.entity).despawn();
+                }
                 _ => {}
             }
 
@@ -283,6 +297,7 @@ pub enum Pane {
     Hierarchy,
     Inspector,
     SchematicTree(TreePane),
+    Map(MapPane),
 }
 
 impl Pane {
@@ -323,6 +338,7 @@ impl Pane {
             Pane::Hierarchy => "Entities".to_string(),
             Pane::Inspector => "Inspector".to_string(),
             Pane::SchematicTree(_) => "Tree".to_string(),
+            Pane::Map(map) => map.label.to_string(),
         }
     }
 
@@ -423,6 +439,10 @@ impl Pane {
                     "tree",
                     (tree_icons, tree_pane.entity),
                 );
+                egui_tiles::UiResponse::None
+            }
+            Pane::Map(pane) => {
+                ui.add_widget_with::<MapTileWidget>(world, "map_tile", pane.entity);
                 egui_tiles::UiResponse::None
             }
         }
@@ -617,6 +637,7 @@ pub enum TreeAction {
     AddHierarchy(Option<TileId>),
     AddInspector(Option<TileId>),
     AddSchematicTree(Option<TileId>),
+    AddMap(Option<TileId>, String),
     AddSidebars,
     DeleteTab(TileId),
     SelectTile(TileId),
@@ -1048,6 +1069,10 @@ impl WidgetSystem for TileLayout<'_, '_> {
                             state_mut.commands.entity(pane.entity).despawn();
                         };
 
+                        if let egui_tiles::Tile::Pane(Pane::Map(pane)) = tile {
+                            state_mut.commands.entity(pane.entity).despawn();
+                        };
+
                         ui_state.tree.remove_recursively(tile_id);
 
                         if let Some(graph_id) = ui_state.graphs.get(&tile_id) {
@@ -1241,6 +1266,37 @@ impl WidgetSystem for TileLayout<'_, '_> {
                             ui_state.tree.make_active(|id, _| id == tile_id);
                         }
                     }
+                    TreeAction::AddMap(parent_tile_id, eql) => {
+                        let entity = state_mut
+                            .commands
+                            .spawn(MapTile {
+                                eql: EditableEQL {
+                                    eql: eql.clone(),
+                                    compiled_expr: state_mut
+                                        .eql_ctx
+                                        .0
+                                        .parse_str(&eql)
+                                        .inspect_err(|err| println!("{err:?} eql error"))
+                                        .ok()
+                                        .map(compile_eql_expr),
+                                },
+                                label: "Map".to_string(),
+                            })
+                            .insert(MapTileState {
+                                tiles: None,
+                                map_memory: Default::default(),
+                            })
+                            .id();
+                        let pane = Pane::Map(MapPane {
+                            entity,
+                            label: "Map".to_string(),
+                        });
+                        if let Some(tile_id) =
+                            ui_state.insert_tile(Tile::Pane(pane), parent_tile_id, true)
+                        {
+                            ui_state.tree.make_active(|id, _| id == tile_id);
+                        }
+                    }
                     TreeAction::AddSidebars => {
                         let hierarchy = ui_state.tree.tiles.insert_new(Tile::Pane(Pane::Hierarchy));
                         let inspector = ui_state.tree.tiles.insert_new(Tile::Pane(Pane::Inspector));
@@ -1316,6 +1372,7 @@ impl WidgetSystem for TileLayout<'_, '_> {
                             stream.try_insert(IsTileVisible(active_tiles.contains(tile_id)));
                         }
                     }
+                    Pane::Map(_) => {}
                 }
             }
         })

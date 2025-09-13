@@ -672,6 +672,30 @@ pub fn create_video_stream(tile_id: Option<TileId>) -> PaletteItem {
     )
 }
 
+pub fn create_map(tile_id: Option<TileId>) -> PaletteItem {
+    PaletteItem::new(
+        "Create Map",
+        TILES_LABEL,
+        move |_: In<String>| -> PaletteEvent {
+            PalettePage::new(vec![
+                PaletteItem::new(
+                    LabelSource::placeholder(
+                        "Enter EQL expression that evaluates to lat,lon pairs (e.g., 'entity.position[0:2]')",
+                    ),
+                    "Enter an EQL expression that returns an array of lat,lon coordinates",
+                    move |In(eql): In<String>, mut tile_state: ResMut<tiles::TileState>| {
+                        tile_state.create_map_tile(eql.trim().to_string(), tile_id);
+                        PaletteEvent::Exit
+                    },
+                )
+                .default(),
+            ])
+            .prompt("Enter EQL expression for map markers")
+            .into()
+        },
+    )
+}
+
 fn set_playback_speed() -> PaletteItem {
     PaletteItem::new("Set Playback Speed", TIME_LABEL, |_: In<String>| {
         let speeds = [
@@ -1131,6 +1155,7 @@ pub fn create_tiles(tile_id: TileId) -> PalettePage {
         create_query_table(Some(tile_id)),
         create_query_plot(Some(tile_id)),
         create_video_stream(Some(tile_id)),
+        create_map(Some(tile_id)),
         create_hierarchy(Some(tile_id)),
         create_schematic_tree(Some(tile_id)),
         create_dashboard(Some(tile_id)),
@@ -1200,6 +1225,7 @@ impl Default for PalettePage {
             create_query_table(None),
             create_query_plot(None),
             create_video_stream(None),
+            create_map(None),
             create_hierarchy(None),
             create_inspector(None),
             create_schematic_tree(None),
