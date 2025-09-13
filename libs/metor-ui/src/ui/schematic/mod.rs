@@ -3,7 +3,9 @@ use std::collections::HashMap;
 use crate::{
     object_3d::Object3DState,
     ui::{
-        actions, inspector, plot, query_plot, query_table,
+        actions, inspector,
+        map::MapTile,
+        plot, query_plot, query_table,
         tiles::{self, Pane},
     },
 };
@@ -33,6 +35,7 @@ pub struct SchematicParam<'w, 's> {
     pub lines_3d: Query<'w, 's, (Entity, &'static Line3d)>,
     pub ui_state: Res<'w, tiles::TileState>,
     pub dashboards: Query<'w, 's, &'static Dashboard<Entity>>,
+    pub maps: Query<'w, 's, &'static MapTile>,
 }
 
 impl SchematicParam<'_, '_> {
@@ -101,7 +104,13 @@ impl SchematicParam<'_, '_> {
                     let dashboard = self.dashboards.get(dash.entity).ok()?;
                     Some(Panel::Dashboard(Box::new(dashboard.clone())))
                 }
-                Pane::Map(_) => None,
+                Pane::Map(map_pane) => {
+                    let map = self.maps.get(map_pane.entity).ok()?;
+                    Some(Panel::Map(impeller2_wkt::Map {
+                        eql: map.eql.eql.clone(),
+                        aux: map_pane.entity,
+                    }))
+                }
             },
             Tile::Container(container) => match container {
                 egui_tiles::Container::Tabs(t) => {

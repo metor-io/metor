@@ -1,8 +1,8 @@
 use bevy::{
     ecs::system::{SystemParam, SystemState},
-    prelude::{Commands, Component, Entity, Query, Res, ResMut},
+    prelude::{Component, Entity, Query, Res, ResMut},
 };
-use bevy_egui::{EguiContexts, egui::Ui};
+use bevy_egui::egui::Ui;
 use impeller2_bevy::EntityMap;
 use impeller2_wkt::ComponentValue;
 use walkers::{
@@ -45,7 +45,7 @@ pub struct MapTileWidget<'w, 's> {
     map_states: Query<'w, 's, &'static mut MapTileState>,
     entity_map: Res<'w, EntityMap>,
     component_values: Query<'w, 's, &'static ComponentValue>,
-    selected_object: ResMut<'w, SelectedObject>,
+    _selected_object: ResMut<'w, SelectedObject>,
 }
 
 impl WidgetSystem for MapTileWidget<'_, '_> {
@@ -125,11 +125,6 @@ impl WidgetSystem for MapTileWidget<'_, '_> {
         if response.double_clicked() {
             map_state.map_memory.follow_my_position();
         }
-
-        // // Handle selection
-        // if response.clicked() {
-        //     *state.selected_object = SelectedObject::Map { entity };
-        // }
     }
 }
 

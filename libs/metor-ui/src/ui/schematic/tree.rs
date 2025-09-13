@@ -140,6 +140,7 @@ fn panel(
         Panel::Hierarchy => icons.viewport,
         Panel::SchematicTree => icons.viewport,
         Panel::Dashboard(_) => icons.viewport,
+        Panel::Map(_) => icons.viewport,
     };
     let children = p.children();
     let selected = if p.aux().copied() == selected_object.entity() {
@@ -206,6 +207,7 @@ fn panel(
             Panel::Dashboard(d) => {
                 *selected_object = SelectedObject::DashboardNode { entity: d.aux }
             }
+            Panel::Map(map) => *selected_object = SelectedObject::Map { entity: map.aux },
             _ => {}
         }
     }

@@ -8,6 +8,10 @@ use impeller2_wkt::{DbConfig, Graph, Line3d, Object3D, Panel, Schematic, Viewpor
 use std::time::Duration;
 use std::{collections::BTreeMap, path::Path};
 
+use crate::object_3d::EditableEQL;
+use crate::object_3d::compile_eql_expr;
+use crate::ui::map::MapTile;
+use crate::ui::map::MapTileState;
 use crate::{
     EqlContext,
     object_3d::Object3DState,
@@ -326,6 +330,26 @@ impl LoadSchematicParams<'_, '_> {
                     parent_id,
                     false,
                 )
+            }
+            Panel::Map(map) => {
+                let compiled_expr = self.eql.0.parse_str(&map.eql).ok().map(compile_eql_expr);
+                let entity = self
+                    .commands
+                    .spawn(MapTile {
+                        eql: EditableEQL {
+                            eql: map.eql.clone(),
+                            compiled_expr,
+                        },
+                        label: "Map".to_string(),
+                    })
+                    .insert(MapTileState::new())
+                    .id();
+                let pane = super::tiles::MapPane {
+                    entity,
+                    label: "Map".to_string(),
+                };
+                self.tile_state
+                    .insert_tile(Tile::Pane(Pane::Map(pane)), parent_id, false)
             }
         }
     }

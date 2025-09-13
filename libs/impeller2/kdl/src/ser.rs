@@ -46,6 +46,7 @@ fn serialize_panel<T>(panel: &Panel<T>) -> KdlNode {
         Panel::Hierarchy => KdlNode::new("hierarchy"),
         Panel::SchematicTree => KdlNode::new("schematic_tree"),
         Panel::Dashboard(dashboard) => serialize_dashboard(dashboard),
+        Panel::Map(map) => serialize_map(map),
     }
 }
 
@@ -310,6 +311,15 @@ fn serialize_color_to_node(node: &mut KdlNode, color: &Color) {
 
 fn serialize_material_to_node(node: &mut KdlNode, material: &Material) {
     serialize_color_to_node(node, &material.base_color);
+}
+
+fn serialize_map<T>(map: &Map<T>) -> KdlNode {
+    let mut node = KdlNode::new("map");
+
+    // Add the EQL query as the first unnamed entry
+    node.entries_mut().push(KdlEntry::new(map.eql.clone()));
+
+    node
 }
 
 fn serialize_dashboard<T>(dashboard: &Dashboard<T>) -> KdlNode {

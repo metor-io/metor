@@ -4,9 +4,15 @@ use bevy::{
 };
 use egui::{Color32, CornerRadius, RichText, Stroke};
 
-use crate::ui::{colors::get_scheme, map::MapTile, widgets::WidgetSystem};
+use crate::{
+    EqlContext,
+    ui::{
+        colors::get_scheme, label, map::MapTile, theme::configure_input_with_border,
+        utils::MarginSides, widgets::WidgetSystem,
+    },
+};
 
-use crate::{EqlContext, object_3d::compile_eql_expr};
+use super::eql_textfield;
 
 #[derive(SystemParam)]
 pub struct InspectorMap<'w, 's> {
@@ -29,78 +35,34 @@ impl WidgetSystem for InspectorMap<'_, '_> {
             return;
         };
 
-        let style = ui.style_mut();
-        style.visuals.widgets.active.corner_radius = CornerRadius::ZERO;
-        style.visuals.widgets.hovered.corner_radius = CornerRadius::ZERO;
-        style.visuals.widgets.open.corner_radius = CornerRadius::ZERO;
+        ui.spacing_mut().item_spacing.y = 8.0;
 
-        style.visuals.widgets.active.fg_stroke = Stroke::new(0.0, Color32::TRANSPARENT);
-        style.visuals.widgets.active.bg_stroke = Stroke::new(0.0, Color32::TRANSPARENT);
-        style.visuals.widgets.hovered.fg_stroke = Stroke::new(0.0, Color32::TRANSPARENT);
-        style.visuals.widgets.hovered.bg_stroke = Stroke::new(0.0, Color32::TRANSPARENT);
-        style.visuals.widgets.open.fg_stroke = Stroke::new(0.0, Color32::TRANSPARENT);
-        style.visuals.widgets.open.bg_stroke = Stroke::new(0.0, Color32::TRANSPARENT);
-
-        style.spacing.button_padding = [16.0, 16.0].into();
-
-        style.visuals.widgets.active.bg_fill = get_scheme().bg_secondary;
-        style.visuals.widgets.open.bg_fill = get_scheme().bg_secondary;
-        style.visuals.widgets.inactive.bg_fill = get_scheme().bg_secondary;
-        style.visuals.widgets.hovered.bg_fill = get_scheme().bg_secondary;
-
-        ui.add(
-            egui::Label::new(
-                RichText::new("MAP LABEL")
-                    .color(get_scheme().text_tertiary)
-                    .size(12.),
-            )
-            .selectable(false),
-        );
-        ui.add_space(16.);
-
-        ui.add_sized(
-            egui::vec2(ui.available_width(), 50.0),
-            egui::TextEdit::singleline(&mut tile.label).margin(egui::Margin::same(16)),
-        );
-        ui.add_space(32.);
-
-        ui.add(
-            egui::Label::new(
-                RichText::new("EQL EXPRESSION")
-                    .color(get_scheme().text_tertiary)
-                    .size(12.),
-            )
-            .selectable(false),
-        );
-        ui.add_space(16.);
-
-        let mut eql_text = tile.eql.eql.clone();
-        let response = ui.add_sized(
-            egui::vec2(ui.available_width(), 100.0),
-            egui::TextEdit::multiline(&mut eql_text)
-                .margin(egui::Margin::same(16))
-                .desired_width(0.0),
+        label::editable_label_with_buttons(
+            ui,
+            [],
+            &mut tile.label,
+            get_scheme().text_primary,
+            egui::Margin::same(0).top(10.0).bottom(14.0),
         );
 
-        if response.changed() {
-            tile.eql.eql = eql_text.clone();
-            // Recompile the EQL expression
-            tile.eql.compiled_expr = state
-                .eql_ctx
-                .0
-                .parse_str(&eql_text)
-                .ok()
-                .map(compile_eql_expr);
-        }
+        egui::Frame::NONE.show(ui, |ui| {
+            ui.label(
+                egui::RichText::new("EQL Expression (lat, lon)").color(get_scheme().text_secondary),
+            );
+            configure_input_with_border(ui.style_mut());
 
-        ui.add_space(8.);
-        ui.add(
-            egui::Label::new(
-                RichText::new("Enter an EQL expression that evaluates to lat,lon pairs")
-                    .color(get_scheme().text_tertiary)
-                    .size(10.),
-            )
-            .selectable(false),
-        );
+            let query_res = eql_textfield(ui, true, &state.eql_ctx.0, &mut tile.eql.eql);
+
+            if query_res.changed() {
+                match state.eql_ctx.0.parse_str(&tile.eql.eql) {
+                    Ok(expr) => {
+                        tile.eql.compiled_expr = Some(crate::object_3d::compile_eql_expr(expr));
+                    }
+                    Err(err) => {
+                        ui.colored_label(get_scheme().error, err.to_string());
+                    }
+                }
+            }
+        });
     }
 }

@@ -32,7 +32,9 @@ fn parse_schematic_elem(node: &KdlNode, src: &str) -> Result<SchematicElem, KdlS
     match node.name().value() {
         "tabs" | "hsplit" | "vsplit" | "viewport" | "graph" | "component_monitor"
         | "action_pane" | "query_table" | "query_plot" | "inspector" | "hierarchy"
-        | "schematic_tree" | "dashboard" => Ok(SchematicElem::Panel(parse_panel(node, src)?)),
+        | "schematic_tree" | "dashboard" | "map" => {
+            Ok(SchematicElem::Panel(parse_panel(node, src)?))
+        }
         "object_3d" => Ok(SchematicElem::Object3d(parse_object_3d(node, src)?)),
         "line_3d" => Ok(SchematicElem::Line3d(parse_line_3d(node, src)?)),
         _ => Err(KdlSchematicError::UnknownNode {
@@ -66,6 +68,7 @@ fn parse_panel(node: &KdlNode, src: &str) -> Result<Panel, KdlSchematicError> {
         "hierarchy" => Ok(Panel::Hierarchy),
         "schematic_tree" => Ok(Panel::SchematicTree),
         "dashboard" => parse_dashboard(node),
+        "map" => parse_map(node, src),
         _ => Err(KdlSchematicError::UnknownNode {
             node_type: node.name().to_string(),
             src: src.to_string(),
@@ -540,6 +543,23 @@ fn parse_dashboard(node: &KdlNode) -> Result<Panel, KdlSchematicError> {
     let root = parse_dashboard_node(node)?;
 
     Ok(Panel::Dashboard(Box::new(Dashboard { root, aux: () })))
+}
+
+fn parse_map(node: &KdlNode, src: &str) -> Result<Panel, KdlSchematicError> {
+    let eql = node
+        .entries()
+        .iter()
+        .find(|e| e.name().is_none())
+        .and_then(|e| e.value().as_string())
+        .ok_or_else(|| KdlSchematicError::MissingProperty {
+            property: "eql".to_string(),
+            node: "map".to_string(),
+            src: src.to_string(),
+            span: node.span(),
+        })?
+        .to_string();
+
+    Ok(Panel::Map(Map { eql, aux: () }))
 }
 
 fn parse_dashboard_node(node: &KdlNode) -> Result<DashboardNode<()>, KdlSchematicError> {

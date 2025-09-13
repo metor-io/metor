@@ -66,6 +66,7 @@ pub enum Panel<T = ()> {
     Hierarchy,
     SchematicTree,
     Dashboard(Box<Dashboard<T>>),
+    Map(Map<T>),
 }
 
 impl<T> Panel<T> {
@@ -84,6 +85,7 @@ impl<T> Panel<T> {
             Panel::Hierarchy => "Hierarchy",
             Panel::SchematicTree => "Tree",
             Panel::Dashboard(d) => d.root.label.as_deref().unwrap_or("Dashboard"),
+            Panel::Map(_) => "Map",
         }
     }
 
@@ -127,6 +129,7 @@ impl<T> Panel<T> {
             Panel::Inspector => Panel::Inspector,
             Panel::Viewport(v) => Panel::Viewport(v.map_aux(f)),
             Panel::Dashboard(d) => Panel::Dashboard(Box::new(d.map_aux(f))),
+            Panel::Map(m) => Panel::Map(m.map_aux(f)),
         }
     }
 
@@ -136,6 +139,7 @@ impl<T> Panel<T> {
             Panel::QueryPlot(query_plot) => Some(&query_plot.aux),
             Panel::Viewport(v) => Some(&v.aux),
             Panel::Dashboard(d) => Some(&d.aux),
+            Panel::Map(m) => Some(&m.aux),
             _ => None,
         }
     }
@@ -699,6 +703,32 @@ impl Val {
             Val::Vh(v) => v,
             Val::VMin(v) => v,
             Val::VMax(v) => v,
+        }
+    }
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+#[serde(bound = "T: Serialize + DeserializeOwned")]
+#[cfg_attr(feature = "bevy", derive(bevy::prelude::Component))]
+pub struct Map<T = ()> {
+    pub eql: String,
+    pub aux: T,
+}
+
+impl<T> Map<T> {
+    pub fn map_aux<U>(&self, f: impl Fn(&T) -> U) -> Map<U> {
+        Map {
+            eql: self.eql.clone(),
+            aux: f(&self.aux),
+        }
+    }
+}
+
+impl Default for Map {
+    fn default() -> Self {
+        Self {
+            eql: String::new(),
+            aux: (),
         }
     }
 }

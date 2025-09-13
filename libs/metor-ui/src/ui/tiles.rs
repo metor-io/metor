@@ -1298,18 +1298,40 @@ impl WidgetSystem for TileLayout<'_, '_> {
                         }
                     }
                     TreeAction::AddSidebars => {
+                        let entity = state_mut
+                            .commands
+                            .spawn(super::schematic::tree::TreeWidgetState::default())
+                            .id();
+                        let schematic_tree = ui_state
+                            .tree
+                            .tiles
+                            .insert_new(Tile::Pane(Pane::SchematicTree(TreePane { entity })));
                         let hierarchy = ui_state.tree.tiles.insert_new(Tile::Pane(Pane::Hierarchy));
                         let inspector = ui_state.tree.tiles.insert_new(Tile::Pane(Pane::Inspector));
+                        let trees =
+                            ui_state
+                                .tree
+                                .tiles
+                                .insert_new(Tile::Container(Container::Tabs(
+                                    egui_tiles::Tabs::new(vec![hierarchy, schematic_tree]),
+                                )));
 
+                        let vertical = egui_tiles::Linear::new(
+                            egui_tiles::LinearDir::Vertical,
+                            vec![trees, inspector],
+                        );
+                        let vertical = ui_state
+                            .tree
+                            .tiles
+                            .insert_new(Tile::Container(Container::Linear(vertical)));
                         let mut linear = egui_tiles::Linear::new(
                             egui_tiles::LinearDir::Horizontal,
-                            vec![hierarchy, inspector],
+                            vec![vertical],
                         );
                         if let Some(root) = ui_state.tree.root() {
                             linear.children.insert(1, root);
-                            linear.shares.set_share(hierarchy, 0.2);
-                            linear.shares.set_share(root, 0.6);
-                            linear.shares.set_share(inspector, 0.2);
+                            linear.shares.set_share(vertical, 0.2);
+                            linear.shares.set_share(root, 0.8);
                         }
                         let root = ui_state
                             .tree
