@@ -702,6 +702,9 @@ pub fn auto_y_bounds(
                 if let gpu::LineMut::Timeseries(line) = line {
                     let summary = line.data.range_summary(selected_range.0.clone());
                     if let Some(min) = summary.min {
+                        if min.is_infinite() {
+                            continue;
+                        }
                         if let Some(y_min) = &mut y_min {
                             *y_min = y_min.min(min);
                         } else {
@@ -709,6 +712,9 @@ pub fn auto_y_bounds(
                         }
                     }
                     if let Some(max) = summary.max {
+                        if max.is_infinite() {
+                            continue;
+                        }
                         if let Some(y_max) = &mut y_max {
                             *y_max = y_max.max(max);
                         } else {
@@ -718,8 +724,13 @@ pub fn auto_y_bounds(
                 }
             }
 
-            graph_state.y_range =
-                y_min.unwrap_or_default() as f64..y_max.unwrap_or_default() as f64;
+            let mut y_min = y_min.unwrap_or_default() as f64;
+            let mut y_max = y_max.unwrap_or_default() as f64;
+            if y_min == y_max {
+                y_min -= 1.0;
+                y_max += 1.0;
+            }
+            graph_state.y_range = y_min..y_max;
         }
     }
 }
