@@ -1031,10 +1031,15 @@ impl<D: Clone + BoundOrd + Immutable + IntoBytes + Debug> LineTree<D> {
             .expect("no write buf");
         let (chunk_count, index_count) = self.draw_index_count(line_visible_range.clone());
         let desired_index_len = INDEX_BUFFER_LEN.min(pixel_width * 4);
-        let step = (index_count.div_ceil(desired_index_len - 2 * chunk_count)).max(1);
+        let step = (index_count.div_ceil(desired_index_len - 6 * chunk_count)).max(1);
         let mut view = &mut view[..];
         let mut count = 0;
-        for chunk in self.draw_index_chunk_iter(line_visible_range) {
+        let chunk_step = (chunk_count * 6).div_ceil(desired_index_len).max(1);
+
+        for chunk in self
+            .draw_index_chunk_iter(line_visible_range)
+            .step_by(chunk_step)
+        {
             view = append_u32(view, 0);
             let end = chunk.clone().into_index_iter().last();
             let mut index_iter = chunk.into_index_iter();
@@ -1053,6 +1058,7 @@ impl<D: Clone + BoundOrd + Immutable + IntoBytes + Debug> LineTree<D> {
             view = append_u32(view, 0);
             count += 2;
         }
+
         count
     }
 
