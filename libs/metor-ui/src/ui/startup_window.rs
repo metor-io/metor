@@ -1,9 +1,12 @@
 use bevy::{
-    ecs::system::SystemParam,
+    ecs::{schedule::ScheduleLabel, system::SystemParam},
     prelude::*,
-    window::{EnabledButtons, PresentMode, PrimaryWindow, WindowResolution, WindowTheme},
+    window::{
+        EnabledButtons, PresentMode, PrimaryWindow, WindowRef, WindowResolution, WindowTheme,
+    },
 };
-use bevy_egui::EguiContexts;
+use bevy_egui::{EguiContexts, EguiMultipassSchedule};
+use bevy_render::camera::RenderTarget;
 use egui::{Color32, CornerRadius, RichText, Stroke, load::SizedTexture};
 use hifitime::Epoch;
 use impeller2_bevy::{
@@ -32,6 +35,12 @@ use super::{
 #[derive(Component)]
 pub struct StartupWindow;
 
+#[derive(ScheduleLabel, Clone, Debug, PartialEq, Eq, Hash)]
+pub struct StartupWindowContextPass;
+
+#[derive(Component)]
+struct StartupCamera;
+
 fn create_startup_window(
     mut commands: Commands,
     status: Res<ThreadConnectionStatus>,
@@ -45,27 +54,38 @@ fn create_startup_window(
             bevy::window::CompositeAlphaMode::Opaque
         };
 
+        let window_id = commands
+            .spawn((
+                Window {
+                    title: "Metor".to_owned(),
+                    resolution: WindowResolution::new(730.0, 470.0),
+                    resize_constraints: WindowResizeConstraints {
+                        min_width: 730.0,
+                        min_height: 470.0,
+                        max_width: 730.0,
+                        max_height: 470.0,
+                    },
+                    present_mode: PresentMode::AutoVsync,
+                    window_theme: Some(WindowTheme::Dark),
+                    enabled_buttons: EnabledButtons {
+                        minimize: false,
+                        maximize: false,
+                        close: true,
+                    },
+                    composite_alpha_mode,
+                    ..Default::default()
+                },
+                StartupWindow,
+            ))
+            .id();
         commands.spawn((
-            Window {
-                title: "Metor".to_owned(),
-                resolution: WindowResolution::new(730.0, 470.0),
-                resize_constraints: WindowResizeConstraints {
-                    min_width: 730.0,
-                    min_height: 470.0,
-                    max_width: 730.0,
-                    max_height: 470.0,
-                },
-                present_mode: PresentMode::AutoVsync,
-                window_theme: Some(WindowTheme::Dark),
-                enabled_buttons: EnabledButtons {
-                    minimize: false,
-                    maximize: false,
-                    close: true,
-                },
-                composite_alpha_mode,
+            Camera2d::default(),
+            Camera {
+                target: RenderTarget::Window(WindowRef::Entity(window_id)),
                 ..Default::default()
             },
-            StartupWindow,
+            StartupCamera,
+            EguiMultipassSchedule::new(StartupWindowContextPass),
         ));
     } else if let Ok(mut primary) = primary.single_mut() {
         primary.visible = true
@@ -73,7 +93,7 @@ fn create_startup_window(
 }
 
 pub fn add_layouts(world: &mut World) {
-    world.add_root_widget_with::<StartupLayout, With<StartupWindow>>("startup_layout", ());
+    world.add_root_widget_with::<StartupLayout, With<StartupCamera>>("startup_layout", ());
 }
 
 pub struct StartupPlugin;
@@ -81,7 +101,7 @@ pub struct StartupPlugin;
 impl Plugin for StartupPlugin {
     fn build(&self, app: &mut App) {
         app.add_systems(Startup, create_startup_window);
-        app.add_systems(Update, add_layouts);
+        app.add_systems(StartupWindowContextPass, add_layouts);
     }
 }
 

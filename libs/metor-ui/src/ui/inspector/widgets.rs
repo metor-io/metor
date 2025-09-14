@@ -64,7 +64,7 @@ pub fn eql_autocomplete(
         .ctx()
         .input_mut(|i| i.consume_key(Default::default(), egui::Key::Tab));
     let suggestions = eql_context.get_string_suggestions(current_query);
-    let id = ui.next_auto_id();
+    let _id = ui.next_auto_id();
     let suggestion_memory_id = ui.id().with("eql_suggestion_index");
 
     if tab_pressed && !suggestions.is_empty() && query_res.has_focus() {
@@ -85,7 +85,7 @@ pub fn eql_autocomplete(
             }
             ui.memory_mut(|mem| {
                 mem.data.remove::<usize>(suggestion_memory_id);
-                mem.close_popup();
+                //mem.close_popup();
             });
         }
     }
@@ -115,82 +115,67 @@ pub fn eql_autocomplete(
         ui.scope(|ui| {
             configure_combo_box(ui.style_mut());
             ui.style_mut().spacing.menu_margin = egui::Margin::same(4);
-            egui::popup::popup_below_widget(
-                ui,
-                id,
+            let popup = egui::containers::Popup::from_response(
                 &query_res.clone().with_new_rect(query_res.rect.expand(8.0)),
-                egui::PopupCloseBehavior::IgnoreClicks,
-                |ui| {
-                    egui::ScrollArea::vertical()
-                        .max_height(200.)
-                        .show(ui, |ui| {
-                            ui.style_mut().spacing.item_spacing = egui::vec2(0.0, 8.0);
-                            for (i, (suggestion, patch)) in suggestions.iter().enumerate() {
-                                let is_selected = i == selected_index;
-                                let response = if is_selected {
-                                    ui.colored_label(get_scheme().highlight, suggestion)
-                                } else {
-                                    ui.label(suggestion)
-                                };
+            )
+            .open(!suggestions.is_empty());
+            let popup_id = popup.get_id();
+            popup.show(|ui| {
+                egui::ScrollArea::vertical()
+                    .max_height(200.)
+                    .show(ui, |ui| {
+                        ui.style_mut().spacing.item_spacing = egui::vec2(0.0, 8.0);
+                        for (i, (suggestion, patch)) in suggestions.iter().enumerate() {
+                            let is_selected = i == selected_index;
+                            let response = if is_selected {
+                                ui.colored_label(get_scheme().highlight, suggestion)
+                            } else {
+                                ui.label(suggestion)
+                            };
 
-                                // Handle mouse click to apply suggestion
-                                if response.clicked() {
-                                    *current_query = patch.clone();
-                                    ui.memory_mut(|mem| {
-                                        mem.data.remove::<usize>(suggestion_memory_id);
-                                        mem.close_popup();
-                                    });
-                                }
+                            // Handle mouse click to apply suggestion
+                            if response.clicked() {
+                                *current_query = patch.clone();
+                                ui.memory_mut(|mem| {
+                                    mem.data.remove::<usize>(suggestion_memory_id);
+                                    egui::Popup::close_id(ui.ctx(), popup_id);
+                                });
                             }
-                        })
-                },
-            );
-        });
-        if !suggestions.is_empty() {
-            ui.memory_mut(|mem| mem.open_popup(id));
-        } else {
-            ui.memory_mut(|mem| {
-                mem.data.remove::<usize>(suggestion_memory_id);
-                if mem.is_popup_open(id) {
-                    mem.close_popup();
-                }
+                        }
+                    })
             });
-        }
+            // if !suggestions.is_empty() {
+            //     ui.memory_mut(|mem| mem.open_popup(id));
+            // } else {
+            //     ui.memory_mut(|mem| {
+            //         mem.data.remove::<usize>(suggestion_memory_id);
+            //         if mem.is_popup_open(popup_id) {
+            //             egui::Popup::close_id(ui.ctx(), popup_id);
+            //         }
+            //     });
+            // }
+        });
     }
 }
 
-pub fn color_popup(
-    ui: &mut egui::Ui,
-    color: &mut egui::Color32,
-    color_id: egui::Id,
-    pos: egui::Pos2,
-) -> egui::Response {
-    egui::Area::new(color_id)
-        .kind(egui::UiKind::Picker)
-        .order(egui::Order::Foreground)
-        .fixed_pos(pos)
-        .default_width(300.0)
-        .constrain(true)
-        .show(ui.ctx(), |ui| {
-            theme::configure_input_with_border(ui.style_mut());
-            ui.spacing_mut().slider_width = 275.;
-            ui.spacing_mut().button_padding = egui::vec2(6.0, 4.0);
-            ui.spacing_mut().item_spacing = egui::vec2(8.0, 4.0);
+pub fn color_popup(color: &mut egui::Color32) -> impl FnMut(&mut egui::Ui) {
+    |ui: &mut egui::Ui| {
+        theme::configure_input_with_border(ui.style_mut());
+        ui.spacing_mut().slider_width = 275.;
+        ui.spacing_mut().button_padding = egui::vec2(6.0, 4.0);
+        ui.spacing_mut().item_spacing = egui::vec2(8.0, 4.0);
 
-            ui.add_space(8.0);
-            egui::Frame::popup(ui.style()).show(ui, |ui| {
-                ui.horizontal_wrapped(|ui| {
-                    for elem_color in &colors::ALL_COLORS_DARK[..24] {
-                        if ui.add(EColorButton::new(*elem_color)).clicked() {
-                            *color = *elem_color;
-                        }
-                    }
-                });
-                ui.add_space(8.0);
-                color_picker_color32(ui, color, Alpha::OnlyBlend);
-            });
-        })
-        .response
+        ui.add_space(8.0);
+        ui.horizontal_wrapped(|ui| {
+            for elem_color in &colors::ALL_COLORS_DARK[..24] {
+                if ui.add(EColorButton::new(*elem_color)).clicked() {
+                    *color = *elem_color;
+                }
+            }
+        });
+        ui.add_space(8.0);
+        color_picker_color32(ui, color, Alpha::OnlyBlend);
+    }
 }
 
 pub fn search(
@@ -236,24 +221,25 @@ pub fn node_color_picker(ui: &mut egui::Ui, label: &str, color: &mut impeller2_w
             .text_color(get_scheme().text_secondary)
             .left_label(true),
     );
-    let color_id = ui.auto_id_with("color");
-    if res.clicked() {
-        ui.memory_mut(|mem| mem.toggle_popup(color_id));
-    }
-    if ui.memory(|mem| mem.is_popup_open(color_id)) {
-        let popup_response = color_popup(
-            ui,
-            &mut egui_color,
-            color_id,
-            res.rect.right_center() - egui::vec2(128.0, 0.0),
-        );
-        if !res.clicked()
-            && (ui.input(|i| i.key_pressed(egui::Key::Escape))
-                || popup_response.clicked_elsewhere())
-        {
-            ui.memory_mut(|mem| mem.close_popup());
-        }
-    }
+    egui::containers::Popup::context_menu(&res).show(color_popup(&mut egui_color));
+    //let color_id = ui.auto_id_with("color");
+    // if res.clicked() {
+    //     ui.memory_mut(|mem| mem.toggle_popup(color_id));
+    // }
+    // if ui.memory(|mem| mem.is_popup_open(color_id)) {
+    //     let popup_response = color_popup(
+    //         ui,
+    //         &mut egui_color,
+    //         color_id,
+    //         res.rect.right_center() - egui::vec2(128.0, 0.0),
+    //     );
+    //     if !res.clicked()
+    //         && (ui.input(|i| i.key_pressed(egui::Key::Escape))
+    //             || popup_response.clicked_elsewhere())
+    //     {
+    //         ui.memory_mut(|mem| mem.close_popup());
+    //     }
+    // }
 
     let new_color = impeller2_wkt::Color::from_color32(egui_color);
     let changed = new_color != *color;

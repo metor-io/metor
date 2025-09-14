@@ -9,7 +9,7 @@ use bevy::{
     window::PrimaryWindow,
 };
 use bevy_egui::{
-    EguiContext, EguiContexts,
+    EguiContext, EguiContexts, EguiPrimaryContextPass, PrimaryEguiContext,
     egui::{self, Color32, Label, Margin, RichText},
 };
 
@@ -194,11 +194,17 @@ impl Plugin for UiPlugin {
             .add_systems(Update, timeline_slider::sync_ui_tick.before(render_layout))
             .add_systems(Update, actions::spawn_lua_actor)
             .add_systems(Update, shortcuts)
-            .add_systems(Update, render_layout)
+            .add_systems(bevy_egui::EguiPrimaryContextPass, render_layout)
             .add_systems(Update, sync_hdr)
             .add_systems(Update, tiles::shortcuts)
-            .add_systems(Update, set_camera_viewport.after(render_layout))
-            .add_systems(Update, sync_camera_grid_cell.after(render_layout))
+            .add_systems(
+                bevy_egui::EguiPrimaryContextPass,
+                set_camera_viewport.after(render_layout),
+            )
+            .add_systems(
+                bevy_egui::EguiPrimaryContextPass,
+                sync_camera_grid_cell.after(render_layout),
+            )
             .add_systems(Update, query_plot::auto_bounds)
             .add_systems(Update, dashboard::update_nodes)
             .add_plugins(SchematicPlugin)
@@ -472,7 +478,10 @@ impl RootWidgetSystem for MainLayout<'_, '_> {
             icon_close: contexts.add_image(images.icon_close.clone_weak()),
         };
 
-        world.add_root_widget_with::<Titlebar, With<PrimaryWindow>>("titlebar", titlebar_icons);
+        world.add_root_widget_with::<Titlebar, With<bevy_egui::PrimaryEguiContext>>(
+            "titlebar",
+            titlebar_icons,
+        );
 
         #[cfg(not(target_family = "wasm"))]
         world.add_root_widget::<status_bar::StatusBar>("status_bar");
@@ -570,7 +579,7 @@ struct CameraViewportQuery {
 }
 
 fn set_camera_viewport(
-    window: Query<(&Window, &bevy_egui::EguiContextSettings), With<PrimaryWindow>>,
+    window: Query<&Window, With<PrimaryWindow>>,
     mut main_camera_query: Query<CameraViewportQuery, With<MainCamera>>,
 ) {
     for CameraViewportQueryItem {
@@ -590,10 +599,10 @@ fn set_camera_viewport(
             continue;
         };
         camera.is_active = true;
-        let Some((window, egui_settings)) = window.iter().next() else {
+        let Some(window) = window.iter().next() else {
             continue;
         };
-        let scale_factor = window.scale_factor() * egui_settings.scale_factor;
+        let scale_factor = window.scale_factor();
         let viewport_pos = available_rect.left_top().to_vec2() * scale_factor;
         let viewport_size = available_rect.size() * scale_factor;
         if available_rect.size().x > window.width() || available_rect.size().y > window.height() {

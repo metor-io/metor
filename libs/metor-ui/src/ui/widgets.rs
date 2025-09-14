@@ -5,14 +5,13 @@ use bevy::{
         world::{Mut, World},
     },
     prelude::Resource,
-    window::PrimaryWindow,
 };
-use bevy_egui::{EguiContext, egui};
+use bevy_egui::{EguiContext, PrimaryEguiContext, egui};
 use std::collections::HashMap;
 
 pub trait RootWidgetSystemExt {
     fn add_root_widget<S: RootWidgetSystem<Args = ()> + 'static>(&mut self, id: &str) -> S::Output {
-        self.add_root_widget_with::<S, With<PrimaryWindow>>(id, ())
+        self.add_root_widget_with::<S, With<PrimaryEguiContext>>(id, ())
             .expect("missing window")
     }
 

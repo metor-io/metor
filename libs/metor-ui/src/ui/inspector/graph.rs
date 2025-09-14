@@ -17,7 +17,7 @@ use crate::{
     ui::{
         SettingModal, SettingModalState,
         button::{EButton, ECheckboxButton},
-        colors::{EColor, get_scheme},
+        colors::get_scheme,
         inspector::{color_popup, eql_autocomplete, query},
         label::{self, label_with_buttons},
         plot::GraphState,
@@ -226,24 +226,24 @@ impl WidgetSystem for InspectorGraph<'_, '_> {
                     }
                     ui.separator();
                     ui.label(egui::RichText::new("Color").color(get_scheme().text_secondary));
-                    let color_id = ui.auto_id_with("color");
-                    let btn_resp = ui.add(EButton::new("Set Color"));
-                    if btn_resp.clicked() {
-                        ui.memory_mut(|m| m.toggle_popup(color_id));
-                    }
+                    let _color_id = ui.auto_id_with("color");
+                    let _btn_resp = ui.add(EButton::new("Set Color"));
+                    // if btn_resp.clicked() {
+                    //     ui.memory_mut(|m| m.toggle_popup(color_id));
+                    // }
 
-                    if ui.memory(|mem| mem.is_popup_open(color_id)) {
-                        let mut color = query_plot.data.color.into_color32();
-                        let popup_response =
-                            color_popup(ui, &mut color, color_id, btn_resp.rect.min);
-                        if !btn_resp.clicked()
-                            && (ui.input(|i| i.key_pressed(egui::Key::Escape))
-                                || popup_response.clicked_elsewhere())
-                        {
-                            ui.memory_mut(|mem| mem.close_popup());
-                        }
-                        query_plot.data.color = impeller2_wkt::Color::from_color32(color);
-                    }
+                    // if ui.memory(|mem| mem.is_popup_open(color_id)) {
+                    //     let mut color = query_plot.data.color.into_color32();
+                    //     let popup_response =
+                    //         color_popup(ui, &mut color, color_id, btn_resp.rect.min);
+                    //     if !btn_resp.clicked()
+                    //         && (ui.input(|i| i.key_pressed(egui::Key::Escape))
+                    //             || popup_response.clicked_elsewhere())
+                    //     {
+                    //         ui.memory_mut(|mem| mem.close_popup());
+                    //     }
+                    //     query_plot.data.color = impeller2_wkt::Color::from_color32(color);
+                    // }
                 });
         } else {
             let mut remove_list: SmallVec<[ComponentPath; 1]> = SmallVec::new();
@@ -339,19 +339,20 @@ fn component_value(
             if value_toggle.clicked() {
                 *enabled = !*enabled;
             }
-            let color_id = ui.auto_id_with("color");
-            if value_toggle.secondary_clicked() {
-                ui.memory_mut(|mem| mem.toggle_popup(color_id));
-            }
-            if ui.memory(|mem| mem.is_popup_open(color_id)) {
-                let popup_response = color_popup(ui, color, color_id, value_toggle.rect.min);
-                if !value_toggle.secondary_clicked()
-                    && (ui.input(|i| i.key_pressed(egui::Key::Escape))
-                        || popup_response.clicked_elsewhere())
-                {
-                    ui.memory_mut(|mem| mem.close_popup());
-                }
-            }
+            let _color_id = ui.auto_id_with("color");
+            egui::containers::Popup::context_menu(&value_toggle).show(color_popup(color));
+            // if value_toggle.secondary_clicked() {
+            //     ui.memory_mut(|mem| mem.toggle_popup(color_id));
+            // }
+            // if ui.memory(|mem| mem.is_popup_open(color_id)) {
+            //     let popup_response = color_popup(ui, color, color_id, value_toggle.rect.min);
+            //     if !value_toggle.secondary_clicked()
+            //         && (ui.input(|i| i.key_pressed(egui::Key::Escape))
+            //             || popup_response.clicked_elsewhere())
+            //     {
+            //         ui.memory_mut(|mem| mem.close_popup());
+            //     }
+            // }
         }
     });
 }

@@ -172,7 +172,8 @@ impl Plugin for EditorPlugin {
             .add_plugins(bevy_editor_cam::DefaultEditorCamPlugins)
             .add_plugins(EmbeddedAssetPlugin)
             .add_plugins(EguiPlugin {
-                enable_multipass_for_primary_context: false,
+                ui_render_order: bevy_egui::UiRenderOrder::BevyUiAboveEgui,
+                ..Default::default()
             })
             .add_plugins(bevy_infinite_grid::InfiniteGridPlugin)
             .add_plugins(NavigationGizmoPlugin)

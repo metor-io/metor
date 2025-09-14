@@ -147,23 +147,16 @@ impl WidgetSystem for TimelineControls<'_> {
                                     ));
 
                                     if res.clicked() {
-                                        ui.memory_mut(|mem| mem.toggle_popup(popup_id));
+                                        egui::containers::Popup::toggle_id(ui.ctx(), popup_id);
                                     }
                                     configure_combo_box(ui.style_mut());
                                     ui.style_mut().spacing.interact_size.y = 28.0;
                                     ui.style_mut().spacing.button_padding = [8.0, 0.0].into();
-                                    egui::popup::popup_above_or_below_widget(
-                                        ui,
-                                        popup_id,
-                                        &res,
-                                        egui::containers::AboveOrBelow::Above,
-                                        egui::popup::PopupCloseBehavior::CloseOnClickOutside,
-                                        time_range_window(
-                                            &mut behavior,
-                                            earliest_timestamp.0,
-                                            max_tick.0,
-                                        ),
-                                    );
+                                    egui::containers::Popup::menu(&res).show(time_range_window(
+                                        &mut behavior,
+                                        earliest_timestamp.0,
+                                        max_tick.0,
+                                    ));
 
                                     // TIME
 

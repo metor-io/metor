@@ -2,7 +2,6 @@ use bevy::{
     ecs::system::SystemParam,
     prelude::{Entity, Query},
 };
-use egui::{Color32, CornerRadius, RichText, Stroke};
 
 use crate::{
     EqlContext,

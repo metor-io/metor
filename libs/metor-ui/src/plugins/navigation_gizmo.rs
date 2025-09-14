@@ -341,17 +341,17 @@ pub fn sync_nav_camera(
 }
 
 pub fn set_camera_viewport(
-    window: Query<(&Window, &bevy_egui::EguiContextSettings)>,
+    window: Query<&Window>,
     _contexts: EguiContexts,
     mut nav_camera_query: Query<(&mut Camera, &NavGizmoParent)>,
     main_camera_query: Query<&mut Camera, Without<NavGizmoParent>>,
 ) {
     let margin = 8.0;
     let side_length = 128.0;
-    let Some((window, egui_settings)) = window.iter().next() else {
+    let Some(window) = window.iter().next() else {
         return;
     };
-    let scale_factor = window.scale_factor() * egui_settings.scale_factor;
+    let scale_factor = window.scale_factor();
 
     let margin = margin * scale_factor;
     let side_length = side_length * scale_factor;
