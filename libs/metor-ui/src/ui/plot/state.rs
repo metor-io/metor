@@ -49,6 +49,7 @@ pub struct GraphState {
     pub x_range: Range<f64>,
     pub widget_width: f64,
     pub visible_range: LineVisibleRange,
+    pub right_drag_selection: Option<egui::Pos2>,
 }
 
 impl GraphBundle {
@@ -76,6 +77,7 @@ impl GraphBundle {
             auto_x_range: true,
             widget_width: 1920.0,
             visible_range: LineVisibleRange(Timestamp(i64::MIN)..Timestamp(i64::MAX)),
+            right_drag_selection: None,
         };
         GraphBundle {
             camera: Camera {

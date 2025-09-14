@@ -1,6 +1,9 @@
 use crate::{
     editor_cam_touch::*,
-    ui::{theme::corner_radius_sm, utils::Shrink4},
+    ui::{
+        theme::{corner_radius_sm, corner_radius_xs},
+        utils::Shrink4,
+    },
 };
 use bevy::{
     asset::Assets,
@@ -373,6 +376,59 @@ impl TimeseriesPlot {
             });
     }
 
+    /// Handle right-click drag selection for changing plot bounds
+    fn handle_right_click_drag_selection(
+        &self,
+        ui: &mut egui::Ui,
+        response: &egui::Response,
+        graph_state: &mut GraphState,
+        time_range_behavior: &mut TimeRangeBehavior,
+    ) {
+        let right_button_down = ui.input(|i| i.pointer.button_down(egui::PointerButton::Secondary));
+        let right_button_released =
+            ui.input(|i| i.pointer.button_released(egui::PointerButton::Secondary));
+        let pointer_pos = ui.input(|i| i.pointer.latest_pos());
+
+        let Some(current_pos) = pointer_pos else {
+            return;
+        };
+        if let Some(start_pos) = graph_state.right_drag_selection {
+            let rect = egui::Rect::from_two_pos(start_pos, current_pos);
+            ui.painter().rect(
+                rect,
+                corner_radius_xs(),
+                get_scheme().text_secondary.opacity(0.05),
+                egui::Stroke::new(1.0, get_scheme().text_secondary.opacity(0.6)),
+                egui::StrokeKind::Inside,
+            );
+
+            if right_button_released {
+                if rect.width() > 10.0 && rect.height() > 10.0 {
+                    let rect = rect.expand(2.0);
+                    let start_value = self.bounds.screen_pos_to_value(self.rect, rect.max);
+                    let stop_value = self.bounds.screen_pos_to_value(self.rect, rect.min);
+
+                    graph_state.zoom_factor = Vec2::new(1.0, 1.0);
+                    graph_state.pan_offset = Vec2::ZERO;
+
+                    let start = Timestamp(stop_value.x as i64 + self.earliest_timestamp.0);
+                    let end = Timestamp(start_value.x as i64 + self.earliest_timestamp.0);
+                    *time_range_behavior = TimeRangeBehavior {
+                        start: Offset::Fixed(start),
+                        end: Offset::Fixed(end),
+                    };
+
+                    graph_state.y_range = start_value.y..stop_value.y;
+                    graph_state.auto_y_range = false;
+                }
+
+                graph_state.right_drag_selection = None;
+            }
+        } else if right_button_down && response.hovered() && self.rect.contains(current_pos) {
+            graph_state.right_drag_selection = Some(current_pos);
+        }
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub fn render(
         &self,
@@ -387,19 +443,25 @@ impl TimeseriesPlot {
         let response = ui.allocate_rect(self.rect, egui::Sense::click_and_drag());
         let pointer_pos = ui.input(|i| i.pointer.latest_pos());
 
-        response.context_menu(|ui| {
-            if ui.button("Set Time Range to Viewport Bounds").clicked() {
-                let start = Timestamp((self.bounds.min_x as i64) + self.earliest_timestamp.0);
-                let end = Timestamp((self.bounds.max_x as i64) + self.earliest_timestamp.0);
-                graph_state.zoom_factor = Vec2::new(1.0, 1.0);
-                graph_state.pan_offset = Vec2::ZERO;
-                *time_range_behavior = TimeRangeBehavior {
-                    start: Offset::Fixed(start),
-                    end: Offset::Fixed(end),
-                };
-                ui.close_menu();
-            }
-        });
+        // Handle right-click drag selection
+        self.handle_right_click_drag_selection(ui, &response, graph_state, time_range_behavior);
+
+        // Only show context menu if not doing right-click drag
+        if graph_state.right_drag_selection.is_none() {
+            response.context_menu(|ui| {
+                if ui.button("Set Time Range to Viewport Bounds").clicked() {
+                    let start = Timestamp((self.bounds.min_x as i64) + self.earliest_timestamp.0);
+                    let end = Timestamp((self.bounds.max_x as i64) + self.earliest_timestamp.0);
+                    graph_state.zoom_factor = Vec2::new(1.0, 1.0);
+                    graph_state.pan_offset = Vec2::ZERO;
+                    *time_range_behavior = TimeRangeBehavior {
+                        start: Offset::Fixed(start),
+                        end: Offset::Fixed(end),
+                    };
+                    ui.close_menu();
+                }
+            });
+        }
 
         let mut font_id = egui::TextStyle::Monospace.resolve(ui.style());
 
@@ -674,7 +736,11 @@ pub fn sync_bounds(
     let (y_min, y_max) = (graph_state.y_range.start, graph_state.y_range.end);
     let outer_ratio = (rect.size() / inner_rect.size()).as_dvec2();
     let pan_offset = graph_state.pan_offset.as_dvec2() * DVec2::new(-1.0, 1.0);
-    PlotBounds::from_lines(&selected_range, earliest_timestamp, y_min, y_max)
+    let mut bounds = PlotBounds::from_lines(&selected_range, earliest_timestamp, y_min, y_max);
+    if graph_state.auto_y_range {
+        bounds = bounds.round_y();
+    }
+    bounds
         .zoom_at(outer_ratio, DVec2::new(1.0, 0.5)) // zoom the bounds out so the graph takes up the entire screen
         .offset_by_norm(pan_offset) // pan the bounds by the amount the cursor has moved
         .zoom(graph_state.zoom_factor.as_dvec2()) // zoom the bounds based on the current zoom factor
@@ -864,9 +930,13 @@ impl PlotBounds {
             (baseline.end.0 - earliest_timestamp.0) as f64,
         );
 
-        let min_y = sigfig_round(min_y, 2);
-        let max_y = sigfig_round(max_y, 2);
         Self::new(min_x, min_y, max_x, max_y)
+    }
+
+    pub fn round_y(mut self) -> Self {
+        self.min_y = sigfig_round(self.min_y, 2);
+        self.max_y = sigfig_round(self.max_y, 2);
+        self
     }
 
     pub fn min(&self) -> DVec2 {
@@ -970,7 +1040,7 @@ impl PlotBounds {
     }
 
     pub fn screen_pos_to_value(&self, screen_rect: egui::Rect, pos: egui::Pos2) -> DVec2 {
-        let offset = (pos - screen_rect.min).as_dvec2();
+        let offset = egui::vec2(pos.x - screen_rect.min.x, screen_rect.max.y - pos.y).as_dvec2();
         let screen_to_value = self.size() / screen_rect.size().as_dvec2();
         self.min() + offset * screen_to_value
     }
