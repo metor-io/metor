@@ -9,7 +9,7 @@ use bevy_egui::{EguiContexts, EguiMultipassSchedule};
 use bevy_render::camera::RenderTarget;
 use egui::{Color32, CornerRadius, RichText, Stroke, load::SizedTexture};
 use hifitime::Epoch;
-use impeller2_bevy::{
+use metor_proto_bevy::{
     ConnectionAddr, ConnectionStatus, CurrentStreamId, PacketRx, PacketTx, ThreadConnectionStatus,
     spawn_tcp_connect,
 };
@@ -178,7 +178,7 @@ impl std::fmt::Display for ConnectError {
 impl StartupLayout<'_, '_> {
     fn connect(&mut self, addr: SocketAddr, reconnect: bool) -> ThreadConnectionStatus {
         let (packet_tx, packet_rx, outgoing_packet_rx, incoming_packet_tx) =
-            impeller2_bevy::channels();
+            metor_proto_bevy::channels();
         let stream_id = fastrand::u64(..);
         let status = spawn_tcp_connect(
             addr,

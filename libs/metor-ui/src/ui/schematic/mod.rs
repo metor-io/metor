@@ -11,7 +11,7 @@ use crate::{
 };
 use bevy::{ecs::system::SystemParam, prelude::*};
 use egui_tiles::{Tile, TileId};
-use impeller2_wkt::{
+use metor_proto_wkt::{
     ActionPane, ComponentMonitor, ComponentPath, Dashboard, Line3d, Panel, Schematic,
     SchematicElem, Split, Viewport,
 };
@@ -67,7 +67,7 @@ impl SchematicParam<'_, '_> {
                         // TODO(sphw): add back color support
                         eql.push(format!("{}[{}]", path, index));
                     }
-                    Some(Panel::Graph(impeller2_wkt::Graph {
+                    Some(Panel::Graph(metor_proto_wkt::Graph {
                         eql: eql.join(","),
                         name: Some(graph_state.label.clone()),
                         graph_type: graph_state.graph_type,
@@ -106,7 +106,7 @@ impl SchematicParam<'_, '_> {
                 }
                 Pane::Map(map_pane) => {
                     let map = self.maps.get(map_pane.entity).ok()?;
-                    Some(Panel::Map(impeller2_wkt::Map {
+                    Some(Panel::Map(metor_proto_wkt::Map {
                         eql: map.eql.eql.clone(),
                         aux: map_pane.entity,
                     }))

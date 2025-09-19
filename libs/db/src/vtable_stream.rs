@@ -8,15 +8,15 @@ use std::{
     time::Instant,
 };
 
-use impeller2::{
+use metor_proto::{
     types::{
         ComponentView, IntoLenPacket, LenPacket, Msg, PACKET_HEADER_LEN, PacketId, PrimType,
         RequestId, Timestamp,
     },
     vtable::{Op, RealizedComponent, RealizedOp, VTable},
 };
-use impeller2_stellar::PacketSink;
-use impeller2_wkt::{ComponentValue, FixedRateBehavior, FixedRateOp, MeanOp, VTableMsg};
+use metor_proto_stellar::PacketSink;
+use metor_proto_wkt::{ComponentValue, FixedRateBehavior, FixedRateOp, MeanOp, VTableMsg};
 use stellarator::{
     io::AsyncWrite,
     rent,
@@ -91,7 +91,7 @@ pub async fn handle_vtable_stream<A: AsyncWrite + 'static>(
                     let RealizedOp::Component(RealizedComponent { component_id }) =
                         vtable.realize(ext.arg, None)?
                     else {
-                        return Err(Error::Impeller(impeller2::error::Error::InvalidOp));
+                        return Err(Error::Impeller(metor_proto::error::Error::InvalidOp));
                     };
                     let component = db
                         .with_state(|s| s.get_component(component_id).cloned())
@@ -109,7 +109,7 @@ pub async fn handle_vtable_stream<A: AsyncWrite + 'static>(
                     );
                     break 'find;
                 }
-                _ => return Err(Error::Impeller(impeller2::error::Error::InvalidOp)),
+                _ => return Err(Error::Impeller(metor_proto::error::Error::InvalidOp)),
             }
         }
         let field_range = field.offset.to_index()..field.offset.to_index() + field.len as usize;
@@ -118,7 +118,7 @@ pub async fn handle_vtable_stream<A: AsyncWrite + 'static>(
         let component = plan
             .first()
             .and_then(|s| s.as_component())
-            .ok_or(Error::Impeller(impeller2::error::Error::InvalidOp))
+            .ok_or(Error::Impeller(metor_proto::error::Error::InvalidOp))
             .inspect_err(|_| warn!("component not found"))?;
         if let Some((shape, ty)) = schema {
             let component_shape = component.schema.shape();
@@ -127,7 +127,7 @@ pub async fn handle_vtable_stream<A: AsyncWrite + 'static>(
                     "invalid schema: expected {:?}, got {:?}",
                     shape, component_shape
                 );
-                return Err(Error::Impeller(impeller2::error::Error::InvalidOp));
+                return Err(Error::Impeller(metor_proto::error::Error::InvalidOp));
             }
         }
         if component.schema.size() != field.len as usize {
@@ -136,7 +136,7 @@ pub async fn handle_vtable_stream<A: AsyncWrite + 'static>(
                 component.schema.size(),
                 field.len
             );
-            return Err(Error::Impeller(impeller2::error::Error::InvalidOp));
+            return Err(Error::Impeller(metor_proto::error::Error::InvalidOp));
         }
         let prim_type = component.schema.prim_type;
         stellarator::spawn(handle_plan(plan, shard, timestamp, prim_type));

@@ -1,5 +1,5 @@
-use impeller2::types::ComponentId;
-use impeller2_wkt::ComponentMetadata;
+use metor_proto::types::ComponentId;
+use metor_proto_wkt::ComponentMetadata;
 
 pub trait ComponentPath: Clone {
     fn to_name(&self) -> String;

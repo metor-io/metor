@@ -2,11 +2,11 @@
 mod tests {
 
     use arrow::{array::AsArray, datatypes::Float64Type};
-    use impeller2::{
+    use metor_proto::{
         types::{ComponentId, IntoLenPacket, LenPacket, Msg, PrimType, Timestamp},
         vtable::builder::{component, raw_field, raw_table, schema, timestamp, vtable},
     };
-    use impeller2_stellar::Client;
+    use metor_proto_stellar::Client;
     use metor_db::{DB, Error, Server};
     use postcard_schema::{Schema, schema::owned::OwnedNamedType};
     use std::{net::SocketAddr, sync::Arc, time::Duration};
@@ -14,7 +14,7 @@ mod tests {
     use zerocopy::FromBytes;
     use zerocopy::IntoBytes;
 
-    use impeller2_wkt::*;
+    use metor_proto_wkt::*;
 
     async fn setup_test_db() -> Result<(SocketAddr, Arc<DB>), Error> {
         let subscriber = tracing_subscriber::FmtSubscriber::new();
@@ -572,7 +572,7 @@ mod tests {
         };
 
         let result = client.request(&get_schema).await;
-        let Err(impeller2_stellar::Error::Response(resp)) = result else {
+        let Err(metor_proto_stellar::Error::Response(resp)) = result else {
             panic!("invalid error");
         };
         assert_eq!(
@@ -594,7 +594,7 @@ mod tests {
         };
 
         let result = client.request(&get_metadata).await.unwrap_err();
-        let impeller2_stellar::Error::Response(resp) = result else {
+        let metor_proto_stellar::Error::Response(resp) = result else {
             panic!("invalid error");
         };
         assert_eq!(
@@ -613,7 +613,7 @@ mod tests {
         let get_metadata = GetMsgMetadata { msg_id };
 
         let result = client.request(&get_metadata).await.unwrap_err();
-        let impeller2_stellar::Error::Response(resp) = result else {
+        let metor_proto_stellar::Error::Response(resp) = result else {
             panic!("invalid error");
         };
         assert_eq!(
@@ -637,7 +637,7 @@ mod tests {
         };
 
         let result = client.request(&get_msgs).await.unwrap_err();
-        let impeller2_stellar::Error::Response(resp) = result else {
+        let metor_proto_stellar::Error::Response(resp) = result else {
             panic!("invalid error");
         };
         assert_eq!(resp.description, format!("msg not found {:?}", msg_id));
@@ -1088,7 +1088,7 @@ mod tests {
             .0
             .unwrap();
 
-        let Err(impeller2_stellar::Error::Response(err)) = client.recv::<()>(42).await else {
+        let Err(metor_proto_stellar::Error::Response(err)) = client.recv::<()>(42).await else {
             panic!("invalid response");
         };
         assert_eq!(metor_db::Error::SchemaMismatch.to_string(), err.description);

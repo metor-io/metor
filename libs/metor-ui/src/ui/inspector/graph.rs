@@ -6,11 +6,11 @@ use bevy::ecs::{
     world::World,
 };
 use bevy_egui::egui;
-use impeller2_wkt::{ComponentPath, GraphType, QueryType};
+use metor_proto_wkt::{ComponentPath, GraphType, QueryType};
 use smallvec::SmallVec;
 
 use egui::{Align, Color32};
-use impeller2_bevy::ComponentMetadataRegistry;
+use metor_proto_bevy::ComponentMetadataRegistry;
 
 use crate::{
     EqlContext,
@@ -242,7 +242,7 @@ impl WidgetSystem for InspectorGraph<'_, '_> {
                     //     {
                     //         ui.memory_mut(|mem| mem.close_popup());
                     //     }
-                    //     query_plot.data.color = impeller2_wkt::Color::from_color32(color);
+                    //     query_plot.data.color = metor_proto_wkt::Color::from_color32(color);
                     // }
                 });
         } else {

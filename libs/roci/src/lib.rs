@@ -1,5 +1,5 @@
-pub use impeller2;
-pub use impeller2_wkt;
+pub use metor_proto;
+pub use metor_proto_wkt;
 pub use roci_macros::{AsVTable, Metadatatize};
 pub use vtable::AsVTable;
 pub use zerocopy;

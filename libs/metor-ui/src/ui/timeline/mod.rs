@@ -3,7 +3,7 @@ use bevy::ecs::{
     world::World,
 };
 use bevy_egui::{EguiContexts, egui};
-use impeller2_wkt::SimulationTimeStep;
+use metor_proto_wkt::SimulationTimeStep;
 use timeline_controls::TimelineControls;
 
 use std::ops::RangeInclusive;

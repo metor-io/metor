@@ -8,8 +8,8 @@ use bevy::ui::{
 };
 use bevy::window::PrimaryWindow;
 use eql::FmtExpr;
-use impeller2_bevy::EntityMap;
-use impeller2_wkt::{ComponentValue, DashboardNode};
+use metor_proto_bevy::EntityMap;
+use metor_proto_wkt::{ComponentValue, DashboardNode};
 use nox::ArrayBuf;
 use smallvec::{SmallVec, smallvec};
 
@@ -153,30 +153,30 @@ impl CompiledVal {
     }
 }
 
-pub fn compile_val(ctx: &eql::Context, val: &impeller2_wkt::Val) -> CompiledVal {
+pub fn compile_val(ctx: &eql::Context, val: &metor_proto_wkt::Val) -> CompiledVal {
     try_compile_val(ctx, val).unwrap_or(CompiledVal::Auto)
 }
 
 pub fn try_compile_val(
     ctx: &eql::Context,
-    val: &impeller2_wkt::Val,
+    val: &metor_proto_wkt::Val,
 ) -> Result<CompiledVal, eql::Error> {
     let val = match val {
-        impeller2_wkt::Val::Auto => CompiledVal::Auto,
-        impeller2_wkt::Val::Px(px) => CompiledVal::Px(compile_eql_expr(ctx.parse_str(px)?)),
-        impeller2_wkt::Val::Percent(percent) => {
+        metor_proto_wkt::Val::Auto => CompiledVal::Auto,
+        metor_proto_wkt::Val::Px(px) => CompiledVal::Px(compile_eql_expr(ctx.parse_str(px)?)),
+        metor_proto_wkt::Val::Percent(percent) => {
             CompiledVal::Percent(compile_eql_expr(ctx.parse_str(percent)?))
         }
-        impeller2_wkt::Val::Vw(vw) => CompiledVal::Vw(compile_eql_expr(ctx.parse_str(vw)?)),
-        impeller2_wkt::Val::Vh(vh) => CompiledVal::Vh(compile_eql_expr(ctx.parse_str(vh)?)),
-        impeller2_wkt::Val::VMin(vmin) => CompiledVal::VMin(compile_eql_expr(ctx.parse_str(vmin)?)),
-        impeller2_wkt::Val::VMax(vmax) => CompiledVal::VMax(compile_eql_expr(ctx.parse_str(vmax)?)),
+        metor_proto_wkt::Val::Vw(vw) => CompiledVal::Vw(compile_eql_expr(ctx.parse_str(vw)?)),
+        metor_proto_wkt::Val::Vh(vh) => CompiledVal::Vh(compile_eql_expr(ctx.parse_str(vh)?)),
+        metor_proto_wkt::Val::VMin(vmin) => CompiledVal::VMin(compile_eql_expr(ctx.parse_str(vmin)?)),
+        metor_proto_wkt::Val::VMax(vmax) => CompiledVal::VMax(compile_eql_expr(ctx.parse_str(vmax)?)),
     };
     Ok(val)
 }
 
 pub fn spawn_dashboard(
-    source: &impeller2_wkt::Dashboard,
+    source: &metor_proto_wkt::Dashboard,
     eql: &eql::Context,
     commands: &mut Commands,
     params: &NodeUpdaterParams,
@@ -200,7 +200,7 @@ pub fn spawn_dashboard(
         smallvec![],
         params,
     )?;
-    parent.insert(impeller2_wkt::Dashboard {
+    parent.insert(metor_proto_wkt::Dashboard {
         root: node,
         aux: parent_id,
     });
@@ -218,7 +218,7 @@ pub struct DashboardNodePath {
 }
 
 pub fn spawn_node<T>(
-    source: &impeller2_wkt::DashboardNode<T>,
+    source: &metor_proto_wkt::DashboardNode<T>,
     eql: &eql::Context,
     commands: &mut EntityCommands,
     root: Entity,
@@ -256,111 +256,111 @@ pub fn spawn_node<T>(
     });
     let node = Node {
         display: match source.display {
-            impeller2_wkt::Display::None => Display::None,
-            impeller2_wkt::Display::Block => Display::Block,
-            impeller2_wkt::Display::Flex => Display::Flex,
-            impeller2_wkt::Display::Grid => Display::Grid,
+            metor_proto_wkt::Display::None => Display::None,
+            metor_proto_wkt::Display::Block => Display::Block,
+            metor_proto_wkt::Display::Flex => Display::Flex,
+            metor_proto_wkt::Display::Grid => Display::Grid,
         },
         box_sizing: match source.box_sizing {
-            impeller2_wkt::BoxSizing::BorderBox => BoxSizing::BorderBox,
-            impeller2_wkt::BoxSizing::ContentBox => BoxSizing::ContentBox,
+            metor_proto_wkt::BoxSizing::BorderBox => BoxSizing::BorderBox,
+            metor_proto_wkt::BoxSizing::ContentBox => BoxSizing::ContentBox,
         },
         position_type: match source.position_type {
-            impeller2_wkt::PositionType::Relative => PositionType::Relative,
-            impeller2_wkt::PositionType::Absolute => PositionType::Absolute,
+            metor_proto_wkt::PositionType::Relative => PositionType::Relative,
+            metor_proto_wkt::PositionType::Absolute => PositionType::Absolute,
         },
         overflow: Overflow {
             x: match source.overflow.x {
-                impeller2_wkt::OverflowAxis::Visible => OverflowAxis::Visible,
-                impeller2_wkt::OverflowAxis::Clip => OverflowAxis::Clip,
-                impeller2_wkt::OverflowAxis::Hidden => OverflowAxis::Hidden,
-                impeller2_wkt::OverflowAxis::Scroll => OverflowAxis::Scroll,
+                metor_proto_wkt::OverflowAxis::Visible => OverflowAxis::Visible,
+                metor_proto_wkt::OverflowAxis::Clip => OverflowAxis::Clip,
+                metor_proto_wkt::OverflowAxis::Hidden => OverflowAxis::Hidden,
+                metor_proto_wkt::OverflowAxis::Scroll => OverflowAxis::Scroll,
             },
             y: match source.overflow.y {
-                impeller2_wkt::OverflowAxis::Visible => OverflowAxis::Visible,
-                impeller2_wkt::OverflowAxis::Clip => OverflowAxis::Clip,
-                impeller2_wkt::OverflowAxis::Hidden => OverflowAxis::Hidden,
-                impeller2_wkt::OverflowAxis::Scroll => OverflowAxis::Scroll,
+                metor_proto_wkt::OverflowAxis::Visible => OverflowAxis::Visible,
+                metor_proto_wkt::OverflowAxis::Clip => OverflowAxis::Clip,
+                metor_proto_wkt::OverflowAxis::Hidden => OverflowAxis::Hidden,
+                metor_proto_wkt::OverflowAxis::Scroll => OverflowAxis::Scroll,
             },
         },
         overflow_clip_margin: OverflowClipMargin {
             visual_box: match source.overflow_clip_margin.visual_box {
-                impeller2_wkt::OverflowClipBox::ContentBox => OverflowClipBox::ContentBox,
-                impeller2_wkt::OverflowClipBox::PaddingBox => OverflowClipBox::PaddingBox,
-                impeller2_wkt::OverflowClipBox::BorderBox => OverflowClipBox::BorderBox,
+                metor_proto_wkt::OverflowClipBox::ContentBox => OverflowClipBox::ContentBox,
+                metor_proto_wkt::OverflowClipBox::PaddingBox => OverflowClipBox::PaddingBox,
+                metor_proto_wkt::OverflowClipBox::BorderBox => OverflowClipBox::BorderBox,
             },
             margin: 0.0,
         },
         align_items: match source.align_items {
-            impeller2_wkt::AlignItems::Default => AlignItems::Default,
-            impeller2_wkt::AlignItems::Start => AlignItems::Start,
-            impeller2_wkt::AlignItems::End => AlignItems::End,
-            impeller2_wkt::AlignItems::FlexStart => AlignItems::FlexStart,
-            impeller2_wkt::AlignItems::FlexEnd => AlignItems::FlexEnd,
-            impeller2_wkt::AlignItems::Center => AlignItems::Center,
-            impeller2_wkt::AlignItems::Baseline => AlignItems::Baseline,
-            impeller2_wkt::AlignItems::Stretch => AlignItems::Stretch,
+            metor_proto_wkt::AlignItems::Default => AlignItems::Default,
+            metor_proto_wkt::AlignItems::Start => AlignItems::Start,
+            metor_proto_wkt::AlignItems::End => AlignItems::End,
+            metor_proto_wkt::AlignItems::FlexStart => AlignItems::FlexStart,
+            metor_proto_wkt::AlignItems::FlexEnd => AlignItems::FlexEnd,
+            metor_proto_wkt::AlignItems::Center => AlignItems::Center,
+            metor_proto_wkt::AlignItems::Baseline => AlignItems::Baseline,
+            metor_proto_wkt::AlignItems::Stretch => AlignItems::Stretch,
         },
         justify_items: match source.justify_items {
-            impeller2_wkt::JustifyItems::Default => JustifyItems::Default,
-            impeller2_wkt::JustifyItems::Start => JustifyItems::Start,
-            impeller2_wkt::JustifyItems::End => JustifyItems::End,
-            impeller2_wkt::JustifyItems::Center => JustifyItems::Center,
-            impeller2_wkt::JustifyItems::Baseline => JustifyItems::Baseline,
-            impeller2_wkt::JustifyItems::Stretch => JustifyItems::Stretch,
+            metor_proto_wkt::JustifyItems::Default => JustifyItems::Default,
+            metor_proto_wkt::JustifyItems::Start => JustifyItems::Start,
+            metor_proto_wkt::JustifyItems::End => JustifyItems::End,
+            metor_proto_wkt::JustifyItems::Center => JustifyItems::Center,
+            metor_proto_wkt::JustifyItems::Baseline => JustifyItems::Baseline,
+            metor_proto_wkt::JustifyItems::Stretch => JustifyItems::Stretch,
         },
         align_self: match source.align_self {
-            impeller2_wkt::AlignSelf::Auto => AlignSelf::Auto,
-            impeller2_wkt::AlignSelf::Start => AlignSelf::Start,
-            impeller2_wkt::AlignSelf::End => AlignSelf::End,
-            impeller2_wkt::AlignSelf::FlexStart => AlignSelf::FlexStart,
-            impeller2_wkt::AlignSelf::FlexEnd => AlignSelf::FlexEnd,
-            impeller2_wkt::AlignSelf::Center => AlignSelf::Center,
-            impeller2_wkt::AlignSelf::Baseline => AlignSelf::Baseline,
-            impeller2_wkt::AlignSelf::Stretch => AlignSelf::Stretch,
+            metor_proto_wkt::AlignSelf::Auto => AlignSelf::Auto,
+            metor_proto_wkt::AlignSelf::Start => AlignSelf::Start,
+            metor_proto_wkt::AlignSelf::End => AlignSelf::End,
+            metor_proto_wkt::AlignSelf::FlexStart => AlignSelf::FlexStart,
+            metor_proto_wkt::AlignSelf::FlexEnd => AlignSelf::FlexEnd,
+            metor_proto_wkt::AlignSelf::Center => AlignSelf::Center,
+            metor_proto_wkt::AlignSelf::Baseline => AlignSelf::Baseline,
+            metor_proto_wkt::AlignSelf::Stretch => AlignSelf::Stretch,
         },
         justify_self: match source.justify_self {
-            impeller2_wkt::JustifySelf::Auto => JustifySelf::Auto,
-            impeller2_wkt::JustifySelf::Start => JustifySelf::Start,
-            impeller2_wkt::JustifySelf::End => JustifySelf::End,
-            impeller2_wkt::JustifySelf::Center => JustifySelf::Center,
-            impeller2_wkt::JustifySelf::Baseline => JustifySelf::Baseline,
-            impeller2_wkt::JustifySelf::Stretch => JustifySelf::Stretch,
+            metor_proto_wkt::JustifySelf::Auto => JustifySelf::Auto,
+            metor_proto_wkt::JustifySelf::Start => JustifySelf::Start,
+            metor_proto_wkt::JustifySelf::End => JustifySelf::End,
+            metor_proto_wkt::JustifySelf::Center => JustifySelf::Center,
+            metor_proto_wkt::JustifySelf::Baseline => JustifySelf::Baseline,
+            metor_proto_wkt::JustifySelf::Stretch => JustifySelf::Stretch,
         },
         align_content: match source.align_content {
-            impeller2_wkt::AlignContent::Default => AlignContent::Default,
-            impeller2_wkt::AlignContent::Start => AlignContent::Start,
-            impeller2_wkt::AlignContent::End => AlignContent::End,
-            impeller2_wkt::AlignContent::FlexStart => AlignContent::FlexStart,
-            impeller2_wkt::AlignContent::FlexEnd => AlignContent::FlexEnd,
-            impeller2_wkt::AlignContent::Center => AlignContent::Center,
-            impeller2_wkt::AlignContent::Stretch => AlignContent::Stretch,
-            impeller2_wkt::AlignContent::SpaceBetween => AlignContent::SpaceBetween,
-            impeller2_wkt::AlignContent::SpaceEvenly => AlignContent::SpaceEvenly,
-            impeller2_wkt::AlignContent::SpaceAround => AlignContent::SpaceAround,
+            metor_proto_wkt::AlignContent::Default => AlignContent::Default,
+            metor_proto_wkt::AlignContent::Start => AlignContent::Start,
+            metor_proto_wkt::AlignContent::End => AlignContent::End,
+            metor_proto_wkt::AlignContent::FlexStart => AlignContent::FlexStart,
+            metor_proto_wkt::AlignContent::FlexEnd => AlignContent::FlexEnd,
+            metor_proto_wkt::AlignContent::Center => AlignContent::Center,
+            metor_proto_wkt::AlignContent::Stretch => AlignContent::Stretch,
+            metor_proto_wkt::AlignContent::SpaceBetween => AlignContent::SpaceBetween,
+            metor_proto_wkt::AlignContent::SpaceEvenly => AlignContent::SpaceEvenly,
+            metor_proto_wkt::AlignContent::SpaceAround => AlignContent::SpaceAround,
         },
         justify_content: match source.justify_content {
-            impeller2_wkt::JustifyContent::Default => JustifyContent::Default,
-            impeller2_wkt::JustifyContent::Start => JustifyContent::Start,
-            impeller2_wkt::JustifyContent::End => JustifyContent::End,
-            impeller2_wkt::JustifyContent::FlexStart => JustifyContent::FlexStart,
-            impeller2_wkt::JustifyContent::FlexEnd => JustifyContent::FlexEnd,
-            impeller2_wkt::JustifyContent::Center => JustifyContent::Center,
-            impeller2_wkt::JustifyContent::Stretch => JustifyContent::Stretch,
-            impeller2_wkt::JustifyContent::SpaceBetween => JustifyContent::SpaceBetween,
-            impeller2_wkt::JustifyContent::SpaceEvenly => JustifyContent::SpaceEvenly,
-            impeller2_wkt::JustifyContent::SpaceAround => JustifyContent::SpaceAround,
+            metor_proto_wkt::JustifyContent::Default => JustifyContent::Default,
+            metor_proto_wkt::JustifyContent::Start => JustifyContent::Start,
+            metor_proto_wkt::JustifyContent::End => JustifyContent::End,
+            metor_proto_wkt::JustifyContent::FlexStart => JustifyContent::FlexStart,
+            metor_proto_wkt::JustifyContent::FlexEnd => JustifyContent::FlexEnd,
+            metor_proto_wkt::JustifyContent::Center => JustifyContent::Center,
+            metor_proto_wkt::JustifyContent::Stretch => JustifyContent::Stretch,
+            metor_proto_wkt::JustifyContent::SpaceBetween => JustifyContent::SpaceBetween,
+            metor_proto_wkt::JustifyContent::SpaceEvenly => JustifyContent::SpaceEvenly,
+            metor_proto_wkt::JustifyContent::SpaceAround => JustifyContent::SpaceAround,
         },
         flex_direction: match source.flex_direction {
-            impeller2_wkt::FlexDirection::Row => FlexDirection::Row,
-            impeller2_wkt::FlexDirection::Column => FlexDirection::Column,
-            impeller2_wkt::FlexDirection::RowReverse => FlexDirection::RowReverse,
-            impeller2_wkt::FlexDirection::ColumnReverse => FlexDirection::ColumnReverse,
+            metor_proto_wkt::FlexDirection::Row => FlexDirection::Row,
+            metor_proto_wkt::FlexDirection::Column => FlexDirection::Column,
+            metor_proto_wkt::FlexDirection::RowReverse => FlexDirection::RowReverse,
+            metor_proto_wkt::FlexDirection::ColumnReverse => FlexDirection::ColumnReverse,
         },
         flex_wrap: match source.flex_wrap {
-            impeller2_wkt::FlexWrap::NoWrap => FlexWrap::NoWrap,
-            impeller2_wkt::FlexWrap::Wrap => FlexWrap::Wrap,
-            impeller2_wkt::FlexWrap::WrapReverse => FlexWrap::WrapReverse,
+            metor_proto_wkt::FlexWrap::NoWrap => FlexWrap::NoWrap,
+            metor_proto_wkt::FlexWrap::Wrap => FlexWrap::Wrap,
+            metor_proto_wkt::FlexWrap::WrapReverse => FlexWrap::WrapReverse,
         },
         flex_grow: source.flex_grow,
         flex_shrink: source.flex_shrink,

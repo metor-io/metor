@@ -14,7 +14,7 @@ impl Cli {
     pub fn editor(self) -> miette::Result<()> {
         let cancel_token = CancelToken::new();
         let mut app = self.editor_app()?;
-        app.add_plugins(impeller2_bevy::TcpImpellerPlugin::new(self.addr));
+        app.add_plugins(metor_proto_bevy::TcpImpellerPlugin::new(self.addr));
         app.insert_resource(BevyCancelToken(cancel_token.clone()))
             .add_systems(Update, check_cancel_token);
         app.run();

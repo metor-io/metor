@@ -6,7 +6,7 @@ use bevy::{
     window::Window,
 };
 use bevy_egui::{EguiContexts, egui};
-use impeller2_bevy::{ComponentMetadataRegistry, ComponentPath, ComponentPathRegistry};
+use metor_proto_bevy::{ComponentMetadataRegistry, ComponentPath, ComponentPathRegistry};
 
 use crate::ui::{
     EntityData, InspectorAnchor, SettingModal, SettingModalState, colors::get_scheme, images,

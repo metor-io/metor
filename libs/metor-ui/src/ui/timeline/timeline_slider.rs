@@ -8,9 +8,9 @@ use bevy::{
 };
 use bevy_egui::egui;
 use egui::{CornerRadius, Margin};
-use impeller2::types::Timestamp;
-use impeller2_bevy::{CurrentStreamId, PacketTx};
-use impeller2_wkt::{CurrentTimestamp, SetStreamState};
+use metor_proto::types::Timestamp;
+use metor_proto_bevy::{CurrentStreamId, PacketTx};
+use metor_proto_wkt::{CurrentTimestamp, SetStreamState};
 use std::ops::RangeInclusive;
 
 use crate::ui::{

@@ -3,8 +3,8 @@ use std::{
     sync::Arc,
 };
 
-use impeller2::{buf::UmbraBuf, types::Timestamp};
-use impeller2_wkt::MsgMetadata;
+use metor_proto::{buf::UmbraBuf, types::Timestamp};
+use metor_proto_wkt::MsgMetadata;
 use stellarator::sync::WaitQueue;
 use zerocopy::{FromBytes, IntoBytes};
 

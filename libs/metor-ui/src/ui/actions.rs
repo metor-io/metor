@@ -6,8 +6,8 @@ use bevy::{
     prelude::{Commands, Component, Entity, Query, Res, Resource},
 };
 use egui::{CornerRadius, RichText};
-use impeller2_bevy::{ConnectionAddr, ConnectionStatus, ThreadConnectionStatus};
-use impeller2_cli::mlua::MultiValue;
+use metor_proto_bevy::{ConnectionAddr, ConnectionStatus, ThreadConnectionStatus};
+use metor_proto_cli::mlua::MultiValue;
 
 use super::{
     button::EButton,
@@ -25,8 +25,8 @@ impl LuaActor {
         let (cmd_tx, cmd_rx) =
             flume::unbounded::<(String, flume::Sender<Result<String, String>>)>();
         stellarator::struc_con::stellar(move || async move {
-            let lua = impeller2_cli::lua().unwrap();
-            let client = match impeller2_cli::Client::connect(addr).await {
+            let lua = metor_proto_cli::lua().unwrap();
+            let client = match metor_proto_cli::Client::connect(addr).await {
                 Ok(c) => c,
                 Err(err) => {
                     warn!(?err, "lua client couldn't connect");
@@ -186,8 +186,8 @@ pub fn spawn_lua_actor(
     }
     if lua.is_some() {
         match status {
-            impeller2_bevy::ConnectionStatus::NoConnection
-            | impeller2_bevy::ConnectionStatus::Error => {
+            metor_proto_bevy::ConnectionStatus::NoConnection
+            | metor_proto_bevy::ConnectionStatus::Error => {
                 commands.remove_resource::<LuaActor>();
             }
             _ => {}

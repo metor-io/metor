@@ -9,8 +9,8 @@ use bevy::{
     prelude::{Commands, Component, Entity, In, Query, Res},
 };
 use egui::{RichText, Stroke};
-use impeller2_bevy::CommandsExt;
-use impeller2_wkt::{ArrowIPC, ErrorResponse, QueryTable, QueryType, SQLQuery};
+use metor_proto_bevy::CommandsExt;
+use metor_proto_wkt::{ArrowIPC, ErrorResponse, QueryTable, QueryType, SQLQuery};
 
 use crate::EqlContext;
 

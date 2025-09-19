@@ -1,10 +1,10 @@
 use bevy::{ecs::system::SystemParam, prelude::*};
 use bevy_egui::egui::Color32;
 use egui_tiles::{Container, Tile, TileId};
-use impeller2_bevy::{ComponentPath, ComponentSchemaRegistry};
-use impeller2_kdl::FromKdl;
-use impeller2_kdl::KdlSchematicError;
-use impeller2_wkt::{DbConfig, Graph, Line3d, Object3D, Panel, Schematic, Viewport};
+use metor_proto_bevy::{ComponentPath, ComponentSchemaRegistry};
+use metor_proto_kdl::FromKdl;
+use metor_proto_kdl::KdlSchematicError;
+use metor_proto_wkt::{DbConfig, Graph, Line3d, Object3D, Panel, Schematic, Viewport};
 use std::time::Duration;
 use std::{collections::BTreeMap, path::Path};
 
@@ -63,7 +63,7 @@ pub fn sync_schematic(
         return;
     }
     if let Some(content) = config.schematic_content() {
-        let Ok(schematic) = impeller2_wkt::Schematic::from_kdl(content) else {
+        let Ok(schematic) = metor_proto_wkt::Schematic::from_kdl(content) else {
             return;
         };
         params.load_schematic(&schematic);
@@ -89,7 +89,7 @@ pub fn load_schematic_file(
 
                 info!(path = ?cb_path, "refreshing schematic");
                 if let Ok(kdl) = std::fs::read_to_string(&cb_path) {
-                    let Ok(schematic) = impeller2_wkt::Schematic::from_kdl(&kdl) else {
+                    let Ok(schematic) = metor_proto_wkt::Schematic::from_kdl(&kdl) else {
                         return;
                     };
                     let _ = tx.send(schematic);
@@ -109,7 +109,7 @@ pub fn load_schematic_file(
         }
     });
     if let Ok(kdl) = std::fs::read_to_string(path) {
-        let schematic = impeller2_wkt::Schematic::from_kdl(&kdl)?;
+        let schematic = metor_proto_wkt::Schematic::from_kdl(&kdl)?;
         params.load_schematic(&schematic);
     }
     Ok(())
@@ -125,13 +125,13 @@ impl LoadSchematicParams<'_, '_> {
         }
         for elem in &schematic.elems {
             match elem {
-                impeller2_wkt::SchematicElem::Panel(p) => {
+                metor_proto_wkt::SchematicElem::Panel(p) => {
                     self.spawn_panel(p, None);
                 }
-                impeller2_wkt::SchematicElem::Object3d(object_3d) => {
+                metor_proto_wkt::SchematicElem::Object3d(object_3d) => {
                     self.spawn_object_3d(object_3d.clone());
                 }
-                impeller2_wkt::SchematicElem::Line3d(line_3d) => {
+                metor_proto_wkt::SchematicElem::Line3d(line_3d) => {
                     self.spawn_line_3d(line_3d.clone());
                 }
             }

@@ -1,6 +1,6 @@
 use futures_concurrency::future::Join;
-use impeller2::types::{LenPacket, PacketId};
-use impeller2_stellar::Client;
+use metor_proto::types::{LenPacket, PacketId};
+use metor_proto_stellar::Client;
 use roci::{AsVTable, Metadatatize, tcp::SinkExt};
 use std::{mem, net::SocketAddr, time::Duration};
 use stellarator::{fs::File, rent};

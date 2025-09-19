@@ -5,8 +5,8 @@ use bevy::{
         world::World,
     },
 };
-use impeller2_bevy::{ConnectionStatus, ThreadConnectionStatus};
-use impeller2_wkt::SimulationTimeStep;
+use metor_proto_bevy::{ConnectionStatus, ThreadConnectionStatus};
+use metor_proto_wkt::SimulationTimeStep;
 
 use crate::ui::colors::get_scheme;
 

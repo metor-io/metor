@@ -1,7 +1,7 @@
-use impeller2::buf::{Slice, deref};
-use impeller2::types::{Msg, PacketId};
-use impeller2_stellar::{Client, Error, SubStream};
-use impeller2_wkt::{MsgMetadata, SetMsgMetadata, StreamReply, VTableMsg, VTableStream};
+use metor_proto::buf::{Slice, deref};
+use metor_proto::types::{Msg, PacketId};
+use metor_proto_stellar::{Client, Error, SubStream};
+use metor_proto_wkt::{MsgMetadata, SetMsgMetadata, StreamReply, VTableMsg, VTableStream};
 use std::future::Future;
 use std::marker::PhantomData;
 use std::ops::{Deref, DerefMut};
@@ -21,7 +21,7 @@ pub trait SinkExt {
     -> impl Future<Output = Result<(), Error>>;
 }
 
-impl<W: AsyncWrite> SinkExt for impeller2_stellar::PacketSink<W> {
+impl<W: AsyncWrite> SinkExt for metor_proto_stellar::PacketSink<W> {
     async fn send_vtable<V: AsVTable>(&self, id: PacketId) -> Result<(), Error> {
         let vtable = V::as_vtable();
         self.send(&(VTableMsg { id, vtable })).await.0?;
@@ -31,7 +31,7 @@ impl<W: AsyncWrite> SinkExt for impeller2_stellar::PacketSink<W> {
     async fn send_metadata<V: Metadatatize>(&self) -> Result<(), Error> {
         for metadata in V::metadata(()) {
             println!("{metadata:?}");
-            self.send(&impeller2_wkt::SetComponentMetadata(metadata))
+            self.send(&metor_proto_wkt::SetComponentMetadata(metadata))
                 .await
                 .0?;
         }
@@ -120,7 +120,7 @@ impl<T: AsVTable + zerocopy::TryFromBytes + Immutable + KnownLayout + Clone> Sub
         loop {
             if let StreamReply::Table(table) = self.sub.next().await? {
                 let t = <T>::try_ref_from_bytes(deref(&table.buf))
-                    .map_err(impeller2::error::Error::from)?;
+                    .map_err(metor_proto::error::Error::from)?;
                 return Ok(t.clone());
             }
         }

@@ -1,5 +1,5 @@
-use impeller2::types::{LenPacket, Msg, PacketId};
-use impeller2_wkt::{MsgStream, SetComponentMetadata};
+use metor_proto::types::{LenPacket, Msg, PacketId};
+use metor_proto_wkt::{MsgStream, SetComponentMetadata};
 use roci::tcp::SinkExt;
 use serde::{Deserialize, Serialize};
 use std::net::SocketAddr;
@@ -33,8 +33,8 @@ pub async fn connect() -> anyhow::Result<()> {
         .await
         .map_err(anyhow::Error::from)?;
     let (rx, tx) = stream.split();
-    let tx = impeller2_stellar::PacketSink::new(tx);
-    let mut rx = impeller2_stellar::PacketStream::new(rx);
+    let tx = metor_proto_stellar::PacketSink::new(tx);
+    let mut rx = metor_proto_stellar::PacketStream::new(rx);
 
     let id: PacketId = fastrand::u16(..).to_le_bytes();
     tx.send(&SetComponentMetadata::new("aleph", "aleph"))
@@ -56,7 +56,7 @@ pub async fn connect() -> anyhow::Result<()> {
         loop {
             let pkt = rx.next(buf).await?;
             match &pkt {
-                impeller2::types::OwnedPacket::Msg(m) if m.id == Command::ID => {
+                metor_proto::types::OwnedPacket::Msg(m) if m.id == Command::ID => {
                     let cmd = m.parse::<Command>()?;
                     println!("cmd {cmd:?}");
                     let buf = cobs::encode_vec(cmd.as_bytes());
@@ -70,7 +70,7 @@ pub async fn connect() -> anyhow::Result<()> {
     });
     let read = stellarator::struc_con::stellar(move || async move {
         let mut buf = vec![0u8; 512];
-        let mut frame = impeller2_frame::FrameDecoder::<Vec<u8>>::default();
+        let mut frame = metor_proto_frame::FrameDecoder::<Vec<u8>>::default();
         loop {
             let n = rent!(port_rx.read(buf).await, buf)?;
             let data = &buf[..n];

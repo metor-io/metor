@@ -16,9 +16,9 @@ use bevy::{
 };
 use big_space::GridCell;
 use eql;
-use impeller2_bevy::{CommandsExt, ComponentMetadataRegistry, EntityMap};
-use impeller2_wkt::LastUpdated;
-use impeller2_wkt::{ComponentValue, EntityMetadata, GetTimeSeries, Line3d};
+use metor_proto_bevy::{CommandsExt, ComponentMetadataRegistry, EntityMap};
+use metor_proto_wkt::LastUpdated;
+use metor_proto_wkt::{ComponentValue, EntityMetadata, GetTimeSeries, Line3d};
 
 use gpu::LineBundle;
 use gpu::{LineConfig, LineUniform};

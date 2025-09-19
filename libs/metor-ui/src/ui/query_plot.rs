@@ -17,8 +17,8 @@ use bevy::{
     render::camera::Projection,
 };
 use egui::RichText;
-use impeller2_bevy::CommandsExt;
-use impeller2_wkt::{ArrowIPC, ErrorResponse, QueryPlot, QueryType, SQLQuery};
+use metor_proto_bevy::CommandsExt;
+use metor_proto_wkt::{ArrowIPC, ErrorResponse, QueryPlot, QueryType, SQLQuery};
 use itertools::Itertools;
 
 use crate::{
@@ -63,7 +63,7 @@ impl Default for QueryPlotData {
                 query: Default::default(),
                 refresh_interval: Duration::from_millis(500),
                 auto_refresh: Default::default(),
-                color: impeller2_wkt::Color::from_color32(get_scheme().highlight),
+                color: metor_proto_wkt::Color::from_color32(get_scheme().highlight),
                 query_type: QueryType::EQL,
                 aux: (),
             },

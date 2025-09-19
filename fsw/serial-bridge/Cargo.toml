@@ -12,15 +12,15 @@ anyhow = "1"
 # async
 stellarator.path = "../../libs/stellarator"
 stellarator.features = ["miette"]
-impeller2-stellar.path = "../../libs/impeller2/stellar"
+metor-proto-stellar.path = "../../libs/metor-proto/stellar"
 futures-lite = "2.5.0"
 
 # ser-de
-impeller2.path = "../../libs/impeller2"
-impeller2.features = ["std"]
-impeller2-wkt.path = "../../libs/impeller2/wkt"
-impeller2-wkt.features = ["std"]
-impeller2-frame.path = "../../libs/impeller2/frame"
+metor-proto.path = "../../libs/metor-proto"
+metor-proto.features = ["std"]
+metor-proto-wkt.path = "../../libs/metor-proto/wkt"
+metor-proto-wkt.features = ["std"]
+metor-proto-frame.path = "../../libs/metor-proto/frame"
 cobs = "0.2"
 zerocopy.version = "0.8.2"
 roci.path = "../../libs/roci"

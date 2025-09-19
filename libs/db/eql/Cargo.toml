@@ -11,8 +11,8 @@ convert_case = "0.8"
 
 # data-structures
 smallvec = "1.15"
-impeller2.path = "../../impeller2"
-impeller2-wkt.path = "../../impeller2/wkt"
+metor-proto.path = "../../metor-proto"
+metor-proto-wkt.path = "../../metor-proto/wkt"
 
 # errors
 thiserror = "1"

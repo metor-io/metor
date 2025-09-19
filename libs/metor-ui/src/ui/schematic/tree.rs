@@ -16,7 +16,7 @@ use bevy::ecs::system::{Commands, Res, SystemParam};
 use bevy::prelude::{Component, Query, ResMut};
 use egui::collapsing_header::CollapsingState;
 use egui::load::SizedTexture;
-use impeller2_wkt::{Dashboard, DashboardNode, Panel};
+use metor_proto_wkt::{Dashboard, DashboardNode, Panel};
 use smallvec::smallvec;
 
 #[derive(SystemParam)]
@@ -82,7 +82,7 @@ impl WidgetSystem for TreeWidget<'_, '_> {
         egui::ScrollArea::vertical().show(ui, |ui| {
             for elem in &schematic.elems {
                 match elem {
-                    impeller2_wkt::SchematicElem::Panel(p) => panel(
+                    metor_proto_wkt::SchematicElem::Panel(p) => panel(
                         ui,
                         max_rect,
                         &icons,
@@ -90,7 +90,7 @@ impl WidgetSystem for TreeWidget<'_, '_> {
                         &mut selected_object,
                         &mut spawn_node_params,
                     ),
-                    impeller2_wkt::SchematicElem::Object3d(object_3d) => {
+                    metor_proto_wkt::SchematicElem::Object3d(object_3d) => {
                         let selected = if Some(object_3d.aux) == selected_object.entity() {
                             *selected_object != SelectedObject::None
                         } else {
@@ -111,7 +111,7 @@ impl WidgetSystem for TreeWidget<'_, '_> {
                             };
                         }
                     }
-                    impeller2_wkt::SchematicElem::Line3d(_line3d) => {}
+                    metor_proto_wkt::SchematicElem::Line3d(_line3d) => {}
                 }
             }
         });

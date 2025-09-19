@@ -1,0 +1,43 @@
+[package]
+name = "metor-proto-wkt"
+license = "MIT OR Apache-2.0"
+version = "0.1.0"
+edition = "2024"
+
+[features]
+bevy = ["dep:bevy", "std", "gui"]
+nox = ["dep:nox"]
+gui = ["nox"]
+std = ["metor-proto/std", "postcard-schema/use-std"]
+mlua = ["dep:mlua"]
+
+[dependencies]
+metor-proto.path = ".."
+nox.path = "../../nox"
+nox.features = ["serde"]
+nox.optional = true
+zerocopy.version = "0.8.2"
+zerocopy.features = ["derive"]
+
+
+# data-structs
+smallvec.version = "1.11.2"
+compact_str = "0.9"
+
+# bevy
+bevy.version = "0.16"
+bevy.optional = true
+
+# serde
+serde.version = "1.0"
+serde.features = ["derive"]
+postcard.version = "1.1"
+postcard-schema.version = "0.2"
+postcard-schema.features = ["use-std"]
+strum.version = "0.27"
+strum.features = ["derive"]
+
+# lua
+mlua.version = "0.10"
+mlua.features = ["serialize"]
+mlua.optional = true

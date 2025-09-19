@@ -1,4 +1,4 @@
-use impeller2::vtable::{
+use metor_proto::vtable::{
     VTable,
     builder::{FieldBuilder, vtable},
 };

@@ -1,4 +1,4 @@
-use impeller2::{
+use metor_proto::{
     table::{Entry, VTable},
     types::PacketId,
 };
@@ -9,7 +9,7 @@ pub struct VTableRegistry {
     pub map: HashMap<PacketId, VTable>,
 }
 
-impl impeller2::registry::VTableRegistry for VTableRegistry {
+impl metor_proto::registry::VTableRegistry for VTableRegistry {
     type EntryBuf = Vec<Entry>;
 
     type DataBuf = Vec<u8>;
@@ -17,7 +17,7 @@ impl impeller2::registry::VTableRegistry for VTableRegistry {
     fn get(
         &self,
         id: &PacketId,
-    ) -> Option<&impeller2::table::VTable<Self::EntryBuf, Self::DataBuf>> {
+    ) -> Option<&metor_proto::table::VTable<Self::EntryBuf, Self::DataBuf>> {
         self.map.get(id)
     }
 }

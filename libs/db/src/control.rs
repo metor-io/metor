@@ -1,9 +1,9 @@
-use impeller2::{
+use metor_proto::{
     schema::Schema,
     table::{Entry, VTable},
     types::{ComponentId, Msg, PacketId},
 };
-use impeller2_stellar::MsgExt;
+use metor_proto_stellar::MsgExt;
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
 use std::{collections::HashMap, ops::Range};

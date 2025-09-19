@@ -22,7 +22,7 @@ mod metorsink {
     use gstreamer::{self as gst, glib};
     use gstreamer::{prelude::*, subclass::prelude::*};
     use gstreamer_base::subclass::prelude::*;
-    use impeller2::types::{msg_id, LenPacket, Timestamp};
+    use metor_proto::types::{msg_id, LenPacket, Timestamp};
     use std::{
         io::Write,
         net::{SocketAddr, TcpStream},

@@ -8,7 +8,7 @@ use bevy::{
     scene::SceneRoot,
 };
 use bevy_egui::egui::{self, Align, RichText};
-use impeller2_wkt::{ComponentMetadata, Material, Mesh, Object3DMesh};
+use metor_proto_wkt::{ComponentMetadata, Material, Mesh, Object3DMesh};
 use smallvec::SmallVec;
 
 use crate::object_3d::spawn_mesh;
@@ -158,7 +158,7 @@ impl WidgetSystem for InspectorObject3D<'_, '_> {
                         object_3d_state.data.mesh = Object3DMesh::Mesh {
                             mesh: Mesh::Sphere { radius: 1.0 },
                             material: Material {
-                                base_color: impeller2_wkt::Color::HYPERBLUE,
+                                base_color: metor_proto_wkt::Color::HYPERBLUE,
                             },
                         };
                     }
@@ -170,7 +170,7 @@ impl WidgetSystem for InspectorObject3D<'_, '_> {
                                 z: 1.0,
                             },
                             material: Material {
-                                base_color: impeller2_wkt::Color::HYPERBLUE,
+                                base_color: metor_proto_wkt::Color::HYPERBLUE,
                             },
                         };
                     }
@@ -181,7 +181,7 @@ impl WidgetSystem for InspectorObject3D<'_, '_> {
                                 height: 2.0,
                             },
                             material: Material {
-                                base_color: impeller2_wkt::Color::HYPERBLUE,
+                                base_color: metor_proto_wkt::Color::HYPERBLUE,
                             },
                         };
                     }

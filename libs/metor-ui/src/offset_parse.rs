@@ -1,7 +1,7 @@
 use std::{str::FromStr, time::Duration};
 
 use crate::Offset;
-use impeller2::types::Timestamp;
+use metor_proto::types::Timestamp;
 use jiff::Span;
 
 peg::parser! {

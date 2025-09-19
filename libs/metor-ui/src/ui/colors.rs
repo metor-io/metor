@@ -1,7 +1,7 @@
 use std::sync::atomic::{self, AtomicPtr};
 
 use egui::Color32;
-use impeller2_wkt::Color;
+use metor_proto_wkt::Color;
 use serde::{Deserialize, Serialize};
 
 use crate::dirs;

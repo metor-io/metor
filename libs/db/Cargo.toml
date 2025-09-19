@@ -20,11 +20,11 @@ parquet = ["dep:parquet"]
 
 [dependencies]
 # ser-de
-impeller2.path = "../impeller2"
-impeller2.features = ["std"]
-impeller2-wkt.path = "../impeller2/wkt"
-impeller2-wkt.features = ["nox"]
-impeller2-cli.path = "cli"
+metor-proto.path = "../metor-proto"
+metor-proto.features = ["std"]
+metor-proto-wkt.path = "../metor-proto/wkt"
+metor-proto-wkt.features = ["nox"]
+metor-proto-cli.path = "cli"
 serde.version = "1.0"
 serde.features = ["derive"]
 postcard = "1.1"
@@ -35,7 +35,7 @@ nox.default-features = false
 # async
 stellarator.path = "../stellarator"
 stellarator.features = ["miette", "tokio"]
-impeller2-stellar.path = "../impeller2/stellar"
+metor-proto-stellar.path = "../metor-proto/stellar"
 futures-lite = "2.5.0"
 
 # data structures

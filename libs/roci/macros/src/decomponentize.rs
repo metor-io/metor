@@ -25,7 +25,7 @@ pub fn decomponentize(input: TokenStream) -> TokenStream {
         parent,
     } = Decomponentize::from_derive_input(&input).unwrap();
     let where_clause = &generics.where_clause;
-    let impeller = quote! { #crate_name::impeller2 };
+    let impeller = quote! { #crate_name::metor_proto };
     let fields = data.take_struct().unwrap();
     let if_arms = fields.fields.iter().map(|field| {
         let ty = &field.ty;

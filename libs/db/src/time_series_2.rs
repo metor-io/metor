@@ -8,7 +8,7 @@ use std::{
     },
 };
 
-use impeller2::types::Timestamp;
+use metor_proto::types::Timestamp;
 use stellarator::sync::WaitQueue;
 use tracing::warn;
 use zerocopy::FromBytes;

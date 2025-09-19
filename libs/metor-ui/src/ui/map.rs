@@ -3,8 +3,8 @@ use bevy::{
     prelude::{Component, Entity, Query, Res, ResMut},
 };
 use bevy_egui::egui::Ui;
-use impeller2_bevy::EntityMap;
-use impeller2_wkt::ComponentValue;
+use metor_proto_bevy::EntityMap;
+use metor_proto_wkt::ComponentValue;
 use walkers::{
     HttpOptions, HttpTiles, Map, MapMemory, Position,
     extras::{Place, Places},

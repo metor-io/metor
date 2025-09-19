@@ -23,7 +23,7 @@ pub fn metadatatize(input: TokenStream) -> TokenStream {
         parent,
     } = Metadatatize::from_derive_input(&input).unwrap();
     let where_clause = &generics.where_clause;
-    let impeller_wkt = quote! { #crate_name::impeller2_wkt };
+    let impeller_wkt = quote! { #crate_name::metor_proto_wkt };
     match data {
         ast::Data::Enum(variants) => {
             let variants = variants.iter().map(|v| v.to_string()).collect::<Vec<_>>();

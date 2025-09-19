@@ -6,11 +6,11 @@ use std::{
 };
 use unicode_ident::*;
 
-use impeller2::{
+use metor_proto::{
     schema::Schema,
     types::{ComponentId, Timestamp},
 };
-use impeller2_wkt::ComponentPath;
+use metor_proto_wkt::ComponentPath;
 use peg::error::ParseError;
 
 #[derive(Debug, Clone, PartialEq)]
@@ -760,7 +760,7 @@ mod tests {
     }
 
     fn create_test_entity_component() -> Arc<Component> {
-        use impeller2::types::{ComponentId, PrimType};
+        use metor_proto::types::{ComponentId, PrimType};
 
         Arc::new(Component::new(
             "a.world_pos".to_string(),
@@ -889,7 +889,7 @@ mod tests {
 
     #[test]
     fn test_two_table_join_sql() {
-        use impeller2::types::{ComponentId, PrimType};
+        use metor_proto::types::{ComponentId, PrimType};
 
         let part1 = create_test_component_part();
         let context = create_test_context();
@@ -943,7 +943,7 @@ mod tests {
 
     #[test]
     fn test_three_table_join_sql() {
-        use impeller2::types::{ComponentId, PrimType};
+        use metor_proto::types::{ComponentId, PrimType};
 
         let part1 = create_test_component_part();
         let context = create_test_context();

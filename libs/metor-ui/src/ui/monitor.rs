@@ -1,9 +1,9 @@
 use bevy::{ecs::system::SystemParam, prelude::*};
 use bevy_egui::egui::{self, Frame, RichText, Stroke};
-use impeller2::types::ComponentId;
-use impeller2_bevy::ComponentValue;
-use impeller2_bevy::ComponentValueExt;
-use impeller2_bevy::{ComponentMetadataRegistry, EntityMap};
+use metor_proto::types::ComponentId;
+use metor_proto_bevy::ComponentValue;
+use metor_proto_bevy::ComponentValueExt;
+use metor_proto_bevy::{ComponentMetadataRegistry, EntityMap};
 
 use super::{colors::get_scheme, widgets::WidgetSystem};
 
@@ -95,37 +95,37 @@ impl WidgetSystem for MonitorWidget<'_, '_> {
                                                 .unwrap_or_else(|| format!("{dim_i:?}"));
 
                                             let value = match value {
-                                                impeller2_bevy::ElementValueMut::U8(v) => {
+                                                metor_proto_bevy::ElementValueMut::U8(v) => {
                                                     v.to_string()
                                                 }
-                                                impeller2_bevy::ElementValueMut::U16(v) => {
+                                                metor_proto_bevy::ElementValueMut::U16(v) => {
                                                     v.to_string()
                                                 }
-                                                impeller2_bevy::ElementValueMut::U32(v) => {
+                                                metor_proto_bevy::ElementValueMut::U32(v) => {
                                                     v.to_string()
                                                 }
-                                                impeller2_bevy::ElementValueMut::U64(v) => {
+                                                metor_proto_bevy::ElementValueMut::U64(v) => {
                                                     v.to_string()
                                                 }
-                                                impeller2_bevy::ElementValueMut::I8(v) => {
+                                                metor_proto_bevy::ElementValueMut::I8(v) => {
                                                     v.to_string()
                                                 }
-                                                impeller2_bevy::ElementValueMut::I16(v) => {
+                                                metor_proto_bevy::ElementValueMut::I16(v) => {
                                                     v.to_string()
                                                 }
-                                                impeller2_bevy::ElementValueMut::I32(v) => {
+                                                metor_proto_bevy::ElementValueMut::I32(v) => {
                                                     v.to_string()
                                                 }
-                                                impeller2_bevy::ElementValueMut::I64(v) => {
+                                                metor_proto_bevy::ElementValueMut::I64(v) => {
                                                     v.to_string()
                                                 }
-                                                impeller2_bevy::ElementValueMut::F64(v) => {
+                                                metor_proto_bevy::ElementValueMut::F64(v) => {
                                                     format!("{v:.8}")
                                                 }
-                                                impeller2_bevy::ElementValueMut::F32(v) => {
+                                                metor_proto_bevy::ElementValueMut::F32(v) => {
                                                     format!("{v:.8}")
                                                 }
-                                                impeller2_bevy::ElementValueMut::Bool(v) => {
+                                                metor_proto_bevy::ElementValueMut::Bool(v) => {
                                                     v.to_string()
                                                 }
                                             };

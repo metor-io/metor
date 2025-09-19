@@ -25,14 +25,14 @@ use bevy::{
 use bevy_egui::{EguiContextSettings, EguiPlugin};
 use big_space::{FloatingOrigin, FloatingOriginSettings, GridCell};
 use convert_case::{Case, Casing};
-use impeller2::types::{ComponentId, OwnedPacket};
-use impeller2::types::{Msg, Timestamp};
-use impeller2_bevy::{
+use metor_proto::types::{ComponentId, OwnedPacket};
+use metor_proto::types::{Msg, Timestamp};
+use metor_proto_bevy::{
     ComponentMetadataRegistry, ComponentPathRegistry, ComponentSchemaRegistry, ComponentValueMap,
     CurrentStreamId, EntityMap, PacketHandlerInput, PacketHandlers, PacketTx,
 };
-use impeller2_wkt::{CurrentTimestamp, NewConnection, Object3D, SetStreamState, WorldPos};
-use impeller2_wkt::{EarliestTimestamp, LastUpdated};
+use metor_proto_wkt::{CurrentTimestamp, NewConnection, Object3D, SetStreamState, WorldPos};
+use metor_proto_wkt::{EarliestTimestamp, LastUpdated};
 use nox::Tensor;
 use object_3d::create_object_3d_entity;
 use plugins::navigation_gizmo::{NavigationGizmoPlugin, RenderLayerAlloc};
@@ -177,7 +177,7 @@ impl Plugin for EditorPlugin {
             })
             .add_plugins(bevy_infinite_grid::InfiniteGridPlugin)
             .add_plugins(NavigationGizmoPlugin)
-            .add_plugins(impeller2_bevy::Impeller2Plugin)
+            .add_plugins(metor_proto_bevy::Impeller2Plugin)
             //.add_plugins(crate::plugins::gizmos::GizmoPlugin)
             .add_plugins(ui::UiPlugin)
             .add_plugins(FrameTimeDiagnosticsPlugin::default())
@@ -193,7 +193,7 @@ impl Plugin for EditorPlugin {
             //.add_systems(Update, make_entities_selectable)
             .add_systems(PreUpdate, setup_cell)
             .add_systems(PreUpdate, sync_res::<CurrentTimestamp>)
-            .add_systems(PreUpdate, sync_res::<impeller2_wkt::SimulationTimeStep>)
+            .add_systems(PreUpdate, sync_res::<metor_proto_wkt::SimulationTimeStep>)
             .add_systems(PreUpdate, sync_pos)
             .add_systems(PreUpdate, sync_object_3d)
             .add_systems(Update, sync_paused)
@@ -682,25 +682,25 @@ pub trait BevyExt {
     type Bevy;
     fn into_bevy(self) -> Self::Bevy;
 }
-impl BevyExt for impeller2_wkt::Mesh {
+impl BevyExt for metor_proto_wkt::Mesh {
     type Bevy = Mesh;
 
     fn into_bevy(self) -> Self::Bevy {
         match self {
-            impeller2_wkt::Mesh::Sphere { radius } => {
+            metor_proto_wkt::Mesh::Sphere { radius } => {
                 bevy::math::primitives::Sphere { radius }.into()
             }
-            impeller2_wkt::Mesh::Box { x, y, z } => {
+            metor_proto_wkt::Mesh::Box { x, y, z } => {
                 bevy::math::primitives::Cuboid::new(x, y, z).into()
             }
-            impeller2_wkt::Mesh::Cylinder { radius, height } => {
+            metor_proto_wkt::Mesh::Cylinder { radius, height } => {
                 bevy::math::primitives::Cylinder::new(radius, height).into()
             }
         }
     }
 }
 
-impl BevyExt for impeller2_wkt::Material {
+impl BevyExt for metor_proto_wkt::Material {
     type Bevy = StandardMaterial;
 
     fn into_bevy(self) -> Self::Bevy {
@@ -716,10 +716,10 @@ struct SyncedObject3d(HashMap<Entity, Entity>);
 
 #[allow(clippy::too_many_arguments)]
 fn sync_object_3d(
-    query: Query<(Entity, &ComponentId), With<impeller2_wkt::WorldPos>>,
-    meshes: Query<&impeller2_wkt::Mesh>,
-    materials: Query<&impeller2_wkt::Material>,
-    glbs: Query<&impeller2_wkt::Glb>,
+    query: Query<(Entity, &ComponentId), With<metor_proto_wkt::WorldPos>>,
+    meshes: Query<&metor_proto_wkt::Mesh>,
+    materials: Query<&metor_proto_wkt::Material>,
+    glbs: Query<&metor_proto_wkt::Glb>,
     mut synced_object_3d: ResMut<SyncedObject3d>,
     entity_map: ResMut<EntityMap>,
     path_reg: Res<ComponentPathRegistry>,
@@ -758,8 +758,8 @@ fn sync_object_3d(
             .and_then(|e| materials.get(*e).ok());
 
         let mesh_source = match (glb, mesh, material) {
-            (Some(glb), _, _) => impeller2_wkt::Object3DMesh::Glb(glb.0.clone()),
-            (_, Some(mesh), Some(mat)) => impeller2_wkt::Object3DMesh::Mesh {
+            (Some(glb), _, _) => metor_proto_wkt::Object3DMesh::Glb(glb.0.clone()),
+            (_, Some(mesh), Some(mat)) => metor_proto_wkt::Object3DMesh::Mesh {
                 mesh: mesh.clone(),
                 material: mat.clone(),
             },

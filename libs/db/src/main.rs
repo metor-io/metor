@@ -1,7 +1,7 @@
 use std::{io::Write, net::SocketAddr, path::PathBuf};
 
 use clap::{Parser, Subcommand};
-use impeller2::vtable;
+use metor_proto::vtable;
 use metor_db::Server;
 use miette::IntoDiagnostic;
 use postcard_c_codegen::SchemaExt;
@@ -20,7 +20,7 @@ enum Commands {
     #[command(about = "Run the Metor database server")]
     Run(RunArgs),
     #[command(about = "Run a Lua script or launch a REPL")]
-    Lua(impeller2_cli::Args),
+    Lua(metor_proto_cli::Args),
     #[command(about = "Generate C++ header files")]
     GenCpp,
 }
@@ -75,16 +75,16 @@ async fn main() -> miette::Result<()> {
             let server = Server::new(path, addr).into_diagnostic()?;
             let db = stellarator::spawn(server.run());
             if let Some(lua_config) = config {
-                let args = impeller2_cli::Args {
+                let args = metor_proto_cli::Args {
                     path: Some(lua_config),
                 };
-                impeller2_cli::run(args)
+                metor_proto_cli::run(args)
                     .await
                     .map_err(|e| miette::miette!(e))?;
             }
             db.await.unwrap().into_diagnostic()
         }
-        Commands::Lua(args) => impeller2_cli::run(args)
+        Commands::Lua(args) => metor_proto_cli::run(args)
             .await
             .map_err(|e| miette::miette!(e)),
         Commands::GenCpp => {
@@ -92,20 +92,20 @@ async fn main() -> miette::Result<()> {
                 "ELODIN_DB",
                 [
                     include_str!("../../postcard-c/postcard.h").to_string(),
-                    impeller2_wkt::InitialTimestamp::to_cpp()?,
-                    impeller2_wkt::FixedRateBehavior::to_cpp()?,
-                    impeller2_wkt::StreamBehavior::to_cpp()?,
-                    impeller2_wkt::Stream::to_cpp()?,
-                    impeller2_wkt::MsgStream::to_cpp()?,
+                    metor_proto_wkt::InitialTimestamp::to_cpp()?,
+                    metor_proto_wkt::FixedRateBehavior::to_cpp()?,
+                    metor_proto_wkt::StreamBehavior::to_cpp()?,
+                    metor_proto_wkt::Stream::to_cpp()?,
+                    metor_proto_wkt::MsgStream::to_cpp()?,
                     vtable::Field::to_cpp()?,
                     vtable::Op::to_cpp()?,
                     vtable::OpRef::to_cpp()?,
-                    impeller2::types::PrimType::to_cpp()?,
+                    metor_proto::types::PrimType::to_cpp()?,
                     vtable::VTable::<Vec<vtable::Op>, Vec<u8>, Vec<vtable::Field>>::to_cpp()?,
-                    impeller2_wkt::VTableMsg::to_cpp()?,
-                    impeller2_wkt::VTableStream::to_cpp()?,
-                    impeller2_wkt::ComponentMetadata::to_cpp()?,
-                    impeller2_wkt::SetComponentMetadata::to_cpp()?,
+                    metor_proto_wkt::VTableMsg::to_cpp()?,
+                    metor_proto_wkt::VTableStream::to_cpp()?,
+                    metor_proto_wkt::ComponentMetadata::to_cpp()?,
+                    metor_proto_wkt::SetComponentMetadata::to_cpp()?,
                     include_str!("../cpp/helpers.hpp").to_string(),
                     include_str!("../cpp/vtable.hpp").to_string(),
                 ],

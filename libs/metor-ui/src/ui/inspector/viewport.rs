@@ -6,8 +6,8 @@ use bevy::{
 };
 use bevy_egui::egui::{self, Align};
 use bevy_infinite_grid::InfiniteGrid;
-use impeller2_bevy::EntityMap;
-use impeller2_wkt::{ComponentValue, QueryType, WorldPos};
+use metor_proto_bevy::EntityMap;
+use metor_proto_wkt::{ComponentValue, QueryType, WorldPos};
 
 use crate::EqlContext;
 use crate::object_3d::{ComponentArrayExt, EditableEQL, compile_eql_expr};

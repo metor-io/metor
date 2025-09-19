@@ -9,12 +9,12 @@ members = [
     "libs/roci/macros",
     "libs/roci/adcs",
     "libs/wmm",
-    "libs/impeller2",
-    "libs/impeller2/stellar",
-    "libs/impeller2/bevy",
-    "libs/impeller2/wkt",
-    "libs/impeller2/bbq",
-    "libs/impeller2/frame",
+    "libs/metor-proto",
+    "libs/metor-proto/stellar",
+    "libs/metor-proto/bevy",
+    "libs/metor-proto/wkt",
+    "libs/metor-proto/bbq",
+    "libs/metor-proto/frame",
     "libs/db",
     "libs/db/cli",
     "libs/db/tests",
@@ -29,7 +29,7 @@ members = [
     "fsw/video-streamer",
     "fsw/gstreamer",
     "libs/db/eql",
-    "libs/impeller2/kdl",
+    "libs/metor-proto/kdl",
     "examples/cube-sat"
 ]
 exclude = ["fsw/sensor-fw", "fsw/blackbox", "docs/memserve"]

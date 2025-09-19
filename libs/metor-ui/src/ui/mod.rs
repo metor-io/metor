@@ -20,10 +20,10 @@ use schematic::SchematicPlugin;
 use self::colors::get_scheme;
 use self::{command_palette::CommandPaletteState, timeline::timeline_slider};
 use egui::CornerRadius;
-use impeller2::types::ComponentId;
-use impeller2_bevy::ComponentValueMap;
-use impeller2_wkt::ComponentMetadata;
-use impeller2_wkt::ComponentValue;
+use metor_proto::types::ComponentId;
+use metor_proto_bevy::ComponentValueMap;
+use metor_proto_wkt::ComponentMetadata;
+use metor_proto_wkt::ComponentValue;
 
 use crate::{GridHandle, MainCamera, plugins::LogicalKeyState};
 
@@ -95,7 +95,7 @@ pub enum SelectedObject {
 }
 
 impl SelectedObject {
-    pub fn is_entity_selected(&self, id: impeller2::types::ComponentId) -> bool {
+    pub fn is_entity_selected(&self, id: metor_proto::types::ComponentId) -> bool {
         matches!(self, SelectedObject::Entity(pair) if pair.impeller == id)
     }
 

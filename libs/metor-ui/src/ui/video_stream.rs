@@ -16,9 +16,9 @@ use bevy::{
     ui::Val,
 };
 use egui::{self, Color32, TextureHandle, Vec2};
-use impeller2::types::{OwnedPacket, Timestamp};
-use impeller2_bevy::{CommandsExt, CurrentStreamId, PacketGrantR};
-use impeller2_wkt::{CurrentTimestamp, FixedRateMsgStream, FixedRateOp};
+use metor_proto::types::{OwnedPacket, Timestamp};
+use metor_proto_bevy::{CommandsExt, CurrentStreamId, PacketGrantR};
+use metor_proto_wkt::{CurrentTimestamp, FixedRateMsgStream, FixedRateOp};
 use std::sync::Arc;
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::{self};

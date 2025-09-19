@@ -6,9 +6,9 @@ edition = "2024"
 [dependencies]
 metor-db = { path = ".." }
 stellarator = { path = "../../stellarator" }
-impeller2 = { path = "../../impeller2" }
-impeller2-wkt = { path = "../../impeller2/wkt" }
-impeller2-stellar = { path = "../../impeller2/stellar" }
+metor-proto = { path = "../../metor-proto" }
+metor-proto-wkt = { path = "../../metor-proto/wkt" }
+metor-proto-stellar = { path = "../../metor-proto/stellar" }
 nox = { path = "../../nox" }
 fastrand = "2.2.0"
 futures-lite = "2.5.0"

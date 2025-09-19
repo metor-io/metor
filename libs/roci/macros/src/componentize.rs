@@ -23,7 +23,7 @@ pub fn componentize(input: TokenStream) -> TokenStream {
         parent,
     } = Componentize::from_derive_input(&input).unwrap();
     let where_clause = &generics.where_clause;
-    let impeller = quote! { #crate_name::impeller2 };
+    let impeller = quote! { #crate_name::metor_proto };
     let fields = data.take_struct().unwrap();
     let sink_calls = fields.fields.iter().map(|field| {
         let component_id = field.component_id();

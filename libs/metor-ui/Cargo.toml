@@ -49,11 +49,11 @@ reqwest = { version = "0.12", features = [
     "rustls-tls",
     "gzip",
 ], default-features = false }
-impeller2.path = "../../libs/impeller2"
-impeller2.features = ["hifitime"]
-impeller2-wkt.path = "../../libs/impeller2/wkt"
-impeller2-wkt.features = ["bevy", "nox", "gui", "std"]
-impeller2-kdl.path = "../../libs/impeller2/kdl"
+metor-proto.path = "../../libs/metor-proto"
+metor-proto.features = ["hifitime"]
+metor-proto-wkt.path = "../../libs/metor-proto/wkt"
+metor-proto-wkt.features = ["bevy", "nox", "gui", "std"]
+metor-proto-kdl.path = "../../libs/metor-proto/kdl"
 toml.version = "0.8"
 serde = { version = "1.0.196", features = ["derive"] }
 serde_json = "1"
@@ -86,7 +86,7 @@ arrow.version = "54"
 arrow.features = ["canonical_extension_types"]
 
 # lua
-impeller2-cli.path = "../db/cli"
+metor-proto-cli.path = "../db/cli"
 
 # channels
 flume = "0.11.1"
@@ -101,8 +101,8 @@ convert_case = "0.6.0"
 
 
 [target.'cfg(target_family = "wasm")'.dependencies]
-impeller2-bevy.path = "../../libs/impeller2/bevy"
-impeller2-bevy.default-features = false
+metor-proto-bevy.path = "../../libs/metor-proto/bevy"
+metor-proto-bevy.default-features = false
 
 [target.'cfg(not(target_family = "wasm"))'.dependencies]
 tokio = { version = "1.34", features = ["rt-multi-thread", "net"] }
@@ -121,9 +121,9 @@ miette.version = "7.2"
 miette.features = ["fancy"]
 
 # impeller
-impeller2-bevy.path = "../../libs/impeller2/bevy"
-impeller2-bevy.features = ["tcp"]
-impeller2-bevy.default-features = false
+metor-proto-bevy.path = "../../libs/metor-proto/bevy"
+metor-proto-bevy.features = ["tcp"]
+metor-proto-bevy.default-features = false
 
 
 # macos

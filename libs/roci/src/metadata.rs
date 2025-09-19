@@ -1,4 +1,4 @@
-use impeller2_wkt::ComponentMetadata;
+use metor_proto_wkt::ComponentMetadata;
 
 use crate::path::ComponentPath;
 

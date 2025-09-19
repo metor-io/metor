@@ -1,12 +1,12 @@
 use datafusion::common::HashSet;
 use futures_lite::StreamExt;
-use impeller2::registry::VTableRegistry;
-use impeller2::types::{PacketHeader, PacketTy};
-use impeller2::vtable::builder::{
+use metor_proto::registry::VTableRegistry;
+use metor_proto::types::{PacketHeader, PacketTy};
+use metor_proto::vtable::builder::{
     OpBuilder, component, raw_field, raw_table, schema, timestamp, vtable,
 };
-use impeller2::vtable::{RealizedField, builder};
-use impeller2::{
+use metor_proto::vtable::{RealizedField, builder};
+use metor_proto::{
     com_de::Decomponentize,
     registry,
     schema::Schema,
@@ -16,8 +16,8 @@ use impeller2::{
     },
     vtable::VTable,
 };
-use impeller2_stellar::{PacketSink, PacketStream};
-use impeller2_wkt::*;
+use metor_proto_stellar::{PacketSink, PacketStream};
+use metor_proto_wkt::*;
 use msg_log_2::MsgLog;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use smallvec::SmallVec;
@@ -435,52 +435,52 @@ impl ComponentSchema {
         let size = self.size();
         let buf = buf
             .get(..size)
-            .ok_or(Error::Impeller(impeller2::error::Error::BufferOverflow))?;
+            .ok_or(Error::Impeller(metor_proto::error::Error::BufferOverflow))?;
         let dim = &self.dim;
         let view = match self.prim_type {
             PrimType::U8 => ComponentView::U8(
                 nox::ArrayView::from_bytes_shape_unchecked(buf, dim)
-                    .ok_or(Error::Impeller(impeller2::error::Error::BufferOverflow))?,
+                    .ok_or(Error::Impeller(metor_proto::error::Error::BufferOverflow))?,
             ),
             PrimType::U16 => ComponentView::U16(
                 nox::ArrayView::from_bytes_shape_unchecked(buf, dim)
-                    .ok_or(Error::Impeller(impeller2::error::Error::BufferOverflow))?,
+                    .ok_or(Error::Impeller(metor_proto::error::Error::BufferOverflow))?,
             ),
             PrimType::U32 => ComponentView::U32(
                 nox::ArrayView::from_bytes_shape_unchecked(buf, dim)
-                    .ok_or(Error::Impeller(impeller2::error::Error::BufferOverflow))?,
+                    .ok_or(Error::Impeller(metor_proto::error::Error::BufferOverflow))?,
             ),
             PrimType::U64 => ComponentView::U64(
                 nox::ArrayView::from_bytes_shape_unchecked(buf, dim)
-                    .ok_or(Error::Impeller(impeller2::error::Error::BufferOverflow))?,
+                    .ok_or(Error::Impeller(metor_proto::error::Error::BufferOverflow))?,
             ),
             PrimType::I8 => ComponentView::I8(
                 nox::ArrayView::from_bytes_shape_unchecked(buf, dim)
-                    .ok_or(Error::Impeller(impeller2::error::Error::BufferOverflow))?,
+                    .ok_or(Error::Impeller(metor_proto::error::Error::BufferOverflow))?,
             ),
             PrimType::I16 => ComponentView::I16(
                 nox::ArrayView::from_bytes_shape_unchecked(buf, dim)
-                    .ok_or(Error::Impeller(impeller2::error::Error::BufferOverflow))?,
+                    .ok_or(Error::Impeller(metor_proto::error::Error::BufferOverflow))?,
             ),
             PrimType::I32 => ComponentView::I32(
                 nox::ArrayView::from_bytes_shape_unchecked(buf, dim)
-                    .ok_or(Error::Impeller(impeller2::error::Error::BufferOverflow))?,
+                    .ok_or(Error::Impeller(metor_proto::error::Error::BufferOverflow))?,
             ),
             PrimType::I64 => ComponentView::I64(
                 nox::ArrayView::from_bytes_shape_unchecked(buf, dim)
-                    .ok_or(Error::Impeller(impeller2::error::Error::BufferOverflow))?,
+                    .ok_or(Error::Impeller(metor_proto::error::Error::BufferOverflow))?,
             ),
             PrimType::Bool => ComponentView::Bool(
                 nox::ArrayView::from_bytes_shape_unchecked(buf, dim)
-                    .ok_or(Error::Impeller(impeller2::error::Error::BufferOverflow))?,
+                    .ok_or(Error::Impeller(metor_proto::error::Error::BufferOverflow))?,
             ),
             PrimType::F32 => ComponentView::F32(
                 nox::ArrayView::from_bytes_shape_unchecked(buf, dim)
-                    .ok_or(Error::Impeller(impeller2::error::Error::BufferOverflow))?,
+                    .ok_or(Error::Impeller(metor_proto::error::Error::BufferOverflow))?,
             ),
             PrimType::F64 => ComponentView::F64(
                 nox::ArrayView::from_bytes_shape_unchecked(buf, dim)
-                    .ok_or(Error::Impeller(impeller2::error::Error::BufferOverflow))?,
+                    .ok_or(Error::Impeller(metor_proto::error::Error::BufferOverflow))?,
             ),
         };
         Ok((size, view))
@@ -640,7 +640,7 @@ impl Decomponentize for DBSink<'_> {
     fn apply_value(
         &mut self,
         component_id: ComponentId,
-        value: impeller2::types::ComponentView<'_>,
+        value: metor_proto::types::ComponentView<'_>,
         timestamp: Option<Timestamp>,
     ) -> Result<(), Error> {
         let timestamp = timestamp.unwrap_or(self.table_received);
@@ -786,7 +786,7 @@ impl<A: AsyncWrite + 'static> PacketTx<A> {
         let req_id = self.req_id;
         self.send_with_builder(|pkt| {
             let header = PacketHeader {
-                packet_ty: impeller2::types::PacketTy::Msg,
+                packet_ty: metor_proto::types::PacketTy::Msg,
                 id: M::ID,
                 req_id,
             };
@@ -823,7 +823,7 @@ impl<A: AsyncWrite + 'static> PacketTx<A> {
         let req_id = self.req_id;
         self.send_with_builder(|pkt| {
             let header = PacketHeader {
-                packet_ty: impeller2::types::PacketTy::TimeSeries,
+                packet_ty: metor_proto::types::PacketTy::TimeSeries,
                 id,
                 req_id,
             };
@@ -921,7 +921,7 @@ async fn handle_packet<A: AsyncWrite + 'static>(
             let req_id = tx.req_id;
             tx.send_with_builder(move |pkt| {
                 let header = PacketHeader {
-                    packet_ty: impeller2::types::PacketTy::TimeSeries,
+                    packet_ty: metor_proto::types::PacketTy::TimeSeries,
                     id,
                     req_id,
                 };
@@ -986,7 +986,7 @@ async fn handle_packet<A: AsyncWrite + 'static>(
 
             tx.send_with_builder(|pkt| {
                 let header = PacketHeader {
-                    packet_ty: impeller2::types::PacketTy::Msg,
+                    packet_ty: metor_proto::types::PacketTy::Msg,
                     id: ComponentMetadata::ID,
                     req_id: m.req_id,
                 };

@@ -15,8 +15,8 @@ use bevy_render::{
 };
 use egui::UiBuilder;
 use egui_tiles::{Container, Tile, TileId, Tiles};
-use impeller2::types::ComponentId;
-use impeller2_wkt::{Dashboard, Graph, Viewport};
+use metor_proto::types::ComponentId;
+use metor_proto_wkt::{Dashboard, Graph, Viewport};
 use smallvec::SmallVec;
 use std::collections::{BTreeMap, HashMap};
 
@@ -195,7 +195,7 @@ impl TileState {
 
     pub fn create_dashboard_tile(
         &mut self,
-        dashboard: impeller2_wkt::Dashboard,
+        dashboard: metor_proto_wkt::Dashboard,
         label: String,
         tile_id: Option<TileId>,
     ) {
@@ -506,7 +506,7 @@ impl ViewportPane {
                 GlobalTransform::default(),
                 Transform::from_translation(Vec3::new(5.0, 5.0, 10.0))
                     .looking_at(Vec3::ZERO, Vec3::Y),
-                impeller2_wkt::WorldPos::default(),
+                metor_proto_wkt::WorldPos::default(),
             ))
             .id();
         let pos = viewport
@@ -633,7 +633,7 @@ pub enum TreeAction {
     AddQueryPlot(Option<TileId>),
     AddActionTile(Option<TileId>, String, String),
     AddVideoStream(Option<TileId>, [u8; 2], String),
-    AddDashboard(Option<TileId>, Box<impeller2_wkt::Dashboard>, String),
+    AddDashboard(Option<TileId>, Box<metor_proto_wkt::Dashboard>, String),
     AddHierarchy(Option<TileId>),
     AddInspector(Option<TileId>),
     AddSchematicTree(Option<TileId>),

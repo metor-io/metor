@@ -1,5 +1,5 @@
 [package]
-name = "impeller2-cli"
+name = "metor-proto-cli"
 license = "MIT OR Apache-2.0"
 version = "0.1.0"
 edition = "2024"
@@ -31,14 +31,14 @@ tabled = "0.17.0"
 # async
 stellarator.path = "../../stellarator"
 stellarator.features = ["miette"]
-impeller2-stellar.path = "../../impeller2/stellar"
+metor-proto-stellar.path = "../../metor-proto/stellar"
 futures-lite = "2.5.0"
 
 # ser-de
-impeller2.path = "../../impeller2"
-impeller2.features = ["std", "mlua", "hifitime"]
-impeller2-wkt.path = "../../impeller2/wkt"
-impeller2-wkt.features = ["std", "mlua"]
+metor-proto.path = "../../metor-proto"
+metor-proto.features = ["std", "mlua", "hifitime"]
+metor-proto-wkt.path = "../../metor-proto/wkt"
+metor-proto-wkt.features = ["std", "mlua"]
 serde.version = "1.0"
 serde.features = ["derive"]
 postcard = "1.1"

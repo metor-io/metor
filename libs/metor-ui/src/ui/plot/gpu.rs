@@ -40,8 +40,8 @@ use bevy::{
 use bevy_render::extract_component::ExtractComponent;
 use bevy_render::sync_world::{MainEntity, SyncToRenderWorld, TemporaryRenderEntity};
 use binding_types::storage_buffer_read_only_sized;
-use impeller2::types::Timestamp;
-use impeller2_wkt::GraphType;
+use metor_proto::types::Timestamp;
+use metor_proto_wkt::GraphType;
 use std::num::NonZeroU64;
 use std::ops::Range;
 

@@ -24,7 +24,7 @@ tracing-subscriber = { version = "0.3", features = ["chrono"] }
 
 metor-ui.path = "../../libs/metor-ui"
 metor-ui.default-features = false
-impeller2-bevy.path = "../../libs/impeller2/bevy"
+metor-proto-bevy.path = "../../libs/metor-proto/bevy"
 
 [build-dependencies]
 anyhow = "1.0.79"

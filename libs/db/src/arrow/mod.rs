@@ -9,8 +9,8 @@ use arrow::{
 use convert_case::Casing;
 use datafusion::{datasource::MemTable, prelude::SessionContext};
 use futures_lite::{Stream, pin};
-use impeller2::types::{PrimType, Timestamp};
-use impeller2_wkt::ArchiveFormat;
+use metor_proto::types::{PrimType, Timestamp};
+use metor_proto_wkt::ArchiveFormat;
 use std::{
     fs::File,
     ops::{Bound, RangeBounds},

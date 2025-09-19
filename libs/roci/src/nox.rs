@@ -1,9 +1,9 @@
-use impeller2::{
+use metor_proto::{
     component::PrimTypeElem,
     types::Timestamp,
     vtable::builder::{self, FieldBuilder, raw_field, schema},
 };
-use impeller2_wkt::ComponentMetadata;
+use metor_proto_wkt::ComponentMetadata;
 use nox::{
     Body, ConstDim, Dim, Field, SpatialForce, SpatialInertia, SpatialMotion, SpatialTransform,
 };
@@ -241,7 +241,7 @@ impl AsVTable for Timestamp {
         iter::once(raw_field(
             0,
             size_of::<Timestamp>() as u32,
-            builder::schema(impeller2::types::PrimType::I64, &[], component),
+            builder::schema(metor_proto::types::PrimType::I64, &[], component),
         ))
     }
 }

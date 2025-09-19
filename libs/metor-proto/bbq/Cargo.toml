@@ -1,0 +1,14 @@
+[package]
+name = "metor-proto-bbq"
+license = "MIT OR Apache-2.0"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+stellarator-buf.path = "../../stellarator/buf"
+metor-proto.path = ".."
+metor-proto.features = ["std"]
+bbq2.git = "https://github.com/elodin-sys/bbq2.git"
+bbq2.rev = "b6e36706a5549d770ebf2dc122b39cef1368b06d"
+bbq2.default-features = false
+bbq2.features = ["std", "maitake-sync-0_2", "cas-atomics"]

@@ -9,9 +9,9 @@ use bevy::prelude::*;
 use bevy::render::view::RenderLayers;
 use bevy_egui::egui::{self, Color32};
 
-use impeller2::types::{ComponentId, Timestamp};
-use impeller2_bevy::{ComponentPath, ComponentValue};
-use impeller2_wkt::GraphType;
+use metor_proto::types::{ComponentId, Timestamp};
+use metor_proto_bevy::{ComponentPath, ComponentValue};
+use metor_proto_wkt::GraphType;
 
 use super::gpu::LineVisibleRange;
 use crate::MainCamera;

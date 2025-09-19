@@ -9,15 +9,15 @@ use bevy::{
 };
 use bevy_render::render_resource::{Buffer, BufferDescriptor, BufferSlice, BufferUsages};
 use bevy_render::renderer::{RenderDevice, RenderQueue};
-use impeller2::schema::Schema;
-use impeller2::types::{
+use metor_proto::schema::Schema;
+use metor_proto::types::{
     ComponentId, ComponentView, IntoLenPacket, LenPacket, OwnedPacket, PrimType, Timestamp,
 };
-use impeller2_bevy::{
+use metor_proto_bevy::{
     CommandsExt, ComponentSchemaRegistry, ComponentValueMap, CurrentStreamId, EntityMap,
     PacketGrantR, PacketHandlerInput, PacketHandlers, PacketTx,
 };
-use impeller2_wkt::{CurrentTimestamp, EarliestTimestamp, GetTimeSeries, VTableMsg, VTableStream};
+use metor_proto_wkt::{CurrentTimestamp, EarliestTimestamp, GetTimeSeries, VTableMsg, VTableStream};
 use itertools::{Itertools, MinMaxResult};
 use nodit::NoditMap;
 use nodit::interval::ii;
@@ -531,7 +531,7 @@ fn next_range(
 }
 
 fn real_time_vtable(component_id: ComponentId, s: &Schema<Vec<u64>>) -> [LenPacket; 2] {
-    use impeller2::vtable::builder::{component, raw_field, raw_table, schema, timestamp, vtable};
+    use metor_proto::vtable::builder::{component, raw_field, raw_table, schema, timestamp, vtable};
     let time = raw_table(0, size_of::<Timestamp>() as u32);
     let field = raw_field(
         8,

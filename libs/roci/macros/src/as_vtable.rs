@@ -39,7 +39,7 @@ pub fn as_vtable(input: TokenStream) -> TokenStream {
         parent,
     } = AsVTable::from_derive_input(&input).unwrap();
     let where_clause = &generics.where_clause;
-    let impeller = quote! { #crate_name::impeller2 };
+    let impeller = quote! { #crate_name::metor_proto };
     match data {
         ast::Data::Enum(_) => {
             let name = parent.unwrap_or_else(|| ident.to_string());

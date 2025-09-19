@@ -6,7 +6,7 @@ use bevy::ecs::{
 use bevy::prelude::Res;
 use bevy_egui::egui;
 use fuzzy_matcher::{FuzzyMatcher, skim::SkimMatcherV2};
-use impeller2_bevy::EntityMap;
+use metor_proto_bevy::EntityMap;
 use std::collections::BTreeMap;
 
 use crate::ui::{EntityFilter, EntityPair, SelectedObject, colors::get_scheme};

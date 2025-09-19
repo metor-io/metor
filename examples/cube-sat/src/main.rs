@@ -4,10 +4,10 @@ use std::{
     time::{Duration, Instant},
 };
 
-use impeller2::types::{ComponentId, LenPacket, Msg, OwnedPacket, PacketId, Timestamp};
-use impeller2_bbq::RxExt;
-use impeller2_stellar::{PacketSink, PacketStream, queue::spawn_recv};
-use impeller2_wkt::{ComponentValue, MsgStream, SetDbConfig, UpdateComponent};
+use metor_proto::types::{ComponentId, LenPacket, Msg, OwnedPacket, PacketId, Timestamp};
+use metor_proto_bbq::RxExt;
+use metor_proto_stellar::{PacketSink, PacketStream, queue::spawn_recv};
+use metor_proto_wkt::{ComponentValue, MsgStream, SetDbConfig, UpdateComponent};
 use nox::{
     ArrayBuf, Body, DU, Quaternion, Scalar, SpatialForce, SpatialInertia, SpatialMotion,
     SpatialTransform, Vec3, Vector, Vector3, array::Quat, rk4, tensor,
@@ -486,7 +486,7 @@ pub async fn main() -> anyhow::Result<()> {
     .await
     .0?;
     let mut cube_sat = CubeSat::default();
-    let mut pkt = LenPacket::new(impeller2::types::PacketTy::Table, id, size_of::<CubeSat>());
+    let mut pkt = LenPacket::new(metor_proto::types::PacketTy::Table, id, size_of::<CubeSat>());
     loop {
         let start = Instant::now();
         while let Some(pkt) = rx.try_recv_pkt() {

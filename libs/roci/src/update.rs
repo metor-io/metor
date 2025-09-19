@@ -1,6 +1,6 @@
 use std::{collections::HashMap, marker::PhantomData};
 
-use impeller2::{
+use metor_proto::{
     com_de::Decomponentize,
     component::PrimTypeElem,
     types::{ComponentId, ComponentView, PrimType},
@@ -18,7 +18,7 @@ pub struct VTableSink<'a, T> {
 impl<T: FromBytes + IntoBytes> VTableSink<'_, T> {
     pub fn apply_update(
         &mut self,
-        update: &impeller2_wkt::UpdateComponent,
+        update: &metor_proto_wkt::UpdateComponent,
     ) -> Result<(), VTableSinkError> {
         self.apply_value(update.id, update.value.as_view(), None)
     }
@@ -71,9 +71,9 @@ impl<T: FromBytes + IntoBytes> Decomponentize for VTableSink<'_, T> {
 
     fn apply_value(
         &mut self,
-        component_id: impeller2::types::ComponentId,
-        value: impeller2::types::ComponentView<'_>,
-        _timestamp: Option<impeller2::types::Timestamp>,
+        component_id: metor_proto::types::ComponentId,
+        value: metor_proto::types::ComponentView<'_>,
+        _timestamp: Option<metor_proto::types::Timestamp>,
     ) -> Result<(), Self::Error> {
         let field = self
             .index

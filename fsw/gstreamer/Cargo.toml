@@ -10,9 +10,9 @@ gstreamer-base = { version = "0.23", features = ["v1_18"] }
 gstreamer-video = { version = "0.23", features = ["v1_18"] }
 
 # impeller
-impeller2.path = "../../libs/impeller2"
-impeller2.features = ["std"]
-impeller2-wkt = { path = "../../libs/impeller2/wkt" }
+metor-proto.path = "../../libs/metor-proto"
+metor-proto.features = ["std"]
+metor-proto-wkt = { path = "../../libs/metor-proto/wkt" }
 
 # General utilities
 anyhow = "1.0"

@@ -15,12 +15,12 @@ use bevy::{
 use bevy_infinite_grid::InfiniteGrid;
 use egui_tiles::TileId;
 use fuzzy_matcher::{FuzzyMatcher, skim::SkimMatcherV2};
-use impeller2::types::{ComponentId, PrimType, msg_id};
-use impeller2_bevy::{
+use metor_proto::types::{ComponentId, PrimType, msg_id};
+use metor_proto_bevy::{
     ComponentMetadataRegistry, ComponentSchemaRegistry, CurrentStreamId, EntityMap, PacketTx,
 };
-use impeller2_kdl::ToKdl;
-use impeller2_wkt::{
+use metor_proto_kdl::ToKdl;
+use metor_proto_wkt::{
     ComponentValue, IsRecording, Material, Mesh, Object3D, SetDbConfig, SetStreamState,
     UpdateComponent,
 };
@@ -931,7 +931,7 @@ fn create_object_3d_with_color(eql: String, expr: eql::Expr, mesh: Mesh) -> Pale
                     parse_color(color_str, &eql_ctx.0, &entity_map, component_value_maps)
                         .unwrap_or((0.8, 0.8, 0.8));
 
-                let mesh_source = impeller2_wkt::Object3DMesh::Mesh {
+                let mesh_source = metor_proto_wkt::Object3DMesh::Mesh {
                     mesh: mesh.clone(),
                     material: Material::color(r, g, b),
                 };
@@ -1011,7 +1011,7 @@ pub fn create_3d_object() -> PaletteItem {
                                                   mut mesh_assets: ResMut<Assets<bevy::prelude::Mesh>>,
                                                   assets: Res<AssetServer>,
                                                   | {
-                                                let obj = impeller2_wkt::Object3DMesh::Glb(gltf_path.trim().to_string());
+                                                let obj = metor_proto_wkt::Object3DMesh::Glb(gltf_path.trim().to_string());
 
                                                 crate::object_3d::create_object_3d_entity(
                                                     &mut commands,

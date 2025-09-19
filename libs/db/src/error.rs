@@ -1,7 +1,7 @@
 use std::io;
 
-use impeller2::types::{ComponentId, PacketId};
-use impeller2_wkt::{ErrorResponse, StreamId};
+use metor_proto::types::{ComponentId, PacketId};
+use metor_proto_wkt::{ErrorResponse, StreamId};
 use thiserror::Error;
 #[derive(Debug, Error)]
 pub enum Error {
@@ -12,9 +12,9 @@ pub enum Error {
     #[error("io {0}")]
     Io(#[from] std::io::Error),
     #[error("impeller_stella {0}")]
-    ImpellerStella(impeller2_stellar::Error),
+    ImpellerStella(metor_proto_stellar::Error),
     #[error("impeller {0}")]
-    Impeller(#[from] impeller2::error::Error),
+    Impeller(#[from] metor_proto::error::Error),
     #[error("component not found {0}")]
     ComponentNotFound(ComponentId),
     #[error("postcard error {0}")]
@@ -46,10 +46,10 @@ pub enum Error {
     SchemaMismatch,
 }
 
-impl From<impeller2_stellar::Error> for Error {
-    fn from(value: impeller2_stellar::Error) -> Self {
+impl From<metor_proto_stellar::Error> for Error {
+    fn from(value: metor_proto_stellar::Error) -> Self {
         match value {
-            impeller2_stellar::Error::Stellar(error) => Error::from(error),
+            metor_proto_stellar::Error::Stellar(error) => Error::from(error),
             err => Error::ImpellerStella(err),
         }
     }

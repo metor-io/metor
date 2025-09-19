@@ -2,8 +2,8 @@ use bevy::prelude::Mesh;
 use bevy::prelude::*;
 use big_space::GridCell;
 use eql::Expr;
-use impeller2_bevy::EntityMap;
-use impeller2_wkt::{ComponentValue, Object3D};
+use metor_proto_bevy::EntityMap;
+use metor_proto_wkt::{ComponentValue, Object3D};
 use nox::Array;
 use smallvec::smallvec;
 
@@ -193,7 +193,7 @@ pub fn compile_eql_expr(expression: eql::Expr) -> CompiledExpr {
 
 /// System that updates 3D object entities based on their EQL expressions
 pub fn update_object_3d_system(
-    mut objects_query: Query<(Entity, &Object3DState, &mut impeller2_wkt::WorldPos)>,
+    mut objects_query: Query<(Entity, &Object3DState, &mut metor_proto_wkt::WorldPos)>,
     entity_map: Res<EntityMap>,
     component_value_maps: Query<&'static ComponentValue>,
 ) {
@@ -218,16 +218,16 @@ pub fn update_object_3d_system(
 }
 
 pub trait ComponentArrayExt {
-    fn as_world_pos(&self) -> Option<impeller2_wkt::WorldPos>;
+    fn as_world_pos(&self) -> Option<metor_proto_wkt::WorldPos>;
 }
 
 impl ComponentArrayExt for ComponentValue {
-    fn as_world_pos(&self) -> Option<impeller2_wkt::WorldPos> {
+    fn as_world_pos(&self) -> Option<metor_proto_wkt::WorldPos> {
         if let ComponentValue::F64(array) = self {
             use nox::ArrayBuf;
             let data = array.buf.as_buf();
             if data.len() >= 7 {
-                return Some(impeller2_wkt::WorldPos {
+                return Some(metor_proto_wkt::WorldPos {
                     att: nox::Quaternion::new(data[3], data[0], data[1], data[2]),
                     pos: nox::Vector3::new(data[4], data[5], data[6]),
                 });
@@ -239,7 +239,7 @@ impl ComponentArrayExt for ComponentValue {
 
 pub fn create_object_3d_entity(
     commands: &mut Commands,
-    data: impeller2_wkt::Object3D,
+    data: metor_proto_wkt::Object3D,
     expr: eql::Expr,
     material_assets: &mut ResMut<Assets<StandardMaterial>>,
     mesh_assets: &mut ResMut<Assets<Mesh>>,
@@ -256,7 +256,7 @@ pub fn create_object_3d_entity(
         InheritedVisibility::default(),
         ViewVisibility::default(),
         GridCell::<i128>::default(),
-        impeller2_wkt::WorldPos::default(),
+        metor_proto_wkt::WorldPos::default(),
     ));
 
     spawn_mesh(
@@ -271,18 +271,18 @@ pub fn create_object_3d_entity(
 }
 pub fn spawn_mesh(
     entity: &mut EntityCommands,
-    mesh: &impeller2_wkt::Object3DMesh,
+    mesh: &metor_proto_wkt::Object3DMesh,
     material_assets: &mut ResMut<Assets<StandardMaterial>>,
     mesh_assets: &mut ResMut<Assets<Mesh>>,
     assets: &Res<AssetServer>,
 ) -> Entity {
     match mesh {
-        impeller2_wkt::Object3DMesh::Glb(path) => {
+        metor_proto_wkt::Object3DMesh::Glb(path) => {
             let url = format!("{path}#Scene0");
             let scene = assets.load(&url);
             entity.insert(SceneRoot(scene));
         }
-        impeller2_wkt::Object3DMesh::Mesh { mesh, material } => {
+        metor_proto_wkt::Object3DMesh::Mesh { mesh, material } => {
             let material = material.clone().into_bevy();
             let material = material_assets.add(material);
             entity.insert(MeshMaterial3d(material));

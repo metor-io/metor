@@ -25,9 +25,9 @@ use bevy::{
 };
 use bevy_egui::egui::{self, Align, Layout};
 use egui::{CornerRadius, Frame, Margin, RichText, Stroke};
-use impeller2::types::Timestamp;
-use impeller2_bevy::{ComponentMetadataRegistry, ComponentPath};
-use impeller2_wkt::{CurrentTimestamp, EarliestTimestamp};
+use metor_proto::types::Timestamp;
+use metor_proto_bevy::{ComponentMetadataRegistry, ComponentPath};
+use metor_proto_wkt::{CurrentTimestamp, EarliestTimestamp};
 use std::time::{Duration, Instant};
 use std::{
     fmt::Debug,

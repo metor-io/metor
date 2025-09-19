@@ -4,9 +4,9 @@ use bevy::ecs::{
 };
 use bevy_egui::egui;
 use egui::{Ui, load::SizedTexture};
-use impeller2::types::Timestamp;
-use impeller2_bevy::{CurrentStreamId, PacketTx};
-use impeller2_wkt::{
+use metor_proto::types::Timestamp;
+use metor_proto_bevy::{CurrentStreamId, PacketTx};
+use metor_proto_wkt::{
     CurrentTimestamp, EarliestTimestamp, LastUpdated, SetStreamState, SimulationTimeStep,
 };
 

@@ -1,7 +1,7 @@
 use std::str::FromStr;
 
 use bevy::{ecs::system::SystemParam, prelude::*};
-use impeller2_wkt::{Dashboard, DashboardNode};
+use metor_proto_wkt::{Dashboard, DashboardNode};
 
 use crate::ui::dashboard::DashboardNodePath;
 use crate::{
@@ -138,9 +138,9 @@ fn val_editor(
     ui: &mut egui::Ui,
     label: &str,
     eql_ctx: &eql::Context,
-    val: &mut impeller2_wkt::Val,
+    val: &mut metor_proto_wkt::Val,
 ) -> bool {
-    use impeller2_wkt::Val;
+    use metor_proto_wkt::Val;
     ui.label(egui::RichText::new(label).color(get_scheme().text_secondary));
     configure_input_with_border(ui.style_mut());
 
@@ -186,9 +186,9 @@ fn val_editor(
 fn val_ty_select(
     ui: &mut egui::Ui,
     current_val_type: &'static str,
-    val: &mut impeller2_wkt::Val,
-) -> Option<impeller2_wkt::Val> {
-    use impeller2_wkt::Val;
+    val: &mut metor_proto_wkt::Val,
+) -> Option<metor_proto_wkt::Val> {
+    use metor_proto_wkt::Val;
     ui.scope(|ui| {
         configure_combo_box(ui.style_mut());
         ui.style_mut().spacing.combo_width = 60.0;

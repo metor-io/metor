@@ -12,12 +12,12 @@ repository = "https://github.com/metor-sys/metor"
 default = ["csv", "std", "stellar"]
 std = []
 csv = ["dep:csv", "serde"]
-stellar = ["dep:stellarator", "impeller2-stellar", "impeller2/thingbuf", "fastrand", "bbq2", "impeller2-bbq"]
+stellar = ["dep:stellarator", "metor-proto-stellar", "metor-proto/thingbuf", "fastrand", "bbq2", "metor-proto-bbq"]
 
 [dependencies]
-impeller2.path = "../impeller2"
-impeller2.features = ["std"]
-impeller2-wkt.path = "../impeller2/wkt"
+metor-proto.path = "../metor-proto"
+metor-proto.features = ["std"]
+metor-proto-wkt.path = "../metor-proto/wkt"
 
 # data structures
 heapless = "0.8"
@@ -28,11 +28,11 @@ zerocopy.features = ["derive"]
 # async
 stellarator.path = "../stellarator"
 stellarator.optional = true
-impeller2-stellar.path = "../impeller2/stellar"
-impeller2-stellar.features = ["queue"]
-impeller2-stellar.optional = true
-impeller2-bbq.path = "../impeller2/bbq"
-impeller2-bbq.optional = true
+metor-proto-stellar.path = "../metor-proto/stellar"
+metor-proto-stellar.features = ["queue"]
+metor-proto-stellar.optional = true
+metor-proto-bbq.path = "../metor-proto/bbq"
+metor-proto-bbq.optional = true
 fastrand.version = "2.2.0"
 fastrand.optional = true
 bbq2.git = "https://github.com/elodin-sys/bbq2.git"
