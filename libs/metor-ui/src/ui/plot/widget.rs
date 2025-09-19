@@ -154,7 +154,7 @@ pub const TICK_MARK_LINE_WIDTH: f32 = 1.0;
 pub const TICK_MARK_ASPECT_RATIO: f32 = 12.0 / 30.0;
 pub const NOTCH_LENGTH: f32 = 10.0;
 pub const AXIS_LABEL_MARGIN: f32 = 5.0;
-pub const Y_AXIS_LABEL_MARGIN: f32 = 10.0;
+pub const Y_AXIS_LABEL_MARGIN: f32 = 4.0;
 pub const Y_AXIS_FLAG_WIDTH: f32 = 70.0;
 pub const Y_AXIS_FLAG_HEIGHT: f32 = 20.0;
 pub const Y_AXIS_FLAG_MARGIN: f32 = 4.0;
@@ -477,7 +477,7 @@ impl TimeseriesPlot {
             return;
         }
 
-        font_id.size = 11.0;
+        font_id.size = 10.0;
 
         draw_borders(ui, self.rect, self.inner_rect);
 
@@ -574,7 +574,7 @@ pub fn draw_y_axis(
     let border_stroke = egui::Stroke::new(1.0, get_scheme().border_primary);
     let scheme = get_scheme();
     let mut font_id = egui::TextStyle::Monospace.resolve(ui.style());
-    font_id.size = 11.0;
+    font_id.size = 10.0;
 
     let draw_tick = |tick| {
         let value = DVec2::new(bounds.min_x, tick);
@@ -690,12 +690,12 @@ pub fn draw_borders(ui: &mut egui::Ui, rect: egui::Rect, inner_rect: egui::Rect)
     ui.painter()
         .rect_filled(x_bg_rect, CornerRadius::ZERO, border_bg_color);
 
-    let border_stroke = egui::Stroke::new(1.0, get_scheme().border_primary);
-    let left_border = [inner_rect.left_top(), inner_rect.left_bottom()];
-    ui.painter().line_segment(left_border, border_stroke);
+    // let border_stroke = egui::Stroke::new(1.0, get_scheme().border_primary);
+    // let left_border = [inner_rect.left_top(), inner_rect.left_bottom()];
+    // ui.painter().line_segment(left_border, border_stroke);
 
-    let bottom_border = [inner_rect.left_bottom(), inner_rect.right_bottom()];
-    ui.painter().line_segment(bottom_border, border_stroke);
+    // let bottom_border = [inner_rect.left_bottom(), inner_rect.right_bottom()];
+    // ui.painter().line_segment(bottom_border, border_stroke);
 }
 
 pub fn draw_tick_mark(

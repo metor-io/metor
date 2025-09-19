@@ -18,6 +18,7 @@ use crate::{
         colors::{ColorExt, get_scheme},
         theme::configure_combo_box,
         time_label::time_label,
+        utils::MarginSides,
         widgets::WidgetSystem,
     },
 };
@@ -59,14 +60,14 @@ impl WidgetSystem for TimelineControls<'_> {
         } = state.get_mut(world);
 
         let mut tick_changed = false;
-        ui.set_height(34.0);
+        ui.set_height(32.0);
 
         egui::Frame::NONE
             .inner_margin(egui::Margin::symmetric(4, 6))
             .show(ui, |ui| {
                 ui.horizontal(|ui| {
                     ui.allocate_ui_with_layout(
-                        egui::vec2(ui.available_width(), 22.0),
+                        egui::vec2(ui.available_width(), 23.4),
                         egui::Layout::left_to_right(egui::Align::Center),
                         |ui| {
                             let btn_scale = 1.3;
@@ -137,7 +138,7 @@ impl WidgetSystem for TimelineControls<'_> {
                         egui::Layout::right_to_left(egui::Align::Center),
                         |col_ui| {
                             egui::Frame::NONE
-                                .inner_margin(egui::Margin::symmetric(8, 0))
+                                .inner_margin(egui::Margin::symmetric(8, 0).top(-1.0))
                                 .show(col_ui, |ui| {
                                     ui.spacing_mut().item_spacing.x = 12.0;
                                     let popup_id = ui.make_persistent_id("time_selector");
@@ -150,8 +151,8 @@ impl WidgetSystem for TimelineControls<'_> {
                                         egui::containers::Popup::toggle_id(ui.ctx(), popup_id);
                                     }
                                     configure_combo_box(ui.style_mut());
-                                    ui.style_mut().spacing.interact_size.y = 28.0;
-                                    ui.style_mut().spacing.button_padding = [8.0, 0.0].into();
+                                    ui.style_mut().spacing.interact_size.y = 22.0;
+                                    ui.style_mut().spacing.button_padding = [4.0, 0.0].into();
                                     egui::containers::Popup::menu(&res).show(time_range_window(
                                         &mut behavior,
                                         earliest_timestamp.0,

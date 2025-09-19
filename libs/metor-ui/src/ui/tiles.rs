@@ -683,7 +683,7 @@ impl egui_tiles::Behavior<Pane> for TreeBehavior<'_> {
         };
         let text = self.tab_title_for_tile(tiles, tile_id);
         let mut font_id = egui::TextStyle::Button.resolve(ui.style());
-        font_id.size = 11.0;
+        font_id.size = 10.0;
         let galley = text.into_galley(ui, Some(egui::TextWrapMode::Extend), f32::INFINITY, font_id);
         let x_margin = self.tab_title_spacing(ui.visuals());
         let (_, rect) = ui.allocate_space(vec2(
@@ -718,7 +718,7 @@ impl egui_tiles::Behavior<Pane> for TreeBehavior<'_> {
             ui.add_space(-3.0 * x_margin);
             let close_response = ui.add(
                 EImageButton::new(self.icons.close)
-                    .scale(1.3, 1.3)
+                    .scale(1.1, 1.1)
                     .image_tint(match tab_state {
                         TabState::Inactive => scheme.text_primary,
                         TabState::Selected => scheme.bg_primary,
@@ -761,7 +761,7 @@ impl egui_tiles::Behavior<Pane> for TreeBehavior<'_> {
     }
 
     fn tab_bar_height(&self, _style: &egui::Style) -> f32 {
-        32.0
+        28.0
     }
 
     fn tab_bar_color(&self, _visuals: &egui::Visuals) -> Color32 {
@@ -821,8 +821,13 @@ impl egui_tiles::Behavior<Pane> for TreeBehavior<'_> {
 
         ui.style_mut().visuals.widgets.hovered.bg_stroke = Stroke::NONE;
         ui.style_mut().visuals.widgets.active.bg_stroke = Stroke::NONE;
+        ui.style_mut().visuals.widgets.inactive.bg_stroke = Stroke::NONE;
         ui.add_space(5.0);
-        let resp = ui.add(EImageButton::new(self.icons.add).scale(1.4, 1.4));
+        let resp = ui.add(
+            EImageButton::new(self.icons.add)
+                .scale(1.1, 1.1)
+                .bg_color(Color32::TRANSPARENT),
+        );
         if resp.clicked() {
             layout
                 .cmd_palette_state

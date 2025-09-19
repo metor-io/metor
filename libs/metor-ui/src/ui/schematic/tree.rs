@@ -460,7 +460,7 @@ impl Branch {
         ui.visuals_mut().indent_has_left_vline = false;
         let scheme = get_scheme();
         let header_res = ui.allocate_ui_with_layout(
-            egui::vec2(ui.available_width(), 36.0),
+            egui::vec2(ui.available_width(), 28.0),
             egui::Layout::left_to_right(egui::Align::Center),
             |ui| {
                 let inner_rect = ui.max_rect();
@@ -525,7 +525,7 @@ impl Branch {
                     .paint_at(ui, icon_rect);
 
                 let mut font_id = egui::TextStyle::Button.resolve(ui.style());
-                font_id.size = 12.0;
+                font_id.size = 11.0;
                 ui.painter().text(
                     icon_rect.right_center() + egui::vec2(8.0, 0.0),
                     egui::Align2::LEFT_CENTER,

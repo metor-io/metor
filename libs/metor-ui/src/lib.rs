@@ -172,7 +172,7 @@ impl Plugin for EditorPlugin {
             .add_plugins(bevy_editor_cam::DefaultEditorCamPlugins)
             .add_plugins(EmbeddedAssetPlugin)
             .add_plugins(EguiPlugin {
-                ui_render_order: bevy_egui::UiRenderOrder::BevyUiAboveEgui,
+                ui_render_order: bevy_egui::UiRenderOrder::EguiAboveBevyUi,
                 ..Default::default()
             })
             .add_plugins(bevy_infinite_grid::InfiniteGridPlugin)
@@ -258,7 +258,14 @@ fn setup_floating_origin(mut commands: Commands) {
 }
 
 fn spawn_ui_cam(mut commands: Commands) {
-    commands.spawn((Camera2d, IsDefaultUiCamera));
+    commands.spawn((
+        Camera2d,
+        Camera {
+            order: 1000,
+            ..Default::default()
+        },
+        IsDefaultUiCamera,
+    ));
 }
 
 fn set_clear_color(mut clear_color: ResMut<ClearColor>) {
