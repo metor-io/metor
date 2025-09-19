@@ -87,8 +87,8 @@ pub struct TimeSeriesNodeSlice {
 
 impl TimeSeriesNodeSlice {
     pub fn timestamps(&self) -> &[Timestamp] {
-        let start: usize = *self.range.start(); //.min(self.node.timestamps().len().saturating_sub(1));
-        let mut end = *self.range.end(); //.min(self.node.timestamps().len().saturating_sub(1));
+        let start: usize = *self.range.start();
+        let mut end = *self.range.end();
         if end >= self.node.timestamps().len() {
             println!(
                 "End index out of bounds {end:?} >= {}",

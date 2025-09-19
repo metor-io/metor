@@ -28,7 +28,6 @@ use std::{
 pub struct AppendLog<E> {
     map: Arc<memmap2::MmapRaw>,
     header_extra: PhantomData<E>,
-    write_lock: Arc<Mutex<()>>,
 }
 
 impl<E> Clone for AppendLog<E> {
@@ -36,7 +35,6 @@ impl<E> Clone for AppendLog<E> {
         Self {
             map: self.map.clone(),
             header_extra: PhantomData,
-            write_lock: self.write_lock.clone(),
         }
     }
 }
@@ -66,7 +64,6 @@ impl<E: IntoBytes + Immutable> AppendLog<E> {
         let map = Self {
             map,
             header_extra: PhantomData,
-            write_lock: Arc::new(Mutex::new(())),
         };
         unsafe {
             let map = map.map.as_mut_ptr().add(size_of::<AtomicU64>() * 2);
@@ -85,7 +82,6 @@ impl<E: IntoBytes + Immutable> AppendLog<E> {
         let map = Self {
             map,
             header_extra: PhantomData,
-            write_lock: Arc::new(Mutex::new(())),
         };
         Ok(map)
     }
@@ -140,7 +136,6 @@ impl<E: IntoBytes + Immutable> AppendLog<E> {
     }
 
     pub fn write(&self, buf: &[u8]) -> Result<usize, Error> {
-        let guard = self.write_lock.lock().unwrap();
         let slice: &mut [u8] =
             unsafe { slice::from_raw_parts_mut(self.map.as_mut_ptr(), self.map.len()) };
 
@@ -154,7 +149,6 @@ impl<E: IntoBytes + Immutable> AppendLog<E> {
 
         self.committed_len()
             .store(head_end as u64, Ordering::Release);
-        drop(guard);
         Ok(end - size_of::<Header<E>>())
     }
 
