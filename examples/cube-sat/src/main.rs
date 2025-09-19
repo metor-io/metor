@@ -13,8 +13,8 @@ use nox::{
     SpatialTransform, Vec3, Vector, Vector3, array::Quat, rk4, tensor,
 };
 use rand_distr::Distribution;
-use roci::{AsVTable, Metadatatize, tcp::SinkExt};
-use roci_adcs::{mekf, yang_lqr::YangLQR};
+use metor_fsw::{AsVTable, Metadatatize, tcp::SinkExt};
+use metor_fsw_adcs::{mekf, yang_lqr::YangLQR};
 use stellarator::{io::SplitExt, net::TcpStream, rent, struc_con::stellar};
 use tracing_subscriber::EnvFilter;
 use zerocopy::{Immutable, IntoBytes, KnownLayout};
@@ -30,7 +30,7 @@ const K_0: Vec3<f64> = Vec3::from_buf([-30926.00e-9, 5817.00e-9, -2318.00e-9]);
 
 #[derive(AsVTable, Debug, Clone, Immutable, KnownLayout, Metadatatize, IntoBytes)]
 #[repr(C)]
-#[roci(parent = "cube_sat")]
+#[metor_fsw(parent = "cube_sat")]
 pub struct CubeSat {
     pub sim: Sim,
     pub fsw: FSW,

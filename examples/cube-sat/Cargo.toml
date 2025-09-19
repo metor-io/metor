@@ -17,8 +17,8 @@ metor-proto-wkt.path = "../../libs/metor-proto/wkt"
 metor-proto-wkt.features = ["gui", "std"]
 metor-proto-bbq.path = "../../libs/metor-proto/bbq"
 zerocopy.version = "0.8.2"
-roci.path = "../../libs/roci"
-roci-adcs.path = "../../libs/roci/adcs"
+metor-fsw.path = "../../libs/metor-fsw"
+metor-fsw-adcs.path = "../../libs/metor-fsw/adcs"
 
 anyhow = "1"
 

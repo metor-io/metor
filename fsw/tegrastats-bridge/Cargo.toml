@@ -18,7 +18,7 @@ metor-proto.features = ["std"]
 metor-proto-wkt.path = "../../libs/metor-proto/wkt"
 metor-proto-wkt.features = ["gui", "std"]
 zerocopy.version = "0.8.2"
-roci.path = "../../libs/roci"
+metor-fsw.path = "../../libs/metor-fsw"
 
 # errors
 anyhow = "1"

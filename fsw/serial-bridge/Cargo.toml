@@ -23,13 +23,13 @@ metor-proto-wkt.features = ["std"]
 metor-proto-frame.path = "../../libs/metor-proto/frame"
 cobs = "0.2"
 zerocopy.version = "0.8.2"
-roci.path = "../../libs/roci"
+metor-fsw.path = "../../libs/metor-fsw"
 serde.version = "1.0"
 serde.features = ["derive"]
 postcard-schema.version = "0.2"
 postcard-schema.features = ["derive"]
 blackbox.path = "../../fsw/blackbox"
-blackbox.features = ["roci"]
+blackbox.features = ["metor-fsw"]
 
 # rand
 fastrand = "2.2.0"

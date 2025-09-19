@@ -6,9 +6,9 @@ repository.workspace = true
 publish = false
 
 [features]
-roci = ["dep:roci", "std"]
-std = ["roci/std"]
+metor-fsw = ["dep:metor-fsw", "std"]
+std = ["metor-fsw/std"]
 
 [dependencies]
 zerocopy = { version = "0.8.13", features = ["derive"] }
-roci = { path = "../../libs/roci", default-features = false, optional = true }
+metor-fsw = { path = "../../libs/metor-fsw", default-features = false, optional = true }

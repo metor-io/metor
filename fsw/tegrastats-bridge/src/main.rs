@@ -1,14 +1,14 @@
 use futures_concurrency::future::Join;
 use metor_proto::types::{LenPacket, PacketId};
 use metor_proto_stellar::Client;
-use roci::{AsVTable, Metadatatize, tcp::SinkExt};
+use metor_fsw::{AsVTable, Metadatatize, tcp::SinkExt};
 use std::{mem, net::SocketAddr, time::Duration};
 use stellarator::{fs::File, rent};
 use sysinfo::CpuRefreshKind;
 use zerocopy::{Immutable, IntoBytes};
 
 #[derive(AsVTable, Metadatatize, IntoBytes, Immutable, Debug)]
-#[roci(parent = "aleph")]
+#[metor_fsw(parent = "aleph")]
 pub struct Output {
     pub cpu_usage: [f32; 8],
     pub cpu_freq: [f32; 8],

@@ -5,9 +5,9 @@ members = [
     "libs/nox",
     "libs/nox-frames",
     "apps/metor",
-    "libs/roci",
-    "libs/roci/macros",
-    "libs/roci/adcs",
+    "libs/metor-fsw",
+    "libs/metor-fsw/macros",
+    "libs/metor-fsw/adcs",
     "libs/wmm",
     "libs/metor-proto",
     "libs/metor-proto/stellar",
@@ -58,10 +58,10 @@ inherits = "release"
 lto = "thin"
 
 [workspace.dependencies]
-roci-macros.path = "libs/roci/macros"
-roci.path = "libs/roci"
-roci.default-features = false
-roci-adcs.path = "libs/roci/adcs"
+metor-fsw-macros.path = "libs/metor-fsw/macros"
+metor-fsw.path = "libs/metor-fsw"
+metor-fsw.default-features = false
+metor-fsw-adcs.path = "libs/metor-fsw/adcs"
 nox.path = "libs/nox"
 nox.default-features = false
 nox-frames.path = "libs/nox-frames"

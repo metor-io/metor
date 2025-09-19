@@ -1,6 +1,6 @@
 use metor_proto::types::{LenPacket, Msg, PacketId};
 use metor_proto_wkt::{MsgStream, SetComponentMetadata};
-use roci::tcp::SinkExt;
+use metor_fsw::tcp::SinkExt;
 use serde::{Deserialize, Serialize};
 use std::net::SocketAddr;
 use stellarator::io::{AsyncRead, AsyncWrite};
