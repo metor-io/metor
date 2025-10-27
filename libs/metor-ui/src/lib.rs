@@ -29,7 +29,7 @@ use metor_proto::types::{ComponentId, OwnedPacket};
 use metor_proto::types::{Msg, Timestamp};
 use metor_proto_bevy::{
     ComponentMetadataRegistry, ComponentPathRegistry, ComponentSchemaRegistry, ComponentValueMap,
-    CurrentStreamId, EntityMap, PacketHandlerInput, PacketHandlers, PacketTx,
+    CurrentStreamId, EntityMap, InvalidatedEqlCtx, PacketHandlerInput, PacketHandlers, PacketTx,
 };
 use metor_proto_wkt::{CurrentTimestamp, NewConnection, Object3D, SetStreamState, WorldPos};
 use metor_proto_wkt::{EarliestTimestamp, LastUpdated};
@@ -1005,10 +1005,14 @@ pub fn update_eql_context(
     component_schema_registry: Res<ComponentSchemaRegistry>,
     path_reg: Res<ComponentPathRegistry>,
     mut eql_context: ResMut<EqlContext>,
+    mut invalidated_eql_context: ResMut<InvalidatedEqlCtx>,
 ) {
     if path_reg.0.is_empty() {
         return;
     };
+    if !core::mem::take(&mut invalidated_eql_context.0) {
+        return;
+    }
     eql_context.0 = eql::Context::from_leaves(
         path_reg.0.iter().filter_map(|(id, path)| {
             let schema = component_schema_registry.0.get(id)?;

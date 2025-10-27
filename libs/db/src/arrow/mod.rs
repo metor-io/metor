@@ -7,7 +7,7 @@ use arrow::{
     datatypes::*,
 };
 use convert_case::Casing;
-use datafusion::{datasource::MemTable, prelude::SessionContext};
+use datafusion::{datasource::MemTable, prelude::SessionContext, sql::TableReference};
 use futures_lite::{Stream, pin};
 use metor_proto::types::{PrimType, Timestamp};
 use metor_proto_wkt::ArchiveFormat;
@@ -206,13 +206,11 @@ impl DB {
                     .component_metadata
                     .get(&component.component_id)
                     .unwrap();
-                let component_name = component_metadata
-                    .name
-                    .to_case(convert_case::Case::Snake)
-                    .replace(".", "_");
-                let name = component_name.clone();
-                if let Some(mem_table) = component.as_mem_table(&component_name) {
-                    ctx.register_table(name, Arc::new(mem_table))?;
+                if let Some(mem_table) = component.as_mem_table(&component_metadata.name) {
+                    ctx.register_table(
+                        TableReference::bare(component_metadata.name.clone()),
+                        Arc::new(mem_table),
+                    )?;
                 }
             }
             Ok::<_, datafusion::error::DataFusionError>(())

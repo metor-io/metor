@@ -18,6 +18,8 @@ use crate::{
     ui::{SelectedObject, colors, widgets::WidgetSystem},
 };
 
+use super::colors::{ColorExt, get_scheme};
+
 #[derive(Component)]
 pub struct MapTile {
     pub eql: EditableEQL,
@@ -73,12 +75,6 @@ impl WidgetSystem for MapTileWidget<'_, '_> {
 
         let map_state = &mut *map_state;
 
-        // Initialize tiles if needed
-        if map_state.tiles.is_none() {
-            let egui_ctx = ui.ctx().clone();
-            map_state.tiles = Some(HttpTiles::new(OpenStreetMap, egui_ctx));
-        }
-
         // Update markers based on EQL expression
         let Some(compiled_expr) = &map_tile.eql.compiled_expr else {
             ui.label("No EQL");
@@ -101,9 +97,13 @@ impl WidgetSystem for MapTileWidget<'_, '_> {
             let dirs = dirs();
             let cache = dirs.cache_dir();
             map_state.tiles = Some(HttpTiles::with_options(
-                OpenStreetMap,
+                CustomMapbox {
+                    style: "outdoors-v12".to_string(),
+                    high_resolution: true,
+                    access_token: "pk.eyJ1Ijoic3BodyIsImEiOiJjbWZ0eW4zbXAwb2Z1MmtvZHFsMjlnc2JzIn0.mf3qBgeCNJFyx9h6gZAQTg".to_string(),
+                },
                 HttpOptions {
-                    cache: Some(cache.join("osm-tiles")),
+                    cache: Some(cache.join("mapbox-tiles")),
                     ..Default::default()
                 },
                 ui.ctx().clone(),
@@ -138,11 +138,16 @@ impl Place for Marker {
     }
 
     fn draw(&self, ui: &Ui, projector: &walkers::Projector) {
+        let schema = get_scheme();
         let projected = projector.project(self.pos);
-        ui.painter().circle_filled(
+        ui.painter()
+            .circle_filled(egui::pos2(projected.x, projected.y), 3.0, schema.highlight);
+
+        ui.painter().circle(
             egui::pos2(projected.x, projected.y),
-            5.0,
-            colors::REDDISH_DEFAULT,
+            7.0,
+            schema.highlight.opacity(0.6),
+            egui::Stroke::new(2.0, schema.text_primary),
         );
     }
 }
@@ -164,5 +169,39 @@ fn extract_positions(value: &ComponentValue) -> Option<Position> {
             Some(lat_lon(*lat as f64, *long as f64))
         }
         _ => None,
+    }
+}
+
+#[derive(Default)]
+pub struct CustomMapbox {
+    pub style: String,
+    pub high_resolution: bool,
+    pub access_token: String,
+}
+
+impl walkers::sources::TileSource for CustomMapbox {
+    fn tile_url(&self, tile_id: walkers::TileId) -> String {
+        format!(
+            "https://api.mapbox.com/styles/v1/mapbox/{}/tiles/512/{}/{}/{}{}?access_token={}",
+            self.style,
+            tile_id.zoom,
+            tile_id.x,
+            tile_id.y,
+            if self.high_resolution { "@2x" } else { "" },
+            self.access_token
+        )
+    }
+
+    fn attribution(&self) -> walkers::sources::Attribution {
+        walkers::sources::Attribution {
+            text: "© Mapbox, © OpenStreetMap",
+            url: "https://www.mapbox.com/about/maps/",
+            logo_light: None,
+            logo_dark: None,
+        }
+    }
+
+    fn tile_size(&self) -> u32 {
+        512
     }
 }

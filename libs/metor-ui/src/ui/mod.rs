@@ -197,10 +197,7 @@ impl Plugin for UiPlugin {
             .add_systems(bevy_egui::EguiPrimaryContextPass, render_layout)
             .add_systems(Update, sync_hdr)
             .add_systems(Update, tiles::shortcuts)
-            .add_systems(
-                bevy_egui::EguiPrimaryContextPass,
-                set_camera_viewport.after(render_layout),
-            )
+            .add_systems(PostUpdate, set_camera_viewport)
             .add_systems(
                 bevy_egui::EguiPrimaryContextPass,
                 sync_camera_grid_cell.after(render_layout),

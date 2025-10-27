@@ -157,7 +157,9 @@ fn sink_inner(
                         &mut world_sink.metadata_reg,
                         &mut world_sink.commands,
                         path.path.last().unwrap(),
+                        &mut world_sink.invalidated_eql_ctx.0,
                     );
+                    world_sink.invalidated_eql_ctx.0 = true;
                     world_sink.path_reg.0.insert(metadata.component_id, path);
                     world_sink
                         .metadata_reg
@@ -269,6 +271,9 @@ pub struct ComponentSchemaRegistry(pub HashMap<ComponentId, Schema<Vec<u64>>>);
 #[derive(Resource, Default, Deref, DerefMut)]
 pub struct ComponentPathRegistry(pub HashMap<ComponentId, ComponentPath>);
 
+#[derive(Resource, Default, Deref, DerefMut)]
+pub struct InvalidatedEqlCtx(pub bool);
+
 #[derive(SystemParam)]
 pub struct WorldSink<'w, 's> {
     query: Query<'w, 's, &'static mut ComponentValue>,
@@ -283,6 +288,7 @@ pub struct WorldSink<'w, 's> {
     schema_reg: ResMut<'w, ComponentSchemaRegistry>,
     path_reg: ResMut<'w, ComponentPathRegistry>,
     db_config: ResMut<'w, DbConfig>,
+    invalidated_eql_ctx: ResMut<'w, InvalidatedEqlCtx>,
 }
 
 #[allow(clippy::needless_lifetimes)] // removing these lifetimes causes an internal compiler error, so here we are
@@ -291,6 +297,7 @@ fn try_insert_entity<'a, 'w, 's>(
     metadata_reg: &mut ComponentMetadataRegistry,
     commands: &'a mut Commands<'w, 's>,
     component_path: &ComponentPart,
+    invalidated_eql_ctx: &mut bool,
 ) -> Option<EntityCommands<'a>> {
     let component_id = component_path.id;
     if let Some(entity) = entity_map.get(&component_id) {
@@ -308,6 +315,7 @@ fn try_insert_entity<'a, 'w, 's>(
                 metadata: Default::default(),
             })
             .clone();
+        *invalidated_eql_ctx = true;
         e.insert(metadata.clone());
 
         entity_map.insert(component_id, e.id());
@@ -336,6 +344,7 @@ impl Decomponentize for WorldSink<'_, '_> {
             &mut self.metadata_reg,
             &mut self.commands,
             part,
+            &mut self.invalidated_eql_ctx.0,
         ) else {
             return Ok(());
         };
@@ -355,6 +364,7 @@ impl Decomponentize for WorldSink<'_, '_> {
                 &mut self.metadata_reg,
                 &mut self.commands,
                 parent,
+                &mut self.invalidated_eql_ctx.0,
             ) else {
                 continue;
             };
@@ -508,6 +518,7 @@ impl Plugin for Impeller2Plugin {
             .init_resource::<PacketHandlers>()
             .init_resource::<RequestIdHandlers>()
             .init_resource::<RequestIdAlloc>()
+            .init_resource::<InvalidatedEqlCtx>()
             .init_resource::<DbConfig>();
     }
 }
