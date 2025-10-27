@@ -1,12 +1,14 @@
+use metor_proto::types::Timestamp;
 use std::{
     ops::{Deref, DerefMut, Range},
     ptr,
     sync::{
         Arc,
-        atomic::{AtomicPtr, AtomicU64, Ordering},
+        atomic::{self, AtomicBool, AtomicPtr, AtomicU64, Ordering},
     },
+    time::Duration,
 };
-use stellarator::sync::WaitQueue;
+use stellarator::{sync::WaitQueue, util::AtomicCell};
 
 #[derive(Clone)]
 pub struct Disruptor {
@@ -124,18 +126,24 @@ pub fn can_write(core: &DistruptorCore, len: usize, write: usize, max: usize) ->
     let mut cursor = core.readers.first();
     'check_room: while let Some(node) = cursor {
         cursor = node.next();
+
+        if Timestamp::now() - node.last_read.latest() > Duration::from_millis(250) {
+            continue;
+        }
         let read = (node.cursor.load(Ordering::Acquire) % core.ringbuf.len() as u64) as usize;
         // based on logic in https://github.com/jamesmunns/bbqueue/blob/8468029832ce2293cd93f8af10b7372be3c96ad0/core/src/bbbuffer.rs#L365C1-L397C1
         //
         // check the case where we are inverted, and the new write will overlap with a read
         if write < read && write + len >= read {
             buffer_full = true;
+            println!("full read = {read:?} write = {write:?} len = {len:?} max = {max:?}");
             break 'check_room;
         // check the case where we are not inverted,
         // but the next write will casue an inversion,
         // and that inversion will lead to an overlap with a read
         } else if write + len > max && len >= read {
             buffer_full = true;
+            println!("full read = {read:?} write = {write:?} len = {len:?} max = {max:?}");
             break 'check_room;
         }
     }
@@ -200,8 +208,11 @@ pub struct Reader {
 }
 
 impl Reader {
-    pub async fn next(&mut self) -> ReadGrant<'_> {
+    pub async fn next(&mut self) -> Option<ReadGrant<'_>> {
         let node = self.node.as_ref();
+        if node.killed.load(Ordering::Acquire) {
+            return None;
+        }
         let range: Range<usize> = self
             .core
             .new_data_queue
@@ -220,18 +231,24 @@ impl Reader {
             })
             .await
             .expect("queue closed");
-        ReadGrant {
+        self.node.last_read.store(Timestamp::now());
+        self.node.cursor.store(range.end as u64, Ordering::Release);
+        Some(ReadGrant {
             range,
             reader: self,
-        }
+        })
     }
 
     pub fn try_next(&mut self) -> Option<ReadGrant<'_>> {
+        if self.node.killed.load(Ordering::Acquire) {
+            return None;
+        }
         let node = self.node.as_ref();
 
         let mut read = node.cursor.load(Ordering::Acquire);
         let write = self.core.write_head.committed.load(Ordering::Acquire);
         let high_water_mark = self.core.write_head.high_water_mark.load(Ordering::Acquire);
+
         if read == high_water_mark && write < read {
             read = 0;
             node.cursor.store(0, Ordering::Release);
@@ -240,6 +257,8 @@ impl Reader {
         let len = len as usize;
         let read = read as usize;
         let range = (len > 0).then(|| read..read + len)?;
+        self.node.last_read.store(Timestamp::now());
+        self.node.cursor.store(range.end as u64, Ordering::Release);
         Some(ReadGrant {
             range,
             reader: self,
@@ -312,12 +331,7 @@ impl Deref for ReadGrant<'_> {
 }
 
 impl Drop for ReadGrant<'_> {
-    fn drop(&mut self) {
-        self.reader
-            .node
-            .cursor
-            .store(self.range.end as u64, Ordering::Release);
-    }
+    fn drop(&mut self) {}
 }
 
 pub struct Readers(ReadNode);
@@ -332,6 +346,8 @@ impl Readers {
     pub fn new() -> Self {
         Self(ReadNode {
             cursor: AtomicU64::default(),
+            killed: AtomicBool::new(false),
+            last_read: AtomicCell::new(Timestamp::now()),
             next: ArcAtomic::null(),
         })
     }
@@ -343,6 +359,8 @@ impl Readers {
     pub fn push(&self, cursor: AtomicU64) -> Arc<ReadNode> {
         let node = ReadNode {
             cursor,
+            last_read: AtomicCell::new(Timestamp::now()),
+            killed: AtomicBool::new(false),
             next: self.0.next.clone(),
         };
         let first = Arc::new(node);
@@ -363,6 +381,8 @@ impl Readers {
 
 pub struct ReadNode {
     cursor: AtomicU64,
+    killed: AtomicBool,
+    last_read: AtomicCell<Timestamp>,
     next: ArcAtomic<ReadNode>,
 }
 
@@ -480,14 +500,14 @@ mod tests {
     async fn test_single_reader_writer() {
         let disruptor = Disruptor::new(1024);
         let mut reader = disruptor.reader();
-        let mut write = disruptor.grant(11).await.unwrap();
+        let mut write = disruptor.try_grant(11).unwrap();
         write.copy_from_slice(b"hello world");
         drop(write);
         {
             let grant = reader.next().await;
             assert_eq!(&grant[..], b"hello world");
         }
-        let mut write = disruptor.grant(3).await.unwrap();
+        let mut write = disruptor.try_grant(3).unwrap();
         write.copy_from_slice(b"foo");
         drop(write);
         {
@@ -501,14 +521,14 @@ mod tests {
         let disruptor = Disruptor::new(1024);
         let mut a = disruptor.reader();
         let mut b = disruptor.reader();
-        let mut write = disruptor.grant(11).await.unwrap();
+        let mut write = disruptor.try_grant(11).unwrap();
         write.copy_from_slice(b"hello world");
         drop(write);
         {
             let grant = a.next().await;
             assert_eq!(&grant[..], b"hello world");
         }
-        let mut write = disruptor.grant(3).await.unwrap();
+        let mut write = disruptor.try_grant(3).unwrap();
         write.copy_from_slice(b"foo");
         drop(write);
         {
@@ -524,14 +544,14 @@ mod tests {
     async fn test_single_reader_writer_wrap() {
         let disruptor = Disruptor::new(12);
         let mut reader = disruptor.reader();
-        let mut write = disruptor.grant(11).await.unwrap();
+        let mut write = disruptor.try_grant(11).unwrap();
         write.copy_from_slice(b"hello world");
         drop(write);
         {
             let grant = reader.next().await;
             assert_eq!(&grant[..], b"hello world");
         }
-        let mut write = disruptor.grant(3).await.unwrap();
+        let mut write = disruptor.try_grant(3).unwrap();
         write.copy_from_slice(b"foo");
         drop(write);
         {
@@ -539,7 +559,7 @@ mod tests {
             assert_eq!(&grant[..], b"foo");
         }
 
-        let mut write = disruptor.grant(3).await.unwrap();
+        let mut write = disruptor.try_grant(3).unwrap();
         write.copy_from_slice(b"foo");
         drop(write);
         {
@@ -553,7 +573,7 @@ mod tests {
         let disruptor = Disruptor::new(12);
         let mut a = disruptor.reader();
         let mut b = disruptor.reader();
-        let mut write = disruptor.grant(11).await.unwrap();
+        let mut write = disruptor.try_grant(11).unwrap();
         write.copy_from_slice(b"hello world");
         drop(write);
         {
@@ -564,12 +584,69 @@ mod tests {
             let grant = b.next().await;
             assert_eq!(&grant[..], b"hello world");
         }
-        let mut write = disruptor.grant(3).await.unwrap();
+        let mut write = disruptor.try_grant(3).unwrap();
         write.copy_from_slice(b"foo");
         drop(write);
         {
             let grant = a.next().await;
             assert_eq!(&grant[..], b"foo");
         }
+    }
+
+    #[stellarator::test]
+    async fn test_drop_reader() {
+        let disruptor = Disruptor::new(6);
+        let mut a = disruptor.reader();
+        let mut b = disruptor.reader();
+        let mut c = disruptor.reader();
+        let mut write = disruptor.try_grant(3).unwrap();
+        write.copy_from_slice(b"foo");
+        drop(write);
+        let a_grant = a.next().await;
+        let b_grant = b.next().await;
+        let c_grant = c.next().await;
+        assert_eq!(&a_grant[..], b"foo");
+        assert_eq!(&b_grant[..], b"foo");
+        assert_eq!(&c_grant[..], b"foo");
+        let mut write = disruptor.try_grant(3).unwrap();
+        write.copy_from_slice(b"foo");
+        drop(write);
+        assert!(disruptor.try_grant(3).is_err());
+        drop(a_grant);
+        drop(a);
+        drop(c_grant);
+        drop(c);
+        drop(b_grant);
+        drop(b);
+        let mut a = disruptor.reader();
+        let mut b = disruptor.reader();
+        let mut c = disruptor.reader();
+        let mut write = disruptor.try_grant(3).unwrap();
+        write.copy_from_slice(b"bar");
+        drop(write);
+
+        let a_grant = a.next().await;
+        let b_grant = b.next().await;
+        let c_grant = c.next().await;
+
+        assert_eq!(&a_grant[..], b"bar");
+        assert_eq!(&b_grant[..], b"bar");
+        assert_eq!(&c_grant[..], b"bar");
+        drop(a_grant);
+        drop(c_grant);
+        drop(b_grant);
+        drop(b);
+
+        println!();
+        println!("DROPPED B");
+
+        let mut write = disruptor.try_grant(3).unwrap();
+        write.copy_from_slice(b"cat");
+        drop(write);
+
+        let a_grant = a.next().await;
+        let c_grant = c.next().await;
+        assert_eq!(&a_grant[..], b"cat");
+        assert_eq!(&c_grant[..], b"cat");
     }
 }

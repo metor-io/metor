@@ -581,6 +581,9 @@ impl Component {
         async move {
             loop {
                 let buf = reader.next().await;
+                let Some(buf) = buf else {
+                    continue;
+                };
                 let mut buf = &buf[..];
                 'parse: while let Some(msg) = buf.get(..msg_size) {
                     let Some(timestamp) = msg.get(..size_of::<Timestamp>()) else {
@@ -615,7 +618,8 @@ impl Component {
         }
         let Ok(mut grant) = self.wal.try_grant(value_buf.len() + size_of::<Timestamp>()) else {
             let reader_count = self.wal.reader_count();
-            warn!(?timestamp, ?reader_count, "skipped buf due to overflow");
+            println!("skipping buf due to overflow reader_count = {reader_count:?}");
+            //warn!(?timestamp, ?reader_count, "skipped buf due to overflow");
             // TODO(sphw): we should probably wait here, log, or even error out
             // not sure what is best
             return Ok(());

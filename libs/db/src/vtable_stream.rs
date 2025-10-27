@@ -324,8 +324,11 @@ impl RealTimeStage {
             component.id = ?self.component.component_id,
             "real time stage waiting"
         );
-        let buf = self.reader.next().await;
+        let Some(buf) = self.reader.next().await else {
+            return Ok(false);
+        };
         let msg_size = self.component.schema.size() + size_of::<Timestamp>();
+
         let Some(msg) = buf.get(..msg_size) else {
             return Ok(false);
         };

@@ -437,6 +437,9 @@ impl MsgLog {
         async move {
             loop {
                 let buf = reader.next().await;
+                let Some(buf) = buf else {
+                    continue;
+                };
                 let mut buf = &buf[..];
 
                 'parse: while buf.len() >= size_of::<Timestamp>() + size_of::<u32>() {

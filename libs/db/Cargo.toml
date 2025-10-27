@@ -70,6 +70,7 @@ arrow.features = ["canonical_extension_types", "csv"]
 arrow-schema.version = "54"
 arrow-schema.features = ["canonical_extension_types"]
 datafusion.version = "46"
+datafusion.features = ["parquet"]
 datafusion.default-features = false
 convert_case = "0.6.0"
 thingbuf.version = "0.1"
