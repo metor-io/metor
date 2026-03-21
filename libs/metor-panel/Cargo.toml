@@ -1,0 +1,16 @@
+[package]
+name = "metor-panel"
+version.workspace = true
+edition.workspace = true
+repository.workspace = true
+
+[dependencies]
+gpui = "*"
+metor-db.path = "../db"
+metor-proto.path = "../metor-proto"
+metor-proto.features = ["std"]
+stellarator.path = "../stellarator"
+
+[[example]]
+name = "component_text"
+path = "examples/component_text.rs"
