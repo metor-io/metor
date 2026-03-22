@@ -1,10 +1,15 @@
 use std::sync::Arc;
 
-use gpui::{Context, IntoElement, SharedString, Window, div, prelude::*, rgb};
+use gpui::{Context, IntoElement, SharedString, Window, div, prelude::*};
 use metor_db::DB;
 use std::fmt::Write;
 
+use crate::theme::DARK;
 use crate::{AsComponentView, ComponentStream, ComponentStreamBuilder};
+
+pub mod time_series;
+
+pub use time_series::TimeSeriesPlot;
 
 pub struct ComponentText {
     value: Option<SharedString>,
@@ -45,12 +50,13 @@ impl ComponentText {
 impl Render for ComponentText {
     fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
         div()
-            .text_color(rgb(0xFFFFFF))
+            .text_color(DARK.text_primary)
+            .bg(DARK.bg_primary)
             .text_size(gpui::px(24.0))
             .size_full()
             .child(
                 self.value
-                    .take()
+                    .clone()
                     .unwrap_or_else(|| SharedString::new_static("")),
             )
     }

@@ -1,0 +1,94 @@
+use gpui::Hsla;
+
+pub struct Theme {
+    pub bg_primary: Hsla,
+    pub bg_secondary: Hsla,
+
+    pub text_primary: Hsla,
+    pub text_secondary: Hsla,
+    pub text_tertiary: Hsla,
+
+    pub border_primary: Hsla,
+
+    pub line_color: Hsla,
+    pub grid_color: Hsla,
+    pub axis_color: Hsla,
+    pub zero_line_color: Hsla,
+}
+
+fn rgb(r: u8, g: u8, b: u8) -> Hsla {
+    gpui::rgb(((r as u32) << 16) | ((g as u32) << 8) | (b as u32)).into()
+}
+
+fn rgba(r: u8, g: u8, b: u8, a: f32) -> Hsla {
+    let mut c = rgb(r, g, b);
+    c.a = a;
+    c
+}
+
+pub static DARK: Theme = Theme {
+    bg_primary: Hsla {
+        h: 0.083,
+        s: 0.08,
+        l: 0.12,
+        a: 1.0,
+    },
+    bg_secondary: Hsla {
+        h: 0.083,
+        s: 0.08,
+        l: 0.08,
+        a: 1.0,
+    },
+
+    text_primary: Hsla {
+        h: 0.1,
+        s: 0.6,
+        l: 0.95,
+        a: 1.0,
+    },
+    text_secondary: Hsla {
+        h: 0.083,
+        s: 0.05,
+        l: 0.50,
+        a: 1.0,
+    },
+    text_tertiary: Hsla {
+        h: 0.083,
+        s: 0.05,
+        l: 0.40,
+        a: 1.0,
+    },
+
+    border_primary: Hsla {
+        h: 0.083,
+        s: 0.06,
+        l: 0.20,
+        a: 1.0,
+    },
+
+    // Pumpkin orange line
+    line_color: Hsla {
+        h: 0.069,
+        s: 1.0,
+        l: 0.56,
+        a: 1.0,
+    },
+    grid_color: Hsla {
+        h: 0.083,
+        s: 0.06,
+        l: 0.18,
+        a: 1.0,
+    },
+    axis_color: Hsla {
+        h: 0.083,
+        s: 0.08,
+        l: 0.30,
+        a: 1.0,
+    },
+    zero_line_color: Hsla {
+        h: 0.083,
+        s: 0.10,
+        l: 0.40,
+        a: 1.0,
+    },
+};

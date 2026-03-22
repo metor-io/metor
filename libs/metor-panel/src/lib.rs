@@ -1,13 +1,11 @@
-use std::fmt::Write;
 use std::mem::size_of;
-use std::sync::Arc;
 
-use gpui::{Context, IntoElement, SharedString, Window, div, prelude::*, rgb};
 use metor_db::disruptor::{ReadGrant, Reader};
 use metor_db::{Component, ComponentSchema, DB};
 use metor_proto::types::{ComponentId, ComponentView, Timestamp};
 
 pub mod elements;
+pub mod theme;
 
 pub trait AsComponentView {
     fn as_component_view(&self) -> ComponentView<'_>;

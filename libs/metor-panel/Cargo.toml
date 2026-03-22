@@ -14,3 +14,7 @@ stellarator.path = "../stellarator"
 [[example]]
 name = "component_text"
 path = "examples/component_text.rs"
+
+[[example]]
+name = "time_series_plot"
+path = "examples/time_series_plot.rs"
