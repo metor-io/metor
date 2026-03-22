@@ -1,8 +1,8 @@
 use std::sync::Arc;
 
 use gpui::{
-    canvas, div, point, prelude::*, px, Bounds, Context, Hsla, IntoElement, PathBuilder, Pixels,
-    Point, SharedString, Styled, TextRun, Window,
+    canvas, div, point, prelude::*, px, Bounds, Context, Hsla, IntoElement, MouseButton,
+    PathBuilder, Pixels, Point, SharedString, Styled, TextRun, Window,
 };
 use metor_db::{Component, DB};
 use metor_proto::types::{ComponentId, ComponentView};
@@ -47,8 +47,148 @@ fn read_time_series(component: &Component) -> Vec<(i64, f64)> {
     points
 }
 
-/// Compute "nice" tick values that include 0 when the data range spans it.
-/// Returns (axis_min, axis_max, ticks) where ticks are the values to label.
+// --- PlotBounds ---
+
+#[derive(Clone, Copy, Debug)]
+pub struct PlotBounds {
+    pub min_x: f64,
+    pub min_y: f64,
+    pub max_x: f64,
+    pub max_y: f64,
+}
+
+impl PlotBounds {
+    pub fn new(min_x: f64, min_y: f64, max_x: f64, max_y: f64) -> Self {
+        Self {
+            min_x,
+            min_y,
+            max_x,
+            max_y,
+        }
+    }
+
+    pub fn from_points(points: &[(i64, f64)]) -> Option<Self> {
+        if points.len() < 2 {
+            return None;
+        }
+        let min_x = points[0].0 as f64;
+        let max_x = points[points.len() - 1].0 as f64;
+        if min_x == max_x {
+            return None;
+        }
+        let mut min_y = f64::INFINITY;
+        let mut max_y = f64::NEG_INFINITY;
+        for &(_, y) in points {
+            if y < min_y {
+                min_y = y;
+            }
+            if y > max_y {
+                max_y = y;
+            }
+        }
+        Some(Self::new(min_x, min_y, max_x, max_y).normalize())
+    }
+
+    pub fn width(&self) -> f64 {
+        self.max_x - self.min_x
+    }
+
+    pub fn height(&self) -> f64 {
+        self.max_y - self.min_y
+    }
+
+    pub fn offset(mut self, dx: f64, dy: f64) -> Self {
+        self.min_x += dx;
+        self.max_x += dx;
+        self.min_y += dy;
+        self.max_y += dy;
+        self
+    }
+
+    /// Pan by a normalized amount (0..1 = full width/height).
+    pub fn offset_by_norm(self, nx: f64, ny: f64) -> Self {
+        self.offset(nx * self.width(), ny * self.height())
+    }
+
+    /// Zoom around an anchor point (0..1 normalized within the bounds).
+    pub fn zoom_at(self, factor: f64, anchor_x: f64, anchor_y: f64) -> Self {
+        let dw = self.width() * (factor - 1.0);
+        let dh = self.height() * (factor - 1.0);
+        Self {
+            min_x: self.min_x - dw * anchor_x,
+            max_x: self.max_x + dw * (1.0 - anchor_x),
+            min_y: self.min_y - dh * anchor_y,
+            max_y: self.max_y + dh * (1.0 - anchor_y),
+        }
+    }
+
+    /// Ensure min < max with at least a span of 1.0.
+    pub fn normalize(mut self) -> Self {
+        if self.min_x >= self.max_x {
+            self.min_x = self.max_x.min(self.min_x);
+            self.max_x = self.min_x + 1.0;
+        }
+        if self.min_y >= self.max_y {
+            self.min_y = self.max_y.min(self.min_y);
+            self.max_y = self.min_y + 1.0;
+        }
+        self
+    }
+
+    /// Convert a screen pixel position to data coordinates given the pixel bounds of the plot.
+    pub fn screen_to_data(&self, screen_bounds: Bounds<Pixels>, pos: Point<Pixels>) -> (f64, f64) {
+        let nx = (f32::from(pos.x - screen_bounds.origin.x)
+            / f32::from(screen_bounds.size.width)) as f64;
+        let ny = (f32::from(pos.y - screen_bounds.origin.y)
+            / f32::from(screen_bounds.size.height)) as f64;
+        (self.min_x + nx * self.width(), self.max_y - ny * self.height())
+    }
+
+    /// Convert a screen pixel delta to a normalized (0..1) fraction of the plot.
+    pub fn screen_delta_to_norm(
+        &self,
+        screen_bounds: Bounds<Pixels>,
+        dx: Pixels,
+        dy: Pixels,
+    ) -> (f64, f64) {
+        let nx = f32::from(dx) as f64 / f32::from(screen_bounds.size.width) as f64;
+        let ny = f32::from(dy) as f64 / f32::from(screen_bounds.size.height) as f64;
+        (nx, ny)
+    }
+
+    /// Normalized position of a screen point within the plot (0..1).
+    pub fn screen_anchor(
+        &self,
+        screen_bounds: Bounds<Pixels>,
+        pos: Point<Pixels>,
+    ) -> (f64, f64) {
+        let nx = (f32::from(pos.x - screen_bounds.origin.x)
+            / f32::from(screen_bounds.size.width)) as f64;
+        let ny = (f32::from(pos.y - screen_bounds.origin.y)
+            / f32::from(screen_bounds.size.height)) as f64;
+        (nx.clamp(0.0, 1.0), ny.clamp(0.0, 1.0))
+    }
+
+    fn to_screen(&self, screen_bounds: Bounds<Pixels>, data_x: f64, data_y: f64) -> Point<Pixels> {
+        let nx = if self.width() == 0.0 {
+            0.5
+        } else {
+            (data_x - self.min_x) / self.width()
+        };
+        let ny = if self.height() == 0.0 {
+            0.5
+        } else {
+            1.0 - (data_y - self.min_y) / self.height()
+        };
+        point(
+            screen_bounds.origin.x + screen_bounds.size.width * nx as f32,
+            screen_bounds.origin.y + screen_bounds.size.height * ny as f32,
+        )
+    }
+}
+
+// --- Tick computation ---
+
 fn nice_ticks(data_min: f64, data_max: f64, target_count: usize) -> (f64, f64, Vec<f64>) {
     if data_min == data_max {
         let v = data_min;
@@ -56,13 +196,10 @@ fn nice_ticks(data_min: f64, data_max: f64, target_count: usize) -> (f64, f64, V
             return (-1.0, 1.0, vec![-1.0, 0.0, 1.0]);
         }
         let pad = v.abs() * 0.1;
-        let lo = v - pad;
-        let hi = v + pad;
-        return (lo, hi, vec![lo, v, hi]);
+        return (v - pad, v + pad, vec![v - pad, v, v + pad]);
     }
 
     let range = data_max - data_min;
-    // Pick a "nice" step: 1, 2, or 5 times a power of 10
     let rough_step = range / target_count as f64;
     let mag = 10f64.powf(rough_step.log10().floor());
     let norm = rough_step / mag;
@@ -88,7 +225,6 @@ fn nice_ticks(data_min: f64, data_max: f64, target_count: usize) -> (f64, f64, V
     (axis_min, axis_max, ticks)
 }
 
-/// Compute nice time ticks (in microseconds). Returns tick positions.
 fn nice_time_ticks(t_min: i64, t_max: i64, target_count: usize) -> Vec<i64> {
     let range = (t_max - t_min) as f64;
     if range <= 0.0 {
@@ -149,220 +285,159 @@ fn format_value_label(v: f64) -> String {
     }
 }
 
-struct PlotLayout {
-    plot_bounds: Bounds<Pixels>,
-    y_min: f64,
-    y_max: f64,
-    t_min: f64,
-    t_max: f64,
-}
+// --- Plot area layout ---
 
-impl PlotLayout {
-    fn to_screen(&self, t: f64, v: f64) -> Point<Pixels> {
-        let b = &self.plot_bounds;
-        let nx = if self.t_max == self.t_min {
-            0.5
-        } else {
-            (t - self.t_min) / (self.t_max - self.t_min)
-        };
-        let ny = if self.y_max == self.y_min {
-            0.5
-        } else {
-            1.0 - (v - self.y_min) / (self.y_max - self.y_min)
-        };
-        point(
-            b.origin.x + b.size.width * nx as f32,
-            b.origin.y + b.size.height * ny as f32,
-        )
+const Y_LABEL_WIDTH: f32 = 50.0;
+const X_LABEL_HEIGHT: f32 = 20.0;
+const PADDING: f32 = 8.0;
+const LABEL_FONT_SIZE: f32 = 11.0;
+
+fn plot_area(outer: Bounds<Pixels>) -> Bounds<Pixels> {
+    Bounds {
+        origin: point(
+            outer.origin.x + px(Y_LABEL_WIDTH + PADDING),
+            outer.origin.y + px(PADDING),
+        ),
+        size: gpui::Size {
+            width: (outer.size.width - px(Y_LABEL_WIDTH + PADDING * 2.0)).max(px(1.0)),
+            height: (outer.size.height - px(X_LABEL_HEIGHT + PADDING * 2.0)).max(px(1.0)),
+        },
     }
 }
 
+// --- Painting ---
+
 fn paint_plot(
-    bounds: Bounds<Pixels>,
+    outer_bounds: Bounds<Pixels>,
     points: &[(i64, f64)],
+    view: PlotBounds,
     color: Hsla,
     window: &mut Window,
     cx: &mut gpui::App,
 ) {
-    if points.len() < 2 {
+    if points.is_empty() {
         return;
     }
 
-    let t_min_data = points[0].0;
-    let t_max_data = points[points.len() - 1].0;
-    if t_min_data == t_max_data {
-        return;
-    }
+    let (y_axis_min, y_axis_max, y_ticks) = nice_ticks(view.min_y, view.max_y, 5);
+    let x_ticks = nice_time_ticks(view.min_x as i64, view.max_x as i64, 5);
 
-    let mut y_min_data = f64::INFINITY;
-    let mut y_max_data = f64::NEG_INFINITY;
-    for &(_, y) in points {
-        if y < y_min_data {
-            y_min_data = y;
-        }
-        if y > y_max_data {
-            y_max_data = y;
-        }
-    }
-
-    // Compute nice axis ranges
-    let (y_axis_min, y_axis_max, y_ticks) = nice_ticks(y_min_data, y_max_data, 5);
-    let x_ticks = nice_time_ticks(t_min_data, t_max_data, 5);
-
-    // Reserve space for axis labels
-    let label_font_size = px(11.0);
-    let y_label_width = px(50.0);
-    let x_label_height = px(20.0);
-    let padding = px(8.0);
-
-    let plot_bounds = Bounds {
-        origin: point(
-            bounds.origin.x + y_label_width + padding,
-            bounds.origin.y + padding,
-        ),
-        size: gpui::Size {
-            width: (bounds.size.width - y_label_width - padding * 2.0).max(px(1.0)),
-            height: (bounds.size.height - x_label_height - padding * 2.0).max(px(1.0)),
-        },
-    };
-
-    let layout = PlotLayout {
-        plot_bounds,
-        y_min: y_axis_min,
-        y_max: y_axis_max,
-        t_min: t_min_data as f64,
-        t_max: t_max_data as f64,
-    };
+    let pb = plot_area(outer_bounds);
+    let axis_view = PlotBounds::new(view.min_x, y_axis_min, view.max_x, y_axis_max);
 
     let theme = &crate::theme::DARK;
-    let axis_color = theme.axis_color;
-    let grid_color = theme.grid_color;
-    let label_color = theme.text_secondary;
-
+    let label_font_size = px(LABEL_FONT_SIZE);
     let text_style = window.text_style();
     let font = text_style.font();
 
-    // Draw Y-axis grid lines, tick marks, and labels
-    for &tick in &y_ticks {
-        let screen = layout.to_screen(layout.t_min, tick);
-        let y = screen.y;
+    let make_run = |text: &str| TextRun {
+        len: text.len(),
+        font: font.clone(),
+        color: theme.text_secondary,
+        background_color: None,
+        underline: None,
+        strikethrough: None,
+    };
 
-        // Grid line
-        let mut grid = PathBuilder::stroke(px(0.5));
-        grid.move_to(point(plot_bounds.origin.x, y));
-        grid.line_to(point(
-            plot_bounds.origin.x + plot_bounds.size.width,
-            y,
-        ));
-        if let Ok(path) = grid.build() {
-            window.paint_path(path, grid_color);
+    // Clipped region: grid, zero line, data
+    window.with_content_mask(Some(gpui::ContentMask { bounds: pb }), |window| {
+        // Y grid
+        for &tick in &y_ticks {
+            let y = axis_view.to_screen(pb, axis_view.min_x, tick).y;
+            let mut grid = PathBuilder::stroke(px(0.5));
+            grid.move_to(point(pb.origin.x, y));
+            grid.line_to(point(pb.origin.x + pb.size.width, y));
+            if let Ok(path) = grid.build() {
+                window.paint_path(path, theme.grid_color);
+            }
         }
 
-        // Label
-        let label_text = format_value_label(tick);
-        let label_shared = SharedString::from(label_text.clone());
-        let run = TextRun {
-            len: label_text.len(),
-            font: font.clone(),
-            color: label_color,
-            background_color: None,
-            underline: None,
-            strikethrough: None,
-        };
-        let shaped = window
-            .text_system()
-            .shape_line(label_shared, label_font_size, &[run], None);
-        let label_width = shaped.width;
-        let label_origin = point(
-            plot_bounds.origin.x - label_width - px(4.0),
-            y - label_font_size / 2.0,
-        );
-        let _ = shaped.paint(label_origin, label_font_size, window, cx);
-    }
-
-    // Draw X-axis tick marks and labels
-    for &tick in &x_ticks {
-        let screen = layout.to_screen(tick as f64, layout.y_min);
-        let x = screen.x;
-
-        // Grid line
-        let mut grid = PathBuilder::stroke(px(0.5));
-        grid.move_to(point(x, plot_bounds.origin.y));
-        grid.line_to(point(
-            x,
-            plot_bounds.origin.y + plot_bounds.size.height,
-        ));
-        if let Ok(path) = grid.build() {
-            window.paint_path(path, grid_color);
+        // X grid
+        for &tick in &x_ticks {
+            let x = axis_view.to_screen(pb, tick as f64, axis_view.min_y).x;
+            let mut grid = PathBuilder::stroke(px(0.5));
+            grid.move_to(point(x, pb.origin.y));
+            grid.line_to(point(x, pb.origin.y + pb.size.height));
+            if let Ok(path) = grid.build() {
+                window.paint_path(path, theme.grid_color);
+            }
         }
 
-        // Label
-        let label_text = format_time_label(tick, t_min_data);
-        let label_shared = SharedString::from(label_text.clone());
-        let run = TextRun {
-            len: label_text.len(),
-            font: font.clone(),
-            color: label_color,
-            background_color: None,
-            underline: None,
-            strikethrough: None,
-        };
-        let shaped = window
-            .text_system()
-            .shape_line(label_shared, label_font_size, &[run], None);
-        let label_origin = point(
-            x - shaped.width / 2.0,
-            plot_bounds.origin.y + plot_bounds.size.height + px(4.0),
-        );
-        let _ = shaped.paint(label_origin, label_font_size, window, cx);
-    }
-
-    // Draw zero line if visible
-    if y_axis_min < 0.0 && y_axis_max > 0.0 {
-        let zero_y = layout.to_screen(layout.t_min, 0.0).y;
-        let mut zero_path = PathBuilder::stroke(px(1.0));
-        zero_path.move_to(point(plot_bounds.origin.x, zero_y));
-        zero_path.line_to(point(
-            plot_bounds.origin.x + plot_bounds.size.width,
-            zero_y,
-        ));
-        if let Ok(path) = zero_path.build() {
-            window.paint_path(path, theme.zero_line_color);
+        // Zero line
+        if axis_view.min_y < 0.0 && axis_view.max_y > 0.0 {
+            let zero_y = axis_view.to_screen(pb, axis_view.min_x, 0.0).y;
+            let mut zp = PathBuilder::stroke(px(1.0));
+            zp.move_to(point(pb.origin.x, zero_y));
+            zp.line_to(point(pb.origin.x + pb.size.width, zero_y));
+            if let Ok(path) = zp.build() {
+                window.paint_path(path, theme.zero_line_color);
+            }
         }
-    }
 
-    // Draw axis lines
+        // Data line
+        if points.len() >= 2 {
+            let mut path = PathBuilder::stroke(px(1.5));
+            let first = view.to_screen(pb, points[0].0 as f64, points[0].1);
+            path.move_to(first);
+            for &(t, v) in &points[1..] {
+                path.line_to(view.to_screen(pb, t as f64, v));
+            }
+            if let Ok(path) = path.build() {
+                window.paint_path(path, color);
+            }
+        }
+    });
+
+    // Axis frame (unclipped)
     let mut axes = PathBuilder::stroke(px(1.0));
-    // Y axis
-    axes.move_to(point(plot_bounds.origin.x, plot_bounds.origin.y));
-    axes.line_to(point(
-        plot_bounds.origin.x,
-        plot_bounds.origin.y + plot_bounds.size.height,
-    ));
-    // X axis
-    axes.line_to(point(
-        plot_bounds.origin.x + plot_bounds.size.width,
-        plot_bounds.origin.y + plot_bounds.size.height,
-    ));
+    axes.move_to(point(pb.origin.x, pb.origin.y));
+    axes.line_to(point(pb.origin.x, pb.origin.y + pb.size.height));
+    axes.line_to(point(pb.origin.x + pb.size.width, pb.origin.y + pb.size.height));
     if let Ok(path) = axes.build() {
-        window.paint_path(path, axis_color);
+        window.paint_path(path, theme.axis_color);
     }
 
-    // Draw data line
-    let mut path = PathBuilder::stroke(px(1.5));
-    let first = layout.to_screen(points[0].0 as f64, points[0].1);
-    path.move_to(first);
-    for &(t, v) in &points[1..] {
-        path.line_to(layout.to_screen(t as f64, v));
+    // Y labels
+    for &tick in &y_ticks {
+        let y = axis_view.to_screen(pb, axis_view.min_x, tick).y;
+        if y < pb.origin.y || y > pb.origin.y + pb.size.height {
+            continue;
+        }
+        let text = format_value_label(tick);
+        let run = make_run(&text);
+        let shaped = window
+            .text_system()
+            .shape_line(SharedString::from(text), label_font_size, &[run], None);
+        let origin = point(pb.origin.x - shaped.width - px(4.0), y - label_font_size / 2.0);
+        let _ = shaped.paint(origin, label_font_size, window, cx);
     }
-    if let Ok(path) = path.build() {
-        window.paint_path(path, color);
+
+    // X labels
+    for &tick in &x_ticks {
+        let x = axis_view.to_screen(pb, tick as f64, axis_view.min_y).x;
+        if x < pb.origin.x || x > pb.origin.x + pb.size.width {
+            continue;
+        }
+        let text = format_time_label(tick, view.min_x as i64);
+        let run = make_run(&text);
+        let shaped = window
+            .text_system()
+            .shape_line(SharedString::from(text), label_font_size, &[run], None);
+        let origin = point(x - shaped.width / 2.0, pb.origin.y + pb.size.height + px(4.0));
+        let _ = shaped.paint(origin, label_font_size, window, cx);
     }
 }
+
+// --- TimeSeriesPlot view ---
 
 pub struct TimeSeriesPlot {
     points: Vec<(i64, f64)>,
     color: Hsla,
+    /// Current viewport. None means auto-fit to data.
+    view: Option<PlotBounds>,
+    drag_start: Option<Point<Pixels>>,
+    drag_start_view: Option<PlotBounds>,
+    last_plot_area: Option<Bounds<Pixels>>,
     _task: gpui::Task<()>,
 }
 
@@ -390,6 +465,10 @@ impl TimeSeriesPlot {
         Self {
             points: Vec::new(),
             color: crate::theme::DARK.line_color,
+            view: None,
+            drag_start: None,
+            drag_start_view: None,
+            last_plot_area: None,
             _task: task,
         }
     }
@@ -398,20 +477,86 @@ impl TimeSeriesPlot {
         self.color = color;
         self
     }
+
+    fn current_view(&self) -> Option<PlotBounds> {
+        self.view.or_else(|| PlotBounds::from_points(&self.points))
+    }
 }
 
 impl Render for TimeSeriesPlot {
-    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let points = self.points.clone();
         let color = self.color;
+        let view = self.current_view();
+
         div()
             .size_full()
             .bg(crate::theme::DARK.bg_secondary)
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, event: &gpui::MouseDownEvent, _window, _cx| {
+                    this.drag_start = Some(event.position);
+                    this.drag_start_view = this.current_view();
+                }),
+            )
+            .on_mouse_up(
+                MouseButton::Left,
+                cx.listener(|this, _event: &gpui::MouseUpEvent, _window, _cx| {
+                    this.drag_start = None;
+                    this.drag_start_view = None;
+                }),
+            )
+            .on_mouse_move(cx.listener(
+                |this, event: &gpui::MouseMoveEvent, _window, cx| {
+                    if !event.dragging() {
+                        return;
+                    }
+                    let (Some(start), Some(start_view), Some(pa)) =
+                        (this.drag_start, this.drag_start_view, this.last_plot_area)
+                    else {
+                        return;
+                    };
+
+                    let dx = event.position.x - start.x;
+                    let dy = event.position.y - start.y;
+                    let (nx, ny) = start_view.screen_delta_to_norm(pa, dx, dy);
+                    // Invert: dragging right pans data left, dragging down pans data up
+                    this.view = Some(start_view.offset_by_norm(-nx, ny));
+                    cx.notify();
+                },
+            ))
+            .on_scroll_wheel(cx.listener(
+                |this, event: &gpui::ScrollWheelEvent, _window, cx| {
+                    let (Some(view), Some(pa)) = (this.current_view(), this.last_plot_area) else {
+                        return;
+                    };
+
+                    let delta = event.delta.pixel_delta(px(20.0));
+                    let zoom_amount = f32::from(-delta.y) as f64 / 200.0;
+                    let factor = (1.0_f64 + zoom_amount).clamp(0.5, 2.0);
+
+                    let (ax, ay) = view.screen_anchor(pa, event.position);
+                    // Invert Y anchor: screen Y is top-down, data Y is bottom-up
+                    this.view = Some(view.zoom_at(factor, ax, 1.0 - ay));
+                    cx.notify();
+                },
+            ))
             .child(
                 canvas(
-                    move |bounds, _, _| (bounds, points),
-                    move |_, (bounds, points), window, cx| {
-                        paint_plot(bounds, &points, color, window, cx);
+                    {
+                        let this = cx.entity().downgrade();
+                        move |bounds, _window, cx| {
+                            let pa = plot_area(bounds);
+                            let _ = this.update(cx, |this, _cx| {
+                                this.last_plot_area = Some(pa);
+                            });
+                            (bounds, points, view)
+                        }
+                    },
+                    move |_, (bounds, points, view), window, cx| {
+                        if let Some(view) = view {
+                            paint_plot(bounds, &points, view, color, window, cx);
+                        }
                     },
                 )
                 .size_full(),
