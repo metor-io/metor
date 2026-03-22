@@ -316,6 +316,22 @@ impl<'a> ComponentView<'a> {
         }
     }
 
+    pub fn to_f64(&self) -> f64 {
+        match *self {
+            Self::U8(ref v) => v.buf()[0] as f64,
+            Self::U16(ref v) => v.buf()[0] as f64,
+            Self::U32(ref v) => v.buf()[0] as f64,
+            Self::U64(ref v) => v.buf()[0] as f64,
+            Self::I8(ref v) => v.buf()[0] as f64,
+            Self::I16(ref v) => v.buf()[0] as f64,
+            Self::I32(ref v) => v.buf()[0] as f64,
+            Self::I64(ref v) => v.buf()[0] as f64,
+            Self::F32(ref v) => v.buf()[0] as f64,
+            Self::F64(ref v) => v.buf()[0],
+            Self::Bool(ref v) => v.buf()[0] as u8 as f64,
+        }
+    }
+
     pub fn prim_type(&self) -> PrimType {
         match *self {
             Self::U8(_) => PrimType::U8,

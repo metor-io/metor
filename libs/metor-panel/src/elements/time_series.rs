@@ -5,47 +5,9 @@ use gpui::{
     PathBuilder, Pixels, Point, SharedString, Styled, TextRun, Window,
 };
 use metor_db::{Component, DB};
-use metor_proto::types::{ComponentId, ComponentView};
+use metor_proto::types::{ComponentId, Timestamp};
 
 use crate::wait_for_component;
-
-fn component_view_to_f64(view: ComponentView<'_>) -> f64 {
-    match view {
-        ComponentView::U8(v) => v.buf()[0] as f64,
-        ComponentView::U16(v) => v.buf()[0] as f64,
-        ComponentView::U32(v) => v.buf()[0] as f64,
-        ComponentView::U64(v) => v.buf()[0] as f64,
-        ComponentView::I8(v) => v.buf()[0] as f64,
-        ComponentView::I16(v) => v.buf()[0] as f64,
-        ComponentView::I32(v) => v.buf()[0] as f64,
-        ComponentView::I64(v) => v.buf()[0] as f64,
-        ComponentView::F32(v) => v.buf()[0] as f64,
-        ComponentView::F64(v) => v.buf()[0],
-        ComponentView::Bool(v) => v.buf()[0] as u8 as f64,
-    }
-}
-
-fn read_time_series(component: &Component) -> Vec<(i64, f64)> {
-    let mut points = Vec::new();
-    let ts = &component.time_series;
-    let element_size = component.schema.size();
-    for node in ts.list.iter() {
-        let timestamps = node.timestamps();
-        let data = node.data.data();
-        for (i, timestamp) in timestamps.iter().enumerate() {
-            let start = i * element_size;
-            let end = start + element_size;
-            let Some(buf) = data.get(start..end) else {
-                break;
-            };
-            if let Ok((_size, view)) = component.schema.parse_value(buf) {
-                points.push((timestamp.0, component_view_to_f64(view)));
-            }
-        }
-    }
-    points.sort_by_key(|p| p.0);
-    points
-}
 
 // --- PlotBounds ---
 
@@ -67,28 +29,6 @@ impl PlotBounds {
         }
     }
 
-    pub fn from_points(points: &[(i64, f64)]) -> Option<Self> {
-        if points.len() < 2 {
-            return None;
-        }
-        let min_x = points[0].0 as f64;
-        let max_x = points[points.len() - 1].0 as f64;
-        if min_x == max_x {
-            return None;
-        }
-        let mut min_y = f64::INFINITY;
-        let mut max_y = f64::NEG_INFINITY;
-        for &(_, y) in points {
-            if y < min_y {
-                min_y = y;
-            }
-            if y > max_y {
-                max_y = y;
-            }
-        }
-        Some(Self::new(min_x, min_y, max_x, max_y).normalize())
-    }
-
     pub fn width(&self) -> f64 {
         self.max_x - self.min_x
     }
@@ -105,12 +45,10 @@ impl PlotBounds {
         self
     }
 
-    /// Pan by a normalized amount (0..1 = full width/height).
     pub fn offset_by_norm(self, nx: f64, ny: f64) -> Self {
         self.offset(nx * self.width(), ny * self.height())
     }
 
-    /// Zoom around an anchor point (0..1 normalized within the bounds).
     pub fn zoom_at(self, factor: f64, anchor_x: f64, anchor_y: f64) -> Self {
         let dw = self.width() * (factor - 1.0);
         let dh = self.height() * (factor - 1.0);
@@ -122,7 +60,6 @@ impl PlotBounds {
         }
     }
 
-    /// Ensure min < max with at least a span of 1.0.
     pub fn normalize(mut self) -> Self {
         if self.min_x >= self.max_x {
             self.min_x = self.max_x.min(self.min_x);
@@ -135,16 +72,6 @@ impl PlotBounds {
         self
     }
 
-    /// Convert a screen pixel position to data coordinates given the pixel bounds of the plot.
-    pub fn screen_to_data(&self, screen_bounds: Bounds<Pixels>, pos: Point<Pixels>) -> (f64, f64) {
-        let nx = (f32::from(pos.x - screen_bounds.origin.x)
-            / f32::from(screen_bounds.size.width)) as f64;
-        let ny = (f32::from(pos.y - screen_bounds.origin.y)
-            / f32::from(screen_bounds.size.height)) as f64;
-        (self.min_x + nx * self.width(), self.max_y - ny * self.height())
-    }
-
-    /// Convert a screen pixel delta to a normalized (0..1) fraction of the plot.
     pub fn screen_delta_to_norm(
         &self,
         screen_bounds: Bounds<Pixels>,
@@ -156,7 +83,6 @@ impl PlotBounds {
         (nx, ny)
     }
 
-    /// Normalized position of a screen point within the plot (0..1).
     pub fn screen_anchor(
         &self,
         screen_bounds: Bounds<Pixels>,
@@ -305,20 +231,41 @@ fn plot_area(outer: Bounds<Pixels>) -> Bounds<Pixels> {
     }
 }
 
+// --- Y-bounds computation ---
+
+fn compute_y_bounds(component: &Component) -> Option<(f64, f64)> {
+    let mut min_y = f64::INFINITY;
+    let mut max_y = f64::NEG_INFINITY;
+    let element_size = component.schema.size();
+    let mut any = false;
+    for node in component.time_series.list.iter() {
+        let data = node.data.data();
+        let count = node.timestamps().len();
+        for i in 0..count {
+            let start = i * element_size;
+            if let Some(buf) = data.get(start..start + element_size) {
+                if let Ok((_size, view)) = component.schema.parse_value(buf) {
+                    let v = view.to_f64();
+                    min_y = min_y.min(v);
+                    max_y = max_y.max(v);
+                    any = true;
+                }
+            }
+        }
+    }
+    any.then_some((min_y, max_y))
+}
+
 // --- Painting ---
 
 fn paint_plot(
     outer_bounds: Bounds<Pixels>,
-    points: &[(i64, f64)],
+    component: &Component,
     view: PlotBounds,
     color: Hsla,
     window: &mut Window,
     cx: &mut gpui::App,
 ) {
-    if points.is_empty() {
-        return;
-    }
-
     let (y_axis_min, y_axis_max, y_ticks) = nice_ticks(view.min_y, view.max_y, 5);
     let x_ticks = nice_time_ticks(view.min_x as i64, view.max_x as i64, 5);
 
@@ -374,16 +321,33 @@ fn paint_plot(
             }
         }
 
-        // Data line
-        if points.len() >= 2 {
+        // Data line — iterate directly from TimeSeries
+        let start_ts = Timestamp(view.min_x as i64);
+        let end_ts = Timestamp(view.max_x as i64);
+        if let Some(slice) = component.time_series.get_range(start_ts..end_ts) {
+            let schema = &component.schema;
+            // Collect node slices and reverse so we iterate chronologically
+            let node_slices: Vec<_> = slice.as_iter().collect();
+
             let mut path = PathBuilder::stroke(px(1.5));
-            let first = view.to_screen(pb, points[0].0 as f64, points[0].1);
-            path.move_to(first);
-            for &(t, v) in &points[1..] {
-                path.line_to(view.to_screen(pb, t as f64, v));
+            let mut first = true;
+
+            for node_slice in node_slices.iter().rev() {
+                for (ts, cv) in node_slice.iter_values(schema) {
+                    let screen_pt = view.to_screen(pb, ts.0 as f64, cv.to_f64());
+                    if first {
+                        path.move_to(screen_pt);
+                        first = false;
+                    } else {
+                        path.line_to(screen_pt);
+                    }
+                }
             }
-            if let Ok(path) = path.build() {
-                window.paint_path(path, color);
+
+            if !first {
+                if let Ok(path) = path.build() {
+                    window.paint_path(path, color);
+                }
             }
         }
     });
@@ -431,9 +395,9 @@ fn paint_plot(
 // --- TimeSeriesPlot view ---
 
 pub struct TimeSeriesPlot {
-    points: Vec<(i64, f64)>,
+    component: Option<Component>,
+    y_bounds: Option<(f64, f64)>,
     color: Hsla,
-    /// Current viewport. None means auto-fit to data.
     view: Option<PlotBounds>,
     drag_start: Option<Point<Pixels>>,
     drag_start_view: Option<PlotBounds>,
@@ -450,10 +414,21 @@ impl TimeSeriesPlot {
         let component_id = component_id.into();
         let task = cx.spawn(async move |this, cx| {
             let component = wait_for_component(&db, component_id).await;
+
+            // Store the component reference
+            let result = this.update(cx, |this, cx| {
+                this.component = Some(component.clone());
+                cx.notify();
+            });
+            if result.is_err() {
+                return;
+            }
+
+            // Update y-bounds whenever new data arrives
             loop {
-                let points = read_time_series(&component);
+                let y_bounds = compute_y_bounds(&component);
                 let result = this.update(cx, |this, cx| {
-                    this.points = points;
+                    this.y_bounds = y_bounds;
                     cx.notify();
                 });
                 if result.is_err() {
@@ -463,7 +438,8 @@ impl TimeSeriesPlot {
             }
         });
         Self {
-            points: Vec::new(),
+            component: None,
+            y_bounds: None,
             color: crate::theme::DARK.line_color,
             view: None,
             drag_start: None,
@@ -479,13 +455,23 @@ impl TimeSeriesPlot {
     }
 
     fn current_view(&self) -> Option<PlotBounds> {
-        self.view.or_else(|| PlotBounds::from_points(&self.points))
+        self.view.or_else(|| {
+            let component = self.component.as_ref()?;
+            let ts = &component.time_series;
+            let start = ts.start_timestamp()?.0 as f64;
+            let end = ts.latest()?.timestamp().0 as f64;
+            if start == end {
+                return None;
+            }
+            let (min_y, max_y) = self.y_bounds?;
+            Some(PlotBounds::new(start, min_y, end, max_y).normalize())
+        })
     }
 }
 
 impl Render for TimeSeriesPlot {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let points = self.points.clone();
+        let component = self.component.clone();
         let color = self.color;
         let view = self.current_view();
 
@@ -520,7 +506,6 @@ impl Render for TimeSeriesPlot {
                     let dx = event.position.x - start.x;
                     let dy = event.position.y - start.y;
                     let (nx, ny) = start_view.screen_delta_to_norm(pa, dx, dy);
-                    // Invert: dragging right pans data left, dragging down pans data up
                     this.view = Some(start_view.offset_by_norm(-nx, ny));
                     cx.notify();
                 },
@@ -536,7 +521,6 @@ impl Render for TimeSeriesPlot {
                     let factor = (1.0_f64 + zoom_amount).clamp(0.5, 2.0);
 
                     let (ax, ay) = view.screen_anchor(pa, event.position);
-                    // Invert Y anchor: screen Y is top-down, data Y is bottom-up
                     this.view = Some(view.zoom_at(factor, ax, 1.0 - ay));
                     cx.notify();
                 },
@@ -550,12 +534,12 @@ impl Render for TimeSeriesPlot {
                             let _ = this.update(cx, |this, _cx| {
                                 this.last_plot_area = Some(pa);
                             });
-                            (bounds, points, view)
+                            (bounds, component, view)
                         }
                     },
-                    move |_, (bounds, points, view), window, cx| {
-                        if let Some(view) = view {
-                            paint_plot(bounds, &points, view, color, window, cx);
+                    move |_, (bounds, component, view), window, cx| {
+                        if let (Some(component), Some(view)) = (component, view) {
+                            paint_plot(bounds, &component, view, color, window, cx);
                         }
                     },
                 )

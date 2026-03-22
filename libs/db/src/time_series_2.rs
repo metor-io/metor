@@ -8,7 +8,9 @@ use std::{
     },
 };
 
-use metor_proto::types::Timestamp;
+use metor_proto::types::{ComponentView, Timestamp};
+
+use crate::ComponentSchema;
 use stellarator::sync::WaitQueue;
 use tracing::warn;
 use zerocopy::FromBytes;
@@ -105,6 +107,21 @@ impl TimeSeriesNodeSlice {
         let start = (self.range.start() * element_size).min(data_len);
         let end = (self.range.end().saturating_add(1) * element_size).min(data_len);
         &self.node.data.data()[start..end]
+    }
+
+    pub fn iter_values<'a>(
+        &'a self,
+        schema: &'a ComponentSchema,
+    ) -> impl Iterator<Item = (Timestamp, ComponentView<'a>)> + 'a {
+        let element_size = schema.size();
+        let timestamps = self.timestamps();
+        let data = self.data();
+        timestamps.iter().enumerate().filter_map(move |(i, ts)| {
+            let start = i * element_size;
+            let buf = data.get(start..start + element_size)?;
+            let (_size, view) = schema.parse_value(buf).ok()?;
+            Some((*ts, view))
+        })
     }
 }
 
