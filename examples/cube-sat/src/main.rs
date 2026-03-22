@@ -4,6 +4,8 @@ use std::{
     time::{Duration, Instant},
 };
 
+use metor_fsw::{AsVTable, Metadatatize, tcp::SinkExt};
+use metor_fsw_adcs::{mekf, yang_lqr::YangLQR};
 use metor_proto::types::{ComponentId, LenPacket, Msg, OwnedPacket, PacketId, Timestamp};
 use metor_proto_bbq::RxExt;
 use metor_proto_stellar::{PacketSink, PacketStream, queue::spawn_recv};
@@ -13,8 +15,6 @@ use nox::{
     SpatialTransform, Vec3, Vector, Vector3, array::Quat, rk4, tensor,
 };
 use rand_distr::Distribution;
-use metor_fsw::{AsVTable, Metadatatize, tcp::SinkExt};
-use metor_fsw_adcs::{mekf, yang_lqr::YangLQR};
 use stellarator::{io::SplitExt, net::TcpStream, rent, struc_con::stellar};
 use tracing_subscriber::EnvFilter;
 use zerocopy::{Immutable, IntoBytes, KnownLayout};
@@ -465,8 +465,8 @@ pub async fn main() -> anyhow::Result<()> {
         .try_init()
         .unwrap();
 
-    stellar(move || metor_db::serve_tmp_db(SocketAddr::new([127, 0, 0, 1].into(), 2240)));
-    stellarator::sleep(Duration::from_millis(50)).await;
+    //stellar(move || metor_db::serve_tmp_db(SocketAddr::new([127, 0, 0, 1].into(), 2240)));
+    //stellarator::sleep(Duration::from_millis(50)).await;
     let (rx, tx) = TcpStream::connect(SocketAddr::new([127, 0, 0, 1].into(), 2240))
         .await?
         .split();
@@ -486,7 +486,11 @@ pub async fn main() -> anyhow::Result<()> {
     .await
     .0?;
     let mut cube_sat = CubeSat::default();
-    let mut pkt = LenPacket::new(metor_proto::types::PacketTy::Table, id, size_of::<CubeSat>());
+    let mut pkt = LenPacket::new(
+        metor_proto::types::PacketTy::Table,
+        id,
+        size_of::<CubeSat>(),
+    );
     loop {
         let start = Instant::now();
         while let Some(pkt) = rx.try_recv_pkt() {

@@ -1,12 +1,13 @@
 use std::sync::Arc;
 
 use gpui::{
-    canvas, div, point, prelude::*, px, Bounds, Context, Hsla, IntoElement, MouseButton,
-    PathBuilder, Pixels, Point, SharedString, Styled, TextRun, Window,
+    Bounds, Context, Hsla, IntoElement, MouseButton, PathBuilder, Pixels, Point, SharedString,
+    Styled, TextRun, Window, canvas, div, point, prelude::*, px,
 };
 use metor_db::{Component, DB};
 use metor_proto::types::{ComponentId, Timestamp};
 
+use crate::inspectable::{FieldId, Inspectable, InspectionField, InspectionValue};
 use crate::wait_for_component;
 
 // --- PlotBounds ---
@@ -83,15 +84,11 @@ impl PlotBounds {
         (nx, ny)
     }
 
-    pub fn screen_anchor(
-        &self,
-        screen_bounds: Bounds<Pixels>,
-        pos: Point<Pixels>,
-    ) -> (f64, f64) {
-        let nx = (f32::from(pos.x - screen_bounds.origin.x)
-            / f32::from(screen_bounds.size.width)) as f64;
-        let ny = (f32::from(pos.y - screen_bounds.origin.y)
-            / f32::from(screen_bounds.size.height)) as f64;
+    pub fn screen_anchor(&self, screen_bounds: Bounds<Pixels>, pos: Point<Pixels>) -> (f64, f64) {
+        let nx = (f32::from(pos.x - screen_bounds.origin.x) / f32::from(screen_bounds.size.width))
+            as f64;
+        let ny = (f32::from(pos.y - screen_bounds.origin.y) / f32::from(screen_bounds.size.height))
+            as f64;
         (nx.clamp(0.0, 1.0), ny.clamp(0.0, 1.0))
     }
 
@@ -115,69 +112,87 @@ impl PlotBounds {
 
 // --- Tick computation ---
 
-fn nice_ticks(data_min: f64, data_max: f64, target_count: usize) -> (f64, f64, Vec<f64>) {
-    if data_min == data_max {
-        let v = data_min;
-        if v == 0.0 {
-            return (-1.0, 1.0, vec![-1.0, 0.0, 1.0]);
-        }
-        let pad = v.abs() * 0.1;
-        return (v - pad, v + pad, vec![v - pad, v, v + pad]);
+/// Round a step size to a "pretty" value (nearest 0.5 at the appropriate magnitude).
+fn pretty_round(num: f64) -> f64 {
+    if num == 0.0 || !num.is_finite() {
+        return num;
+    }
+    let mut multiplier = 1.0;
+    let mut n = num.abs();
+
+    while n < 1.0 {
+        n *= 10.0;
+        multiplier *= 10.0;
     }
 
-    let range = data_max - data_min;
-    let rough_step = range / target_count as f64;
-    let mag = 10f64.powf(rough_step.log10().floor());
-    let norm = rough_step / mag;
-    let nice_step = if norm <= 1.5 {
-        mag
-    } else if norm <= 3.0 {
-        2.0 * mag
-    } else if norm <= 7.0 {
-        5.0 * mag
-    } else {
-        10.0 * mag
-    };
-
-    let axis_min = (data_min / nice_step).floor() * nice_step;
-    let axis_max = (data_max / nice_step).ceil() * nice_step;
-
-    let mut ticks = Vec::new();
-    let mut v = axis_min;
-    while v <= axis_max + nice_step * 0.5 {
-        ticks.push(v);
-        v += nice_step;
-    }
-    (axis_min, axis_max, ticks)
+    let rounded = (n * 2.0).round() / 2.0;
+    let result = rounded / multiplier;
+    if num < 0.0 { -result } else { result }
 }
 
-fn nice_time_ticks(t_min: i64, t_max: i64, target_count: usize) -> Vec<i64> {
-    let range = (t_max - t_min) as f64;
-    if range <= 0.0 {
-        return vec![t_min];
+/// Generate Y-axis tick positions within the visible bounds.
+/// When the range spans 0, ticks are anchored at 0 and extend outward.
+fn y_ticks(view: &PlotBounds, target_count: usize) -> Vec<f64> {
+    let step = pretty_round(view.height() / target_count as f64);
+    if !step.is_normal() || step <= 0.0 {
+        return vec![];
     }
-    let rough_step = range / target_count as f64;
-    let mag = 10f64.powf(rough_step.log10().floor());
-    let norm = rough_step / mag;
-    let nice_step = if norm <= 1.5 {
-        mag
-    } else if norm <= 3.0 {
-        2.0 * mag
-    } else if norm <= 7.0 {
-        5.0 * mag
-    } else {
-        10.0 * mag
-    };
-    let step = (nice_step as i64).max(1);
 
-    let start = (t_min / step) * step;
+    let mut ticks = Vec::new();
+
+    if view.min_y <= 0.0 && view.max_y >= 0.0 {
+        // Walk outward from 0 in both directions
+        let mut v = 0.0;
+        while v <= view.max_y {
+            ticks.push(v);
+            v += step;
+        }
+        let mut v = -step;
+        while v >= view.min_y {
+            ticks.push(v);
+            v -= step;
+        }
+    } else {
+        // Walk from a step-aligned start
+        let start = (view.min_y / step).floor() * step;
+        let mut v = start;
+        while v <= view.max_y + step * 0.01 {
+            if v >= view.min_y {
+                ticks.push(v);
+            }
+            v += step;
+        }
+    }
+
+    ticks.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    ticks
+}
+
+/// Generate X-axis tick positions (timestamps in microseconds) within the visible bounds.
+/// Ticks are anchored at 0 relative to view.min_x and stepped by a pretty-rounded interval.
+fn x_ticks(view: &PlotBounds, target_count: usize) -> Vec<i64> {
+    let range = view.width();
+    if range <= 0.0 {
+        return vec![view.min_x as i64];
+    }
+
+    let step = pretty_round(range / target_count as f64);
+    if !step.is_normal() || step <= 0.0 {
+        return vec![view.min_x as i64];
+    }
+    let step_i = (step as i64).max(1);
+    let t_min = view.min_x as i64;
+    let t_max = view.max_x as i64;
+
+    // Align to multiples of step
+    let start = (t_min / step_i) * step_i;
     let mut ticks = Vec::new();
     let mut t = start;
     while t <= t_max {
         if t >= t_min {
             ticks.push(t);
         }
-        t += step;
+        t += step_i;
     }
     if ticks.is_empty() {
         ticks.push(t_min);
@@ -266,11 +281,10 @@ fn paint_plot(
     window: &mut Window,
     cx: &mut gpui::App,
 ) {
-    let (y_axis_min, y_axis_max, y_ticks) = nice_ticks(view.min_y, view.max_y, 5);
-    let x_ticks = nice_time_ticks(view.min_x as i64, view.max_x as i64, 5);
+    let y_tick_values = y_ticks(&view, 5);
+    let x_tick_values = x_ticks(&view, 5);
 
     let pb = plot_area(outer_bounds);
-    let axis_view = PlotBounds::new(view.min_x, y_axis_min, view.max_x, y_axis_max);
 
     let theme = &crate::theme::DARK;
     let label_font_size = px(LABEL_FONT_SIZE);
@@ -289,8 +303,8 @@ fn paint_plot(
     // Clipped region: grid, zero line, data
     window.with_content_mask(Some(gpui::ContentMask { bounds: pb }), |window| {
         // Y grid
-        for &tick in &y_ticks {
-            let y = axis_view.to_screen(pb, axis_view.min_x, tick).y;
+        for &tick in &y_tick_values {
+            let y = view.to_screen(pb, view.min_x, tick).y;
             let mut grid = PathBuilder::stroke(px(0.5));
             grid.move_to(point(pb.origin.x, y));
             grid.line_to(point(pb.origin.x + pb.size.width, y));
@@ -300,8 +314,8 @@ fn paint_plot(
         }
 
         // X grid
-        for &tick in &x_ticks {
-            let x = axis_view.to_screen(pb, tick as f64, axis_view.min_y).x;
+        for &tick in &x_tick_values {
+            let x = view.to_screen(pb, tick as f64, view.min_y).x;
             let mut grid = PathBuilder::stroke(px(0.5));
             grid.move_to(point(x, pb.origin.y));
             grid.line_to(point(x, pb.origin.y + pb.size.height));
@@ -311,8 +325,8 @@ fn paint_plot(
         }
 
         // Zero line
-        if axis_view.min_y < 0.0 && axis_view.max_y > 0.0 {
-            let zero_y = axis_view.to_screen(pb, axis_view.min_x, 0.0).y;
+        if view.min_y < 0.0 && view.max_y > 0.0 {
+            let zero_y = view.to_screen(pb, view.min_x, 0.0).y;
             let mut zp = PathBuilder::stroke(px(1.0));
             zp.move_to(point(pb.origin.x, zero_y));
             zp.line_to(point(pb.origin.x + pb.size.width, zero_y));
@@ -326,7 +340,6 @@ fn paint_plot(
         let end_ts = Timestamp(view.max_x as i64);
         if let Some(slice) = component.time_series.get_range(start_ts..end_ts) {
             let schema = &component.schema;
-            // Collect node slices and reverse so we iterate chronologically
             let node_slices: Vec<_> = slice.as_iter().collect();
 
             let mut path = PathBuilder::stroke(px(1.5));
@@ -356,38 +369,53 @@ fn paint_plot(
     let mut axes = PathBuilder::stroke(px(1.0));
     axes.move_to(point(pb.origin.x, pb.origin.y));
     axes.line_to(point(pb.origin.x, pb.origin.y + pb.size.height));
-    axes.line_to(point(pb.origin.x + pb.size.width, pb.origin.y + pb.size.height));
+    axes.line_to(point(
+        pb.origin.x + pb.size.width,
+        pb.origin.y + pb.size.height,
+    ));
     if let Ok(path) = axes.build() {
         window.paint_path(path, theme.axis_color);
     }
 
-    // Y labels
-    for &tick in &y_ticks {
-        let y = axis_view.to_screen(pb, axis_view.min_x, tick).y;
+    // Y labels (unclipped)
+    for &tick in &y_tick_values {
+        let y = view.to_screen(pb, view.min_x, tick).y;
         if y < pb.origin.y || y > pb.origin.y + pb.size.height {
             continue;
         }
         let text = format_value_label(tick);
         let run = make_run(&text);
-        let shaped = window
-            .text_system()
-            .shape_line(SharedString::from(text), label_font_size, &[run], None);
-        let origin = point(pb.origin.x - shaped.width - px(4.0), y - label_font_size / 2.0);
+        let shaped = window.text_system().shape_line(
+            SharedString::from(text),
+            label_font_size,
+            &[run],
+            None,
+        );
+        let origin = point(
+            pb.origin.x - shaped.width - px(4.0),
+            y - label_font_size / 2.0,
+        );
         let _ = shaped.paint(origin, label_font_size, window, cx);
     }
 
-    // X labels
-    for &tick in &x_ticks {
-        let x = axis_view.to_screen(pb, tick as f64, axis_view.min_y).x;
+    // X labels (unclipped)
+    for &tick in &x_tick_values {
+        let x = view.to_screen(pb, tick as f64, view.min_y).x;
         if x < pb.origin.x || x > pb.origin.x + pb.size.width {
             continue;
         }
         let text = format_time_label(tick, view.min_x as i64);
         let run = make_run(&text);
-        let shaped = window
-            .text_system()
-            .shape_line(SharedString::from(text), label_font_size, &[run], None);
-        let origin = point(x - shaped.width / 2.0, pb.origin.y + pb.size.height + px(4.0));
+        let shaped = window.text_system().shape_line(
+            SharedString::from(text),
+            label_font_size,
+            &[run],
+            None,
+        );
+        let origin = point(
+            x - shaped.width / 2.0,
+            pb.origin.y + pb.size.height + px(4.0),
+        );
         let _ = shaped.paint(origin, label_font_size, window, cx);
     }
 }
@@ -395,7 +423,9 @@ fn paint_plot(
 // --- TimeSeriesPlot view ---
 
 pub struct TimeSeriesPlot {
+    db: Arc<DB>,
     component: Option<Component>,
+    component_id: ComponentId,
     y_bounds: Option<(f64, f64)>,
     color: Hsla,
     view: Option<PlotBounds>,
@@ -412,10 +442,29 @@ impl TimeSeriesPlot {
         cx: &mut Context<Self>,
     ) -> Self {
         let component_id = component_id.into();
-        let task = cx.spawn(async move |this, cx| {
+        let task = Self::spawn_stream(db.clone(), component_id, cx);
+        Self {
+            db,
+            component: None,
+            component_id,
+            y_bounds: None,
+            color: crate::theme::DARK.line_color,
+            view: None,
+            drag_start: None,
+            drag_start_view: None,
+            last_plot_area: None,
+            _task: task,
+        }
+    }
+
+    fn spawn_stream(
+        db: Arc<DB>,
+        component_id: ComponentId,
+        cx: &mut Context<Self>,
+    ) -> gpui::Task<()> {
+        cx.spawn(async move |this, cx| {
             let component = wait_for_component(&db, component_id).await;
 
-            // Store the component reference
             let result = this.update(cx, |this, cx| {
                 this.component = Some(component.clone());
                 cx.notify();
@@ -424,7 +473,6 @@ impl TimeSeriesPlot {
                 return;
             }
 
-            // Update y-bounds whenever new data arrives
             loop {
                 let y_bounds = compute_y_bounds(&component);
                 let result = this.update(cx, |this, cx| {
@@ -436,17 +484,16 @@ impl TimeSeriesPlot {
                 }
                 component.time_series.wait().await;
             }
-        });
-        Self {
-            component: None,
-            y_bounds: None,
-            color: crate::theme::DARK.line_color,
-            view: None,
-            drag_start: None,
-            drag_start_view: None,
-            last_plot_area: None,
-            _task: task,
-        }
+        })
+    }
+
+    pub fn set_component(&mut self, component_id: ComponentId, cx: &mut Context<Self>) {
+        self.component_id = component_id;
+        self.component = None;
+        self.y_bounds = None;
+        self.view = None;
+        self._task = Self::spawn_stream(self.db.clone(), component_id, cx);
+        cx.notify();
     }
 
     pub fn color(mut self, color: Hsla) -> Self {
@@ -480,9 +527,14 @@ impl Render for TimeSeriesPlot {
             .bg(crate::theme::DARK.bg_secondary)
             .on_mouse_down(
                 MouseButton::Left,
-                cx.listener(|this, event: &gpui::MouseDownEvent, _window, _cx| {
-                    this.drag_start = Some(event.position);
-                    this.drag_start_view = this.current_view();
+                cx.listener(|this, event: &gpui::MouseDownEvent, _window, cx| {
+                    if event.click_count == 2 {
+                        this.view = None;
+                        cx.notify();
+                    } else {
+                        this.drag_start = Some(event.position);
+                        this.drag_start_view = this.current_view();
+                    }
                 }),
             )
             .on_mouse_up(
@@ -492,8 +544,8 @@ impl Render for TimeSeriesPlot {
                     this.drag_start_view = None;
                 }),
             )
-            .on_mouse_move(cx.listener(
-                |this, event: &gpui::MouseMoveEvent, _window, cx| {
+            .on_mouse_move(
+                cx.listener(|this, event: &gpui::MouseMoveEvent, _window, cx| {
                     if !event.dragging() {
                         return;
                     }
@@ -508,10 +560,10 @@ impl Render for TimeSeriesPlot {
                     let (nx, ny) = start_view.screen_delta_to_norm(pa, dx, dy);
                     this.view = Some(start_view.offset_by_norm(-nx, ny));
                     cx.notify();
-                },
-            ))
-            .on_scroll_wheel(cx.listener(
-                |this, event: &gpui::ScrollWheelEvent, _window, cx| {
+                }),
+            )
+            .on_scroll_wheel(
+                cx.listener(|this, event: &gpui::ScrollWheelEvent, _window, cx| {
                     let (Some(view), Some(pa)) = (this.current_view(), this.last_plot_area) else {
                         return;
                     };
@@ -523,8 +575,8 @@ impl Render for TimeSeriesPlot {
                     let (ax, ay) = view.screen_anchor(pa, event.position);
                     this.view = Some(view.zoom_at(factor, ax, 1.0 - ay));
                     cx.notify();
-                },
-            ))
+                }),
+            )
             .child(
                 canvas(
                     {
@@ -545,5 +597,75 @@ impl Render for TimeSeriesPlot {
                 )
                 .size_full(),
             )
+    }
+}
+
+impl Inspectable for TimeSeriesPlot {
+    fn fields(&self) -> Vec<InspectionField> {
+        let component_name = self
+            .db
+            .with_state(|state| {
+                state
+                    .get_component_metadata(self.component_id)
+                    .map(|m| m.name.clone())
+            })
+            .unwrap_or_else(|| self.component_id.to_string());
+
+        let mut fields = vec![
+            InspectionField {
+                label: "Component".into(),
+                field_id: FieldId(0),
+                value: InspectionValue::Component {
+                    name: component_name,
+                },
+            },
+            InspectionField {
+                label: "Color".into(),
+                field_id: FieldId(1),
+                value: InspectionValue::Color(self.color),
+            },
+        ];
+        if let Some((min, max)) = self.y_bounds {
+            fields.push(InspectionField {
+                label: "Y Min".into(),
+                field_id: FieldId(2),
+                value: InspectionValue::F64(min),
+            });
+            fields.push(InspectionField {
+                label: "Y Max".into(),
+                field_id: FieldId(3),
+                value: InspectionValue::F64(max),
+            });
+        }
+        fields
+    }
+
+    fn set_field(&mut self, field_id: FieldId, value: InspectionValue, cx: &mut Context<Self>) {
+        match (field_id, value) {
+            (FieldId(0), InspectionValue::Component { name }) => {
+                // Look up the ComponentId by name from the DB.
+                let id = self.db.with_state(|state| {
+                    state
+                        .component_metadata_iter()
+                        .find(|(_, m)| m.name == name)
+                        .map(|(id, _)| *id)
+                });
+                if let Some(id) = id {
+                    self.set_component(id, cx);
+                }
+            }
+            (FieldId(1), InspectionValue::Color(c)) => {
+                self.color = c;
+            }
+            (FieldId(2), InspectionValue::F64(v)) => {
+                let (_, max) = self.y_bounds.unwrap_or((v, v));
+                self.y_bounds = Some((v, max));
+            }
+            (FieldId(3), InspectionValue::F64(v)) => {
+                let (min, _) = self.y_bounds.unwrap_or((v, v));
+                self.y_bounds = Some((min, v));
+            }
+            _ => {}
+        }
     }
 }

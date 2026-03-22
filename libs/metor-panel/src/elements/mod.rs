@@ -4,6 +4,7 @@ use gpui::{Context, IntoElement, SharedString, Window, div, prelude::*};
 use metor_db::DB;
 use std::fmt::Write;
 
+use crate::inspectable::{FieldId, Inspectable, InspectionField, InspectionValue};
 use crate::theme::DARK;
 use crate::{AsComponentView, ComponentStream, ComponentStreamBuilder};
 
@@ -60,4 +61,12 @@ impl Render for ComponentText {
                     .unwrap_or_else(|| SharedString::new_static("")),
             )
     }
+}
+
+impl Inspectable for ComponentText {
+    fn fields(&self) -> Vec<InspectionField> {
+        vec![]
+    }
+
+    fn set_field(&mut self, _field_id: FieldId, _value: InspectionValue, _cx: &mut Context<Self>) {}
 }

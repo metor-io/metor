@@ -332,6 +332,10 @@ impl State {
         self.components.get(&component_id)
     }
 
+    pub fn component_metadata_iter(&self) -> impl Iterator<Item = (&ComponentId, &ComponentMetadata)> {
+        self.component_metadata.iter()
+    }
+
     pub fn set_component_metadata(
         &mut self,
         metadata: ComponentMetadata,
