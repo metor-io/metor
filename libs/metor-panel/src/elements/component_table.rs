@@ -1,20 +1,14 @@
 use std::fmt::Write;
-use std::ops::Range;
 use std::sync::Arc;
 
 use gpui::{
-    AppContext, AsyncApp, Bounds, Context, Entity, IntoElement, Pixels, SharedString, Window,
-    canvas, div, point, prelude::*, px, uniform_list,
+    AnyElement, App, AppContext, AsyncApp, Context, Entity, IntoElement, Pixels, SharedString,
+    Window, canvas, div, prelude::*, px,
 };
 use metor_db::{Component, DB};
-use metor_proto::types::Timestamp;
-
+use super::table::{Column, ColumnSort, Table, TableDelegate};
 use super::time_series::{PlotBounds, compute_y_bounds, paint_data_line};
 use crate::{ComponentStream, WalComponentStream, theme::DARK};
-
-const ROW_HEIGHT: f32 = 60.0;
-const NAME_WIDTH: f32 = 280.0;
-const VALUE_WIDTH: f32 = 320.0;
 
 struct ComponentRow {
     name: String,
@@ -71,28 +65,19 @@ impl ComponentRow {
     }
 }
 
-pub struct ComponentTable {
+pub struct ComponentTableDelegate {
     db: Arc<DB>,
     rows: Vec<Entity<ComponentRow>>,
     _task: gpui::Task<()>,
 }
 
-impl ComponentTable {
-    pub fn new(db: Arc<DB>, cx: &mut Context<Self>) -> Self {
-        let task = Self::spawn_watcher(db.clone(), cx);
-        Self {
-            db,
-            rows: Vec::new(),
-            _task: task,
-        }
-    }
-
-    fn spawn_watcher(db: Arc<DB>, cx: &mut Context<Self>) -> gpui::Task<()> {
+impl ComponentTableDelegate {
+    fn spawn_watcher(db: Arc<DB>, cx: &mut Context<Table<Self>>) -> gpui::Task<()> {
         cx.spawn(async move |this, cx| {
             loop {
                 let rows = Self::build_rows(&db, cx);
                 let result = this.update(cx, |this, cx| {
-                    this.rows = rows;
+                    this.delegate_mut().rows = rows;
                     cx.notify();
                 });
                 if result.is_err() {
@@ -117,37 +102,53 @@ impl ComponentTable {
     }
 }
 
-impl Render for ComponentRow {
-    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
-        let component = self.component.clone();
-        let plot_bounds = self.sparkline_bounds();
-        let value = self.current_value();
-        let color = DARK.line_color;
-        div()
-            .flex()
-            .flex_row()
-            .items_center()
-            .w_full()
-            .h(px(ROW_HEIGHT))
-            .border_b_1()
-            .border_color(DARK.border_primary)
-            .child(
+impl TableDelegate for ComponentTableDelegate {
+    fn columns(&self) -> Vec<Column> {
+        vec![
+            Column::new("Name", 280.0).sortable(),
+            Column::new("Value", 320.0).sortable(),
+            Column::new("Sparkline", 200.0).flex().resizable(false),
+        ]
+    }
+
+    fn rows_count(&self) -> usize {
+        self.rows.len()
+    }
+
+    fn row_height(&self) -> Pixels {
+        px(60.0)
+    }
+
+    fn render_cell(
+        &mut self,
+        row_ix: usize,
+        col_ix: usize,
+        _window: &mut Window,
+        cx: &mut Context<Table<Self>>,
+    ) -> AnyElement {
+        let row = &self.rows[row_ix];
+        let row_ref = row.read(cx);
+        match col_ix {
+            0 => div()
+                .px(px(12.0))
+                .text_size(px(13.0))
+                .text_color(DARK.text_primary)
+                .child(SharedString::from(row_ref.name.clone()))
+                .into_any_element(),
+            1 => {
+                let value = row_ref.current_value();
                 div()
-                    .w(px(NAME_WIDTH))
-                    .px(px(12.0))
-                    .text_size(px(13.0))
-                    .text_color(DARK.text_primary)
-                    .child(SharedString::from(self.name.clone())),
-            )
-            .child(
-                div()
-                    .w(px(VALUE_WIDTH))
                     .px(px(8.0))
                     .text_size(px(13.0))
                     .text_color(DARK.text_primary)
-                    .child(SharedString::from(value)),
-            )
-            .child(
+                    .child(SharedString::from(value))
+                    .into_any_element()
+            }
+            2 => {
+                let component = row_ref.component.clone();
+                let plot_bounds = row_ref.sparkline_bounds();
+                let color = DARK.line_color;
+                let row_height = self.row_height();
                 canvas(
                     move |bounds, _window, _cx| (bounds, component, plot_bounds),
                     move |_, (bounds, component, _), window, _cx| {
@@ -156,70 +157,57 @@ impl Render for ComponentRow {
                         }
                     },
                 )
-                .flex_1()
-                .h(px(ROW_HEIGHT - 8.0)),
-            )
+                .w_full()
+                .h(row_height - px(8.0))
+                .into_any_element()
+            }
+            _ => div().into_any_element(),
+        }
+    }
+
+    fn sort_column(&mut self, col_ix: usize, sort: ColumnSort, cx: &App) {
+        match (col_ix, sort) {
+            (0, ColumnSort::Ascending) => {
+                self.rows.sort_by(|a, b| {
+                    let a = a.read(cx).name.clone();
+                    let b = b.read(cx).name.clone();
+                    a.cmp(&b)
+                });
+            }
+            (0, ColumnSort::Descending) => {
+                self.rows.sort_by(|a, b| {
+                    let a = a.read(cx).name.clone();
+                    let b = b.read(cx).name.clone();
+                    b.cmp(&a)
+                });
+            }
+            (1, ColumnSort::Ascending) => {
+                self.rows.sort_by(|a, b| {
+                    let a = a.read(cx).current_value();
+                    let b = b.read(cx).current_value();
+                    a.cmp(&b)
+                });
+            }
+            (1, ColumnSort::Descending) => {
+                self.rows.sort_by(|a, b| {
+                    let a = a.read(cx).current_value();
+                    let b = b.read(cx).current_value();
+                    b.cmp(&a)
+                });
+            }
+            _ => {}
+        }
     }
 }
 
-impl Render for ComponentTable {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let row_count = self.rows.len();
+pub type ComponentTable = Table<ComponentTableDelegate>;
 
-        div()
-            .flex()
-            .flex_col()
-            .size_full()
-            .bg(DARK.bg_primary)
-            .child(
-                // Header row
-                div()
-                    .flex()
-                    .flex_row()
-                    .items_center()
-                    .h(px(32.0))
-                    .border_b_1()
-                    .border_color(DARK.border_primary)
-                    .child(
-                        div()
-                            .w(px(NAME_WIDTH))
-                            .px(px(12.0))
-                            .text_size(px(12.0))
-                            .text_color(DARK.text_tertiary)
-                            .child("Name"),
-                    )
-                    .child(
-                        div()
-                            .w(px(VALUE_WIDTH))
-                            .px(px(8.0))
-                            .text_size(px(12.0))
-                            .text_color(DARK.text_tertiary)
-                            .child("Value"),
-                    )
-                    .child(
-                        div()
-                            .flex_1()
-                            .px(px(8.0))
-                            .text_size(px(12.0))
-                            .text_color(DARK.text_tertiary)
-                            .child("Sparkline"),
-                    ),
-            )
-            .child(
-                uniform_list(
-                    "component-rows",
-                    row_count,
-                    cx.processor(
-                        |this: &mut Self, range: Range<usize>, _window, _cx| {
-                            this.rows[range]
-                                .iter()
-                                .cloned()
-                                .map(|row: Entity<ComponentRow>| row.into_any_element())
-                                .collect()
-                        },
-                    ),
-                )
-                .flex_1(),
-            )
-    }
+pub fn new_component_table(db: Arc<DB>, cx: &mut Context<ComponentTable>) -> ComponentTable {
+    let task = ComponentTableDelegate::spawn_watcher(db.clone(), cx);
+    let delegate = ComponentTableDelegate {
+        db,
+        rows: Vec::new(),
+        _task: task,
+    };
+    Table::new(delegate)
 }

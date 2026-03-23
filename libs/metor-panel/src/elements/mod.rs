@@ -9,9 +9,11 @@ use crate::theme::DARK;
 use crate::{AsComponentView, ComponentStream, ComponentStreamBuilder};
 
 pub mod component_table;
+pub mod table;
 pub mod time_series;
 
-pub use component_table::ComponentTable;
+pub use component_table::{ComponentTable, new_component_table};
+pub use table::{Column, ColumnSort, Table, TableDelegate};
 pub use time_series::TimeSeriesPlot;
 
 pub struct ComponentText {

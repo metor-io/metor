@@ -3,7 +3,7 @@ use std::sync::Arc;
 
 use gpui::{App, AppContext, Application, Bounds, WindowBounds, WindowOptions, px, size};
 use metor_db::{DB, Server};
-use metor_panel::elements::ComponentTable;
+use metor_panel::elements::new_component_table;
 use stellarator::{net::TcpListener, struc_con::stellar};
 
 fn main() {
@@ -26,7 +26,7 @@ fn main() {
                 window_bounds: Some(WindowBounds::Windowed(bounds)),
                 ..Default::default()
             },
-            |_window, cx| cx.new(|cx| ComponentTable::new(db, cx)),
+            |_window, cx| cx.new(|cx| new_component_table(db, cx)),
         )
         .unwrap();
     });
