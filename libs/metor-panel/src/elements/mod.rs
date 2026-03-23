@@ -8,8 +8,10 @@ use crate::inspectable::{FieldId, Inspectable, InspectionField, InspectionValue}
 use crate::theme::DARK;
 use crate::{AsComponentView, ComponentStream, ComponentStreamBuilder};
 
+pub mod component_table;
 pub mod time_series;
 
+pub use component_table::ComponentTable;
 pub use time_series::TimeSeriesPlot;
 
 pub struct ComponentText {

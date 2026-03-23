@@ -18,3 +18,7 @@ path = "examples/component_text.rs"
 [[example]]
 name = "time_series_plot"
 path = "examples/time_series_plot.rs"
+
+[[example]]
+name = "component_table"
+path = "examples/component_table.rs"

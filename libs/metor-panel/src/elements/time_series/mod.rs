@@ -10,194 +10,78 @@ use metor_proto::types::{ComponentId, Timestamp};
 use crate::inspectable::{FieldId, Inspectable, InspectionField, InspectionValue};
 use crate::wait_for_component;
 
-// --- PlotBounds ---
+mod bounds;
+pub use bounds::*;
 
-#[derive(Clone, Copy, Debug)]
-pub struct PlotBounds {
-    pub min_x: f64,
-    pub min_y: f64,
-    pub max_x: f64,
-    pub max_y: f64,
-}
-
-impl PlotBounds {
-    pub fn new(min_x: f64, min_y: f64, max_x: f64, max_y: f64) -> Self {
-        Self {
-            min_x,
-            min_y,
-            max_x,
-            max_y,
-        }
-    }
-
-    pub fn width(&self) -> f64 {
-        self.max_x - self.min_x
-    }
-
-    pub fn height(&self) -> f64 {
-        self.max_y - self.min_y
-    }
-
-    pub fn offset(mut self, dx: f64, dy: f64) -> Self {
-        self.min_x += dx;
-        self.max_x += dx;
-        self.min_y += dy;
-        self.max_y += dy;
-        self
-    }
-
-    pub fn offset_by_norm(self, nx: f64, ny: f64) -> Self {
-        self.offset(nx * self.width(), ny * self.height())
-    }
-
-    pub fn zoom_at(self, factor: f64, anchor_x: f64, anchor_y: f64) -> Self {
-        let dw = self.width() * (factor - 1.0);
-        let dh = self.height() * (factor - 1.0);
-        Self {
-            min_x: self.min_x - dw * anchor_x,
-            max_x: self.max_x + dw * (1.0 - anchor_x),
-            min_y: self.min_y - dh * anchor_y,
-            max_y: self.max_y + dh * (1.0 - anchor_y),
-        }
-    }
-
-    pub fn normalize(mut self) -> Self {
-        if self.min_x >= self.max_x {
-            self.min_x = self.max_x.min(self.min_x);
-            self.max_x = self.min_x + 1.0;
-        }
-        if self.min_y >= self.max_y {
-            self.min_y = self.max_y.min(self.min_y);
-            self.max_y = self.min_y + 1.0;
-        }
-        self
-    }
-
-    pub fn screen_delta_to_norm(
-        &self,
-        screen_bounds: Bounds<Pixels>,
-        dx: Pixels,
-        dy: Pixels,
-    ) -> (f64, f64) {
-        let nx = f32::from(dx) as f64 / f32::from(screen_bounds.size.width) as f64;
-        let ny = f32::from(dy) as f64 / f32::from(screen_bounds.size.height) as f64;
-        (nx, ny)
-    }
-
-    pub fn screen_anchor(&self, screen_bounds: Bounds<Pixels>, pos: Point<Pixels>) -> (f64, f64) {
-        let nx = (f32::from(pos.x - screen_bounds.origin.x) / f32::from(screen_bounds.size.width))
-            as f64;
-        let ny = (f32::from(pos.y - screen_bounds.origin.y) / f32::from(screen_bounds.size.height))
-            as f64;
-        (nx.clamp(0.0, 1.0), ny.clamp(0.0, 1.0))
-    }
-
-    fn to_screen(&self, screen_bounds: Bounds<Pixels>, data_x: f64, data_y: f64) -> Point<Pixels> {
-        let nx = if self.width() == 0.0 {
-            0.5
-        } else {
-            (data_x - self.min_x) / self.width()
-        };
-        let ny = if self.height() == 0.0 {
-            0.5
-        } else {
-            1.0 - (data_y - self.min_y) / self.height()
-        };
-        point(
-            screen_bounds.origin.x + screen_bounds.size.width * nx as f32,
-            screen_bounds.origin.y + screen_bounds.size.height * ny as f32,
-        )
-    }
-}
-
-// --- Tick computation ---
-
-/// Round a step size to a "pretty" value (nearest 0.5 at the appropriate magnitude).
-fn pretty_round(num: f64) -> f64 {
-    if num == 0.0 || !num.is_finite() {
-        return num;
-    }
-    let mut multiplier = 1.0;
-    let mut n = num.abs();
-
-    while n < 1.0 {
-        n *= 10.0;
-        multiplier *= 10.0;
-    }
-
-    let rounded = (n * 2.0).round() / 2.0;
-    let result = rounded / multiplier;
-    if num < 0.0 { -result } else { result }
-}
-
-/// Generate Y-axis tick positions within the visible bounds.
+/// Generate Y-axis tick positions within the visible bounds (sorted ascending).
 /// When the range spans 0, ticks are anchored at 0 and extend outward.
-fn y_ticks(view: &PlotBounds, target_count: usize) -> Vec<f64> {
+fn y_ticks(view: &PlotBounds, target_count: usize) -> impl Iterator<Item = f64> {
     let step = pretty_round(view.height() / target_count as f64);
-    if !step.is_normal() || step <= 0.0 {
-        return vec![];
-    }
-
-    let mut ticks = Vec::new();
-
-    if view.min_y <= 0.0 && view.max_y >= 0.0 {
-        // Walk outward from 0 in both directions
-        let mut v = 0.0;
-        while v <= view.max_y {
-            ticks.push(v);
-            v += step;
-        }
-        let mut v = -step;
-        while v >= view.min_y {
-            ticks.push(v);
-            v -= step;
-        }
+    let (start, end) = if !step.is_normal() || step <= 0.0 {
+        (0.0, -1.0) // empty range — iterator yields nothing
+    } else if view.min_y <= 0.0 && view.max_y >= 0.0 {
+        // Anchor at 0: find the lowest tick by stepping down from 0
+        let neg_steps = (-view.min_y / step).floor() as i64;
+        let start = -step * neg_steps as f64;
+        (start, view.max_y)
     } else {
-        // Walk from a step-aligned start
-        let start = (view.min_y / step).floor() * step;
-        let mut v = start;
-        while v <= view.max_y + step * 0.01 {
-            if v >= view.min_y {
-                ticks.push(v);
-            }
-            v += step;
-        }
-    }
+        let start = (view.min_y / step).ceil() * step;
+        (start, view.max_y + step * 0.01)
+    };
 
-    ticks.sort_by(|a, b| a.partial_cmp(b).unwrap());
-    ticks
+    let mut v = start;
+    std::iter::from_fn(move || {
+        if v <= end {
+            let tick = v;
+            v += step;
+            Some(tick)
+        } else {
+            None
+        }
+    })
 }
 
 /// Generate X-axis tick positions (timestamps in microseconds) within the visible bounds.
-/// Ticks are anchored at 0 relative to view.min_x and stepped by a pretty-rounded interval.
-fn x_ticks(view: &PlotBounds, target_count: usize) -> Vec<i64> {
+fn x_ticks(view: &PlotBounds, target_count: usize) -> impl Iterator<Item = i64> {
     let range = view.width();
-    if range <= 0.0 {
-        return vec![view.min_x as i64];
-    }
-
     let step = pretty_round(range / target_count as f64);
-    if !step.is_normal() || step <= 0.0 {
-        return vec![view.min_x as i64];
-    }
-    let step_i = (step as i64).max(1);
+    let valid = range > 0.0 && step.is_normal() && step > 0.0;
+
+    let step_i = if valid { (step as i64).max(1) } else { 1 };
     let t_min = view.min_x as i64;
     let t_max = view.max_x as i64;
 
-    // Align to multiples of step
-    let start = (t_min / step_i) * step_i;
-    let mut ticks = Vec::new();
+    // Align start to multiples of step, then skip below t_min
+    let aligned = if valid {
+        (t_min / step_i) * step_i
+    } else {
+        t_min
+    };
+    let start = if aligned < t_min {
+        aligned + step_i
+    } else {
+        aligned
+    };
+    // If !valid, produce exactly one tick at t_min
+    let end = if valid { t_max } else { t_min };
+
     let mut t = start;
-    while t <= t_max {
-        if t >= t_min {
-            ticks.push(t);
+    let mut done = false;
+    std::iter::from_fn(move || {
+        if done {
+            return None;
         }
-        t += step_i;
-    }
-    if ticks.is_empty() {
-        ticks.push(t_min);
-    }
-    ticks
+        if t <= end {
+            let tick = t;
+            t += step_i;
+            Some(tick)
+        } else if !valid && !done {
+            done = true;
+            Some(t_min)
+        } else {
+            None
+        }
+    })
 }
 
 fn format_time_label(t_us: i64, t_min: i64) -> String {
@@ -226,8 +110,6 @@ fn format_value_label(v: f64) -> String {
     }
 }
 
-// --- Plot area layout ---
-
 const Y_LABEL_WIDTH: f32 = 50.0;
 const X_LABEL_HEIGHT: f32 = 20.0;
 const PADDING: f32 = 8.0;
@@ -246,9 +128,7 @@ fn plot_area(outer: Bounds<Pixels>) -> Bounds<Pixels> {
     }
 }
 
-// --- Y-bounds computation ---
-
-fn compute_y_bounds(component: &Component) -> Option<(f64, f64)> {
+pub fn compute_y_bounds(component: &Component) -> Option<(f64, f64)> {
     let mut min_y = f64::INFINITY;
     let mut max_y = f64::NEG_INFINITY;
     let element_size = component.schema.size();
@@ -271,8 +151,6 @@ fn compute_y_bounds(component: &Component) -> Option<(f64, f64)> {
     any.then_some((min_y, max_y))
 }
 
-// --- Painting ---
-
 fn paint_plot(
     outer_bounds: Bounds<Pixels>,
     component: &Component,
@@ -281,9 +159,6 @@ fn paint_plot(
     window: &mut Window,
     cx: &mut gpui::App,
 ) {
-    let y_tick_values = y_ticks(&view, 5);
-    let x_tick_values = x_ticks(&view, 5);
-
     let pb = plot_area(outer_bounds);
 
     let theme = &crate::theme::DARK;
@@ -300,89 +175,20 @@ fn paint_plot(
         strikethrough: None,
     };
 
-    // Clipped region: grid, zero line, data
-    window.with_content_mask(Some(gpui::ContentMask { bounds: pb }), |window| {
-        // Y grid
-        for &tick in &y_tick_values {
-            let y = view.to_screen(pb, view.min_x, tick).y;
-            let mut grid = PathBuilder::stroke(px(0.5));
-            grid.move_to(point(pb.origin.x, y));
-            grid.line_to(point(pb.origin.x + pb.size.width, y));
-            if let Ok(path) = grid.build() {
-                window.paint_path(path, theme.grid_color);
-            }
-        }
-
-        // X grid
-        for &tick in &x_tick_values {
-            let x = view.to_screen(pb, tick as f64, view.min_y).x;
-            let mut grid = PathBuilder::stroke(px(0.5));
-            grid.move_to(point(x, pb.origin.y));
-            grid.line_to(point(x, pb.origin.y + pb.size.height));
-            if let Ok(path) = grid.build() {
-                window.paint_path(path, theme.grid_color);
-            }
-        }
-
-        // Zero line
-        if view.min_y < 0.0 && view.max_y > 0.0 {
-            let zero_y = view.to_screen(pb, view.min_x, 0.0).y;
-            let mut zp = PathBuilder::stroke(px(1.0));
-            zp.move_to(point(pb.origin.x, zero_y));
-            zp.line_to(point(pb.origin.x + pb.size.width, zero_y));
-            if let Ok(path) = zp.build() {
-                window.paint_path(path, theme.zero_line_color);
-            }
-        }
-
-        // Data line — iterate directly from TimeSeries
-        let start_ts = Timestamp(view.min_x as i64);
-        let end_ts = Timestamp(view.max_x as i64);
-        if let Some(slice) = component.time_series.get_range(start_ts..end_ts) {
-            let schema = &component.schema;
-            let node_slices: Vec<_> = slice.as_iter().collect();
-
-            let mut path = PathBuilder::stroke(px(1.5));
-            let mut first = true;
-
-            for node_slice in node_slices.iter().rev() {
-                for (ts, cv) in node_slice.iter_values(schema) {
-                    let screen_pt = view.to_screen(pb, ts.0 as f64, cv.to_f64());
-                    if first {
-                        path.move_to(screen_pt);
-                        first = false;
-                    } else {
-                        path.line_to(screen_pt);
-                    }
-                }
-            }
-
-            if !first {
-                if let Ok(path) = path.build() {
-                    window.paint_path(path, color);
-                }
-            }
-        }
-    });
-
-    // Axis frame (unclipped)
-    let mut axes = PathBuilder::stroke(px(1.0));
-    axes.move_to(point(pb.origin.x, pb.origin.y));
-    axes.line_to(point(pb.origin.x, pb.origin.y + pb.size.height));
-    axes.line_to(point(
-        pb.origin.x + pb.size.width,
-        pb.origin.y + pb.size.height,
-    ));
-    if let Ok(path) = axes.build() {
-        window.paint_path(path, theme.axis_color);
-    }
-
-    // Y labels (unclipped)
-    for &tick in &y_tick_values {
+    // Y axis: grid lines + labels in a single pass (no clipping needed)
+    for tick in y_ticks(&view, 5) {
         let y = view.to_screen(pb, view.min_x, tick).y;
         if y < pb.origin.y || y > pb.origin.y + pb.size.height {
             continue;
         }
+        // Grid line
+        let mut grid = PathBuilder::stroke(px(0.5));
+        grid.move_to(point(pb.origin.x, y));
+        grid.line_to(point(pb.origin.x + pb.size.width, y));
+        if let Ok(path) = grid.build() {
+            window.paint_path(path, theme.grid_color);
+        }
+        // Label
         let text = format_value_label(tick);
         let run = make_run(&text);
         let shaped = window.text_system().shape_line(
@@ -398,13 +204,22 @@ fn paint_plot(
         let _ = shaped.paint(origin, label_font_size, window, cx);
     }
 
-    // X labels (unclipped)
-    for &tick in &x_tick_values {
+    // X axis: grid lines + labels in a single pass (no clipping needed)
+    let t_min_i = view.min_x as i64;
+    for tick in x_ticks(&view, 5) {
         let x = view.to_screen(pb, tick as f64, view.min_y).x;
         if x < pb.origin.x || x > pb.origin.x + pb.size.width {
             continue;
         }
-        let text = format_time_label(tick, view.min_x as i64);
+        // Grid line
+        let mut grid = PathBuilder::stroke(px(0.5));
+        grid.move_to(point(x, pb.origin.y));
+        grid.line_to(point(x, pb.origin.y + pb.size.height));
+        if let Ok(path) = grid.build() {
+            window.paint_path(path, theme.grid_color);
+        }
+        // Label
+        let text = format_time_label(tick, t_min_i);
         let run = make_run(&text);
         let shaped = window.text_system().shape_line(
             SharedString::from(text),
@@ -418,9 +233,75 @@ fn paint_plot(
         );
         let _ = shaped.paint(origin, label_font_size, window, cx);
     }
+
+    // Zero line (bounded to plot area, no clipping needed)
+    if view.min_y < 0.0 && view.max_y > 0.0 {
+        let zero_y = view.to_screen(pb, view.min_x, 0.0).y;
+        let mut zp = PathBuilder::stroke(px(1.0));
+        zp.move_to(point(pb.origin.x, zero_y));
+        zp.line_to(point(pb.origin.x + pb.size.width, zero_y));
+        if let Ok(path) = zp.build() {
+            window.paint_path(path, theme.zero_line_color);
+        }
+    }
+
+    // Axis frame
+    let mut axes = PathBuilder::stroke(px(1.0));
+    axes.move_to(point(pb.origin.x, pb.origin.y));
+    axes.line_to(point(pb.origin.x, pb.origin.y + pb.size.height));
+    axes.line_to(point(
+        pb.origin.x + pb.size.width,
+        pb.origin.y + pb.size.height,
+    ));
+    if let Ok(path) = axes.build() {
+        window.paint_path(path, theme.axis_color);
+    }
+
+    // Data line — clipped to plot area
+    window.with_content_mask(Some(gpui::ContentMask { bounds: pb }), |window| {
+        paint_data_line(pb, component, &view, color, px(1.5), window);
+    });
 }
 
-// --- TimeSeriesPlot view ---
+/// Draw a time series data line within the given screen bounds.
+/// This is the core drawing primitive used by both the full plot and sparklines.
+/// Does not clip — caller should wrap in `with_content_mask` if needed.
+pub fn paint_data_line(
+    screen_bounds: Bounds<Pixels>,
+    component: &Component,
+    view: &PlotBounds,
+    color: Hsla,
+    stroke_width: Pixels,
+    window: &mut Window,
+) {
+    let start_ts = Timestamp(view.min_x as i64);
+    let end_ts = Timestamp(view.max_x as i64);
+    if let Some(slice) = component.time_series.get_range(start_ts..end_ts) {
+        let schema = &component.schema;
+        let node_slices: Vec<_> = slice.as_iter().collect();
+
+        let mut path = PathBuilder::stroke(stroke_width);
+        let mut first = true;
+
+        for node_slice in node_slices.iter().rev() {
+            for (ts, cv) in node_slice.iter_values(schema) {
+                let screen_pt = view.to_screen(screen_bounds, ts.0 as f64, cv.to_f64());
+                if first {
+                    path.move_to(screen_pt);
+                    first = false;
+                } else {
+                    path.line_to(screen_pt);
+                }
+            }
+        }
+
+        if !first {
+            if let Ok(path) = path.build() {
+                window.paint_path(path, color);
+            }
+        }
+    }
+}
 
 pub struct TimeSeriesPlot {
     db: Arc<DB>,
