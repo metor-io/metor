@@ -1,14 +1,14 @@
 use std::fmt::Write;
 use std::sync::Arc;
 
+use super::table::{Column, ColumnSort, Table, TableDelegate};
+use super::time_series::{PlotBounds, compute_y_bounds, paint_data_line};
+use crate::{ComponentStream, WalComponentStream, theme::DARK};
 use gpui::{
     AnyElement, App, AppContext, AsyncApp, Context, Entity, IntoElement, Pixels, SharedString,
     Window, canvas, div, prelude::*, px,
 };
 use metor_db::{Component, DB};
-use super::table::{Column, ColumnSort, Table, TableDelegate};
-use super::time_series::{PlotBounds, compute_y_bounds, paint_data_line};
-use crate::{ComponentStream, WalComponentStream, theme::DARK};
 
 struct ComponentRow {
     name: String,
@@ -116,7 +116,7 @@ impl TableDelegate for ComponentTableDelegate {
     }
 
     fn row_height(&self) -> Pixels {
-        px(60.0)
+        px(50.0)
     }
 
     fn render_cell(

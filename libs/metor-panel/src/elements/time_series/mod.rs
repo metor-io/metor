@@ -129,25 +129,58 @@ fn plot_area(outer: Bounds<Pixels>) -> Bounds<Pixels> {
 }
 
 pub fn compute_y_bounds(component: &Component) -> Option<(f64, f64)> {
-    let mut min_y = f64::INFINITY;
-    let mut max_y = f64::NEG_INFINITY;
-    let element_size = component.schema.size();
-    let mut any = false;
-    for node in component.time_series.list.iter() {
-        let data = node.data.data();
-        let count = node.timestamps().len();
-        for i in 0..count {
-            let start = i * element_size;
-            if let Some(buf) = data.get(start..start + element_size) {
-                if let Ok((_size, view)) = component.schema.parse_value(buf) {
-                    let v = view.to_f64();
-                    min_y = min_y.min(v);
-                    max_y = max_y.max(v);
-                    any = true;
+    expand_y_bounds(component, None, None)
+}
+
+/// Incrementally expand y bounds by scanning only data newer than `since`.
+/// If `existing` bounds and a `since` timestamp are provided, only new data is
+/// scanned and the bounds are expanded (never shrunk). When either is `None` a
+/// full scan is performed.
+pub fn expand_y_bounds(
+    component: &Component,
+    existing: Option<(f64, f64)>,
+    since: Option<Timestamp>,
+) -> Option<(f64, f64)> {
+    let (mut min_y, mut max_y) = existing.unwrap_or((f64::INFINITY, f64::NEG_INFINITY));
+    let mut any = existing.is_some();
+
+    match since {
+        Some(since_ts) => {
+            // Incremental: only scan from since_ts onward
+            let range = since_ts..Timestamp(i64::MAX);
+            if let Some(slice) = component.time_series.get_range(range) {
+                let schema = &component.schema;
+                for node_slice in slice.as_iter() {
+                    for (_ts, cv) in node_slice.iter_values(schema) {
+                        let v = cv.to_f64();
+                        min_y = min_y.min(v);
+                        max_y = max_y.max(v);
+                        any = true;
+                    }
+                }
+            }
+        }
+        None => {
+            // Full scan
+            let element_size = component.schema.size();
+            for node in component.time_series.list.iter() {
+                let data = node.data.data();
+                let count = node.timestamps().len();
+                for i in 0..count {
+                    let start = i * element_size;
+                    if let Some(buf) = data.get(start..start + element_size) {
+                        if let Ok((_size, view)) = component.schema.parse_value(buf) {
+                            let v = view.to_f64();
+                            min_y = min_y.min(v);
+                            max_y = max_y.max(v);
+                            any = true;
+                        }
+                    }
                 }
             }
         }
     }
+
     any.then_some((min_y, max_y))
 }
 
@@ -354,8 +387,14 @@ impl TimeSeriesPlot {
                 return;
             }
 
+            let mut y_bounds: Option<(f64, f64)> = None;
+            let mut last_scan_ts: Option<Timestamp> = None;
+
             loop {
-                let y_bounds = compute_y_bounds(&component);
+                let latest_ts = component.time_series.latest().map(|n| n.timestamp());
+                y_bounds = expand_y_bounds(&component, y_bounds, last_scan_ts);
+                last_scan_ts = latest_ts;
+
                 let result = this.update(cx, |this, cx| {
                     this.y_bounds = y_bounds;
                     cx.notify();
