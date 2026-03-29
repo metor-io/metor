@@ -34,7 +34,7 @@ impl ComponentText {
                 {
                     let view = stream.next().await;
                     s.clear();
-                    let _ = write!(s, "{}", view.as_component_view());
+                    let _ = write!(s, "{:5}", view.as_component_view());
                 }
                 let result = this.update(cx, |this, cx| {
                     this.value = Some(SharedString::from(&s));

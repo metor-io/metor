@@ -64,10 +64,23 @@ impl<T: fmt::Display> fmt::Display for ArrayView<'_, T> {
         let no_limit = f.alternate() || self.len() < MANY_ELEM_LIMIT;
 
         // Helper function to format array slice
+        fn write_element<T: fmt::Display>(
+            f: &mut fmt::Formatter<'_>,
+            x: &T,
+            precision: Option<usize>,
+        ) -> fmt::Result {
+            if let Some(prec) = precision {
+                write!(f, "{:.prec$}", x, prec = prec)
+            } else {
+                write!(f, "{}", x)
+            }
+        }
+
         fn format_slice<T: fmt::Display>(
             slice: &[T],
             f: &mut fmt::Formatter<'_>,
             limit: usize,
+            precision: Option<usize>,
         ) -> fmt::Result {
             if slice.is_empty() {
                 return Ok(());
@@ -78,20 +91,23 @@ impl<T: fmt::Display> fmt::Display for ArrayView<'_, T> {
 
             if show_all || slice.len() <= limit {
                 // Show all elements
-                write!(f, "{}", slice[0])?;
+                write_element(f, &slice[0], precision)?;
                 for x in slice.iter().skip(1) {
-                    write!(f, ", {}", x)?;
+                    write!(f, ", ")?;
+                    write_element(f, x, precision)?;
                 }
             } else {
                 // Show edges with ellipsis
-                write!(f, "{}", slice[0])?;
+                write_element(f, &slice[0], precision)?;
                 for x in slice.iter().skip(1) {
-                    write!(f, ", {}", x)?;
+                    write!(f, ", ")?;
+                    write_element(f, x, precision)?;
                 }
 
                 write!(f, ", ...")?;
                 for x in slice.iter().skip(slice.len() - edge) {
-                    write!(f, ", {}", x)?;
+                    write!(f, ", ")?;
+                    write_element(f, x, precision)?;
                 }
             }
             Ok(())
@@ -108,8 +124,9 @@ impl<T: fmt::Display> fmt::Display for ArrayView<'_, T> {
         }
 
         // Special case for 0-dimensional array (scalar)
+        let precision = f.precision();
         if self.shape.is_empty() {
-            return write!(f, "{}", self.buf[0]);
+            return write_element(f, &self.buf[0], precision);
         }
 
         // Helper function to recursively format n-dimensional arrays
@@ -118,6 +135,7 @@ impl<T: fmt::Display> fmt::Display for ArrayView<'_, T> {
             f: &mut fmt::Formatter<'_>,
             depth: usize,
             no_limit: bool,
+            precision: Option<usize>,
         ) -> fmt::Result {
             let limit = if no_limit {
                 usize::MAX
@@ -131,7 +149,7 @@ impl<T: fmt::Display> fmt::Display for ArrayView<'_, T> {
 
             if view.shape.len() == 1 {
                 write!(f, "[")?;
-                format_slice(view.buf, f, limit)?;
+                format_slice(view.buf, f, limit, precision)?;
                 write!(f, "]")?;
                 return Ok(());
             }
@@ -148,7 +166,7 @@ impl<T: fmt::Display> fmt::Display for ArrayView<'_, T> {
                         buf: first,
                         shape: &view.shape[1..],
                     };
-                    format_recursive(&subview, f, depth + 1, no_limit)?;
+                    format_recursive(&subview, f, depth + 1, no_limit, precision)?;
                 }
                 for chunk in view.buf.chunks(sub_len).skip(1) {
                     write!(f, ",\n{}", " ".repeat(depth + 1))?;
@@ -156,7 +174,7 @@ impl<T: fmt::Display> fmt::Display for ArrayView<'_, T> {
                         buf: chunk,
                         shape: &view.shape[1..],
                     };
-                    format_recursive(&subview, f, depth + 1, no_limit)?;
+                    format_recursive(&subview, f, depth + 1, no_limit, precision)?;
                 }
             } else {
                 // Show edges with ellipsis
@@ -171,7 +189,7 @@ impl<T: fmt::Display> fmt::Display for ArrayView<'_, T> {
                         buf: chunk,
                         shape: &view.shape[1..],
                     };
-                    format_recursive(&subview, f, depth + 1, no_limit)?;
+                    format_recursive(&subview, f, depth + 1, no_limit, precision)?;
                 }
 
                 // Ellipsis
@@ -185,7 +203,7 @@ impl<T: fmt::Display> fmt::Display for ArrayView<'_, T> {
                         buf: chunk,
                         shape: &view.shape[1..],
                     };
-                    format_recursive(&subview, f, depth + 1, no_limit)?;
+                    format_recursive(&subview, f, depth + 1, no_limit, precision)?;
                 }
             }
 
@@ -193,6 +211,6 @@ impl<T: fmt::Display> fmt::Display for ArrayView<'_, T> {
             Ok(())
         }
 
-        format_recursive(self, f, 0, no_limit)
+        format_recursive(self, f, 0, no_limit, precision)
     }
 }

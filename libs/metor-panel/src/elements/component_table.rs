@@ -13,18 +13,22 @@ use metor_db::{Component, DB};
 struct ComponentRow {
     name: String,
     component: Component,
+    indexes: Vec<usize>,
     y_bounds: Option<(f64, f64)>,
     _task: gpui::Task<()>,
 }
 
 impl ComponentRow {
     pub fn new(name: String, component: Component, cx: &mut Context<Self>) -> Self {
+        let num_elements: usize = component.schema.dim.iter().product();
+        let indexes: Vec<usize> = (0..num_elements.max(1)).collect();
+        let idx_clone = indexes.clone();
         let mut stream = WalComponentStream::new(&component);
         let task = cx.spawn(async move |this, cx| {
             loop {
                 let _ = stream.next().await;
                 let result = this.update(cx, |this, cx| {
-                    this.y_bounds = compute_y_bounds(&this.component);
+                    this.y_bounds = compute_y_bounds(&this.component, &idx_clone);
                     cx.notify();
                 });
                 if result.is_err() {
@@ -35,6 +39,7 @@ impl ComponentRow {
         Self {
             name,
             component,
+            indexes,
             y_bounds: None,
             _task: task,
         }
@@ -147,13 +152,16 @@ impl TableDelegate for ComponentTableDelegate {
             2 => {
                 let component = row_ref.component.clone();
                 let plot_bounds = row_ref.sparkline_bounds();
-                let color = DARK.line_color;
+                let indexes = row_ref.indexes.clone();
                 let row_height = self.row_height();
                 canvas(
-                    move |bounds, _window, _cx| (bounds, component, plot_bounds),
-                    move |_, (bounds, component, _), window, _cx| {
+                    move |bounds, _window, _cx| (bounds, component, plot_bounds, indexes),
+                    move |_, (bounds, component, _, indexes), window, _cx| {
                         if let Some(view) = plot_bounds {
-                            paint_data_line(bounds, &component, &view, color, px(1.0), window);
+                            for (i, &idx) in indexes.iter().enumerate() {
+                                let color = DARK.line_colors[i % DARK.line_colors.len()];
+                                paint_data_line(bounds, &component, &view, color, px(1.0), idx, window);
+                            }
                         }
                     },
                 )

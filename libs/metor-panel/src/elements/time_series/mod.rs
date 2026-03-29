@@ -128,21 +128,33 @@ fn plot_area(outer: Bounds<Pixels>) -> Bounds<Pixels> {
     }
 }
 
-pub fn compute_y_bounds(component: &Component) -> Option<(f64, f64)> {
-    expand_y_bounds(component, None, None)
+pub fn compute_y_bounds(component: &Component, indexes: &[usize]) -> Option<(f64, f64)> {
+    expand_y_bounds(component, indexes, None, None)
 }
 
 /// Incrementally expand y bounds by scanning only data newer than `since`.
 /// If `existing` bounds and a `since` timestamp are provided, only new data is
 /// scanned and the bounds are expanded (never shrunk). When either is `None` a
-/// full scan is performed.
+/// full scan is performed. Considers all element `indexes`.
 pub fn expand_y_bounds(
     component: &Component,
+    indexes: &[usize],
     existing: Option<(f64, f64)>,
     since: Option<Timestamp>,
 ) -> Option<(f64, f64)> {
     let (mut min_y, mut max_y) = existing.unwrap_or((f64::INFINITY, f64::NEG_INFINITY));
     let mut any = existing.is_some();
+
+    let mut update = |cv: &metor_proto::types::ComponentView| {
+        for &idx in indexes {
+            if let Some(ev) = cv.get(idx) {
+                let v = ev.as_f64();
+                min_y = min_y.min(v);
+                max_y = max_y.max(v);
+                any = true;
+            }
+        }
+    };
 
     match since {
         Some(since_ts) => {
@@ -152,10 +164,7 @@ pub fn expand_y_bounds(
                 let schema = &component.schema;
                 for node_slice in slice.as_iter() {
                     for (_ts, cv) in node_slice.iter_values(schema) {
-                        let v = cv.to_f64();
-                        min_y = min_y.min(v);
-                        max_y = max_y.max(v);
-                        any = true;
+                        update(&cv);
                     }
                 }
             }
@@ -170,10 +179,7 @@ pub fn expand_y_bounds(
                     let start = i * element_size;
                     if let Some(buf) = data.get(start..start + element_size) {
                         if let Ok((_size, view)) = component.schema.parse_value(buf) {
-                            let v = view.to_f64();
-                            min_y = min_y.min(v);
-                            max_y = max_y.max(v);
-                            any = true;
+                            update(&view);
                         }
                     }
                 }
@@ -184,14 +190,14 @@ pub fn expand_y_bounds(
     any.then_some((min_y, max_y))
 }
 
-fn paint_plot(
+fn paint_plot<'a>(
     outer_bounds: Bounds<Pixels>,
-    component: &Component,
+    traces: impl Iterator<Item = &'a ResolvedTrace>,
     view: PlotBounds,
-    color: Hsla,
     window: &mut Window,
     cx: &mut gpui::App,
 ) {
+    let traces: Vec<_> = traces.collect();
     let pb = plot_area(outer_bounds);
 
     let theme = &crate::theme::DARK;
@@ -290,21 +296,34 @@ fn paint_plot(
         window.paint_path(path, theme.axis_color);
     }
 
-    // Data line — clipped to plot area
+    // Data lines — clipped to plot area
     window.with_content_mask(Some(gpui::ContentMask { bounds: pb }), |window| {
-        paint_data_line(pb, component, &view, color, px(1.5), window);
+        for rt in traces {
+            paint_data_line(
+                pb,
+                &rt.component,
+                &view,
+                rt.trace.color,
+                px(1.5),
+                rt.trace.element_index,
+                window,
+            );
+        }
     });
 }
 
 /// Draw a time series data line within the given screen bounds.
 /// This is the core drawing primitive used by both the full plot and sparklines.
-/// Does not clip — caller should wrap in `with_content_mask` if needed.
+/// `element_index` selects which element of a multi-element component to plot
+/// (e.g. index 0, 1, 2 for a Vec3). Does not clip — caller should wrap in
+/// `with_content_mask` if needed.
 pub fn paint_data_line(
     screen_bounds: Bounds<Pixels>,
     component: &Component,
     view: &PlotBounds,
     color: Hsla,
     stroke_width: Pixels,
+    element_index: usize,
     window: &mut Window,
 ) {
     let start_ts = Timestamp(view.min_x as i64);
@@ -318,7 +337,11 @@ pub fn paint_data_line(
 
         for node_slice in node_slices.iter().rev() {
             for (ts, cv) in node_slice.iter_values(schema) {
-                let screen_pt = view.to_screen(screen_bounds, ts.0 as f64, cv.to_f64());
+                let v = match cv.get(element_index) {
+                    Some(ev) => ev.as_f64(),
+                    None => continue,
+                };
+                let screen_pt = view.to_screen(screen_bounds, ts.0 as f64, v);
                 if first {
                     path.move_to(screen_pt);
                     first = false;
@@ -336,67 +359,134 @@ pub fn paint_data_line(
     }
 }
 
+/// A single line on a time series plot: one element index from one component.
+#[derive(Clone)]
+pub struct Trace {
+    pub component_id: ComponentId,
+    pub element_index: usize,
+    pub color: Hsla,
+}
+
+impl Trace {
+    pub fn new(component_id: impl Into<ComponentId>, element_index: usize, color: Hsla) -> Self {
+        Self {
+            component_id: component_id.into(),
+            element_index,
+            color,
+        }
+    }
+}
+
+#[derive(Clone)]
+struct ResolvedTrace {
+    trace: Trace,
+    component: Component,
+    y_bounds: Option<(f64, f64)>,
+    last_scan_ts: Option<Timestamp>,
+}
+
 pub struct TimeSeriesPlot {
     db: Arc<DB>,
-    component: Option<Component>,
-    component_id: ComponentId,
-    y_bounds: Option<(f64, f64)>,
-    color: Hsla,
+    traces: Vec<Option<ResolvedTrace>>,
     view: Option<PlotBounds>,
     drag_start: Option<Point<Pixels>>,
     drag_start_view: Option<PlotBounds>,
     last_plot_area: Option<Bounds<Pixels>>,
-    _task: gpui::Task<()>,
+    _tasks: Vec<gpui::Task<()>>,
 }
 
 impl TimeSeriesPlot {
-    pub fn new(
-        db: Arc<DB>,
-        component_id: impl Into<ComponentId> + Send + 'static,
-        cx: &mut Context<Self>,
-    ) -> Self {
-        let component_id = component_id.into();
-        let task = Self::spawn_stream(db.clone(), component_id, cx);
+    pub fn new(db: Arc<DB>, traces: Vec<Trace>, cx: &mut Context<Self>) -> Self {
+        let tasks = traces
+            .iter()
+            .enumerate()
+            .map(|(i, trace)| Self::spawn_trace(db.clone(), i, trace, cx))
+            .collect();
+        let trace_slots = (0..traces.len()).map(|_| None).collect();
         Self {
             db,
-            component: None,
-            component_id,
-            y_bounds: None,
-            color: crate::theme::DARK.line_color,
+            traces: trace_slots,
             view: None,
             drag_start: None,
             drag_start_view: None,
             last_plot_area: None,
-            _task: task,
+            _tasks: tasks,
         }
     }
 
-    fn spawn_stream(
+    /// Convenience: create a plot for a single component with the given element
+    /// indexes, auto-assigning colors from the theme palette.
+    pub fn from_component(
         db: Arc<DB>,
-        component_id: ComponentId,
+        component_id: impl Into<ComponentId>,
+        indexes: Vec<usize>,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        let component_id = component_id.into();
+        let indexes = if indexes.is_empty() { vec![0] } else { indexes };
+        let theme = &crate::theme::DARK;
+        let traces = indexes
+            .iter()
+            .enumerate()
+            .map(|(i, &idx)| Trace {
+                component_id,
+                element_index: idx,
+                color: theme.line_colors[i % theme.line_colors.len()],
+            })
+            .collect();
+        Self::new(db, traces, cx)
+    }
+
+    pub fn set_traces(&mut self, traces: Vec<Trace>, cx: &mut Context<Self>) {
+        self._tasks = traces
+            .iter()
+            .enumerate()
+            .map(|(i, trace)| Self::spawn_trace(self.db.clone(), i, trace, cx))
+            .collect();
+        self.traces = (0..traces.len()).map(|_| None).collect();
+        self.view = None;
+        cx.notify();
+    }
+
+    fn spawn_trace(
+        db: Arc<DB>,
+        trace_idx: usize,
+        trace: &Trace,
         cx: &mut Context<Self>,
     ) -> gpui::Task<()> {
+        let trace = trace.clone();
         cx.spawn(async move |this, cx| {
-            let component = wait_for_component(&db, component_id).await;
+            let component = wait_for_component(&db, trace.component_id).await;
 
             let result = this.update(cx, |this, cx| {
-                this.component = Some(component.clone());
+                this.traces[trace_idx] = Some(ResolvedTrace {
+                    trace: trace.clone(),
+                    component: component.clone(),
+                    y_bounds: None,
+                    last_scan_ts: None,
+                });
                 cx.notify();
             });
             if result.is_err() {
                 return;
             }
 
-            let mut y_bounds: Option<(f64, f64)> = None;
-            let mut last_scan_ts: Option<Timestamp> = None;
-
             loop {
-                let latest_ts = component.time_series.latest().map(|n| n.timestamp());
-                y_bounds = expand_y_bounds(&component, y_bounds, last_scan_ts);
-                last_scan_ts = latest_ts;
-
                 let result = this.update(cx, |this, cx| {
-                    this.y_bounds = y_bounds;
+                    if let Some(resolved) = &mut this.traces[trace_idx] {
+                        let latest_ts = resolved
+                            .component
+                            .time_series
+                            .latest()
+                            .map(|n| n.timestamp());
+                        resolved.y_bounds = expand_y_bounds(
+                            &resolved.component,
+                            &[resolved.trace.element_index],
+                            resolved.y_bounds,
+                            resolved.last_scan_ts,
+                        );
+                        resolved.last_scan_ts = latest_ts;
+                    }
                     cx.notify();
                 });
                 if result.is_err() {
@@ -407,40 +497,70 @@ impl TimeSeriesPlot {
         })
     }
 
-    pub fn set_component(&mut self, component_id: ComponentId, cx: &mut Context<Self>) {
-        self.component_id = component_id;
-        self.component = None;
-        self.y_bounds = None;
-        self.view = None;
-        self._task = Self::spawn_stream(self.db.clone(), component_id, cx);
-        cx.notify();
+    fn resolved_traces(&self) -> impl Iterator<Item = &ResolvedTrace> {
+        self.traces.iter().flatten()
     }
 
-    pub fn color(mut self, color: Hsla) -> Self {
-        self.color = color;
-        self
+    fn merged_y_bounds(&self) -> Option<(f64, f64)> {
+        let mut min = f64::INFINITY;
+        let mut max = f64::NEG_INFINITY;
+        let mut any = false;
+        for r in self.resolved_traces() {
+            if let Some((lo, hi)) = r.y_bounds {
+                min = min.min(lo);
+                max = max.max(hi);
+                any = true;
+            }
+        }
+        any.then_some((min, max))
+    }
+
+    fn time_range(&self) -> Option<(f64, f64)> {
+        let mut start = f64::INFINITY;
+        let mut end = f64::NEG_INFINITY;
+        let mut any = false;
+        for r in self.resolved_traces() {
+            if let Some(s) = r.component.time_series.start_timestamp() {
+                start = start.min(s.0 as f64);
+                any = true;
+            }
+            if let Some(l) = r.component.time_series.latest() {
+                end = end.max(l.timestamp().0 as f64);
+                any = true;
+            }
+        }
+        if any && start < end {
+            Some((start, end))
+        } else {
+            None
+        }
     }
 
     fn current_view(&self) -> Option<PlotBounds> {
         self.view.or_else(|| {
-            let component = self.component.as_ref()?;
-            let ts = &component.time_series;
-            let start = ts.start_timestamp()?.0 as f64;
-            let end = ts.latest()?.timestamp().0 as f64;
-            if start == end {
-                return None;
-            }
-            let (min_y, max_y) = self.y_bounds?;
+            let (start, end) = self.time_range()?;
+            let (min_y, max_y) = self.merged_y_bounds()?;
             Some(PlotBounds::new(start, min_y, end, max_y).normalize())
         })
+    }
+
+    fn trace_label(&self, trace: &Trace) -> String {
+        let name = self
+            .db
+            .with_state(|state| {
+                state
+                    .get_component_metadata(trace.component_id)
+                    .map(|m| m.name.clone())
+            })
+            .unwrap_or_else(|| trace.component_id.to_string());
+        format!("{}[{}]", name, trace.element_index)
     }
 }
 
 impl Render for TimeSeriesPlot {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let component = self.component.clone();
-        let color = self.color;
         let view = self.current_view();
+        let traces = self.traces.clone();
 
         div()
             .size_full()
@@ -506,12 +626,12 @@ impl Render for TimeSeriesPlot {
                             let _ = this.update(cx, |this, _cx| {
                                 this.last_plot_area = Some(pa);
                             });
-                            (bounds, component, view)
+                            (bounds, view)
                         }
                     },
-                    move |_, (bounds, component, view), window, cx| {
-                        if let (Some(component), Some(view)) = (component, view) {
-                            paint_plot(bounds, &component, view, color, window, cx);
+                    move |_, (bounds, view), window, cx| {
+                        if let Some(view) = view {
+                            paint_plot(bounds, traces.iter().flatten(), view, window, cx);
                         }
                     },
                 )
@@ -522,38 +642,27 @@ impl Render for TimeSeriesPlot {
 
 impl Inspectable for TimeSeriesPlot {
     fn fields(&self) -> Vec<InspectionField> {
-        let component_name = self
-            .db
-            .with_state(|state| {
-                state
-                    .get_component_metadata(self.component_id)
-                    .map(|m| m.name.clone())
-            })
-            .unwrap_or_else(|| self.component_id.to_string());
+        let traces_str = self
+            .resolved_traces()
+            .map(|rt| self.trace_label(&rt.trace))
+            .collect::<Vec<_>>()
+            .join(", ");
 
-        let mut fields = vec![
-            InspectionField {
-                label: "Component".into(),
-                field_id: FieldId(0),
-                value: InspectionValue::Component {
-                    name: component_name,
-                },
-            },
-            InspectionField {
-                label: "Color".into(),
-                field_id: FieldId(1),
-                value: InspectionValue::Color(self.color),
-            },
-        ];
-        if let Some((min, max)) = self.y_bounds {
+        let mut fields = vec![InspectionField {
+            label: "Traces".into(),
+            field_id: FieldId(0),
+            value: InspectionValue::String(traces_str),
+        }];
+
+        if let Some((min, max)) = self.merged_y_bounds() {
             fields.push(InspectionField {
                 label: "Y Min".into(),
-                field_id: FieldId(2),
+                field_id: FieldId(1),
                 value: InspectionValue::F64(min),
             });
             fields.push(InspectionField {
                 label: "Y Max".into(),
-                field_id: FieldId(3),
+                field_id: FieldId(2),
                 value: InspectionValue::F64(max),
             });
         }
@@ -562,28 +671,41 @@ impl Inspectable for TimeSeriesPlot {
 
     fn set_field(&mut self, field_id: FieldId, value: InspectionValue, cx: &mut Context<Self>) {
         match (field_id, value) {
-            (FieldId(0), InspectionValue::Component { name }) => {
-                // Look up the ComponentId by name from the DB.
-                let id = self.db.with_state(|state| {
-                    state
-                        .component_metadata_iter()
-                        .find(|(_, m)| m.name == name)
-                        .map(|(id, _)| *id)
-                });
-                if let Some(id) = id {
-                    self.set_component(id, cx);
+            (FieldId(0), InspectionValue::String(s)) => {
+                // Parse "name[idx], name[idx], ..."
+                let theme = &crate::theme::DARK;
+                let new_traces: Vec<Trace> = s
+                    .split(',')
+                    .filter_map(|part| {
+                        let part = part.trim();
+                        let (name, rest) = part.split_once('[')?;
+                        let idx_str = rest.strip_suffix(']')?;
+                        let idx: usize = idx_str.parse().ok()?;
+                        let component_id = self.db.with_state(|state| {
+                            state
+                                .component_metadata_iter()
+                                .find(|(_, m)| m.name == name.trim())
+                                .map(|(id, _)| *id)
+                        })?;
+                        Some((component_id, idx))
+                    })
+                    .enumerate()
+                    .map(|(i, (component_id, idx))| Trace {
+                        component_id,
+                        element_index: idx,
+                        color: theme.line_colors[i % theme.line_colors.len()],
+                    })
+                    .collect();
+
+                if !new_traces.is_empty() {
+                    self.set_traces(new_traces, cx);
                 }
             }
-            (FieldId(1), InspectionValue::Color(c)) => {
-                self.color = c;
+            (FieldId(1), InspectionValue::F64(_v)) => {
+                // Y Min override — not implemented for multi-trace yet
             }
-            (FieldId(2), InspectionValue::F64(v)) => {
-                let (_, max) = self.y_bounds.unwrap_or((v, v));
-                self.y_bounds = Some((v, max));
-            }
-            (FieldId(3), InspectionValue::F64(v)) => {
-                let (min, _) = self.y_bounds.unwrap_or((v, v));
-                self.y_bounds = Some((min, v));
+            (FieldId(2), InspectionValue::F64(_v)) => {
+                // Y Max override — not implemented for multi-trace yet
             }
             _ => {}
         }
