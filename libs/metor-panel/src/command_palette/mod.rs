@@ -1,6 +1,6 @@
 use gpui::{
-    deferred, div, prelude::*, px, App, FocusHandle, Focusable, Hsla, IntoElement, KeyDownEvent,
-    SharedString, Window,
+    deferred, div, prelude::*, px, App, ClipboardItem, FocusHandle, Focusable, Hsla, IntoElement,
+    KeyDownEvent, SharedString, Window,
 };
 
 use crate::theme::DARK;
@@ -58,6 +58,10 @@ impl PalettePage {
 /// The command palette view.
 pub struct CommandPalette {
     filter: String,
+    /// Cursor byte offset into `filter`.
+    cursor: usize,
+    /// Selection anchor byte offset. When equal to `cursor`, nothing is selected.
+    mark: usize,
     page_stack: Vec<PalettePage>,
     selected_index: usize,
     focus_handle: FocusHandle,
@@ -67,6 +71,8 @@ impl CommandPalette {
     pub fn new(page: PalettePage, cx: &mut Context<Self>) -> Self {
         Self {
             filter: String::new(),
+            cursor: 0,
+            mark: 0,
             page_stack: vec![page],
             selected_index: 0,
             focus_handle: cx.focus_handle(),
@@ -95,6 +101,86 @@ impl CommandPalette {
             .map(|(i, _)| i)
             .collect()
     }
+
+    // ── Text editing helpers ──────────────────────────────────────────
+
+    fn has_selection(&self) -> bool {
+        self.mark != self.cursor
+    }
+
+    fn selection_range(&self) -> std::ops::Range<usize> {
+        let start = self.mark.min(self.cursor);
+        let end = self.mark.max(self.cursor);
+        start..end
+    }
+
+    fn selected_text(&self) -> &str {
+        &self.filter[self.selection_range()]
+    }
+
+    fn clear_filter(&mut self) {
+        self.filter.clear();
+        self.cursor = 0;
+        self.mark = 0;
+    }
+
+    fn prev_char_boundary(&self, offset: usize) -> usize {
+        let mut o = offset.saturating_sub(1);
+        while o > 0 && !self.filter.is_char_boundary(o) {
+            o -= 1;
+        }
+        o
+    }
+
+    fn next_char_boundary(&self, offset: usize) -> usize {
+        let mut o = (offset + 1).min(self.filter.len());
+        while o < self.filter.len() && !self.filter.is_char_boundary(o) {
+            o += 1;
+        }
+        o
+    }
+
+    fn delete_selection(&mut self) {
+        let range = self.selection_range();
+        self.filter.replace_range(range.clone(), "");
+        self.cursor = range.start;
+        self.mark = self.cursor;
+    }
+
+    fn insert_text(&mut self, text: &str) {
+        if self.has_selection() {
+            self.delete_selection();
+        }
+        self.filter.insert_str(self.cursor, text);
+        self.cursor += text.len();
+        self.mark = self.cursor;
+    }
+
+    fn copy(&self, cx: &mut App) {
+        if self.has_selection() {
+            cx.write_to_clipboard(ClipboardItem::new_string(self.selected_text().to_string()));
+        }
+    }
+
+    fn cut(&mut self, cx: &mut App) {
+        if self.has_selection() {
+            cx.write_to_clipboard(ClipboardItem::new_string(self.selected_text().to_string()));
+            self.delete_selection();
+            self.selected_index = 0;
+        }
+    }
+
+    fn paste(&mut self, cx: &mut App) {
+        if let Some(item) = cx.read_from_clipboard() {
+            if let Some(text) = item.text() {
+                let text = text.replace('\n', "");
+                self.insert_text(&text);
+                self.selected_index = 0;
+            }
+        }
+    }
+
+    // ── Core logic ──────────────────────────────────────────────────
 
     fn confirm(&mut self, window: &mut Window, cx: &mut App) {
         let indices = self.filtered_indices();
@@ -138,7 +224,7 @@ impl CommandPalette {
             }
             PaletteAction::NextPage(make_page) => {
                 let next = make_page();
-                self.filter.clear();
+                self.clear_filter();
                 self.selected_index = 0;
                 self.page_stack.push(next);
             }
@@ -147,21 +233,102 @@ impl CommandPalette {
 
     fn handle_key_down(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut App) {
         let key = event.keystroke.key.as_str();
+        let mods = &event.keystroke.modifiers;
+
+        // ── Platform (Cmd) shortcuts ────────────────────────────────
+        if mods.platform {
+            match key {
+                "a" => {
+                    self.mark = 0;
+                    self.cursor = self.filter.len();
+                }
+                "c" => self.copy(cx),
+                "x" => self.cut(cx),
+                "v" => self.paste(cx),
+                "left" => {
+                    if mods.shift {
+                        self.cursor = 0;
+                    } else {
+                        self.cursor = 0;
+                        self.mark = 0;
+                    }
+                }
+                "right" => {
+                    if mods.shift {
+                        self.cursor = self.filter.len();
+                    } else {
+                        self.cursor = self.filter.len();
+                        self.mark = self.cursor;
+                    }
+                }
+                "backspace" => {
+                    if self.has_selection() {
+                        self.delete_selection();
+                    } else if self.cursor > 0 {
+                        self.filter.replace_range(0..self.cursor, "");
+                        self.cursor = 0;
+                        self.mark = 0;
+                    }
+                    self.selected_index = 0;
+                }
+                _ => {}
+            }
+            return;
+        }
+
+        // ── Regular keys ────────────────────────────────────────────
         match key {
             "escape" => {
                 if self.page_stack.len() > 1 {
                     self.page_stack.pop();
-                    self.filter.clear();
+                    self.clear_filter();
                     self.selected_index = 0;
                 }
             }
             "backspace" => {
-                if self.filter.is_empty() && self.page_stack.len() > 1 {
+                if self.has_selection() {
+                    self.delete_selection();
+                    self.selected_index = 0;
+                } else if self.cursor > 0 {
+                    let prev = self.prev_char_boundary(self.cursor);
+                    self.filter.replace_range(prev..self.cursor, "");
+                    self.cursor = prev;
+                    self.mark = self.cursor;
+                    self.selected_index = 0;
+                } else if self.filter.is_empty() && self.page_stack.len() > 1 {
                     self.page_stack.pop();
                     self.selected_index = 0;
+                }
+            }
+            "delete" => {
+                if self.has_selection() {
+                    self.delete_selection();
+                } else if self.cursor < self.filter.len() {
+                    let next = self.next_char_boundary(self.cursor);
+                    self.filter.replace_range(self.cursor..next, "");
+                }
+                self.selected_index = 0;
+            }
+            "left" => {
+                if mods.shift {
+                    self.cursor = self.prev_char_boundary(self.cursor);
+                } else if self.has_selection() {
+                    self.cursor = self.selection_range().start;
+                    self.mark = self.cursor;
                 } else {
-                    self.filter.pop();
-                    self.selected_index = 0;
+                    self.cursor = self.prev_char_boundary(self.cursor);
+                    self.mark = self.cursor;
+                }
+            }
+            "right" => {
+                if mods.shift {
+                    self.cursor = self.next_char_boundary(self.cursor);
+                } else if self.has_selection() {
+                    self.cursor = self.selection_range().end;
+                    self.mark = self.cursor;
+                } else {
+                    self.cursor = self.next_char_boundary(self.cursor);
+                    self.mark = self.cursor;
                 }
             }
             "up" => {
@@ -184,11 +351,8 @@ impl CommandPalette {
             }
             _ => {
                 if let Some(ch) = &event.keystroke.key_char {
-                    if !event.keystroke.modifiers.platform
-                        && !event.keystroke.modifiers.control
-                        && !event.keystroke.modifiers.alt
-                    {
-                        self.filter.push_str(ch);
+                    if !mods.control && !mods.alt {
+                        self.insert_text(ch);
                         self.selected_index = 0;
                     }
                 }
@@ -225,12 +389,82 @@ impl CommandPalette {
             .and_then(|p| p.prompt.clone())
             .unwrap_or_else(|| SharedString::new_static("Search..."));
 
-        let display_text = if self.filter.is_empty() {
-            div().text_color(DARK.text_tertiary).child(prompt)
-        } else {
+        let text_field = if self.filter.is_empty() {
+            // Empty: show placeholder with cursor at the left
             div()
-                .text_color(DARK.text_primary)
-                .child(SharedString::from(self.filter.clone()))
+                .flex()
+                .flex_row()
+                .items_center()
+                .child(Self::render_cursor())
+                .child(
+                    div()
+                        .text_color(DARK.text_tertiary)
+                        .child(prompt),
+                )
+        } else {
+            // Split text around cursor/selection and render spans
+            let sel = self.selection_range();
+            let cursor_at_start = self.cursor <= self.mark;
+
+            let before = &self.filter[..sel.start];
+            let selected = &self.filter[sel.clone()];
+            let after = &self.filter[sel.end..];
+
+            let mut row = div().flex().flex_row().items_center();
+
+            if cursor_at_start {
+                // Cursor is at left edge of selection
+                if !before.is_empty() {
+                    row = row.child(
+                        div()
+                            .text_color(DARK.text_primary)
+                            .child(SharedString::from(before.to_string())),
+                    );
+                }
+                row = row.child(Self::render_cursor());
+                if !selected.is_empty() {
+                    row = row.child(
+                        div()
+                            .text_color(DARK.text_primary)
+                            .bg(SELECTION_BG)
+                            .child(SharedString::from(selected.to_string())),
+                    );
+                }
+                if !after.is_empty() {
+                    row = row.child(
+                        div()
+                            .text_color(DARK.text_primary)
+                            .child(SharedString::from(after.to_string())),
+                    );
+                }
+            } else {
+                // Cursor is at right edge of selection
+                if !before.is_empty() {
+                    row = row.child(
+                        div()
+                            .text_color(DARK.text_primary)
+                            .child(SharedString::from(before.to_string())),
+                    );
+                }
+                if !selected.is_empty() {
+                    row = row.child(
+                        div()
+                            .text_color(DARK.text_primary)
+                            .bg(SELECTION_BG)
+                            .child(SharedString::from(selected.to_string())),
+                    );
+                }
+                row = row.child(Self::render_cursor());
+                if !after.is_empty() {
+                    row = row.child(
+                        div()
+                            .text_color(DARK.text_primary)
+                            .child(SharedString::from(after.to_string())),
+                    );
+                }
+            }
+
+            row
         };
 
         div()
@@ -243,7 +477,11 @@ impl CommandPalette {
             .border_b_1()
             .border_color(DARK.border_primary)
             .child(self.render_breadcrumbs())
-            .child(display_text.text_size(px(14.0)).flex_1())
+            .child(text_field.text_size(px(14.0)).flex_1())
+    }
+
+    fn render_cursor() -> impl IntoElement {
+        div().w(px(1.0)).h(px(16.0)).bg(DARK.text_primary)
     }
 
     fn render_items(&self) -> impl IntoElement {
@@ -308,6 +546,13 @@ impl CommandPalette {
             .child(label.clone())
     }
 }
+
+const SELECTION_BG: Hsla = Hsla {
+    h: 0.583,
+    s: 0.5,
+    l: 0.35,
+    a: 0.6,
+};
 
 const ITEM_SELECTED_BG: Hsla = Hsla {
     h: 0.083,

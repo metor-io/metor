@@ -14,7 +14,7 @@ pub mod time_series;
 
 pub use component_table::{ComponentTable, new_component_table};
 pub use table::{Column, ColumnSort, Table, TableDelegate};
-pub use time_series::TimeSeriesPlot;
+pub use time_series::{TimeSeriesPlot, Trace};
 
 pub struct ComponentText {
     value: Option<SharedString>,
