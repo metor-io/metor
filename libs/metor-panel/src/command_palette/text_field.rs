@@ -421,6 +421,7 @@ impl TextField {
                 );
             },
         )
-        .size_full()
+        .w_full()
+        .h(line_height)
     }
 }

@@ -642,16 +642,15 @@ impl Render for TimeSeriesPlot {
 
 impl Inspectable for TimeSeriesPlot {
     fn fields(&self) -> Vec<InspectionField> {
-        let traces_str = self
+        let current_traces: Vec<(ComponentId, usize)> = self
             .resolved_traces()
-            .map(|rt| self.trace_label(&rt.trace))
-            .collect::<Vec<_>>()
-            .join(", ");
+            .map(|rt| (rt.trace.component_id, rt.trace.element_index))
+            .collect();
 
         let mut fields = vec![InspectionField {
             label: "Traces".into(),
             field_id: FieldId(0),
-            value: InspectionValue::String(traces_str),
+            value: InspectionValue::Traces(current_traces),
         }];
 
         if let Some((min, max)) = self.merged_y_bounds() {
@@ -671,32 +670,17 @@ impl Inspectable for TimeSeriesPlot {
 
     fn set_field(&mut self, field_id: FieldId, value: InspectionValue, cx: &mut Context<Self>) {
         match (field_id, value) {
-            (FieldId(0), InspectionValue::String(s)) => {
-                // Parse "name[idx], name[idx], ..."
+            (FieldId(0), InspectionValue::Traces(selections)) => {
                 let theme = &crate::theme::DARK;
-                let new_traces: Vec<Trace> = s
-                    .split(',')
-                    .filter_map(|part| {
-                        let part = part.trim();
-                        let (name, rest) = part.split_once('[')?;
-                        let idx_str = rest.strip_suffix(']')?;
-                        let idx: usize = idx_str.parse().ok()?;
-                        let component_id = self.db.with_state(|state| {
-                            state
-                                .component_metadata_iter()
-                                .find(|(_, m)| m.name == name.trim())
-                                .map(|(id, _)| *id)
-                        })?;
-                        Some((component_id, idx))
-                    })
+                let new_traces: Vec<Trace> = selections
+                    .into_iter()
                     .enumerate()
-                    .map(|(i, (component_id, idx))| Trace {
+                    .map(|(i, (component_id, element_index))| Trace {
                         component_id,
-                        element_index: idx,
+                        element_index,
                         color: theme.line_colors[i % theme.line_colors.len()],
                     })
                     .collect();
-
                 if !new_traces.is_empty() {
                     self.set_traces(new_traces, cx);
                 }

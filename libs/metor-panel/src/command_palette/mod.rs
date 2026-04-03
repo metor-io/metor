@@ -1,6 +1,6 @@
 use gpui::{
-    deferred, div, prelude::*, px, App, FocusHandle, Focusable, Hsla, IntoElement, KeyDownEvent,
-    SharedString, Window,
+    App, FocusHandle, Focusable, Hsla, IntoElement, KeyDownEvent, ListAlignment, ListState,
+    SharedString, Window, deferred, div, list, prelude::*, px,
 };
 
 use crate::theme::DARK;
@@ -12,14 +12,35 @@ pub use text_field::TextField;
 pub struct PaletteItem {
     pub label: SharedString,
     pub action: PaletteAction,
+    /// Optional pill chips rendered below the label.
+    pub pills: Vec<SharedString>,
+}
+
+impl PaletteItem {
+    pub fn new(label: impl Into<SharedString>, action: PaletteAction) -> Self {
+        Self {
+            label: label.into(),
+            action,
+            pills: Vec::new(),
+        }
+    }
+
+    pub fn with_pills(mut self, pills: Vec<SharedString>) -> Self {
+        self.pills = pills;
+        self
+    }
 }
 
 /// What happens when a palette item is selected.
 pub enum PaletteAction {
     /// Run a one-shot callback. Receives the current filter text.
     Execute(Box<dyn FnOnce(&str, &mut Window, &mut App) + 'static>),
-    /// Push a new page onto the palette stack.
-    NextPage(Box<dyn FnOnce() -> PalettePage + 'static>),
+    /// Push a new page onto the palette stack. `label` is set on the
+    /// *current* page so it renders as a pill chip in the input bar.
+    NextPage {
+        label: Option<SharedString>,
+        page: Box<dyn FnOnce() -> PalettePage + 'static>,
+    },
 }
 
 /// A page of items shown in the palette, with optional breadcrumb label and placeholder text.
@@ -30,6 +51,9 @@ pub struct PalettePage {
     /// An optional default action shown at the bottom and used as fallback
     /// when no items match the filter. Receives the filter text on confirm.
     pub default_action: Option<PaletteItem>,
+    /// Pre-populated pages to insert into the stack before this page.
+    /// Each page has a label (shown as a pill) and full items (functional when popped to).
+    pub prepopulated_pills_pages: Vec<PalettePage>,
 }
 
 impl PalettePage {
@@ -39,6 +63,7 @@ impl PalettePage {
             prompt: None,
             items,
             default_action: None,
+            prepopulated_pills_pages: Vec::new(),
         }
     }
 
@@ -58,12 +83,34 @@ impl PalettePage {
     }
 }
 
+// ── Pill styling ────────────────────────────────────────────────────
+
+const PILL_BG: Hsla = Hsla {
+    h: 0.0,
+    s: 0.0,
+    l: 0.25,
+    a: 1.0,
+};
+
+const PILL_BORDER: Hsla = Hsla {
+    h: 0.0,
+    s: 0.0,
+    l: 0.35,
+    a: 1.0,
+};
+
 /// The command palette view.
 pub struct CommandPalette {
     text_field: TextField,
     page_stack: Vec<PalettePage>,
     selected_index: usize,
+    list_state: ListState,
+    last_list_count: usize,
     focus_handle: FocusHandle,
+    /// Focus handle to return focus to when the palette is dismissed.
+    parent_focus: Option<FocusHandle>,
+    /// Set to true after an Execute action runs or Escape on root page.
+    pub dismissed: bool,
 }
 
 impl CommandPalette {
@@ -77,8 +124,32 @@ impl CommandPalette {
             text_field: TextField::new(prompt),
             page_stack: vec![page],
             selected_index: 0,
+            list_state: ListState::new(0, ListAlignment::Top, px(100.0)),
+            last_list_count: 0,
             focus_handle: cx.focus_handle(),
+            parent_focus: None,
+            dismissed: false,
         }
+    }
+
+    /// Push additional pages onto the stack (for pre-populating selections as pills).
+    pub fn push_pages(&mut self, pages: Vec<PalettePage>) {
+        for page in pages {
+            let prompt = page
+                .prompt
+                .clone()
+                .map(|s| s.to_string())
+                .unwrap_or_else(|| "Search...".to_string());
+            self.text_field.clear();
+            self.text_field.set_placeholder(prompt);
+            self.page_stack.push(page);
+        }
+        self.selected_index = 0;
+    }
+
+    /// Set the focus handle to return focus to when the palette is dismissed.
+    pub fn set_parent_focus(&mut self, handle: FocusHandle) {
+        self.parent_focus = Some(handle);
     }
 
     fn current_page(&self) -> Option<&PalettePage> {
@@ -105,31 +176,36 @@ impl CommandPalette {
     }
 
     fn confirm(&mut self, window: &mut Window, cx: &mut App) {
-        let indices = self.filtered_indices();
         let filter = self.text_field.text.clone();
-        let default_idx = indices.len();
 
-        // Selected a filtered item.
-        if let Some(&item_index) = indices.get(self.selected_index) {
-            let page = self.page_stack.last_mut().unwrap();
-            let action = std::mem::replace(
-                &mut page.items[item_index].action,
-                PaletteAction::Execute(Box::new(|_, _, _| {})),
-            );
-            self.run_action(action, filter, window, cx);
-            return;
-        }
-
-        // Selected the default action (either explicitly or no matches).
-        let page = match self.page_stack.last_mut() {
-            Some(p) => p,
-            None => return,
-        };
-        let is_default_selected = self.selected_index == default_idx || indices.is_empty();
-        if is_default_selected {
-            if let Some(default) = page.default_action.take() {
-                self.run_action(default.action, filter, window, cx);
+        match self.row_to_item(self.selected_index) {
+            None => {
+                // Default action selected
+                let page = match self.page_stack.last_mut() {
+                    Some(p) => p,
+                    None => return,
+                };
+                if let Some(default) = page.default_action.take() {
+                    self.run_action(default.action, filter, window, cx);
+                }
             }
+            Some(item_index) => {
+                let page = self.page_stack.last_mut().unwrap();
+                let action = std::mem::replace(
+                    &mut page.items[item_index].action,
+                    PaletteAction::Execute(Box::new(|_, _, _| {})),
+                );
+                self.run_action(action, filter, window, cx);
+            }
+        }
+    }
+
+    fn dismiss(&mut self, window: &mut Window) {
+        self.dismissed = true;
+        if let Some(parent) = &self.parent_focus {
+            parent.focus(window);
+        } else {
+            window.blur();
         }
     }
 
@@ -143,9 +219,23 @@ impl CommandPalette {
         match action {
             PaletteAction::Execute(f) => {
                 f(&filter, window, cx);
+                self.dismiss(window);
             }
-            PaletteAction::NextPage(make_page) => {
-                let next = make_page();
+            PaletteAction::NextPage { label, page } => {
+                // Set the label on the current page (it becomes a pill)
+                if let Some(current) = self.page_stack.last_mut() {
+                    if label.is_some() {
+                        current.label = label;
+                    }
+                }
+                let mut next = page();
+
+                // Insert pre-populated pages (with items) before the active page
+                let prepopulated = std::mem::take(&mut next.prepopulated_pills_pages);
+                for pre_page in prepopulated {
+                    self.page_stack.push(pre_page);
+                }
+
                 let prompt = next
                     .prompt
                     .clone()
@@ -159,41 +249,48 @@ impl CommandPalette {
         }
     }
 
+    fn pop_page(&mut self) {
+        if self.page_stack.len() > 1 {
+            self.page_stack.pop();
+            // Clear the label on the revealed page — the selection it
+            // represented was just removed by popping.
+            if let Some(page) = self.page_stack.last_mut() {
+                page.label = None;
+            }
+            self.text_field.clear();
+            if let Some(page) = self.current_page() {
+                let prompt = page
+                    .prompt
+                    .clone()
+                    .map(|s| s.to_string())
+                    .unwrap_or_else(|| "Search...".to_string());
+                self.text_field.set_placeholder(prompt);
+            }
+            self.selected_index = 0;
+        }
+    }
+
     fn handle_key_down(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut App) {
         let key = event.keystroke.key.as_str();
 
         // ── Palette-specific keys (handled before text field) ────────
         match key {
             "escape" => {
-                if self.page_stack.len() > 1 {
-                    self.page_stack.pop();
-                    self.text_field.clear();
-                    if let Some(page) = self.current_page() {
-                        let prompt = page
-                            .prompt
-                            .clone()
-                            .map(|s| s.to_string())
-                            .unwrap_or_else(|| "Search...".to_string());
-                        self.text_field.set_placeholder(prompt);
-                    }
-                    self.selected_index = 0;
-                }
+                self.dismiss(window);
                 return;
             }
             "up" => {
                 if self.selected_index > 0 {
                     self.selected_index -= 1;
+                    self.list_state.scroll_to_reveal_item(self.selected_index);
                 }
                 return;
             }
             "down" => {
-                let filtered_count = self.filtered_indices().len();
-                let has_default = self
-                    .current_page()
-                    .map_or(false, |p| p.default_action.is_some());
-                let total = filtered_count + if has_default { 1 } else { 0 };
+                let total = self.visible_row_count();
                 if total > 0 && self.selected_index < total - 1 {
                     self.selected_index += 1;
+                    self.list_state.scroll_to_reveal_item(self.selected_index);
                 }
                 return;
             }
@@ -208,121 +305,209 @@ impl CommandPalette {
         let handled = self.text_field.handle_key_down(event, cx);
 
         if !handled && key == "backspace" {
-            // Backspace on empty text — pop page
+            // Backspace on empty text — pop page (removes a pill)
             if self.text_field.text.is_empty() && self.page_stack.len() > 1 {
-                self.page_stack.pop();
-                if let Some(page) = self.current_page() {
-                    let prompt = page
-                        .prompt
-                        .clone()
-                        .map(|s| s.to_string())
-                        .unwrap_or_else(|| "Search...".to_string());
-                    self.text_field.set_placeholder(prompt);
-                }
-                self.selected_index = 0;
+                self.pop_page();
             }
         } else if handled {
             self.selected_index = 0;
+            self.list_state.scroll_to_reveal_item(0);
         }
     }
 
-    fn render_breadcrumbs(&self) -> impl IntoElement {
-        let mut crumbs = div().flex().flex_row().gap(px(4.0));
-        for (i, page) in self.page_stack.iter().enumerate() {
+    fn render_input(&self) -> impl IntoElement {
+        let len = self.page_stack.len();
+
+        let mut row = div()
+            .flex()
+            .flex_row()
+            .flex_wrap()
+            .items_center()
+            .px(px(12.0))
+            .py(px(8.0))
+            .gap(px(4.0))
+            .w_full()
+            .border_b_1()
+            .border_color(DARK.border_primary);
+
+        // Back arrow pill if deeper than root
+        if len > 1 {
+            row = row.child(
+                div()
+                    .flex_shrink_0()
+                    .px(px(6.0))
+                    .py(px(2.0))
+                    .bg(PILL_BG)
+                    .border_1()
+                    .border_color(PILL_BORDER)
+                    .rounded(px(4.0))
+                    .text_size(px(12.0))
+                    .text_color(DARK.text_secondary)
+                    .child(SharedString::new_static("←")),
+            );
+        }
+
+        // All pages except the last render as pill chips
+        for page in &self.page_stack[..len.saturating_sub(1)] {
             if let Some(label) = &page.label {
-                if i > 0 {
-                    crumbs = crumbs.child(
-                        div()
-                            .text_color(DARK.text_tertiary)
-                            .text_size(px(12.0))
-                            .child(SharedString::new_static(">")),
-                    );
-                }
-                crumbs = crumbs.child(
+                row = row.child(
                     div()
-                        .text_color(DARK.text_secondary)
+                        .flex_shrink_0()
+                        .px(px(8.0))
+                        .py(px(2.0))
+                        .bg(PILL_BG)
+                        .border_1()
+                        .border_color(PILL_BORDER)
+                        .rounded(px(4.0))
                         .text_size(px(12.0))
+                        .text_color(DARK.text_primary)
                         .child(label.clone()),
                 );
             }
         }
-        crumbs
+
+        // Text field fills remaining space
+        row = row.child(
+            div()
+                .flex_1()
+                .min_w(px(100.0))
+                .child(self.text_field.element()),
+        );
+
+        row
     }
 
-    fn render_input(&self) -> impl IntoElement {
-        div()
-            .flex()
-            .flex_row()
-            .px(px(12.0))
-            .py(px(8.0))
-            .gap(px(8.0))
-            .w_full()
-            .border_b_1()
-            .border_color(DARK.border_primary)
-            .child(self.render_breadcrumbs())
-            .child(div().flex_1().child(self.text_field.element()))
-    }
-
-    fn render_items(&self) -> impl IntoElement {
+    /// Total number of visible rows: default action (if any) + filtered items.
+    fn visible_row_count(&self) -> usize {
         let indices = self.filtered_indices();
+        let has_default = self
+            .current_page()
+            .map_or(false, |p| p.default_action.is_some());
+        let offset = if has_default { 1 } else { 0 };
+        offset + indices.len()
+    }
+
+    /// Map a visual row index to either the default action or a page item index.
+    /// Returns `None` for default action, `Some(item_idx)` for page items.
+    fn row_to_item(&self, row: usize) -> Option<usize> {
+        let has_default = self
+            .current_page()
+            .map_or(false, |p| p.default_action.is_some());
+        if has_default {
+            if row == 0 {
+                return None; // default action
+            }
+            self.filtered_indices().get(row - 1).copied()
+        } else {
+            self.filtered_indices().get(row).copied()
+        }
+    }
+
+    fn render_items(&mut self) -> impl IntoElement {
         let page = match self.current_page() {
             Some(p) => p,
-            None => return div(),
+            None => return div().into_any_element(),
         };
-        let has_default = page.default_action.is_some();
-        // The default action occupies the slot right after the filtered items.
-        let default_visual_idx = indices.len();
 
-        let mut list = div().flex().flex_col().w_full().py(px(4.0));
-        for (visual_idx, &item_idx) in indices.iter().enumerate() {
-            let item = &page.items[item_idx];
-            let selected = visual_idx == self.selected_index;
-            list = list.child(self.render_item_row(&item.label, selected));
+        let total = self.visible_row_count();
+        if total == 0 {
+            return div()
+                .py(px(4.0))
+                .child(
+                    div()
+                        .px(px(12.0))
+                        .py(px(6.0))
+                        .text_size(px(13.0))
+                        .text_color(DARK.text_tertiary)
+                        .child(SharedString::new_static("No results")),
+                )
+                .into_any_element();
         }
+
+        // Build row data for the list
+        let has_default = page.default_action.is_some();
+        let indices = self.filtered_indices();
+        let selected_index = self.selected_index;
+
+        let mut rows: Vec<(SharedString, bool, Vec<SharedString>)> = Vec::with_capacity(total);
 
         if let Some(default) = &page.default_action {
-            let selected = if indices.is_empty() {
-                // No matches — default is always selected.
-                true
-            } else {
-                self.selected_index == default_visual_idx
-            };
-            list = list.child(self.render_item_row(&default.label, selected));
+            rows.push((
+                default.label.clone(),
+                selected_index == 0,
+                default.pills.clone(),
+            ));
         }
 
-        if indices.is_empty() && !has_default {
-            list = list.child(
-                div()
-                    .px(px(12.0))
-                    .py(px(6.0))
-                    .text_size(px(13.0))
-                    .text_color(DARK.text_tertiary)
-                    .child(SharedString::new_static("No results")),
-            );
+        for (i, &item_idx) in indices.iter().enumerate() {
+            let visual = if has_default { i + 1 } else { i };
+            rows.push((
+                page.items[item_idx].label.clone(),
+                visual == selected_index,
+                page.items[item_idx].pills.clone(),
+            ));
         }
 
-        list
+        if total != self.last_list_count {
+            self.list_state.reset(total);
+            self.last_list_count = total;
+        }
+
+        list(self.list_state.clone(), move |i, _window, _cx| {
+            let (ref label, selected, ref pills) = rows[i];
+            Self::render_item_row_static(label.clone(), selected, pills.clone()).into_any_element()
+        })
+        .flex_1()
+        .py(px(4.0))
+        .into_any_element()
     }
 
-    fn render_item_row(&self, label: &SharedString, selected: bool) -> impl IntoElement {
+    fn render_item_row_static(
+        label: SharedString,
+        selected: bool,
+        pills: Vec<SharedString>,
+    ) -> impl IntoElement {
         let bg = if selected {
             ITEM_SELECTED_BG
         } else {
             Hsla::transparent_black()
         };
-        div()
+        let text_color = if selected {
+            DARK.text_primary
+        } else {
+            DARK.text_secondary
+        };
+
+        let mut row = div()
             .px(px(12.0))
             .py(px(6.0))
             .w_full()
             .bg(bg)
-            .rounded(px(4.0))
             .text_size(px(14.0))
-            .text_color(if selected {
-                DARK.text_primary
-            } else {
-                DARK.text_secondary
-            })
-            .child(label.clone())
+            .text_color(text_color)
+            .child(label);
+
+        if !pills.is_empty() {
+            let mut pill_row = div().flex().flex_row().flex_wrap().gap(px(4.0)).pt(px(4.0));
+            for pill in pills {
+                pill_row = pill_row.child(
+                    div()
+                        .flex_shrink_0()
+                        .px(px(6.0))
+                        .py(px(1.0))
+                        .bg(PILL_BG)
+                        .border_1()
+                        .border_color(PILL_BORDER)
+                        .rounded(px(4.0))
+                        .text_size(px(11.0))
+                        .text_color(DARK.text_primary)
+                        .child(pill.clone()),
+                );
+            }
+            row = row.child(pill_row);
+        }
+
+        row
     }
 }
 
@@ -348,8 +533,14 @@ impl Focusable for CommandPalette {
 
 impl Render for CommandPalette {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        if self.dismissed {
+            return div().into_any_element();
+        }
+
         deferred(
             div()
+                .id("command-palette-overlay")
+                .occlude()
                 .absolute()
                 .top_0()
                 .left_0()
@@ -378,6 +569,7 @@ impl Render for CommandPalette {
                         .child(self.render_items()),
                 ),
         )
+        .into_any_element()
     }
 }
 

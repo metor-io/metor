@@ -2,8 +2,8 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 
 use gpui::{
-    App, Application, Bounds, Context, Entity, FocusHandle, Focusable, IntoElement, KeyDownEvent,
-    Window, WindowBounds, WindowOptions, div, prelude::*, px, size,
+    App, Application, Bounds, Context, Entity, FocusHandle, Focusable, IntoElement, KeyBinding,
+    Window, WindowBounds, WindowDecorations, WindowOptions, actions, div, prelude::*, px, size,
 };
 use metor_db::{DB, Server};
 use metor_panel::command_palette::CommandPalette;
@@ -11,6 +11,8 @@ use metor_panel::elements::TimeSeriesPlot;
 use metor_panel::inspectable::palette_page_for_inspectable;
 use metor_proto::types::ComponentId;
 use stellarator::{net::TcpListener, struc_con::stellar};
+
+actions!(example, [TogglePalette]);
 
 struct ExampleRoot {
     db: Arc<DB>,
@@ -21,7 +23,8 @@ struct ExampleRoot {
 
 impl ExampleRoot {
     fn new(db: Arc<DB>, component_id: ComponentId, cx: &mut Context<Self>) -> Self {
-        let plot = cx.new(|cx| TimeSeriesPlot::from_component(db.clone(), component_id, vec![0], cx));
+        let plot =
+            cx.new(|cx| TimeSeriesPlot::from_component(db.clone(), component_id, vec![0], cx));
         Self {
             db,
             plot,
@@ -30,13 +33,25 @@ impl ExampleRoot {
         }
     }
 
-    fn toggle_palette(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    fn toggle_palette(&mut self, _: &TogglePalette, window: &mut Window, cx: &mut Context<Self>) {
+        // Clean up dismissed palette
+        if let Some(palette) = &self.palette {
+            if palette.read(cx).dismissed {
+                self.palette = None;
+            }
+        }
+
         if self.palette.is_some() {
             self.palette = None;
+            self.focus_handle.focus(window);
         } else {
-            let page =
-                palette_page_for_inspectable(self.plot.clone(), Some(self.db.clone()), cx);
-            let palette = cx.new(|cx| CommandPalette::new(page, cx));
+            let page = palette_page_for_inspectable(self.plot.clone(), Some(self.db.clone()), cx);
+            let parent_focus = self.focus_handle.clone();
+            let palette = cx.new(|cx| {
+                let mut p = CommandPalette::new(page, cx);
+                p.set_parent_focus(parent_focus);
+                p
+            });
             palette.focus_handle(cx).focus(window);
             self.palette = Some(palette);
         }
@@ -51,21 +66,19 @@ impl Focusable for ExampleRoot {
 }
 
 impl Render for ExampleRoot {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        // Clean up dismissed palette and reclaim focus
+        if let Some(palette) = &self.palette {
+            if palette.read(cx).dismissed {
+                self.palette = None;
+                self.focus_handle.focus(window);
+            }
+        }
+
         let mut root = div()
             .id("example-root")
             .track_focus(&self.focus_handle)
-            .on_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
-                let key = event.keystroke.key.as_str();
-                let cmd = event.keystroke.modifiers.platform;
-                if key == "p" && cmd {
-                    println!("toggle");
-                    this.toggle_palette(window, cx);
-                } else if key == "escape" && this.palette.is_some() {
-                    this.palette = None;
-                    cx.notify();
-                }
-            }))
+            .on_action(cx.listener(Self::toggle_palette))
             .size_full()
             .child(self.plot.clone());
 
@@ -96,6 +109,8 @@ fn main() {
     });
 
     Application::new().run(move |cx: &mut App| {
+        cx.bind_keys([KeyBinding::new("cmd-p", TogglePalette, None)]);
+
         let bounds = Bounds::centered(None, size(px(800.), px(400.)), cx);
         let db = db.clone();
         cx.open_window(
