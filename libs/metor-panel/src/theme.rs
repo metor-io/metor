@@ -17,16 +17,6 @@ pub struct Theme {
     pub zero_line_color: Hsla,
 }
 
-fn rgb(r: u8, g: u8, b: u8) -> Hsla {
-    gpui::rgb(((r as u32) << 16) | ((g as u32) << 8) | (b as u32)).into()
-}
-
-fn rgba(r: u8, g: u8, b: u8, a: f32) -> Hsla {
-    let mut c = rgb(r, g, b);
-    c.a = a;
-    c
-}
-
 pub static DARK: Theme = Theme {
     bg_primary: Hsla {
         h: 0.083,

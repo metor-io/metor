@@ -6,6 +6,18 @@ use metor_proto::types::ComponentId;
 
 use crate::command_palette::{PaletteAction, PaletteItem, PalettePage};
 
+/// List all components from the DB, sorted by name.
+pub fn list_components(db: &DB) -> Vec<(ComponentId, String)> {
+    let mut components: Vec<_> = db.with_state(|state| {
+        state
+            .component_metadata_iter()
+            .map(|(id, meta)| (*id, meta.name.clone()))
+            .collect()
+    });
+    components.sort_by(|a, b| a.1.cmp(&b.1));
+    components
+}
+
 /// Unique identifier for an inspection field.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct FieldId(pub u32);
@@ -203,7 +215,8 @@ pub fn palette_page_for_field<T: Inspectable>(
                     .collect()
             });
 
-            return trace_picker_prepopulated(entity, field_id, db, existing_selections);
+            let ctx = TracePickerCtx { entity, field_id, db };
+            return ctx.prepopulated(existing_selections);
         }
     }
 
@@ -212,14 +225,7 @@ pub fn palette_page_for_field<T: Inspectable>(
     // For Component fields, list available components from the DB as preset items.
     if matches!(current_value, InspectionValue::Component { .. }) {
         if let Some(db) = &db {
-            let mut components: Vec<_> = db.with_state(|state| {
-                state
-                    .component_metadata_iter()
-                    .map(|(id, meta)| (*id, meta.name.clone()))
-                    .collect()
-            });
-            components.sort_by(|a, b| a.1.cmp(&b.1));
-            for (_id, name) in components {
+            for (_id, name) in list_components(db) {
                 let entity = entity.clone();
                 let component_name = name.clone();
                 items.push(PaletteItem::new(
@@ -260,183 +266,151 @@ pub fn palette_page_for_field<T: Inspectable>(
 /// A pending trace selection: display label, component id, element index.
 type TraceSelection = (String, ComponentId, usize);
 
-/// Build a pre-populated trace picker.
-fn trace_picker_prepopulated<T: Inspectable>(
+/// Bundles the immutable context for trace picker page construction,
+/// avoiding repetitive parameter threading across recursive calls.
+struct TracePickerCtx<T: Inspectable> {
     entity: Entity<T>,
     field_id: FieldId,
     db: Arc<DB>,
-    existing: Vec<TraceSelection>,
-) -> PalettePage {
-    if existing.is_empty() {
-        return trace_picker_component_page(entity, field_id, db, vec![]);
-    }
-
-    let mut prepopulated = Vec::new();
-    for i in 0..existing.len() {
-        let sels_so_far: Vec<TraceSelection> = existing[..i].to_vec();
-        let mut page = trace_picker_component_page(entity.clone(), field_id, db.clone(), sels_so_far);
-        page.label = Some(SharedString::from(existing[i].0.clone()));
-        prepopulated.push(page);
-    }
-
-    let mut active = trace_picker_component_page(entity, field_id, db, existing);
-    active.prepopulated_pills_pages = prepopulated;
-    active
 }
 
-/// Build the component selection page for the trace picker.
-fn trace_picker_component_page<T: Inspectable>(
-    entity: Entity<T>,
-    field_id: FieldId,
-    db: Arc<DB>,
-    selections: Vec<TraceSelection>,
-) -> PalettePage {
-    let apply_selections = selections.clone();
-    let apply_entity = entity.clone();
-    let apply_item = if selections.is_empty() {
-        None
-    } else {
-        Some(PaletteItem::new(
-            format!("Apply ({} selected)", selections.len()),
-            PaletteAction::Execute(Box::new(move |_input, _window, cx| {
-                let traces: Vec<(ComponentId, usize)> = apply_selections
-                    .iter()
-                    .map(|(_name, id, idx)| (*id, *idx))
-                    .collect();
-                let value = InspectionValue::Traces(traces);
-                apply_entity.update(cx, |this, cx| {
-                    this.set_field(field_id, value, cx);
-                });
-            })),
-        ))
-    };
+impl<T: Inspectable> TracePickerCtx<T> {
+    /// Build a trace picker pre-populated with existing selections as pills.
+    fn prepopulated(&self, existing: Vec<TraceSelection>) -> PalettePage {
+        if existing.is_empty() {
+            return self.component_page(vec![]);
+        }
 
-    let mut components: Vec<_> = db.with_state(|state| {
-        state
-            .component_metadata_iter()
-            .map(|(id, meta)| (*id, meta.name.clone(), meta.clone()))
-            .collect()
-    });
-    components.sort_by(|a, b| a.1.cmp(&b.1));
+        let mut prepopulated = Vec::new();
+        for i in 0..existing.len() {
+            let mut page = self.component_page(existing[..i].to_vec());
+            page.label = Some(SharedString::from(existing[i].0.clone()));
+            prepopulated.push(page);
+        }
 
-    let items: Vec<PaletteItem> = components
-        .into_iter()
-        .map(|(id, name, _meta)| {
-            let entity = entity.clone();
-            let db = db.clone();
-            let selections = selections.clone();
-            let comp_name = name.clone();
-            let schema = db.with_state(|state| state.get_component(id).map(|c| c.schema.clone()));
-            PaletteItem::new(
-                name,
+        let mut active = self.component_page(existing);
+        active.prepopulated_pills_pages = prepopulated;
+        active
+    }
+
+    /// Build the component selection page.
+    fn component_page(&self, selections: Vec<TraceSelection>) -> PalettePage {
+        let apply_item = if selections.is_empty() {
+            None
+        } else {
+            let sels = selections.clone();
+            let entity = self.entity.clone();
+            let field_id = self.field_id;
+            Some(PaletteItem::new(
+                format!("Apply ({} selected)", sels.len()),
+                PaletteAction::Execute(Box::new(move |_input, _window, cx| {
+                    let traces: Vec<(ComponentId, usize)> =
+                        sels.iter().map(|(_name, id, idx)| (*id, *idx)).collect();
+                    entity.update(cx, |this, cx| {
+                        this.set_field(field_id, InspectionValue::Traces(traces), cx);
+                    });
+                })),
+            ))
+        };
+
+        let items: Vec<PaletteItem> = list_components(&self.db)
+            .into_iter()
+            .map(|(id, name)| {
+                let entity = self.entity.clone();
+                let db = self.db.clone();
+                let field_id = self.field_id;
+                let selections = selections.clone();
+                let comp_name = name.clone();
+                PaletteItem::new(
+                    name,
+                    PaletteAction::NextPage {
+                        label: None,
+                        page: Box::new(move || {
+                            let ctx = TracePickerCtx { entity, field_id, db };
+                            ctx.element_page(id, comp_name, selections)
+                        }),
+                    },
+                )
+            })
+            .collect();
+
+        let mut page = PalettePage::new(items).prompt("Select a component...");
+        if let Some(apply) = apply_item {
+            page = page.default_action(apply);
+        }
+        page
+    }
+
+    /// Build the element selection page for a specific component.
+    fn element_page(
+        &self,
+        component_id: ComponentId,
+        component_name: String,
+        selections: Vec<TraceSelection>,
+    ) -> PalettePage {
+        let element_names = element_names_for_component(&self.db, component_id);
+
+        // For scalars, synthesize a single entry so the loop handles everything
+        let element_names = if element_names.is_empty() {
+            vec![component_name.clone()]
+        } else {
+            element_names
+        };
+
+        let mut items = Vec::new();
+
+        // "All" — adds one selection per element
+        if element_names.len() > 1 {
+            let entity = self.entity.clone();
+            let db = self.db.clone();
+            let field_id = self.field_id;
+            let mut sels = selections.clone();
+            for i in 0..element_names.len() {
+                sels.push((component_name.clone(), component_id, i));
+            }
+            items.push(PaletteItem::new(
+                "All",
                 PaletteAction::NextPage {
-                    label: None,
+                    label: Some(SharedString::from(component_name.clone())),
                     page: Box::new(move || {
-                        trace_picker_element_page(
-                            entity, field_id, db, selections, id, comp_name, schema,
-                        )
+                        let ctx = TracePickerCtx { entity, field_id, db };
+                        ctx.component_page(sels)
                     }),
                 },
-            )
-        })
-        .collect();
-
-    let mut page = PalettePage::new(items).prompt("Select a component...");
-    if let Some(apply) = apply_item {
-        page = page.default_action(apply);
-    }
-    page
-}
-
-/// Build the element selection page for a specific component.
-fn trace_picker_element_page<T: Inspectable>(
-    entity: Entity<T>,
-    field_id: FieldId,
-    db: Arc<DB>,
-    selections: Vec<TraceSelection>,
-    component_id: ComponentId,
-    component_name: String,
-    schema: Option<metor_db::ComponentSchema>,
-) -> PalettePage {
-    let element_names: Vec<String> = schema
-        .as_ref()
-        .map(|s| {
-            let dim: Vec<u64> = s.dim.iter().map(|d| *d as u64).collect();
-            default_element_names(&dim)
-        })
-        .unwrap_or_default();
-
-    let elem_count = element_names.len().max(1);
-    let mut items = Vec::new();
-
-    // "All" — adds one selection per element
-    if elem_count > 1 {
-        let entity_all = entity.clone();
-        let db_all = db.clone();
-        let name_all = component_name.clone();
-        let mut sels_all = selections.clone();
-        for i in 0..elem_count {
-            sels_all.push((name_all.clone(), component_id, i));
+            ));
         }
-        let pill_label = SharedString::from(component_name.clone());
-        items.push(PaletteItem::new(
-            "All",
-            PaletteAction::NextPage {
-                label: Some(pill_label),
-                page: Box::new(move || {
-                    trace_picker_component_page(entity_all, field_id, db_all, sels_all)
-                }),
-            },
-        ));
+
+        // Individual elements
+        for (i, elem_name) in element_names.iter().enumerate() {
+            let entity = self.entity.clone();
+            let db = self.db.clone();
+            let field_id = self.field_id;
+            let mut sels = selections.clone();
+            sels.push((component_name.clone(), component_id, i));
+
+            let display = if elem_name.is_empty() {
+                format!("[{}]", i)
+            } else {
+                elem_name.clone()
+            };
+            let pill_label = SharedString::from(format!("{}.{}", component_name, display));
+
+            items.push(PaletteItem::new(
+                display,
+                PaletteAction::NextPage {
+                    label: Some(pill_label),
+                    page: Box::new(move || {
+                        let ctx = TracePickerCtx { entity, field_id, db };
+                        ctx.component_page(sels)
+                    }),
+                },
+            ));
+        }
+
+        PalettePage::new(items)
+            .label(component_name)
+            .prompt("Select element...")
     }
-
-    // Individual elements
-    for (i, elem_name) in element_names.iter().enumerate() {
-        let entity_elem = entity.clone();
-        let db_elem = db.clone();
-        let comp_name = component_name.clone();
-        let mut sels_elem = selections.clone();
-        sels_elem.push((comp_name.clone(), component_id, i));
-
-        let display = if elem_name.is_empty() {
-            format!("[{}]", i)
-        } else {
-            elem_name.clone()
-        };
-        let pill_label = SharedString::from(format!("{}.{}", comp_name, display));
-
-        items.push(PaletteItem::new(
-            display,
-            PaletteAction::NextPage {
-                label: Some(pill_label),
-                page: Box::new(move || {
-                    trace_picker_component_page(entity_elem, field_id, db_elem, sels_elem)
-                }),
-            },
-        ));
-    }
-
-    // For scalars (single element), just select it directly
-    if elem_count == 1 && element_names.is_empty() {
-        let entity_scalar = entity.clone();
-        let db_scalar = db.clone();
-        let mut sels_scalar = selections.clone();
-        sels_scalar.push((component_name.clone(), component_id, 0));
-        let pill_label = SharedString::from(component_name.clone());
-        items.push(PaletteItem::new(
-            component_name.clone(),
-            PaletteAction::NextPage {
-                label: Some(pill_label),
-                page: Box::new(move || {
-                    trace_picker_component_page(entity_scalar, field_id, db_scalar, sels_scalar)
-                }),
-            },
-        ));
-    }
-
-    PalettePage::new(items)
-        .label(component_name)
-        .prompt("Select element...")
 }
 
 /// Return element names for a component from the DB, or an empty vec if not found.

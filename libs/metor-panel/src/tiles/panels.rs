@@ -122,12 +122,12 @@ impl PlotPanel {
     }
 
     /// The inner TimeSeriesPlot entity, for use with `palette_page_for_inspectable`.
-    pub fn inner(&self) -> &Entity<TimeSeriesPlot> {
+    pub(crate) fn inner(&self) -> &Entity<TimeSeriesPlot> {
         &self.inner
     }
 
     /// The DB reference, needed for the inspectable palette.
-    pub fn db(&self) -> &Arc<DB> {
+    pub(crate) fn db(&self) -> &Arc<DB> {
         &self.db
     }
 }
@@ -282,16 +282,8 @@ fn component_picker_page(
     db: Arc<DB>,
     on_select: impl Fn(ComponentId, String, &mut App) + 'static,
 ) -> PalettePage {
-    let mut components: Vec<(ComponentId, String)> = db.with_state(|state| {
-        state
-            .component_metadata_iter()
-            .map(|(id, meta)| (*id, meta.name.clone()))
-            .collect()
-    });
-    components.sort_by(|a, b| a.1.cmp(&b.1));
-
     let on_select = Arc::new(on_select);
-    let items: Vec<PaletteItem> = components
+    let items: Vec<PaletteItem> = crate::inspectable::list_components(&db)
         .into_iter()
         .map(|(id, name)| {
             let on_select = on_select.clone();

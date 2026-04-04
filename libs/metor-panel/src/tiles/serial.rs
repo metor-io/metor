@@ -68,11 +68,17 @@ pub struct ItemRegistry {
     deserializers: HashMap<String, DeserializeFn>,
 }
 
-impl ItemRegistry {
-    pub fn new() -> Self {
+impl Default for ItemRegistry {
+    fn default() -> Self {
         Self {
             deserializers: HashMap::new(),
         }
+    }
+}
+
+impl ItemRegistry {
+    pub fn new() -> Self {
+        Self::default()
     }
 
     /// Register a deserializer for a PaneItem type.

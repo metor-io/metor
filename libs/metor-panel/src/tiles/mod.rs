@@ -1,8 +1,8 @@
-pub mod drag;
-pub mod item;
-pub mod pane;
+pub(crate) mod drag;
+pub(crate) mod item;
+pub(crate) mod pane;
 pub mod panels;
-pub mod serial;
+pub(crate) mod serial;
 
 use gpui::{
     AnyElement, App, Axis, Context, DragMoveEvent, Entity, EventEmitter, IntoElement, Render,
@@ -10,18 +10,13 @@ use gpui::{
 };
 
 use crate::theme::DARK;
-use drag::{ResizeDrag, SplitDirection};
-use item::PaneItemHandle;
-use pane::{Pane, PaneEvent};
-use serial::{
-    ItemRegistry, SerializedItem, SerializedMember, SerializedPane,
-    SerializedSplit, SerializedTileGroup,
-};
+use drag::ResizeDrag;
+use serial::{SerializedItem, SerializedMember, SerializedPane, SerializedSplit};
 
-pub use drag::SplitDirection as TileSplitDirection;
-pub use item::{PaneItem, PaneItemHandle as TilePaneItemHandle};
-pub use pane::Pane as TilePane;
-pub use serial::{ItemRegistry as TileItemRegistry, SerializedTileGroup as SerializedTiles};
+pub use drag::SplitDirection;
+pub use item::{PaneItem, PaneItemHandle};
+pub use pane::{Pane, PaneEvent};
+pub use serial::{ItemRegistry, SerializedTileGroup};
 
 /// Events emitted by TileGroup to its parent.
 pub enum TileGroupEvent {
@@ -141,18 +136,6 @@ impl Member {
             // If only one child remains, replace axis with that child
             if axis.members.len() == 1 {
                 *self = axis.members.remove(0);
-            }
-        }
-    }
-
-    #[allow(dead_code)]
-    fn collect_panes(&self, out: &mut Vec<Entity<Pane>>) {
-        match self {
-            Member::Pane(pane) => out.push(pane.clone()),
-            Member::Axis(axis) => {
-                for member in &axis.members {
-                    member.collect_panes(out);
-                }
             }
         }
     }
@@ -455,9 +438,6 @@ impl TileGroup {
                 if self.panes.len() > 1 {
                     self.remove_pane(&pane, cx);
                 }
-            }
-            PaneEvent::TabDropped { .. } => {
-                // Already handled in Pane itself
             }
             PaneEvent::Inspect { item } => {
                 cx.emit(TileGroupEvent::Inspect {

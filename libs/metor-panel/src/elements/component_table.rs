@@ -71,7 +71,6 @@ impl ComponentRow {
 }
 
 pub struct ComponentTableDelegate {
-    db: Arc<DB>,
     rows: Vec<Entity<ComponentRow>>,
     _task: gpui::Task<()>,
 }
@@ -213,7 +212,6 @@ pub type ComponentTable = Table<ComponentTableDelegate>;
 pub fn new_component_table(db: Arc<DB>, cx: &mut Context<ComponentTable>) -> ComponentTable {
     let task = ComponentTableDelegate::spawn_watcher(db.clone(), cx);
     let delegate = ComponentTableDelegate {
-        db,
         rows: Vec::new(),
         _task: task,
     };

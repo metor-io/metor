@@ -7,8 +7,8 @@ use gpui::{
 };
 use metor_db::{DB, Server};
 use metor_panel::command_palette::{CommandPalette, PalettePage};
-use metor_panel::tiles::panels::tile_palette_page;
 use metor_panel::tiles::{TileGroup, TileGroupEvent};
+use metor_panel::tiles::panels::tile_palette_page;
 use stellarator::{net::TcpListener, struc_con::stellar};
 
 actions!(tiles_example, [OpenPalette]);

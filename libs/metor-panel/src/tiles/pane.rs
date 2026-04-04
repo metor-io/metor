@@ -1,5 +1,5 @@
 use gpui::{
-    AnyElement, Bounds, Context, DragMoveEvent, Entity, EventEmitter, IntoElement,
+    AnyElement, Bounds, Context, DragMoveEvent, EventEmitter, IntoElement,
     MouseButton, Pixels, Render, Window, div, prelude::*, px,
 };
 
@@ -19,11 +19,6 @@ pub enum PaneEvent {
     },
     /// The pane has no more items and should be removed.
     Empty,
-    /// A tab was dropped from another pane (move, not split).
-    TabDropped {
-        item: Box<dyn PaneItemHandle>,
-        from_pane: Entity<Pane>,
-    },
     /// User requested to inspect/edit a panel item (e.g. via right-click).
     Inspect {
         item: Box<dyn PaneItemHandle>,
