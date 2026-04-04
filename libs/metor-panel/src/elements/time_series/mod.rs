@@ -41,19 +41,88 @@ fn y_ticks(view: &PlotBounds, target_count: usize) -> impl Iterator<Item = f64> 
     })
 }
 
-/// Generate X-axis tick positions (timestamps in microseconds) within the visible bounds.
-fn x_ticks(view: &PlotBounds, target_count: usize) -> impl Iterator<Item = i64> {
-    let range = view.width();
-    let step = pretty_round(range / target_count as f64);
-    let valid = range > 0.0 && step.is_normal() && step > 0.0;
+/// Copied from metor-ui's `DurationExt::segment_round`.
+/// Snaps a duration to a "nice" human-readable time interval.
+#[allow(clippy::match_overlapping_arm)]
+fn segment_round(dur: hifitime::Duration) -> hifitime::Duration {
+    use hifitime::{TimeUnits, Unit};
+    let (_, days, hours, minutes, seconds, milli, us, _) = dur.decompose();
+    let round_to = if days > 0 {
+        match days {
+            ..=2 => 1,
+            ..=5 => 5,
+            ..=15 => 15,
+            ..=30 => 30,
+            _ => 50,
+        }
+        .days()
+    } else if hours > 0 {
+        match hours {
+            ..=2 => 1,
+            ..=6 => 6,
+            ..=12 => 12,
+            _ => 24,
+        }
+        .hours()
+    } else if minutes > 0 {
+        match minutes {
+            ..=2 => 1,
+            ..=5 => 5,
+            ..=15 => 15,
+            ..=30 => 30,
+            _ => 60,
+        }
+        .minutes()
+    } else if seconds > 0 {
+        match seconds {
+            ..=2 => 1,
+            ..=5 => 5,
+            ..=15 => 15,
+            ..=30 => 30,
+            _ => 60,
+        }
+        .seconds()
+    } else if milli > 0 {
+        match milli {
+            ..=2 => 1,
+            ..=5 => 5,
+            ..=10 => 10,
+            ..=25 => 25,
+            ..=50 => 50,
+            ..=100 => 100,
+            ..=250 => 250,
+            ..=500 => 500,
+            _ => 1000,
+        }
+        .milliseconds()
+    } else if us > 0 {
+        1 * Unit::Microsecond
+    } else {
+        1 * Unit::Nanosecond
+    };
 
-    let step_i = if valid { (step as i64).max(1) } else { 1 };
+    dur.ceil(round_to)
+}
+
+/// Generate X-axis tick positions (timestamps in microseconds) within the visible bounds.
+/// `data_start` is the absolute timestamp of the data origin so ticks align to round
+/// offsets from it (e.g. 0 s, 5 s, 10 s, …).
+fn x_ticks(view: &PlotBounds, target_count: usize, data_start: f64) -> impl Iterator<Item = i64> {
+    let range = view.width();
+    let target = (target_count as f64).max(1.0);
+    let raw_step_us = range / target;
+    let step_dur = segment_round(hifitime::Duration::from_microseconds(raw_step_us));
+    let step_i = (step_dur.total_nanoseconds() / 1_000) as i64;
+
     let t_min = view.min_x as i64;
     let t_max = view.max_x as i64;
+    let ds = data_start as i64;
+    let valid = range > 0.0 && step_i > 0;
 
-    // Align start to multiples of step, then skip below t_min
+    // Align ticks to multiples of step relative to data_start
+    let offset_from_start = t_min - ds;
     let aligned = if valid {
-        (t_min / step_i) * step_i
+        ds + (offset_from_start / step_i) * step_i
     } else {
         t_min
     };
@@ -62,7 +131,6 @@ fn x_ticks(view: &PlotBounds, target_count: usize) -> impl Iterator<Item = i64> 
     } else {
         aligned
     };
-    // If !valid, produce exactly one tick at t_min
     let end = if valid { t_max } else { t_min };
 
     let mut t = start;
@@ -84,14 +152,16 @@ fn x_ticks(view: &PlotBounds, target_count: usize) -> impl Iterator<Item = i64> 
     })
 }
 
-fn format_time_label(t_us: i64, t_min: i64) -> String {
-    let relative_us = t_us - t_min;
-    let secs = relative_us as f64 / 1_000_000.0;
-    if secs.abs() < 100.0 {
-        format!("{:.1}s", secs)
-    } else {
-        format!("{:.0}s", secs)
+/// Format a timestamp as a human-readable time label relative to a reference point.
+/// Uses hifitime's Duration display for consistent formatting with metor-ui
+/// (e.g. "0", "30 s", "1 min", "1 min 30 s").
+fn format_time_label(t_us: i64, ref_us: i64) -> String {
+    let offset_us = t_us - ref_us;
+    if offset_us == 0 {
+        return "0".to_string();
     }
+    let dur = hifitime::Duration::from_microseconds(offset_us as f64);
+    format!("{}", dur)
 }
 
 fn format_value_label(v: f64) -> String {
@@ -194,6 +264,7 @@ fn paint_plot<'a>(
     outer_bounds: Bounds<Pixels>,
     traces: impl Iterator<Item = &'a ResolvedTrace>,
     view: PlotBounds,
+    data_start: f64,
     window: &mut Window,
     cx: &mut gpui::App,
 ) {
@@ -244,8 +315,8 @@ fn paint_plot<'a>(
     }
 
     // X axis: grid lines + labels in a single pass (no clipping needed)
-    let t_min_i = view.min_x as i64;
-    for tick in x_ticks(&view, 5) {
+    let t_min_i = data_start as i64;
+    for tick in x_ticks(&view, 5, data_start) {
         let x = view.to_screen(pb, tick as f64, view.min_y).x;
         if x < pb.origin.x || x > pb.origin.x + pb.size.width {
             continue;
@@ -560,6 +631,7 @@ impl TimeSeriesPlot {
 impl Render for TimeSeriesPlot {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let view = self.current_view();
+        let data_start = self.time_range().map(|(s, _)| s).unwrap_or(0.0);
         let traces = self.traces.clone();
 
         div()
@@ -631,7 +703,7 @@ impl Render for TimeSeriesPlot {
                     },
                     move |_, (bounds, view), window, cx| {
                         if let Some(view) = view {
-                            paint_plot(bounds, traces.iter().flatten(), view, window, cx);
+                            paint_plot(bounds, traces.iter().flatten(), view, data_start, window, cx);
                         }
                     },
                 )
