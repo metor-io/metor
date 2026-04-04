@@ -8,6 +8,7 @@ pub mod command_palette;
 pub mod elements;
 pub mod inspectable;
 pub mod theme;
+pub mod tiles;
 
 pub trait AsComponentView {
     fn as_component_view(&self) -> ComponentView<'_>;
