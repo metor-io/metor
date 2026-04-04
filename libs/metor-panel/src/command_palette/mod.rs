@@ -160,19 +160,35 @@ impl CommandPalette {
         let Some(page) = self.current_page() else {
             return vec![];
         };
-        let filter = self.text_field.text.to_lowercase();
+        let filter = &self.text_field.text;
         if filter.is_empty() {
             return (0..page.items.len()).collect();
         }
-        page.items
+
+        use nucleo_matcher::{
+            Matcher,
+            pattern::{CaseMatching, Normalization, Pattern},
+        };
+
+        let mut matcher = Matcher::new(nucleo_matcher::Config::DEFAULT);
+        let pattern = Pattern::parse(filter, CaseMatching::Ignore, Normalization::Smart);
+
+        let mut scored: Vec<(usize, u32)> = page
+            .items
             .iter()
             .enumerate()
-            .filter(|(_, item)| {
-                let label = item.label.to_lowercase();
-                fuzzy_match(&label, &filter)
+            .filter_map(|(i, item)| {
+                let mut buf = Vec::new();
+                let haystack =
+                    nucleo_matcher::Utf32Str::new(&item.label, &mut buf);
+                let score = pattern.score(haystack, &mut matcher)?;
+                Some((i, score))
             })
-            .map(|(i, _)| i)
-            .collect()
+            .collect();
+
+        // Sort by score descending (best matches first)
+        scored.sort_by(|a, b| b.1.cmp(&a.1));
+        scored.into_iter().map(|(i, _)| i).collect()
     }
 
     fn confirm(&mut self, window: &mut Window, cx: &mut App) {
@@ -573,18 +589,3 @@ impl Render for CommandPalette {
     }
 }
 
-/// Simple subsequence fuzzy match. Returns true if all characters of
-/// `pattern` appear in `text` in order.
-fn fuzzy_match(text: &str, pattern: &str) -> bool {
-    let mut text_chars = text.chars();
-    for p in pattern.chars() {
-        loop {
-            match text_chars.next() {
-                Some(t) if t == p => break,
-                Some(_) => continue,
-                None => return false,
-            }
-        }
-    }
-    true
-}
