@@ -5,8 +5,8 @@ pub mod panels;
 pub mod serial;
 
 use gpui::{
-    AnyElement, App, Axis, Context, DragMoveEvent, Entity, IntoElement, Render, Window,
-    div, prelude::*, px, relative,
+    AnyElement, App, Axis, Context, DragMoveEvent, Entity, EventEmitter, IntoElement, Render,
+    Window, div, prelude::*, px, relative,
 };
 
 use crate::theme::DARK;
@@ -22,6 +22,14 @@ pub use drag::SplitDirection as TileSplitDirection;
 pub use item::{PaneItem, PaneItemHandle as TilePaneItemHandle};
 pub use pane::Pane as TilePane;
 pub use serial::{ItemRegistry as TileItemRegistry, SerializedTileGroup as SerializedTiles};
+
+/// Events emitted by TileGroup to its parent.
+pub enum TileGroupEvent {
+    /// A panel item requested inspection/editing (e.g. via right-click on tab).
+    Inspect { item: Box<dyn PaneItemHandle> },
+}
+
+impl EventEmitter<TileGroupEvent> for TileGroup {}
 
 const RESIZE_HANDLE_SIZE: f32 = 4.0;
 
@@ -450,6 +458,11 @@ impl TileGroup {
             }
             PaneEvent::TabDropped { .. } => {
                 // Already handled in Pane itself
+            }
+            PaneEvent::Inspect { item } => {
+                cx.emit(TileGroupEvent::Inspect {
+                    item: item.clone_handle(),
+                });
             }
         }
     }

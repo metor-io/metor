@@ -614,18 +614,6 @@ impl TimeSeriesPlot {
             Some(PlotBounds::new(start, min_y, end, max_y).normalize())
         })
     }
-
-    fn trace_label(&self, trace: &Trace) -> String {
-        let name = self
-            .db
-            .with_state(|state| {
-                state
-                    .get_component_metadata(trace.component_id)
-                    .map(|m| m.name.clone())
-            })
-            .unwrap_or_else(|| trace.component_id.to_string());
-        format!("{}[{}]", name, trace.element_index)
-    }
 }
 
 impl Render for TimeSeriesPlot {
@@ -703,7 +691,14 @@ impl Render for TimeSeriesPlot {
                     },
                     move |_, (bounds, view), window, cx| {
                         if let Some(view) = view {
-                            paint_plot(bounds, traces.iter().flatten(), view, data_start, window, cx);
+                            paint_plot(
+                                bounds,
+                                traces.iter().flatten(),
+                                view,
+                                data_start,
+                                window,
+                                cx,
+                            );
                         }
                     },
                 )

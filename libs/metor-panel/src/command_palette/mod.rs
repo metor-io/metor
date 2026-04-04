@@ -234,8 +234,8 @@ impl CommandPalette {
     ) {
         match action {
             PaletteAction::Execute(f) => {
-                f(&filter, window, cx);
                 self.dismiss(window);
+                f(&filter, window, cx);
             }
             PaletteAction::NextPage { label, page } => {
                 // Set the label on the current page (it becomes a pill)

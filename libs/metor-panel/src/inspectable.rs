@@ -158,7 +158,7 @@ pub fn palette_page_for_inspectable<T: Inspectable>(
                 PaletteAction::NextPage {
                     label: None,
                     page: Box::new(move || {
-                        editor_page_for_field(entity, field_id, field_label, current_value, db_clone)
+                        palette_page_for_field(entity, field_id, field_label, current_value, db_clone)
                     }),
                 },
             )
@@ -168,7 +168,9 @@ pub fn palette_page_for_inspectable<T: Inspectable>(
     PalettePage::new(items).label("Inspect")
 }
 
-fn editor_page_for_field<T: Inspectable>(
+/// Create a [`PalettePage`] that edits a specific field on an inspectable entity.
+/// For `Traces` fields this opens the guided component/element picker.
+pub fn palette_page_for_field<T: Inspectable>(
     entity: Entity<T>,
     field_id: FieldId,
     field_label: SharedString,

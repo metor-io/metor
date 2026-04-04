@@ -1,4 +1,9 @@
+use std::sync::Arc;
+
 use gpui::{AnyView, App, Entity, Render, SharedString};
+use metor_db::DB;
+
+use crate::command_palette::PalettePage;
 
 /// Trait that pane content must implement to be hosted in a tile pane.
 pub trait PaneItem: Render + Sized + 'static {
@@ -15,6 +20,11 @@ pub trait PaneItem: Render + Sized + 'static {
     fn can_close(&self, _cx: &App) -> bool {
         true
     }
+
+    /// Return an inspection palette page for configuring this item, if supported.
+    fn inspect_page(&self, _db: Option<Arc<DB>>, _cx: &App) -> Option<PalettePage> {
+        None
+    }
 }
 
 /// Object-safe handle to any pane item, used for type-erased storage in Pane.
@@ -26,6 +36,7 @@ pub trait PaneItemHandle: 'static {
     fn view(&self) -> AnyView;
     fn entity_id(&self) -> gpui::EntityId;
     fn clone_handle(&self) -> Box<dyn PaneItemHandle>;
+    fn inspect_page(&self, db: Option<Arc<DB>>, cx: &App) -> Option<PalettePage>;
 }
 
 impl<T: PaneItem> PaneItemHandle for Entity<T> {
@@ -55,5 +66,9 @@ impl<T: PaneItem> PaneItemHandle for Entity<T> {
 
     fn clone_handle(&self) -> Box<dyn PaneItemHandle> {
         Box::new(self.clone())
+    }
+
+    fn inspect_page(&self, db: Option<Arc<DB>>, cx: &App) -> Option<PalettePage> {
+        self.read(cx).inspect_page(db, cx)
     }
 }

@@ -1,6 +1,6 @@
 use gpui::{
     AnyElement, Bounds, Context, DragMoveEvent, Entity, EventEmitter, IntoElement,
-    Pixels, Render, Window, div, prelude::*, px,
+    MouseButton, Pixels, Render, Window, div, prelude::*, px,
 };
 
 use crate::theme::DARK;
@@ -23,6 +23,10 @@ pub enum PaneEvent {
     TabDropped {
         item: Box<dyn PaneItemHandle>,
         from_pane: Entity<Pane>,
+    },
+    /// User requested to inspect/edit a panel item (e.g. via right-click).
+    Inspect {
+        item: Box<dyn PaneItemHandle>,
     },
 }
 
@@ -186,6 +190,7 @@ impl Pane {
 
         let pane_entity = cx.entity().clone();
         let item_handle = item.clone_handle();
+        let inspect_handle = item.clone_handle();
 
         let mut tab = div()
             .id(("tab", ix))
@@ -213,6 +218,17 @@ impl Pane {
         tab = tab.on_click(cx.listener(move |this, _, _, cx| {
             this.activate_item(ix, cx);
         }));
+
+        // Right-click to inspect/edit
+        tab = tab.on_mouse_down(
+            MouseButton::Right,
+            cx.listener(move |this, _, _, cx| {
+                this.activate_item(ix, cx);
+                cx.emit(PaneEvent::Inspect {
+                    item: inspect_handle.clone_handle(),
+                });
+            }),
+        );
 
         // Drag this tab
         tab = tab.on_drag(
