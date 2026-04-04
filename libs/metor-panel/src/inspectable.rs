@@ -437,6 +437,19 @@ fn trace_picker_element_page<T: Inspectable>(
         .prompt("Select element...")
 }
 
+/// Return element names for a component from the DB, or an empty vec if not found.
+pub fn element_names_for_component(db: &DB, component_id: ComponentId) -> Vec<String> {
+    db.with_state(|state| {
+        state
+            .get_component(component_id)
+            .map(|c| {
+                let dim: Vec<u64> = c.schema.dim.iter().map(|d| *d as u64).collect();
+                default_element_names(&dim)
+            })
+            .unwrap_or_default()
+    })
+}
+
 /// Generate default element names from a shape (e.g. [3] → ["x", "y", "z"]).
 fn default_element_names(shape: &[u64]) -> Vec<String> {
     fn append_elements(shape: &[u64], parent_elem: &str, elems: &mut Vec<String>) {

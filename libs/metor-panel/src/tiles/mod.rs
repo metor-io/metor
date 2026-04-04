@@ -1,6 +1,7 @@
 pub mod drag;
 pub mod item;
 pub mod pane;
+pub mod panels;
 pub mod serial;
 
 use gpui::{
