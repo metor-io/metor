@@ -1,4 +1,4 @@
-use gpui::{Bounds, Pixels, Point, point};
+use gpui::{Bounds, Pixels, Point, point, px};
 
 /// Data-space bounds for a time-series plot, with conversion between data and screen coordinates.
 #[derive(Clone, Copy, Debug)]
@@ -136,6 +136,56 @@ impl PlotBounds {
         point(
             screen_bounds.origin.x + screen_bounds.size.width * nx as f32,
             screen_bounds.origin.y + screen_bounds.size.height * ny as f32,
+        )
+    }
+
+
+    /// Pre-compute a branchless screen transform for the inner loop.
+    pub fn screen_transform(&self, screen_bounds: Bounds<Pixels>) -> ScreenTransform {
+        let sw = f32::from(screen_bounds.size.width) as f64;
+        let sh = f32::from(screen_bounds.size.height) as f64;
+        let ox = f32::from(screen_bounds.origin.x) as f64;
+        let oy = f32::from(screen_bounds.origin.y) as f64;
+        let dw = self.width();
+        let dh = self.height();
+
+        if dw == 0.0 || dh == 0.0 {
+            return ScreenTransform {
+                x_scale: 0.0,
+                y_scale: 0.0,
+                x_offset: ox + sw * 0.5,
+                y_offset: oy + sh * 0.5,
+            };
+        }
+
+        let x_scale = sw / dw;
+        let y_scale = -sh / dh;
+        ScreenTransform {
+            x_scale,
+            y_scale,
+            x_offset: ox - self.min_x * x_scale,
+            y_offset: oy + sh - self.min_y * y_scale,
+        }
+    }
+}
+
+/// Pre-computed data→screen transform. Two multiply-adds per point, no branches.
+/// Keeps scale/offset in f64 to preserve precision for large timestamp values,
+/// only casting to f32 at the very end.
+#[derive(Clone, Copy)]
+pub struct ScreenTransform {
+    x_scale: f64,
+    y_scale: f64,
+    x_offset: f64,
+    y_offset: f64,
+}
+
+impl ScreenTransform {
+    #[inline(always)]
+    pub fn apply(&self, data_x: f64, data_y: f64) -> Point<Pixels> {
+        point(
+            px((self.x_offset + data_x * self.x_scale) as f32),
+            px((self.y_offset + data_y * self.y_scale) as f32),
         )
     }
 }
