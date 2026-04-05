@@ -8,6 +8,7 @@ pub mod elements;
 pub mod inspectable;
 pub mod theme;
 pub mod tiles;
+pub(crate) mod trace_picker;
 
 pub trait AsComponentView {
     fn as_component_view(&self) -> ComponentView<'_>;

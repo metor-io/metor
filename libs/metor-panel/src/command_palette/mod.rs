@@ -83,7 +83,6 @@ impl PalettePage {
     }
 }
 
-// ── Pill styling ────────────────────────────────────────────────────
 
 /// The command palette view.
 pub struct CommandPalette {
@@ -275,7 +274,7 @@ impl CommandPalette {
     fn handle_key_down(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut App) {
         let key = event.keystroke.key.as_str();
 
-        // ── Palette-specific keys (handled before text field) ────────
+
         match key {
             "escape" => {
                 self.dismiss(window);
@@ -303,7 +302,7 @@ impl CommandPalette {
             _ => {}
         }
 
-        // ── Delegate to text field ──────────────────────────────────
+
         let handled = self.text_field.handle_key_down(event, cx);
 
         if !handled && key == "backspace" {

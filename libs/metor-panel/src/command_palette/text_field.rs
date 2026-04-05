@@ -65,7 +65,6 @@ impl TextField {
         self.mark = 0;
     }
 
-    // ── Selection helpers ───────────────────────────────────────────
 
     pub fn has_selection(&self) -> bool {
         self.mark != self.cursor
@@ -97,7 +96,6 @@ impl TextField {
         o
     }
 
-    // ── Editing operations ──────────────────────────────────────────
 
     fn delete_selection(&mut self) {
         let range = self.selection_range();
@@ -141,7 +139,6 @@ impl TextField {
         }
     }
 
-    // ── Cursor movement helpers ─────────────────────────────────────
 
     fn move_cursor(&mut self, offset: usize, extend_selection: bool) {
         self.cursor = offset;
@@ -176,7 +173,6 @@ impl TextField {
         }
     }
 
-    // ── Key handling ────────────────────────────────────────────────
 
     /// Handle a key event. Returns `true` if the key was consumed (text changed
     /// or cursor moved), `false` if the caller should handle it.
@@ -184,7 +180,7 @@ impl TextField {
         let key = event.keystroke.key.as_str();
         let mods = &event.keystroke.modifiers;
 
-        // ── Platform (Cmd) shortcuts ────────────────────────────────
+
         if mods.platform {
             match key {
                 "a" => {
@@ -226,7 +222,7 @@ impl TextField {
             }
         }
 
-        // ── macOS readline / emacs keybindings (Ctrl) ───────────────
+
         #[cfg(target_os = "macos")]
         if mods.control {
             match key {
@@ -268,7 +264,7 @@ impl TextField {
             }
         }
 
-        // ── Regular keys ────────────────────────────────────────────
+
         match key {
             "backspace" => {
                 if self.has_selection() {
@@ -312,7 +308,6 @@ impl TextField {
         }
     }
 
-    // ── Rendering ───────────────────────────────────────────────────
 
     pub fn element(&self) -> impl IntoElement {
         let text = self.text.clone();

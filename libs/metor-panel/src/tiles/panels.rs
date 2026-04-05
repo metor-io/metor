@@ -11,7 +11,6 @@ use crate::inspectable::{palette_page_for_inspectable, palette_page_for_field, F
 use super::item::{PaneItem, PaneItemHandle};
 use super::pane::Pane;
 
-// ── ComponentText wrapper ──────────────────────────────────────────
 
 pub struct TextPanel {
     inner: Entity<ComponentText>,
@@ -53,7 +52,6 @@ impl PaneItem for TextPanel {
     }
 }
 
-// ── ComponentTable wrapper ─────────────────────────────────────────
 
 pub struct TablePanel {
     inner: Entity<ComponentTable>,
@@ -86,7 +84,6 @@ impl PaneItem for TablePanel {
     }
 }
 
-// ── TimeSeriesPlot wrapper ─────────────────────────────────────────
 
 pub struct PlotPanel {
     db: Arc<DB>,
@@ -160,7 +157,6 @@ impl PaneItem for PlotPanel {
     }
 }
 
-// ── Command palette integration ────────────────────────────────────
 
 /// Callback invoked after a panel is created, so the caller can open its
 /// inspectable palette if the panel has configurable fields.
