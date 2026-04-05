@@ -1,7 +1,60 @@
+use std::borrow::Cow;
+
 use gpui::Hsla;
 
-/// Color palette for the panel UI. All colors use HSLA.
+/// Convert an RGB hex literal and alpha to [`Hsla`] at compile time.
+/// Usage: `hex(0x1f1d1b, 1.0)` for an opaque dark brown.
+const fn hex(rgb: u32, a: f32) -> Hsla {
+    let r = ((rgb >> 16) & 0xFF) as f32 / 255.0;
+    let g = ((rgb >> 8) & 0xFF) as f32 / 255.0;
+    let b = (rgb & 0xFF) as f32 / 255.0;
+
+    // f32::max/min aren't const, so do it manually
+    let max = if r > g {
+        if r > b { r } else { b }
+    } else if g > b {
+        g
+    } else {
+        b
+    };
+    let min = if r < g {
+        if r < b { r } else { b }
+    } else if g < b {
+        g
+    } else {
+        b
+    };
+    let delta = max - min;
+    let l = (max + min) / 2.0;
+
+    let s = if l == 0.0 || l == 1.0 {
+        0.0
+    } else if l < 0.5 {
+        delta / (2.0 * l)
+    } else {
+        delta / (2.0 - 2.0 * l)
+    };
+
+    let h = if delta == 0.0 {
+        0.0
+    } else if max == r {
+        let mut h = ((g - b) / delta) / 6.0;
+        if h < 0.0 {
+            h += 1.0;
+        }
+        h
+    } else if max == g {
+        ((b - r) / delta + 2.0) / 6.0
+    } else {
+        ((r - g) / delta + 4.0) / 6.0
+    };
+
+    Hsla { h, s, l, a }
+}
+
+/// Color palette and typography for the panel UI.
 pub struct Theme {
+    pub font_family: &'static str,
     pub bg_primary: Hsla,
     pub bg_secondary: Hsla,
     /// Elevated surface (e.g. palette, popover).
@@ -33,115 +86,48 @@ pub struct Theme {
 }
 
 pub static DARK: Theme = Theme {
-    bg_primary: Hsla {
-        h: 0.083,
-        s: 0.08,
-        l: 0.12,
-        a: 1.0,
-    },
-    bg_secondary: Hsla {
-        h: 0.083,
-        s: 0.08,
-        l: 0.08,
-        a: 1.0,
-    },
-    bg_elevated: Hsla {
-        h: 0.083,
-        s: 0.08,
-        l: 0.14,
-        a: 1.0,
-    },
+    font_family: "Berkeley Mono",
 
-    text_primary: Hsla {
-        h: 0.1,
-        s: 0.6,
-        l: 0.95,
-        a: 1.0,
-    },
-    text_secondary: Hsla {
-        h: 0.083,
-        s: 0.05,
-        l: 0.50,
-        a: 1.0,
-    },
-    text_tertiary: Hsla {
-        h: 0.083,
-        s: 0.05,
-        l: 0.40,
-        a: 1.0,
-    },
+    bg_primary: hex(0x1f1d1b, 1.0),
+    bg_secondary: hex(0x151413, 1.0),
+    bg_elevated: hex(0x252321, 1.0),
 
-    border_primary: Hsla {
-        h: 0.083,
-        s: 0.06,
-        l: 0.20,
-        a: 1.0,
-    },
+    text_primary: hex(0xf5efe6, 1.0),
+    text_secondary: hex(0x857f79, 1.0),
+    text_tertiary: hex(0x6b6661, 1.0),
 
-    selection_bg: Hsla {
-        h: 0.083,
-        s: 0.10,
-        l: 0.20,
-        a: 1.0,
-    },
-    text_selection: Hsla {
-        h: 0.583,
-        s: 0.5,
-        l: 0.35,
-        a: 0.6,
-    },
-    drop_target: Hsla {
-        h: 0.069,
-        s: 1.0,
-        l: 0.56,
-        a: 0.15,
-    },
+    border_primary: hex(0x36322f, 1.0),
 
-    pill_bg: Hsla {
-        h: 0.0,
-        s: 0.0,
-        l: 0.25,
-        a: 1.0,
-    },
-    pill_border: Hsla {
-        h: 0.0,
-        s: 0.0,
-        l: 0.35,
-        a: 1.0,
-    },
+    selection_bg: hex(0x36322f, 1.0),
+    text_selection: hex(0x2d4a6b, 0.6),
+    drop_target: hex(0xe08a30, 0.15),
 
-    line_color: Hsla {
-        h: 0.069,
-        s: 1.0,
-        l: 0.56,
-        a: 1.0,
-    },
+    pill_bg: hex(0x404040, 1.0),
+    pill_border: hex(0x595959, 1.0),
+
+    line_color: hex(0xe08a30, 1.0),
     line_colors: [
-        Hsla { h: 0.069, s: 1.0, l: 0.56, a: 1.0 }, // orange
-        Hsla { h: 0.583, s: 0.8, l: 0.56, a: 1.0 }, // blue
-        Hsla { h: 0.333, s: 0.7, l: 0.50, a: 1.0 }, // green
-        Hsla { h: 0.0,   s: 0.8, l: 0.55, a: 1.0 }, // red
-        Hsla { h: 0.75,  s: 0.7, l: 0.60, a: 1.0 }, // purple
-        Hsla { h: 0.5,   s: 0.7, l: 0.55, a: 1.0 }, // cyan
-        Hsla { h: 0.15,  s: 0.9, l: 0.55, a: 1.0 }, // yellow
-        Hsla { h: 0.917, s: 0.7, l: 0.60, a: 1.0 }, // pink
+        hex(0xff7c1f, 1.0), // orange
+        hex(0x4aa0e0, 1.0), // blue
+        hex(0x40b060, 1.0), // green
+        hex(0xe04040, 1.0), // red
+        hex(0xb070e0, 1.0), // purple
+        hex(0x40c0b0, 1.0), // cyan
+        hex(0xe0c030, 1.0), // yellow
+        hex(0xe070a0, 1.0), // pink
     ],
-    grid_color: Hsla {
-        h: 0.083,
-        s: 0.06,
-        l: 0.18,
-        a: 1.0,
-    },
-    axis_color: Hsla {
-        h: 0.083,
-        s: 0.08,
-        l: 0.30,
-        a: 1.0,
-    },
-    zero_line_color: Hsla {
-        h: 0.083,
-        s: 0.10,
-        l: 0.40,
-        a: 1.0,
-    },
+    grid_color: hex(0x2e2b28, 1.0),
+    axis_color: hex(0x4d4843, 1.0),
+    zero_line_color: hex(0x6b6560, 1.0),
 };
+
+/// Register the embedded IBM Plex Mono font with gpui's text system.
+pub fn register_fonts(cx: &gpui::App) {
+    cx.text_system()
+        .add_fonts(vec![
+            Cow::Borrowed(include_bytes!("../assets/fonts/IBMPlexMono-Regular.ttf")),
+            Cow::Borrowed(include_bytes!("../assets/fonts/IBMPlexMono-Bold.ttf")),
+            Cow::Borrowed(include_bytes!("../assets/fonts/IBMPlexMono-Italic.ttf")),
+        ])
+        .expect("failed to register embedded fonts");
+}

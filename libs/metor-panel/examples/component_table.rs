@@ -18,7 +18,9 @@ fn main() {
         server.run().await
     });
 
-    Application::new().run(move |cx: &mut App| {
+    Application::new()
+        .with_assets(metor_panel::icons::IconAssets)
+        .run(move |cx: &mut App| {
         let bounds = Bounds::centered(None, size(px(800.), px(600.)), cx);
         let db = db.clone();
         cx.open_window(

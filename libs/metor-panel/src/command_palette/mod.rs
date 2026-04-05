@@ -3,6 +3,7 @@ use gpui::{
     SharedString, Window, deferred, div, list, prelude::*, px,
 };
 
+use crate::icons::Icon;
 use crate::theme::DARK;
 
 mod text_field;
@@ -336,15 +337,16 @@ impl CommandPalette {
             row = row.child(
                 div()
                     .flex_shrink_0()
-                    .px(px(6.0))
-                    .py(px(2.0))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .px(px(4.0))
+                    .py(px(3.0))
                     .bg(DARK.pill_bg)
                     .border_1()
                     .border_color(DARK.pill_border)
                     .rounded(px(4.0))
-                    .text_size(px(12.0))
-                    .text_color(DARK.text_secondary)
-                    .child(SharedString::new_static("←")),
+                    .child(Icon::ChevronLeft.svg(10.0)),
             );
         }
 

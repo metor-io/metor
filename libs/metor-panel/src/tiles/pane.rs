@@ -3,6 +3,7 @@ use gpui::{
     MouseButton, Pixels, Render, Window, div, prelude::*, px,
 };
 
+use crate::icons::Icon;
 use crate::theme::DARK;
 use super::drag::{DraggedTab, SplitDirection, detect_split_zone};
 use super::item::PaneItemHandle;
@@ -256,13 +257,12 @@ impl Pane {
                     .w(px(TAB_CLOSE_SIZE))
                     .h(px(TAB_CLOSE_SIZE))
                     .rounded(px(3.0))
-                    .text_size(px(10.0))
                     .text_color(DARK.text_tertiary)
                     .hover(|s| s.bg(DARK.border_primary).text_color(DARK.text_primary))
                     .on_click(cx.listener(move |this, _, _, cx| {
                         this.remove_item(ix, cx);
                     }))
-                    .child("x"),
+                    .child(Icon::Close.svg(10.0)),
             );
         }
 

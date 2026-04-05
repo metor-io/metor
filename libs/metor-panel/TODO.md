@@ -64,7 +64,7 @@ TBD whether this is good / we want this
 ## Theming & Polish
 
 - [x] Dark theme with configurable color palette
-- [ ] **Icons** — toolbar and panel type icons (play, pause, add, close, search, etc.)
+- [x] **Icons** — toolbar and panel type icons (play, pause, add, close, search, etc.)
 - [ ] **Custom button widgets** — styled buttons with icon + text support
 
 ---

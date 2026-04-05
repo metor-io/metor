@@ -108,7 +108,9 @@ fn main() {
         server.run().await
     });
 
-    Application::new().run(move |cx: &mut App| {
+    Application::new()
+        .with_assets(metor_panel::icons::IconAssets)
+        .run(move |cx: &mut App| {
         cx.bind_keys([KeyBinding::new("cmd-p", TogglePalette, None)]);
 
         let bounds = Bounds::centered(None, size(px(800.), px(400.)), cx);

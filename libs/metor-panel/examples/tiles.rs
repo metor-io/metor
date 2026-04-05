@@ -2,13 +2,13 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 
 use gpui::{
-    actions, App, Application, Bounds, Context, Entity, FocusHandle, Focusable, IntoElement,
-    KeyBinding, Render, Window, WindowBounds, WindowOptions, div, prelude::*, px, size,
+    App, Application, Bounds, Context, Entity, FocusHandle, Focusable, IntoElement, KeyBinding,
+    Render, Window, WindowBounds, WindowOptions, actions, div, prelude::*, px, size,
 };
 use metor_db::{DB, Server};
 use metor_panel::command_palette::{CommandPalette, PalettePage};
-use metor_panel::tiles::{TileGroup, TileGroupEvent};
 use metor_panel::tiles::panels::tile_palette_page;
+use metor_panel::tiles::{TileGroup, TileGroupEvent};
 use stellarator::{net::TcpListener, struc_con::stellar};
 
 actions!(tiles_example, [OpenPalette]);
@@ -34,12 +34,7 @@ impl ExampleRoot {
         }
     }
 
-    fn open_palette(
-        &mut self,
-        page: PalettePage,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
+    fn open_palette(&mut self, page: PalettePage, window: &mut Window, cx: &mut Context<Self>) {
         let parent_focus = self.focus_handle.clone();
         let palette = cx.new(|cx| {
             let mut p = CommandPalette::new(page, cx);
@@ -51,7 +46,9 @@ impl ExampleRoot {
         cx.notify();
     }
 
-    fn make_on_inspect(root: Entity<ExampleRoot>) -> impl Fn(PalettePage, &mut Window, &mut App) + 'static {
+    fn make_on_inspect(
+        root: Entity<ExampleRoot>,
+    ) -> impl Fn(PalettePage, &mut Window, &mut App) + 'static {
         move |page, _window, cx| {
             root.update(cx, |this, cx| {
                 this.pending_inspect = Some(page);
@@ -125,6 +122,7 @@ impl Render for ExampleRoot {
             .id("tiles-root")
             .track_focus(&self.focus_handle)
             .on_action(cx.listener(Self::toggle_palette))
+            .font_family(metor_panel::theme::DARK.font_family)
             .size_full()
             .child(self.tiles.clone());
 
@@ -148,18 +146,21 @@ fn main() {
         server.run().await
     });
 
-    Application::new().run(move |cx: &mut App| {
-        cx.bind_keys([KeyBinding::new("cmd-p", OpenPalette, None)]);
+    Application::new()
+        .with_assets(metor_panel::icons::IconAssets)
+        .run(move |cx: &mut App| {
+            metor_panel::theme::register_fonts(cx);
+            cx.bind_keys([KeyBinding::new("cmd-p", OpenPalette, None)]);
 
-        let bounds = Bounds::centered(None, size(px(1024.), px(600.)), cx);
-        let db = db.clone();
-        cx.open_window(
-            WindowOptions {
-                window_bounds: Some(WindowBounds::Windowed(bounds)),
-                ..Default::default()
-            },
-            move |_window, cx| cx.new(|cx| ExampleRoot::new(db, cx)),
-        )
-        .unwrap();
-    });
+            let bounds = Bounds::centered(None, size(px(1024.), px(600.)), cx);
+            let db = db.clone();
+            cx.open_window(
+                WindowOptions {
+                    window_bounds: Some(WindowBounds::Windowed(bounds)),
+                    ..Default::default()
+                },
+                move |_window, cx| cx.new(|cx| ExampleRoot::new(db, cx)),
+            )
+            .unwrap();
+        });
 }

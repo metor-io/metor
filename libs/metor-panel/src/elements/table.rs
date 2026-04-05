@@ -5,6 +5,7 @@ use gpui::{
     SharedString, Window, div, prelude::*, px, uniform_list,
 };
 
+use crate::icons::Icon;
 use crate::theme::DARK;
 
 const HEADER_HEIGHT: f32 = 32.0;
@@ -177,19 +178,26 @@ impl<D: TableDelegate> Table<D> {
         let sort = self.col_states[col_ix].sort;
         let sortable = col.sortable;
 
-        let sort_indicator = match sort {
-            ColumnSort::Ascending => " ^",
-            ColumnSort::Descending => " v",
-            ColumnSort::Default => "",
-        };
-
-        let label = format!("{}{}", col.name, sort_indicator);
         let mut cell = div()
             .id(("header-cell", col_ix))
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap(px(4.0))
             .px(px(12.0))
             .text_size(px(12.0))
             .text_color(DARK.text_tertiary)
-            .child(SharedString::from(label));
+            .child(col.name.clone());
+
+        match sort {
+            ColumnSort::Ascending => {
+                cell = cell.child(Icon::ChevronUp.svg(12.0));
+            }
+            ColumnSort::Descending => {
+                cell = cell.child(Icon::ChevronDown.svg(12.0));
+            }
+            ColumnSort::Default => {}
+        }
 
         if sortable {
             cell = cell
