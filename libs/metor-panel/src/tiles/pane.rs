@@ -83,6 +83,20 @@ impl Pane {
         }
     }
 
+    pub fn cycle_forward(&mut self, cx: &mut Context<Self>) {
+        if self.items.len() > 1 {
+            self.active_index = (self.active_index + 1) % self.items.len();
+            cx.notify();
+        }
+    }
+
+    pub fn cycle_backward(&mut self, cx: &mut Context<Self>) {
+        if self.items.len() > 1 {
+            self.active_index = (self.active_index + self.items.len() - 1) % self.items.len();
+            cx.notify();
+        }
+    }
+
     /// Handle a drop on the tab bar — always insert as a tab, never split.
     fn handle_tab_bar_drop(
         &mut self,

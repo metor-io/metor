@@ -854,6 +854,7 @@ struct ResolvedTrace {
 pub struct TimeSeriesPlot {
     db: Arc<DB>,
     traces: Vec<Option<ResolvedTrace>>,
+    custom_title: Option<SharedString>,
     view: Option<PlotBounds>,
     drag_start: Option<Point<Pixels>>,
     drag_start_view: Option<PlotBounds>,
@@ -881,6 +882,7 @@ impl TimeSeriesPlot {
         Self {
             db,
             traces: trace_slots,
+            custom_title: None,
             view: None,
             drag_start: None,
             drag_start_view: None,
@@ -1000,6 +1002,60 @@ impl TimeSeriesPlot {
                 component.time_series.wait().await;
             }
         })
+    }
+
+    /// Returns the display title: custom title if set, otherwise derived from traces.
+    ///
+    /// Groups traces by component. If all elements are present, shows just the
+    /// component name. Otherwise shows `component[x,y]`.
+    pub fn title(&self) -> SharedString {
+        if let Some(title) = &self.custom_title {
+            return title.clone();
+        }
+
+        use std::collections::HashMap;
+        let mut groups: HashMap<ComponentId, Vec<usize>> = HashMap::new();
+        // Track insertion order so the title is deterministic.
+        let mut order: Vec<ComponentId> = Vec::new();
+        for rt in self.traces.iter().flatten() {
+            let id = rt.trace.component_id;
+            groups.entry(id).or_insert_with(|| {
+                order.push(id);
+                Vec::new()
+            }).push(rt.trace.element_index);
+        }
+
+        if order.is_empty() {
+            return "Plot".into();
+        }
+
+        let parts: Vec<String> = order
+            .iter()
+            .map(|comp_id| {
+                let indexes = &groups[comp_id];
+                let all_elements =
+                    crate::trace_picker::element_names_for_component(&self.db, *comp_id);
+                let comp_name = self
+                    .db
+                    .with_state(|s| {
+                        s.get_component_metadata(*comp_id)
+                            .map(|m| m.name.clone())
+                    })
+                    .unwrap_or_default();
+
+                if indexes.len() == all_elements.len() {
+                    comp_name
+                } else {
+                    let names: Vec<&str> = indexes
+                        .iter()
+                        .filter_map(|&i| all_elements.get(i).map(|s| s.as_str()))
+                        .collect();
+                    format!("{}[{}]", comp_name, names.join(","))
+                }
+            })
+            .collect();
+
+        SharedString::from(parts.join(", "))
     }
 
     fn resolved_traces(&self) -> impl Iterator<Item = &ResolvedTrace> {
@@ -1303,11 +1359,18 @@ impl Inspectable for TimeSeriesPlot {
             .map(|rt| (rt.trace.component_id, rt.trace.element_index))
             .collect();
 
-        let mut fields = vec![InspectionField {
-            label: "Traces".into(),
-            field_id: FieldId(0),
-            value: InspectionValue::Traces(current_traces),
-        }];
+        let mut fields = vec![
+            InspectionField {
+                label: "Title".into(),
+                field_id: FieldId(5),
+                value: InspectionValue::String(self.title().to_string()),
+            },
+            InspectionField {
+                label: "Traces".into(),
+                field_id: FieldId(0),
+                value: InspectionValue::Traces(current_traces),
+            },
+        ];
 
         // Per-trace settings as a nested list
         let trace_items: Vec<ListItem> = self
@@ -1434,6 +1497,10 @@ impl Inspectable for TimeSeriesPlot {
                     self.view = None;
                     cx.notify();
                 }
+            }
+            (FieldId(5), InspectionValue::String(s)) => {
+                self.custom_title = if s.is_empty() { None } else { Some(s.into()) };
+                cx.notify();
             }
             (FieldId(id), value) if id >= TRACE_SETTINGS_BASE => {
                 let trace_idx = ((id - TRACE_SETTINGS_BASE) / 100) as usize;

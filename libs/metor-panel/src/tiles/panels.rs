@@ -58,12 +58,16 @@ impl PaneItem for TextPanel {
 /// Tile panel wrapping a [`ComponentTable`].
 pub struct TablePanel {
     inner: Entity<ComponentTable>,
+    label: SharedString,
 }
 
 impl TablePanel {
     pub fn new(db: Arc<DB>, cx: &mut Context<Self>) -> Self {
         let inner = cx.new(|cx| new_component_table(db, cx));
-        Self { inner }
+        Self {
+            inner,
+            label: "Components".into(),
+        }
     }
 }
 
@@ -75,7 +79,7 @@ impl Render for TablePanel {
 
 impl PaneItem for TablePanel {
     fn tab_title(&self, _cx: &App) -> SharedString {
-        "Components".into()
+        self.label.clone()
     }
 
     fn serialization_key() -> &'static str {
@@ -91,7 +95,6 @@ impl PaneItem for TablePanel {
 pub struct PlotPanel {
     db: Arc<DB>,
     inner: Entity<TimeSeriesPlot>,
-    label: SharedString,
 }
 
 impl PlotPanel {
@@ -99,26 +102,17 @@ impl PlotPanel {
         db: Arc<DB>,
         component_id: ComponentId,
         elements: &[usize],
-        label: impl Into<SharedString>,
         cx: &mut Context<Self>,
     ) -> Self {
         let inner =
             cx.new(|cx| TimeSeriesPlot::from_component(db.clone(), component_id, elements, cx));
-        Self {
-            db,
-            inner,
-            label: label.into(),
-        }
+        Self { db, inner }
     }
 
     /// Create an empty plot panel, ready to be configured via the inspector.
     pub fn empty(db: Arc<DB>, cx: &mut Context<Self>) -> Self {
         let inner = cx.new(|cx| TimeSeriesPlot::new(db.clone(), vec![], cx));
-        Self {
-            db,
-            inner,
-            label: "Plot".into(),
-        }
+        Self { db, inner }
     }
 
     /// The inner TimeSeriesPlot entity, for use with `palette_page_for_inspectable`.
@@ -146,16 +140,17 @@ impl Render for PlotPanel {
 }
 
 impl PaneItem for PlotPanel {
-    fn tab_title(&self, _cx: &App) -> SharedString {
-        self.label.clone()
+    fn tab_title(&self, cx: &App) -> SharedString {
+        self.inner.read(cx).title()
     }
 
     fn serialization_key() -> &'static str {
         "time_series_plot"
     }
 
-    fn serialize(&self, _cx: &App) -> serde_json::Value {
-        serde_json::json!({ "label": self.label.as_ref() })
+    fn serialize(&self, cx: &App) -> serde_json::Value {
+        let title = self.tab_title(cx);
+        serde_json::json!({ "label": title.as_ref() })
     }
 
     fn inspect_page(&self, _db: Option<Arc<DB>>, cx: &App) -> Option<PalettePage> {
@@ -367,3 +362,4 @@ fn build_edit_items(
 
     items
 }
+

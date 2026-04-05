@@ -42,7 +42,7 @@ TBD whether this is good / we want this
 
 - [x] Command palette with fuzzy search
 - [x] Multi-page palette navigation with breadcrumb pills
-- [ ] **Tab cycling** (Ctrl+Tab / Shift+Ctrl+Tab)
+- [x] **Tab cycling** (Ctrl+Tab / Shift+Ctrl+Tab)
 
 ## Layout & Persistence
 

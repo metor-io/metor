@@ -14,7 +14,7 @@ use metor_panel::tiles::panels::tile_palette_page;
 use metor_panel::tiles::{TileGroup, TileGroupEvent};
 use stellarator::{net::TcpListener, struc_con::stellar};
 
-actions!(metor_panel, [OpenPalette]);
+actions!(metor_panel, [OpenPalette, CycleTabForward, CycleTabBackward]);
 
 const TITLEBAR_HEIGHT: f32 = 36.0;
 
@@ -87,6 +87,26 @@ impl AppRoot {
         }
     }
 
+    fn cycle_tab_forward(
+        &mut self,
+        _: &CycleTabForward,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let pane = self.tiles.read(cx).panes()[0].clone();
+        pane.update(cx, |pane, cx| pane.cycle_forward(cx));
+    }
+
+    fn cycle_tab_backward(
+        &mut self,
+        _: &CycleTabBackward,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let pane = self.tiles.read(cx).panes()[0].clone();
+        pane.update(cx, |pane, cx| pane.cycle_backward(cx));
+    }
+
     fn handle_tile_event(
         &mut self,
         _tiles: Entity<TileGroup>,
@@ -128,6 +148,8 @@ impl Render for AppRoot {
             .id("app-root")
             .track_focus(&self.focus_handle)
             .on_action(cx.listener(Self::toggle_palette))
+            .on_action(cx.listener(Self::cycle_tab_forward))
+            .on_action(cx.listener(Self::cycle_tab_backward))
             .font_family(theme.font_family)
             .flex()
             .flex_col()
@@ -171,7 +193,11 @@ fn main() {
                 metor_panel::theme::DARK.clone(),
             )));
             set_dock_icon();
-            cx.bind_keys([KeyBinding::new("cmd-p", OpenPalette, None)]);
+            cx.bind_keys([
+                KeyBinding::new("cmd-p", OpenPalette, None),
+                KeyBinding::new("ctrl-tab", CycleTabForward, None),
+                KeyBinding::new("shift-ctrl-tab", CycleTabBackward, None),
+            ]);
 
             let bounds = Bounds::centered(None, size(px(1024.), px(600.)), cx);
             let db = db.clone();
