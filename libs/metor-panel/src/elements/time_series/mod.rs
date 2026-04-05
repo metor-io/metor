@@ -33,7 +33,8 @@ fn y_ticks(view: &PlotBounds, target_count: usize) -> impl Iterator<Item = f64> 
     let mut v = start;
     std::iter::from_fn(move || {
         if v <= end {
-            let tick = v;
+            // Snap near-zero values to exactly 0 to avoid displaying "-5.6e-17"
+            let tick = if v.abs() < step * 1e-10 { 0.0 } else { v };
             v += step;
             Some(tick)
         } else {
@@ -305,20 +306,77 @@ fn paint_plot<'a>(
         strikethrough: None,
     };
 
-    // Y axis: grid lines + labels in a single pass (no clipping needed)
+    // 1. Grid lines (behind everything)
     for tick in y_ticks(&view, 5) {
         let y = view.to_screen(pb, view.min_x, tick).y;
         if y < pb.origin.y || y > pb.origin.y + pb.size.height {
             continue;
         }
-        // Grid line
         let mut grid = PathBuilder::stroke(px(0.5));
         grid.move_to(point(pb.origin.x, y));
         grid.line_to(point(pb.origin.x + pb.size.width, y));
         if let Ok(path) = grid.build() {
             window.paint_path(path, theme.grid_color);
         }
-        // Label
+    }
+    let t_min_i = data_start as i64;
+    for tick in x_ticks(&view, 5, data_start) {
+        let x = view.to_screen(pb, tick as f64, view.min_y).x;
+        if x < pb.origin.x || x > pb.origin.x + pb.size.width {
+            continue;
+        }
+        let mut grid = PathBuilder::stroke(px(0.5));
+        grid.move_to(point(x, pb.origin.y));
+        grid.line_to(point(x, pb.origin.y + pb.size.height));
+        if let Ok(path) = grid.build() {
+            window.paint_path(path, theme.grid_color);
+        }
+    }
+
+    // 2. Data traces — clipped to outer bounds so lines extend under axis areas
+    window.with_content_mask(
+        Some(gpui::ContentMask {
+            bounds: outer_bounds,
+        }),
+        |window| {
+            for rt in &traces {
+                if !rt.trace.visible {
+                    continue;
+                }
+                paint_trace(pb, &rt.component, &view, &rt.trace, window);
+            }
+        },
+    );
+
+    // 3. Semi-transparent fills over axis label areas (partially occlude lines)
+    let axis_bg = Hsla {
+        a: 0.5,
+        ..theme.bg_secondary
+    };
+    let y_axis_bg = Bounds {
+        origin: outer_bounds.origin,
+        size: gpui::Size {
+            width: pb.origin.x - outer_bounds.origin.x,
+            height: outer_bounds.size.height,
+        },
+    };
+    window.paint_quad(gpui::fill(y_axis_bg, axis_bg));
+
+    let x_axis_bg = Bounds {
+        origin: point(pb.origin.x, pb.origin.y + pb.size.height),
+        size: gpui::Size {
+            width: pb.size.width,
+            height: outer_bounds.origin.y + outer_bounds.size.height - pb.origin.y - pb.size.height,
+        },
+    };
+    window.paint_quad(gpui::fill(x_axis_bg, axis_bg));
+
+    // 4. Labels on top of the fills
+    for tick in y_ticks(&view, 5) {
+        let y = view.to_screen(pb, view.min_x, tick).y;
+        if y < pb.origin.y || y > pb.origin.y + pb.size.height {
+            continue;
+        }
         let text = format_value_label(tick);
         let run = make_run(&text);
         let shaped = window.text_system().shape_line(
@@ -333,22 +391,11 @@ fn paint_plot<'a>(
         );
         let _ = shaped.paint(origin, label_font_size, window, cx);
     }
-
-    // X axis: grid lines + labels in a single pass (no clipping needed)
-    let t_min_i = data_start as i64;
     for tick in x_ticks(&view, 5, data_start) {
         let x = view.to_screen(pb, tick as f64, view.min_y).x;
         if x < pb.origin.x || x > pb.origin.x + pb.size.width {
             continue;
         }
-        // Grid line
-        let mut grid = PathBuilder::stroke(px(0.5));
-        grid.move_to(point(x, pb.origin.y));
-        grid.line_to(point(x, pb.origin.y + pb.size.height));
-        if let Ok(path) = grid.build() {
-            window.paint_path(path, theme.grid_color);
-        }
-        // Label
         let text = format_time_label(tick, t_min_i);
         let run = make_run(&text);
         let shaped = window.text_system().shape_line(
@@ -364,7 +411,7 @@ fn paint_plot<'a>(
         let _ = shaped.paint(origin, label_font_size, window, cx);
     }
 
-    // Zero line (bounded to plot area, no clipping needed)
+    // 5. Zero line and axes on top
     if view.min_y < 0.0 && view.max_y > 0.0 {
         let zero_y = view.to_screen(pb, view.min_x, 0.0).y;
         let mut zp = PathBuilder::stroke(px(1.0));
@@ -385,16 +432,6 @@ fn paint_plot<'a>(
     if let Ok(path) = axes.build() {
         window.paint_path(path, theme.axis_color);
     }
-
-    // Data traces — clipped to plot area
-    window.with_content_mask(Some(gpui::ContentMask { bounds: pb }), |window| {
-        for rt in &traces {
-            if !rt.trace.visible {
-                continue;
-            }
-            paint_trace(pb, &rt.component, &view, &rt.trace, window);
-        }
-    });
 }
 
 fn paint_trace(
@@ -439,6 +476,22 @@ fn paint_trace(
     }
 }
 
+/// Widen the query range so lines extend into the axis label areas.
+/// `margin_px` is the pixel width of the left margin (Y-axis labels).
+/// Converts that pixel margin into time-space and extends both sides.
+fn query_range(view: &PlotBounds, screen_width_px: f32) -> (Timestamp, Timestamp) {
+    let margin_px = Y_LABEL_WIDTH + PADDING;
+    if screen_width_px <= 0.0 {
+        return (Timestamp(view.min_x as i64), Timestamp(view.max_x as i64));
+    }
+    let time_per_px = view.width() / screen_width_px as f64;
+    let margin_time = (margin_px as f64 * time_per_px) as i64;
+    (
+        Timestamp(view.min_x as i64 - margin_time),
+        Timestamp(view.max_x as i64 + margin_time),
+    )
+}
+
 fn decimation_stride(point_count: usize, pixel_budget: usize) -> usize {
     if pixel_budget == 0 || point_count <= pixel_budget {
         1
@@ -455,8 +508,7 @@ fn paint_scatter(
     element_index: usize,
     window: &mut Window,
 ) {
-    let start_ts = Timestamp(view.min_x as i64);
-    let end_ts = Timestamp(view.max_x as i64);
+    let (start_ts, end_ts) = query_range(view, f32::from(screen_bounds.size.width));
     let Some(slice) = component.time_series.get_range(start_ts..end_ts) else {
         return;
     };
@@ -509,8 +561,7 @@ fn paint_bars(
     element_index: usize,
     window: &mut Window,
 ) {
-    let start_ts = Timestamp(view.min_x as i64);
-    let end_ts = Timestamp(view.max_x as i64);
+    let (start_ts, end_ts) = query_range(view, f32::from(screen_bounds.size.width));
     let Some(slice) = component.time_series.get_range(start_ts..end_ts) else {
         return;
     };
@@ -598,8 +649,7 @@ pub fn paint_data_line(
     element_index: usize,
     window: &mut Window,
 ) {
-    let start_ts = Timestamp(view.min_x as i64);
-    let end_ts = Timestamp(view.max_x as i64);
+    let (start_ts, end_ts) = query_range(view, f32::from(screen_bounds.size.width));
     let Some(slice) = component.time_series.get_range(start_ts..end_ts) else {
         return;
     };
@@ -1121,13 +1171,19 @@ impl Render for TimeSeriesPlot {
             );
 
         if show_legend {
+            let legend_bg = Hsla {
+                a: 0.5,
+                ..theme.bg_secondary
+            };
             let mut legend_row = div()
                 .flex()
                 .flex_row()
                 .flex_wrap()
-                .gap_3()
+                .gap_2()
+                .gap_y_0()
                 .px(px(Y_LABEL_WIDTH + PADDING))
-                .py_1();
+                //.py_1()
+                .bg(legend_bg);
 
             for (i, rt) in self.traces.iter().enumerate() {
                 let Some(rt) = rt else { continue };

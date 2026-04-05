@@ -30,6 +30,6 @@ path = "examples/time_series_plot.rs"
 name = "component_table"
 path = "examples/component_table.rs"
 
-[[example]]
-name = "tiles"
-path = "examples/tiles.rs"
+[target.'cfg(target_os = "macos")'.dependencies]
+cocoa = "0.26"
+objc = "0.2"

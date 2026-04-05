@@ -2,7 +2,7 @@ use std::fmt::Write;
 use std::sync::Arc;
 
 use super::table::{Column, ColumnSort, Table, TableDelegate};
-use super::time_series::{PlotBounds, compute_y_bounds, paint_data_line};
+use super::time_series::{PlotBounds, expand_y_bounds, paint_data_line};
 use crate::{ComponentStream, WalComponentStream, theme::theme};
 use super::ElementIndexes;
 use gpui::{
@@ -16,6 +16,7 @@ struct ComponentRow {
     component: Component,
     indexes: ElementIndexes,
     y_bounds: Option<(f64, f64)>,
+    last_scan_ts: Option<metor_proto::types::Timestamp>,
     _task: gpui::Task<()>,
 }
 
@@ -29,7 +30,14 @@ impl ComponentRow {
             loop {
                 let _ = stream.next().await;
                 let result = this.update(cx, |this, cx| {
-                    this.y_bounds = compute_y_bounds(&this.component, &idx_clone);
+                    let latest_ts = this.component.time_series.latest().map(|n| n.timestamp());
+                    this.y_bounds = expand_y_bounds(
+                        &this.component,
+                        &idx_clone,
+                        this.y_bounds,
+                        this.last_scan_ts,
+                    );
+                    this.last_scan_ts = latest_ts;
                     cx.notify();
                 });
                 if result.is_err() {
@@ -42,6 +50,7 @@ impl ComponentRow {
             component,
             indexes,
             y_bounds: None,
+            last_scan_ts: None,
             _task: task,
         }
     }

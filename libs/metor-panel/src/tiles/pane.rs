@@ -1,12 +1,12 @@
 use gpui::{
-    AnyElement, App, Bounds, Context, DragMoveEvent, EventEmitter, IntoElement,
-    MouseButton, Pixels, Render, Window, div, prelude::*, px,
+    AnyElement, App, Bounds, Context, DragMoveEvent, EventEmitter, IntoElement, MouseButton,
+    Pixels, Render, Window, div, prelude::*, px,
 };
 
-use crate::icons::Icon;
-use crate::theme::theme;
 use super::drag::{DraggedTab, SplitDirection, detect_split_zone};
 use super::item::PaneItemHandle;
+use crate::icons::Icon;
+use crate::theme::theme;
 
 const TAB_HEIGHT: f32 = 28.0;
 const TAB_CLOSE_SIZE: f32 = 16.0;
@@ -20,7 +20,7 @@ pub enum PaneEvent {
     },
     /// The pane has no more items and should be removed.
     Empty,
-    /// User requested to inspect/edit a panel item (e.g. via right-click).
+    ///// User requested to inspect/edit a panel item (e.g. via right-click).
     Inspect {
         item: Box<dyn PaneItemHandle>,
     },
@@ -104,10 +104,7 @@ impl Pane {
     ) {
         self.drag_split_direction = None;
 
-        if let Some(direction) = detect_split_zone(
-            window.mouse_position(),
-            self.content_bounds,
-        ) {
+        if let Some(direction) = detect_split_zone(window.mouse_position(), self.content_bounds) {
             let same_pane = cx.entity().entity_id() == dragged.pane.entity_id();
             if same_pane {
                 // Splitting from our own pane: remove first, then emit split.
@@ -130,12 +127,7 @@ impl Pane {
         self.drop_tab(dragged, self.items.len(), cx);
     }
 
-    fn drop_tab(
-        &mut self,
-        dragged: &DraggedTab,
-        target_ix: usize,
-        cx: &mut Context<Self>,
-    ) {
+    fn drop_tab(&mut self, dragged: &DraggedTab, target_ix: usize, cx: &mut Context<Self>) {
         let same_pane = cx.entity().entity_id() == dragged.pane.entity_id();
         if same_pane {
             let from = dragged.ix;
@@ -166,7 +158,11 @@ impl Pane {
         cx: &mut Context<Self>,
     ) {
         let position = event.event.position;
-        let new_direction = detect_split_zone(position, self.content_bounds);
+        let new_direction = if self.content_bounds.contains(&position) {
+            detect_split_zone(position, self.content_bounds)
+        } else {
+            None
+        };
         if new_direction != self.drag_split_direction {
             self.drag_split_direction = new_direction;
             cx.notify();
@@ -235,20 +231,20 @@ impl Pane {
                 item: item_handle,
                 ix,
             },
-            |dragged, _, _, cx| cx.new(|_| DraggedTab {
-                pane: dragged.pane.clone(),
-                item: dragged.item.clone_handle(),
-                ix: dragged.ix,
-            }),
+            |dragged, _, _, cx| {
+                cx.new(|_| DraggedTab {
+                    pane: dragged.pane.clone(),
+                    item: dragged.item.clone_handle(),
+                    ix: dragged.ix,
+                })
+            },
         );
 
         tab = tab.on_drop(cx.listener(move |this, dragged: &DraggedTab, window, cx| {
             this.handle_tab_bar_drop(dragged, ix, window, cx);
         }));
 
-        tab = tab.drag_over::<DraggedTab>(move |style, _, _, _| {
-            style.bg(border_primary)
-        });
+        tab = tab.drag_over::<DraggedTab>(move |style, _, _, _| style.bg(border_primary));
 
         tab = tab.child(title);
 

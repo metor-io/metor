@@ -7,11 +7,12 @@ use metor_proto::types::ComponentId;
 use crate::command_palette::{PaletteAction, PaletteItem, PalettePage};
 use crate::elements::time_series::OpenPageCallback;
 use crate::elements::{ComponentTable, ComponentText, TimeSeriesPlot, new_component_table};
-use crate::inspectable::{palette_page_for_inspectable, palette_page_for_field, FieldId, InspectionValue};
+use crate::inspectable::{
+    FieldId, InspectionValue, palette_page_for_field, palette_page_for_inspectable,
+};
 
 use super::item::{PaneItem, PaneItemHandle};
 use super::pane::Pane;
-
 
 /// Tile panel wrapping a [`ComponentText`] display.
 pub struct TextPanel {
@@ -54,7 +55,6 @@ impl PaneItem for TextPanel {
     }
 }
 
-
 /// Tile panel wrapping a [`ComponentTable`].
 pub struct TablePanel {
     inner: Entity<ComponentTable>,
@@ -86,7 +86,6 @@ impl PaneItem for TablePanel {
         serde_json::json!({})
     }
 }
-
 
 /// Tile panel wrapping a [`TimeSeriesPlot`], with inspection support for trace configuration.
 pub struct PlotPanel {
@@ -168,7 +167,6 @@ impl PaneItem for PlotPanel {
     }
 }
 
-
 /// Callback invoked after a panel is created, so the caller can open its
 /// inspectable palette if the panel has configurable fields.
 pub type OnPanelCreated = Box<dyn FnOnce(Entity<PlotPanel>, &App) -> Option<PalettePage>>;
@@ -187,17 +185,15 @@ pub fn tile_palette_page(
 ) -> PalettePage {
     let on_inspect = Arc::new(on_inspect);
 
-    let mut items = vec![
-        PaletteItem::new("New Panel", {
-            let db = db.clone();
-            let pane = pane.clone();
-            let on_inspect = on_inspect.clone();
-            PaletteAction::NextPage {
-                label: Some("New".into()),
-                page: Box::new(move || new_panel_page(db, pane, on_inspect)),
-            }
-        }),
-    ];
+    let mut items = vec![PaletteItem::new("New Panel", {
+        let db = db.clone();
+        let pane = pane.clone();
+        let on_inspect = on_inspect.clone();
+        PaletteAction::NextPage {
+            label: Some("New".into()),
+            page: Box::new(move || new_panel_page(db, pane, on_inspect)),
+        }
+    })];
 
     // Only show "Edit Panel" if there are panels to edit
     let edit_items = build_edit_items(db.clone(), tiles, on_inspect.clone(), cx);
@@ -205,28 +201,32 @@ pub fn tile_palette_page(
         items.push(PaletteItem::new("Edit Panel", {
             PaletteAction::NextPage {
                 label: Some("Edit".into()),
-                page: Box::new(move || {
-                    PalettePage::new(edit_items).prompt("Select panel to edit")
-                }),
+                page: Box::new(move || PalettePage::new(edit_items).prompt("Select panel to edit")),
             }
         }));
     }
 
-    items.push(PaletteItem::new("Theme", PaletteAction::NextPage {
-        label: Some("Theme".into()),
-        page: Box::new(|| {
-            let items: Vec<PaletteItem> = crate::theme::all_themes()
-                .iter()
-                .map(|t| {
-                    let theme = Arc::new((*t).clone());
-                    PaletteItem::new(t.name, PaletteAction::Execute(Box::new(move |_, _, cx| {
-                        crate::theme::set_theme(cx, theme.clone());
-                    })))
-                })
-                .collect();
-            PalettePage::new(items).prompt("Select theme")
-        }),
-    }));
+    items.push(PaletteItem::new(
+        "Theme",
+        PaletteAction::NextPage {
+            label: Some("Theme".into()),
+            page: Box::new(|| {
+                let items: Vec<PaletteItem> = crate::theme::all_themes()
+                    .iter()
+                    .map(|t| {
+                        let theme = Arc::new((*t).clone());
+                        PaletteItem::new(
+                            t.name,
+                            PaletteAction::Execute(Box::new(move |_, _, cx| {
+                                crate::theme::set_theme(cx, theme.clone());
+                            })),
+                        )
+                    })
+                    .collect();
+                PalettePage::new(items).prompt("Select theme")
+            }),
+        },
+    ));
 
     PalettePage::new(items).prompt("Command")
 }

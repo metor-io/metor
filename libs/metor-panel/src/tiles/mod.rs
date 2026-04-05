@@ -31,7 +31,7 @@ pub enum TileGroupEvent {
 
 impl EventEmitter<TileGroupEvent> for TileGroup {}
 
-const RESIZE_HANDLE_SIZE: f32 = 4.0;
+const RESIZE_HANDLE_SIZE: f32 = 1.0;
 
 /// A recursive split tree member: either a leaf pane or an axis split.
 enum Member {
@@ -76,18 +76,14 @@ impl Member {
                 } else {
                     (new, old)
                 };
-                *self = Member::Axis(SplitAxis::new(
-                    direction.axis(),
-                    vec![first, second],
-                ));
+                *self = Member::Axis(SplitAxis::new(direction.axis(), vec![first, second]));
                 true
             }
             Member::Axis(axis) => {
                 // Check if we can append to this axis (same direction)
                 for i in 0..axis.members.len() {
                     if let Member::Pane(pane) = &axis.members[i] {
-                        if pane.entity_id() == target.entity_id() && axis.axis == direction.axis()
-                        {
+                        if pane.entity_id() == target.entity_id() && axis.axis == direction.axis() {
                             let new = Member::Pane(new_pane.clone());
                             let insert_at = if direction.increasing() { i + 1 } else { i };
                             axis.members.insert(insert_at, new);
@@ -111,9 +107,9 @@ impl Member {
         match self {
             Member::Pane(pane) => pane.entity_id() == target.entity_id(),
             Member::Axis(axis) => {
-                if let Some(ix) = axis.members.iter().position(|m| {
-                    matches!(m, Member::Pane(p) if p.entity_id() == target.entity_id())
-                }) {
+                if let Some(ix) = axis.members.iter().position(
+                    |m| matches!(m, Member::Pane(p) if p.entity_id() == target.entity_id()),
+                ) {
                     axis.members.remove(ix);
                     axis.flexes.remove(ix);
                     true
@@ -175,10 +171,7 @@ impl Member {
         cx: &mut App,
     ) -> AnyElement {
         match self {
-            Member::Pane(pane) => div()
-                .size_full()
-                .child(pane.clone())
-                .into_any_element(),
+            Member::Pane(pane) => div().size_full().child(pane.clone()).into_any_element(),
             Member::Axis(axis) => {
                 let container = match axis.axis {
                     Axis::Horizontal => div().flex().flex_row(),
@@ -190,13 +183,8 @@ impl Member {
                 for (ix, member) in axis.members.iter().enumerate() {
                     // Resize handle between children
                     if ix > 0 {
-                        let handle = render_resize_handle(
-                            path.clone(),
-                            ix,
-                            axis.axis,
-                            tile_group,
-                            cx,
-                        );
+                        let handle =
+                            render_resize_handle(path.clone(), ix, axis.axis, tile_group, cx);
                         children.push(handle.into_any_element());
                     }
 
@@ -255,8 +243,12 @@ fn render_resize_handle(
     let theme = theme(cx);
     let tg = tile_group.clone();
 
-    let mut handle = div()
-        .id(("resize-handle", handle_ix * 1000 + path.len()));
+    // Build a unique ID from the full path + handle index to avoid collisions in nested splits
+    let mut id_hash: u64 = handle_ix as u64;
+    for &segment in path.as_slice() {
+        id_hash = id_hash.wrapping_mul(31).wrapping_add(segment as u64);
+    }
+    let mut handle = div().id(("resize-handle", id_hash as usize));
 
     handle = match axis {
         Axis::Horizontal => handle
@@ -425,12 +417,7 @@ impl TileGroup {
         }
     }
 
-    fn handle_pane_event(
-        &mut self,
-        pane: Entity<Pane>,
-        event: &PaneEvent,
-        cx: &mut Context<Self>,
-    ) {
+    fn handle_pane_event(&mut self, pane: Entity<Pane>, event: &PaneEvent, cx: &mut Context<Self>) {
         match event {
             PaneEvent::Split { direction, item } => {
                 let new_pane = cx.new(|cx| Pane::new(vec![item.clone_handle()], cx));
@@ -457,58 +444,59 @@ impl TileGroup {
         position: gpui::Point<gpui::Pixels>,
         cx: &mut Context<Self>,
     ) {
-        // Get cached bounds before mutable borrow
         let bounds = match self.axis_bounds.get(&path) {
             Some(b) => *b,
             None => return,
         };
 
-        // Navigate to the axis at the given path
         if let Some(axis) = self.find_axis_mut(&path) {
             if handle_ix == 0 || handle_ix > axis.members.len() {
                 return;
             }
 
             let total = match axis.axis {
-                Axis::Horizontal => bounds.size.width,
-                Axis::Vertical => bounds.size.height,
+                Axis::Horizontal => f32::from(bounds.size.width),
+                Axis::Vertical => f32::from(bounds.size.height),
             };
 
-            let rel_pos = match axis.axis {
-                Axis::Horizontal => position.x - bounds.origin.x,
-                Axis::Vertical => position.y - bounds.origin.y,
+            let rel = match axis.axis {
+                Axis::Horizontal => f32::from(position.x - bounds.origin.x),
+                Axis::Vertical => f32::from(position.y - bounds.origin.y),
             };
 
-            let flex_sum: f32 = axis.flexes.iter().sum();
-            let target_flex_before = (rel_pos / total) * flex_sum;
-            let current_before: f32 = axis.flexes[..handle_ix].iter().sum();
+            if total <= 0.0 {
+                return;
+            }
 
-            let delta = target_flex_before - current_before;
-            let min_flex = 0.1;
+            // Compute the fraction of total space that should be before the handle
+            let ratio = (rel / total).clamp(0.0, 1.0);
 
             let left = handle_ix - 1;
             let right = handle_ix;
-            if right < axis.flexes.len() {
-                let new_left = (axis.flexes[left] + delta).max(min_flex);
-                let new_right = (axis.flexes[right] - delta).max(min_flex);
-                axis.flexes[left] = new_left;
-                axis.flexes[right] = new_right;
-                cx.notify();
+            if right >= axis.flexes.len() {
+                return;
             }
+
+            // The two panes sharing this handle own a combined flex budget
+            let pair_flex = axis.flexes[left] + axis.flexes[right];
+            // How much of the total flex is before the left pane?
+            let flex_before_pair: f32 = axis.flexes[..left].iter().sum();
+            let flex_sum: f32 = axis.flexes.iter().sum();
+
+            // Target flex for the left pane: map the mouse ratio into the pair's budget
+            let target_left = (ratio * flex_sum - flex_before_pair).clamp(0.05, pair_flex - 0.05);
+            let target_right = pair_flex - target_left;
+
+            axis.flexes[left] = target_left;
+            axis.flexes[right] = target_right;
+            cx.notify();
         }
     }
 
     fn find_axis_mut(&mut self, path: &[usize]) -> Option<&mut SplitAxis> {
         let mut current = &mut self.root;
-        // Path is empty means the root itself is the axis
-        if path.is_empty() {
-            return match current {
-                Member::Axis(axis) => Some(axis),
-                _ => None,
-            };
-        }
-        // Navigate along the path
-        for &ix in &path[..path.len() - 1] {
+        // Navigate along the full path
+        for &ix in path {
             current = match current {
                 Member::Axis(axis) => axis.members.get_mut(ix)?,
                 _ => return None,
@@ -519,7 +507,6 @@ impl TileGroup {
             _ => None,
         }
     }
-
 }
 
 impl Render for TileGroup {
