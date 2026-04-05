@@ -3,7 +3,7 @@ use gpui::{
     SharedString, Styled, TextRun,
 };
 
-use crate::theme::DARK;
+use crate::theme::{Theme, theme};
 
 fn cursor_width() -> Pixels {
     px(1.5)
@@ -23,15 +23,15 @@ pub struct TextFieldStyle {
     pub selection_color: Hsla,
 }
 
-impl Default for TextFieldStyle {
-    fn default() -> Self {
+impl TextFieldStyle {
+    fn from_theme(theme: &Theme) -> Self {
         Self {
             font_size: px(14.0),
             line_height: px(20.0),
-            text_color: DARK.text_primary,
-            placeholder_color: DARK.text_tertiary,
-            cursor_color: DARK.text_primary,
-            selection_color: DARK.text_selection,
+            text_color: theme.text_primary,
+            placeholder_color: theme.text_tertiary,
+            cursor_color: theme.text_primary,
+            selection_color: theme.text_selection,
         }
     }
 }
@@ -46,13 +46,13 @@ pub struct TextField {
 }
 
 impl TextField {
-    pub fn new(placeholder: impl Into<String>) -> Self {
+    pub fn new(placeholder: impl Into<String>, cx: &App) -> Self {
         Self {
             text: String::new(),
             cursor: 0,
             mark: 0,
             placeholder: placeholder.into(),
-            style: TextFieldStyle::default(),
+            style: TextFieldStyle::from_theme(&theme(cx)),
         }
     }
 

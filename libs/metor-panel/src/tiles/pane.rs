@@ -1,10 +1,10 @@
 use gpui::{
-    AnyElement, Bounds, Context, DragMoveEvent, EventEmitter, IntoElement,
+    AnyElement, App, Bounds, Context, DragMoveEvent, EventEmitter, IntoElement,
     MouseButton, Pixels, Render, Window, div, prelude::*, px,
 };
 
 use crate::icons::Icon;
-use crate::theme::DARK;
+use crate::theme::theme;
 use super::drag::{DraggedTab, SplitDirection, detect_split_zone};
 use super::item::PaneItemHandle;
 
@@ -179,6 +179,7 @@ impl Pane {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
+        let theme = theme(cx);
         let item = &self.items[ix];
         let title = item.tab_title(cx);
         let is_active = ix == self.active_index;
@@ -187,6 +188,10 @@ impl Pane {
         let pane_entity = cx.entity().clone();
         let item_handle = item.clone_handle();
         let inspect_handle = item.clone_handle();
+
+        let border_primary = theme.border_primary;
+        let bg_primary = theme.bg_primary;
+        let text_primary = theme.text_primary;
 
         let mut tab = div()
             .id(("tab", ix))
@@ -199,15 +204,15 @@ impl Pane {
             .text_size(px(12.0))
             .cursor_pointer()
             .border_r_1()
-            .border_color(DARK.border_primary);
+            .border_color(border_primary);
 
         if is_active {
-            tab = tab.bg(DARK.bg_primary).text_color(DARK.text_primary);
+            tab = tab.bg(bg_primary).text_color(text_primary);
         } else {
             tab = tab
-                .bg(DARK.bg_secondary)
-                .text_color(DARK.text_secondary)
-                .hover(|s| s.bg(DARK.bg_primary).text_color(DARK.text_primary));
+                .bg(theme.bg_secondary)
+                .text_color(theme.text_secondary)
+                .hover(move |s| s.bg(bg_primary).text_color(text_primary));
         }
 
         tab = tab.on_click(cx.listener(move |this, _, _, cx| {
@@ -241,8 +246,8 @@ impl Pane {
             this.handle_tab_bar_drop(dragged, ix, window, cx);
         }));
 
-        tab = tab.drag_over::<DraggedTab>(|style, _, _, _| {
-            style.bg(DARK.border_primary)
+        tab = tab.drag_over::<DraggedTab>(move |style, _, _, _| {
+            style.bg(border_primary)
         });
 
         tab = tab.child(title);
@@ -257,8 +262,8 @@ impl Pane {
                     .w(px(TAB_CLOSE_SIZE))
                     .h(px(TAB_CLOSE_SIZE))
                     .rounded(px(3.0))
-                    .text_color(DARK.text_tertiary)
-                    .hover(|s| s.bg(DARK.border_primary).text_color(DARK.text_primary))
+                    .text_color(theme.text_tertiary)
+                    .hover(move |s| s.bg(border_primary).text_color(text_primary))
                     .on_click(cx.listener(move |this, _, _, cx| {
                         this.remove_item(ix, cx);
                     }))
@@ -269,9 +274,10 @@ impl Pane {
         tab
     }
 
-    fn render_split_overlay(&self) -> Option<AnyElement> {
+    fn render_split_overlay(&self, cx: &App) -> Option<AnyElement> {
+        let theme = theme(cx);
         let direction = self.drag_split_direction?;
-        let highlight = DARK.drop_target;
+        let highlight = theme.drop_target;
 
         let overlay = match direction {
             SplitDirection::Left => div().w_1_2().h_full().bg(highlight),
@@ -304,14 +310,15 @@ impl Pane {
 
 impl Render for Pane {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = theme(cx);
         let mut tab_bar = div()
             .flex()
             .flex_row()
             .w_full()
             .h(px(TAB_HEIGHT))
-            .bg(DARK.bg_secondary)
+            .bg(theme.bg_secondary)
             .border_b_1()
-            .border_color(DARK.border_primary)
+            .border_color(theme.border_primary)
             .overflow_x_hidden();
 
         let tab_count = self.items.len();
@@ -327,8 +334,9 @@ impl Render for Pane {
                 .on_drop(cx.listener(move |this, dragged: &DraggedTab, window, cx| {
                     this.handle_tab_bar_drop(dragged, tab_count, window, cx);
                 }))
-                .drag_over::<DraggedTab>(|style, _, _, _| {
-                    style.bg(DARK.border_primary)
+                .drag_over::<DraggedTab>({
+                    let border = theme.border_primary;
+                    move |style, _, _, _| style.bg(border)
                 }),
         );
 
@@ -351,7 +359,7 @@ impl Render for Pane {
             .flex_1()
             .size_full()
             .overflow_hidden()
-            .bg(DARK.bg_primary)
+            .bg(theme.bg_primary)
             .child(content_bounds_tracker);
 
         if let Some(item) = self.items.get(self.active_index) {
@@ -365,7 +373,7 @@ impl Render for Pane {
             }))
             .on_drag_move(cx.listener(Self::handle_content_drag_move));
 
-        if let Some(overlay) = self.render_split_overlay() {
+        if let Some(overlay) = self.render_split_overlay(cx) {
             content = content.child(overlay);
         }
 

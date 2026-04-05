@@ -6,7 +6,7 @@ use gpui::{
 };
 
 use crate::icons::Icon;
-use crate::theme::DARK;
+use crate::theme::theme;
 
 const HEADER_HEIGHT: f32 = 32.0;
 const RESIZE_HANDLE_WIDTH: f32 = 6.0;
@@ -178,6 +178,7 @@ impl<D: TableDelegate> Table<D> {
         let sort = self.col_states[col_ix].sort;
         let sortable = col.sortable;
 
+        let theme = theme(cx);
         let mut cell = div()
             .id(("header-cell", col_ix))
             .flex()
@@ -186,7 +187,7 @@ impl<D: TableDelegate> Table<D> {
             .gap(px(4.0))
             .px(px(12.0))
             .text_size(px(12.0))
-            .text_color(DARK.text_tertiary)
+            .text_color(theme.text_tertiary)
             .child(col.name.clone());
 
         match sort {
@@ -249,6 +250,7 @@ impl<D: TableDelegate> Table<D> {
 impl<D: TableDelegate> Render for Table<D> {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.sync_col_states();
+        let theme = theme(cx);
         let columns = self.delegate.columns();
         let row_count = self.delegate.rows_count();
         let row_height = self.delegate.row_height();
@@ -261,7 +263,7 @@ impl<D: TableDelegate> Render for Table<D> {
             .w_full()
             .h(px(HEADER_HEIGHT))
             .border_b_1()
-            .border_color(DARK.border_primary);
+            .border_color(theme.border_primary);
 
         let view = cx.entity().clone();
         for (ix, col) in columns.iter().enumerate() {
@@ -314,11 +316,12 @@ impl<D: TableDelegate> Render for Table<D> {
         let col_count = columns.len();
         let col_flex: Vec<bool> = columns.iter().map(|c| c.flex).collect();
 
+        let border_color = theme.border_primary;
         div()
             .flex()
             .flex_col()
             .size_full()
-            .bg(DARK.bg_primary)
+            .bg(theme.bg_primary)
             .child(header)
             .child(
                 uniform_list(
@@ -338,7 +341,7 @@ impl<D: TableDelegate> Render for Table<D> {
                                     .w_full()
                                     .h(row_height)
                                     .border_b_1()
-                                    .border_color(DARK.border_primary);
+                                    .border_color(border_color);
 
                                 for col_ix in 0..col_count {
                                     let cell =

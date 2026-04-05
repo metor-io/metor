@@ -11,7 +11,7 @@ use gpui::{
 
 use smallvec::SmallVec;
 
-use crate::theme::DARK;
+use crate::theme::theme;
 use drag::ResizeDrag;
 use serial::{SerializedItem, SerializedMember, SerializedPane, SerializedSplit};
 
@@ -250,8 +250,9 @@ fn render_resize_handle(
     handle_ix: usize,
     axis: Axis,
     tile_group: &Entity<TileGroup>,
-    _cx: &mut App,
+    cx: &mut App,
 ) -> impl IntoElement {
+    let theme = theme(cx);
     let tg = tile_group.clone();
 
     let mut handle = div()
@@ -270,9 +271,10 @@ fn render_resize_handle(
 
     handle.style().flex_shrink = Some(0.);
 
+    let hover_color = theme.text_tertiary;
     handle
-        .bg(DARK.border_primary)
-        .hover(|s| s.bg(DARK.text_tertiary))
+        .bg(theme.border_primary)
+        .hover(move |s| s.bg(hover_color))
         .on_drag(
             ResizeDrag {
                 path: path.clone(),
@@ -522,11 +524,12 @@ impl TileGroup {
 
 impl Render for TileGroup {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = theme(cx);
         let tile_group = cx.entity().clone();
 
         div()
             .size_full()
-            .bg(DARK.bg_secondary)
+            .bg(theme.bg_secondary)
             .child(self.root.render(SplitPath::new(), &tile_group, window, cx))
     }
 }

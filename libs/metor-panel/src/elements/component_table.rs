@@ -3,7 +3,7 @@ use std::sync::Arc;
 
 use super::table::{Column, ColumnSort, Table, TableDelegate};
 use super::time_series::{PlotBounds, compute_y_bounds, paint_data_line};
-use crate::{ComponentStream, WalComponentStream, theme::DARK};
+use crate::{ComponentStream, WalComponentStream, theme::theme};
 use super::ElementIndexes;
 use gpui::{
     AnyElement, App, AppContext, AsyncApp, Context, Entity, IntoElement, Pixels, SharedString,
@@ -132,13 +132,14 @@ impl TableDelegate for ComponentTableDelegate {
         _window: &mut Window,
         cx: &mut Context<Table<Self>>,
     ) -> AnyElement {
+        let theme = theme(cx);
         let row = &self.rows[row_ix];
         let row_ref = row.read(cx);
         match col_ix {
             0 => div()
                 .px(px(12.0))
                 .text_size(px(13.0))
-                .text_color(DARK.text_primary)
+                .text_color(theme.text_primary)
                 .child(row_ref.name.clone())
                 .into_any_element(),
             1 => {
@@ -146,7 +147,7 @@ impl TableDelegate for ComponentTableDelegate {
                 div()
                     .px(px(8.0))
                     .text_size(px(13.0))
-                    .text_color(DARK.text_primary)
+                    .text_color(theme.text_primary)
                     .child(SharedString::from(value))
                     .into_any_element()
             }
@@ -155,12 +156,13 @@ impl TableDelegate for ComponentTableDelegate {
                 let plot_bounds = row_ref.sparkline_bounds();
                 let indexes = row_ref.indexes.clone();
                 let row_height = self.row_height();
+                let line_colors = theme.line_colors;
                 canvas(
                     move |bounds, _window, _cx| (bounds, component, plot_bounds, indexes),
                     move |_, (bounds, component, _, indexes), window, _cx| {
                         if let Some(view) = plot_bounds {
                             for (i, &idx) in indexes.iter().enumerate() {
-                                let color = DARK.line_colors[i % DARK.line_colors.len()];
+                                let color = line_colors[i % line_colors.len()];
                                 paint_data_line(bounds, &component, &view, color, px(1.0), idx, window);
                             }
                         }

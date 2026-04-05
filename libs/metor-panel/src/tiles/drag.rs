@@ -2,7 +2,7 @@ use gpui::{Bounds, Entity, IntoElement, Pixels, Point, Render, Window, Context, 
 use super::SplitPath;
 use serde::{Deserialize, Serialize};
 
-use crate::theme::DARK;
+use crate::theme::theme;
 use super::item::PaneItemHandle;
 use super::pane::Pane;
 
@@ -15,14 +15,15 @@ pub struct DraggedTab {
 
 impl Render for DraggedTab {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = theme(cx);
         let title = self.item.tab_title(cx);
         div()
-            .bg(DARK.bg_primary)
+            .bg(theme.bg_primary)
             .border_1()
-            .border_color(DARK.border_primary)
+            .border_color(theme.border_primary)
             .px(px(8.0))
             .py(px(4.0))
-            .text_color(DARK.text_primary)
+            .text_color(theme.text_primary)
             .text_size(px(12.0))
             .child(title)
     }

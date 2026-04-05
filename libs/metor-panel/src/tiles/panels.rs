@@ -212,6 +212,22 @@ pub fn tile_palette_page(
         }));
     }
 
+    items.push(PaletteItem::new("Theme", PaletteAction::NextPage {
+        label: Some("Theme".into()),
+        page: Box::new(|| {
+            let items: Vec<PaletteItem> = crate::theme::all_themes()
+                .iter()
+                .map(|t| {
+                    let theme = Arc::new((*t).clone());
+                    PaletteItem::new(t.name, PaletteAction::Execute(Box::new(move |_, _, cx| {
+                        crate::theme::set_theme(cx, theme.clone());
+                    })))
+                })
+                .collect();
+            PalettePage::new(items).prompt("Select theme")
+        }),
+    }));
+
     PalettePage::new(items).prompt("Command")
 }
 

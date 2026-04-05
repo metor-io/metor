@@ -111,6 +111,10 @@ fn main() {
     Application::new()
         .with_assets(metor_panel::icons::IconAssets)
         .run(move |cx: &mut App| {
+        metor_panel::theme::register_fonts(cx);
+        cx.set_global(metor_panel::theme::ActiveTheme(
+            std::sync::Arc::new(metor_panel::theme::DARK.clone()),
+        ));
         cx.bind_keys([KeyBinding::new("cmd-p", TogglePalette, None)]);
 
         let bounds = Bounds::centered(None, size(px(800.), px(400.)), cx);

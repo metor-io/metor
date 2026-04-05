@@ -6,7 +6,7 @@ use smallvec::SmallVec;
 use std::fmt::Write;
 
 use crate::inspectable::{FieldId, Inspectable, InspectionField, InspectionValue};
-use crate::theme::DARK;
+use crate::theme::theme;
 use crate::{AsComponentView, ComponentStream, ComponentStreamBuilder};
 
 pub mod component_table;
@@ -58,10 +58,11 @@ impl ComponentText {
 }
 
 impl Render for ComponentText {
-    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = theme(cx);
         div()
-            .text_color(DARK.text_primary)
-            .bg(DARK.bg_primary)
+            .text_color(theme.text_primary)
+            .bg(theme.bg_primary)
             .text_size(gpui::px(24.0))
             .size_full()
             .child(

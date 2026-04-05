@@ -4,7 +4,7 @@ use gpui::{
 };
 
 use crate::icons::Icon;
-use crate::theme::DARK;
+use crate::theme::theme;
 
 mod text_field;
 pub use text_field::TextField;
@@ -107,7 +107,7 @@ impl CommandPalette {
             .map(|s| s.to_string())
             .unwrap_or_else(|| "Search...".to_string());
         Self {
-            text_field: TextField::new(prompt),
+            text_field: TextField::new(prompt, cx),
             page_stack: vec![page],
             selected_index: 0,
             list_state: ListState::new(0, ListAlignment::Top, px(100.0)),
@@ -317,7 +317,8 @@ impl CommandPalette {
         }
     }
 
-    fn render_input(&self) -> impl IntoElement {
+    fn render_input(&self, cx: &App) -> impl IntoElement {
+        let theme = theme(cx);
         let len = self.page_stack.len();
 
         let mut row = div()
@@ -330,7 +331,7 @@ impl CommandPalette {
             .gap(px(4.0))
             .w_full()
             .border_b_1()
-            .border_color(DARK.border_primary);
+            .border_color(theme.border_primary);
 
         // Back arrow pill if deeper than root
         if len > 1 {
@@ -342,9 +343,9 @@ impl CommandPalette {
                     .justify_center()
                     .px(px(4.0))
                     .py(px(3.0))
-                    .bg(DARK.pill_bg)
+                    .bg(theme.pill_bg)
                     .border_1()
-                    .border_color(DARK.pill_border)
+                    .border_color(theme.pill_border)
                     .rounded(px(4.0))
                     .child(Icon::ChevronLeft.svg(10.0)),
             );
@@ -358,12 +359,12 @@ impl CommandPalette {
                         .flex_shrink_0()
                         .px(px(8.0))
                         .py(px(2.0))
-                        .bg(DARK.pill_bg)
+                        .bg(theme.pill_bg)
                         .border_1()
-                        .border_color(DARK.pill_border)
+                        .border_color(theme.pill_border)
                         .rounded(px(4.0))
                         .text_size(px(12.0))
-                        .text_color(DARK.text_primary)
+                        .text_color(theme.text_primary)
                         .child(label.clone()),
                 );
             }
@@ -407,6 +408,7 @@ impl CommandPalette {
     }
 
     fn render_items(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = theme(cx);
         let page = match self.current_page() {
             Some(p) => p,
             None => return div().into_any_element(),
@@ -421,7 +423,7 @@ impl CommandPalette {
                         .px(px(12.0))
                         .py(px(6.0))
                         .text_size(px(13.0))
-                        .text_color(DARK.text_tertiary)
+                        .text_color(theme.text_tertiary)
                         .child(SharedString::new_static("No results")),
                 )
                 .into_any_element();
@@ -457,10 +459,10 @@ impl CommandPalette {
         }
 
         let this = cx.entity().downgrade();
-        list(self.list_state.clone(), move |i, _window, _cx| {
+        list(self.list_state.clone(), move |i, _window, cx| {
             let (ref label, selected, ref pills) = rows[i];
             let this = this.clone();
-            Self::render_item_row(label.clone(), selected, pills, i, this).into_any_element()
+            Self::render_item_row(label.clone(), selected, pills, i, this, cx).into_any_element()
         })
         .flex_1()
         .py(px(4.0))
@@ -473,17 +475,20 @@ impl CommandPalette {
         pills: &[SharedString],
         row_index: usize,
         this: gpui::WeakEntity<Self>,
+        cx: &App,
     ) -> impl IntoElement {
+        let theme = theme(cx);
         let bg = if selected {
-            DARK.selection_bg
+            theme.selection_bg
         } else {
             Hsla::transparent_black()
         };
         let text_color = if selected {
-            DARK.text_primary
+            theme.text_primary
         } else {
-            DARK.text_secondary
+            theme.text_secondary
         };
+        let selection_bg = theme.selection_bg;
 
         let mut row = div()
             .id(("palette-row", row_index))
@@ -492,7 +497,7 @@ impl CommandPalette {
             .w_full()
             .bg(bg)
             .cursor_pointer()
-            .hover(|s| s.bg(DARK.selection_bg))
+            .hover(|s| s.bg(selection_bg))
             .text_size(px(14.0))
             .text_color(text_color)
             .on_mouse_down(gpui::MouseButton::Left, move |_event, window, cx| {
@@ -505,6 +510,9 @@ impl CommandPalette {
             .child(label);
 
         if !pills.is_empty() {
+            let pill_bg = theme.pill_bg;
+            let pill_border = theme.pill_border;
+            let pill_text = theme.text_primary;
             let mut pill_row = div().flex().flex_row().flex_wrap().gap(px(4.0)).pt(px(4.0));
             for pill in pills {
                 pill_row = pill_row.child(
@@ -512,12 +520,12 @@ impl CommandPalette {
                         .flex_shrink_0()
                         .px(px(6.0))
                         .py(px(1.0))
-                        .bg(DARK.pill_bg)
+                        .bg(pill_bg)
                         .border_1()
-                        .border_color(DARK.pill_border)
+                        .border_color(pill_border)
                         .rounded(px(4.0))
                         .text_size(px(11.0))
-                        .text_color(DARK.text_primary)
+                        .text_color(pill_text)
                         .child(pill.clone()),
                 );
             }
@@ -540,6 +548,8 @@ impl Render for CommandPalette {
         if self.dismissed {
             return div().into_any_element();
         }
+
+        let theme = theme(cx);
 
         deferred(
             div()
@@ -564,12 +574,12 @@ impl Render for CommandPalette {
                         }))
                         .w(px(500.0))
                         .max_h(px(400.0))
-                        .bg(DARK.bg_elevated)
+                        .bg(theme.bg_elevated)
                         .border_1()
-                        .border_color(DARK.border_primary)
+                        .border_color(theme.border_primary)
                         .rounded(px(8.0))
                         .overflow_hidden()
-                        .child(self.render_input())
+                        .child(self.render_input(cx))
                         .child(self.render_items(cx)),
                 ),
         )

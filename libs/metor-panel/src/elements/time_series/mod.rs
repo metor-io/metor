@@ -291,7 +291,7 @@ fn paint_plot<'a>(
     let traces: Vec<_> = traces.collect();
     let pb = plot_area(outer_bounds);
 
-    let theme = &crate::theme::DARK;
+    let theme = crate::theme::theme(cx);
     let label_font_size = px(LABEL_FONT_SIZE);
     let text_style = window.text_style();
     let font = text_style.font();
@@ -813,7 +813,7 @@ impl TimeSeriesPlot {
         } else {
             indexes
         };
-        let theme = &crate::theme::DARK;
+        let theme = crate::theme::theme(cx);
         let elem_names = crate::trace_picker::element_names_for_component(&db, component_id);
         let comp_name = db
             .with_state(|s| {
@@ -1010,7 +1010,7 @@ impl Render for TimeSeriesPlot {
         let data_start = self.time_range().map(|(s, _)| s).unwrap_or(0.0);
         let traces = self.traces.clone();
         let show_legend = self.resolved_traces().count() >= 2;
-        let theme = &crate::theme::DARK;
+        let theme = crate::theme::theme(cx);
 
         let mut root = div()
             .flex()
@@ -1278,7 +1278,7 @@ impl Inspectable for TimeSeriesPlot {
     fn set_field(&mut self, field_id: FieldId, value: InspectionValue, cx: &mut Context<Self>) {
         match (field_id, value) {
             (FieldId(0), InspectionValue::Traces(selections)) => {
-                let theme = &crate::theme::DARK;
+                let theme = crate::theme::theme(cx);
                 let new_traces: Vec<Trace> = selections
                     .into_iter()
                     .enumerate()

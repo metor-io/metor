@@ -21,6 +21,10 @@ fn main() {
     Application::new()
         .with_assets(metor_panel::icons::IconAssets)
         .run(move |cx: &mut App| {
+        metor_panel::theme::register_fonts(cx);
+        cx.set_global(metor_panel::theme::ActiveTheme(
+            std::sync::Arc::new(metor_panel::theme::DARK.clone()),
+        ));
         let bounds = Bounds::centered(None, size(px(800.), px(600.)), cx);
         let db = db.clone();
         cx.open_window(
