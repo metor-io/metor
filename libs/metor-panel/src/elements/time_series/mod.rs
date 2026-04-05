@@ -405,61 +405,23 @@ fn paint_trace(
     }
 }
 
-/// Decimation state that tracks min/max per pixel-width bucket.
-/// Call `push` for each point in chronological order, then `flush` at the end.
-struct Decimator {
-    bucket_width: f64,
-    bucket_start: f64,
-    min_pt: Option<(f64, f64)>,
-    max_pt: Option<(f64, f64)>,
-    output: Vec<(f64, f64)>,
+/// Count visible data points for a component within the view range.
+fn count_points(component: &Component, view: &PlotBounds) -> usize {
+    let start_ts = Timestamp(view.min_x as i64);
+    let end_ts = Timestamp(view.max_x as i64);
+    match component.time_series.get_range(start_ts..end_ts) {
+        Some(slice) => slice.len(),
+        None => 0,
+    }
 }
 
-impl Decimator {
-    fn new(t_min: f64, t_max: f64, pixel_budget: usize) -> Self {
-        let range = t_max - t_min;
-        let bucket_count = (pixel_budget / 2).max(1);
-        Self {
-            bucket_width: if range > 0.0 { range / bucket_count as f64 } else { f64::MAX },
-            bucket_start: t_min,
-            min_pt: None,
-            max_pt: None,
-            output: Vec::with_capacity(pixel_budget),
-        }
-    }
-
-    fn push(&mut self, t: f64, v: f64) {
-        // Flush completed buckets
-        while t >= self.bucket_start + self.bucket_width {
-            self.emit_bucket();
-            self.bucket_start += self.bucket_width;
-        }
-        match self.min_pt {
-            None => { self.min_pt = Some((t, v)); self.max_pt = Some((t, v)); }
-            Some(cur) => {
-                if v < cur.1 { self.min_pt = Some((t, v)); }
-                if v > self.max_pt.unwrap().1 { self.max_pt = Some((t, v)); }
-            }
-        }
-    }
-
-    fn flush(mut self) -> Vec<(f64, f64)> {
-        self.emit_bucket();
-        self.output
-    }
-
-    fn emit_bucket(&mut self) {
-        if let (Some(mn), Some(mx)) = (self.min_pt.take(), self.max_pt.take()) {
-            if mn.0 == mx.0 {
-                self.output.push(mn);
-            } else if mn.0 <= mx.0 {
-                self.output.push(mn);
-                self.output.push(mx);
-            } else {
-                self.output.push(mx);
-                self.output.push(mn);
-            }
-        }
+/// Compute the decimation stride: how many source points to group into one
+/// output bucket. Returns 1 when no decimation is needed.
+fn decimation_stride(point_count: usize, pixel_budget: usize) -> usize {
+    if pixel_budget == 0 || point_count <= pixel_budget {
+        1
+    } else {
+        point_count / pixel_budget
     }
 }
 
@@ -478,21 +440,24 @@ fn paint_scatter(
     };
     let schema = &component.schema;
     let radius = px(3.0);
-    let mut last_bucket: Option<i32> = None;
+    let pixel_budget = f32::from(screen_bounds.size.width) as usize;
+    let stride = decimation_stride(count_points(component, view), pixel_budget);
+    let mut skip = 0usize;
 
-    // Order doesn't matter for scatter — iterate forward, skip same-pixel points
+    // Order doesn't matter for scatter — iterate forward, skip by stride
     for node_slice in slice.as_iter() {
         for (ts, cv) in node_slice.iter_values(schema) {
+            if skip > 0 {
+                skip -= 1;
+                continue;
+            }
+            skip = stride - 1;
+
             let v = match cv.get(element_index) {
                 Some(ev) => ev.as_f64(),
                 None => continue,
             };
             let pt = view.to_screen(screen_bounds, ts.0 as f64, v);
-            let bucket = f32::from(pt.x) as i32;
-            if last_bucket == Some(bucket) {
-                continue;
-            }
-            last_bucket = Some(bucket);
 
             let mut path = PathBuilder::fill();
             path.move_to(point(pt.x, pt.y - radius));
@@ -523,23 +488,8 @@ fn paint_bars(
     let schema = &component.schema;
     let node_slices: Vec<_> = slice.as_iter().collect();
     let pixel_budget = f32::from(screen_bounds.size.width) as usize;
-
-    let mut decimator = Decimator::new(view.min_x, view.max_x, pixel_budget);
-    for node_slice in node_slices.iter().rev() {
-        for (ts, cv) in node_slice.iter_values(schema) {
-            if let Some(ev) = cv.get(element_index) {
-                decimator.push(ts.0 as f64, ev.as_f64());
-            }
-        }
-    }
-    let points = decimator.flush();
-    if points.is_empty() {
-        return;
-    }
-
-    let max_bar_width = px(20.0);
-    let bar_half =
-        (screen_bounds.size.width / (points.len() as f32 * 2.0)).min(max_bar_width / 2.0);
+    let total = count_points(component, view);
+    let stride = decimation_stride(total, pixel_budget);
 
     let baseline = if view.min_y <= 0.0 && view.max_y >= 0.0 {
         0.0
@@ -547,17 +497,26 @@ fn paint_bars(
         view.min_y
     };
     let baseline_y = view.to_screen(screen_bounds, view.min_x, baseline).y;
+    let bar_count = if stride > 0 { (total / stride).max(1) } else { total };
+    let max_bar_width = px(20.0);
+    let bar_half =
+        (screen_bounds.size.width / (bar_count as f32 * 2.0)).min(max_bar_width / 2.0);
 
-    for (t, v) in &points {
-        let top = view.to_screen(screen_bounds, *t, *v);
-        let mut path = PathBuilder::fill();
+    // Within each stride-group, pick the last timestamp and the mean value
+    let mut group_count = 0usize;
+    let mut group_t = 0.0f64;
+    let mut group_v = 0.0f64;
+
+    let emit_bar = |t: f64, v: f64, window: &mut Window| {
+        let top = view.to_screen(screen_bounds, t, v);
         let left = top.x - bar_half;
         let right = top.x + bar_half;
-        let (top_y, bot_y) = if *v >= baseline {
+        let (top_y, bot_y) = if v >= baseline {
             (top.y, baseline_y)
         } else {
             (baseline_y, top.y)
         };
+        let mut path = PathBuilder::fill();
         path.move_to(point(left, top_y));
         path.line_to(point(right, top_y));
         path.line_to(point(right, bot_y));
@@ -566,6 +525,26 @@ fn paint_bars(
         if let Ok(path) = path.build() {
             window.paint_path(path, color);
         }
+    };
+
+    for node_slice in node_slices.iter().rev() {
+        for (ts, cv) in node_slice.iter_values(schema) {
+            let v = match cv.get(element_index) {
+                Some(ev) => ev.as_f64(),
+                None => continue,
+            };
+            group_t = ts.0 as f64;
+            group_v += v;
+            group_count += 1;
+            if group_count >= stride {
+                emit_bar(group_t, group_v / group_count as f64, window);
+                group_count = 0;
+                group_v = 0.0;
+            }
+        }
+    }
+    if group_count > 0 {
+        emit_bar(group_t, group_v / group_count as f64, window);
     }
 }
 
@@ -574,6 +553,10 @@ fn paint_bars(
 /// `element_index` selects which element of a multi-element component to plot
 /// (e.g. index 0, 1, 2 for a Vec3). Does not clip — caller should wrap in
 /// `with_content_mask` if needed.
+///
+/// Uses stride-based min/max decimation: within each stride-sized group of
+/// points, emits the min and max values to the path. This preserves spikes
+/// without allocating an intermediate buffer.
 pub fn paint_data_line(
     screen_bounds: Bounds<Pixels>,
     component: &Component,
@@ -591,33 +574,77 @@ pub fn paint_data_line(
     let schema = &component.schema;
     let node_slices: Vec<_> = slice.as_iter().collect();
     let pixel_budget = f32::from(screen_bounds.size.width) as usize;
+    let stride = decimation_stride(count_points(component, view), pixel_budget);
 
-    let mut decimator = Decimator::new(view.min_x, view.max_x, pixel_budget * 2);
+    let mut path = PathBuilder::stroke(stroke_width);
+    let mut first = true;
+
+    // When stride <= 1, draw every point. Otherwise, for each group of
+    // `stride` points, emit min then max (ordered by timestamp) to preserve
+    // the visual envelope of the signal.
+    let mut group_count = 0usize;
+    let mut min_v = f64::INFINITY;
+    let mut max_v = f64::NEG_INFINITY;
+    let mut min_t = 0.0f64;
+    let mut max_t = 0.0f64;
+
+    let emit = |t: f64, v: f64, first: &mut bool, path: &mut PathBuilder| {
+        let pt = view.to_screen(screen_bounds, t, v);
+        if *first {
+            path.move_to(pt);
+            *first = false;
+        } else {
+            path.line_to(pt);
+        }
+    };
+
     for node_slice in node_slices.iter().rev() {
         for (ts, cv) in node_slice.iter_values(schema) {
-            if let Some(ev) = cv.get(element_index) {
-                decimator.push(ts.0 as f64, ev.as_f64());
+            let v = match cv.get(element_index) {
+                Some(ev) => ev.as_f64(),
+                None => continue,
+            };
+            let t = ts.0 as f64;
+
+            if stride <= 1 {
+                emit(t, v, &mut first, &mut path);
+                continue;
+            }
+
+            if v < min_v { min_v = v; min_t = t; }
+            if v > max_v { max_v = v; max_t = t; }
+            group_count += 1;
+
+            if group_count >= stride {
+                // Emit min and max in chronological order
+                if min_t <= max_t {
+                    emit(min_t, min_v, &mut first, &mut path);
+                    if min_t != max_t { emit(max_t, max_v, &mut first, &mut path); }
+                } else {
+                    emit(max_t, max_v, &mut first, &mut path);
+                    emit(min_t, min_v, &mut first, &mut path);
+                }
+                group_count = 0;
+                min_v = f64::INFINITY;
+                max_v = f64::NEG_INFINITY;
             }
         }
     }
-    let points = decimator.flush();
-
-    if points.is_empty() {
-        return;
-    }
-
-    let mut path = PathBuilder::stroke(stroke_width);
-    for (i, (t, v)) in points.iter().enumerate() {
-        let screen_pt = view.to_screen(screen_bounds, *t, *v);
-        if i == 0 {
-            path.move_to(screen_pt);
+    // Flush remaining group
+    if group_count > 0 && stride > 1 {
+        if min_t <= max_t {
+            emit(min_t, min_v, &mut first, &mut path);
+            if min_t != max_t { emit(max_t, max_v, &mut first, &mut path); }
         } else {
-            path.line_to(screen_pt);
+            emit(max_t, max_v, &mut first, &mut path);
+            emit(min_t, min_v, &mut first, &mut path);
         }
     }
 
-    if let Ok(path) = path.build() {
-        window.paint_path(path, color);
+    if !first {
+        if let Ok(path) = path.build() {
+            window.paint_path(path, color);
+        }
     }
 }
 
