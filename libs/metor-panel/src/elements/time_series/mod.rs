@@ -355,7 +355,6 @@ fn paint_plot<'a>(
         }
     }
 
-    // Axis frame
     let mut axes = PathBuilder::stroke(px(1.0));
     axes.move_to(point(pb.origin.x, pb.origin.y));
     axes.line_to(point(pb.origin.x, pb.origin.y + pb.size.height));

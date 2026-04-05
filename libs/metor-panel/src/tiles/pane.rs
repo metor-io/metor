@@ -89,7 +89,7 @@ impl Pane {
         cx: &mut Context<Self>,
     ) {
         self.drag_split_direction = None;
-        self.move_or_insert_tab(dragged, target_ix, cx);
+        self.drop_tab(dragged, target_ix, cx);
     }
 
     /// Handle a drop on the content area — check split zones first.
@@ -101,7 +101,6 @@ impl Pane {
     ) {
         self.drag_split_direction = None;
 
-        // Check for split zone
         if let Some(direction) = detect_split_zone(
             window.mouse_position(),
             self.content_bounds,
@@ -125,11 +124,10 @@ impl Pane {
             return;
         }
 
-        // Center zone: add as a tab
-        self.move_or_insert_tab(dragged, self.items.len(), cx);
+        self.drop_tab(dragged, self.items.len(), cx);
     }
 
-    fn move_or_insert_tab(
+    fn drop_tab(
         &mut self,
         dragged: &DraggedTab,
         target_ix: usize,
@@ -209,12 +207,10 @@ impl Pane {
                 .hover(|s| s.bg(DARK.bg_primary).text_color(DARK.text_primary));
         }
 
-        // Click to activate
         tab = tab.on_click(cx.listener(move |this, _, _, cx| {
             this.activate_item(ix, cx);
         }));
 
-        // Right-click to inspect/edit
         tab = tab.on_mouse_down(
             MouseButton::Right,
             cx.listener(move |this, _, _, cx| {
@@ -225,7 +221,6 @@ impl Pane {
             }),
         );
 
-        // Drag this tab
         tab = tab.on_drag(
             DraggedTab {
                 pane: pane_entity,
@@ -239,20 +234,16 @@ impl Pane {
             }),
         );
 
-        // Drop target for reordering (tab bar — never splits)
         tab = tab.on_drop(cx.listener(move |this, dragged: &DraggedTab, window, cx| {
             this.handle_tab_bar_drop(dragged, ix, window, cx);
         }));
 
-        // Drag-over highlight
         tab = tab.drag_over::<DraggedTab>(|style, _, _, _| {
             style.bg(DARK.border_primary)
         });
 
-        // Tab label
         tab = tab.child(title);
 
-        // Close button
         if can_close {
             tab = tab.child(
                 div()
@@ -316,7 +307,6 @@ impl Pane {
 
 impl Render for Pane {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        // Tab bar
         let mut tab_bar = div()
             .flex()
             .flex_row()
@@ -327,13 +317,11 @@ impl Render for Pane {
             .border_color(DARK.border_primary)
             .overflow_x_hidden();
 
-        // Drop target at end of tab bar (to drop as last tab)
         let tab_count = self.items.len();
         for ix in 0..tab_count {
             tab_bar = tab_bar.child(self.render_tab(ix, window, cx));
         }
 
-        // Empty space drop target in tab bar
         tab_bar = tab_bar.child(
             div()
                 .id("tab-bar-drop-zone")
@@ -347,7 +335,6 @@ impl Render for Pane {
                 }),
         );
 
-        // Content area
         let view = cx.entity().clone();
         let content_bounds_tracker = gpui::canvas(
             move |bounds, _window, cx| {
@@ -370,7 +357,6 @@ impl Render for Pane {
             .bg(DARK.bg_primary)
             .child(content_bounds_tracker);
 
-        // Render active item
         if let Some(item) = self.items.get(self.active_index) {
             content = content.child(item.view());
         }
@@ -382,7 +368,6 @@ impl Render for Pane {
             }))
             .on_drag_move(cx.listener(Self::handle_content_drag_move));
 
-        // Split direction overlay
         if let Some(overlay) = self.render_split_overlay() {
             content = content.child(overlay);
         }

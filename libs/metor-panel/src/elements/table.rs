@@ -18,7 +18,7 @@ pub enum ColumnSort {
 }
 
 impl ColumnSort {
-    fn next(self) -> Self {
+    fn cycle(self) -> Self {
         match self {
             Self::Default => Self::Descending,
             Self::Descending => Self::Ascending,
@@ -151,8 +151,8 @@ impl<D: TableDelegate> Table<D> {
         }
     }
 
-    fn perform_sort(&mut self, col_ix: usize, cx: &App) {
-        let new_sort = self.col_states[col_ix].sort.next();
+    fn apply_sort(&mut self, col_ix: usize, cx: &App) {
+        let new_sort = self.col_states[col_ix].sort.cycle();
         for (ix, state) in self.col_states.iter_mut().enumerate() {
             if ix == col_ix {
                 state.sort = new_sort;
@@ -191,7 +191,7 @@ impl<D: TableDelegate> Table<D> {
             cell = cell
                 .cursor_pointer()
                 .on_click(cx.listener(move |this, _, _, cx| {
-                    this.perform_sort(col_ix, cx);
+                    this.apply_sort(col_ix, cx);
                     cx.notify();
                 }));
         }

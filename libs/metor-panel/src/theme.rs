@@ -57,7 +57,6 @@ pub static DARK: Theme = Theme {
         a: 1.0,
     },
 
-    // Pumpkin orange line
     line_color: Hsla {
         h: 0.069,
         s: 1.0,
@@ -65,22 +64,14 @@ pub static DARK: Theme = Theme {
         a: 1.0,
     },
     line_colors: [
-        // orange (same as line_color)
-        Hsla { h: 0.069, s: 1.0, l: 0.56, a: 1.0 },
-        // blue
-        Hsla { h: 0.583, s: 0.8, l: 0.56, a: 1.0 },
-        // green
-        Hsla { h: 0.333, s: 0.7, l: 0.50, a: 1.0 },
-        // red
-        Hsla { h: 0.0, s: 0.8, l: 0.55, a: 1.0 },
-        // purple
-        Hsla { h: 0.75, s: 0.7, l: 0.60, a: 1.0 },
-        // cyan
-        Hsla { h: 0.5, s: 0.7, l: 0.55, a: 1.0 },
-        // yellow
-        Hsla { h: 0.15, s: 0.9, l: 0.55, a: 1.0 },
-        // pink
-        Hsla { h: 0.917, s: 0.7, l: 0.60, a: 1.0 },
+        Hsla { h: 0.069, s: 1.0, l: 0.56, a: 1.0 }, // orange
+        Hsla { h: 0.583, s: 0.8, l: 0.56, a: 1.0 }, // blue
+        Hsla { h: 0.333, s: 0.7, l: 0.50, a: 1.0 }, // green
+        Hsla { h: 0.0,   s: 0.8, l: 0.55, a: 1.0 }, // red
+        Hsla { h: 0.75,  s: 0.7, l: 0.60, a: 1.0 }, // purple
+        Hsla { h: 0.5,   s: 0.7, l: 0.55, a: 1.0 }, // cyan
+        Hsla { h: 0.15,  s: 0.9, l: 0.55, a: 1.0 }, // yellow
+        Hsla { h: 0.917, s: 0.7, l: 0.60, a: 1.0 }, // pink
     ],
     grid_color: Hsla {
         h: 0.083,

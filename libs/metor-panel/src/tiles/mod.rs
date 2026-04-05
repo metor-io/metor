@@ -91,7 +91,6 @@ impl Member {
                         }
                     }
                 }
-                // Recurse into children
                 for member in &mut axis.members {
                     if member.split(target, new_pane, direction) {
                         return true;
@@ -114,7 +113,6 @@ impl Member {
                     axis.flexes.remove(ix);
                     true
                 } else {
-                    // Recurse
                     for member in &mut axis.members {
                         if member.remove(target) {
                             return true;
@@ -133,7 +131,6 @@ impl Member {
             for member in &mut axis.members {
                 member.collapse();
             }
-            // If only one child remains, replace axis with that child
             if axis.members.len() == 1 {
                 *self = axis.members.remove(0);
             }
@@ -376,7 +373,6 @@ impl TileGroup {
             panes: Vec::new(),
             axis_bounds: Default::default(),
         };
-        // Subscribe to all panes
         for pane in &panes {
             cx.subscribe(pane, Self::handle_pane_event).detach();
         }
