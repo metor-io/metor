@@ -52,9 +52,10 @@ impl ExampleRoot {
     }
 
     fn make_on_inspect(root: Entity<ExampleRoot>) -> impl Fn(PalettePage, &mut Window, &mut App) + 'static {
-        move |page, window, cx| {
+        move |page, _window, cx| {
             root.update(cx, |this, cx| {
-                this.open_palette(page, window, cx);
+                this.pending_inspect = Some(page);
+                cx.notify();
             });
         }
     }

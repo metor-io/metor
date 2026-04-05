@@ -317,7 +317,7 @@ pub fn palette_page_for_field<T: Inspectable>(
 }
 
 /// Render a palette page for a single item inside a `List`, showing its sub-fields.
-fn palette_page_for_list_item<T: Inspectable>(
+pub fn palette_page_for_list_item<T: Inspectable>(
     entity: Entity<T>,
     fields: &[InspectionField],
     label: SharedString,

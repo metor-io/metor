@@ -696,8 +696,13 @@ pub struct TimeSeriesPlot {
     x_range: TimeRangeBehavior,
     y_min_override: Option<f64>,
     y_max_override: Option<f64>,
+    on_open_page: Option<OpenPageCallback>,
     _tasks: Vec<gpui::Task<()>>,
 }
+
+/// Callback type for when the plot wants to open an inspector page.
+pub type OpenPageCallback =
+    Arc<dyn Fn(crate::command_palette::PalettePage, &mut Window, &mut gpui::App) + 'static>;
 
 impl TimeSeriesPlot {
     pub fn new(db: Arc<DB>, traces: Vec<Trace>, cx: &mut Context<Self>) -> Self {
@@ -717,8 +722,13 @@ impl TimeSeriesPlot {
             x_range: TimeRangeBehavior::default(),
             y_min_override: None,
             y_max_override: None,
+            on_open_page: None,
             _tasks: tasks,
         }
+    }
+
+    pub fn set_on_open_page(&mut self, cb: OpenPageCallback) {
+        self.on_open_page = Some(cb);
     }
 
     /// Convenience: create a plot for a single component with the given element
@@ -883,6 +893,43 @@ impl TimeSeriesPlot {
             Some(PlotBounds::new(range.start.0 as f64, min_y, range.end.0 as f64, max_y).normalize())
         })
     }
+
+    fn trace_inspect_page(
+        &self,
+        trace_idx: usize,
+        cx: &Context<Self>,
+    ) -> crate::command_palette::PalettePage {
+        use crate::inspectable::palette_page_for_list_item;
+
+        let rt = self.traces[trace_idx].as_ref().unwrap();
+        let base = TRACE_SETTINGS_BASE + trace_idx as u32 * 100;
+        let fields = vec![
+            InspectionField {
+                label: "Style".into(),
+                field_id: FieldId(base + TRACE_SUB_STYLE),
+                value: InspectionValue::Enum {
+                    selected: rt.trace.style.label().to_string(),
+                    options: PlotStyle::ALL.iter().map(|s| s.label().to_string()).collect(),
+                },
+            },
+            InspectionField {
+                label: "Color".into(),
+                field_id: FieldId(base + TRACE_SUB_COLOR),
+                value: InspectionValue::Color(rt.trace.color),
+            },
+            InspectionField {
+                label: "Visible".into(),
+                field_id: FieldId(base + TRACE_SUB_VISIBLE),
+                value: InspectionValue::Bool(rt.trace.visible),
+            },
+            InspectionField {
+                label: "Width".into(),
+                field_id: FieldId(base + TRACE_SUB_STROKE_WIDTH),
+                value: InspectionValue::F64(rt.trace.stroke_width as f64),
+            },
+        ];
+        palette_page_for_list_item(cx.entity().clone(), &fields, rt.trace.label.clone(), None)
+    }
 }
 
 impl Render for TimeSeriesPlot {
@@ -1017,6 +1064,15 @@ impl Render for TimeSeriesPlot {
                                 if let Some(Some(resolved)) = this.traces.get_mut(i) {
                                     resolved.trace.visible = !resolved.trace.visible;
                                     cx.notify();
+                                }
+                            }),
+                        )
+                        .on_mouse_down(
+                            MouseButton::Right,
+                            cx.listener(move |this, _event: &gpui::MouseDownEvent, window, cx| {
+                                if let Some(cb) = &this.on_open_page {
+                                    let page = this.trace_inspect_page(i, cx);
+                                    cb(page, window, cx);
                                 }
                             }),
                         )

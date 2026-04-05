@@ -18,7 +18,7 @@ pub type ElementIndexes = SmallVec<[usize; 8]>;
 
 pub use component_table::{ComponentTable, new_component_table};
 pub use table::{Column, ColumnSort, Table, TableDelegate};
-pub use time_series::{PlotStyle, TimeSeriesPlot, Trace};
+pub use time_series::{OpenPageCallback, PlotStyle, TimeSeriesPlot, Trace};
 
 /// Displays a single component's latest value as text, updating reactively.
 pub struct ComponentText {

@@ -5,6 +5,7 @@ use metor_db::DB;
 use metor_proto::types::ComponentId;
 
 use crate::command_palette::{PaletteAction, PaletteItem, PalettePage};
+use crate::elements::time_series::OpenPageCallback;
 use crate::elements::{ComponentTable, ComponentText, TimeSeriesPlot, new_component_table};
 use crate::inspectable::{palette_page_for_inspectable, palette_page_for_field, FieldId, InspectionValue};
 
@@ -130,6 +131,13 @@ impl PlotPanel {
     pub(crate) fn db(&self) -> &Arc<DB> {
         &self.db
     }
+
+    /// Wire up the callback so right-clicking a legend item opens its inspector.
+    pub fn set_on_open_page(&self, cb: OpenPageCallback, cx: &mut App) {
+        self.inner.update(cx, |plot, _cx| {
+            plot.set_on_open_page(cb);
+        });
+    }
 }
 
 impl Render for PlotPanel {
@@ -223,8 +231,16 @@ fn new_panel_page(
                     let db = db.clone();
                     cx.new(|cx| PlotPanel::empty(db, cx))
                 };
-                let inner = plot_panel.read(cx).inner().clone();
-                let plot_db = plot_panel.read(cx).db().clone();
+                let (inner, plot_db) = {
+                    let panel = plot_panel.read(cx);
+                    (panel.inner().clone(), panel.db().clone())
+                };
+
+                let cb: OpenPageCallback = Arc::new({
+                    let on_inspect = on_inspect.clone();
+                    move |page, window, cx| on_inspect(page, window, cx)
+                });
+                inner.update(cx, |plot, _cx| plot.set_on_open_page(cb));
 
                 pane.update(cx, |pane, cx| {
                     pane.add_item(Box::new(plot_panel), cx);
