@@ -3,7 +3,8 @@ use std::sync::Arc;
 
 use gpui::{
     App, Application, Bounds, Context, Entity, FocusHandle, Focusable, IntoElement, KeyBinding,
-    Render, Window, WindowBounds, WindowOptions, actions, div, prelude::*, px, size,
+    Render, TitlebarOptions, Window, WindowBounds, WindowOptions, actions, div, point, prelude::*,
+    px, size,
 };
 use metor_db::{DB, Server};
 use metor_panel::command_palette::{CommandPalette, PalettePage};
@@ -12,6 +13,8 @@ use metor_panel::tiles::{TileGroup, TileGroupEvent};
 use stellarator::{net::TcpListener, struc_con::stellar};
 
 actions!(tiles_example, [OpenPalette]);
+
+const TAB_BAR_INSET: f32 = 36.0;
 
 struct ExampleRoot {
     db: Arc<DB>,
@@ -118,13 +121,25 @@ impl Render for ExampleRoot {
             self.open_palette(page, window, cx);
         }
 
+        let theme = metor_panel::theme::theme(cx);
         let mut root = div()
             .id("tiles-root")
             .track_focus(&self.focus_handle)
             .on_action(cx.listener(Self::toggle_palette))
-            .font_family(metor_panel::theme::DARK.font_family)
+            .font_family(theme.font_family)
+            .flex()
+            .flex_col()
             .size_full()
-            .child(self.tiles.clone());
+            .child(
+                div()
+                    .bg(theme.bg_secondary)
+                    .border_b_1()
+                    .border_color(theme.border_primary)
+                    .w_full()
+                    .flex_shrink_0()
+                    .h(px(TAB_BAR_INSET)),
+            )
+            .child(div().flex_1().min_h_0().child(self.tiles.clone()));
 
         if let Some(palette) = &self.palette {
             root = root.child(palette.clone());
@@ -150,9 +165,9 @@ fn main() {
         .with_assets(metor_panel::icons::IconAssets)
         .run(move |cx: &mut App| {
             metor_panel::theme::register_fonts(cx);
-            cx.set_global(metor_panel::theme::ActiveTheme(
-                std::sync::Arc::new(metor_panel::theme::DARK.clone()),
-            ));
+            cx.set_global(metor_panel::theme::ActiveTheme(std::sync::Arc::new(
+                metor_panel::theme::DARK.clone(),
+            )));
             cx.bind_keys([KeyBinding::new("cmd-p", OpenPalette, None)]);
 
             let bounds = Bounds::centered(None, size(px(1024.), px(600.)), cx);
@@ -160,6 +175,11 @@ fn main() {
             cx.open_window(
                 WindowOptions {
                     window_bounds: Some(WindowBounds::Windowed(bounds)),
+                    titlebar: Some(TitlebarOptions {
+                        appears_transparent: true,
+                        traffic_light_position: Some(point(px(12.0), px(8.0))),
+                        ..Default::default()
+                    }),
                     ..Default::default()
                 },
                 move |_window, cx| cx.new(|cx| ExampleRoot::new(db, cx)),
