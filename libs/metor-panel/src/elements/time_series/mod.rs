@@ -394,7 +394,7 @@ fn paint_trace(
 ) {
     match trace.style {
         PlotStyle::Line => {
-            paint_data_line(screen_bounds, component, view, trace.color, px(1.5), trace.element_index, window);
+            paint_data_line(screen_bounds, component, view, trace.color, px(trace.stroke_width), trace.element_index, window);
         }
         PlotStyle::Scatter => {
             paint_scatter(screen_bounds, component, view, trace.color, trace.element_index, window);
@@ -660,6 +660,7 @@ pub struct Trace {
     pub style: PlotStyle,
     pub visible: bool,
     pub label: SharedString,
+    pub stroke_width: f32,
 }
 
 impl Trace {
@@ -671,6 +672,7 @@ impl Trace {
             style: PlotStyle::default(),
             visible: true,
             label: SharedString::new_static(""),
+            stroke_width: 1.5,
         }
     }
 }
@@ -756,6 +758,7 @@ impl TimeSeriesPlot {
                     style: PlotStyle::default(),
                     visible: true,
                     label: SharedString::from(label),
+                    stroke_width: 1.5,
                 }
             })
             .collect();
@@ -1045,6 +1048,7 @@ const TRACE_SETTINGS_BASE: u32 = 100;
 const TRACE_SUB_STYLE: u32 = 0;
 const TRACE_SUB_COLOR: u32 = 1;
 const TRACE_SUB_VISIBLE: u32 = 2;
+const TRACE_SUB_STROKE_WIDTH: u32 = 3;
 
 impl Inspectable for TimeSeriesPlot {
     fn fields(&self) -> Vec<InspectionField> {
@@ -1090,6 +1094,11 @@ impl Inspectable for TimeSeriesPlot {
                             label: "Visible".into(),
                             field_id: FieldId(base + TRACE_SUB_VISIBLE),
                             value: InspectionValue::Bool(rt.trace.visible),
+                        },
+                        InspectionField {
+                            label: "Width".into(),
+                            field_id: FieldId(base + TRACE_SUB_STROKE_WIDTH),
+                            value: InspectionValue::F64(rt.trace.stroke_width as f64),
                         },
                     ],
                 })
@@ -1153,6 +1162,7 @@ impl Inspectable for TimeSeriesPlot {
                             style: PlotStyle::default(),
                             visible: true,
                             label: SharedString::from(label),
+                            stroke_width: 1.5,
                         }
                     })
                     .collect();
@@ -1192,6 +1202,9 @@ impl Inspectable for TimeSeriesPlot {
                         }
                         (TRACE_SUB_VISIBLE, InspectionValue::Bool(b)) => {
                             resolved.trace.visible = b;
+                        }
+                        (TRACE_SUB_STROKE_WIDTH, InspectionValue::F64(w)) => {
+                            resolved.trace.stroke_width = (w as f32).clamp(0.5, 10.0);
                         }
                         _ => {}
                     }
