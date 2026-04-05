@@ -6,6 +6,7 @@ use metor_proto::types::{ComponentId, ComponentView, Timestamp};
 pub mod command_palette;
 pub mod elements;
 pub mod inspectable;
+pub mod offset_parse;
 pub mod theme;
 pub mod tiles;
 pub(crate) mod trace_picker;

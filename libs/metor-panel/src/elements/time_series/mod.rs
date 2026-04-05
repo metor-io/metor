@@ -7,7 +7,8 @@ use gpui::{
 use metor_db::{Component, DB};
 use metor_proto::types::{ComponentId, Timestamp};
 
-use crate::inspectable::{FieldId, Inspectable, InspectionField, InspectionValue};
+use crate::inspectable::{FieldId, Inspectable, InspectionField, InspectionValue, ListItem};
+use crate::offset_parse::TimeRangeBehavior;
 use crate::wait_for_component;
 
 mod bounds;
@@ -366,20 +367,142 @@ fn paint_plot<'a>(
         window.paint_path(path, theme.axis_color);
     }
 
-    // Data lines — clipped to plot area
+    // Data traces — clipped to plot area
     window.with_content_mask(Some(gpui::ContentMask { bounds: pb }), |window| {
-        for rt in traces {
-            paint_data_line(
+        for rt in &traces {
+            if !rt.trace.visible {
+                continue;
+            }
+            paint_trace(
                 pb,
                 &rt.component,
                 &view,
-                rt.trace.color,
-                px(1.5),
-                rt.trace.element_index,
+                &rt.trace,
                 window,
             );
         }
     });
+
+}
+
+fn paint_trace(
+    screen_bounds: Bounds<Pixels>,
+    component: &Component,
+    view: &PlotBounds,
+    trace: &Trace,
+    window: &mut Window,
+) {
+    match trace.style {
+        PlotStyle::Line => {
+            paint_data_line(screen_bounds, component, view, trace.color, px(1.5), trace.element_index, window);
+        }
+        PlotStyle::Scatter => {
+            paint_scatter(screen_bounds, component, view, trace.color, trace.element_index, window);
+        }
+        PlotStyle::Bar => {
+            paint_bars(screen_bounds, component, view, trace.color, trace.element_index, window);
+        }
+    }
+}
+
+fn paint_scatter(
+    screen_bounds: Bounds<Pixels>,
+    component: &Component,
+    view: &PlotBounds,
+    color: Hsla,
+    element_index: usize,
+    window: &mut Window,
+) {
+    let start_ts = Timestamp(view.min_x as i64);
+    let end_ts = Timestamp(view.max_x as i64);
+    let Some(slice) = component.time_series.get_range(start_ts..end_ts) else {
+        return;
+    };
+    let schema = &component.schema;
+    let radius = px(3.0);
+    let node_slices: Vec<_> = slice.as_iter().collect();
+
+    for node_slice in node_slices.iter().rev() {
+        for (ts, cv) in node_slice.iter_values(schema) {
+            let v = match cv.get(element_index) {
+                Some(ev) => ev.as_f64(),
+                None => continue,
+            };
+            let pt = view.to_screen(screen_bounds, ts.0 as f64, v);
+            // Diamond shape as a scatter marker
+            let mut path = PathBuilder::fill();
+            path.move_to(point(pt.x, pt.y - radius));
+            path.line_to(point(pt.x + radius, pt.y));
+            path.line_to(point(pt.x, pt.y + radius));
+            path.line_to(point(pt.x - radius, pt.y));
+            path.line_to(point(pt.x, pt.y - radius));
+            if let Ok(path) = path.build() {
+                window.paint_path(path, color);
+            }
+        }
+    }
+}
+
+fn paint_bars(
+    screen_bounds: Bounds<Pixels>,
+    component: &Component,
+    view: &PlotBounds,
+    color: Hsla,
+    element_index: usize,
+    window: &mut Window,
+) {
+    let start_ts = Timestamp(view.min_x as i64);
+    let end_ts = Timestamp(view.max_x as i64);
+    let Some(slice) = component.time_series.get_range(start_ts..end_ts) else {
+        return;
+    };
+    let schema = &component.schema;
+
+    // Collect points to determine bar width
+    let node_slices: Vec<_> = slice.as_iter().collect();
+    let mut points: Vec<(f64, f64)> = Vec::new();
+    for node_slice in node_slices.iter().rev() {
+        for (ts, cv) in node_slice.iter_values(schema) {
+            if let Some(ev) = cv.get(element_index) {
+                points.push((ts.0 as f64, ev.as_f64()));
+            }
+        }
+    }
+    if points.is_empty() {
+        return;
+    }
+
+    // Bar width: fraction of screen width divided by point count, capped
+    let max_bar_width = px(20.0);
+    let bar_half = (screen_bounds.size.width / (points.len() as f32 * 2.0)).min(max_bar_width / 2.0);
+
+    // Baseline: 0 if visible, otherwise min_y
+    let baseline = if view.min_y <= 0.0 && view.max_y >= 0.0 {
+        0.0
+    } else {
+        view.min_y
+    };
+    let baseline_y = view.to_screen(screen_bounds, view.min_x, baseline).y;
+
+    for (t, v) in &points {
+        let top = view.to_screen(screen_bounds, *t, *v);
+        let mut path = PathBuilder::fill();
+        let left = top.x - bar_half;
+        let right = top.x + bar_half;
+        let (top_y, bot_y) = if *v >= baseline {
+            (top.y, baseline_y)
+        } else {
+            (baseline_y, top.y)
+        };
+        path.move_to(point(left, top_y));
+        path.line_to(point(right, top_y));
+        path.line_to(point(right, bot_y));
+        path.line_to(point(left, bot_y));
+        path.line_to(point(left, top_y));
+        if let Ok(path) = path.build() {
+            window.paint_path(path, color);
+        }
+    }
 }
 
 /// Draw a time series data line within the given screen bounds.
@@ -429,12 +552,45 @@ pub fn paint_data_line(
     }
 }
 
-/// A single line on a time series plot: one element index from one component.
+/// How a trace is drawn on the plot.
+#[derive(Clone, Copy, Default, PartialEq)]
+pub enum PlotStyle {
+    #[default]
+    Line,
+    Scatter,
+    Bar,
+}
+
+impl PlotStyle {
+    pub const ALL: [PlotStyle; 3] = [PlotStyle::Line, PlotStyle::Scatter, PlotStyle::Bar];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            PlotStyle::Line => "Line",
+            PlotStyle::Scatter => "Scatter",
+            PlotStyle::Bar => "Bar",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<PlotStyle> {
+        match s.to_lowercase().as_str() {
+            "line" => Some(PlotStyle::Line),
+            "scatter" => Some(PlotStyle::Scatter),
+            "bar" => Some(PlotStyle::Bar),
+            _ => None,
+        }
+    }
+}
+
+/// A single trace on a time series plot: one element index from one component.
 #[derive(Clone)]
 pub struct Trace {
     pub component_id: ComponentId,
     pub element_index: usize,
     pub color: Hsla,
+    pub style: PlotStyle,
+    pub visible: bool,
+    pub label: SharedString,
 }
 
 impl Trace {
@@ -443,6 +599,9 @@ impl Trace {
             component_id: component_id.into(),
             element_index,
             color,
+            style: PlotStyle::default(),
+            visible: true,
+            label: SharedString::new_static(""),
         }
     }
 }
@@ -463,6 +622,9 @@ pub struct TimeSeriesPlot {
     drag_start: Option<Point<Pixels>>,
     drag_start_view: Option<PlotBounds>,
     last_plot_area: Option<Bounds<Pixels>>,
+    x_range: TimeRangeBehavior,
+    y_min_override: Option<f64>,
+    y_max_override: Option<f64>,
     _tasks: Vec<gpui::Task<()>>,
 }
 
@@ -481,6 +643,9 @@ impl TimeSeriesPlot {
             drag_start: None,
             drag_start_view: None,
             last_plot_area: None,
+            x_range: TimeRangeBehavior::default(),
+            y_min_override: None,
+            y_max_override: None,
             _tasks: tasks,
         }
     }
@@ -500,13 +665,29 @@ impl TimeSeriesPlot {
             indexes
         };
         let theme = &crate::theme::DARK;
+        let elem_names = crate::trace_picker::element_names_for_component(&db, component_id);
+        let comp_name = db
+            .with_state(|s| {
+                s.get_component_metadata(component_id)
+                    .map(|m| m.name.clone())
+            })
+            .unwrap_or_default();
         let traces = indexes
             .iter()
             .enumerate()
-            .map(|(i, &idx)| Trace {
-                component_id,
-                element_index: idx,
-                color: theme.line_colors[i % theme.line_colors.len()],
+            .map(|(i, &idx)| {
+                let label = elem_names
+                    .get(idx)
+                    .map(|n| format!("{}.{}", comp_name, n))
+                    .unwrap_or_else(|| format!("{}[{}]", comp_name, idx));
+                Trace {
+                    component_id,
+                    element_index: idx,
+                    color: theme.line_colors[i % theme.line_colors.len()],
+                    style: PlotStyle::default(),
+                    visible: true,
+                    label: SharedString::from(label),
+                }
             })
             .collect();
         Self::new(db, traces, cx)
@@ -611,11 +792,23 @@ impl TimeSeriesPlot {
         }
     }
 
+    fn effective_y_bounds(&self) -> (f64, f64) {
+        let (auto_min, auto_max) = self.merged_y_bounds().unwrap_or((0.0, 1.0));
+        (
+            self.y_min_override.unwrap_or(auto_min),
+            self.y_max_override.unwrap_or(auto_max),
+        )
+    }
+
     fn current_view(&self) -> Option<PlotBounds> {
         self.view.or_else(|| {
-            let (start, end) = self.time_range()?;
-            let (min_y, max_y) = self.merged_y_bounds()?;
-            Some(PlotBounds::new(start, min_y, end, max_y).normalize())
+            let (data_start, data_end) = self.time_range()?;
+            let range = self.x_range.calculate_range(
+                Timestamp(data_start as i64),
+                Timestamp(data_end as i64),
+            );
+            let (min_y, max_y) = self.effective_y_bounds();
+            Some(PlotBounds::new(range.start.0 as f64, min_y, range.end.0 as f64, max_y).normalize())
         })
     }
 }
@@ -625,91 +818,164 @@ impl Render for TimeSeriesPlot {
         let view = self.current_view();
         let data_start = self.time_range().map(|(s, _)| s).unwrap_or(0.0);
         let traces = self.traces.clone();
+        let show_legend = self.resolved_traces().count() >= 2;
+        let theme = &crate::theme::DARK;
 
-        div()
+        let mut root = div()
+            .flex()
+            .flex_col()
             .size_full()
-            .bg(crate::theme::DARK.bg_secondary)
-            .on_mouse_down(
-                MouseButton::Left,
-                cx.listener(|this, event: &gpui::MouseDownEvent, _window, cx| {
-                    if event.click_count == 2 {
-                        this.view = None;
-                        cx.notify();
-                    } else {
-                        this.drag_start = Some(event.position);
-                        this.drag_start_view = this.current_view();
-                    }
-                }),
-            )
-            .on_mouse_up(
-                MouseButton::Left,
-                cx.listener(|this, _event: &gpui::MouseUpEvent, _window, _cx| {
-                    this.drag_start = None;
-                    this.drag_start_view = None;
-                }),
-            )
-            .on_mouse_move(
-                cx.listener(|this, event: &gpui::MouseMoveEvent, _window, cx| {
-                    if !event.dragging() {
-                        return;
-                    }
-                    let (Some(start), Some(start_view), Some(pa)) =
-                        (this.drag_start, this.drag_start_view, this.last_plot_area)
-                    else {
-                        return;
-                    };
-
-                    let dx = event.position.x - start.x;
-                    let dy = event.position.y - start.y;
-                    let (nx, ny) = start_view.screen_delta_to_norm(pa, dx, dy);
-                    this.view = Some(start_view.offset_by_norm(-nx, ny));
-                    cx.notify();
-                }),
-            )
-            .on_scroll_wheel(
-                cx.listener(|this, event: &gpui::ScrollWheelEvent, _window, cx| {
-                    let (Some(view), Some(pa)) = (this.current_view(), this.last_plot_area) else {
-                        return;
-                    };
-
-                    let delta = event.delta.pixel_delta(px(20.0));
-                    let zoom_amount = f32::from(-delta.y) as f64 / 200.0;
-                    let factor = (1.0_f64 + zoom_amount).clamp(0.5, 2.0);
-
-                    let (ax, ay) = view.screen_anchor(pa, event.position);
-                    this.view = Some(view.zoom_at(factor, ax, 1.0 - ay));
-                    cx.notify();
-                }),
-            )
+            .bg(theme.bg_secondary)
             .child(
-                canvas(
-                    {
-                        let this = cx.entity().downgrade();
-                        move |bounds, _window, cx| {
-                            let pa = plot_area(bounds);
-                            let _ = this.update(cx, |this, _cx| {
-                                this.last_plot_area = Some(pa);
-                            });
-                            (bounds, view)
-                        }
-                    },
-                    move |_, (bounds, view), window, cx| {
-                        if let Some(view) = view {
-                            paint_plot(
-                                bounds,
-                                traces.iter().flatten(),
-                                view,
-                                data_start,
-                                window,
-                                cx,
-                            );
-                        }
-                    },
-                )
-                .size_full(),
-            )
+                div()
+                    .flex_1()
+                    .min_h_0()
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(|this, event: &gpui::MouseDownEvent, _window, cx| {
+                            if event.click_count == 2 {
+                                this.view = None;
+                                this.x_range = TimeRangeBehavior::default();
+                                this.y_min_override = None;
+                                this.y_max_override = None;
+                                cx.notify();
+                            } else {
+                                this.drag_start = Some(event.position);
+                                this.drag_start_view = this.current_view();
+                            }
+                        }),
+                    )
+                    .on_mouse_up(
+                        MouseButton::Left,
+                        cx.listener(|this, _event: &gpui::MouseUpEvent, _window, _cx| {
+                            this.drag_start = None;
+                            this.drag_start_view = None;
+                        }),
+                    )
+                    .on_mouse_move(
+                        cx.listener(|this, event: &gpui::MouseMoveEvent, _window, cx| {
+                            if !event.dragging() {
+                                return;
+                            }
+                            let (Some(start), Some(start_view), Some(pa)) =
+                                (this.drag_start, this.drag_start_view, this.last_plot_area)
+                            else {
+                                return;
+                            };
+
+                            let dx = event.position.x - start.x;
+                            let dy = event.position.y - start.y;
+                            let (nx, ny) = start_view.screen_delta_to_norm(pa, dx, dy);
+                            this.view = Some(start_view.offset_by_norm(-nx, ny));
+                            cx.notify();
+                        }),
+                    )
+                    .on_scroll_wheel(
+                        cx.listener(|this, event: &gpui::ScrollWheelEvent, _window, cx| {
+                            let (Some(view), Some(pa)) =
+                                (this.current_view(), this.last_plot_area)
+                            else {
+                                return;
+                            };
+
+                            let delta = event.delta.pixel_delta(px(20.0));
+                            let zoom_amount = f32::from(-delta.y) as f64 / 200.0;
+                            let factor = (1.0_f64 + zoom_amount).clamp(0.5, 2.0);
+
+                            let (ax, ay) = view.screen_anchor(pa, event.position);
+                            this.view = Some(view.zoom_at(factor, ax, 1.0 - ay));
+                            cx.notify();
+                        }),
+                    )
+                    .child(
+                        canvas(
+                            {
+                                let this = cx.entity().downgrade();
+                                move |bounds, _window, cx| {
+                                    let pa = plot_area(bounds);
+                                    let _ = this.update(cx, |this, _cx| {
+                                        this.last_plot_area = Some(pa);
+                                    });
+                                    (bounds, view)
+                                }
+                            },
+                            move |_, (bounds, view), window, cx| {
+                                if let Some(view) = view {
+                                    paint_plot(
+                                        bounds,
+                                        traces.iter().flatten(),
+                                        view,
+                                        data_start,
+                                        window,
+                                        cx,
+                                    );
+                                }
+                            },
+                        )
+                        .size_full(),
+                    ),
+            );
+
+        if show_legend {
+            let mut legend_row = div()
+                .flex()
+                .flex_row()
+                .flex_wrap()
+                .gap_3()
+                .px(px(Y_LABEL_WIDTH + PADDING))
+                .py_1();
+
+            for (i, rt) in self.traces.iter().enumerate() {
+                let Some(rt) = rt else { continue };
+                let visible = rt.trace.visible;
+                let opacity = if visible { 1.0 } else { 0.3 };
+                let color = Hsla { a: opacity, ..rt.trace.color };
+                let text_color = Hsla { a: opacity, ..theme.text_secondary };
+
+                legend_row = legend_row.child(
+                    div()
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .gap_1()
+                        .cursor_pointer()
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(move |this, _event: &gpui::MouseDownEvent, _window, cx| {
+                                if let Some(Some(resolved)) = this.traces.get_mut(i) {
+                                    resolved.trace.visible = !resolved.trace.visible;
+                                    cx.notify();
+                                }
+                            }),
+                        )
+                        .child(
+                            div()
+                                .w(px(10.0))
+                                .h(px(10.0))
+                                .rounded(px(2.0))
+                                .bg(color),
+                        )
+                        .child(
+                            div()
+                                .text_size(px(LABEL_FONT_SIZE))
+                                .text_color(text_color)
+                                .child(rt.trace.label.clone()),
+                        ),
+                );
+            }
+
+            root = root.child(legend_row);
+        }
+
+        root
     }
 }
+
+/// Field IDs for trace sub-fields: `trace_index * 100 + sub_field`.
+const TRACE_SETTINGS_BASE: u32 = 100;
+const TRACE_SUB_STYLE: u32 = 0;
+const TRACE_SUB_COLOR: u32 = 1;
+const TRACE_SUB_VISIBLE: u32 = 2;
 
 impl Inspectable for TimeSeriesPlot {
     fn fields(&self) -> Vec<InspectionField> {
@@ -724,18 +990,69 @@ impl Inspectable for TimeSeriesPlot {
             value: InspectionValue::Traces(current_traces),
         }];
 
-        if let Some((min, max)) = self.merged_y_bounds() {
+        // Per-trace settings as a nested list
+        let trace_items: Vec<ListItem> = self
+            .traces
+            .iter()
+            .enumerate()
+            .filter_map(|(i, rt)| {
+                let rt = rt.as_ref()?;
+                let base = TRACE_SETTINGS_BASE + i as u32 * 100;
+                Some(ListItem {
+                    label: rt.trace.label.clone(),
+                    fields: vec![
+                        InspectionField {
+                            label: "Style".into(),
+                            field_id: FieldId(base + TRACE_SUB_STYLE),
+                            value: InspectionValue::Enum {
+                                selected: rt.trace.style.label().to_string(),
+                                options: PlotStyle::ALL
+                                    .iter()
+                                    .map(|s| s.label().to_string())
+                                    .collect(),
+                            },
+                        },
+                        InspectionField {
+                            label: "Color".into(),
+                            field_id: FieldId(base + TRACE_SUB_COLOR),
+                            value: InspectionValue::Color(rt.trace.color),
+                        },
+                        InspectionField {
+                            label: "Visible".into(),
+                            field_id: FieldId(base + TRACE_SUB_VISIBLE),
+                            value: InspectionValue::Bool(rt.trace.visible),
+                        },
+                    ],
+                })
+            })
+            .collect();
+
+        if !trace_items.is_empty() {
             fields.push(InspectionField {
-                label: "Y Min".into(),
+                label: "Trace Settings".into(),
                 field_id: FieldId(1),
-                value: InspectionValue::F64(min),
-            });
-            fields.push(InspectionField {
-                label: "Y Max".into(),
-                field_id: FieldId(2),
-                value: InspectionValue::F64(max),
+                value: InspectionValue::List(trace_items),
             });
         }
+
+        fields.push(InspectionField {
+            label: "X Range".into(),
+            field_id: FieldId(4),
+            value: InspectionValue::String(self.x_range.to_string()),
+        });
+
+        let (min_y, max_y) = self.effective_y_bounds();
+        fields.push(InspectionField {
+            label: "Y Min".into(),
+            field_id: FieldId(2),
+            value: InspectionValue::F64(min_y),
+        });
+        fields.push(InspectionField {
+            label: "Y Max".into(),
+            field_id: FieldId(3),
+            value: InspectionValue::F64(max_y),
+        });
+
         fields
     }
 
@@ -746,21 +1063,71 @@ impl Inspectable for TimeSeriesPlot {
                 let new_traces: Vec<Trace> = selections
                     .into_iter()
                     .enumerate()
-                    .map(|(i, (component_id, element_index))| Trace {
-                        component_id,
-                        element_index,
-                        color: theme.line_colors[i % theme.line_colors.len()],
+                    .map(|(i, (component_id, element_index))| {
+                        let elem_names =
+                            crate::trace_picker::element_names_for_component(&self.db, component_id);
+                        let comp_name = self
+                            .db
+                            .with_state(|s| {
+                                s.get_component_metadata(component_id)
+                                    .map(|m| m.name.clone())
+                            })
+                            .unwrap_or_default();
+                        let label = elem_names
+                            .get(element_index)
+                            .map(|n| format!("{}.{}", comp_name, n))
+                            .unwrap_or_else(|| format!("{}[{}]", comp_name, element_index));
+                        Trace {
+                            component_id,
+                            element_index,
+                            color: theme.line_colors[i % theme.line_colors.len()],
+                            style: PlotStyle::default(),
+                            visible: true,
+                            label: SharedString::from(label),
+                        }
                     })
                     .collect();
                 if !new_traces.is_empty() {
                     self.set_traces(new_traces, cx);
                 }
             }
-            (FieldId(1), InspectionValue::F64(_v)) => {
-                // Y Min override — not implemented for multi-trace yet
+            (FieldId(2), InspectionValue::F64(v)) => {
+                self.y_min_override = Some(v);
+                self.view = None;
+                cx.notify();
             }
-            (FieldId(2), InspectionValue::F64(_v)) => {
-                // Y Max override — not implemented for multi-trace yet
+            (FieldId(3), InspectionValue::F64(v)) => {
+                self.y_max_override = Some(v);
+                self.view = None;
+                cx.notify();
+            }
+            (FieldId(4), InspectionValue::String(s)) => {
+                if let Ok(behavior) = s.parse::<TimeRangeBehavior>() {
+                    self.x_range = behavior;
+                    self.view = None;
+                    cx.notify();
+                }
+            }
+            (FieldId(id), value) if id >= TRACE_SETTINGS_BASE => {
+                let trace_idx = ((id - TRACE_SETTINGS_BASE) / 100) as usize;
+                let sub_field = (id - TRACE_SETTINGS_BASE) % 100;
+                if let Some(Some(resolved)) = self.traces.get_mut(trace_idx) {
+                    match (sub_field, value) {
+                        (TRACE_SUB_STYLE, InspectionValue::Enum { selected, .. }) => {
+                            if let Some(style) = PlotStyle::parse(&selected) {
+                                resolved.trace.style = style;
+                            }
+                        }
+                        (TRACE_SUB_COLOR, InspectionValue::Color(c)) => {
+                            resolved.trace.color = c;
+                        }
+                        (TRACE_SUB_VISIBLE, InspectionValue::Bool(b)) => {
+                            resolved.trace.visible = b;
+                        }
+                        _ => {}
+                    }
+                    cx.notify();
+                }
             }
             _ => {}
         }

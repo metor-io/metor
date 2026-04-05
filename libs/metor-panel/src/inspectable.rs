@@ -23,10 +23,18 @@ pub fn list_components(db: &DB) -> Vec<(ComponentId, String)> {
 pub struct FieldId(pub u32);
 
 /// A single inspectable field on an element.
+#[derive(Clone, Debug)]
 pub struct InspectionField {
     pub label: SharedString,
     pub field_id: FieldId,
     pub value: InspectionValue,
+}
+
+/// A sub-item in a [`InspectionValue::List`], with its own inspectable fields.
+#[derive(Clone, Debug)]
+pub struct ListItem {
+    pub label: SharedString,
+    pub fields: Vec<InspectionField>,
 }
 
 /// The current value of an inspectable field.
@@ -37,9 +45,17 @@ pub enum InspectionValue {
     F64(f64),
     String(String),
     Bool(bool),
+    /// A fixed set of named choices (rendered as a selectable list).
+    Enum {
+        selected: String,
+        options: Vec<String>,
+    },
     /// A trace selection: list of (ComponentId, element_index) pairs.
     /// Edited via the guided component/element picker.
     Traces(Vec<(ComponentId, usize)>),
+    /// A list of named sub-items, each with its own fields.
+    /// Field IDs for sub-fields encode `item_index * 100 + sub_field_id`.
+    List(Vec<ListItem>),
 }
 
 impl InspectionValue {
@@ -53,7 +69,14 @@ impl InspectionValue {
             InspectionValue::Component { .. } => Some(InspectionValue::Component {
                 name: input.to_string(),
             }),
+            InspectionValue::Enum { options, .. } => {
+                options.contains(&input.to_string()).then(|| InspectionValue::Enum {
+                    selected: input.to_string(),
+                    options: options.clone(),
+                })
+            }
             InspectionValue::Traces(_) => None, // traces are edited via the picker, not parsed
+            InspectionValue::List(_) => None,   // lists are navigated, not parsed
         }
     }
 }
@@ -90,8 +113,12 @@ impl std::fmt::Display for InspectionValue {
             InspectionValue::F64(v) => write!(f, "{}", v),
             InspectionValue::String(s) => write!(f, "{}", s),
             InspectionValue::Bool(b) => write!(f, "{}", b),
+            InspectionValue::Enum { selected, .. } => write!(f, "{}", selected),
             InspectionValue::Traces(traces) => {
                 write!(f, "{} selected", traces.len())
+            }
+            InspectionValue::List(items) => {
+                write!(f, "{} items", items.len())
             }
         }
     }
@@ -157,16 +184,25 @@ pub fn palette_page_for_inspectable<T: Inspectable>(
                 ),
             };
 
-            PaletteItem::new(
-                label,
+            // Bool fields toggle immediately on select
+            let action = if matches!(current_value, InspectionValue::Bool(_)) {
+                let entity = entity.clone();
+                let toggled = matches!(current_value, InspectionValue::Bool(false));
+                PaletteAction::Execute(Box::new(move |_input, _window, cx| {
+                    entity.update(cx, |this, cx| {
+                        this.set_field(field_id, InspectionValue::Bool(toggled), cx);
+                    });
+                }))
+            } else {
                 PaletteAction::NextPage {
                     label: None,
                     page: Box::new(move || {
                         palette_page_for_field(entity, field_id, field_label, current_value, db_clone)
                     }),
-                },
-            )
-            .with_pills(pills)
+                }
+            };
+
+            PaletteItem::new(label, action).with_pills(pills)
         })
         .collect();
     PalettePage::new(items).label("Inspect")
@@ -184,9 +220,59 @@ pub fn palette_page_for_field<T: Inspectable>(
     // For Traces fields, use the guided component/element picker.
     if let InspectionValue::Traces(ref existing) = current_value {
         if let Some(db) = db {
-            // Convert existing (ComponentId, usize) pairs into TraceSelections with names
             return crate::trace_picker::trace_picker_page(entity, field_id, db, existing);
         }
+    }
+
+    // For Enum fields, show each option as a selectable item.
+    if let InspectionValue::Enum { ref options, .. } = current_value {
+        let items: Vec<PaletteItem> = options
+            .iter()
+            .map(|option| {
+                let entity = entity.clone();
+                let option_val = option.clone();
+                let opts = options.clone();
+                PaletteItem::new(
+                    option.clone(),
+                    PaletteAction::Execute(Box::new(move |_input, _window, cx| {
+                        entity.update(cx, |this, cx| {
+                            this.set_field(
+                                field_id,
+                                InspectionValue::Enum {
+                                    selected: option_val,
+                                    options: opts,
+                                },
+                                cx,
+                            );
+                        });
+                    })),
+                )
+            })
+            .collect();
+        return PalettePage::new(items).label(field_label);
+    }
+
+    // For List fields, show each item as a navigable row.
+    if let InspectionValue::List(ref items) = current_value {
+        let list_items: Vec<PaletteItem> = items
+            .iter()
+            .map(|item| {
+                let entity = entity.clone();
+                let db_clone = db.clone();
+                let sub_fields = item.fields.clone();
+                let item_label = item.label.clone();
+                PaletteItem::new(
+                    item.label.clone(),
+                    PaletteAction::NextPage {
+                        label: None,
+                        page: Box::new(move || {
+                            palette_page_for_list_item(entity, &sub_fields, item_label, db_clone)
+                        }),
+                    },
+                )
+            })
+            .collect();
+        return PalettePage::new(list_items).label(field_label);
     }
 
     let mut items = Vec::new();
@@ -228,5 +314,46 @@ pub fn palette_page_for_field<T: Inspectable>(
         .label(field_label)
         .prompt("Enter value...")
         .default_action(apply_item)
+}
+
+/// Render a palette page for a single item inside a `List`, showing its sub-fields.
+fn palette_page_for_list_item<T: Inspectable>(
+    entity: Entity<T>,
+    fields: &[InspectionField],
+    label: SharedString,
+    db: Option<Arc<DB>>,
+) -> PalettePage {
+    let items: Vec<PaletteItem> = fields
+        .iter()
+        .map(|field| {
+            let field_id = field.field_id;
+            let field_label = field.label.clone();
+            let current_value = field.value.clone();
+            let entity = entity.clone();
+            let db_clone = db.clone();
+
+            let display = SharedString::from(format!("{}: {}", field.label, field.value));
+
+            // Bool toggles immediately; everything else opens a sub-page
+            let action = if matches!(current_value, InspectionValue::Bool(_)) {
+                let toggled = matches!(current_value, InspectionValue::Bool(false));
+                PaletteAction::Execute(Box::new(move |_input, _window, cx| {
+                    entity.update(cx, |this, cx| {
+                        this.set_field(field_id, InspectionValue::Bool(toggled), cx);
+                    });
+                }))
+            } else {
+                PaletteAction::NextPage {
+                    label: None,
+                    page: Box::new(move || {
+                        palette_page_for_field(entity, field_id, field_label, current_value, db_clone)
+                    }),
+                }
+            };
+
+            PaletteItem::new(display, action)
+        })
+        .collect();
+    PalettePage::new(items).label(label)
 }
 
