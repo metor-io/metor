@@ -5,11 +5,13 @@ use serde::{Deserialize, Serialize};
 
 use super::item::{PaneItem, PaneItemHandle};
 
+/// Serialized snapshot of an entire tile layout.
 #[derive(Serialize, Deserialize)]
 pub struct SerializedTileGroup {
     pub root: SerializedMember,
 }
 
+/// A node in the serialized tile tree: either a pane or a split.
 #[derive(Serialize, Deserialize)]
 #[serde(tag = "type")]
 pub enum SerializedMember {
@@ -17,6 +19,7 @@ pub enum SerializedMember {
     Split(SerializedSplit),
 }
 
+/// A serialized split axis with flex proportions and child members.
 #[derive(Serialize, Deserialize)]
 pub struct SerializedSplit {
     pub axis: SerializedAxis,
@@ -48,12 +51,14 @@ impl From<SerializedAxis> for gpui::Axis {
     }
 }
 
+/// A serialized pane with its active tab index and items.
 #[derive(Serialize, Deserialize)]
 pub struct SerializedPane {
     pub active_index: usize,
     pub items: Vec<SerializedItem>,
 }
 
+/// A serialized pane item identified by its type key and JSON state.
 #[derive(Serialize, Deserialize)]
 pub struct SerializedItem {
     pub kind: String,

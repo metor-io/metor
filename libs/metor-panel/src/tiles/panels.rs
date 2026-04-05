@@ -12,6 +12,7 @@ use super::item::{PaneItem, PaneItemHandle};
 use super::pane::Pane;
 
 
+/// Tile panel wrapping a [`ComponentText`] display.
 pub struct TextPanel {
     inner: Entity<ComponentText>,
     label: SharedString,
@@ -53,6 +54,7 @@ impl PaneItem for TextPanel {
 }
 
 
+/// Tile panel wrapping a [`ComponentTable`].
 pub struct TablePanel {
     inner: Entity<ComponentTable>,
 }
@@ -85,6 +87,7 @@ impl PaneItem for TablePanel {
 }
 
 
+/// Tile panel wrapping a [`TimeSeriesPlot`], with inspection support for trace configuration.
 pub struct PlotPanel {
     db: Arc<DB>,
     inner: Entity<TimeSeriesPlot>,

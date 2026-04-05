@@ -1,5 +1,6 @@
 use gpui::{Bounds, Pixels, Point, point};
 
+/// Data-space bounds for a time-series plot, with conversion between data and screen coordinates.
 #[derive(Clone, Copy, Debug)]
 pub struct PlotBounds {
     pub min_x: f64,

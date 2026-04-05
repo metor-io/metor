@@ -27,6 +27,8 @@ pub enum PaneEvent {
 
 impl EventEmitter<PaneEvent> for Pane {}
 
+/// A tab container within a [`TileGroup`](super::TileGroup). Holds multiple [`PaneItem`](super::PaneItem)s
+/// as tabs, with drag-and-drop support for reordering and splitting.
 pub struct Pane {
     items: Vec<Box<dyn PaneItemHandle>>,
     active_index: usize,

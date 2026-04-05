@@ -20,6 +20,7 @@ pub use component_table::{ComponentTable, new_component_table};
 pub use table::{Column, ColumnSort, Table, TableDelegate};
 pub use time_series::{TimeSeriesPlot, Trace};
 
+/// Displays a single component's latest value as text, updating reactively.
 pub struct ComponentText {
     value: Option<SharedString>,
     _task: gpui::Task<()>,

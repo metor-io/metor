@@ -71,6 +71,7 @@ impl ComponentRow {
     }
 }
 
+/// Table delegate that displays all components in the database with name, value, and sparkline columns.
 pub struct ComponentTableDelegate {
     rows: Vec<Entity<ComponentRow>>,
     _task: gpui::Task<()>,
@@ -192,6 +193,7 @@ impl TableDelegate for ComponentTableDelegate {
     }
 }
 
+/// A table showing all database components with sortable columns and sparklines.
 pub type ComponentTable = Table<ComponentTableDelegate>;
 
 pub fn new_component_table(db: Arc<DB>, cx: &mut Context<ComponentTable>) -> ComponentTable {

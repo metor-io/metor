@@ -13,6 +13,7 @@ fn scroll_margin() -> Pixels {
     px(4.0)
 }
 
+/// Visual styling for a [`TextField`].
 pub struct TextFieldStyle {
     pub font_size: Pixels,
     pub line_height: Pixels,

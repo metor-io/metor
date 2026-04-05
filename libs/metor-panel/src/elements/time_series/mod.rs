@@ -455,6 +455,7 @@ struct ResolvedTrace {
     last_scan_ts: Option<Timestamp>,
 }
 
+/// Interactive time-series plot with multi-trace support, pan, and zoom.
 pub struct TimeSeriesPlot {
     db: Arc<DB>,
     traces: Vec<Option<ResolvedTrace>>,
@@ -493,7 +494,11 @@ impl TimeSeriesPlot {
         cx: &mut Context<Self>,
     ) -> Self {
         let component_id = component_id.into();
-        let indexes = if indexes.is_empty() { &[0usize] as &[usize] } else { indexes };
+        let indexes = if indexes.is_empty() {
+            &[0usize] as &[usize]
+        } else {
+            indexes
+        };
         let theme = &crate::theme::DARK;
         let traces = indexes
             .iter()

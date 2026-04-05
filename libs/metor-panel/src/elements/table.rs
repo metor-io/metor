@@ -10,6 +10,7 @@ use crate::theme::DARK;
 const HEADER_HEIGHT: f32 = 32.0;
 const RESIZE_HANDLE_WIDTH: f32 = 6.0;
 
+/// Sort state for a table column.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ColumnSort {
     Default,
@@ -27,6 +28,7 @@ impl ColumnSort {
     }
 }
 
+/// Definition for a table column: name, sizing, and behavior.
 pub struct Column {
     pub name: SharedString,
     pub width: Pixels,
@@ -76,6 +78,7 @@ impl Column {
     }
 }
 
+/// Provides data and rendering for a [`Table`]: columns, row count, cell rendering, and sorting.
 pub trait TableDelegate: Sized + 'static {
     fn columns(&self) -> Vec<Column>;
     fn rows_count(&self) -> usize;
@@ -107,6 +110,7 @@ impl Render for ResizeDrag {
     }
 }
 
+/// Generic table widget with resizable/sortable columns and virtual scrolling.
 pub struct Table<D: TableDelegate> {
     delegate: D,
     col_states: Vec<ColState>,

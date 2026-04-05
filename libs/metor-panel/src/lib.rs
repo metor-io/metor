@@ -10,6 +10,7 @@ pub mod theme;
 pub mod tiles;
 pub(crate) mod trace_picker;
 
+/// Borrowing conversion to a [`ComponentView`].
 pub trait AsComponentView {
     fn as_component_view(&self) -> ComponentView<'_>;
 }
@@ -20,6 +21,7 @@ impl AsComponentView for ComponentView<'_> {
     }
 }
 
+/// Async stream of component data updates.
 pub trait ComponentStream {
     type View<'a>: AsComponentView
     where
@@ -27,6 +29,7 @@ pub trait ComponentStream {
     fn next(&mut self) -> impl std::future::Future<Output = Self::View<'_>>;
 }
 
+/// Factory for creating a [`WalComponentStream`] from a component identifier or handle.
 pub trait ComponentStreamBuilder {
     fn into_stream(self, db: &DB) -> impl std::future::Future<Output = WalComponentStream> + Send;
 }
@@ -44,6 +47,7 @@ impl ComponentStreamBuilder for ComponentId {
     }
 }
 
+/// Reads the latest values from a component's write-ahead log as a stream.
 pub struct WalComponentStream {
     reader: Reader,
     schema: ComponentSchema,

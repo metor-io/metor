@@ -1,5 +1,6 @@
 use gpui::Hsla;
 
+/// Color palette for the panel UI. All colors use HSLA.
 pub struct Theme {
     pub bg_primary: Hsla,
     pub bg_secondary: Hsla,
