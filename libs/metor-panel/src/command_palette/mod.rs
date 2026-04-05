@@ -404,7 +404,7 @@ impl CommandPalette {
         }
     }
 
-    fn render_items(&mut self) -> impl IntoElement {
+    fn render_items(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
         let page = match self.current_page() {
             Some(p) => p,
             None => return div().into_any_element(),
@@ -454,9 +454,11 @@ impl CommandPalette {
             self.last_list_count = total;
         }
 
+        let this = cx.entity().downgrade();
         list(self.list_state.clone(), move |i, _window, _cx| {
             let (ref label, selected, ref pills) = rows[i];
-            Self::render_item_row(label.clone(), selected, pills).into_any_element()
+            let this = this.clone();
+            Self::render_item_row(label.clone(), selected, pills, i, this).into_any_element()
         })
         .flex_1()
         .py(px(4.0))
@@ -467,6 +469,8 @@ impl CommandPalette {
         label: SharedString,
         selected: bool,
         pills: &[SharedString],
+        row_index: usize,
+        this: gpui::WeakEntity<Self>,
     ) -> impl IntoElement {
         let bg = if selected {
             DARK.selection_bg
@@ -480,12 +484,22 @@ impl CommandPalette {
         };
 
         let mut row = div()
+            .id(("palette-row", row_index))
             .px(px(12.0))
             .py(px(6.0))
             .w_full()
             .bg(bg)
+            .cursor_pointer()
+            .hover(|s| s.bg(DARK.selection_bg))
             .text_size(px(14.0))
             .text_color(text_color)
+            .on_mouse_down(gpui::MouseButton::Left, move |_event, window, cx| {
+                let _ = this.update(cx, |this, cx| {
+                    this.selected_index = row_index;
+                    this.confirm(window, cx);
+                    cx.notify();
+                });
+            })
             .child(label);
 
         if !pills.is_empty() {
@@ -554,7 +568,7 @@ impl Render for CommandPalette {
                         .rounded(px(8.0))
                         .overflow_hidden()
                         .child(self.render_input())
-                        .child(self.render_items()),
+                        .child(self.render_items(cx)),
                 ),
         )
         .into_any_element()

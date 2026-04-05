@@ -373,16 +373,9 @@ fn paint_plot<'a>(
             if !rt.trace.visible {
                 continue;
             }
-            paint_trace(
-                pb,
-                &rt.component,
-                &view,
-                &rt.trace,
-                window,
-            );
+            paint_trace(pb, &rt.component, &view, &rt.trace, window);
         }
     });
-
 }
 
 fn paint_trace(
@@ -394,13 +387,35 @@ fn paint_trace(
 ) {
     match trace.style {
         PlotStyle::Line => {
-            paint_data_line(screen_bounds, component, view, trace.color, px(trace.stroke_width), trace.element_index, window);
+            paint_data_line(
+                screen_bounds,
+                component,
+                view,
+                trace.color,
+                px(trace.stroke_width),
+                trace.element_index,
+                window,
+            );
         }
         PlotStyle::Scatter => {
-            paint_scatter(screen_bounds, component, view, trace.color, trace.element_index, window);
+            paint_scatter(
+                screen_bounds,
+                component,
+                view,
+                trace.color,
+                trace.element_index,
+                window,
+            );
         }
         PlotStyle::Bar => {
-            paint_bars(screen_bounds, component, view, trace.color, trace.element_index, window);
+            paint_bars(
+                screen_bounds,
+                component,
+                view,
+                trace.color,
+                trace.element_index,
+                window,
+            );
         }
     }
 }
@@ -497,10 +512,13 @@ fn paint_bars(
         view.min_y
     };
     let baseline_y = view.to_screen(screen_bounds, view.min_x, baseline).y;
-    let bar_count = if stride > 0 { (total / stride).max(1) } else { total };
+    let bar_count = if stride > 0 {
+        (total / stride).max(1)
+    } else {
+        total
+    };
     let max_bar_width = px(20.0);
-    let bar_half =
-        (screen_bounds.size.width / (bar_count as f32 * 2.0)).min(max_bar_width / 2.0);
+    let bar_half = (screen_bounds.size.width / (bar_count as f32 * 2.0)).min(max_bar_width / 2.0);
 
     // Within each stride-group, pick the last timestamp and the mean value
     let mut group_count = 0usize;
@@ -611,15 +629,23 @@ pub fn paint_data_line(
                 continue;
             }
 
-            if v < min_v { min_v = v; min_t = t; }
-            if v > max_v { max_v = v; max_t = t; }
+            if v < min_v {
+                min_v = v;
+                min_t = t;
+            }
+            if v > max_v {
+                max_v = v;
+                max_t = t;
+            }
             group_count += 1;
 
             if group_count >= stride {
                 // Emit min and max in chronological order
                 if min_t <= max_t {
                     emit(min_t, min_v, &mut first, &mut path);
-                    if min_t != max_t { emit(max_t, max_v, &mut first, &mut path); }
+                    if min_t != max_t {
+                        emit(max_t, max_v, &mut first, &mut path);
+                    }
                 } else {
                     emit(max_t, max_v, &mut first, &mut path);
                     emit(min_t, min_v, &mut first, &mut path);
@@ -634,7 +660,9 @@ pub fn paint_data_line(
     if group_count > 0 && stride > 1 {
         if min_t <= max_t {
             emit(min_t, min_v, &mut first, &mut path);
-            if min_t != max_t { emit(max_t, max_v, &mut first, &mut path); }
+            if min_t != max_t {
+                emit(max_t, max_v, &mut first, &mut path);
+            }
         } else {
             emit(max_t, max_v, &mut first, &mut path);
             emit(min_t, min_v, &mut first, &mut path);
@@ -912,12 +940,13 @@ impl TimeSeriesPlot {
     fn current_view(&self) -> Option<PlotBounds> {
         self.view.or_else(|| {
             let (data_start, data_end) = self.time_range()?;
-            let range = self.x_range.calculate_range(
-                Timestamp(data_start as i64),
-                Timestamp(data_end as i64),
-            );
+            let range = self
+                .x_range
+                .calculate_range(Timestamp(data_start as i64), Timestamp(data_end as i64));
             let (min_y, max_y) = self.effective_y_bounds();
-            Some(PlotBounds::new(range.start.0 as f64, min_y, range.end.0 as f64, max_y).normalize())
+            Some(
+                PlotBounds::new(range.start.0 as f64, min_y, range.end.0 as f64, max_y).normalize(),
+            )
         })
     }
 
@@ -936,7 +965,10 @@ impl TimeSeriesPlot {
                 field_id: FieldId(base + TRACE_SUB_STYLE),
                 value: InspectionValue::Enum {
                     selected: rt.trace.style.label().to_string(),
-                    options: PlotStyle::ALL.iter().map(|s| s.label().to_string()).collect(),
+                    options: PlotStyle::ALL
+                        .iter()
+                        .map(|s| s.label().to_string())
+                        .collect(),
                 },
             },
             InspectionField {
@@ -998,8 +1030,8 @@ impl Render for TimeSeriesPlot {
                             this.drag_start_view = None;
                         }),
                     )
-                    .on_mouse_move(
-                        cx.listener(|this, event: &gpui::MouseMoveEvent, _window, cx| {
+                    .on_mouse_move(cx.listener(
+                        |this, event: &gpui::MouseMoveEvent, _window, cx| {
                             if !event.dragging() {
                                 return;
                             }
@@ -1014,12 +1046,11 @@ impl Render for TimeSeriesPlot {
                             let (nx, ny) = start_view.screen_delta_to_norm(pa, dx, dy);
                             this.view = Some(start_view.offset_by_norm(-nx, ny));
                             cx.notify();
-                        }),
-                    )
-                    .on_scroll_wheel(
-                        cx.listener(|this, event: &gpui::ScrollWheelEvent, _window, cx| {
-                            let (Some(view), Some(pa)) =
-                                (this.current_view(), this.last_plot_area)
+                        },
+                    ))
+                    .on_scroll_wheel(cx.listener(
+                        |this, event: &gpui::ScrollWheelEvent, _window, cx| {
+                            let (Some(view), Some(pa)) = (this.current_view(), this.last_plot_area)
                             else {
                                 return;
                             };
@@ -1031,8 +1062,8 @@ impl Render for TimeSeriesPlot {
                             let (ax, ay) = view.screen_anchor(pa, event.position);
                             this.view = Some(view.zoom_at(factor, ax, 1.0 - ay));
                             cx.notify();
-                        }),
-                    )
+                        },
+                    ))
                     .child(
                         canvas(
                             {
@@ -1075,8 +1106,14 @@ impl Render for TimeSeriesPlot {
                 let Some(rt) = rt else { continue };
                 let visible = rt.trace.visible;
                 let opacity = if visible { 1.0 } else { 0.3 };
-                let color = Hsla { a: opacity, ..rt.trace.color };
-                let text_color = Hsla { a: opacity, ..theme.text_secondary };
+                let color = Hsla {
+                    a: opacity,
+                    ..rt.trace.color
+                };
+                let text_color = Hsla {
+                    a: opacity,
+                    ..theme.text_secondary
+                };
 
                 legend_row = legend_row.child(
                     div()
@@ -1103,13 +1140,7 @@ impl Render for TimeSeriesPlot {
                                 }
                             }),
                         )
-                        .child(
-                            div()
-                                .w(px(10.0))
-                                .h(px(10.0))
-                                .rounded(px(2.0))
-                                .bg(color),
-                        )
+                        .child(div().w(px(10.0)).h(px(10.0)).rounded(px(2.0)).bg(color))
                         .child(
                             div()
                                 .text_size(px(LABEL_FONT_SIZE))
@@ -1225,8 +1256,10 @@ impl Inspectable for TimeSeriesPlot {
                     .into_iter()
                     .enumerate()
                     .map(|(i, (component_id, element_index))| {
-                        let elem_names =
-                            crate::trace_picker::element_names_for_component(&self.db, component_id);
+                        let elem_names = crate::trace_picker::element_names_for_component(
+                            &self.db,
+                            component_id,
+                        );
                         let comp_name = self
                             .db
                             .with_state(|s| {
