@@ -30,12 +30,7 @@ impl Default for TextFieldStyle {
             text_color: DARK.text_primary,
             placeholder_color: DARK.text_tertiary,
             cursor_color: DARK.text_primary,
-            selection_color: Hsla {
-                h: 0.583,
-                s: 0.5,
-                l: 0.35,
-                a: 0.6,
-            },
+            selection_color: DARK.text_selection,
         }
     }
 }

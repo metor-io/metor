@@ -85,20 +85,6 @@ impl PalettePage {
 
 // ── Pill styling ────────────────────────────────────────────────────
 
-const PILL_BG: Hsla = Hsla {
-    h: 0.0,
-    s: 0.0,
-    l: 0.25,
-    a: 1.0,
-};
-
-const PILL_BORDER: Hsla = Hsla {
-    h: 0.0,
-    s: 0.0,
-    l: 0.35,
-    a: 1.0,
-};
-
 /// The command palette view.
 pub struct CommandPalette {
     text_field: TextField,
@@ -353,9 +339,9 @@ impl CommandPalette {
                     .flex_shrink_0()
                     .px(px(6.0))
                     .py(px(2.0))
-                    .bg(PILL_BG)
+                    .bg(DARK.pill_bg)
                     .border_1()
-                    .border_color(PILL_BORDER)
+                    .border_color(DARK.pill_border)
                     .rounded(px(4.0))
                     .text_size(px(12.0))
                     .text_color(DARK.text_secondary)
@@ -371,9 +357,9 @@ impl CommandPalette {
                         .flex_shrink_0()
                         .px(px(8.0))
                         .py(px(2.0))
-                        .bg(PILL_BG)
+                        .bg(DARK.pill_bg)
                         .border_1()
-                        .border_color(PILL_BORDER)
+                        .border_color(DARK.pill_border)
                         .rounded(px(4.0))
                         .text_size(px(12.0))
                         .text_color(DARK.text_primary)
@@ -484,7 +470,7 @@ impl CommandPalette {
         pills: &[SharedString],
     ) -> impl IntoElement {
         let bg = if selected {
-            ITEM_SELECTED_BG
+            DARK.selection_bg
         } else {
             Hsla::transparent_black()
         };
@@ -511,9 +497,9 @@ impl CommandPalette {
                         .flex_shrink_0()
                         .px(px(6.0))
                         .py(px(1.0))
-                        .bg(PILL_BG)
+                        .bg(DARK.pill_bg)
                         .border_1()
-                        .border_color(PILL_BORDER)
+                        .border_color(DARK.pill_border)
                         .rounded(px(4.0))
                         .text_size(px(11.0))
                         .text_color(DARK.text_primary)
@@ -527,19 +513,6 @@ impl CommandPalette {
     }
 }
 
-const ITEM_SELECTED_BG: Hsla = Hsla {
-    h: 0.083,
-    s: 0.10,
-    l: 0.20,
-    a: 1.0,
-};
-
-const PALETTE_BG: Hsla = Hsla {
-    h: 0.083,
-    s: 0.08,
-    l: 0.14,
-    a: 1.0,
-};
 
 impl Focusable for CommandPalette {
     fn focus_handle(&self, _cx: &App) -> FocusHandle {
@@ -576,7 +549,7 @@ impl Render for CommandPalette {
                         }))
                         .w(px(500.0))
                         .max_h(px(400.0))
-                        .bg(PALETTE_BG)
+                        .bg(DARK.bg_elevated)
                         .border_1()
                         .border_color(DARK.border_primary)
                         .rounded(px(8.0))

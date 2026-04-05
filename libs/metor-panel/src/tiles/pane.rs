@@ -269,12 +269,7 @@ impl Pane {
 
     fn render_split_overlay(&self) -> Option<AnyElement> {
         let direction = self.drag_split_direction?;
-        let highlight = gpui::Hsla {
-            h: DARK.line_color.h,
-            s: DARK.line_color.s,
-            l: DARK.line_color.l,
-            a: 0.15,
-        };
+        let highlight = DARK.drop_target;
 
         let overlay = match direction {
             SplitDirection::Left => div().w_1_2().h_full().bg(highlight),

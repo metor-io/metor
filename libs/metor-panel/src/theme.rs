@@ -3,12 +3,26 @@ use gpui::Hsla;
 pub struct Theme {
     pub bg_primary: Hsla,
     pub bg_secondary: Hsla,
+    /// Elevated surface (e.g. palette, popover).
+    pub bg_elevated: Hsla,
 
     pub text_primary: Hsla,
     pub text_secondary: Hsla,
     pub text_tertiary: Hsla,
 
     pub border_primary: Hsla,
+
+    /// Background for selected/highlighted items.
+    pub selection_bg: Hsla,
+    /// Text selection highlight in text fields.
+    pub text_selection: Hsla,
+    /// Semi-transparent overlay for drop targets.
+    pub drop_target: Hsla,
+
+    /// Pill/badge background.
+    pub pill_bg: Hsla,
+    /// Pill/badge border.
+    pub pill_border: Hsla,
 
     pub line_color: Hsla,
     pub line_colors: [Hsla; 8],
@@ -28,6 +42,12 @@ pub static DARK: Theme = Theme {
         h: 0.083,
         s: 0.08,
         l: 0.08,
+        a: 1.0,
+    },
+    bg_elevated: Hsla {
+        h: 0.083,
+        s: 0.08,
+        l: 0.14,
         a: 1.0,
     },
 
@@ -54,6 +74,38 @@ pub static DARK: Theme = Theme {
         h: 0.083,
         s: 0.06,
         l: 0.20,
+        a: 1.0,
+    },
+
+    selection_bg: Hsla {
+        h: 0.083,
+        s: 0.10,
+        l: 0.20,
+        a: 1.0,
+    },
+    text_selection: Hsla {
+        h: 0.583,
+        s: 0.5,
+        l: 0.35,
+        a: 0.6,
+    },
+    drop_target: Hsla {
+        h: 0.069,
+        s: 1.0,
+        l: 0.56,
+        a: 0.15,
+    },
+
+    pill_bg: Hsla {
+        h: 0.0,
+        s: 0.0,
+        l: 0.25,
+        a: 1.0,
+    },
+    pill_border: Hsla {
+        h: 0.0,
+        s: 0.0,
+        l: 0.35,
         a: 1.0,
     },
 
