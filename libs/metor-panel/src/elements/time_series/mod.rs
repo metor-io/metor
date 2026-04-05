@@ -5,7 +5,8 @@ use gpui::{
     Styled, TextRun, Window, canvas, div, point, prelude::*, px,
 };
 use metor_db::{Component, DB};
-use metor_proto::types::{ComponentId, Timestamp};
+use metor_db::time_series::TimeSeriesNodeSlice;
+use metor_proto::types::{ComponentId, PrimType, Timestamp};
 
 use crate::inspectable::{FieldId, Inspectable, InspectionField, InspectionValue, ListItem};
 use crate::offset_parse::TimeRangeBehavior;
@@ -444,41 +445,87 @@ fn paint_trace(
     match trace.style {
         PlotStyle::Line => {
             paint_data_line(
-                screen_bounds,
-                component,
-                view,
-                trace.color,
-                px(trace.stroke_width),
-                trace.element_index,
-                window,
+                screen_bounds, component, view, trace.color,
+                px(trace.stroke_width), trace.element_index, window,
             );
         }
         PlotStyle::Scatter => {
             paint_scatter(
-                screen_bounds,
-                component,
-                view,
-                trace.color,
-                trace.element_index,
-                window,
+                screen_bounds, component, view, trace.color,
+                trace.element_index, window,
             );
         }
         PlotStyle::Bar => {
             paint_bars(
-                screen_bounds,
-                component,
-                view,
-                trace.color,
-                trace.element_index,
-                window,
+                screen_bounds, component, view, trace.color,
+                trace.element_index, window,
             );
         }
     }
 }
 
-/// Widen the query range so lines extend into the axis label areas.
-/// `margin_px` is the pixel width of the left margin (Y-axis labels).
-/// Converts that pixel margin into time-space and extends both sides.
+// ── Fast data access ────────────────────────────────────────────────
+
+/// Trait for primitive types that can be read from a byte buffer and converted to f64.
+trait PlotValue: zerocopy::FromBytes + Copy + Sized + 'static {
+    fn to_f64(self) -> f64;
+}
+
+macro_rules! impl_plot_value {
+    ($($ty:ty => $conv:expr),* $(,)?) => {
+        $(impl PlotValue for $ty {
+            #[inline(always)]
+            fn to_f64(self) -> f64 { $conv(self) }
+        })*
+    };
+}
+
+impl_plot_value! {
+    f64  => |x| x,
+    f32  => |x: f32| x as f64,
+    i8   => |x: i8| x as f64,
+    i16  => |x: i16| x as f64,
+    i32  => |x: i32| x as f64,
+    i64  => |x: i64| x as f64,
+    u8   => |x: u8| x as f64,
+    u16  => |x: u16| x as f64,
+    u32  => |x: u32| x as f64,
+    u64  => |x: u64| x as f64,
+}
+
+/// Bool isn't `FromBytes` (not all bit patterns valid), so treat it as u8.
+/// The dispatch macro maps `PrimType::Bool` to `u8` which reads the byte
+/// and converts via `u8::to_f64` (0 or 1).
+
+/// Read a single element value directly from a raw data buffer.
+#[inline(always)]
+fn read_value<T: PlotValue>(
+    data: &[u8],
+    sample_index: usize,
+    elem_size: usize,
+    elem_index: usize,
+    prim_size: usize,
+) -> Option<f64> {
+    let offset = sample_index * elem_size + elem_index * prim_size;
+    let buf = data.get(offset..offset + prim_size)?;
+    T::read_from_bytes(buf).ok().map(|v| v.to_f64())
+}
+
+/// Compute per-node stride for two-level decimation.
+/// Returns the step between sample indices within a node, or `None` to skip it entirely.
+fn node_stride(node_len: usize, total: usize, pixel_budget: usize) -> Option<usize> {
+    if node_len == 0 || total == 0 || pixel_budget == 0 {
+        return None;
+    }
+    let node_budget = ((node_len as f64 / total as f64) * pixel_budget as f64).ceil() as usize;
+    if node_budget == 0 {
+        return None;
+    }
+    Some((node_len / node_budget).max(1))
+}
+
+// ── Query helpers ───────────────────────────────────────────────────
+
 fn query_range(view: &PlotBounds, screen_width_px: f32) -> (Timestamp, Timestamp) {
     let margin_px = Y_LABEL_WIDTH + PADDING;
     if screen_width_px <= 0.0 {
@@ -492,13 +539,7 @@ fn query_range(view: &PlotBounds, screen_width_px: f32) -> (Timestamp, Timestamp
     )
 }
 
-fn decimation_stride(point_count: usize, pixel_budget: usize) -> usize {
-    if pixel_budget == 0 || point_count <= pixel_budget {
-        1
-    } else {
-        point_count / pixel_budget
-    }
-}
+// ── Paint functions ─────────────────────────────────────────────────
 
 fn paint_scatter(
     screen_bounds: Bounds<Pixels>,
@@ -512,38 +553,60 @@ fn paint_scatter(
     let Some(slice) = component.time_series.get_range(start_ts..end_ts) else {
         return;
     };
-    let schema = &component.schema;
-    let radius = px(3.0);
+    let node_slices: Vec<_> = slice.as_iter().collect();
     let pixel_budget = f32::from(screen_bounds.size.width) as usize;
-    let total = slice.len();
-    let stride = decimation_stride(total, pixel_budget);
+    let total: usize = node_slices.iter().map(|ns| ns.timestamps().len()).sum();
     let xf = view.screen_transform(screen_bounds);
-    let mut skip = 0usize;
+    let elem_size = component.schema.size();
+    let prim_size = component.schema.prim_type.size();
 
-    // Batch all diamonds into one path for a single tessellation call
+    fn inner<T: PlotValue>(
+        node_slices: &[TimeSeriesNodeSlice],
+        total: usize,
+        pixel_budget: usize,
+        elem_size: usize,
+        elem_index: usize,
+        prim_size: usize,
+        xf: &ScreenTransform,
+        path: &mut PathBuilder,
+        any: &mut bool,
+    ) {
+        let radius = px(3.0);
+        for ns in node_slices.iter() {
+            let Some(stride) = node_stride(ns.timestamps().len(), total, pixel_budget) else {
+                continue;
+            };
+            let timestamps = ns.timestamps();
+            let data = ns.data();
+            let mut i = 0;
+            while i < timestamps.len() {
+                if let Some(v) = read_value::<T>(data, i, elem_size, elem_index, prim_size) {
+                    let pt = xf.apply(timestamps[i].0 as f64, v);
+                    path.move_to(point(pt.x, pt.y - radius));
+                    path.line_to(point(pt.x + radius, pt.y));
+                    path.line_to(point(pt.x, pt.y + radius));
+                    path.line_to(point(pt.x - radius, pt.y));
+                    path.line_to(point(pt.x, pt.y - radius));
+                    *any = true;
+                }
+                i += stride;
+            }
+        }
+    }
+
     let mut path = PathBuilder::fill();
     let mut any = false;
-
-    for node_slice in slice.as_iter() {
-        for (ts, cv) in node_slice.iter_values(schema) {
-            if skip > 0 {
-                skip -= 1;
-                continue;
-            }
-            skip = stride - 1;
-
-            let v = match cv.get(element_index) {
-                Some(ev) => ev.as_f64(),
-                None => continue,
-            };
-            let pt = xf.apply(ts.0 as f64, v);
-            path.move_to(point(pt.x, pt.y - radius));
-            path.line_to(point(pt.x + radius, pt.y));
-            path.line_to(point(pt.x, pt.y + radius));
-            path.line_to(point(pt.x - radius, pt.y));
-            path.line_to(point(pt.x, pt.y - radius));
-            any = true;
-        }
+    match component.schema.prim_type {
+        PrimType::F64 => inner::<f64>(&node_slices, total, pixel_budget, elem_size, element_index, prim_size, &xf, &mut path, &mut any),
+        PrimType::F32 => inner::<f32>(&node_slices, total, pixel_budget, elem_size, element_index, prim_size, &xf, &mut path, &mut any),
+        PrimType::I64 => inner::<i64>(&node_slices, total, pixel_budget, elem_size, element_index, prim_size, &xf, &mut path, &mut any),
+        PrimType::I32 => inner::<i32>(&node_slices, total, pixel_budget, elem_size, element_index, prim_size, &xf, &mut path, &mut any),
+        PrimType::I16 => inner::<i16>(&node_slices, total, pixel_budget, elem_size, element_index, prim_size, &xf, &mut path, &mut any),
+        PrimType::I8  => inner::<i8>(&node_slices, total, pixel_budget, elem_size, element_index, prim_size, &xf, &mut path, &mut any),
+        PrimType::U64 => inner::<u64>(&node_slices, total, pixel_budget, elem_size, element_index, prim_size, &xf, &mut path, &mut any),
+        PrimType::U32 => inner::<u32>(&node_slices, total, pixel_budget, elem_size, element_index, prim_size, &xf, &mut path, &mut any),
+        PrimType::U16 => inner::<u16>(&node_slices, total, pixel_budget, elem_size, element_index, prim_size, &xf, &mut path, &mut any),
+        PrimType::U8 | PrimType::Bool => inner::<u8>(&node_slices, total, pixel_budget, elem_size, element_index, prim_size, &xf, &mut path, &mut any),
     }
 
     if any {
@@ -565,69 +628,76 @@ fn paint_bars(
     let Some(slice) = component.time_series.get_range(start_ts..end_ts) else {
         return;
     };
-    let schema = &component.schema;
     let node_slices: Vec<_> = slice.as_iter().collect();
     let pixel_budget = f32::from(screen_bounds.size.width) as usize;
     let total: usize = node_slices.iter().map(|ns| ns.timestamps().len()).sum();
-    let stride = decimation_stride(total, pixel_budget);
     let xf = view.screen_transform(screen_bounds);
+    let elem_size = component.schema.size();
+    let prim_size = component.schema.prim_type.size();
 
-    let baseline = if view.min_y <= 0.0 && view.max_y >= 0.0 {
-        0.0
-    } else {
-        view.min_y
-    };
+    let baseline = if view.min_y <= 0.0 && view.max_y >= 0.0 { 0.0 } else { view.min_y };
     let baseline_y = xf.apply(view.min_x, baseline).y;
-    let bar_count = if stride > 0 {
-        (total / stride).max(1)
-    } else {
-        total
-    };
+    let budget = pixel_budget.max(1);
     let max_bar_width = px(20.0);
-    let bar_half = (screen_bounds.size.width / (bar_count as f32 * 2.0)).min(max_bar_width / 2.0);
+    let bar_half = (screen_bounds.size.width / (budget as f32 * 2.0)).min(max_bar_width / 2.0);
 
-    // Batch all bars into one path
-    let mut path = PathBuilder::fill();
-    let mut any = false;
-    let mut group_count = 0usize;
-    let mut group_t = 0.0f64;
-    let mut group_v = 0.0f64;
-
-    let mut emit_bar = |t: f64, v: f64| {
-        let top = xf.apply(t, v);
-        let left = top.x - bar_half;
-        let right = top.x + bar_half;
-        let (top_y, bot_y) = if v >= baseline {
-            (top.y, baseline_y)
-        } else {
-            (baseline_y, top.y)
-        };
-        path.move_to(point(left, top_y));
-        path.line_to(point(right, top_y));
-        path.line_to(point(right, bot_y));
-        path.line_to(point(left, bot_y));
-        path.line_to(point(left, top_y));
-        any = true;
-    };
-
-    for node_slice in node_slices.iter().rev() {
-        for (ts, cv) in node_slice.iter_values(schema) {
-            let v = match cv.get(element_index) {
-                Some(ev) => ev.as_f64(),
-                None => continue,
+    fn inner<T: PlotValue>(
+        node_slices: &[TimeSeriesNodeSlice],
+        total: usize,
+        pixel_budget: usize,
+        elem_size: usize,
+        elem_index: usize,
+        prim_size: usize,
+        xf: &ScreenTransform,
+        baseline: f64,
+        baseline_y: Pixels,
+        bar_half: Pixels,
+        path: &mut PathBuilder,
+        any: &mut bool,
+    ) {
+        for ns in node_slices.iter().rev() {
+            let Some(stride) = node_stride(ns.timestamps().len(), total, pixel_budget) else {
+                continue;
             };
-            group_t = ts.0 as f64;
-            group_v += v;
-            group_count += 1;
-            if group_count >= stride {
-                emit_bar(group_t, group_v / group_count as f64);
-                group_count = 0;
-                group_v = 0.0;
+            let timestamps = ns.timestamps();
+            let data = ns.data();
+            let mut i = 0;
+            while i < timestamps.len() {
+                if let Some(v) = read_value::<T>(data, i, elem_size, elem_index, prim_size) {
+                    let t = timestamps[i].0 as f64;
+                    let top = xf.apply(t, v);
+                    let left = top.x - bar_half;
+                    let right = top.x + bar_half;
+                    let (top_y, bot_y) = if v >= baseline {
+                        (top.y, baseline_y)
+                    } else {
+                        (baseline_y, top.y)
+                    };
+                    path.move_to(point(left, top_y));
+                    path.line_to(point(right, top_y));
+                    path.line_to(point(right, bot_y));
+                    path.line_to(point(left, bot_y));
+                    path.line_to(point(left, top_y));
+                    *any = true;
+                }
+                i += stride;
             }
         }
     }
-    if group_count > 0 {
-        emit_bar(group_t, group_v / group_count as f64);
+
+    let mut path = PathBuilder::fill();
+    let mut any = false;
+    match component.schema.prim_type {
+        PrimType::F64 => inner::<f64>(&node_slices, total, pixel_budget, elem_size, element_index, prim_size, &xf, baseline, baseline_y, bar_half, &mut path, &mut any),
+        PrimType::F32 => inner::<f32>(&node_slices, total, pixel_budget, elem_size, element_index, prim_size, &xf, baseline, baseline_y, bar_half, &mut path, &mut any),
+        PrimType::I64 => inner::<i64>(&node_slices, total, pixel_budget, elem_size, element_index, prim_size, &xf, baseline, baseline_y, bar_half, &mut path, &mut any),
+        PrimType::I32 => inner::<i32>(&node_slices, total, pixel_budget, elem_size, element_index, prim_size, &xf, baseline, baseline_y, bar_half, &mut path, &mut any),
+        PrimType::I16 => inner::<i16>(&node_slices, total, pixel_budget, elem_size, element_index, prim_size, &xf, baseline, baseline_y, bar_half, &mut path, &mut any),
+        PrimType::I8  => inner::<i8>(&node_slices, total, pixel_budget, elem_size, element_index, prim_size, &xf, baseline, baseline_y, bar_half, &mut path, &mut any),
+        PrimType::U64 => inner::<u64>(&node_slices, total, pixel_budget, elem_size, element_index, prim_size, &xf, baseline, baseline_y, bar_half, &mut path, &mut any),
+        PrimType::U32 => inner::<u32>(&node_slices, total, pixel_budget, elem_size, element_index, prim_size, &xf, baseline, baseline_y, bar_half, &mut path, &mut any),
+        PrimType::U16 => inner::<u16>(&node_slices, total, pixel_budget, elem_size, element_index, prim_size, &xf, baseline, baseline_y, bar_half, &mut path, &mut any),
+        PrimType::U8 | PrimType::Bool => inner::<u8>(&node_slices, total, pixel_budget, elem_size, element_index, prim_size, &xf, baseline, baseline_y, bar_half, &mut path, &mut any),
     }
 
     if any {
@@ -638,8 +708,9 @@ fn paint_bars(
 }
 
 /// Draw a time series data line within the given screen bounds.
-/// Uses stride-based min/max decimation to cap output points at the pixel
-/// width, keeping tessellation cost proportional to screen resolution.
+/// Reads values directly from the raw byte buffer, bypassing parse_value.
+/// Uses two-level stride decimation: skips entire nodes when possible,
+/// then samples within nodes at a proportional rate.
 pub fn paint_data_line(
     screen_bounds: Bounds<Pixels>,
     component: &Component,
@@ -653,81 +724,59 @@ pub fn paint_data_line(
     let Some(slice) = component.time_series.get_range(start_ts..end_ts) else {
         return;
     };
-    let schema = &component.schema;
     let node_slices: Vec<_> = slice.as_iter().collect();
     let pixel_budget = f32::from(screen_bounds.size.width) as usize;
     let total: usize = node_slices.iter().map(|ns| ns.timestamps().len()).sum();
-    let stride = decimation_stride(total, pixel_budget);
     let xf = view.screen_transform(screen_bounds);
+    let elem_size = component.schema.size();
+    let prim_size = component.schema.prim_type.size();
 
-    let mut path = PathBuilder::stroke(stroke_width);
-    let mut first = true;
-
-    let mut group_count = 0usize;
-    let mut min_v = f64::INFINITY;
-    let mut max_v = f64::NEG_INFINITY;
-    let mut min_t = 0.0f64;
-    let mut max_t = 0.0f64;
-
-    let mut emit = |t: f64, v: f64| {
-        let pt = xf.apply(t, v);
-        if first {
-            path.move_to(pt);
-            first = false;
-        } else {
-            path.line_to(pt);
-        }
-    };
-
-    for node_slice in node_slices.iter().rev() {
-        for (ts, cv) in node_slice.iter_values(schema) {
-            let v = match cv.get(element_index) {
-                Some(ev) => ev.as_f64(),
-                None => continue,
-            };
-            let t = ts.0 as f64;
-
-            if stride <= 1 {
-                emit(t, v);
+    fn inner<T: PlotValue>(
+        node_slices: &[TimeSeriesNodeSlice],
+        total: usize,
+        pixel_budget: usize,
+        elem_size: usize,
+        elem_index: usize,
+        prim_size: usize,
+        xf: &ScreenTransform,
+        path: &mut PathBuilder,
+        first: &mut bool,
+    ) {
+        for ns in node_slices.iter().rev() {
+            let Some(stride) = node_stride(ns.timestamps().len(), total, pixel_budget) else {
                 continue;
-            }
-
-            if v < min_v {
-                min_v = v;
-                min_t = t;
-            }
-            if v > max_v {
-                max_v = v;
-                max_t = t;
-            }
-            group_count += 1;
-
-            if group_count >= stride {
-                if min_t <= max_t {
-                    emit(min_t, min_v);
-                    if min_t != max_t {
-                        emit(max_t, max_v);
+            };
+            let timestamps = ns.timestamps();
+            let data = ns.data();
+            let mut i = 0;
+            while i < timestamps.len() {
+                if let Some(v) = read_value::<T>(data, i, elem_size, elem_index, prim_size) {
+                    let pt = xf.apply(timestamps[i].0 as f64, v);
+                    if *first {
+                        path.move_to(pt);
+                        *first = false;
+                    } else {
+                        path.line_to(pt);
                     }
-                } else {
-                    emit(max_t, max_v);
-                    emit(min_t, min_v);
                 }
-                group_count = 0;
-                min_v = f64::INFINITY;
-                max_v = f64::NEG_INFINITY;
+                i += stride;
             }
         }
     }
-    if group_count > 0 && stride > 1 {
-        if min_t <= max_t {
-            emit(min_t, min_v);
-            if min_t != max_t {
-                emit(max_t, max_v);
-            }
-        } else {
-            emit(max_t, max_v);
-            emit(min_t, min_v);
-        }
+
+    let mut path = PathBuilder::stroke(stroke_width);
+    let mut first = true;
+    match component.schema.prim_type {
+        PrimType::F64 => inner::<f64>(&node_slices, total, pixel_budget, elem_size, element_index, prim_size, &xf, &mut path, &mut first),
+        PrimType::F32 => inner::<f32>(&node_slices, total, pixel_budget, elem_size, element_index, prim_size, &xf, &mut path, &mut first),
+        PrimType::I64 => inner::<i64>(&node_slices, total, pixel_budget, elem_size, element_index, prim_size, &xf, &mut path, &mut first),
+        PrimType::I32 => inner::<i32>(&node_slices, total, pixel_budget, elem_size, element_index, prim_size, &xf, &mut path, &mut first),
+        PrimType::I16 => inner::<i16>(&node_slices, total, pixel_budget, elem_size, element_index, prim_size, &xf, &mut path, &mut first),
+        PrimType::I8  => inner::<i8>(&node_slices, total, pixel_budget, elem_size, element_index, prim_size, &xf, &mut path, &mut first),
+        PrimType::U64 => inner::<u64>(&node_slices, total, pixel_budget, elem_size, element_index, prim_size, &xf, &mut path, &mut first),
+        PrimType::U32 => inner::<u32>(&node_slices, total, pixel_budget, elem_size, element_index, prim_size, &xf, &mut path, &mut first),
+        PrimType::U16 => inner::<u16>(&node_slices, total, pixel_budget, elem_size, element_index, prim_size, &xf, &mut path, &mut first),
+        PrimType::U8 | PrimType::Bool => inner::<u8>(&node_slices, total, pixel_budget, elem_size, element_index, prim_size, &xf, &mut path, &mut first),
     }
 
     if !first {

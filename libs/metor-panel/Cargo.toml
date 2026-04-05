@@ -15,6 +15,7 @@ serde = { version = "1", features = ["derive"] }
 smallvec = "1"
 serde_json = "1"
 peg = "0.8.5"
+zerocopy = "0.8"
 jiff = "0.2"
 stellarator.path = "../stellarator"
 
