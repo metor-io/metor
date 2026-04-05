@@ -9,6 +9,8 @@ use gpui::{
     Window, div, prelude::*, px, relative,
 };
 
+use smallvec::SmallVec;
+
 use crate::theme::DARK;
 use drag::ResizeDrag;
 use serial::{SerializedItem, SerializedMember, SerializedPane, SerializedSplit};
@@ -17,6 +19,9 @@ pub use drag::SplitDirection;
 pub use item::{PaneItem, PaneItemHandle};
 pub use pane::{Pane, PaneEvent};
 pub use serial::{ItemRegistry, SerializedTileGroup};
+
+/// Path of member indices through the tile split tree.
+pub(crate) type SplitPath = SmallVec<[usize; 4]>;
 
 /// Events emitted by TileGroup to its parent.
 pub enum TileGroupEvent {
@@ -164,7 +169,7 @@ impl Member {
 
     fn render(
         &self,
-        path: Vec<usize>,
+        path: SplitPath,
         tile_group: &Entity<TileGroup>,
         window: &mut Window,
         cx: &mut App,
@@ -241,7 +246,7 @@ impl Member {
 }
 
 fn render_resize_handle(
-    path: Vec<usize>,
+    path: SplitPath,
     handle_ix: usize,
     axis: Axis,
     tile_group: &Entity<TileGroup>,
@@ -300,7 +305,7 @@ pub struct TileGroup {
     root: Member,
     panes: Vec<Entity<Pane>>,
     /// Cached bounds for each axis path, updated during render.
-    axis_bounds: std::collections::HashMap<Vec<usize>, gpui::Bounds<gpui::Pixels>>,
+    axis_bounds: std::collections::HashMap<SplitPath, gpui::Bounds<gpui::Pixels>>,
 }
 
 impl TileGroup {
@@ -445,7 +450,7 @@ impl TileGroup {
 
     fn handle_resize(
         &mut self,
-        path: Vec<usize>,
+        path: SplitPath,
         handle_ix: usize,
         position: gpui::Point<gpui::Pixels>,
         cx: &mut Context<Self>,
@@ -522,6 +527,6 @@ impl Render for TileGroup {
         div()
             .size_full()
             .bg(DARK.bg_secondary)
-            .child(self.root.render(vec![], &tile_group, window, cx))
+            .child(self.root.render(SplitPath::new(), &tile_group, window, cx))
     }
 }

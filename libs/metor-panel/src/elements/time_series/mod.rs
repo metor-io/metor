@@ -489,11 +489,11 @@ impl TimeSeriesPlot {
     pub fn from_component(
         db: Arc<DB>,
         component_id: impl Into<ComponentId>,
-        indexes: Vec<usize>,
+        indexes: &[usize],
         cx: &mut Context<Self>,
     ) -> Self {
         let component_id = component_id.into();
-        let indexes = if indexes.is_empty() { vec![0] } else { indexes };
+        let indexes = if indexes.is_empty() { &[0usize] as &[usize] } else { indexes };
         let theme = &crate::theme::DARK;
         let traces = indexes
             .iter()

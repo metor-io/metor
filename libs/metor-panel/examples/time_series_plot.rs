@@ -24,7 +24,7 @@ struct ExampleRoot {
 impl ExampleRoot {
     fn new(db: Arc<DB>, component_id: ComponentId, cx: &mut Context<Self>) -> Self {
         let plot =
-            cx.new(|cx| TimeSeriesPlot::from_component(db.clone(), component_id, vec![0], cx));
+            cx.new(|cx| TimeSeriesPlot::from_component(db.clone(), component_id, &[0], cx));
         Self {
             db,
             plot,

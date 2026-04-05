@@ -1,4 +1,5 @@
 use gpui::{Bounds, Entity, IntoElement, Pixels, Point, Render, Window, Context, Empty, div, prelude::*, px};
+use super::SplitPath;
 use serde::{Deserialize, Serialize};
 
 use crate::theme::DARK;
@@ -31,7 +32,7 @@ impl Render for DraggedTab {
 #[derive(Clone)]
 pub struct ResizeDrag {
     /// Path of member indices to the SplitAxis being resized.
-    pub path: Vec<usize>,
+    pub path: SplitPath,
     /// Index of the handle within that axis (between member[ix-1] and member[ix]).
     pub handle_ix: usize,
 }

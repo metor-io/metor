@@ -2,6 +2,7 @@ use std::sync::Arc;
 
 use gpui::{Context, IntoElement, SharedString, Window, div, prelude::*};
 use metor_db::DB;
+use smallvec::SmallVec;
 use std::fmt::Write;
 
 use crate::inspectable::{FieldId, Inspectable, InspectionField, InspectionValue};
@@ -11,6 +12,9 @@ use crate::{AsComponentView, ComponentStream, ComponentStreamBuilder};
 pub mod component_table;
 pub mod table;
 pub mod time_series;
+
+/// Element indices within a component (e.g. x=0, y=1, z=2 for a Vec3).
+pub type ElementIndexes = SmallVec<[usize; 8]>;
 
 pub use component_table::{ComponentTable, new_component_table};
 pub use table::{Column, ColumnSort, Table, TableDelegate};

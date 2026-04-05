@@ -4,6 +4,7 @@ use std::sync::Arc;
 use super::table::{Column, ColumnSort, Table, TableDelegate};
 use super::time_series::{PlotBounds, compute_y_bounds, paint_data_line};
 use crate::{ComponentStream, WalComponentStream, theme::DARK};
+use super::ElementIndexes;
 use gpui::{
     AnyElement, App, AppContext, AsyncApp, Context, Entity, IntoElement, Pixels, SharedString,
     Window, canvas, div, prelude::*, px,
@@ -11,17 +12,17 @@ use gpui::{
 use metor_db::{Component, DB};
 
 struct ComponentRow {
-    name: String,
+    name: SharedString,
     component: Component,
-    indexes: Vec<usize>,
+    indexes: ElementIndexes,
     y_bounds: Option<(f64, f64)>,
     _task: gpui::Task<()>,
 }
 
 impl ComponentRow {
-    pub fn new(name: String, component: Component, cx: &mut Context<Self>) -> Self {
+    pub fn new(name: impl Into<SharedString>, component: Component, cx: &mut Context<Self>) -> Self {
         let num_elements: usize = component.schema.dim.iter().product();
-        let indexes: Vec<usize> = (0..num_elements.max(1)).collect();
+        let indexes: ElementIndexes = (0..num_elements.max(1)).collect();
         let idx_clone = indexes.clone();
         let mut stream = WalComponentStream::new(&component);
         let task = cx.spawn(async move |this, cx| {
@@ -37,7 +38,7 @@ impl ComponentRow {
             }
         });
         Self {
-            name,
+            name: name.into(),
             component,
             indexes,
             y_bounds: None,
@@ -137,7 +138,7 @@ impl TableDelegate for ComponentTableDelegate {
                 .px(px(12.0))
                 .text_size(px(13.0))
                 .text_color(DARK.text_primary)
-                .child(SharedString::from(row_ref.name.clone()))
+                .child(row_ref.name.clone())
                 .into_any_element(),
             1 => {
                 let value = row_ref.current_value();
@@ -175,32 +176,16 @@ impl TableDelegate for ComponentTableDelegate {
     fn sort_column(&mut self, col_ix: usize, sort: ColumnSort, cx: &App) {
         match (col_ix, sort) {
             (0, ColumnSort::Ascending) => {
-                self.rows.sort_by(|a, b| {
-                    let a = a.read(cx).name.clone();
-                    let b = b.read(cx).name.clone();
-                    a.cmp(&b)
-                });
+                self.rows.sort_by(|a, b| a.read(cx).name.cmp(&b.read(cx).name));
             }
             (0, ColumnSort::Descending) => {
-                self.rows.sort_by(|a, b| {
-                    let a = a.read(cx).name.clone();
-                    let b = b.read(cx).name.clone();
-                    b.cmp(&a)
-                });
+                self.rows.sort_by(|a, b| b.read(cx).name.cmp(&a.read(cx).name));
             }
             (1, ColumnSort::Ascending) => {
-                self.rows.sort_by(|a, b| {
-                    let a = a.read(cx).current_value();
-                    let b = b.read(cx).current_value();
-                    a.cmp(&b)
-                });
+                self.rows.sort_by(|a, b| a.read(cx).current_value().cmp(&b.read(cx).current_value()));
             }
             (1, ColumnSort::Descending) => {
-                self.rows.sort_by(|a, b| {
-                    let a = a.read(cx).current_value();
-                    let b = b.read(cx).current_value();
-                    b.cmp(&a)
-                });
+                self.rows.sort_by(|a, b| b.read(cx).current_value().cmp(&a.read(cx).current_value()));
             }
             _ => {}
         }

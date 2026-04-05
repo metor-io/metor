@@ -98,7 +98,7 @@ impl PlotPanel {
     pub fn new(
         db: Arc<DB>,
         component_id: ComponentId,
-        elements: Vec<usize>,
+        elements: &[usize],
         label: impl Into<SharedString>,
         cx: &mut Context<Self>,
     ) -> Self {

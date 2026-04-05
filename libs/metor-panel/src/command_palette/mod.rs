@@ -471,17 +471,17 @@ impl CommandPalette {
 
         list(self.list_state.clone(), move |i, _window, _cx| {
             let (ref label, selected, ref pills) = rows[i];
-            Self::render_item_row_static(label.clone(), selected, pills.clone()).into_any_element()
+            Self::render_item_row(label.clone(), selected, pills).into_any_element()
         })
         .flex_1()
         .py(px(4.0))
         .into_any_element()
     }
 
-    fn render_item_row_static(
+    fn render_item_row(
         label: SharedString,
         selected: bool,
-        pills: Vec<SharedString>,
+        pills: &[SharedString],
     ) -> impl IntoElement {
         let bg = if selected {
             ITEM_SELECTED_BG
