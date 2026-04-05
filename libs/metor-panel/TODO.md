@@ -28,7 +28,7 @@ Features from metor-ui parity (excluding 3D rendering) and new ideas for industr
   Maybe a new type of InspectableValue where you can select a new Box<InspectableValue>
 - [x] **Legend** — trace labels with color indicators
 - [x] **Manual set x and y bounds** - With the inspector you should be able to select times for the X axis using the same syntax as metor-ui, and be able to set y bounds
-- [ ] **Axis zoom and pan**. Scrolling on each axis should just zoom that axis, same for panning
+- [x] **Axis zoom and pan**. Scrolling on each axis should just zoom that axis, same for panning
 
 ## Timeline & Playback
 TBD whether this is good / we want this

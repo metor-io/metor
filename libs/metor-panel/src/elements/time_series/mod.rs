@@ -186,6 +186,25 @@ const X_LABEL_HEIGHT: f32 = 20.0;
 const PADDING: f32 = 8.0;
 const LABEL_FONT_SIZE: f32 = 11.0;
 
+#[derive(Clone, Copy, PartialEq)]
+enum AxisZone {
+    Plot,
+    XAxis,
+    YAxis,
+}
+
+fn axis_zone(pos: Point<Pixels>, plot_area: Bounds<Pixels>) -> AxisZone {
+    let below_plot = pos.y > plot_area.origin.y + plot_area.size.height;
+    let left_of_plot = pos.x < plot_area.origin.x;
+    if left_of_plot {
+        AxisZone::YAxis
+    } else if below_plot {
+        AxisZone::XAxis
+    } else {
+        AxisZone::Plot
+    }
+}
+
 fn plot_area(outer: Bounds<Pixels>) -> Bounds<Pixels> {
     Bounds {
         origin: point(
@@ -747,6 +766,7 @@ pub struct TimeSeriesPlot {
     view: Option<PlotBounds>,
     drag_start: Option<Point<Pixels>>,
     drag_start_view: Option<PlotBounds>,
+    drag_zone: AxisZone,
     last_plot_area: Option<Bounds<Pixels>>,
     x_range: TimeRangeBehavior,
     y_min_override: Option<f64>,
@@ -773,6 +793,7 @@ impl TimeSeriesPlot {
             view: None,
             drag_start: None,
             drag_start_view: None,
+            drag_zone: AxisZone::Plot,
             last_plot_area: None,
             x_range: TimeRangeBehavior::default(),
             y_min_override: None,
@@ -1018,8 +1039,13 @@ impl Render for TimeSeriesPlot {
                                 this.y_max_override = None;
                                 cx.notify();
                             } else {
+                                let zone = this
+                                    .last_plot_area
+                                    .map(|pa| axis_zone(event.position, pa))
+                                    .unwrap_or(AxisZone::Plot);
                                 this.drag_start = Some(event.position);
                                 this.drag_start_view = this.current_view();
+                                this.drag_zone = zone;
                             }
                         }),
                     )
@@ -1044,7 +1070,11 @@ impl Render for TimeSeriesPlot {
                             let dx = event.position.x - start.x;
                             let dy = event.position.y - start.y;
                             let (nx, ny) = start_view.screen_delta_to_norm(pa, dx, dy);
-                            this.view = Some(start_view.offset_by_norm(-nx, ny));
+                            this.view = Some(match this.drag_zone {
+                                AxisZone::Plot => start_view.offset_by_norm(-nx, ny),
+                                AxisZone::XAxis => start_view.offset_x(-nx),
+                                AxisZone::YAxis => start_view.offset_y(ny),
+                            });
                             cx.notify();
                         },
                     ))
@@ -1059,8 +1089,13 @@ impl Render for TimeSeriesPlot {
                             let zoom_amount = f32::from(-delta.y) as f64 / 200.0;
                             let factor = (1.0_f64 + zoom_amount).clamp(0.5, 2.0);
 
+                            let zone = axis_zone(event.position, pa);
                             let (ax, ay) = view.screen_anchor(pa, event.position);
-                            this.view = Some(view.zoom_at(factor, ax, 1.0 - ay));
+                            this.view = Some(match zone {
+                                AxisZone::Plot => view.zoom_at(factor, ax, 1.0 - ay),
+                                AxisZone::XAxis => view.zoom_x(factor, ax),
+                                AxisZone::YAxis => view.zoom_y(factor, 1.0 - ay),
+                            });
                             cx.notify();
                         },
                     ))

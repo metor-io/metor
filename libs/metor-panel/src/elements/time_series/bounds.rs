@@ -50,6 +50,42 @@ impl PlotBounds {
         }
     }
 
+    pub fn zoom_x(self, factor: f64, anchor_x: f64) -> Self {
+        let dw = self.width() * (factor - 1.0);
+        Self {
+            min_x: self.min_x - dw * anchor_x,
+            max_x: self.max_x + dw * (1.0 - anchor_x),
+            ..self
+        }
+    }
+
+    pub fn zoom_y(self, factor: f64, anchor_y: f64) -> Self {
+        let dh = self.height() * (factor - 1.0);
+        Self {
+            min_y: self.min_y - dh * anchor_y,
+            max_y: self.max_y + dh * (1.0 - anchor_y),
+            ..self
+        }
+    }
+
+    pub fn offset_x(self, nx: f64) -> Self {
+        let dx = nx * self.width();
+        Self {
+            min_x: self.min_x + dx,
+            max_x: self.max_x + dx,
+            ..self
+        }
+    }
+
+    pub fn offset_y(self, ny: f64) -> Self {
+        let dy = ny * self.height();
+        Self {
+            min_y: self.min_y + dy,
+            max_y: self.max_y + dy,
+            ..self
+        }
+    }
+
     pub fn normalize(mut self) -> Self {
         if self.min_x >= self.max_x {
             self.min_x = self.max_x.min(self.min_x);
