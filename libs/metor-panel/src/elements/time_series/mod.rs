@@ -405,6 +405,64 @@ fn paint_trace(
     }
 }
 
+/// Decimation state that tracks min/max per pixel-width bucket.
+/// Call `push` for each point in chronological order, then `flush` at the end.
+struct Decimator {
+    bucket_width: f64,
+    bucket_start: f64,
+    min_pt: Option<(f64, f64)>,
+    max_pt: Option<(f64, f64)>,
+    output: Vec<(f64, f64)>,
+}
+
+impl Decimator {
+    fn new(t_min: f64, t_max: f64, pixel_budget: usize) -> Self {
+        let range = t_max - t_min;
+        let bucket_count = (pixel_budget / 2).max(1);
+        Self {
+            bucket_width: if range > 0.0 { range / bucket_count as f64 } else { f64::MAX },
+            bucket_start: t_min,
+            min_pt: None,
+            max_pt: None,
+            output: Vec::with_capacity(pixel_budget),
+        }
+    }
+
+    fn push(&mut self, t: f64, v: f64) {
+        // Flush completed buckets
+        while t >= self.bucket_start + self.bucket_width {
+            self.emit_bucket();
+            self.bucket_start += self.bucket_width;
+        }
+        match self.min_pt {
+            None => { self.min_pt = Some((t, v)); self.max_pt = Some((t, v)); }
+            Some(cur) => {
+                if v < cur.1 { self.min_pt = Some((t, v)); }
+                if v > self.max_pt.unwrap().1 { self.max_pt = Some((t, v)); }
+            }
+        }
+    }
+
+    fn flush(mut self) -> Vec<(f64, f64)> {
+        self.emit_bucket();
+        self.output
+    }
+
+    fn emit_bucket(&mut self) {
+        if let (Some(mn), Some(mx)) = (self.min_pt.take(), self.max_pt.take()) {
+            if mn.0 == mx.0 {
+                self.output.push(mn);
+            } else if mn.0 <= mx.0 {
+                self.output.push(mn);
+                self.output.push(mx);
+            } else {
+                self.output.push(mx);
+                self.output.push(mn);
+            }
+        }
+    }
+}
+
 fn paint_scatter(
     screen_bounds: Bounds<Pixels>,
     component: &Component,
@@ -420,16 +478,22 @@ fn paint_scatter(
     };
     let schema = &component.schema;
     let radius = px(3.0);
-    let node_slices: Vec<_> = slice.as_iter().collect();
+    let mut last_bucket: Option<i32> = None;
 
-    for node_slice in node_slices.iter().rev() {
+    // Order doesn't matter for scatter — iterate forward, skip same-pixel points
+    for node_slice in slice.as_iter() {
         for (ts, cv) in node_slice.iter_values(schema) {
             let v = match cv.get(element_index) {
                 Some(ev) => ev.as_f64(),
                 None => continue,
             };
             let pt = view.to_screen(screen_bounds, ts.0 as f64, v);
-            // Diamond shape as a scatter marker
+            let bucket = f32::from(pt.x) as i32;
+            if last_bucket == Some(bucket) {
+                continue;
+            }
+            last_bucket = Some(bucket);
+
             let mut path = PathBuilder::fill();
             path.move_to(point(pt.x, pt.y - radius));
             path.line_to(point(pt.x + radius, pt.y));
@@ -457,26 +521,26 @@ fn paint_bars(
         return;
     };
     let schema = &component.schema;
-
-    // Collect points to determine bar width
     let node_slices: Vec<_> = slice.as_iter().collect();
-    let mut points: Vec<(f64, f64)> = Vec::new();
+    let pixel_budget = f32::from(screen_bounds.size.width) as usize;
+
+    let mut decimator = Decimator::new(view.min_x, view.max_x, pixel_budget);
     for node_slice in node_slices.iter().rev() {
         for (ts, cv) in node_slice.iter_values(schema) {
             if let Some(ev) = cv.get(element_index) {
-                points.push((ts.0 as f64, ev.as_f64()));
+                decimator.push(ts.0 as f64, ev.as_f64());
             }
         }
     }
+    let points = decimator.flush();
     if points.is_empty() {
         return;
     }
 
-    // Bar width: fraction of screen width divided by point count, capped
     let max_bar_width = px(20.0);
-    let bar_half = (screen_bounds.size.width / (points.len() as f32 * 2.0)).min(max_bar_width / 2.0);
+    let bar_half =
+        (screen_bounds.size.width / (points.len() as f32 * 2.0)).min(max_bar_width / 2.0);
 
-    // Baseline: 0 if visible, otherwise min_y
     let baseline = if view.min_y <= 0.0 && view.max_y >= 0.0 {
         0.0
     } else {
@@ -521,34 +585,39 @@ pub fn paint_data_line(
 ) {
     let start_ts = Timestamp(view.min_x as i64);
     let end_ts = Timestamp(view.max_x as i64);
-    if let Some(slice) = component.time_series.get_range(start_ts..end_ts) {
-        let schema = &component.schema;
-        let node_slices: Vec<_> = slice.as_iter().collect();
+    let Some(slice) = component.time_series.get_range(start_ts..end_ts) else {
+        return;
+    };
+    let schema = &component.schema;
+    let node_slices: Vec<_> = slice.as_iter().collect();
+    let pixel_budget = f32::from(screen_bounds.size.width) as usize;
 
-        let mut path = PathBuilder::stroke(stroke_width);
-        let mut first = true;
-
-        for node_slice in node_slices.iter().rev() {
-            for (ts, cv) in node_slice.iter_values(schema) {
-                let v = match cv.get(element_index) {
-                    Some(ev) => ev.as_f64(),
-                    None => continue,
-                };
-                let screen_pt = view.to_screen(screen_bounds, ts.0 as f64, v);
-                if first {
-                    path.move_to(screen_pt);
-                    first = false;
-                } else {
-                    path.line_to(screen_pt);
-                }
+    let mut decimator = Decimator::new(view.min_x, view.max_x, pixel_budget * 2);
+    for node_slice in node_slices.iter().rev() {
+        for (ts, cv) in node_slice.iter_values(schema) {
+            if let Some(ev) = cv.get(element_index) {
+                decimator.push(ts.0 as f64, ev.as_f64());
             }
         }
+    }
+    let points = decimator.flush();
 
-        if !first {
-            if let Ok(path) = path.build() {
-                window.paint_path(path, color);
-            }
+    if points.is_empty() {
+        return;
+    }
+
+    let mut path = PathBuilder::stroke(stroke_width);
+    for (i, (t, v)) in points.iter().enumerate() {
+        let screen_pt = view.to_screen(screen_bounds, *t, *v);
+        if i == 0 {
+            path.move_to(screen_pt);
+        } else {
+            path.line_to(screen_pt);
         }
+    }
+
+    if let Ok(path) = path.build() {
+        window.paint_path(path, color);
     }
 }
 
