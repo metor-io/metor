@@ -2,6 +2,7 @@ use std::sync::Arc;
 
 use gpui::{Context, IntoElement, SharedString, Window, div, prelude::*};
 use metor_db::DB;
+use metor_proto::types::{ComponentId, ComponentView};
 use smallvec::SmallVec;
 use std::fmt::Write;
 
@@ -20,6 +21,36 @@ pub use component_table::{ComponentTable, new_component_table};
 pub use table::{Column, ColumnSort, Table, TableDelegate};
 pub use time_series::{OpenPageCallback, PlotStyle, TimeSeriesPlot, Trace};
 
+/// Format a component value using metadata hints.
+///
+/// - `is_string`: interprets U8 bytes as UTF-8
+/// - `enum_variants`: maps integer value to variant name
+/// - Otherwise: numeric display with 4 decimal places
+pub fn format_value(view: ComponentView<'_>, db: &DB, component_id: ComponentId) -> String {
+    let meta = db.with_state(|s| s.get_component_metadata(component_id).cloned());
+    if let Some(meta) = &meta {
+        if meta.is_string() {
+            if let ComponentView::U8(array) = &view {
+                let buf = array.buf();
+                let len = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
+                if let Ok(s) = std::str::from_utf8(&buf[..len]) {
+                    return s.to_string();
+                }
+            }
+        }
+        if let Some(variants) = meta.enum_variants() {
+            let variants: Vec<&str> = variants.collect();
+            let idx = view.to_f64() as usize;
+            if let Some(name) = variants.get(idx) {
+                return name.to_string();
+            }
+        }
+    }
+    let mut s = String::new();
+    let _ = write!(s, "{:.4}", view);
+    s
+}
+
 /// Displays a single component's latest value as text, updating reactively.
 pub struct ComponentText {
     value: Option<SharedString>,
@@ -33,14 +64,13 @@ impl ComponentText {
         cx: &mut Context<Self>,
     ) -> Self {
         let task = cx.spawn(async move |this, cx| {
+            let component_id = source.component_id();
             let mut stream = source.into_stream(&db).await;
-            let mut s = String::new();
             loop {
-                {
+                let s = {
                     let view = stream.next().await;
-                    s.clear();
-                    let _ = write!(s, "{:5}", view.as_component_view());
-                }
+                    format_value(view.as_component_view(), &db, component_id)
+                };
                 let result = this.update(cx, |this, cx| {
                     this.value = Some(SharedString::from(&s));
                     cx.notify();

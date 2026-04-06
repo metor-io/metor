@@ -1,4 +1,3 @@
-use std::fmt::Write;
 use std::sync::Arc;
 
 use super::table::{Column, ColumnSort, Table, TableDelegate};
@@ -12,6 +11,7 @@ use gpui::{
 use metor_db::{Component, DB};
 
 struct ComponentRow {
+    db: Arc<DB>,
     name: SharedString,
     component: Component,
     indexes: ElementIndexes,
@@ -21,7 +21,7 @@ struct ComponentRow {
 }
 
 impl ComponentRow {
-    pub fn new(name: impl Into<SharedString>, component: Component, cx: &mut Context<Self>) -> Self {
+    pub fn new(db: Arc<DB>, name: impl Into<SharedString>, component: Component, cx: &mut Context<Self>) -> Self {
         let num_elements: usize = component.schema.dim.iter().product();
         let indexes: ElementIndexes = (0..num_elements.max(1)).collect();
         let idx_clone = indexes.clone();
@@ -46,6 +46,7 @@ impl ComponentRow {
             }
         });
         Self {
+            db,
             name: name.into(),
             component,
             indexes,
@@ -63,9 +64,7 @@ impl ComponentRow {
         let Ok((_size, view)) = self.component.schema.parse_value(buf) else {
             return String::new();
         };
-        let mut s = String::new();
-        let _ = write!(s, "{:.4}", view);
-        s
+        super::format_value(view, &self.db, self.component.component_id)
     }
 
     fn sparkline_bounds(&self) -> Option<PlotBounds> {
@@ -103,14 +102,15 @@ impl ComponentTableDelegate {
         })
     }
 
-    fn build_rows(db: &DB, cx: &mut AsyncApp) -> Vec<Entity<ComponentRow>> {
+    fn build_rows(db: &Arc<DB>, cx: &mut AsyncApp) -> Vec<Entity<ComponentRow>> {
         db.with_state(|state| {
             state
                 .component_metadata_iter()
                 .filter_map(|(id, meta)| {
                     let name = meta.name.clone();
                     let component = state.get_component(*id)?.clone();
-                    Some(cx.new(|cx| ComponentRow::new(name, component, cx)).ok()?)
+                    let db = db.clone();
+                    Some(cx.new(|cx| ComponentRow::new(db, name, component, cx)).ok()?)
                 })
                 .collect()
         })

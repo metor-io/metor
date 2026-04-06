@@ -33,16 +33,25 @@ pub trait ComponentStream {
 
 /// Factory for creating a [`WalComponentStream`] from a component identifier or handle.
 pub trait ComponentStreamBuilder {
+    fn component_id(&self) -> ComponentId;
     fn into_stream(self, db: &DB) -> impl std::future::Future<Output = WalComponentStream> + Send;
 }
 
 impl ComponentStreamBuilder for Component {
+    fn component_id(&self) -> ComponentId {
+        self.component_id
+    }
+
     async fn into_stream(self, _db: &DB) -> WalComponentStream {
         WalComponentStream::new(&self)
     }
 }
 
 impl ComponentStreamBuilder for ComponentId {
+    fn component_id(&self) -> ComponentId {
+        *self
+    }
+
     async fn into_stream(self, db: &DB) -> WalComponentStream {
         let component = wait_for_component(db, self).await;
         WalComponentStream::new(&component)
