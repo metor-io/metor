@@ -55,7 +55,7 @@ pub fn element_names_for_component(db: &DB, component_id: ComponentId) -> Vec<St
 }
 
 /// Generate default element names from a shape (e.g. [3] -> ["x", "y", "z"]).
-fn element_names(shape: &[usize]) -> Vec<String> {
+pub(crate) fn element_names(shape: &[usize]) -> Vec<String> {
     fn walk(shape: &[usize], prefix: &str, out: &mut Vec<String>) {
         if shape.is_empty() {
             out.push(prefix.to_string());

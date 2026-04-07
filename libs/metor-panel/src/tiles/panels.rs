@@ -202,6 +202,31 @@ pub fn tile_palette_page(
     }
 
     items.push(PaletteItem::new(
+        "Update Component",
+        PaletteAction::NextPage {
+            label: Some("Update".into()),
+            page: Box::new({
+                let db = db.clone();
+                move || crate::pending_edits::update_component_page(db)
+            }),
+        },
+    ));
+
+    let pending_count = crate::pending_edits::pending_edits(cx).edits.len();
+    if pending_count > 0 {
+        let label = SharedString::from(format!("Review Edits ({})", pending_count));
+        let on_inspect_review = on_inspect.clone();
+        let review_db = db.clone();
+        items.push(PaletteItem::new(
+            label,
+            PaletteAction::Execute(Box::new(move |_filter, window, cx| {
+                let page = crate::pending_edits::review_page(review_db.clone(), cx);
+                on_inspect_review(page, window, cx);
+            })),
+        ));
+    }
+
+    items.push(PaletteItem::new(
         "Theme",
         PaletteAction::NextPage {
             label: Some("Theme".into()),

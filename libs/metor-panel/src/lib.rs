@@ -8,6 +8,7 @@ pub mod elements;
 pub mod icons;
 pub mod inspectable;
 pub mod offset_parse;
+pub mod pending_edits;
 pub mod theme;
 pub mod tiles;
 pub(crate) mod trace_picker;

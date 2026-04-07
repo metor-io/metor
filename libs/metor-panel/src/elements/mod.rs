@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use gpui::{Context, IntoElement, SharedString, Window, div, prelude::*};
 use metor_db::DB;
-use metor_proto::types::{ComponentId, ComponentView};
+use metor_proto::types::{ComponentId, ComponentView, ElementValue};
 use smallvec::SmallVec;
 use std::fmt::Write;
 
@@ -49,6 +49,26 @@ pub fn format_value(view: ComponentView<'_>, db: &DB, component_id: ComponentId)
     let mut s = String::new();
     let _ = write!(s, "{:.4}", view);
     s
+}
+
+/// Format a single element value, respecting enum variant metadata.
+pub fn format_element_value(value: ElementValue, enum_variants: Option<&[&str]>) -> String {
+    if let Some(variants) = enum_variants {
+        let idx = value.as_usize();
+        if let Some(name) = variants.get(idx) {
+            return name.to_string();
+        }
+    }
+    match value {
+        ElementValue::F32(v) => format!("{:.4}", v),
+        ElementValue::F64(v) => format!("{:.4}", v),
+        ElementValue::Bool(b) => (if b { "true" } else { "false" }).to_string(),
+        _ => {
+            let mut s = String::new();
+            let _ = write!(s, "{}", value.as_f64());
+            s
+        }
+    }
 }
 
 /// Displays a single component's latest value as text, updating reactively.
