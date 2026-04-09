@@ -12,30 +12,157 @@
 // whose fields are only read via `bytemuck::bytes_of`.
 #![allow(dead_code)]
 
+use std::collections::HashMap;
 use std::sync::{Arc, OnceLock};
 
 use bytemuck::{Pod, Zeroable};
 use gpui::{Bounds, Hsla, Pixels, RenderImage};
 use image::{Frame, ImageBuffer, Rgba};
-use metor_db::Component;
 use metor_db::time_series::TimeSeriesNodeSlice;
-use metor_proto::types::{PrimType, Timestamp};
+use metor_db::{Component, ComponentSchema};
+use metor_proto::types::{ComponentId, PrimType, Timestamp};
+use offset_allocator::{Allocation, Allocator};
 use smallvec::SmallVec;
 
 use super::PlotBounds;
 
-const MAX_POINTS: u32 = 1 << 18;
-const VALUE_BUF_BYTES: u64 = MAX_POINTS as u64 * 4;
-const INDEX_BUF_BYTES: u64 = MAX_POINTS as u64 * 4;
+const VALUE_CAPACITY: u32 = 1 << 22;
+const VALUE_BUF_BYTES: u64 = VALUE_CAPACITY as u64 * 4;
+const INDEX_CAPACITY: u32 = 1 << 18;
+const INDEX_BUF_BYTES: u64 = INDEX_CAPACITY as u64 * 4;
 const TARGET_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Bgra8Unorm;
 const SAMPLE_COUNT: u32 = 4;
+const NS_PER_SEC: f64 = 1.0e9;
 
 /// One trace's worth of data the renderer needs each frame.
 pub(super) struct LineDraw<'a> {
+    pub component_id: ComponentId,
     pub component: &'a Component,
     pub element_index: usize,
     pub color: Hsla,
     pub stroke_width: f32,
+}
+
+/// Stable identity for a cached chunk: one element column of one node.
+#[derive(Clone, Copy, Hash, Eq, PartialEq)]
+struct ChunkKey {
+    component_id: u64,
+    element_index: u32,
+    node_id: usize,
+}
+
+/// A node's worth of converted f32 samples currently resident in the value buffers.
+struct ResidentChunk {
+    allocation: Allocation,
+    capacity: u32,
+    sample_count: u32,
+}
+
+/// Per-plot offset-allocator cache mapping each visible node to a region of the
+/// shared `x_buf` / `y_buf`. Once a chunk is uploaded it stays resident until it
+/// either grows past its allocation or the allocator runs out of space.
+struct ValueCache {
+    allocator: Allocator,
+    resident: HashMap<ChunkKey, ResidentChunk>,
+    /// Reference epoch for the x axis, in nanoseconds. All cached x values are
+    /// stored as `f32` seconds relative to this. Set lazily on first upload so
+    /// the dynamic range stays small enough for `f32` to keep useful precision.
+    epoch_ns: Option<i64>,
+}
+
+impl ValueCache {
+    fn new() -> Self {
+        Self {
+            allocator: Allocator::new(VALUE_CAPACITY),
+            resident: HashMap::new(),
+            epoch_ns: None,
+        }
+    }
+
+    fn evict_all(&mut self) {
+        for (_, chunk) in self.resident.drain() {
+            self.allocator.free(chunk.allocation);
+        }
+    }
+
+    /// Ensure the full node behind `slice` is resident for the given trace.
+    /// Returns `(offset, sample_count)` into the shared value buffers.
+    fn ensure(
+        &mut self,
+        queue: &wgpu::Queue,
+        x_buf: &wgpu::Buffer,
+        y_buf: &wgpu::Buffer,
+        scratch_x: &mut Vec<f32>,
+        scratch_y: &mut Vec<f32>,
+        component_id: ComponentId,
+        element_index: usize,
+        slice: &TimeSeriesNodeSlice,
+        schema: &ComponentSchema,
+    ) -> Option<(u32, u32)> {
+        let timestamps = slice.full_timestamps();
+        let len = timestamps.len();
+        if len == 0 {
+            return None;
+        }
+        if self.epoch_ns.is_none() {
+            self.epoch_ns = Some(timestamps[0].0);
+        }
+        let epoch = self.epoch_ns?;
+
+        let key = ChunkKey {
+            component_id: component_id.0,
+            element_index: element_index as u32,
+            node_id: slice.node_id(),
+        };
+
+        if let Some(chunk) = self.resident.get(&key) {
+            if chunk.sample_count as usize >= len {
+                return Some((chunk.allocation.offset, chunk.sample_count));
+            }
+            if (len as u32) > chunk.capacity {
+                let removed = self.resident.remove(&key).unwrap();
+                self.allocator.free(removed.allocation);
+            }
+        }
+
+        if !self.resident.contains_key(&key) {
+            let want = (len as u32).next_power_of_two().max(64);
+            let allocation = match self.allocator.allocate(want) {
+                Some(a) => a,
+                None => {
+                    self.evict_all();
+                    self.allocator.allocate(want)?
+                }
+            };
+            self.resident.insert(
+                key,
+                ResidentChunk {
+                    allocation,
+                    capacity: want,
+                    sample_count: 0,
+                },
+            );
+        }
+
+        let chunk = self.resident.get_mut(&key)?;
+        let from = chunk.sample_count as usize;
+        if from < len {
+            convert_timestamps(&timestamps[from..len], epoch, scratch_x);
+            convert_values(
+                schema,
+                slice.full_data(),
+                element_index,
+                from,
+                len,
+                scratch_y,
+            );
+            let byte_offset = (chunk.allocation.offset + from as u32) as u64 * 4;
+            queue.write_buffer(x_buf, byte_offset, bytemuck::cast_slice(scratch_x));
+            queue.write_buffer(y_buf, byte_offset, bytemuck::cast_slice(scratch_y));
+            chunk.sample_count = len as u32;
+        }
+        Some((chunk.allocation.offset, chunk.sample_count))
+    }
 }
 
 /// Lazily-initialized wgpu adapter/device shared across all `LineRenderer`s.
@@ -52,7 +179,8 @@ impl GpuContext {
     }
 
     async fn create() -> Result<GpuContext, String> {
-        let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor::default());
+        let instance =
+            wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
         let adapter = instance
             .request_adapter(&wgpu::RequestAdapterOptions {
                 power_preference: wgpu::PowerPreference::HighPerformance,
@@ -60,17 +188,14 @@ impl GpuContext {
                 force_fallback_adapter: false,
             })
             .await
-            .ok_or_else(|| "no wgpu adapter".to_string())?;
+            .map_err(|e| format!("no wgpu adapter: {e:?}"))?;
         let (device, queue) = adapter
-            .request_device(
-                &wgpu::DeviceDescriptor {
-                    label: Some("metor-panel line renderer"),
-                    required_features: wgpu::Features::empty(),
-                    required_limits: adapter.limits(),
-                    memory_hints: wgpu::MemoryHints::Performance,
-                },
-                None,
-            )
+            .request_device(&wgpu::DeviceDescriptor {
+                label: Some("metor-panel line renderer"),
+                required_limits: adapter.limits(),
+                memory_hints: wgpu::MemoryHints::Performance,
+                ..Default::default()
+            })
             .await
             .map_err(|e| format!("wgpu request_device failed: {e:?}"))?;
         Ok(GpuContext { device, queue })
@@ -154,8 +279,8 @@ impl RenderTarget {
     }
 }
 
-/// Owns the wgpu pipeline + per-plot scratch buffers and renders all line
-/// traces for one [`TimeSeriesPlot`] into an in-memory image each frame.
+/// Owns the wgpu pipeline, the per-plot value cache, and the offscreen target.
+/// `LineRenderer::render` is invoked once per frame from `TimeSeriesPlot`.
 pub(super) struct LineRenderer {
     ctx: Arc<GpuContext>,
     pipeline: wgpu::RenderPipeline,
@@ -168,8 +293,9 @@ pub(super) struct LineRenderer {
     idx_buf: wgpu::Buffer,
     storage_bg: wgpu::BindGroup,
     target: Option<RenderTarget>,
-    x_scratch: Vec<f32>,
-    y_scratch: Vec<f32>,
+    cache: ValueCache,
+    upload_x: Vec<f32>,
+    upload_y: Vec<f32>,
     idx_scratch: Vec<u32>,
 }
 
@@ -226,8 +352,12 @@ impl LineRenderer {
 
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("line pipeline"),
-            bind_group_layouts: &[&view_layout, &line_layout, &storage_layout],
-            push_constant_ranges: &[],
+            bind_group_layouts: &[
+                Some(&view_layout),
+                Some(&line_layout),
+                Some(&storage_layout),
+            ],
+            immediate_size: 0,
         });
 
         let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
@@ -264,7 +394,7 @@ impl LineRenderer {
                     write_mask: wgpu::ColorWrites::ALL,
                 })],
             }),
-            multiview: None,
+            multiview_mask: None,
             cache: None,
         });
 
@@ -345,9 +475,10 @@ impl LineRenderer {
             idx_buf,
             storage_bg,
             target: None,
-            x_scratch: Vec::with_capacity(MAX_POINTS as usize),
-            y_scratch: Vec::with_capacity(MAX_POINTS as usize),
-            idx_scratch: Vec::with_capacity(MAX_POINTS as usize),
+            cache: ValueCache::new(),
+            upload_x: Vec::new(),
+            upload_y: Vec::new(),
+            idx_scratch: Vec::with_capacity(INDEX_CAPACITY as usize),
         })
     }
 
@@ -375,57 +506,82 @@ impl LineRenderer {
         {
             self.target = Some(RenderTarget::new(&self.ctx.device, width, height));
         }
-        let target = self.target.as_ref()?;
 
-        let epoch = view.min_x as i64;
-        let dx = (view.max_x - view.min_x).max(1e-12);
+        let LineRenderer {
+            ctx,
+            cache,
+            upload_x,
+            upload_y,
+            idx_scratch,
+            x_buf,
+            y_buf,
+            idx_buf,
+            view_buf,
+            line_buf,
+            view_bg,
+            line_bg,
+            storage_bg,
+            pipeline,
+            target,
+            ..
+        } = self;
+        let target = target.as_ref()?;
+
+        idx_scratch.clear();
+        let pixel_budget = width as usize;
+        let mut plans: Vec<TracePlan> = Vec::with_capacity(traces.len());
+
+        for trace in traces.iter() {
+            let plan = plan_trace(
+                ctx,
+                cache,
+                upload_x,
+                upload_y,
+                idx_scratch,
+                x_buf,
+                y_buf,
+                trace,
+                view,
+                pixel_budget,
+            );
+            plans.push(plan);
+        }
+
+        if plans.iter().all(|p| p.spans.is_empty()) {
+            return None;
+        }
+
+        let epoch_ns = cache.epoch_ns.unwrap_or(view.min_x as i64);
+        let view_min_sec = ((view.min_x as i64 - epoch_ns) as f64 / NS_PER_SEC) as f32;
+        let view_max_sec = ((view.max_x as i64 - epoch_ns) as f64 / NS_PER_SEC) as f32;
+        let dx_sec = (view_max_sec - view_min_sec).max(1e-12);
         let dy = (view.max_y - view.min_y).max(1e-12);
+        let scale_x = 2.0 / dx_sec;
+        let scale_y = (2.0 / dy) as f32;
         let view_uniform = ViewUniform {
-            scale: [(2.0 / dx) as f32, (2.0 / dy) as f32],
-            offset: [-1.0, -1.0 - (view.min_y * 2.0 / dy) as f32],
+            scale: [scale_x, scale_y],
+            offset: [-1.0 - view_min_sec * scale_x, -1.0 - (view.min_y as f32) * scale_y],
             viewport: [width as f32, height as f32],
             _pad: [0.0; 2],
         };
-        self.ctx
-            .queue
-            .write_buffer(&self.view_buf, 0, bytemuck::bytes_of(&view_uniform));
+        ctx.queue
+            .write_buffer(view_buf, 0, bytemuck::bytes_of(&view_uniform));
+        ctx.queue
+            .write_buffer(idx_buf, 0, bytemuck::cast_slice(idx_scratch));
 
         let mut any_drawn = false;
-        for trace in traces.iter() {
-            let count = collect_decimated(
-                trace.component,
-                trace.element_index,
-                view,
-                width as usize,
-                epoch,
-                &mut self.x_scratch,
-                &mut self.y_scratch,
-            );
-            if count < 2 {
+        for (trace, plan) in traces.iter().zip(plans.iter()) {
+            if plan.spans.is_empty() {
                 continue;
             }
-            self.idx_scratch.clear();
-            self.idx_scratch.extend(0..count as u32);
-
-            self.ctx
-                .queue
-                .write_buffer(&self.x_buf, 0, bytemuck::cast_slice(&self.x_scratch));
-            self.ctx
-                .queue
-                .write_buffer(&self.y_buf, 0, bytemuck::cast_slice(&self.y_scratch));
-            self.ctx
-                .queue
-                .write_buffer(&self.idx_buf, 0, bytemuck::cast_slice(&self.idx_scratch));
-
             let rgba = trace.color.to_rgb();
             let line_uniform = LineUniform {
                 color: [rgba.r, rgba.g, rgba.b, rgba.a],
                 line_width: trace.stroke_width * scale,
                 _pad: [0.0; 3],
             };
-            self.ctx
-                .queue
-                .write_buffer(&self.line_buf, 0, bytemuck::bytes_of(&line_uniform));
+            ctx.queue
+                .write_buffer(line_buf, 0, bytemuck::bytes_of(&line_uniform));
 
             let load = if !any_drawn {
                 wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT)
@@ -433,8 +589,7 @@ impl LineRenderer {
                 wgpu::LoadOp::Load
             };
             let mut encoder =
-                self.ctx
-                    .device
+                ctx.device
                     .create_command_encoder(&wgpu::CommandEncoderDescriptor {
                         label: Some("line encoder"),
                     });
@@ -443,6 +598,7 @@ impl LineRenderer {
                     label: Some("line pass"),
                     color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                         view: &target.msaa_view,
+                        depth_slice: None,
                         resolve_target: Some(&target.resolve_view),
                         ops: wgpu::Operations {
                             load,
@@ -452,14 +608,17 @@ impl LineRenderer {
                     depth_stencil_attachment: None,
                     timestamp_writes: None,
                     occlusion_query_set: None,
+                    multiview_mask: None,
                 });
-                pass.set_pipeline(&self.pipeline);
-                pass.set_bind_group(0, &self.view_bg, &[]);
-                pass.set_bind_group(1, &self.line_bg, &[]);
-                pass.set_bind_group(2, &self.storage_bg, &[]);
-                pass.draw(0..4, 0..(count as u32 - 1));
+                pass.set_pipeline(pipeline);
+                pass.set_bind_group(0, &*view_bg, &[]);
+                pass.set_bind_group(1, &*line_bg, &[]);
+                pass.set_bind_group(2, &*storage_bg, &[]);
+                for span in &plan.spans {
+                    pass.draw(0..4, span.instance_start..span.instance_end);
+                }
             }
-            self.ctx.queue.submit(Some(encoder.finish()));
+            ctx.queue.submit(Some(encoder.finish()));
             any_drawn = true;
         }
 
@@ -467,12 +626,11 @@ impl LineRenderer {
             return None;
         }
 
-        let mut encoder = self
-            .ctx
-            .device
-            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                label: Some("line readback"),
-            });
+        let mut encoder =
+            ctx.device
+                .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                    label: Some("line readback"),
+                });
         encoder.copy_texture_to_buffer(
             wgpu::TexelCopyTextureInfo {
                 texture: &target.resolve_texture,
@@ -494,9 +652,9 @@ impl LineRenderer {
                 depth_or_array_layers: 1,
             },
         );
-        self.ctx.queue.submit(Some(encoder.finish()));
+        ctx.queue.submit(Some(encoder.finish()));
 
-        let bytes = read_staging(&self.ctx.device, target)?;
+        let bytes = read_staging(&ctx.device, target)?;
         let buffer =
             ImageBuffer::<Rgba<u8>, Vec<u8>>::from_raw(target.width, target.height, bytes)?;
         let mut frames = SmallVec::<[Frame; 1]>::new();
@@ -511,7 +669,7 @@ fn read_staging(device: &wgpu::Device, target: &RenderTarget) -> Option<Vec<u8>>
     slice.map_async(wgpu::MapMode::Read, move |res| {
         let _ = tx.send(res);
     });
-    let _ = device.poll(wgpu::Maintain::Wait);
+    let _ = device.poll(wgpu::PollType::wait_indefinitely());
     rx.recv().ok()?.ok()?;
 
     let unpadded_row = target.width as usize * 4;
@@ -528,187 +686,150 @@ fn read_staging(device: &wgpu::Device, target: &RenderTarget) -> Option<Vec<u8>>
     Some(out)
 }
 
-/// Walk a component's visible time range, two-level decimate to fit
-/// `pixel_budget`, and push (timestamp − epoch, value) pairs into the
-/// supplied scratch vectors. Returns the number of points written.
-fn collect_decimated(
-    component: &Component,
-    element_index: usize,
+/// One contiguous range of `idx_buf` instances belonging to a single trace.
+struct DrawSpan {
+    instance_start: u32,
+    instance_end: u32,
+}
+
+struct TracePlan {
+    spans: Vec<DrawSpan>,
+}
+
+/// Resolve the visible nodes for one trace, ensure each is resident in the
+/// value cache, and emit decimated indices into `idx_scratch`. Returns the
+/// list of `(start, end)` instance ranges to draw, one per visible chunk.
+#[allow(clippy::too_many_arguments)]
+fn plan_trace(
+    ctx: &GpuContext,
+    cache: &mut ValueCache,
+    upload_x: &mut Vec<f32>,
+    upload_y: &mut Vec<f32>,
+    idx_scratch: &mut Vec<u32>,
+    x_buf: &wgpu::Buffer,
+    y_buf: &wgpu::Buffer,
+    trace: &LineDraw<'_>,
     view: PlotBounds,
     pixel_budget: usize,
-    epoch: i64,
-    xs: &mut Vec<f32>,
-    ys: &mut Vec<f32>,
-) -> usize {
-    xs.clear();
-    ys.clear();
+) -> TracePlan {
+    let mut spans = Vec::new();
     if pixel_budget == 0 {
-        return 0;
+        return TracePlan { spans };
     }
-    let cap = MAX_POINTS as usize;
     let start = Timestamp(view.min_x as i64);
     let end = Timestamp(view.max_x as i64);
-    let Some(slice) = component.time_series.get_range(start..end) else {
-        return 0;
+    let Some(slice) = trace.component.time_series.get_range(start..end) else {
+        return TracePlan { spans };
     };
     let nodes: Vec<_> = slice.as_iter().collect();
     let total: usize = nodes.iter().map(|n| n.timestamps().len()).sum();
-    let elem_size = component.schema.size();
-    let prim_size = component.schema.prim_type.size();
 
-    fn fill<T: super::PlotValue>(
-        nodes: &[TimeSeriesNodeSlice],
-        total: usize,
-        budget: usize,
-        cap: usize,
-        elem_size: usize,
-        elem_index: usize,
-        prim_size: usize,
-        epoch: i64,
-        xs: &mut Vec<f32>,
-        ys: &mut Vec<f32>,
-    ) {
-        for n in nodes.iter().rev() {
-            let Some(stride) = super::node_stride(n.timestamps().len(), total, budget) else {
-                continue;
-            };
-            let timestamps = n.timestamps();
-            let data = n.data();
-            let mut i = 0;
-            while i < timestamps.len() {
-                if xs.len() >= cap {
-                    return;
-                }
-                if let Some(v) = super::read_value::<T>(data, i, elem_size, elem_index, prim_size) {
-                    xs.push((timestamps[i].0 - epoch) as f32);
-                    ys.push(v as f32);
-                }
-                i += stride;
+    for node in nodes.iter().rev() {
+        let visible = node.timestamps();
+        let visible_len = visible.len();
+        if visible_len == 0 {
+            continue;
+        }
+        let Some(stride) = super::node_stride(visible_len, total, pixel_budget) else {
+            continue;
+        };
+        let Some((chunk_offset, chunk_count)) = cache.ensure(
+            &ctx.queue,
+            x_buf,
+            y_buf,
+            upload_x,
+            upload_y,
+            trace.component_id,
+            trace.element_index,
+            node,
+            &trace.component.schema,
+        ) else {
+            continue;
+        };
+
+        let full = node.full_timestamps();
+        let slice_start_idx = unsafe {
+            visible.as_ptr().offset_from(full.as_ptr()).max(0) as usize
+        };
+
+        let span_first = idx_scratch.len() as u32;
+        let mut count_pushed: u32 = 0;
+        let mut i = 0;
+        while i < visible_len {
+            let absolute = slice_start_idx + i;
+            if (absolute as u32) >= chunk_count {
+                break;
             }
+            idx_scratch.push(chunk_offset + absolute as u32);
+            count_pushed += 1;
+            i += stride;
+        }
+        if count_pushed >= 2 {
+            spans.push(DrawSpan {
+                instance_start: span_first,
+                instance_end: span_first + count_pushed - 1,
+            });
+        } else {
+            idx_scratch.truncate(span_first as usize);
         }
     }
 
-    match component.schema.prim_type {
-        PrimType::F64 => fill::<f64>(
-            &nodes,
-            total,
-            pixel_budget,
-            cap,
-            elem_size,
-            element_index,
-            prim_size,
-            epoch,
-            xs,
-            ys,
-        ),
-        PrimType::F32 => fill::<f32>(
-            &nodes,
-            total,
-            pixel_budget,
-            cap,
-            elem_size,
-            element_index,
-            prim_size,
-            epoch,
-            xs,
-            ys,
-        ),
-        PrimType::I64 => fill::<i64>(
-            &nodes,
-            total,
-            pixel_budget,
-            cap,
-            elem_size,
-            element_index,
-            prim_size,
-            epoch,
-            xs,
-            ys,
-        ),
-        PrimType::I32 => fill::<i32>(
-            &nodes,
-            total,
-            pixel_budget,
-            cap,
-            elem_size,
-            element_index,
-            prim_size,
-            epoch,
-            xs,
-            ys,
-        ),
-        PrimType::I16 => fill::<i16>(
-            &nodes,
-            total,
-            pixel_budget,
-            cap,
-            elem_size,
-            element_index,
-            prim_size,
-            epoch,
-            xs,
-            ys,
-        ),
-        PrimType::I8 => fill::<i8>(
-            &nodes,
-            total,
-            pixel_budget,
-            cap,
-            elem_size,
-            element_index,
-            prim_size,
-            epoch,
-            xs,
-            ys,
-        ),
-        PrimType::U64 => fill::<u64>(
-            &nodes,
-            total,
-            pixel_budget,
-            cap,
-            elem_size,
-            element_index,
-            prim_size,
-            epoch,
-            xs,
-            ys,
-        ),
-        PrimType::U32 => fill::<u32>(
-            &nodes,
-            total,
-            pixel_budget,
-            cap,
-            elem_size,
-            element_index,
-            prim_size,
-            epoch,
-            xs,
-            ys,
-        ),
-        PrimType::U16 => fill::<u16>(
-            &nodes,
-            total,
-            pixel_budget,
-            cap,
-            elem_size,
-            element_index,
-            prim_size,
-            epoch,
-            xs,
-            ys,
-        ),
-        PrimType::U8 | PrimType::Bool => fill::<u8>(
-            &nodes,
-            total,
-            pixel_budget,
-            cap,
-            elem_size,
-            element_index,
-            prim_size,
-            epoch,
-            xs,
-            ys,
-        ),
-    }
-    xs.len()
+    TracePlan { spans }
 }
+
+/// Convert a slice of `Timestamp`s to `f32` seconds relative to `epoch_ns`.
+fn convert_timestamps(timestamps: &[Timestamp], epoch_ns: i64, out: &mut Vec<f32>) {
+    out.clear();
+    out.reserve(timestamps.len());
+    for ts in timestamps {
+        let delta_ns = ts.0 - epoch_ns;
+        out.push((delta_ns as f64 / NS_PER_SEC) as f32);
+    }
+}
+
+/// Convert `data[from..to]` for the given element index into f32 values.
+fn convert_values(
+    schema: &ComponentSchema,
+    full_data: &[u8],
+    element_index: usize,
+    from: usize,
+    to: usize,
+    out: &mut Vec<f32>,
+) {
+    let elem_size = schema.size();
+    let prim_size = schema.prim_type.size();
+    out.clear();
+    out.reserve(to - from);
+
+    fn fill<T: super::PlotValue>(
+        data: &[u8],
+        from: usize,
+        to: usize,
+        elem_size: usize,
+        elem_index: usize,
+        prim_size: usize,
+        out: &mut Vec<f32>,
+    ) {
+        for i in from..to {
+            let v = super::read_value::<T>(data, i, elem_size, elem_index, prim_size)
+                .unwrap_or(0.0);
+            out.push(v as f32);
+        }
+    }
+
+    match schema.prim_type {
+        PrimType::F64 => fill::<f64>(full_data, from, to, elem_size, element_index, prim_size, out),
+        PrimType::F32 => fill::<f32>(full_data, from, to, elem_size, element_index, prim_size, out),
+        PrimType::I64 => fill::<i64>(full_data, from, to, elem_size, element_index, prim_size, out),
+        PrimType::I32 => fill::<i32>(full_data, from, to, elem_size, element_index, prim_size, out),
+        PrimType::I16 => fill::<i16>(full_data, from, to, elem_size, element_index, prim_size, out),
+        PrimType::I8  => fill::<i8> (full_data, from, to, elem_size, element_index, prim_size, out),
+        PrimType::U64 => fill::<u64>(full_data, from, to, elem_size, element_index, prim_size, out),
+        PrimType::U32 => fill::<u32>(full_data, from, to, elem_size, element_index, prim_size, out),
+        PrimType::U16 => fill::<u16>(full_data, from, to, elem_size, element_index, prim_size, out),
+        PrimType::U8 | PrimType::Bool => {
+            fill::<u8>(full_data, from, to, elem_size, element_index, prim_size, out)
+        }
+    }
+}
+

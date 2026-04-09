@@ -1287,6 +1287,7 @@ impl Render for TimeSeriesPlot {
                                                         )
                                                 })
                                                 .map(|rt| gpu::LineDraw {
+                                                    component_id: rt.trace.component_id,
                                                     component: &rt.component,
                                                     element_index: rt.trace.element_index,
                                                     color: rt.trace.color,
