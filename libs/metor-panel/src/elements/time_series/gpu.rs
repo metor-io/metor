@@ -28,6 +28,7 @@ const MAX_POINTS: u32 = 1 << 18;
 const VALUE_BUF_BYTES: u64 = MAX_POINTS as u64 * 4;
 const INDEX_BUF_BYTES: u64 = MAX_POINTS as u64 * 4;
 const TARGET_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Bgra8Unorm;
+const SAMPLE_COUNT: u32 = 4;
 
 /// One trace's worth of data the renderer needs each frame.
 pub(super) struct LineDraw<'a> {
@@ -96,17 +97,33 @@ struct LineUniform {
 struct RenderTarget {
     width: u32,
     height: u32,
-    texture: wgpu::Texture,
-    view: wgpu::TextureView,
+    resolve_texture: wgpu::Texture,
+    msaa_view: wgpu::TextureView,
+    resolve_view: wgpu::TextureView,
     staging: wgpu::Buffer,
     padded_bytes_per_row: u32,
 }
 
 impl RenderTarget {
     fn new(device: &wgpu::Device, width: u32, height: u32) -> Self {
-        let texture = device.create_texture(&wgpu::TextureDescriptor {
-            label: Some("line target"),
-            size: wgpu::Extent3d { width, height, depth_or_array_layers: 1 },
+        let extent = wgpu::Extent3d {
+            width,
+            height,
+            depth_or_array_layers: 1,
+        };
+        let msaa_texture = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("line msaa"),
+            size: extent,
+            mip_level_count: 1,
+            sample_count: SAMPLE_COUNT,
+            dimension: wgpu::TextureDimension::D2,
+            format: TARGET_FORMAT,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+            view_formats: &[],
+        });
+        let resolve_texture = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("line resolve"),
+            size: extent,
             mip_level_count: 1,
             sample_count: 1,
             dimension: wgpu::TextureDimension::D2,
@@ -114,7 +131,8 @@ impl RenderTarget {
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
             view_formats: &[],
         });
-        let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+        let msaa_view = msaa_texture.create_view(&wgpu::TextureViewDescriptor::default());
+        let resolve_view = resolve_texture.create_view(&wgpu::TextureViewDescriptor::default());
         let unpadded = width * 4;
         let align = wgpu::COPY_BYTES_PER_ROW_ALIGNMENT;
         let padded_bytes_per_row = unpadded.div_ceil(align) * align;
@@ -124,7 +142,15 @@ impl RenderTarget {
             usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
             mapped_at_creation: false,
         });
-        Self { width, height, texture, view, staging, padded_bytes_per_row }
+        Self {
+            width,
+            height,
+            resolve_texture,
+            msaa_view,
+            resolve_view,
+            staging,
+            padded_bytes_per_row,
+        }
     }
 }
 
@@ -223,7 +249,11 @@ impl LineRenderer {
                 conservative: false,
             },
             depth_stencil: None,
-            multisample: wgpu::MultisampleState::default(),
+            multisample: wgpu::MultisampleState {
+                count: SAMPLE_COUNT,
+                mask: !0,
+                alpha_to_coverage_enabled: false,
+            },
             fragment: Some(wgpu::FragmentState {
                 module: &shader,
                 entry_point: Some("fragment"),
@@ -288,9 +318,18 @@ impl LineRenderer {
             label: Some("line storage bg"),
             layout: &storage_layout,
             entries: &[
-                wgpu::BindGroupEntry { binding: 0, resource: x_buf.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 1, resource: y_buf.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 2, resource: idx_buf.as_entire_binding() },
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: x_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: y_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: idx_buf.as_entire_binding(),
+                },
             ],
         });
 
@@ -329,7 +368,11 @@ impl LineRenderer {
             return None;
         }
 
-        if self.target.as_ref().is_none_or(|t| t.width != width || t.height != height) {
+        if self
+            .target
+            .as_ref()
+            .is_none_or(|t| t.width != width || t.height != height)
+        {
             self.target = Some(RenderTarget::new(&self.ctx.device, width, height));
         }
         let target = self.target.as_ref()?;
@@ -343,7 +386,9 @@ impl LineRenderer {
             viewport: [width as f32, height as f32],
             _pad: [0.0; 2],
         };
-        self.ctx.queue.write_buffer(&self.view_buf, 0, bytemuck::bytes_of(&view_uniform));
+        self.ctx
+            .queue
+            .write_buffer(&self.view_buf, 0, bytemuck::bytes_of(&view_uniform));
 
         let mut any_drawn = false;
         for trace in traces.iter() {
@@ -362,23 +407,25 @@ impl LineRenderer {
             self.idx_scratch.clear();
             self.idx_scratch.extend(0..count as u32);
 
-            self.ctx.queue.write_buffer(
-                &self.x_buf, 0, bytemuck::cast_slice(&self.x_scratch),
-            );
-            self.ctx.queue.write_buffer(
-                &self.y_buf, 0, bytemuck::cast_slice(&self.y_scratch),
-            );
-            self.ctx.queue.write_buffer(
-                &self.idx_buf, 0, bytemuck::cast_slice(&self.idx_scratch),
-            );
+            self.ctx
+                .queue
+                .write_buffer(&self.x_buf, 0, bytemuck::cast_slice(&self.x_scratch));
+            self.ctx
+                .queue
+                .write_buffer(&self.y_buf, 0, bytemuck::cast_slice(&self.y_scratch));
+            self.ctx
+                .queue
+                .write_buffer(&self.idx_buf, 0, bytemuck::cast_slice(&self.idx_scratch));
 
             let rgba = trace.color.to_rgb();
             let line_uniform = LineUniform {
                 color: [rgba.r, rgba.g, rgba.b, rgba.a],
-                line_width: trace.stroke_width,
+                line_width: trace.stroke_width * scale,
                 _pad: [0.0; 3],
             };
-            self.ctx.queue.write_buffer(&self.line_buf, 0, bytemuck::bytes_of(&line_uniform));
+            self.ctx
+                .queue
+                .write_buffer(&self.line_buf, 0, bytemuck::bytes_of(&line_uniform));
 
             let load = if !any_drawn {
                 wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT)
@@ -386,16 +433,21 @@ impl LineRenderer {
                 wgpu::LoadOp::Load
             };
             let mut encoder =
-                self.ctx.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                    label: Some("line encoder"),
-                });
+                self.ctx
+                    .device
+                    .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                        label: Some("line encoder"),
+                    });
             {
                 let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                     label: Some("line pass"),
                     color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                        view: &target.view,
-                        resolve_target: None,
-                        ops: wgpu::Operations { load, store: wgpu::StoreOp::Store },
+                        view: &target.msaa_view,
+                        resolve_target: Some(&target.resolve_view),
+                        ops: wgpu::Operations {
+                            load,
+                            store: wgpu::StoreOp::Store,
+                        },
                     })],
                     depth_stencil_attachment: None,
                     timestamp_writes: None,
@@ -415,13 +467,15 @@ impl LineRenderer {
             return None;
         }
 
-        let mut encoder =
-            self.ctx.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+        let mut encoder = self
+            .ctx
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
                 label: Some("line readback"),
             });
         encoder.copy_texture_to_buffer(
             wgpu::TexelCopyTextureInfo {
-                texture: &target.texture,
+                texture: &target.resolve_texture,
                 mip_level: 0,
                 origin: wgpu::Origin3d::ZERO,
                 aspect: wgpu::TextureAspect::All,
@@ -434,12 +488,17 @@ impl LineRenderer {
                     rows_per_image: Some(target.height),
                 },
             },
-            wgpu::Extent3d { width: target.width, height: target.height, depth_or_array_layers: 1 },
+            wgpu::Extent3d {
+                width: target.width,
+                height: target.height,
+                depth_or_array_layers: 1,
+            },
         );
         self.ctx.queue.submit(Some(encoder.finish()));
 
         let bytes = read_staging(&self.ctx.device, target)?;
-        let buffer = ImageBuffer::<Rgba<u8>, Vec<u8>>::from_raw(target.width, target.height, bytes)?;
+        let buffer =
+            ImageBuffer::<Rgba<u8>, Vec<u8>>::from_raw(target.width, target.height, bytes)?;
         let mut frames = SmallVec::<[Frame; 1]>::new();
         frames.push(Frame::new(buffer));
         Some(Arc::new(RenderImage::new(frames)))
@@ -520,9 +579,7 @@ fn collect_decimated(
                 if xs.len() >= cap {
                     return;
                 }
-                if let Some(v) =
-                    super::read_value::<T>(data, i, elem_size, elem_index, prim_size)
-                {
+                if let Some(v) = super::read_value::<T>(data, i, elem_size, elem_index, prim_size) {
                     xs.push((timestamps[i].0 - epoch) as f32);
                     ys.push(v as f32);
                 }
@@ -532,16 +589,126 @@ fn collect_decimated(
     }
 
     match component.schema.prim_type {
-        PrimType::F64 => fill::<f64>(&nodes, total, pixel_budget, cap, elem_size, element_index, prim_size, epoch, xs, ys),
-        PrimType::F32 => fill::<f32>(&nodes, total, pixel_budget, cap, elem_size, element_index, prim_size, epoch, xs, ys),
-        PrimType::I64 => fill::<i64>(&nodes, total, pixel_budget, cap, elem_size, element_index, prim_size, epoch, xs, ys),
-        PrimType::I32 => fill::<i32>(&nodes, total, pixel_budget, cap, elem_size, element_index, prim_size, epoch, xs, ys),
-        PrimType::I16 => fill::<i16>(&nodes, total, pixel_budget, cap, elem_size, element_index, prim_size, epoch, xs, ys),
-        PrimType::I8  => fill::<i8> (&nodes, total, pixel_budget, cap, elem_size, element_index, prim_size, epoch, xs, ys),
-        PrimType::U64 => fill::<u64>(&nodes, total, pixel_budget, cap, elem_size, element_index, prim_size, epoch, xs, ys),
-        PrimType::U32 => fill::<u32>(&nodes, total, pixel_budget, cap, elem_size, element_index, prim_size, epoch, xs, ys),
-        PrimType::U16 => fill::<u16>(&nodes, total, pixel_budget, cap, elem_size, element_index, prim_size, epoch, xs, ys),
-        PrimType::U8 | PrimType::Bool => fill::<u8>(&nodes, total, pixel_budget, cap, elem_size, element_index, prim_size, epoch, xs, ys),
+        PrimType::F64 => fill::<f64>(
+            &nodes,
+            total,
+            pixel_budget,
+            cap,
+            elem_size,
+            element_index,
+            prim_size,
+            epoch,
+            xs,
+            ys,
+        ),
+        PrimType::F32 => fill::<f32>(
+            &nodes,
+            total,
+            pixel_budget,
+            cap,
+            elem_size,
+            element_index,
+            prim_size,
+            epoch,
+            xs,
+            ys,
+        ),
+        PrimType::I64 => fill::<i64>(
+            &nodes,
+            total,
+            pixel_budget,
+            cap,
+            elem_size,
+            element_index,
+            prim_size,
+            epoch,
+            xs,
+            ys,
+        ),
+        PrimType::I32 => fill::<i32>(
+            &nodes,
+            total,
+            pixel_budget,
+            cap,
+            elem_size,
+            element_index,
+            prim_size,
+            epoch,
+            xs,
+            ys,
+        ),
+        PrimType::I16 => fill::<i16>(
+            &nodes,
+            total,
+            pixel_budget,
+            cap,
+            elem_size,
+            element_index,
+            prim_size,
+            epoch,
+            xs,
+            ys,
+        ),
+        PrimType::I8 => fill::<i8>(
+            &nodes,
+            total,
+            pixel_budget,
+            cap,
+            elem_size,
+            element_index,
+            prim_size,
+            epoch,
+            xs,
+            ys,
+        ),
+        PrimType::U64 => fill::<u64>(
+            &nodes,
+            total,
+            pixel_budget,
+            cap,
+            elem_size,
+            element_index,
+            prim_size,
+            epoch,
+            xs,
+            ys,
+        ),
+        PrimType::U32 => fill::<u32>(
+            &nodes,
+            total,
+            pixel_budget,
+            cap,
+            elem_size,
+            element_index,
+            prim_size,
+            epoch,
+            xs,
+            ys,
+        ),
+        PrimType::U16 => fill::<u16>(
+            &nodes,
+            total,
+            pixel_budget,
+            cap,
+            elem_size,
+            element_index,
+            prim_size,
+            epoch,
+            xs,
+            ys,
+        ),
+        PrimType::U8 | PrimType::Bool => fill::<u8>(
+            &nodes,
+            total,
+            pixel_budget,
+            cap,
+            elem_size,
+            element_index,
+            prim_size,
+            epoch,
+            xs,
+            ys,
+        ),
     }
     xs.len()
 }
