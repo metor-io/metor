@@ -1,8 +1,8 @@
 use std::sync::Arc;
 
 use gpui::{
-    Bounds, Context, Hsla, IntoElement, MouseButton, PathBuilder, Pixels, Point, SharedString,
-    Styled, TextRun, Window, canvas, div, point, prelude::*, px,
+    Bounds, Context, Corners, Hsla, IntoElement, MouseButton, PathBuilder, Pixels, Point,
+    RenderImage, SharedString, Styled, TextRun, Window, canvas, div, point, prelude::*, px,
 };
 use metor_db::{Component, DB};
 use metor_db::time_series::TimeSeriesNodeSlice;
@@ -14,6 +14,8 @@ use crate::wait_for_component;
 
 mod bounds;
 pub use bounds::*;
+
+mod gpu;
 
 /// Generate Y-axis tick positions within the visible bounds (sorted ascending).
 /// When the range spans 0, ticks are anchored at 0 and extend outward.
@@ -287,6 +289,7 @@ fn paint_plot<'a>(
     traces: impl Iterator<Item = &'a ResolvedTrace>,
     view: PlotBounds,
     data_start: f64,
+    line_image: Option<Arc<RenderImage>>,
     window: &mut Window,
     cx: &mut gpui::App,
 ) {
@@ -334,14 +337,23 @@ fn paint_plot<'a>(
         }
     }
 
-    // 2. Data traces — clipped to outer bounds so lines extend under axis areas
+    // 2. Data traces — clipped to outer bounds so lines extend under axis areas.
+    //    When the GPU path produced an image, blit it for the line traces and
+    //    let the CPU path handle scatter/bar.
+    let gpu_handled_lines = line_image.is_some();
     window.with_content_mask(
         Some(gpui::ContentMask {
             bounds: outer_bounds,
         }),
         |window| {
+            if let Some(img) = line_image {
+                let _ = window.paint_image(pb, Corners::default(), img, 0, false);
+            }
             for rt in &traces {
                 if !rt.trace.visible {
+                    continue;
+                }
+                if gpu_handled_lines && matches!(rt.trace.style, PlotStyle::Line) {
                     continue;
                 }
                 paint_trace(pb, &rt.component, &view, &rt.trace, window);
@@ -864,6 +876,7 @@ pub struct TimeSeriesPlot {
     y_min_override: Option<f64>,
     y_max_override: Option<f64>,
     on_open_page: Option<OpenPageCallback>,
+    gpu_line: Option<gpu::LineRenderer>,
     _tasks: Vec<gpui::Task<()>>,
 }
 
@@ -892,6 +905,7 @@ impl TimeSeriesPlot {
             y_min_override: None,
             y_max_override: None,
             on_open_page: None,
+            gpu_line: None,
             _tasks: tasks,
         }
     }
@@ -1250,21 +1264,50 @@ impl Render for TimeSeriesPlot {
                         canvas(
                             {
                                 let this = cx.entity().downgrade();
-                                move |bounds, _window, cx| {
+                                move |bounds, window, cx| {
                                     let pa = plot_area(bounds);
-                                    let _ = this.update(cx, |this, _cx| {
-                                        this.last_plot_area = Some(pa);
-                                    });
-                                    (bounds, view)
+                                    let scale_factor = window.scale_factor();
+                                    let line_image = this
+                                        .update(cx, |this, _cx| {
+                                            this.last_plot_area = Some(pa);
+                                            let view = view?;
+                                            if this.gpu_line.is_none() {
+                                                this.gpu_line = gpu::LineRenderer::try_new();
+                                            }
+                                            let renderer = this.gpu_line.as_mut()?;
+                                            let draws: Vec<gpu::LineDraw<'_>> = this
+                                                .traces
+                                                .iter()
+                                                .flatten()
+                                                .filter(|rt| {
+                                                    rt.trace.visible
+                                                        && matches!(
+                                                            rt.trace.style,
+                                                            PlotStyle::Line
+                                                        )
+                                                })
+                                                .map(|rt| gpu::LineDraw {
+                                                    component: &rt.component,
+                                                    element_index: rt.trace.element_index,
+                                                    color: rt.trace.color,
+                                                    stroke_width: rt.trace.stroke_width,
+                                                })
+                                                .collect();
+                                            renderer.render(pa, view, scale_factor, &draws)
+                                        })
+                                        .ok()
+                                        .flatten();
+                                    (bounds, view, line_image)
                                 }
                             },
-                            move |_, (bounds, view), window, cx| {
+                            move |_, (bounds, view, line_image), window, cx| {
                                 if let Some(view) = view {
                                     paint_plot(
                                         bounds,
                                         traces.iter().flatten(),
                                         view,
                                         data_start,
+                                        line_image,
                                         window,
                                         cx,
                                     );

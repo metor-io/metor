@@ -22,6 +22,10 @@ peg = "0.8.5"
 zerocopy = "0.8"
 jiff = "0.2"
 stellarator.path = "../stellarator"
+wgpu = "24"
+bytemuck = { version = "1", features = ["derive"] }
+pollster = "0.4"
+image = "0.25"
 
 [[example]]
 name = "component_text"
