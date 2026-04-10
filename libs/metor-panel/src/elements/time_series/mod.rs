@@ -4,8 +4,8 @@ use gpui::{
     Bounds, Context, Corners, Hsla, IntoElement, MouseButton, PathBuilder, Pixels, Point,
     RenderImage, SharedString, Styled, TextRun, Window, canvas, div, point, prelude::*, px,
 };
-use metor_db::{Component, DB};
 use metor_db::time_series::TimeSeriesNodeSlice;
+use metor_db::{Component, DB};
 use metor_proto::types::{ComponentId, PrimType, Timestamp};
 
 use crate::inspectable::{FieldId, Inspectable, InspectionField, InspectionValue, ListItem};
@@ -457,20 +457,33 @@ fn paint_trace(
     match trace.style {
         PlotStyle::Line => {
             paint_data_line(
-                screen_bounds, component, view, trace.color,
-                px(trace.stroke_width), trace.element_index, window,
+                screen_bounds,
+                component,
+                view,
+                trace.color,
+                px(trace.stroke_width),
+                trace.element_index,
+                window,
             );
         }
         PlotStyle::Scatter => {
             paint_scatter(
-                screen_bounds, component, view, trace.color,
-                trace.element_index, window,
+                screen_bounds,
+                component,
+                view,
+                trace.color,
+                trace.element_index,
+                window,
             );
         }
         PlotStyle::Bar => {
             paint_bars(
-                screen_bounds, component, view, trace.color,
-                trace.element_index, window,
+                screen_bounds,
+                component,
+                view,
+                trace.color,
+                trace.element_index,
+                window,
             );
         }
     }
@@ -516,10 +529,9 @@ fn read_value<T: PlotValue>(
     sample_index: usize,
     elem_size: usize,
     elem_index: usize,
-    prim_size: usize,
 ) -> Option<f64> {
-    let offset = sample_index * elem_size + elem_index * prim_size;
-    let buf = data.get(offset..offset + prim_size)?;
+    let offset = sample_index * elem_size + elem_index * size_of::<T>();
+    let buf = data.get(offset..offset + size_of::<T>())?;
     T::read_from_bytes(buf).ok().map(|v| v.to_f64())
 }
 
@@ -570,7 +582,6 @@ fn paint_scatter(
     let total: usize = node_slices.iter().map(|ns| ns.timestamps().len()).sum();
     let xf = view.screen_transform(screen_bounds);
     let elem_size = component.schema.size();
-    let prim_size = component.schema.prim_type.size();
 
     fn inner<T: PlotValue>(
         node_slices: &[TimeSeriesNodeSlice],
@@ -578,7 +589,6 @@ fn paint_scatter(
         pixel_budget: usize,
         elem_size: usize,
         elem_index: usize,
-        prim_size: usize,
         xf: &ScreenTransform,
         path: &mut PathBuilder,
         any: &mut bool,
@@ -592,7 +602,7 @@ fn paint_scatter(
             let data = ns.data();
             let mut i = 0;
             while i < timestamps.len() {
-                if let Some(v) = read_value::<T>(data, i, elem_size, elem_index, prim_size) {
+                if let Some(v) = read_value::<T>(data, i, elem_size, elem_index) {
                     let pt = xf.apply(timestamps[i].0 as f64, v);
                     path.move_to(point(pt.x, pt.y - radius));
                     path.line_to(point(pt.x + radius, pt.y));
@@ -609,16 +619,106 @@ fn paint_scatter(
     let mut path = PathBuilder::fill();
     let mut any = false;
     match component.schema.prim_type {
-        PrimType::F64 => inner::<f64>(&node_slices, total, pixel_budget, elem_size, element_index, prim_size, &xf, &mut path, &mut any),
-        PrimType::F32 => inner::<f32>(&node_slices, total, pixel_budget, elem_size, element_index, prim_size, &xf, &mut path, &mut any),
-        PrimType::I64 => inner::<i64>(&node_slices, total, pixel_budget, elem_size, element_index, prim_size, &xf, &mut path, &mut any),
-        PrimType::I32 => inner::<i32>(&node_slices, total, pixel_budget, elem_size, element_index, prim_size, &xf, &mut path, &mut any),
-        PrimType::I16 => inner::<i16>(&node_slices, total, pixel_budget, elem_size, element_index, prim_size, &xf, &mut path, &mut any),
-        PrimType::I8  => inner::<i8>(&node_slices, total, pixel_budget, elem_size, element_index, prim_size, &xf, &mut path, &mut any),
-        PrimType::U64 => inner::<u64>(&node_slices, total, pixel_budget, elem_size, element_index, prim_size, &xf, &mut path, &mut any),
-        PrimType::U32 => inner::<u32>(&node_slices, total, pixel_budget, elem_size, element_index, prim_size, &xf, &mut path, &mut any),
-        PrimType::U16 => inner::<u16>(&node_slices, total, pixel_budget, elem_size, element_index, prim_size, &xf, &mut path, &mut any),
-        PrimType::U8 | PrimType::Bool => inner::<u8>(&node_slices, total, pixel_budget, elem_size, element_index, prim_size, &xf, &mut path, &mut any),
+        PrimType::F64 => inner::<f64>(
+            &node_slices,
+            total,
+            pixel_budget,
+            elem_size,
+            element_index,
+            &xf,
+            &mut path,
+            &mut any,
+        ),
+        PrimType::F32 => inner::<f32>(
+            &node_slices,
+            total,
+            pixel_budget,
+            elem_size,
+            element_index,
+            &xf,
+            &mut path,
+            &mut any,
+        ),
+        PrimType::I64 => inner::<i64>(
+            &node_slices,
+            total,
+            pixel_budget,
+            elem_size,
+            element_index,
+            &xf,
+            &mut path,
+            &mut any,
+        ),
+        PrimType::I32 => inner::<i32>(
+            &node_slices,
+            total,
+            pixel_budget,
+            elem_size,
+            element_index,
+            &xf,
+            &mut path,
+            &mut any,
+        ),
+        PrimType::I16 => inner::<i16>(
+            &node_slices,
+            total,
+            pixel_budget,
+            elem_size,
+            element_index,
+            &xf,
+            &mut path,
+            &mut any,
+        ),
+        PrimType::I8 => inner::<i8>(
+            &node_slices,
+            total,
+            pixel_budget,
+            elem_size,
+            element_index,
+            &xf,
+            &mut path,
+            &mut any,
+        ),
+        PrimType::U64 => inner::<u64>(
+            &node_slices,
+            total,
+            pixel_budget,
+            elem_size,
+            element_index,
+            &xf,
+            &mut path,
+            &mut any,
+        ),
+        PrimType::U32 => inner::<u32>(
+            &node_slices,
+            total,
+            pixel_budget,
+            elem_size,
+            element_index,
+            &xf,
+            &mut path,
+            &mut any,
+        ),
+        PrimType::U16 => inner::<u16>(
+            &node_slices,
+            total,
+            pixel_budget,
+            elem_size,
+            element_index,
+            &xf,
+            &mut path,
+            &mut any,
+        ),
+        PrimType::U8 | PrimType::Bool => inner::<u8>(
+            &node_slices,
+            total,
+            pixel_budget,
+            elem_size,
+            element_index,
+            &xf,
+            &mut path,
+            &mut any,
+        ),
     }
 
     if any {
@@ -645,9 +745,12 @@ fn paint_bars(
     let total: usize = node_slices.iter().map(|ns| ns.timestamps().len()).sum();
     let xf = view.screen_transform(screen_bounds);
     let elem_size = component.schema.size();
-    let prim_size = component.schema.prim_type.size();
 
-    let baseline = if view.min_y <= 0.0 && view.max_y >= 0.0 { 0.0 } else { view.min_y };
+    let baseline = if view.min_y <= 0.0 && view.max_y >= 0.0 {
+        0.0
+    } else {
+        view.min_y
+    };
     let baseline_y = xf.apply(view.min_x, baseline).y;
     let budget = pixel_budget.max(1);
     let max_bar_width = px(20.0);
@@ -659,7 +762,6 @@ fn paint_bars(
         pixel_budget: usize,
         elem_size: usize,
         elem_index: usize,
-        prim_size: usize,
         xf: &ScreenTransform,
         baseline: f64,
         baseline_y: Pixels,
@@ -675,7 +777,7 @@ fn paint_bars(
             let data = ns.data();
             let mut i = 0;
             while i < timestamps.len() {
-                if let Some(v) = read_value::<T>(data, i, elem_size, elem_index, prim_size) {
+                if let Some(v) = read_value::<T>(data, i, elem_size, elem_index) {
                     let t = timestamps[i].0 as f64;
                     let top = xf.apply(t, v);
                     let left = top.x - bar_half;
@@ -700,16 +802,136 @@ fn paint_bars(
     let mut path = PathBuilder::fill();
     let mut any = false;
     match component.schema.prim_type {
-        PrimType::F64 => inner::<f64>(&node_slices, total, pixel_budget, elem_size, element_index, prim_size, &xf, baseline, baseline_y, bar_half, &mut path, &mut any),
-        PrimType::F32 => inner::<f32>(&node_slices, total, pixel_budget, elem_size, element_index, prim_size, &xf, baseline, baseline_y, bar_half, &mut path, &mut any),
-        PrimType::I64 => inner::<i64>(&node_slices, total, pixel_budget, elem_size, element_index, prim_size, &xf, baseline, baseline_y, bar_half, &mut path, &mut any),
-        PrimType::I32 => inner::<i32>(&node_slices, total, pixel_budget, elem_size, element_index, prim_size, &xf, baseline, baseline_y, bar_half, &mut path, &mut any),
-        PrimType::I16 => inner::<i16>(&node_slices, total, pixel_budget, elem_size, element_index, prim_size, &xf, baseline, baseline_y, bar_half, &mut path, &mut any),
-        PrimType::I8  => inner::<i8>(&node_slices, total, pixel_budget, elem_size, element_index, prim_size, &xf, baseline, baseline_y, bar_half, &mut path, &mut any),
-        PrimType::U64 => inner::<u64>(&node_slices, total, pixel_budget, elem_size, element_index, prim_size, &xf, baseline, baseline_y, bar_half, &mut path, &mut any),
-        PrimType::U32 => inner::<u32>(&node_slices, total, pixel_budget, elem_size, element_index, prim_size, &xf, baseline, baseline_y, bar_half, &mut path, &mut any),
-        PrimType::U16 => inner::<u16>(&node_slices, total, pixel_budget, elem_size, element_index, prim_size, &xf, baseline, baseline_y, bar_half, &mut path, &mut any),
-        PrimType::U8 | PrimType::Bool => inner::<u8>(&node_slices, total, pixel_budget, elem_size, element_index, prim_size, &xf, baseline, baseline_y, bar_half, &mut path, &mut any),
+        PrimType::F64 => inner::<f64>(
+            &node_slices,
+            total,
+            pixel_budget,
+            elem_size,
+            element_index,
+            &xf,
+            baseline,
+            baseline_y,
+            bar_half,
+            &mut path,
+            &mut any,
+        ),
+        PrimType::F32 => inner::<f32>(
+            &node_slices,
+            total,
+            pixel_budget,
+            elem_size,
+            element_index,
+            &xf,
+            baseline,
+            baseline_y,
+            bar_half,
+            &mut path,
+            &mut any,
+        ),
+        PrimType::I64 => inner::<i64>(
+            &node_slices,
+            total,
+            pixel_budget,
+            elem_size,
+            element_index,
+            &xf,
+            baseline,
+            baseline_y,
+            bar_half,
+            &mut path,
+            &mut any,
+        ),
+        PrimType::I32 => inner::<i32>(
+            &node_slices,
+            total,
+            pixel_budget,
+            elem_size,
+            element_index,
+            &xf,
+            baseline,
+            baseline_y,
+            bar_half,
+            &mut path,
+            &mut any,
+        ),
+        PrimType::I16 => inner::<i16>(
+            &node_slices,
+            total,
+            pixel_budget,
+            elem_size,
+            element_index,
+            &xf,
+            baseline,
+            baseline_y,
+            bar_half,
+            &mut path,
+            &mut any,
+        ),
+        PrimType::I8 => inner::<i8>(
+            &node_slices,
+            total,
+            pixel_budget,
+            elem_size,
+            element_index,
+            &xf,
+            baseline,
+            baseline_y,
+            bar_half,
+            &mut path,
+            &mut any,
+        ),
+        PrimType::U64 => inner::<u64>(
+            &node_slices,
+            total,
+            pixel_budget,
+            elem_size,
+            element_index,
+            &xf,
+            baseline,
+            baseline_y,
+            bar_half,
+            &mut path,
+            &mut any,
+        ),
+        PrimType::U32 => inner::<u32>(
+            &node_slices,
+            total,
+            pixel_budget,
+            elem_size,
+            element_index,
+            &xf,
+            baseline,
+            baseline_y,
+            bar_half,
+            &mut path,
+            &mut any,
+        ),
+        PrimType::U16 => inner::<u16>(
+            &node_slices,
+            total,
+            pixel_budget,
+            elem_size,
+            element_index,
+            &xf,
+            baseline,
+            baseline_y,
+            bar_half,
+            &mut path,
+            &mut any,
+        ),
+        PrimType::U8 | PrimType::Bool => inner::<u8>(
+            &node_slices,
+            total,
+            pixel_budget,
+            elem_size,
+            element_index,
+            &xf,
+            baseline,
+            baseline_y,
+            bar_half,
+            &mut path,
+            &mut any,
+        ),
     }
 
     if any {
@@ -741,7 +963,6 @@ pub fn paint_data_line(
     let total: usize = node_slices.iter().map(|ns| ns.timestamps().len()).sum();
     let xf = view.screen_transform(screen_bounds);
     let elem_size = component.schema.size();
-    let prim_size = component.schema.prim_type.size();
 
     fn inner<T: PlotValue>(
         node_slices: &[TimeSeriesNodeSlice],
@@ -749,7 +970,6 @@ pub fn paint_data_line(
         pixel_budget: usize,
         elem_size: usize,
         elem_index: usize,
-        prim_size: usize,
         xf: &ScreenTransform,
         path: &mut PathBuilder,
         first: &mut bool,
@@ -762,7 +982,7 @@ pub fn paint_data_line(
             let data = ns.data();
             let mut i = 0;
             while i < timestamps.len() {
-                if let Some(v) = read_value::<T>(data, i, elem_size, elem_index, prim_size) {
+                if let Some(v) = read_value::<T>(data, i, elem_size, elem_index) {
                     let pt = xf.apply(timestamps[i].0 as f64, v);
                     if *first {
                         path.move_to(pt);
@@ -779,16 +999,106 @@ pub fn paint_data_line(
     let mut path = PathBuilder::stroke(stroke_width);
     let mut first = true;
     match component.schema.prim_type {
-        PrimType::F64 => inner::<f64>(&node_slices, total, pixel_budget, elem_size, element_index, prim_size, &xf, &mut path, &mut first),
-        PrimType::F32 => inner::<f32>(&node_slices, total, pixel_budget, elem_size, element_index, prim_size, &xf, &mut path, &mut first),
-        PrimType::I64 => inner::<i64>(&node_slices, total, pixel_budget, elem_size, element_index, prim_size, &xf, &mut path, &mut first),
-        PrimType::I32 => inner::<i32>(&node_slices, total, pixel_budget, elem_size, element_index, prim_size, &xf, &mut path, &mut first),
-        PrimType::I16 => inner::<i16>(&node_slices, total, pixel_budget, elem_size, element_index, prim_size, &xf, &mut path, &mut first),
-        PrimType::I8  => inner::<i8>(&node_slices, total, pixel_budget, elem_size, element_index, prim_size, &xf, &mut path, &mut first),
-        PrimType::U64 => inner::<u64>(&node_slices, total, pixel_budget, elem_size, element_index, prim_size, &xf, &mut path, &mut first),
-        PrimType::U32 => inner::<u32>(&node_slices, total, pixel_budget, elem_size, element_index, prim_size, &xf, &mut path, &mut first),
-        PrimType::U16 => inner::<u16>(&node_slices, total, pixel_budget, elem_size, element_index, prim_size, &xf, &mut path, &mut first),
-        PrimType::U8 | PrimType::Bool => inner::<u8>(&node_slices, total, pixel_budget, elem_size, element_index, prim_size, &xf, &mut path, &mut first),
+        PrimType::F64 => inner::<f64>(
+            &node_slices,
+            total,
+            pixel_budget,
+            elem_size,
+            element_index,
+            &xf,
+            &mut path,
+            &mut first,
+        ),
+        PrimType::F32 => inner::<f32>(
+            &node_slices,
+            total,
+            pixel_budget,
+            elem_size,
+            element_index,
+            &xf,
+            &mut path,
+            &mut first,
+        ),
+        PrimType::I64 => inner::<i64>(
+            &node_slices,
+            total,
+            pixel_budget,
+            elem_size,
+            element_index,
+            &xf,
+            &mut path,
+            &mut first,
+        ),
+        PrimType::I32 => inner::<i32>(
+            &node_slices,
+            total,
+            pixel_budget,
+            elem_size,
+            element_index,
+            &xf,
+            &mut path,
+            &mut first,
+        ),
+        PrimType::I16 => inner::<i16>(
+            &node_slices,
+            total,
+            pixel_budget,
+            elem_size,
+            element_index,
+            &xf,
+            &mut path,
+            &mut first,
+        ),
+        PrimType::I8 => inner::<i8>(
+            &node_slices,
+            total,
+            pixel_budget,
+            elem_size,
+            element_index,
+            &xf,
+            &mut path,
+            &mut first,
+        ),
+        PrimType::U64 => inner::<u64>(
+            &node_slices,
+            total,
+            pixel_budget,
+            elem_size,
+            element_index,
+            &xf,
+            &mut path,
+            &mut first,
+        ),
+        PrimType::U32 => inner::<u32>(
+            &node_slices,
+            total,
+            pixel_budget,
+            elem_size,
+            element_index,
+            &xf,
+            &mut path,
+            &mut first,
+        ),
+        PrimType::U16 => inner::<u16>(
+            &node_slices,
+            total,
+            pixel_budget,
+            elem_size,
+            element_index,
+            &xf,
+            &mut path,
+            &mut first,
+        ),
+        PrimType::U8 | PrimType::Bool => inner::<u8>(
+            &node_slices,
+            total,
+            pixel_budget,
+            elem_size,
+            element_index,
+            &xf,
+            &mut path,
+            &mut first,
+        ),
     }
 
     if !first {
@@ -877,6 +1187,8 @@ pub struct TimeSeriesPlot {
     y_max_override: Option<f64>,
     on_open_page: Option<OpenPageCallback>,
     gpu_line: Option<gpu::LineRenderer>,
+    gpu_line_image: Option<Arc<RenderImage>>,
+    gpu_dropped_images: Vec<Arc<RenderImage>>,
     _tasks: Vec<gpui::Task<()>>,
 }
 
@@ -906,6 +1218,8 @@ impl TimeSeriesPlot {
             y_max_override: None,
             on_open_page: None,
             gpu_line: None,
+            gpu_line_image: None,
+            gpu_dropped_images: Vec::new(),
             _tasks: tasks,
         }
     }
@@ -1033,10 +1347,13 @@ impl TimeSeriesPlot {
         let mut order: Vec<ComponentId> = Vec::new();
         for rt in self.traces.iter().flatten() {
             let id = rt.trace.component_id;
-            groups.entry(id).or_insert_with(|| {
-                order.push(id);
-                Vec::new()
-            }).push(rt.trace.element_index);
+            groups
+                .entry(id)
+                .or_insert_with(|| {
+                    order.push(id);
+                    Vec::new()
+                })
+                .push(rt.trace.element_index);
         }
 
         if order.is_empty() {
@@ -1051,10 +1368,7 @@ impl TimeSeriesPlot {
                     crate::trace_picker::element_names_for_component(&self.db, *comp_id);
                 let comp_name = self
                     .db
-                    .with_state(|s| {
-                        s.get_component_metadata(*comp_id)
-                            .map(|m| m.name.clone())
-                    })
+                    .with_state(|s| s.get_component_metadata(*comp_id).map(|m| m.name.clone()))
                     .unwrap_or_default();
 
                 if indexes.len() == all_elements.len() {
@@ -1267,37 +1581,80 @@ impl Render for TimeSeriesPlot {
                                 move |bounds, window, cx| {
                                     let pa = plot_area(bounds);
                                     let scale_factor = window.scale_factor();
-                                    let line_image = this
+                                    let (line_image, dropped) = this
                                         .update(cx, |this, _cx| {
                                             this.last_plot_area = Some(pa);
-                                            let view = view?;
+                                            let view = match view {
+                                                Some(v) => v,
+                                                None => {
+                                                    return (
+                                                        this.gpu_line_image.clone(),
+                                                        std::mem::take(
+                                                            &mut this.gpu_dropped_images,
+                                                        ),
+                                                    );
+                                                }
+                                            };
                                             if this.gpu_line.is_none() {
                                                 this.gpu_line = gpu::LineRenderer::try_new();
                                             }
-                                            let renderer = this.gpu_line.as_mut()?;
-                                            let draws: Vec<gpu::LineDraw<'_>> = this
-                                                .traces
-                                                .iter()
-                                                .flatten()
-                                                .filter(|rt| {
-                                                    rt.trace.visible
-                                                        && matches!(
-                                                            rt.trace.style,
-                                                            PlotStyle::Line
-                                                        )
-                                                })
-                                                .map(|rt| gpu::LineDraw {
-                                                    component_id: rt.trace.component_id,
-                                                    component: &rt.component,
-                                                    element_index: rt.trace.element_index,
-                                                    color: rt.trace.color,
-                                                    stroke_width: rt.trace.stroke_width,
-                                                })
-                                                .collect();
-                                            renderer.render(pa, view, scale_factor, &draws)
+                                            if let Some(renderer) = this.gpu_line.as_mut() {
+                                                let draws: Vec<gpu::LineDraw<'_>> = this
+                                                    .traces
+                                                    .iter()
+                                                    .flatten()
+                                                    .filter(|rt| {
+                                                        rt.trace.visible
+                                                            && matches!(
+                                                                rt.trace.style,
+                                                                PlotStyle::Line
+                                                            )
+                                                    })
+                                                    .map(|rt| gpu::LineDraw {
+                                                        component_id: rt.trace.component_id,
+                                                        component: &rt.component,
+                                                        element_index: rt.trace.element_index,
+                                                        color: rt.trace.color,
+                                                        stroke_width: rt.trace.stroke_width,
+                                                    })
+                                                    .collect();
+                                                if let Some(handle) = renderer.render_to_gpu(
+                                                    pa,
+                                                    view,
+                                                    scale_factor,
+                                                    &draws,
+                                                ) {
+                                                    _cx.spawn(async move |this, cx| {
+                                                        let image = cx
+                                                            .background_executor()
+                                                            .spawn(
+                                                                async move { handle.read_image() },
+                                                            )
+                                                            .await;
+                                                        if let Some(img) = image {
+                                                            let _ = this.update(cx, |this, cx| {
+                                                                if let Some(prev) =
+                                                                    this.gpu_line_image.replace(img)
+                                                                {
+                                                                    this.gpu_dropped_images
+                                                                        .push(prev);
+                                                                }
+                                                                cx.notify();
+                                                            });
+                                                        }
+                                                    })
+                                                    .detach();
+                                                }
+                                            }
+                                            (
+                                                this.gpu_line_image.clone(),
+                                                std::mem::take(&mut this.gpu_dropped_images),
+                                            )
                                         })
-                                        .ok()
-                                        .flatten();
+                                        .unwrap_or((None, Vec::new()));
+                                    for img in dropped {
+                                        let _ = window.drop_image(img);
+                                    }
                                     (bounds, view, line_image)
                                 }
                             },

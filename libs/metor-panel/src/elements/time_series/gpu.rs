@@ -13,7 +13,10 @@
 #![allow(dead_code)]
 
 use std::collections::HashMap;
-use std::sync::{Arc, OnceLock};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+
+use std::sync::OnceLock;
 
 use bytemuck::{Pod, Zeroable};
 use gpui::{Bounds, Hsla, Pixels, RenderImage};
@@ -179,8 +182,7 @@ impl GpuContext {
     }
 
     async fn create() -> Result<GpuContext, String> {
-        let instance =
-            wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
+        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
         let adapter = instance
             .request_adapter(&wgpu::RequestAdapterOptions {
                 power_preference: wgpu::PowerPreference::HighPerformance,
@@ -279,8 +281,39 @@ impl RenderTarget {
     }
 }
 
+/// Handle returned by [`LineRenderer::render_to_gpu`] when a new frame is
+/// submitted. Callers use it on a background thread to wait for the GPU,
+/// read the mapped staging buffer, and build a `RenderImage`.
+pub(super) struct ReadbackHandle {
+    ctx: Arc<GpuContext>,
+    staging: wgpu::Buffer,
+    width: u32,
+    height: u32,
+    padded_bytes_per_row: u32,
+    in_flight: Arc<AtomicBool>,
+}
+
+impl ReadbackHandle {
+    /// Block the current thread until the GPU finishes, then read the mapped
+    /// staging bytes and build a `RenderImage`. Call this from a background
+    /// thread (e.g. via `BackgroundExecutor::spawn`).
+    pub(super) fn read_image(self) -> Option<Arc<RenderImage>> {
+        let _ = self.ctx.device.poll(wgpu::PollType::wait_indefinitely());
+        let bytes = read_mapped_bytes(
+            &self.staging,
+            self.width,
+            self.height,
+            self.padded_bytes_per_row,
+        )?;
+        self.staging.unmap();
+        self.in_flight.store(false, Ordering::Release);
+        let buffer = ImageBuffer::<Rgba<u8>, Vec<u8>>::from_raw(self.width, self.height, bytes)?;
+        let frames = SmallVec::from_elem(Frame::new(buffer), 1);
+        Some(Arc::new(RenderImage::new(frames)))
+    }
+}
+
 /// Owns the wgpu pipeline, the per-plot value cache, and the offscreen target.
-/// `LineRenderer::render` is invoked once per frame from `TimeSeriesPlot`.
 pub(super) struct LineRenderer {
     ctx: Arc<GpuContext>,
     pipeline: wgpu::RenderPipeline,
@@ -297,6 +330,7 @@ pub(super) struct LineRenderer {
     upload_x: Vec<f32>,
     upload_y: Vec<f32>,
     idx_scratch: Vec<u32>,
+    readback_in_flight: Arc<AtomicBool>,
 }
 
 impl LineRenderer {
@@ -479,19 +513,25 @@ impl LineRenderer {
             upload_x: Vec::new(),
             upload_y: Vec::new(),
             idx_scratch: Vec::with_capacity(INDEX_CAPACITY as usize),
+            readback_in_flight: Arc::new(AtomicBool::new(false)),
         })
     }
 
-    /// Draw all `traces` into the offscreen target sized to `bounds` and
-    /// return the result as an image suitable for `Window::paint_image`.
-    /// Returns `None` if there is nothing visible to draw.
-    pub(super) fn render(
+    /// Submit the GPU render + readback copy for all visible line traces
+    /// and return a [`ReadbackHandle`] the caller should `.read_image()` on
+    /// a background thread. Returns `None` if a previous readback is still
+    /// in flight, or there is nothing to draw.
+    pub(super) fn render_to_gpu(
         &mut self,
         bounds: Bounds<Pixels>,
         view: PlotBounds,
         scale_factor: f32,
         traces: &[LineDraw<'_>],
-    ) -> Option<Arc<RenderImage>> {
+    ) -> Option<ReadbackHandle> {
+        if self.readback_in_flight.load(Ordering::Acquire) {
+            return None;
+        }
+
         let scale = scale_factor.max(1.0);
         let width = ((f32::from(bounds.size.width) * scale).round() as u32).max(1);
         let height = ((f32::from(bounds.size.height) * scale).round() as u32).max(1);
@@ -507,32 +547,8 @@ impl LineRenderer {
             self.target = Some(RenderTarget::new(&self.ctx.device, width, height));
         }
 
-        let LineRenderer {
-            ctx,
-            cache,
-            upload_x,
-            upload_y,
-            idx_scratch,
-            x_buf,
-            y_buf,
-            idx_buf,
-            view_buf,
-            line_buf,
-            view_bg,
-            line_bg,
-            storage_bg,
-            pipeline,
-            target,
-            ..
-        } = self;
-        let target = target.as_ref()?;
-
-        idx_scratch.clear();
-        let pixel_budget = width as usize;
-        let mut plans: Vec<TracePlan> = Vec::with_capacity(traces.len());
-
-        for trace in traces.iter() {
-            let plan = plan_trace(
+        let handle: Option<ReadbackHandle> = {
+            let LineRenderer {
                 ctx,
                 cache,
                 upload_x,
@@ -540,149 +556,184 @@ impl LineRenderer {
                 idx_scratch,
                 x_buf,
                 y_buf,
-                trace,
-                view,
-                pixel_budget,
-            );
-            plans.push(plan);
-        }
+                idx_buf,
+                view_buf,
+                line_buf,
+                view_bg,
+                line_bg,
+                storage_bg,
+                pipeline,
+                target,
+                ..
+            } = self;
+            let target = target.as_ref()?;
 
-        if plans.iter().all(|p| p.spans.is_empty()) {
-            return None;
-        }
+            idx_scratch.clear();
+            let pixel_budget = width as usize;
+            let mut plans: Vec<TracePlan> = Vec::with_capacity(traces.len());
 
-        let epoch_ns = cache.epoch_ns.unwrap_or(view.min_x as i64);
-        let view_min_sec = ((view.min_x as i64 - epoch_ns) as f64 / NS_PER_SEC) as f32;
-        let view_max_sec = ((view.max_x as i64 - epoch_ns) as f64 / NS_PER_SEC) as f32;
-        let dx_sec = (view_max_sec - view_min_sec).max(1e-12);
-        let dy = (view.max_y - view.min_y).max(1e-12);
-        let scale_x = 2.0 / dx_sec;
-        let scale_y = (2.0 / dy) as f32;
-        let view_uniform = ViewUniform {
-            scale: [scale_x, scale_y],
-            offset: [-1.0 - view_min_sec * scale_x, -1.0 - (view.min_y as f32) * scale_y],
-            viewport: [width as f32, height as f32],
-            _pad: [0.0; 2],
-        };
-        ctx.queue
-            .write_buffer(view_buf, 0, bytemuck::bytes_of(&view_uniform));
-        ctx.queue
-            .write_buffer(idx_buf, 0, bytemuck::cast_slice(idx_scratch));
-
-        let mut any_drawn = false;
-        for (trace, plan) in traces.iter().zip(plans.iter()) {
-            if plan.spans.is_empty() {
-                continue;
+            for trace in traces.iter() {
+                let plan = plan_trace(
+                    ctx,
+                    cache,
+                    upload_x,
+                    upload_y,
+                    idx_scratch,
+                    x_buf,
+                    y_buf,
+                    trace,
+                    view,
+                    pixel_budget,
+                );
+                plans.push(plan);
             }
-            let rgba = trace.color.to_rgb();
-            let line_uniform = LineUniform {
-                color: [rgba.r, rgba.g, rgba.b, rgba.a],
-                line_width: trace.stroke_width * scale,
-                _pad: [0.0; 3],
+
+            if plans.iter().all(|p| p.spans.is_empty()) {
+                return None;
+            }
+
+            let epoch_ns = cache.epoch_ns.unwrap_or(view.min_x as i64);
+            let view_min_sec = ((view.min_x as i64 - epoch_ns) as f64 / NS_PER_SEC) as f32;
+            let view_max_sec = ((view.max_x as i64 - epoch_ns) as f64 / NS_PER_SEC) as f32;
+            let dx_sec = (view_max_sec - view_min_sec).max(1e-12);
+            let dy = (view.max_y - view.min_y).max(1e-12);
+            let scale_x = 2.0 / dx_sec;
+            let scale_y = (2.0 / dy) as f32;
+            let view_uniform = ViewUniform {
+                scale: [scale_x, scale_y],
+                offset: [
+                    -1.0 - view_min_sec * scale_x,
+                    -1.0 - (view.min_y as f32) * scale_y,
+                ],
+                viewport: [width as f32, height as f32],
+                _pad: [0.0; 2],
             };
             ctx.queue
-                .write_buffer(line_buf, 0, bytemuck::bytes_of(&line_uniform));
+                .write_buffer(view_buf, 0, bytemuck::bytes_of(&view_uniform));
+            ctx.queue
+                .write_buffer(idx_buf, 0, bytemuck::cast_slice(idx_scratch));
 
-            let load = if !any_drawn {
-                wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT)
-            } else {
-                wgpu::LoadOp::Load
-            };
-            let mut encoder =
-                ctx.device
-                    .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                        label: Some("line encoder"),
-                    });
-            {
-                let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                    label: Some("line pass"),
-                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                        view: &target.msaa_view,
-                        depth_slice: None,
-                        resolve_target: Some(&target.resolve_view),
-                        ops: wgpu::Operations {
-                            load,
-                            store: wgpu::StoreOp::Store,
-                        },
-                    })],
-                    depth_stencil_attachment: None,
-                    timestamp_writes: None,
-                    occlusion_query_set: None,
-                    multiview_mask: None,
-                });
-                pass.set_pipeline(pipeline);
-                pass.set_bind_group(0, &*view_bg, &[]);
-                pass.set_bind_group(1, &*line_bg, &[]);
-                pass.set_bind_group(2, &*storage_bg, &[]);
-                for span in &plan.spans {
-                    pass.draw(0..4, span.instance_start..span.instance_end);
+            let mut any_drawn = false;
+            for (trace, plan) in traces.iter().zip(plans.iter()) {
+                if plan.spans.is_empty() {
+                    continue;
                 }
+                let rgba = trace.color.to_rgb();
+                let line_uniform = LineUniform {
+                    color: [rgba.r, rgba.g, rgba.b, rgba.a],
+                    line_width: trace.stroke_width * scale,
+                    _pad: [0.0; 3],
+                };
+                ctx.queue
+                    .write_buffer(line_buf, 0, bytemuck::bytes_of(&line_uniform));
+
+                let load = if !any_drawn {
+                    wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT)
+                } else {
+                    wgpu::LoadOp::Load
+                };
+                let mut encoder =
+                    ctx.device
+                        .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                            label: Some("line encoder"),
+                        });
+                {
+                    let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                        label: Some("line pass"),
+                        color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                            view: &target.msaa_view,
+                            depth_slice: None,
+                            resolve_target: Some(&target.resolve_view),
+                            ops: wgpu::Operations {
+                                load,
+                                store: wgpu::StoreOp::Store,
+                            },
+                        })],
+                        depth_stencil_attachment: None,
+                        timestamp_writes: None,
+                        occlusion_query_set: None,
+                        multiview_mask: None,
+                    });
+                    pass.set_pipeline(pipeline);
+                    pass.set_bind_group(0, &*view_bg, &[]);
+                    pass.set_bind_group(1, &*line_bg, &[]);
+                    pass.set_bind_group(2, &*storage_bg, &[]);
+                    for span in &plan.spans {
+                        pass.draw(0..4, span.instance_start..span.instance_end);
+                    }
+                }
+                ctx.queue.submit(Some(encoder.finish()));
+                any_drawn = true;
             }
-            ctx.queue.submit(Some(encoder.finish()));
-            any_drawn = true;
-        }
 
-        if !any_drawn {
-            return None;
-        }
+            if !any_drawn {
+                return None;
+            }
 
-        let mut encoder =
-            ctx.device
+            let mut encoder = ctx
+                .device
                 .create_command_encoder(&wgpu::CommandEncoderDescriptor {
                     label: Some("line readback"),
                 });
-        encoder.copy_texture_to_buffer(
-            wgpu::TexelCopyTextureInfo {
-                texture: &target.resolve_texture,
-                mip_level: 0,
-                origin: wgpu::Origin3d::ZERO,
-                aspect: wgpu::TextureAspect::All,
-            },
-            wgpu::TexelCopyBufferInfo {
-                buffer: &target.staging,
-                layout: wgpu::TexelCopyBufferLayout {
-                    offset: 0,
-                    bytes_per_row: Some(target.padded_bytes_per_row),
-                    rows_per_image: Some(target.height),
+            encoder.copy_texture_to_buffer(
+                wgpu::TexelCopyTextureInfo {
+                    texture: &target.resolve_texture,
+                    mip_level: 0,
+                    origin: wgpu::Origin3d::ZERO,
+                    aspect: wgpu::TextureAspect::All,
                 },
-            },
-            wgpu::Extent3d {
+                wgpu::TexelCopyBufferInfo {
+                    buffer: &target.staging,
+                    layout: wgpu::TexelCopyBufferLayout {
+                        offset: 0,
+                        bytes_per_row: Some(target.padded_bytes_per_row),
+                        rows_per_image: Some(target.height),
+                    },
+                },
+                wgpu::Extent3d {
+                    width: target.width,
+                    height: target.height,
+                    depth_or_array_layers: 1,
+                },
+            );
+            ctx.queue.submit(Some(encoder.finish()));
+
+            self.readback_in_flight.store(true, Ordering::Release);
+            target
+                .staging
+                .slice(..)
+                .map_async(wgpu::MapMode::Read, |_| {});
+
+            Some(ReadbackHandle {
+                ctx: ctx.clone(),
+                staging: target.staging.clone(),
                 width: target.width,
                 height: target.height,
-                depth_or_array_layers: 1,
-            },
-        );
-        ctx.queue.submit(Some(encoder.finish()));
+                padded_bytes_per_row: target.padded_bytes_per_row,
+                in_flight: self.readback_in_flight.clone(),
+            })
+        };
 
-        let bytes = read_staging(&ctx.device, target)?;
-        let buffer =
-            ImageBuffer::<Rgba<u8>, Vec<u8>>::from_raw(target.width, target.height, bytes)?;
-        let mut frames = SmallVec::<[Frame; 1]>::new();
-        frames.push(Frame::new(buffer));
-        Some(Arc::new(RenderImage::new(frames)))
+        handle
     }
 }
 
-fn read_staging(device: &wgpu::Device, target: &RenderTarget) -> Option<Vec<u8>> {
-    let slice = target.staging.slice(..);
-    let (tx, rx) = std::sync::mpsc::channel();
-    slice.map_async(wgpu::MapMode::Read, move |res| {
-        let _ = tx.send(res);
-    });
-    let _ = device.poll(wgpu::PollType::wait_indefinitely());
-    rx.recv().ok()?.ok()?;
-
-    let unpadded_row = target.width as usize * 4;
-    let padded_row = target.padded_bytes_per_row as usize;
-    let mut out = Vec::with_capacity(unpadded_row * target.height as usize);
-    {
-        let view = slice.get_mapped_range();
-        for row in 0..target.height as usize {
-            let start = row * padded_row;
-            out.extend_from_slice(&view[start..start + unpadded_row]);
-        }
+fn read_mapped_bytes(
+    staging: &wgpu::Buffer,
+    width: u32,
+    height: u32,
+    padded_bytes_per_row: u32,
+) -> Option<Vec<u8>> {
+    let slice = staging.slice(..);
+    let unpadded_row = width as usize * 4;
+    let padded_row = padded_bytes_per_row as usize;
+    let mut out = Vec::with_capacity(unpadded_row * height as usize);
+    let view = slice.get_mapped_range();
+    for row in 0..height as usize {
+        let start = row * padded_row;
+        out.extend_from_slice(&view[start..start + unpadded_row]);
     }
-    target.staging.unmap();
+    drop(view);
     Some(out)
 }
 
@@ -748,9 +799,8 @@ fn plan_trace(
         };
 
         let full = node.full_timestamps();
-        let slice_start_idx = unsafe {
-            visible.as_ptr().offset_from(full.as_ptr()).max(0) as usize
-        };
+        let slice_start_idx =
+            unsafe { visible.as_ptr().offset_from(full.as_ptr()).max(0) as usize };
 
         let span_first = idx_scratch.len() as u32;
         let mut count_pushed: u32 = 0;
@@ -797,7 +847,6 @@ fn convert_values(
     out: &mut Vec<f32>,
 ) {
     let elem_size = schema.size();
-    let prim_size = schema.prim_type.size();
     out.clear();
     out.reserve(to - from);
 
@@ -807,29 +856,26 @@ fn convert_values(
         to: usize,
         elem_size: usize,
         elem_index: usize,
-        prim_size: usize,
         out: &mut Vec<f32>,
     ) {
         for i in from..to {
-            let v = super::read_value::<T>(data, i, elem_size, elem_index, prim_size)
-                .unwrap_or(0.0);
+            let v = super::read_value::<T>(data, i, elem_size, elem_index).unwrap_or(0.0);
             out.push(v as f32);
         }
     }
 
     match schema.prim_type {
-        PrimType::F64 => fill::<f64>(full_data, from, to, elem_size, element_index, prim_size, out),
-        PrimType::F32 => fill::<f32>(full_data, from, to, elem_size, element_index, prim_size, out),
-        PrimType::I64 => fill::<i64>(full_data, from, to, elem_size, element_index, prim_size, out),
-        PrimType::I32 => fill::<i32>(full_data, from, to, elem_size, element_index, prim_size, out),
-        PrimType::I16 => fill::<i16>(full_data, from, to, elem_size, element_index, prim_size, out),
-        PrimType::I8  => fill::<i8> (full_data, from, to, elem_size, element_index, prim_size, out),
-        PrimType::U64 => fill::<u64>(full_data, from, to, elem_size, element_index, prim_size, out),
-        PrimType::U32 => fill::<u32>(full_data, from, to, elem_size, element_index, prim_size, out),
-        PrimType::U16 => fill::<u16>(full_data, from, to, elem_size, element_index, prim_size, out),
+        PrimType::F64 => fill::<f64>(full_data, from, to, elem_size, element_index, out),
+        PrimType::F32 => fill::<f32>(full_data, from, to, elem_size, element_index, out),
+        PrimType::I64 => fill::<i64>(full_data, from, to, elem_size, element_index, out),
+        PrimType::I32 => fill::<i32>(full_data, from, to, elem_size, element_index, out),
+        PrimType::I16 => fill::<i16>(full_data, from, to, elem_size, element_index, out),
+        PrimType::I8 => fill::<i8>(full_data, from, to, elem_size, element_index, out),
+        PrimType::U64 => fill::<u64>(full_data, from, to, elem_size, element_index, out),
+        PrimType::U32 => fill::<u32>(full_data, from, to, elem_size, element_index, out),
+        PrimType::U16 => fill::<u16>(full_data, from, to, elem_size, element_index, out),
         PrimType::U8 | PrimType::Bool => {
-            fill::<u8>(full_data, from, to, elem_size, element_index, prim_size, out)
+            fill::<u8>(full_data, from, to, elem_size, element_index, out)
         }
     }
 }
-
