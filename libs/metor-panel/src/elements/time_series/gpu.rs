@@ -42,6 +42,7 @@ pub(super) struct LineDraw<'a> {
     pub component_id: ComponentId,
     pub component: &'a Component,
     pub element_index: usize,
+    pub style: super::PlotStyle,
     pub color: Hsla,
     pub stroke_width: f32,
 }
@@ -353,10 +354,13 @@ impl ReadbackHandle {
     }
 }
 
-/// Owns the wgpu pipeline, the per-plot value cache, and the offscreen target.
+/// Owns the wgpu pipelines for all three plot styles, the per-plot value
+/// cache, and the offscreen target.
 pub(super) struct LineRenderer {
     ctx: Arc<GpuContext>,
-    pipeline: wgpu::RenderPipeline,
+    line_pipeline: wgpu::RenderPipeline,
+    scatter_pipeline: wgpu::RenderPipeline,
+    bars_pipeline: wgpu::RenderPipeline,
     view_buf: wgpu::Buffer,
     view_bg: wgpu::BindGroup,
     line_buf: wgpu::Buffer,
@@ -378,9 +382,17 @@ impl LineRenderer {
         let ctx = GpuContext::get()?;
         let device = &ctx.device;
 
-        let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+        let line_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("line.wgsl"),
             source: wgpu::ShaderSource::Wgsl(include_str!("line.wgsl").into()),
+        });
+        let scatter_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("scatter.wgsl"),
+            source: wgpu::ShaderSource::Wgsl(include_str!("scatter.wgsl").into()),
+        });
+        let bars_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("bars.wgsl"),
+            source: wgpu::ShaderSource::Wgsl(include_str!("bars.wgsl").into()),
         });
 
         let view_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
@@ -434,43 +446,50 @@ impl LineRenderer {
             immediate_size: 0,
         });
 
-        let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label: Some("line pipeline"),
-            layout: Some(&pipeline_layout),
-            vertex: wgpu::VertexState {
-                module: &shader,
-                entry_point: Some("vertex"),
-                compilation_options: Default::default(),
-                buffers: &[],
-            },
-            primitive: wgpu::PrimitiveState {
-                topology: wgpu::PrimitiveTopology::TriangleStrip,
-                strip_index_format: None,
-                front_face: wgpu::FrontFace::Ccw,
-                cull_mode: None,
-                unclipped_depth: false,
-                polygon_mode: wgpu::PolygonMode::Fill,
-                conservative: false,
-            },
-            depth_stencil: None,
-            multisample: wgpu::MultisampleState {
-                count: SAMPLE_COUNT,
-                mask: !0,
-                alpha_to_coverage_enabled: false,
-            },
-            fragment: Some(wgpu::FragmentState {
-                module: &shader,
-                entry_point: Some("fragment"),
-                compilation_options: Default::default(),
-                targets: &[Some(wgpu::ColorTargetState {
-                    format: TARGET_FORMAT,
-                    blend: Some(wgpu::BlendState::ALPHA_BLENDING),
-                    write_mask: wgpu::ColorWrites::ALL,
-                })],
-            }),
-            multiview_mask: None,
-            cache: None,
-        });
+        let make_pipeline =
+            |label: &str, shader: &wgpu::ShaderModule| -> wgpu::RenderPipeline {
+                device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                    label: Some(label),
+                    layout: Some(&pipeline_layout),
+                    vertex: wgpu::VertexState {
+                        module: shader,
+                        entry_point: Some("vertex"),
+                        compilation_options: Default::default(),
+                        buffers: &[],
+                    },
+                    primitive: wgpu::PrimitiveState {
+                        topology: wgpu::PrimitiveTopology::TriangleStrip,
+                        strip_index_format: None,
+                        front_face: wgpu::FrontFace::Ccw,
+                        cull_mode: None,
+                        unclipped_depth: false,
+                        polygon_mode: wgpu::PolygonMode::Fill,
+                        conservative: false,
+                    },
+                    depth_stencil: None,
+                    multisample: wgpu::MultisampleState {
+                        count: SAMPLE_COUNT,
+                        mask: !0,
+                        alpha_to_coverage_enabled: false,
+                    },
+                    fragment: Some(wgpu::FragmentState {
+                        module: shader,
+                        entry_point: Some("fragment"),
+                        compilation_options: Default::default(),
+                        targets: &[Some(wgpu::ColorTargetState {
+                            format: TARGET_FORMAT,
+                            blend: Some(wgpu::BlendState::ALPHA_BLENDING),
+                            write_mask: wgpu::ColorWrites::ALL,
+                        })],
+                    }),
+                    multiview_mask: None,
+                    cache: None,
+                })
+            };
+
+        let line_pipeline = make_pipeline("line pipeline", &line_shader);
+        let scatter_pipeline = make_pipeline("scatter pipeline", &scatter_shader);
+        let bars_pipeline = make_pipeline("bars pipeline", &bars_shader);
 
         let view_buf = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("view uniform"),
@@ -539,7 +558,9 @@ impl LineRenderer {
 
         Some(Self {
             ctx,
-            pipeline,
+            line_pipeline,
+            scatter_pipeline,
+            bars_pipeline,
             view_buf,
             view_bg,
             line_buf,
@@ -602,7 +623,9 @@ impl LineRenderer {
                 view_bg,
                 line_bg,
                 storage_bg,
-                pipeline,
+                line_pipeline,
+                scatter_pipeline,
+                bars_pipeline,
                 target,
                 ..
             } = self;
@@ -659,9 +682,23 @@ impl LineRenderer {
                     continue;
                 }
                 let rgba = trace.color.to_rgb();
+                let lw = match trace.style {
+                    super::PlotStyle::Bar => {
+                        let visible_count = plan
+                            .spans
+                            .iter()
+                            .map(|s| s.instance_end - s.instance_start)
+                            .sum::<u32>()
+                            .max(1);
+                        (width as f32 / visible_count as f32 * 0.4)
+                            .clamp(scale, 20.0 * scale)
+                    }
+                    super::PlotStyle::Scatter => trace.stroke_width * scale * 3.0,
+                    super::PlotStyle::Line => trace.stroke_width * scale,
+                };
                 let line_uniform = LineUniform {
                     color: [rgba.r, rgba.g, rgba.b, rgba.a],
-                    line_width: trace.stroke_width * scale,
+                    line_width: lw,
                     _pad: [0.0; 3],
                 };
                 ctx.queue
@@ -694,7 +731,12 @@ impl LineRenderer {
                         occlusion_query_set: None,
                         multiview_mask: None,
                     });
-                    pass.set_pipeline(pipeline);
+                    let pip = match trace.style {
+                        super::PlotStyle::Line => &*line_pipeline,
+                        super::PlotStyle::Scatter => &*scatter_pipeline,
+                        super::PlotStyle::Bar => &*bars_pipeline,
+                    };
+                    pass.set_pipeline(pip);
                     pass.set_bind_group(0, &*view_bg, &[]);
                     pass.set_bind_group(1, &*line_bg, &[]);
                     pass.set_bind_group(2, &*storage_bg, &[]);
@@ -860,10 +902,18 @@ fn plan_trace(
             count_pushed += 1;
             i += residual_stride;
         }
-        if count_pushed >= 2 {
+        let min_for_draw = match trace.style {
+            super::PlotStyle::Line => 2u32,
+            _ => 1,
+        };
+        if count_pushed >= min_for_draw {
+            let instance_end = match trace.style {
+                super::PlotStyle::Line => span_first + count_pushed - 1,
+                _ => span_first + count_pushed,
+            };
             spans.push(DrawSpan {
                 instance_start: span_first,
-                instance_end: span_first + count_pushed - 1,
+                instance_end,
             });
         } else {
             idx_scratch.truncate(span_first as usize);

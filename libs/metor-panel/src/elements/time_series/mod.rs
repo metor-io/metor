@@ -340,7 +340,7 @@ fn paint_plot<'a>(
     // 2. Data traces — clipped to outer bounds so lines extend under axis areas.
     //    When the GPU path produced an image, blit it for the line traces and
     //    let the CPU path handle scatter/bar.
-    let gpu_handled_lines = line_image.is_some();
+    let gpu_handled = line_image.is_some();
     window.with_content_mask(
         Some(gpui::ContentMask {
             bounds: outer_bounds,
@@ -349,14 +349,13 @@ fn paint_plot<'a>(
             if let Some(img) = line_image {
                 let _ = window.paint_image(pb, Corners::default(), img, 0, false);
             }
-            for rt in &traces {
-                if !rt.trace.visible {
-                    continue;
+            if !gpu_handled {
+                for rt in &traces {
+                    if !rt.trace.visible {
+                        continue;
+                    }
+                    paint_trace(pb, &rt.component, &view, &rt.trace, window);
                 }
-                if gpu_handled_lines && matches!(rt.trace.style, PlotStyle::Line) {
-                    continue;
-                }
-                paint_trace(pb, &rt.component, &view, &rt.trace, window);
             }
         },
     );
@@ -1603,17 +1602,12 @@ impl Render for TimeSeriesPlot {
                                                     .traces
                                                     .iter()
                                                     .flatten()
-                                                    .filter(|rt| {
-                                                        rt.trace.visible
-                                                            && matches!(
-                                                                rt.trace.style,
-                                                                PlotStyle::Line
-                                                            )
-                                                    })
+                                                    .filter(|rt| rt.trace.visible)
                                                     .map(|rt| gpu::LineDraw {
                                                         component_id: rt.trace.component_id,
                                                         component: &rt.component,
                                                         element_index: rt.trace.element_index,
+                                                        style: rt.trace.style,
                                                         color: rt.trace.color,
                                                         stroke_width: rt.trace.stroke_width,
                                                     })
