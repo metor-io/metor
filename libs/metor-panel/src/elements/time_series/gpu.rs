@@ -36,6 +36,8 @@ const INDEX_BUF_BYTES: u64 = INDEX_CAPACITY as u64 * 4;
 const TARGET_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Bgra8Unorm;
 const SAMPLE_COUNT: u32 = 4;
 const NS_PER_SEC: f64 = 1.0e9;
+const UNIFORM_ALIGN: u64 = 256;
+const MAX_TRACES: usize = 64;
 
 /// One trace's worth of data the renderer needs each frame.
 pub(super) struct LineDraw<'a> {
@@ -345,7 +347,7 @@ impl ReadbackHandle {
             self.width,
             self.height,
             self.padded_bytes_per_row,
-        )?;
+        );
         self.staging.unmap();
         self.in_flight.store(false, Ordering::Release);
         let buffer = ImageBuffer::<Rgba<u8>, Vec<u8>>::from_raw(self.width, self.height, bytes)?;
@@ -415,7 +417,7 @@ impl LineRenderer {
                 visibility: wgpu::ShaderStages::VERTEX | wgpu::ShaderStages::FRAGMENT,
                 ty: wgpu::BindingType::Buffer {
                     ty: wgpu::BufferBindingType::Uniform,
-                    has_dynamic_offset: false,
+                    has_dynamic_offset: true,
                     min_binding_size: None,
                 },
                 count: None,
@@ -508,7 +510,7 @@ impl LineRenderer {
 
         let line_buf = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("line uniform"),
-            size: std::mem::size_of::<LineUniform>() as u64,
+            size: UNIFORM_ALIGN * MAX_TRACES as u64,
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
@@ -517,7 +519,13 @@ impl LineRenderer {
             layout: &line_layout,
             entries: &[wgpu::BindGroupEntry {
                 binding: 0,
-                resource: line_buf.as_entire_binding(),
+                resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+                    buffer: &line_buf,
+                    offset: 0,
+                    size: Some(
+                        std::num::NonZeroU64::new(UNIFORM_ALIGN).unwrap(),
+                    ),
+                }),
             }],
         });
 
@@ -676,9 +684,11 @@ impl LineRenderer {
             ctx.queue
                 .write_buffer(idx_buf, 0, bytemuck::cast_slice(idx_scratch));
 
-            let mut any_drawn = false;
-            for (trace, plan) in traces.iter().zip(plans.iter()) {
-                if plan.spans.is_empty() {
+            // Write all per-trace uniforms into the dynamic uniform buffer up
+            // front so we can draw everything in a single submit.
+            let mut live_traces: Vec<(usize, &LineDraw<'_>, &TracePlan)> = Vec::new();
+            for (i, (trace, plan)) in traces.iter().zip(plans.iter()).enumerate() {
+                if plan.spans.is_empty() || i >= MAX_TRACES {
                     continue;
                 }
                 let rgba = trace.color.to_rgb();
@@ -696,67 +706,68 @@ impl LineRenderer {
                     super::PlotStyle::Scatter => trace.stroke_width * scale * 3.0,
                     super::PlotStyle::Line => trace.stroke_width * scale,
                 };
-                let line_uniform = LineUniform {
+                let uniform = LineUniform {
                     color: [rgba.r, rgba.g, rgba.b, rgba.a],
                     line_width: lw,
                     _pad: [0.0; 3],
                 };
-                ctx.queue
-                    .write_buffer(line_buf, 0, bytemuck::bytes_of(&line_uniform));
+                ctx.queue.write_buffer(
+                    line_buf,
+                    i as u64 * UNIFORM_ALIGN,
+                    bytemuck::bytes_of(&uniform),
+                );
+                live_traces.push((i, trace, plan));
+            }
 
-                let load = if !any_drawn {
-                    wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT)
-                } else {
-                    wgpu::LoadOp::Load
-                };
-                let mut encoder =
-                    ctx.device
-                        .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                            label: Some("line encoder"),
-                        });
-                {
-                    let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                        label: Some("line pass"),
-                        color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                            view: &target.msaa_view,
-                            depth_slice: None,
-                            resolve_target: Some(&target.resolve_view),
-                            ops: wgpu::Operations {
-                                load,
-                                store: wgpu::StoreOp::Store,
-                            },
-                        })],
-                        depth_stencil_attachment: None,
-                        timestamp_writes: None,
-                        occlusion_query_set: None,
-                        multiview_mask: None,
+            if live_traces.is_empty() {
+                return None;
+            }
+
+            let mut encoder =
+                ctx.device
+                    .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                        label: Some("plot encoder"),
                     });
-                    let pip = match trace.style {
-                        super::PlotStyle::Line => &*line_pipeline,
-                        super::PlotStyle::Scatter => &*scatter_pipeline,
-                        super::PlotStyle::Bar => &*bars_pipeline,
-                    };
-                    pass.set_pipeline(pip);
-                    pass.set_bind_group(0, &*view_bg, &[]);
-                    pass.set_bind_group(1, &*line_bg, &[]);
-                    pass.set_bind_group(2, &*storage_bg, &[]);
+            {
+                let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                    label: Some("plot pass"),
+                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                        view: &target.msaa_view,
+                        depth_slice: None,
+                        resolve_target: Some(&target.resolve_view),
+                        ops: wgpu::Operations {
+                            load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+                            store: wgpu::StoreOp::Store,
+                        },
+                    })],
+                    depth_stencil_attachment: None,
+                    timestamp_writes: None,
+                    occlusion_query_set: None,
+                    multiview_mask: None,
+                });
+                pass.set_bind_group(0, &*view_bg, &[]);
+                pass.set_bind_group(2, &*storage_bg, &[]);
+
+                let mut current_pipeline = None;
+                for &(slot, trace, plan) in &live_traces {
+                    let style = trace.style;
+                    if current_pipeline != Some(style) {
+                        let pip = match style {
+                            super::PlotStyle::Line => &*line_pipeline,
+                            super::PlotStyle::Scatter => &*scatter_pipeline,
+                            super::PlotStyle::Bar => &*bars_pipeline,
+                        };
+                        pass.set_pipeline(pip);
+                        current_pipeline = Some(style);
+                    }
+                    let offset = (slot as u64 * UNIFORM_ALIGN) as u32;
+                    pass.set_bind_group(1, &*line_bg, &[offset]);
                     for span in &plan.spans {
                         pass.draw(0..4, span.instance_start..span.instance_end);
                     }
                 }
-                ctx.queue.submit(Some(encoder.finish()));
-                any_drawn = true;
             }
 
-            if !any_drawn {
-                return None;
-            }
-
-            let mut encoder = ctx
-                .device
-                .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                    label: Some("line readback"),
-                });
             encoder.copy_texture_to_buffer(
                 wgpu::TexelCopyTextureInfo {
                     texture: &target.resolve_texture,
@@ -805,7 +816,7 @@ fn read_mapped_bytes(
     width: u32,
     height: u32,
     padded_bytes_per_row: u32,
-) -> Option<Vec<u8>> {
+) -> Vec<u8> {
     let slice = staging.slice(..);
     let unpadded_row = width as usize * 4;
     let padded_row = padded_bytes_per_row as usize;
@@ -816,7 +827,7 @@ fn read_mapped_bytes(
         out.extend_from_slice(&view[start..start + unpadded_row]);
     }
     drop(view);
-    Some(out)
+    out
 }
 
 /// One contiguous range of `idx_buf` instances belonging to a single trace.
