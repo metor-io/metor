@@ -109,6 +109,24 @@ impl TimeSeriesNodeSlice {
         &self.node.data.data()[start..end]
     }
 
+    /// Stable identity for the underlying node, suitable for use as a cache key.
+    /// Two slices that share the same node will return the same id.
+    pub fn node_id(&self) -> usize {
+        Arc::as_ptr(&self.node) as usize
+    }
+
+    /// Timestamps for every sample in the underlying node, ignoring this slice's
+    /// visible range. Useful for caches that index by full-node identity.
+    pub fn full_timestamps(&self) -> &[Timestamp] {
+        self.node.timestamps()
+    }
+
+    /// Raw sample bytes for every sample in the underlying node, ignoring this
+    /// slice's visible range.
+    pub fn full_data(&self) -> &[u8] {
+        self.node.data.data()
+    }
+
     pub fn iter_values<'a>(
         &'a self,
         schema: &'a ComponentSchema,

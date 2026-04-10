@@ -46,12 +46,27 @@ pub(super) struct LineDraw<'a> {
     pub stroke_width: f32,
 }
 
-/// Stable identity for a cached chunk: one element column of one node.
+/// LOD level strides. LOD n stores every `LOD_STRIDES[n]`-th sample.
+const LOD_STRIDES: [usize; 5] = [1, 4, 16, 64, 256];
+
+/// Pick the coarsest LOD whose stride does not exceed `needed_stride`.
+fn select_lod(needed_stride: usize) -> usize {
+    for (i, &s) in LOD_STRIDES.iter().enumerate().rev() {
+        if s <= needed_stride {
+            return i;
+        }
+    }
+    0
+}
+
+/// Stable identity for a cached chunk: one element column of one node at a
+/// specific level of detail.
 #[derive(Clone, Copy, Hash, Eq, PartialEq)]
 struct ChunkKey {
     component_id: u64,
     element_index: u32,
     node_id: usize,
+    lod: u32,
 }
 
 /// A node's worth of converted f32 samples currently resident in the value buffers.
@@ -82,15 +97,34 @@ impl ValueCache {
         }
     }
 
-    fn evict_all(&mut self) {
-        for (_, chunk) in self.resident.drain() {
-            self.allocator.free(chunk.allocation);
+    /// Evict entries starting from the finest LOD level until `needed` slots
+    /// are freed. Falls back to evicting everything if finer levels don't
+    /// suffice.
+    fn evict_for(&mut self, needed: u32) {
+        let mut freed = 0u32;
+        for target_lod in 0..LOD_STRIDES.len() as u32 {
+            let keys: Vec<ChunkKey> = self
+                .resident
+                .keys()
+                .filter(|k| k.lod == target_lod)
+                .copied()
+                .collect();
+            for key in keys {
+                if freed >= needed {
+                    return;
+                }
+                if let Some(chunk) = self.resident.remove(&key) {
+                    freed += chunk.capacity;
+                    self.allocator.free(chunk.allocation);
+                }
+            }
         }
     }
 
-    /// Ensure the full node behind `slice` is resident for the given trace.
-    /// Returns `(offset, sample_count)` into the shared value buffers.
-    fn ensure(
+    /// Ensure the node behind `slice` is resident at the given LOD level.
+    /// Returns `(offset, decimated_sample_count)` into the shared value
+    /// buffers.
+    fn ensure_lod(
         &mut self,
         queue: &wgpu::Queue,
         x_buf: &wgpu::Buffer,
@@ -101,39 +135,44 @@ impl ValueCache {
         element_index: usize,
         slice: &TimeSeriesNodeSlice,
         schema: &ComponentSchema,
+        lod: usize,
     ) -> Option<(u32, u32)> {
         let timestamps = slice.full_timestamps();
-        let len = timestamps.len();
-        if len == 0 {
+        let full_len = timestamps.len();
+        if full_len == 0 {
             return None;
         }
         if self.epoch_ns.is_none() {
             self.epoch_ns = Some(timestamps[0].0);
         }
         let epoch = self.epoch_ns?;
+        let lod_stride = LOD_STRIDES[lod];
+        let decimated_len = full_len.div_ceil(lod_stride);
 
         let key = ChunkKey {
             component_id: component_id.0,
             element_index: element_index as u32,
             node_id: slice.node_id(),
+            lod: lod as u32,
         };
 
         if let Some(chunk) = self.resident.get(&key) {
-            if chunk.sample_count as usize >= len {
+            if chunk.sample_count as usize >= decimated_len {
                 return Some((chunk.allocation.offset, chunk.sample_count));
             }
-            if (len as u32) > chunk.capacity {
+            // Node grew past capacity — free and re-upload.
+            if (decimated_len as u32) > chunk.capacity {
                 let removed = self.resident.remove(&key).unwrap();
                 self.allocator.free(removed.allocation);
             }
         }
 
         if !self.resident.contains_key(&key) {
-            let want = (len as u32).next_power_of_two().max(64);
+            let want = (decimated_len as u32).next_power_of_two().max(16);
             let allocation = match self.allocator.allocate(want) {
                 Some(a) => a,
                 None => {
-                    self.evict_all();
+                    self.evict_for(want);
                     self.allocator.allocate(want)?
                 }
             };
@@ -149,20 +188,21 @@ impl ValueCache {
 
         let chunk = self.resident.get_mut(&key)?;
         let from = chunk.sample_count as usize;
-        if from < len {
-            convert_timestamps(&timestamps[from..len], epoch, scratch_x);
-            convert_values(
+        if from < decimated_len {
+            convert_timestamps_strided(timestamps, lod_stride, from, decimated_len, epoch, scratch_x);
+            convert_values_strided(
                 schema,
                 slice.full_data(),
                 element_index,
+                lod_stride,
                 from,
-                len,
+                decimated_len,
                 scratch_y,
             );
             let byte_offset = (chunk.allocation.offset + from as u32) as u64 * 4;
             queue.write_buffer(x_buf, byte_offset, bytemuck::cast_slice(scratch_x));
             queue.write_buffer(y_buf, byte_offset, bytemuck::cast_slice(scratch_y));
-            chunk.sample_count = len as u32;
+            chunk.sample_count = decimated_len as u32;
         }
         Some((chunk.allocation.offset, chunk.sample_count))
     }
@@ -784,7 +824,11 @@ fn plan_trace(
         let Some(stride) = super::node_stride(visible_len, total, pixel_budget) else {
             continue;
         };
-        let Some((chunk_offset, chunk_count)) = cache.ensure(
+
+        let lod = select_lod(stride);
+        let lod_stride = LOD_STRIDES[lod];
+
+        let Some((chunk_offset, decimated_count)) = cache.ensure_lod(
             &ctx.queue,
             x_buf,
             y_buf,
@@ -794,6 +838,7 @@ fn plan_trace(
             trace.element_index,
             node,
             &trace.component.schema,
+            lod,
         ) else {
             continue;
         };
@@ -802,17 +847,18 @@ fn plan_trace(
         let slice_start_idx =
             unsafe { visible.as_ptr().offset_from(full.as_ptr()).max(0) as usize };
 
+        let lod_start = slice_start_idx / lod_stride;
+        let lod_end = ((slice_start_idx + visible_len).div_ceil(lod_stride))
+            .min(decimated_count as usize);
+        let residual_stride = (stride / lod_stride).max(1);
+
         let span_first = idx_scratch.len() as u32;
         let mut count_pushed: u32 = 0;
-        let mut i = 0;
-        while i < visible_len {
-            let absolute = slice_start_idx + i;
-            if (absolute as u32) >= chunk_count {
-                break;
-            }
-            idx_scratch.push(chunk_offset + absolute as u32);
+        let mut i = lod_start;
+        while i < lod_end {
+            idx_scratch.push(chunk_offset + i as u32);
             count_pushed += 1;
-            i += stride;
+            i += residual_stride;
         }
         if count_pushed >= 2 {
             spans.push(DrawSpan {
@@ -827,55 +873,75 @@ fn plan_trace(
     TracePlan { spans }
 }
 
-/// Convert a slice of `Timestamp`s to `f32` seconds relative to `epoch_ns`.
-fn convert_timestamps(timestamps: &[Timestamp], epoch_ns: i64, out: &mut Vec<f32>) {
+/// Convert every `lod_stride`-th timestamp in decimated index range
+/// `[from..to)` to `f32` seconds relative to `epoch_ns`.
+fn convert_timestamps_strided(
+    timestamps: &[Timestamp],
+    lod_stride: usize,
+    from: usize,
+    to: usize,
+    epoch_ns: i64,
+    out: &mut Vec<f32>,
+) {
     out.clear();
-    out.reserve(timestamps.len());
-    for ts in timestamps {
-        let delta_ns = ts.0 - epoch_ns;
+    out.reserve(to - from);
+    for decimated_i in from..to {
+        let src = (decimated_i * lod_stride).min(timestamps.len().saturating_sub(1));
+        let delta_ns = timestamps[src].0 - epoch_ns;
         out.push((delta_ns as f64 / NS_PER_SEC) as f32);
     }
 }
 
-/// Convert `data[from..to]` for the given element index into f32 values.
-fn convert_values(
+/// Convert every `lod_stride`-th data sample in decimated index range
+/// `[from..to)` for the given element index into f32 values.
+fn convert_values_strided(
     schema: &ComponentSchema,
     full_data: &[u8],
     element_index: usize,
+    lod_stride: usize,
     from: usize,
     to: usize,
     out: &mut Vec<f32>,
 ) {
     let elem_size = schema.size();
+    let max_sample = if elem_size == 0 {
+        0
+    } else {
+        full_data.len() / elem_size
+    };
     out.clear();
     out.reserve(to - from);
 
     fn fill<T: super::PlotValue>(
         data: &[u8],
+        lod_stride: usize,
         from: usize,
         to: usize,
+        max_sample: usize,
         elem_size: usize,
         elem_index: usize,
         out: &mut Vec<f32>,
     ) {
-        for i in from..to {
-            let v = super::read_value::<T>(data, i, elem_size, elem_index).unwrap_or(0.0);
+        for decimated_i in from..to {
+            let src = (decimated_i * lod_stride).min(max_sample.saturating_sub(1));
+            let v =
+                super::read_value::<T>(data, src, elem_size, elem_index).unwrap_or(0.0);
             out.push(v as f32);
         }
     }
 
     match schema.prim_type {
-        PrimType::F64 => fill::<f64>(full_data, from, to, elem_size, element_index, out),
-        PrimType::F32 => fill::<f32>(full_data, from, to, elem_size, element_index, out),
-        PrimType::I64 => fill::<i64>(full_data, from, to, elem_size, element_index, out),
-        PrimType::I32 => fill::<i32>(full_data, from, to, elem_size, element_index, out),
-        PrimType::I16 => fill::<i16>(full_data, from, to, elem_size, element_index, out),
-        PrimType::I8 => fill::<i8>(full_data, from, to, elem_size, element_index, out),
-        PrimType::U64 => fill::<u64>(full_data, from, to, elem_size, element_index, out),
-        PrimType::U32 => fill::<u32>(full_data, from, to, elem_size, element_index, out),
-        PrimType::U16 => fill::<u16>(full_data, from, to, elem_size, element_index, out),
+        PrimType::F64 => fill::<f64>(full_data, lod_stride, from, to, max_sample, elem_size, element_index, out),
+        PrimType::F32 => fill::<f32>(full_data, lod_stride, from, to, max_sample, elem_size, element_index, out),
+        PrimType::I64 => fill::<i64>(full_data, lod_stride, from, to, max_sample, elem_size, element_index, out),
+        PrimType::I32 => fill::<i32>(full_data, lod_stride, from, to, max_sample, elem_size, element_index, out),
+        PrimType::I16 => fill::<i16>(full_data, lod_stride, from, to, max_sample, elem_size, element_index, out),
+        PrimType::I8  => fill::<i8> (full_data, lod_stride, from, to, max_sample, elem_size, element_index, out),
+        PrimType::U64 => fill::<u64>(full_data, lod_stride, from, to, max_sample, elem_size, element_index, out),
+        PrimType::U32 => fill::<u32>(full_data, lod_stride, from, to, max_sample, elem_size, element_index, out),
+        PrimType::U16 => fill::<u16>(full_data, lod_stride, from, to, max_sample, elem_size, element_index, out),
         PrimType::U8 | PrimType::Bool => {
-            fill::<u8>(full_data, from, to, elem_size, element_index, out)
+            fill::<u8>(full_data, lod_stride, from, to, max_sample, elem_size, element_index, out)
         }
     }
 }
