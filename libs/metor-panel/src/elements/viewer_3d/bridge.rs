@@ -25,6 +25,13 @@ use super::bevy_app;
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct ViewerId(pub u64);
 
+/// Stable identifier for a model within a single viewer. Minted by the
+/// owning `Viewer3d` and never reused. The Bevy side keys
+/// `ViewerRecord::models` by `ModelId` so commands can target one model
+/// without depending on its position in any list.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct ModelId(pub u64);
+
 /// Commands flowing from GPUI into the Bevy world.
 pub enum ViewerCommand {
     /// Register a new viewer with an initial render target size.
@@ -42,19 +49,22 @@ pub enum ViewerCommand {
         distance: f32,
         fov_y_rad: f32,
     },
-    /// Replace the viewer's current model with a GLTF loaded from a local
-    /// file path. The path is resolved relative to whatever asset source
-    /// Bevy's `AssetServer` is configured with — typically the current
-    /// working directory.
+    /// Add or replace a single model in the viewer. Replaces any existing
+    /// model with the same `model_id`. The path is resolved by Bevy's
+    /// `AssetServer`, so absolute paths work anywhere.
     LoadModel {
         id: ViewerId,
+        model_id: ModelId,
         path: std::path::PathBuf,
     },
-    /// Apply a live position and/or orientation delta from a component
-    /// binding. Setting either component to `None` leaves that axis at the
-    /// identity; both `None` is the model at its origin.
+    /// Despawn one model from the viewer. No-op if the model_id is unknown.
+    RemoveModel { id: ViewerId, model_id: ModelId },
+    /// Apply a live position and/or orientation delta to one specific
+    /// model. Setting either component to `None` leaves that axis at
+    /// identity; both `None` parks the model at its origin.
     SetLiveTransform {
         id: ViewerId,
+        model_id: ModelId,
         translation: Option<glam::Vec3>,
         rotation: Option<glam::Quat>,
     },

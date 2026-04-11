@@ -201,8 +201,24 @@ impl PaneItem for Viewer3dPanel {
     fn serialize(&self, cx: &App) -> serde_json::Value {
         let inner = self.inner.read(cx);
         let cam = inner.camera();
+        let models: Vec<serde_json::Value> = inner
+            .models()
+            .iter()
+            .map(|m| {
+                serde_json::json!({
+                    "label": m.label.as_ref(),
+                    "path": m.path,
+                    "position_binding": m
+                        .position_binding_component()
+                        .map(|c| format!("{:?}", c)),
+                    "orientation_binding": m
+                        .orientation_binding_component()
+                        .map(|c| format!("{:?}", c)),
+                })
+            })
+            .collect();
         serde_json::json!({
-            "model_path": inner.model_path(),
+            "models": models,
             "camera": {
                 "target": [cam.target.x, cam.target.y, cam.target.z],
                 "yaw": cam.yaw,
@@ -210,8 +226,6 @@ impl PaneItem for Viewer3dPanel {
                 "distance": cam.distance,
                 "fov_y_rad": cam.fov_y_rad,
             },
-            "position_binding": inner.position_binding_serialized(),
-            "orientation_binding": inner.orientation_binding_serialized(),
         })
     }
 

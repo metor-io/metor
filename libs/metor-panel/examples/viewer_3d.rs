@@ -1,9 +1,11 @@
-//! Minimal 3D viewer example. Opens a window containing a single
-//! [`Viewer3d`], which boots the shared Bevy bridge, spawns a test scene
-//! (directional light + blue cube), and blits rendered frames into GPUI.
+//! Minimal 3D viewer example. Opens a window with two side-by-side
+//! [`Viewer3d`]s, both wired to the shared Bevy bridge.
 //!
-//! Useful for smoke-testing the bridge without standing up a full DB-backed
-//! metor-panel session.
+//! By default both viewers render an empty clear color — the viewer no
+//! longer ships a placeholder cube, models are added explicitly. Set
+//! `METOR_VIEWER3D_GLB=<path>` to load a GLTF/GLB into the left viewer
+//! programmatically. The right viewer stays empty so you can verify
+//! per-viewer render-layer isolation.
 
 use std::sync::Arc;
 
@@ -24,10 +26,11 @@ impl Root {
         let left = cx.new(Viewer3d::new);
         let right = cx.new(Viewer3d::new);
         // Optional: set METOR_VIEWER3D_GLB=<path> to load a GLTF file into
-        // the left viewer. The right viewer keeps showing the default cube,
-        // which helps verify render-layer isolation.
+        // the left viewer.
         if let Ok(path) = std::env::var("METOR_VIEWER3D_GLB") {
-            left.read(cx).load_gltf(path);
+            left.update(cx, |viewer, _cx| {
+                viewer.add_model("env-glb", path);
+            });
         }
         Self { left, right }
     }

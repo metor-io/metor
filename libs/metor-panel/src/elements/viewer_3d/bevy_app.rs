@@ -30,7 +30,7 @@ use crossbeam_channel::Receiver;
 
 use crate::gpu_context::GpuContext;
 
-use super::bridge::{FrameRouter, ViewerCommand, ViewerFrame, ViewerId};
+use super::bridge::{FrameRouter, ModelId, ViewerCommand, ViewerFrame, ViewerId};
 
 /// Bevy thread entry point. Builds the App, wires the command/frame channels
 /// into ECS resources, and enters `ScheduleRunnerPlugin`'s loop via `run()`.
@@ -105,18 +105,27 @@ struct ViewerRegistry {
 
 struct ViewerRecord {
     camera: Entity,
-    model: Entity,
     light: Entity,
     render_target: Handle<Image>,
     readback: Entity,
     width: u32,
     height: u32,
+    /// Live model entities keyed by their per-viewer [`ModelId`]. Empty
+    /// when no models have been added — the viewer renders just the clear
+    /// color in that case.
+    models: HashMap<ModelId, Entity>,
 }
 
 /// Component tagging an entity (or readback sentinel) with the viewer it
 /// belongs to. The readback observer uses this to route bytes back.
 #[derive(Component, Clone, Copy)]
 struct ViewerTag(ViewerId);
+
+/// Component tagging a model entity with its per-viewer [`ModelId`]. Used
+/// for diagnostics; lookups go through `ViewerRecord::models` directly.
+#[derive(Component, Clone, Copy)]
+#[allow(dead_code)]
+struct ModelTag(ModelId);
 
 /// Marker for an entity whose children should inherit its [`RenderLayers`].
 /// Bevy doesn't propagate `RenderLayers` through the hierarchy, so when a
@@ -195,8 +204,6 @@ fn apply_commands(
     mut commands: Commands,
     asset_server: Res<AssetServer>,
     mut images: ResMut<Assets<Image>>,
-    mut meshes: ResMut<Assets<Mesh>>,
-    mut materials: ResMut<Assets<StandardMaterial>>,
     mut registry: ResMut<ViewerRegistry>,
     router: Res<Router>,
 ) {
@@ -206,23 +213,17 @@ fn apply_commands(
                 if registry.viewers.contains_key(&id) {
                     continue;
                 }
-                let record = spawn_viewer(
-                    id,
-                    width,
-                    height,
-                    &mut commands,
-                    &mut images,
-                    &mut meshes,
-                    &mut materials,
-                );
+                let record = spawn_viewer(id, width, height, &mut commands, &mut images);
                 registry.viewers.insert(id, record);
             }
             ViewerCommand::Despawn { id } => {
                 if let Some(record) = registry.viewers.remove(&id) {
                     commands.entity(record.camera).despawn();
-                    commands.entity(record.model).despawn();
                     commands.entity(record.light).despawn();
                     commands.entity(record.readback).despawn();
+                    for &model_entity in record.models.values() {
+                        commands.entity(model_entity).despawn();
+                    }
                     images.remove(&record.render_target);
                     crate::elements::viewer_3d::bridge::BevyBridge::drop_router_entry(
                         &router.0, id,
@@ -275,13 +276,18 @@ fn apply_commands(
                         }));
                 }
             }
-            ViewerCommand::LoadModel { id, path } => {
+            ViewerCommand::LoadModel {
+                id,
+                model_id,
+                path,
+            } => {
                 if let Some(record) = registry.viewers.get_mut(&id) {
-                    // Replace the current model with a fresh WorldAssetRoot
-                    // pointing at the requested GLB/GLTF. The propagation
-                    // system will fill in RenderLayers on the scene's
-                    // children as they spawn.
-                    commands.entity(record.model).despawn();
+                    // Replace any existing model with this `model_id`. The
+                    // propagation system fills in RenderLayers on the
+                    // scene's children as they spawn.
+                    if let Some(prev) = record.models.remove(&model_id) {
+                        commands.entity(prev).despawn();
+                    }
                     let path_str = path.to_string_lossy().into_owned();
                     let handle = asset_server
                         .load(GltfAssetLabel::Scene(0).from_asset(path_str));
@@ -294,23 +300,34 @@ fn apply_commands(
                             layers,
                             PropagateRenderLayers,
                             ViewerTag(id),
+                            ModelTag(model_id),
                         ))
                         .id();
-                    record.model = new_model;
+                    record.models.insert(model_id, new_model);
+                }
+            }
+            ViewerCommand::RemoveModel { id, model_id } => {
+                if let Some(record) = registry.viewers.get_mut(&id) {
+                    if let Some(entity) = record.models.remove(&model_id) {
+                        commands.entity(entity).despawn();
+                    }
                 }
             }
             ViewerCommand::SetLiveTransform {
                 id,
+                model_id,
                 translation,
                 rotation,
             } => {
                 if let Some(record) = registry.viewers.get(&id) {
-                    let translation = translation.map(|v| Vec3::new(v.x, v.y, v.z));
-                    let rotation = rotation.map(|q| Quat::from_xyzw(q.x, q.y, q.z, q.w));
-                    commands.entity(record.model).insert(LiveDelta {
-                        translation,
-                        rotation,
-                    });
+                    if let Some(&entity) = record.models.get(&model_id) {
+                        let translation = translation.map(|v| Vec3::new(v.x, v.y, v.z));
+                        let rotation = rotation.map(|q| Quat::from_xyzw(q.x, q.y, q.z, q.w));
+                        commands.entity(entity).insert(LiveDelta {
+                            translation,
+                            rotation,
+                        });
+                    }
                 }
             }
         }
@@ -334,30 +351,10 @@ fn spawn_viewer(
     height: u32,
     commands: &mut Commands,
     images: &mut Assets<Image>,
-    meshes: &mut Assets<Mesh>,
-    materials: &mut Assets<StandardMaterial>,
 ) -> ViewerRecord {
     let target_image = new_target_image(width, height);
     let render_target = images.add(target_image);
     let layers = viewer_layer(id);
-
-    // Default placeholder content: a single blue cube. A `LoadModel` command
-    // replaces this with a GLTF scene.
-    let model = commands
-        .spawn((
-            Mesh3d(meshes.add(Cuboid::new(1.0, 1.0, 1.0))),
-            MeshMaterial3d(materials.add(StandardMaterial {
-                base_color: Color::srgb(0.55, 0.70, 0.95),
-                perceptual_roughness: 0.4,
-                ..default()
-            })),
-            Transform::IDENTITY,
-            LiveDelta::default(),
-            layers.clone(),
-            PropagateRenderLayers,
-            ViewerTag(id),
-        ))
-        .id();
 
     let light = commands
         .spawn((
@@ -395,12 +392,12 @@ fn spawn_viewer(
 
     ViewerRecord {
         camera,
-        model,
         light,
         render_target,
         readback,
         width,
         height,
+        models: HashMap::new(),
     }
 }
 

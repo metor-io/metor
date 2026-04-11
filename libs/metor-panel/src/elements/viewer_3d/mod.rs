@@ -14,19 +14,21 @@ use std::sync::Arc;
 
 use glam::{Quat, Vec3};
 use gpui::{
-    Bounds, Context, Corners, IntoElement, MouseButton, Pixels, Point, RenderImage, Window, canvas,
-    div, prelude::*, px,
+    Bounds, Context, Corners, IntoElement, MouseButton, Pixels, Point, RenderImage, SharedString,
+    Window, canvas, div, prelude::*, px,
 };
 use image::{Frame, ImageBuffer, Rgba};
 use metor_db::DB;
 use metor_proto::types::ComponentView;
 use smallvec::SmallVec;
 
-use crate::inspectable::{FieldId, Inspectable, InspectionField, InspectionValue, PickerArity};
+use crate::inspectable::{
+    FieldId, Inspectable, InspectionField, InspectionValue, ListItem, PickerArity,
+};
 use crate::theme::theme;
 use crate::{AsComponentView, ComponentStream, ComponentStreamBuilder};
 
-pub use bridge::{BevyBridge, ViewerCommand, ViewerFrame, ViewerHandle, ViewerId};
+pub use bridge::{BevyBridge, ModelId, ViewerCommand, ViewerFrame, ViewerHandle, ViewerId};
 pub use camera::OrbitCamera;
 
 /// Convert a metor-panel `[x, y, z]` position component into a Bevy-frame
@@ -63,18 +65,16 @@ const INITIAL_SIZE: (u32, u32) = (512, 512);
 /// element for the next paint.
 pub struct Viewer3d {
     handle: ViewerHandle,
-    /// DB handle so `bind_position` / `bind_orientation` can start streams
-    /// from the inspector. `None` when the viewer was constructed without a
-    /// DB (the standalone example case).
+    /// DB handle so per-model bindings can start streams from the
+    /// inspector. `None` when the viewer was constructed without a DB (the
+    /// standalone example case).
     db: Option<Arc<DB>>,
     camera: OrbitCamera,
-    /// GLTF/GLB path currently loaded. Empty string means "use the default
-    /// placeholder cube".
-    model_path: String,
-    /// Latest position binding configuration, if any.
-    position_binding: Option<Binding>,
-    /// Latest orientation binding configuration, if any.
-    orientation_binding: Option<Binding>,
+    /// All models currently displayed in this viewer. Order is the
+    /// inspector's display order; lookups go by `ModelId`.
+    models: Vec<ModelEntry>,
+    /// Counter for minting fresh per-viewer [`ModelId`]s. Never reused.
+    next_model_id: u64,
     frame_image: Option<Arc<RenderImage>>,
     frame_size: (u32, u32),
     /// The size most recently requested from the Bevy side. Tracked
@@ -83,14 +83,37 @@ pub struct Viewer3d {
     requested_size: (u32, u32),
     dropped_images: Vec<Arc<RenderImage>>,
     drag: Option<DragState>,
-    /// Latest live delta aggregated from the binding streaming tasks.
-    /// Kept so that re-issuing a SetLiveTransform (e.g. after a LoadModel)
-    /// doesn't forget the currently-bound axes.
-    live: LiveTransform,
-    /// One task per binding. Dropping the viewer drops the tasks, which
-    /// terminate the associated streams.
-    binding_tasks: SmallVec<[gpui::Task<()>; 2]>,
     _pump: gpui::Task<()>,
+}
+
+/// One model in a viewer. Owns its path, label, bindings, the latest live
+/// delta produced by its streaming tasks, and the tasks themselves.
+/// Dropping a [`ModelEntry`] drops its tasks, which terminates the
+/// associated WAL streams cleanly.
+pub struct ModelEntry {
+    pub id: ModelId,
+    pub label: SharedString,
+    pub path: String,
+    position_binding: Option<Binding>,
+    orientation_binding: Option<Binding>,
+    /// Latest live delta produced by the streaming tasks for this model.
+    /// Kept on the GPUI side so that when one binding updates, we re-emit
+    /// the full `SetLiveTransform` (translation + rotation) and don't lose
+    /// the other axis.
+    live: LiveTransform,
+    /// One streaming task per active binding. Dropping the entry drops the
+    /// tasks.
+    binding_tasks: SmallVec<[gpui::Task<()>; 2]>,
+}
+
+impl ModelEntry {
+    pub fn position_binding_component(&self) -> Option<metor_proto::types::ComponentId> {
+        self.position_binding.map(|b| b.component_id)
+    }
+
+    pub fn orientation_binding_component(&self) -> Option<metor_proto::types::ComponentId> {
+        self.orientation_binding.map(|b| b.component_id)
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -148,17 +171,152 @@ impl Viewer3d {
             handle,
             db,
             camera,
-            model_path: String::new(),
-            position_binding: None,
-            orientation_binding: None,
+            models: Vec::new(),
+            next_model_id: 1,
             frame_image: None,
             frame_size: INITIAL_SIZE,
             requested_size: INITIAL_SIZE,
             dropped_images: Vec::new(),
             drag: None,
+            _pump: pump,
+        }
+    }
+
+    /// Borrow the current model list. Used by serialization and the
+    /// inspector to walk all models.
+    pub fn models(&self) -> &[ModelEntry] {
+        &self.models
+    }
+
+    /// Add a new model to the viewer. If `path` is non-empty the GLB is
+    /// loaded immediately; otherwise the model is created with no asset
+    /// (the user can fill in a path later via the inspector).
+    pub fn add_model(
+        &mut self,
+        label: impl Into<SharedString>,
+        path: impl Into<String>,
+    ) -> ModelId {
+        let id = ModelId(self.next_model_id);
+        self.next_model_id += 1;
+        let path = path.into();
+        let entry = ModelEntry {
+            id,
+            label: label.into(),
+            path: path.clone(),
+            position_binding: None,
+            orientation_binding: None,
             live: LiveTransform::default(),
             binding_tasks: SmallVec::new(),
-            _pump: pump,
+        };
+        self.models.push(entry);
+        if !path.is_empty() {
+            self.handle.send(ViewerCommand::LoadModel {
+                id: self.handle.id(),
+                model_id: id,
+                path: path.into(),
+            });
+        }
+        id
+    }
+
+    /// Despawn one model from the viewer. Drops the entry's binding tasks
+    /// (terminating the streams) and tells Bevy to despawn the entity.
+    pub fn remove_model(&mut self, model_id: ModelId) {
+        let Some(idx) = self.models.iter().position(|m| m.id == model_id) else {
+            return;
+        };
+        // Drop the entry first so its `binding_tasks` are released — any
+        // in-flight stream value the task was about to publish will be
+        // discarded rather than racing the RemoveModel command.
+        self.models.remove(idx);
+        self.handle.send(ViewerCommand::RemoveModel {
+            id: self.handle.id(),
+            model_id,
+        });
+    }
+
+    /// Update one model's GLTF path. Sends a `LoadModel` to Bevy if the
+    /// new path is non-empty.
+    pub fn set_model_path(&mut self, model_id: ModelId, path: String) {
+        let Some(entry) = self.models.iter_mut().find(|m| m.id == model_id) else {
+            return;
+        };
+        entry.path = path.clone();
+        if !path.is_empty() {
+            self.handle.send(ViewerCommand::LoadModel {
+                id: self.handle.id(),
+                model_id,
+                path: path.into(),
+            });
+        }
+    }
+
+    /// Update one model's display label. Affects the inspector list row
+    /// only — does not touch the Bevy side.
+    pub fn set_model_label(&mut self, model_id: ModelId, label: impl Into<SharedString>) {
+        if let Some(entry) = self.models.iter_mut().find(|m| m.id == model_id) {
+            entry.label = label.into();
+        }
+    }
+
+    /// Bind one model's position to a component. Tears down and respawns
+    /// only that model's streaming tasks.
+    pub fn set_model_position_binding(
+        &mut self,
+        model_id: ModelId,
+        component_id: metor_proto::types::ComponentId,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(entry) = self.models.iter_mut().find(|m| m.id == model_id) {
+            entry.position_binding = Some(Binding { component_id });
+        }
+        self.restart_model_bindings(model_id, cx);
+    }
+
+    /// Bind one model's orientation to a component. Tears down and
+    /// respawns only that model's streaming tasks.
+    pub fn set_model_orientation_binding(
+        &mut self,
+        model_id: ModelId,
+        component_id: metor_proto::types::ComponentId,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(entry) = self.models.iter_mut().find(|m| m.id == model_id) {
+            entry.orientation_binding = Some(Binding { component_id });
+        }
+        self.restart_model_bindings(model_id, cx);
+    }
+
+    /// Drop the streaming tasks for one model and respawn them from its
+    /// current bindings.
+    fn restart_model_bindings(&mut self, model_id: ModelId, cx: &mut Context<Self>) {
+        let Some(db) = self.db.clone() else {
+            return;
+        };
+        let Some(entry) = self.models.iter_mut().find(|m| m.id == model_id) else {
+            return;
+        };
+        let position = entry.position_binding;
+        let orientation = entry.orientation_binding;
+        entry.binding_tasks.clear();
+        // Reset the cached live delta so a stale axis from a prior binding
+        // doesn't bleed into the next SetLiveTransform.
+        entry.live = LiveTransform::default();
+
+        let mut tasks: SmallVec<[gpui::Task<()>; 2]> = SmallVec::new();
+        if let Some(b) = position {
+            tasks.push(Self::spawn_position_task(
+                db.clone(),
+                model_id,
+                b.component_id,
+                cx,
+            ));
+        }
+        if let Some(b) = orientation {
+            tasks.push(Self::spawn_orientation_task(db, model_id, b.component_id, cx));
+        }
+        if let Some(entry) = self.models.iter_mut().find(|m| m.id == model_id) {
+            entry.binding_tasks = tasks;
         }
     }
 
@@ -200,67 +358,13 @@ impl Viewer3d {
         self.sync_camera();
     }
 
-    /// Request that the viewer's current model be replaced with a GLTF/GLB
-    /// loaded from `path`. The path is resolved by Bevy's `AssetServer`, so
-    /// an absolute path works anywhere; a relative path resolves against the
-    /// asset source, which defaults to the process working directory.
-    pub fn load_gltf(&self, path: impl Into<std::path::PathBuf>) {
-        self.handle.send(ViewerCommand::LoadModel {
-            id: self.handle.id(),
-            path: path.into(),
-        });
-    }
-
     pub fn camera(&self) -> OrbitCamera {
         self.camera
     }
 
-    pub fn model_path(&self) -> &str {
-        &self.model_path
-    }
-
-    /// JSON snapshot of the position binding for serialization. Returns
-    /// `Null` when no binding is set.
-    pub fn position_binding_serialized(&self) -> serde_json::Value {
-        match self.position_binding {
-            Some(b) => serde_json::json!({
-                "component_id": format!("{:?}", b.component_id),
-            }),
-            None => serde_json::Value::Null,
-        }
-    }
-
-    /// JSON snapshot of the orientation binding for serialization. Returns
-    /// `Null` when no binding is set.
-    pub fn orientation_binding_serialized(&self) -> serde_json::Value {
-        match self.orientation_binding {
-            Some(b) => serde_json::json!({
-                "component_id": format!("{:?}", b.component_id),
-            }),
-            None => serde_json::Value::Null,
-        }
-    }
-
-    /// Rebuild the binding streaming tasks from `self.position_binding` /
-    /// `self.orientation_binding`. Called whenever the inspector changes
-    /// either binding (or when the DB becomes available).
-    fn restart_bindings(&mut self, cx: &mut Context<Self>) {
-        let Some(db) = self.db.clone() else {
-            return;
-        };
-        self.binding_tasks.clear();
-        if let Some(b) = self.position_binding {
-            self.binding_tasks
-                .push(Self::spawn_position_task(db.clone(), b.component_id, cx));
-        }
-        if let Some(b) = self.orientation_binding {
-            self.binding_tasks
-                .push(Self::spawn_orientation_task(db, b.component_id, cx));
-        }
-    }
-
     fn spawn_position_task(
         db: Arc<DB>,
+        model_id: ModelId,
         component_id: metor_proto::types::ComponentId,
         cx: &mut Context<Self>,
     ) -> gpui::Task<()> {
@@ -271,18 +375,25 @@ impl Viewer3d {
                     let view = stream.next().await;
                     pick_position(&view.as_component_view())
                 };
-                if this
-                    .update(cx, |this, _cx| {
-                        this.live.translation = Some(v);
-                        this.handle.send(ViewerCommand::SetLiveTransform {
-                            id: this.handle.id(),
-                            translation: this.live.translation,
-                            rotation: this.live.rotation,
-                        });
-                    })
-                    .is_err()
-                {
-                    break;
+                let result = this.update(cx, |this, _cx| {
+                    let Some(entry) = this.models.iter_mut().find(|m| m.id == model_id) else {
+                        // Model has been removed; signal the loop to break.
+                        return false;
+                    };
+                    entry.live.translation = Some(v);
+                    let translation = entry.live.translation;
+                    let rotation = entry.live.rotation;
+                    this.handle.send(ViewerCommand::SetLiveTransform {
+                        id: this.handle.id(),
+                        model_id,
+                        translation,
+                        rotation,
+                    });
+                    true
+                });
+                match result {
+                    Ok(true) => {}
+                    _ => break,
                 }
             }
         })
@@ -290,6 +401,7 @@ impl Viewer3d {
 
     fn spawn_orientation_task(
         db: Arc<DB>,
+        model_id: ModelId,
         component_id: metor_proto::types::ComponentId,
         cx: &mut Context<Self>,
     ) -> gpui::Task<()> {
@@ -300,18 +412,24 @@ impl Viewer3d {
                     let view = stream.next().await;
                     pick_attitude(&view.as_component_view())
                 };
-                if this
-                    .update(cx, |this, _cx| {
-                        this.live.rotation = Some(q);
-                        this.handle.send(ViewerCommand::SetLiveTransform {
-                            id: this.handle.id(),
-                            translation: this.live.translation,
-                            rotation: this.live.rotation,
-                        });
-                    })
-                    .is_err()
-                {
-                    break;
+                let result = this.update(cx, |this, _cx| {
+                    let Some(entry) = this.models.iter_mut().find(|m| m.id == model_id) else {
+                        return false;
+                    };
+                    entry.live.rotation = Some(q);
+                    let translation = entry.live.translation;
+                    let rotation = entry.live.rotation;
+                    this.handle.send(ViewerCommand::SetLiveTransform {
+                        id: this.handle.id(),
+                        model_id,
+                        translation,
+                        rotation,
+                    });
+                    true
+                });
+                match result {
+                    Ok(true) => {}
+                    _ => break,
                 }
             }
         })
@@ -479,38 +597,114 @@ impl Render for Viewer3d {
     }
 }
 
-// Inspectable field-id layout. Kept as constants so the mapping is obvious
-// from the `set_field` match arms below.
-const FIELD_MODEL_PATH: u32 = 0;
-const FIELD_POSITION: u32 = 1;
-const FIELD_ORIENTATION: u32 = 2;
-const FIELD_FOV: u32 = 3;
-const FIELD_RESET_CAMERA: u32 = 4;
+// Inspectable field-id layout.
+//
+// Parent fields use IDs in 0..99. Per-model sub-field IDs are encoded as
+// `1000 + item_index * 100 + sub_field_id`. The encoding is local to this
+// element — `set_field` decodes it before routing.
 
-fn binding_to_value(binding: Option<Binding>, arity: PickerArity) -> InspectionValue {
-    InspectionValue::ElementPicker {
-        component: binding.map(|b| b.component_id),
-        arity,
+const FIELD_MODELS: u32 = 0;
+const FIELD_ADD_MODEL: u32 = 1;
+const FIELD_FOV: u32 = 2;
+const FIELD_RESET_CAMERA: u32 = 3;
+
+const SUB_LABEL: u32 = 0;
+const SUB_PATH: u32 = 1;
+const SUB_POSITION: u32 = 2;
+const SUB_ORIENTATION: u32 = 3;
+const SUB_REMOVE: u32 = 4;
+
+fn encode_sub(item_index: usize, sub: u32) -> u32 {
+    1000 + item_index as u32 * 100 + sub
+}
+
+fn decode_sub(field_id: u32) -> Option<(usize, u32)> {
+    if field_id < 1000 {
+        return None;
     }
+    let raw = field_id - 1000;
+    Some(((raw / 100) as usize, raw % 100))
+}
+
+fn binding_to_value(
+    component: Option<metor_proto::types::ComponentId>,
+    arity: PickerArity,
+) -> InspectionValue {
+    InspectionValue::ElementPicker { component, arity }
+}
+
+/// Pull a display label out of a model entry. Falls back to the path's
+/// basename if the label is empty, then to a placeholder for empty
+/// entries.
+fn model_row_label(entry: &ModelEntry, index: usize) -> SharedString {
+    if !entry.label.is_empty() {
+        return entry.label.clone();
+    }
+    if !entry.path.is_empty() {
+        if let Some(name) = std::path::Path::new(&entry.path)
+            .file_name()
+            .and_then(|n| n.to_str())
+        {
+            return SharedString::from(name.to_string());
+        }
+    }
+    SharedString::from(format!("Model {}", index + 1))
 }
 
 impl Inspectable for Viewer3d {
     fn fields(&self) -> Vec<InspectionField> {
+        let model_items: Vec<ListItem> = self
+            .models
+            .iter()
+            .enumerate()
+            .map(|(i, entry)| ListItem {
+                label: model_row_label(entry, i),
+                fields: vec![
+                    InspectionField {
+                        label: "Label".into(),
+                        field_id: FieldId(encode_sub(i, SUB_LABEL)),
+                        value: InspectionValue::String(entry.label.to_string()),
+                    },
+                    InspectionField {
+                        label: "Path".into(),
+                        field_id: FieldId(encode_sub(i, SUB_PATH)),
+                        value: InspectionValue::String(entry.path.clone()),
+                    },
+                    InspectionField {
+                        label: "Position".into(),
+                        field_id: FieldId(encode_sub(i, SUB_POSITION)),
+                        value: binding_to_value(
+                            entry.position_binding_component(),
+                            PickerArity::Vec3,
+                        ),
+                    },
+                    InspectionField {
+                        label: "Orientation".into(),
+                        field_id: FieldId(encode_sub(i, SUB_ORIENTATION)),
+                        value: binding_to_value(
+                            entry.orientation_binding_component(),
+                            PickerArity::Quat,
+                        ),
+                    },
+                    InspectionField {
+                        label: "Remove".into(),
+                        field_id: FieldId(encode_sub(i, SUB_REMOVE)),
+                        value: InspectionValue::Bool(false),
+                    },
+                ],
+            })
+            .collect();
+
         vec![
             InspectionField {
-                label: "Model Path".into(),
-                field_id: FieldId(FIELD_MODEL_PATH),
-                value: InspectionValue::String(self.model_path.clone()),
+                label: "Models".into(),
+                field_id: FieldId(FIELD_MODELS),
+                value: InspectionValue::List(model_items),
             },
             InspectionField {
-                label: "Position".into(),
-                field_id: FieldId(FIELD_POSITION),
-                value: binding_to_value(self.position_binding, PickerArity::Vec3),
-            },
-            InspectionField {
-                label: "Orientation".into(),
-                field_id: FieldId(FIELD_ORIENTATION),
-                value: binding_to_value(self.orientation_binding, PickerArity::Quat),
+                label: "Add Model".into(),
+                field_id: FieldId(FIELD_ADD_MODEL),
+                value: InspectionValue::Bool(false),
             },
             InspectionField {
                 label: "Camera FOV (rad)".into(),
@@ -526,37 +720,59 @@ impl Inspectable for Viewer3d {
     }
 
     fn set_field(&mut self, field_id: FieldId, value: InspectionValue, cx: &mut Context<Self>) {
-        match field_id.0 {
-            FIELD_MODEL_PATH => {
-                if let InspectionValue::String(s) = value {
-                    self.model_path = s.clone();
-                    if !s.is_empty() {
-                        self.handle.send(ViewerCommand::LoadModel {
-                            id: self.handle.id(),
-                            path: s.into(),
-                        });
+        if let Some((item_index, sub)) = decode_sub(field_id.0) {
+            // Resolve the model by index, capturing the stable ModelId so
+            // any subsequent self-mutations don't depend on the borrow.
+            let Some(model_id) = self.models.get(item_index).map(|m| m.id) else {
+                return;
+            };
+            match sub {
+                SUB_LABEL => {
+                    if let InspectionValue::String(s) = value {
+                        self.set_model_label(model_id, s);
                     }
                 }
-            }
-            FIELD_POSITION => {
-                if let InspectionValue::ElementPicker {
-                    component: Some(component_id),
-                    ..
-                } = value
-                {
-                    self.position_binding = Some(Binding { component_id });
-                    self.restart_bindings(cx);
+                SUB_PATH => {
+                    if let InspectionValue::String(s) = value {
+                        self.set_model_path(model_id, s);
+                    }
                 }
-            }
-            FIELD_ORIENTATION => {
-                if let InspectionValue::ElementPicker {
-                    component: Some(component_id),
-                    ..
-                } = value
-                {
-                    self.orientation_binding = Some(Binding { component_id });
-                    self.restart_bindings(cx);
+                SUB_POSITION => {
+                    if let InspectionValue::ElementPicker {
+                        component: Some(component_id),
+                        ..
+                    } = value
+                    {
+                        self.set_model_position_binding(model_id, component_id, cx);
+                    }
                 }
+                SUB_ORIENTATION => {
+                    if let InspectionValue::ElementPicker {
+                        component: Some(component_id),
+                        ..
+                    } = value
+                    {
+                        self.set_model_orientation_binding(model_id, component_id, cx);
+                    }
+                }
+                SUB_REMOVE => {
+                    self.remove_model(model_id);
+                }
+                _ => {}
+            }
+            cx.notify();
+            return;
+        }
+
+        match field_id.0 {
+            FIELD_MODELS => {
+                // The List value itself is never written to directly — its
+                // sub-fields handle all mutations.
+            }
+            FIELD_ADD_MODEL => {
+                // Bool toggle is a one-shot action: any value (true or
+                // false) means "add an empty model now".
+                self.add_model("", "");
             }
             FIELD_FOV => {
                 if let InspectionValue::F64(v) = value {
