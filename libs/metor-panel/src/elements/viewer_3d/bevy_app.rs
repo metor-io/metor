@@ -30,7 +30,7 @@ use crossbeam_channel::Receiver;
 
 use crate::gpu_context::GpuContext;
 
-use super::bridge::{BaseTransform, FrameRouter, ViewerCommand, ViewerFrame, ViewerId};
+use super::bridge::{FrameRouter, ViewerCommand, ViewerFrame, ViewerId};
 
 /// Bevy thread entry point. Builds the App, wires the command/frame channels
 /// into ECS resources, and enters `ScheduleRunnerPlugin`'s loop via `run()`.
@@ -125,25 +125,9 @@ struct ViewerTag(ViewerId);
 #[derive(Component)]
 struct PropagateRenderLayers;
 
-/// The user-editable base TRS applied to a model's root. Lives as a
-/// separate component so the binding systems can compose live
-/// position/orientation on top without losing the user's frame correction.
-#[derive(Component, Clone, Copy)]
-struct ModelBase(BaseTransform);
-
-impl ModelBase {
-    fn to_transform(self) -> Transform {
-        let e = self.0.rotation_euler;
-        Transform {
-            translation: Vec3::new(self.0.translation.x, self.0.translation.y, self.0.translation.z),
-            rotation: Quat::from_euler(EulerRot::XYZ, e.x, e.y, e.z),
-            scale: Vec3::new(self.0.scale.x, self.0.scale.y, self.0.scale.z),
-        }
-    }
-}
-
-/// Live-binding delta from a component stream, composed on top of
-/// [`ModelBase`] each frame by [`compose_transforms`].
+/// Live-binding delta from a component stream, written into the model's
+/// [`Transform`] each frame by [`compose_transforms`]. Either field being
+/// `None` leaves that axis at identity.
 #[derive(Component, Default, Clone, Copy)]
 struct LiveDelta {
     translation: Option<Vec3>,
@@ -157,22 +141,16 @@ fn viewer_layer(id: ViewerId) -> RenderLayers {
     RenderLayers::from_layers(&[id.0 as usize])
 }
 
-/// Combine each model's base transform with its live binding delta and
-/// write the result into its [`Transform`]. Runs every frame — the cost is
-/// one component-query per model, negligible at the scales this viewer
-/// targets.
-fn compose_transforms(
-    mut q: Query<(&ModelBase, Option<&LiveDelta>, &mut Transform)>,
-) {
-    for (base, delta, mut transform) in &mut q {
-        let mut out = base.to_transform();
-        if let Some(d) = delta {
-            if let Some(t) = d.translation {
-                out.translation += t;
-            }
-            if let Some(r) = d.rotation {
-                out.rotation = r * out.rotation;
-            }
+/// Write each model's live binding delta into its [`Transform`]. Either
+/// axis being `None` is treated as identity for that axis.
+fn compose_transforms(mut q: Query<(&LiveDelta, &mut Transform)>) {
+    for (delta, mut transform) in &mut q {
+        let mut out = Transform::IDENTITY;
+        if let Some(t) = delta.translation {
+            out.translation = t;
+        }
+        if let Some(r) = delta.rotation {
+            out.rotation = r;
         }
         *transform = out;
     }
@@ -297,11 +275,7 @@ fn apply_commands(
                         }));
                 }
             }
-            ViewerCommand::LoadModel {
-                id,
-                path,
-                base_transform,
-            } => {
+            ViewerCommand::LoadModel { id, path } => {
                 if let Some(record) = registry.viewers.get_mut(&id) {
                     // Replace the current model with a fresh WorldAssetRoot
                     // pointing at the requested GLB/GLTF. The propagation
@@ -312,12 +286,10 @@ fn apply_commands(
                     let handle = asset_server
                         .load(GltfAssetLabel::Scene(0).from_asset(path_str));
                     let layers = viewer_layer(id);
-                    let base = ModelBase(base_transform);
                     let new_model = commands
                         .spawn((
                             WorldAssetRoot(handle),
-                            base.to_transform(),
-                            base,
+                            Transform::IDENTITY,
                             LiveDelta::default(),
                             layers,
                             PropagateRenderLayers,
@@ -325,15 +297,6 @@ fn apply_commands(
                         ))
                         .id();
                     record.model = new_model;
-                }
-            }
-            ViewerCommand::SetBaseTransform {
-                id,
-                base_transform,
-            } => {
-                if let Some(record) = registry.viewers.get(&id) {
-                    let base = ModelBase(base_transform);
-                    commands.entity(record.model).insert(base);
                 }
             }
             ViewerCommand::SetLiveTransform {
@@ -380,7 +343,6 @@ fn spawn_viewer(
 
     // Default placeholder content: a single blue cube. A `LoadModel` command
     // replaces this with a GLTF scene.
-    let base = ModelBase(BaseTransform::default());
     let model = commands
         .spawn((
             Mesh3d(meshes.add(Cuboid::new(1.0, 1.0, 1.0))),
@@ -389,8 +351,7 @@ fn spawn_viewer(
                 perceptual_roughness: 0.4,
                 ..default()
             })),
-            base.to_transform(),
-            base,
+            Transform::IDENTITY,
             LiveDelta::default(),
             layers.clone(),
             PropagateRenderLayers,

@@ -9,25 +9,48 @@
 pub(crate) mod bevy_app;
 pub mod bridge;
 pub mod camera;
-pub mod picker;
 
 use std::sync::Arc;
 
+use glam::{Quat, Vec3};
 use gpui::{
     Bounds, Context, Corners, IntoElement, MouseButton, Pixels, Point, RenderImage, Window, canvas,
     div, prelude::*, px,
 };
 use image::{Frame, ImageBuffer, Rgba};
 use metor_db::DB;
+use metor_proto::types::ComponentView;
 use smallvec::SmallVec;
 
 use crate::inspectable::{FieldId, Inspectable, InspectionField, InspectionValue, PickerArity};
 use crate::theme::theme;
 use crate::{AsComponentView, ComponentStream, ComponentStreamBuilder};
 
-pub use bridge::{BaseTransform, BevyBridge, ViewerCommand, ViewerFrame, ViewerHandle, ViewerId};
+pub use bridge::{BevyBridge, ViewerCommand, ViewerFrame, ViewerHandle, ViewerId};
 pub use camera::OrbitCamera;
-pub use picker::{QuatPick, Vec3Pick};
+
+/// Convert a metor-panel `[x, y, z]` position component into a Bevy-frame
+/// `Vec3`. metor-panel is Z-down; Bevy is Y-up, so position swizzles to
+/// `(x, z, -y)`. Missing elements default to `0.0`.
+fn pick_position(view: &ComponentView<'_>) -> Vec3 {
+    let pick = |i: usize| view.get(i).map(|v| v.as_f64() as f32).unwrap_or(0.0);
+    let x = pick(0);
+    let y = pick(1);
+    let z = pick(2);
+    Vec3::new(x, z, -y)
+}
+
+/// Convert a metor-panel `[i, j, k, w]` quaternion component into a
+/// Bevy-frame `Quat`. Same Z-down → Y-up swizzle as [`pick_position`],
+/// applied to the imaginary parts: `(i, k, -j, w)`. Does not re-normalize.
+fn pick_attitude(view: &ComponentView<'_>) -> Quat {
+    let pick = |i: usize| view.get(i).map(|v| v.as_f64() as f32).unwrap_or(0.0);
+    let i = pick(0);
+    let j = pick(1);
+    let k = pick(2);
+    let w = pick(3);
+    Quat::from_xyzw(i, k, -j, w)
+}
 
 /// Default render target size used the first time a viewer is created, before
 /// the first resize callback fires. Small enough to not waste VRAM, large
@@ -45,7 +68,6 @@ pub struct Viewer3d {
     /// DB (the standalone example case).
     db: Option<Arc<DB>>,
     camera: OrbitCamera,
-    base_transform: BaseTransform,
     /// GLTF/GLB path currently loaded. Empty string means "use the default
     /// placeholder cube".
     model_path: String,
@@ -126,7 +148,6 @@ impl Viewer3d {
             handle,
             db,
             camera,
-            base_transform: BaseTransform::default(),
             model_path: String::new(),
             position_binding: None,
             orientation_binding: None,
@@ -183,29 +204,11 @@ impl Viewer3d {
     /// loaded from `path`. The path is resolved by Bevy's `AssetServer`, so
     /// an absolute path works anywhere; a relative path resolves against the
     /// asset source, which defaults to the process working directory.
-    ///
-    /// The current [`Self::base_transform`] is reused — set it first if you
-    /// need a custom frame rotation.
     pub fn load_gltf(&self, path: impl Into<std::path::PathBuf>) {
         self.handle.send(ViewerCommand::LoadModel {
             id: self.handle.id(),
             path: path.into(),
-            base_transform: self.base_transform,
         });
-    }
-
-    /// Replace the model's base transform (pre-binding TRS). Usually driven
-    /// by the inspector in Phase 11.
-    pub fn set_base_transform(&mut self, base_transform: BaseTransform) {
-        self.base_transform = base_transform;
-        self.handle.send(ViewerCommand::SetBaseTransform {
-            id: self.handle.id(),
-            base_transform,
-        });
-    }
-
-    pub fn base_transform(&self) -> BaseTransform {
-        self.base_transform
     }
 
     pub fn camera(&self) -> OrbitCamera {
@@ -248,18 +251,17 @@ impl Viewer3d {
         self.binding_tasks.clear();
         if let Some(b) = self.position_binding {
             self.binding_tasks
-                .push(Self::spawn_position_task(db.clone(), b.component_id, Vec3Pick, cx));
+                .push(Self::spawn_position_task(db.clone(), b.component_id, cx));
         }
         if let Some(b) = self.orientation_binding {
             self.binding_tasks
-                .push(Self::spawn_orientation_task(db, b.component_id, QuatPick, cx));
+                .push(Self::spawn_orientation_task(db, b.component_id, cx));
         }
     }
 
     fn spawn_position_task(
         db: Arc<DB>,
         component_id: metor_proto::types::ComponentId,
-        picker: Vec3Pick,
         cx: &mut Context<Self>,
     ) -> gpui::Task<()> {
         cx.spawn(async move |this, cx| {
@@ -267,7 +269,7 @@ impl Viewer3d {
             loop {
                 let v = {
                     let view = stream.next().await;
-                    picker.pick(&view.as_component_view())
+                    pick_position(&view.as_component_view())
                 };
                 if this
                     .update(cx, |this, _cx| {
@@ -289,7 +291,6 @@ impl Viewer3d {
     fn spawn_orientation_task(
         db: Arc<DB>,
         component_id: metor_proto::types::ComponentId,
-        picker: QuatPick,
         cx: &mut Context<Self>,
     ) -> gpui::Task<()> {
         cx.spawn(async move |this, cx| {
@@ -297,7 +298,7 @@ impl Viewer3d {
             loop {
                 let q = {
                     let view = stream.next().await;
-                    picker.pick(&view.as_component_view())
+                    pick_attitude(&view.as_component_view())
                 };
                 if this
                     .update(cx, |this, _cx| {
@@ -410,8 +411,8 @@ impl Render for Viewer3d {
                     this.drag = None;
                 }),
             )
-            .on_mouse_move(cx.listener(
-                |this, event: &gpui::MouseMoveEvent, _window, cx| {
+            .on_mouse_move(
+                cx.listener(|this, event: &gpui::MouseMoveEvent, _window, cx| {
                     let Some(drag) = this.drag else {
                         return;
                     };
@@ -428,17 +429,17 @@ impl Render for Viewer3d {
                     this.camera = cam;
                     this.sync_camera();
                     cx.notify();
-                },
-            ))
-            .on_scroll_wheel(cx.listener(
-                |this, event: &gpui::ScrollWheelEvent, _window, cx| {
+                }),
+            )
+            .on_scroll_wheel(
+                cx.listener(|this, event: &gpui::ScrollWheelEvent, _window, cx| {
                     let delta = event.delta.pixel_delta(px(20.0));
                     this.camera.zoom(-f32::from(delta.y));
                     this.sync_camera();
                     cx.stop_propagation();
                     cx.notify();
-                },
-            ))
+                }),
+            )
             .child(
                 canvas(
                     // Prepaint: capture the latest image + dropped-image list,
@@ -483,14 +484,8 @@ impl Render for Viewer3d {
 const FIELD_MODEL_PATH: u32 = 0;
 const FIELD_POSITION: u32 = 1;
 const FIELD_ORIENTATION: u32 = 2;
-const FIELD_BASE_TX: u32 = 3;
-const FIELD_BASE_TY: u32 = 4;
-const FIELD_BASE_TZ: u32 = 5;
-const FIELD_BASE_RX: u32 = 6;
-const FIELD_BASE_RY: u32 = 7;
-const FIELD_BASE_RZ: u32 = 8;
-const FIELD_FOV: u32 = 9;
-const FIELD_RESET_CAMERA: u32 = 10;
+const FIELD_FOV: u32 = 3;
+const FIELD_RESET_CAMERA: u32 = 4;
 
 fn binding_to_value(binding: Option<Binding>, arity: PickerArity) -> InspectionValue {
     InspectionValue::ElementPicker {
@@ -518,36 +513,6 @@ impl Inspectable for Viewer3d {
                 value: binding_to_value(self.orientation_binding, PickerArity::Quat),
             },
             InspectionField {
-                label: "Base Tx".into(),
-                field_id: FieldId(FIELD_BASE_TX),
-                value: InspectionValue::F64(self.base_transform.translation.x as f64),
-            },
-            InspectionField {
-                label: "Base Ty".into(),
-                field_id: FieldId(FIELD_BASE_TY),
-                value: InspectionValue::F64(self.base_transform.translation.y as f64),
-            },
-            InspectionField {
-                label: "Base Tz".into(),
-                field_id: FieldId(FIELD_BASE_TZ),
-                value: InspectionValue::F64(self.base_transform.translation.z as f64),
-            },
-            InspectionField {
-                label: "Base Rx (rad)".into(),
-                field_id: FieldId(FIELD_BASE_RX),
-                value: InspectionValue::F64(self.base_transform.rotation_euler.x as f64),
-            },
-            InspectionField {
-                label: "Base Ry (rad)".into(),
-                field_id: FieldId(FIELD_BASE_RY),
-                value: InspectionValue::F64(self.base_transform.rotation_euler.y as f64),
-            },
-            InspectionField {
-                label: "Base Rz (rad)".into(),
-                field_id: FieldId(FIELD_BASE_RZ),
-                value: InspectionValue::F64(self.base_transform.rotation_euler.z as f64),
-            },
-            InspectionField {
                 label: "Camera FOV (rad)".into(),
                 field_id: FieldId(FIELD_FOV),
                 value: InspectionValue::F64(self.camera.fov_y_rad as f64),
@@ -569,7 +534,6 @@ impl Inspectable for Viewer3d {
                         self.handle.send(ViewerCommand::LoadModel {
                             id: self.handle.id(),
                             path: s.into(),
-                            base_transform: self.base_transform,
                         });
                     }
                 }
@@ -592,23 +556,6 @@ impl Inspectable for Viewer3d {
                 {
                     self.orientation_binding = Some(Binding { component_id });
                     self.restart_bindings(cx);
-                }
-            }
-            FIELD_BASE_TX | FIELD_BASE_TY | FIELD_BASE_TZ | FIELD_BASE_RX | FIELD_BASE_RY
-            | FIELD_BASE_RZ => {
-                if let InspectionValue::F64(v) = value {
-                    let v = v as f32;
-                    let mut bt = self.base_transform;
-                    match field_id.0 {
-                        FIELD_BASE_TX => bt.translation.x = v,
-                        FIELD_BASE_TY => bt.translation.y = v,
-                        FIELD_BASE_TZ => bt.translation.z = v,
-                        FIELD_BASE_RX => bt.rotation_euler.x = v,
-                        FIELD_BASE_RY => bt.rotation_euler.y = v,
-                        FIELD_BASE_RZ => bt.rotation_euler.z = v,
-                        _ => unreachable!(),
-                    }
-                    self.set_base_transform(bt);
                 }
             }
             FIELD_FOV => {

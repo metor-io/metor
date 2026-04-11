@@ -49,47 +49,15 @@ pub enum ViewerCommand {
     LoadModel {
         id: ViewerId,
         path: std::path::PathBuf,
-        base_transform: BaseTransform,
-    },
-    /// Update the model's base transform (pre-binding orientation, offset
-    /// and scale). Does not touch any live component bindings — those are
-    /// composed on top.
-    SetBaseTransform {
-        id: ViewerId,
-        base_transform: BaseTransform,
     },
     /// Apply a live position and/or orientation delta from a component
-    /// binding. These are composed on top of the model's base transform.
-    /// Setting either component to `None` leaves that axis untouched; both
-    /// `None` is a no-op.
+    /// binding. Setting either component to `None` leaves that axis at the
+    /// identity; both `None` is the model at its origin.
     SetLiveTransform {
         id: ViewerId,
         translation: Option<glam::Vec3>,
         rotation: Option<glam::Quat>,
     },
-}
-
-/// A user-settable TRS applied to a model's root before any live component
-/// binding runs. Lets the user rotate incoming telemetry data into the
-/// model's local frame (e.g. rotate a GLTF that was authored Z-up into our
-/// Y-up convention) and offset/scale it as needed.
-#[derive(Clone, Copy, Debug)]
-pub struct BaseTransform {
-    pub translation: glam::Vec3,
-    /// Euler XYZ (roll, pitch, yaw) in radians. Stored as Euler for easy
-    /// inspector editing; the Bevy side converts to a quaternion.
-    pub rotation_euler: glam::Vec3,
-    pub scale: glam::Vec3,
-}
-
-impl Default for BaseTransform {
-    fn default() -> Self {
-        Self {
-            translation: glam::Vec3::ZERO,
-            rotation_euler: glam::Vec3::ZERO,
-            scale: glam::Vec3::ONE,
-        }
-    }
 }
 
 /// Rendered frame sent back to a [`ViewerHandle`].

@@ -201,14 +201,8 @@ impl PaneItem for Viewer3dPanel {
     fn serialize(&self, cx: &App) -> serde_json::Value {
         let inner = self.inner.read(cx);
         let cam = inner.camera();
-        let base = inner.base_transform();
         serde_json::json!({
             "model_path": inner.model_path(),
-            "base_transform": {
-                "translation": [base.translation.x, base.translation.y, base.translation.z],
-                "rotation_euler": [base.rotation_euler.x, base.rotation_euler.y, base.rotation_euler.z],
-                "scale": [base.scale.x, base.scale.y, base.scale.z],
-            },
             "camera": {
                 "target": [cam.target.x, cam.target.y, cam.target.z],
                 "yaw": cam.yaw,
