@@ -1,15 +1,11 @@
 //! Per-viewer orbit camera state and the math for turning mouse/scroll
 //! deltas into new yaw/pitch/distance/target values.
 //!
-//! The camera is purely GPUI-side data; it's serialized into
-//! [`ViewerCommand::SetCamera`] and shipped to Bevy each time it changes.
-//! Keeping the math out of the Bevy systems makes it easy to unit-test and
-//! avoids a round-trip through the command channel for every frame.
+//! The camera is purely GPUI-side data. The owning `Viewer3d` calls
+//! [`BevyBridge::set_camera`] each time the pose changes; keeping the math
+//! out of the Bevy systems makes it easy to unit-test.
 
 use glam::Vec3;
-
-use super::bridge::ViewerCommand;
-use super::bridge::ViewerId;
 
 /// An orbit camera rotating around a world-space target point.
 #[derive(Clone, Copy, Debug)]
@@ -79,17 +75,5 @@ impl OrbitCamera {
         let right = forward.cross(world_up).normalize_or_zero();
         let up = right.cross(forward).normalize_or_zero();
         (right, up)
-    }
-
-    /// Build a [`ViewerCommand::SetCamera`] snapshot for the given viewer.
-    pub fn to_command(&self, id: ViewerId) -> ViewerCommand {
-        ViewerCommand::SetCamera {
-            id,
-            target: self.target,
-            yaw: self.yaw,
-            pitch: self.pitch,
-            distance: self.distance,
-            fov_y_rad: self.fov_y_rad,
-        }
     }
 }

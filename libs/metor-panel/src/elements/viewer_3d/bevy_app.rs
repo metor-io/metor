@@ -1,24 +1,33 @@
-//! Bevy-side half of the viewer bridge. Builds an `App` that reuses
-//! metor-panel's shared [`GpuContext`], runs it on a dedicated thread via
-//! `ScheduleRunnerPlugin`, and exposes two channels to the rest of the crate:
-//! commands in and rendered frames out.
+//! Bevy-side helpers for the viewer bridge. The Bevy `App` itself is
+//! owned by [`super::bridge::BevyBridge`] on the GPUI thread; this module
+//! exposes:
 //!
-//! The entry point is [`run`], which never returns — it owns the thread for
-//! the lifetime of the process.
+//! - [`build_app`] — constructs the headless App with our trimmed plugin
+//!   set, [`RenderCreation::Manual`] using the shared [`GpuContext`], and
+//!   the per-frame systems we need.
+//! - Free functions that operate on a `&mut World` directly:
+//!   [`create_viewer`], [`despawn_viewer`], [`resize_viewer`],
+//!   [`set_viewer_camera`], [`load_model`], [`remove_model`],
+//!   [`set_live_transform`].
+//!
+//! The free functions are called by the bridge either inline (when the
+//! App is on the GPUI thread) or as queued closures drained after a
+//! background render.
 
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::Duration;
 
-use bevy::app::ScheduleRunnerPlugin;
+use bevy::app::{App, SubApps};
 use bevy::asset::{AssetPlugin, AssetServer, RenderAssetUsages, UnapprovedPathMode};
 use bevy::camera::RenderTarget;
 use bevy::camera::visibility::RenderLayers;
+use bevy::ecs::world::World;
 use bevy::gltf::GltfAssetLabel;
 use bevy::image::Image;
 use bevy::prelude::*;
 use bevy::render::RenderPlugin;
 use bevy::render::gpu_readback::{Readback, ReadbackComplete};
+use bevy::render::pipelined_rendering::PipelinedRenderingPlugin;
 use bevy::render::render_resource::{Extent3d, TextureDimension, TextureFormat, TextureUsages};
 use bevy::render::renderer::{
     RenderAdapter, RenderAdapterInfo, RenderDevice, RenderInstance, RenderQueue, WgpuWrapper,
@@ -26,21 +35,25 @@ use bevy::render::renderer::{
 use bevy::render::settings::{RenderCreation, RenderResources};
 use bevy::window::{ExitCondition, WindowPlugin};
 use bevy::world_serialization::WorldAssetRoot;
-use crossbeam_channel::Receiver;
 
 use crate::gpu_context::GpuContext;
 
-use super::bridge::{FrameRouter, ModelId, ViewerCommand, ViewerFrame, ViewerId};
+use super::bridge::{ModelId, ViewerId};
 
-/// Bevy thread entry point. Builds the App, wires the command/frame channels
-/// into ECS resources, and enters `ScheduleRunnerPlugin`'s loop via `run()`.
-pub(super) fn run(command_rx: Receiver<ViewerCommand>, frame_router: FrameRouter) {
-    let Some(ctx) = GpuContext::get() else {
-        // Nothing we can do without a GPU; the bridge thread just exits and
-        // any Viewer3d elements will show empty frames.
-        eprintln!("metor-panel: no GPU adapter available, 3D viewer disabled");
-        return;
-    };
+/// Build the headless Bevy app and immediately extract its [`SubApps`].
+///
+/// We return `SubApps` rather than the full `App` because `App` holds a
+/// non-`Send` `RunnerFn` (`Box<dyn FnOnce(App) -> AppExit>`) that we
+/// don't need — all updates are driven via `sub_apps.update()` directly,
+/// the same pattern Bevy's `examples/app/externally_driven_headless_renderer.rs`
+/// uses.
+///
+/// The returned `SubApps` is `Send` (its contents are: `World` is unsafely
+/// `Send`, plugin registries hold `Box<dyn Plugin + Send + Sync>`), so the
+/// bridge can ship it to a background-executor worker for each render
+/// without thread pinning.
+pub(super) fn build_app() -> SubApps {
+    let ctx = GpuContext::get().expect("metor-panel: no GPU adapter");
 
     let render_resources = RenderResources(
         RenderDevice::from(ctx.device.clone()),
@@ -55,7 +68,7 @@ pub(super) fn run(command_rx: Receiver<ViewerCommand>, frame_router: FrameRouter
         DefaultPlugins
             .set(RenderPlugin {
                 render_creation: RenderCreation::Manual(render_resources),
-                synchronous_pipeline_compilation: false,
+                synchronous_pipeline_compilation: true,
                 ..default()
             })
             .set(WindowPlugin {
@@ -63,57 +76,42 @@ pub(super) fn run(command_rx: Receiver<ViewerCommand>, frame_router: FrameRouter
                 exit_condition: ExitCondition::DontExit,
                 ..default()
             })
-            // Allow arbitrary file paths so `LoadModel` can point at any GLB
-            // the user opens from the inspector. The viewer is a local dev
-            // tool, not a sandbox for untrusted assets, so the default
-            // `Forbid` mode is too restrictive.
             .set(AssetPlugin {
                 unapproved_path_mode: UnapprovedPathMode::Allow,
                 ..default()
-            }),
+            })
+            // Pipelined rendering would put the render world on its own
+            // dedicated thread, which fights the "ship the App between
+            // threads on each render" model. Disable it so `app.update()`
+            // runs the render graph synchronously on whichever thread is
+            // currently driving the App.
+            .disable::<PipelinedRenderingPlugin>(),
     );
-    app.add_plugins(ScheduleRunnerPlugin::run_loop(Duration::from_secs_f64(
-        1.0 / 60.0,
-    )));
 
-    app.insert_resource(CommandRx(command_rx));
-    app.insert_resource(Router(frame_router));
-    app.init_resource::<ViewerRegistry>();
-
-    app.add_systems(
-        Update,
-        (apply_commands, compose_transforms, propagate_render_layers).chain(),
-    );
+    app.init_resource::<LatestFrames>();
+    app.add_systems(Update, (compose_transforms, propagate_render_layers).chain());
     app.add_observer(on_readback_complete);
 
-    app.run();
+    // Externally-driven update loop: finish + cleanup must be called
+    // before the first `update()`.
+    app.finish();
+    app.cleanup();
+
+    // Extract just the SubApps; the App's RunnerFn is dropped here.
+    std::mem::take(app.sub_apps_mut())
 }
 
-/// Holds the incoming command channel as a Bevy resource.
-#[derive(Resource)]
-struct CommandRx(Receiver<ViewerCommand>);
-
-/// Holds the outgoing frame-router as a Bevy resource.
-#[derive(Resource)]
-struct Router(FrameRouter);
-
-/// Tracks per-viewer entities so `Despawn` can clean them up.
+/// Resource holding rendered frame bytes keyed by [`ViewerId`]. The
+/// readback observer writes here every time a `ReadbackComplete` event
+/// fires; the bridge drains this resource immediately after each
+/// `app.update()` call on the background worker.
 #[derive(Resource, Default)]
-struct ViewerRegistry {
-    viewers: HashMap<ViewerId, ViewerRecord>,
-}
+pub(super) struct LatestFrames(HashMap<ViewerId, Vec<u8>>);
 
-struct ViewerRecord {
-    camera: Entity,
-    light: Entity,
-    render_target: Handle<Image>,
-    readback: Entity,
-    width: u32,
-    height: u32,
-    /// Live model entities keyed by their per-viewer [`ModelId`]. Empty
-    /// when no models have been added — the viewer renders just the clear
-    /// color in that case.
-    models: HashMap<ModelId, Entity>,
+/// Move every accumulated frame out of the world. Called by the bridge
+/// after `app.update()` on the background worker.
+pub(super) fn take_latest_frames(world: &mut World) -> HashMap<ViewerId, Vec<u8>> {
+    std::mem::take(&mut world.resource_mut::<LatestFrames>().0)
 }
 
 /// Component tagging an entity (or readback sentinel) with the viewer it
@@ -122,9 +120,8 @@ struct ViewerRecord {
 struct ViewerTag(ViewerId);
 
 /// Component tagging a model entity with its per-viewer [`ModelId`]. Used
-/// for diagnostics; lookups go through `ViewerRecord::models` directly.
-#[derive(Component, Clone, Copy)]
-#[allow(dead_code)]
+/// for despawn and `SetLiveTransform` lookups via tag queries.
+#[derive(Component, Clone, Copy, PartialEq, Eq)]
 struct ModelTag(ModelId);
 
 /// Marker for an entity whose children should inherit its [`RenderLayers`].
@@ -143,9 +140,10 @@ struct LiveDelta {
     rotation: Option<Quat>,
 }
 
-/// Map a [`ViewerId`] to its dedicated [`RenderLayers`] slot. Viewers start
-/// at id 1, so layer 0 is intentionally unused (it's the default layer for
-/// any untagged entity, which we don't want any viewer's camera to see).
+/// Map a [`ViewerId`] to its dedicated [`RenderLayers`] slot. Viewers
+/// start at id 1, so layer 0 is intentionally unused (it's the default
+/// layer for any untagged entity, which we don't want any viewer's camera
+/// to see).
 fn viewer_layer(id: ViewerId) -> RenderLayers {
     RenderLayers::from_layers(&[id.0 as usize])
 }
@@ -198,140 +196,162 @@ fn propagate_layers_recursive(
     }
 }
 
-/// Drain pending commands from GPUI and apply them to the world.
-fn apply_commands(
-    command_rx: Res<CommandRx>,
-    mut commands: Commands,
-    asset_server: Res<AssetServer>,
-    mut images: ResMut<Assets<Image>>,
-    mut registry: ResMut<ViewerRegistry>,
-    router: Res<Router>,
+/// Observer: when a readback completes on a tagged entity, store the
+/// padded bytes in [`LatestFrames`] keyed by viewer id.
+fn on_readback_complete(
+    trigger: On<ReadbackComplete>,
+    tags: Query<&ViewerTag>,
+    mut latest: ResMut<LatestFrames>,
 ) {
-    while let Ok(cmd) = command_rx.0.try_recv() {
-        match cmd {
-            ViewerCommand::Create { id, width, height } => {
-                if registry.viewers.contains_key(&id) {
-                    continue;
-                }
-                let record = spawn_viewer(id, width, height, &mut commands, &mut images);
-                registry.viewers.insert(id, record);
-            }
-            ViewerCommand::Despawn { id } => {
-                if let Some(record) = registry.viewers.remove(&id) {
-                    commands.entity(record.camera).despawn();
-                    commands.entity(record.light).despawn();
-                    commands.entity(record.readback).despawn();
-                    for &model_entity in record.models.values() {
-                        commands.entity(model_entity).despawn();
-                    }
-                    images.remove(&record.render_target);
-                    crate::elements::viewer_3d::bridge::BevyBridge::drop_router_entry(
-                        &router.0, id,
-                    );
-                }
-            }
-            ViewerCommand::Resize { id, width, height } => {
-                if let Some(record) = registry.viewers.get_mut(&id) {
-                    if record.width == width && record.height == height {
-                        continue;
-                    }
-                    // Build a new render target image; drop the old one. The
-                    // readback component is re-created to target the new image.
-                    let new_target = new_target_image(width, height);
-                    let new_handle = images.add(new_target);
-                    images.remove(&record.render_target);
-                    record.render_target = new_handle.clone();
-                    record.width = width;
-                    record.height = height;
+    let entity = trigger.entity;
+    let Ok(tag) = tags.get(entity) else {
+        return;
+    };
+    latest.0.insert(tag.0, trigger.data.clone());
+}
 
-                    commands
-                        .entity(record.camera)
-                        .insert(RenderTarget::from(new_handle.clone()));
+/// wgpu aligns `bytes_per_row` to `COPY_BYTES_PER_ROW_ALIGNMENT` (256).
+/// Strip that padding so downstream consumers see a tight `width * 4`
+/// byte stride.
+pub(super) fn strip_row_padding(padded: &[u8], width: u32, height: u32) -> Vec<u8> {
+    let tight_row = (width as usize) * 4;
+    let align = wgpu::COPY_BYTES_PER_ROW_ALIGNMENT as usize;
+    let padded_row = tight_row.div_ceil(align) * align;
+    if padded_row == tight_row {
+        return padded.to_vec();
+    }
+    let mut out = Vec::with_capacity(tight_row * height as usize);
+    for y in 0..height as usize {
+        let start = y * padded_row;
+        let end = start + tight_row;
+        if end > padded.len() {
+            break;
+        }
+        out.extend_from_slice(&padded[start..end]);
+    }
+    out
+}
 
-                    commands.entity(record.readback).despawn();
-                    record.readback = commands
-                        .spawn((Readback::texture(new_handle), ViewerTag(id)))
-                        .id();
-                }
-            }
-            ViewerCommand::SetCamera {
-                id,
-                target,
-                yaw,
-                pitch,
-                distance,
-                fov_y_rad,
-            } => {
-                if let Some(record) = registry.viewers.get(&id) {
-                    let eye = orbit_eye(target, yaw, pitch, distance);
-                    let target_bevy = Vec3::new(target.x, target.y, target.z);
-                    let transform =
-                        Transform::from_translation(eye).looking_at(target_bevy, Vec3::Y);
-                    commands
-                        .entity(record.camera)
-                        .insert(transform)
-                        .insert(Projection::Perspective(PerspectiveProjection {
-                            fov: fov_y_rad,
-                            ..default()
-                        }));
-                }
-            }
-            ViewerCommand::LoadModel {
-                id,
-                model_id,
-                path,
-            } => {
-                if let Some(record) = registry.viewers.get_mut(&id) {
-                    // Replace any existing model with this `model_id`. The
-                    // propagation system fills in RenderLayers on the
-                    // scene's children as they spawn.
-                    if let Some(prev) = record.models.remove(&model_id) {
-                        commands.entity(prev).despawn();
-                    }
-                    let path_str = path.to_string_lossy().into_owned();
-                    let handle = asset_server
-                        .load(GltfAssetLabel::Scene(0).from_asset(path_str));
-                    let layers = viewer_layer(id);
-                    let new_model = commands
-                        .spawn((
-                            WorldAssetRoot(handle),
-                            Transform::IDENTITY,
-                            LiveDelta::default(),
-                            layers,
-                            PropagateRenderLayers,
-                            ViewerTag(id),
-                            ModelTag(model_id),
-                        ))
-                        .id();
-                    record.models.insert(model_id, new_model);
-                }
-            }
-            ViewerCommand::RemoveModel { id, model_id } => {
-                if let Some(record) = registry.viewers.get_mut(&id) {
-                    if let Some(entity) = record.models.remove(&model_id) {
-                        commands.entity(entity).despawn();
-                    }
-                }
-            }
-            ViewerCommand::SetLiveTransform {
-                id,
-                model_id,
-                translation,
-                rotation,
-            } => {
-                if let Some(record) = registry.viewers.get(&id) {
-                    if let Some(&entity) = record.models.get(&model_id) {
-                        let translation = translation.map(|v| Vec3::new(v.x, v.y, v.z));
-                        let rotation = rotation.map(|q| Quat::from_xyzw(q.x, q.y, q.z, q.w));
-                        commands.entity(entity).insert(LiveDelta {
-                            translation,
-                            rotation,
-                        });
-                    }
-                }
-            }
+// ---------------------------------------------------------------------
+// Free functions invoked by the bridge to mutate the world directly.
+// ---------------------------------------------------------------------
+
+/// Spawn a viewer's camera, light, render-target image, and readback
+/// sentinel. Called from `BevyBridge::register`.
+pub(super) fn create_viewer(world: &mut World, id: ViewerId, width: u32, height: u32) {
+    let target_image = new_target_image(width, height);
+    let render_target = world.resource_mut::<Assets<Image>>().add(target_image);
+    let layers = viewer_layer(id);
+
+    world.spawn((
+        DirectionalLight {
+            illuminance: 10_000.0,
+            ..default()
+        },
+        Transform::from_xyz(4.0, 8.0, 4.0).looking_at(Vec3::ZERO, Vec3::Y),
+        layers.clone(),
+        ViewerTag(id),
+    ));
+
+    world.spawn((
+        Camera3d::default(),
+        Camera {
+            clear_color: ClearColorConfig::Custom(Color::srgb(0.05, 0.05, 0.08)),
+            ..default()
+        },
+        RenderTarget::from(render_target.clone()),
+        Projection::Perspective(PerspectiveProjection {
+            fov: std::f32::consts::FRAC_PI_3,
+            ..default()
+        }),
+        Transform::from_xyz(3.0, 2.0, 3.0).looking_at(Vec3::ZERO, Vec3::Y),
+        layers.clone(),
+        ViewerTag(id),
+    ));
+
+    world.spawn((Readback::texture(render_target), ViewerTag(id)));
+}
+
+/// Despawn every entity tagged with `ViewerTag(id)`, plus any model
+/// entities that belong to this viewer.
+pub(super) fn despawn_viewer(world: &mut World, id: ViewerId) {
+    let mut to_despawn: Vec<Entity> = Vec::new();
+    let mut q = world.query::<(Entity, &ViewerTag)>();
+    for (entity, tag) in q.iter(world) {
+        if tag.0 == id {
+            to_despawn.push(entity);
         }
     }
+    for entity in to_despawn {
+        world.despawn(entity);
+    }
+}
+
+/// Replace a viewer's render-target image with a fresh one at the
+/// requested size. Re-creates the readback sentinel so subsequent reads
+/// target the new image.
+pub(super) fn resize_viewer(world: &mut World, id: ViewerId, width: u32, height: u32) {
+    let new_image = new_target_image(width, height);
+    let new_handle = world.resource_mut::<Assets<Image>>().add(new_image);
+
+    // Find the camera entity tagged with this viewer and re-attach the
+    // new render target.
+    let camera_entity = {
+        let mut q = world.query::<(Entity, &ViewerTag, &Camera3d)>();
+        q.iter(world)
+            .find(|(_, tag, _)| tag.0 == id)
+            .map(|(e, _, _)| e)
+    };
+    if let Some(camera) = camera_entity {
+        world
+            .entity_mut(camera)
+            .insert(RenderTarget::from(new_handle.clone()));
+    }
+
+    // Despawn the old readback sentinel(s) and spawn a new one targeting
+    // the new image.
+    let old_readbacks: Vec<Entity> = {
+        let mut q = world.query::<(Entity, &ViewerTag, &Readback)>();
+        q.iter(world)
+            .filter(|(_, tag, _)| tag.0 == id)
+            .map(|(e, _, _)| e)
+            .collect()
+    };
+    for entity in old_readbacks {
+        world.despawn(entity);
+    }
+    world.spawn((Readback::texture(new_handle), ViewerTag(id)));
+}
+
+/// Move a viewer's camera to the given orbit pose.
+pub(super) fn set_viewer_camera(
+    world: &mut World,
+    id: ViewerId,
+    target: glam::Vec3,
+    yaw: f32,
+    pitch: f32,
+    distance: f32,
+    fov_y_rad: f32,
+) {
+    let camera_entity = {
+        let mut q = world.query::<(Entity, &ViewerTag, &Camera3d)>();
+        q.iter(world)
+            .find(|(_, tag, _)| tag.0 == id)
+            .map(|(e, _, _)| e)
+    };
+    let Some(entity) = camera_entity else {
+        return;
+    };
+    let eye = orbit_eye(target, yaw, pitch, distance);
+    let target_bevy = Vec3::new(target.x, target.y, target.z);
+    let transform = Transform::from_translation(eye).looking_at(target_bevy, Vec3::Y);
+    world
+        .entity_mut(entity)
+        .insert(transform)
+        .insert(Projection::Perspective(PerspectiveProjection {
+            fov: fov_y_rad,
+            ..default()
+        }));
 }
 
 fn orbit_eye(target: glam::Vec3, yaw: f32, pitch: f32, distance: f32) -> Vec3 {
@@ -345,60 +365,64 @@ fn orbit_eye(target: glam::Vec3, yaw: f32, pitch: f32, distance: f32) -> Vec3 {
     t + offset
 }
 
-fn spawn_viewer(
-    id: ViewerId,
-    width: u32,
-    height: u32,
-    commands: &mut Commands,
-    images: &mut Assets<Image>,
-) -> ViewerRecord {
-    let target_image = new_target_image(width, height);
-    let render_target = images.add(target_image);
-    let layers = viewer_layer(id);
+/// Add or replace a model on a viewer.
+pub(super) fn load_model(
+    world: &mut World,
+    viewer_id: ViewerId,
+    model_id: ModelId,
+    path: std::path::PathBuf,
+) {
+    // Despawn any existing model with the same id first.
+    remove_model(world, viewer_id, model_id);
 
-    let light = commands
-        .spawn((
-            DirectionalLight {
-                illuminance: 10_000.0,
-                ..default()
-            },
-            Transform::from_xyz(4.0, 8.0, 4.0).looking_at(Vec3::ZERO, Vec3::Y),
-            layers.clone(),
-            ViewerTag(id),
-        ))
-        .id();
+    let path_str = path.to_string_lossy().into_owned();
+    let handle = world
+        .resource::<AssetServer>()
+        .load(GltfAssetLabel::Scene(0).from_asset(path_str));
+    let layers = viewer_layer(viewer_id);
+    world.spawn((
+        WorldAssetRoot(handle),
+        Transform::IDENTITY,
+        LiveDelta::default(),
+        layers,
+        PropagateRenderLayers,
+        ViewerTag(viewer_id),
+        ModelTag(model_id),
+    ));
+}
 
-    let camera = commands
-        .spawn((
-            Camera3d::default(),
-            Camera {
-                clear_color: ClearColorConfig::Custom(Color::srgb(0.05, 0.05, 0.08)),
-                ..default()
-            },
-            RenderTarget::from(render_target.clone()),
-            Projection::Perspective(PerspectiveProjection {
-                fov: std::f32::consts::FRAC_PI_3,
-                ..default()
-            }),
-            Transform::from_xyz(3.0, 2.0, 3.0).looking_at(Vec3::ZERO, Vec3::Y),
-            layers.clone(),
-            ViewerTag(id),
-        ))
-        .id();
-
-    let readback = commands
-        .spawn((Readback::texture(render_target.clone()), ViewerTag(id)))
-        .id();
-
-    ViewerRecord {
-        camera,
-        light,
-        render_target,
-        readback,
-        width,
-        height,
-        models: HashMap::new(),
+/// Despawn one model from a viewer. No-op if the model isn't found.
+pub(super) fn remove_model(world: &mut World, viewer_id: ViewerId, model_id: ModelId) {
+    let entity = find_model(world, viewer_id, model_id);
+    if let Some(entity) = entity {
+        world.despawn(entity);
     }
+}
+
+/// Apply a live transform delta to one model.
+pub(super) fn set_live_transform(
+    world: &mut World,
+    viewer_id: ViewerId,
+    model_id: ModelId,
+    translation: Option<glam::Vec3>,
+    rotation: Option<glam::Quat>,
+) {
+    let Some(entity) = find_model(world, viewer_id, model_id) else {
+        return;
+    };
+    let translation = translation.map(|v| Vec3::new(v.x, v.y, v.z));
+    let rotation = rotation.map(|q| Quat::from_xyzw(q.x, q.y, q.z, q.w));
+    world.entity_mut(entity).insert(LiveDelta {
+        translation,
+        rotation,
+    });
+}
+
+fn find_model(world: &mut World, viewer_id: ViewerId, model_id: ModelId) -> Option<Entity> {
+    let mut q = world.query::<(Entity, &ViewerTag, &ModelTag)>();
+    q.iter(world)
+        .find(|(_, vt, mt)| vt.0 == viewer_id && mt.0 == model_id)
+        .map(|(e, _, _)| e)
 }
 
 fn new_target_image(width: u32, height: u32) -> Image {
@@ -419,57 +443,4 @@ fn new_target_image(width: u32, height: u32) -> Image {
         | TextureUsages::COPY_SRC
         | TextureUsages::TEXTURE_BINDING;
     img
-}
-
-/// Observer: when a readback completes on a tagged entity, strip wgpu row
-/// padding and dispatch the frame bytes through the router.
-fn on_readback_complete(
-    trigger: On<ReadbackComplete>,
-    tags: Query<&ViewerTag>,
-    registry: Res<ViewerRegistry>,
-    router: Res<Router>,
-) {
-    let entity = trigger.entity;
-    let Ok(tag) = tags.get(entity) else {
-        return;
-    };
-    let id = tag.0;
-    let Some(record) = registry.viewers.get(&id) else {
-        return;
-    };
-
-    let width = record.width;
-    let height = record.height;
-    let tight = strip_row_padding(&trigger.data, width, height);
-
-    let router = router.0.lock().unwrap();
-    if let Some(tx) = router.get(&id) {
-        let _ = tx.try_send(ViewerFrame {
-            id,
-            width,
-            height,
-            rgba: tight,
-        });
-    }
-}
-
-/// wgpu aligns `bytes_per_row` to `COPY_BYTES_PER_ROW_ALIGNMENT` (256). Strip
-/// that padding so downstream consumers see a tight `width * 4` byte stride.
-fn strip_row_padding(padded: &[u8], width: u32, height: u32) -> Vec<u8> {
-    let tight_row = (width as usize) * 4;
-    let align = wgpu::COPY_BYTES_PER_ROW_ALIGNMENT as usize;
-    let padded_row = tight_row.div_ceil(align) * align;
-    if padded_row == tight_row {
-        return padded.to_vec();
-    }
-    let mut out = Vec::with_capacity(tight_row * height as usize);
-    for y in 0..height as usize {
-        let start = y * padded_row;
-        let end = start + tight_row;
-        if end > padded.len() {
-            break;
-        }
-        out.extend_from_slice(&padded[start..end]);
-    }
-    out
 }

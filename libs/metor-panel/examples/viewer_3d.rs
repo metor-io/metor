@@ -28,8 +28,8 @@ impl Root {
         // Optional: set METOR_VIEWER3D_GLB=<path> to load a GLTF file into
         // the left viewer.
         if let Ok(path) = std::env::var("METOR_VIEWER3D_GLB") {
-            left.update(cx, |viewer, _cx| {
-                viewer.add_model("env-glb", path);
+            left.update(cx, |viewer, cx| {
+                viewer.add_model("env-glb", path, cx);
             });
         }
         Self { left, right }

@@ -1,10 +1,11 @@
-//! 3D scene viewer element. A single Bevy `App` runs on a dedicated thread
-//! and is shared by every [`Viewer3d`] instance; communication is via
-//! crossbeam channels managed by [`bridge::BevyBridge`].
+//! 3D scene viewer element. A single Bevy `App` lives inside
+//! [`bridge::BevyBridge`] (a `gpui::Global`) on the GPUI thread. Mutations
+//! are direct ECS calls; renders ship the App to a background-executor
+//! task and return the rendered frames to per-viewer slots on the bridge.
 //!
-//! Each `Viewer3d` holds a [`ViewerHandle`], a pumping task that drains the
-//! frame channel into an `Arc<RenderImage>`, and a canvas paint callback that
-//! blits that image the same way the time-series plot does.
+//! Each `Viewer3d` is a thin GPUI element: it owns a [`ViewerId`], a list
+//! of [`ModelEntry`]s with their streaming tasks, and a canvas that blits
+//! whatever frame the bridge currently has stored for its id.
 
 pub(crate) mod bevy_app;
 pub mod bridge;
@@ -28,7 +29,7 @@ use crate::inspectable::{
 use crate::theme::theme;
 use crate::{AsComponentView, ComponentStream, ComponentStreamBuilder};
 
-pub use bridge::{BevyBridge, ModelId, ViewerCommand, ViewerFrame, ViewerHandle, ViewerId};
+pub use bridge::{BevyBridge, ModelId, ViewerId};
 pub use camera::OrbitCamera;
 
 /// Convert a metor-panel `[x, y, z]` position component into a Bevy-frame
@@ -54,20 +55,17 @@ fn pick_attitude(view: &ComponentView<'_>) -> Quat {
     Quat::from_xyzw(i, k, -j, w)
 }
 
-/// Default render target size used the first time a viewer is created, before
-/// the first resize callback fires. Small enough to not waste VRAM, large
-/// enough that the first frame isn't a pixelated mess.
+/// Default render target size used the first time a viewer is created,
+/// before the first canvas resize callback fires.
 const INITIAL_SIZE: (u32, u32) = (512, 512);
 
-/// A single 3D scene embedded in a GPUI canvas. Frames come from the shared
-/// Bevy app via [`ViewerHandle::frame_rx`]; rendering is handled by a pump
-/// task that converts them into `Arc<RenderImage>` and stores them on the
-/// element for the next paint.
+/// A 3D scene element. Owns a list of models and a stable [`ViewerId`]
+/// the bridge uses to look up its frame and ECS entities.
 pub struct Viewer3d {
-    handle: ViewerHandle,
+    viewer_id: ViewerId,
     /// DB handle so per-model bindings can start streams from the
-    /// inspector. `None` when the viewer was constructed without a DB (the
-    /// standalone example case).
+    /// inspector. `None` when the viewer was constructed without a DB
+    /// (the standalone example case).
     db: Option<Arc<DB>>,
     camera: OrbitCamera,
     /// All models currently displayed in this viewer. Order is the
@@ -75,19 +73,14 @@ pub struct Viewer3d {
     models: Vec<ModelEntry>,
     /// Counter for minting fresh per-viewer [`ModelId`]s. Never reused.
     next_model_id: u64,
-    frame_image: Option<Arc<RenderImage>>,
-    frame_size: (u32, u32),
-    /// The size most recently requested from the Bevy side. Tracked
-    /// separately from `frame_size` (which is the size of the *last frame
-    /// received*) so we don't re-issue `Resize` commands for every paint.
+    /// Most-recently-rendered size sent to the bridge, used to debounce
+    /// resize calls.
     requested_size: (u32, u32),
-    dropped_images: Vec<Arc<RenderImage>>,
     drag: Option<DragState>,
-    _pump: gpui::Task<()>,
 }
 
-/// One model in a viewer. Owns its path, label, bindings, the latest live
-/// delta produced by its streaming tasks, and the tasks themselves.
+/// One model in a viewer. Owns its path, label, bindings, the latest
+/// live delta produced by its streaming tasks, and the tasks themselves.
 /// Dropping a [`ModelEntry`] drops its tasks, which terminates the
 /// associated WAL streams cleanly.
 pub struct ModelEntry {
@@ -98,11 +91,11 @@ pub struct ModelEntry {
     orientation_binding: Option<Binding>,
     /// Latest live delta produced by the streaming tasks for this model.
     /// Kept on the GPUI side so that when one binding updates, we re-emit
-    /// the full `SetLiveTransform` (translation + rotation) and don't lose
-    /// the other axis.
+    /// the full live transform (translation + rotation) to Bevy and don't
+    /// lose the other axis.
     live: LiveTransform,
-    /// One streaming task per active binding. Dropping the entry drops the
-    /// tasks.
+    /// One streaming task per active binding. Dropping the entry drops
+    /// the tasks.
     binding_tasks: SmallVec<[gpui::Task<()>; 2]>,
 }
 
@@ -130,8 +123,8 @@ struct LiveTransform {
 }
 
 /// State captured at the start of a drag so the delta is applied to the
-/// camera's pre-drag pose — avoids drift from accumulating pixel deltas frame
-/// by frame.
+/// camera's pre-drag pose — avoids drift from accumulating pixel deltas
+/// frame by frame.
 #[derive(Clone, Copy)]
 struct DragState {
     start_pos: Point<Pixels>,
@@ -146,9 +139,9 @@ enum DragMode {
 }
 
 impl Viewer3d {
-    /// Register this viewer with the process-wide Bevy bridge and spawn the
-    /// frame-pump task. Without a DB, the viewer can still render models
-    /// loaded via [`Self::load_gltf`] but can't install component bindings.
+    /// Register this viewer with the process-wide Bevy bridge. Without a
+    /// DB, the viewer can still load models via [`Self::add_model`] but
+    /// can't install component bindings.
     pub fn new(cx: &mut Context<Self>) -> Self {
         Self::new_inner(None, cx)
     }
@@ -160,32 +153,43 @@ impl Viewer3d {
     }
 
     fn new_inner(db: Option<Arc<DB>>, cx: &mut Context<Self>) -> Self {
-        let handle = {
+        let weak = cx.entity().downgrade();
+        let viewer_id = {
             let bridge = BevyBridge::get_or_init(cx);
-            bridge.register(INITIAL_SIZE.0, INITIAL_SIZE.1)
+            bridge.register(weak, INITIAL_SIZE.0, INITIAL_SIZE.1)
         };
+
+        // Register the on_release callback so the bridge cleans up when
+        // the entity goes away.
+        cx.on_release(move |this, cx| {
+            cx.update_global::<BevyBridge, _>(|bridge, _| {
+                bridge.unregister(this.viewer_id);
+            });
+        })
+        .detach();
+
         let camera = OrbitCamera::default();
-        handle.send(camera.to_command(handle.id()));
-        let pump = Self::spawn_pump(&handle, cx);
-        Self {
-            handle,
+        let viewer = Self {
+            viewer_id,
             db,
             camera,
             models: Vec::new(),
             next_model_id: 1,
-            frame_image: None,
-            frame_size: INITIAL_SIZE,
             requested_size: INITIAL_SIZE,
-            dropped_images: Vec::new(),
             drag: None,
-            _pump: pump,
-        }
+        };
+        viewer.sync_camera(cx);
+        viewer
     }
 
     /// Borrow the current model list. Used by serialization and the
     /// inspector to walk all models.
     pub fn models(&self) -> &[ModelEntry] {
         &self.models
+    }
+
+    pub fn camera(&self) -> OrbitCamera {
+        self.camera
     }
 
     /// Add a new model to the viewer. If `path` is non-empty the GLB is
@@ -195,6 +199,7 @@ impl Viewer3d {
         &mut self,
         label: impl Into<SharedString>,
         path: impl Into<String>,
+        cx: &mut Context<Self>,
     ) -> ModelId {
         let id = ModelId(self.next_model_id);
         self.next_model_id += 1;
@@ -210,43 +215,39 @@ impl Viewer3d {
         };
         self.models.push(entry);
         if !path.is_empty() {
-            self.handle.send(ViewerCommand::LoadModel {
-                id: self.handle.id(),
-                model_id: id,
-                path: path.into(),
+            let viewer_id = self.viewer_id;
+            cx.update_global::<BevyBridge, _>(|bridge, _| {
+                bridge.load_model(viewer_id, id, path.into());
             });
         }
         id
     }
 
-    /// Despawn one model from the viewer. Drops the entry's binding tasks
-    /// (terminating the streams) and tells Bevy to despawn the entity.
-    pub fn remove_model(&mut self, model_id: ModelId) {
+    /// Despawn one model from the viewer. Drops the entry's binding
+    /// tasks (terminating the streams) and tells Bevy to despawn the
+    /// entity.
+    pub fn remove_model(&mut self, model_id: ModelId, cx: &mut Context<Self>) {
         let Some(idx) = self.models.iter().position(|m| m.id == model_id) else {
             return;
         };
-        // Drop the entry first so its `binding_tasks` are released — any
-        // in-flight stream value the task was about to publish will be
-        // discarded rather than racing the RemoveModel command.
         self.models.remove(idx);
-        self.handle.send(ViewerCommand::RemoveModel {
-            id: self.handle.id(),
-            model_id,
+        let viewer_id = self.viewer_id;
+        cx.update_global::<BevyBridge, _>(|bridge, _| {
+            bridge.remove_model(viewer_id, model_id);
         });
     }
 
-    /// Update one model's GLTF path. Sends a `LoadModel` to Bevy if the
-    /// new path is non-empty.
-    pub fn set_model_path(&mut self, model_id: ModelId, path: String) {
+    /// Update one model's GLTF path. Tells Bevy to load the new GLB if
+    /// the path is non-empty.
+    pub fn set_model_path(&mut self, model_id: ModelId, path: String, cx: &mut Context<Self>) {
         let Some(entry) = self.models.iter_mut().find(|m| m.id == model_id) else {
             return;
         };
         entry.path = path.clone();
         if !path.is_empty() {
-            self.handle.send(ViewerCommand::LoadModel {
-                id: self.handle.id(),
-                model_id,
-                path: path.into(),
+            let viewer_id = self.viewer_id;
+            cx.update_global::<BevyBridge, _>(|bridge, _| {
+                bridge.load_model(viewer_id, model_id, path.into());
             });
         }
     }
@@ -299,8 +300,8 @@ impl Viewer3d {
         let position = entry.position_binding;
         let orientation = entry.orientation_binding;
         entry.binding_tasks.clear();
-        // Reset the cached live delta so a stale axis from a prior binding
-        // doesn't bleed into the next SetLiveTransform.
+        // Reset the cached live delta so a stale axis from a prior
+        // binding doesn't bleed into the next live transform send.
         entry.live = LiveTransform::default();
 
         let mut tasks: SmallVec<[gpui::Task<()>; 2]> = SmallVec::new();
@@ -320,7 +321,7 @@ impl Viewer3d {
         }
     }
 
-    /// Round a pixel size to a 32-pixel grid. Avoids a `Resize` command on
+    /// Round a pixel size to a 32-pixel grid. Avoids a `Resize` call on
     /// every single pixel the user drags a window edge by, while still
     /// adapting quickly enough that the image doesn't stretch visibly.
     fn quantize(size: gpui::Size<Pixels>, scale: f32) -> (u32, u32) {
@@ -332,34 +333,39 @@ impl Viewer3d {
         (round(phys_w).max(MIN), round(phys_h).max(MIN))
     }
 
-    /// If `new_size` differs from the last-requested size, send a `Resize`
-    /// command to the Bevy world and remember it.
-    fn maybe_resize(&mut self, new_size: (u32, u32)) {
+    /// If `new_size` differs from the last-requested size, ask the
+    /// bridge to resize this viewer's render target.
+    fn maybe_resize(&mut self, new_size: (u32, u32), cx: &mut Context<Self>) {
         if self.requested_size == new_size {
             return;
         }
         self.requested_size = new_size;
-        self.handle.send(ViewerCommand::Resize {
-            id: self.handle.id(),
-            width: new_size.0,
-            height: new_size.1,
+        let viewer_id = self.viewer_id;
+        cx.update_global::<BevyBridge, _>(|bridge, _| {
+            bridge.resize(viewer_id, new_size.0, new_size.1);
         });
     }
 
-    /// Send the current camera state to the Bevy world. Called after every
-    /// interaction that mutates `self.camera`.
-    fn sync_camera(&self) {
-        self.handle.send(self.camera.to_command(self.handle.id()));
+    /// Push the current camera pose to the bridge.
+    fn sync_camera(&self, cx: &mut Context<Self>) {
+        let viewer_id = self.viewer_id;
+        let cam = self.camera;
+        cx.update_global::<BevyBridge, _>(|bridge, _| {
+            bridge.set_camera(
+                viewer_id,
+                cam.target,
+                cam.yaw,
+                cam.pitch,
+                cam.distance,
+                cam.fov_y_rad,
+            );
+        });
     }
 
     /// Reset the camera to its default pose.
-    fn reset_camera(&mut self) {
+    fn reset_camera(&mut self, cx: &mut Context<Self>) {
         self.camera = OrbitCamera::default();
-        self.sync_camera();
-    }
-
-    pub fn camera(&self) -> OrbitCamera {
-        self.camera
+        self.sync_camera(cx);
     }
 
     fn spawn_position_task(
@@ -375,19 +381,16 @@ impl Viewer3d {
                     let view = stream.next().await;
                     pick_position(&view.as_component_view())
                 };
-                let result = this.update(cx, |this, _cx| {
+                let result = this.update(cx, |this, cx| {
                     let Some(entry) = this.models.iter_mut().find(|m| m.id == model_id) else {
-                        // Model has been removed; signal the loop to break.
                         return false;
                     };
                     entry.live.translation = Some(v);
                     let translation = entry.live.translation;
                     let rotation = entry.live.rotation;
-                    this.handle.send(ViewerCommand::SetLiveTransform {
-                        id: this.handle.id(),
-                        model_id,
-                        translation,
-                        rotation,
+                    let viewer_id = this.viewer_id;
+                    cx.update_global::<BevyBridge, _>(|bridge, _| {
+                        bridge.set_live_transform(viewer_id, model_id, translation, rotation);
                     });
                     true
                 });
@@ -412,18 +415,16 @@ impl Viewer3d {
                     let view = stream.next().await;
                     pick_attitude(&view.as_component_view())
                 };
-                let result = this.update(cx, |this, _cx| {
+                let result = this.update(cx, |this, cx| {
                     let Some(entry) = this.models.iter_mut().find(|m| m.id == model_id) else {
                         return false;
                     };
                     entry.live.rotation = Some(q);
                     let translation = entry.live.translation;
                     let rotation = entry.live.rotation;
-                    this.handle.send(ViewerCommand::SetLiveTransform {
-                        id: this.handle.id(),
-                        model_id,
-                        translation,
-                        rotation,
+                    let viewer_id = this.viewer_id;
+                    cx.update_global::<BevyBridge, _>(|bridge, _| {
+                        bridge.set_live_transform(viewer_id, model_id, translation, rotation);
                     });
                     true
                 });
@@ -434,49 +435,17 @@ impl Viewer3d {
             }
         })
     }
-
-    /// Spawn a long-lived task that drains frames off the bridge channel and
-    /// writes them to `frame_image`, triggering a repaint. Uses
-    /// `background_executor` for the blocking `recv` so GPUI's main thread
-    /// never blocks on the channel.
-    fn spawn_pump(handle: &ViewerHandle, cx: &mut Context<Self>) -> gpui::Task<()> {
-        let rx = handle.frame_rx().clone();
-        cx.spawn(async move |this, cx| {
-            loop {
-                let recv_rx = rx.clone();
-                let Some(frame) = cx
-                    .background_executor()
-                    .spawn(async move { recv_rx.recv().ok() })
-                    .await
-                else {
-                    break;
-                };
-                let Some(image) = make_render_image(&frame) else {
-                    continue;
-                };
-                let size = (frame.width, frame.height);
-                if this
-                    .update(cx, |this, cx| {
-                        if let Some(prev) = this.frame_image.replace(image) {
-                            this.dropped_images.push(prev);
-                        }
-                        this.frame_size = size;
-                        cx.notify();
-                    })
-                    .is_err()
-                {
-                    break;
-                }
-            }
-        })
-    }
 }
 
 /// Wrap tight BGRA bytes into a `gpui::RenderImage` suitable for
-/// `Window::paint_image`.
-fn make_render_image(frame: &ViewerFrame) -> Option<Arc<RenderImage>> {
-    let buffer =
-        ImageBuffer::<Rgba<u8>, Vec<u8>>::from_raw(frame.width, frame.height, frame.rgba.clone())?;
+/// `Window::paint_image`. Used by the bridge's render task on the
+/// background worker.
+pub(crate) fn make_render_image_from_bytes(
+    width: u32,
+    height: u32,
+    rgba: Vec<u8>,
+) -> Option<Arc<RenderImage>> {
+    let buffer = ImageBuffer::<Rgba<u8>, Vec<u8>>::from_raw(width, height, rgba)?;
     let frames = SmallVec::from_elem(Frame::new(buffer), 1);
     Some(Arc::new(RenderImage::new(frames)))
 }
@@ -491,7 +460,7 @@ impl Render for Viewer3d {
                 MouseButton::Left,
                 cx.listener(|this, event: &gpui::MouseDownEvent, _window, cx| {
                     if event.click_count >= 2 {
-                        this.reset_camera();
+                        this.reset_camera(cx);
                         cx.notify();
                         return;
                     }
@@ -545,7 +514,7 @@ impl Render for Viewer3d {
                         DragMode::Pan => cam.pan(dx, dy),
                     }
                     this.camera = cam;
-                    this.sync_camera();
+                    this.sync_camera(cx);
                     cx.notify();
                 }),
             )
@@ -553,39 +522,34 @@ impl Render for Viewer3d {
                 cx.listener(|this, event: &gpui::ScrollWheelEvent, _window, cx| {
                     let delta = event.delta.pixel_delta(px(20.0));
                     this.camera.zoom(-f32::from(delta.y));
-                    this.sync_camera();
+                    this.sync_camera(cx);
                     cx.stop_propagation();
                     cx.notify();
                 }),
             )
             .child(
                 canvas(
-                    // Prepaint: capture the latest image + dropped-image list,
-                    // and issue a `Resize` command if the bounds have changed.
-                    // Returning them as state makes the paint closure
-                    // self-contained and lets us release old images by calling
-                    // `window.drop_image` without touching element state.
                     {
+                        // Prepaint: read the current frame for this
+                        // viewer from the bridge, debounce-resize, and
+                        // schedule a Bevy render so the next paint cycle
+                        // sees a fresher frame.
                         let this = cx.entity().downgrade();
                         move |bounds: Bounds<Pixels>, window, cx| {
                             let scale = window.scale_factor();
                             let new_size = Viewer3d::quantize(bounds.size, scale);
-                            let state = this
-                                .update(cx, |this, _cx| {
-                                    this.maybe_resize(new_size);
-                                    (
-                                        this.frame_image.clone(),
-                                        std::mem::take(&mut this.dropped_images),
-                                    )
+                            let frame = this
+                                .update(cx, |this, cx| {
+                                    this.maybe_resize(new_size, cx);
+                                    let id = this.viewer_id;
+                                    cx.global::<BevyBridge>().frame_for(id)
                                 })
-                                .unwrap_or((None, Vec::new()));
-                            (bounds, state.0, state.1)
+                                .unwrap_or(None);
+                            BevyBridge::schedule_render(cx);
+                            (bounds, frame)
                         }
                     },
-                    move |_, (bounds, image, dropped), window, _cx| {
-                        for img in dropped {
-                            let _ = window.drop_image(img);
-                        }
+                    move |_, (bounds, image), window, _cx| {
                         if let Some(img) = image {
                             let _ = window.paint_image(bounds, Corners::default(), img, 0, false);
                         }
@@ -721,8 +685,6 @@ impl Inspectable for Viewer3d {
 
     fn set_field(&mut self, field_id: FieldId, value: InspectionValue, cx: &mut Context<Self>) {
         if let Some((item_index, sub)) = decode_sub(field_id.0) {
-            // Resolve the model by index, capturing the stable ModelId so
-            // any subsequent self-mutations don't depend on the borrow.
             let Some(model_id) = self.models.get(item_index).map(|m| m.id) else {
                 return;
             };
@@ -734,7 +696,7 @@ impl Inspectable for Viewer3d {
                 }
                 SUB_PATH => {
                     if let InspectionValue::String(s) = value {
-                        self.set_model_path(model_id, s);
+                        self.set_model_path(model_id, s, cx);
                     }
                 }
                 SUB_POSITION => {
@@ -756,7 +718,7 @@ impl Inspectable for Viewer3d {
                     }
                 }
                 SUB_REMOVE => {
-                    self.remove_model(model_id);
+                    self.remove_model(model_id, cx);
                 }
                 _ => {}
             }
@@ -766,22 +728,20 @@ impl Inspectable for Viewer3d {
 
         match field_id.0 {
             FIELD_MODELS => {
-                // The List value itself is never written to directly — its
-                // sub-fields handle all mutations.
+                // List value is never written to directly — sub-fields
+                // handle all mutations.
             }
             FIELD_ADD_MODEL => {
-                // Bool toggle is a one-shot action: any value (true or
-                // false) means "add an empty model now".
-                self.add_model("", "");
+                self.add_model("", "", cx);
             }
             FIELD_FOV => {
                 if let InspectionValue::F64(v) = value {
                     self.camera.fov_y_rad = (v as f32).max(0.01);
-                    self.sync_camera();
+                    self.sync_camera(cx);
                 }
             }
             FIELD_RESET_CAMERA => {
-                self.reset_camera();
+                self.reset_camera(cx);
             }
             _ => {}
         }
