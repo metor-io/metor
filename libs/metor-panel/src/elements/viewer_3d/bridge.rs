@@ -1,118 +1,95 @@
-//! Bevy bridge: a single process-wide [`bevy::App`] owned directly by the
-//! GPUI thread. There are no command channels and no dedicated render
-//! thread — viewer mutations are synchronous ECS calls (or queued onto a
-//! deferred-mutation list while the App is on a background worker for a
-//! render), and renders are produced on demand by shipping the App to
-//! `cx.background_executor()`.
+//! Process-wide holder for the headless Bevy app driving every 3D viewer.
+//!
+//! The bridge is intentionally dumb. It owns:
+//!
+//! - the [`SubApps`] (the headless Bevy world),
+//! - a queue of deferred world mutations that arrived while the app was
+//!   on a background-executor worker for a render,
+//! - the in-flight render task and a flag to de-dupe scheduling,
+//! - an orphan list of `RenderImage`s that need to be released from
+//!   gpui's sprite atlas after their owning viewer has been dropped,
+//! - a monotonic counter minting per-viewer [`RenderLayers`] slots.
+//!
+//! It does **not** track which viewers exist, their sizes, their frames,
+//! or which ones are dirty. Every viewer owns its own ECS entity handles
+//! (`camera`, `light`, `readback`) and issues direct `with_world(|w| …)`
+//! calls to mutate them — no per-operation wrapper methods.
 //!
 //! ## Threading model
 //!
-//! At rest the [`BevyBridge`] holds `Some(App)`. Mutations through
-//! [`BevyBridge::with_world`] borrow the world and run inline. When a
-//! viewer needs a frame the GPUI thread `take`s the App, ships it to a
-//! background-executor task that calls `app.update()` once, then restores
-//! the App on the main thread (draining any mutations that arrived while
-//! it was gone).
+//! At rest `app: Some(SubApps)`. When a viewer's prepaint schedules a
+//! render we `take` the `SubApps`, ship it to a background-executor task
+//! that calls `sub_apps.update()` once, then restore it on the GPUI
+//! thread. While the app is taken, viewer mutations are boxed up into
+//! `pending` and drained onto the main world the moment the app comes
+//! back.
 //!
 //! Bevy's `App` is `Send` at the type level via the unsafe `Send` impl on
 //! `World`. The runtime safety guarantee is that no `NonSend<T>` resource
 //! is ever accessed from a thread other than the one that owns it. Our
-//! plugin set deliberately omits anything window/audio/winit-related, so
-//! we believe there are no non-send resources in play. If a future plugin
-//! addition introduces one, the second render will land on a different
-//! pool worker and panic — fail loud, fail fast.
-//!
-//! ## Frame distribution
-//!
-//! The Bevy world owns a [`LatestFrames`] resource that the readback
-//! observer writes into every time a `ReadbackComplete` event fires. After
-//! `app.update()` returns, the background task drains that resource into
-//! a viewer-id keyed map of (width, height, tight bytes), wraps each into
-//! a `gpui::RenderImage`, and returns them along with the App. The main
-//! thread then stores the new frames into per-viewer slots and notifies
-//! every live viewer entity to repaint.
+//! plugin set deliberately omits anything window/audio/winit-related. If
+//! a future plugin addition introduces a non-send resource the second
+//! render will land on a different pool worker and panic — fail loud.
 
-use std::collections::HashMap;
 use std::sync::Arc;
 
 use bevy::app::SubApps;
+use bevy::camera::visibility::RenderLayers;
 use bevy::ecs::world::World;
-use gpui::{AsyncApp, BorrowAppContext, Global, RenderImage, Task, WeakEntity};
-use smallvec::SmallVec;
+use gpui::{AsyncApp, BorrowAppContext, Global, RenderImage, Task};
 
-use super::{Viewer3d, bevy_app};
+use super::bevy_app;
 
-/// Stable identifier for a live viewer. Minted by [`BevyBridge::register`]
-/// and never reused for the lifetime of the process.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub struct ViewerId(pub u64);
+/// A deferred world mutation. Queued when a mutation arrives while the
+/// [`SubApps`] is on a background-executor worker for a render; drained
+/// onto the main world in [`BevyBridge::restore_app`].
+type WorldOp = Box<dyn FnOnce(&mut World) + Send + 'static>;
 
-/// Stable identifier for a model within one viewer. Minted by the owning
-/// `Viewer3d` and never reused. Bevy entities carry a `ModelTag(ModelId)`
-/// component so per-model lookups go through tag queries.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub struct ModelId(pub u64);
-
-/// A deferred world mutation. Queued on [`BevyBridge`] when a mutation is
-/// requested while the App is on a background worker; drained when the
-/// App is restored.
-type WorldOp = Box<dyn FnOnce(&mut World) + 'static>;
-
-/// Per-viewer state stored on the GPUI side. The actual ECS entities live
-/// in the Bevy world; the slot is just bookkeeping the GPUI thread can
-/// read without taking the App.
-pub struct ViewerSlot {
-    pub id: ViewerId,
-    /// Most recent size requested by the viewer (after quantization).
-    /// `(width, height)` in physical pixels.
-    pub requested_size: (u32, u32),
-    /// Latest fully-rendered frame, ready for `Window::paint_image`.
-    /// `None` until the first render completes.
-    pub frame: Option<Arc<RenderImage>>,
-}
-
-/// Process-wide bridge to the Bevy app. Stored as a `gpui::Global` and
-/// lazy-initialized on the first viewer creation.
+/// Process-wide bridge to the headless Bevy app. Stored as a
+/// [`gpui::Global`] and lazy-initialized on the first viewer creation.
 pub struct BevyBridge {
-    /// The Bevy `SubApps`. `Some` while it lives on the GPUI thread,
-    /// `None` while a background-executor task is running an
-    /// `sub_apps.update()`. We hold `SubApps` rather than `App` because
-    /// `App` contains a non-`Send` `RunnerFn` we don't use.
+    /// The headless Bevy `SubApps`. `Some` while it lives on the GPUI
+    /// thread, `None` while a background-executor task is running a
+    /// `sub_apps.update()`.
     app: Option<SubApps>,
-    /// Per-viewer bookkeeping (size, latest frame, etc.).
-    viewers: HashMap<ViewerId, ViewerSlot>,
     /// Mutations queued while `app` is `None`. Drained inside
-    /// [`Self::restore_app`] before the App is reinserted.
+    /// [`Self::restore_app`] before the app is reinserted.
     pending: Vec<WorldOp>,
-    next_viewer_id: u64,
-    /// Weak refs to live viewer entities. After a render completes the
-    /// bridge calls `notify` on each so they repaint with their new
-    /// frame. Stale entries are pruned lazily.
-    viewer_entities: SmallVec<[WeakEntity<Viewer3d>; 4]>,
-    /// Whether a render task is currently in flight. Set when a render is
-    /// scheduled; cleared in [`Self::restore_app`].
+    /// `true` while a background render task is in flight. Set by
+    /// [`Self::schedule_render`], cleared by [`Self::restore_app`].
     render_in_flight: bool,
     /// Most recently spawned render task. Held to keep it alive (gpui
     /// `Task` cancels on drop).
     _render_task: Option<Task<()>>,
+    /// Sprite-atlas entries owned by viewers that have already been
+    /// unregistered. Drained opportunistically by any live viewer's next
+    /// prepaint (which has `&mut Window` access to call `drop_image`).
+    /// Grows only in the pathological case where every viewer is dropped
+    /// at once; in that case the remaining entries leak until the
+    /// process exits — a bounded, rare leak we accept.
+    pending_releases: Vec<Arc<RenderImage>>,
+    /// Monotonic counter minting the [`RenderLayers`] slot for each new
+    /// viewer. Layer 0 is intentionally unused (it's the default layer
+    /// for any untagged entity, which we don't want any viewer's camera
+    /// to see) so the counter starts at 1.
+    next_render_layer: usize,
 }
 
 impl Global for BevyBridge {}
 
 impl BevyBridge {
     /// Fetch or create the process-wide bridge. The first call builds
-    /// the Bevy `SubApps` synchronously on the GPUI thread.
+    /// the headless `SubApps` synchronously on the GPUI thread.
     pub fn get_or_init(cx: &mut gpui::App) -> &mut BevyBridge {
         if !cx.has_global::<BevyBridge>() {
             let app = bevy_app::build_app();
             cx.set_global(BevyBridge {
                 app: Some(app),
-                viewers: HashMap::new(),
                 pending: Vec::new(),
-                next_viewer_id: 1,
-                viewer_entities: SmallVec::new(),
                 render_in_flight: false,
                 _render_task: None,
+                pending_releases: Vec::new(),
+                next_render_layer: 1,
             });
         }
         cx.global_mut::<BevyBridge>()
@@ -123,7 +100,7 @@ impl BevyBridge {
     /// it when the `SubApps` is restored after a render.
     pub fn with_world<F>(&mut self, f: F)
     where
-        F: FnOnce(&mut World) + 'static,
+        F: FnOnce(&mut World) + Send + 'static,
     {
         if let Some(app) = self.app.as_mut() {
             f(app.main.world_mut());
@@ -132,182 +109,69 @@ impl BevyBridge {
         }
     }
 
-    /// Read the most recent frame for a viewer, if any.
-    pub fn frame_for(&self, id: ViewerId) -> Option<Arc<RenderImage>> {
-        self.viewers.get(&id).and_then(|s| s.frame.clone())
+    /// Claim the next [`RenderLayers`] slot for a freshly-created viewer.
+    /// Slots are never reused, mirroring the old `ViewerId` lifetime.
+    pub fn claim_render_layer(&mut self) -> usize {
+        let layer = self.next_render_layer;
+        self.next_render_layer += 1;
+        layer
     }
 
-    /// Register a fresh viewer: mint a new id, allocate a `ViewerSlot`,
-    /// and queue (or run inline) the world mutations that spawn the
-    /// camera, light, and render target inside the world.
+    /// Park an `Arc<RenderImage>` that belonged to a now-dead viewer so
+    /// some surviving viewer can release it from gpui's sprite atlas on
+    /// its next prepaint. Called from `Viewer3d::on_release`.
+    pub fn orphan_release(&mut self, image: Arc<RenderImage>) {
+        self.pending_releases.push(image);
+    }
+
+    /// Drain any orphaned atlas entries. Called from a live viewer's
+    /// prepaint, which is the only place we have `&mut Window` access.
+    pub fn take_orphaned_releases(&mut self) -> Vec<Arc<RenderImage>> {
+        std::mem::take(&mut self.pending_releases)
+    }
+
+    /// Spawn a render task if one isn't already in flight. The
+    /// background worker runs `sub_apps.update()` once — nothing else.
+    /// Frame transport happens inside the update via the per-viewer
+    /// [`bevy_app::FrameSink`] thingbufs, so the bridge never touches
+    /// frame bytes.
     ///
-    /// Returns the freshly-minted [`ViewerId`].
-    pub fn register(
-        &mut self,
-        weak: WeakEntity<Viewer3d>,
-        width: u32,
-        height: u32,
-    ) -> ViewerId {
-        let id = ViewerId(self.next_viewer_id);
-        self.next_viewer_id += 1;
-        self.viewers.insert(
-            id,
-            ViewerSlot {
-                id,
-                requested_size: (width, height),
-                frame: None,
-            },
-        );
-        self.viewer_entities.push(weak);
-        self.with_world(move |world| {
-            bevy_app::create_viewer(world, id, width, height);
-        });
-        id
-    }
-
-    /// Tear down a viewer: drop its slot, despawn its ECS entities.
-    pub fn unregister(&mut self, id: ViewerId) {
-        self.viewers.remove(&id);
-        self.with_world(move |world| {
-            bevy_app::despawn_viewer(world, id);
-        });
-    }
-
-    /// Resize a viewer's render target. The slot's `requested_size` is
-    /// updated immediately; the world mutation is queued.
-    pub fn resize(&mut self, id: ViewerId, width: u32, height: u32) {
-        if let Some(slot) = self.viewers.get_mut(&id) {
-            if slot.requested_size == (width, height) {
-                return;
-            }
-            slot.requested_size = (width, height);
-        }
-        self.with_world(move |world| {
-            bevy_app::resize_viewer(world, id, width, height);
-        });
-    }
-
-    /// Update a viewer's camera pose.
-    pub fn set_camera(
-        &mut self,
-        id: ViewerId,
-        target: glam::Vec3,
-        yaw: f32,
-        pitch: f32,
-        distance: f32,
-        fov_y_rad: f32,
-    ) {
-        self.with_world(move |world| {
-            bevy_app::set_viewer_camera(world, id, target, yaw, pitch, distance, fov_y_rad);
-        });
-    }
-
-    /// Add or replace a model within a viewer.
-    pub fn load_model(
-        &mut self,
-        viewer_id: ViewerId,
-        model_id: ModelId,
-        path: std::path::PathBuf,
-    ) {
-        self.with_world(move |world| {
-            bevy_app::load_model(world, viewer_id, model_id, path);
-        });
-    }
-
-    /// Despawn one model from a viewer.
-    pub fn remove_model(&mut self, viewer_id: ViewerId, model_id: ModelId) {
-        self.with_world(move |world| {
-            bevy_app::remove_model(world, viewer_id, model_id);
-        });
-    }
-
-    /// Apply a live binding delta to one model. `None` axes are left at
-    /// identity.
-    pub fn set_live_transform(
-        &mut self,
-        viewer_id: ViewerId,
-        model_id: ModelId,
-        translation: Option<glam::Vec3>,
-        rotation: Option<glam::Quat>,
-    ) {
-        self.with_world(move |world| {
-            bevy_app::set_live_transform(world, viewer_id, model_id, translation, rotation);
-        });
-    }
-
-    /// Schedule a render if one isn't already in flight. The render
-    /// runs on a background-executor worker; on completion every live
-    /// viewer entity is notified to repaint.
-    ///
-    /// Structure: an outer foreground task holds the (`!Send`) `AsyncApp`
-    /// for cx access, and inside it we `await` an inner background-task
-    /// that owns the `SubApps` and runs `update()`. Only the inner future
-    /// needs to be `Send` (it captures only `SubApps` and `viewer_dims`,
-    /// both of which are `Send`).
+    /// After the render completes the task restores the `SubApps` onto
+    /// the GPUI thread (draining any queued mutations as it goes) and
+    /// calls `cx.refresh()` so every live viewer's next prepaint picks
+    /// up whatever new frames landed in its queue.
     pub fn schedule_render(cx: &mut gpui::App) {
-        // Take the SubApps out of the bridge on the GPUI thread. This
-        // closure also marks the bridge as "render in flight" so a
-        // second concurrent caller is a no-op.
-        let take_result = cx.update_global::<BevyBridge, _>(|bridge, _cx| {
+        let app = cx.update_global::<BevyBridge, _>(|bridge, _| {
             if bridge.render_in_flight {
                 return None;
             }
             let app = bridge.app.take()?;
             bridge.render_in_flight = true;
-            let viewer_dims: HashMap<ViewerId, (u32, u32)> = bridge
-                .viewers
-                .iter()
-                .map(|(&id, slot)| (id, slot.requested_size))
-                .collect();
-            Some((app, viewer_dims))
+            Some(app)
         });
-        let Some((app, viewer_dims)) = take_result else {
+        let Some(app) = app else {
             return;
         };
 
         let task = cx.spawn(async move |cx: &mut AsyncApp| {
-            // Run app.update() + readback on a background worker. The
-            // bg future captures `app` (Send) and `viewer_dims` (Send).
-            let bg = cx.background_executor().spawn(async move {
-                let mut app = app;
-                app.update();
-                let raw_frames = bevy_app::take_latest_frames(app.main.world_mut());
-                let mut wrapped: HashMap<ViewerId, Arc<RenderImage>> =
-                    HashMap::with_capacity(raw_frames.len());
-                for (id, padded) in raw_frames {
-                    let Some(&(w, h)) = viewer_dims.get(&id) else {
-                        continue;
-                    };
-                    let tight = bevy_app::strip_row_padding(&padded, w, h);
-                    if let Some(image) = super::make_render_image_from_bytes(w, h, tight) {
-                        wrapped.insert(id, image);
-                    }
-                }
-                (app, wrapped)
-            });
-            let (app, wrapped) = bg.await;
+            let app = cx
+                .background_executor()
+                .spawn(async move {
+                    let mut app = app;
+                    app.update();
+                    app
+                })
+                .await;
 
-            // Restore the SubApps + store frames + notify all live
-            // viewer entities, all on the GPUI thread.
             let _ = cx.update(|cx| {
-                let entities_to_notify: SmallVec<[WeakEntity<Viewer3d>; 4]> =
-                    cx.update_global::<BevyBridge, _>(|bridge, _cx| {
-                        bridge.restore_app(app);
-                        for (id, image) in wrapped {
-                            if let Some(slot) = bridge.viewers.get_mut(&id) {
-                                slot.frame = Some(image);
-                            }
-                        }
-                        bridge.render_in_flight = false;
-                        bridge.viewer_entities.clone()
-                    });
-                for weak in entities_to_notify {
-                    let _ = weak.update(cx, |_, cx| cx.notify());
-                }
+                cx.update_global::<BevyBridge, _>(|bridge, _| {
+                    bridge.restore_app(app);
+                });
+                cx.refresh_windows();
             });
         });
 
-        cx.update_global::<BevyBridge, _>(|bridge, _cx| {
+        cx.update_global::<BevyBridge, _>(|bridge, _| {
             bridge._render_task = Some(task);
         });
     }
@@ -323,11 +187,13 @@ impl BevyBridge {
             }
         }
         self.app = Some(app);
+        self.render_in_flight = false;
     }
+}
 
-    /// Prune dropped weak references. Called occasionally to keep the
-    /// notify list bounded; not strictly necessary for correctness.
-    pub fn prune_dead_viewers(&mut self) {
-        self.viewer_entities.retain(|w| w.upgrade().is_some());
-    }
+/// Build the [`RenderLayers`] slot for a given viewer layer index. Kept
+/// here so both the bridge and `Viewer3d` can reach it without pulling
+/// `bevy::render` into every call site.
+pub(super) fn render_layers_for(layer: usize) -> RenderLayers {
+    RenderLayers::from_layers(&[layer])
 }

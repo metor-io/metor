@@ -29,6 +29,7 @@ image = "0.25"
 offset-allocator = "0.2"
 glam = "0.32"
 crossbeam-channel = "0.5"
+thingbuf = "0.1"
 bevy = { git = "https://github.com/bevyengine/bevy", rev = "5330b01ed6dfe8ee9ea98c97ded72e44ca336c74", default-features = false, features = [
     "std",
     # Core rendering

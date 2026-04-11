@@ -293,7 +293,6 @@ fn paint_plot<'a>(
     window: &mut Window,
     cx: &mut gpui::App,
 ) {
-    let traces: Vec<_> = traces.collect();
     let pb = plot_area(outer_bounds);
 
     let theme = crate::theme::theme(cx);
@@ -340,7 +339,6 @@ fn paint_plot<'a>(
     // 2. Data traces — clipped to outer bounds so lines extend under axis areas.
     //    When the GPU path produced an image, blit it for the line traces and
     //    let the CPU path handle scatter/bar.
-    let gpu_handled = line_image.is_some();
     window.with_content_mask(
         Some(gpui::ContentMask {
             bounds: outer_bounds,
@@ -348,14 +346,6 @@ fn paint_plot<'a>(
         |window| {
             if let Some(img) = line_image {
                 let _ = window.paint_image(pb, Corners::default(), img, 0, false);
-            }
-            if !gpu_handled {
-                for rt in &traces {
-                    if !rt.trace.visible {
-                        continue;
-                    }
-                    paint_trace(pb, &rt.component, &view, &rt.trace, window);
-                }
             }
         },
     );
