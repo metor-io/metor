@@ -1,15 +1,30 @@
-//! GPU-accelerated line trace renderer for [`TimeSeriesPlot`].
+//! GPU-accelerated plot renderer.
 //!
-//! Maintains a wgpu device + line pipeline, draws all visible line traces into
-//! an offscreen `Bgra8Unorm` texture, reads the bytes back, and wraps them in
-//! a fresh [`gpui::RenderImage`] each frame so the caller can blit via
-//! `Window::paint_image`. The macOS zero-copy IOSurface path is intentionally
-//! left as a follow-up; this module is structured so it can slot in alongside
-//! the readback path without changing callers.
+//! A single process-wide [`PlotGpu`] (a [`gpui::Global`]) owns the wgpu
+//! pipelines, shared storage buffers, and a cross-plot [`ValueCache`].
+//! Each call site — the `TimeSeriesPlot` panel, `Monitor` sparklines,
+//! and the `ComponentTable` row sparklines — owns one lightweight
+//! [`PlotRenderState`] that carries its per-instance render target,
+//! the frame currently blitted on its canvas, and an "in-flight" flag.
+//!
+//! Control flow per frame:
+//!
+//! 1. Caller builds a `&[LineDraw]` from whatever traces it wants to
+//!    render and calls [`PlotRenderState::render`] from inside its
+//!    canvas prepaint closure.
+//! 2. `render` lazy-inits the global, reuses or rebuilds the per-caller
+//!    render target, submits the draw to wgpu, and returns a
+//!    [`ReadbackHandle`] (`None` if a previous readback is still in
+//!    flight or there's nothing to draw).
+//! 3. The caller forwards the handle to [`ReadbackHandle::spawn_and_set`],
+//!    which runs the staging-buffer read on a background worker, wraps
+//!    the bytes into a `gpui::RenderImage`, and stores it back into the
+//!    per-caller state via a pointer-to-field supplied by the caller.
+//! 4. The caller's canvas paint closure blits `state.current_frame()`.
 
 // `bytemuck::Pod`/`Zeroable` derives expand into helper items rustc can't
-// see through, producing spurious dead-code warnings on the uniform structs
-// whose fields are only read via `bytemuck::bytes_of`.
+// see through, producing spurious dead-code warnings on the uniform
+// structs whose fields are only read via `bytemuck::bytes_of`.
 #![allow(dead_code)]
 
 use std::collections::HashMap;
@@ -17,7 +32,10 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use bytemuck::{Pod, Zeroable};
-use gpui::{Bounds, Hsla, Pixels, RenderImage};
+use gpui::{
+    App, BorrowAppContext, Bounds, Canvas, Context, Corners, Global, Hsla, Pixels, RenderImage,
+    WeakEntity, Window, canvas,
+};
 use image::{Frame, ImageBuffer, Rgba};
 use metor_db::time_series::TimeSeriesNodeSlice;
 use metor_db::{Component, ComponentSchema};
@@ -25,7 +43,7 @@ use metor_proto::types::{ComponentId, PrimType, Timestamp};
 use offset_allocator::{Allocation, Allocator};
 use smallvec::SmallVec;
 
-use super::PlotBounds;
+use super::{PlotBounds, PlotStyle};
 use crate::gpu_context::GpuContext;
 
 const VALUE_CAPACITY: u32 = 1 << 22;
@@ -38,12 +56,13 @@ const NS_PER_SEC: f64 = 1.0e9;
 const UNIFORM_ALIGN: u64 = 256;
 const MAX_TRACES: usize = 64;
 
-/// One trace's worth of data the renderer needs each frame.
-pub(super) struct LineDraw<'a> {
+/// One trace's worth of data the renderer needs each frame. Callers
+/// build a slice of these per paint.
+pub(crate) struct LineDraw<'a> {
     pub component_id: ComponentId,
     pub component: &'a Component,
     pub element_index: usize,
-    pub style: super::PlotStyle,
+    pub style: PlotStyle,
     pub color: Hsla,
     pub stroke_width: f32,
 }
@@ -61,8 +80,9 @@ fn select_lod(needed_stride: usize) -> usize {
     0
 }
 
-/// Stable identity for a cached chunk: one element column of one node at a
-/// specific level of detail.
+/// Stable identity for a cached chunk: one element column of one node at
+/// a specific level of detail. Uniquely addresses any node across every
+/// plot sharing the global cache.
 #[derive(Clone, Copy, Hash, Eq, PartialEq)]
 struct ChunkKey {
     component_id: u64,
@@ -71,22 +91,26 @@ struct ChunkKey {
     lod: u32,
 }
 
-/// A node's worth of converted f32 samples currently resident in the value buffers.
+/// A node's worth of converted f32 samples currently resident in the
+/// shared value buffers.
 struct ResidentChunk {
     allocation: Allocation,
     capacity: u32,
     sample_count: u32,
 }
 
-/// Per-plot offset-allocator cache mapping each visible node to a region of the
-/// shared `x_buf` / `y_buf`. Once a chunk is uploaded it stays resident until it
-/// either grows past its allocation or the allocator runs out of space.
+/// Cross-plot offset-allocator cache mapping each visible node to a
+/// region of the shared `x_buf` / `y_buf`. Uploaded chunks stay resident
+/// until they either grow past their allocation or the allocator runs
+/// out of space and evicts them.
 struct ValueCache {
     allocator: Allocator,
     resident: HashMap<ChunkKey, ResidentChunk>,
-    /// Reference epoch for the x axis, in nanoseconds. All cached x values are
-    /// stored as `f32` seconds relative to this. Set lazily on first upload so
-    /// the dynamic range stays small enough for `f32` to keep useful precision.
+    /// Reference epoch for the x axis, in nanoseconds. All cached x
+    /// values are stored as `f32` seconds relative to this. Set lazily
+    /// on first upload so the dynamic range stays small enough for `f32`
+    /// to keep useful precision. Shared across plots; dashboards viewing
+    /// a common "now" stay well within f32's range.
     epoch_ns: Option<i64>,
 }
 
@@ -99,9 +123,9 @@ impl ValueCache {
         }
     }
 
-    /// Evict entries starting from the finest LOD level until `needed` slots
-    /// are freed. Falls back to evicting everything if finer levels don't
-    /// suffice.
+    /// Evict entries starting from the finest LOD level until `needed`
+    /// slots are freed. Falls back to evicting everything if finer
+    /// levels don't suffice.
     fn evict_for(&mut self, needed: u32) {
         let mut freed = 0u32;
         for target_lod in 0..LOD_STRIDES.len() as u32 {
@@ -126,6 +150,7 @@ impl ValueCache {
     /// Ensure the node behind `slice` is resident at the given LOD level.
     /// Returns `(offset, decimated_sample_count)` into the shared value
     /// buffers.
+    #[allow(clippy::too_many_arguments)]
     fn ensure_lod(
         &mut self,
         queue: &wgpu::Queue,
@@ -162,8 +187,8 @@ impl ValueCache {
             if chunk.sample_count as usize >= decimated_len {
                 return Some((chunk.allocation.offset, chunk.sample_count));
             }
-            // Node grew past capacity — free and re-upload.
             if (decimated_len as u32) > chunk.capacity {
+                // Node grew past capacity — free and re-upload.
                 let removed = self.resident.remove(&key).unwrap();
                 self.allocator.free(removed.allocation);
             }
@@ -191,7 +216,14 @@ impl ValueCache {
         let chunk = self.resident.get_mut(&key)?;
         let from = chunk.sample_count as usize;
         if from < decimated_len {
-            convert_timestamps_strided(timestamps, lod_stride, from, decimated_len, epoch, scratch_x);
+            convert_timestamps_strided(
+                timestamps,
+                lod_stride,
+                from,
+                decimated_len,
+                epoch,
+                scratch_x,
+            );
             convert_values_strided(
                 schema,
                 slice.full_data(),
@@ -227,11 +259,13 @@ struct LineUniform {
     _pad: [f32; 3],
 }
 
+/// Per-caller off-screen target: MSAA + resolve + staging buffer sized
+/// to the caller's current pixel bounds.
 struct RenderTarget {
     width: u32,
     height: u32,
-    resolve_texture: wgpu::Texture,
     msaa_view: wgpu::TextureView,
+    resolve_texture: wgpu::Texture,
     resolve_view: wgpu::TextureView,
     staging: wgpu::Buffer,
     padded_bytes_per_row: u32,
@@ -245,7 +279,7 @@ impl RenderTarget {
             depth_or_array_layers: 1,
         };
         let msaa_texture = device.create_texture(&wgpu::TextureDescriptor {
-            label: Some("line msaa"),
+            label: Some("plot msaa"),
             size: extent,
             mip_level_count: 1,
             sample_count: SAMPLE_COUNT,
@@ -255,7 +289,7 @@ impl RenderTarget {
             view_formats: &[],
         });
         let resolve_texture = device.create_texture(&wgpu::TextureDescriptor {
-            label: Some("line resolve"),
+            label: Some("plot resolve"),
             size: extent,
             mip_level_count: 1,
             sample_count: 1,
@@ -270,7 +304,7 @@ impl RenderTarget {
         let align = wgpu::COPY_BYTES_PER_ROW_ALIGNMENT;
         let padded_bytes_per_row = unpadded.div_ceil(align) * align;
         let staging = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("line staging"),
+            label: Some("plot staging"),
             size: padded_bytes_per_row as u64 * height as u64,
             usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
             mapped_at_creation: false,
@@ -278,8 +312,8 @@ impl RenderTarget {
         Self {
             width,
             height,
-            resolve_texture,
             msaa_view,
+            resolve_texture,
             resolve_view,
             staging,
             padded_bytes_per_row,
@@ -287,10 +321,10 @@ impl RenderTarget {
     }
 }
 
-/// Handle returned by [`LineRenderer::render_to_gpu`] when a new frame is
-/// submitted. Callers use it on a background thread to wait for the GPU,
-/// read the mapped staging buffer, and build a `RenderImage`.
-pub(super) struct ReadbackHandle {
+/// Handle returned by [`PlotRenderState::render`] when a new frame is
+/// submitted. Call [`Self::spawn_and_set`] (or [`Self::read_image`]
+/// directly) on a background worker to drive the readback.
+pub(crate) struct ReadbackHandle {
     ctx: Arc<GpuContext>,
     staging: wgpu::Buffer,
     width: u32,
@@ -300,10 +334,10 @@ pub(super) struct ReadbackHandle {
 }
 
 impl ReadbackHandle {
-    /// Block the current thread until the GPU finishes, then read the mapped
-    /// staging bytes and build a `RenderImage`. Call this from a background
-    /// thread (e.g. via `BackgroundExecutor::spawn`).
-    pub(super) fn read_image(self) -> Option<Arc<RenderImage>> {
+    /// Block the current thread until the GPU finishes, then read the
+    /// mapped staging bytes and build a `RenderImage`. Call from a
+    /// background thread (e.g. via `BackgroundExecutor::spawn`).
+    pub(crate) fn read_image(self) -> Option<Arc<RenderImage>> {
         let _ = self.ctx.device.poll(wgpu::PollType::wait_indefinitely());
         let bytes = read_mapped_bytes(
             &self.staging,
@@ -317,11 +351,37 @@ impl ReadbackHandle {
         let frames = SmallVec::from_elem(Frame::new(buffer), 1);
         Some(Arc::new(RenderImage::new(frames)))
     }
+
+    /// Spawn a background worker that reads the frame back, wraps it
+    /// into a `RenderImage`, and installs it via `access(t).set_frame()`.
+    /// The caller supplies a function pointer pointing at whichever
+    /// field holds its [`PlotRenderState`], so a single line at each
+    /// call site replaces the bg-task + update + notify boilerplate.
+    pub(crate) fn spawn_and_set<T: 'static>(
+        self,
+        cx: &mut Context<T>,
+        access: fn(&mut T) -> &mut PlotRenderState,
+    ) {
+        cx.spawn(async move |this, cx| {
+            let image = cx
+                .background_executor()
+                .spawn(async move { self.read_image() })
+                .await;
+            let Some(img) = image else {
+                return;
+            };
+            let _ = this.update(cx, |t, cx| {
+                access(t).set_frame(img);
+                cx.notify();
+            });
+        })
+        .detach();
+    }
 }
 
-/// Owns the wgpu pipelines for all three plot styles, the per-plot value
-/// cache, and the offscreen target.
-pub(super) struct LineRenderer {
+/// Process-wide GPU plot renderer. Lazy-initialized on the first
+/// [`PlotRenderState::render`] call and stored as a [`gpui::Global`].
+pub(super) struct PlotGpu {
     ctx: Arc<GpuContext>,
     line_pipeline: wgpu::RenderPipeline,
     scatter_pipeline: wgpu::RenderPipeline,
@@ -334,16 +394,16 @@ pub(super) struct LineRenderer {
     y_buf: wgpu::Buffer,
     idx_buf: wgpu::Buffer,
     storage_bg: wgpu::BindGroup,
-    target: Option<RenderTarget>,
     cache: ValueCache,
     upload_x: Vec<f32>,
     upload_y: Vec<f32>,
     idx_scratch: Vec<u32>,
-    readback_in_flight: Arc<AtomicBool>,
 }
 
-impl LineRenderer {
-    pub(super) fn try_new() -> Option<Self> {
+impl Global for PlotGpu {}
+
+impl PlotGpu {
+    fn try_new() -> Option<Self> {
         let ctx = GpuContext::get()?;
         let device = &ctx.device;
 
@@ -411,46 +471,45 @@ impl LineRenderer {
             immediate_size: 0,
         });
 
-        let make_pipeline =
-            |label: &str, shader: &wgpu::ShaderModule| -> wgpu::RenderPipeline {
-                device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-                    label: Some(label),
-                    layout: Some(&pipeline_layout),
-                    vertex: wgpu::VertexState {
-                        module: shader,
-                        entry_point: Some("vertex"),
-                        compilation_options: Default::default(),
-                        buffers: &[],
-                    },
-                    primitive: wgpu::PrimitiveState {
-                        topology: wgpu::PrimitiveTopology::TriangleStrip,
-                        strip_index_format: None,
-                        front_face: wgpu::FrontFace::Ccw,
-                        cull_mode: None,
-                        unclipped_depth: false,
-                        polygon_mode: wgpu::PolygonMode::Fill,
-                        conservative: false,
-                    },
-                    depth_stencil: None,
-                    multisample: wgpu::MultisampleState {
-                        count: SAMPLE_COUNT,
-                        mask: !0,
-                        alpha_to_coverage_enabled: false,
-                    },
-                    fragment: Some(wgpu::FragmentState {
-                        module: shader,
-                        entry_point: Some("fragment"),
-                        compilation_options: Default::default(),
-                        targets: &[Some(wgpu::ColorTargetState {
-                            format: TARGET_FORMAT,
-                            blend: Some(wgpu::BlendState::ALPHA_BLENDING),
-                            write_mask: wgpu::ColorWrites::ALL,
-                        })],
-                    }),
-                    multiview_mask: None,
-                    cache: None,
-                })
-            };
+        let make_pipeline = |label: &str, shader: &wgpu::ShaderModule| -> wgpu::RenderPipeline {
+            device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label: Some(label),
+                layout: Some(&pipeline_layout),
+                vertex: wgpu::VertexState {
+                    module: shader,
+                    entry_point: Some("vertex"),
+                    compilation_options: Default::default(),
+                    buffers: &[],
+                },
+                primitive: wgpu::PrimitiveState {
+                    topology: wgpu::PrimitiveTopology::TriangleStrip,
+                    strip_index_format: None,
+                    front_face: wgpu::FrontFace::Ccw,
+                    cull_mode: None,
+                    unclipped_depth: false,
+                    polygon_mode: wgpu::PolygonMode::Fill,
+                    conservative: false,
+                },
+                depth_stencil: None,
+                multisample: wgpu::MultisampleState {
+                    count: SAMPLE_COUNT,
+                    mask: !0,
+                    alpha_to_coverage_enabled: false,
+                },
+                fragment: Some(wgpu::FragmentState {
+                    module: shader,
+                    entry_point: Some("fragment"),
+                    compilation_options: Default::default(),
+                    targets: &[Some(wgpu::ColorTargetState {
+                        format: TARGET_FORMAT,
+                        blend: Some(wgpu::BlendState::ALPHA_BLENDING),
+                        write_mask: wgpu::ColorWrites::ALL,
+                    })],
+                }),
+                multiview_mask: None,
+                cache: None,
+            })
+        };
 
         let line_pipeline = make_pipeline("line pipeline", &line_shader);
         let scatter_pipeline = make_pipeline("scatter pipeline", &scatter_shader);
@@ -485,9 +544,7 @@ impl LineRenderer {
                 resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
                     buffer: &line_buf,
                     offset: 0,
-                    size: Some(
-                        std::num::NonZeroU64::new(UNIFORM_ALIGN).unwrap(),
-                    ),
+                    size: Some(std::num::NonZeroU64::new(UNIFORM_ALIGN).unwrap()),
                 }),
             }],
         });
@@ -540,237 +597,291 @@ impl LineRenderer {
             y_buf,
             idx_buf,
             storage_bg,
-            target: None,
             cache: ValueCache::new(),
             upload_x: Vec::new(),
             upload_y: Vec::new(),
             idx_scratch: Vec::with_capacity(INDEX_CAPACITY as usize),
-            readback_in_flight: Arc::new(AtomicBool::new(false)),
         })
     }
 
-    /// Submit the GPU render + readback copy for all visible line traces
-    /// and return a [`ReadbackHandle`] the caller should `.read_image()` on
-    /// a background thread. Returns `None` if a previous readback is still
-    /// in flight, or there is nothing to draw.
-    pub(super) fn render_to_gpu(
+    /// Submit the GPU render for one plot into the caller's
+    /// [`RenderTarget`]. Returns `true` if any work was actually
+    /// encoded and submitted (caller starts its readback); `false` if
+    /// there was nothing to draw.
+    fn submit(
         &mut self,
-        bounds: Bounds<Pixels>,
+        target: &RenderTarget,
         view: PlotBounds,
-        scale_factor: f32,
+        scale: f32,
         traces: &[LineDraw<'_>],
-    ) -> Option<ReadbackHandle> {
-        if self.readback_in_flight.load(Ordering::Acquire) {
-            return None;
+    ) -> bool {
+        self.idx_scratch.clear();
+        let pixel_budget = target.width as usize;
+
+        let mut plans: Vec<TracePlan> = Vec::with_capacity(traces.len());
+        for trace in traces {
+            let plan = plan_trace(
+                &self.ctx,
+                &mut self.cache,
+                &mut self.upload_x,
+                &mut self.upload_y,
+                &mut self.idx_scratch,
+                &self.x_buf,
+                &self.y_buf,
+                trace,
+                view,
+                pixel_budget,
+            );
+            plans.push(plan);
+        }
+        if plans.iter().all(|p| p.spans.is_empty()) {
+            return false;
         }
 
+        let epoch_ns = self.cache.epoch_ns.unwrap_or(view.min_x as i64);
+        let view_min_sec = ((view.min_x as i64 - epoch_ns) as f64 / NS_PER_SEC) as f32;
+        let view_max_sec = ((view.max_x as i64 - epoch_ns) as f64 / NS_PER_SEC) as f32;
+        let dx_sec = (view_max_sec - view_min_sec).max(1e-12);
+        let dy = (view.max_y - view.min_y).max(1e-12);
+        let scale_x = 2.0 / dx_sec;
+        let scale_y = (2.0 / dy) as f32;
+        let view_uniform = ViewUniform {
+            scale: [scale_x, scale_y],
+            offset: [
+                -1.0 - view_min_sec * scale_x,
+                -1.0 - (view.min_y as f32) * scale_y,
+            ],
+            viewport: [target.width as f32, target.height as f32],
+            _pad: [0.0; 2],
+        };
+        self.ctx
+            .queue
+            .write_buffer(&self.view_buf, 0, bytemuck::bytes_of(&view_uniform));
+        self.ctx
+            .queue
+            .write_buffer(&self.idx_buf, 0, bytemuck::cast_slice(&self.idx_scratch));
+
+        // Pack all per-trace uniforms into the dynamic uniform buffer so
+        // we can draw everything in a single submit.
+        let mut live_traces: SmallVec<[(usize, PlotStyle, &TracePlan); 8]> = SmallVec::new();
+        for (i, (trace, plan)) in traces.iter().zip(plans.iter()).enumerate() {
+            if plan.spans.is_empty() || i >= MAX_TRACES {
+                continue;
+            }
+            let rgba = trace.color.to_rgb();
+            let lw = match trace.style {
+                PlotStyle::Bar => {
+                    let visible_count = plan
+                        .spans
+                        .iter()
+                        .map(|s| s.instance_end - s.instance_start)
+                        .sum::<u32>()
+                        .max(1);
+                    (target.width as f32 / visible_count as f32 * 0.4).clamp(scale, 20.0 * scale)
+                }
+                PlotStyle::Scatter => trace.stroke_width * scale * 3.0,
+                PlotStyle::Line => trace.stroke_width * scale,
+            };
+            let uniform = LineUniform {
+                color: [rgba.r, rgba.g, rgba.b, rgba.a],
+                line_width: lw,
+                _pad: [0.0; 3],
+            };
+            self.ctx.queue.write_buffer(
+                &self.line_buf,
+                i as u64 * UNIFORM_ALIGN,
+                bytemuck::bytes_of(&uniform),
+            );
+            live_traces.push((i, trace.style, plan));
+        }
+        if live_traces.is_empty() {
+            return false;
+        }
+
+        let mut encoder = self
+            .ctx
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("plot encoder"),
+            });
+        {
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("plot pass"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &target.msaa_view,
+                    depth_slice: None,
+                    resolve_target: Some(&target.resolve_view),
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+                multiview_mask: None,
+            });
+            pass.set_bind_group(0, &self.view_bg, &[]);
+            pass.set_bind_group(2, &self.storage_bg, &[]);
+
+            let mut current_pipeline: Option<PlotStyle> = None;
+            for &(slot, style, plan) in &live_traces {
+                if current_pipeline != Some(style) {
+                    pass.set_pipeline(match style {
+                        PlotStyle::Line => &self.line_pipeline,
+                        PlotStyle::Scatter => &self.scatter_pipeline,
+                        PlotStyle::Bar => &self.bars_pipeline,
+                    });
+                    current_pipeline = Some(style);
+                }
+                let offset = (slot as u64 * UNIFORM_ALIGN) as u32;
+                pass.set_bind_group(1, &self.line_bg, &[offset]);
+                for span in &plan.spans {
+                    pass.draw(0..4, span.instance_start..span.instance_end);
+                }
+            }
+        }
+
+        encoder.copy_texture_to_buffer(
+            wgpu::TexelCopyTextureInfo {
+                texture: &target.resolve_texture,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            wgpu::TexelCopyBufferInfo {
+                buffer: &target.staging,
+                layout: wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(target.padded_bytes_per_row),
+                    rows_per_image: Some(target.height),
+                },
+            },
+            wgpu::Extent3d {
+                width: target.width,
+                height: target.height,
+                depth_or_array_layers: 1,
+            },
+        );
+        self.ctx.queue.submit(Some(encoder.finish()));
+        true
+    }
+}
+
+/// Per-caller render state: owns one [`RenderTarget`] sized to the
+/// caller's bounds, the frame currently blitted to its canvas, and the
+/// in-flight flag that back-pressures submissions while a readback is
+/// still outstanding.
+pub(crate) struct PlotRenderState {
+    target: Option<RenderTarget>,
+    current_frame: Option<Arc<RenderImage>>,
+    pending_release: Option<Arc<RenderImage>>,
+    in_flight: Arc<AtomicBool>,
+}
+
+impl Default for PlotRenderState {
+    fn default() -> Self {
+        Self {
+            target: None,
+            current_frame: None,
+            pending_release: None,
+            in_flight: Arc::new(AtomicBool::new(false)),
+        }
+    }
+}
+
+impl PlotRenderState {
+    /// Submit a fresh render for this plot. Lazy-inits [`PlotGpu`] the
+    /// first time it's called; returns `None` if GPU context is
+    /// unavailable, the caller has a readback still in flight, the
+    /// bounds are zero, there are no visible traces, or nothing ends
+    /// up being drawn after decimation.
+    pub(crate) fn render(
+        &mut self,
+        cx: &mut gpui::App,
+        bounds: Bounds<Pixels>,
+        scale_factor: f32,
+        view: PlotBounds,
+        traces: &[LineDraw<'_>],
+    ) -> Option<ReadbackHandle> {
+        if self.in_flight.load(Ordering::Acquire) {
+            return None;
+        }
         let scale = scale_factor.max(1.0);
         let width = ((f32::from(bounds.size.width) * scale).round() as u32).max(1);
         let height = ((f32::from(bounds.size.height) * scale).round() as u32).max(1);
-        if width == 0 || height == 0 || traces.is_empty() {
+        if traces.is_empty() {
             return None;
         }
 
-        if self
-            .target
-            .as_ref()
-            .is_none_or(|t| t.width != width || t.height != height)
-        {
-            self.target = Some(RenderTarget::new(&self.ctx.device, width, height));
+        if !cx.has_global::<PlotGpu>() {
+            let gpu = PlotGpu::try_new()?;
+            cx.set_global(gpu);
         }
-
-        let handle: Option<ReadbackHandle> = {
-            let LineRenderer {
-                ctx,
-                cache,
-                upload_x,
-                upload_y,
-                idx_scratch,
-                x_buf,
-                y_buf,
-                idx_buf,
-                view_buf,
-                line_buf,
-                view_bg,
-                line_bg,
-                storage_bg,
-                line_pipeline,
-                scatter_pipeline,
-                bars_pipeline,
-                target,
-                ..
-            } = self;
-            let target = target.as_ref()?;
-
-            idx_scratch.clear();
-            let pixel_budget = width as usize;
-            let mut plans: Vec<TracePlan> = Vec::with_capacity(traces.len());
-
-            for trace in traces.iter() {
-                let plan = plan_trace(
-                    ctx,
-                    cache,
-                    upload_x,
-                    upload_y,
-                    idx_scratch,
-                    x_buf,
-                    y_buf,
-                    trace,
-                    view,
-                    pixel_budget,
-                );
-                plans.push(plan);
-            }
-
-            if plans.iter().all(|p| p.spans.is_empty()) {
-                return None;
-            }
-
-            let epoch_ns = cache.epoch_ns.unwrap_or(view.min_x as i64);
-            let view_min_sec = ((view.min_x as i64 - epoch_ns) as f64 / NS_PER_SEC) as f32;
-            let view_max_sec = ((view.max_x as i64 - epoch_ns) as f64 / NS_PER_SEC) as f32;
-            let dx_sec = (view_max_sec - view_min_sec).max(1e-12);
-            let dy = (view.max_y - view.min_y).max(1e-12);
-            let scale_x = 2.0 / dx_sec;
-            let scale_y = (2.0 / dy) as f32;
-            let view_uniform = ViewUniform {
-                scale: [scale_x, scale_y],
-                offset: [
-                    -1.0 - view_min_sec * scale_x,
-                    -1.0 - (view.min_y as f32) * scale_y,
-                ],
-                viewport: [width as f32, height as f32],
-                _pad: [0.0; 2],
-            };
-            ctx.queue
-                .write_buffer(view_buf, 0, bytemuck::bytes_of(&view_uniform));
-            ctx.queue
-                .write_buffer(idx_buf, 0, bytemuck::cast_slice(idx_scratch));
-
-            // Write all per-trace uniforms into the dynamic uniform buffer up
-            // front so we can draw everything in a single submit.
-            let mut live_traces: Vec<(usize, &LineDraw<'_>, &TracePlan)> = Vec::new();
-            for (i, (trace, plan)) in traces.iter().zip(plans.iter()).enumerate() {
-                if plan.spans.is_empty() || i >= MAX_TRACES {
-                    continue;
-                }
-                let rgba = trace.color.to_rgb();
-                let lw = match trace.style {
-                    super::PlotStyle::Bar => {
-                        let visible_count = plan
-                            .spans
-                            .iter()
-                            .map(|s| s.instance_end - s.instance_start)
-                            .sum::<u32>()
-                            .max(1);
-                        (width as f32 / visible_count as f32 * 0.4)
-                            .clamp(scale, 20.0 * scale)
-                    }
-                    super::PlotStyle::Scatter => trace.stroke_width * scale * 3.0,
-                    super::PlotStyle::Line => trace.stroke_width * scale,
-                };
-                let uniform = LineUniform {
-                    color: [rgba.r, rgba.g, rgba.b, rgba.a],
-                    line_width: lw,
-                    _pad: [0.0; 3],
-                };
-                ctx.queue.write_buffer(
-                    line_buf,
-                    i as u64 * UNIFORM_ALIGN,
-                    bytemuck::bytes_of(&uniform),
-                );
-                live_traces.push((i, trace, plan));
-            }
-
-            if live_traces.is_empty() {
-                return None;
-            }
-
-            let mut encoder =
-                ctx.device
-                    .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                        label: Some("plot encoder"),
-                    });
+        cx.update_global::<PlotGpu, _>(|gpu, _| {
+            if self
+                .target
+                .as_ref()
+                .is_none_or(|t| t.width != width || t.height != height)
             {
-                let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                    label: Some("plot pass"),
-                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                        view: &target.msaa_view,
-                        depth_slice: None,
-                        resolve_target: Some(&target.resolve_view),
-                        ops: wgpu::Operations {
-                            load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
-                            store: wgpu::StoreOp::Store,
-                        },
-                    })],
-                    depth_stencil_attachment: None,
-                    timestamp_writes: None,
-                    occlusion_query_set: None,
-                    multiview_mask: None,
-                });
-                pass.set_bind_group(0, &*view_bg, &[]);
-                pass.set_bind_group(2, &*storage_bg, &[]);
-
-                let mut current_pipeline = None;
-                for &(slot, trace, plan) in &live_traces {
-                    let style = trace.style;
-                    if current_pipeline != Some(style) {
-                        let pip = match style {
-                            super::PlotStyle::Line => &*line_pipeline,
-                            super::PlotStyle::Scatter => &*scatter_pipeline,
-                            super::PlotStyle::Bar => &*bars_pipeline,
-                        };
-                        pass.set_pipeline(pip);
-                        current_pipeline = Some(style);
-                    }
-                    let offset = (slot as u64 * UNIFORM_ALIGN) as u32;
-                    pass.set_bind_group(1, &*line_bg, &[offset]);
-                    for span in &plan.spans {
-                        pass.draw(0..4, span.instance_start..span.instance_end);
-                    }
-                }
+                self.target = Some(RenderTarget::new(&gpu.ctx.device, width, height));
             }
-
-            encoder.copy_texture_to_buffer(
-                wgpu::TexelCopyTextureInfo {
-                    texture: &target.resolve_texture,
-                    mip_level: 0,
-                    origin: wgpu::Origin3d::ZERO,
-                    aspect: wgpu::TextureAspect::All,
-                },
-                wgpu::TexelCopyBufferInfo {
-                    buffer: &target.staging,
-                    layout: wgpu::TexelCopyBufferLayout {
-                        offset: 0,
-                        bytes_per_row: Some(target.padded_bytes_per_row),
-                        rows_per_image: Some(target.height),
-                    },
-                },
-                wgpu::Extent3d {
-                    width: target.width,
-                    height: target.height,
-                    depth_or_array_layers: 1,
-                },
-            );
-            ctx.queue.submit(Some(encoder.finish()));
-
-            self.readback_in_flight.store(true, Ordering::Release);
+            let target = self.target.as_ref()?;
+            if !gpu.submit(target, view, scale, traces) {
+                return None;
+            }
+            self.in_flight.store(true, Ordering::Release);
             target
                 .staging
                 .slice(..)
                 .map_async(wgpu::MapMode::Read, |_| {});
-
             Some(ReadbackHandle {
-                ctx: ctx.clone(),
+                ctx: gpu.ctx.clone(),
                 staging: target.staging.clone(),
                 width: target.width,
                 height: target.height,
                 padded_bytes_per_row: target.padded_bytes_per_row,
-                in_flight: self.readback_in_flight.clone(),
+                in_flight: self.in_flight.clone(),
             })
-        };
+        })
+    }
 
-        handle
+    /// Replace the current frame with a freshly-read `RenderImage`,
+    /// parking the old frame for release from gpui's sprite atlas on
+    /// the next paint.
+    pub(crate) fn set_frame(&mut self, image: Arc<RenderImage>) {
+        self.pending_release = self.current_frame.replace(image);
+    }
+
+    /// Clone the current frame handle for blitting via `paint_image`.
+    pub(crate) fn current_frame(&self) -> Option<Arc<RenderImage>> {
+        self.current_frame.clone()
+    }
+
+    /// Take the frame waiting to be released from gpui's sprite atlas.
+    /// The caller passes each entry to `window.drop_image` inside the
+    /// prepaint closure that has `&mut Window` access.
+    pub(crate) fn take_pending_release(&mut self) -> Option<Arc<RenderImage>> {
+        self.pending_release.take()
+    }
+
+    /// Convenience: submit a render and schedule the async readback in
+    /// one call. `access` is a pointer to whichever field on `T` holds
+    /// this `PlotRenderState`, so the readback task knows where to write
+    /// the fresh frame.
+    pub(crate) fn render_and_update<T: 'static>(
+        &mut self,
+        cx: &mut Context<T>,
+        bounds: Bounds<Pixels>,
+        scale_factor: f32,
+        view: PlotBounds,
+        traces: &[LineDraw<'_>],
+        access: fn(&mut T) -> &mut PlotRenderState,
+    ) {
+        let handle = self.render(cx, bounds, scale_factor, view, traces);
+        if let Some(handle) = handle {
+            handle.spawn_and_set(cx, access);
+        }
     }
 }
 
@@ -793,7 +904,8 @@ fn read_mapped_bytes(
     out
 }
 
-/// One contiguous range of `idx_buf` instances belonging to a single trace.
+/// One contiguous range of `idx_buf` instances belonging to a single
+/// trace.
 struct DrawSpan {
     instance_start: u32,
     instance_end: u32,
@@ -803,9 +915,8 @@ struct TracePlan {
     spans: Vec<DrawSpan>,
 }
 
-/// Resolve the visible nodes for one trace, ensure each is resident in the
-/// value cache, and emit decimated indices into `idx_scratch`. Returns the
-/// list of `(start, end)` instance ranges to draw, one per visible chunk.
+/// Resolve the visible nodes for one trace, ensure each is resident in
+/// the value cache, and emit decimated indices into `idx_scratch`.
 #[allow(clippy::too_many_arguments)]
 fn plan_trace(
     ctx: &GpuContext,
@@ -837,7 +948,7 @@ fn plan_trace(
         if visible_len == 0 {
             continue;
         }
-        let Some(stride) = super::node_stride(visible_len, total, pixel_budget) else {
+        let Some(stride) = node_stride(visible_len, total, pixel_budget) else {
             continue;
         };
 
@@ -864,8 +975,8 @@ fn plan_trace(
             unsafe { visible.as_ptr().offset_from(full.as_ptr()).max(0) as usize };
 
         let lod_start = slice_start_idx / lod_stride;
-        let lod_end = ((slice_start_idx + visible_len).div_ceil(lod_stride))
-            .min(decimated_count as usize);
+        let lod_end =
+            ((slice_start_idx + visible_len).div_ceil(lod_stride)).min(decimated_count as usize);
         let residual_stride = (stride / lod_stride).max(1);
 
         let span_first = idx_scratch.len() as u32;
@@ -877,12 +988,12 @@ fn plan_trace(
             i += residual_stride;
         }
         let min_for_draw = match trace.style {
-            super::PlotStyle::Line => 2u32,
+            PlotStyle::Line => 2u32,
             _ => 1,
         };
         if count_pushed >= min_for_draw {
             let instance_end = match trace.style {
-                super::PlotStyle::Line => span_first + count_pushed - 1,
+                PlotStyle::Line => span_first + count_pushed - 1,
                 _ => span_first + count_pushed,
             };
             spans.push(DrawSpan {
@@ -895,6 +1006,63 @@ fn plan_trace(
     }
 
     TracePlan { spans }
+}
+
+/// Compute per-node stride for two-level decimation. Returns the step
+/// between sample indices within a node, or `None` to skip it entirely.
+fn node_stride(node_len: usize, total: usize, pixel_budget: usize) -> Option<usize> {
+    if node_len == 0 || total == 0 || pixel_budget == 0 {
+        return None;
+    }
+    let node_budget = ((node_len as f64 / total as f64) * pixel_budget as f64).ceil() as usize;
+    if node_budget == 0 {
+        return None;
+    }
+    Some((node_len / node_budget).max(1))
+}
+
+/// Primitive types that can be read from a byte buffer and converted to
+/// f64. Shared between `convert_values_strided` and the upstream trace
+/// planner.
+trait PlotValue: zerocopy::FromBytes + Copy + Sized + 'static {
+    fn to_f64(self) -> f64;
+}
+
+macro_rules! impl_plot_value {
+    ($($ty:ty => $conv:expr),* $(,)?) => {
+        $(impl PlotValue for $ty {
+            #[inline(always)]
+            fn to_f64(self) -> f64 { $conv(self) }
+        })*
+    };
+}
+
+impl_plot_value! {
+    f64 => |x| x,
+    f32 => |x: f32| x as f64,
+    i8  => |x: i8| x as f64,
+    i16 => |x: i16| x as f64,
+    i32 => |x: i32| x as f64,
+    i64 => |x: i64| x as f64,
+    u8  => |x: u8| x as f64,
+    u16 => |x: u16| x as f64,
+    u32 => |x: u32| x as f64,
+    u64 => |x: u64| x as f64,
+}
+
+/// Read a single element value directly from a raw data buffer. Bool
+/// isn't `FromBytes` (not all bit patterns valid), so callers of the
+/// `PrimType::Bool` branch route through `u8`.
+#[inline(always)]
+fn read_value<T: PlotValue>(
+    data: &[u8],
+    sample_index: usize,
+    elem_size: usize,
+    elem_index: usize,
+) -> Option<f64> {
+    let offset = sample_index * elem_size + elem_index * size_of::<T>();
+    let buf = data.get(offset..offset + size_of::<T>())?;
+    T::read_from_bytes(buf).ok().map(|v| v.to_f64())
 }
 
 /// Convert every `lod_stride`-th timestamp in decimated index range
@@ -936,7 +1104,7 @@ fn convert_values_strided(
     out.clear();
     out.reserve(to - from);
 
-    fn fill<T: super::PlotValue>(
+    fn fill<T: PlotValue>(
         data: &[u8],
         lod_stride: usize,
         from: usize,
@@ -948,24 +1116,171 @@ fn convert_values_strided(
     ) {
         for decimated_i in from..to {
             let src = (decimated_i * lod_stride).min(max_sample.saturating_sub(1));
-            let v =
-                super::read_value::<T>(data, src, elem_size, elem_index).unwrap_or(0.0);
+            let v = read_value::<T>(data, src, elem_size, elem_index).unwrap_or(0.0);
             out.push(v as f32);
         }
     }
 
     match schema.prim_type {
-        PrimType::F64 => fill::<f64>(full_data, lod_stride, from, to, max_sample, elem_size, element_index, out),
-        PrimType::F32 => fill::<f32>(full_data, lod_stride, from, to, max_sample, elem_size, element_index, out),
-        PrimType::I64 => fill::<i64>(full_data, lod_stride, from, to, max_sample, elem_size, element_index, out),
-        PrimType::I32 => fill::<i32>(full_data, lod_stride, from, to, max_sample, elem_size, element_index, out),
-        PrimType::I16 => fill::<i16>(full_data, lod_stride, from, to, max_sample, elem_size, element_index, out),
-        PrimType::I8  => fill::<i8> (full_data, lod_stride, from, to, max_sample, elem_size, element_index, out),
-        PrimType::U64 => fill::<u64>(full_data, lod_stride, from, to, max_sample, elem_size, element_index, out),
-        PrimType::U32 => fill::<u32>(full_data, lod_stride, from, to, max_sample, elem_size, element_index, out),
-        PrimType::U16 => fill::<u16>(full_data, lod_stride, from, to, max_sample, elem_size, element_index, out),
+        PrimType::F64 => {
+            fill::<f64>(full_data, lod_stride, from, to, max_sample, elem_size, element_index, out)
+        }
+        PrimType::F32 => {
+            fill::<f32>(full_data, lod_stride, from, to, max_sample, elem_size, element_index, out)
+        }
+        PrimType::I64 => {
+            fill::<i64>(full_data, lod_stride, from, to, max_sample, elem_size, element_index, out)
+        }
+        PrimType::I32 => {
+            fill::<i32>(full_data, lod_stride, from, to, max_sample, elem_size, element_index, out)
+        }
+        PrimType::I16 => {
+            fill::<i16>(full_data, lod_stride, from, to, max_sample, elem_size, element_index, out)
+        }
+        PrimType::I8 => {
+            fill::<i8>(full_data, lod_stride, from, to, max_sample, elem_size, element_index, out)
+        }
+        PrimType::U64 => {
+            fill::<u64>(full_data, lod_stride, from, to, max_sample, elem_size, element_index, out)
+        }
+        PrimType::U32 => {
+            fill::<u32>(full_data, lod_stride, from, to, max_sample, elem_size, element_index, out)
+        }
+        PrimType::U16 => {
+            fill::<u16>(full_data, lod_stride, from, to, max_sample, elem_size, element_index, out)
+        }
         PrimType::U8 | PrimType::Bool => {
             fill::<u8>(full_data, lod_stride, from, to, max_sample, elem_size, element_index, out)
         }
     }
+}
+
+// ── Reusable canvas element ─────────────────────────────────────────
+
+/// Owned trace-draw descriptor returned by [`plot_canvas`]'s `build`
+/// callback. A borrow-free sibling of [`LineDraw`] — cloning a
+/// `Component` is just an `Arc` bump so this stays cheap per frame.
+#[derive(Clone)]
+pub(crate) struct OwnedLineDraw {
+    pub component: Component,
+    pub element_index: usize,
+    pub style: PlotStyle,
+    pub color: Hsla,
+    pub stroke_width: f32,
+}
+
+impl OwnedLineDraw {
+    fn as_line_draw(&self) -> LineDraw<'_> {
+        LineDraw {
+            component_id: self.component.component_id,
+            component: &self.component,
+            element_index: self.element_index,
+            style: self.style,
+            color: self.color,
+            stroke_width: self.stroke_width,
+        }
+    }
+}
+
+/// Snapshot returned by [`plot_canvas`]'s `build` callback. `None`
+/// from the callback tells the canvas to skip GPU submission this
+/// frame (data not yet loaded, bounds not yet resolved, etc.) and
+/// just re-blit whatever frame is currently cached.
+pub(crate) struct PlotCanvasBuild {
+    /// Where the GPU-rendered frame should be drawn, relative to the
+    /// caller's window. Usually equal to the outer canvas bounds; the
+    /// `TimeSeriesPlot` panel shrinks this to `plot_area(outer)` so
+    /// its axis chrome has room to the left and bottom.
+    pub inner_bounds: Bounds<Pixels>,
+    pub view: PlotBounds,
+    pub traces: Vec<OwnedLineDraw>,
+}
+
+/// Tuple the [`plot_canvas`] prepaint hands to the paint callback:
+/// `(outer_bounds, view, frame)`. Extracted into an alias so the
+/// return type of [`plot_canvas`] fits on one line.
+type PlotCanvasState = (Bounds<Pixels>, Option<PlotBounds>, Option<Arc<RenderImage>>);
+
+/// Default paint callback for [`plot_canvas`]: blit the GPU frame at
+/// the canvas bounds with no surrounding chrome. Used by sparklines —
+/// `Monitor` and component-table rows — which have no axes or labels.
+pub(crate) fn blit_frame(
+    bounds: Bounds<Pixels>,
+    _view: Option<PlotBounds>,
+    frame: Option<Arc<RenderImage>>,
+    window: &mut Window,
+    _cx: &mut App,
+) {
+    if let Some(img) = frame {
+        let _ = window.paint_image(bounds, Corners::default(), img, 0, false);
+    }
+}
+
+/// Build a canvas that renders a line plot through the global
+/// [`PlotGpu`]. This is the single abstraction every plot site in
+/// metor-panel uses: the `TimeSeriesPlot` panel, `Monitor` sparklines,
+/// and component-table row sparklines. Each caller supplies:
+///
+/// - a [`WeakEntity<T>`] pointing at whichever entity owns the backing
+///   data and the [`PlotRenderState`],
+/// - `access`: a function pointer from that entity to its render
+///   state, so the async readback task knows where to install the
+///   freshly-read frame,
+/// - `build`: a callback the prepaint runs each frame against the
+///   entity with the full canvas bounds, returning the visible trace
+///   list, plot-space view bounds, and the sub-area the GPU should
+///   render into; returning `None` skips GPU submission,
+/// - `chrome`: a callback the paint runs with the outer canvas bounds,
+///   the most recent view, and the frame about to be blitted. Use
+///   [`blit_frame`] for plots with no axis chrome, or a closure that
+///   renders gridlines + labels + the blit itself for the full
+///   `TimeSeriesPlot` panel.
+pub(crate) fn plot_canvas<T, Build, Chrome>(
+    weak: WeakEntity<T>,
+    access: fn(&mut T) -> &mut PlotRenderState,
+    build: Build,
+    chrome: Chrome,
+) -> Canvas<PlotCanvasState>
+where
+    T: 'static,
+    Build: FnOnce(&mut T, Bounds<Pixels>) -> Option<PlotCanvasBuild> + 'static,
+    Chrome: FnOnce(Bounds<Pixels>, Option<PlotBounds>, Option<Arc<RenderImage>>, &mut Window, &mut App)
+        + 'static,
+{
+    canvas(
+        move |bounds, window, cx| {
+            let scale_factor = window.scale_factor();
+            let (view, frame, released) = weak
+                .update(cx, |t, cx| {
+                    let snapshot = build(t, bounds);
+                    let view = snapshot.as_ref().map(|s| s.view);
+                    if let Some(s) = snapshot {
+                        let draws: Vec<LineDraw<'_>> =
+                            s.traces.iter().map(OwnedLineDraw::as_line_draw).collect();
+                        access(t).render_and_update(
+                            cx,
+                            s.inner_bounds,
+                            scale_factor,
+                            s.view,
+                            &draws,
+                            access,
+                        );
+                    }
+                    let state = access(t);
+                    (
+                        view,
+                        state.current_frame(),
+                        state.take_pending_release(),
+                    )
+                })
+                .unwrap_or((None, None, None));
+            if let Some(img) = released {
+                let _ = window.drop_image(img);
+            }
+            (bounds, view, frame)
+        },
+        move |_, (bounds, view, frame), window, cx| {
+            chrome(bounds, view, frame, window, cx);
+        },
+    )
 }

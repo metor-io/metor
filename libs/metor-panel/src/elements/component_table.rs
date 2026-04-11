@@ -1,14 +1,17 @@
 use std::sync::Arc;
 
+use super::ElementIndexes;
 use super::table::{Column, ColumnSort, Table, TableDelegate};
-use super::time_series::{PlotBounds, expand_y_bounds, paint_data_line};
+use super::time_series::{
+    OwnedLineDraw, PlotBounds, PlotCanvasBuild, PlotRenderState, PlotStyle, blit_frame,
+    expand_y_bounds, plot_canvas,
+};
 use crate::pending_edits::{EditRequest, pending_edits, pending_edits_mut};
 use crate::theme::{Theme, theme};
 use crate::{ComponentStream, WalComponentStream};
-use super::ElementIndexes;
 use gpui::{
     AnyElement, App, AppContext, AsyncApp, Context, Entity, InteractiveElement, IntoElement,
-    Pixels, SharedString, Stateful, Window, canvas, div, prelude::*, px,
+    Pixels, SharedString, Stateful, Window, div, prelude::*, px,
 };
 use metor_db::{Component, DB};
 use metor_proto::types::ComponentView;
@@ -21,7 +24,12 @@ struct ComponentRow {
     indexes: ElementIndexes,
     y_bounds: Option<(f64, f64)>,
     last_scan_ts: Option<metor_proto::types::Timestamp>,
+    gpu_state: PlotRenderState,
     _task: gpui::Task<()>,
+}
+
+fn component_row_gpu_state(r: &mut ComponentRow) -> &mut PlotRenderState {
+    &mut r.gpu_state
 }
 
 impl ComponentRow {
@@ -63,6 +71,7 @@ impl ComponentRow {
             indexes,
             y_bounds: None,
             last_scan_ts: None,
+            gpu_state: PlotRenderState::default(),
             _task: task,
         }
     }
@@ -177,21 +186,32 @@ impl TableDelegate for ComponentTableDelegate {
                 .into_any_element(),
             1 => render_value_cell(row_ref, &theme, cx).into_any_element(),
             2 => {
-                let component = row_ref.component.clone();
-                let plot_bounds = row_ref.sparkline_bounds();
-                let indexes = row_ref.indexes.clone();
                 let row_height = self.row_height();
                 let line_colors = theme.line_colors;
-                canvas(
-                    move |bounds, _window, _cx| (bounds, component, plot_bounds, indexes),
-                    move |_, (bounds, component, _, indexes), window, _cx| {
-                        if let Some(view) = plot_bounds {
-                            for (i, &idx) in indexes.iter().enumerate() {
-                                let color = line_colors[i % line_colors.len()];
-                                paint_data_line(bounds, &component, &view, color, px(1.0), idx, window);
-                            }
-                        }
+                plot_canvas(
+                    row.downgrade(),
+                    component_row_gpu_state,
+                    move |row, bounds| {
+                        let view = row.sparkline_bounds()?;
+                        let traces: Vec<OwnedLineDraw> = row
+                            .indexes
+                            .iter()
+                            .enumerate()
+                            .map(|(i, &idx)| OwnedLineDraw {
+                                component: row.component.clone(),
+                                element_index: idx,
+                                style: PlotStyle::Line,
+                                color: line_colors[i % line_colors.len()],
+                                stroke_width: 1.0,
+                            })
+                            .collect();
+                        Some(PlotCanvasBuild {
+                            inner_bounds: bounds,
+                            view,
+                            traces,
+                        })
                     },
+                    blit_frame,
                 )
                 .w_full()
                 .h(row_height - px(8.0))

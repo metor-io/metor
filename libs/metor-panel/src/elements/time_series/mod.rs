@@ -2,11 +2,10 @@ use std::sync::Arc;
 
 use gpui::{
     Bounds, Context, Corners, Hsla, IntoElement, MouseButton, PathBuilder, Pixels, Point,
-    RenderImage, SharedString, Styled, TextRun, Window, canvas, div, point, prelude::*, px,
+    RenderImage, SharedString, Styled, TextRun, Window, div, point, prelude::*, px,
 };
-use metor_db::time_series::TimeSeriesNodeSlice;
 use metor_db::{Component, DB};
-use metor_proto::types::{ComponentId, PrimType, Timestamp};
+use metor_proto::types::{ComponentId, Timestamp};
 
 use crate::inspectable::{FieldId, Inspectable, InspectionField, InspectionValue, ListItem};
 use crate::offset_parse::TimeRangeBehavior;
@@ -16,6 +15,9 @@ mod bounds;
 pub use bounds::*;
 
 mod gpu;
+pub(crate) use gpu::{
+    OwnedLineDraw, PlotCanvasBuild, PlotRenderState, blit_frame, plot_canvas,
+};
 
 /// Generate Y-axis tick positions within the visible bounds (sorted ascending).
 /// When the range spans 0, ticks are anchored at 0 and extend outward.
@@ -284,12 +286,15 @@ pub fn expand_y_bounds(
     any.then_some((min_y, max_y))
 }
 
-fn paint_plot<'a>(
+/// Paint the axes, gridlines, labels, and zero line around a plot, and
+/// blit the provided GPU-rendered frame into the plot area. The trace
+/// data itself is rendered entirely on the GPU; this function owns the
+/// CPU-only chrome.
+fn paint_plot(
     outer_bounds: Bounds<Pixels>,
-    traces: impl Iterator<Item = &'a ResolvedTrace>,
     view: PlotBounds,
     data_start: f64,
-    line_image: Option<Arc<RenderImage>>,
+    frame: Option<Arc<RenderImage>>,
     window: &mut Window,
     cx: &mut gpui::App,
 ) {
@@ -336,15 +341,15 @@ fn paint_plot<'a>(
         }
     }
 
-    // 2. Data traces — clipped to outer bounds so lines extend under axis areas.
-    //    When the GPU path produced an image, blit it for the line traces and
-    //    let the CPU path handle scatter/bar.
+    // 2. Data traces — clipped to outer bounds so the GPU frame can
+    //    extend under the axis label areas that the next step paints
+    //    over with semi-transparent fills.
     window.with_content_mask(
         Some(gpui::ContentMask {
             bounds: outer_bounds,
         }),
         |window| {
-            if let Some(img) = line_image {
+            if let Some(img) = frame {
                 let _ = window.paint_image(pb, Corners::default(), img, 0, false);
             }
         },
@@ -436,667 +441,6 @@ fn paint_plot<'a>(
     }
 }
 
-fn paint_trace(
-    screen_bounds: Bounds<Pixels>,
-    component: &Component,
-    view: &PlotBounds,
-    trace: &Trace,
-    window: &mut Window,
-) {
-    match trace.style {
-        PlotStyle::Line => {
-            paint_data_line(
-                screen_bounds,
-                component,
-                view,
-                trace.color,
-                px(trace.stroke_width),
-                trace.element_index,
-                window,
-            );
-        }
-        PlotStyle::Scatter => {
-            paint_scatter(
-                screen_bounds,
-                component,
-                view,
-                trace.color,
-                trace.element_index,
-                window,
-            );
-        }
-        PlotStyle::Bar => {
-            paint_bars(
-                screen_bounds,
-                component,
-                view,
-                trace.color,
-                trace.element_index,
-                window,
-            );
-        }
-    }
-}
-
-// ── Fast data access ────────────────────────────────────────────────
-
-/// Trait for primitive types that can be read from a byte buffer and converted to f64.
-trait PlotValue: zerocopy::FromBytes + Copy + Sized + 'static {
-    fn to_f64(self) -> f64;
-}
-
-macro_rules! impl_plot_value {
-    ($($ty:ty => $conv:expr),* $(,)?) => {
-        $(impl PlotValue for $ty {
-            #[inline(always)]
-            fn to_f64(self) -> f64 { $conv(self) }
-        })*
-    };
-}
-
-impl_plot_value! {
-    f64  => |x| x,
-    f32  => |x: f32| x as f64,
-    i8   => |x: i8| x as f64,
-    i16  => |x: i16| x as f64,
-    i32  => |x: i32| x as f64,
-    i64  => |x: i64| x as f64,
-    u8   => |x: u8| x as f64,
-    u16  => |x: u16| x as f64,
-    u32  => |x: u32| x as f64,
-    u64  => |x: u64| x as f64,
-}
-
-/// Bool isn't `FromBytes` (not all bit patterns valid), so treat it as u8.
-/// The dispatch macro maps `PrimType::Bool` to `u8` which reads the byte
-/// and converts via `u8::to_f64` (0 or 1).
-
-/// Read a single element value directly from a raw data buffer.
-#[inline(always)]
-fn read_value<T: PlotValue>(
-    data: &[u8],
-    sample_index: usize,
-    elem_size: usize,
-    elem_index: usize,
-) -> Option<f64> {
-    let offset = sample_index * elem_size + elem_index * size_of::<T>();
-    let buf = data.get(offset..offset + size_of::<T>())?;
-    T::read_from_bytes(buf).ok().map(|v| v.to_f64())
-}
-
-/// Compute per-node stride for two-level decimation.
-/// Returns the step between sample indices within a node, or `None` to skip it entirely.
-fn node_stride(node_len: usize, total: usize, pixel_budget: usize) -> Option<usize> {
-    if node_len == 0 || total == 0 || pixel_budget == 0 {
-        return None;
-    }
-    let node_budget = ((node_len as f64 / total as f64) * pixel_budget as f64).ceil() as usize;
-    if node_budget == 0 {
-        return None;
-    }
-    Some((node_len / node_budget).max(1))
-}
-
-// ── Query helpers ───────────────────────────────────────────────────
-
-fn query_range(view: &PlotBounds, screen_width_px: f32) -> (Timestamp, Timestamp) {
-    let margin_px = Y_LABEL_WIDTH + PADDING;
-    if screen_width_px <= 0.0 {
-        return (Timestamp(view.min_x as i64), Timestamp(view.max_x as i64));
-    }
-    let time_per_px = view.width() / screen_width_px as f64;
-    let margin_time = (margin_px as f64 * time_per_px) as i64;
-    (
-        Timestamp(view.min_x as i64 - margin_time),
-        Timestamp(view.max_x as i64 + margin_time),
-    )
-}
-
-// ── Paint functions ─────────────────────────────────────────────────
-
-fn paint_scatter(
-    screen_bounds: Bounds<Pixels>,
-    component: &Component,
-    view: &PlotBounds,
-    color: Hsla,
-    element_index: usize,
-    window: &mut Window,
-) {
-    let (start_ts, end_ts) = query_range(view, f32::from(screen_bounds.size.width));
-    let Some(slice) = component.time_series.get_range(start_ts..end_ts) else {
-        return;
-    };
-    let node_slices: Vec<_> = slice.as_iter().collect();
-    let pixel_budget = f32::from(screen_bounds.size.width) as usize;
-    let total: usize = node_slices.iter().map(|ns| ns.timestamps().len()).sum();
-    let xf = view.screen_transform(screen_bounds);
-    let elem_size = component.schema.size();
-
-    fn inner<T: PlotValue>(
-        node_slices: &[TimeSeriesNodeSlice],
-        total: usize,
-        pixel_budget: usize,
-        elem_size: usize,
-        elem_index: usize,
-        xf: &ScreenTransform,
-        path: &mut PathBuilder,
-        any: &mut bool,
-    ) {
-        let radius = px(3.0);
-        for ns in node_slices.iter() {
-            let Some(stride) = node_stride(ns.timestamps().len(), total, pixel_budget) else {
-                continue;
-            };
-            let timestamps = ns.timestamps();
-            let data = ns.data();
-            let mut i = 0;
-            while i < timestamps.len() {
-                if let Some(v) = read_value::<T>(data, i, elem_size, elem_index) {
-                    let pt = xf.apply(timestamps[i].0 as f64, v);
-                    path.move_to(point(pt.x, pt.y - radius));
-                    path.line_to(point(pt.x + radius, pt.y));
-                    path.line_to(point(pt.x, pt.y + radius));
-                    path.line_to(point(pt.x - radius, pt.y));
-                    path.line_to(point(pt.x, pt.y - radius));
-                    *any = true;
-                }
-                i += stride;
-            }
-        }
-    }
-
-    let mut path = PathBuilder::fill();
-    let mut any = false;
-    match component.schema.prim_type {
-        PrimType::F64 => inner::<f64>(
-            &node_slices,
-            total,
-            pixel_budget,
-            elem_size,
-            element_index,
-            &xf,
-            &mut path,
-            &mut any,
-        ),
-        PrimType::F32 => inner::<f32>(
-            &node_slices,
-            total,
-            pixel_budget,
-            elem_size,
-            element_index,
-            &xf,
-            &mut path,
-            &mut any,
-        ),
-        PrimType::I64 => inner::<i64>(
-            &node_slices,
-            total,
-            pixel_budget,
-            elem_size,
-            element_index,
-            &xf,
-            &mut path,
-            &mut any,
-        ),
-        PrimType::I32 => inner::<i32>(
-            &node_slices,
-            total,
-            pixel_budget,
-            elem_size,
-            element_index,
-            &xf,
-            &mut path,
-            &mut any,
-        ),
-        PrimType::I16 => inner::<i16>(
-            &node_slices,
-            total,
-            pixel_budget,
-            elem_size,
-            element_index,
-            &xf,
-            &mut path,
-            &mut any,
-        ),
-        PrimType::I8 => inner::<i8>(
-            &node_slices,
-            total,
-            pixel_budget,
-            elem_size,
-            element_index,
-            &xf,
-            &mut path,
-            &mut any,
-        ),
-        PrimType::U64 => inner::<u64>(
-            &node_slices,
-            total,
-            pixel_budget,
-            elem_size,
-            element_index,
-            &xf,
-            &mut path,
-            &mut any,
-        ),
-        PrimType::U32 => inner::<u32>(
-            &node_slices,
-            total,
-            pixel_budget,
-            elem_size,
-            element_index,
-            &xf,
-            &mut path,
-            &mut any,
-        ),
-        PrimType::U16 => inner::<u16>(
-            &node_slices,
-            total,
-            pixel_budget,
-            elem_size,
-            element_index,
-            &xf,
-            &mut path,
-            &mut any,
-        ),
-        PrimType::U8 | PrimType::Bool => inner::<u8>(
-            &node_slices,
-            total,
-            pixel_budget,
-            elem_size,
-            element_index,
-            &xf,
-            &mut path,
-            &mut any,
-        ),
-    }
-
-    if any {
-        if let Ok(path) = path.build() {
-            window.paint_path(path, color);
-        }
-    }
-}
-
-fn paint_bars(
-    screen_bounds: Bounds<Pixels>,
-    component: &Component,
-    view: &PlotBounds,
-    color: Hsla,
-    element_index: usize,
-    window: &mut Window,
-) {
-    let (start_ts, end_ts) = query_range(view, f32::from(screen_bounds.size.width));
-    let Some(slice) = component.time_series.get_range(start_ts..end_ts) else {
-        return;
-    };
-    let node_slices: Vec<_> = slice.as_iter().collect();
-    let pixel_budget = f32::from(screen_bounds.size.width) as usize;
-    let total: usize = node_slices.iter().map(|ns| ns.timestamps().len()).sum();
-    let xf = view.screen_transform(screen_bounds);
-    let elem_size = component.schema.size();
-
-    let baseline = if view.min_y <= 0.0 && view.max_y >= 0.0 {
-        0.0
-    } else {
-        view.min_y
-    };
-    let baseline_y = xf.apply(view.min_x, baseline).y;
-    let budget = pixel_budget.max(1);
-    let max_bar_width = px(20.0);
-    let bar_half = (screen_bounds.size.width / (budget as f32 * 2.0)).min(max_bar_width / 2.0);
-
-    fn inner<T: PlotValue>(
-        node_slices: &[TimeSeriesNodeSlice],
-        total: usize,
-        pixel_budget: usize,
-        elem_size: usize,
-        elem_index: usize,
-        xf: &ScreenTransform,
-        baseline: f64,
-        baseline_y: Pixels,
-        bar_half: Pixels,
-        path: &mut PathBuilder,
-        any: &mut bool,
-    ) {
-        for ns in node_slices.iter().rev() {
-            let Some(stride) = node_stride(ns.timestamps().len(), total, pixel_budget) else {
-                continue;
-            };
-            let timestamps = ns.timestamps();
-            let data = ns.data();
-            let mut i = 0;
-            while i < timestamps.len() {
-                if let Some(v) = read_value::<T>(data, i, elem_size, elem_index) {
-                    let t = timestamps[i].0 as f64;
-                    let top = xf.apply(t, v);
-                    let left = top.x - bar_half;
-                    let right = top.x + bar_half;
-                    let (top_y, bot_y) = if v >= baseline {
-                        (top.y, baseline_y)
-                    } else {
-                        (baseline_y, top.y)
-                    };
-                    path.move_to(point(left, top_y));
-                    path.line_to(point(right, top_y));
-                    path.line_to(point(right, bot_y));
-                    path.line_to(point(left, bot_y));
-                    path.line_to(point(left, top_y));
-                    *any = true;
-                }
-                i += stride;
-            }
-        }
-    }
-
-    let mut path = PathBuilder::fill();
-    let mut any = false;
-    match component.schema.prim_type {
-        PrimType::F64 => inner::<f64>(
-            &node_slices,
-            total,
-            pixel_budget,
-            elem_size,
-            element_index,
-            &xf,
-            baseline,
-            baseline_y,
-            bar_half,
-            &mut path,
-            &mut any,
-        ),
-        PrimType::F32 => inner::<f32>(
-            &node_slices,
-            total,
-            pixel_budget,
-            elem_size,
-            element_index,
-            &xf,
-            baseline,
-            baseline_y,
-            bar_half,
-            &mut path,
-            &mut any,
-        ),
-        PrimType::I64 => inner::<i64>(
-            &node_slices,
-            total,
-            pixel_budget,
-            elem_size,
-            element_index,
-            &xf,
-            baseline,
-            baseline_y,
-            bar_half,
-            &mut path,
-            &mut any,
-        ),
-        PrimType::I32 => inner::<i32>(
-            &node_slices,
-            total,
-            pixel_budget,
-            elem_size,
-            element_index,
-            &xf,
-            baseline,
-            baseline_y,
-            bar_half,
-            &mut path,
-            &mut any,
-        ),
-        PrimType::I16 => inner::<i16>(
-            &node_slices,
-            total,
-            pixel_budget,
-            elem_size,
-            element_index,
-            &xf,
-            baseline,
-            baseline_y,
-            bar_half,
-            &mut path,
-            &mut any,
-        ),
-        PrimType::I8 => inner::<i8>(
-            &node_slices,
-            total,
-            pixel_budget,
-            elem_size,
-            element_index,
-            &xf,
-            baseline,
-            baseline_y,
-            bar_half,
-            &mut path,
-            &mut any,
-        ),
-        PrimType::U64 => inner::<u64>(
-            &node_slices,
-            total,
-            pixel_budget,
-            elem_size,
-            element_index,
-            &xf,
-            baseline,
-            baseline_y,
-            bar_half,
-            &mut path,
-            &mut any,
-        ),
-        PrimType::U32 => inner::<u32>(
-            &node_slices,
-            total,
-            pixel_budget,
-            elem_size,
-            element_index,
-            &xf,
-            baseline,
-            baseline_y,
-            bar_half,
-            &mut path,
-            &mut any,
-        ),
-        PrimType::U16 => inner::<u16>(
-            &node_slices,
-            total,
-            pixel_budget,
-            elem_size,
-            element_index,
-            &xf,
-            baseline,
-            baseline_y,
-            bar_half,
-            &mut path,
-            &mut any,
-        ),
-        PrimType::U8 | PrimType::Bool => inner::<u8>(
-            &node_slices,
-            total,
-            pixel_budget,
-            elem_size,
-            element_index,
-            &xf,
-            baseline,
-            baseline_y,
-            bar_half,
-            &mut path,
-            &mut any,
-        ),
-    }
-
-    if any {
-        if let Ok(path) = path.build() {
-            window.paint_path(path, color);
-        }
-    }
-}
-
-/// Draw a time series data line within the given screen bounds.
-/// Reads values directly from the raw byte buffer, bypassing parse_value.
-/// Uses two-level stride decimation: skips entire nodes when possible,
-/// then samples within nodes at a proportional rate.
-pub fn paint_data_line(
-    screen_bounds: Bounds<Pixels>,
-    component: &Component,
-    view: &PlotBounds,
-    color: Hsla,
-    stroke_width: Pixels,
-    element_index: usize,
-    window: &mut Window,
-) {
-    let (start_ts, end_ts) = query_range(view, f32::from(screen_bounds.size.width));
-    let Some(slice) = component.time_series.get_range(start_ts..end_ts) else {
-        return;
-    };
-    let node_slices: Vec<_> = slice.as_iter().collect();
-    let pixel_budget = f32::from(screen_bounds.size.width) as usize;
-    let total: usize = node_slices.iter().map(|ns| ns.timestamps().len()).sum();
-    let xf = view.screen_transform(screen_bounds);
-    let elem_size = component.schema.size();
-
-    fn inner<T: PlotValue>(
-        node_slices: &[TimeSeriesNodeSlice],
-        total: usize,
-        pixel_budget: usize,
-        elem_size: usize,
-        elem_index: usize,
-        xf: &ScreenTransform,
-        path: &mut PathBuilder,
-        first: &mut bool,
-    ) {
-        for ns in node_slices.iter().rev() {
-            let Some(stride) = node_stride(ns.timestamps().len(), total, pixel_budget) else {
-                continue;
-            };
-            let timestamps = ns.timestamps();
-            let data = ns.data();
-            let mut i = 0;
-            while i < timestamps.len() {
-                if let Some(v) = read_value::<T>(data, i, elem_size, elem_index) {
-                    let pt = xf.apply(timestamps[i].0 as f64, v);
-                    if *first {
-                        path.move_to(pt);
-                        *first = false;
-                    } else {
-                        path.line_to(pt);
-                    }
-                }
-                i += stride;
-            }
-        }
-    }
-
-    let mut path = PathBuilder::stroke(stroke_width);
-    let mut first = true;
-    match component.schema.prim_type {
-        PrimType::F64 => inner::<f64>(
-            &node_slices,
-            total,
-            pixel_budget,
-            elem_size,
-            element_index,
-            &xf,
-            &mut path,
-            &mut first,
-        ),
-        PrimType::F32 => inner::<f32>(
-            &node_slices,
-            total,
-            pixel_budget,
-            elem_size,
-            element_index,
-            &xf,
-            &mut path,
-            &mut first,
-        ),
-        PrimType::I64 => inner::<i64>(
-            &node_slices,
-            total,
-            pixel_budget,
-            elem_size,
-            element_index,
-            &xf,
-            &mut path,
-            &mut first,
-        ),
-        PrimType::I32 => inner::<i32>(
-            &node_slices,
-            total,
-            pixel_budget,
-            elem_size,
-            element_index,
-            &xf,
-            &mut path,
-            &mut first,
-        ),
-        PrimType::I16 => inner::<i16>(
-            &node_slices,
-            total,
-            pixel_budget,
-            elem_size,
-            element_index,
-            &xf,
-            &mut path,
-            &mut first,
-        ),
-        PrimType::I8 => inner::<i8>(
-            &node_slices,
-            total,
-            pixel_budget,
-            elem_size,
-            element_index,
-            &xf,
-            &mut path,
-            &mut first,
-        ),
-        PrimType::U64 => inner::<u64>(
-            &node_slices,
-            total,
-            pixel_budget,
-            elem_size,
-            element_index,
-            &xf,
-            &mut path,
-            &mut first,
-        ),
-        PrimType::U32 => inner::<u32>(
-            &node_slices,
-            total,
-            pixel_budget,
-            elem_size,
-            element_index,
-            &xf,
-            &mut path,
-            &mut first,
-        ),
-        PrimType::U16 => inner::<u16>(
-            &node_slices,
-            total,
-            pixel_budget,
-            elem_size,
-            element_index,
-            &xf,
-            &mut path,
-            &mut first,
-        ),
-        PrimType::U8 | PrimType::Bool => inner::<u8>(
-            &node_slices,
-            total,
-            pixel_budget,
-            elem_size,
-            element_index,
-            &xf,
-            &mut path,
-            &mut first,
-        ),
-    }
-
-    if !first {
-        if let Ok(path) = path.build() {
-            window.paint_path(path, color);
-        }
-    }
-}
-
 /// How a trace is drawn on the plot.
 #[derive(Clone, Copy, Default, PartialEq)]
 pub enum PlotStyle {
@@ -1175,10 +519,12 @@ pub struct TimeSeriesPlot {
     y_min_override: Option<f64>,
     y_max_override: Option<f64>,
     on_open_page: Option<OpenPageCallback>,
-    gpu_line: Option<gpu::LineRenderer>,
-    gpu_line_image: Option<Arc<RenderImage>>,
-    gpu_dropped_images: Vec<Arc<RenderImage>>,
+    gpu_state: gpu::PlotRenderState,
     _tasks: Vec<gpui::Task<()>>,
+}
+
+fn time_series_plot_gpu_state(t: &mut TimeSeriesPlot) -> &mut gpu::PlotRenderState {
+    &mut t.gpu_state
 }
 
 /// Callback type for when the plot wants to open an inspector page.
@@ -1206,9 +552,7 @@ impl TimeSeriesPlot {
             y_min_override: None,
             y_max_override: None,
             on_open_page: None,
-            gpu_line: None,
-            gpu_line_image: None,
-            gpu_dropped_images: Vec::new(),
+            gpu_state: gpu::PlotRenderState::default(),
             _tasks: tasks,
         }
     }
@@ -1480,7 +824,6 @@ impl Render for TimeSeriesPlot {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let view = self.current_view();
         let data_start = self.time_range().map(|(s, _)| s).unwrap_or(0.0);
-        let traces = self.traces.clone();
         let show_legend = self.resolved_traces().count() >= 2;
         let theme = crate::theme::theme(cx);
 
@@ -1565,95 +908,35 @@ impl Render for TimeSeriesPlot {
                         },
                     ))
                     .child(
-                        canvas(
-                            {
-                                let this = cx.entity().downgrade();
-                                move |bounds, window, cx| {
-                                    let pa = plot_area(bounds);
-                                    let scale_factor = window.scale_factor();
-                                    let (line_image, dropped) = this
-                                        .update(cx, |this, _cx| {
-                                            this.last_plot_area = Some(pa);
-                                            let view = match view {
-                                                Some(v) => v,
-                                                None => {
-                                                    return (
-                                                        this.gpu_line_image.clone(),
-                                                        std::mem::take(
-                                                            &mut this.gpu_dropped_images,
-                                                        ),
-                                                    );
-                                                }
-                                            };
-                                            if this.gpu_line.is_none() {
-                                                this.gpu_line = gpu::LineRenderer::try_new();
-                                            }
-                                            if let Some(renderer) = this.gpu_line.as_mut() {
-                                                let draws: Vec<gpu::LineDraw<'_>> = this
-                                                    .traces
-                                                    .iter()
-                                                    .flatten()
-                                                    .filter(|rt| rt.trace.visible)
-                                                    .map(|rt| gpu::LineDraw {
-                                                        component_id: rt.trace.component_id,
-                                                        component: &rt.component,
-                                                        element_index: rt.trace.element_index,
-                                                        style: rt.trace.style,
-                                                        color: rt.trace.color,
-                                                        stroke_width: rt.trace.stroke_width,
-                                                    })
-                                                    .collect();
-                                                if let Some(handle) = renderer.render_to_gpu(
-                                                    pa,
-                                                    view,
-                                                    scale_factor,
-                                                    &draws,
-                                                ) {
-                                                    _cx.spawn(async move |this, cx| {
-                                                        let image = cx
-                                                            .background_executor()
-                                                            .spawn(
-                                                                async move { handle.read_image() },
-                                                            )
-                                                            .await;
-                                                        if let Some(img) = image {
-                                                            let _ = this.update(cx, |this, cx| {
-                                                                if let Some(prev) =
-                                                                    this.gpu_line_image.replace(img)
-                                                                {
-                                                                    this.gpu_dropped_images
-                                                                        .push(prev);
-                                                                }
-                                                                cx.notify();
-                                                            });
-                                                        }
-                                                    })
-                                                    .detach();
-                                                }
-                                            }
-                                            (
-                                                this.gpu_line_image.clone(),
-                                                std::mem::take(&mut this.gpu_dropped_images),
-                                            )
-                                        })
-                                        .unwrap_or((None, Vec::new()));
-                                    for img in dropped {
-                                        let _ = window.drop_image(img);
-                                    }
-                                    (bounds, view, line_image)
-                                }
+                        plot_canvas(
+                            cx.entity().downgrade(),
+                            time_series_plot_gpu_state,
+                            move |this, bounds| {
+                                let pa = plot_area(bounds);
+                                this.last_plot_area = Some(pa);
+                                let view = view?;
+                                let traces: Vec<OwnedLineDraw> = this
+                                    .traces
+                                    .iter()
+                                    .flatten()
+                                    .filter(|rt| rt.trace.visible)
+                                    .map(|rt| OwnedLineDraw {
+                                        component: rt.component.clone(),
+                                        element_index: rt.trace.element_index,
+                                        style: rt.trace.style,
+                                        color: rt.trace.color,
+                                        stroke_width: rt.trace.stroke_width,
+                                    })
+                                    .collect();
+                                Some(PlotCanvasBuild {
+                                    inner_bounds: pa,
+                                    view,
+                                    traces,
+                                })
                             },
-                            move |_, (bounds, view, line_image), window, cx| {
+                            move |bounds, view, frame, window, cx| {
                                 if let Some(view) = view {
-                                    paint_plot(
-                                        bounds,
-                                        traces.iter().flatten(),
-                                        view,
-                                        data_start,
-                                        line_image,
-                                        window,
-                                        cx,
-                                    );
+                                    paint_plot(bounds, view, data_start, frame, window, cx);
                                 }
                             },
                         )

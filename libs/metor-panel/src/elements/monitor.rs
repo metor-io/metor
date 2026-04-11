@@ -1,12 +1,15 @@
 use std::sync::Arc;
 
-use gpui::{Context, IntoElement, SharedString, Window, canvas, div, prelude::*, px};
+use gpui::{Context, IntoElement, SharedString, Window, div, prelude::*, px};
 use metor_db::{Component, DB};
 use metor_proto::types::ComponentView;
 use smallvec::SmallVec;
 
-use super::time_series::{PlotBounds, expand_y_bounds, paint_data_line};
 use super::ElementIndexes;
+use super::time_series::{
+    OwnedLineDraw, PlotBounds, PlotCanvasBuild, PlotRenderState, PlotStyle, blit_frame,
+    expand_y_bounds, plot_canvas,
+};
 use crate::inspectable::{FieldId, Inspectable, InspectionField, InspectionValue};
 use crate::theme::theme;
 use crate::{AsComponentView, ComponentStream, ComponentStreamBuilder};
@@ -31,7 +34,12 @@ pub struct Monitor {
     indexes: ElementIndexes,
     y_bounds: Option<(f64, f64)>,
     last_scan_ts: Option<metor_proto::types::Timestamp>,
+    gpu_state: PlotRenderState,
     _task: gpui::Task<()>,
+}
+
+fn monitor_gpu_state(m: &mut Monitor) -> &mut PlotRenderState {
+    &mut m.gpu_state
 }
 
 impl Monitor {
@@ -132,6 +140,7 @@ impl Monitor {
             indexes,
             y_bounds: None,
             last_scan_ts: None,
+            gpu_state: PlotRenderState::default(),
             _task: task,
         }
     }
@@ -232,33 +241,40 @@ impl Render for Monitor {
             .overflow_hidden();
 
         // Sparkline — fills available space above the text content
-        if self.show_sparkline {
-            if let Some(ref comp) = self.component {
-                let component = comp.clone();
-                let plot_bounds = self.sparkline_bounds();
-                let indexes = self.indexes.clone();
-                let line_colors = theme.line_colors;
-
-                root = root.child(
-                    canvas(
-                        move |bounds, _window, _cx| (bounds, component, plot_bounds, indexes),
-                        move |_, (bounds, component, plot_bounds, indexes), window, _cx| {
-                            if let Some(view) = plot_bounds {
-                                for (i, &idx) in indexes.iter().enumerate() {
-                                    let color = line_colors[i % line_colors.len()];
-                                    paint_data_line(
-                                        bounds, &component, &view, color, px(1.5), idx, window,
-                                    );
-                                }
-                            }
-                        },
-                    )
-                    .w_full()
-                    .pt(px(4.0))
-                    .flex_1()
-                    .min_h(px(16.0)),
-                );
-            }
+        if self.show_sparkline && self.component.is_some() {
+            let line_colors = theme.line_colors;
+            root = root.child(
+                plot_canvas(
+                    cx.entity().downgrade(),
+                    monitor_gpu_state,
+                    move |m, bounds| {
+                        let comp = m.component.as_ref()?;
+                        let view = m.sparkline_bounds()?;
+                        let traces: Vec<OwnedLineDraw> = m
+                            .indexes
+                            .iter()
+                            .enumerate()
+                            .map(|(i, &idx)| OwnedLineDraw {
+                                component: comp.clone(),
+                                element_index: idx,
+                                style: PlotStyle::Line,
+                                color: line_colors[i % line_colors.len()],
+                                stroke_width: 1.5,
+                            })
+                            .collect();
+                        Some(PlotCanvasBuild {
+                            inner_bounds: bounds,
+                            view,
+                            traces,
+                        })
+                    },
+                    blit_frame,
+                )
+                .w_full()
+                .pt(px(4.0))
+                .flex_1()
+                .min_h(px(16.0)),
+            );
         }
 
         // Values

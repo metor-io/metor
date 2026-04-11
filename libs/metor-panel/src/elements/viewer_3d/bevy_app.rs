@@ -16,23 +16,29 @@
 
 use std::sync::Arc;
 
-use bevy::app::{App, SubApps};
-use bevy::asset::{AssetPlugin, RenderAssetUsages, UnapprovedPathMode};
-use bevy::camera::visibility::RenderLayers;
-use bevy::ecs::world::World;
-use bevy::image::Image;
-use bevy::prelude::*;
-use bevy::render::RenderPlugin;
-use bevy::render::gpu_readback::ReadbackComplete;
-use bevy::render::pipelined_rendering::PipelinedRenderingPlugin;
-use bevy::render::render_resource::{Extent3d, TextureDimension, TextureFormat, TextureUsages};
-use bevy::render::renderer::{
-    RenderAdapter, RenderAdapterInfo, RenderDevice, RenderInstance, RenderQueue, WgpuWrapper,
-};
-use bevy::render::settings::{RenderCreation, RenderResources};
 use bevy::window::{ExitCondition, WindowPlugin};
-use thingbuf::ThingBuf;
-use thingbuf::recycling::Recycle;
+use bevy::{
+    app::{App, SubApps},
+    asset::{AssetPlugin, RenderAssetUsages, UnapprovedPathMode},
+};
+use bevy::{
+    camera::visibility::RenderLayers,
+    ecs::world::World,
+    image::Image,
+    prelude::*,
+    render::{
+        RenderPlugin,
+        gpu_readback::ReadbackComplete,
+        pipelined_rendering::PipelinedRenderingPlugin,
+        render_resource::{Extent3d, TextureDimension, TextureFormat, TextureUsages},
+        renderer::{
+            RenderAdapter, RenderAdapterInfo, RenderDevice, RenderInstance, RenderQueue,
+            WgpuWrapper,
+        },
+        settings::{RenderCreation, RenderResources},
+    },
+};
+use thingbuf::{ThingBuf, recycling::Recycle};
 
 use crate::gpu_context::GpuContext;
 
@@ -81,7 +87,10 @@ pub(super) fn build_app() -> SubApps {
             .disable::<PipelinedRenderingPlugin>(),
     );
 
-    app.add_systems(Update, (compose_transforms, propagate_render_layers).chain());
+    app.add_systems(
+        Update,
+        (compose_transforms, propagate_render_layers).chain(),
+    );
     app.add_observer(on_readback_complete);
 
     // Externally-driven update loop: finish + cleanup must be called
@@ -214,10 +223,7 @@ fn propagate_layers_recursive(
 /// are occupied (the viewer fell two frames behind), we discard the
 /// oldest by draining one entry, then enqueue the newest — most-recent
 /// frame wins.
-fn on_readback_complete(
-    trigger: On<ReadbackComplete>,
-    mut sinks: Query<&mut FrameSink>,
-) {
+fn on_readback_complete(trigger: On<ReadbackComplete>, mut sinks: Query<&mut FrameSink>) {
     let Ok(sink) = sinks.get_mut(trigger.entity) else {
         return;
     };
@@ -289,9 +295,8 @@ pub(super) fn new_target_image(width: u32, height: u32) -> Image {
         TextureFormat::Bgra8UnormSrgb,
         RenderAssetUsages::RENDER_WORLD,
     );
-    img.texture_descriptor.usage |= TextureUsages::RENDER_ATTACHMENT
-        | TextureUsages::COPY_SRC
-        | TextureUsages::TEXTURE_BINDING;
+    img.texture_descriptor.usage |=
+        TextureUsages::RENDER_ATTACHMENT | TextureUsages::COPY_SRC | TextureUsages::TEXTURE_BINDING;
     img
 }
 
