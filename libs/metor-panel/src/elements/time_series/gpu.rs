@@ -16,8 +16,6 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use std::sync::OnceLock;
-
 use bytemuck::{Pod, Zeroable};
 use gpui::{Bounds, Hsla, Pixels, RenderImage};
 use image::{Frame, ImageBuffer, Rgba};
@@ -28,6 +26,7 @@ use offset_allocator::{Allocation, Allocator};
 use smallvec::SmallVec;
 
 use super::PlotBounds;
+use crate::gpu_context::GpuContext;
 
 const VALUE_CAPACITY: u32 = 1 << 22;
 const VALUE_BUF_BYTES: u64 = VALUE_CAPACITY as u64 * 4;
@@ -208,42 +207,6 @@ impl ValueCache {
             chunk.sample_count = decimated_len as u32;
         }
         Some((chunk.allocation.offset, chunk.sample_count))
-    }
-}
-
-/// Lazily-initialized wgpu adapter/device shared across all `LineRenderer`s.
-struct GpuContext {
-    device: wgpu::Device,
-    queue: wgpu::Queue,
-}
-
-impl GpuContext {
-    fn get() -> Option<Arc<GpuContext>> {
-        static CTX: OnceLock<Option<Arc<GpuContext>>> = OnceLock::new();
-        CTX.get_or_init(|| pollster::block_on(Self::create()).ok().map(Arc::new))
-            .clone()
-    }
-
-    async fn create() -> Result<GpuContext, String> {
-        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
-        let adapter = instance
-            .request_adapter(&wgpu::RequestAdapterOptions {
-                power_preference: wgpu::PowerPreference::HighPerformance,
-                compatible_surface: None,
-                force_fallback_adapter: false,
-            })
-            .await
-            .map_err(|e| format!("no wgpu adapter: {e:?}"))?;
-        let (device, queue) = adapter
-            .request_device(&wgpu::DeviceDescriptor {
-                label: Some("metor-panel line renderer"),
-                required_limits: adapter.limits(),
-                memory_hints: wgpu::MemoryHints::Performance,
-                ..Default::default()
-            })
-            .await
-            .map_err(|e| format!("wgpu request_device failed: {e:?}"))?;
-        Ok(GpuContext { device, queue })
     }
 }
 

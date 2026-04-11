@@ -27,6 +27,38 @@ bytemuck = { version = "1", features = ["derive"] }
 pollster = "0.4"
 image = "0.25"
 offset-allocator = "0.2"
+glam = "0.32"
+crossbeam-channel = "0.5"
+bevy = { git = "https://github.com/bevyengine/bevy", rev = "5330b01ed6dfe8ee9ea98c97ded72e44ca336c74", default-features = false, features = [
+    "std",
+    # Core rendering
+    "bevy_asset",
+    "bevy_render",
+    "bevy_core_pipeline",
+    "bevy_pbr",
+    "bevy_mesh",
+    "bevy_image",
+    "bevy_shader",
+    "bevy_camera",
+    "bevy_light",
+    "bevy_window",
+    # Scenes & models
+    "bevy_scene",
+    "bevy_gltf",
+    "bevy_animation",
+    # Image formats used by GLTF textures
+    "png",
+    "jpeg",
+    "ktx2",
+    "zstd_rust",
+    # Visual quality
+    "tonemapping_luts",
+    "bevy_anti_alias",
+    # Scheduling
+    "multi_threaded",
+    "async_executor",
+    "bevy_log",
+] }
 
 [[example]]
 name = "component_text"
@@ -39,6 +71,10 @@ path = "examples/time_series_plot.rs"
 [[example]]
 name = "component_table"
 path = "examples/component_table.rs"
+
+[[example]]
+name = "viewer_3d"
+path = "examples/viewer_3d.rs"
 
 [target.'cfg(target_os = "macos")'.dependencies]
 cocoa = "0.26"

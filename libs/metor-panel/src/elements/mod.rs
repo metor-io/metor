@@ -15,6 +15,7 @@ pub mod monitor;
 pub mod scrollbar;
 pub mod table;
 pub mod time_series;
+pub mod viewer_3d;
 
 /// Element indices within a component (e.g. x=0, y=1, z=2 for a Vec3).
 pub type ElementIndexes = SmallVec<[usize; 8]>;

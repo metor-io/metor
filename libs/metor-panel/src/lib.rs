@@ -5,6 +5,7 @@ use metor_db::{Component, ComponentSchema, DB};
 use metor_proto::types::{ComponentId, ComponentView, Timestamp};
 pub mod command_palette;
 pub mod elements;
+pub mod gpu_context;
 pub mod icons;
 pub mod inspectable;
 pub mod offset_parse;

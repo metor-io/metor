@@ -6,6 +6,7 @@ use metor_proto::types::ComponentId;
 
 use crate::command_palette::{PaletteAction, PaletteItem, PalettePage};
 use crate::elements::time_series::OpenPageCallback;
+use crate::elements::viewer_3d::Viewer3d;
 use crate::elements::{ComponentTable, ComponentText, TimeSeriesPlot, new_component_table};
 use crate::inspectable::{
     FieldId, InspectionValue, palette_page_for_field, palette_page_for_inspectable,
@@ -160,6 +161,43 @@ impl PaneItem for PlotPanel {
             Some(self.db.clone()),
             cx,
         ))
+    }
+}
+
+/// Tile panel wrapping a [`Viewer3d`]. Inspector support and model
+/// configuration come in later phases.
+pub struct Viewer3dPanel {
+    inner: Entity<Viewer3d>,
+    label: SharedString,
+}
+
+impl Viewer3dPanel {
+    pub fn new(cx: &mut Context<Self>) -> Self {
+        let inner = cx.new(|cx| Viewer3d::new(cx));
+        Self {
+            inner,
+            label: "3D Viewer".into(),
+        }
+    }
+}
+
+impl Render for Viewer3dPanel {
+    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+        div().size_full().child(self.inner.clone())
+    }
+}
+
+impl PaneItem for Viewer3dPanel {
+    fn tab_title(&self, _cx: &App) -> SharedString {
+        self.label.clone()
+    }
+
+    fn serialization_key() -> &'static str {
+        "viewer_3d"
+    }
+
+    fn serialize(&self, _cx: &App) -> serde_json::Value {
+        serde_json::json!({})
     }
 }
 
@@ -319,6 +357,16 @@ fn new_panel_page(
                 pane.update(cx, |pane, cx| {
                     let item: Box<dyn PaneItemHandle> =
                         Box::new(cx.new(|cx| TablePanel::new(db, cx)));
+                    pane.add_item(item, cx);
+                });
+            }))
+        }),
+        PaletteItem::new("3D Viewer", {
+            let pane = pane.clone();
+            PaletteAction::Execute(Box::new(move |_filter, _window, cx| {
+                pane.update(cx, |pane, cx| {
+                    let item: Box<dyn PaneItemHandle> =
+                        Box::new(cx.new(|cx| Viewer3dPanel::new(cx)));
                     pane.add_item(item, cx);
                 });
             }))
