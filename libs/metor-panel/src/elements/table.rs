@@ -322,6 +322,7 @@ impl<D: TableDelegate> Render for Table<D> {
             .flex_col()
             .size_full()
             .bg(theme.bg_primary)
+            .on_scroll_wheel(|_, _, cx| cx.stop_propagation())
             .child(header)
             .child(
                 uniform_list(

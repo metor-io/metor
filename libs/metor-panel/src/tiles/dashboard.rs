@@ -4,7 +4,7 @@ use std::sync::Arc;
 use gpui::{
     AnyElement, AnyView, App, Bounds, Corners, Context, DragMoveEvent, Empty, Entity,
     IntoElement, Pixels, Point, Render, RenderImage, SharedString, Window, canvas, div, fill,
-    point, prelude::*, px, relative, size,
+    point, prelude::*, px, size,
 };
 use image::{Frame, ImageBuffer, Rgba};
 use metor_db::DB;
@@ -19,8 +19,8 @@ use crate::theme::theme;
 
 use super::item::PaneItem;
 
-const SNAP_GRID: f32 = 1.0 / 48.0;
-const MIN_WIDGET_FRAC: f32 = 0.05;
+const SNAP_GRID_PX: f32 = 10.0;
+const MIN_WIDGET_PX: f32 = 40.0;
 /// Width of the edge resize zones (like macOS window borders).
 const EDGE_ZONE_PX: f32 = 6.0;
 /// Size of corner resize zones.
@@ -30,7 +30,7 @@ const CORNER_ZONE_PX: f32 = 10.0;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct WidgetId(pub u64);
 
-/// Position and size as fractions of the canvas (0.0–1.0).
+/// Position and size in pixels on the dashboard canvas.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 pub struct WidgetRect {
     pub x: f32,
@@ -39,11 +39,8 @@ pub struct WidgetRect {
     pub h: f32,
 }
 
-impl WidgetRect {
-}
-
-fn snap_value(v: f32) -> f32 {
-    (v / SNAP_GRID).round() * SNAP_GRID
+fn snap_px(v: f32) -> f32 {
+    (v / SNAP_GRID_PX).round() * SNAP_GRID_PX
 }
 
 /// The type of content a widget displays.
@@ -60,11 +57,11 @@ pub enum WidgetKind {
 impl WidgetKind {
     fn default_size(self) -> (f32, f32) {
         match self {
-            WidgetKind::Plot => (0.4, 0.3),
-            WidgetKind::Text => (0.15, 0.08),
-            WidgetKind::Table => (0.4, 0.4),
-            WidgetKind::Image => (0.3, 0.3),
-            WidgetKind::Monitor => (0.12, 0.1),
+            WidgetKind::Plot => (400.0, 250.0),
+            WidgetKind::Text => (160.0, 60.0),
+            WidgetKind::Table => (400.0, 300.0),
+            WidgetKind::Image => (300.0, 200.0),
+            WidgetKind::Monitor => (150.0, 80.0),
         }
     }
 }
@@ -96,7 +93,7 @@ struct DraggedWidget {
     widget_id: WidgetId,
     dashboard: Entity<DashboardPanel>,
     /// Fractional offset from the widget's origin to the grab point.
-    grab_offset_frac: Point<f32>,
+    grab_offset: Point<f32>,
 }
 
 impl Render for DraggedWidget {
@@ -122,7 +119,7 @@ impl Render for ResizingWidget {
 /// Type-erased function that produces an inspect palette for a widget's inner entity.
 type WidgetInspectFn = Box<dyn Fn(&Arc<DB>, &App) -> Option<PalettePage>>;
 
-/// Free-form canvas dashboard where widgets are positioned at fractional coordinates.
+/// Free-form canvas dashboard where widgets are positioned at pixel coordinates.
 pub struct DashboardPanel {
     db: Arc<DB>,
     self_entity: Entity<DashboardPanel>,
@@ -135,6 +132,9 @@ pub struct DashboardPanel {
     editing: bool,
     selected: Option<WidgetId>,
     container_bounds: Option<Bounds<Pixels>>,
+    /// Viewport pan offset in pixels. Negative values scroll the canvas
+    /// so content below/right of the origin becomes visible.
+    scroll_offset: Point<f32>,
 }
 
 impl DashboardPanel {
@@ -151,6 +151,7 @@ impl DashboardPanel {
             editing: false,
             selected: None,
             container_bounds: None,
+            scroll_offset: point(0.0, 0.0),
         }
     }
 
@@ -166,18 +167,20 @@ impl DashboardPanel {
 
     /// Find an unoccupied position for a new widget of the given size.
     fn auto_place(&self, w: f32, h: f32) -> WidgetRect {
-        let x = 0.05_f32;
-        let mut y = 0.05_f32;
+        let x = 20.0_f32;
+        let mut y = 20.0_f32;
         for widget in &self.widgets {
             let bottom = widget.rect.y + widget.rect.h;
-            if bottom + 0.02 > y {
-                y = bottom + 0.02;
+            if bottom + 10.0 > y {
+                y = bottom + 10.0;
             }
         }
-        if y + h > 1.0 {
-            y = 0.05;
+        WidgetRect {
+            x,
+            y: snap_px(y),
+            w: snap_px(w),
+            h: snap_px(h),
         }
-        WidgetRect { x, y, w, h }
     }
 
     fn add_widget(
@@ -259,11 +262,12 @@ impl DashboardPanel {
         }
     }
 
-    /// Convert a window-space pixel position to fractional canvas coordinates.
-    fn pixel_to_frac(&self, pixel: Point<Pixels>) -> Option<Point<f32>> {
+    /// Convert a window-space pixel position to canvas coordinates,
+    /// accounting for the current scroll offset.
+    fn pixel_to_canvas(&self, pixel: Point<Pixels>) -> Option<Point<f32>> {
         let bounds = self.container_bounds?;
-        let x = f32::from(pixel.x - bounds.origin.x) / f32::from(bounds.size.width);
-        let y = f32::from(pixel.y - bounds.origin.y) / f32::from(bounds.size.height);
+        let x = f32::from(pixel.x - bounds.origin.x) - self.scroll_offset.x;
+        let y = f32::from(pixel.y - bounds.origin.y) - self.scroll_offset.y;
         Some(point(x, y))
     }
 
@@ -275,17 +279,15 @@ impl DashboardPanel {
     ) {
         let drag = event.drag(cx);
         let widget_id = drag.widget_id;
-        let grab_offset = drag.grab_offset_frac;
+        let grab_offset = drag.grab_offset;
 
-        let Some(frac) = self.pixel_to_frac(event.event.position) else {
+        let Some(pos) = self.pixel_to_canvas(event.event.position) else {
             return;
         };
 
         if let Some(w) = self.widgets.iter_mut().find(|w| w.id == widget_id) {
-            let new_x = frac.x - grab_offset.x;
-            let new_y = frac.y - grab_offset.y;
-            w.rect.x = snap_value(new_x).clamp(0.0, 1.0 - w.rect.w);
-            w.rect.y = snap_value(new_y).max(0.0);
+            w.rect.x = snap_px(pos.x - grab_offset.x).max(0.0);
+            w.rect.y = snap_px(pos.y - grab_offset.y).max(0.0);
             cx.notify();
         }
     }
@@ -301,51 +303,51 @@ impl DashboardPanel {
         let edge = drag.edge;
         let orig = drag.original_rect;
 
-        let Some(frac) = self.pixel_to_frac(event.event.position) else {
+        let Some(pos) = self.pixel_to_canvas(event.event.position) else {
             return;
         };
 
         if let Some(w) = self.widgets.iter_mut().find(|w| w.id == widget_id) {
-            let snapped = point(snap_value(frac.x), snap_value(frac.y));
+            let snapped = point(snap_px(pos.x), snap_px(pos.y));
             let right = orig.x + orig.w;
             let bottom = orig.y + orig.h;
 
             match edge {
                 ResizeEdge::Right => {
-                    w.rect.w = (snapped.x - orig.x).max(MIN_WIDGET_FRAC);
+                    w.rect.w = (snapped.x - orig.x).max(MIN_WIDGET_PX);
                 }
                 ResizeEdge::Bottom => {
-                    w.rect.h = (snapped.y - orig.y).max(MIN_WIDGET_FRAC);
+                    w.rect.h = (snapped.y - orig.y).max(MIN_WIDGET_PX);
                 }
                 ResizeEdge::Left => {
-                    let new_x = snapped.x.min(right - MIN_WIDGET_FRAC);
-                    w.rect.x = new_x.max(0.0);
+                    let new_x = snapped.x.min(right - MIN_WIDGET_PX).max(0.0);
+                    w.rect.x = new_x;
                     w.rect.w = right - w.rect.x;
                 }
                 ResizeEdge::Top => {
-                    let new_y = snapped.y.min(bottom - MIN_WIDGET_FRAC);
-                    w.rect.y = new_y.max(0.0);
+                    let new_y = snapped.y.min(bottom - MIN_WIDGET_PX).max(0.0);
+                    w.rect.y = new_y;
                     w.rect.h = bottom - w.rect.y;
                 }
                 ResizeEdge::BottomRight => {
-                    w.rect.w = (snapped.x - orig.x).max(MIN_WIDGET_FRAC);
-                    w.rect.h = (snapped.y - orig.y).max(MIN_WIDGET_FRAC);
+                    w.rect.w = (snapped.x - orig.x).max(MIN_WIDGET_PX);
+                    w.rect.h = (snapped.y - orig.y).max(MIN_WIDGET_PX);
                 }
                 ResizeEdge::BottomLeft => {
-                    let new_x = snapped.x.min(right - MIN_WIDGET_FRAC).max(0.0);
+                    let new_x = snapped.x.min(right - MIN_WIDGET_PX).max(0.0);
                     w.rect.x = new_x;
                     w.rect.w = right - w.rect.x;
-                    w.rect.h = (snapped.y - orig.y).max(MIN_WIDGET_FRAC);
+                    w.rect.h = (snapped.y - orig.y).max(MIN_WIDGET_PX);
                 }
                 ResizeEdge::TopRight => {
-                    w.rect.w = (snapped.x - orig.x).max(MIN_WIDGET_FRAC);
-                    let new_y = snapped.y.min(bottom - MIN_WIDGET_FRAC).max(0.0);
+                    w.rect.w = (snapped.x - orig.x).max(MIN_WIDGET_PX);
+                    let new_y = snapped.y.min(bottom - MIN_WIDGET_PX).max(0.0);
                     w.rect.y = new_y;
                     w.rect.h = bottom - w.rect.y;
                 }
                 ResizeEdge::TopLeft => {
-                    let new_x = snapped.x.min(right - MIN_WIDGET_FRAC).max(0.0);
-                    let new_y = snapped.y.min(bottom - MIN_WIDGET_FRAC).max(0.0);
+                    let new_x = snapped.x.min(right - MIN_WIDGET_PX).max(0.0);
+                    let new_y = snapped.y.min(bottom - MIN_WIDGET_PX).max(0.0);
                     w.rect.x = new_x;
                     w.rect.y = new_y;
                     w.rect.w = right - w.rect.x;
@@ -368,10 +370,10 @@ impl DashboardPanel {
         let mut container = div()
             .id(("dashboard-widget", widget.id.0 as usize))
             .absolute()
-            .top(relative(r.y))
-            .left(relative(r.x))
-            .w(relative(r.w))
-            .h(relative(r.h))
+            .top(px(r.y + self.scroll_offset.y))
+            .left(px(r.x + self.scroll_offset.x))
+            .w(px(r.w))
+            .h(px(r.h))
             .overflow_hidden()
             .border_1()
             .border_color(theme.border_primary)
@@ -422,23 +424,23 @@ impl DashboardPanel {
                         DraggedWidget {
                             widget_id,
                             dashboard: entity.clone(),
-                            grab_offset_frac: point(0.0, 0.0),
+                            grab_offset: point(0.0, 0.0),
                         },
                         {
                             let entity = entity.clone();
                             move |drag, _, window, cx| {
                                 let grab_offset = entity
                                     .read(cx)
-                                    .pixel_to_frac(window.mouse_position())
-                                    .map(|frac| {
-                                        point(frac.x - widget_rect.x, frac.y - widget_rect.y)
+                                    .pixel_to_canvas(window.mouse_position())
+                                    .map(|pos| {
+                                        point(pos.x - widget_rect.x, pos.y - widget_rect.y)
                                     })
                                     .unwrap_or(point(0.0, 0.0));
 
                                 cx.new(|_| DraggedWidget {
                                     widget_id: drag.widget_id,
                                     dashboard: drag.dashboard.clone(),
-                                    grab_offset_frac: grab_offset,
+                                    grab_offset: grab_offset,
                                 })
                             }
                         },
@@ -547,28 +549,33 @@ impl DashboardPanel {
         let theme = theme(cx);
         let grid_color = theme.border_primary.opacity(0.3);
         let bounds = self.container_bounds;
+        let offset = self.scroll_offset;
 
+        let grid_step = SNAP_GRID_PX;
         canvas(
             move |_, _, _| {},
             move |_, _, window, _| {
                 let Some(bounds) = bounds else { return };
                 let w = f32::from(bounds.size.width);
                 let h = f32::from(bounds.size.height);
-                let cols = 24;
-                let rows = (h / (w / cols as f32)).ceil() as u32;
 
-                for i in 1..cols {
-                    let x = bounds.origin.x + px(w * i as f32 / cols as f32);
-                    let origin = point(x, bounds.origin.y);
+                // Offset grid lines by scroll so they pan with content
+                let start_x = offset.x.rem_euclid(grid_step);
+                let mut x_off = start_x;
+                while x_off < w {
+                    let origin = point(bounds.origin.x + px(x_off), bounds.origin.y);
                     let sz = size(px(1.0), bounds.size.height);
                     window.paint_quad(fill(Bounds { origin, size: sz }, grid_color));
+                    x_off += grid_step;
                 }
 
-                for i in 1..rows {
-                    let y = bounds.origin.y + px(h * i as f32 / rows as f32);
-                    let origin = point(bounds.origin.x, y);
+                let start_y = offset.y.rem_euclid(grid_step);
+                let mut y_off = start_y;
+                while y_off < h {
+                    let origin = point(bounds.origin.x, bounds.origin.y + px(y_off));
                     let sz = size(bounds.size.width, px(1.0));
                     window.paint_quad(fill(Bounds { origin, size: sz }, grid_color));
+                    y_off += grid_step;
                 }
             },
         )
@@ -997,6 +1004,7 @@ impl Render for DashboardPanel {
             .id("dashboard-canvas")
             .relative()
             .size_full()
+            .overflow_hidden()
             .bg(theme.bg_secondary)
             .child(bounds_tracker);
 
@@ -1015,6 +1023,20 @@ impl Render for DashboardPanel {
         canvas_div = canvas_div
             .on_drag_move(cx.listener(Self::handle_widget_drag_move))
             .on_drag_move(cx.listener(Self::handle_widget_resize_move));
+
+        // Scroll wheel pans the viewport. Child widgets that handle scroll
+        // themselves (e.g. plot zoom) should call cx.stop_propagation() to
+        // prevent this handler from also firing.
+        canvas_div = canvas_div.on_scroll_wheel(cx.listener(
+            |this, event: &gpui::ScrollWheelEvent, _window, cx| {
+                let delta = event.delta.pixel_delta(px(20.0));
+                this.scroll_offset.x += f32::from(delta.x);
+                this.scroll_offset.y += f32::from(delta.y);
+                this.scroll_offset.x = this.scroll_offset.x.min(0.0);
+                this.scroll_offset.y = this.scroll_offset.y.min(0.0);
+                cx.notify();
+            },
+        ));
 
         // Click on empty canvas space deselects.
         // Uses on_click (requires .id()) which only fires when this element
@@ -1134,5 +1156,6 @@ pub fn deserialize_dashboard(
         editing: false,
         selected: None,
         container_bounds: None,
+        scroll_offset: point(0.0, 0.0),
     })
 }

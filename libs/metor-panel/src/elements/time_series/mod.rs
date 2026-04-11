@@ -1570,6 +1570,7 @@ impl Render for TimeSeriesPlot {
                                 AxisZone::XAxis => view.zoom_x(factor, ax),
                                 AxisZone::YAxis => view.zoom_y(factor, 1.0 - ay),
                             });
+                            cx.stop_propagation();
                             cx.notify();
                         },
                     ))
