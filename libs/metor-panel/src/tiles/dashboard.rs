@@ -13,7 +13,7 @@ use smallvec::SmallVec;
 
 use crate::command_palette::{PaletteAction, PaletteItem, PalettePage};
 use crate::elements::time_series::OpenPageCallback;
-use crate::elements::{ComponentText, TimeSeriesPlot, new_component_table};
+use crate::elements::{ComponentText, Monitor, TimeSeriesPlot, new_component_table};
 use crate::inspectable::palette_page_for_inspectable;
 use crate::theme::theme;
 
@@ -54,6 +54,7 @@ pub enum WidgetKind {
     Text,
     Table,
     Image,
+    Monitor,
 }
 
 impl WidgetKind {
@@ -63,6 +64,7 @@ impl WidgetKind {
             WidgetKind::Text => (0.15, 0.08),
             WidgetKind::Table => (0.4, 0.4),
             WidgetKind::Image => (0.3, 0.3),
+            WidgetKind::Monitor => (0.12, 0.1),
         }
     }
 }
@@ -713,6 +715,16 @@ fn add_widget_page(dashboard: Entity<DashboardPanel>, db: Arc<DB>) -> PalettePag
                 });
             }))
         }),
+        PaletteItem::new("Monitor", {
+            let dashboard = dashboard.clone();
+            let db = db.clone();
+            PaletteAction::NextPage {
+                label: Some("Monitor".into()),
+                page: Box::new(move || {
+                    component_picker_for_widget(dashboard, db, WidgetKind::Monitor)
+                }),
+            }
+        }),
         PaletteItem::new("Image", {
             let dashboard = dashboard.clone();
             PaletteAction::NextPage {
@@ -768,16 +780,16 @@ fn image_path_page(dashboard: Entity<DashboardPanel>) -> PalettePage {
 }
 
 fn widget_display_label(widget: &DashboardWidget) -> SharedString {
+    let component_label = || {
+        widget
+            .config
+            .get("component")
+            .and_then(|v| v.as_str())
+            .unwrap_or("?")
+    };
     match widget.kind {
         WidgetKind::Plot => SharedString::from(format!("Plot #{}", widget.id.0)),
-        WidgetKind::Text => SharedString::from(format!(
-            "Text: {}",
-            widget
-                .config
-                .get("component")
-                .and_then(|v| v.as_str())
-                .unwrap_or("?")
-        )),
+        WidgetKind::Text => SharedString::from(format!("Text: {}", component_label())),
         WidgetKind::Table => SharedString::from(format!("Table #{}", widget.id.0)),
         WidgetKind::Image => SharedString::from(format!(
             "Image: {}",
@@ -787,6 +799,7 @@ fn widget_display_label(widget: &DashboardWidget) -> SharedString {
                 .and_then(|v| v.as_str())
                 .unwrap_or("?")
         )),
+        WidgetKind::Monitor => SharedString::from(format!("Monitor: {}", component_label())),
     }
 }
 
@@ -850,6 +863,35 @@ fn create_widget_view(
                 .to_string();
             let entity = cx.new(|_cx| ImageWidget::load(path));
             (AnyView::from(entity), None)
+        }
+        WidgetKind::Monitor => {
+            let component_name = config
+                .get("component")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            let component_id = db.with_state(|state| {
+                state
+                    .component_metadata_iter()
+                    .find(|(_, meta)| meta.name == component_name)
+                    .map(|(id, _)| *id)
+            });
+            if let Some(id) = component_id {
+                let entity = cx.new(|cx| Monitor::new(db.clone(), id, cx));
+                let inspect_entity = entity.clone();
+                let inspect_fn: WidgetInspectFn = Box::new(move |db, cx| {
+                    Some(palette_page_for_inspectable(
+                        inspect_entity.clone(),
+                        Some(db.clone()),
+                        cx,
+                    ))
+                });
+                (AnyView::from(entity), Some(inspect_fn))
+            } else {
+                let entity = cx.new(|_cx| PlaceholderWidget {
+                    label: SharedString::from(format!("? {}", component_name)),
+                });
+                (AnyView::from(entity), None)
+            }
         }
     }
 }

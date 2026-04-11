@@ -11,6 +11,7 @@ use crate::theme::theme;
 use crate::{AsComponentView, ComponentStream, ComponentStreamBuilder};
 
 pub mod component_table;
+pub mod monitor;
 pub mod table;
 pub mod time_series;
 
@@ -18,6 +19,7 @@ pub mod time_series;
 pub type ElementIndexes = SmallVec<[usize; 8]>;
 
 pub use component_table::{ComponentTable, new_component_table};
+pub use monitor::Monitor;
 pub use table::{Column, ColumnSort, Table, TableDelegate};
 pub use time_series::{OpenPageCallback, PlotStyle, TimeSeriesPlot, Trace};
 
