@@ -1,9 +1,11 @@
 use std::ops::Range;
 
 use gpui::{
-    AnyElement, App, Bounds, Context, DragMoveEvent, Empty, IntoElement, Pixels, Render,
-    SharedString, Window, div, prelude::*, px, uniform_list,
+    AnyElement, App, Axis, Bounds, Context, DragMoveEvent, Empty, IntoElement, Pixels, Render,
+    SharedString, UniformListScrollHandle, Window, div, prelude::*, px, uniform_list,
 };
+
+use super::Scrollbar;
 
 use crate::icons::Icon;
 use crate::theme::theme;
@@ -115,6 +117,7 @@ impl Render for ResizeDrag {
 pub struct Table<D: TableDelegate> {
     delegate: D,
     col_states: Vec<ColState>,
+    scroll_handle: UniformListScrollHandle,
 }
 
 impl<D: TableDelegate> Table<D> {
@@ -131,6 +134,7 @@ impl<D: TableDelegate> Table<D> {
         Self {
             delegate,
             col_states,
+            scroll_handle: UniformListScrollHandle::new(),
         }
     }
 
@@ -317,10 +321,14 @@ impl<D: TableDelegate> Render for Table<D> {
         let col_flex: Vec<bool> = columns.iter().map(|c| c.flex).collect();
 
         let border_color = theme.border_primary;
+        let scroll_handle = self.scroll_handle.clone();
+        let scrollbar_handle = self.scroll_handle.clone();
+
         div()
             .flex()
             .flex_col()
             .size_full()
+            .relative()
             .bg(theme.bg_primary)
             .on_scroll_wheel(|_, _, cx| cx.stop_propagation())
             .child(header)
@@ -365,7 +373,28 @@ impl<D: TableDelegate> Render for Table<D> {
                         },
                     ),
                 )
+                .track_scroll(scroll_handle)
                 .flex_1(),
             )
+            .child({
+                let state = scrollbar_handle.0.borrow();
+                let offset = state.base_handle.offset();
+                let max_off = state.base_handle.max_offset();
+                let max_y = f32::from(max_off.height);
+                let scroll_y = f32::from(-offset.y).clamp(0.0, max_y);
+                let vp = f32::from(state.base_handle.bounds().size.height);
+                let vp = if vp > 0.0 {
+                    vp
+                } else {
+                    row_count as f32 * f32::from(row_height)
+                };
+                div()
+                    .absolute()
+                    .top(px(HEADER_HEIGHT))
+                    .right_0()
+                    .bottom_0()
+                    .left_0()
+                    .child(Scrollbar::new(Axis::Vertical, vp, vp + max_y, scroll_y))
+            })
     }
 }

@@ -13,7 +13,7 @@ use smallvec::SmallVec;
 
 use crate::command_palette::{PaletteAction, PaletteItem, PalettePage};
 use crate::elements::time_series::OpenPageCallback;
-use crate::elements::{ComponentText, Monitor, TimeSeriesPlot, new_component_table};
+use crate::elements::{ComponentText, Monitor, Scrollbar, TimeSeriesPlot, new_component_table};
 use crate::inspectable::palette_page_for_inspectable;
 use crate::theme::theme;
 
@@ -259,6 +259,38 @@ impl DashboardPanel {
                     self.widget_inspect_fns.insert(widget.id, f);
                 }
             }
+        }
+    }
+
+    /// The furthest right and bottom edges of any widget.
+    fn content_extent(&self) -> Point<f32> {
+        let max_x = self
+            .widgets
+            .iter()
+            .map(|w| w.rect.x + w.rect.w)
+            .fold(0.0_f32, f32::max);
+        let max_y = self
+            .widgets
+            .iter()
+            .map(|w| w.rect.y + w.rect.h)
+            .fold(0.0_f32, f32::max);
+        point(max_x, max_y)
+    }
+
+    /// Clamp scroll offset so the viewport doesn't scroll past content bounds.
+    fn clamp_scroll(&mut self) {
+        let extent = self.content_extent();
+        if let Some(bounds) = self.container_bounds {
+            let vw = f32::from(bounds.size.width);
+            let vh = f32::from(bounds.size.height);
+            // scroll_offset is negative (scroll down = more negative)
+            let min_x = -(extent.x - vw).max(0.0);
+            let min_y = -(extent.y - vh).max(0.0);
+            self.scroll_offset.x = self.scroll_offset.x.clamp(min_x, 0.0);
+            self.scroll_offset.y = self.scroll_offset.y.clamp(min_y, 0.0);
+        } else {
+            self.scroll_offset.x = self.scroll_offset.x.min(0.0);
+            self.scroll_offset.y = self.scroll_offset.y.min(0.0);
         }
     }
 
@@ -1032,8 +1064,7 @@ impl Render for DashboardPanel {
                 let delta = event.delta.pixel_delta(px(20.0));
                 this.scroll_offset.x += f32::from(delta.x);
                 this.scroll_offset.y += f32::from(delta.y);
-                this.scroll_offset.x = this.scroll_offset.x.min(0.0);
-                this.scroll_offset.y = this.scroll_offset.y.min(0.0);
+                this.clamp_scroll();
                 cx.notify();
             },
         ));
@@ -1082,6 +1113,27 @@ impl Render for DashboardPanel {
                     .text_size(px(14.0))
                     .child("Open command palette to add widgets"),
             );
+        }
+
+        // Scrollbars
+        if let Some(bounds) = self.container_bounds {
+            let extent = self.content_extent();
+            let vw = f32::from(bounds.size.width);
+            let vh = f32::from(bounds.size.height);
+
+            canvas_div = canvas_div
+                .child(Scrollbar::new(
+                    gpui::Axis::Vertical,
+                    vh,
+                    extent.y,
+                    -self.scroll_offset.y,
+                ))
+                .child(Scrollbar::new(
+                    gpui::Axis::Horizontal,
+                    vw,
+                    extent.x,
+                    -self.scroll_offset.x,
+                ));
         }
 
         canvas_div
