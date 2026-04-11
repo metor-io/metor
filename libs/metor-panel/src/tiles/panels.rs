@@ -10,6 +10,7 @@ use crate::elements::{ComponentTable, ComponentText, TimeSeriesPlot, new_compone
 use crate::inspectable::{
     FieldId, InspectionValue, palette_page_for_field, palette_page_for_inspectable,
 };
+use super::dashboard::DashboardPanel;
 
 use super::item::{PaneItem, PaneItemHandle};
 use super::pane::Pane;
@@ -319,6 +320,25 @@ fn new_panel_page(
                     let item: Box<dyn PaneItemHandle> =
                         Box::new(cx.new(|cx| TablePanel::new(db, cx)));
                     pane.add_item(item, cx);
+                });
+            }))
+        }),
+        PaletteItem::new("Dashboard", {
+            let db = db.clone();
+            let pane = pane.clone();
+            let on_inspect = on_inspect.clone();
+            PaletteAction::Execute(Box::new(move |_filter, _window, cx| {
+                let db = db.clone();
+                let on_inspect = on_inspect.clone();
+                pane.update(cx, |pane, cx| {
+                    let dashboard = cx.new(|cx| {
+                        let mut d = DashboardPanel::new(db, cx);
+                        let cb: crate::elements::time_series::OpenPageCallback =
+                            Arc::new(move |page, window, cx| on_inspect(page, window, cx));
+                        d.set_on_open_page(cb);
+                        d
+                    });
+                    pane.add_item(Box::new(dashboard), cx);
                 });
             }))
         }),
