@@ -37,6 +37,18 @@ pub struct ListItem {
     pub fields: Vec<InspectionField>,
 }
 
+/// What kind of value an [`InspectionValue::ElementPicker`] component is
+/// expected to produce. The picker UI uses this to label its prompt; the
+/// downstream consumer uses it to choose the correct fixed-frame
+/// conversion (see `viewer_3d::picker`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PickerArity {
+    /// A 3-element position component (`[x, y, z]` in metor-panel frame).
+    Vec3,
+    /// A 4-element quaternion (`[i, j, k, w]` in metor-panel frame).
+    Quat,
+}
+
 /// The current value of an inspectable field.
 #[derive(Clone, Debug)]
 pub enum InspectionValue {
@@ -56,6 +68,14 @@ pub enum InspectionValue {
     /// A list of named sub-items, each with its own fields.
     /// Field IDs for sub-fields encode `item_index * 100 + sub_field_id`.
     List(Vec<ListItem>),
+    /// Bind to a component whose layout matches a fixed
+    /// metor-panel-frame `Vec3` (position) or `Quat` (attitude). `None`
+    /// means the binding has not yet been configured. The frame swizzle
+    /// from metor-panel to Bevy is applied by the downstream consumer.
+    ElementPicker {
+        component: Option<ComponentId>,
+        arity: PickerArity,
+    },
 }
 
 impl InspectionValue {
@@ -77,6 +97,7 @@ impl InspectionValue {
             }
             InspectionValue::Traces(_) => None, // traces are edited via the picker, not parsed
             InspectionValue::List(_) => None,   // lists are navigated, not parsed
+            InspectionValue::ElementPicker { .. } => None, // same — always picker-driven
         }
     }
 }
@@ -120,6 +141,10 @@ impl std::fmt::Display for InspectionValue {
             InspectionValue::List(items) => {
                 write!(f, "{} items", items.len())
             }
+            InspectionValue::ElementPicker { component, .. } => match component {
+                Some(_) => write!(f, "(bound)"),
+                None => write!(f, "(none)"),
+            },
         }
     }
 }
@@ -221,6 +246,17 @@ pub fn palette_page_for_field<T: Inspectable>(
     if let InspectionValue::Traces(ref existing) = current_value {
         if let Some(db) = db {
             return crate::trace_picker::trace_picker_page(entity, field_id, db, existing);
+        }
+    }
+
+    // For ElementPicker fields, use the fixed-arity element picker.
+    if let InspectionValue::ElementPicker {
+        component: _,
+        arity,
+    } = current_value
+    {
+        if let Some(db) = db {
+            return crate::trace_picker::element_picker_page(entity, field_id, db, arity);
         }
     }
 

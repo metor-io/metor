@@ -15,13 +15,21 @@ use metor_panel::elements::viewer_3d::Viewer3d;
 use metor_panel::theme::{ActiveTheme, DARK};
 
 struct Root {
-    viewer: Entity<Viewer3d>,
+    left: Entity<Viewer3d>,
+    right: Entity<Viewer3d>,
 }
 
 impl Root {
     fn new(cx: &mut Context<Self>) -> Self {
-        let viewer = cx.new(Viewer3d::new);
-        Self { viewer }
+        let left = cx.new(Viewer3d::new);
+        let right = cx.new(Viewer3d::new);
+        // Optional: set METOR_VIEWER3D_GLB=<path> to load a GLTF file into
+        // the left viewer. The right viewer keeps showing the default cube,
+        // which helps verify render-layer isolation.
+        if let Ok(path) = std::env::var("METOR_VIEWER3D_GLB") {
+            left.read(cx).load_gltf(path);
+        }
+        Self { left, right }
     }
 }
 
@@ -34,7 +42,11 @@ impl Render for Root {
         div()
             .size_full()
             .bg(gpui::rgb(0x0a0a10))
-            .child(self.viewer.clone())
+            .flex()
+            .flex_row()
+            .child(div().flex_1().child(self.left.clone()))
+            .child(div().w(px(1.0)).bg(gpui::rgb(0x1a1a24)))
+            .child(div().flex_1().child(self.right.clone()))
     }
 }
 

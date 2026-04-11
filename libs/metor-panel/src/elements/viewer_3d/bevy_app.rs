@@ -11,8 +11,10 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use bevy::app::ScheduleRunnerPlugin;
-use bevy::asset::RenderAssetUsages;
+use bevy::asset::{AssetPlugin, AssetServer, RenderAssetUsages, UnapprovedPathMode};
 use bevy::camera::RenderTarget;
+use bevy::camera::visibility::RenderLayers;
+use bevy::gltf::GltfAssetLabel;
 use bevy::image::Image;
 use bevy::prelude::*;
 use bevy::render::RenderPlugin;
@@ -23,11 +25,12 @@ use bevy::render::renderer::{
 };
 use bevy::render::settings::{RenderCreation, RenderResources};
 use bevy::window::{ExitCondition, WindowPlugin};
+use bevy::world_serialization::WorldAssetRoot;
 use crossbeam_channel::Receiver;
 
 use crate::gpu_context::GpuContext;
 
-use super::bridge::{FrameRouter, ViewerCommand, ViewerFrame, ViewerId};
+use super::bridge::{BaseTransform, FrameRouter, ViewerCommand, ViewerFrame, ViewerId};
 
 /// Bevy thread entry point. Builds the App, wires the command/frame channels
 /// into ECS resources, and enters `ScheduleRunnerPlugin`'s loop via `run()`.
@@ -59,6 +62,14 @@ pub(super) fn run(command_rx: Receiver<ViewerCommand>, frame_router: FrameRouter
                 primary_window: None,
                 exit_condition: ExitCondition::DontExit,
                 ..default()
+            })
+            // Allow arbitrary file paths so `LoadModel` can point at any GLB
+            // the user opens from the inspector. The viewer is a local dev
+            // tool, not a sandbox for untrusted assets, so the default
+            // `Forbid` mode is too restrictive.
+            .set(AssetPlugin {
+                unapproved_path_mode: UnapprovedPathMode::Allow,
+                ..default()
             }),
     );
     app.add_plugins(ScheduleRunnerPlugin::run_loop(Duration::from_secs_f64(
@@ -69,8 +80,10 @@ pub(super) fn run(command_rx: Receiver<ViewerCommand>, frame_router: FrameRouter
     app.insert_resource(Router(frame_router));
     app.init_resource::<ViewerRegistry>();
 
-    app.add_systems(Startup, setup_shared_scene);
-    app.add_systems(Update, apply_commands);
+    app.add_systems(
+        Update,
+        (apply_commands, compose_transforms, propagate_render_layers).chain(),
+    );
     app.add_observer(on_readback_complete);
 
     app.run();
@@ -93,6 +106,7 @@ struct ViewerRegistry {
 struct ViewerRecord {
     camera: Entity,
     model: Entity,
+    light: Entity,
     render_target: Handle<Image>,
     readback: Entity,
     width: u32,
@@ -104,23 +118,104 @@ struct ViewerRecord {
 #[derive(Component, Clone, Copy)]
 struct ViewerTag(ViewerId);
 
-/// One-time setup: directional light shared by every viewer. Per-viewer
-/// RenderLayer isolation comes in a later phase; for now every viewer sees
-/// the same light and (until models are added) the same test cube.
-fn setup_shared_scene(mut commands: Commands) {
-    commands.spawn((
-        DirectionalLight {
-            illuminance: 10_000.0,
-            ..default()
-        },
-        Transform::from_xyz(4.0, 8.0, 4.0).looking_at(Vec3::ZERO, Vec3::Y),
-    ));
+/// Marker for an entity whose children should inherit its [`RenderLayers`].
+/// Bevy doesn't propagate `RenderLayers` through the hierarchy, so when a
+/// GLTF scene is spawned under a tagged root the child mesh entities would
+/// otherwise default to layer 0 and be invisible to every per-viewer camera.
+#[derive(Component)]
+struct PropagateRenderLayers;
+
+/// The user-editable base TRS applied to a model's root. Lives as a
+/// separate component so the binding systems can compose live
+/// position/orientation on top without losing the user's frame correction.
+#[derive(Component, Clone, Copy)]
+struct ModelBase(BaseTransform);
+
+impl ModelBase {
+    fn to_transform(self) -> Transform {
+        let e = self.0.rotation_euler;
+        Transform {
+            translation: Vec3::new(self.0.translation.x, self.0.translation.y, self.0.translation.z),
+            rotation: Quat::from_euler(EulerRot::XYZ, e.x, e.y, e.z),
+            scale: Vec3::new(self.0.scale.x, self.0.scale.y, self.0.scale.z),
+        }
+    }
+}
+
+/// Live-binding delta from a component stream, composed on top of
+/// [`ModelBase`] each frame by [`compose_transforms`].
+#[derive(Component, Default, Clone, Copy)]
+struct LiveDelta {
+    translation: Option<Vec3>,
+    rotation: Option<Quat>,
+}
+
+/// Map a [`ViewerId`] to its dedicated [`RenderLayers`] slot. Viewers start
+/// at id 1, so layer 0 is intentionally unused (it's the default layer for
+/// any untagged entity, which we don't want any viewer's camera to see).
+fn viewer_layer(id: ViewerId) -> RenderLayers {
+    RenderLayers::from_layers(&[id.0 as usize])
+}
+
+/// Combine each model's base transform with its live binding delta and
+/// write the result into its [`Transform`]. Runs every frame — the cost is
+/// one component-query per model, negligible at the scales this viewer
+/// targets.
+fn compose_transforms(
+    mut q: Query<(&ModelBase, Option<&LiveDelta>, &mut Transform)>,
+) {
+    for (base, delta, mut transform) in &mut q {
+        let mut out = base.to_transform();
+        if let Some(d) = delta {
+            if let Some(t) = d.translation {
+                out.translation += t;
+            }
+            if let Some(r) = d.rotation {
+                out.rotation = r * out.rotation;
+            }
+        }
+        *transform = out;
+    }
+}
+
+/// Walk the descendants of every `PropagateRenderLayers` root and insert the
+/// root's layers on any descendant that lacks its own. Runs every frame in
+/// `Update`, which handles the asynchronous nature of GLTF scene loading —
+/// newly-spawned child entities get their layers the frame after they appear.
+fn propagate_render_layers(
+    mut commands: Commands,
+    roots: Query<(Entity, &RenderLayers), With<PropagateRenderLayers>>,
+    children_q: Query<&Children>,
+    existing: Query<(), With<RenderLayers>>,
+) {
+    for (root, layers) in &roots {
+        propagate_layers_recursive(root, layers, &children_q, &existing, &mut commands);
+    }
+}
+
+fn propagate_layers_recursive(
+    entity: Entity,
+    layers: &RenderLayers,
+    children_q: &Query<&Children>,
+    existing: &Query<(), With<RenderLayers>>,
+    commands: &mut Commands,
+) {
+    let Ok(children) = children_q.get(entity) else {
+        return;
+    };
+    for child in children.iter() {
+        if existing.get(child).is_err() {
+            commands.entity(child).insert(layers.clone());
+        }
+        propagate_layers_recursive(child, layers, children_q, existing, commands);
+    }
 }
 
 /// Drain pending commands from GPUI and apply them to the world.
 fn apply_commands(
     command_rx: Res<CommandRx>,
     mut commands: Commands,
+    asset_server: Res<AssetServer>,
     mut images: ResMut<Assets<Image>>,
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<StandardMaterial>>,
@@ -148,6 +243,7 @@ fn apply_commands(
                 if let Some(record) = registry.viewers.remove(&id) {
                     commands.entity(record.camera).despawn();
                     commands.entity(record.model).despawn();
+                    commands.entity(record.light).despawn();
                     commands.entity(record.readback).despawn();
                     images.remove(&record.render_target);
                     crate::elements::viewer_3d::bridge::BevyBridge::drop_router_entry(
@@ -201,6 +297,59 @@ fn apply_commands(
                         }));
                 }
             }
+            ViewerCommand::LoadModel {
+                id,
+                path,
+                base_transform,
+            } => {
+                if let Some(record) = registry.viewers.get_mut(&id) {
+                    // Replace the current model with a fresh WorldAssetRoot
+                    // pointing at the requested GLB/GLTF. The propagation
+                    // system will fill in RenderLayers on the scene's
+                    // children as they spawn.
+                    commands.entity(record.model).despawn();
+                    let path_str = path.to_string_lossy().into_owned();
+                    let handle = asset_server
+                        .load(GltfAssetLabel::Scene(0).from_asset(path_str));
+                    let layers = viewer_layer(id);
+                    let base = ModelBase(base_transform);
+                    let new_model = commands
+                        .spawn((
+                            WorldAssetRoot(handle),
+                            base.to_transform(),
+                            base,
+                            LiveDelta::default(),
+                            layers,
+                            PropagateRenderLayers,
+                            ViewerTag(id),
+                        ))
+                        .id();
+                    record.model = new_model;
+                }
+            }
+            ViewerCommand::SetBaseTransform {
+                id,
+                base_transform,
+            } => {
+                if let Some(record) = registry.viewers.get(&id) {
+                    let base = ModelBase(base_transform);
+                    commands.entity(record.model).insert(base);
+                }
+            }
+            ViewerCommand::SetLiveTransform {
+                id,
+                translation,
+                rotation,
+            } => {
+                if let Some(record) = registry.viewers.get(&id) {
+                    let translation = translation.map(|v| Vec3::new(v.x, v.y, v.z));
+                    let rotation = rotation.map(|q| Quat::from_xyzw(q.x, q.y, q.z, q.w));
+                    commands.entity(record.model).insert(LiveDelta {
+                        translation,
+                        rotation,
+                    });
+                }
+            }
         }
     }
 }
@@ -227,9 +376,11 @@ fn spawn_viewer(
 ) -> ViewerRecord {
     let target_image = new_target_image(width, height);
     let render_target = images.add(target_image);
+    let layers = viewer_layer(id);
 
-    // Test content: a single unlit-ish cube. Phase 8 replaces this with a
-    // GLTF load.
+    // Default placeholder content: a single blue cube. A `LoadModel` command
+    // replaces this with a GLTF scene.
+    let base = ModelBase(BaseTransform::default());
     let model = commands
         .spawn((
             Mesh3d(meshes.add(Cuboid::new(1.0, 1.0, 1.0))),
@@ -238,7 +389,23 @@ fn spawn_viewer(
                 perceptual_roughness: 0.4,
                 ..default()
             })),
-            Transform::from_xyz(0.0, 0.0, 0.0),
+            base.to_transform(),
+            base,
+            LiveDelta::default(),
+            layers.clone(),
+            PropagateRenderLayers,
+            ViewerTag(id),
+        ))
+        .id();
+
+    let light = commands
+        .spawn((
+            DirectionalLight {
+                illuminance: 10_000.0,
+                ..default()
+            },
+            Transform::from_xyz(4.0, 8.0, 4.0).looking_at(Vec3::ZERO, Vec3::Y),
+            layers.clone(),
             ViewerTag(id),
         ))
         .id();
@@ -256,6 +423,7 @@ fn spawn_viewer(
                 ..default()
             }),
             Transform::from_xyz(3.0, 2.0, 3.0).looking_at(Vec3::ZERO, Vec3::Y),
+            layers.clone(),
             ViewerTag(id),
         ))
         .id();
@@ -267,6 +435,7 @@ fn spawn_viewer(
     ViewerRecord {
         camera,
         model,
+        light,
         render_target,
         readback,
         width,

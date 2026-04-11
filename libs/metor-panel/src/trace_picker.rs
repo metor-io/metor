@@ -5,7 +5,7 @@ use metor_db::DB;
 use metor_proto::types::ComponentId;
 
 use crate::command_palette::{PaletteAction, PaletteItem, PalettePage};
-use crate::inspectable::{list_components, FieldId, Inspectable, InspectionValue};
+use crate::inspectable::{list_components, FieldId, Inspectable, InspectionValue, PickerArity};
 
 /// A pending trace selection: display label, component id, element index.
 type TraceSelection = (String, ComponentId, usize);
@@ -216,4 +216,39 @@ impl<T: Inspectable> TracePickerCtx<T> {
             .label(component_name)
             .prompt("Select element...")
     }
+}
+
+/// Build a picker for an [`InspectionValue::ElementPicker`] field. The user
+/// just picks a component — the field's `arity` decides whether the
+/// component is interpreted as a `Vec3` or `Quat`, and the fixed
+/// metor-panel-frame layout convention determines element ordering.
+pub(crate) fn element_picker_page<T: Inspectable>(
+    entity: Entity<T>,
+    field_id: FieldId,
+    db: Arc<DB>,
+    arity: PickerArity,
+) -> PalettePage {
+    let items: Vec<PaletteItem> = list_components(&db)
+        .into_iter()
+        .map(|(id, name)| {
+            let entity = entity.clone();
+            PaletteItem::new(
+                name,
+                PaletteAction::Execute(Box::new(move |_input, _window, cx| {
+                    let value = InspectionValue::ElementPicker {
+                        component: Some(id),
+                        arity,
+                    };
+                    entity.update(cx, |this, cx| {
+                        this.set_field(field_id, value, cx);
+                    });
+                })),
+            )
+        })
+        .collect();
+
+    PalettePage::new(items).prompt(match arity {
+        PickerArity::Vec3 => "Select a position component...",
+        PickerArity::Quat => "Select an attitude component...",
+    })
 }

@@ -164,18 +164,20 @@ impl PaneItem for PlotPanel {
     }
 }
 
-/// Tile panel wrapping a [`Viewer3d`]. Inspector support and model
-/// configuration come in later phases.
+/// Tile panel wrapping a [`Viewer3d`] with inspector support.
 pub struct Viewer3dPanel {
     inner: Entity<Viewer3d>,
+    db: Arc<DB>,
     label: SharedString,
 }
 
 impl Viewer3dPanel {
-    pub fn new(cx: &mut Context<Self>) -> Self {
-        let inner = cx.new(|cx| Viewer3d::new(cx));
+    pub fn new(db: Arc<DB>, cx: &mut Context<Self>) -> Self {
+        let db_clone = db.clone();
+        let inner = cx.new(|cx| Viewer3d::with_db(db_clone, cx));
         Self {
             inner,
+            db,
             label: "3D Viewer".into(),
         }
     }
@@ -196,8 +198,35 @@ impl PaneItem for Viewer3dPanel {
         "viewer_3d"
     }
 
-    fn serialize(&self, _cx: &App) -> serde_json::Value {
-        serde_json::json!({})
+    fn serialize(&self, cx: &App) -> serde_json::Value {
+        let inner = self.inner.read(cx);
+        let cam = inner.camera();
+        let base = inner.base_transform();
+        serde_json::json!({
+            "model_path": inner.model_path(),
+            "base_transform": {
+                "translation": [base.translation.x, base.translation.y, base.translation.z],
+                "rotation_euler": [base.rotation_euler.x, base.rotation_euler.y, base.rotation_euler.z],
+                "scale": [base.scale.x, base.scale.y, base.scale.z],
+            },
+            "camera": {
+                "target": [cam.target.x, cam.target.y, cam.target.z],
+                "yaw": cam.yaw,
+                "pitch": cam.pitch,
+                "distance": cam.distance,
+                "fov_y_rad": cam.fov_y_rad,
+            },
+            "position_binding": inner.position_binding_serialized(),
+            "orientation_binding": inner.orientation_binding_serialized(),
+        })
+    }
+
+    fn inspect_page(&self, _db: Option<Arc<DB>>, cx: &App) -> Option<PalettePage> {
+        Some(palette_page_for_inspectable(
+            self.inner.clone(),
+            Some(self.db.clone()),
+            cx,
+        ))
     }
 }
 
@@ -362,11 +391,13 @@ fn new_panel_page(
             }))
         }),
         PaletteItem::new("3D Viewer", {
+            let db = db.clone();
             let pane = pane.clone();
             PaletteAction::Execute(Box::new(move |_filter, _window, cx| {
+                let db = db.clone();
                 pane.update(cx, |pane, cx| {
                     let item: Box<dyn PaneItemHandle> =
-                        Box::new(cx.new(|cx| Viewer3dPanel::new(cx)));
+                        Box::new(cx.new(|cx| Viewer3dPanel::new(db, cx)));
                     pane.add_item(item, cx);
                 });
             }))

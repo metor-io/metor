@@ -58,6 +58,11 @@ bevy = { git = "https://github.com/bevyengine/bevy", rev = "5330b01ed6dfe8ee9ea9
     "multi_threaded",
     "async_executor",
     "bevy_log",
+    # Auto-register every `#[derive(Reflect)]` type with the AppTypeRegistry
+    # at startup. Required by `bevy_world_serialization` (which backs the
+    # GLTF loader's WorldAssetRoot path) — without this it panics on the
+    # first unregistered component it encounters in a loaded scene.
+    "reflect_auto_register",
 ] }
 
 [[example]]
