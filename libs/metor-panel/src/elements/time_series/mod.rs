@@ -614,14 +614,15 @@ impl TimeSeriesPlot {
         // Track insertion order so the title is deterministic.
         let mut order: Vec<ComponentId> = Vec::new();
         for trace in self.line_plot.read(cx).traces() {
-            let id = trace.component_id;
+            let t = trace.read(cx);
+            let id = t.component_id;
             groups
                 .entry(id)
                 .or_insert_with(|| {
                     order.push(id);
                     Vec::new()
                 })
-                .push(trace.element_index);
+                .push(t.element_index);
         }
 
         if order.is_empty() {
@@ -658,7 +659,7 @@ impl TimeSeriesPlot {
     /// Used by drag/zoom handlers and by `Viewer3dPanel::serialize`
     /// downstream.
     pub fn view(&self, cx: &gpui::App) -> Option<PlotBounds> {
-        self.line_plot.read(cx).effective_view()
+        self.line_plot.read(cx).effective_view(cx)
     }
 
     /// Reset all view overrides so the plot snaps back to auto-fit.
@@ -674,12 +675,13 @@ impl TimeSeriesPlot {
     }
 
     pub(crate) fn trace_fields(&self, trace_idx: usize, cx: &gpui::App) -> Vec<InspectionField> {
-        let trace = self
+        let trace_entity = self
             .line_plot
             .read(cx)
             .trace(trace_idx)
             .cloned()
             .expect("trace_fields called with an invalid index");
+        let trace = trace_entity.read(cx);
         let base = TRACE_SETTINGS_BASE + trace_idx as u32 * 100;
         vec![
             InspectionField::new(
@@ -723,7 +725,7 @@ impl TimeSeriesPlot {
             .line_plot
             .read(cx)
             .trace(trace_idx)
-            .map(|t| t.label.clone())
+            .map(|t| t.read(cx).label.clone())
             .unwrap_or_default();
         let fields = self.trace_fields(trace_idx, cx);
         palette_page_for_list_item(cx.entity().clone(), &fields, label, None)
@@ -733,8 +735,13 @@ impl TimeSeriesPlot {
 impl Render for TimeSeriesPlot {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = crate::theme::theme(cx);
-        let trace_configs: Vec<Trace> = self.line_plot.read(cx).traces().cloned().collect();
-        let show_legend = trace_configs.iter().filter(|_| true).count() >= 2;
+        let trace_configs: Vec<Trace> = self
+            .line_plot
+            .read(cx)
+            .traces()
+            .map(|e| e.read(cx).clone())
+            .collect();
+        let show_legend = trace_configs.len() >= 2;
 
         let underlay_lp = self.line_plot.clone();
         let overlay_lp = self.line_plot.clone();
@@ -760,7 +767,7 @@ impl Render for TimeSeriesPlot {
                                     .map(|pa| axis_zone(event.position, pa))
                                     .unwrap_or(AxisZone::Plot);
                                 this.drag_start = Some(event.position);
-                                this.drag_start_view = this.line_plot.read(cx).effective_view();
+                                this.drag_start_view = this.line_plot.read(cx).effective_view(cx);
                                 this.drag_zone = zone;
                             }
                         }),
@@ -797,7 +804,7 @@ impl Render for TimeSeriesPlot {
                     ))
                     .on_scroll_wheel(cx.listener(
                         |this, event: &gpui::ScrollWheelEvent, _window, cx| {
-                            let Some(view) = this.line_plot.read(cx).effective_view() else {
+                            let Some(view) = this.line_plot.read(cx).effective_view(cx) else {
                                 return;
                             };
                             let Some(pa) = this.last_plot_area else {
@@ -829,7 +836,7 @@ impl Render for TimeSeriesPlot {
                                         this.last_plot_area = Some(plot_area(bounds));
                                     });
                                     let lp = underlay_lp.read(cx);
-                                    (bounds, lp.effective_view(), lp.data_start().unwrap_or(0.0))
+                                    (bounds, lp.effective_view(cx), lp.data_start().unwrap_or(0.0))
                                 }
                             },
                             move |_, (bounds, view, data_start), window, cx| {
@@ -854,7 +861,7 @@ impl Render for TimeSeriesPlot {
                         canvas(
                             move |bounds, _window, cx| {
                                 let lp = overlay_lp.read(cx);
-                                (bounds, lp.effective_view(), lp.data_start().unwrap_or(0.0))
+                                (bounds, lp.effective_view(cx), lp.data_start().unwrap_or(0.0))
                             },
                             move |_, (bounds, view, data_start), window, cx| {
                                 if let Some(view) = view {
@@ -981,7 +988,8 @@ impl Inspectable for TimeSeriesPlot {
         let trace_items: Vec<ListItem> = lp
             .traces()
             .enumerate()
-            .map(|(i, trace)| {
+            .map(|(i, trace_entity)| {
+                let trace = trace_entity.read(cx);
                 let base = TRACE_SETTINGS_BASE + i as u32 * 100;
                 ListItem {
                     label: trace.label.clone(),
@@ -1028,7 +1036,10 @@ impl Inspectable for TimeSeriesPlot {
         let db = self.db.clone();
         let existing: Vec<(ComponentId, usize)> = lp
             .traces()
-            .map(|t| (t.component_id, t.element_index))
+            .map(|t| {
+                let t = t.read(cx);
+                (t.component_id, t.element_index)
+            })
             .collect();
         let on_add: crate::inspectable::AddCallback = Arc::new(move || {
             crate::trace_picker::trace_picker_page(entity.clone(), FieldId(0), db.clone(), &existing)
@@ -1049,7 +1060,7 @@ impl Inspectable for TimeSeriesPlot {
             InspectionValue::String(lp.x_range().to_string()),
         ));
 
-        let effective = lp.effective_view();
+        let effective = lp.effective_view(cx);
         let (min_y, max_y) = match effective {
             Some(v) => (v.min_y, v.max_y),
             None => (0.0, 1.0),
@@ -1138,7 +1149,7 @@ impl Inspectable for TimeSeriesPlot {
                             .traces()
                             .enumerate()
                             .filter(|(i, _)| *i != trace_idx)
-                            .map(|(_, t)| t.clone())
+                            .map(|(_, t)| t.read(cx).clone())
                             .collect();
                         self.set_traces(remaining, cx);
                     }

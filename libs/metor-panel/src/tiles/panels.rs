@@ -225,6 +225,7 @@ impl PaneItem for Viewer3dPanel {
             .models()
             .iter()
             .map(|m| {
+                let m = m.read(cx);
                 serde_json::json!({
                     "label": m.label.as_ref(),
                     "path": m.path,

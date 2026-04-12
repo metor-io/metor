@@ -122,7 +122,7 @@ pub struct Viewer3d {
     camera: OrbitCamera,
     /// All models currently displayed in this viewer. Order is the
     /// inspector's display order.
-    models: Vec<ModelEntry>,
+    models: Vec<gpui::Entity<ModelEntry>>,
     /// Most-recently-requested physical pixel size of the render target.
     /// Used by [`Self::maybe_resize`] to debounce resize ops.
     requested_size: (u32, u32),
@@ -170,6 +170,20 @@ impl ModelEntry {
 
     pub fn orientation_binding_component(&self) -> Option<metor_proto::types::ComponentId> {
         self.orientation_binding
+    }
+
+    fn position_orientation_entity(
+        &self,
+    ) -> (
+        Option<metor_proto::types::ComponentId>,
+        Option<metor_proto::types::ComponentId>,
+        Arc<OnceLock<Entity>>,
+    ) {
+        (
+            self.position_binding,
+            self.orientation_binding,
+            self.entity.clone(),
+        )
     }
 }
 
@@ -271,7 +285,7 @@ impl Viewer3d {
         cx.on_release(move |this, cx| {
             let ents = entities_for_release;
             let model_cells: Vec<Arc<OnceLock<Entity>>> =
-                this.models.iter().map(|m| m.entity.clone()).collect();
+                this.models.iter().map(|m| m.read(cx).entity.clone()).collect();
             cx.update_global::<BevyBridge, _>(|bridge, _| {
                 for frame in this.current_frame.take().into_iter().chain(this.pending_release.take()) {
                     bridge.orphan_release(frame);
@@ -306,7 +320,7 @@ impl Viewer3d {
         viewer
     }
 
-    pub fn models(&self) -> &[ModelEntry] {
+    pub fn models(&self) -> &[gpui::Entity<ModelEntry>] {
         &self.models
     }
 
@@ -379,14 +393,14 @@ impl Viewer3d {
     ) {
         let path = path.into();
         let entity: Arc<OnceLock<Entity>> = Arc::new(OnceLock::new());
-        self.models.push(ModelEntry {
+        self.models.push(cx.new(|_| ModelEntry {
             label: label.into(),
             path: path.clone(),
             entity: entity.clone(),
             position_binding: None,
             orientation_binding: None,
             binding_tasks: SmallVec::new(),
-        });
+        }));
         if !path.is_empty() {
             self.loading_until = Some(Instant::now() + POST_LOAD_WINDOW);
         }
@@ -402,7 +416,8 @@ impl Viewer3d {
             return;
         }
         let entry = self.models.remove(index);
-        self.with_model_entity(cx, entry.entity, |world, entity| {
+        let entity_cell = entry.read(cx).entity.clone();
+        self.with_model_entity(cx, entity_cell, |world, entity| {
             world.despawn(entity);
         });
     }
@@ -412,12 +427,14 @@ impl Viewer3d {
     /// cell for the new scene entity, swap it into the entry, and queue
     /// a despawn-then-spawn op.
     fn set_model_path(&mut self, index: usize, path: String, cx: &mut Context<Self>) {
-        let Some(entry) = self.models.get_mut(index) else {
+        let Some(entry) = self.models.get(index).cloned() else {
             return;
         };
-        entry.path = path.clone();
-        let old_cell = std::mem::replace(&mut entry.entity, Arc::new(OnceLock::new()));
-        let new_cell = entry.entity.clone();
+        let old_cell = entry.update(cx, |model, _| {
+            model.path = path.clone();
+            std::mem::replace(&mut model.entity, Arc::new(OnceLock::new()))
+        });
+        let new_cell = entry.read(cx).entity.clone();
         if !path.is_empty() {
             self.loading_until = Some(Instant::now() + POST_LOAD_WINDOW);
         }
@@ -431,9 +448,12 @@ impl Viewer3d {
     }
 
     /// Update one model's display label. Inspector list row only.
-    fn set_model_label(&mut self, index: usize, label: impl Into<SharedString>) {
-        if let Some(entry) = self.models.get_mut(index) {
-            entry.label = label.into();
+    fn set_model_label(&mut self, index: usize, label: impl Into<SharedString>, cx: &mut Context<Self>) {
+        let label = label.into();
+        if let Some(entry) = self.models.get(index) {
+            entry.update(cx, |model, _| {
+                model.label = label;
+            });
         }
     }
 
@@ -444,8 +464,10 @@ impl Viewer3d {
         component_id: metor_proto::types::ComponentId,
         cx: &mut Context<Self>,
     ) {
-        if let Some(entry) = self.models.get_mut(index) {
-            entry.position_binding = Some(component_id);
+        if let Some(entry) = self.models.get(index).cloned() {
+            entry.update(cx, |model, _| {
+                model.position_binding = Some(component_id);
+            });
         }
         self.restart_model_bindings(index, cx);
     }
@@ -457,8 +479,10 @@ impl Viewer3d {
         component_id: metor_proto::types::ComponentId,
         cx: &mut Context<Self>,
     ) {
-        if let Some(entry) = self.models.get_mut(index) {
-            entry.orientation_binding = Some(component_id);
+        if let Some(entry) = self.models.get(index).cloned() {
+            entry.update(cx, |model, _| {
+                model.orientation_binding = Some(component_id);
+            });
         }
         self.restart_model_bindings(index, cx);
     }
@@ -471,13 +495,13 @@ impl Viewer3d {
         let Some(db) = self.db.clone() else {
             return;
         };
-        let Some(entry) = self.models.get_mut(index) else {
+        let Some(entry) = self.models.get(index).cloned() else {
             return;
         };
-        let position = entry.position_binding;
-        let orientation = entry.orientation_binding;
-        let entity_cell = entry.entity.clone();
-        entry.binding_tasks.clear();
+        let (position, orientation, entity_cell) = entry.read(cx).position_orientation_entity();
+        entry.update(cx, |model, _| {
+            model.binding_tasks.clear();
+        });
 
         self.with_model_entity(cx, entity_cell.clone(), |world, entity| {
             world.entity_mut(entity).insert(LiveDelta::default());
@@ -504,8 +528,10 @@ impl Viewer3d {
                 |q, delta| delta.rotation = Some(q),
             ));
         }
-        if let Some(entry) = self.models.get_mut(index) {
-            entry.binding_tasks = tasks;
+        if let Some(entry) = self.models.get(index) {
+            entry.update(cx, |model, _| {
+                model.binding_tasks = tasks;
+            });
         }
         self.mark_dirty(cx);
     }
@@ -849,47 +875,50 @@ fn model_row_label(entry: &ModelEntry, index: usize) -> SharedString {
 }
 
 impl Inspectable for Viewer3d {
-    fn fields(&self, _cx: &gpui::App) -> Vec<InspectionField> {
+    fn fields(&self, cx: &gpui::App) -> Vec<InspectionField> {
         let model_items: Vec<ListItem> = self
             .models
             .iter()
             .enumerate()
-            .map(|(i, entry)| ListItem {
-                label: model_row_label(entry, i),
-                can_remove: true,
-                fields: vec![
-                    InspectionField::new(
-                        "Label",
-                        FieldId(encode_sub(i, SUB_LABEL)),
-                        InspectionValue::String(entry.label.to_string()),
-                    ),
-                    InspectionField::new(
-                        "Path",
-                        FieldId(encode_sub(i, SUB_PATH)),
-                        InspectionValue::String(entry.path.clone()),
-                    ),
-                    InspectionField::new(
-                        "Position",
-                        FieldId(encode_sub(i, SUB_POSITION)),
-                        binding_to_value(
-                            entry.position_binding_component(),
-                            PickerArity::Vec3,
+            .map(|(i, entry)| {
+                let entry = entry.read(cx);
+                ListItem {
+                    label: model_row_label(&entry, i),
+                    can_remove: true,
+                    fields: vec![
+                        InspectionField::new(
+                            "Label",
+                            FieldId(encode_sub(i, SUB_LABEL)),
+                            InspectionValue::String(entry.label.to_string()),
                         ),
-                    ),
-                    InspectionField::new(
-                        "Orientation",
-                        FieldId(encode_sub(i, SUB_ORIENTATION)),
-                        binding_to_value(
-                            entry.orientation_binding_component(),
-                            PickerArity::Quat,
+                        InspectionField::new(
+                            "Path",
+                            FieldId(encode_sub(i, SUB_PATH)),
+                            InspectionValue::String(entry.path.clone()),
                         ),
-                    ),
-                    InspectionField::new(
-                        "Remove",
-                        FieldId(encode_sub(i, SUB_REMOVE)),
-                        InspectionValue::Bool(false),
-                    ),
-                ],
+                        InspectionField::new(
+                            "Position",
+                            FieldId(encode_sub(i, SUB_POSITION)),
+                            binding_to_value(
+                                entry.position_binding_component(),
+                                PickerArity::Vec3,
+                            ),
+                        ),
+                        InspectionField::new(
+                            "Orientation",
+                            FieldId(encode_sub(i, SUB_ORIENTATION)),
+                            binding_to_value(
+                                entry.orientation_binding_component(),
+                                PickerArity::Quat,
+                            ),
+                        ),
+                        InspectionField::new(
+                            "Remove",
+                            FieldId(encode_sub(i, SUB_REMOVE)),
+                            InspectionValue::Bool(false),
+                        ),
+                    ],
+                }
             })
             .collect();
 
@@ -929,7 +958,7 @@ impl Inspectable for Viewer3d {
             match sub {
                 SUB_LABEL => {
                     if let InspectionValue::String(s) = value {
-                        self.set_model_label(index, s);
+                        self.set_model_label(index, s, cx);
                     }
                 }
                 SUB_PATH => {

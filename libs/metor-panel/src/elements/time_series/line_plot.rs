@@ -34,7 +34,7 @@ use crate::wait_for_component;
 /// Per-trace state inside a [`LinePlot`]. `component` is `None` until
 /// the tracker task's [`wait_for_component`] resolves.
 struct Entry {
-    config: Trace,
+    config: gpui::Entity<Trace>,
     component: Option<Component>,
     y_bounds: Option<(f64, f64)>,
     last_scan_ts: Option<Timestamp>,
@@ -43,18 +43,19 @@ struct Entry {
 impl Entry {
     /// Build a borrowing [`LineDraw`] for the GPU submit, or `None` if
     /// the component hasn't resolved yet or the trace is hidden.
-    fn as_line_draw(&self) -> Option<LineDraw<'_>> {
-        if !self.config.visible {
+    fn as_line_draw(&self, cx: &gpui::App) -> Option<LineDraw<'_>> {
+        let config = self.config.read(cx);
+        if !config.visible {
             return None;
         }
         let component = self.component.as_ref()?;
         Some(LineDraw {
-            component_id: self.config.component_id,
+            component_id: config.component_id,
             component,
-            element_index: self.config.element_index,
-            style: self.config.style,
-            color: self.config.color,
-            stroke_width: self.config.stroke_width,
+            element_index: config.element_index,
+            style: config.style,
+            color: config.color,
+            stroke_width: config.stroke_width,
         })
     }
 }
@@ -92,7 +93,7 @@ impl LinePlot {
         self.entries = traces
             .into_iter()
             .map(|config| Entry {
-                config,
+                config: cx.new(|_| config),
                 component: None,
                 y_bounds: None,
                 last_scan_ts: None,
@@ -113,8 +114,8 @@ impl LinePlot {
     where
         F: FnOnce(&mut Trace),
     {
-        if let Some(entry) = self.entries.get_mut(index) {
-            f(&mut entry.config);
+        if let Some(entry) = self.entries.get(index) {
+            entry.config.update(cx, |config, _| f(config));
             cx.notify();
         }
     }
@@ -164,7 +165,7 @@ impl LinePlot {
 
     /// The view currently used for rendering: the interactive override
     /// if set, otherwise auto-fit from trace data + inspector overrides.
-    pub fn effective_view(&self) -> Option<PlotBounds> {
+    pub fn effective_view(&self, cx: &gpui::App) -> Option<PlotBounds> {
         if let Some(v) = self.view_override {
             return Some(v);
         }
@@ -175,7 +176,7 @@ impl LinePlot {
         let mut any_time = false;
         let mut any_y = false;
         for entry in &self.entries {
-            if !entry.config.visible {
+            if !entry.config.read(cx).visible {
                 continue;
             }
             let Some(comp) = &entry.component else {
@@ -232,12 +233,12 @@ impl LinePlot {
         any.then_some(start)
     }
 
-    /// Read-only iteration over all trace configs, resolved or not.
-    pub fn traces(&self) -> impl Iterator<Item = &Trace> {
+    /// Iterate over all trace entity handles, resolved or not.
+    pub fn traces(&self) -> impl Iterator<Item = &gpui::Entity<Trace>> {
         self.entries.iter().map(|e| &e.config)
     }
 
-    pub fn trace(&self, idx: usize) -> Option<&Trace> {
+    pub fn trace(&self, idx: usize) -> Option<&gpui::Entity<Trace>> {
         self.entries.get(idx).map(|e| &e.config)
     }
 
@@ -251,8 +252,8 @@ impl LinePlot {
 
     fn spawn_tracker(db: Arc<DB>, idx: usize, cx: &mut Context<Self>) -> gpui::Task<()> {
         cx.spawn(async move |this, cx| {
-            let trace_id = match this.update(cx, |lp, _| {
-                lp.entries.get(idx).map(|e| e.config.component_id)
+            let trace_id = match this.update(cx, |lp, cx| {
+                lp.entries.get(idx).map(|e| e.config.read(cx).component_id)
             }) {
                 Ok(Some(id)) => id,
                 _ => return,
@@ -280,9 +281,10 @@ impl LinePlot {
                         return false;
                     };
                     let latest_ts = comp.time_series.latest().map(|n| n.timestamp());
+                    let element_index = entry.config.read(cx).element_index;
                     entry.y_bounds = expand_y_bounds(
                         comp,
-                        &[entry.config.element_index],
+                        &[element_index],
                         entry.y_bounds,
                         entry.last_scan_ts,
                     );
@@ -313,9 +315,9 @@ impl Render for LinePlot {
                 let scale_factor = window.scale_factor();
                 let (frame, released) = weak
                     .update(cx, |lp, cx| {
-                        if let Some(view) = lp.effective_view() {
+                        if let Some(view) = lp.effective_view(cx) {
                             let draws: Vec<LineDraw<'_>> =
-                                lp.entries.iter().filter_map(Entry::as_line_draw).collect();
+                                lp.entries.iter().filter_map(|e| e.as_line_draw(cx)).collect();
                             if !draws.is_empty()
                                 && let Some(handle) = lp.gpu_state.render(
                                     cx,
