@@ -9,8 +9,10 @@ use crate::elements::time_series::OpenPageCallback;
 use crate::elements::viewer_3d::Viewer3d;
 use crate::elements::{ComponentTable, ComponentText, TimeSeriesPlot, new_component_table};
 use crate::inspectable::{
-    FieldId, InspectionValue, palette_page_for_field, palette_page_for_inspectable,
+    FieldId, Inspectable, InspectionField, InspectionValue, palette_page_for_field,
+    palette_page_for_inspectable,
 };
+use super::item::FieldSetter;
 use super::dashboard::DashboardPanel;
 
 use super::item::{PaneItem, PaneItemHandle};
@@ -162,6 +164,14 @@ impl PaneItem for PlotPanel {
             cx,
         ))
     }
+
+    fn inspect_fields_and_setter(
+        &self,
+        _db: Option<Arc<DB>>,
+        cx: &App,
+    ) -> Option<(Vec<InspectionField>, FieldSetter)> {
+        Some(inspectable_fields_and_setter(self.inner.clone(), cx))
+    }
 }
 
 /// Tile panel wrapping a [`Viewer3d`] with inspector support.
@@ -235,6 +245,14 @@ impl PaneItem for Viewer3dPanel {
             Some(self.db.clone()),
             cx,
         ))
+    }
+
+    fn inspect_fields_and_setter(
+        &self,
+        _db: Option<Arc<DB>>,
+        cx: &App,
+    ) -> Option<(Vec<InspectionField>, FieldSetter)> {
+        Some(inspectable_fields_and_setter(self.inner.clone(), cx))
     }
 }
 
@@ -493,5 +511,19 @@ fn build_edit_items(
     }
 
     items
+}
+
+/// Build a `(fields, setter)` pair from any `Inspectable` entity.
+fn inspectable_fields_and_setter<T: Inspectable>(
+    entity: Entity<T>,
+    cx: &App,
+) -> (Vec<InspectionField>, FieldSetter) {
+    let fields = entity.read(cx).fields(cx);
+    let setter: FieldSetter = Box::new(move |field_id, value, _window, cx| {
+        entity.update(cx, |this, cx| {
+            this.set_field(field_id, value, cx);
+        });
+    });
+    (fields, setter)
 }
 

@@ -6,8 +6,8 @@ pub mod panels;
 pub(crate) mod serial;
 
 use gpui::{
-    AnyElement, App, Axis, Context, DragMoveEvent, Entity, EventEmitter, IntoElement, Render,
-    Window, div, prelude::*, px, relative,
+    AnyElement, App, Axis, Context, DragMoveEvent, Entity, EventEmitter, IntoElement, Pixels,
+    Point, Render, Window, div, prelude::*, px, relative,
 };
 
 use smallvec::SmallVec;
@@ -27,7 +27,10 @@ pub(crate) type SplitPath = SmallVec<[usize; 4]>;
 /// Events emitted by TileGroup to its parent.
 pub enum TileGroupEvent {
     /// A panel item requested inspection/editing (e.g. via right-click on tab).
-    Inspect { item: Box<dyn PaneItemHandle> },
+    Inspect {
+        item: Box<dyn PaneItemHandle>,
+        position: Point<Pixels>,
+    },
 }
 
 impl EventEmitter<TileGroupEvent> for TileGroup {}
@@ -430,9 +433,10 @@ impl TileGroup {
                     self.remove_pane(&pane, cx);
                 }
             }
-            PaneEvent::Inspect { item } => {
+            PaneEvent::Inspect { item, position } => {
                 cx.emit(TileGroupEvent::Inspect {
                     item: item.clone_handle(),
+                    position: *position,
                 });
             }
         }

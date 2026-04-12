@@ -12,6 +12,7 @@ pub mod offset_parse;
 pub mod pending_edits;
 pub mod theme;
 pub mod tiles;
+pub mod property_inspector;
 pub(crate) mod trace_picker;
 
 /// Borrowing conversion to a [`ComponentView`].

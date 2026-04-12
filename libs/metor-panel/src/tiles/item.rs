@@ -1,9 +1,10 @@
 use std::sync::Arc;
 
-use gpui::{AnyView, App, Entity, Render, SharedString};
+use gpui::{AnyView, App, Entity, Render, SharedString, Window};
 use metor_db::DB;
 
 use crate::command_palette::PalettePage;
+use crate::inspectable::{FieldId, InspectionField, InspectionValue};
 
 /// Trait that pane content must implement to be hosted in a tile pane.
 pub trait PaneItem: Render + Sized + 'static {
@@ -25,7 +26,19 @@ pub trait PaneItem: Render + Sized + 'static {
     fn inspect_page(&self, _db: Option<Arc<DB>>, _cx: &App) -> Option<PalettePage> {
         None
     }
+
+    /// Return inspectable fields and a type-erased setter closure, if supported.
+    fn inspect_fields_and_setter(
+        &self,
+        _db: Option<Arc<DB>>,
+        _cx: &App,
+    ) -> Option<(Vec<InspectionField>, FieldSetter)> {
+        None
+    }
 }
+
+/// Type-erased setter for an inspectable field.
+pub type FieldSetter = Box<dyn Fn(FieldId, InspectionValue, &mut Window, &mut App)>;
 
 /// Object-safe handle to any pane item, used for type-erased storage in Pane.
 pub trait PaneItemHandle: 'static {
@@ -37,6 +50,15 @@ pub trait PaneItemHandle: 'static {
     fn entity_id(&self) -> gpui::EntityId;
     fn clone_handle(&self) -> Box<dyn PaneItemHandle>;
     fn inspect_page(&self, db: Option<Arc<DB>>, cx: &App) -> Option<PalettePage>;
+
+    /// Return the inspectable fields and a closure to apply changes, if supported.
+    fn inspect_fields_and_setter(
+        &self,
+        _db: Option<Arc<DB>>,
+        _cx: &App,
+    ) -> Option<(Vec<InspectionField>, FieldSetter)> {
+        None
+    }
 }
 
 impl<T: PaneItem> PaneItemHandle for Entity<T> {
@@ -70,5 +92,13 @@ impl<T: PaneItem> PaneItemHandle for Entity<T> {
 
     fn inspect_page(&self, db: Option<Arc<DB>>, cx: &App) -> Option<PalettePage> {
         self.read(cx).inspect_page(db, cx)
+    }
+
+    fn inspect_fields_and_setter(
+        &self,
+        db: Option<Arc<DB>>,
+        cx: &App,
+    ) -> Option<(Vec<InspectionField>, FieldSetter)> {
+        self.read(cx).inspect_fields_and_setter(db, cx)
     }
 }

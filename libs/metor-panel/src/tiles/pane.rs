@@ -1,6 +1,6 @@
 use gpui::{
     AnyElement, App, Bounds, Context, DragMoveEvent, EventEmitter, IntoElement, MouseButton,
-    Pixels, Render, Window, div, prelude::*, px,
+    Pixels, Point, Render, Window, div, prelude::*, px,
 };
 
 use super::drag::{DraggedTab, SplitDirection, detect_split_zone};
@@ -20,9 +20,10 @@ pub enum PaneEvent {
     },
     /// The pane has no more items and should be removed.
     Empty,
-    ///// User requested to inspect/edit a panel item (e.g. via right-click).
+    /// User requested to inspect/edit a panel item (e.g. via right-click).
     Inspect {
         item: Box<dyn PaneItemHandle>,
+        position: Point<Pixels>,
     },
 }
 
@@ -231,10 +232,11 @@ impl Pane {
 
         tab = tab.on_mouse_down(
             MouseButton::Right,
-            cx.listener(move |this, _, _, cx| {
+            cx.listener(move |this, event: &gpui::MouseDownEvent, _window, cx| {
                 this.activate_item(ix, cx);
                 cx.emit(PaneEvent::Inspect {
                     item: inspect_handle.clone_handle(),
+                    position: event.position,
                 });
             }),
         );

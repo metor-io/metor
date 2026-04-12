@@ -5,14 +5,15 @@ use std::sync::Arc;
 
 use gpui::{
     App, Application, Bounds, Context, Entity, FocusHandle, Focusable, IntoElement, KeyBinding,
-    Render, SharedString, TitlebarOptions, Window, WindowBounds, WindowOptions, actions, div,
-    point, prelude::*, px, size,
+    Pixels, Point, Render, SharedString, TitlebarOptions, Window, WindowBounds, WindowOptions,
+    actions, div, point, prelude::*, px, size,
 };
 use metor_db::{DB, Server};
 use metor_panel::command_palette::{CommandPalette, PalettePage};
 use metor_panel::pending_edits::{
     self, edit_value_page, pending_edits, pending_edits_mut, review_page,
 };
+use metor_panel::property_inspector::PropertyInspector;
 use metor_panel::tiles::panels::tile_palette_page;
 use metor_panel::tiles::{TileGroup, TileGroupEvent};
 use stellarator::{net::TcpListener, struc_con::stellar};
@@ -34,7 +35,10 @@ struct AppRoot {
     db: Arc<DB>,
     tiles: Entity<TileGroup>,
     palette: Option<Entity<CommandPalette>>,
+    inspector: Option<Entity<PropertyInspector>>,
     pending_inspect: Option<PalettePage>,
+    pending_inspector_request:
+        Option<(Box<dyn metor_panel::tiles::PaneItemHandle>, Point<Pixels>)>,
     focus_handle: FocusHandle,
 }
 
@@ -46,7 +50,9 @@ impl AppRoot {
             db,
             tiles,
             palette: None,
+            inspector: None,
             pending_inspect: None,
+            pending_inspector_request: None,
             focus_handle: cx.focus_handle(),
         }
     }
@@ -135,6 +141,30 @@ impl AppRoot {
         self.open_palette(page, window, cx);
     }
 
+    fn open_inspector(
+        &mut self,
+        item: &dyn metor_panel::tiles::PaneItemHandle,
+        position: Point<Pixels>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let db = self.db.clone();
+        if let Some((fields, setter)) = item.inspect_fields_and_setter(Some(db.clone()), cx) {
+            let parent_focus = self.focus_handle.clone();
+            let inspector = cx.new(|cx| {
+                let mut insp = PropertyInspector::new(fields, position, setter, cx);
+                insp.set_parent_focus(parent_focus);
+                insp
+            });
+            inspector.focus_handle(cx).focus(window);
+            self.inspector = Some(inspector);
+            cx.notify();
+        } else if let Some(page) = item.inspect_page(Some(self.db.clone()), cx) {
+            self.pending_inspect = Some(page);
+            cx.notify();
+        }
+    }
+
     fn handle_tile_event(
         &mut self,
         _tiles: Entity<TileGroup>,
@@ -142,11 +172,12 @@ impl AppRoot {
         cx: &mut Context<Self>,
     ) {
         match event {
-            TileGroupEvent::Inspect { item } => {
-                if let Some(page) = item.inspect_page(Some(self.db.clone()), cx) {
-                    self.pending_inspect = Some(page);
-                    cx.notify();
-                }
+            TileGroupEvent::Inspect { item, position } => {
+                let position = *position;
+                let item = item.clone_handle();
+                // Defer to render to avoid re-entrant updates
+                self.pending_inspector_request = Some((item, position));
+                cx.notify();
             }
         }
     }
@@ -165,6 +196,17 @@ impl Render for AppRoot {
                 self.palette = None;
                 self.focus_handle.focus(window);
             }
+        }
+
+        if let Some(inspector) = &self.inspector {
+            if inspector.read(cx).dismissed {
+                self.inspector = None;
+                self.focus_handle.focus(window);
+            }
+        }
+
+        if let Some((item, position)) = self.pending_inspector_request.take() {
+            self.open_inspector(&*item, position, window, cx);
         }
 
         if let Some(page) = self.pending_inspect.take() {
@@ -202,6 +244,10 @@ impl Render for AppRoot {
 
         if let Some(palette) = &self.palette {
             root = root.child(palette.clone());
+        }
+
+        if let Some(inspector) = &self.inspector {
+            root = root.child(inspector.clone());
         }
 
         root
