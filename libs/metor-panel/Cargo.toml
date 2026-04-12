@@ -10,10 +10,11 @@ hifitime.version = "4.0"
 nucleo-matcher = "0.3"
 metor-db.path = "../db"
 metor-proto.path = "../metor-proto"
-metor-proto.features = ["std"]
+metor-proto.features = ["std", "facet"]
 metor-proto-wkt.path = "../metor-proto/wkt"
 metor-proto-wkt.features = ["nox"]
 nox.path = "../nox"
+facet = { path = "../../../facet/facet", features = ["reflect", "smallvec", "gpui"] }
 postcard = "1"
 serde = { version = "1", features = ["derive"] }
 smallvec = "1"
