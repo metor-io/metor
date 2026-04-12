@@ -28,6 +28,28 @@ pub struct InspectionField {
     pub label: SharedString,
     pub field_id: FieldId,
     pub value: InspectionValue,
+    /// For `F64` fields, an optional `(min, max)` range that enables a slider widget.
+    pub range: Option<(f64, f64)>,
+}
+
+impl InspectionField {
+    pub fn new(
+        label: impl Into<SharedString>,
+        field_id: FieldId,
+        value: InspectionValue,
+    ) -> Self {
+        Self {
+            label: label.into(),
+            field_id,
+            value,
+            range: None,
+        }
+    }
+
+    pub fn with_range(mut self, min: f64, max: f64) -> Self {
+        self.range = Some((min, max));
+        self
+    }
 }
 
 /// A sub-item in a [`InspectionValue::List`], with its own inspectable fields.

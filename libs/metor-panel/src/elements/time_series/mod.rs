@@ -674,32 +674,33 @@ impl TimeSeriesPlot {
             .expect("trace_inspect_page called with an invalid index");
         let base = TRACE_SETTINGS_BASE + trace_idx as u32 * 100;
         let fields = vec![
-            InspectionField {
-                label: "Style".into(),
-                field_id: FieldId(base + TRACE_SUB_STYLE),
-                value: InspectionValue::Enum {
+            InspectionField::new(
+                "Style",
+                FieldId(base + TRACE_SUB_STYLE),
+                InspectionValue::Enum {
                     selected: trace.style.label().to_string(),
                     options: PlotStyle::ALL
                         .iter()
                         .map(|s| s.label().to_string())
                         .collect(),
                 },
-            },
-            InspectionField {
-                label: "Color".into(),
-                field_id: FieldId(base + TRACE_SUB_COLOR),
-                value: InspectionValue::Color(trace.color),
-            },
-            InspectionField {
-                label: "Visible".into(),
-                field_id: FieldId(base + TRACE_SUB_VISIBLE),
-                value: InspectionValue::Bool(trace.visible),
-            },
-            InspectionField {
-                label: "Width".into(),
-                field_id: FieldId(base + TRACE_SUB_STROKE_WIDTH),
-                value: InspectionValue::F64(trace.stroke_width as f64),
-            },
+            ),
+            InspectionField::new(
+                "Color",
+                FieldId(base + TRACE_SUB_COLOR),
+                InspectionValue::Color(trace.color),
+            ),
+            InspectionField::new(
+                "Visible",
+                FieldId(base + TRACE_SUB_VISIBLE),
+                InspectionValue::Bool(trace.visible),
+            ),
+            InspectionField::new(
+                "Width",
+                FieldId(base + TRACE_SUB_STROKE_WIDTH),
+                InspectionValue::F64(trace.stroke_width as f64),
+            )
+            .with_range(0.5, 10.0),
         ];
         palette_page_for_list_item(cx.entity().clone(), &fields, trace.label.clone(), None)
     }
@@ -926,16 +927,16 @@ impl Inspectable for TimeSeriesPlot {
             .collect();
 
         let mut fields = vec![
-            InspectionField {
-                label: "Title".into(),
-                field_id: FieldId(5),
-                value: InspectionValue::String(self.title(cx).to_string()),
-            },
-            InspectionField {
-                label: "Traces".into(),
-                field_id: FieldId(0),
-                value: InspectionValue::Traces(current_traces),
-            },
+            InspectionField::new(
+                "Title",
+                FieldId(5),
+                InspectionValue::String(self.title(cx).to_string()),
+            ),
+            InspectionField::new(
+                "Traces",
+                FieldId(0),
+                InspectionValue::Traces(current_traces),
+            ),
         ];
 
         let trace_items: Vec<ListItem> = lp
@@ -946,66 +947,67 @@ impl Inspectable for TimeSeriesPlot {
                 ListItem {
                     label: trace.label.clone(),
                     fields: vec![
-                        InspectionField {
-                            label: "Style".into(),
-                            field_id: FieldId(base + TRACE_SUB_STYLE),
-                            value: InspectionValue::Enum {
+                        InspectionField::new(
+                            "Style",
+                            FieldId(base + TRACE_SUB_STYLE),
+                            InspectionValue::Enum {
                                 selected: trace.style.label().to_string(),
                                 options: PlotStyle::ALL
                                     .iter()
                                     .map(|s| s.label().to_string())
                                     .collect(),
                             },
-                        },
-                        InspectionField {
-                            label: "Color".into(),
-                            field_id: FieldId(base + TRACE_SUB_COLOR),
-                            value: InspectionValue::Color(trace.color),
-                        },
-                        InspectionField {
-                            label: "Visible".into(),
-                            field_id: FieldId(base + TRACE_SUB_VISIBLE),
-                            value: InspectionValue::Bool(trace.visible),
-                        },
-                        InspectionField {
-                            label: "Width".into(),
-                            field_id: FieldId(base + TRACE_SUB_STROKE_WIDTH),
-                            value: InspectionValue::F64(trace.stroke_width as f64),
-                        },
+                        ),
+                        InspectionField::new(
+                            "Color",
+                            FieldId(base + TRACE_SUB_COLOR),
+                            InspectionValue::Color(trace.color),
+                        ),
+                        InspectionField::new(
+                            "Visible",
+                            FieldId(base + TRACE_SUB_VISIBLE),
+                            InspectionValue::Bool(trace.visible),
+                        ),
+                        InspectionField::new(
+                            "Width",
+                            FieldId(base + TRACE_SUB_STROKE_WIDTH),
+                            InspectionValue::F64(trace.stroke_width as f64),
+                        )
+                        .with_range(0.5, 10.0),
                     ],
                 }
             })
             .collect();
 
         if !trace_items.is_empty() {
-            fields.push(InspectionField {
-                label: "Trace Settings".into(),
-                field_id: FieldId(1),
-                value: InspectionValue::List(trace_items),
-            });
+            fields.push(InspectionField::new(
+                "Trace Settings",
+                FieldId(1),
+                InspectionValue::List(trace_items),
+            ));
         }
 
-        fields.push(InspectionField {
-            label: "X Range".into(),
-            field_id: FieldId(4),
-            value: InspectionValue::String(lp.x_range().to_string()),
-        });
+        fields.push(InspectionField::new(
+            "X Range",
+            FieldId(4),
+            InspectionValue::String(lp.x_range().to_string()),
+        ));
 
         let effective = lp.effective_view();
         let (min_y, max_y) = match effective {
             Some(v) => (v.min_y, v.max_y),
             None => (0.0, 1.0),
         };
-        fields.push(InspectionField {
-            label: "Y Min".into(),
-            field_id: FieldId(2),
-            value: InspectionValue::F64(lp.y_min_override().unwrap_or(min_y)),
-        });
-        fields.push(InspectionField {
-            label: "Y Max".into(),
-            field_id: FieldId(3),
-            value: InspectionValue::F64(lp.y_max_override().unwrap_or(max_y)),
-        });
+        fields.push(InspectionField::new(
+            "Y Min",
+            FieldId(2),
+            InspectionValue::F64(lp.y_min_override().unwrap_or(min_y)),
+        ));
+        fields.push(InspectionField::new(
+            "Y Max",
+            FieldId(3),
+            InspectionValue::F64(lp.y_max_override().unwrap_or(max_y)),
+        ));
 
         fields
     }

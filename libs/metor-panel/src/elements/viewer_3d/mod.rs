@@ -857,62 +857,63 @@ impl Inspectable for Viewer3d {
             .map(|(i, entry)| ListItem {
                 label: model_row_label(entry, i),
                 fields: vec![
-                    InspectionField {
-                        label: "Label".into(),
-                        field_id: FieldId(encode_sub(i, SUB_LABEL)),
-                        value: InspectionValue::String(entry.label.to_string()),
-                    },
-                    InspectionField {
-                        label: "Path".into(),
-                        field_id: FieldId(encode_sub(i, SUB_PATH)),
-                        value: InspectionValue::String(entry.path.clone()),
-                    },
-                    InspectionField {
-                        label: "Position".into(),
-                        field_id: FieldId(encode_sub(i, SUB_POSITION)),
-                        value: binding_to_value(
+                    InspectionField::new(
+                        "Label",
+                        FieldId(encode_sub(i, SUB_LABEL)),
+                        InspectionValue::String(entry.label.to_string()),
+                    ),
+                    InspectionField::new(
+                        "Path",
+                        FieldId(encode_sub(i, SUB_PATH)),
+                        InspectionValue::String(entry.path.clone()),
+                    ),
+                    InspectionField::new(
+                        "Position",
+                        FieldId(encode_sub(i, SUB_POSITION)),
+                        binding_to_value(
                             entry.position_binding_component(),
                             PickerArity::Vec3,
                         ),
-                    },
-                    InspectionField {
-                        label: "Orientation".into(),
-                        field_id: FieldId(encode_sub(i, SUB_ORIENTATION)),
-                        value: binding_to_value(
+                    ),
+                    InspectionField::new(
+                        "Orientation",
+                        FieldId(encode_sub(i, SUB_ORIENTATION)),
+                        binding_to_value(
                             entry.orientation_binding_component(),
                             PickerArity::Quat,
                         ),
-                    },
-                    InspectionField {
-                        label: "Remove".into(),
-                        field_id: FieldId(encode_sub(i, SUB_REMOVE)),
-                        value: InspectionValue::Bool(false),
-                    },
+                    ),
+                    InspectionField::new(
+                        "Remove",
+                        FieldId(encode_sub(i, SUB_REMOVE)),
+                        InspectionValue::Bool(false),
+                    ),
                 ],
             })
             .collect();
 
         vec![
-            InspectionField {
-                label: "Models".into(),
-                field_id: FieldId(FIELD_MODELS),
-                value: InspectionValue::List(model_items),
-            },
-            InspectionField {
-                label: "Add Model".into(),
-                field_id: FieldId(FIELD_ADD_MODEL),
-                value: InspectionValue::Bool(false),
-            },
-            InspectionField {
-                label: "Camera FOV (rad)".into(),
-                field_id: FieldId(FIELD_FOV),
-                value: InspectionValue::F64(self.camera.fov_y_rad as f64),
-            },
-            InspectionField {
-                label: "Reset Camera".into(),
-                field_id: FieldId(FIELD_RESET_CAMERA),
-                value: InspectionValue::Bool(false),
-            },
+            InspectionField::new(
+                "Models",
+                FieldId(FIELD_MODELS),
+                InspectionValue::List(model_items),
+            ),
+            InspectionField::new(
+                "Add Model",
+                FieldId(FIELD_ADD_MODEL),
+                InspectionValue::Bool(false),
+            ),
+            InspectionField::new(
+                "Camera FOV (rad)",
+                FieldId(FIELD_FOV),
+                InspectionValue::F64(self.camera.fov_y_rad as f64),
+            )
+            .with_range(0.1, 3.14),
+            InspectionField::new(
+                "Reset Camera",
+                FieldId(FIELD_RESET_CAMERA),
+                InspectionValue::Bool(false),
+            ),
         ]
     }
 

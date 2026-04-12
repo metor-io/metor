@@ -334,16 +334,16 @@ impl Render for Monitor {
 impl Inspectable for Monitor {
     fn fields(&self, _cx: &gpui::App) -> Vec<InspectionField> {
         vec![
-            InspectionField {
-                label: "Unit".into(),
-                field_id: FieldId(0),
-                value: InspectionValue::String(self.unit.to_string()),
-            },
-            InspectionField {
-                label: "Sparkline".into(),
-                field_id: FieldId(1),
-                value: InspectionValue::Bool(self.show_sparkline),
-            },
+            InspectionField::new(
+                "Unit",
+                FieldId(0),
+                InspectionValue::String(self.unit.to_string()),
+            ),
+            InspectionField::new(
+                "Sparkline",
+                FieldId(1),
+                InspectionValue::Bool(self.show_sparkline),
+            ),
         ]
     }
 
