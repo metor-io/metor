@@ -4,7 +4,7 @@ use metor_db::disruptor::{ReadGrant, Reader};
 use metor_db::{Component, ComponentSchema, DB};
 use metor_proto::types::{ComponentId, ComponentView, Timestamp};
 pub mod command_palette;
-pub mod inspect_attrs;
+pub mod inspect;
 pub mod reflect;
 pub mod elements;
 pub mod gpu_context;

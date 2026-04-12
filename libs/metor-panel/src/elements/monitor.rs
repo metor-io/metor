@@ -19,12 +19,17 @@ struct ElementDisplay {
 /// A monitor displays a component's current value with its name and an
 /// optional sparkline. Designed for dashboard use where a clean,
 /// at-a-glance readout is needed.
+#[derive(facet::Facet)]
 pub struct Monitor {
+    #[facet(skip)]
     name: SharedString,
     unit: SharedString,
+    #[facet(opaque)]
     elements: Vec<ElementDisplay>,
     show_sparkline: bool,
+    #[facet(opaque)]
     sparkline: Entity<LinePlot>,
+    #[facet(opaque)]
     _task: gpui::Task<()>,
 }
 

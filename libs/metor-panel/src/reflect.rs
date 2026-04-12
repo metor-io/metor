@@ -9,7 +9,7 @@ use std::collections::HashMap;
 use facet::{Facet, Peek, ScalarType};
 use gpui::{AnyEntity, App, Entity, Hsla, SharedString, Window};
 
-use crate::inspect_attrs;
+use crate::inspect;
 use crate::inspectable::{FieldId, InspectionField, InspectionValue};
 
 /// Function that reads an entity and produces inspection fields.
@@ -126,7 +126,7 @@ pub fn peek_to_fields(peek: &Peek<'_, '_>) -> Vec<InspectionField> {
 
         let range: Option<(f64, f64)> = field_def.attributes.iter().find_map(|a| {
             if a.ns == Some("inspect") && a.key == "range" {
-                a.get_as::<inspect_attrs::Range>().and_then(|r| {
+                a.get_as::<inspect::Range>().and_then(|r| {
                     let min = r.min.parse::<f64>().ok()?;
                     let max = r.max.parse::<f64>().ok()?;
                     Some((min, max))

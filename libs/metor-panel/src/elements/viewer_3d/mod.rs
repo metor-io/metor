@@ -151,15 +151,15 @@ pub struct Viewer3d {
 /// tasks. The world-side `Entity` is created by a queued spawn op and
 /// written into `entity` once; later mutations load it the same way the
 /// viewer's own entities are loaded.
+#[derive(facet::Facet)]
 pub struct ModelEntry {
     pub label: SharedString,
     pub path: String,
-    /// Filled by the queued spawn op in [`Viewer3d::add_model`].
+    #[facet(opaque)]
     entity: Arc<OnceLock<Entity>>,
     position_binding: Option<metor_proto::types::ComponentId>,
     orientation_binding: Option<metor_proto::types::ComponentId>,
-    /// One streaming task per active binding. Dropping the entry drops
-    /// the tasks.
+    #[facet(opaque)]
     binding_tasks: SmallVec<[gpui::Task<()>; 2]>,
 }
 

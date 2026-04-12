@@ -7,6 +7,8 @@ use gpui::{
 use metor_db::{Component, DB};
 use metor_proto::types::{ComponentId, Timestamp};
 
+#[allow(unused_imports)]
+use crate::inspect;
 use crate::inspectable::{FieldId, Inspectable, InspectionField, InspectionValue, ListItem};
 use crate::offset_parse::TimeRangeBehavior;
 
@@ -438,7 +440,8 @@ fn paint_overlay(
 }
 
 /// How a trace is drawn on the plot.
-#[derive(Clone, Copy, Default, PartialEq)]
+#[derive(Clone, Copy, Default, PartialEq, facet::Facet)]
+#[repr(u8)]
 pub enum PlotStyle {
     #[default]
     Line,
@@ -468,9 +471,12 @@ impl PlotStyle {
 }
 
 /// A single trace on a time series plot: one element index from one component.
-#[derive(Clone)]
+#[derive(Clone, facet::Facet)]
+#[facet(pod)]
 pub struct Trace {
+    #[facet(skip)]
     pub component_id: ComponentId,
+    #[facet(skip)]
     pub element_index: usize,
     pub color: Hsla,
     pub style: PlotStyle,

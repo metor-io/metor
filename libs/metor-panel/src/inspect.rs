@@ -4,7 +4,7 @@
 /// command palette. Applied via `#[facet(inspect::...)]` syntax.
 facet::define_attr_grammar! {
     ns "inspect";
-    crate_path ::metor_panel::inspect_attrs;
+    crate_path ::metor_panel::inspect;
 
     /// Inspector attributes for metor-panel fields and types.
     pub enum Attr {
