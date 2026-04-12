@@ -65,6 +65,9 @@ pub struct ListItem {
 /// Type-erased callback that returns a palette page for adding a new child.
 pub type AddCallback = Arc<dyn Fn() -> PalettePage + Send + Sync>;
 
+/// One-shot action callback for command fields.
+pub type CommandCallback = Arc<dyn Fn(&mut gpui::Window, &mut App) + Send + Sync>;
+
 /// What kind of value an [`InspectionValue::ElementPicker`] component is
 /// expected to produce. The picker UI uses this to label its prompt; the
 /// downstream consumer uses it to choose the correct fixed-frame
@@ -109,6 +112,10 @@ pub enum InspectionValue {
         component: Option<ComponentId>,
         arity: PickerArity,
     },
+    /// A one-shot action. Clicking executes the callback and dismisses.
+    Command(CommandCallback),
+    /// Sub-fields of a list item. Clicking cascades to show these fields.
+    ListItemFields(Vec<InspectionField>),
 }
 
 impl std::fmt::Debug for InspectionValue {
@@ -135,6 +142,8 @@ impl std::fmt::Debug for InspectionValue {
                 .field("component", component)
                 .field("arity", arity)
                 .finish(),
+            Self::Command(_) => f.debug_tuple("Command").field(&"..").finish(),
+            Self::ListItemFields(fields) => f.debug_tuple("ListItemFields").field(fields).finish(),
         }
     }
 }
@@ -157,8 +166,10 @@ impl InspectionValue {
                 })
             }
             InspectionValue::Traces(_) => None,     // traces are edited via the picker, not parsed
-            InspectionValue::List { .. } => None, // lists are navigated, not parsed
-            InspectionValue::ElementPicker { .. } => None, // same — always picker-driven
+            InspectionValue::List { .. } => None,
+            InspectionValue::ElementPicker { .. } => None,
+            InspectionValue::Command(_) => None,
+            InspectionValue::ListItemFields(_) => None,
         }
     }
 }
@@ -206,6 +217,10 @@ impl std::fmt::Display for InspectionValue {
                 Some(_) => write!(f, "(bound)"),
                 None => write!(f, "(none)"),
             },
+            InspectionValue::Command(_) => Ok(()),
+            InspectionValue::ListItemFields(fields) => {
+                write!(f, "{} fields", fields.len())
+            }
         }
     }
 }

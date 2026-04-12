@@ -544,7 +544,7 @@ fn inspectable_fields_and_setter<T: Inspectable>(
 ) -> (Vec<InspectionField>, FieldSetter, FieldsProvider) {
     let fields = entity.read(cx).fields(cx);
     let setter_entity = entity.clone();
-    let setter: FieldSetter = Box::new(move |field_id, value, _window, cx| {
+    let setter: FieldSetter = Arc::new(move |field_id, value, _window, cx| {
         setter_entity.update(cx, |this, cx| {
             this.set_field(field_id, value, cx);
         });

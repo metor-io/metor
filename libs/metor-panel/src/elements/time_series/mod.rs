@@ -911,7 +911,7 @@ impl Render for TimeSeriesPlot {
                                     let entity = cx.entity().clone();
                                     let provider_entity = entity.clone();
                                     let setter: crate::tiles::item::FieldSetter =
-                                        Box::new(move |fid, val, _w, cx| {
+                                        Arc::new(move |fid, val, _w, cx| {
                                             entity.update(cx, |t, cx| t.set_field(fid, val, cx));
                                         });
                                     let trace_idx = i;

@@ -1,6 +1,6 @@
 use gpui::{
-    canvas, fill, point, px, size, App, ClipboardItem, Hsla, IntoElement, KeyDownEvent, Pixels,
-    SharedString, Styled, TextRun,
+    App, ClipboardItem, Hsla, IntoElement, KeyDownEvent, Pixels, SharedString, Styled, TextRun,
+    canvas, fill, point, px, size,
 };
 
 use crate::theme::{Theme, theme};
@@ -26,7 +26,7 @@ pub struct TextFieldStyle {
 impl TextFieldStyle {
     fn from_theme(theme: &Theme) -> Self {
         Self {
-            font_size: px(14.0),
+            font_size: px(12.0),
             line_height: px(20.0),
             text_color: theme.text_primary,
             placeholder_color: theme.text_tertiary,
@@ -66,7 +66,6 @@ impl TextField {
         self.mark = 0;
     }
 
-
     pub fn has_selection(&self) -> bool {
         self.mark != self.cursor
     }
@@ -97,7 +96,6 @@ impl TextField {
         o
     }
 
-
     fn delete_selection(&mut self) {
         let range = self.selection_range();
         self.text.replace_range(range.clone(), "");
@@ -116,17 +114,13 @@ impl TextField {
 
     fn copy(&self, cx: &mut App) {
         if self.has_selection() {
-            cx.write_to_clipboard(ClipboardItem::new_string(
-                self.selected_text().to_string(),
-            ));
+            cx.write_to_clipboard(ClipboardItem::new_string(self.selected_text().to_string()));
         }
     }
 
     fn cut(&mut self, cx: &mut App) {
         if self.has_selection() {
-            cx.write_to_clipboard(ClipboardItem::new_string(
-                self.selected_text().to_string(),
-            ));
+            cx.write_to_clipboard(ClipboardItem::new_string(self.selected_text().to_string()));
             self.delete_selection();
         }
     }
@@ -139,7 +133,6 @@ impl TextField {
             }
         }
     }
-
 
     fn move_cursor(&mut self, offset: usize, extend_selection: bool) {
         self.cursor = offset;
@@ -174,13 +167,11 @@ impl TextField {
         }
     }
 
-
     /// Handle a key event. Returns `true` if the key was consumed (text changed
     /// or cursor moved), `false` if the caller should handle it.
     pub fn handle_key_down(&mut self, event: &KeyDownEvent, cx: &mut App) -> bool {
         let key = event.keystroke.key.as_str();
         let mods = &event.keystroke.modifiers;
-
 
         if mods.platform {
             match key {
@@ -223,7 +214,6 @@ impl TextField {
             }
         }
 
-
         #[cfg(target_os = "macos")]
         if mods.control {
             match key {
@@ -264,7 +254,6 @@ impl TextField {
                 _ => return false,
             }
         }
-
 
         match key {
             "backspace" => {
@@ -308,7 +297,6 @@ impl TextField {
             }
         }
     }
-
 
     pub fn element(&self) -> impl IntoElement {
         let text = self.text.clone();
@@ -377,39 +365,33 @@ impl TextField {
                 let text_origin = point(bounds.origin.x - scroll_offset, base_y);
 
                 // Clip to element bounds
-                window.with_content_mask(
-                    Some(gpui::ContentMask { bounds }),
-                    |window| {
-                        // 1. Paint selection highlight (behind text)
-                        if !is_placeholder && mark != cursor {
-                            let sel_start = mark.min(cursor);
-                            let sel_end = mark.max(cursor);
-                            let sel_x_start = shaped.x_for_index(sel_start);
-                            let sel_x_end = shaped.x_for_index(sel_end);
+                window.with_content_mask(Some(gpui::ContentMask { bounds }), |window| {
+                    // 1. Paint selection highlight (behind text)
+                    if !is_placeholder && mark != cursor {
+                        let sel_start = mark.min(cursor);
+                        let sel_end = mark.max(cursor);
+                        let sel_x_start = shaped.x_for_index(sel_start);
+                        let sel_x_end = shaped.x_for_index(sel_end);
 
-                            let sel_bounds = gpui::Bounds::new(
-                                point(
-                                    bounds.origin.x + sel_x_start - scroll_offset,
-                                    base_y,
-                                ),
-                                size(sel_x_end - sel_x_start, line_height),
-                            );
-                            window.paint_quad(fill(sel_bounds, selection_color));
-                        }
-
-                        // 2. Paint text
-                        let _ = shaped.paint(text_origin, line_height, window, _cx);
-
-                        // 3. Paint cursor (on top of text)
-                        let cursor_screen_x =
-                            bounds.origin.x + cursor_x - scroll_offset - cursor_width() / 2.0;
-                        let cursor_bounds = gpui::Bounds::new(
-                            point(cursor_screen_x, base_y),
-                            size(cursor_width(), line_height),
+                        let sel_bounds = gpui::Bounds::new(
+                            point(bounds.origin.x + sel_x_start - scroll_offset, base_y),
+                            size(sel_x_end - sel_x_start, line_height),
                         );
-                        window.paint_quad(fill(cursor_bounds, cursor_color));
-                    },
-                );
+                        window.paint_quad(fill(sel_bounds, selection_color));
+                    }
+
+                    // 2. Paint text
+                    let _ = shaped.paint(text_origin, line_height, window, _cx);
+
+                    // 3. Paint cursor (on top of text)
+                    let cursor_screen_x =
+                        bounds.origin.x + cursor_x - scroll_offset - cursor_width() / 2.0;
+                    let cursor_bounds = gpui::Bounds::new(
+                        point(cursor_screen_x, base_y),
+                        size(cursor_width(), line_height),
+                    );
+                    window.paint_quad(fill(cursor_bounds, cursor_color));
+                });
             },
         )
         .w_full()

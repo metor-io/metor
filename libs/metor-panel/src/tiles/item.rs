@@ -39,7 +39,7 @@ pub trait PaneItem: Render + Sized + 'static {
 }
 
 /// Type-erased setter for an inspectable field.
-pub type FieldSetter = Box<dyn Fn(FieldId, InspectionValue, &mut Window, &mut App)>;
+pub type FieldSetter = Arc<dyn Fn(FieldId, InspectionValue, &mut Window, &mut App)>;
 
 /// Re-fetches the current fields from an inspectable entity.
 pub type FieldsProvider = Arc<dyn Fn(&App) -> Vec<InspectionField>>;

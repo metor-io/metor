@@ -928,7 +928,7 @@ fn create_widget_view(
                 let fields = e.read(cx).fields(cx);
                 let setter_e = e.clone();
                 let setter: super::item::FieldSetter =
-                    Box::new(move |fid, val, _w, cx| {
+                    Arc::new(move |fid, val, _w, cx| {
                         setter_e.update(cx, |this, cx| this.set_field(fid, val, cx));
                     });
                 let provider: super::item::FieldsProvider =
@@ -1006,7 +1006,7 @@ fn create_widget_view(
                     let fields = e.read(cx).fields(cx);
                     let setter_e = e.clone();
                     let setter: super::item::FieldSetter =
-                        Box::new(move |fid, val, _w, cx| {
+                        Arc::new(move |fid, val, _w, cx| {
                             setter_e.update(cx, |this, cx| this.set_field(fid, val, cx));
                         });
                     let provider: super::item::FieldsProvider =
@@ -1037,7 +1037,7 @@ fn create_widget_view(
                 let fields = e.read(cx).fields(cx);
                 let setter_e = e.clone();
                 let setter: super::item::FieldSetter =
-                    Box::new(move |fid, val, _w, cx| {
+                    Arc::new(move |fid, val, _w, cx| {
                         setter_e.update(cx, |this, cx| this.set_field(fid, val, cx));
                     });
                 let provider: super::item::FieldsProvider =
@@ -1369,7 +1369,7 @@ impl PaneItem for DashboardPanel {
         let fields = self.fields(cx);
         let setter_entity = self.self_entity.clone();
         let setter: super::item::FieldSetter =
-            Box::new(move |field_id, value, _window, cx| {
+            Arc::new(move |field_id, value, _window, cx| {
                 setter_entity.update(cx, |this, cx| {
                     this.set_field(field_id, value, cx);
                 });
