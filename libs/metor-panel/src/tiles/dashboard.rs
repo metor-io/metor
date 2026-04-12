@@ -13,6 +13,7 @@ use smallvec::SmallVec;
 
 use crate::command_palette::{PaletteAction, PaletteItem, PalettePage};
 use crate::elements::time_series::OpenPageCallback;
+use crate::elements::viewer_3d::Viewer3d;
 use crate::elements::{ComponentText, Monitor, Scrollbar, TimeSeriesPlot, new_component_table};
 use crate::inspectable::palette_page_for_inspectable;
 use crate::theme::theme;
@@ -52,6 +53,7 @@ pub enum WidgetKind {
     Table,
     Image,
     Monitor,
+    Viewer3d,
 }
 
 impl WidgetKind {
@@ -62,6 +64,7 @@ impl WidgetKind {
             WidgetKind::Table => (400.0, 300.0),
             WidgetKind::Image => (300.0, 200.0),
             WidgetKind::Monitor => (150.0, 80.0),
+            WidgetKind::Viewer3d => (480.0, 320.0),
         }
     }
 }
@@ -771,6 +774,14 @@ fn add_widget_page(dashboard: Entity<DashboardPanel>, db: Arc<DB>) -> PalettePag
                 page: Box::new(move || image_path_page(dashboard)),
             }
         }),
+        PaletteItem::new("3D Viewer", {
+            let dashboard = dashboard.clone();
+            PaletteAction::Execute(Box::new(move |_, _, cx| {
+                dashboard.update(cx, |this, cx| {
+                    this.add_widget(WidgetKind::Viewer3d, serde_json::json!({}), cx);
+                });
+            }))
+        }),
     ];
 
     PalettePage::new(items).prompt("Select widget type")
@@ -839,6 +850,7 @@ fn widget_display_label(widget: &DashboardWidget) -> SharedString {
                 .unwrap_or("?")
         )),
         WidgetKind::Monitor => SharedString::from(format!("Monitor: {}", component_label())),
+        WidgetKind::Viewer3d => SharedString::from(format!("3D Viewer #{}", widget.id.0)),
     }
 }
 
@@ -931,6 +943,18 @@ fn create_widget_view(
                 });
                 (AnyView::from(entity), None)
             }
+        }
+        WidgetKind::Viewer3d => {
+            let entity = cx.new(|cx| Viewer3d::with_db(db.clone(), cx));
+            let inspect_entity = entity.clone();
+            let inspect_fn: WidgetInspectFn = Box::new(move |db, cx| {
+                Some(palette_page_for_inspectable(
+                    inspect_entity.clone(),
+                    Some(db.clone()),
+                    cx,
+                ))
+            });
+            (AnyView::from(entity), Some(inspect_fn))
         }
     }
 }
