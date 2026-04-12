@@ -502,6 +502,7 @@ impl Trace {
 /// chrome painted around the `LinePlot` child.
 pub struct TimeSeriesPlot {
     db: Arc<DB>,
+    self_entity: Entity<TimeSeriesPlot>,
     line_plot: Entity<LinePlot>,
     custom_title: Option<SharedString>,
     drag_start: Option<Point<Pixels>>,
@@ -509,6 +510,7 @@ pub struct TimeSeriesPlot {
     drag_zone: AxisZone,
     last_plot_area: Option<Bounds<Pixels>>,
     on_open_page: Option<OpenPageCallback>,
+    on_open_inspector: Option<crate::inspectable::OpenInspectorCallback>,
 }
 
 /// Callback type for when the plot wants to open an inspector page.
@@ -521,6 +523,7 @@ impl TimeSeriesPlot {
         line_plot.update(cx, |lp, cx| lp.bind_traces(db.clone(), traces, cx));
         Self {
             db,
+            self_entity: cx.entity().clone(),
             line_plot,
             custom_title: None,
             drag_start: None,
@@ -528,11 +531,16 @@ impl TimeSeriesPlot {
             drag_zone: AxisZone::Plot,
             last_plot_area: None,
             on_open_page: None,
+            on_open_inspector: None,
         }
     }
 
     pub fn set_on_open_page(&mut self, cb: OpenPageCallback) {
         self.on_open_page = Some(cb);
+    }
+
+    pub fn set_on_open_inspector(&mut self, cb: crate::inspectable::OpenInspectorCallback) {
+        self.on_open_inspector = Some(cb);
     }
 
     /// Convenience: create a plot for a single component with the given element
@@ -659,21 +667,15 @@ impl TimeSeriesPlot {
         cx.notify();
     }
 
-    fn trace_inspect_page(
-        &self,
-        trace_idx: usize,
-        cx: &Context<Self>,
-    ) -> crate::command_palette::PalettePage {
-        use crate::inspectable::palette_page_for_list_item;
-
+    pub(crate) fn trace_fields(&self, trace_idx: usize, cx: &gpui::App) -> Vec<InspectionField> {
         let trace = self
             .line_plot
             .read(cx)
             .trace(trace_idx)
             .cloned()
-            .expect("trace_inspect_page called with an invalid index");
+            .expect("trace_fields called with an invalid index");
         let base = TRACE_SETTINGS_BASE + trace_idx as u32 * 100;
-        let fields = vec![
+        vec![
             InspectionField::new(
                 "Style",
                 FieldId(base + TRACE_SUB_STYLE),
@@ -701,8 +703,24 @@ impl TimeSeriesPlot {
                 InspectionValue::F64(trace.stroke_width as f64),
             )
             .with_range(0.5, 10.0),
-        ];
-        palette_page_for_list_item(cx.entity().clone(), &fields, trace.label.clone(), None)
+        ]
+    }
+
+    fn trace_inspect_page(
+        &self,
+        trace_idx: usize,
+        cx: &Context<Self>,
+    ) -> crate::command_palette::PalettePage {
+        use crate::inspectable::palette_page_for_list_item;
+
+        let label = self
+            .line_plot
+            .read(cx)
+            .trace(trace_idx)
+            .map(|t| t.label.clone())
+            .unwrap_or_default();
+        let fields = self.trace_fields(trace_idx, cx);
+        palette_page_for_list_item(cx.entity().clone(), &fields, label, None)
     }
 }
 
@@ -887,8 +905,31 @@ impl Render for TimeSeriesPlot {
                         )
                         .on_mouse_down(
                             MouseButton::Right,
-                            cx.listener(move |this, _event: &gpui::MouseDownEvent, window, cx| {
-                                if let Some(cb) = this.on_open_page.clone() {
+                            cx.listener(move |this, event: &gpui::MouseDownEvent, window, cx| {
+                                if let Some(cb) = this.on_open_inspector.clone() {
+                                    let fields = this.trace_fields(i, cx);
+                                    let entity = cx.entity().clone();
+                                    let provider_entity = entity.clone();
+                                    let setter: crate::tiles::item::FieldSetter =
+                                        Box::new(move |fid, val, _w, cx| {
+                                            entity.update(cx, |t, cx| t.set_field(fid, val, cx));
+                                        });
+                                    let trace_idx = i;
+                                    let provider: crate::tiles::item::FieldsProvider =
+                                        std::sync::Arc::new(move |cx| {
+                                            provider_entity.read(cx).trace_fields(trace_idx, cx)
+                                        });
+                                    cb(
+                                        crate::inspectable::InspectorRequest {
+                                            fields,
+                                            position: event.position,
+                                            on_set_field: setter,
+                                            fields_provider: provider,
+                                        },
+                                        window,
+                                        cx,
+                                    );
+                                } else if let Some(cb) = this.on_open_page.clone() {
                                     let page = this.trace_inspect_page(i, cx);
                                     cb(page, window, cx);
                                 }
@@ -917,25 +958,17 @@ const TRACE_SUB_STYLE: u32 = 0;
 const TRACE_SUB_COLOR: u32 = 1;
 const TRACE_SUB_VISIBLE: u32 = 2;
 const TRACE_SUB_STROKE_WIDTH: u32 = 3;
+const TRACE_SUB_REMOVE: u32 = 4;
 
 impl Inspectable for TimeSeriesPlot {
     fn fields(&self, cx: &gpui::App) -> Vec<InspectionField> {
         let lp = self.line_plot.read(cx);
-        let current_traces: Vec<(ComponentId, usize)> = lp
-            .traces()
-            .map(|t| (t.component_id, t.element_index))
-            .collect();
 
         let mut fields = vec![
             InspectionField::new(
                 "Title",
                 FieldId(5),
                 InspectionValue::String(self.title(cx).to_string()),
-            ),
-            InspectionField::new(
-                "Traces",
-                FieldId(0),
-                InspectionValue::Traces(current_traces),
             ),
         ];
 
@@ -946,6 +979,7 @@ impl Inspectable for TimeSeriesPlot {
                 let base = TRACE_SETTINGS_BASE + i as u32 * 100;
                 ListItem {
                     label: trace.label.clone(),
+                    can_remove: true,
                     fields: vec![
                         InspectionField::new(
                             "Style",
@@ -974,18 +1008,34 @@ impl Inspectable for TimeSeriesPlot {
                             InspectionValue::F64(trace.stroke_width as f64),
                         )
                         .with_range(0.5, 10.0),
+                        InspectionField::new(
+                            "Remove",
+                            FieldId(base + TRACE_SUB_REMOVE),
+                            InspectionValue::Bool(false),
+                        ),
                     ],
                 }
             })
             .collect();
 
-        if !trace_items.is_empty() {
-            fields.push(InspectionField::new(
-                "Trace Settings",
-                FieldId(1),
-                InspectionValue::List(trace_items),
-            ));
-        }
+        let entity = self.self_entity.clone();
+        let db = self.db.clone();
+        let existing: Vec<(ComponentId, usize)> = lp
+            .traces()
+            .map(|t| (t.component_id, t.element_index))
+            .collect();
+        let on_add: crate::inspectable::AddCallback = Arc::new(move || {
+            crate::trace_picker::trace_picker_page(entity.clone(), FieldId(0), db.clone(), &existing)
+        });
+
+        fields.push(InspectionField::new(
+            "Traces",
+            FieldId(1),
+            InspectionValue::List {
+                items: trace_items,
+                on_add: Some(on_add),
+            },
+        ));
 
         fields.push(InspectionField::new(
             "X Range",
@@ -1074,6 +1124,20 @@ impl Inspectable for TimeSeriesPlot {
             (FieldId(id), value) if id >= TRACE_SETTINGS_BASE => {
                 let trace_idx = ((id - TRACE_SETTINGS_BASE) / 100) as usize;
                 let sub_field = (id - TRACE_SETTINGS_BASE) % 100;
+                if sub_field == TRACE_SUB_REMOVE {
+                    if matches!(value, InspectionValue::Bool(true)) {
+                        let remaining: Vec<Trace> = self
+                            .line_plot
+                            .read(cx)
+                            .traces()
+                            .enumerate()
+                            .filter(|(i, _)| *i != trace_idx)
+                            .map(|(_, t)| t.clone())
+                            .collect();
+                        self.set_traces(remaining, cx);
+                    }
+                    return;
+                }
                 self.line_plot.update(cx, |lp, cx| {
                     lp.update_trace(
                         trace_idx,

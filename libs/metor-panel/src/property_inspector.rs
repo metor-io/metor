@@ -2,14 +2,15 @@ use std::sync::Arc;
 
 use gpui::{
     anchored, canvas, deferred, div, fill, point, prelude::*, px, size, App, Bounds, Context,
-    Corner, DragMoveEvent, Empty, FocusHandle, Focusable, Hsla, IntoElement, KeyDownEvent,
-    MouseDownEvent, Pixels, Point, Render, SharedString, Window,
+    Corner, DragMoveEvent, Empty, FocusHandle, Focusable, Hsla, IntoElement, KeyDownEvent, Pixels,
+    Point, Render, SharedString, Window,
 };
 
-use crate::command_palette::{PalettePage, TextField};
-use crate::inspectable::{FieldId, InspectionField, InspectionValue};
+use crate::command_palette::{PaletteAction, PalettePage, TextField};
+use crate::icons::Icon;
+use crate::inspectable::{AddCallback, FieldId, InspectionField, InspectionValue, ListItem};
 use crate::theme::theme;
-use crate::tiles::item::FieldSetter;
+use crate::tiles::item::{FieldSetter, FieldsProvider};
 
 const SLIDER_HEIGHT: f32 = 14.0;
 const SLIDER_TRACK_HEIGHT: f32 = 4.0;
@@ -59,9 +60,16 @@ pub struct PropertyInspector {
     editing_field: Option<FieldId>,
     text_field: TextField,
     on_set_field: FieldSetter,
+    fields_provider: Option<FieldsProvider>,
     on_open_palette: Option<Arc<dyn Fn(PalettePage, &mut Window, &mut App)>>,
     /// Which color field is expanded for HSL editing.
     expanded_color: Option<FieldId>,
+    /// Which list fields are expanded to show child items.
+    expanded_lists: Vec<FieldId>,
+    /// Which enum field is expanded to show its options.
+    expanded_enum: Option<FieldId>,
+    /// Which list's add submenu is expanded, with the cached page items.
+    expanded_add: Option<(FieldId, Vec<(SharedString, PaletteAction)>)>,
 }
 
 impl PropertyInspector {
@@ -80,13 +88,21 @@ impl PropertyInspector {
             editing_field: None,
             text_field: TextField::new("", cx),
             on_set_field,
+            fields_provider: None,
             on_open_palette: None,
             expanded_color: None,
+            expanded_lists: Vec::new(),
+            expanded_enum: None,
+            expanded_add: None,
         }
     }
 
     pub fn set_parent_focus(&mut self, handle: FocusHandle) {
         self.parent_focus = Some(handle);
+    }
+
+    pub fn set_fields_provider(&mut self, provider: FieldsProvider) {
+        self.fields_provider = Some(provider);
     }
 
     pub fn set_on_open_palette(
@@ -156,9 +172,9 @@ impl PropertyInspector {
     }
 
     fn apply_field(&mut self, field_id: FieldId, value: InspectionValue, window: &mut Window, cx: &mut App) {
-        (self.on_set_field)(field_id, value.clone(), window, cx);
-        if let Some(f) = self.fields.iter_mut().find(|f| f.field_id == field_id) {
-            f.value = value;
+        (self.on_set_field)(field_id, value, window, cx);
+        if let Some(provider) = &self.fields_provider {
+            self.fields = provider(cx);
         }
     }
 
@@ -186,6 +202,9 @@ impl PropertyInspector {
             InspectionValue::Color(color) => self
                 .render_color_row(field, *color, row_ix, cx)
                 .into_any_element(),
+            InspectionValue::List { items, on_add } => self
+                .render_list_section(field, items, on_add.as_ref(), row_ix, cx)
+                .into_any_element(),
             _ => self.render_fallback_row(field, row_ix, cx).into_any_element(),
         }
     }
@@ -200,11 +219,28 @@ impl PropertyInspector {
         let theme = theme(cx);
         let field_id = field.field_id;
         let toggled = !val;
-        let toggle_color = if val {
+        let track_color = if val {
             theme.line_color
         } else {
             theme.text_tertiary
         };
+
+        let knob = div()
+            .w(px(10.0))
+            .h(px(10.0))
+            .rounded(px(2.0))
+            .bg(theme.text_primary);
+
+        let track = div()
+            .w(px(28.0))
+            .h(px(14.0))
+            .rounded(px(3.0))
+            .bg(track_color)
+            .flex()
+            .items_center()
+            .px(px(2.0))
+            .when(val, |el| el.flex_row_reverse())
+            .child(knob);
 
         div()
             .id(("inspector-row", row_ix))
@@ -230,13 +266,7 @@ impl PropertyInspector {
                     .text_color(theme.text_primary)
                     .child(field.label.clone()),
             )
-            .child(
-                div()
-                    .w(px(14.0))
-                    .h(px(14.0))
-                    .rounded(px(7.0))
-                    .bg(toggle_color),
-            )
+            .child(track)
     }
 
     fn render_text_row(
@@ -433,14 +463,9 @@ impl PropertyInspector {
     ) -> impl IntoElement {
         let theme = theme(cx);
         let field_id = field.field_id;
-        let next_option = {
-            let idx = options.iter().position(|o| o == selected).unwrap_or(0);
-            let next_idx = (idx + 1) % options.len();
-            options[next_idx].clone()
-        };
-        let all_opts = options.to_vec();
+        let is_expanded = self.expanded_enum == Some(field_id);
 
-        div()
+        let header = div()
             .id(("inspector-row", row_ix))
             .flex()
             .flex_row()
@@ -453,16 +478,12 @@ impl PropertyInspector {
             .hover(|s| s.bg(theme.selection_bg))
             .on_mouse_down(
                 gpui::MouseButton::Left,
-                cx.listener(move |this, _, window, cx| {
-                    this.apply_field(
-                        field_id,
-                        InspectionValue::Enum {
-                            selected: next_option.clone(),
-                            options: all_opts.clone(),
-                        },
-                        window,
-                        cx,
-                    );
+                cx.listener(move |this, _, _, cx| {
+                    if this.expanded_enum == Some(field_id) {
+                        this.expanded_enum = None;
+                    } else {
+                        this.expanded_enum = Some(field_id);
+                    }
                     cx.notify();
                 }),
             )
@@ -474,10 +495,72 @@ impl PropertyInspector {
             )
             .child(
                 div()
-                    .text_size(px(12.0))
-                    .text_color(theme.text_secondary)
-                    .child(SharedString::from(selected.to_string())),
-            )
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap(px(4.0))
+                    .child(
+                        div()
+                            .text_size(px(12.0))
+                            .text_color(theme.text_secondary)
+                            .child(SharedString::from(selected.to_string())),
+                    )
+                    .child(
+                        if is_expanded {
+                            Icon::ChevronDown.svg(8.0)
+                        } else {
+                            Icon::ChevronRight.svg(8.0)
+                        },
+                    ),
+            );
+
+        let mut col = div().flex().flex_col().w_full().child(header);
+
+        if is_expanded {
+            for (i, option) in options.iter().enumerate() {
+                let is_selected = option == selected;
+                let option_val = option.clone();
+                let all_opts = options.to_vec();
+                let option_text_color = if is_selected {
+                    theme.text_primary
+                } else {
+                    theme.text_secondary
+                };
+                col = col.child(
+                    div()
+                        .id(("enum-option", row_ix * 100 + i + 4000))
+                        .w_full()
+                        .px(px(24.0))
+                        .py(px(3.0))
+                        .cursor_pointer()
+                        .hover(|s| s.bg(theme.selection_bg))
+                        .on_mouse_down(
+                            gpui::MouseButton::Left,
+                            cx.listener(move |this, _, window, cx| {
+                                this.apply_field(
+                                    field_id,
+                                    InspectionValue::Enum {
+                                        selected: option_val.clone(),
+                                        options: all_opts.clone(),
+                                    },
+                                    window,
+                                    cx,
+                                );
+                                this.expanded_enum = None;
+                                cx.notify();
+                            }),
+                        )
+                        .child(
+                            div()
+                                .text_size(px(11.0))
+                                .text_color(option_text_color)
+                                .child(SharedString::from(option.clone())),
+                        ),
+                );
+            }
+        }
+
+        col
     }
 
     fn render_color_row(
@@ -697,6 +780,271 @@ impl PropertyInspector {
         col
     }
 
+    fn render_list_section(
+        &self,
+        field: &InspectionField,
+        items: &[ListItem],
+        on_add: Option<&AddCallback>,
+        row_ix: usize,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let theme = theme(cx);
+        let field_id = field.field_id;
+        let is_expanded = self.expanded_lists.contains(&field_id);
+        let item_count = items.len();
+
+        let header = div()
+            .id(("inspector-row", row_ix))
+            .flex()
+            .flex_row()
+            .items_center()
+            .justify_between()
+            .w_full()
+            .px(px(12.0))
+            .py(px(4.0))
+            .cursor_pointer()
+            .hover(|s| s.bg(theme.selection_bg))
+            .on_mouse_down(
+                gpui::MouseButton::Left,
+                cx.listener(move |this, _, _, cx| {
+                    if let Some(pos) = this.expanded_lists.iter().position(|id| *id == field_id) {
+                        this.expanded_lists.remove(pos);
+                    } else {
+                        this.expanded_lists.push(field_id);
+                    }
+                    cx.notify();
+                }),
+            )
+            .child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap(px(4.0))
+                    .child(
+                        if is_expanded {
+                            Icon::ChevronDown.svg(10.0)
+                        } else {
+                            Icon::ChevronRight.svg(10.0)
+                        },
+                    )
+                    .child(
+                        div()
+                            .text_size(px(12.0))
+                            .text_color(theme.text_primary)
+                            .child(field.label.clone()),
+                    ),
+            )
+            .child(
+                div()
+                    .text_size(px(11.0))
+                    .text_color(theme.text_tertiary)
+                    .child(SharedString::from(format!("{}", item_count))),
+            );
+
+        let mut col = div().flex().flex_col().w_full().child(header);
+
+        if is_expanded {
+            if let Some(add_cb) = on_add {
+                let add_cb = add_cb.clone();
+                let is_add_expanded = self
+                    .expanded_add
+                    .as_ref()
+                    .map_or(false, |(id, _)| *id == field_id);
+
+                col = col.child(
+                    div()
+                        .id(("list-add", row_ix))
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .gap(px(4.0))
+                        .w_full()
+                        .px(px(24.0))
+                        .py(px(3.0))
+                        .cursor_pointer()
+                        .hover(|s| s.bg(theme.selection_bg))
+                        .on_mouse_down(
+                            gpui::MouseButton::Left,
+                            cx.listener(move |this, _, _, cx| {
+                                if this
+                                    .expanded_add
+                                    .as_ref()
+                                    .map_or(false, |(id, _)| *id == field_id)
+                                {
+                                    this.expanded_add = None;
+                                } else {
+                                    let page = add_cb();
+                                    let items: Vec<_> = page
+                                        .items
+                                        .into_iter()
+                                        .map(|item| (item.label, item.action))
+                                        .collect();
+                                    this.expanded_add = Some((field_id, items));
+                                }
+                                cx.notify();
+                            }),
+                        )
+                        .child(Icon::Add.svg(10.0))
+                        .child(
+                            div()
+                                .text_size(px(11.0))
+                                .text_color(theme.text_secondary)
+                                .child(SharedString::new_static("New")),
+                        ),
+                );
+
+                if is_add_expanded {
+                    if let Some((_, ref items)) = self.expanded_add {
+                        for (i, (label, _)) in items.iter().enumerate() {
+                            let add_ix = row_ix * 100 + i + 5000;
+                            col = col.child(
+                                div()
+                                    .id(("add-option", add_ix))
+                                    .w_full()
+                                    .px(px(36.0))
+                                    .py(px(3.0))
+                                    .cursor_pointer()
+                                    .hover(|s| s.bg(theme.selection_bg))
+                                    .on_mouse_down(
+                                        gpui::MouseButton::Left,
+                                        cx.listener({
+                                            let idx = i;
+                                            move |this, _, window, cx| {
+                                                if let Some((_, mut items)) =
+                                                    this.expanded_add.take()
+                                                {
+                                                    if idx < items.len() {
+                                                        let (_, action) = items.remove(idx);
+                                                        match action {
+                                                            PaletteAction::Execute(f) => {
+                                                                this.dismiss(window);
+                                                                f("", window, cx);
+                                                            }
+                                                            PaletteAction::NextPage {
+                                                                page, ..
+                                                            } => {
+                                                                let page = page();
+                                                                if let Some(cb) =
+                                                                    &this.on_open_palette
+                                                                {
+                                                                    cb(page, window, cx);
+                                                                    this.dismiss(window);
+                                                                }
+                                                            }
+                                                        }
+                                                    }
+                                                }
+                                                cx.notify();
+                                            }
+                                        }),
+                                    )
+                                    .child(
+                                        div()
+                                            .text_size(px(11.0))
+                                            .text_color(theme.text_secondary)
+                                            .child(label.clone()),
+                                    ),
+                            );
+                        }
+                    }
+                }
+            }
+
+            for (i, item) in items.iter().enumerate() {
+                let child_ix = row_ix * 100 + i + 2000;
+                col = col.child(self.render_list_child(item, child_ix, cx));
+            }
+        }
+
+        col
+    }
+
+    fn render_list_child(
+        &self,
+        item: &ListItem,
+        child_ix: usize,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let theme = theme(cx);
+
+        let mut row = div()
+            .id(("list-child", child_ix))
+            .flex()
+            .flex_col()
+            .w_full()
+            .px(px(24.0))
+            .py(px(2.0));
+
+        let mut header = div()
+            .flex()
+            .flex_row()
+            .items_center()
+            .justify_between()
+            .w_full();
+
+        header = header.child(
+            div()
+                .text_size(px(11.0))
+                .text_color(theme.text_primary)
+                .child(item.label.clone()),
+        );
+
+        if item.can_remove {
+            // Render sub-fields inline with a delete indicator
+            for sub_field in &item.fields {
+                if matches!(sub_field.value, InspectionValue::Bool(false))
+                    && sub_field.label.as_ref() == "Remove"
+                {
+                    let field_id = sub_field.field_id;
+                    header = header.child(
+                        div()
+                            .id(("list-remove", child_ix))
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .w(px(16.0))
+                            .h(px(16.0))
+                            .rounded(px(3.0))
+                            .cursor_pointer()
+                            .text_color(theme.text_tertiary)
+                            .hover(|s| s.bg(theme.selection_bg).text_color(theme.text_primary))
+                            .on_mouse_down(
+                                gpui::MouseButton::Left,
+                                cx.listener(move |this, _, window, cx| {
+                                    this.apply_field(
+                                        field_id,
+                                        InspectionValue::Bool(true),
+                                        window,
+                                        cx,
+                                    );
+                                    cx.notify();
+                                }),
+                            )
+                            .child(Icon::Close.svg(10.0)),
+                    );
+                    break;
+                }
+            }
+        }
+
+        row = row.child(header);
+
+        // Render sub-fields (excluding the Remove bool used for delete)
+        for (j, sub_field) in item.fields.iter().enumerate() {
+            if item.can_remove
+                && matches!(sub_field.value, InspectionValue::Bool(false))
+                && sub_field.label.as_ref() == "Remove"
+            {
+                continue;
+            }
+            let sub_ix = child_ix * 100 + j + 3000;
+            row = row.child(self.render_field_row(sub_field, sub_ix, cx));
+        }
+
+        row
+    }
+
     fn render_fallback_row(
         &self,
         field: &InspectionField,
@@ -755,9 +1103,6 @@ impl Render for PropertyInspector {
                 this.handle_key_down(event, window, cx);
                 cx.notify();
             }))
-            .on_mouse_down_out(cx.listener(|this, _: &MouseDownEvent, window, _cx| {
-                this.dismiss(window);
-            }))
             .w(px(280.0))
             .max_h(px(400.0))
             .bg(theme.bg_elevated)
@@ -784,11 +1129,26 @@ impl Render for PropertyInspector {
         }
 
         deferred(
-            anchored()
-                .position(position)
-                .anchor(Corner::TopLeft)
-                .snap_to_window_with_margin(px(8.0))
-                .child(panel),
+            div()
+                .id("inspector-overlay")
+                .occlude()
+                .absolute()
+                .top_0()
+                .left_0()
+                .size_full()
+                .child(
+                    anchored()
+                        .position(position)
+                        .anchor(Corner::TopLeft)
+                        .snap_to_window_with_margin(px(8.0))
+                        .child(
+                            panel.on_mouse_down_out(cx.listener(
+                                |this, _: &gpui::MouseDownEvent, window, _cx| {
+                                    this.dismiss(window);
+                                },
+                            )),
+                        ),
+                ),
         )
         .with_priority(1)
         .into_any_element()

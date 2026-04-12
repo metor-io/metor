@@ -856,6 +856,7 @@ impl Inspectable for Viewer3d {
             .enumerate()
             .map(|(i, entry)| ListItem {
                 label: model_row_label(entry, i),
+                can_remove: true,
                 fields: vec![
                     InspectionField::new(
                         "Label",
@@ -896,7 +897,10 @@ impl Inspectable for Viewer3d {
             InspectionField::new(
                 "Models",
                 FieldId(FIELD_MODELS),
-                InspectionValue::List(model_items),
+                InspectionValue::List {
+                    items: model_items,
+                    on_add: None,
+                },
             ),
             InspectionField::new(
                 "Add Model",

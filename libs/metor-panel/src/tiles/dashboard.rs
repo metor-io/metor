@@ -15,7 +15,10 @@ use crate::command_palette::{PaletteAction, PaletteItem, PalettePage};
 use crate::elements::time_series::OpenPageCallback;
 use crate::elements::viewer_3d::Viewer3d;
 use crate::elements::{ComponentText, Monitor, Scrollbar, TimeSeriesPlot, new_component_table};
-use crate::inspectable::palette_page_for_inspectable;
+use crate::inspectable::{
+    palette_page_for_inspectable, AddCallback, FieldId, Inspectable, InspectionField,
+    InspectionValue, ListItem,
+};
 use crate::theme::theme;
 
 use super::item::PaneItem;
@@ -122,6 +125,17 @@ impl Render for ResizingWidget {
 /// Type-erased function that produces an inspect palette for a widget's inner entity.
 type WidgetInspectFn = Box<dyn Fn(&Arc<DB>, &App) -> Option<PalettePage>>;
 
+/// Type-erased function that returns inspectable fields, a setter, and a provider for a widget.
+type WidgetFieldsFn = Box<
+    dyn Fn(
+        &App,
+    ) -> Option<(
+        Vec<InspectionField>,
+        super::item::FieldSetter,
+        super::item::FieldsProvider,
+    )>,
+>;
+
 /// Free-form canvas dashboard where widgets are positioned at pixel coordinates.
 pub struct DashboardPanel {
     db: Arc<DB>,
@@ -130,7 +144,9 @@ pub struct DashboardPanel {
     widgets: Vec<DashboardWidget>,
     widget_views: HashMap<WidgetId, AnyView>,
     widget_inspect_fns: HashMap<WidgetId, WidgetInspectFn>,
+    widget_fields_fns: HashMap<WidgetId, WidgetFieldsFn>,
     on_open_page: Option<OpenPageCallback>,
+    on_open_inspector: Option<crate::inspectable::OpenInspectorCallback>,
     next_id: u64,
     editing: bool,
     selected: Option<WidgetId>,
@@ -149,7 +165,9 @@ impl DashboardPanel {
             widgets: Vec::new(),
             widget_views: HashMap::new(),
             widget_inspect_fns: HashMap::new(),
+            widget_fields_fns: HashMap::new(),
             on_open_page: None,
+            on_open_inspector: None,
             next_id: 1,
             editing: false,
             selected: None,
@@ -160,6 +178,10 @@ impl DashboardPanel {
 
     pub fn set_on_open_page(&mut self, cb: OpenPageCallback) {
         self.on_open_page = Some(cb);
+    }
+
+    pub fn set_on_open_inspector(&mut self, cb: crate::inspectable::OpenInspectorCallback) {
+        self.on_open_inspector = Some(cb);
     }
 
     fn alloc_id(&mut self) -> WidgetId {
@@ -201,11 +223,14 @@ impl DashboardPanel {
             kind,
             config: config.clone(),
         };
-        let (view, inspect_fn) = create_widget_view(kind, &config, &self.db, cx);
+        let (view, inspect_fn, fields_fn) = create_widget_view(kind, &config, &self.db, cx);
         self.widgets.push(widget);
         self.widget_views.insert(id, view);
         if let Some(f) = inspect_fn {
             self.widget_inspect_fns.insert(id, f);
+        }
+        if let Some(f) = fields_fn {
+            self.widget_fields_fns.insert(id, f);
         }
         cx.notify();
         id
@@ -215,6 +240,7 @@ impl DashboardPanel {
         self.widgets.retain(|w| w.id != id);
         self.widget_views.remove(&id);
         self.widget_inspect_fns.remove(&id);
+        self.widget_fields_fns.remove(&id);
         if self.selected == Some(id) {
             self.selected = None;
         }
@@ -240,9 +266,27 @@ impl DashboardPanel {
     fn open_widget_inspector(
         &self,
         widget_id: WidgetId,
+        position: gpui::Point<gpui::Pixels>,
         window: &mut Window,
         cx: &mut App,
     ) {
+        if let Some(fields_fn) = self.widget_fields_fns.get(&widget_id) {
+            if let Some(cb) = &self.on_open_inspector {
+                if let Some((fields, setter, provider)) = fields_fn(cx) {
+                    cb(
+                        crate::inspectable::InspectorRequest {
+                            fields,
+                            position,
+                            on_set_field: setter,
+                            fields_provider: provider,
+                        },
+                        window,
+                        cx,
+                    );
+                    return;
+                }
+            }
+        }
         if let Some(inspect_fn) = self.widget_inspect_fns.get(&widget_id) {
             if let Some(page) = inspect_fn(&self.db, cx) {
                 if let Some(cb) = &self.on_open_page {
@@ -255,11 +299,14 @@ impl DashboardPanel {
     fn ensure_views(&mut self, cx: &mut Context<Self>) {
         for widget in &self.widgets {
             if !self.widget_views.contains_key(&widget.id) {
-                let (view, inspect_fn) =
+                let (view, inspect_fn, fields_fn) =
                     create_widget_view(widget.kind, &widget.config, &self.db, cx);
                 self.widget_views.insert(widget.id, view);
                 if let Some(f) = inspect_fn {
                     self.widget_inspect_fns.insert(widget.id, f);
+                }
+                if let Some(f) = fields_fn {
+                    self.widget_fields_fns.insert(widget.id, f);
                 }
             }
         }
@@ -438,11 +485,15 @@ impl DashboardPanel {
                     .left_0()
                     .size_full()
                     .on_mouse_down(gpui::MouseButton::Left, |_, _, _| {})
-                    .on_mouse_down(gpui::MouseButton::Right, move |_, window, cx| {
-                        blocker_entity.update(cx, |this, cx| {
-                            this.open_widget_inspector(blocker_widget_id, window, cx);
-                        });
-                    }),
+                    .on_mouse_down(
+                        gpui::MouseButton::Right,
+                        move |event: &gpui::MouseDownEvent, window, cx| {
+                            let pos = event.position;
+                            blocker_entity.update(cx, |this, cx| {
+                                this.open_widget_inspector(blocker_widget_id, pos, window, cx);
+                            });
+                        },
+                    ),
             );
 
             // Center move zone — inset from edges so resize zones sit on top.
@@ -859,11 +910,12 @@ fn create_widget_view(
     config: &serde_json::Value,
     db: &Arc<DB>,
     cx: &mut App,
-) -> (AnyView, Option<WidgetInspectFn>) {
+) -> (AnyView, Option<WidgetInspectFn>, Option<WidgetFieldsFn>) {
     match kind {
         WidgetKind::Plot => {
             let entity = cx.new(|cx| TimeSeriesPlot::new(db.clone(), vec![], cx));
             let inspect_entity = entity.clone();
+            let fields_entity = entity.clone();
             let inspect_fn: WidgetInspectFn = Box::new(move |db, cx| {
                 Some(palette_page_for_inspectable(
                     inspect_entity.clone(),
@@ -871,7 +923,19 @@ fn create_widget_view(
                     cx,
                 ))
             });
-            (AnyView::from(entity), Some(inspect_fn))
+            let fields_fn: WidgetFieldsFn = Box::new(move |cx| {
+                let e = fields_entity.clone();
+                let fields = e.read(cx).fields(cx);
+                let setter_e = e.clone();
+                let setter: super::item::FieldSetter =
+                    Box::new(move |fid, val, _w, cx| {
+                        setter_e.update(cx, |this, cx| this.set_field(fid, val, cx));
+                    });
+                let provider: super::item::FieldsProvider =
+                    std::sync::Arc::new(move |cx| e.read(cx).fields(cx));
+                Some((fields, setter, provider))
+            });
+            (AnyView::from(entity), Some(inspect_fn), Some(fields_fn))
         }
         WidgetKind::Text => {
             let component_name = config
@@ -894,17 +958,17 @@ fn create_widget_view(
                         cx,
                     ))
                 });
-                (AnyView::from(entity), Some(inspect_fn))
+                (AnyView::from(entity), Some(inspect_fn), None)
             } else {
                 let entity = cx.new(|_cx| PlaceholderWidget {
                     label: SharedString::from(format!("? {}", component_name)),
                 });
-                (AnyView::from(entity), None)
+                (AnyView::from(entity), None, None)
             }
         }
         WidgetKind::Table => {
             let entity = cx.new(|cx| new_component_table(db.clone(), cx));
-            (AnyView::from(entity), None)
+            (AnyView::from(entity), None, None)
         }
         WidgetKind::Image => {
             let path = config
@@ -913,7 +977,7 @@ fn create_widget_view(
                 .unwrap_or("")
                 .to_string();
             let entity = cx.new(|_cx| ImageWidget::load(path));
-            (AnyView::from(entity), None)
+            (AnyView::from(entity), None, None)
         }
         WidgetKind::Monitor => {
             let component_name = config
@@ -929,6 +993,7 @@ fn create_widget_view(
             if let Some(id) = component_id {
                 let entity = cx.new(|cx| Monitor::new(db.clone(), id, cx));
                 let inspect_entity = entity.clone();
+                let fields_entity = entity.clone();
                 let inspect_fn: WidgetInspectFn = Box::new(move |db, cx| {
                     Some(palette_page_for_inspectable(
                         inspect_entity.clone(),
@@ -936,17 +1001,30 @@ fn create_widget_view(
                         cx,
                     ))
                 });
-                (AnyView::from(entity), Some(inspect_fn))
+                let fields_fn: WidgetFieldsFn = Box::new(move |cx| {
+                    let e = fields_entity.clone();
+                    let fields = e.read(cx).fields(cx);
+                    let setter_e = e.clone();
+                    let setter: super::item::FieldSetter =
+                        Box::new(move |fid, val, _w, cx| {
+                            setter_e.update(cx, |this, cx| this.set_field(fid, val, cx));
+                        });
+                    let provider: super::item::FieldsProvider =
+                        std::sync::Arc::new(move |cx| e.read(cx).fields(cx));
+                    Some((fields, setter, provider))
+                });
+                (AnyView::from(entity), Some(inspect_fn), Some(fields_fn))
             } else {
                 let entity = cx.new(|_cx| PlaceholderWidget {
                     label: SharedString::from(format!("? {}", component_name)),
                 });
-                (AnyView::from(entity), None)
+                (AnyView::from(entity), None, None)
             }
         }
         WidgetKind::Viewer3d => {
             let entity = cx.new(|cx| Viewer3d::with_db(db.clone(), cx));
             let inspect_entity = entity.clone();
+            let fields_entity = entity.clone();
             let inspect_fn: WidgetInspectFn = Box::new(move |db, cx| {
                 Some(palette_page_for_inspectable(
                     inspect_entity.clone(),
@@ -954,7 +1032,19 @@ fn create_widget_view(
                     cx,
                 ))
             });
-            (AnyView::from(entity), Some(inspect_fn))
+            let fields_fn: WidgetFieldsFn = Box::new(move |cx| {
+                let e = fields_entity.clone();
+                let fields = e.read(cx).fields(cx);
+                let setter_e = e.clone();
+                let setter: super::item::FieldSetter =
+                    Box::new(move |fid, val, _w, cx| {
+                        setter_e.update(cx, |this, cx| this.set_field(fid, val, cx));
+                    });
+                let provider: super::item::FieldsProvider =
+                    std::sync::Arc::new(move |cx| e.read(cx).fields(cx));
+                Some((fields, setter, provider))
+            });
+            (AnyView::from(entity), Some(inspect_fn), Some(fields_fn))
         }
     }
 }
@@ -1164,6 +1254,84 @@ impl Render for DashboardPanel {
     }
 }
 
+const FIELD_TITLE: u32 = 0;
+const FIELD_EDIT_MODE: u32 = 1;
+const FIELD_WIDGETS: u32 = 2;
+const WIDGET_REMOVE_BASE: u32 = 1000;
+
+impl Inspectable for DashboardPanel {
+    fn fields(&self, _cx: &gpui::App) -> Vec<InspectionField> {
+        let dashboard = self.self_entity.clone();
+        let db = self.db.clone();
+        let on_add: AddCallback = Arc::new(move || add_widget_page(dashboard.clone(), db.clone()));
+
+        let widget_items: Vec<ListItem> = self
+            .widgets
+            .iter()
+            .enumerate()
+            .map(|(i, w)| ListItem {
+                label: widget_display_label(w),
+                can_remove: true,
+                fields: vec![InspectionField::new(
+                    "Remove",
+                    FieldId(WIDGET_REMOVE_BASE + i as u32),
+                    InspectionValue::Bool(false),
+                )],
+            })
+            .collect();
+
+        vec![
+            InspectionField::new(
+                "Title",
+                FieldId(FIELD_TITLE),
+                InspectionValue::String(self.title.to_string()),
+            ),
+            InspectionField::new(
+                "Edit Mode",
+                FieldId(FIELD_EDIT_MODE),
+                InspectionValue::Bool(self.editing),
+            ),
+            InspectionField::new(
+                "Widgets",
+                FieldId(FIELD_WIDGETS),
+                InspectionValue::List {
+                    items: widget_items,
+                    on_add: Some(on_add),
+                },
+            ),
+        ]
+    }
+
+    fn set_field(
+        &mut self,
+        field_id: FieldId,
+        value: InspectionValue,
+        cx: &mut Context<Self>,
+    ) {
+        match (field_id, value) {
+            (FieldId(FIELD_TITLE), InspectionValue::String(s)) => {
+                self.title = SharedString::from(s);
+                cx.notify();
+            }
+            (FieldId(FIELD_EDIT_MODE), InspectionValue::Bool(b)) => {
+                self.editing = b;
+                if !b {
+                    self.selected = None;
+                }
+                cx.notify();
+            }
+            (FieldId(id), InspectionValue::Bool(true)) if id >= WIDGET_REMOVE_BASE => {
+                let idx = (id - WIDGET_REMOVE_BASE) as usize;
+                if idx < self.widgets.len() {
+                    let widget_id = self.widgets[idx].id;
+                    self.remove_widget(widget_id, cx);
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
 impl PaneItem for DashboardPanel {
     fn tab_title(&self, _cx: &App) -> SharedString {
         self.title.clone()
@@ -1187,6 +1355,29 @@ impl PaneItem for DashboardPanel {
             self.db.clone(),
             cx,
         ))
+    }
+
+    fn inspect_fields_and_setter(
+        &self,
+        _db: Option<Arc<DB>>,
+        cx: &App,
+    ) -> Option<(
+        Vec<InspectionField>,
+        super::item::FieldSetter,
+        super::item::FieldsProvider,
+    )> {
+        let fields = self.fields(cx);
+        let setter_entity = self.self_entity.clone();
+        let setter: super::item::FieldSetter =
+            Box::new(move |field_id, value, _window, cx| {
+                setter_entity.update(cx, |this, cx| {
+                    this.set_field(field_id, value, cx);
+                });
+            });
+        let provider_entity = self.self_entity.clone();
+        let provider: super::item::FieldsProvider =
+            Arc::new(move |cx| provider_entity.read(cx).fields(cx));
+        Some((fields, setter, provider))
     }
 }
 
@@ -1212,11 +1403,16 @@ pub fn deserialize_dashboard(
 
     let mut widget_views = HashMap::new();
     let mut widget_inspect_fns = HashMap::new();
+    let mut widget_fields_fns = HashMap::new();
     for widget in &widgets {
-        let (view, inspect_fn) = create_widget_view(widget.kind, &widget.config, &db, cx);
+        let (view, inspect_fn, fields_fn) =
+            create_widget_view(widget.kind, &widget.config, &db, cx);
         widget_views.insert(widget.id, view);
         if let Some(f) = inspect_fn {
             widget_inspect_fns.insert(widget.id, f);
+        }
+        if let Some(f) = fields_fn {
+            widget_fields_fns.insert(widget.id, f);
         }
     }
 
@@ -1227,7 +1423,9 @@ pub fn deserialize_dashboard(
         widgets,
         widget_views,
         widget_inspect_fns,
+        widget_fields_fns,
         on_open_page: None,
+        on_open_inspector: None,
         next_id,
         editing: false,
         selected: None,

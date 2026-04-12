@@ -39,6 +39,7 @@ struct AppRoot {
     pending_inspect: Option<PalettePage>,
     pending_inspector_request:
         Option<(Box<dyn metor_panel::tiles::PaneItemHandle>, Point<Pixels>)>,
+    pending_inspector_open: Option<metor_panel::inspectable::InspectorRequest>,
     focus_handle: FocusHandle,
 }
 
@@ -53,6 +54,7 @@ impl AppRoot {
             inspector: None,
             pending_inspect: None,
             pending_inspector_request: None,
+            pending_inspector_open: None,
             focus_handle: cx.focus_handle(),
         }
     }
@@ -80,6 +82,17 @@ impl AppRoot {
         }
     }
 
+    fn make_on_open_inspector(
+        root: Entity<AppRoot>,
+    ) -> metor_panel::inspectable::OpenInspectorCallback {
+        Arc::new(move |request, _window, cx| {
+            root.update(cx, |this, cx| {
+                this.pending_inspector_open = Some(request);
+                cx.notify();
+            });
+        })
+    }
+
     fn toggle_palette(&mut self, _: &OpenPalette, window: &mut Window, cx: &mut Context<Self>) {
         if let Some(palette) = &self.palette {
             if palette.read(cx).dismissed {
@@ -94,11 +107,13 @@ impl AppRoot {
         } else {
             let pane = self.tiles.read(cx).panes()[0].clone();
             let root = cx.entity().clone();
+            let inspector_cb = Self::make_on_open_inspector(root.clone());
             let page = tile_palette_page(
                 self.db.clone(),
                 pane,
                 &self.tiles,
                 Self::make_on_inspect(root),
+                Some(inspector_cb),
                 cx,
             );
             self.open_palette(page, window, cx);
@@ -149,11 +164,20 @@ impl AppRoot {
         cx: &mut Context<Self>,
     ) {
         let db = self.db.clone();
-        if let Some((fields, setter)) = item.inspect_fields_and_setter(Some(db.clone()), cx) {
+        if let Some((fields, setter, provider)) = item.inspect_fields_and_setter(Some(db.clone()), cx) {
             let parent_focus = self.focus_handle.clone();
+            let root = cx.entity().clone();
             let inspector = cx.new(|cx| {
                 let mut insp = PropertyInspector::new(fields, position, setter, cx);
                 insp.set_parent_focus(parent_focus);
+                insp.set_fields_provider(provider);
+                let root = root.clone();
+                insp.set_on_open_palette(move |page, _window, cx| {
+                    root.update(cx, |this, cx| {
+                        this.pending_inspect = Some(page);
+                        cx.notify();
+                    });
+                });
                 insp
             });
             inspector.focus_handle(cx).focus(window);
@@ -207,6 +231,27 @@ impl Render for AppRoot {
 
         if let Some((item, position)) = self.pending_inspector_request.take() {
             self.open_inspector(&*item, position, window, cx);
+        }
+
+        if let Some(request) = self.pending_inspector_open.take() {
+            let parent_focus = self.focus_handle.clone();
+            let root = cx.entity().clone();
+            let inspector = cx.new(|cx| {
+                let mut insp =
+                    PropertyInspector::new(request.fields, request.position, request.on_set_field, cx);
+                insp.set_parent_focus(parent_focus);
+                insp.set_fields_provider(request.fields_provider);
+                let root = root.clone();
+                insp.set_on_open_palette(move |page, _window, cx| {
+                    root.update(cx, |this, cx| {
+                        this.pending_inspect = Some(page);
+                        cx.notify();
+                    });
+                });
+                insp
+            });
+            inspector.focus_handle(cx).focus(window);
+            self.inspector = Some(inspector);
         }
 
         if let Some(page) = self.pending_inspect.take() {

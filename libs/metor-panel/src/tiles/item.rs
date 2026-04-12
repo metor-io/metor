@@ -3,6 +3,7 @@ use std::sync::Arc;
 use gpui::{AnyView, App, Entity, Render, SharedString, Window};
 use metor_db::DB;
 
+
 use crate::command_palette::PalettePage;
 use crate::inspectable::{FieldId, InspectionField, InspectionValue};
 
@@ -32,13 +33,16 @@ pub trait PaneItem: Render + Sized + 'static {
         &self,
         _db: Option<Arc<DB>>,
         _cx: &App,
-    ) -> Option<(Vec<InspectionField>, FieldSetter)> {
+    ) -> Option<(Vec<InspectionField>, FieldSetter, FieldsProvider)> {
         None
     }
 }
 
 /// Type-erased setter for an inspectable field.
 pub type FieldSetter = Box<dyn Fn(FieldId, InspectionValue, &mut Window, &mut App)>;
+
+/// Re-fetches the current fields from an inspectable entity.
+pub type FieldsProvider = Arc<dyn Fn(&App) -> Vec<InspectionField>>;
 
 /// Object-safe handle to any pane item, used for type-erased storage in Pane.
 pub trait PaneItemHandle: 'static {
@@ -56,7 +60,7 @@ pub trait PaneItemHandle: 'static {
         &self,
         _db: Option<Arc<DB>>,
         _cx: &App,
-    ) -> Option<(Vec<InspectionField>, FieldSetter)> {
+    ) -> Option<(Vec<InspectionField>, FieldSetter, FieldsProvider)> {
         None
     }
 }
@@ -98,7 +102,7 @@ impl<T: PaneItem> PaneItemHandle for Entity<T> {
         &self,
         db: Option<Arc<DB>>,
         cx: &App,
-    ) -> Option<(Vec<InspectionField>, FieldSetter)> {
+    ) -> Option<(Vec<InspectionField>, FieldSetter, FieldsProvider)> {
         self.read(cx).inspect_fields_and_setter(db, cx)
     }
 }
