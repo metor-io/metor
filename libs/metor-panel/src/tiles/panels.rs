@@ -143,7 +143,7 @@ impl Render for PlotPanel {
 
 impl PaneItem for PlotPanel {
     fn tab_title(&self, cx: &App) -> SharedString {
-        self.inner.read(cx).title()
+        self.inner.read(cx).title(cx)
     }
 
     fn serialization_key() -> &'static str {

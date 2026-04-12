@@ -32,10 +32,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use bytemuck::{Pod, Zeroable};
-use gpui::{
-    App, BorrowAppContext, Bounds, Canvas, Context, Corners, Global, Hsla, Pixels, RenderImage,
-    WeakEntity, Window, canvas,
-};
+use gpui::{BorrowAppContext, Bounds, Context, Global, Hsla, Pixels, RenderImage};
 use image::{Frame, ImageBuffer, Rgba};
 use metor_db::time_series::TimeSeriesNodeSlice;
 use metor_db::{Component, ComponentSchema};
@@ -865,24 +862,6 @@ impl PlotRenderState {
         self.pending_release.take()
     }
 
-    /// Convenience: submit a render and schedule the async readback in
-    /// one call. `access` is a pointer to whichever field on `T` holds
-    /// this `PlotRenderState`, so the readback task knows where to write
-    /// the fresh frame.
-    pub(crate) fn render_and_update<T: 'static>(
-        &mut self,
-        cx: &mut Context<T>,
-        bounds: Bounds<Pixels>,
-        scale_factor: f32,
-        view: PlotBounds,
-        traces: &[LineDraw<'_>],
-        access: fn(&mut T) -> &mut PlotRenderState,
-    ) {
-        let handle = self.render(cx, bounds, scale_factor, view, traces);
-        if let Some(handle) = handle {
-            handle.spawn_and_set(cx, access);
-        }
-    }
 }
 
 fn read_mapped_bytes(
@@ -1155,132 +1134,3 @@ fn convert_values_strided(
     }
 }
 
-// ── Reusable canvas element ─────────────────────────────────────────
-
-/// Owned trace-draw descriptor returned by [`plot_canvas`]'s `build`
-/// callback. A borrow-free sibling of [`LineDraw`] — cloning a
-/// `Component` is just an `Arc` bump so this stays cheap per frame.
-#[derive(Clone)]
-pub(crate) struct OwnedLineDraw {
-    pub component: Component,
-    pub element_index: usize,
-    pub style: PlotStyle,
-    pub color: Hsla,
-    pub stroke_width: f32,
-}
-
-impl OwnedLineDraw {
-    fn as_line_draw(&self) -> LineDraw<'_> {
-        LineDraw {
-            component_id: self.component.component_id,
-            component: &self.component,
-            element_index: self.element_index,
-            style: self.style,
-            color: self.color,
-            stroke_width: self.stroke_width,
-        }
-    }
-}
-
-/// Snapshot returned by [`plot_canvas`]'s `build` callback. `None`
-/// from the callback tells the canvas to skip GPU submission this
-/// frame (data not yet loaded, bounds not yet resolved, etc.) and
-/// just re-blit whatever frame is currently cached.
-pub(crate) struct PlotCanvasBuild {
-    /// Where the GPU-rendered frame should be drawn, relative to the
-    /// caller's window. Usually equal to the outer canvas bounds; the
-    /// `TimeSeriesPlot` panel shrinks this to `plot_area(outer)` so
-    /// its axis chrome has room to the left and bottom.
-    pub inner_bounds: Bounds<Pixels>,
-    pub view: PlotBounds,
-    pub traces: Vec<OwnedLineDraw>,
-}
-
-/// Tuple the [`plot_canvas`] prepaint hands to the paint callback:
-/// `(outer_bounds, view, frame)`. Extracted into an alias so the
-/// return type of [`plot_canvas`] fits on one line.
-type PlotCanvasState = (Bounds<Pixels>, Option<PlotBounds>, Option<Arc<RenderImage>>);
-
-/// Default paint callback for [`plot_canvas`]: blit the GPU frame at
-/// the canvas bounds with no surrounding chrome. Used by sparklines —
-/// `Monitor` and component-table rows — which have no axes or labels.
-pub(crate) fn blit_frame(
-    bounds: Bounds<Pixels>,
-    _view: Option<PlotBounds>,
-    frame: Option<Arc<RenderImage>>,
-    window: &mut Window,
-    _cx: &mut App,
-) {
-    if let Some(img) = frame {
-        let _ = window.paint_image(bounds, Corners::default(), img, 0, false);
-    }
-}
-
-/// Build a canvas that renders a line plot through the global
-/// [`PlotGpu`]. This is the single abstraction every plot site in
-/// metor-panel uses: the `TimeSeriesPlot` panel, `Monitor` sparklines,
-/// and component-table row sparklines. Each caller supplies:
-///
-/// - a [`WeakEntity<T>`] pointing at whichever entity owns the backing
-///   data and the [`PlotRenderState`],
-/// - `access`: a function pointer from that entity to its render
-///   state, so the async readback task knows where to install the
-///   freshly-read frame,
-/// - `build`: a callback the prepaint runs each frame against the
-///   entity with the full canvas bounds, returning the visible trace
-///   list, plot-space view bounds, and the sub-area the GPU should
-///   render into; returning `None` skips GPU submission,
-/// - `chrome`: a callback the paint runs with the outer canvas bounds,
-///   the most recent view, and the frame about to be blitted. Use
-///   [`blit_frame`] for plots with no axis chrome, or a closure that
-///   renders gridlines + labels + the blit itself for the full
-///   `TimeSeriesPlot` panel.
-pub(crate) fn plot_canvas<T, Build, Chrome>(
-    weak: WeakEntity<T>,
-    access: fn(&mut T) -> &mut PlotRenderState,
-    build: Build,
-    chrome: Chrome,
-) -> Canvas<PlotCanvasState>
-where
-    T: 'static,
-    Build: FnOnce(&mut T, Bounds<Pixels>) -> Option<PlotCanvasBuild> + 'static,
-    Chrome: FnOnce(Bounds<Pixels>, Option<PlotBounds>, Option<Arc<RenderImage>>, &mut Window, &mut App)
-        + 'static,
-{
-    canvas(
-        move |bounds, window, cx| {
-            let scale_factor = window.scale_factor();
-            let (view, frame, released) = weak
-                .update(cx, |t, cx| {
-                    let snapshot = build(t, bounds);
-                    let view = snapshot.as_ref().map(|s| s.view);
-                    if let Some(s) = snapshot {
-                        let draws: Vec<LineDraw<'_>> =
-                            s.traces.iter().map(OwnedLineDraw::as_line_draw).collect();
-                        access(t).render_and_update(
-                            cx,
-                            s.inner_bounds,
-                            scale_factor,
-                            s.view,
-                            &draws,
-                            access,
-                        );
-                    }
-                    let state = access(t);
-                    (
-                        view,
-                        state.current_frame(),
-                        state.take_pending_release(),
-                    )
-                })
-                .unwrap_or((None, None, None));
-            if let Some(img) = released {
-                let _ = window.drop_image(img);
-            }
-            (bounds, view, frame)
-        },
-        move |_, (bounds, view, frame), window, cx| {
-            chrome(bounds, view, frame, window, cx);
-        },
-    )
-}

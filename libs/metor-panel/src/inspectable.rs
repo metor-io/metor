@@ -151,7 +151,11 @@ impl std::fmt::Display for InspectionValue {
 
 /// Trait for elements that expose their configuration at runtime.
 pub trait Inspectable: Sized + 'static {
-    fn fields(&self) -> Vec<InspectionField>;
+    /// Returns the inspectable field list for this element. Takes an
+    /// `&App` so implementations that delegate to child entities (e.g.
+    /// `TimeSeriesPlot` reading from its inner `LinePlot`) can do the
+    /// lookup directly instead of shadowing state.
+    fn fields(&self, cx: &gpui::App) -> Vec<InspectionField>;
     fn set_field(&mut self, field_id: FieldId, value: InspectionValue, cx: &mut Context<Self>);
 }
 
@@ -163,7 +167,7 @@ pub fn palette_page_for_inspectable<T: Inspectable>(
 ) -> PalettePage {
     let items = entity
         .read(cx)
-        .fields()
+        .fields(cx)
         .into_iter()
         .map(|field| {
             let field_id = field.field_id;

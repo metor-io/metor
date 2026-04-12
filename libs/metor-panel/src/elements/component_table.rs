@@ -1,11 +1,7 @@
 use std::sync::Arc;
 
-use super::ElementIndexes;
 use super::table::{Column, ColumnSort, Table, TableDelegate};
-use super::time_series::{
-    OwnedLineDraw, PlotBounds, PlotCanvasBuild, PlotRenderState, PlotStyle, blit_frame,
-    expand_y_bounds, plot_canvas,
-};
+use super::time_series::{LinePlot, Trace};
 use crate::pending_edits::{EditRequest, pending_edits, pending_edits_mut};
 use crate::theme::{Theme, theme};
 use crate::{ComponentStream, WalComponentStream};
@@ -21,15 +17,8 @@ struct ComponentRow {
     name: SharedString,
     component: Component,
     element_names: Vec<SharedString>,
-    indexes: ElementIndexes,
-    y_bounds: Option<(f64, f64)>,
-    last_scan_ts: Option<metor_proto::types::Timestamp>,
-    gpu_state: PlotRenderState,
+    sparkline: Entity<LinePlot>,
     _task: gpui::Task<()>,
-}
-
-fn component_row_gpu_state(r: &mut ComponentRow) -> &mut PlotRenderState {
-    &mut r.gpu_state
 }
 
 impl ComponentRow {
@@ -40,38 +29,39 @@ impl ComponentRow {
         element_names: Vec<SharedString>,
         cx: &mut Context<Self>,
     ) -> Self {
-        let num_elements: usize = component.schema.dim.iter().product();
-        let indexes: ElementIndexes = (0..num_elements.max(1)).collect();
-        let idx_clone = indexes.clone();
+        let line_colors = theme(cx).line_colors;
+        let num_elements: usize = component.schema.dim.iter().product::<usize>().max(1);
+        let traces: Vec<Trace> = (0..num_elements)
+            .map(|i| {
+                let mut t = Trace::new(component.component_id, i, line_colors[i % line_colors.len()]);
+                t.stroke_width = 1.0;
+                t
+            })
+            .collect();
+
+        let sparkline = cx.new(|_| LinePlot::new());
+        sparkline.update(cx, |sp, cx| sp.bind_traces(db.clone(), traces, cx));
+
+        // Tiny notify task: wake the row's render on every new sample so
+        // the value cell re-renders. Y-bounds tracking lives inside the
+        // LinePlot's own per-trace tracker task.
         let mut stream = WalComponentStream::new(&component);
         let task = cx.spawn(async move |this, cx| {
             loop {
-                let _ = stream.next().await;
-                let result = this.update(cx, |this, cx| {
-                    let latest_ts = this.component.time_series.latest().map(|n| n.timestamp());
-                    this.y_bounds = expand_y_bounds(
-                        &this.component,
-                        &idx_clone,
-                        this.y_bounds,
-                        this.last_scan_ts,
-                    );
-                    this.last_scan_ts = latest_ts;
-                    cx.notify();
-                });
+                stream.next().await;
+                let result = this.update(cx, |_this, cx| cx.notify());
                 if result.is_err() {
                     break;
                 }
             }
         });
+
         Self {
             db,
             name: name.into(),
             component,
             element_names,
-            indexes,
-            y_bounds: None,
-            last_scan_ts: None,
-            gpu_state: PlotRenderState::default(),
+            sparkline,
             _task: task,
         }
     }
@@ -85,17 +75,6 @@ impl ComponentRow {
             return String::new();
         };
         super::format_value(view, &self.db, self.component.component_id)
-    }
-
-    fn sparkline_bounds(&self) -> Option<PlotBounds> {
-        let ts = &self.component.time_series;
-        let start = ts.start_timestamp()?.0 as f64;
-        let end = ts.latest()?.timestamp().0 as f64;
-        if start == end {
-            return None;
-        }
-        let (min_y, max_y) = self.y_bounds?;
-        Some(PlotBounds::new(start, min_y, end, max_y).normalize())
     }
 }
 
@@ -187,35 +166,11 @@ impl TableDelegate for ComponentTableDelegate {
             1 => render_value_cell(row_ref, &theme, cx).into_any_element(),
             2 => {
                 let row_height = self.row_height();
-                let line_colors = theme.line_colors;
-                plot_canvas(
-                    row.downgrade(),
-                    component_row_gpu_state,
-                    move |row, bounds| {
-                        let view = row.sparkline_bounds()?;
-                        let traces: Vec<OwnedLineDraw> = row
-                            .indexes
-                            .iter()
-                            .enumerate()
-                            .map(|(i, &idx)| OwnedLineDraw {
-                                component: row.component.clone(),
-                                element_index: idx,
-                                style: PlotStyle::Line,
-                                color: line_colors[i % line_colors.len()],
-                                stroke_width: 1.0,
-                            })
-                            .collect();
-                        Some(PlotCanvasBuild {
-                            inner_bounds: bounds,
-                            view,
-                            traces,
-                        })
-                    },
-                    blit_frame,
-                )
-                .w_full()
-                .h(row_height - px(8.0))
-                .into_any_element()
+                div()
+                    .w_full()
+                    .h(row_height - px(8.0))
+                    .child(row_ref.sparkline.clone())
+                    .into_any_element()
             }
             _ => div().into_any_element(),
         }

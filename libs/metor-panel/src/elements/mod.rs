@@ -129,7 +129,7 @@ impl Render for ComponentText {
 }
 
 impl Inspectable for ComponentText {
-    fn fields(&self) -> Vec<InspectionField> {
+    fn fields(&self, _cx: &gpui::App) -> Vec<InspectionField> {
         vec![]
     }
 

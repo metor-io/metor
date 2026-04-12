@@ -1,23 +1,22 @@
 use std::sync::Arc;
 
 use gpui::{
-    Bounds, Context, Corners, Hsla, IntoElement, MouseButton, PathBuilder, Pixels, Point,
-    RenderImage, SharedString, Styled, TextRun, Window, div, point, prelude::*, px,
+    Bounds, Context, Entity, Hsla, IntoElement, MouseButton, PathBuilder, Pixels, Point,
+    SharedString, Styled, TextRun, Window, canvas, div, point, prelude::*, px,
 };
 use metor_db::{Component, DB};
 use metor_proto::types::{ComponentId, Timestamp};
 
 use crate::inspectable::{FieldId, Inspectable, InspectionField, InspectionValue, ListItem};
 use crate::offset_parse::TimeRangeBehavior;
-use crate::wait_for_component;
 
 mod bounds;
 pub use bounds::*;
 
 mod gpu;
-pub(crate) use gpu::{
-    OwnedLineDraw, PlotCanvasBuild, PlotRenderState, blit_frame, plot_canvas,
-};
+
+mod line_plot;
+pub use line_plot::LinePlot;
 
 /// Generate Y-axis tick positions within the visible bounds (sorted ascending).
 /// When the range spans 0, ticks are anchored at 0 and extend outward.
@@ -286,20 +285,68 @@ pub fn expand_y_bounds(
     any.then_some((min_y, max_y))
 }
 
-/// Paint the axes, gridlines, labels, and zero line around a plot, and
-/// blit the provided GPU-rendered frame into the plot area. The trace
-/// data itself is rendered entirely on the GPU; this function owns the
-/// CPU-only chrome.
-fn paint_plot(
+/// Paint the "underlay" chrome of a `TimeSeriesPlot`: gridlines + zero
+/// line, all drawn in the inner plot area so they sit *behind* the
+/// `LinePlot`'s GPU frame (which is the middle child of the
+/// three-child sandwich).
+fn paint_underlay(
     outer_bounds: Bounds<Pixels>,
     view: PlotBounds,
     data_start: f64,
-    frame: Option<Arc<RenderImage>>,
     window: &mut Window,
     cx: &mut gpui::App,
 ) {
     let pb = plot_area(outer_bounds);
+    let theme = crate::theme::theme(cx);
 
+    for tick in y_ticks(&view, 5) {
+        let y = view.to_screen(pb, view.min_x, tick).y;
+        if y < pb.origin.y || y > pb.origin.y + pb.size.height {
+            continue;
+        }
+        let mut grid = PathBuilder::stroke(px(0.5));
+        grid.move_to(point(pb.origin.x, y));
+        grid.line_to(point(pb.origin.x + pb.size.width, y));
+        if let Ok(path) = grid.build() {
+            window.paint_path(path, theme.grid_color);
+        }
+    }
+    for tick in x_ticks(&view, 5, data_start) {
+        let x = view.to_screen(pb, tick as f64, view.min_y).x;
+        if x < pb.origin.x || x > pb.origin.x + pb.size.width {
+            continue;
+        }
+        let mut grid = PathBuilder::stroke(px(0.5));
+        grid.move_to(point(x, pb.origin.y));
+        grid.line_to(point(x, pb.origin.y + pb.size.height));
+        if let Ok(path) = grid.build() {
+            window.paint_path(path, theme.grid_color);
+        }
+    }
+
+    if view.min_y < 0.0 && view.max_y > 0.0 {
+        let zero_y = view.to_screen(pb, view.min_x, 0.0).y;
+        let mut zp = PathBuilder::stroke(px(1.0));
+        zp.move_to(point(pb.origin.x, zero_y));
+        zp.line_to(point(pb.origin.x + pb.size.width, zero_y));
+        if let Ok(path) = zp.build() {
+            window.paint_path(path, theme.zero_line_color);
+        }
+    }
+}
+
+/// Paint the "overlay" chrome of a `TimeSeriesPlot`: semi-transparent
+/// axis background fills (which hide any GPU-frame edge bleeds), axis
+/// labels, and the L-shaped outer axes. Drawn *over* the `LinePlot`
+/// child so labels and axes appear on top.
+fn paint_overlay(
+    outer_bounds: Bounds<Pixels>,
+    view: PlotBounds,
+    data_start: f64,
+    window: &mut Window,
+    cx: &mut gpui::App,
+) {
+    let pb = plot_area(outer_bounds);
     let theme = crate::theme::theme(cx);
     let label_font_size = px(LABEL_FONT_SIZE);
     let text_style = window.text_style();
@@ -314,48 +361,8 @@ fn paint_plot(
         strikethrough: None,
     };
 
-    // 1. Grid lines (behind everything)
-    for tick in y_ticks(&view, 5) {
-        let y = view.to_screen(pb, view.min_x, tick).y;
-        if y < pb.origin.y || y > pb.origin.y + pb.size.height {
-            continue;
-        }
-        let mut grid = PathBuilder::stroke(px(0.5));
-        grid.move_to(point(pb.origin.x, y));
-        grid.line_to(point(pb.origin.x + pb.size.width, y));
-        if let Ok(path) = grid.build() {
-            window.paint_path(path, theme.grid_color);
-        }
-    }
-    let t_min_i = data_start as i64;
-    for tick in x_ticks(&view, 5, data_start) {
-        let x = view.to_screen(pb, tick as f64, view.min_y).x;
-        if x < pb.origin.x || x > pb.origin.x + pb.size.width {
-            continue;
-        }
-        let mut grid = PathBuilder::stroke(px(0.5));
-        grid.move_to(point(x, pb.origin.y));
-        grid.line_to(point(x, pb.origin.y + pb.size.height));
-        if let Ok(path) = grid.build() {
-            window.paint_path(path, theme.grid_color);
-        }
-    }
-
-    // 2. Data traces — clipped to outer bounds so the GPU frame can
-    //    extend under the axis label areas that the next step paints
-    //    over with semi-transparent fills.
-    window.with_content_mask(
-        Some(gpui::ContentMask {
-            bounds: outer_bounds,
-        }),
-        |window| {
-            if let Some(img) = frame {
-                let _ = window.paint_image(pb, Corners::default(), img, 0, false);
-            }
-        },
-    );
-
-    // 3. Semi-transparent fills over axis label areas (partially occlude lines)
+    // Semi-transparent fills over axis label areas — hide any GPU frame
+    // bleed into the chrome strips.
     let axis_bg = Hsla {
         a: 0.5,
         ..theme.bg_secondary
@@ -378,7 +385,7 @@ fn paint_plot(
     };
     window.paint_quad(gpui::fill(x_axis_bg, axis_bg));
 
-    // 4. Labels on top of the fills
+    let t_min_i = data_start as i64;
     for tick in y_ticks(&view, 5) {
         let y = view.to_screen(pb, view.min_x, tick).y;
         if y < pb.origin.y || y > pb.origin.y + pb.size.height {
@@ -416,17 +423,6 @@ fn paint_plot(
             pb.origin.y + pb.size.height + px(4.0),
         );
         let _ = shaped.paint(origin, label_font_size, window, cx);
-    }
-
-    // 5. Zero line and axes on top
-    if view.min_y < 0.0 && view.max_y > 0.0 {
-        let zero_y = view.to_screen(pb, view.min_x, 0.0).y;
-        let mut zp = PathBuilder::stroke(px(1.0));
-        zp.move_to(point(pb.origin.x, zero_y));
-        zp.line_to(point(pb.origin.x + pb.size.width, zero_y));
-        if let Ok(path) = zp.build() {
-            window.paint_path(path, theme.zero_line_color);
-        }
     }
 
     let mut axes = PathBuilder::stroke(px(1.0));
@@ -497,34 +493,22 @@ impl Trace {
     }
 }
 
-#[derive(Clone)]
-struct ResolvedTrace {
-    trace: Trace,
-    component: Component,
-    y_bounds: Option<(f64, f64)>,
-    last_scan_ts: Option<Timestamp>,
-}
-
 /// Interactive time-series plot with multi-trace support, pan, and zoom.
+///
+/// All the line-drawing state (traces, per-trace y-bounds tracking,
+/// view overrides, GPU render state) lives inside [`LinePlot`] — this
+/// entity is just the outer container that manages user interaction
+/// (drag, zoom, double-click reset), the inspector, and the axis
+/// chrome painted around the `LinePlot` child.
 pub struct TimeSeriesPlot {
     db: Arc<DB>,
-    traces: Vec<Option<ResolvedTrace>>,
+    line_plot: Entity<LinePlot>,
     custom_title: Option<SharedString>,
-    view: Option<PlotBounds>,
     drag_start: Option<Point<Pixels>>,
     drag_start_view: Option<PlotBounds>,
     drag_zone: AxisZone,
     last_plot_area: Option<Bounds<Pixels>>,
-    x_range: TimeRangeBehavior,
-    y_min_override: Option<f64>,
-    y_max_override: Option<f64>,
     on_open_page: Option<OpenPageCallback>,
-    gpu_state: gpu::PlotRenderState,
-    _tasks: Vec<gpui::Task<()>>,
-}
-
-fn time_series_plot_gpu_state(t: &mut TimeSeriesPlot) -> &mut gpu::PlotRenderState {
-    &mut t.gpu_state
 }
 
 /// Callback type for when the plot wants to open an inspector page.
@@ -533,27 +517,17 @@ pub type OpenPageCallback =
 
 impl TimeSeriesPlot {
     pub fn new(db: Arc<DB>, traces: Vec<Trace>, cx: &mut Context<Self>) -> Self {
-        let tasks = traces
-            .iter()
-            .enumerate()
-            .map(|(i, trace)| Self::spawn_trace(db.clone(), i, trace, cx))
-            .collect();
-        let trace_slots = (0..traces.len()).map(|_| None).collect();
+        let line_plot = cx.new(|_| LinePlot::new());
+        line_plot.update(cx, |lp, cx| lp.bind_traces(db.clone(), traces, cx));
         Self {
             db,
-            traces: trace_slots,
+            line_plot,
             custom_title: None,
-            view: None,
             drag_start: None,
             drag_start_view: None,
             drag_zone: AxisZone::Plot,
             last_plot_area: None,
-            x_range: TimeRangeBehavior::default(),
-            y_min_override: None,
-            y_max_override: None,
             on_open_page: None,
-            gpu_state: gpu::PlotRenderState::default(),
-            _tasks: tasks,
         }
     }
 
@@ -606,70 +580,17 @@ impl TimeSeriesPlot {
     }
 
     pub fn set_traces(&mut self, traces: Vec<Trace>, cx: &mut Context<Self>) {
-        self._tasks = traces
-            .iter()
-            .enumerate()
-            .map(|(i, trace)| Self::spawn_trace(self.db.clone(), i, trace, cx))
-            .collect();
-        self.traces = (0..traces.len()).map(|_| None).collect();
-        self.view = None;
+        let db = self.db.clone();
+        self.line_plot
+            .update(cx, |lp, cx| lp.bind_traces(db, traces, cx));
         cx.notify();
-    }
-
-    fn spawn_trace(
-        db: Arc<DB>,
-        trace_idx: usize,
-        trace: &Trace,
-        cx: &mut Context<Self>,
-    ) -> gpui::Task<()> {
-        let trace = trace.clone();
-        cx.spawn(async move |this, cx| {
-            let component = wait_for_component(&db, trace.component_id).await;
-
-            let result = this.update(cx, |this, cx| {
-                this.traces[trace_idx] = Some(ResolvedTrace {
-                    trace: trace.clone(),
-                    component: component.clone(),
-                    y_bounds: None,
-                    last_scan_ts: None,
-                });
-                cx.notify();
-            });
-            if result.is_err() {
-                return;
-            }
-
-            loop {
-                let result = this.update(cx, |this, cx| {
-                    if let Some(resolved) = &mut this.traces[trace_idx] {
-                        let latest_ts = resolved
-                            .component
-                            .time_series
-                            .latest()
-                            .map(|n| n.timestamp());
-                        resolved.y_bounds = expand_y_bounds(
-                            &resolved.component,
-                            &[resolved.trace.element_index],
-                            resolved.y_bounds,
-                            resolved.last_scan_ts,
-                        );
-                        resolved.last_scan_ts = latest_ts;
-                    }
-                    cx.notify();
-                });
-                if result.is_err() {
-                    break;
-                }
-                component.time_series.wait().await;
-            }
-        })
     }
 
     /// Returns the display title: custom title if set, otherwise derived from traces.
     ///
     /// Groups traces by component. If all elements are present, shows just the
     /// component name. Otherwise shows `component[x,y]`.
-    pub fn title(&self) -> SharedString {
+    pub fn title(&self, cx: &gpui::App) -> SharedString {
         if let Some(title) = &self.custom_title {
             return title.clone();
         }
@@ -678,15 +599,15 @@ impl TimeSeriesPlot {
         let mut groups: HashMap<ComponentId, Vec<usize>> = HashMap::new();
         // Track insertion order so the title is deterministic.
         let mut order: Vec<ComponentId> = Vec::new();
-        for rt in self.traces.iter().flatten() {
-            let id = rt.trace.component_id;
+        for trace in self.line_plot.read(cx).traces() {
+            let id = trace.component_id;
             groups
                 .entry(id)
                 .or_insert_with(|| {
                     order.push(id);
                     Vec::new()
                 })
-                .push(rt.trace.element_index);
+                .push(trace.element_index);
         }
 
         if order.is_empty() {
@@ -719,64 +640,23 @@ impl TimeSeriesPlot {
         SharedString::from(parts.join(", "))
     }
 
-    fn resolved_traces(&self) -> impl Iterator<Item = &ResolvedTrace> {
-        self.traces.iter().flatten()
+    /// Read the current effective view from the embedded `LinePlot`.
+    /// Used by drag/zoom handlers and by `Viewer3dPanel::serialize`
+    /// downstream.
+    pub fn view(&self, cx: &gpui::App) -> Option<PlotBounds> {
+        self.line_plot.read(cx).effective_view()
     }
 
-    fn merged_y_bounds(&self) -> Option<(f64, f64)> {
-        let mut min = f64::INFINITY;
-        let mut max = f64::NEG_INFINITY;
-        let mut any = false;
-        for r in self.resolved_traces() {
-            if let Some((lo, hi)) = r.y_bounds {
-                min = min.min(lo);
-                max = max.max(hi);
-                any = true;
-            }
-        }
-        any.then_some((min, max))
-    }
-
-    fn time_range(&self) -> Option<(f64, f64)> {
-        let mut start = f64::INFINITY;
-        let mut end = f64::NEG_INFINITY;
-        let mut any = false;
-        for r in self.resolved_traces() {
-            if let Some(s) = r.component.time_series.start_timestamp() {
-                start = start.min(s.0 as f64);
-                any = true;
-            }
-            if let Some(l) = r.component.time_series.latest() {
-                end = end.max(l.timestamp().0 as f64);
-                any = true;
-            }
-        }
-        if any && start < end {
-            Some((start, end))
-        } else {
-            None
-        }
-    }
-
-    fn effective_y_bounds(&self) -> (f64, f64) {
-        let (auto_min, auto_max) = self.merged_y_bounds().unwrap_or((0.0, 1.0));
-        (
-            self.y_min_override.unwrap_or(auto_min),
-            self.y_max_override.unwrap_or(auto_max),
-        )
-    }
-
-    fn current_view(&self) -> Option<PlotBounds> {
-        self.view.or_else(|| {
-            let (data_start, data_end) = self.time_range()?;
-            let range = self
-                .x_range
-                .calculate_range(Timestamp(data_start as i64), Timestamp(data_end as i64));
-            let (min_y, max_y) = self.effective_y_bounds();
-            Some(
-                PlotBounds::new(range.start.0 as f64, min_y, range.end.0 as f64, max_y).normalize(),
-            )
-        })
+    /// Reset all view overrides so the plot snaps back to auto-fit.
+    fn reset_view(&mut self, cx: &mut Context<Self>) {
+        let line_plot = self.line_plot.clone();
+        line_plot.update(cx, |lp, cx| {
+            lp.set_view_override(None, cx);
+            lp.set_x_range(TimeRangeBehavior::default(), cx);
+            lp.set_y_min_override(None, cx);
+            lp.set_y_max_override(None, cx);
+        });
+        cx.notify();
     }
 
     fn trace_inspect_page(
@@ -786,14 +666,19 @@ impl TimeSeriesPlot {
     ) -> crate::command_palette::PalettePage {
         use crate::inspectable::palette_page_for_list_item;
 
-        let rt = self.traces[trace_idx].as_ref().unwrap();
+        let trace = self
+            .line_plot
+            .read(cx)
+            .trace(trace_idx)
+            .cloned()
+            .expect("trace_inspect_page called with an invalid index");
         let base = TRACE_SETTINGS_BASE + trace_idx as u32 * 100;
         let fields = vec![
             InspectionField {
                 label: "Style".into(),
                 field_id: FieldId(base + TRACE_SUB_STYLE),
                 value: InspectionValue::Enum {
-                    selected: rt.trace.style.label().to_string(),
+                    selected: trace.style.label().to_string(),
                     options: PlotStyle::ALL
                         .iter()
                         .map(|s| s.label().to_string())
@@ -803,29 +688,31 @@ impl TimeSeriesPlot {
             InspectionField {
                 label: "Color".into(),
                 field_id: FieldId(base + TRACE_SUB_COLOR),
-                value: InspectionValue::Color(rt.trace.color),
+                value: InspectionValue::Color(trace.color),
             },
             InspectionField {
                 label: "Visible".into(),
                 field_id: FieldId(base + TRACE_SUB_VISIBLE),
-                value: InspectionValue::Bool(rt.trace.visible),
+                value: InspectionValue::Bool(trace.visible),
             },
             InspectionField {
                 label: "Width".into(),
                 field_id: FieldId(base + TRACE_SUB_STROKE_WIDTH),
-                value: InspectionValue::F64(rt.trace.stroke_width as f64),
+                value: InspectionValue::F64(trace.stroke_width as f64),
             },
         ];
-        palette_page_for_list_item(cx.entity().clone(), &fields, rt.trace.label.clone(), None)
+        palette_page_for_list_item(cx.entity().clone(), &fields, trace.label.clone(), None)
     }
 }
 
 impl Render for TimeSeriesPlot {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let view = self.current_view();
-        let data_start = self.time_range().map(|(s, _)| s).unwrap_or(0.0);
-        let show_legend = self.resolved_traces().count() >= 2;
         let theme = crate::theme::theme(cx);
+        let trace_configs: Vec<Trace> = self.line_plot.read(cx).traces().cloned().collect();
+        let show_legend = trace_configs.iter().filter(|_| true).count() >= 2;
+
+        let underlay_lp = self.line_plot.clone();
+        let overlay_lp = self.line_plot.clone();
 
         let mut root = div()
             .flex()
@@ -836,22 +723,19 @@ impl Render for TimeSeriesPlot {
                 div()
                     .flex_1()
                     .min_h_0()
+                    .relative()
                     .on_mouse_down(
                         MouseButton::Left,
                         cx.listener(|this, event: &gpui::MouseDownEvent, _window, cx| {
                             if event.click_count == 2 {
-                                this.view = None;
-                                this.x_range = TimeRangeBehavior::default();
-                                this.y_min_override = None;
-                                this.y_max_override = None;
-                                cx.notify();
+                                this.reset_view(cx);
                             } else {
                                 let zone = this
                                     .last_plot_area
                                     .map(|pa| axis_zone(event.position, pa))
                                     .unwrap_or(AxisZone::Plot);
                                 this.drag_start = Some(event.position);
-                                this.drag_start_view = this.current_view();
+                                this.drag_start_view = this.line_plot.read(cx).effective_view();
                                 this.drag_zone = zone;
                             }
                         }),
@@ -877,18 +761,21 @@ impl Render for TimeSeriesPlot {
                             let dx = event.position.x - start.x;
                             let dy = event.position.y - start.y;
                             let (nx, ny) = start_view.screen_delta_to_norm(pa, dx, dy);
-                            this.view = Some(match this.drag_zone {
+                            let new_view = match this.drag_zone {
                                 AxisZone::Plot => start_view.offset_by_norm(-nx, ny),
                                 AxisZone::XAxis => start_view.offset_x(-nx),
                                 AxisZone::YAxis => start_view.offset_y(ny),
-                            });
-                            cx.notify();
+                            };
+                            this.line_plot
+                                .update(cx, |lp, cx| lp.set_view_override(Some(new_view), cx));
                         },
                     ))
                     .on_scroll_wheel(cx.listener(
                         |this, event: &gpui::ScrollWheelEvent, _window, cx| {
-                            let (Some(view), Some(pa)) = (this.current_view(), this.last_plot_area)
-                            else {
+                            let Some(view) = this.line_plot.read(cx).effective_view() else {
+                                return;
+                            };
+                            let Some(pa) = this.last_plot_area else {
                                 return;
                             };
 
@@ -898,49 +785,60 @@ impl Render for TimeSeriesPlot {
 
                             let zone = axis_zone(event.position, pa);
                             let (ax, ay) = view.screen_anchor(pa, event.position);
-                            this.view = Some(match zone {
+                            let new_view = match zone {
                                 AxisZone::Plot => view.zoom_at(factor, ax, 1.0 - ay),
                                 AxisZone::XAxis => view.zoom_x(factor, ax),
                                 AxisZone::YAxis => view.zoom_y(factor, 1.0 - ay),
-                            });
+                            };
+                            this.line_plot
+                                .update(cx, |lp, cx| lp.set_view_override(Some(new_view), cx));
                             cx.stop_propagation();
-                            cx.notify();
                         },
                     ))
                     .child(
-                        plot_canvas(
-                            cx.entity().downgrade(),
-                            time_series_plot_gpu_state,
-                            move |this, bounds| {
-                                let pa = plot_area(bounds);
-                                this.last_plot_area = Some(pa);
-                                let view = view?;
-                                let traces: Vec<OwnedLineDraw> = this
-                                    .traces
-                                    .iter()
-                                    .flatten()
-                                    .filter(|rt| rt.trace.visible)
-                                    .map(|rt| OwnedLineDraw {
-                                        component: rt.component.clone(),
-                                        element_index: rt.trace.element_index,
-                                        style: rt.trace.style,
-                                        color: rt.trace.color,
-                                        stroke_width: rt.trace.stroke_width,
-                                    })
-                                    .collect();
-                                Some(PlotCanvasBuild {
-                                    inner_bounds: pa,
-                                    view,
-                                    traces,
-                                })
+                        canvas(
+                            {
+                                let this = cx.entity().downgrade();
+                                move |bounds, _window, cx| {
+                                    let _ = this.update(cx, |this, _| {
+                                        this.last_plot_area = Some(plot_area(bounds));
+                                    });
+                                    let lp = underlay_lp.read(cx);
+                                    (bounds, lp.effective_view(), lp.data_start().unwrap_or(0.0))
+                                }
                             },
-                            move |bounds, view, frame, window, cx| {
+                            move |_, (bounds, view, data_start), window, cx| {
                                 if let Some(view) = view {
-                                    paint_plot(bounds, view, data_start, frame, window, cx);
+                                    paint_underlay(bounds, view, data_start, window, cx);
                                 }
                             },
                         )
-                        .size_full(),
+                        .absolute()
+                        .inset_0(),
+                    )
+                    .child(
+                        div()
+                            .absolute()
+                            .left(px(Y_LABEL_WIDTH + PADDING))
+                            .top(px(PADDING))
+                            .right(px(PADDING))
+                            .bottom(px(X_LABEL_HEIGHT + PADDING))
+                            .child(self.line_plot.clone()),
+                    )
+                    .child(
+                        canvas(
+                            move |bounds, _window, cx| {
+                                let lp = overlay_lp.read(cx);
+                                (bounds, lp.effective_view(), lp.data_start().unwrap_or(0.0))
+                            },
+                            move |_, (bounds, view, data_start), window, cx| {
+                                if let Some(view) = view {
+                                    paint_overlay(bounds, view, data_start, window, cx);
+                                }
+                            },
+                        )
+                        .absolute()
+                        .inset_0(),
                     ),
             );
 
@@ -956,16 +854,14 @@ impl Render for TimeSeriesPlot {
                 .gap_2()
                 .gap_y_0()
                 .px(px(Y_LABEL_WIDTH + PADDING))
-                //.py_1()
                 .bg(legend_bg);
 
-            for (i, rt) in self.traces.iter().enumerate() {
-                let Some(rt) = rt else { continue };
-                let visible = rt.trace.visible;
+            for (i, trace) in trace_configs.iter().enumerate() {
+                let visible = trace.visible;
                 let opacity = if visible { 1.0 } else { 0.3 };
                 let color = Hsla {
                     a: opacity,
-                    ..rt.trace.color
+                    ..trace.color
                 };
                 let text_color = Hsla {
                     a: opacity,
@@ -982,16 +878,16 @@ impl Render for TimeSeriesPlot {
                         .on_mouse_down(
                             MouseButton::Left,
                             cx.listener(move |this, _event: &gpui::MouseDownEvent, _window, cx| {
-                                if let Some(Some(resolved)) = this.traces.get_mut(i) {
-                                    resolved.trace.visible = !resolved.trace.visible;
-                                    cx.notify();
-                                }
+                                let line_plot = this.line_plot.clone();
+                                line_plot.update(cx, |lp, cx| {
+                                    lp.update_trace(i, |t| t.visible = !t.visible, cx);
+                                });
                             }),
                         )
                         .on_mouse_down(
                             MouseButton::Right,
                             cx.listener(move |this, _event: &gpui::MouseDownEvent, window, cx| {
-                                if let Some(cb) = &this.on_open_page {
+                                if let Some(cb) = this.on_open_page.clone() {
                                     let page = this.trace_inspect_page(i, cx);
                                     cb(page, window, cx);
                                 }
@@ -1002,7 +898,7 @@ impl Render for TimeSeriesPlot {
                             div()
                                 .text_size(px(LABEL_FONT_SIZE))
                                 .text_color(text_color)
-                                .child(rt.trace.label.clone()),
+                                .child(trace.label.clone()),
                         ),
                 );
             }
@@ -1022,17 +918,18 @@ const TRACE_SUB_VISIBLE: u32 = 2;
 const TRACE_SUB_STROKE_WIDTH: u32 = 3;
 
 impl Inspectable for TimeSeriesPlot {
-    fn fields(&self) -> Vec<InspectionField> {
-        let current_traces: Vec<(ComponentId, usize)> = self
-            .resolved_traces()
-            .map(|rt| (rt.trace.component_id, rt.trace.element_index))
+    fn fields(&self, cx: &gpui::App) -> Vec<InspectionField> {
+        let lp = self.line_plot.read(cx);
+        let current_traces: Vec<(ComponentId, usize)> = lp
+            .traces()
+            .map(|t| (t.component_id, t.element_index))
             .collect();
 
         let mut fields = vec![
             InspectionField {
                 label: "Title".into(),
                 field_id: FieldId(5),
-                value: InspectionValue::String(self.title().to_string()),
+                value: InspectionValue::String(self.title(cx).to_string()),
             },
             InspectionField {
                 label: "Traces".into(),
@@ -1041,22 +938,19 @@ impl Inspectable for TimeSeriesPlot {
             },
         ];
 
-        // Per-trace settings as a nested list
-        let trace_items: Vec<ListItem> = self
-            .traces
-            .iter()
+        let trace_items: Vec<ListItem> = lp
+            .traces()
             .enumerate()
-            .filter_map(|(i, rt)| {
-                let rt = rt.as_ref()?;
+            .map(|(i, trace)| {
                 let base = TRACE_SETTINGS_BASE + i as u32 * 100;
-                Some(ListItem {
-                    label: rt.trace.label.clone(),
+                ListItem {
+                    label: trace.label.clone(),
                     fields: vec![
                         InspectionField {
                             label: "Style".into(),
                             field_id: FieldId(base + TRACE_SUB_STYLE),
                             value: InspectionValue::Enum {
-                                selected: rt.trace.style.label().to_string(),
+                                selected: trace.style.label().to_string(),
                                 options: PlotStyle::ALL
                                     .iter()
                                     .map(|s| s.label().to_string())
@@ -1066,20 +960,20 @@ impl Inspectable for TimeSeriesPlot {
                         InspectionField {
                             label: "Color".into(),
                             field_id: FieldId(base + TRACE_SUB_COLOR),
-                            value: InspectionValue::Color(rt.trace.color),
+                            value: InspectionValue::Color(trace.color),
                         },
                         InspectionField {
                             label: "Visible".into(),
                             field_id: FieldId(base + TRACE_SUB_VISIBLE),
-                            value: InspectionValue::Bool(rt.trace.visible),
+                            value: InspectionValue::Bool(trace.visible),
                         },
                         InspectionField {
                             label: "Width".into(),
                             field_id: FieldId(base + TRACE_SUB_STROKE_WIDTH),
-                            value: InspectionValue::F64(rt.trace.stroke_width as f64),
+                            value: InspectionValue::F64(trace.stroke_width as f64),
                         },
                     ],
-                })
+                }
             })
             .collect();
 
@@ -1094,19 +988,23 @@ impl Inspectable for TimeSeriesPlot {
         fields.push(InspectionField {
             label: "X Range".into(),
             field_id: FieldId(4),
-            value: InspectionValue::String(self.x_range.to_string()),
+            value: InspectionValue::String(lp.x_range().to_string()),
         });
 
-        let (min_y, max_y) = self.effective_y_bounds();
+        let effective = lp.effective_view();
+        let (min_y, max_y) = match effective {
+            Some(v) => (v.min_y, v.max_y),
+            None => (0.0, 1.0),
+        };
         fields.push(InspectionField {
             label: "Y Min".into(),
             field_id: FieldId(2),
-            value: InspectionValue::F64(min_y),
+            value: InspectionValue::F64(lp.y_min_override().unwrap_or(min_y)),
         });
         fields.push(InspectionField {
             label: "Y Max".into(),
             field_id: FieldId(3),
-            value: InspectionValue::F64(max_y),
+            value: InspectionValue::F64(lp.y_max_override().unwrap_or(max_y)),
         });
 
         fields
@@ -1151,19 +1049,19 @@ impl Inspectable for TimeSeriesPlot {
                 }
             }
             (FieldId(2), InspectionValue::F64(v)) => {
-                self.y_min_override = Some(v);
-                self.view = None;
+                self.line_plot
+                    .update(cx, |lp, cx| lp.set_y_min_override(Some(v), cx));
                 cx.notify();
             }
             (FieldId(3), InspectionValue::F64(v)) => {
-                self.y_max_override = Some(v);
-                self.view = None;
+                self.line_plot
+                    .update(cx, |lp, cx| lp.set_y_max_override(Some(v), cx));
                 cx.notify();
             }
             (FieldId(4), InspectionValue::String(s)) => {
                 if let Ok(behavior) = s.parse::<TimeRangeBehavior>() {
-                    self.x_range = behavior;
-                    self.view = None;
+                    self.line_plot
+                        .update(cx, |lp, cx| lp.set_x_range(behavior, cx));
                     cx.notify();
                 }
             }
@@ -1174,26 +1072,30 @@ impl Inspectable for TimeSeriesPlot {
             (FieldId(id), value) if id >= TRACE_SETTINGS_BASE => {
                 let trace_idx = ((id - TRACE_SETTINGS_BASE) / 100) as usize;
                 let sub_field = (id - TRACE_SETTINGS_BASE) % 100;
-                if let Some(Some(resolved)) = self.traces.get_mut(trace_idx) {
-                    match (sub_field, value) {
-                        (TRACE_SUB_STYLE, InspectionValue::Enum { selected, .. }) => {
-                            if let Some(style) = PlotStyle::parse(&selected) {
-                                resolved.trace.style = style;
+                self.line_plot.update(cx, |lp, cx| {
+                    lp.update_trace(
+                        trace_idx,
+                        |t| match (sub_field, value) {
+                            (TRACE_SUB_STYLE, InspectionValue::Enum { selected, .. }) => {
+                                if let Some(style) = PlotStyle::parse(&selected) {
+                                    t.style = style;
+                                }
                             }
-                        }
-                        (TRACE_SUB_COLOR, InspectionValue::Color(c)) => {
-                            resolved.trace.color = c;
-                        }
-                        (TRACE_SUB_VISIBLE, InspectionValue::Bool(b)) => {
-                            resolved.trace.visible = b;
-                        }
-                        (TRACE_SUB_STROKE_WIDTH, InspectionValue::F64(w)) => {
-                            resolved.trace.stroke_width = (w as f32).clamp(0.5, 10.0);
-                        }
-                        _ => {}
-                    }
-                    cx.notify();
-                }
+                            (TRACE_SUB_COLOR, InspectionValue::Color(c)) => {
+                                t.color = c;
+                            }
+                            (TRACE_SUB_VISIBLE, InspectionValue::Bool(b)) => {
+                                t.visible = b;
+                            }
+                            (TRACE_SUB_STROKE_WIDTH, InspectionValue::F64(w)) => {
+                                t.stroke_width = (w as f32).clamp(0.5, 10.0);
+                            }
+                            _ => {}
+                        },
+                        cx,
+                    );
+                });
+                cx.notify();
             }
             _ => {}
         }

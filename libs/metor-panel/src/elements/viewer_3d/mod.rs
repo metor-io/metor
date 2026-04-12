@@ -849,7 +849,7 @@ fn model_row_label(entry: &ModelEntry, index: usize) -> SharedString {
 }
 
 impl Inspectable for Viewer3d {
-    fn fields(&self) -> Vec<InspectionField> {
+    fn fields(&self, _cx: &gpui::App) -> Vec<InspectionField> {
         let model_items: Vec<ListItem> = self
             .models
             .iter()

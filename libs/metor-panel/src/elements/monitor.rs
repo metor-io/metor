@@ -1,15 +1,10 @@
 use std::sync::Arc;
 
-use gpui::{Context, IntoElement, SharedString, Window, div, prelude::*, px};
-use metor_db::{Component, DB};
-use metor_proto::types::ComponentView;
-use smallvec::SmallVec;
+use gpui::{Context, Entity, IntoElement, SharedString, Window, div, prelude::*, px};
+use metor_db::DB;
+use metor_proto::types::{ComponentId, ComponentView};
 
-use super::ElementIndexes;
-use super::time_series::{
-    OwnedLineDraw, PlotBounds, PlotCanvasBuild, PlotRenderState, PlotStyle, blit_frame,
-    expand_y_bounds, plot_canvas,
-};
+use super::time_series::{LinePlot, Trace};
 use crate::inspectable::{FieldId, Inspectable, InspectionField, InspectionValue};
 use crate::theme::theme;
 use crate::{AsComponentView, ComponentStream, ComponentStreamBuilder};
@@ -21,25 +16,16 @@ struct ElementDisplay {
     value: SharedString,
 }
 
-/// A monitor displays a component's current value with its name and an optional sparkline.
-///
-/// Designed for dashboard use where a clean, at-a-glance readout is needed — similar
-/// to the value cards in Revel's turbine dashboards.
+/// A monitor displays a component's current value with its name and an
+/// optional sparkline. Designed for dashboard use where a clean,
+/// at-a-glance readout is needed.
 pub struct Monitor {
     name: SharedString,
     unit: SharedString,
     elements: Vec<ElementDisplay>,
     show_sparkline: bool,
-    component: Option<Component>,
-    indexes: ElementIndexes,
-    y_bounds: Option<(f64, f64)>,
-    last_scan_ts: Option<metor_proto::types::Timestamp>,
-    gpu_state: PlotRenderState,
+    sparkline: Entity<LinePlot>,
     _task: gpui::Task<()>,
-}
-
-fn monitor_gpu_state(m: &mut Monitor) -> &mut PlotRenderState {
-    &mut m.gpu_state
 }
 
 impl Monitor {
@@ -49,6 +35,7 @@ impl Monitor {
         cx: &mut Context<Self>,
     ) -> Self {
         let component_id = source.component_id();
+        let line_colors = theme(cx).line_colors;
 
         let (name, unit, element_names) = db.with_state(|state| {
             let meta = state.get_component_metadata(component_id);
@@ -71,62 +58,60 @@ impl Monitor {
             (name, unit, element_names)
         });
 
-        let component = db.with_state(|state| state.get_component(component_id).cloned());
-        let indexes: ElementIndexes = component
-            .as_ref()
-            .map(|c| {
-                let n: usize = c.schema.dim.iter().product();
-                (0..n.max(1)).collect()
-            })
-            .unwrap_or_else(|| SmallVec::from_elem(0, 1));
+        let sparkline = cx.new(|_| LinePlot::new());
 
-        let elem_names = element_names.clone();
-        let task = cx.spawn(async move |this, cx| {
-            let mut stream = source.into_stream(&db).await;
+        // If the component is already in the DB, bind traces inline so
+        // the sparkline is never momentarily empty. Otherwise the text
+        // task binds on its first stream wake-up, which is the moment
+        // the component has been registered.
+        if let Some(comp) = db.with_state(|state| state.get_component(component_id).cloned()) {
+            let element_count: usize = comp.schema.dim.iter().product::<usize>().max(1);
+            let traces = build_traces(component_id, element_count, &line_colors);
+            sparkline.update(cx, |sp, cx| sp.bind_traces(db.clone(), traces, cx));
+        }
 
-            let comp = db.with_state(|state| state.get_component(component_id).cloned());
-            let idx: ElementIndexes = comp
-                .as_ref()
-                .map(|c| {
-                    let n: usize = c.schema.dim.iter().product();
-                    (0..n.max(1)).collect()
-                })
-                .unwrap_or_else(|| SmallVec::from_elem(0, 1));
+        let task = cx.spawn({
+            let db = db.clone();
+            let sparkline = sparkline.clone();
+            async move |this, cx| {
+                let mut stream = source.into_stream(&db).await;
 
-            let _ = this.update(cx, |this, _cx| {
-                this.component = comp;
-                this.indexes = idx;
-            });
+                // The stream builder only returns once the component is
+                // resolvable; rebind traces with the authoritative
+                // element count in case the constructor fell through to
+                // the fallback.
+                let comp = db.with_state(|s| s.get_component(component_id).cloned());
+                if let Some(comp) = comp {
+                    let element_count: usize = comp.schema.dim.iter().product::<usize>().max(1);
+                    let _ = sparkline.update(cx, |sp, cx| {
+                        if element_count != sp.trace_count() {
+                            let traces = build_traces(component_id, element_count, &line_colors);
+                            sp.bind_traces(db.clone(), traces, cx);
+                        }
+                    });
+                }
 
-            let enum_variants: Option<Vec<String>> = db.with_state(|state| {
-                state
-                    .get_component_metadata(component_id)
-                    .and_then(|m| {
-                        m.enum_variants().map(|v| v.map(|s| s.to_string()).collect())
-                    })
-            });
-
-            loop {
-                let elements = {
-                    let view = stream.next().await;
-                    let cv = view.as_component_view();
-                    format_elements(&cv, &elem_names, enum_variants.as_deref())
-                };
-                let result = this.update(cx, |this, cx| {
-                    this.elements = elements;
-                    if let Some(ref comp) = this.component {
-                        this.y_bounds = expand_y_bounds(
-                            comp,
-                            &this.indexes,
-                            this.y_bounds,
-                            this.last_scan_ts,
-                        );
-                        this.last_scan_ts = comp.time_series.latest().map(|n| n.timestamp());
-                    }
-                    cx.notify();
+                let enum_variants: Option<Vec<String>> = db.with_state(|state| {
+                    state
+                        .get_component_metadata(component_id)
+                        .and_then(|m| {
+                            m.enum_variants().map(|v| v.map(|s| s.to_string()).collect())
+                        })
                 });
-                if result.is_err() {
-                    break;
+
+                loop {
+                    let elements = {
+                        let view = stream.next().await;
+                        let cv = view.as_component_view();
+                        format_elements(&cv, &element_names, enum_variants.as_deref())
+                    };
+                    let result = this.update(cx, |this, cx| {
+                        this.elements = elements;
+                        cx.notify();
+                    });
+                    if result.is_err() {
+                        break;
+                    }
                 }
             }
         });
@@ -136,26 +121,24 @@ impl Monitor {
             unit: SharedString::from(unit),
             elements: Vec::new(),
             show_sparkline: true,
-            component,
-            indexes,
-            y_bounds: None,
-            last_scan_ts: None,
-            gpu_state: PlotRenderState::default(),
+            sparkline,
             _task: task,
         }
     }
+}
 
-    fn sparkline_bounds(&self) -> Option<PlotBounds> {
-        let comp = self.component.as_ref()?;
-        let ts = &comp.time_series;
-        let start = ts.start_timestamp()?.0 as f64;
-        let end = ts.latest()?.timestamp().0 as f64;
-        if start == end {
-            return None;
-        }
-        let (min_y, max_y) = self.y_bounds?;
-        Some(PlotBounds::new(start, min_y, end, max_y).normalize())
-    }
+fn build_traces(
+    component_id: ComponentId,
+    element_count: usize,
+    line_colors: &[gpui::Hsla],
+) -> Vec<Trace> {
+    (0..element_count)
+        .map(|i| {
+            let mut t = Trace::new(component_id, i, line_colors[i % line_colors.len()]);
+            t.stroke_width = 1.5;
+            t
+        })
+        .collect()
 }
 
 /// Format component elements into display-friendly strings.
@@ -241,39 +224,14 @@ impl Render for Monitor {
             .overflow_hidden();
 
         // Sparkline — fills available space above the text content
-        if self.show_sparkline && self.component.is_some() {
-            let line_colors = theme.line_colors;
+        if self.show_sparkline && !self.sparkline.read(cx).is_empty() {
             root = root.child(
-                plot_canvas(
-                    cx.entity().downgrade(),
-                    monitor_gpu_state,
-                    move |m, bounds| {
-                        let comp = m.component.as_ref()?;
-                        let view = m.sparkline_bounds()?;
-                        let traces: Vec<OwnedLineDraw> = m
-                            .indexes
-                            .iter()
-                            .enumerate()
-                            .map(|(i, &idx)| OwnedLineDraw {
-                                component: comp.clone(),
-                                element_index: idx,
-                                style: PlotStyle::Line,
-                                color: line_colors[i % line_colors.len()],
-                                stroke_width: 1.5,
-                            })
-                            .collect();
-                        Some(PlotCanvasBuild {
-                            inner_bounds: bounds,
-                            view,
-                            traces,
-                        })
-                    },
-                    blit_frame,
-                )
-                .w_full()
-                .pt(px(4.0))
-                .flex_1()
-                .min_h(px(16.0)),
+                div()
+                    .w_full()
+                    .pt(px(4.0))
+                    .flex_1()
+                    .min_h(px(16.0))
+                    .child(self.sparkline.clone()),
             );
         }
 
@@ -374,7 +332,7 @@ impl Render for Monitor {
 }
 
 impl Inspectable for Monitor {
-    fn fields(&self) -> Vec<InspectionField> {
+    fn fields(&self, _cx: &gpui::App) -> Vec<InspectionField> {
         vec![
             InspectionField {
                 label: "Unit".into(),
