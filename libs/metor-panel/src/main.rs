@@ -13,7 +13,8 @@ use metor_panel::command_palette::{CommandPalette, PalettePage};
 use metor_panel::pending_edits::{
     self, edit_value_page, pending_edits, pending_edits_mut, review_page,
 };
-use metor_panel::property_inspector::PropertyInspector;
+use metor_panel::inspector::Inspector;
+use metor_panel::inspectable::InspectorRowsRequest;
 use metor_panel::tiles::panels::tile_palette_page;
 use metor_panel::tiles::{TileGroup, TileGroupEvent};
 use stellarator::{net::TcpListener, struc_con::stellar};
@@ -35,11 +36,11 @@ struct AppRoot {
     db: Arc<DB>,
     tiles: Entity<TileGroup>,
     palette: Option<Entity<CommandPalette>>,
-    inspector: Option<Entity<PropertyInspector>>,
+    inspector: Option<Entity<Inspector>>,
     pending_inspect: Option<PalettePage>,
     pending_inspector_request:
         Option<(Box<dyn metor_panel::tiles::PaneItemHandle>, Point<Pixels>)>,
-    pending_inspector_open: Option<metor_panel::inspectable::InspectorRequest>,
+    pending_inspector_open: Option<InspectorRowsRequest>,
     focus_handle: FocusHandle,
 }
 
@@ -82,42 +83,22 @@ impl AppRoot {
         }
     }
 
-    fn make_on_open_inspector(
-        root: Entity<AppRoot>,
-    ) -> metor_panel::inspectable::OpenInspectorCallback {
-        Arc::new(move |request, _window, cx| {
-            root.update(cx, |this, cx| {
-                this.pending_inspector_open = Some(request);
-                cx.notify();
-            });
-        })
-    }
 
     fn toggle_palette(&mut self, _: &OpenPalette, window: &mut Window, cx: &mut Context<Self>) {
         if let Some(palette) = &self.palette {
-            if palette.read(cx).dismissed {
+            if !palette.read(cx).dismissed {
                 self.palette = None;
+                self.focus_handle.focus(window);
+                cx.notify();
+                return;
             }
         }
 
-        if self.palette.is_some() {
-            self.palette = None;
-            self.focus_handle.focus(window);
-            cx.notify();
-        } else {
-            let pane = self.tiles.read(cx).panes()[0].clone();
-            let root = cx.entity().clone();
-            let inspector_cb = Self::make_on_open_inspector(root.clone());
-            let page = tile_palette_page(
-                self.db.clone(),
-                pane,
-                &self.tiles,
-                Self::make_on_inspect(root),
-                Some(inspector_cb),
-                cx,
-            );
-            self.open_palette(page, window, cx);
-        }
+        let on_inspect = Self::make_on_inspect(cx.entity().clone());
+        let pane = self.tiles.read(cx).panes()[0].clone();
+        let page =
+            tile_palette_page(self.db.clone(), pane, &self.tiles, on_inspect, cx);
+        self.open_palette(page, window, cx);
     }
 
     fn cycle_tab_forward(
@@ -164,13 +145,12 @@ impl AppRoot {
         cx: &mut Context<Self>,
     ) {
         let db = self.db.clone();
-        if let Some((fields, setter, provider)) = item.inspect_fields_and_setter(Some(db.clone()), cx) {
+        if let Some(rows) = item.inspect_rows(Some(db.clone()), cx) {
             let parent_focus = self.focus_handle.clone();
             let root = cx.entity().clone();
             let inspector = cx.new(|cx| {
-                let mut insp = PropertyInspector::new(fields, position, setter, cx);
+                let mut insp = Inspector::new(rows, position, cx);
                 insp.set_parent_focus(parent_focus);
-                insp.set_fields_provider(provider);
                 let root = root.clone();
                 insp.set_on_open_palette(move |page, _window, cx| {
                     root.update(cx, |this, cx| {
@@ -199,7 +179,6 @@ impl AppRoot {
             TileGroupEvent::Inspect { item, position } => {
                 let position = *position;
                 let item = item.clone_handle();
-                // Defer to render to avoid re-entrant updates
                 self.pending_inspector_request = Some((item, position));
                 cx.notify();
             }
@@ -237,10 +216,8 @@ impl Render for AppRoot {
             let parent_focus = self.focus_handle.clone();
             let root = cx.entity().clone();
             let inspector = cx.new(|cx| {
-                let mut insp =
-                    PropertyInspector::new(request.fields, request.position, request.on_set_field, cx);
+                let mut insp = Inspector::new(request.rows, request.position, cx);
                 insp.set_parent_focus(parent_focus);
-                insp.set_fields_provider(request.fields_provider);
                 let root = root.clone();
                 insp.set_on_open_palette(move |page, _window, cx| {
                     root.update(cx, |this, cx| {

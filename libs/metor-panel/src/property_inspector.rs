@@ -10,7 +10,6 @@ use crate::command_palette::{PalettePage, TextField};
 use crate::icons::Icon;
 use crate::inspectable::{FieldId, InspectionField, InspectionValue};
 use crate::theme::theme;
-use crate::tiles::item::{FieldSetter, FieldsProvider};
 
 const SLIDER_HEIGHT: f32 = 14.0;
 const SLIDER_TRACK_HEIGHT: f32 = 4.0;

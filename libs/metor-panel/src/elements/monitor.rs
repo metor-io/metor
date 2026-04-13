@@ -5,7 +5,6 @@ use metor_db::DB;
 use metor_proto::types::{ComponentId, ComponentView};
 
 use super::time_series::{LinePlot, Trace};
-use crate::inspectable::{FieldId, Inspectable, InspectionField, InspectionValue};
 use crate::theme::theme;
 use crate::{AsComponentView, ComponentStream, ComponentStreamBuilder};
 
@@ -23,10 +22,10 @@ struct ElementDisplay {
 pub struct Monitor {
     #[facet(skip)]
     name: SharedString,
-    unit: SharedString,
+    pub unit: SharedString,
     #[facet(opaque)]
     elements: Vec<ElementDisplay>,
-    show_sparkline: bool,
+    pub show_sparkline: bool,
     #[facet(opaque)]
     sparkline: Entity<LinePlot>,
     #[facet(opaque)]
@@ -336,37 +335,3 @@ impl Render for Monitor {
     }
 }
 
-impl Inspectable for Monitor {
-    fn fields(&self, _cx: &gpui::App) -> Vec<InspectionField> {
-        vec![
-            InspectionField::new(
-                "Unit",
-                FieldId(0),
-                InspectionValue::String(self.unit.to_string()),
-            ),
-            InspectionField::new(
-                "Sparkline",
-                FieldId(1),
-                InspectionValue::Bool(self.show_sparkline),
-            ),
-        ]
-    }
-
-    fn set_field(&mut self, field_id: FieldId, value: InspectionValue, cx: &mut Context<Self>) {
-        match field_id {
-            FieldId(0) => {
-                if let InspectionValue::String(s) = value {
-                    self.unit = SharedString::from(s);
-                    cx.notify();
-                }
-            }
-            FieldId(1) => {
-                if let InspectionValue::Bool(b) = value {
-                    self.show_sparkline = b;
-                    cx.notify();
-                }
-            }
-            _ => {}
-        }
-    }
-}

@@ -1,0 +1,79 @@
+/// Per-type widget elements for the property inspector.
+///
+/// Each field type rendered in the inspector is a self-contained struct
+/// implementing [`InspectorRow`]. The [`Inspector`](crate::inspector::Inspector)
+/// container composes these rows without knowing their concrete types.
+use gpui::{AnyElement, App, Hsla, SharedString, Window, div, prelude::*, px};
+
+use crate::theme::theme;
+
+pub mod bool_row;
+pub mod command_row;
+pub mod scalar_row;
+pub mod text_row;
+
+pub use bool_row::BoolRow;
+pub use command_row::CommandRow;
+pub use scalar_row::ScalarRow;
+pub use text_row::TextRow;
+
+/// One row in an inspector panel.
+///
+/// Each widget struct captures its own entity handle and setter closure
+/// at construction time, making mutation self-contained.
+pub trait InspectorRow: 'static {
+    /// Searchable label text for fuzzy filtering.
+    fn label(&self) -> &str;
+
+    /// Render this row. `selected` indicates keyboard focus.
+    fn render_row(
+        &self,
+        row_ix: usize,
+        selected: bool,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> AnyElement;
+
+    /// What happens when this row is activated (Enter / click).
+    fn activate(&self, window: &mut Window, cx: &mut App) -> RowAction;
+}
+
+/// Result of activating an inspector row.
+pub enum RowAction {
+    /// The row handled the action internally (e.g., bool toggled).
+    Handled,
+    /// Open a cascading child inspector with these rows.
+    Cascade(Vec<Box<dyn InspectorRow>>),
+    /// Open a command palette page.
+    OpenPalette(crate::command_palette::PalettePage),
+    /// Dismiss the inspector.
+    Dismiss,
+    /// Start inline text editing with the given initial value.
+    StartEdit {
+        current_text: String,
+        /// Called when editing is committed.
+        on_commit: Box<dyn FnOnce(String, &mut Window, &mut App)>,
+    },
+}
+
+/// Shared base styling for an inspector row.
+pub fn row_base(row_ix: usize, selected: bool, cx: &App) -> gpui::Stateful<gpui::Div> {
+    let theme = theme(cx);
+    let bg = if selected {
+        theme.selection_bg
+    } else {
+        Hsla::transparent_black()
+    };
+    div()
+        .id(("inspector-row", row_ix))
+        .flex()
+        .flex_row()
+        .items_center()
+        .justify_between()
+        .w_full()
+        .px(px(12.0))
+        .py(px(4.0))
+        .bg(bg)
+        .cursor_pointer()
+        .hover(|s| s.bg(theme.selection_bg))
+}

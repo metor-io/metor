@@ -5,7 +5,9 @@ use metor_db::{Component, ComponentSchema, DB};
 use metor_proto::types::{ComponentId, ComponentView, Timestamp};
 pub mod command_palette;
 pub mod inspect;
+pub mod inspector;
 pub mod reflect;
+pub mod widgets;
 pub mod elements;
 pub mod gpu_context;
 pub mod icons;
@@ -14,7 +16,6 @@ pub mod offset_parse;
 pub mod pending_edits;
 pub mod theme;
 pub mod tiles;
-pub mod property_inspector;
 pub(crate) mod trace_picker;
 
 /// Borrowing conversion to a [`ComponentView`].

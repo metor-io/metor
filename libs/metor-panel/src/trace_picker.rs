@@ -1,23 +1,28 @@
 use std::sync::Arc;
 
-use gpui::{Entity, SharedString};
+use gpui::SharedString;
 use metor_db::DB;
 use metor_proto::types::ComponentId;
 
 use crate::command_palette::{PaletteAction, PaletteItem, PalettePage};
-use crate::inspectable::{list_components, FieldId, Inspectable, InspectionValue, PickerArity};
+use crate::inspectable::{list_components, PickerArity};
 
 /// A pending trace selection: display label, component id, element index.
 type TraceSelection = (String, ComponentId, usize);
 
-/// Build a trace picker page for an inspectable entity's Traces field.
+/// Callback that applies selected traces.
+type ApplyTraces = Arc<dyn Fn(Vec<(ComponentId, usize)>, &mut gpui::Window, &mut gpui::App) + Send + Sync>;
+
+/// Callback that applies an element picker selection.
+type ApplyElement = Arc<dyn Fn(ComponentId, &mut gpui::Window, &mut gpui::App) + Send + Sync>;
+
+/// Build a trace picker page.
 ///
 /// If `existing` contains prior selections, they appear as pills in the
 /// palette breadcrumb bar so the user can see what's already chosen and
 /// continue adding more.
-pub(crate) fn trace_picker_page<T: Inspectable>(
-    entity: Entity<T>,
-    field_id: FieldId,
+pub(crate) fn trace_picker_page(
+    on_apply: ApplyTraces,
     db: Arc<DB>,
     existing: &[(ComponentId, usize)],
 ) -> PalettePage {
@@ -36,11 +41,7 @@ pub(crate) fn trace_picker_page<T: Inspectable>(
             .collect()
     });
 
-    let ctx = TracePickerCtx {
-        entity,
-        field_id,
-        db,
-    };
+    let ctx = TracePickerCtx { on_apply, db };
     ctx.prepopulated(existing_selections)
 }
 
@@ -77,15 +78,13 @@ pub(crate) fn element_names(shape: &[usize]) -> Vec<String> {
     out
 }
 
-/// Bundles the immutable context for trace picker page construction,
-/// avoiding repetitive parameter threading across recursive calls.
-struct TracePickerCtx<T: Inspectable> {
-    entity: Entity<T>,
-    field_id: FieldId,
+/// Bundles the immutable context for trace picker page construction.
+struct TracePickerCtx {
+    on_apply: ApplyTraces,
     db: Arc<DB>,
 }
 
-impl<T: Inspectable> TracePickerCtx<T> {
+impl TracePickerCtx {
     fn prepopulated(&self, existing: Vec<TraceSelection>) -> PalettePage {
         if existing.is_empty() {
             return self.component_page(vec![]);
@@ -108,16 +107,13 @@ impl<T: Inspectable> TracePickerCtx<T> {
             None
         } else {
             let sels = selections.clone();
-            let entity = self.entity.clone();
-            let field_id = self.field_id;
+            let on_apply = self.on_apply.clone();
             Some(PaletteItem::new(
                 format!("Apply ({} selected)", sels.len()),
-                PaletteAction::Execute(Box::new(move |_input, _window, cx| {
+                PaletteAction::Execute(Box::new(move |_input, window, cx| {
                     let traces: Vec<(ComponentId, usize)> =
                         sels.iter().map(|(_name, id, idx)| (*id, *idx)).collect();
-                    entity.update(cx, |this, cx| {
-                        this.set_field(field_id, InspectionValue::Traces(traces), cx);
-                    });
+                    on_apply(traces, window, cx);
                 })),
             ))
         };
@@ -125,9 +121,8 @@ impl<T: Inspectable> TracePickerCtx<T> {
         let items: Vec<PaletteItem> = list_components(&self.db)
             .into_iter()
             .map(|(id, name)| {
-                let entity = self.entity.clone();
+                let on_apply = self.on_apply.clone();
                 let db = self.db.clone();
-                let field_id = self.field_id;
                 let selections = selections.clone();
                 let comp_name = name.clone();
                 PaletteItem::new(
@@ -135,7 +130,7 @@ impl<T: Inspectable> TracePickerCtx<T> {
                     PaletteAction::NextPage {
                         label: None,
                         page: Box::new(move || {
-                            let ctx = TracePickerCtx { entity, field_id, db };
+                            let ctx = TracePickerCtx { on_apply, db };
                             ctx.element_page(id, comp_name, selections)
                         }),
                     },
@@ -167,9 +162,8 @@ impl<T: Inspectable> TracePickerCtx<T> {
         let mut items = Vec::new();
 
         if names.len() > 1 {
-            let entity = self.entity.clone();
+            let on_apply = self.on_apply.clone();
             let db = self.db.clone();
-            let field_id = self.field_id;
             let mut sels = selections.clone();
             for i in 0..names.len() {
                 sels.push((component_name.clone(), component_id, i));
@@ -179,7 +173,7 @@ impl<T: Inspectable> TracePickerCtx<T> {
                 PaletteAction::NextPage {
                     label: Some(SharedString::from(component_name.clone())),
                     page: Box::new(move || {
-                        let ctx = TracePickerCtx { entity, field_id, db };
+                        let ctx = TracePickerCtx { on_apply, db };
                         ctx.component_page(sels)
                     }),
                 },
@@ -187,9 +181,8 @@ impl<T: Inspectable> TracePickerCtx<T> {
         }
 
         for (i, elem_name) in names.iter().enumerate() {
-            let entity = self.entity.clone();
+            let on_apply = self.on_apply.clone();
             let db = self.db.clone();
-            let field_id = self.field_id;
             let mut sels = selections.clone();
             sels.push((component_name.clone(), component_id, i));
 
@@ -205,7 +198,7 @@ impl<T: Inspectable> TracePickerCtx<T> {
                 PaletteAction::NextPage {
                     label: Some(pill_label),
                     page: Box::new(move || {
-                        let ctx = TracePickerCtx { entity, field_id, db };
+                        let ctx = TracePickerCtx { on_apply, db };
                         ctx.component_page(sels)
                     }),
                 },
@@ -218,30 +211,20 @@ impl<T: Inspectable> TracePickerCtx<T> {
     }
 }
 
-/// Build a picker for an [`InspectionValue::ElementPicker`] field. The user
-/// just picks a component — the field's `arity` decides whether the
-/// component is interpreted as a `Vec3` or `Quat`, and the fixed
-/// metor-panel-frame layout convention determines element ordering.
-pub(crate) fn element_picker_page<T: Inspectable>(
-    entity: Entity<T>,
-    field_id: FieldId,
+/// Build a picker for an element binding field.
+pub(crate) fn element_picker_page(
+    on_apply: ApplyElement,
     db: Arc<DB>,
     arity: PickerArity,
 ) -> PalettePage {
     let items: Vec<PaletteItem> = list_components(&db)
         .into_iter()
         .map(|(id, name)| {
-            let entity = entity.clone();
+            let on_apply = on_apply.clone();
             PaletteItem::new(
                 name,
-                PaletteAction::Execute(Box::new(move |_input, _window, cx| {
-                    let value = InspectionValue::ElementPicker {
-                        component: Some(id),
-                        arity,
-                    };
-                    entity.update(cx, |this, cx| {
-                        this.set_field(field_id, value, cx);
-                    });
+                PaletteAction::Execute(Box::new(move |_input, window, cx| {
+                    on_apply(id, window, cx);
                 })),
             )
         })

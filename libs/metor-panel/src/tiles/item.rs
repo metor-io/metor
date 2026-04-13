@@ -1,11 +1,10 @@
 use std::sync::Arc;
 
-use gpui::{AnyView, App, Entity, Render, SharedString, Window};
+use gpui::{AnyView, App, Entity, Render, SharedString};
 use metor_db::DB;
 
-
 use crate::command_palette::PalettePage;
-use crate::inspectable::{FieldId, InspectionField, InspectionValue};
+use crate::widgets::InspectorRow;
 
 /// Trait that pane content must implement to be hosted in a tile pane.
 pub trait PaneItem: Render + Sized + 'static {
@@ -28,21 +27,11 @@ pub trait PaneItem: Render + Sized + 'static {
         None
     }
 
-    /// Return inspectable fields and a type-erased setter closure, if supported.
-    fn inspect_fields_and_setter(
-        &self,
-        _db: Option<Arc<DB>>,
-        _cx: &App,
-    ) -> Option<(Vec<InspectionField>, FieldSetter, FieldsProvider)> {
+    /// Return inspector rows for this item, if supported.
+    fn inspect_rows(&self, _db: Option<Arc<DB>>, _cx: &App) -> Option<Vec<Box<dyn InspectorRow>>> {
         None
     }
 }
-
-/// Type-erased setter for an inspectable field.
-pub type FieldSetter = Arc<dyn Fn(FieldId, InspectionValue, &mut Window, &mut App)>;
-
-/// Re-fetches the current fields from an inspectable entity.
-pub type FieldsProvider = Arc<dyn Fn(&App) -> Vec<InspectionField>>;
 
 /// Object-safe handle to any pane item, used for type-erased storage in Pane.
 pub trait PaneItemHandle: 'static {
@@ -54,13 +43,11 @@ pub trait PaneItemHandle: 'static {
     fn entity_id(&self) -> gpui::EntityId;
     fn clone_handle(&self) -> Box<dyn PaneItemHandle>;
     fn inspect_page(&self, db: Option<Arc<DB>>, cx: &App) -> Option<PalettePage>;
-
-    /// Return the inspectable fields and a closure to apply changes, if supported.
-    fn inspect_fields_and_setter(
+    fn inspect_rows(
         &self,
         _db: Option<Arc<DB>>,
         _cx: &App,
-    ) -> Option<(Vec<InspectionField>, FieldSetter, FieldsProvider)> {
+    ) -> Option<Vec<Box<dyn InspectorRow>>> {
         None
     }
 }
@@ -98,11 +85,11 @@ impl<T: PaneItem> PaneItemHandle for Entity<T> {
         self.read(cx).inspect_page(db, cx)
     }
 
-    fn inspect_fields_and_setter(
+    fn inspect_rows(
         &self,
         db: Option<Arc<DB>>,
         cx: &App,
-    ) -> Option<(Vec<InspectionField>, FieldSetter, FieldsProvider)> {
-        self.read(cx).inspect_fields_and_setter(db, cx)
+    ) -> Option<Vec<Box<dyn InspectorRow>>> {
+        self.read(cx).inspect_rows(db, cx)
     }
 }

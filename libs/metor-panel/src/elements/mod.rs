@@ -6,7 +6,6 @@ use metor_proto::types::{ComponentId, ComponentView, ElementValue};
 use smallvec::SmallVec;
 use std::fmt::Write;
 
-use crate::inspectable::{FieldId, Inspectable, InspectionField, InspectionValue};
 use crate::theme::theme;
 use crate::{AsComponentView, ComponentStream, ComponentStreamBuilder};
 
@@ -128,10 +127,3 @@ impl Render for ComponentText {
     }
 }
 
-impl Inspectable for ComponentText {
-    fn fields(&self, _cx: &gpui::App) -> Vec<InspectionField> {
-        vec![]
-    }
-
-    fn set_field(&mut self, _field_id: FieldId, _value: InspectionValue, _cx: &mut Context<Self>) {}
-}

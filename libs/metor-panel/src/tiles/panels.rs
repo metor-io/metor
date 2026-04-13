@@ -8,11 +8,6 @@ use crate::command_palette::{PaletteAction, PaletteItem, PalettePage};
 use crate::elements::time_series::OpenPageCallback;
 use crate::elements::viewer_3d::Viewer3d;
 use crate::elements::{ComponentTable, ComponentText, TimeSeriesPlot, new_component_table};
-use crate::inspectable::{
-    FieldId, Inspectable, InspectionField, InspectionValue, palette_page_for_field,
-    palette_page_for_inspectable,
-};
-use super::item::{FieldSetter, FieldsProvider};
 use super::dashboard::DashboardPanel;
 
 use super::item::{PaneItem, PaneItemHandle};
@@ -136,15 +131,6 @@ impl PlotPanel {
         });
     }
 
-    pub fn set_on_open_inspector(
-        &self,
-        cb: crate::inspectable::OpenInspectorCallback,
-        cx: &mut App,
-    ) {
-        self.inner.update(cx, |plot, _cx| {
-            plot.set_on_open_inspector(cb);
-        });
-    }
 }
 
 impl Render for PlotPanel {
@@ -167,21 +153,6 @@ impl PaneItem for PlotPanel {
         serde_json::json!({ "label": title.as_ref() })
     }
 
-    fn inspect_page(&self, _db: Option<Arc<DB>>, cx: &App) -> Option<PalettePage> {
-        Some(palette_page_for_inspectable(
-            self.inner.clone(),
-            Some(self.db.clone()),
-            cx,
-        ))
-    }
-
-    fn inspect_fields_and_setter(
-        &self,
-        _db: Option<Arc<DB>>,
-        cx: &App,
-    ) -> Option<(Vec<InspectionField>, FieldSetter, FieldsProvider)> {
-        Some(inspectable_fields_and_setter(self.inner.clone(), cx))
-    }
 }
 
 /// Tile panel wrapping a [`Viewer3d`] with inspector support.
@@ -250,21 +221,6 @@ impl PaneItem for Viewer3dPanel {
         })
     }
 
-    fn inspect_page(&self, _db: Option<Arc<DB>>, cx: &App) -> Option<PalettePage> {
-        Some(palette_page_for_inspectable(
-            self.inner.clone(),
-            Some(self.db.clone()),
-            cx,
-        ))
-    }
-
-    fn inspect_fields_and_setter(
-        &self,
-        _db: Option<Arc<DB>>,
-        cx: &App,
-    ) -> Option<(Vec<InspectionField>, FieldSetter, FieldsProvider)> {
-        Some(inspectable_fields_and_setter(self.inner.clone(), cx))
-    }
 }
 
 /// Callback invoked after a panel is created, so the caller can open its
@@ -281,7 +237,6 @@ pub fn tile_palette_page(
     pane: Entity<Pane>,
     tiles: &Entity<super::TileGroup>,
     on_inspect: impl Fn(PalettePage, &mut Window, &mut App) + 'static,
-    on_open_inspector: Option<crate::inspectable::OpenInspectorCallback>,
     cx: &App,
 ) -> PalettePage {
     let on_inspect = Arc::new(on_inspect);
@@ -290,10 +245,9 @@ pub fn tile_palette_page(
         let db = db.clone();
         let pane = pane.clone();
         let on_inspect = on_inspect.clone();
-        let on_open_inspector = on_open_inspector.clone();
         PaletteAction::NextPage {
             label: Some("New".into()),
-            page: Box::new(move || new_panel_page(db, pane, on_inspect, on_open_inspector)),
+            page: Box::new(move || new_panel_page(db, pane, on_inspect)),
         }
     })];
 
@@ -362,23 +316,20 @@ fn new_panel_page(
     db: Arc<DB>,
     pane: Entity<Pane>,
     on_inspect: Arc<dyn Fn(PalettePage, &mut Window, &mut App) + 'static>,
-    on_open_inspector: Option<crate::inspectable::OpenInspectorCallback>,
 ) -> PalettePage {
     let items = vec![
         PaletteItem::new("Time Series Plot", {
             let db = db.clone();
             let pane = pane.clone();
             let on_inspect = on_inspect.clone();
-            let on_open_inspector = on_open_inspector.clone();
-            PaletteAction::Execute(Box::new(move |_filter, window, cx| {
-                // Create an empty plot and add it to the pane
+            PaletteAction::Execute(Box::new(move |_filter, _window, cx| {
                 let plot_panel = {
                     let db = db.clone();
                     cx.new(|cx| PlotPanel::empty(db, cx))
                 };
-                let (inner, plot_db) = {
+                let inner = {
                     let panel = plot_panel.read(cx);
-                    (panel.inner().clone(), panel.db().clone())
+                    panel.inner().clone()
                 };
 
                 let cb: OpenPageCallback = Arc::new({
@@ -387,24 +338,11 @@ fn new_panel_page(
                 });
                 inner.update(cx, |plot, _cx| {
                     plot.set_on_open_page(cb);
-                    if let Some(ref insp_cb) = on_open_inspector {
-                        plot.set_on_open_inspector(insp_cb.clone());
-                    }
                 });
 
                 pane.update(cx, |pane, cx| {
                     pane.add_item(Box::new(plot_panel), cx);
                 });
-
-                // Go directly into the Traces field editor (component/element picker)
-                let page = palette_page_for_field(
-                    inner,
-                    FieldId(0), // Traces field on TimeSeriesPlot
-                    "Traces".into(),
-                    InspectionValue::Traces(vec![]),
-                    Some(plot_db),
-                );
-                on_inspect(page, window, cx);
             }))
         }),
         PaletteItem::new("Component Text", {
@@ -452,20 +390,15 @@ fn new_panel_page(
             let db = db.clone();
             let pane = pane.clone();
             let on_inspect = on_inspect.clone();
-            let on_open_inspector = on_open_inspector.clone();
             PaletteAction::Execute(Box::new(move |_filter, _window, cx| {
                 let db = db.clone();
                 let on_inspect = on_inspect.clone();
-                let on_open_inspector = on_open_inspector.clone();
                 pane.update(cx, |pane, cx| {
                     let dashboard = cx.new(|cx| {
                         let mut d = DashboardPanel::new(db, cx);
                         let cb: crate::elements::time_series::OpenPageCallback =
                             Arc::new(move |page, window, cx| on_inspect(page, window, cx));
                         d.set_on_open_page(cb);
-                        if let Some(ref insp_cb) = on_open_inspector {
-                            d.set_on_open_inspector(insp_cb.clone());
-                        }
                         d
                     });
                     pane.add_item(Box::new(dashboard), cx);
@@ -538,19 +471,4 @@ fn build_edit_items(
     items
 }
 
-/// Build a `(fields, setter, provider)` tuple from any `Inspectable` entity.
-fn inspectable_fields_and_setter<T: Inspectable>(
-    entity: Entity<T>,
-    cx: &App,
-) -> (Vec<InspectionField>, FieldSetter, FieldsProvider) {
-    let fields = entity.read(cx).fields(cx);
-    let setter_entity = entity.clone();
-    let setter: FieldSetter = Arc::new(move |field_id, value, _window, cx| {
-        setter_entity.update(cx, |this, cx| {
-            this.set_field(field_id, value, cx);
-        });
-    });
-    let provider: FieldsProvider = Arc::new(move |cx| entity.read(cx).fields(cx));
-    (fields, setter, provider)
-}
 

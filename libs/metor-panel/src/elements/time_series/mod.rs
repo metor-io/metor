@@ -9,7 +9,7 @@ use metor_proto::types::{ComponentId, Timestamp};
 
 #[allow(unused_imports)]
 use crate::inspect;
-use crate::inspectable::{FieldId, Inspectable, InspectionField, InspectionValue, ListItem};
+use crate::inspectable::{FieldId, InspectionField, InspectionValue, ListItem};
 use crate::offset_parse::TimeRangeBehavior;
 
 mod bounds;
@@ -516,7 +516,6 @@ pub struct TimeSeriesPlot {
     drag_zone: AxisZone,
     last_plot_area: Option<Bounds<Pixels>>,
     on_open_page: Option<OpenPageCallback>,
-    on_open_inspector: Option<crate::inspectable::OpenInspectorCallback>,
 }
 
 /// Callback type for when the plot wants to open an inspector page.
@@ -537,16 +536,11 @@ impl TimeSeriesPlot {
             drag_zone: AxisZone::Plot,
             last_plot_area: None,
             on_open_page: None,
-            on_open_inspector: None,
         }
     }
 
     pub fn set_on_open_page(&mut self, cb: OpenPageCallback) {
         self.on_open_page = Some(cb);
-    }
-
-    pub fn set_on_open_inspector(&mut self, cb: crate::inspectable::OpenInspectorCallback) {
-        self.on_open_inspector = Some(cb);
     }
 
     /// Convenience: create a plot for a single component with the given element
@@ -674,62 +668,6 @@ impl TimeSeriesPlot {
         cx.notify();
     }
 
-    pub(crate) fn trace_fields(&self, trace_idx: usize, cx: &gpui::App) -> Vec<InspectionField> {
-        let trace_entity = self
-            .line_plot
-            .read(cx)
-            .trace(trace_idx)
-            .cloned()
-            .expect("trace_fields called with an invalid index");
-        let trace = trace_entity.read(cx);
-        let base = TRACE_SETTINGS_BASE + trace_idx as u32 * 100;
-        vec![
-            InspectionField::new(
-                "Style",
-                FieldId(base + TRACE_SUB_STYLE),
-                InspectionValue::Enum {
-                    selected: trace.style.label().to_string(),
-                    options: PlotStyle::ALL
-                        .iter()
-                        .map(|s| s.label().to_string())
-                        .collect(),
-                },
-            ),
-            InspectionField::new(
-                "Color",
-                FieldId(base + TRACE_SUB_COLOR),
-                InspectionValue::Color(trace.color),
-            ),
-            InspectionField::new(
-                "Visible",
-                FieldId(base + TRACE_SUB_VISIBLE),
-                InspectionValue::Bool(trace.visible),
-            ),
-            InspectionField::new(
-                "Width",
-                FieldId(base + TRACE_SUB_STROKE_WIDTH),
-                InspectionValue::F64(trace.stroke_width as f64),
-            )
-            .with_range(0.5, 10.0),
-        ]
-    }
-
-    fn trace_inspect_page(
-        &self,
-        trace_idx: usize,
-        cx: &Context<Self>,
-    ) -> crate::command_palette::PalettePage {
-        use crate::inspectable::palette_page_for_list_item;
-
-        let label = self
-            .line_plot
-            .read(cx)
-            .trace(trace_idx)
-            .map(|t| t.read(cx).label.clone())
-            .unwrap_or_default();
-        let fields = self.trace_fields(trace_idx, cx);
-        palette_page_for_list_item(cx.entity().clone(), &fields, label, None)
-    }
 }
 
 impl Render for TimeSeriesPlot {
@@ -916,38 +854,6 @@ impl Render for TimeSeriesPlot {
                                 });
                             }),
                         )
-                        .on_mouse_down(
-                            MouseButton::Right,
-                            cx.listener(move |this, event: &gpui::MouseDownEvent, window, cx| {
-                                if let Some(cb) = this.on_open_inspector.clone() {
-                                    let fields = this.trace_fields(i, cx);
-                                    let entity = cx.entity().clone();
-                                    let provider_entity = entity.clone();
-                                    let setter: crate::tiles::item::FieldSetter =
-                                        Arc::new(move |fid, val, _w, cx| {
-                                            entity.update(cx, |t, cx| t.set_field(fid, val, cx));
-                                        });
-                                    let trace_idx = i;
-                                    let provider: crate::tiles::item::FieldsProvider =
-                                        std::sync::Arc::new(move |cx| {
-                                            provider_entity.read(cx).trace_fields(trace_idx, cx)
-                                        });
-                                    cb(
-                                        crate::inspectable::InspectorRequest {
-                                            fields,
-                                            position: event.position,
-                                            on_set_field: setter,
-                                            fields_provider: provider,
-                                        },
-                                        window,
-                                        cx,
-                                    );
-                                } else if let Some(cb) = this.on_open_page.clone() {
-                                    let page = this.trace_inspect_page(i, cx);
-                                    cb(page, window, cx);
-                                }
-                            }),
-                        )
                         .child(div().w(px(10.0)).h(px(10.0)).rounded(px(2.0)).bg(color))
                         .child(
                             div()
@@ -965,222 +871,3 @@ impl Render for TimeSeriesPlot {
     }
 }
 
-/// Field IDs for trace sub-fields: `trace_index * 100 + sub_field`.
-const TRACE_SETTINGS_BASE: u32 = 100;
-const TRACE_SUB_STYLE: u32 = 0;
-const TRACE_SUB_COLOR: u32 = 1;
-const TRACE_SUB_VISIBLE: u32 = 2;
-const TRACE_SUB_STROKE_WIDTH: u32 = 3;
-const TRACE_SUB_REMOVE: u32 = 4;
-
-impl Inspectable for TimeSeriesPlot {
-    fn fields(&self, cx: &gpui::App) -> Vec<InspectionField> {
-        let lp = self.line_plot.read(cx);
-
-        let mut fields = vec![
-            InspectionField::new(
-                "Title",
-                FieldId(5),
-                InspectionValue::String(self.title(cx).to_string()),
-            ),
-        ];
-
-        let trace_items: Vec<ListItem> = lp
-            .traces()
-            .enumerate()
-            .map(|(i, trace_entity)| {
-                let trace = trace_entity.read(cx);
-                let base = TRACE_SETTINGS_BASE + i as u32 * 100;
-                ListItem {
-                    label: trace.label.clone(),
-                    can_remove: true,
-                    fields: vec![
-                        InspectionField::new(
-                            "Style",
-                            FieldId(base + TRACE_SUB_STYLE),
-                            InspectionValue::Enum {
-                                selected: trace.style.label().to_string(),
-                                options: PlotStyle::ALL
-                                    .iter()
-                                    .map(|s| s.label().to_string())
-                                    .collect(),
-                            },
-                        ),
-                        InspectionField::new(
-                            "Color",
-                            FieldId(base + TRACE_SUB_COLOR),
-                            InspectionValue::Color(trace.color),
-                        ),
-                        InspectionField::new(
-                            "Visible",
-                            FieldId(base + TRACE_SUB_VISIBLE),
-                            InspectionValue::Bool(trace.visible),
-                        ),
-                        InspectionField::new(
-                            "Width",
-                            FieldId(base + TRACE_SUB_STROKE_WIDTH),
-                            InspectionValue::F64(trace.stroke_width as f64),
-                        )
-                        .with_range(0.5, 10.0),
-                        InspectionField::new(
-                            "Remove",
-                            FieldId(base + TRACE_SUB_REMOVE),
-                            InspectionValue::Bool(false),
-                        ),
-                    ],
-                }
-            })
-            .collect();
-
-        let entity = self.self_entity.clone();
-        let db = self.db.clone();
-        let existing: Vec<(ComponentId, usize)> = lp
-            .traces()
-            .map(|t| {
-                let t = t.read(cx);
-                (t.component_id, t.element_index)
-            })
-            .collect();
-        let on_add: crate::inspectable::AddCallback = Arc::new(move || {
-            crate::trace_picker::trace_picker_page(entity.clone(), FieldId(0), db.clone(), &existing)
-        });
-
-        fields.push(InspectionField::new(
-            "Traces",
-            FieldId(1),
-            InspectionValue::List {
-                items: trace_items,
-                on_add: Some(on_add),
-            },
-        ));
-
-        fields.push(InspectionField::new(
-            "X Range",
-            FieldId(4),
-            InspectionValue::String(lp.x_range().to_string()),
-        ));
-
-        let effective = lp.effective_view(cx);
-        let (min_y, max_y) = match effective {
-            Some(v) => (v.min_y, v.max_y),
-            None => (0.0, 1.0),
-        };
-        fields.push(InspectionField::new(
-            "Y Min",
-            FieldId(2),
-            InspectionValue::F64(lp.y_min_override().unwrap_or(min_y)),
-        ));
-        fields.push(InspectionField::new(
-            "Y Max",
-            FieldId(3),
-            InspectionValue::F64(lp.y_max_override().unwrap_or(max_y)),
-        ));
-
-        fields
-    }
-
-    fn set_field(&mut self, field_id: FieldId, value: InspectionValue, cx: &mut Context<Self>) {
-        match (field_id, value) {
-            (FieldId(0), InspectionValue::Traces(selections)) => {
-                let theme = crate::theme::theme(cx);
-                let new_traces: Vec<Trace> = selections
-                    .into_iter()
-                    .enumerate()
-                    .map(|(i, (component_id, element_index))| {
-                        let elem_names = crate::trace_picker::element_names_for_component(
-                            &self.db,
-                            component_id,
-                        );
-                        let comp_name = self
-                            .db
-                            .with_state(|s| {
-                                s.get_component_metadata(component_id)
-                                    .map(|m| m.name.clone())
-                            })
-                            .unwrap_or_default();
-                        let label = elem_names
-                            .get(element_index)
-                            .map(|n| format!("{}.{}", comp_name, n))
-                            .unwrap_or_else(|| format!("{}[{}]", comp_name, element_index));
-                        Trace {
-                            component_id,
-                            element_index,
-                            color: theme.line_colors[i % theme.line_colors.len()],
-                            style: PlotStyle::default(),
-                            visible: true,
-                            label: SharedString::from(label),
-                            stroke_width: 1.5,
-                        }
-                    })
-                    .collect();
-                if !new_traces.is_empty() {
-                    self.set_traces(new_traces, cx);
-                }
-            }
-            (FieldId(2), InspectionValue::F64(v)) => {
-                self.line_plot
-                    .update(cx, |lp, cx| lp.set_y_min_override(Some(v), cx));
-                cx.notify();
-            }
-            (FieldId(3), InspectionValue::F64(v)) => {
-                self.line_plot
-                    .update(cx, |lp, cx| lp.set_y_max_override(Some(v), cx));
-                cx.notify();
-            }
-            (FieldId(4), InspectionValue::String(s)) => {
-                if let Ok(behavior) = s.parse::<TimeRangeBehavior>() {
-                    self.line_plot
-                        .update(cx, |lp, cx| lp.set_x_range(behavior, cx));
-                    cx.notify();
-                }
-            }
-            (FieldId(5), InspectionValue::String(s)) => {
-                self.custom_title = if s.is_empty() { None } else { Some(s.into()) };
-                cx.notify();
-            }
-            (FieldId(id), value) if id >= TRACE_SETTINGS_BASE => {
-                let trace_idx = ((id - TRACE_SETTINGS_BASE) / 100) as usize;
-                let sub_field = (id - TRACE_SETTINGS_BASE) % 100;
-                if sub_field == TRACE_SUB_REMOVE {
-                    if matches!(value, InspectionValue::Bool(true)) {
-                        let remaining: Vec<Trace> = self
-                            .line_plot
-                            .read(cx)
-                            .traces()
-                            .enumerate()
-                            .filter(|(i, _)| *i != trace_idx)
-                            .map(|(_, t)| t.read(cx).clone())
-                            .collect();
-                        self.set_traces(remaining, cx);
-                    }
-                    return;
-                }
-                self.line_plot.update(cx, |lp, cx| {
-                    lp.update_trace(
-                        trace_idx,
-                        |t| match (sub_field, value) {
-                            (TRACE_SUB_STYLE, InspectionValue::Enum { selected, .. }) => {
-                                if let Some(style) = PlotStyle::parse(&selected) {
-                                    t.style = style;
-                                }
-                            }
-                            (TRACE_SUB_COLOR, InspectionValue::Color(c)) => {
-                                t.color = c;
-                            }
-                            (TRACE_SUB_VISIBLE, InspectionValue::Bool(b)) => {
-                                t.visible = b;
-                            }
-                            (TRACE_SUB_STROKE_WIDTH, InspectionValue::F64(w)) => {
-                                t.stroke_width = (w as f32).clamp(0.5, 10.0);
-                            }
-                            _ => {}
-                        },
-                        cx,
-                    );
-                });
-                cx.notify();
-            }
-            _ => {}
-        }
-    }
-}
