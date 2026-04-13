@@ -14,7 +14,7 @@ use metor_panel::pending_edits::{
     self, edit_value_page, pending_edits, pending_edits_mut, review_page,
 };
 use metor_panel::inspector::Inspector;
-use metor_panel::inspectable::InspectorRowsRequest;
+use metor_panel::inspector::InspectorRowsRequest;
 use metor_panel::tiles::panels::tile_palette_page;
 use metor_panel::tiles::{TileGroup, TileGroupEvent};
 use stellarator::{net::TcpListener, struc_con::stellar};
@@ -86,7 +86,7 @@ impl AppRoot {
 
     fn make_on_open_inspector(
         root: Entity<AppRoot>,
-    ) -> metor_panel::inspectable::OpenInspectorCallback {
+    ) -> metor_panel::inspector::OpenInspectorCallback {
         Arc::new(move |request, _window, cx| {
             root.update(cx, |this, cx| {
                 this.pending_inspector_open = Some(request);
@@ -391,6 +391,7 @@ fn main() {
                 metor_panel::theme::DARK.clone(),
             )));
             pending_edits::init(cx);
+            metor_panel::widget_registry::WidgetRegistry::init(db.clone(), cx);
             set_dock_icon();
             cx.bind_keys([
                 KeyBinding::new("cmd-p", OpenPalette, None),

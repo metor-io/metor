@@ -15,6 +15,16 @@ use crate::command_palette::{PalettePage, TextField};
 use crate::theme::theme;
 use crate::widgets::{InspectorRow, RowAction};
 
+/// Bundles everything needed to open an inspector from any entry point.
+pub struct InspectorRowsRequest {
+    pub rows: Vec<Box<dyn InspectorRow>>,
+    pub position: Point<Pixels>,
+}
+
+/// Callback that opens an inspector at a given position.
+pub type OpenInspectorCallback =
+    Arc<dyn Fn(InspectorRowsRequest, &mut Window, &mut App) + 'static>;
+
 /// Searchable right-click inspector panel with cascading submenus.
 ///
 /// Constructed with a `Vec<Box<dyn InspectorRow>>` — each row renders

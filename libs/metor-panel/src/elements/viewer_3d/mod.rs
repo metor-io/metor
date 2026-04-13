@@ -46,9 +46,6 @@ use metor_db::DB;
 use metor_proto::types::ComponentView;
 use smallvec::SmallVec;
 
-use crate::inspectable::{
-    FieldId, InspectionField, InspectionValue, ListItem, PickerArity,
-};
 use crate::theme::theme;
 use crate::{AsComponentView, ComponentStream, ComponentStreamBuilder};
 
@@ -107,43 +104,34 @@ struct ViewerEntities {
 
 /// A 3D scene element. Owns a list of models, its own slice of the Bevy
 /// world, and a depth-2 frame queue fed by the readback observer.
+#[derive(facet::Facet)]
 pub struct Viewer3d {
-    /// Filled by the queued spawn op that runs against the Bevy world.
-    /// Mutator closures clone this Arc and read it with `.get().unwrap()`
-    /// — FIFO pending-op order guarantees the spawn op ran first.
+    #[facet(opaque)]
     entities: Arc<OnceLock<ViewerEntities>>,
-    /// [`RenderLayers`] slot this viewer's camera is configured for.
-    /// Minted by [`BevyBridge::claim_render_layer`] at construction.
+    #[facet(skip)]
     render_layer: usize,
-    /// DB handle so per-model bindings can start streams from the
-    /// inspector. `None` when the viewer was constructed without a DB
-    /// (the standalone example case).
+    #[facet(opaque)]
     db: Option<Arc<DB>>,
+    #[facet(opaque)]
     camera: OrbitCamera,
-    /// All models currently displayed in this viewer. Order is the
-    /// inspector's display order.
-    models: Vec<gpui::Entity<ModelEntry>>,
-    /// Most-recently-requested physical pixel size of the render target.
-    /// Used by [`Self::maybe_resize`] to debounce resize ops.
+
+    // Inspectable fields — reflected by the walker
+    pub models: Vec<gpui::Entity<ModelEntry>>,
+    pub camera_fov: f32,
+
+    #[facet(skip)]
     requested_size: (u32, u32),
-    /// Shared with the viewer's [`FrameSink`] component inside the Bevy
-    /// world. The `on_readback_complete` observer pushes frames; the
-    /// prepaint closure pops them.
+    #[facet(opaque)]
     frame_queue: FrameQueue,
-    /// Frame most recently blitted by the canvas painter. `None` until
-    /// the first render completes.
+    #[facet(opaque)]
     current_frame: Option<Arc<RenderImage>>,
-    /// Previous `current_frame` parked for release from gpui's sprite
-    /// atlas on the next prepaint. `paint_image` uploads bytes keyed by
-    /// `image_id`; without a matching `drop_image` the atlas entry leaks.
+    #[facet(opaque)]
     pending_release: Option<Arc<RenderImage>>,
-    /// Any mutation that changed the world sets this to request a
-    /// render on the next prepaint. Cleared when the render is
-    /// scheduled.
+    #[facet(skip)]
     needs_render: bool,
-    /// Force-render window that kicks in every time a model is (re)loaded
-    /// so the asynchronously-loaded GLTF scene tree has time to settle.
+    #[facet(opaque)]
     loading_until: Option<Instant>,
+    #[facet(opaque)]
     drag: Option<DragState>,
 }
 
@@ -152,6 +140,7 @@ pub struct Viewer3d {
 /// written into `entity` once; later mutations load it the same way the
 /// viewer's own entities are loaded.
 #[derive(facet::Facet)]
+#[facet(pod)]
 pub struct ModelEntry {
     pub label: SharedString,
     pub path: String,
@@ -302,12 +291,15 @@ impl Viewer3d {
         })
         .detach();
 
+        let camera = OrbitCamera::default();
+        let camera_fov = camera.fov_y_rad;
         let mut viewer = Self {
             entities,
             render_layer,
             db,
-            camera: OrbitCamera::default(),
+            camera,
             models: Vec::new(),
+            camera_fov,
             requested_size: INITIAL_SIZE,
             frame_queue,
             current_frame: None,
@@ -326,6 +318,10 @@ impl Viewer3d {
 
     pub fn camera(&self) -> OrbitCamera {
         self.camera
+    }
+
+    pub fn camera_mut(&mut self) -> &mut OrbitCamera {
+        &mut self.camera
     }
 
     /// Mark the viewer as dirty so its next prepaint schedules a render
@@ -411,7 +407,7 @@ impl Viewer3d {
     }
 
     /// Remove one model from the viewer by its index in [`Self::models`].
-    fn remove_model(&mut self, index: usize, cx: &mut Context<Self>) {
+    pub fn remove_model(&mut self, index: usize, cx: &mut Context<Self>) {
         if index >= self.models.len() {
             return;
         }
@@ -426,7 +422,7 @@ impl Viewer3d {
     /// existing `OnceLock` cell (it's already set), so we mint a fresh
     /// cell for the new scene entity, swap it into the entry, and queue
     /// a despawn-then-spawn op.
-    fn set_model_path(&mut self, index: usize, path: String, cx: &mut Context<Self>) {
+    pub fn set_model_path(&mut self, index: usize, path: String, cx: &mut Context<Self>) {
         let Some(entry) = self.models.get(index).cloned() else {
             return;
         };
@@ -448,7 +444,7 @@ impl Viewer3d {
     }
 
     /// Update one model's display label. Inspector list row only.
-    fn set_model_label(&mut self, index: usize, label: impl Into<SharedString>, cx: &mut Context<Self>) {
+    pub fn set_model_label(&mut self, index: usize, label: impl Into<SharedString>, cx: &mut Context<Self>) {
         let label = label.into();
         if let Some(entry) = self.models.get(index) {
             entry.update(cx, |model, _| {
@@ -573,7 +569,7 @@ impl Viewer3d {
     }
 
     /// Push the current camera pose to the world.
-    fn sync_camera(&mut self, cx: &mut Context<Self>) {
+    pub fn sync_camera(&mut self, cx: &mut Context<Self>) {
         let cam = self.camera;
         self.with_entities(cx, move |world, ents| {
             let eye = cam.eye();
@@ -588,7 +584,7 @@ impl Viewer3d {
     }
 
     /// Reset the camera to its default pose.
-    fn reset_camera(&mut self, cx: &mut Context<Self>) {
+    pub fn reset_camera(&mut self, cx: &mut Context<Self>) {
         self.camera = OrbitCamera::default();
         self.sync_camera(cx);
     }
@@ -828,49 +824,4 @@ impl Render for Viewer3d {
 // `1000 + item_index * 100 + sub_field_id`. The encoding is local to this
 // element — `set_field` decodes it before routing.
 
-const FIELD_MODELS: u32 = 0;
-const FIELD_ADD_MODEL: u32 = 1;
-const FIELD_FOV: u32 = 2;
-const FIELD_RESET_CAMERA: u32 = 3;
-
-const SUB_LABEL: u32 = 0;
-const SUB_PATH: u32 = 1;
-const SUB_POSITION: u32 = 2;
-const SUB_ORIENTATION: u32 = 3;
-const SUB_REMOVE: u32 = 4;
-
-fn encode_sub(item_index: usize, sub: u32) -> u32 {
-    1000 + item_index as u32 * 100 + sub
-}
-
-fn decode_sub(field_id: u32) -> Option<(usize, u32)> {
-    if field_id < 1000 {
-        return None;
-    }
-    let raw = field_id - 1000;
-    Some(((raw / 100) as usize, raw % 100))
-}
-
-fn binding_to_value(
-    component: Option<metor_proto::types::ComponentId>,
-    arity: PickerArity,
-) -> InspectionValue {
-    InspectionValue::ElementPicker { component, arity }
-}
-
-/// Pull a display label out of a model entry. Falls back to the path's
-/// basename if the label is empty, then to a placeholder for empty
-/// entries.
-fn model_row_label(entry: &ModelEntry, index: usize) -> SharedString {
-    if !entry.label.is_empty() {
-        return entry.label.clone();
-    }
-    if let Some(name) = std::path::Path::new(&entry.path)
-        .file_name()
-        .and_then(|n| n.to_str())
-    {
-        return SharedString::from(name.to_string());
-    }
-    SharedString::from(format!("Model {}", index + 1))
-}
 

@@ -9,7 +9,6 @@ use metor_proto::types::{ComponentId, Timestamp};
 
 #[allow(unused_imports)]
 use crate::inspect;
-use crate::inspectable::{FieldId, InspectionField, InspectionValue, ListItem};
 use crate::offset_parse::TimeRangeBehavior;
 
 mod bounds;
@@ -506,15 +505,31 @@ impl Trace {
 /// entity is just the outer container that manages user interaction
 /// (drag, zoom, double-click reset), the inspector, and the axis
 /// chrome painted around the `LinePlot` child.
+#[derive(facet::Facet)]
 pub struct TimeSeriesPlot {
+    #[facet(opaque)]
     db: Arc<DB>,
+    #[facet(opaque)]
     self_entity: Entity<TimeSeriesPlot>,
+    #[facet(opaque)]
     line_plot: Entity<LinePlot>,
-    custom_title: Option<SharedString>,
+
+    // Inspectable fields — reflected by the walker
+    pub custom_title: Option<SharedString>,
+    pub x_range: TimeRangeBehavior,
+    pub y_min_override: Option<f64>,
+    pub y_max_override: Option<f64>,
+    pub traces: Vec<Entity<Trace>>,
+
+    #[facet(opaque)]
     drag_start: Option<Point<Pixels>>,
+    #[facet(opaque)]
     drag_start_view: Option<PlotBounds>,
+    #[facet(opaque)]
     drag_zone: AxisZone,
+    #[facet(opaque)]
     last_plot_area: Option<Bounds<Pixels>>,
+    #[facet(opaque)]
     on_open_page: Option<OpenPageCallback>,
 }
 
@@ -524,13 +539,21 @@ pub type OpenPageCallback =
 
 impl TimeSeriesPlot {
     pub fn new(db: Arc<DB>, traces: Vec<Trace>, cx: &mut Context<Self>) -> Self {
+        let trace_entities: Vec<Entity<Trace>> =
+            traces.into_iter().map(|t| cx.new(|_| t)).collect();
         let line_plot = cx.new(|_| LinePlot::new());
-        line_plot.update(cx, |lp, cx| lp.bind_traces(db.clone(), traces, cx));
+        line_plot.update(cx, |lp, cx| {
+            lp.bind_trace_entities(db.clone(), trace_entities.clone(), cx);
+        });
         Self {
             db,
             self_entity: cx.entity().clone(),
             line_plot,
             custom_title: None,
+            x_range: TimeRangeBehavior::default(),
+            y_min_override: None,
+            y_max_override: None,
+            traces: trace_entities,
             drag_start: None,
             drag_start_view: None,
             drag_zone: AxisZone::Plot,
@@ -587,10 +610,26 @@ impl TimeSeriesPlot {
         Self::new(db, traces, cx)
     }
 
+    pub fn line_plot(&self) -> &Entity<LinePlot> {
+        &self.line_plot
+    }
+
+    pub fn db(&self) -> &Arc<DB> {
+        &self.db
+    }
+
+    pub fn set_custom_title(&mut self, title: Option<SharedString>) {
+        self.custom_title = title;
+    }
+
     pub fn set_traces(&mut self, traces: Vec<Trace>, cx: &mut Context<Self>) {
+        let trace_entities: Vec<Entity<Trace>> =
+            traces.into_iter().map(|t| cx.new(|_| t)).collect();
+        self.traces = trace_entities.clone();
         let db = self.db.clone();
-        self.line_plot
-            .update(cx, |lp, cx| lp.bind_traces(db, traces, cx));
+        self.line_plot.update(cx, |lp, cx| {
+            lp.bind_trace_entities(db, trace_entities, cx);
+        });
         cx.notify();
     }
 
@@ -605,9 +644,8 @@ impl TimeSeriesPlot {
 
         use std::collections::HashMap;
         let mut groups: HashMap<ComponentId, Vec<usize>> = HashMap::new();
-        // Track insertion order so the title is deterministic.
         let mut order: Vec<ComponentId> = Vec::new();
-        for trace in self.line_plot.read(cx).traces() {
+        for trace in &self.traces {
             let t = trace.read(cx);
             let id = t.component_id;
             groups
@@ -658,6 +696,9 @@ impl TimeSeriesPlot {
 
     /// Reset all view overrides so the plot snaps back to auto-fit.
     fn reset_view(&mut self, cx: &mut Context<Self>) {
+        self.x_range = TimeRangeBehavior::default();
+        self.y_min_override = None;
+        self.y_max_override = None;
         let line_plot = self.line_plot.clone();
         line_plot.update(cx, |lp, cx| {
             lp.set_view_override(None, cx);
@@ -674,9 +715,8 @@ impl Render for TimeSeriesPlot {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = crate::theme::theme(cx);
         let trace_configs: Vec<Trace> = self
-            .line_plot
-            .read(cx)
-            .traces()
+            .traces
+            .iter()
             .map(|e| e.read(cx).clone())
             .collect();
         let show_legend = trace_configs.len() >= 2;

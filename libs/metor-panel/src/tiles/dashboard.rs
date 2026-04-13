@@ -15,7 +15,7 @@ use crate::command_palette::{PaletteAction, PaletteItem, PalettePage};
 use crate::elements::time_series::OpenPageCallback;
 use crate::elements::viewer_3d::Viewer3d;
 use crate::elements::{ComponentText, Monitor, Scrollbar, TimeSeriesPlot, new_component_table};
-use crate::inspectable::InspectorRowsRequest;
+use crate::inspector::InspectorRowsRequest;
 use crate::widgets::InspectorRow;
 use crate::theme::theme;
 
@@ -136,7 +136,7 @@ pub struct DashboardPanel {
     widget_inspect_fns: HashMap<WidgetId, WidgetInspectFn>,
     widget_rows_fns: HashMap<WidgetId, WidgetRowsFn>,
     on_open_page: Option<OpenPageCallback>,
-    on_open_inspector: Option<crate::inspectable::OpenInspectorCallback>,
+    on_open_inspector: Option<crate::inspector::OpenInspectorCallback>,
 
     next_id: u64,
     editing: bool,
@@ -171,7 +171,7 @@ impl DashboardPanel {
         self.on_open_page = Some(cb);
     }
 
-    pub fn set_on_open_inspector(&mut self, cb: crate::inspectable::OpenInspectorCallback) {
+    pub fn set_on_open_inspector(&mut self, cb: crate::inspector::OpenInspectorCallback) {
         self.on_open_inspector = Some(cb);
     }
 
@@ -829,7 +829,7 @@ fn component_picker_for_widget(
     db: Arc<DB>,
     kind: WidgetKind,
 ) -> PalettePage {
-    let items: Vec<PaletteItem> = crate::inspectable::list_components(&db)
+    let items: Vec<PaletteItem> = crate::trace_picker::list_components(&db)
         .into_iter()
         .map(|(_id, name)| {
             let dashboard = dashboard.clone();
@@ -950,33 +950,9 @@ fn create_widget_view(
             if let Some(id) = component_id {
                 let entity = cx.new(|cx| Monitor::new(db.clone(), id, cx));
                 let rows_entity = entity.clone();
+                let rows_db = db.clone();
                 let rows_fn: WidgetRowsFn = Box::new(move |cx| {
-                    let monitor = rows_entity.read(cx);
-                    let entity = rows_entity.clone();
-                    let unit_entity = entity.clone();
-                    let sparkline_entity = entity.clone();
-                    Some(vec![
-                        Box::new(crate::widgets::TextRow {
-                            label: "Unit".into(),
-                            value: monitor.unit.clone(),
-                            on_change: Arc::new(move |s, _w, cx| {
-                                unit_entity.update(cx, |m, cx| {
-                                    m.unit = SharedString::from(s);
-                                    cx.notify();
-                                });
-                            }),
-                        }) as Box<dyn InspectorRow>,
-                        Box::new(crate::widgets::BoolRow {
-                            label: "Sparkline".into(),
-                            value: monitor.show_sparkline,
-                            toggle: Arc::new(move |v, _w, cx| {
-                                sparkline_entity.update(cx, |m, cx| {
-                                    m.show_sparkline = v;
-                                    cx.notify();
-                                });
-                            }),
-                        }) as Box<dyn InspectorRow>,
-                    ])
+                    Some(crate::reflect::rows_for_entity(&rows_entity, &rows_db, cx))
                 });
                 (AnyView::from(entity), None, Some(rows_fn))
             } else {

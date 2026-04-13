@@ -167,7 +167,7 @@ fn summarize_edit(edit: &PendingEdit) -> SharedString {
 /// Build a palette page listing all components. Selecting one drills into an
 /// element picker, which then opens the value editor.
 pub fn update_component_page(db: Arc<DB>) -> PalettePage {
-    let components = crate::inspectable::list_components(&db);
+    let components = crate::trace_picker::list_components(&db);
     let items: Vec<PaletteItem> = components
         .into_iter()
         .map(|(id, name)| {

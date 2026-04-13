@@ -19,9 +19,7 @@
 
 use std::sync::Arc;
 
-use gpui::{
-    Bounds, Context, Corners, IntoElement, Pixels, Render, Window, canvas, prelude::*,
-};
+use gpui::{Bounds, Context, Corners, IntoElement, Pixels, Render, Window, canvas, prelude::*};
 use metor_db::{Component, DB};
 use metor_proto::types::Timestamp;
 
@@ -88,12 +86,25 @@ impl LinePlot {
         }
     }
 
-    /// Replace all traces and restart per-trace tracking tasks.
+    /// Replace all traces from raw Trace values. Creates Entity handles internally.
+    /// Used by Monitor's sparkline which doesn't need entity ownership.
     pub fn bind_traces(&mut self, db: Arc<DB>, traces: Vec<Trace>, cx: &mut Context<Self>) {
-        self.entries = traces
+        let entities: Vec<gpui::Entity<Trace>> =
+            traces.into_iter().map(|t| cx.new(|_| t)).collect();
+        self.bind_trace_entities(db, entities, cx);
+    }
+
+    /// Replace all traces from pre-existing Entity<Trace> handles and restart tracking tasks.
+    pub fn bind_trace_entities(
+        &mut self,
+        db: Arc<DB>,
+        trace_entities: Vec<gpui::Entity<Trace>>,
+        cx: &mut Context<Self>,
+    ) {
+        self.entries = trace_entities
             .into_iter()
             .map(|config| Entry {
-                config: cx.new(|_| config),
+                config,
                 component: None,
                 y_bounds: None,
                 last_scan_ts: None,
@@ -205,15 +216,7 @@ impl LinePlot {
         let (auto_min, auto_max) = if any_y { (y_min, y_max) } else { (0.0, 1.0) };
         let min_y = self.y_min_override.unwrap_or(auto_min);
         let max_y = self.y_max_override.unwrap_or(auto_max);
-        Some(
-            PlotBounds::new(
-                range.start.0 as f64,
-                min_y,
-                range.end.0 as f64,
-                max_y,
-            )
-            .normalize(),
-        )
+        Some(PlotBounds::new(range.start.0 as f64, min_y, range.end.0 as f64, max_y).normalize())
     }
 
     /// The earliest sample timestamp across resolved traces. Used by
@@ -282,12 +285,8 @@ impl LinePlot {
                     };
                     let latest_ts = comp.time_series.latest().map(|n| n.timestamp());
                     let element_index = entry.config.read(cx).element_index;
-                    entry.y_bounds = expand_y_bounds(
-                        comp,
-                        &[element_index],
-                        entry.y_bounds,
-                        entry.last_scan_ts,
-                    );
+                    entry.y_bounds =
+                        expand_y_bounds(comp, &[element_index], entry.y_bounds, entry.last_scan_ts);
                     entry.last_scan_ts = latest_ts;
                     cx.notify();
                     true
@@ -316,16 +315,14 @@ impl Render for LinePlot {
                 let (frame, released) = weak
                     .update(cx, |lp, cx| {
                         if let Some(view) = lp.effective_view(cx) {
-                            let draws: Vec<LineDraw<'_>> =
-                                lp.entries.iter().filter_map(|e| e.as_line_draw(cx)).collect();
+                            let draws: Vec<LineDraw<'_>> = lp
+                                .entries
+                                .iter()
+                                .filter_map(|e| e.as_line_draw(cx))
+                                .collect();
                             if !draws.is_empty()
-                                && let Some(handle) = lp.gpu_state.render(
-                                    cx,
-                                    bounds,
-                                    scale_factor,
-                                    view,
-                                    &draws,
-                                )
+                                && let Some(handle) =
+                                    lp.gpu_state.render(cx, bounds, scale_factor, view, &draws)
                             {
                                 handle.spawn_and_set(cx, line_plot_gpu_state);
                             }

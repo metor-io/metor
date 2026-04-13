@@ -8,6 +8,7 @@ use crate::command_palette::{PaletteAction, PaletteItem, PalettePage};
 use crate::elements::time_series::OpenPageCallback;
 use crate::elements::viewer_3d::Viewer3d;
 use crate::elements::{ComponentTable, ComponentText, TimeSeriesPlot, new_component_table};
+use crate::widgets::InspectorRow;
 use super::dashboard::DashboardPanel;
 
 use super::item::{PaneItem, PaneItemHandle};
@@ -153,6 +154,13 @@ impl PaneItem for PlotPanel {
         serde_json::json!({ "label": title.as_ref() })
     }
 
+    fn inspect_rows(
+        &self,
+        _db: Option<Arc<DB>>,
+        cx: &App,
+    ) -> Option<Vec<Box<dyn crate::widgets::InspectorRow>>> {
+        Some(crate::reflect::rows_for_entity(&self.inner, &self.db, cx))
+    }
 }
 
 /// Tile panel wrapping a [`Viewer3d`] with inspector support.
@@ -221,6 +229,13 @@ impl PaneItem for Viewer3dPanel {
         })
     }
 
+    fn inspect_rows(
+        &self,
+        _db: Option<Arc<DB>>,
+        cx: &App,
+    ) -> Option<Vec<Box<dyn InspectorRow>>> {
+        Some(crate::reflect::rows_for_entity(&self.inner, &self.db, cx))
+    }
 }
 
 /// Callback invoked after a panel is created, so the caller can open its
@@ -237,7 +252,7 @@ pub fn tile_palette_page(
     pane: Entity<Pane>,
     tiles: &Entity<super::TileGroup>,
     on_inspect: impl Fn(PalettePage, &mut Window, &mut App) + 'static,
-    on_open_inspector: Option<crate::inspectable::OpenInspectorCallback>,
+    on_open_inspector: Option<crate::inspector::OpenInspectorCallback>,
     cx: &App,
 ) -> PalettePage {
     let on_inspect = Arc::new(on_inspect);
@@ -318,7 +333,7 @@ fn new_panel_page(
     db: Arc<DB>,
     pane: Entity<Pane>,
     on_inspect: Arc<dyn Fn(PalettePage, &mut Window, &mut App) + 'static>,
-    on_open_inspector: Option<crate::inspectable::OpenInspectorCallback>,
+    on_open_inspector: Option<crate::inspector::OpenInspectorCallback>,
 ) -> PalettePage {
     let items = vec![
         PaletteItem::new("Time Series Plot", {
@@ -425,7 +440,7 @@ fn component_picker_page(
     on_select: impl Fn(ComponentId, String, &mut App) + 'static,
 ) -> PalettePage {
     let on_select = Arc::new(on_select);
-    let items: Vec<PaletteItem> = crate::inspectable::list_components(&db)
+    let items: Vec<PaletteItem> = crate::trace_picker::list_components(&db)
         .into_iter()
         .map(|(id, name)| {
             let on_select = on_select.clone();

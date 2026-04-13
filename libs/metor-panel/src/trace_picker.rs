@@ -5,7 +5,25 @@ use metor_db::DB;
 use metor_proto::types::ComponentId;
 
 use crate::command_palette::{PaletteAction, PaletteItem, PalettePage};
-use crate::inspectable::{list_components, PickerArity};
+
+/// List all components from the DB, sorted by name.
+pub(crate) fn list_components(db: &DB) -> Vec<(ComponentId, String)> {
+    let mut components: Vec<_> = db.with_state(|state| {
+        state
+            .component_metadata_iter()
+            .map(|(id, meta)| (*id, meta.name.clone()))
+            .collect()
+    });
+    components.sort_by(|a, b| a.1.cmp(&b.1));
+    components
+}
+
+/// What kind of value an element picker produces.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PickerArity {
+    Vec3,
+    Quat,
+}
 
 /// A pending trace selection: display label, component id, element index.
 type TraceSelection = (String, ComponentId, usize);

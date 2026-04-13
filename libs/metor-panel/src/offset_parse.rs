@@ -31,7 +31,8 @@ impl fmt::Display for Offset {
 }
 
 /// Describes how to compute the visible time window from the data's full range.
-#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+#[derive(Debug, PartialEq, Eq, Clone, Copy, facet::Facet)]
+#[facet(opaque)]
 pub struct TimeRangeBehavior {
     pub start: Offset,
     pub end: Offset,
