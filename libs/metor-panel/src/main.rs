@@ -155,8 +155,18 @@ impl AppRoot {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let db = self.db.clone();
-        if let Some(rows) = item.inspect_rows(Some(db.clone()), cx) {
+        let entity = item.entity_any(cx);
+        self.open_entity_inspector(&entity, position, window, cx);
+    }
+
+    fn open_entity_inspector(
+        &mut self,
+        entity: &gpui::AnyEntity,
+        position: Point<Pixels>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(rows) = metor_panel::reflect::rows_for_any_entity(entity, &self.db, cx) {
             let parent_focus = self.focus_handle.clone();
             let inspector = cx.new(|cx| {
                 let mut insp = Inspector::new(rows, InspectorMode::Anchored(position), cx);
@@ -166,10 +176,16 @@ impl AppRoot {
             inspector.focus_handle(cx).focus(window);
             self.inspector = Some(inspector);
             cx.notify();
-        } else if let Some(page) = item.inspect_page(Some(self.db.clone()), cx) {
-            self.pending_inspect = Some(page);
-            cx.notify();
         }
+    }
+
+    fn handle_inspect_entity(
+        &mut self,
+        action: &metor_panel::inspector::InspectEntity,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.open_entity_inspector(&action.entity, action.position, window, cx)
     }
 
     fn handle_tile_event(
@@ -244,6 +260,7 @@ impl Render for AppRoot {
             .on_action(cx.listener(Self::cycle_tab_forward))
             .on_action(cx.listener(Self::cycle_tab_backward))
             .on_action(cx.listener(Self::toggle_cmd_lock))
+            .on_action(cx.listener(Self::handle_inspect_entity))
             .on_action(cx.listener(Self::open_review_edits))
             .font_family(theme.font_family)
             .flex()

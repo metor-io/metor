@@ -11,6 +11,7 @@ use crate::theme::theme;
 pub struct ColorRow {
     pub label: SharedString,
     pub color: Hsla,
+    pub read_color: Arc<dyn Fn(&App) -> Hsla>,
     pub on_change: Arc<dyn Fn(Hsla, &mut Window, &mut App)>,
 }
 
@@ -54,9 +55,13 @@ impl InspectorRow for ColorRow {
     }
 
     fn activate(&self, _window: &mut Window, _cx: &mut App) -> RowAction {
-        let color = self.color;
         let on_change = self.on_change.clone();
+        let read = self.read_color.clone();
 
+        let (hue_read, hue_set) = (read.clone(), read.clone());
+        let (sat_read, sat_set) = (read.clone(), read.clone());
+        let (lit_read, lit_set) = (read.clone(), read.clone());
+        let (alpha_read, alpha_set) = (read.clone(), read.clone());
         let hue_cb = on_change.clone();
         let sat_cb = on_change.clone();
         let lit_cb = on_change.clone();
@@ -65,38 +70,42 @@ impl InspectorRow for ColorRow {
         RowAction::Cascade(vec![
             Box::new(SliderRow {
                 label: "Hue".into(),
-                value: color.h as f64,
+                read_value: Arc::new(move |cx| hue_read(cx).h as f64),
                 min: 0.0,
                 max: 1.0,
                 on_change: Arc::new(move |v, w, cx| {
-                    hue_cb(Hsla { h: v as f32, ..color }, w, cx);
+                    let cur = hue_set(cx);
+                    hue_cb(Hsla { h: v as f32, ..cur }, w, cx);
                 }),
             }),
             Box::new(SliderRow {
                 label: "Saturation".into(),
-                value: color.s as f64,
+                read_value: Arc::new(move |cx| sat_read(cx).s as f64),
                 min: 0.0,
                 max: 1.0,
                 on_change: Arc::new(move |v, w, cx| {
-                    sat_cb(Hsla { s: v as f32, ..color }, w, cx);
+                    let cur = sat_set(cx);
+                    sat_cb(Hsla { s: v as f32, ..cur }, w, cx);
                 }),
             }),
             Box::new(SliderRow {
                 label: "Lightness".into(),
-                value: color.l as f64,
+                read_value: Arc::new(move |cx| lit_read(cx).l as f64),
                 min: 0.0,
                 max: 1.0,
                 on_change: Arc::new(move |v, w, cx| {
-                    lit_cb(Hsla { l: v as f32, ..color }, w, cx);
+                    let cur = lit_set(cx);
+                    lit_cb(Hsla { l: v as f32, ..cur }, w, cx);
                 }),
             }),
             Box::new(SliderRow {
                 label: "Alpha".into(),
-                value: color.a as f64,
+                read_value: Arc::new(move |cx| alpha_read(cx).a as f64),
                 min: 0.0,
                 max: 1.0,
                 on_change: Arc::new(move |v, w, cx| {
-                    alpha_cb(Hsla { a: v as f32, ..color }, w, cx);
+                    let cur = alpha_set(cx);
+                    alpha_cb(Hsla { a: v as f32, ..cur }, w, cx);
                 }),
             }),
         ])

@@ -96,11 +96,10 @@ impl Monitor {
                 }
 
                 let enum_variants: Option<Vec<String>> = db.with_state(|state| {
-                    state
-                        .get_component_metadata(component_id)
-                        .and_then(|m| {
-                            m.enum_variants().map(|v| v.map(|s| s.to_string()).collect())
-                        })
+                    state.get_component_metadata(component_id).and_then(|m| {
+                        m.enum_variants()
+                            .map(|v| v.map(|s| s.to_string()).collect())
+                    })
                 });
 
                 loop {
@@ -189,9 +188,7 @@ fn format_elements(
         .iter()
         .enumerate()
         .map(|(i, v)| {
-            let label = element_names
-                .get(i)
-                .map(|n| SharedString::from(n.clone()));
+            let label = element_names.get(i).map(|n| SharedString::from(n.clone()));
             ElementDisplay {
                 label,
                 value: SharedString::from(format_number(v.as_f64())),
@@ -334,4 +331,3 @@ impl Render for Monitor {
         root
     }
 }
-

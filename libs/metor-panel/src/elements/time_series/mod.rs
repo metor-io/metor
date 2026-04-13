@@ -510,8 +510,6 @@ pub struct TimeSeriesPlot {
     #[facet(opaque)]
     db: Arc<DB>,
     #[facet(opaque)]
-    self_entity: Entity<TimeSeriesPlot>,
-    #[facet(opaque)]
     line_plot: Entity<LinePlot>,
 
     // Inspectable fields — reflected by the walker
@@ -521,6 +519,8 @@ pub struct TimeSeriesPlot {
     pub y_max_override: Option<f64>,
     pub traces: Vec<Entity<Trace>>,
 
+    #[facet(opaque)]
+    bound_trace_ids: Vec<gpui::EntityId>,
     #[facet(opaque)]
     drag_start: Option<Point<Pixels>>,
     #[facet(opaque)]
@@ -545,15 +545,17 @@ impl TimeSeriesPlot {
         line_plot.update(cx, |lp, cx| {
             lp.bind_trace_entities(db.clone(), trace_entities.clone(), cx);
         });
+        cx.observe_self(Self::on_notify).detach();
+        let bound_trace_ids = trace_entities.iter().map(|e| e.entity_id()).collect();
         Self {
             db,
-            self_entity: cx.entity().clone(),
             line_plot,
             custom_title: None,
             x_range: TimeRangeBehavior::default(),
             y_min_override: None,
             y_max_override: None,
             traces: trace_entities,
+            bound_trace_ids,
             drag_start: None,
             drag_start_view: None,
             drag_zone: AxisZone::Plot,
@@ -564,6 +566,22 @@ impl TimeSeriesPlot {
 
     pub fn set_on_open_page(&mut self, cb: OpenPageCallback) {
         self.on_open_page = Some(cb);
+    }
+
+    fn on_notify(&mut self, cx: &mut Context<Self>) {
+        println!("on notify");
+        let current_ids: Vec<gpui::EntityId> = self.traces.iter().map(|e| e.entity_id()).collect();
+        if current_ids != self.bound_trace_ids {
+            self.rebind_traces(cx);
+        }
+    }
+
+    /// Re-synchronise the [`LinePlot`] with the current `traces` Vec.
+    pub fn rebind_traces(&mut self, cx: &mut Context<Self>) {
+        self.bound_trace_ids = self.traces.iter().map(|e| e.entity_id()).collect();
+        self.line_plot.update(cx, |lp, cx| {
+            lp.bind_trace_entities(self.db.clone(), self.traces.clone(), cx);
+        });
     }
 
     /// Convenience: create a plot for a single component with the given element
@@ -708,17 +726,12 @@ impl TimeSeriesPlot {
         });
         cx.notify();
     }
-
 }
 
 impl Render for TimeSeriesPlot {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = crate::theme::theme(cx);
-        let trace_configs: Vec<Trace> = self
-            .traces
-            .iter()
-            .map(|e| e.read(cx).clone())
-            .collect();
+        let trace_configs: Vec<Trace> = self.traces.iter().map(|e| e.read(cx).clone()).collect();
         let show_legend = trace_configs.len() >= 2;
 
         let underlay_lp = self.line_plot.clone();
@@ -814,7 +827,11 @@ impl Render for TimeSeriesPlot {
                                         this.last_plot_area = Some(plot_area(bounds));
                                     });
                                     let lp = underlay_lp.read(cx);
-                                    (bounds, lp.effective_view(cx), lp.data_start().unwrap_or(0.0))
+                                    (
+                                        bounds,
+                                        lp.effective_view(cx),
+                                        lp.data_start().unwrap_or(0.0),
+                                    )
                                 }
                             },
                             move |_, (bounds, view, data_start), window, cx| {
@@ -839,7 +856,11 @@ impl Render for TimeSeriesPlot {
                         canvas(
                             move |bounds, _window, cx| {
                                 let lp = overlay_lp.read(cx);
-                                (bounds, lp.effective_view(cx), lp.data_start().unwrap_or(0.0))
+                                (
+                                    bounds,
+                                    lp.effective_view(cx),
+                                    lp.data_start().unwrap_or(0.0),
+                                )
                             },
                             move |_, (bounds, view, data_start), window, cx| {
                                 if let Some(view) = view {
@@ -894,6 +915,21 @@ impl Render for TimeSeriesPlot {
                                 });
                             }),
                         )
+                        .on_mouse_down(
+                            MouseButton::Right,
+                            cx.listener(move |this, event: &gpui::MouseDownEvent, window, cx| {
+                                let Some(trace_entity) = this.traces.get(i).cloned() else {
+                                    return;
+                                };
+                                window.dispatch_action(
+                                    Box::new(crate::inspector::InspectEntity {
+                                        entity: trace_entity.into_any(),
+                                        position: event.position,
+                                    }),
+                                    cx,
+                                );
+                            }),
+                        )
                         .child(div().w(px(10.0)).h(px(10.0)).rounded(px(2.0)).bg(color))
                         .child(
                             div()
@@ -910,4 +946,3 @@ impl Render for TimeSeriesPlot {
         root
     }
 }
-

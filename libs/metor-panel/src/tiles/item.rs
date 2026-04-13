@@ -1,10 +1,4 @@
-use std::sync::Arc;
-
-use gpui::{AnyView, App, Entity, Render, SharedString};
-use metor_db::DB;
-
-use crate::command_palette::PalettePage;
-use crate::widgets::InspectorRow;
+use gpui::{AnyEntity, AnyView, App, Entity, Render, SharedString};
 
 /// Trait that pane content must implement to be hosted in a tile pane.
 pub trait PaneItem: Render + Sized + 'static {
@@ -22,13 +16,9 @@ pub trait PaneItem: Render + Sized + 'static {
         true
     }
 
-    /// Return an inspection palette page for configuring this item, if supported.
-    fn inspect_page(&self, _db: Option<Arc<DB>>, _cx: &App) -> Option<PalettePage> {
-        None
-    }
-
-    /// Return inspector rows for this item, if supported.
-    fn inspect_rows(&self, _db: Option<Arc<DB>>, _cx: &App) -> Option<Vec<Box<dyn InspectorRow>>> {
+    /// Return the entity to inspect. Defaults to the panel entity itself,
+    /// but wrapper panels can override to return their inner entity.
+    fn inspectable_entity(&self) -> Option<AnyEntity> {
         None
     }
 }
@@ -42,14 +32,9 @@ pub trait PaneItemHandle: 'static {
     fn view(&self) -> AnyView;
     fn entity_id(&self) -> gpui::EntityId;
     fn clone_handle(&self) -> Box<dyn PaneItemHandle>;
-    fn inspect_page(&self, db: Option<Arc<DB>>, cx: &App) -> Option<PalettePage>;
-    fn inspect_rows(
-        &self,
-        _db: Option<Arc<DB>>,
-        _cx: &App,
-    ) -> Option<Vec<Box<dyn InspectorRow>>> {
-        None
-    }
+
+    /// Return the type-erased entity for reflection-based inspection.
+    fn entity_any(&self, cx: &App) -> AnyEntity;
 }
 
 impl<T: PaneItem> PaneItemHandle for Entity<T> {
@@ -81,15 +66,9 @@ impl<T: PaneItem> PaneItemHandle for Entity<T> {
         Box::new(self.clone())
     }
 
-    fn inspect_page(&self, db: Option<Arc<DB>>, cx: &App) -> Option<PalettePage> {
-        self.read(cx).inspect_page(db, cx)
-    }
-
-    fn inspect_rows(
-        &self,
-        db: Option<Arc<DB>>,
-        cx: &App,
-    ) -> Option<Vec<Box<dyn InspectorRow>>> {
-        self.read(cx).inspect_rows(db, cx)
+    fn entity_any(&self, cx: &App) -> AnyEntity {
+        self.read(cx)
+            .inspectable_entity()
+            .unwrap_or_else(|| self.clone().into_any())
     }
 }

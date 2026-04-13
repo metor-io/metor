@@ -10,7 +10,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use facet::{ConstTypeId, Facet, Peek};
-use gpui::{AnyEntity, App, Entity, Global, Hsla, SharedString, Window};
+use gpui::{AnyEntity, App, AppContext, Entity, Global, Hsla, SharedString, Window};
 use metor_db::DB;
 use metor_proto::types::ComponentId;
 
@@ -25,6 +25,8 @@ pub struct FieldBuildCtx<'a> {
     pub db: &'a Arc<DB>,
     pub label: SharedString,
     pub field_name: &'static str,
+    /// Read the current value of this field from the entity (for live updates).
+    pub read_field: Arc<dyn Fn(&App) -> Box<dyn Any>>,
 }
 
 /// Type-erased setter: downcasted to the concrete field type by each factory.
@@ -49,6 +51,27 @@ pub struct FieldOverride {
 /// parent entity, field label, and db.
 pub type EntityListHandler =
     Arc<dyn Fn(gpui::AnyEntity, SharedString, &Arc<DB>, &App) -> Box<dyn InspectorRow>>;
+
+/// How the "Add" button behaves in a `Vec<Entity<T>>` list.
+///
+/// `Default` creates an item immediately. `Wizard` cascades to a
+/// multi-step page that gathers required fields before creating.
+pub enum AddBehavior<T: 'static> {
+    /// Instant creation with a default value factory.
+    Default(Arc<dyn Fn(&mut App) -> T>),
+    /// Multi-step wizard. Receives the parent entity so the wizard
+    /// can push the created item into the list.
+    Wizard(Arc<dyn Fn(AnyEntity, &Arc<DB>, &App) -> Vec<Box<dyn InspectorRow>>>),
+}
+
+impl<T: 'static> Clone for AddBehavior<T> {
+    fn clone(&self) -> Self {
+        match self {
+            Self::Default(f) => Self::Default(f.clone()),
+            Self::Wizard(f) => Self::Wizard(f.clone()),
+        }
+    }
+}
 
 pub struct WidgetRegistry {
     field_widgets: HashMap<ConstTypeId, FieldWidgetFactory>,
@@ -98,6 +121,7 @@ impl WidgetRegistry {
         self.entity_list_handlers.get(&field_type_id)
     }
 
+    /// How the "Add" button behaves in an entity list.
     /// Register a handler for a `Vec<Entity<T>>` field type.
     /// When the walker sees this field type, it delegates to this handler
     /// instead of the generic scalar/enum/struct fallback.
@@ -105,6 +129,8 @@ impl WidgetRegistry {
         &mut self,
         db: Arc<DB>,
         get_list: fn(&ParentT) -> &Vec<Entity<ItemT>>,
+        get_list_mut: fn(&mut ParentT) -> &mut Vec<Entity<ItemT>>,
+        add_behavior: AddBehavior<ItemT>,
     ) {
         let db = db.clone();
         let field_type_id = <Vec<Entity<ItemT>> as Facet>::SHAPE.id;
@@ -115,11 +141,14 @@ impl WidgetRegistry {
                 let items: Vec<Entity<ItemT>> = get_list(parent.read(cx)).clone();
                 let item_count = items.len();
                 let db = db.clone();
+                let parent_for_add = parent.clone();
+                let add_behavior = add_behavior.clone();
+
                 Box::new(NavRow {
                     label,
                     summary: SharedString::from(format!("{} items", item_count)),
                     build_children: Arc::new(move |cx| {
-                        items
+                        let mut rows: Vec<Box<dyn InspectorRow>> = items
                             .iter()
                             .enumerate()
                             .map(|(i, entity)| {
@@ -128,15 +157,65 @@ impl WidgetRegistry {
                                     .unwrap_or_else(|| SharedString::from(format!("Item {}", i + 1)));
                                 let entity = entity.clone();
                                 let db = db.clone();
+                                let parent_for_remove = parent_for_add.clone();
+                                let idx = i;
+
                                 Box::new(NavRow {
                                     label: item_label,
                                     summary: SharedString::new_static(""),
                                     build_children: Arc::new(move |cx| {
-                                        crate::reflect::rows_for_entity(&entity, &db, cx)
+                                        let mut sub_rows = crate::reflect::rows_for_entity(&entity, &db, cx);
+                                        let remove_parent = parent_for_remove.clone();
+                                        sub_rows.push(Box::new(CommandRow {
+                                            label: "Remove".into(),
+                                            callback: Arc::new(move |_w, cx| {
+                                                remove_parent.update(cx, |p, cx| {
+                                                    let list = get_list_mut(p);
+                                                    if idx < list.len() {
+                                                        list.remove(idx);
+                                                    }
+                                                    cx.notify();
+                                                });
+                                            }),
+                                        }));
+                                        sub_rows
                                     }),
                                 }) as Box<dyn InspectorRow>
                             })
-                            .collect()
+                            .collect();
+
+                        // "Add" row — either instant-create or wizard cascade
+                        match &add_behavior {
+                            AddBehavior::Default(factory) => {
+                                let add_parent = parent_for_add.clone();
+                                let factory = factory.clone();
+                                rows.push(Box::new(CommandRow {
+                                    label: "Add".into(),
+                                    callback: Arc::new(move |_w, cx| {
+                                        let item = factory(cx);
+                                        let entity = cx.new(|_| item);
+                                        add_parent.update(cx, |p, cx| {
+                                            get_list_mut(p).push(entity);
+                                            cx.notify();
+                                        });
+                                    }),
+                                }));
+                            }
+                            AddBehavior::Wizard(wizard) => {
+                                let add_parent = parent_for_add.clone();
+                                let db = db.clone();
+                                let wizard = wizard.clone();
+                                rows.push(Box::new(NavRow {
+                                    label: "Add".into(),
+                                    summary: SharedString::new_static(""),
+                                    build_children: Arc::new(move |cx| {
+                                        wizard(add_parent.clone().into_any(), &db, cx)
+                                    }),
+                                }));
+                            }
+                        }
+
+                        rows
                     }),
                 })
             }),
@@ -160,13 +239,22 @@ impl WidgetRegistry {
         self.register_entity_list::<TimeSeriesPlot, Trace>(
             db.clone(),
             |tsp| &tsp.traces,
+            |tsp| &mut tsp.traces,
+            AddBehavior::Wizard(Arc::new(|parent, db, cx| {
+                build_trace_add_wizard(parent, db, cx)
+            })),
         );
         self.register_entity_list::<Viewer3d, crate::elements::viewer_3d::ModelEntry>(
             db.clone(),
             |v| &v.models,
+            |v| &mut v.models,
+            AddBehavior::Default(Arc::new(|_cx| {
+                crate::elements::viewer_3d::ModelEntry::empty()
+            })),
         );
         self.register_time_series_plot_builder(db.clone());
-        self.register_viewer3d_builder(db);
+        self.register_viewer3d_builder(db.clone());
+        self.register_dashboard_builder(db);
         self.register_field_override::<crate::elements::time_series::Trace>(
             "stroke_width",
             FieldOverride {
@@ -185,9 +273,15 @@ impl WidgetRegistry {
         self.register_field_widget::<Hsla>(Arc::new(|ctx, peek, setter| {
             let color = *peek.get::<Hsla>().unwrap();
             let label = ctx.label.clone();
+            let read_field = ctx.read_field.clone();
+            let read_color: Arc<dyn Fn(&App) -> Hsla> = Arc::new(move |cx| {
+                let val = read_field(cx);
+                *val.downcast_ref::<Hsla>().unwrap_or(&color)
+            });
             Box::new(ColorRow {
                 label,
                 color,
+                read_color,
                 on_change: Arc::new(move |c, w, cx| {
                     setter(Box::new(c), w, cx);
                 }),
@@ -283,6 +377,21 @@ impl WidgetRegistry {
             rows
         }));
     }
+
+    fn register_dashboard_builder(&mut self, _db: Arc<DB>) {
+        self.register_type_builder::<crate::tiles::dashboard::DashboardPanel>(Arc::new(
+            |any_entity, db, cx| {
+                let entity: Entity<crate::tiles::dashboard::DashboardPanel> =
+                    any_entity.downcast().expect("DashboardPanel type mismatch");
+                let page = crate::tiles::dashboard::dashboard_palette_page(
+                    entity,
+                    db.clone(),
+                    cx,
+                );
+                crate::inspector::palette_page_to_rows(page)
+            },
+        ));
+    }
 }
 
 /// Extract the first SharedString field from a Facet struct as a display label.
@@ -317,6 +426,105 @@ fn build_component_picker(
                 label: SharedString::from(name),
                 callback: Arc::new(move |w, cx| {
                     setter(Box::new(id), w, cx);
+                }),
+            }) as Box<dyn InspectorRow>
+        })
+        .collect()
+}
+
+/// Build a trace construction wizard: component picker → element picker → create trace.
+fn build_trace_add_wizard(
+    parent: gpui::AnyEntity,
+    db: &Arc<DB>,
+    _cx: &App,
+) -> Vec<Box<dyn InspectorRow>> {
+    let components = crate::trace_picker::list_components(db);
+    let db = db.clone();
+
+    components
+        .into_iter()
+        .map(|(comp_id, comp_name)| {
+            let parent = parent.clone();
+            let db = db.clone();
+            let comp_name = comp_name.clone();
+
+            Box::new(NavRow {
+                label: SharedString::from(comp_name.clone()),
+                summary: SharedString::new_static(""),
+                build_children: Arc::new(move |cx| {
+                    let elem_names = crate::trace_picker::element_names_for_component(&db, comp_id);
+                    let elem_names = if elem_names.is_empty() {
+                        vec!["value".to_string()]
+                    } else {
+                        elem_names
+                    };
+
+                    let mut rows: Vec<Box<dyn InspectorRow>> = Vec::new();
+
+                    // "All" option — adds every element as a trace at once
+                    if elem_names.len() > 1 {
+                        let parent = parent.clone();
+                        let comp_name = comp_name.clone();
+                        let elem_count = elem_names.len();
+                        let names = elem_names.clone();
+                        rows.push(Box::new(CommandRow {
+                            label: SharedString::from(format!("{} (all)", comp_name)),
+                            callback: Arc::new(move |_w, cx| {
+                                let parent: Entity<TimeSeriesPlot> =
+                                    parent.clone().downcast().expect("parent type mismatch");
+                                let theme = crate::theme::theme(cx);
+                                let base_idx = parent.read(cx).traces.len();
+                                let mut new_entities = Vec::with_capacity(elem_count);
+                                for (idx, elem_name) in names.iter().enumerate() {
+                                    let color = theme.line_colors[(base_idx + idx) % theme.line_colors.len()];
+                                    let display = if elem_name.is_empty() {
+                                        format!("[{}]", idx)
+                                    } else {
+                                        elem_name.clone()
+                                    };
+                                    let mut trace = Trace::new(comp_id, idx, color);
+                                    trace.label = SharedString::from(format!("{}.{}", comp_name, display));
+                                    new_entities.push(cx.new(|_| trace));
+                                }
+                                parent.update(cx, |tsp, cx| {
+                                    tsp.traces.extend(new_entities);
+                                    cx.notify();
+                                });
+                            }),
+                        }));
+                    }
+
+                    // Individual element options
+                    for (idx, elem_name) in elem_names.into_iter().enumerate() {
+                        let parent = parent.clone();
+                        let comp_name = comp_name.clone();
+                        let display = if elem_name.is_empty() {
+                            format!("[{}]", idx)
+                        } else {
+                            elem_name
+                        };
+                        let label_text = format!("{}.{}", comp_name, display);
+
+                        rows.push(Box::new(CommandRow {
+                            label: SharedString::from(label_text),
+                            callback: Arc::new(move |_w, cx| {
+                                let parent: Entity<TimeSeriesPlot> =
+                                    parent.clone().downcast().expect("parent type mismatch");
+                                let theme = crate::theme::theme(cx);
+                                let color_idx = parent.read(cx).traces.len();
+                                let color = theme.line_colors[color_idx % theme.line_colors.len()];
+                                let mut trace = Trace::new(comp_id, idx, color);
+                                trace.label = SharedString::from(format!("{}.{}", comp_name, display));
+                                let entity = cx.new(|_| trace);
+                                parent.update(cx, |tsp, cx| {
+                                    tsp.traces.push(entity);
+                                    cx.notify();
+                                });
+                            }),
+                        }));
+                    }
+
+                    rows
                 }),
             }) as Box<dyn InspectorRow>
         })

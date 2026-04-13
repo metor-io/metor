@@ -8,7 +8,6 @@ use crate::command_palette::{PaletteAction, PaletteItem, PalettePage};
 use crate::elements::time_series::OpenPageCallback;
 use crate::elements::viewer_3d::Viewer3d;
 use crate::elements::{ComponentTable, ComponentText, TimeSeriesPlot, new_component_table};
-use crate::widgets::InspectorRow;
 use super::dashboard::DashboardPanel;
 
 use super::item::{PaneItem, PaneItemHandle};
@@ -154,12 +153,8 @@ impl PaneItem for PlotPanel {
         serde_json::json!({ "label": title.as_ref() })
     }
 
-    fn inspect_rows(
-        &self,
-        _db: Option<Arc<DB>>,
-        cx: &App,
-    ) -> Option<Vec<Box<dyn crate::widgets::InspectorRow>>> {
-        Some(crate::reflect::rows_for_entity(&self.inner, &self.db, cx))
+    fn inspectable_entity(&self) -> Option<gpui::AnyEntity> {
+        Some(self.inner.clone().into_any())
     }
 }
 
@@ -229,12 +224,8 @@ impl PaneItem for Viewer3dPanel {
         })
     }
 
-    fn inspect_rows(
-        &self,
-        _db: Option<Arc<DB>>,
-        cx: &App,
-    ) -> Option<Vec<Box<dyn InspectorRow>>> {
-        Some(crate::reflect::rows_for_entity(&self.inner, &self.db, cx))
+    fn inspectable_entity(&self) -> Option<gpui::AnyEntity> {
+        Some(self.inner.clone().into_any())
     }
 }
 
@@ -340,7 +331,8 @@ fn new_panel_page(
             let db = db.clone();
             let pane = pane.clone();
             let on_inspect = on_inspect.clone();
-            PaletteAction::Execute(Box::new(move |_filter, _window, cx| {
+            let on_open_inspector = on_open_inspector.clone();
+            PaletteAction::Execute(Box::new(move |_filter, window, cx| {
                 let plot_panel = {
                     let db = db.clone();
                     cx.new(|cx| PlotPanel::empty(db, cx))
@@ -361,6 +353,18 @@ fn new_panel_page(
                 pane.update(cx, |pane, cx| {
                     pane.add_item(Box::new(plot_panel), cx);
                 });
+
+                // Auto-open the inspector so the user gets the trace wizard
+                if let Some(on_open_inspector) = &on_open_inspector {
+                    let inner_any = inner.into_any();
+                    if let Some(rows) = crate::reflect::rows_for_any_entity(&inner_any, &db, cx) {
+                        let request = crate::inspector::InspectorRequest {
+                            rows,
+                            mode: crate::inspector::InspectorMode::Centered,
+                        };
+                        on_open_inspector(request, window, cx);
+                    }
+                }
             }))
         }),
         PaletteItem::new("Component Text", {
@@ -407,23 +411,10 @@ fn new_panel_page(
         PaletteItem::new("Dashboard", {
             let db = db.clone();
             let pane = pane.clone();
-            let on_inspect = on_inspect.clone();
-            let on_open_inspector = on_open_inspector.clone();
             PaletteAction::Execute(Box::new(move |_filter, _window, cx| {
                 let db = db.clone();
-                let on_inspect = on_inspect.clone();
-                let on_open_inspector = on_open_inspector.clone();
                 pane.update(cx, |pane, cx| {
-                    let dashboard = cx.new(|cx| {
-                        let mut d = DashboardPanel::new(db, cx);
-                        let cb: crate::elements::time_series::OpenPageCallback =
-                            Arc::new(move |page, window, cx| on_inspect(page, window, cx));
-                        d.set_on_open_page(cb);
-                        if let Some(insp_cb) = on_open_inspector {
-                            d.set_on_open_inspector(insp_cb);
-                        }
-                        d
-                    });
+                    let dashboard = cx.new(|cx| DashboardPanel::new(db, cx));
                     pane.add_item(Box::new(dashboard), cx);
                 });
             }))
@@ -477,16 +468,18 @@ fn build_edit_items(
                 title
             };
 
-            let item_handle = item.clone_handle();
+            let entity = item.entity_any(cx);
             let db = db.clone();
-            let on_inspect = on_inspect.clone();
             items.push(PaletteItem::new(
                 label,
-                PaletteAction::Execute(Box::new(move |_filter, window, cx| {
-                    if let Some(page) = item_handle.inspect_page(Some(db), cx) {
-                        on_inspect(page, window, cx);
-                    }
-                })),
+                PaletteAction::NextPage {
+                    label: None,
+                    page: Box::new(move || {
+                        // This is a temporary bridge — eventually tile_palette_page
+                        // will produce InspectorRows directly
+                        PalettePage::new(vec![])
+                    }),
+                },
             ));
         }
     }

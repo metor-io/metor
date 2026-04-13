@@ -14,6 +14,7 @@ pub mod enum_row;
 pub mod list_row;
 pub mod scalar_row;
 pub mod slider_row;
+pub mod text_field;
 pub mod text_row;
 
 pub use bool_row::BoolRow;
@@ -23,6 +24,7 @@ pub use enum_row::EnumRow;
 pub use list_row::NavRow;
 pub use scalar_row::ScalarRow;
 pub use slider_row::SliderRow;
+pub use text_field::TextField;
 pub use text_row::TextRow;
 
 /// One row in an inspector panel.

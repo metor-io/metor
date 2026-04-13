@@ -1,8 +1,8 @@
 use std::sync::Arc;
 
 use gpui::{
-    AnyElement, App, Bounds, DragMoveEvent, Empty, Render, SharedString, Window,
-    canvas, div, fill, point, prelude::*, px, size, Context,
+    AnyElement, App, Bounds, Context, DragMoveEvent, Empty, Render, SharedString, Window, canvas,
+    div, fill, point, prelude::*, px, size,
 };
 
 use super::{InspectorRow, RowAction, row_base};
@@ -27,7 +27,7 @@ impl Render for SliderDrag {
 /// Canvas-based drag slider for numeric fields with a range.
 pub struct SliderRow {
     pub label: SharedString,
-    pub value: f64,
+    pub read_value: Arc<dyn Fn(&App) -> f64>,
     pub min: f64,
     pub max: f64,
     pub on_change: Arc<dyn Fn(f64, &mut Window, &mut App)>,
@@ -48,7 +48,7 @@ impl InspectorRow for SliderRow {
         let theme = theme(cx);
         let min = self.min;
         let max = self.max;
-        let val = self.value;
+        let val = (self.read_value)(cx);
         let fraction = if max > min {
             ((val - min) / (max - min)).clamp(0.0, 1.0) as f32
         } else {
@@ -80,20 +80,17 @@ impl InspectorRow for SliderRow {
                     })
                 },
             )
-            .on_drag_move(
-                move |event: &DragMoveEvent<SliderDrag>, window, cx| {
-                    let drag = event.drag(cx);
-                    let bounds = event.bounds;
-                    let rel_x = f32::from(event.event.position.x - bounds.origin.x);
-                    let width = f32::from(bounds.size.width);
-                    let frac = (rel_x / width).clamp(0.0, 1.0) as f64;
-                    let new_val = drag.min + frac * (drag.max - drag.min);
-                    let rounded = (new_val * 100.0).round() / 100.0;
-                    let cb = drag.on_change.clone();
-                    drop(drag);
-                    cb(rounded, window, cx);
-                },
-            )
+            .on_drag_move(move |event: &DragMoveEvent<SliderDrag>, window, cx| {
+                let drag = event.drag(cx);
+                let bounds = event.bounds;
+                let rel_x = f32::from(event.event.position.x - bounds.origin.x);
+                let width = f32::from(bounds.size.width);
+                let frac = (rel_x / width).clamp(0.0, 1.0) as f64;
+                let new_val = drag.min + frac * (drag.max - drag.min);
+                let rounded = (new_val * 100.0).round() / 100.0;
+                let cb = drag.on_change.clone();
+                cb(rounded, window, cx);
+            })
             .child(
                 canvas(
                     move |bounds, _window, _cx| (bounds, fraction),
@@ -123,8 +120,7 @@ impl InspectorRow for SliderRow {
                             size(px(SLIDER_HANDLE_SIZE), px(SLIDER_HANDLE_SIZE)),
                         );
                         let mut handle_quad = fill(handle_bounds, handle_color);
-                        handle_quad.corner_radii =
-                            gpui::Corners::all(px(SLIDER_HANDLE_SIZE / 2.0));
+                        handle_quad.corner_radii = gpui::Corners::all(px(SLIDER_HANDLE_SIZE / 2.0));
                         window.paint_quad(handle_quad);
                     },
                 )
@@ -160,14 +156,6 @@ impl InspectorRow for SliderRow {
     }
 
     fn activate(&self, _window: &mut Window, _cx: &mut App) -> RowAction {
-        let on_change = self.on_change.clone();
-        RowAction::StartEdit {
-            current_text: format!("{:.2}", self.value),
-            on_commit: Box::new(move |text, window, cx| {
-                if let Ok(v) = text.parse::<f64>() {
-                    on_change(v, window, cx);
-                }
-            }),
-        }
+        RowAction::Handled
     }
 }

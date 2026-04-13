@@ -2,9 +2,9 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use gpui::{
-    AnyElement, AnyView, App, Bounds, Corners, Context, DragMoveEvent, Empty, Entity,
-    IntoElement, Pixels, Point, Render, RenderImage, SharedString, Window, canvas, div, fill,
-    point, prelude::*, px, size,
+    AnyElement, AnyView, App, Bounds, Context, Corners, DragMoveEvent, Empty, Entity, IntoElement,
+    Pixels, Point, Render, RenderImage, SharedString, Window, canvas, div, fill, point, prelude::*,
+    px, size,
 };
 use image::{Frame, ImageBuffer, Rgba};
 use metor_db::DB;
@@ -12,11 +12,8 @@ use serde::{Deserialize, Serialize};
 use smallvec::SmallVec;
 
 use crate::command_palette::{PaletteAction, PaletteItem, PalettePage};
-use crate::elements::time_series::OpenPageCallback;
 use crate::elements::viewer_3d::Viewer3d;
 use crate::elements::{ComponentText, Monitor, Scrollbar, TimeSeriesPlot, new_component_table};
-use crate::inspector::{InspectorMode, InspectorRequest};
-use crate::widgets::InspectorRow;
 use crate::theme::theme;
 
 use super::item::PaneItem;
@@ -120,12 +117,6 @@ impl Render for ResizingWidget {
     }
 }
 
-/// Type-erased function that produces an inspect palette for a widget's inner entity.
-type WidgetInspectFn = Box<dyn Fn(&Arc<DB>, &App) -> Option<PalettePage>>;
-
-/// Type-erased function that returns inspector rows for a widget.
-type WidgetRowsFn = Box<dyn Fn(&App) -> Option<Vec<Box<dyn InspectorRow>>>>;
-
 /// Free-form canvas dashboard where widgets are positioned at pixel coordinates.
 pub struct DashboardPanel {
     db: Arc<DB>,
@@ -133,10 +124,7 @@ pub struct DashboardPanel {
     title: SharedString,
     widgets: Vec<DashboardWidget>,
     widget_views: HashMap<WidgetId, AnyView>,
-    widget_inspect_fns: HashMap<WidgetId, WidgetInspectFn>,
-    widget_rows_fns: HashMap<WidgetId, WidgetRowsFn>,
-    on_open_page: Option<OpenPageCallback>,
-    on_open_inspector: Option<crate::inspector::OpenInspectorCallback>,
+    widget_entities: HashMap<WidgetId, gpui::AnyEntity>,
 
     next_id: u64,
     editing: bool,
@@ -155,10 +143,7 @@ impl DashboardPanel {
             title: "Dashboard".into(),
             widgets: Vec::new(),
             widget_views: HashMap::new(),
-            widget_inspect_fns: HashMap::new(),
-            widget_rows_fns: HashMap::new(),
-            on_open_page: None,
-            on_open_inspector: None,
+            widget_entities: HashMap::new(),
             next_id: 1,
             editing: false,
             selected: None,
@@ -167,13 +152,6 @@ impl DashboardPanel {
         }
     }
 
-    pub fn set_on_open_page(&mut self, cb: OpenPageCallback) {
-        self.on_open_page = Some(cb);
-    }
-
-    pub fn set_on_open_inspector(&mut self, cb: crate::inspector::OpenInspectorCallback) {
-        self.on_open_inspector = Some(cb);
-    }
 
     fn alloc_id(&mut self) -> WidgetId {
         let id = WidgetId(self.next_id);
@@ -214,15 +192,11 @@ impl DashboardPanel {
             kind,
             config: config.clone(),
         };
-        let (view, inspect_fn, rows_fn) = create_widget_view(kind, &config, &self.db, cx);
+        let (view, widget_entity) =
+            create_widget_view(kind, &config, &self.db, cx);
         self.widgets.push(widget);
         self.widget_views.insert(id, view);
-        if let Some(f) = inspect_fn {
-            self.widget_inspect_fns.insert(id, f);
-        }
-        if let Some(f) = rows_fn {
-            self.widget_rows_fns.insert(id, f);
-        }
+        self.widget_entities.insert(id, widget_entity);
         cx.notify();
         id
     }
@@ -230,8 +204,6 @@ impl DashboardPanel {
     fn remove_widget(&mut self, id: WidgetId, cx: &mut Context<Self>) {
         self.widgets.retain(|w| w.id != id);
         self.widget_views.remove(&id);
-        self.widget_inspect_fns.remove(&id);
-        self.widget_rows_fns.remove(&id);
         if self.selected == Some(id) {
             self.selected = None;
         }
@@ -261,39 +233,24 @@ impl DashboardPanel {
         window: &mut Window,
         cx: &mut App,
     ) {
-        if let Some(rows_fn) = self.widget_rows_fns.get(&widget_id) {
-            if let Some(cb) = &self.on_open_inspector {
-                if let Some(rows) = rows_fn(cx) {
-                    cb(
-                        InspectorRequest { rows, mode: InspectorMode::Anchored(position) },
-                        window,
-                        cx,
-                    );
-                    return;
-                }
-            }
-        }
-        if let Some(inspect_fn) = self.widget_inspect_fns.get(&widget_id) {
-            if let Some(page) = inspect_fn(&self.db, cx) {
-                if let Some(cb) = &self.on_open_page {
-                    cb(page, window, cx);
-                }
-            }
+        if let Some(entity) = self.widget_entities.get(&widget_id) {
+            window.dispatch_action(
+                Box::new(crate::inspector::InspectEntity {
+                    entity: entity.clone(),
+                    position,
+                }),
+                cx,
+            );
         }
     }
 
     fn ensure_views(&mut self, cx: &mut Context<Self>) {
         for widget in &self.widgets {
             if !self.widget_views.contains_key(&widget.id) {
-                let (view, inspect_fn, rows_fn) =
+                let (view, widget_entity) =
                     create_widget_view(widget.kind, &widget.config, &self.db, cx);
                 self.widget_views.insert(widget.id, view);
-                if let Some(f) = inspect_fn {
-                    self.widget_inspect_fns.insert(widget.id, f);
-                }
-                if let Some(f) = rows_fn {
-                    self.widget_rows_fns.insert(widget.id, f);
-                }
+                self.widget_entities.insert(widget.id, widget_entity);
             }
         }
     }
@@ -426,11 +383,7 @@ impl DashboardPanel {
         }
     }
 
-    fn render_widget(
-        &self,
-        widget: &DashboardWidget,
-        cx: &mut Context<Self>,
-    ) -> AnyElement {
+    fn render_widget(&self, widget: &DashboardWidget, cx: &mut Context<Self>) -> AnyElement {
         let theme = theme(cx);
         let view = self.widget_views.get(&widget.id);
         let r = &widget.rect;
@@ -504,9 +457,7 @@ impl DashboardPanel {
                                 let grab_offset = entity
                                     .read(cx)
                                     .pixel_to_canvas(window.mouse_position())
-                                    .map(|pos| {
-                                        point(pos.x - widget_rect.x, pos.y - widget_rect.y)
-                                    })
+                                    .map(|pos| point(pos.x - widget_rect.x, pos.y - widget_rect.y))
                                     .unwrap_or(point(0.0, 0.0));
 
                                 cx.new(|_| DraggedWidget {
@@ -558,15 +509,87 @@ impl DashboardPanel {
 
         let zones = [
             // Corners
-            Zone { edge: ResizeEdge::TopLeft,     top: Some(0.0), left: Some(0.0), right: None,     bottom: None,     width: ZoneDim::Px(c), height: ZoneDim::Px(c), cursor: gpui::CursorStyle::ResizeUpLeftDownRight },
-            Zone { edge: ResizeEdge::TopRight,    top: Some(0.0), left: None,      right: Some(0.0), bottom: None,     width: ZoneDim::Px(c), height: ZoneDim::Px(c), cursor: gpui::CursorStyle::ResizeUpRightDownLeft },
-            Zone { edge: ResizeEdge::BottomLeft,  top: None,      left: Some(0.0), right: None,     bottom: Some(0.0), width: ZoneDim::Px(c), height: ZoneDim::Px(c), cursor: gpui::CursorStyle::ResizeUpRightDownLeft },
-            Zone { edge: ResizeEdge::BottomRight, top: None,      left: None,      right: Some(0.0), bottom: Some(0.0), width: ZoneDim::Px(c), height: ZoneDim::Px(c), cursor: gpui::CursorStyle::ResizeUpLeftDownRight },
+            Zone {
+                edge: ResizeEdge::TopLeft,
+                top: Some(0.0),
+                left: Some(0.0),
+                right: None,
+                bottom: None,
+                width: ZoneDim::Px(c),
+                height: ZoneDim::Px(c),
+                cursor: gpui::CursorStyle::ResizeUpLeftDownRight,
+            },
+            Zone {
+                edge: ResizeEdge::TopRight,
+                top: Some(0.0),
+                left: None,
+                right: Some(0.0),
+                bottom: None,
+                width: ZoneDim::Px(c),
+                height: ZoneDim::Px(c),
+                cursor: gpui::CursorStyle::ResizeUpRightDownLeft,
+            },
+            Zone {
+                edge: ResizeEdge::BottomLeft,
+                top: None,
+                left: Some(0.0),
+                right: None,
+                bottom: Some(0.0),
+                width: ZoneDim::Px(c),
+                height: ZoneDim::Px(c),
+                cursor: gpui::CursorStyle::ResizeUpRightDownLeft,
+            },
+            Zone {
+                edge: ResizeEdge::BottomRight,
+                top: None,
+                left: None,
+                right: Some(0.0),
+                bottom: Some(0.0),
+                width: ZoneDim::Px(c),
+                height: ZoneDim::Px(c),
+                cursor: gpui::CursorStyle::ResizeUpLeftDownRight,
+            },
             // Edges (between corners)
-            Zone { edge: ResizeEdge::Top,    top: Some(0.0), left: Some(c), right: Some(c), bottom: None,     width: ZoneDim::Fill, height: ZoneDim::Px(e), cursor: gpui::CursorStyle::ResizeRow },
-            Zone { edge: ResizeEdge::Bottom, top: None,      left: Some(c), right: Some(c), bottom: Some(0.0), width: ZoneDim::Fill, height: ZoneDim::Px(e), cursor: gpui::CursorStyle::ResizeRow },
-            Zone { edge: ResizeEdge::Left,   top: Some(c),   left: Some(0.0), right: None,  bottom: Some(c),  width: ZoneDim::Px(e), height: ZoneDim::Fill, cursor: gpui::CursorStyle::ResizeColumn },
-            Zone { edge: ResizeEdge::Right,  top: Some(c),   left: None,     right: Some(0.0), bottom: Some(c), width: ZoneDim::Px(e), height: ZoneDim::Fill, cursor: gpui::CursorStyle::ResizeColumn },
+            Zone {
+                edge: ResizeEdge::Top,
+                top: Some(0.0),
+                left: Some(c),
+                right: Some(c),
+                bottom: None,
+                width: ZoneDim::Fill,
+                height: ZoneDim::Px(e),
+                cursor: gpui::CursorStyle::ResizeRow,
+            },
+            Zone {
+                edge: ResizeEdge::Bottom,
+                top: None,
+                left: Some(c),
+                right: Some(c),
+                bottom: Some(0.0),
+                width: ZoneDim::Fill,
+                height: ZoneDim::Px(e),
+                cursor: gpui::CursorStyle::ResizeRow,
+            },
+            Zone {
+                edge: ResizeEdge::Left,
+                top: Some(c),
+                left: Some(0.0),
+                right: None,
+                bottom: Some(c),
+                width: ZoneDim::Px(e),
+                height: ZoneDim::Fill,
+                cursor: gpui::CursorStyle::ResizeColumn,
+            },
+            Zone {
+                edge: ResizeEdge::Right,
+                top: Some(c),
+                left: None,
+                right: Some(0.0),
+                bottom: Some(c),
+                width: ZoneDim::Px(e),
+                height: ZoneDim::Fill,
+                cursor: gpui::CursorStyle::ResizeColumn,
+            },
         ];
 
         for (ix, zone) in zones.iter().enumerate() {
@@ -580,10 +603,18 @@ impl DashboardPanel {
                 .absolute()
                 .cursor(zone.cursor);
 
-            if let Some(v) = zone.top { handle = handle.top(px(v)); }
-            if let Some(v) = zone.left { handle = handle.left(px(v)); }
-            if let Some(v) = zone.right { handle = handle.right(px(v)); }
-            if let Some(v) = zone.bottom { handle = handle.bottom(px(v)); }
+            if let Some(v) = zone.top {
+                handle = handle.top(px(v));
+            }
+            if let Some(v) = zone.left {
+                handle = handle.left(px(v));
+            }
+            if let Some(v) = zone.right {
+                handle = handle.right(px(v));
+            }
+            if let Some(v) = zone.bottom {
+                handle = handle.bottom(px(v));
+            }
 
             handle = match zone.width {
                 ZoneDim::Px(v) => handle.w(px(v)),
@@ -783,7 +814,9 @@ fn add_widget_page(dashboard: Entity<DashboardPanel>, db: Arc<DB>) -> PalettePag
             let db = db.clone();
             PaletteAction::NextPage {
                 label: Some("Text".into()),
-                page: Box::new(move || component_picker_for_widget(dashboard, db, WidgetKind::Text)),
+                page: Box::new(move || {
+                    component_picker_for_widget(dashboard, db, WidgetKind::Text)
+                }),
             }
         }),
         PaletteItem::new("Component Table", {
@@ -896,11 +929,17 @@ fn create_widget_view(
     config: &serde_json::Value,
     db: &Arc<DB>,
     cx: &mut App,
-) -> (AnyView, Option<WidgetInspectFn>, Option<WidgetRowsFn>) {
+) -> (AnyView, gpui::AnyEntity) {
+    macro_rules! widget {
+        ($entity:expr) => {{
+            let e = $entity;
+            let any = e.clone().into_any();
+            (AnyView::from(e), any)
+        }};
+    }
     match kind {
         WidgetKind::Plot => {
-            let entity = cx.new(|cx| TimeSeriesPlot::new(db.clone(), vec![], cx));
-            (AnyView::from(entity), None, None)
+            widget!(cx.new(|cx| TimeSeriesPlot::new(db.clone(), vec![], cx)))
         }
         WidgetKind::Text => {
             let component_name = config
@@ -914,18 +953,15 @@ fn create_widget_view(
                     .map(|(id, _)| *id)
             });
             if let Some(id) = component_id {
-                let entity = cx.new(|cx| ComponentText::new(db.clone(), id, cx));
-                (AnyView::from(entity), None, None)
+                widget!(cx.new(|cx| ComponentText::new(db.clone(), id, cx)))
             } else {
-                let entity = cx.new(|_cx| PlaceholderWidget {
+                widget!(cx.new(|_cx| PlaceholderWidget {
                     label: SharedString::from(format!("? {}", component_name)),
-                });
-                (AnyView::from(entity), None, None)
+                }))
             }
         }
         WidgetKind::Table => {
-            let entity = cx.new(|cx| new_component_table(db.clone(), cx));
-            (AnyView::from(entity), None, None)
+            widget!(cx.new(|cx| new_component_table(db.clone(), cx)))
         }
         WidgetKind::Image => {
             let path = config
@@ -933,8 +969,7 @@ fn create_widget_view(
                 .and_then(|v| v.as_str())
                 .unwrap_or("")
                 .to_string();
-            let entity = cx.new(|_cx| ImageWidget::load(path));
-            (AnyView::from(entity), None, None)
+            widget!(cx.new(|_cx| ImageWidget::load(path)))
         }
         WidgetKind::Monitor => {
             let component_name = config
@@ -948,23 +983,15 @@ fn create_widget_view(
                     .map(|(id, _)| *id)
             });
             if let Some(id) = component_id {
-                let entity = cx.new(|cx| Monitor::new(db.clone(), id, cx));
-                let rows_entity = entity.clone();
-                let rows_db = db.clone();
-                let rows_fn: WidgetRowsFn = Box::new(move |cx| {
-                    Some(crate::reflect::rows_for_entity(&rows_entity, &rows_db, cx))
-                });
-                (AnyView::from(entity), None, Some(rows_fn))
+                widget!(cx.new(|cx| Monitor::new(db.clone(), id, cx)))
             } else {
-                let entity = cx.new(|_cx| PlaceholderWidget {
+                widget!(cx.new(|_cx| PlaceholderWidget {
                     label: SharedString::from(format!("? {}", component_name)),
-                });
-                (AnyView::from(entity), None, None)
+                }))
             }
         }
         WidgetKind::Viewer3d => {
-            let entity = cx.new(|cx| Viewer3d::with_db(db.clone(), cx));
-            (AnyView::from(entity), None, None)
+            widget!(cx.new(|cx| Viewer3d::with_db(db.clone(), cx)))
         }
     }
 }
@@ -1190,15 +1217,6 @@ impl PaneItem for DashboardPanel {
             "widgets": self.widgets,
         })
     }
-
-    fn inspect_page(&self, _db: Option<Arc<DB>>, cx: &App) -> Option<PalettePage> {
-        Some(dashboard_palette_page(
-            self.self_entity.clone(),
-            self.db.clone(),
-            cx,
-        ))
-    }
-
 }
 
 /// Deserialize a DashboardPanel from its serialized JSON state.
@@ -1212,28 +1230,19 @@ pub fn deserialize_dashboard(
         .and_then(|v| v.as_str())
         .unwrap_or("Dashboard")
         .to_string();
-    let next_id = value
-        .get("next_id")
-        .and_then(|v| v.as_u64())
-        .unwrap_or(1);
+    let next_id = value.get("next_id").and_then(|v| v.as_u64()).unwrap_or(1);
     let widgets: Vec<DashboardWidget> = value
         .get("widgets")
         .and_then(|v| serde_json::from_value(v.clone()).ok())
         .unwrap_or_default();
 
     let mut widget_views = HashMap::new();
-    let mut widget_inspect_fns = HashMap::new();
-    let mut widget_rows_fns = HashMap::new();
+    let mut widget_entities = HashMap::new();
     for widget in &widgets {
-        let (view, inspect_fn, rows_fn) =
+        let (view, widget_entity) =
             create_widget_view(widget.kind, &widget.config, &db, cx);
         widget_views.insert(widget.id, view);
-        if let Some(f) = inspect_fn {
-            widget_inspect_fns.insert(widget.id, f);
-        }
-        if let Some(f) = rows_fn {
-            widget_rows_fns.insert(widget.id, f);
-        }
+        widget_entities.insert(widget.id, widget_entity);
     }
 
     cx.new(|cx| DashboardPanel {
@@ -1242,10 +1251,7 @@ pub fn deserialize_dashboard(
         title: SharedString::from(title),
         widgets,
         widget_views,
-        widget_inspect_fns,
-        widget_rows_fns,
-        on_open_page: None,
-        on_open_inspector: None,
+        widget_entities,
         next_id,
         editing: false,
         selected: None,

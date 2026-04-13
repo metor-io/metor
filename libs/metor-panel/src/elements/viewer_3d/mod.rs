@@ -161,6 +161,17 @@ impl ModelEntry {
         self.orientation_binding
     }
 
+    pub fn empty() -> Self {
+        Self {
+            label: SharedString::new_static(""),
+            path: String::new(),
+            entity: Arc::new(OnceLock::new()),
+            position_binding: None,
+            orientation_binding: None,
+            binding_tasks: SmallVec::new(),
+        }
+    }
+
     fn position_orientation_entity(
         &self,
     ) -> (
@@ -293,6 +304,7 @@ impl Viewer3d {
 
         let camera = OrbitCamera::default();
         let camera_fov = camera.fov_y_rad;
+        cx.observe_self(Self::on_notify).detach();
         let mut viewer = Self {
             entities,
             render_layer,
@@ -329,6 +341,34 @@ impl Viewer3d {
     fn mark_dirty(&mut self, cx: &mut Context<Self>) {
         self.needs_render = true;
         cx.notify();
+    }
+
+    fn on_notify(&mut self, cx: &mut Context<Self>) {
+        self.sync_models(cx);
+    }
+
+    /// Spawn Bevy entities for any model entries that don't have one yet.
+    fn sync_models(&mut self, cx: &mut Context<Self>) {
+        let layer = self.render_layer;
+        let pending: Vec<_> = self
+            .models
+            .iter()
+            .filter_map(|model| {
+                let entry = model.read(cx);
+                if entry.entity.get().is_some() {
+                    return None;
+                }
+                Some((entry.path.clone(), entry.entity.clone()))
+            })
+            .collect();
+        for (path, entity_cell) in pending {
+            if !path.is_empty() {
+                self.loading_until = Some(Instant::now() + POST_LOAD_WINDOW);
+            }
+            self.with_world(cx, move |world| {
+                let _ = entity_cell.set(spawn_model(world, layer, &path));
+            });
+        }
     }
 
     /// Queue a world op and mark the viewer dirty. Every viewer-side
