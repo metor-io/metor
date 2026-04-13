@@ -8,7 +8,7 @@ use crate::theme::theme;
 /// One-shot action row (e.g., "Reset Camera", "Add Model").
 pub struct CommandRow {
     pub label: SharedString,
-    pub callback: Arc<dyn Fn(&mut Window, &mut App) + Send + Sync>,
+    pub callback: Arc<dyn Fn(&mut Window, &mut App)>,
 }
 
 impl InspectorRow for CommandRow {

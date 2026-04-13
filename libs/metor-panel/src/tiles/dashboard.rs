@@ -15,7 +15,7 @@ use crate::command_palette::{PaletteAction, PaletteItem, PalettePage};
 use crate::elements::time_series::OpenPageCallback;
 use crate::elements::viewer_3d::Viewer3d;
 use crate::elements::{ComponentText, Monitor, Scrollbar, TimeSeriesPlot, new_component_table};
-use crate::inspector::InspectorRowsRequest;
+use crate::inspector::{InspectorMode, InspectorRequest};
 use crate::widgets::InspectorRow;
 use crate::theme::theme;
 
@@ -265,7 +265,7 @@ impl DashboardPanel {
             if let Some(cb) = &self.on_open_inspector {
                 if let Some(rows) = rows_fn(cx) {
                     cb(
-                        InspectorRowsRequest { rows, position },
+                        InspectorRequest { rows, mode: InspectorMode::Anchored(position) },
                         window,
                         cx,
                     );

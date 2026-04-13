@@ -9,7 +9,7 @@ use crate::theme::theme;
 pub struct TextRow {
     pub label: SharedString,
     pub value: SharedString,
-    pub on_change: Arc<dyn Fn(String, &mut Window, &mut App) + Send + Sync>,
+    pub on_change: Arc<dyn Fn(String, &mut Window, &mut App)>,
 }
 
 impl InspectorRow for TextRow {

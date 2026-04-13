@@ -14,7 +14,7 @@ use crate::theme::theme;
 pub struct NavRow {
     pub label: SharedString,
     pub summary: SharedString,
-    pub build_children: Arc<dyn Fn(&gpui::App) -> Vec<Box<dyn InspectorRow>> + Send + Sync>,
+    pub build_children: Arc<dyn Fn(&gpui::App) -> Vec<Box<dyn InspectorRow>>>,
 }
 
 impl InspectorRow for NavRow {

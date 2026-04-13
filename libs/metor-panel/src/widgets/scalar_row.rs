@@ -9,7 +9,7 @@ use crate::theme::theme;
 pub struct ScalarRow {
     pub label: SharedString,
     pub value: f64,
-    pub on_change: Arc<dyn Fn(f64, &mut Window, &mut App) + Send + Sync>,
+    pub on_change: Arc<dyn Fn(f64, &mut Window, &mut App)>,
 }
 
 impl InspectorRow for ScalarRow {

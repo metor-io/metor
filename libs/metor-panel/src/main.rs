@@ -9,12 +9,12 @@ use gpui::{
     actions, div, point, prelude::*, px, size,
 };
 use metor_db::{DB, Server};
-use metor_panel::command_palette::{CommandPalette, PalettePage};
+use metor_panel::command_palette::PalettePage;
 use metor_panel::pending_edits::{
     self, edit_value_page, pending_edits, pending_edits_mut, review_page,
 };
 use metor_panel::inspector::Inspector;
-use metor_panel::inspector::InspectorRowsRequest;
+use metor_panel::inspector::{InspectorMode, InspectorRequest};
 use metor_panel::tiles::panels::tile_palette_page;
 use metor_panel::tiles::{TileGroup, TileGroupEvent};
 use stellarator::{net::TcpListener, struc_con::stellar};
@@ -35,12 +35,11 @@ const TITLEBAR_HEIGHT: f32 = 36.0;
 struct AppRoot {
     db: Arc<DB>,
     tiles: Entity<TileGroup>,
-    palette: Option<Entity<CommandPalette>>,
     inspector: Option<Entity<Inspector>>,
     pending_inspect: Option<PalettePage>,
     pending_inspector_request:
         Option<(Box<dyn metor_panel::tiles::PaneItemHandle>, Point<Pixels>)>,
-    pending_inspector_open: Option<InspectorRowsRequest>,
+    pending_inspector_open: Option<InspectorRequest>,
     focus_handle: FocusHandle,
 }
 
@@ -51,7 +50,6 @@ impl AppRoot {
         Self {
             db,
             tiles,
-            palette: None,
             inspector: None,
             pending_inspect: None,
             pending_inspector_request: None,
@@ -61,14 +59,15 @@ impl AppRoot {
     }
 
     fn open_palette(&mut self, page: PalettePage, window: &mut Window, cx: &mut Context<Self>) {
+        let rows = metor_panel::inspector::palette_page_to_rows(page);
         let parent_focus = self.focus_handle.clone();
-        let palette = cx.new(|cx| {
-            let mut p = CommandPalette::new(page, cx);
-            p.set_parent_focus(parent_focus);
-            p
+        let inspector = cx.new(|cx| {
+            let mut insp = Inspector::new(rows, InspectorMode::Centered, cx);
+            insp.set_parent_focus(parent_focus);
+            insp
         });
-        palette.focus_handle(cx).focus(window);
-        self.palette = Some(palette);
+        inspector.focus_handle(cx).focus(window);
+        self.inspector = Some(inspector);
         cx.notify();
     }
 
@@ -96,9 +95,9 @@ impl AppRoot {
     }
 
     fn toggle_palette(&mut self, _: &OpenPalette, window: &mut Window, cx: &mut Context<Self>) {
-        if let Some(palette) = &self.palette {
-            if !palette.read(cx).dismissed {
-                self.palette = None;
+        if let Some(inspector) = &self.inspector {
+            if !inspector.read(cx).dismissed {
+                self.inspector = None;
                 self.focus_handle.focus(window);
                 cx.notify();
                 return;
@@ -159,17 +158,9 @@ impl AppRoot {
         let db = self.db.clone();
         if let Some(rows) = item.inspect_rows(Some(db.clone()), cx) {
             let parent_focus = self.focus_handle.clone();
-            let root = cx.entity().clone();
             let inspector = cx.new(|cx| {
-                let mut insp = Inspector::new(rows, position, cx);
+                let mut insp = Inspector::new(rows, InspectorMode::Anchored(position), cx);
                 insp.set_parent_focus(parent_focus);
-                let root = root.clone();
-                insp.set_on_open_palette(move |page, _window, cx| {
-                    root.update(cx, |this, cx| {
-                        this.pending_inspect = Some(page);
-                        cx.notify();
-                    });
-                });
                 insp
             });
             inspector.focus_handle(cx).focus(window);
@@ -206,13 +197,6 @@ impl Focusable for AppRoot {
 
 impl Render for AppRoot {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        if let Some(palette) = &self.palette {
-            if palette.read(cx).dismissed {
-                self.palette = None;
-                self.focus_handle.focus(window);
-            }
-        }
-
         if let Some(inspector) = &self.inspector {
             if inspector.read(cx).dismissed {
                 self.inspector = None;
@@ -226,17 +210,9 @@ impl Render for AppRoot {
 
         if let Some(request) = self.pending_inspector_open.take() {
             let parent_focus = self.focus_handle.clone();
-            let root = cx.entity().clone();
             let inspector = cx.new(|cx| {
-                let mut insp = Inspector::new(request.rows, request.position, cx);
+                let mut insp = Inspector::new(request.rows, request.mode, cx);
                 insp.set_parent_focus(parent_focus);
-                let root = root.clone();
-                insp.set_on_open_palette(move |page, _window, cx| {
-                    root.update(cx, |this, cx| {
-                        this.pending_inspect = Some(page);
-                        cx.notify();
-                    });
-                });
                 insp
             });
             inspector.focus_handle(cx).focus(window);
@@ -275,10 +251,6 @@ impl Render for AppRoot {
             .size_full()
             .child(titlebar)
             .child(div().flex_1().min_h_0().child(self.tiles.clone()));
-
-        if let Some(palette) = &self.palette {
-            root = root.child(palette.clone());
-        }
 
         if let Some(inspector) = &self.inspector {
             root = root.child(inspector.clone());

@@ -28,16 +28,16 @@ pub struct FieldBuildCtx<'a> {
 }
 
 /// Type-erased setter: downcasted to the concrete field type by each factory.
-pub type FieldSetter = Arc<dyn Fn(Box<dyn Any>, &mut Window, &mut App) + Send + Sync>;
+pub type FieldSetter = Arc<dyn Fn(Box<dyn Any>, &mut Window, &mut App)>;
 
 /// Factory that produces a single InspectorRow for a field of a given type.
 pub type FieldWidgetFactory = Arc<
-    dyn Fn(&FieldBuildCtx, &Peek<'_, '_>, FieldSetter) -> Box<dyn InspectorRow> + Send + Sync,
+    dyn Fn(&FieldBuildCtx, &Peek<'_, '_>, FieldSetter) -> Box<dyn InspectorRow>,
 >;
 
 /// Builder that produces the full row set for an entity type.
 pub type TypeRowBuilder =
-    Arc<dyn Fn(AnyEntity, &Arc<DB>, &App) -> Vec<Box<dyn InspectorRow>> + Send + Sync>;
+    Arc<dyn Fn(AnyEntity, &Arc<DB>, &App) -> Vec<Box<dyn InspectorRow>>>;
 
 /// Per-field metadata that can't be expressed via Facet attributes.
 #[derive(Clone)]
@@ -48,7 +48,7 @@ pub struct FieldOverride {
 /// Handler that builds a NavRow for a `Vec<Entity<T>>` field, given the
 /// parent entity, field label, and db.
 pub type EntityListHandler =
-    Arc<dyn Fn(gpui::AnyEntity, SharedString, &Arc<DB>, &App) -> Box<dyn InspectorRow> + Send + Sync>;
+    Arc<dyn Fn(gpui::AnyEntity, SharedString, &Arc<DB>, &App) -> Box<dyn InspectorRow>>;
 
 pub struct WidgetRegistry {
     field_widgets: HashMap<ConstTypeId, FieldWidgetFactory>,

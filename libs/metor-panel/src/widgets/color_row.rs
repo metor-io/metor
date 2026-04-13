@@ -11,7 +11,7 @@ use crate::theme::theme;
 pub struct ColorRow {
     pub label: SharedString,
     pub color: Hsla,
-    pub on_change: Arc<dyn Fn(Hsla, &mut Window, &mut App) + Send + Sync>,
+    pub on_change: Arc<dyn Fn(Hsla, &mut Window, &mut App)>,
 }
 
 impl InspectorRow for ColorRow {

@@ -50,10 +50,8 @@ pub trait InspectorRow: 'static {
 pub enum RowAction {
     /// The row handled the action internally (e.g., bool toggled).
     Handled,
-    /// Open a cascading child inspector with these rows.
+    /// Push a new page onto the inspector's page stack with these rows.
     Cascade(Vec<Box<dyn InspectorRow>>),
-    /// Open a command palette page.
-    OpenPalette(crate::command_palette::PalettePage),
     /// Dismiss the inspector.
     Dismiss,
     /// Start inline text editing with the given initial value.

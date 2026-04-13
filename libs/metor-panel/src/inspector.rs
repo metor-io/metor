@@ -1,48 +1,61 @@
-/// Reusable inspector container for the right-click property panel.
+/// Unified inspector and command palette.
 ///
-/// Operates on [`InspectorRow`] widgets — does not know about specific
-/// field types. Handles layout, fuzzy search, keyboard navigation,
-/// cascading children, and inline text editing.
+/// Operates on [`InspectorRow`] widgets with a page-stack navigation model.
+/// Can render as either an anchored right-click panel or a centered overlay.
 use std::sync::Arc;
 
 use gpui::{
-    anchored, canvas, deferred, div, point, prelude::*, px, App, Bounds, Context, Corner, Entity,
-    FocusHandle, Focusable, Hsla, IntoElement, KeyDownEvent, Pixels, Point, Render, SharedString,
-    Window,
+    anchored, canvas, deferred, div, prelude::*, px, App, Bounds, Context, Corner, FocusHandle,
+    Focusable, Hsla, IntoElement, KeyDownEvent, Pixels, Point, Render, SharedString, Window,
 };
 
-use crate::command_palette::{PalettePage, TextField};
+use crate::command_palette::{PaletteAction, PalettePage, TextField};
 use crate::theme::theme;
-use crate::widgets::{InspectorRow, RowAction};
+use crate::widgets::{CommandRow, InspectorRow, NavRow, RowAction};
 
-/// Bundles everything needed to open an inspector from any entry point.
-pub struct InspectorRowsRequest {
-    pub rows: Vec<Box<dyn InspectorRow>>,
-    pub position: Point<Pixels>,
+/// How the inspector is positioned on screen.
+#[derive(Clone, Copy)]
+pub enum InspectorMode {
+    /// Anchored at a specific point (right-click menu).
+    Anchored(Point<Pixels>),
+    /// Centered in the window (command palette style).
+    Centered,
 }
 
-/// Callback that opens an inspector at a given position.
-pub type OpenInspectorCallback =
-    Arc<dyn Fn(InspectorRowsRequest, &mut Window, &mut App) + 'static>;
+/// Bundles everything needed to open an inspector from any entry point.
+pub struct InspectorRequest {
+    pub rows: Vec<Box<dyn InspectorRow>>,
+    pub mode: InspectorMode,
+}
 
-/// Searchable right-click inspector panel with cascading submenus.
-///
-/// Constructed with a `Vec<Box<dyn InspectorRow>>` — each row renders
-/// and handles activation independently. The container provides the
-/// shell: search, keyboard nav, cascade management, inline editing.
-pub struct Inspector {
+/// Callback that opens an inspector.
+pub type OpenInspectorCallback =
+    Arc<dyn Fn(InspectorRequest, &mut Window, &mut App) + 'static>;
+
+/// One page in the inspector's navigation stack.
+struct InspectorPage {
     rows: Vec<Box<dyn InspectorRow>>,
-    position: Point<Pixels>,
+    label: Option<SharedString>,
+}
+
+/// Unified inspector panel with page-stack navigation.
+///
+/// Replaces both `PropertyInspector` and `CommandPalette`. Supports:
+/// - Fuzzy search
+/// - Keyboard navigation (up/down/enter/escape)
+/// - Page stack with breadcrumb pills (cascade pushes a page)
+/// - Inline text editing
+/// - Anchored (right-click) or centered (Cmd-P) positioning
+pub struct Inspector {
+    pages: Vec<InspectorPage>,
+    mode: InspectorMode,
     focus_handle: FocusHandle,
     parent_focus: Option<FocusHandle>,
     pub dismissed: bool,
     search: TextField,
     selected_index: usize,
     editing: Option<EditState>,
-    child: Option<Entity<Inspector>>,
     panel_bounds: Option<Bounds<Pixels>>,
-    is_root: bool,
-    on_open_palette: Option<Arc<dyn Fn(PalettePage, &mut Window, &mut App)>>,
 }
 
 struct EditState {
@@ -54,44 +67,19 @@ struct EditState {
 impl Inspector {
     pub fn new(
         rows: Vec<Box<dyn InspectorRow>>,
-        position: Point<Pixels>,
+        mode: InspectorMode,
         cx: &mut Context<Self>,
     ) -> Self {
         Self {
-            rows,
-            position,
+            pages: vec![InspectorPage { rows, label: None }],
+            mode,
             focus_handle: cx.focus_handle(),
             parent_focus: None,
             dismissed: false,
             search: TextField::new("Search...", cx),
             selected_index: 0,
             editing: None,
-            child: None,
             panel_bounds: None,
-            is_root: true,
-            on_open_palette: None,
-        }
-    }
-
-    fn new_child(
-        rows: Vec<Box<dyn InspectorRow>>,
-        position: Point<Pixels>,
-        on_open_palette: Option<Arc<dyn Fn(PalettePage, &mut Window, &mut App)>>,
-        cx: &mut Context<Self>,
-    ) -> Self {
-        Self {
-            rows,
-            position,
-            focus_handle: cx.focus_handle(),
-            parent_focus: None,
-            dismissed: false,
-            search: TextField::new("Search...", cx),
-            selected_index: 0,
-            editing: None,
-            child: None,
-            panel_bounds: None,
-            is_root: false,
-            on_open_palette,
         }
     }
 
@@ -99,15 +87,11 @@ impl Inspector {
         self.parent_focus = Some(handle);
     }
 
-    pub fn set_on_open_palette(
-        &mut self,
-        cb: impl Fn(PalettePage, &mut Window, &mut App) + 'static,
-    ) {
-        self.on_open_palette = Some(Arc::new(cb));
+    fn current_page(&self) -> &InspectorPage {
+        self.pages.last().expect("page stack must never be empty")
     }
 
     fn dismiss(&mut self, window: &mut Window) {
-        self.child = None;
         self.dismissed = true;
         if let Some(parent) = &self.parent_focus {
             parent.focus(window);
@@ -116,37 +100,44 @@ impl Inspector {
         }
     }
 
-    fn child_position(&self) -> Point<Pixels> {
-        self.panel_bounds
-            .map(|b| {
-                let row_y = px(self.selected_index as f32 * 26.0);
-                point(b.origin.x + b.size.width, b.origin.y + row_y)
-            })
-            .unwrap_or(self.position)
-    }
-
-    fn open_cascade(
+    fn push_page(
         &mut self,
-        child_rows: Vec<Box<dyn InspectorRow>>,
-        window: &mut Window,
+        label: Option<SharedString>,
+        rows: Vec<Box<dyn InspectorRow>>,
         cx: &mut Context<Self>,
     ) {
-        let child_pos = self.child_position();
-        let on_open_palette = self.on_open_palette.clone();
-        let parent_focus = self.focus_handle.clone();
-        let child = cx.new(|cx| {
-            let mut c = Self::new_child(child_rows, child_pos, on_open_palette, cx);
-            c.set_parent_focus(parent_focus);
-            c
-        });
-        child.focus_handle(cx).focus(window);
-        self.child = Some(child);
+        // Set label on current page (becomes a breadcrumb pill)
+        if let Some(current) = self.pages.last_mut() {
+            if current.label.is_none() {
+                current.label = label;
+            }
+        }
+        self.pages.push(InspectorPage { rows, label: None });
+        self.search.clear();
+        self.selected_index = 0;
+        cx.notify();
+    }
+
+    fn pop_page(&mut self, cx: &mut Context<Self>) -> bool {
+        if self.pages.len() > 1 {
+            self.pages.pop();
+            if let Some(current) = self.pages.last_mut() {
+                current.label = None;
+            }
+            self.search.clear();
+            self.selected_index = 0;
+            cx.notify();
+            true
+        } else {
+            false
+        }
     }
 
     fn filtered_indices(&self) -> Vec<usize> {
+        let page = self.current_page();
         let filter = &self.search.text;
         if filter.is_empty() {
-            return (0..self.rows.len()).collect();
+            return (0..page.rows.len()).collect();
         }
 
         use nucleo_matcher::{
@@ -157,7 +148,7 @@ impl Inspector {
         let mut matcher = Matcher::new(nucleo_matcher::Config::DEFAULT);
         let pattern = Pattern::parse(filter, CaseMatching::Ignore, Normalization::Smart);
 
-        let mut scored: Vec<(usize, u32)> = self
+        let mut scored: Vec<(usize, u32)> = page
             .rows
             .iter()
             .enumerate()
@@ -177,24 +168,30 @@ impl Inspector {
         self.filtered_indices().len()
     }
 
-    fn confirm(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let indices = self.filtered_indices();
-        let Some(&row_idx) = indices.get(self.selected_index) else {
-            return;
-        };
-        let action = self.rows[row_idx].activate(window, cx);
+    fn activate_row(&mut self, row_idx: usize, window: &mut Window, cx: &mut Context<Self>) {
+        let page = self.pages.last().expect("page stack empty");
+        let action = page.rows[row_idx].activate(window, cx);
+        self.handle_action(action, row_idx, window, cx);
+    }
+
+    fn handle_action(
+        &mut self,
+        action: RowAction,
+        row_idx: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         match action {
             RowAction::Handled => {
                 cx.notify();
             }
             RowAction::Cascade(child_rows) => {
-                self.open_cascade(child_rows, window, cx);
-            }
-            RowAction::OpenPalette(page) => {
-                if let Some(cb) = &self.on_open_palette {
-                    cb(page, window, cx);
-                }
-                self.dismiss(window);
+                let label = self
+                    .current_page()
+                    .rows
+                    .get(row_idx)
+                    .map(|r| SharedString::from(r.label().to_string()));
+                self.push_page(label, child_rows, cx);
             }
             RowAction::Dismiss => {
                 self.dismiss(window);
@@ -215,6 +212,14 @@ impl Inspector {
                 cx.notify();
             }
         }
+    }
+
+    fn confirm(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let indices = self.filtered_indices();
+        let Some(&row_idx) = indices.get(self.selected_index) else {
+            return;
+        };
+        self.activate_row(row_idx, window, cx);
     }
 
     fn commit_edit(&mut self, window: &mut Window, cx: &mut App) {
@@ -257,13 +262,17 @@ impl Inspector {
 
         match key {
             "escape" => {
-                if self.child.is_some() {
-                    self.child = None;
-                } else {
+                if !self.pop_page(cx) {
                     self.dismiss(window);
                 }
                 cx.notify();
                 return;
+            }
+            "backspace" => {
+                if self.search.text.is_empty() && self.pages.len() > 1 {
+                    self.pop_page(cx);
+                    return;
+                }
             }
             "up" => {
                 if self.selected_index > 0 {
@@ -293,9 +302,9 @@ impl Inspector {
         }
     }
 
-    fn render_search_bar(&self, cx: &App) -> impl IntoElement {
+    fn render_input_bar(&self, cx: &App) -> impl IntoElement {
         let theme = theme(cx);
-        div()
+        let mut bar = div()
             .flex()
             .flex_row()
             .items_center()
@@ -303,13 +312,35 @@ impl Inspector {
             .py(px(3.0))
             .border_b_1()
             .border_color(theme.border_primary)
-            .text_size(px(12.0))
-            .child(
-                div()
-                    .flex_1()
-                    .min_w(px(60.0))
-                    .child(self.search.element()),
-            )
+            .text_size(px(12.0));
+
+        // Breadcrumb pills for stacked pages
+        for page in &self.pages[..self.pages.len().saturating_sub(1)] {
+            if let Some(label) = &page.label {
+                bar = bar.child(
+                    div()
+                        .px(px(6.0))
+                        .py(px(1.0))
+                        .mr(px(4.0))
+                        .bg(theme.pill_bg)
+                        .border_1()
+                        .border_color(theme.pill_border)
+                        .rounded(px(3.0))
+                        .text_size(px(10.0))
+                        .text_color(theme.text_secondary)
+                        .child(label.clone()),
+                );
+            }
+        }
+
+        bar = bar.child(
+            div()
+                .flex_1()
+                .min_w(px(60.0))
+                .child(self.search.element()),
+        );
+
+        bar
     }
 
     fn render_panel(&mut self, window: &mut Window, cx: &mut Context<Self>) -> gpui::Stateful<gpui::Div> {
@@ -349,7 +380,8 @@ impl Inspector {
 
                 if is_editing {
                     let edit = self.editing.as_ref().unwrap();
-                    let label = SharedString::from(self.rows[row_idx].label().to_string());
+                    let page = self.current_page();
+                    let label = SharedString::from(page.rows[row_idx].label().to_string());
                     items_col = items_col.child(
                         crate::widgets::row_base(vis_ix, selected, cx)
                             .child(
@@ -366,8 +398,9 @@ impl Inspector {
                             ),
                     );
                 } else {
+                    let page = self.current_page();
                     let row_element =
-                        self.rows[row_idx].render_row(vis_ix, selected, window, cx);
+                        page.rows[row_idx].render_row(vis_ix, selected, window, cx);
                     let row_idx_click = row_idx;
                     items_col = items_col.child(
                         div()
@@ -375,35 +408,7 @@ impl Inspector {
                                 gpui::MouseButton::Left,
                                 cx.listener(move |this, _, window, cx| {
                                     this.selected_index = vis_ix;
-                                    let action = this.rows[row_idx_click].activate(window, cx);
-                                    match action {
-                                        RowAction::Handled => cx.notify(),
-                                        RowAction::Cascade(rows) => {
-                                            this.open_cascade(rows, window, cx);
-                                        }
-                                        RowAction::OpenPalette(page) => {
-                                            if let Some(cb) = &this.on_open_palette {
-                                                cb(page, window, cx);
-                                            }
-                                            this.dismiss(window);
-                                        }
-                                        RowAction::Dismiss => this.dismiss(window),
-                                        RowAction::StartEdit {
-                                            current_text,
-                                            on_commit,
-                                        } => {
-                                            let mut edit_field = TextField::new("", cx);
-                                            edit_field.text = current_text;
-                                            edit_field.cursor = edit_field.text.len();
-                                            edit_field.mark = edit_field.cursor;
-                                            this.editing = Some(EditState {
-                                                row_index: row_idx_click,
-                                                field: edit_field,
-                                                on_commit: Some(on_commit),
-                                            });
-                                            cx.notify();
-                                        }
-                                    }
+                                    this.activate_row(row_idx_click, window, cx);
                                 }),
                             )
                             .child(row_element),
@@ -411,6 +416,11 @@ impl Inspector {
                 }
             }
         }
+
+        let width = match self.mode {
+            InspectorMode::Anchored(_) => px(280.0),
+            InspectorMode::Centered => px(500.0),
+        };
 
         div()
             .relative()
@@ -422,7 +432,7 @@ impl Inspector {
                 this.handle_key_down(event, window, cx);
                 cx.notify();
             }))
-            .w(px(280.0))
+            .w(width)
             .max_h(px(400.0))
             .bg(theme.bg_elevated)
             .border_1()
@@ -430,7 +440,7 @@ impl Inspector {
             .rounded(px(6.0))
             .overflow_y_scroll()
             .child(bounds_tracker)
-            .child(self.render_search_bar(cx))
+            .child(self.render_input_bar(cx))
             .child(items_col)
     }
 }
@@ -447,51 +457,91 @@ impl Render for Inspector {
             return div().into_any_element();
         }
 
-        if let Some(child) = &self.child {
-            if child.read(cx).dismissed {
-                self.child = None;
-                self.focus_handle.focus(window);
-            }
-        }
-
-        let position = self.position;
         let panel = self.render_panel(window, cx);
 
-        let anchored_panel = anchored()
-            .position(position)
-            .anchor(Corner::TopLeft)
-            .snap_to_window_with_margin(px(8.0))
-            .child(
-                panel.on_mouse_down_out(cx.listener(
-                    |this, _: &gpui::MouseDownEvent, window, _cx| {
-                        if this.child.is_none() {
-                            this.dismiss(window);
-                        }
-                    },
-                )),
-            );
+        let panel_with_dismiss = panel.on_mouse_down_out(cx.listener(
+            |this, _: &gpui::MouseDownEvent, window, _cx| {
+                this.dismiss(window);
+            },
+        ));
 
-        if self.is_root {
-            let mut overlay = div()
-                .id("inspector-overlay")
-                .occlude()
-                .absolute()
-                .top_0()
-                .left_0()
-                .size_full()
-                .child(anchored_panel);
+        match self.mode {
+            InspectorMode::Anchored(position) => {
+                let anchored_panel = anchored()
+                    .position(position)
+                    .anchor(Corner::TopLeft)
+                    .snap_to_window_with_margin(px(8.0))
+                    .child(panel_with_dismiss);
 
-            if let Some(child) = &self.child {
-                overlay = overlay.child(child.clone());
+                let overlay = div()
+                    .id("inspector-overlay")
+                    .occlude()
+                    .absolute()
+                    .top_0()
+                    .left_0()
+                    .size_full()
+                    .child(anchored_panel);
+
+                deferred(overlay).with_priority(1).into_any_element()
             }
+            InspectorMode::Centered => {
+                let centered = div()
+                    .id("inspector-centered")
+                    .occlude()
+                    .absolute()
+                    .top_0()
+                    .left_0()
+                    .size_full()
+                    .flex()
+                    .flex_col()
+                    .items_center()
+                    .pt(px(80.0))
+                    .child(panel_with_dismiss);
 
-            deferred(overlay).with_priority(1).into_any_element()
-        } else {
-            let mut container = div().child(anchored_panel);
-            if let Some(child) = &self.child {
-                container = container.child(child.clone());
+                deferred(centered).with_priority(1).into_any_element()
             }
-            container.into_any_element()
         }
     }
+}
+
+/// Convert a [`PalettePage`] into inspector rows.
+///
+/// This bridges the old CommandPalette page model to the new unified
+/// Inspector. `PaletteAction::Execute` becomes a `CommandRow`,
+/// `PaletteAction::NextPage` becomes a `NavRow` that cascades.
+pub fn palette_page_to_rows(page: PalettePage) -> Vec<Box<dyn InspectorRow>> {
+    page.items
+        .into_iter()
+        .map(|item| {
+            let label = item.label;
+            match item.action {
+                PaletteAction::Execute(cb) => {
+                    let cb = std::sync::Mutex::new(Some(cb));
+                    Box::new(CommandRow {
+                        label,
+                        callback: Arc::new(move |w, cx| {
+                            if let Some(cb) = cb.lock().unwrap().take() {
+                                cb("", w, cx);
+                            }
+                        }),
+                    }) as Box<dyn InspectorRow>
+                }
+                PaletteAction::NextPage { label: page_label, page: page_fn } => {
+                    let page_fn = std::sync::Mutex::new(Some(page_fn));
+                    Box::new(NavRow {
+                        label,
+                        summary: page_label.unwrap_or_default(),
+                        build_children: Arc::new(move |_cx| {
+                            if let Some(page_fn) = page_fn.lock().unwrap().take() {
+                                let page = page_fn();
+                                palette_page_to_rows(page)
+                            } else {
+                                vec![]
+                            }
+                        }),
+                    }) as Box<dyn InspectorRow>
+                }
+            }
+        })
+        .collect()
 }

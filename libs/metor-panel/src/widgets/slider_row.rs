@@ -15,7 +15,7 @@ const SLIDER_HANDLE_SIZE: f32 = 10.0;
 struct SliderDrag {
     min: f64,
     max: f64,
-    on_change: Arc<dyn Fn(f64, &mut Window, &mut App) + Send + Sync>,
+    on_change: Arc<dyn Fn(f64, &mut Window, &mut App)>,
 }
 
 impl Render for SliderDrag {
@@ -30,7 +30,7 @@ pub struct SliderRow {
     pub value: f64,
     pub min: f64,
     pub max: f64,
-    pub on_change: Arc<dyn Fn(f64, &mut Window, &mut App) + Send + Sync>,
+    pub on_change: Arc<dyn Fn(f64, &mut Window, &mut App)>,
 }
 
 impl InspectorRow for SliderRow {

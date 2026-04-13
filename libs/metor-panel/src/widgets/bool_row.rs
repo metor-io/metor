@@ -9,7 +9,7 @@ use crate::theme::theme;
 pub struct BoolRow {
     pub label: SharedString,
     pub value: bool,
-    pub toggle: Arc<dyn Fn(bool, &mut Window, &mut App) + Send + Sync>,
+    pub toggle: Arc<dyn Fn(bool, &mut Window, &mut App)>,
 }
 
 impl InspectorRow for BoolRow {

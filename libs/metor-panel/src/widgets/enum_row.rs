@@ -12,7 +12,7 @@ pub struct EnumRow {
     pub label: SharedString,
     pub selected: SharedString,
     pub options: Vec<SharedString>,
-    pub on_select: Arc<dyn Fn(String, &mut Window, &mut App) + Send + Sync>,
+    pub on_select: Arc<dyn Fn(String, &mut Window, &mut App)>,
 }
 
 impl InspectorRow for EnumRow {
@@ -78,7 +78,7 @@ impl InspectorRow for EnumRow {
 struct EnumOptionRow {
     label: SharedString,
     value: String,
-    on_select: Arc<dyn Fn(String, &mut Window, &mut App) + Send + Sync>,
+    on_select: Arc<dyn Fn(String, &mut Window, &mut App)>,
 }
 
 impl InspectorRow for EnumOptionRow {
