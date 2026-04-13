@@ -84,6 +84,17 @@ impl AppRoot {
     }
 
 
+    fn make_on_open_inspector(
+        root: Entity<AppRoot>,
+    ) -> metor_panel::inspectable::OpenInspectorCallback {
+        Arc::new(move |request, _window, cx| {
+            root.update(cx, |this, cx| {
+                this.pending_inspector_open = Some(request);
+                cx.notify();
+            });
+        })
+    }
+
     fn toggle_palette(&mut self, _: &OpenPalette, window: &mut Window, cx: &mut Context<Self>) {
         if let Some(palette) = &self.palette {
             if !palette.read(cx).dismissed {
@@ -95,9 +106,10 @@ impl AppRoot {
         }
 
         let on_inspect = Self::make_on_inspect(cx.entity().clone());
+        let on_open_inspector = Self::make_on_open_inspector(cx.entity().clone());
         let pane = self.tiles.read(cx).panes()[0].clone();
         let page =
-            tile_palette_page(self.db.clone(), pane, &self.tiles, on_inspect, cx);
+            tile_palette_page(self.db.clone(), pane, &self.tiles, on_inspect, Some(on_open_inspector), cx);
         self.open_palette(page, window, cx);
     }
 

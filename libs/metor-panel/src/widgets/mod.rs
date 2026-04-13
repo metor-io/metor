@@ -8,13 +8,19 @@ use gpui::{AnyElement, App, Hsla, SharedString, Window, div, prelude::*, px};
 use crate::theme::theme;
 
 pub mod bool_row;
+pub mod color_row;
 pub mod command_row;
+pub mod enum_row;
 pub mod scalar_row;
+pub mod slider_row;
 pub mod text_row;
 
 pub use bool_row::BoolRow;
+pub use color_row::ColorRow;
 pub use command_row::CommandRow;
+pub use enum_row::EnumRow;
 pub use scalar_row::ScalarRow;
+pub use slider_row::SliderRow;
 pub use text_row::TextRow;
 
 /// One row in an inspector panel.

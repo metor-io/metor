@@ -237,6 +237,7 @@ pub fn tile_palette_page(
     pane: Entity<Pane>,
     tiles: &Entity<super::TileGroup>,
     on_inspect: impl Fn(PalettePage, &mut Window, &mut App) + 'static,
+    on_open_inspector: Option<crate::inspectable::OpenInspectorCallback>,
     cx: &App,
 ) -> PalettePage {
     let on_inspect = Arc::new(on_inspect);
@@ -245,9 +246,10 @@ pub fn tile_palette_page(
         let db = db.clone();
         let pane = pane.clone();
         let on_inspect = on_inspect.clone();
+        let on_open_inspector = on_open_inspector.clone();
         PaletteAction::NextPage {
             label: Some("New".into()),
-            page: Box::new(move || new_panel_page(db, pane, on_inspect)),
+            page: Box::new(move || new_panel_page(db, pane, on_inspect, on_open_inspector)),
         }
     })];
 
@@ -316,6 +318,7 @@ fn new_panel_page(
     db: Arc<DB>,
     pane: Entity<Pane>,
     on_inspect: Arc<dyn Fn(PalettePage, &mut Window, &mut App) + 'static>,
+    on_open_inspector: Option<crate::inspectable::OpenInspectorCallback>,
 ) -> PalettePage {
     let items = vec![
         PaletteItem::new("Time Series Plot", {
@@ -390,15 +393,20 @@ fn new_panel_page(
             let db = db.clone();
             let pane = pane.clone();
             let on_inspect = on_inspect.clone();
+            let on_open_inspector = on_open_inspector.clone();
             PaletteAction::Execute(Box::new(move |_filter, _window, cx| {
                 let db = db.clone();
                 let on_inspect = on_inspect.clone();
+                let on_open_inspector = on_open_inspector.clone();
                 pane.update(cx, |pane, cx| {
                     let dashboard = cx.new(|cx| {
                         let mut d = DashboardPanel::new(db, cx);
                         let cb: crate::elements::time_series::OpenPageCallback =
                             Arc::new(move |page, window, cx| on_inspect(page, window, cx));
                         d.set_on_open_page(cb);
+                        if let Some(insp_cb) = on_open_inspector {
+                            d.set_on_open_inspector(insp_cb);
+                        }
                         d
                     });
                     pane.add_item(Box::new(dashboard), cx);
