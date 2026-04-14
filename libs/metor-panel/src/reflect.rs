@@ -3,15 +3,15 @@
 /// The core function [`rows_for_entity`] checks the [`WidgetRegistry`] for
 /// type-level builders first, then falls back to [`default_rows_for_entity`]
 /// which walks Facet struct fields and maps them to widgets.
-use std::any::{Any, TypeId};
+use std::any::TypeId;
 use std::sync::Arc;
 
-use facet::{Def, Facet, FieldFlags, Peek, Poke, ScalarType};
-use gpui::{App, Entity, Hsla, SharedString};
+use facet::{Facet, FieldFlags, Peek, Poke, PokeStruct, ScalarType};
+use gpui::{App, Entity, SharedString};
 use metor_db::DB;
 use metor_proto::types::ComponentId;
 
-use crate::widget_registry::{FieldBuildCtx, FieldSetter, WidgetRegistry};
+use crate::widget_registry::{FieldBuildCtx, FieldReader, FieldSetter, FieldWrite, WidgetRegistry};
 use crate::widgets::{
     BoolRow, CommandRow, EnumRow, InspectorRow, NavRow, ScalarRow, SliderRow, TextRow,
 };
@@ -74,84 +74,28 @@ pub fn default_rows_for_entity<T: Facet<'static> + 'static>(
             continue;
         };
 
-        // Build the type-erased setter for this field
-        let entity_clone = entity.clone();
-        let field_idx = idx;
-        let setter: FieldSetter = Arc::new(move |val: Box<dyn Any>, _w, cx| {
-            entity_clone.update(cx, |target, _cx| {
-                set_field_from_any(target, field_idx, val);
-            });
-        });
-
-        // Build a type-erased reader for this field (used by live widgets like ColorRow)
-        let entity_for_field = entity.clone();
-        let read_field: Arc<dyn Fn(&App) -> Box<dyn Any>> = Arc::new(move |cx| {
-            let value = entity_for_field.read(cx);
-            let peek = Peek::new(value);
-            if let Ok(ps) = peek.into_struct() {
-                if let Ok(fp) = ps.field(field_idx) {
-                    if let Ok(v) = fp.get::<Hsla>() {
-                        return Box::new(*v);
-                    }
-                    if let Ok(v) = fp.get::<String>() {
-                        return Box::new(v.clone());
-                    }
-                    if let Ok(v) = fp.get::<SharedString>() {
-                        return Box::new(v.clone());
-                    }
-                }
-            }
-            Box::new(())
-        });
-
+        let setter = make_setter(entity, idx);
         let ctx = FieldBuildCtx {
             db,
             label: label.clone(),
             field_name: field_def.name,
-            read_field,
         };
 
-        // Check registry for a field widget factory for this type
         if let Some(factory) = registry.field_widget(field_shape.id) {
-            rows.push(factory(&ctx, &field_peek, setter));
+            let reader = make_reader(entity, idx);
+            rows.push(factory(&ctx, &field_peek, setter, reader));
             continue;
         }
 
-        // Check for Vec<Entity<T>> list handler
         if let Some(handler) = registry.entity_list_handler(field_shape.id) {
             let handler = handler.clone();
             rows.push(handler(entity.clone().into_any(), label, db, cx));
             continue;
         }
 
-        // Check for field override (e.g., range for slider)
         let field_override = registry.field_override(parent_shape_id, field_def.name);
-
-        // Build a live-read closure for numeric fields (used by SliderRow)
-        let entity_for_read = entity.clone();
-        let read_f64: Arc<dyn Fn(&App) -> f64> = Arc::new(move |cx| {
-            let value = entity_for_read.read(cx);
-            let peek = Peek::new(value);
-            let Ok(ps) = peek.into_struct() else { return 0.0 };
-            let Ok(fp) = ps.field(field_idx) else { return 0.0 };
-            if let Some(scalar) = fp.scalar_type() {
-                match scalar {
-                    ScalarType::F32 => fp.get::<f32>().ok().map(|v| *v as f64),
-                    ScalarType::F64 => fp.get::<f64>().ok().copied(),
-                    ScalarType::I32 => fp.get::<i32>().ok().map(|v| *v as f64),
-                    ScalarType::I64 => fp.get::<i64>().ok().map(|v| *v as f64),
-                    ScalarType::U32 => fp.get::<u32>().ok().map(|v| *v as f64),
-                    ScalarType::U64 => fp.get::<u64>().ok().map(|v| *v as f64),
-                    _ => None,
-                }
-                .unwrap_or(0.0)
-            } else {
-                0.0
-            }
-        });
-
-        // Fall back to shape-based defaults
-        if let Some(row) = build_default_row(&ctx, &field_peek, setter, field_override, read_f64, cx) {
+        if let Some(row) = build_default_row(&ctx, &field_peek, setter, field_override, entity, idx)
+        {
             rows.push(row);
         }
     }
@@ -159,152 +103,97 @@ pub fn default_rows_for_entity<T: Facet<'static> + 'static>(
     rows
 }
 
+/// Per-field setter: captures the typed entity + field index and applies
+/// widget-supplied [`FieldWrite`]s through a single `Poke::set_field` call.
+fn make_setter<T: Facet<'static> + 'static>(entity: &Entity<T>, idx: usize) -> FieldSetter {
+    let entity = entity.clone();
+    Arc::new(move |write, _w, cx| {
+        entity.update(cx, move |target, _cx| {
+            if let Ok(mut ps) = Poke::new(target).into_struct() {
+                write.apply(&mut ps, idx);
+            }
+        });
+    })
+}
+
+/// Per-field live reader: exposes the current typed value through a Peek
+/// visitor so factories can extract without `Box<dyn Any>` round-trips.
+fn make_reader<T: Facet<'static> + 'static>(entity: &Entity<T>, idx: usize) -> FieldReader {
+    let entity = entity.clone();
+    FieldReader::new(Arc::new(move |cx, visit| {
+        let value = entity.read(cx);
+        let peek = Peek::new(value);
+        if let Ok(ps) = peek.into_struct() {
+            if let Ok(fp) = ps.field(idx) {
+                visit(&fp);
+            }
+        }
+    }))
+}
+
 /// Build a widget row from the Facet shape when no registry override exists.
-fn build_default_row(
+fn build_default_row<T: Facet<'static> + 'static>(
     ctx: &FieldBuildCtx,
     peek: &Peek<'_, '_>,
     setter: FieldSetter,
     field_override: Option<&crate::widget_registry::FieldOverride>,
-    read_f64: Arc<dyn Fn(&App) -> f64>,
-    cx: &App,
+    entity: &Entity<T>,
+    field_idx: usize,
 ) -> Option<Box<dyn InspectorRow>> {
     let shape = peek.shape();
 
-    // Bool
     if shape.id == <bool as Facet>::SHAPE.id {
         let val = *peek.get::<bool>().ok()?;
-        let label = ctx.label.clone();
         return Some(Box::new(BoolRow {
-            label,
+            label: ctx.label.clone(),
             value: val,
-            toggle: Arc::new(move |v, w, cx| setter(Box::new(v), w, cx)),
+            toggle: Arc::new(move |v, w, cx| setter(FieldWrite::of(v), w, cx)),
         }));
     }
 
-    // Numeric scalars
     if let Some(scalar) = peek.scalar_type() {
-        let f64_val = match scalar {
-            ScalarType::F32 => peek.get::<f32>().ok().map(|v| *v as f64),
-            ScalarType::F64 => peek.get::<f64>().ok().copied(),
-            ScalarType::I32 => peek.get::<i32>().ok().map(|v| *v as f64),
-            ScalarType::I64 => peek.get::<i64>().ok().map(|v| *v as f64),
-            ScalarType::U32 => peek.get::<u32>().ok().map(|v| *v as f64),
-            ScalarType::U64 => peek.get::<u64>().ok().map(|v| *v as f64),
-            _ => None,
-        };
-        if let Some(val) = f64_val {
+        if let Some(val) = scalar_as_f64(peek, scalar) {
             let label = ctx.label.clone();
-            if let Some(over) = field_override {
-                if let Some((min, max)) = over.range {
-                    let setter_clone = setter.clone();
-                    return Some(Box::new(SliderRow {
-                        label,
-                        read_value: read_f64,
-                        min,
-                        max,
-                        on_change: Arc::new(move |v, w, cx| {
-                            match scalar {
-                                ScalarType::F32 => setter_clone(Box::new(v as f32), w, cx),
-                                ScalarType::F64 => setter_clone(Box::new(v), w, cx),
-                                _ => setter_clone(Box::new(v), w, cx),
-                            }
-                        }),
-                    }));
-                }
+            if let Some((min, max)) = field_override.and_then(|o| o.range) {
+                let slider_setter = setter.clone();
+                let read_f64 = make_scalar_reader(entity, field_idx, scalar);
+                return Some(Box::new(SliderRow {
+                    label,
+                    read_value: read_f64,
+                    min,
+                    max,
+                    on_change: Arc::new(move |v, w, cx| {
+                        if let Some(write) = scalar_write(scalar, v) {
+                            slider_setter(write, w, cx);
+                        }
+                    }),
+                }));
             }
-            let setter_clone = setter.clone();
             return Some(Box::new(ScalarRow {
                 label,
                 value: val,
                 on_change: Arc::new(move |v, w, cx| {
-                    match scalar {
-                        ScalarType::F32 => setter_clone(Box::new(v as f32), w, cx),
-                        ScalarType::F64 => setter_clone(Box::new(v), w, cx),
-                        _ => setter_clone(Box::new(v), w, cx),
+                    if let Some(write) = scalar_write(scalar, v) {
+                        setter(write, w, cx);
                     }
                 }),
             }));
         }
     }
 
-    // String
     if shape.id == <String as Facet>::SHAPE.id {
         let val = peek.get::<String>().ok()?.clone();
-        let label = ctx.label.clone();
         return Some(Box::new(TextRow {
-            label,
+            label: ctx.label.clone(),
             value: SharedString::from(val),
-            on_change: Arc::new(move |s, w, cx| setter(Box::new(s), w, cx)),
+            on_change: Arc::new(move |s, w, cx| setter(FieldWrite::of(s), w, cx)),
         }));
     }
 
-    // Option<T> — show inner type with None/Clear handling
     if let Ok(peek_option) = peek.clone().into_option() {
-        let label = ctx.label.clone();
-        let is_some = peek_option.is_some();
-        let inner_shape = peek_option.def().t;
-
-        // Check registry for a widget factory for the inner type
-        let registry = cx.global::<WidgetRegistry>();
-        let has_inner_widget = registry.field_widget(inner_shape.id).is_some();
-
-        let summary = if is_some {
-            SharedString::from("Set")
-        } else {
-            SharedString::from("None")
-        };
-
-        let setter_for_clear = setter.clone();
-        let db = ctx.db.clone();
-
-        return Some(Box::new(NavRow {
-            label,
-            summary,
-            build_children: Arc::new(move |cx| {
-                let mut rows: Vec<Box<dyn InspectorRow>> = Vec::new();
-
-                if is_some {
-                    // Show the inner value's widget if we have a factory
-                    if has_inner_widget {
-                        // Delegate to the inner type's widget via the setter
-                        // The inner widget will set the Some variant
-                    }
-
-                    // "Clear" button sets to None
-                    let clear_setter = setter_for_clear.clone();
-                    rows.push(Box::new(CommandRow {
-                        label: "Clear".into(),
-                        callback: Arc::new(move |w, cx| {
-                            // We need to set the field to None.
-                            // Since Option<T> is the field type, we pass None::<T> encoded
-                            // For Option<ComponentId>, this would be Option::<ComponentId>::None
-                            // But we don't know T at runtime... use a sentinel
-                            clear_setter(Box::new(OptionAction::Clear), w, cx);
-                        }),
-                    }));
-                } else {
-                    // Show component list if inner type is ComponentId
-                    if inner_shape.id == <ComponentId as Facet>::SHAPE.id {
-                        let components = crate::trace_picker::list_components(&db);
-                        let setter = setter_for_clear.clone();
-                        for (id, name) in components {
-                            let setter = setter.clone();
-                            rows.push(Box::new(CommandRow {
-                                label: SharedString::from(name),
-                                callback: Arc::new(move |w, cx| {
-                                    setter(Box::new(OptionAction::Set(Box::new(id))), w, cx);
-                                }),
-                            }));
-                        }
-                    }
-                }
-
-                rows
-            }),
-        }));
+        return Some(build_option_row(ctx, peek_option, setter));
     }
 
-    // Enum
     if let Ok(peek_enum) = peek.clone().into_enum() {
         let selected = peek_enum
             .variant_name_active()
@@ -315,89 +204,126 @@ fn build_default_row(
             .iter()
             .map(|v| SharedString::from(v.name))
             .collect();
-        let label = ctx.label.clone();
+        let entity = entity.clone();
         return Some(Box::new(EnumRow {
-            label,
+            label: ctx.label.clone(),
             selected: SharedString::from(selected),
             options,
-            on_select: Arc::new(move |s, w, cx| setter(Box::new(s), w, cx)),
+            on_select: Arc::new(move |name, _w, cx| {
+                entity.update(cx, |target, _cx| {
+                    let Ok(mut ps) = Poke::new(target).into_struct() else {
+                        return;
+                    };
+                    set_enum_by_name(&mut ps, field_idx, &name);
+                });
+            }),
         }));
     }
 
     None
 }
 
-/// Sentinel for Option field mutations.
-pub enum OptionAction {
-    Clear,
-    Set(Box<dyn Any>),
-}
+/// Build an Option<T> row. Currently only `Option<ComponentId>` is wired —
+/// other inner types render as a single "None"/"Set" status with no picker.
+fn build_option_row(
+    ctx: &FieldBuildCtx,
+    peek_option: facet::PeekOption<'_, '_>,
+    setter: FieldSetter,
+) -> Box<dyn InspectorRow> {
+    let label = ctx.label.clone();
+    let is_some = peek_option.is_some();
+    let inner_shape = peek_option.def().t;
+    let db = ctx.db.clone();
 
-/// Apply a type-erased `Box<dyn Any>` value to a Facet struct field using Poke.
-///
-/// Tries to downcast to known concrete types and uses `set_field` on the
-/// PokeStruct. Falls back silently if the type doesn't match.
-fn set_field_from_any<T: Facet<'static>>(target: &mut T, field_idx: usize, val: Box<dyn Any>) {
-    let mut poke = Poke::new(target);
-    let Ok(mut ps) = poke.into_struct() else {
-        return;
+    let summary = if is_some {
+        SharedString::from("Set")
+    } else {
+        SharedString::from("None")
     };
 
-    // Check OptionAction first (consumes the Box)
-    if val.is::<OptionAction>() {
-        let action = *val.downcast::<OptionAction>().unwrap();
-        match action {
-            OptionAction::Clear => {
-                let _ = ps.set_field(field_idx, Option::<ComponentId>::None);
+    Box::new(NavRow {
+        label,
+        summary,
+        build_children: Arc::new(move |_cx| {
+            let mut rows: Vec<Box<dyn InspectorRow>> = Vec::new();
+
+            if inner_shape.id != <ComponentId as Facet>::SHAPE.id {
+                return rows;
             }
-            OptionAction::Set(inner) => {
-                if let Some(id) = inner.downcast_ref::<ComponentId>() {
-                    let _ = ps.set_field(field_idx, Some(*id));
+
+            if is_some {
+                let clear_setter = setter.clone();
+                rows.push(Box::new(CommandRow {
+                    label: "Clear".into(),
+                    callback: Arc::new(move |w, cx| {
+                        clear_setter(FieldWrite::of(Option::<ComponentId>::None), w, cx);
+                    }),
+                }));
+            } else {
+                for (id, name) in crate::trace_picker::list_components(&db) {
+                    let setter = setter.clone();
+                    rows.push(Box::new(CommandRow {
+                        label: SharedString::from(name),
+                        callback: Arc::new(move |w, cx| {
+                            setter(FieldWrite::of(Some(id)), w, cx);
+                        }),
+                    }));
                 }
             }
-        }
-        return;
-    }
 
-    // Try each concrete type
-    if let Some(v) = val.downcast_ref::<bool>() {
-        let _ = ps.set_field(field_idx, *v);
-    } else if let Some(v) = val.downcast_ref::<f32>() {
-        let _ = ps.set_field(field_idx, *v);
-    } else if let Some(v) = val.downcast_ref::<f64>() {
-        let _ = ps.set_field(field_idx, *v);
-    } else if let Some(v) = val.downcast_ref::<i32>() {
-        let _ = ps.set_field(field_idx, *v);
-    } else if let Some(v) = val.downcast_ref::<i64>() {
-        let _ = ps.set_field(field_idx, *v);
-    } else if let Some(v) = val.downcast_ref::<u32>() {
-        let _ = ps.set_field(field_idx, *v);
-    } else if let Some(v) = val.downcast_ref::<u64>() {
-        let _ = ps.set_field(field_idx, *v);
-    } else if let Some(variant_name) = val.downcast_ref::<SharedString>() {
-        // Try enum variant by name first, then fall back to SharedString field
-        if !try_set_enum_by_name(&mut ps, field_idx, variant_name) {
-            let _ = ps.set_field(field_idx, variant_name.clone());
-        }
-    } else if let Some(v) = val.downcast_ref::<String>() {
-        // Try enum variant by name first, then fall back to String field
-        if !try_set_enum_by_name(&mut ps, field_idx, v.as_str()) {
-            let _ = ps.set_field(field_idx, v.clone());
-        }
-    } else if let Some(v) = val.downcast_ref::<Hsla>() {
-        let _ = ps.set_field(field_idx, *v);
-    } else if let Some(v) = val.downcast_ref::<ComponentId>() {
-        let _ = ps.set_field(field_idx, *v);
+            rows
+        }),
+    })
+}
+
+fn scalar_as_f64(peek: &Peek<'_, '_>, scalar: ScalarType) -> Option<f64> {
+    match scalar {
+        ScalarType::F32 => peek.get::<f32>().ok().map(|v| *v as f64),
+        ScalarType::F64 => peek.get::<f64>().ok().copied(),
+        ScalarType::I32 => peek.get::<i32>().ok().map(|v| *v as f64),
+        ScalarType::I64 => peek.get::<i64>().ok().map(|v| *v as f64),
+        ScalarType::U32 => peek.get::<u32>().ok().map(|v| *v as f64),
+        ScalarType::U64 => peek.get::<u64>().ok().map(|v| *v as f64),
+        _ => None,
     }
 }
 
-/// Try to set a struct field to an enum variant by name.
-/// Returns `true` if the field was an enum and the variant was found.
-fn try_set_enum_by_name(
-    ps: &mut facet::PokeStruct<'_, '_>,
-    field_idx: usize,
-    variant_name: &str,
-) -> bool {
+fn scalar_write(scalar: ScalarType, v: f64) -> Option<FieldWrite> {
+    Some(match scalar {
+        ScalarType::F32 => FieldWrite::of(v as f32),
+        ScalarType::F64 => FieldWrite::of(v),
+        ScalarType::I32 => FieldWrite::of(v as i32),
+        ScalarType::I64 => FieldWrite::of(v as i64),
+        ScalarType::U32 => FieldWrite::of(v as u32),
+        ScalarType::U64 => FieldWrite::of(v as u64),
+        _ => return None,
+    })
+}
+
+fn make_scalar_reader<T: Facet<'static> + 'static>(
+    entity: &Entity<T>,
+    idx: usize,
+    scalar: ScalarType,
+) -> Arc<dyn Fn(&App) -> f64> {
+    let reader = make_reader(entity, idx);
+    Arc::new(move |cx| {
+        match scalar {
+            ScalarType::F32 => reader.get::<f32>(cx).map(|v| v as f64),
+            ScalarType::F64 => reader.get::<f64>(cx),
+            ScalarType::I32 => reader.get::<i32>(cx).map(|v| v as f64),
+            ScalarType::I64 => reader.get::<i64>(cx).map(|v| v as f64),
+            ScalarType::U32 => reader.get::<u32>(cx).map(|v| v as f64),
+            ScalarType::U64 => reader.get::<u64>(cx).map(|v| v as f64),
+            _ => None,
+        }
+        .unwrap_or(0.0)
+    })
+}
+
+/// Write an enum variant by name into field `idx` of a struct. Returns `true`
+/// on success; silently no-ops if the field isn't an enum or the variant
+/// doesn't exist.
+fn set_enum_by_name(ps: &mut PokeStruct<'_, '_>, field_idx: usize, variant_name: &str) -> bool {
     let Ok(field_poke) = ps.field(field_idx) else {
         return false;
     };
@@ -405,18 +331,13 @@ fn try_set_enum_by_name(
         return false;
     };
     let enum_repr = poke_enum.enum_repr();
-    let Some(variant) = poke_enum
-        .variants()
-        .iter()
-        .find(|v| v.name == variant_name)
-    else {
+    let Some(variant) = poke_enum.variants().iter().find(|v| v.name == variant_name) else {
         return false;
     };
     let Some(discriminant) = variant.discriminant else {
         return false;
     };
 
-    // Write the discriminant directly based on the enum representation
     let mut inner = poke_enum.into_inner();
     let data = inner.data_mut();
     match enum_repr {

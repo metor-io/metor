@@ -5,11 +5,11 @@
 ///   of a given type (e.g., `Hsla` → ColorRow, `ComponentId` → component picker)
 /// - **Type row builders**: produce the full row set for an entity type,
 ///   replacing the default reflect walk (e.g., Trace → reflected rows + Remove)
-use std::any::{Any, TypeId};
+use std::any::TypeId;
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use facet::{ConstTypeId, Facet, Peek};
+use facet::{ConstTypeId, Facet, Peek, PokeStruct};
 use gpui::{AnyEntity, App, AppContext, Entity, Global, Hsla, SharedString, Window};
 use metor_db::DB;
 use metor_proto::types::ComponentId;
@@ -25,21 +25,57 @@ pub struct FieldBuildCtx<'a> {
     pub db: &'a Arc<DB>,
     pub label: SharedString,
     pub field_name: &'static str,
-    /// Read the current value of this field from the entity (for live updates).
-    pub read_field: Arc<dyn Fn(&App) -> Box<dyn Any>>,
 }
 
-/// Type-erased setter: downcasted to the concrete field type by each factory.
-pub type FieldSetter = Arc<dyn Fn(Box<dyn Any>, &mut Window, &mut App)>;
+/// A pending typed write into a struct field. Built by a widget's callback
+/// and routed through the per-field [`FieldSetter`] that owns the target entity.
+pub struct FieldWrite(Box<dyn for<'a> FnOnce(&mut PokeStruct<'a, 'static>, usize)>);
+
+impl FieldWrite {
+    pub fn of<V: Facet<'static> + 'static>(value: V) -> Self {
+        Self(Box::new(move |ps, idx| {
+            let _ = ps.set_field(idx, value);
+        }))
+    }
+
+    pub(crate) fn apply(self, ps: &mut PokeStruct<'_, 'static>, idx: usize) {
+        (self.0)(ps, idx);
+    }
+}
+
+/// Per-field writer. The walker captures the typed entity + field index, so
+/// the widget only supplies the typed value via [`FieldWrite::of`].
+pub type FieldSetter = Arc<dyn Fn(FieldWrite, &mut Window, &mut App)>;
+
+/// Per-field live reader. Factories extract the current typed value without
+/// an eager `Box<dyn Any>` round-trip.
+type PeekVisitor<'v> = dyn FnMut(&Peek<'_, 'static>) + 'v;
+
+#[derive(Clone)]
+pub struct FieldReader(Arc<dyn for<'a, 'v> Fn(&'a App, &mut PeekVisitor<'v>)>);
+
+impl FieldReader {
+    pub(crate) fn new(f: Arc<dyn for<'a, 'v> Fn(&'a App, &mut PeekVisitor<'v>)>) -> Self {
+        Self(f)
+    }
+
+    pub fn get<V: Facet<'static> + Clone>(&self, cx: &App) -> Option<V> {
+        let mut out = None;
+        (self.0)(cx, &mut |peek| {
+            if let Ok(v) = peek.get::<V>() {
+                out = Some(v.clone());
+            }
+        });
+        out
+    }
+}
 
 /// Factory that produces a single InspectorRow for a field of a given type.
-pub type FieldWidgetFactory = Arc<
-    dyn Fn(&FieldBuildCtx, &Peek<'_, '_>, FieldSetter) -> Box<dyn InspectorRow>,
->;
+pub type FieldWidgetFactory =
+    Arc<dyn Fn(&FieldBuildCtx, &Peek<'_, '_>, FieldSetter, FieldReader) -> Box<dyn InspectorRow>>;
 
 /// Builder that produces the full row set for an entity type.
-pub type TypeRowBuilder =
-    Arc<dyn Fn(AnyEntity, &Arc<DB>, &App) -> Vec<Box<dyn InspectorRow>>>;
+pub type TypeRowBuilder = Arc<dyn Fn(AnyEntity, &Arc<DB>, &App) -> Vec<Box<dyn InspectorRow>>>;
 
 /// Per-field metadata that can't be expressed via Facet attributes.
 #[derive(Clone)]
@@ -105,7 +141,11 @@ impl WidgetRegistry {
         self.type_builders.get(&type_id)
     }
 
-    pub fn field_override(&self, type_id: ConstTypeId, field_name: &'static str) -> Option<&FieldOverride> {
+    pub fn field_override(
+        &self,
+        type_id: ConstTypeId,
+        field_name: &'static str,
+    ) -> Option<&FieldOverride> {
         self.field_overrides.get(&(type_id, field_name))
     }
 
@@ -125,14 +165,16 @@ impl WidgetRegistry {
     /// Register a handler for a `Vec<Entity<T>>` field type.
     /// When the walker sees this field type, it delegates to this handler
     /// instead of the generic scalar/enum/struct fallback.
-    pub fn register_entity_list<ParentT: Facet<'static> + 'static, ItemT: Facet<'static> + 'static>(
+    pub fn register_entity_list<
+        ParentT: Facet<'static> + 'static,
+        ItemT: Facet<'static> + 'static,
+    >(
         &mut self,
         db: Arc<DB>,
         get_list: fn(&ParentT) -> &Vec<Entity<ItemT>>,
         get_list_mut: fn(&mut ParentT) -> &mut Vec<Entity<ItemT>>,
         add_behavior: AddBehavior<ItemT>,
     ) {
-        let db = db.clone();
         let field_type_id = <Vec<Entity<ItemT>> as Facet>::SHAPE.id;
         self.entity_list_handlers.insert(
             field_type_id,
@@ -153,8 +195,10 @@ impl WidgetRegistry {
                             .enumerate()
                             .map(|(i, entity)| {
                                 let inner = entity.read(cx);
-                                let item_label = find_label_field::<ItemT>(inner)
-                                    .unwrap_or_else(|| SharedString::from(format!("Item {}", i + 1)));
+                                let item_label =
+                                    find_label_field::<ItemT>(inner).unwrap_or_else(|| {
+                                        SharedString::from(format!("Item {}", i + 1))
+                                    });
                                 let entity = entity.clone();
                                 let db = db.clone();
                                 let parent_for_remove = parent_for_add.clone();
@@ -164,7 +208,8 @@ impl WidgetRegistry {
                                     label: item_label,
                                     summary: SharedString::new_static(""),
                                     build_children: Arc::new(move |cx| {
-                                        let mut sub_rows = crate::reflect::rows_for_entity(&entity, &db, cx);
+                                        let mut sub_rows =
+                                            crate::reflect::rows_for_entity(&entity, &db, cx);
                                         let remove_parent = parent_for_remove.clone();
                                         sub_rows.push(Box::new(CommandRow {
                                             label: "Remove".into(),
@@ -254,6 +299,7 @@ impl WidgetRegistry {
         );
         self.register_time_series_plot_builder(db.clone());
         self.register_viewer3d_builder(db.clone());
+        self.register_monitor_builder(db.clone());
         self.register_dashboard_builder(db);
         self.register_field_override::<crate::elements::time_series::Trace>(
             "stroke_width",
@@ -270,34 +316,31 @@ impl WidgetRegistry {
     }
 
     fn register_hsla(&mut self) {
-        self.register_field_widget::<Hsla>(Arc::new(|ctx, peek, setter| {
+        self.register_field_widget::<Hsla>(Arc::new(|ctx, peek, setter, reader| {
             let color = *peek.get::<Hsla>().unwrap();
             let label = ctx.label.clone();
-            let read_field = ctx.read_field.clone();
-            let read_color: Arc<dyn Fn(&App) -> Hsla> = Arc::new(move |cx| {
-                let val = read_field(cx);
-                *val.downcast_ref::<Hsla>().unwrap_or(&color)
-            });
+            let read_color: Arc<dyn Fn(&App) -> Hsla> =
+                Arc::new(move |cx| reader.get::<Hsla>(cx).unwrap_or(color));
             Box::new(ColorRow {
                 label,
                 color,
                 read_color,
                 on_change: Arc::new(move |c, w, cx| {
-                    setter(Box::new(c), w, cx);
+                    setter(FieldWrite::of(c), w, cx);
                 }),
             })
         }));
     }
 
     fn register_shared_string(&mut self) {
-        self.register_field_widget::<SharedString>(Arc::new(|ctx, peek, setter| {
+        self.register_field_widget::<SharedString>(Arc::new(|ctx, peek, setter, _reader| {
             let value = peek.get::<SharedString>().unwrap().clone();
             let label = ctx.label.clone();
             Box::new(TextRow {
                 label,
                 value,
                 on_change: Arc::new(move |s, w, cx| {
-                    setter(Box::new(SharedString::from(s)), w, cx);
+                    setter(FieldWrite::of(SharedString::from(s)), w, cx);
                 }),
             })
         }));
@@ -305,7 +348,7 @@ impl WidgetRegistry {
 
     fn register_component_id(&mut self, db: Arc<DB>) {
         let db = db.clone();
-        self.register_field_widget::<ComponentId>(Arc::new(move |ctx, peek, setter| {
+        self.register_field_widget::<ComponentId>(Arc::new(move |ctx, peek, setter, _reader| {
             let current = *peek.get::<ComponentId>().unwrap();
             let current_name = db.with_state(|s| {
                 s.get_component_metadata(current)
@@ -316,9 +359,7 @@ impl WidgetRegistry {
             Box::new(NavRow {
                 label,
                 summary: current_name.unwrap_or_else(|| SharedString::from(format!("{}", current))),
-                build_children: Arc::new(move |cx| {
-                    build_component_picker(&db, &setter, cx)
-                }),
+                build_children: Arc::new(move |cx| build_component_picker(&db, &setter, cx)),
             })
         }));
     }
@@ -356,8 +397,7 @@ impl WidgetRegistry {
 
     fn register_viewer3d_builder(&mut self, _db: Arc<DB>) {
         self.register_type_builder::<Viewer3d>(Arc::new(|any_entity, db, cx| {
-            let viewer: Entity<Viewer3d> =
-                any_entity.downcast().expect("Viewer3d type mismatch");
+            let viewer: Entity<Viewer3d> = any_entity.downcast().expect("Viewer3d type mismatch");
             let mut rows = crate::reflect::default_rows_for_entity(&viewer, db, cx);
             // Append entity-level commands that aren't Facet fields
             let add_viewer = viewer.clone();
@@ -378,16 +418,20 @@ impl WidgetRegistry {
         }));
     }
 
+    fn register_monitor_builder(&mut self, _db: Arc<DB>) {
+        self.register_type_builder::<crate::elements::Monitor>(Arc::new(|any_entity, db, cx| {
+            let entity: Entity<crate::elements::Monitor> =
+                any_entity.downcast().expect("Monitor type mismatch");
+            crate::reflect::default_rows_for_entity(&entity, db, cx)
+        }));
+    }
+
     fn register_dashboard_builder(&mut self, _db: Arc<DB>) {
         self.register_type_builder::<crate::tiles::dashboard::DashboardPanel>(Arc::new(
             |any_entity, db, cx| {
                 let entity: Entity<crate::tiles::dashboard::DashboardPanel> =
                     any_entity.downcast().expect("DashboardPanel type mismatch");
-                let page = crate::tiles::dashboard::dashboard_palette_page(
-                    entity,
-                    db.clone(),
-                    cx,
-                );
+                let page = crate::tiles::dashboard::dashboard_palette_page(entity, db.clone(), cx);
                 crate::inspector::palette_page_to_rows(page)
             },
         ));
@@ -425,7 +469,7 @@ fn build_component_picker(
             Box::new(CommandRow {
                 label: SharedString::from(name),
                 callback: Arc::new(move |w, cx| {
-                    setter(Box::new(id), w, cx);
+                    setter(FieldWrite::of(id), w, cx);
                 }),
             }) as Box<dyn InspectorRow>
         })
@@ -476,14 +520,16 @@ fn build_trace_add_wizard(
                                 let base_idx = parent.read(cx).traces.len();
                                 let mut new_entities = Vec::with_capacity(elem_count);
                                 for (idx, elem_name) in names.iter().enumerate() {
-                                    let color = theme.line_colors[(base_idx + idx) % theme.line_colors.len()];
+                                    let color = theme.line_colors
+                                        [(base_idx + idx) % theme.line_colors.len()];
                                     let display = if elem_name.is_empty() {
                                         format!("[{}]", idx)
                                     } else {
                                         elem_name.clone()
                                     };
                                     let mut trace = Trace::new(comp_id, idx, color);
-                                    trace.label = SharedString::from(format!("{}.{}", comp_name, display));
+                                    trace.label =
+                                        SharedString::from(format!("{}.{}", comp_name, display));
                                     new_entities.push(cx.new(|_| trace));
                                 }
                                 parent.update(cx, |tsp, cx| {
@@ -514,7 +560,8 @@ fn build_trace_add_wizard(
                                 let color_idx = parent.read(cx).traces.len();
                                 let color = theme.line_colors[color_idx % theme.line_colors.len()];
                                 let mut trace = Trace::new(comp_id, idx, color);
-                                trace.label = SharedString::from(format!("{}.{}", comp_name, display));
+                                trace.label =
+                                    SharedString::from(format!("{}.{}", comp_name, display));
                                 let entity = cx.new(|_| trace);
                                 parent.update(cx, |tsp, cx| {
                                     tsp.traces.push(entity);
@@ -530,4 +577,3 @@ fn build_trace_add_wizard(
         })
         .collect()
 }
-

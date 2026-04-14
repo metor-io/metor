@@ -152,7 +152,6 @@ impl DashboardPanel {
         }
     }
 
-
     fn alloc_id(&mut self) -> WidgetId {
         let id = WidgetId(self.next_id);
         self.next_id += 1;
@@ -192,8 +191,7 @@ impl DashboardPanel {
             kind,
             config: config.clone(),
         };
-        let (view, widget_entity) =
-            create_widget_view(kind, &config, &self.db, cx);
+        let (view, widget_entity) = create_widget_view(kind, &config, &self.db, cx);
         self.widgets.push(widget);
         self.widget_views.insert(id, view);
         self.widget_entities.insert(id, widget_entity);
@@ -1239,8 +1237,7 @@ pub fn deserialize_dashboard(
     let mut widget_views = HashMap::new();
     let mut widget_entities = HashMap::new();
     for widget in &widgets {
-        let (view, widget_entity) =
-            create_widget_view(widget.kind, &widget.config, &db, cx);
+        let (view, widget_entity) = create_widget_view(widget.kind, &widget.config, &db, cx);
         widget_views.insert(widget.id, view);
         widget_entities.insert(widget.id, widget_entity);
     }

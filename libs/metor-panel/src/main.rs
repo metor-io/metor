@@ -10,11 +10,11 @@ use gpui::{
 };
 use metor_db::{DB, Server};
 use metor_panel::command_palette::PalettePage;
+use metor_panel::inspector::Inspector;
+use metor_panel::inspector::{InspectorMode, InspectorRequest};
 use metor_panel::pending_edits::{
     self, edit_value_page, pending_edits, pending_edits_mut, review_page,
 };
-use metor_panel::inspector::Inspector;
-use metor_panel::inspector::{InspectorMode, InspectorRequest};
 use metor_panel::tiles::panels::tile_palette_page;
 use metor_panel::tiles::{TileGroup, TileGroupEvent};
 use stellarator::{net::TcpListener, struc_con::stellar};
@@ -37,8 +37,7 @@ struct AppRoot {
     tiles: Entity<TileGroup>,
     inspector: Option<Entity<Inspector>>,
     pending_inspect: Option<PalettePage>,
-    pending_inspector_request:
-        Option<(Box<dyn metor_panel::tiles::PaneItemHandle>, Point<Pixels>)>,
+    pending_inspector_request: Option<(Box<dyn metor_panel::tiles::PaneItemHandle>, Point<Pixels>)>,
     pending_inspector_open: Option<InspectorRequest>,
     focus_handle: FocusHandle,
 }
@@ -82,7 +81,6 @@ impl AppRoot {
         }
     }
 
-
     fn make_on_open_inspector(
         root: Entity<AppRoot>,
     ) -> metor_panel::inspector::OpenInspectorCallback {
@@ -107,8 +105,14 @@ impl AppRoot {
         let on_inspect = Self::make_on_inspect(cx.entity().clone());
         let on_open_inspector = Self::make_on_open_inspector(cx.entity().clone());
         let pane = self.tiles.read(cx).panes()[0].clone();
-        let page =
-            tile_palette_page(self.db.clone(), pane, &self.tiles, on_inspect, Some(on_open_inspector), cx);
+        let page = tile_palette_page(
+            self.db.clone(),
+            pane,
+            &self.tiles,
+            on_inspect,
+            Some(on_open_inspector),
+            cx,
+        );
         self.open_palette(page, window, cx);
     }
 
@@ -176,6 +180,8 @@ impl AppRoot {
             inspector.focus_handle(cx).focus(window);
             self.inspector = Some(inspector);
             cx.notify();
+        } else {
+            println!("no rows for entity");
         }
     }
 
@@ -278,11 +284,7 @@ impl Render for AppRoot {
 }
 
 impl AppRoot {
-    fn render_titlebar(
-        &self,
-        theme: &metor_panel::theme::Theme,
-        cx: &App,
-    ) -> impl IntoElement {
+    fn render_titlebar(&self, theme: &metor_panel::theme::Theme, cx: &App) -> impl IntoElement {
         let pending = pending_edits(cx);
         let edit_count = pending.edits.len();
         let locked = pending.locked;
