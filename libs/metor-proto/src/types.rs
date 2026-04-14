@@ -32,6 +32,8 @@ use stellarator_buf::{IoBuf, Slice};
     postcard_schema::Schema,
 )]
 #[cfg_attr(feature = "bevy", derive(bevy::prelude::Component))]
+#[cfg_attr(feature = "facet", derive(facet::Facet))]
+#[cfg_attr(feature = "facet", facet(transparent))]
 #[repr(transparent)]
 pub struct ComponentId(pub u64);
 
@@ -564,7 +566,7 @@ pub struct PacketHeader {
     pub req_id: RequestId,
 }
 
-#[derive(TryFromBytes, Unaligned, Immutable, KnownLayout, Debug)]
+#[derive(TryFromBytes, Unaligned, Immutable, KnownLayout, Debug, IntoBytes)]
 #[repr(C)]
 pub struct Packet {
     pub header: PacketHeader,
