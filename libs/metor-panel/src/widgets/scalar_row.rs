@@ -35,20 +35,17 @@ impl InspectorRow for ScalarRow {
                     .child(self.label.clone()),
             )
             .child(
-                div()
-                    .min_w(px(60.0))
-                    .max_w(px(120.0))
-                    .child(
-                        div()
-                            .text_size(px(12.0))
-                            .text_color(theme.text_secondary)
-                            .child(value_text),
-                    ),
+                div().min_w(px(60.0)).max_w(px(120.0)).child(
+                    div()
+                        .text_size(px(12.0))
+                        .text_color(theme.text_secondary)
+                        .child(value_text),
+                ),
             )
             .into_any_element()
     }
 
-    fn activate(&self, _window: &mut Window, _cx: &mut App) -> RowAction {
+    fn activate(&mut self, _window: &mut Window, _cx: &mut App) -> RowAction {
         let on_change = self.on_change.clone();
         RowAction::StartEdit {
             current_text: format!("{}", self.value),

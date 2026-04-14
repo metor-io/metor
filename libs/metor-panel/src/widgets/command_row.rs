@@ -34,7 +34,7 @@ impl InspectorRow for CommandRow {
             .into_any_element()
     }
 
-    fn activate(&self, window: &mut Window, cx: &mut App) -> RowAction {
+    fn activate(&mut self, window: &mut Window, cx: &mut App) -> RowAction {
         (self.callback)(window, cx);
         RowAction::Dismiss
     }

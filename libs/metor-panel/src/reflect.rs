@@ -92,8 +92,7 @@ pub fn default_rows_for_any_entity(
             }
 
             let field_override = registry.field_override(parent_shape_id, field_def.name);
-            if let Some(row) =
-                build_default_row(&ctx, &field_peek, any_entity, idx, field_override)
+            if let Some(row) = build_default_row(&ctx, &field_peek, any_entity, idx, field_override)
             {
                 rows.push(row);
             }
@@ -205,7 +204,9 @@ fn build_default_row(
                 let read_entity = any_entity.clone();
                 return Some(Box::new(SliderRow {
                     label,
-                    read_value: Arc::new(move |cx| read_scalar(&read_entity, field_idx, scalar, cx)),
+                    read_value: Arc::new(move |cx| {
+                        read_scalar(&read_entity, field_idx, scalar, cx)
+                    }),
                     min,
                     max,
                     on_change: Arc::new(move |v, _w, cx| {
@@ -230,12 +231,19 @@ fn build_default_row(
         return Some(Box::new(TextRow {
             label: ctx.label.clone(),
             value: SharedString::from(val),
-            on_change: Arc::new(move |s, _w, cx| set_field::<String>(&any_entity, field_idx, s, cx)),
+            on_change: Arc::new(move |s, _w, cx| {
+                set_field::<String>(&any_entity, field_idx, s, cx)
+            }),
         }));
     }
 
     if let Ok(peek_option) = peek.clone().into_option() {
-        return Some(build_option_row(ctx, peek_option, any_entity.clone(), field_idx));
+        return Some(build_option_row(
+            ctx,
+            peek_option,
+            any_entity.clone(),
+            field_idx,
+        ));
     }
 
     if let Ok(peek_enum) = peek.clone().into_enum() {
@@ -284,7 +292,7 @@ fn build_option_row(
     Box::new(NavRow {
         label,
         summary,
-        build_children: Arc::new(move |_cx| {
+        build_children: Box::new(move |_cx| {
             let mut rows: Vec<Box<dyn InspectorRow>> = Vec::new();
 
             if inner_shape.id != <ComponentId as Facet>::SHAPE.id {
@@ -356,7 +364,11 @@ fn write_scalar(any_entity: &AnyEntity, idx: usize, scalar: ScalarType, v: f64, 
 /// Write an enum variant by name into field `idx` of a struct. Returns `true`
 /// on success; silently no-ops if the field isn't an enum or the variant
 /// doesn't exist.
-fn set_enum_by_name(ps: &mut PokeStruct<'_, 'static>, field_idx: usize, variant_name: &str) -> bool {
+fn set_enum_by_name(
+    ps: &mut PokeStruct<'_, 'static>,
+    field_idx: usize,
+    variant_name: &str,
+) -> bool {
     let Ok(field_poke) = ps.field(field_idx) else {
         return false;
     };

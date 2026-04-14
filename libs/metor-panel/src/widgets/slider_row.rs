@@ -155,7 +155,7 @@ impl InspectorRow for SliderRow {
             .into_any_element()
     }
 
-    fn activate(&self, _window: &mut Window, _cx: &mut App) -> RowAction {
+    fn activate(&mut self, _window: &mut Window, _cx: &mut App) -> RowAction {
         RowAction::Handled
     }
 }

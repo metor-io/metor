@@ -29,7 +29,8 @@ pub enum PickerArity {
 type TraceSelection = (String, ComponentId, usize);
 
 /// Callback that applies selected traces.
-type ApplyTraces = Arc<dyn Fn(Vec<(ComponentId, usize)>, &mut gpui::Window, &mut gpui::App) + Send + Sync>;
+type ApplyTraces =
+    Arc<dyn Fn(Vec<(ComponentId, usize)>, &mut gpui::Window, &mut gpui::App) + Send + Sync>;
 
 /// Callback that applies an element picker selection.
 type ApplyElement = Arc<dyn Fn(ComponentId, &mut gpui::Window, &mut gpui::App) + Send + Sync>;
@@ -148,8 +149,11 @@ impl TracePickerCtx {
                     PaletteAction::NextPage {
                         label: None,
                         page: Box::new(move || {
-                            let ctx = TracePickerCtx { on_apply, db };
-                            ctx.element_page(id, comp_name, selections)
+                            let ctx = TracePickerCtx {
+                                on_apply: on_apply.clone(),
+                                db: db.clone(),
+                            };
+                            ctx.element_page(id, comp_name.clone(), selections.clone())
                         }),
                     },
                 )
@@ -191,8 +195,10 @@ impl TracePickerCtx {
                 PaletteAction::NextPage {
                     label: Some(SharedString::from(component_name.clone())),
                     page: Box::new(move || {
+                        let on_apply = on_apply.clone();
+                        let db = db.clone();
                         let ctx = TracePickerCtx { on_apply, db };
-                        ctx.component_page(sels)
+                        ctx.component_page(sels.clone())
                     }),
                 },
             ));
@@ -216,8 +222,10 @@ impl TracePickerCtx {
                 PaletteAction::NextPage {
                     label: Some(pill_label),
                     page: Box::new(move || {
+                        let on_apply = on_apply.clone();
+                        let db = db.clone();
                         let ctx = TracePickerCtx { on_apply, db };
-                        ctx.component_page(sels)
+                        ctx.component_page(sels.clone())
                     }),
                 },
             ));

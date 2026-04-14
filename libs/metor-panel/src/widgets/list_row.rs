@@ -14,7 +14,7 @@ use crate::theme::theme;
 pub struct NavRow {
     pub label: SharedString,
     pub summary: SharedString,
-    pub build_children: Arc<dyn Fn(&gpui::App) -> Vec<Box<dyn InspectorRow>>>,
+    pub build_children: Box<dyn Fn(&gpui::App) -> Vec<Box<dyn InspectorRow>>>,
 }
 
 impl InspectorRow for NavRow {
@@ -55,7 +55,7 @@ impl InspectorRow for NavRow {
             .into_any_element()
     }
 
-    fn activate(&self, _window: &mut Window, cx: &mut App) -> RowAction {
+    fn activate(&mut self, _window: &mut Window, cx: &mut App) -> RowAction {
         RowAction::Cascade((self.build_children)(cx))
     }
 }

@@ -44,12 +44,8 @@ type PokeAdapterVisitor<'v> = dyn FnMut(Poke<'_, 'static>) + 'v;
 /// Adapter letting the reflection walker go from an [`AnyEntity`] to a typed
 /// [`Peek`] or [`Poke`] without the call site knowing the concrete type.
 pub struct EntityAdapter {
-    pub(crate) peek: Arc<
-        dyn for<'a, 'v> Fn(&'a AnyEntity, &'a App, &mut PeekAdapterVisitor<'v>),
-    >,
-    pub(crate) poke: Arc<
-        dyn for<'v> Fn(&AnyEntity, &mut App, &mut PokeAdapterVisitor<'v>),
-    >,
+    pub(crate) peek: Arc<dyn for<'a, 'v> Fn(&'a AnyEntity, &'a App, &mut PeekAdapterVisitor<'v>)>,
+    pub(crate) poke: Arc<dyn for<'v> Fn(&AnyEntity, &mut App, &mut PokeAdapterVisitor<'v>)>,
     pub shape_id: ConstTypeId,
 }
 
@@ -145,24 +141,22 @@ impl WidgetRegistry {
     /// Register an `AnyEntity`→`Peek`/`Poke` adapter for a Facet type so the
     /// reflection walker can inspect it without knowing its concrete `T`.
     pub fn register_inspectable<T: Facet<'static> + 'static>(&mut self) {
-        let peek: Arc<
-            dyn for<'a, 'v> Fn(&'a AnyEntity, &'a App, &mut PeekAdapterVisitor<'v>),
-        > = Arc::new(|any_entity, cx, visit| {
-            let Ok(entity) = any_entity.clone().downcast::<T>() else {
-                return;
-            };
-            let value = entity.read(cx);
-            let peek = Peek::new(value);
-            visit(&peek);
-        });
-        let poke: Arc<
-            dyn for<'v> Fn(&AnyEntity, &mut App, &mut PokeAdapterVisitor<'v>),
-        > = Arc::new(|any_entity, cx, visit| {
-            let Ok(entity) = any_entity.clone().downcast::<T>() else {
-                return;
-            };
-            entity.update(cx, |target, _cx| visit(Poke::new(target)));
-        });
+        let peek: Arc<dyn for<'a, 'v> Fn(&'a AnyEntity, &'a App, &mut PeekAdapterVisitor<'v>)> =
+            Arc::new(|any_entity, cx, visit| {
+                let Ok(entity) = any_entity.clone().downcast::<T>() else {
+                    return;
+                };
+                let value = entity.read(cx);
+                let peek = Peek::new(value);
+                visit(&peek);
+            });
+        let poke: Arc<dyn for<'v> Fn(&AnyEntity, &mut App, &mut PokeAdapterVisitor<'v>)> =
+            Arc::new(|any_entity, cx, visit| {
+                let Ok(entity) = any_entity.clone().downcast::<T>() else {
+                    return;
+                };
+                entity.update(cx, |target, _cx| visit(Poke::new(target)));
+            });
         self.entity_adapters.insert(
             TypeId::of::<T>(),
             Arc::new(EntityAdapter {
@@ -211,7 +205,7 @@ impl WidgetRegistry {
                 Box::new(NavRow {
                     label,
                     summary: SharedString::from(format!("{} items", item_count)),
-                    build_children: Arc::new(move |cx| {
+                    build_children: Box::new(move |cx| {
                         let mut rows: Vec<Box<dyn InspectorRow>> = items
                             .iter()
                             .enumerate()
@@ -229,7 +223,7 @@ impl WidgetRegistry {
                                 Box::new(NavRow {
                                     label: item_label,
                                     summary: SharedString::new_static(""),
-                                    build_children: Arc::new(move |cx| {
+                                    build_children: Box::new(move |cx| {
                                         let mut sub_rows =
                                             crate::reflect::rows_for_entity(&entity, &db, cx);
                                         let remove_parent = parent_for_remove.clone();
@@ -275,7 +269,7 @@ impl WidgetRegistry {
                                 rows.push(Box::new(NavRow {
                                     label: "Add".into(),
                                     summary: SharedString::new_static(""),
-                                    build_children: Arc::new(move |cx| {
+                                    build_children: Box::new(move |cx| {
                                         wizard(add_parent.clone().into_any(), &db, cx)
                                     }),
                                 }));
@@ -385,7 +379,7 @@ impl WidgetRegistry {
             Box::new(NavRow {
                 label,
                 summary: current_name.unwrap_or_else(|| SharedString::from(format!("{}", current))),
-                build_children: Arc::new(move |cx| {
+                build_children: Box::new(move |cx| {
                     build_component_picker(&db, any_entity.clone(), idx, cx)
                 }),
             })
@@ -487,7 +481,7 @@ fn build_trace_add_wizard(
             Box::new(NavRow {
                 label: SharedString::from(comp_name.clone()),
                 summary: SharedString::new_static(""),
-                build_children: Arc::new(move |cx| {
+                build_children: Box::new(move |cx| {
                     let elem_names = crate::trace_picker::element_names_for_component(&db, comp_id);
                     let elem_names = if elem_names.is_empty() {
                         vec!["value".to_string()]

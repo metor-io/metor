@@ -4,11 +4,11 @@ use gpui::{App, Context, Entity, IntoElement, Render, SharedString, Window, div,
 use metor_db::DB;
 use metor_proto::types::ComponentId;
 
+use super::dashboard::DashboardPanel;
 use crate::command_palette::{PaletteAction, PaletteItem, PalettePage};
 use crate::elements::time_series::OpenPageCallback;
 use crate::elements::viewer_3d::Viewer3d;
 use crate::elements::{ComponentTable, ComponentText, TimeSeriesPlot, new_component_table};
-use super::dashboard::DashboardPanel;
 
 use super::item::{PaneItem, PaneItemHandle};
 use super::pane::Pane;
@@ -130,7 +130,6 @@ impl PlotPanel {
             plot.set_on_open_page(cb);
         });
     }
-
 }
 
 impl Render for PlotPanel {
@@ -255,17 +254,38 @@ pub fn tile_palette_page(
         let on_open_inspector = on_open_inspector.clone();
         PaletteAction::NextPage {
             label: Some("New".into()),
-            page: Box::new(move || new_panel_page(db, pane, on_inspect, on_open_inspector)),
+            page: Box::new(move || {
+                new_panel_page(
+                    db.clone(),
+                    pane.clone(),
+                    on_inspect.clone(),
+                    on_open_inspector.clone(),
+                )
+            }),
         }
     })];
 
     // Only show "Edit Panel" if there are panels to edit
-    let edit_items = build_edit_items(db.clone(), tiles, on_inspect.clone(), cx);
-    if !edit_items.is_empty() {
+    let edit_labels = collect_edit_labels(tiles, cx);
+    if !edit_labels.is_empty() {
         items.push(PaletteItem::new("Edit Panel", {
             PaletteAction::NextPage {
                 label: Some("Edit".into()),
-                page: Box::new(move || PalettePage::new(edit_items).prompt("Select panel to edit")),
+                page: Box::new(move || {
+                    let edit_items: Vec<PaletteItem> = edit_labels
+                        .iter()
+                        .map(|label| {
+                            PaletteItem::new(
+                                label.clone(),
+                                PaletteAction::NextPage {
+                                    label: None,
+                                    page: Box::new(|| PalettePage::new(vec![])),
+                                },
+                            )
+                        })
+                        .collect();
+                    PalettePage::new(edit_items).prompt("Select panel to edit")
+                }),
             }
         }));
     }
@@ -276,7 +296,7 @@ pub fn tile_palette_page(
             label: Some("Update".into()),
             page: Box::new({
                 let db = db.clone();
-                move || crate::pending_edits::update_component_page(db)
+                move || crate::pending_edits::update_component_page(db.clone())
             }),
         },
     ));
@@ -373,8 +393,10 @@ fn new_panel_page(
             PaletteAction::NextPage {
                 label: Some("Text".into()),
                 page: Box::new(move || {
+                    let db_outer = db.clone();
+                    let pane = pane.clone();
                     component_picker_page(db.clone(), move |component_id, name, cx| {
-                        let db = db.clone();
+                        let db = db_outer.clone();
                         pane.update(cx, |pane, cx| {
                             let item: Box<dyn PaneItemHandle> =
                                 Box::new(cx.new(|cx| TextPanel::new(db, component_id, name, cx)));
@@ -435,11 +457,10 @@ fn component_picker_page(
         .into_iter()
         .map(|(id, name)| {
             let on_select = on_select.clone();
-            let name_clone = name.clone();
             PaletteItem::new(
-                SharedString::from(name),
+                SharedString::from(name.clone()),
                 PaletteAction::Execute(Box::new(move |_filter, _window, cx| {
-                    on_select(id, name_clone, cx);
+                    on_select(id, name.clone(), cx);
                 })),
             )
         })
@@ -449,14 +470,9 @@ fn component_picker_page(
 }
 
 /// Build palette items for all panels across all panes.
-fn build_edit_items(
-    db: Arc<DB>,
-    tiles: &Entity<super::TileGroup>,
-    on_inspect: Arc<dyn Fn(PalettePage, &mut Window, &mut App) + 'static>,
-    cx: &App,
-) -> Vec<PaletteItem> {
+fn collect_edit_labels(tiles: &Entity<super::TileGroup>, cx: &App) -> Vec<SharedString> {
     let panes = tiles.read(cx).panes().to_vec();
-    let mut items = Vec::new();
+    let mut labels = Vec::new();
 
     for (pane_ix, pane) in panes.iter().enumerate() {
         let pane_items = pane.read(cx).items();
@@ -467,24 +483,9 @@ fn build_edit_items(
             } else {
                 title
             };
-
-            let entity = item.entity_any(cx);
-            let db = db.clone();
-            items.push(PaletteItem::new(
-                label,
-                PaletteAction::NextPage {
-                    label: None,
-                    page: Box::new(move || {
-                        // This is a temporary bridge — eventually tile_palette_page
-                        // will produce InspectorRows directly
-                        PalettePage::new(vec![])
-                    }),
-                },
-            ));
+            labels.push(label);
         }
     }
 
-    items
+    labels
 }
-
-

@@ -60,8 +60,9 @@ impl InspectorRow for BoolRow {
             .into_any_element()
     }
 
-    fn activate(&self, window: &mut Window, cx: &mut App) -> RowAction {
-        (self.toggle)(!self.value, window, cx);
+    fn activate(&mut self, window: &mut Window, cx: &mut App) -> RowAction {
+        self.value = !self.value;
+        (self.toggle)(self.value, window, cx);
         RowAction::Handled
     }
 }

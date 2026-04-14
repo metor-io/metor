@@ -45,7 +45,7 @@ pub trait InspectorRow: 'static {
     ) -> AnyElement;
 
     /// What happens when this row is activated (Enter / click).
-    fn activate(&self, window: &mut Window, cx: &mut App) -> RowAction;
+    fn activate(&mut self, window: &mut Window, cx: &mut App) -> RowAction;
 }
 
 /// Result of activating an inspector row.

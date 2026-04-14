@@ -54,7 +54,7 @@ impl InspectorRow for ColorRow {
             .into_any_element()
     }
 
-    fn activate(&self, _window: &mut Window, _cx: &mut App) -> RowAction {
+    fn activate(&mut self, _window: &mut Window, _cx: &mut App) -> RowAction {
         let on_change = self.on_change.clone();
         let read = self.read_color.clone();
 

@@ -5,8 +5,8 @@
 use std::sync::Arc;
 
 use gpui::{
-    anchored, canvas, deferred, div, prelude::*, px, App, Bounds, Context, Corner, FocusHandle,
-    Focusable, IntoElement, KeyDownEvent, Pixels, Point, Render, SharedString, Window,
+    App, Bounds, Context, Corner, FocusHandle, Focusable, IntoElement, KeyDownEvent, Pixels, Point,
+    Render, SharedString, Window, anchored, canvas, deferred, div, prelude::*, px,
 };
 
 use crate::command_palette::{PaletteAction, PalettePage};
@@ -37,8 +37,7 @@ pub struct InspectorRequest {
 }
 
 /// Callback that opens an inspector.
-pub type OpenInspectorCallback =
-    Arc<dyn Fn(InspectorRequest, &mut Window, &mut App) + 'static>;
+pub type OpenInspectorCallback = Arc<dyn Fn(InspectorRequest, &mut Window, &mut App) + 'static>;
 
 /// One page in the inspector's navigation stack.
 struct InspectorPage {
@@ -177,7 +176,7 @@ impl Inspector {
     }
 
     fn activate_row(&mut self, row_idx: usize, window: &mut Window, cx: &mut Context<Self>) {
-        let page = self.pages.last().expect("page stack empty");
+        let page = self.pages.last_mut().expect("page stack empty");
         let action = page.rows[row_idx].activate(window, cx);
         self.handle_action(action, row_idx, window, cx);
     }
@@ -341,17 +340,16 @@ impl Inspector {
             }
         }
 
-        bar = bar.child(
-            div()
-                .flex_1()
-                .min_w(px(60.0))
-                .child(self.search.element()),
-        );
+        bar = bar.child(div().flex_1().min_w(px(60.0)).child(self.search.element()));
 
         bar
     }
 
-    fn render_panel(&mut self, window: &mut Window, cx: &mut Context<Self>) -> gpui::Stateful<gpui::Div> {
+    fn render_panel(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> gpui::Stateful<gpui::Div> {
         let theme = theme(cx);
         let indices = self.filtered_indices();
 
@@ -407,8 +405,7 @@ impl Inspector {
                     );
                 } else {
                     let page = self.current_page();
-                    let row_element =
-                        page.rows[row_idx].render_row(vis_ix, selected, window, cx);
+                    let row_element = page.rows[row_idx].render_row(vis_ix, selected, window, cx);
                     let row_idx_click = row_idx;
                     items_col = items_col.child(
                         div()
@@ -467,11 +464,10 @@ impl Render for Inspector {
 
         let panel = self.render_panel(window, cx);
 
-        let panel_with_dismiss = panel.on_mouse_down_out(cx.listener(
-            |this, _: &gpui::MouseDownEvent, window, _cx| {
+        let panel_with_dismiss =
+            panel.on_mouse_down_out(cx.listener(|this, _: &gpui::MouseDownEvent, window, _cx| {
                 this.dismiss(window);
-            },
-        ));
+            }));
 
         match self.mode {
             InspectorMode::Anchored(position) => {
@@ -542,7 +538,7 @@ impl InspectorRow for DefaultActionRow {
             .into_any_element()
     }
 
-    fn activate(&self, _window: &mut Window, _cx: &mut App) -> RowAction {
+    fn activate(&mut self, _window: &mut Window, _cx: &mut App) -> RowAction {
         let cb = self.callback.clone();
         RowAction::StartEdit {
             current_text: String::new(),
@@ -570,7 +566,7 @@ pub fn inspector_rows_to_page(rows: Vec<Box<dyn InspectorRow>>) -> PalettePage {
             crate::command_palette::PaletteItem::new(
                 label,
                 PaletteAction::Execute(Box::new(move |_, window, cx| {
-                    if let Some(row) = row.lock().unwrap().as_ref() {
+                    if let Some(row) = row.lock().unwrap().as_mut() {
                         row.activate(window, cx);
                     }
                 })),
@@ -586,37 +582,30 @@ pub fn inspector_rows_to_page(rows: Vec<Box<dyn InspectorRow>>) -> PalettePage {
 /// Inspector. `PaletteAction::Execute` becomes a `CommandRow`,
 /// `PaletteAction::NextPage` becomes a `NavRow` that cascades.
 pub fn palette_page_to_rows(page: PalettePage) -> Vec<Box<dyn InspectorRow>> {
-    let mut rows: Vec<Box<dyn InspectorRow>> = page.items
+    let mut rows: Vec<Box<dyn InspectorRow>> = page
+        .items
         .into_iter()
         .map(|item| {
             let label = item.label;
             match item.action {
-                PaletteAction::Execute(cb) => {
-                    let cb = std::sync::Mutex::new(Some(cb));
-                    Box::new(CommandRow {
-                        label,
-                        callback: Arc::new(move |w, cx| {
-                            if let Some(cb) = cb.lock().unwrap().take() {
-                                cb("", w, cx);
-                            }
-                        }),
-                    }) as Box<dyn InspectorRow>
-                }
-                PaletteAction::NextPage { label: page_label, page: page_fn } => {
-                    let page_fn = std::sync::Mutex::new(Some(page_fn));
-                    Box::new(NavRow {
-                        label,
-                        summary: page_label.unwrap_or_default(),
-                        build_children: Arc::new(move |_cx| {
-                            if let Some(page_fn) = page_fn.lock().unwrap().take() {
-                                let page = page_fn();
-                                palette_page_to_rows(page)
-                            } else {
-                                vec![]
-                            }
-                        }),
-                    }) as Box<dyn InspectorRow>
-                }
+                PaletteAction::Execute(cb) => Box::new(CommandRow {
+                    label,
+                    callback: Arc::new(move |w, cx| {
+                        cb("", w, cx);
+                    }),
+                }) as Box<dyn InspectorRow>,
+                PaletteAction::NextPage {
+                    label: page_label,
+                    page: page_fn,
+                } => Box::new(NavRow {
+                    label,
+                    summary: page_label.unwrap_or_default(),
+                    build_children: Box::new(move |_cx| {
+                        let page = page_fn();
+                        let rows = palette_page_to_rows(page);
+                        rows
+                    }),
+                }) as Box<dyn InspectorRow>,
             }
         })
         .collect();
@@ -627,13 +616,10 @@ pub fn palette_page_to_rows(page: PalettePage) -> Vec<Box<dyn InspectorRow>> {
         let label = default.label;
         match default.action {
             PaletteAction::Execute(cb) => {
-                let cb = std::sync::Mutex::new(Some(cb));
                 rows.push(Box::new(DefaultActionRow {
                     label,
                     callback: Arc::new(move |text, w, cx| {
-                        if let Some(cb) = cb.lock().unwrap().take() {
-                            cb(&text, w, cx);
-                        }
+                        cb(&text, w, cx);
                     }),
                 }));
             }

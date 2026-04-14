@@ -698,7 +698,7 @@ pub fn dashboard_palette_page(
         let db = db.clone();
         PaletteAction::NextPage {
             label: Some("Add".into()),
-            page: Box::new(move || add_widget_page(dashboard, db)),
+            page: Box::new(move || add_widget_page(dashboard.clone(), db.clone())),
         }
     }));
 
@@ -723,27 +723,31 @@ pub fn dashboard_palette_page(
 
     let widgets = &dashboard.read(cx).widgets;
     if !widgets.is_empty() {
-        let remove_items: Vec<PaletteItem> = widgets
+        let widget_infos: Vec<(WidgetId, SharedString)> = widgets
             .iter()
-            .map(|w| {
-                let widget_id = w.id;
-                let label = widget_display_label(w);
-                let dashboard = dashboard.clone();
-                PaletteItem::new(
-                    label,
-                    PaletteAction::Execute(Box::new(move |_, _, cx| {
-                        dashboard.update(cx, |this, cx| {
-                            this.remove_widget(widget_id, cx);
-                        });
-                    })),
-                )
-            })
+            .map(|w| (w.id, widget_display_label(w)))
             .collect();
 
         items.push(PaletteItem::new("Remove Widget", {
+            let dashboard = dashboard.clone();
             PaletteAction::NextPage {
                 label: Some("Remove".into()),
                 page: Box::new(move || {
+                    let remove_items: Vec<PaletteItem> = widget_infos
+                        .iter()
+                        .map(|(widget_id, label)| {
+                            let widget_id = *widget_id;
+                            let dashboard = dashboard.clone();
+                            PaletteItem::new(
+                                label.clone(),
+                                PaletteAction::Execute(Box::new(move |_, _, cx| {
+                                    dashboard.update(cx, |this, cx| {
+                                        this.remove_widget(widget_id, cx);
+                                    });
+                                })),
+                            )
+                        })
+                        .collect();
                     PalettePage::new(remove_items).prompt("Select widget to remove")
                 }),
             }
@@ -776,6 +780,7 @@ pub fn dashboard_palette_page(
         PaletteAction::NextPage {
             label: Some("Rename".into()),
             page: Box::new(move || {
+                let dashboard = dashboard.clone();
                 let apply = PaletteItem::new(
                     "Apply",
                     PaletteAction::Execute(Box::new(move |input, _, cx| {
@@ -813,7 +818,7 @@ fn add_widget_page(dashboard: Entity<DashboardPanel>, db: Arc<DB>) -> PalettePag
             PaletteAction::NextPage {
                 label: Some("Text".into()),
                 page: Box::new(move || {
-                    component_picker_for_widget(dashboard, db, WidgetKind::Text)
+                    component_picker_for_widget(dashboard.clone(), db.clone(), WidgetKind::Text)
                 }),
             }
         }),
@@ -831,7 +836,7 @@ fn add_widget_page(dashboard: Entity<DashboardPanel>, db: Arc<DB>) -> PalettePag
             PaletteAction::NextPage {
                 label: Some("Monitor".into()),
                 page: Box::new(move || {
-                    component_picker_for_widget(dashboard, db, WidgetKind::Monitor)
+                    component_picker_for_widget(dashboard.clone(), db.clone(), WidgetKind::Monitor)
                 }),
             }
         }),
@@ -839,7 +844,7 @@ fn add_widget_page(dashboard: Entity<DashboardPanel>, db: Arc<DB>) -> PalettePag
             let dashboard = dashboard.clone();
             PaletteAction::NextPage {
                 label: Some("Image".into()),
-                page: Box::new(move || image_path_page(dashboard)),
+                page: Box::new(move || image_path_page(dashboard.clone())),
             }
         }),
         PaletteItem::new("3D Viewer", {

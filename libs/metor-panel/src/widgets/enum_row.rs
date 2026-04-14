@@ -53,7 +53,7 @@ impl InspectorRow for EnumRow {
             .into_any_element()
     }
 
-    fn activate(&self, _window: &mut Window, _cx: &mut App) -> RowAction {
+    fn activate(&mut self, _window: &mut Window, _cx: &mut App) -> RowAction {
         let on_select = self.on_select.clone();
         let options = self.options.clone();
 
@@ -104,7 +104,7 @@ impl InspectorRow for EnumOptionRow {
             .into_any_element()
     }
 
-    fn activate(&self, window: &mut Window, cx: &mut App) -> RowAction {
+    fn activate(&mut self, window: &mut Window, cx: &mut App) -> RowAction {
         (self.on_select)(self.value.clone(), window, cx);
         RowAction::Dismiss
     }

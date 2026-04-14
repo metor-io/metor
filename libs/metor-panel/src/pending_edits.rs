@@ -178,7 +178,9 @@ pub fn update_component_page(db: Arc<DB>) -> PalettePage {
                 label,
                 PaletteAction::NextPage {
                     label: Some(label_for_page.clone()),
-                    page: Box::new(move || select_element_page(db, id, label_for_page)),
+                    page: Box::new(move || {
+                        select_element_page(db.clone(), id, label_for_page.clone())
+                    }),
                 },
             )
         })
@@ -224,11 +226,11 @@ fn select_element_page(
                     label: Some(name.clone()),
                     page: Box::new(move || {
                         edit_value_page(
-                            db,
+                            db.clone(),
                             EditRequest {
                                 component_id,
-                                component_name,
-                                element_names,
+                                component_name: component_name.clone(),
+                                element_names: element_names.clone(),
                                 element_index: idx,
                             },
                         )

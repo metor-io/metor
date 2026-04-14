@@ -34,13 +34,12 @@ impl PaletteItem {
 
 /// What happens when a palette item is selected.
 pub enum PaletteAction {
-    /// Run a one-shot callback. Receives the current filter text.
-    Execute(Box<dyn FnOnce(&str, &mut Window, &mut App) + 'static>),
+    Execute(Box<dyn Fn(&str, &mut Window, &mut App) + 'static>),
     /// Push a new page onto the palette stack. `label` is set on the
     /// *current* page so it renders as a pill chip in the input bar.
     NextPage {
         label: Option<SharedString>,
-        page: Box<dyn FnOnce() -> PalettePage + 'static>,
+        page: Box<dyn Fn() -> PalettePage + 'static>,
     },
 }
 
@@ -83,7 +82,6 @@ impl PalettePage {
         self
     }
 }
-
 
 /// The command palette view.
 pub struct CommandPalette {
@@ -165,8 +163,7 @@ impl CommandPalette {
             .enumerate()
             .filter_map(|(i, item)| {
                 let mut buf = Vec::new();
-                let haystack =
-                    nucleo_matcher::Utf32Str::new(&item.label, &mut buf);
+                let haystack = nucleo_matcher::Utf32Str::new(&item.label, &mut buf);
                 let score = pattern.score(haystack, &mut matcher)?;
                 Some((i, score))
             })
@@ -275,7 +272,6 @@ impl CommandPalette {
     fn handle_key_down(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut App) {
         let key = event.keystroke.key.as_str();
 
-
         match key {
             "escape" => {
                 self.dismiss(window);
@@ -302,7 +298,6 @@ impl CommandPalette {
             }
             _ => {}
         }
-
 
         let handled = self.text_field.handle_key_down(event, cx);
 
@@ -536,7 +531,6 @@ impl CommandPalette {
     }
 }
 
-
 impl Focusable for CommandPalette {
     fn focus_handle(&self, _cx: &App) -> FocusHandle {
         self.focus_handle.clone()
@@ -586,4 +580,3 @@ impl Render for CommandPalette {
         .into_any_element()
     }
 }
-
