@@ -1,17 +1,17 @@
 [workspace]
 resolver = "2"
 members = [
-    "libs/metor-ui",
+    #"libs/metor-ui",
     "libs/nox",
     "libs/nox-frames",
-    "apps/metor",
+    #"apps/metor",
     "libs/metor-fsw",
     "libs/metor-fsw/macros",
     "libs/metor-fsw/adcs",
     "libs/wmm",
     "libs/metor-proto",
     "libs/metor-proto/stellar",
-    "libs/metor-proto/bevy",
+    #"libs/metor-proto/bevy",
     "libs/metor-proto/wkt",
     "libs/metor-proto/bbq",
     "libs/metor-proto/frame",
@@ -32,7 +32,7 @@ members = [
     "libs/metor-proto/kdl",
     "examples/cube-sat"
 , "libs/metor-panel"]
-exclude = ["fsw/sensor-fw", "fsw/blackbox", "docs/memserve"]
+exclude = ["fsw/sensor-fw", "fsw/blackbox", "docs/memserve", "apps/metor"]
 
 [workspace.package]
 version = "0.14.2"
