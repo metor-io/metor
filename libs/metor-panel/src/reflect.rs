@@ -147,9 +147,13 @@ pub fn set_field<V: Facet<'static> + 'static>(
     let mut slot = Some(value);
     (adapter.poke)(any_entity, cx, &mut |poke| {
         let Some(v) = slot.take() else { return };
-        if let Ok(mut ps) = poke.into_struct() {
-            let _ = ps.set_field(field_idx, v);
-        }
+        let Ok(mut ps) = poke.into_struct() else {
+            return;
+        };
+        let Ok(mut field_poke) = ps.field(field_idx) else {
+            return;
+        };
+        let _ = field_poke.set(v);
     });
 }
 

@@ -155,7 +155,10 @@ impl WidgetRegistry {
                 let Ok(entity) = any_entity.clone().downcast::<T>() else {
                     return;
                 };
-                entity.update(cx, |target, _cx| visit(Poke::new(target)));
+                entity.update(cx, |target, cx| {
+                    visit(Poke::new(target));
+                    cx.notify();
+                });
             });
         self.entity_adapters.insert(
             TypeId::of::<T>(),
