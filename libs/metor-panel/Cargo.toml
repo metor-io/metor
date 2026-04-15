@@ -14,7 +14,7 @@ metor-proto.features = ["std", "facet"]
 metor-proto-wkt.path = "../metor-proto/wkt"
 metor-proto-wkt.features = ["nox"]
 nox.path = "../nox"
-facet = { path = "../../../facet/facet", features = ["reflect", "smallvec", "gpui"] }
+facet = { git = "https://github.com/metor-io/facet.git", branch = "sphw/facet-gpui", features = ["reflect", "smallvec", "gpui"] }
 postcard = "1"
 serde = { version = "1", features = ["derive"] }
 smallvec = "1"
