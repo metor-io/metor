@@ -67,22 +67,6 @@ bevy = { git = "https://github.com/bevyengine/bevy", rev = "5330b01ed6dfe8ee9ea9
     "reflect_auto_register",
 ] }
 
-[[example]]
-name = "component_text"
-path = "examples/component_text.rs"
-
-[[example]]
-name = "time_series_plot"
-path = "examples/time_series_plot.rs"
-
-[[example]]
-name = "component_table"
-path = "examples/component_table.rs"
-
-[[example]]
-name = "viewer_3d"
-path = "examples/viewer_3d.rs"
-
 [target.'cfg(target_os = "macos")'.dependencies]
 cocoa = "0.26"
 objc = "0.2"

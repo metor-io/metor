@@ -31,7 +31,6 @@ use stellarator_buf::{IoBuf, Slice};
     FromBytes,
     postcard_schema::Schema,
 )]
-#[cfg_attr(feature = "bevy", derive(bevy::prelude::Component))]
 #[cfg_attr(feature = "facet", derive(facet::Facet))]
 #[cfg_attr(feature = "facet", facet(transparent))]
 #[repr(transparent)]
@@ -71,7 +70,6 @@ impl Display for ComponentId {
     FromBytes,
     postcard_schema::Schema,
 )]
-#[cfg_attr(feature = "bevy", derive(bevy::prelude::Component))]
 #[repr(transparent)]
 pub struct EntityId(pub u64);
 

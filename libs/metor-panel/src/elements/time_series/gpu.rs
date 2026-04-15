@@ -635,11 +635,6 @@ impl PlotGpu {
             return false;
         }
 
-        let total_instances: u32 = plans.iter()
-            .flat_map(|p| &p.spans)
-            .map(|s| s.instance_end - s.instance_start)
-            .sum();
-
         let epoch_ns = self.cache.epoch_ns.unwrap_or(view.min_x as i64);
         let view_min_sec = ((view.min_x as i64 - epoch_ns) as f64 / NS_PER_SEC) as f32;
         let view_max_sec = ((view.max_x as i64 - epoch_ns) as f64 / NS_PER_SEC) as f32;
@@ -656,11 +651,6 @@ impl PlotGpu {
             viewport: [target.width as f32, target.height as f32],
             _pad: [0.0; 2],
         };
-        // Dump first few idx values and their data
-        for i in 0..self.idx_scratch.len().min(4) {
-            let idx = self.idx_scratch[i] as usize;
-        }
-
         self.ctx
             .queue
             .write_buffer(&self.view_buf, 0, bytemuck::bytes_of(&view_uniform));

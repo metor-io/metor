@@ -1,7 +1,7 @@
-/// Custom Facet attributes for the property inspector.
-///
-/// These attributes control how fields appear in the UI inspector and
-/// command palette. Applied via `#[facet(inspect::...)]` syntax.
+// Custom Facet attributes for the property inspector.
+//
+// These attributes control how fields appear in the UI inspector and
+// command palette. Applied via `#[facet(inspect::...)]` syntax.
 facet::define_attr_grammar! {
     ns "inspect";
     crate_path ::metor_panel::inspect;

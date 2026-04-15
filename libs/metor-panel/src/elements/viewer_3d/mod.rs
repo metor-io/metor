@@ -615,38 +615,6 @@ impl Viewer3d {
         }
     }
 
-    /// Bind one model's position to a component. Reconcile (re)spawns
-    /// the streaming task.
-    fn set_model_position_binding(
-        &mut self,
-        index: usize,
-        component_id: ComponentId,
-        cx: &mut Context<Self>,
-    ) {
-        if let Some(entry) = self.models.get(index).cloned() {
-            entry.update(cx, |model, cx| {
-                model.position_binding = Some(component_id);
-                cx.notify();
-            });
-        }
-    }
-
-    /// Bind one model's orientation to a component. Reconcile
-    /// (re)spawns the streaming task.
-    fn set_model_orientation_binding(
-        &mut self,
-        index: usize,
-        component_id: ComponentId,
-        cx: &mut Context<Self>,
-    ) {
-        if let Some(entry) = self.models.get(index).cloned() {
-            entry.update(cx, |model, cx| {
-                model.orientation_binding = Some(component_id);
-                cx.notify();
-            });
-        }
-    }
-
     /// Round a pixel size to a 64-pixel grid. The grid is a deliberate
     /// alignment: `64 * 4 = 256` bytes per row, which matches wgpu's
     /// `COPY_BYTES_PER_ROW_ALIGNMENT`. Readback rows need no padding and

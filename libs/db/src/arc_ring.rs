@@ -1,25 +1,10 @@
 use std::{
-    marker::PhantomData,
     mem::ManuallyDrop,
     ops::Deref,
     sync::{Arc, atomic::Ordering},
 };
 
 use crate::disruptor::ArcAtomic;
-
-pub struct ArcProj<A, T: ?Sized, F = for<'a> fn(&'a A) -> &'a T> {
-    arc: Arc<A>,
-    phantom: PhantomData<T>,
-    proj: F,
-}
-
-impl<A, T: ?Sized, F: Fn(&A) -> &T> std::ops::Deref for ArcProj<A, T, F> {
-    type Target = T;
-
-    fn deref(&self) -> &Self::Target {
-        (self.proj)(&*self.arc)
-    }
-}
 
 pub struct AtomicStack<T> {
     head: ArcAtomic<AtomicNode<T>>,

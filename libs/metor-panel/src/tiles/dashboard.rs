@@ -135,7 +135,7 @@ pub struct DashboardPanel {
 }
 
 impl DashboardPanel {
-    pub fn new(db: Arc<DB>, cx: &mut Context<Self>) -> Self {
+    pub fn new(db: Arc<DB>, _cx: &mut Context<Self>) -> Self {
         Self {
             db,
             title: "Dashboard".into(),
@@ -1293,7 +1293,7 @@ pub fn deserialize_dashboard(
         widget_entities.insert(widget.id, widget_entity);
     }
 
-    cx.new(|cx| DashboardPanel {
+    cx.new(|_cx| DashboardPanel {
         db,
         title: SharedString::from(title),
         widgets,

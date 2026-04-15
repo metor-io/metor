@@ -93,7 +93,6 @@ impl PaneItem for TablePanel {
 
 /// Tile panel wrapping a [`TimeSeriesPlot`], with inspection support for trace configuration.
 pub struct PlotPanel {
-    db: Arc<DB>,
     inner: Entity<TimeSeriesPlot>,
     line_plot: Entity<LinePlot>,
 }
@@ -105,14 +104,9 @@ impl PlotPanel {
         elements: &[usize],
         cx: &mut Context<Self>,
     ) -> Self {
-        let inner =
-            cx.new(|cx| TimeSeriesPlot::from_component(db.clone(), component_id, elements, cx));
+        let inner = cx.new(|cx| TimeSeriesPlot::from_component(db, component_id, elements, cx));
         let line_plot = inner.read(cx).line_plot().clone();
-        Self {
-            db,
-            inner,
-            line_plot,
-        }
+        Self { inner, line_plot }
     }
 
     /// Create an empty plot panel, ready to be configured via the inspector.
@@ -126,13 +120,9 @@ impl PlotPanel {
         traces: Vec<crate::elements::time_series::Trace>,
         cx: &mut Context<Self>,
     ) -> Self {
-        let inner = cx.new(|cx| TimeSeriesPlot::new(db.clone(), traces, cx));
+        let inner = cx.new(|cx| TimeSeriesPlot::new(db, traces, cx));
         let line_plot = inner.read(cx).line_plot().clone();
-        Self {
-            db,
-            inner,
-            line_plot,
-        }
+        Self { inner, line_plot }
     }
 
     /// The inner TimeSeriesPlot entity.
@@ -169,17 +159,14 @@ impl PaneItem for PlotPanel {
 /// Tile panel wrapping a [`Viewer3d`] with inspector support.
 pub struct Viewer3dPanel {
     inner: Entity<Viewer3d>,
-    db: Arc<DB>,
     label: SharedString,
 }
 
 impl Viewer3dPanel {
     pub fn new(db: Arc<DB>, cx: &mut Context<Self>) -> Self {
-        let db_clone = db.clone();
-        let inner = cx.new(|cx| Viewer3d::with_db(db_clone, cx));
+        let inner = cx.new(|cx| Viewer3d::with_db(db, cx));
         Self {
             inner,
-            db,
             label: "3D Viewer".into(),
         }
     }

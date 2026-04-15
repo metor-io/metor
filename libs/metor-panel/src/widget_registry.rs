@@ -16,9 +16,7 @@ use metor_proto::types::ComponentId;
 
 use crate::elements::time_series::{LinePlot, Trace};
 use crate::elements::viewer_3d::Viewer3d;
-use crate::widgets::{
-    BoolRow, ColorRow, CommandRow, EnumRow, InspectorRow, NavRow, ScalarRow, SliderRow, TextRow,
-};
+use crate::widgets::{ColorRow, CommandRow, InspectorRow, NavRow, TextRow};
 
 /// Context passed to field widget factories.
 pub struct FieldBuildCtx<'a> {
@@ -187,7 +185,7 @@ impl WidgetRegistry {
         ItemT: Facet<'static> + 'static,
     >(
         &mut self,
-        db: Arc<DB>,
+        _db: Arc<DB>,
         get_list: fn(&ParentT) -> &Vec<Entity<ItemT>>,
         get_list_mut: fn(&mut ParentT) -> &mut Vec<Entity<ItemT>>,
         add_behavior: AddBehavior<ItemT>,

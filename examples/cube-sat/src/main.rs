@@ -15,7 +15,7 @@ use nox::{
     SpatialTransform, Vec3, Vector, Vector3, array::Quat, rk4, tensor,
 };
 use rand_distr::Distribution;
-use stellarator::{io::SplitExt, net::TcpStream, rent, struc_con::stellar};
+use stellarator::{io::SplitExt, net::TcpStream, rent};
 use tracing_subscriber::EnvFilter;
 use zerocopy::{Immutable, IntoBytes, KnownLayout};
 
@@ -43,6 +43,7 @@ pub struct Sim {
     reaction_wheels: [ReactionWheel; 3],
     sensors: Sensors,
     control_torque: Vec3<f64>,
+    tick_time: f64,
 }
 
 #[derive(AsVTable, Debug, Clone, Immutable, KnownLayout, Metadatatize, IntoBytes, Default)]
@@ -251,6 +252,7 @@ pub struct FSW {
     pub control: Control,
     pub mode: Mode,
     pub start_epoch: Timestamp,
+    pub tick_time: f64,
 }
 
 #[derive(AsVTable, Metadatatize, Debug, Clone, Copy, IntoBytes, KnownLayout, Immutable)]
@@ -314,6 +316,7 @@ impl Default for FSW {
             control: Control::default(),
             mode: Mode::HilPoint,
             start_epoch: Timestamp::now(),
+            tick_time: 0.0,
         }
     }
 }
@@ -403,6 +406,7 @@ impl Default for CubeSat {
             ],
             control_torque: Vec3::zeros(),
             body,
+            tick_time: 0.0,
         };
         let control = FSW::default();
         Self { sim, fsw: control }
@@ -448,12 +452,16 @@ impl Sim {
 }
 
 fn tick(mut cubesat: CubeSat) -> CubeSat {
+    let sim_start = Instant::now();
     cubesat.sim = cubesat.sim.update();
     cubesat.sim = rk4::<f64, Sim, DU, _>(DT, &cubesat.sim, |sim: &Sim| -> DU { sim.du() });
+    cubesat.sim.tick_time = sim_start.elapsed().as_secs_f64();
+    let fsw_start = Instant::now();
     cubesat.fsw = cubesat.fsw.update(&cubesat.sim.sensors);
     cubesat
         .sim
         .set_reaction_wheel_torque(cubesat.fsw.control.torque_set_point);
+    cubesat.fsw.tick_time = fsw_start.elapsed().as_secs_f64();
     cubesat
 }
 
@@ -507,8 +515,8 @@ pub async fn main() -> anyhow::Result<()> {
                         if update_component.id == ComponentId::new("cube_sat.fsw.mode") {
                             let mode = value.buf.as_buf()[0];
                             cube_sat.fsw.mode = match mode {
-                                0 => Mode::HilPoint,
-                                1 => Mode::NadirPoint,
+                                0 => Mode::NadirPoint,
+                                1 => Mode::HilPoint,
                                 _ => continue,
                             };
                         }

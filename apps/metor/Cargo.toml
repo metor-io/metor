@@ -1,8 +1,8 @@
 [package]
 name = "metor"
 license = "MIT OR Apache-2.0"
-version.workspace = true
-repository.workspace = true
+#version.workspace = true
+#repository.workspace = true
 edition = "2024"
 authors = ["sascha@metor.io"]
 

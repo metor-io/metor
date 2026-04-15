@@ -389,6 +389,7 @@ fn main() {
 }
 
 #[cfg(target_os = "macos")]
+#[allow(deprecated)]
 fn set_dock_icon() {
     use cocoa::appkit::NSImage;
     use cocoa::base::{id, nil};

@@ -8,7 +8,7 @@
 use std::sync::Arc;
 
 use facet::{Facet, FieldFlags, Peek, PokeStruct, ScalarType};
-use gpui::{AnyEntity, App, AppContext, Entity, SharedString};
+use gpui::{AnyEntity, App, Entity, SharedString};
 use metor_db::DB;
 use metor_proto::types::ComponentId;
 

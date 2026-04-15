@@ -18,7 +18,6 @@ mod std {
     use alloc::vec::Vec;
 
     #[derive(Default)]
-    #[cfg_attr(feature = "bevy", derive(bevy::prelude::Resource))]
     pub struct HashMapRegistry {
         pub map: HashMap<PacketId, VTable>,
     }

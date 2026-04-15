@@ -10,7 +10,7 @@ use std::{
     path::Path,
     slice::{self, SliceIndex},
     sync::{
-        Arc, Mutex,
+        Arc,
         atomic::{AtomicU64, Ordering},
     },
 };
