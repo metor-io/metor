@@ -39,8 +39,8 @@ impl ComponentRow {
             })
             .collect();
 
-        let sparkline = cx.new(|_| LinePlot::new());
-        sparkline.update(cx, |sp, cx| sp.bind_traces(db.clone(), traces, cx));
+        let sparkline = cx.new(|cx| LinePlot::new(db.clone(), cx));
+        sparkline.update(cx, |sp, cx| sp.bind_traces(traces, cx));
 
         // Tiny notify task: wake the row's render on every new sample so
         // the value cell re-renders. Y-bounds tracking lives inside the

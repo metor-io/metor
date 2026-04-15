@@ -3,25 +3,33 @@
 //! [`LinePlot`] is the single gpui entity every plot site in metor-panel
 //! embeds to actually draw lines. It owns:
 //!
-//! - the per-trace config, resolved [`Component`], and incrementally
-//!   scanned y-bounds;
-//! - the user-interactive view overrides ([`set_view_override`] for
-//!   drag/pan, per-axis y-min/y-max overrides, [`TimeRangeBehavior`]);
+//! - the canonical list of trace entities and their reflected
+//!   view-override knobs (`x_range`, y-axis overrides, `custom_title`);
+//! - a keyed map of per-trace tracking state (resolved [`Component`],
+//!   incrementally scanned y-bounds, last-scan watermark);
 //! - the [`PlotRenderState`] that drives the GPU renderer;
-//! - one tracking task per trace that waits for the trace's component
-//!   to appear in the DB and then grows its y-bounds incrementally as
-//!   new samples arrive.
+//! - one tracking task per trace keyed by [`gpui::EntityId`], spawned
+//!   and dropped as the `traces` Vec changes.
 //!
 //! Parents (`Monitor`, `ComponentRow`, `TimeSeriesPlot`) construct one
 //! `Entity<LinePlot>`, push traces via [`bind_traces`], and embed
 //! `self.sparkline.clone()` as a child in their render tree. They do
 //! not touch canvas closures, GPU state, or y-bounds math directly.
+//!
+//! Mutations to the reflected fields (including traces) go through
+//! `cx.notify`, which triggers [`Self::reconcile`] — this is where new
+//! trace ids get trackers spawned, removed ids get trackers dropped,
+//! and scalar changes invalidate the interactive view override.
 
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
-use gpui::{Bounds, Context, Corners, IntoElement, Pixels, Render, Window, canvas, prelude::*};
+use gpui::{
+    Bounds, Context, Corners, Entity, EntityId, IntoElement, Pixels, Render, SharedString, Window,
+    canvas, prelude::*,
+};
 use metor_db::{Component, DB};
-use metor_proto::types::Timestamp;
+use metor_proto::types::{ComponentId, Timestamp};
 
 use super::bounds::PlotBounds;
 use super::gpu::{LineDraw, PlotRenderState};
@@ -29,106 +37,91 @@ use super::{Trace, expand_y_bounds};
 use crate::offset_parse::TimeRangeBehavior;
 use crate::wait_for_component;
 
-/// Per-trace state inside a [`LinePlot`]. `component` is `None` until
-/// the tracker task's [`wait_for_component`] resolves.
-struct Entry {
-    config: gpui::Entity<Trace>,
+/// Per-trace tracking state keyed by the trace entity's [`EntityId`].
+/// Independent of the position in `LinePlot::traces`, so reordering or
+/// inserting traces does not invalidate already-resolved components or
+/// y-bounds watermarks.
+struct TraceTracking {
     component: Option<Component>,
     y_bounds: Option<(f64, f64)>,
     last_scan_ts: Option<Timestamp>,
 }
 
-impl Entry {
-    /// Build a borrowing [`LineDraw`] for the GPU submit, or `None` if
-    /// the component hasn't resolved yet or the trace is hidden.
-    fn as_line_draw(&self, cx: &gpui::App) -> Option<LineDraw<'_>> {
-        let config = self.config.read(cx);
-        if !config.visible {
-            return None;
+impl TraceTracking {
+    fn new() -> Self {
+        Self {
+            component: None,
+            y_bounds: None,
+            last_scan_ts: None,
         }
-        let component = self.component.as_ref()?;
-        Some(LineDraw {
-            component_id: config.component_id,
-            component,
-            element_index: config.element_index,
-            style: config.style,
-            color: config.color,
-            stroke_width: config.stroke_width,
-        })
     }
+}
+
+/// Snapshot of the scalar view-override fields used to detect edits
+/// between reconciles (so inspector writes reset `view_override`).
+#[derive(Clone, Copy, PartialEq)]
+struct OverrideSnapshot {
+    y_min: Option<f64>,
+    y_max: Option<f64>,
+    x_range: TimeRangeBehavior,
 }
 
 /// A self-contained GPU-accelerated line plot. Holds its own render
 /// state, trace list, per-trace y-bounds trackers, and view-override
 /// knobs. Implements [`Render`] so parents just `.child(entity.clone())`
 /// it into their own trees.
+#[derive(facet::Facet)]
 pub struct LinePlot {
-    entries: Vec<Entry>,
+    pub traces: Vec<Entity<Trace>>,
+    pub x_range: TimeRangeBehavior,
+    pub y_min_override: Option<f64>,
+    pub y_max_override: Option<f64>,
+    pub custom_title: Option<SharedString>,
+
+    #[facet(opaque)]
+    db: Arc<DB>,
+    #[facet(opaque)]
+    tracking: HashMap<EntityId, TraceTracking>,
+    #[facet(opaque)]
+    tasks: HashMap<EntityId, gpui::Task<()>>,
+    #[facet(opaque)]
     view_override: Option<PlotBounds>,
-    y_min_override: Option<f64>,
-    y_max_override: Option<f64>,
-    x_range: TimeRangeBehavior,
+    #[facet(opaque)]
+    last_overrides: OverrideSnapshot,
+    #[facet(opaque)]
+    title_cache: SharedString,
+    #[facet(opaque)]
     gpu_state: PlotRenderState,
-    /// One per trace, dropped and respawned on every [`bind_traces`].
-    _tasks: Vec<gpui::Task<()>>,
 }
 
 impl LinePlot {
-    pub fn new() -> Self {
+    pub fn new(db: Arc<DB>, cx: &mut Context<Self>) -> Self {
+        cx.observe_self(Self::reconcile).detach();
         Self {
-            entries: Vec::new(),
-            view_override: None,
+            traces: Vec::new(),
+            x_range: TimeRangeBehavior::default(),
             y_min_override: None,
             y_max_override: None,
-            x_range: TimeRangeBehavior::default(),
+            custom_title: None,
+            db,
+            tracking: HashMap::new(),
+            tasks: HashMap::new(),
+            view_override: None,
+            last_overrides: OverrideSnapshot {
+                y_min: None,
+                y_max: None,
+                x_range: TimeRangeBehavior::default(),
+            },
+            title_cache: "Plot".into(),
             gpu_state: PlotRenderState::default(),
-            _tasks: Vec::new(),
         }
     }
 
-    /// Replace all traces from raw Trace values. Creates Entity handles internally.
-    /// Used by Monitor's sparkline which doesn't need entity ownership.
-    pub fn bind_traces(&mut self, db: Arc<DB>, traces: Vec<Trace>, cx: &mut Context<Self>) {
-        let entities: Vec<gpui::Entity<Trace>> =
-            traces.into_iter().map(|t| cx.new(|_| t)).collect();
-        self.bind_trace_entities(db, entities, cx);
-    }
-
-    /// Replace all traces from pre-existing Entity<Trace> handles and restart tracking tasks.
-    pub fn bind_trace_entities(
-        &mut self,
-        db: Arc<DB>,
-        trace_entities: Vec<gpui::Entity<Trace>>,
-        cx: &mut Context<Self>,
-    ) {
-        self.entries = trace_entities
-            .into_iter()
-            .map(|config| Entry {
-                config,
-                component: None,
-                y_bounds: None,
-                last_scan_ts: None,
-            })
-            .collect();
-        // Clear any interactive view override so the freshly-rebound
-        // plot reverts to auto-fit until the user drags again.
-        self.view_override = None;
-        self._tasks = (0..self.entries.len())
-            .map(|idx| Self::spawn_tracker(db.clone(), idx, cx))
-            .collect();
+    /// Replace all traces from raw [`Trace`] values. Used by `Monitor`
+    /// and `ComponentRow` which don't need entity ownership.
+    pub fn bind_traces(&mut self, traces: Vec<Trace>, cx: &mut Context<Self>) {
+        self.traces = traces.into_iter().map(|t| cx.new(|_| t)).collect();
         cx.notify();
-    }
-
-    /// Mutate one trace's config in place (style / color / visible /
-    /// stroke_width / label). Does not touch the tracker task.
-    pub fn update_trace<F>(&mut self, index: usize, f: F, cx: &mut Context<Self>)
-    where
-        F: FnOnce(&mut Trace),
-    {
-        if let Some(entry) = self.entries.get(index) {
-            entry.config.update(cx, |config, _| f(config));
-            cx.notify();
-        }
     }
 
     pub fn set_view_override(&mut self, view: Option<PlotBounds>, cx: &mut Context<Self>) {
@@ -138,40 +131,46 @@ impl LinePlot {
         }
     }
 
-    pub fn set_y_min_override(&mut self, value: Option<f64>, cx: &mut Context<Self>) {
-        if self.y_min_override != value {
-            self.y_min_override = value;
-            self.view_override = None;
-            cx.notify();
+    pub fn db(&self) -> &Arc<DB> {
+        &self.db
+    }
+
+    /// Reconcile `tracking` + `tasks` with the current `traces` Vec,
+    /// invalidate the title cache, and clear the interactive view
+    /// override if a scalar knob changed. Runs on every self-notify.
+    fn reconcile(&mut self, cx: &mut Context<Self>) {
+        let current_ids: HashSet<EntityId> = self.traces.iter().map(|e| e.entity_id()).collect();
+        let had_tracking_keys: Vec<EntityId> = self.tracking.keys().copied().collect();
+        for id in had_tracking_keys {
+            if !current_ids.contains(&id) {
+                self.tracking.remove(&id);
+                self.tasks.remove(&id);
+            }
         }
-    }
-
-    pub fn set_y_max_override(&mut self, value: Option<f64>, cx: &mut Context<Self>) {
-        if self.y_max_override != value {
-            self.y_max_override = value;
-            self.view_override = None;
-            cx.notify();
+        for trace in &self.traces {
+            let id = trace.entity_id();
+            if !self.tracking.contains_key(&id) {
+                self.tracking.insert(id, TraceTracking::new());
+                let task = Self::spawn_tracker(id, trace.clone(), self.db.clone(), cx);
+                self.tasks.insert(id, task);
+            }
         }
-    }
 
-    pub fn set_x_range(&mut self, behavior: TimeRangeBehavior, cx: &mut Context<Self>) {
-        if self.x_range != behavior {
-            self.x_range = behavior;
+        let snapshot = OverrideSnapshot {
+            y_min: self.y_min_override,
+            y_max: self.y_max_override,
+            x_range: self.x_range,
+        };
+        if snapshot != self.last_overrides {
             self.view_override = None;
-            cx.notify();
+            self.last_overrides = snapshot;
         }
-    }
 
-    pub fn x_range(&self) -> TimeRangeBehavior {
-        self.x_range
-    }
-
-    pub fn y_min_override(&self) -> Option<f64> {
-        self.y_min_override
-    }
-
-    pub fn y_max_override(&self) -> Option<f64> {
-        self.y_max_override
+        self.title_cache = if let Some(custom) = &self.custom_title {
+            custom.clone()
+        } else {
+            derive_title(&self.traces, &self.db, cx)
+        };
     }
 
     /// The view currently used for rendering: the interactive override
@@ -186,11 +185,14 @@ impl LinePlot {
         let mut y_max = f64::NEG_INFINITY;
         let mut any_time = false;
         let mut any_y = false;
-        for entry in &self.entries {
-            if !entry.config.read(cx).visible {
+        for trace in &self.traces {
+            if !trace.read(cx).visible {
                 continue;
             }
-            let Some(comp) = &entry.component else {
+            let Some(tracking) = self.tracking.get(&trace.entity_id()) else {
+                continue;
+            };
+            let Some(comp) = &tracking.component else {
                 continue;
             };
             if let Some(s) = comp.time_series.start_timestamp() {
@@ -201,7 +203,7 @@ impl LinePlot {
                 end = end.max(l.timestamp().0 as f64);
                 any_time = true;
             }
-            if let Some((lo, hi)) = entry.y_bounds {
+            if let Some((lo, hi)) = tracking.y_bounds {
                 y_min = y_min.min(lo);
                 y_max = y_max.max(hi);
                 any_y = true;
@@ -224,8 +226,11 @@ impl LinePlot {
     pub fn data_start(&self) -> Option<f64> {
         let mut start = f64::INFINITY;
         let mut any = false;
-        for entry in &self.entries {
-            let Some(comp) = &entry.component else {
+        for trace in &self.traces {
+            let Some(tracking) = self.tracking.get(&trace.entity_id()) else {
+                continue;
+            };
+            let Some(comp) = &tracking.component else {
                 continue;
             };
             if let Some(s) = comp.time_series.start_timestamp() {
@@ -236,35 +241,44 @@ impl LinePlot {
         any.then_some(start)
     }
 
-    /// Iterate over all trace entity handles, resolved or not.
-    pub fn traces(&self) -> impl Iterator<Item = &gpui::Entity<Trace>> {
-        self.entries.iter().map(|e| &e.config)
+    pub fn traces(&self) -> &[Entity<Trace>] {
+        &self.traces
     }
 
-    pub fn trace(&self, idx: usize) -> Option<&gpui::Entity<Trace>> {
-        self.entries.get(idx).map(|e| &e.config)
+    pub fn trace(&self, idx: usize) -> Option<&Entity<Trace>> {
+        self.traces.get(idx)
     }
 
     pub fn trace_count(&self) -> usize {
-        self.entries.len()
+        self.traces.len()
     }
 
     pub fn is_empty(&self) -> bool {
-        self.entries.is_empty()
+        self.traces.is_empty()
     }
 
-    fn spawn_tracker(db: Arc<DB>, idx: usize, cx: &mut Context<Self>) -> gpui::Task<()> {
+    /// The display title: custom title if set, otherwise derived from
+    /// the current trace list. Recomputed only when traces or
+    /// `custom_title` change (via [`Self::reconcile`]).
+    pub fn title(&self) -> SharedString {
+        self.title_cache.clone()
+    }
+
+    fn spawn_tracker(
+        id: EntityId,
+        trace: Entity<Trace>,
+        db: Arc<DB>,
+        cx: &mut Context<Self>,
+    ) -> gpui::Task<()> {
         cx.spawn(async move |this, cx| {
-            let trace_id = match this.update(cx, |lp, cx| {
-                lp.entries.get(idx).map(|e| e.config.read(cx).component_id)
-            }) {
-                Ok(Some(id)) => id,
-                _ => return,
+            let trace_id = match this.update(cx, |_, cx| trace.read(cx).component_id) {
+                Ok(id) => id,
+                Err(_) => return,
             };
             let component = wait_for_component(&db, trace_id).await;
             let installed = this.update(cx, |lp, cx| {
-                if let Some(entry) = lp.entries.get_mut(idx) {
-                    entry.component = Some(component.clone());
+                if let Some(tracking) = lp.tracking.get_mut(&id) {
+                    tracking.component = Some(component.clone());
                     cx.notify();
                     true
                 } else {
@@ -277,17 +291,21 @@ impl LinePlot {
 
             loop {
                 let result = this.update(cx, |lp, cx| {
-                    let Some(entry) = lp.entries.get_mut(idx) else {
+                    let Some(tracking) = lp.tracking.get_mut(&id) else {
                         return false;
                     };
-                    let Some(comp) = entry.component.as_ref() else {
+                    let Some(comp) = tracking.component.as_ref() else {
                         return false;
                     };
                     let latest_ts = comp.time_series.latest().map(|n| n.timestamp());
-                    let element_index = entry.config.read(cx).element_index;
-                    entry.y_bounds =
-                        expand_y_bounds(comp, &[element_index], entry.y_bounds, entry.last_scan_ts);
-                    entry.last_scan_ts = latest_ts;
+                    let element_index = trace.read(cx).element_index;
+                    tracking.y_bounds = expand_y_bounds(
+                        comp,
+                        &[element_index],
+                        tracking.y_bounds,
+                        tracking.last_scan_ts,
+                    );
+                    tracking.last_scan_ts = latest_ts;
                     cx.notify();
                     true
                 });
@@ -297,12 +315,6 @@ impl LinePlot {
                 component.time_series.wait().await;
             }
         })
-    }
-}
-
-impl Default for LinePlot {
-    fn default() -> Self {
-        Self::new()
     }
 }
 
@@ -316,9 +328,24 @@ impl Render for LinePlot {
                     .update(cx, |lp, cx| {
                         if let Some(view) = lp.effective_view(cx) {
                             let draws: Vec<LineDraw<'_>> = lp
-                                .entries
+                                .traces
                                 .iter()
-                                .filter_map(|e| e.as_line_draw(cx))
+                                .filter_map(|trace| {
+                                    let config = trace.read(cx);
+                                    if !config.visible {
+                                        return None;
+                                    }
+                                    let tracking = lp.tracking.get(&trace.entity_id())?;
+                                    let component = tracking.component.as_ref()?;
+                                    Some(LineDraw {
+                                        component_id: config.component_id,
+                                        component,
+                                        element_index: config.element_index,
+                                        style: config.style,
+                                        color: config.color,
+                                        stroke_width: config.stroke_width,
+                                    })
+                                })
                                 .collect();
                             if !draws.is_empty()
                                 && let Some(handle) =
@@ -361,4 +388,49 @@ fn bounds_tuple(b: PlotBounds) -> (u64, u64, u64, u64) {
         b.max_x.to_bits(),
         b.max_y.to_bits(),
     )
+}
+
+/// Group traces by component and format as `"comp"` (all elements) or
+/// `"comp[x,y]"` (subset). Multiple components join with `", "`.
+fn derive_title(traces: &[Entity<Trace>], db: &Arc<DB>, cx: &gpui::App) -> SharedString {
+    if traces.is_empty() {
+        return "Plot".into();
+    }
+
+    let mut groups: HashMap<ComponentId, Vec<usize>> = HashMap::new();
+    let mut order: Vec<ComponentId> = Vec::new();
+    for trace in traces {
+        let t = trace.read(cx);
+        let id = t.component_id;
+        groups
+            .entry(id)
+            .or_insert_with(|| {
+                order.push(id);
+                Vec::new()
+            })
+            .push(t.element_index);
+    }
+
+    let parts: Vec<String> = order
+        .iter()
+        .map(|comp_id| {
+            let indexes = &groups[comp_id];
+            let all_elements = crate::trace_picker::element_names_for_component(db, *comp_id);
+            let comp_name = db
+                .with_state(|s| s.get_component_metadata(*comp_id).map(|m| m.name.clone()))
+                .unwrap_or_default();
+
+            if indexes.len() == all_elements.len() {
+                comp_name
+            } else {
+                let names: Vec<&str> = indexes
+                    .iter()
+                    .filter_map(|&i| all_elements.get(i).map(|s| s.as_str()))
+                    .collect();
+                format!("{}[{}]", comp_name, names.join(","))
+            }
+        })
+        .collect();
+
+    SharedString::from(parts.join(", "))
 }

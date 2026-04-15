@@ -62,7 +62,7 @@ impl Monitor {
             (name, unit, element_names)
         });
 
-        let sparkline = cx.new(|_| LinePlot::new());
+        let sparkline = cx.new(|cx| LinePlot::new(db.clone(), cx));
 
         // If the component is already in the DB, bind traces inline so
         // the sparkline is never momentarily empty. Otherwise the text
@@ -71,7 +71,7 @@ impl Monitor {
         if let Some(comp) = db.with_state(|state| state.get_component(component_id).cloned()) {
             let element_count: usize = comp.schema.dim.iter().product::<usize>().max(1);
             let traces = build_traces(component_id, element_count, &line_colors);
-            sparkline.update(cx, |sp, cx| sp.bind_traces(db.clone(), traces, cx));
+            sparkline.update(cx, |sp, cx| sp.bind_traces(traces, cx));
         }
 
         let task = cx.spawn({
@@ -90,7 +90,7 @@ impl Monitor {
                     let _ = sparkline.update(cx, |sp, cx| {
                         if element_count != sp.trace_count() {
                             let traces = build_traces(component_id, element_count, &line_colors);
-                            sp.bind_traces(db.clone(), traces, cx);
+                            sp.bind_traces(traces, cx);
                         }
                     });
                 }

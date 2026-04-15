@@ -14,7 +14,7 @@ use gpui::{AnyEntity, App, AppContext, Entity, Global, Hsla, SharedString};
 use metor_db::DB;
 use metor_proto::types::ComponentId;
 
-use crate::elements::time_series::{TimeSeriesPlot, Trace};
+use crate::elements::time_series::{LinePlot, Trace};
 use crate::elements::viewer_3d::Viewer3d;
 use crate::widgets::{
     BoolRow, ColorRow, CommandRow, EnumRow, InspectorRow, NavRow, ScalarRow, SliderRow, TextRow,
@@ -300,10 +300,10 @@ impl WidgetRegistry {
         self.register_shared_string();
         self.register_component_id(db.clone());
         self.register_inspectable::<crate::elements::Monitor>();
-        self.register_entity_list::<TimeSeriesPlot, Trace>(
+        self.register_entity_list::<LinePlot, Trace>(
             db.clone(),
-            |tsp| &tsp.traces,
-            |tsp| &mut tsp.traces,
+            |lp| &lp.traces,
+            |lp| &mut lp.traces,
             AddBehavior::Wizard(Arc::new(|parent, db, cx| {
                 build_trace_add_wizard(parent, db, cx)
             })),
@@ -503,7 +503,7 @@ fn build_trace_add_wizard(
                         rows.push(Box::new(CommandRow {
                             label: SharedString::from(format!("{} (all)", comp_name)),
                             callback: Arc::new(move |_w, cx| {
-                                let parent: Entity<TimeSeriesPlot> =
+                                let parent: Entity<LinePlot> =
                                     parent.clone().downcast().expect("parent type mismatch");
                                 let theme = crate::theme::theme(cx);
                                 let base_idx = parent.read(cx).traces.len();
@@ -521,8 +521,8 @@ fn build_trace_add_wizard(
                                         SharedString::from(format!("{}.{}", comp_name, display));
                                     new_entities.push(cx.new(|_| trace));
                                 }
-                                parent.update(cx, |tsp, cx| {
-                                    tsp.traces.extend(new_entities);
+                                parent.update(cx, |lp, cx| {
+                                    lp.traces.extend(new_entities);
                                     cx.notify();
                                 });
                             }),
@@ -543,7 +543,7 @@ fn build_trace_add_wizard(
                         rows.push(Box::new(CommandRow {
                             label: SharedString::from(label_text),
                             callback: Arc::new(move |_w, cx| {
-                                let parent: Entity<TimeSeriesPlot> =
+                                let parent: Entity<LinePlot> =
                                     parent.clone().downcast().expect("parent type mismatch");
                                 let theme = crate::theme::theme(cx);
                                 let color_idx = parent.read(cx).traces.len();
@@ -552,8 +552,8 @@ fn build_trace_add_wizard(
                                 trace.label =
                                     SharedString::from(format!("{}.{}", comp_name, display));
                                 let entity = cx.new(|_| trace);
-                                parent.update(cx, |tsp, cx| {
-                                    tsp.traces.push(entity);
+                                parent.update(cx, |lp, cx| {
+                                    lp.traces.push(entity);
                                     cx.notify();
                                 });
                             }),

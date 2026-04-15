@@ -120,7 +120,6 @@ impl Render for ResizingWidget {
 /// Free-form canvas dashboard where widgets are positioned at pixel coordinates.
 pub struct DashboardPanel {
     db: Arc<DB>,
-    self_entity: Entity<DashboardPanel>,
     title: SharedString,
     widgets: Vec<DashboardWidget>,
     widget_views: HashMap<WidgetId, AnyView>,
@@ -139,7 +138,6 @@ impl DashboardPanel {
     pub fn new(db: Arc<DB>, cx: &mut Context<Self>) -> Self {
         Self {
             db,
-            self_entity: cx.entity().clone(),
             title: "Dashboard".into(),
             widgets: Vec::new(),
             widget_views: HashMap::new(),
@@ -405,14 +403,12 @@ impl DashboardPanel {
 
         if self.editing {
             let widget_id = widget.id;
-            let entity = self.self_entity.clone();
             let widget_rect = widget.rect;
-
             // Full-size interaction blocker — absorbs all clicks so the
             // inner widget content cannot be interacted with in edit mode.
             // Right-click opens the widget's inspector.
             // The move-zone drag and edge-zone resizes are layered above.
-            let blocker_entity = self.self_entity.clone();
+            let blocker_entity = cx.entity();
             let blocker_widget_id = widget.id;
             container = container.child(
                 div()
@@ -433,6 +429,7 @@ impl DashboardPanel {
                     ),
             );
 
+            let entity = cx.entity();
             // Center move zone — inset from edges so resize zones sit on top.
             container = container.child(
                 div()
@@ -481,7 +478,7 @@ impl DashboardPanel {
         &self,
         mut container: gpui::Stateful<gpui::Div>,
         widget: &DashboardWidget,
-        _cx: &mut Context<Self>,
+        cx: &mut Context<Self>,
     ) -> gpui::Stateful<gpui::Div> {
         let e = EDGE_ZONE_PX;
         let c = CORNER_ZONE_PX;
@@ -593,7 +590,7 @@ impl DashboardPanel {
         for (ix, zone) in zones.iter().enumerate() {
             let widget_id = widget.id;
             let original_rect = widget.rect;
-            let dashboard = self.self_entity.clone();
+            let dashboard = cx.entity();
             let edge = zone.edge;
 
             let mut handle = div()
@@ -1137,7 +1134,7 @@ impl Render for DashboardPanel {
         // Uses on_click (requires .id()) which only fires when this element
         // is the actual click target, not when a child widget is clicked.
         if self.editing {
-            let entity = self.self_entity.clone();
+            let entity = cx.entity();
             canvas_div = canvas_div.on_click(move |_, _, cx| {
                 entity.update(cx, |this, cx| {
                     this.selected = None;
@@ -1249,7 +1246,6 @@ pub fn deserialize_dashboard(
 
     cx.new(|cx| DashboardPanel {
         db,
-        self_entity: cx.entity().clone(),
         title: SharedString::from(title),
         widgets,
         widget_views,

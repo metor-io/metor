@@ -501,35 +501,17 @@ impl Trace {
 /// Interactive time-series plot with multi-trace support, pan, and zoom.
 ///
 /// All the line-drawing state (traces, per-trace y-bounds tracking,
-/// view overrides, GPU render state) lives inside [`LinePlot`] — this
-/// entity is just the outer container that manages user interaction
-/// (drag, zoom, double-click reset), the inspector, and the axis
-/// chrome painted around the `LinePlot` child.
-#[derive(facet::Facet)]
+/// view overrides, GPU render state, title) lives inside [`LinePlot`],
+/// which is also the inspectable Facet target. This entity is just
+/// the outer container that manages user interaction (drag, zoom,
+/// double-click reset) and the axis chrome painted around the
+/// `LinePlot` child.
 pub struct TimeSeriesPlot {
-    #[facet(opaque)]
-    db: Arc<DB>,
-    #[facet(opaque)]
     line_plot: Entity<LinePlot>,
-
-    // Inspectable fields — reflected by the walker
-    pub custom_title: Option<SharedString>,
-    pub x_range: TimeRangeBehavior,
-    pub y_min_override: Option<f64>,
-    pub y_max_override: Option<f64>,
-    pub traces: Vec<Entity<Trace>>,
-
-    #[facet(opaque)]
-    bound_trace_ids: Vec<gpui::EntityId>,
-    #[facet(opaque)]
     drag_start: Option<Point<Pixels>>,
-    #[facet(opaque)]
     drag_start_view: Option<PlotBounds>,
-    #[facet(opaque)]
     drag_zone: AxisZone,
-    #[facet(opaque)]
     last_plot_area: Option<Bounds<Pixels>>,
-    #[facet(opaque)]
     on_open_page: Option<OpenPageCallback>,
 }
 
@@ -539,23 +521,16 @@ pub type OpenPageCallback =
 
 impl TimeSeriesPlot {
     pub fn new(db: Arc<DB>, traces: Vec<Trace>, cx: &mut Context<Self>) -> Self {
-        let trace_entities: Vec<Entity<Trace>> =
-            traces.into_iter().map(|t| cx.new(|_| t)).collect();
-        let line_plot = cx.new(|_| LinePlot::new());
-        line_plot.update(cx, |lp, cx| {
-            lp.bind_trace_entities(db.clone(), trace_entities.clone(), cx);
+        let line_plot = cx.new(|cx| {
+            let mut lp = LinePlot::new(db, cx);
+            lp.bind_traces(traces, cx);
+            lp
         });
-        cx.observe_self(Self::on_notify).detach();
-        let bound_trace_ids = trace_entities.iter().map(|e| e.entity_id()).collect();
+        // Re-render legend + chrome when the LinePlot's traces or view
+        // change (e.g., legend-toggle of `visible`, inspector edits).
+        cx.observe(&line_plot, |_, _, cx| cx.notify()).detach();
         Self {
-            db,
             line_plot,
-            custom_title: None,
-            x_range: TimeRangeBehavior::default(),
-            y_min_override: None,
-            y_max_override: None,
-            traces: trace_entities,
-            bound_trace_ids,
             drag_start: None,
             drag_start_view: None,
             drag_zone: AxisZone::Plot,
@@ -566,22 +541,6 @@ impl TimeSeriesPlot {
 
     pub fn set_on_open_page(&mut self, cb: OpenPageCallback) {
         self.on_open_page = Some(cb);
-    }
-
-    fn on_notify(&mut self, cx: &mut Context<Self>) {
-        println!("on notify");
-        let current_ids: Vec<gpui::EntityId> = self.traces.iter().map(|e| e.entity_id()).collect();
-        if current_ids != self.bound_trace_ids {
-            self.rebind_traces(cx);
-        }
-    }
-
-    /// Re-synchronise the [`LinePlot`] with the current `traces` Vec.
-    pub fn rebind_traces(&mut self, cx: &mut Context<Self>) {
-        self.bound_trace_ids = self.traces.iter().map(|e| e.entity_id()).collect();
-        self.line_plot.update(cx, |lp, cx| {
-            lp.bind_trace_entities(self.db.clone(), self.traces.clone(), cx);
-        });
     }
 
     /// Convenience: create a plot for a single component with the given element
@@ -632,77 +591,8 @@ impl TimeSeriesPlot {
         &self.line_plot
     }
 
-    pub fn db(&self) -> &Arc<DB> {
-        &self.db
-    }
-
-    pub fn set_custom_title(&mut self, title: Option<SharedString>) {
-        self.custom_title = title;
-    }
-
-    pub fn set_traces(&mut self, traces: Vec<Trace>, cx: &mut Context<Self>) {
-        let trace_entities: Vec<Entity<Trace>> =
-            traces.into_iter().map(|t| cx.new(|_| t)).collect();
-        self.traces = trace_entities.clone();
-        let db = self.db.clone();
-        self.line_plot.update(cx, |lp, cx| {
-            lp.bind_trace_entities(db, trace_entities, cx);
-        });
-        cx.notify();
-    }
-
-    /// Returns the display title: custom title if set, otherwise derived from traces.
-    ///
-    /// Groups traces by component. If all elements are present, shows just the
-    /// component name. Otherwise shows `component[x,y]`.
     pub fn title(&self, cx: &gpui::App) -> SharedString {
-        if let Some(title) = &self.custom_title {
-            return title.clone();
-        }
-
-        use std::collections::HashMap;
-        let mut groups: HashMap<ComponentId, Vec<usize>> = HashMap::new();
-        let mut order: Vec<ComponentId> = Vec::new();
-        for trace in &self.traces {
-            let t = trace.read(cx);
-            let id = t.component_id;
-            groups
-                .entry(id)
-                .or_insert_with(|| {
-                    order.push(id);
-                    Vec::new()
-                })
-                .push(t.element_index);
-        }
-
-        if order.is_empty() {
-            return "Plot".into();
-        }
-
-        let parts: Vec<String> = order
-            .iter()
-            .map(|comp_id| {
-                let indexes = &groups[comp_id];
-                let all_elements =
-                    crate::trace_picker::element_names_for_component(&self.db, *comp_id);
-                let comp_name = self
-                    .db
-                    .with_state(|s| s.get_component_metadata(*comp_id).map(|m| m.name.clone()))
-                    .unwrap_or_default();
-
-                if indexes.len() == all_elements.len() {
-                    comp_name
-                } else {
-                    let names: Vec<&str> = indexes
-                        .iter()
-                        .filter_map(|&i| all_elements.get(i).map(|s| s.as_str()))
-                        .collect();
-                    format!("{}[{}]", comp_name, names.join(","))
-                }
-            })
-            .collect();
-
-        SharedString::from(parts.join(", "))
+        self.line_plot.read(cx).title()
     }
 
     /// Read the current effective view from the embedded `LinePlot`.
@@ -714,25 +604,22 @@ impl TimeSeriesPlot {
 
     /// Reset all view overrides so the plot snaps back to auto-fit.
     fn reset_view(&mut self, cx: &mut Context<Self>) {
-        self.x_range = TimeRangeBehavior::default();
-        self.y_min_override = None;
-        self.y_max_override = None;
-        let line_plot = self.line_plot.clone();
-        line_plot.update(cx, |lp, cx| {
+        self.line_plot.update(cx, |lp, cx| {
+            lp.x_range = TimeRangeBehavior::default();
+            lp.y_min_override = None;
+            lp.y_max_override = None;
             lp.set_view_override(None, cx);
-            lp.set_x_range(TimeRangeBehavior::default(), cx);
-            lp.set_y_min_override(None, cx);
-            lp.set_y_max_override(None, cx);
+            cx.notify();
         });
-        cx.notify();
     }
 }
 
 impl Render for TimeSeriesPlot {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = crate::theme::theme(cx);
-        let trace_configs: Vec<Trace> = self.traces.iter().map(|e| e.read(cx).clone()).collect();
-        let show_legend = trace_configs.len() >= 2;
+        let trace_entities: Vec<Entity<Trace>> =
+            self.line_plot.read(cx).traces().to_vec();
+        let show_legend = trace_entities.len() >= 2;
 
         let underlay_lp = self.line_plot.clone();
         let overlay_lp = self.line_plot.clone();
@@ -887,7 +774,8 @@ impl Render for TimeSeriesPlot {
                 .px(px(Y_LABEL_WIDTH + PADDING))
                 .bg(legend_bg);
 
-            for (i, trace) in trace_configs.iter().enumerate() {
+            for trace_entity in trace_entities.iter() {
+                let trace = trace_entity.read(cx);
                 let visible = trace.visible;
                 let opacity = if visible { 1.0 } else { 0.3 };
                 let color = Hsla {
@@ -898,6 +786,9 @@ impl Render for TimeSeriesPlot {
                     a: opacity,
                     ..theme.text_secondary
                 };
+                let label = trace.label.clone();
+                let toggle_target = trace_entity.clone();
+                let inspect_target = trace_entity.clone();
 
                 legend_row = legend_row.child(
                     div()
@@ -909,21 +800,19 @@ impl Render for TimeSeriesPlot {
                         .on_mouse_down(
                             MouseButton::Left,
                             cx.listener(move |this, _event: &gpui::MouseDownEvent, _window, cx| {
-                                let line_plot = this.line_plot.clone();
-                                line_plot.update(cx, |lp, cx| {
-                                    lp.update_trace(i, |t| t.visible = !t.visible, cx);
+                                toggle_target.update(cx, |t, cx| {
+                                    t.visible = !t.visible;
+                                    cx.notify();
                                 });
+                                this.line_plot.update(cx, |_, cx| cx.notify());
                             }),
                         )
                         .on_mouse_down(
                             MouseButton::Right,
-                            cx.listener(move |this, event: &gpui::MouseDownEvent, window, cx| {
-                                let Some(trace_entity) = this.traces.get(i).cloned() else {
-                                    return;
-                                };
+                            cx.listener(move |_this, event: &gpui::MouseDownEvent, window, cx| {
                                 window.dispatch_action(
                                     Box::new(crate::inspector::InspectEntity {
-                                        entity: trace_entity.into_any(),
+                                        entity: inspect_target.clone().into_any(),
                                         position: event.position,
                                     }),
                                     cx,
@@ -935,7 +824,7 @@ impl Render for TimeSeriesPlot {
                             div()
                                 .text_size(px(LABEL_FONT_SIZE))
                                 .text_color(text_color)
-                                .child(trace.label.clone()),
+                                .child(label),
                         ),
                 );
             }

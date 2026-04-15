@@ -6,7 +6,7 @@ use metor_proto::types::ComponentId;
 
 use super::dashboard::DashboardPanel;
 use crate::command_palette::{PaletteAction, PaletteItem, PalettePage};
-use crate::elements::time_series::OpenPageCallback;
+use crate::elements::time_series::{LinePlot, OpenPageCallback};
 use crate::elements::viewer_3d::Viewer3d;
 use crate::elements::{ComponentTable, ComponentText, TimeSeriesPlot, new_component_table};
 
@@ -94,6 +94,7 @@ impl PaneItem for TablePanel {
 pub struct PlotPanel {
     db: Arc<DB>,
     inner: Entity<TimeSeriesPlot>,
+    line_plot: Entity<LinePlot>,
 }
 
 impl PlotPanel {
@@ -105,13 +106,23 @@ impl PlotPanel {
     ) -> Self {
         let inner =
             cx.new(|cx| TimeSeriesPlot::from_component(db.clone(), component_id, elements, cx));
-        Self { db, inner }
+        let line_plot = inner.read(cx).line_plot().clone();
+        Self {
+            db,
+            inner,
+            line_plot,
+        }
     }
 
     /// Create an empty plot panel, ready to be configured via the inspector.
     pub fn empty(db: Arc<DB>, cx: &mut Context<Self>) -> Self {
         let inner = cx.new(|cx| TimeSeriesPlot::new(db.clone(), vec![], cx));
-        Self { db, inner }
+        let line_plot = inner.read(cx).line_plot().clone();
+        Self {
+            db,
+            inner,
+            line_plot,
+        }
     }
 
     /// The inner TimeSeriesPlot entity, for use with `palette_page_for_inspectable`.
@@ -153,7 +164,7 @@ impl PaneItem for PlotPanel {
     }
 
     fn inspectable_entity(&self) -> Option<gpui::AnyEntity> {
-        Some(self.inner.clone().into_any())
+        Some(self.line_plot.clone().into_any())
     }
 }
 
