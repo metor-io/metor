@@ -232,13 +232,11 @@ fn build_default_row(
     if shape.id == <String as Facet>::SHAPE.id {
         let val = peek.get::<String>().ok()?.clone();
         let any_entity = any_entity.clone();
-        return Some(Box::new(TextRow {
-            label: ctx.label.clone(),
-            value: SharedString::from(val),
-            on_change: Arc::new(move |s, _w, cx| {
-                set_field::<String>(&any_entity, field_idx, s, cx)
-            }),
-        }));
+        return Some(Box::new(TextRow::new(
+            ctx.label.clone(),
+            SharedString::from(val),
+            Arc::new(move |s, _w, cx| set_field::<String>(&any_entity, field_idx, s, cx)),
+        )));
     }
 
     if let Ok(peek_option) = peek.clone().into_option() {

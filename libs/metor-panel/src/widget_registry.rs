@@ -354,10 +354,10 @@ impl WidgetRegistry {
         self.register_field_widget::<SharedString>(Arc::new(|ctx, peek, any_entity, idx| {
             let value = peek.get::<SharedString>().unwrap().clone();
             let label = ctx.label.clone();
-            Box::new(TextRow {
+            Box::new(TextRow::new(
                 label,
                 value,
-                on_change: Arc::new(move |s, _w, cx| {
+                Arc::new(move |s, _w, cx| {
                     crate::reflect::set_field::<SharedString>(
                         &any_entity,
                         idx,
@@ -365,7 +365,7 @@ impl WidgetRegistry {
                         cx,
                     );
                 }),
-            })
+            ))
         }));
     }
 
