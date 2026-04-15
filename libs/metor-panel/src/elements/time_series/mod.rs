@@ -512,12 +512,7 @@ pub struct TimeSeriesPlot {
     drag_start_view: Option<PlotBounds>,
     drag_zone: AxisZone,
     last_plot_area: Option<Bounds<Pixels>>,
-    on_open_page: Option<OpenPageCallback>,
 }
-
-/// Callback type for when the plot wants to open an inspector page.
-pub type OpenPageCallback =
-    Arc<dyn Fn(crate::command_palette::PalettePage, &mut Window, &mut gpui::App) + 'static>;
 
 impl TimeSeriesPlot {
     pub fn new(db: Arc<DB>, traces: Vec<Trace>, cx: &mut Context<Self>) -> Self {
@@ -535,12 +530,7 @@ impl TimeSeriesPlot {
             drag_start_view: None,
             drag_zone: AxisZone::Plot,
             last_plot_area: None,
-            on_open_page: None,
         }
-    }
-
-    pub fn set_on_open_page(&mut self, cb: OpenPageCallback) {
-        self.on_open_page = Some(cb);
     }
 
     /// Convenience: create a plot for a single component with the given element

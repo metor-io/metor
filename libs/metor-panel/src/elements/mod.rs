@@ -23,7 +23,7 @@ pub use component_table::{ComponentTable, new_component_table};
 pub use monitor::Monitor;
 pub use scrollbar::Scrollbar;
 pub use table::{Column, ColumnSort, Table, TableDelegate};
-pub use time_series::{OpenPageCallback, PlotStyle, TimeSeriesPlot, Trace};
+pub use time_series::{PlotStyle, TimeSeriesPlot, Trace};
 
 /// Format a component value using metadata hints.
 ///

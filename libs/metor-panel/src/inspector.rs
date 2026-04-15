@@ -1,4 +1,4 @@
-/// Unified inspector and command palette.
+/// Unified inspector — the everything-palette and right-click panel.
 ///
 /// Operates on [`InspectorRow`] widgets with a page-stack navigation model.
 /// Can render as either an anchored right-click panel or a centered overlay.
@@ -9,9 +9,8 @@ use gpui::{
     Render, SharedString, Window, anchored, canvas, deferred, div, prelude::*, px,
 };
 
-use crate::command_palette::{PaletteAction, PalettePage};
 use crate::theme::theme;
-use crate::widgets::{CommandRow, InspectorRow, NavRow, RowAction, TextField};
+use crate::widgets::{InspectorRow, RowAction, TextField};
 
 /// Action to open the inspector for an arbitrary entity at a position.
 #[derive(Clone, PartialEq, gpui::Action)]
@@ -508,124 +507,3 @@ impl Render for Inspector {
     }
 }
 
-/// A row that prompts for text input via inline editing, then forwards
-/// the committed text to a callback. Used for `PalettePage::default_action`.
-struct DefaultActionRow {
-    label: SharedString,
-    callback: Arc<dyn Fn(String, &mut Window, &mut App)>,
-}
-
-impl InspectorRow for DefaultActionRow {
-    fn label(&self) -> &str {
-        &self.label
-    }
-
-    fn render_row(
-        &self,
-        row_ix: usize,
-        selected: bool,
-        _window: &mut Window,
-        cx: &mut App,
-    ) -> gpui::AnyElement {
-        let theme = theme(cx);
-        crate::widgets::row_base(row_ix, selected, cx)
-            .child(
-                div()
-                    .text_size(px(12.0))
-                    .text_color(theme.text_primary)
-                    .child(self.label.clone()),
-            )
-            .into_any_element()
-    }
-
-    fn activate(&mut self, _window: &mut Window, _cx: &mut App) -> RowAction {
-        let cb = self.callback.clone();
-        RowAction::StartEdit {
-            current_text: String::new(),
-            on_commit: Box::new(move |text, w, cx| {
-                cb(text, w, cx);
-            }),
-        }
-    }
-}
-
-/// Wrap inspector rows in a [`PalettePage`] so they can be opened via
-/// the `on_open_page` callback chain. Each row becomes a `PaletteItem`
-/// whose `Execute` action is a no-op — the real behaviour comes from
-/// `palette_page_to_rows` converting back on the receiving end.
-///
-/// This is intentionally a thin wrapper: the page's items list is empty
-/// and the rows are stashed in a `NextPage` so that `palette_page_to_rows`
-/// can recover them.
-pub fn inspector_rows_to_page(rows: Vec<Box<dyn InspectorRow>>) -> PalettePage {
-    let items: Vec<crate::command_palette::PaletteItem> = rows
-        .into_iter()
-        .map(|row| {
-            let label = SharedString::from(row.label().to_string());
-            let row = std::sync::Mutex::new(Some(row));
-            crate::command_palette::PaletteItem::new(
-                label,
-                PaletteAction::Execute(Box::new(move |_, window, cx| {
-                    if let Some(row) = row.lock().unwrap().as_mut() {
-                        row.activate(window, cx);
-                    }
-                })),
-            )
-        })
-        .collect();
-    PalettePage::new(items)
-}
-
-/// Convert a [`PalettePage`] into inspector rows.
-///
-/// This bridges the old CommandPalette page model to the new unified
-/// Inspector. `PaletteAction::Execute` becomes a `CommandRow`,
-/// `PaletteAction::NextPage` becomes a `NavRow` that cascades.
-pub fn palette_page_to_rows(page: PalettePage) -> Vec<Box<dyn InspectorRow>> {
-    let mut rows: Vec<Box<dyn InspectorRow>> = page
-        .items
-        .into_iter()
-        .map(|item| {
-            let label = item.label;
-            match item.action {
-                PaletteAction::Execute(cb) => Box::new(CommandRow {
-                    label,
-                    callback: Arc::new(move |w, cx| {
-                        cb("", w, cx);
-                    }),
-                }) as Box<dyn InspectorRow>,
-                PaletteAction::NextPage {
-                    label: page_label,
-                    page: page_fn,
-                } => Box::new(NavRow {
-                    label,
-                    summary: page_label.unwrap_or_default(),
-                    build_children: Box::new(move |_cx| {
-                        let page = page_fn();
-                        let rows = palette_page_to_rows(page);
-                        rows
-                    }),
-                }) as Box<dyn InspectorRow>,
-            }
-        })
-        .collect();
-
-    // Convert default_action into a row that starts inline text editing.
-    // The committed text is forwarded to the action's callback.
-    if let Some(default) = page.default_action {
-        let label = default.label;
-        match default.action {
-            PaletteAction::Execute(cb) => {
-                rows.push(Box::new(DefaultActionRow {
-                    label,
-                    callback: Arc::new(move |text, w, cx| {
-                        cb(&text, w, cx);
-                    }),
-                }));
-            }
-            _ => {}
-        }
-    }
-
-    rows
-}

@@ -293,10 +293,10 @@ fn build_option_row(
         SharedString::from("None")
     };
 
-    Box::new(NavRow {
+    Box::new(NavRow::new(
         label,
         summary,
-        build_children: Box::new(move |_cx| {
+        Box::new(move |_cx| {
             let mut rows: Vec<Box<dyn InspectorRow>> = Vec::new();
 
             if inner_shape.id != <ComponentId as Facet>::SHAPE.id {
@@ -305,27 +305,27 @@ fn build_option_row(
 
             if is_some {
                 let any_entity = any_entity.clone();
-                rows.push(Box::new(CommandRow {
-                    label: "Clear".into(),
-                    callback: Arc::new(move |_w, cx| {
+                rows.push(Box::new(CommandRow::new(
+                    "Clear",
+                    Arc::new(move |_w, cx| {
                         set_field::<Option<ComponentId>>(&any_entity, field_idx, None, cx);
                     }),
-                }));
+                )));
             } else {
                 for (id, name) in crate::trace_picker::list_components(&db) {
                     let any_entity = any_entity.clone();
-                    rows.push(Box::new(CommandRow {
-                        label: SharedString::from(name),
-                        callback: Arc::new(move |_w, cx| {
+                    rows.push(Box::new(CommandRow::new(
+                        SharedString::from(name),
+                        Arc::new(move |_w, cx| {
                             set_field::<Option<ComponentId>>(&any_entity, field_idx, Some(id), cx);
                         }),
-                    }));
+                    )));
                 }
             }
 
             rows
         }),
-    })
+    ))
 }
 
 fn scalar_as_f64(peek: &Peek<'_, '_>, scalar: ScalarType) -> Option<f64> {

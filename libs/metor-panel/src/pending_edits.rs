@@ -6,7 +6,7 @@ use metor_proto::types::{ComponentId, Timestamp};
 use metor_proto_wkt::{ComponentValue, UpdateComponent};
 use metor_proto::types::Msg;
 
-use crate::command_palette::{PaletteAction, PaletteItem, PalettePage};
+use crate::widgets::{CommandRow, DefaultActionRow, InspectorRow, NavRow};
 
 /// A pending edit to a component's value, accumulated until the user commits it.
 #[derive(Clone)]
@@ -95,52 +95,50 @@ pub fn apply_edit(db: &DB, edit: &PendingEdit) {
     let _ = db.push_msg(Timestamp::now(), UpdateComponent::ID, &bytes);
 }
 
-/// Build a palette page that lists pending edits with apply/discard actions.
-pub fn review_page(db: Arc<DB>, cx: &App) -> PalettePage {
+/// Build the inspector rows that list pending edits with apply/discard actions.
+pub fn review_rows(db: Arc<DB>, cx: &App) -> Vec<Box<dyn InspectorRow>> {
     let edits = pending_edits(cx).edits.clone();
 
-    let mut items: Vec<PaletteItem> = edits
+    let mut rows: Vec<Box<dyn InspectorRow>> = edits
         .iter()
         .map(|edit| {
             let summary = summarize_edit(edit);
             let id = edit.component_id;
             let db = db.clone();
-            PaletteItem::new(
+            Box::new(CommandRow::new(
                 summary,
-                PaletteAction::Execute(Box::new(move |_input, _window, cx| {
+                Arc::new(move |_window, cx| {
                     let pending = pending_edits(cx);
                     if let Some(e) = pending.get(id).cloned() {
                         apply_edit(&db, &e);
                         pending_edits_mut(cx).remove(id);
                     }
-                })),
-            )
+                }),
+            )) as Box<dyn InspectorRow>
         })
         .collect();
 
     if !edits.is_empty() {
-        items.push(PaletteItem::new(
+        let apply_db = db.clone();
+        rows.push(Box::new(CommandRow::new(
             "Apply All",
-            PaletteAction::Execute(Box::new({
-                let db = db.clone();
-                move |_input, _window, cx| {
-                    let edits = pending_edits(cx).edits.clone();
-                    for edit in &edits {
-                        apply_edit(&db, edit);
-                    }
-                    pending_edits_mut(cx).edits.clear();
+            Arc::new(move |_window, cx| {
+                let edits = pending_edits(cx).edits.clone();
+                for edit in &edits {
+                    apply_edit(&apply_db, edit);
                 }
-            })),
-        ));
-        items.push(PaletteItem::new(
-            "Discard All",
-            PaletteAction::Execute(Box::new(move |_input, _window, cx| {
                 pending_edits_mut(cx).edits.clear();
-            })),
-        ));
+            }),
+        )));
+        rows.push(Box::new(CommandRow::new(
+            "Discard All",
+            Arc::new(move |_window, cx| {
+                pending_edits_mut(cx).edits.clear();
+            }),
+        )));
     }
 
-    PalettePage::new(items).prompt("Review pending edits")
+    rows
 }
 
 fn summarize_edit(edit: &PendingEdit) -> SharedString {
@@ -164,37 +162,34 @@ fn summarize_edit(edit: &PendingEdit) -> SharedString {
     SharedString::from(format!("{}: {}", edit.component_name, parts.join(", ")))
 }
 
-/// Build a palette page listing all components. Selecting one drills into an
+/// Build inspector rows listing all components. Selecting one cascades into an
 /// element picker, which then opens the value editor.
-pub fn update_component_page(db: Arc<DB>) -> PalettePage {
+pub fn update_component_rows(db: Arc<DB>) -> Vec<Box<dyn InspectorRow>> {
     let components = crate::trace_picker::list_components(&db);
-    let items: Vec<PaletteItem> = components
+    components
         .into_iter()
         .map(|(id, name)| {
             let db = db.clone();
             let label = SharedString::from(name);
-            let label_for_page = label.clone();
-            PaletteItem::new(
+            let label_for_children = label.clone();
+            Box::new(NavRow::new(
                 label,
-                PaletteAction::NextPage {
-                    label: Some(label_for_page.clone()),
-                    page: Box::new(move || {
-                        select_element_page(db.clone(), id, label_for_page.clone())
-                    }),
-                },
-            )
+                SharedString::new_static(""),
+                Box::new(move |_cx| {
+                    select_element_rows(db.clone(), id, label_for_children.clone())
+                }),
+            )) as Box<dyn InspectorRow>
         })
-        .collect();
-    PalettePage::new(items).prompt("Select component to update")
+        .collect()
 }
 
-/// Build a palette page listing each element of a component, or skip directly
+/// Build inspector rows listing each element of a component, or skip directly
 /// to the editor for scalar / single-element components.
-fn select_element_page(
+fn select_element_rows(
     db: Arc<DB>,
     component_id: ComponentId,
     component_name: SharedString,
-) -> PalettePage {
+) -> Vec<Box<dyn InspectorRow>> {
     let element_names: Vec<SharedString> =
         crate::trace_picker::element_names_for_component(&db, component_id)
             .into_iter()
@@ -202,7 +197,7 @@ fn select_element_page(
             .collect();
 
     if element_names.len() <= 1 {
-        return edit_value_page(
+        return edit_value_rows(
             db,
             EditRequest {
                 component_id,
@@ -213,39 +208,37 @@ fn select_element_page(
         );
     }
 
-    let items: Vec<PaletteItem> = element_names
+    element_names
         .iter()
         .enumerate()
         .map(|(idx, name)| {
             let db = db.clone();
             let component_name = component_name.clone();
             let element_names = element_names.clone();
-            PaletteItem::new(
-                name.clone(),
-                PaletteAction::NextPage {
-                    label: Some(name.clone()),
-                    page: Box::new(move || {
-                        edit_value_page(
-                            db.clone(),
-                            EditRequest {
-                                component_id,
-                                component_name: component_name.clone(),
-                                element_names: element_names.clone(),
-                                element_index: idx,
-                            },
-                        )
-                    }),
-                },
-            )
+            let name = name.clone();
+            Box::new(NavRow::new(
+                name,
+                SharedString::new_static(""),
+                Box::new(move |_cx| {
+                    edit_value_rows(
+                        db.clone(),
+                        EditRequest {
+                            component_id,
+                            component_name: component_name.clone(),
+                            element_names: element_names.clone(),
+                            element_index: idx,
+                        },
+                    )
+                }),
+            )) as Box<dyn InspectorRow>
         })
-        .collect();
-    PalettePage::new(items).prompt("Select element")
+        .collect()
 }
 
-/// Build a palette page that prompts the user for a new value for a single element.
-/// For enum components, lists each variant as a selectable item; otherwise prompts
-/// for free-text input.
-pub fn edit_value_page(db: Arc<DB>, request: EditRequest) -> PalettePage {
+/// Build inspector rows that prompt the user for a new value for a single
+/// element. For enum components, lists each variant; otherwise emits a
+/// [`DefaultActionRow`] that prompts for free-text input.
+pub fn edit_value_rows(db: Arc<DB>, request: EditRequest) -> Vec<Box<dyn InspectorRow>> {
     let EditRequest {
         component_id,
         component_name,
@@ -253,29 +246,22 @@ pub fn edit_value_page(db: Arc<DB>, request: EditRequest) -> PalettePage {
         element_index,
     } = request;
 
-    let label = element_names
-        .get(element_index)
-        .cloned()
-        .unwrap_or_else(|| SharedString::from(format!("[{}]", element_index)));
-
-    let prompt = SharedString::from(format!("New value for {}.{}", component_name, label));
-
     let enum_variants: Option<Vec<String>> = db.with_state(|s| {
         s.get_component_metadata(component_id)
             .and_then(|m| m.enum_variants().map(|it| it.map(|s| s.to_string()).collect()))
     });
 
     if let Some(variants) = enum_variants {
-        let items: Vec<PaletteItem> = variants
+        return variants
             .into_iter()
             .enumerate()
             .map(|(idx, name)| {
                 let db = db.clone();
                 let component_name = component_name.clone();
                 let element_names = element_names.clone();
-                PaletteItem::new(
+                Box::new(CommandRow::new(
                     SharedString::from(name),
-                    PaletteAction::Execute(Box::new(move |_input, _window, cx| {
+                    Arc::new(move |_window, cx| {
                         upsert_element_edit(
                             &db,
                             component_id,
@@ -285,27 +271,32 @@ pub fn edit_value_page(db: Arc<DB>, request: EditRequest) -> PalettePage {
                             &idx.to_string(),
                             cx,
                         );
-                    })),
-                )
+                    }),
+                )) as Box<dyn InspectorRow>
             })
             .collect();
-        return PalettePage::new(items).prompt(prompt);
     }
 
-    PalettePage::new(vec![]).prompt(prompt).default_action(PaletteItem::new(
-        "Apply",
-        PaletteAction::Execute(Box::new(move |input, _window, cx| {
+    let label = element_names
+        .get(element_index)
+        .cloned()
+        .unwrap_or_else(|| SharedString::from(format!("[{}]", element_index)));
+    let prompt = SharedString::from(format!("New value for {}.{}", component_name, label));
+
+    vec![Box::new(DefaultActionRow {
+        label: prompt,
+        callback: Arc::new(move |input, _window, cx| {
             upsert_element_edit(
                 &db,
                 component_id,
                 component_name.clone(),
                 element_names.clone(),
                 element_index,
-                input,
+                &input,
                 cx,
             );
-        })),
-    ))
+        }),
+    })]
 }
 
 fn upsert_element_edit(

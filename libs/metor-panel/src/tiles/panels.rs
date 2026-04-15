@@ -5,10 +5,11 @@ use metor_db::DB;
 use metor_proto::types::ComponentId;
 
 use super::dashboard::DashboardPanel;
-use crate::command_palette::{PaletteAction, PaletteItem, PalettePage};
-use crate::elements::time_series::{LinePlot, OpenPageCallback};
+use crate::elements::time_series::LinePlot;
 use crate::elements::viewer_3d::Viewer3d;
 use crate::elements::{ComponentTable, ComponentText, TimeSeriesPlot, new_component_table};
+use crate::inspector::{InspectorMode, InspectorRequest, OpenInspectorCallback};
+use crate::widgets::{CommandRow, InspectorRow, NavRow};
 
 use super::item::{PaneItem, PaneItemHandle};
 use super::pane::Pane;
@@ -125,21 +126,9 @@ impl PlotPanel {
         }
     }
 
-    /// The inner TimeSeriesPlot entity, for use with `palette_page_for_inspectable`.
+    /// The inner TimeSeriesPlot entity.
     pub(crate) fn inner(&self) -> &Entity<TimeSeriesPlot> {
         &self.inner
-    }
-
-    /// The DB reference, needed for the inspectable palette.
-    pub(crate) fn db(&self) -> &Arc<DB> {
-        &self.db
-    }
-
-    /// Wire up the callback so right-clicking a legend item opens its inspector.
-    pub fn set_on_open_page(&self, cb: OpenPageCallback, cx: &mut App) {
-        self.inner.update(cx, |plot, _cx| {
-            plot.set_on_open_page(cb);
-        });
     }
 }
 
@@ -239,264 +228,129 @@ impl PaneItem for Viewer3dPanel {
     }
 }
 
-/// Callback invoked after a panel is created, so the caller can open its
-/// inspectable palette if the panel has configurable fields.
-pub type OnPanelCreated = Box<dyn FnOnce(Entity<PlotPanel>, &App) -> Option<PalettePage>>;
-
-/// Build the root command palette page with "New Panel" and "Edit Panel" branches.
+/// Build the inspector rows for the "New Panel" submenu in the
+/// everything-palette. Each row creates a new panel and adds it to `pane`.
 ///
-/// `on_inspect` is called when a panel needs configuration (newly created or
-/// editing an existing one). The caller should display the returned PalettePage
-/// in a CommandPalette.
-pub fn tile_palette_page(
+/// Time-Series-Plot also auto-opens the trace wizard via `on_open_inspector`
+/// (when supplied).
+pub fn new_panel_rows(
     db: Arc<DB>,
     pane: Entity<Pane>,
-    tiles: &Entity<super::TileGroup>,
-    on_inspect: impl Fn(PalettePage, &mut Window, &mut App) + 'static,
-    on_open_inspector: Option<crate::inspector::OpenInspectorCallback>,
-    cx: &App,
-) -> PalettePage {
-    let on_inspect = Arc::new(on_inspect);
+    on_open_inspector: Option<OpenInspectorCallback>,
+) -> Vec<Box<dyn InspectorRow>> {
+    let mut rows: Vec<Box<dyn InspectorRow>> = Vec::new();
 
-    let mut items = vec![PaletteItem::new("New Panel", {
+    rows.push(Box::new(CommandRow::new("Time Series Plot", {
         let db = db.clone();
         let pane = pane.clone();
-        let on_inspect = on_inspect.clone();
         let on_open_inspector = on_open_inspector.clone();
-        PaletteAction::NextPage {
-            label: Some("New".into()),
-            page: Box::new(move || {
-                new_panel_page(
-                    db.clone(),
-                    pane.clone(),
-                    on_inspect.clone(),
-                    on_open_inspector.clone(),
-                )
-            }),
-        }
-    })];
-
-    // Only show "Edit Panel" if there are panels to edit
-    let edit_labels = collect_edit_labels(tiles, cx);
-    if !edit_labels.is_empty() {
-        items.push(PaletteItem::new("Edit Panel", {
-            PaletteAction::NextPage {
-                label: Some("Edit".into()),
-                page: Box::new(move || {
-                    let edit_items: Vec<PaletteItem> = edit_labels
-                        .iter()
-                        .map(|label| {
-                            PaletteItem::new(
-                                label.clone(),
-                                PaletteAction::NextPage {
-                                    label: None,
-                                    page: Box::new(|| PalettePage::new(vec![])),
-                                },
-                            )
-                        })
-                        .collect();
-                    PalettePage::new(edit_items).prompt("Select panel to edit")
-                }),
-            }
-        }));
-    }
-
-    items.push(PaletteItem::new(
-        "Update Component",
-        PaletteAction::NextPage {
-            label: Some("Update".into()),
-            page: Box::new({
+        Arc::new(move |window, cx| {
+            let plot_panel = {
                 let db = db.clone();
-                move || crate::pending_edits::update_component_page(db.clone())
-            }),
-        },
-    ));
+                cx.new(|cx| PlotPanel::empty(db, cx))
+            };
+            let inner = plot_panel.read(cx).inner().clone();
 
-    let pending_count = crate::pending_edits::pending_edits(cx).edits.len();
-    if pending_count > 0 {
-        let label = SharedString::from(format!("Review Edits ({})", pending_count));
-        let on_inspect_review = on_inspect.clone();
-        let review_db = db.clone();
-        items.push(PaletteItem::new(
-            label,
-            PaletteAction::Execute(Box::new(move |_filter, window, cx| {
-                let page = crate::pending_edits::review_page(review_db.clone(), cx);
-                on_inspect_review(page, window, cx);
-            })),
-        ));
-    }
+            pane.update(cx, |pane, cx| {
+                pane.add_item(Box::new(plot_panel), cx);
+            });
 
-    items.push(PaletteItem::new(
-        "Theme",
-        PaletteAction::NextPage {
-            label: Some("Theme".into()),
-            page: Box::new(|| {
-                let items: Vec<PaletteItem> = crate::theme::all_themes()
-                    .iter()
-                    .map(|t| {
-                        let theme = Arc::new((*t).clone());
-                        PaletteItem::new(
-                            t.name,
-                            PaletteAction::Execute(Box::new(move |_, _, cx| {
-                                crate::theme::set_theme(cx, theme.clone());
-                            })),
-                        )
-                    })
-                    .collect();
-                PalettePage::new(items).prompt("Select theme")
-            }),
-        },
-    ));
-
-    PalettePage::new(items).prompt("Command")
-}
-
-fn new_panel_page(
-    db: Arc<DB>,
-    pane: Entity<Pane>,
-    on_inspect: Arc<dyn Fn(PalettePage, &mut Window, &mut App) + 'static>,
-    on_open_inspector: Option<crate::inspector::OpenInspectorCallback>,
-) -> PalettePage {
-    let items = vec![
-        PaletteItem::new("Time Series Plot", {
-            let db = db.clone();
-            let pane = pane.clone();
-            let on_inspect = on_inspect.clone();
-            let on_open_inspector = on_open_inspector.clone();
-            PaletteAction::Execute(Box::new(move |_filter, window, cx| {
-                let plot_panel = {
-                    let db = db.clone();
-                    cx.new(|cx| PlotPanel::empty(db, cx))
-                };
-                let inner = {
-                    let panel = plot_panel.read(cx);
-                    panel.inner().clone()
-                };
-
-                let cb: OpenPageCallback = Arc::new({
-                    let on_inspect = on_inspect.clone();
-                    move |page, window, cx| on_inspect(page, window, cx)
-                });
-                inner.update(cx, |plot, _cx| {
-                    plot.set_on_open_page(cb);
-                });
-
-                pane.update(cx, |pane, cx| {
-                    pane.add_item(Box::new(plot_panel), cx);
-                });
-
-                // Auto-open the inspector so the user gets the trace wizard
-                if let Some(on_open_inspector) = &on_open_inspector {
-                    let inner_any = inner.into_any();
-                    if let Some(rows) = crate::reflect::rows_for_any_entity(&inner_any, &db, cx) {
-                        let request = crate::inspector::InspectorRequest {
+            // Auto-open the inspector so the user gets the trace wizard
+            if let Some(on_open_inspector) = &on_open_inspector {
+                let inner_any = inner.into_any();
+                if let Some(rows) = crate::reflect::rows_for_any_entity(&inner_any, &db, cx) {
+                    on_open_inspector(
+                        InspectorRequest {
                             rows,
-                            mode: crate::inspector::InspectorMode::Centered,
-                        };
-                        on_open_inspector(request, window, cx);
-                    }
+                            mode: InspectorMode::Centered,
+                        },
+                        window,
+                        cx,
+                    );
                 }
-            }))
-        }),
-        PaletteItem::new("Component Text", {
-            let db = db.clone();
-            let pane = pane.clone();
-            PaletteAction::NextPage {
-                label: Some("Text".into()),
-                page: Box::new(move || {
-                    let db_outer = db.clone();
-                    let pane = pane.clone();
-                    component_picker_page(db.clone(), move |component_id, name, cx| {
-                        let db = db_outer.clone();
-                        pane.update(cx, |pane, cx| {
-                            let item: Box<dyn PaneItemHandle> =
-                                Box::new(cx.new(|cx| TextPanel::new(db, component_id, name, cx)));
-                            pane.add_item(item, cx);
-                        });
-                    })
-                }),
             }
-        }),
-        PaletteItem::new("Component Table", {
-            let db = db.clone();
-            let pane = pane.clone();
-            PaletteAction::Execute(Box::new(move |_filter, _window, cx| {
-                let db = db.clone();
-                pane.update(cx, |pane, cx| {
-                    let item: Box<dyn PaneItemHandle> =
-                        Box::new(cx.new(|cx| TablePanel::new(db, cx)));
-                    pane.add_item(item, cx);
-                });
-            }))
-        }),
-        PaletteItem::new("3D Viewer", {
-            let db = db.clone();
-            let pane = pane.clone();
-            PaletteAction::Execute(Box::new(move |_filter, _window, cx| {
-                let db = db.clone();
-                pane.update(cx, |pane, cx| {
-                    let item: Box<dyn PaneItemHandle> =
-                        Box::new(cx.new(|cx| Viewer3dPanel::new(db, cx)));
-                    pane.add_item(item, cx);
-                });
-            }))
-        }),
-        PaletteItem::new("Dashboard", {
-            let db = db.clone();
-            let pane = pane.clone();
-            PaletteAction::Execute(Box::new(move |_filter, _window, cx| {
-                let db = db.clone();
-                pane.update(cx, |pane, cx| {
-                    let dashboard = cx.new(|cx| DashboardPanel::new(db, cx));
-                    pane.add_item(Box::new(dashboard), cx);
-                });
-            }))
-        }),
-    ];
+        })
+    })));
 
-    PalettePage::new(items).prompt("Select panel type")
+    rows.push(Box::new(NavRow::new(
+        "Component Text",
+        SharedString::new_static(""),
+        {
+            let db = db.clone();
+            let pane = pane.clone();
+            Box::new(move |_cx| {
+                let db_outer = db.clone();
+                let pane = pane.clone();
+                component_picker_rows(db.clone(), move |component_id, name, cx| {
+                    let db = db_outer.clone();
+                    pane.update(cx, |pane, cx| {
+                        let item: Box<dyn PaneItemHandle> =
+                            Box::new(cx.new(|cx| TextPanel::new(db, component_id, name, cx)));
+                        pane.add_item(item, cx);
+                    });
+                })
+            })
+        },
+    )));
+
+    rows.push(Box::new(CommandRow::new("Component Table", {
+        let db = db.clone();
+        let pane = pane.clone();
+        Arc::new(move |_window, cx| {
+            let db = db.clone();
+            pane.update(cx, |pane, cx| {
+                let item: Box<dyn PaneItemHandle> =
+                    Box::new(cx.new(|cx| TablePanel::new(db, cx)));
+                pane.add_item(item, cx);
+            });
+        })
+    })));
+
+    rows.push(Box::new(CommandRow::new("3D Viewer", {
+        let db = db.clone();
+        let pane = pane.clone();
+        Arc::new(move |_window, cx| {
+            let db = db.clone();
+            pane.update(cx, |pane, cx| {
+                let item: Box<dyn PaneItemHandle> =
+                    Box::new(cx.new(|cx| Viewer3dPanel::new(db, cx)));
+                pane.add_item(item, cx);
+            });
+        })
+    })));
+
+    rows.push(Box::new(CommandRow::new("Dashboard", {
+        let db = db.clone();
+        let pane = pane.clone();
+        Arc::new(move |_window, cx| {
+            let db = db.clone();
+            pane.update(cx, |pane, cx| {
+                let dashboard = cx.new(|cx| DashboardPanel::new(db, cx));
+                pane.add_item(Box::new(dashboard), cx);
+            });
+        })
+    })));
+
+    rows
 }
 
-/// Build a palette page listing available components, calling `on_select`
+/// Build inspector rows listing available components, calling `on_select`
 /// with the chosen component ID and name.
-fn component_picker_page(
+pub fn component_picker_rows(
     db: Arc<DB>,
     on_select: impl Fn(ComponentId, String, &mut App) + 'static,
-) -> PalettePage {
+) -> Vec<Box<dyn InspectorRow>> {
     let on_select = Arc::new(on_select);
-    let items: Vec<PaletteItem> = crate::trace_picker::list_components(&db)
+    crate::trace_picker::list_components(&db)
         .into_iter()
         .map(|(id, name)| {
             let on_select = on_select.clone();
-            PaletteItem::new(
+            Box::new(CommandRow::new(
                 SharedString::from(name.clone()),
-                PaletteAction::Execute(Box::new(move |_filter, _window, cx| {
+                Arc::new(move |_window, cx| {
                     on_select(id, name.clone(), cx);
-                })),
-            )
+                }),
+            )) as Box<dyn InspectorRow>
         })
-        .collect();
-
-    PalettePage::new(items).prompt("Select component")
-}
-
-/// Build palette items for all panels across all panes.
-fn collect_edit_labels(tiles: &Entity<super::TileGroup>, cx: &App) -> Vec<SharedString> {
-    let panes = tiles.read(cx).panes().to_vec();
-    let mut labels = Vec::new();
-
-    for (pane_ix, pane) in panes.iter().enumerate() {
-        let pane_items = pane.read(cx).items();
-        for item in pane_items.iter() {
-            let title = item.tab_title(cx);
-            let label = if panes.len() > 1 {
-                SharedString::from(format!("[Pane {}] {}", pane_ix + 1, title))
-            } else {
-                title
-            };
-            labels.push(label);
-        }
-    }
-
-    labels
+        .collect()
 }

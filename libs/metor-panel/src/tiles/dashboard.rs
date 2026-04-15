@@ -11,10 +11,10 @@ use metor_db::DB;
 use serde::{Deserialize, Serialize};
 use smallvec::SmallVec;
 
-use crate::command_palette::{PaletteAction, PaletteItem, PalettePage};
 use crate::elements::viewer_3d::Viewer3d;
 use crate::elements::{ComponentText, Monitor, Scrollbar, TimeSeriesPlot, new_component_table};
 use crate::theme::theme;
+use crate::widgets::{CommandRow, DefaultActionRow, InspectorRow, NavRow};
 
 use super::item::PaneItem;
 
@@ -154,6 +154,23 @@ impl DashboardPanel {
         let id = WidgetId(self.next_id);
         self.next_id += 1;
         id
+    }
+
+    /// Iterate all widgets along with their inspectable entity handle and a
+    /// display label. Used by the items registry to surface widgets in the
+    /// everything-palette.
+    pub fn inspectable_widgets(&self) -> Vec<(WidgetId, gpui::AnyEntity, SharedString)> {
+        self.widgets
+            .iter()
+            .filter_map(|w| {
+                let entity = self.widget_entities.get(&w.id)?.clone();
+                Some((w.id, entity, widget_display_label(w)))
+            })
+            .collect()
+    }
+
+    pub fn title(&self) -> SharedString {
+        self.title.clone()
     }
 
     /// Find an unoccupied position for a new widget of the given size.
@@ -682,32 +699,34 @@ impl DashboardPanel {
     }
 }
 
-/// Build the command palette page for dashboard operations.
-pub fn dashboard_palette_page(
+/// Build the inspector rows for dashboard operations (Add/Remove widget,
+/// Edit Mode toggle, Rename, Z-order controls).
+pub fn dashboard_rows(
     dashboard: Entity<DashboardPanel>,
     db: Arc<DB>,
     cx: &App,
-) -> PalettePage {
-    let mut items = vec![];
+) -> Vec<Box<dyn InspectorRow>> {
+    let mut rows: Vec<Box<dyn InspectorRow>> = Vec::new();
 
-    items.push(PaletteItem::new("Add Widget", {
-        let dashboard = dashboard.clone();
-        let db = db.clone();
-        PaletteAction::NextPage {
-            label: Some("Add".into()),
-            page: Box::new(move || add_widget_page(dashboard.clone(), db.clone())),
-        }
-    }));
+    rows.push(Box::new(NavRow::new(
+        "Add Widget",
+        SharedString::new_static(""),
+        {
+            let dashboard = dashboard.clone();
+            let db = db.clone();
+            Box::new(move |_cx| add_widget_rows(dashboard.clone(), db.clone()))
+        },
+    )));
 
     let editing = dashboard.read(cx).editing;
-    let edit_label = if editing {
-        "Exit Edit Mode"
+    let edit_label: SharedString = if editing {
+        "Exit Edit Mode".into()
     } else {
-        "Enter Edit Mode"
+        "Enter Edit Mode".into()
     };
-    items.push(PaletteItem::new(edit_label, {
+    rows.push(Box::new(CommandRow::new(edit_label, {
         let dashboard = dashboard.clone();
-        PaletteAction::Execute(Box::new(move |_, _, cx| {
+        Arc::new(move |_window, cx| {
             dashboard.update(cx, |this, cx| {
                 this.editing = !this.editing;
                 if !this.editing {
@@ -715,8 +734,8 @@ pub fn dashboard_palette_page(
                 }
                 cx.notify();
             });
-        }))
-    }));
+        })
+    })));
 
     let widgets = &dashboard.read(cx).widgets;
     if !widgets.is_empty() {
@@ -724,179 +743,157 @@ pub fn dashboard_palette_page(
             .iter()
             .map(|w| (w.id, widget_display_label(w)))
             .collect();
-
-        items.push(PaletteItem::new("Remove Widget", {
+        rows.push(Box::new(NavRow::new("Remove Widget", SharedString::new_static(""), {
             let dashboard = dashboard.clone();
-            PaletteAction::NextPage {
-                label: Some("Remove".into()),
-                page: Box::new(move || {
-                    let remove_items: Vec<PaletteItem> = widget_infos
-                        .iter()
-                        .map(|(widget_id, label)| {
-                            let widget_id = *widget_id;
-                            let dashboard = dashboard.clone();
-                            PaletteItem::new(
-                                label.clone(),
-                                PaletteAction::Execute(Box::new(move |_, _, cx| {
-                                    dashboard.update(cx, |this, cx| {
-                                        this.remove_widget(widget_id, cx);
-                                    });
-                                })),
-                            )
-                        })
-                        .collect();
-                    PalettePage::new(remove_items).prompt("Select widget to remove")
-                }),
-            }
-        }));
+            Box::new(move |_cx| {
+                widget_infos
+                    .iter()
+                    .map(|(widget_id, label)| {
+                        let widget_id = *widget_id;
+                        let dashboard = dashboard.clone();
+                        Box::new(CommandRow::new(
+                            label.clone(),
+                            Arc::new(move |_window, cx| {
+                                dashboard.update(cx, |this, cx| {
+                                    this.remove_widget(widget_id, cx);
+                                });
+                            }),
+                        )) as Box<dyn InspectorRow>
+                    })
+                    .collect()
+            })
+        })));
     }
 
     // Z-order controls when a widget is selected
     let selected = dashboard.read(cx).selected;
     if let Some(sel_id) = selected {
-        items.push(PaletteItem::new("Bring to Front", {
+        rows.push(Box::new(CommandRow::new("Bring to Front", {
             let dashboard = dashboard.clone();
-            PaletteAction::Execute(Box::new(move |_, _, cx| {
+            Arc::new(move |_window, cx| {
                 dashboard.update(cx, |this, cx| {
                     this.bring_to_front(sel_id, cx);
                 });
-            }))
-        }));
-        items.push(PaletteItem::new("Send to Back", {
+            })
+        })));
+        rows.push(Box::new(CommandRow::new("Send to Back", {
             let dashboard = dashboard.clone();
-            PaletteAction::Execute(Box::new(move |_, _, cx| {
+            Arc::new(move |_window, cx| {
                 dashboard.update(cx, |this, cx| {
                     this.send_to_back(sel_id, cx);
                 });
-            }))
-        }));
+            })
+        })));
     }
 
-    items.push(PaletteItem::new("Rename", {
+    rows.push(Box::new(NavRow::new("Rename", SharedString::new_static(""), {
         let dashboard = dashboard.clone();
-        PaletteAction::NextPage {
-            label: Some("Rename".into()),
-            page: Box::new(move || {
-                let dashboard = dashboard.clone();
-                let apply = PaletteItem::new(
-                    "Apply",
-                    PaletteAction::Execute(Box::new(move |input, _, cx| {
-                        if !input.is_empty() {
-                            dashboard.update(cx, |this, cx| {
-                                this.title = SharedString::from(input.to_string());
-                                cx.notify();
-                            });
-                        }
-                    })),
-                );
-                PalettePage::new(vec![])
-                    .prompt("Dashboard name...")
-                    .default_action(apply)
-            }),
-        }
-    }));
+        Box::new(move |_cx| {
+            let dashboard = dashboard.clone();
+            vec![Box::new(DefaultActionRow {
+                label: "Dashboard name...".into(),
+                callback: Arc::new(move |input, _window, cx| {
+                    if !input.is_empty() {
+                        dashboard.update(cx, |this, cx| {
+                            this.title = SharedString::from(input);
+                            cx.notify();
+                        });
+                    }
+                }),
+            }) as Box<dyn InspectorRow>]
+        })
+    })));
 
-    PalettePage::new(items).label("Dashboard")
+    rows
 }
 
-fn add_widget_page(dashboard: Entity<DashboardPanel>, db: Arc<DB>) -> PalettePage {
-    let items = vec![
-        PaletteItem::new("Time Series Plot", {
-            let dashboard = dashboard.clone();
-            PaletteAction::Execute(Box::new(move |_, _, cx| {
-                dashboard.update(cx, |this, cx| {
-                    this.add_widget(WidgetKind::Plot, serde_json::json!({}), cx);
-                });
-            }))
-        }),
-        PaletteItem::new("Component Text", {
-            let dashboard = dashboard.clone();
-            let db = db.clone();
-            PaletteAction::NextPage {
-                label: Some("Text".into()),
-                page: Box::new(move || {
-                    component_picker_for_widget(dashboard.clone(), db.clone(), WidgetKind::Text)
-                }),
-            }
-        }),
-        PaletteItem::new("Component Table", {
-            let dashboard = dashboard.clone();
-            PaletteAction::Execute(Box::new(move |_, _, cx| {
-                dashboard.update(cx, |this, cx| {
-                    this.add_widget(WidgetKind::Table, serde_json::json!({}), cx);
-                });
-            }))
-        }),
-        PaletteItem::new("Monitor", {
-            let dashboard = dashboard.clone();
-            let db = db.clone();
-            PaletteAction::NextPage {
-                label: Some("Monitor".into()),
-                page: Box::new(move || {
-                    component_picker_for_widget(dashboard.clone(), db.clone(), WidgetKind::Monitor)
-                }),
-            }
-        }),
-        PaletteItem::new("Image", {
-            let dashboard = dashboard.clone();
-            PaletteAction::NextPage {
-                label: Some("Image".into()),
-                page: Box::new(move || image_path_page(dashboard.clone())),
-            }
-        }),
-        PaletteItem::new("3D Viewer", {
-            let dashboard = dashboard.clone();
-            PaletteAction::Execute(Box::new(move |_, _, cx| {
-                dashboard.update(cx, |this, cx| {
-                    this.add_widget(WidgetKind::Viewer3d, serde_json::json!({}), cx);
-                });
-            }))
-        }),
-    ];
+fn add_widget_rows(
+    dashboard: Entity<DashboardPanel>,
+    db: Arc<DB>,
+) -> Vec<Box<dyn InspectorRow>> {
+    let mut rows: Vec<Box<dyn InspectorRow>> = Vec::new();
 
-    PalettePage::new(items).prompt("Select widget type")
+    rows.push(Box::new(CommandRow::new("Time Series Plot", {
+        let dashboard = dashboard.clone();
+        Arc::new(move |_window, cx| {
+            dashboard.update(cx, |this, cx| {
+                this.add_widget(WidgetKind::Plot, serde_json::json!({}), cx);
+            });
+        })
+    })));
+    rows.push(Box::new(NavRow::new("Component Text", SharedString::new_static(""), {
+        let dashboard = dashboard.clone();
+        let db = db.clone();
+        Box::new(move |_cx| {
+            component_picker_rows(dashboard.clone(), db.clone(), WidgetKind::Text)
+        })
+    })));
+    rows.push(Box::new(CommandRow::new("Component Table", {
+        let dashboard = dashboard.clone();
+        Arc::new(move |_window, cx| {
+            dashboard.update(cx, |this, cx| {
+                this.add_widget(WidgetKind::Table, serde_json::json!({}), cx);
+            });
+        })
+    })));
+    rows.push(Box::new(NavRow::new("Monitor", SharedString::new_static(""), {
+        let dashboard = dashboard.clone();
+        let db = db.clone();
+        Box::new(move |_cx| {
+            component_picker_rows(dashboard.clone(), db.clone(), WidgetKind::Monitor)
+        })
+    })));
+    rows.push(Box::new(NavRow::new("Image", SharedString::new_static(""), {
+        let dashboard = dashboard.clone();
+        Box::new(move |_cx| image_path_rows(dashboard.clone()))
+    })));
+    rows.push(Box::new(CommandRow::new("3D Viewer", {
+        let dashboard = dashboard.clone();
+        Arc::new(move |_window, cx| {
+            dashboard.update(cx, |this, cx| {
+                this.add_widget(WidgetKind::Viewer3d, serde_json::json!({}), cx);
+            });
+        })
+    })));
+
+    rows
 }
 
-fn component_picker_for_widget(
+fn component_picker_rows(
     dashboard: Entity<DashboardPanel>,
     db: Arc<DB>,
     kind: WidgetKind,
-) -> PalettePage {
-    let items: Vec<PaletteItem> = crate::trace_picker::list_components(&db)
+) -> Vec<Box<dyn InspectorRow>> {
+    crate::trace_picker::list_components(&db)
         .into_iter()
         .map(|(_id, name)| {
             let dashboard = dashboard.clone();
             let name_clone = name.clone();
-            PaletteItem::new(
+            Box::new(CommandRow::new(
                 SharedString::from(name),
-                PaletteAction::Execute(Box::new(move |_, _, cx| {
+                Arc::new(move |_window, cx| {
                     let config = serde_json::json!({ "component": name_clone });
                     dashboard.update(cx, |this, cx| {
                         this.add_widget(kind, config, cx);
                     });
-                })),
-            )
+                }),
+            )) as Box<dyn InspectorRow>
         })
-        .collect();
-
-    PalettePage::new(items).prompt("Select component")
+        .collect()
 }
 
-fn image_path_page(dashboard: Entity<DashboardPanel>) -> PalettePage {
-    let apply = PaletteItem::new(
-        "Add Image",
-        PaletteAction::Execute(Box::new(move |input, _, cx| {
+fn image_path_rows(dashboard: Entity<DashboardPanel>) -> Vec<Box<dyn InspectorRow>> {
+    vec![Box::new(DefaultActionRow {
+        label: "Image file path...".into(),
+        callback: Arc::new(move |input, _window, cx| {
             if !input.is_empty() {
                 let config = serde_json::json!({ "path": input });
                 dashboard.update(cx, |this, cx| {
                     this.add_widget(WidgetKind::Image, config, cx);
                 });
             }
-        })),
-    );
-    PalettePage::new(vec![])
-        .prompt("Image file path...")
-        .default_action(apply)
+        }),
+    })]
 }
 
 fn widget_display_label(widget: &DashboardWidget) -> SharedString {
@@ -939,7 +936,12 @@ fn create_widget_view(
     }
     match kind {
         WidgetKind::Plot => {
-            widget!(cx.new(|cx| TimeSeriesPlot::new(db.clone(), vec![], cx)))
+            // The TimeSeriesPlot is the rendered view, but only its inner
+            // LinePlot has registered Facet adapters — expose that as the
+            // inspectable entity so the everything-palette can edit traces.
+            let plot = cx.new(|cx| TimeSeriesPlot::new(db.clone(), vec![], cx));
+            let line_plot = plot.read(cx).line_plot().clone();
+            (AnyView::from(plot), line_plot.into_any())
         }
         WidgetKind::Text => {
             let component_name = config

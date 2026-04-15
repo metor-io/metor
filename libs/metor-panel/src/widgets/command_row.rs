@@ -9,6 +9,26 @@ use crate::theme::theme;
 pub struct CommandRow {
     pub label: SharedString,
     pub callback: Arc<dyn Fn(&mut Window, &mut App)>,
+    /// Optional category pill rendered to the right of the label.
+    tag: Option<SharedString>,
+}
+
+impl CommandRow {
+    pub fn new(
+        label: impl Into<SharedString>,
+        callback: Arc<dyn Fn(&mut Window, &mut App)>,
+    ) -> Self {
+        Self {
+            label: label.into(),
+            callback,
+            tag: None,
+        }
+    }
+
+    pub fn with_tag(mut self, tag: impl Into<SharedString>) -> Self {
+        self.tag = Some(tag.into());
+        self
+    }
 }
 
 impl InspectorRow for CommandRow {
@@ -24,14 +44,16 @@ impl InspectorRow for CommandRow {
         cx: &mut App,
     ) -> AnyElement {
         let theme = theme(cx);
-        row_base(row_ix, selected, cx)
-            .child(
-                div()
-                    .text_size(px(12.0))
-                    .text_color(theme.text_secondary)
-                    .child(self.label.clone()),
-            )
-            .into_any_element()
+        let mut row = row_base(row_ix, selected, cx).child(
+            div()
+                .text_size(px(12.0))
+                .text_color(theme.text_primary)
+                .child(self.label.clone()),
+        );
+        if let Some(tag) = &self.tag {
+            row = row.child(super::tag_pill(tag.clone(), cx));
+        }
+        row.into_any_element()
     }
 
     fn activate(&mut self, window: &mut Window, cx: &mut App) -> RowAction {

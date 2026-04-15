@@ -9,13 +9,12 @@ use gpui::{
     actions, div, point, prelude::*, px, size,
 };
 use metor_db::{DB, Server};
-use metor_panel::command_palette::PalettePage;
 use metor_panel::inspector::Inspector;
 use metor_panel::inspector::{InspectorMode, InspectorRequest};
+use metor_panel::items::ItemRegistry;
 use metor_panel::pending_edits::{
-    self, edit_value_page, pending_edits, pending_edits_mut, review_page,
+    self, edit_value_rows, pending_edits, pending_edits_mut, review_rows,
 };
-use metor_panel::tiles::panels::tile_palette_page;
 use metor_panel::tiles::{TileGroup, TileGroupEvent};
 use stellarator::{net::TcpListener, struc_con::stellar};
 
@@ -36,7 +35,6 @@ struct AppRoot {
     db: Arc<DB>,
     tiles: Entity<TileGroup>,
     inspector: Option<Entity<Inspector>>,
-    pending_inspect: Option<PalettePage>,
     pending_inspector_request: Option<(Box<dyn metor_panel::tiles::PaneItemHandle>, Point<Pixels>)>,
     pending_inspector_open: Option<InspectorRequest>,
     focus_handle: FocusHandle,
@@ -46,39 +44,39 @@ impl AppRoot {
     fn new(db: Arc<DB>, cx: &mut Context<Self>) -> Self {
         let tiles = cx.new(|cx| TileGroup::new(vec![], cx));
         cx.subscribe(&tiles, Self::handle_tile_event).detach();
+        let on_open_inspector = Self::make_on_open_inspector(cx.entity().clone());
+        metor_panel::items::register_builtin_providers(
+            db.clone(),
+            tiles.clone(),
+            on_open_inspector,
+            cx,
+        );
         Self {
             db,
             tiles,
             inspector: None,
-            pending_inspect: None,
             pending_inspector_request: None,
             pending_inspector_open: None,
             focus_handle: cx.focus_handle(),
         }
     }
 
-    fn open_palette(&mut self, page: PalettePage, window: &mut Window, cx: &mut Context<Self>) {
-        let rows = metor_panel::inspector::palette_page_to_rows(page);
+    fn open_inspector_with(
+        &mut self,
+        rows: Vec<Box<dyn metor_panel::widgets::InspectorRow>>,
+        mode: InspectorMode,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let parent_focus = self.focus_handle.clone();
         let inspector = cx.new(|cx| {
-            let mut insp = Inspector::new(rows, InspectorMode::Centered, cx);
+            let mut insp = Inspector::new(rows, mode, cx);
             insp.set_parent_focus(parent_focus);
             insp
         });
         inspector.focus_handle(cx).focus(window);
         self.inspector = Some(inspector);
         cx.notify();
-    }
-
-    fn make_on_inspect(
-        root: Entity<AppRoot>,
-    ) -> impl Fn(PalettePage, &mut Window, &mut App) + 'static {
-        move |page, _window, cx| {
-            root.update(cx, |this, cx| {
-                this.pending_inspect = Some(page);
-                cx.notify();
-            });
-        }
     }
 
     fn make_on_open_inspector(
@@ -102,18 +100,8 @@ impl AppRoot {
             }
         }
 
-        let on_inspect = Self::make_on_inspect(cx.entity().clone());
-        let on_open_inspector = Self::make_on_open_inspector(cx.entity().clone());
-        let pane = self.tiles.read(cx).panes()[0].clone();
-        let page = tile_palette_page(
-            self.db.clone(),
-            pane,
-            &self.tiles,
-            on_inspect,
-            Some(on_open_inspector),
-            cx,
-        );
-        self.open_palette(page, window, cx);
+        let rows = ItemRegistry::root_rows(&self.db, cx);
+        self.open_inspector_with(rows, InspectorMode::Centered, window, cx);
     }
 
     fn cycle_tab_forward(
@@ -148,8 +136,8 @@ impl AppRoot {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let page = review_page(self.db.clone(), cx);
-        self.open_palette(page, window, cx);
+        let rows = review_rows(self.db.clone(), cx);
+        self.open_inspector_with(rows, InspectorMode::Centered, window, cx);
     }
 
     fn open_inspector(
@@ -231,29 +219,18 @@ impl Render for AppRoot {
         }
 
         if let Some(request) = self.pending_inspector_open.take() {
-            let parent_focus = self.focus_handle.clone();
-            let inspector = cx.new(|cx| {
-                let mut insp = Inspector::new(request.rows, request.mode, cx);
-                insp.set_parent_focus(parent_focus);
-                insp
-            });
-            inspector.focus_handle(cx).focus(window);
-            self.inspector = Some(inspector);
-        }
-
-        if let Some(page) = self.pending_inspect.take() {
-            self.open_palette(page, window, cx);
+            self.open_inspector_with(request.rows, request.mode, window, cx);
         }
 
         if let Some(request) = pending_edits_mut(cx).pending_request.take() {
-            let page = edit_value_page(self.db.clone(), request);
-            self.open_palette(page, window, cx);
+            let rows = edit_value_rows(self.db.clone(), request);
+            self.open_inspector_with(rows, InspectorMode::Centered, window, cx);
         }
 
         if pending_edits(cx).open_review_requested {
             pending_edits_mut(cx).open_review_requested = false;
-            let page = review_page(self.db.clone(), cx);
-            self.open_palette(page, window, cx);
+            let rows = review_rows(self.db.clone(), cx);
+            self.open_inspector_with(rows, InspectorMode::Centered, window, cx);
         }
 
         let theme = metor_panel::theme::theme(cx);
@@ -382,6 +359,7 @@ fn main() {
                 metor_panel::theme::DARK.clone(),
             )));
             pending_edits::init(cx);
+            ItemRegistry::init(cx);
             metor_panel::widget_registry::WidgetRegistry::init(db.clone(), cx);
             set_dock_icon();
             cx.bind_keys([

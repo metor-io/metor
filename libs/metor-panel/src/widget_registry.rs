@@ -205,10 +205,10 @@ impl WidgetRegistry {
                 let parent_for_add = parent.clone();
                 let add_behavior = add_behavior.clone();
 
-                Box::new(NavRow {
+                Box::new(NavRow::new(
                     label,
-                    summary: SharedString::from(format!("{} items", item_count)),
-                    build_children: Box::new(move |cx| {
+                    SharedString::from(format!("{} items", item_count)),
+                    Box::new(move |cx| {
                         let mut rows: Vec<Box<dyn InspectorRow>> = items
                             .iter()
                             .enumerate()
@@ -223,16 +223,16 @@ impl WidgetRegistry {
                                 let parent_for_remove = parent_for_add.clone();
                                 let idx = i;
 
-                                Box::new(NavRow {
-                                    label: item_label,
-                                    summary: SharedString::new_static(""),
-                                    build_children: Box::new(move |cx| {
+                                Box::new(NavRow::new(
+                                    item_label,
+                                    SharedString::new_static(""),
+                                    Box::new(move |cx| {
                                         let mut sub_rows =
                                             crate::reflect::rows_for_entity(&entity, &db, cx);
                                         let remove_parent = parent_for_remove.clone();
-                                        sub_rows.push(Box::new(CommandRow {
-                                            label: "Remove".into(),
-                                            callback: Arc::new(move |_w, cx| {
+                                        sub_rows.push(Box::new(CommandRow::new(
+                                            "Remove",
+                                            Arc::new(move |_w, cx| {
                                                 remove_parent.update(cx, |p, cx| {
                                                     let list = get_list_mut(p);
                                                     if idx < list.len() {
@@ -241,10 +241,10 @@ impl WidgetRegistry {
                                                     cx.notify();
                                                 });
                                             }),
-                                        }));
+                                        )));
                                         sub_rows
                                     }),
-                                }) as Box<dyn InspectorRow>
+                                )) as Box<dyn InspectorRow>
                             })
                             .collect();
 
@@ -253,9 +253,9 @@ impl WidgetRegistry {
                             AddBehavior::Default(factory) => {
                                 let add_parent = parent_for_add.clone();
                                 let factory = factory.clone();
-                                rows.push(Box::new(CommandRow {
-                                    label: "Add".into(),
-                                    callback: Arc::new(move |_w, cx| {
+                                rows.push(Box::new(CommandRow::new(
+                                    "Add",
+                                    Arc::new(move |_w, cx| {
                                         let item = factory(cx);
                                         let entity = cx.new(|_| item);
                                         add_parent.update(cx, |p, cx| {
@@ -263,25 +263,25 @@ impl WidgetRegistry {
                                             cx.notify();
                                         });
                                     }),
-                                }));
+                                )));
                             }
                             AddBehavior::Wizard(wizard) => {
                                 let add_parent = parent_for_add.clone();
                                 let db = db.clone();
                                 let wizard = wizard.clone();
-                                rows.push(Box::new(NavRow {
-                                    label: "Add".into(),
-                                    summary: SharedString::new_static(""),
-                                    build_children: Box::new(move |cx| {
+                                rows.push(Box::new(NavRow::new(
+                                    "Add",
+                                    SharedString::new_static(""),
+                                    Box::new(move |cx| {
                                         wizard(add_parent.clone().into_any(), &db, cx)
                                     }),
-                                }));
+                                )));
                             }
                         }
 
                         rows
                     }),
-                })
+                ))
             }),
         );
     }
@@ -379,13 +379,11 @@ impl WidgetRegistry {
             });
             let label = ctx.label.clone();
             let db = ctx.db.clone();
-            Box::new(NavRow {
+            Box::new(NavRow::new(
                 label,
-                summary: current_name.unwrap_or_else(|| SharedString::from(format!("{}", current))),
-                build_children: Box::new(move |cx| {
-                    build_component_picker(&db, any_entity.clone(), idx, cx)
-                }),
-            })
+                current_name.unwrap_or_else(|| SharedString::from(format!("{}", current))),
+                Box::new(move |cx| build_component_picker(&db, any_entity.clone(), idx, cx)),
+            ))
         }));
     }
 
@@ -397,19 +395,19 @@ impl WidgetRegistry {
                 .expect("Viewer3d type mismatch");
             let mut rows = crate::reflect::default_rows_for_any_entity(&any_entity, db, cx);
             let add_viewer = viewer.clone();
-            rows.push(Box::new(CommandRow {
-                label: "Add Model".into(),
-                callback: Arc::new(move |_w, cx| {
+            rows.push(Box::new(CommandRow::new(
+                "Add Model",
+                Arc::new(move |_w, cx| {
                     add_viewer.update(cx, |v, cx| v.add_model("", "", cx));
                 }),
-            }));
+            )));
             let reset_viewer = viewer.clone();
-            rows.push(Box::new(CommandRow {
-                label: "Reset Camera".into(),
-                callback: Arc::new(move |_w, cx| {
+            rows.push(Box::new(CommandRow::new(
+                "Reset Camera",
+                Arc::new(move |_w, cx| {
                     reset_viewer.update(cx, |v, cx| v.reset_camera(cx));
                 }),
-            }));
+            )));
             rows
         }));
     }
@@ -419,8 +417,7 @@ impl WidgetRegistry {
             |any_entity, db, cx| {
                 let entity: Entity<crate::tiles::dashboard::DashboardPanel> =
                     any_entity.downcast().expect("DashboardPanel type mismatch");
-                let page = crate::tiles::dashboard::dashboard_palette_page(entity, db.clone(), cx);
-                crate::inspector::palette_page_to_rows(page)
+                crate::tiles::dashboard::dashboard_rows(entity, db.clone(), cx)
             },
         ));
     }
@@ -455,12 +452,12 @@ fn build_component_picker(
         .into_iter()
         .map(|(id, name)| {
             let any_entity = any_entity.clone();
-            Box::new(CommandRow {
-                label: SharedString::from(name),
-                callback: Arc::new(move |_w, cx| {
+            Box::new(CommandRow::new(
+                SharedString::from(name),
+                Arc::new(move |_w, cx| {
                     crate::reflect::set_field::<ComponentId>(&any_entity, idx, id, cx);
                 }),
-            }) as Box<dyn InspectorRow>
+            )) as Box<dyn InspectorRow>
         })
         .collect()
 }
@@ -481,10 +478,10 @@ fn build_trace_add_wizard(
             let db = db.clone();
             let comp_name = comp_name.clone();
 
-            Box::new(NavRow {
-                label: SharedString::from(comp_name.clone()),
-                summary: SharedString::new_static(""),
-                build_children: Box::new(move |cx| {
+            Box::new(NavRow::new(
+                SharedString::from(comp_name.clone()),
+                SharedString::new_static(""),
+                Box::new(move |cx| {
                     let elem_names = crate::trace_picker::element_names_for_component(&db, comp_id);
                     let elem_names = if elem_names.is_empty() {
                         vec!["value".to_string()]
@@ -500,9 +497,9 @@ fn build_trace_add_wizard(
                         let comp_name = comp_name.clone();
                         let elem_count = elem_names.len();
                         let names = elem_names.clone();
-                        rows.push(Box::new(CommandRow {
-                            label: SharedString::from(format!("{} (all)", comp_name)),
-                            callback: Arc::new(move |_w, cx| {
+                        rows.push(Box::new(CommandRow::new(
+                            SharedString::from(format!("{} (all)", comp_name)),
+                            Arc::new(move |_w, cx| {
                                 let parent: Entity<LinePlot> =
                                     parent.clone().downcast().expect("parent type mismatch");
                                 let theme = crate::theme::theme(cx);
@@ -526,7 +523,7 @@ fn build_trace_add_wizard(
                                     cx.notify();
                                 });
                             }),
-                        }));
+                        )));
                     }
 
                     // Individual element options
@@ -540,9 +537,9 @@ fn build_trace_add_wizard(
                         };
                         let label_text = format!("{}.{}", comp_name, display);
 
-                        rows.push(Box::new(CommandRow {
-                            label: SharedString::from(label_text),
-                            callback: Arc::new(move |_w, cx| {
+                        rows.push(Box::new(CommandRow::new(
+                            SharedString::from(label_text),
+                            Arc::new(move |_w, cx| {
                                 let parent: Entity<LinePlot> =
                                     parent.clone().downcast().expect("parent type mismatch");
                                 let theme = crate::theme::theme(cx);
@@ -557,12 +554,12 @@ fn build_trace_add_wizard(
                                     cx.notify();
                                 });
                             }),
-                        }));
+                        )));
                     }
 
                     rows
                 }),
-            }) as Box<dyn InspectorRow>
+            )) as Box<dyn InspectorRow>
         })
         .collect()
 }

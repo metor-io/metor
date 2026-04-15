@@ -10,6 +10,7 @@ use crate::theme::theme;
 pub mod bool_row;
 pub mod color_row;
 pub mod command_row;
+pub mod default_action_row;
 pub mod enum_row;
 pub mod list_row;
 pub mod scalar_row;
@@ -20,6 +21,7 @@ pub mod text_row;
 pub use bool_row::BoolRow;
 pub use color_row::ColorRow;
 pub use command_row::CommandRow;
+pub use default_action_row::DefaultActionRow;
 pub use enum_row::EnumRow;
 pub use list_row::NavRow;
 pub use scalar_row::ScalarRow;
@@ -62,6 +64,21 @@ pub enum RowAction {
         /// Called when editing is committed.
         on_commit: Box<dyn FnOnce(String, &mut Window, &mut App)>,
     },
+}
+
+/// Small category pill rendered alongside a row label.
+pub fn tag_pill(tag: SharedString, cx: &App) -> impl IntoElement {
+    let theme = theme(cx);
+    div()
+        .px(px(6.0))
+        .py(px(1.0))
+        .bg(theme.pill_bg)
+        .border_1()
+        .border_color(theme.pill_border)
+        .rounded(px(3.0))
+        .text_size(px(10.0))
+        .text_color(theme.text_secondary)
+        .child(tag)
 }
 
 /// Shared base styling for an inspector row.
