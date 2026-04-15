@@ -33,6 +33,7 @@ use metor_proto::types::{ComponentId, Timestamp};
 
 use super::bounds::PlotBounds;
 use super::gpu::{LineDraw, PlotRenderState};
+use super::override_field::Override;
 use super::{Trace, expand_y_bounds};
 use crate::offset_parse::TimeRangeBehavior;
 use crate::wait_for_component;
@@ -66,6 +67,16 @@ struct OverrideSnapshot {
     x_range: TimeRangeBehavior,
 }
 
+impl OverrideSnapshot {
+    fn capture(lp: &LinePlot) -> Self {
+        Self {
+            y_min: lp.y_min_override.as_custom().copied(),
+            y_max: lp.y_max_override.as_custom().copied(),
+            x_range: lp.x_range,
+        }
+    }
+}
+
 /// A self-contained GPU-accelerated line plot. Holds its own render
 /// state, trace list, per-trace y-bounds trackers, and view-override
 /// knobs. Implements [`Render`] so parents just `.child(entity.clone())`
@@ -74,9 +85,9 @@ struct OverrideSnapshot {
 pub struct LinePlot {
     pub traces: Vec<Entity<Trace>>,
     pub x_range: TimeRangeBehavior,
-    pub y_min_override: Option<f64>,
-    pub y_max_override: Option<f64>,
-    pub custom_title: Option<SharedString>,
+    pub y_min_override: Override<f64>,
+    pub y_max_override: Override<f64>,
+    pub custom_title: Override<SharedString>,
 
     #[facet(opaque)]
     db: Arc<DB>,
@@ -100,9 +111,9 @@ impl LinePlot {
         Self {
             traces: Vec::new(),
             x_range: TimeRangeBehavior::default(),
-            y_min_override: None,
-            y_max_override: None,
-            custom_title: None,
+            y_min_override: Override::Auto,
+            y_max_override: Override::Auto,
+            custom_title: Override::Auto,
             db,
             tracking: HashMap::new(),
             tasks: HashMap::new(),
@@ -156,20 +167,15 @@ impl LinePlot {
             }
         }
 
-        let snapshot = OverrideSnapshot {
-            y_min: self.y_min_override,
-            y_max: self.y_max_override,
-            x_range: self.x_range,
-        };
+        let snapshot = OverrideSnapshot::capture(self);
         if snapshot != self.last_overrides {
             self.view_override = None;
             self.last_overrides = snapshot;
         }
 
-        self.title_cache = if let Some(custom) = &self.custom_title {
-            custom.clone()
-        } else {
-            derive_title(&self.traces, &self.db, cx)
+        self.title_cache = match &self.custom_title {
+            Override::Custom(custom) => custom.clone(),
+            Override::Auto => derive_title(&self.traces, &self.db, cx),
         };
     }
 
@@ -216,8 +222,8 @@ impl LinePlot {
             .x_range
             .calculate_range(Timestamp(start as i64), Timestamp(end as i64));
         let (auto_min, auto_max) = if any_y { (y_min, y_max) } else { (0.0, 1.0) };
-        let min_y = self.y_min_override.unwrap_or(auto_min);
-        let max_y = self.y_max_override.unwrap_or(auto_max);
+        let min_y = self.y_min_override.as_custom().copied().unwrap_or(auto_min);
+        let max_y = self.y_max_override.as_custom().copied().unwrap_or(auto_max);
         Some(PlotBounds::new(range.start.0 as f64, min_y, range.end.0 as f64, max_y).normalize())
     }
 

@@ -14,9 +14,10 @@ use gpui::{AnyEntity, App, AppContext, Entity, Global, Hsla, SharedString};
 use metor_db::DB;
 use metor_proto::types::ComponentId;
 
-use crate::elements::time_series::{LinePlot, Trace};
+use crate::elements::time_series::{LinePlot, Override, Trace};
 use crate::elements::viewer_3d::Viewer3d;
-use crate::widgets::{ColorRow, CommandRow, InspectorRow, NavRow, TextRow};
+use crate::offset_parse::TimeRangeBehavior;
+use crate::widgets::{ColorRow, CommandRow, InspectorRow, NavRow, ScalarRow, TextRow};
 
 /// Context passed to field widget factories.
 pub struct FieldBuildCtx<'a> {
@@ -297,6 +298,9 @@ impl WidgetRegistry {
         self.register_hsla();
         self.register_shared_string();
         self.register_component_id(db.clone());
+        self.register_override_f64();
+        self.register_override_shared_string();
+        self.register_time_range_behavior();
         self.register_inspectable::<crate::elements::Monitor>();
         self.register_entity_list::<LinePlot, Trace>(
             db.clone(),
@@ -385,6 +389,122 @@ impl WidgetRegistry {
         }));
     }
 
+    /// Widget for `Override<f64>`. Top-level row shows `Auto` or the number;
+    /// cascading reveals a `ScalarRow` that writes `Custom(v)` and a command
+    /// row that flips it back to `Auto`.
+    fn register_override_f64(&mut self) {
+        self.register_field_widget::<Override<f64>>(Arc::new(|ctx, peek, any_entity, idx| {
+            let current = peek.get::<Override<f64>>().unwrap().clone();
+            build_override_row(
+                ctx.label.clone(),
+                current,
+                any_entity,
+                idx,
+                |v| SharedString::from(format!("{}", v)),
+                |label, initial, any_entity, idx| {
+                    let write = any_entity.clone();
+                    Box::new(ScalarRow {
+                        label,
+                        value: initial,
+                        on_change: Arc::new(move |v, _w, cx| {
+                            crate::reflect::set_field::<Override<f64>>(
+                                &write,
+                                idx,
+                                Override::Custom(v),
+                                cx,
+                            );
+                        }),
+                    })
+                },
+            )
+        }));
+    }
+
+    /// Widget for `Override<SharedString>`. Mirrors [`Self::register_override_f64`]
+    /// but uses a `TextRow` as the value editor.
+    fn register_override_shared_string(&mut self) {
+        self.register_field_widget::<Override<SharedString>>(Arc::new(
+            |ctx, peek, any_entity, idx| {
+                let current = peek.get::<Override<SharedString>>().unwrap().clone();
+                build_override_row(
+                    ctx.label.clone(),
+                    current,
+                    any_entity,
+                    idx,
+                    |s| s.clone(),
+                    |label, initial, any_entity, idx| {
+                        let write = any_entity.clone();
+                        Box::new(TextRow::new(
+                            label,
+                            initial,
+                            Arc::new(move |s, _w, cx| {
+                                crate::reflect::set_field::<Override<SharedString>>(
+                                    &write,
+                                    idx,
+                                    Override::Custom(SharedString::from(s)),
+                                    cx,
+                                );
+                            }),
+                        ))
+                    },
+                )
+            },
+        ));
+    }
+
+    /// Widget for `TimeRangeBehavior`. Top-level row shows the current preset
+    /// name (or the formatted range when off-preset); cascading reveals a list
+    /// of presets plus a free-form text field for arbitrary input.
+    fn register_time_range_behavior(&mut self) {
+        self.register_field_widget::<TimeRangeBehavior>(Arc::new(
+            |ctx, peek, any_entity, idx| {
+                let current = *peek.get::<TimeRangeBehavior>().unwrap();
+                let summary = preset_label(&current)
+                    .map(SharedString::from)
+                    .unwrap_or_else(|| SharedString::from(format!("{}", current)));
+                let label = ctx.label.clone();
+                Box::new(NavRow::new(
+                    label,
+                    summary,
+                    Box::new(move |cx| {
+                        let current = crate::reflect::get_field::<TimeRangeBehavior>(
+                            &any_entity, idx, cx,
+                        )
+                        .unwrap_or_default();
+                        let mut rows: Vec<Box<dyn InspectorRow>> = TimeRangeBehavior::PRESETS
+                            .iter()
+                            .map(|(name, value)| {
+                                let entity = any_entity.clone();
+                                let value = *value;
+                                Box::new(CommandRow::new(
+                                    *name,
+                                    Arc::new(move |_w, cx| {
+                                        crate::reflect::set_field::<TimeRangeBehavior>(
+                                            &entity, idx, value, cx,
+                                        );
+                                    }),
+                                )) as Box<dyn InspectorRow>
+                            })
+                            .collect();
+                        let entity = any_entity.clone();
+                        rows.push(Box::new(TextRow::new(
+                            SharedString::new_static("Custom"),
+                            SharedString::from(format!("{}", current)),
+                            Arc::new(move |s, _w, cx| {
+                                if let Ok(value) = s.parse::<TimeRangeBehavior>() {
+                                    crate::reflect::set_field::<TimeRangeBehavior>(
+                                        &entity, idx, value, cx,
+                                    );
+                                }
+                            }),
+                        )));
+                        rows
+                    }),
+                ))
+            },
+        ));
+    }
+
     fn register_viewer3d_builder(&mut self, _db: Arc<DB>) {
         self.register_type_builder::<Viewer3d>(Arc::new(|any_entity, db, cx| {
             let viewer: Entity<Viewer3d> = any_entity
@@ -458,6 +578,63 @@ fn build_component_picker(
             )) as Box<dyn InspectorRow>
         })
         .collect()
+}
+
+/// Return the preset display name if `value` matches one of the
+/// [`TimeRangeBehavior::PRESETS`].
+fn preset_label(value: &TimeRangeBehavior) -> Option<&'static str> {
+    TimeRangeBehavior::PRESETS
+        .iter()
+        .find(|(_, preset)| preset == value)
+        .map(|(name, _)| *name)
+}
+
+/// Construct the top-level `NavRow` for an `Override<T>` field. Its summary
+/// reflects the current variant, and cascading reveals a value editor plus an
+/// "Auto" command row.
+fn build_override_row<T>(
+    label: SharedString,
+    current: Override<T>,
+    any_entity: AnyEntity,
+    idx: usize,
+    fmt_custom: impl Fn(&T) -> SharedString + 'static,
+    value_row: impl Fn(SharedString, T, AnyEntity, usize) -> Box<dyn InspectorRow> + 'static,
+) -> Box<dyn InspectorRow>
+where
+    T: Facet<'static> + Clone + Default + 'static,
+{
+    let summary = match &current {
+        Override::Auto => SharedString::new_static("Auto"),
+        Override::Custom(v) => fmt_custom(v),
+    };
+    let label_for_value = label.clone();
+    Box::new(NavRow::new(
+        label,
+        summary,
+        Box::new(move |cx| {
+            let initial = crate::reflect::get_field::<Override<T>>(&any_entity, idx, cx)
+                .unwrap_or(Override::Auto);
+            let value_initial = match &initial {
+                Override::Custom(v) => v.clone(),
+                Override::Auto => T::default(),
+            };
+            let mut rows: Vec<Box<dyn InspectorRow>> = Vec::new();
+            rows.push(value_row(
+                label_for_value.clone(),
+                value_initial,
+                any_entity.clone(),
+                idx,
+            ));
+            let auto_entity = any_entity.clone();
+            rows.push(Box::new(CommandRow::new(
+                "Auto",
+                Arc::new(move |_w, cx| {
+                    crate::reflect::set_field::<Override<T>>(&auto_entity, idx, Override::Auto, cx);
+                }),
+            )));
+            rows
+        }),
+    ))
 }
 
 /// Build a trace construction wizard: component picker → element picker →

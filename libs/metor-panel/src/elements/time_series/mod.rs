@@ -19,6 +19,9 @@ mod gpu;
 mod line_plot;
 pub use line_plot::LinePlot;
 
+mod override_field;
+pub use override_field::Override;
+
 /// Generate Y-axis tick positions within the visible bounds (sorted ascending).
 /// When the range spans 0, ticks are anchored at 0 and extend outward.
 fn y_ticks(view: &PlotBounds, target_count: usize) -> impl Iterator<Item = f64> {
@@ -596,8 +599,8 @@ impl TimeSeriesPlot {
     fn reset_view(&mut self, cx: &mut Context<Self>) {
         self.line_plot.update(cx, |lp, cx| {
             lp.x_range = TimeRangeBehavior::default();
-            lp.y_min_override = None;
-            lp.y_max_override = None;
+            lp.y_min_override = Override::Auto;
+            lp.y_max_override = Override::Auto;
             lp.set_view_override(None, cx);
             cx.notify();
         });
