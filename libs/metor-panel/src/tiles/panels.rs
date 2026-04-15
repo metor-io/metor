@@ -117,7 +117,16 @@ impl PlotPanel {
 
     /// Create an empty plot panel, ready to be configured via the inspector.
     pub fn empty(db: Arc<DB>, cx: &mut Context<Self>) -> Self {
-        let inner = cx.new(|cx| TimeSeriesPlot::new(db.clone(), vec![], cx));
+        Self::with_traces(db, vec![], cx)
+    }
+
+    /// Create a plot panel pre-populated with the given traces.
+    pub fn with_traces(
+        db: Arc<DB>,
+        traces: Vec<crate::elements::time_series::Trace>,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        let inner = cx.new(|cx| TimeSeriesPlot::new(db.clone(), traces, cx));
         let line_plot = inner.read(cx).line_plot().clone();
         Self {
             db,
@@ -240,37 +249,52 @@ pub fn new_panel_rows(
 ) -> Vec<Box<dyn InspectorRow>> {
     let mut rows: Vec<Box<dyn InspectorRow>> = Vec::new();
 
-    rows.push(Box::new(CommandRow::new("Time Series Plot", {
-        let db = db.clone();
-        let pane = pane.clone();
-        let on_open_inspector = on_open_inspector.clone();
-        Arc::new(move |window, cx| {
-            let plot_panel = {
-                let db = db.clone();
-                cx.new(|cx| PlotPanel::empty(db, cx))
-            };
-            let inner = plot_panel.read(cx).inner().clone();
+    rows.push(Box::new(NavRow::new(
+        "Time Series Plot",
+        SharedString::new_static(""),
+        {
+            let db = db.clone();
+            let pane = pane.clone();
+            let on_open_inspector = on_open_inspector.clone();
+            Box::new(move |_cx| {
+                let db_for_select = db.clone();
+                let pane = pane.clone();
+                let on_open_inspector = on_open_inspector.clone();
+                crate::trace_picker::select_traces_wizard_rows(
+                    db.clone(),
+                    Arc::new(|_cx| 0),
+                    Arc::new(move |traces, window, cx| {
+                        let db_for_panel = db_for_select.clone();
+                        let plot_panel =
+                            cx.new(|cx| PlotPanel::with_traces(db_for_panel, traces, cx));
+                        let inner = plot_panel.read(cx).inner().clone();
 
-            pane.update(cx, |pane, cx| {
-                pane.add_item(Box::new(plot_panel), cx);
-            });
+                        pane.update(cx, |pane, cx| {
+                            pane.add_item(Box::new(plot_panel), cx);
+                        });
 
-            // Auto-open the inspector so the user gets the trace wizard
-            if let Some(on_open_inspector) = &on_open_inspector {
-                let inner_any = inner.into_any();
-                if let Some(rows) = crate::reflect::rows_for_any_entity(&inner_any, &db, cx) {
-                    on_open_inspector(
-                        InspectorRequest {
-                            rows,
-                            mode: InspectorMode::Centered,
-                        },
-                        window,
-                        cx,
-                    );
-                }
-            }
-        })
-    })));
+                        if let Some(on_open_inspector) = &on_open_inspector {
+                            let inner_any = inner.into_any();
+                            if let Some(rows) = crate::reflect::rows_for_any_entity(
+                                &inner_any,
+                                &db_for_select,
+                                cx,
+                            ) {
+                                on_open_inspector(
+                                    InspectorRequest {
+                                        rows,
+                                        mode: InspectorMode::Centered,
+                                    },
+                                    window,
+                                    cx,
+                                );
+                            }
+                        }
+                    }),
+                )
+            })
+        },
+    )));
 
     rows.push(Box::new(NavRow::new(
         "Component Text",

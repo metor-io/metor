@@ -462,104 +462,35 @@ fn build_component_picker(
         .collect()
 }
 
-/// Build a trace construction wizard: component picker → element picker → create trace.
+/// Build a trace construction wizard: component picker → element picker →
+/// append the new trace(s) to the existing `LinePlot`'s `traces` list.
+///
+/// Color-index basis is the parent's current trace count, so newly added
+/// traces continue the color palette where it left off.
 fn build_trace_add_wizard(
     parent: gpui::AnyEntity,
     db: &Arc<DB>,
     _cx: &App,
 ) -> Vec<Box<dyn InspectorRow>> {
-    let components = crate::trace_picker::list_components(db);
-    let db = db.clone();
+    let parent_for_basis = parent.clone();
+    let color_basis: crate::trace_picker::ColorBasis = Arc::new(move |cx: &App| {
+        parent_for_basis
+            .clone()
+            .downcast::<LinePlot>()
+            .map(|p| p.read(cx).traces.len())
+            .unwrap_or(0)
+    });
 
-    components
-        .into_iter()
-        .map(|(comp_id, comp_name)| {
-            let parent = parent.clone();
-            let db = db.clone();
-            let comp_name = comp_name.clone();
+    let on_select: crate::trace_picker::OnTracesSelected =
+        Arc::new(move |traces, _w, cx| {
+            let parent: Entity<LinePlot> =
+                parent.clone().downcast().expect("parent type mismatch");
+            let new_entities: Vec<_> = traces.into_iter().map(|t| cx.new(|_| t)).collect();
+            parent.update(cx, |lp, cx| {
+                lp.traces.extend(new_entities);
+                cx.notify();
+            });
+        });
 
-            Box::new(NavRow::new(
-                SharedString::from(comp_name.clone()),
-                SharedString::new_static(""),
-                Box::new(move |cx| {
-                    let elem_names = crate::trace_picker::element_names_for_component(&db, comp_id);
-                    let elem_names = if elem_names.is_empty() {
-                        vec!["value".to_string()]
-                    } else {
-                        elem_names
-                    };
-
-                    let mut rows: Vec<Box<dyn InspectorRow>> = Vec::new();
-
-                    // "All" option — adds every element as a trace at once
-                    if elem_names.len() > 1 {
-                        let parent = parent.clone();
-                        let comp_name = comp_name.clone();
-                        let elem_count = elem_names.len();
-                        let names = elem_names.clone();
-                        rows.push(Box::new(CommandRow::new(
-                            SharedString::from(format!("{} (all)", comp_name)),
-                            Arc::new(move |_w, cx| {
-                                let parent: Entity<LinePlot> =
-                                    parent.clone().downcast().expect("parent type mismatch");
-                                let theme = crate::theme::theme(cx);
-                                let base_idx = parent.read(cx).traces.len();
-                                let mut new_entities = Vec::with_capacity(elem_count);
-                                for (idx, elem_name) in names.iter().enumerate() {
-                                    let color = theme.line_colors
-                                        [(base_idx + idx) % theme.line_colors.len()];
-                                    let display = if elem_name.is_empty() {
-                                        format!("[{}]", idx)
-                                    } else {
-                                        elem_name.clone()
-                                    };
-                                    let mut trace = Trace::new(comp_id, idx, color);
-                                    trace.label =
-                                        SharedString::from(format!("{}.{}", comp_name, display));
-                                    new_entities.push(cx.new(|_| trace));
-                                }
-                                parent.update(cx, |lp, cx| {
-                                    lp.traces.extend(new_entities);
-                                    cx.notify();
-                                });
-                            }),
-                        )));
-                    }
-
-                    // Individual element options
-                    for (idx, elem_name) in elem_names.into_iter().enumerate() {
-                        let parent = parent.clone();
-                        let comp_name = comp_name.clone();
-                        let display = if elem_name.is_empty() {
-                            format!("[{}]", idx)
-                        } else {
-                            elem_name
-                        };
-                        let label_text = format!("{}.{}", comp_name, display);
-
-                        rows.push(Box::new(CommandRow::new(
-                            SharedString::from(label_text),
-                            Arc::new(move |_w, cx| {
-                                let parent: Entity<LinePlot> =
-                                    parent.clone().downcast().expect("parent type mismatch");
-                                let theme = crate::theme::theme(cx);
-                                let color_idx = parent.read(cx).traces.len();
-                                let color = theme.line_colors[color_idx % theme.line_colors.len()];
-                                let mut trace = Trace::new(comp_id, idx, color);
-                                trace.label =
-                                    SharedString::from(format!("{}.{}", comp_name, display));
-                                let entity = cx.new(|_| trace);
-                                parent.update(cx, |lp, cx| {
-                                    lp.traces.push(entity);
-                                    cx.notify();
-                                });
-                            }),
-                        )));
-                    }
-
-                    rows
-                }),
-            )) as Box<dyn InspectorRow>
-        })
-        .collect()
+    crate::trace_picker::select_traces_wizard_rows(db.clone(), color_basis, on_select)
 }

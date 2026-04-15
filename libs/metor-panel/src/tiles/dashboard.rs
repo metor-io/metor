@@ -191,6 +191,32 @@ impl DashboardPanel {
         }
     }
 
+    /// Insert a widget whose view + inspectable entity were built externally
+    /// (e.g. by the new-plot wizard, which constructs a pre-populated
+    /// `TimeSeriesPlot`). The widget's `config` is left empty — round-trip
+    /// persistence of the pre-built state is not handled by this path.
+    pub fn add_widget_with_entity(
+        &mut self,
+        kind: WidgetKind,
+        view: AnyView,
+        entity: gpui::AnyEntity,
+        cx: &mut Context<Self>,
+    ) -> WidgetId {
+        let id = self.alloc_id();
+        let (w, h) = kind.default_size();
+        let rect = self.auto_place(w, h);
+        self.widgets.push(DashboardWidget {
+            id,
+            rect,
+            kind,
+            config: serde_json::json!({}),
+        });
+        self.widget_views.insert(id, view);
+        self.widget_entities.insert(id, entity);
+        cx.notify();
+        id
+    }
+
     fn add_widget(
         &mut self,
         kind: WidgetKind,
@@ -813,14 +839,35 @@ fn add_widget_rows(
 ) -> Vec<Box<dyn InspectorRow>> {
     let mut rows: Vec<Box<dyn InspectorRow>> = Vec::new();
 
-    rows.push(Box::new(CommandRow::new("Time Series Plot", {
-        let dashboard = dashboard.clone();
-        Arc::new(move |_window, cx| {
-            dashboard.update(cx, |this, cx| {
-                this.add_widget(WidgetKind::Plot, serde_json::json!({}), cx);
-            });
-        })
-    })));
+    rows.push(Box::new(NavRow::new(
+        "Time Series Plot",
+        SharedString::new_static(""),
+        {
+            let dashboard = dashboard.clone();
+            let db = db.clone();
+            Box::new(move |_cx| {
+                let dashboard = dashboard.clone();
+                let db_for_plot = db.clone();
+                crate::trace_picker::select_traces_wizard_rows(
+                    db.clone(),
+                    Arc::new(|_cx| 0),
+                    Arc::new(move |traces, _window, cx| {
+                        let db_for_plot = db_for_plot.clone();
+                        let plot = cx.new(|cx| TimeSeriesPlot::new(db_for_plot, traces, cx));
+                        let line_plot = plot.read(cx).line_plot().clone();
+                        dashboard.update(cx, |this, cx| {
+                            this.add_widget_with_entity(
+                                WidgetKind::Plot,
+                                AnyView::from(plot),
+                                line_plot.into_any(),
+                                cx,
+                            );
+                        });
+                    }),
+                )
+            })
+        },
+    )));
     rows.push(Box::new(NavRow::new("Component Text", SharedString::new_static(""), {
         let dashboard = dashboard.clone();
         let db = db.clone();

@@ -26,6 +26,7 @@ pub(crate) mod bevy_app;
 pub mod bridge;
 pub mod camera;
 
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -38,12 +39,12 @@ use bevy::render::gpu_readback::Readback;
 use bevy::world_serialization::WorldAssetRoot;
 use glam::{Quat, Vec3};
 use gpui::{
-    Bounds, Context, Corners, IntoElement, MouseButton, Pixels, Point, RenderImage, SharedString,
-    Window, canvas, div, prelude::*, px,
+    Bounds, Context, Corners, EntityId, IntoElement, MouseButton, Pixels, Point, RenderImage,
+    SharedString, Subscription, Window, canvas, div, prelude::*, px,
 };
 use image::{Frame, ImageBuffer, Rgba};
 use metor_db::DB;
-use metor_proto::types::ComponentView;
+use metor_proto::types::{ComponentId, ComponentView};
 use smallvec::SmallVec;
 
 use crate::theme::theme;
@@ -133,31 +134,61 @@ pub struct Viewer3d {
     loading_until: Option<Instant>,
     #[facet(opaque)]
     drag: Option<DragState>,
+    #[facet(opaque)]
+    tracking: HashMap<EntityId, ModelTracking>,
+    #[facet(opaque)]
+    last_camera: CameraSnapshot,
 }
 
-/// One model in a viewer. Owns its path, label, bindings, and streaming
-/// tasks. The world-side `Entity` is created by a queued spawn op and
-/// written into `entity` once; later mutations load it the same way the
-/// viewer's own entities are loaded.
+struct ModelTracking {
+    entity: Arc<OnceLock<Entity>>,
+    /// Last path we spawned for. Reconcile compares against the entry's
+    /// current `path` and respawns the Bevy entity on any change.
+    path: String,
+    /// Last bindings we wired. Reconcile compares against the entry's
+    /// current bindings and rebinds streaming tasks on any change.
+    position_binding: Option<ComponentId>,
+    orientation_binding: Option<ComponentId>,
+    tasks: SmallVec<[gpui::Task<()>; 2]>,
+    /// Drops when the tracker is removed, unwiring child→parent notify
+    /// propagation for the now-removed model.
+    _subscription: Subscription,
+}
+
+/// Snapshot of inspectable camera scalars used to detect inspector edits
+/// between reconciles, so writes to `camera_fov` push through to the Bevy
+/// `Projection`.
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct CameraSnapshot {
+    fov_bits: u32,
+}
+
+impl CameraSnapshot {
+    fn from_fov(fov: f32) -> Self {
+        Self {
+            fov_bits: fov.to_bits(),
+        }
+    }
+}
+
+/// One model in a viewer. Pure config — the world-side `Entity`, binding
+/// tasks, and resolved component live in the parent's
+/// [`ModelTracking`] map keyed by this entry's gpui `EntityId`.
 #[derive(facet::Facet)]
 #[facet(pod)]
 pub struct ModelEntry {
     pub label: SharedString,
     pub path: String,
-    #[facet(opaque)]
-    entity: Arc<OnceLock<Entity>>,
-    position_binding: Option<metor_proto::types::ComponentId>,
-    orientation_binding: Option<metor_proto::types::ComponentId>,
-    #[facet(opaque)]
-    binding_tasks: SmallVec<[gpui::Task<()>; 2]>,
+    pub position_binding: Option<ComponentId>,
+    pub orientation_binding: Option<ComponentId>,
 }
 
 impl ModelEntry {
-    pub fn position_binding_component(&self) -> Option<metor_proto::types::ComponentId> {
+    pub fn position_binding_component(&self) -> Option<ComponentId> {
         self.position_binding
     }
 
-    pub fn orientation_binding_component(&self) -> Option<metor_proto::types::ComponentId> {
+    pub fn orientation_binding_component(&self) -> Option<ComponentId> {
         self.orientation_binding
     }
 
@@ -165,25 +196,9 @@ impl ModelEntry {
         Self {
             label: SharedString::new_static(""),
             path: String::new(),
-            entity: Arc::new(OnceLock::new()),
             position_binding: None,
             orientation_binding: None,
-            binding_tasks: SmallVec::new(),
         }
-    }
-
-    fn position_orientation_entity(
-        &self,
-    ) -> (
-        Option<metor_proto::types::ComponentId>,
-        Option<metor_proto::types::ComponentId>,
-        Arc<OnceLock<Entity>>,
-    ) {
-        (
-            self.position_binding,
-            self.orientation_binding,
-            self.entity.clone(),
-        )
     }
 }
 
@@ -280,14 +295,19 @@ impl Viewer3d {
 
         // Queue a despawn op on drop. Because `with_world` is FIFO and
         // our spawn op was enqueued first, by the time this op runs the
-        // entity cell is filled.
+        // entity cells are filled.
         let entities_for_release = entities.clone();
         cx.on_release(move |this, cx| {
             let ents = entities_for_release;
             let model_cells: Vec<Arc<OnceLock<Entity>>> =
-                this.models.iter().map(|m| m.read(cx).entity.clone()).collect();
+                this.tracking.values().map(|t| t.entity.clone()).collect();
             cx.update_global::<BevyBridge, _>(|bridge, _| {
-                for frame in this.current_frame.take().into_iter().chain(this.pending_release.take()) {
+                for frame in this
+                    .current_frame
+                    .take()
+                    .into_iter()
+                    .chain(this.pending_release.take())
+                {
                     bridge.orphan_release(frame);
                 }
                 bridge.with_world(move |world| {
@@ -304,7 +324,7 @@ impl Viewer3d {
 
         let camera = OrbitCamera::default();
         let camera_fov = camera.fov_y_rad;
-        cx.observe_self(Self::on_notify).detach();
+        cx.observe_self(Self::reconcile).detach();
         let mut viewer = Self {
             entities,
             render_layer,
@@ -319,6 +339,8 @@ impl Viewer3d {
             needs_render: true,
             loading_until: None,
             drag: None,
+            tracking: HashMap::new(),
+            last_camera: CameraSnapshot::from_fov(camera_fov),
         };
         viewer.sync_camera(cx);
         viewer
@@ -343,233 +365,286 @@ impl Viewer3d {
         cx.notify();
     }
 
-    fn on_notify(&mut self, cx: &mut Context<Self>) {
-        self.sync_models(cx);
-    }
-
-    /// Spawn Bevy entities for any model entries that don't have one yet.
-    fn sync_models(&mut self, cx: &mut Context<Self>) {
-        let layer = self.render_layer;
-        let pending: Vec<_> = self
-            .models
-            .iter()
-            .filter_map(|model| {
-                let entry = model.read(cx);
-                if entry.entity.get().is_some() {
-                    return None;
-                }
-                Some((entry.path.clone(), entry.entity.clone()))
-            })
-            .collect();
-        for (path, entity_cell) in pending {
-            if !path.is_empty() {
-                self.loading_until = Some(Instant::now() + POST_LOAD_WINDOW);
-            }
-            self.with_world(cx, move |world| {
-                let _ = entity_cell.set(spawn_model(world, layer, &path));
-            });
-        }
-    }
-
-    /// Queue a world op and mark the viewer dirty. Every viewer-side
-    /// mutator goes through this helper — it is the single point where
-    /// `update_global::<BevyBridge, _>(…bridge.with_world(…))` appears
-    /// in `Viewer3d`.
-    fn with_world(
-        &mut self,
-        cx: &mut Context<Self>,
-        f: impl FnOnce(&mut World) + Send + 'static,
-    ) {
-        cx.update_global::<BevyBridge, _>(|bridge, _| bridge.with_world(f));
-        self.mark_dirty(cx);
-    }
-
-    /// Queue a world op against one of this viewer's own entities. Thin
-    /// wrapper over [`Self::with_world`] that loads the entity cell for
-    /// the caller — the closure only runs if the initial spawn op has
-    /// populated the cell, which FIFO op ordering guarantees for every
-    /// mutation issued after construction.
+    /// Queue a world op against this viewer's own entities. The closure
+    /// only runs once the construction-time spawn op has populated the
+    /// cell, which FIFO ordering on the bridge guarantees. Marks the
+    /// viewer dirty so the next prepaint schedules a render.
     fn with_entities(
         &mut self,
         cx: &mut Context<Self>,
         f: impl FnOnce(&mut World, ViewerEntities) + Send + 'static,
     ) {
         let cell = self.entities.clone();
-        self.with_world(cx, move |world| {
-            if let Some(&ents) = cell.get() {
-                f(world, ents);
-            }
+        cx.update_global::<BevyBridge, _>(|bridge, _| {
+            bridge.with_world(move |world| {
+                if let Some(&ents) = cell.get() {
+                    f(world, ents);
+                }
+            });
         });
+        self.mark_dirty(cx);
     }
 
-    /// Queue a world op against a single model's entity, loading the
-    /// cell the same way [`Self::with_entities`] does for viewer
-    /// entities.
-    fn with_model_entity(
-        &mut self,
-        cx: &mut Context<Self>,
-        cell: Arc<OnceLock<Entity>>,
-        f: impl FnOnce(&mut World, Entity) + Send + 'static,
-    ) {
-        self.with_world(cx, move |world| {
-            if let Some(e) = cell.get().copied() {
-                f(world, e);
+    /// Reconcile the per-id [`ModelTracking`] map against the current
+    /// `models` Vec. Runs on every self-notify (including child notifies
+    /// proxied by the per-tracker subscription). Idempotent: branches
+    /// are gated on snapshot diffs so a no-op reconcile does no work.
+    ///
+    /// Sets `needs_render = true` directly rather than calling
+    /// `cx.notify()`, which would re-enter reconcile in an infinite loop.
+    /// The notify that triggered this run already scheduled the next
+    /// prepaint where `needs_render` will be observed.
+    fn reconcile(&mut self, cx: &mut Context<Self>) {
+        let mut work = false;
+
+        // 1. Drop trackers for removed models. Subscription drops with
+        //    the tracker; binding tasks drop with the SmallVec.
+        let current_ids: HashSet<EntityId> = self.models.iter().map(|m| m.entity_id()).collect();
+        let stale: Vec<EntityId> = self
+            .tracking
+            .keys()
+            .copied()
+            .filter(|id| !current_ids.contains(id))
+            .collect();
+        for id in stale {
+            let track = self.tracking.remove(&id).expect("just enumerated");
+            if let Some(entity) = track.entity.get().copied() {
+                cx.update_global::<BevyBridge, _>(|bridge, _| {
+                    bridge.with_world(move |world| {
+                        world.despawn(entity);
+                    });
+                });
             }
-        });
+            work = true;
+        }
+
+        // 2. Walk current models, creating trackers and reacting to
+        //    path / binding changes. Snapshot up-front so we can borrow
+        //    `self.tracking` mutably without aliasing `self.models`.
+        let layer = self.render_layer;
+        let db = self.db.clone();
+        let model_snapshots: Vec<(
+            EntityId,
+            gpui::Entity<ModelEntry>,
+            String,
+            Option<ComponentId>,
+            Option<ComponentId>,
+        )> = self
+            .models
+            .iter()
+            .map(|m| {
+                let id = m.entity_id();
+                let entry = m.read(cx);
+                (
+                    id,
+                    m.clone(),
+                    entry.path.clone(),
+                    entry.position_binding,
+                    entry.orientation_binding,
+                )
+            })
+            .collect();
+
+        for (id, model, path, pos_bind, orient_bind) in model_snapshots {
+            // Insert tracker on first sight, wiring a child→parent
+            // subscription so inspector edits to the entry trigger this
+            // reconcile.
+            if !self.tracking.contains_key(&id) {
+                let subscription = cx.observe(&model, |this, _, cx| {
+                    this.reconcile(cx);
+                });
+                self.tracking.insert(
+                    id,
+                    ModelTracking {
+                        entity: Arc::new(OnceLock::new()),
+                        path: String::new(),
+                        position_binding: None,
+                        orientation_binding: None,
+                        tasks: SmallVec::new(),
+                        _subscription: subscription,
+                    },
+                );
+                work = true;
+            }
+
+            // Path change: despawn previous Bevy entity (if any) and
+            // spawn a fresh one with a new cell. Bindings are also
+            // cleared because they captured the old cell — they'll be
+            // re-spawned by the bindings-changed branch below now that
+            // `track.position_binding` / `orientation_binding` were
+            // reset to `None`.
+            let track = self.tracking.get_mut(&id).expect("inserted above");
+            if track.path != path {
+                let old_cell = std::mem::replace(&mut track.entity, Arc::new(OnceLock::new()));
+                track.path = path.clone();
+                track.tasks.clear();
+                track.position_binding = None;
+                track.orientation_binding = None;
+                let new_cell = track.entity.clone();
+                if !path.is_empty() {
+                    self.loading_until = Some(Instant::now() + POST_LOAD_WINDOW);
+                }
+                let path_for_world = path;
+                cx.update_global::<BevyBridge, _>(|bridge, _| {
+                    bridge.with_world(move |world| {
+                        if let Some(prev) = old_cell.get().copied() {
+                            world.despawn(prev);
+                        }
+                        let _ = new_cell.set(spawn_model(world, layer, &path_for_world));
+                    });
+                });
+                work = true;
+            }
+
+            // Bindings changed: drop old tasks, reset LiveDelta, spawn
+            // fresh tasks against the (possibly fresh) entity cell.
+            let track = self.tracking.get_mut(&id).expect("inserted above");
+            let bindings_changed =
+                track.position_binding != pos_bind || track.orientation_binding != orient_bind;
+            if bindings_changed {
+                track.tasks.clear();
+                track.position_binding = pos_bind;
+                track.orientation_binding = orient_bind;
+
+                if let Some(db) = db.clone() {
+                    let entity_cell = track.entity.clone();
+                    let cell_for_reset = entity_cell.clone();
+                    cx.update_global::<BevyBridge, _>(|bridge, _| {
+                        bridge.with_world(move |world| {
+                            if let Some(e) = cell_for_reset.get().copied() {
+                                world.entity_mut(e).insert(LiveDelta::default());
+                            }
+                        });
+                    });
+
+                    let mut tasks: SmallVec<[gpui::Task<()>; 2]> = SmallVec::new();
+                    if let Some(component_id) = pos_bind {
+                        tasks.push(Self::spawn_binding_stream(
+                            db.clone(),
+                            entity_cell.clone(),
+                            component_id,
+                            cx,
+                            pick_position,
+                            |v, delta| delta.translation = Some(v),
+                        ));
+                    }
+                    if let Some(component_id) = orient_bind {
+                        tasks.push(Self::spawn_binding_stream(
+                            db,
+                            entity_cell,
+                            component_id,
+                            cx,
+                            pick_attitude,
+                            |q, delta| delta.rotation = Some(q),
+                        ));
+                    }
+                    let track = self.tracking.get_mut(&id).expect("inserted above");
+                    track.tasks = tasks;
+                }
+                work = true;
+            }
+        }
+
+        // 3. Camera-fov edit detection.
+        let snap = CameraSnapshot::from_fov(self.camera_fov);
+        if snap != self.last_camera {
+            self.camera.fov_y_rad = self.camera_fov;
+            self.last_camera = snap;
+            self.sync_camera(cx);
+            work = true;
+        }
+
+        if work {
+            self.needs_render = true;
+        }
     }
 
-    /// Add a new model to the viewer. If `path` is non-empty the GLB is
-    /// loaded immediately; otherwise the model is created with no asset
-    /// and the user can fill the path in later via the inspector.
+    /// Append a new model. The Bevy-side spawn happens in [`Self::reconcile`]
+    /// via the `cx.notify()` triggered by this push.
     pub fn add_model(
         &mut self,
         label: impl Into<SharedString>,
         path: impl Into<String>,
         cx: &mut Context<Self>,
     ) {
-        let path = path.into();
-        let entity: Arc<OnceLock<Entity>> = Arc::new(OnceLock::new());
-        self.models.push(cx.new(|_| ModelEntry {
+        let entry = ModelEntry {
             label: label.into(),
-            path: path.clone(),
-            entity: entity.clone(),
+            path: path.into(),
             position_binding: None,
             orientation_binding: None,
-            binding_tasks: SmallVec::new(),
-        }));
-        if !path.is_empty() {
-            self.loading_until = Some(Instant::now() + POST_LOAD_WINDOW);
-        }
-        let layer = self.render_layer;
-        self.with_world(cx, move |world| {
-            let _ = entity.set(spawn_model(world, layer, &path));
-        });
+        };
+        self.models.push(cx.new(|_| entry));
+        cx.notify();
     }
 
-    /// Remove one model from the viewer by its index in [`Self::models`].
+    /// Remove one model from the viewer. Reconcile despawns the Bevy
+    /// entity and drops the binding tasks when the tracker disappears.
     pub fn remove_model(&mut self, index: usize, cx: &mut Context<Self>) {
         if index >= self.models.len() {
             return;
         }
-        let entry = self.models.remove(index);
-        let entity_cell = entry.read(cx).entity.clone();
-        self.with_model_entity(cx, entity_cell, |world, entity| {
-            world.despawn(entity);
-        });
+        self.models.remove(index);
+        cx.notify();
     }
 
-    /// Update one model's GLTF path and reload. We can't reuse the
-    /// existing `OnceLock` cell (it's already set), so we mint a fresh
-    /// cell for the new scene entity, swap it into the entry, and queue
-    /// a despawn-then-spawn op.
+    /// Update one model's GLTF path. The despawn-then-spawn happens in
+    /// [`Self::reconcile`] via the per-model child subscription.
     pub fn set_model_path(&mut self, index: usize, path: String, cx: &mut Context<Self>) {
         let Some(entry) = self.models.get(index).cloned() else {
             return;
         };
-        let old_cell = entry.update(cx, |model, _| {
-            model.path = path.clone();
-            std::mem::replace(&mut model.entity, Arc::new(OnceLock::new()))
-        });
-        let new_cell = entry.read(cx).entity.clone();
-        if !path.is_empty() {
-            self.loading_until = Some(Instant::now() + POST_LOAD_WINDOW);
-        }
-        let layer = self.render_layer;
-        self.with_world(cx, move |world| {
-            if let Some(prev) = old_cell.get().copied() {
-                world.despawn(prev);
-            }
-            let _ = new_cell.set(spawn_model(world, layer, &path));
+        entry.update(cx, |model, cx| {
+            model.path = path;
+            cx.notify();
         });
     }
 
-    /// Update one model's display label. Inspector list row only.
-    pub fn set_model_label(&mut self, index: usize, label: impl Into<SharedString>, cx: &mut Context<Self>) {
+    /// Update one model's display label.
+    pub fn set_model_label(
+        &mut self,
+        index: usize,
+        label: impl Into<SharedString>,
+        cx: &mut Context<Self>,
+    ) {
         let label = label.into();
         if let Some(entry) = self.models.get(index) {
-            entry.update(cx, |model, _| {
+            entry.update(cx, |model, cx| {
                 model.label = label;
+                cx.notify();
             });
         }
     }
 
-    /// Bind one model's position to a component.
+    /// Bind one model's position to a component. Reconcile (re)spawns
+    /// the streaming task.
     fn set_model_position_binding(
         &mut self,
         index: usize,
-        component_id: metor_proto::types::ComponentId,
+        component_id: ComponentId,
         cx: &mut Context<Self>,
     ) {
         if let Some(entry) = self.models.get(index).cloned() {
-            entry.update(cx, |model, _| {
+            entry.update(cx, |model, cx| {
                 model.position_binding = Some(component_id);
+                cx.notify();
             });
         }
-        self.restart_model_bindings(index, cx);
     }
 
-    /// Bind one model's orientation to a component.
+    /// Bind one model's orientation to a component. Reconcile
+    /// (re)spawns the streaming task.
     fn set_model_orientation_binding(
         &mut self,
         index: usize,
-        component_id: metor_proto::types::ComponentId,
+        component_id: ComponentId,
         cx: &mut Context<Self>,
     ) {
         if let Some(entry) = self.models.get(index).cloned() {
-            entry.update(cx, |model, _| {
+            entry.update(cx, |model, cx| {
                 model.orientation_binding = Some(component_id);
+                cx.notify();
             });
         }
-        self.restart_model_bindings(index, cx);
-    }
-
-    /// Drop the streaming tasks for one model and respawn them from the
-    /// current bindings, also resetting the world-side [`LiveDelta`]
-    /// back to identity so a stale axis from a prior binding doesn't
-    /// bleed into the next live transform write.
-    fn restart_model_bindings(&mut self, index: usize, cx: &mut Context<Self>) {
-        let Some(db) = self.db.clone() else {
-            return;
-        };
-        let Some(entry) = self.models.get(index).cloned() else {
-            return;
-        };
-        let (position, orientation, entity_cell) = entry.read(cx).position_orientation_entity();
-        entry.update(cx, |model, _| {
-            model.binding_tasks.clear();
-        });
-
-        self.with_model_entity(cx, entity_cell.clone(), |world, entity| {
-            world.entity_mut(entity).insert(LiveDelta::default());
-        });
-
-        let mut tasks: SmallVec<[gpui::Task<()>; 2]> = SmallVec::new();
-        if let Some(component_id) = position {
-            tasks.push(Self::spawn_binding_stream(
-                db.clone(),
-                entity_cell.clone(),
-                component_id,
-                cx,
-                pick_position,
-                |v, delta| delta.translation = Some(v),
-            ));
-        }
-        if let Some(component_id) = orientation {
-            tasks.push(Self::spawn_binding_stream(
-                db,
-                entity_cell,
-                component_id,
-                cx,
-                pick_attitude,
-                |q, delta| delta.rotation = Some(q),
-            ));
-        }
-        if let Some(entry) = self.models.get(index) {
-            entry.update(cx, |model, _| {
-                model.binding_tasks = tasks;
-            });
-        }
-        self.mark_dirty(cx);
     }
 
     /// Round a pixel size to a 64-pixel grid. The grid is a deliberate
@@ -636,7 +711,7 @@ impl Viewer3d {
     fn spawn_binding_stream<T: Send + 'static>(
         db: Arc<DB>,
         entity_cell: Arc<OnceLock<Entity>>,
-        component_id: metor_proto::types::ComponentId,
+        component_id: ComponentId,
         cx: &mut Context<Self>,
         extract: fn(&ComponentView<'_>) -> T,
         apply: fn(T, &mut LiveDelta),
@@ -647,15 +722,18 @@ impl Viewer3d {
                 let value = extract(&stream.next().await.as_component_view());
                 let cell = entity_cell.clone();
                 let result = this.update(cx, |this, cx| {
-                    this.with_world(cx, move |world| {
-                        let Some(entity) = cell.get().copied() else {
-                            return;
-                        };
-                        let mut delta =
-                            world.get::<LiveDelta>(entity).copied().unwrap_or_default();
-                        apply(value, &mut delta);
-                        world.entity_mut(entity).insert(delta);
+                    cx.update_global::<BevyBridge, _>(|bridge, _| {
+                        bridge.with_world(move |world| {
+                            let Some(entity) = cell.get().copied() else {
+                                return;
+                            };
+                            let mut delta =
+                                world.get::<LiveDelta>(entity).copied().unwrap_or_default();
+                            apply(value, &mut delta);
+                            world.entity_mut(entity).insert(delta);
+                        });
                     });
+                    this.mark_dirty(cx);
                 });
                 if result.is_err() {
                     break;
@@ -819,8 +897,8 @@ impl Render for Viewer3d {
                                     this.maybe_resize(new_size, cx);
                                     this.consume_frame();
 
-                                    let mut releases = cx
-                                        .update_global::<BevyBridge, _>(|bridge, _| {
+                                    let mut releases =
+                                        cx.update_global::<BevyBridge, _>(|bridge, _| {
                                             bridge.take_orphaned_releases()
                                         });
                                     releases.extend(this.pending_release.take());
@@ -857,11 +935,3 @@ impl Render for Viewer3d {
             )
     }
 }
-
-// Inspectable field-id layout.
-//
-// Parent fields use IDs in 0..99. Per-model sub-field IDs are encoded as
-// `1000 + item_index * 100 + sub_field_id`. The encoding is local to this
-// element — `set_field` decodes it before routing.
-
-
