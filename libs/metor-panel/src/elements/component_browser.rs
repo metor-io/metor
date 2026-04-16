@@ -293,7 +293,6 @@ impl ColumnBrowserDelegate for ComponentBrowserDelegate {
                 .overflow_y_scroll()
                 .size_full()
                 .p(px(8.0))
-                .on_scroll_wheel(|_, _, cx| cx.stop_propagation())
                 .child(list)
                 .into_any_element(),
         )

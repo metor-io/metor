@@ -2,8 +2,8 @@ use std::ops::Range;
 
 use gpui::{
     AnyElement, App, Axis, Bounds, Context, DragMoveEvent, Empty, FocusHandle, Focusable, Hsla,
-    IntoElement, KeyDownEvent, MouseButton, MouseDownEvent, Pixels, Render, SharedString,
-    UniformListScrollHandle, Window, div, prelude::*, px, uniform_list,
+    IntoElement, KeyDownEvent, MouseButton, MouseDownEvent, Pixels, Render, ScrollHandle,
+    SharedString, UniformListScrollHandle, Window, div, prelude::*, px, uniform_list,
 };
 use smallvec::SmallVec;
 
@@ -121,6 +121,7 @@ pub struct ColumnBrowser<D: ColumnBrowserDelegate> {
     column_widths: SmallVec<[Pixels; 8]>,
     scroll_handles: SmallVec<[UniformListScrollHandle; 8]>,
     column_bounds: SmallVec<[Bounds<Pixels>; 8]>,
+    hscroll: ScrollHandle,
 }
 
 #[derive(Clone)]
@@ -141,6 +142,7 @@ impl<D: ColumnBrowserDelegate> ColumnBrowser<D> {
             column_widths: SmallVec::new(),
             scroll_handles: SmallVec::new(),
             column_bounds: SmallVec::new(),
+            hscroll: ScrollHandle::new(),
         }
     }
 
@@ -497,7 +499,6 @@ impl<D: ColumnBrowserDelegate> ColumnBrowser<D> {
                         div()
                             .flex_1()
                             .overflow_hidden()
-                            .on_scroll_wheel(|_, _, cx| cx.stop_propagation())
                             .child(list_view),
                     ),
             )
@@ -596,9 +597,31 @@ impl<D: ColumnBrowserDelegate> Render for ColumnBrowser<D> {
             column_elements.push(col);
         }
 
-        div()
+        let hscroll_overlay = {
+            let offset = self.hscroll.offset();
+            let max_off = self.hscroll.max_offset();
+            let vp = f32::from(self.hscroll.bounds().size.width);
+            let max_x = f32::from(max_off.width);
+            if max_x > 0.0 && vp > 0.0 {
+                let scroll_x = f32::from(-offset.x).clamp(0.0, max_x);
+                Some(
+                    div()
+                        .absolute()
+                        .left_0()
+                        .right_0()
+                        .bottom_0()
+                        .h(px(10.0))
+                        .child(Scrollbar::new(Axis::Horizontal, vp, vp + max_x, scroll_x)),
+                )
+            } else {
+                None
+            }
+        };
+
+        let mut strip = div()
             .id("column-browser")
             .track_focus(&self.focus_handle)
+            .track_scroll(&self.hscroll)
             .on_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
                 this.handle_key(event, window, cx);
             }))
@@ -607,6 +630,13 @@ impl<D: ColumnBrowserDelegate> Render for ColumnBrowser<D> {
             .size_full()
             .overflow_x_scroll()
             .bg(theme.bg_primary)
-            .children(column_elements)
+            .children(column_elements);
+        strip.style().restrict_scroll_to_axis = Some(true);
+
+        div()
+            .relative()
+            .size_full()
+            .child(strip)
+            .children(hscroll_overlay)
     }
 }
