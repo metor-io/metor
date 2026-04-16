@@ -167,7 +167,6 @@ impl ComponentBrowserDelegate {
                     build_element_values(
                         &db,
                         component_id,
-                        &component,
                         &element_names,
                         view.as_component_view(),
                     )
@@ -326,10 +325,7 @@ impl ColumnBrowserDelegate for ComponentBrowserDelegate {
     }
 }
 
-pub fn new_component_browser(
-    db: Arc<DB>,
-    cx: &mut Context<ComponentBrowser>,
-) -> ComponentBrowser {
+pub fn new_component_browser(db: Arc<DB>, cx: &mut Context<ComponentBrowser>) -> ComponentBrowser {
     let watcher = ComponentBrowserDelegate::spawn_watcher(db.clone(), cx);
     let delegate = ComponentBrowserDelegate {
         db,
@@ -358,9 +354,7 @@ fn collect_component_nodes(node: &Arc<ComponentNode>, out: &mut Vec<Arc<Componen
 
 async fn wait_for_component(db: &DB, component_id: ComponentId) -> Component {
     loop {
-        if let Some(component) =
-            db.with_state(|state| state.get_component(component_id).cloned())
-        {
+        if let Some(component) = db.with_state(|state| state.get_component(component_id).cloned()) {
             return component;
         }
         db.vtable_gen.wait().await;
@@ -370,10 +364,22 @@ async fn wait_for_component(db: &DB, component_id: ComponentId) -> Component {
 fn build_element_values(
     db: &DB,
     component_id: ComponentId,
-    component: &Component,
     element_names: &[SharedString],
     view: ComponentView<'_>,
 ) -> Vec<(Option<SharedString>, SharedString)> {
+    let is_string = db.with_state(|s| {
+        s.get_component_metadata(component_id)
+            .map(|m| m.is_string())
+            .unwrap_or_default()
+    });
+    if is_string {
+        let bytes = view.as_bytes();
+        let len = bytes.iter().position(|&x| x == 0).unwrap_or(bytes.len());
+        if let Ok(s) = str::from_utf8(&bytes[..len]) {
+            return vec![(None, SharedString::from(s.to_string()))];
+        }
+    }
+
     let enum_variants: Option<Vec<String>> = db.with_state(|s| {
         s.get_component_metadata(component_id).and_then(|m| {
             m.enum_variants()
@@ -383,8 +389,6 @@ fn build_element_values(
     let variant_refs: Option<Vec<&str>> = enum_variants
         .as_ref()
         .map(|v| v.iter().map(|s| s.as_str()).collect());
-
-    let _ = component;
 
     view.iter()
         .enumerate()
