@@ -3,21 +3,22 @@ use std::mem::size_of;
 use metor_db::disruptor::{ReadGrant, Reader};
 use metor_db::{Component, ComponentSchema, DB};
 use metor_proto::types::{ComponentId, ComponentView, Timestamp};
-pub mod inspect;
-pub mod inspector;
-pub mod items;
-pub mod reflect;
-pub mod widget_registry;
-pub mod widgets;
+pub mod app;
 pub mod elements;
 pub mod gpu_context;
 pub mod icons;
+pub mod inspect;
+pub mod inspector;
+pub mod items;
 pub mod offset_parse;
 pub mod pending_edits;
+pub mod reflect;
 pub mod theme;
 pub mod tiles;
 pub(crate) mod component_tree;
 pub(crate) mod trace_picker;
+pub mod widget_registry;
+pub mod widgets;
 
 /// Borrowing conversion to a [`ComponentView`].
 pub trait AsComponentView {
