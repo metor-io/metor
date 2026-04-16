@@ -958,6 +958,19 @@ fn plan_trace(
             ((slice_start_idx + visible_len).div_ceil(lod_stride)).min(decimated_count as usize);
         let residual_stride = (stride / lod_stride).max(1);
 
+        // For line spans we pad the index buffer with a sentinel at both
+        // ends so the miter vertex shader can safely read `i - 1` and
+        // `i + 2` without a bounds check. Scatter and bar draws use the
+        // indices directly and do not need padding.
+        let is_line = matches!(trace.style, PlotStyle::Line);
+        let sentinel_pos = if is_line {
+            let pos = idx_scratch.len();
+            idx_scratch.push(0);
+            Some(pos)
+        } else {
+            None
+        };
+
         let span_first = idx_scratch.len() as u32;
         let mut count_pushed: u32 = 0;
         let mut i = lod_start;
@@ -966,21 +979,26 @@ fn plan_trace(
             count_pushed += 1;
             i += residual_stride;
         }
-        let min_for_draw = match trace.style {
-            PlotStyle::Line => 2u32,
-            _ => 1,
-        };
+        let min_for_draw = if is_line { 2u32 } else { 1 };
         if count_pushed >= min_for_draw {
-            let instance_end = match trace.style {
-                PlotStyle::Line => span_first + count_pushed - 1,
-                _ => span_first + count_pushed,
+            if let Some(pos) = sentinel_pos {
+                let first_idx = idx_scratch[span_first as usize];
+                idx_scratch[pos] = first_idx;
+                let last_idx = *idx_scratch.last().expect("just pushed indices");
+                idx_scratch.push(last_idx);
+            }
+            let instance_end = if is_line {
+                span_first + count_pushed - 1
+            } else {
+                span_first + count_pushed
             };
             spans.push(DrawSpan {
                 instance_start: span_first,
                 instance_end,
             });
         } else {
-            idx_scratch.truncate(span_first as usize);
+            let target = sentinel_pos.unwrap_or(span_first as usize);
+            idx_scratch.truncate(target);
         }
     }
 

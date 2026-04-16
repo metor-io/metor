@@ -191,7 +191,7 @@ fn format_value_label(v: f64) -> String {
 }
 
 const Y_LABEL_WIDTH: f32 = 50.0;
-const X_LABEL_HEIGHT: f32 = 20.0;
+const X_LABEL_HEIGHT: f32 = 10.0;
 const PADDING: f32 = 8.0;
 const LABEL_FONT_SIZE: f32 = 11.0;
 
@@ -762,9 +762,10 @@ impl Render for TimeSeriesPlot {
                 .flex()
                 .flex_row()
                 .flex_wrap()
-                .gap_2()
+                .gap_1()
                 .gap_y_0()
-                .px(px(Y_LABEL_WIDTH + PADDING))
+                .pl(px(Y_LABEL_WIDTH + PADDING))
+                .pb_1()
                 .bg(legend_bg);
 
             for trace_entity in trace_entities.iter() {

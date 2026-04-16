@@ -9,6 +9,8 @@ use std::fmt::Write;
 use crate::theme::theme;
 use crate::{AsComponentView, ComponentStream, ComponentStreamBuilder};
 
+pub mod column_browser;
+pub mod component_browser;
 pub mod component_table;
 pub mod monitor;
 pub mod scrollbar;
@@ -19,6 +21,8 @@ pub mod viewer_3d;
 /// Element indices within a component (e.g. x=0, y=1, z=2 for a Vec3).
 pub type ElementIndexes = SmallVec<[usize; 8]>;
 
+pub use column_browser::{ColumnBrowser, ColumnBrowserDelegate};
+pub use component_browser::{BrowserEvent, ComponentBrowser, new_component_browser};
 pub use component_table::{ComponentTable, new_component_table};
 pub use monitor::Monitor;
 pub use scrollbar::Scrollbar;

@@ -7,7 +7,10 @@ use metor_proto::types::ComponentId;
 use super::dashboard::DashboardPanel;
 use crate::elements::time_series::LinePlot;
 use crate::elements::viewer_3d::Viewer3d;
-use crate::elements::{ComponentTable, ComponentText, TimeSeriesPlot, new_component_table};
+use crate::elements::{
+    ComponentBrowser, ComponentTable, ComponentText, TimeSeriesPlot, new_component_browser,
+    new_component_table,
+};
 use crate::inspector::{InspectorMode, InspectorRequest, OpenInspectorCallback};
 use crate::widgets::{CommandRow, InspectorRow, NavRow};
 
@@ -84,6 +87,42 @@ impl PaneItem for TablePanel {
 
     fn serialization_key() -> &'static str {
         "component_table"
+    }
+
+    fn serialize(&self, _cx: &App) -> serde_json::Value {
+        serde_json::json!({})
+    }
+}
+
+/// Tile panel wrapping a [`ComponentBrowser`] for Finder-style namespace navigation.
+pub struct BrowserPanel {
+    inner: Entity<ComponentBrowser>,
+    label: SharedString,
+}
+
+impl BrowserPanel {
+    pub fn new(db: Arc<DB>, cx: &mut Context<Self>) -> Self {
+        let inner = cx.new(|cx| new_component_browser(db, cx));
+        Self {
+            inner,
+            label: "Components".into(),
+        }
+    }
+}
+
+impl Render for BrowserPanel {
+    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+        div().size_full().child(self.inner.clone())
+    }
+}
+
+impl PaneItem for BrowserPanel {
+    fn tab_title(&self, _cx: &App) -> SharedString {
+        self.label.clone()
+    }
+
+    fn serialization_key() -> &'static str {
+        "component_browser"
     }
 
     fn serialize(&self, _cx: &App) -> serde_json::Value {
@@ -312,6 +351,19 @@ pub fn new_panel_rows(
             pane.update(cx, |pane, cx| {
                 let item: Box<dyn PaneItemHandle> =
                     Box::new(cx.new(|cx| TablePanel::new(db, cx)));
+                pane.add_item(item, cx);
+            });
+        })
+    })));
+
+    rows.push(Box::new(CommandRow::new("Component Browser", {
+        let db = db.clone();
+        let pane = pane.clone();
+        Arc::new(move |_window, cx| {
+            let db = db.clone();
+            pane.update(cx, |pane, cx| {
+                let item: Box<dyn PaneItemHandle> =
+                    Box::new(cx.new(|cx| BrowserPanel::new(db, cx)));
                 pane.add_item(item, cx);
             });
         })

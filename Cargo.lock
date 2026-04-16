@@ -5821,6 +5821,7 @@ dependencies = [
 [[package]]
 name = "facet"
 version = "0.44.3"
+source = "git+https://github.com/metor-io/facet.git?branch=sphw%2Ffacet-gpui#e41048a3680e9af8b434cc5cff1d0a53db2dded0"
 dependencies = [
  "autocfg",
  "facet-core",
@@ -5831,6 +5832,7 @@ dependencies = [
 [[package]]
 name = "facet-core"
 version = "0.44.3"
+source = "git+https://github.com/metor-io/facet.git?branch=sphw%2Ffacet-gpui#e41048a3680e9af8b434cc5cff1d0a53db2dded0"
 dependencies = [
  "autocfg",
  "const-fnv1a-hash",
@@ -5843,6 +5845,7 @@ dependencies = [
 [[package]]
 name = "facet-macro-parse"
 version = "0.44.3"
+source = "git+https://github.com/metor-io/facet.git?branch=sphw%2Ffacet-gpui#e41048a3680e9af8b434cc5cff1d0a53db2dded0"
 dependencies = [
  "facet-macro-types",
  "proc-macro2",
@@ -5852,6 +5855,7 @@ dependencies = [
 [[package]]
 name = "facet-macro-types"
 version = "0.44.3"
+source = "git+https://github.com/metor-io/facet.git?branch=sphw%2Ffacet-gpui#e41048a3680e9af8b434cc5cff1d0a53db2dded0"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -5861,6 +5865,7 @@ dependencies = [
 [[package]]
 name = "facet-macros"
 version = "0.44.3"
+source = "git+https://github.com/metor-io/facet.git?branch=sphw%2Ffacet-gpui#e41048a3680e9af8b434cc5cff1d0a53db2dded0"
 dependencies = [
  "facet-macros-impl",
 ]
@@ -5868,6 +5873,7 @@ dependencies = [
 [[package]]
 name = "facet-macros-impl"
 version = "0.44.3"
+source = "git+https://github.com/metor-io/facet.git?branch=sphw%2Ffacet-gpui#e41048a3680e9af8b434cc5cff1d0a53db2dded0"
 dependencies = [
  "facet-macro-parse",
  "facet-macro-types",
@@ -5880,6 +5886,7 @@ dependencies = [
 [[package]]
 name = "facet-path"
 version = "0.44.3"
+source = "git+https://github.com/metor-io/facet.git?branch=sphw%2Ffacet-gpui#e41048a3680e9af8b434cc5cff1d0a53db2dded0"
 dependencies = [
  "facet-core",
 ]
@@ -5887,6 +5894,7 @@ dependencies = [
 [[package]]
 name = "facet-reflect"
 version = "0.44.3"
+source = "git+https://github.com/metor-io/facet.git?branch=sphw%2Ffacet-gpui#e41048a3680e9af8b434cc5cff1d0a53db2dded0"
 dependencies = [
  "facet-core",
  "facet-path",
