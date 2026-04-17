@@ -13,8 +13,7 @@ use gpui::{
     Pixels, Point, Render, SharedString, TitlebarOptions, Window, WindowBounds, WindowOptions,
     actions, div, point, prelude::*, px, size,
 };
-use metor_db::{DB, Server};
-use stellarator::{net::TcpListener, struc_con::stellar};
+use metor_db::DB;
 
 actions!(
     metor_panel,

@@ -2,15 +2,19 @@
 ///
 /// Operates on [`InspectorRow`] widgets with a page-stack navigation model.
 /// Can render as either an anchored right-click panel or a centered overlay.
+use std::ops::Range;
 use std::sync::Arc;
 
 use gpui::{
-    App, Bounds, Context, Corner, FocusHandle, Focusable, IntoElement, KeyDownEvent, Pixels, Point,
-    Render, SharedString, Window, anchored, canvas, deferred, div, prelude::*, px,
+    AnyElement, App, Bounds, Context, Corner, FocusHandle, Focusable, IntoElement, KeyDownEvent,
+    Pixels, Point, Render, ScrollStrategy, SharedString, UniformListScrollHandle, Window, anchored,
+    canvas, deferred, div, prelude::*, px, uniform_list,
 };
 
 use crate::theme::theme;
 use crate::widgets::{InspectorRow, RowAction, TextField};
+
+const ROW_HEIGHT: f32 = 28.0;
 
 /// Action to open the inspector for an arbitrary entity at a position.
 #[derive(Clone, PartialEq, gpui::Action)]
@@ -62,6 +66,7 @@ pub struct Inspector {
     selected_index: usize,
     editing: Option<EditState>,
     panel_bounds: Option<Bounds<Pixels>>,
+    scroll_handle: UniformListScrollHandle,
 }
 
 struct EditState {
@@ -86,6 +91,7 @@ impl Inspector {
             selected_index: 0,
             editing: None,
             panel_bounds: None,
+            scroll_handle: UniformListScrollHandle::new(),
         }
     }
 
@@ -283,6 +289,8 @@ impl Inspector {
             "up" => {
                 if self.selected_index > 0 {
                     self.selected_index -= 1;
+                    self.scroll_handle
+                        .scroll_to_item(self.selected_index, ScrollStrategy::Top);
                 }
                 cx.notify();
                 return;
@@ -291,6 +299,8 @@ impl Inspector {
                 let total = self.visible_count();
                 if total > 0 && self.selected_index < total - 1 {
                     self.selected_index += 1;
+                    self.scroll_handle
+                        .scroll_to_item(self.selected_index, ScrollStrategy::Bottom);
                 }
                 cx.notify();
                 return;
@@ -315,7 +325,7 @@ impl Inspector {
             .flex_row()
             .items_center()
             .px(px(8.0))
-            .py(px(3.0))
+            .py(px(4.0))
             .border_b_1()
             .border_color(theme.border_primary)
             .text_size(px(12.0));
@@ -346,7 +356,7 @@ impl Inspector {
 
     fn render_panel(
         &mut self,
-        window: &mut Window,
+        _window: &mut Window,
         cx: &mut Context<Self>,
     ) -> gpui::Stateful<gpui::Div> {
         let theme = theme(cx);
@@ -364,62 +374,84 @@ impl Inspector {
         .size_full()
         .absolute();
 
-        let mut items_col = div().flex().flex_col().py(px(4.0));
-
-        if indices.is_empty() {
-            items_col = items_col.child(
-                div()
-                    .px(px(12.0))
-                    .py(px(6.0))
-                    .text_size(px(12.0))
-                    .text_color(theme.text_tertiary)
-                    .child(SharedString::new_static("No results")),
-            );
+        let items_element: AnyElement = if indices.is_empty() {
+            div()
+                .px(px(12.0))
+                .py(px(6.0))
+                .text_size(px(12.0))
+                .text_color(theme.text_tertiary)
+                .child(SharedString::new_static("No results"))
+                .into_any_element()
         } else {
-            for (vis_ix, &row_idx) in indices.iter().enumerate() {
-                let selected = vis_ix == self.selected_index;
-                let is_editing = self
-                    .editing
-                    .as_ref()
-                    .is_some_and(|e| e.row_index == row_idx);
+            let count = indices.len();
+            let scroll_handle = self.scroll_handle.clone();
+            let max_items_h = 360.0_f32;
+            let items_h = (count as f32 * ROW_HEIGHT).min(max_items_h);
+            uniform_list(
+                "inspector-items",
+                count,
+                cx.processor(
+                    move |this: &mut Self,
+                          range: Range<usize>,
+                          window: &mut Window,
+                          cx: &mut Context<Self>| {
+                        let theme = crate::theme::theme(cx);
+                        let indices = this.filtered_indices();
+                        let mut out = Vec::with_capacity(range.len());
+                        for vis_ix in range {
+                            let row_idx = indices[vis_ix];
+                            let selected = vis_ix == this.selected_index;
+                            let is_editing = this
+                                .editing
+                                .as_ref()
+                                .is_some_and(|e| e.row_index == row_idx);
 
-                if is_editing {
-                    let edit = self.editing.as_ref().unwrap();
-                    let page = self.current_page();
-                    let label = SharedString::from(page.rows[row_idx].label().to_string());
-                    items_col = items_col.child(
-                        crate::widgets::row_base(vis_ix, selected, cx)
-                            .child(
+                            let element = if is_editing {
+                                let edit = this.editing.as_ref().unwrap();
+                                let page = this.current_page();
+                                let label =
+                                    SharedString::from(page.rows[row_idx].label().to_string());
+                                crate::widgets::row_base(vis_ix, selected, cx)
+                                    .child(
+                                        div()
+                                            .text_size(px(12.0))
+                                            .text_color(theme.text_primary)
+                                            .child(label),
+                                    )
+                                    .child(
+                                        div()
+                                            .min_w(px(60.0))
+                                            .max_w(px(120.0))
+                                            .child(edit.field.element()),
+                                    )
+                                    .into_any_element()
+                            } else {
+                                let page = this.current_page();
+                                let row_element =
+                                    page.rows[row_idx].render_row(vis_ix, selected, window, cx);
+                                let row_idx_click = row_idx;
                                 div()
-                                    .text_size(px(12.0))
-                                    .text_color(theme.text_primary)
-                                    .child(label),
-                            )
-                            .child(
-                                div()
-                                    .min_w(px(60.0))
-                                    .max_w(px(120.0))
-                                    .child(edit.field.element()),
-                            ),
-                    );
-                } else {
-                    let page = self.current_page();
-                    let row_element = page.rows[row_idx].render_row(vis_ix, selected, window, cx);
-                    let row_idx_click = row_idx;
-                    items_col = items_col.child(
-                        div()
-                            .on_mouse_down(
-                                gpui::MouseButton::Left,
-                                cx.listener(move |this, _, window, cx| {
-                                    this.selected_index = vis_ix;
-                                    this.activate_row(row_idx_click, window, cx);
-                                }),
-                            )
-                            .child(row_element),
-                    );
-                }
-            }
-        }
+                                    .on_mouse_down(
+                                        gpui::MouseButton::Left,
+                                        cx.listener(move |this, _, window, cx| {
+                                            this.selected_index = vis_ix;
+                                            this.activate_row(row_idx_click, window, cx);
+                                        }),
+                                    )
+                                    .child(row_element)
+                                    .into_any_element()
+                            };
+
+                            out.push(element);
+                        }
+                        out
+                    },
+                ),
+            )
+            .track_scroll(scroll_handle)
+            .h(px(items_h))
+            .into_any_element()
+        };
 
         let width = match self.mode {
             InspectorMode::Anchored(_) => px(280.0),
@@ -442,10 +474,9 @@ impl Inspector {
             .border_1()
             .border_color(theme.border_primary)
             .rounded(px(6.0))
-            .overflow_y_scroll()
             .child(bounds_tracker)
             .child(self.render_input_bar(cx))
-            .child(items_col)
+            .child(items_element)
     }
 }
 
@@ -506,4 +537,3 @@ impl Render for Inspector {
         }
     }
 }
-

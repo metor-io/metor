@@ -2,7 +2,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 use gpui::{
-    AnyElement, App, Context, EventEmitter, IntoElement, SharedString, Window, div, prelude::*, px,
+    AnyElement, App, Context, EventEmitter, IntoElement, SharedString, UniformListScrollHandle,
+    Window, div, prelude::*, px, uniform_list,
 };
 use metor_db::{Component, DB};
 use metor_proto::types::{ComponentId, ComponentView};
@@ -47,6 +48,7 @@ pub struct ComponentBrowserDelegate {
     selection_path: SmallVec<[SharedString; 8]>,
     root_override_path: Option<SmallVec<[SharedString; 8]>>,
     previews: BTreeMap<SharedString, ComponentPreview>,
+    detail_scroll_handle: UniformListScrollHandle,
     _watcher: gpui::Task<()>,
 }
 
@@ -281,18 +283,26 @@ impl ColumnBrowserDelegate for ComponentBrowserDelegate {
             );
         }
 
-        let mut list = div().flex().flex_col().gap(px(10.0));
-        for preview in self.previews.values() {
-            list = list.child(render_preview_entry(preview, &theme));
-        }
+        let preview_data: Vec<PreviewSnapshot> =
+            self.previews.values().map(PreviewSnapshot::from).collect();
+        let count = preview_data.len();
+        let scroll_handle = self.detail_scroll_handle.clone();
+
+        let list_view = uniform_list("component-detail-list", count, move |range, _window, cx| {
+            let theme = crate::theme::theme(cx);
+            range
+                .map(|ix| render_preview_entry(&preview_data[ix], &theme))
+                .collect()
+        })
+        .track_scroll(scroll_handle)
+        .h_full();
 
         Some(
             div()
                 .id("component-browser-detail")
-                .overflow_y_scroll()
                 .size_full()
                 .p(px(8.0))
-                .child(list)
+                .child(list_view)
                 .into_any_element(),
         )
     }
@@ -338,6 +348,7 @@ pub fn new_component_browser(db: Arc<DB>, cx: &mut Context<ComponentBrowser>) ->
         selection_path: SmallVec::new(),
         root_override_path: None,
         previews: BTreeMap::new(),
+        detail_scroll_handle: UniformListScrollHandle::new(),
         _watcher: watcher,
     };
     ColumnBrowser::new(delegate, cx)
@@ -400,27 +411,47 @@ fn build_element_values(
         .collect()
 }
 
-fn render_preview_entry(preview: &ComponentPreview, theme: &Arc<Theme>) -> AnyElement {
-    let values: AnyElement = match &preview.elements {
-        Some(elements) if !elements.is_empty() => div()
+const PREVIEW_ROW_HEIGHT: f32 = 56.0;
+
+struct PreviewSnapshot {
+    full_name: SharedString,
+    elements: Vec<(Option<SharedString>, SharedString)>,
+}
+
+impl From<&ComponentPreview> for PreviewSnapshot {
+    fn from(p: &ComponentPreview) -> Self {
+        Self {
+            full_name: p.full_name.clone(),
+            elements: p.elements.clone().unwrap_or_default(),
+        }
+    }
+}
+
+fn render_preview_entry(preview: &PreviewSnapshot, theme: &Arc<Theme>) -> AnyElement {
+    let values: AnyElement = if preview.elements.is_empty() {
+        div()
+            .text_size(px(11.0))
+            .text_color(theme.text_tertiary)
+            .child(SharedString::new_static("…"))
+            .into_any_element()
+    } else {
+        div()
             .flex()
             .flex_row()
             .flex_wrap()
             .gap(px(4.0))
             .children(
-                elements
+                preview
+                    .elements
                     .iter()
                     .map(|(label, value)| element_box(label.clone(), value.clone(), theme)),
             )
-            .into_any_element(),
-        _ => div()
-            .text_size(px(11.0))
-            .text_color(theme.text_tertiary)
-            .child(SharedString::new_static("…"))
-            .into_any_element(),
+            .into_any_element()
     };
 
     div()
+        .h(px(PREVIEW_ROW_HEIGHT))
+        .overflow_hidden()
         .flex()
         .flex_col()
         .gap(px(4.0))
