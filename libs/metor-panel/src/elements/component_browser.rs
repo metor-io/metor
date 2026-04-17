@@ -2,17 +2,18 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 use gpui::{
-    AnyElement, App, Context, EventEmitter, IntoElement, SharedString, UniformListScrollHandle,
-    Window, div, prelude::*, px, uniform_list,
+    AnyElement, App, Context, Entity, EventEmitter, IntoElement, SharedString,
+    UniformListScrollHandle, Window, div, prelude::*, px, uniform_list,
 };
-use metor_db::{Component, DB};
-use metor_proto::types::{ComponentId, ComponentView};
+use metor_db::DB;
+use metor_proto::types::ComponentId;
 use smallvec::SmallVec;
 
 use super::column_browser::{ColumnBrowser, ColumnBrowserDelegate};
+use super::monitor::{behavior_snapshot, edit_click};
+use super::value_strip::{ComponentValueStrip, StripBehavior, StripClick, StripStyle};
 use crate::component_tree::{ComponentNode, build_tree, resolve_path};
 use crate::theme::{Theme, theme};
-use crate::{AsComponentView, ComponentStream, WalComponentStream};
 
 /// Specialization of [`ColumnBrowser`] that browses the DB's component namespace.
 pub type ComponentBrowser = ColumnBrowser<ComponentBrowserDelegate>;
@@ -31,8 +32,8 @@ impl EventEmitter<BrowserEvent> for ColumnBrowser<ComponentBrowserDelegate> {}
 struct ComponentPreview {
     component_id: ComponentId,
     full_name: SharedString,
-    elements: Option<Vec<(Option<SharedString>, SharedString)>>,
-    _task: gpui::Task<()>,
+    strip: Entity<ComponentValueStrip>,
+    click: StripClick,
 }
 
 /// Delegate that browses the dot-delimited namespace of DB components.
@@ -136,57 +137,33 @@ impl ComponentBrowserDelegate {
                 continue;
             };
             let full_name = node.full_name.clone();
-            let task = Self::spawn_stream(self.db.clone(), id, full_name.clone(), cx);
+            let click = edit_click(self.db.clone(), id, full_name.clone());
+            let strip = {
+                let db = self.db.clone();
+                let click = click.clone();
+                cx.new(|cx| {
+                    ComponentValueStrip::new(
+                        db,
+                        id,
+                        StripStyle::boxes(),
+                        StripBehavior {
+                            on_element_click: Some(click),
+                            ..Default::default()
+                        },
+                        cx,
+                    )
+                })
+            };
             self.previews.insert(
                 full_name.clone(),
                 ComponentPreview {
                     component_id: id,
                     full_name,
-                    elements: None,
-                    _task: task,
+                    strip,
+                    click,
                 },
             );
         }
-    }
-
-    fn spawn_stream(
-        db: Arc<DB>,
-        component_id: ComponentId,
-        full_name: SharedString,
-        cx: &mut Context<ComponentBrowser>,
-    ) -> gpui::Task<()> {
-        cx.spawn(async move |this, cx| {
-            let component = wait_for_component(&db, component_id).await;
-            let element_names: Vec<SharedString> =
-                crate::trace_picker::element_names(component.schema.dim.as_slice())
-                    .into_iter()
-                    .map(SharedString::from)
-                    .collect();
-            let mut stream = WalComponentStream::new(&component);
-            loop {
-                let snapshot = {
-                    let view = stream.next().await;
-                    build_element_values(
-                        &db,
-                        component_id,
-                        &element_names,
-                        view.as_component_view(),
-                    )
-                };
-                let result = this.update(cx, |browser, cx| {
-                    let delegate = browser.delegate_mut();
-                    if let Some(entry) = delegate.previews.get_mut(&full_name)
-                        && entry.component_id == component_id
-                    {
-                        entry.elements = Some(snapshot);
-                        cx.notify();
-                    }
-                });
-                if result.is_err() {
-                    break;
-                }
-            }
-        })
     }
 }
 
@@ -283,15 +260,37 @@ impl ColumnBrowserDelegate for ComponentBrowserDelegate {
             );
         }
 
-        let preview_data: Vec<PreviewSnapshot> =
-            self.previews.values().map(PreviewSnapshot::from).collect();
+        // Refresh each strip's interactive snapshot against the current
+        // pending-edit state before the list re-renders.
+        let updates: Vec<(Entity<ComponentValueStrip>, StripBehavior)> = self
+            .previews
+            .values()
+            .map(|p| {
+                (
+                    p.strip.clone(),
+                    behavior_snapshot(cx, p.component_id, p.click.clone()),
+                )
+            })
+            .collect();
+        for (strip, behavior) in updates {
+            strip.update(cx, |s, cx| s.set_behavior(behavior, cx));
+        }
+
+        let preview_data: Vec<(SharedString, Entity<ComponentValueStrip>)> = self
+            .previews
+            .values()
+            .map(|p| (p.full_name.clone(), p.strip.clone()))
+            .collect();
         let count = preview_data.len();
         let scroll_handle = self.detail_scroll_handle.clone();
 
         let list_view = uniform_list("component-detail-list", count, move |range, _window, cx| {
             let theme = crate::theme::theme(cx);
             range
-                .map(|ix| render_preview_entry(&preview_data[ix], &theme))
+                .map(|ix| {
+                    let (name, strip) = &preview_data[ix];
+                    render_preview_entry(name.clone(), strip.clone(), &theme)
+                })
                 .collect()
         })
         .track_scroll(scroll_handle)
@@ -363,92 +362,13 @@ fn collect_component_nodes(node: &Arc<ComponentNode>, out: &mut Vec<Arc<Componen
     }
 }
 
-async fn wait_for_component(db: &DB, component_id: ComponentId) -> Component {
-    loop {
-        if let Some(component) = db.with_state(|state| state.get_component(component_id).cloned()) {
-            return component;
-        }
-        db.vtable_gen.wait().await;
-    }
-}
-
-fn build_element_values(
-    db: &DB,
-    component_id: ComponentId,
-    element_names: &[SharedString],
-    view: ComponentView<'_>,
-) -> Vec<(Option<SharedString>, SharedString)> {
-    let is_string = db.with_state(|s| {
-        s.get_component_metadata(component_id)
-            .map(|m| m.is_string())
-            .unwrap_or_default()
-    });
-    if is_string {
-        let bytes = view.as_bytes();
-        let len = bytes.iter().position(|&x| x == 0).unwrap_or(bytes.len());
-        if let Ok(s) = str::from_utf8(&bytes[..len]) {
-            return vec![(None, SharedString::from(s.to_string()))];
-        }
-    }
-
-    let enum_variants: Option<Vec<String>> = db.with_state(|s| {
-        s.get_component_metadata(component_id).and_then(|m| {
-            m.enum_variants()
-                .map(|it| it.map(|s| s.to_string()).collect())
-        })
-    });
-    let variant_refs: Option<Vec<&str>> = enum_variants
-        .as_ref()
-        .map(|v| v.iter().map(|s| s.as_str()).collect());
-
-    view.iter()
-        .enumerate()
-        .map(|(idx, value)| {
-            let label = element_names.get(idx).cloned();
-            let formatted = super::format_element_value(value, variant_refs.as_deref());
-            (label, SharedString::from(formatted))
-        })
-        .collect()
-}
-
 const PREVIEW_ROW_HEIGHT: f32 = 56.0;
 
-struct PreviewSnapshot {
+fn render_preview_entry(
     full_name: SharedString,
-    elements: Vec<(Option<SharedString>, SharedString)>,
-}
-
-impl From<&ComponentPreview> for PreviewSnapshot {
-    fn from(p: &ComponentPreview) -> Self {
-        Self {
-            full_name: p.full_name.clone(),
-            elements: p.elements.clone().unwrap_or_default(),
-        }
-    }
-}
-
-fn render_preview_entry(preview: &PreviewSnapshot, theme: &Arc<Theme>) -> AnyElement {
-    let values: AnyElement = if preview.elements.is_empty() {
-        div()
-            .text_size(px(11.0))
-            .text_color(theme.text_tertiary)
-            .child(SharedString::new_static("…"))
-            .into_any_element()
-    } else {
-        div()
-            .flex()
-            .flex_row()
-            .flex_wrap()
-            .gap(px(4.0))
-            .children(
-                preview
-                    .elements
-                    .iter()
-                    .map(|(label, value)| element_box(label.clone(), value.clone(), theme)),
-            )
-            .into_any_element()
-    };
-
+    strip: Entity<ComponentValueStrip>,
+    theme: &Arc<Theme>,
+) -> AnyElement {
     div()
         .h(px(PREVIEW_ROW_HEIGHT))
         .overflow_hidden()
@@ -459,29 +379,8 @@ fn render_preview_entry(preview: &PreviewSnapshot, theme: &Arc<Theme>) -> AnyEle
             div()
                 .text_size(px(12.0))
                 .text_color(theme.text_secondary)
-                .child(preview.full_name.clone()),
+                .child(full_name),
         )
-        .child(values)
+        .child(strip)
         .into_any_element()
-}
-
-fn element_box(
-    label: Option<SharedString>,
-    value: SharedString,
-    theme: &Arc<Theme>,
-) -> impl IntoElement {
-    let mut b = div()
-        .flex()
-        .flex_row()
-        .items_center()
-        .gap(px(4.0))
-        .px(px(6.0))
-        .py(px(2.0))
-        .rounded(px(3.0))
-        .bg(theme.bg_secondary)
-        .text_size(px(12.0));
-    if let Some(label) = label {
-        b = b.child(div().text_color(theme.text_tertiary).child(label));
-    }
-    b.child(div().text_color(theme.text_primary).child(value))
 }

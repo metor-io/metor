@@ -1,23 +1,24 @@
 use std::sync::Arc;
 
+use super::monitor::{behavior_snapshot, edit_click};
 use super::table::{Column, ColumnSort, Table, TableDelegate};
 use super::time_series::{LinePlot, Trace};
-use crate::pending_edits::{EditRequest, pending_edits, pending_edits_mut};
-use crate::theme::{Theme, theme};
+use super::value_strip::{ComponentValueStrip, StripClick, StripStyle};
+use crate::theme::theme;
 use crate::{ComponentStream, WalComponentStream};
 use gpui::{
-    AnyElement, App, AppContext, AsyncApp, Context, Entity, InteractiveElement, IntoElement,
-    Pixels, SharedString, Stateful, Window, div, prelude::*, px,
+    AnyElement, App, AppContext, AsyncApp, Context, Entity, IntoElement, Pixels, SharedString,
+    Window, div, prelude::*, px,
 };
 use metor_db::{Component, DB};
-use metor_proto::types::ComponentView;
 
 struct ComponentRow {
     db: Arc<DB>,
     name: SharedString,
     component: Component,
-    element_names: Vec<SharedString>,
     sparkline: Entity<LinePlot>,
+    strip: Entity<ComponentValueStrip>,
+    click: StripClick,
     _task: gpui::Task<()>,
 }
 
@@ -26,14 +27,15 @@ impl ComponentRow {
         db: Arc<DB>,
         name: impl Into<SharedString>,
         component: Component,
-        element_names: Vec<SharedString>,
         cx: &mut Context<Self>,
     ) -> Self {
+        let name: SharedString = name.into();
+        let component_id = component.component_id;
         let line_colors = theme(cx).line_colors;
         let num_elements: usize = component.schema.dim.iter().product::<usize>().max(1);
         let traces: Vec<Trace> = (0..num_elements)
             .map(|i| {
-                let mut t = Trace::new(component.component_id, i, line_colors[i % line_colors.len()]);
+                let mut t = Trace::new(component_id, i, line_colors[i % line_colors.len()]);
                 t.stroke_width = 1.0;
                 t
             })
@@ -42,9 +44,27 @@ impl ComponentRow {
         let sparkline = cx.new(|cx| LinePlot::new(db.clone(), cx));
         sparkline.update(cx, |sp, cx| sp.bind_traces(traces, cx));
 
-        // Tiny notify task: wake the row's render on every new sample so
-        // the value cell re-renders. Y-bounds tracking lives inside the
-        // LinePlot's own per-trace tracker task.
+        let click = edit_click(db.clone(), component_id, name.clone());
+        let strip = {
+            let db_for_strip = db.clone();
+            let component_for_strip = component.clone();
+            let click_for_strip = click.clone();
+            cx.new(|cx| {
+                ComponentValueStrip::new(
+                    db_for_strip,
+                    component_for_strip,
+                    StripStyle::boxes(),
+                    super::value_strip::StripBehavior {
+                        on_element_click: Some(click_for_strip),
+                        ..Default::default()
+                    },
+                    cx,
+                )
+            })
+        };
+
+        // Tiny notify task: wake the row on every new sample so the sort
+        // column sees fresh values and the sparkline cell re-renders.
         let mut stream = WalComponentStream::new(&component);
         let task = cx.spawn(async move |this, cx| {
             loop {
@@ -58,12 +78,17 @@ impl ComponentRow {
 
         Self {
             db,
-            name: name.into(),
+            name,
             component,
-            element_names,
             sparkline,
+            strip,
+            click,
             _task: task,
         }
+    }
+
+    fn component_id(&self) -> metor_proto::types::ComponentId {
+        self.component.component_id
     }
 
     fn current_value_string(&self) -> String {
@@ -102,28 +127,22 @@ impl ComponentTableDelegate {
     }
 
     fn build_rows(db: &Arc<DB>, cx: &mut AsyncApp) -> Vec<Entity<ComponentRow>> {
-        let prepared: Vec<(SharedString, Component, Vec<SharedString>)> = db.with_state(|state| {
+        let prepared: Vec<(SharedString, Component)> = db.with_state(|state| {
             state
                 .component_metadata_iter()
                 .filter_map(|(id, meta)| {
                     let name = SharedString::from(meta.name.clone());
                     let component = state.get_component(*id)?.clone();
-                    let element_names: Vec<SharedString> =
-                        crate::trace_picker::element_names(component.schema.dim.as_slice())
-                            .into_iter()
-                            .map(SharedString::from)
-                            .collect();
-                    Some((name, component, element_names))
+                    Some((name, component))
                 })
                 .collect()
         });
 
         prepared
             .into_iter()
-            .filter_map(|(name, component, element_names)| {
+            .filter_map(|(name, component)| {
                 let db = db.clone();
-                cx.new(|cx| ComponentRow::new(db, name, component, element_names, cx))
-                    .ok()
+                cx.new(|cx| ComponentRow::new(db, name, component, cx)).ok()
             })
             .collect()
     }
@@ -155,21 +174,39 @@ impl TableDelegate for ComponentTableDelegate {
     ) -> AnyElement {
         let theme = theme(cx);
         let row = &self.rows[row_ix];
-        let row_ref = row.read(cx);
         match col_ix {
-            0 => div()
-                .px(px(12.0))
-                .text_size(px(13.0))
-                .text_color(theme.text_primary)
-                .child(row_ref.name.clone())
-                .into_any_element(),
-            1 => render_value_cell(row_ref, &theme, cx).into_any_element(),
+            0 => {
+                let name = row.read(cx).name.clone();
+                div()
+                    .px(px(12.0))
+                    .text_size(px(13.0))
+                    .text_color(theme.text_primary)
+                    .child(name)
+                    .into_any_element()
+            }
+            1 => {
+                let (strip, behavior) = {
+                    let row_ref = row.read(cx);
+                    let behavior =
+                        behavior_snapshot(cx, row_ref.component_id(), row_ref.click.clone());
+                    (row_ref.strip.clone(), behavior)
+                };
+                strip.update(cx, |s, cx| s.set_behavior(behavior, cx));
+                div()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .px(px(4.0))
+                    .child(strip)
+                    .into_any_element()
+            }
             2 => {
                 let row_height = self.row_height();
+                let sparkline = row.read(cx).sparkline.clone();
                 div()
                     .w_full()
                     .h(row_height - px(8.0))
-                    .child(row_ref.sparkline.clone())
+                    .child(sparkline)
                     .into_any_element()
             }
             _ => div().into_any_element(),
@@ -179,10 +216,12 @@ impl TableDelegate for ComponentTableDelegate {
     fn sort_column(&mut self, col_ix: usize, sort: ColumnSort, cx: &App) {
         match (col_ix, sort) {
             (0, ColumnSort::Ascending) => {
-                self.rows.sort_by(|a, b| a.read(cx).name.cmp(&b.read(cx).name));
+                self.rows
+                    .sort_by(|a, b| a.read(cx).name.cmp(&b.read(cx).name));
             }
             (0, ColumnSort::Descending) => {
-                self.rows.sort_by(|a, b| b.read(cx).name.cmp(&a.read(cx).name));
+                self.rows
+                    .sort_by(|a, b| b.read(cx).name.cmp(&a.read(cx).name));
             }
             (1, ColumnSort::Ascending) => {
                 self.rows.sort_by(|a, b| {
@@ -213,172 +252,4 @@ pub fn new_component_table(db: Arc<DB>, cx: &mut Context<ComponentTable>) -> Com
         _task: task,
     };
     Table::new(delegate)
-}
-
-/// Render the value cell as a horizontal row of labeled element boxes.
-fn render_value_cell(row: &ComponentRow, theme: &Theme, cx: &App) -> Stateful<gpui::Div> {
-    let component_id = row.component.component_id;
-    let element_names = row.element_names.clone();
-    let component_name = row.name.clone();
-    let pending = pending_edits(cx);
-    let locked = pending.locked;
-    let pending_value = pending
-        .get(component_id)
-        .map(|e| (e.value.clone(), e.modified_elements.clone()));
-
-    let mut container = div()
-        .id(("value-cell", component_id.0 as usize))
-        .flex()
-        .flex_row()
-        .items_center()
-        .gap(px(2.0))
-        .px(px(4.0))
-        .text_size(px(13.0));
-
-    let Some(latest) = row.component.time_series.latest() else {
-        return container;
-    };
-    let buf = latest.data();
-    let Ok((_size, view)) = row.component.schema.parse_value(buf) else {
-        return container;
-    };
-
-    let meta = row
-        .db
-        .with_state(|s| s.get_component_metadata(component_id).cloned());
-    let enum_variants: Option<Vec<String>> = meta
-        .as_ref()
-        .and_then(|m| m.enum_variants().map(|it| it.map(|s| s.to_string()).collect()));
-    let is_string = meta.as_ref().map(|m| m.is_string()).unwrap_or(false);
-
-    if is_string {
-        if let ComponentView::U8(array) = &view {
-            let buf = array.buf();
-            let len = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
-            let s = std::str::from_utf8(&buf[..len]).unwrap_or("").to_string();
-            return container.child(value_box(
-                None,
-                SharedString::from(s),
-                false,
-                locked,
-                theme,
-                EditRequest {
-                    component_id,
-                    component_name,
-                    element_names,
-                    element_index: 0,
-                },
-            ));
-        }
-    }
-
-    let element_values: Vec<_> = view.iter().collect();
-    let variant_refs: Option<Vec<&str>> = enum_variants
-        .as_ref()
-        .map(|v| v.iter().map(|s| s.as_str()).collect());
-
-    for (idx, element) in element_values.into_iter().enumerate() {
-        let label = row.element_names.get(idx).cloned();
-
-        // If a pending edit exists for this element, show that value instead.
-        let (display_value, is_pending) = if let Some((pv, modified)) = &pending_value {
-            if modified.contains(&idx) {
-                let pv_element = pv.get(idx);
-                if let Some(pe) = pv_element {
-                    (
-                        super::format_element_value(pe, variant_refs.as_deref()),
-                        true,
-                    )
-                } else {
-                    (
-                        super::format_element_value(element, variant_refs.as_deref()),
-                        false,
-                    )
-                }
-            } else {
-                (
-                    super::format_element_value(element, variant_refs.as_deref()),
-                    false,
-                )
-            }
-        } else {
-            (
-                super::format_element_value(element, variant_refs.as_deref()),
-                false,
-            )
-        };
-
-        container = container.child(value_box(
-            label,
-            SharedString::from(display_value),
-            is_pending,
-            locked,
-            theme,
-            EditRequest {
-                component_id,
-                component_name: component_name.clone(),
-                element_names: element_names.clone(),
-                element_index: idx,
-            },
-        ));
-    }
-
-    container
-}
-
-/// Render a single labeled value box. When unlocked, it becomes clickable to
-/// open an edit palette for the element.
-fn value_box(
-    label: Option<SharedString>,
-    value: SharedString,
-    is_pending: bool,
-    locked: bool,
-    theme: &Theme,
-    request: EditRequest,
-) -> Stateful<gpui::Div> {
-    let bg = if is_pending {
-        theme.drop_target
-    } else {
-        theme.bg_secondary
-    };
-
-    let id_hash = request.component_id.0.wrapping_mul(31)
-        + request.element_index as u64;
-
-    let mut b = div()
-        .id(("vbox", id_hash as usize))
-        .flex()
-        .flex_row()
-        .items_center()
-        .gap(px(4.0))
-        .px(px(4.0))
-        .py(px(1.0))
-        .rounded(px(3.0))
-        .bg(bg);
-
-    if let Some(label) = label {
-        b = b.child(
-            div()
-                .text_color(theme.text_tertiary)
-                .child(label),
-        );
-    }
-
-    b = b.child(
-        div()
-            .text_color(theme.text_primary)
-            .child(value),
-    );
-
-    if !locked {
-        b = b.cursor_pointer().on_mouse_down(
-            gpui::MouseButton::Left,
-            move |_, _window, cx| {
-                pending_edits_mut(cx).pending_request = Some(request.clone());
-                cx.refresh_windows();
-            },
-        );
-    }
-
-    b
 }

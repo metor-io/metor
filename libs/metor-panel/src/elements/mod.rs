@@ -16,6 +16,7 @@ pub mod monitor;
 pub mod scrollbar;
 pub mod table;
 pub mod time_series;
+pub mod value_strip;
 pub mod viewer_3d;
 
 /// Element indices within a component (e.g. x=0, y=1, z=2 for a Vec3).
@@ -28,6 +29,9 @@ pub use monitor::Monitor;
 pub use scrollbar::Scrollbar;
 pub use table::{Column, ColumnSort, Table, TableDelegate};
 pub use time_series::{PlotStyle, TimeSeriesPlot, Trace};
+pub use value_strip::{
+    ComponentValueStrip, StripBehavior, StripCell, StripClick, StripPreset, StripStyle,
+};
 
 /// Format a component value using metadata hints.
 ///
@@ -67,15 +71,22 @@ pub fn format_element_value(value: ElementValue, enum_variants: Option<&[&str]>)
             return name.to_string();
         }
     }
-    match value {
-        ElementValue::F32(v) => format!("{:.4}", v),
-        ElementValue::F64(v) => format!("{:.4}", v),
-        ElementValue::Bool(b) => (if b { "true" } else { "false" }).to_string(),
-        _ => {
-            let mut s = String::new();
-            let _ = write!(s, "{}", value.as_f64());
-            s
-        }
+    value_strip::format_element(value)
+}
+
+/// Format a number with adaptive precision: drops unnecessary trailing
+/// zeros for large magnitudes and keeps more digits for small ones.
+pub(crate) fn format_number(v: f64) -> String {
+    if v == 0.0 {
+        "0".to_string()
+    } else if v.abs() >= 1000.0 {
+        format!("{:.0}", v)
+    } else if v.abs() >= 100.0 {
+        format!("{:.1}", v)
+    } else if v.abs() >= 1.0 {
+        format!("{:.2}", v)
+    } else {
+        format!("{:.4}", v)
     }
 }
 

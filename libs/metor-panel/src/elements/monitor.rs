@@ -2,34 +2,35 @@ use std::sync::Arc;
 
 use gpui::{Context, Entity, IntoElement, SharedString, Window, div, prelude::*, px};
 use metor_db::DB;
-use metor_proto::types::{ComponentId, ComponentView};
+use metor_proto::types::ComponentId;
+use smallvec::SmallVec;
 
 use super::time_series::{LinePlot, Trace};
+use super::value_strip::{ComponentValueStrip, StripBehavior, StripClick, StripStyle};
+use crate::ComponentStreamBuilder;
+use crate::pending_edits::{EditRequest, pending_edits, pending_edits_mut};
 use crate::theme::theme;
-use crate::{AsComponentView, ComponentStream, ComponentStreamBuilder};
 
-/// A single element's formatted value and label.
-#[derive(Clone)]
-struct ElementDisplay {
-    label: Option<SharedString>,
-    value: SharedString,
-}
-
-/// A monitor displays a component's current value with its name and an
-/// optional sparkline. Designed for dashboard use where a clean,
-/// at-a-glance readout is needed.
+/// Dashboard widget that displays a component's current value alongside its
+/// name and an optional sparkline. The value row itself is rendered by a
+/// shared [`ComponentValueStrip`] that handles streaming, formatting, and
+/// click-to-edit behaviour.
 #[derive(facet::Facet)]
 pub struct Monitor {
     #[facet(skip)]
     name: SharedString,
     pub unit: SharedString,
-    #[facet(opaque)]
-    elements: Vec<ElementDisplay>,
     pub show_sparkline: bool,
+    #[facet(opaque)]
+    component_id: ComponentId,
     #[facet(opaque)]
     sparkline: Entity<LinePlot>,
     #[facet(opaque)]
-    _task: gpui::Task<()>,
+    strip: Entity<ComponentValueStrip>,
+    #[facet(opaque)]
+    click: StripClick,
+    #[facet(opaque)]
+    _resolver_task: gpui::Task<()>,
 }
 
 impl Monitor {
@@ -41,7 +42,7 @@ impl Monitor {
         let component_id = source.component_id();
         let line_colors = theme(cx).line_colors;
 
-        let (name, unit, element_names) = db.with_state(|state| {
+        let (name, unit) = db.with_state(|state| {
             let meta = state.get_component_metadata(component_id);
             let name = meta
                 .map(|m| m.name.clone())
@@ -49,83 +50,70 @@ impl Monitor {
             let unit = meta
                 .and_then(|m| m.metadata.get("unit").cloned())
                 .unwrap_or_default();
-            let element_names: Vec<String> = meta
-                .map(|m| {
-                    let raw = m.element_names();
-                    if raw.is_empty() {
-                        vec![]
-                    } else {
-                        raw.split(',').map(|s| s.trim().to_string()).collect()
-                    }
-                })
-                .unwrap_or_default();
-            (name, unit, element_names)
+            (name, unit)
         });
 
         let sparkline = cx.new(|cx| LinePlot::new(db.clone(), cx));
 
-        // If the component is already in the DB, bind traces inline so
-        // the sparkline is never momentarily empty. Otherwise the text
-        // task binds on its first stream wake-up, which is the moment
-        // the component has been registered.
+        // Seed traces when the component is already registered so the
+        // sparkline is not momentarily empty.
         if let Some(comp) = db.with_state(|state| state.get_component(component_id).cloned()) {
             let element_count: usize = comp.schema.dim.iter().product::<usize>().max(1);
             let traces = build_traces(component_id, element_count, &line_colors);
             sparkline.update(cx, |sp, cx| sp.bind_traces(traces, cx));
         }
 
-        let task = cx.spawn({
+        let name_shared = SharedString::from(name);
+        let unit_shared = SharedString::from(unit);
+
+        let click = edit_click(db.clone(), component_id, name_shared.clone());
+
+        let style = StripStyle::dashboard().with_unit(unit_shared.clone());
+        let behavior = StripBehavior {
+            on_element_click: Some(click.clone()),
+            highlighted: SmallVec::new(),
+            locked: pending_edits(cx).locked,
+        };
+
+        let strip = cx.new(|cx| {
+            ComponentValueStrip::new(db.clone(), source, style, behavior, cx)
+        });
+
+        // Rebind traces once the component is registered — until then the
+        // eager rebind above may have fallen through and the plot is empty.
+        let resolver_task = cx.spawn({
             let db = db.clone();
             let sparkline = sparkline.clone();
-            async move |this, cx| {
-                let mut stream = source.into_stream(&db).await;
-
-                // The stream builder only returns once the component is
-                // resolvable; rebind traces with the authoritative
-                // element count in case the constructor fell through to
-                // the fallback.
-                let comp = db.with_state(|s| s.get_component(component_id).cloned());
-                if let Some(comp) = comp {
-                    let element_count: usize = comp.schema.dim.iter().product::<usize>().max(1);
-                    let _ = sparkline.update(cx, |sp, cx| {
-                        if element_count != sp.trace_count() {
-                            let traces = build_traces(component_id, element_count, &line_colors);
-                            sp.bind_traces(traces, cx);
-                        }
-                    });
-                }
-
-                let enum_variants: Option<Vec<String>> = db.with_state(|state| {
-                    state.get_component_metadata(component_id).and_then(|m| {
-                        m.enum_variants()
-                            .map(|v| v.map(|s| s.to_string()).collect())
-                    })
-                });
-
+            async move |_this, cx| {
                 loop {
-                    let elements = {
-                        let view = stream.next().await;
-                        let cv = view.as_component_view();
-                        format_elements(&cv, &element_names, enum_variants.as_deref())
-                    };
-                    let result = this.update(cx, |this, cx| {
-                        this.elements = elements;
-                        cx.notify();
-                    });
-                    if result.is_err() {
+                    let comp =
+                        db.with_state(|state| state.get_component(component_id).cloned());
+                    if let Some(comp) = comp {
+                        let element_count: usize =
+                            comp.schema.dim.iter().product::<usize>().max(1);
+                        let _ = sparkline.update(cx, |sp, cx| {
+                            if element_count != sp.trace_count() {
+                                let traces =
+                                    build_traces(component_id, element_count, &line_colors);
+                                sp.bind_traces(traces, cx);
+                            }
+                        });
                         break;
                     }
+                    db.vtable_gen.wait().await;
                 }
             }
         });
 
         Self {
-            name: SharedString::from(name),
-            unit: SharedString::from(unit),
-            elements: Vec::new(),
+            name: name_shared,
+            unit: unit_shared,
             show_sparkline: true,
+            component_id,
             sparkline,
-            _task: task,
+            strip,
+            click,
+            _resolver_task: resolver_task,
         }
     }
 }
@@ -144,77 +132,58 @@ fn build_traces(
         .collect()
 }
 
-/// Format component elements into display-friendly strings.
-fn format_elements(
-    view: &ComponentView<'_>,
-    element_names: &[String],
-    enum_variants: Option<&[String]>,
-) -> Vec<ElementDisplay> {
-    // Check if this is a string component
-    if let ComponentView::U8(array) = view {
-        let buf = array.buf();
-        let len = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
-        if let Ok(s) = std::str::from_utf8(&buf[..len]) {
-            return vec![ElementDisplay {
-                label: None,
-                value: SharedString::from(s.to_string()),
-            }];
-        }
-    }
-
-    // Check if this is an enum
-    if let Some(variants) = enum_variants {
-        let idx = view.to_f64() as usize;
-        if let Some(name) = variants.get(idx) {
-            return vec![ElementDisplay {
-                label: None,
-                value: SharedString::from(name.to_string()),
-            }];
-        }
-    }
-
-    let values: Vec<_> = view.iter().collect();
-
-    // Single scalar — no label needed
-    if values.len() == 1 {
-        return vec![ElementDisplay {
-            label: None,
-            value: SharedString::from(format_number(values[0].as_f64())),
-        }];
-    }
-
-    // Multi-element — show each with its label
-    values
-        .iter()
-        .enumerate()
-        .map(|(i, v)| {
-            let label = element_names.get(i).map(|n| SharedString::from(n.clone()));
-            ElementDisplay {
-                label,
-                value: SharedString::from(format_number(v.as_f64())),
-            }
-        })
-        .collect()
+/// Build the click adapter that forwards strip clicks to the pending-edit
+/// palette. Element names are re-resolved at click time to reflect the
+/// component's latest metadata.
+pub(crate) fn edit_click(
+    db: Arc<DB>,
+    component_id: ComponentId,
+    component_name: SharedString,
+) -> StripClick {
+    Arc::new(move |element_index, _window, cx| {
+        let element_names: Vec<SharedString> =
+            crate::trace_picker::element_names_for_component(&db, component_id)
+                .into_iter()
+                .map(SharedString::from)
+                .collect();
+        pending_edits_mut(cx).pending_request = Some(EditRequest {
+            component_id,
+            component_name: component_name.clone(),
+            element_names,
+            element_index,
+        });
+    })
 }
 
-/// Format a number concisely: drop unnecessary trailing zeros.
-fn format_number(v: f64) -> String {
-    if v.abs() >= 1000.0 {
-        format!("{:.0}", v)
-    } else if v.abs() >= 100.0 {
-        format!("{:.1}", v)
-    } else if v.abs() >= 1.0 {
-        format!("{:.2}", v)
-    } else if v == 0.0 {
-        "0".to_string()
-    } else {
-        format!("{:.4}", v)
+/// Snapshot the current pending-edits state relevant to `component_id` into
+/// a [`StripBehavior`]. Shared by all three consumers of the strip.
+pub(crate) fn behavior_snapshot(
+    cx: &gpui::App,
+    component_id: ComponentId,
+    on_element_click: StripClick,
+) -> StripBehavior {
+    let pending = pending_edits(cx);
+    let highlighted = pending
+        .get(component_id)
+        .map(|edit| edit.modified_elements.iter().copied().collect())
+        .unwrap_or_else(SmallVec::new);
+    StripBehavior {
+        on_element_click: Some(on_element_click),
+        highlighted,
+        locked: pending.locked,
     }
 }
 
 impl Render for Monitor {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = theme(cx);
+
+        let style = StripStyle::dashboard().with_unit(self.unit.clone());
+        let behavior = behavior_snapshot(cx, self.component_id, self.click.clone());
+        self.strip.update(cx, |strip, cx| {
+            strip.set_style(style, cx);
+            strip.set_behavior(behavior, cx);
+        });
 
         let mut root = div()
             .size_full()
@@ -224,7 +193,6 @@ impl Render for Monitor {
             .bg(theme.bg_primary)
             .overflow_hidden();
 
-        // Sparkline — fills available space above the text content
         if self.show_sparkline && !self.sparkline.read(cx).is_empty() {
             root = root.child(
                 div()
@@ -236,89 +204,13 @@ impl Render for Monitor {
             );
         }
 
-        // Values
-        let is_multi = self.elements.len() > 1;
-        if is_multi {
-            // Multi-element: compact row of labeled values
-            let mut row = div()
-                .flex()
-                .flex_row()
-                .flex_wrap()
-                .gap(px(6.0))
+        root = root.child(
+            div()
                 .px(px(6.0))
-                .pt(px(3.0));
+                .pt(px(3.0))
+                .child(self.strip.clone()),
+        );
 
-            for elem in &self.elements {
-                let mut item = div().flex().flex_row().items_baseline().gap(px(2.0));
-
-                if let Some(ref label) = elem.label {
-                    item = item.child(
-                        div()
-                            .text_size(px(9.0))
-                            .text_color(theme.text_tertiary)
-                            .child(label.clone()),
-                    );
-                }
-
-                item = item.child(
-                    div()
-                        .text_size(px(13.0))
-                        .text_color(theme.text_primary)
-                        .child(elem.value.clone()),
-                );
-
-                if !self.unit.is_empty() {
-                    item = item.child(
-                        div()
-                            .text_size(px(9.0))
-                            .text_color(theme.text_secondary)
-                            .child(self.unit.clone()),
-                    );
-                }
-
-                row = row.child(item);
-            }
-
-            root = root.child(row);
-        } else if let Some(elem) = self.elements.first() {
-            // Single value: larger display
-            let mut value_row = div()
-                .flex()
-                .flex_row()
-                .items_baseline()
-                .gap(px(3.0))
-                .px(px(6.0))
-                .pt(px(3.0));
-
-            value_row = value_row.child(
-                div()
-                    .text_size(px(16.0))
-                    .text_color(theme.text_primary)
-                    .child(elem.value.clone()),
-            );
-
-            if !self.unit.is_empty() {
-                value_row = value_row.child(
-                    div()
-                        .text_size(px(10.0))
-                        .text_color(theme.text_secondary)
-                        .child(self.unit.clone()),
-                );
-            }
-
-            root = root.child(value_row);
-        } else {
-            root = root.child(
-                div()
-                    .px(px(6.0))
-                    .pt(px(3.0))
-                    .text_size(px(14.0))
-                    .text_color(theme.text_tertiary)
-                    .child("—"),
-            );
-        }
-
-        // Component name
         root = root.child(
             div()
                 .px(px(6.0))
