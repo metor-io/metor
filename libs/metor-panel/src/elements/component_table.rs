@@ -187,8 +187,12 @@ impl TableDelegate for ComponentTableDelegate {
             1 => {
                 let (strip, behavior) = {
                     let row_ref = row.read(cx);
-                    let behavior =
-                        behavior_snapshot(cx, row_ref.component_id(), row_ref.click.clone());
+                    let behavior = behavior_snapshot(
+                        cx,
+                        row_ref.db.clone(),
+                        row_ref.component_id(),
+                        row_ref.click.clone(),
+                    );
                     (row_ref.strip.clone(), behavior)
                 };
                 strip.update(cx, |s, cx| s.set_behavior(behavior, cx));

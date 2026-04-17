@@ -8,6 +8,7 @@ use gpui::{AnyElement, App, Hsla, SharedString, Window, div, prelude::*, px};
 use crate::theme::theme;
 
 pub mod bool_row;
+pub mod checkbox;
 pub mod color_row;
 pub mod command_row;
 pub mod default_action_row;
@@ -19,6 +20,7 @@ pub mod text_field;
 pub mod text_row;
 
 pub use bool_row::BoolRow;
+pub use checkbox::{check_square, checkbox};
 pub use color_row::ColorRow;
 pub use command_row::CommandRow;
 pub use default_action_row::DefaultActionRow;

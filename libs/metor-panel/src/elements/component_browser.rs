@@ -268,7 +268,7 @@ impl ColumnBrowserDelegate for ComponentBrowserDelegate {
             .map(|p| {
                 (
                     p.strip.clone(),
-                    behavior_snapshot(cx, p.component_id, p.click.clone()),
+                    behavior_snapshot(cx, self.db.clone(), p.component_id, p.click.clone()),
                 )
             })
             .collect();

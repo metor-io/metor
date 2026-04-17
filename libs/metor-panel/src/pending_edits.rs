@@ -1,8 +1,8 @@
 use std::sync::Arc;
 
-use gpui::{App, Global, SharedString};
+use gpui::{App, Global, Pixels, Point, SharedString};
 use metor_db::DB;
-use metor_proto::types::{ComponentId, Timestamp};
+use metor_proto::types::{ComponentId, ElementValue, Timestamp};
 use metor_proto_wkt::{ComponentValue, UpdateComponent};
 use metor_proto::types::Msg;
 
@@ -28,6 +28,9 @@ pub struct EditRequest {
     pub component_name: SharedString,
     pub element_names: Vec<SharedString>,
     pub element_index: usize,
+    /// Window-space position for anchoring the inspector near the clicked
+    /// cell. `None` falls back to centered.
+    pub anchor: Option<Point<Pixels>>,
 }
 
 /// Global store for the editor lock state and accumulated pending edits.
@@ -93,6 +96,28 @@ pub fn apply_edit(db: &DB, edit: &PendingEdit) {
     };
     let bytes = postcard::to_allocvec(&update).expect("postcard serialize");
     let _ = db.push_msg(Timestamp::now(), UpdateComponent::ID, &bytes);
+}
+
+/// Commit the pending edit for `component_id` and drop `element_index` from
+/// its modified list. The wire protocol is component-scoped, so the full
+/// `ComponentValue` (including any other modified elements) is sent; only
+/// `element_index` is removed from the pending UI state.
+pub fn apply_element(db: &DB, component_id: ComponentId, element_index: usize, cx: &mut App) {
+    let Some(edit) = pending_edits(cx).get(component_id).cloned() else {
+        return;
+    };
+    apply_edit(db, &edit);
+    let pending = pending_edits_mut(cx);
+    if let Some(existing) = pending
+        .edits
+        .iter_mut()
+        .find(|e| e.component_id == component_id)
+    {
+        existing.modified_elements.retain(|&i| i != element_index);
+        if existing.modified_elements.is_empty() {
+            pending.remove(component_id);
+        }
+    }
 }
 
 /// Build the inspector rows that list pending edits with apply/discard actions.
@@ -204,6 +229,7 @@ fn select_element_rows(
                 component_name,
                 element_names,
                 element_index: 0,
+                anchor: None,
             },
         );
     }
@@ -227,6 +253,7 @@ fn select_element_rows(
                             component_name: component_name.clone(),
                             element_names: element_names.clone(),
                             element_index: idx,
+                            anchor: None,
                         },
                     )
                 }),
@@ -244,6 +271,7 @@ pub fn edit_value_rows(db: Arc<DB>, request: EditRequest) -> Vec<Box<dyn Inspect
         component_name,
         element_names,
         element_index,
+        anchor: _,
     } = request;
 
     let enum_variants: Option<Vec<String>> = db.with_state(|s| {
@@ -299,6 +327,72 @@ pub fn edit_value_rows(db: Arc<DB>, request: EditRequest) -> Vec<Box<dyn Inspect
     })]
 }
 
+/// Upsert a pending edit that replaces the full U8 buffer of a string
+/// component. UTF-8 bytes are written and any remainder is zero-padded so
+/// the receiver sees a properly null-terminated string. `modified_elements`
+/// is `[0]` as a sentinel — strings have no element-level granularity.
+pub fn upsert_string_value(
+    db: &DB,
+    component_id: ComponentId,
+    component_name: SharedString,
+    element_names: Vec<SharedString>,
+    text: &str,
+    cx: &mut App,
+) {
+    let Some(component) = db.with_state(|s| s.get_component(component_id).cloned()) else {
+        return;
+    };
+    let cap: usize = component.schema.dim.iter().product();
+    let bytes = text.as_bytes();
+    if bytes.len() > cap.saturating_sub(1) {
+        return;
+    }
+    let Some(latest) = component.time_series.latest() else {
+        return;
+    };
+    let buf = latest.data();
+    let Ok((_size, view)) = component.schema.parse_value(buf) else {
+        return;
+    };
+    let mut value = ComponentValue::from_view(view);
+    if let ComponentValue::U8(arr) = &mut value {
+        use nox::ArrayBuf;
+        let slot = arr.buf.as_mut_buf();
+        for (i, cell) in slot.iter_mut().enumerate() {
+            *cell = *bytes.get(i).unwrap_or(&0);
+        }
+    } else {
+        return;
+    }
+    merge_pending(cx, component_id, component_name, element_names, 0, value);
+}
+
+/// Upsert a pending edit with an already-typed element value. Used by the
+/// inline editors (checkbox toggle, text field commit) to skip the
+/// string-parse round trip.
+pub fn upsert_element_value(
+    db: &DB,
+    component_id: ComponentId,
+    component_name: SharedString,
+    element_names: Vec<SharedString>,
+    element_index: usize,
+    value: ElementValue,
+    cx: &mut App,
+) {
+    let Some(component_value) = build_updated_value_typed(db, component_id, element_index, value)
+    else {
+        return;
+    };
+    merge_pending(
+        cx,
+        component_id,
+        component_name,
+        element_names,
+        element_index,
+        component_value,
+    );
+}
+
 fn upsert_element_edit(
     db: &DB,
     component_id: ComponentId,
@@ -311,7 +405,24 @@ fn upsert_element_edit(
     let Some(value) = build_updated_value(db, component_id, element_index, input) else {
         return;
     };
+    merge_pending(
+        cx,
+        component_id,
+        component_name,
+        element_names,
+        element_index,
+        value,
+    );
+}
 
+fn merge_pending(
+    cx: &mut App,
+    component_id: ComponentId,
+    component_name: SharedString,
+    element_names: Vec<SharedString>,
+    element_index: usize,
+    value: ComponentValue,
+) {
     let pending = pending_edits_mut(cx);
     if let Some(existing) = pending
         .edits
@@ -331,6 +442,40 @@ fn upsert_element_edit(
             element_names,
         });
     }
+}
+
+fn build_updated_value_typed(
+    db: &DB,
+    component_id: ComponentId,
+    element_index: usize,
+    value: ElementValue,
+) -> Option<ComponentValue> {
+    let component = db.with_state(|s| s.get_component(component_id).cloned())?;
+    let latest = component.time_series.latest()?;
+    let buf = latest.data();
+    let (_size, view) = component.schema.parse_value(buf).ok()?;
+    let mut out = ComponentValue::from_view(view);
+    set_element_typed(&mut out, element_index, value)?;
+    Some(out)
+}
+
+fn set_element_typed(value: &mut ComponentValue, idx: usize, element: ElementValue) -> Option<()> {
+    use nox::ArrayBuf;
+    match (value, element) {
+        (ComponentValue::U8(a), ElementValue::U8(v)) => *a.buf.as_mut_buf().get_mut(idx)? = v,
+        (ComponentValue::U16(a), ElementValue::U16(v)) => *a.buf.as_mut_buf().get_mut(idx)? = v,
+        (ComponentValue::U32(a), ElementValue::U32(v)) => *a.buf.as_mut_buf().get_mut(idx)? = v,
+        (ComponentValue::U64(a), ElementValue::U64(v)) => *a.buf.as_mut_buf().get_mut(idx)? = v,
+        (ComponentValue::I8(a), ElementValue::I8(v)) => *a.buf.as_mut_buf().get_mut(idx)? = v,
+        (ComponentValue::I16(a), ElementValue::I16(v)) => *a.buf.as_mut_buf().get_mut(idx)? = v,
+        (ComponentValue::I32(a), ElementValue::I32(v)) => *a.buf.as_mut_buf().get_mut(idx)? = v,
+        (ComponentValue::I64(a), ElementValue::I64(v)) => *a.buf.as_mut_buf().get_mut(idx)? = v,
+        (ComponentValue::Bool(a), ElementValue::Bool(v)) => *a.buf.as_mut_buf().get_mut(idx)? = v,
+        (ComponentValue::F32(a), ElementValue::F32(v)) => *a.buf.as_mut_buf().get_mut(idx)? = v,
+        (ComponentValue::F64(a), ElementValue::F64(v)) => *a.buf.as_mut_buf().get_mut(idx)? = v,
+        _ => return None,
+    }
+    Some(())
 }
 
 /// Build an updated [`ComponentValue`] by reading the current value, then setting

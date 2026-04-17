@@ -2,14 +2,16 @@ use std::fmt::Write;
 use std::sync::Arc;
 
 use gpui::{
-    App, Context, InteractiveElement, IntoElement, MouseButton, SharedString, Stateful, Window,
-    div, prelude::*, px,
+    App, Context, FocusHandle, Focusable, InteractiveElement, IntoElement, KeyDownEvent,
+    MouseButton, Pixels, Point, SharedString, Stateful, Window, div, prelude::*, px,
 };
 use metor_db::DB;
-use metor_proto::types::{ComponentId, ComponentView, ElementValue};
+use metor_proto::types::{ComponentId, ComponentView, ElementValue, PrimType};
 use smallvec::SmallVec;
 
+use crate::icons::Icon;
 use crate::theme::{Theme, theme};
+use crate::widgets::TextField;
 use crate::{AsComponentView, ComponentStream, ComponentStreamBuilder};
 
 /// One formatted value within a [`ComponentValueStrip`].
@@ -17,6 +19,56 @@ use crate::{AsComponentView, ComponentStream, ComponentStreamBuilder};
 pub struct StripCell {
     pub label: Option<SharedString>,
     pub value: SharedString,
+}
+
+/// Scalar interpretation of a component's elements. Shared across all cells
+/// in a single strip because every element of a component has the same
+/// primitive type. Drives the editor affordance: checkbox for bools, anchored
+/// inspector for enums, inline text for numeric/string.
+#[derive(Clone, Debug, PartialEq)]
+pub enum CellKind {
+    /// Component isn't registered yet, or metadata can't be resolved.
+    Unknown,
+    Bool,
+    Enum {
+        variants: Vec<SharedString>,
+    },
+    Numeric {
+        signed: bool,
+        float: bool,
+    },
+    String,
+}
+
+impl CellKind {
+    fn from_schema(prim_type: PrimType, is_string: bool, enum_variants: Option<&[String]>) -> Self {
+        if is_string {
+            return CellKind::String;
+        }
+        if let Some(variants) = enum_variants {
+            return CellKind::Enum {
+                variants: variants
+                    .iter()
+                    .map(|s| SharedString::from(s.clone()))
+                    .collect(),
+            };
+        }
+        match prim_type {
+            PrimType::Bool => CellKind::Bool,
+            PrimType::F32 | PrimType::F64 => CellKind::Numeric {
+                signed: true,
+                float: true,
+            },
+            PrimType::I8 | PrimType::I16 | PrimType::I32 | PrimType::I64 => CellKind::Numeric {
+                signed: true,
+                float: false,
+            },
+            PrimType::U8 | PrimType::U16 | PrimType::U32 | PrimType::U64 => CellKind::Numeric {
+                signed: false,
+                float: false,
+            },
+        }
+    }
 }
 
 /// Visual preset controlling the strip's chrome and typography.
@@ -71,15 +123,21 @@ impl StripStyle {
 }
 
 /// Callback invoked when the user clicks a value — the strip surfaces the
-/// index of the clicked element; callers translate that to whatever edit
-/// flow they use (typically populating `pending_edits.pending_request`).
-pub type StripClick = Arc<dyn Fn(usize, &mut Window, &mut App) + Send + Sync>;
+/// index of the clicked element and the window-space position of the click
+/// (so callers can anchor an overlay near the cell). Callers translate that
+/// to whatever edit flow they use — typically populating
+/// `pending_edits.pending_request`.
+pub type StripClick = Arc<dyn Fn(usize, Point<Pixels>, &mut Window, &mut App) + Send + Sync>;
 
 /// Per-render interactive state: which elements show as pending-modified,
-/// whether clicks are disabled (Cmd+L lock), and the edit callback.
+/// whether clicks are disabled (Cmd+L lock), and the edit / apply callbacks.
 #[derive(Default, Clone)]
 pub struct StripBehavior {
     pub on_element_click: Option<StripClick>,
+    /// Applies the pending edit for the strip's component, then drops the
+    /// clicked element from `highlighted`. Shown as a green chevron next to
+    /// highlighted cells. Ignored when `locked` is true.
+    pub on_apply_element: Option<StripClick>,
     pub highlighted: SmallVec<[usize; 4]>,
     pub locked: bool,
 }
@@ -89,6 +147,7 @@ impl StripBehavior {
         self.locked == other.locked
             && self.highlighted == other.highlighted
             && click_ptr(&self.on_element_click) == click_ptr(&other.on_element_click)
+            && click_ptr(&self.on_apply_element) == click_ptr(&other.on_apply_element)
     }
 }
 
@@ -112,11 +171,29 @@ fn click_ptr(click: &Option<StripClick>) -> usize {
 /// list, and the `ComponentTable` value cell. The strip owns the stream
 /// task; callers embed `Entity<ComponentValueStrip>` and refresh the
 /// behavior snapshot each render.
+/// Active inline text edit. `field` holds the user's current typed buffer;
+/// `error` flags a failed commit so the cell can render an error style and
+/// keep focus instead of silently reverting.
+struct EditingCell {
+    index: usize,
+    field: TextField,
+    error: bool,
+}
+
 pub struct ComponentValueStrip {
+    db: Arc<DB>,
     component_id: ComponentId,
+    component_name: SharedString,
+    element_names: Vec<SharedString>,
+    is_string: bool,
+    enum_variants: Option<Vec<String>>,
+    raw_values: Vec<ElementValue>,
     style: StripStyle,
     behavior: StripBehavior,
     cells: Vec<StripCell>,
+    kind: CellKind,
+    editing: Option<EditingCell>,
+    focus: FocusHandle,
     _task: gpui::Task<()>,
 }
 
@@ -134,15 +211,34 @@ impl ComponentValueStrip {
             let db = db.clone();
             async move |this, cx| {
                 let mut stream = source.into_stream(&db).await;
-                let (element_names, enum_variants, is_string) = resolve_metadata(&db, component_id);
+                let metadata = resolve_metadata(&db, component_id);
+                let ResolvedMetadata {
+                    element_names,
+                    enum_variants,
+                    is_string,
+                    kind,
+                    component_name,
+                } = metadata;
+                let _ = this.update(cx, |this, cx| {
+                    this.kind = kind;
+                    this.component_name = component_name;
+                    this.element_names = element_names.clone();
+                    this.is_string = is_string;
+                    this.enum_variants = enum_variants.clone();
+                    cx.notify();
+                });
                 loop {
-                    let cells = {
+                    let (cells, raw_values) = {
                         let view = stream.next().await;
                         let cv = view.as_component_view();
-                        format_cells(&cv, &element_names, enum_variants.as_deref(), is_string)
+                        let raw: Vec<ElementValue> = cv.iter().collect();
+                        let cells =
+                            format_cells(&cv, &element_names, enum_variants.as_deref(), is_string);
+                        (cells, raw)
                     };
                     let result = this.update(cx, |this, cx| {
                         this.cells = cells;
+                        this.raw_values = raw_values;
                         cx.notify();
                     });
                     if result.is_err() {
@@ -153,12 +249,25 @@ impl ComponentValueStrip {
         });
 
         Self {
+            db,
             component_id,
+            component_name: SharedString::default(),
+            element_names: Vec::new(),
+            is_string: false,
+            enum_variants: None,
+            raw_values: Vec::new(),
             style,
             behavior,
             cells: Vec::new(),
+            kind: CellKind::Unknown,
+            editing: None,
+            focus: cx.focus_handle(),
             _task: task,
         }
+    }
+
+    pub fn kind(&self) -> &CellKind {
+        &self.kind
     }
 
     pub fn component_id(&self) -> ComponentId {
@@ -188,45 +297,359 @@ impl ComponentValueStrip {
     }
 }
 
+impl ComponentValueStrip {
+    fn toggle_bool_cell(&mut self, idx: usize, _window: &mut Window, cx: &mut Context<Self>) {
+        if self.behavior.locked {
+            return;
+        }
+        let Some(ElementValue::Bool(current)) = self.raw_values.get(idx).copied() else {
+            return;
+        };
+        let new_value = ElementValue::Bool(!current);
+        crate::pending_edits::upsert_element_value(
+            &self.db,
+            self.component_id,
+            self.component_name.clone(),
+            self.element_names.clone(),
+            idx,
+            new_value,
+            cx,
+        );
+        cx.notify();
+    }
+
+    fn enter_text_edit(&mut self, idx: usize, window: &mut Window, cx: &mut Context<Self>) {
+        if self.behavior.locked {
+            return;
+        }
+        // If already editing another cell, try to commit its value first so
+        // clicking between cells doesn't silently drop typing.
+        if self.editing.as_ref().is_some_and(|e| e.index != idx) {
+            self.commit_edit(window, cx);
+        }
+        let seed = match self.kind {
+            CellKind::String => string_seed(&self.raw_values),
+            CellKind::Numeric { .. } => self
+                .raw_values
+                .get(idx)
+                .map(|v| format_seed(*v))
+                .unwrap_or_default(),
+            _ => return,
+        };
+        let mut field = TextField::new("", cx);
+        field.text = seed;
+        field.cursor = field.text.len();
+        field.mark = field.cursor;
+        self.editing = Some(EditingCell {
+            index: idx,
+            field,
+            error: false,
+        });
+        self.focus.focus(window);
+        cx.notify();
+    }
+
+    fn commit_edit(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
+        let Some(mut edit) = self.editing.take() else {
+            return;
+        };
+        let text = edit.field.text.clone();
+        match self.kind.clone() {
+            CellKind::Numeric { signed, float } => {
+                match parse_numeric(&text, self.prim_type(), signed, float) {
+                    Some(value) => {
+                        crate::pending_edits::upsert_element_value(
+                            &self.db,
+                            self.component_id,
+                            self.component_name.clone(),
+                            self.element_names.clone(),
+                            edit.index,
+                            value,
+                            cx,
+                        );
+                    }
+                    None => {
+                        edit.error = true;
+                        self.editing = Some(edit);
+                        cx.notify();
+                        return;
+                    }
+                }
+            }
+            CellKind::String => {
+                crate::pending_edits::upsert_string_value(
+                    &self.db,
+                    self.component_id,
+                    self.component_name.clone(),
+                    self.element_names.clone(),
+                    &text,
+                    cx,
+                );
+            }
+            _ => {}
+        }
+        cx.notify();
+    }
+
+    fn cancel_edit(&mut self, cx: &mut Context<Self>) {
+        if self.editing.take().is_some() {
+            cx.notify();
+        }
+    }
+
+    fn prim_type(&self) -> Option<PrimType> {
+        self.db.with_state(|s| {
+            s.get_component(self.component_id)
+                .map(|c| c.schema.prim_type)
+        })
+    }
+
+    fn handle_key_down(
+        &mut self,
+        event: &KeyDownEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.editing.is_none() {
+            return;
+        }
+        let key = event.keystroke.key.as_str();
+        match key {
+            "escape" => {
+                self.cancel_edit(cx);
+            }
+            "enter" | "return" => {
+                self.commit_edit(window, cx);
+            }
+            _ => {
+                if let Some(edit) = self.editing.as_mut() {
+                    if edit.field.handle_key_down(event, cx) {
+                        edit.error = false;
+                        cx.notify();
+                    }
+                }
+            }
+        }
+    }
+}
+
+impl Focusable for ComponentValueStrip {
+    fn focus_handle(&self, _cx: &App) -> FocusHandle {
+        self.focus.clone()
+    }
+}
+
+fn format_seed(v: ElementValue) -> String {
+    match v {
+        ElementValue::F32(x) => format!("{}", x),
+        ElementValue::F64(x) => format!("{}", x),
+        ElementValue::Bool(b) => (if b { "true" } else { "false" }).to_string(),
+        other => format!("{}", other.as_f64()),
+    }
+}
+
+fn string_seed(raw: &[ElementValue]) -> String {
+    let bytes: Vec<u8> = raw
+        .iter()
+        .filter_map(|v| match v {
+            ElementValue::U8(b) => Some(*b),
+            _ => None,
+        })
+        .take_while(|&b| b != 0)
+        .collect();
+    String::from_utf8(bytes).unwrap_or_default()
+}
+
+fn parse_numeric(
+    text: &str,
+    prim_type: Option<PrimType>,
+    _signed: bool,
+    _float: bool,
+) -> Option<ElementValue> {
+    let prim_type = prim_type?;
+    Some(match prim_type {
+        PrimType::U8 => ElementValue::U8(text.parse().ok()?),
+        PrimType::U16 => ElementValue::U16(text.parse().ok()?),
+        PrimType::U32 => ElementValue::U32(text.parse().ok()?),
+        PrimType::U64 => ElementValue::U64(text.parse().ok()?),
+        PrimType::I8 => ElementValue::I8(text.parse().ok()?),
+        PrimType::I16 => ElementValue::I16(text.parse().ok()?),
+        PrimType::I32 => ElementValue::I32(text.parse().ok()?),
+        PrimType::I64 => ElementValue::I64(text.parse().ok()?),
+        PrimType::F32 => ElementValue::F32(text.parse().ok()?),
+        PrimType::F64 => ElementValue::F64(text.parse().ok()?),
+        PrimType::Bool => return None,
+    })
+}
+
 impl Render for ComponentValueStrip {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = theme(cx);
 
-        if self.cells.is_empty() {
-            return render_placeholder(&self.style, &theme).into_any_element();
+        // Overlay the pending edit on top of the live WAL values so the cell
+        // reflects the user's in-flight change, not the last broadcast value.
+        let (cells, raw_values) = {
+            let pending = crate::pending_edits::pending_edits(cx).get(self.component_id);
+            if let Some(edit) = pending {
+                let view = edit.value.as_view();
+                let raw: Vec<ElementValue> = view.iter().collect();
+                let cells = format_cells(
+                    &view,
+                    &self.element_names,
+                    self.enum_variants.as_deref(),
+                    self.is_string,
+                );
+                (cells, raw)
+            } else {
+                (self.cells.clone(), self.raw_values.clone())
+            }
+        };
+
+        if cells.is_empty() {
+            return div()
+                .track_focus(&self.focus)
+                .child(render_placeholder(&self.style, &theme))
+                .into_any_element();
         }
 
-        let is_solo =
-            self.style.solo_emphasize && self.cells.len() == 1 && self.cells[0].label.is_none();
+        let is_solo = self.style.solo_emphasize && cells.len() == 1 && cells[0].label.is_none();
 
-        let container = div()
+        let kind = self.kind.clone();
+        let style = self.style.clone();
+        let behavior = self.behavior.clone();
+        let component_id = self.component_id;
+        let editing_index = self.editing.as_ref().map(|e| e.index);
+        let editing_error = self.editing.as_ref().map(|e| e.error).unwrap_or(false);
+
+        let mut row = div()
             .flex()
             .flex_row()
             .flex_wrap()
             .items_center()
             .gap(px(4.0));
 
-        let container = self
-            .cells
-            .iter()
-            .enumerate()
-            .fold(container, |container, (idx, cell)| {
-                let is_pending = self.behavior.highlighted.iter().any(|h| *h == idx);
-                let clickable = self.behavior.on_element_click.is_some() && !self.behavior.locked;
-                container.child(render_cell(
-                    self.component_id,
+        for (idx, cell) in cells.iter().enumerate() {
+            let is_pending = behavior.highlighted.iter().any(|h| *h == idx);
+            let is_editing = editing_index == Some(idx);
+            let is_bool = matches!(kind, CellKind::Bool)
+                && matches!(raw_values.get(idx), Some(ElementValue::Bool(_)));
+            let bool_value = if is_bool {
+                match raw_values.get(idx) {
+                    Some(ElementValue::Bool(b)) => *b,
+                    _ => false,
+                }
+            } else {
+                false
+            };
+
+            let has_apply_group =
+                is_pending && !behavior.locked && behavior.on_apply_element.is_some();
+
+            let atom = if is_editing {
+                build_editing_chrome(
+                    component_id,
                     idx,
                     cell,
-                    &self.style,
-                    &self.behavior,
+                    &style,
+                    &theme,
+                    is_pending,
+                    editing_error,
+                    self.editing.as_ref().map(|e| &e.field),
+                )
+            } else {
+                build_cell_chrome(
+                    component_id,
+                    idx,
+                    cell,
+                    &style,
                     &theme,
                     is_solo,
                     is_pending,
-                    clickable,
-                ))
-            });
+                    is_bool,
+                    bool_value,
+                    has_apply_group,
+                )
+            };
 
-        container.into_any_element()
+            let can_edit_inline =
+                !behavior.locked && matches!(kind, CellKind::Numeric { .. } | CellKind::String);
+
+            let atom = if behavior.locked || is_editing {
+                atom
+            } else if is_bool {
+                atom.cursor_pointer().on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(move |this, _, window, cx| {
+                        this.toggle_bool_cell(idx, window, cx);
+                    }),
+                )
+            } else if can_edit_inline {
+                atom.cursor_pointer().on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(move |this, _, window, cx| {
+                        this.enter_text_edit(idx, window, cx);
+                    }),
+                )
+            } else if let Some(click) = behavior.on_element_click.clone() {
+                atom.cursor_pointer().on_mouse_down(
+                    MouseButton::Left,
+                    move |event: &gpui::MouseDownEvent, window, cx| {
+                        click(idx, event.position, window, cx);
+                        cx.refresh_windows();
+                    },
+                )
+            } else {
+                atom
+            };
+
+            let child = if has_apply_group {
+                let apply = behavior.on_apply_element.clone().unwrap();
+                let chevron_id =
+                    (component_id.0.wrapping_mul(31) ^ idx as u64).wrapping_add(0x1001) as usize;
+                let mut green = theme.line_colors[2];
+                green.a = 0.15;
+                div()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .child(atom)
+                    .child(
+                        div()
+                            .id(("strip-apply", chevron_id))
+                            .px(px(6.0))
+                            .h(px(25.5))
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .bg(green)
+                            .rounded_r(px(3.0))
+                            .text_size(px(12.0))
+                            .text_color(theme.line_colors[2])
+                            .cursor_pointer()
+                            .child(Icon::ChevronRight.svg_color(11.0, theme.line_colors[2]))
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                move |event: &gpui::MouseDownEvent, window, cx| {
+                                    apply(idx, event.position, window, cx);
+                                    cx.refresh_windows();
+                                },
+                            ),
+                    )
+                    .into_any_element()
+            } else {
+                atom.into_any_element()
+            };
+
+            row = row.child(child);
+        }
+
+        div()
+            .track_focus(&self.focus)
+            .on_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
+                this.handle_key_down(event, window, cx);
+            }))
+            .child(row)
+            .into_any_element()
     }
 }
 
@@ -243,29 +666,116 @@ fn render_placeholder(style: &StripStyle, theme: &Theme) -> impl IntoElement {
 }
 
 #[allow(clippy::too_many_arguments)]
-fn render_cell(
+fn build_editing_chrome(
     component_id: ComponentId,
     idx: usize,
     cell: &StripCell,
     style: &StripStyle,
-    behavior: &StripBehavior,
     theme: &Theme,
-    is_solo: bool,
     is_pending: bool,
-    clickable: bool,
+    error: bool,
+    field: Option<&TextField>,
 ) -> Stateful<gpui::Div> {
     let id_hash = component_id.0.wrapping_mul(31) ^ idx as u64;
     let mut atom = div()
-        .id(("strip-cell", id_hash as usize))
+        .id(("strip-cell-edit", id_hash as usize))
         .flex()
         .flex_row()
-        .items_baseline()
+        .items_center()
         .gap(px(4.0))
         .px(px(6.0))
         .py(px(3.0))
         .rounded(px(3.0));
 
-    // Chrome by preset.
+    let bg = if error {
+        theme.drop_target
+    } else if is_pending {
+        theme.drop_target
+    } else {
+        match style.preset {
+            StripPreset::Boxes => theme.bg_secondary,
+            StripPreset::Dashboard => theme.bg_secondary,
+        }
+    };
+    atom = atom.bg(bg).border_1().border_color(if error {
+        theme.line_colors[3]
+    } else {
+        theme.line_color
+    });
+
+    if let Some(label) = cell.label.as_ref() {
+        let label_size = match style.preset {
+            StripPreset::Dashboard => px(9.0),
+            StripPreset::Boxes => px(10.0),
+        };
+        atom = atom.child(
+            div()
+                .text_size(label_size)
+                .text_color(theme.text_tertiary)
+                .child(label.clone()),
+        );
+    }
+
+    if let Some(field) = field {
+        atom = atom.child(div().w(px(80.0)).child(field.element()));
+    }
+
+    atom
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_cell_chrome(
+    component_id: ComponentId,
+    idx: usize,
+    cell: &StripCell,
+    style: &StripStyle,
+    theme: &Theme,
+    is_solo: bool,
+    is_pending: bool,
+    is_bool: bool,
+    bool_value: bool,
+    inside_apply_group: bool,
+) -> Stateful<gpui::Div> {
+    let id_hash = component_id.0.wrapping_mul(31) ^ idx as u64;
+    let mut atom = div().id(("strip-cell", id_hash as usize)).flex().flex_row();
+    // When wrapped with the apply-group chevron, only the left corners are
+    // rounded so the green chevron sits flush on the right.
+    if inside_apply_group {
+        atom = atom.rounded_l(px(3.0));
+    } else {
+        atom = atom.rounded(px(3.0));
+    }
+
+    if is_bool {
+        // The cell itself is the toggle track. Vertical padding matches the
+        // text cells so a bool sits on the same baseline as its neighbours;
+        // the knob is sized down from its height to leave a small margin.
+        let track_color = if is_pending {
+            theme.drop_target
+        } else {
+            theme.bg_secondary
+        };
+        let knob = div()
+            .w(px(12.5))
+            .h(px(12.5))
+            .rounded(px(2.0))
+            .bg(theme.text_primary);
+        atom = atom
+            .w(px(40.0))
+            .h(px(25.5))
+            .py(px(6.25))
+            .px(px(4.0))
+            .items_center()
+            .bg(track_color)
+            .when(bool_value, |el| el.flex_row_reverse())
+            .child(knob);
+        return atom;
+    }
+
+    atom = atom.items_center().gap(px(4.0)).px(px(6.0)).py(px(3.0));
+
+    // Chrome by preset. The inner cell keeps its `drop_target` heat color
+    // when pending; the green tint on the chevron half signals "apply".
     match style.preset {
         StripPreset::Boxes => {
             let bg = if is_pending {
@@ -296,7 +806,7 @@ fn render_cell(
         );
     }
 
-    // Value.
+    // Value text.
     let value_size = match (style.preset, is_solo) {
         (StripPreset::Dashboard, true) => px(16.0),
         (StripPreset::Dashboard, false) => px(12.0),
@@ -329,27 +839,21 @@ fn render_cell(
         );
     }
 
-    if clickable {
-        if let Some(click) = behavior.on_element_click.clone() {
-            atom = atom
-                .cursor_pointer()
-                .on_mouse_down(MouseButton::Left, move |_, window, cx| {
-                    click(idx, window, cx);
-                    cx.refresh_windows();
-                });
-        }
-    }
-
     atom
 }
 
-/// Resolve the metadata the strip needs to format values. Returns empty
-/// results if the component isn't yet registered; callers should call this
-/// again after `into_stream().await` resolves.
-pub(crate) fn resolve_metadata(
-    db: &DB,
-    component_id: ComponentId,
-) -> (Vec<SharedString>, Option<Vec<String>>, bool) {
+pub(crate) struct ResolvedMetadata {
+    pub element_names: Vec<SharedString>,
+    pub enum_variants: Option<Vec<String>>,
+    pub is_string: bool,
+    pub kind: CellKind,
+    pub component_name: SharedString,
+}
+
+/// Resolve the metadata the strip needs to format values. Returns an
+/// [`CellKind::Unknown`] kind if the component isn't yet registered; callers
+/// should call this again after `into_stream().await` resolves.
+pub(crate) fn resolve_metadata(db: &DB, component_id: ComponentId) -> ResolvedMetadata {
     db.with_state(|state| {
         let meta = state.get_component_metadata(component_id);
         let is_string = meta.map(|m| m.is_string()).unwrap_or(false);
@@ -367,11 +871,11 @@ pub(crate) fn resolve_metadata(
                 .map(|s| SharedString::from(s.trim().to_string()))
                 .collect()
         };
+        let component = state.get_component(component_id);
         let element_names = if !custom.is_empty() {
             custom
         } else {
-            state
-                .get_component(component_id)
+            component
                 .map(|c| {
                     crate::trace_picker::element_names(c.schema.dim.as_slice())
                         .into_iter()
@@ -380,7 +884,20 @@ pub(crate) fn resolve_metadata(
                 })
                 .unwrap_or_default()
         };
-        (element_names, enum_variants, is_string)
+        let kind = component
+            .map(|c| CellKind::from_schema(c.schema.prim_type, is_string, enum_variants.as_deref()))
+            .unwrap_or(CellKind::Unknown);
+        let component_name = SharedString::from(
+            meta.map(|m| m.name.clone())
+                .unwrap_or_else(|| format!("{:?}", component_id)),
+        );
+        ResolvedMetadata {
+            element_names,
+            enum_variants,
+            is_string,
+            kind,
+            component_name,
+        }
     })
 }
 
@@ -484,6 +1001,44 @@ mod tests {
     #[test]
     fn i64_formats_without_decimals() {
         assert_eq!(format_element(ElementValue::I64(42)), "42");
+    }
+
+    #[test]
+    fn cell_kind_from_schema_covers_each_branch() {
+        assert_eq!(
+            CellKind::from_schema(PrimType::Bool, false, None),
+            CellKind::Bool
+        );
+        assert_eq!(
+            CellKind::from_schema(PrimType::U8, true, None),
+            CellKind::String
+        );
+        let variants: Vec<String> = vec!["Idle".into(), "Run".into()];
+        match CellKind::from_schema(PrimType::U8, false, Some(&variants)) {
+            CellKind::Enum { variants: v } => assert_eq!(v.len(), 2),
+            other => panic!("expected Enum, got {:?}", other),
+        }
+        assert_eq!(
+            CellKind::from_schema(PrimType::F32, false, None),
+            CellKind::Numeric {
+                signed: true,
+                float: true
+            }
+        );
+        assert_eq!(
+            CellKind::from_schema(PrimType::I32, false, None),
+            CellKind::Numeric {
+                signed: true,
+                float: false
+            }
+        );
+        assert_eq!(
+            CellKind::from_schema(PrimType::U64, false, None),
+            CellKind::Numeric {
+                signed: false,
+                float: false
+            }
+        );
     }
 
     #[test]

@@ -213,8 +213,12 @@ impl Render for AppRoot {
         }
 
         if let Some(request) = pending_edits_mut(cx).pending_request.take() {
+            let mode = request
+                .anchor
+                .map(InspectorMode::Anchored)
+                .unwrap_or(InspectorMode::Centered);
             let rows = edit_value_rows(self.db.clone(), request);
-            self.open_inspector_with(rows, InspectorMode::Centered, window, cx);
+            self.open_inspector_with(rows, mode, window, cx);
         }
 
         if pending_edits(cx).open_review_requested {

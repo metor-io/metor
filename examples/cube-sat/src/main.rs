@@ -253,6 +253,14 @@ pub struct FSW {
     pub mode: Mode,
     pub start_epoch: Timestamp,
     pub tick_time: f64,
+    pub overrides: Overrides,
+}
+
+#[derive(AsVTable, Debug, Clone, Immutable, KnownLayout, Metadatatize, IntoBytes)]
+#[repr(C)]
+pub struct Overrides {
+    pub _pad: [u8; 5],
+    pub disable_reaction_wheels: [bool; 3],
 }
 
 #[derive(AsVTable, Metadatatize, Debug, Clone, Copy, IntoBytes, KnownLayout, Immutable)]
@@ -317,6 +325,10 @@ impl Default for FSW {
             mode: Mode::HilPoint,
             start_epoch: Timestamp::now(),
             tick_time: 0.0,
+            overrides: Overrides {
+                _pad: [0; 5],
+                disable_reaction_wheels: [false; 3],
+            },
         }
     }
 }

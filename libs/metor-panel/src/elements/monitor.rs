@@ -22,6 +22,8 @@ pub struct Monitor {
     pub unit: SharedString,
     pub show_sparkline: bool,
     #[facet(opaque)]
+    db: Arc<DB>,
+    #[facet(opaque)]
     component_id: ComponentId,
     #[facet(opaque)]
     sparkline: Entity<LinePlot>,
@@ -71,6 +73,7 @@ impl Monitor {
         let style = StripStyle::dashboard().with_unit(unit_shared.clone());
         let behavior = StripBehavior {
             on_element_click: Some(click.clone()),
+            on_apply_element: Some(apply_click(db.clone(), component_id)),
             highlighted: SmallVec::new(),
             locked: pending_edits(cx).locked,
         };
@@ -109,6 +112,7 @@ impl Monitor {
             name: name_shared,
             unit: unit_shared,
             show_sparkline: true,
+            db,
             component_id,
             sparkline,
             strip,
@@ -134,13 +138,14 @@ fn build_traces(
 
 /// Build the click adapter that forwards strip clicks to the pending-edit
 /// palette. Element names are re-resolved at click time to reflect the
-/// component's latest metadata.
+/// component's latest metadata. The click position is carried through as the
+/// anchor so the resulting inspector opens next to the cell.
 pub(crate) fn edit_click(
     db: Arc<DB>,
     component_id: ComponentId,
     component_name: SharedString,
 ) -> StripClick {
-    Arc::new(move |element_index, _window, cx| {
+    Arc::new(move |element_index, position, _window, cx| {
         let element_names: Vec<SharedString> =
             crate::trace_picker::element_names_for_component(&db, component_id)
                 .into_iter()
@@ -151,6 +156,7 @@ pub(crate) fn edit_click(
             component_name: component_name.clone(),
             element_names,
             element_index,
+            anchor: Some(position),
         });
     })
 }
@@ -159,6 +165,7 @@ pub(crate) fn edit_click(
 /// a [`StripBehavior`]. Shared by all three consumers of the strip.
 pub(crate) fn behavior_snapshot(
     cx: &gpui::App,
+    db: Arc<DB>,
     component_id: ComponentId,
     on_element_click: StripClick,
 ) -> StripBehavior {
@@ -169,9 +176,19 @@ pub(crate) fn behavior_snapshot(
         .unwrap_or_else(SmallVec::new);
     StripBehavior {
         on_element_click: Some(on_element_click),
+        on_apply_element: Some(apply_click(db, component_id)),
         highlighted,
         locked: pending.locked,
     }
+}
+
+/// Build the chevron-click adapter: applies the pending edit for this
+/// component (whole-value send) and drops `element_index` from the pending
+/// UI list.
+pub(crate) fn apply_click(db: Arc<DB>, component_id: ComponentId) -> StripClick {
+    Arc::new(move |element_index, _position, _window, cx| {
+        crate::pending_edits::apply_element(&db, component_id, element_index, cx);
+    })
 }
 
 impl Render for Monitor {
@@ -179,7 +196,8 @@ impl Render for Monitor {
         let theme = theme(cx);
 
         let style = StripStyle::dashboard().with_unit(self.unit.clone());
-        let behavior = behavior_snapshot(cx, self.component_id, self.click.clone());
+        let behavior =
+            behavior_snapshot(cx, self.db.clone(), self.component_id, self.click.clone());
         self.strip.update(cx, |strip, cx| {
             strip.set_style(style, cx);
             strip.set_behavior(behavior, cx);
