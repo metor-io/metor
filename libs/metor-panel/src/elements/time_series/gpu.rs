@@ -861,7 +861,6 @@ impl PlotRenderState {
     pub(crate) fn take_pending_release(&mut self) -> Option<Arc<RenderImage>> {
         self.pending_release.take()
     }
-
 }
 
 fn read_mapped_bytes(
@@ -952,25 +951,19 @@ fn plan_trace(
         let full = node.full_timestamps();
         let slice_start_idx =
             unsafe { visible.as_ptr().offset_from(full.as_ptr()).max(0) as usize };
+        // Pull one extra sample past each end of the visible range so
+        // the segments that cross the viewport boundary are drawn (and
+        // clipped by the GPU) instead of being dropped.
+        let ext_start_idx = slice_start_idx.saturating_sub(1);
+        let ext_end_idx = (slice_start_idx + visible_len + 1).min(full.len());
 
-        let lod_start = slice_start_idx / lod_stride;
-        let lod_end =
-            ((slice_start_idx + visible_len).div_ceil(lod_stride)).min(decimated_count as usize);
+        let lod_start = ext_start_idx / lod_stride;
+        let lod_end = ext_end_idx
+            .div_ceil(lod_stride)
+            .min(decimated_count as usize);
         let residual_stride = (stride / lod_stride).max(1);
 
-        // For line spans we pad the index buffer with a sentinel at both
-        // ends so the miter vertex shader can safely read `i - 1` and
-        // `i + 2` without a bounds check. Scatter and bar draws use the
-        // indices directly and do not need padding.
         let is_line = matches!(trace.style, PlotStyle::Line);
-        let sentinel_pos = if is_line {
-            let pos = idx_scratch.len();
-            idx_scratch.push(0);
-            Some(pos)
-        } else {
-            None
-        };
-
         let span_first = idx_scratch.len() as u32;
         let mut count_pushed: u32 = 0;
         let mut i = lod_start;
@@ -981,12 +974,6 @@ fn plan_trace(
         }
         let min_for_draw = if is_line { 2u32 } else { 1 };
         if count_pushed >= min_for_draw {
-            if let Some(pos) = sentinel_pos {
-                let first_idx = idx_scratch[span_first as usize];
-                idx_scratch[pos] = first_idx;
-                let last_idx = *idx_scratch.last().expect("just pushed indices");
-                idx_scratch.push(last_idx);
-            }
             let instance_end = if is_line {
                 span_first + count_pushed - 1
             } else {
@@ -997,8 +984,7 @@ fn plan_trace(
                 instance_end,
             });
         } else {
-            let target = sentinel_pos.unwrap_or(span_first as usize);
-            idx_scratch.truncate(target);
+            idx_scratch.truncate(span_first as usize);
         }
     }
 
@@ -1119,36 +1105,105 @@ fn convert_values_strided(
     }
 
     match schema.prim_type {
-        PrimType::F64 => {
-            fill::<f64>(full_data, lod_stride, from, to, max_sample, elem_size, element_index, out)
-        }
-        PrimType::F32 => {
-            fill::<f32>(full_data, lod_stride, from, to, max_sample, elem_size, element_index, out)
-        }
-        PrimType::I64 => {
-            fill::<i64>(full_data, lod_stride, from, to, max_sample, elem_size, element_index, out)
-        }
-        PrimType::I32 => {
-            fill::<i32>(full_data, lod_stride, from, to, max_sample, elem_size, element_index, out)
-        }
-        PrimType::I16 => {
-            fill::<i16>(full_data, lod_stride, from, to, max_sample, elem_size, element_index, out)
-        }
-        PrimType::I8 => {
-            fill::<i8>(full_data, lod_stride, from, to, max_sample, elem_size, element_index, out)
-        }
-        PrimType::U64 => {
-            fill::<u64>(full_data, lod_stride, from, to, max_sample, elem_size, element_index, out)
-        }
-        PrimType::U32 => {
-            fill::<u32>(full_data, lod_stride, from, to, max_sample, elem_size, element_index, out)
-        }
-        PrimType::U16 => {
-            fill::<u16>(full_data, lod_stride, from, to, max_sample, elem_size, element_index, out)
-        }
-        PrimType::U8 | PrimType::Bool => {
-            fill::<u8>(full_data, lod_stride, from, to, max_sample, elem_size, element_index, out)
-        }
+        PrimType::F64 => fill::<f64>(
+            full_data,
+            lod_stride,
+            from,
+            to,
+            max_sample,
+            elem_size,
+            element_index,
+            out,
+        ),
+        PrimType::F32 => fill::<f32>(
+            full_data,
+            lod_stride,
+            from,
+            to,
+            max_sample,
+            elem_size,
+            element_index,
+            out,
+        ),
+        PrimType::I64 => fill::<i64>(
+            full_data,
+            lod_stride,
+            from,
+            to,
+            max_sample,
+            elem_size,
+            element_index,
+            out,
+        ),
+        PrimType::I32 => fill::<i32>(
+            full_data,
+            lod_stride,
+            from,
+            to,
+            max_sample,
+            elem_size,
+            element_index,
+            out,
+        ),
+        PrimType::I16 => fill::<i16>(
+            full_data,
+            lod_stride,
+            from,
+            to,
+            max_sample,
+            elem_size,
+            element_index,
+            out,
+        ),
+        PrimType::I8 => fill::<i8>(
+            full_data,
+            lod_stride,
+            from,
+            to,
+            max_sample,
+            elem_size,
+            element_index,
+            out,
+        ),
+        PrimType::U64 => fill::<u64>(
+            full_data,
+            lod_stride,
+            from,
+            to,
+            max_sample,
+            elem_size,
+            element_index,
+            out,
+        ),
+        PrimType::U32 => fill::<u32>(
+            full_data,
+            lod_stride,
+            from,
+            to,
+            max_sample,
+            elem_size,
+            element_index,
+            out,
+        ),
+        PrimType::U16 => fill::<u16>(
+            full_data,
+            lod_stride,
+            from,
+            to,
+            max_sample,
+            elem_size,
+            element_index,
+            out,
+        ),
+        PrimType::U8 | PrimType::Bool => fill::<u8>(
+            full_data,
+            lod_stride,
+            from,
+            to,
+            max_sample,
+            elem_size,
+            element_index,
+            out,
+        ),
     }
 }
-
