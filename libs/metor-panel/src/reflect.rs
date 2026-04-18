@@ -2,20 +2,19 @@
 ///
 /// [`rows_for_any_entity`] is the type-erased entry point: it prefers a
 /// registered [`TypeRowBuilder`] override, then falls back to the adapter-
-/// driven [`default_rows_for_any_entity`] walk. Widget callbacks write values
-/// back through the monomorphic [`set_field`] / [`get_field`] helpers, which
-/// dispatch through the registry's per-type [`EntityAdapter`].
+/// driven [`default_rows_for_any_entity`] walk. The walk delegates per-field
+/// dispatch to [`WidgetRegistry::row_for_field`], so concrete row construction
+/// lives in `widget_registry`. Widget callbacks write values back through the
+/// monomorphic [`set_field`] / [`get_field`] helpers, which dispatch through
+/// the registry's per-type [`EntityAdapter`].
 use std::sync::Arc;
 
-use facet::{Facet, FieldFlags, Peek, PokeStruct, ScalarType};
+use facet::{Facet, FieldFlags, PokeStruct};
 use gpui::{AnyEntity, App, Entity, SharedString};
 use metor_db::DB;
-use metor_proto::types::ComponentId;
 
 use crate::widget_registry::{FieldBuildCtx, WidgetRegistry};
-use crate::widgets::{
-    BoolRow, CommandRow, EnumRow, InspectorRow, NavRow, ScalarRow, SliderRow, TextRow,
-};
+use crate::widgets::InspectorRow;
 
 /// Resolve rows for any entity. Returns `None` only when the entity's type
 /// has neither a `TypeRowBuilder` override nor an `EntityAdapter`.
@@ -44,7 +43,7 @@ pub fn rows_for_entity<T: 'static>(
 }
 
 /// Walk a Facet struct's fields via the registry adapter and produce widget
-/// rows using shape-based defaults and field widget overrides.
+/// rows. Per-field dispatch is delegated to [`WidgetRegistry::row_for_field`].
 pub fn default_rows_for_any_entity(
     any_entity: &AnyEntity,
     db: &Arc<DB>,
@@ -67,32 +66,18 @@ pub fn default_rows_for_any_entity(
                 continue;
             }
 
-            let field_shape = field_def.shape();
-            let label = SharedString::from(field_def.name);
-
             let Ok(field_peek) = peek_struct.field(idx) else {
                 continue;
             };
 
             let ctx = FieldBuildCtx {
                 db,
-                label: label.clone(),
+                label: SharedString::from(field_def.name),
                 field_name: field_def.name,
             };
 
-            if let Some(factory) = registry.field_widget(field_shape.id) {
-                rows.push(factory(&ctx, &field_peek, any_entity.clone(), idx));
-                continue;
-            }
-
-            if let Some(handler) = registry.entity_list_handler(field_shape.id) {
-                let handler = handler.clone();
-                rows.push(handler(any_entity.clone(), label, db, cx));
-                continue;
-            }
-
-            let field_override = registry.field_override(parent_shape_id, field_def.name);
-            if let Some(row) = build_default_row(&ctx, &field_peek, any_entity, idx, field_override)
+            if let Some(row) =
+                registry.row_for_field(&ctx, &field_peek, any_entity, idx, parent_shape_id, cx)
             {
                 rows.push(row);
             }
@@ -179,188 +164,6 @@ pub fn set_enum_variant(
         };
         set_enum_by_name(&mut ps, field_idx, variant_name);
     });
-}
-
-fn build_default_row(
-    ctx: &FieldBuildCtx,
-    peek: &Peek<'_, '_>,
-    any_entity: &AnyEntity,
-    field_idx: usize,
-    field_override: Option<&crate::widget_registry::FieldOverride>,
-) -> Option<Box<dyn InspectorRow>> {
-    let shape = peek.shape();
-
-    if shape.id == <bool as Facet>::SHAPE.id {
-        let val = *peek.get::<bool>().ok()?;
-        let any_entity = any_entity.clone();
-        return Some(Box::new(BoolRow {
-            label: ctx.label.clone(),
-            value: val,
-            toggle: Arc::new(move |v, _w, cx| set_field::<bool>(&any_entity, field_idx, v, cx)),
-        }));
-    }
-
-    if let Some(scalar) = peek.scalar_type() {
-        if let Some(val) = scalar_as_f64(peek, scalar) {
-            let label = ctx.label.clone();
-            if let Some((min, max)) = field_override.and_then(|o| o.range) {
-                let write_entity = any_entity.clone();
-                let read_entity = any_entity.clone();
-                return Some(Box::new(SliderRow {
-                    label,
-                    read_value: Arc::new(move |cx| {
-                        read_scalar(&read_entity, field_idx, scalar, cx)
-                    }),
-                    min,
-                    max,
-                    on_change: Arc::new(move |v, _w, cx| {
-                        write_scalar(&write_entity, field_idx, scalar, v, cx);
-                    }),
-                }));
-            }
-            let any_entity = any_entity.clone();
-            return Some(Box::new(ScalarRow {
-                label,
-                value: val,
-                on_change: Arc::new(move |v, _w, cx| {
-                    write_scalar(&any_entity, field_idx, scalar, v, cx);
-                }),
-            }));
-        }
-    }
-
-    if shape.id == <String as Facet>::SHAPE.id {
-        let val = peek.get::<String>().ok()?.clone();
-        let any_entity = any_entity.clone();
-        return Some(Box::new(TextRow::new(
-            ctx.label.clone(),
-            SharedString::from(val),
-            Arc::new(move |s, _w, cx| set_field::<String>(&any_entity, field_idx, s, cx)),
-        )));
-    }
-
-    if let Ok(peek_option) = peek.clone().into_option() {
-        return Some(build_option_row(
-            ctx,
-            peek_option,
-            any_entity.clone(),
-            field_idx,
-        ));
-    }
-
-    if let Ok(peek_enum) = peek.clone().into_enum() {
-        let selected = peek_enum
-            .variant_name_active()
-            .unwrap_or("unknown")
-            .to_string();
-        let options: Vec<SharedString> = peek_enum
-            .variants()
-            .iter()
-            .map(|v| SharedString::from(v.name))
-            .collect();
-        let any_entity = any_entity.clone();
-        return Some(Box::new(EnumRow {
-            label: ctx.label.clone(),
-            selected: SharedString::from(selected),
-            options,
-            on_select: Arc::new(move |name, _w, cx| {
-                set_enum_variant(&any_entity, field_idx, &name, cx);
-            }),
-        }));
-    }
-
-    None
-}
-
-/// Build an Option<T> row. Currently only `Option<ComponentId>` is wired —
-/// other inner types render as a single "None"/"Set" status with no picker.
-fn build_option_row(
-    ctx: &FieldBuildCtx,
-    peek_option: facet::PeekOption<'_, '_>,
-    any_entity: AnyEntity,
-    field_idx: usize,
-) -> Box<dyn InspectorRow> {
-    let label = ctx.label.clone();
-    let is_some = peek_option.is_some();
-    let inner_shape = peek_option.def().t;
-    let db = ctx.db.clone();
-
-    let summary = if is_some {
-        SharedString::from("Set")
-    } else {
-        SharedString::from("None")
-    };
-
-    Box::new(NavRow::new(
-        label,
-        summary,
-        Box::new(move |_cx| {
-            let mut rows: Vec<Box<dyn InspectorRow>> = Vec::new();
-
-            if inner_shape.id != <ComponentId as Facet>::SHAPE.id {
-                return rows;
-            }
-
-            if is_some {
-                let any_entity = any_entity.clone();
-                rows.push(Box::new(CommandRow::new(
-                    "Clear",
-                    Arc::new(move |_w, cx| {
-                        set_field::<Option<ComponentId>>(&any_entity, field_idx, None, cx);
-                    }),
-                )));
-            } else {
-                for (id, name) in crate::trace_picker::list_components(&db) {
-                    let any_entity = any_entity.clone();
-                    rows.push(Box::new(CommandRow::new(
-                        SharedString::from(name),
-                        Arc::new(move |_w, cx| {
-                            set_field::<Option<ComponentId>>(&any_entity, field_idx, Some(id), cx);
-                        }),
-                    )));
-                }
-            }
-
-            rows
-        }),
-    ))
-}
-
-fn scalar_as_f64(peek: &Peek<'_, '_>, scalar: ScalarType) -> Option<f64> {
-    match scalar {
-        ScalarType::F32 => peek.get::<f32>().ok().map(|v| *v as f64),
-        ScalarType::F64 => peek.get::<f64>().ok().copied(),
-        ScalarType::I32 => peek.get::<i32>().ok().map(|v| *v as f64),
-        ScalarType::I64 => peek.get::<i64>().ok().map(|v| *v as f64),
-        ScalarType::U32 => peek.get::<u32>().ok().map(|v| *v as f64),
-        ScalarType::U64 => peek.get::<u64>().ok().map(|v| *v as f64),
-        _ => None,
-    }
-}
-
-fn read_scalar(any_entity: &AnyEntity, idx: usize, scalar: ScalarType, cx: &App) -> f64 {
-    match scalar {
-        ScalarType::F32 => get_field::<f32>(any_entity, idx, cx).map(|v| v as f64),
-        ScalarType::F64 => get_field::<f64>(any_entity, idx, cx),
-        ScalarType::I32 => get_field::<i32>(any_entity, idx, cx).map(|v| v as f64),
-        ScalarType::I64 => get_field::<i64>(any_entity, idx, cx).map(|v| v as f64),
-        ScalarType::U32 => get_field::<u32>(any_entity, idx, cx).map(|v| v as f64),
-        ScalarType::U64 => get_field::<u64>(any_entity, idx, cx).map(|v| v as f64),
-        _ => None,
-    }
-    .unwrap_or(0.0)
-}
-
-fn write_scalar(any_entity: &AnyEntity, idx: usize, scalar: ScalarType, v: f64, cx: &mut App) {
-    match scalar {
-        ScalarType::F32 => set_field::<f32>(any_entity, idx, v as f32, cx),
-        ScalarType::F64 => set_field::<f64>(any_entity, idx, v, cx),
-        ScalarType::I32 => set_field::<i32>(any_entity, idx, v as i32, cx),
-        ScalarType::I64 => set_field::<i64>(any_entity, idx, v as i64, cx),
-        ScalarType::U32 => set_field::<u32>(any_entity, idx, v as u32, cx),
-        ScalarType::U64 => set_field::<u64>(any_entity, idx, v as u64, cx),
-        _ => {}
-    }
 }
 
 /// Write an enum variant by name into field `idx` of a struct. Returns `true`
