@@ -27,7 +27,6 @@
 // structs whose fields are only read via `bytemuck::bytes_of`.
 #![allow(dead_code)]
 
-use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -37,7 +36,6 @@ use image::{Frame, ImageBuffer, Rgba};
 use metor_db::time_series::TimeSeriesNodeSlice;
 use metor_db::{Component, ComponentSchema};
 use metor_proto::types::{ComponentId, PrimType, Timestamp};
-use offset_allocator::{Allocation, Allocator};
 use smallvec::SmallVec;
 
 use super::{PlotBounds, PlotStyle};
@@ -64,178 +62,100 @@ pub(crate) struct LineDraw<'a> {
     pub stroke_width: f32,
 }
 
-/// LOD level strides. LOD n stores every `LOD_STRIDES[n]`-th sample.
-const LOD_STRIDES: [usize; 5] = [1, 4, 16, 64, 256];
-
-/// Pick the coarsest LOD whose stride does not exceed `needed_stride`.
-fn select_lod(needed_stride: usize) -> usize {
-    for (i, &s) in LOD_STRIDES.iter().enumerate().rev() {
-        if s <= needed_stride {
-            return i;
-        }
-    }
-    0
+/// Round `needed_stride` to the nearest power of 4 (minimum 1). Quantizing
+/// the decimation factor this way keeps sampled indices stable under small
+/// zoom deltas (no visible "crawl") while letting the upload size scale
+/// unboundedly with data volume — so we never over-upload at extreme zoom-
+/// outs the way a fixed LOD cap did.
+fn quantize_stride(needed_stride: usize) -> usize {
+    let n = needed_stride.max(1);
+    let log2 = n.ilog2();
+    // Candidates: largest power of 4 ≤ n, and the next one up.
+    let floor_p = 1usize << (log2 & !1);
+    // Geometric midpoint between floor_p and floor_p*4 is 2*floor_p.
+    if n >= floor_p * 2 { floor_p * 4 } else { floor_p }
 }
 
-/// Stable identity for a cached chunk: one element column of one node at
-/// a specific level of detail. Uniquely addresses any node across every
-/// plot sharing the global cache.
-#[derive(Clone, Copy, Hash, Eq, PartialEq)]
-struct ChunkKey {
-    component_id: u64,
-    element_index: u32,
-    node_id: usize,
-    lod: u32,
-}
-
-/// A node's worth of converted f32 samples currently resident in the
-/// shared value buffers.
-struct ResidentChunk {
-    allocation: Allocation,
-    capacity: u32,
-    sample_count: u32,
-}
-
-/// Cross-plot offset-allocator cache mapping each visible node to a
-/// region of the shared `x_buf` / `y_buf`. Uploaded chunks stay resident
-/// until they either grow past their allocation or the allocator runs
-/// out of space and evicts them.
+/// Per-frame bump allocator over the shared `x_buf` / `y_buf`. Every
+/// `submit` resets `cursor` to 0 and traces bump-allocate their
+/// windowed uploads as they plan. Cross-frame reuse is intentionally
+/// absent — the decimation math in `plan_trace` keeps each per-trace
+/// upload at ~`pixel_budget` samples regardless of node size, so
+/// per-frame re-upload is cheap and avoids the cross-trace aliasing
+/// that a shared LRU cache is prone to.
 struct ValueCache {
-    allocator: Allocator,
-    resident: HashMap<ChunkKey, ResidentChunk>,
-    /// Reference epoch for the x axis, in nanoseconds. All cached x
-    /// values are stored as `f32` seconds relative to this. Set lazily
-    /// on first upload so the dynamic range stays small enough for `f32`
-    /// to keep useful precision. Shared across plots; dashboards viewing
-    /// a common "now" stay well within f32's range.
+    /// Next free sample slot, in samples (× 4 bytes for byte offset).
+    /// Reset at the start of every `submit`.
+    cursor: u32,
+    /// Reference epoch for the x axis, in nanoseconds. All uploaded x
+    /// values are `f32` seconds relative to this. Set lazily on first
+    /// upload so the dynamic range stays small enough for `f32` to
+    /// keep useful precision. Shared across plots.
     epoch_ns: Option<i64>,
 }
 
 impl ValueCache {
     fn new() -> Self {
         Self {
-            allocator: Allocator::new(VALUE_CAPACITY),
-            resident: HashMap::new(),
+            cursor: 0,
             epoch_ns: None,
         }
     }
 
-    /// Evict entries starting from the finest LOD level until `needed`
-    /// slots are freed. Falls back to evicting everything if finer
-    /// levels don't suffice.
-    fn evict_for(&mut self, needed: u32) {
-        let mut freed = 0u32;
-        for target_lod in 0..LOD_STRIDES.len() as u32 {
-            let keys: Vec<ChunkKey> = self
-                .resident
-                .keys()
-                .filter(|k| k.lod == target_lod)
-                .copied()
-                .collect();
-            for key in keys {
-                if freed >= needed {
-                    return;
-                }
-                if let Some(chunk) = self.resident.remove(&key) {
-                    freed += chunk.capacity;
-                    self.allocator.free(chunk.allocation);
-                }
-            }
-        }
-    }
-
-    /// Ensure the node behind `slice` is resident at the given LOD level.
-    /// Returns `(offset, decimated_sample_count)` into the shared value
-    /// buffers.
+    /// Convert and upload the decimated samples `[lod_start..lod_end)`
+    /// of one visible node into the shared value buffers at the current
+    /// cursor, then bump the cursor. Returns the `(offset, count)` the
+    /// caller should record indices against, or `None` if the per-frame
+    /// working set would overflow `VALUE_CAPACITY`.
     #[allow(clippy::too_many_arguments)]
-    fn ensure_lod(
+    fn upload_window(
         &mut self,
         queue: &wgpu::Queue,
         x_buf: &wgpu::Buffer,
         y_buf: &wgpu::Buffer,
         scratch_x: &mut Vec<f32>,
         scratch_y: &mut Vec<f32>,
-        component_id: ComponentId,
-        element_index: usize,
         slice: &TimeSeriesNodeSlice,
         schema: &ComponentSchema,
-        lod: usize,
+        element_index: usize,
+        lod_stride: usize,
+        lod_start: usize,
+        lod_end: usize,
     ) -> Option<(u32, u32)> {
+        if lod_end <= lod_start {
+            return None;
+        }
         let timestamps = slice.full_timestamps();
-        let full_len = timestamps.len();
-        if full_len == 0 {
+        if timestamps.is_empty() {
             return None;
         }
         if self.epoch_ns.is_none() {
             self.epoch_ns = Some(timestamps[0].0);
         }
         let epoch = self.epoch_ns?;
-        let lod_stride = LOD_STRIDES[lod];
-        let decimated_len = full_len.div_ceil(lod_stride);
 
-        let key = ChunkKey {
-            component_id: component_id.0,
-            element_index: element_index as u32,
-            node_id: slice.node_id(),
-            lod: lod as u32,
-        };
-
-        if let Some(chunk) = self.resident.get(&key) {
-            if chunk.sample_count as usize >= decimated_len {
-                return Some((chunk.allocation.offset, chunk.sample_count));
-            }
-            if (decimated_len as u32) > chunk.capacity {
-                // Node grew past capacity — free and re-upload.
-                let removed = self.resident.remove(&key).unwrap();
-                self.allocator.free(removed.allocation);
-            }
+        let count = (lod_end - lod_start) as u32;
+        if self.cursor.checked_add(count)? > VALUE_CAPACITY {
+            return None;
         }
 
-        if !self.resident.contains_key(&key) {
-            let want = (decimated_len as u32).next_power_of_two().max(16);
-            let allocation = match self.allocator.allocate(want) {
-                Some(a) => a,
-                None => {
-                    self.evict_for(want);
-                    self.allocator.allocate(want)?
-                }
-            };
-            self.resident.insert(
-                key,
-                ResidentChunk {
-                    allocation,
-                    capacity: want,
-                    sample_count: 0,
-                },
-            );
-        }
+        convert_timestamps_strided(timestamps, lod_stride, lod_start, lod_end, epoch, scratch_x);
+        convert_values_strided(
+            schema,
+            slice.full_data(),
+            element_index,
+            lod_stride,
+            lod_start,
+            lod_end,
+            scratch_y,
+        );
+        let byte_offset = self.cursor as u64 * 4;
+        queue.write_buffer(x_buf, byte_offset, bytemuck::cast_slice(scratch_x));
+        queue.write_buffer(y_buf, byte_offset, bytemuck::cast_slice(scratch_y));
 
-        let chunk = self.resident.get_mut(&key)?;
-        let from = chunk.sample_count as usize;
-        if from < decimated_len {
-            convert_timestamps_strided(
-                timestamps,
-                lod_stride,
-                from,
-                decimated_len,
-                epoch,
-                scratch_x,
-            );
-            convert_values_strided(
-                schema,
-                slice.full_data(),
-                element_index,
-                lod_stride,
-                from,
-                decimated_len,
-                scratch_y,
-            );
-            let byte_offset = (chunk.allocation.offset + from as u32) as u64 * 4;
-            queue.write_buffer(x_buf, byte_offset, bytemuck::cast_slice(scratch_x));
-            queue.write_buffer(y_buf, byte_offset, bytemuck::cast_slice(scratch_y));
-            chunk.sample_count = decimated_len as u32;
-        }
-        Some((chunk.allocation.offset, chunk.sample_count))
+        let offset = self.cursor;
+        self.cursor += count;
+        Some((offset, count))
     }
 }
 
@@ -613,6 +533,7 @@ impl PlotGpu {
         traces: &[LineDraw<'_>],
     ) -> bool {
         self.idx_scratch.clear();
+        self.cache.cursor = 0;
         let pixel_budget = target.width as usize;
 
         let mut plans: Vec<TracePlan> = Vec::with_capacity(traces.len());
@@ -930,23 +851,7 @@ fn plan_trace(
             continue;
         };
 
-        let lod = select_lod(stride);
-        let lod_stride = LOD_STRIDES[lod];
-
-        let Some((chunk_offset, decimated_count)) = cache.ensure_lod(
-            &ctx.queue,
-            x_buf,
-            y_buf,
-            upload_x,
-            upload_y,
-            trace.component_id,
-            trace.element_index,
-            node,
-            &trace.component.schema,
-            lod,
-        ) else {
-            continue;
-        };
+        let upload_stride = quantize_stride(stride);
 
         let full = node.full_timestamps();
         let slice_start_idx =
@@ -957,20 +862,32 @@ fn plan_trace(
         let ext_start_idx = slice_start_idx.saturating_sub(1);
         let ext_end_idx = (slice_start_idx + visible_len + 1).min(full.len());
 
-        let lod_start = ext_start_idx / lod_stride;
-        let lod_end = ext_end_idx
-            .div_ceil(lod_stride)
-            .min(decimated_count as usize);
-        let residual_stride = (stride / lod_stride).max(1);
+        let full_decimated = full.len().div_ceil(upload_stride);
+        let lod_start = ext_start_idx / upload_stride;
+        let lod_end = ext_end_idx.div_ceil(upload_stride).min(full_decimated);
+
+        let Some((chunk_offset, count)) = cache.upload_window(
+            &ctx.queue,
+            x_buf,
+            y_buf,
+            upload_x,
+            upload_y,
+            node,
+            &trace.component.schema,
+            trace.element_index,
+            upload_stride,
+            lod_start,
+            lod_end,
+        ) else {
+            continue;
+        };
 
         let is_line = matches!(trace.style, PlotStyle::Line);
         let span_first = idx_scratch.len() as u32;
         let mut count_pushed: u32 = 0;
-        let mut i = lod_start;
-        while i < lod_end {
-            idx_scratch.push(chunk_offset + i as u32);
+        for j in 0..count {
+            idx_scratch.push(chunk_offset + j);
             count_pushed += 1;
-            i += residual_stride;
         }
         let min_for_draw = if is_line { 2u32 } else { 1 };
         if count_pushed >= min_for_draw {

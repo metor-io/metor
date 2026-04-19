@@ -27,7 +27,6 @@ wgpu = "29"
 bytemuck = { version = "1", features = ["derive"] }
 pollster = "0.4"
 image = "0.25"
-offset-allocator = "0.2"
 glam = "0.32"
 crossbeam-channel = "0.5"
 thingbuf = "0.1"

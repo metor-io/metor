@@ -49,13 +49,6 @@ struct InspectorPage {
 }
 
 /// Unified inspector panel with page-stack navigation.
-///
-/// Replaces both `PropertyInspector` and `CommandPalette`. Supports:
-/// - Fuzzy search
-/// - Keyboard navigation (up/down/enter/escape)
-/// - Page stack with breadcrumb pills (cascade pushes a page)
-/// - Inline text editing
-/// - Anchored (right-click) or centered (Cmd-P) positioning
 pub struct Inspector {
     pages: Vec<InspectorPage>,
     mode: InspectorMode,
@@ -514,7 +507,8 @@ impl Render for Inspector {
                     .top_0()
                     .left_0()
                     .size_full()
-                    .child(anchored_panel);
+                    .child(anchored_panel)
+                    .shadow_sm();
 
                 deferred(overlay).with_priority(1).into_any_element()
             }
@@ -530,7 +524,8 @@ impl Render for Inspector {
                     .flex_col()
                     .items_center()
                     .pt(px(80.0))
-                    .child(panel_with_dismiss);
+                    .child(panel_with_dismiss)
+                    .shadow_sm();
 
                 deferred(centered).with_priority(1).into_any_element()
             }
