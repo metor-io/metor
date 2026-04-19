@@ -2,7 +2,7 @@
 
 use std::sync::Arc;
 
-use gpui::{App, AppContext, Entity, Hsla, SharedString};
+use gpui::{Entity, Hsla, SharedString};
 use metor_db::DB;
 use metor_proto::types::ComponentId;
 

@@ -69,3 +69,6 @@ bevy = { git = "https://github.com/bevyengine/bevy", rev = "5330b01ed6dfe8ee9ea9
 [target.'cfg(target_os = "macos")'.dependencies]
 cocoa = "0.26"
 objc = "0.2"
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(feature, values("cargo-clippy"))'] }

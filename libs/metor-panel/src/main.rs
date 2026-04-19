@@ -1,11 +1,6 @@
 use std::net::SocketAddr;
 use std::sync::Arc;
 
-use gpui::{
-    App, Application, Bounds, Context, Entity, FocusHandle, Focusable, IntoElement, KeyBinding,
-    Pixels, Point, Render, SharedString, TitlebarOptions, Window, WindowBounds, WindowOptions,
-    actions, div, point, prelude::*, px, size,
-};
 use metor_db::{DB, Server};
 use stellarator::{net::TcpListener, struc_con::stellar};
 

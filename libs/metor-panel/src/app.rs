@@ -1,6 +1,5 @@
 #![allow(unexpected_cfgs)]
 
-use std::net::SocketAddr;
 use std::sync::Arc;
 
 use crate::inspector::Inspector;
@@ -373,7 +372,7 @@ pub fn run(db: Arc<metor_db::DB>) {
 }
 
 #[cfg(target_os = "macos")]
-#[allow(deprecated)]
+#[allow(deprecated, unexpected_cfgs)]
 fn set_dock_icon() {
     use cocoa::appkit::NSImage;
     use cocoa::base::{id, nil};
