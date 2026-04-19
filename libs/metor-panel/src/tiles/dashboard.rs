@@ -1,29 +1,38 @@
+//! Free-form canvas dashboard where widgets are positioned at pixel coordinates.
+//!
+//! Split across submodules:
+//! - [`widgets`] — per-kind factories plus image/placeholder leaf renderers
+//! - [`interaction`] — drag/resize payloads, edit-mode zones, `render_widget`
+//! - [`chrome`] — grid overlay drawn atop widgets in edit mode
 use std::collections::HashMap;
 use std::sync::Arc;
 
 use gpui::{
-    AnyElement, AnyView, App, Bounds, Context, Corners, DragMoveEvent, Empty, Entity, IntoElement,
-    Pixels, Point, Render, RenderImage, SharedString, Window, canvas, div, fill, point, prelude::*,
-    px, size,
+    AnyView, App, Bounds, Context, Entity, IntoElement, Pixels, Point, Render, SharedString,
+    Window, div, point, prelude::*, px,
 };
-use image::{Frame, ImageBuffer, Rgba};
 use metor_db::DB;
 use serde::{Deserialize, Serialize};
-use smallvec::SmallVec;
 
-use crate::elements::viewer_3d::Viewer3d;
-use crate::elements::{ComponentText, Monitor, Scrollbar, TimeSeriesPlot, new_component_table};
+use crate::elements::{Scrollbar, TimeSeriesPlot};
 use crate::theme::theme;
 use crate::widgets::{CommandRow, DefaultActionRow, InspectorRow, NavRow};
 
 use super::item::PaneItem;
 
+mod chrome;
+mod interaction;
+mod widgets;
+
+pub use widgets::{WidgetRegistry, WidgetSpec};
+use widgets::create_widget_view;
+
+/// Snap step for widget placement on the canvas.
 const SNAP_GRID_PX: f32 = 10.0;
-const MIN_WIDGET_PX: f32 = 40.0;
-/// Width of the edge resize zones (like macOS window borders).
-const EDGE_ZONE_PX: f32 = 6.0;
-/// Size of corner resize zones.
-const CORNER_ZONE_PX: f32 = 10.0;
+
+fn snap_px(v: f32) -> f32 {
+    (v / SNAP_GRID_PX).round() * SNAP_GRID_PX
+}
 
 /// Unique identifier for a widget within a dashboard.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -38,46 +47,42 @@ pub struct WidgetRect {
     pub h: f32,
 }
 
-fn snap_px(v: f32) -> f32 {
-    (v / SNAP_GRID_PX).round() * SNAP_GRID_PX
-}
-
 /// The type of content a widget displays.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum WidgetKind {
-    Plot,
-    Text,
-    Table,
-    Image,
-    Monitor,
-    Viewer3d,
-}
+///
+/// Wire format is a string (`"plot"`, `"text"`, `"viewer3d"`, …) — newtype
+/// over [`SharedString`] so consumers can register custom kinds beyond the
+/// built-ins. Built-ins are spelled `WidgetKind::plot()`, `::text()`, etc.;
+/// downstream code uses `WidgetKind::new("my_kind")`.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct WidgetKind(pub SharedString);
 
 impl WidgetKind {
-    fn default_size(self) -> (f32, f32) {
-        match self {
-            WidgetKind::Plot => (400.0, 250.0),
-            WidgetKind::Text => (160.0, 60.0),
-            WidgetKind::Table => (400.0, 300.0),
-            WidgetKind::Image => (300.0, 200.0),
-            WidgetKind::Monitor => (150.0, 80.0),
-            WidgetKind::Viewer3d => (480.0, 320.0),
-        }
+    pub fn new(name: impl Into<SharedString>) -> Self {
+        Self(name.into())
     }
-}
+    pub fn plot() -> Self {
+        Self(SharedString::new_static("plot"))
+    }
+    pub fn text() -> Self {
+        Self(SharedString::new_static("text"))
+    }
+    pub fn table() -> Self {
+        Self(SharedString::new_static("table"))
+    }
+    pub fn image() -> Self {
+        Self(SharedString::new_static("image"))
+    }
+    pub fn monitor() -> Self {
+        Self(SharedString::new_static("monitor"))
+    }
+    pub fn viewer3d() -> Self {
+        Self(SharedString::new_static("viewer3d"))
+    }
 
-/// Which edge or corner a resize drag started from.
-#[derive(Debug, Clone, Copy)]
-enum ResizeEdge {
-    TopLeft,
-    Top,
-    TopRight,
-    Left,
-    Right,
-    BottomLeft,
-    Bottom,
-    BottomRight,
+    fn default_size(&self, cx: &App) -> (f32, f32) {
+        widgets::widget_spec(self, cx).default_size
+    }
 }
 
 /// A positioned widget on the dashboard canvas.
@@ -87,34 +92,6 @@ pub struct DashboardWidget {
     pub rect: WidgetRect,
     pub kind: WidgetKind,
     pub config: serde_json::Value,
-}
-
-/// Drag payload when moving a widget.
-struct DraggedWidget {
-    widget_id: WidgetId,
-    dashboard: Entity<DashboardPanel>,
-    /// Fractional offset from the widget's origin to the grab point.
-    grab_offset: Point<f32>,
-}
-
-impl Render for DraggedWidget {
-    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
-        Empty
-    }
-}
-
-/// Drag payload when resizing a widget.
-struct ResizingWidget {
-    widget_id: WidgetId,
-    dashboard: Entity<DashboardPanel>,
-    edge: ResizeEdge,
-    original_rect: WidgetRect,
-}
-
-impl Render for ResizingWidget {
-    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
-        Empty
-    }
 }
 
 /// Free-form canvas dashboard where widgets are positioned at pixel coordinates.
@@ -159,12 +136,15 @@ impl DashboardPanel {
     /// Iterate all widgets along with their inspectable entity handle and a
     /// display label. Used by the items registry to surface widgets in the
     /// everything-palette.
-    pub fn inspectable_widgets(&self) -> Vec<(WidgetId, gpui::AnyEntity, SharedString)> {
+    pub fn inspectable_widgets(
+        &self,
+        cx: &App,
+    ) -> Vec<(WidgetId, gpui::AnyEntity, SharedString)> {
         self.widgets
             .iter()
             .filter_map(|w| {
                 let entity = self.widget_entities.get(&w.id)?.clone();
-                Some((w.id, entity, widget_display_label(w)))
+                Some((w.id, entity, widget_display_label(w, cx)))
             })
             .collect()
     }
@@ -203,7 +183,7 @@ impl DashboardPanel {
         cx: &mut Context<Self>,
     ) -> WidgetId {
         let id = self.alloc_id();
-        let (w, h) = kind.default_size();
+        let (w, h) = kind.default_size(cx);
         let rect = self.auto_place(w, h);
         self.widgets.push(DashboardWidget {
             id,
@@ -224,15 +204,15 @@ impl DashboardPanel {
         cx: &mut Context<Self>,
     ) -> WidgetId {
         let id = self.alloc_id();
-        let (w, h) = kind.default_size();
+        let (w, h) = kind.default_size(cx);
         let rect = self.auto_place(w, h);
+        let (view, widget_entity) = create_widget_view(&kind, &config, &self.db, cx);
         let widget = DashboardWidget {
             id,
             rect,
             kind,
-            config: config.clone(),
+            config,
         };
-        let (view, widget_entity) = create_widget_view(kind, &config, &self.db, cx);
         self.widgets.push(widget);
         self.widget_views.insert(id, view);
         self.widget_entities.insert(id, widget_entity);
@@ -287,7 +267,7 @@ impl DashboardPanel {
         for widget in &self.widgets {
             if !self.widget_views.contains_key(&widget.id) {
                 let (view, widget_entity) =
-                    create_widget_view(widget.kind, &widget.config, &self.db, cx);
+                    create_widget_view(&widget.kind, &widget.config, &self.db, cx);
                 self.widget_views.insert(widget.id, view);
                 self.widget_entities.insert(widget.id, widget_entity);
             }
@@ -334,395 +314,6 @@ impl DashboardPanel {
         let y = f32::from(pixel.y - bounds.origin.y) - self.scroll_offset.y;
         Some(point(x, y))
     }
-
-    fn handle_widget_drag_move(
-        &mut self,
-        event: &DragMoveEvent<DraggedWidget>,
-        _window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        let drag = event.drag(cx);
-        let widget_id = drag.widget_id;
-        let grab_offset = drag.grab_offset;
-
-        let Some(pos) = self.pixel_to_canvas(event.event.position) else {
-            return;
-        };
-
-        if let Some(w) = self.widgets.iter_mut().find(|w| w.id == widget_id) {
-            w.rect.x = snap_px(pos.x - grab_offset.x).max(0.0);
-            w.rect.y = snap_px(pos.y - grab_offset.y).max(0.0);
-            cx.notify();
-        }
-    }
-
-    fn handle_widget_resize_move(
-        &mut self,
-        event: &DragMoveEvent<ResizingWidget>,
-        _window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        let drag = event.drag(cx);
-        let widget_id = drag.widget_id;
-        let edge = drag.edge;
-        let orig = drag.original_rect;
-
-        let Some(pos) = self.pixel_to_canvas(event.event.position) else {
-            return;
-        };
-
-        if let Some(w) = self.widgets.iter_mut().find(|w| w.id == widget_id) {
-            let snapped = point(snap_px(pos.x), snap_px(pos.y));
-            let right = orig.x + orig.w;
-            let bottom = orig.y + orig.h;
-
-            match edge {
-                ResizeEdge::Right => {
-                    w.rect.w = (snapped.x - orig.x).max(MIN_WIDGET_PX);
-                }
-                ResizeEdge::Bottom => {
-                    w.rect.h = (snapped.y - orig.y).max(MIN_WIDGET_PX);
-                }
-                ResizeEdge::Left => {
-                    let new_x = snapped.x.min(right - MIN_WIDGET_PX).max(0.0);
-                    w.rect.x = new_x;
-                    w.rect.w = right - w.rect.x;
-                }
-                ResizeEdge::Top => {
-                    let new_y = snapped.y.min(bottom - MIN_WIDGET_PX).max(0.0);
-                    w.rect.y = new_y;
-                    w.rect.h = bottom - w.rect.y;
-                }
-                ResizeEdge::BottomRight => {
-                    w.rect.w = (snapped.x - orig.x).max(MIN_WIDGET_PX);
-                    w.rect.h = (snapped.y - orig.y).max(MIN_WIDGET_PX);
-                }
-                ResizeEdge::BottomLeft => {
-                    let new_x = snapped.x.min(right - MIN_WIDGET_PX).max(0.0);
-                    w.rect.x = new_x;
-                    w.rect.w = right - w.rect.x;
-                    w.rect.h = (snapped.y - orig.y).max(MIN_WIDGET_PX);
-                }
-                ResizeEdge::TopRight => {
-                    w.rect.w = (snapped.x - orig.x).max(MIN_WIDGET_PX);
-                    let new_y = snapped.y.min(bottom - MIN_WIDGET_PX).max(0.0);
-                    w.rect.y = new_y;
-                    w.rect.h = bottom - w.rect.y;
-                }
-                ResizeEdge::TopLeft => {
-                    let new_x = snapped.x.min(right - MIN_WIDGET_PX).max(0.0);
-                    let new_y = snapped.y.min(bottom - MIN_WIDGET_PX).max(0.0);
-                    w.rect.x = new_x;
-                    w.rect.y = new_y;
-                    w.rect.w = right - w.rect.x;
-                    w.rect.h = bottom - w.rect.y;
-                }
-            }
-            cx.notify();
-        }
-    }
-
-    fn render_widget(&self, widget: &DashboardWidget, cx: &mut Context<Self>) -> AnyElement {
-        let theme = theme(cx);
-        let view = self.widget_views.get(&widget.id);
-        let r = &widget.rect;
-
-        let mut container = div()
-            .id(("dashboard-widget", widget.id.0 as usize))
-            .absolute()
-            .top(px(r.y + self.scroll_offset.y))
-            .left(px(r.x + self.scroll_offset.x))
-            .w(px(r.w))
-            .h(px(r.h))
-            .overflow_hidden()
-            .border_1()
-            .border_color(theme.border_primary)
-            .rounded(px(4.0))
-            .bg(theme.bg_primary);
-
-        if let Some(view) = view {
-            container = container.child(view.clone());
-        }
-
-        if self.editing {
-            let widget_id = widget.id;
-            let widget_rect = widget.rect;
-            // Full-size interaction blocker — absorbs all clicks so the
-            // inner widget content cannot be interacted with in edit mode.
-            // Right-click opens the widget's inspector.
-            // The move-zone drag and edge-zone resizes are layered above.
-            let blocker_entity = cx.entity();
-            let blocker_widget_id = widget.id;
-            container = container.child(
-                div()
-                    .id(("widget-blocker", widget.id.0 as usize))
-                    .absolute()
-                    .top_0()
-                    .left_0()
-                    .size_full()
-                    .on_mouse_down(gpui::MouseButton::Left, |_, _, _| {})
-                    .on_mouse_down(
-                        gpui::MouseButton::Right,
-                        move |event: &gpui::MouseDownEvent, window, cx| {
-                            let pos = event.position;
-                            blocker_entity.update(cx, |this, cx| {
-                                this.open_widget_inspector(blocker_widget_id, pos, window, cx);
-                            });
-                        },
-                    ),
-            );
-
-            let entity = cx.entity();
-            // Center move zone — inset from edges so resize zones sit on top.
-            container = container.child(
-                div()
-                    .id(("widget-move-zone", widget.id.0 as usize))
-                    .absolute()
-                    .top(px(EDGE_ZONE_PX))
-                    .left(px(EDGE_ZONE_PX))
-                    .right(px(EDGE_ZONE_PX))
-                    .bottom(px(EDGE_ZONE_PX))
-                    .cursor(gpui::CursorStyle::PointingHand)
-                    .on_drag(
-                        DraggedWidget {
-                            widget_id,
-                            dashboard: entity.clone(),
-                            grab_offset: point(0.0, 0.0),
-                        },
-                        {
-                            let entity = entity.clone();
-                            move |drag, _, window, cx| {
-                                let grab_offset = entity
-                                    .read(cx)
-                                    .pixel_to_canvas(window.mouse_position())
-                                    .map(|pos| point(pos.x - widget_rect.x, pos.y - widget_rect.y))
-                                    .unwrap_or(point(0.0, 0.0));
-
-                                cx.new(|_| DraggedWidget {
-                                    widget_id: drag.widget_id,
-                                    dashboard: drag.dashboard.clone(),
-                                    grab_offset: grab_offset,
-                                })
-                            }
-                        },
-                    ),
-            );
-
-            // Edge resize zones — always present, like macOS window borders.
-            container = self.render_edge_zones(container, widget, cx);
-        }
-
-        container.into_any_element()
-    }
-
-    /// Render invisible edge/corner zones around the widget border that
-    /// initiate resize on drag, like macOS window edges.
-    fn render_edge_zones(
-        &self,
-        mut container: gpui::Stateful<gpui::Div>,
-        widget: &DashboardWidget,
-        cx: &mut Context<Self>,
-    ) -> gpui::Stateful<gpui::Div> {
-        let e = EDGE_ZONE_PX;
-        let c = CORNER_ZONE_PX;
-
-        // (edge, top, left, right, bottom, width, height, cursor)
-        // Edges: thin strips along each side, inset from corners.
-        // Corners: small squares at each corner.
-        struct Zone {
-            edge: ResizeEdge,
-            top: Option<f32>,
-            left: Option<f32>,
-            right: Option<f32>,
-            bottom: Option<f32>,
-            width: ZoneDim,
-            height: ZoneDim,
-            cursor: gpui::CursorStyle,
-        }
-
-        enum ZoneDim {
-            Px(f32),
-            Fill, // stretch between the two corner zones
-        }
-
-        let zones = [
-            // Corners
-            Zone {
-                edge: ResizeEdge::TopLeft,
-                top: Some(0.0),
-                left: Some(0.0),
-                right: None,
-                bottom: None,
-                width: ZoneDim::Px(c),
-                height: ZoneDim::Px(c),
-                cursor: gpui::CursorStyle::ResizeUpLeftDownRight,
-            },
-            Zone {
-                edge: ResizeEdge::TopRight,
-                top: Some(0.0),
-                left: None,
-                right: Some(0.0),
-                bottom: None,
-                width: ZoneDim::Px(c),
-                height: ZoneDim::Px(c),
-                cursor: gpui::CursorStyle::ResizeUpRightDownLeft,
-            },
-            Zone {
-                edge: ResizeEdge::BottomLeft,
-                top: None,
-                left: Some(0.0),
-                right: None,
-                bottom: Some(0.0),
-                width: ZoneDim::Px(c),
-                height: ZoneDim::Px(c),
-                cursor: gpui::CursorStyle::ResizeUpRightDownLeft,
-            },
-            Zone {
-                edge: ResizeEdge::BottomRight,
-                top: None,
-                left: None,
-                right: Some(0.0),
-                bottom: Some(0.0),
-                width: ZoneDim::Px(c),
-                height: ZoneDim::Px(c),
-                cursor: gpui::CursorStyle::ResizeUpLeftDownRight,
-            },
-            // Edges (between corners)
-            Zone {
-                edge: ResizeEdge::Top,
-                top: Some(0.0),
-                left: Some(c),
-                right: Some(c),
-                bottom: None,
-                width: ZoneDim::Fill,
-                height: ZoneDim::Px(e),
-                cursor: gpui::CursorStyle::ResizeRow,
-            },
-            Zone {
-                edge: ResizeEdge::Bottom,
-                top: None,
-                left: Some(c),
-                right: Some(c),
-                bottom: Some(0.0),
-                width: ZoneDim::Fill,
-                height: ZoneDim::Px(e),
-                cursor: gpui::CursorStyle::ResizeRow,
-            },
-            Zone {
-                edge: ResizeEdge::Left,
-                top: Some(c),
-                left: Some(0.0),
-                right: None,
-                bottom: Some(c),
-                width: ZoneDim::Px(e),
-                height: ZoneDim::Fill,
-                cursor: gpui::CursorStyle::ResizeColumn,
-            },
-            Zone {
-                edge: ResizeEdge::Right,
-                top: Some(c),
-                left: None,
-                right: Some(0.0),
-                bottom: Some(c),
-                width: ZoneDim::Px(e),
-                height: ZoneDim::Fill,
-                cursor: gpui::CursorStyle::ResizeColumn,
-            },
-        ];
-
-        for (ix, zone) in zones.iter().enumerate() {
-            let widget_id = widget.id;
-            let original_rect = widget.rect;
-            let dashboard = cx.entity();
-            let edge = zone.edge;
-
-            let mut handle = div()
-                .id(("edge-zone", widget.id.0 as usize * 10 + ix))
-                .absolute()
-                .cursor(zone.cursor);
-
-            if let Some(v) = zone.top {
-                handle = handle.top(px(v));
-            }
-            if let Some(v) = zone.left {
-                handle = handle.left(px(v));
-            }
-            if let Some(v) = zone.right {
-                handle = handle.right(px(v));
-            }
-            if let Some(v) = zone.bottom {
-                handle = handle.bottom(px(v));
-            }
-
-            handle = match zone.width {
-                ZoneDim::Px(v) => handle.w(px(v)),
-                ZoneDim::Fill => handle, // width determined by left+right anchors
-            };
-            handle = match zone.height {
-                ZoneDim::Px(v) => handle.h(px(v)),
-                ZoneDim::Fill => handle, // height determined by top+bottom anchors
-            };
-
-            handle = handle.on_drag(
-                ResizingWidget {
-                    widget_id,
-                    dashboard: dashboard.clone(),
-                    edge,
-                    original_rect,
-                },
-                move |drag, _, _, cx| {
-                    cx.new(|_| ResizingWidget {
-                        widget_id: drag.widget_id,
-                        dashboard: drag.dashboard.clone(),
-                        edge: drag.edge,
-                        original_rect: drag.original_rect,
-                    })
-                },
-            );
-
-            container = container.child(handle);
-        }
-
-        container
-    }
-
-    fn render_grid_overlay(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let theme = theme(cx);
-        let grid_color = theme.border_primary.opacity(0.3);
-        let bounds = self.container_bounds;
-        let offset = self.scroll_offset;
-
-        let grid_step = SNAP_GRID_PX;
-        canvas(
-            move |_, _, _| {},
-            move |_, _, window, _| {
-                let Some(bounds) = bounds else { return };
-                let w = f32::from(bounds.size.width);
-                let h = f32::from(bounds.size.height);
-
-                // Offset grid lines by scroll so they pan with content
-                let start_x = offset.x.rem_euclid(grid_step);
-                let mut x_off = start_x;
-                while x_off < w {
-                    let origin = point(bounds.origin.x + px(x_off), bounds.origin.y);
-                    let sz = size(px(1.0), bounds.size.height);
-                    window.paint_quad(fill(Bounds { origin, size: sz }, grid_color));
-                    x_off += grid_step;
-                }
-
-                let start_y = offset.y.rem_euclid(grid_step);
-                let mut y_off = start_y;
-                while y_off < h {
-                    let origin = point(bounds.origin.x, bounds.origin.y + px(y_off));
-                    let sz = size(bounds.size.width, px(1.0));
-                    window.paint_quad(fill(Bounds { origin, size: sz }, grid_color));
-                    y_off += grid_step;
-                }
-            },
-        )
-        .size_full()
-        .absolute()
-    }
 }
 
 /// Build the inspector rows for dashboard operations (Add/Remove widget,
@@ -767,7 +358,7 @@ pub fn dashboard_rows(
     if !widgets.is_empty() {
         let widget_infos: Vec<(WidgetId, SharedString)> = widgets
             .iter()
-            .map(|w| (w.id, widget_display_label(w)))
+            .map(|w| (w.id, widget_display_label(w, cx)))
             .collect();
         rows.push(Box::new(NavRow::new("Remove Widget", SharedString::new_static(""), {
             let dashboard = dashboard.clone();
@@ -857,7 +448,7 @@ fn add_widget_rows(
                         let line_plot = plot.read(cx).line_plot().clone();
                         dashboard.update(cx, |this, cx| {
                             this.add_widget_with_entity(
-                                WidgetKind::Plot,
+                                WidgetKind::plot(),
                                 AnyView::from(plot),
                                 line_plot.into_any(),
                                 cx,
@@ -872,14 +463,14 @@ fn add_widget_rows(
         let dashboard = dashboard.clone();
         let db = db.clone();
         Box::new(move |_cx| {
-            component_picker_rows(dashboard.clone(), db.clone(), WidgetKind::Text)
+            component_picker_rows(dashboard.clone(), db.clone(), WidgetKind::text())
         })
     })));
     rows.push(Box::new(CommandRow::new("Component Table", {
         let dashboard = dashboard.clone();
         Arc::new(move |_window, cx| {
             dashboard.update(cx, |this, cx| {
-                this.add_widget(WidgetKind::Table, serde_json::json!({}), cx);
+                this.add_widget(WidgetKind::table(), serde_json::json!({}), cx);
             });
         })
     })));
@@ -887,7 +478,7 @@ fn add_widget_rows(
         let dashboard = dashboard.clone();
         let db = db.clone();
         Box::new(move |_cx| {
-            component_picker_rows(dashboard.clone(), db.clone(), WidgetKind::Monitor)
+            component_picker_rows(dashboard.clone(), db.clone(), WidgetKind::monitor())
         })
     })));
     rows.push(Box::new(NavRow::new("Image", SharedString::new_static(""), {
@@ -898,7 +489,7 @@ fn add_widget_rows(
         let dashboard = dashboard.clone();
         Arc::new(move |_window, cx| {
             dashboard.update(cx, |this, cx| {
-                this.add_widget(WidgetKind::Viewer3d, serde_json::json!({}), cx);
+                this.add_widget(WidgetKind::viewer3d(), serde_json::json!({}), cx);
             });
         })
     })));
@@ -916,10 +507,12 @@ fn component_picker_rows(
         .map(|(_id, name)| {
             let dashboard = dashboard.clone();
             let name_clone = name.clone();
+            let kind = kind.clone();
             Box::new(CommandRow::new(
                 SharedString::from(name),
                 Arc::new(move |_window, cx| {
                     let config = serde_json::json!({ "component": name_clone });
+                    let kind = kind.clone();
                     dashboard.update(cx, |this, cx| {
                         this.add_widget(kind, config, cx);
                     });
@@ -936,193 +529,15 @@ fn image_path_rows(dashboard: Entity<DashboardPanel>) -> Vec<Box<dyn InspectorRo
             if !input.is_empty() {
                 let config = serde_json::json!({ "path": input });
                 dashboard.update(cx, |this, cx| {
-                    this.add_widget(WidgetKind::Image, config, cx);
+                    this.add_widget(WidgetKind::image(), config, cx);
                 });
             }
         }),
     })]
 }
 
-fn widget_display_label(widget: &DashboardWidget) -> SharedString {
-    let component_label = || {
-        widget
-            .config
-            .get("component")
-            .and_then(|v| v.as_str())
-            .unwrap_or("?")
-    };
-    match widget.kind {
-        WidgetKind::Plot => SharedString::from(format!("Plot #{}", widget.id.0)),
-        WidgetKind::Text => SharedString::from(format!("Text: {}", component_label())),
-        WidgetKind::Table => SharedString::from(format!("Table #{}", widget.id.0)),
-        WidgetKind::Image => SharedString::from(format!(
-            "Image: {}",
-            widget
-                .config
-                .get("path")
-                .and_then(|v| v.as_str())
-                .unwrap_or("?")
-        )),
-        WidgetKind::Monitor => SharedString::from(format!("Monitor: {}", component_label())),
-        WidgetKind::Viewer3d => SharedString::from(format!("3D Viewer #{}", widget.id.0)),
-    }
-}
-
-fn create_widget_view(
-    kind: WidgetKind,
-    config: &serde_json::Value,
-    db: &Arc<DB>,
-    cx: &mut App,
-) -> (AnyView, gpui::AnyEntity) {
-    macro_rules! widget {
-        ($entity:expr) => {{
-            let e = $entity;
-            let any = e.clone().into_any();
-            (AnyView::from(e), any)
-        }};
-    }
-    match kind {
-        WidgetKind::Plot => {
-            // The TimeSeriesPlot is the rendered view, but only its inner
-            // LinePlot has registered Facet adapters — expose that as the
-            // inspectable entity so the everything-palette can edit traces.
-            let plot = cx.new(|cx| TimeSeriesPlot::new(db.clone(), vec![], cx));
-            let line_plot = plot.read(cx).line_plot().clone();
-            (AnyView::from(plot), line_plot.into_any())
-        }
-        WidgetKind::Text => {
-            let component_name = config
-                .get("component")
-                .and_then(|v| v.as_str())
-                .unwrap_or("");
-            let component_id = db.with_state(|state| {
-                state
-                    .component_metadata_iter()
-                    .find(|(_, meta)| meta.name == component_name)
-                    .map(|(id, _)| *id)
-            });
-            if let Some(id) = component_id {
-                widget!(cx.new(|cx| ComponentText::new(db.clone(), id, cx)))
-            } else {
-                widget!(cx.new(|_cx| PlaceholderWidget {
-                    label: SharedString::from(format!("? {}", component_name)),
-                }))
-            }
-        }
-        WidgetKind::Table => {
-            widget!(cx.new(|cx| new_component_table(db.clone(), cx)))
-        }
-        WidgetKind::Image => {
-            let path = config
-                .get("path")
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_string();
-            widget!(cx.new(|_cx| ImageWidget::load(path)))
-        }
-        WidgetKind::Monitor => {
-            let component_name = config
-                .get("component")
-                .and_then(|v| v.as_str())
-                .unwrap_or("");
-            let component_id = db.with_state(|state| {
-                state
-                    .component_metadata_iter()
-                    .find(|(_, meta)| meta.name == component_name)
-                    .map(|(id, _)| *id)
-            });
-            if let Some(id) = component_id {
-                widget!(cx.new(|cx| Monitor::new(db.clone(), id, cx)))
-            } else {
-                widget!(cx.new(|_cx| PlaceholderWidget {
-                    label: SharedString::from(format!("? {}", component_name)),
-                }))
-            }
-        }
-        WidgetKind::Viewer3d => {
-            widget!(cx.new(|cx| Viewer3d::with_db(db.clone(), cx)))
-        }
-    }
-}
-
-/// Renders an image loaded from a file path, scaled to fill its widget bounds.
-struct ImageWidget {
-    render_image: Option<Arc<RenderImage>>,
-    label: SharedString,
-}
-
-impl ImageWidget {
-    fn load(path: String) -> Self {
-        let render_image = std::fs::read(&path)
-            .ok()
-            .and_then(|bytes| image::load_from_memory(&bytes).ok())
-            .map(|img| {
-                let rgba = img.to_rgba8();
-                let (w, h) = rgba.dimensions();
-                let buffer = ImageBuffer::<Rgba<u8>, Vec<u8>>::from_raw(w, h, rgba.into_raw())
-                    .expect("buffer size mismatch");
-                let frames = SmallVec::from_elem(Frame::new(buffer), 1);
-                Arc::new(RenderImage::new(frames))
-            });
-
-        let label = if render_image.is_some() {
-            SharedString::from(path)
-        } else {
-            SharedString::from(format!("Failed to load: {}", path))
-        };
-
-        Self {
-            render_image,
-            label,
-        }
-    }
-}
-
-impl Render for ImageWidget {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        if let Some(img) = &self.render_image {
-            let img = img.clone();
-            div().size_full().child(
-                canvas(
-                    move |_, _, _| {},
-                    move |bounds, _, window, _| {
-                        let _ =
-                            window.paint_image(bounds, Corners::default(), img.clone(), 0, false);
-                    },
-                )
-                .size_full(),
-            )
-        } else {
-            let theme = theme(cx);
-            div()
-                .size_full()
-                .flex()
-                .items_center()
-                .justify_center()
-                .text_color(theme.text_tertiary)
-                .text_size(px(14.0))
-                .child(self.label.clone())
-        }
-    }
-}
-
-/// Placeholder shown when a referenced component isn't available.
-struct PlaceholderWidget {
-    label: SharedString,
-}
-
-impl Render for PlaceholderWidget {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let theme = theme(cx);
-        div()
-            .size_full()
-            .flex()
-            .items_center()
-            .justify_center()
-            .text_color(theme.text_tertiary)
-            .text_size(px(14.0))
-            .child(self.label.clone())
-    }
+fn widget_display_label(widget: &DashboardWidget, cx: &App) -> SharedString {
+    (widgets::widget_spec(&widget.kind, cx).label)(widget)
 }
 
 impl Render for DashboardPanel {
@@ -1150,7 +565,6 @@ impl Render for DashboardPanel {
             .bg(theme.bg_secondary)
             .child(bounds_tracker);
 
-        // Grid overlay in edit mode
         if self.editing {
             canvas_div = canvas_div.child(self.render_grid_overlay(cx));
         }
@@ -1161,7 +575,6 @@ impl Render for DashboardPanel {
             canvas_div = canvas_div.child(self.render_widget(widget, cx));
         }
 
-        // Drag-move handler on the canvas
         canvas_div = canvas_div
             .on_drag_move(cx.listener(Self::handle_widget_drag_move))
             .on_drag_move(cx.listener(Self::handle_widget_resize_move));
@@ -1180,8 +593,6 @@ impl Render for DashboardPanel {
         ));
 
         // Click on empty canvas space deselects.
-        // Uses on_click (requires .id()) which only fires when this element
-        // is the actual click target, not when a child widget is clicked.
         if self.editing {
             let entity = cx.entity();
             canvas_div = canvas_div.on_click(move |_, _, cx| {
@@ -1192,7 +603,6 @@ impl Render for DashboardPanel {
             });
         }
 
-        // Edit mode indicator pill
         if self.editing {
             canvas_div = canvas_div.child(
                 div()
@@ -1211,7 +621,6 @@ impl Render for DashboardPanel {
             );
         }
 
-        // Empty state
         if self.widgets.is_empty() {
             canvas_div = canvas_div.child(
                 div()
@@ -1225,7 +634,6 @@ impl Render for DashboardPanel {
             );
         }
 
-        // Scrollbars
         if let Some(bounds) = self.container_bounds {
             let extent = self.content_extent();
             let vw = f32::from(bounds.size.width);
@@ -1288,7 +696,7 @@ pub fn deserialize_dashboard(
     let mut widget_views = HashMap::new();
     let mut widget_entities = HashMap::new();
     for widget in &widgets {
-        let (view, widget_entity) = create_widget_view(widget.kind, &widget.config, &db, cx);
+        let (view, widget_entity) = create_widget_view(&widget.kind, &widget.config, &db, cx);
         widget_views.insert(widget.id, view);
         widget_entities.insert(widget.id, widget_entity);
     }

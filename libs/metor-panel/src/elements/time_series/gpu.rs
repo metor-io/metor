@@ -1007,7 +1007,7 @@ fn node_stride(node_len: usize, total: usize, pixel_budget: usize) -> Option<usi
 /// Primitive types that can be read from a byte buffer and converted to
 /// f64. Shared between `convert_values_strided` and the upstream trace
 /// planner.
-trait PlotValue: zerocopy::FromBytes + Copy + Sized + 'static {
+pub(super) trait PlotValue: zerocopy::FromBytes + Copy + Sized + 'static {
     fn to_f64(self) -> f64;
 }
 

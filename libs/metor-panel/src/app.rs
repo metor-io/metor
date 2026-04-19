@@ -343,7 +343,8 @@ pub fn run(db: Arc<metor_db::DB>) {
             )));
             pending_edits::init(cx);
             ItemRegistry::init(cx);
-            crate::widget_registry::WidgetRegistry::init(db.clone(), cx);
+            crate::inspector_registry::InspectorRegistry::init(db.clone(), cx);
+            crate::tiles::dashboard::WidgetRegistry::init(cx);
             set_dock_icon();
             cx.bind_keys([
                 KeyBinding::new("cmd-p", OpenPalette, None),

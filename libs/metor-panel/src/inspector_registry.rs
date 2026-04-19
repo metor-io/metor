@@ -1,4 +1,4 @@
-/// Type registry mapping Facet types to widget factories and row builders.
+/// Registry mapping Facet types to inspector row factories and entity adapters.
 ///
 /// The registry has two layers:
 /// - **Field widget factories**: produce a single `InspectorRow` for a field
@@ -82,7 +82,7 @@ impl<T: 'static> Clone for AddBehavior<T> {
     }
 }
 
-pub struct WidgetRegistry {
+pub struct InspectorRegistry {
     field_widgets: HashMap<ConstTypeId, FieldWidgetFactory>,
     type_builders: HashMap<TypeId, TypeRowBuilder>,
     field_overrides: HashMap<(ConstTypeId, &'static str), FieldOverride>,
@@ -96,9 +96,9 @@ pub struct WidgetRegistry {
     entity_adapters: HashMap<TypeId, Arc<EntityAdapter>>,
 }
 
-impl Global for WidgetRegistry {}
+impl Global for InspectorRegistry {}
 
-impl WidgetRegistry {
+impl InspectorRegistry {
     pub fn init(db: Arc<DB>, cx: &mut App) {
         let mut reg = Self {
             field_widgets: HashMap::new(),

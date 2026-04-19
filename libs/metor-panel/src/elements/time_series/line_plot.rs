@@ -34,7 +34,7 @@ use metor_proto::types::{ComponentId, Timestamp};
 use super::bounds::PlotBounds;
 use super::gpu::{LineDraw, PlotRenderState};
 use super::override_field::Override;
-use super::{Trace, expand_y_bounds};
+use super::{NodeBoundsCache, Trace, expand_y_bounds};
 use crate::offset_parse::TimeRangeBehavior;
 use crate::wait_for_component;
 
@@ -45,7 +45,11 @@ use crate::wait_for_component;
 struct TraceTracking {
     component: Option<Component>,
     y_bounds: Option<(f64, f64)>,
-    last_scan_ts: Option<Timestamp>,
+    /// Per-node (min, max) cache owned by the tracker. Taken out on each
+    /// background scan and put back with the result; invalidated when
+    /// `cached_element_index` changes.
+    node_bounds: NodeBoundsCache,
+    cached_element_index: Option<usize>,
 }
 
 impl TraceTracking {
@@ -53,7 +57,8 @@ impl TraceTracking {
         Self {
             component: None,
             y_bounds: None,
-            last_scan_ts: None,
+            node_bounds: NodeBoundsCache::default(),
+            cached_element_index: None,
         }
     }
 }
@@ -296,26 +301,43 @@ impl LinePlot {
             }
 
             loop {
-                let result = this.update(cx, |lp, cx| {
+                let inputs = this.update(cx, |lp, cx| {
+                    let tracking = lp.tracking.get_mut(&id)?;
+                    let comp = tracking.component.clone()?;
+                    let element_index = trace.read(cx).element_index;
+                    if tracking.cached_element_index != Some(element_index) {
+                        tracking.node_bounds.clear();
+                        tracking.y_bounds = None;
+                        tracking.cached_element_index = Some(element_index);
+                    }
+                    let cache = std::mem::take(&mut tracking.node_bounds);
+                    Some((comp, element_index, cache))
+                });
+                let Ok(Some((comp, element_index, mut cache))) = inputs else {
+                    break;
+                };
+
+                let (bounds, cache) = cx
+                    .background_executor()
+                    .spawn(async move {
+                        let bounds = expand_y_bounds(&comp, &[element_index], &mut cache);
+                        (bounds, cache)
+                    })
+                    .await;
+
+                let installed = this.update(cx, |lp, cx| {
                     let Some(tracking) = lp.tracking.get_mut(&id) else {
                         return false;
                     };
-                    let Some(comp) = tracking.component.as_ref() else {
-                        return false;
-                    };
-                    let latest_ts = comp.time_series.latest().map(|n| n.timestamp());
-                    let element_index = trace.read(cx).element_index;
-                    tracking.y_bounds = expand_y_bounds(
-                        comp,
-                        &[element_index],
-                        tracking.y_bounds,
-                        tracking.last_scan_ts,
-                    );
-                    tracking.last_scan_ts = latest_ts;
+                    // Guard against element_index churn during the scan.
+                    if tracking.cached_element_index == Some(element_index) {
+                        tracking.node_bounds = cache;
+                        tracking.y_bounds = bounds;
+                    }
                     cx.notify();
                     true
                 });
-                if !matches!(result, Ok(true)) {
+                if !matches!(installed, Ok(true)) {
                     break;
                 }
                 component.time_series.wait().await;

@@ -3,8 +3,8 @@
 /// [`rows_for_any_entity`] is the type-erased entry point: it prefers a
 /// registered [`TypeRowBuilder`] override, then falls back to the adapter-
 /// driven [`default_rows_for_any_entity`] walk. The walk delegates per-field
-/// dispatch to [`WidgetRegistry::row_for_field`], so concrete row construction
-/// lives in `widget_registry`. Widget callbacks write values back through the
+/// dispatch to [`InspectorRegistry::row_for_field`], so concrete row construction
+/// lives in `inspector_registry`. Widget callbacks write values back through the
 /// monomorphic [`set_field`] / [`get_field`] helpers, which dispatch through
 /// the registry's per-type [`EntityAdapter`].
 use std::sync::Arc;
@@ -13,7 +13,7 @@ use facet::{Facet, FieldFlags, PokeStruct};
 use gpui::{AnyEntity, App, Entity, SharedString};
 use metor_db::DB;
 
-use crate::widget_registry::{FieldBuildCtx, WidgetRegistry};
+use crate::inspector_registry::{FieldBuildCtx, InspectorRegistry};
 use crate::widgets::InspectorRow;
 
 /// Resolve rows for any entity. Returns `None` only when the entity's type
@@ -23,7 +23,7 @@ pub fn rows_for_any_entity(
     db: &Arc<DB>,
     cx: &App,
 ) -> Option<Vec<Box<dyn InspectorRow>>> {
-    let registry = cx.global::<WidgetRegistry>();
+    let registry = cx.global::<InspectorRegistry>();
     if let Some(builder) = registry.type_builder(entity.entity_type()).cloned() {
         return Some(builder(entity.clone(), db, cx));
     }
@@ -43,13 +43,13 @@ pub fn rows_for_entity<T: 'static>(
 }
 
 /// Walk a Facet struct's fields via the registry adapter and produce widget
-/// rows. Per-field dispatch is delegated to [`WidgetRegistry::row_for_field`].
+/// rows. Per-field dispatch is delegated to [`InspectorRegistry::row_for_field`].
 pub fn default_rows_for_any_entity(
     any_entity: &AnyEntity,
     db: &Arc<DB>,
     cx: &App,
 ) -> Vec<Box<dyn InspectorRow>> {
-    let registry = cx.global::<WidgetRegistry>();
+    let registry = cx.global::<InspectorRegistry>();
     let Some(adapter) = registry.entity_adapter(any_entity.entity_type()).cloned() else {
         return vec![];
     };
@@ -95,7 +95,7 @@ pub fn get_field<V: Facet<'static> + Clone + 'static>(
     cx: &App,
 ) -> Option<V> {
     let adapter = cx
-        .global::<WidgetRegistry>()
+        .global::<InspectorRegistry>()
         .entity_adapter(any_entity.entity_type())?
         .clone();
     let mut out = None;
@@ -121,7 +121,7 @@ pub fn set_field<V: Facet<'static> + 'static>(
     cx: &mut App,
 ) {
     let Some(adapter) = cx
-        .global::<WidgetRegistry>()
+        .global::<InspectorRegistry>()
         .entity_adapter(any_entity.entity_type())
         .cloned()
     else {
@@ -152,7 +152,7 @@ pub fn set_enum_variant(
     cx: &mut App,
 ) {
     let Some(adapter) = cx
-        .global::<WidgetRegistry>()
+        .global::<InspectorRegistry>()
         .entity_adapter(any_entity.entity_type())
         .cloned()
     else {

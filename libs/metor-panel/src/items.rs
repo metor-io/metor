@@ -200,7 +200,7 @@ fn register_widget_provider(tiles: Entity<TileGroup>, cx: &mut App) {
                     continue;
                 };
                 let dashboard_title = dashboard.read(cx).title();
-                for (_id, widget_entity, label) in dashboard.read(cx).inspectable_widgets() {
+                for (_id, widget_entity, label) in dashboard.read(cx).inspectable_widgets(cx) {
                     items.push(InspectionItem::Entity {
                         label,
                         summary: dashboard_title.clone(),

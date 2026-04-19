@@ -1,3 +1,4 @@
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use gpui::{
@@ -5,7 +6,7 @@ use gpui::{
     SharedString, Styled, TextRun, Window, canvas, div, point, prelude::*, px,
 };
 use metor_db::{Component, DB};
-use metor_proto::types::{ComponentId, Timestamp};
+use metor_proto::types::{ComponentId, PrimType};
 
 #[allow(unused_imports)]
 use crate::inspect;
@@ -227,66 +228,144 @@ fn plot_area(outer: Bounds<Pixels>) -> Bounds<Pixels> {
     }
 }
 
-pub fn compute_y_bounds(component: &Component, indexes: &[usize]) -> Option<(f64, f64)> {
-    expand_y_bounds(component, indexes, None, None)
+/// Per-node cached (min, max) over the first `sample_count` samples.
+/// `TimeSeriesNode`s are append-only, so this value is stable for a
+/// sealed node and only extends for the active head node.
+#[derive(Clone, Copy)]
+pub struct NodeBounds {
+    pub sample_count: usize,
+    pub min: f64,
+    pub max: f64,
 }
 
-/// Incrementally expand y bounds by scanning only data newer than `since`.
-/// If `existing` bounds and a `since` timestamp are provided, only new data is
-/// scanned and the bounds are expanded (never shrunk). When either is `None` a
-/// full scan is performed. Considers all element `indexes`.
+/// Per-trace cache passed to [`expand_y_bounds`]. Keyed by the stable
+/// `Arc::as_ptr` identity of each `TimeSeriesNode` in the component's
+/// append-only stack. Evicted entries are dropped on each call so the
+/// map size tracks live nodes only.
+pub type NodeBoundsCache = HashMap<usize, NodeBounds>;
+
+/// Aggregate (min, max) across `indexes` for every sample in
+/// `component.time_series`, reusing `cache` so only the tail of the
+/// head node is re-scanned each call. `cache` is mutated in place.
+///
+/// The inner loop dispatches on `PrimType` once per node, then reads
+/// values directly from the memory-mapped bytes. No `ComponentView`,
+/// `ElementValue`, or `Result` allocation in the hot path.
 pub fn expand_y_bounds(
     component: &Component,
     indexes: &[usize],
-    existing: Option<(f64, f64)>,
-    since: Option<Timestamp>,
+    cache: &mut NodeBoundsCache,
 ) -> Option<(f64, f64)> {
-    let (mut min_y, mut max_y) = existing.unwrap_or((f64::INFINITY, f64::NEG_INFINITY));
-    let mut any = existing.is_some();
+    let schema = &component.schema;
+    let sample_size = schema.size();
+    if sample_size == 0 || indexes.is_empty() {
+        return None;
+    }
+    let prim_size = schema.prim_type.size();
+    let mut offsets: smallvec::SmallVec<[usize; 4]> = smallvec::SmallVec::new();
+    for &idx in indexes {
+        let off = idx * prim_size;
+        if off + prim_size <= sample_size {
+            offsets.push(off);
+        }
+    }
+    if offsets.is_empty() {
+        return None;
+    }
 
-    let mut update = |cv: &metor_proto::types::ComponentView| {
-        for &idx in indexes {
-            if let Some(ev) = cv.get(idx) {
-                let v = ev.as_f64();
-                min_y = min_y.min(v);
-                max_y = max_y.max(v);
-                any = true;
+    let mut agg_min = f64::INFINITY;
+    let mut agg_max = f64::NEG_INFINITY;
+    let mut seen = false;
+    let mut live: HashSet<usize> = HashSet::new();
+
+    for node in component.time_series.list.iter() {
+        let node_id = Arc::as_ptr(&node) as usize;
+        live.insert(node_id);
+        let current_len = node.timestamps().len();
+        let entry = cache.entry(node_id).or_insert(NodeBounds {
+            sample_count: 0,
+            min: f64::INFINITY,
+            max: f64::NEG_INFINITY,
+        });
+        if current_len > entry.sample_count {
+            let data = node.data.data();
+            let from = entry.sample_count * sample_size;
+            let to = current_len * sample_size;
+            if to <= data.len() {
+                let (min, max) =
+                    scan_min_max_dispatch(schema.prim_type, &data[from..to], sample_size, &offsets);
+                if min < entry.min {
+                    entry.min = min;
+                }
+                if max > entry.max {
+                    entry.max = max;
+                }
+                entry.sample_count = current_len;
             }
         }
-    };
-
-    match since {
-        Some(since_ts) => {
-            // Incremental: only scan from since_ts onward
-            let range = since_ts..Timestamp(i64::MAX);
-            if let Some(slice) = component.time_series.get_range(range) {
-                let schema = &component.schema;
-                for node_slice in slice.as_iter() {
-                    for (_ts, cv) in node_slice.iter_values(schema) {
-                        update(&cv);
-                    }
-                }
+        if entry.sample_count > 0 && entry.min.is_finite() {
+            if entry.min < agg_min {
+                agg_min = entry.min;
             }
-        }
-        None => {
-            // Full scan
-            let element_size = component.schema.size();
-            for node in component.time_series.list.iter() {
-                let data = node.data.data();
-                let count = node.timestamps().len();
-                for i in 0..count {
-                    let start = i * element_size;
-                    if let Some(buf) = data.get(start..start + element_size) {
-                        if let Ok((_size, view)) = component.schema.parse_value(buf) {
-                            update(&view);
-                        }
-                    }
-                }
+            if entry.max > agg_max {
+                agg_max = entry.max;
             }
+            seen = true;
         }
     }
 
-    any.then_some((min_y, max_y))
+    cache.retain(|id, _| live.contains(id));
+    seen.then_some((agg_min, agg_max))
+}
+
+fn scan_min_max_dispatch(
+    prim: PrimType,
+    data: &[u8],
+    sample_size: usize,
+    offsets: &[usize],
+) -> (f64, f64) {
+    match prim {
+        // Bool is one byte; treat as u8 (0/1) for min/max.
+        PrimType::U8 | PrimType::Bool => scan_min_max::<u8>(data, sample_size, offsets),
+        PrimType::U16 => scan_min_max::<u16>(data, sample_size, offsets),
+        PrimType::U32 => scan_min_max::<u32>(data, sample_size, offsets),
+        PrimType::U64 => scan_min_max::<u64>(data, sample_size, offsets),
+        PrimType::I8 => scan_min_max::<i8>(data, sample_size, offsets),
+        PrimType::I16 => scan_min_max::<i16>(data, sample_size, offsets),
+        PrimType::I32 => scan_min_max::<i32>(data, sample_size, offsets),
+        PrimType::I64 => scan_min_max::<i64>(data, sample_size, offsets),
+        PrimType::F32 => scan_min_max::<f32>(data, sample_size, offsets),
+        PrimType::F64 => scan_min_max::<f64>(data, sample_size, offsets),
+    }
+}
+
+#[inline]
+fn scan_min_max<T: gpu::PlotValue>(
+    data: &[u8],
+    sample_size: usize,
+    offsets: &[usize],
+) -> (f64, f64) {
+    let t_size = std::mem::size_of::<T>();
+    let mut min = f64::INFINITY;
+    let mut max = f64::NEG_INFINITY;
+    for sample in data.chunks_exact(sample_size) {
+        for &off in offsets {
+            let Some(buf) = sample.get(off..off + t_size) else {
+                continue;
+            };
+            let Ok(v) = T::read_from_bytes(buf) else {
+                continue;
+            };
+            let f = v.to_f64();
+            if f < min {
+                min = f;
+            }
+            if f > max {
+                max = f;
+            }
+        }
+    }
+    (min, max)
 }
 
 /// Paint the "underlay" chrome of a `TimeSeriesPlot`: gridlines + zero
@@ -610,8 +689,7 @@ impl TimeSeriesPlot {
 impl Render for TimeSeriesPlot {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = crate::theme::theme(cx);
-        let trace_entities: Vec<Entity<Trace>> =
-            self.line_plot.read(cx).traces().to_vec();
+        let trace_entities: Vec<Entity<Trace>> = self.line_plot.read(cx).traces().to_vec();
         let show_legend = trace_entities.len() >= 2;
 
         let underlay_lp = self.line_plot.clone();

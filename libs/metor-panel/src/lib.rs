@@ -17,7 +17,7 @@ pub mod theme;
 pub mod tiles;
 pub(crate) mod component_tree;
 pub(crate) mod trace_picker;
-pub mod widget_registry;
+pub mod inspector_registry;
 pub mod widgets;
 
 /// Borrowing conversion to a [`ComponentView`].
