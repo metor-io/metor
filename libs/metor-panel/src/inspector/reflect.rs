@@ -13,8 +13,8 @@ use facet::{Facet, FieldFlags, PokeStruct};
 use gpui::{AnyEntity, App, Entity, SharedString};
 use metor_db::DB;
 
-use crate::inspector_registry::{FieldBuildCtx, InspectorRegistry};
-use crate::widgets::InspectorRow;
+use crate::inspector::registry::{FieldBuildCtx, InspectorRegistry};
+use crate::inspector::rows::InspectorRow;
 
 /// Resolve rows for any entity. Returns `None` only when the entity's type
 /// has neither a `TypeRowBuilder` override nor an `EntityAdapter`.

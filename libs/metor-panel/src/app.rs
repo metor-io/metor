@@ -5,8 +5,8 @@ use std::sync::Arc;
 
 use crate::inspector::Inspector;
 use crate::inspector::{InspectorMode, InspectorRequest};
-use crate::items::ItemRegistry;
-use crate::pending_edits::{self, edit_value_rows, pending_edits, pending_edits_mut, review_rows};
+use crate::inspector::palette::ItemRegistry;
+use crate::inspector::edits::{self, edit_value_rows, pending_edits, pending_edits_mut, review_rows};
 use crate::tiles::{TileGroup, TileGroupEvent};
 use gpui::{
     App, Application, Bounds, Context, Entity, FocusHandle, Focusable, IntoElement, KeyBinding,
@@ -42,7 +42,7 @@ impl AppRoot {
         let tiles = cx.new(|cx| TileGroup::new(vec![], cx));
         cx.subscribe(&tiles, Self::handle_tile_event).detach();
         let on_open_inspector = Self::make_on_open_inspector(cx.entity().clone());
-        crate::items::register_builtin_providers(db.clone(), tiles.clone(), on_open_inspector, cx);
+        crate::inspector::palette::register_builtin_providers(db.clone(), tiles.clone(), on_open_inspector, cx);
         Self {
             db,
             tiles,
@@ -55,7 +55,7 @@ impl AppRoot {
 
     fn open_inspector_with(
         &mut self,
-        rows: Vec<Box<dyn crate::widgets::InspectorRow>>,
+        rows: Vec<Box<dyn crate::inspector::rows::InspectorRow>>,
         mode: InspectorMode,
         window: &mut Window,
         cx: &mut Context<Self>,
@@ -148,7 +148,7 @@ impl AppRoot {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if let Some(rows) = crate::reflect::rows_for_any_entity(entity, &self.db, cx) {
+        if let Some(rows) = crate::inspector::reflect::rows_for_any_entity(entity, &self.db, cx) {
             let parent_focus = self.focus_handle.clone();
             let inspector = cx.new(|cx| {
                 let mut insp = Inspector::new(rows, InspectorMode::Anchored(position), cx);
@@ -341,10 +341,10 @@ pub fn run(db: Arc<metor_db::DB>) {
             cx.set_global(crate::theme::ActiveTheme(Arc::new(
                 crate::theme::DARK.clone(),
             )));
-            pending_edits::init(cx);
+            edits::init(cx);
             ItemRegistry::init(cx);
-            crate::inspector_registry::InspectorRegistry::init(db.clone(), cx);
-            crate::tiles::dashboard::WidgetRegistry::init(cx);
+            crate::inspector::registry::InspectorRegistry::init(db.clone(), cx);
+            crate::views::dashboard::WidgetRegistry::init(cx);
             set_dock_icon();
             cx.bind_keys([
                 KeyBinding::new("cmd-p", OpenPalette, None),

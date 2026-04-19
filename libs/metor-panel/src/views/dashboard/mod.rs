@@ -14,11 +14,11 @@ use gpui::{
 use metor_db::DB;
 use serde::{Deserialize, Serialize};
 
-use crate::elements::{Scrollbar, TimeSeriesPlot};
+use crate::views::{Scrollbar, TimeSeriesPlot};
 use crate::theme::theme;
-use crate::widgets::{CommandRow, DefaultActionRow, InspectorRow, NavRow};
+use crate::inspector::rows::{CommandRow, DefaultActionRow, InspectorRow, NavRow};
 
-use super::item::PaneItem;
+use crate::tiles::PaneItem;
 
 mod chrome;
 mod interaction;
@@ -439,7 +439,7 @@ fn add_widget_rows(
             Box::new(move |_cx| {
                 let dashboard = dashboard.clone();
                 let db_for_plot = db.clone();
-                crate::trace_picker::select_traces_wizard_rows(
+                crate::inspector::trace_picker::select_traces_wizard_rows(
                     db.clone(),
                     Arc::new(|_cx| 0),
                     Arc::new(move |traces, _window, cx| {
@@ -502,7 +502,7 @@ fn component_picker_rows(
     db: Arc<DB>,
     kind: WidgetKind,
 ) -> Vec<Box<dyn InspectorRow>> {
-    crate::trace_picker::list_components(&db)
+    crate::inspector::trace_picker::list_components(&db)
         .into_iter()
         .map(|(_id, name)| {
             let dashboard = dashboard.clone();

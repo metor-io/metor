@@ -11,7 +11,7 @@ use smallvec::SmallVec;
 
 use crate::icons::Icon;
 use crate::theme::{Theme, theme};
-use crate::widgets::TextField;
+use crate::inspector::rows::TextField;
 use crate::{AsComponentView, ComponentStream, ComponentStreamBuilder};
 
 /// One formatted value within a [`ComponentValueStrip`].
@@ -306,7 +306,7 @@ impl ComponentValueStrip {
             return;
         };
         let new_value = ElementValue::Bool(!current);
-        crate::pending_edits::upsert_element_value(
+        crate::inspector::edits::upsert_element_value(
             &self.db,
             self.component_id,
             self.component_name.clone(),
@@ -358,7 +358,7 @@ impl ComponentValueStrip {
             CellKind::Numeric { signed, float } => {
                 match parse_numeric(&text, self.prim_type(), signed, float) {
                     Some(value) => {
-                        crate::pending_edits::upsert_element_value(
+                        crate::inspector::edits::upsert_element_value(
                             &self.db,
                             self.component_id,
                             self.component_name.clone(),
@@ -377,7 +377,7 @@ impl ComponentValueStrip {
                 }
             }
             CellKind::String => {
-                crate::pending_edits::upsert_string_value(
+                crate::inspector::edits::upsert_string_value(
                     &self.db,
                     self.component_id,
                     self.component_name.clone(),
@@ -489,7 +489,7 @@ impl Render for ComponentValueStrip {
         // Overlay the pending edit on top of the live WAL values so the cell
         // reflects the user's in-flight change, not the last broadcast value.
         let (cells, raw_values) = {
-            let pending = crate::pending_edits::pending_edits(cx).get(self.component_id);
+            let pending = crate::inspector::edits::pending_edits(cx).get(self.component_id);
             if let Some(edit) = pending {
                 let view = edit.value.as_view();
                 let raw: Vec<ElementValue> = view.iter().collect();
@@ -877,7 +877,7 @@ pub(crate) fn resolve_metadata(db: &DB, component_id: ComponentId) -> ResolvedMe
         } else {
             component
                 .map(|c| {
-                    crate::trace_picker::element_names(c.schema.dim.as_slice())
+                    crate::inspector::trace_picker::element_names(c.schema.dim.as_slice())
                         .into_iter()
                         .map(SharedString::from)
                         .collect()

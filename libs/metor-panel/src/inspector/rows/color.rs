@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use gpui::{AnyElement, App, Hsla, SharedString, Window, div, prelude::*, px};
 
-use super::slider_row::SliderRow;
+use super::slider::SliderRow;
 use super::{InspectorRow, RowAction, row_base};
 use crate::icons::Icon;
 use crate::theme::theme;

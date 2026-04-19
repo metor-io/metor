@@ -6,7 +6,7 @@ use metor_proto::types::{ComponentId, ElementValue, Timestamp};
 use metor_proto_wkt::{ComponentValue, UpdateComponent};
 use metor_proto::types::Msg;
 
-use crate::widgets::{CommandRow, DefaultActionRow, InspectorRow, NavRow};
+use crate::inspector::rows::{CommandRow, DefaultActionRow, InspectorRow, NavRow};
 
 /// A pending edit to a component's value, accumulated until the user commits it.
 #[derive(Clone)]
@@ -179,7 +179,7 @@ fn summarize_edit(edit: &PendingEdit) -> SharedString {
             let value = edit
                 .value
                 .get(i)
-                .map(|v| crate::elements::format_element_value(v, None))
+                .map(|v| crate::views::format_element_value(v, None))
                 .unwrap_or_default();
             format!("{}={}", label, value)
         })
@@ -190,7 +190,7 @@ fn summarize_edit(edit: &PendingEdit) -> SharedString {
 /// Build inspector rows listing all components. Selecting one cascades into an
 /// element picker, which then opens the value editor.
 pub fn update_component_rows(db: Arc<DB>) -> Vec<Box<dyn InspectorRow>> {
-    let components = crate::trace_picker::list_components(&db);
+    let components = crate::inspector::trace_picker::list_components(&db);
     components
         .into_iter()
         .map(|(id, name)| {
@@ -216,7 +216,7 @@ fn select_element_rows(
     component_name: SharedString,
 ) -> Vec<Box<dyn InspectorRow>> {
     let element_names: Vec<SharedString> =
-        crate::trace_picker::element_names_for_component(&db, component_id)
+        crate::inspector::trace_picker::element_names_for_component(&db, component_id)
             .into_iter()
             .map(SharedString::from)
             .collect();

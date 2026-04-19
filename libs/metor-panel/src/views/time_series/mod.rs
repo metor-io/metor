@@ -10,7 +10,6 @@ use metor_proto::types::{ComponentId, PrimType};
 
 #[allow(unused_imports)]
 use crate::inspect;
-use crate::offset_parse::TimeRangeBehavior;
 
 mod bounds;
 pub use bounds::*;
@@ -22,6 +21,9 @@ pub use line_plot::LinePlot;
 
 mod override_field;
 pub use override_field::Override;
+
+pub mod time_range;
+pub use time_range::TimeRangeBehavior;
 
 /// Generate Y-axis tick positions within the visible bounds (sorted ascending).
 /// When the range spans 0, ticks are anchored at 0 and extend outward.
@@ -630,7 +632,7 @@ impl TimeSeriesPlot {
             indexes
         };
         let theme = crate::theme::theme(cx);
-        let elem_names = crate::trace_picker::element_names_for_component(&db, component_id);
+        let elem_names = crate::inspector::trace_picker::element_names_for_component(&db, component_id);
         let comp_name = db
             .with_state(|s| {
                 s.get_component_metadata(component_id)

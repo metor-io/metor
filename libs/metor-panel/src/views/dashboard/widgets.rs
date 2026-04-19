@@ -15,8 +15,8 @@ use image::{Frame, ImageBuffer, Rgba};
 use metor_db::DB;
 use smallvec::SmallVec;
 
-use crate::elements::viewer_3d::Viewer3d;
-use crate::elements::{ComponentText, Monitor, TimeSeriesPlot, new_component_table};
+use crate::views::viewer_3d::Viewer3d;
+use crate::views::{ComponentText, Monitor, TimeSeriesPlot, new_component_table};
 use crate::theme::theme;
 
 use super::{DashboardWidget, WidgetKind};

@@ -11,8 +11,15 @@ use gpui::{
     canvas, deferred, div, prelude::*, px, uniform_list,
 };
 
+pub mod edits;
+pub mod palette;
+pub mod reflect;
+pub mod registry;
+pub mod rows;
+pub mod trace_picker;
+
 use crate::theme::theme;
-use crate::widgets::{InspectorRow, RowAction, TextField};
+use rows::{InspectorRow, RowAction, TextField};
 
 const ROW_HEIGHT: f32 = 28.0;
 
@@ -404,7 +411,7 @@ impl Inspector {
                                 let page = this.current_page();
                                 let label =
                                     SharedString::from(page.rows[row_idx].label().to_string());
-                                crate::widgets::row_base(vis_ix, selected, cx)
+                                crate::inspector::rows::row_base(vis_ix, selected, cx)
                                     .child(
                                         div()
                                             .text_size(px(12.0))

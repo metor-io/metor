@@ -9,10 +9,12 @@ use metor_db::DB;
 use metor_proto::types::ComponentId;
 use smallvec::SmallVec;
 
+pub mod component_tree;
+
 use super::column_browser::{ColumnBrowser, ColumnBrowserDelegate};
 use super::monitor::{behavior_snapshot, edit_click};
 use super::value_strip::{ComponentValueStrip, StripBehavior, StripClick, StripStyle};
-use crate::component_tree::{ComponentNode, build_tree, resolve_path};
+use component_tree::{ComponentNode, build_tree, resolve_path};
 use crate::theme::{Theme, theme};
 
 /// Specialization of [`ColumnBrowser`] that browses the DB's component namespace.

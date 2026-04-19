@@ -4,8 +4,8 @@ use gpui::{App, SharedString, Window};
 use metor_db::DB;
 use metor_proto::types::ComponentId;
 
-use crate::elements::time_series::Trace;
-use crate::widgets::{CommandRow, InspectorRow, NavRow};
+use crate::views::time_series::Trace;
+use crate::inspector::rows::{CommandRow, InspectorRow, NavRow};
 
 /// List all components from the DB, sorted by name.
 pub(crate) fn list_components(db: &DB) -> Vec<(ComponentId, String)> {

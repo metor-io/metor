@@ -8,7 +8,7 @@ use smallvec::SmallVec;
 use super::time_series::{LinePlot, Trace};
 use super::value_strip::{ComponentValueStrip, StripBehavior, StripClick, StripStyle};
 use crate::ComponentStreamBuilder;
-use crate::pending_edits::{EditRequest, pending_edits, pending_edits_mut};
+use crate::inspector::edits::{EditRequest, pending_edits, pending_edits_mut};
 use crate::theme::theme;
 
 /// Dashboard widget that displays a component's current value alongside its
@@ -147,7 +147,7 @@ pub(crate) fn edit_click(
 ) -> StripClick {
     Arc::new(move |element_index, position, _window, cx| {
         let element_names: Vec<SharedString> =
-            crate::trace_picker::element_names_for_component(&db, component_id)
+            crate::inspector::trace_picker::element_names_for_component(&db, component_id)
                 .into_iter()
                 .map(SharedString::from)
                 .collect();
@@ -187,7 +187,7 @@ pub(crate) fn behavior_snapshot(
 /// UI list.
 pub(crate) fn apply_click(db: Arc<DB>, component_id: ComponentId) -> StripClick {
     Arc::new(move |element_index, _position, _window, cx| {
-        crate::pending_edits::apply_element(&db, component_id, element_index, cx);
+        crate::inspector::edits::apply_element(&db, component_id, element_index, cx);
     })
 }
 

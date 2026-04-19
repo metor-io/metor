@@ -1,4 +1,3 @@
-pub mod dashboard;
 pub(crate) mod drag;
 pub(crate) mod item;
 pub(crate) mod pane;

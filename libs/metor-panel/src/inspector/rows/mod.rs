@@ -7,29 +7,29 @@ use gpui::{AnyElement, App, Hsla, SharedString, Window, div, prelude::*, px};
 
 use crate::theme::theme;
 
-pub mod bool_row;
+pub mod bool;
 pub mod checkbox;
-pub mod color_row;
-pub mod command_row;
-pub mod default_action_row;
-pub mod enum_row;
-pub mod list_row;
-pub mod scalar_row;
-pub mod slider_row;
+pub mod color;
+pub mod command;
+pub mod default_action;
+pub mod enum_;
+pub mod nav;
+pub mod scalar;
+pub mod slider;
+pub mod text;
 pub mod text_field;
-pub mod text_row;
 
-pub use bool_row::BoolRow;
+pub use bool::BoolRow;
 pub use checkbox::{check_square, checkbox};
-pub use color_row::ColorRow;
-pub use command_row::CommandRow;
-pub use default_action_row::DefaultActionRow;
-pub use enum_row::EnumRow;
-pub use list_row::NavRow;
-pub use scalar_row::ScalarRow;
-pub use slider_row::SliderRow;
+pub use color::ColorRow;
+pub use command::CommandRow;
+pub use default_action::DefaultActionRow;
+pub use enum_::EnumRow;
+pub use nav::NavRow;
+pub use scalar::ScalarRow;
+pub use slider::SliderRow;
+pub use text::TextRow;
 pub use text_field::TextField;
-pub use text_row::TextRow;
 
 /// One row in an inspector panel.
 ///

@@ -4,15 +4,15 @@ use gpui::{App, Context, Entity, IntoElement, Render, SharedString, Window, div,
 use metor_db::DB;
 use metor_proto::types::ComponentId;
 
-use super::dashboard::DashboardPanel;
-use crate::elements::time_series::LinePlot;
-use crate::elements::viewer_3d::Viewer3d;
-use crate::elements::{
+use crate::views::dashboard::DashboardPanel;
+use crate::views::time_series::LinePlot;
+use crate::views::viewer_3d::Viewer3d;
+use crate::views::{
     ComponentBrowser, ComponentTable, ComponentText, TimeSeriesPlot, new_component_browser,
     new_component_table,
 };
 use crate::inspector::{InspectorMode, InspectorRequest, OpenInspectorCallback};
-use crate::widgets::{CommandRow, InspectorRow, NavRow};
+use crate::inspector::rows::{CommandRow, InspectorRow, NavRow};
 
 use super::item::{PaneItem, PaneItemHandle};
 use super::pane::Pane;
@@ -156,7 +156,7 @@ impl PlotPanel {
     /// Create a plot panel pre-populated with the given traces.
     pub fn with_traces(
         db: Arc<DB>,
-        traces: Vec<crate::elements::time_series::Trace>,
+        traces: Vec<crate::views::time_series::Trace>,
         cx: &mut Context<Self>,
     ) -> Self {
         let inner = cx.new(|cx| TimeSeriesPlot::new(db, traces, cx));
@@ -286,7 +286,7 @@ pub fn new_panel_rows(
                 let db_for_select = db.clone();
                 let pane = pane.clone();
                 let on_open_inspector = on_open_inspector.clone();
-                crate::trace_picker::select_traces_wizard_rows(
+                crate::inspector::trace_picker::select_traces_wizard_rows(
                     db.clone(),
                     Arc::new(|_cx| 0),
                     Arc::new(move |traces, window, cx| {
@@ -301,7 +301,7 @@ pub fn new_panel_rows(
 
                         if let Some(on_open_inspector) = &on_open_inspector {
                             let inner_any = inner.into_any();
-                            if let Some(rows) = crate::reflect::rows_for_any_entity(
+                            if let Some(rows) = crate::inspector::reflect::rows_for_any_entity(
                                 &inner_any,
                                 &db_for_select,
                                 cx,
@@ -404,7 +404,7 @@ pub fn component_picker_rows(
     on_select: impl Fn(ComponentId, String, &mut App) + 'static,
 ) -> Vec<Box<dyn InspectorRow>> {
     let on_select = Arc::new(on_select);
-    crate::trace_picker::list_components(&db)
+    crate::inspector::trace_picker::list_components(&db)
         .into_iter()
         .map(|(id, name)| {
             let on_select = on_select.clone();

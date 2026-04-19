@@ -17,8 +17,8 @@ use metor_db::DB;
 
 use crate::inspector::OpenInspectorCallback;
 use crate::tiles::TileGroup;
-use crate::tiles::dashboard::DashboardPanel;
-use crate::widgets::{CommandRow, InspectorRow, NavRow};
+use crate::views::dashboard::DashboardPanel;
+use crate::inspector::rows::{CommandRow, InspectorRow, NavRow};
 
 /// Top-level grouping for items in the everything-palette.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -122,7 +122,7 @@ fn item_to_row(
                 label,
                 summary,
                 Box::new(move |cx| {
-                    crate::reflect::rows_for_any_entity(&entity, &db, cx).unwrap_or_default()
+                    crate::inspector::reflect::rows_for_any_entity(&entity, &db, cx).unwrap_or_default()
                 }),
             )
             .with_tag(tag),
@@ -245,19 +245,19 @@ fn register_command_provider(
             label: "Update Component".into(),
             summary: SharedString::new_static(""),
             build: Arc::new(move |_cx| {
-                crate::pending_edits::update_component_rows(update_db.clone())
+                crate::inspector::edits::update_component_rows(update_db.clone())
             }),
         });
 
         // Review Edits — only when there are pending edits.
-        let pending_count = crate::pending_edits::pending_edits(cx).edits.len();
+        let pending_count = crate::inspector::edits::pending_edits(cx).edits.len();
         if pending_count > 0 {
             let review_db = db.clone();
             let review_open = on_open_inspector.clone();
             items.push(InspectionItem::Command {
                 label: SharedString::from(format!("Review Edits ({})", pending_count)),
                 callback: Arc::new(move |window, cx| {
-                    let rows = crate::pending_edits::review_rows(review_db.clone(), cx);
+                    let rows = crate::inspector::edits::review_rows(review_db.clone(), cx);
                     review_open(
                         crate::inspector::InspectorRequest {
                             rows,
@@ -292,14 +292,14 @@ fn register_command_provider(
 
         // Toggle edit lock
         items.push(InspectionItem::Command {
-            label: if crate::pending_edits::pending_edits(cx).locked {
+            label: if crate::inspector::edits::pending_edits(cx).locked {
                 "Unlock Editing".into()
             } else {
                 "Lock Editing".into()
             },
             callback: Arc::new(|_window, cx| {
-                let locked = !crate::pending_edits::pending_edits(cx).locked;
-                crate::pending_edits::pending_edits_mut(cx).locked = locked;
+                let locked = !crate::inspector::edits::pending_edits(cx).locked;
+                crate::inspector::edits::pending_edits_mut(cx).locked = locked;
             }),
         });
 

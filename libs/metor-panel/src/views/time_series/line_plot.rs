@@ -35,7 +35,7 @@ use super::bounds::PlotBounds;
 use super::gpu::{LineDraw, PlotRenderState};
 use super::override_field::Override;
 use super::{NodeBoundsCache, Trace, expand_y_bounds};
-use crate::offset_parse::TimeRangeBehavior;
+use crate::views::time_series::time_range::TimeRangeBehavior;
 use crate::wait_for_component;
 
 /// Per-trace tracking state keyed by the trace entity's [`EntityId`].
@@ -443,7 +443,7 @@ fn derive_title(traces: &[Entity<Trace>], db: &Arc<DB>, cx: &gpui::App) -> Share
         .iter()
         .map(|comp_id| {
             let indexes = &groups[comp_id];
-            let all_elements = crate::trace_picker::element_names_for_component(db, *comp_id);
+            let all_elements = crate::inspector::trace_picker::element_names_for_component(db, *comp_id);
             let comp_name = db
                 .with_state(|s| s.get_component_metadata(*comp_id).map(|m| m.name.clone()))
                 .unwrap_or_default();
