@@ -1,13 +1,9 @@
-//! Per-viewer orbit camera state and the math for turning mouse/scroll
-//! deltas into new yaw/pitch/distance/target values.
-//!
-//! The camera is purely GPUI-side data. The owning `Viewer3d` calls
-//! [`BevyBridge::set_camera`] each time the pose changes; keeping the math
-//! out of the Bevy systems makes it easy to unit-test.
+//! Orbit-camera state and input math, kept on the gpui side so the
+//! Bevy world only ever sees the final resolved [`Transform`].
 
 use glam::Vec3;
 
-/// An orbit camera rotating around a world-space target point.
+/// Orbit camera: spherical coordinates around a world-space target.
 #[derive(Clone, Copy, Debug)]
 pub struct OrbitCamera {
     pub target: Vec3,
@@ -29,35 +25,35 @@ impl Default for OrbitCamera {
     }
 }
 
-/// Clamp pitch to avoid gimbal flip at the poles.
+/// Pitch clamp; avoids gimbal flip at the poles.
 const PITCH_LIMIT: f32 = std::f32::consts::FRAC_PI_2 - 0.01;
 
 impl OrbitCamera {
-    /// Apply a rotation delta from a mouse drag in pixels. Negative dy looks
-    /// down; positive dx yaws right. Matches the convention used by most
-    /// 3D tools on first try.
+    /// Apply a pixel-space rotation drag. Positive `dx` yaws right; positive
+    /// `dy` pitches up (matches Blender/Maya conventions).
     pub fn rotate(&mut self, dx: f32, dy: f32) {
         const RADIANS_PER_PIXEL: f32 = 0.005;
         self.yaw -= dx * RADIANS_PER_PIXEL;
         self.pitch = (self.pitch + dy * RADIANS_PER_PIXEL).clamp(-PITCH_LIMIT, PITCH_LIMIT);
     }
 
-    /// Pan the target in the camera's local right/up plane. The pan speed
-    /// scales with the distance so far-away views don't feel sluggish.
+    /// Translate the target in camera-local right/up.
+    ///
+    /// Pan speed scales with orbit distance so far-away views pan at a
+    /// comparable on-screen rate to close-ups.
     pub fn pan(&mut self, dx: f32, dy: f32) {
         let pan_speed = self.distance * 0.0015;
         let (right, up) = self.right_up();
         self.target += -right * dx * pan_speed + up * dy * pan_speed;
     }
 
-    /// Zoom in or out by a scroll delta. Positive `delta` moves the camera
-    /// away from the target.
+    /// Multiplicatively adjust orbit distance. Positive `delta` zooms out.
     pub fn zoom(&mut self, delta: f32) {
         let factor = (1.0 + delta * 0.0015).clamp(0.5, 2.0);
         self.distance = (self.distance * factor).clamp(0.1, 10_000.0);
     }
 
-    /// World-space eye position implied by the current spherical coords.
+    /// World-space eye position implied by the current orbit state.
     pub fn eye(&self) -> Vec3 {
         let cp = self.pitch.cos();
         let offset = Vec3::new(
@@ -68,7 +64,7 @@ impl OrbitCamera {
         self.target + offset
     }
 
-    /// The camera's local right and up axes, used for panning.
+    /// Camera-local right and up axes; used to resolve pan offsets.
     fn right_up(&self) -> (Vec3, Vec3) {
         let forward = (self.target - self.eye()).normalize_or_zero();
         let world_up = Vec3::Y;

@@ -1,30 +1,23 @@
-//! GPU-accelerated plot renderer.
+//! GPU pipeline shared by every line plot in the panel.
 //!
-//! A single process-wide [`PlotGpu`] (a [`gpui::Global`]) owns the wgpu
-//! pipelines, shared storage buffers, and a cross-plot [`ValueCache`].
-//! Each call site — the `TimeSeriesPlot` panel, `Monitor` sparklines,
-//! and the `ComponentTable` row sparklines — owns one lightweight
-//! [`PlotRenderState`] that carries its per-instance render target,
-//! the frame currently blitted on its canvas, and an "in-flight" flag.
+//! A single process-wide [`PlotGpu`] global owns the wgpu pipelines and
+//! shared storage buffers. Each caller holds a lightweight
+//! [`PlotRenderState`] carrying its own off-screen target and the frame
+//! currently blitted to its canvas.
 //!
-//! Control flow per frame:
-//!
-//! 1. Caller builds a `&[LineDraw]` from whatever traces it wants to
-//!    render and calls [`PlotRenderState::render`] from inside its
-//!    canvas prepaint closure.
-//! 2. `render` lazy-inits the global, reuses or rebuilds the per-caller
-//!    render target, submits the draw to wgpu, and returns a
-//!    [`ReadbackHandle`] (`None` if a previous readback is still in
-//!    flight or there's nothing to draw).
-//! 3. The caller forwards the handle to [`ReadbackHandle::spawn_and_set`],
-//!    which runs the staging-buffer read on a background worker, wraps
-//!    the bytes into a `gpui::RenderImage`, and stores it back into the
-//!    per-caller state via a pointer-to-field supplied by the caller.
-//! 4. The caller's canvas paint closure blits `state.current_frame()`.
+//! Frame lifecycle:
+//! 1. Caller passes a `&[LineDraw]` to [`PlotRenderState::render`] from
+//!    inside a canvas prepaint closure.
+//! 2. `render` resizes or allocates the per-caller target, submits the
+//!    draw, and returns a [`ReadbackHandle`]. `None` when a previous
+//!    readback is still in flight or the scene is empty.
+//! 3. The caller passes the handle to [`ReadbackHandle::spawn_and_set`],
+//!    which reads the staging buffer on a background worker, builds a
+//!    `RenderImage`, and installs it back via a field accessor.
+//! 4. The paint closure blits `state.current_frame()`.
 
-// `bytemuck::Pod`/`Zeroable` derives expand into helper items rustc can't
-// see through, producing spurious dead-code warnings on the uniform
-// structs whose fields are only read via `bytemuck::bytes_of`.
+// Uniform fields are only read via `bytemuck::bytes_of`, which the
+// dead-code lint can't see through the Pod/Zeroable derive expansions.
 #![allow(dead_code)]
 
 use std::sync::Arc;
@@ -51,8 +44,7 @@ const NS_PER_SEC: f64 = 1.0e9;
 const UNIFORM_ALIGN: u64 = 256;
 const MAX_TRACES: usize = 64;
 
-/// One trace's worth of data the renderer needs each frame. Callers
-/// build a slice of these per paint.
+/// Draw inputs for one trace; callers build a slice of these per paint.
 pub(crate) struct LineDraw<'a> {
     pub component_id: ComponentId,
     pub component: &'a Component,
@@ -62,35 +54,35 @@ pub(crate) struct LineDraw<'a> {
     pub stroke_width: f32,
 }
 
-/// Round `needed_stride` to the nearest power of 4 (minimum 1). Quantizing
-/// the decimation factor this way keeps sampled indices stable under small
-/// zoom deltas (no visible "crawl") while letting the upload size scale
-/// unboundedly with data volume — so we never over-upload at extreme zoom-
-/// outs the way a fixed LOD cap did.
+/// Snap a decimation stride to the nearest power of 4.
+///
+/// Power-of-4 quantization keeps the sampled index set stable across small
+/// zoom deltas (no "crawling" of rendered points), and scales the upload
+/// unboundedly with data volume so extreme zoom-outs don't over-upload
+/// the way a fixed LOD cap would.
 fn quantize_stride(needed_stride: usize) -> usize {
     let n = needed_stride.max(1);
     let log2 = n.ilog2();
-    // Candidates: largest power of 4 ≤ n, and the next one up.
     let floor_p = 1usize << (log2 & !1);
-    // Geometric midpoint between floor_p and floor_p*4 is 2*floor_p.
+    // `2 * floor_p` is the geometric midpoint between `floor_p` and `4 * floor_p`.
     if n >= floor_p * 2 { floor_p * 4 } else { floor_p }
 }
 
-/// Per-frame bump allocator over the shared `x_buf` / `y_buf`. Every
-/// `submit` resets `cursor` to 0 and traces bump-allocate their
-/// windowed uploads as they plan. Cross-frame reuse is intentionally
-/// absent — the decimation math in `plan_trace` keeps each per-trace
-/// upload at ~`pixel_budget` samples regardless of node size, so
-/// per-frame re-upload is cheap and avoids the cross-trace aliasing
-/// that a shared LRU cache is prone to.
+/// Per-frame bump allocator over the shared x/y storage buffers.
+///
+/// Cross-frame reuse is intentional dead weight here: decimation keeps each
+/// trace's upload at ~`pixel_budget` samples regardless of source size, so
+/// re-upload is cheap and we sidestep the aliasing problems a shared LRU
+/// cache would have across traces.
 struct ValueCache {
-    /// Next free sample slot, in samples (× 4 bytes for byte offset).
-    /// Reset at the start of every `submit`.
+    /// Next free slot in samples (×4 bytes for the byte offset). Reset at
+    /// the start of every `submit`.
     cursor: u32,
-    /// Reference epoch for the x axis, in nanoseconds. All uploaded x
-    /// values are `f32` seconds relative to this. Set lazily on first
-    /// upload so the dynamic range stays small enough for `f32` to
-    /// keep useful precision. Shared across plots.
+    /// Common epoch for all uploaded timestamps (nanoseconds).
+    ///
+    /// X values are uploaded as `f32` seconds relative to this epoch; the
+    /// epoch is lazy-initialized so the dynamic range stays small enough
+    /// for `f32` precision to hold.
     epoch_ns: Option<i64>,
 }
 
@@ -102,11 +94,11 @@ impl ValueCache {
         }
     }
 
-    /// Convert and upload the decimated samples `[lod_start..lod_end)`
-    /// of one visible node into the shared value buffers at the current
-    /// cursor, then bump the cursor. Returns the `(offset, count)` the
-    /// caller should record indices against, or `None` if the per-frame
-    /// working set would overflow `VALUE_CAPACITY`.
+    /// Upload decimated samples `[lod_start..lod_end)` of one node.
+    ///
+    /// Bumps `cursor` by the uploaded count. Returns `None` when either
+    /// the node is empty or the per-frame working set would overflow
+    /// `VALUE_CAPACITY`.
     #[allow(clippy::too_many_arguments)]
     fn upload_window(
         &mut self,
@@ -176,8 +168,10 @@ struct LineUniform {
     _pad: [f32; 3],
 }
 
-/// Per-caller off-screen target: MSAA + resolve + staging buffer sized
-/// to the caller's current pixel bounds.
+/// Off-screen render target owned by one caller.
+///
+/// Wraps the MSAA color attachment, its resolve texture, and a
+/// host-readable staging buffer, all sized to the caller's canvas.
 struct RenderTarget {
     width: u32,
     height: u32,
@@ -238,9 +232,10 @@ impl RenderTarget {
     }
 }
 
-/// Handle returned by [`PlotRenderState::render`] when a new frame is
-/// submitted. Call [`Self::spawn_and_set`] (or [`Self::read_image`]
-/// directly) on a background worker to drive the readback.
+/// Cookie representing an in-flight staging buffer readback.
+///
+/// Drive it to completion via [`ReadbackHandle::spawn_and_set`] on the
+/// gpui side or [`ReadbackHandle::read_image`] directly on a worker.
 pub(crate) struct ReadbackHandle {
     ctx: Arc<GpuContext>,
     staging: wgpu::Buffer,
@@ -251,9 +246,8 @@ pub(crate) struct ReadbackHandle {
 }
 
 impl ReadbackHandle {
-    /// Block the current thread until the GPU finishes, then read the
-    /// mapped staging bytes and build a `RenderImage`. Call from a
-    /// background thread (e.g. via `BackgroundExecutor::spawn`).
+    /// Block until GPU work finishes, unmap the staging buffer, and wrap
+    /// the pixels into a `RenderImage`. Intended for background workers.
     pub(crate) fn read_image(self) -> Option<Arc<RenderImage>> {
         let _ = self.ctx.device.poll(wgpu::PollType::wait_indefinitely());
         let bytes = read_mapped_bytes(
@@ -269,11 +263,12 @@ impl ReadbackHandle {
         Some(Arc::new(RenderImage::new(frames)))
     }
 
-    /// Spawn a background worker that reads the frame back, wraps it
-    /// into a `RenderImage`, and installs it via `access(t).set_frame()`.
-    /// The caller supplies a function pointer pointing at whichever
-    /// field holds its [`PlotRenderState`], so a single line at each
-    /// call site replaces the bg-task + update + notify boilerplate.
+    /// Run the readback on the background executor and install the
+    /// resulting frame via `access(t).set_frame()`.
+    ///
+    /// `access` lets this helper reach whichever field the caller stores
+    /// its [`PlotRenderState`] in, replacing a block of task/update/notify
+    /// boilerplate at every call site.
     pub(crate) fn spawn_and_set<T: 'static>(
         self,
         cx: &mut Context<T>,
@@ -296,8 +291,10 @@ impl ReadbackHandle {
     }
 }
 
-/// Process-wide GPU plot renderer. Lazy-initialized on the first
-/// [`PlotRenderState::render`] call and stored as a [`gpui::Global`].
+/// Global owning the wgpu pipelines and shared storage buffers.
+///
+/// Stored as a [`gpui::Global`] and lazy-initialized on the first
+/// [`PlotRenderState::render`] call.
 pub(super) struct PlotGpu {
     ctx: Arc<GpuContext>,
     line_pipeline: wgpu::RenderPipeline,
@@ -521,10 +518,10 @@ impl PlotGpu {
         })
     }
 
-    /// Submit the GPU render for one plot into the caller's
-    /// [`RenderTarget`]. Returns `true` if any work was actually
-    /// encoded and submitted (caller starts its readback); `false` if
-    /// there was nothing to draw.
+    /// Encode and submit one plot's frame into `target`.
+    ///
+    /// Returns `true` when real work was submitted (the caller starts a
+    /// readback), `false` when every trace decimated to nothing.
     fn submit(
         &mut self,
         target: &RenderTarget,
@@ -579,8 +576,8 @@ impl PlotGpu {
             .queue
             .write_buffer(&self.idx_buf, 0, bytemuck::cast_slice(&self.idx_scratch));
 
-        // Pack all per-trace uniforms into the dynamic uniform buffer so
-        // we can draw everything in a single submit.
+        // Pack every trace's uniform into one dynamic-offset buffer so
+        // the whole frame goes in a single submit.
         let mut live_traces: SmallVec<[(usize, PlotStyle, &TracePlan); 8]> = SmallVec::new();
         for (i, (trace, plan)) in traces.iter().zip(plans.iter()).enumerate() {
             if plan.spans.is_empty() || i >= MAX_TRACES {
@@ -686,10 +683,8 @@ impl PlotGpu {
     }
 }
 
-/// Per-caller render state: owns one [`RenderTarget`] sized to the
-/// caller's bounds, the frame currently blitted to its canvas, and the
-/// in-flight flag that back-pressures submissions while a readback is
-/// still outstanding.
+/// Caller-local render state: target, blitted frame, and the in-flight
+/// flag that back-pressures submissions while a readback is outstanding.
 pub(crate) struct PlotRenderState {
     target: Option<RenderTarget>,
     current_frame: Option<Arc<RenderImage>>,
@@ -709,11 +704,12 @@ impl Default for PlotRenderState {
 }
 
 impl PlotRenderState {
-    /// Submit a fresh render for this plot. Lazy-inits [`PlotGpu`] the
-    /// first time it's called; returns `None` if GPU context is
-    /// unavailable, the caller has a readback still in flight, the
-    /// bounds are zero, there are no visible traces, or nothing ends
-    /// up being drawn after decimation.
+    /// Submit a frame for this plot.
+    ///
+    /// Returns `None` when a prior readback is still in flight, the GPU
+    /// context is unavailable, the bounds are degenerate, or every trace
+    /// decimated to nothing. [`PlotGpu`] is lazy-initialized on the first
+    /// call that reaches wgpu.
     pub(crate) fn render(
         &mut self,
         cx: &mut gpui::App,
@@ -764,21 +760,18 @@ impl PlotRenderState {
         })
     }
 
-    /// Replace the current frame with a freshly-read `RenderImage`,
-    /// parking the old frame for release from gpui's sprite atlas on
-    /// the next paint.
+    /// Install a newly-read frame and park the previous one for release.
     pub(crate) fn set_frame(&mut self, image: Arc<RenderImage>) {
         self.pending_release = self.current_frame.replace(image);
     }
 
-    /// Clone the current frame handle for blitting via `paint_image`.
     pub(crate) fn current_frame(&self) -> Option<Arc<RenderImage>> {
         self.current_frame.clone()
     }
 
-    /// Take the frame waiting to be released from gpui's sprite atlas.
-    /// The caller passes each entry to `window.drop_image` inside the
-    /// prepaint closure that has `&mut Window` access.
+    /// Take the previous frame so the caller can pass it to
+    /// `window.drop_image`, which needs `&mut Window` access only
+    /// available inside the prepaint closure.
     pub(crate) fn take_pending_release(&mut self) -> Option<Arc<RenderImage>> {
         self.pending_release.take()
     }
@@ -803,8 +796,7 @@ fn read_mapped_bytes(
     out
 }
 
-/// One contiguous range of `idx_buf` instances belonging to a single
-/// trace.
+/// Contiguous run of instance indices that belong to one trace.
 struct DrawSpan {
     instance_start: u32,
     instance_end: u32,
@@ -814,8 +806,8 @@ struct TracePlan {
     spans: Vec<DrawSpan>,
 }
 
-/// Resolve the visible nodes for one trace, ensure each is resident in
-/// the value cache, and emit decimated indices into `idx_scratch`.
+/// Walk one trace's visible nodes, decimate, upload to the value cache,
+/// and emit draw spans referenced by `idx_scratch`.
 #[allow(clippy::too_many_arguments)]
 fn plan_trace(
     ctx: &GpuContext,
@@ -856,9 +848,8 @@ fn plan_trace(
         let full = node.full_timestamps();
         let slice_start_idx =
             unsafe { visible.as_ptr().offset_from(full.as_ptr()).max(0) as usize };
-        // Pull one extra sample past each end of the visible range so
-        // the segments that cross the viewport boundary are drawn (and
-        // clipped by the GPU) instead of being dropped.
+        // Extend one sample past each boundary so segments crossing the
+        // edge are drawn and clipped by the GPU rather than dropped.
         let ext_start_idx = slice_start_idx.saturating_sub(1);
         let ext_end_idx = (slice_start_idx + visible_len + 1).min(full.len());
 
@@ -908,8 +899,10 @@ fn plan_trace(
     TracePlan { spans }
 }
 
-/// Compute per-node stride for two-level decimation. Returns the step
-/// between sample indices within a node, or `None` to skip it entirely.
+/// Pick the decimation stride for one node.
+///
+/// Shares the pixel budget proportionally across nodes by length; returns
+/// `None` when this node deserves zero samples (skip it entirely).
 fn node_stride(node_len: usize, total: usize, pixel_budget: usize) -> Option<usize> {
     if node_len == 0 || total == 0 || pixel_budget == 0 {
         return None;
@@ -921,9 +914,8 @@ fn node_stride(node_len: usize, total: usize, pixel_budget: usize) -> Option<usi
     Some((node_len / node_budget).max(1))
 }
 
-/// Primitive types that can be read from a byte buffer and converted to
-/// f64. Shared between `convert_values_strided` and the upstream trace
-/// planner.
+/// Primitive types read directly from a mapped byte buffer during
+/// decimation. `to_f64` centralises widening.
 pub(super) trait PlotValue: zerocopy::FromBytes + Copy + Sized + 'static {
     fn to_f64(self) -> f64;
 }
@@ -950,9 +942,10 @@ impl_plot_value! {
     u64 => |x: u64| x as f64,
 }
 
-/// Read a single element value directly from a raw data buffer. Bool
-/// isn't `FromBytes` (not all bit patterns valid), so callers of the
-/// `PrimType::Bool` branch route through `u8`.
+/// Decode one element at `sample_index` directly from a raw buffer.
+///
+/// `bool` doesn't implement `FromBytes` because not every byte pattern is
+/// valid; callers handle `PrimType::Bool` by routing through `u8`.
 #[inline(always)]
 fn read_value<T: PlotValue>(
     data: &[u8],
@@ -965,8 +958,8 @@ fn read_value<T: PlotValue>(
     T::read_from_bytes(buf).ok().map(|v| v.to_f64())
 }
 
-/// Convert every `lod_stride`-th timestamp in decimated index range
-/// `[from..to)` to `f32` seconds relative to `epoch_ns`.
+/// Materialize every `lod_stride`-th timestamp in `[from..to)` as `f32`
+/// seconds relative to `epoch_ns`.
 fn convert_timestamps_strided(
     timestamps: &[Timestamp],
     lod_stride: usize,
@@ -984,8 +977,7 @@ fn convert_timestamps_strided(
     }
 }
 
-/// Convert every `lod_stride`-th data sample in decimated index range
-/// `[from..to)` for the given element index into f32 values.
+/// Materialize every `lod_stride`-th sample of one element into `f32`.
 fn convert_values_strided(
     schema: &ComponentSchema,
     full_data: &[u8],

@@ -2,8 +2,9 @@ use gpui::{IntoElement, SharedString, Styled, div, prelude::*, px};
 
 use crate::theme::Theme;
 
-/// Compact toggle track+knob used by [`BoolRow`]. Stateless — the caller
-/// decides what to do on click.
+/// Toggle track-and-knob element used by [`BoolRow`].
+///
+/// Purely presentational; the caller owns click routing and state.
 pub fn checkbox(checked: bool, theme: &Theme) -> impl IntoElement {
     let track_color = if checked {
         theme.line_color
@@ -27,10 +28,10 @@ pub fn checkbox(checked: bool, theme: &Theme) -> impl IntoElement {
         .child(knob)
 }
 
-/// Compact tick-box sized to match the cell's text chrome — a 12×12 square
-/// with 2px rounding, filled with the theme accent when checked. Used inline
-/// in [`ComponentValueStrip`] so a bool cell reads as the same kind of box
-/// as its surrounding value cell, not a separate toggle widget.
+/// Cell-sized tick-box used inline with value strips.
+///
+/// Matches the surrounding value-cell chrome so a boolean reads as another
+/// cell rather than a differently-shaped toggle widget.
 pub fn check_square(checked: bool, theme: &Theme) -> impl IntoElement {
     let mut square = div()
         .w(px(12.0))

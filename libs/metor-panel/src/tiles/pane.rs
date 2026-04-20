@@ -11,16 +11,20 @@ use crate::theme::theme;
 const TAB_HEIGHT: f32 = 28.0;
 const TAB_CLOSE_SIZE: f32 = 16.0;
 
-/// Events emitted by a Pane to its parent TileGroup.
+/// Messages a pane sends to the [`TileGroup`](super::TileGroup) that owns it.
+///
+/// Splits and removals happen at the tile-group level so the whole tree can
+/// be mutated coherently; the pane only signals what the user wanted.
 pub enum PaneEvent {
-    /// A tab was dropped on an edge zone, requesting a split.
+    /// Drop landed on an edge zone: create a sibling pane holding `item`.
     Split {
         direction: SplitDirection,
         item: Box<dyn PaneItemHandle>,
     },
-    /// The pane has no more items and should be removed.
+    /// Last tab was closed; tile group may drop the pane entirely.
     Empty,
-    /// User requested to inspect/edit a panel item (e.g. via right-click).
+    /// User requested an inspector anchored at `position` (typically from a
+    /// tab's right-click).
     Inspect {
         item: Box<dyn PaneItemHandle>,
         position: Point<Pixels>,
@@ -29,8 +33,11 @@ pub enum PaneEvent {
 
 impl EventEmitter<PaneEvent> for Pane {}
 
-/// A tab container within a [`TileGroup`](super::TileGroup). Holds multiple [`PaneItem`](super::PaneItem)s
-/// as tabs, with drag-and-drop support for reordering and splitting.
+/// A tabbed container for [`PaneItem`](super::PaneItem)s.
+///
+/// Handles local concerns only: tab switching, close, reordering, and drag
+/// hit-testing against split zones. Cross-pane moves and splits are raised as
+/// [`PaneEvent`]s for the tile group to resolve.
 pub struct Pane {
     items: Vec<Box<dyn PaneItemHandle>>,
     active_index: usize,
@@ -98,7 +105,7 @@ impl Pane {
         }
     }
 
-    /// Handle a drop on the tab bar — always insert as a tab, never split.
+    /// Tab-bar drops always insert as a new tab, regardless of cursor position.
     fn handle_tab_bar_drop(
         &mut self,
         dragged: &DraggedTab,
@@ -110,7 +117,8 @@ impl Pane {
         self.drop_tab(dragged, target_ix, cx);
     }
 
-    /// Handle a drop on the content area — check split zones first.
+    /// Content-area drops split the pane when near an edge, otherwise insert
+    /// as a tab.
     fn handle_content_drop(
         &mut self,
         dragged: &DraggedTab,
@@ -122,8 +130,8 @@ impl Pane {
         if let Some(direction) = detect_split_zone(window.mouse_position(), self.content_bounds) {
             let same_pane = cx.entity().entity_id() == dragged.pane.entity_id();
             if same_pane {
-                // Splitting from our own pane: remove first, then emit split.
-                // This avoids re-entrant update on the same entity.
+                // Re-entrant update on the same entity is forbidden; remove
+                // the tab locally before asking the tile group to split.
                 let item = dragged.item.clone_handle();
                 self.remove_item(dragged.ix, cx);
                 cx.emit(PaneEvent::Split { direction, item });

@@ -5,11 +5,13 @@ use gpui::{AnyElement, App, SharedString, Window, div, prelude::*, px};
 use super::{InspectorRow, RowAction, row_base};
 use crate::theme::theme;
 
-/// One-shot action row (e.g., "Reset Camera", "Add Model").
+/// Row that runs a callback once and dismisses the inspector.
+///
+/// Used for leaf actions like "Reset Camera" or "Add Model" where there's
+/// no follow-up page.
 pub struct CommandRow {
     pub label: SharedString,
     pub callback: Arc<dyn Fn(&mut Window, &mut App)>,
-    /// Optional category pill rendered to the right of the label.
     tag: Option<SharedString>,
 }
 

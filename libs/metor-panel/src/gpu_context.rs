@@ -1,15 +1,13 @@
-//! Process-wide wgpu device shared by all GPU-accelerated elements.
+//! Shared wgpu resources reused by every GPU-backed view.
 //!
-//! Both the time-series line renderer and the 3D viewer's Bevy bridge hold an
-//! `Arc<GpuContext>` so they render against the same adapter, device, and
-//! queue. Bevy needs the `instance` and `adapter` in addition to the device
-//! and queue to satisfy `RenderCreation::Manual`, which is why they're exposed
-//! here even though the line renderer only uses `device` and `queue`.
+//! The time-series renderer and the 3D viewer both target the same device and
+//! queue so they can be composited by gpui without cross-device copies. Bevy's
+//! `RenderCreation::Manual` additionally needs the `instance` and `adapter`,
+//! which is why those are exposed here.
 
 use std::sync::{Arc, OnceLock};
 
-/// Lazily-initialized wgpu resources shared across every renderer in the
-/// process. Constructed on first access via [`GpuContext::get`].
+/// Process-wide wgpu handles, created lazily on first [`GpuContext::get`].
 pub struct GpuContext {
     pub instance: wgpu::Instance,
     pub adapter: wgpu::Adapter,
@@ -18,8 +16,9 @@ pub struct GpuContext {
 }
 
 impl GpuContext {
-    /// Return the process-wide context, creating it on the first call. Returns
-    /// `None` if no adapter is available (e.g. a headless CI host with no GPU).
+    /// Return the shared context. Returns `None` when no adapter is available
+    /// (typical of headless CI hosts); views should fall back to a no-GPU path
+    /// rather than panic.
     pub fn get() -> Option<Arc<GpuContext>> {
         static CTX: OnceLock<Option<Arc<GpuContext>>> = OnceLock::new();
         CTX.get_or_init(|| match pollster::block_on(Self::create()) {
@@ -42,11 +41,8 @@ impl GpuContext {
             })
             .await
             .map_err(|e| format!("no wgpu adapter: {e:?}"))?;
-        // Enable the full adapter feature set so Bevy's PBR pipelines (SSAO,
-        // cluster assignment, mipmap downsampling) can create their bind
-        // groups. Experimental features are excluded because requesting them
-        // without `InstanceFlags::ALLOW_UNDERLYING_NONCOMPLIANT_ADAPTER` fails
-        // device creation on most drivers.
+        // Bevy's PBR pipelines need the full non-experimental feature set;
+        // experimental features fail device creation without an unsafe flag.
         let experimental = wgpu::Features::EXPERIMENTAL_RAY_QUERY
             | wgpu::Features::EXPERIMENTAL_MESH_SHADER
             | wgpu::Features::EXPERIMENTAL_COOPERATIVE_MATRIX;

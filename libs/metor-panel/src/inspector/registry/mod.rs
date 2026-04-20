@@ -1,10 +1,16 @@
-/// Registry mapping Facet types to inspector row factories and entity adapters.
-///
-/// The registry has two layers:
-/// - **Field widget factories**: produce a single `InspectorRow` for a field
-///   of a given type (e.g., `Hsla` → ColorRow, `ComponentId` → component picker)
-/// - **Type row builders**: produce the full row set for an entity type,
-///   replacing the default reflect walk (e.g., Trace → reflected rows + Remove)
+//! Type-indexed overrides that the reflection walker consults while
+//! turning an entity into an inspector page.
+//!
+//! Two layers coexist:
+//!
+//! - **Field widget factories** replace the default row for a single typed
+//!   field (e.g., `Hsla` renders as a color swatch, `ComponentId` as a picker).
+//! - **Type row builders** replace the whole reflection walk for a given
+//!   entity type, used when a view needs custom rows that don't correspond
+//!   to Facet fields.
+//!
+//! Every registration also installs an [`EntityAdapter`] so the walker can
+//! reach the typed `Peek`/`Poke` from an `AnyEntity`.
 use std::any::TypeId;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -19,55 +25,59 @@ mod builders;
 mod defaults;
 mod dispatch;
 
-/// Context passed to field widget factories.
+/// Inputs threaded to every field widget factory.
 pub struct FieldBuildCtx<'a> {
     pub db: &'a Arc<DB>,
     pub label: SharedString,
     pub field_name: &'static str,
 }
 
-/// Factory that produces a single InspectorRow for a field of a given type.
-/// Receives the owning entity + field index so it can build typed read/write
-/// callbacks via [`crate::inspector::reflect::get_field`] / [`crate::inspector::reflect::set_field`].
+/// Builds a single inspector row for one field.
+///
+/// Receives the owning entity plus the field index, enabling callbacks to
+/// read and write through [`crate::inspector::reflect::get_field`] and
+/// [`crate::inspector::reflect::set_field`] without referring to the
+/// concrete parent type.
 pub type FieldWidgetFactory =
     Arc<dyn Fn(&FieldBuildCtx, &Peek<'_, '_>, AnyEntity, usize) -> Box<dyn InspectorRow>>;
 
-/// Builder that produces the full row set for an entity type.
+/// Builds the complete row set for an entity type, bypassing field reflection.
 pub type TypeRowBuilder = Arc<dyn Fn(AnyEntity, &Arc<DB>, &App) -> Vec<Box<dyn InspectorRow>>>;
 
-/// Visitor type used by [`EntityAdapter::peek`].
 pub(crate) type PeekAdapterVisitor<'v> = dyn FnMut(&Peek<'_, 'static>) + 'v;
-/// Visitor type used by [`EntityAdapter::poke`].
 pub(crate) type PokeAdapterVisitor<'v> = dyn FnMut(Poke<'_, 'static>) + 'v;
 
-/// Adapter letting the reflection walker go from an [`AnyEntity`] to a typed
-/// [`Peek`] or [`Poke`] without the call site knowing the concrete type.
+/// Type-erased bridge from [`AnyEntity`] to Facet `Peek`/`Poke`.
+///
+/// Installed by [`InspectorRegistry::register_inspectable`]; the walker
+/// looks this up to reach typed reflection without knowing the entity's
+/// concrete `T`.
 pub struct EntityAdapter {
     pub(crate) peek: Arc<dyn for<'a, 'v> Fn(&'a AnyEntity, &'a App, &mut PeekAdapterVisitor<'v>)>,
     pub(crate) poke: Arc<dyn for<'v> Fn(&AnyEntity, &mut App, &mut PokeAdapterVisitor<'v>)>,
     pub shape_id: ConstTypeId,
 }
 
-/// Per-field metadata that can't be expressed via Facet attributes.
+/// Non-Facet field metadata that still needs to affect rendering.
+///
+/// Currently carries slider ranges; Facet attributes can't take non-string
+/// literal ranges without parse support at the grammar level.
 #[derive(Clone)]
 pub struct FieldOverride {
     pub range: Option<(f64, f64)>,
 }
 
-/// Handler that builds a NavRow for a `Vec<Entity<T>>` field, given the
-/// parent entity, field label, and db.
+/// Builds the nav row for a `Vec<Entity<T>>` field.
 pub type EntityListHandler =
     Arc<dyn Fn(gpui::AnyEntity, SharedString, &Arc<DB>, &App) -> Box<dyn InspectorRow>>;
 
-/// How the "Add" button behaves in a `Vec<Entity<T>>` list.
-///
-/// `Default` creates an item immediately. `Wizard` cascades to a
-/// multi-step page that gathers required fields before creating.
+/// How the "Add" affordance works inside a `Vec<Entity<T>>` list.
 pub enum AddBehavior<T: 'static> {
-    /// Instant creation with a default value factory.
+    /// Push a freshly-defaulted item with no user interaction.
     Default(Arc<dyn Fn(&mut App) -> T>),
-    /// Multi-step wizard. Receives the parent entity so the wizard
-    /// can push the created item into the list.
+    /// Cascade into a multi-step wizard that eventually appends the item.
+    /// The closure receives the parent entity so the wizard knows where to
+    /// write the result.
     Wizard(Arc<dyn Fn(AnyEntity, &Arc<DB>, &App) -> Vec<Box<dyn InspectorRow>>>),
 }
 
@@ -80,17 +90,16 @@ impl<T: 'static> Clone for AddBehavior<T> {
     }
 }
 
+/// Single global holding every field, type, and list override.
+///
+/// Install once at startup via [`InspectorRegistry::init`]; thereafter it's
+/// read-only from the render thread.
 pub struct InspectorRegistry {
     field_widgets: HashMap<ConstTypeId, FieldWidgetFactory>,
     type_builders: HashMap<TypeId, TypeRowBuilder>,
     field_overrides: HashMap<(ConstTypeId, &'static str), FieldOverride>,
-    /// Handlers for Vec<Entity<T>> fields, keyed by the ConstTypeId of
-    /// Vec<Entity<T>> (the field type, not the item type).
+    /// Keyed by the `ConstTypeId` of `Vec<Entity<T>>` itself, not of `T`.
     entity_list_handlers: HashMap<ConstTypeId, EntityListHandler>,
-    /// Typed `AnyEntity` → `Peek`/`Poke` bridges, keyed by the gpui `TypeId`
-    /// of the entity's inner value. Populated alongside any Facet-bounded
-    /// registration (`register_field_override`, `register_entity_list`) and
-    /// directly via [`Self::register_inspectable`].
     entity_adapters: HashMap<TypeId, Arc<EntityAdapter>>,
 }
 
@@ -130,15 +139,19 @@ impl InspectorRegistry {
         self.field_widgets.insert(T::SHAPE.id, factory);
     }
 
-    /// Register a custom override that replaces the default adapter-driven
-    /// walk for this entity type. Used for types that need extra non-Facet
-    /// rows (e.g. Viewer3d) or a completely custom page (e.g. DashboardPanel).
+    /// Replace the reflection walk for `T` with a custom row builder.
+    ///
+    /// Used when a view needs rows that don't map onto Facet fields (e.g.
+    /// `Viewer3d`'s gizmo controls, `DashboardPanel`'s widget grid).
     pub fn register_type_builder<T: 'static>(&mut self, builder: TypeRowBuilder) {
         self.type_builders.insert(TypeId::of::<T>(), builder);
     }
 
-    /// Register an `AnyEntity`→`Peek`/`Poke` adapter for a Facet type so the
-    /// reflection walker can inspect it without knowing its concrete `T`.
+    /// Install the `AnyEntity`↔`Peek`/`Poke` bridge for `T`.
+    ///
+    /// Called automatically by the higher-level registration helpers; only
+    /// call directly when registering a type that has no field widgets or
+    /// list handlers but still needs to be inspected.
     pub fn register_inspectable<T: Facet<'static> + 'static>(&mut self) {
         let peek: Arc<dyn for<'a, 'v> Fn(&'a AnyEntity, &'a App, &mut PeekAdapterVisitor<'v>)> =
             Arc::new(|any_entity, cx, visit| {
@@ -177,9 +190,11 @@ impl InspectorRegistry {
         self.entity_list_handlers.get(&field_type_id)
     }
 
-    /// Register a handler for a `Vec<Entity<T>>` field type.
-    /// When the walker sees this field type, it delegates to this handler
-    /// instead of the generic scalar/enum/struct fallback.
+    /// Register behavior for a `Vec<Entity<ItemT>>` field on `ParentT`.
+    ///
+    /// Produces a nav row that lists items, cascades into each one's
+    /// reflected inspector, and offers an "Add" affordance whose behavior
+    /// is controlled by [`AddBehavior`].
     pub fn register_entity_list<
         ParentT: Facet<'static> + 'static,
         ItemT: Facet<'static> + 'static,

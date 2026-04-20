@@ -2,7 +2,10 @@ use std::borrow::Cow;
 
 use gpui::{AssetSource, Hsla, Result, SharedString, Styled, Svg, px, svg};
 
-/// Embedded SVG icon assets (Lucide icons, MIT license), compiled into the binary.
+/// [`AssetSource`] for the icon set compiled into the binary.
+///
+/// Installed once via `Application::with_assets` so `svg()` elements can
+/// reference icons by their `icons/...` path without filesystem access.
 pub struct IconAssets;
 
 impl AssetSource for IconAssets {
@@ -61,7 +64,10 @@ impl AssetSource for IconAssets {
     }
 }
 
-/// Available icons (Lucide equivalents of the metor-ui icon set).
+/// Typed handle for every icon bundled with the panel.
+///
+/// Use variants instead of raw asset paths so the compiler catches renames
+/// and removed assets.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Icon {
     Add,
@@ -142,8 +148,9 @@ impl Icon {
         }
     }
 
-    /// Create an SVG element for this icon at the given size.
-    /// Uses `text_color` as the tint — defaults to the theme's secondary text.
+    /// Build an [`Svg`] sized in pixels and tinted with the dark theme's
+    /// secondary-text color. Callers that need a different tint should use
+    /// [`Icon::svg_color`].
     pub fn svg(self, size: f32) -> Svg {
         svg()
             .path(SharedString::from(self.asset_path()))
@@ -151,7 +158,7 @@ impl Icon {
             .text_color(crate::theme::DARK.text_secondary)
     }
 
-    /// Create an SVG element with a specific color.
+    /// Build an [`Svg`] sized in pixels and tinted with an explicit color.
     pub fn svg_color(self, size: f32, color: Hsla) -> Svg {
         svg()
             .path(SharedString::from(self.asset_path()))

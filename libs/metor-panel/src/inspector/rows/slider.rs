@@ -24,7 +24,10 @@ impl Render for SliderDrag {
     }
 }
 
-/// Canvas-based drag slider for numeric fields with a range.
+/// Inspector row for a bounded numeric field, rendered as a draggable slider.
+///
+/// Values are rounded to two decimal places on each drag tick to keep
+/// callbacks debounced and the displayed value stable.
 pub struct SliderRow {
     pub label: SharedString,
     pub read_value: Arc<dyn Fn(&App) -> f64>,

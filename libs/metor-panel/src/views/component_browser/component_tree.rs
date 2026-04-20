@@ -6,27 +6,24 @@ use metor_db::DB;
 use metor_proto::types::ComponentId;
 use smallvec::SmallVec;
 
-/// A node in the dot-delimited component namespace tree.
+/// Node in the dot-delimited component namespace tree.
 ///
-/// Each component name like `cube_sat.fsw.imu.accel` contributes a chain of
-/// nodes: `cube_sat`, `fsw`, `imu`, `accel`. A node is a *leaf* when it has a
-/// real component (`component_id.is_some()`) and no further children. A node
-/// can be both a component *and* a branch when a component name is a prefix
-/// of another component's name.
+/// A node can be both a component and a parent: the name `foo.bar` makes
+/// `foo` a branch even when `foo` itself is registered as a component,
+/// which is why `component_id` and `children` can coexist.
 pub struct ComponentNode {
-    /// Last path segment (e.g. `"imu"`).
     pub segment: SharedString,
-    /// Full dot-delimited path from the root (e.g. `"cube_sat.fsw.imu"`).
     pub full_name: SharedString,
-    /// `Some` when this node corresponds to a real component.
     pub component_id: Option<ComponentId>,
-    /// Direct children keyed by their segment, ordered for stable rendering.
+    /// Children keyed by segment; `BTreeMap` keeps iteration order stable
+    /// so columns don't shuffle between renders.
     pub children: BTreeMap<SharedString, Arc<ComponentNode>>,
 }
 
-/// Build a root node whose children are the top-level namespace segments.
+/// Snapshot every component in `db` into a tree rooted at a synthetic node.
 ///
-/// The returned root is synthetic (empty segment / full name, no `component_id`).
+/// The synthetic root has empty `segment` and `full_name` and no
+/// `component_id`; its children are the first-level namespace segments.
 pub fn build_tree(db: &DB) -> Arc<ComponentNode> {
     let mut root = Builder::new(SharedString::new_static(""), String::new());
     db.with_state(|state| {
@@ -37,8 +34,8 @@ pub fn build_tree(db: &DB) -> Arc<ComponentNode> {
     Arc::new(root.freeze())
 }
 
-/// Walk the tree one segment at a time, returning the chain of resolved nodes.
-/// Truncates at the first missing segment.
+/// Resolve `path` to the chain of nodes reached, stopping at the first
+/// missing segment. The returned chain has at most `path.len()` entries.
 pub fn resolve_path(
     root: &Arc<ComponentNode>,
     path: &[SharedString],

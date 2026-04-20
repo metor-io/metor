@@ -6,8 +6,10 @@ use super::{InspectorRow, RowAction, row_base};
 use crate::icons::Icon;
 use crate::theme::theme;
 
-/// Enum picker row. Displays the current selection and cascades to an
-/// option list on activation.
+/// Inspector row for an enum field.
+///
+/// The summary shows the current variant; activation cascades into a list
+/// with one [`EnumOptionRow`] per declared variant.
 pub struct EnumRow {
     pub label: SharedString,
     pub selected: SharedString,
@@ -74,7 +76,6 @@ impl InspectorRow for EnumRow {
     }
 }
 
-/// A single option in an enum picker cascade.
 struct EnumOptionRow {
     label: SharedString,
     value: String,

@@ -7,7 +7,10 @@ use super::{InspectorRow, RowAction, row_base};
 use crate::icons::Icon;
 use crate::theme::theme;
 
-/// Color swatch row that cascades to H/S/L/A slider sub-rows.
+/// Row for [`Hsla`] fields.
+///
+/// Shows a color swatch and cascades into four slider rows (H, S, L, A) so
+/// the user can tune each channel without leaving the inspector.
 pub struct ColorRow {
     pub label: SharedString,
     pub color: Hsla,

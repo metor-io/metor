@@ -8,52 +8,55 @@ use metor_proto::types::Msg;
 
 use crate::inspector::rows::{CommandRow, DefaultActionRow, InspectorRow, NavRow};
 
-/// A pending edit to a component's value, accumulated until the user commits it.
+/// A staged edit to a single component, held until the user applies it.
+///
+/// The full [`ComponentValue`] is stored because the wire protocol updates
+/// components atomically; `modified_elements` tracks which indices the user
+/// actually touched so the review UI can show a concise summary.
 #[derive(Clone)]
 pub struct PendingEdit {
     pub component_id: ComponentId,
     pub component_name: SharedString,
     pub value: ComponentValue,
-    /// Element indices that were modified, for display in the review UI.
     pub modified_elements: Vec<usize>,
-    /// Element labels for display.
     pub element_names: Vec<SharedString>,
 }
 
-/// A request from a value box click to open an edit palette. The AppRoot
-/// drains this on render and opens the palette.
+/// A request to open the editor palette, raised by a value-cell click.
+///
+/// The handler stashes this on the global [`PendingEdits`]; `AppRoot` drains
+/// it during the next render, which is where a new inspector entity can be
+/// created with access to [`Window`].
 #[derive(Clone)]
 pub struct EditRequest {
     pub component_id: ComponentId,
     pub component_name: SharedString,
     pub element_names: Vec<SharedString>,
     pub element_index: usize,
-    /// Window-space position for anchoring the inspector near the clicked
-    /// cell. `None` falls back to centered.
+    /// Click position used to anchor the editor. `None` falls back to a
+    /// centered palette.
     pub anchor: Option<Point<Pixels>>,
 }
 
-/// Global store for the editor lock state and accumulated pending edits.
+/// Global holding the edit queue plus the cross-view signalling flags that
+/// let click handlers defer UI work to the next render.
 #[derive(Default)]
 pub struct PendingEdits {
     pub edits: Vec<PendingEdit>,
-    /// True when editing is locked (default). Cmd+L toggles.
+    /// When true, writable cells render as read-only; Cmd+L toggles.
     pub locked: bool,
-    /// Set by click handlers; AppRoot drains this each render.
     pub pending_request: Option<EditRequest>,
-    /// Set when a click wants to open the review palette.
     pub open_review_requested: bool,
 }
 
 impl Global for PendingEdits {}
 
 impl PendingEdits {
-    /// Returns the existing pending edit for a component, if any.
     pub fn get(&self, id: ComponentId) -> Option<&PendingEdit> {
         self.edits.iter().find(|e| e.component_id == id)
     }
 
-    /// Inserts or updates the pending edit for a component.
+    /// Replace the pending edit for a component, or insert if absent.
     pub fn upsert(&mut self, edit: PendingEdit) {
         if let Some(existing) = self.edits.iter_mut().find(|e| e.component_id == edit.component_id) {
             *existing = edit;
@@ -62,13 +65,12 @@ impl PendingEdits {
         }
     }
 
-    /// Removes the pending edit for a component.
     pub fn remove(&mut self, id: ComponentId) {
         self.edits.retain(|e| e.component_id != id);
     }
 }
 
-/// Initialize the global state. Call once at app startup.
+/// Install the global. Call once at app startup before any edit-UI runs.
 pub fn init(cx: &mut App) {
     cx.set_global(PendingEdits {
         edits: Vec::new(),
@@ -78,17 +80,15 @@ pub fn init(cx: &mut App) {
     });
 }
 
-/// Convenience read accessor.
 pub fn pending_edits(cx: &App) -> &PendingEdits {
     cx.global::<PendingEdits>()
 }
 
-/// Convenience write accessor.
 pub fn pending_edits_mut(cx: &mut App) -> &mut PendingEdits {
     cx.global_mut::<PendingEdits>()
 }
 
-/// Send a single pending edit to the FSW via the DB message log.
+/// Encode `edit` as an [`UpdateComponent`] message and push it to the DB log.
 pub fn apply_edit(db: &DB, edit: &PendingEdit) {
     let update = UpdateComponent {
         id: edit.component_id,
@@ -98,10 +98,13 @@ pub fn apply_edit(db: &DB, edit: &PendingEdit) {
     let _ = db.push_msg(Timestamp::now(), UpdateComponent::ID, &bytes);
 }
 
-/// Commit the pending edit for `component_id` and drop `element_index` from
-/// its modified list. The wire protocol is component-scoped, so the full
-/// `ComponentValue` (including any other modified elements) is sent; only
-/// `element_index` is removed from the pending UI state.
+/// Apply a pending component edit and remove `element_index` from its list
+/// of modified elements.
+///
+/// Protocol updates are component-wide, so the full [`ComponentValue`]
+/// (including other modified indices) is still sent; only the UI's
+/// "modified" tracking is narrowed. Once the list empties the whole pending
+/// edit is dropped.
 pub fn apply_element(db: &DB, component_id: ComponentId, element_index: usize, cx: &mut App) {
     let Some(edit) = pending_edits(cx).get(component_id).cloned() else {
         return;
@@ -120,7 +123,7 @@ pub fn apply_element(db: &DB, component_id: ComponentId, element_index: usize, c
     }
 }
 
-/// Build the inspector rows that list pending edits with apply/discard actions.
+/// Rows for the review palette: one per pending edit plus bulk apply/discard.
 pub fn review_rows(db: Arc<DB>, cx: &App) -> Vec<Box<dyn InspectorRow>> {
     let edits = pending_edits(cx).edits.clone();
 
@@ -187,8 +190,9 @@ fn summarize_edit(edit: &PendingEdit) -> SharedString {
     SharedString::from(format!("{}: {}", edit.component_name, parts.join(", ")))
 }
 
-/// Build inspector rows listing all components. Selecting one cascades into an
-/// element picker, which then opens the value editor.
+/// Top-level component picker for the "update component" palette action.
+///
+/// Selecting a row drills into an element picker and finally the editor.
 pub fn update_component_rows(db: Arc<DB>) -> Vec<Box<dyn InspectorRow>> {
     let components = crate::inspector::trace_picker::list_components(&db);
     components
@@ -208,8 +212,8 @@ pub fn update_component_rows(db: Arc<DB>) -> Vec<Box<dyn InspectorRow>> {
         .collect()
 }
 
-/// Build inspector rows listing each element of a component, or skip directly
-/// to the editor for scalar / single-element components.
+/// Element picker. Scalar and single-element components skip straight to
+/// the value editor since there's nothing to choose.
 fn select_element_rows(
     db: Arc<DB>,
     component_id: ComponentId,
@@ -262,9 +266,10 @@ fn select_element_rows(
         .collect()
 }
 
-/// Build inspector rows that prompt the user for a new value for a single
-/// element. For enum components, lists each variant; otherwise emits a
-/// [`DefaultActionRow`] that prompts for free-text input.
+/// Value-editor rows for a single element.
+///
+/// Enum components list one row per variant; other types fall back to a
+/// free-text [`DefaultActionRow`] that parses input into the element's type.
 pub fn edit_value_rows(db: Arc<DB>, request: EditRequest) -> Vec<Box<dyn InspectorRow>> {
     let EditRequest {
         component_id,
@@ -327,10 +332,12 @@ pub fn edit_value_rows(db: Arc<DB>, request: EditRequest) -> Vec<Box<dyn Inspect
     })]
 }
 
-/// Upsert a pending edit that replaces the full U8 buffer of a string
-/// component. UTF-8 bytes are written and any remainder is zero-padded so
-/// the receiver sees a properly null-terminated string. `modified_elements`
-/// is `[0]` as a sentinel — strings have no element-level granularity.
+/// Stage a string-component edit by overwriting its `U8` buffer with UTF-8
+/// bytes, zero-padding the remainder so the receiver sees a null-terminated
+/// string.
+///
+/// Strings have no element-level granularity, so the pending edit records
+/// `modified_elements = [0]` as a sentinel.
 pub fn upsert_string_value(
     db: &DB,
     component_id: ComponentId,
@@ -367,9 +374,10 @@ pub fn upsert_string_value(
     merge_pending(cx, component_id, component_name, element_names, 0, value);
 }
 
-/// Upsert a pending edit with an already-typed element value. Used by the
-/// inline editors (checkbox toggle, text field commit) to skip the
-/// string-parse round trip.
+/// Stage an element edit when the caller already has a typed [`ElementValue`].
+///
+/// Used by inline editors (checkboxes, committed text fields) so simple
+/// toggles avoid the string-parse round trip.
 pub fn upsert_element_value(
     db: &DB,
     component_id: ComponentId,
@@ -478,8 +486,8 @@ fn set_element_typed(value: &mut ComponentValue, idx: usize, element: ElementVal
     Some(())
 }
 
-/// Build an updated [`ComponentValue`] by reading the current value, then setting
-/// `element_index` to the parsed input.
+/// Read the component's current value, apply the parsed `input` to
+/// `element_index`, and return the combined [`ComponentValue`].
 fn build_updated_value(
     db: &DB,
     component_id: ComponentId,

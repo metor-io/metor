@@ -2,11 +2,17 @@ use std::{fmt, ops::Range, str::FromStr, time::Duration};
 
 use metor_proto::types::Timestamp;
 
-/// A time offset relative to the earliest or latest timestamp, or a fixed point.
+/// One endpoint of a [`TimeRangeBehavior`].
+///
+/// Relative endpoints track a moving window against live data; the
+/// absolute `Fixed` form pins to a specific wall-clock timestamp.
 #[derive(PartialEq, Eq, Clone, Copy, Debug)]
 pub enum Offset {
+    /// `earliest_timestamp + duration`.
     Earliest(Duration),
+    /// `latest_timestamp - duration`.
     Latest(Duration),
+    /// Absolute epoch.
     Fixed(Timestamp),
 }
 
@@ -30,7 +36,10 @@ impl fmt::Display for Offset {
     }
 }
 
-/// Describes how to compute the visible time window from the data's full range.
+/// Derivation rule for the visible time window.
+///
+/// Resolved against the data's earliest/latest timestamps via
+/// [`TimeRangeBehavior::calculate_range`].
 #[derive(Debug, PartialEq, Eq, Clone, Copy, facet::Facet)]
 #[facet(opaque)]
 pub struct TimeRangeBehavior {
@@ -89,7 +98,7 @@ impl TimeRangeBehavior {
         clamp_range(earliest..latest, start..end)
     }
 
-    /// Common presets for the palette.
+    /// Preset choices offered by the inspector's range picker.
     pub const PRESETS: &[(&str, TimeRangeBehavior)] = &[
         ("Full Range", Self::FULL),
         ("Last 30s", Self::last(Duration::from_secs(30))),
@@ -156,8 +165,10 @@ fn span_to_duration(span: jiff::Span) -> Result<Duration, jiff::Error> {
     ))
 }
 
-/// Parse a string like "- 30s ↔ - 0s" or "LAST 30s" into a [`TimeRangeBehavior`].
-/// Also accepts single offset strings like "- 30s" (interpreted as start, end = latest).
+/// Parse strings produced by `Display` plus a few ergonomic shortcuts.
+///
+/// Accepts `"full"`, `"last 30s"`, `"- 30s ↔ - 0s"`, or a single offset
+/// (interpreted as the start, end defaults to the latest sample).
 impl FromStr for TimeRangeBehavior {
     type Err = ();
 

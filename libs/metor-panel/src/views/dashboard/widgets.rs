@@ -1,9 +1,8 @@
-//! Per-widget-kind factories and leaf renderers (Image / Placeholder).
+//! Widget-kind registry and the leaf renderers that back built-in kinds.
 //!
-//! [`WidgetRegistry`] is a gpui `Global` mapping [`WidgetKind`] → [`WidgetSpec`].
-//! Built-ins are populated by [`WidgetRegistry::register_defaults`]; downstream
-//! consumers can call [`WidgetRegistry::register`] at startup to add custom
-//! kinds or replace built-in specs.
+//! [`WidgetRegistry`] is a gpui `Global` mapping [`WidgetKind`] to its
+//! [`WidgetSpec`]. Downstream consumers can register or override specs at
+//! startup via [`WidgetRegistry::register`].
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -21,10 +20,10 @@ use crate::theme::theme;
 
 use super::{DashboardWidget, WidgetKind};
 
-/// Default size + display label + view factory for one [`WidgetKind`].
+/// Everything the dashboard needs to create and label one [`WidgetKind`].
 ///
-/// Closures use `Arc<dyn Fn>` rather than `fn` pointers so consumers can
-/// register specs that capture state (e.g. shared resources, remote handles).
+/// Uses `Arc<dyn Fn>` so specs can capture owned state (shared resources,
+/// remote handles) instead of being limited to plain function pointers.
 pub struct WidgetSpec {
     pub default_size: (f32, f32),
     pub label: Arc<dyn Fn(&DashboardWidget) -> SharedString>,
@@ -32,9 +31,7 @@ pub struct WidgetSpec {
         Arc<dyn Fn(&serde_json::Value, &Arc<DB>, &mut App) -> (AnyView, gpui::AnyEntity)>,
 }
 
-/// Runtime registry of canvas widget kinds. Initialized once at startup via
-/// [`WidgetRegistry::init`]; consumers register additional kinds via
-/// [`WidgetRegistry::register`] before opening a dashboard.
+/// Global table of every widget kind the dashboard can render.
 pub struct WidgetRegistry {
     specs: HashMap<WidgetKind, Arc<WidgetSpec>>,
 }
@@ -116,17 +113,16 @@ impl WidgetRegistry {
     }
 }
 
-/// Look up a [`WidgetSpec`] for `kind`, falling back to a placeholder spec
-/// when the kind isn't registered (e.g. an unknown kind in a saved layout).
+/// Resolve `kind` to a spec. Unregistered kinds fall back to a placeholder
+/// so a stale saved layout cannot crash the app.
 pub(super) fn widget_spec(kind: &WidgetKind, cx: &App) -> Arc<WidgetSpec> {
     cx.global::<WidgetRegistry>()
         .spec(kind)
         .unwrap_or_else(|| placeholder_spec(kind))
 }
 
-/// Synthesize a `WidgetSpec` that renders a placeholder for an unregistered
-/// kind. Lets dashboards load saved layouts that reference removed kinds
-/// without panicking.
+/// Build a spec that draws a "? unknown kind" placeholder so removed or
+/// renamed kinds degrade gracefully in older saved layouts.
 fn placeholder_spec(kind: &WidgetKind) -> Arc<WidgetSpec> {
     let kind_name = kind.0.clone();
     Arc::new(WidgetSpec {
@@ -142,7 +138,7 @@ fn placeholder_spec(kind: &WidgetKind) -> Arc<WidgetSpec> {
     })
 }
 
-/// Build a widget view plus its inspectable entity handle from saved config.
+/// Build the rendered view and its inspectable entity for a stored widget.
 pub(super) fn create_widget_view(
     kind: &WidgetKind,
     config: &serde_json::Value,
@@ -180,9 +176,8 @@ fn build_plot(
     db: &Arc<DB>,
     cx: &mut App,
 ) -> (AnyView, gpui::AnyEntity) {
-    // The TimeSeriesPlot is the rendered view, but only its inner LinePlot
-    // has registered Facet adapters — expose that as the inspectable entity
-    // so the everything-palette can edit traces.
+    // Only LinePlot has Facet adapters, so expose it — not the outer
+    // TimeSeriesPlot — as the inspectable entity.
     let plot = cx.new(|cx| TimeSeriesPlot::new(db.clone(), vec![], cx));
     let line_plot = plot.read(cx).line_plot().clone();
     (AnyView::from(plot), line_plot.into_any())
@@ -253,7 +248,7 @@ fn build_viewer3d(
     as_view_and_entity(cx.new(|cx| Viewer3d::with_db(db.clone(), cx)))
 }
 
-/// Renders an image loaded from a file path, scaled to fill its widget bounds.
+/// Widget that decodes an image from disk and paints it into its bounds.
 struct ImageWidget {
     render_image: Option<Arc<RenderImage>>,
     label: SharedString,
@@ -314,8 +309,7 @@ impl Render for ImageWidget {
     }
 }
 
-/// Placeholder shown when a referenced component isn't available, or when
-/// a saved layout references an unregistered widget kind.
+/// Grey "missing content" tile used whenever a widget can't instantiate.
 struct PlaceholderWidget {
     label: SharedString,
 }

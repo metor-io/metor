@@ -1,6 +1,9 @@
 use gpui::{Bounds, Pixels, Point, point, px};
 
-/// Data-space bounds for a time-series plot, with conversion between data and screen coordinates.
+/// Data-space rectangle for a plot view.
+///
+/// Doubles as the coordinate transform: pan/zoom methods mutate the bounds
+/// and [`PlotBounds::to_screen`] maps data points into pixels.
 #[derive(Clone, Copy, Debug)]
 pub struct PlotBounds {
     pub min_x: f64,
@@ -140,7 +143,7 @@ impl PlotBounds {
     }
 
 
-    /// Pre-compute a branchless screen transform for the inner loop.
+    /// Bake the screen transform into a branchless form for inner-loop use.
     pub fn screen_transform(&self, screen_bounds: Bounds<Pixels>) -> ScreenTransform {
         let sw = f32::from(screen_bounds.size.width) as f64;
         let sh = f32::from(screen_bounds.size.height) as f64;
@@ -169,9 +172,11 @@ impl PlotBounds {
     }
 }
 
-/// Pre-computed data→screen transform. Two multiply-adds per point, no branches.
-/// Keeps scale/offset in f64 to preserve precision for large timestamp values,
-/// only casting to f32 at the very end.
+/// Pre-computed data-to-screen transform.
+///
+/// `f64` is retained through the scale/offset multiplies so large
+/// microsecond timestamps don't lose precision; the cast to `f32` only
+/// happens on the final pixel coordinate.
 #[derive(Clone, Copy)]
 pub struct ScreenTransform {
     x_scale: f64,
@@ -190,7 +195,8 @@ impl ScreenTransform {
     }
 }
 
-/// Round a step size to a "pretty" value (nearest 0.5 at the appropriate magnitude).
+/// Round `num` to the nearest `0.5 * 10^k` so axis steps land on
+/// human-friendly values (1, 1.5, 2, 5, 10, 20, 50, …).
 pub fn pretty_round(num: f64) -> f64 {
     if num == 0.0 || !num.is_finite() {
         return num;

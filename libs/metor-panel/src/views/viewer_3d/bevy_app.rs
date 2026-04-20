@@ -1,18 +1,9 @@
-//! Bevy-side helpers for the 3D viewer.
+//! Bevy world construction and the components systems in it rely on.
 //!
-//! The Bevy [`App`] itself lives inside [`super::bridge::BevyBridge`] on the
-//! GPUI thread. This module holds everything that goes *into* that App: the
-//! plugin set, the components and systems a viewer element relies on, and
-//! the single observer that ships readback bytes back to the GPUI side
-//! through a per-viewer [`ThingBuf`] attached as a [`FrameSink`] component.
-//!
-//! Every mutation a viewer wants to make (spawn a camera, swap a render
-//! target, apply a live transform) is expressed as an inline
-//! `bridge.with_world(|w| …)` block at the call site — there are no
-//! per-operation wrapper functions here. What lives in this file is the
-//! *shared shape* every viewer agrees on: component types, the transform
-//! composition system, the render-layer propagation system, and the
-//! readback observer.
+//! Holds the plugin set, transform and render-layer propagation systems,
+//! the readback observer, and the [`FrameSink`] component that pumps
+//! rendered bytes back to the gpui thread. The actual [`App`] lives in
+//! [`super::bridge::BevyBridge`] — everything here describes its shape.
 
 use std::sync::Arc;
 
@@ -42,15 +33,12 @@ use thingbuf::{ThingBuf, recycling::Recycle};
 
 use crate::gpu_context::GpuContext;
 
-/// Build the headless Bevy app and immediately extract its [`SubApps`].
+/// Build the headless Bevy app and return its [`SubApps`].
 ///
-/// We return `SubApps` rather than the full `App` because `App` holds a
-/// non-`Send` `RunnerFn` we don't use — every update is driven via
-/// `sub_apps.update()` directly, the same pattern Bevy's
-/// `examples/app/externally_driven_headless_renderer.rs` uses.
-///
-/// The returned `SubApps` is `Send`, so the bridge can ship it to a
-/// background-executor worker for each render without thread pinning.
+/// `SubApps` is `Send`; the full `App` is not. Returning just the
+/// sub-apps lets the bridge ship them between gpui and the render
+/// worker without pinning to a thread. Mirrors the pattern in Bevy's
+/// `externally_driven_headless_renderer` example.
 pub(super) fn build_app() -> SubApps {
     let ctx = GpuContext::get().expect("metor-panel: no GPU adapter");
 
@@ -79,11 +67,9 @@ pub(super) fn build_app() -> SubApps {
                 unapproved_path_mode: UnapprovedPathMode::Allow,
                 ..default()
             })
-            // Pipelined rendering would put the render world on its own
-            // dedicated thread, which fights the "ship the App between
-            // threads on each render" model. Disable it so `app.update()`
-            // runs the render graph synchronously on whichever thread is
-            // currently driving the App.
+            // Pipelined rendering pins the render world to its own
+            // thread, which breaks our model of migrating the app
+            // between threads on each update.
             .disable::<PipelinedRenderingPlugin>(),
     );
 
@@ -93,19 +79,18 @@ pub(super) fn build_app() -> SubApps {
     );
     app.add_observer(on_readback_complete);
 
-    // Externally-driven update loop: finish + cleanup must be called
-    // before the first `update()`.
+    // Externally-driven loop: finish + cleanup must run before the
+    // first manual `update()`.
     app.finish();
     app.cleanup();
 
     std::mem::take(app.sub_apps_mut())
 }
 
-/// One rendered frame waiting to be consumed by the GPUI side. The
-/// underlying `Vec<u8>` is reused across frames by the [`ClearSlot`]
-/// recycler — the queue hands the writer a pre-allocated buffer that the
-/// previous reader already emptied with `mem::take`, so steady-state
-/// operation does zero allocations per frame.
+/// One rendered frame in the transit queue.
+///
+/// The `Vec<u8>` is recycled in place by [`ClearSlot`] so steady-state
+/// rendering does zero heap work per frame.
 #[derive(Default)]
 pub(super) struct FrameSlot {
     pub width: u32,
@@ -113,8 +98,8 @@ pub(super) struct FrameSlot {
     pub bytes: Vec<u8>,
 }
 
-/// [`thingbuf`] recycle policy for [`FrameSlot`]: new slots start empty,
-/// recycled slots have their `Vec` cleared (keeping its capacity).
+/// Recycle policy: zero the header fields and clear the byte vec
+/// without dropping its capacity.
 pub(super) struct ClearSlot;
 
 impl Recycle<FrameSlot> for ClearSlot {
@@ -129,45 +114,46 @@ impl Recycle<FrameSlot> for ClearSlot {
     }
 }
 
-/// Shared readback queue between the Bevy world and one [`super::Viewer3d`].
-/// Depth 2 with most-recent-wins semantics: if the viewer falls a frame
-/// behind, the observer drops the oldest queued frame before pushing the
-/// newest.
+/// Shared depth-2 queue between the readback observer and one viewer.
+///
+/// Most-recent-wins: if the viewer falls behind the observer discards
+/// the oldest entry before pushing the new frame.
 pub(super) type FrameQueue = Arc<ThingBuf<FrameSlot, ClearSlot>>;
 
-/// Allocate a fresh depth-2 readback queue.
 pub(super) fn new_frame_queue() -> FrameQueue {
     Arc::new(ThingBuf::with_recycle(2, ClearSlot))
 }
 
-/// Component attached to a viewer's readback sentinel entity. Holds the
-/// shared [`ThingBuf`] the observer writes into plus the current
-/// render-target dimensions (updated whenever the viewer swaps its render
-/// target — the observer stamps these into every frame it produces).
+/// Attached to a viewer's readback sentinel entity.
+///
+/// Pairs the transit queue with the render-target size the observer
+/// should stamp onto each outgoing frame. The size is updated whenever
+/// the viewer swaps its render target.
 #[derive(Component)]
 pub(super) struct FrameSink {
     pub queue: FrameQueue,
     pub size: (u32, u32),
 }
 
-/// Marker for an entity whose children should inherit its [`RenderLayers`].
-/// Bevy doesn't propagate `RenderLayers` through the hierarchy, so when a
-/// GLTF scene is spawned under a tagged root the child mesh entities would
-/// otherwise default to layer 0 and be invisible to every per-viewer camera.
+/// Marker requesting that a subtree inherit the root's [`RenderLayers`].
+///
+/// Bevy doesn't auto-propagate render layers through the hierarchy, so
+/// child meshes in a GLTF scene would default to layer 0 and be
+/// invisible to the per-viewer camera.
 #[derive(Component)]
 pub(super) struct PropagateRenderLayers;
 
-/// Live-binding delta from a component stream, written into the model's
-/// [`Transform`] each frame by [`compose_transforms`]. Either field being
-/// `None` leaves that axis at identity.
+/// Per-model transform inputs from the component streams.
+///
+/// A `None` axis is treated as identity, letting a stream drive only
+/// translation or only rotation without touching the other.
 #[derive(Component, Default, Clone, Copy)]
 pub(super) struct LiveDelta {
     pub translation: Option<Vec3>,
     pub rotation: Option<Quat>,
 }
 
-/// Write each model's live binding delta into its [`Transform`]. Either
-/// axis being `None` is treated as identity for that axis.
+/// System: apply each model's [`LiveDelta`] to its [`Transform`].
 fn compose_transforms(mut q: Query<(&LiveDelta, &mut Transform)>) {
     for (delta, mut transform) in &mut q {
         let mut out = Transform::IDENTITY;
@@ -181,11 +167,10 @@ fn compose_transforms(mut q: Query<(&LiveDelta, &mut Transform)>) {
     }
 }
 
-/// Walk the descendants of every [`PropagateRenderLayers`] root and insert
-/// the root's layers on any descendant that lacks its own. Runs every
-/// frame in `Update`, which handles the asynchronous nature of GLTF scene
-/// loading — newly-spawned child entities get their layers the frame after
-/// they appear.
+/// System: push [`RenderLayers`] into descendants that lack their own.
+///
+/// Runs every `Update`, so children spawned by asynchronous GLTF loading
+/// pick up the viewer's layers on the frame after they appear.
 fn propagate_render_layers(
     mut commands: Commands,
     roots: Query<(Entity, &RenderLayers), With<PropagateRenderLayers>>,
@@ -216,13 +201,10 @@ fn propagate_layers_recursive(
 }
 
 /// Observer: when a readback completes on an entity carrying a
-/// [`FrameSink`], copy the rendered bytes into the per-viewer queue.
+/// [`FrameSink`], push the bytes into the viewer's queue.
 ///
-/// Steady-state behavior: the queue has depth 2 so the viewer can miss a
-/// single frame without forcing the observer to allocate. If both slots
-/// are occupied (the viewer fell two frames behind), we discard the
-/// oldest by draining one entry, then enqueue the newest — most-recent
-/// frame wins.
+/// Drops the oldest queued frame if both slots are full so the latest
+/// frame always wins.
 fn on_readback_complete(trigger: On<ReadbackComplete>, mut sinks: Query<&mut FrameSink>) {
     let Ok(sink) = sinks.get_mut(trigger.entity) else {
         return;
@@ -239,11 +221,9 @@ fn on_readback_complete(trigger: On<ReadbackComplete>, mut sinks: Query<&mut Fra
                 return;
             }
             Err(_) => {
-                // Queue is full: drop the oldest frame and retry.
+                // Full queue: drop the oldest and retry. Bail if the
+                // pop fails so we don't spin on a genuinely empty queue.
                 if sink.queue.pop_ref().is_none() {
-                    // Nothing to pop and nothing to push — bail to avoid
-                    // spinning. Shouldn't happen in practice because the
-                    // observer is the only producer.
                     return;
                 }
             }
@@ -251,12 +231,12 @@ fn on_readback_complete(trigger: On<ReadbackComplete>, mut sinks: Query<&mut Fra
     }
 }
 
-/// Copy the padded readback rows into `dst` without any padding. wgpu
-/// aligns `bytes_per_row` to `COPY_BYTES_PER_ROW_ALIGNMENT` (256); when
-/// `width * 4` is already a multiple of that alignment (the common case
-/// after `Viewer3d::quantize`'s 64-pixel rounding — 64 × 4 = 256) this is
-/// a single flat memcpy. Writes into `dst`'s existing capacity whenever
-/// possible so the recycled `Vec` doesn't reallocate.
+/// Strip wgpu's row padding from a readback.
+///
+/// When the row stride is already 256-aligned — the usual case after
+/// `Viewer3d::quantize` rounds to a 64-pixel grid — this collapses to a
+/// single memcpy. Writes into `dst`'s existing capacity so recycled
+/// slots don't reallocate.
 fn copy_tight_rows(src: &[u8], dst: &mut Vec<u8>, width: u32, height: u32) {
     let tight_row = (width as usize) * 4;
     let align = wgpu::COPY_BYTES_PER_ROW_ALIGNMENT as usize;
@@ -278,12 +258,12 @@ fn copy_tight_rows(src: &[u8], dst: &mut Vec<u8>, width: u32, height: u32) {
     }
 }
 
-/// Allocate a fresh BGRA render-target image at the requested size. The
-/// usage flags cover the readback (`COPY_SRC`) + camera render pass
-/// (`RENDER_ATTACHMENT`) + any debug texture binding. Bgra8UnormSrgb
-/// matches the byte ordering GPUI's `Window::paint_image` expects and
-/// lets Bevy's PBR pipeline produce gamma-correct output without a manual
-/// transform.
+/// Allocate a BGRA render-target image.
+///
+/// `Bgra8UnormSrgb` matches the byte order `Window::paint_image` expects
+/// and lets the PBR pipeline emit gamma-correct output without a manual
+/// conversion step. Usage flags cover camera rendering, readback, and
+/// debug texture binding.
 pub(super) fn new_target_image(width: u32, height: u32) -> Image {
     let mut img = Image::new_uninit(
         Extent3d {
@@ -300,10 +280,8 @@ pub(super) fn new_target_image(width: u32, height: u32) -> Image {
     img
 }
 
-/// Despawn each entity in `entities`. `World::despawn` is already a
-/// non-panicking no-op for missing entities, so this is just a batching
-/// convenience for call sites that have several handles to clean up at
-/// once (e.g. a viewer tearing down its camera + light + readback).
+/// Batch-despawn several entities. `World::despawn` no-ops on missing
+/// ids, so the viewer doesn't have to track which cells populated.
 pub(super) fn despawn_entities(world: &mut World, entities: &[Entity]) {
     for entity in entities {
         world.despawn(*entity);

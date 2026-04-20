@@ -1,35 +1,23 @@
-//! Process-wide holder for the headless Bevy app driving every 3D viewer.
+//! Process-wide holder for the Bevy app shared by every 3D viewer.
 //!
-//! The bridge is intentionally dumb. It owns:
+//! The bridge is intentionally minimal: it owns the [`SubApps`], a queue
+//! of deferred world mutations, the in-flight render task, an orphan
+//! list of atlas entries pending release, and a counter that mints
+//! [`RenderLayers`] slots.
 //!
-//! - the [`SubApps`] (the headless Bevy world),
-//! - a queue of deferred world mutations that arrived while the app was
-//!   on a background-executor worker for a render,
-//! - the in-flight render task and a flag to de-dupe scheduling,
-//! - an orphan list of `RenderImage`s that need to be released from
-//!   gpui's sprite atlas after their owning viewer has been dropped,
-//! - a monotonic counter minting per-viewer [`RenderLayers`] slots.
+//! Threading model:
+//! - At rest the `SubApps` lives on the gpui thread and `with_world`
+//!   runs synchronously.
+//! - A scheduled render takes the app, ships it to a background
+//!   worker for one `sub_apps.update()`, and restores it when done.
+//!   World mutations that arrive while the app is off-thread queue in
+//!   `pending` and drain just before the app is reinserted.
 //!
-//! It does **not** track which viewers exist, their sizes, their frames,
-//! or which ones are dirty. Every viewer owns its own ECS entity handles
-//! (`camera`, `light`, `readback`) and issues direct `with_world(|w| …)`
-//! calls to mutate them — no per-operation wrapper methods.
-//!
-//! ## Threading model
-//!
-//! At rest `app: Some(SubApps)`. When a viewer's prepaint schedules a
-//! render we `take` the `SubApps`, ship it to a background-executor task
-//! that calls `sub_apps.update()` once, then restore it on the GPUI
-//! thread. While the app is taken, viewer mutations are boxed up into
-//! `pending` and drained onto the main world the moment the app comes
-//! back.
-//!
-//! Bevy's `App` is `Send` at the type level via the unsafe `Send` impl on
-//! `World`. The runtime safety guarantee is that no `NonSend<T>` resource
-//! is ever accessed from a thread other than the one that owns it. Our
-//! plugin set deliberately omits anything window/audio/winit-related. If
-//! a future plugin addition introduces a non-send resource the second
-//! render will land on a different pool worker and panic — fail loud.
+//! Bevy's `App` is `Send` because `World` is unsafe-`Send`. The runtime
+//! invariant is that no `NonSend<T>` resource ever crosses threads; the
+//! shipped plugin set omits window, audio, and winit resources so this
+//! holds. A future plugin that reintroduces a non-send resource will
+//! panic loudly on the next render, which is the failure mode we want.
 
 use std::sync::Arc;
 
@@ -40,46 +28,36 @@ use gpui::{AsyncApp, BorrowAppContext, Global, RenderImage, Task};
 
 use super::bevy_app;
 
-/// A deferred world mutation. Queued when a mutation arrives while the
-/// [`SubApps`] is on a background-executor worker for a render; drained
-/// onto the main world in [`BevyBridge::restore_app`].
+/// Deferred world mutation. Queued while the app is off-thread, drained
+/// by [`BevyBridge::restore_app`] just before the app is reinserted.
 type WorldOp = Box<dyn FnOnce(&mut World) + Send + 'static>;
 
-/// Process-wide bridge to the headless Bevy app. Stored as a
-/// [`gpui::Global`] and lazy-initialized on the first viewer creation.
+/// Global bridge to the shared Bevy app.
 pub struct BevyBridge {
-    /// The headless Bevy `SubApps`. `Some` while it lives on the GPUI
-    /// thread, `None` while a background-executor task is running a
-    /// `sub_apps.update()`.
+    /// The headless Bevy app. `None` while a background render is
+    /// updating it.
     app: Option<SubApps>,
-    /// Mutations queued while `app` is `None`. Drained inside
-    /// [`Self::restore_app`] before the app is reinserted.
     pending: Vec<WorldOp>,
-    /// `true` while a background render task is in flight. Set by
-    /// [`Self::schedule_render`], cleared by [`Self::restore_app`].
+    /// True while a background render is outstanding; used to de-dupe
+    /// scheduling.
     render_in_flight: bool,
-    /// Most recently spawned render task. Held to keep it alive (gpui
-    /// `Task` cancels on drop).
+    /// Holds the most recent render task alive; gpui tasks cancel on drop.
     _render_task: Option<Task<()>>,
-    /// Sprite-atlas entries owned by viewers that have already been
-    /// unregistered. Drained opportunistically by any live viewer's next
-    /// prepaint (which has `&mut Window` access to call `drop_image`).
-    /// Grows only in the pathological case where every viewer is dropped
-    /// at once; in that case the remaining entries leak until the
-    /// process exits — a bounded, rare leak we accept.
+    /// Atlas entries orphaned by viewer drops, released by any surviving
+    /// viewer's next prepaint. The list only grows in the pathological
+    /// case of every viewer dying at once, where the remainder leaks
+    /// until shutdown — a bounded, accepted leak.
     pending_releases: Vec<Arc<RenderImage>>,
-    /// Monotonic counter minting the [`RenderLayers`] slot for each new
-    /// viewer. Layer 0 is intentionally unused (it's the default layer
-    /// for any untagged entity, which we don't want any viewer's camera
-    /// to see) so the counter starts at 1.
+    /// Monotonic layer counter. Starts at 1 because layer 0 is Bevy's
+    /// default for untagged entities and must not be visible to any
+    /// per-viewer camera.
     next_render_layer: usize,
 }
 
 impl Global for BevyBridge {}
 
 impl BevyBridge {
-    /// Fetch or create the process-wide bridge. The first call builds
-    /// the headless `SubApps` synchronously on the GPUI thread.
+    /// Fetch the bridge, building the Bevy app on the first call.
     pub fn get_or_init(cx: &mut gpui::App) -> &mut BevyBridge {
         if !cx.has_global::<BevyBridge>() {
             let app = bevy_app::build_app();
@@ -95,9 +73,11 @@ impl BevyBridge {
         cx.global_mut::<BevyBridge>()
     }
 
-    /// Apply a mutation to the Bevy world. Runs inline if the `SubApps`
-    /// is on the GPUI thread; otherwise queues the closure and applies
-    /// it when the `SubApps` is restored after a render.
+    /// Apply `f` to the Bevy world.
+    ///
+    /// Runs inline when the app is on the gpui thread; otherwise queues
+    /// for execution when the app returns. Operations run FIFO, which
+    /// callers rely on to order construction before subsequent mutations.
     pub fn with_world<F>(&mut self, f: F)
     where
         F: FnOnce(&mut World) + Send + 'static,
@@ -109,37 +89,34 @@ impl BevyBridge {
         }
     }
 
-    /// Claim the next [`RenderLayers`] slot for a freshly-created viewer.
-    /// Slots are never reused, mirroring the old `ViewerId` lifetime.
+    /// Reserve a fresh [`RenderLayers`] slot for a new viewer. Slots are
+    /// never reused.
     pub fn claim_render_layer(&mut self) -> usize {
         let layer = self.next_render_layer;
         self.next_render_layer += 1;
         layer
     }
 
-    /// Park an `Arc<RenderImage>` that belonged to a now-dead viewer so
-    /// some surviving viewer can release it from gpui's sprite atlas on
-    /// its next prepaint. Called from `Viewer3d::on_release`.
+    /// Hand off a [`RenderImage`] owned by a dying viewer. A live
+    /// viewer will release it from the sprite atlas on its next prepaint.
     pub fn orphan_release(&mut self, image: Arc<RenderImage>) {
         self.pending_releases.push(image);
     }
 
-    /// Drain any orphaned atlas entries. Called from a live viewer's
-    /// prepaint, which is the only place we have `&mut Window` access.
+    /// Drain orphaned atlas entries. Must run from a viewer prepaint;
+    /// that's the only place with `&mut Window` for `drop_image`.
     pub fn take_orphaned_releases(&mut self) -> Vec<Arc<RenderImage>> {
         std::mem::take(&mut self.pending_releases)
     }
 
-    /// Spawn a render task if one isn't already in flight. The
-    /// background worker runs `sub_apps.update()` once — nothing else.
-    /// Frame transport happens inside the update via the per-viewer
-    /// [`bevy_app::FrameSink`] thingbufs, so the bridge never touches
-    /// frame bytes.
+    /// Schedule one background render, ignoring the call if one is
+    /// already in flight.
     ///
-    /// After the render completes the task restores the `SubApps` onto
-    /// the GPUI thread (draining any queued mutations as it goes) and
-    /// calls `cx.refresh()` so every live viewer's next prepaint picks
-    /// up whatever new frames landed in its queue.
+    /// The worker runs a single `sub_apps.update()`; frame bytes flow
+    /// through per-viewer [`bevy_app::FrameSink`] queues so the bridge
+    /// never inspects them. On completion the task restores the app,
+    /// drains queued mutations, and refreshes every gpui window so
+    /// viewers pick up the new frames.
     pub fn schedule_render(cx: &mut gpui::App) {
         let app = cx.update_global::<BevyBridge, _>(|bridge, _| {
             if bridge.render_in_flight {
@@ -176,8 +153,8 @@ impl BevyBridge {
         });
     }
 
-    /// Restore the `SubApps` after a background render. Drains queued
-    /// mutations onto the main world before reinserting them.
+    /// Reinstate the app after a render. Queued mutations run first so
+    /// callers never observe a gap where their ops are lost.
     fn restore_app(&mut self, mut app: SubApps) {
         let pending: Vec<WorldOp> = std::mem::take(&mut self.pending);
         if !pending.is_empty() {
@@ -191,9 +168,7 @@ impl BevyBridge {
     }
 }
 
-/// Build the [`RenderLayers`] slot for a given viewer layer index. Kept
-/// here so both the bridge and `Viewer3d` can reach it without pulling
-/// `bevy::render` into every call site.
+/// Construct the [`RenderLayers`] component for one viewer layer.
 pub(super) fn render_layers_for(layer: usize) -> RenderLayers {
     RenderLayers::from_layers(&[layer])
 }

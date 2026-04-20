@@ -7,7 +7,7 @@ use metor_proto::types::ComponentId;
 use crate::views::time_series::Trace;
 use crate::inspector::rows::{CommandRow, InspectorRow, NavRow};
 
-/// List all components from the DB, sorted by name.
+/// Every known component sorted by name, suitable for palette display.
 pub(crate) fn list_components(db: &DB) -> Vec<(ComponentId, String)> {
     let mut components: Vec<_> = db.with_state(|state| {
         state
@@ -19,7 +19,8 @@ pub(crate) fn list_components(db: &DB) -> Vec<(ComponentId, String)> {
     components
 }
 
-/// Return element names for a component from the DB, or an empty vec if not found.
+/// Element labels for `component_id`, derived from its schema dimension.
+/// Empty when the component is missing from the DB.
 pub fn element_names_for_component(db: &DB, component_id: ComponentId) -> Vec<String> {
     db.with_state(|state| {
         state
@@ -29,18 +30,19 @@ pub fn element_names_for_component(db: &DB, component_id: ComponentId) -> Vec<St
     })
 }
 
-/// Callback invoked once the user has selected one or more elements; receives
-/// the constructed traces ready to be inserted into a plot.
+/// Invoked with the [`Trace`]s the user built through the wizard.
 pub type OnTracesSelected = Arc<dyn Fn(Vec<Trace>, &mut Window, &mut App)>;
 
-/// Returns the next color index to assign, given the current `App`. Used so
-/// the wizard can either start fresh (return `0`) or continue an existing
-/// trace list (return `parent.read(cx).traces.len()`).
+/// Starting index into the theme's categorical color palette.
+///
+/// Lets the wizard continue an existing plot's color sequence (return the
+/// current trace count) or restart from zero (return `0`).
 pub type ColorBasis = Arc<dyn Fn(&App) -> usize>;
 
-/// Build a component → element wizard that constructs `Trace`s from the user's
-/// pick and forwards them to `on_select`. Mirrors the layout of the in-plot
-/// "Add Trace" wizard so the picker UX is consistent across entry points.
+/// Two-step component-then-element picker for constructing [`Trace`]s.
+///
+/// Shared between the "New Panel → Time Series" flow and the in-plot
+/// "Add Trace" button so both entry points present the same UX.
 pub fn select_traces_wizard_rows(
     db: Arc<DB>,
     color_basis: ColorBasis,
@@ -68,7 +70,8 @@ pub fn select_traces_wizard_rows(
 
                     let mut rows: Vec<Box<dyn InspectorRow>> = Vec::new();
 
-                    // "All" option — emit one trace per element at once.
+                    // A vector component gets an extra row that adds every
+                    // element in one pick; colors step through the palette.
                     if elem_names.len() > 1 {
                         let comp_name = comp_name.clone();
                         let names = elem_names.clone();
@@ -103,7 +106,6 @@ pub fn select_traces_wizard_rows(
                         )));
                     }
 
-                    // Individual element options.
                     for (idx, elem_name) in elem_names.into_iter().enumerate() {
                         let comp_name = comp_name.clone();
                         let display = if elem_name.is_empty() {
@@ -138,7 +140,13 @@ pub fn select_traces_wizard_rows(
         .collect()
 }
 
-/// Generate default element names from a shape (e.g. [3] -> ["x", "y", "z"]).
+/// Default element names for a tensor shape.
+///
+/// Axes consume letters in order from `NAMES` (x, y, z, w, u, v, s, t);
+/// once exhausted the numeric index is used. A rank-0 scalar yields a
+/// single empty string so callers can substitute `"value"`.
+///
+/// Example: `[3]` → `["x", "y", "z"]`; `[2, 2]` → `["xx", "xy", "yx", "yy"]`.
 pub(crate) fn element_names(shape: &[usize]) -> Vec<String> {
     fn walk(shape: &[usize], prefix: &str, out: &mut Vec<String>) {
         if shape.is_empty() {

@@ -5,7 +5,11 @@ use gpui::{AnyElement, App, SharedString, Window, div, prelude::*, px};
 use super::{InspectorRow, RowAction, row_base};
 use crate::theme::theme;
 
-/// Text-editable string field row.
+/// Inspector row for a string field.
+///
+/// Activation drops into inline editing; on commit the row's cached value
+/// is updated immediately so the summary redraws without waiting for the
+/// next read from the underlying entity.
 pub struct TextRow {
     pub label: SharedString,
     pub value: Rc<RefCell<SharedString>>,

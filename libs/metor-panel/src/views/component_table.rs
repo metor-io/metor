@@ -63,8 +63,8 @@ impl ComponentRow {
             })
         };
 
-        // Tiny notify task: wake the row on every new sample so the sort
-        // column sees fresh values and the sparkline cell re-renders.
+        // Wake the row on every sample so the sort column and sparkline
+        // stay current even when the strip doesn't need to redraw.
         let mut stream = WalComponentStream::new(&component);
         let task = cx.spawn(async move |this, cx| {
             loop {
@@ -103,7 +103,11 @@ impl ComponentRow {
     }
 }
 
-/// Table delegate that displays all components in the database with name, value, and sparkline columns.
+/// [`TableDelegate`] that lists every component with name, value, and
+/// sparkline columns.
+///
+/// Rows are regenerated whenever the DB's virtual table generation
+/// advances, so newly-registered components appear without a manual refresh.
 pub struct ComponentTableDelegate {
     rows: Vec<Entity<ComponentRow>>,
     _task: gpui::Task<()>,
@@ -246,9 +250,10 @@ impl TableDelegate for ComponentTableDelegate {
     }
 }
 
-/// A table showing all database components with sortable columns and sparklines.
+/// Table of every database component paired with [`ComponentTableDelegate`].
 pub type ComponentTable = Table<ComponentTableDelegate>;
 
+/// Construct a [`ComponentTable`] wired to `db`.
 pub fn new_component_table(db: Arc<DB>, cx: &mut Context<ComponentTable>) -> ComponentTable {
     let task = ComponentTableDelegate::spawn_watcher(db.clone(), cx);
     let delegate = ComponentTableDelegate {

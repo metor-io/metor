@@ -14,20 +14,21 @@ use crate::theme::{Theme, theme};
 use crate::inspector::rows::TextField;
 use crate::{AsComponentView, ComponentStream, ComponentStreamBuilder};
 
-/// One formatted value within a [`ComponentValueStrip`].
+/// Display payload for one element of a component.
 #[derive(Clone, Debug, PartialEq)]
 pub struct StripCell {
     pub label: Option<SharedString>,
     pub value: SharedString,
 }
 
-/// Scalar interpretation of a component's elements. Shared across all cells
-/// in a single strip because every element of a component has the same
-/// primitive type. Drives the editor affordance: checkbox for bools, anchored
-/// inspector for enums, inline text for numeric/string.
+/// Scalar interpretation of every cell in a strip.
+///
+/// All elements of a given component share the same primitive type, so this
+/// can be resolved once and reused. The variant drives editor affordance
+/// (checkbox, enum picker, text field).
 #[derive(Clone, Debug, PartialEq)]
 pub enum CellKind {
-    /// Component isn't registered yet, or metadata can't be resolved.
+    /// Component isn't registered yet or its metadata can't be resolved.
     Unknown,
     Bool,
     Enum {
@@ -71,32 +72,32 @@ impl CellKind {
     }
 }
 
-/// Visual preset controlling the strip's chrome and typography.
+/// Visual mode for the strip.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum StripPreset {
-    /// Monitor dashboard: inline values, no box chrome, optional larger
-    /// font for solo scalars, unit suffix shown alongside each value.
+    /// Inline values with no cell background; used by the dashboard Monitor
+    /// where the value sits next to the label and an optional unit suffix.
     Dashboard,
-    /// Browser detail list & Table value cell: rounded bg_secondary boxes
-    /// with comfortable click padding.
+    /// Rounded boxed cells with click padding; used by the browser detail
+    /// view and table value column.
     Boxes,
 }
 
-/// Style configuration for a [`ComponentValueStrip`].
+/// Style knobs applied uniformly across every cell in the strip.
 #[derive(Clone)]
 pub struct StripStyle {
     pub preset: StripPreset,
-    /// When true and the strip has a single unlabeled cell, use a larger
-    /// display font. Honoured by the Dashboard preset only.
+    /// Dashboard-only: render a solo unlabeled scalar at a larger font size
+    /// so lone values read as the focal point of the tile.
     pub solo_emphasize: bool,
-    /// Optional unit suffix shown after each value (e.g. "V", "rpm").
+    /// Suffix shown after each value. Empty string disables the suffix.
     pub unit: SharedString,
-    /// Text shown when no sample has arrived yet (e.g. "—" or "…").
+    /// Displayed before the first sample arrives.
     pub placeholder: SharedString,
 }
 
 impl StripStyle {
-    /// Preset used by `Monitor`.
+    /// Style used by [`Monitor`](super::Monitor).
     pub fn dashboard() -> Self {
         Self {
             preset: StripPreset::Dashboard,
@@ -106,7 +107,7 @@ impl StripStyle {
         }
     }
 
-    /// Preset shared by the browser detail list and the table value cell.
+    /// Style shared by the component browser and table value column.
     pub fn boxes() -> Self {
         Self {
             preset: StripPreset::Boxes,
@@ -122,21 +123,25 @@ impl StripStyle {
     }
 }
 
-/// Callback invoked when the user clicks a value — the strip surfaces the
-/// index of the clicked element and the window-space position of the click
-/// (so callers can anchor an overlay near the cell). Callers translate that
-/// to whatever edit flow they use — typically populating
-/// `pending_edits.pending_request`.
+/// Click handler surfaced by the strip.
+///
+/// Receives the element index and the cursor position so callers can anchor
+/// a popover next to the clicked cell. Typically stashes an
+/// [`EditRequest`](crate::inspector::edits::EditRequest) onto the pending
+/// edits global, which the root view drains on the next render.
 pub type StripClick = Arc<dyn Fn(usize, Point<Pixels>, &mut Window, &mut App) + Send + Sync>;
 
-/// Per-render interactive state: which elements show as pending-modified,
-/// whether clicks are disabled (Cmd+L lock), and the edit / apply callbacks.
+/// Interactive state supplied afresh by the host each render.
+///
+/// Snapshot pattern keeps the strip decoupled from the pending-edits global
+/// and lets `Monitor`, `ComponentText`, and `ComponentTable` share one
+/// widget with different policies.
 #[derive(Default, Clone)]
 pub struct StripBehavior {
     pub on_element_click: Option<StripClick>,
-    /// Applies the pending edit for the strip's component, then drops the
-    /// clicked element from `highlighted`. Shown as a green chevron next to
-    /// highlighted cells. Ignored when `locked` is true.
+    /// Apply-chevron handler shown beside highlighted cells. Fires the
+    /// pending edit for the component and clears the element from
+    /// `highlighted`. Ignored while `locked`.
     pub on_apply_element: Option<StripClick>,
     pub highlighted: SmallVec<[usize; 4]>,
     pub locked: bool,
@@ -165,21 +170,19 @@ fn click_ptr(click: &Option<StripClick>) -> usize {
         .unwrap_or(0)
 }
 
-/// A live-updating horizontal row of a component's elements.
-///
-/// Shared across the dashboard `Monitor`, the `ComponentBrowser` detail
-/// list, and the `ComponentTable` value cell. The strip owns the stream
-/// task; callers embed `Entity<ComponentValueStrip>` and refresh the
-/// behavior snapshot each render.
-/// Active inline text edit. `field` holds the user's current typed buffer;
-/// `error` flags a failed commit so the cell can render an error style and
-/// keep focus instead of silently reverting.
+/// In-flight inline edit. `error` latches when a commit fails to parse so
+/// the cell can render an error state and retain focus.
 struct EditingCell {
     index: usize,
     field: TextField,
     error: bool,
 }
 
+/// Live horizontal row of a component's elements.
+///
+/// Shared widget between `Monitor`, `ComponentBrowser`, and
+/// `ComponentTable`. The strip owns its stream task; hosts refresh the
+/// visible [`StripStyle`] and [`StripBehavior`] every render.
 pub struct ComponentValueStrip {
     db: Arc<DB>,
     component_id: ComponentId,
@@ -286,8 +289,10 @@ impl ComponentValueStrip {
         cx.notify();
     }
 
-    /// Refresh the interactive layer. Cheap no-op when nothing changed, so
-    /// callers can safely call this every render.
+    /// Install a new behavior snapshot.
+    ///
+    /// Short-circuits when nothing changed so callers can invoke it every
+    /// render without triggering redundant repaints.
     pub fn set_behavior(&mut self, behavior: StripBehavior, cx: &mut Context<Self>) {
         if self.behavior.equivalent(&behavior) {
             return;
@@ -322,8 +327,8 @@ impl ComponentValueStrip {
         if self.behavior.locked {
             return;
         }
-        // If already editing another cell, try to commit its value first so
-        // clicking between cells doesn't silently drop typing.
+        // Commit an in-progress edit before moving focus so clicking across
+        // cells doesn't silently drop typed input.
         if self.editing.as_ref().is_some_and(|e| e.index != idx) {
             self.commit_edit(window, cx);
         }
@@ -486,8 +491,8 @@ impl Render for ComponentValueStrip {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = theme(cx);
 
-        // Overlay the pending edit on top of the live WAL values so the cell
-        // reflects the user's in-flight change, not the last broadcast value.
+        // Pending edits shadow WAL samples so typed changes stay visible
+        // until the user applies or discards them.
         let (cells, raw_values) = {
             let pending = crate::inspector::edits::pending_edits(cx).get(self.component_id);
             if let Some(edit) = pending {
@@ -738,8 +743,8 @@ fn build_cell_chrome(
 ) -> Stateful<gpui::Div> {
     let id_hash = component_id.0.wrapping_mul(31) ^ idx as u64;
     let mut atom = div().id(("strip-cell", id_hash as usize)).flex().flex_row();
-    // When wrapped with the apply-group chevron, only the left corners are
-    // rounded so the green chevron sits flush on the right.
+    // Round only the left corners when a chevron sits flush against the
+    // right edge, so the two halves visually fuse into a single pill.
     if inside_apply_group {
         atom = atom.rounded_l(px(3.0));
     } else {
@@ -747,9 +752,9 @@ fn build_cell_chrome(
     }
 
     if is_bool {
-        // The cell itself is the toggle track. Vertical padding matches the
-        // text cells so a bool sits on the same baseline as its neighbours;
-        // the knob is sized down from its height to leave a small margin.
+        // Bool cells double as their own toggle track. Padding mirrors text
+        // cells so the baseline aligns; the knob is inset so the track
+        // still reads as a frame.
         let track_color = if is_pending {
             theme.drop_target
         } else {
@@ -774,8 +779,6 @@ fn build_cell_chrome(
 
     atom = atom.items_center().gap(px(4.0)).px(px(6.0)).py(px(3.0));
 
-    // Chrome by preset. The inner cell keeps its `drop_target` heat color
-    // when pending; the green tint on the chevron half signals "apply".
     match style.preset {
         StripPreset::Boxes => {
             let bg = if is_pending {
@@ -792,7 +795,6 @@ fn build_cell_chrome(
         }
     }
 
-    // Label.
     if let Some(label) = cell.label.as_ref() {
         let label_size = match style.preset {
             StripPreset::Dashboard => px(9.0),
@@ -806,7 +808,6 @@ fn build_cell_chrome(
         );
     }
 
-    // Value text.
     let value_size = match (style.preset, is_solo) {
         (StripPreset::Dashboard, true) => px(16.0),
         (StripPreset::Dashboard, false) => px(12.0),
@@ -819,7 +820,6 @@ fn build_cell_chrome(
             .child(cell.value.clone()),
     );
 
-    // Unit suffix.
     if !style.unit.is_empty() {
         let unit_size = match style.preset {
             StripPreset::Dashboard => {
@@ -850,9 +850,11 @@ pub(crate) struct ResolvedMetadata {
     pub component_name: SharedString,
 }
 
-/// Resolve the metadata the strip needs to format values. Returns an
-/// [`CellKind::Unknown`] kind if the component isn't yet registered; callers
-/// should call this again after `into_stream().await` resolves.
+/// Look up the metadata the strip needs to decode and label elements.
+///
+/// An unregistered component yields [`CellKind::Unknown`] so callers can
+/// render a placeholder until the producer connects; the async strip task
+/// re-resolves after `into_stream` awakens.
 pub(crate) fn resolve_metadata(db: &DB, component_id: ComponentId) -> ResolvedMetadata {
     db.with_state(|state| {
         let meta = state.get_component_metadata(component_id);
@@ -901,8 +903,10 @@ pub(crate) fn resolve_metadata(db: &DB, component_id: ComponentId) -> ResolvedMe
     })
 }
 
-/// Format a component's latest view into a list of display cells, applying
-/// string/enum/numeric detection and element labelling.
+/// Render a [`ComponentView`] into display cells.
+///
+/// Collapses string and enum components into a single unlabeled cell so the
+/// strip reads as a value, not an array of bytes or discriminants.
 pub(crate) fn format_cells(
     view: &ComponentView<'_>,
     element_names: &[SharedString],
@@ -974,9 +978,8 @@ mod tests {
 
     #[test]
     fn scalar_no_label() {
-        // Cannot construct a real ComponentView in a unit test without the
-        // surrounding DB plumbing, so instead test format_element / solo
-        // collapsing via a synthetic cells result.
+        // Full strip construction needs the DB; test the collapse rule via
+        // a synthetic cells vector instead.
         let cells = vec![StripCell {
             label: None,
             value: sv("42"),

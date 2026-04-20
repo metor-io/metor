@@ -25,8 +25,11 @@ pub use override_field::Override;
 pub mod time_range;
 pub use time_range::TimeRangeBehavior;
 
-/// Generate Y-axis tick positions within the visible bounds (sorted ascending).
-/// When the range spans 0, ticks are anchored at 0 and extend outward.
+/// Iterator of Y-axis tick values within `view`.
+///
+/// Ticks are anchored at zero whenever the range crosses it so the origin
+/// stays on a labeled line. Near-zero values are snapped to exact zero to
+/// avoid the `-5.6e-17` artifacts that show up with floating arithmetic.
 fn y_ticks(view: &PlotBounds, target_count: usize) -> impl Iterator<Item = f64> {
     let step = pretty_round(view.height() / target_count as f64);
     let (start, end) = if !step.is_normal() || step <= 0.0 {
@@ -44,7 +47,6 @@ fn y_ticks(view: &PlotBounds, target_count: usize) -> impl Iterator<Item = f64> 
     let mut v = start;
     std::iter::from_fn(move || {
         if v <= end {
-            // Snap near-zero values to exactly 0 to avoid displaying "-5.6e-17"
             let tick = if v.abs() < step * 1e-10 { 0.0 } else { v };
             v += step;
             Some(tick)
@@ -54,8 +56,8 @@ fn y_ticks(view: &PlotBounds, target_count: usize) -> impl Iterator<Item = f64> 
     })
 }
 
-/// Copied from metor-ui's `DurationExt::segment_round`.
-/// Snaps a duration to a "nice" human-readable time interval.
+/// Round a duration up to the next "nice" tick size (1/5/15/30 sec, 1 min,
+/// 1 hour, 1 day, …) so x-axis labels land on human-friendly intervals.
 #[allow(clippy::match_overlapping_arm)]
 fn segment_round(dur: hifitime::Duration) -> hifitime::Duration {
     use hifitime::{TimeUnits, Unit};
@@ -117,9 +119,8 @@ fn segment_round(dur: hifitime::Duration) -> hifitime::Duration {
     dur.ceil(round_to)
 }
 
-/// Generate X-axis tick positions (timestamps in microseconds) within the visible bounds.
-/// `data_start` is the absolute timestamp of the data origin so ticks align to round
-/// offsets from it (e.g. 0 s, 5 s, 10 s, …).
+/// Iterator of X-axis tick values (microseconds) aligned to
+/// human-readable offsets from `data_start`.
 fn x_ticks(view: &PlotBounds, target_count: usize, data_start: f64) -> impl Iterator<Item = i64> {
     let range = view.width();
     let target = (target_count as f64).max(1.0);
@@ -132,7 +133,8 @@ fn x_ticks(view: &PlotBounds, target_count: usize, data_start: f64) -> impl Iter
     let ds = data_start as i64;
     let valid = range > 0.0 && step_i > 0;
 
-    // Align ticks to multiples of step relative to data_start
+    // Ticks are snapped to multiples of `step_i` measured from `data_start`
+    // so scrubbing doesn't make labels crawl across the axis.
     let offset_from_start = t_min - ds;
     let aligned = if valid {
         ds + (offset_from_start / step_i) * step_i
@@ -165,9 +167,7 @@ fn x_ticks(view: &PlotBounds, target_count: usize, data_start: f64) -> impl Iter
     })
 }
 
-/// Format a timestamp as a human-readable time label relative to a reference point.
-/// Uses hifitime's Duration display for consistent formatting with metor-ui
-/// (e.g. "0", "30 s", "1 min", "1 min 30 s").
+/// Render a timestamp relative to `ref_us` as `"0"`, `"30 s"`, `"1 min 30 s"`, etc.
 fn format_time_label(t_us: i64, ref_us: i64) -> String {
     let offset_us = t_us - ref_us;
     if offset_us == 0 {
@@ -230,9 +230,11 @@ fn plot_area(outer: Bounds<Pixels>) -> Bounds<Pixels> {
     }
 }
 
-/// Per-node cached (min, max) over the first `sample_count` samples.
-/// `TimeSeriesNode`s are append-only, so this value is stable for a
-/// sealed node and only extends for the active head node.
+/// Cached `(min, max)` over the first `sample_count` samples of one
+/// [`TimeSeriesNode`](metor_db::TimeSeriesNode).
+///
+/// Sealed nodes are immutable so their entry is stable for the rest of the
+/// plot's lifetime; only the head node's entry extends.
 #[derive(Clone, Copy)]
 pub struct NodeBounds {
     pub sample_count: usize,
@@ -240,19 +242,19 @@ pub struct NodeBounds {
     pub max: f64,
 }
 
-/// Per-trace cache passed to [`expand_y_bounds`]. Keyed by the stable
-/// `Arc::as_ptr` identity of each `TimeSeriesNode` in the component's
-/// append-only stack. Evicted entries are dropped on each call so the
-/// map size tracks live nodes only.
+/// Per-trace cache keyed by a node's `Arc::as_ptr` identity.
+///
+/// Stable across calls because sealed nodes are never replaced. Entries for
+/// nodes that leave the component's live set are evicted on each call.
 pub type NodeBoundsCache = HashMap<usize, NodeBounds>;
 
-/// Aggregate (min, max) across `indexes` for every sample in
-/// `component.time_series`, reusing `cache` so only the tail of the
-/// head node is re-scanned each call. `cache` is mutated in place.
+/// Aggregate `(min, max)` across `indexes` over every sample in
+/// `component.time_series`, reusing `cache` so only new head-node samples
+/// are scanned.
 ///
-/// The inner loop dispatches on `PrimType` once per node, then reads
-/// values directly from the memory-mapped bytes. No `ComponentView`,
-/// `ElementValue`, or `Result` allocation in the hot path.
+/// The inner loop dispatches on `PrimType` once per node and reads values
+/// straight from the memory-mapped byte buffer, avoiding any per-sample
+/// `ComponentView`, `ElementValue`, or `Result` allocation in the hot path.
 pub fn expand_y_bounds(
     component: &Component,
     indexes: &[usize],
@@ -370,10 +372,9 @@ fn scan_min_max<T: gpu::PlotValue>(
     (min, max)
 }
 
-/// Paint the "underlay" chrome of a `TimeSeriesPlot`: gridlines + zero
-/// line, all drawn in the inner plot area so they sit *behind* the
-/// `LinePlot`'s GPU frame (which is the middle child of the
-/// three-child sandwich).
+/// Paint gridlines and the zero line behind the GPU-rendered line plot.
+///
+/// Called before [`LinePlot`] paints so the grid sits under the series.
 fn paint_underlay(
     outer_bounds: Bounds<Pixels>,
     view: PlotBounds,
@@ -420,10 +421,10 @@ fn paint_underlay(
     }
 }
 
-/// Paint the "overlay" chrome of a `TimeSeriesPlot`: semi-transparent
-/// axis background fills (which hide any GPU-frame edge bleeds), axis
-/// labels, and the L-shaped outer axes. Drawn *over* the `LinePlot`
-/// child so labels and axes appear on top.
+/// Paint axis chrome on top of the GPU-rendered line plot.
+///
+/// Renders the semi-transparent axis fills (which mask sub-pixel GPU-frame
+/// bleeds into the chrome), tick labels, and the L-shaped axes.
 fn paint_overlay(
     outer_bounds: Bounds<Pixels>,
     view: PlotBounds,
@@ -446,8 +447,8 @@ fn paint_overlay(
         strikethrough: None,
     };
 
-    // Semi-transparent fills over axis label areas — hide any GPU frame
-    // bleed into the chrome strips.
+    // Semi-transparent axis fills mask any GPU-frame edge that strays into
+    // the chrome strips.
     let axis_bg = Hsla {
         a: 0.5,
         ..theme.bg_secondary
@@ -522,7 +523,7 @@ fn paint_overlay(
     }
 }
 
-/// How a trace is drawn on the plot.
+/// Rendering mode for a single [`Trace`].
 #[derive(Clone, Copy, Default, PartialEq, facet::Facet)]
 #[repr(u8)]
 pub enum PlotStyle {
@@ -553,7 +554,8 @@ impl PlotStyle {
     }
 }
 
-/// A single trace on a time series plot: one element index from one component.
+/// One series on a plot: a single element of a component with its own
+/// color, style, and label.
 #[derive(Clone, facet::Facet)]
 #[facet(pod)]
 pub struct Trace {
@@ -582,14 +584,12 @@ impl Trace {
     }
 }
 
-/// Interactive time-series plot with multi-trace support, pan, and zoom.
+/// Interactive wrapper around a [`LinePlot`] that adds axes, legend, and
+/// pan/zoom input.
 ///
-/// All the line-drawing state (traces, per-trace y-bounds tracking,
-/// view overrides, GPU render state, title) lives inside [`LinePlot`],
-/// which is also the inspectable Facet target. This entity is just
-/// the outer container that manages user interaction (drag, zoom,
-/// double-click reset) and the axis chrome painted around the
-/// `LinePlot` child.
+/// All plot state — traces, bounds tracking, view overrides, GPU resources
+/// — lives in the inner [`LinePlot`] (also the Facet inspection target).
+/// `TimeSeriesPlot` only owns drag state and chrome.
 pub struct TimeSeriesPlot {
     line_plot: Entity<LinePlot>,
     drag_start: Option<Point<Pixels>>,
@@ -605,8 +605,8 @@ impl TimeSeriesPlot {
             lp.bind_traces(traces, cx);
             lp
         });
-        // Re-render legend + chrome when the LinePlot's traces or view
-        // change (e.g., legend-toggle of `visible`, inspector edits).
+        // Legend and chrome live on this entity; listen to the inner
+        // LinePlot so trace toggles and inspector edits trigger a repaint.
         cx.observe(&line_plot, |_, _, cx| cx.notify()).detach();
         Self {
             line_plot,
@@ -617,8 +617,8 @@ impl TimeSeriesPlot {
         }
     }
 
-    /// Convenience: create a plot for a single component with the given element
-    /// indexes, auto-assigning colors from the theme palette.
+    /// Convenience constructor: one trace per element, colors cycled from
+    /// the theme's categorical palette, labels derived from element names.
     pub fn from_component(
         db: Arc<DB>,
         component_id: impl Into<ComponentId>,
@@ -669,14 +669,12 @@ impl TimeSeriesPlot {
         self.line_plot.read(cx).title()
     }
 
-    /// Read the current effective view from the embedded `LinePlot`.
-    /// Used by drag/zoom handlers and by `Viewer3dPanel::serialize`
-    /// downstream.
+    /// Current effective view (auto-fit unless the user has overridden it).
     pub fn view(&self, cx: &gpui::App) -> Option<PlotBounds> {
         self.line_plot.read(cx).effective_view(cx)
     }
 
-    /// Reset all view overrides so the plot snaps back to auto-fit.
+    /// Clear every user-imposed bound so auto-fit resumes on the next frame.
     fn reset_view(&mut self, cx: &mut Context<Self>) {
         self.line_plot.update(cx, |lp, cx| {
             lp.x_range = TimeRangeBehavior::default();

@@ -1,7 +1,11 @@
-// Custom Facet attributes for the property inspector.
-//
-// These attributes control how fields appear in the UI inspector and
-// command palette. Applied via `#[facet(inspect::...)]` syntax.
+//! Facet attribute grammar driving inspector rendering.
+//!
+//! Types opt into richer inspector behavior by annotating fields with
+//! `#[facet(inspect::...)]`. The registry dispatch in `inspector::registry`
+//! reads these attributes when choosing a row builder.
+//!
+//! The grammar lives in its own module (not the derive crate) because the
+//! `define_attr_grammar!` macro needs to resolve `Attr` at the call site.
 facet::define_attr_grammar! {
     ns "inspect";
     crate_path ::metor_panel::inspect;

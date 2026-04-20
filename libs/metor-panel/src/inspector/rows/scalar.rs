@@ -5,7 +5,10 @@ use gpui::{AnyElement, App, SharedString, Window, div, prelude::*, px};
 use super::{InspectorRow, RowAction, row_base};
 use crate::theme::theme;
 
-/// Text-editable numeric field row.
+/// Inspector row for a numeric field.
+///
+/// Shows the current value as text; activation starts inline editing.
+/// Unparsable input is silently dropped rather than raising an error.
 pub struct ScalarRow {
     pub label: SharedString,
     pub value: f64,

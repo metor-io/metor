@@ -5,13 +5,13 @@ use serde::{Deserialize, Serialize};
 
 use super::item::{PaneItem, PaneItemHandle};
 
-/// Serialized snapshot of an entire tile layout.
+/// On-disk form of a tile layout.
 #[derive(Serialize, Deserialize)]
 pub struct SerializedTileGroup {
     pub root: SerializedMember,
 }
 
-/// A node in the serialized tile tree: either a pane or a split.
+/// Node in a serialized tree; mirrors the runtime `Member` enum.
 #[derive(Serialize, Deserialize)]
 #[serde(tag = "type")]
 pub enum SerializedMember {
@@ -19,7 +19,7 @@ pub enum SerializedMember {
     Split(SerializedSplit),
 }
 
-/// A serialized split axis with flex proportions and child members.
+/// Persisted split node: axis, per-child flex weights, and recursive children.
 #[derive(Serialize, Deserialize)]
 pub struct SerializedSplit {
     pub axis: SerializedAxis,
@@ -51,24 +51,27 @@ impl From<SerializedAxis> for gpui::Axis {
     }
 }
 
-/// A serialized pane with its active tab index and items.
+/// Persisted pane: which tab was active plus the items themselves.
 #[derive(Serialize, Deserialize)]
 pub struct SerializedPane {
     pub active_index: usize,
     pub items: Vec<SerializedItem>,
 }
 
-/// A serialized pane item identified by its type key and JSON state.
+/// Persisted pane item, tagged with the [`PaneItem::serialization_key`] used
+/// to pick a deserializer at load time.
 #[derive(Serialize, Deserialize)]
 pub struct SerializedItem {
     pub kind: String,
     pub state: serde_json::Value,
 }
 
-/// Type-erased deserializer function.
 type DeserializeFn = Box<dyn Fn(serde_json::Value, &mut Context<super::pane::Pane>) -> Option<Box<dyn PaneItemHandle>>>;
 
-/// Registry mapping serialization keys to item deserializers.
+/// Directory of `serialization_key -> constructor` used to rehydrate items.
+///
+/// Must be populated with every pane-item type before
+/// [`TileGroup::deserialize`] is called, or the item is silently dropped.
 pub struct ItemRegistry {
     deserializers: HashMap<String, DeserializeFn>,
 }
@@ -86,8 +89,7 @@ impl ItemRegistry {
         Self::default()
     }
 
-    /// Register a deserializer for a PaneItem type.
-    /// The closure receives the serialized JSON state and should return an Entity.
+    /// Associate `T`'s serialization key with a constructor from JSON state.
     pub fn register<T: PaneItem>(
         &mut self,
         deserialize: impl Fn(serde_json::Value, &mut Context<super::pane::Pane>) -> Option<Entity<T>> + 'static,
@@ -101,7 +103,8 @@ impl ItemRegistry {
         );
     }
 
-    /// Deserialize an item by its kind key.
+    /// Invoke the registered constructor for `kind`. Returns `None` when no
+    /// type matches, so the caller can drop unknown items from the layout.
     pub fn deserialize(
         &self,
         kind: &str,

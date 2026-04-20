@@ -4,14 +4,18 @@ use metor_db::DB;
 use metor_proto::types::{ComponentId, ComponentView, ElementValue};
 use smallvec::SmallVec;
 
-/// Element indices within a component (e.g. x=0, y=1, z=2 for a Vec3).
+/// Packed element indices into a multi-dimensional component.
+///
+/// Inline capacity covers a Vec3 (3) or small matrix (9) without spilling
+/// to the heap; larger components allocate.
 pub type ElementIndexes = SmallVec<[usize; 8]>;
 
-/// Format a component value using metadata hints.
+/// Render a component value respecting its metadata.
 ///
-/// - `is_string`: interprets U8 bytes as UTF-8
-/// - `enum_variants`: maps integer value to variant name
-/// - Otherwise: numeric display with 4 decimal places
+/// - String components (U8 marked `is_string`) decode as UTF-8 up to the
+///   first NUL.
+/// - Enum components map the integer value to a variant name.
+/// - Everything else falls back to 4-decimal numeric formatting.
 pub fn format_value(view: ComponentView<'_>, db: &DB, component_id: ComponentId) -> String {
     let meta = db.with_state(|s| s.get_component_metadata(component_id).cloned());
     if let Some(meta) = &meta {
@@ -37,7 +41,7 @@ pub fn format_value(view: ComponentView<'_>, db: &DB, component_id: ComponentId)
     s
 }
 
-/// Format a single element value, respecting enum variant metadata.
+/// Render one element, substituting a variant name when the component is an enum.
 pub fn format_element_value(value: ElementValue, enum_variants: Option<&[&str]>) -> String {
     if let Some(variants) = enum_variants {
         let idx = value.as_usize();
@@ -48,8 +52,10 @@ pub fn format_element_value(value: ElementValue, enum_variants: Option<&[&str]>)
     super::value_strip::format_element(value)
 }
 
-/// Format a number with adaptive precision: drops unnecessary trailing
-/// zeros for large magnitudes and keeps more digits for small ones.
+/// Adaptive-precision number formatter.
+///
+/// Keeps large magnitudes compact (no trailing decimals above 1000) and
+/// preserves resolution below unity (4 fractional digits under 1.0).
 pub(crate) fn format_number(v: f64) -> String {
     if v == 0.0 {
         "0".to_string()

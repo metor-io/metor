@@ -8,11 +8,11 @@ const THUMB_RADIUS: f32 = 3.0;
 const MIN_THUMB: f32 = 25.0;
 const TRACK_MARGIN: f32 = 1.0;
 
-/// A simple scrollbar thumb rendered as an absolutely-positioned div.
+/// Indicator-only scrollbar rendered absolutely within a `relative()` parent.
 ///
-/// Place this as a child of a `relative()` container. It computes the thumb
-/// position and size from the viewport size, content size, and current scroll
-/// offset, then renders a rounded bar along the specified axis.
+/// Non-interactive: the host handles wheel and drag events itself. The
+/// scrollbar just reflects progress so the user sees where they are in a
+/// long list.
 #[derive(IntoElement)]
 pub struct Scrollbar {
     axis: Axis,
@@ -22,11 +22,10 @@ pub struct Scrollbar {
 }
 
 impl Scrollbar {
-    /// Create a scrollbar for the given axis.
+    /// Build an indicator for `axis`.
     ///
-    /// - `viewport`: visible size along the axis (px)
-    /// - `content`: total content size along the axis (px)
-    /// - `offset`: current scroll position (positive = scrolled into content)
+    /// All sizes are in pixels. `offset` is the positive distance the
+    /// viewport has been scrolled into the content.
     pub fn new(axis: Axis, viewport: f32, content: f32, offset: f32) -> Self {
         Self {
             axis,
@@ -36,7 +35,7 @@ impl Scrollbar {
         }
     }
 
-    /// Whether the scrollbar should be visible (content overflows viewport).
+    /// `true` when content overflows the viewport and the bar should render.
     pub fn visible(&self) -> bool {
         self.content > self.viewport
     }

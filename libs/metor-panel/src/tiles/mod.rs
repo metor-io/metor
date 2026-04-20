@@ -20,12 +20,16 @@ pub use item::{PaneItem, PaneItemHandle};
 pub use pane::{Pane, PaneEvent};
 pub use serial::{ItemRegistry, SerializedTileGroup};
 
-/// Path of member indices through the tile split tree.
+/// Sequence of member indices locating a node in the split tree.
+///
+/// `SmallVec` inlines the first four levels since the UI is rarely nested
+/// deeper and the path is cloned on every handle render.
 pub(crate) type SplitPath = SmallVec<[usize; 4]>;
 
-/// Events emitted by TileGroup to its parent.
+/// Events the tile group forwards to its owning view.
 pub enum TileGroupEvent {
-    /// A panel item requested inspection/editing (e.g. via right-click on tab).
+    /// User asked to inspect a pane item (typically via right-click on a tab).
+    /// The position marks where to anchor the inspector.
     Inspect {
         item: Box<dyn PaneItemHandle>,
         position: Point<Pixels>,
@@ -36,12 +40,16 @@ impl EventEmitter<TileGroupEvent> for TileGroup {}
 
 const RESIZE_HANDLE_SIZE: f32 = 1.0;
 
-/// A recursive split tree member: either a leaf pane or an axis split.
+/// A node in the split tree: a leaf [`Pane`] or an interior [`SplitAxis`].
 enum Member {
     Pane(Entity<Pane>),
     Axis(SplitAxis),
 }
 
+/// Interior node laying children out along a single axis.
+///
+/// `flexes[i]` is the flex-grow weight for `members[i]`; during resize these
+/// values shift within a pair so the total for an axis stays constant.
 struct SplitAxis {
     axis: Axis,
     members: Vec<Member>,
@@ -60,7 +68,11 @@ impl SplitAxis {
 }
 
 impl Member {
-    /// Find the target pane and replace it with a split containing old + new pane.
+    /// Insert `new_pane` next to `target` along `direction`.
+    ///
+    /// If `target` already sits in a split along the matching axis, the new
+    /// pane is appended as a sibling; otherwise a new `SplitAxis` wraps both.
+    /// Returns `true` if `target` was found.
     fn split(
         &mut self,
         target: &Entity<Pane>,
@@ -83,7 +95,6 @@ impl Member {
                 true
             }
             Member::Axis(axis) => {
-                // Check if we can append to this axis (same direction)
                 for i in 0..axis.members.len() {
                     if let Member::Pane(pane) = &axis.members[i] {
                         if pane.entity_id() == target.entity_id() && axis.axis == direction.axis() {
@@ -105,7 +116,10 @@ impl Member {
         }
     }
 
-    /// Remove a pane from the tree. Returns true if found and removed.
+    /// Remove `target` from the tree. Returns `true` when found.
+    ///
+    /// Leaves empty axis nodes behind; run [`Member::collapse`] afterwards to
+    /// unwrap single-child axes.
     fn remove(&mut self, target: &Entity<Pane>) -> bool {
         match self {
             Member::Pane(pane) => pane.entity_id() == target.entity_id(),
@@ -128,10 +142,12 @@ impl Member {
         }
     }
 
-    /// Collapse single-child axes into their child.
+    /// Bottom-up pass that replaces any single-child axis with its child.
+    ///
+    /// Called after [`Member::remove`] so a 2-way split holding one pane
+    /// doesn't render an empty slot.
     fn collapse(&mut self) {
         if let Member::Axis(axis) = self {
-            // First collapse children
             for member in &mut axis.members {
                 member.collapse();
             }
@@ -184,7 +200,6 @@ impl Member {
                 let mut children: Vec<AnyElement> = Vec::new();
 
                 for (ix, member) in axis.members.iter().enumerate() {
-                    // Resize handle between children
                     if ix > 0 {
                         let handle =
                             render_resize_handle(path.clone(), ix, axis.axis, tile_group, cx);
@@ -211,7 +226,7 @@ impl Member {
                     children.push(child_div.into_any_element());
                 }
 
-                // Track axis bounds for resize calculations
+                // Resize handles need the axis's on-screen extent; capture it here.
                 let tg = tile_group.clone();
                 let p = path.clone();
                 let bounds_tracker = gpui::canvas(
@@ -246,7 +261,7 @@ fn render_resize_handle(
     let theme = theme(cx);
     let tg = tile_group.clone();
 
-    // Build a unique ID from the full path + handle index to avoid collisions in nested splits
+    // Hash path + handle index so gpui element IDs stay unique across nested splits.
     let mut id_hash: u64 = handle_ix as u64;
     for &segment in path.as_slice() {
         id_hash = id_hash.wrapping_mul(31).wrapping_add(segment as u64);
@@ -297,16 +312,20 @@ fn render_resize_handle(
         })
 }
 
-/// Root of the tile system. Create with `cx.new(|cx| TileGroup::new(..., cx))`.
+/// Owns the split tree that fills the main viewport.
+///
+/// Panes are flat-indexed for fast iteration; the tree is only consulted for
+/// layout and structural edits. Axis bounds are cached during paint so
+/// resize drags can convert pixel positions into flex weights without a
+/// second traversal.
 pub struct TileGroup {
     root: Member,
     panes: Vec<Entity<Pane>>,
-    /// Cached bounds for each axis path, updated during render.
     axis_bounds: std::collections::HashMap<SplitPath, gpui::Bounds<gpui::Pixels>>,
 }
 
 impl TileGroup {
-    /// Create a new TileGroup with a single pane.
+    /// Build a tile group containing a single pane seeded with `items`.
     pub fn new(items: Vec<Box<dyn PaneItemHandle>>, cx: &mut Context<Self>) -> Self {
         let pane = cx.new(|cx| Pane::new(items, cx));
         cx.subscribe(&pane, Self::handle_pane_event).detach();
@@ -318,7 +337,10 @@ impl TileGroup {
         }
     }
 
-    /// Create a TileGroup with a pre-built pane entity.
+    /// Adopt an already-constructed pane as the sole member of the tree.
+    ///
+    /// Use when the caller needs to hold the pane entity before handing
+    /// ownership of the layout to the tile group.
     pub fn from_pane(pane: Entity<Pane>, cx: &mut Context<Self>) -> Self {
         cx.subscribe(&pane, Self::handle_pane_event).detach();
         let panes = vec![pane.clone()];
@@ -333,7 +355,7 @@ impl TileGroup {
         &self.panes
     }
 
-    /// Add a pane by splitting an existing one.
+    /// Split `target` along `direction`, placing `new_pane` beside it.
     pub fn split_pane(
         &mut self,
         target: &Entity<Pane>,
@@ -347,7 +369,8 @@ impl TileGroup {
         cx.notify();
     }
 
-    /// Remove a pane from the tree (called when pane becomes empty).
+    /// Drop a pane from the layout; usually triggered by a pane emitting
+    /// [`PaneEvent::Empty`].
     pub fn remove_pane(&mut self, target: &Entity<Pane>, cx: &mut Context<Self>) {
         self.root.remove(target);
         self.root.collapse();
@@ -355,14 +378,16 @@ impl TileGroup {
         cx.notify();
     }
 
-    /// Serialize the entire tile layout to a JSON-compatible structure.
+    /// Snapshot the full layout (tree shape, flexes, and each item's own
+    /// persisted state) for saving to disk.
     pub fn serialize(&self, cx: &App) -> SerializedTileGroup {
         SerializedTileGroup {
             root: self.root.serialize(cx),
         }
     }
 
-    /// Deserialize a tile layout from a serialized structure.
+    /// Rebuild a layout from a [`SerializedTileGroup`]. Items whose
+    /// serialization key is absent from `registry` are silently dropped.
     pub fn deserialize(
         serialized: SerializedTileGroup,
         registry: &ItemRegistry,
@@ -427,7 +452,7 @@ impl TileGroup {
                 self.split_pane(&pane, new_pane, *direction, cx);
             }
             PaneEvent::Empty => {
-                // Only remove if there's more than one pane
+                // Keep one empty pane around so the layout is never void.
                 if self.panes.len() > 1 {
                     self.remove_pane(&pane, cx);
                 }
@@ -472,7 +497,6 @@ impl TileGroup {
                 return;
             }
 
-            // Compute the fraction of total space that should be before the handle
             let ratio = (rel / total).clamp(0.0, 1.0);
 
             let left = handle_ix - 1;
@@ -481,13 +505,13 @@ impl TileGroup {
                 return;
             }
 
-            // The two panes sharing this handle own a combined flex budget
+            // Only the two panes adjacent to the handle redistribute flex;
+            // everything else keeps its current weight so unrelated panes
+            // don't visibly shift when the user drags one boundary.
             let pair_flex = axis.flexes[left] + axis.flexes[right];
-            // How much of the total flex is before the left pane?
             let flex_before_pair: f32 = axis.flexes[..left].iter().sum();
             let flex_sum: f32 = axis.flexes.iter().sum();
 
-            // Target flex for the left pane: map the mouse ratio into the pair's budget
             let target_left = (ratio * flex_sum - flex_before_pair).clamp(0.05, pair_flex - 0.05);
             let target_right = pair_flex - target_left;
 
@@ -499,7 +523,6 @@ impl TileGroup {
 
     fn find_axis_mut(&mut self, path: &[usize]) -> Option<&mut SplitAxis> {
         let mut current = &mut self.root;
-        // Navigate along the full path
         for &ix in path {
             current = match current {
                 Member::Axis(axis) => axis.members.get_mut(ix)?,

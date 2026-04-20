@@ -19,44 +19,43 @@ const MIN_COL_WIDTH: f32 = 120.0;
 const MAX_COL_WIDTH: f32 = 800.0;
 const MIN_DETAIL_WIDTH: f32 = 320.0;
 
-/// Provides tree data and per-item rendering for a [`ColumnBrowser`].
+/// Data source and label supplier for a [`ColumnBrowser`].
 ///
-/// A delegate owns the authoritative selection state (typically as a path of
-/// stable keys). The generic widget holds only ephemeral view state (column
-/// widths, scroll handles, focused column) and defers every tree query to
-/// the delegate, including `resolve_selection` — which is called each render
-/// so that external tree rebuilds don't invalidate a cached chain of items.
+/// The delegate owns selection (typically stored as a path of stable keys);
+/// the widget retains only view state (column widths, scroll positions,
+/// focused column). `resolve_selection` runs every render so external tree
+/// mutations propagate without explicit invalidation.
 pub trait ColumnBrowserDelegate: Sized + 'static {
-    /// One row in a column. Typically a lightweight handle like `Arc<Node>`.
+    /// One row value. Keep it cheap to clone: `Arc`-based handles work well.
     type Item: Clone + 'static;
 
-    /// Live chain of selected items, resolved against the current tree.
-    /// Called on every render; truncate at the first missing item.
+    /// Current selection resolved against the live tree.
+    ///
+    /// Truncate at the first missing ancestor so the browser collapses back
+    /// to a valid prefix after a tree rebuild.
     fn resolve_selection(&self, cx: &App) -> SmallVec<[Self::Item; 8]>;
 
-    /// Items in column 0 (honoring any root override set via
-    /// [`set_root_override`](Self::set_root_override)).
+    /// Items shown in column 0, honoring any [`set_root_override`](Self::set_root_override).
     fn root_items(&self, cx: &App) -> Vec<Self::Item>;
 
-    /// Children of `item` — used to render every non-root column.
     fn children(&self, item: &Self::Item, cx: &App) -> Vec<Self::Item>;
 
-    /// `true` when `item` has no further drill-down (shows preview instead).
+    /// `true` when `item` should display a preview instead of a child column.
     fn is_leaf(&self, item: &Self::Item) -> bool;
 
-    /// Row label text.
     fn item_label(&self, item: &Self::Item) -> SharedString;
 
-    /// Column header label. `parent` is `None` for the root column.
+    /// Header text for a column. `parent` is `None` for the root column.
     fn column_label(&self, parent: Option<&Self::Item>) -> SharedString;
 
-    /// Identity predicate used to match the delegate's stored selection
-    /// against freshly produced items after a tree rebuild.
+    /// Identity comparison used to reattach a stored selection to freshly
+    /// produced items.
     fn items_equal(&self, a: &Self::Item, b: &Self::Item) -> bool;
 
-    /// Commit a click / keyboard pick. `column_ix` is the column the user
-    /// picked in; the delegate is responsible for truncating any deeper
-    /// selection.
+    /// Record that the user picked `item` in `column_ix`.
+    ///
+    /// The delegate must truncate any deeper prior selection so the new
+    /// pick becomes the tail.
     fn set_selection(
         &mut self,
         column_ix: usize,
@@ -64,22 +63,24 @@ pub trait ColumnBrowserDelegate: Sized + 'static {
         cx: &mut Context<ColumnBrowser<Self>>,
     );
 
-    /// Anchor the browser at a new virtual root. `ancestors` is the chain of
-    /// nodes from the prior root down to (but not including) the new root's
-    /// children column. The new root itself is `ancestors.last()`.
+    /// Set a virtual root so the browser behaves as though a sub-node were
+    /// the top of the tree.
+    ///
+    /// `ancestors` is the chain from the original root down to the new
+    /// root; `ancestors.last()` is the node whose children become column 0.
     fn set_root_override(
         &mut self,
         ancestors: SmallVec<[Self::Item; 8]>,
         cx: &mut Context<ColumnBrowser<Self>>,
     );
 
-    /// Return to the true root.
+    /// Undo a [`set_root_override`](Self::set_root_override).
     fn clear_root_override(&mut self, cx: &mut Context<ColumnBrowser<Self>>);
 
-    /// Trailing detail column — rendered after all navigation columns on
-    /// every frame. `tail` is the currently selected leaf/branch, or `None`
-    /// when nothing is selected (the delegate decides what "under root"
-    /// means). Returning `None` suppresses the detail column entirely.
+    /// Optional trailing detail column.
+    ///
+    /// Rendered after every navigation column. `tail` is the selected node,
+    /// or `None` when nothing is selected. Return `None` to suppress.
     fn render_detail(
         &mut self,
         tail: Option<&Self::Item>,
@@ -90,13 +91,13 @@ pub trait ColumnBrowserDelegate: Sized + 'static {
         None
     }
 
-    /// Header label for the detail column (if rendered).
+    /// Header text above the detail column. Ignored when no detail renders.
     fn detail_label(&self, tail: Option<&Self::Item>) -> SharedString {
         let _ = tail;
         SharedString::default()
     }
 
-    /// Called on Enter / double-click of a row.
+    /// Triggered by Enter or a double-click on a row.
     fn on_activate(
         &mut self,
         item: &Self::Item,
@@ -107,13 +108,12 @@ pub trait ColumnBrowserDelegate: Sized + 'static {
     }
 }
 
-/// Finder-style column browser over a [`ColumnBrowserDelegate`].
+/// Finder-style hierarchical browser.
 ///
-/// Renders a left-to-right strip of columns: the root column, one children
-/// column per selected item that has children, and a trailing detail column
-/// supplied by the delegate. Supports click navigation, keyboard focus
-/// (Up/Down/Left/Right/Enter), resizable columns, and double-click-on-header
-/// to reroot the browser at a sub-prefix.
+/// Renders the root column, a child column per selected non-leaf item, and
+/// a trailing detail column supplied by the delegate. Keyboard navigation
+/// (arrow keys, Enter) and column resizing are built in; double-clicking a
+/// column header reroots the browser at that prefix.
 pub struct ColumnBrowser<D: ColumnBrowserDelegate> {
     delegate: D,
     focus_handle: FocusHandle,

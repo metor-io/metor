@@ -1,7 +1,10 @@
-/// Unified inspector — the everything-palette and right-click panel.
-///
-/// Operates on [`InspectorRow`] widgets with a page-stack navigation model.
-/// Can render as either an anchored right-click panel or a centered overlay.
+//! The unified inspector: command palette and right-click property editor.
+//!
+//! The inspector is a row-list backed by a page stack. Any action that needs
+//! to "drill into" another view pushes a new page instead of opening a
+//! separate window, giving the palette and the property inspector a single
+//! implementation and a consistent keyboard model. [`InspectorMode`]
+//! controls whether the panel anchors to a point or centers in the window.
 use std::ops::Range;
 use std::sync::Arc;
 
@@ -23,7 +26,9 @@ use rows::{InspectorRow, RowAction, TextField};
 
 const ROW_HEIGHT: f32 = 28.0;
 
-/// Action to open the inspector for an arbitrary entity at a position.
+/// gpui action that asks the root view to inspect `entity` anchored at
+/// `position`. Dispatched from deep in the view tree so inspection can reach
+/// across pane boundaries without threading callbacks.
 #[derive(Clone, PartialEq, gpui::Action)]
 #[action(no_json)]
 pub struct InspectEntity {
@@ -31,31 +36,33 @@ pub struct InspectEntity {
     pub position: Point<Pixels>,
 }
 
-/// How the inspector is positioned on screen.
+/// Where the inspector draws itself relative to the window.
 #[derive(Clone, Copy)]
 pub enum InspectorMode {
-    /// Anchored at a specific point (right-click menu).
+    /// Snap the panel to a window point, used for right-click menus.
     Anchored(Point<Pixels>),
-    /// Centered in the window (command palette style).
+    /// Float near the top-center, used for the command palette.
     Centered,
 }
 
-/// Bundles everything needed to open an inspector from any entry point.
+/// Inputs needed to open an inspector from a callback.
 pub struct InspectorRequest {
     pub rows: Vec<Box<dyn InspectorRow>>,
     pub mode: InspectorMode,
 }
 
-/// Callback that opens an inspector.
+/// Callback installed by subsystems that want the ability to open an
+/// inspector without holding a direct reference to the root view.
 pub type OpenInspectorCallback = Arc<dyn Fn(InspectorRequest, &mut Window, &mut App) + 'static>;
 
-/// One page in the inspector's navigation stack.
 struct InspectorPage {
     rows: Vec<Box<dyn InspectorRow>>,
     label: Option<SharedString>,
 }
 
-/// Unified inspector panel with page-stack navigation.
+/// Row-list panel with page-stack navigation, fuzzy search, and inline
+/// editing. Rendered as either an anchored popup or a centered overlay
+/// depending on [`InspectorMode`].
 pub struct Inspector {
     pages: Vec<InspectorPage>,
     mode: InspectorMode,
@@ -118,7 +125,7 @@ impl Inspector {
         rows: Vec<Box<dyn InspectorRow>>,
         cx: &mut Context<Self>,
     ) {
-        // Set label on current page (becomes a breadcrumb pill)
+        // The outgoing page's label becomes a breadcrumb pill above the search box.
         if let Some(current) = self.pages.last_mut() {
             if current.label.is_none() {
                 current.label = label;
@@ -330,7 +337,6 @@ impl Inspector {
             .border_color(theme.border_primary)
             .text_size(px(12.0));
 
-        // Breadcrumb pills for stacked pages
         for page in &self.pages[..self.pages.len().saturating_sub(1)] {
             if let Some(label) = &page.label {
                 bar = bar.child(

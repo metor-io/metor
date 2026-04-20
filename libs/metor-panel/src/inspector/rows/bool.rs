@@ -5,7 +5,10 @@ use gpui::{AnyElement, App, SharedString, Window, div, prelude::*, px};
 use super::{InspectorRow, RowAction, checkbox, row_base};
 use crate::theme::theme;
 
-/// Toggle switch row for boolean fields.
+/// Inspector row for a `bool` field, rendered as a checkbox.
+///
+/// Activation flips the value and invokes `toggle` so the write can land on
+/// the owning entity via the reflection layer.
 pub struct BoolRow {
     pub label: SharedString,
     pub value: bool,

@@ -6,7 +6,10 @@ use crate::theme::theme;
 use super::item::PaneItemHandle;
 use super::pane::Pane;
 
-/// Data carried during a tab drag operation.
+/// Payload carried by gpui while a tab is being dragged.
+///
+/// The source pane and index are retained so the drop target can remove the
+/// tab from its origin without searching for it.
 pub struct DraggedTab {
     pub pane: Entity<Pane>,
     pub item: Box<dyn PaneItemHandle>,
@@ -29,12 +32,13 @@ impl Render for DraggedTab {
     }
 }
 
-/// Data carried during a split resize drag.
+/// Payload identifying which split handle is being dragged.
+///
+/// `path` locates the axis inside the tree; `handle_ix` is the gap the user
+/// grabbed, between `members[handle_ix - 1]` and `members[handle_ix]`.
 #[derive(Clone)]
 pub struct ResizeDrag {
-    /// Path of member indices to the SplitAxis being resized.
     pub path: SplitPath,
-    /// Index of the handle within that axis (between member[ix-1] and member[ix]).
     pub handle_ix: usize,
 }
 
@@ -44,7 +48,7 @@ impl Render for ResizeDrag {
     }
 }
 
-/// Direction for splitting a pane.
+/// Side of a pane a tab was dropped against.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum SplitDirection {
     Up,
@@ -61,14 +65,18 @@ impl SplitDirection {
         }
     }
 
-    /// Whether the new pane goes after (true) or before (false) the existing one.
+    /// `true` when the new pane is inserted after the existing one along the
+    /// axis (right of, or below). Used to pick insert positions.
     pub fn increasing(self) -> bool {
         matches!(self, Self::Down | Self::Right)
     }
 }
 
-/// Given cursor position within bounds, determine split direction.
-/// Returns None if cursor is in the center (meaning "add as tab").
+/// Classify a drop position inside a pane's content area.
+///
+/// The pane is divided into four edge strips (25% deep) plus a central
+/// region. A drop on an edge splits the pane; a drop in the center yields
+/// `None`, signalling the caller to insert the tab instead.
 pub fn detect_split_zone(
     cursor: Point<Pixels>,
     bounds: Bounds<Pixels>,

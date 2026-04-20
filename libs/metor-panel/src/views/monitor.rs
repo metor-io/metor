@@ -11,10 +11,13 @@ use crate::ComponentStreamBuilder;
 use crate::inspector::edits::{EditRequest, pending_edits, pending_edits_mut};
 use crate::theme::theme;
 
-/// Dashboard widget that displays a component's current value alongside its
-/// name and an optional sparkline. The value row itself is rendered by a
-/// shared [`ComponentValueStrip`] that handles streaming, formatting, and
-/// click-to-edit behaviour.
+/// Dashboard tile showing a component's current value, name, and an optional
+/// sparkline.
+///
+/// The widget delegates streaming, formatting, and click-to-edit to a shared
+/// [`ComponentValueStrip`]. Sparkline traces are bound lazily: producers may
+/// register the component after the monitor is placed, so an async resolver
+/// rebinds when the schema finally shows up in the DB.
 #[derive(facet::Facet)]
 pub struct Monitor {
     #[facet(skip)]
@@ -57,8 +60,9 @@ impl Monitor {
 
         let sparkline = cx.new(|cx| LinePlot::new(db.clone(), cx));
 
-        // Seed traces when the component is already registered so the
-        // sparkline is not momentarily empty.
+        // Eager bind avoids a one-frame empty sparkline when the component
+        // is already registered. The async resolver below handles the case
+        // where it isn't.
         if let Some(comp) = db.with_state(|state| state.get_component(component_id).cloned()) {
             let element_count: usize = comp.schema.dim.iter().product::<usize>().max(1);
             let traces = build_traces(component_id, element_count, &line_colors);
@@ -82,8 +86,8 @@ impl Monitor {
             ComponentValueStrip::new(db.clone(), source, style, behavior, cx)
         });
 
-        // Rebind traces once the component is registered — until then the
-        // eager rebind above may have fallen through and the plot is empty.
+        // Await component registration, then rebind traces to match its
+        // actual element count.
         let resolver_task = cx.spawn({
             let db = db.clone();
             let sparkline = sparkline.clone();
@@ -136,10 +140,11 @@ fn build_traces(
         .collect()
 }
 
-/// Build the click adapter that forwards strip clicks to the pending-edit
-/// palette. Element names are re-resolved at click time to reflect the
-/// component's latest metadata. The click position is carried through as the
-/// anchor so the resulting inspector opens next to the cell.
+/// Click adapter that routes a strip click into the pending-edit palette.
+///
+/// Element names are looked up at click time so a metadata refresh doesn't
+/// leave the palette showing stale labels. The cursor position travels with
+/// the request so the inspector anchors next to the clicked cell.
 pub(crate) fn edit_click(
     db: Arc<DB>,
     component_id: ComponentId,
@@ -161,8 +166,10 @@ pub(crate) fn edit_click(
     })
 }
 
-/// Snapshot the current pending-edits state relevant to `component_id` into
-/// a [`StripBehavior`]. Shared by all three consumers of the strip.
+/// Build a fresh [`StripBehavior`] each frame from the global pending-edit state.
+///
+/// Centralises the snapshot so Monitor, ComponentText, and ComponentTable
+/// share the same edit semantics (highlighted indices and lock state).
 pub(crate) fn behavior_snapshot(
     cx: &gpui::App,
     db: Arc<DB>,
@@ -182,9 +189,8 @@ pub(crate) fn behavior_snapshot(
     }
 }
 
-/// Build the chevron-click adapter: applies the pending edit for this
-/// component (whole-value send) and drops `element_index` from the pending
-/// UI list.
+/// Chevron-click adapter: sends the component's full pending value and
+/// clears `element_index` from the UI's modified list.
 pub(crate) fn apply_click(db: Arc<DB>, component_id: ComponentId) -> StripClick {
     Arc::new(move |element_index, _position, _window, cx| {
         crate::inspector::edits::apply_element(&db, component_id, element_index, cx);

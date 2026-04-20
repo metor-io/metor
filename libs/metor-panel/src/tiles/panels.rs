@@ -17,7 +17,7 @@ use crate::inspector::rows::{CommandRow, InspectorRow, NavRow};
 use super::item::{PaneItem, PaneItemHandle};
 use super::pane::Pane;
 
-/// Tile panel wrapping a [`ComponentText`] display.
+/// Pane item that renders a single component's latest value as text.
 pub struct TextPanel {
     inner: Entity<ComponentText>,
     label: SharedString,
@@ -58,7 +58,7 @@ impl PaneItem for TextPanel {
     }
 }
 
-/// Tile panel wrapping a [`ComponentTable`].
+/// Pane item listing every component in the DB as a flat table.
 pub struct TablePanel {
     inner: Entity<ComponentTable>,
     label: SharedString,
@@ -94,7 +94,7 @@ impl PaneItem for TablePanel {
     }
 }
 
-/// Tile panel wrapping a [`ComponentBrowser`] for Finder-style namespace navigation.
+/// Pane item with a Finder-style browser over the component namespace tree.
 pub struct BrowserPanel {
     inner: Entity<ComponentBrowser>,
     label: SharedString,
@@ -130,13 +130,18 @@ impl PaneItem for BrowserPanel {
     }
 }
 
-/// Tile panel wrapping a [`TimeSeriesPlot`], with inspection support for trace configuration.
+/// Pane item hosting a time-series plot.
+///
+/// The panel is a thin wrapper around [`TimeSeriesPlot`]; inspection is
+/// routed to the inner [`LinePlot`] so trace configuration shows up in the
+/// property inspector.
 pub struct PlotPanel {
     inner: Entity<TimeSeriesPlot>,
     line_plot: Entity<LinePlot>,
 }
 
 impl PlotPanel {
+    /// Build a plot showing the selected elements of a single component.
     pub fn new(
         db: Arc<DB>,
         component_id: ComponentId,
@@ -148,12 +153,12 @@ impl PlotPanel {
         Self { inner, line_plot }
     }
 
-    /// Create an empty plot panel, ready to be configured via the inspector.
+    /// Build a plot with no traces; configure via the trace picker.
     pub fn empty(db: Arc<DB>, cx: &mut Context<Self>) -> Self {
         Self::with_traces(db, vec![], cx)
     }
 
-    /// Create a plot panel pre-populated with the given traces.
+    /// Build a plot seeded with an explicit trace list.
     pub fn with_traces(
         db: Arc<DB>,
         traces: Vec<crate::views::time_series::Trace>,
@@ -164,7 +169,6 @@ impl PlotPanel {
         Self { inner, line_plot }
     }
 
-    /// The inner TimeSeriesPlot entity.
     pub(crate) fn inner(&self) -> &Entity<TimeSeriesPlot> {
         &self.inner
     }
@@ -195,7 +199,7 @@ impl PaneItem for PlotPanel {
     }
 }
 
-/// Tile panel wrapping a [`Viewer3d`] with inspector support.
+/// Pane item hosting the Bevy-backed 3D viewer.
 pub struct Viewer3dPanel {
     inner: Entity<Viewer3d>,
     label: SharedString,
@@ -263,11 +267,11 @@ impl PaneItem for Viewer3dPanel {
     }
 }
 
-/// Build the inspector rows for the "New Panel" submenu in the
-/// everything-palette. Each row creates a new panel and adds it to `pane`.
+/// Rows for the palette's "New Panel" submenu.
 ///
-/// Time-Series-Plot also auto-opens the trace wizard via `on_open_inspector`
-/// (when supplied).
+/// Each row adds a freshly-constructed panel to `pane`. The time-series row
+/// detours through the trace picker, then calls `on_open_inspector` (if
+/// provided) so the user can immediately configure the plot.
 pub fn new_panel_rows(
     db: Arc<DB>,
     pane: Entity<Pane>,
@@ -397,8 +401,7 @@ pub fn new_panel_rows(
     rows
 }
 
-/// Build inspector rows listing available components, calling `on_select`
-/// with the chosen component ID and name.
+/// Rows listing every known component; selecting one invokes `on_select`.
 pub fn component_picker_rows(
     db: Arc<DB>,
     on_select: impl Fn(ComponentId, String, &mut App) + 'static,

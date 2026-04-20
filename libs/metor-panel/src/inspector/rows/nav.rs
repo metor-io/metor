@@ -4,16 +4,16 @@ use super::{InspectorRow, RowAction, row_base};
 use crate::icons::Icon;
 use crate::theme::theme;
 
-/// A navigable row that cascades to sub-rows built by a factory closure.
+/// Drill-down row whose child page is rebuilt from scratch on every
+/// activation.
 ///
-/// The factory is called on each activation, producing fresh rows that
-/// reflect the current state. This is the building block for lists,
-/// nested structs, and any row that opens a child panel.
+/// Re-evaluating the factory each time keeps cascaded pages in sync with
+/// the world without listener bookkeeping: the child rows see the state
+/// live on entry rather than a stale snapshot.
 pub struct NavRow {
     pub label: SharedString,
     pub summary: SharedString,
     pub build_children: Box<dyn Fn(&gpui::App) -> Vec<Box<dyn InspectorRow>>>,
-    /// Optional category pill rendered alongside the summary.
     tag: Option<SharedString>,
 }
 

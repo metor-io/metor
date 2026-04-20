@@ -13,7 +13,8 @@ fn scroll_margin() -> Pixels {
     px(4.0)
 }
 
-/// Visual styling for a [`TextField`].
+/// Visual styling bundled so themes can tweak a text field's appearance
+/// without touching its input logic.
 pub struct TextFieldStyle {
     pub font_size: Pixels,
     pub line_height: Pixels,
@@ -36,7 +37,12 @@ impl TextFieldStyle {
     }
 }
 
-/// A single-line text field with cursor, selection, and clipboard support.
+/// Minimal single-line text editor used inside the inspector.
+///
+/// Implements cursor movement, selection, standard shortcuts (Cmd-A/C/X/V,
+/// emacs-style Ctrl-A/E/F/B/D/K on macOS) and clipboard access without
+/// depending on gpui's heavier text-input widget. Clients drive repaint
+/// after each [`handle_key_down`].
 pub struct TextField {
     pub text: String,
     pub cursor: usize,
@@ -167,8 +173,10 @@ impl TextField {
         }
     }
 
-    /// Handle a key event. Returns `true` if the key was consumed (text changed
-    /// or cursor moved), `false` if the caller should handle it.
+    /// Dispatch a key event. Returns `true` when the field consumed it.
+    ///
+    /// `false` means the key did nothing visible and the host can interpret
+    /// it (e.g. empty-field backspace pops the inspector page).
     pub fn handle_key_down(&mut self, event: &KeyDownEvent, cx: &mut App) -> bool {
         let key = event.keystroke.key.as_str();
         let mods = &event.keystroke.modifiers;
@@ -265,7 +273,8 @@ impl TextField {
                     self.cursor = prev;
                     self.mark = self.cursor;
                 } else {
-                    return false; // empty — let caller handle (e.g. pop page)
+                    // Empty field: bubble so host can pop the page.
+                    return false;
                 }
                 true
             }
@@ -340,18 +349,17 @@ impl TextField {
                 (bounds, shaped, is_placeholder)
             },
             move |_, (bounds, shaped, is_placeholder), window, _cx| {
-                // Vertically center text within the element bounds
                 let y_offset = (bounds.size.height - line_height).max(px(0.0)) / 2.0;
                 let base_y = bounds.origin.y + y_offset;
 
-                // Compute cursor x position in the shaped line
                 let cursor_x = if is_placeholder {
                     px(0.0)
                 } else {
                     shaped.x_for_index(cursor)
                 };
 
-                // Compute scroll offset to keep cursor visible
+                // Horizontal scroll follows the cursor so long values stay
+                // legible within the field's visible width.
                 let visible_width = bounds.size.width;
                 let scroll_offset = if cursor_x > visible_width - scroll_margin() {
                     cursor_x - visible_width + scroll_margin()
@@ -361,12 +369,9 @@ impl TextField {
                 let max_scroll = (shaped.width - visible_width).max(px(0.0));
                 let scroll_offset = scroll_offset.min(max_scroll).max(px(0.0));
 
-                // Text origin (shifted left by scroll, vertically centered)
                 let text_origin = point(bounds.origin.x - scroll_offset, base_y);
 
-                // Clip to element bounds
                 window.with_content_mask(Some(gpui::ContentMask { bounds }), |window| {
-                    // 1. Paint selection highlight (behind text)
                     if !is_placeholder && mark != cursor {
                         let sel_start = mark.min(cursor);
                         let sel_end = mark.max(cursor);
@@ -380,10 +385,8 @@ impl TextField {
                         window.paint_quad(fill(sel_bounds, selection_color));
                     }
 
-                    // 2. Paint text
                     let _ = shaped.paint(text_origin, line_height, window, _cx);
 
-                    // 3. Paint cursor (on top of text)
                     let cursor_screen_x =
                         bounds.origin.x + cursor_x - scroll_offset - cursor_width() / 2.0;
                     let cursor_bounds = gpui::Bounds::new(

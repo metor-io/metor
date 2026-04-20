@@ -1,5 +1,8 @@
-//! Helpers shared by the default field-widget registrations: row builders for
-//! generic shapes (`Override<T>`, `Option<T>`), pickers, and wizard launchers.
+//! Row builders shared across default field-widget registrations.
+//!
+//! Keeps reusable shapes — `Override<T>`, `Option<T>`, component pickers,
+//! trace wizards — in one place so `defaults.rs` stays a flat list of
+//! registrations rather than a dumping ground of closures.
 
 use std::sync::Arc;
 
@@ -15,7 +18,8 @@ use crate::views::time_series::time_range::TimeRangeBehavior;
 
 use super::FieldBuildCtx;
 
-/// Extract the first SharedString field from a Facet struct as a display label.
+/// First non-empty `SharedString` field of `value`, used as a list-item label
+/// when no explicit label attribute is present.
 pub(super) fn find_label_field<T: Facet<'static>>(value: &T) -> Option<SharedString> {
     let peek = facet::Peek::new(value);
     let peek_struct = peek.into_struct().ok()?;
@@ -54,8 +58,7 @@ pub(super) fn build_component_picker(
         .collect()
 }
 
-/// Return the preset display name if `value` matches one of the
-/// [`TimeRangeBehavior::PRESETS`].
+/// Name of the matching preset, or `None` when `value` is a custom range.
 pub(super) fn preset_label(value: &TimeRangeBehavior) -> Option<&'static str> {
     TimeRangeBehavior::PRESETS
         .iter()
@@ -63,9 +66,11 @@ pub(super) fn preset_label(value: &TimeRangeBehavior) -> Option<&'static str> {
         .map(|(name, _)| *name)
 }
 
-/// Construct the top-level `NavRow` for an `Override<T>` field. Its summary
-/// reflects the current variant, and cascading reveals a value editor plus an
-/// "Auto" command row.
+/// Nav row for an [`Override<T>`] field.
+///
+/// Summary shows `Auto` or the formatted custom value; cascading into the
+/// row exposes the typed value editor plus an "Auto" shortcut that restores
+/// the automatic behavior.
 pub(super) fn build_override_row<T>(
     label: SharedString,
     current: Override<T>,
@@ -116,8 +121,11 @@ where
     ))
 }
 
-/// Build an `Option<T>` row. Currently only `Option<ComponentId>` is wired —
-/// other inner types render as a `None`/`Set` summary with no picker.
+/// Nav row for an `Option<T>` field.
+///
+/// Only `Option<ComponentId>` has a populated picker today; other inner
+/// types render as a passive `Set`/`None` summary so the walker doesn't
+/// silently drop the field.
 pub(super) fn build_option_row(
     ctx: &FieldBuildCtx,
     peek_option: facet::PeekOption<'_, '_>,
@@ -180,11 +188,11 @@ pub(super) fn build_option_row(
     ))
 }
 
-/// Build a trace construction wizard: component picker → element picker →
-/// append the new trace(s) to the existing `LinePlot`'s `traces` list.
+/// Trace-creation wizard for the "Add" button on a `LinePlot`'s trace list.
 ///
-/// Color-index basis is the parent's current trace count, so newly added
-/// traces continue the color palette where it left off.
+/// Drills through component → element selection and appends the resulting
+/// traces to the parent plot. The color basis starts at the parent's
+/// existing trace count so palette colors continue contiguously.
 pub(super) fn build_trace_add_wizard(
     parent: gpui::AnyEntity,
     db: &Arc<DB>,

@@ -1,8 +1,9 @@
-/// Per-type widget elements for the property inspector.
-///
-/// Each field type rendered in the inspector is a self-contained struct
-/// implementing [`InspectorRow`]. The [`Inspector`](crate::inspector::Inspector)
-/// container composes these rows without knowing their concrete types.
+//! Row widgets rendered inside an [`Inspector`](crate::inspector::Inspector).
+//!
+//! Every concrete widget lives in its own submodule and captures the
+//! closures needed to read and write its bound data. The inspector itself
+//! only sees [`InspectorRow`] trait objects and a [`RowAction`] reply when
+//! a row is activated, so adding a new widget doesn't touch shared code.
 use gpui::{AnyElement, App, Hsla, SharedString, Window, div, prelude::*, px};
 
 use crate::theme::theme;
@@ -31,15 +32,13 @@ pub use slider::SliderRow;
 pub use text::TextRow;
 pub use text_field::TextField;
 
-/// One row in an inspector panel.
-///
-/// Each widget struct captures its own entity handle and setter closure
-/// at construction time, making mutation self-contained.
+/// Contract every row in the inspector satisfies.
 pub trait InspectorRow: 'static {
-    /// Searchable label text for fuzzy filtering.
+    /// Text matched by the inspector's fuzzy search.
     fn label(&self) -> &str;
 
-    /// Render this row. `selected` indicates keyboard focus.
+    /// Paint the row. `selected` reflects keyboard focus and drives the
+    /// selection-background highlight.
     fn render_row(
         &self,
         row_ix: usize,
@@ -48,27 +47,28 @@ pub trait InspectorRow: 'static {
         cx: &mut App,
     ) -> AnyElement;
 
-    /// What happens when this row is activated (Enter / click).
+    /// Respond to Enter or a click. Returning a [`RowAction`] lets the row
+    /// mutate its bound data directly while delegating navigation and
+    /// dismissal to the host.
     fn activate(&mut self, window: &mut Window, cx: &mut App) -> RowAction;
 }
 
-/// Result of activating an inspector row.
+/// Reply from [`InspectorRow::activate`] directing what the host should do next.
 pub enum RowAction {
-    /// The row handled the action internally (e.g., bool toggled).
+    /// Row mutated its own state; refresh only.
     Handled,
-    /// Push a new page onto the inspector's page stack with these rows.
+    /// Drill into a sub-page with the provided rows.
     Cascade(Vec<Box<dyn InspectorRow>>),
-    /// Dismiss the inspector.
+    /// Close the inspector.
     Dismiss,
-    /// Start inline text editing with the given initial value.
+    /// Hand off to inline text editing seeded with `current_text`.
     StartEdit {
         current_text: String,
-        /// Called when editing is committed.
         on_commit: Box<dyn FnOnce(String, &mut Window, &mut App)>,
     },
 }
 
-/// Small category pill rendered alongside a row label.
+/// Small pill used for category and tag annotations next to a row label.
 pub fn tag_pill(tag: SharedString, cx: &App) -> impl IntoElement {
     let theme = theme(cx);
     div()
@@ -83,7 +83,7 @@ pub fn tag_pill(tag: SharedString, cx: &App) -> impl IntoElement {
         .child(tag)
 }
 
-/// Shared base styling for an inspector row.
+/// Row-chrome the concrete widgets wrap: background, hover, spacing, and id.
 pub fn row_base(row_ix: usize, selected: bool, cx: &App) -> gpui::Stateful<gpui::Div> {
     let theme = theme(cx);
     let bg = if selected {

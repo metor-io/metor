@@ -1,26 +1,20 @@
-//! 3D scene viewer element.
+//! Bevy-backed 3D scene viewer.
 //!
-//! A single headless Bevy [`bevy::app::App`] lives inside
-//! [`bridge::BevyBridge`] (a `gpui::Global`) and is driven by periodic
-//! renders from each [`Viewer3d`]'s prepaint closure. Every viewer owns:
+//! One headless Bevy app, held inside [`bridge::BevyBridge`], renders
+//! every [`Viewer3d`] in the panel. Each viewer owns:
 //!
-//! - A stable set of `Entity` handles inside the Bevy world
-//!   ([`ViewerEntities`]): its camera, its directional light, and the
-//!   readback sentinel that carries the per-viewer [`bevy_app::FrameSink`]
-//!   component. The handles are wrapped in `Arc<OnceLock<_>>` so
-//!   construction can be safely deferred through the bridge's pending-op
-//!   queue — every mutation the viewer issues is a
-//!   `bridge.with_world(|w| …)` closure that reads the cell, which FIFO
-//!   ordering guarantees is filled by the time the closure runs.
-//! - A depth-2 [`thingbuf::ThingBuf`] it shares with its `FrameSink`.
-//!   The Bevy readback observer writes straight into this queue and the
-//!   viewer's next prepaint drains it. The `Vec<u8>` storage is reused
-//!   in place so steady-state rendering does zero per-frame allocations.
-//! - A list of [`ModelEntry`]s, each with its own `Arc<OnceLock<Entity>>`
-//!   and any component-stream tasks driving its live transform.
+//! - A set of stable Bevy entities ([`ViewerEntities`]) for its camera,
+//!   light, and readback sentinel. They are wrapped in
+//!   `Arc<OnceLock<_>>` so mutation closures can run against the bridge's
+//!   FIFO queue without racing construction.
+//! - A depth-2 `thingbuf` queue that the readback observer writes into
+//!   and the next prepaint drains; the `Vec<u8>` storage is reused in
+//!   place for zero allocation in steady state.
+//! - A `Vec<ModelEntry>`, each with its own entity cell and any
+//!   component-stream tasks driving live transforms.
 //!
-//! The element itself is thin: a mouse/keyboard surface over a canvas
-//! that blits whichever frame its receiver most recently produced.
+//! The gpui element itself is a thin mouse/keyboard surface over a
+//! canvas that blits the most recently received frame.
 
 pub(crate) mod bevy_app;
 pub mod bridge;
@@ -55,9 +49,9 @@ pub use camera::OrbitCamera;
 
 use bevy_app::{FrameQueue, FrameSink, LiveDelta, PropagateRenderLayers, new_frame_queue};
 
-/// Convert a metor-panel `[x, y, z]` position component into a Bevy-frame
-/// `Vec3`. metor-panel is Z-down; Bevy is Y-up, so position swizzles to
-/// `(x, z, -y)`. Missing elements default to `0.0`.
+/// Swizzle a Z-down metor-panel `[x, y, z]` into Bevy's Y-up `Vec3`.
+///
+/// Missing elements default to `0.0`.
 fn pick_position(view: &ComponentView<'_>) -> Vec3 {
     let pick = |i: usize| view.get(i).map(|v| v.as_f64() as f32).unwrap_or(0.0);
     let x = pick(0);
@@ -66,9 +60,10 @@ fn pick_position(view: &ComponentView<'_>) -> Vec3 {
     Vec3::new(x, z, -y)
 }
 
-/// Convert a metor-panel `[i, j, k, w]` quaternion component into a
-/// Bevy-frame `Quat`. Same Z-down → Y-up swizzle as [`pick_position`],
-/// applied to the imaginary parts: `(i, k, -j, w)`. Does not re-normalize.
+/// Swizzle a Z-down quaternion `[i, j, k, w]` into Bevy's Y-up `Quat`.
+///
+/// Applies the same axis swap as [`pick_position`] to the imaginary
+/// parts. Does not re-normalize the result.
 fn pick_attitude(view: &ComponentView<'_>) -> Quat {
     let pick = |i: usize| view.get(i).map(|v| v.as_f64() as f32).unwrap_or(0.0);
     let i = pick(0);
@@ -78,33 +73,30 @@ fn pick_attitude(view: &ComponentView<'_>) -> Quat {
     Quat::from_xyzw(i, k, -j, w)
 }
 
-/// Default render target size used the first time a viewer is created,
-/// before the first canvas resize callback fires.
 const INITIAL_SIZE: (u32, u32) = (512, 512);
 
-/// How long after a model load we keep force-rendering every paint. The
-/// GLTF loader completes asynchronously, so the scene tree and PBR
-/// pipeline need a handful of frames to settle before the output is
-/// stable.
+/// Force-render window after a new model loads. GLTF finishes asynchronously
+/// and the PBR pipeline needs a few frames for lighting to settle.
 const POST_LOAD_WINDOW: Duration = Duration::from_millis(500);
 
-/// The three ECS entities that define one viewer's render target. Wrapped
-/// in an `Arc<OnceLock<_>>` on [`Viewer3d`] so construction can be queued
-/// behind an in-flight render — every mutator closure loads the cell and
-/// FIFO op ordering guarantees it's filled by the time the closure runs.
+/// Bevy-side identities that define a single viewer's render target.
+///
+/// The entity ids are stable even across render-target resizes, so
+/// mutation closures can cache them freely.
 #[derive(Clone, Copy)]
 struct ViewerEntities {
     camera: Entity,
     light: Entity,
-    /// Carries both the [`Readback`] component and the [`FrameSink`]
-    /// that the `on_readback_complete` observer writes into. Stable
-    /// across render-target resizes (the `Readback` component gets
-    /// replaced in place; the entity id doesn't change).
+    /// Hosts both the [`Readback`] component and the [`FrameSink`] the
+    /// readback observer writes into.
     readback: Entity,
 }
 
-/// A 3D scene element. Owns a list of models, its own slice of the Bevy
-/// world, and a depth-2 frame queue fed by the readback observer.
+/// 3D scene element.
+///
+/// Owns the reflected config (models, camera FOV), the frame queue that
+/// receives Bevy-side renders, and the per-model tracking state used by
+/// [`Viewer3d::reconcile`] to spawn and tear down world entities.
 #[derive(facet::Facet)]
 pub struct Viewer3d {
     #[facet(opaque)]
@@ -116,7 +108,6 @@ pub struct Viewer3d {
     #[facet(opaque)]
     camera: OrbitCamera,
 
-    // Inspectable fields — reflected by the walker
     pub models: Vec<gpui::Entity<ModelEntry>>,
     pub camera_fov: f32,
 
@@ -140,24 +131,26 @@ pub struct Viewer3d {
     last_camera: CameraSnapshot,
 }
 
+/// Background tracking for one model entry.
+///
+/// `path` and `*_binding` record the values used to spawn the current
+/// Bevy state. Reconcile compares the stored values against the entry's
+/// live fields and respawns or rebinds on any change.
 struct ModelTracking {
     entity: Arc<OnceLock<Entity>>,
-    /// Last path we spawned for. Reconcile compares against the entry's
-    /// current `path` and respawns the Bevy entity on any change.
     path: String,
-    /// Last bindings we wired. Reconcile compares against the entry's
-    /// current bindings and rebinds streaming tasks on any change.
     position_binding: Option<ComponentId>,
     orientation_binding: Option<ComponentId>,
     tasks: SmallVec<[gpui::Task<()>; 2]>,
-    /// Drops when the tracker is removed, unwiring child→parent notify
-    /// propagation for the now-removed model.
+    /// Child-to-parent observer. Dropping unwires the notify propagation
+    /// when the tracker is removed.
     _subscription: Subscription,
 }
 
-/// Snapshot of inspectable camera scalars used to detect inspector edits
-/// between reconciles, so writes to `camera_fov` push through to the Bevy
-/// `Projection`.
+/// Previous values of the reflected camera scalars.
+///
+/// Compared during reconcile so inspector edits to `camera_fov` push
+/// through to Bevy's `Projection`.
 #[derive(Clone, Copy, PartialEq, Eq)]
 struct CameraSnapshot {
     fov_bits: u32,
@@ -171,9 +164,11 @@ impl CameraSnapshot {
     }
 }
 
-/// One model in a viewer. Pure config — the world-side `Entity`, binding
-/// tasks, and resolved component live in the parent's
-/// [`ModelTracking`] map keyed by this entry's gpui `EntityId`.
+/// Pure-config description of one model in a [`Viewer3d`].
+///
+/// The live Bevy entity, streaming tasks, and resolved components live
+/// in [`ModelTracking`] on the parent viewer, keyed by this entry's
+/// gpui `EntityId`.
 #[derive(facet::Facet)]
 #[facet(pod)]
 pub struct ModelEntry {
@@ -202,9 +197,8 @@ impl ModelEntry {
     }
 }
 
-/// State captured at the start of a drag so the delta is applied to the
-/// camera's pre-drag pose — avoids drift from accumulating pixel deltas
-/// frame by frame.
+/// Snapshot taken at drag start so pose deltas apply to the pre-drag
+/// camera rather than accumulating from frame to frame.
 #[derive(Clone, Copy)]
 struct DragState {
     start_pos: Point<Pixels>,
@@ -219,14 +213,16 @@ enum DragMode {
 }
 
 impl Viewer3d {
-    /// Create a viewer with no DB. The viewer can still load models via
-    /// [`Self::add_model`] but can't install component bindings.
+    /// Build a viewer without a DB connection.
+    ///
+    /// Models can still load from the filesystem, but component-driven
+    /// bindings are unavailable.
     pub fn new(cx: &mut Context<Self>) -> Self {
         Self::new_inner(None, cx)
     }
 
-    /// Create a viewer connected to `db` so the inspector can install
-    /// position and orientation bindings from its components.
+    /// Build a viewer bound to `db` so model transforms can follow
+    /// component values.
     pub fn with_db(db: Arc<DB>, cx: &mut Context<Self>) -> Self {
         Self::new_inner(Some(db), cx)
     }
@@ -293,9 +289,9 @@ impl Viewer3d {
             layer
         };
 
-        // Queue a despawn op on drop. Because `with_world` is FIFO and
-        // our spawn op was enqueued first, by the time this op runs the
-        // entity cells are filled.
+        // The bridge runs ops FIFO, so the entity cells set during
+        // construction are guaranteed populated by the time this
+        // release op executes.
         let entities_for_release = entities.clone();
         cx.on_release(move |this, cx| {
             let ents = entities_for_release;
@@ -358,17 +354,16 @@ impl Viewer3d {
         &mut self.camera
     }
 
-    /// Mark the viewer as dirty so its next prepaint schedules a render
-    /// and issue `cx.notify()` so gpui actually schedules that prepaint.
+    /// Mark the viewer dirty and schedule a repaint.
     fn mark_dirty(&mut self, cx: &mut Context<Self>) {
         self.needs_render = true;
         cx.notify();
     }
 
-    /// Queue a world op against this viewer's own entities. The closure
-    /// only runs once the construction-time spawn op has populated the
-    /// cell, which FIFO ordering on the bridge guarantees. Marks the
-    /// viewer dirty so the next prepaint schedules a render.
+    /// Run `f` on the Bevy world once this viewer's entities exist.
+    ///
+    /// Cells are guaranteed populated by FIFO bridge ordering. Marks the
+    /// viewer dirty so the next prepaint submits a frame.
     fn with_entities(
         &mut self,
         cx: &mut Context<Self>,
@@ -385,20 +380,19 @@ impl Viewer3d {
         self.mark_dirty(cx);
     }
 
-    /// Reconcile the per-id [`ModelTracking`] map against the current
-    /// `models` Vec. Runs on every self-notify (including child notifies
-    /// proxied by the per-tracker subscription). Idempotent: branches
-    /// are gated on snapshot diffs so a no-op reconcile does no work.
+    /// Bring Bevy-side state in sync with the reflected config.
     ///
-    /// Sets `needs_render = true` directly rather than calling
-    /// `cx.notify()`, which would re-enter reconcile in an infinite loop.
-    /// The notify that triggered this run already scheduled the next
-    /// prepaint where `needs_render` will be observed.
+    /// Runs on every self-notify, including notifications proxied by the
+    /// per-tracker subscription. Every branch is snapshot-diffed so
+    /// idempotent reconciles do no work.
+    ///
+    /// Dirties the viewer by flipping `needs_render` directly; calling
+    /// `cx.notify()` here would re-enter this function forever.
     fn reconcile(&mut self, cx: &mut Context<Self>) {
         let mut work = false;
 
-        // 1. Drop trackers for removed models. Subscription drops with
-        //    the tracker; binding tasks drop with the SmallVec.
+        // Drop trackers for removed models; subscriptions and binding
+        // tasks follow the tracker into the grave.
         let current_ids: HashSet<EntityId> = self.models.iter().map(|m| m.entity_id()).collect();
         let stale: Vec<EntityId> = self
             .tracking
@@ -418,9 +412,8 @@ impl Viewer3d {
             work = true;
         }
 
-        // 2. Walk current models, creating trackers and reacting to
-        //    path / binding changes. Snapshot up-front so we can borrow
-        //    `self.tracking` mutably without aliasing `self.models`.
+        // Snapshot up-front so we can borrow `self.tracking` mutably
+        // without aliasing `self.models`.
         let layer = self.render_layer;
         let db = self.db.clone();
         let model_snapshots: Vec<(
@@ -446,9 +439,8 @@ impl Viewer3d {
             .collect();
 
         for (id, model, path, pos_bind, orient_bind) in model_snapshots {
-            // Insert tracker on first sight, wiring a child→parent
-            // subscription so inspector edits to the entry trigger this
-            // reconcile.
+            // First-sight insert: wire the subscription so inspector
+            // edits on the entry proxy back into reconcile.
             if !self.tracking.contains_key(&id) {
                 let subscription = cx.observe(&model, |this, _, cx| {
                     this.reconcile(cx);
@@ -467,12 +459,10 @@ impl Viewer3d {
                 work = true;
             }
 
-            // Path change: despawn previous Bevy entity (if any) and
-            // spawn a fresh one with a new cell. Bindings are also
-            // cleared because they captured the old cell — they'll be
-            // re-spawned by the bindings-changed branch below now that
-            // `track.position_binding` / `orientation_binding` were
-            // reset to `None`.
+            // Path change: respawn the Bevy entity into a fresh cell
+            // and clear bindings — the old cell is gone, so the tasks
+            // that captured it must be rebuilt. Zeroing the stored
+            // bindings triggers the rebind branch below on this pass.
             let track = self.tracking.get_mut(&id).expect("inserted above");
             if track.path != path {
                 let old_cell = std::mem::replace(&mut track.entity, Arc::new(OnceLock::new()));
@@ -496,8 +486,6 @@ impl Viewer3d {
                 work = true;
             }
 
-            // Bindings changed: drop old tasks, reset LiveDelta, spawn
-            // fresh tasks against the (possibly fresh) entity cell.
             let track = self.tracking.get_mut(&id).expect("inserted above");
             let bindings_changed =
                 track.position_binding != pos_bind || track.orientation_binding != orient_bind;
@@ -545,7 +533,6 @@ impl Viewer3d {
             }
         }
 
-        // 3. Camera-fov edit detection.
         let snap = CameraSnapshot::from_fov(self.camera_fov);
         if snap != self.last_camera {
             self.camera.fov_y_rad = self.camera_fov;
@@ -559,8 +546,7 @@ impl Viewer3d {
         }
     }
 
-    /// Append a new model. The Bevy-side spawn happens in [`Self::reconcile`]
-    /// via the `cx.notify()` triggered by this push.
+    /// Append a model entry; the Bevy spawn happens in [`Self::reconcile`].
     pub fn add_model(
         &mut self,
         label: impl Into<SharedString>,
@@ -577,8 +563,7 @@ impl Viewer3d {
         cx.notify();
     }
 
-    /// Remove one model from the viewer. Reconcile despawns the Bevy
-    /// entity and drops the binding tasks when the tracker disappears.
+    /// Remove a model; reconcile tears down its Bevy entity and tasks.
     pub fn remove_model(&mut self, index: usize, cx: &mut Context<Self>) {
         if index >= self.models.len() {
             return;
@@ -587,8 +572,7 @@ impl Viewer3d {
         cx.notify();
     }
 
-    /// Update one model's GLTF path. The despawn-then-spawn happens in
-    /// [`Self::reconcile`] via the per-model child subscription.
+    /// Change a model's GLTF path; reconcile despawns and respawns.
     pub fn set_model_path(&mut self, index: usize, path: String, cx: &mut Context<Self>) {
         let Some(entry) = self.models.get(index).cloned() else {
             return;
@@ -599,7 +583,7 @@ impl Viewer3d {
         });
     }
 
-    /// Update one model's display label.
+    /// Change a model's display label.
     pub fn set_model_label(
         &mut self,
         index: usize,
@@ -615,11 +599,11 @@ impl Viewer3d {
         }
     }
 
-    /// Round a pixel size to a 64-pixel grid. The grid is a deliberate
-    /// alignment: `64 * 4 = 256` bytes per row, which matches wgpu's
-    /// `COPY_BYTES_PER_ROW_ALIGNMENT`. Readback rows need no padding and
-    /// the observer's `copy_tight_rows` is a flat memcpy. Also avoids
-    /// re-issuing resize ops on every sub-pixel edge drag.
+    /// Snap the target size to a 64-pixel grid.
+    ///
+    /// 64 × 4 bytes per pixel = 256-byte rows, which matches wgpu's
+    /// `COPY_BYTES_PER_ROW_ALIGNMENT` so readback becomes a flat memcpy.
+    /// The grid also prevents resize thrash during sub-pixel edge drags.
     fn quantize(size: gpui::Size<Pixels>, scale: f32) -> (u32, u32) {
         const STEP: u32 = 64;
         const MIN: u32 = 64;
@@ -629,8 +613,8 @@ impl Viewer3d {
         (round(phys_w).max(MIN), round(phys_h).max(MIN))
     }
 
-    /// If `new_size` differs from the last-requested size, swap the
-    /// render target image and update the `FrameSink.size`.
+    /// Allocate a new render target when `new_size` differs from the
+    /// current one.
     fn maybe_resize(&mut self, new_size: (u32, u32), cx: &mut Context<Self>) {
         if self.requested_size == new_size {
             return;
@@ -651,7 +635,7 @@ impl Viewer3d {
         });
     }
 
-    /// Push the current camera pose to the world.
+    /// Flush the current [`OrbitCamera`] pose to the Bevy camera entity.
     pub fn sync_camera(&mut self, cx: &mut Context<Self>) {
         let cam = self.camera;
         self.with_entities(cx, move |world, ents| {
@@ -666,16 +650,16 @@ impl Viewer3d {
         });
     }
 
-    /// Reset the camera to its default pose.
+    /// Restore the camera to its default orbit pose.
     pub fn reset_camera(&mut self, cx: &mut Context<Self>) {
         self.camera = OrbitCamera::default();
         self.sync_camera(cx);
     }
 
-    /// Spawn a binding-stream task that pumps values from a component
-    /// stream into the Bevy world's [`LiveDelta`] on one model. Shared
-    /// by the position and orientation paths — the only per-axis
-    /// knowledge lives in the `extract`/`apply` function pointers.
+    /// Pipe a component stream into one model's [`LiveDelta`].
+    ///
+    /// Shared between the position and orientation binding paths; the
+    /// per-axis behavior lives in the `extract` and `apply` fn pointers.
     fn spawn_binding_stream<T: Send + 'static>(
         db: Arc<DB>,
         entity_cell: Arc<OnceLock<Entity>>,
@@ -711,10 +695,10 @@ impl Viewer3d {
     }
 }
 
-/// Spawn a scene entity for one model. Returns the new [`Entity`]; the
-/// caller writes it into its [`OnceLock`]. If `path` is empty the entity
-/// still spawns with a default transform + [`LiveDelta`] so subsequent
-/// binding updates have somewhere to land.
+/// Spawn the Bevy-side entity for one model.
+///
+/// An empty `path` still produces an entity carrying a default transform
+/// and [`LiveDelta`] so later binding updates have somewhere to land.
 fn spawn_model(world: &mut World, render_layer: usize, path: &str) -> Entity {
     let layers = bridge::render_layers_for(render_layer);
     if path.is_empty() {
@@ -741,9 +725,8 @@ fn spawn_model(world: &mut World, render_layer: usize, path: &str) -> Entity {
         .id()
 }
 
-/// Wrap tight BGRA bytes into a `gpui::RenderImage` suitable for
-/// `Window::paint_image`. Called from the prepaint closure the moment a
-/// fresh frame is popped out of the thingbuf.
+/// Wrap tightly-packed BGRA bytes into a [`RenderImage`] for
+/// `Window::paint_image`.
 fn make_render_image_from_bytes(
     width: u32,
     height: u32,
@@ -755,12 +738,11 @@ fn make_render_image_from_bytes(
 }
 
 impl Viewer3d {
-    /// Pop the most recent frame (if any) out of the viewer's thingbuf
-    /// into `self.current_frame`, parking the old frame in
-    /// `self.pending_release` for atlas cleanup on the next paint.
+    /// Promote the next queued frame into `current_frame`, parking the
+    /// old frame in `pending_release` for atlas cleanup on the next paint.
     ///
-    /// Invariant: `pending_release` is always `None` on entry because
-    /// prepaint drains it immediately after calling this.
+    /// Invariant: `pending_release` is `None` on entry — prepaint drains
+    /// it immediately after calling this.
     fn consume_frame(&mut self) {
         let Some(mut slot) = self.frame_queue.pop_ref() else {
             return;
@@ -857,9 +839,8 @@ impl Render for Viewer3d {
                             let scale = window.scale_factor();
                             let new_size = Viewer3d::quantize(bounds.size, scale);
 
-                            // Snapshot the frame + any atlas entries to
-                            // release, then schedule a render if the
-                            // viewer thinks it still needs one.
+                            // Capture the frame plus any queued
+                            // releases, then request a render when dirty.
                             let (frame, releases) = this
                                 .update(cx, |this, cx| {
                                     this.maybe_resize(new_size, cx);

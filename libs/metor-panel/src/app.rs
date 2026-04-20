@@ -27,6 +27,12 @@ actions!(
 
 const TITLEBAR_HEIGHT: f32 = 36.0;
 
+/// Window-level view that owns the tile tree and any active inspector overlay.
+///
+/// Inspector requests come in asynchronously (from palette callbacks, tile
+/// events, pending-edit flushes). They're queued into `pending_*` fields and
+/// drained inside `render` so entity creation always happens on the render
+/// thread with access to [`Window`] for focus transfer.
 struct AppRoot {
     db: Arc<DB>,
     tiles: Entity<TileGroup>,
@@ -332,6 +338,10 @@ impl AppRoot {
     }
 }
 
+/// Boot the gpui application and block until the last window closes.
+///
+/// Registers the theme, fonts, icons, edit queue, palette providers,
+/// inspector registry, and widget registry before opening the root window.
 pub fn run(db: Arc<metor_db::DB>) {
     Application::new()
         .with_assets(crate::icons::IconAssets)

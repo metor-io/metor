@@ -1,4 +1,6 @@
-//! Per-field row dispatch + scalar conversion helpers.
+//! Per-field dispatch inside the walker: pick a concrete row or fall back to
+//! shape-based defaults. Also hosts the generic scalar read/write routines
+//! that let a single `SliderRow` or `ScalarRow` work across every numeric type.
 
 use std::sync::Arc;
 
@@ -12,9 +14,11 @@ use crate::inspector::rows::{
 use super::{FieldBuildCtx, FieldOverride, InspectorRegistry, builders};
 
 impl InspectorRegistry {
-    /// Build a row for a single struct field. Consults registered overrides
-    /// first (per-field-type widgets, entity-list handlers), then falls back
-    /// to shape-based defaults via [`Self::default_row_for_shape`].
+    /// Resolve the row for one struct field.
+    ///
+    /// Tries, in order: a type-keyed field widget factory, an entity-list
+    /// handler (for `Vec<Entity<T>>`), then the shape-based defaults.
+    /// Returns `None` when nothing in the registry can render the field.
     pub fn row_for_field(
         &self,
         ctx: &FieldBuildCtx,
@@ -38,9 +42,11 @@ impl InspectorRegistry {
         self.default_row_for_shape(ctx, peek, any_entity, field_idx, field_override)
     }
 
-    /// Shape-based default row dispatch: bool, numeric scalars, `String`,
-    /// `Option<ComponentId>`, and `enum`. Returns `None` for shapes outside
-    /// this set so callers can choose to skip or fall through.
+    /// Shape-driven defaults for fields with no registered override.
+    ///
+    /// Handles `bool`, numeric scalars (with an optional slider range from
+    /// [`FieldOverride`]), `String`, `Option`, and `enum`. Everything else
+    /// returns `None` so the walker can skip the field silently.
     pub fn default_row_for_shape(
         &self,
         ctx: &FieldBuildCtx,

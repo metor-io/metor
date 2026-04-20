@@ -1,12 +1,10 @@
-/// Facet shape walker that produces InspectorRow widgets from entity reflection.
-///
-/// [`rows_for_any_entity`] is the type-erased entry point: it prefers a
-/// registered [`TypeRowBuilder`] override, then falls back to the adapter-
-/// driven [`default_rows_for_any_entity`] walk. The walk delegates per-field
-/// dispatch to [`InspectorRegistry::row_for_field`], so concrete row construction
-/// lives in `inspector_registry`. Widget callbacks write values back through the
-/// monomorphic [`set_field`] / [`get_field`] helpers, which dispatch through
-/// the registry's per-type [`EntityAdapter`].
+//! Bridge from Facet reflection to [`InspectorRow`] widgets.
+//!
+//! [`rows_for_any_entity`] is the type-erased entry: it prefers a registered
+//! whole-type override, then falls back to walking fields via the
+//! registry's [`EntityAdapter`]. Read-back and write-back go through
+//! [`get_field`] / [`set_field`], which hide the per-type poke/peek calls so
+//! row widgets can stay generic.
 use std::sync::Arc;
 
 use facet::{Facet, FieldFlags, PokeStruct};
@@ -16,8 +14,11 @@ use metor_db::DB;
 use crate::inspector::registry::{FieldBuildCtx, InspectorRegistry};
 use crate::inspector::rows::InspectorRow;
 
-/// Resolve rows for any entity. Returns `None` only when the entity's type
-/// has neither a `TypeRowBuilder` override nor an `EntityAdapter`.
+/// Build inspector rows for `entity`.
+///
+/// Returns `None` when the type is unregistered in both the whole-type
+/// builder map and the adapter map. Callers should fall back to a generic
+/// "nothing to inspect" placeholder rather than panicking.
 pub fn rows_for_any_entity(
     entity: &AnyEntity,
     db: &Arc<DB>,
@@ -33,7 +34,7 @@ pub fn rows_for_any_entity(
     None
 }
 
-/// Convenience wrapper for callers that already hold a typed `Entity<T>`.
+/// Typed shortcut for callers that already have an `Entity<T>`.
 pub fn rows_for_entity<T: 'static>(
     entity: &Entity<T>,
     db: &Arc<DB>,
@@ -42,8 +43,11 @@ pub fn rows_for_entity<T: 'static>(
     rows_for_any_entity(&entity.clone().into_any(), db, cx).unwrap_or_default()
 }
 
-/// Walk a Facet struct's fields via the registry adapter and produce widget
-/// rows. Per-field dispatch is delegated to [`InspectorRegistry::row_for_field`].
+/// Default field walk used when no whole-type builder is registered.
+///
+/// Each non-skipped Facet field is routed to
+/// [`InspectorRegistry::row_for_field`], which picks the concrete widget
+/// (slider, checkbox, nested inspector, etc.).
 pub fn default_rows_for_any_entity(
     any_entity: &AnyEntity,
     db: &Arc<DB>,
@@ -86,9 +90,10 @@ pub fn default_rows_for_any_entity(
     rows
 }
 
-/// Read a Facet field from an entity without knowing its concrete type.
-/// Returns `None` if no adapter is registered or the field is missing/typed
-/// differently than `V`.
+/// Read field `field_idx` of `any_entity` as `V`.
+///
+/// Returns `None` when the entity type has no adapter, the field index is
+/// out of range, or the field's static type is not `V`.
 pub fn get_field<V: Facet<'static> + Clone + 'static>(
     any_entity: &AnyEntity,
     field_idx: usize,
@@ -111,9 +116,10 @@ pub fn get_field<V: Facet<'static> + Clone + 'static>(
     out
 }
 
-/// Write a typed Facet value into a struct field. No-op if the adapter is
-/// missing or the field type doesn't match `V` — Facet's `set_field` enforces
-/// the latter and silently rejects mismatches.
+/// Write `value` into field `field_idx` of `any_entity`.
+///
+/// Silently no-ops on adapter or type mismatch; Facet's own `set` guards
+/// the type check so a wrong `V` cannot corrupt memory.
 pub fn set_field<V: Facet<'static> + 'static>(
     any_entity: &AnyEntity,
     field_idx: usize,
@@ -127,8 +133,8 @@ pub fn set_field<V: Facet<'static> + 'static>(
     else {
         return;
     };
-    // `FnMut` can't move `value` out across repeated calls; slot-and-take
-    // satisfies that constraint while still consuming the value once.
+    // The poke callback is `FnMut`; `value` must be moved exactly once, so
+    // the slot-and-take pattern works where a plain capture would not.
     let mut slot = Some(value);
     (adapter.poke)(any_entity, cx, &mut |poke| {
         let Some(v) = slot.take() else { return };
@@ -142,9 +148,11 @@ pub fn set_field<V: Facet<'static> + 'static>(
     });
 }
 
-/// Write an enum field by variant name. Goes through the adapter because
-/// `set_field<V>` can't express "variant by name" — we need direct
-/// `PokeEnum` discriminant access.
+/// Set an enum field to the variant named `variant_name`.
+///
+/// Separate from [`set_field`] because the generic path can't express
+/// "variant by name"; this drops down to `PokeEnum` to write the
+/// discriminant directly.
 pub fn set_enum_variant(
     any_entity: &AnyEntity,
     field_idx: usize,
@@ -166,9 +174,8 @@ pub fn set_enum_variant(
     });
 }
 
-/// Write an enum variant by name into field `idx` of a struct. Returns `true`
-/// on success; silently no-ops if the field isn't an enum or the variant
-/// doesn't exist.
+/// Low-level enum write. Returns `false` when `field_idx` is not an enum,
+/// the variant name is unknown, or the discriminant type is unsupported.
 fn set_enum_by_name(
     ps: &mut PokeStruct<'_, 'static>,
     field_idx: usize,

@@ -1,15 +1,9 @@
-/// Provider-based registry that powers the everything-palette.
-///
-/// Each top-level "category" of the palette (Panel, Widget, Command, ...)
-/// registers one [`ItemProvider`] closure. When the palette is opened, every
-/// provider is evaluated to produce a fresh [`Vec<InspectionItem>`] which is
-/// flattened into the inspector's top page. Selecting an entity item cascades
-/// into that entity's reflected inspector; selecting a command runs its
-/// callback.
-///
-/// Providers are evaluated on each open, so there is no lifecycle bookkeeping
-/// (weak refs, observe_release, etc.) — entities that no longer exist simply
-/// stop appearing.
+//! Pull-based registry that feeds the command palette.
+//!
+//! Each [`Category`] registers one [`ItemProvider`] closure. On every open,
+//! the palette evaluates all providers and flattens the results into the top
+//! page. Pull-based means no lifecycle bookkeeping: destroyed entities
+//! simply stop appearing in the next snapshot.
 use std::sync::Arc;
 
 use gpui::{AnyEntity, App, Entity, Global, SharedString, Window};
@@ -20,7 +14,9 @@ use crate::tiles::TileGroup;
 use crate::views::dashboard::DashboardPanel;
 use crate::inspector::rows::{CommandRow, InspectorRow, NavRow};
 
-/// Top-level grouping for items in the everything-palette.
+/// Tag shown as a pill alongside each palette row, also used to group
+/// providers. `Custom` lets external subsystems add categories without
+/// editing this enum.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum Category {
     Panel,
@@ -40,20 +36,20 @@ impl Category {
     }
 }
 
-/// One thing the user can pick from the everything-palette.
+/// One selectable entry returned by an [`ItemProvider`].
 pub enum InspectionItem {
-    /// An entity to open in the inspector. Cascades to its reflected rows.
+    /// Drill into an entity's reflected properties.
     Entity {
         label: SharedString,
         summary: SharedString,
         entity: AnyEntity,
     },
-    /// A one-shot command.
+    /// Run a callback and dismiss.
     Command {
         label: SharedString,
         callback: Arc<dyn Fn(&mut Window, &mut App)>,
     },
-    /// A nested submenu of pre-built rows (e.g. "New Panel" → list of types).
+    /// Push another page of rows, built lazily on selection.
     SubMenu {
         label: SharedString,
         summary: SharedString,
@@ -61,11 +57,10 @@ pub enum InspectionItem {
     },
 }
 
-/// Closure that produces the items for one category at the moment the palette
-/// is opened.
+/// Closure run on every palette open to snapshot a category's items.
 pub type ItemProvider = Arc<dyn Fn(&App) -> Vec<InspectionItem>>;
 
-/// Global registry of providers.
+/// Global holding the category-keyed provider list.
 pub struct ItemRegistry {
     providers: Vec<(Category, ItemProvider)>,
 }
@@ -83,7 +78,7 @@ impl ItemRegistry {
         cx.global_mut::<Self>().providers.push((category, provider));
     }
 
-    /// Snapshot every category at this moment.
+    /// Evaluate every provider and return its fresh items.
     pub fn snapshot(cx: &App) -> Vec<(Category, Vec<InspectionItem>)> {
         cx.global::<Self>()
             .providers
@@ -92,8 +87,8 @@ impl ItemRegistry {
             .collect()
     }
 
-    /// Flatten the snapshot into the top-level row list for the everything
-    /// palette. Each row carries a category pill set via `with_tag`.
+    /// Build the row list the palette renders on open. Rows carry their
+    /// category as a tag pill.
     pub fn root_rows(db: &Arc<DB>, cx: &App) -> Vec<Box<dyn InspectorRow>> {
         let snapshot = Self::snapshot(cx);
         let mut rows: Vec<Box<dyn InspectorRow>> = Vec::new();
@@ -145,12 +140,11 @@ fn item_to_row(
     }
 }
 
-/// Register the built-in providers (Panel, Widget, Command).
+/// Register the built-in Panel, Widget, and Command providers.
 ///
-/// Called once at startup after `ItemRegistry::init`. `tiles` is the root
-/// [`TileGroup`]; the providers walk it on each open. `on_open_inspector`
-/// is forwarded to the "New Panel → Time Series Plot" command so the trace
-/// wizard auto-opens after creation.
+/// Call once after [`ItemRegistry::init`]. `on_open_inspector` is forwarded
+/// to the "New Panel → Time Series Plot" flow so the trace wizard can open
+/// immediately after the plot is created.
 pub fn register_builtin_providers(
     db: Arc<DB>,
     tiles: Entity<TileGroup>,
@@ -223,7 +217,8 @@ fn register_command_provider(
     let provider: ItemProvider = Arc::new(move |cx: &App| {
         let mut items: Vec<InspectionItem> = Vec::new();
 
-        // New Panel — adds to the first pane (matches legacy behaviour).
+        // New Panel targets the first pane so palette-created panels always
+        // land somewhere visible, even when multiple panes are open.
         let pane = tiles.read(cx).panes()[0].clone();
         let new_db = db.clone();
         let new_open = on_open_inspector.clone();
@@ -239,7 +234,6 @@ fn register_command_provider(
             }),
         });
 
-        // Update Component
         let update_db = db.clone();
         items.push(InspectionItem::SubMenu {
             label: "Update Component".into(),
@@ -249,7 +243,6 @@ fn register_command_provider(
             }),
         });
 
-        // Review Edits — only when there are pending edits.
         let pending_count = crate::inspector::edits::pending_edits(cx).edits.len();
         if pending_count > 0 {
             let review_db = db.clone();
@@ -270,7 +263,6 @@ fn register_command_provider(
             });
         }
 
-        // Theme picker
         items.push(InspectionItem::SubMenu {
             label: "Theme".into(),
             summary: SharedString::new_static(""),
@@ -290,7 +282,6 @@ fn register_command_provider(
             }),
         });
 
-        // Toggle edit lock
         items.push(InspectionItem::Command {
             label: if crate::inspector::edits::pending_edits(cx).locked {
                 "Unlock Editing".into()

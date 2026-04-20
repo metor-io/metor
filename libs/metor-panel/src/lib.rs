@@ -12,7 +12,7 @@ pub mod inspector;
 pub mod theme;
 pub mod tiles;
 
-/// Borrowing conversion to a [`ComponentView`].
+/// Borrow as a [`ComponentView`] without copying the backing buffer.
 pub trait AsComponentView {
     fn as_component_view(&self) -> ComponentView<'_>;
 }
@@ -23,7 +23,9 @@ impl AsComponentView for ComponentView<'_> {
     }
 }
 
-/// Async stream of component data updates.
+/// Async source of component value updates.
+///
+/// Views borrow from the stream; hold the stream across `.await` points.
 pub trait ComponentStream {
     type View<'a>: AsComponentView
     where
@@ -31,7 +33,10 @@ pub trait ComponentStream {
     fn next(&mut self) -> impl std::future::Future<Output = Self::View<'_>>;
 }
 
-/// Factory for creating a [`WalComponentStream`] from a component identifier or handle.
+/// Resolves a component (by handle or id) into a [`WalComponentStream`].
+///
+/// The `ComponentId` impl waits for the component to appear in the DB,
+/// letting views subscribe before the producer has registered.
 pub trait ComponentStreamBuilder {
     fn component_id(&self) -> ComponentId;
     fn into_stream(self, db: &DB) -> impl std::future::Future<Output = WalComponentStream> + Send;
@@ -58,7 +63,11 @@ impl ComponentStreamBuilder for ComponentId {
     }
 }
 
-/// Reads the latest values from a component's write-ahead log as a stream.
+/// Streams the most recent value of a component from its WAL.
+///
+/// Each `next()` yields a [`WalView`] pointing at the last complete message
+/// in the grant. Earlier messages in the same grant are skipped: views only
+/// need the latest sample to repaint.
 pub struct WalComponentStream {
     reader: Reader,
     schema: ComponentSchema,
@@ -73,8 +82,10 @@ impl WalComponentStream {
     }
 }
 
-/// A parsed view into the last value from a WAL read grant.
-/// Holds the grant to keep the underlying buffer alive.
+/// Borrowed view into the last value of a WAL grant.
+///
+/// The grant is retained so `parse_value` can lazily materialize the
+/// [`ComponentView`] against a buffer that stays alive for `'a`.
 pub struct WalView<'a> {
     _grant: ReadGrant<'a>,
     schema: &'a ComponentSchema,
@@ -99,7 +110,6 @@ impl ComponentStream for WalComponentStream {
         let msg_size = self.schema.size() + size_of::<Timestamp>();
         let grant = self.reader.next().await;
         let count = (grant.len() / msg_size).max(1);
-        // Point to the value portion of the last complete message
         let offset = (count - 1) * msg_size + size_of::<Timestamp>();
         WalView {
             _grant: grant,

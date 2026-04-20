@@ -5,11 +5,11 @@ use gpui::{AnyElement, App, SharedString, Window, div, prelude::*, px};
 use super::{InspectorRow, RowAction, row_base};
 use crate::theme::theme;
 
-/// A row that prompts for inline text input, then forwards the committed
-/// text to a callback.
+/// Prompt row: activation drops into inline editing and forwards the
+/// committed text to `callback`.
 ///
-/// Used to model "type a value and press enter" prompts (e.g. renaming a
-/// dashboard, typing a new component value) inside the unified inspector.
+/// Used for "type a value and press enter" flows such as renaming a
+/// dashboard or entering a new component value.
 pub struct DefaultActionRow {
     pub label: SharedString,
     pub callback: Arc<dyn Fn(String, &mut Window, &mut App)>,

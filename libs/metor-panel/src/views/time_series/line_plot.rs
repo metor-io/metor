@@ -1,25 +1,13 @@
-//! Reusable line-plot element.
+//! GPU-backed line plot entity shared by every plot site in the panel.
 //!
-//! [`LinePlot`] is the single gpui entity every plot site in metor-panel
-//! embeds to actually draw lines. It owns:
+//! [`LinePlot`] owns the canonical trace list, the inspector-exposed view
+//! overrides, the [`PlotRenderState`], and one tracking task per trace
+//! keyed by [`gpui::EntityId`]. Parents embed a `LinePlot` entity and
+//! leave rendering, bounds tracking, and GPU management to it.
 //!
-//! - the canonical list of trace entities and their reflected
-//!   view-override knobs (`x_range`, y-axis overrides, `custom_title`);
-//! - a keyed map of per-trace tracking state (resolved [`Component`],
-//!   incrementally scanned y-bounds, last-scan watermark);
-//! - the [`PlotRenderState`] that drives the GPU renderer;
-//! - one tracking task per trace keyed by [`gpui::EntityId`], spawned
-//!   and dropped as the `traces` Vec changes.
-//!
-//! Parents (`Monitor`, `ComponentRow`, `TimeSeriesPlot`) construct one
-//! `Entity<LinePlot>`, push traces via [`bind_traces`], and embed
-//! `self.sparkline.clone()` as a child in their render tree. They do
-//! not touch canvas closures, GPU state, or y-bounds math directly.
-//!
-//! Mutations to the reflected fields (including traces) go through
-//! `cx.notify`, which triggers [`Self::reconcile`] — this is where new
-//! trace ids get trackers spawned, removed ids get trackers dropped,
-//! and scalar changes invalidate the interactive view override.
+//! Every self-notify runs [`LinePlot::reconcile`], which spawns or drops
+//! trackers for added or removed traces, invalidates the view override
+//! when a reflected knob changes, and refreshes the cached title.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -38,16 +26,13 @@ use super::{NodeBoundsCache, Trace, expand_y_bounds};
 use crate::views::time_series::time_range::TimeRangeBehavior;
 use crate::wait_for_component;
 
-/// Per-trace tracking state keyed by the trace entity's [`EntityId`].
-/// Independent of the position in `LinePlot::traces`, so reordering or
-/// inserting traces does not invalidate already-resolved components or
-/// y-bounds watermarks.
+/// Background state for one trace, keyed by the trace's [`EntityId`] so
+/// reordering `traces` doesn't invalidate resolved data.
 struct TraceTracking {
     component: Option<Component>,
     y_bounds: Option<(f64, f64)>,
-    /// Per-node (min, max) cache owned by the tracker. Taken out on each
-    /// background scan and put back with the result; invalidated when
-    /// `cached_element_index` changes.
+    /// Moved in and out of the background scan task on each tick; cleared
+    /// when the trace's element index changes.
     node_bounds: NodeBoundsCache,
     cached_element_index: Option<usize>,
 }
@@ -63,8 +48,8 @@ impl TraceTracking {
     }
 }
 
-/// Snapshot of the scalar view-override fields used to detect edits
-/// between reconciles (so inspector writes reset `view_override`).
+/// Previous values of the reflected override knobs. Compared on each
+/// reconcile so an inspector edit can clear the interactive view override.
 #[derive(Clone, Copy, PartialEq)]
 struct OverrideSnapshot {
     y_min: Option<f64>,
@@ -82,10 +67,11 @@ impl OverrideSnapshot {
     }
 }
 
-/// A self-contained GPU-accelerated line plot. Holds its own render
-/// state, trace list, per-trace y-bounds trackers, and view-override
-/// knobs. Implements [`Render`] so parents just `.child(entity.clone())`
-/// it into their own trees.
+/// Self-contained line plot entity.
+///
+/// Owns the render state, traces, per-trace trackers, and the
+/// inspector-reflected view-override fields. Parents `.child(entity.clone())`
+/// into their render trees and mutate this entity's fields directly.
 #[derive(facet::Facet)]
 pub struct LinePlot {
     pub traces: Vec<Entity<Trace>>,
@@ -133,13 +119,19 @@ impl LinePlot {
         }
     }
 
-    /// Replace all traces from raw [`Trace`] values. Used by `Monitor`
-    /// and `ComponentRow` which don't need entity ownership.
+    /// Replace the trace list from raw values.
+    ///
+    /// Convenience for callers (sparklines, table rows) that don't need a
+    /// persistent `Entity<Trace>` handle for each series.
     pub fn bind_traces(&mut self, traces: Vec<Trace>, cx: &mut Context<Self>) {
         self.traces = traces.into_iter().map(|t| cx.new(|_| t)).collect();
         cx.notify();
     }
 
+    /// Pin the view to `view`, or clear the override with `None`.
+    ///
+    /// Called by pan/zoom handlers. Uses a bit-pattern compare to dodge
+    /// the lack of `PartialEq` on `f64`-containing [`PlotBounds`].
     pub fn set_view_override(&mut self, view: Option<PlotBounds>, cx: &mut Context<Self>) {
         if self.view_override.map(bounds_tuple) != view.map(bounds_tuple) {
             self.view_override = view;
@@ -151,9 +143,11 @@ impl LinePlot {
         &self.db
     }
 
-    /// Reconcile `tracking` + `tasks` with the current `traces` Vec,
-    /// invalidate the title cache, and clear the interactive view
-    /// override if a scalar knob changed. Runs on every self-notify.
+    /// Bring tracking state and the title cache in sync with `self.traces`.
+    ///
+    /// Runs on every self-notify. Spawns a tracker for each new trace,
+    /// drops trackers for removed traces, and resets the pan/zoom override
+    /// when an inspector edit changes the reflected view knobs.
     fn reconcile(&mut self, cx: &mut Context<Self>) {
         let current_ids: HashSet<EntityId> = self.traces.iter().map(|e| e.entity_id()).collect();
         let had_tracking_keys: Vec<EntityId> = self.tracking.keys().copied().collect();
@@ -184,8 +178,11 @@ impl LinePlot {
         };
     }
 
-    /// The view currently used for rendering: the interactive override
-    /// if set, otherwise auto-fit from trace data + inspector overrides.
+    /// The bounds the renderer will use this frame.
+    ///
+    /// Returns the interactive pan/zoom override when set; otherwise
+    /// auto-fits against the visible traces, then applies any
+    /// inspector-exposed bound overrides on top.
     pub fn effective_view(&self, cx: &gpui::App) -> Option<PlotBounds> {
         if let Some(v) = self.view_override {
             return Some(v);
@@ -232,8 +229,10 @@ impl LinePlot {
         Some(PlotBounds::new(range.start.0 as f64, min_y, range.end.0 as f64, max_y).normalize())
     }
 
-    /// The earliest sample timestamp across resolved traces. Used by
-    /// `TimeSeriesPlot`'s chrome canvases to offset x-axis labels.
+    /// Earliest sample timestamp across resolved traces.
+    ///
+    /// Used by the x-axis tick generator to anchor labels against a
+    /// stable origin even as the plot scrolls.
     pub fn data_start(&self) -> Option<f64> {
         let mut start = f64::INFINITY;
         let mut any = false;
@@ -268,9 +267,7 @@ impl LinePlot {
         self.traces.is_empty()
     }
 
-    /// The display title: custom title if set, otherwise derived from
-    /// the current trace list. Recomputed only when traces or
-    /// `custom_title` change (via [`Self::reconcile`]).
+    /// Title shown in the host panel. Cached by [`Self::reconcile`].
     pub fn title(&self) -> SharedString {
         self.title_cache.clone()
     }
@@ -329,7 +326,8 @@ impl LinePlot {
                     let Some(tracking) = lp.tracking.get_mut(&id) else {
                         return false;
                     };
-                    // Guard against element_index churn during the scan.
+                    // Drop the result if the trace's element index was
+                    // changed concurrently; the next iteration rescans.
                     if tracking.cached_element_index == Some(element_index) {
                         tracking.node_bounds = cache;
                         tracking.y_bounds = bounds;
@@ -407,8 +405,8 @@ fn line_plot_gpu_state(lp: &mut LinePlot) -> &mut PlotRenderState {
     &mut lp.gpu_state
 }
 
-/// `PlotBounds` doesn't implement `PartialEq` (it holds `f64`s), so the
-/// setters compare via a tuple conversion for change detection.
+/// Convert [`PlotBounds`] to a bit-pattern tuple so `PartialEq` fields can
+/// compare bounds despite the `f64` contents.
 fn bounds_tuple(b: PlotBounds) -> (u64, u64, u64, u64) {
     (
         b.min_x.to_bits(),
@@ -418,8 +416,11 @@ fn bounds_tuple(b: PlotBounds) -> (u64, u64, u64, u64) {
     )
 }
 
-/// Group traces by component and format as `"comp"` (all elements) or
-/// `"comp[x,y]"` (subset). Multiple components join with `", "`.
+/// Derive a plot title from the trace list.
+///
+/// A component contributes just its name when every element is plotted;
+/// partial coverage gets an `[x,y]`-style subset. Multiple components are
+/// joined with `", "`.
 fn derive_title(traces: &[Entity<Trace>], db: &Arc<DB>, cx: &gpui::App) -> SharedString {
     if traces.is_empty() {
         return "Plot".into();

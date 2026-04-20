@@ -3,7 +3,10 @@ use std::sync::Arc;
 
 use gpui::{App, Global, Hsla};
 
-/// Convert an RGB hex literal and alpha to [`Hsla`] at compile time.
+/// Build an [`Hsla`] from a packed `0xRRGGBB` literal in a const context.
+///
+/// Theme tables are `static`, so the conversion has to happen without
+/// floating-point intrinsics or runtime allocation.
 const fn hex(rgb: u32, a: f32) -> Hsla {
     let r = ((rgb >> 16) & 0xFF) as f32 / 255.0;
     let g = ((rgb >> 8) & 0xFF) as f32 / 255.0;
@@ -51,14 +54,17 @@ const fn hex(rgb: u32, a: f32) -> Hsla {
     Hsla { h, s, l, a }
 }
 
-/// Color palette and typography for the panel UI.
+/// Complete color and typography palette for the panel UI.
+///
+/// All colors live here. Widgets must never hardcode an [`Hsla`] literal;
+/// reference a theme field instead so palettes stay swappable.
 #[derive(Clone)]
 pub struct Theme {
     pub name: &'static str,
     pub font_family: &'static str,
     pub bg_primary: Hsla,
     pub bg_secondary: Hsla,
-    /// Elevated surface (e.g. palette, popover).
+    /// Surface lifted above the page, used by palettes and popovers.
     pub bg_elevated: Hsla,
 
     pub text_primary: Hsla,
@@ -67,47 +73,45 @@ pub struct Theme {
 
     pub border_primary: Hsla,
 
-    /// Background for selected/highlighted items.
+    /// Highlight for selected rows and active tabs.
     pub selection_bg: Hsla,
-    /// Text selection highlight in text fields.
+    /// Inline text-field selection range.
     pub text_selection: Hsla,
-    /// Semi-transparent overlay for drop targets.
+    /// Translucent overlay drawn over a drop target during drag.
     pub drop_target: Hsla,
 
-    /// Pill/badge background.
     pub pill_bg: Hsla,
-    /// Pill/badge border.
     pub pill_border: Hsla,
 
+    /// Default color for a plot line when no per-series color is set.
     pub line_color: Hsla,
+    /// Categorical palette cycled through when a plot has several series.
     pub line_colors: [Hsla; 8],
     pub grid_color: Hsla,
     pub axis_color: Hsla,
     pub zero_line_color: Hsla,
 }
 
-/// Wrapper for storing the active theme as a gpui Global.
+/// Global wrapper that makes the active [`Theme`] addressable from any view.
 pub struct ActiveTheme(pub Arc<Theme>);
 
 impl Global for ActiveTheme {}
 
-/// Read the active theme from the gpui global state.
+/// Read the currently active theme. Cheap: clones an `Arc`.
 pub fn theme(cx: &App) -> Arc<Theme> {
     cx.global::<ActiveTheme>().0.clone()
 }
 
-/// Set the active theme. Notifies all global observers so views repaint.
+/// Swap the active theme. Triggers global observers so every view repaints.
 pub fn set_theme(cx: &mut App, theme: Arc<Theme>) {
     cx.set_global(ActiveTheme(theme));
 }
 
-/// All built-in themes.
+/// Every theme compiled into the binary, in the order the settings UI displays them.
 pub fn all_themes() -> &'static [&'static Theme] {
     static THEMES: &[&Theme] = &[&DARK, &CATPPUCCIN_MOCHA, &CATPPUCCIN_MACCHIATO, &CATPPUCCIN_LATTE, &AYU_DARK];
     THEMES
 }
-
-// ── Default line colors (shared across themes that don't override) ──
 
 const LINE_COLORS: [Hsla; 8] = [
     hex(0xff7c1f, 1.0), // orange
@@ -119,8 +123,6 @@ const LINE_COLORS: [Hsla; 8] = [
     hex(0xe0c030, 1.0), // yellow
     hex(0xe070a0, 1.0), // pink
 ];
-
-// ── Built-in themes ─────────────────────────────────────────────────
 
 pub static DARK: Theme = Theme {
     name: "Dark",
@@ -298,7 +300,9 @@ pub static AYU_DARK: Theme = Theme {
     zero_line_color: hex(0x2a2e38, 1.0),
 };
 
-/// Register the embedded fonts with gpui's text system.
+/// Load the embedded IBM Plex Mono fonts into gpui's text system.
+///
+/// Call once at startup before any view requests a font.
 pub fn register_fonts(cx: &App) {
     cx.text_system()
         .add_fonts(vec![

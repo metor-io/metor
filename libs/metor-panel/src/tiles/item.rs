@@ -1,29 +1,35 @@
 use gpui::{AnyEntity, AnyView, App, Entity, Render, SharedString};
 
-/// Trait that pane content must implement to be hosted in a tile pane.
+/// Content hosted inside a pane as a single tab.
+///
+/// Implementers gain a tab title, JSON persistence, and optional inspection
+/// support. The trait is generic so concrete panel types can keep their own
+/// APIs; [`PaneItemHandle`] erases them for storage.
 pub trait PaneItem: Render + Sized + 'static {
-    /// Display title shown in the tab bar.
     fn tab_title(&self, cx: &App) -> SharedString;
 
-    /// Unique type key used for serialization dispatch (e.g. "time_series_plot").
+    /// Stable identifier written into the serialized layout. Changing it
+    /// breaks compatibility with previously-saved workspaces.
     fn serialization_key() -> &'static str;
 
-    /// Serialize this item's state to a JSON value for persistence.
+    /// Snapshot the item's own state. Paired with an [`ItemRegistry`]
+    /// deserializer keyed on [`PaneItem::serialization_key`].
     fn serialize(&self, cx: &App) -> serde_json::Value;
 
-    /// Whether this tab can be closed by the user. Default: true.
+    /// Whether the tab bar should render a close affordance for this item.
     fn can_close(&self, _cx: &App) -> bool {
         true
     }
 
-    /// Return the entity to inspect. Defaults to the panel entity itself,
-    /// but wrapper panels can override to return their inner entity.
+    /// Optional override for reflection-based inspection. Wrapper panels
+    /// return their inner entity so the inspector walks the real data model
+    /// rather than the wrapper.
     fn inspectable_entity(&self) -> Option<AnyEntity> {
         None
     }
 }
 
-/// Object-safe handle to any pane item, used for type-erased storage in Pane.
+/// Object-safe view of a [`PaneItem`] so heterogeneous panels can share a tab bar.
 pub trait PaneItemHandle: 'static {
     fn tab_title(&self, cx: &App) -> SharedString;
     fn serialization_key(&self) -> &'static str;
@@ -33,7 +39,8 @@ pub trait PaneItemHandle: 'static {
     fn entity_id(&self) -> gpui::EntityId;
     fn clone_handle(&self) -> Box<dyn PaneItemHandle>;
 
-    /// Return the type-erased entity for reflection-based inspection.
+    /// Resolve the entity used by the reflection-driven inspector, applying
+    /// [`PaneItem::inspectable_entity`] when set.
     fn entity_any(&self, cx: &App) -> AnyEntity;
 }
 

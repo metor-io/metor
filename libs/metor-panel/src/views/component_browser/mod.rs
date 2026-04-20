@@ -17,12 +17,13 @@ use super::value_strip::{ComponentValueStrip, StripBehavior, StripClick, StripSt
 use component_tree::{ComponentNode, build_tree, resolve_path};
 use crate::theme::{Theme, theme};
 
-/// Specialization of [`ColumnBrowser`] that browses the DB's component namespace.
+/// [`ColumnBrowser`] specialized for the DB component namespace.
 pub type ComponentBrowser = ColumnBrowser<ComponentBrowserDelegate>;
 
-/// Emitted by [`ComponentBrowser`] when the user activates a leaf component
-/// (Enter / double-click). Owners decide the follow-up action — v1's
-/// `BrowserPanel` wrapper ignores these.
+/// Event raised on Enter / double-click of a leaf component.
+///
+/// Consumers decide how to act on an activation. The bundled `BrowserPanel`
+/// ignores it; other hosts can use it to wire up navigation or plotting.
 #[derive(Clone, Copy)]
 pub enum BrowserEvent {
     Activated(ComponentId),
@@ -30,7 +31,7 @@ pub enum BrowserEvent {
 
 impl EventEmitter<BrowserEvent> for ColumnBrowser<ComponentBrowserDelegate> {}
 
-/// Streaming preview for a single component.
+/// Cached live preview for a component in the detail column.
 struct ComponentPreview {
     component_id: ComponentId,
     full_name: SharedString,
@@ -38,13 +39,12 @@ struct ComponentPreview {
     click: StripClick,
 }
 
-/// Delegate that browses the dot-delimited namespace of DB components.
+/// Browses the dot-delimited component namespace.
 ///
-/// Selection is stored as an absolute path of `SharedString` segments so
-/// external tree rebuilds don't invalidate it. The detail column is always
-/// rendered; it shows the union of values for every component at or below
-/// the current selection tail (or the effective root when nothing is
-/// selected).
+/// Selection is stored as absolute path segments, so a DB rebuild (or a
+/// reroot via `set_root_override`) can't orphan it. The detail column is
+/// always rendered and shows the union of component values at or below the
+/// current tail, or the effective root when selection is empty.
 pub struct ComponentBrowserDelegate {
     db: Arc<DB>,
     tree: Arc<ComponentNode>,
@@ -119,9 +119,9 @@ impl ComponentBrowserDelegate {
             .unwrap_or_else(|| self.effective_root())
     }
 
-    /// Bring `self.previews` into sync with the components under the current
-    /// detail target: spawn streams for new entries, drop tasks for entries
-    /// that left the target set, leave already-streaming entries alone.
+    /// Align `previews` with the components currently under the detail
+    /// target: start streams for new entries, drop ones that fell out,
+    /// leave shared entries untouched so existing tasks keep running.
     fn reconcile_previews(&mut self, cx: &mut Context<ComponentBrowser>) {
         let target = self.detail_target();
         let mut target_nodes: Vec<Arc<ComponentNode>> = Vec::new();
@@ -262,8 +262,8 @@ impl ColumnBrowserDelegate for ComponentBrowserDelegate {
             );
         }
 
-        // Refresh each strip's interactive snapshot against the current
-        // pending-edit state before the list re-renders.
+        // Push the latest pending-edit snapshot into each strip before
+        // the list repaints.
         let updates: Vec<(Entity<ComponentValueStrip>, StripBehavior)> = self
             .previews
             .values()
@@ -336,6 +336,7 @@ impl ColumnBrowserDelegate for ComponentBrowserDelegate {
     }
 }
 
+/// Build a [`ComponentBrowser`] rooted at `db`'s component namespace.
 pub fn new_component_browser(db: Arc<DB>, cx: &mut Context<ComponentBrowser>) -> ComponentBrowser {
     let watcher = ComponentBrowserDelegate::spawn_watcher(db.clone(), cx);
     let delegate = ComponentBrowserDelegate {

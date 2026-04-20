@@ -1,8 +1,7 @@
-//! Drag/resize chrome for dashboard widgets in edit mode.
+//! Edit-mode drag and resize affordances for dashboard widgets.
 //!
-//! Holds the drag payload types ([`DraggedWidget`] / [`ResizingWidget`]) and
-//! the methods on [`DashboardPanel`] that render per-widget edit-mode zones
-//! and respond to drag events.
+//! Houses the drag payload types and the per-widget chrome that renders
+//! move/resize zones when the dashboard is editable.
 use gpui::{
     AnyElement, Context, DragMoveEvent, Empty, Entity, IntoElement, Render, Window, div, point,
     prelude::*, px,
@@ -12,14 +11,11 @@ use crate::theme::theme;
 
 use super::{DashboardPanel, DashboardWidget, WidgetId, WidgetRect, snap_px};
 
-/// Minimum width/height in pixels — widgets can't be resized smaller.
 const MIN_WIDGET_PX: f32 = 40.0;
-/// Width of the edge resize zones (like macOS window borders).
 const EDGE_ZONE_PX: f32 = 6.0;
-/// Size of corner resize zones.
 const CORNER_ZONE_PX: f32 = 10.0;
 
-/// Which edge or corner a resize drag started from.
+/// Edge or corner a resize drag grabbed.
 #[derive(Debug, Clone, Copy)]
 pub(super) enum ResizeEdge {
     TopLeft,
@@ -32,11 +28,14 @@ pub(super) enum ResizeEdge {
     BottomRight,
 }
 
-/// Drag payload when moving a widget.
+/// Payload carried while a widget is being translated.
+///
+/// `grab_offset` is the cursor position relative to the widget's top-left
+/// so the drag handler can move the widget without snapping the cursor to
+/// the origin.
 pub(super) struct DraggedWidget {
     pub(super) widget_id: WidgetId,
     pub(super) dashboard: Entity<DashboardPanel>,
-    /// Fractional offset from the widget's origin to the grab point.
     pub(super) grab_offset: gpui::Point<f32>,
 }
 
@@ -46,7 +45,9 @@ impl Render for DraggedWidget {
     }
 }
 
-/// Drag payload when resizing a widget.
+/// Payload carried while a widget is being resized; `original_rect` lets
+/// the handler compute deltas against the drag start rather than
+/// accumulating rounding error.
 pub(super) struct ResizingWidget {
     pub(super) widget_id: WidgetId,
     pub(super) dashboard: Entity<DashboardPanel>,
@@ -177,10 +178,9 @@ impl DashboardPanel {
         if self.editing {
             let widget_id = widget.id;
             let widget_rect = widget.rect;
-            // Full-size interaction blocker — absorbs all clicks so the
-            // inner widget content cannot be interacted with in edit mode.
-            // Right-click opens the widget's inspector.
-            // The move-zone drag and edge-zone resizes are layered above.
+            // Edit-mode blocker: swallows inner-view clicks so drag/resize
+            // zones are the only interactive surface. Right-click still
+            // opens the widget's inspector.
             let blocker_entity = cx.entity();
             let blocker_widget_id = widget.id;
             container = container.child(
@@ -203,7 +203,8 @@ impl DashboardPanel {
             );
 
             let entity = cx.entity();
-            // Center move zone — inset from edges so resize zones sit on top.
+            // Inner move zone is inset so resize zones along the edges
+            // remain hit-testable on top.
             container = container.child(
                 div()
                     .id(("widget-move-zone", widget.id.0 as usize))
@@ -238,15 +239,13 @@ impl DashboardPanel {
                     ),
             );
 
-            // Edge resize zones — always present, like macOS window borders.
             container = self.render_edge_zones(container, widget, cx);
         }
 
         container.into_any_element()
     }
 
-    /// Render invisible edge/corner zones around the widget border that
-    /// initiate resize on drag, like macOS window edges.
+    /// Add invisible 8-point resize zones that ring the widget's border.
     fn render_edge_zones(
         &self,
         mut container: gpui::Stateful<gpui::Div>,
@@ -256,8 +255,6 @@ impl DashboardPanel {
         let e = EDGE_ZONE_PX;
         let c = CORNER_ZONE_PX;
 
-        // Edges: thin strips along each side, inset from corners.
-        // Corners: small squares at each corner.
         struct Zone {
             edge: ResizeEdge,
             top: Option<f32>,
@@ -271,11 +268,11 @@ impl DashboardPanel {
 
         enum ZoneDim {
             Px(f32),
-            Fill, // stretch between the two corner zones
+            /// Stretch between the two bracketing corner zones.
+            Fill,
         }
 
         let zones = [
-            // Corners
             Zone {
                 edge: ResizeEdge::TopLeft,
                 top: Some(0.0),
@@ -316,7 +313,6 @@ impl DashboardPanel {
                 height: ZoneDim::Px(c),
                 cursor: gpui::CursorStyle::ResizeUpLeftDownRight,
             },
-            // Edges (between corners)
             Zone {
                 edge: ResizeEdge::Top,
                 top: Some(0.0),
@@ -385,11 +381,11 @@ impl DashboardPanel {
 
             handle = match zone.width {
                 ZoneDim::Px(v) => handle.w(px(v)),
-                ZoneDim::Fill => handle, // width determined by left+right anchors
+                ZoneDim::Fill => handle,
             };
             handle = match zone.height {
                 ZoneDim::Px(v) => handle.h(px(v)),
-                ZoneDim::Fill => handle, // height determined by top+bottom anchors
+                ZoneDim::Fill => handle,
             };
 
             handle = handle.on_drag(

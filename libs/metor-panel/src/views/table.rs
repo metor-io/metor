@@ -13,7 +13,7 @@ use crate::theme::theme;
 const HEADER_HEIGHT: f32 = 32.0;
 const RESIZE_HANDLE_WIDTH: f32 = 6.0;
 
-/// Sort state for a table column.
+/// Sort state of a column in a [`Table`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ColumnSort {
     Default,
@@ -31,7 +31,10 @@ impl ColumnSort {
     }
 }
 
-/// Definition for a table column: name, sizing, and behavior.
+/// Declarative description of one table column.
+///
+/// Width is pixel-based unless `flex` is set, in which case the column
+/// absorbs remaining horizontal space in proportion with other flex columns.
 pub struct Column {
     pub name: SharedString,
     pub width: Pixels,
@@ -81,7 +84,10 @@ impl Column {
     }
 }
 
-/// Provides data and rendering for a [`Table`]: columns, row count, cell rendering, and sorting.
+/// Data source for a [`Table`].
+///
+/// Implementers own the row model and paint each cell on demand. Sorting is
+/// delegated so backends can use whatever comparator makes sense.
 pub trait TableDelegate: Sized + 'static {
     fn columns(&self) -> Vec<Column>;
     fn rows_count(&self) -> usize;
@@ -113,7 +119,11 @@ impl Render for ResizeDrag {
     }
 }
 
-/// Generic table widget with resizable/sortable columns and virtual scrolling.
+/// Virtualized table widget driven by a [`TableDelegate`].
+///
+/// Column widths and sort state live here; the delegate just supplies rows.
+/// Scrolling uses gpui's `uniform_list` so the row count scales to
+/// thousands without per-row element cost.
 pub struct Table<D: TableDelegate> {
     delegate: D,
     col_states: Vec<ColState>,
@@ -259,7 +269,6 @@ impl<D: TableDelegate> Render for Table<D> {
         let row_count = self.delegate.rows_count();
         let row_height = self.delegate.row_height();
 
-        // Build header
         let mut header = div()
             .flex()
             .flex_row()
@@ -276,6 +285,8 @@ impl<D: TableDelegate> Render for Table<D> {
             let is_resizable = col.resizable;
 
             // Capture column bounds via canvas
+            // Resize drags convert pixel deltas against the column's
+            // on-screen origin; capture the bounds here during paint.
             let view = view.clone();
             let bounds_canvas = gpui::canvas(
                 move |bounds, _window, cx| {
@@ -316,7 +327,6 @@ impl<D: TableDelegate> Render for Table<D> {
             header = header.child(col_div);
         }
 
-        // Build body with uniform_list
         let col_count = columns.len();
         let col_flex: Vec<bool> = columns.iter().map(|c| c.flex).collect();
 

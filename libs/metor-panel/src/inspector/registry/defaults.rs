@@ -1,4 +1,9 @@
-//! Built-in field-widget registrations for primitive and well-known types.
+//! Built-in widgets and overrides registered at startup.
+//!
+//! Populates the registry with coverage for primitive types (`Hsla`,
+//! `SharedString`, `ComponentId`), generic shapes (`Override<T>`,
+//! `TimeRangeBehavior`), list-of-entity fields, and the views whose
+//! inspector pages need custom rows.
 
 use std::sync::Arc;
 
@@ -112,9 +117,7 @@ impl InspectorRegistry {
         }));
     }
 
-    /// Widget for `Override<f64>`. Top-level row shows `Auto` or the number;
-    /// cascading reveals a `ScalarRow` that writes `Custom(v)` and a command
-    /// row that flips it back to `Auto`.
+    /// Row for `Override<f64>`: numeric editor with an "Auto" escape hatch.
     fn register_override_f64(&mut self) {
         self.register_field_widget::<Override<f64>>(Arc::new(|ctx, peek, any_entity, idx| {
             let current = peek.get::<Override<f64>>().unwrap().clone();
@@ -143,8 +146,7 @@ impl InspectorRegistry {
         }));
     }
 
-    /// Widget for `Override<SharedString>`. Mirrors [`Self::register_override_f64`]
-    /// but uses a `TextRow` as the value editor.
+    /// Row for `Override<SharedString>`: text editor paired with an "Auto" reset.
     fn register_override_shared_string(&mut self) {
         self.register_field_widget::<Override<SharedString>>(Arc::new(
             |ctx, peek, any_entity, idx| {
@@ -175,9 +177,10 @@ impl InspectorRegistry {
         ));
     }
 
-    /// Widget for `TimeRangeBehavior`. Top-level row shows the current preset
-    /// name (or the formatted range when off-preset); cascading reveals a list
-    /// of presets plus a free-form text field for arbitrary input.
+    /// Row for `TimeRangeBehavior`: preset picker plus a custom text field.
+    ///
+    /// The summary shows the matching preset name or, failing that, the
+    /// formatted range so off-preset values remain legible at a glance.
     fn register_time_range_behavior(&mut self) {
         self.register_field_widget::<TimeRangeBehavior>(Arc::new(
             |ctx, peek, any_entity, idx| {

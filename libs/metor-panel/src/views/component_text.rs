@@ -7,7 +7,10 @@ use super::format::format_value;
 use crate::theme::theme;
 use crate::{AsComponentView, ComponentStream, ComponentStreamBuilder};
 
-/// Displays a single component's latest value as text, updating reactively.
+/// Large-text readout for a single component.
+///
+/// Subscribes to the component's WAL and replaces the displayed string on
+/// each tick; the task ends when the entity is dropped.
 pub struct ComponentText {
     value: Option<SharedString>,
     _task: gpui::Task<()>,

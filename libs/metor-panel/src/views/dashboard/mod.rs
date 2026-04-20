@@ -1,9 +1,9 @@
-//! Free-form canvas dashboard where widgets are positioned at pixel coordinates.
+//! Free-form dashboard with pixel-positioned widgets.
 //!
-//! Split across submodules:
-//! - [`widgets`] — per-kind factories plus image/placeholder leaf renderers
-//! - [`interaction`] — drag/resize payloads, edit-mode zones, `render_widget`
-//! - [`chrome`] — grid overlay drawn atop widgets in edit mode
+//! Submodules:
+//! - [`widgets`] — per-kind factories and leaf renderers (image, monitor).
+//! - [`interaction`] — drag and resize payloads plus the per-widget layout.
+//! - [`chrome`] — grid overlay rendered above widgets in edit mode.
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -27,18 +27,17 @@ mod widgets;
 pub use widgets::{WidgetRegistry, WidgetSpec};
 use widgets::create_widget_view;
 
-/// Snap step for widget placement on the canvas.
 const SNAP_GRID_PX: f32 = 10.0;
 
 fn snap_px(v: f32) -> f32 {
     (v / SNAP_GRID_PX).round() * SNAP_GRID_PX
 }
 
-/// Unique identifier for a widget within a dashboard.
+/// Monotonic id assigned to a widget on placement.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct WidgetId(pub u64);
 
-/// Position and size in pixels on the dashboard canvas.
+/// Pixel rectangle within the dashboard canvas.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 pub struct WidgetRect {
     pub x: f32,
@@ -47,12 +46,11 @@ pub struct WidgetRect {
     pub h: f32,
 }
 
-/// The type of content a widget displays.
+/// Content type of a widget, serialized as a plain string.
 ///
-/// Wire format is a string (`"plot"`, `"text"`, `"viewer3d"`, …) — newtype
-/// over [`SharedString`] so consumers can register custom kinds beyond the
-/// built-ins. Built-ins are spelled `WidgetKind::plot()`, `::text()`, etc.;
-/// downstream code uses `WidgetKind::new("my_kind")`.
+/// Exposed as a newtype over [`SharedString`] so downstream code can
+/// register additional kinds beyond the shipped built-ins via
+/// [`WidgetKind::new`].
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct WidgetKind(pub SharedString);
@@ -85,7 +83,7 @@ impl WidgetKind {
     }
 }
 
-/// A positioned widget on the dashboard canvas.
+/// One placed widget (position + persisted config).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DashboardWidget {
     pub id: WidgetId,
@@ -94,7 +92,12 @@ pub struct DashboardWidget {
     pub config: serde_json::Value,
 }
 
-/// Free-form canvas dashboard where widgets are positioned at pixel coordinates.
+/// Canvas panel that lays out [`DashboardWidget`]s at absolute pixel
+/// coordinates.
+///
+/// Widget entities live in parallel maps keyed by [`WidgetId`] so the
+/// rendered view and the inspectable data model stay addressable without
+/// holding references inside the config.
 pub struct DashboardPanel {
     db: Arc<DB>,
     title: SharedString,
@@ -106,8 +109,8 @@ pub struct DashboardPanel {
     editing: bool,
     selected: Option<WidgetId>,
     container_bounds: Option<Bounds<Pixels>>,
-    /// Viewport pan offset in pixels. Negative values scroll the canvas
-    /// so content below/right of the origin becomes visible.
+    /// Viewport pan in pixels; negative values scroll content below and
+    /// right of origin into view.
     scroll_offset: Point<f32>,
 }
 
@@ -133,9 +136,10 @@ impl DashboardPanel {
         id
     }
 
-    /// Iterate all widgets along with their inspectable entity handle and a
-    /// display label. Used by the items registry to surface widgets in the
-    /// everything-palette.
+    /// Widgets paired with their inspectable entity and a palette label.
+    ///
+    /// Consumed by the palette's `Widget` category so each widget is
+    /// reachable without opening the dashboard first.
     pub fn inspectable_widgets(
         &self,
         cx: &App,
@@ -153,7 +157,7 @@ impl DashboardPanel {
         self.title.clone()
     }
 
-    /// Find an unoccupied position for a new widget of the given size.
+    /// Pick a starting rect for a new widget that sits below existing ones.
     fn auto_place(&self, w: f32, h: f32) -> WidgetRect {
         let x = 20.0_f32;
         let mut y = 20.0_f32;
@@ -171,10 +175,11 @@ impl DashboardPanel {
         }
     }
 
-    /// Insert a widget whose view + inspectable entity were built externally
-    /// (e.g. by the new-plot wizard, which constructs a pre-populated
-    /// `TimeSeriesPlot`). The widget's `config` is left empty — round-trip
-    /// persistence of the pre-built state is not handled by this path.
+    /// Add a widget whose view and inspectable entity are already built.
+    ///
+    /// Used by flows (e.g. the trace wizard) that want to seed a widget
+    /// with runtime state. `config` is left empty; the pre-built state is
+    /// not round-tripped through serialization.
     pub fn add_widget_with_entity(
         &mut self,
         kind: WidgetKind,
@@ -274,7 +279,7 @@ impl DashboardPanel {
         }
     }
 
-    /// The furthest right and bottom edges of any widget.
+    /// Farthest right and bottom edges across all widgets; bounds the scroll.
     fn content_extent(&self) -> Point<f32> {
         let max_x = self
             .widgets
@@ -289,7 +294,7 @@ impl DashboardPanel {
         point(max_x, max_y)
     }
 
-    /// Clamp scroll offset so the viewport doesn't scroll past content bounds.
+    /// Keep `scroll_offset` inside the reachable range given the current viewport.
     fn clamp_scroll(&mut self) {
         let extent = self.content_extent();
         if let Some(bounds) = self.container_bounds {
@@ -306,8 +311,8 @@ impl DashboardPanel {
         }
     }
 
-    /// Convert a window-space pixel position to canvas coordinates,
-    /// accounting for the current scroll offset.
+    /// Translate a window-space point into canvas coordinates, applying the
+    /// current scroll offset.
     fn pixel_to_canvas(&self, pixel: Point<Pixels>) -> Option<Point<f32>> {
         let bounds = self.container_bounds?;
         let x = f32::from(pixel.x - bounds.origin.x) - self.scroll_offset.x;
@@ -316,8 +321,8 @@ impl DashboardPanel {
     }
 }
 
-/// Build the inspector rows for dashboard operations (Add/Remove widget,
-/// Edit Mode toggle, Rename, Z-order controls).
+/// Inspector rows that operate on the dashboard itself: add/remove widgets,
+/// toggle edit mode, rename, adjust z-order.
 pub fn dashboard_rows(
     dashboard: Entity<DashboardPanel>,
     db: Arc<DB>,
@@ -382,7 +387,6 @@ pub fn dashboard_rows(
         })));
     }
 
-    // Z-order controls when a widget is selected
     let selected = dashboard.read(cx).selected;
     if let Some(sel_id) = selected {
         rows.push(Box::new(CommandRow::new("Bring to Front", {
@@ -569,7 +573,7 @@ impl Render for DashboardPanel {
             canvas_div = canvas_div.child(self.render_grid_overlay(cx));
         }
 
-        // Render widgets in order (z-order = vec order)
+        // Vec order is z-order: later widgets paint on top.
         let widgets: Vec<DashboardWidget> = self.widgets.clone();
         for widget in &widgets {
             canvas_div = canvas_div.child(self.render_widget(widget, cx));
@@ -579,9 +583,8 @@ impl Render for DashboardPanel {
             .on_drag_move(cx.listener(Self::handle_widget_drag_move))
             .on_drag_move(cx.listener(Self::handle_widget_resize_move));
 
-        // Scroll wheel pans the viewport. Child widgets that handle scroll
-        // themselves (e.g. plot zoom) should call cx.stop_propagation() to
-        // prevent this handler from also firing.
+        // Wheel events pan the canvas; widgets that consume wheel (plots)
+        // must stop propagation to keep their own handling authoritative.
         canvas_div = canvas_div.on_scroll_wheel(cx.listener(
             |this, event: &gpui::ScrollWheelEvent, _window, cx| {
                 let delta = event.delta.pixel_delta(px(20.0));
@@ -592,7 +595,6 @@ impl Render for DashboardPanel {
             },
         ));
 
-        // Click on empty canvas space deselects.
         if self.editing {
             let entity = cx.entity();
             canvas_div = canvas_div.on_click(move |_, _, cx| {
@@ -676,7 +678,10 @@ impl PaneItem for DashboardPanel {
     }
 }
 
-/// Deserialize a DashboardPanel from its serialized JSON state.
+/// Rebuild a [`DashboardPanel`] from its JSON snapshot.
+///
+/// Missing keys fall back to safe defaults so older serialized dashboards
+/// remain loadable when the schema grows.
 pub fn deserialize_dashboard(
     db: Arc<DB>,
     value: serde_json::Value,
