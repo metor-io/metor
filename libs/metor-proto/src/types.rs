@@ -31,7 +31,8 @@ use stellarator_buf::{IoBuf, Slice};
     FromBytes,
     postcard_schema::Schema,
 )]
-#[cfg_attr(feature = "bevy", derive(bevy::prelude::Component))]
+#[cfg_attr(feature = "facet", derive(facet::Facet))]
+#[cfg_attr(feature = "facet", facet(transparent))]
 #[repr(transparent)]
 pub struct ComponentId(pub u64);
 
@@ -69,7 +70,6 @@ impl Display for ComponentId {
     FromBytes,
     postcard_schema::Schema,
 )]
-#[cfg_attr(feature = "bevy", derive(bevy::prelude::Component))]
 #[repr(transparent)]
 pub struct EntityId(pub u64);
 
@@ -316,6 +316,22 @@ impl<'a> ComponentView<'a> {
         }
     }
 
+    pub fn to_f64(&self) -> f64 {
+        match *self {
+            Self::U8(ref v) => v.buf()[0] as f64,
+            Self::U16(ref v) => v.buf()[0] as f64,
+            Self::U32(ref v) => v.buf()[0] as f64,
+            Self::U64(ref v) => v.buf()[0] as f64,
+            Self::I8(ref v) => v.buf()[0] as f64,
+            Self::I16(ref v) => v.buf()[0] as f64,
+            Self::I32(ref v) => v.buf()[0] as f64,
+            Self::I64(ref v) => v.buf()[0] as f64,
+            Self::F32(ref v) => v.buf()[0] as f64,
+            Self::F64(ref v) => v.buf()[0],
+            Self::Bool(ref v) => v.buf()[0] as u8 as f64,
+        }
+    }
+
     pub fn prim_type(&self) -> PrimType {
         match *self {
             Self::U8(_) => PrimType::U8,
@@ -548,7 +564,7 @@ pub struct PacketHeader {
     pub req_id: RequestId,
 }
 
-#[derive(TryFromBytes, Unaligned, Immutable, KnownLayout, Debug)]
+#[derive(TryFromBytes, Unaligned, Immutable, KnownLayout, Debug, IntoBytes)]
 #[repr(C)]
 pub struct Packet {
     pub header: PacketHeader,

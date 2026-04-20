@@ -1,0 +1,129 @@
+use std::mem::size_of;
+
+use metor_db::disruptor::{ReadGrant, Reader};
+use metor_db::{Component, ComponentSchema, DB};
+use metor_proto::types::{ComponentId, ComponentView, Timestamp};
+pub mod app;
+pub mod views;
+pub mod gpu_context;
+pub mod icons;
+pub mod inspect;
+pub mod inspector;
+pub mod theme;
+pub mod tiles;
+
+/// Borrow as a [`ComponentView`] without copying the backing buffer.
+pub trait AsComponentView {
+    fn as_component_view(&self) -> ComponentView<'_>;
+}
+
+impl AsComponentView for ComponentView<'_> {
+    fn as_component_view(&self) -> ComponentView<'_> {
+        *self
+    }
+}
+
+/// Async source of component value updates.
+///
+/// Views borrow from the stream; hold the stream across `.await` points.
+pub trait ComponentStream {
+    type View<'a>: AsComponentView
+    where
+        Self: 'a;
+    fn next(&mut self) -> impl std::future::Future<Output = Self::View<'_>>;
+}
+
+/// Resolves a component (by handle or id) into a [`WalComponentStream`].
+///
+/// The `ComponentId` impl waits for the component to appear in the DB,
+/// letting views subscribe before the producer has registered.
+pub trait ComponentStreamBuilder {
+    fn component_id(&self) -> ComponentId;
+    fn into_stream(self, db: &DB) -> impl std::future::Future<Output = WalComponentStream> + Send;
+}
+
+impl ComponentStreamBuilder for Component {
+    fn component_id(&self) -> ComponentId {
+        self.component_id
+    }
+
+    async fn into_stream(self, _db: &DB) -> WalComponentStream {
+        WalComponentStream::new(&self)
+    }
+}
+
+impl ComponentStreamBuilder for ComponentId {
+    fn component_id(&self) -> ComponentId {
+        *self
+    }
+
+    async fn into_stream(self, db: &DB) -> WalComponentStream {
+        let component = wait_for_component(db, self).await;
+        WalComponentStream::new(&component)
+    }
+}
+
+/// Streams the most recent value of a component from its WAL.
+///
+/// Each `next()` yields a [`WalView`] pointing at the last complete message
+/// in the grant. Earlier messages in the same grant are skipped: views only
+/// need the latest sample to repaint.
+pub struct WalComponentStream {
+    reader: Reader,
+    schema: ComponentSchema,
+}
+
+impl WalComponentStream {
+    pub fn new(component: &Component) -> Self {
+        Self {
+            reader: component.wal.reader(),
+            schema: component.schema.clone(),
+        }
+    }
+}
+
+/// Borrowed view into the last value of a WAL grant.
+///
+/// The grant is retained so `parse_value` can lazily materialize the
+/// [`ComponentView`] against a buffer that stays alive for `'a`.
+pub struct WalView<'a> {
+    _grant: ReadGrant<'a>,
+    schema: &'a ComponentSchema,
+    offset: usize,
+}
+
+impl AsComponentView for WalView<'_> {
+    fn as_component_view(&self) -> ComponentView<'_> {
+        let value_buf = &self._grant[self.offset..];
+        let (_size, view) = self
+            .schema
+            .parse_value(value_buf)
+            .expect("invalid WAL data");
+        view
+    }
+}
+
+impl ComponentStream for WalComponentStream {
+    type View<'a> = WalView<'a>;
+
+    async fn next(&mut self) -> WalView<'_> {
+        let msg_size = self.schema.size() + size_of::<Timestamp>();
+        let grant = self.reader.next().await;
+        let count = (grant.len() / msg_size).max(1);
+        let offset = (count - 1) * msg_size + size_of::<Timestamp>();
+        WalView {
+            _grant: grant,
+            schema: &self.schema,
+            offset,
+        }
+    }
+}
+
+async fn wait_for_component(db: &DB, component_id: ComponentId) -> Component {
+    loop {
+        if let Some(component) = db.with_state(|state| state.get_component(component_id).cloned()) {
+            return component;
+        }
+        db.vtable_gen.wait().await;
+    }
+}

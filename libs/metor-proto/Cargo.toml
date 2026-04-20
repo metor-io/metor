@@ -9,15 +9,16 @@ repository.workspace = true
 default = ["alloc", "std"]
 std = ["miette", "alloc", "serde/std", "nox", "nox-array/std", "stellarator-buf/std"]
 alloc = []
-bevy = ["dep:bevy"]
+#bevy = ["dep:bevy"]
 mlua = ["dep:mlua"]
 thingbuf = ["dep:thingbuf", "replace_with"]
 hifitime = ["dep:hifitime"]
 nox = ["dep:nox"]
+facet = ["dep:facet"]
 
 [dependencies]
 # ser-des
-zerocopy.version = "=0.8.14"
+zerocopy.version = "0.8"
 zerocopy.features = ["derive"]
 serde.version = "1.0"
 serde.default-features = false
@@ -46,9 +47,9 @@ miette.optional = true
 const-fnv1a-hash = "1.1.0"
 
 # bevy
-bevy.version = "0.16"
-bevy.default-features = false
-bevy.optional = true
+#bevy.version = "0.16"
+#bevy.default-features = false
+#bevy.optional = true
 
 # lua
 mlua.version = "0.10"
@@ -64,3 +65,5 @@ replace_with.optional = true
 # integrations
 hifitime.version = "4.0"
 hifitime.optional = true
+
+facet = { git = "https://github.com/metor-io/facet.git", branch = "sphw/facet-gpui", optional = true, default-features = false }

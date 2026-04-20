@@ -4,6 +4,8 @@ use std::{
     time::{Duration, Instant},
 };
 
+use metor_fsw::{AsVTable, Metadatatize, tcp::SinkExt};
+use metor_fsw_adcs::{mekf, yang_lqr::YangLQR};
 use metor_proto::types::{ComponentId, LenPacket, Msg, OwnedPacket, PacketId, Timestamp};
 use metor_proto_bbq::RxExt;
 use metor_proto_stellar::{PacketSink, PacketStream, queue::spawn_recv};
@@ -13,9 +15,7 @@ use nox::{
     SpatialTransform, Vec3, Vector, Vector3, array::Quat, rk4, tensor,
 };
 use rand_distr::Distribution;
-use metor_fsw::{AsVTable, Metadatatize, tcp::SinkExt};
-use metor_fsw_adcs::{mekf, yang_lqr::YangLQR};
-use stellarator::{io::SplitExt, net::TcpStream, rent, struc_con::stellar};
+use stellarator::{io::SplitExt, net::TcpStream, rent};
 use tracing_subscriber::EnvFilter;
 use zerocopy::{Immutable, IntoBytes, KnownLayout};
 
@@ -43,6 +43,7 @@ pub struct Sim {
     reaction_wheels: [ReactionWheel; 3],
     sensors: Sensors,
     control_torque: Vec3<f64>,
+    tick_time: f64,
 }
 
 #[derive(AsVTable, Debug, Clone, Immutable, KnownLayout, Metadatatize, IntoBytes, Default)]
@@ -251,6 +252,15 @@ pub struct FSW {
     pub control: Control,
     pub mode: Mode,
     pub start_epoch: Timestamp,
+    pub tick_time: f64,
+    pub overrides: Overrides,
+}
+
+#[derive(AsVTable, Debug, Clone, Immutable, KnownLayout, Metadatatize, IntoBytes)]
+#[repr(C)]
+pub struct Overrides {
+    pub _pad: [u8; 5],
+    pub disable_reaction_wheels: [bool; 3],
 }
 
 #[derive(AsVTable, Metadatatize, Debug, Clone, Copy, IntoBytes, KnownLayout, Immutable)]
@@ -314,6 +324,11 @@ impl Default for FSW {
             control: Control::default(),
             mode: Mode::HilPoint,
             start_epoch: Timestamp::now(),
+            tick_time: 0.0,
+            overrides: Overrides {
+                _pad: [0; 5],
+                disable_reaction_wheels: [false; 3],
+            },
         }
     }
 }
@@ -403,6 +418,7 @@ impl Default for CubeSat {
             ],
             control_torque: Vec3::zeros(),
             body,
+            tick_time: 0.0,
         };
         let control = FSW::default();
         Self { sim, fsw: control }
@@ -448,12 +464,16 @@ impl Sim {
 }
 
 fn tick(mut cubesat: CubeSat) -> CubeSat {
+    let sim_start = Instant::now();
     cubesat.sim = cubesat.sim.update();
     cubesat.sim = rk4::<f64, Sim, DU, _>(DT, &cubesat.sim, |sim: &Sim| -> DU { sim.du() });
+    cubesat.sim.tick_time = sim_start.elapsed().as_secs_f64();
+    let fsw_start = Instant::now();
     cubesat.fsw = cubesat.fsw.update(&cubesat.sim.sensors);
     cubesat
         .sim
         .set_reaction_wheel_torque(cubesat.fsw.control.torque_set_point);
+    cubesat.fsw.tick_time = fsw_start.elapsed().as_secs_f64();
     cubesat
 }
 
@@ -465,8 +485,8 @@ pub async fn main() -> anyhow::Result<()> {
         .try_init()
         .unwrap();
 
-    stellar(move || metor_db::serve_tmp_db(SocketAddr::new([127, 0, 0, 1].into(), 2240)));
-    stellarator::sleep(Duration::from_millis(50)).await;
+    //stellar(move || metor_db::serve_tmp_db(SocketAddr::new([127, 0, 0, 1].into(), 2240)));
+    //stellarator::sleep(Duration::from_millis(50)).await;
     let (rx, tx) = TcpStream::connect(SocketAddr::new([127, 0, 0, 1].into(), 2240))
         .await?
         .split();
@@ -486,7 +506,11 @@ pub async fn main() -> anyhow::Result<()> {
     .await
     .0?;
     let mut cube_sat = CubeSat::default();
-    let mut pkt = LenPacket::new(metor_proto::types::PacketTy::Table, id, size_of::<CubeSat>());
+    let mut pkt = LenPacket::new(
+        metor_proto::types::PacketTy::Table,
+        id,
+        size_of::<CubeSat>(),
+    );
     loop {
         let start = Instant::now();
         while let Some(pkt) = rx.try_recv_pkt() {
@@ -503,8 +527,8 @@ pub async fn main() -> anyhow::Result<()> {
                         if update_component.id == ComponentId::new("cube_sat.fsw.mode") {
                             let mode = value.buf.as_buf()[0];
                             cube_sat.fsw.mode = match mode {
-                                0 => Mode::HilPoint,
-                                1 => Mode::NadirPoint,
+                                0 => Mode::NadirPoint,
+                                1 => Mode::HilPoint,
                                 _ => continue,
                             };
                         }

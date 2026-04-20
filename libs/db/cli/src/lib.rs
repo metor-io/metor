@@ -7,7 +7,7 @@ use arrow::{
 use metor_proto::{
     com_de::Decomponentize,
     schema::Schema,
-    types::{ComponentId, Msg, OwnedTimeSeries, PacketId, PrimType, Request, Timestamp, msg_id},
+    types::{ComponentId, OwnedTimeSeries, PacketId, PrimType, Request, Timestamp, msg_id},
     vtable::{
         self, VTable,
         builder::{FieldBuilder, OpBuilder, schema},
@@ -645,17 +645,6 @@ impl Highlighter for CliHelper {
 #[derive(clap::Args, Clone, Debug)]
 pub struct Args {
     pub path: Option<PathBuf>,
-}
-
-struct LuaMsg<M: Msg>(M);
-
-impl<M: Msg> UserData for LuaMsg<M> {
-    fn add_methods<T: mlua::UserDataMethods<Self>>(methods: &mut T) {
-        methods.add_method("msg", |_, this, ()| {
-            let msg = this.0.into_len_packet().inner;
-            Ok(msg)
-        });
-    }
 }
 
 pub fn lua() -> anyhow::Result<Lua> {

@@ -1,0 +1,75 @@
+[package]
+name = "metor-panel"
+version.workspace = true
+edition.workspace = true
+repository.workspace = true
+
+[dependencies]
+gpui = "*"
+hifitime.version = "4.0"
+nucleo-matcher = "0.3"
+regex = "1"
+metor-db.path = "../db"
+metor-proto.path = "../metor-proto"
+metor-proto.features = ["std", "facet"]
+metor-proto-wkt.path = "../metor-proto/wkt"
+metor-proto-wkt.features = ["nox"]
+nox.path = "../nox"
+facet = { git = "https://github.com/metor-io/facet.git", branch = "sphw/facet-gpui", features = ["reflect", "smallvec", "gpui"] }
+postcard = "1"
+serde = { version = "1", features = ["derive"] }
+smallvec = "1"
+serde_json = "1"
+peg = "0.8.5"
+zerocopy = "0.8"
+jiff = "0.2"
+stellarator.path = "../stellarator"
+wgpu = "29"
+bytemuck = { version = "1", features = ["derive"] }
+pollster = "0.4"
+image = "0.25"
+glam = "0.32"
+crossbeam-channel = "0.5"
+thingbuf = "0.1"
+bevy = { git = "https://github.com/bevyengine/bevy", rev = "5330b01ed6dfe8ee9ea98c97ded72e44ca336c74", default-features = false, features = [
+    "std",
+    # Core rendering
+    "bevy_asset",
+    "bevy_render",
+    "bevy_core_pipeline",
+    "bevy_pbr",
+    "bevy_mesh",
+    "bevy_image",
+    "bevy_shader",
+    "bevy_camera",
+    "bevy_light",
+    "bevy_window",
+    # Scenes & models
+    "bevy_scene",
+    "bevy_gltf",
+    "bevy_animation",
+    # Image formats used by GLTF textures
+    "png",
+    "jpeg",
+    "ktx2",
+    "zstd_rust",
+    # Visual quality
+    "tonemapping_luts",
+    "bevy_anti_alias",
+    # Scheduling
+    "multi_threaded",
+    "async_executor",
+    "bevy_log",
+    # Auto-register every `#[derive(Reflect)]` type with the AppTypeRegistry
+    # at startup. Required by `bevy_world_serialization` (which backs the
+    # GLTF loader's WorldAssetRoot path) — without this it panics on the
+    # first unregistered component it encounters in a loaded scene.
+    "reflect_auto_register",
+] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+cocoa = "0.26"
+objc = "0.2"
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(feature, values("cargo-clippy"))'] }

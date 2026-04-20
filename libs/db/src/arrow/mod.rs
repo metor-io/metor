@@ -6,9 +6,8 @@ use arrow::{
     buffer::{BooleanBuffer, Buffer, ScalarBuffer},
     datatypes::*,
 };
-use convert_case::Casing;
 use datafusion::{datasource::MemTable, prelude::SessionContext, sql::TableReference};
-use futures_lite::{Stream, pin};
+use futures_lite::Stream;
 use metor_proto::types::{PrimType, Timestamp};
 use metor_proto_wkt::ArchiveFormat;
 use std::{

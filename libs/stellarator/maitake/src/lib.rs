@@ -4,6 +4,7 @@
 #![cfg_attr(feature = "core-error", feature(error_in_core))]
 #![allow(clippy::new_without_default)]
 #![allow(unused_unsafe)]
+#![allow(unused_attributes)]
 
 #[cfg(feature = "alloc")]
 extern crate alloc;

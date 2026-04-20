@@ -8,7 +8,9 @@ use std::{
     },
 };
 
-use metor_proto::types::Timestamp;
+use metor_proto::types::{ComponentView, Timestamp};
+
+use crate::ComponentSchema;
 use stellarator::sync::WaitQueue;
 use tracing::warn;
 use zerocopy::FromBytes;
@@ -105,6 +107,39 @@ impl TimeSeriesNodeSlice {
         let start = (self.range.start() * element_size).min(data_len);
         let end = (self.range.end().saturating_add(1) * element_size).min(data_len);
         &self.node.data.data()[start..end]
+    }
+
+    /// Stable identity for the underlying node, suitable for use as a cache key.
+    /// Two slices that share the same node will return the same id.
+    pub fn node_id(&self) -> usize {
+        Arc::as_ptr(&self.node) as usize
+    }
+
+    /// Timestamps for every sample in the underlying node, ignoring this slice's
+    /// visible range. Useful for caches that index by full-node identity.
+    pub fn full_timestamps(&self) -> &[Timestamp] {
+        self.node.timestamps()
+    }
+
+    /// Raw sample bytes for every sample in the underlying node, ignoring this
+    /// slice's visible range.
+    pub fn full_data(&self) -> &[u8] {
+        self.node.data.data()
+    }
+
+    pub fn iter_values<'a>(
+        &'a self,
+        schema: &'a ComponentSchema,
+    ) -> impl Iterator<Item = (Timestamp, ComponentView<'a>)> + 'a {
+        let element_size = schema.size();
+        let timestamps = self.timestamps();
+        let data = self.data();
+        timestamps.iter().enumerate().filter_map(move |(i, ts)| {
+            let start = i * element_size;
+            let buf = data.get(start..start + element_size)?;
+            let (_size, view) = schema.parse_value(buf).ok()?;
+            Some((*ts, view))
+        })
     }
 }
 
