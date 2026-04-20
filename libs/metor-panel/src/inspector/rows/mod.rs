@@ -51,6 +51,29 @@ pub trait InspectorRow: 'static {
     /// mutate its bound data directly while delegating navigation and
     /// dismissal to the host.
     fn activate(&mut self, window: &mut Window, cx: &mut App) -> RowAction;
+
+    /// Variant of [`Self::activate`] that receives the inspector's
+    /// current search text. Rows that accept free-form text (prompts,
+    /// filter builders) override this to consume the typed query as
+    /// their input rather than opening a secondary edit field.
+    ///
+    /// The default delegates to `activate`, so existing rows keep their
+    /// current behaviour.
+    fn activate_with_search(
+        &mut self,
+        _search: &str,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> RowAction {
+        self.activate(window, cx)
+    }
+
+    /// Rows that consume the search field itself return `true` so the
+    /// fuzzy filter keeps them visible even when the query doesn't
+    /// match their label.
+    fn consumes_search(&self) -> bool {
+        false
+    }
 }
 
 /// Reply from [`InspectorRow::activate`] directing what the host should do next.

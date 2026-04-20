@@ -24,6 +24,9 @@ pub struct ComponentNode {
 ///
 /// The synthetic root has empty `segment` and `full_name` and no
 /// `component_id`; its children are the first-level namespace segments.
+/// Single-child chains are collapsed via [`compress_subtree`] so a long
+/// non-branching prefix (`cube_sat.sim.reaction_wheels.…`) renders as
+/// one row instead of a column-per-segment drill-down.
 pub fn build_tree(db: &DB) -> Arc<ComponentNode> {
     let mut root = Builder::new(SharedString::new_static(""), String::new());
     db.with_state(|state| {
@@ -31,7 +34,55 @@ pub fn build_tree(db: &DB) -> Arc<ComponentNode> {
             insert(&mut root, &meta.name, *id);
         }
     });
-    Arc::new(root.freeze())
+    let raw = root.freeze();
+    let compressed_children: BTreeMap<SharedString, Arc<ComponentNode>> = raw
+        .children
+        .values()
+        .map(|c| compress_subtree(c.clone()))
+        .map(|c| (c.segment.clone(), c))
+        .collect();
+    Arc::new(ComponentNode {
+        segment: raw.segment,
+        full_name: raw.full_name,
+        component_id: raw.component_id,
+        children: compressed_children,
+    })
+}
+
+/// Post-order fuse a non-component branch with its only surviving child.
+///
+/// A node collapses into its child only when it has no `component_id`
+/// of its own (a real component registered on a non-leaf name must
+/// stay clickable) and exactly one child after the child's own
+/// compression. The fused node adopts the child's `full_name`,
+/// `component_id`, and `children` and uses `"parent.child"` as its
+/// segment so the column browser displays the full collapsed prefix.
+pub(crate) fn compress_subtree(node: Arc<ComponentNode>) -> Arc<ComponentNode> {
+    let compressed: Vec<Arc<ComponentNode>> = node
+        .children
+        .values()
+        .map(|c| compress_subtree(c.clone()))
+        .collect();
+
+    if node.component_id.is_none() && compressed.len() == 1 {
+        let child = &compressed[0];
+        return Arc::new(ComponentNode {
+            segment: SharedString::from(format!("{}.{}", node.segment, child.segment)),
+            full_name: child.full_name.clone(),
+            component_id: child.component_id,
+            children: child.children.clone(),
+        });
+    }
+
+    Arc::new(ComponentNode {
+        segment: node.segment.clone(),
+        full_name: node.full_name.clone(),
+        component_id: node.component_id,
+        children: compressed
+            .into_iter()
+            .map(|c| (c.segment.clone(), c))
+            .collect(),
+    })
 }
 
 /// Resolve `path` to the chain of nodes reached, stopping at the first

@@ -3,10 +3,11 @@
 use std::sync::Arc;
 
 use crate::inspector::Inspector;
-use crate::inspector::{InspectorMode, InspectorRequest};
+use crate::inspector::{InspectorMode, InspectorRequest, OpenInspectorGlobal};
 use crate::inspector::palette::ItemRegistry;
 use crate::inspector::edits::{self, edit_value_rows, pending_edits, pending_edits_mut, review_rows};
-use crate::tiles::{TileGroup, TileGroupEvent};
+use crate::tiles::{PlotComponentAction, TileGroup, TileGroupEvent};
+use crate::tiles::panels::PlotPanel;
 use gpui::{
     App, Application, Bounds, Context, Entity, FocusHandle, Focusable, IntoElement, KeyBinding,
     Pixels, Point, Render, SharedString, TitlebarOptions, Window, WindowBounds, WindowOptions,
@@ -47,6 +48,7 @@ impl AppRoot {
         let tiles = cx.new(|cx| TileGroup::new(vec![], cx));
         cx.subscribe(&tiles, Self::handle_tile_event).detach();
         let on_open_inspector = Self::make_on_open_inspector(cx.entity().clone());
+        cx.set_global(OpenInspectorGlobal(on_open_inspector.clone()));
         crate::inspector::palette::register_builtin_providers(db.clone(), tiles.clone(), on_open_inspector, cx);
         Self {
             db,
@@ -177,6 +179,22 @@ impl AppRoot {
         self.open_entity_inspector(&action.entity, action.position, window, cx)
     }
 
+    fn handle_plot_component_action(
+        &mut self,
+        action: &PlotComponentAction,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(pane) = self.tiles.read(cx).panes().first().cloned() else {
+            return;
+        };
+        let db = self.db.clone();
+        let component_id = action.component_id;
+        let indices = action.indices.clone();
+        let plot = cx.new(|cx| PlotPanel::new(db, component_id, &indices, cx));
+        pane.update(cx, |pane, cx| pane.add_item(Box::new(plot), cx));
+    }
+
     fn handle_tile_event(
         &mut self,
         _tiles: Entity<TileGroup>,
@@ -243,6 +261,7 @@ impl Render for AppRoot {
             .on_action(cx.listener(Self::cycle_tab_backward))
             .on_action(cx.listener(Self::toggle_cmd_lock))
             .on_action(cx.listener(Self::handle_inspect_entity))
+            .on_action(cx.listener(Self::handle_plot_component_action))
             .on_action(cx.listener(Self::open_review_edits))
             .font_family(theme.font_family)
             .flex()

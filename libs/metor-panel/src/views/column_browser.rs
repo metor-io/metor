@@ -2,7 +2,7 @@ use std::ops::Range;
 
 use gpui::{
     AnyElement, App, Axis, Bounds, Context, DragMoveEvent, Empty, FocusHandle, Focusable, Hsla,
-    IntoElement, KeyDownEvent, MouseButton, MouseDownEvent, Pixels, Render, ScrollHandle,
+    IntoElement, KeyDownEvent, MouseButton, MouseDownEvent, Pixels, Point, Render, ScrollHandle,
     SharedString, UniformListScrollHandle, Window, div, prelude::*, px, uniform_list,
 };
 use smallvec::SmallVec;
@@ -105,6 +105,29 @@ pub trait ColumnBrowserDelegate: Sized + 'static {
         cx: &mut Context<ColumnBrowser<Self>>,
     ) {
         let _ = (item, window, cx);
+    }
+
+    /// Right-click on a row (`item = Some`) or the column body
+    /// (`item = None`). Default: ignore.
+    fn on_context_menu(
+        &mut self,
+        column_ix: usize,
+        item: Option<&Self::Item>,
+        position: Point<Pixels>,
+        window: &mut Window,
+        cx: &mut Context<ColumnBrowser<Self>>,
+    ) {
+        let _ = (column_ix, item, position, window, cx);
+    }
+
+    /// Run before each render so the delegate can auto-extend the
+    /// current selection through single-item columns. Default: no-op.
+    ///
+    /// Delegates override this to skip past columns that would only
+    /// contain one row, so the user sees deeper content without having
+    /// to click through every level.
+    fn auto_extend_selection(&mut self, cx: &mut Context<ColumnBrowser<Self>>) {
+        let _ = cx;
     }
 }
 
@@ -246,7 +269,7 @@ impl<D: ColumnBrowserDelegate> ColumnBrowser<D> {
         }
     }
 
-    fn apply_root_override(&mut self, column_ix: usize, cx: &mut Context<Self>) {
+    pub fn apply_root_override(&mut self, column_ix: usize, cx: &mut Context<Self>) {
         if column_ix == 0 {
             self.delegate.clear_root_override(cx);
         } else {
@@ -344,7 +367,8 @@ impl<D: ColumnBrowserDelegate> ColumnBrowser<D> {
         let hover_bg = theme.selection_bg;
         let text_color = theme.text_primary;
 
-        let item_for_click = item.clone();
+        let item_left = item.clone();
+        let item_right = item.clone();
 
         let mut row = div()
             .id(SharedString::from(format!(
@@ -367,13 +391,26 @@ impl<D: ColumnBrowserDelegate> ColumnBrowser<D> {
                 MouseButton::Left,
                 cx.listener(move |this, event: &MouseDownEvent, window, cx| {
                     window.focus(&focus);
-                    this.delegate
-                        .set_selection(column_ix, &item_for_click, cx);
+                    this.delegate.set_selection(column_ix, &item_left, cx);
                     this.focused_column = column_ix;
                     if event.click_count == 2 {
-                        this.delegate.on_activate(&item_for_click, window, cx);
+                        if this.delegate.is_leaf(&item_left) {
+                            this.delegate.on_activate(&item_left, window, cx);
+                        } else {
+                            // Reroot to the clicked prefix; `column_ix + 1`
+                            // so the clicked row itself becomes the new root.
+                            this.apply_root_override(column_ix + 1, cx);
+                        }
                     }
                     cx.notify();
+                }),
+            )
+            .on_mouse_down(
+                MouseButton::Right,
+                cx.listener(move |this, event: &MouseDownEvent, window, cx| {
+                    this.delegate
+                        .on_context_menu(column_ix, Some(&item_right), event.position, window, cx);
+                    cx.stop_propagation();
                 }),
             )
             .child(
@@ -488,6 +525,13 @@ impl<D: ColumnBrowserDelegate> ColumnBrowser<D> {
             .bg(bg)
             .border_r_1()
             .border_color(border)
+            .on_mouse_down(
+                MouseButton::Right,
+                cx.listener(move |this, event: &MouseDownEvent, window, cx| {
+                    this.delegate
+                        .on_context_menu(column_ix, None, event.position, window, cx);
+                }),
+            )
             .child(bounds_canvas)
             .child(
                 div()
@@ -564,6 +608,7 @@ impl<D: ColumnBrowserDelegate> Focusable for ColumnBrowser<D> {
 impl<D: ColumnBrowserDelegate> Render for ColumnBrowser<D> {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = theme(cx);
+        self.delegate.auto_extend_selection(cx);
         let selection = self.delegate.resolve_selection(cx);
         let n = selection.len();
 

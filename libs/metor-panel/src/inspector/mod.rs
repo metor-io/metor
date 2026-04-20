@@ -55,6 +55,21 @@ pub struct InspectorRequest {
 /// inspector without holding a direct reference to the root view.
 pub type OpenInspectorCallback = Arc<dyn Fn(InspectorRequest, &mut Window, &mut App) + 'static>;
 
+/// App-wide handle to the current window's inspector opener.
+///
+/// Populated by [`AppRoot::new`] so leaf views can reach the inspector
+/// without threading the callback through every constructor. Overwritten
+/// by each new window; single-window apps see exactly one installation.
+pub struct OpenInspectorGlobal(pub OpenInspectorCallback);
+
+impl gpui::Global for OpenInspectorGlobal {}
+
+/// Grab the registered callback, if any. `None` during early startup
+/// before any window has been opened.
+pub fn open_inspector(cx: &App) -> Option<OpenInspectorCallback> {
+    cx.try_global::<OpenInspectorGlobal>().map(|g| g.0.clone())
+}
+
 struct InspectorPage {
     rows: Vec<Box<dyn InspectorRow>>,
     label: Option<SharedString>,
@@ -172,6 +187,13 @@ impl Inspector {
             .iter()
             .enumerate()
             .filter_map(|(i, row)| {
+                // Search-consuming rows (prompts / filter builders) stay
+                // pinned to the bottom so the query-as-input affordance
+                // is always reachable, even when the query doesn't
+                // fuzzy-match the hint label.
+                if row.consumes_search() {
+                    return Some((i, 0));
+                }
                 let mut buf = Vec::new();
                 let haystack = nucleo_matcher::Utf32Str::new(row.label(), &mut buf);
                 let score = pattern.score(haystack, &mut matcher)?;
@@ -188,8 +210,9 @@ impl Inspector {
     }
 
     fn activate_row(&mut self, row_idx: usize, window: &mut Window, cx: &mut Context<Self>) {
+        let search = self.search.text.clone();
         let page = self.pages.last_mut().expect("page stack empty");
-        let action = page.rows[row_idx].activate(window, cx);
+        let action = page.rows[row_idx].activate_with_search(&search, window, cx);
         self.handle_action(action, row_idx, window, cx);
     }
 

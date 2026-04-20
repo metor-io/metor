@@ -8,6 +8,7 @@ repository.workspace = true
 gpui = "*"
 hifitime.version = "4.0"
 nucleo-matcher = "0.3"
+regex = "1"
 metor-db.path = "../db"
 metor-proto.path = "../metor-proto"
 metor-proto.features = ["std", "facet"]

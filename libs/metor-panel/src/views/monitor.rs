@@ -78,6 +78,7 @@ impl Monitor {
         let behavior = StripBehavior {
             on_element_click: Some(click.clone()),
             on_apply_element: Some(apply_click(db.clone(), component_id)),
+            on_element_right_click: None,
             highlighted: SmallVec::new(),
             locked: pending_edits(cx).locked,
         };
@@ -184,6 +185,7 @@ pub(crate) fn behavior_snapshot(
     StripBehavior {
         on_element_click: Some(on_element_click),
         on_apply_element: Some(apply_click(db, component_id)),
+        on_element_right_click: None,
         highlighted,
         locked: pending.locked,
     }

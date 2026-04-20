@@ -17,7 +17,7 @@ use serial::{SerializedItem, SerializedMember, SerializedPane, SerializedSplit};
 
 pub use drag::SplitDirection;
 pub use item::{PaneItem, PaneItemHandle};
-pub use pane::{Pane, PaneEvent};
+pub use pane::{Pane, PaneEvent, PlotComponentAction};
 pub use serial::{ItemRegistry, SerializedTileGroup};
 
 /// Sequence of member indices locating a node in the split tree.

@@ -143,6 +143,11 @@ pub struct StripBehavior {
     /// pending edit for the component and clears the element from
     /// `highlighted`. Ignored while `locked`.
     pub on_apply_element: Option<StripClick>,
+    /// Right-click handler. Hosts that want a context menu install this
+    /// alongside (not instead of) `on_element_click`. Not suppressed by
+    /// `locked` since right-click menus are typically read-only (e.g.
+    /// "plot this element").
+    pub on_element_right_click: Option<StripClick>,
     pub highlighted: SmallVec<[usize; 4]>,
     pub locked: bool,
 }
@@ -153,6 +158,8 @@ impl StripBehavior {
             && self.highlighted == other.highlighted
             && click_ptr(&self.on_element_click) == click_ptr(&other.on_element_click)
             && click_ptr(&self.on_apply_element) == click_ptr(&other.on_apply_element)
+            && click_ptr(&self.on_element_right_click)
+                == click_ptr(&other.on_element_right_click)
     }
 }
 
@@ -601,6 +608,18 @@ impl Render for ComponentValueStrip {
                     move |event: &gpui::MouseDownEvent, window, cx| {
                         click(idx, event.position, window, cx);
                         cx.refresh_windows();
+                    },
+                )
+            } else {
+                atom
+            };
+
+            let atom = if let Some(right_click) = behavior.on_element_right_click.clone() {
+                atom.on_mouse_down(
+                    MouseButton::Right,
+                    move |event: &gpui::MouseDownEvent, window, cx| {
+                        right_click(idx, event.position, window, cx);
+                        cx.stop_propagation();
                     },
                 )
             } else {

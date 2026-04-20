@@ -2,11 +2,26 @@ use gpui::{
     AnyElement, App, Bounds, Context, DragMoveEvent, EventEmitter, IntoElement, MouseButton,
     Pixels, Point, Render, Window, div, prelude::*, px,
 };
+use metor_proto::types::ComponentId;
+use smallvec::SmallVec;
 
 use super::drag::{DraggedTab, SplitDirection, detect_split_zone};
 use super::item::PaneItemHandle;
 use crate::icons::Icon;
 use crate::theme::theme;
+
+/// Dispatched by views inside a pane to spawn a new plot tab in that pane.
+///
+/// The payload is deliberately minimal — `ComponentId` and element indices —
+/// so the action can implement `PartialEq`. Color, label, and style derive
+/// from theme and metadata inside `PlotPanel::new`, matching the
+/// `TimeSeriesPlot::from_component` path used by the palette wizard.
+#[derive(Clone, PartialEq, gpui::Action)]
+#[action(no_json)]
+pub struct PlotComponentAction {
+    pub component_id: ComponentId,
+    pub indices: SmallVec<[usize; 4]>,
+}
 
 const TAB_HEIGHT: f32 = 28.0;
 const TAB_CLOSE_SIZE: f32 = 16.0;
