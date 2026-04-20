@@ -109,7 +109,15 @@ pub fn set_theme(cx: &mut App, theme: Arc<Theme>) {
 
 /// Every theme compiled into the binary, in the order the settings UI displays them.
 pub fn all_themes() -> &'static [&'static Theme] {
-    static THEMES: &[&Theme] = &[&DARK, &CATPPUCCIN_MOCHA, &CATPPUCCIN_MACCHIATO, &CATPPUCCIN_LATTE, &AYU_DARK];
+    static THEMES: &[&Theme] = &[
+        &DARK,
+        &CATPPUCCIN_MOCHA,
+        &CATPPUCCIN_MACCHIATO,
+        &CATPPUCCIN_LATTE,
+        &AYU_DARK,
+        &EVERFOREST_DARK,
+        &EVERFOREST_LIGHT,
+    ];
     THEMES
 }
 
@@ -298,6 +306,80 @@ pub static AYU_DARK: Theme = Theme {
     grid_color:      hex(0x11151c, 1.0),
     axis_color:      hex(0x1a1e28, 1.0),
     zero_line_color: hex(0x2a2e38, 1.0),
+};
+
+pub static EVERFOREST_DARK: Theme = Theme {
+    name: "Everforest Dark",
+    font_family: "Berkeley Mono",
+
+    bg_primary:   hex(0x2d353b, 1.0),
+    bg_secondary: hex(0x232a2e, 1.0),
+    bg_elevated:  hex(0x3d484d, 1.0),
+
+    text_primary:   hex(0xd3c6aa, 1.0),
+    text_secondary: hex(0x9da9a0, 1.0),
+    text_tertiary:  hex(0x859289, 1.0),
+
+    border_primary: hex(0x475258, 1.0),
+
+    selection_bg:   hex(0x4f585e, 1.0),
+    text_selection: hex(0x543a48, 0.6),
+    drop_target:    hex(0xdbbc7f, 0.15),
+
+    pill_bg:     hex(0x3d484d, 1.0),
+    pill_border: hex(0x4f585e, 1.0),
+
+    line_color:      hex(0xdbbc7f, 1.0),
+    line_colors: [
+        hex(0xe69875, 1.0), // orange
+        hex(0x7fbbb3, 1.0), // blue
+        hex(0xa7c080, 1.0), // green
+        hex(0xe67e80, 1.0), // red
+        hex(0xd699b6, 1.0), // purple
+        hex(0x83c092, 1.0), // aqua
+        hex(0xdbbc7f, 1.0), // yellow
+        hex(0xd699b6, 1.0), // pink
+    ],
+    grid_color:      hex(0x3d484d, 1.0),
+    axis_color:      hex(0x475258, 1.0),
+    zero_line_color: hex(0x56635f, 1.0),
+};
+
+pub static EVERFOREST_LIGHT: Theme = Theme {
+    name: "Everforest Light",
+    font_family: "Berkeley Mono",
+
+    bg_primary:   hex(0xfdf6e3, 1.0),
+    bg_secondary: hex(0xf4f0d9, 1.0),
+    bg_elevated:  hex(0xefebd4, 1.0),
+
+    text_primary:   hex(0x5c6a72, 1.0),
+    text_secondary: hex(0x829181, 1.0),
+    text_tertiary:  hex(0x939f91, 1.0),
+
+    border_primary: hex(0xe6e2cc, 1.0),
+
+    selection_bg:   hex(0xe0dcc7, 1.0),
+    text_selection: hex(0xeaedc8, 0.8),
+    drop_target:    hex(0xdfa000, 0.15),
+
+    pill_bg:     hex(0xefebd4, 1.0),
+    pill_border: hex(0xe0dcc7, 1.0),
+
+    line_color:      hex(0xdfa000, 1.0),
+    line_colors: [
+        hex(0xf57d26, 1.0), // orange
+        hex(0x3a94c5, 1.0), // blue
+        hex(0x8da101, 1.0), // green
+        hex(0xf85552, 1.0), // red
+        hex(0xdf69ba, 1.0), // purple
+        hex(0x35a77c, 1.0), // aqua
+        hex(0xdfa000, 1.0), // yellow
+        hex(0xdf69ba, 1.0), // pink
+    ],
+    grid_color:      hex(0xefebd4, 1.0),
+    axis_color:      hex(0xe6e2cc, 1.0),
+    zero_line_color: hex(0xbdc3af, 1.0),
 };
 
 /// Load the embedded IBM Plex Mono fonts into gpui's text system.
