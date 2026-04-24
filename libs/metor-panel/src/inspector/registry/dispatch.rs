@@ -60,13 +60,13 @@ impl InspectorRegistry {
         if shape.id == <bool as Facet>::SHAPE.id {
             let val = *peek.get::<bool>().ok()?;
             let any_entity = any_entity.clone();
-            return Some(Box::new(BoolRow {
-                label: ctx.label.clone(),
-                value: val,
-                toggle: Arc::new(move |v, _w, cx| {
+            return Some(Box::new(BoolRow::new(
+                ctx.label.clone(),
+                val,
+                Arc::new(move |v, _w, cx| {
                     crate::inspector::reflect::set_field::<bool>(&any_entity, field_idx, v, cx)
                 }),
-            }));
+            )));
         }
 
         if let Some(scalar) = peek.scalar_type() {

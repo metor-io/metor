@@ -10,9 +10,14 @@ use crate::theme::theme;
 /// Re-evaluating the factory each time keeps cascaded pages in sync with
 /// the world without listener bookkeeping: the child rows see the state
 /// live on entry rather than a stale snapshot.
+///
+/// The right-hand summary is read through a closure each render, so it
+/// stays in sync with shared state mutated from elsewhere (a sub-page
+/// committing a selection, for example). Use [`NavRow::new`] for a fixed
+/// summary or [`NavRow::with_dynamic_summary`] for a live one.
 pub struct NavRow {
     pub label: SharedString,
-    pub summary: SharedString,
+    summary: Box<dyn Fn(&App) -> SharedString>,
     pub build_children: Box<dyn Fn(&gpui::App) -> Vec<Box<dyn InspectorRow>>>,
     tag: Option<SharedString>,
 }
@@ -23,9 +28,23 @@ impl NavRow {
         summary: impl Into<SharedString>,
         build_children: Box<dyn Fn(&gpui::App) -> Vec<Box<dyn InspectorRow>>>,
     ) -> Self {
+        let summary = summary.into();
         Self {
             label: label.into(),
-            summary: summary.into(),
+            summary: Box::new(move |_| summary.clone()),
+            build_children,
+            tag: None,
+        }
+    }
+
+    pub fn with_dynamic_summary(
+        label: impl Into<SharedString>,
+        summary: Box<dyn Fn(&App) -> SharedString>,
+        build_children: Box<dyn Fn(&gpui::App) -> Vec<Box<dyn InspectorRow>>>,
+    ) -> Self {
+        Self {
+            label: label.into(),
+            summary,
             build_children,
             tag: None,
         }
@@ -51,6 +70,7 @@ impl InspectorRow for NavRow {
     ) -> AnyElement {
         let theme = theme(cx);
 
+        let summary = (self.summary)(cx);
         let mut right = div().flex().flex_row().items_center().gap(px(6.0));
         if let Some(tag) = &self.tag {
             right = right.child(super::tag_pill(tag.clone(), cx));
@@ -60,7 +80,7 @@ impl InspectorRow for NavRow {
                 div()
                     .text_size(px(12.0))
                     .text_color(theme.text_secondary)
-                    .child(self.summary.clone()),
+                    .child(summary),
             )
             .child(Icon::ChevronRight.svg(8.0));
 

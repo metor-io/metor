@@ -235,6 +235,9 @@ impl Inspector {
                     .map(|r| SharedString::from(r.label().to_string()));
                 self.push_page(label, child_rows, cx);
             }
+            RowAction::Pop => {
+                self.pop_page(cx);
+            }
             RowAction::Dismiss => {
                 self.dismiss(window);
             }
