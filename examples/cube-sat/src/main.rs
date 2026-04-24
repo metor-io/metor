@@ -66,6 +66,7 @@ impl Sensors {
 
 #[derive(AsVTable, Debug, Clone, Immutable, KnownLayout, Metadatatize, IntoBytes, Default)]
 #[repr(C)]
+#[metor_fsw(group)]
 pub struct IMU {
     gyro: Vec3<f64>,
     bias: Vec3<f64>,
@@ -84,6 +85,7 @@ impl IMU {
 
 #[derive(AsVTable, Debug, Clone, Immutable, KnownLayout, Metadatatize, IntoBytes, Default)]
 #[repr(C)]
+#[metor_fsw(group)]
 pub struct Mag {
     mag: Vec3<f64>,
 }
@@ -104,6 +106,7 @@ impl Mag {
 
 #[derive(AsVTable, Debug, Clone, Immutable, KnownLayout, Metadatatize, IntoBytes, Default)]
 #[repr(C)]
+#[metor_fsw(group)]
 pub struct CSS {
     css_readings: Vector<f64, 6>,
     sun_vec: Vec3<f64>,
@@ -143,6 +146,7 @@ impl CSS {
 }
 #[derive(AsVTable, Debug, Clone, Immutable, KnownLayout, Metadatatize, IntoBytes, Default)]
 #[repr(C)]
+#[metor_fsw(group)]
 pub struct GPS {
     pos: Vector<f64, 3>,
     vel: Vector<f64, 3>,
@@ -159,6 +163,7 @@ impl GPS {
 
 #[derive(AsVTable, Debug, Clone, Immutable, KnownLayout, Metadatatize, IntoBytes, Default)]
 #[repr(C)]
+#[metor_fsw(group)]
 pub struct ReactionWheel {
     axis: Vec3<f64>,
     speed: Scalar<f64>,

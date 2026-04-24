@@ -6,12 +6,22 @@ use syn::{Attribute, Meta};
 use syn::{DeriveInput, Generics, Ident, parse_macro_input};
 
 #[derive(Debug, FromDeriveInput)]
-#[darling(attributes(metor_fsw), supports(struct_named, enum_unit))]
+#[darling(
+    attributes(metor_fsw),
+    supports(struct_named, enum_unit),
+    // Other derive macros in this attribute namespace (e.g. Metadatatize)
+    // recognise additional fields like `group`. AsVTable doesn't care
+    // about them, but darling would fail on the unknown key; accept and
+    // ignore anything unrecognised here.
+    forward_attrs(allow, doc, cfg)
+)]
 pub struct AsVTable {
     ident: Ident,
     generics: Generics,
     data: ast::Data<(), crate::Field>,
     parent: Option<String>,
+    #[darling(default, rename = "group")]
+    _group: darling::util::Ignored,
 }
 
 fn extract_repr_type(attrs: &[Attribute]) -> Option<Ident> {
@@ -37,6 +47,7 @@ pub fn as_vtable(input: TokenStream) -> TokenStream {
         generics,
         data,
         parent,
+        _group,
     } = AsVTable::from_derive_input(&input).unwrap();
     let where_clause = &generics.where_clause;
     let impeller = quote! { #crate_name::metor_proto };
