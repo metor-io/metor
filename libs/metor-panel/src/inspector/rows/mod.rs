@@ -82,6 +82,8 @@ pub enum RowAction {
     Handled,
     /// Drill into a sub-page with the provided rows.
     Cascade(Vec<Box<dyn InspectorRow>>),
+    /// Pop the current page off the stack, returning to the parent.
+    Pop,
     /// Close the inspector.
     Dismiss,
     /// Hand off to inline text editing seeded with `current_text`.
