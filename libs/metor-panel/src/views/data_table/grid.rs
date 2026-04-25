@@ -10,7 +10,9 @@ use super::grouping::{Group, GroupInstance};
 use crate::theme::theme;
 use crate::views::monitor::{behavior_snapshot, edit_click};
 use crate::views::table::{Column, ColumnSort, Table, TableDelegate};
-use crate::views::value_strip::{ComponentValueStrip, StripBehavior, StripClick, StripStyle};
+use crate::views::value_strip::{
+    ComponentValueStrip, StripBehavior, StripClick, StripStyle, resolve_metadata, strip_row_width,
+};
 
 /// Live state backing one instance row of the data-table detail grid.
 ///
@@ -22,6 +24,9 @@ struct RowState {
     instance: GroupInstance,
     strips: Vec<Option<Entity<ComponentValueStrip>>>,
     clicks: Vec<Option<StripClick>>,
+    /// Element count per field. Drives column widths so a 3-box strip gets
+    /// a wider column than a scalar. `0` for fields the instance lacks.
+    element_counts: Vec<usize>,
 }
 
 /// [`TableDelegate`] for the data-table detail grid.
@@ -114,10 +119,12 @@ fn build_row(
 ) -> RowState {
     let mut strips = Vec::with_capacity(fields.len());
     let mut clicks = Vec::with_capacity(fields.len());
+    let mut element_counts = Vec::with_capacity(fields.len());
     for (ix, field) in fields.iter().enumerate() {
         let Some(Some(component_id)) = instance.field_ids.get(ix).copied() else {
             strips.push(None);
             clicks.push(None);
+            element_counts.push(0);
             continue;
         };
         let full_name = SharedString::from(format!("{}.{}", instance.name, field));
@@ -138,20 +145,48 @@ fn build_row(
         });
         strips.push(Some(strip));
         clicks.push(Some(click));
+        // Element count comes from the registered schema/metadata. Falls
+        // back to 1 when the vtable hasn't arrived yet — the group
+        // rebuilds on the next `vtable_gen` tick and picks up the real
+        // dim.
+        let meta = resolve_metadata(db, component_id);
+        let n = meta.element_names.len().max(1);
+        element_counts.push(n);
     }
     RowState {
         instance: instance.clone(),
         strips,
         clicks,
+        element_counts,
     }
 }
 
 impl TableDelegate for DataTableGrid {
     fn columns(&self) -> Vec<Column> {
-        let mut cols = vec![Column::new("Instance", 180.0)];
+        const CELL_H_PAD: f32 = 8.0; // matches `.px(px(4.0))` cell wrapper
+        let mut cols = vec![Column::new("Instance", 180.0).min_width(120.0)];
         if let Some(group) = &self.group {
-            for f in &group.fields {
-                cols.push(Column::new(f.clone(), 200.0));
+            for (field_ix, field) in group.fields.iter().enumerate() {
+                // Take the widest strip across instances — ragged groups
+                // still get a column that fits the fullest representation.
+                let n_cells = self
+                    .rows
+                    .iter()
+                    .map(|r| r.element_counts.get(field_ix).copied().unwrap_or(0))
+                    .max()
+                    .unwrap_or(0)
+                    .max(1);
+                // Scalar (unlabeled, intrinsic-width) cells don't get the
+                // fixed 78px box treatment, so the 1-cell strip can grow
+                // or shrink with the value. Give those columns a little
+                // extra breathing room; multi-cell strips already know
+                // their size exactly via `strip_row_width`.
+                let width = if n_cells == 1 {
+                    120.0 + CELL_H_PAD
+                } else {
+                    strip_row_width(n_cells) + CELL_H_PAD
+                };
+                cols.push(Column::new(field.clone(), width).min_width(width));
             }
         }
         cols

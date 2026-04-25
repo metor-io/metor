@@ -2,7 +2,7 @@ use std::ops::Range;
 
 use gpui::{
     AnyElement, App, Axis, Bounds, Context, DragMoveEvent, Empty, IntoElement, Pixels, Render,
-    SharedString, UniformListScrollHandle, Window, div, prelude::*, px, uniform_list,
+    ScrollHandle, SharedString, UniformListScrollHandle, Window, div, prelude::*, px, uniform_list,
 };
 
 use super::Scrollbar;
@@ -128,6 +128,10 @@ pub struct Table<D: TableDelegate> {
     delegate: D,
     col_states: Vec<ColState>,
     scroll_handle: UniformListScrollHandle,
+    /// Horizontal scroll anchor. When every column has a fixed width
+    /// the rows render at their natural sum; this handle drives the
+    /// overflow wrapper so header and body scroll together.
+    hscroll: ScrollHandle,
 }
 
 impl<D: TableDelegate> Table<D> {
@@ -145,6 +149,7 @@ impl<D: TableDelegate> Table<D> {
             delegate,
             col_states,
             scroll_handle: UniformListScrollHandle::new(),
+            hscroll: ScrollHandle::new(),
         }
     }
 
@@ -307,6 +312,7 @@ impl<D: TableDelegate> Render for Table<D> {
                 col_div = col_div.flex_1();
             } else {
                 col_div = col_div.w(width);
+                col_div.style().flex_shrink = Some(0.0);
             }
 
             let cell = self.render_header_cell(ix, col, window, cx);
@@ -329,82 +335,146 @@ impl<D: TableDelegate> Render for Table<D> {
 
         let col_count = columns.len();
         let col_flex: Vec<bool> = columns.iter().map(|c| c.flex).collect();
+        let any_flex = col_flex.iter().any(|f| *f);
+
+        // Sum of fixed-width column footprints. When `any_flex` is true
+        // the flex columns absorb whatever's left over, so horizontal
+        // overflow doesn't apply and we skip the inner width constraint.
+        let total_width: f32 = self
+            .col_states
+            .iter()
+            .zip(columns.iter())
+            .filter(|(_, c)| !c.flex)
+            .map(|(s, _)| f32::from(s.width))
+            .sum();
 
         let border_color = theme.border_primary;
         let scroll_handle = self.scroll_handle.clone();
         let scrollbar_handle = self.scroll_handle.clone();
+        let hscroll_handle = self.hscroll.clone();
+        let hscroll_indicator = self.hscroll.clone();
 
-        div()
+        let body = uniform_list(
+            "table-body",
+            row_count,
+            cx.processor(
+                move |this: &mut Self,
+                      range: Range<usize>,
+                      window: &mut Window,
+                      cx: &mut Context<Self>| {
+                    let mut items = Vec::new();
+                    for row_ix in range {
+                        let mut row = div()
+                            .flex()
+                            .flex_row()
+                            .items_center()
+                            .w_full()
+                            .h(row_height)
+                            .border_b_1()
+                            .border_color(border_color);
+
+                        for col_ix in 0..col_count {
+                            let cell = this.delegate.render_cell(row_ix, col_ix, window, cx);
+
+                            let mut cell_div = div().overflow_hidden();
+                            if col_flex[col_ix] {
+                                cell_div = cell_div.flex_1().h(row_height);
+                            } else {
+                                // flex-shrink defaults to 1, so without an
+                                // explicit 0 the cell collapses when the
+                                // row is narrower than the column sum and
+                                // the strip's `flex_wrap` then breaks
+                                // element boxes onto a new line. Pin the
+                                // cell at its column width and let the
+                                // outer hscroll handle overflow.
+                                cell_div = cell_div.w(this.col_states[col_ix].width);
+                                cell_div.style().flex_shrink = Some(0.0);
+                            }
+
+                            row = row.child(cell_div.child(cell));
+                        }
+
+                        items.push(row.into_any_element());
+                    }
+                    items
+                },
+            ),
+        )
+        .track_scroll(scroll_handle)
+        .flex_1();
+
+        let mut inner = div().flex().flex_col().size_full().child(header).child(body);
+        if !any_flex {
+            inner = inner.w(px(total_width));
+        }
+
+        let mut scroll_wrap = div()
+            .id("table-hscroll")
+            .size_full()
+            .child(inner);
+        if !any_flex {
+            scroll_wrap = scroll_wrap
+                .overflow_x_scroll()
+                .track_scroll(&hscroll_handle);
+            scroll_wrap.style().restrict_scroll_to_axis = Some(true);
+        }
+
+        let vertical_scrollbar = {
+            let state = scrollbar_handle.0.borrow();
+            let offset = state.base_handle.offset();
+            let max_off = state.base_handle.max_offset();
+            let max_y = f32::from(max_off.height);
+            let scroll_y = f32::from(-offset.y).clamp(0.0, max_y);
+            let vp = f32::from(state.base_handle.bounds().size.height);
+            let vp = if vp > 0.0 {
+                vp
+            } else {
+                row_count as f32 * f32::from(row_height)
+            };
+            div()
+                .absolute()
+                .top(px(HEADER_HEIGHT))
+                .right_0()
+                .bottom_0()
+                .left_0()
+                .child(Scrollbar::new(Axis::Vertical, vp, vp + max_y, scroll_y))
+        };
+
+        let horizontal_scrollbar = if any_flex {
+            None
+        } else {
+            let offset = hscroll_indicator.offset();
+            let max_off = hscroll_indicator.max_offset();
+            let vp = f32::from(hscroll_indicator.bounds().size.width);
+            let max_x = f32::from(max_off.width);
+            if max_x > 0.0 && vp > 0.0 {
+                let scroll_x = f32::from(-offset.x).clamp(0.0, max_x);
+                Some(
+                    div()
+                        .absolute()
+                        .left_0()
+                        .right_0()
+                        .bottom_0()
+                        .h(px(10.0))
+                        .child(Scrollbar::new(Axis::Horizontal, vp, vp + max_x, scroll_x)),
+                )
+            } else {
+                None
+            }
+        };
+
+        let mut outer = div()
             .flex()
             .flex_col()
             .size_full()
             .relative()
             .bg(theme.bg_primary)
             .on_scroll_wheel(|_, _, cx| cx.stop_propagation())
-            .child(header)
-            .child(
-                uniform_list(
-                    "table-body",
-                    row_count,
-                    cx.processor(
-                        move |this: &mut Self,
-                              range: Range<usize>,
-                              window: &mut Window,
-                              cx: &mut Context<Self>| {
-                            let mut items = Vec::new();
-                            for row_ix in range {
-                                let mut row = div()
-                                    .flex()
-                                    .flex_row()
-                                    .items_center()
-                                    .w_full()
-                                    .h(row_height)
-                                    .border_b_1()
-                                    .border_color(border_color);
-
-                                for col_ix in 0..col_count {
-                                    let cell =
-                                        this.delegate.render_cell(row_ix, col_ix, window, cx);
-
-                                    let mut cell_div = div().overflow_hidden();
-                                    if col_flex[col_ix] {
-                                        cell_div = cell_div.flex_1().h(row_height);
-                                    } else {
-                                        cell_div =
-                                            cell_div.w(this.col_states[col_ix].width);
-                                    }
-
-                                    row = row.child(cell_div.child(cell));
-                                }
-
-                                items.push(row.into_any_element());
-                            }
-                            items
-                        },
-                    ),
-                )
-                .track_scroll(scroll_handle)
-                .flex_1(),
-            )
-            .child({
-                let state = scrollbar_handle.0.borrow();
-                let offset = state.base_handle.offset();
-                let max_off = state.base_handle.max_offset();
-                let max_y = f32::from(max_off.height);
-                let scroll_y = f32::from(-offset.y).clamp(0.0, max_y);
-                let vp = f32::from(state.base_handle.bounds().size.height);
-                let vp = if vp > 0.0 {
-                    vp
-                } else {
-                    row_count as f32 * f32::from(row_height)
-                };
-                div()
-                    .absolute()
-                    .top(px(HEADER_HEIGHT))
-                    .right_0()
-                    .bottom_0()
-                    .left_0()
-                    .child(Scrollbar::new(Axis::Vertical, vp, vp + max_y, scroll_y))
-            })
+            .child(scroll_wrap)
+            .child(vertical_scrollbar);
+        if let Some(h) = horizontal_scrollbar {
+            outer = outer.child(h);
+        }
+        outer
     }
 }
