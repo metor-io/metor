@@ -177,7 +177,7 @@ pub(crate) fn behavior_snapshot(
     let highlighted = pending
         .get(component_id)
         .map(|edit| edit.modified_elements.iter().copied().collect())
-        .unwrap_or_else(SmallVec::new);
+        .unwrap_or_default();
     StripBehavior {
         on_element_click: Some(on_element_click),
         on_apply_element: Some(apply_click(db, component_id)),

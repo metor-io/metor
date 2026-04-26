@@ -19,13 +19,13 @@ pub type ElementIndexes = SmallVec<[usize; 8]>;
 pub fn format_value(view: ComponentView<'_>, db: &DB, component_id: ComponentId) -> String {
     let meta = db.with_state(|s| s.get_component_metadata(component_id).cloned());
     if let Some(meta) = &meta {
-        if meta.is_string() {
-            if let ComponentView::U8(array) = &view {
-                let buf = array.buf();
-                let len = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
-                if let Ok(s) = std::str::from_utf8(&buf[..len]) {
-                    return s.to_string();
-                }
+        if meta.is_string()
+            && let ComponentView::U8(array) = &view
+        {
+            let buf = array.buf();
+            let len = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
+            if let Ok(s) = std::str::from_utf8(&buf[..len]) {
+                return s.to_string();
             }
         }
         if let Some(variants) = meta.enum_variants() {

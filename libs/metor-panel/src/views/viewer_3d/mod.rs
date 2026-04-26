@@ -416,13 +416,14 @@ impl Viewer3d {
         // without aliasing `self.models`.
         let layer = self.render_layer;
         let db = self.db.clone();
-        let model_snapshots: Vec<(
+        type ModelSnapshot = (
             EntityId,
             gpui::Entity<ModelEntry>,
             String,
             Option<ComponentId>,
             Option<ComponentId>,
-        )> = self
+        );
+        let model_snapshots: Vec<ModelSnapshot> = self
             .models
             .iter()
             .map(|m| {
@@ -441,21 +442,18 @@ impl Viewer3d {
         for (id, model, path, pos_bind, orient_bind) in model_snapshots {
             // First-sight insert: wire the subscription so inspector
             // edits on the entry proxy back into reconcile.
-            if !self.tracking.contains_key(&id) {
+            if let std::collections::hash_map::Entry::Vacant(slot) = self.tracking.entry(id) {
                 let subscription = cx.observe(&model, |this, _, cx| {
                     this.reconcile(cx);
                 });
-                self.tracking.insert(
-                    id,
-                    ModelTracking {
-                        entity: Arc::new(OnceLock::new()),
-                        path: String::new(),
-                        position_binding: None,
-                        orientation_binding: None,
-                        tasks: SmallVec::new(),
-                        _subscription: subscription,
-                    },
-                );
+                slot.insert(ModelTracking {
+                    entity: Arc::new(OnceLock::new()),
+                    path: String::new(),
+                    position_binding: None,
+                    orientation_binding: None,
+                    tasks: SmallVec::new(),
+                    _subscription: subscription,
+                });
                 work = true;
             }
 

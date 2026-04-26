@@ -55,7 +55,7 @@ impl InspectorRegistry {
         self.register_field_override::<crate::views::viewer_3d::Viewer3d>(
             "camera_fov",
             FieldOverride {
-                range: Some((0.1, 3.14)),
+                range: Some((0.1, std::f64::consts::PI)),
             },
         );
     }

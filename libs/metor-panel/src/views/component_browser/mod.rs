@@ -333,8 +333,9 @@ impl ComponentBrowserDelegate {
                         }
                     }),
                 )));
-            } else if node.component_id.is_some() && node.children.is_empty() {
-                let component_id = node.component_id.unwrap();
+            } else if let Some(component_id) = node.component_id
+                && node.children.is_empty()
+            {
                 let db = self.db.clone();
                 rows.push(Box::new(CommandRow::new(
                     SharedString::new_static("Plot component"),

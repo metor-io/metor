@@ -251,11 +251,11 @@ impl<D: TableDelegate> Table<D> {
                         let col_left = this.col_states[col_ix].bounds.left();
                         let new_width =
                             (e.event.position.x - col_left).clamp(col.min_width, col.max_width);
-                        if let Some(state) = this.col_states.get_mut(col_ix) {
-                            if state.width != new_width {
-                                state.width = new_width;
-                                cx.notify();
-                            }
+                        if let Some(state) = this.col_states.get_mut(col_ix)
+                            && state.width != new_width
+                        {
+                            state.width = new_width;
+                            cx.notify();
                         }
                     }
                 }),
@@ -367,6 +367,10 @@ impl<D: TableDelegate> Render for Table<D> {
                             .border_b_1()
                             .border_color(border_color);
 
+                        // `col_ix` indexes both `col_flex` and `col_states`,
+                        // so a plain index loop reads better than zipping
+                        // two slices together.
+                        #[allow(clippy::needless_range_loop)]
                         for col_ix in 0..col_count {
                             let cell = this.delegate.render_cell(row_ix, col_ix, window, cx);
 

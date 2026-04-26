@@ -24,14 +24,12 @@ pub(super) fn find_label_field<T: Facet<'static>>(value: &T) -> Option<SharedStr
     let peek = facet::Peek::new(value);
     let peek_struct = peek.into_struct().ok()?;
     for (i, field_def) in peek_struct.ty().fields.iter().enumerate() {
-        if field_def.shape().id == <SharedString as Facet>::SHAPE.id {
-            if let Ok(field_peek) = peek_struct.field(i) {
-                if let Ok(s) = field_peek.get::<SharedString>() {
-                    if !s.is_empty() {
-                        return Some(s.clone());
-                    }
-                }
-            }
+        if field_def.shape().id == <SharedString as Facet>::SHAPE.id
+            && let Ok(field_peek) = peek_struct.field(i)
+            && let Ok(s) = field_peek.get::<SharedString>()
+            && !s.is_empty()
+        {
+            return Some(s.clone());
         }
     }
     None

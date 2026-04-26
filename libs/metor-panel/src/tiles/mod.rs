@@ -134,14 +134,15 @@ impl Member {
             }
             Member::Axis(axis) => {
                 for i in 0..axis.members.len() {
-                    if let Member::Pane(pane) = &axis.members[i] {
-                        if pane.entity_id() == target.entity_id() && axis.axis == direction.axis() {
-                            let new = Member::Pane(new_pane.clone());
-                            let insert_at = if direction.increasing() { i + 1 } else { i };
-                            axis.members.insert(insert_at, new);
-                            axis.flexes.insert(insert_at, 1.0);
-                            return true;
-                        }
+                    if let Member::Pane(pane) = &axis.members[i]
+                        && pane.entity_id() == target.entity_id()
+                        && axis.axis == direction.axis()
+                    {
+                        let new = Member::Pane(new_pane.clone());
+                        let insert_at = if direction.increasing() { i + 1 } else { i };
+                        axis.members.insert(insert_at, new);
+                        axis.flexes.insert(insert_at, 1.0);
+                        return true;
                     }
                 }
                 for member in &mut axis.members {
@@ -223,6 +224,10 @@ impl Member {
         }
     }
 
+    // `window` is unused at the leaf today, but forwarded so future render
+    // paths (focus, scroll into view) can reach gpui's window APIs without
+    // a signature churn.
+    #[allow(clippy::only_used_in_recursion)]
     fn render(
         &self,
         path: SplitPath,

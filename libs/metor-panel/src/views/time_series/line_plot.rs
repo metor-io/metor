@@ -159,8 +159,8 @@ impl LinePlot {
         }
         for trace in &self.traces {
             let id = trace.entity_id();
-            if !self.tracking.contains_key(&id) {
-                self.tracking.insert(id, TraceTracking::new());
+            if let std::collections::hash_map::Entry::Vacant(slot) = self.tracking.entry(id) {
+                slot.insert(TraceTracking::new());
                 let task = Self::spawn_tracker(id, trace.clone(), self.db.clone(), cx);
                 self.tasks.insert(id, task);
             }

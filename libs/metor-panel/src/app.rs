@@ -100,13 +100,13 @@ impl AppRoot {
     }
 
     fn toggle_palette(&mut self, _: &OpenPalette, window: &mut Window, cx: &mut Context<Self>) {
-        if let Some(inspector) = &self.inspector {
-            if !inspector.read(cx).dismissed {
-                self.inspector = None;
-                self.focus_handle.focus(window);
-                cx.notify();
-                return;
-            }
+        if let Some(inspector) = &self.inspector
+            && !inspector.read(cx).dismissed
+        {
+            self.inspector = None;
+            self.focus_handle.focus(window);
+            cx.notify();
+            return;
         }
 
         let rows = ItemRegistry::root_rows(&self.db, cx);
@@ -236,11 +236,11 @@ impl Focusable for AppRoot {
 
 impl Render for AppRoot {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        if let Some(inspector) = &self.inspector {
-            if inspector.read(cx).dismissed {
-                self.inspector = None;
-                self.focus_handle.focus(window);
-            }
+        if let Some(inspector) = &self.inspector
+            && inspector.read(cx).dismissed
+        {
+            self.inspector = None;
+            self.focus_handle.focus(window);
         }
 
         if let Some((item, position)) = self.pending_inspector_request.take() {

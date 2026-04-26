@@ -1000,6 +1000,7 @@ fn convert_values_strided(
     out.clear();
     out.reserve(to - from);
 
+    #[allow(clippy::too_many_arguments)]
     fn fill<T: PlotValue>(
         data: &[u8],
         lod_stride: usize,

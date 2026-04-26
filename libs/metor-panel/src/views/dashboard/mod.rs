@@ -717,10 +717,10 @@ impl PaneItem for DashboardPanel {
             .iter()
             .map(|w| {
                 let mut w = w.clone();
-                if let Some(entity) = self.widget_entities.get(&w.id) {
-                    if let Some(blob) = widgets::serialize_widget_state(&w.kind, entity, cx) {
-                        w.config = blob;
-                    }
+                if let Some(entity) = self.widget_entities.get(&w.id)
+                    && let Some(blob) = widgets::serialize_widget_state(&w.kind, entity, cx)
+                {
+                    w.config = blob;
                 }
                 w
             })

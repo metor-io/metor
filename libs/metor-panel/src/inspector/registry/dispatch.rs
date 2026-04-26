@@ -67,33 +67,33 @@ impl InspectorRegistry {
             )));
         }
 
-        if let Some(scalar) = peek.scalar_type() {
-            if let Some(val) = scalar_as_f64(peek, scalar) {
-                let label = ctx.label.clone();
-                if let Some((min, max)) = field_override.and_then(|o| o.range) {
-                    let write_entity = any_entity.clone();
-                    let read_entity = any_entity.clone();
-                    return Some(Box::new(SliderRow {
-                        label,
-                        read_value: Arc::new(move |cx| {
-                            read_scalar(&read_entity, field_idx, scalar, cx)
-                        }),
-                        min,
-                        max,
-                        on_change: Arc::new(move |v, _w, cx| {
-                            write_scalar(&write_entity, field_idx, scalar, v, cx);
-                        }),
-                    }));
-                }
-                let any_entity = any_entity.clone();
-                return Some(Box::new(ScalarRow {
+        if let Some(scalar) = peek.scalar_type()
+            && let Some(val) = scalar_as_f64(peek, scalar)
+        {
+            let label = ctx.label.clone();
+            if let Some((min, max)) = field_override.and_then(|o| o.range) {
+                let write_entity = any_entity.clone();
+                let read_entity = any_entity.clone();
+                return Some(Box::new(SliderRow {
                     label,
-                    value: val,
+                    read_value: Arc::new(move |cx| {
+                        read_scalar(&read_entity, field_idx, scalar, cx)
+                    }),
+                    min,
+                    max,
                     on_change: Arc::new(move |v, _w, cx| {
-                        write_scalar(&any_entity, field_idx, scalar, v, cx);
+                        write_scalar(&write_entity, field_idx, scalar, v, cx);
                     }),
                 }));
             }
+            let any_entity = any_entity.clone();
+            return Some(Box::new(ScalarRow {
+                label,
+                value: val,
+                on_change: Arc::new(move |v, _w, cx| {
+                    write_scalar(&any_entity, field_idx, scalar, v, cx);
+                }),
+            }));
         }
 
         if shape.id == <String as Facet>::SHAPE.id {
@@ -108,7 +108,7 @@ impl InspectorRegistry {
             )));
         }
 
-        if let Ok(peek_option) = peek.clone().into_option() {
+        if let Ok(peek_option) = (*peek).into_option() {
             return Some(builders::build_option_row(
                 ctx,
                 peek_option,
@@ -117,7 +117,7 @@ impl InspectorRegistry {
             ));
         }
 
-        if let Ok(peek_enum) = peek.clone().into_enum() {
+        if let Ok(peek_enum) = (*peek).into_enum() {
             let selected = peek_enum
                 .variant_name_active()
                 .unwrap_or("unknown")
