@@ -94,8 +94,6 @@ impl PaneItem for TablePanel {
     }
 }
 
-/// Pane item rendering components grouped by declared `group_name`
-/// metadata as a spreadsheet (instances = rows, fields = columns).
 pub struct DataTablePanel {
     inner: Entity<DataTable>,
     label: SharedString,

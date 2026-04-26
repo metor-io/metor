@@ -710,25 +710,13 @@ fn build_editing_chrome(
         .px(px(6.0))
         .py(px(3.0))
         .rounded(px(3.0))
-        .overflow_hidden();
-    match style.preset {
-        StripPreset::Boxes => {
-            atom = atom.w(cell_width(style.preset, false));
-        }
-        StripPreset::Dashboard => {
-            atom = atom.w(cell_width(style.preset, false));
-        }
-    }
+        .overflow_hidden()
+        .w(cell_width(style.preset, false));
 
-    let bg = if error {
-        theme.drop_target
-    } else if is_pending {
+    let bg = if error || is_pending {
         theme.drop_target
     } else {
-        match style.preset {
-            StripPreset::Boxes => theme.bg_secondary,
-            StripPreset::Dashboard => theme.bg_secondary,
-        }
+        theme.bg_secondary
     };
     atom = atom.bg(bg).border_1().border_color(if error {
         theme.line_colors[3]
@@ -813,21 +801,14 @@ fn build_cell_chrome(
         .py(px(3.0))
         .overflow_hidden();
 
-    // Fixed cell width keeps multi-element rows vertically aligned across
-    // instances — otherwise a "0" cell and a "0.0083" cell render at
-    // different widths and neighboring boxes shift horizontally from row
-    // to row. Skip for label-less scalars (Component Table value column,
-    // strings, enums) — their single cell has no siblings to align with
-    // and a fixed width just leaves dead space around the value.
+    // Fixed-width keeps a "0" cell and a "0.0083" cell aligned across rows
+    // so neighboring boxes don't shift. Solo unlabeled cells have no siblings
+    // to align with, so they keep their intrinsic width.
     let labeled = cell.label.is_some();
-    match (style.preset, is_solo, labeled) {
-        (StripPreset::Boxes, _, true) => {
-            atom = atom.w(cell_width(style.preset, is_solo));
-        }
-        (StripPreset::Dashboard, false, true) => {
-            atom = atom.w(cell_width(style.preset, is_solo));
-        }
-        _ => {}
+    let needs_fixed_width =
+        labeled && !matches!((style.preset, is_solo), (StripPreset::Dashboard, true));
+    if needs_fixed_width {
+        atom = atom.w(cell_width(style.preset, is_solo));
     }
 
     match style.preset {
@@ -860,10 +841,8 @@ fn build_cell_chrome(
         );
     }
 
-    // Adaptive font size: shrink the value when the formatted string would
-    // overflow the fixed cell at the default size. The thresholds here are
-    // calibrated for the 78 px Boxes width minus padding/label/gap ≈ 50 px
-    // of usable value space at a ~7 px/char monospace cadence.
+    // Thresholds calibrated for the 78px Boxes width minus padding/label/gap
+    // (≈50px of usable value space at ~7px/char monospace).
     let base_value_size = match (style.preset, is_solo) {
         (StripPreset::Dashboard, true) => 16.0,
         (StripPreset::Dashboard, false) => 12.0,
@@ -915,13 +894,9 @@ fn build_cell_chrome(
     atom
 }
 
-/// Fixed pixel width of one element cell; see [`cell_width`].
 pub const STRIP_BOX_CELL_WIDTH: f32 = 78.0;
-/// Horizontal gap between element cells inside a strip row.
 pub const STRIP_CELL_GAP: f32 = 4.0;
 
-/// Width of one cell in [`build_cell_chrome`]. The solo Dashboard case
-/// has no fixed width (the caller sizes it), so this returns `0.0` there.
 pub fn cell_width(preset: StripPreset, is_solo: bool) -> Pixels {
     match (preset, is_solo) {
         (StripPreset::Boxes, _) => px(STRIP_BOX_CELL_WIDTH),
@@ -930,8 +905,6 @@ pub fn cell_width(preset: StripPreset, is_solo: bool) -> Pixels {
     }
 }
 
-/// Total horizontal footprint of a [`ComponentValueStrip`] with `n_cells`
-/// boxed cells. Used by callers that need to match a column to strip width.
 pub fn strip_row_width(n_cells: usize) -> f32 {
     if n_cells == 0 {
         return 0.0;
@@ -1093,8 +1066,6 @@ mod tests {
 
     #[test]
     fn f32_uses_adaptive_precision() {
-        // Positive values get a leading digit-width space so the digit
-        // columns stay put across a sign change.
         assert_eq!(format_element(ElementValue::F32(0.0)), " 0");
         assert_eq!(format_element(ElementValue::F32(1.5)), " 1.50");
         assert_eq!(format_element(ElementValue::F32(1234.5)), " 1234");

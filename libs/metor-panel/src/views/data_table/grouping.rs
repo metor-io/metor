@@ -4,37 +4,25 @@ use gpui::SharedString;
 use metor_db::DB;
 use metor_proto::types::ComponentId;
 
-/// One detected group of like-shaped component instances.
 #[derive(Clone, Debug)]
 pub struct Group {
     pub name: SharedString,
-    /// Relative leaf paths (dot-joined), union across all instances,
-    /// alphabetically sorted. Drives the detail table's field columns.
     pub fields: Vec<SharedString>,
-    /// Instances sorted by full name.
     pub instances: Vec<GroupInstance>,
 }
 
 #[derive(Clone, Debug)]
 pub struct GroupInstance {
-    /// Full dotted path (e.g. `cube_sat.gps0`).
     pub name: SharedString,
-    /// Last segment of [`name`] (e.g. `gps0`).
     pub short_name: SharedString,
-    /// Component id per field; `None` when an instance is missing a
-    /// field that peers have, so rendering can draw an empty cell.
     pub field_ids: Vec<Option<ComponentId>>,
 }
 
-/// Flattened metadata view; written as a separate type so
-/// [`detect_groups_from_entries`] can be exercised without a live DB.
 #[derive(Clone, Debug)]
 pub struct MetadataEntry {
     pub id: ComponentId,
     pub name: String,
     pub group_name: Option<String>,
-    /// `true` when the DB also holds a value-producing `Component` for
-    /// this id. Metadata-only entries (group parents) are `false`.
     pub has_component: bool,
 }
 
@@ -44,44 +32,13 @@ pub fn detect_groups(db: &DB) -> Vec<Group> {
             .component_metadata_iter()
             .map(|(id, meta)| MetadataEntry {
                 id: *id,
-                name: dbg!(meta).name.clone(),
+                name: meta.name.clone(),
                 group_name: meta.group_name().map(|s| s.to_string()),
                 has_component: state.get_component(*id).is_some(),
             })
             .collect()
     });
-    let total = entries.len();
-    let with_group: Vec<(String, String, bool)> = entries
-        .iter()
-        .filter(|e| e.group_name.is_some())
-        .map(|e| {
-            (
-                e.name.clone(),
-                e.group_name.clone().unwrap(),
-                e.has_component,
-            )
-        })
-        .collect();
-    let result = detect_groups_from_entries(entries);
-    eprintln!(
-        "[data_table] detect_groups: total_metadata={} with_group_name={} groups_returned={} group_instances={:?}",
-        total,
-        with_group.len(),
-        result.len(),
-        with_group,
-    );
-    for g in &result {
-        eprintln!(
-            "[data_table]   group {} fields={:?} instances={:?}",
-            g.name,
-            g.fields.iter().map(|s| s.as_ref()).collect::<Vec<_>>(),
-            g.instances
-                .iter()
-                .map(|i| i.name.as_ref())
-                .collect::<Vec<_>>(),
-        );
-    }
-    result
+    detect_groups_from_entries(entries)
 }
 
 pub fn detect_groups_from_entries(entries: Vec<MetadataEntry>) -> Vec<Group> {
@@ -93,7 +50,6 @@ pub fn detect_groups_from_entries(entries: Vec<MetadataEntry>) -> Vec<Group> {
         .collect();
     instance_prefixes.sort_by(|a, b| b.1.len().cmp(&a.1.len()));
 
-    // group_name -> instance_name -> field_path -> component_id
     let mut by_group: BTreeMap<String, BTreeMap<String, BTreeMap<String, ComponentId>>> =
         BTreeMap::new();
     // Seed so instances with zero detected fields still render as a row.

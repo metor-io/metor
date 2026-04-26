@@ -16,13 +16,8 @@ use super::column_browser::{ColumnBrowser, ColumnBrowserDelegate};
 use super::table::Table;
 use crate::theme::theme;
 
-/// [`ColumnBrowser`] specialized for grouped-component navigation.
 pub type DataTable = ColumnBrowser<DataTableDelegate>;
 
-/// Browser item surfacing either a group or one of its instances.
-///
-/// Kept identity-based (names, not indices) so a DB rebuild that reorders
-/// groups doesn't misroute selections.
 #[derive(Clone)]
 pub enum DataTableItem {
     Group {
@@ -169,8 +164,6 @@ impl ColumnBrowserDelegate for DataTableDelegate {
         match (column_ix, item) {
             (0, DataTableItem::Group { name }) => {
                 self.selected_group = Some(name.clone());
-                // Re-picking the group (or picking a new one) clears any
-                // instance filter so all rows show again.
                 self.selected_instance = None;
             }
             (1, DataTableItem::Instance { group, name, .. }) => {
@@ -187,8 +180,6 @@ impl ColumnBrowserDelegate for DataTableDelegate {
         _ancestors: SmallVec<[Self::Item; 8]>,
         _cx: &mut Context<DataTable>,
     ) {
-        // Rerooting doesn't make sense for a two-column browser whose
-        // column 0 is a flat group list.
     }
 
     fn clear_root_override(&mut self, _cx: &mut Context<DataTable>) {}

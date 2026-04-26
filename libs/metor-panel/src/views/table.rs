@@ -128,9 +128,6 @@ pub struct Table<D: TableDelegate> {
     delegate: D,
     col_states: Vec<ColState>,
     scroll_handle: UniformListScrollHandle,
-    /// Horizontal scroll anchor. When every column has a fixed width
-    /// the rows render at their natural sum; this handle drives the
-    /// overflow wrapper so header and body scroll together.
     hscroll: ScrollHandle,
 }
 
@@ -337,9 +334,6 @@ impl<D: TableDelegate> Render for Table<D> {
         let col_flex: Vec<bool> = columns.iter().map(|c| c.flex).collect();
         let any_flex = col_flex.iter().any(|f| *f);
 
-        // Sum of fixed-width column footprints. When `any_flex` is true
-        // the flex columns absorb whatever's left over, so horizontal
-        // overflow doesn't apply and we skip the inner width constraint.
         let total_width: f32 = self
             .col_states
             .iter()
@@ -380,13 +374,10 @@ impl<D: TableDelegate> Render for Table<D> {
                             if col_flex[col_ix] {
                                 cell_div = cell_div.flex_1().h(row_height);
                             } else {
-                                // flex-shrink defaults to 1, so without an
-                                // explicit 0 the cell collapses when the
-                                // row is narrower than the column sum and
-                                // the strip's `flex_wrap` then breaks
-                                // element boxes onto a new line. Pin the
-                                // cell at its column width and let the
-                                // outer hscroll handle overflow.
+                                // Without explicit flex_shrink=0 the cell
+                                // collapses below its column width and
+                                // the strip's flex_wrap breaks element
+                                // boxes onto a new line.
                                 cell_div = cell_div.w(this.col_states[col_ix].width);
                                 cell_div.style().flex_shrink = Some(0.0);
                             }

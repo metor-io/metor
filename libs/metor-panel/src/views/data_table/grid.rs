@@ -14,26 +14,13 @@ use crate::views::value_strip::{
     ComponentValueStrip, StripBehavior, StripClick, StripStyle, resolve_metadata, strip_row_width,
 };
 
-/// Live state backing one instance row of the data-table detail grid.
-///
-/// Owns one [`ComponentValueStrip`] per group field so each cell streams
-/// its own WAL updates and handles click-to-edit independently. A `None`
-/// slot represents a field the instance doesn't have — the cell renders
-/// blank.
 struct RowState {
     instance: GroupInstance,
     strips: Vec<Option<Entity<ComponentValueStrip>>>,
     clicks: Vec<Option<StripClick>>,
-    /// Element count per field. Drives column widths so a 3-box strip gets
-    /// a wider column than a scalar. `0` for fields the instance lacks.
     element_counts: Vec<usize>,
 }
 
-/// [`TableDelegate`] for the data-table detail grid.
-///
-/// Columns are a fixed `Instance` column plus one column per field of
-/// the currently-selected group. Rebuilt in-place via [`Self::set_group`]
-/// whenever the browser's group selection changes.
 pub struct DataTableGrid {
     db: Arc<DB>,
     group: Option<Group>,
@@ -59,26 +46,19 @@ impl DataTableGrid {
     ) {
         self.filter = filter;
 
-        let same_group = match (&self.group, &group) {
-            (Some(a), Some(b)) => a.name == b.name,
+        let same_shape = match (&self.group, &group) {
             (None, None) => true,
+            (Some(a), Some(b)) => {
+                a.name == b.name
+                    && a.fields == b.fields
+                    && a.instances.len() == b.instances.len()
+                    && a.instances
+                        .iter()
+                        .zip(b.instances.iter())
+                        .all(|(x, y)| x.name == y.name && x.field_ids == y.field_ids)
+            }
             _ => false,
         };
-        let same_shape = same_group
-            && match (&self.group, &group) {
-                (Some(a), Some(b)) => {
-                    a.fields == b.fields
-                        && a.instances.len() == b.instances.len()
-                        && a.instances
-                            .iter()
-                            .zip(b.instances.iter())
-                            .all(|(x, y)| {
-                                x.name == y.name && x.field_ids == y.field_ids
-                            })
-                }
-                (None, None) => true,
-                _ => false,
-            };
 
         if same_shape {
             return;
@@ -145,10 +125,8 @@ fn build_row(
         });
         strips.push(Some(strip));
         clicks.push(Some(click));
-        // Element count comes from the registered schema/metadata. Falls
-        // back to 1 when the vtable hasn't arrived yet — the group
-        // rebuilds on the next `vtable_gen` tick and picks up the real
-        // dim.
+        // Falls back to 1 when the vtable hasn't arrived yet; group
+        // rebuilds on the next vtable_gen tick.
         let meta = resolve_metadata(db, component_id);
         let n = meta.element_names.len().max(1);
         element_counts.push(n);
@@ -163,12 +141,10 @@ fn build_row(
 
 impl TableDelegate for DataTableGrid {
     fn columns(&self) -> Vec<Column> {
-        const CELL_H_PAD: f32 = 8.0; // matches `.px(px(4.0))` cell wrapper
+        const CELL_H_PAD: f32 = 8.0;
         let mut cols = vec![Column::new("Instance", 180.0).min_width(120.0)];
         if let Some(group) = &self.group {
             for (field_ix, field) in group.fields.iter().enumerate() {
-                // Take the widest strip across instances — ragged groups
-                // still get a column that fits the fullest representation.
                 let n_cells = self
                     .rows
                     .iter()
@@ -176,11 +152,6 @@ impl TableDelegate for DataTableGrid {
                     .max()
                     .unwrap_or(0)
                     .max(1);
-                // Scalar (unlabeled, intrinsic-width) cells don't get the
-                // fixed 78px box treatment, so the 1-cell strip can grow
-                // or shrink with the value. Give those columns a little
-                // extra breathing room; multi-cell strips already know
-                // their size exactly via `strip_row_width`.
                 let width = if n_cells == 1 {
                     120.0 + CELL_H_PAD
                 } else {
@@ -224,17 +195,15 @@ impl TableDelegate for DataTableGrid {
         }
 
         let field_ix = col_ix - 1;
-        let strip_opt = row.strips.get(field_ix).cloned().flatten();
-        let click_opt = row.clicks.get(field_ix).cloned().flatten();
-        let component_id_opt = row
-            .instance
-            .field_ids
-            .get(field_ix)
-            .copied()
-            .flatten();
-
-        let (Some(strip), Some(click), Some(component_id)) = (strip_opt, click_opt, component_id_opt)
-        else {
+        let (
+            Some(Some(strip)),
+            Some(Some(click)),
+            Some(Some(component_id)),
+        ) = (
+            row.strips.get(field_ix).cloned(),
+            row.clicks.get(field_ix).cloned(),
+            row.instance.field_ids.get(field_ix).copied(),
+        ) else {
             return div().into_any_element();
         };
 
@@ -251,8 +220,5 @@ impl TableDelegate for DataTableGrid {
             .into_any_element()
     }
 
-    fn sort_column(&mut self, _col_ix: usize, _sort: ColumnSort, _cx: &App) {
-        // v1: detail grid is unsorted. Values stream live, so a useful
-        // sort would need to re-key on every sample — deferred.
-    }
+    fn sort_column(&mut self, _col_ix: usize, _sort: ColumnSort, _cx: &App) {}
 }
