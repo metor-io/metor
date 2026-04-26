@@ -262,15 +262,19 @@ impl InspectorRegistry {
         use crate::tiles::{Pane, TabOrientation};
         self.register_type_builder::<Pane>(Arc::new(|any_entity, _db, _cx| {
             let pane: Entity<Pane> = any_entity.downcast().expect("Pane type mismatch");
-            let read_pane = pane.clone();
-            let write_pane = pane;
-            vec![Box::new(BoolRow::dynamic(
+
+            let orientation_read = pane.clone();
+            let orientation_write = pane.clone();
+            let orientation_row = BoolRow::dynamic(
                 "Vertical Tabs",
                 Box::new(move |cx| {
-                    matches!(read_pane.read(cx).tab_orientation(), TabOrientation::Vertical)
+                    matches!(
+                        orientation_read.read(cx).tab_orientation(),
+                        TabOrientation::Vertical
+                    )
                 }),
                 Arc::new(move |checked, _w, cx| {
-                    write_pane.update(cx, |p, cx| {
+                    orientation_write.update(cx, |p, cx| {
                         let next = if checked {
                             TabOrientation::Vertical
                         } else {
@@ -279,7 +283,33 @@ impl InspectorRegistry {
                         p.set_tab_orientation(next, cx);
                     });
                 }),
-            ))]
+            );
+
+            let hide_read = pane.clone();
+            let hide_write = pane.clone();
+            let hide_row = BoolRow::dynamic(
+                "Hide Tab Bar",
+                Box::new(move |cx| hide_read.read(cx).hide_tab_bar()),
+                Arc::new(move |checked, _w, cx| {
+                    hide_write.update(cx, |p, cx| p.set_hide_tab_bar(checked, cx));
+                }),
+            );
+
+            let lock_read = pane.clone();
+            let lock_write = pane;
+            let lock_row = BoolRow::dynamic(
+                "Locked Size",
+                Box::new(move |cx| lock_read.read(cx).locked_size().is_some()),
+                Arc::new(move |checked, _w, cx| {
+                    lock_write.update(cx, |p, cx| p.set_locked(checked, cx));
+                }),
+            );
+
+            vec![
+                Box::new(orientation_row),
+                Box::new(hide_row),
+                Box::new(lock_row),
+            ]
         }));
     }
 

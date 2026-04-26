@@ -152,8 +152,33 @@ pub fn register_builtin_providers(
     cx: &mut App,
 ) {
     register_panel_provider(tiles.clone(), cx);
+    register_pane_provider(tiles.clone(), cx);
     register_widget_provider(tiles.clone(), cx);
     register_command_provider(db, tiles, on_open_inspector, cx);
+}
+
+/// Exposes each `Pane` as a palette entry so pane-level settings (orientation,
+/// hide-tab-bar, locked-size) are reachable even when the tab bar is hidden.
+fn register_pane_provider(tiles: Entity<TileGroup>, cx: &mut App) {
+    let provider: ItemProvider = Arc::new(move |cx: &App| {
+        let panes = tiles.read(cx).panes().to_vec();
+        panes
+            .iter()
+            .enumerate()
+            .map(|(ix, pane)| {
+                let label = match pane.read(cx).items().first() {
+                    Some(item) => SharedString::from(format!("Pane: {}", item.tab_title(cx))),
+                    None => SharedString::from(format!("Pane {}", ix + 1)),
+                };
+                InspectionItem::Entity {
+                    label,
+                    summary: SharedString::new_static(""),
+                    entity: pane.clone().into_any(),
+                }
+            })
+            .collect()
+    });
+    ItemRegistry::register(cx, Category::Custom("Pane".into()), provider);
 }
 
 fn register_panel_provider(tiles: Entity<TileGroup>, cx: &mut App) {

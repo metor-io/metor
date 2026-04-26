@@ -59,6 +59,10 @@ pub struct SerializedPane {
     pub items: Vec<SerializedItem>,
     #[serde(default)]
     pub tab_orientation: SerializedTabOrientation,
+    #[serde(default)]
+    pub hide_tab_bar: bool,
+    #[serde(default)]
+    pub locked_size: Option<(f32, f32)>,
 }
 
 #[derive(Serialize, Deserialize, Default, Clone, Copy)]
