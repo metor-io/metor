@@ -343,15 +343,13 @@ impl State {
         metadata: ComponentMetadata,
         db_path: &Path,
     ) -> Result<(), Error> {
-        let component_metadata_path = dbg!(db_path.join(metadata.component_id.to_string()));
+        let component_metadata_path = db_path.join(metadata.component_id.to_string());
         std::fs::create_dir_all(&component_metadata_path)?;
         let component_metadata_path = component_metadata_path.join("metadata");
         info!(component.name= ?metadata.name, component.id = ?metadata.component_id.0, "setting component metadata");
-        metadata
-            .write(component_metadata_path)
-            .inspect_err(|e| println!("failed to write metadata: {:?}", e))?;
+        metadata.write(component_metadata_path)?;
         self.component_metadata
-            .insert(metadata.component_id, metadata.clone());
+            .insert(metadata.component_id, metadata);
         Ok(())
     }
 

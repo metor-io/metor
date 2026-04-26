@@ -9,10 +9,6 @@ use syn::{DeriveInput, Generics, Ident, parse_macro_input};
 #[darling(
     attributes(metor_fsw),
     supports(struct_named, enum_unit),
-    // Other derive macros in this attribute namespace (e.g. Metadatatize)
-    // recognise additional fields like `group`. AsVTable doesn't care
-    // about them, but darling would fail on the unknown key; accept and
-    // ignore anything unrecognised here.
     forward_attrs(allow, doc, cfg)
 )]
 pub struct AsVTable {

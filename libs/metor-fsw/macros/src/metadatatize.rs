@@ -12,10 +12,8 @@ pub struct Metadatatize {
     generics: Generics,
     data: ast::Data<Ident, crate::Field>,
     parent: Option<String>,
-    /// `#[metor_fsw(group)]` opts the struct into the data-table grouping
-    /// model: emits a metadata-only parent entry at the struct's path with
-    /// `group_name = <Ident>`. `#[metor_fsw(group = "Custom")]` overrides
-    /// the label.
+    /// `#[metor_fsw(group)]` emits a metadata-only parent entry with
+    /// `group_name = <Ident>`. `#[metor_fsw(group = "Custom")]` overrides.
     #[darling(default)]
     group: Option<Override<String>>,
 }
@@ -61,13 +59,8 @@ pub fn metadatatize(input: TokenStream) -> TokenStream {
                     .chain(<#ty>::metadata(prefix.clone().chain(#name)))
                 }
             });
-            // Group-parent emission is opt-in. When the struct is tagged
-            // `#[metor_fsw(group)]` (or `#[metor_fsw(group = "Name")]`),
-            // emit a metadata-only entry at the struct's own path with
-            // `group_name` set, so the data-table view can cluster each
-            // instance of this struct into a group. Always skipped at the
-            // empty root prefix — an empty name would collide across
-            // roots.
+            // Skipped at empty root prefix — an empty name would collide
+            // across roots.
             let group_emit = match group {
                 None => quote! {
                     let group_parent: Option<#impeller_wkt::ComponentMetadata> = None;
