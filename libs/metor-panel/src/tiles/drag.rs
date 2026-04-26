@@ -1,6 +1,5 @@
 use gpui::{Bounds, Entity, IntoElement, Pixels, Point, Render, Window, Context, Empty, div, prelude::*, px};
 use super::SplitPath;
-use serde::{Deserialize, Serialize};
 
 use crate::theme::theme;
 use super::item::PaneItemHandle;
@@ -49,7 +48,7 @@ impl Render for ResizeDrag {
 }
 
 /// Side of a pane a tab was dropped against.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SplitDirection {
     Up,
     Down,

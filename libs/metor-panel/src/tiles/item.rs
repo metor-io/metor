@@ -12,9 +12,11 @@ pub trait PaneItem: Render + Sized + 'static {
     /// breaks compatibility with previously-saved workspaces.
     fn serialization_key() -> &'static str;
 
-    /// Snapshot the item's own state. Paired with an [`ItemRegistry`]
-    /// deserializer keyed on [`PaneItem::serialization_key`].
-    fn serialize(&self, cx: &App) -> serde_json::Value;
+    /// Snapshot the item's own state as a facet-json blob. Paired with an
+    /// [`ItemRegistry`] deserializer keyed on [`PaneItem::serialization_key`];
+    /// the registered closure receives the same string and is responsible for
+    /// parsing it (typically with `facet_json::from_str` into a `*Config`).
+    fn serialize(&self, cx: &App) -> String;
 
     /// Whether the tab bar should render a close affordance for this item.
     fn can_close(&self, _cx: &App) -> bool {
@@ -33,7 +35,7 @@ pub trait PaneItem: Render + Sized + 'static {
 pub trait PaneItemHandle: 'static {
     fn tab_title(&self, cx: &App) -> SharedString;
     fn serialization_key(&self) -> &'static str;
-    fn serialize(&self, cx: &App) -> serde_json::Value;
+    fn serialize(&self, cx: &App) -> String;
     fn can_close(&self, cx: &App) -> bool;
     fn view(&self) -> AnyView;
     fn entity_id(&self) -> gpui::EntityId;
@@ -53,7 +55,7 @@ impl<T: PaneItem> PaneItemHandle for Entity<T> {
         T::serialization_key()
     }
 
-    fn serialize(&self, cx: &App) -> serde_json::Value {
+    fn serialize(&self, cx: &App) -> String {
         self.read(cx).serialize(cx)
     }
 

@@ -430,8 +430,30 @@ impl TileGroup {
     /// persisted state) for saving to disk.
     pub fn serialize(&self, cx: &App) -> SerializedTileGroup {
         SerializedTileGroup {
+            version: 1,
             root: self.root.serialize(cx),
         }
+    }
+
+    /// Convenience: snapshot to a JSON string ready to write to disk.
+    ///
+    /// Panics on serialization failure — every field in the serialized tree
+    /// is plain `Facet` data, so the only way `facet_json::to_string` can
+    /// fail here is a programmer error (e.g. a freshly-added field with no
+    /// `Facet` impl).
+    pub fn to_json(&self, cx: &App) -> String {
+        facet_json::to_string(&self.serialize(cx)).expect("tile layout always serializes")
+    }
+
+    /// Convenience: load a layout from a JSON string. The application picks
+    /// the file path; this layer is format-only.
+    pub fn from_json(
+        json: &str,
+        registry: &ItemRegistry,
+        cx: &mut Context<Self>,
+    ) -> Result<Self, facet_json::DeserializeError> {
+        let serialized: SerializedTileGroup = facet_json::from_str(json)?;
+        Ok(Self::deserialize(serialized, registry, cx))
     }
 
     /// Rebuild a layout from a [`SerializedTileGroup`]. Items whose
@@ -467,7 +489,7 @@ impl TileGroup {
                     let items: Vec<Box<dyn PaneItemHandle>> = sp
                         .items
                         .iter()
-                        .filter_map(|si| registry.deserialize(&si.kind, si.state.clone(), cx))
+                        .filter_map(|si| registry.deserialize(&si.kind, &si.state, cx))
                         .collect();
                     let mut pane = Pane::new(items, cx);
                     if sp.active_index < pane.items().len() {

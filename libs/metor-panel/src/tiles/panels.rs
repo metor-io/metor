@@ -17,6 +17,13 @@ use crate::inspector::rows::{CommandRow, InspectorRow, NavRow};
 use super::item::{PaneItem, PaneItemHandle};
 use super::pane::Pane;
 
+/// Persisted shape of a [`TextPanel`].
+#[derive(facet::Facet, Default)]
+pub struct TextPanelConfig {
+    /// Display label and serialization key for the source component.
+    pub component: String,
+}
+
 /// Pane item that renders a single component's latest value as text.
 pub struct TextPanel {
     inner: Entity<ComponentText>,
@@ -36,6 +43,12 @@ impl TextPanel {
             label: label.into(),
         }
     }
+
+    pub fn to_config(&self, _cx: &App) -> TextPanelConfig {
+        TextPanelConfig {
+            component: self.label.to_string(),
+        }
+    }
 }
 
 impl Render for TextPanel {
@@ -53,10 +66,15 @@ impl PaneItem for TextPanel {
         "component_text"
     }
 
-    fn serialize(&self, _cx: &App) -> serde_json::Value {
-        serde_json::json!({ "component": self.label.as_ref() })
+    fn serialize(&self, cx: &App) -> String {
+        facet_json::to_string(&self.to_config(cx)).expect("text panel config serializes")
     }
 }
+
+/// Persisted shape of a [`TablePanel`]. Currently empty — the panel renders
+/// every component in the DB and has no per-instance configuration.
+#[derive(facet::Facet, Default)]
+pub struct TablePanelConfig {}
 
 /// Pane item listing every component in the DB as a flat table.
 pub struct TablePanel {
@@ -71,6 +89,10 @@ impl TablePanel {
             inner,
             label: "Components".into(),
         }
+    }
+
+    pub fn to_config(&self, _cx: &App) -> TablePanelConfig {
+        TablePanelConfig {}
     }
 }
 
@@ -89,10 +111,14 @@ impl PaneItem for TablePanel {
         "component_table"
     }
 
-    fn serialize(&self, _cx: &App) -> serde_json::Value {
-        serde_json::json!({})
+    fn serialize(&self, cx: &App) -> String {
+        facet_json::to_string(&self.to_config(cx)).expect("table panel config serializes")
     }
 }
+
+/// Persisted shape of a [`DataTablePanel`]. No per-instance configuration today.
+#[derive(facet::Facet, Default)]
+pub struct DataTablePanelConfig {}
 
 pub struct DataTablePanel {
     inner: Entity<DataTable>,
@@ -106,6 +132,10 @@ impl DataTablePanel {
             inner,
             label: "Data Table".into(),
         }
+    }
+
+    pub fn to_config(&self, _cx: &App) -> DataTablePanelConfig {
+        DataTablePanelConfig {}
     }
 }
 
@@ -124,10 +154,14 @@ impl PaneItem for DataTablePanel {
         "data_table"
     }
 
-    fn serialize(&self, _cx: &App) -> serde_json::Value {
-        serde_json::json!({})
+    fn serialize(&self, cx: &App) -> String {
+        facet_json::to_string(&self.to_config(cx)).expect("data table panel config serializes")
     }
 }
+
+/// Persisted shape of a [`BrowserPanel`]. No per-instance configuration today.
+#[derive(facet::Facet, Default)]
+pub struct BrowserPanelConfig {}
 
 /// Pane item with a Finder-style browser over the component namespace tree.
 pub struct BrowserPanel {
@@ -142,6 +176,10 @@ impl BrowserPanel {
             inner,
             label: "Components".into(),
         }
+    }
+
+    pub fn to_config(&self, _cx: &App) -> BrowserPanelConfig {
+        BrowserPanelConfig {}
     }
 }
 
@@ -160,8 +198,8 @@ impl PaneItem for BrowserPanel {
         "component_browser"
     }
 
-    fn serialize(&self, _cx: &App) -> serde_json::Value {
-        serde_json::json!({})
+    fn serialize(&self, cx: &App) -> String {
+        facet_json::to_string(&self.to_config(cx)).expect("browser panel config serializes")
     }
 }
 
@@ -215,6 +253,24 @@ impl Render for PlotPanel {
     }
 }
 
+/// Persisted shape of a [`PlotPanel`].
+///
+/// Currently mirrors what the legacy serializer wrote — just the rendered
+/// title — but lives in its own struct so future trace/range/override fields
+/// can land here without touching the registry.
+#[derive(facet::Facet, Default)]
+pub struct PlotPanelConfig {
+    pub label: String,
+}
+
+impl PlotPanel {
+    pub fn to_config(&self, cx: &App) -> PlotPanelConfig {
+        PlotPanelConfig {
+            label: self.tab_title(cx).to_string(),
+        }
+    }
+}
+
 impl PaneItem for PlotPanel {
     fn tab_title(&self, cx: &App) -> SharedString {
         self.inner.read(cx).title(cx)
@@ -224,14 +280,47 @@ impl PaneItem for PlotPanel {
         "time_series_plot"
     }
 
-    fn serialize(&self, cx: &App) -> serde_json::Value {
-        let title = self.tab_title(cx);
-        serde_json::json!({ "label": title.as_ref() })
+    fn serialize(&self, cx: &App) -> String {
+        facet_json::to_string(&self.to_config(cx)).expect("plot panel config serializes")
     }
 
     fn inspectable_entity(&self) -> Option<gpui::AnyEntity> {
         Some(self.line_plot.clone().into_any())
     }
+}
+
+/// Persisted shape of a [`Viewer3dPanel`].
+#[derive(facet::Facet, Default)]
+pub struct Viewer3dPanelConfig {
+    pub models: Vec<ModelConfig>,
+    pub camera: CameraConfig,
+}
+
+/// Persisted shape of one model entry inside a [`Viewer3dPanel`].
+///
+/// Mirrors the data fields of [`crate::views::viewer_3d::ModelEntry`] but
+/// avoids the live `Entity` wrapping so the config can round-trip directly.
+#[derive(facet::Facet, Default)]
+pub struct ModelConfig {
+    pub label: String,
+    pub path: String,
+    pub position_binding: Option<ComponentId>,
+    pub orientation_binding: Option<ComponentId>,
+}
+
+/// Persisted shape of [`crate::views::viewer_3d::OrbitCamera`].
+///
+/// `glam::Vec3` is not `Facet`, so the target is unpacked into three fields
+/// at the persistence boundary.
+#[derive(facet::Facet, Default)]
+pub struct CameraConfig {
+    pub target_x: f32,
+    pub target_y: f32,
+    pub target_z: f32,
+    pub yaw: f32,
+    pub pitch: f32,
+    pub distance: f32,
+    pub fov_y_rad: f32,
 }
 
 /// Pane item hosting the Bevy-backed 3D viewer.
@@ -246,6 +335,36 @@ impl Viewer3dPanel {
         Self {
             inner,
             label: "3D Viewer".into(),
+        }
+    }
+
+    pub fn to_config(&self, cx: &App) -> Viewer3dPanelConfig {
+        let inner = self.inner.read(cx);
+        let cam = inner.camera();
+        let models = inner
+            .models()
+            .iter()
+            .map(|m| {
+                let m = m.read(cx);
+                ModelConfig {
+                    label: m.label.to_string(),
+                    path: m.path.clone(),
+                    position_binding: m.position_binding_component(),
+                    orientation_binding: m.orientation_binding_component(),
+                }
+            })
+            .collect();
+        Viewer3dPanelConfig {
+            models,
+            camera: CameraConfig {
+                target_x: cam.target.x,
+                target_y: cam.target.y,
+                target_z: cam.target.z,
+                yaw: cam.yaw,
+                pitch: cam.pitch,
+                distance: cam.distance,
+                fov_y_rad: cam.fov_y_rad,
+            },
         }
     }
 }
@@ -265,36 +384,8 @@ impl PaneItem for Viewer3dPanel {
         "viewer_3d"
     }
 
-    fn serialize(&self, cx: &App) -> serde_json::Value {
-        let inner = self.inner.read(cx);
-        let cam = inner.camera();
-        let models: Vec<serde_json::Value> = inner
-            .models()
-            .iter()
-            .map(|m| {
-                let m = m.read(cx);
-                serde_json::json!({
-                    "label": m.label.as_ref(),
-                    "path": m.path,
-                    "position_binding": m
-                        .position_binding_component()
-                        .map(|c| format!("{:?}", c)),
-                    "orientation_binding": m
-                        .orientation_binding_component()
-                        .map(|c| format!("{:?}", c)),
-                })
-            })
-            .collect();
-        serde_json::json!({
-            "models": models,
-            "camera": {
-                "target": [cam.target.x, cam.target.y, cam.target.z],
-                "yaw": cam.yaw,
-                "pitch": cam.pitch,
-                "distance": cam.distance,
-                "fov_y_rad": cam.fov_y_rad,
-            },
-        })
+    fn serialize(&self, cx: &App) -> String {
+        facet_json::to_string(&self.to_config(cx)).expect("viewer 3d config serializes")
     }
 
     fn inspectable_entity(&self) -> Option<gpui::AnyEntity> {
@@ -467,4 +558,58 @@ pub fn component_picker_rows(
             )) as Box<dyn InspectorRow>
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use metor_proto::types::ComponentId;
+
+    /// Each panel's `*Config` round-trips through facet-json without loss.
+    /// Mirrors the per-instance shape that `to_config` would produce; this
+    /// test pins the wire format independently of the panel-construction
+    /// code path so a missing field in either direction shows up here.
+    #[test]
+    fn panel_configs_round_trip_through_facet_json() {
+        let text = TextPanelConfig {
+            component: "altitude".into(),
+        };
+        let s = facet_json::to_string(&text).unwrap();
+        let back: TextPanelConfig = facet_json::from_str(&s).unwrap();
+        assert_eq!(back.component, "altitude");
+
+        let plot = PlotPanelConfig {
+            label: "speed".into(),
+        };
+        let s = facet_json::to_string(&plot).unwrap();
+        let back: PlotPanelConfig = facet_json::from_str(&s).unwrap();
+        assert_eq!(back.label, "speed");
+
+        let viewer = Viewer3dPanelConfig {
+            models: vec![ModelConfig {
+                label: "satellite".into(),
+                path: "sat.glb".into(),
+                position_binding: Some(ComponentId(7)),
+                orientation_binding: None,
+            }],
+            camera: CameraConfig {
+                target_x: 1.0,
+                target_y: 2.0,
+                target_z: 3.0,
+                yaw: 0.5,
+                pitch: 0.25,
+                distance: 10.0,
+                fov_y_rad: std::f32::consts::FRAC_PI_3,
+            },
+        };
+        let s = facet_json::to_string(&viewer).unwrap();
+        let back: Viewer3dPanelConfig = facet_json::from_str(&s).unwrap();
+        assert_eq!(back.models.len(), 1);
+        assert_eq!(back.models[0].label, "satellite");
+        assert_eq!(back.models[0].path, "sat.glb");
+        assert_eq!(back.models[0].position_binding, Some(ComponentId(7)));
+        assert_eq!(back.models[0].orientation_binding, None);
+        assert_eq!(back.camera.target_x, 1.0);
+        assert_eq!(back.camera.fov_y_rad, std::f32::consts::FRAC_PI_3);
+    }
 }
