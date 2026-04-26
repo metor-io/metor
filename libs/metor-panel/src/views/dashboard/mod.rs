@@ -519,15 +519,18 @@ fn component_picker_rows(
             Box::new(CommandRow::new(
                 SharedString::from(name),
                 Arc::new(move |_window, cx| {
-                    // Both the text and monitor builders accept the same
-                    // `{ component: String }` shape, so a single config type
-                    // suffices regardless of which kind the wizard was opened
-                    // for.
-                    let cfg = widgets::TextWidgetConfig {
-                        component: name_clone.clone(),
-                    };
-                    let config =
-                        facet_json::to_string(&cfg).expect("component widget config serializes");
+                    // Pick the kind-specific config struct so any future
+                    // divergence between the two doesn't silently lose the
+                    // user's component selection.
+                    let component = name_clone.clone();
+                    let config = if kind == WidgetKind::monitor() {
+                        let cfg = widgets::MonitorWidgetConfig { component };
+                        facet_json::to_string(&cfg)
+                    } else {
+                        let cfg = widgets::TextWidgetConfig { component };
+                        facet_json::to_string(&cfg)
+                    }
+                    .expect("component widget config serializes");
                     let kind = kind.clone();
                     dashboard.update(cx, |this, cx| {
                         this.add_widget(kind, config, cx);
@@ -699,11 +702,29 @@ pub struct DashboardPanelConfig {
 }
 
 impl DashboardPanel {
-    pub fn to_config(&self, _cx: &App) -> DashboardPanelConfig {
+    pub fn to_config(&self, cx: &App) -> DashboardPanelConfig {
+        // Refresh widget configs from live entities so inspector edits land
+        // on disk. Today only `plot` widgets diverge from their cached blob
+        // (the user can add/remove traces, edit overrides). The other kinds
+        // never mutate after construction so their cached config stays
+        // authoritative.
+        let widgets = self
+            .widgets
+            .iter()
+            .map(|w| {
+                let mut w = w.clone();
+                if let Some(entity) = self.widget_entities.get(&w.id) {
+                    if let Some(blob) = widgets::serialize_widget_state(&w.kind, entity, cx) {
+                        w.config = blob;
+                    }
+                }
+                w
+            })
+            .collect();
         DashboardPanelConfig {
             title: self.title.to_string(),
             next_id: self.next_id,
-            widgets: self.widgets.clone(),
+            widgets,
         }
     }
 }

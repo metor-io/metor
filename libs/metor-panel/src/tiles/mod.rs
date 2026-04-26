@@ -44,6 +44,40 @@ impl EventEmitter<TileGroupEvent> for TileGroup {}
 
 const RESIZE_HANDLE_SIZE: f32 = 1.0;
 
+/// Layout version this binary writes and accepts on read. Bump in lockstep
+/// with [`TileGroup::serialize`] when the document shape changes.
+const SUPPORTED_LAYOUT_VERSION: u32 = 1;
+
+/// Failure modes when loading a layout from JSON.
+#[derive(Debug)]
+pub enum LoadError {
+    /// `facet-json` couldn't parse the document.
+    Parse(facet_json::DeserializeError),
+    /// The document parsed but claims a layout version this binary doesn't
+    /// understand. The number is whatever the document carried.
+    UnsupportedVersion(u32),
+}
+
+impl std::fmt::Display for LoadError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Parse(e) => write!(f, "parse: {e}"),
+            Self::UnsupportedVersion(v) => write!(
+                f,
+                "unsupported layout version {v}; this build understands {SUPPORTED_LAYOUT_VERSION}"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for LoadError {}
+
+impl From<facet_json::DeserializeError> for LoadError {
+    fn from(e: facet_json::DeserializeError) -> Self {
+        Self::Parse(e)
+    }
+}
+
 /// A node in the split tree: a leaf [`Pane`] or an interior [`SplitAxis`].
 enum Member {
     Pane(Entity<Pane>),
@@ -430,7 +464,7 @@ impl TileGroup {
     /// persisted state) for saving to disk.
     pub fn serialize(&self, cx: &App) -> SerializedTileGroup {
         SerializedTileGroup {
-            version: 1,
+            version: SUPPORTED_LAYOUT_VERSION,
             root: self.root.serialize(cx),
         }
     }
@@ -451,8 +485,11 @@ impl TileGroup {
         json: &str,
         registry: &ItemRegistry,
         cx: &mut Context<Self>,
-    ) -> Result<Self, facet_json::DeserializeError> {
+    ) -> Result<Self, LoadError> {
         let serialized: SerializedTileGroup = facet_json::from_str(json)?;
+        if serialized.version != SUPPORTED_LAYOUT_VERSION {
+            return Err(LoadError::UnsupportedVersion(serialized.version));
+        }
         Ok(Self::deserialize(serialized, registry, cx))
     }
 
@@ -465,7 +502,7 @@ impl TileGroup {
         &mut self,
         json: &str,
         cx: &mut Context<Self>,
-    ) -> Result<(), facet_json::DeserializeError> {
+    ) -> Result<(), LoadError> {
         let registry = cx.global::<ItemRegistry>().clone();
         let new_self = Self::from_json(json, &registry, cx)?;
         *self = new_self;

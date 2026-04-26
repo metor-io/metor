@@ -18,28 +18,41 @@ use gpui::{App, Entity};
 
 use crate::tiles::TileGroup;
 
-/// Resolve (and create if missing) the per-user preset directory.
-pub fn presets_dir() -> io::Result<PathBuf> {
+/// Resolve the per-user preset directory path. Does **not** create it —
+/// list/read paths shouldn't materialize the directory just by being walked.
+fn presets_dir_path() -> io::Result<PathBuf> {
     let base = dirs::config_dir()
         .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "no config dir"))?;
-    let dir = base.join("metor").join("panel").join("presets");
+    Ok(base.join("metor").join("panel").join("presets"))
+}
+
+/// Resolve and create the per-user preset directory. Used by the write path.
+pub fn presets_dir() -> io::Result<PathBuf> {
+    let dir = presets_dir_path()?;
     fs::create_dir_all(&dir)?;
     Ok(dir)
 }
 
 /// Every `*.json` file in the preset directory, paired with its bare name
-/// (sans extension) for display.
+/// (sans extension) for display. The extension match is case-insensitive
+/// so files written elsewhere as `.JSON` still appear.
 pub fn list_presets() -> Vec<(String, PathBuf)> {
-    let Ok(dir) = presets_dir() else {
+    let Ok(dir) = presets_dir_path() else {
         return Vec::new();
     };
     let mut out = Vec::new();
+    // `read_dir` returns NotFound for a missing directory, so users who
+    // never saved a preset see an empty list without us touching disk.
     let Ok(entries) = fs::read_dir(&dir) else {
         return out;
     };
     for entry in entries.flatten() {
         let path = entry.path();
-        if path.extension() != Some(OsStr::new("json")) {
+        let is_json = path
+            .extension()
+            .and_then(OsStr::to_str)
+            .is_some_and(|ext| ext.eq_ignore_ascii_case("json"));
+        if !is_json {
             continue;
         }
         let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else {
@@ -64,7 +77,8 @@ pub fn save_preset(name: &str, json: &str) -> io::Result<PathBuf> {
         .chars()
         .map(|c| if matches!(c, '/' | '\\') { '_' } else { c })
         .collect();
-    let file_name = if safe.ends_with(".json") {
+    let already_has_ext = safe.len() >= 5 && safe[safe.len() - 5..].eq_ignore_ascii_case(".json");
+    let file_name = if already_has_ext {
         safe
     } else {
         format!("{safe}.json")

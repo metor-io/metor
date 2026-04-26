@@ -354,15 +354,22 @@ fn register_preset_provider(tiles: Entity<TileGroup>, cx: &mut App) {
                 rows.push(Box::new(CommandRow::new(
                     SharedString::new_static("Save to file…"),
                     Arc::new(move |_window, cx| {
-                        let json = tiles_for_file.read(cx).to_json(cx);
                         let initial_dir = dirs::home_dir().unwrap_or_else(std::env::temp_dir);
                         let receiver =
                             cx.prompt_for_new_path(&initial_dir, Some("metor-layout.json"));
-                        cx.spawn(async move |_cx| {
-                            if let Ok(Ok(Some(path))) = receiver.await {
-                                if let Err(e) = std::fs::write(&path, json) {
-                                    eprintln!("save preset to {}: {e}", path.display());
-                                }
+                        let tiles = tiles_for_file.clone();
+                        // Snapshot the layout *after* the user confirms the path,
+                        // so any in-flight edits land in the saved file.
+                        cx.spawn(async move |cx| {
+                            let Ok(Ok(Some(path))) = receiver.await else {
+                                return;
+                            };
+                            let json = match cx.update(|cx| tiles.read(cx).to_json(cx)) {
+                                Ok(j) => j,
+                                Err(_) => return,
+                            };
+                            if let Err(e) = std::fs::write(&path, json) {
+                                eprintln!("save preset to {}: {e}", path.display());
                             }
                         })
                         .detach();

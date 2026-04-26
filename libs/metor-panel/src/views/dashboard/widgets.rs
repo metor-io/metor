@@ -14,6 +14,8 @@ use image::{Frame, ImageBuffer, Rgba};
 use metor_db::DB;
 use smallvec::SmallVec;
 
+use crate::tiles::panels::{PlotPanelConfig, TraceConfig};
+use crate::views::time_series::{LinePlot, Override, Trace};
 use crate::views::viewer_3d::Viewer3d;
 use crate::views::{ComponentText, Monitor, TimeSeriesPlot, new_component_table};
 use crate::theme::theme;
@@ -174,6 +176,55 @@ fn placeholder_spec(kind: &WidgetKind) -> Arc<WidgetSpec> {
     })
 }
 
+/// Snapshot a live widget's editable state into a fresh facet-json blob.
+///
+/// Returns `None` for widget kinds whose persisted config never changes
+/// after construction (text, image, monitor, table, viewer3d) — the cached
+/// blob on `DashboardWidget.config` already reflects everything they own,
+/// so the dashboard's `to_config` keeps it as-is.
+///
+/// `plot` is the only kind whose state diverges over time: the user adds
+/// or removes traces, edits overrides, etc. — so we re-serialize from the
+/// inspectable [`LinePlot`] entity at save time.
+pub fn serialize_widget_state(
+    kind: &WidgetKind,
+    entity: &gpui::AnyEntity,
+    cx: &App,
+) -> Option<String> {
+    if *kind != WidgetKind::plot() {
+        return None;
+    }
+    let plot = entity.clone().downcast::<LinePlot>().ok()?;
+    let lp = plot.read(cx);
+    let traces: Vec<TraceConfig> = lp
+        .traces()
+        .iter()
+        .map(|t| {
+            let t = t.read(cx);
+            TraceConfig {
+                component_id: t.component_id,
+                element_index: t.element_index,
+                color: t.color,
+                style: t.style,
+                visible: t.visible,
+                label: t.label.to_string(),
+                stroke_width: t.stroke_width,
+            }
+        })
+        .collect();
+    let cfg = PlotPanelConfig {
+        label: String::new(),
+        traces,
+        custom_title: match &lp.custom_title {
+            Override::Auto => Override::Auto,
+            Override::Custom(s) => Override::Custom(s.to_string()),
+        },
+        y_min_override: lp.y_min_override.clone(),
+        y_max_override: lp.y_max_override.clone(),
+    };
+    facet_json::to_string(&cfg).ok()
+}
+
 /// Build the rendered view and its inspectable entity for a stored widget.
 pub(super) fn create_widget_view(
     kind: &WidgetKind,
@@ -199,11 +250,34 @@ fn lookup_component(db: &Arc<DB>, name: &str) -> Option<metor_proto::types::Comp
     })
 }
 
-fn build_plot(_config: &str, db: &Arc<DB>, cx: &mut App) -> (AnyView, gpui::AnyEntity) {
+fn build_plot(config: &str, db: &Arc<DB>, cx: &mut App) -> (AnyView, gpui::AnyEntity) {
     // Only LinePlot has Facet adapters, so expose it — not the outer
     // TimeSeriesPlot — as the inspectable entity.
-    let plot = cx.new(|cx| TimeSeriesPlot::new(db.clone(), vec![], cx));
+    let cfg = parse_or_default::<PlotPanelConfig>(config);
+    let traces: Vec<Trace> = cfg
+        .traces
+        .into_iter()
+        .map(|t| Trace {
+            component_id: t.component_id,
+            element_index: t.element_index,
+            color: t.color,
+            style: t.style,
+            visible: t.visible,
+            label: t.label.into(),
+            stroke_width: t.stroke_width,
+        })
+        .collect();
+    let plot = cx.new(|cx| TimeSeriesPlot::new(db.clone(), traces, cx));
     let line_plot = plot.read(cx).line_plot().clone();
+    line_plot.update(cx, |lp, cx| {
+        lp.custom_title = match cfg.custom_title {
+            Override::Auto => Override::Auto,
+            Override::Custom(s) => Override::Custom(s.into()),
+        };
+        lp.y_min_override = cfg.y_min_override;
+        lp.y_max_override = cfg.y_max_override;
+        cx.notify();
+    });
     (AnyView::from(plot), line_plot.into_any())
 }
 

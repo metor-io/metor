@@ -5,7 +5,7 @@ use metor_db::DB;
 use metor_proto::types::ComponentId;
 
 use crate::views::dashboard::DashboardPanel;
-use crate::views::time_series::{LinePlot, PlotStyle, Trace};
+use crate::views::time_series::{LinePlot, Override, PlotStyle, Trace};
 use crate::views::viewer_3d::Viewer3d;
 use crate::views::{
     ComponentBrowser, ComponentTable, ComponentText, DataTable, TimeSeriesPlot,
@@ -65,9 +65,10 @@ impl TextPanel {
 
     /// Rebuild a [`TextPanel`] from its persisted config.
     ///
-    /// Resolves the component by name through the DB; falls back to a stub
-    /// pointing at the first registered component (or `ComponentId(0)` if
-    /// none exists yet) so the layout still renders against an empty DB.
+    /// Resolves the component by name through the DB; falls back to the
+    /// invalid sentinel `ComponentId(0)` when the name is unknown so the
+    /// panel still loads (it'll just render nothing) instead of dropping
+    /// the whole layout.
     pub fn from_config(cfg: TextPanelConfig, db: Arc<DB>, cx: &mut Context<Self>) -> Self {
         let component_id = lookup_component_by_name(&db, &cfg.component).unwrap_or(ComponentId(0));
         Self::new(db, component_id, cfg.component, cx)
@@ -289,10 +290,18 @@ impl Render for PlotPanel {
 }
 
 /// Persisted shape of a [`PlotPanel`].
+///
+/// `x_range` is intentionally absent: `TimeRangeBehavior::Offset` carries
+/// `std::time::Duration`/`Timestamp` variants that aren't `Facet` yet, so it
+/// can't round-trip through `facet-json` without a parallel config struct.
+/// Adding it is a follow-up.
 #[derive(facet::Facet, Default)]
 pub struct PlotPanelConfig {
     pub label: String,
     pub traces: Vec<TraceConfig>,
+    pub custom_title: Override<String>,
+    pub y_min_override: Override<f64>,
+    pub y_max_override: Override<f64>,
 }
 
 /// Persisted shape of one [`Trace`].
@@ -328,9 +337,8 @@ impl Default for TraceConfig {
 
 impl PlotPanel {
     pub fn to_config(&self, cx: &App) -> PlotPanelConfig {
-        let traces = self
-            .line_plot
-            .read(cx)
+        let line_plot = self.line_plot.read(cx);
+        let traces = line_plot
             .traces()
             .iter()
             .map(|t| {
@@ -349,11 +357,17 @@ impl PlotPanel {
         PlotPanelConfig {
             label: self.tab_title(cx).to_string(),
             traces,
+            custom_title: match &line_plot.custom_title {
+                Override::Auto => Override::Auto,
+                Override::Custom(s) => Override::Custom(s.to_string()),
+            },
+            y_min_override: line_plot.y_min_override.clone(),
+            y_max_override: line_plot.y_max_override.clone(),
         }
     }
 
     pub fn from_config(cfg: PlotPanelConfig, db: Arc<DB>, cx: &mut Context<Self>) -> Self {
-        let traces = cfg
+        let traces: Vec<Trace> = cfg
             .traces
             .into_iter()
             .map(|t| Trace {
@@ -366,7 +380,18 @@ impl PlotPanel {
                 stroke_width: t.stroke_width,
             })
             .collect();
-        Self::with_traces(db, traces, cx)
+        let panel = Self::with_traces(db, traces, cx);
+        let line_plot = panel.line_plot.clone();
+        line_plot.update(cx, |lp, cx| {
+            lp.custom_title = match cfg.custom_title {
+                Override::Auto => Override::Auto,
+                Override::Custom(s) => Override::Custom(s.into()),
+            };
+            lp.y_min_override = cfg.y_min_override;
+            lp.y_max_override = cfg.y_max_override;
+            cx.notify();
+        });
+        panel
     }
 }
 
@@ -411,7 +436,7 @@ pub struct ModelConfig {
 ///
 /// `glam::Vec3` is not `Facet`, so the target is unpacked into three fields
 /// at the persistence boundary.
-#[derive(facet::Facet, Default)]
+#[derive(facet::Facet)]
 pub struct CameraConfig {
     pub target_x: f32,
     pub target_y: f32,
@@ -420,6 +445,25 @@ pub struct CameraConfig {
     pub pitch: f32,
     pub distance: f32,
     pub fov_y_rad: f32,
+}
+
+impl Default for CameraConfig {
+    /// Mirror [`crate::views::viewer_3d::OrbitCamera::default`] so a parse
+    /// failure that falls back to `Default` still yields a usable camera.
+    /// The auto-derived all-zero default would render nothing
+    /// (`fov_y_rad == 0` collapses the projection matrix).
+    fn default() -> Self {
+        let cam = crate::views::viewer_3d::OrbitCamera::default();
+        Self {
+            target_x: cam.target.x,
+            target_y: cam.target.y,
+            target_z: cam.target.z,
+            yaw: cam.yaw,
+            pitch: cam.pitch,
+            distance: cam.distance,
+            fov_y_rad: cam.fov_y_rad,
+        }
+    }
 }
 
 /// Pane item hosting the Bevy-backed 3D viewer.
@@ -724,6 +768,9 @@ mod tests {
                 label: "vx".into(),
                 stroke_width: 2.0,
             }],
+            custom_title: Override::Custom("My View".into()),
+            y_min_override: Override::Custom(-10.0),
+            y_max_override: Override::Auto,
         };
         let s = facet_json::to_string(&plot).unwrap();
         let back: PlotPanelConfig = facet_json::from_str(&s).unwrap();
@@ -732,6 +779,9 @@ mod tests {
         assert_eq!(back.traces[0].component_id, ComponentId(3));
         assert_eq!(back.traces[0].element_index, 1);
         assert_eq!(back.traces[0].label, "vx");
+        assert!(matches!(back.custom_title, Override::Custom(s) if s == "My View"));
+        assert!(matches!(back.y_min_override, Override::Custom(v) if (v + 10.0).abs() < 1e-9));
+        assert!(matches!(back.y_max_override, Override::Auto));
 
         let viewer = Viewer3dPanelConfig {
             models: vec![ModelConfig {

@@ -66,4 +66,4 @@ replace_with.optional = true
 hifitime.version = "4.0"
 hifitime.optional = true
 
-facet = { git = "https://github.com/metor-io/facet.git", branch = "sphw/facet-gpui", optional = true, default-features = false }
+facet = { version = "0.44.3", optional = true, default-features = false }
