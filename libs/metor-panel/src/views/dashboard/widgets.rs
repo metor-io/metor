@@ -241,15 +241,6 @@ fn as_view_and_entity<T: Render + 'static>(e: Entity<T>) -> (AnyView, gpui::AnyE
     (AnyView::from(e), any)
 }
 
-fn lookup_component(db: &Arc<DB>, name: &str) -> Option<metor_proto::types::ComponentId> {
-    db.with_state(|state| {
-        state
-            .component_metadata_iter()
-            .find(|(_, meta)| meta.name == name)
-            .map(|(id, _)| *id)
-    })
-}
-
 fn build_plot(config: &str, db: &Arc<DB>, cx: &mut App) -> (AnyView, gpui::AnyEntity) {
     // Only LinePlot has Facet adapters, so expose it — not the outer
     // TimeSeriesPlot — as the inspectable entity.
@@ -283,13 +274,13 @@ fn build_plot(config: &str, db: &Arc<DB>, cx: &mut App) -> (AnyView, gpui::AnyEn
 
 fn build_text(config: &str, db: &Arc<DB>, cx: &mut App) -> (AnyView, gpui::AnyEntity) {
     let cfg = parse_or_default::<TextWidgetConfig>(config);
-    if let Some(id) = lookup_component(db, &cfg.component) {
-        as_view_and_entity(cx.new(|cx| ComponentText::new(db.clone(), id, cx)))
-    } else {
-        as_view_and_entity(cx.new(|_cx| PlaceholderWidget {
-            label: SharedString::from(format!("? {}", cfg.component)),
-        }))
+    if cfg.component.is_empty() {
+        return as_view_and_entity(cx.new(|_cx| PlaceholderWidget {
+            label: SharedString::new_static("?"),
+        }));
     }
+    let id = metor_proto::types::ComponentId::new(&cfg.component);
+    as_view_and_entity(cx.new(|cx| ComponentText::new(db.clone(), id, cx)))
 }
 
 fn build_table(_config: &str, db: &Arc<DB>, cx: &mut App) -> (AnyView, gpui::AnyEntity) {
@@ -303,13 +294,13 @@ fn build_image(config: &str, _db: &Arc<DB>, cx: &mut App) -> (AnyView, gpui::Any
 
 fn build_monitor(config: &str, db: &Arc<DB>, cx: &mut App) -> (AnyView, gpui::AnyEntity) {
     let cfg = parse_or_default::<MonitorWidgetConfig>(config);
-    if let Some(id) = lookup_component(db, &cfg.component) {
-        as_view_and_entity(cx.new(|cx| Monitor::new(db.clone(), id, cx)))
-    } else {
-        as_view_and_entity(cx.new(|_cx| PlaceholderWidget {
-            label: SharedString::from(format!("? {}", cfg.component)),
-        }))
+    if cfg.component.is_empty() {
+        return as_view_and_entity(cx.new(|_cx| PlaceholderWidget {
+            label: SharedString::new_static("?"),
+        }));
     }
+    let id = metor_proto::types::ComponentId::new(&cfg.component);
+    as_view_and_entity(cx.new(|cx| Monitor::new(db.clone(), id, cx)))
 }
 
 fn build_viewer3d(_config: &str, db: &Arc<DB>, cx: &mut App) -> (AnyView, gpui::AnyEntity) {

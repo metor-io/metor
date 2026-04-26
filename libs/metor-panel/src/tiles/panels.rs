@@ -18,18 +18,6 @@ use crate::inspector::rows::{CommandRow, InspectorRow, NavRow};
 use super::item::{PaneItem, PaneItemHandle};
 use super::pane::Pane;
 
-/// Resolve a component by display name. Returns `None` when the DB has no
-/// such component yet — callers fall back to a stub binding so saved layouts
-/// still load against an empty DB.
-fn lookup_component_by_name(db: &Arc<DB>, name: &str) -> Option<ComponentId> {
-    db.with_state(|state| {
-        state
-            .component_metadata_iter()
-            .find(|(_, meta)| meta.name == name)
-            .map(|(id, _)| *id)
-    })
-}
-
 /// Persisted shape of a [`TextPanel`].
 #[derive(facet::Facet, Default)]
 pub struct TextPanelConfig {
@@ -63,14 +51,8 @@ impl TextPanel {
         }
     }
 
-    /// Rebuild a [`TextPanel`] from its persisted config.
-    ///
-    /// Resolves the component by name through the DB; falls back to the
-    /// invalid sentinel `ComponentId(0)` when the name is unknown so the
-    /// panel still loads (it'll just render nothing) instead of dropping
-    /// the whole layout.
     pub fn from_config(cfg: TextPanelConfig, db: Arc<DB>, cx: &mut Context<Self>) -> Self {
-        let component_id = lookup_component_by_name(&db, &cfg.component).unwrap_or(ComponentId(0));
+        let component_id = ComponentId::new(&cfg.component);
         Self::new(db, component_id, cfg.component, cx)
     }
 }
