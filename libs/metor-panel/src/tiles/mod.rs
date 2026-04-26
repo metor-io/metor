@@ -17,7 +17,7 @@ use serial::{SerializedItem, SerializedMember, SerializedPane, SerializedSplit};
 
 pub use drag::SplitDirection;
 pub use item::{PaneItem, PaneItemHandle};
-pub use pane::{Pane, PaneEvent, PlotComponentAction};
+pub use pane::{Pane, PaneEvent, PlotComponentAction, TabOrientation};
 pub use serial::{ItemRegistry, SerializedTileGroup};
 
 /// Sequence of member indices locating a node in the split tree.
@@ -32,6 +32,10 @@ pub enum TileGroupEvent {
     /// The position marks where to anchor the inspector.
     Inspect {
         item: Box<dyn PaneItemHandle>,
+        position: Point<Pixels>,
+    },
+    InspectPane {
+        pane: Entity<Pane>,
         position: Point<Pixels>,
     },
 }
@@ -172,6 +176,9 @@ impl Member {
                 SerializedMember::Pane(SerializedPane {
                     active_index: pane.active_index(),
                     items,
+                    tab_orientation: pane.tab_orientation(),
+                    hide_tab_bar: pane.hide_tab_bar(),
+                    locked_size: pane.locked_size().map(|s| (s.width, s.height)),
                 })
             }
             Member::Axis(axis) => SerializedMember::Split(SerializedSplit {
@@ -201,9 +208,15 @@ impl Member {
 
                 for (ix, member) in axis.members.iter().enumerate() {
                     if ix > 0 {
-                        let handle =
-                            render_resize_handle(path.clone(), ix, axis.axis, tile_group, cx);
-                        children.push(handle.into_any_element());
+                        let prev_locked = locked_along_axis(&axis.members[ix - 1], axis.axis, cx);
+                        let cur_locked = locked_along_axis(member, axis.axis, cx);
+                        let handle = if prev_locked.is_some() || cur_locked.is_some() {
+                            render_static_resize_handle(axis.axis, cx).into_any_element()
+                        } else {
+                            render_resize_handle(path.clone(), ix, axis.axis, tile_group, cx)
+                                .into_any_element()
+                        };
+                        children.push(handle);
                     }
 
                     let flex = axis.flexes[ix];
@@ -211,6 +224,7 @@ impl Member {
                     child_path.push(ix);
 
                     let child_element = member.render(child_path, tile_group, window, cx);
+                    let locked_px = locked_along_axis(member, axis.axis, cx);
 
                     let mut child_div = div()
                         .flex_basis(relative(0.))
@@ -220,8 +234,16 @@ impl Member {
                         .child(child_element);
                     {
                         let style = child_div.style();
-                        style.flex_grow = Some(flex);
-                        style.flex_shrink = Some(flex);
+                        if let Some(px_val) = locked_px {
+                            style.flex_grow = Some(0.0);
+                            style.flex_shrink = Some(0.0);
+                            style.flex_basis = Some(gpui::Length::Definite(px(px_val).into()));
+                            style.min_size.width = Some(px(0.).into());
+                            style.min_size.height = Some(px(0.).into());
+                        } else {
+                            style.flex_grow = Some(flex);
+                            style.flex_shrink = Some(flex);
+                        }
                     }
                     children.push(child_div.into_any_element());
                 }
@@ -249,6 +271,32 @@ impl Member {
             }
         }
     }
+}
+
+/// Returns the locked-size pixel value of `member` along `axis`, or `None`
+/// if the member is unlocked or is a sub-axis (only panes can lock).
+fn locked_along_axis(member: &Member, axis: Axis, cx: &App) -> Option<f32> {
+    match member {
+        Member::Pane(pane) => pane.read(cx).locked_size().map(|s| match axis {
+            Axis::Horizontal => s.width,
+            Axis::Vertical => s.height,
+        }),
+        Member::Axis(_) => None,
+    }
+}
+
+/// Static placeholder rendered in place of a draggable resize handle when one
+/// of its neighbors is a locked pane. Same on-screen size as the live handle
+/// so layout doesn't shift when locking is toggled.
+fn render_static_resize_handle(axis: Axis, cx: &App) -> impl IntoElement {
+    let theme = theme(cx);
+    let mut handle = div().bg(theme.border_primary);
+    handle = match axis {
+        Axis::Horizontal => handle.w(px(RESIZE_HANDLE_SIZE)).h_full(),
+        Axis::Vertical => handle.w_full().h(px(RESIZE_HANDLE_SIZE)),
+    };
+    handle.style().flex_shrink = Some(0.);
+    handle
 }
 
 fn render_resize_handle(
@@ -425,6 +473,12 @@ impl TileGroup {
                     if sp.active_index < pane.items().len() {
                         pane.activate_item(sp.active_index, cx);
                     }
+                    pane.set_tab_orientation(sp.tab_orientation, cx);
+                    pane.set_hide_tab_bar(sp.hide_tab_bar, cx);
+                    pane.set_locked_size(
+                        sp.locked_size.map(|(w, h)| gpui::Size { width: w, height: h }),
+                        cx,
+                    );
                     pane
                 });
                 panes.push(pane.clone());
@@ -460,6 +514,12 @@ impl TileGroup {
             PaneEvent::Inspect { item, position } => {
                 cx.emit(TileGroupEvent::Inspect {
                     item: item.clone_handle(),
+                    position: *position,
+                });
+            }
+            PaneEvent::InspectPane { position } => {
+                cx.emit(TileGroupEvent::InspectPane {
+                    pane: pane.clone(),
                     position: *position,
                 });
             }

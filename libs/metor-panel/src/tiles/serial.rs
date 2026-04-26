@@ -4,6 +4,7 @@ use gpui::{Context, Entity};
 use serde::{Deserialize, Serialize};
 
 use super::item::{PaneItem, PaneItemHandle};
+use super::pane::TabOrientation;
 
 /// On-disk form of a tile layout.
 #[derive(Serialize, Deserialize)]
@@ -56,6 +57,12 @@ impl From<SerializedAxis> for gpui::Axis {
 pub struct SerializedPane {
     pub active_index: usize,
     pub items: Vec<SerializedItem>,
+    #[serde(default)]
+    pub tab_orientation: TabOrientation,
+    #[serde(default)]
+    pub hide_tab_bar: bool,
+    #[serde(default)]
+    pub locked_size: Option<(f32, f32)>,
 }
 
 /// Persisted pane item, tagged with the [`PaneItem::serialization_key`] used

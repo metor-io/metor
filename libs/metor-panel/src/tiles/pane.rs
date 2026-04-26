@@ -1,6 +1,6 @@
 use gpui::{
     AnyElement, App, Bounds, Context, DragMoveEvent, EventEmitter, IntoElement, MouseButton,
-    Pixels, Point, Render, Window, div, prelude::*, px,
+    Pixels, Point, Render, ScrollHandle, Window, div, prelude::*, px,
 };
 use metor_proto::types::ComponentId;
 use smallvec::SmallVec;
@@ -25,6 +25,14 @@ pub struct PlotComponentAction {
 
 const TAB_HEIGHT: f32 = 28.0;
 const TAB_CLOSE_SIZE: f32 = 16.0;
+const TAB_RAIL_WIDTH: f32 = 160.0;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+pub enum TabOrientation {
+    #[default]
+    Horizontal,
+    Vertical,
+}
 
 /// Messages a pane sends to the [`TileGroup`](super::TileGroup) that owns it.
 ///
@@ -44,6 +52,7 @@ pub enum PaneEvent {
         item: Box<dyn PaneItemHandle>,
         position: Point<Pixels>,
     },
+    InspectPane { position: Point<Pixels> },
 }
 
 impl EventEmitter<PaneEvent> for Pane {}
@@ -58,6 +67,10 @@ pub struct Pane {
     active_index: usize,
     drag_split_direction: Option<SplitDirection>,
     content_bounds: Bounds<Pixels>,
+    tab_scroll: ScrollHandle,
+    tab_orientation: TabOrientation,
+    hide_tab_bar: bool,
+    locked_size: Option<gpui::Size<f32>>,
 }
 
 impl Pane {
@@ -67,7 +80,54 @@ impl Pane {
             active_index: 0,
             drag_split_direction: None,
             content_bounds: Bounds::default(),
+            tab_scroll: ScrollHandle::new(),
+            tab_orientation: TabOrientation::default(),
+            hide_tab_bar: false,
+            locked_size: None,
         }
+    }
+
+    pub fn tab_orientation(&self) -> TabOrientation {
+        self.tab_orientation
+    }
+
+    pub fn set_tab_orientation(&mut self, orientation: TabOrientation, cx: &mut Context<Self>) {
+        self.tab_orientation = orientation;
+        cx.notify();
+    }
+
+    pub fn hide_tab_bar(&self) -> bool {
+        self.hide_tab_bar
+    }
+
+    pub fn set_hide_tab_bar(&mut self, hide: bool, cx: &mut Context<Self>) {
+        self.hide_tab_bar = hide;
+        cx.notify();
+    }
+
+    pub fn locked_size(&self) -> Option<gpui::Size<f32>> {
+        self.locked_size
+    }
+
+    /// Outer pane size = content bounds plus the tab strip (when shown).
+    /// Used by the inspector toggle to capture "lock at the current size".
+    pub fn current_outer_size(&self) -> gpui::Size<f32> {
+        let mut size = gpui::Size {
+            width: self.content_bounds.size.width.into(),
+            height: self.content_bounds.size.height.into(),
+        };
+        if !self.hide_tab_bar {
+            match self.tab_orientation {
+                TabOrientation::Horizontal => size.height += TAB_HEIGHT,
+                TabOrientation::Vertical => size.width += TAB_RAIL_WIDTH,
+            }
+        }
+        size
+    }
+
+    pub fn set_locked_size(&mut self, size: Option<gpui::Size<f32>>, cx: &mut Context<Self>) {
+        self.locked_size = size;
+        cx.notify();
     }
 
     pub fn items(&self) -> &[Box<dyn PaneItemHandle>] {
@@ -210,6 +270,7 @@ impl Pane {
     fn render_tab(
         &self,
         ix: usize,
+        orientation: TabOrientation,
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
@@ -237,8 +298,12 @@ impl Pane {
             .h(px(TAB_HEIGHT))
             .text_size(px(12.0))
             .cursor_pointer()
-            .border_r_1()
             .border_color(border_primary);
+
+        tab = match orientation {
+            TabOrientation::Horizontal => tab.border_r_1(),
+            TabOrientation::Vertical => tab.w_full().justify_between().border_b_1(),
+        };
 
         if is_active {
             tab = tab.bg(bg_primary).text_color(text_primary);
@@ -346,34 +411,60 @@ impl Pane {
 impl Render for Pane {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = theme(cx);
-        let mut tab_bar = div()
-            .flex()
-            .flex_row()
-            .w_full()
-            .h(px(TAB_HEIGHT))
-            .bg(theme.bg_secondary)
-            .border_b_1()
-            .border_color(theme.border_primary)
-            .overflow_x_hidden();
-
+        let orientation = self.tab_orientation;
         let tab_count = self.items.len();
-        for ix in 0..tab_count {
-            tab_bar = tab_bar.child(self.render_tab(ix, window, cx));
-        }
 
-        tab_bar = tab_bar.child(
-            div()
+        let tab_bar = (!self.hide_tab_bar).then(|| {
+            let mut tab_bar = div()
+                .id("pane-tab-bar")
+                .flex()
+                .bg(theme.bg_secondary)
+                .border_color(theme.border_primary)
+                .track_scroll(&self.tab_scroll);
+            tab_bar = match orientation {
+                TabOrientation::Horizontal => tab_bar
+                    .flex_row()
+                    .w_full()
+                    .h(px(TAB_HEIGHT))
+                    .border_b_1()
+                    .overflow_x_scroll(),
+                TabOrientation::Vertical => tab_bar
+                    .flex_col()
+                    .h_full()
+                    .w(px(TAB_RAIL_WIDTH))
+                    .border_r_1()
+                    .overflow_y_scroll(),
+            };
+            tab_bar.style().restrict_scroll_to_axis = Some(true);
+
+            for ix in 0..tab_count {
+                tab_bar = tab_bar.child(self.render_tab(ix, orientation, window, cx));
+            }
+
+            let mut drop_zone = div()
                 .id("tab-bar-drop-zone")
                 .flex_1()
-                .h_full()
                 .on_drop(cx.listener(move |this, dragged: &DraggedTab, window, cx| {
                     this.handle_tab_bar_drop(dragged, tab_count, window, cx);
                 }))
                 .drag_over::<DraggedTab>({
                     let border = theme.border_primary;
                     move |style, _, _, _| style.bg(border)
-                }),
-        );
+                })
+                .on_mouse_down(
+                    MouseButton::Right,
+                    cx.listener(move |_this, event: &gpui::MouseDownEvent, _window, cx| {
+                        cx.emit(PaneEvent::InspectPane {
+                            position: event.position,
+                        });
+                    }),
+                );
+            drop_zone = match orientation {
+                TabOrientation::Horizontal => drop_zone.h_full(),
+                TabOrientation::Vertical => drop_zone.w_full(),
+            };
+            tab_bar.child(drop_zone)
+        });
 
         let view = cx.entity().clone();
         let content_bounds_tracker = gpui::canvas(
@@ -412,11 +503,14 @@ impl Render for Pane {
             content = content.child(overlay);
         }
 
-        div()
-            .flex()
-            .flex_col()
-            .size_full()
-            .child(tab_bar)
-            .child(content)
+        let mut outer = div().flex().size_full();
+        outer = match orientation {
+            TabOrientation::Horizontal => outer.flex_col(),
+            TabOrientation::Vertical => outer.flex_row(),
+        };
+        if let Some(tab_bar) = tab_bar {
+            outer = outer.child(tab_bar);
+        }
+        outer.child(content)
     }
 }
