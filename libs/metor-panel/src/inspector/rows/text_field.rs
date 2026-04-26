@@ -132,11 +132,11 @@ impl TextField {
     }
 
     fn paste(&mut self, cx: &mut App) {
-        if let Some(item) = cx.read_from_clipboard() {
-            if let Some(text) = item.text() {
-                let text = text.replace('\n', "");
-                self.insert_text(&text);
-            }
+        if let Some(item) = cx.read_from_clipboard()
+            && let Some(text) = item.text()
+        {
+            let text = text.replace('\n', "");
+            self.insert_text(&text);
         }
     }
 
@@ -296,11 +296,12 @@ impl TextField {
                 true
             }
             _ => {
-                if let Some(ch) = &event.keystroke.key_char {
-                    if !mods.control && !mods.alt {
-                        self.insert_text(ch);
-                        return true;
-                    }
+                if let Some(ch) = &event.keystroke.key_char
+                    && !mods.control
+                    && !mods.alt
+                {
+                    self.insert_text(ch);
+                    return true;
                 }
                 false
             }

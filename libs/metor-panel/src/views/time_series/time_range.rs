@@ -116,11 +116,7 @@ impl TimeRangeBehavior {
 fn clamp_range(full: Range<Timestamp>, requested: Range<Timestamp>) -> Range<Timestamp> {
     let start = requested.start.max(full.start);
     let end = requested.end.min(full.end);
-    if start >= end {
-        full
-    } else {
-        start..end
-    }
+    if start >= end { full } else { start..end }
 }
 
 peg::parser! {
@@ -161,7 +157,7 @@ impl FromStr for Offset {
 
 fn span_to_duration(span: jiff::Span) -> Result<Duration, jiff::Error> {
     Ok(Duration::from_nanos(
-        span.total(jiff::Unit::Nanosecond)? as u64,
+        span.total(jiff::Unit::Nanosecond)? as u64
     ))
 }
 

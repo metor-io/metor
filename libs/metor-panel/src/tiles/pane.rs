@@ -27,7 +27,8 @@ const TAB_HEIGHT: f32 = 28.0;
 const TAB_CLOSE_SIZE: f32 = 16.0;
 const TAB_RAIL_WIDTH: f32 = 160.0;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default, facet::Facet)]
+#[repr(u8)]
 pub enum TabOrientation {
     #[default]
     Horizontal,
@@ -52,7 +53,9 @@ pub enum PaneEvent {
         item: Box<dyn PaneItemHandle>,
         position: Point<Pixels>,
     },
-    InspectPane { position: Point<Pixels> },
+    InspectPane {
+        position: Point<Pixels>,
+    },
 }
 
 impl EventEmitter<PaneEvent> for Pane {}

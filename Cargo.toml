@@ -58,6 +58,7 @@ inherits = "release"
 lto = "thin"
 
 [workspace.dependencies]
+dirs = "5"
 metor-fsw-macros.path = "libs/metor-fsw/macros"
 metor-fsw.path = "libs/metor-fsw"
 metor-fsw.default-features = false
@@ -70,3 +71,17 @@ wmm.path = "libs/wmm"
 [profile.release-with-debug]
 inherits = "release"
 debug = true
+
+# Route the published facet crates through our fork so the gpui Entity/Hsla/SharedString
+# impls and the inspect attribute grammar are present everywhere — including in
+# transitive deps like facet-json/facet-format that pull facet from crates.io.
+[patch.crates-io]
+facet = { git = "https://github.com/metor-io/facet.git", branch = "sphw/facet-gpui" }
+facet-core = { git = "https://github.com/metor-io/facet.git", branch = "sphw/facet-gpui" }
+facet-reflect = { git = "https://github.com/metor-io/facet.git", branch = "sphw/facet-gpui" }
+facet-macros = { git = "https://github.com/metor-io/facet.git", branch = "sphw/facet-gpui" }
+facet-macros-impl = { git = "https://github.com/metor-io/facet.git", branch = "sphw/facet-gpui" }
+facet-macro-parse = { git = "https://github.com/metor-io/facet.git", branch = "sphw/facet-gpui" }
+facet-macro-types = { git = "https://github.com/metor-io/facet.git", branch = "sphw/facet-gpui" }
+facet-path = { git = "https://github.com/metor-io/facet.git", branch = "sphw/facet-gpui" }
+facet-solver = { git = "https://github.com/metor-io/facet.git", branch = "sphw/facet-gpui" }

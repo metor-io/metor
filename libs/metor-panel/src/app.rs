@@ -3,11 +3,16 @@
 use std::sync::Arc;
 
 use crate::inspector::Inspector;
-use crate::inspector::{InspectorMode, InspectorRequest, OpenInspectorGlobal};
+use crate::inspector::edits::{
+    self, edit_value_rows, pending_edits, pending_edits_mut, review_rows,
+};
 use crate::inspector::palette::ItemRegistry;
-use crate::inspector::edits::{self, edit_value_rows, pending_edits, pending_edits_mut, review_rows};
+use crate::inspector::{InspectorMode, InspectorRequest, OpenInspectorGlobal};
+use crate::tiles::panels::{
+    BrowserPanel, DataTablePanel, PlotPanel, TablePanel, TextPanel, Viewer3dPanel,
+};
 use crate::tiles::{PlotComponentAction, TileGroup, TileGroupEvent};
-use crate::tiles::panels::PlotPanel;
+use crate::views::dashboard::{DashboardPanel, deserialize_dashboard};
 use gpui::{
     App, Application, Bounds, Context, Entity, FocusHandle, Focusable, IntoElement, KeyBinding,
     Pixels, Point, Render, SharedString, TitlebarOptions, Window, WindowBounds, WindowOptions,
@@ -50,7 +55,12 @@ impl AppRoot {
         cx.subscribe(&tiles, Self::handle_tile_event).detach();
         let on_open_inspector = Self::make_on_open_inspector(cx.entity().clone());
         cx.set_global(OpenInspectorGlobal(on_open_inspector.clone()));
-        crate::inspector::palette::register_builtin_providers(db.clone(), tiles.clone(), on_open_inspector, cx);
+        crate::inspector::palette::register_builtin_providers(
+            db.clone(),
+            tiles.clone(),
+            on_open_inspector,
+            cx,
+        );
         Self {
             db,
             tiles,
@@ -90,13 +100,13 @@ impl AppRoot {
     }
 
     fn toggle_palette(&mut self, _: &OpenPalette, window: &mut Window, cx: &mut Context<Self>) {
-        if let Some(inspector) = &self.inspector {
-            if !inspector.read(cx).dismissed {
-                self.inspector = None;
-                self.focus_handle.focus(window);
-                cx.notify();
-                return;
-            }
+        if let Some(inspector) = &self.inspector
+            && !inspector.read(cx).dismissed
+        {
+            self.inspector = None;
+            self.focus_handle.focus(window);
+            cx.notify();
+            return;
         }
 
         let rows = ItemRegistry::root_rows(&self.db, cx);
@@ -226,11 +236,11 @@ impl Focusable for AppRoot {
 
 impl Render for AppRoot {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        if let Some(inspector) = &self.inspector {
-            if inspector.read(cx).dismissed {
-                self.inspector = None;
-                self.focus_handle.focus(window);
-            }
+        if let Some(inspector) = &self.inspector
+            && inspector.read(cx).dismissed
+        {
+            self.inspector = None;
+            self.focus_handle.focus(window);
         }
 
         if let Some((item, position)) = self.pending_inspector_request.take() {
@@ -383,6 +393,7 @@ pub fn run(db: Arc<metor_db::DB>) {
             ItemRegistry::init(cx);
             crate::inspector::registry::InspectorRegistry::init(db.clone(), cx);
             crate::views::dashboard::WidgetRegistry::init(cx);
+            register_pane_item_deserializers(db.clone(), cx);
             set_dock_icon();
             cx.bind_keys([
                 KeyBinding::new("cmd-p", OpenPalette, None),
@@ -408,6 +419,48 @@ pub fn run(db: Arc<metor_db::DB>) {
             )
             .unwrap();
         });
+}
+
+/// Populate the pane-item registry so [`TileGroup::from_json`] can rehydrate
+/// every built-in panel kind. One closure per kind, parsing the kind's
+/// `*Config` blob with `facet-json` and constructing the panel via its
+/// `from_config` constructor (or, for [`DashboardPanel`], the dedicated
+/// `deserialize_dashboard` helper). The populated registry is installed as a
+/// gpui `Global` so palette callbacks can fetch it without threading.
+fn register_pane_item_deserializers(db: Arc<DB>, cx: &mut App) {
+    use crate::tiles::ItemRegistry as PaneItemRegistry;
+    let mut reg = PaneItemRegistry::default();
+
+    register_panel::<TextPanel>(&mut reg, db.clone(), TextPanel::from_config);
+    register_panel::<TablePanel>(&mut reg, db.clone(), TablePanel::from_config);
+    register_panel::<DataTablePanel>(&mut reg, db.clone(), DataTablePanel::from_config);
+    register_panel::<BrowserPanel>(&mut reg, db.clone(), BrowserPanel::from_config);
+    register_panel::<PlotPanel>(&mut reg, db.clone(), PlotPanel::from_config);
+    register_panel::<Viewer3dPanel>(&mut reg, db.clone(), Viewer3dPanel::from_config);
+
+    // Dashboard's deserializer returns a fully-constructed entity rather
+    // than a `Self`, so it doesn't fit the generic helper.
+    let db_dashboard = db.clone();
+    reg.register::<DashboardPanel>(move |state, cx| {
+        Some(deserialize_dashboard(db_dashboard.clone(), state, cx))
+    });
+
+    cx.set_global(reg);
+}
+
+/// Wire one closure for `T` into the pane-item registry. The closure parses
+/// `T::Config` out of the state blob (falling back to `Default` on parse
+/// failure) and constructs `T` via the supplied `from_config` function.
+fn register_panel<T: crate::tiles::PaneItem>(
+    reg: &mut crate::tiles::ItemRegistry,
+    db: Arc<DB>,
+    from_config: fn(T::Config, Arc<DB>, &mut Context<T>) -> T,
+) {
+    reg.register::<T>(move |state, cx| {
+        let cfg: T::Config = facet_json::from_str(state).unwrap_or_default();
+        let db = db.clone();
+        Some(cx.new(|cx| from_config(cfg, db, cx)))
+    });
 }
 
 #[cfg(target_os = "macos")]

@@ -24,14 +24,12 @@ pub(super) fn find_label_field<T: Facet<'static>>(value: &T) -> Option<SharedStr
     let peek = facet::Peek::new(value);
     let peek_struct = peek.into_struct().ok()?;
     for (i, field_def) in peek_struct.ty().fields.iter().enumerate() {
-        if field_def.shape().id == <SharedString as Facet>::SHAPE.id {
-            if let Ok(field_peek) = peek_struct.field(i) {
-                if let Ok(s) = field_peek.get::<SharedString>() {
-                    if !s.is_empty() {
-                        return Some(s.clone());
-                    }
-                }
-            }
+        if field_def.shape().id == <SharedString as Facet>::SHAPE.id
+            && let Ok(field_peek) = peek_struct.field(i)
+            && let Ok(s) = field_peek.get::<SharedString>()
+            && !s.is_empty()
+        {
+            return Some(s.clone());
         }
     }
     None
@@ -209,8 +207,7 @@ pub(super) fn build_trace_add_wizard(
 
     let on_select: crate::inspector::trace_picker::OnTracesSelected =
         Arc::new(move |traces, _w, cx| {
-            let parent: Entity<LinePlot> =
-                parent.clone().downcast().expect("parent type mismatch");
+            let parent: Entity<LinePlot> = parent.clone().downcast().expect("parent type mismatch");
             let new_entities: Vec<_> = traces.into_iter().map(|t| cx.new(|_| t)).collect();
             parent.update(cx, |lp, cx| {
                 lp.traces.extend(new_entities);

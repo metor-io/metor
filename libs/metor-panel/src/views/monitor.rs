@@ -83,9 +83,7 @@ impl Monitor {
             locked: pending_edits(cx).locked,
         };
 
-        let strip = cx.new(|cx| {
-            ComponentValueStrip::new(db.clone(), source, style, behavior, cx)
-        });
+        let strip = cx.new(|cx| ComponentValueStrip::new(db.clone(), source, style, behavior, cx));
 
         // Await component registration, then rebind traces to match its
         // actual element count.
@@ -94,11 +92,9 @@ impl Monitor {
             let sparkline = sparkline.clone();
             async move |_this, cx| {
                 loop {
-                    let comp =
-                        db.with_state(|state| state.get_component(component_id).cloned());
+                    let comp = db.with_state(|state| state.get_component(component_id).cloned());
                     if let Some(comp) = comp {
-                        let element_count: usize =
-                            comp.schema.dim.iter().product::<usize>().max(1);
+                        let element_count: usize = comp.schema.dim.iter().product::<usize>().max(1);
                         let _ = sparkline.update(cx, |sp, cx| {
                             if element_count != sp.trace_count() {
                                 let traces =
@@ -181,7 +177,7 @@ pub(crate) fn behavior_snapshot(
     let highlighted = pending
         .get(component_id)
         .map(|edit| edit.modified_elements.iter().copied().collect())
-        .unwrap_or_else(SmallVec::new);
+        .unwrap_or_default();
     StripBehavior {
         on_element_click: Some(on_element_click),
         on_apply_element: Some(apply_click(db, component_id)),
@@ -230,12 +226,7 @@ impl Render for Monitor {
             );
         }
 
-        root = root.child(
-            div()
-                .px(px(6.0))
-                .pt(px(3.0))
-                .child(self.strip.clone()),
-        );
+        root = root.child(div().px(px(6.0)).pt(px(3.0)).child(self.strip.clone()));
 
         root = root.child(
             div()

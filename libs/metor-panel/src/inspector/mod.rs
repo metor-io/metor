@@ -141,10 +141,10 @@ impl Inspector {
         cx: &mut Context<Self>,
     ) {
         // The outgoing page's label becomes a breadcrumb pill above the search box.
-        if let Some(current) = self.pages.last_mut() {
-            if current.label.is_none() {
-                current.label = label;
-            }
+        if let Some(current) = self.pages.last_mut()
+            && current.label.is_none()
+        {
+            current.label = label;
         }
         self.pages.push(InspectorPage { rows, label: None });
         self.search.clear();
@@ -268,10 +268,10 @@ impl Inspector {
     }
 
     fn commit_edit(&mut self, window: &mut Window, cx: &mut App) {
-        if let Some(mut edit) = self.editing.take() {
-            if let Some(on_commit) = edit.on_commit.take() {
-                on_commit(edit.field.text.clone(), window, cx);
-            }
+        if let Some(mut edit) = self.editing.take()
+            && let Some(on_commit) = edit.on_commit.take()
+        {
+            on_commit(edit.field.text.clone(), window, cx);
         }
     }
 

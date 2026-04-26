@@ -10,8 +10,8 @@ use metor_proto::types::{ComponentId, ComponentView, ElementValue, PrimType};
 use smallvec::SmallVec;
 
 use crate::icons::Icon;
-use crate::theme::{Theme, theme};
 use crate::inspector::rows::TextField;
+use crate::theme::{Theme, theme};
 use crate::{AsComponentView, ComponentStream, ComponentStreamBuilder};
 
 /// Display payload for one element of a component.
@@ -158,8 +158,7 @@ impl StripBehavior {
             && self.highlighted == other.highlighted
             && click_ptr(&self.on_element_click) == click_ptr(&other.on_element_click)
             && click_ptr(&self.on_apply_element) == click_ptr(&other.on_apply_element)
-            && click_ptr(&self.on_element_right_click)
-                == click_ptr(&other.on_element_right_click)
+            && click_ptr(&self.on_element_right_click) == click_ptr(&other.on_element_right_click)
     }
 }
 
@@ -434,11 +433,11 @@ impl ComponentValueStrip {
                 self.commit_edit(window, cx);
             }
             _ => {
-                if let Some(edit) = self.editing.as_mut() {
-                    if edit.field.handle_key_down(event, cx) {
-                        edit.error = false;
-                        cx.notify();
-                    }
+                if let Some(edit) = self.editing.as_mut()
+                    && edit.field.handle_key_down(event, cx)
+                {
+                    edit.error = false;
+                    cx.notify();
                 }
             }
         }
@@ -541,7 +540,7 @@ impl Render for ComponentValueStrip {
             .gap(px(4.0));
 
         for (idx, cell) in cells.iter().enumerate() {
-            let is_pending = behavior.highlighted.iter().any(|h| *h == idx);
+            let is_pending = behavior.highlighted.contains(&idx);
             let is_editing = editing_index == Some(idx);
             let is_bool = matches!(kind, CellKind::Bool)
                 && matches!(raw_values.get(idx), Some(ElementValue::Bool(_)));
@@ -983,16 +982,16 @@ pub(crate) fn format_cells(
     enum_variants: Option<&[String]>,
     is_string: bool,
 ) -> Vec<StripCell> {
-    if is_string {
-        if let ComponentView::U8(array) = view {
-            let buf = array.buf();
-            let len = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
-            if let Ok(s) = std::str::from_utf8(&buf[..len]) {
-                return vec![StripCell {
-                    label: None,
-                    value: SharedString::from(s.to_string()),
-                }];
-            }
+    if is_string
+        && let ComponentView::U8(array) = view
+    {
+        let buf = array.buf();
+        let len = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
+        if let Ok(s) = std::str::from_utf8(&buf[..len]) {
+            return vec![StripCell {
+                label: None,
+                value: SharedString::from(s.to_string()),
+            }];
         }
     }
     if let Some(variants) = enum_variants {
@@ -1050,7 +1049,7 @@ mod tests {
     fn scalar_no_label() {
         // Full strip construction needs the DB; test the collapse rule via
         // a synthetic cells vector instead.
-        let cells = vec![StripCell {
+        let cells = [StripCell {
             label: None,
             value: sv("42"),
         }];
@@ -1122,8 +1121,10 @@ mod tests {
         let b = StripBehavior::default();
         assert!(a.equivalent(&b));
 
-        let mut c = StripBehavior::default();
-        c.locked = true;
+        let c = StripBehavior {
+            locked: true,
+            ..Default::default()
+        };
         assert!(!a.equivalent(&c));
 
         let mut d = StripBehavior::default();

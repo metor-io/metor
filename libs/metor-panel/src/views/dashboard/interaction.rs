@@ -232,7 +232,7 @@ impl DashboardPanel {
                                 cx.new(|_| DraggedWidget {
                                     widget_id: drag.widget_id,
                                     dashboard: drag.dashboard.clone(),
-                                    grab_offset: grab_offset,
+                                    grab_offset,
                                 })
                             }
                         },

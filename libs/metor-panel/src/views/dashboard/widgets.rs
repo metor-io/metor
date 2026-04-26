@@ -14,9 +14,11 @@ use image::{Frame, ImageBuffer, Rgba};
 use metor_db::DB;
 use smallvec::SmallVec;
 
+use crate::theme::theme;
+use crate::tiles::panels::{PlotPanelConfig, TraceConfig};
+use crate::views::time_series::{LinePlot, Trace};
 use crate::views::viewer_3d::Viewer3d;
 use crate::views::{ComponentText, Monitor, TimeSeriesPlot, new_component_table};
-use crate::theme::theme;
 
 use super::{DashboardWidget, WidgetKind};
 
@@ -27,8 +29,10 @@ use super::{DashboardWidget, WidgetKind};
 pub struct WidgetSpec {
     pub default_size: (f32, f32),
     pub label: Arc<dyn Fn(&DashboardWidget) -> SharedString>,
-    pub build:
-        Arc<dyn Fn(&serde_json::Value, &Arc<DB>, &mut App) -> (AnyView, gpui::AnyEntity)>,
+    /// Build receives the widget's persisted config string. Each builder
+    /// chooses how to parse it (typically `facet_json::from_str` into a
+    /// kind-specific config struct).
+    pub build: Arc<dyn Fn(&str, &Arc<DB>, &mut App) -> (AnyView, gpui::AnyEntity)>,
 }
 
 /// Global table of every widget kind the dashboard can render.
@@ -69,7 +73,8 @@ impl WidgetRegistry {
             WidgetSpec {
                 default_size: (160.0, 60.0),
                 label: Arc::new(|w| {
-                    SharedString::from(format!("Text: {}", config_str(w, "component")))
+                    let cfg = parse_or_default::<TextWidgetConfig>(&w.config);
+                    SharedString::from(format!("Text: {}", display_or_unknown(&cfg.component)))
                 }),
                 build: Arc::new(build_text),
             },
@@ -87,7 +92,8 @@ impl WidgetRegistry {
             WidgetSpec {
                 default_size: (300.0, 200.0),
                 label: Arc::new(|w| {
-                    SharedString::from(format!("Image: {}", config_str(w, "path")))
+                    let cfg = parse_or_default::<ImageWidgetConfig>(&w.config);
+                    SharedString::from(format!("Image: {}", display_or_unknown(&cfg.path)))
                 }),
                 build: Arc::new(build_image),
             },
@@ -97,7 +103,8 @@ impl WidgetRegistry {
             WidgetSpec {
                 default_size: (300.0, 160.0),
                 label: Arc::new(|w| {
-                    SharedString::from(format!("Monitor: {}", config_str(w, "component")))
+                    let cfg = parse_or_default::<MonitorWidgetConfig>(&w.config);
+                    SharedString::from(format!("Monitor: {}", display_or_unknown(&cfg.component)))
                 }),
                 build: Arc::new(build_monitor),
             },
@@ -111,6 +118,37 @@ impl WidgetRegistry {
             },
         );
     }
+}
+
+/// Persisted shape of a text widget — the source component to display.
+#[derive(facet::Facet, Default)]
+pub struct TextWidgetConfig {
+    pub component: String,
+}
+
+/// Persisted shape of an image widget — the file path to load.
+#[derive(facet::Facet, Default)]
+pub struct ImageWidgetConfig {
+    pub path: String,
+}
+
+/// Persisted shape of a monitor widget — the source component to monitor.
+#[derive(facet::Facet, Default)]
+pub struct MonitorWidgetConfig {
+    pub component: String,
+}
+
+/// Parse a widget's facet-json blob into its expected config type, falling
+/// back to `Default` on any parse error so labels and builders degrade
+/// gracefully on a stale or hand-edited file.
+fn parse_or_default<T: facet::Facet<'static> + Default>(blob: &str) -> T {
+    facet_json::from_str::<T>(blob).unwrap_or_default()
+}
+
+/// Render an empty string as `"?"` so labels stay legible when a widget
+/// hasn't been configured yet.
+fn display_or_unknown(s: &str) -> &str {
+    if s.is_empty() { "?" } else { s }
 }
 
 /// Resolve `kind` to a spec. Unregistered kinds fall back to a placeholder
@@ -138,10 +176,44 @@ fn placeholder_spec(kind: &WidgetKind) -> Arc<WidgetSpec> {
     })
 }
 
+/// Snapshot a live widget's editable state into a fresh facet-json blob.
+///
+/// Returns `None` for widget kinds whose persisted config never changes
+/// after construction (text, image, monitor, table, viewer3d) — the cached
+/// blob on `DashboardWidget.config` already reflects everything they own,
+/// so the dashboard's `to_config` keeps it as-is.
+///
+/// `plot` is the only kind whose state diverges over time: the user adds
+/// or removes traces, edits overrides, etc. — so we re-serialize from the
+/// inspectable [`LinePlot`] entity at save time.
+pub fn serialize_widget_state(
+    kind: &WidgetKind,
+    entity: &gpui::AnyEntity,
+    cx: &App,
+) -> Option<String> {
+    if *kind != WidgetKind::plot() {
+        return None;
+    }
+    let plot = entity.clone().downcast::<LinePlot>().ok()?;
+    let lp = plot.read(cx);
+    let cfg = PlotPanelConfig {
+        label: String::new(),
+        traces: lp
+            .traces()
+            .iter()
+            .map(|e| TraceConfig::from(e.read(cx)))
+            .collect(),
+        custom_title: lp.custom_title.as_ref().map(|s| s.to_string()),
+        y_min_override: lp.y_min_override.clone(),
+        y_max_override: lp.y_max_override.clone(),
+    };
+    facet_json::to_string(&cfg).ok()
+}
+
 /// Build the rendered view and its inspectable entity for a stored widget.
 pub(super) fn create_widget_view(
     kind: &WidgetKind,
-    config: &serde_json::Value,
+    config: &str,
     db: &Arc<DB>,
     cx: &mut App,
 ) -> (AnyView, gpui::AnyEntity) {
@@ -149,102 +221,59 @@ pub(super) fn create_widget_view(
     (spec.build)(config, db, cx)
 }
 
-fn config_str<'a>(widget: &'a DashboardWidget, key: &str) -> &'a str {
-    widget
-        .config
-        .get(key)
-        .and_then(|v| v.as_str())
-        .unwrap_or("?")
-}
-
 fn as_view_and_entity<T: Render + 'static>(e: Entity<T>) -> (AnyView, gpui::AnyEntity) {
     let any = e.clone().into_any();
     (AnyView::from(e), any)
 }
 
-fn lookup_component(db: &Arc<DB>, name: &str) -> Option<metor_proto::types::ComponentId> {
-    db.with_state(|state| {
-        state
-            .component_metadata_iter()
-            .find(|(_, meta)| meta.name == name)
-            .map(|(id, _)| *id)
-    })
-}
-
-fn build_plot(
-    _config: &serde_json::Value,
-    db: &Arc<DB>,
-    cx: &mut App,
-) -> (AnyView, gpui::AnyEntity) {
+fn build_plot(config: &str, db: &Arc<DB>, cx: &mut App) -> (AnyView, gpui::AnyEntity) {
     // Only LinePlot has Facet adapters, so expose it — not the outer
     // TimeSeriesPlot — as the inspectable entity.
-    let plot = cx.new(|cx| TimeSeriesPlot::new(db.clone(), vec![], cx));
+    let cfg = parse_or_default::<PlotPanelConfig>(config);
+    let traces: Vec<Trace> = cfg.traces.into_iter().map(Trace::from).collect();
+    let plot = cx.new(|cx| TimeSeriesPlot::new(db.clone(), traces, cx));
     let line_plot = plot.read(cx).line_plot().clone();
+    line_plot.update(cx, |lp, cx| {
+        lp.custom_title = cfg.custom_title.map(SharedString::from);
+        lp.y_min_override = cfg.y_min_override;
+        lp.y_max_override = cfg.y_max_override;
+        cx.notify();
+    });
     (AnyView::from(plot), line_plot.into_any())
 }
 
-fn build_text(
-    config: &serde_json::Value,
-    db: &Arc<DB>,
-    cx: &mut App,
-) -> (AnyView, gpui::AnyEntity) {
-    let component_name = config
-        .get("component")
-        .and_then(|v| v.as_str())
-        .unwrap_or("");
-    if let Some(id) = lookup_component(db, component_name) {
-        as_view_and_entity(cx.new(|cx| ComponentText::new(db.clone(), id, cx)))
-    } else {
-        as_view_and_entity(cx.new(|_cx| PlaceholderWidget {
-            label: SharedString::from(format!("? {}", component_name)),
-        }))
+fn build_text(config: &str, db: &Arc<DB>, cx: &mut App) -> (AnyView, gpui::AnyEntity) {
+    let cfg = parse_or_default::<TextWidgetConfig>(config);
+    if cfg.component.is_empty() {
+        return as_view_and_entity(cx.new(|_cx| PlaceholderWidget {
+            label: SharedString::new_static("?"),
+        }));
     }
+    let id = metor_proto::types::ComponentId::new(&cfg.component);
+    as_view_and_entity(cx.new(|cx| ComponentText::new(db.clone(), id, cx)))
 }
 
-fn build_table(
-    _config: &serde_json::Value,
-    db: &Arc<DB>,
-    cx: &mut App,
-) -> (AnyView, gpui::AnyEntity) {
+fn build_table(_config: &str, db: &Arc<DB>, cx: &mut App) -> (AnyView, gpui::AnyEntity) {
     as_view_and_entity(cx.new(|cx| new_component_table(db.clone(), cx)))
 }
 
-fn build_image(
-    config: &serde_json::Value,
-    _db: &Arc<DB>,
-    cx: &mut App,
-) -> (AnyView, gpui::AnyEntity) {
-    let path = config
-        .get("path")
-        .and_then(|v| v.as_str())
-        .unwrap_or("")
-        .to_string();
-    as_view_and_entity(cx.new(|_cx| ImageWidget::load(path)))
+fn build_image(config: &str, _db: &Arc<DB>, cx: &mut App) -> (AnyView, gpui::AnyEntity) {
+    let cfg = parse_or_default::<ImageWidgetConfig>(config);
+    as_view_and_entity(cx.new(|_cx| ImageWidget::load(cfg.path)))
 }
 
-fn build_monitor(
-    config: &serde_json::Value,
-    db: &Arc<DB>,
-    cx: &mut App,
-) -> (AnyView, gpui::AnyEntity) {
-    let component_name = config
-        .get("component")
-        .and_then(|v| v.as_str())
-        .unwrap_or("");
-    if let Some(id) = lookup_component(db, component_name) {
-        as_view_and_entity(cx.new(|cx| Monitor::new(db.clone(), id, cx)))
-    } else {
-        as_view_and_entity(cx.new(|_cx| PlaceholderWidget {
-            label: SharedString::from(format!("? {}", component_name)),
-        }))
+fn build_monitor(config: &str, db: &Arc<DB>, cx: &mut App) -> (AnyView, gpui::AnyEntity) {
+    let cfg = parse_or_default::<MonitorWidgetConfig>(config);
+    if cfg.component.is_empty() {
+        return as_view_and_entity(cx.new(|_cx| PlaceholderWidget {
+            label: SharedString::new_static("?"),
+        }));
     }
+    let id = metor_proto::types::ComponentId::new(&cfg.component);
+    as_view_and_entity(cx.new(|cx| Monitor::new(db.clone(), id, cx)))
 }
 
-fn build_viewer3d(
-    _config: &serde_json::Value,
-    db: &Arc<DB>,
-    cx: &mut App,
-) -> (AnyView, gpui::AnyEntity) {
+fn build_viewer3d(_config: &str, db: &Arc<DB>, cx: &mut App) -> (AnyView, gpui::AnyEntity) {
     as_view_and_entity(cx.new(|cx| Viewer3d::with_db(db.clone(), cx)))
 }
 

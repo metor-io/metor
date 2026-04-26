@@ -1,16 +1,26 @@
+// gpui is single-threaded by design, so `Arc<dyn Fn>` is the load-bearing
+// shape for every event handler / build closure in this crate. The
+// `arc_with_non_send_sync` lint flags this everywhere, but switching to
+// `Rc` isn't possible — gpui's own APIs require `Arc`. Same story for
+// `type_complexity`: the closures' fully-spelled-out types fall out of
+// gpui's API and adding type aliases everywhere would mostly just shuffle
+// the noise around.
+#![allow(clippy::arc_with_non_send_sync, clippy::type_complexity)]
+
 use std::mem::size_of;
 
 use metor_db::disruptor::{ReadGrant, Reader};
 use metor_db::{Component, ComponentSchema, DB};
 use metor_proto::types::{ComponentId, ComponentView, Timestamp};
 pub mod app;
-pub mod views;
 pub mod gpu_context;
 pub mod icons;
 pub mod inspect;
 pub mod inspector;
+pub mod presets;
 pub mod theme;
 pub mod tiles;
+pub mod views;
 
 /// Borrow as a [`ComponentView`] without copying the backing buffer.
 pub trait AsComponentView {

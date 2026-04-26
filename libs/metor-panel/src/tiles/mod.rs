@@ -44,6 +44,40 @@ impl EventEmitter<TileGroupEvent> for TileGroup {}
 
 const RESIZE_HANDLE_SIZE: f32 = 1.0;
 
+/// Layout version this binary writes and accepts on read. Bump in lockstep
+/// with [`TileGroup::serialize`] when the document shape changes.
+const SUPPORTED_LAYOUT_VERSION: u32 = 1;
+
+/// Failure modes when loading a layout from JSON.
+#[derive(Debug)]
+pub enum LoadError {
+    /// `facet-json` couldn't parse the document.
+    Parse(facet_json::DeserializeError),
+    /// The document parsed but claims a layout version this binary doesn't
+    /// understand. The number is whatever the document carried.
+    UnsupportedVersion(u32),
+}
+
+impl std::fmt::Display for LoadError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Parse(e) => write!(f, "parse: {e}"),
+            Self::UnsupportedVersion(v) => write!(
+                f,
+                "unsupported layout version {v}; this build understands {SUPPORTED_LAYOUT_VERSION}"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for LoadError {}
+
+impl From<facet_json::DeserializeError> for LoadError {
+    fn from(e: facet_json::DeserializeError) -> Self {
+        Self::Parse(e)
+    }
+}
+
 /// A node in the split tree: a leaf [`Pane`] or an interior [`SplitAxis`].
 enum Member {
     Pane(Entity<Pane>),
@@ -100,14 +134,15 @@ impl Member {
             }
             Member::Axis(axis) => {
                 for i in 0..axis.members.len() {
-                    if let Member::Pane(pane) = &axis.members[i] {
-                        if pane.entity_id() == target.entity_id() && axis.axis == direction.axis() {
-                            let new = Member::Pane(new_pane.clone());
-                            let insert_at = if direction.increasing() { i + 1 } else { i };
-                            axis.members.insert(insert_at, new);
-                            axis.flexes.insert(insert_at, 1.0);
-                            return true;
-                        }
+                    if let Member::Pane(pane) = &axis.members[i]
+                        && pane.entity_id() == target.entity_id()
+                        && axis.axis == direction.axis()
+                    {
+                        let new = Member::Pane(new_pane.clone());
+                        let insert_at = if direction.increasing() { i + 1 } else { i };
+                        axis.members.insert(insert_at, new);
+                        axis.flexes.insert(insert_at, 1.0);
+                        return true;
                     }
                 }
                 for member in &mut axis.members {
@@ -189,6 +224,10 @@ impl Member {
         }
     }
 
+    // `window` is unused at the leaf today, but forwarded so future render
+    // paths (focus, scroll into view) can reach gpui's window APIs without
+    // a signature churn.
+    #[allow(clippy::only_used_in_recursion)]
     fn render(
         &self,
         path: SplitPath,
@@ -430,8 +469,50 @@ impl TileGroup {
     /// persisted state) for saving to disk.
     pub fn serialize(&self, cx: &App) -> SerializedTileGroup {
         SerializedTileGroup {
+            version: SUPPORTED_LAYOUT_VERSION,
             root: self.root.serialize(cx),
         }
+    }
+
+    /// Convenience: snapshot to a JSON string ready to write to disk.
+    ///
+    /// Panics on serialization failure — every field in the serialized tree
+    /// is plain `Facet` data, so the only way `facet_json::to_string` can
+    /// fail here is a programmer error (e.g. a freshly-added field with no
+    /// `Facet` impl).
+    pub fn to_json(&self, cx: &App) -> String {
+        facet_json::to_string(&self.serialize(cx)).expect("tile layout always serializes")
+    }
+
+    /// Convenience: load a layout from a JSON string. The application picks
+    /// the file path; this layer is format-only.
+    pub fn from_json(
+        json: &str,
+        registry: &ItemRegistry,
+        cx: &mut Context<Self>,
+    ) -> Result<Self, LoadError> {
+        let serialized: SerializedTileGroup = facet_json::from_str(json)?;
+        if serialized.version != SUPPORTED_LAYOUT_VERSION {
+            return Err(LoadError::UnsupportedVersion(serialized.version));
+        }
+        Ok(Self::deserialize(serialized, registry, cx))
+    }
+
+    /// Parse `json` and swap the layout in place.
+    ///
+    /// Pulls the panel-item registry from gpui globals so callers don't have
+    /// to thread it. The clone keeps the global borrow short so the rest of
+    /// the deserialization can take `&mut Context<Self>` freely.
+    pub fn replace_from_json(
+        &mut self,
+        json: &str,
+        cx: &mut Context<Self>,
+    ) -> Result<(), LoadError> {
+        let registry = cx.global::<ItemRegistry>().clone();
+        let new_self = Self::from_json(json, &registry, cx)?;
+        *self = new_self;
+        cx.notify();
+        Ok(())
     }
 
     /// Rebuild a layout from a [`SerializedTileGroup`]. Items whose
@@ -467,7 +548,7 @@ impl TileGroup {
                     let items: Vec<Box<dyn PaneItemHandle>> = sp
                         .items
                         .iter()
-                        .filter_map(|si| registry.deserialize(&si.kind, si.state.clone(), cx))
+                        .filter_map(|si| registry.deserialize(&si.kind, &si.state, cx))
                         .collect();
                     let mut pane = Pane::new(items, cx);
                     if sp.active_index < pane.items().len() {
@@ -476,7 +557,10 @@ impl TileGroup {
                     pane.set_tab_orientation(sp.tab_orientation, cx);
                     pane.set_hide_tab_bar(sp.hide_tab_bar, cx);
                     pane.set_locked_size(
-                        sp.locked_size.map(|(w, h)| gpui::Size { width: w, height: h }),
+                        sp.locked_size.map(|(w, h)| gpui::Size {
+                            width: w,
+                            height: h,
+                        }),
                         cx,
                     );
                     pane

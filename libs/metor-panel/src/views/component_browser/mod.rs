@@ -17,8 +17,8 @@ use super::value_strip::{ComponentValueStrip, StripBehavior, StripClick, StripSt
 use crate::icons::Icon;
 use crate::inspector::rows::{CommandRow, DefaultActionRow, InspectorRow, NavRow};
 use crate::inspector::{InspectorMode, InspectorRequest, open_inspector};
-use crate::tiles::PlotComponentAction;
 use crate::theme::{Theme, theme};
+use crate::tiles::PlotComponentAction;
 use component_tree::{ComponentNode, build_tree, compress_subtree, resolve_path};
 
 /// [`ColumnBrowser`] specialized for the DB component namespace.
@@ -333,8 +333,9 @@ impl ComponentBrowserDelegate {
                         }
                     }),
                 )));
-            } else if node.component_id.is_some() && node.children.is_empty() {
-                let component_id = node.component_id.unwrap();
+            } else if let Some(component_id) = node.component_id
+                && node.children.is_empty()
+            {
                 let db = self.db.clone();
                 rows.push(Box::new(CommandRow::new(
                     SharedString::new_static("Plot component"),
@@ -632,8 +633,7 @@ impl ColumnBrowserDelegate for ComponentBrowserDelegate {
             .map(|p| {
                 let click = edit_click(self.db.clone(), p.component_id, p.full_name.clone());
                 let right_click = right_click_plot(self.db.clone(), p.component_id);
-                let mut behavior =
-                    behavior_snapshot(cx, self.db.clone(), p.component_id, click);
+                let mut behavior = behavior_snapshot(cx, self.db.clone(), p.component_id, click);
                 behavior.on_element_right_click = Some(right_click);
                 (p.strip.clone(), behavior)
             })
@@ -809,10 +809,7 @@ fn build_filter_synth(
     {
         pruned[0].children.clone()
     } else {
-        pruned
-            .into_iter()
-            .map(|c| (c.segment.clone(), c))
-            .collect()
+        pruned.into_iter().map(|c| (c.segment.clone(), c)).collect()
     };
 
     Arc::new(ComponentNode {
@@ -827,10 +824,7 @@ fn build_filter_synth(
 /// node with only its matching descendants kept. Matching nodes
 /// short-circuit with their full subtree so the user can explore
 /// siblings of the thing they were looking for.
-fn prune_to_matches(
-    node: &Arc<ComponentNode>,
-    regex: &regex::Regex,
-) -> Option<Arc<ComponentNode>> {
+fn prune_to_matches(node: &Arc<ComponentNode>, regex: &regex::Regex) -> Option<Arc<ComponentNode>> {
     if regex.is_match(node.full_name.as_ref()) {
         return Some(node.clone());
     }

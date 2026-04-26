@@ -142,7 +142,6 @@ impl PlotBounds {
         )
     }
 
-
     /// Bake the screen transform into a branchless form for inner-loop use.
     pub fn screen_transform(&self, screen_bounds: Bounds<Pixels>) -> ScreenTransform {
         let sw = f32::from(screen_bounds.size.width) as f64;

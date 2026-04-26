@@ -2,9 +2,9 @@ use std::sync::Arc;
 
 use gpui::{App, Global, Pixels, Point, SharedString};
 use metor_db::DB;
+use metor_proto::types::Msg;
 use metor_proto::types::{ComponentId, ElementValue, Timestamp};
 use metor_proto_wkt::{ComponentValue, UpdateComponent};
-use metor_proto::types::Msg;
 
 use crate::inspector::rows::{CommandRow, DefaultActionRow, InspectorRow, NavRow};
 
@@ -58,7 +58,11 @@ impl PendingEdits {
 
     /// Replace the pending edit for a component, or insert if absent.
     pub fn upsert(&mut self, edit: PendingEdit) {
-        if let Some(existing) = self.edits.iter_mut().find(|e| e.component_id == edit.component_id) {
+        if let Some(existing) = self
+            .edits
+            .iter_mut()
+            .find(|e| e.component_id == edit.component_id)
+        {
             *existing = edit;
         } else {
             self.edits.push(edit);
@@ -280,8 +284,10 @@ pub fn edit_value_rows(db: Arc<DB>, request: EditRequest) -> Vec<Box<dyn Inspect
     } = request;
 
     let enum_variants: Option<Vec<String>> = db.with_state(|s| {
-        s.get_component_metadata(component_id)
-            .and_then(|m| m.enum_variants().map(|it| it.map(|s| s.to_string()).collect()))
+        s.get_component_metadata(component_id).and_then(|m| {
+            m.enum_variants()
+                .map(|it| it.map(|s| s.to_string()).collect())
+        })
     });
 
     if let Some(variants) = enum_variants {

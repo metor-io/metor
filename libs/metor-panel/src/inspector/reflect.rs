@@ -61,7 +61,7 @@ pub fn default_rows_for_any_entity(
 
     let mut rows: Vec<Box<dyn InspectorRow>> = Vec::new();
     (adapter.peek)(any_entity, cx, &mut |peek| {
-        let Ok(peek_struct) = peek.clone().into_struct() else {
+        let Ok(peek_struct) = (*peek).into_struct() else {
             return;
         };
 
@@ -105,7 +105,7 @@ pub fn get_field<V: Facet<'static> + Clone + 'static>(
         .clone();
     let mut out = None;
     (adapter.peek)(any_entity, cx, &mut |peek| {
-        let Ok(ps) = peek.clone().into_struct() else {
+        let Ok(ps) = (*peek).into_struct() else {
             return;
         };
         let Ok(fp) = ps.field(field_idx) else { return };

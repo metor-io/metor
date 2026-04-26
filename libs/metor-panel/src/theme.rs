@@ -136,27 +136,27 @@ pub static DARK: Theme = Theme {
     name: "Dark",
     font_family: "Berkeley Mono",
 
-    bg_primary:   hex(0x1f1d1b, 1.0),
+    bg_primary: hex(0x1f1d1b, 1.0),
     bg_secondary: hex(0x151413, 1.0),
-    bg_elevated:  hex(0x252321, 1.0),
+    bg_elevated: hex(0x252321, 1.0),
 
-    text_primary:   hex(0xf5efe6, 1.0),
+    text_primary: hex(0xf5efe6, 1.0),
     text_secondary: hex(0x857f79, 1.0),
-    text_tertiary:  hex(0x6b6661, 1.0),
+    text_tertiary: hex(0x6b6661, 1.0),
 
     border_primary: hex(0x36322f, 1.0),
 
-    selection_bg:   hex(0x36322f, 1.0),
+    selection_bg: hex(0x36322f, 1.0),
     text_selection: hex(0x2d4a6b, 0.6),
-    drop_target:    hex(0xe08a30, 0.15),
+    drop_target: hex(0xe08a30, 0.15),
 
-    pill_bg:     hex(0x404040, 1.0),
+    pill_bg: hex(0x404040, 1.0),
     pill_border: hex(0x595959, 1.0),
 
-    line_color:      hex(0xe08a30, 1.0),
-    line_colors:     LINE_COLORS,
-    grid_color:      hex(0x2e2b28, 1.0),
-    axis_color:      hex(0x4d4843, 1.0),
+    line_color: hex(0xe08a30, 1.0),
+    line_colors: LINE_COLORS,
+    grid_color: hex(0x2e2b28, 1.0),
+    axis_color: hex(0x4d4843, 1.0),
     zero_line_color: hex(0x6b6560, 1.0),
 };
 
@@ -164,24 +164,24 @@ pub static CATPPUCCIN_MOCHA: Theme = Theme {
     name: "Catppuccin Mocha",
     font_family: "Berkeley Mono",
 
-    bg_primary:   hex(0x1e1e2e, 1.0),
+    bg_primary: hex(0x1e1e2e, 1.0),
     bg_secondary: hex(0x11111b, 1.0),
-    bg_elevated:  hex(0x313244, 1.0),
+    bg_elevated: hex(0x313244, 1.0),
 
-    text_primary:   hex(0xcdd6f4, 1.0),
+    text_primary: hex(0xcdd6f4, 1.0),
     text_secondary: hex(0xbac2de, 1.0),
-    text_tertiary:  hex(0xa6adc8, 1.0),
+    text_tertiary: hex(0xa6adc8, 1.0),
 
     border_primary: hex(0x313244, 1.0),
 
-    selection_bg:   hex(0x45475a, 1.0),
+    selection_bg: hex(0x45475a, 1.0),
     text_selection: hex(0x585b70, 0.6),
-    drop_target:    hex(0xf9e2af, 0.15),
+    drop_target: hex(0xf9e2af, 0.15),
 
-    pill_bg:     hex(0x45475a, 1.0),
+    pill_bg: hex(0x45475a, 1.0),
     pill_border: hex(0x585b70, 1.0),
 
-    line_color:      hex(0xf9e2af, 1.0),
+    line_color: hex(0xf9e2af, 1.0),
     line_colors: [
         hex(0xfab387, 1.0), // peach
         hex(0x89b4fa, 1.0), // blue
@@ -192,8 +192,8 @@ pub static CATPPUCCIN_MOCHA: Theme = Theme {
         hex(0xf9e2af, 1.0), // yellow
         hex(0xf5c2e7, 1.0), // pink
     ],
-    grid_color:      hex(0x313244, 1.0),
-    axis_color:      hex(0x45475a, 1.0),
+    grid_color: hex(0x313244, 1.0),
+    axis_color: hex(0x45475a, 1.0),
     zero_line_color: hex(0x585b70, 1.0),
 };
 
@@ -201,24 +201,24 @@ pub static CATPPUCCIN_MACCHIATO: Theme = Theme {
     name: "Catppuccin Macchiato",
     font_family: "Berkeley Mono",
 
-    bg_primary:   hex(0x24273a, 1.0),
+    bg_primary: hex(0x24273a, 1.0),
     bg_secondary: hex(0x1e2030, 1.0),
-    bg_elevated:  hex(0x363a4f, 1.0),
+    bg_elevated: hex(0x363a4f, 1.0),
 
-    text_primary:   hex(0xcad3f5, 1.0),
+    text_primary: hex(0xcad3f5, 1.0),
     text_secondary: hex(0xb8c0e0, 1.0),
-    text_tertiary:  hex(0xa5adcb, 1.0),
+    text_tertiary: hex(0xa5adcb, 1.0),
 
     border_primary: hex(0x363a4f, 1.0),
 
-    selection_bg:   hex(0x494d64, 1.0),
+    selection_bg: hex(0x494d64, 1.0),
     text_selection: hex(0x5b6078, 0.6),
-    drop_target:    hex(0xeed49f, 0.15),
+    drop_target: hex(0xeed49f, 0.15),
 
-    pill_bg:     hex(0x494d64, 1.0),
+    pill_bg: hex(0x494d64, 1.0),
     pill_border: hex(0x5b6078, 1.0),
 
-    line_color:      hex(0xeed49f, 1.0),
+    line_color: hex(0xeed49f, 1.0),
     line_colors: [
         hex(0xf5a97f, 1.0), // peach
         hex(0x8aadf4, 1.0), // blue
@@ -229,8 +229,8 @@ pub static CATPPUCCIN_MACCHIATO: Theme = Theme {
         hex(0xeed49f, 1.0), // yellow
         hex(0xf5bde6, 1.0), // pink
     ],
-    grid_color:      hex(0x363a4f, 1.0),
-    axis_color:      hex(0x494d64, 1.0),
+    grid_color: hex(0x363a4f, 1.0),
+    axis_color: hex(0x494d64, 1.0),
     zero_line_color: hex(0x5b6078, 1.0),
 };
 
@@ -238,24 +238,24 @@ pub static CATPPUCCIN_LATTE: Theme = Theme {
     name: "Catppuccin Latte",
     font_family: "Berkeley Mono",
 
-    bg_primary:   hex(0xeff1f5, 1.0),
+    bg_primary: hex(0xeff1f5, 1.0),
     bg_secondary: hex(0xe6e9ef, 1.0),
-    bg_elevated:  hex(0xdce0e8, 1.0),
+    bg_elevated: hex(0xdce0e8, 1.0),
 
-    text_primary:   hex(0x4c4f69, 1.0),
+    text_primary: hex(0x4c4f69, 1.0),
     text_secondary: hex(0x5c5f77, 1.0),
-    text_tertiary:  hex(0x6c6f85, 1.0),
+    text_tertiary: hex(0x6c6f85, 1.0),
 
     border_primary: hex(0xccd0da, 1.0),
 
-    selection_bg:   hex(0xbcc0cc, 1.0),
+    selection_bg: hex(0xbcc0cc, 1.0),
     text_selection: hex(0x7287fd, 0.3),
-    drop_target:    hex(0xdf8e1d, 0.15),
+    drop_target: hex(0xdf8e1d, 0.15),
 
-    pill_bg:     hex(0xccd0da, 1.0),
+    pill_bg: hex(0xccd0da, 1.0),
     pill_border: hex(0xbcc0cc, 1.0),
 
-    line_color:      hex(0xdf8e1d, 1.0),
+    line_color: hex(0xdf8e1d, 1.0),
     line_colors: [
         hex(0xfe640b, 1.0), // peach
         hex(0x1e66f5, 1.0), // blue
@@ -266,8 +266,8 @@ pub static CATPPUCCIN_LATTE: Theme = Theme {
         hex(0xdf8e1d, 1.0), // yellow
         hex(0xea76cb, 1.0), // pink
     ],
-    grid_color:      hex(0xdce0e8, 1.0),
-    axis_color:      hex(0xccd0da, 1.0),
+    grid_color: hex(0xdce0e8, 1.0),
+    axis_color: hex(0xccd0da, 1.0),
     zero_line_color: hex(0xbcc0cc, 1.0),
 };
 
@@ -275,24 +275,24 @@ pub static AYU_DARK: Theme = Theme {
     name: "Ayu Dark",
     font_family: "Berkeley Mono",
 
-    bg_primary:   hex(0x0b0e14, 1.0),
+    bg_primary: hex(0x0b0e14, 1.0),
     bg_secondary: hex(0x0f131a, 1.0),
-    bg_elevated:  hex(0x1a1e28, 1.0),
+    bg_elevated: hex(0x1a1e28, 1.0),
 
-    text_primary:   hex(0xbfbdb6, 1.0),
+    text_primary: hex(0xbfbdb6, 1.0),
     text_secondary: hex(0x565b66, 1.0),
-    text_tertiary:  hex(0x6c7380, 1.0),
+    text_tertiary: hex(0x6c7380, 1.0),
 
     border_primary: hex(0x11151c, 1.0),
 
-    selection_bg:   hex(0x475266, 1.0),
+    selection_bg: hex(0x475266, 1.0),
     text_selection: hex(0x3d4455, 0.6),
-    drop_target:    hex(0x59c2ff, 0.15),
+    drop_target: hex(0x59c2ff, 0.15),
 
-    pill_bg:     hex(0x1a1e28, 1.0),
+    pill_bg: hex(0x1a1e28, 1.0),
     pill_border: hex(0x2a2e38, 1.0),
 
-    line_color:      hex(0xe6b450, 1.0),
+    line_color: hex(0xe6b450, 1.0),
     line_colors: [
         hex(0xe6b450, 1.0), // orange/yellow
         hex(0x59c2ff, 1.0), // blue
@@ -303,8 +303,8 @@ pub static AYU_DARK: Theme = Theme {
         hex(0xffb454, 1.0), // yellow
         hex(0xf07178, 1.0), // pink/red
     ],
-    grid_color:      hex(0x11151c, 1.0),
-    axis_color:      hex(0x1a1e28, 1.0),
+    grid_color: hex(0x11151c, 1.0),
+    axis_color: hex(0x1a1e28, 1.0),
     zero_line_color: hex(0x2a2e38, 1.0),
 };
 
@@ -312,24 +312,24 @@ pub static EVERFOREST_DARK: Theme = Theme {
     name: "Everforest Dark",
     font_family: "Berkeley Mono",
 
-    bg_primary:   hex(0x2d353b, 1.0),
+    bg_primary: hex(0x2d353b, 1.0),
     bg_secondary: hex(0x232a2e, 1.0),
-    bg_elevated:  hex(0x3d484d, 1.0),
+    bg_elevated: hex(0x3d484d, 1.0),
 
-    text_primary:   hex(0xd3c6aa, 1.0),
+    text_primary: hex(0xd3c6aa, 1.0),
     text_secondary: hex(0x9da9a0, 1.0),
-    text_tertiary:  hex(0x859289, 1.0),
+    text_tertiary: hex(0x859289, 1.0),
 
     border_primary: hex(0x475258, 1.0),
 
-    selection_bg:   hex(0x4f585e, 1.0),
+    selection_bg: hex(0x4f585e, 1.0),
     text_selection: hex(0x543a48, 0.6),
-    drop_target:    hex(0xdbbc7f, 0.15),
+    drop_target: hex(0xdbbc7f, 0.15),
 
-    pill_bg:     hex(0x3d484d, 1.0),
+    pill_bg: hex(0x3d484d, 1.0),
     pill_border: hex(0x4f585e, 1.0),
 
-    line_color:      hex(0xdbbc7f, 1.0),
+    line_color: hex(0xdbbc7f, 1.0),
     line_colors: [
         hex(0xe69875, 1.0), // orange
         hex(0x7fbbb3, 1.0), // blue
@@ -340,8 +340,8 @@ pub static EVERFOREST_DARK: Theme = Theme {
         hex(0xdbbc7f, 1.0), // yellow
         hex(0xd699b6, 1.0), // pink
     ],
-    grid_color:      hex(0x3d484d, 1.0),
-    axis_color:      hex(0x475258, 1.0),
+    grid_color: hex(0x3d484d, 1.0),
+    axis_color: hex(0x475258, 1.0),
     zero_line_color: hex(0x56635f, 1.0),
 };
 
@@ -349,24 +349,24 @@ pub static EVERFOREST_LIGHT: Theme = Theme {
     name: "Everforest Light",
     font_family: "Berkeley Mono",
 
-    bg_primary:   hex(0xfdf6e3, 1.0),
+    bg_primary: hex(0xfdf6e3, 1.0),
     bg_secondary: hex(0xf4f0d9, 1.0),
-    bg_elevated:  hex(0xefebd4, 1.0),
+    bg_elevated: hex(0xefebd4, 1.0),
 
-    text_primary:   hex(0x5c6a72, 1.0),
+    text_primary: hex(0x5c6a72, 1.0),
     text_secondary: hex(0x829181, 1.0),
-    text_tertiary:  hex(0x939f91, 1.0),
+    text_tertiary: hex(0x939f91, 1.0),
 
     border_primary: hex(0xe6e2cc, 1.0),
 
-    selection_bg:   hex(0xe0dcc7, 1.0),
+    selection_bg: hex(0xe0dcc7, 1.0),
     text_selection: hex(0xeaedc8, 0.8),
-    drop_target:    hex(0xdfa000, 0.15),
+    drop_target: hex(0xdfa000, 0.15),
 
-    pill_bg:     hex(0xefebd4, 1.0),
+    pill_bg: hex(0xefebd4, 1.0),
     pill_border: hex(0xe0dcc7, 1.0),
 
-    line_color:      hex(0xdfa000, 1.0),
+    line_color: hex(0xdfa000, 1.0),
     line_colors: [
         hex(0xf57d26, 1.0), // orange
         hex(0x3a94c5, 1.0), // blue
@@ -377,8 +377,8 @@ pub static EVERFOREST_LIGHT: Theme = Theme {
         hex(0xdfa000, 1.0), // yellow
         hex(0xdf69ba, 1.0), // pink
     ],
-    grid_color:      hex(0xefebd4, 1.0),
-    axis_color:      hex(0xe6e2cc, 1.0),
+    grid_color: hex(0xefebd4, 1.0),
+    axis_color: hex(0xe6e2cc, 1.0),
     zero_line_color: hex(0xbdc3af, 1.0),
 };
 

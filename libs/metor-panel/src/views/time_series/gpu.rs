@@ -65,7 +65,11 @@ fn quantize_stride(needed_stride: usize) -> usize {
     let log2 = n.ilog2();
     let floor_p = 1usize << (log2 & !1);
     // `2 * floor_p` is the geometric midpoint between `floor_p` and `4 * floor_p`.
-    if n >= floor_p * 2 { floor_p * 4 } else { floor_p }
+    if n >= floor_p * 2 {
+        floor_p * 4
+    } else {
+        floor_p
+    }
 }
 
 /// Per-frame bump allocator over the shared x/y storage buffers.
@@ -996,6 +1000,7 @@ fn convert_values_strided(
     out.clear();
     out.reserve(to - from);
 
+    #[allow(clippy::too_many_arguments)]
     fn fill<T: PlotValue>(
         data: &[u8],
         lod_stride: usize,

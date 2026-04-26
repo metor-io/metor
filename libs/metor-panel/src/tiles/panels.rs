@@ -1,21 +1,30 @@
 use std::sync::Arc;
 
-use gpui::{App, Context, Entity, IntoElement, Render, SharedString, Window, div, prelude::*};
+use gpui::{
+    App, Context, Entity, Hsla, IntoElement, Render, SharedString, Window, div, prelude::*,
+};
 use metor_db::DB;
 use metor_proto::types::ComponentId;
 
+use crate::inspector::rows::{CommandRow, InspectorRow, NavRow};
+use crate::inspector::{InspectorMode, InspectorRequest, OpenInspectorCallback};
 use crate::views::dashboard::DashboardPanel;
-use crate::views::time_series::LinePlot;
+use crate::views::time_series::{LinePlot, Override, PlotStyle, Trace};
 use crate::views::viewer_3d::Viewer3d;
 use crate::views::{
     ComponentBrowser, ComponentTable, ComponentText, DataTable, TimeSeriesPlot,
     new_component_browser, new_component_table, new_data_table,
 };
-use crate::inspector::{InspectorMode, InspectorRequest, OpenInspectorCallback};
-use crate::inspector::rows::{CommandRow, InspectorRow, NavRow};
 
 use super::item::{PaneItem, PaneItemHandle};
 use super::pane::Pane;
+
+/// Persisted shape of a [`TextPanel`].
+#[derive(facet::Facet, Default)]
+pub struct TextPanelConfig {
+    /// Display label and serialization key for the source component.
+    pub component: String,
+}
 
 /// Pane item that renders a single component's latest value as text.
 pub struct TextPanel {
@@ -36,6 +45,11 @@ impl TextPanel {
             label: label.into(),
         }
     }
+
+    pub fn from_config(cfg: TextPanelConfig, db: Arc<DB>, cx: &mut Context<Self>) -> Self {
+        let component_id = ComponentId::new(&cfg.component);
+        Self::new(db, component_id, cfg.component, cx)
+    }
 }
 
 impl Render for TextPanel {
@@ -45,6 +59,8 @@ impl Render for TextPanel {
 }
 
 impl PaneItem for TextPanel {
+    type Config = TextPanelConfig;
+
     fn tab_title(&self, _cx: &App) -> SharedString {
         self.label.clone()
     }
@@ -53,10 +69,17 @@ impl PaneItem for TextPanel {
         "component_text"
     }
 
-    fn serialize(&self, _cx: &App) -> serde_json::Value {
-        serde_json::json!({ "component": self.label.as_ref() })
+    fn to_config(&self, _cx: &App) -> TextPanelConfig {
+        TextPanelConfig {
+            component: self.label.to_string(),
+        }
     }
 }
+
+/// Persisted shape of a [`TablePanel`]. Currently empty — the panel renders
+/// every component in the DB and has no per-instance configuration.
+#[derive(facet::Facet, Default)]
+pub struct TablePanelConfig {}
 
 /// Pane item listing every component in the DB as a flat table.
 pub struct TablePanel {
@@ -72,6 +95,10 @@ impl TablePanel {
             label: "Components".into(),
         }
     }
+
+    pub fn from_config(_cfg: TablePanelConfig, db: Arc<DB>, cx: &mut Context<Self>) -> Self {
+        Self::new(db, cx)
+    }
 }
 
 impl Render for TablePanel {
@@ -81,6 +108,8 @@ impl Render for TablePanel {
 }
 
 impl PaneItem for TablePanel {
+    type Config = TablePanelConfig;
+
     fn tab_title(&self, _cx: &App) -> SharedString {
         self.label.clone()
     }
@@ -89,11 +118,18 @@ impl PaneItem for TablePanel {
         "component_table"
     }
 
-    fn serialize(&self, _cx: &App) -> serde_json::Value {
-        serde_json::json!({})
+    fn to_config(&self, _cx: &App) -> TablePanelConfig {
+        TablePanelConfig {}
     }
 }
 
+/// Persisted shape of a [`DataTablePanel`]. No per-instance configuration today.
+#[derive(facet::Facet, Default)]
+pub struct DataTablePanelConfig {}
+
+/// Pane item rendering one row per component, grouped by namespace, with
+/// live values per element. Wraps the same [`DataTable`] view used outside
+/// the tile system.
 pub struct DataTablePanel {
     inner: Entity<DataTable>,
     label: SharedString,
@@ -107,6 +143,10 @@ impl DataTablePanel {
             label: "Data Table".into(),
         }
     }
+
+    pub fn from_config(_cfg: DataTablePanelConfig, db: Arc<DB>, cx: &mut Context<Self>) -> Self {
+        Self::new(db, cx)
+    }
 }
 
 impl Render for DataTablePanel {
@@ -116,6 +156,8 @@ impl Render for DataTablePanel {
 }
 
 impl PaneItem for DataTablePanel {
+    type Config = DataTablePanelConfig;
+
     fn tab_title(&self, _cx: &App) -> SharedString {
         self.label.clone()
     }
@@ -124,10 +166,14 @@ impl PaneItem for DataTablePanel {
         "data_table"
     }
 
-    fn serialize(&self, _cx: &App) -> serde_json::Value {
-        serde_json::json!({})
+    fn to_config(&self, _cx: &App) -> DataTablePanelConfig {
+        DataTablePanelConfig {}
     }
 }
+
+/// Persisted shape of a [`BrowserPanel`]. No per-instance configuration today.
+#[derive(facet::Facet, Default)]
+pub struct BrowserPanelConfig {}
 
 /// Pane item with a Finder-style browser over the component namespace tree.
 pub struct BrowserPanel {
@@ -143,6 +189,10 @@ impl BrowserPanel {
             label: "Components".into(),
         }
     }
+
+    pub fn from_config(_cfg: BrowserPanelConfig, db: Arc<DB>, cx: &mut Context<Self>) -> Self {
+        Self::new(db, cx)
+    }
 }
 
 impl Render for BrowserPanel {
@@ -152,6 +202,8 @@ impl Render for BrowserPanel {
 }
 
 impl PaneItem for BrowserPanel {
+    type Config = BrowserPanelConfig;
+
     fn tab_title(&self, _cx: &App) -> SharedString {
         self.label.clone()
     }
@@ -160,8 +212,8 @@ impl PaneItem for BrowserPanel {
         "component_browser"
     }
 
-    fn serialize(&self, _cx: &App) -> serde_json::Value {
-        serde_json::json!({})
+    fn to_config(&self, _cx: &App) -> BrowserPanelConfig {
+        BrowserPanelConfig {}
     }
 }
 
@@ -194,11 +246,7 @@ impl PlotPanel {
     }
 
     /// Build a plot seeded with an explicit trace list.
-    pub fn with_traces(
-        db: Arc<DB>,
-        traces: Vec<crate::views::time_series::Trace>,
-        cx: &mut Context<Self>,
-    ) -> Self {
+    pub fn with_traces(db: Arc<DB>, traces: Vec<Trace>, cx: &mut Context<Self>) -> Self {
         let inner = cx.new(|cx| TimeSeriesPlot::new(db, traces, cx));
         let line_plot = inner.read(cx).line_plot().clone();
         Self { inner, line_plot }
@@ -215,7 +263,98 @@ impl Render for PlotPanel {
     }
 }
 
+/// Persisted shape of a [`PlotPanel`].
+///
+/// `x_range` is intentionally absent: `TimeRangeBehavior::Offset` carries
+/// `std::time::Duration`/`Timestamp` variants that aren't `Facet` yet, so it
+/// can't round-trip through `facet-json` without a parallel config struct.
+/// Adding it is a follow-up.
+#[derive(facet::Facet, Default)]
+pub struct PlotPanelConfig {
+    pub label: String,
+    pub traces: Vec<TraceConfig>,
+    pub custom_title: Override<String>,
+    pub y_min_override: Override<f64>,
+    pub y_max_override: Override<f64>,
+}
+
+/// Persisted shape of one [`Trace`].
+///
+/// `Trace` itself marks `component_id` and `element_index` as
+/// `#[facet(skip)]` because the inspector doesn't expose them — but we *do*
+/// need them on disk, so the persistence boundary uses this parallel
+/// struct.
+#[derive(facet::Facet, Clone)]
+pub struct TraceConfig {
+    pub component_id: ComponentId,
+    pub element_index: usize,
+    pub color: Hsla,
+    pub style: PlotStyle,
+    pub visible: bool,
+    pub label: String,
+    pub stroke_width: f32,
+}
+
+impl Default for TraceConfig {
+    fn default() -> Self {
+        Self {
+            component_id: ComponentId(0),
+            element_index: 0,
+            color: Hsla::default(),
+            style: PlotStyle::default(),
+            visible: true,
+            label: String::new(),
+            stroke_width: 1.5,
+        }
+    }
+}
+
+impl From<&Trace> for TraceConfig {
+    fn from(t: &Trace) -> Self {
+        Self {
+            component_id: t.component_id,
+            element_index: t.element_index,
+            color: t.color,
+            style: t.style,
+            visible: t.visible,
+            label: t.label.to_string(),
+            stroke_width: t.stroke_width,
+        }
+    }
+}
+
+impl From<TraceConfig> for Trace {
+    fn from(t: TraceConfig) -> Self {
+        Self {
+            component_id: t.component_id,
+            element_index: t.element_index,
+            color: t.color,
+            style: t.style,
+            visible: t.visible,
+            label: t.label.into(),
+            stroke_width: t.stroke_width,
+        }
+    }
+}
+
+impl PlotPanel {
+    pub fn from_config(cfg: PlotPanelConfig, db: Arc<DB>, cx: &mut Context<Self>) -> Self {
+        let traces: Vec<Trace> = cfg.traces.into_iter().map(Trace::from).collect();
+        let panel = Self::with_traces(db, traces, cx);
+        let line_plot = panel.line_plot.clone();
+        line_plot.update(cx, |lp, cx| {
+            lp.custom_title = cfg.custom_title.map(SharedString::from);
+            lp.y_min_override = cfg.y_min_override;
+            lp.y_max_override = cfg.y_max_override;
+            cx.notify();
+        });
+        panel
+    }
+}
+
 impl PaneItem for PlotPanel {
+    type Config = PlotPanelConfig;
+
     fn tab_title(&self, cx: &App) -> SharedString {
         self.inner.read(cx).title(cx)
     }
@@ -224,13 +363,76 @@ impl PaneItem for PlotPanel {
         "time_series_plot"
     }
 
-    fn serialize(&self, cx: &App) -> serde_json::Value {
-        let title = self.tab_title(cx);
-        serde_json::json!({ "label": title.as_ref() })
+    fn to_config(&self, cx: &App) -> PlotPanelConfig {
+        let lp = self.line_plot.read(cx);
+        PlotPanelConfig {
+            label: self.tab_title(cx).to_string(),
+            traces: lp
+                .traces()
+                .iter()
+                .map(|e| TraceConfig::from(e.read(cx)))
+                .collect(),
+            custom_title: lp.custom_title.as_ref().map(|s| s.to_string()),
+            y_min_override: lp.y_min_override.clone(),
+            y_max_override: lp.y_max_override.clone(),
+        }
     }
 
     fn inspectable_entity(&self) -> Option<gpui::AnyEntity> {
         Some(self.line_plot.clone().into_any())
+    }
+}
+
+/// Persisted shape of a [`Viewer3dPanel`].
+#[derive(facet::Facet, Default)]
+pub struct Viewer3dPanelConfig {
+    pub models: Vec<ModelConfig>,
+    pub camera: CameraConfig,
+}
+
+/// Persisted shape of one model entry inside a [`Viewer3dPanel`].
+///
+/// Mirrors the data fields of [`crate::views::viewer_3d::ModelEntry`] but
+/// avoids the live `Entity` wrapping so the config can round-trip directly.
+#[derive(facet::Facet, Default)]
+pub struct ModelConfig {
+    pub label: String,
+    pub path: String,
+    pub position_binding: Option<ComponentId>,
+    pub orientation_binding: Option<ComponentId>,
+}
+
+/// Persisted shape of [`crate::views::viewer_3d::OrbitCamera`].
+///
+/// `glam::Vec3` is not `Facet`, so the target is unpacked into three fields
+/// at the persistence boundary.
+#[derive(facet::Facet)]
+pub struct CameraConfig {
+    pub target_x: f32,
+    pub target_y: f32,
+    pub target_z: f32,
+    pub yaw: f32,
+    pub pitch: f32,
+    pub distance: f32,
+    pub fov_y_rad: f32,
+}
+
+impl Default for CameraConfig {
+    /// Mirror [`crate::views::viewer_3d::OrbitCamera::default`] so a parse
+    /// failure that falls back to `Default` still yields a usable camera.
+    /// The auto-derived all-zero default would render nothing
+    /// (`fov_y_rad == 0` collapses the projection matrix).
+    fn default() -> Self {
+        let cam = crate::views::viewer_3d::OrbitCamera::default();
+        Self {
+            target_x: cam.target.x,
+            target_y: cam.target.y,
+            target_z: cam.target.z,
+            yaw: cam.yaw,
+            pitch: cam.pitch,
+            distance: cam.distance,
+            fov_y_rad: cam.fov_y_rad,
+        }
     }
 }
 
@@ -248,6 +450,46 @@ impl Viewer3dPanel {
             label: "3D Viewer".into(),
         }
     }
+
+    /// Rebuild a [`Viewer3dPanel`] from its persisted config.
+    ///
+    /// Spawns models through the public `add_model` API; bindings get reset
+    /// directly on each [`crate::views::viewer_3d::ModelEntry`] entity so
+    /// the viewer's reconcile pass picks them up on the next observe tick.
+    pub fn from_config(cfg: Viewer3dPanelConfig, db: Arc<DB>, cx: &mut Context<Self>) -> Self {
+        let inner = cx.new(|cx| {
+            let mut viewer = Viewer3d::with_db(db, cx);
+            for model in &cfg.models {
+                viewer.add_model(model.label.clone(), model.path.clone(), cx);
+                if let Some(entry) = viewer.models().last().cloned() {
+                    let pos = model.position_binding;
+                    let orient = model.orientation_binding;
+                    entry.update(cx, |m, cx| {
+                        m.position_binding = pos;
+                        m.orientation_binding = orient;
+                        cx.notify();
+                    });
+                }
+            }
+            let cam = viewer.camera_mut();
+            cam.target = glam::Vec3::new(
+                cfg.camera.target_x,
+                cfg.camera.target_y,
+                cfg.camera.target_z,
+            );
+            cam.yaw = cfg.camera.yaw;
+            cam.pitch = cfg.camera.pitch;
+            cam.distance = cfg.camera.distance;
+            cam.fov_y_rad = cfg.camera.fov_y_rad;
+            viewer.camera_fov = cfg.camera.fov_y_rad;
+            viewer.sync_camera(cx);
+            viewer
+        });
+        Self {
+            inner,
+            label: "3D Viewer".into(),
+        }
+    }
 }
 
 impl Render for Viewer3dPanel {
@@ -257,6 +499,8 @@ impl Render for Viewer3dPanel {
 }
 
 impl PaneItem for Viewer3dPanel {
+    type Config = Viewer3dPanelConfig;
+
     fn tab_title(&self, _cx: &App) -> SharedString {
         self.label.clone()
     }
@@ -265,36 +509,34 @@ impl PaneItem for Viewer3dPanel {
         "viewer_3d"
     }
 
-    fn serialize(&self, cx: &App) -> serde_json::Value {
+    fn to_config(&self, cx: &App) -> Viewer3dPanelConfig {
         let inner = self.inner.read(cx);
         let cam = inner.camera();
-        let models: Vec<serde_json::Value> = inner
+        let models = inner
             .models()
             .iter()
             .map(|m| {
                 let m = m.read(cx);
-                serde_json::json!({
-                    "label": m.label.as_ref(),
-                    "path": m.path,
-                    "position_binding": m
-                        .position_binding_component()
-                        .map(|c| format!("{:?}", c)),
-                    "orientation_binding": m
-                        .orientation_binding_component()
-                        .map(|c| format!("{:?}", c)),
-                })
+                ModelConfig {
+                    label: m.label.to_string(),
+                    path: m.path.clone(),
+                    position_binding: m.position_binding_component(),
+                    orientation_binding: m.orientation_binding_component(),
+                }
             })
             .collect();
-        serde_json::json!({
-            "models": models,
-            "camera": {
-                "target": [cam.target.x, cam.target.y, cam.target.z],
-                "yaw": cam.yaw,
-                "pitch": cam.pitch,
-                "distance": cam.distance,
-                "fov_y_rad": cam.fov_y_rad,
+        Viewer3dPanelConfig {
+            models,
+            camera: CameraConfig {
+                target_x: cam.target.x,
+                target_y: cam.target.y,
+                target_z: cam.target.z,
+                yaw: cam.yaw,
+                pitch: cam.pitch,
+                distance: cam.distance,
+                fov_y_rad: cam.fov_y_rad,
             },
-        })
+        }
     }
 
     fn inspectable_entity(&self) -> Option<gpui::AnyEntity> {
@@ -388,8 +630,7 @@ pub fn new_panel_rows(
         Arc::new(move |_window, cx| {
             let db = db.clone();
             pane.update(cx, |pane, cx| {
-                let item: Box<dyn PaneItemHandle> =
-                    Box::new(cx.new(|cx| TablePanel::new(db, cx)));
+                let item: Box<dyn PaneItemHandle> = Box::new(cx.new(|cx| TablePanel::new(db, cx)));
                 pane.add_item(item, cx);
             });
         })
@@ -467,4 +708,77 @@ pub fn component_picker_rows(
             )) as Box<dyn InspectorRow>
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use metor_proto::types::ComponentId;
+
+    /// Each panel's `*Config` round-trips through facet-json without loss.
+    /// Mirrors the per-instance shape that `to_config` would produce; this
+    /// test pins the wire format independently of the panel-construction
+    /// code path so a missing field in either direction shows up here.
+    #[test]
+    fn panel_configs_round_trip_through_facet_json() {
+        let text = TextPanelConfig {
+            component: "altitude".into(),
+        };
+        let s = facet_json::to_string(&text).unwrap();
+        let back: TextPanelConfig = facet_json::from_str(&s).unwrap();
+        assert_eq!(back.component, "altitude");
+
+        let plot = PlotPanelConfig {
+            label: "speed".into(),
+            traces: vec![TraceConfig {
+                component_id: ComponentId(3),
+                element_index: 1,
+                color: Hsla::default(),
+                style: PlotStyle::Line,
+                visible: true,
+                label: "vx".into(),
+                stroke_width: 2.0,
+            }],
+            custom_title: Override::Custom("My View".into()),
+            y_min_override: Override::Custom(-10.0),
+            y_max_override: Override::Auto,
+        };
+        let s = facet_json::to_string(&plot).unwrap();
+        let back: PlotPanelConfig = facet_json::from_str(&s).unwrap();
+        assert_eq!(back.label, "speed");
+        assert_eq!(back.traces.len(), 1);
+        assert_eq!(back.traces[0].component_id, ComponentId(3));
+        assert_eq!(back.traces[0].element_index, 1);
+        assert_eq!(back.traces[0].label, "vx");
+        assert!(matches!(back.custom_title, Override::Custom(s) if s == "My View"));
+        assert!(matches!(back.y_min_override, Override::Custom(v) if (v + 10.0).abs() < 1e-9));
+        assert!(matches!(back.y_max_override, Override::Auto));
+
+        let viewer = Viewer3dPanelConfig {
+            models: vec![ModelConfig {
+                label: "satellite".into(),
+                path: "sat.glb".into(),
+                position_binding: Some(ComponentId(7)),
+                orientation_binding: None,
+            }],
+            camera: CameraConfig {
+                target_x: 1.0,
+                target_y: 2.0,
+                target_z: 3.0,
+                yaw: 0.5,
+                pitch: 0.25,
+                distance: 10.0,
+                fov_y_rad: std::f32::consts::FRAC_PI_3,
+            },
+        };
+        let s = facet_json::to_string(&viewer).unwrap();
+        let back: Viewer3dPanelConfig = facet_json::from_str(&s).unwrap();
+        assert_eq!(back.models.len(), 1);
+        assert_eq!(back.models[0].label, "satellite");
+        assert_eq!(back.models[0].path, "sat.glb");
+        assert_eq!(back.models[0].position_binding, Some(ComponentId(7)));
+        assert_eq!(back.models[0].orientation_binding, None);
+        assert_eq!(back.camera.target_x, 1.0);
+        assert_eq!(back.camera.fov_y_rad, std::f32::consts::FRAC_PI_3);
+    }
 }

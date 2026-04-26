@@ -159,8 +159,8 @@ impl LinePlot {
         }
         for trace in &self.traces {
             let id = trace.entity_id();
-            if !self.tracking.contains_key(&id) {
-                self.tracking.insert(id, TraceTracking::new());
+            if let std::collections::hash_map::Entry::Vacant(slot) = self.tracking.entry(id) {
+                slot.insert(TraceTracking::new());
                 let task = Self::spawn_tracker(id, trace.clone(), self.db.clone(), cx);
                 self.tasks.insert(id, task);
             }
@@ -444,7 +444,8 @@ fn derive_title(traces: &[Entity<Trace>], db: &Arc<DB>, cx: &gpui::App) -> Share
         .iter()
         .map(|comp_id| {
             let indexes = &groups[comp_id];
-            let all_elements = crate::inspector::trace_picker::element_names_for_component(db, *comp_id);
+            let all_elements =
+                crate::inspector::trace_picker::element_names_for_component(db, *comp_id);
             let comp_name = db
                 .with_state(|s| s.get_component_metadata(*comp_id).map(|m| m.name.clone()))
                 .unwrap_or_default();

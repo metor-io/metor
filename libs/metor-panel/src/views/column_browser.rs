@@ -189,12 +189,7 @@ impl<D: ColumnBrowserDelegate> ColumnBrowser<D> {
         }
     }
 
-    fn items_for_column(
-        &self,
-        column_ix: usize,
-        selection: &[D::Item],
-        cx: &App,
-    ) -> Vec<D::Item> {
+    fn items_for_column(&self, column_ix: usize, selection: &[D::Item], cx: &App) -> Vec<D::Item> {
         if column_ix == 0 {
             self.delegate.root_items(cx)
         } else {
@@ -226,8 +221,7 @@ impl<D: ColumnBrowserDelegate> ColumnBrowser<D> {
                 if items.is_empty() {
                     return;
                 }
-                let next = match self
-                    .selected_ix_in_column(self.focused_column, &selection, &items)
+                let next = match self.selected_ix_in_column(self.focused_column, &selection, &items)
                 {
                     Some(i) => {
                         let delta: isize = if key == "up" { -1 } else { 1 };
@@ -295,8 +289,8 @@ impl<D: ColumnBrowserDelegate> ColumnBrowser<D> {
             .on_drag(ResizeDrag(column_ix), |drag, _, _, cx| {
                 cx.new(|_| drag.clone())
             })
-            .on_drag_move(cx.listener(
-                move |this, e: &DragMoveEvent<ResizeDrag>, _window, cx| {
+            .on_drag_move(
+                cx.listener(move |this, e: &DragMoveEvent<ResizeDrag>, _window, cx| {
                     let ix = e.drag(cx).0;
                     let Some(left) = this.column_bounds.get(ix).map(|b| b.left()) else {
                         return;
@@ -309,8 +303,8 @@ impl<D: ColumnBrowserDelegate> ColumnBrowser<D> {
                         *slot = new_width;
                         cx.notify();
                     }
-                },
-            ))
+                }),
+            )
             .into_any_element()
     }
 
@@ -408,17 +402,17 @@ impl<D: ColumnBrowserDelegate> ColumnBrowser<D> {
             .on_mouse_down(
                 MouseButton::Right,
                 cx.listener(move |this, event: &MouseDownEvent, window, cx| {
-                    this.delegate
-                        .on_context_menu(column_ix, Some(&item_right), event.position, window, cx);
+                    this.delegate.on_context_menu(
+                        column_ix,
+                        Some(&item_right),
+                        event.position,
+                        window,
+                        cx,
+                    );
                     cx.stop_propagation();
                 }),
             )
-            .child(
-                div()
-                    .flex_1()
-                    .overflow_hidden()
-                    .child(label),
-            );
+            .child(div().flex_1().overflow_hidden().child(label));
 
         if !is_leaf {
             row = row.child(Icon::ChevronRight.svg(8.0));
@@ -539,12 +533,7 @@ impl<D: ColumnBrowserDelegate> ColumnBrowser<D> {
                     .flex_col()
                     .size_full()
                     .child(header)
-                    .child(
-                        div()
-                            .flex_1()
-                            .overflow_hidden()
-                            .child(list_view),
-                    ),
+                    .child(div().flex_1().overflow_hidden().child(list_view)),
             )
             .child(scrollbar_overlay)
             .child(
@@ -588,13 +577,7 @@ impl<D: ColumnBrowserDelegate> ColumnBrowser<D> {
             .overflow_hidden()
             .bg(theme.bg_primary)
             .child(header)
-            .child(
-                div()
-                    .flex_1()
-                    .overflow_hidden()
-                    .p(px(8.0))
-                    .child(content),
-            )
+            .child(div().flex_1().overflow_hidden().p(px(8.0)).child(content))
             .into_any_element()
     }
 }

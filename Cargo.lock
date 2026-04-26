@@ -5843,6 +5843,42 @@ dependencies = [
 ]
 
 [[package]]
+name = "facet-dessert"
+version = "0.44.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0fb18a3e7ee90139051f679390662ae158439c1564b73b482676b9a3862d13c0"
+dependencies = [
+ "facet-core",
+ "facet-reflect",
+]
+
+[[package]]
+name = "facet-format"
+version = "0.44.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d87b44b7183a982f8c9889b7ec50bf8f1a38318a77069084436cc908bb1e5e96"
+dependencies = [
+ "facet-core",
+ "facet-dessert",
+ "facet-path",
+ "facet-reflect",
+ "facet-solver",
+]
+
+[[package]]
+name = "facet-json"
+version = "0.44.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "81791a228a3d57e2e982430f92ad2a219feaca8f21234316a830246594f64e84"
+dependencies = [
+ "facet",
+ "facet-core",
+ "facet-format",
+ "facet-reflect",
+ "memchr",
+]
+
+[[package]]
 name = "facet-macro-parse"
 version = "0.44.3"
 source = "git+https://github.com/metor-io/facet.git?branch=sphw%2Ffacet-gpui#e41048a3680e9af8b434cc5cff1d0a53db2dded0"
@@ -5901,6 +5937,16 @@ dependencies = [
  "hashbrown 0.16.1",
  "regex",
  "smallvec 2.0.0-alpha.12",
+]
+
+[[package]]
+name = "facet-solver"
+version = "0.44.3"
+source = "git+https://github.com/metor-io/facet.git?branch=sphw%2Ffacet-gpui#e41048a3680e9af8b434cc5cff1d0a53db2dded0"
+dependencies = [
+ "facet-core",
+ "facet-reflect",
+ "strsim 0.11.1",
 ]
 
 [[package]]
@@ -9052,7 +9098,11 @@ dependencies = [
  "bytemuck",
  "cocoa 0.26.1",
  "crossbeam-channel",
+ "dirs 5.0.1",
  "facet",
+ "facet-dessert",
+ "facet-format",
+ "facet-json",
  "glam 0.32.1",
  "gpui",
  "hifitime",
@@ -9068,8 +9118,6 @@ dependencies = [
  "pollster 0.4.0",
  "postcard",
  "regex",
- "serde",
- "serde_json",
  "smallvec 1.15.1",
  "stellarator",
  "thingbuf",
