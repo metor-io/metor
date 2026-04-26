@@ -13,9 +13,9 @@ use gpui::{
 };
 use metor_db::DB;
 
-use crate::views::{Scrollbar, TimeSeriesPlot};
-use crate::theme::theme;
 use crate::inspector::rows::{CommandRow, DefaultActionRow, InspectorRow, NavRow};
+use crate::theme::theme;
+use crate::views::{Scrollbar, TimeSeriesPlot};
 
 use crate::tiles::PaneItem;
 
@@ -23,8 +23,8 @@ mod chrome;
 mod interaction;
 mod widgets;
 
-pub use widgets::{WidgetRegistry, WidgetSpec};
 use widgets::create_widget_view;
+pub use widgets::{WidgetRegistry, WidgetSpec};
 
 const SNAP_GRID_PX: f32 = 10.0;
 
@@ -144,10 +144,7 @@ impl DashboardPanel {
     ///
     /// Consumed by the palette's `Widget` category so each widget is
     /// reachable without opening the dashboard first.
-    pub fn inspectable_widgets(
-        &self,
-        cx: &App,
-    ) -> Vec<(WidgetId, gpui::AnyEntity, SharedString)> {
+    pub fn inspectable_widgets(&self, cx: &App) -> Vec<(WidgetId, gpui::AnyEntity, SharedString)> {
         self.widgets
             .iter()
             .filter_map(|w| {
@@ -206,12 +203,7 @@ impl DashboardPanel {
         id
     }
 
-    fn add_widget(
-        &mut self,
-        kind: WidgetKind,
-        config: String,
-        cx: &mut Context<Self>,
-    ) -> WidgetId {
+    fn add_widget(&mut self, kind: WidgetKind, config: String, cx: &mut Context<Self>) -> WidgetId {
         let id = self.alloc_id();
         let (w, h) = kind.default_size(cx);
         let rect = self.auto_place(w, h);
@@ -369,26 +361,30 @@ pub fn dashboard_rows(
             .iter()
             .map(|w| (w.id, widget_display_label(w, cx)))
             .collect();
-        rows.push(Box::new(NavRow::new("Remove Widget", SharedString::new_static(""), {
-            let dashboard = dashboard.clone();
-            Box::new(move |_cx| {
-                widget_infos
-                    .iter()
-                    .map(|(widget_id, label)| {
-                        let widget_id = *widget_id;
-                        let dashboard = dashboard.clone();
-                        Box::new(CommandRow::new(
-                            label.clone(),
-                            Arc::new(move |_window, cx| {
-                                dashboard.update(cx, |this, cx| {
-                                    this.remove_widget(widget_id, cx);
-                                });
-                            }),
-                        )) as Box<dyn InspectorRow>
-                    })
-                    .collect()
-            })
-        })));
+        rows.push(Box::new(NavRow::new(
+            "Remove Widget",
+            SharedString::new_static(""),
+            {
+                let dashboard = dashboard.clone();
+                Box::new(move |_cx| {
+                    widget_infos
+                        .iter()
+                        .map(|(widget_id, label)| {
+                            let widget_id = *widget_id;
+                            let dashboard = dashboard.clone();
+                            Box::new(CommandRow::new(
+                                label.clone(),
+                                Arc::new(move |_window, cx| {
+                                    dashboard.update(cx, |this, cx| {
+                                        this.remove_widget(widget_id, cx);
+                                    });
+                                }),
+                            )) as Box<dyn InspectorRow>
+                        })
+                        .collect()
+                })
+            },
+        )));
     }
 
     let selected = dashboard.read(cx).selected;
@@ -411,31 +407,32 @@ pub fn dashboard_rows(
         })));
     }
 
-    rows.push(Box::new(NavRow::new("Rename", SharedString::new_static(""), {
-        let dashboard = dashboard.clone();
-        Box::new(move |_cx| {
+    rows.push(Box::new(NavRow::new(
+        "Rename",
+        SharedString::new_static(""),
+        {
             let dashboard = dashboard.clone();
-            vec![Box::new(DefaultActionRow {
-                label: "Dashboard name...".into(),
-                callback: Arc::new(move |input, _window, cx| {
-                    if !input.is_empty() {
-                        dashboard.update(cx, |this, cx| {
-                            this.title = SharedString::from(input);
-                            cx.notify();
-                        });
-                    }
-                }),
-            }) as Box<dyn InspectorRow>]
-        })
-    })));
+            Box::new(move |_cx| {
+                let dashboard = dashboard.clone();
+                vec![Box::new(DefaultActionRow {
+                    label: "Dashboard name...".into(),
+                    callback: Arc::new(move |input, _window, cx| {
+                        if !input.is_empty() {
+                            dashboard.update(cx, |this, cx| {
+                                this.title = SharedString::from(input);
+                                cx.notify();
+                            });
+                        }
+                    }),
+                }) as Box<dyn InspectorRow>]
+            })
+        },
+    )));
 
     rows
 }
 
-fn add_widget_rows(
-    dashboard: Entity<DashboardPanel>,
-    db: Arc<DB>,
-) -> Vec<Box<dyn InspectorRow>> {
+fn add_widget_rows(dashboard: Entity<DashboardPanel>, db: Arc<DB>) -> Vec<Box<dyn InspectorRow>> {
     let mut rows: Vec<Box<dyn InspectorRow>> = Vec::new();
 
     rows.push(Box::new(NavRow::new(
@@ -467,13 +464,17 @@ fn add_widget_rows(
             })
         },
     )));
-    rows.push(Box::new(NavRow::new("Component Text", SharedString::new_static(""), {
-        let dashboard = dashboard.clone();
-        let db = db.clone();
-        Box::new(move |_cx| {
-            component_picker_rows(dashboard.clone(), db.clone(), WidgetKind::text())
-        })
-    })));
+    rows.push(Box::new(NavRow::new(
+        "Component Text",
+        SharedString::new_static(""),
+        {
+            let dashboard = dashboard.clone();
+            let db = db.clone();
+            Box::new(move |_cx| {
+                component_picker_rows(dashboard.clone(), db.clone(), WidgetKind::text())
+            })
+        },
+    )));
     rows.push(Box::new(CommandRow::new("Component Table", {
         let dashboard = dashboard.clone();
         Arc::new(move |_window, cx| {
@@ -482,17 +483,25 @@ fn add_widget_rows(
             });
         })
     })));
-    rows.push(Box::new(NavRow::new("Monitor", SharedString::new_static(""), {
-        let dashboard = dashboard.clone();
-        let db = db.clone();
-        Box::new(move |_cx| {
-            component_picker_rows(dashboard.clone(), db.clone(), WidgetKind::monitor())
-        })
-    })));
-    rows.push(Box::new(NavRow::new("Image", SharedString::new_static(""), {
-        let dashboard = dashboard.clone();
-        Box::new(move |_cx| image_path_rows(dashboard.clone()))
-    })));
+    rows.push(Box::new(NavRow::new(
+        "Monitor",
+        SharedString::new_static(""),
+        {
+            let dashboard = dashboard.clone();
+            let db = db.clone();
+            Box::new(move |_cx| {
+                component_picker_rows(dashboard.clone(), db.clone(), WidgetKind::monitor())
+            })
+        },
+    )));
+    rows.push(Box::new(NavRow::new(
+        "Image",
+        SharedString::new_static(""),
+        {
+            let dashboard = dashboard.clone();
+            Box::new(move |_cx| image_path_rows(dashboard.clone()))
+        },
+    )));
     rows.push(Box::new(CommandRow::new("3D Viewer", {
         let dashboard = dashboard.clone();
         Arc::new(move |_window, cx| {
@@ -549,8 +558,7 @@ fn image_path_rows(dashboard: Entity<DashboardPanel>) -> Vec<Box<dyn InspectorRo
                 let cfg = widgets::ImageWidgetConfig {
                     path: input.to_string(),
                 };
-                let config =
-                    facet_json::to_string(&cfg).expect("image widget config serializes");
+                let config = facet_json::to_string(&cfg).expect("image widget config serializes");
                 dashboard.update(cx, |this, cx| {
                     this.add_widget(WidgetKind::image(), config, cx);
                 });
@@ -679,20 +687,6 @@ impl Render for DashboardPanel {
     }
 }
 
-impl PaneItem for DashboardPanel {
-    fn tab_title(&self, _cx: &App) -> SharedString {
-        self.title.clone()
-    }
-
-    fn serialization_key() -> &'static str {
-        "dashboard"
-    }
-
-    fn serialize(&self, cx: &App) -> String {
-        facet_json::to_string(&self.to_config(cx)).expect("dashboard panel config serializes")
-    }
-}
-
 /// Persisted shape of [`DashboardPanel`].
 #[derive(facet::Facet, Default)]
 pub struct DashboardPanelConfig {
@@ -701,8 +695,18 @@ pub struct DashboardPanelConfig {
     pub widgets: Vec<DashboardWidget>,
 }
 
-impl DashboardPanel {
-    pub fn to_config(&self, cx: &App) -> DashboardPanelConfig {
+impl PaneItem for DashboardPanel {
+    type Config = DashboardPanelConfig;
+
+    fn tab_title(&self, _cx: &App) -> SharedString {
+        self.title.clone()
+    }
+
+    fn serialization_key() -> &'static str {
+        "dashboard"
+    }
+
+    fn to_config(&self, cx: &App) -> DashboardPanelConfig {
         // Refresh widget configs from live entities so inspector edits land
         // on disk. Today only `plot` widgets diverge from their cached blob
         // (the user can add/remove traces, edit overrides). The other kinds

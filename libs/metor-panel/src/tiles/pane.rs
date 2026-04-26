@@ -53,7 +53,9 @@ pub enum PaneEvent {
         item: Box<dyn PaneItemHandle>,
         position: Point<Pixels>,
     },
-    InspectPane { position: Point<Pixels> },
+    InspectPane {
+        position: Point<Pixels>,
+    },
 }
 
 impl EventEmitter<PaneEvent> for Pane {}

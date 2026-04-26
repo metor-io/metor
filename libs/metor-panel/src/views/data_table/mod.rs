@@ -147,20 +147,14 @@ impl ColumnBrowserDelegate for DataTableDelegate {
     fn items_equal(&self, a: &Self::Item, b: &Self::Item) -> bool {
         match (a, b) {
             (DataTableItem::Group { name: x }, DataTableItem::Group { name: y }) => x == y,
-            (
-                DataTableItem::Instance { name: x, .. },
-                DataTableItem::Instance { name: y, .. },
-            ) => x == y,
+            (DataTableItem::Instance { name: x, .. }, DataTableItem::Instance { name: y, .. }) => {
+                x == y
+            }
             _ => false,
         }
     }
 
-    fn set_selection(
-        &mut self,
-        column_ix: usize,
-        item: &Self::Item,
-        cx: &mut Context<DataTable>,
-    ) {
+    fn set_selection(&mut self, column_ix: usize, item: &Self::Item, cx: &mut Context<DataTable>) {
         match (column_ix, item) {
             (0, DataTableItem::Group { name }) => {
                 self.selected_group = Some(name.clone());

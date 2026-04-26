@@ -3,15 +3,15 @@
 use std::sync::Arc;
 
 use crate::inspector::Inspector;
-use crate::inspector::{InspectorMode, InspectorRequest, OpenInspectorGlobal};
-use crate::inspector::palette::ItemRegistry;
-use crate::inspector::edits::{self, edit_value_rows, pending_edits, pending_edits_mut, review_rows};
-use crate::tiles::{PlotComponentAction, TileGroup, TileGroupEvent};
-use crate::tiles::panels::{
-    BrowserPanel, DataTablePanel, PlotPanel, PlotPanelConfig, TablePanel, TablePanelConfig,
-    DataTablePanelConfig, BrowserPanelConfig, TextPanel, TextPanelConfig, Viewer3dPanel,
-    Viewer3dPanelConfig,
+use crate::inspector::edits::{
+    self, edit_value_rows, pending_edits, pending_edits_mut, review_rows,
 };
+use crate::inspector::palette::ItemRegistry;
+use crate::inspector::{InspectorMode, InspectorRequest, OpenInspectorGlobal};
+use crate::tiles::panels::{
+    BrowserPanel, DataTablePanel, PlotPanel, TablePanel, TextPanel, Viewer3dPanel,
+};
+use crate::tiles::{PlotComponentAction, TileGroup, TileGroupEvent};
 use crate::views::dashboard::{DashboardPanel, deserialize_dashboard};
 use gpui::{
     App, Application, Bounds, Context, Entity, FocusHandle, Focusable, IntoElement, KeyBinding,
@@ -55,7 +55,12 @@ impl AppRoot {
         cx.subscribe(&tiles, Self::handle_tile_event).detach();
         let on_open_inspector = Self::make_on_open_inspector(cx.entity().clone());
         cx.set_global(OpenInspectorGlobal(on_open_inspector.clone()));
-        crate::inspector::palette::register_builtin_providers(db.clone(), tiles.clone(), on_open_inspector, cx);
+        crate::inspector::palette::register_builtin_providers(
+            db.clone(),
+            tiles.clone(),
+            on_open_inspector,
+            cx,
+        );
         Self {
             db,
             tiles,
@@ -426,55 +431,36 @@ fn register_pane_item_deserializers(db: Arc<DB>, cx: &mut App) {
     use crate::tiles::ItemRegistry as PaneItemRegistry;
     let mut reg = PaneItemRegistry::default();
 
-    let db_text = db.clone();
-    reg.register::<TextPanel>(move |state, cx| {
-        let cfg: TextPanelConfig = facet_json::from_str(state).unwrap_or_default();
-        let db = db_text.clone();
-        Some(cx.new(|cx| TextPanel::from_config(cfg, db, cx)))
-    });
+    register_panel::<TextPanel>(&mut reg, db.clone(), TextPanel::from_config);
+    register_panel::<TablePanel>(&mut reg, db.clone(), TablePanel::from_config);
+    register_panel::<DataTablePanel>(&mut reg, db.clone(), DataTablePanel::from_config);
+    register_panel::<BrowserPanel>(&mut reg, db.clone(), BrowserPanel::from_config);
+    register_panel::<PlotPanel>(&mut reg, db.clone(), PlotPanel::from_config);
+    register_panel::<Viewer3dPanel>(&mut reg, db.clone(), Viewer3dPanel::from_config);
 
-    let db_table = db.clone();
-    reg.register::<TablePanel>(move |state, cx| {
-        let cfg: TablePanelConfig = facet_json::from_str(state).unwrap_or_default();
-        let db = db_table.clone();
-        Some(cx.new(|cx| TablePanel::from_config(cfg, db, cx)))
-    });
-
-    let db_data = db.clone();
-    reg.register::<DataTablePanel>(move |state, cx| {
-        let cfg: DataTablePanelConfig = facet_json::from_str(state).unwrap_or_default();
-        let db = db_data.clone();
-        Some(cx.new(|cx| DataTablePanel::from_config(cfg, db, cx)))
-    });
-
-    let db_browser = db.clone();
-    reg.register::<BrowserPanel>(move |state, cx| {
-        let cfg: BrowserPanelConfig = facet_json::from_str(state).unwrap_or_default();
-        let db = db_browser.clone();
-        Some(cx.new(|cx| BrowserPanel::from_config(cfg, db, cx)))
-    });
-
-    let db_plot = db.clone();
-    reg.register::<PlotPanel>(move |state, cx| {
-        let cfg: PlotPanelConfig = facet_json::from_str(state).unwrap_or_default();
-        let db = db_plot.clone();
-        Some(cx.new(|cx| PlotPanel::from_config(cfg, db, cx)))
-    });
-
-    let db_viewer = db.clone();
-    reg.register::<Viewer3dPanel>(move |state, cx| {
-        let cfg: Viewer3dPanelConfig = facet_json::from_str(state).unwrap_or_default();
-        let db = db_viewer.clone();
-        Some(cx.new(|cx| Viewer3dPanel::from_config(cfg, db, cx)))
-    });
-
+    // Dashboard's deserializer returns a fully-constructed entity rather
+    // than a `Self`, so it doesn't fit the generic helper.
     let db_dashboard = db.clone();
     reg.register::<DashboardPanel>(move |state, cx| {
-        let db = db_dashboard.clone();
-        Some(deserialize_dashboard(db, state, cx))
+        Some(deserialize_dashboard(db_dashboard.clone(), state, cx))
     });
 
     cx.set_global(reg);
+}
+
+/// Wire one closure for `T` into the pane-item registry. The closure parses
+/// `T::Config` out of the state blob (falling back to `Default` on parse
+/// failure) and constructs `T` via the supplied `from_config` function.
+fn register_panel<T: crate::tiles::PaneItem>(
+    reg: &mut crate::tiles::ItemRegistry,
+    db: Arc<DB>,
+    from_config: fn(T::Config, Arc<DB>, &mut Context<T>) -> T,
+) {
+    reg.register::<T>(move |state, cx| {
+        let cfg: T::Config = facet_json::from_str(state).unwrap_or_default();
+        let db = db.clone();
+        Some(cx.new(|cx| from_config(cfg, db, cx)))
+    });
 }
 
 #[cfg(target_os = "macos")]

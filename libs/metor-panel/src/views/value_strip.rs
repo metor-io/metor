@@ -10,8 +10,8 @@ use metor_proto::types::{ComponentId, ComponentView, ElementValue, PrimType};
 use smallvec::SmallVec;
 
 use crate::icons::Icon;
-use crate::theme::{Theme, theme};
 use crate::inspector::rows::TextField;
+use crate::theme::{Theme, theme};
 use crate::{AsComponentView, ComponentStream, ComponentStreamBuilder};
 
 /// Display payload for one element of a component.
@@ -158,8 +158,7 @@ impl StripBehavior {
             && self.highlighted == other.highlighted
             && click_ptr(&self.on_element_click) == click_ptr(&other.on_element_click)
             && click_ptr(&self.on_apply_element) == click_ptr(&other.on_apply_element)
-            && click_ptr(&self.on_element_right_click)
-                == click_ptr(&other.on_element_right_click)
+            && click_ptr(&self.on_element_right_click) == click_ptr(&other.on_element_right_click)
     }
 }
 

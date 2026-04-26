@@ -195,11 +195,7 @@ impl TableDelegate for DataTableGrid {
         }
 
         let field_ix = col_ix - 1;
-        let (
-            Some(Some(strip)),
-            Some(Some(click)),
-            Some(Some(component_id)),
-        ) = (
+        let (Some(Some(strip)), Some(Some(click)), Some(Some(component_id))) = (
             row.strips.get(field_ix).cloned(),
             row.clicks.get(field_ix).cloned(),
             row.instance.field_ids.get(field_ix).copied(),

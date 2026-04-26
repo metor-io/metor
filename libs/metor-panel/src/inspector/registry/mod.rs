@@ -240,9 +240,10 @@ impl InspectorRegistry {
                                     item_label,
                                     SharedString::new_static(""),
                                     Box::new(move |cx| {
-                                        let mut sub_rows = crate::inspector::reflect::rows_for_entity(
-                                            &entity, &db, cx,
-                                        );
+                                        let mut sub_rows =
+                                            crate::inspector::reflect::rows_for_entity(
+                                                &entity, &db, cx,
+                                            );
                                         let remove_parent = parent_for_remove.clone();
                                         sub_rows.push(Box::new(CommandRow::new(
                                             "Remove",

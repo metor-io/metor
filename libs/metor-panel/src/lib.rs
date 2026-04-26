@@ -4,7 +4,6 @@ use metor_db::disruptor::{ReadGrant, Reader};
 use metor_db::{Component, ComponentSchema, DB};
 use metor_proto::types::{ComponentId, ComponentView, Timestamp};
 pub mod app;
-pub mod views;
 pub mod gpu_context;
 pub mod icons;
 pub mod inspect;
@@ -12,6 +11,7 @@ pub mod inspector;
 pub mod presets;
 pub mod theme;
 pub mod tiles;
+pub mod views;
 
 /// Borrow as a [`ComponentView`] without copying the backing buffer.
 pub trait AsComponentView {

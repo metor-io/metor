@@ -94,10 +94,6 @@ pub struct ItemRegistry {
 impl Global for ItemRegistry {}
 
 impl ItemRegistry {
-    pub fn new() -> Self {
-        Self::default()
-    }
-
     /// Associate `T`'s serialization key with a constructor from a facet-json
     /// blob. Each panel decides what shape to expect inside `state`; the
     /// closure is responsible for parsing it (typically with

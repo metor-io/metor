@@ -444,7 +444,8 @@ fn derive_title(traces: &[Entity<Trace>], db: &Arc<DB>, cx: &gpui::App) -> Share
         .iter()
         .map(|comp_id| {
             let indexes = &groups[comp_id];
-            let all_elements = crate::inspector::trace_picker::element_names_for_component(db, *comp_id);
+            let all_elements =
+                crate::inspector::trace_picker::element_names_for_component(db, *comp_id);
             let comp_name = db
                 .with_state(|s| s.get_component_metadata(*comp_id).map(|m| m.name.clone()))
                 .unwrap_or_default();

@@ -552,7 +552,10 @@ impl TileGroup {
                     pane.set_tab_orientation(sp.tab_orientation, cx);
                     pane.set_hide_tab_bar(sp.hide_tab_bar, cx);
                     pane.set_locked_size(
-                        sp.locked_size.map(|(w, h)| gpui::Size { width: w, height: h }),
+                        sp.locked_size.map(|(w, h)| gpui::Size {
+                            width: w,
+                            height: h,
+                        }),
                         cx,
                     );
                     pane

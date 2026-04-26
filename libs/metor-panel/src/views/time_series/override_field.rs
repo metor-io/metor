@@ -22,3 +22,23 @@ impl<T: facet::Facet<'static> + 'static> Override<T> {
         }
     }
 }
+
+impl<T> Override<T> {
+    /// Mirror of [`Option::map`]. `Auto` stays `Auto`; `Custom(v)` becomes
+    /// `Custom(f(v))`.
+    pub fn map<U>(self, f: impl FnOnce(T) -> U) -> Override<U> {
+        match self {
+            Self::Auto => Override::Auto,
+            Self::Custom(v) => Override::Custom(f(v)),
+        }
+    }
+
+    /// Mirror of [`Option::as_ref`]: borrow the inner value through the
+    /// override wrapper.
+    pub fn as_ref(&self) -> Override<&T> {
+        match self {
+            Self::Auto => Override::Auto,
+            Self::Custom(v) => Override::Custom(v),
+        }
+    }
+}

@@ -1,4 +1,4 @@
-use gpui::{div, prelude::*, px, Axis, IntoElement};
+use gpui::{Axis, IntoElement, div, prelude::*, px};
 
 use crate::theme::theme;
 
@@ -56,10 +56,7 @@ impl gpui::RenderOnce for Scrollbar {
         let scroll_frac = self.offset.clamp(0.0, max_scroll) / max_scroll;
         let thumb_offset = scroll_frac * (self.viewport - thumb_len);
 
-        let thumb = div()
-            .absolute()
-            .bg(thumb_color)
-            .rounded(px(THUMB_RADIUS));
+        let thumb = div().absolute().bg(thumb_color).rounded(px(THUMB_RADIUS));
 
         let (track, thumb) = match self.axis {
             Axis::Vertical => (

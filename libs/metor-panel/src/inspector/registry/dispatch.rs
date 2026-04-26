@@ -7,9 +7,7 @@ use std::sync::Arc;
 use facet::{ConstTypeId, Facet, Peek, ScalarType};
 use gpui::{AnyEntity, App, SharedString};
 
-use crate::inspector::rows::{
-    BoolRow, EnumRow, InspectorRow, ScalarRow, SliderRow, TextRow,
-};
+use crate::inspector::rows::{BoolRow, EnumRow, InspectorRow, ScalarRow, SliderRow, TextRow};
 
 use super::{FieldBuildCtx, FieldOverride, InspectorRegistry, builders};
 
@@ -158,17 +156,22 @@ fn scalar_as_f64(peek: &Peek<'_, '_>, scalar: ScalarType) -> Option<f64> {
 
 fn read_scalar(any_entity: &AnyEntity, idx: usize, scalar: ScalarType, cx: &App) -> f64 {
     match scalar {
-        ScalarType::F32 => crate::inspector::reflect::get_field::<f32>(any_entity, idx, cx)
-            .map(|v| v as f64),
+        ScalarType::F32 => {
+            crate::inspector::reflect::get_field::<f32>(any_entity, idx, cx).map(|v| v as f64)
+        }
         ScalarType::F64 => crate::inspector::reflect::get_field::<f64>(any_entity, idx, cx),
-        ScalarType::I32 => crate::inspector::reflect::get_field::<i32>(any_entity, idx, cx)
-            .map(|v| v as f64),
-        ScalarType::I64 => crate::inspector::reflect::get_field::<i64>(any_entity, idx, cx)
-            .map(|v| v as f64),
-        ScalarType::U32 => crate::inspector::reflect::get_field::<u32>(any_entity, idx, cx)
-            .map(|v| v as f64),
-        ScalarType::U64 => crate::inspector::reflect::get_field::<u64>(any_entity, idx, cx)
-            .map(|v| v as f64),
+        ScalarType::I32 => {
+            crate::inspector::reflect::get_field::<i32>(any_entity, idx, cx).map(|v| v as f64)
+        }
+        ScalarType::I64 => {
+            crate::inspector::reflect::get_field::<i64>(any_entity, idx, cx).map(|v| v as f64)
+        }
+        ScalarType::U32 => {
+            crate::inspector::reflect::get_field::<u32>(any_entity, idx, cx).map(|v| v as f64)
+        }
+        ScalarType::U64 => {
+            crate::inspector::reflect::get_field::<u64>(any_entity, idx, cx).map(|v| v as f64)
+        }
         _ => None,
     }
     .unwrap_or(0.0)
@@ -176,12 +179,22 @@ fn read_scalar(any_entity: &AnyEntity, idx: usize, scalar: ScalarType, cx: &App)
 
 fn write_scalar(any_entity: &AnyEntity, idx: usize, scalar: ScalarType, v: f64, cx: &mut App) {
     match scalar {
-        ScalarType::F32 => crate::inspector::reflect::set_field::<f32>(any_entity, idx, v as f32, cx),
+        ScalarType::F32 => {
+            crate::inspector::reflect::set_field::<f32>(any_entity, idx, v as f32, cx)
+        }
         ScalarType::F64 => crate::inspector::reflect::set_field::<f64>(any_entity, idx, v, cx),
-        ScalarType::I32 => crate::inspector::reflect::set_field::<i32>(any_entity, idx, v as i32, cx),
-        ScalarType::I64 => crate::inspector::reflect::set_field::<i64>(any_entity, idx, v as i64, cx),
-        ScalarType::U32 => crate::inspector::reflect::set_field::<u32>(any_entity, idx, v as u32, cx),
-        ScalarType::U64 => crate::inspector::reflect::set_field::<u64>(any_entity, idx, v as u64, cx),
+        ScalarType::I32 => {
+            crate::inspector::reflect::set_field::<i32>(any_entity, idx, v as i32, cx)
+        }
+        ScalarType::I64 => {
+            crate::inspector::reflect::set_field::<i64>(any_entity, idx, v as i64, cx)
+        }
+        ScalarType::U32 => {
+            crate::inspector::reflect::set_field::<u32>(any_entity, idx, v as u32, cx)
+        }
+        ScalarType::U64 => {
+            crate::inspector::reflect::set_field::<u64>(any_entity, idx, v as u64, cx)
+        }
         _ => {}
     }
 }

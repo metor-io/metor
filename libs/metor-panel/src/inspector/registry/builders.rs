@@ -209,8 +209,7 @@ pub(super) fn build_trace_add_wizard(
 
     let on_select: crate::inspector::trace_picker::OnTracesSelected =
         Arc::new(move |traces, _w, cx| {
-            let parent: Entity<LinePlot> =
-                parent.clone().downcast().expect("parent type mismatch");
+            let parent: Entity<LinePlot> = parent.clone().downcast().expect("parent type mismatch");
             let new_entities: Vec<_> = traces.into_iter().map(|t| cx.new(|_| t)).collect();
             parent.update(cx, |lp, cx| {
                 lp.traces.extend(new_entities);

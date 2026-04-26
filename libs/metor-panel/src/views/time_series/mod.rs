@@ -632,7 +632,8 @@ impl TimeSeriesPlot {
             indexes
         };
         let theme = crate::theme::theme(cx);
-        let elem_names = crate::inspector::trace_picker::element_names_for_component(&db, component_id);
+        let elem_names =
+            crate::inspector::trace_picker::element_names_for_component(&db, component_id);
         let comp_name = db
             .with_state(|s| {
                 s.get_component_metadata(component_id)

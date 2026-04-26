@@ -41,9 +41,7 @@ impl InspectorRegistry {
             db.clone(),
             |v| &v.models,
             |v| &mut v.models,
-            AddBehavior::Default(Arc::new(|_cx| {
-                crate::views::viewer_3d::ModelEntry::empty()
-            })),
+            AddBehavior::Default(Arc::new(|_cx| crate::views::viewer_3d::ModelEntry::empty())),
         );
         self.register_viewer3d_builder(db.clone());
         self.register_dashboard_builder(db);
@@ -113,7 +111,9 @@ impl InspectorRegistry {
             Box::new(NavRow::new(
                 label,
                 current_name.unwrap_or_else(|| SharedString::from(format!("{}", current))),
-                Box::new(move |cx| builders::build_component_picker(&db, any_entity.clone(), idx, cx)),
+                Box::new(move |cx| {
+                    builders::build_component_picker(&db, any_entity.clone(), idx, cx)
+                }),
             ))
         }));
     }
@@ -183,53 +183,53 @@ impl InspectorRegistry {
     /// The summary shows the matching preset name or, failing that, the
     /// formatted range so off-preset values remain legible at a glance.
     fn register_time_range_behavior(&mut self) {
-        self.register_field_widget::<TimeRangeBehavior>(Arc::new(
-            |ctx, peek, any_entity, idx| {
-                let current = *peek.get::<TimeRangeBehavior>().unwrap();
-                let summary = builders::preset_label(&current)
-                    .map(SharedString::from)
-                    .unwrap_or_else(|| SharedString::from(format!("{}", current)));
-                let label = ctx.label.clone();
-                Box::new(NavRow::new(
-                    label,
-                    summary,
-                    Box::new(move |cx| {
-                        let current = crate::inspector::reflect::get_field::<TimeRangeBehavior>(
-                            &any_entity, idx, cx,
-                        )
-                        .unwrap_or_default();
-                        let mut rows: Vec<Box<dyn InspectorRow>> = TimeRangeBehavior::PRESETS
-                            .iter()
-                            .map(|(name, value)| {
-                                let entity = any_entity.clone();
-                                let value = *value;
-                                Box::new(CommandRow::new(
-                                    *name,
-                                    Arc::new(move |_w, cx| {
-                                        crate::inspector::reflect::set_field::<TimeRangeBehavior>(
-                                            &entity, idx, value, cx,
-                                        );
-                                    }),
-                                )) as Box<dyn InspectorRow>
-                            })
-                            .collect();
-                        let entity = any_entity.clone();
-                        rows.push(Box::new(TextRow::new(
-                            SharedString::new_static("Custom"),
-                            SharedString::from(format!("{}", current)),
-                            Arc::new(move |s, _w, cx| {
-                                if let Ok(value) = s.parse::<TimeRangeBehavior>() {
+        self.register_field_widget::<TimeRangeBehavior>(Arc::new(|ctx, peek, any_entity, idx| {
+            let current = *peek.get::<TimeRangeBehavior>().unwrap();
+            let summary = builders::preset_label(&current)
+                .map(SharedString::from)
+                .unwrap_or_else(|| SharedString::from(format!("{}", current)));
+            let label = ctx.label.clone();
+            Box::new(NavRow::new(
+                label,
+                summary,
+                Box::new(move |cx| {
+                    let current = crate::inspector::reflect::get_field::<TimeRangeBehavior>(
+                        &any_entity,
+                        idx,
+                        cx,
+                    )
+                    .unwrap_or_default();
+                    let mut rows: Vec<Box<dyn InspectorRow>> = TimeRangeBehavior::PRESETS
+                        .iter()
+                        .map(|(name, value)| {
+                            let entity = any_entity.clone();
+                            let value = *value;
+                            Box::new(CommandRow::new(
+                                *name,
+                                Arc::new(move |_w, cx| {
                                     crate::inspector::reflect::set_field::<TimeRangeBehavior>(
                                         &entity, idx, value, cx,
                                     );
-                                }
-                            }),
-                        )));
-                        rows
-                    }),
-                ))
-            },
-        ));
+                                }),
+                            )) as Box<dyn InspectorRow>
+                        })
+                        .collect();
+                    let entity = any_entity.clone();
+                    rows.push(Box::new(TextRow::new(
+                        SharedString::new_static("Custom"),
+                        SharedString::from(format!("{}", current)),
+                        Arc::new(move |s, _w, cx| {
+                            if let Ok(value) = s.parse::<TimeRangeBehavior>() {
+                                crate::inspector::reflect::set_field::<TimeRangeBehavior>(
+                                    &entity, idx, value, cx,
+                                );
+                            }
+                        }),
+                    )));
+                    rows
+                }),
+            ))
+        }));
     }
 
     fn register_viewer3d_builder(&mut self, _db: Arc<DB>) {

@@ -4,16 +4,17 @@
 //! the palette evaluates all providers and flattens the results into the top
 //! page. Pull-based means no lifecycle bookkeeping: destroyed entities
 //! simply stop appearing in the next snapshot.
+use std::path::Path;
 use std::sync::Arc;
 
 use gpui::{AnyEntity, App, Entity, Global, PathPromptOptions, SharedString, Window};
 use metor_db::DB;
 
 use crate::inspector::OpenInspectorCallback;
+use crate::inspector::rows::{CommandRow, DefaultActionRow, InspectorRow, NavRow};
 use crate::presets;
 use crate::tiles::TileGroup;
 use crate::views::dashboard::DashboardPanel;
-use crate::inspector::rows::{CommandRow, DefaultActionRow, InspectorRow, NavRow};
 
 /// Tag shown as a pill alongside each palette row, also used to group
 /// providers. `Custom` lets external subsystems add categories without
@@ -103,11 +104,7 @@ impl ItemRegistry {
     }
 }
 
-fn item_to_row(
-    item: InspectionItem,
-    db: Arc<DB>,
-    tag: SharedString,
-) -> Box<dyn InspectorRow> {
+fn item_to_row(item: InspectionItem, db: Arc<DB>, tag: SharedString) -> Box<dyn InspectorRow> {
     match item {
         InspectionItem::Entity {
             label,
@@ -118,7 +115,8 @@ fn item_to_row(
                 label,
                 summary,
                 Box::new(move |cx| {
-                    crate::inspector::reflect::rows_for_any_entity(&entity, &db, cx).unwrap_or_default()
+                    crate::inspector::reflect::rows_for_any_entity(&entity, &db, cx)
+                        .unwrap_or_default()
                 }),
             )
             .with_tag(tag),
@@ -130,14 +128,7 @@ fn item_to_row(
             label,
             summary,
             build,
-        } => Box::new(
-            NavRow::new(
-                label,
-                summary,
-                Box::new(move |cx| build(cx)),
-            )
-            .with_tag(tag),
-        ),
+        } => Box::new(NavRow::new(label, summary, Box::new(move |cx| build(cx))).with_tag(tag)),
     }
 }
 
@@ -325,6 +316,15 @@ fn register_command_provider(
     ItemRegistry::register(cx, Category::Command, provider);
 }
 
+/// Read a preset file and apply it to `tiles`. Errors are logged and the
+/// layout is left untouched, so a bad file can't take the app down.
+fn read_and_load(path: &Path, tiles: &Entity<TileGroup>, cx: &mut App) {
+    match presets::load_preset(path) {
+        Ok(json) => presets::load_into_tiles(&json, tiles, cx),
+        Err(e) => eprintln!("read preset {}: {e}", path.display()),
+    }
+}
+
 /// Register the "Preset" category with two entries: **Save preset** and
 /// **Load preset**. Each opens a submenu listing the built-in directory
 /// items alongside a `Save to file…` / `Load from file…` row, so the OS
@@ -391,16 +391,7 @@ fn register_preset_provider(tiles: Entity<TileGroup>, cx: &mut App) {
                     let tiles = tiles_for_load.clone();
                     rows.push(Box::new(CommandRow::new(
                         SharedString::from(name),
-                        Arc::new(move |_window, cx| {
-                            let json = match std::fs::read_to_string(&path) {
-                                Ok(s) => s,
-                                Err(e) => {
-                                    eprintln!("read preset {}: {e}", path.display());
-                                    return;
-                                }
-                            };
-                            presets::load_into_tiles(&json, &tiles, cx);
-                        }),
+                        Arc::new(move |_window, cx| read_and_load(&path, &tiles, cx)),
                     )));
                 }
                 let tiles_for_file = tiles_for_load.clone();
@@ -421,14 +412,7 @@ fn register_preset_provider(tiles: Entity<TileGroup>, cx: &mut App) {
                             let Some(path) = paths.into_iter().next() else {
                                 return;
                             };
-                            let json = match std::fs::read_to_string(&path) {
-                                Ok(s) => s,
-                                Err(e) => {
-                                    eprintln!("read preset {}: {e}", path.display());
-                                    return;
-                                }
-                            };
-                            let _ = cx.update(|cx| presets::load_into_tiles(&json, &tiles, cx));
+                            let _ = cx.update(|cx| read_and_load(&path, &tiles, cx));
                         })
                         .detach();
                     }),

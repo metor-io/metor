@@ -1,9 +1,11 @@
-use gpui::{Bounds, Entity, IntoElement, Pixels, Point, Render, Window, Context, Empty, div, prelude::*, px};
 use super::SplitPath;
+use gpui::{
+    Bounds, Context, Empty, Entity, IntoElement, Pixels, Point, Render, Window, div, prelude::*, px,
+};
 
-use crate::theme::theme;
 use super::item::PaneItemHandle;
 use super::pane::Pane;
+use crate::theme::theme;
 
 /// Payload carried by gpui while a tab is being dragged.
 ///
@@ -76,10 +78,7 @@ impl SplitDirection {
 /// The pane is divided into four edge strips (25% deep) plus a central
 /// region. A drop on an edge splits the pane; a drop in the center yields
 /// `None`, signalling the caller to insert the tab instead.
-pub fn detect_split_zone(
-    cursor: Point<Pixels>,
-    bounds: Bounds<Pixels>,
-) -> Option<SplitDirection> {
+pub fn detect_split_zone(cursor: Point<Pixels>, bounds: Bounds<Pixels>) -> Option<SplitDirection> {
     let margin = 0.25;
     let rel_x = (cursor.x - bounds.origin.x) / bounds.size.width;
     let rel_y = (cursor.y - bounds.origin.y) / bounds.size.height;

@@ -243,8 +243,8 @@ impl<D: TableDelegate> Table<D> {
             .on_drag(ResizeDrag(col_ix), |drag, _, _, cx| {
                 cx.new(|_| drag.clone())
             })
-            .on_drag_move(cx.listener(
-                move |this, e: &DragMoveEvent<ResizeDrag>, _window, cx| {
+            .on_drag_move(
+                cx.listener(move |this, e: &DragMoveEvent<ResizeDrag>, _window, cx| {
                     let columns = this.delegate.columns();
                     let col_ix = e.drag(cx).0;
                     if let Some(col) = columns.get(col_ix) {
@@ -258,8 +258,8 @@ impl<D: TableDelegate> Table<D> {
                             }
                         }
                     }
-                },
-            ))
+                }),
+            )
     }
 }
 
@@ -394,15 +394,17 @@ impl<D: TableDelegate> Render for Table<D> {
         .track_scroll(scroll_handle)
         .flex_1();
 
-        let mut inner = div().flex().flex_col().size_full().child(header).child(body);
+        let mut inner = div()
+            .flex()
+            .flex_col()
+            .size_full()
+            .child(header)
+            .child(body);
         if !any_flex {
             inner = inner.w(px(total_width));
         }
 
-        let mut scroll_wrap = div()
-            .id("table-hscroll")
-            .size_full()
-            .child(inner);
+        let mut scroll_wrap = div().id("table-hscroll").size_full().child(inner);
         if !any_flex {
             scroll_wrap = scroll_wrap
                 .overflow_x_scroll()

@@ -1,9 +1,13 @@
 use std::sync::Arc;
 
-use gpui::{App, Context, Entity, IntoElement, Render, SharedString, Window, div, prelude::*};
+use gpui::{
+    App, Context, Entity, Hsla, IntoElement, Render, SharedString, Window, div, prelude::*,
+};
 use metor_db::DB;
 use metor_proto::types::ComponentId;
 
+use crate::inspector::rows::{CommandRow, InspectorRow, NavRow};
+use crate::inspector::{InspectorMode, InspectorRequest, OpenInspectorCallback};
 use crate::views::dashboard::DashboardPanel;
 use crate::views::time_series::{LinePlot, Override, PlotStyle, Trace};
 use crate::views::viewer_3d::Viewer3d;
@@ -11,9 +15,6 @@ use crate::views::{
     ComponentBrowser, ComponentTable, ComponentText, DataTable, TimeSeriesPlot,
     new_component_browser, new_component_table, new_data_table,
 };
-use gpui::Hsla;
-use crate::inspector::{InspectorMode, InspectorRequest, OpenInspectorCallback};
-use crate::inspector::rows::{CommandRow, InspectorRow, NavRow};
 
 use super::item::{PaneItem, PaneItemHandle};
 use super::pane::Pane;
@@ -45,12 +46,6 @@ impl TextPanel {
         }
     }
 
-    pub fn to_config(&self, _cx: &App) -> TextPanelConfig {
-        TextPanelConfig {
-            component: self.label.to_string(),
-        }
-    }
-
     pub fn from_config(cfg: TextPanelConfig, db: Arc<DB>, cx: &mut Context<Self>) -> Self {
         let component_id = ComponentId::new(&cfg.component);
         Self::new(db, component_id, cfg.component, cx)
@@ -64,6 +59,8 @@ impl Render for TextPanel {
 }
 
 impl PaneItem for TextPanel {
+    type Config = TextPanelConfig;
+
     fn tab_title(&self, _cx: &App) -> SharedString {
         self.label.clone()
     }
@@ -72,8 +69,10 @@ impl PaneItem for TextPanel {
         "component_text"
     }
 
-    fn serialize(&self, cx: &App) -> String {
-        facet_json::to_string(&self.to_config(cx)).expect("text panel config serializes")
+    fn to_config(&self, _cx: &App) -> TextPanelConfig {
+        TextPanelConfig {
+            component: self.label.to_string(),
+        }
     }
 }
 
@@ -97,10 +96,6 @@ impl TablePanel {
         }
     }
 
-    pub fn to_config(&self, _cx: &App) -> TablePanelConfig {
-        TablePanelConfig {}
-    }
-
     pub fn from_config(_cfg: TablePanelConfig, db: Arc<DB>, cx: &mut Context<Self>) -> Self {
         Self::new(db, cx)
     }
@@ -113,6 +108,8 @@ impl Render for TablePanel {
 }
 
 impl PaneItem for TablePanel {
+    type Config = TablePanelConfig;
+
     fn tab_title(&self, _cx: &App) -> SharedString {
         self.label.clone()
     }
@@ -121,8 +118,8 @@ impl PaneItem for TablePanel {
         "component_table"
     }
 
-    fn serialize(&self, cx: &App) -> String {
-        facet_json::to_string(&self.to_config(cx)).expect("table panel config serializes")
+    fn to_config(&self, _cx: &App) -> TablePanelConfig {
+        TablePanelConfig {}
     }
 }
 
@@ -130,6 +127,9 @@ impl PaneItem for TablePanel {
 #[derive(facet::Facet, Default)]
 pub struct DataTablePanelConfig {}
 
+/// Pane item rendering one row per component, grouped by namespace, with
+/// live values per element. Wraps the same [`DataTable`] view used outside
+/// the tile system.
 pub struct DataTablePanel {
     inner: Entity<DataTable>,
     label: SharedString,
@@ -144,10 +144,6 @@ impl DataTablePanel {
         }
     }
 
-    pub fn to_config(&self, _cx: &App) -> DataTablePanelConfig {
-        DataTablePanelConfig {}
-    }
-
     pub fn from_config(_cfg: DataTablePanelConfig, db: Arc<DB>, cx: &mut Context<Self>) -> Self {
         Self::new(db, cx)
     }
@@ -160,6 +156,8 @@ impl Render for DataTablePanel {
 }
 
 impl PaneItem for DataTablePanel {
+    type Config = DataTablePanelConfig;
+
     fn tab_title(&self, _cx: &App) -> SharedString {
         self.label.clone()
     }
@@ -168,8 +166,8 @@ impl PaneItem for DataTablePanel {
         "data_table"
     }
 
-    fn serialize(&self, cx: &App) -> String {
-        facet_json::to_string(&self.to_config(cx)).expect("data table panel config serializes")
+    fn to_config(&self, _cx: &App) -> DataTablePanelConfig {
+        DataTablePanelConfig {}
     }
 }
 
@@ -192,10 +190,6 @@ impl BrowserPanel {
         }
     }
 
-    pub fn to_config(&self, _cx: &App) -> BrowserPanelConfig {
-        BrowserPanelConfig {}
-    }
-
     pub fn from_config(_cfg: BrowserPanelConfig, db: Arc<DB>, cx: &mut Context<Self>) -> Self {
         Self::new(db, cx)
     }
@@ -208,6 +202,8 @@ impl Render for BrowserPanel {
 }
 
 impl PaneItem for BrowserPanel {
+    type Config = BrowserPanelConfig;
+
     fn tab_title(&self, _cx: &App) -> SharedString {
         self.label.clone()
     }
@@ -216,8 +212,8 @@ impl PaneItem for BrowserPanel {
         "component_browser"
     }
 
-    fn serialize(&self, cx: &App) -> String {
-        facet_json::to_string(&self.to_config(cx)).expect("browser panel config serializes")
+    fn to_config(&self, _cx: &App) -> BrowserPanelConfig {
+        BrowserPanelConfig {}
     }
 }
 
@@ -250,11 +246,7 @@ impl PlotPanel {
     }
 
     /// Build a plot seeded with an explicit trace list.
-    pub fn with_traces(
-        db: Arc<DB>,
-        traces: Vec<crate::views::time_series::Trace>,
-        cx: &mut Context<Self>,
-    ) -> Self {
+    pub fn with_traces(db: Arc<DB>, traces: Vec<Trace>, cx: &mut Context<Self>) -> Self {
         let inner = cx.new(|cx| TimeSeriesPlot::new(db, traces, cx));
         let line_plot = inner.read(cx).line_plot().clone();
         Self { inner, line_plot }
@@ -317,58 +309,41 @@ impl Default for TraceConfig {
     }
 }
 
-impl PlotPanel {
-    pub fn to_config(&self, cx: &App) -> PlotPanelConfig {
-        let line_plot = self.line_plot.read(cx);
-        let traces = line_plot
-            .traces()
-            .iter()
-            .map(|t| {
-                let t = t.read(cx);
-                TraceConfig {
-                    component_id: t.component_id,
-                    element_index: t.element_index,
-                    color: t.color,
-                    style: t.style,
-                    visible: t.visible,
-                    label: t.label.to_string(),
-                    stroke_width: t.stroke_width,
-                }
-            })
-            .collect();
-        PlotPanelConfig {
-            label: self.tab_title(cx).to_string(),
-            traces,
-            custom_title: match &line_plot.custom_title {
-                Override::Auto => Override::Auto,
-                Override::Custom(s) => Override::Custom(s.to_string()),
-            },
-            y_min_override: line_plot.y_min_override.clone(),
-            y_max_override: line_plot.y_max_override.clone(),
+impl From<&Trace> for TraceConfig {
+    fn from(t: &Trace) -> Self {
+        Self {
+            component_id: t.component_id,
+            element_index: t.element_index,
+            color: t.color,
+            style: t.style,
+            visible: t.visible,
+            label: t.label.to_string(),
+            stroke_width: t.stroke_width,
         }
     }
+}
 
+impl From<TraceConfig> for Trace {
+    fn from(t: TraceConfig) -> Self {
+        Self {
+            component_id: t.component_id,
+            element_index: t.element_index,
+            color: t.color,
+            style: t.style,
+            visible: t.visible,
+            label: t.label.into(),
+            stroke_width: t.stroke_width,
+        }
+    }
+}
+
+impl PlotPanel {
     pub fn from_config(cfg: PlotPanelConfig, db: Arc<DB>, cx: &mut Context<Self>) -> Self {
-        let traces: Vec<Trace> = cfg
-            .traces
-            .into_iter()
-            .map(|t| Trace {
-                component_id: t.component_id,
-                element_index: t.element_index,
-                color: t.color,
-                style: t.style,
-                visible: t.visible,
-                label: t.label.into(),
-                stroke_width: t.stroke_width,
-            })
-            .collect();
+        let traces: Vec<Trace> = cfg.traces.into_iter().map(Trace::from).collect();
         let panel = Self::with_traces(db, traces, cx);
         let line_plot = panel.line_plot.clone();
         line_plot.update(cx, |lp, cx| {
-            lp.custom_title = match cfg.custom_title {
-                Override::Auto => Override::Auto,
-                Override::Custom(s) => Override::Custom(s.into()),
-            };
+            lp.custom_title = cfg.custom_title.map(SharedString::from);
             lp.y_min_override = cfg.y_min_override;
             lp.y_max_override = cfg.y_max_override;
             cx.notify();
@@ -378,6 +353,8 @@ impl PlotPanel {
 }
 
 impl PaneItem for PlotPanel {
+    type Config = PlotPanelConfig;
+
     fn tab_title(&self, cx: &App) -> SharedString {
         self.inner.read(cx).title(cx)
     }
@@ -386,8 +363,19 @@ impl PaneItem for PlotPanel {
         "time_series_plot"
     }
 
-    fn serialize(&self, cx: &App) -> String {
-        facet_json::to_string(&self.to_config(cx)).expect("plot panel config serializes")
+    fn to_config(&self, cx: &App) -> PlotPanelConfig {
+        let lp = self.line_plot.read(cx);
+        PlotPanelConfig {
+            label: self.tab_title(cx).to_string(),
+            traces: lp
+                .traces()
+                .iter()
+                .map(|e| TraceConfig::from(e.read(cx)))
+                .collect(),
+            custom_title: lp.custom_title.as_ref().map(|s| s.to_string()),
+            y_min_override: lp.y_min_override.clone(),
+            y_max_override: lp.y_max_override.clone(),
+        }
     }
 
     fn inspectable_entity(&self) -> Option<gpui::AnyEntity> {
@@ -463,7 +451,65 @@ impl Viewer3dPanel {
         }
     }
 
-    pub fn to_config(&self, cx: &App) -> Viewer3dPanelConfig {
+    /// Rebuild a [`Viewer3dPanel`] from its persisted config.
+    ///
+    /// Spawns models through the public `add_model` API; bindings get reset
+    /// directly on each [`crate::views::viewer_3d::ModelEntry`] entity so
+    /// the viewer's reconcile pass picks them up on the next observe tick.
+    pub fn from_config(cfg: Viewer3dPanelConfig, db: Arc<DB>, cx: &mut Context<Self>) -> Self {
+        let inner = cx.new(|cx| {
+            let mut viewer = Viewer3d::with_db(db, cx);
+            for model in &cfg.models {
+                viewer.add_model(model.label.clone(), model.path.clone(), cx);
+                if let Some(entry) = viewer.models().last().cloned() {
+                    let pos = model.position_binding;
+                    let orient = model.orientation_binding;
+                    entry.update(cx, |m, cx| {
+                        m.position_binding = pos;
+                        m.orientation_binding = orient;
+                        cx.notify();
+                    });
+                }
+            }
+            let cam = viewer.camera_mut();
+            cam.target = glam::Vec3::new(
+                cfg.camera.target_x,
+                cfg.camera.target_y,
+                cfg.camera.target_z,
+            );
+            cam.yaw = cfg.camera.yaw;
+            cam.pitch = cfg.camera.pitch;
+            cam.distance = cfg.camera.distance;
+            cam.fov_y_rad = cfg.camera.fov_y_rad;
+            viewer.camera_fov = cfg.camera.fov_y_rad;
+            viewer.sync_camera(cx);
+            viewer
+        });
+        Self {
+            inner,
+            label: "3D Viewer".into(),
+        }
+    }
+}
+
+impl Render for Viewer3dPanel {
+    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+        div().size_full().child(self.inner.clone())
+    }
+}
+
+impl PaneItem for Viewer3dPanel {
+    type Config = Viewer3dPanelConfig;
+
+    fn tab_title(&self, _cx: &App) -> SharedString {
+        self.label.clone()
+    }
+
+    fn serialization_key() -> &'static str {
+        "viewer_3d"
+    }
+
+    fn to_config(&self, cx: &App) -> Viewer3dPanelConfig {
         let inner = self.inner.read(cx);
         let cam = inner.camera();
         let models = inner
@@ -491,62 +537,6 @@ impl Viewer3dPanel {
                 fov_y_rad: cam.fov_y_rad,
             },
         }
-    }
-
-    /// Rebuild a [`Viewer3dPanel`] from its persisted config.
-    ///
-    /// Spawns models through the public `add_model` API; bindings get reset
-    /// directly on each [`crate::views::viewer_3d::ModelEntry`] entity so
-    /// the viewer's reconcile pass picks them up on the next observe tick.
-    pub fn from_config(cfg: Viewer3dPanelConfig, db: Arc<DB>, cx: &mut Context<Self>) -> Self {
-        let inner = cx.new(|cx| {
-            let mut viewer = Viewer3d::with_db(db, cx);
-            for model in &cfg.models {
-                viewer.add_model(model.label.clone(), model.path.clone(), cx);
-                if let Some(entry) = viewer.models().last().cloned() {
-                    let pos = model.position_binding;
-                    let orient = model.orientation_binding;
-                    entry.update(cx, |m, cx| {
-                        m.position_binding = pos;
-                        m.orientation_binding = orient;
-                        cx.notify();
-                    });
-                }
-            }
-            let cam = viewer.camera_mut();
-            cam.target = glam::Vec3::new(cfg.camera.target_x, cfg.camera.target_y, cfg.camera.target_z);
-            cam.yaw = cfg.camera.yaw;
-            cam.pitch = cfg.camera.pitch;
-            cam.distance = cfg.camera.distance;
-            cam.fov_y_rad = cfg.camera.fov_y_rad;
-            viewer.camera_fov = cfg.camera.fov_y_rad;
-            viewer.sync_camera(cx);
-            viewer
-        });
-        Self {
-            inner,
-            label: "3D Viewer".into(),
-        }
-    }
-}
-
-impl Render for Viewer3dPanel {
-    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
-        div().size_full().child(self.inner.clone())
-    }
-}
-
-impl PaneItem for Viewer3dPanel {
-    fn tab_title(&self, _cx: &App) -> SharedString {
-        self.label.clone()
-    }
-
-    fn serialization_key() -> &'static str {
-        "viewer_3d"
-    }
-
-    fn serialize(&self, cx: &App) -> String {
-        facet_json::to_string(&self.to_config(cx)).expect("viewer 3d config serializes")
     }
 
     fn inspectable_entity(&self) -> Option<gpui::AnyEntity> {
@@ -640,8 +630,7 @@ pub fn new_panel_rows(
         Arc::new(move |_window, cx| {
             let db = db.clone();
             pane.update(cx, |pane, cx| {
-                let item: Box<dyn PaneItemHandle> =
-                    Box::new(cx.new(|cx| TablePanel::new(db, cx)));
+                let item: Box<dyn PaneItemHandle> = Box::new(cx.new(|cx| TablePanel::new(db, cx)));
                 pane.add_item(item, cx);
             });
         })
