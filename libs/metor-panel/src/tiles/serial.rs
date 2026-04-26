@@ -58,36 +58,11 @@ pub struct SerializedPane {
     pub active_index: usize,
     pub items: Vec<SerializedItem>,
     #[serde(default)]
-    pub tab_orientation: SerializedTabOrientation,
+    pub tab_orientation: TabOrientation,
     #[serde(default)]
     pub hide_tab_bar: bool,
     #[serde(default)]
     pub locked_size: Option<(f32, f32)>,
-}
-
-#[derive(Serialize, Deserialize, Default, Clone, Copy)]
-pub enum SerializedTabOrientation {
-    #[default]
-    Horizontal,
-    Vertical,
-}
-
-impl From<TabOrientation> for SerializedTabOrientation {
-    fn from(o: TabOrientation) -> Self {
-        match o {
-            TabOrientation::Horizontal => SerializedTabOrientation::Horizontal,
-            TabOrientation::Vertical => SerializedTabOrientation::Vertical,
-        }
-    }
-}
-
-impl From<SerializedTabOrientation> for TabOrientation {
-    fn from(o: SerializedTabOrientation) -> Self {
-        match o {
-            SerializedTabOrientation::Horizontal => TabOrientation::Horizontal,
-            SerializedTabOrientation::Vertical => TabOrientation::Vertical,
-        }
-    }
 }
 
 /// Persisted pane item, tagged with the [`PaneItem::serialization_key`] used

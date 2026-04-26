@@ -34,8 +34,6 @@ pub enum TileGroupEvent {
         item: Box<dyn PaneItemHandle>,
         position: Point<Pixels>,
     },
-    /// User asked to inspect a pane itself (right-click on the tab bar
-    /// background). Used for pane-level settings like tab orientation.
     InspectPane {
         pane: Entity<Pane>,
         position: Point<Pixels>,
@@ -178,7 +176,7 @@ impl Member {
                 SerializedMember::Pane(SerializedPane {
                     active_index: pane.active_index(),
                     items,
-                    tab_orientation: pane.tab_orientation().into(),
+                    tab_orientation: pane.tab_orientation(),
                     hide_tab_bar: pane.hide_tab_bar(),
                     locked_size: pane.locked_size().map(|s| (s.width, s.height)),
                 })
@@ -475,10 +473,11 @@ impl TileGroup {
                     if sp.active_index < pane.items().len() {
                         pane.activate_item(sp.active_index, cx);
                     }
-                    pane.set_tab_orientation(sp.tab_orientation.into(), cx);
+                    pane.set_tab_orientation(sp.tab_orientation, cx);
                     pane.set_hide_tab_bar(sp.hide_tab_bar, cx);
-                    pane.restore_locked_size(
+                    pane.set_locked_size(
                         sp.locked_size.map(|(w, h)| gpui::Size { width: w, height: h }),
+                        cx,
                     );
                     pane
                 });

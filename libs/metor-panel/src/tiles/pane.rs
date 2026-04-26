@@ -27,9 +27,7 @@ const TAB_HEIGHT: f32 = 28.0;
 const TAB_CLOSE_SIZE: f32 = 16.0;
 const TAB_RAIL_WIDTH: f32 = 160.0;
 
-/// Whether a pane lays its tab strip across the top (horizontal) or down the
-/// left side (vertical). Persisted per pane.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
 pub enum TabOrientation {
     #[default]
     Horizontal,
@@ -54,8 +52,6 @@ pub enum PaneEvent {
         item: Box<dyn PaneItemHandle>,
         position: Point<Pixels>,
     },
-    /// User right-clicked the tab bar background and wants to inspect the
-    /// pane itself (e.g. to toggle tab orientation).
     InspectPane { position: Point<Pixels> },
 }
 
@@ -71,7 +67,6 @@ pub struct Pane {
     active_index: usize,
     drag_split_direction: Option<SplitDirection>,
     content_bounds: Bounds<Pixels>,
-    pane_bounds: Bounds<Pixels>,
     tab_scroll: ScrollHandle,
     tab_orientation: TabOrientation,
     hide_tab_bar: bool,
@@ -85,7 +80,6 @@ impl Pane {
             active_index: 0,
             drag_split_direction: None,
             content_bounds: Bounds::default(),
-            pane_bounds: Bounds::default(),
             tab_scroll: ScrollHandle::new(),
             tab_orientation: TabOrientation::default(),
             hide_tab_bar: false,
@@ -98,10 +92,8 @@ impl Pane {
     }
 
     pub fn set_tab_orientation(&mut self, orientation: TabOrientation, cx: &mut Context<Self>) {
-        if self.tab_orientation != orientation {
-            self.tab_orientation = orientation;
-            cx.notify();
-        }
+        self.tab_orientation = orientation;
+        cx.notify();
     }
 
     pub fn hide_tab_bar(&self) -> bool {
@@ -109,36 +101,33 @@ impl Pane {
     }
 
     pub fn set_hide_tab_bar(&mut self, hide: bool, cx: &mut Context<Self>) {
-        if self.hide_tab_bar != hide {
-            self.hide_tab_bar = hide;
-            cx.notify();
-        }
+        self.hide_tab_bar = hide;
+        cx.notify();
     }
 
     pub fn locked_size(&self) -> Option<gpui::Size<f32>> {
         self.locked_size
     }
 
-    pub fn set_locked(&mut self, locked: bool, cx: &mut Context<Self>) {
-        let next = if locked {
-            Some(gpui::Size {
-                width: self.pane_bounds.size.width.into(),
-                height: self.pane_bounds.size.height.into(),
-            })
-        } else {
-            None
+    /// Outer pane size = content bounds plus the tab strip (when shown).
+    /// Used by the inspector toggle to capture "lock at the current size".
+    pub fn current_outer_size(&self) -> gpui::Size<f32> {
+        let mut size = gpui::Size {
+            width: self.content_bounds.size.width.into(),
+            height: self.content_bounds.size.height.into(),
         };
-        if self.locked_size != next {
-            self.locked_size = next;
-            cx.notify();
+        if !self.hide_tab_bar {
+            match self.tab_orientation {
+                TabOrientation::Horizontal => size.height += TAB_HEIGHT,
+                TabOrientation::Vertical => size.width += TAB_RAIL_WIDTH,
+            }
         }
+        size
     }
 
-    /// Restore an exact locked size from persistence. Skips the `pane_bounds`
-    /// capture that `set_locked` does, since at deserialization time bounds
-    /// haven't been measured yet.
-    pub fn restore_locked_size(&mut self, size: Option<gpui::Size<f32>>) {
+    pub fn set_locked_size(&mut self, size: Option<gpui::Size<f32>>, cx: &mut Context<Self>) {
         self.locked_size = size;
+        cx.notify();
     }
 
     pub fn items(&self) -> &[Box<dyn PaneItemHandle>] {
@@ -514,25 +503,11 @@ impl Render for Pane {
             content = content.child(overlay);
         }
 
-        let view = cx.entity().clone();
-        let pane_bounds_tracker = gpui::canvas(
-            move |bounds, _window, cx| {
-                view.update(cx, |pane, _| {
-                    pane.pane_bounds = bounds;
-                });
-                bounds
-            },
-            |_, _, _, _| {},
-        )
-        .size_full()
-        .absolute();
-
-        let mut outer = div().relative().flex().size_full();
+        let mut outer = div().flex().size_full();
         outer = match orientation {
             TabOrientation::Horizontal => outer.flex_col(),
             TabOrientation::Vertical => outer.flex_row(),
         };
-        outer = outer.child(pane_bounds_tracker);
         if let Some(tab_bar) = tab_bar {
             outer = outer.child(tab_bar);
         }

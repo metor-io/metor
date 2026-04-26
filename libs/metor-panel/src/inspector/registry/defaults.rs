@@ -301,7 +301,10 @@ impl InspectorRegistry {
                 "Locked Size",
                 Box::new(move |cx| lock_read.read(cx).locked_size().is_some()),
                 Arc::new(move |checked, _w, cx| {
-                    lock_write.update(cx, |p, cx| p.set_locked(checked, cx));
+                    lock_write.update(cx, |p, cx| {
+                        let next = checked.then(|| p.current_outer_size());
+                        p.set_locked_size(next, cx);
+                    });
                 }),
             );
 
