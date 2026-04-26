@@ -17,7 +17,7 @@ use serial::{SerializedItem, SerializedMember, SerializedPane, SerializedSplit};
 
 pub use drag::SplitDirection;
 pub use item::{PaneItem, PaneItemHandle};
-pub use pane::{Pane, PaneEvent, PlotComponentAction};
+pub use pane::{Pane, PaneEvent, PlotComponentAction, TabOrientation};
 pub use serial::{ItemRegistry, SerializedTileGroup};
 
 /// Sequence of member indices locating a node in the split tree.
@@ -32,6 +32,12 @@ pub enum TileGroupEvent {
     /// The position marks where to anchor the inspector.
     Inspect {
         item: Box<dyn PaneItemHandle>,
+        position: Point<Pixels>,
+    },
+    /// User asked to inspect a pane itself (right-click on the tab bar
+    /// background). Used for pane-level settings like tab orientation.
+    InspectPane {
+        pane: Entity<Pane>,
         position: Point<Pixels>,
     },
 }
@@ -172,6 +178,7 @@ impl Member {
                 SerializedMember::Pane(SerializedPane {
                     active_index: pane.active_index(),
                     items,
+                    tab_orientation: pane.tab_orientation().into(),
                 })
             }
             Member::Axis(axis) => SerializedMember::Split(SerializedSplit {
@@ -425,6 +432,7 @@ impl TileGroup {
                     if sp.active_index < pane.items().len() {
                         pane.activate_item(sp.active_index, cx);
                     }
+                    pane.set_tab_orientation(sp.tab_orientation.into(), cx);
                     pane
                 });
                 panes.push(pane.clone());
@@ -460,6 +468,12 @@ impl TileGroup {
             PaneEvent::Inspect { item, position } => {
                 cx.emit(TileGroupEvent::Inspect {
                     item: item.clone_handle(),
+                    position: *position,
+                });
+            }
+            PaneEvent::InspectPane { position } => {
+                cx.emit(TileGroupEvent::InspectPane {
+                    pane: pane.clone(),
                     position: *position,
                 });
             }

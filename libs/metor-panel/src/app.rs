@@ -39,6 +39,7 @@ struct AppRoot {
     tiles: Entity<TileGroup>,
     inspector: Option<Entity<Inspector>>,
     pending_inspector_request: Option<(Box<dyn crate::tiles::PaneItemHandle>, Point<Pixels>)>,
+    pending_pane_inspector_request: Option<(Entity<crate::tiles::Pane>, Point<Pixels>)>,
     pending_inspector_open: Option<InspectorRequest>,
     focus_handle: FocusHandle,
 }
@@ -55,6 +56,7 @@ impl AppRoot {
             tiles,
             inspector: None,
             pending_inspector_request: None,
+            pending_pane_inspector_request: None,
             pending_inspector_open: None,
             focus_handle: cx.focus_handle(),
         }
@@ -208,6 +210,10 @@ impl AppRoot {
                 self.pending_inspector_request = Some((item, position));
                 cx.notify();
             }
+            TileGroupEvent::InspectPane { pane, position } => {
+                self.pending_pane_inspector_request = Some((pane.clone(), *position));
+                cx.notify();
+            }
         }
     }
 }
@@ -229,6 +235,10 @@ impl Render for AppRoot {
 
         if let Some((item, position)) = self.pending_inspector_request.take() {
             self.open_inspector(&*item, position, window, cx);
+        }
+
+        if let Some((pane, position)) = self.pending_pane_inspector_request.take() {
+            self.open_entity_inspector(&pane.into_any(), position, window, cx);
         }
 
         if let Some(request) = self.pending_inspector_open.take() {

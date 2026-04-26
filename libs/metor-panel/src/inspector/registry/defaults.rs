@@ -12,7 +12,7 @@ use metor_db::DB;
 use metor_proto::types::ComponentId;
 
 use crate::inspector::rows::{
-    ColorRow, CommandRow, InspectorRow, NavRow, ScalarRow, TextRow,
+    BoolRow, ColorRow, CommandRow, InspectorRow, NavRow, ScalarRow, TextRow,
 };
 use crate::views::time_series::time_range::TimeRangeBehavior;
 use crate::views::time_series::{LinePlot, Override, Trace};
@@ -47,6 +47,7 @@ impl InspectorRegistry {
         );
         self.register_viewer3d_builder(db.clone());
         self.register_dashboard_builder(db);
+        self.register_pane_builder();
         self.register_field_override::<crate::views::time_series::Trace>(
             "stroke_width",
             FieldOverride {
@@ -254,6 +255,31 @@ impl InspectorRegistry {
                 }),
             )));
             rows
+        }));
+    }
+
+    fn register_pane_builder(&mut self) {
+        use crate::tiles::{Pane, TabOrientation};
+        self.register_type_builder::<Pane>(Arc::new(|any_entity, _db, _cx| {
+            let pane: Entity<Pane> = any_entity.downcast().expect("Pane type mismatch");
+            let read_pane = pane.clone();
+            let write_pane = pane;
+            vec![Box::new(BoolRow::dynamic(
+                "Vertical Tabs",
+                Box::new(move |cx| {
+                    matches!(read_pane.read(cx).tab_orientation(), TabOrientation::Vertical)
+                }),
+                Arc::new(move |checked, _w, cx| {
+                    write_pane.update(cx, |p, cx| {
+                        let next = if checked {
+                            TabOrientation::Vertical
+                        } else {
+                            TabOrientation::Horizontal
+                        };
+                        p.set_tab_orientation(next, cx);
+                    });
+                }),
+            ))]
         }));
     }
 
