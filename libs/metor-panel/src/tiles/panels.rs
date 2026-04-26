@@ -8,8 +8,8 @@ use crate::views::dashboard::DashboardPanel;
 use crate::views::time_series::LinePlot;
 use crate::views::viewer_3d::Viewer3d;
 use crate::views::{
-    ComponentBrowser, ComponentTable, ComponentText, TimeSeriesPlot, new_component_browser,
-    new_component_table,
+    ComponentBrowser, ComponentTable, ComponentText, DataTable, TimeSeriesPlot,
+    new_component_browser, new_component_table, new_data_table,
 };
 use crate::inspector::{InspectorMode, InspectorRequest, OpenInspectorCallback};
 use crate::inspector::rows::{CommandRow, InspectorRow, NavRow};
@@ -87,6 +87,41 @@ impl PaneItem for TablePanel {
 
     fn serialization_key() -> &'static str {
         "component_table"
+    }
+
+    fn serialize(&self, _cx: &App) -> serde_json::Value {
+        serde_json::json!({})
+    }
+}
+
+pub struct DataTablePanel {
+    inner: Entity<DataTable>,
+    label: SharedString,
+}
+
+impl DataTablePanel {
+    pub fn new(db: Arc<DB>, cx: &mut Context<Self>) -> Self {
+        let inner = cx.new(|cx| new_data_table(db, cx));
+        Self {
+            inner,
+            label: "Data Table".into(),
+        }
+    }
+}
+
+impl Render for DataTablePanel {
+    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+        div().size_full().child(self.inner.clone())
+    }
+}
+
+impl PaneItem for DataTablePanel {
+    fn tab_title(&self, _cx: &App) -> SharedString {
+        self.label.clone()
+    }
+
+    fn serialization_key() -> &'static str {
+        "data_table"
     }
 
     fn serialize(&self, _cx: &App) -> serde_json::Value {
@@ -355,6 +390,19 @@ pub fn new_panel_rows(
             pane.update(cx, |pane, cx| {
                 let item: Box<dyn PaneItemHandle> =
                     Box::new(cx.new(|cx| TablePanel::new(db, cx)));
+                pane.add_item(item, cx);
+            });
+        })
+    })));
+
+    rows.push(Box::new(CommandRow::new("Data Table", {
+        let db = db.clone();
+        let pane = pane.clone();
+        Arc::new(move |_window, cx| {
+            let db = db.clone();
+            pane.update(cx, |pane, cx| {
+                let item: Box<dyn PaneItemHandle> =
+                    Box::new(cx.new(|cx| DataTablePanel::new(db, cx)));
                 pane.add_item(item, cx);
             });
         })

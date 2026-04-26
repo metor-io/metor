@@ -709,17 +709,14 @@ fn build_editing_chrome(
         .gap(px(4.0))
         .px(px(6.0))
         .py(px(3.0))
-        .rounded(px(3.0));
+        .rounded(px(3.0))
+        .overflow_hidden()
+        .w(cell_width(style.preset, false));
 
-    let bg = if error {
-        theme.drop_target
-    } else if is_pending {
+    let bg = if error || is_pending {
         theme.drop_target
     } else {
-        match style.preset {
-            StripPreset::Boxes => theme.bg_secondary,
-            StripPreset::Dashboard => theme.bg_secondary,
-        }
+        theme.bg_secondary
     };
     atom = atom.bg(bg).border_1().border_color(if error {
         theme.line_colors[3]
@@ -736,12 +733,13 @@ fn build_editing_chrome(
             div()
                 .text_size(label_size)
                 .text_color(theme.text_tertiary)
+                .flex_none()
                 .child(label.clone()),
         );
     }
 
     if let Some(field) = field {
-        atom = atom.child(div().w(px(80.0)).child(field.element()));
+        atom = atom.child(div().flex_1().child(field.element()));
     }
 
     atom
@@ -796,7 +794,22 @@ fn build_cell_chrome(
         return atom;
     }
 
-    atom = atom.items_center().gap(px(4.0)).px(px(6.0)).py(px(3.0));
+    atom = atom
+        .items_center()
+        .gap(px(2.0))
+        .px(px(4.0))
+        .py(px(3.0))
+        .overflow_hidden();
+
+    // Fixed-width keeps a "0" cell and a "0.0083" cell aligned across rows
+    // so neighboring boxes don't shift. Solo unlabeled cells have no siblings
+    // to align with, so they keep their intrinsic width.
+    let labeled = cell.label.is_some();
+    let needs_fixed_width =
+        labeled && !matches!((style.preset, is_solo), (StripPreset::Dashboard, true));
+    if needs_fixed_width {
+        atom = atom.w(cell_width(style.preset, is_solo));
+    }
 
     match style.preset {
         StripPreset::Boxes => {
@@ -823,19 +836,38 @@ fn build_cell_chrome(
             div()
                 .text_size(label_size)
                 .text_color(theme.text_tertiary)
+                .flex_none()
                 .child(label.clone()),
         );
     }
 
-    let value_size = match (style.preset, is_solo) {
-        (StripPreset::Dashboard, true) => px(16.0),
-        (StripPreset::Dashboard, false) => px(12.0),
-        (StripPreset::Boxes, _) => px(12.0),
+    // Thresholds calibrated for the 78px Boxes width minus padding/label/gap
+    // (≈50px of usable value space at ~7px/char monospace).
+    let base_value_size = match (style.preset, is_solo) {
+        (StripPreset::Dashboard, true) => 16.0,
+        (StripPreset::Dashboard, false) => 12.0,
+        (StripPreset::Boxes, _) => 12.0,
+    };
+    let value_size = if matches!(style.preset, StripPreset::Boxes) && cell.label.is_some() {
+        let len = cell.value.chars().count();
+        if len >= 9 {
+            px(9.0)
+        } else if len >= 7 {
+            px(10.5)
+        } else {
+            px(base_value_size)
+        }
+    } else {
+        px(base_value_size)
     };
     atom = atom.child(
         div()
+            .flex_1()
             .text_size(value_size)
             .text_color(theme.text_primary)
+            .text_right()
+            .whitespace_nowrap()
+            .overflow_hidden()
             .child(cell.value.clone()),
     );
 
@@ -854,11 +886,30 @@ fn build_cell_chrome(
             div()
                 .text_size(unit_size)
                 .text_color(theme.text_secondary)
+                .flex_none()
                 .child(style.unit.clone()),
         );
     }
 
     atom
+}
+
+pub const STRIP_BOX_CELL_WIDTH: f32 = 78.0;
+pub const STRIP_CELL_GAP: f32 = 4.0;
+
+pub fn cell_width(preset: StripPreset, is_solo: bool) -> Pixels {
+    match (preset, is_solo) {
+        (StripPreset::Boxes, _) => px(STRIP_BOX_CELL_WIDTH),
+        (StripPreset::Dashboard, false) => px(96.0),
+        (StripPreset::Dashboard, true) => px(0.0),
+    }
+}
+
+pub fn strip_row_width(n_cells: usize) -> f32 {
+    if n_cells == 0 {
+        return 0.0;
+    }
+    n_cells as f32 * STRIP_BOX_CELL_WIDTH + (n_cells.saturating_sub(1)) as f32 * STRIP_CELL_GAP
 }
 
 pub(crate) struct ResolvedMetadata {
@@ -982,7 +1033,7 @@ pub(crate) fn format_element(v: ElementValue) -> String {
         other => {
             let mut s = String::new();
             let _ = write!(s, "{}", other.as_f64());
-            s
+            super::format::pad_positive(&s)
         }
     }
 }
@@ -1015,14 +1066,16 @@ mod tests {
 
     #[test]
     fn f32_uses_adaptive_precision() {
-        assert_eq!(format_element(ElementValue::F32(0.0)), "0");
-        assert_eq!(format_element(ElementValue::F32(1.5)), "1.50");
-        assert_eq!(format_element(ElementValue::F32(1234.5)), "1234");
+        assert_eq!(format_element(ElementValue::F32(0.0)), " 0");
+        assert_eq!(format_element(ElementValue::F32(1.5)), " 1.50");
+        assert_eq!(format_element(ElementValue::F32(1234.5)), " 1234");
+        assert_eq!(format_element(ElementValue::F32(-1.5)), "-1.50");
     }
 
     #[test]
     fn i64_formats_without_decimals() {
-        assert_eq!(format_element(ElementValue::I64(42)), "42");
+        assert_eq!(format_element(ElementValue::I64(42)), " 42");
+        assert_eq!(format_element(ElementValue::I64(-42)), "-42");
     }
 
     #[test]

@@ -59,6 +59,10 @@ impl ComponentMetadata {
             .map(|v| v == "true")
             .unwrap_or_default()
     }
+
+    pub fn group_name(&self) -> Option<&str> {
+        self.metadata.get("group_name").map(|v| v.as_str())
+    }
 }
 
 impl From<&str> for ComponentMetadata {

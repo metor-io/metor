@@ -332,7 +332,9 @@ impl State {
         self.components.get(&component_id)
     }
 
-    pub fn component_metadata_iter(&self) -> impl Iterator<Item = (&ComponentId, &ComponentMetadata)> {
+    pub fn component_metadata_iter(
+        &self,
+    ) -> impl Iterator<Item = (&ComponentId, &ComponentMetadata)> {
         self.component_metadata.iter()
     }
 
@@ -341,18 +343,15 @@ impl State {
         metadata: ComponentMetadata,
         db_path: &Path,
     ) -> Result<(), Error> {
-        let component_metadata_path = db_path.join(metadata.component_id.to_string());
+        let component_metadata_path = dbg!(db_path.join(metadata.component_id.to_string()));
         std::fs::create_dir_all(&component_metadata_path)?;
         let component_metadata_path = component_metadata_path.join("metadata");
-        if component_metadata_path.exists()
-            && ComponentMetadata::read(&component_metadata_path)? == metadata
-        {
-            return Ok(());
-        }
         info!(component.name= ?metadata.name, component.id = ?metadata.component_id.0, "setting component metadata");
-        metadata.write(component_metadata_path)?;
+        metadata
+            .write(component_metadata_path)
+            .inspect_err(|e| println!("failed to write metadata: {:?}", e))?;
         self.component_metadata
-            .insert(metadata.component_id, metadata);
+            .insert(metadata.component_id, metadata.clone());
         Ok(())
     }
 
@@ -513,6 +512,7 @@ pub trait MetadataExt: Sized + Serialize + DeserializeOwned {
         Ok(postcard::from_bytes(&data)?)
     }
     fn write(&self, path: impl AsRef<Path>) -> Result<(), Error> {
+        let path = path.as_ref();
         let data = postcard::to_allocvec(&self)?;
         std::fs::write(path, data)?;
         Ok(())

@@ -52,12 +52,10 @@ pub fn format_element_value(value: ElementValue, enum_variants: Option<&[&str]>)
     super::value_strip::format_element(value)
 }
 
-/// Adaptive-precision number formatter.
-///
-/// Keeps large magnitudes compact (no trailing decimals above 1000) and
-/// preserves resolution below unity (4 fractional digits under 1.0).
+/// Adaptive-precision number formatter. Non-negative values get a leading
+/// space so digits stay column-aligned across a sign change.
 pub(crate) fn format_number(v: f64) -> String {
-    if v == 0.0 {
+    let body = if v == 0.0 {
         "0".to_string()
     } else if v.abs() >= 1000.0 {
         format!("{:.0}", v)
@@ -67,5 +65,22 @@ pub(crate) fn format_number(v: f64) -> String {
         format!("{:.2}", v)
     } else {
         format!("{:.4}", v)
+    };
+    pad_positive(&body)
+}
+
+/// Pass-through for already-signed strings and non-finite floats.
+pub(crate) fn pad_positive(s: &str) -> String {
+    if s.starts_with('-') {
+        s.to_string()
+    } else if s
+        .chars()
+        .next()
+        .map(|c| c.is_ascii_digit())
+        .unwrap_or(false)
+    {
+        format!(" {s}")
+    } else {
+        s.to_string()
     }
 }
