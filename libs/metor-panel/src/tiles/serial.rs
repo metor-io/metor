@@ -1,6 +1,7 @@
 use std::collections::HashMap;
+use std::sync::Arc;
 
-use gpui::{Context, Entity};
+use gpui::{Context, Entity, Global};
 
 use super::item::{PaneItem, PaneItemHandle};
 use super::pane::TabOrientation;
@@ -75,23 +76,22 @@ pub struct SerializedItem {
 }
 
 type DeserializeFn =
-    Box<dyn Fn(&str, &mut Context<super::pane::Pane>) -> Option<Box<dyn PaneItemHandle>>>;
+    Arc<dyn Fn(&str, &mut Context<super::pane::Pane>) -> Option<Box<dyn PaneItemHandle>>>;
 
 /// Directory of `serialization_key -> constructor` used to rehydrate items.
 ///
+/// Cloning is cheap (deserializers live behind an `Arc<HashMap>`), so callers
+/// can snapshot the global, drop the borrow on `cx`, and still deserialize
+/// items via `&mut Context`.
+///
 /// Must be populated with every pane-item type before
 /// [`super::TileGroup::deserialize`] is called, or the item is silently dropped.
+#[derive(Clone, Default)]
 pub struct ItemRegistry {
-    deserializers: HashMap<String, DeserializeFn>,
+    deserializers: Arc<HashMap<String, DeserializeFn>>,
 }
 
-impl Default for ItemRegistry {
-    fn default() -> Self {
-        Self {
-            deserializers: HashMap::new(),
-        }
-    }
-}
+impl Global for ItemRegistry {}
 
 impl ItemRegistry {
     pub fn new() -> Self {
@@ -106,9 +106,10 @@ impl ItemRegistry {
         &mut self,
         deserialize: impl Fn(&str, &mut Context<super::pane::Pane>) -> Option<Entity<T>> + 'static,
     ) {
-        self.deserializers.insert(
+        let map = Arc::make_mut(&mut self.deserializers);
+        map.insert(
             T::serialization_key().to_string(),
-            Box::new(move |state, cx| {
+            Arc::new(move |state, cx| {
                 let entity = deserialize(state, cx)?;
                 Some(Box::new(entity) as Box<dyn PaneItemHandle>)
             }),

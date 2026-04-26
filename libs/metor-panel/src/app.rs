@@ -7,7 +7,12 @@ use crate::inspector::{InspectorMode, InspectorRequest, OpenInspectorGlobal};
 use crate::inspector::palette::ItemRegistry;
 use crate::inspector::edits::{self, edit_value_rows, pending_edits, pending_edits_mut, review_rows};
 use crate::tiles::{PlotComponentAction, TileGroup, TileGroupEvent};
-use crate::tiles::panels::PlotPanel;
+use crate::tiles::panels::{
+    BrowserPanel, DataTablePanel, PlotPanel, PlotPanelConfig, TablePanel, TablePanelConfig,
+    DataTablePanelConfig, BrowserPanelConfig, TextPanel, TextPanelConfig, Viewer3dPanel,
+    Viewer3dPanelConfig,
+};
+use crate::views::dashboard::{DashboardPanel, deserialize_dashboard};
 use gpui::{
     App, Application, Bounds, Context, Entity, FocusHandle, Focusable, IntoElement, KeyBinding,
     Pixels, Point, Render, SharedString, TitlebarOptions, Window, WindowBounds, WindowOptions,
@@ -383,6 +388,7 @@ pub fn run(db: Arc<metor_db::DB>) {
             ItemRegistry::init(cx);
             crate::inspector::registry::InspectorRegistry::init(db.clone(), cx);
             crate::views::dashboard::WidgetRegistry::init(cx);
+            register_pane_item_deserializers(db.clone(), cx);
             set_dock_icon();
             cx.bind_keys([
                 KeyBinding::new("cmd-p", OpenPalette, None),
@@ -408,6 +414,67 @@ pub fn run(db: Arc<metor_db::DB>) {
             )
             .unwrap();
         });
+}
+
+/// Populate the pane-item registry so [`TileGroup::from_json`] can rehydrate
+/// every built-in panel kind. One closure per kind, parsing the kind's
+/// `*Config` blob with `facet-json` and constructing the panel via its
+/// `from_config` constructor (or, for [`DashboardPanel`], the dedicated
+/// `deserialize_dashboard` helper). The populated registry is installed as a
+/// gpui `Global` so palette callbacks can fetch it without threading.
+fn register_pane_item_deserializers(db: Arc<DB>, cx: &mut App) {
+    use crate::tiles::ItemRegistry as PaneItemRegistry;
+    let mut reg = PaneItemRegistry::default();
+
+    let db_text = db.clone();
+    reg.register::<TextPanel>(move |state, cx| {
+        let cfg: TextPanelConfig = facet_json::from_str(state).unwrap_or_default();
+        let db = db_text.clone();
+        Some(cx.new(|cx| TextPanel::from_config(cfg, db, cx)))
+    });
+
+    let db_table = db.clone();
+    reg.register::<TablePanel>(move |state, cx| {
+        let cfg: TablePanelConfig = facet_json::from_str(state).unwrap_or_default();
+        let db = db_table.clone();
+        Some(cx.new(|cx| TablePanel::from_config(cfg, db, cx)))
+    });
+
+    let db_data = db.clone();
+    reg.register::<DataTablePanel>(move |state, cx| {
+        let cfg: DataTablePanelConfig = facet_json::from_str(state).unwrap_or_default();
+        let db = db_data.clone();
+        Some(cx.new(|cx| DataTablePanel::from_config(cfg, db, cx)))
+    });
+
+    let db_browser = db.clone();
+    reg.register::<BrowserPanel>(move |state, cx| {
+        let cfg: BrowserPanelConfig = facet_json::from_str(state).unwrap_or_default();
+        let db = db_browser.clone();
+        Some(cx.new(|cx| BrowserPanel::from_config(cfg, db, cx)))
+    });
+
+    let db_plot = db.clone();
+    reg.register::<PlotPanel>(move |state, cx| {
+        let cfg: PlotPanelConfig = facet_json::from_str(state).unwrap_or_default();
+        let db = db_plot.clone();
+        Some(cx.new(|cx| PlotPanel::from_config(cfg, db, cx)))
+    });
+
+    let db_viewer = db.clone();
+    reg.register::<Viewer3dPanel>(move |state, cx| {
+        let cfg: Viewer3dPanelConfig = facet_json::from_str(state).unwrap_or_default();
+        let db = db_viewer.clone();
+        Some(cx.new(|cx| Viewer3dPanel::from_config(cfg, db, cx)))
+    });
+
+    let db_dashboard = db.clone();
+    reg.register::<DashboardPanel>(move |state, cx| {
+        let db = db_dashboard.clone();
+        Some(deserialize_dashboard(db, state, cx))
+    });
+
+    cx.set_global(reg);
 }
 
 #[cfg(target_os = "macos")]

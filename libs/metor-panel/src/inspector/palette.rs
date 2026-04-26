@@ -6,13 +6,14 @@
 //! simply stop appearing in the next snapshot.
 use std::sync::Arc;
 
-use gpui::{AnyEntity, App, Entity, Global, SharedString, Window};
+use gpui::{AnyEntity, App, Entity, Global, PathPromptOptions, SharedString, Window};
 use metor_db::DB;
 
 use crate::inspector::OpenInspectorCallback;
+use crate::presets;
 use crate::tiles::TileGroup;
 use crate::views::dashboard::DashboardPanel;
-use crate::inspector::rows::{CommandRow, InspectorRow, NavRow};
+use crate::inspector::rows::{CommandRow, DefaultActionRow, InspectorRow, NavRow};
 
 /// Tag shown as a pill alongside each palette row, also used to group
 /// providers. `Custom` lets external subsystems add categories without
@@ -154,6 +155,7 @@ pub fn register_builtin_providers(
     register_panel_provider(tiles.clone(), cx);
     register_pane_settings_provider(tiles.clone(), cx);
     register_widget_provider(tiles.clone(), cx);
+    register_preset_provider(tiles.clone(), cx);
     register_command_provider(db, tiles, on_open_inspector, cx);
 }
 
@@ -321,4 +323,114 @@ fn register_command_provider(
         items
     });
     ItemRegistry::register(cx, Category::Command, provider);
+}
+
+/// Register the "Preset" category with two entries: **Save preset** and
+/// **Load preset**. Each opens a submenu listing the built-in directory
+/// items alongside a `Save to file…` / `Load from file…` row, so the OS
+/// file dialog is reachable without a separate top-level command.
+fn register_preset_provider(tiles: Entity<TileGroup>, cx: &mut App) {
+    let provider: ItemProvider = Arc::new(move |_cx: &App| {
+        let mut items: Vec<InspectionItem> = Vec::new();
+
+        // Save preset
+        let tiles_for_save = tiles.clone();
+        items.push(InspectionItem::SubMenu {
+            label: SharedString::new_static("Save preset"),
+            summary: SharedString::new_static("Type a name, or pick \"Save to file…\""),
+            build: Arc::new(move |_cx| {
+                let mut rows: Vec<Box<dyn InspectorRow>> = Vec::new();
+                let tiles_for_name = tiles_for_save.clone();
+                rows.push(Box::new(DefaultActionRow {
+                    label: SharedString::new_static("Type a name and press Enter"),
+                    callback: Arc::new(move |name, _window, cx| {
+                        let json = tiles_for_name.read(cx).to_json(cx);
+                        if let Err(e) = presets::save_preset(&name, &json) {
+                            eprintln!("save preset {name}: {e}");
+                        }
+                    }),
+                }));
+                let tiles_for_file = tiles_for_save.clone();
+                rows.push(Box::new(CommandRow::new(
+                    SharedString::new_static("Save to file…"),
+                    Arc::new(move |_window, cx| {
+                        let json = tiles_for_file.read(cx).to_json(cx);
+                        let initial_dir = dirs::home_dir().unwrap_or_else(std::env::temp_dir);
+                        let receiver =
+                            cx.prompt_for_new_path(&initial_dir, Some("metor-layout.json"));
+                        cx.spawn(async move |_cx| {
+                            if let Ok(Ok(Some(path))) = receiver.await {
+                                if let Err(e) = std::fs::write(&path, json) {
+                                    eprintln!("save preset to {}: {e}", path.display());
+                                }
+                            }
+                        })
+                        .detach();
+                    }),
+                )));
+                rows
+            }),
+        });
+
+        // Load preset
+        let tiles_for_load = tiles.clone();
+        items.push(InspectionItem::SubMenu {
+            label: SharedString::new_static("Load preset"),
+            summary: SharedString::new_static(""),
+            build: Arc::new(move |_cx| {
+                let mut rows: Vec<Box<dyn InspectorRow>> = Vec::new();
+                let entries = presets::list_presets();
+                for (name, path) in entries {
+                    let tiles = tiles_for_load.clone();
+                    rows.push(Box::new(CommandRow::new(
+                        SharedString::from(name),
+                        Arc::new(move |_window, cx| {
+                            let json = match std::fs::read_to_string(&path) {
+                                Ok(s) => s,
+                                Err(e) => {
+                                    eprintln!("read preset {}: {e}", path.display());
+                                    return;
+                                }
+                            };
+                            presets::load_into_tiles(&json, &tiles, cx);
+                        }),
+                    )));
+                }
+                let tiles_for_file = tiles_for_load.clone();
+                rows.push(Box::new(CommandRow::new(
+                    SharedString::new_static("Load from file…"),
+                    Arc::new(move |_window, cx| {
+                        let receiver = cx.prompt_for_paths(PathPromptOptions {
+                            files: true,
+                            directories: false,
+                            multiple: false,
+                            prompt: Some(SharedString::new_static("Open layout preset")),
+                        });
+                        let tiles = tiles_for_file.clone();
+                        cx.spawn(async move |cx| {
+                            let Ok(Ok(Some(paths))) = receiver.await else {
+                                return;
+                            };
+                            let Some(path) = paths.into_iter().next() else {
+                                return;
+                            };
+                            let json = match std::fs::read_to_string(&path) {
+                                Ok(s) => s,
+                                Err(e) => {
+                                    eprintln!("read preset {}: {e}", path.display());
+                                    return;
+                                }
+                            };
+                            let _ = cx.update(|cx| presets::load_into_tiles(&json, &tiles, cx));
+                        })
+                        .detach();
+                    }),
+                )));
+                rows
+            }),
+        });
+
+        items
+    });
+    ItemRegistry::register(cx, Category::Custom("Preset".into()), provider);
 }

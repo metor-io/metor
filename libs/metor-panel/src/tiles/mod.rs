@@ -456,6 +456,23 @@ impl TileGroup {
         Ok(Self::deserialize(serialized, registry, cx))
     }
 
+    /// Parse `json` and swap the layout in place.
+    ///
+    /// Pulls the panel-item registry from gpui globals so callers don't have
+    /// to thread it. The clone keeps the global borrow short so the rest of
+    /// the deserialization can take `&mut Context<Self>` freely.
+    pub fn replace_from_json(
+        &mut self,
+        json: &str,
+        cx: &mut Context<Self>,
+    ) -> Result<(), facet_json::DeserializeError> {
+        let registry = cx.global::<ItemRegistry>().clone();
+        let new_self = Self::from_json(json, &registry, cx)?;
+        *self = new_self;
+        cx.notify();
+        Ok(())
+    }
+
     /// Rebuild a layout from a [`SerializedTileGroup`]. Items whose
     /// serialization key is absent from `registry` are silently dropped.
     pub fn deserialize(

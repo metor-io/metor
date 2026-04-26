@@ -5,17 +5,30 @@ use metor_db::DB;
 use metor_proto::types::ComponentId;
 
 use crate::views::dashboard::DashboardPanel;
-use crate::views::time_series::LinePlot;
+use crate::views::time_series::{LinePlot, PlotStyle, Trace};
 use crate::views::viewer_3d::Viewer3d;
 use crate::views::{
     ComponentBrowser, ComponentTable, ComponentText, DataTable, TimeSeriesPlot,
     new_component_browser, new_component_table, new_data_table,
 };
+use gpui::Hsla;
 use crate::inspector::{InspectorMode, InspectorRequest, OpenInspectorCallback};
 use crate::inspector::rows::{CommandRow, InspectorRow, NavRow};
 
 use super::item::{PaneItem, PaneItemHandle};
 use super::pane::Pane;
+
+/// Resolve a component by display name. Returns `None` when the DB has no
+/// such component yet — callers fall back to a stub binding so saved layouts
+/// still load against an empty DB.
+fn lookup_component_by_name(db: &Arc<DB>, name: &str) -> Option<ComponentId> {
+    db.with_state(|state| {
+        state
+            .component_metadata_iter()
+            .find(|(_, meta)| meta.name == name)
+            .map(|(id, _)| *id)
+    })
+}
 
 /// Persisted shape of a [`TextPanel`].
 #[derive(facet::Facet, Default)]
@@ -48,6 +61,16 @@ impl TextPanel {
         TextPanelConfig {
             component: self.label.to_string(),
         }
+    }
+
+    /// Rebuild a [`TextPanel`] from its persisted config.
+    ///
+    /// Resolves the component by name through the DB; falls back to a stub
+    /// pointing at the first registered component (or `ComponentId(0)` if
+    /// none exists yet) so the layout still renders against an empty DB.
+    pub fn from_config(cfg: TextPanelConfig, db: Arc<DB>, cx: &mut Context<Self>) -> Self {
+        let component_id = lookup_component_by_name(&db, &cfg.component).unwrap_or(ComponentId(0));
+        Self::new(db, component_id, cfg.component, cx)
     }
 }
 
@@ -94,6 +117,10 @@ impl TablePanel {
     pub fn to_config(&self, _cx: &App) -> TablePanelConfig {
         TablePanelConfig {}
     }
+
+    pub fn from_config(_cfg: TablePanelConfig, db: Arc<DB>, cx: &mut Context<Self>) -> Self {
+        Self::new(db, cx)
+    }
 }
 
 impl Render for TablePanel {
@@ -136,6 +163,10 @@ impl DataTablePanel {
 
     pub fn to_config(&self, _cx: &App) -> DataTablePanelConfig {
         DataTablePanelConfig {}
+    }
+
+    pub fn from_config(_cfg: DataTablePanelConfig, db: Arc<DB>, cx: &mut Context<Self>) -> Self {
+        Self::new(db, cx)
     }
 }
 
@@ -180,6 +211,10 @@ impl BrowserPanel {
 
     pub fn to_config(&self, _cx: &App) -> BrowserPanelConfig {
         BrowserPanelConfig {}
+    }
+
+    pub fn from_config(_cfg: BrowserPanelConfig, db: Arc<DB>, cx: &mut Context<Self>) -> Self {
+        Self::new(db, cx)
     }
 }
 
@@ -254,20 +289,84 @@ impl Render for PlotPanel {
 }
 
 /// Persisted shape of a [`PlotPanel`].
-///
-/// Currently mirrors what the legacy serializer wrote — just the rendered
-/// title — but lives in its own struct so future trace/range/override fields
-/// can land here without touching the registry.
 #[derive(facet::Facet, Default)]
 pub struct PlotPanelConfig {
     pub label: String,
+    pub traces: Vec<TraceConfig>,
+}
+
+/// Persisted shape of one [`Trace`].
+///
+/// `Trace` itself marks `component_id` and `element_index` as
+/// `#[facet(skip)]` because the inspector doesn't expose them — but we *do*
+/// need them on disk, so the persistence boundary uses this parallel
+/// struct.
+#[derive(facet::Facet, Clone)]
+pub struct TraceConfig {
+    pub component_id: ComponentId,
+    pub element_index: usize,
+    pub color: Hsla,
+    pub style: PlotStyle,
+    pub visible: bool,
+    pub label: String,
+    pub stroke_width: f32,
+}
+
+impl Default for TraceConfig {
+    fn default() -> Self {
+        Self {
+            component_id: ComponentId(0),
+            element_index: 0,
+            color: Hsla::default(),
+            style: PlotStyle::default(),
+            visible: true,
+            label: String::new(),
+            stroke_width: 1.5,
+        }
+    }
 }
 
 impl PlotPanel {
     pub fn to_config(&self, cx: &App) -> PlotPanelConfig {
+        let traces = self
+            .line_plot
+            .read(cx)
+            .traces()
+            .iter()
+            .map(|t| {
+                let t = t.read(cx);
+                TraceConfig {
+                    component_id: t.component_id,
+                    element_index: t.element_index,
+                    color: t.color,
+                    style: t.style,
+                    visible: t.visible,
+                    label: t.label.to_string(),
+                    stroke_width: t.stroke_width,
+                }
+            })
+            .collect();
         PlotPanelConfig {
             label: self.tab_title(cx).to_string(),
+            traces,
         }
+    }
+
+    pub fn from_config(cfg: PlotPanelConfig, db: Arc<DB>, cx: &mut Context<Self>) -> Self {
+        let traces = cfg
+            .traces
+            .into_iter()
+            .map(|t| Trace {
+                component_id: t.component_id,
+                element_index: t.element_index,
+                color: t.color,
+                style: t.style,
+                visible: t.visible,
+                label: t.label.into(),
+                stroke_width: t.stroke_width,
+            })
+            .collect();
+        Self::with_traces(db, traces, cx)
     }
 }
 
@@ -365,6 +464,42 @@ impl Viewer3dPanel {
                 distance: cam.distance,
                 fov_y_rad: cam.fov_y_rad,
             },
+        }
+    }
+
+    /// Rebuild a [`Viewer3dPanel`] from its persisted config.
+    ///
+    /// Spawns models through the public `add_model` API; bindings get reset
+    /// directly on each [`crate::views::viewer_3d::ModelEntry`] entity so
+    /// the viewer's reconcile pass picks them up on the next observe tick.
+    pub fn from_config(cfg: Viewer3dPanelConfig, db: Arc<DB>, cx: &mut Context<Self>) -> Self {
+        let inner = cx.new(|cx| {
+            let mut viewer = Viewer3d::with_db(db, cx);
+            for model in &cfg.models {
+                viewer.add_model(model.label.clone(), model.path.clone(), cx);
+                if let Some(entry) = viewer.models().last().cloned() {
+                    let pos = model.position_binding;
+                    let orient = model.orientation_binding;
+                    entry.update(cx, |m, cx| {
+                        m.position_binding = pos;
+                        m.orientation_binding = orient;
+                        cx.notify();
+                    });
+                }
+            }
+            let cam = viewer.camera_mut();
+            cam.target = glam::Vec3::new(cfg.camera.target_x, cfg.camera.target_y, cfg.camera.target_z);
+            cam.yaw = cfg.camera.yaw;
+            cam.pitch = cfg.camera.pitch;
+            cam.distance = cfg.camera.distance;
+            cam.fov_y_rad = cfg.camera.fov_y_rad;
+            viewer.camera_fov = cfg.camera.fov_y_rad;
+            viewer.sync_camera(cx);
+            viewer
+        });
+        Self {
+            inner,
+            label: "3D Viewer".into(),
         }
     }
 }
@@ -580,10 +715,23 @@ mod tests {
 
         let plot = PlotPanelConfig {
             label: "speed".into(),
+            traces: vec![TraceConfig {
+                component_id: ComponentId(3),
+                element_index: 1,
+                color: Hsla::default(),
+                style: PlotStyle::Line,
+                visible: true,
+                label: "vx".into(),
+                stroke_width: 2.0,
+            }],
         };
         let s = facet_json::to_string(&plot).unwrap();
         let back: PlotPanelConfig = facet_json::from_str(&s).unwrap();
         assert_eq!(back.label, "speed");
+        assert_eq!(back.traces.len(), 1);
+        assert_eq!(back.traces[0].component_id, ComponentId(3));
+        assert_eq!(back.traces[0].element_index, 1);
+        assert_eq!(back.traces[0].label, "vx");
 
         let viewer = Viewer3dPanelConfig {
             models: vec![ModelConfig {
