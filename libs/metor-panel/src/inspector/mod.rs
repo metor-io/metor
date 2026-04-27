@@ -14,6 +14,7 @@ use gpui::{
     canvas, deferred, div, prelude::*, px, uniform_list,
 };
 
+pub mod drag_paint;
 pub mod edits;
 pub mod palette;
 pub mod reflect;

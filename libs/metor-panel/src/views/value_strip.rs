@@ -309,21 +309,41 @@ impl ComponentValueStrip {
 }
 
 impl ComponentValueStrip {
-    fn toggle_bool_cell(&mut self, idx: usize, _window: &mut Window, cx: &mut Context<Self>) {
+    fn displayed_bool(&self, idx: usize, cx: &App) -> Option<bool> {
+        if let Some(edit) = crate::inspector::edits::pending_edits(cx).get(self.component_id) {
+            match edit.value.as_view().iter().nth(idx)? {
+                ElementValue::Bool(b) => Some(b),
+                _ => None,
+            }
+        } else {
+            match self.raw_values.get(idx).copied()? {
+                ElementValue::Bool(b) => Some(b),
+                _ => None,
+            }
+        }
+    }
+
+    fn toggle_bool_cell(&mut self, idx: usize, cx: &mut Context<Self>) -> Option<bool> {
+        let current = self.displayed_bool(idx, cx)?;
+        let next = !current;
+        self.set_bool_cell(idx, next, cx);
+        Some(next)
+    }
+
+    fn set_bool_cell(&mut self, idx: usize, value: bool, cx: &mut Context<Self>) {
         if self.behavior.locked {
             return;
         }
-        let Some(ElementValue::Bool(current)) = self.raw_values.get(idx).copied() else {
+        if self.displayed_bool(idx, cx) != Some(!value) {
             return;
-        };
-        let new_value = ElementValue::Bool(!current);
+        }
         crate::inspector::edits::upsert_element_value(
             &self.db,
             self.component_id,
             self.component_name.clone(),
             self.element_names.clone(),
             idx,
-            new_value,
+            ElementValue::Bool(value),
             cx,
         );
         cx.notify();
@@ -588,12 +608,27 @@ impl Render for ComponentValueStrip {
             let atom = if behavior.locked || is_editing {
                 atom
             } else if is_bool {
-                atom.cursor_pointer().on_mouse_down(
-                    MouseButton::Left,
-                    cx.listener(move |this, _, window, cx| {
-                        this.toggle_bool_cell(idx, window, cx);
-                    }),
-                )
+                atom.cursor_pointer()
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |this, _, _window, cx| {
+                            if let Some(next) = this.toggle_bool_cell(idx, cx) {
+                                crate::inspector::drag_paint::start(next, cx);
+                            }
+                        }),
+                    )
+                    .on_mouse_move(cx.listener(
+                        move |this, event: &gpui::MouseMoveEvent, _window, cx| {
+                            if !event.dragging() {
+                                crate::inspector::drag_paint::clear(cx);
+                                return;
+                            }
+                            let Some(target) = crate::inspector::drag_paint::current(cx) else {
+                                return;
+                            };
+                            this.set_bool_cell(idx, target, cx);
+                        },
+                    ))
             } else if can_edit_inline {
                 atom.cursor_pointer().on_mouse_down(
                     MouseButton::Left,

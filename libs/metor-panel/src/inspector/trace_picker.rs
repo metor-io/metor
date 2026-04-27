@@ -72,8 +72,8 @@ impl TraceSelection {
             .unwrap_or(false)
     }
 
-    pub fn is_all(&self, id: ComponentId, elem_count: usize) -> bool {
-        elem_count > 0 && self.count_for(id) == elem_count
+    pub fn has_component(&self, id: ComponentId) -> bool {
+        self.by_component.iter().any(|(c, _)| *c == id)
     }
 
     pub fn set_index(&mut self, id: ComponentId, idx: usize, checked: bool) {
@@ -190,20 +190,15 @@ fn element_page_rows(
         elem_names
     };
 
+    {
+        let mut sel = selection.lock().unwrap();
+        if !sel.has_component(comp_id) {
+            sel.set_all(comp_id, elem_count, true);
+        }
+    }
+
     let mut rows: Vec<Box<dyn InspectorRow>> = Vec::new();
     rows.push(Box::new(DoneRow));
-
-    if elem_count > 1 {
-        let sel_v = selection.clone();
-        let sel_t = selection.clone();
-        rows.push(Box::new(BoolRow::dynamic(
-            SharedString::new_static("All elements"),
-            Box::new(move |_cx| sel_v.lock().unwrap().is_all(comp_id, elem_count)),
-            Arc::new(move |checked, _w, _cx| {
-                sel_t.lock().unwrap().set_all(comp_id, elem_count, checked);
-            }),
-        )));
-    }
 
     for (idx, elem_name) in elem_names.into_iter().enumerate() {
         let display = if elem_name.is_empty() {
@@ -216,7 +211,7 @@ fn element_page_rows(
         let sel_t = selection.clone();
         rows.push(Box::new(BoolRow::dynamic(
             label,
-            Box::new(move |_cx| sel_v.lock().unwrap().contains(comp_id, idx)),
+            Arc::new(move |_cx| sel_v.lock().unwrap().contains(comp_id, idx)),
             Arc::new(move |checked, _w, _cx| {
                 sel_t.lock().unwrap().set_index(comp_id, idx, checked);
             }),
