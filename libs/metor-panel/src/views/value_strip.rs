@@ -809,19 +809,19 @@ fn build_cell_chrome(
         let track_color = if is_pending {
             theme.drop_target
         } else if bool_value {
-            theme.line_colors[2]
+            theme.line_colors[2].opacity(0.7)
         } else {
             theme.bg_secondary
         };
         let knob = div()
-            .w(px(12.5))
-            .h(px(12.5))
-            .rounded(px(2.0))
+            .w(px(15.0))
+            .h(px(15.0))
+            .rounded(px(3.0))
             .bg(theme.text_primary);
         atom = atom
             .w(px(40.0))
             .h(px(25.5))
-            .py(px(6.25))
+            .py(px(4.0))
             .px(px(4.0))
             .items_center()
             .bg(track_color)
@@ -1019,9 +1019,7 @@ pub(crate) fn format_cells(
     enum_variants: Option<&[String]>,
     is_string: bool,
 ) -> Vec<StripCell> {
-    if is_string
-        && let ComponentView::U8(array) = view
-    {
+    if is_string && let ComponentView::U8(array) = view {
         let buf = array.buf();
         let len = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
         if let Ok(s) = std::str::from_utf8(&buf[..len]) {

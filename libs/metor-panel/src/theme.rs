@@ -117,6 +117,9 @@ pub fn all_themes() -> &'static [&'static Theme] {
         &AYU_DARK,
         &EVERFOREST_DARK,
         &EVERFOREST_LIGHT,
+        &ROSE_PINE,
+        &ROSE_PINE_MOON,
+        &ROSE_PINE_DAWN,
     ];
     THEMES
 }
@@ -380,6 +383,117 @@ pub static EVERFOREST_LIGHT: Theme = Theme {
     grid_color: hex(0xefebd4, 1.0),
     axis_color: hex(0xe6e2cc, 1.0),
     zero_line_color: hex(0xbdc3af, 1.0),
+};
+
+pub static ROSE_PINE: Theme = Theme {
+    name: "Rosé Pine",
+    font_family: "Berkeley Mono",
+
+    bg_primary: hex(0x1f1d2e, 1.0),
+    bg_secondary: hex(0x191724, 1.0),
+    bg_elevated: hex(0x26233a, 1.0),
+
+    text_primary: hex(0xe0def4, 1.0),
+    text_secondary: hex(0x908caa, 1.0),
+    text_tertiary: hex(0x6e6a86, 1.0),
+
+    border_primary: hex(0x403d52, 1.0),
+
+    selection_bg: hex(0x524f67, 1.0),
+    text_selection: hex(0xc4a7e7, 0.3),
+    drop_target: hex(0xf6c177, 0.15),
+
+    pill_bg: hex(0x403d52, 1.0),
+    pill_border: hex(0x524f67, 1.0),
+
+    line_color: hex(0xf6c177, 1.0),
+    line_colors: [
+        hex(0xf6c177, 1.0), // gold
+        hex(0x31748f, 1.0), // pine
+        hex(0x9ccfd8, 1.0), // foam
+        hex(0xeb6f92, 1.0), // love
+        hex(0xc4a7e7, 1.0), // iris
+        hex(0xebbcba, 1.0), // rose
+        hex(0xf6c177, 1.0), // gold
+        hex(0xeb6f92, 1.0), // love
+    ],
+    grid_color: hex(0x21202e, 1.0),
+    axis_color: hex(0x403d52, 1.0),
+    zero_line_color: hex(0x524f67, 1.0),
+};
+
+pub static ROSE_PINE_MOON: Theme = Theme {
+    name: "Rosé Pine Moon",
+    font_family: "Berkeley Mono",
+
+    bg_primary: hex(0x2a273f, 1.0),
+    bg_secondary: hex(0x232136, 1.0),
+    bg_elevated: hex(0x393552, 1.0),
+
+    text_primary: hex(0xe0def4, 1.0),
+    text_secondary: hex(0x908caa, 1.0),
+    text_tertiary: hex(0x6e6a86, 1.0),
+
+    border_primary: hex(0x44415a, 1.0),
+
+    selection_bg: hex(0x56526e, 1.0),
+    text_selection: hex(0xc4a7e7, 0.3),
+    drop_target: hex(0xf6c177, 0.15),
+
+    pill_bg: hex(0x44415a, 1.0),
+    pill_border: hex(0x56526e, 1.0),
+
+    line_color: hex(0xf6c177, 1.0),
+    line_colors: [
+        hex(0xf6c177, 1.0), // gold
+        hex(0x3e8fb0, 1.0), // pine
+        hex(0x9ccfd8, 1.0), // foam
+        hex(0xeb6f92, 1.0), // love
+        hex(0xc4a7e7, 1.0), // iris
+        hex(0xea9a97, 1.0), // rose
+        hex(0xf6c177, 1.0), // gold
+        hex(0xea9a97, 1.0), // rose
+    ],
+    grid_color: hex(0x2a283e, 1.0),
+    axis_color: hex(0x44415a, 1.0),
+    zero_line_color: hex(0x56526e, 1.0),
+};
+
+pub static ROSE_PINE_DAWN: Theme = Theme {
+    name: "Rosé Pine Dawn",
+    font_family: "Berkeley Mono",
+
+    bg_primary: hex(0xfffaf3, 1.0),
+    bg_secondary: hex(0xfaf4ed, 1.0),
+    bg_elevated: hex(0xf2e9e1, 1.0),
+
+    text_primary: hex(0x575279, 1.0),
+    text_secondary: hex(0x797593, 1.0),
+    text_tertiary: hex(0x9893a5, 1.0),
+
+    border_primary: hex(0xdfdad9, 1.0),
+
+    selection_bg: hex(0xcecacd, 1.0),
+    text_selection: hex(0x907aa9, 0.3),
+    drop_target: hex(0xea9d34, 0.15),
+
+    pill_bg: hex(0xf2e9e1, 1.0),
+    pill_border: hex(0xdfdad9, 1.0),
+
+    line_color: hex(0xea9d34, 1.0),
+    line_colors: [
+        hex(0xea9d34, 1.0), // gold
+        hex(0x286983, 1.0), // pine
+        hex(0x56949f, 1.0), // foam
+        hex(0xb4637a, 1.0), // love
+        hex(0x907aa9, 1.0), // iris
+        hex(0xd7827e, 1.0), // rose
+        hex(0xea9d34, 1.0), // gold
+        hex(0xb4637a, 1.0), // love
+    ],
+    grid_color: hex(0xf4ede8, 1.0),
+    axis_color: hex(0xdfdad9, 1.0),
+    zero_line_color: hex(0xcecacd, 1.0),
 };
 
 /// Load the embedded IBM Plex Mono fonts into gpui's text system.
