@@ -9,7 +9,8 @@ use crate::inspector::edits::{
 use crate::inspector::palette::ItemRegistry;
 use crate::inspector::{InspectorMode, InspectorRequest, OpenInspectorGlobal};
 use crate::tiles::panels::{
-    BrowserPanel, DataTablePanel, PlotPanel, TablePanel, TextPanel, Viewer3dPanel,
+    BrowserPanel, DataTablePanel, PlotPanel, TablePanel, TextPanel, TrafficLightGridPanel,
+    TrafficLightPanel, Viewer3dPanel,
 };
 use crate::tiles::{PlotComponentAction, TileGroup, TileGroupEvent};
 use crate::views::dashboard::{DashboardPanel, deserialize_dashboard};
@@ -437,6 +438,12 @@ fn register_pane_item_deserializers(db: Arc<DB>, cx: &mut App) {
     register_panel::<BrowserPanel>(&mut reg, db.clone(), BrowserPanel::from_config);
     register_panel::<PlotPanel>(&mut reg, db.clone(), PlotPanel::from_config);
     register_panel::<Viewer3dPanel>(&mut reg, db.clone(), Viewer3dPanel::from_config);
+    register_panel::<TrafficLightPanel>(&mut reg, db.clone(), TrafficLightPanel::from_config);
+    register_panel::<TrafficLightGridPanel>(
+        &mut reg,
+        db.clone(),
+        TrafficLightGridPanel::from_config,
+    );
 
     // Dashboard's deserializer returns a fully-constructed entity rather
     // than a `Self`, so it doesn't fit the generic helper.

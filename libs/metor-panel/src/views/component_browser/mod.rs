@@ -95,7 +95,7 @@ impl Selection {
 /// dots in component names match literally. `*` maps to `.*` and `?` to
 /// `.` — both traverse segment boundaries, which matches the user's
 /// expectation that `*.health` picks up `cube_sat.imu.health`.
-fn glob_to_regex(pattern: &str) -> Result<regex::Regex, regex::Error> {
+pub(crate) fn glob_to_regex(pattern: &str) -> Result<regex::Regex, regex::Error> {
     let mut out = String::with_capacity(pattern.len() + 2);
     out.push('^');
     for ch in pattern.chars() {

@@ -773,6 +773,8 @@ fn build_cell_chrome(
         // still reads as a frame.
         let track_color = if is_pending {
             theme.drop_target
+        } else if bool_value {
+            theme.line_colors[2]
         } else {
             theme.bg_secondary
         };

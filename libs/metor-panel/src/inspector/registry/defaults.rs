@@ -29,6 +29,8 @@ impl InspectorRegistry {
         self.register_override_shared_string();
         self.register_time_range_behavior();
         self.register_inspectable::<crate::views::Monitor>();
+        self.register_inspectable::<crate::views::TrafficLight>();
+        self.register_inspectable::<crate::views::TrafficLightGrid>();
         self.register_entity_list::<LinePlot, Trace>(
             db.clone(),
             |lp| &lp.traces,
