@@ -29,6 +29,8 @@ impl InspectorRegistry {
         self.register_override_shared_string();
         self.register_time_range_behavior();
         self.register_inspectable::<crate::views::Monitor>();
+        self.register_inspectable::<crate::views::TrafficLight>();
+        self.register_inspectable::<crate::views::TrafficLightGrid>();
         self.register_entity_list::<LinePlot, Trace>(
             db.clone(),
             |lp| &lp.traces,
@@ -267,7 +269,7 @@ impl InspectorRegistry {
             let orientation_write = pane.clone();
             let orientation_row = BoolRow::dynamic(
                 "Vertical Tabs",
-                Box::new(move |cx| {
+                Arc::new(move |cx| {
                     matches!(
                         orientation_read.read(cx).tab_orientation(),
                         TabOrientation::Vertical
@@ -289,7 +291,7 @@ impl InspectorRegistry {
             let hide_write = pane.clone();
             let hide_row = BoolRow::dynamic(
                 "Hide Tab Bar",
-                Box::new(move |cx| hide_read.read(cx).hide_tab_bar()),
+                Arc::new(move |cx| hide_read.read(cx).hide_tab_bar()),
                 Arc::new(move |checked, _w, cx| {
                     hide_write.update(cx, |p, cx| p.set_hide_tab_bar(checked, cx));
                 }),
@@ -299,7 +301,7 @@ impl InspectorRegistry {
             let lock_write = pane;
             let lock_row = BoolRow::dynamic(
                 "Locked Size",
-                Box::new(move |cx| lock_read.read(cx).locked_size().is_some()),
+                Arc::new(move |cx| lock_read.read(cx).locked_size().is_some()),
                 Arc::new(move |checked, _w, cx| {
                     lock_write.update(cx, |p, cx| {
                         let next = checked.then(|| p.current_outer_size());

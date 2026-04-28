@@ -45,6 +45,7 @@ impl InspectorRow for TextRow {
         let theme = theme(cx);
 
         row_base(row_ix, selected, cx)
+            .gap(px(2.))
             .child(
                 div()
                     .text_size(px(12.0))
@@ -52,12 +53,16 @@ impl InspectorRow for TextRow {
                     .child(self.label.clone()),
             )
             .child(
-                div().min_w(px(60.0)).max_w(px(120.0)).child(
-                    div()
-                        .text_size(px(12.0))
-                        .text_color(theme.text_secondary)
-                        .child(self.value.borrow().clone()),
-                ),
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .text_size(px(12.0))
+                    .text_color(theme.text_secondary)
+                    .overflow_hidden()
+                    .whitespace_nowrap()
+                    .text_ellipsis()
+                    .text_right()
+                    .child(self.value.borrow().clone()),
             )
             .into_any_element()
     }

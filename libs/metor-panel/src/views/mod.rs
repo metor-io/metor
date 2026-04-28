@@ -9,6 +9,9 @@ pub mod monitor;
 pub mod scrollbar;
 pub mod table;
 pub mod time_series;
+pub mod tooltip;
+pub mod traffic_light;
+pub mod traffic_light_grid;
 pub mod value_strip;
 pub mod viewer_3d;
 
@@ -23,6 +26,9 @@ pub use monitor::Monitor;
 pub use scrollbar::Scrollbar;
 pub use table::{Column, ColumnSort, Table, TableDelegate};
 pub use time_series::{PlotStyle, TimeSeriesPlot, Trace};
+pub use tooltip::TooltipText;
+pub use traffic_light::TrafficLight;
+pub use traffic_light_grid::TrafficLightGrid;
 pub use value_strip::{
     ComponentValueStrip, StripBehavior, StripCell, StripClick, StripPreset, StripStyle,
 };

@@ -12,8 +12,8 @@ use crate::views::dashboard::DashboardPanel;
 use crate::views::time_series::{LinePlot, Override, PlotStyle, Trace};
 use crate::views::viewer_3d::Viewer3d;
 use crate::views::{
-    ComponentBrowser, ComponentTable, ComponentText, DataTable, TimeSeriesPlot,
-    new_component_browser, new_component_table, new_data_table,
+    ComponentBrowser, ComponentTable, ComponentText, DataTable, TimeSeriesPlot, TrafficLight,
+    TrafficLightGrid, new_component_browser, new_component_table, new_data_table,
 };
 
 use super::item::{PaneItem, PaneItemHandle};
@@ -73,6 +73,145 @@ impl PaneItem for TextPanel {
         TextPanelConfig {
             component: self.label.to_string(),
         }
+    }
+}
+
+/// Persisted shape of a [`TrafficLightPanel`].
+#[derive(facet::Facet, Clone, Default)]
+pub struct TrafficLightPanelConfig {
+    pub component: String,
+    pub color: Option<Hsla>,
+}
+
+/// Pane item rendering one component as a coloured on/off square.
+pub struct TrafficLightPanel {
+    inner: Entity<TrafficLight>,
+    label: SharedString,
+}
+
+impl TrafficLightPanel {
+    pub fn new(
+        db: Arc<DB>,
+        component_id: ComponentId,
+        label: impl Into<SharedString>,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        let inner = cx.new(|cx| TrafficLight::new(db, component_id, cx));
+        Self {
+            inner,
+            label: label.into(),
+        }
+    }
+
+    pub fn from_config(cfg: TrafficLightPanelConfig, db: Arc<DB>, cx: &mut Context<Self>) -> Self {
+        let component_id = ComponentId::new(&cfg.component);
+        let inner = cx.new(|cx| TrafficLight::new(db, component_id, cx));
+        if let Some(color) = cfg.color {
+            inner.update(cx, |t, cx| t.set_color(color, cx));
+        }
+        Self {
+            inner,
+            label: cfg.component.into(),
+        }
+    }
+}
+
+impl Render for TrafficLightPanel {
+    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+        div().size_full().child(self.inner.clone())
+    }
+}
+
+impl PaneItem for TrafficLightPanel {
+    type Config = TrafficLightPanelConfig;
+
+    fn tab_title(&self, _cx: &App) -> SharedString {
+        self.label.clone()
+    }
+
+    fn serialization_key() -> &'static str {
+        "traffic_light"
+    }
+
+    fn to_config(&self, cx: &App) -> TrafficLightPanelConfig {
+        TrafficLightPanelConfig {
+            component: self.label.to_string(),
+            color: Some(self.inner.read(cx).color()),
+        }
+    }
+
+    fn inspectable_entity(&self) -> Option<gpui::AnyEntity> {
+        Some(self.inner.clone().into_any())
+    }
+}
+
+/// Persisted shape of a [`TrafficLightGridPanel`].
+#[derive(facet::Facet, Clone, Default)]
+pub struct TrafficLightGridPanelConfig {
+    pub pattern: String,
+    pub color: Option<Hsla>,
+}
+
+/// Pane item rendering every component matching a glob pattern as a grid of
+/// traffic-light tiles.
+pub struct TrafficLightGridPanel {
+    inner: Entity<TrafficLightGrid>,
+    label: SharedString,
+}
+
+impl TrafficLightGridPanel {
+    pub fn new(db: Arc<DB>, pattern: SharedString, cx: &mut Context<Self>) -> Self {
+        let inner = cx.new(|cx| TrafficLightGrid::new(db, pattern, cx));
+        Self {
+            inner,
+            label: "Traffic Lights".into(),
+        }
+    }
+
+    pub fn from_config(
+        cfg: TrafficLightGridPanelConfig,
+        db: Arc<DB>,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        let pattern = SharedString::from(cfg.pattern);
+        let inner = cx.new(|cx| TrafficLightGrid::new(db, pattern, cx));
+        if let Some(color) = cfg.color {
+            inner.update(cx, |g, cx| g.set_color(color, cx));
+        }
+        Self {
+            inner,
+            label: "Traffic Lights".into(),
+        }
+    }
+}
+
+impl Render for TrafficLightGridPanel {
+    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+        div().size_full().child(self.inner.clone())
+    }
+}
+
+impl PaneItem for TrafficLightGridPanel {
+    type Config = TrafficLightGridPanelConfig;
+
+    fn tab_title(&self, _cx: &App) -> SharedString {
+        self.label.clone()
+    }
+
+    fn serialization_key() -> &'static str {
+        "traffic_light_grid"
+    }
+
+    fn to_config(&self, cx: &App) -> TrafficLightGridPanelConfig {
+        let inner = self.inner.read(cx);
+        TrafficLightGridPanelConfig {
+            pattern: inner.pattern().to_string(),
+            color: Some(inner.color()),
+        }
+    }
+
+    fn inspectable_entity(&self) -> Option<gpui::AnyEntity> {
+        Some(self.inner.clone().into_any())
     }
 }
 
@@ -624,6 +763,38 @@ pub fn new_panel_rows(
         },
     )));
 
+    rows.push(Box::new(NavRow::new(
+        "Traffic Light",
+        SharedString::new_static(""),
+        {
+            let db = db.clone();
+            let pane = pane.clone();
+            Box::new(move |_cx| {
+                let db_outer = db.clone();
+                let pane = pane.clone();
+                component_picker_rows(db.clone(), move |component_id, name, cx| {
+                    let db = db_outer.clone();
+                    pane.update(cx, |pane, cx| {
+                        let item: Box<dyn PaneItemHandle> = Box::new(
+                            cx.new(|cx| TrafficLightPanel::new(db, component_id, name, cx)),
+                        );
+                        pane.add_item(item, cx);
+                    });
+                })
+            })
+        },
+    )));
+
+    rows.push(Box::new(NavRow::new(
+        "Traffic Light Grid",
+        SharedString::new_static(""),
+        {
+            let db = db.clone();
+            let pane = pane.clone();
+            Box::new(move |_cx| traffic_light_grid_pattern_rows(db.clone(), pane.clone()))
+        },
+    )));
+
     rows.push(Box::new(CommandRow::new("Component Table", {
         let db = db.clone();
         let pane = pane.clone();
@@ -688,6 +859,25 @@ pub fn new_panel_rows(
     })));
 
     rows
+}
+
+/// Single-question wizard for "New Panel → Traffic Light Grid": prompts
+/// for a glob pattern, then constructs a [`TrafficLightGridPanel`] seeded
+/// with that pattern.
+fn traffic_light_grid_pattern_rows(
+    db: Arc<DB>,
+    pane: Entity<Pane>,
+) -> Vec<Box<dyn InspectorRow>> {
+    vec![crate::views::traffic_light_grid::glob_prompt_row(Arc::new(
+        move |pattern, _window, cx| {
+            let db = db.clone();
+            pane.update(cx, |pane, cx| {
+                let item: Box<dyn PaneItemHandle> =
+                    Box::new(cx.new(|cx| TrafficLightGridPanel::new(db, pattern, cx)));
+                pane.add_item(item, cx);
+            });
+        },
+    ))]
 }
 
 /// Rows listing every known component; selecting one invokes `on_select`.

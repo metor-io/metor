@@ -77,6 +77,12 @@ impl WidgetKind {
     pub fn viewer3d() -> Self {
         Self(SharedString::new_static("viewer3d"))
     }
+    pub fn traffic_light() -> Self {
+        Self(SharedString::new_static("traffic_light"))
+    }
+    pub fn traffic_light_grid() -> Self {
+        Self(SharedString::new_static("traffic_light_grid"))
+    }
 
     fn default_size(&self, cx: &App) -> (f32, f32) {
         widgets::widget_spec(self, cx).default_size
@@ -495,6 +501,25 @@ fn add_widget_rows(dashboard: Entity<DashboardPanel>, db: Arc<DB>) -> Vec<Box<dy
         },
     )));
     rows.push(Box::new(NavRow::new(
+        "Traffic Light",
+        SharedString::new_static(""),
+        {
+            let dashboard = dashboard.clone();
+            let db = db.clone();
+            Box::new(move |_cx| {
+                component_picker_rows(dashboard.clone(), db.clone(), WidgetKind::traffic_light())
+            })
+        },
+    )));
+    rows.push(Box::new(NavRow::new(
+        "Traffic Light Grid",
+        SharedString::new_static(""),
+        {
+            let dashboard = dashboard.clone();
+            Box::new(move |_cx| traffic_light_grid_pattern_rows(dashboard.clone()))
+        },
+    )));
+    rows.push(Box::new(NavRow::new(
         "Image",
         SharedString::new_static(""),
         {
@@ -535,6 +560,12 @@ fn component_picker_rows(
                     let config = if kind == WidgetKind::monitor() {
                         let cfg = widgets::MonitorWidgetConfig { component };
                         facet_json::to_string(&cfg)
+                    } else if kind == WidgetKind::traffic_light() {
+                        let cfg = widgets::TrafficLightWidgetConfig {
+                            component,
+                            color: None,
+                        };
+                        facet_json::to_string(&cfg)
                     } else {
                         let cfg = widgets::TextWidgetConfig { component };
                         facet_json::to_string(&cfg)
@@ -548,6 +579,27 @@ fn component_picker_rows(
             )) as Box<dyn InspectorRow>
         })
         .collect()
+}
+
+/// Single-question wizard for "+ widget → Traffic Light Grid": prompts for
+/// a glob pattern, then adds a `traffic_light_grid` widget with that
+/// pattern. Mirrors [`image_path_rows`].
+fn traffic_light_grid_pattern_rows(
+    dashboard: Entity<DashboardPanel>,
+) -> Vec<Box<dyn InspectorRow>> {
+    vec![crate::views::traffic_light_grid::glob_prompt_row(Arc::new(
+        move |input, _window, cx| {
+            let cfg = widgets::TrafficLightGridWidgetConfig {
+                pattern: input.to_string(),
+                color: None,
+            };
+            let config = facet_json::to_string(&cfg)
+                .expect("traffic light grid widget config serializes");
+            dashboard.update(cx, |this, cx| {
+                this.add_widget(WidgetKind::traffic_light_grid(), config, cx);
+            });
+        },
+    ))]
 }
 
 fn image_path_rows(dashboard: Entity<DashboardPanel>) -> Vec<Box<dyn InspectorRow>> {

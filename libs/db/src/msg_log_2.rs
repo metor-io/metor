@@ -340,10 +340,10 @@ impl MsgLog {
             let end = timestamps.last()?;
 
             if timestamp.0 > end.0 {
-                if let Some(prev) = &prev_node {
-                    if prev.timestamp.0.abs_diff(timestamp.0) < start.0.abs_diff(timestamp.0) {
-                        return prev_node;
-                    }
+                if let Some(prev) = &prev_node
+                    && prev.timestamp.0.abs_diff(timestamp.0) < start.0.abs_diff(timestamp.0)
+                {
+                    return prev_node;
                 }
                 return Some(MsgRef {
                     timestamp: *start,

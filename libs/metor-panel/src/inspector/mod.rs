@@ -14,6 +14,7 @@ use gpui::{
     canvas, deferred, div, prelude::*, px, uniform_list,
 };
 
+pub mod drag_paint;
 pub mod edits;
 pub mod palette;
 pub mod reflect;
@@ -23,6 +24,7 @@ pub mod trace_picker;
 
 use crate::theme::theme;
 use rows::{InspectorRow, RowAction, TextField};
+use rows::text_field::TextAlign;
 
 const ROW_HEIGHT: f32 = 28.0;
 
@@ -249,6 +251,7 @@ impl Inspector {
                 edit_field.text = current_text;
                 edit_field.cursor = edit_field.text.len();
                 edit_field.mark = edit_field.cursor;
+                edit_field.set_align(TextAlign::Right);
                 self.editing = Some(EditState {
                     row_index: row_idx,
                     field: edit_field,
@@ -452,8 +455,8 @@ impl Inspector {
                                     )
                                     .child(
                                         div()
-                                            .min_w(px(60.0))
-                                            .max_w(px(120.0))
+                                            .flex_1()
+                                            .min_w_0()
                                             .child(edit.field.element()),
                                     )
                                     .into_any_element()

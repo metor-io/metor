@@ -7,8 +7,8 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use gpui::{
-    AnyView, App, Context, Corners, Entity, IntoElement, Render, RenderImage, SharedString, Window,
-    canvas, div, prelude::*, px,
+    AnyView, App, Context, Corners, Entity, Hsla, IntoElement, Render, RenderImage, SharedString,
+    Window, canvas, div, prelude::*, px,
 };
 use image::{Frame, ImageBuffer, Rgba};
 use metor_db::DB;
@@ -18,7 +18,9 @@ use crate::theme::theme;
 use crate::tiles::panels::{PlotPanelConfig, TraceConfig};
 use crate::views::time_series::{LinePlot, Trace};
 use crate::views::viewer_3d::Viewer3d;
-use crate::views::{ComponentText, Monitor, TimeSeriesPlot, new_component_table};
+use crate::views::{
+    ComponentText, Monitor, TimeSeriesPlot, TrafficLight, TrafficLightGrid, new_component_table,
+};
 
 use super::{DashboardWidget, WidgetKind};
 
@@ -117,6 +119,36 @@ impl WidgetRegistry {
                 build: Arc::new(build_viewer3d),
             },
         );
+        self.register(
+            WidgetKind::traffic_light(),
+            WidgetSpec {
+                default_size: (120.0, 120.0),
+                label: Arc::new(|w| {
+                    let cfg = parse_or_default::<TrafficLightWidgetConfig>(&w.config);
+                    SharedString::from(format!(
+                        "Traffic Light: {}",
+                        display_or_unknown(&cfg.component)
+                    ))
+                }),
+                build: Arc::new(build_traffic_light),
+            },
+        );
+        self.register(
+            WidgetKind::traffic_light_grid(),
+            WidgetSpec {
+                default_size: (360.0, 200.0),
+                label: Arc::new(|w| {
+                    let cfg = parse_or_default::<TrafficLightGridWidgetConfig>(&w.config);
+                    let label = if cfg.pattern.is_empty() {
+                        "?".to_string()
+                    } else {
+                        cfg.pattern
+                    };
+                    SharedString::from(format!("Traffic Lights: {}", label))
+                }),
+                build: Arc::new(build_traffic_light_grid),
+            },
+        );
     }
 }
 
@@ -136,6 +168,20 @@ pub struct ImageWidgetConfig {
 #[derive(facet::Facet, Default)]
 pub struct MonitorWidgetConfig {
     pub component: String,
+}
+
+/// Persisted shape of a traffic-light widget.
+#[derive(facet::Facet, Clone, Default)]
+pub struct TrafficLightWidgetConfig {
+    pub component: String,
+    pub color: Option<Hsla>,
+}
+
+/// Persisted shape of a traffic-light grid widget.
+#[derive(facet::Facet, Clone, Default)]
+pub struct TrafficLightGridWidgetConfig {
+    pub pattern: String,
+    pub color: Option<Hsla>,
 }
 
 /// Parse a widget's facet-json blob into its expected config type, falling
@@ -191,23 +237,41 @@ pub fn serialize_widget_state(
     entity: &gpui::AnyEntity,
     cx: &App,
 ) -> Option<String> {
-    if *kind != WidgetKind::plot() {
-        return None;
+    if *kind == WidgetKind::plot() {
+        let plot = entity.clone().downcast::<LinePlot>().ok()?;
+        let lp = plot.read(cx);
+        let cfg = PlotPanelConfig {
+            label: String::new(),
+            traces: lp
+                .traces()
+                .iter()
+                .map(|e| TraceConfig::from(e.read(cx)))
+                .collect(),
+            custom_title: lp.custom_title.as_ref().map(|s| s.to_string()),
+            y_min_override: lp.y_min_override.clone(),
+            y_max_override: lp.y_max_override.clone(),
+        };
+        return facet_json::to_string(&cfg).ok();
     }
-    let plot = entity.clone().downcast::<LinePlot>().ok()?;
-    let lp = plot.read(cx);
-    let cfg = PlotPanelConfig {
-        label: String::new(),
-        traces: lp
-            .traces()
-            .iter()
-            .map(|e| TraceConfig::from(e.read(cx)))
-            .collect(),
-        custom_title: lp.custom_title.as_ref().map(|s| s.to_string()),
-        y_min_override: lp.y_min_override.clone(),
-        y_max_override: lp.y_max_override.clone(),
-    };
-    facet_json::to_string(&cfg).ok()
+    if *kind == WidgetKind::traffic_light() {
+        let tl = entity.clone().downcast::<TrafficLight>().ok()?;
+        let v = tl.read(cx);
+        let cfg = TrafficLightWidgetConfig {
+            component: v.name().to_string(),
+            color: Some(v.color()),
+        };
+        return facet_json::to_string(&cfg).ok();
+    }
+    if *kind == WidgetKind::traffic_light_grid() {
+        let g = entity.clone().downcast::<TrafficLightGrid>().ok()?;
+        let v = g.read(cx);
+        let cfg = TrafficLightGridWidgetConfig {
+            pattern: v.pattern().to_string(),
+            color: Some(v.color()),
+        };
+        return facet_json::to_string(&cfg).ok();
+    }
+    None
 }
 
 /// Build the rendered view and its inspectable entity for a stored widget.
@@ -275,6 +339,35 @@ fn build_monitor(config: &str, db: &Arc<DB>, cx: &mut App) -> (AnyView, gpui::An
 
 fn build_viewer3d(_config: &str, db: &Arc<DB>, cx: &mut App) -> (AnyView, gpui::AnyEntity) {
     as_view_and_entity(cx.new(|cx| Viewer3d::with_db(db.clone(), cx)))
+}
+
+fn build_traffic_light(config: &str, db: &Arc<DB>, cx: &mut App) -> (AnyView, gpui::AnyEntity) {
+    let cfg = parse_or_default::<TrafficLightWidgetConfig>(config);
+    if cfg.component.is_empty() {
+        return as_view_and_entity(cx.new(|_cx| PlaceholderWidget {
+            label: SharedString::new_static("?"),
+        }));
+    }
+    let id = metor_proto::types::ComponentId::new(&cfg.component);
+    let entity = cx.new(|cx| TrafficLight::new(db.clone(), id, cx));
+    if let Some(color) = cfg.color {
+        entity.update(cx, |t, cx| t.set_color(color, cx));
+    }
+    as_view_and_entity(entity)
+}
+
+fn build_traffic_light_grid(
+    config: &str,
+    db: &Arc<DB>,
+    cx: &mut App,
+) -> (AnyView, gpui::AnyEntity) {
+    let cfg = parse_or_default::<TrafficLightGridWidgetConfig>(config);
+    let pattern = SharedString::from(cfg.pattern);
+    let entity = cx.new(|cx| TrafficLightGrid::new(db.clone(), pattern, cx));
+    if let Some(color) = cfg.color {
+        entity.update(cx, |g, cx| g.set_color(color, cx));
+    }
+    as_view_and_entity(entity)
 }
 
 /// Widget that decodes an image from disk and paints it into its bounds.

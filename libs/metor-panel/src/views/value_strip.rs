@@ -309,21 +309,41 @@ impl ComponentValueStrip {
 }
 
 impl ComponentValueStrip {
-    fn toggle_bool_cell(&mut self, idx: usize, _window: &mut Window, cx: &mut Context<Self>) {
+    fn displayed_bool(&self, idx: usize, cx: &App) -> Option<bool> {
+        let value = match crate::inspector::edits::pending_edits(cx).get(self.component_id) {
+            Some(edit) => edit.value.as_view().iter().nth(idx)?,
+            None => self.raw_values.get(idx).copied()?,
+        };
+        match value {
+            ElementValue::Bool(b) => Some(b),
+            _ => None,
+        }
+    }
+
+    fn toggle_bool_cell(&mut self, idx: usize, cx: &mut Context<Self>) -> Option<bool> {
+        let current = self.displayed_bool(idx, cx)?;
+        let next = !current;
+        self.set_bool_cell(idx, next, cx);
+        Some(next)
+    }
+
+    fn set_bool_cell(&mut self, idx: usize, value: bool, cx: &mut Context<Self>) {
         if self.behavior.locked {
             return;
         }
-        let Some(ElementValue::Bool(current)) = self.raw_values.get(idx).copied() else {
+        let Some(current) = self.displayed_bool(idx, cx) else {
             return;
         };
-        let new_value = ElementValue::Bool(!current);
+        if current == value {
+            return;
+        }
         crate::inspector::edits::upsert_element_value(
             &self.db,
             self.component_id,
             self.component_name.clone(),
             self.element_names.clone(),
             idx,
-            new_value,
+            ElementValue::Bool(value),
             cx,
         );
         cx.notify();
@@ -588,12 +608,27 @@ impl Render for ComponentValueStrip {
             let atom = if behavior.locked || is_editing {
                 atom
             } else if is_bool {
-                atom.cursor_pointer().on_mouse_down(
-                    MouseButton::Left,
-                    cx.listener(move |this, _, window, cx| {
-                        this.toggle_bool_cell(idx, window, cx);
-                    }),
-                )
+                atom.cursor_pointer()
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |this, _, _window, cx| {
+                            if let Some(next) = this.toggle_bool_cell(idx, cx) {
+                                crate::inspector::drag_paint::start(next, cx);
+                            }
+                        }),
+                    )
+                    .on_mouse_move(cx.listener(
+                        move |this, event: &gpui::MouseMoveEvent, _window, cx| {
+                            if !event.dragging() {
+                                crate::inspector::drag_paint::clear(cx);
+                                return;
+                            }
+                            let Some(target) = crate::inspector::drag_paint::current(cx) else {
+                                return;
+                            };
+                            this.set_bool_cell(idx, target, cx);
+                        },
+                    ))
             } else if can_edit_inline {
                 atom.cursor_pointer().on_mouse_down(
                     MouseButton::Left,
@@ -629,8 +664,8 @@ impl Render for ComponentValueStrip {
                 let apply = behavior.on_apply_element.clone().unwrap();
                 let chevron_id =
                     (component_id.0.wrapping_mul(31) ^ idx as u64).wrapping_add(0x1001) as usize;
-                let mut green = theme.line_colors[2];
-                green.a = 0.15;
+                let mut bg = theme.control_active;
+                bg.a = 0.15;
                 div()
                     .flex()
                     .flex_row()
@@ -644,12 +679,12 @@ impl Render for ComponentValueStrip {
                             .flex()
                             .items_center()
                             .justify_center()
-                            .bg(green)
+                            .bg(bg)
                             .rounded_r(px(3.0))
                             .text_size(px(12.0))
-                            .text_color(theme.line_colors[2])
+                            .text_color(theme.control_active)
                             .cursor_pointer()
-                            .child(Icon::ChevronRight.svg_color(11.0, theme.line_colors[2]))
+                            .child(Icon::ChevronRight.svg_color(11.0, theme.control_active))
                             .on_mouse_down(
                                 MouseButton::Left,
                                 move |event: &gpui::MouseDownEvent, window, cx| {
@@ -773,18 +808,20 @@ fn build_cell_chrome(
         // still reads as a frame.
         let track_color = if is_pending {
             theme.drop_target
+        } else if bool_value {
+            theme.control_active_track
         } else {
             theme.bg_secondary
         };
         let knob = div()
-            .w(px(12.5))
-            .h(px(12.5))
-            .rounded(px(2.0))
+            .w(px(15.0))
+            .h(px(15.0))
+            .rounded(px(3.0))
             .bg(theme.text_primary);
         atom = atom
             .w(px(40.0))
             .h(px(25.5))
-            .py(px(6.25))
+            .py(px(4.0))
             .px(px(4.0))
             .items_center()
             .bg(track_color)
@@ -982,9 +1019,7 @@ pub(crate) fn format_cells(
     enum_variants: Option<&[String]>,
     is_string: bool,
 ) -> Vec<StripCell> {
-    if is_string
-        && let ComponentView::U8(array) = view
-    {
+    if is_string && let ComponentView::U8(array) = view {
         let buf = array.buf();
         let len = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
         if let Ok(s) = std::str::from_utf8(&buf[..len]) {
