@@ -43,12 +43,20 @@ impl TextFieldStyle {
 /// emacs-style Ctrl-A/E/F/B/D/K on macOS) and clipboard access without
 /// depending on gpui's heavier text-input widget. Clients drive repaint
 /// after each [`handle_key_down`].
+#[derive(Clone, Copy, Default, PartialEq, Eq)]
+pub enum TextAlign {
+    #[default]
+    Left,
+    Right,
+}
+
 pub struct TextField {
     pub text: String,
     pub cursor: usize,
     pub mark: usize,
     placeholder: String,
     style: TextFieldStyle,
+    align: TextAlign,
 }
 
 impl TextField {
@@ -59,11 +67,16 @@ impl TextField {
             mark: 0,
             placeholder: placeholder.into(),
             style: TextFieldStyle::from_theme(&theme(cx)),
+            align: TextAlign::Left,
         }
     }
 
     pub fn set_placeholder(&mut self, placeholder: impl Into<String>) {
         self.placeholder = placeholder.into();
+    }
+
+    pub fn set_align(&mut self, align: TextAlign) {
+        self.align = align;
     }
 
     pub fn clear(&mut self) {
@@ -319,6 +332,7 @@ impl TextField {
         let placeholder_color = self.style.placeholder_color;
         let cursor_color = self.style.cursor_color;
         let selection_color = self.style.selection_color;
+        let align = self.align;
 
         canvas(
             move |bounds, window, _cx| {
@@ -370,7 +384,18 @@ impl TextField {
                 let max_scroll = (shaped.width - visible_width).max(px(0.0));
                 let scroll_offset = scroll_offset.min(max_scroll).max(px(0.0));
 
-                let text_origin = point(bounds.origin.x - scroll_offset, base_y);
+                // When right-aligned and the text fits, anchor it to the
+                // right edge. If it overflows the field, fall back to the
+                // left-anchored cursor-follow so the cursor stays visible.
+                let align_offset = match align {
+                    TextAlign::Left => px(0.0),
+                    TextAlign::Right => (visible_width - shaped.width).max(px(0.0)),
+                };
+
+                let text_origin = point(
+                    bounds.origin.x + align_offset - scroll_offset,
+                    base_y,
+                );
 
                 window.with_content_mask(Some(gpui::ContentMask { bounds }), |window| {
                     if !is_placeholder && mark != cursor {
@@ -380,7 +405,10 @@ impl TextField {
                         let sel_x_end = shaped.x_for_index(sel_end);
 
                         let sel_bounds = gpui::Bounds::new(
-                            point(bounds.origin.x + sel_x_start - scroll_offset, base_y),
+                            point(
+                                bounds.origin.x + align_offset + sel_x_start - scroll_offset,
+                                base_y,
+                            ),
                             size(sel_x_end - sel_x_start, line_height),
                         );
                         window.paint_quad(fill(sel_bounds, selection_color));
@@ -388,8 +416,9 @@ impl TextField {
 
                     let _ = shaped.paint(text_origin, line_height, window, _cx);
 
-                    let cursor_screen_x =
-                        bounds.origin.x + cursor_x - scroll_offset - cursor_width() / 2.0;
+                    let cursor_screen_x = bounds.origin.x + align_offset + cursor_x
+                        - scroll_offset
+                        - cursor_width() / 2.0;
                     let cursor_bounds = gpui::Bounds::new(
                         point(cursor_screen_x, base_y),
                         size(cursor_width(), line_height),
