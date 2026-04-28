@@ -1184,16 +1184,16 @@ async fn handle_packet<A: AsyncWrite + 'static>(
                 for node_slice in slice.as_iter() {
                     for (timestamp, msg) in node_slice.msgs() {
                         collected.push((timestamp, msg.to_vec()));
-                        if let Some(limit) = limit {
-                            if collected.len() >= limit {
-                                break;
-                            }
-                        }
-                    }
-                    if let Some(limit) = limit {
-                        if collected.len() >= limit {
+                        if let Some(limit) = limit
+                            && collected.len() >= limit
+                        {
                             break;
                         }
+                    }
+                    if let Some(limit) = limit
+                        && collected.len() >= limit
+                    {
+                        break;
                     }
                 }
                 collected
