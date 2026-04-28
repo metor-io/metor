@@ -10,7 +10,7 @@
 use gpui::{App, Global};
 
 pub struct DragPaint {
-    pub target: bool,
+    target: bool,
 }
 
 impl Global for DragPaint {}

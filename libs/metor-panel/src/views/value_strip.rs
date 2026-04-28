@@ -310,16 +310,13 @@ impl ComponentValueStrip {
 
 impl ComponentValueStrip {
     fn displayed_bool(&self, idx: usize, cx: &App) -> Option<bool> {
-        if let Some(edit) = crate::inspector::edits::pending_edits(cx).get(self.component_id) {
-            match edit.value.as_view().iter().nth(idx)? {
-                ElementValue::Bool(b) => Some(b),
-                _ => None,
-            }
-        } else {
-            match self.raw_values.get(idx).copied()? {
-                ElementValue::Bool(b) => Some(b),
-                _ => None,
-            }
+        let value = match crate::inspector::edits::pending_edits(cx).get(self.component_id) {
+            Some(edit) => edit.value.as_view().iter().nth(idx)?,
+            None => self.raw_values.get(idx).copied()?,
+        };
+        match value {
+            ElementValue::Bool(b) => Some(b),
+            _ => None,
         }
     }
 
@@ -334,7 +331,10 @@ impl ComponentValueStrip {
         if self.behavior.locked {
             return;
         }
-        if self.displayed_bool(idx, cx) != Some(!value) {
+        let Some(current) = self.displayed_bool(idx, cx) else {
+            return;
+        };
+        if current == value {
             return;
         }
         crate::inspector::edits::upsert_element_value(
@@ -664,8 +664,8 @@ impl Render for ComponentValueStrip {
                 let apply = behavior.on_apply_element.clone().unwrap();
                 let chevron_id =
                     (component_id.0.wrapping_mul(31) ^ idx as u64).wrapping_add(0x1001) as usize;
-                let mut green = theme.line_colors[2];
-                green.a = 0.15;
+                let mut bg = theme.control_active;
+                bg.a = 0.15;
                 div()
                     .flex()
                     .flex_row()
@@ -679,12 +679,12 @@ impl Render for ComponentValueStrip {
                             .flex()
                             .items_center()
                             .justify_center()
-                            .bg(green)
+                            .bg(bg)
                             .rounded_r(px(3.0))
                             .text_size(px(12.0))
-                            .text_color(theme.line_colors[2])
+                            .text_color(theme.control_active)
                             .cursor_pointer()
-                            .child(Icon::ChevronRight.svg_color(11.0, theme.line_colors[2]))
+                            .child(Icon::ChevronRight.svg_color(11.0, theme.control_active))
                             .on_mouse_down(
                                 MouseButton::Left,
                                 move |event: &gpui::MouseDownEvent, window, cx| {
@@ -809,7 +809,7 @@ fn build_cell_chrome(
         let track_color = if is_pending {
             theme.drop_target
         } else if bool_value {
-            theme.line_colors[2].opacity(0.7)
+            theme.control_active_track
         } else {
             theme.bg_secondary
         };

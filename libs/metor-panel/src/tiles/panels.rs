@@ -6,7 +6,7 @@ use gpui::{
 use metor_db::DB;
 use metor_proto::types::ComponentId;
 
-use crate::inspector::rows::{CommandRow, DefaultActionRow, InspectorRow, NavRow};
+use crate::inspector::rows::{CommandRow, InspectorRow, NavRow};
 use crate::inspector::{InspectorMode, InspectorRequest, OpenInspectorCallback};
 use crate::views::dashboard::DashboardPanel;
 use crate::views::time_series::{LinePlot, Override, PlotStyle, Trace};
@@ -80,7 +80,7 @@ impl PaneItem for TextPanel {
 #[derive(facet::Facet, Clone, Default)]
 pub struct TrafficLightPanelConfig {
     pub component: String,
-    pub color: Hsla,
+    pub color: Option<Hsla>,
 }
 
 /// Pane item rendering one component as a coloured on/off square.
@@ -106,8 +106,8 @@ impl TrafficLightPanel {
     pub fn from_config(cfg: TrafficLightPanelConfig, db: Arc<DB>, cx: &mut Context<Self>) -> Self {
         let component_id = ComponentId::new(&cfg.component);
         let inner = cx.new(|cx| TrafficLight::new(db, component_id, cx));
-        if cfg.color.a > 0.0 {
-            inner.update(cx, |t, cx| t.set_color(cfg.color, cx));
+        if let Some(color) = cfg.color {
+            inner.update(cx, |t, cx| t.set_color(color, cx));
         }
         Self {
             inner,
@@ -136,7 +136,7 @@ impl PaneItem for TrafficLightPanel {
     fn to_config(&self, cx: &App) -> TrafficLightPanelConfig {
         TrafficLightPanelConfig {
             component: self.label.to_string(),
-            color: self.inner.read(cx).color(),
+            color: Some(self.inner.read(cx).color()),
         }
     }
 
@@ -149,7 +149,7 @@ impl PaneItem for TrafficLightPanel {
 #[derive(facet::Facet, Clone, Default)]
 pub struct TrafficLightGridPanelConfig {
     pub pattern: String,
-    pub color: Hsla,
+    pub color: Option<Hsla>,
 }
 
 /// Pane item rendering every component matching a glob pattern as a grid of
@@ -175,8 +175,8 @@ impl TrafficLightGridPanel {
     ) -> Self {
         let pattern = SharedString::from(cfg.pattern);
         let inner = cx.new(|cx| TrafficLightGrid::new(db, pattern, cx));
-        if cfg.color.a > 0.0 {
-            inner.update(cx, |g, cx| g.set_color(cfg.color, cx));
+        if let Some(color) = cfg.color {
+            inner.update(cx, |g, cx| g.set_color(color, cx));
         }
         Self {
             inner,
@@ -206,7 +206,7 @@ impl PaneItem for TrafficLightGridPanel {
         let inner = self.inner.read(cx);
         TrafficLightGridPanelConfig {
             pattern: inner.pattern().to_string(),
-            color: inner.color(),
+            color: Some(inner.color()),
         }
     }
 
@@ -864,29 +864,20 @@ pub fn new_panel_rows(
 /// Single-question wizard for "New Panel → Traffic Light Grid": prompts
 /// for a glob pattern, then constructs a [`TrafficLightGridPanel`] seeded
 /// with that pattern.
-///
-/// Mirrors [`crate::views::dashboard::image_path_rows`]: empty input
-/// dismisses without creating anything, otherwise the panel is added to
-/// `pane` immediately.
 fn traffic_light_grid_pattern_rows(
     db: Arc<DB>,
     pane: Entity<Pane>,
 ) -> Vec<Box<dyn InspectorRow>> {
-    vec![Box::new(DefaultActionRow {
-        label: "Glob pattern (e.g. *.health)…".into(),
-        callback: Arc::new(move |input, _window, cx| {
-            if input.is_empty() {
-                return;
-            }
-            let pattern = SharedString::from(input);
+    vec![crate::views::traffic_light_grid::glob_prompt_row(Arc::new(
+        move |pattern, _window, cx| {
             let db = db.clone();
             pane.update(cx, |pane, cx| {
                 let item: Box<dyn PaneItemHandle> =
                     Box::new(cx.new(|cx| TrafficLightGridPanel::new(db, pattern, cx)));
                 pane.add_item(item, cx);
             });
-        }),
-    })]
+        },
+    ))]
 }
 
 /// Rows listing every known component; selecting one invokes `on_select`.

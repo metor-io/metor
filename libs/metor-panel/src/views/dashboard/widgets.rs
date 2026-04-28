@@ -174,14 +174,14 @@ pub struct MonitorWidgetConfig {
 #[derive(facet::Facet, Clone, Default)]
 pub struct TrafficLightWidgetConfig {
     pub component: String,
-    pub color: Hsla,
+    pub color: Option<Hsla>,
 }
 
 /// Persisted shape of a traffic-light grid widget.
 #[derive(facet::Facet, Clone, Default)]
 pub struct TrafficLightGridWidgetConfig {
     pub pattern: String,
-    pub color: Hsla,
+    pub color: Option<Hsla>,
 }
 
 /// Parse a widget's facet-json blob into its expected config type, falling
@@ -258,7 +258,7 @@ pub fn serialize_widget_state(
         let v = tl.read(cx);
         let cfg = TrafficLightWidgetConfig {
             component: v.name().to_string(),
-            color: v.color(),
+            color: Some(v.color()),
         };
         return facet_json::to_string(&cfg).ok();
     }
@@ -267,7 +267,7 @@ pub fn serialize_widget_state(
         let v = g.read(cx);
         let cfg = TrafficLightGridWidgetConfig {
             pattern: v.pattern().to_string(),
-            color: v.color(),
+            color: Some(v.color()),
         };
         return facet_json::to_string(&cfg).ok();
     }
@@ -350,8 +350,8 @@ fn build_traffic_light(config: &str, db: &Arc<DB>, cx: &mut App) -> (AnyView, gp
     }
     let id = metor_proto::types::ComponentId::new(&cfg.component);
     let entity = cx.new(|cx| TrafficLight::new(db.clone(), id, cx));
-    if cfg.color.a > 0.0 {
-        entity.update(cx, |t, cx| t.set_color(cfg.color, cx));
+    if let Some(color) = cfg.color {
+        entity.update(cx, |t, cx| t.set_color(color, cx));
     }
     as_view_and_entity(entity)
 }
@@ -364,8 +364,8 @@ fn build_traffic_light_grid(
     let cfg = parse_or_default::<TrafficLightGridWidgetConfig>(config);
     let pattern = SharedString::from(cfg.pattern);
     let entity = cx.new(|cx| TrafficLightGrid::new(db.clone(), pattern, cx));
-    if cfg.color.a > 0.0 {
-        entity.update(cx, |g, cx| g.set_color(cfg.color, cx));
+    if let Some(color) = cfg.color {
+        entity.update(cx, |g, cx| g.set_color(color, cx));
     }
     as_view_and_entity(entity)
 }

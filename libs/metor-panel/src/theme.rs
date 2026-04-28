@@ -90,6 +90,13 @@ pub struct Theme {
     pub grid_color: Hsla,
     pub axis_color: Hsla,
     pub zero_line_color: Hsla,
+
+    /// "On" color for checkboxes, switches, and traffic-light tiles. Replaces
+    /// per-call-site indexing into `line_colors`.
+    pub control_active: Hsla,
+    /// Dimmed variant of `control_active` used as the track behind a checked
+    /// switch knob. Same hue, lower presence.
+    pub control_active_track: Hsla,
 }
 
 /// Global wrapper that makes the active [`Theme`] addressable from any view.
@@ -161,6 +168,9 @@ pub static DARK: Theme = Theme {
     grid_color: hex(0x2e2b28, 1.0),
     axis_color: hex(0x4d4843, 1.0),
     zero_line_color: hex(0x6b6560, 1.0),
+
+    control_active: hex(0x40b060, 1.0),
+    control_active_track: hex(0x40b060, 0.7),
 };
 
 pub static CATPPUCCIN_MOCHA: Theme = Theme {
@@ -198,6 +208,9 @@ pub static CATPPUCCIN_MOCHA: Theme = Theme {
     grid_color: hex(0x313244, 1.0),
     axis_color: hex(0x45475a, 1.0),
     zero_line_color: hex(0x585b70, 1.0),
+
+    control_active: hex(0xa6e3a1, 1.0),
+    control_active_track: hex(0xa6e3a1, 0.7),
 };
 
 pub static CATPPUCCIN_MACCHIATO: Theme = Theme {
@@ -235,6 +248,9 @@ pub static CATPPUCCIN_MACCHIATO: Theme = Theme {
     grid_color: hex(0x363a4f, 1.0),
     axis_color: hex(0x494d64, 1.0),
     zero_line_color: hex(0x5b6078, 1.0),
+
+    control_active: hex(0xa6da95, 1.0),
+    control_active_track: hex(0xa6da95, 0.7),
 };
 
 pub static CATPPUCCIN_LATTE: Theme = Theme {
@@ -272,6 +288,9 @@ pub static CATPPUCCIN_LATTE: Theme = Theme {
     grid_color: hex(0xdce0e8, 1.0),
     axis_color: hex(0xccd0da, 1.0),
     zero_line_color: hex(0xbcc0cc, 1.0),
+
+    control_active: hex(0x40a02b, 1.0),
+    control_active_track: hex(0x40a02b, 0.7),
 };
 
 pub static AYU_DARK: Theme = Theme {
@@ -309,6 +328,9 @@ pub static AYU_DARK: Theme = Theme {
     grid_color: hex(0x11151c, 1.0),
     axis_color: hex(0x1a1e28, 1.0),
     zero_line_color: hex(0x2a2e38, 1.0),
+
+    control_active: hex(0x7fd962, 1.0),
+    control_active_track: hex(0x7fd962, 0.7),
 };
 
 pub static EVERFOREST_DARK: Theme = Theme {
@@ -346,6 +368,9 @@ pub static EVERFOREST_DARK: Theme = Theme {
     grid_color: hex(0x3d484d, 1.0),
     axis_color: hex(0x475258, 1.0),
     zero_line_color: hex(0x56635f, 1.0),
+
+    control_active: hex(0xa7c080, 1.0),
+    control_active_track: hex(0xa7c080, 0.7),
 };
 
 pub static EVERFOREST_LIGHT: Theme = Theme {
@@ -383,6 +408,9 @@ pub static EVERFOREST_LIGHT: Theme = Theme {
     grid_color: hex(0xefebd4, 1.0),
     axis_color: hex(0xe6e2cc, 1.0),
     zero_line_color: hex(0xbdc3af, 1.0),
+
+    control_active: hex(0x8da101, 1.0),
+    control_active_track: hex(0x8da101, 0.7),
 };
 
 pub static ROSE_PINE: Theme = Theme {
@@ -420,6 +448,9 @@ pub static ROSE_PINE: Theme = Theme {
     grid_color: hex(0x21202e, 1.0),
     axis_color: hex(0x403d52, 1.0),
     zero_line_color: hex(0x524f67, 1.0),
+
+    control_active: hex(0x9ccfd8, 1.0),
+    control_active_track: hex(0x9ccfd8, 0.7),
 };
 
 pub static ROSE_PINE_MOON: Theme = Theme {
@@ -457,6 +488,9 @@ pub static ROSE_PINE_MOON: Theme = Theme {
     grid_color: hex(0x2a283e, 1.0),
     axis_color: hex(0x44415a, 1.0),
     zero_line_color: hex(0x56526e, 1.0),
+
+    control_active: hex(0x9ccfd8, 1.0),
+    control_active_track: hex(0x9ccfd8, 0.7),
 };
 
 pub static ROSE_PINE_DAWN: Theme = Theme {
@@ -494,6 +528,9 @@ pub static ROSE_PINE_DAWN: Theme = Theme {
     grid_color: hex(0xf4ede8, 1.0),
     axis_color: hex(0xdfdad9, 1.0),
     zero_line_color: hex(0xcecacd, 1.0),
+
+    control_active: hex(0x56949f, 1.0),
+    control_active_track: hex(0x56949f, 0.7),
 };
 
 /// Load the embedded IBM Plex Mono fonts into gpui's text system.

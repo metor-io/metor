@@ -563,7 +563,7 @@ fn component_picker_rows(
                     } else if kind == WidgetKind::traffic_light() {
                         let cfg = widgets::TrafficLightWidgetConfig {
                             component,
-                            color: gpui::Hsla::default(),
+                            color: None,
                         };
                         facet_json::to_string(&cfg)
                     } else {
@@ -587,23 +587,19 @@ fn component_picker_rows(
 fn traffic_light_grid_pattern_rows(
     dashboard: Entity<DashboardPanel>,
 ) -> Vec<Box<dyn InspectorRow>> {
-    vec![Box::new(DefaultActionRow {
-        label: "Glob pattern (e.g. *.health)…".into(),
-        callback: Arc::new(move |input, _window, cx| {
-            if input.is_empty() {
-                return;
-            }
+    vec![crate::views::traffic_light_grid::glob_prompt_row(Arc::new(
+        move |input, _window, cx| {
             let cfg = widgets::TrafficLightGridWidgetConfig {
                 pattern: input.to_string(),
-                color: gpui::Hsla::default(),
+                color: None,
             };
             let config = facet_json::to_string(&cfg)
                 .expect("traffic light grid widget config serializes");
             dashboard.update(cx, |this, cx| {
                 this.add_widget(WidgetKind::traffic_light_grid(), config, cx);
             });
-        }),
-    })]
+        },
+    ))]
 }
 
 fn image_path_rows(dashboard: Entity<DashboardPanel>) -> Vec<Box<dyn InspectorRow>> {

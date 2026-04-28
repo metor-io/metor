@@ -5,12 +5,13 @@ use gpui::{
     div, prelude::*, px,
 };
 use metor_db::DB;
-use metor_proto::types::{ComponentId, ElementValue, PrimType};
+use metor_proto::types::{ComponentId, ElementValue};
 use regex::Regex;
 
-use super::traffic_light::{TooltipText, coerce_on, traffic_light_swatch};
+use super::tooltip::TooltipText;
+use super::traffic_light::{component_meta, spawn_on_stream, traffic_light_swatch};
+use crate::inspector::rows::{DefaultActionRow, InspectorRow};
 use crate::theme::theme;
-use crate::{AsComponentView, ComponentStream, ComponentStreamBuilder};
 
 /// Cell tracked by the grid for one matched component.
 struct GridCell {
@@ -51,7 +52,7 @@ pub struct TrafficLightGrid {
 
 impl TrafficLightGrid {
     pub fn new(db: Arc<DB>, pattern: SharedString, cx: &mut Context<Self>) -> Self {
-        let color = theme(cx).line_colors[2];
+        let color = theme(cx).control_active;
         let regex = compile_pattern(&pattern);
         let watcher = spawn_watcher(db.clone(), cx);
         Self {
@@ -230,56 +231,43 @@ fn spawn_watcher(db: Arc<DB>, cx: &mut Context<TrafficLightGrid>) -> gpui::Task<
     })
 }
 
+/// Single-question wizard row for "give me a glob pattern, build a
+/// `TrafficLightGrid` from it". Empty input is a no-op so a stray Enter
+/// doesn't create an empty grid. Used by both the dashboard "+ widget" menu
+/// and the pane's "New Panel" menu.
+pub fn glob_prompt_row(
+    on_submit: Arc<dyn Fn(SharedString, &mut Window, &mut App)>,
+) -> Box<dyn InspectorRow> {
+    Box::new(DefaultActionRow {
+        label: "Glob pattern (e.g. *.health)…".into(),
+        callback: Arc::new(move |input, window, cx| {
+            if input.is_empty() {
+                return;
+            }
+            on_submit(SharedString::from(input), window, cx);
+        }),
+    })
+}
+
 fn build_cell(
     db: Arc<DB>,
     id: ComponentId,
     name: SharedString,
     cx: &mut Context<TrafficLightGrid>,
 ) -> GridCell {
-    let (is_bool, element_names) = db.with_state(|state| {
-        let comp = state.get_component(id);
-        let is_bool = comp
-            .map(|c| c.schema.prim_type == PrimType::Bool)
-            .unwrap_or(false);
-        let element_names: Vec<SharedString> = comp
-            .map(|c| {
-                crate::inspector::trace_picker::element_names(c.schema.dim.as_slice())
-                    .into_iter()
-                    .map(SharedString::from)
-                    .collect()
-            })
-            .unwrap_or_default();
-        (is_bool, element_names)
-    });
-
-    let task = cx.spawn({
-        let db = db.clone();
-        async move |this, cx| {
-            let mut stream = id.into_stream(&db).await;
-            loop {
-                let on = {
-                    let view = stream.next().await;
-                    let cv = view.as_component_view();
-                    coerce_on(cv.iter())
-                };
-                let result = this.update(cx, |grid, cx| {
-                    if let Some(cell) = grid.cells.iter_mut().find(|c| c.id == id) {
-                        cell.latest_on = Some(on);
-                        cx.notify();
-                    }
-                });
-                if result.is_err() {
-                    break;
-                }
-            }
+    let meta = component_meta(&db, id);
+    let task = spawn_on_stream(db, id, cx, move |grid, on, cx| {
+        if let Some(cell) = grid.cells.iter_mut().find(|c| c.id == id) {
+            cell.latest_on = Some(on);
+            cx.notify();
         }
     });
 
     GridCell {
         id,
         name,
-        is_bool,
-        element_names,
+        is_bool: meta.is_bool,
+        element_names: meta.element_names,
         latest_on: None,
         _task: task,
     }

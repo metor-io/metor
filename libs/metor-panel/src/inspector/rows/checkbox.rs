@@ -7,7 +7,7 @@ use crate::theme::Theme;
 /// Purely presentational; the caller owns click routing and state.
 pub fn checkbox(checked: bool, theme: &Theme) -> impl IntoElement {
     let track_color = if checked {
-        theme.line_colors[2].opacity(0.7)
+        theme.control_active_track
     } else {
         theme.text_tertiary
     };
@@ -43,8 +43,8 @@ pub fn check_square(checked: bool, theme: &Theme) -> impl IntoElement {
         .justify_center();
     square = if checked {
         square
-            .bg(theme.line_colors[2])
-            .border_color(theme.line_colors[2])
+            .bg(theme.control_active)
+            .border_color(theme.control_active)
             .text_size(px(10.0))
             .text_color(theme.bg_primary)
             .child(SharedString::new_static("✓"))
