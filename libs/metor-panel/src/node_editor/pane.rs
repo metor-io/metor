@@ -19,6 +19,7 @@ use crate::node_editor::graph::{
     BuildState, EdgeEntry, FlowId, NodeEntry, NodeGraph, Position,
 };
 use crate::node_editor::registry::{Arity, OpDescriptor, SocketKind, descriptor_for};
+use crate::node_editor::spec::NodeSpec;
 use crate::node_editor::validate::{EdgeColor, EdgeVerdict, edge_color, validate_connection};
 use crate::theme::theme;
 use crate::tiles::PaneItem;
@@ -82,8 +83,13 @@ pub struct NodeEditor {
     edge_draft: Option<EdgeDraft>,
     pan_drag: Option<PanDrag>,
     canvas_origin: Option<Point<Pixels>>,
+    canvas_size: Option<gpui::Size<Pixels>>,
     rebuild_task: Option<Task<()>>,
     next_node_seq: u64,
+    /// Embedded inspector showing rows for the currently-selected node.
+    /// `None` when nothing is selected; refreshed on selection change and
+    /// after each graph rebuild.
+    inspector: Option<Entity<crate::inspector::Inspector>>,
 }
 
 impl NodeEditor {
@@ -102,8 +108,10 @@ impl NodeEditor {
             edge_draft: None,
             pan_drag: None,
             canvas_origin: None,
+            canvas_size: None,
             rebuild_task: None,
             next_node_seq: 0,
+            inspector: None,
         }
     }
 
@@ -129,8 +137,10 @@ impl NodeEditor {
             edge_draft: None,
             pan_drag: None,
             canvas_origin: None,
+            canvas_size: None,
             rebuild_task: None,
             next_node_seq,
+            inspector: None,
         };
         this.schedule_rebuild(cx);
         this
@@ -162,16 +172,87 @@ impl NodeEditor {
         self.schedule_rebuild(cx);
     }
 
+    /// Refresh the embedded inspector to reflect the current selection.
+    /// Creates the inspector entity if needed; clears it when there is no
+    /// selection. Also called after every graph rebuild so status pills
+    /// (built / pending / error) stay current.
+    fn update_inspector(&mut self, cx: &mut Context<Self>) {
+        let Some(flow_id) = self.selection.clone() else {
+            self.inspector = None;
+            return;
+        };
+        let editor = cx.entity().clone();
+        let graph = self.graph.clone();
+        let proxy = cx.new(|_| crate::node_editor::inspector_rows::SelectedNodeProxy {
+            editor,
+            graph,
+            flow_id,
+        });
+        let db = self.db.clone();
+        let rows = crate::inspector::reflect::rows_for_any_entity(&proxy.into_any(), &db, cx)
+            .unwrap_or_default();
+        if let Some(inspector) = &self.inspector {
+            inspector.update(cx, |insp, cx| insp.set_rows(rows, cx));
+        } else {
+            self.inspector = Some(cx.new(|cx| {
+                crate::inspector::Inspector::new(
+                    rows,
+                    crate::inspector::InspectorMode::Embedded,
+                    cx,
+                )
+            }));
+        }
+    }
+
     pub fn add_node(&mut self, descriptor: &OpDescriptor, cx: &mut Context<Self>) {
         let spec = (descriptor.default_spec)();
+        self.add_node_with_spec(descriptor.label, spec, cx);
+    }
+
+    /// Spawn a node with a fully-specified `spec`. Used by the palette
+    /// wizards that gather extra input (component name for `Persist`,
+    /// component id for `FromDb`) before insertion.
+    pub fn add_node_with_spec(
+        &mut self,
+        kind_label: &str,
+        spec: NodeSpec,
+        cx: &mut Context<Self>,
+    ) {
         let (x, y) = self.next_node_position();
-        let id = self.next_flow_id(descriptor.label);
+        let id = self.next_flow_id(kind_label);
         self.graph.update(cx, |g, _| {
             g.insert_node(id.clone(), spec, Position { x, y });
         });
         self.selection = Some(id);
         self.schedule_rebuild(cx);
         cx.notify();
+    }
+
+    /// Currently-selected node, if any.
+    pub fn selected_node(&self) -> Option<&FlowId> {
+        self.selection.as_ref()
+    }
+
+    /// Currently-selected edge, if any.
+    pub fn selected_edge_ref(&self) -> Option<&EdgeEntry> {
+        self.selected_edge.as_ref()
+    }
+
+    /// Trigger the same delete logic the keymap fires. Removes the
+    /// currently-selected edge if any, otherwise the selected node.
+    pub fn delete_selection(&mut self, cx: &mut Context<Self>) {
+        if let Some(edge) = self.selected_edge.take() {
+            self.graph.update(cx, |g, _| g.remove_edge(&edge));
+            self.schedule_rebuild(cx);
+            cx.notify();
+            return;
+        }
+        if let Some(id) = self.selection.take() {
+            self.graph.update(cx, |g, _| g.remove_node(&id));
+            self.update_inspector(cx);
+            self.schedule_rebuild(cx);
+            cx.notify();
+        }
     }
 
     fn next_node_position(&self) -> (f32, f32) {
@@ -193,22 +274,48 @@ impl NodeEditor {
             let _ = cx.update(|cx| {
                 graph.update(cx, |g, cx_inner| g.rebuild(&db, cx_inner));
             });
-            let _ = this.update(cx, |_, cx| cx.notify());
+            let _ = this.update(cx, |this, cx| {
+                // Refresh embedded inspector so status pills (built /
+                // pending / error) reflect the new build state.
+                this.update_inspector(cx);
+                cx.notify();
+            });
         }));
     }
 
+    /// World-space extent of all nodes, used to bound scrolling and size
+    /// the scrollbar thumbs. Includes a small margin so scrolled-to-edge
+    /// nodes have breathing room.
+    fn content_extent(&self, cx: &App) -> Point<f32> {
+        const MARGIN: f32 = 24.0;
+        let g = self.graph.read(cx);
+        let mut max_x = 0.0_f32;
+        let mut max_y = 0.0_f32;
+        for (id, entry) in &g.nodes {
+            let h = node_height(input_count(entry, &g.edges, id));
+            max_x = max_x.max(entry.position.x + NODE_WIDTH);
+            max_y = max_y.max(entry.position.y + h);
+        }
+        point(max_x + MARGIN, max_y + MARGIN)
+    }
+
+    fn clamp_viewport(&mut self, cx: &App) {
+        let extent = self.content_extent(cx);
+        if let Some(size) = self.canvas_size {
+            let vw = f32::from(size.width);
+            let vh = f32::from(size.height);
+            let max_x = (extent.x - vw).max(0.0);
+            let max_y = (extent.y - vh).max(0.0);
+            self.viewport.x = self.viewport.x.clamp(0.0, max_x);
+            self.viewport.y = self.viewport.y.clamp(0.0, max_y);
+        } else {
+            self.viewport.x = self.viewport.x.max(0.0);
+            self.viewport.y = self.viewport.y.max(0.0);
+        }
+    }
+
     fn on_delete(&mut self, _: &DeleteSelected, _: &mut Window, cx: &mut Context<Self>) {
-        if let Some(edge) = self.selected_edge.take() {
-            self.graph.update(cx, |g, _| g.remove_edge(&edge));
-            self.schedule_rebuild(cx);
-            cx.notify();
-            return;
-        }
-        if let Some(id) = self.selection.take() {
-            self.graph.update(cx, |g, _| g.remove_node(&id));
-            self.schedule_rebuild(cx);
-            cx.notify();
-        }
+        self.delete_selection(cx);
     }
 }
 
@@ -362,6 +469,7 @@ impl Render for NodeEditor {
                 move |bounds: Bounds<Pixels>, _window, cx| {
                     let _ = weak.update(cx, |this, _| {
                         this.canvas_origin = Some(bounds.origin);
+                        this.canvas_size = Some(bounds.size);
                     });
                     bounds
                 }
@@ -416,6 +524,7 @@ impl Render for NodeEditor {
                         this.selection = None;
                         this.selected_edge = None;
                         this.edge_draft = None;
+                        this.update_inspector(cx);
                         cx.notify();
                     }
                 })
@@ -427,6 +536,21 @@ impl Render for NodeEditor {
                         pointer_origin: ev.position,
                         viewport_origin: this.viewport.clone(),
                     });
+                }),
+            )
+            .on_mouse_down(
+                MouseButton::Right,
+                cx.listener(|this, ev: &gpui::MouseDownEvent, window, cx| {
+                    let editor = cx.entity().clone();
+                    window.dispatch_action(
+                        Box::new(crate::inspector::InspectEntity {
+                            entity: editor.into_any(),
+                            position: ev.position,
+                        }),
+                        cx,
+                    );
+                    cx.stop_propagation();
+                    let _ = this;
                 }),
             )
             .on_mouse_move(cx.listener(
@@ -489,12 +613,98 @@ impl Render for NodeEditor {
                     }
                 }),
             )
+            .on_scroll_wheel(cx.listener(
+                |this, event: &gpui::ScrollWheelEvent, _window, cx| {
+                    let delta = event.delta.pixel_delta(px(20.0));
+                    // viewport.{x,y} are positive when scrolled into content;
+                    // wheel delta is negative when scrolling down, so subtract.
+                    this.viewport.x -= f32::from(delta.x);
+                    this.viewport.y -= f32::from(delta.y);
+                    this.clamp_viewport(cx);
+                    cx.notify();
+                },
+            ))
             .child(canvas_layer);
 
         for (flow_id, graph_pos, screen_pos, descriptor, inputs, pill) in node_snapshots {
             root = root.child(self.render_node(
                 flow_id, graph_pos, screen_pos, descriptor, inputs, pill, &theme, cx,
             ));
+        }
+
+        // Embedded inspector sidebar — visible whenever a node is selected.
+        if let Some(inspector) = self.inspector.clone() {
+            root = root.child(
+                div()
+                    .absolute()
+                    .top(px(8.0))
+                    .right(px(8.0))
+                    .child(inspector),
+            );
+        }
+
+        // Scrollbars (indicator-only — wheel handler drives the viewport).
+        if let Some(size) = self.canvas_size {
+            let extent = self.content_extent(cx);
+            let vw = f32::from(size.width);
+            let vh = f32::from(size.height);
+            root = root
+                .child(crate::views::scrollbar::Scrollbar::new(
+                    gpui::Axis::Vertical,
+                    vh,
+                    extent.y,
+                    self.viewport.y,
+                ))
+                .child(crate::views::scrollbar::Scrollbar::new(
+                    gpui::Axis::Horizontal,
+                    vw,
+                    extent.x,
+                    self.viewport.x,
+                ));
+        }
+
+        // Edge-delete "×" affordance painted near the midpoint of the
+        // currently selected edge.
+        if let Some(selected) = self.selected_edge.as_ref() {
+            for (edge, src, tgt, _color) in &edge_snapshots {
+                if edge != selected {
+                    continue;
+                }
+                let mid_x = (f32::from(src.x) + f32::from(tgt.x)) / 2.0;
+                let mid_y = (f32::from(src.y) + f32::from(tgt.y)) / 2.0;
+                let size = 14.0_f32;
+                let edge_for_click = edge.clone();
+                root = root.child(
+                    div()
+                        .absolute()
+                        .left(px(mid_x - size / 2.0))
+                        .top(px(mid_y - size / 2.0))
+                        .w(px(size))
+                        .h(px(size))
+                        .rounded_full()
+                        .bg(theme.bg_elevated)
+                        .border_1()
+                        .border_color(theme.line_colors[0])
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .text_size(px(10.0))
+                        .text_color(theme.line_colors[0])
+                        .child("×")
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(move |this, _ev: &gpui::MouseDownEvent, _w, cx| {
+                                let edge = edge_for_click.clone();
+                                this.graph.update(cx, |g, _| g.remove_edge(&edge));
+                                this.selected_edge = None;
+                                this.schedule_rebuild(cx);
+                                cx.stop_propagation();
+                                cx.notify();
+                            }),
+                        ),
+                );
+                break;
+            }
         }
 
         root
@@ -528,12 +738,18 @@ impl NodeEditor {
             theme.text_secondary
         };
 
-        let mut body = div()
+        // Outer wrapper is positioned absolutely on the canvas and hosts the
+        // bordered card *and* the socket dots as siblings — so the dots paint
+        // on top of (rather than being clipped by) the card's border.
+        let body = div()
             .absolute()
             .left(px(screen_pos.x))
             .top(px(screen_pos.y))
             .w(px(NODE_WIDTH))
-            .h(px(height))
+            .h(px(height));
+
+        let card = div()
+            .size_full()
             .bg(theme.bg_elevated)
             .border_1()
             .border_color(border_color)
@@ -544,6 +760,7 @@ impl NodeEditor {
                     let id = flow_id.clone();
                     let pos = graph_pos.clone();
                     move |this, ev: &gpui::MouseDownEvent, _w, cx| {
+                        let selection_changed = this.selection.as_ref() != Some(&id);
                         this.selection = Some(id.clone());
                         this.selected_edge = None;
                         this.node_drag = Some(NodeDrag {
@@ -551,64 +768,43 @@ impl NodeEditor {
                             pointer_origin: ev.position,
                             node_origin: pos.clone(),
                         });
+                        if selection_changed {
+                            this.update_inspector(cx);
+                        }
                         cx.stop_propagation();
                         cx.notify();
                     }
                 }),
             )
-            .on_mouse_down(
-                MouseButton::Right,
-                cx.listener({
-                    let id = flow_id.clone();
-                    move |this, ev: &gpui::MouseDownEvent, window, cx| {
-                        this.selection = Some(id.clone());
-                        let editor_entity = cx.entity().clone();
-                        let graph_entity = this.graph.clone();
-                        let id_for_proxy = id.clone();
-                        let proxy = cx.new(|_| crate::node_editor::inspector_rows::SelectedNodeProxy {
-                            editor: editor_entity,
-                            graph: graph_entity,
-                            flow_id: id_for_proxy,
-                        });
-                        window.dispatch_action(
-                            Box::new(crate::inspector::InspectEntity {
-                                entity: proxy.into_any(),
-                                position: ev.position,
-                            }),
-                            cx,
-                        );
-                        cx.stop_propagation();
-                        cx.notify();
-                    }
-                }),
+            // Header bar: label + status pill.
+            .child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .justify_between()
+                    .px_2()
+                    .h(px(HEADER_HEIGHT))
+                    .border_b_1()
+                    .border_color(theme.border_primary)
+                    .child(
+                        div()
+                            .text_size(px(11.0))
+                            .text_color(theme.text_primary)
+                            .child(SharedString::from(descriptor.label)),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(10.0))
+                            .text_color(pill_color)
+                            .child(SharedString::from(pill_text)),
+                    ),
             );
 
-        // Header bar: label + status pill.
-        body = body.child(
-            div()
-                .flex()
-                .flex_row()
-                .items_center()
-                .justify_between()
-                .px_2()
-                .h(px(HEADER_HEIGHT))
-                .border_b_1()
-                .border_color(theme.border_primary)
-                .child(
-                    div()
-                        .text_size(px(11.0))
-                        .text_color(theme.text_primary)
-                        .child(SharedString::from(descriptor.label)),
-                )
-                .child(
-                    div()
-                        .text_size(px(10.0))
-                        .text_color(pill_color)
-                        .child(SharedString::from(pill_text)),
-                ),
-        );
+        let mut body = body.child(card);
 
-        // Input sockets (left edge).
+        // Input sockets (left edge) — siblings of `card` so they paint on top
+        // of the card border.
         let arity = descriptor.inputs;
         for i in 0..inputs {
             let socket_kind = arity.socket_at(i).unwrap_or(SocketKind::Any);

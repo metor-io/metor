@@ -45,10 +45,14 @@ impl DynamicNode for PersistNode {
 /// Promote `input` to a real db Component named `name`. Returns a
 /// passthrough node whose output mirrors the Component's WAL.
 ///
-/// The Component's `ComponentId` is derived from this node's id. If a
-/// component with that id already exists (e.g. from a prior session), it is
-/// reused — historical samples on disk are preserved. If the existing
-/// schema doesn't match, returns `BuildError::SchemaMismatch`.
+/// The Component's `ComponentId` is derived from `name` alone, so the
+/// component identity is stable across graph edits and sessions: editing
+/// upstream args (or restarting the app) re-resolves to the same on-disk
+/// Component, preserving its history. If a component with that id already
+/// exists with a different schema, returns `BuildError::SchemaMismatch`.
+///
+/// The persist *node*'s `NodeId` still hashes the input chain, so the graph
+/// rebuilder can dedup persist nodes correctly.
 pub fn persist(
     db: &DB,
     name: String,
@@ -62,7 +66,9 @@ pub fn persist(
     let id = hash_id(op_tag::PERSIST, &[input.id()], |h| {
         name.hash(h);
     });
-    let component_id = ComponentId(id.0);
+    // ComponentId is name-derived (not node-id-derived) so the on-disk
+    // Component survives upstream edits.
+    let component_id = ComponentId(component_id_for_name(&name));
 
     db.with_state_mut(|s| s.insert_component(component_id, schema.clone(), &db.path))
         .map_err(|err| match err {
@@ -117,4 +123,12 @@ pub fn persist(
         component_wal,
         _task: task.drop_guard(),
     }))
+}
+
+/// Hash a component name into a stable `ComponentId` raw value. Distinct
+/// from any node id hash so persist names don't collide with NodeId-derived
+/// stream component ids.
+pub fn component_id_for_name(name: &str) -> u64 {
+    let id = hash_id(b"persist.component_name", &[], |h| name.hash(h));
+    id.0
 }

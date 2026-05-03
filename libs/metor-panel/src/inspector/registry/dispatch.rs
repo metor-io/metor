@@ -87,13 +87,13 @@ impl InspectorRegistry {
                 }));
             }
             let any_entity = any_entity.clone();
-            return Some(Box::new(ScalarRow {
+            return Some(Box::new(ScalarRow::new(
                 label,
-                value: val,
-                on_change: Arc::new(move |v, _w, cx| {
+                val,
+                Arc::new(move |v, _w, cx| {
                     write_scalar(&any_entity, field_idx, scalar, v, cx);
                 }),
-            }));
+            )));
         }
 
         if shape.id == <String as Facet>::SHAPE.id {

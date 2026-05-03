@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::{cell::RefCell, rc::Rc, sync::Arc};
 
 use gpui::{AnyElement, App, SharedString, Window, div, prelude::*, px};
 
@@ -9,10 +9,28 @@ use crate::theme::theme;
 ///
 /// Shows the current value as text; activation starts inline editing.
 /// Unparsable input is silently dropped rather than raising an error.
+///
+/// The current value is cached in an `Rc<RefCell<f64>>` so that on commit
+/// the row redraws with the new value immediately, instead of waiting for
+/// the underlying entity to refresh.
 pub struct ScalarRow {
     pub label: SharedString,
-    pub value: f64,
+    pub value: Rc<RefCell<f64>>,
     pub on_change: Arc<dyn Fn(f64, &mut Window, &mut App)>,
+}
+
+impl ScalarRow {
+    pub fn new(
+        label: SharedString,
+        value: f64,
+        on_change: Arc<dyn Fn(f64, &mut Window, &mut App)>,
+    ) -> Self {
+        Self {
+            label,
+            value: Rc::new(RefCell::new(value)),
+            on_change,
+        }
+    }
 }
 
 impl InspectorRow for ScalarRow {
@@ -28,7 +46,7 @@ impl InspectorRow for ScalarRow {
         cx: &mut App,
     ) -> AnyElement {
         let theme = theme(cx);
-        let value_text = SharedString::from(format!("{}", self.value));
+        let value_text = SharedString::from(format!("{}", *self.value.borrow()));
 
         row_base(row_ix, selected, cx)
             .child(
@@ -50,10 +68,12 @@ impl InspectorRow for ScalarRow {
 
     fn activate(&mut self, _window: &mut Window, _cx: &mut App) -> RowAction {
         let on_change = self.on_change.clone();
+        let cached = self.value.clone();
         RowAction::StartEdit {
-            current_text: format!("{}", self.value),
+            current_text: format!("{}", *self.value.borrow()),
             on_commit: Box::new(move |text, window, cx| {
                 if let Ok(v) = text.parse::<f64>() {
+                    *cached.borrow_mut() = v;
                     on_change(v, window, cx);
                 }
             }),

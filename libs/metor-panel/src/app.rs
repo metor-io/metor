@@ -407,6 +407,16 @@ pub fn run(db: Arc<metor_db::DB>) {
                 KeyBinding::new("shift-ctrl-tab", CycleTabBackward, None),
                 KeyBinding::new("cmd-l", ToggleCmdLock, None),
                 KeyBinding::new("cmd-shift-e", OpenReviewEdits, None),
+                KeyBinding::new(
+                    "delete",
+                    crate::node_editor::DeleteSelected,
+                    Some("NodeEditor"),
+                ),
+                KeyBinding::new(
+                    "backspace",
+                    crate::node_editor::DeleteSelected,
+                    Some("NodeEditor"),
+                ),
             ]);
 
             let bounds = Bounds::centered(None, size(px(1024.), px(600.)), cx);

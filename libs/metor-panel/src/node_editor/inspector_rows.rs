@@ -8,6 +8,20 @@
 //! The builder dispatches per-variant: each arg becomes one existing row
 //! (`ScalarRow` / `TextRow` / `EnumRow`) wired so `on_change` updates the
 //! spec on the graph entity *and* asks the editor to debounce-rebuild.
+//!
+//! ## Why not full Facet reflection?
+//!
+//! `NodeSpec` does derive `Facet`, but the inspector's default enum
+//! dispatch (`registry/dispatch.rs::default_row_for_shape`) renders an
+//! enum as a single variant *picker*. To expose the active variant's
+//! per-field rows automatically, the walker would need a nested write
+//! path (parent `Poke` → `PokeEnum::field(i).set::<T>(v)`), which the
+//! current `set_field` helper doesn't model.
+//!
+//! Adding a new `NodeSpec` variant with `f64`/`String` args therefore
+//! requires extending the match below. The per-variant match also keeps
+//! variant-specific UX (`Persist` name field, `FromDb` component picker)
+//! out of the generic walker.
 
 use std::sync::Arc;
 
@@ -15,11 +29,13 @@ use gpui::{AnyEntity, App, Entity, SharedString};
 use metor_db::DB;
 
 use crate::inspector::registry::InspectorRegistry;
-use crate::inspector::rows::{EnumRow, InspectorRow, ScalarRow, TextRow};
+use crate::inspector::rows::{
+    ActionRow, CommandRow, DefaultActionRow, EnumRow, InspectorRow, RowAction, ScalarRow, TextRow,
+};
 use crate::node_editor::graph::{BuildState, FlowId, NodeGraph};
 use crate::node_editor::pane::NodeEditor;
-use crate::node_editor::registry::descriptor_for;
-use crate::node_editor::spec::NodeSpec;
+use crate::node_editor::registry::{ALL as ALL_OPS, descriptor_for};
+use crate::node_editor::spec::{NodeSpec, NodeSpecKind};
 
 /// Entity placed into the inspector when a node is selected. Created on
 /// right-click; reused for the lifetime of the selection.
@@ -32,9 +48,145 @@ pub struct SelectedNodeProxy {
 pub fn register_inspector_rows(cx: &mut App) {
     cx.global_mut::<InspectorRegistry>()
         .register_type_builder::<SelectedNodeProxy>(Arc::new(build_rows));
+    cx.global_mut::<InspectorRegistry>()
+        .register_type_builder::<NodeEditor>(Arc::new(build_editor_rows));
 }
 
-fn build_rows(any: AnyEntity, _db: &Arc<DB>, cx: &App) -> Vec<Box<dyn InspectorRow>> {
+/// Rows for an inspected `NodeEditor` pane. Surfaces "Add Node" (with a
+/// wizard for `Persist`/`FromDb` so the user always supplies a component
+/// name / picks an existing component) and a delete row for the current
+/// selection.
+fn build_editor_rows(any: AnyEntity, _db: &Arc<DB>, cx: &App) -> Vec<Box<dyn InspectorRow>> {
+    let Ok(editor) = any.downcast::<NodeEditor>() else {
+        return Vec::new();
+    };
+    let mut rows: Vec<Box<dyn InspectorRow>> = Vec::new();
+
+    rows.push(Box::new(
+        ActionRow::new(
+            SharedString::new_static("Add Node"),
+            {
+                let editor = editor.clone();
+                Arc::new(move |_window, cx| {
+                    RowAction::Cascade(build_add_node_rows(editor.clone(), cx))
+                })
+            },
+        )
+        .with_tag(SharedString::new_static("editor")),
+    ));
+
+    let has_selection = editor.read(cx).selected_node().is_some();
+    let has_edge = editor.read(cx).selected_edge_ref().is_some();
+    if has_selection || has_edge {
+        let editor_for_delete = editor.clone();
+        rows.push(Box::new(CommandRow::new(
+            SharedString::new_static(if has_edge { "Delete Edge" } else { "Delete Node" }),
+            Arc::new(move |_window, cx| {
+                editor_for_delete.update(cx, |ed, cx| ed.delete_selection(cx));
+            }),
+        )));
+    }
+
+    rows
+}
+
+/// Build the "Add Node" submenu rows. Most ops insert immediately; `Persist`
+/// and `FromDb` cascade into a small wizard that requires the user to
+/// supply the missing field before the node lands in the graph.
+pub fn build_add_node_rows(
+    editor: Entity<NodeEditor>,
+    cx: &App,
+) -> Vec<Box<dyn InspectorRow>> {
+    let db = editor.read(cx).db().clone();
+    let mut rows: Vec<Box<dyn InspectorRow>> = Vec::new();
+    for descriptor in ALL_OPS {
+        let label =
+            SharedString::from(format!("{} · {}", descriptor.category, descriptor.label));
+        match descriptor.kind {
+            NodeSpecKind::Persist => {
+                let editor = editor.clone();
+                rows.push(Box::new(
+                    ActionRow::new(
+                        label,
+                        Arc::new(move |_window, _cx| {
+                            RowAction::Cascade(build_persist_wizard(editor.clone()))
+                        }),
+                    ),
+                ));
+            }
+            NodeSpecKind::FromDb => {
+                let editor = editor.clone();
+                let db = db.clone();
+                rows.push(Box::new(ActionRow::new(
+                    label,
+                    Arc::new(move |_window, _cx| {
+                        RowAction::Cascade(build_from_db_wizard(editor.clone(), db.clone()))
+                    }),
+                )));
+            }
+            _ => {
+                let editor = editor.clone();
+                let descriptor = descriptor;
+                rows.push(Box::new(CommandRow::new(
+                    label,
+                    Arc::new(move |_window, cx| {
+                        editor.update(cx, |ed, cx| ed.add_node(descriptor, cx));
+                    }),
+                )));
+            }
+        }
+    }
+    rows
+}
+
+/// Single-row wizard: type a name, press Enter, get a `Persist` node.
+fn build_persist_wizard(editor: Entity<NodeEditor>) -> Vec<Box<dyn InspectorRow>> {
+    vec![Box::new(DefaultActionRow {
+        label: SharedString::new_static("Type a component name and press Enter"),
+        callback: Arc::new(move |name, _window, cx| {
+            if name.trim().is_empty() {
+                return;
+            }
+            editor.update(cx, |ed, cx| {
+                ed.add_node_with_spec("Persist", NodeSpec::Persist { name: name.clone() }, cx);
+            });
+        }),
+    })]
+}
+
+/// Single-row wizard: pick an existing component from the DB.
+fn build_from_db_wizard(
+    editor: Entity<NodeEditor>,
+    db: Arc<DB>,
+) -> Vec<Box<dyn InspectorRow>> {
+    let components = crate::inspector::trace_picker::list_components(&db);
+    if components.is_empty() {
+        return vec![Box::new(TextRow::new_readonly(
+            SharedString::new_static("No components"),
+            SharedString::new_static("create a Persist first"),
+        ))];
+    }
+    components
+        .into_iter()
+        .map(|(id, name)| {
+            let editor = editor.clone();
+            Box::new(CommandRow::new(
+                SharedString::from(name),
+                Arc::new(move |_window, cx| {
+                    editor.update(cx, |ed, cx| {
+                        ed.add_node_with_spec(
+                            "From DB",
+                            NodeSpec::FromDb { component_id: id.0 },
+                            cx,
+                        );
+                    });
+                }),
+            )) as Box<dyn InspectorRow>
+        })
+        .collect()
+}
+
+fn build_rows(any: AnyEntity, db: &Arc<DB>, cx: &App) -> Vec<Box<dyn InspectorRow>> {
     let Ok(proxy) = any.downcast::<SelectedNodeProxy>() else {
         return Vec::new();
     };
@@ -42,7 +194,11 @@ fn build_rows(any: AnyEntity, _db: &Arc<DB>, cx: &App) -> Vec<Box<dyn InspectorR
     let editor = proxy_ref.editor.clone();
     let graph = proxy_ref.graph.clone();
     let flow_id = proxy_ref.flow_id.clone();
-    let db = editor.read(cx).db().clone();
+    // Use the DB threaded through by the inspector framework rather than
+    // reading it off the editor entity — `update_inspector` invokes us
+    // from inside the editor's own update closure, so reading the editor
+    // here would panic with a re-entrant borrow.
+    let db = db.clone();
 
     let Some(spec) = graph.read(cx).nodes.get(&flow_id).map(|e| e.spec.clone()) else {
         return Vec::new();
@@ -68,10 +224,9 @@ fn build_rows(any: AnyEntity, _db: &Arc<DB>, cx: &App) -> Vec<Box<dyn InspectorR
         },
         None => "missing",
     };
-    rows.push(Box::new(TextRow::new(
+    rows.push(Box::new(TextRow::new_readonly(
         SharedString::from(format!("{} · {}", descriptor.category, descriptor.label)),
         SharedString::from(status),
-        Arc::new(|_, _, _| {}),
     )));
 
     match &spec {
@@ -101,6 +256,8 @@ fn build_rows(any: AnyEntity, _db: &Arc<DB>, cx: &App) -> Vec<Box<dyn InspectorR
             }));
         }
         NodeSpec::Square { freq, amplitude, phase } => {
+            // Square shares Sin's arg layout; the variant guard inside each
+            // closure keeps the spec write type-safe.
             rows.push(scalar_arg("Frequency", *freq, editor.clone(), graph.clone(), flow_id.clone(), |s, v| {
                 if let NodeSpec::Square { freq, .. } = s { *freq = v; }
             }));
@@ -253,10 +410,10 @@ fn scalar_arg(
     apply: impl Fn(&mut NodeSpec, f64) + 'static,
 ) -> Box<dyn InspectorRow> {
     let apply = Arc::new(apply);
-    Box::new(ScalarRow {
-        label: SharedString::from(label),
+    Box::new(ScalarRow::new(
+        SharedString::from(label),
         value,
-        on_change: Arc::new(move |new_value, _window, cx| {
+        Arc::new(move |new_value, _window, cx| {
             let id = flow_id.clone();
             graph.update(cx, |g, _| {
                 if let Some(entry) = g.nodes.get_mut(&id) {
@@ -265,5 +422,5 @@ fn scalar_arg(
             });
             editor.update(cx, |ed, cx| ed.bump_rebuild(cx));
         }),
-    })
+    ))
 }
