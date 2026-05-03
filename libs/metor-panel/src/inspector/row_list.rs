@@ -196,6 +196,10 @@ impl Render for RowList {
                         gpui::MouseButton::Left,
                         cx.listener(move |this, _, window, cx| {
                             this.activate_row(row_idx_for_click, window, cx);
+                            // Don't let the host's mouse_down (e.g. the
+                            // node card's drag-to-move) also fire — clicking
+                            // a row is for editing, not dragging.
+                            cx.stop_propagation();
                         }),
                     )
                     .child(row_element)
