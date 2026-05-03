@@ -59,6 +59,9 @@ pub struct OpDescriptor {
     pub inputs: Arity,
     pub output: SocketKind,
     pub default_spec: fn() -> NodeSpec,
+    /// Number of inline arg rows the inspector renders inside the node card.
+    /// Must match what `inspector_rows::rows_for_node` returns for this op.
+    pub arg_count: usize,
 }
 
 const F64: SocketKind = SocketKind::F64Scalar;
@@ -78,106 +81,126 @@ pub const ALL: &[OpDescriptor] = &[
         kind: NodeSpecKind::FixedRate, label: "Fixed Rate", category: "Clock",
         inputs: NO_INPUTS, output: CLK,
         default_spec: || NodeSpec::FixedRate { hz: 100.0 },
+        arg_count: 1,
     },
     OpDescriptor {
         kind: NodeSpecKind::ClockOf, label: "Clock Of", category: "Clock",
         inputs: ONE_ANY, output: CLK,
         default_spec: || NodeSpec::ClockOf,
+        arg_count: 0,
     },
     // Generators
     OpDescriptor {
         kind: NodeSpecKind::Sin, label: "Sin", category: "Generator",
         inputs: ONE_CLK, output: F64,
         default_spec: || NodeSpec::Sin { freq: 1.0, amplitude: 1.0, phase: 0.0 },
+        arg_count: 3,
     },
     OpDescriptor {
         kind: NodeSpecKind::Square, label: "Square", category: "Generator",
         inputs: ONE_CLK, output: F64,
         default_spec: || NodeSpec::Square { freq: 1.0, amplitude: 1.0, phase: 0.0 },
+        arg_count: 3,
     },
     OpDescriptor {
         kind: NodeSpecKind::Random, label: "Random", category: "Generator",
         inputs: ONE_CLK, output: F64,
         default_spec: || NodeSpec::Random { seed: 1 },
+        arg_count: 1,
     },
     OpDescriptor {
         kind: NodeSpecKind::Constant, label: "Constant", category: "Generator",
         inputs: ONE_CLK, output: F64,
         default_spec: || NodeSpec::Constant { value: 0.0 },
+        arg_count: 1,
     },
     // Derive
     OpDescriptor {
         kind: NodeSpecKind::Scale, label: "Scale", category: "Derive",
         inputs: ONE_F64, output: F64,
         default_spec: || NodeSpec::Scale { k: 1.0 },
+        arg_count: 1,
     },
     OpDescriptor {
         kind: NodeSpecKind::Offset, label: "Offset", category: "Derive",
         inputs: ONE_F64, output: F64,
         default_spec: || NodeSpec::Offset { k: 0.0 },
+        arg_count: 1,
     },
     OpDescriptor {
         kind: NodeSpecKind::Abs, label: "Abs", category: "Derive",
         inputs: ONE_F64, output: F64,
         default_spec: || NodeSpec::Abs,
+        arg_count: 0,
     },
     OpDescriptor {
         kind: NodeSpecKind::Neg, label: "Neg", category: "Derive",
         inputs: ONE_F64, output: F64,
         default_spec: || NodeSpec::Neg,
+        arg_count: 0,
     },
     OpDescriptor {
         kind: NodeSpecKind::Log, label: "Log", category: "Derive",
         inputs: ONE_F64, output: F64,
         default_spec: || NodeSpec::Log,
+        arg_count: 0,
     },
     // Compose
     OpDescriptor {
         kind: NodeSpecKind::Add, label: "Add", category: "Compose",
         inputs: TWO_F64, output: F64,
         default_spec: || NodeSpec::Add,
+        arg_count: 0,
     },
     OpDescriptor {
         kind: NodeSpecKind::Sub, label: "Sub", category: "Compose",
         inputs: TWO_F64, output: F64,
         default_spec: || NodeSpec::Sub,
+        arg_count: 0,
     },
     OpDescriptor {
         kind: NodeSpecKind::Mul, label: "Mul", category: "Compose",
         inputs: TWO_F64, output: F64,
         default_spec: || NodeSpec::Mul,
+        arg_count: 0,
     },
     OpDescriptor {
         kind: NodeSpecKind::Mean, label: "Mean", category: "Compose",
         inputs: Arity::Variadic { kind: F64, min: 1 }, output: F64,
         default_spec: || NodeSpec::Mean,
+        arg_count: 0,
     },
     // Resample
     OpDescriptor {
         kind: NodeSpecKind::Zoh, label: "Zero-Order Hold", category: "Resample",
         inputs: VALUE_AND_CLOCK, output: F64,
         default_spec: || NodeSpec::Zoh,
+        arg_count: 0,
     },
     OpDescriptor {
         kind: NodeSpecKind::Linear, label: "Linear Interp", category: "Resample",
         inputs: VALUE_AND_CLOCK, output: F64,
         default_spec: || NodeSpec::Linear,
+        arg_count: 0,
     },
     OpDescriptor {
         kind: NodeSpecKind::LatestAt, label: "Latest At", category: "Resample",
         inputs: VALUE_AND_CLOCK, output: F64,
         default_spec: || NodeSpec::LatestAt,
+        arg_count: 0,
     },
     // DB bridges
     OpDescriptor {
         kind: NodeSpecKind::FromDb, label: "From DB", category: "DB",
         inputs: NO_INPUTS, output: F64,
         default_spec: || NodeSpec::FromDb { component_id: 0 },
+        arg_count: 1,
     },
     OpDescriptor {
         kind: NodeSpecKind::Persist, label: "Persist", category: "DB",
         inputs: ONE_F64, output: F64,
         default_spec: || NodeSpec::Persist { name: String::new() },
+        arg_count: 1,
     },
 ];
 

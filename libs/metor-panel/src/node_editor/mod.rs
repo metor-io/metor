@@ -27,7 +27,7 @@ pub mod worker;
 mod tests;
 
 pub use config::{NodeEditorConfig, SerializedEdge, SerializedNode, Viewport};
-pub use coordinator::{GraphCoordinator, OwnerId};
+pub use coordinator::GraphCoordinator;
 pub use pane::{ActiveNodeEditor, DeleteSelected, NodeEditor};
 pub use graph::{BuildState, EdgeEntry, FlowId, NodeEntry, NodeGraph, Position};
 pub use registry::{Arity, OpDescriptor, SocketKind, descriptor, descriptor_for};

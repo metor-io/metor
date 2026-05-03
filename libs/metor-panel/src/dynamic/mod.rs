@@ -21,7 +21,7 @@ mod tests;
 
 pub use node::{
     BuildError, DynamicNode, DynamicNodeExt, NodeGrant, NodeId, NodeImpl, NodeReader, ValueType,
-    default_ring_bytes, hash_id, op_tag, write_sample,
+    default_ring_bytes, hash_id, op_tag, require_clock, require_f64_scalar, write_sample,
 };
 pub use registry::DynamicRegistry;
 

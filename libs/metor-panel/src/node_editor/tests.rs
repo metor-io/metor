@@ -35,14 +35,9 @@ fn unique_db_path(label: &str) -> std::path::PathBuf {
     ))
 }
 
-// -----------------------------------------------------------------------------
-// node_id_matches_constructor — one assertion per variant
-// -----------------------------------------------------------------------------
-//
 // Constructors that spawn tasks need a stellarator runtime, so those go inside
 // `#[stellarator::test]`. Variants that hash purely from args (FromDb, Persist)
 // can be checked synchronously against `hash_id`.
-
 #[stellarator::test]
 async fn fixed_rate_id_matches() {
     let built = ops::clock::fixed_rate(123.5).unwrap();
@@ -210,10 +205,6 @@ fn persist_id_matches() {
     assert_eq!(direct, computed);
 }
 
-// -----------------------------------------------------------------------------
-// Reconciliation
-// -----------------------------------------------------------------------------
-
 fn graph_with_clock_and_constant() -> NodeGraph {
     let mut graph = NodeGraph::new(/*owner_id*/ 1);
     graph.insert_node(
@@ -330,10 +321,6 @@ async fn rebuild_propagates_parent_failure_downstream() {
     let _ = std::fs::remove_dir_all(&db_path);
 }
 
-// -----------------------------------------------------------------------------
-// Validation
-// -----------------------------------------------------------------------------
-
 #[test]
 fn validate_rejects_clock_into_value_socket() {
     let mut g = NodeGraph::new(1);
@@ -408,10 +395,6 @@ fn validate_rejects_cycle() {
     assert_eq!(validate_connection(&g, &edge), EdgeVerdict::WouldCycle);
 }
 
-// -----------------------------------------------------------------------------
-// Mean canonical ordering
-// -----------------------------------------------------------------------------
-
 #[test]
 fn mean_parent_order_follows_y_then_x() {
     let mut g = NodeGraph::new(1);
@@ -438,10 +421,6 @@ fn mean_parent_order_follows_y_then_x() {
     let expected: Vec<gpui::SharedString> = vec!["b".into(), "a".into(), "c".into()];
     assert_eq!(parents, expected);
 }
-
-// -----------------------------------------------------------------------------
-// Serialization round-trip
-// -----------------------------------------------------------------------------
 
 #[test]
 fn config_round_trips_through_facet_json() {
@@ -500,10 +479,6 @@ fn config_round_trips_through_facet_json() {
         .collect();
     assert_eq!(original_ids, new_ids);
 }
-
-// -----------------------------------------------------------------------------
-// Idempotency
-// -----------------------------------------------------------------------------
 
 #[stellarator::test]
 async fn unchanged_subtree_keeps_arc_alive() {

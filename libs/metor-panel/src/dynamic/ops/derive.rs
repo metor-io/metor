@@ -12,25 +12,20 @@ use metor_proto::types::PrimType;
 
 use crate::dynamic::node::{
     BuildError, DynamicNode, DynamicNodeExt, NodeImpl, ValueType, default_ring_bytes, hash_id,
-    op_tag, write_sample,
+    op_tag, require_f64_scalar, write_sample,
 };
 
-fn ensure_f64_scalar(node: &Arc<dyn DynamicNode>) -> Result<ComponentSchema, BuildError> {
-    let schema = match node.value_type() {
-        ValueType::Clock => return Err(BuildError::ExpectedValue),
-        ValueType::Value(s) => s,
-    };
-    if schema.prim_type != PrimType::F64 {
-        return Err(BuildError::ExpectedFloat(schema.prim_type));
-    }
+/// `require_f64_scalar` plus the single-element-shape allowance derive ops
+/// accept (so a `Vec3<f64>` element pulled out as a scalar still works).
+fn require_f64_derivable(node: &Arc<dyn DynamicNode>) -> Result<ComponentSchema, BuildError> {
+    let schema = require_f64_scalar(node)?;
     if !schema.dim.is_empty() && schema.dim.iter().product::<usize>() != 1 {
-        // Allow scalar OR a single-element shape for now.
         return Err(BuildError::SchemaMismatch {
             a: schema.clone(),
             b: ComponentSchema::new(PrimType::F64, &[]),
         });
     }
-    Ok(schema.clone())
+    Ok(schema)
 }
 
 fn read_f64(value: &[u8]) -> f64 {
@@ -43,7 +38,7 @@ fn map(
     extra_args: impl FnOnce(&mut std::collections::hash_map::DefaultHasher),
     f: impl Fn(f64) -> f64 + Send + Sync + 'static,
 ) -> Result<Arc<dyn DynamicNode>, BuildError> {
-    let schema = ensure_f64_scalar(&input)?;
+    let schema = require_f64_derivable(&input)?;
     let id = hash_id(tag, &[input.id()], extra_args);
     let parent_clock = input.parent_clock_id();
     let mut reader = input.subscribe();

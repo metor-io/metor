@@ -6,7 +6,7 @@ use std::collections::{HashSet, VecDeque};
 
 use crate::dynamic::BuildError;
 use crate::node_editor::graph::{BuildState, EdgeEntry, FlowId, NodeGraph};
-use crate::node_editor::registry::{Arity, descriptor_for};
+use crate::node_editor::registry::descriptor_for;
 
 /// Result of evaluating a proposed edge.
 #[derive(Debug, PartialEq)]
@@ -38,19 +38,6 @@ pub fn validate_connection(graph: &NodeGraph, edge: &EdgeEntry) -> EdgeVerdict {
     if !source_kind.compatible_with(target_socket_kind) {
         return EdgeVerdict::BadSocket;
     }
-
-    // For exact-arity ops, the slot must be free (a connection drop replaces;
-    // but here we only validate — replacement is a graph mutation concern).
-    if let Arity::Exact(_) = target_arity {
-        let occupied = graph.edges.iter().any(|e| {
-            e.target == edge.target && e.target_socket == edge.target_socket
-        });
-        if occupied {
-            // Allow — the canvas's add_edge logic replaces the existing edge.
-            // (We could reject here instead; current preference is replace.)
-        }
-    }
-
     if creates_cycle(graph, edge) {
         return EdgeVerdict::WouldCycle;
     }
@@ -108,8 +95,9 @@ pub fn edge_color(graph: &NodeGraph, edge: &EdgeEntry) -> EdgeColor {
     };
     match (s_arc.parent_clock_id(), t_arc.parent_clock_id()) {
         (Some(a), Some(b)) if a == b => {
-            // Map the u64 clock id to a small palette index. Stable per-clock.
-            EdgeColor::SharedClock((a.0 as usize) & 0x7)
+            // Map the u64 clock id to a small palette index. Stable per-clock;
+            // the consumer mods by `theme.line_colors.len()`.
+            EdgeColor::SharedClock(a.0 as usize)
         }
         _ => EdgeColor::Neutral,
     }

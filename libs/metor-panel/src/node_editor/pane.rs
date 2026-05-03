@@ -98,6 +98,18 @@ struct NodeRowEntry {
     list: Entity<crate::inspector::row_list::RowList>,
 }
 
+/// Per-node data captured once per render, then handed to `render_node`.
+/// Avoids re-borrowing the graph entity inside the per-node loop.
+struct NodeRenderSnapshot {
+    flow_id: FlowId,
+    graph_pos: Position,
+    screen_pos: Position,
+    descriptor: &'static OpDescriptor,
+    inputs: usize,
+    args: usize,
+    pill: (&'static str, bool),
+}
+
 impl NodeEditor {
     pub fn new(db: Arc<DB>, cx: &mut Context<Self>) -> Self {
         let owner = cx.entity_id().as_u64();
@@ -124,11 +136,10 @@ impl NodeEditor {
     pub fn from_config(cfg: NodeEditorConfig, db: Arc<DB>, cx: &mut Context<Self>) -> Self {
         let viewport = cfg.viewport.clone();
         let next_node_seq = cfg.nodes.len() as u64;
-        let graph = cfg.into_graph();
         let owner = cx.entity_id().as_u64();
         // The hydrated graph carries its serialized owner_id, but every
         // process gets a fresh EntityId, so override with our actual id.
-        let mut graph = graph;
+        let mut graph = cfg.into_graph();
         graph.owner_id = owner;
         let graph = cx.new(|_| graph);
         let focus_handle = cx.focus_handle();
@@ -173,12 +184,6 @@ impl NodeEditor {
         &self.db
     }
 
-    /// Schedule a rebuild from outside the pane (e.g. an inspector arg edit).
-    pub fn bump_rebuild(&mut self, cx: &mut Context<Self>) {
-        self.schedule_rebuild(cx);
-    }
-
-
     pub fn add_node(&mut self, descriptor: &OpDescriptor, cx: &mut Context<Self>) {
         let spec = (descriptor.default_spec)();
         self.add_node_with_spec(descriptor.label, spec, cx);
@@ -209,7 +214,7 @@ impl NodeEditor {
     }
 
     /// Currently-selected edge, if any.
-    pub fn selected_edge_ref(&self) -> Option<&EdgeEntry> {
+    pub fn selected_edge(&self) -> Option<&EdgeEntry> {
         self.selected_edge.as_ref()
     }
 
@@ -236,7 +241,11 @@ impl NodeEditor {
         (24.0 + (n % 6.0) * 24.0, 24.0 + n * 12.0)
     }
 
-    fn schedule_rebuild(&mut self, cx: &mut Context<Self>) {
+    /// Cancel any pending rebuild and queue a fresh one after the debounce
+    /// window. Public so external callers (inspector arg edits, palette
+    /// commands) can ask the editor to refresh without going through the
+    /// internal mutation path.
+    pub fn schedule_rebuild(&mut self, cx: &mut Context<Self>) {
         // Drop any pending task to cancel its timer.
         self.rebuild_task.take();
         let graph = self.graph.clone();
@@ -332,24 +341,11 @@ impl NodeEditor {
     }
 }
 
-impl Drop for NodeEditor {
-    fn drop(&mut self) {
-        // Best-effort: we don't have cx in Drop, so coordinator cleanup
-        // happens lazily when the next editor's rebuild runs (DynamicRegistry
-        // entries with no surviving owner get dropped). For an explicit
-        // release, call `release` from a `cx.on_release`-style hook.
-    }
-}
-
 impl Focusable for NodeEditor {
     fn focus_handle(&self, _: &App) -> FocusHandle {
         self.focus_handle.clone()
     }
 }
-
-// -----------------------------------------------------------------------------
-// Geometry helpers
-// -----------------------------------------------------------------------------
 
 /// Number of input sockets shown on `entry`. For variadic ops we render a
 /// single "+" affordance plus one row per existing edge.
@@ -369,27 +365,7 @@ const ARG_ROW_HEIGHT: f32 = 28.0;
 
 /// Number of inline arg rows for a spec, used to size the node card.
 fn args_count(spec: &NodeSpec) -> usize {
-    match spec {
-        NodeSpec::FixedRate { .. } => 1,
-        NodeSpec::Sin { .. } | NodeSpec::Square { .. } => 3,
-        NodeSpec::Random { .. }
-        | NodeSpec::Constant { .. }
-        | NodeSpec::Scale { .. }
-        | NodeSpec::Offset { .. }
-        | NodeSpec::FromDb { .. }
-        | NodeSpec::Persist { .. } => 1,
-        NodeSpec::ClockOf
-        | NodeSpec::Abs
-        | NodeSpec::Neg
-        | NodeSpec::Log
-        | NodeSpec::Add
-        | NodeSpec::Sub
-        | NodeSpec::Mul
-        | NodeSpec::Mean
-        | NodeSpec::Zoh
-        | NodeSpec::Linear
-        | NodeSpec::LatestAt => 0,
-    }
+    descriptor_for(spec).arg_count
 }
 
 /// Height of a node card. Header on top, then `inputs * SOCKET_ROW_HEIGHT`
@@ -424,14 +400,9 @@ fn socket_dot_color(kind: SocketKind, theme: &crate::theme::Theme) -> Hsla {
 
 fn edge_color_to_hsla(c: EdgeColor, theme: &crate::theme::Theme) -> Hsla {
     match c {
-        EdgeColor::SharedClock(idx) => theme.line_colors[idx % 8],
+        EdgeColor::SharedClock(idx) => theme.line_colors[idx % theme.line_colors.len()],
         EdgeColor::Neutral => theme.border_primary,
-        EdgeColor::Error => Hsla {
-            h: 0.0,
-            s: 0.7,
-            l: 0.55,
-            a: 1.0,
-        },
+        EdgeColor::Error => theme.error_accent,
         EdgeColor::Pending => Hsla {
             a: 0.4,
             ..theme.text_tertiary
@@ -448,10 +419,6 @@ fn status_pill(entry: &NodeEntry) -> (&'static str, bool) {
     }
 }
 
-// -----------------------------------------------------------------------------
-// Render
-// -----------------------------------------------------------------------------
-
 impl Render for NodeEditor {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = theme(cx);
@@ -460,33 +427,21 @@ impl Render for NodeEditor {
         let selected_edge = self.selected_edge.clone();
 
         // Per-node screen position = graph position - viewport offset.
-        let mut node_snapshots: Vec<(
-            FlowId,
-            Position,
-            Position,
-            &'static OpDescriptor,
-            usize,
-            usize,
-            (&'static str, bool),
-        )> = Vec::with_capacity(graph_ref.nodes.len());
+        let mut node_snapshots: Vec<NodeRenderSnapshot> =
+            Vec::with_capacity(graph_ref.nodes.len());
         for (id, entry) in &graph_ref.nodes {
-            let descriptor = descriptor_for(&entry.spec);
-            let inputs = input_count(entry, &graph_ref.edges, id);
-            let args = args_count(&entry.spec);
-            let pill = status_pill(entry);
-            let screen = Position {
-                x: entry.position.x - viewport.x,
-                y: entry.position.y - viewport.y,
-            };
-            node_snapshots.push((
-                id.clone(),
-                entry.position.clone(),
-                screen,
-                descriptor,
-                inputs,
-                args,
-                pill,
-            ));
+            node_snapshots.push(NodeRenderSnapshot {
+                flow_id: id.clone(),
+                graph_pos: entry.position.clone(),
+                screen_pos: Position {
+                    x: entry.position.x - viewport.x,
+                    y: entry.position.y - viewport.y,
+                },
+                descriptor: descriptor_for(&entry.spec),
+                inputs: input_count(entry, &graph_ref.edges, id),
+                args: args_count(&entry.spec),
+                pill: status_pill(entry),
+            });
         }
 
         // Pre-compute edges in canvas-local coordinates. We retain the
@@ -698,18 +653,15 @@ impl Render for NodeEditor {
         // know which flow ids are alive, but before render_node so the
         // cards can pull the row-list entity by id.
         let alive_ids: HashSet<FlowId> =
-            node_snapshots.iter().map(|s| s.0.clone()).collect();
+            node_snapshots.iter().map(|s| s.flow_id.clone()).collect();
         self.refresh_row_lists(&alive_ids, cx);
 
-        for (flow_id, graph_pos, screen_pos, descriptor, inputs, args, pill) in node_snapshots {
+        for snap in node_snapshots {
             let row_list = self
                 .node_row_lists
-                .get(&flow_id)
+                .get(&snap.flow_id)
                 .map(|e| e.list.clone());
-            root = root.child(self.render_node(
-                flow_id, graph_pos, screen_pos, descriptor, inputs, args, pill, row_list,
-                &theme, cx,
-            ));
+            root = root.child(self.render_node(snap, row_list, &theme, cx));
         }
 
         // Scrollbars (indicator-only — wheel handler drives the viewport).
@@ -781,20 +733,22 @@ impl Render for NodeEditor {
 }
 
 impl NodeEditor {
-    #[allow(clippy::too_many_arguments)]
     fn render_node(
         &self,
-        flow_id: FlowId,
-        graph_pos: Position,
-        screen_pos: Position,
-        descriptor: &'static OpDescriptor,
-        inputs: usize,
-        args: usize,
-        (pill_text, pill_error): (&'static str, bool),
+        snap: NodeRenderSnapshot,
         row_list: Option<Entity<crate::inspector::row_list::RowList>>,
         theme: &crate::theme::Theme,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
+        let NodeRenderSnapshot {
+            flow_id,
+            graph_pos,
+            screen_pos,
+            descriptor,
+            inputs,
+            args,
+            pill: (pill_text, pill_error),
+        } = snap;
         let height = node_height(inputs, args);
         let selected = self.selection.as_ref() == Some(&flow_id);
 
@@ -804,7 +758,7 @@ impl NodeEditor {
             theme.border_primary
         };
         let pill_color = if pill_error {
-            Hsla { h: 0.0, s: 0.7, l: 0.55, a: 1.0 }
+            theme.error_accent
         } else {
             theme.text_secondary
         };
@@ -1004,10 +958,6 @@ impl NodeEditor {
     }
 }
 
-// -----------------------------------------------------------------------------
-// PaneItem
-// -----------------------------------------------------------------------------
-
 impl PaneItem for NodeEditor {
     type Config = NodeEditorConfig;
 
@@ -1023,10 +973,6 @@ impl PaneItem for NodeEditor {
         NodeEditorConfig::from_graph(self.graph.read(cx), self.viewport.clone())
     }
 }
-
-// -----------------------------------------------------------------------------
-// Painting
-// -----------------------------------------------------------------------------
 
 fn paint_grid(bounds: Bounds<Pixels>, theme: &crate::theme::Theme, window: &mut Window) {
     let step = 24.0_f32;

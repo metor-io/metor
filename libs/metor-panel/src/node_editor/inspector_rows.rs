@@ -3,7 +3,7 @@
 //! A `SelectedNodeProxy` entity carries `(editor, graph, flow_id)`. The
 //! inspector's reflection registry is told that proxies of this type produce
 //! their rows from a custom builder rather than facet reflection (which
-//! would lose the editor's `bump_rebuild` hook).
+//! would lose the editor's `schedule_rebuild` hook).
 //!
 //! The builder dispatches per-variant: each arg becomes one existing row
 //! (`ScalarRow` / `TextRow` / `EnumRow`) wired so `on_change` updates the
@@ -101,7 +101,7 @@ fn build_editor_rows(any: AnyEntity, db: &Arc<DB>, cx: &App) -> Vec<Box<dyn Insp
     }
 
     let has_selection = editor.read(cx).selected_node().is_some();
-    let has_edge = editor.read(cx).selected_edge_ref().is_some();
+    let has_edge = editor.read(cx).selected_edge().is_some();
     if has_selection || has_edge {
         let editor_for_delete = editor.clone();
         rows.push(Box::new(CommandRow::new(
@@ -303,7 +303,7 @@ fn build_rows(any: AnyEntity, db: &Arc<DB>, cx: &App) -> Vec<Box<dyn InspectorRo
 /// Per-variant arg rows for a single node, *without* the status header.
 /// Used inline by the canvas (the node card already has a header) and by
 /// the proxy `build_rows` (which prepends its own header). The same
-/// `editor.bump_rebuild` wiring is used in both cases so palette edits and
+/// `editor.schedule_rebuild` wiring is used in both cases so palette edits and
 /// inline edits write back identically.
 pub fn rows_for_node(
     editor: &Entity<NodeEditor>,
@@ -415,7 +415,6 @@ pub fn rows_for_node(
             ));
         }
         NodeSpec::FromDb { component_id } => {
-            // List every component in the DB; fold (id, name) into an EnumRow.
             let components = crate::inspector::trace_picker::list_components(&db);
             let selected_label = components
                 .iter()
@@ -428,54 +427,39 @@ pub fn rows_for_node(
                 .into_iter()
                 .map(|(id, name)| (name, id.0))
                 .collect();
-            let editor = editor.clone();
-            let graph = graph.clone();
-            let flow_id = flow_id.clone();
-            rows.push(Box::new(EnumRow {
-                label: SharedString::from("Component"),
-                selected: selected_label,
+            rows.push(enum_arg(
+                "Component",
+                selected_label,
                 options,
-                on_select: Arc::new(move |chosen, _window, cx| {
-                    let Some(new_id) = id_by_name.get(&chosen).copied() else {
-                        return;
-                    };
-                    let id = flow_id.clone();
-                    graph.update(cx, |g, _| {
-                        if let Some(entry) = g.nodes.get_mut(&id)
-                            && let NodeSpec::FromDb { component_id } = &mut entry.spec
-                        {
-                            *component_id = new_id;
-                        }
-                    });
-                    editor.update(cx, |ed, cx| ed.bump_rebuild(cx));
-                }),
-            }));
+                editor.clone(),
+                graph.clone(),
+                flow_id.clone(),
+                move |spec, chosen| {
+                    if let (Some(new_id), NodeSpec::FromDb { component_id }) =
+                        (id_by_name.get(&chosen).copied(), spec)
+                    {
+                        *component_id = new_id;
+                    }
+                },
+            ));
         }
         NodeSpec::Persist { name } => {
-            let editor = editor.clone();
-            let graph = graph.clone();
-            let flow_id = flow_id.clone();
-            rows.push(Box::new(TextRow::new(
-                SharedString::from("Component Name"),
+            rows.push(text_arg(
+                "Component Name",
                 SharedString::from(name.clone()),
-                Arc::new(move |new_name, _window, cx| {
-                    // Empty/whitespace names hash to a fixed `ComponentId`,
-                    // so two empty-named Persist nodes silently alias onto
-                    // the same WAL. The creation wizard rejects them too.
-                    if new_name.trim().is_empty() {
-                        return;
+                editor.clone(),
+                graph.clone(),
+                flow_id.clone(),
+                // Empty/whitespace names hash to a fixed `ComponentId`,
+                // so two empty-named Persist nodes silently alias onto
+                // the same WAL. The creation wizard rejects them too.
+                |s| !s.trim().is_empty(),
+                |spec, new_name| {
+                    if let NodeSpec::Persist { name } = spec {
+                        *name = new_name;
                     }
-                    let id = flow_id.clone();
-                    graph.update(cx, |g, _| {
-                        if let Some(entry) = g.nodes.get_mut(&id)
-                            && let NodeSpec::Persist { name } = &mut entry.spec
-                        {
-                            *name = new_name;
-                        }
-                    });
-                    editor.update(cx, |ed, cx| ed.bump_rebuild(cx));
-                }),
-            )));
+                },
+            ));
         }
         // No editable args.
         NodeSpec::ClockOf
@@ -516,7 +500,66 @@ fn scalar_arg(
                     apply(&mut entry.spec, new_value);
                 }
             });
-            editor.update(cx, |ed, cx| ed.bump_rebuild(cx));
+            editor.update(cx, |ed, cx| ed.schedule_rebuild(cx));
         }),
     ))
+}
+
+/// `TextRow` analogue of [`scalar_arg`]. `accept` returns `false` to reject
+/// a value before it lands on the spec (e.g. blank `Persist` names).
+fn text_arg(
+    label: &'static str,
+    value: SharedString,
+    editor: Entity<NodeEditor>,
+    graph: Entity<NodeGraph>,
+    flow_id: FlowId,
+    accept: impl Fn(&str) -> bool + 'static,
+    apply: impl Fn(&mut NodeSpec, String) + 'static,
+) -> Box<dyn InspectorRow> {
+    let accept = Arc::new(accept);
+    let apply = Arc::new(apply);
+    Box::new(TextRow::new(
+        SharedString::from(label),
+        value,
+        Arc::new(move |new_value, _window, cx| {
+            if !accept(&new_value) {
+                return;
+            }
+            let id = flow_id.clone();
+            graph.update(cx, |g, _| {
+                if let Some(entry) = g.nodes.get_mut(&id) {
+                    apply(&mut entry.spec, new_value);
+                }
+            });
+            editor.update(cx, |ed, cx| ed.schedule_rebuild(cx));
+        }),
+    ))
+}
+
+/// `EnumRow` analogue of [`scalar_arg`]. The caller supplies the option list
+/// and the `on_select` mutation; this helper just owns the rebuild wiring.
+fn enum_arg(
+    label: &'static str,
+    selected: SharedString,
+    options: Vec<SharedString>,
+    editor: Entity<NodeEditor>,
+    graph: Entity<NodeGraph>,
+    flow_id: FlowId,
+    apply: impl Fn(&mut NodeSpec, String) + 'static,
+) -> Box<dyn InspectorRow> {
+    let apply = Arc::new(apply);
+    Box::new(EnumRow {
+        label: SharedString::from(label),
+        selected,
+        options,
+        on_select: Arc::new(move |chosen, _window, cx| {
+            let id = flow_id.clone();
+            graph.update(cx, |g, _| {
+                if let Some(entry) = g.nodes.get_mut(&id) {
+                    apply(&mut entry.spec, chosen);
+                }
+            });
+            editor.update(cx, |ed, cx| ed.schedule_rebuild(cx));
+        }),
+    })
 }

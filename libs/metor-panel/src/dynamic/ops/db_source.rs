@@ -6,14 +6,14 @@
 //! lets us treat it like any other node (own clock id, own subscribers).
 
 use std::hash::Hash;
-use std::mem::size_of;
 use std::sync::Arc;
 
 use metor_db::DB;
-use metor_proto::types::{ComponentId, Timestamp};
+use metor_proto::types::ComponentId;
 
 use crate::dynamic::node::{
-    BuildError, DynamicNode, NodeImpl, ValueType, default_ring_bytes, hash_id, op_tag, write_sample,
+    BuildError, DynamicNode, NodeImpl, NodeReader, ValueType, default_ring_bytes, hash_id, op_tag,
+    write_sample,
 };
 
 /// Mirror `component_id` from the DB into a node. The component must be
@@ -30,8 +30,7 @@ pub fn from_db(db: &DB, component_id: ComponentId) -> Result<Arc<dyn DynamicNode
     let id = hash_id(op_tag::FROM_DB, &[], |h| {
         component_id.0.hash(h);
     });
-    let mut reader = component.wal.reader();
-    let msg_size = size_of::<Timestamp>() + value_bytes;
+    let mut reader = NodeReader::from_disruptor(&component.wal, value_bytes);
     Ok(NodeImpl::spawn(
         id,
         ValueType::Value(schema),
@@ -41,12 +40,7 @@ pub fn from_db(db: &DB, component_id: ComponentId) -> Result<Arc<dyn DynamicNode
             let _component = component;
             loop {
                 let grant = reader.next().await;
-                for chunk in grant.chunks_exact(msg_size) {
-                    let ts_bytes: [u8; 8] = chunk[..size_of::<Timestamp>()]
-                        .try_into()
-                        .expect("ts slice");
-                    let ts = Timestamp::from_le_bytes(ts_bytes);
-                    let value = &chunk[size_of::<Timestamp>()..];
+                for (ts, value) in grant.samples() {
                     write_sample(&output, ts, value);
                 }
             }

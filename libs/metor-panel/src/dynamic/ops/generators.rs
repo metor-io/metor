@@ -8,18 +8,11 @@ use metor_proto::types::PrimType;
 
 use crate::dynamic::node::{
     BuildError, DynamicNode, DynamicNodeExt, NodeImpl, ValueType, default_ring_bytes, hash_id,
-    op_tag, write_sample,
+    op_tag, require_clock, write_sample,
 };
 
 fn f64_scalar_schema() -> ComponentSchema {
     ComponentSchema::new(PrimType::F64, &[])
-}
-
-fn ensure_clock(node: &Arc<dyn DynamicNode>) -> Result<(), BuildError> {
-    match node.value_type() {
-        ValueType::Clock => Ok(()),
-        ValueType::Value(_) => Err(BuildError::ExpectedClock(node.value_type().clone())),
-    }
 }
 
 /// `sin(2π·freq·t + phase) · amplitude`, sampled at every clock tick.
@@ -30,7 +23,7 @@ pub fn sin(
     amplitude: f64,
     phase: f64,
 ) -> Result<Arc<dyn DynamicNode>, BuildError> {
-    ensure_clock(&clock)?;
+    require_clock(&clock)?;
     let id = hash_id(op_tag::SIN, &[clock.id()], |h| {
         freq.to_bits().hash(h);
         amplitude.to_bits().hash(h);
@@ -67,7 +60,7 @@ pub fn square(
     amplitude: f64,
     phase: f64,
 ) -> Result<Arc<dyn DynamicNode>, BuildError> {
-    ensure_clock(&clock)?;
+    require_clock(&clock)?;
     let id = hash_id(op_tag::SQUARE, &[clock.id()], |h| {
         freq.to_bits().hash(h);
         amplitude.to_bits().hash(h);
@@ -100,7 +93,7 @@ pub fn square(
 /// Pseudo-random uniform in `[0, 1)`. Cheap LCG seeded from `seed` and
 /// advanced once per tick — deterministic given the same seed and clock.
 pub fn random(clock: Arc<dyn DynamicNode>, seed: u64) -> Result<Arc<dyn DynamicNode>, BuildError> {
-    ensure_clock(&clock)?;
+    require_clock(&clock)?;
     let id = hash_id(op_tag::RANDOM, &[clock.id()], |h| {
         seed.hash(h);
     });
@@ -135,7 +128,7 @@ pub fn random(clock: Arc<dyn DynamicNode>, seed: u64) -> Result<Arc<dyn DynamicN
 /// Always emit `value` on every tick. Useful for testing and as a constant
 /// input to composers.
 pub fn constant(clock: Arc<dyn DynamicNode>, value: f64) -> Result<Arc<dyn DynamicNode>, BuildError> {
-    ensure_clock(&clock)?;
+    require_clock(&clock)?;
     let id = hash_id(op_tag::CONSTANT, &[clock.id()], |h| {
         value.to_bits().hash(h);
     });

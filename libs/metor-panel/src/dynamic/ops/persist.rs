@@ -11,36 +11,11 @@ use std::hash::Hash;
 use std::sync::Arc;
 
 use metor_db::DB;
-use metor_db::disruptor::Disruptor;
 use metor_proto::types::ComponentId;
-use stellarator::JoinHandleDropGuard;
 
 use crate::dynamic::node::{
-    BuildError, DynamicNode, DynamicNodeExt, NodeId, ValueType, hash_id, op_tag,
+    BuildError, DynamicNode, DynamicNodeExt, NodeImpl, ValueType, hash_id, op_tag,
 };
-
-struct PersistNode {
-    id: NodeId,
-    value_type: ValueType,
-    parent_clock_id: Option<NodeId>,
-    component_wal: Disruptor,
-    _task: JoinHandleDropGuard<()>,
-}
-
-impl DynamicNode for PersistNode {
-    fn id(&self) -> NodeId {
-        self.id
-    }
-    fn value_type(&self) -> &ValueType {
-        &self.value_type
-    }
-    fn parent_clock_id(&self) -> Option<NodeId> {
-        self.parent_clock_id
-    }
-    fn output(&self) -> &Disruptor {
-        &self.component_wal
-    }
-}
 
 /// Promote `input` to a real db Component named `name`. Returns a
 /// passthrough node whose output mirrors the Component's WAL.
@@ -89,7 +64,6 @@ pub fn persist(
             }
         })?;
 
-    // Set human-readable metadata so the component browser shows `name`.
     let mut metadata = metor_proto_wkt::ComponentMetadata {
         component_id,
         name,
@@ -104,29 +78,27 @@ pub fn persist(
     let component = db
         .with_state(|s| s.get_component(component_id).cloned())
         .expect("just inserted");
-    let component_wal = component.wal.clone();
     let parent_clock_id = input.parent_clock_id();
-
     let mut reader = input.subscribe();
-    let task = stellarator::spawn(async move {
-        let _input = input;
-        loop {
-            let grant = reader.next().await;
-            for (ts, value) in grant.samples() {
-                if let Err(err) = component.push_buf(ts, value) {
-                    tracing::warn!(?err, ?ts, "persist: push_buf failed");
+    let component_for_task = component.clone();
+    Ok(NodeImpl::spawn_with_output(
+        id,
+        ValueType::Value(schema),
+        parent_clock_id,
+        component.wal.clone(),
+        move |_output| async move {
+            let _input = input;
+            let component = component_for_task;
+            loop {
+                let grant = reader.next().await;
+                for (ts, value) in grant.samples() {
+                    if let Err(err) = component.push_buf(ts, value) {
+                        tracing::warn!(?err, ?ts, "persist: push_buf failed");
+                    }
                 }
             }
-        }
-    });
-
-    Ok(Arc::new(PersistNode {
-        id,
-        value_type: ValueType::Value(schema),
-        parent_clock_id,
-        component_wal,
-        _task: task.drop_guard(),
-    }))
+        },
+    ))
 }
 
 /// Hash a component name into a stable `ComponentId` raw value. Distinct

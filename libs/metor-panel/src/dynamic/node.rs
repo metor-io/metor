@@ -44,6 +44,29 @@ impl ValueType {
     }
 }
 
+/// Validate that `node` is a value-typed f64 scalar; return its schema.
+/// Shared by every op whose Phase 1 scope is f64-only.
+pub fn require_f64_scalar(
+    node: &std::sync::Arc<dyn DynamicNode>,
+) -> Result<ComponentSchema, BuildError> {
+    let schema = match node.value_type() {
+        ValueType::Clock => return Err(BuildError::ExpectedValue),
+        ValueType::Value(s) => s,
+    };
+    if schema.prim_type != PrimType::F64 {
+        return Err(BuildError::ExpectedFloat(schema.prim_type));
+    }
+    Ok(schema.clone())
+}
+
+/// Validate that `node` is clock-typed.
+pub fn require_clock(node: &std::sync::Arc<dyn DynamicNode>) -> Result<(), BuildError> {
+    match node.value_type() {
+        ValueType::Clock => Ok(()),
+        v => Err(BuildError::ExpectedClock(v.clone())),
+    }
+}
+
 /// Errors surfaced when *building* a node — schema mismatches, clock
 /// mismatches, or wrong value type for an op. The node editor will render
 /// these as edge errors in a later phase.
@@ -123,6 +146,13 @@ impl NodeReader {
         }
     }
 
+    /// Construct a reader directly over an arbitrary `[Timestamp][value]`
+    /// framed `Disruptor`. Used by `from_db` to read off a Component's
+    /// WAL without spawning a wrapper node.
+    pub fn from_disruptor(disruptor: &Disruptor, value_bytes: usize) -> Self {
+        Self::new(disruptor, value_bytes)
+    }
+
     pub async fn next(&mut self) -> NodeGrant<'_> {
         let grant = self.reader.next().await;
         NodeGrant {
@@ -132,7 +162,7 @@ impl NodeReader {
     }
 
     /// Non-blocking grant fetch. Returns `None` if no new data is available.
-    pub fn try_next_grant(&mut self) -> Option<NodeGrant<'_>> {
+    pub fn try_next(&mut self) -> Option<NodeGrant<'_>> {
         let grant = self.reader.try_next()?;
         Some(NodeGrant {
             grant,
@@ -199,7 +229,29 @@ impl NodeImpl {
         F: FnOnce(Disruptor) -> Fut,
         Fut: std::future::Future<Output = ()> + Send + 'static,
     {
-        let output = Disruptor::new(capacity);
+        Self::spawn_with_output(
+            id,
+            value_type,
+            parent_clock_id,
+            Disruptor::new(capacity),
+            build_task,
+        )
+    }
+
+    /// Variant of [`spawn`](Self::spawn) that adopts an existing [`Disruptor`]
+    /// as the output ring instead of allocating one. Used by `persist`, whose
+    /// output is the underlying db Component's WAL.
+    pub fn spawn_with_output<F, Fut>(
+        id: NodeId,
+        value_type: ValueType,
+        parent_clock_id: Option<NodeId>,
+        output: Disruptor,
+        build_task: F,
+    ) -> Arc<Self>
+    where
+        F: FnOnce(Disruptor) -> Fut,
+        Fut: std::future::Future<Output = ()> + Send + 'static,
+    {
         let task = stellarator::spawn(build_task(output.clone()));
         Arc::new(Self {
             id,
