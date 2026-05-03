@@ -18,6 +18,7 @@ pub mod gpu_context;
 pub mod icons;
 pub mod inspect;
 pub mod inspector;
+pub mod node_editor;
 pub mod presets;
 pub mod theme;
 pub mod tiles;

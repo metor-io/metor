@@ -395,6 +395,7 @@ pub fn run(db: Arc<metor_db::DB>) {
             crate::inspector::registry::InspectorRegistry::init(db.clone(), cx);
             crate::views::dashboard::WidgetRegistry::init(cx);
             crate::dynamic::DynamicRegistry::init(cx);
+            crate::node_editor::GraphCoordinator::init(cx);
             register_pane_item_deserializers(db.clone(), cx);
             set_dock_icon();
             cx.bind_keys([

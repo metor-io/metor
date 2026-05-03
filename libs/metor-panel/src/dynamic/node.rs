@@ -61,6 +61,16 @@ pub enum BuildError {
     ExpectedFloat(PrimType),
     #[error("composer needs at least one input")]
     EmptyInputs,
+    #[error("graph contains a cycle")]
+    Cycle,
+    #[error("{op} expected {expected} input(s), got {got}")]
+    WrongArity {
+        op: &'static str,
+        expected: usize,
+        got: usize,
+    },
+    #[error("a parent node failed to build")]
+    ParentFailed,
 }
 
 /// A live producer task whose output is a fan-out [`Disruptor`].
