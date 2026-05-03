@@ -4,6 +4,7 @@
 //! are followed by a 200ms-debounced `rebuild` so unrelated subtrees stay
 //! live across keystrokes.
 
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -28,7 +29,6 @@ const NODE_WIDTH: f32 = 168.0;
 const HEADER_HEIGHT: f32 = 26.0;
 const SOCKET_ROW_HEIGHT: f32 = 20.0;
 const SOCKET_DOT_SIZE: f32 = 10.0;
-const NODE_VPAD: f32 = 6.0;
 
 /// Track the most recently focused `NodeEditor` so palette commands can
 /// route "Add Node" to the right place.
@@ -86,10 +86,16 @@ pub struct NodeEditor {
     canvas_size: Option<gpui::Size<Pixels>>,
     rebuild_task: Option<Task<()>>,
     next_node_seq: u64,
-    /// Embedded inspector showing rows for the currently-selected node.
-    /// `None` when nothing is selected; refreshed on selection change and
-    /// after each graph rebuild.
-    inspector: Option<Entity<crate::inspector::Inspector>>,
+    /// Per-node inline row lists keyed by `FlowId`. The cached spec lets
+    /// us detect when a node's args changed (e.g. after the user edits
+    /// freq) so we only call `RowList::set_rows` then — keeping the row
+    /// list's edit state intact across unrelated re-renders.
+    node_row_lists: HashMap<FlowId, NodeRowEntry>,
+}
+
+struct NodeRowEntry {
+    spec: NodeSpec,
+    list: Entity<crate::inspector::row_list::RowList>,
 }
 
 impl NodeEditor {
@@ -111,7 +117,7 @@ impl NodeEditor {
             canvas_size: None,
             rebuild_task: None,
             next_node_seq: 0,
-            inspector: None,
+            node_row_lists: HashMap::new(),
         }
     }
 
@@ -140,7 +146,7 @@ impl NodeEditor {
             canvas_size: None,
             rebuild_task: None,
             next_node_seq,
-            inspector: None,
+            node_row_lists: HashMap::new(),
         };
         this.schedule_rebuild(cx);
         this
@@ -172,37 +178,6 @@ impl NodeEditor {
         self.schedule_rebuild(cx);
     }
 
-    /// Refresh the embedded inspector to reflect the current selection.
-    /// Creates the inspector entity if needed; clears it when there is no
-    /// selection. Also called after every graph rebuild so status pills
-    /// (built / pending / error) stay current.
-    fn update_inspector(&mut self, cx: &mut Context<Self>) {
-        let Some(flow_id) = self.selection.clone() else {
-            self.inspector = None;
-            return;
-        };
-        let editor = cx.entity().clone();
-        let graph = self.graph.clone();
-        let proxy = cx.new(|_| crate::node_editor::inspector_rows::SelectedNodeProxy {
-            editor,
-            graph,
-            flow_id,
-        });
-        let db = self.db.clone();
-        let rows = crate::inspector::reflect::rows_for_any_entity(&proxy.into_any(), &db, cx)
-            .unwrap_or_default();
-        if let Some(inspector) = &self.inspector {
-            inspector.update(cx, |insp, cx| insp.set_rows(rows, cx));
-        } else {
-            self.inspector = Some(cx.new(|cx| {
-                crate::inspector::Inspector::new(
-                    rows,
-                    crate::inspector::InspectorMode::Embedded,
-                    cx,
-                )
-            }));
-        }
-    }
 
     pub fn add_node(&mut self, descriptor: &OpDescriptor, cx: &mut Context<Self>) {
         let spec = (descriptor.default_spec)();
@@ -249,7 +224,6 @@ impl NodeEditor {
         }
         if let Some(id) = self.selection.take() {
             self.graph.update(cx, |g, _| g.remove_node(&id));
-            self.update_inspector(cx);
             self.schedule_rebuild(cx);
             cx.notify();
         }
@@ -274,13 +248,52 @@ impl NodeEditor {
             let _ = cx.update(|cx| {
                 graph.update(cx, |g, cx_inner| g.rebuild(&db, cx_inner));
             });
-            let _ = this.update(cx, |this, cx| {
-                // Refresh embedded inspector so status pills (built /
-                // pending / error) reflect the new build state.
-                this.update_inspector(cx);
-                cx.notify();
-            });
+            let _ = this.update(cx, |_, cx| cx.notify());
         }));
+    }
+
+    /// Build / refresh the inline `RowList` for each node currently in
+    /// `alive`, dropping entries for any node that no longer exists. Called
+    /// once per render before the node cards are drawn. The row list is
+    /// only rebuilt (`set_rows`) when a node's spec actually changed —
+    /// otherwise the existing list is preserved so any in-flight inline
+    /// edit doesn't get clobbered.
+    fn refresh_row_lists(&mut self, alive: &HashSet<FlowId>, cx: &mut Context<Self>) {
+        self.node_row_lists.retain(|id, _| alive.contains(id));
+        let editor_handle = cx.entity().clone();
+        let graph_handle = self.graph.clone();
+        let db = self.db.clone();
+        let snapshots: Vec<(FlowId, NodeSpec)> = {
+            let g = self.graph.read(cx);
+            alive
+                .iter()
+                .filter_map(|id| g.nodes.get(id).map(|e| (id.clone(), e.spec.clone())))
+                .collect()
+        };
+        for (flow_id, spec) in snapshots {
+            let rebuild = match self.node_row_lists.get(&flow_id) {
+                Some(entry) => entry.spec != spec,
+                None => true,
+            };
+            if !rebuild {
+                continue;
+            }
+            let rows = crate::node_editor::inspector_rows::rows_for_node(
+                &editor_handle,
+                &graph_handle,
+                &flow_id,
+                &db,
+                &spec,
+                cx,
+            );
+            if let Some(entry) = self.node_row_lists.get_mut(&flow_id) {
+                entry.spec = spec;
+                entry.list.update(cx, |l, cx| l.set_rows(rows, cx));
+            } else {
+                let list = cx.new(|cx| crate::inspector::row_list::RowList::new(rows, cx));
+                self.node_row_lists.insert(flow_id, NodeRowEntry { spec, list });
+            }
+        }
     }
 
     /// World-space extent of all nodes, used to bound scrolling and size
@@ -292,7 +305,7 @@ impl NodeEditor {
         let mut max_x = 0.0_f32;
         let mut max_y = 0.0_f32;
         for (id, entry) in &g.nodes {
-            let h = node_height(input_count(entry, &g.edges, id));
+            let h = node_height(input_count(entry, &g.edges, id), args_count(&entry.spec));
             max_x = max_x.max(entry.position.x + NODE_WIDTH);
             max_y = max_y.max(entry.position.y + h);
         }
@@ -350,17 +363,54 @@ fn input_count(entry: &NodeEntry, edges: &[EdgeEntry], flow_id: &FlowId) -> usiz
     }
 }
 
-fn node_height(input_count: usize) -> f32 {
-    let inputs = input_count.max(1);
-    HEADER_HEIGHT + NODE_VPAD * 2.0 + (inputs as f32) * SOCKET_ROW_HEIGHT
+/// Inline arg row height — matches `row_base`'s 28px so node height
+/// math agrees with what gpui actually paints.
+const ARG_ROW_HEIGHT: f32 = 28.0;
+
+/// Number of inline arg rows for a spec, used to size the node card.
+fn args_count(spec: &NodeSpec) -> usize {
+    match spec {
+        NodeSpec::FixedRate { .. } => 1,
+        NodeSpec::Sin { .. } | NodeSpec::Square { .. } => 3,
+        NodeSpec::Random { .. }
+        | NodeSpec::Constant { .. }
+        | NodeSpec::Scale { .. }
+        | NodeSpec::Offset { .. }
+        | NodeSpec::FromDb { .. }
+        | NodeSpec::Persist { .. } => 1,
+        NodeSpec::ClockOf
+        | NodeSpec::Abs
+        | NodeSpec::Neg
+        | NodeSpec::Log
+        | NodeSpec::Add
+        | NodeSpec::Sub
+        | NodeSpec::Mul
+        | NodeSpec::Mean
+        | NodeSpec::Zoh
+        | NodeSpec::Linear
+        | NodeSpec::LatestAt => 0,
+    }
+}
+
+/// Height of a node card. Header on top, then `inputs * SOCKET_ROW_HEIGHT`
+/// of input-socket lane, then `arg_count` rows for inline editing. Empty
+/// nodes (no inputs, no args) reserve one socket row so the card doesn't
+/// collapse to just a header.
+fn node_height(input_count: usize, arg_count: usize) -> f32 {
+    let body = if input_count == 0 && arg_count == 0 {
+        SOCKET_ROW_HEIGHT
+    } else {
+        (input_count as f32) * SOCKET_ROW_HEIGHT + (arg_count as f32) * ARG_ROW_HEIGHT
+    };
+    HEADER_HEIGHT + body
 }
 
 fn input_socket_local_y(socket_index: usize) -> f32 {
-    HEADER_HEIGHT + NODE_VPAD + (socket_index as f32 + 0.5) * SOCKET_ROW_HEIGHT
+    HEADER_HEIGHT + (socket_index as f32 + 0.5) * SOCKET_ROW_HEIGHT
 }
 
-fn output_socket_local_y(input_count: usize) -> f32 {
-    node_height(input_count) / 2.0
+fn output_socket_local_y(input_count: usize, arg_count: usize) -> f32 {
+    node_height(input_count, arg_count) / 2.0
 }
 
 /// Color a socket dot by its declared kind.
@@ -410,17 +460,33 @@ impl Render for NodeEditor {
         let selected_edge = self.selected_edge.clone();
 
         // Per-node screen position = graph position - viewport offset.
-        let mut node_snapshots: Vec<(FlowId, Position, Position, &'static OpDescriptor, usize, (&'static str, bool))> =
-            Vec::with_capacity(graph_ref.nodes.len());
+        let mut node_snapshots: Vec<(
+            FlowId,
+            Position,
+            Position,
+            &'static OpDescriptor,
+            usize,
+            usize,
+            (&'static str, bool),
+        )> = Vec::with_capacity(graph_ref.nodes.len());
         for (id, entry) in &graph_ref.nodes {
             let descriptor = descriptor_for(&entry.spec);
             let inputs = input_count(entry, &graph_ref.edges, id);
+            let args = args_count(&entry.spec);
             let pill = status_pill(entry);
             let screen = Position {
                 x: entry.position.x - viewport.x,
                 y: entry.position.y - viewport.y,
             };
-            node_snapshots.push((id.clone(), entry.position.clone(), screen, descriptor, inputs, pill));
+            node_snapshots.push((
+                id.clone(),
+                entry.position.clone(),
+                screen,
+                descriptor,
+                inputs,
+                args,
+                pill,
+            ));
         }
 
         // Pre-compute edges in canvas-local coordinates. We retain the
@@ -433,8 +499,9 @@ impl Render for NodeEditor {
                 let source = graph_ref.nodes.get(&edge.source)?;
                 let target = graph_ref.nodes.get(&edge.target)?;
                 let s_inputs = input_count(source, &graph_ref.edges, &edge.source);
+                let s_args = args_count(&source.spec);
                 let src_x = source.position.x - viewport.x + NODE_WIDTH;
-                let src_y = source.position.y - viewport.y + output_socket_local_y(s_inputs);
+                let src_y = source.position.y - viewport.y + output_socket_local_y(s_inputs, s_args);
                 let tgt_x = target.position.x - viewport.x;
                 let tgt_y = target.position.y - viewport.y + input_socket_local_y(edge.target_socket);
                 let mut color = edge_color_to_hsla(edge_color(graph_ref, edge), &theme);
@@ -453,8 +520,9 @@ impl Render for NodeEditor {
         let edge_draft = self.edge_draft.as_ref().and_then(|draft| {
             let source = graph_ref.nodes.get(&draft.source)?;
             let s_inputs = input_count(source, &graph_ref.edges, &draft.source);
+            let s_args = args_count(&source.spec);
             let src_x = source.position.x - viewport.x + NODE_WIDTH;
-            let src_y = source.position.y - viewport.y + output_socket_local_y(s_inputs);
+            let src_y = source.position.y - viewport.y + output_socket_local_y(s_inputs, s_args);
             Some((point(px(src_x), px(src_y)), draft.pointer, theme.text_secondary))
         });
 
@@ -524,7 +592,6 @@ impl Render for NodeEditor {
                         this.selection = None;
                         this.selected_edge = None;
                         this.edge_draft = None;
-                        this.update_inspector(cx);
                         cx.notify();
                     }
                 })
@@ -626,21 +693,23 @@ impl Render for NodeEditor {
             ))
             .child(canvas_layer);
 
-        for (flow_id, graph_pos, screen_pos, descriptor, inputs, pill) in node_snapshots {
-            root = root.child(self.render_node(
-                flow_id, graph_pos, screen_pos, descriptor, inputs, pill, &theme, cx,
-            ));
-        }
+        // Refresh per-node `RowList`s so each node card has up-to-date
+        // inline arg rows. Done after node_snapshots are computed so we
+        // know which flow ids are alive, but before render_node so the
+        // cards can pull the row-list entity by id.
+        let alive_ids: HashSet<FlowId> =
+            node_snapshots.iter().map(|s| s.0.clone()).collect();
+        self.refresh_row_lists(&alive_ids, cx);
 
-        // Embedded inspector sidebar — visible whenever a node is selected.
-        if let Some(inspector) = self.inspector.clone() {
-            root = root.child(
-                div()
-                    .absolute()
-                    .top(px(8.0))
-                    .right(px(8.0))
-                    .child(inspector),
-            );
+        for (flow_id, graph_pos, screen_pos, descriptor, inputs, args, pill) in node_snapshots {
+            let row_list = self
+                .node_row_lists
+                .get(&flow_id)
+                .map(|e| e.list.clone());
+            root = root.child(self.render_node(
+                flow_id, graph_pos, screen_pos, descriptor, inputs, args, pill, row_list,
+                &theme, cx,
+            ));
         }
 
         // Scrollbars (indicator-only — wheel handler drives the viewport).
@@ -720,11 +789,13 @@ impl NodeEditor {
         screen_pos: Position,
         descriptor: &'static OpDescriptor,
         inputs: usize,
+        args: usize,
         (pill_text, pill_error): (&'static str, bool),
+        row_list: Option<Entity<crate::inspector::row_list::RowList>>,
         theme: &crate::theme::Theme,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
-        let height = node_height(inputs);
+        let height = node_height(inputs, args);
         let selected = self.selection.as_ref() == Some(&flow_id);
 
         let border_color = if selected {
@@ -754,13 +825,13 @@ impl NodeEditor {
             .border_1()
             .border_color(border_color)
             .rounded_md()
+            .overflow_hidden()
             .on_mouse_down(
                 MouseButton::Left,
                 cx.listener({
                     let id = flow_id.clone();
                     let pos = graph_pos.clone();
                     move |this, ev: &gpui::MouseDownEvent, _w, cx| {
-                        let selection_changed = this.selection.as_ref() != Some(&id);
                         this.selection = Some(id.clone());
                         this.selected_edge = None;
                         this.node_drag = Some(NodeDrag {
@@ -768,9 +839,39 @@ impl NodeEditor {
                             pointer_origin: ev.position,
                             node_origin: pos.clone(),
                         });
-                        if selection_changed {
-                            this.update_inspector(cx);
-                        }
+                        cx.stop_propagation();
+                        cx.notify();
+                    }
+                }),
+            )
+            .on_mouse_down(
+                MouseButton::Right,
+                cx.listener({
+                    let id = flow_id.clone();
+                    move |this, ev: &gpui::MouseDownEvent, window, cx| {
+                        // Right-click on a node opens the standard Inspector
+                        // anchored at the click — gives access to the full
+                        // row set (including Cascade pickers) in the
+                        // familiar palette UX. The inline row list inside
+                        // the card handles quick Scalar/Text edits without
+                        // needing this overlay.
+                        this.selection = Some(id.clone());
+                        let editor_entity = cx.entity().clone();
+                        let graph_entity = this.graph.clone();
+                        let proxy = cx.new(|_| {
+                            crate::node_editor::inspector_rows::SelectedNodeProxy {
+                                editor: editor_entity,
+                                graph: graph_entity,
+                                flow_id: id.clone(),
+                            }
+                        });
+                        window.dispatch_action(
+                            Box::new(crate::inspector::InspectEntity {
+                                entity: proxy.into_any(),
+                                position: ev.position,
+                            }),
+                            cx,
+                        );
                         cx.stop_propagation();
                         cx.notify();
                     }
@@ -848,8 +949,26 @@ impl NodeEditor {
             );
         }
 
+        // Inline row list (arg fields), positioned directly below the
+        // input-socket lane. Spans the full card width so the row's own
+        // padding (12px in `row_base`) is what aligns the labels — no
+        // extra margin from the wrapper.
+        if let Some(list) = row_list
+            && args > 0
+        {
+            let list_top = HEADER_HEIGHT + (inputs as f32) * SOCKET_ROW_HEIGHT;
+            body = body.child(
+                div()
+                    .absolute()
+                    .left_0()
+                    .right_0()
+                    .top(px(list_top))
+                    .child(list),
+            );
+        }
+
         // Output socket (right edge).
-        let out_y = output_socket_local_y(inputs) - SOCKET_DOT_SIZE / 2.0;
+        let out_y = output_socket_local_y(inputs, args) - SOCKET_DOT_SIZE / 2.0;
         let out_color = socket_dot_color(descriptor.output, theme);
         body = body.child(
             div()

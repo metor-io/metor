@@ -7,11 +7,11 @@ Features from metor-ui parity (excluding 3D rendering) and new ideas for industr
 - [x] Time Series Plot — line plots with pan/zoom/multi-trace
 - [x] Component Table — sortable table with sparklines
 - [x] Component Text — single value display
-- [ ] **Monitor** — large numeric value cards for multiple components, with element labels and card grid layout
+- [X] **Monitor** — large numeric value cards for multiple components, with element labels and card grid layout
 - [ ] **Video Stream** — H264/H265 decoded video display
 - [ ] **Map** — geographic map with markers driven by component data (lat/lon from EQL)
-- [ ] **Hierarchy** — entity/component tree browser with fuzzy search and expand/collapse
-- [ ] **Inspector** — component property editor with type-aware widgets
+- [X] **Hierarchy** — entity/component tree browser with fuzzy search and expand/collapse
+- [X] **Inspector** — component property editor with type-aware widgets
 
 ## Plot Features
 
@@ -58,8 +58,8 @@ TBD whether this is good / we want this
 
 - [x] Inspectable trait for runtime field configuration
 - [x] Trace picker with component/element selection
-- [ ] **In-place value editing** — edit component values with type-aware input widgets
-- [ ] **Color picker** — visual color selection
+- [X] **In-place value editing** — edit component values with type-aware input widgets
+- [X] **Color picker** — visual color selection
 
 ## Theming & Polish
 

@@ -19,6 +19,7 @@ pub mod edits;
 pub mod palette;
 pub mod reflect;
 pub mod registry;
+pub mod row_list;
 pub mod rows;
 pub mod trace_picker;
 
@@ -45,9 +46,6 @@ pub enum InspectorMode {
     Anchored(Point<Pixels>),
     /// Float near the top-center, used for the command palette.
     Centered,
-    /// Render inline (no overlay, no auto-dismiss). Used when a host pane
-    /// embeds the inspector as a sidebar.
-    Embedded,
 }
 
 /// Inputs needed to open an inspector from a callback.
@@ -124,18 +122,6 @@ impl Inspector {
 
     pub fn set_parent_focus(&mut self, handle: FocusHandle) {
         self.parent_focus = Some(handle);
-    }
-
-    /// Replace the page stack with a fresh root page. Used by embedded
-    /// hosts (e.g. the node editor sidebar) when the inspected entity
-    /// changes or its underlying state was rebuilt.
-    pub fn set_rows(&mut self, rows: Vec<Box<dyn InspectorRow>>, cx: &mut Context<Self>) {
-        self.pages = vec![InspectorPage { rows, label: None }];
-        self.search.clear();
-        self.selected_index = 0;
-        self.editing = None;
-        self.dismissed = false;
-        cx.notify();
     }
 
     fn current_page(&self) -> &InspectorPage {
@@ -506,7 +492,6 @@ impl Inspector {
         let width = match self.mode {
             InspectorMode::Anchored(_) => px(280.0),
             InspectorMode::Centered => px(500.0),
-            InspectorMode::Embedded => px(240.0),
         };
 
         div()
@@ -545,19 +530,12 @@ impl Render for Inspector {
 
         let panel = self.render_panel(window, cx);
 
-        // Embedded mode renders inline as part of the host's normal flow:
-        // no overlay, no click-outside dismissal, host owns the lifecycle.
-        if matches!(self.mode, InspectorMode::Embedded) {
-            return panel.into_any_element();
-        }
-
         let panel_with_dismiss =
             panel.on_mouse_down_out(cx.listener(|this, _: &gpui::MouseDownEvent, window, _cx| {
                 this.dismiss(window);
             }));
 
         match self.mode {
-            InspectorMode::Embedded => unreachable!(),
             InspectorMode::Anchored(position) => {
                 let anchored_panel = anchored()
                     .position(position)

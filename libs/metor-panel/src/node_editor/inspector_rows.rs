@@ -52,11 +52,11 @@ pub fn register_inspector_rows(cx: &mut App) {
         .register_type_builder::<NodeEditor>(Arc::new(build_editor_rows));
 }
 
-/// Rows for an inspected `NodeEditor` pane. Surfaces "Add Node" (with a
-/// wizard for `Persist`/`FromDb` so the user always supplies a component
-/// name / picks an existing component) and a delete row for the current
-/// selection.
-fn build_editor_rows(any: AnyEntity, _db: &Arc<DB>, cx: &App) -> Vec<Box<dyn InspectorRow>> {
+/// Rows for an inspected `NodeEditor` pane. Surfaces "Add Node", "Nodes"
+/// (drill into a specific node's inspector rows), and a delete row for the
+/// current selection. Reached from tab right-click, surface right-click,
+/// and the palette via "Pane: Node Editor N".
+fn build_editor_rows(any: AnyEntity, db: &Arc<DB>, cx: &App) -> Vec<Box<dyn InspectorRow>> {
     let Ok(editor) = any.downcast::<NodeEditor>() else {
         return Vec::new();
     };
@@ -75,6 +75,31 @@ fn build_editor_rows(any: AnyEntity, _db: &Arc<DB>, cx: &App) -> Vec<Box<dyn Ins
         .with_tag(SharedString::new_static("editor")),
     ));
 
+    // "Nodes" — drill into a specific node's rows so palette-driven edits
+    // reach the same `rows_for_node` set used inline.
+    let nodes_listing: Vec<(FlowId, NodeSpec)> = editor
+        .read(cx)
+        .graph_entity()
+        .read(cx)
+        .nodes
+        .iter()
+        .map(|(id, entry)| (id.clone(), entry.spec.clone()))
+        .collect();
+    if !nodes_listing.is_empty() {
+        let editor_for_nodes = editor.clone();
+        let db = db.clone();
+        rows.push(Box::new(ActionRow::new(
+            SharedString::new_static("Nodes"),
+            Arc::new(move |_window, _cx| {
+                RowAction::Cascade(build_nodes_submenu(
+                    editor_for_nodes.clone(),
+                    db.clone(),
+                    nodes_listing.clone(),
+                ))
+            }),
+        )));
+    }
+
     let has_selection = editor.read(cx).selected_node().is_some();
     let has_edge = editor.read(cx).selected_edge_ref().is_some();
     if has_selection || has_edge {
@@ -88,6 +113,45 @@ fn build_editor_rows(any: AnyEntity, _db: &Arc<DB>, cx: &App) -> Vec<Box<dyn Ins
     }
 
     rows
+}
+
+/// One row per node in the editor; selecting one cascades into that
+/// node's `rows_for_node` (same set rendered inline). Lets the palette
+/// edit any node, including ones not currently selected on the canvas.
+fn build_nodes_submenu(
+    editor: Entity<NodeEditor>,
+    db: Arc<DB>,
+    nodes: Vec<(FlowId, NodeSpec)>,
+) -> Vec<Box<dyn InspectorRow>> {
+    nodes
+        .into_iter()
+        .map(|(flow_id, spec)| {
+            let descriptor = descriptor_for(&spec);
+            let label = SharedString::from(format!("{} · {}", descriptor.label, flow_id));
+            let editor = editor.clone();
+            let db = db.clone();
+            Box::new(ActionRow::new(
+                label,
+                Arc::new(move |_window, cx| {
+                    let graph = editor.read(cx).graph_entity().clone();
+                    let current_spec = graph
+                        .read(cx)
+                        .nodes
+                        .get(&flow_id)
+                        .map(|e| e.spec.clone())
+                        .unwrap_or_else(|| spec.clone());
+                    RowAction::Cascade(rows_for_node(
+                        &editor,
+                        &graph,
+                        &flow_id,
+                        &db,
+                        &current_spec,
+                        cx,
+                    ))
+                }),
+            )) as Box<dyn InspectorRow>
+        })
+        .collect()
 }
 
 /// Build the "Add Node" submenu rows. Most ops insert immediately; `Persist`
@@ -126,7 +190,6 @@ pub fn build_add_node_rows(
             }
             _ => {
                 let editor = editor.clone();
-                let descriptor = descriptor;
                 rows.push(Box::new(CommandRow::new(
                     label,
                     Arc::new(move |_window, cx| {
@@ -195,9 +258,8 @@ fn build_rows(any: AnyEntity, db: &Arc<DB>, cx: &App) -> Vec<Box<dyn InspectorRo
     let graph = proxy_ref.graph.clone();
     let flow_id = proxy_ref.flow_id.clone();
     // Use the DB threaded through by the inspector framework rather than
-    // reading it off the editor entity — `update_inspector` invokes us
-    // from inside the editor's own update closure, so reading the editor
-    // here would panic with a re-entrant borrow.
+    // reading it off the editor entity — the canvas refresh path may
+    // invoke us from inside the editor's own update closure.
     let db = db.clone();
 
     let Some(spec) = graph.read(cx).nodes.get(&flow_id).map(|e| e.spec.clone()) else {
@@ -207,7 +269,9 @@ fn build_rows(any: AnyEntity, db: &Arc<DB>, cx: &App) -> Vec<Box<dyn InspectorRo
 
     let mut rows: Vec<Box<dyn InspectorRow>> = Vec::new();
 
-    // Header row: descriptor label + status pill as the row "value".
+    // Header row: descriptor label + status pill as the row "value". Only
+    // emitted by the proxy path (palette / right-click); the inline canvas
+    // path uses the node card header instead.
     let status = match graph.read(cx).nodes.get(&flow_id).map(|e| &e.build) {
         Some(BuildState::Built(_)) => "built",
         Some(BuildState::Pending) => "pending",
@@ -229,7 +293,30 @@ fn build_rows(any: AnyEntity, db: &Arc<DB>, cx: &App) -> Vec<Box<dyn InspectorRo
         SharedString::from(status),
     )));
 
-    match &spec {
+    rows.extend(rows_for_node(&editor, &graph, &flow_id, &db, &spec, cx));
+    rows
+}
+
+/// Per-variant arg rows for a single node, *without* the status header.
+/// Used inline by the canvas (the node card already has a header) and by
+/// the proxy `build_rows` (which prepends its own header). The same
+/// `editor.bump_rebuild` wiring is used in both cases so palette edits and
+/// inline edits write back identically.
+pub fn rows_for_node(
+    editor: &Entity<NodeEditor>,
+    graph: &Entity<NodeGraph>,
+    flow_id: &FlowId,
+    db: &Arc<DB>,
+    spec: &NodeSpec,
+    _cx: &App,
+) -> Vec<Box<dyn InspectorRow>> {
+    let editor = editor.clone();
+    let graph = graph.clone();
+    let flow_id = flow_id.clone();
+    let db = db.clone();
+    let mut rows: Vec<Box<dyn InspectorRow>> = Vec::new();
+
+    match spec {
         NodeSpec::FixedRate { hz } => {
             rows.push(scalar_arg(
                 "Rate (Hz)",

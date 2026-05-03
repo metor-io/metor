@@ -49,6 +49,7 @@ impl InspectorRow for ScalarRow {
         let value_text = SharedString::from(format!("{}", *self.value.borrow()));
 
         row_base(row_ix, selected, cx)
+            .gap(px(2.))
             .child(
                 div()
                     .text_size(px(12.0))
@@ -56,12 +57,16 @@ impl InspectorRow for ScalarRow {
                     .child(self.label.clone()),
             )
             .child(
-                div().min_w(px(60.0)).max_w(px(120.0)).child(
-                    div()
-                        .text_size(px(12.0))
-                        .text_color(theme.text_secondary)
-                        .child(value_text),
-                ),
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .text_size(px(12.0))
+                    .text_color(theme.text_secondary)
+                    .overflow_hidden()
+                    .whitespace_nowrap()
+                    .text_ellipsis()
+                    .text_right()
+                    .child(value_text),
             )
             .into_any_element()
     }

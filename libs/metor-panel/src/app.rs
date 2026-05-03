@@ -407,15 +407,18 @@ pub fn run(db: Arc<metor_db::DB>) {
                 KeyBinding::new("shift-ctrl-tab", CycleTabBackward, None),
                 KeyBinding::new("cmd-l", ToggleCmdLock, None),
                 KeyBinding::new("cmd-shift-e", OpenReviewEdits, None),
+                // Excluded when a `RowList` is focused so editing a node's
+                // inline arg field (typing Backspace, hitting Delete) doesn't
+                // also delete the surrounding node.
                 KeyBinding::new(
                     "delete",
                     crate::node_editor::DeleteSelected,
-                    Some("NodeEditor"),
+                    Some("NodeEditor && !RowList"),
                 ),
                 KeyBinding::new(
                     "backspace",
                     crate::node_editor::DeleteSelected,
-                    Some("NodeEditor"),
+                    Some("NodeEditor && !RowList"),
                 ),
             ]);
 
