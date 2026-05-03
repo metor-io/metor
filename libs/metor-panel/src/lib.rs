@@ -129,7 +129,7 @@ impl ComponentStream for WalComponentStream {
     }
 }
 
-async fn wait_for_component(db: &DB, component_id: ComponentId) -> Component {
+pub(crate) async fn wait_for_component(db: &DB, component_id: ComponentId) -> Component {
     loop {
         if let Some(component) = db.with_state(|state| state.get_component(component_id).cloned()) {
             return component;

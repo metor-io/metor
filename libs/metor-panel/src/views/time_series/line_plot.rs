@@ -20,9 +20,9 @@ use metor_db::{Component, DB};
 use metor_proto::types::{ComponentId, Timestamp};
 
 use super::bounds::PlotBounds;
-use super::gpu::{LineDraw, PlotRenderState};
+use super::gpu::{AxisSource, LineDraw, PlotRenderState};
 use super::override_field::Override;
-use super::{NodeBoundsCache, Trace, expand_y_bounds};
+use super::{NodeBoundsCache, Trace, expand_value_bounds};
 use crate::views::time_series::time_range::TimeRangeBehavior;
 use crate::wait_for_component;
 
@@ -317,7 +317,7 @@ impl LinePlot {
                 let (bounds, cache) = cx
                     .background_executor()
                     .spawn(async move {
-                        let bounds = expand_y_bounds(&comp, &[element_index], &mut cache);
+                        let bounds = expand_value_bounds(&comp, &[element_index], &mut cache);
                         (bounds, cache)
                     })
                     .await;
@@ -364,9 +364,12 @@ impl Render for LinePlot {
                                     let tracking = lp.tracking.get(&trace.entity_id())?;
                                     let component = tracking.component.as_ref()?;
                                     Some(LineDraw {
-                                        component_id: config.component_id,
-                                        component,
-                                        element_index: config.element_index,
+                                        x: AxisSource::Timestamps,
+                                        y: AxisSource::Element {
+                                            component_id: config.component_id,
+                                            component,
+                                            element_index: config.element_index,
+                                        },
                                         style: config.style,
                                         color: config.color,
                                         stroke_width: config.stroke_width,

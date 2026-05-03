@@ -122,9 +122,11 @@ impl InspectorRegistry {
                 .variant_name_active()
                 .unwrap_or("unknown")
                 .to_string();
+            let allowed = field_override.and_then(|o| o.enum_allowed);
             let options: Vec<SharedString> = peek_enum
                 .variants()
                 .iter()
+                .filter(|v| allowed.is_none_or(|a| a.contains(&v.name)))
                 .map(|v| SharedString::from(v.name))
                 .collect();
             let any_entity = any_entity.clone();

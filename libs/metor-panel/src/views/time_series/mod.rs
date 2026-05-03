@@ -15,6 +15,7 @@ mod bounds;
 pub use bounds::*;
 
 mod gpu;
+pub(crate) use gpu::{AxisSource, LineDraw, PlotRenderState};
 
 mod line_plot;
 pub use line_plot::LinePlot;
@@ -25,23 +26,24 @@ pub use override_field::Override;
 pub mod time_range;
 pub use time_range::TimeRangeBehavior;
 
-/// Iterator of Y-axis tick values within `view`.
+/// Iterator of tick values for any value axis on a `[min, max)` range.
 ///
 /// Ticks are anchored at zero whenever the range crosses it so the origin
 /// stays on a labeled line. Near-zero values are snapped to exact zero to
 /// avoid the `-5.6e-17` artifacts that show up with floating arithmetic.
-fn y_ticks(view: &PlotBounds, target_count: usize) -> impl Iterator<Item = f64> {
-    let step = pretty_round(view.height() / target_count as f64);
+/// Used for both Y axes on time-series plots and both axes on XY plots.
+pub(crate) fn value_ticks(min: f64, max: f64, target_count: usize) -> impl Iterator<Item = f64> {
+    let step = pretty_round((max - min) / target_count as f64);
     let (start, end) = if !step.is_normal() || step <= 0.0 {
         (0.0, -1.0) // empty range — iterator yields nothing
-    } else if view.min_y <= 0.0 && view.max_y >= 0.0 {
+    } else if min <= 0.0 && max >= 0.0 {
         // Anchor at 0: find the lowest tick by stepping down from 0
-        let neg_steps = (-view.min_y / step).floor() as i64;
+        let neg_steps = (-min / step).floor() as i64;
         let start = -step * neg_steps as f64;
-        (start, view.max_y)
+        (start, max)
     } else {
-        let start = (view.min_y / step).ceil() * step;
-        (start, view.max_y + step * 0.01)
+        let start = (min / step).ceil() * step;
+        (start, max + step * 0.01)
     };
 
     let mut v = start;
@@ -177,7 +179,7 @@ fn format_time_label(t_us: i64, ref_us: i64) -> String {
     format!("{}", dur)
 }
 
-fn format_value_label(v: f64) -> String {
+pub(crate) fn format_value_label(v: f64) -> String {
     if v == 0.0 {
         return "0".to_string();
     }
@@ -193,19 +195,19 @@ fn format_value_label(v: f64) -> String {
     }
 }
 
-const Y_LABEL_WIDTH: f32 = 50.0;
-const X_LABEL_HEIGHT: f32 = 10.0;
-const PADDING: f32 = 8.0;
-const LABEL_FONT_SIZE: f32 = 11.0;
+pub(crate) const Y_LABEL_WIDTH: f32 = 50.0;
+pub(crate) const X_LABEL_HEIGHT: f32 = 10.0;
+pub(crate) const PADDING: f32 = 8.0;
+pub(crate) const LABEL_FONT_SIZE: f32 = 11.0;
 
 #[derive(Clone, Copy, PartialEq)]
-enum AxisZone {
+pub(crate) enum AxisZone {
     Plot,
     XAxis,
     YAxis,
 }
 
-fn axis_zone(pos: Point<Pixels>, plot_area: Bounds<Pixels>) -> AxisZone {
+pub(crate) fn axis_zone(pos: Point<Pixels>, plot_area: Bounds<Pixels>) -> AxisZone {
     let below_plot = pos.y > plot_area.origin.y + plot_area.size.height;
     let left_of_plot = pos.x < plot_area.origin.x;
     if left_of_plot {
@@ -217,7 +219,7 @@ fn axis_zone(pos: Point<Pixels>, plot_area: Bounds<Pixels>) -> AxisZone {
     }
 }
 
-fn plot_area(outer: Bounds<Pixels>) -> Bounds<Pixels> {
+pub(crate) fn plot_area(outer: Bounds<Pixels>) -> Bounds<Pixels> {
     Bounds {
         origin: point(
             outer.origin.x + px(Y_LABEL_WIDTH + PADDING),
@@ -252,10 +254,13 @@ pub type NodeBoundsCache = HashMap<usize, NodeBounds>;
 /// `component.time_series`, reusing `cache` so only new head-node samples
 /// are scanned.
 ///
+/// Used for both Y-axis bound tracking on time-series plots and per-axis
+/// bound tracking on XY plots (called twice — once per axis component).
+///
 /// The inner loop dispatches on `PrimType` once per node and reads values
 /// straight from the memory-mapped byte buffer, avoiding any per-sample
 /// `ComponentView`, `ElementValue`, or `Result` allocation in the hot path.
-pub fn expand_y_bounds(
+pub fn expand_value_bounds(
     component: &Component,
     indexes: &[usize],
     cache: &mut NodeBoundsCache,
@@ -385,7 +390,7 @@ fn paint_underlay(
     let pb = plot_area(outer_bounds);
     let theme = crate::theme::theme(cx);
 
-    for tick in y_ticks(&view, 5) {
+    for tick in value_ticks(view.min_y, view.max_y, 5) {
         let y = view.to_screen(pb, view.min_x, tick).y;
         if y < pb.origin.y || y > pb.origin.y + pb.size.height {
             continue;
@@ -472,7 +477,7 @@ fn paint_overlay(
     window.paint_quad(gpui::fill(x_axis_bg, axis_bg));
 
     let t_min_i = data_start as i64;
-    for tick in y_ticks(&view, 5) {
+    for tick in value_ticks(view.min_y, view.max_y, 5) {
         let y = view.to_screen(pb, view.min_x, tick).y;
         if y < pb.origin.y || y > pb.origin.y + pb.size.height {
             continue;

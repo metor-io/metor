@@ -82,6 +82,7 @@ pub struct TimestampRef {
     index: usize,
 }
 
+#[derive(Clone)]
 pub struct TimeSeriesNodeSlice {
     node: Arc<AtomicNode<TimeSeriesNode>>,
     range: RangeInclusive<usize>,
@@ -238,6 +239,23 @@ impl TimeSeries {
             .iter()
             .filter_map(|node| node.timestamps().first().copied())
             .min()
+    }
+
+    /// Iterate every node as a [`TimeSeriesNodeSlice`] covering its full
+    /// extent. Newest-first, matching [`Self::list`]'s iter; empty nodes
+    /// are skipped. Use this when consumers want to walk the entire
+    /// component (e.g., XY plot pairing) without a time-range cull.
+    pub fn iter_node_slices(&self) -> impl Iterator<Item = TimeSeriesNodeSlice> + '_ {
+        self.list.iter().filter_map(|node| {
+            let len = node.timestamps().len();
+            if len == 0 {
+                return None;
+            }
+            Some(TimeSeriesNodeSlice {
+                range: 0..=len - 1,
+                node,
+            })
+        })
     }
 
     pub fn get(&self, timestamp: Timestamp) -> Option<TimestampRef> {
