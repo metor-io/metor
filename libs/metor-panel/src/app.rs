@@ -62,6 +62,7 @@ impl AppRoot {
             on_open_inspector,
             cx,
         );
+        crate::node_editor::palette_provider::register(tiles.clone(), cx);
         Self {
             db,
             tiles,
@@ -446,6 +447,11 @@ fn register_pane_item_deserializers(db: Arc<DB>, cx: &mut App) {
         &mut reg,
         db.clone(),
         TrafficLightGridPanel::from_config,
+    );
+    register_panel::<crate::node_editor::pane::NodeEditor>(
+        &mut reg,
+        db.clone(),
+        crate::node_editor::pane::NodeEditor::from_config,
     );
 
     // Dashboard's deserializer returns a fully-constructed entity rather

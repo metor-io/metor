@@ -15,6 +15,8 @@
 pub mod config;
 pub mod coordinator;
 pub mod graph;
+pub mod pane;
+pub mod palette_provider;
 pub mod registry;
 pub mod spec;
 pub mod validate;
@@ -24,6 +26,7 @@ mod tests;
 
 pub use config::{NodeEditorConfig, SerializedEdge, SerializedNode, Viewport};
 pub use coordinator::{GraphCoordinator, OwnerId};
+pub use pane::{ActiveNodeEditor, DeleteSelected, NodeEditor};
 pub use graph::{BuildState, EdgeEntry, FlowId, NodeEntry, NodeGraph, Position};
 pub use registry::{Arity, OpDescriptor, SocketKind, descriptor, descriptor_for};
 pub use spec::{NodeSpec, NodeSpecKind, build, compute_node_id};
