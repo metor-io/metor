@@ -327,6 +327,46 @@ pub fn expand_value_bounds(
     seen.then_some((agg_min, agg_max))
 }
 
+/// `(min, max)` across all elements of the latest sample, treating the
+/// sample as a flat vector of length `len`.
+///
+/// Differs from [`expand_value_bounds`]: that scans across many samples
+/// for one element index; this scans across many element indices for one
+/// sample. Used by list plots, which redraw fully whenever a new sample
+/// arrives — there is no cross-tick caching opportunity.
+pub fn expand_latest_sample_bounds(component: &Component, len: usize) -> Option<(f64, f64)> {
+    if len == 0 {
+        return None;
+    }
+    let schema = &component.schema;
+    let prim_size = schema.prim_type.size();
+    if prim_size == 0 {
+        return None;
+    }
+    let latest = component.time_series.latest()?;
+    let sample = latest.data();
+    if sample.len() < len * prim_size {
+        return None;
+    }
+    let mut offsets: smallvec::SmallVec<[usize; 16]> = smallvec::SmallVec::with_capacity(len);
+    for i in 0..len {
+        offsets.push(i * prim_size);
+    }
+    // `scan_min_max` chunks `data` by `sample_size` — pass a slice of one
+    // sample so it iterates exactly once and inspects every offset.
+    let (min, max) = scan_min_max_dispatch(
+        schema.prim_type,
+        &sample[..len * prim_size],
+        len * prim_size,
+        &offsets,
+    );
+    if min.is_finite() && max.is_finite() {
+        Some((min, max))
+    } else {
+        None
+    }
+}
+
 fn scan_min_max_dispatch(
     prim: PrimType,
     data: &[u8],

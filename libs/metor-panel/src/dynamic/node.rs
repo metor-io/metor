@@ -292,6 +292,8 @@ pub mod op_tag {
     pub const ABS: &[u8] = b"derive.abs";
     pub const NEG: &[u8] = b"derive.neg";
     pub const LOG: &[u8] = b"derive.log";
+    pub const WINDOW: &[u8] = b"derive.window";
+    pub const FFT: &[u8] = b"derive.fft";
     pub const ADD: &[u8] = b"compose.add";
     pub const SUB: &[u8] = b"compose.sub";
     pub const MUL: &[u8] = b"compose.mul";

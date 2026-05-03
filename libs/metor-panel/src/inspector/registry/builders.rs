@@ -253,3 +253,39 @@ pub(super) fn build_xy_trace_add_wizard(
         on_select,
     )
 }
+
+/// List-plot counterpart to [`build_trace_add_wizard`]. Drills through
+/// the single-page picker and appends the resulting trace to the parent
+/// `ListLinePlot`.
+pub(super) fn build_list_trace_add_wizard(
+    parent: gpui::AnyEntity,
+    db: &Arc<DB>,
+    _cx: &App,
+) -> Vec<Box<dyn InspectorRow>> {
+    use crate::views::list_plot::ListLinePlot;
+    let parent_for_basis = parent.clone();
+    let color_basis: crate::inspector::trace_picker::ColorBasis = Arc::new(move |cx: &App| {
+        parent_for_basis
+            .clone()
+            .downcast::<ListLinePlot>()
+            .map(|p| p.read(cx).traces.len())
+            .unwrap_or(0)
+    });
+
+    let on_select: crate::views::list_plot::trace_picker::OnListTraceSelected =
+        Arc::new(move |trace, _w, cx| {
+            let parent: Entity<ListLinePlot> =
+                parent.clone().downcast().expect("parent type mismatch");
+            let new_entity = cx.new(|_| trace);
+            parent.update(cx, |lp, cx| {
+                lp.traces.push(new_entity);
+                cx.notify();
+            });
+        });
+
+    crate::views::list_plot::trace_picker::select_list_trace_wizard_rows(
+        db.clone(),
+        color_basis,
+        on_select,
+    )
+}

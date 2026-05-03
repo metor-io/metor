@@ -153,6 +153,18 @@ pub const ALL: &[OpDescriptor] = &[
         default_spec: || NodeSpec::Log,
         arg_count: 0,
     },
+    OpDescriptor {
+        kind: NodeSpecKind::Window, label: "Window", category: "Derive",
+        inputs: ONE_F64, output: VAL,
+        default_spec: || NodeSpec::Window { size: 64 },
+        arg_count: 1,
+    },
+    OpDescriptor {
+        kind: NodeSpecKind::Fft, label: "FFT", category: "Derive",
+        inputs: ONE_VALUE, output: VAL,
+        default_spec: || NodeSpec::Fft,
+        arg_count: 0,
+    },
     // Compose
     OpDescriptor {
         kind: NodeSpecKind::Add, label: "Add", category: "Compose",

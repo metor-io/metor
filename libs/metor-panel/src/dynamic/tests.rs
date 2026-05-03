@@ -1,3 +1,4 @@
+use std::sync::Arc;
 use std::time::Duration;
 
 use crate::dynamic::node::{DynamicNodeExt, ValueType};
@@ -89,6 +90,204 @@ async fn compose_add_is_co_clocked() {
     for (_, v) in &samples {
         assert!((v - 7.0).abs() < 1e-12);
     }
+}
+
+#[stellarator::test]
+async fn window_buffers_recent_samples() {
+    use crate::dynamic::node::DynamicNodeExt;
+    let clock = ops::clock::fixed_rate(200.0).unwrap();
+    let sin = ops::generators::waveform(
+        clock,
+        ops::generators::Waveform::Sin,
+        1.0,
+        1.0,
+        0.0,
+    )
+    .unwrap();
+    // Subscribe to the input *before* building the window so both readers
+    // start at the same head of the disruptor.
+    let mut sin_reader = sin.subscribe();
+    const N: usize = 4;
+    let win = ops::derive::window(sin, N).unwrap();
+
+    // Schema must be `[N]` of f64; sample bytes are `N * 8`.
+    let schema = match win.value_type() {
+        ValueType::Value(s) => s,
+        _ => panic!("window must produce a value"),
+    };
+    assert_eq!(schema.dim.as_slice(), &[N]);
+    assert_eq!(schema.size(), N * 8);
+
+    let mut win_reader = win.subscribe();
+    const TOTAL: usize = 8;
+    let mut sin_vals: Vec<f64> = Vec::with_capacity(TOTAL);
+    let mut win_emits: Vec<[f64; N]> = Vec::with_capacity(TOTAL);
+    while sin_vals.len() < TOTAL || win_emits.len() < TOTAL {
+        if sin_vals.len() < TOTAL {
+            let grant = sin_reader.next().await;
+            for (_ts, v) in grant.samples() {
+                if v.len() != 8 {
+                    continue;
+                }
+                sin_vals.push(f64::from_le_bytes(v.try_into().unwrap()));
+                if sin_vals.len() == TOTAL {
+                    break;
+                }
+            }
+        }
+        if win_emits.len() < TOTAL {
+            let grant = win_reader.next().await;
+            for (_ts, v) in grant.samples() {
+                if v.len() != N * 8 {
+                    continue;
+                }
+                let mut row = [0.0_f64; N];
+                for (k, chunk) in v.chunks_exact(8).enumerate() {
+                    row[k] = f64::from_le_bytes(chunk.try_into().unwrap());
+                }
+                win_emits.push(row);
+                if win_emits.len() == TOTAL {
+                    break;
+                }
+            }
+        }
+    }
+
+    // Index 0 = oldest, index N-1 = newest. For emit i, buf[k] is the
+    // input value `(N-1-k)` ticks ago, or 0.0 if that tick predates the
+    // start (the buffer is preloaded with zeros).
+    #[allow(clippy::needless_range_loop)]
+    for i in 0..TOTAL {
+        for k in 0..N {
+            let lag = N - 1 - k;
+            let expected = if i >= lag { sin_vals[i - lag] } else { 0.0 };
+            assert!(
+                (win_emits[i][k] - expected).abs() < 1e-12,
+                "emit {i}, slot {k}: got {}, expected {expected}",
+                win_emits[i][k],
+            );
+        }
+    }
+}
+
+#[stellarator::test]
+async fn window_rejects_zero_size() {
+    let clock = ops::clock::fixed_rate(100.0).unwrap();
+    let src = ops::generators::constant(clock, 1.0).unwrap();
+    let err = match ops::derive::window(src, 0) {
+        Ok(_) => panic!("size=0 must be rejected"),
+        Err(e) => e,
+    };
+    assert!(matches!(
+        err,
+        crate::dynamic::BuildError::InvalidArg { op: "window", .. }
+    ));
+}
+
+#[stellarator::test]
+async fn fft_dc_input_concentrates_in_bin_zero() {
+    use crate::dynamic::node::DynamicNodeExt;
+    let clock = ops::clock::fixed_rate(200.0).unwrap();
+    const N: usize = 8;
+    // Pack N co-clocked constants of value 1.0 into [1, 1, ..., 1].
+    let inputs: Vec<_> = (0..N)
+        .map(|_| ops::generators::constant(clock.clone(), 1.0).unwrap())
+        .collect();
+    let packed = ops::compose::pack(inputs).unwrap();
+    let fft = ops::derive::fft(packed).unwrap();
+
+    // Output schema: N/2 + 1 magnitude bins.
+    let schema = match fft.value_type() {
+        ValueType::Value(s) => s,
+        _ => panic!("fft must produce a value"),
+    };
+    let out_len = N / 2 + 1;
+    assert_eq!(schema.dim.as_slice(), &[out_len]);
+
+    let mut reader = fft.subscribe();
+    let mut got = 0;
+    while got < 4 {
+        let grant = reader.next().await;
+        for (_ts, value) in grant.samples() {
+            if value.len() != out_len * 8 {
+                continue;
+            }
+            let bins: Vec<f64> = value
+                .chunks_exact(8)
+                .map(|c| f64::from_le_bytes(c.try_into().unwrap()))
+                .collect();
+            // All-ones input: bin 0 = N, all other bins = 0.
+            assert!(
+                (bins[0] - N as f64).abs() < 1e-9,
+                "bin 0: got {}, expected {}",
+                bins[0],
+                N
+            );
+            for (k, m) in bins.iter().enumerate().skip(1) {
+                assert!(m.abs() < 1e-9, "bin {k}: expected 0, got {m}");
+            }
+            got += 1;
+            if got == 4 {
+                break;
+            }
+        }
+    }
+}
+
+#[stellarator::test]
+async fn fft_impulse_has_flat_magnitude() {
+    use crate::dynamic::node::DynamicNodeExt;
+    let clock = ops::clock::fixed_rate(200.0).unwrap();
+    const N: usize = 8;
+    // Pack [1, 0, 0, 0, 0, 0, 0, 0] — a unit impulse.
+    let mut inputs: Vec<Arc<dyn crate::dynamic::DynamicNode>> = Vec::with_capacity(N);
+    inputs.push(ops::generators::constant(clock.clone(), 1.0).unwrap());
+    for _ in 1..N {
+        inputs.push(ops::generators::constant(clock.clone(), 0.0).unwrap());
+    }
+    let packed = ops::compose::pack(inputs).unwrap();
+    let fft = ops::derive::fft(packed).unwrap();
+
+    let mut reader = fft.subscribe();
+    let out_len = N / 2 + 1;
+    let mut got = 0;
+    while got < 4 {
+        let grant = reader.next().await;
+        for (_ts, value) in grant.samples() {
+            if value.len() != out_len * 8 {
+                continue;
+            }
+            let bins: Vec<f64> = value
+                .chunks_exact(8)
+                .map(|c| f64::from_le_bytes(c.try_into().unwrap()))
+                .collect();
+            // Impulse → flat magnitude spectrum, every bin = 1.
+            for (k, m) in bins.iter().enumerate() {
+                assert!(
+                    (m - 1.0).abs() < 1e-9,
+                    "bin {k}: expected 1.0, got {m}"
+                );
+            }
+            got += 1;
+            if got == 4 {
+                break;
+            }
+        }
+    }
+}
+
+#[stellarator::test]
+async fn fft_rejects_scalar_input() {
+    let clock = ops::clock::fixed_rate(100.0).unwrap();
+    let scalar = ops::generators::constant(clock, 1.0).unwrap();
+    let err = match ops::derive::fft(scalar) {
+        Ok(_) => panic!("scalar input must be rejected"),
+        Err(e) => e,
+    };
+    assert!(matches!(
+        err,
+        crate::dynamic::BuildError::InvalidArg { op: "fft", .. }
+    ));
 }
 
 #[stellarator::test]

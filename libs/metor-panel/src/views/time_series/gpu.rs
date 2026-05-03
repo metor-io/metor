@@ -56,6 +56,11 @@ const MAX_TRACES: usize = 64;
 /// scales nanoseconds to seconds so f32 storage retains precision over
 /// long durations. `Element` reads one element of one component schema's
 /// raw byte buffer at its native scale.
+///
+/// `LatestSampleIndex` and `LatestSampleElements` source from the *interior*
+/// of one sample (the latest), iterating across element offsets within that
+/// single sample rather than walking the time-series. Used by list plots to
+/// render an FFT-style vector as index-vs-value.
 #[derive(Clone, Copy)]
 pub(crate) enum AxisSource<'a> {
     Timestamps,
@@ -63,6 +68,14 @@ pub(crate) enum AxisSource<'a> {
         component_id: ComponentId,
         component: &'a Component,
         element_index: usize,
+    },
+    LatestSampleIndex {
+        len: usize,
+    },
+    LatestSampleElements {
+        component_id: ComponentId,
+        component: &'a Component,
+        len: usize,
     },
 }
 
@@ -73,14 +86,17 @@ impl<'a> AxisSource<'a> {
     fn scale(&self) -> f64 {
         match self {
             AxisSource::Timestamps => 1.0 / NS_PER_SEC,
-            AxisSource::Element { .. } => 1.0,
+            AxisSource::Element { .. }
+            | AxisSource::LatestSampleIndex { .. }
+            | AxisSource::LatestSampleElements { .. } => 1.0,
         }
     }
 
     fn component(&self) -> Option<&'a Component> {
         match self {
-            AxisSource::Timestamps => None,
-            AxisSource::Element { component, .. } => Some(component),
+            AxisSource::Timestamps | AxisSource::LatestSampleIndex { .. } => None,
+            AxisSource::Element { component, .. }
+            | AxisSource::LatestSampleElements { component, .. } => Some(component),
         }
     }
 }
@@ -890,6 +906,33 @@ fn plan_trace(
         return TracePlan { spans };
     }
 
+    // List-plot path: read one latest sample's vector elements rather
+    // than walking nodes over time. Bypasses the NodePair pipeline since
+    // the source byte layout is a single sample of `len * prim_size`
+    // bytes — striding by element offset, not sample offset.
+    if let (
+        AxisSource::LatestSampleIndex { len: x_len },
+        AxisSource::LatestSampleElements {
+            component, len: y_len, ..
+        },
+    ) = (&trace.x, &trace.y)
+    {
+        let len = (*x_len).min(*y_len);
+        return plan_list_trace(
+            ctx,
+            cache,
+            upload_x,
+            upload_y,
+            idx_scratch,
+            x_buf,
+            y_buf,
+            component,
+            len,
+            trace.style,
+            pixel_budget,
+        );
+    }
+
     // Build the per-axis node lists. Time-series uses time-range culling
     // on the Y axis's component; XY pairs nodes by stack index across two
     // components.
@@ -1130,6 +1173,10 @@ fn first_axis_value(
             let src = (lod_start * lod_stride).min(max_sample - 1);
             read_element_f64(schema, data, src, *element_index)
         }
+        // List-plot axes are dispatched ahead of `upload_pair`; this arm
+        // is only reached if a future caller mixes them with node-walk
+        // axes, in which case zero is a safe placeholder.
+        AxisSource::LatestSampleIndex { .. } | AxisSource::LatestSampleElements { .. } => None,
     }
 }
 
@@ -1182,6 +1229,14 @@ fn materialize_axis(
                 scale,
                 out,
             );
+        }
+        // List-plot axes are handled directly by `plan_list_trace` and
+        // never routed through `materialize_axis`; fill with zeros if
+        // somehow reached so the GPU buffer stays well-defined.
+        AxisSource::LatestSampleIndex { .. } | AxisSource::LatestSampleElements { .. } => {
+            for _ in lod_start..lod_end {
+                out.push(0.0);
+            }
         }
     }
 }
@@ -1436,5 +1491,155 @@ fn convert_element_strided(
             scale,
             out,
         ),
+    }
+}
+
+/// Plan one list-plot trace from the component's latest sample.
+///
+/// Reads `component.time_series.latest()` once, decimates the resulting
+/// vector to `pixel_budget`, uploads `(index, value)` pairs and emits a
+/// single draw span. Skipped silently when the component has no samples
+/// yet — the legend/auto-fit path will simply not see this trace.
+#[allow(clippy::too_many_arguments)]
+fn plan_list_trace(
+    ctx: &GpuContext,
+    cache: &mut ValueCache,
+    upload_x: &mut Vec<f32>,
+    upload_y: &mut Vec<f32>,
+    idx_scratch: &mut Vec<u32>,
+    x_buf: &wgpu::Buffer,
+    y_buf: &wgpu::Buffer,
+    component: &Component,
+    len: usize,
+    style: PlotStyle,
+    pixel_budget: usize,
+) -> TracePlan {
+    let mut spans = Vec::new();
+    if len == 0 || pixel_budget == 0 {
+        return TracePlan { spans };
+    }
+    let Some(latest) = component.time_series.latest() else {
+        return TracePlan { spans };
+    };
+    let sample_bytes = latest.data();
+    let schema = &component.schema;
+    let prim_size = schema.prim_type.size();
+    if prim_size == 0 || sample_bytes.len() < len * prim_size {
+        return TracePlan { spans };
+    }
+
+    let stride = node_stride(len, len, pixel_budget).unwrap_or(1);
+    let upload_stride = quantize_stride(stride);
+    let count = len.div_ceil(upload_stride);
+    let count_u32 = count as u32;
+    if count_u32 == 0 {
+        return TracePlan { spans };
+    }
+    if cache
+        .cursor
+        .checked_add(count_u32)
+        .is_none_or(|n| n > VALUE_CAPACITY)
+    {
+        return TracePlan { spans };
+    }
+
+    // X is the integer index sequence — no epoch needed since the range
+    // is small (0..len).
+    if cache.epoch_x.is_none() {
+        cache.epoch_x = Some(0.0);
+    }
+    upload_x.clear();
+    upload_x.reserve(count);
+    for i in 0..count {
+        upload_x.push((i * upload_stride) as f32);
+    }
+
+    upload_y.clear();
+    upload_y.reserve(count);
+    convert_latest_sample_strided(
+        schema.prim_type,
+        sample_bytes,
+        len,
+        upload_stride,
+        prim_size,
+        upload_y,
+    );
+
+    let byte_offset = cache.cursor as u64 * 4;
+    ctx.queue
+        .write_buffer(x_buf, byte_offset, bytemuck::cast_slice(upload_x));
+    ctx.queue
+        .write_buffer(y_buf, byte_offset, bytemuck::cast_slice(upload_y));
+    let chunk_offset = cache.cursor;
+    cache.cursor += count_u32;
+
+    let is_line = matches!(style, PlotStyle::Line);
+    let span_first = idx_scratch.len() as u32;
+    for j in 0..count_u32 {
+        idx_scratch.push(chunk_offset + j);
+    }
+    let min_for_draw = if is_line { 2u32 } else { 1 };
+    if count_u32 >= min_for_draw {
+        let instance_end = if is_line {
+            span_first + count_u32 - 1
+        } else {
+            span_first + count_u32
+        };
+        spans.push(DrawSpan {
+            instance_start: span_first,
+            instance_end,
+        });
+    } else {
+        idx_scratch.truncate(span_first as usize);
+    }
+
+    TracePlan { spans }
+}
+
+/// Read every `lod_stride`-th element from a single sample's byte buffer
+/// into `out` as `f32`. Sibling to [`convert_element_strided`], but the
+/// stride moves through *element* offsets within one sample rather than
+/// across samples.
+fn convert_latest_sample_strided(
+    prim: PrimType,
+    sample_bytes: &[u8],
+    len: usize,
+    lod_stride: usize,
+    prim_size: usize,
+    out: &mut Vec<f32>,
+) {
+    fn fill<T: PlotValue>(
+        data: &[u8],
+        len: usize,
+        lod_stride: usize,
+        prim_size: usize,
+        out: &mut Vec<f32>,
+    ) {
+        let stride = lod_stride.max(1);
+        let mut i = 0;
+        while i < len {
+            let offset = i * prim_size;
+            let v = data
+                .get(offset..offset + size_of::<T>())
+                .and_then(|b| T::read_from_bytes(b).ok())
+                .map(|v| v.to_f64())
+                .unwrap_or(0.0);
+            out.push(v as f32);
+            i += stride;
+        }
+    }
+    match prim {
+        PrimType::F64 => fill::<f64>(sample_bytes, len, lod_stride, prim_size, out),
+        PrimType::F32 => fill::<f32>(sample_bytes, len, lod_stride, prim_size, out),
+        PrimType::I64 => fill::<i64>(sample_bytes, len, lod_stride, prim_size, out),
+        PrimType::I32 => fill::<i32>(sample_bytes, len, lod_stride, prim_size, out),
+        PrimType::I16 => fill::<i16>(sample_bytes, len, lod_stride, prim_size, out),
+        PrimType::I8 => fill::<i8>(sample_bytes, len, lod_stride, prim_size, out),
+        PrimType::U64 => fill::<u64>(sample_bytes, len, lod_stride, prim_size, out),
+        PrimType::U32 => fill::<u32>(sample_bytes, len, lod_stride, prim_size, out),
+        PrimType::U16 => fill::<u16>(sample_bytes, len, lod_stride, prim_size, out),
+        PrimType::U8 | PrimType::Bool => {
+            fill::<u8>(sample_bytes, len, lod_stride, prim_size, out)
+        }
     }
 }

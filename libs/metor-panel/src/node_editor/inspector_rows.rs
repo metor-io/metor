@@ -469,11 +469,26 @@ pub fn rows_for_node(
                 },
             ));
         }
+        NodeSpec::Window { size } => {
+            rows.push(scalar_arg(
+                "Window Size (N)",
+                *size as f64,
+                editor.clone(),
+                graph.clone(),
+                flow_id.clone(),
+                |spec, v| {
+                    if let NodeSpec::Window { size } = spec {
+                        *size = (v as usize).max(1);
+                    }
+                },
+            ));
+        }
         // No editable args.
         NodeSpec::ClockOf
         | NodeSpec::Abs
         | NodeSpec::Neg
         | NodeSpec::Log
+        | NodeSpec::Fft
         | NodeSpec::Add
         | NodeSpec::Sub
         | NodeSpec::Mul

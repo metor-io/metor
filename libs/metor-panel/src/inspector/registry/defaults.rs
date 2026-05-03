@@ -17,6 +17,7 @@ use crate::inspector::rows::{
 use crate::views::time_series::time_range::TimeRangeBehavior;
 use crate::views::time_series::{LinePlot, Override, Trace};
 use crate::views::viewer_3d::Viewer3d;
+use crate::views::list_plot::{ListLinePlot, ListTrace};
 use crate::views::xy_plot::{XyLinePlot, XyTrace};
 
 use super::{AddBehavior, FieldOverride, InspectorRegistry, builders};
@@ -83,6 +84,28 @@ impl InspectorRegistry {
             |lp| &mut lp.traces,
             AddBehavior::Wizard(Arc::new(|parent, db, cx| {
                 builders::build_xy_trace_add_wizard(parent, db, cx)
+            })),
+        );
+        self.register_field_override::<crate::views::list_plot::ListTrace>(
+            "stroke_width",
+            FieldOverride {
+                range: Some((0.5, 10.0)),
+                ..FieldOverride::default()
+            },
+        );
+        self.register_field_override::<crate::views::list_plot::ListTrace>(
+            "style",
+            FieldOverride {
+                enum_allowed: Some(&["Line", "Scatter"]),
+                ..FieldOverride::default()
+            },
+        );
+        self.register_entity_list::<ListLinePlot, ListTrace>(
+            db.clone(),
+            |lp| &lp.traces,
+            |lp| &mut lp.traces,
+            AddBehavior::Wizard(Arc::new(|parent, db, cx| {
+                builders::build_list_trace_add_wizard(parent, db, cx)
             })),
         );
     }

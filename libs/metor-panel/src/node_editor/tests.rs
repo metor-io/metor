@@ -128,6 +128,28 @@ async fn abs_neg_log_ids_match() {
 }
 
 #[stellarator::test]
+async fn window_id_matches() {
+    let clock = ops::clock::fixed_rate(100.0).unwrap();
+    let src = ops::generators::constant(clock, 1.0).unwrap();
+    let src_id = src.id();
+    let built = ops::derive::window(src, 16).unwrap();
+    assert_eq!(
+        built.id(),
+        compute_node_id(&NodeSpec::Window { size: 16 }, &[src_id]),
+    );
+}
+
+#[stellarator::test]
+async fn fft_id_matches() {
+    let clock = ops::clock::fixed_rate(100.0).unwrap();
+    let scalar = ops::generators::constant(clock, 1.0).unwrap();
+    let packed = ops::compose::pack(vec![scalar.clone(), scalar]).unwrap();
+    let packed_id = packed.id();
+    let built = ops::derive::fft(packed).unwrap();
+    assert_eq!(built.id(), compute_node_id(&NodeSpec::Fft, &[packed_id]));
+}
+
+#[stellarator::test]
 async fn add_sub_mul_ids_match() {
     let clock = ops::clock::fixed_rate(100.0).unwrap();
     let a = ops::generators::constant(clock.clone(), 1.0).unwrap();

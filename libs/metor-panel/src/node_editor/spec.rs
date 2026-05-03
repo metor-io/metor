@@ -34,6 +34,8 @@ pub enum NodeSpec {
     Abs,
     Neg,
     Log,
+    Window { size: usize },
+    Fft,
     Add,
     Sub,
     Mul,
@@ -51,7 +53,7 @@ pub enum NodeSpec {
 pub enum NodeSpecKind {
     FixedRate, ClockOf,
     Waveform, Random, Constant,
-    Scale, Offset, Abs, Neg, Log,
+    Scale, Offset, Abs, Neg, Log, Window, Fft,
     Add, Sub, Mul, Mean, Pack,
     Zoh, Linear, LatestAt,
     FromDb, Persist,
@@ -71,6 +73,8 @@ impl NodeSpec {
             Abs => NodeSpecKind::Abs,
             Neg => NodeSpecKind::Neg,
             Log => NodeSpecKind::Log,
+            Window { .. } => NodeSpecKind::Window,
+            Fft => NodeSpecKind::Fft,
             Add => NodeSpecKind::Add,
             Sub => NodeSpecKind::Sub,
             Mul => NodeSpecKind::Mul,
@@ -97,6 +101,8 @@ impl NodeSpec {
             Abs => op_tag::ABS,
             Neg => op_tag::NEG,
             Log => op_tag::LOG,
+            Window { .. } => op_tag::WINDOW,
+            Fft => op_tag::FFT,
             Add => op_tag::ADD,
             Sub => op_tag::SUB,
             Mul => op_tag::MUL,
@@ -134,7 +140,10 @@ impl NodeSpec {
             Scale { k } | Offset { k } => {
                 k.to_bits().hash(h);
             }
-            Abs | Neg | Log => {}
+            Abs | Neg | Log | Fft => {}
+            Window { size } => {
+                size.hash(h);
+            }
             Add | Sub | Mul | Mean | Pack => {}
             Zoh | Linear | LatestAt => {}
             FromDb { component_id } => {
@@ -220,6 +229,8 @@ pub fn build(
         Abs => ops::derive::abs(p1("abs", parents)?),
         Neg => ops::derive::neg(p1("neg", parents)?),
         Log => ops::derive::log(p1("log", parents)?),
+        Window { size } => ops::derive::window(p1("window", parents)?, *size),
+        Fft => ops::derive::fft(p1("fft", parents)?),
         Add => {
             let (a, b) = p2("add", parents)?;
             ops::compose::add(a, b)

@@ -11,6 +11,7 @@ use crate::inspector::{InspectorMode, InspectorRequest, OpenInspectorCallback};
 use crate::views::dashboard::DashboardPanel;
 use crate::views::time_series::{LinePlot, Override, PlotStyle, Trace};
 use crate::views::viewer_3d::Viewer3d;
+use crate::views::list_plot::{ListLinePlot, ListPlot, ListTrace};
 use crate::views::xy_plot::{XyLinePlot, XyPlot, XyTrace};
 use crate::views::{
     ComponentBrowser, ComponentTable, ComponentText, DataTable, TimeSeriesPlot, TrafficLight,
@@ -684,6 +685,152 @@ impl PaneItem for XyPlotPanel {
     }
 }
 
+/// Pane item hosting a list plot (index-vs-value of one component's
+/// latest sample). Mirrors [`XyPlotPanel`] in shape; the inner
+/// [`ListLinePlot`] owns trace state and is what the inspector edits.
+pub struct ListPlotPanel {
+    inner: Entity<ListPlot>,
+    line_plot: Entity<ListLinePlot>,
+}
+
+impl ListPlotPanel {
+    pub fn empty(db: Arc<DB>, cx: &mut Context<Self>) -> Self {
+        Self::with_traces(db, vec![], cx)
+    }
+
+    pub fn with_traces(db: Arc<DB>, traces: Vec<ListTrace>, cx: &mut Context<Self>) -> Self {
+        let inner = cx.new(|cx| ListPlot::new(db, traces, cx));
+        let line_plot = inner.read(cx).line_plot().clone();
+        Self { inner, line_plot }
+    }
+
+    pub(crate) fn inner(&self) -> &Entity<ListPlot> {
+        &self.inner
+    }
+}
+
+impl Render for ListPlotPanel {
+    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+        div().size_full().child(self.inner.clone())
+    }
+}
+
+/// Persisted shape of a [`ListPlotPanel`].
+#[derive(facet::Facet, Default)]
+pub struct ListPlotPanelConfig {
+    pub label: String,
+    pub traces: Vec<ListTraceConfig>,
+    pub custom_title: Override<String>,
+    pub x_min_override: Override<f64>,
+    pub x_max_override: Override<f64>,
+    pub y_min_override: Override<f64>,
+    pub y_max_override: Override<f64>,
+}
+
+/// Persisted shape of one [`ListTrace`].
+#[derive(facet::Facet, Clone)]
+pub struct ListTraceConfig {
+    pub component_id: ComponentId,
+    pub len: usize,
+    pub color: Hsla,
+    pub style: PlotStyle,
+    pub visible: bool,
+    pub label: String,
+    pub stroke_width: f32,
+}
+
+impl Default for ListTraceConfig {
+    fn default() -> Self {
+        Self {
+            component_id: ComponentId(0),
+            len: 0,
+            color: Hsla::default(),
+            style: PlotStyle::default(),
+            visible: true,
+            label: String::new(),
+            stroke_width: 1.5,
+        }
+    }
+}
+
+impl From<&ListTrace> for ListTraceConfig {
+    fn from(t: &ListTrace) -> Self {
+        Self {
+            component_id: t.component_id,
+            len: t.len,
+            color: t.color,
+            style: t.style,
+            visible: t.visible,
+            label: t.label.to_string(),
+            stroke_width: t.stroke_width,
+        }
+    }
+}
+
+impl From<ListTraceConfig> for ListTrace {
+    fn from(t: ListTraceConfig) -> Self {
+        Self {
+            component_id: t.component_id,
+            len: t.len,
+            color: t.color,
+            style: t.style,
+            visible: t.visible,
+            label: t.label.into(),
+            stroke_width: t.stroke_width,
+        }
+    }
+}
+
+impl ListPlotPanel {
+    pub fn from_config(cfg: ListPlotPanelConfig, db: Arc<DB>, cx: &mut Context<Self>) -> Self {
+        let traces: Vec<ListTrace> = cfg.traces.into_iter().map(ListTrace::from).collect();
+        let panel = Self::with_traces(db, traces, cx);
+        let line_plot = panel.line_plot.clone();
+        line_plot.update(cx, |lp, cx| {
+            lp.custom_title = cfg.custom_title.map(SharedString::from);
+            lp.x_min_override = cfg.x_min_override;
+            lp.x_max_override = cfg.x_max_override;
+            lp.y_min_override = cfg.y_min_override;
+            lp.y_max_override = cfg.y_max_override;
+            cx.notify();
+        });
+        panel
+    }
+}
+
+impl PaneItem for ListPlotPanel {
+    type Config = ListPlotPanelConfig;
+
+    fn tab_title(&self, cx: &App) -> SharedString {
+        self.inner.read(cx).title(cx)
+    }
+
+    fn serialization_key() -> &'static str {
+        "list_plot"
+    }
+
+    fn to_config(&self, cx: &App) -> ListPlotPanelConfig {
+        let lp = self.line_plot.read(cx);
+        ListPlotPanelConfig {
+            label: self.tab_title(cx).to_string(),
+            traces: lp
+                .traces()
+                .iter()
+                .map(|e| ListTraceConfig::from(e.read(cx)))
+                .collect(),
+            custom_title: lp.custom_title.as_ref().map(|s| s.to_string()),
+            x_min_override: lp.x_min_override.clone(),
+            x_max_override: lp.x_max_override.clone(),
+            y_min_override: lp.y_min_override.clone(),
+            y_max_override: lp.y_max_override.clone(),
+        }
+    }
+
+    fn inspectable_entity(&self) -> Option<gpui::AnyEntity> {
+        Some(self.line_plot.clone().into_any())
+    }
+}
+
 /// Persisted shape of a [`Viewer3dPanel`].
 #[derive(facet::Facet, Default)]
 pub struct Viewer3dPanelConfig {
@@ -922,6 +1069,53 @@ pub fn new_panel_rows(
                         let db_for_panel = db_for_select.clone();
                         let plot_panel =
                             cx.new(|cx| XyPlotPanel::with_traces(db_for_panel, vec![trace], cx));
+                        let inner = plot_panel.read(cx).inner().clone();
+
+                        pane.update(cx, |pane, cx| {
+                            pane.add_item(Box::new(plot_panel), cx);
+                        });
+
+                        if let Some(on_open_inspector) = &on_open_inspector {
+                            let inner_any = inner.into_any();
+                            if let Some(rows) = crate::inspector::reflect::rows_for_any_entity(
+                                &inner_any,
+                                &db_for_select,
+                                cx,
+                            ) {
+                                on_open_inspector(
+                                    InspectorRequest {
+                                        rows,
+                                        mode: InspectorMode::Centered,
+                                    },
+                                    window,
+                                    cx,
+                                );
+                            }
+                        }
+                    }),
+                )
+            })
+        },
+    )));
+
+    rows.push(Box::new(NavRow::new(
+        "List Plot",
+        SharedString::new_static(""),
+        {
+            let db = db.clone();
+            let pane = pane.clone();
+            let on_open_inspector = on_open_inspector.clone();
+            Box::new(move |_cx| {
+                let db_for_select = db.clone();
+                let pane = pane.clone();
+                let on_open_inspector = on_open_inspector.clone();
+                crate::views::list_plot::trace_picker::select_list_trace_wizard_rows(
+                    db.clone(),
+                    Arc::new(|_cx| 0),
+                    Arc::new(move |trace, window, cx| {
+                        let db_for_panel = db_for_select.clone();
+                        let plot_panel =
+                            cx.new(|cx| ListPlotPanel::with_traces(db_for_panel, vec![trace], cx));
                         let inner = plot_panel.read(cx).inner().clone();
 
                         pane.update(cx, |pane, cx| {
