@@ -27,12 +27,16 @@ use std::sync::Arc;
 
 use gpui::{AnyEntity, App, Entity, SharedString};
 use metor_db::DB;
+use metor_proto::types::PrimType;
+use smallvec::SmallVec;
 
+use crate::dynamic::ValueType;
 use crate::dynamic::ops::generators::Waveform;
 use crate::dynamic::tensor::TypedScalar;
 use crate::inspector::registry::InspectorRegistry;
 use crate::inspector::rows::{
-    ActionRow, CommandRow, DefaultActionRow, EnumRow, InspectorRow, RowAction, ScalarRow, TextRow,
+    ActionRow, BoolRow, CommandRow, DefaultActionRow, EnumRow, InspectorRow, RowAction, ScalarRow,
+    TextRow,
 };
 use crate::node_editor::graph::{BuildState, FlowId, NodeGraph};
 use crate::node_editor::pane::NodeEditor;
@@ -337,7 +341,7 @@ pub fn rows_for_node(
                 },
             ));
         }
-        NodeSpec::Waveform { shape, freq, amplitude, phase, .. } => {
+        NodeSpec::Waveform { shape, freq, amplitude, phase, dtype, out_shape } => {
             let shape_label = SharedString::from(waveform_label(*shape));
             let options: Vec<SharedString> = WAVEFORMS
                 .iter()
@@ -367,8 +371,28 @@ pub fn rows_for_node(
             rows.push(scalar_arg("Phase", *phase, editor.clone(), graph.clone(), flow_id.clone(), |s, v| {
                 if let NodeSpec::Waveform { phase, .. } = s { *phase = v; }
             }));
+            rows.push(dtype_arg(
+                "Output dtype",
+                *dtype,
+                editor.clone(),
+                graph.clone(),
+                flow_id.clone(),
+                |s, picked| {
+                    if let NodeSpec::Waveform { dtype, .. } = s { *dtype = picked; }
+                },
+            ));
+            rows.push(shape_arg(
+                "Output shape",
+                out_shape,
+                editor.clone(),
+                graph.clone(),
+                flow_id.clone(),
+                |s, new_shape| {
+                    if let NodeSpec::Waveform { out_shape, .. } = s { *out_shape = new_shape; }
+                },
+            ));
         }
-        NodeSpec::Random { seed, .. } => {
+        NodeSpec::Random { seed, dtype, out_shape } => {
             rows.push(scalar_arg(
                 "Seed",
                 *seed as f64,
@@ -381,45 +405,100 @@ pub fn rows_for_node(
                     }
                 },
             ));
+            rows.push(dtype_arg(
+                "Output dtype",
+                *dtype,
+                editor.clone(),
+                graph.clone(),
+                flow_id.clone(),
+                |s, picked| {
+                    if let NodeSpec::Random { dtype, .. } = s { *dtype = picked; }
+                },
+            ));
+            rows.push(shape_arg(
+                "Output shape",
+                out_shape,
+                editor.clone(),
+                graph.clone(),
+                flow_id.clone(),
+                |s, new_shape| {
+                    if let NodeSpec::Random { out_shape, .. } = s { *out_shape = new_shape; }
+                },
+            ));
         }
-        NodeSpec::Constant { value, .. } => {
-            rows.push(scalar_arg(
+        NodeSpec::Constant { value, out_shape } => {
+            rows.push(typed_scalar_arg(
                 "Value",
-                value.as_f64(),
+                *value,
                 editor.clone(),
                 graph.clone(),
                 flow_id.clone(),
                 |spec, v| {
                     if let NodeSpec::Constant { value, .. } = spec {
-                        *value = TypedScalar::from_f64(v, value.dtype());
+                        *value = v;
                     }
+                },
+            ));
+            rows.push(dtype_arg(
+                "Dtype",
+                value.dtype(),
+                editor.clone(),
+                graph.clone(),
+                flow_id.clone(),
+                |s, picked| {
+                    if let NodeSpec::Constant { value, .. } = s {
+                        *value = value.cast(picked);
+                    }
+                },
+            ));
+            rows.push(shape_arg(
+                "Output shape",
+                out_shape,
+                editor.clone(),
+                graph.clone(),
+                flow_id.clone(),
+                |s, new_shape| {
+                    if let NodeSpec::Constant { out_shape, .. } = s { *out_shape = new_shape; }
                 },
             ));
         }
         NodeSpec::Scale { k } => {
-            rows.push(scalar_arg(
+            // Reconcile the arg's dtype with the parent's promoted dtype on
+            // render so re-wiring the upstream picks the right widget next
+            // pass. Stays a no-op when there is no built parent.
+            let promoted = parent_dtype(&graph.read(_cx), &flow_id);
+            let display_value = match promoted {
+                Some(dt) => k.cast(dt),
+                None => *k,
+            };
+            rows.push(typed_scalar_arg(
                 "Scale (k)",
-                k.as_f64(),
+                display_value,
                 editor.clone(),
                 graph.clone(),
                 flow_id.clone(),
                 |spec, v| {
                     if let NodeSpec::Scale { k } = spec {
-                        *k = TypedScalar::from_f64(v, k.dtype());
+                        *k = v;
                     }
                 },
             ));
         }
         NodeSpec::Offset { k } => {
-            rows.push(scalar_arg(
+            let promoted = parent_dtype(&graph.read(_cx), &flow_id);
+            let display_value = match promoted {
+                Some(dt) => k.cast(dt),
+                None => *k,
+            };
+            rows.push(typed_scalar_arg(
                 "Offset",
-                k.as_f64(),
+                display_value,
                 editor.clone(),
                 graph.clone(),
                 flow_id.clone(),
                 |spec, v| {
                     if let NodeSpec::Offset { k } = spec {
-                        *k = TypedScalar::from_f64(v, k.dtype());
+                        *k = v;
                     }
                 },
             ));
@@ -588,6 +667,170 @@ fn enum_arg(
             editor.update(cx, |ed, cx| ed.schedule_rebuild(cx));
         }),
     })
+}
+
+/// Dtype-aware scalar row. Picks `BoolRow` for `Bool`, otherwise
+/// `ScalarRow::new_typed` so the displayed text and parser match the dtype.
+/// `apply` receives the new `TypedScalar` keyed to the same dtype.
+fn typed_scalar_arg(
+    label: &'static str,
+    value: TypedScalar,
+    editor: Entity<NodeEditor>,
+    graph: Entity<NodeGraph>,
+    flow_id: FlowId,
+    apply: impl Fn(&mut NodeSpec, TypedScalar) + 'static,
+) -> Box<dyn InspectorRow> {
+    let apply = Arc::new(apply);
+    if value.dtype() == PrimType::Bool {
+        let initial = matches!(value, TypedScalar::Bool(true));
+        let editor = editor.clone();
+        let graph = graph.clone();
+        let flow_id = flow_id.clone();
+        return Box::new(BoolRow::new(
+            SharedString::from(label),
+            initial,
+            Arc::new(move |new_value, _window, cx| {
+                let id = flow_id.clone();
+                graph.update(cx, |g, _| {
+                    if let Some(entry) = g.nodes.get_mut(&id) {
+                        apply(&mut entry.spec, TypedScalar::Bool(new_value));
+                    }
+                });
+                editor.update(cx, |ed, cx| ed.schedule_rebuild(cx));
+            }),
+        ));
+    }
+    Box::new(ScalarRow::new_typed(
+        SharedString::from(label),
+        value,
+        Arc::new(move |new_value, _window, cx| {
+            let id = flow_id.clone();
+            graph.update(cx, |g, _| {
+                if let Some(entry) = g.nodes.get_mut(&id) {
+                    apply(&mut entry.spec, new_value);
+                }
+            });
+            editor.update(cx, |ed, cx| ed.schedule_rebuild(cx));
+        }),
+    ))
+}
+
+/// Enum picker over [`PrimType`]. `apply` receives the user-picked dtype.
+fn dtype_arg(
+    label: &'static str,
+    selected: PrimType,
+    editor: Entity<NodeEditor>,
+    graph: Entity<NodeGraph>,
+    flow_id: FlowId,
+    apply: impl Fn(&mut NodeSpec, PrimType) + 'static,
+) -> Box<dyn InspectorRow> {
+    let options: Vec<SharedString> = DTYPES
+        .iter()
+        .map(|(_, name)| SharedString::new_static(name))
+        .collect();
+    enum_arg(
+        label,
+        SharedString::from(dtype_label(selected)),
+        options,
+        editor,
+        graph,
+        flow_id,
+        move |spec, chosen| {
+            if let Some(picked) = dtype_from_label(&chosen) {
+                apply(spec, picked);
+            }
+        },
+    )
+}
+
+/// Comma-separated shape editor (e.g. "3,4"). Empty input means a scalar
+/// (rank-0). Each component must be a positive integer.
+fn shape_arg(
+    label: &'static str,
+    value: &SmallVec<[usize; 4]>,
+    editor: Entity<NodeEditor>,
+    graph: Entity<NodeGraph>,
+    flow_id: FlowId,
+    apply: impl Fn(&mut NodeSpec, SmallVec<[usize; 4]>) + 'static,
+) -> Box<dyn InspectorRow> {
+    let initial = format_shape(value);
+    text_arg(
+        label,
+        SharedString::from(initial),
+        editor,
+        graph,
+        flow_id,
+        |s| parse_shape(s).is_some(),
+        move |spec, text| {
+            if let Some(parsed) = parse_shape(&text) {
+                apply(spec, parsed);
+            }
+        },
+    )
+}
+
+fn format_shape(shape: &SmallVec<[usize; 4]>) -> String {
+    if shape.is_empty() {
+        return String::new();
+    }
+    let mut s = String::new();
+    for (i, d) in shape.iter().enumerate() {
+        if i > 0 { s.push(','); }
+        s.push_str(&d.to_string());
+    }
+    s
+}
+
+fn parse_shape(text: &str) -> Option<SmallVec<[usize; 4]>> {
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return Some(SmallVec::new());
+    }
+    let mut out: SmallVec<[usize; 4]> = SmallVec::new();
+    for part in trimmed.split(',') {
+        let n: usize = part.trim().parse().ok()?;
+        if n == 0 { return None; }
+        out.push(n);
+    }
+    Some(out)
+}
+
+/// Look up the dtype that the immediate parent of `flow_id` *currently*
+/// produces (after a successful build). Returns `None` if no parent exists,
+/// the parent isn't built yet, or it's clock-typed. Used to render Scale /
+/// Offset arg widgets in the parent's promoted dtype so the row matches
+/// what the runtime will emit.
+fn parent_dtype(graph: &NodeGraph, flow_id: &FlowId) -> Option<PrimType> {
+    let parents = graph.parents_of(flow_id);
+    let parent_id = parents.first()?;
+    let entry = graph.nodes.get(parent_id)?;
+    let node = entry.build.as_built()?;
+    match node.value_type() {
+        ValueType::Value(s) => Some(s.prim_type),
+        ValueType::Clock => None,
+    }
+}
+
+const DTYPES: &[(PrimType, &str)] = &[
+    (PrimType::U8, "u8"),
+    (PrimType::U16, "u16"),
+    (PrimType::U32, "u32"),
+    (PrimType::U64, "u64"),
+    (PrimType::I8, "i8"),
+    (PrimType::I16, "i16"),
+    (PrimType::I32, "i32"),
+    (PrimType::I64, "i64"),
+    (PrimType::Bool, "bool"),
+    (PrimType::F32, "f32"),
+    (PrimType::F64, "f64"),
+];
+
+fn dtype_label(t: PrimType) -> &'static str {
+    DTYPES.iter().find(|(d, _)| *d == t).map(|(_, n)| *n).unwrap_or("f64")
+}
+
+fn dtype_from_label(label: &str) -> Option<PrimType> {
+    DTYPES.iter().find(|(_, n)| *n == label).map(|(d, _)| *d)
 }
 
 /// Single source of truth for the waveform shape <-> label mapping used by

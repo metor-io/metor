@@ -114,7 +114,8 @@ pub const ALL: &[OpDescriptor] = &[
             dtype: PrimType::F64,
             out_shape: SmallVec::new(),
         },
-        arg_count: 4,
+        // shape, freq, amplitude, phase, dtype, out_shape
+        arg_count: 6,
     },
     OpDescriptor {
         kind: NodeSpecKind::Random, label: "Random", category: "Generator",
@@ -124,7 +125,8 @@ pub const ALL: &[OpDescriptor] = &[
             dtype: PrimType::F64,
             out_shape: SmallVec::new(),
         },
-        arg_count: 1,
+        // seed, dtype, out_shape
+        arg_count: 3,
     },
     OpDescriptor {
         kind: NodeSpecKind::Constant, label: "Constant", category: "Generator",
@@ -133,7 +135,8 @@ pub const ALL: &[OpDescriptor] = &[
             value: TypedScalar::F64(0.0),
             out_shape: SmallVec::new(),
         },
-        arg_count: 1,
+        // value, dtype, out_shape
+        arg_count: 3,
     },
     // Derive
     OpDescriptor {
