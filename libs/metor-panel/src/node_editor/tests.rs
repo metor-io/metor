@@ -54,31 +54,21 @@ async fn clock_of_id_matches() {
 }
 
 #[stellarator::test]
-async fn sin_id_matches() {
-    let clock = ops::clock::fixed_rate(200.0).unwrap();
-    let clock_id = clock.id();
-    let built = ops::generators::sin(clock, 1.5, 2.0, 0.25).unwrap();
-    assert_eq!(
-        built.id(),
-        compute_node_id(
-            &NodeSpec::Sin { freq: 1.5, amplitude: 2.0, phase: 0.25 },
-            &[clock_id],
-        ),
-    );
-}
-
-#[stellarator::test]
-async fn square_id_matches() {
-    let clock = ops::clock::fixed_rate(50.0).unwrap();
-    let clock_id = clock.id();
-    let built = ops::generators::square(clock, 0.5, 3.0, 1.0).unwrap();
-    assert_eq!(
-        built.id(),
-        compute_node_id(
-            &NodeSpec::Square { freq: 0.5, amplitude: 3.0, phase: 1.0 },
-            &[clock_id],
-        ),
-    );
+async fn waveform_id_matches() {
+    use crate::dynamic::ops::generators::Waveform;
+    for shape in [Waveform::Sin, Waveform::Cos, Waveform::Square, Waveform::Sawtooth] {
+        let clock = ops::clock::fixed_rate(200.0).unwrap();
+        let clock_id = clock.id();
+        let built = ops::generators::waveform(clock, shape, 1.5, 2.0, 0.25).unwrap();
+        assert_eq!(
+            built.id(),
+            compute_node_id(
+                &NodeSpec::Waveform { shape, freq: 1.5, amplitude: 2.0, phase: 0.25 },
+                &[clock_id],
+            ),
+            "shape={shape:?}",
+        );
+    }
 }
 
 #[stellarator::test]
@@ -368,7 +358,7 @@ fn add_edge_replaces_on_exact_arity_target() {
 }
 
 #[test]
-fn add_edge_preserves_all_for_variadic_mean() {
+fn variadic_edges_use_distinct_sockets() {
     let mut g = NodeGraph::new(1);
     g.insert_node("clk".into(), NodeSpec::FixedRate { hz: 100.0 }, Position { x: 0.0, y: 0.0 });
     for i in 0..3 {
@@ -378,11 +368,40 @@ fn add_edge_preserves_all_for_variadic_mean() {
     }
     g.insert_node("mean".into(), NodeSpec::Mean, Position { x: 200.0, y: 0.0 });
     for i in 0..3 {
-        g.add_edge(EdgeEntry { source: format!("k{i}").into(), target: "mean".into(), target_socket: 0 });
+        g.add_edge(EdgeEntry { source: format!("k{i}").into(), target: "mean".into(), target_socket: i });
     }
 
     let to_mean: Vec<_> = g.edges.iter().filter(|e| e.target == "mean").collect();
     assert_eq!(to_mean.len(), 3, "variadic Mean keeps all parallel edges");
+
+    // Replacing the edge at socket 1 swaps the parent there, leaves the others.
+    g.add_edge(EdgeEntry { source: "k0".into(), target: "mean".into(), target_socket: 1 });
+    let to_mean: Vec<_> = g.edges.iter().filter(|e| e.target == "mean").collect();
+    assert_eq!(to_mean.len(), 3, "drop on existing socket replaces, doesn't append");
+}
+
+#[test]
+fn variadic_remove_compacts_socket_indices() {
+    let mut g = NodeGraph::new(1);
+    g.insert_node("clk".into(), NodeSpec::FixedRate { hz: 100.0 }, Position { x: 0.0, y: 0.0 });
+    for i in 0..3 {
+        let id = format!("k{i}");
+        g.insert_node(id.clone().into(), NodeSpec::Constant { value: i as f64 }, Position { x: 100.0, y: 0.0 });
+        g.add_edge(EdgeEntry { source: "clk".into(), target: id.into(), target_socket: 0 });
+    }
+    g.insert_node("mean".into(), NodeSpec::Mean, Position { x: 200.0, y: 0.0 });
+    for i in 0..3 {
+        g.add_edge(EdgeEntry { source: format!("k{i}").into(), target: "mean".into(), target_socket: i });
+    }
+
+    g.remove_edge(&EdgeEntry { source: "k1".into(), target: "mean".into(), target_socket: 1 });
+
+    let mut to_mean: Vec<_> = g.edges.iter().filter(|e| e.target == "mean").collect();
+    to_mean.sort_by_key(|e| e.target_socket);
+    let sockets: Vec<usize> = to_mean.iter().map(|e| e.target_socket).collect();
+    assert_eq!(sockets, vec![0, 1], "sockets compacted after removal");
+    assert_eq!(to_mean[0].source, "k0");
+    assert_eq!(to_mean[1].source, "k2");
 }
 
 #[test]
@@ -396,29 +415,27 @@ fn validate_rejects_cycle() {
 }
 
 #[test]
-fn mean_parent_order_follows_y_then_x() {
+fn variadic_parent_order_follows_target_socket() {
     let mut g = NodeGraph::new(1);
     g.insert_node("clk".into(), NodeSpec::FixedRate { hz: 100.0 }, Position { x: 0.0, y: 100.0 });
     g.insert_node("a".into(), NodeSpec::Constant { value: 1.0 }, Position { x: 50.0, y: 50.0 });
     g.insert_node("b".into(), NodeSpec::Constant { value: 2.0 }, Position { x: 50.0, y: 0.0 });
     g.insert_node("c".into(), NodeSpec::Constant { value: 3.0 }, Position { x: 50.0, y: 75.0 });
     g.insert_node("mean".into(), NodeSpec::Mean, Position { x: 200.0, y: 50.0 });
-    for (n, _) in [("a", ()), ("b", ()), ("c", ())] {
+    for n in ["a", "b", "c"] {
         g.add_edge(EdgeEntry {
             source: "clk".into(),
             target: n.into(),
             target_socket: 0,
         });
-        g.add_edge(EdgeEntry {
-            source: n.into(),
-            target: "mean".into(),
-            target_socket: 0,
-        });
     }
-    // Insertion order in `edges` is a, b, c — but canonical order is by y
-    // ascending, so it should come out b (y=0), a (y=50), c (y=75).
+    // Wire to specific socket indices — physical positions are ignored.
+    g.add_edge(EdgeEntry { source: "c".into(), target: "mean".into(), target_socket: 0 });
+    g.add_edge(EdgeEntry { source: "a".into(), target: "mean".into(), target_socket: 1 });
+    g.add_edge(EdgeEntry { source: "b".into(), target: "mean".into(), target_socket: 2 });
+
     let parents = g.parents_of(&"mean".into());
-    let expected: Vec<gpui::SharedString> = vec!["b".into(), "a".into(), "c".into()];
+    let expected: Vec<gpui::SharedString> = vec!["c".into(), "a".into(), "b".into()];
     assert_eq!(parents, expected);
 }
 
@@ -428,7 +445,12 @@ fn config_round_trips_through_facet_json() {
     g.insert_node("clk".into(), NodeSpec::FixedRate { hz: 250.0 }, Position { x: 10.0, y: 20.0 });
     g.insert_node(
         "sin".into(),
-        NodeSpec::Sin { freq: 1.5, amplitude: 2.0, phase: 0.25 },
+        NodeSpec::Waveform {
+            shape: crate::dynamic::ops::generators::Waveform::Sin,
+            freq: 1.5,
+            amplitude: 2.0,
+            phase: 0.25,
+        },
         Position { x: 100.0, y: 20.0 },
     );
     g.insert_node("scale".into(), NodeSpec::Scale { k: -0.5 }, Position { x: 200.0, y: 20.0 });

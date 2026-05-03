@@ -28,6 +28,7 @@ use std::sync::Arc;
 use gpui::{AnyEntity, App, Entity, SharedString};
 use metor_db::DB;
 
+use crate::dynamic::ops::generators::Waveform;
 use crate::inspector::registry::InspectorRegistry;
 use crate::inspector::rows::{
     ActionRow, CommandRow, DefaultActionRow, EnumRow, InspectorRow, RowAction, ScalarRow, TextRow,
@@ -334,28 +335,35 @@ pub fn rows_for_node(
                 },
             ));
         }
-        NodeSpec::Sin { freq, amplitude, phase } => {
+        NodeSpec::Waveform { shape, freq, amplitude, phase } => {
+            let shape_label = SharedString::from(waveform_label(*shape));
+            let options: Vec<SharedString> = WAVEFORMS
+                .iter()
+                .map(|(_, name)| SharedString::new_static(name))
+                .collect();
+            rows.push(enum_arg(
+                "Shape",
+                shape_label,
+                options,
+                editor.clone(),
+                graph.clone(),
+                flow_id.clone(),
+                |s, chosen| {
+                    if let (NodeSpec::Waveform { shape, .. }, Some(picked)) =
+                        (s, waveform_from_label(&chosen))
+                    {
+                        *shape = picked;
+                    }
+                },
+            ));
             rows.push(scalar_arg("Frequency", *freq, editor.clone(), graph.clone(), flow_id.clone(), |s, v| {
-                if let NodeSpec::Sin { freq, .. } = s { *freq = v; }
+                if let NodeSpec::Waveform { freq, .. } = s { *freq = v; }
             }));
             rows.push(scalar_arg("Amplitude", *amplitude, editor.clone(), graph.clone(), flow_id.clone(), |s, v| {
-                if let NodeSpec::Sin { amplitude, .. } = s { *amplitude = v; }
+                if let NodeSpec::Waveform { amplitude, .. } = s { *amplitude = v; }
             }));
             rows.push(scalar_arg("Phase", *phase, editor.clone(), graph.clone(), flow_id.clone(), |s, v| {
-                if let NodeSpec::Sin { phase, .. } = s { *phase = v; }
-            }));
-        }
-        NodeSpec::Square { freq, amplitude, phase } => {
-            // Square shares Sin's arg layout; the variant guard inside each
-            // closure keeps the spec write type-safe.
-            rows.push(scalar_arg("Frequency", *freq, editor.clone(), graph.clone(), flow_id.clone(), |s, v| {
-                if let NodeSpec::Square { freq, .. } = s { *freq = v; }
-            }));
-            rows.push(scalar_arg("Amplitude", *amplitude, editor.clone(), graph.clone(), flow_id.clone(), |s, v| {
-                if let NodeSpec::Square { amplitude, .. } = s { *amplitude = v; }
-            }));
-            rows.push(scalar_arg("Phase", *phase, editor.clone(), graph.clone(), flow_id.clone(), |s, v| {
-                if let NodeSpec::Square { phase, .. } = s { *phase = v; }
+                if let NodeSpec::Waveform { phase, .. } = s { *phase = v; }
             }));
         }
         NodeSpec::Random { seed } => {
@@ -470,6 +478,7 @@ pub fn rows_for_node(
         | NodeSpec::Sub
         | NodeSpec::Mul
         | NodeSpec::Mean
+        | NodeSpec::Pack
         | NodeSpec::Zoh
         | NodeSpec::Linear
         | NodeSpec::LatestAt => {}
@@ -562,4 +571,28 @@ fn enum_arg(
             editor.update(cx, |ed, cx| ed.schedule_rebuild(cx));
         }),
     })
+}
+
+/// Single source of truth for the waveform shape <-> label mapping used by
+/// the inspector enum row.
+const WAVEFORMS: &[(Waveform, &str)] = &[
+    (Waveform::Sin, "Sin"),
+    (Waveform::Cos, "Cos"),
+    (Waveform::Square, "Square"),
+    (Waveform::Sawtooth, "Sawtooth"),
+];
+
+fn waveform_label(shape: Waveform) -> &'static str {
+    WAVEFORMS
+        .iter()
+        .find(|(s, _)| *s == shape)
+        .map(|(_, name)| *name)
+        .unwrap_or("Sin")
+}
+
+fn waveform_from_label(label: &str) -> Option<Waveform> {
+    WAVEFORMS
+        .iter()
+        .find(|(_, name)| *name == label)
+        .map(|(s, _)| *s)
 }

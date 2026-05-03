@@ -14,14 +14,19 @@ use metor_db::DB;
 use metor_proto::types::ComponentId;
 
 use crate::dynamic::{BuildError, DynamicNode, NodeId, hash_id, op_tag, ops};
+use crate::dynamic::ops::generators::Waveform;
 
 #[derive(Clone, Debug, PartialEq, facet::Facet)]
 #[repr(u8)]
 pub enum NodeSpec {
     FixedRate { hz: f64 },
     ClockOf,
-    Sin { freq: f64, amplitude: f64, phase: f64 },
-    Square { freq: f64, amplitude: f64, phase: f64 },
+    Waveform {
+        shape: Waveform,
+        freq: f64,
+        amplitude: f64,
+        phase: f64,
+    },
     Random { seed: u64 },
     Constant { value: f64 },
     Scale { k: f64 },
@@ -33,6 +38,7 @@ pub enum NodeSpec {
     Sub,
     Mul,
     Mean,
+    Pack,
     Zoh,
     Linear,
     LatestAt,
@@ -44,9 +50,9 @@ pub enum NodeSpec {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum NodeSpecKind {
     FixedRate, ClockOf,
-    Sin, Square, Random, Constant,
+    Waveform, Random, Constant,
     Scale, Offset, Abs, Neg, Log,
-    Add, Sub, Mul, Mean,
+    Add, Sub, Mul, Mean, Pack,
     Zoh, Linear, LatestAt,
     FromDb, Persist,
 }
@@ -57,8 +63,7 @@ impl NodeSpec {
         match self {
             FixedRate { .. } => NodeSpecKind::FixedRate,
             ClockOf => NodeSpecKind::ClockOf,
-            Sin { .. } => NodeSpecKind::Sin,
-            Square { .. } => NodeSpecKind::Square,
+            Waveform { .. } => NodeSpecKind::Waveform,
             Random { .. } => NodeSpecKind::Random,
             Constant { .. } => NodeSpecKind::Constant,
             Scale { .. } => NodeSpecKind::Scale,
@@ -70,6 +75,7 @@ impl NodeSpec {
             Sub => NodeSpecKind::Sub,
             Mul => NodeSpecKind::Mul,
             Mean => NodeSpecKind::Mean,
+            Pack => NodeSpecKind::Pack,
             Zoh => NodeSpecKind::Zoh,
             Linear => NodeSpecKind::Linear,
             LatestAt => NodeSpecKind::LatestAt,
@@ -83,8 +89,7 @@ impl NodeSpec {
         match self {
             FixedRate { .. } => op_tag::FIXED_RATE_CLOCK,
             ClockOf => op_tag::CLOCK_OF,
-            Sin { .. } => op_tag::SIN,
-            Square { .. } => op_tag::SQUARE,
+            Waveform { .. } => op_tag::WAVEFORM,
             Random { .. } => op_tag::RANDOM,
             Constant { .. } => op_tag::CONSTANT,
             Scale { .. } => op_tag::SCALE,
@@ -96,6 +101,7 @@ impl NodeSpec {
             Sub => op_tag::SUB,
             Mul => op_tag::MUL,
             Mean => op_tag::MEAN,
+            Pack => op_tag::PACK,
             Zoh => op_tag::ZOH,
             Linear => op_tag::LINEAR,
             LatestAt => op_tag::LATEST_AT,
@@ -113,8 +119,8 @@ impl NodeSpec {
                 hz.to_bits().hash(h);
             }
             ClockOf => {}
-            Sin { freq, amplitude, phase }
-            | Square { freq, amplitude, phase } => {
+            Waveform { shape, freq, amplitude, phase } => {
+                (*shape as u8).hash(h);
                 freq.to_bits().hash(h);
                 amplitude.to_bits().hash(h);
                 phase.to_bits().hash(h);
@@ -129,7 +135,7 @@ impl NodeSpec {
                 k.to_bits().hash(h);
             }
             Abs | Neg | Log => {}
-            Add | Sub | Mul | Mean => {}
+            Add | Sub | Mul | Mean | Pack => {}
             Zoh | Linear | LatestAt => {}
             FromDb { component_id } => {
                 component_id.hash(h);
@@ -204,11 +210,8 @@ pub fn build(
             ops::clock::fixed_rate(*hz)
         }
         ClockOf => Ok(ops::clock::clock_of(p1("clock_of", parents)?)),
-        Sin { freq, amplitude, phase } => {
-            ops::generators::sin(p1("sin", parents)?, *freq, *amplitude, *phase)
-        }
-        Square { freq, amplitude, phase } => {
-            ops::generators::square(p1("square", parents)?, *freq, *amplitude, *phase)
+        Waveform { shape, freq, amplitude, phase } => {
+            ops::generators::waveform(p1("waveform", parents)?, *shape, *freq, *amplitude, *phase)
         }
         Random { seed } => ops::generators::random(p1("random", parents)?, *seed),
         Constant { value } => ops::generators::constant(p1("constant", parents)?, *value),
@@ -234,6 +237,12 @@ pub fn build(
                 return Err(BuildError::EmptyInputs);
             }
             ops::compose::mean(parents)
+        }
+        Pack => {
+            if parents.is_empty() {
+                return Err(BuildError::EmptyInputs);
+            }
+            ops::compose::pack(parents)
         }
         Zoh => {
             let (input, clock) = p2("zoh", parents)?;

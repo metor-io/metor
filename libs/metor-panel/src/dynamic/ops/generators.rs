@@ -15,53 +15,53 @@ fn f64_scalar_schema() -> ComponentSchema {
     ComponentSchema::new(PrimType::F64, &[])
 }
 
-/// `sin(2π·freq·t + phase) · amplitude`, sampled at every clock tick.
-/// `t` is the clock's wall-clock timestamp in seconds since the unix epoch.
-pub fn sin(
-    clock: Arc<dyn DynamicNode>,
-    freq: f64,
-    amplitude: f64,
-    phase: f64,
-) -> Result<Arc<dyn DynamicNode>, BuildError> {
-    require_clock(&clock)?;
-    let id = hash_id(op_tag::SIN, &[clock.id()], |h| {
-        freq.to_bits().hash(h);
-        amplitude.to_bits().hash(h);
-        phase.to_bits().hash(h);
-    });
-    let schema = f64_scalar_schema();
-    let value_bytes = schema.size();
-    let parent_clock = clock.parent_clock_id();
-    let mut reader = clock.subscribe();
-    Ok(NodeImpl::spawn(
-        id,
-        ValueType::Value(schema),
-        parent_clock,
-        default_ring_bytes(value_bytes),
-        move |output| async move {
-            let _clock = clock;
-            let two_pi = std::f64::consts::TAU;
-            loop {
-                let grant = reader.next().await;
-                for (ts, _) in grant.samples() {
-                    let t = (ts.0 as f64) * 1e-6;
-                    let v = amplitude * f64::sin(two_pi * freq * t + phase);
-                    write_sample(&output, ts, &v.to_le_bytes());
-                }
-            }
-        },
-    ))
+/// Periodic waveform shape. Phase 1 set covers the four common shapes; add
+/// new variants here and extend [`Waveform::sample`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, facet::Facet)]
+#[repr(u8)]
+pub enum Waveform {
+    Sin,
+    Cos,
+    Square,
+    Sawtooth,
 }
 
-/// `square(2π·freq·t + phase) · amplitude`. ±amplitude.
-pub fn square(
+impl Waveform {
+    /// Sample the unit-amplitude waveform at angular position `theta` (in
+    /// radians, already including phase offset). Caller scales by amplitude.
+    fn sample(self, theta: f64) -> f64 {
+        match self {
+            Waveform::Sin => theta.sin(),
+            Waveform::Cos => theta.cos(),
+            Waveform::Square => {
+                if theta.sin() >= 0.0 {
+                    1.0
+                } else {
+                    -1.0
+                }
+            }
+            // Linear ramp from -1 to +1 across each period, repeating.
+            Waveform::Sawtooth => {
+                let two_pi = std::f64::consts::TAU;
+                let frac = (theta / two_pi).rem_euclid(1.0);
+                2.0 * frac - 1.0
+            }
+        }
+    }
+}
+
+/// `shape(2π·freq·t + phase) · amplitude`, sampled at every clock tick.
+/// `t` is the clock's wall-clock timestamp in seconds since the unix epoch.
+pub fn waveform(
     clock: Arc<dyn DynamicNode>,
+    shape: Waveform,
     freq: f64,
     amplitude: f64,
     phase: f64,
 ) -> Result<Arc<dyn DynamicNode>, BuildError> {
     require_clock(&clock)?;
-    let id = hash_id(op_tag::SQUARE, &[clock.id()], |h| {
+    let id = hash_id(op_tag::WAVEFORM, &[clock.id()], |h| {
+        (shape as u8).hash(h);
         freq.to_bits().hash(h);
         amplitude.to_bits().hash(h);
         phase.to_bits().hash(h);
@@ -82,8 +82,8 @@ pub fn square(
                 for (ts, _) in grant.samples() {
                     let t = (ts.0 as f64) * 1e-6;
                     let theta = two_pi * freq * t + phase;
-                    let s = if theta.sin() >= 0.0 { amplitude } else { -amplitude };
-                    write_sample(&output, ts, &s.to_le_bytes());
+                    let v = amplitude * shape.sample(theta);
+                    write_sample(&output, ts, &v.to_le_bytes());
                 }
             }
         },

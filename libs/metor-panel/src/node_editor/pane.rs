@@ -347,14 +347,16 @@ impl Focusable for NodeEditor {
     }
 }
 
-/// Number of input sockets shown on `entry`. For variadic ops we render a
-/// single "+" affordance plus one row per existing edge.
+/// Number of input sockets shown on `entry`. Variadic ops always render one
+/// trailing empty socket past the highest connected one, so dropping there
+/// extends the input list with a fresh slot. Order is `target_socket` —
+/// the user controls input ordering by which socket they wire into.
 fn input_count(entry: &NodeEntry, edges: &[EdgeEntry], flow_id: &FlowId) -> usize {
     match descriptor_for(&entry.spec).inputs {
         Arity::Exact(slots) => slots.len(),
         Arity::Variadic { min, .. } => {
             let connected = edges.iter().filter(|e| &e.target == flow_id).count();
-            connected.max(min).max(1)
+            (connected + 1).max(min)
         }
     }
 }
@@ -394,6 +396,7 @@ fn socket_dot_color(kind: SocketKind, theme: &crate::theme::Theme) -> Hsla {
     match kind {
         SocketKind::Clock => theme.line_colors[1],     // cool blue family
         SocketKind::F64Scalar => theme.line_colors[0], // accent orange
+        SocketKind::Value => theme.line_colors[2],     // green — distinct from scalar
         SocketKind::Any => theme.text_secondary,
     }
 }

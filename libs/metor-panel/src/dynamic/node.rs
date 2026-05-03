@@ -284,8 +284,7 @@ impl DynamicNode for NodeImpl {
 pub mod op_tag {
     pub const FIXED_RATE_CLOCK: &[u8] = b"clock.fixed_rate";
     pub const CLOCK_OF: &[u8] = b"clock.of";
-    pub const SIN: &[u8] = b"gen.sin";
-    pub const SQUARE: &[u8] = b"gen.square";
+    pub const WAVEFORM: &[u8] = b"gen.waveform";
     pub const RANDOM: &[u8] = b"gen.random";
     pub const CONSTANT: &[u8] = b"gen.constant";
     pub const SCALE: &[u8] = b"derive.scale";
@@ -297,6 +296,7 @@ pub mod op_tag {
     pub const SUB: &[u8] = b"compose.sub";
     pub const MUL: &[u8] = b"compose.mul";
     pub const MEAN: &[u8] = b"compose.mean";
+    pub const PACK: &[u8] = b"compose.pack";
     pub const ZOH: &[u8] = b"resample.zoh";
     pub const LINEAR: &[u8] = b"resample.linear";
     pub const LATEST_AT: &[u8] = b"resample.latest_at";

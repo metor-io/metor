@@ -31,7 +31,14 @@ async fn drain_f64(
 async fn sin_chain_emits_expected_values() {
     let clock = ops::clock::fixed_rate(200.0).unwrap();
     assert!(matches!(clock.value_type(), ValueType::Clock));
-    let sin = ops::generators::sin(clock, 1.0, 1.0, 0.0).expect("sin builds");
+    let sin = ops::generators::waveform(
+        clock,
+        ops::generators::Waveform::Sin,
+        1.0,
+        1.0,
+        0.0,
+    )
+    .expect("sin builds");
     let scaled = ops::derive::scale(sin, 2.0).expect("scale builds");
 
     let samples = drain_f64(&scaled, 32).await;
@@ -49,8 +56,22 @@ async fn sin_chain_emits_expected_values() {
 async fn compose_clock_mismatch_errors() {
     let clk_a = ops::clock::fixed_rate(100.0).unwrap();
     let clk_b = ops::clock::fixed_rate(200.0).unwrap();
-    let a = ops::generators::sin(clk_a, 1.0, 1.0, 0.0).unwrap();
-    let b = ops::generators::sin(clk_b, 1.0, 1.0, 0.0).unwrap();
+    let a = ops::generators::waveform(
+        clk_a,
+        ops::generators::Waveform::Sin,
+        1.0,
+        1.0,
+        0.0,
+    )
+    .unwrap();
+    let b = ops::generators::waveform(
+        clk_b,
+        ops::generators::Waveform::Sin,
+        1.0,
+        1.0,
+        0.0,
+    )
+    .unwrap();
     let err = match ops::compose::add(a, b) {
         Ok(_) => panic!("must reject mismatched clocks"),
         Err(e) => e,
@@ -67,6 +88,38 @@ async fn compose_add_is_co_clocked() {
     let samples = drain_f64(&sum, 16).await;
     for (_, v) in &samples {
         assert!((v - 7.0).abs() < 1e-12);
+    }
+}
+
+#[stellarator::test]
+async fn pack_emits_vector_samples() {
+    use crate::dynamic::node::DynamicNodeExt;
+    let clock = ops::clock::fixed_rate(200.0).unwrap();
+    let x = ops::generators::constant(clock.clone(), 1.5).unwrap();
+    let y = ops::generators::constant(clock, -2.5).unwrap();
+    let packed = ops::compose::pack(vec![x, y]).unwrap();
+    // Schema must be F64[2]; values come out as 16 raw bytes (two LE f64s).
+    let schema = match packed.value_type() {
+        crate::dynamic::ValueType::Value(s) => s,
+        _ => panic!("pack must produce a value, not a clock"),
+    };
+    assert_eq!(schema.dim.as_slice(), &[2]);
+    assert_eq!(schema.size(), 16);
+    let mut reader = packed.subscribe();
+    let mut got = 0;
+    while got < 8 {
+        let grant = reader.next().await;
+        for (_ts, value) in grant.samples() {
+            assert_eq!(value.len(), 16);
+            let x = f64::from_le_bytes(value[..8].try_into().unwrap());
+            let y = f64::from_le_bytes(value[8..].try_into().unwrap());
+            assert!((x - 1.5).abs() < 1e-12);
+            assert!((y + 2.5).abs() < 1e-12);
+            got += 1;
+            if got == 8 {
+                break;
+            }
+        }
     }
 }
 

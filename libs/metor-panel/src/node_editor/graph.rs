@@ -102,56 +102,51 @@ impl NodeGraph {
             .retain(|e| &e.source != id && &e.target != id);
     }
 
+    /// Drop the edge already at `(target, target_socket)`, then add the new
+    /// one. Same replace-on-conflict behavior for both exact and variadic
+    /// targets — variadic ops grow by dropping into the trailing empty
+    /// socket the canvas renders, not by stacking edges on the same socket.
     pub fn add_edge(&mut self, edge: EdgeEntry) {
-        self.edges.retain(|e| {
-            !(e.target == edge.target && e.target_socket == edge.target_socket
-                && !matches!(
-                    descriptor_for(&self.nodes[&edge.target].spec).inputs,
-                    Arity::Variadic { .. }
-                ))
-        });
+        self.edges
+            .retain(|e| !(e.target == edge.target && e.target_socket == edge.target_socket));
         self.edges.push(edge);
     }
 
     pub fn remove_edge(&mut self, edge: &EdgeEntry) {
+        let target = edge.target.clone();
+        let removed_socket = edge.target_socket;
+        let is_variadic = self
+            .nodes
+            .get(&target)
+            .map(|n| matches!(descriptor_for(&n.spec).inputs, Arity::Variadic { .. }))
+            .unwrap_or(false);
         self.edges.retain(|e| e != edge);
+        if is_variadic {
+            // Keep variadic socket indices contiguous so the canvas always
+            // renders a tight column ending in one trailing "add" slot.
+            for e in &mut self.edges {
+                if e.target == target && e.target_socket > removed_socket {
+                    e.target_socket -= 1;
+                }
+            }
+        }
     }
 
     /// Parents of `flow_id` in canonical build order (matches what
-    /// `compute_node_id` and the constructor expect).
+    /// `compute_node_id` and the constructor expect). For both exact and
+    /// variadic ops the order is the `target_socket` index, so users
+    /// control input order by which socket they wire to.
     pub fn parents_of(&self, flow_id: &FlowId) -> Vec<FlowId> {
-        let Some(entry) = self.nodes.get(flow_id) else {
+        if !self.nodes.contains_key(flow_id) {
             return Vec::new();
-        };
-        let descriptor = descriptor_for(&entry.spec);
+        }
         let mut incoming: Vec<&EdgeEntry> = self
             .edges
             .iter()
             .filter(|e| &e.target == flow_id)
             .collect();
-        match descriptor.inputs {
-            Arity::Exact(_) => {
-                incoming.sort_by_key(|e| e.target_socket);
-                incoming.into_iter().map(|e| e.source.clone()).collect()
-            }
-            Arity::Variadic { .. } => {
-                // Canonical order for variadic ops: source position (y, x).
-                incoming.sort_by(|a, b| {
-                    let pa = self
-                        .nodes
-                        .get(&a.source)
-                        .map(|n| (n.position.y, n.position.x))
-                        .unwrap_or((0.0, 0.0));
-                    let pb = self
-                        .nodes
-                        .get(&b.source)
-                        .map(|n| (n.position.y, n.position.x))
-                        .unwrap_or((0.0, 0.0));
-                    pa.partial_cmp(&pb).unwrap_or(std::cmp::Ordering::Equal)
-                });
-                incoming.into_iter().map(|e| e.source.clone()).collect()
-            }
-        }
+        incoming.sort_by_key(|e| e.target_socket);
+        incoming.into_iter().map(|e| e.source.clone()).collect()
     }
 
     /// Topological order over the graph using Kahn's algorithm. Returns

@@ -2,6 +2,7 @@
 //! connection validator. Single source of truth for socket counts and types
 //! so the three subsystems can't drift.
 
+use crate::dynamic::ops::generators::Waveform;
 use crate::node_editor::spec::{NodeSpec, NodeSpecKind};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -10,6 +11,9 @@ pub enum SocketKind {
     Clock,
     /// `ValueType::Value(F64 scalar)`.
     F64Scalar,
+    /// Any non-clock value — scalar or vector. Used by ops that record or
+    /// pass values through without inspecting the schema (e.g. `Persist`).
+    Value,
     /// Any value (clock or value) — used for `ClockOf`'s input, which accepts
     /// either since it just taps the timestamp stream.
     Any,
@@ -18,12 +22,15 @@ pub enum SocketKind {
 impl SocketKind {
     /// Can data flowing out of `source` be plugged into a socket of kind `target`?
     pub fn compatible_with(self, target: SocketKind) -> bool {
+        use SocketKind::*;
         matches!(
             (self, target),
-            (SocketKind::Any, _)
-                | (_, SocketKind::Any)
-                | (SocketKind::Clock, SocketKind::Clock)
-                | (SocketKind::F64Scalar, SocketKind::F64Scalar)
+            (Any, _)
+                | (_, Any)
+                | (Clock, Clock)
+                | (F64Scalar, F64Scalar)
+                | (F64Scalar, Value)
+                | (Value, Value)
         )
     }
 }
@@ -66,6 +73,7 @@ pub struct OpDescriptor {
 
 const F64: SocketKind = SocketKind::F64Scalar;
 const CLK: SocketKind = SocketKind::Clock;
+const VAL: SocketKind = SocketKind::Value;
 const ANY: SocketKind = SocketKind::Any;
 
 const NO_INPUTS: Arity = Arity::Exact(&[]);
@@ -74,6 +82,7 @@ const TWO_F64: Arity = Arity::Exact(&[F64, F64]);
 const ONE_CLK: Arity = Arity::Exact(&[CLK]);
 const VALUE_AND_CLOCK: Arity = Arity::Exact(&[F64, CLK]);
 const ONE_ANY: Arity = Arity::Exact(&[ANY]);
+const ONE_VALUE: Arity = Arity::Exact(&[VAL]);
 
 pub const ALL: &[OpDescriptor] = &[
     // Clocks
@@ -91,16 +100,15 @@ pub const ALL: &[OpDescriptor] = &[
     },
     // Generators
     OpDescriptor {
-        kind: NodeSpecKind::Sin, label: "Sin", category: "Generator",
+        kind: NodeSpecKind::Waveform, label: "Waveform", category: "Generator",
         inputs: ONE_CLK, output: F64,
-        default_spec: || NodeSpec::Sin { freq: 1.0, amplitude: 1.0, phase: 0.0 },
-        arg_count: 3,
-    },
-    OpDescriptor {
-        kind: NodeSpecKind::Square, label: "Square", category: "Generator",
-        inputs: ONE_CLK, output: F64,
-        default_spec: || NodeSpec::Square { freq: 1.0, amplitude: 1.0, phase: 0.0 },
-        arg_count: 3,
+        default_spec: || NodeSpec::Waveform {
+            shape: Waveform::Sin,
+            freq: 1.0,
+            amplitude: 1.0,
+            phase: 0.0,
+        },
+        arg_count: 4,
     },
     OpDescriptor {
         kind: NodeSpecKind::Random, label: "Random", category: "Generator",
@@ -170,6 +178,12 @@ pub const ALL: &[OpDescriptor] = &[
         default_spec: || NodeSpec::Mean,
         arg_count: 0,
     },
+    OpDescriptor {
+        kind: NodeSpecKind::Pack, label: "Pack", category: "Compose",
+        inputs: Arity::Variadic { kind: F64, min: 1 }, output: VAL,
+        default_spec: || NodeSpec::Pack,
+        arg_count: 0,
+    },
     // Resample
     OpDescriptor {
         kind: NodeSpecKind::Zoh, label: "Zero-Order Hold", category: "Resample",
@@ -198,7 +212,7 @@ pub const ALL: &[OpDescriptor] = &[
     },
     OpDescriptor {
         kind: NodeSpecKind::Persist, label: "Persist", category: "DB",
-        inputs: ONE_F64, output: F64,
+        inputs: ONE_VALUE, output: VAL,
         default_spec: || NodeSpec::Persist { name: String::new() },
         arg_count: 1,
     },

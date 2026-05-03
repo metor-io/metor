@@ -1,7 +1,7 @@
 //! Long-lived stellarator thread that runs every dynamic-node producer task.
 //!
 //! Why this exists: dynamic node constructors (`ops::clock::fixed_rate`,
-//! `ops::generators::sin`, `ops::persist::persist`, ...) all call
+//! `ops::generators::waveform`, `ops::persist::persist`, ...) all call
 //! `stellarator::spawn` to launch their producer tasks. `stellarator::spawn`
 //! reads a thread-local `Executor`. The panel's main thread runs gpui's
 //! event loop and never installs a stellarator runtime, so spawned tasks

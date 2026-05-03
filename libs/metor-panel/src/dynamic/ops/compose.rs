@@ -31,19 +31,21 @@ fn read_f64(value: &[u8]) -> f64 {
     f64::from_le_bytes(value.try_into().expect("f64 scalar"))
 }
 
-/// Align N co-clocked f64 streams and emit `reduce` of each aligned tuple.
+/// Align N co-clocked f64 streams and call `encode` for each aligned tuple
+/// to fill the value bytes of the output sample.
 ///
 /// Producers may drop samples on a full ring; if heads desync we drop the
 /// oldest head(s) until they realign rather than emit a value mixed across
 /// ticks. Loops forever — caller wraps in `NodeImpl::spawn`.
-async fn run_aligned_reduce(
+async fn run_aligned_emit(
     mut readers: Vec<NodeReader>,
     output: Disruptor,
-    mut reduce: impl FnMut(&[f64]) -> f64,
+    mut encode: impl FnMut(&[f64], &mut Vec<u8>),
 ) {
     let n = readers.len();
     let mut bufs: Vec<VecDeque<(Timestamp, f64)>> = (0..n).map(|_| VecDeque::new()).collect();
     let mut tuple = vec![0.0f64; n];
+    let mut scratch: Vec<u8> = Vec::new();
     loop {
         for (i, reader) in readers.iter_mut().enumerate() {
             if bufs[i].is_empty() {
@@ -56,8 +58,9 @@ async fn run_aligned_reduce(
             for (i, buf) in bufs.iter_mut().enumerate() {
                 tuple[i] = buf.pop_front().expect("aligned head present").1;
             }
-            let v = reduce(&tuple);
-            write_sample(&output, ts, &v.to_le_bytes());
+            scratch.clear();
+            encode(&tuple, &mut scratch);
+            write_sample(&output, ts, &scratch);
         }
     }
 }
@@ -119,7 +122,11 @@ fn binary(
         move |output| async move {
             let _a = a;
             let _b = b;
-            run_aligned_reduce(readers, output, move |xs| f(xs[0], xs[1])).await;
+            run_aligned_emit(readers, output, move |xs, out| {
+                let v = f(xs[0], xs[1]);
+                out.extend_from_slice(&v.to_le_bytes());
+            })
+            .await;
         },
     ))
 }
@@ -157,7 +164,45 @@ pub fn mean(inputs: Vec<Arc<dyn DynamicNode>>) -> Result<Arc<dyn DynamicNode>, B
         default_ring_bytes(schema.size()),
         move |output| async move {
             let _inputs = inputs;
-            run_aligned_reduce(readers, output, move |xs| xs.iter().sum::<f64>() / n).await;
+            run_aligned_emit(readers, output, move |xs, out| {
+                let v = xs.iter().sum::<f64>() / n;
+                out.extend_from_slice(&v.to_le_bytes());
+            })
+            .await;
+        },
+    ))
+}
+
+/// Pack N co-clocked f64 scalars into a single `F64[N]` vector component.
+/// Inputs must share a clock; output schema is `[N]`-shaped, so downstream
+/// ops that expect a scalar will reject it (use `Persist` or another vec
+/// consumer instead).
+pub fn pack(inputs: Vec<Arc<dyn DynamicNode>>) -> Result<Arc<dyn DynamicNode>, BuildError> {
+    if inputs.is_empty() {
+        return Err(BuildError::EmptyInputs);
+    }
+    for node in &inputs {
+        let _ = require_f64_scalar(node)?;
+    }
+    let clock = require_same_clock(&inputs)?;
+    let n = inputs.len();
+    let parent_ids: Vec<NodeId> = inputs.iter().map(|n| n.id()).collect();
+    let id = hash_id(op_tag::PACK, &parent_ids, |_| {});
+    let schema = metor_db::ComponentSchema::new(metor_proto::types::PrimType::F64, &[n]);
+    let readers: Vec<NodeReader> = inputs.iter().map(|n| n.subscribe()).collect();
+    Ok(NodeImpl::spawn(
+        id,
+        ValueType::Value(schema.clone()),
+        Some(clock),
+        default_ring_bytes(schema.size()),
+        move |output| async move {
+            let _inputs = inputs;
+            run_aligned_emit(readers, output, |xs, out| {
+                for x in xs {
+                    out.extend_from_slice(&x.to_le_bytes());
+                }
+            })
+            .await;
         },
     ))
 }
