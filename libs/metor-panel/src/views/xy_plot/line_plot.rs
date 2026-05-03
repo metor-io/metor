@@ -1,13 +1,10 @@
-//! GPU-backed line plot entity shared by every plot site in the panel.
+//! GPU-backed XY plot entity. Sibling to [`crate::views::time_series::LinePlot`].
 //!
-//! [`LinePlot`] owns the canonical trace list, the inspector-exposed view
-//! overrides, the [`PlotRenderState`], and one tracking task per trace
-//! keyed by [`gpui::EntityId`]. Parents embed a `LinePlot` entity and
-//! leave rendering, bounds tracking, and GPU management to it.
-//!
-//! Every self-notify runs [`LinePlot::reconcile`], which spawns or drops
-//! trackers for added or removed traces, invalidates the view override
-//! when a reflected knob changes, and refreshes the cached title.
+//! Owns the canonical trace list, view-override fields, the
+//! [`PlotRenderState`] (reused as-is from the time-series module), and one
+//! tracking task per trace. Each trace's tracker waits for both its X and
+//! Y components, then loops scanning per-axis bounds so auto-fit reflects
+//! the latest data without re-uploading on every tick.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -17,33 +14,41 @@ use gpui::{
     canvas, prelude::*,
 };
 use metor_db::{Component, DB};
-use metor_proto::types::{ComponentId, Timestamp};
 
-use super::bounds::PlotBounds;
-use super::gpu::{AxisSource, LineDraw, PlotRenderState};
-use super::override_field::Override;
-use super::{NodeBoundsCache, Trace, expand_value_bounds};
-use crate::views::time_series::time_range::TimeRangeBehavior;
+use crate::views::time_series::{
+    AxisSource, LineDraw, NodeBoundsCache, Override, PlotBounds, PlotRenderState,
+    expand_value_bounds,
+};
 use crate::wait_for_component;
 
-/// Background state for one trace, keyed by the trace's [`EntityId`] so
-/// reordering `traces` doesn't invalidate resolved data.
-struct TraceTracking {
-    component: Option<Component>,
+use super::XyTrace;
+
+/// Background state for one XY trace, keyed by the trace's [`EntityId`]
+/// so reordering `traces` doesn't invalidate resolved data.
+struct XyTraceTracking {
+    x_component: Option<Component>,
+    y_component: Option<Component>,
+    x_bounds: Option<(f64, f64)>,
     y_bounds: Option<(f64, f64)>,
-    /// Moved in and out of the background scan task on each tick; cleared
-    /// when the trace's element index changes.
-    node_bounds: NodeBoundsCache,
-    cached_element_index: Option<usize>,
+    /// Per-axis caches keyed by node identity. Reset when the cached
+    /// element index for that axis changes.
+    x_node_bounds: NodeBoundsCache,
+    y_node_bounds: NodeBoundsCache,
+    cached_x_element_index: Option<usize>,
+    cached_y_element_index: Option<usize>,
 }
 
-impl TraceTracking {
+impl XyTraceTracking {
     fn new() -> Self {
         Self {
-            component: None,
+            x_component: None,
+            y_component: None,
+            x_bounds: None,
             y_bounds: None,
-            node_bounds: NodeBoundsCache::default(),
-            cached_element_index: None,
+            x_node_bounds: NodeBoundsCache::default(),
+            y_node_bounds: NodeBoundsCache::default(),
+            cached_x_element_index: None,
+            cached_y_element_index: None,
         }
     }
 }
@@ -52,30 +57,29 @@ impl TraceTracking {
 /// reconcile so an inspector edit can clear the interactive view override.
 #[derive(Clone, Copy, PartialEq)]
 struct OverrideSnapshot {
+    x_min: Option<f64>,
+    x_max: Option<f64>,
     y_min: Option<f64>,
     y_max: Option<f64>,
-    x_range: TimeRangeBehavior,
 }
 
 impl OverrideSnapshot {
-    fn capture(lp: &LinePlot) -> Self {
+    fn capture(lp: &XyLinePlot) -> Self {
         Self {
+            x_min: lp.x_min_override.as_custom().copied(),
+            x_max: lp.x_max_override.as_custom().copied(),
             y_min: lp.y_min_override.as_custom().copied(),
             y_max: lp.y_max_override.as_custom().copied(),
-            x_range: lp.x_range,
         }
     }
 }
 
-/// Self-contained line plot entity.
-///
-/// Owns the render state, traces, per-trace trackers, and the
-/// inspector-reflected view-override fields. Parents `.child(entity.clone())`
-/// into their render trees and mutate this entity's fields directly.
+/// Self-contained XY plot entity.
 #[derive(facet::Facet)]
-pub struct LinePlot {
-    pub traces: Vec<Entity<Trace>>,
-    pub x_range: TimeRangeBehavior,
+pub struct XyLinePlot {
+    pub traces: Vec<Entity<XyTrace>>,
+    pub x_min_override: Override<f64>,
+    pub x_max_override: Override<f64>,
     pub y_min_override: Override<f64>,
     pub y_max_override: Override<f64>,
     pub custom_title: Override<SharedString>,
@@ -83,7 +87,7 @@ pub struct LinePlot {
     #[facet(opaque)]
     db: Arc<DB>,
     #[facet(opaque)]
-    tracking: HashMap<EntityId, TraceTracking>,
+    tracking: HashMap<EntityId, XyTraceTracking>,
     #[facet(opaque)]
     tasks: HashMap<EntityId, gpui::Task<()>>,
     #[facet(opaque)]
@@ -96,12 +100,13 @@ pub struct LinePlot {
     gpu_state: PlotRenderState,
 }
 
-impl LinePlot {
+impl XyLinePlot {
     pub fn new(db: Arc<DB>, cx: &mut Context<Self>) -> Self {
         cx.observe_self(Self::reconcile).detach();
         Self {
             traces: Vec::new(),
-            x_range: TimeRangeBehavior::default(),
+            x_min_override: Override::Auto,
+            x_max_override: Override::Auto,
             y_min_override: Override::Auto,
             y_max_override: Override::Auto,
             custom_title: Override::Auto,
@@ -110,28 +115,21 @@ impl LinePlot {
             tasks: HashMap::new(),
             view_override: None,
             last_overrides: OverrideSnapshot {
+                x_min: None,
+                x_max: None,
                 y_min: None,
                 y_max: None,
-                x_range: TimeRangeBehavior::default(),
             },
-            title_cache: "Plot".into(),
+            title_cache: "XY Plot".into(),
             gpu_state: PlotRenderState::default(),
         }
     }
 
-    /// Replace the trace list from raw values.
-    ///
-    /// Convenience for callers (sparklines, table rows) that don't need a
-    /// persistent `Entity<Trace>` handle for each series.
-    pub fn bind_traces(&mut self, traces: Vec<Trace>, cx: &mut Context<Self>) {
+    pub fn bind_traces(&mut self, traces: Vec<XyTrace>, cx: &mut Context<Self>) {
         self.traces = traces.into_iter().map(|t| cx.new(|_| t)).collect();
         cx.notify();
     }
 
-    /// Pin the view to `view`, or clear the override with `None`.
-    ///
-    /// Called by pan/zoom handlers. Uses a bit-pattern compare to dodge
-    /// the lack of `PartialEq` on `f64`-containing [`PlotBounds`].
     pub fn set_view_override(&mut self, view: Option<PlotBounds>, cx: &mut Context<Self>) {
         if self.view_override.map(bounds_tuple) != view.map(bounds_tuple) {
             self.view_override = view;
@@ -143,11 +141,6 @@ impl LinePlot {
         &self.db
     }
 
-    /// Bring tracking state and the title cache in sync with `self.traces`.
-    ///
-    /// Runs on every self-notify. Spawns a tracker for each new trace,
-    /// drops trackers for removed traces, and resets the pan/zoom override
-    /// when an inspector edit changes the reflected view knobs.
     fn reconcile(&mut self, cx: &mut Context<Self>) {
         let current_ids: HashSet<EntityId> = self.traces.iter().map(|e| e.entity_id()).collect();
         let had_tracking_keys: Vec<EntityId> = self.tracking.keys().copied().collect();
@@ -160,7 +153,7 @@ impl LinePlot {
         for trace in &self.traces {
             let id = trace.entity_id();
             if let std::collections::hash_map::Entry::Vacant(slot) = self.tracking.entry(id) {
-                slot.insert(TraceTracking::new());
+                slot.insert(XyTraceTracking::new());
                 let task = Self::spawn_tracker(id, trace.clone(), self.db.clone(), cx);
                 self.tasks.insert(id, task);
             }
@@ -174,7 +167,7 @@ impl LinePlot {
 
         self.title_cache = match &self.custom_title {
             Override::Custom(custom) => custom.clone(),
-            Override::Auto => derive_title(&self.traces, &self.db, cx),
+            Override::Auto => derive_title(&self.traces, cx),
         };
     }
 
@@ -182,16 +175,19 @@ impl LinePlot {
     ///
     /// Returns the interactive pan/zoom override when set; otherwise
     /// auto-fits against the visible traces, then applies any
-    /// inspector-exposed bound overrides on top.
+    /// inspector-exposed bound overrides on top. Hidden traces are
+    /// skipped so legend toggles re-fit the remaining trace. Returns
+    /// `None` when either axis is missing data — partial bounds would
+    /// paint chrome with the wrong range until the second axis settles.
     pub fn effective_view(&self, cx: &gpui::App) -> Option<PlotBounds> {
         if let Some(v) = self.view_override {
             return Some(v);
         }
-        let mut start = f64::INFINITY;
-        let mut end = f64::NEG_INFINITY;
+        let mut x_min = f64::INFINITY;
+        let mut x_max = f64::NEG_INFINITY;
         let mut y_min = f64::INFINITY;
         let mut y_max = f64::NEG_INFINITY;
-        let mut any_time = false;
+        let mut any_x = false;
         let mut any_y = false;
         for trace in &self.traces {
             if !trace.read(cx).visible {
@@ -200,16 +196,10 @@ impl LinePlot {
             let Some(tracking) = self.tracking.get(&trace.entity_id()) else {
                 continue;
             };
-            let Some(comp) = &tracking.component else {
-                continue;
-            };
-            if let Some(s) = comp.time_series.start_timestamp() {
-                start = start.min(s.0 as f64);
-                any_time = true;
-            }
-            if let Some(l) = comp.time_series.latest() {
-                end = end.max(l.timestamp().0 as f64);
-                any_time = true;
+            if let Some((lo, hi)) = tracking.x_bounds {
+                x_min = x_min.min(lo);
+                x_max = x_max.max(hi);
+                any_x = true;
             }
             if let Some((lo, hi)) = tracking.y_bounds {
                 y_min = y_min.min(lo);
@@ -217,46 +207,18 @@ impl LinePlot {
                 any_y = true;
             }
         }
-        if !any_time || start >= end {
+        if !(any_x && any_y) {
             return None;
         }
-        let range = self
-            .x_range
-            .calculate_range(Timestamp(start as i64), Timestamp(end as i64));
-        let (auto_min, auto_max) = if any_y { (y_min, y_max) } else { (0.0, 1.0) };
-        let min_y = self.y_min_override.as_custom().copied().unwrap_or(auto_min);
-        let max_y = self.y_max_override.as_custom().copied().unwrap_or(auto_max);
-        Some(PlotBounds::new(range.start.0 as f64, min_y, range.end.0 as f64, max_y).normalize())
+        let min_x = self.x_min_override.as_custom().copied().unwrap_or(x_min);
+        let max_x = self.x_max_override.as_custom().copied().unwrap_or(x_max);
+        let min_y = self.y_min_override.as_custom().copied().unwrap_or(y_min);
+        let max_y = self.y_max_override.as_custom().copied().unwrap_or(y_max);
+        Some(PlotBounds::new(min_x, min_y, max_x, max_y).normalize())
     }
 
-    /// Earliest sample timestamp across resolved traces.
-    ///
-    /// Used by the x-axis tick generator to anchor labels against a
-    /// stable origin even as the plot scrolls.
-    pub fn data_start(&self) -> Option<f64> {
-        let mut start = f64::INFINITY;
-        let mut any = false;
-        for trace in &self.traces {
-            let Some(tracking) = self.tracking.get(&trace.entity_id()) else {
-                continue;
-            };
-            let Some(comp) = &tracking.component else {
-                continue;
-            };
-            if let Some(s) = comp.time_series.start_timestamp() {
-                start = start.min(s.0 as f64);
-                any = true;
-            }
-        }
-        any.then_some(start)
-    }
-
-    pub fn traces(&self) -> &[Entity<Trace>] {
+    pub fn traces(&self) -> &[Entity<XyTrace>] {
         &self.traces
-    }
-
-    pub fn trace(&self, idx: usize) -> Option<&Entity<Trace>> {
-        self.traces.get(idx)
     }
 
     pub fn trace_count(&self) -> usize {
@@ -267,26 +229,36 @@ impl LinePlot {
         self.traces.is_empty()
     }
 
-    /// Title shown in the host panel. Cached by [`Self::reconcile`].
     pub fn title(&self) -> SharedString {
         self.title_cache.clone()
     }
 
     fn spawn_tracker(
         id: EntityId,
-        trace: Entity<Trace>,
+        trace: Entity<XyTrace>,
         db: Arc<DB>,
         cx: &mut Context<Self>,
     ) -> gpui::Task<()> {
         cx.spawn(async move |this, cx| {
-            let trace_id = match this.update(cx, |_, cx| trace.read(cx).component_id) {
-                Ok(id) => id,
+            let (x_id, y_id) = match this.update(cx, |_, cx| {
+                let t = trace.read(cx);
+                (t.x_component_id, t.y_component_id)
+            }) {
+                Ok(ids) => ids,
                 Err(_) => return,
             };
-            let component = wait_for_component(&db, trace_id).await;
+
+            // Sequential awaits are fine here: components are typically
+            // already present in the DB by the time a trace is created
+            // (the wizard picks from a populated list), so neither wait
+            // actually blocks past the first poll.
+            let x_component = wait_for_component(&db, x_id).await;
+            let y_component = wait_for_component(&db, y_id).await;
+
             let installed = this.update(cx, |lp, cx| {
                 if let Some(tracking) = lp.tracking.get_mut(&id) {
-                    tracking.component = Some(component.clone());
+                    tracking.x_component = Some(x_component.clone());
+                    tracking.y_component = Some(y_component.clone());
                     cx.notify();
                     true
                 } else {
@@ -300,25 +272,36 @@ impl LinePlot {
             loop {
                 let inputs = this.update(cx, |lp, cx| {
                     let tracking = lp.tracking.get_mut(&id)?;
-                    let comp = tracking.component.clone()?;
-                    let element_index = trace.read(cx).element_index;
-                    if tracking.cached_element_index != Some(element_index) {
-                        tracking.node_bounds.clear();
-                        tracking.y_bounds = None;
-                        tracking.cached_element_index = Some(element_index);
+                    let x_comp = tracking.x_component.clone()?;
+                    let y_comp = tracking.y_component.clone()?;
+                    let t = trace.read(cx);
+                    let x_idx = t.x_element_index;
+                    let y_idx = t.y_element_index;
+                    if tracking.cached_x_element_index != Some(x_idx) {
+                        tracking.x_node_bounds.clear();
+                        tracking.x_bounds = None;
+                        tracking.cached_x_element_index = Some(x_idx);
                     }
-                    let cache = std::mem::take(&mut tracking.node_bounds);
-                    Some((comp, element_index, cache))
+                    if tracking.cached_y_element_index != Some(y_idx) {
+                        tracking.y_node_bounds.clear();
+                        tracking.y_bounds = None;
+                        tracking.cached_y_element_index = Some(y_idx);
+                    }
+                    let x_cache = std::mem::take(&mut tracking.x_node_bounds);
+                    let y_cache = std::mem::take(&mut tracking.y_node_bounds);
+                    Some((x_comp, y_comp, x_idx, y_idx, x_cache, y_cache))
                 });
-                let Ok(Some((comp, element_index, mut cache))) = inputs else {
+                let Ok(Some((x_comp, y_comp, x_idx, y_idx, mut x_cache, mut y_cache))) = inputs
+                else {
                     break;
                 };
 
-                let (bounds, cache) = cx
+                let (x_bounds, x_cache, y_bounds, y_cache) = cx
                     .background_executor()
                     .spawn(async move {
-                        let bounds = expand_value_bounds(&comp, &[element_index], &mut cache);
-                        (bounds, cache)
+                        let xb = expand_value_bounds(&x_comp, &[x_idx], &mut x_cache);
+                        let yb = expand_value_bounds(&y_comp, &[y_idx], &mut y_cache);
+                        (xb, x_cache, yb, y_cache)
                     })
                     .await;
 
@@ -326,11 +309,13 @@ impl LinePlot {
                     let Some(tracking) = lp.tracking.get_mut(&id) else {
                         return false;
                     };
-                    // Drop the result if the trace's element index was
-                    // changed concurrently; the next iteration rescans.
-                    if tracking.cached_element_index == Some(element_index) {
-                        tracking.node_bounds = cache;
-                        tracking.y_bounds = bounds;
+                    if tracking.cached_x_element_index == Some(x_idx) {
+                        tracking.x_node_bounds = x_cache;
+                        tracking.x_bounds = x_bounds;
+                    }
+                    if tracking.cached_y_element_index == Some(y_idx) {
+                        tracking.y_node_bounds = y_cache;
+                        tracking.y_bounds = y_bounds;
                     }
                     cx.notify();
                     true
@@ -338,13 +323,18 @@ impl LinePlot {
                 if !matches!(installed, Ok(true)) {
                     break;
                 }
-                component.time_series.wait().await;
+                // Wake on Y-component data, matching the time-series
+                // tracker. Co-recorded components share cadence in
+                // practice, so X bounds are refreshed in the same
+                // iteration. Cross-cadence pairs lag by one Y tick on
+                // X-bound updates — acceptable for v1.
+                y_component.time_series.wait().await;
             }
         })
     }
 }
 
-impl Render for LinePlot {
+impl Render for XyLinePlot {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let weak = cx.entity().downgrade();
         canvas(
@@ -362,13 +352,18 @@ impl Render for LinePlot {
                                         return None;
                                     }
                                     let tracking = lp.tracking.get(&trace.entity_id())?;
-                                    let component = tracking.component.as_ref()?;
+                                    let x_component = tracking.x_component.as_ref()?;
+                                    let y_component = tracking.y_component.as_ref()?;
                                     Some(LineDraw {
-                                        x: AxisSource::Timestamps,
+                                        x: AxisSource::Element {
+                                            component_id: config.x_component_id,
+                                            component: x_component,
+                                            element_index: config.x_element_index,
+                                        },
                                         y: AxisSource::Element {
-                                            component_id: config.component_id,
-                                            component,
-                                            element_index: config.element_index,
+                                            component_id: config.y_component_id,
+                                            component: y_component,
+                                            element_index: config.y_element_index,
                                         },
                                         style: config.style,
                                         color: config.color,
@@ -380,7 +375,7 @@ impl Render for LinePlot {
                                 && let Some(handle) =
                                     lp.gpu_state.render(cx, bounds, scale_factor, view, &draws)
                             {
-                                handle.spawn_and_set(cx, line_plot_gpu_state);
+                                handle.spawn_and_set(cx, xy_plot_gpu_state);
                             }
                         }
                         (
@@ -404,12 +399,10 @@ impl Render for LinePlot {
     }
 }
 
-fn line_plot_gpu_state(lp: &mut LinePlot) -> &mut PlotRenderState {
+fn xy_plot_gpu_state(lp: &mut XyLinePlot) -> &mut PlotRenderState {
     &mut lp.gpu_state
 }
 
-/// Convert [`PlotBounds`] to a bit-pattern tuple so `PartialEq` fields can
-/// compare bounds despite the `f64` contents.
 fn bounds_tuple(b: PlotBounds) -> (u64, u64, u64, u64) {
     (
         b.min_x.to_bits(),
@@ -421,49 +414,20 @@ fn bounds_tuple(b: PlotBounds) -> (u64, u64, u64, u64) {
 
 /// Derive a plot title from the trace list.
 ///
-/// A component contributes just its name when every element is plotted;
-/// partial coverage gets an `[x,y]`-style subset. Multiple components are
-/// joined with `", "`.
-fn derive_title(traces: &[Entity<Trace>], db: &Arc<DB>, cx: &gpui::App) -> SharedString {
+/// One trace renders as `<x_label> vs <y_label>` (using the trace's
+/// `label` field if non-empty, else the component name suffix). Multiple
+/// traces fall back to a generic count. Empty list yields "XY Plot".
+fn derive_title(traces: &[Entity<XyTrace>], cx: &gpui::App) -> SharedString {
     if traces.is_empty() {
-        return "Plot".into();
+        return "XY Plot".into();
     }
-
-    let mut groups: HashMap<ComponentId, Vec<usize>> = HashMap::new();
-    let mut order: Vec<ComponentId> = Vec::new();
-    for trace in traces {
-        let t = trace.read(cx);
-        let id = t.component_id;
-        groups
-            .entry(id)
-            .or_insert_with(|| {
-                order.push(id);
-                Vec::new()
-            })
-            .push(t.element_index);
+    if traces.len() == 1 {
+        let t = traces[0].read(cx);
+        return if t.label.is_empty() {
+            "XY Plot".into()
+        } else {
+            t.label.clone()
+        };
     }
-
-    let parts: Vec<String> = order
-        .iter()
-        .map(|comp_id| {
-            let indexes = &groups[comp_id];
-            let all_elements =
-                crate::inspector::trace_picker::element_names_for_component(db, *comp_id);
-            let comp_name = db
-                .with_state(|s| s.get_component_metadata(*comp_id).map(|m| m.name.clone()))
-                .unwrap_or_default();
-
-            if indexes.len() == all_elements.len() {
-                comp_name
-            } else {
-                let names: Vec<&str> = indexes
-                    .iter()
-                    .filter_map(|&i| all_elements.get(i).map(|s| s.as_str()))
-                    .collect();
-                format!("{}[{}]", comp_name, names.join(","))
-            }
-        })
-        .collect();
-
-    SharedString::from(parts.join(", "))
+    SharedString::from(format!("XY Plot ({} traces)", traces.len()))
 }

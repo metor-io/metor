@@ -60,11 +60,14 @@ pub struct EntityAdapter {
 
 /// Non-Facet field metadata that still needs to affect rendering.
 ///
-/// Currently carries slider ranges; Facet attributes can't take non-string
-/// literal ranges without parse support at the grammar level.
-#[derive(Clone)]
+/// Carries slider ranges (Facet attributes can't take non-string literal
+/// ranges without parse support at the grammar level) and an
+/// allowed-variant list for enums where the view wants to hide some
+/// variants from the inspector picker (e.g. `Bar` on XY plots).
+#[derive(Clone, Default)]
 pub struct FieldOverride {
     pub range: Option<(f64, f64)>,
+    pub enum_allowed: Option<&'static [&'static str]>,
 }
 
 /// Builds the nav row for a `Vec<Entity<T>>` field.

@@ -1,9 +1,15 @@
-//! GPU pipeline shared by every line plot in the panel.
+//! GPU pipeline shared by every plot in the panel.
 //!
 //! A single process-wide [`PlotGpu`] global owns the wgpu pipelines and
 //! shared storage buffers. Each caller holds a lightweight
 //! [`PlotRenderState`] carrying its own off-screen target and the frame
 //! currently blitted to its canvas.
+//!
+//! The pipeline operates on generic `(x, y)` data-space pairs — there is no
+//! intrinsic notion of time. Time-series and XY-plot callers both build
+//! `LineDraw`s whose `x`/`y` axes are [`AxisSource`]s; the time-series mode
+//! sets `x = AxisSource::Timestamps` so the materializer reads timestamps
+//! out of the same node carrying the Y-axis values.
 //!
 //! Frame lifecycle:
 //! 1. Caller passes a `&[LineDraw]` to [`PlotRenderState::render`] from
@@ -44,11 +50,45 @@ const NS_PER_SEC: f64 = 1.0e9;
 const UNIFORM_ALIGN: u64 = 256;
 const MAX_TRACES: usize = 64;
 
+/// Where one axis of a trace gets its values.
+///
+/// `Timestamps` reads from a node's `Timestamp` index; the materializer
+/// scales nanoseconds to seconds so f32 storage retains precision over
+/// long durations. `Element` reads one element of one component schema's
+/// raw byte buffer at its native scale.
+#[derive(Clone, Copy)]
+pub(crate) enum AxisSource<'a> {
+    Timestamps,
+    Element {
+        component_id: ComponentId,
+        component: &'a Component,
+        element_index: usize,
+    },
+}
+
+impl<'a> AxisSource<'a> {
+    /// Conversion factor applied during materialization so the GPU sees a
+    /// numerically stable f32 even when the source range is huge (e.g.,
+    /// nanosecond timestamps).
+    fn scale(&self) -> f64 {
+        match self {
+            AxisSource::Timestamps => 1.0 / NS_PER_SEC,
+            AxisSource::Element { .. } => 1.0,
+        }
+    }
+
+    fn component(&self) -> Option<&'a Component> {
+        match self {
+            AxisSource::Timestamps => None,
+            AxisSource::Element { component, .. } => Some(component),
+        }
+    }
+}
+
 /// Draw inputs for one trace; callers build a slice of these per paint.
 pub(crate) struct LineDraw<'a> {
-    pub component_id: ComponentId,
-    pub component: &'a Component,
-    pub element_index: usize,
+    pub x: AxisSource<'a>,
+    pub y: AxisSource<'a>,
     pub style: PlotStyle,
     pub color: Hsla,
     pub stroke_width: f32,
@@ -82,76 +122,20 @@ struct ValueCache {
     /// Next free slot in samples (×4 bytes for the byte offset). Reset at
     /// the start of every `submit`.
     cursor: u32,
-    /// Common epoch for all uploaded timestamps (nanoseconds).
+    /// Per-frame epoch for the X axis in raw plot-space units (nanoseconds
+    /// for timestamps, native units for component elements).
     ///
-    /// X values are uploaded as `f32` seconds relative to this epoch; the
-    /// epoch is lazy-initialized so the dynamic range stays small enough
-    /// for `f32` precision to hold.
-    epoch_ns: Option<i64>,
+    /// Lazy-initialized from the first uploaded X sample so the dynamic
+    /// range stays small enough for `f32` precision to hold.
+    epoch_x: Option<f64>,
 }
 
 impl ValueCache {
     fn new() -> Self {
         Self {
             cursor: 0,
-            epoch_ns: None,
+            epoch_x: None,
         }
-    }
-
-    /// Upload decimated samples `[lod_start..lod_end)` of one node.
-    ///
-    /// Bumps `cursor` by the uploaded count. Returns `None` when either
-    /// the node is empty or the per-frame working set would overflow
-    /// `VALUE_CAPACITY`.
-    #[allow(clippy::too_many_arguments)]
-    fn upload_window(
-        &mut self,
-        queue: &wgpu::Queue,
-        x_buf: &wgpu::Buffer,
-        y_buf: &wgpu::Buffer,
-        scratch_x: &mut Vec<f32>,
-        scratch_y: &mut Vec<f32>,
-        slice: &TimeSeriesNodeSlice,
-        schema: &ComponentSchema,
-        element_index: usize,
-        lod_stride: usize,
-        lod_start: usize,
-        lod_end: usize,
-    ) -> Option<(u32, u32)> {
-        if lod_end <= lod_start {
-            return None;
-        }
-        let timestamps = slice.full_timestamps();
-        if timestamps.is_empty() {
-            return None;
-        }
-        if self.epoch_ns.is_none() {
-            self.epoch_ns = Some(timestamps[0].0);
-        }
-        let epoch = self.epoch_ns?;
-
-        let count = (lod_end - lod_start) as u32;
-        if self.cursor.checked_add(count)? > VALUE_CAPACITY {
-            return None;
-        }
-
-        convert_timestamps_strided(timestamps, lod_stride, lod_start, lod_end, epoch, scratch_x);
-        convert_values_strided(
-            schema,
-            slice.full_data(),
-            element_index,
-            lod_stride,
-            lod_start,
-            lod_end,
-            scratch_y,
-        );
-        let byte_offset = self.cursor as u64 * 4;
-        queue.write_buffer(x_buf, byte_offset, bytemuck::cast_slice(scratch_x));
-        queue.write_buffer(y_buf, byte_offset, bytemuck::cast_slice(scratch_y));
-
-        let offset = self.cursor;
-        self.cursor += count;
-        Some((offset, count))
     }
 }
 
@@ -535,6 +519,7 @@ impl PlotGpu {
     ) -> bool {
         self.idx_scratch.clear();
         self.cache.cursor = 0;
+        self.cache.epoch_x = None;
         let pixel_budget = target.width as usize;
 
         let mut plans: Vec<TracePlan> = Vec::with_capacity(traces.len());
@@ -557,17 +542,27 @@ impl PlotGpu {
             return false;
         }
 
-        let epoch_ns = self.cache.epoch_ns.unwrap_or(view.min_x as i64);
-        let view_min_sec = ((view.min_x as i64 - epoch_ns) as f64 / NS_PER_SEC) as f32;
-        let view_max_sec = ((view.max_x as i64 - epoch_ns) as f64 / NS_PER_SEC) as f32;
-        let dx_sec = (view_max_sec - view_min_sec).max(1e-12);
+        // X axis uniform space: shifted by epoch and scaled by the X
+        // source's scale factor (1.0 for element values, 1e-9 for ns
+        // timestamps). The `x_scale_factor` of the FIRST trace whose
+        // source is well-defined drives the view uniform; all real-world
+        // call sites compose homogeneous traces (all time-series xor all
+        // XY), so picking the first is sufficient.
+        let epoch_x = self.cache.epoch_x.unwrap_or(view.min_x);
+        let x_scale_factor = traces
+            .first()
+            .map(|t| t.x.scale())
+            .unwrap_or(1.0 / NS_PER_SEC);
+        let view_min_x = ((view.min_x - epoch_x) * x_scale_factor) as f32;
+        let view_max_x = ((view.max_x - epoch_x) * x_scale_factor) as f32;
+        let dx = (view_max_x - view_min_x).max(1e-12);
         let dy = (view.max_y - view.min_y).max(1e-12);
-        let scale_x = 2.0 / dx_sec;
+        let scale_x = 2.0 / dx;
         let scale_y = (2.0 / dy) as f32;
         let view_uniform = ViewUniform {
             scale: [scale_x, scale_y],
             offset: [
-                -1.0 - view_min_sec * scale_x,
+                -1.0 - view_min_x * scale_x,
                 -1.0 - (view.min_y as f32) * scale_y,
             ],
             viewport: [target.width as f32, target.height as f32],
@@ -810,6 +805,71 @@ struct TracePlan {
     spans: Vec<DrawSpan>,
 }
 
+/// View over one node, decoupled from `TimeSeriesNodeSlice` so the same
+/// upload helper can serve time-series traces (which carry a view-culled
+/// slice) and XY traces (which walk full nodes, possibly capped to the
+/// shorter of the X/Y component's joint length).
+///
+/// Owns its underlying slice (cheap: an `Arc` plus a range) so the
+/// computed start/end indices don't depend on borrowing across iterators.
+struct NodeView {
+    slice: TimeSeriesNodeSlice,
+    /// Index into `slice.full_timestamps()` where the visible window begins.
+    visible_start: usize,
+    /// Number of samples in the visible window (already capped where applicable).
+    visible_len: usize,
+}
+
+impl NodeView {
+    fn from_slice(slice: TimeSeriesNodeSlice) -> Self {
+        let visible = slice.timestamps();
+        let full = slice.full_timestamps();
+        let visible_start = if visible.is_empty() {
+            0
+        } else {
+            unsafe { visible.as_ptr().offset_from(full.as_ptr()).max(0) as usize }
+        };
+        let visible_len = visible.len();
+        Self {
+            slice,
+            visible_start,
+            visible_len,
+        }
+    }
+
+    /// Build a view over a full-extent slice, capping the visible window
+    /// at `cap` samples. Used by XY traces where the X and Y components'
+    /// node lengths must be paired at `min(len_x, len_y)`.
+    fn from_full_slice_capped(slice: TimeSeriesNodeSlice, cap: usize) -> Self {
+        let visible_len = slice.timestamps().len().min(cap);
+        Self {
+            slice,
+            visible_start: 0,
+            visible_len,
+        }
+    }
+
+    fn full_timestamps(&self) -> &[Timestamp] {
+        self.slice.full_timestamps()
+    }
+
+    fn full_data(&self) -> &[u8] {
+        self.slice.full_data()
+    }
+
+    fn visible_start(&self) -> usize {
+        self.visible_start
+    }
+
+    fn visible_end(&self) -> usize {
+        self.visible_start + self.visible_len
+    }
+
+    fn visible_len(&self) -> usize {
+        self.visible_len
+    }
+}
+
 /// Walk one trace's visible nodes, decimate, upload to the value cache,
 /// and emit draw spans referenced by `idx_scratch`.
 #[allow(clippy::too_many_arguments)]
@@ -829,47 +889,106 @@ fn plan_trace(
     if pixel_budget == 0 {
         return TracePlan { spans };
     }
-    let start = Timestamp(view.min_x as i64);
-    let end = Timestamp(view.max_x as i64);
-    let Some(slice) = trace.component.time_series.get_range(start..end) else {
-        return TracePlan { spans };
-    };
-    let nodes: Vec<_> = slice.as_iter().collect();
-    let total: usize = nodes.iter().map(|n| n.timestamps().len()).sum();
 
-    for node in nodes.iter().rev() {
-        let visible = node.timestamps();
-        let visible_len = visible.len();
+    // Build the per-axis node lists. Time-series uses time-range culling
+    // on the Y axis's component; XY pairs nodes by stack index across two
+    // components.
+    let pairs: Vec<NodePair> = match (&trace.x, &trace.y) {
+        (AxisSource::Timestamps, AxisSource::Element { component, .. }) => {
+            let start = Timestamp(view.min_x as i64);
+            let end = Timestamp(view.max_x as i64);
+            let Some(slice) = component.time_series.get_range(start..end) else {
+                return TracePlan { spans };
+            };
+            slice
+                .as_iter()
+                .map(|node| NodePair {
+                    x: NodeView::from_slice(node.clone()),
+                    y: NodeView::from_slice(node),
+                })
+                .collect()
+        }
+        (
+            AxisSource::Element {
+                component: comp_x, ..
+            },
+            AxisSource::Element {
+                component: comp_y, ..
+            },
+        ) => {
+            // AtomicStack iterates newest-first; collect both, pair by
+            // stack index so identical-cadence components line up at the
+            // node level. Mismatched lengths truncate to the shorter list
+            // — this is the user-stated "assume samples are aligned"
+            // mode; resampling is a follow-up.
+            let xs: Vec<_> = comp_x.time_series.iter_node_slices().collect();
+            let ys: Vec<_> = comp_y.time_series.iter_node_slices().collect();
+            let n = xs.len().min(ys.len());
+            xs.into_iter()
+                .zip(ys)
+                .take(n)
+                .map(|(xn, yn)| {
+                    let cap = xn.timestamps().len().min(yn.timestamps().len());
+                    NodePair {
+                        x: NodeView::from_full_slice_capped(xn, cap),
+                        y: NodeView::from_full_slice_capped(yn, cap),
+                    }
+                })
+                .collect()
+        }
+        _ => return TracePlan { spans },
+    };
+
+    let total: usize = pairs.iter().map(|p| p.y.visible_len()).sum();
+    if total == 0 {
+        return TracePlan { spans };
+    }
+
+    for pair in pairs.iter().rev() {
+        let visible_len = pair.y.visible_len();
         if visible_len == 0 {
             continue;
         }
         let Some(stride) = node_stride(visible_len, total, pixel_budget) else {
             continue;
         };
-
         let upload_stride = quantize_stride(stride);
 
-        let full = node.full_timestamps();
-        let slice_start_idx =
-            unsafe { visible.as_ptr().offset_from(full.as_ptr()).max(0) as usize };
         // Extend one sample past each boundary so segments crossing the
         // edge are drawn and clipped by the GPU rather than dropped.
-        let ext_start_idx = slice_start_idx.saturating_sub(1);
-        let ext_end_idx = (slice_start_idx + visible_len + 1).min(full.len());
+        // Only meaningful for view-culled time-series traces. For XY,
+        // `visible_end` is `min(x_node_len, y_node_len)` and the +1
+        // would invent a cross-component pair `(X[last_x], Y[cap])`
+        // when nodes have unequal fill rates (24-byte Vec3 seals at
+        // ~1.4M while paired Scalar seals at 4M).
+        let extend_boundaries = matches!(
+            (&trace.x, &trace.y),
+            (AxisSource::Timestamps, _),
+        );
+        let (ext_start_idx, ext_end_idx) = if extend_boundaries {
+            (
+                pair.y.visible_start().saturating_sub(1),
+                (pair.y.visible_end() + 1).min(pair.y.full_timestamps().len()),
+            )
+        } else {
+            (pair.y.visible_start(), pair.y.visible_end())
+        };
 
-        let full_decimated = full.len().div_ceil(upload_stride);
         let lod_start = ext_start_idx / upload_stride;
+        let full_decimated = pair.y.full_timestamps().len().div_ceil(upload_stride);
         let lod_end = ext_end_idx.div_ceil(upload_stride).min(full_decimated);
 
-        let Some((chunk_offset, count)) = cache.upload_window(
-            &ctx.queue,
-            x_buf,
-            y_buf,
+        let Some((chunk_offset, count)) = upload_pair(
+            ctx,
+            cache,
             upload_x,
             upload_y,
-            node,
-            &trace.component.schema,
-            trace.element_index,
+            x_buf,
+            y_buf,
+            &pair.x,
+            &pair.y,
+            &trace.x,
+            &trace.y,
             upload_stride,
             lod_start,
             lod_end,
@@ -901,6 +1020,170 @@ fn plan_trace(
     }
 
     TracePlan { spans }
+}
+
+struct NodePair {
+    x: NodeView,
+    y: NodeView,
+}
+
+/// Upload one node-pair's decimated samples into the X/Y storage buffers.
+///
+/// Lazy-initializes `cache.epoch_x` from the first uploaded X sample so
+/// the on-GPU f32 stays numerically stable even when raw values are huge
+/// (e.g., nanosecond timestamps).
+#[allow(clippy::too_many_arguments)]
+fn upload_pair(
+    ctx: &GpuContext,
+    cache: &mut ValueCache,
+    scratch_x: &mut Vec<f32>,
+    scratch_y: &mut Vec<f32>,
+    x_buf: &wgpu::Buffer,
+    y_buf: &wgpu::Buffer,
+    x_node: &NodeView,
+    y_node: &NodeView,
+    x_source: &AxisSource<'_>,
+    y_source: &AxisSource<'_>,
+    lod_stride: usize,
+    lod_start: usize,
+    lod_end: usize,
+) -> Option<(u32, u32)> {
+    if lod_end <= lod_start {
+        return None;
+    }
+    let count = (lod_end - lod_start) as u32;
+    if cache.cursor.checked_add(count)? > VALUE_CAPACITY {
+        return None;
+    }
+
+    if cache.epoch_x.is_none() {
+        cache.epoch_x = first_axis_value(x_source, x_node, lod_stride, lod_start);
+    }
+    let epoch_x = cache.epoch_x.unwrap_or(0.0);
+
+    materialize_axis(
+        x_source,
+        x_node,
+        lod_stride,
+        lod_start,
+        lod_end,
+        epoch_x,
+        scratch_x,
+    );
+    materialize_axis(
+        y_source,
+        y_node,
+        lod_stride,
+        lod_start,
+        lod_end,
+        // Y axis is never epoch-shifted on the GPU; data magnitudes are
+        // expected to be reasonable. (If this ever bites, route Y through
+        // the same epoch_y mechanism as X.)
+        0.0,
+        scratch_y,
+    );
+
+    let byte_offset = cache.cursor as u64 * 4;
+    ctx.queue
+        .write_buffer(x_buf, byte_offset, bytemuck::cast_slice(scratch_x));
+    ctx.queue
+        .write_buffer(y_buf, byte_offset, bytemuck::cast_slice(scratch_y));
+
+    let offset = cache.cursor;
+    cache.cursor += count;
+    Some((offset, count))
+}
+
+/// Read the first value the materializer would produce, in raw plot-space
+/// units (i.e. without the axis's scale factor applied). Used to seed the
+/// per-frame epoch.
+fn first_axis_value(
+    source: &AxisSource<'_>,
+    node: &NodeView,
+    lod_stride: usize,
+    lod_start: usize,
+) -> Option<f64> {
+    match source {
+        AxisSource::Timestamps => {
+            let ts = node.full_timestamps();
+            if ts.is_empty() {
+                return None;
+            }
+            let src = (lod_start * lod_stride).min(ts.len() - 1);
+            Some(ts[src].0 as f64)
+        }
+        AxisSource::Element {
+            component,
+            element_index,
+            ..
+        } => {
+            let schema = &component.schema;
+            let elem_size = schema.size();
+            let data = node.full_data();
+            if elem_size == 0 || data.is_empty() {
+                return None;
+            }
+            let max_sample = data.len() / elem_size;
+            if max_sample == 0 {
+                return None;
+            }
+            let src = (lod_start * lod_stride).min(max_sample - 1);
+            read_element_f64(schema, data, src, *element_index)
+        }
+    }
+}
+
+/// Materialize one axis's strided samples as `f32` in shifted plot space.
+///
+/// The output value is `(raw - epoch) * source.scale()`, written into
+/// `out`. Raw timestamp axes pick up a 1e-9 scaling so f32 storage
+/// retains nanosecond precision over long durations.
+fn materialize_axis(
+    source: &AxisSource<'_>,
+    node: &NodeView,
+    lod_stride: usize,
+    lod_start: usize,
+    lod_end: usize,
+    epoch: f64,
+    out: &mut Vec<f32>,
+) {
+    out.clear();
+    out.reserve(lod_end - lod_start);
+    let scale = source.scale();
+    match source {
+        AxisSource::Timestamps => {
+            let ts = node.full_timestamps();
+            if ts.is_empty() {
+                for _ in lod_start..lod_end {
+                    out.push(0.0);
+                }
+                return;
+            }
+            for di in lod_start..lod_end {
+                let src = (di * lod_stride).min(ts.len() - 1);
+                let v = (ts[src].0 as f64 - epoch) * scale;
+                out.push(v as f32);
+            }
+        }
+        AxisSource::Element {
+            component,
+            element_index,
+            ..
+        } => {
+            let schema = &component.schema;
+            convert_element_strided(
+                schema,
+                node.full_data(),
+                *element_index,
+                lod_stride,
+                lod_start,
+                lod_end,
+                epoch,
+                scale,
+                out,
+            );
+        }
+    }
 }
 
 /// Pick the decimation stride for one node.
@@ -962,33 +1245,45 @@ fn read_value<T: PlotValue>(
     T::read_from_bytes(buf).ok().map(|v| v.to_f64())
 }
 
-/// Materialize every `lod_stride`-th timestamp in `[from..to)` as `f32`
-/// seconds relative to `epoch_ns`.
-fn convert_timestamps_strided(
-    timestamps: &[Timestamp],
-    lod_stride: usize,
-    from: usize,
-    to: usize,
-    epoch_ns: i64,
-    out: &mut Vec<f32>,
-) {
-    out.clear();
-    out.reserve(to - from);
-    for decimated_i in from..to {
-        let src = (decimated_i * lod_stride).min(timestamps.len().saturating_sub(1));
-        let delta_ns = timestamps[src].0 - epoch_ns;
-        out.push((delta_ns as f64 / NS_PER_SEC) as f32);
+/// Read one element as f64, dispatching on the schema's prim type.
+fn read_element_f64(
+    schema: &ComponentSchema,
+    data: &[u8],
+    sample_index: usize,
+    element_index: usize,
+) -> Option<f64> {
+    let elem_size = schema.size();
+    if elem_size == 0 {
+        return None;
+    }
+    match schema.prim_type {
+        PrimType::F64 => read_value::<f64>(data, sample_index, elem_size, element_index),
+        PrimType::F32 => read_value::<f32>(data, sample_index, elem_size, element_index),
+        PrimType::I64 => read_value::<i64>(data, sample_index, elem_size, element_index),
+        PrimType::I32 => read_value::<i32>(data, sample_index, elem_size, element_index),
+        PrimType::I16 => read_value::<i16>(data, sample_index, elem_size, element_index),
+        PrimType::I8 => read_value::<i8>(data, sample_index, elem_size, element_index),
+        PrimType::U64 => read_value::<u64>(data, sample_index, elem_size, element_index),
+        PrimType::U32 => read_value::<u32>(data, sample_index, elem_size, element_index),
+        PrimType::U16 => read_value::<u16>(data, sample_index, elem_size, element_index),
+        PrimType::U8 | PrimType::Bool => {
+            read_value::<u8>(data, sample_index, elem_size, element_index)
+        }
     }
 }
 
-/// Materialize every `lod_stride`-th sample of one element into `f32`.
-fn convert_values_strided(
+/// Materialize every `lod_stride`-th sample of one element into `f32`,
+/// applying `(raw - epoch) * scale` per sample.
+#[allow(clippy::too_many_arguments)]
+fn convert_element_strided(
     schema: &ComponentSchema,
     full_data: &[u8],
     element_index: usize,
     lod_stride: usize,
     from: usize,
     to: usize,
+    epoch: f64,
+    scale: f64,
     out: &mut Vec<f32>,
 ) {
     let elem_size = schema.size();
@@ -1009,12 +1304,14 @@ fn convert_values_strided(
         max_sample: usize,
         elem_size: usize,
         elem_index: usize,
+        epoch: f64,
+        scale: f64,
         out: &mut Vec<f32>,
     ) {
         for decimated_i in from..to {
             let src = (decimated_i * lod_stride).min(max_sample.saturating_sub(1));
             let v = read_value::<T>(data, src, elem_size, elem_index).unwrap_or(0.0);
-            out.push(v as f32);
+            out.push(((v - epoch) * scale) as f32);
         }
     }
 
@@ -1027,6 +1324,8 @@ fn convert_values_strided(
             max_sample,
             elem_size,
             element_index,
+            epoch,
+            scale,
             out,
         ),
         PrimType::F32 => fill::<f32>(
@@ -1037,6 +1336,8 @@ fn convert_values_strided(
             max_sample,
             elem_size,
             element_index,
+            epoch,
+            scale,
             out,
         ),
         PrimType::I64 => fill::<i64>(
@@ -1047,6 +1348,8 @@ fn convert_values_strided(
             max_sample,
             elem_size,
             element_index,
+            epoch,
+            scale,
             out,
         ),
         PrimType::I32 => fill::<i32>(
@@ -1057,6 +1360,8 @@ fn convert_values_strided(
             max_sample,
             elem_size,
             element_index,
+            epoch,
+            scale,
             out,
         ),
         PrimType::I16 => fill::<i16>(
@@ -1067,6 +1372,8 @@ fn convert_values_strided(
             max_sample,
             elem_size,
             element_index,
+            epoch,
+            scale,
             out,
         ),
         PrimType::I8 => fill::<i8>(
@@ -1077,6 +1384,8 @@ fn convert_values_strided(
             max_sample,
             elem_size,
             element_index,
+            epoch,
+            scale,
             out,
         ),
         PrimType::U64 => fill::<u64>(
@@ -1087,6 +1396,8 @@ fn convert_values_strided(
             max_sample,
             elem_size,
             element_index,
+            epoch,
+            scale,
             out,
         ),
         PrimType::U32 => fill::<u32>(
@@ -1097,6 +1408,8 @@ fn convert_values_strided(
             max_sample,
             elem_size,
             element_index,
+            epoch,
+            scale,
             out,
         ),
         PrimType::U16 => fill::<u16>(
@@ -1107,6 +1420,8 @@ fn convert_values_strided(
             max_sample,
             elem_size,
             element_index,
+            epoch,
+            scale,
             out,
         ),
         PrimType::U8 | PrimType::Bool => fill::<u8>(
@@ -1117,6 +1432,8 @@ fn convert_values_strided(
             max_sample,
             elem_size,
             element_index,
+            epoch,
+            scale,
             out,
         ),
     }

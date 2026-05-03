@@ -11,6 +11,7 @@ use crate::inspector::{InspectorMode, InspectorRequest, OpenInspectorCallback};
 use crate::views::dashboard::DashboardPanel;
 use crate::views::time_series::{LinePlot, Override, PlotStyle, Trace};
 use crate::views::viewer_3d::Viewer3d;
+use crate::views::xy_plot::{XyLinePlot, XyPlot, XyTrace};
 use crate::views::{
     ComponentBrowser, ComponentTable, ComponentText, DataTable, TimeSeriesPlot, TrafficLight,
     TrafficLightGrid, new_component_browser, new_component_table, new_data_table,
@@ -522,6 +523,167 @@ impl PaneItem for PlotPanel {
     }
 }
 
+/// Pane item hosting an XY (phase / correlation) plot.
+///
+/// Mirrors [`PlotPanel`]: thin wrapper around [`XyPlot`]; inspection
+/// routes to the inner [`XyLinePlot`] so trace configuration shows up in
+/// the property inspector.
+pub struct XyPlotPanel {
+    inner: Entity<XyPlot>,
+    line_plot: Entity<XyLinePlot>,
+}
+
+impl XyPlotPanel {
+    /// Build a plot with no traces; configure via the trace picker.
+    pub fn empty(db: Arc<DB>, cx: &mut Context<Self>) -> Self {
+        Self::with_traces(db, vec![], cx)
+    }
+
+    /// Build a plot seeded with an explicit trace list.
+    pub fn with_traces(db: Arc<DB>, traces: Vec<XyTrace>, cx: &mut Context<Self>) -> Self {
+        let inner = cx.new(|cx| XyPlot::new(db, traces, cx));
+        let line_plot = inner.read(cx).line_plot().clone();
+        Self { inner, line_plot }
+    }
+
+    pub(crate) fn inner(&self) -> &Entity<XyPlot> {
+        &self.inner
+    }
+}
+
+impl Render for XyPlotPanel {
+    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+        div().size_full().child(self.inner.clone())
+    }
+}
+
+/// Persisted shape of an [`XyPlotPanel`].
+#[derive(facet::Facet, Default)]
+pub struct XyPlotPanelConfig {
+    pub label: String,
+    pub traces: Vec<XyTraceConfig>,
+    pub custom_title: Override<String>,
+    pub x_min_override: Override<f64>,
+    pub x_max_override: Override<f64>,
+    pub y_min_override: Override<f64>,
+    pub y_max_override: Override<f64>,
+}
+
+/// Persisted shape of one [`XyTrace`].
+///
+/// Mirrors [`TraceConfig`]; both axes' `(component_id, element_index)`
+/// pairs need to round-trip on disk even though the inspector hides them.
+#[derive(facet::Facet, Clone)]
+pub struct XyTraceConfig {
+    pub x_component_id: ComponentId,
+    pub x_element_index: usize,
+    pub y_component_id: ComponentId,
+    pub y_element_index: usize,
+    pub color: Hsla,
+    pub style: PlotStyle,
+    pub visible: bool,
+    pub label: String,
+    pub stroke_width: f32,
+}
+
+impl Default for XyTraceConfig {
+    fn default() -> Self {
+        Self {
+            x_component_id: ComponentId(0),
+            x_element_index: 0,
+            y_component_id: ComponentId(0),
+            y_element_index: 0,
+            color: Hsla::default(),
+            style: PlotStyle::default(),
+            visible: true,
+            label: String::new(),
+            stroke_width: 1.5,
+        }
+    }
+}
+
+impl From<&XyTrace> for XyTraceConfig {
+    fn from(t: &XyTrace) -> Self {
+        Self {
+            x_component_id: t.x_component_id,
+            x_element_index: t.x_element_index,
+            y_component_id: t.y_component_id,
+            y_element_index: t.y_element_index,
+            color: t.color,
+            style: t.style,
+            visible: t.visible,
+            label: t.label.to_string(),
+            stroke_width: t.stroke_width,
+        }
+    }
+}
+
+impl From<XyTraceConfig> for XyTrace {
+    fn from(t: XyTraceConfig) -> Self {
+        Self {
+            x_component_id: t.x_component_id,
+            x_element_index: t.x_element_index,
+            y_component_id: t.y_component_id,
+            y_element_index: t.y_element_index,
+            color: t.color,
+            style: t.style,
+            visible: t.visible,
+            label: t.label.into(),
+            stroke_width: t.stroke_width,
+        }
+    }
+}
+
+impl XyPlotPanel {
+    pub fn from_config(cfg: XyPlotPanelConfig, db: Arc<DB>, cx: &mut Context<Self>) -> Self {
+        let traces: Vec<XyTrace> = cfg.traces.into_iter().map(XyTrace::from).collect();
+        let panel = Self::with_traces(db, traces, cx);
+        let line_plot = panel.line_plot.clone();
+        line_plot.update(cx, |lp, cx| {
+            lp.custom_title = cfg.custom_title.map(SharedString::from);
+            lp.x_min_override = cfg.x_min_override;
+            lp.x_max_override = cfg.x_max_override;
+            lp.y_min_override = cfg.y_min_override;
+            lp.y_max_override = cfg.y_max_override;
+            cx.notify();
+        });
+        panel
+    }
+}
+
+impl PaneItem for XyPlotPanel {
+    type Config = XyPlotPanelConfig;
+
+    fn tab_title(&self, cx: &App) -> SharedString {
+        self.inner.read(cx).title(cx)
+    }
+
+    fn serialization_key() -> &'static str {
+        "xy_plot"
+    }
+
+    fn to_config(&self, cx: &App) -> XyPlotPanelConfig {
+        let lp = self.line_plot.read(cx);
+        XyPlotPanelConfig {
+            label: self.tab_title(cx).to_string(),
+            traces: lp
+                .traces()
+                .iter()
+                .map(|e| XyTraceConfig::from(e.read(cx)))
+                .collect(),
+            custom_title: lp.custom_title.as_ref().map(|s| s.to_string()),
+            x_min_override: lp.x_min_override.clone(),
+            x_max_override: lp.x_max_override.clone(),
+            y_min_override: lp.y_min_override.clone(),
+            y_max_override: lp.y_max_override.clone(),
+        }
+    }
+
+    fn inspectable_entity(&self) -> Option<gpui::AnyEntity> {
+        Some(self.line_plot.clone().into_any())
+    }
+}
+
 /// Persisted shape of a [`Viewer3dPanel`].
 #[derive(facet::Facet, Default)]
 pub struct Viewer3dPanelConfig {
@@ -713,6 +875,53 @@ pub fn new_panel_rows(
                         let db_for_panel = db_for_select.clone();
                         let plot_panel =
                             cx.new(|cx| PlotPanel::with_traces(db_for_panel, traces, cx));
+                        let inner = plot_panel.read(cx).inner().clone();
+
+                        pane.update(cx, |pane, cx| {
+                            pane.add_item(Box::new(plot_panel), cx);
+                        });
+
+                        if let Some(on_open_inspector) = &on_open_inspector {
+                            let inner_any = inner.into_any();
+                            if let Some(rows) = crate::inspector::reflect::rows_for_any_entity(
+                                &inner_any,
+                                &db_for_select,
+                                cx,
+                            ) {
+                                on_open_inspector(
+                                    InspectorRequest {
+                                        rows,
+                                        mode: InspectorMode::Centered,
+                                    },
+                                    window,
+                                    cx,
+                                );
+                            }
+                        }
+                    }),
+                )
+            })
+        },
+    )));
+
+    rows.push(Box::new(NavRow::new(
+        "XY Plot",
+        SharedString::new_static(""),
+        {
+            let db = db.clone();
+            let pane = pane.clone();
+            let on_open_inspector = on_open_inspector.clone();
+            Box::new(move |_cx| {
+                let db_for_select = db.clone();
+                let pane = pane.clone();
+                let on_open_inspector = on_open_inspector.clone();
+                crate::views::xy_plot::trace_picker::select_xy_trace_wizard_rows(
+                    db.clone(),
+                    Arc::new(|_cx| 0),
+                    Arc::new(move |trace, window, cx| {
+                        let db_for_panel = db_for_select.clone();
+                        let plot_panel =
+                            cx.new(|cx| XyPlotPanel::with_traces(db_for_panel, vec![trace], cx));
                         let inner = plot_panel.read(cx).inner().clone();
 
                         pane.update(cx, |pane, cx| {
@@ -970,5 +1179,40 @@ mod tests {
         assert_eq!(back.models[0].orientation_binding, None);
         assert_eq!(back.camera.target_x, 1.0);
         assert_eq!(back.camera.fov_y_rad, std::f32::consts::FRAC_PI_3);
+
+        let xy = XyPlotPanelConfig {
+            label: "phase".into(),
+            traces: vec![XyTraceConfig {
+                x_component_id: ComponentId(2),
+                x_element_index: 0,
+                y_component_id: ComponentId(2),
+                y_element_index: 1,
+                color: Hsla::default(),
+                style: PlotStyle::Scatter,
+                visible: true,
+                label: "vx vs vy".into(),
+                stroke_width: 1.5,
+            }],
+            custom_title: Override::Custom("Phase".into()),
+            x_min_override: Override::Custom(-1.0),
+            x_max_override: Override::Auto,
+            y_min_override: Override::Auto,
+            y_max_override: Override::Custom(2.5),
+        };
+        let s = facet_json::to_string(&xy).unwrap();
+        let back: XyPlotPanelConfig = facet_json::from_str(&s).unwrap();
+        assert_eq!(back.label, "phase");
+        assert_eq!(back.traces.len(), 1);
+        assert_eq!(back.traces[0].x_component_id, ComponentId(2));
+        assert_eq!(back.traces[0].x_element_index, 0);
+        assert_eq!(back.traces[0].y_component_id, ComponentId(2));
+        assert_eq!(back.traces[0].y_element_index, 1);
+        assert_eq!(back.traces[0].label, "vx vs vy");
+        assert!(matches!(back.traces[0].style, PlotStyle::Scatter));
+        assert!(matches!(back.custom_title, Override::Custom(s) if s == "Phase"));
+        assert!(matches!(back.x_min_override, Override::Custom(v) if (v + 1.0).abs() < 1e-9));
+        assert!(matches!(back.x_max_override, Override::Auto));
+        assert!(matches!(back.y_min_override, Override::Auto));
+        assert!(matches!(back.y_max_override, Override::Custom(v) if (v - 2.5).abs() < 1e-9));
     }
 }

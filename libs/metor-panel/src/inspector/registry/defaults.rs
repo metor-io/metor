@@ -17,6 +17,7 @@ use crate::inspector::rows::{
 use crate::views::time_series::time_range::TimeRangeBehavior;
 use crate::views::time_series::{LinePlot, Override, Trace};
 use crate::views::viewer_3d::Viewer3d;
+use crate::views::xy_plot::{XyLinePlot, XyTrace};
 
 use super::{AddBehavior, FieldOverride, InspectorRegistry, builders};
 
@@ -46,19 +47,43 @@ impl InspectorRegistry {
             AddBehavior::Default(Arc::new(|_cx| crate::views::viewer_3d::ModelEntry::empty())),
         );
         self.register_viewer3d_builder(db.clone());
-        self.register_dashboard_builder(db);
+        self.register_dashboard_builder(db.clone());
         self.register_pane_builder();
         self.register_field_override::<crate::views::time_series::Trace>(
             "stroke_width",
             FieldOverride {
                 range: Some((0.5, 10.0)),
+                ..FieldOverride::default()
             },
         );
         self.register_field_override::<crate::views::viewer_3d::Viewer3d>(
             "camera_fov",
             FieldOverride {
                 range: Some((0.1, std::f64::consts::PI)),
+                ..FieldOverride::default()
             },
+        );
+        self.register_field_override::<crate::views::xy_plot::XyTrace>(
+            "stroke_width",
+            FieldOverride {
+                range: Some((0.5, 10.0)),
+                ..FieldOverride::default()
+            },
+        );
+        self.register_field_override::<crate::views::xy_plot::XyTrace>(
+            "style",
+            FieldOverride {
+                enum_allowed: Some(&["Line", "Scatter"]),
+                ..FieldOverride::default()
+            },
+        );
+        self.register_entity_list::<XyLinePlot, XyTrace>(
+            db.clone(),
+            |lp| &lp.traces,
+            |lp| &mut lp.traces,
+            AddBehavior::Wizard(Arc::new(|parent, db, cx| {
+                builders::build_xy_trace_add_wizard(parent, db, cx)
+            })),
         );
     }
 
