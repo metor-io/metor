@@ -13,6 +13,7 @@ use crate::dynamic::{BuildError, DynamicNode, DynamicRegistry, NodeId};
 use crate::node_editor::coordinator::OwnerId;
 use crate::node_editor::registry::{Arity, descriptor_for};
 use crate::node_editor::spec::{NodeSpec, build as build_spec, compute_node_id};
+use crate::node_editor::worker::DynamicWorker;
 
 /// Editor-stable handle for a node. Survives spec edits (unlike `NodeId`,
 /// which is content-addressed and changes on any arg mutation).
@@ -204,7 +205,17 @@ impl NodeGraph {
     /// downstream. Returns the set of `NodeId`s the editor wants kept alive.
     /// The caller is responsible for handing this set to the coordinator
     /// (which will union it with other editors' sets and reconcile).
-    pub fn rebuild_into(&mut self, db: &DB, registry: &mut DynamicRegistry) -> HashSet<NodeId> {
+    ///
+    /// If `worker` is `Some`, every build closure runs on the worker thread
+    /// — required in the live app where the gpui main thread has no
+    /// stellarator runtime. Tests pass `None` and call constructors directly
+    /// (the test harness installs its own runtime via `#[stellarator::test]`).
+    pub fn rebuild_into(
+        &mut self,
+        db: &Arc<DB>,
+        registry: &mut DynamicRegistry,
+        worker: Option<&DynamicWorker>,
+    ) -> HashSet<NodeId> {
         let (order, cycle_members) = self.topo_order();
 
         // Mark cycle members up front.
@@ -262,7 +273,17 @@ impl NodeGraph {
             let result = if let Some(existing) = registry.get(new_id) {
                 Ok(existing)
             } else {
-                match build_spec(&spec, parent_arcs, db) {
+                let build_result = match worker {
+                    Some(w) => {
+                        let spec_for_worker = spec.clone();
+                        let db_for_worker = db.clone();
+                        w.run(Box::new(move || {
+                            build_spec(&spec_for_worker, parent_arcs, &db_for_worker)
+                        }))
+                    }
+                    None => build_spec(&spec, parent_arcs, db),
+                };
+                match build_result {
                     Ok(node) => {
                         debug_assert_eq!(
                             node.id(),
@@ -295,13 +316,27 @@ impl NodeGraph {
     }
 
     /// View-layer wrapper around [`rebuild_into`] that pulls the registry
-    /// out of the gpui app and submits the resulting alive set to the
-    /// [`GraphCoordinator`](crate::node_editor::coordinator::GraphCoordinator).
+    /// and worker out of the gpui app and submits the resulting alive set to
+    /// the [`GraphCoordinator`](crate::node_editor::coordinator::GraphCoordinator).
     /// Use this from inside `Entity<NodeGraph>::update`.
-    pub fn rebuild(&mut self, db: &DB, cx: &mut gpui::App) {
+    pub fn rebuild(&mut self, db: &Arc<DB>, cx: &mut gpui::App) {
         let alive = {
+            // Detach the worker into a local clone-by-reference: we hold the
+            // global only for the duration of `rebuild_into`, but borrow the
+            // registry mutably from the same `cx`. To satisfy the borrow
+            // checker we route through a raw pointer for the worker (it's a
+            // long-lived global; never moves). Simpler: copy-out the channel
+            // shape would add overhead; the unsafe borrow is bounded in
+            // scope and the worker reference outlives the call.
+            //
+            // Sequencing it explicitly: first take a worker pointer, then
+            // borrow the registry mutably.
+            let worker_ptr: *const DynamicWorker = cx.global::<DynamicWorker>();
             let registry = cx.global_mut::<DynamicRegistry>();
-            self.rebuild_into(db, registry)
+            // Safety: the global storage outlives this call; we never store
+            // or escape the pointer beyond the immediate `rebuild_into`.
+            let worker = unsafe { &*worker_ptr };
+            self.rebuild_into(db, registry, Some(worker))
         };
         crate::node_editor::coordinator::GraphCoordinator::submit(self.owner_id, alive, cx);
     }

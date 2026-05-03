@@ -239,15 +239,15 @@ async fn reconcile_adds_and_removes_built_nodes() {
     let mut registry = DynamicRegistry::new();
     let mut graph = graph_with_clock_and_constant();
     let db_path = unique_db_path("reconcile");
-    let db = metor_db::DB::create(db_path.clone()).unwrap();
+    let db = Arc::new(metor_db::DB::create(db_path.clone()).unwrap());
 
-    let alive = graph.rebuild_into(&db, &mut registry);
+    let alive = graph.rebuild_into(&db, &mut registry, None);
     assert_eq!(alive.len(), 2);
     assert_eq!(registry.len(), 2);
 
     // Remove the constant; only the clock should survive.
     graph.remove_node(&"k".into());
-    let alive2 = graph.rebuild_into(&db, &mut registry);
+    let alive2 = graph.rebuild_into(&db, &mut registry, None);
     assert_eq!(alive2.len(), 1);
     // Manually reconcile to mimic what the coordinator would do.
     registry.reconcile(&alive2);
@@ -260,7 +260,7 @@ async fn reconcile_adds_and_removes_built_nodes() {
 async fn dedup_across_two_graphs_share_node() {
     let mut registry = DynamicRegistry::new();
     let db_path = unique_db_path("dedup");
-    let db = metor_db::DB::create(db_path.clone()).unwrap();
+    let db = Arc::new(metor_db::DB::create(db_path.clone()).unwrap());
 
     // Two graphs, same fixed-rate clock spec — they should hash to the same id
     // and dedupe to one entry in the registry.
@@ -269,8 +269,8 @@ async fn dedup_across_two_graphs_share_node() {
     g1.insert_node("a".into(), NodeSpec::FixedRate { hz: 100.0 }, Position { x: 0.0, y: 0.0 });
     g2.insert_node("b".into(), NodeSpec::FixedRate { hz: 100.0 }, Position { x: 0.0, y: 0.0 });
 
-    let alive_a = g1.rebuild_into(&db, &mut registry);
-    let alive_b = g2.rebuild_into(&db, &mut registry);
+    let alive_a = g1.rebuild_into(&db, &mut registry, None);
+    let alive_b = g2.rebuild_into(&db, &mut registry, None);
     assert_eq!(alive_a, alive_b, "same spec must produce the same NodeId");
     assert_eq!(registry.len(), 1, "deduped to a single live instance");
 
@@ -295,7 +295,7 @@ async fn rebuild_propagates_parent_failure_downstream() {
     // the name). To force a clock mismatch we use Mul of two different clocks.
     let mut registry = DynamicRegistry::new();
     let db_path = unique_db_path("pf");
-    let db = metor_db::DB::create(db_path.clone()).unwrap();
+    let db = Arc::new(metor_db::DB::create(db_path.clone()).unwrap());
 
     let mut g = NodeGraph::new(1);
     g.insert_node("clk_a".into(), NodeSpec::FixedRate { hz: 100.0 }, Position { x: 0.0, y: 0.0 });
@@ -311,7 +311,7 @@ async fn rebuild_propagates_parent_failure_downstream() {
     g.add_edge(EdgeEntry { source: "b".into(), target: "mul".into(), target_socket: 1 });
     g.add_edge(EdgeEntry { source: "mul".into(), target: "scale".into(), target_socket: 0 });
 
-    g.rebuild_into(&db, &mut registry);
+    g.rebuild_into(&db, &mut registry, None);
 
     // Mul must fail with ClockMismatch; Scale must inherit ParentFailed.
     let mul = g.nodes.get(&gpui::SharedString::from("mul")).unwrap();
@@ -360,6 +360,42 @@ fn validate_rejects_self_loop() {
     g.insert_node("k".into(), NodeSpec::Scale { k: 1.0 }, Position { x: 0.0, y: 0.0 });
     let edge = EdgeEntry { source: "k".into(), target: "k".into(), target_socket: 0 };
     assert_eq!(validate_connection(&g, &edge), EdgeVerdict::SelfLoop);
+}
+
+#[test]
+fn add_edge_replaces_on_exact_arity_target() {
+    let mut g = NodeGraph::new(1);
+    g.insert_node("clk".into(), NodeSpec::FixedRate { hz: 100.0 }, Position { x: 0.0, y: 0.0 });
+    g.insert_node("a".into(), NodeSpec::Constant { value: 1.0 }, Position { x: 100.0, y: 0.0 });
+    g.insert_node("b".into(), NodeSpec::Constant { value: 2.0 }, Position { x: 100.0, y: 50.0 });
+    g.insert_node("scale".into(), NodeSpec::Scale { k: 1.0 }, Position { x: 200.0, y: 0.0 });
+    g.add_edge(EdgeEntry { source: "clk".into(), target: "a".into(), target_socket: 0 });
+    g.add_edge(EdgeEntry { source: "clk".into(), target: "b".into(), target_socket: 0 });
+
+    g.add_edge(EdgeEntry { source: "a".into(), target: "scale".into(), target_socket: 0 });
+    g.add_edge(EdgeEntry { source: "b".into(), target: "scale".into(), target_socket: 0 });
+
+    let to_scale: Vec<_> = g.edges.iter().filter(|e| e.target == "scale").collect();
+    assert_eq!(to_scale.len(), 1, "second connect to same socket should replace");
+    assert_eq!(to_scale[0].source, "b");
+}
+
+#[test]
+fn add_edge_preserves_all_for_variadic_mean() {
+    let mut g = NodeGraph::new(1);
+    g.insert_node("clk".into(), NodeSpec::FixedRate { hz: 100.0 }, Position { x: 0.0, y: 0.0 });
+    for i in 0..3 {
+        let id = format!("k{i}");
+        g.insert_node(id.clone().into(), NodeSpec::Constant { value: i as f64 }, Position { x: 100.0, y: i as f32 * 20.0 });
+        g.add_edge(EdgeEntry { source: "clk".into(), target: id.into(), target_socket: 0 });
+    }
+    g.insert_node("mean".into(), NodeSpec::Mean, Position { x: 200.0, y: 0.0 });
+    for i in 0..3 {
+        g.add_edge(EdgeEntry { source: format!("k{i}").into(), target: "mean".into(), target_socket: 0 });
+    }
+
+    let to_mean: Vec<_> = g.edges.iter().filter(|e| e.target == "mean").collect();
+    assert_eq!(to_mean.len(), 3, "variadic Mean keeps all parallel edges");
 }
 
 #[test]
@@ -473,10 +509,10 @@ fn config_round_trips_through_facet_json() {
 async fn unchanged_subtree_keeps_arc_alive() {
     let mut registry = DynamicRegistry::new();
     let db_path = unique_db_path("idem");
-    let db = metor_db::DB::create(db_path.clone()).unwrap();
+    let db = Arc::new(metor_db::DB::create(db_path.clone()).unwrap());
 
     let mut g = graph_with_clock_and_constant();
-    g.rebuild_into(&db, &mut registry);
+    g.rebuild_into(&db, &mut registry, None);
     let arc_before: Arc<dyn DynamicNode> =
         g.nodes[&gpui::SharedString::from("k")].build.as_built().unwrap().clone();
 
@@ -486,7 +522,7 @@ async fn unchanged_subtree_keeps_arc_alive() {
         NodeSpec::FixedRate { hz: 50.0 },
         Position { x: 0.0, y: 100.0 },
     );
-    g.rebuild_into(&db, &mut registry);
+    g.rebuild_into(&db, &mut registry, None);
     let arc_after: Arc<dyn DynamicNode> =
         g.nodes[&gpui::SharedString::from("k")].build.as_built().unwrap().clone();
     assert!(

@@ -15,11 +15,13 @@
 pub mod config;
 pub mod coordinator;
 pub mod graph;
+pub mod inspector_rows;
 pub mod pane;
 pub mod palette_provider;
 pub mod registry;
 pub mod spec;
 pub mod validate;
+pub mod worker;
 
 #[cfg(test)]
 mod tests;
@@ -31,3 +33,4 @@ pub use graph::{BuildState, EdgeEntry, FlowId, NodeEntry, NodeGraph, Position};
 pub use registry::{Arity, OpDescriptor, SocketKind, descriptor, descriptor_for};
 pub use spec::{NodeSpec, NodeSpecKind, build, compute_node_id};
 pub use validate::{EdgeColor, EdgeVerdict, edge_color, validate_connection};
+pub use worker::DynamicWorker;

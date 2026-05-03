@@ -14,9 +14,7 @@ use gpui::{
 };
 use metor_db::DB;
 
-use crate::dynamic::DynamicRegistry;
 use crate::node_editor::config::{NodeEditorConfig, Viewport as ConfigViewport};
-use crate::node_editor::coordinator::GraphCoordinator;
 use crate::node_editor::graph::{
     BuildState, EdgeEntry, FlowId, NodeEntry, NodeGraph, Position,
 };
@@ -68,14 +66,21 @@ struct EdgeDraft {
     pointer: Point<Pixels>,
 }
 
+struct PanDrag {
+    pointer_origin: Point<Pixels>,
+    viewport_origin: ConfigViewport,
+}
+
 pub struct NodeEditor {
     graph: Entity<NodeGraph>,
     db: Arc<DB>,
     focus_handle: FocusHandle,
     selection: Option<FlowId>,
+    selected_edge: Option<EdgeEntry>,
     viewport: ConfigViewport,
     node_drag: Option<NodeDrag>,
     edge_draft: Option<EdgeDraft>,
+    pan_drag: Option<PanDrag>,
     canvas_origin: Option<Point<Pixels>>,
     rebuild_task: Option<Task<()>>,
     next_node_seq: u64,
@@ -91,9 +96,11 @@ impl NodeEditor {
             db,
             focus_handle,
             selection: None,
+            selected_edge: None,
             viewport: ConfigViewport::default(),
             node_drag: None,
             edge_draft: None,
+            pan_drag: None,
             canvas_origin: None,
             rebuild_task: None,
             next_node_seq: 0,
@@ -116,9 +123,11 @@ impl NodeEditor {
             db,
             focus_handle,
             selection: None,
+            selected_edge: None,
             viewport,
             node_drag: None,
             edge_draft: None,
+            pan_drag: None,
             canvas_origin: None,
             rebuild_task: None,
             next_node_seq,
@@ -136,6 +145,23 @@ impl NodeEditor {
     /// Spawn a new node at canvas-local pixel position `screen_pos` (graph
     /// origin assumed at (0, 0); pan/zoom not yet wired). Used by the palette
     /// provider — the descriptor decides label and default args.
+    /// Read-only accessor for the underlying graph entity. Used by
+    /// inspector_rows to walk the spec without going through `to_config`.
+    pub fn graph_entity(&self) -> &Entity<NodeGraph> {
+        &self.graph
+    }
+
+    /// Read-only DB handle for inspector rows that need to enumerate
+    /// components (e.g. `FromDb`'s picker).
+    pub fn db(&self) -> &Arc<DB> {
+        &self.db
+    }
+
+    /// Schedule a rebuild from outside the pane (e.g. an inspector arg edit).
+    pub fn bump_rebuild(&mut self, cx: &mut Context<Self>) {
+        self.schedule_rebuild(cx);
+    }
+
     pub fn add_node(&mut self, descriptor: &OpDescriptor, cx: &mut Context<Self>) {
         let spec = (descriptor.default_spec)();
         let (x, y) = self.next_node_position();
@@ -160,31 +186,29 @@ impl NodeEditor {
         self.rebuild_task.take();
         let graph = self.graph.clone();
         let db = self.db.clone();
-        let owner = self.graph.read(cx).owner_id;
         self.rebuild_task = Some(cx.spawn(async move |this, cx| {
             cx.background_executor()
                 .timer(Duration::from_millis(200))
                 .await;
             let _ = cx.update(|cx| {
-                let alive = graph.update(cx, |g, cx_inner| {
-                    let registry = cx_inner.global_mut::<DynamicRegistry>();
-                    g.rebuild_into(&db, registry)
-                });
-                GraphCoordinator::submit(owner, alive, cx);
+                graph.update(cx, |g, cx_inner| g.rebuild(&db, cx_inner));
             });
             let _ = this.update(cx, |_, cx| cx.notify());
         }));
     }
 
     fn on_delete(&mut self, _: &DeleteSelected, _: &mut Window, cx: &mut Context<Self>) {
-        let Some(id) = self.selection.take() else {
+        if let Some(edge) = self.selected_edge.take() {
+            self.graph.update(cx, |g, _| g.remove_edge(&edge));
+            self.schedule_rebuild(cx);
+            cx.notify();
             return;
-        };
-        self.graph.update(cx, |g, _| {
-            g.remove_node(&id);
-        });
-        self.schedule_rebuild(cx);
-        cx.notify();
+        }
+        if let Some(id) = self.selection.take() {
+            self.graph.update(cx, |g, _| g.remove_node(&id));
+            self.schedule_rebuild(cx);
+            cx.notify();
+        }
     }
 }
 
@@ -275,32 +299,43 @@ impl Render for NodeEditor {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = theme(cx);
         let graph_ref = self.graph.read(cx);
+        let viewport = self.viewport.clone();
+        let selected_edge = self.selected_edge.clone();
 
-        // Snapshot everything the paint closure and per-node renderers need
-        // so we can drop the borrow on `graph` before composing children.
-        let mut node_snapshots: Vec<(FlowId, Position, &'static OpDescriptor, usize, (&'static str, bool))> =
+        // Per-node screen position = graph position - viewport offset.
+        let mut node_snapshots: Vec<(FlowId, Position, Position, &'static OpDescriptor, usize, (&'static str, bool))> =
             Vec::with_capacity(graph_ref.nodes.len());
         for (id, entry) in &graph_ref.nodes {
             let descriptor = descriptor_for(&entry.spec);
             let inputs = input_count(entry, &graph_ref.edges, id);
             let pill = status_pill(entry);
-            node_snapshots.push((id.clone(), entry.position.clone(), descriptor, inputs, pill));
+            let screen = Position {
+                x: entry.position.x - viewport.x,
+                y: entry.position.y - viewport.y,
+            };
+            node_snapshots.push((id.clone(), entry.position.clone(), screen, descriptor, inputs, pill));
         }
 
-        // Pre-compute edges in screen-relative coordinates for the paint pass.
-        let edge_snapshots: Vec<(Point<Pixels>, Point<Pixels>, Hsla)> = graph_ref
+        // Pre-compute edges in canvas-local coordinates. We retain the
+        // EdgeEntry alongside the geometry so the click handler can hit-test
+        // and select the underlying graph edge.
+        let edge_snapshots: Vec<(EdgeEntry, Point<Pixels>, Point<Pixels>, Hsla)> = graph_ref
             .edges
             .iter()
             .filter_map(|edge| {
                 let source = graph_ref.nodes.get(&edge.source)?;
                 let target = graph_ref.nodes.get(&edge.target)?;
                 let s_inputs = input_count(source, &graph_ref.edges, &edge.source);
-                let src_x = source.position.x + NODE_WIDTH;
-                let src_y = source.position.y + output_socket_local_y(s_inputs);
-                let tgt_x = target.position.x;
-                let tgt_y = target.position.y + input_socket_local_y(edge.target_socket);
-                let color = edge_color_to_hsla(edge_color(graph_ref, edge), &theme);
+                let src_x = source.position.x - viewport.x + NODE_WIDTH;
+                let src_y = source.position.y - viewport.y + output_socket_local_y(s_inputs);
+                let tgt_x = target.position.x - viewport.x;
+                let tgt_y = target.position.y - viewport.y + input_socket_local_y(edge.target_socket);
+                let mut color = edge_color_to_hsla(edge_color(graph_ref, edge), &theme);
+                if Some(edge) == selected_edge.as_ref() {
+                    color = theme.line_colors[0];
+                }
                 Some((
+                    edge.clone(),
                     point(px(src_x), px(src_y)),
                     point(px(tgt_x), px(tgt_y)),
                     color,
@@ -311,14 +346,15 @@ impl Render for NodeEditor {
         let edge_draft = self.edge_draft.as_ref().and_then(|draft| {
             let source = graph_ref.nodes.get(&draft.source)?;
             let s_inputs = input_count(source, &graph_ref.edges, &draft.source);
-            let src_x = source.position.x + NODE_WIDTH;
-            let src_y = source.position.y + output_socket_local_y(s_inputs);
+            let src_x = source.position.x - viewport.x + NODE_WIDTH;
+            let src_y = source.position.y - viewport.y + output_socket_local_y(s_inputs);
             Some((point(px(src_x), px(src_y)), draft.pointer, theme.text_secondary))
         });
 
         let _ = graph_ref;
 
         let theme_for_paint = theme.clone();
+        let edge_snapshots_for_paint = edge_snapshots.clone();
 
         let canvas_layer = canvas(
             {
@@ -332,7 +368,7 @@ impl Render for NodeEditor {
             },
             move |_, bounds, window, _cx| {
                 paint_grid(bounds, &theme_for_paint, window);
-                for (src, tgt, color) in &edge_snapshots {
+                for (_edge, src, tgt, color) in &edge_snapshots_for_paint {
                     paint_bezier(bounds.origin, *src, *tgt, *color, false, window);
                 }
                 if let Some((src, tgt, color)) = edge_draft {
@@ -343,6 +379,13 @@ impl Render for NodeEditor {
         .absolute()
         .inset_0();
 
+        let edge_geometry: Arc<Vec<(EdgeEntry, Point<Pixels>, Point<Pixels>)>> = Arc::new(
+            edge_snapshots
+                .iter()
+                .map(|(edge, s, t, _)| (edge.clone(), *s, *t))
+                .collect(),
+        );
+
         let mut root = div()
             .key_context("NodeEditor")
             .track_focus(&self.focus_handle)
@@ -350,16 +393,40 @@ impl Render for NodeEditor {
             .relative()
             .size_full()
             .bg(theme.bg_primary)
-            .on_mouse_down(
-                MouseButton::Left,
-                cx.listener(|this, _ev: &gpui::MouseDownEvent, _w, cx| {
-                    // Click on empty canvas clears selection and any in-progress
-                    // edge draft.
-                    if this.selection.is_some() || this.edge_draft.is_some() {
+            .on_mouse_down(MouseButton::Left, {
+                let edges = edge_geometry.clone();
+                cx.listener(move |this, ev: &gpui::MouseDownEvent, _w, cx| {
+                    let Some(origin) = this.canvas_origin else {
+                        return;
+                    };
+                    let local = ev.position - origin;
+                    if let Some(edge) = hit_test_edges(&edges, local) {
+                        this.selected_edge = Some(edge);
                         this.selection = None;
                         this.edge_draft = None;
                         cx.notify();
+                        return;
                     }
+                    // Click on empty canvas clears selection and any in-progress
+                    // edge draft.
+                    if this.selection.is_some()
+                        || this.selected_edge.is_some()
+                        || this.edge_draft.is_some()
+                    {
+                        this.selection = None;
+                        this.selected_edge = None;
+                        this.edge_draft = None;
+                        cx.notify();
+                    }
+                })
+            })
+            .on_mouse_down(
+                MouseButton::Middle,
+                cx.listener(|this, ev: &gpui::MouseDownEvent, _w, _cx| {
+                    this.pan_drag = Some(PanDrag {
+                        pointer_origin: ev.position,
+                        viewport_origin: this.viewport.clone(),
+                    });
                 }),
             )
             .on_mouse_move(cx.listener(
@@ -368,6 +435,15 @@ impl Render for NodeEditor {
                         return;
                     };
                     let local = ev.position - origin;
+                    if let Some(pan) = &this.pan_drag {
+                        let dx = f32::from(ev.position.x - pan.pointer_origin.x);
+                        let dy = f32::from(ev.position.y - pan.pointer_origin.y);
+                        // Drag right → world moves right under cursor → viewport.x decreases.
+                        this.viewport.x = pan.viewport_origin.x - dx;
+                        this.viewport.y = pan.viewport_origin.y - dy;
+                        cx.notify();
+                        return;
+                    }
                     if let Some(drag) = &this.node_drag {
                         let dx = f32::from(ev.position.x - drag.pointer_origin.x);
                         let dy = f32::from(ev.position.y - drag.pointer_origin.y);
@@ -405,10 +481,20 @@ impl Render for NodeEditor {
                     }
                 }),
             )
+            .on_mouse_up(
+                MouseButton::Middle,
+                cx.listener(|this, _ev: &gpui::MouseUpEvent, _w, cx| {
+                    if this.pan_drag.take().is_some() {
+                        cx.notify();
+                    }
+                }),
+            )
             .child(canvas_layer);
 
-        for (flow_id, position, descriptor, inputs, pill) in node_snapshots {
-            root = root.child(self.render_node(flow_id, position, descriptor, inputs, pill, &theme, cx));
+        for (flow_id, graph_pos, screen_pos, descriptor, inputs, pill) in node_snapshots {
+            root = root.child(self.render_node(
+                flow_id, graph_pos, screen_pos, descriptor, inputs, pill, &theme, cx,
+            ));
         }
 
         root
@@ -420,7 +506,8 @@ impl NodeEditor {
     fn render_node(
         &self,
         flow_id: FlowId,
-        position: Position,
+        graph_pos: Position,
+        screen_pos: Position,
         descriptor: &'static OpDescriptor,
         inputs: usize,
         (pill_text, pill_error): (&'static str, bool),
@@ -443,8 +530,8 @@ impl NodeEditor {
 
         let mut body = div()
             .absolute()
-            .left(px(position.x))
-            .top(px(position.y))
+            .left(px(screen_pos.x))
+            .top(px(screen_pos.y))
             .w(px(NODE_WIDTH))
             .h(px(height))
             .bg(theme.bg_elevated)
@@ -455,14 +542,41 @@ impl NodeEditor {
                 MouseButton::Left,
                 cx.listener({
                     let id = flow_id.clone();
-                    let pos = position.clone();
+                    let pos = graph_pos.clone();
                     move |this, ev: &gpui::MouseDownEvent, _w, cx| {
                         this.selection = Some(id.clone());
+                        this.selected_edge = None;
                         this.node_drag = Some(NodeDrag {
                             flow_id: id.clone(),
                             pointer_origin: ev.position,
                             node_origin: pos.clone(),
                         });
+                        cx.stop_propagation();
+                        cx.notify();
+                    }
+                }),
+            )
+            .on_mouse_down(
+                MouseButton::Right,
+                cx.listener({
+                    let id = flow_id.clone();
+                    move |this, ev: &gpui::MouseDownEvent, window, cx| {
+                        this.selection = Some(id.clone());
+                        let editor_entity = cx.entity().clone();
+                        let graph_entity = this.graph.clone();
+                        let id_for_proxy = id.clone();
+                        let proxy = cx.new(|_| crate::node_editor::inspector_rows::SelectedNodeProxy {
+                            editor: editor_entity,
+                            graph: graph_entity,
+                            flow_id: id_for_proxy,
+                        });
+                        window.dispatch_action(
+                            Box::new(crate::inspector::InspectEntity {
+                                entity: proxy.into_any(),
+                                position: ev.position,
+                            }),
+                            cx,
+                        );
                         cx.stop_propagation();
                         cx.notify();
                     }
@@ -621,6 +735,79 @@ fn paint_grid(bounds: Bounds<Pixels>, theme: &crate::theme::Theme, window: &mut 
     if let Ok(p) = path.build() {
         window.paint_path(p, theme.grid_color);
     }
+}
+
+/// Find the first edge whose bezier passes within `HIT_RADIUS` pixels of
+/// `pointer` (pointer is in canvas-local coordinates). Samples each curve at
+/// 16 points and uses point-to-segment distance.
+fn hit_test_edges(
+    edges: &[(EdgeEntry, Point<Pixels>, Point<Pixels>)],
+    pointer: Point<Pixels>,
+) -> Option<EdgeEntry> {
+    const SAMPLES: usize = 16;
+    const HIT_RADIUS: f32 = 6.0;
+    let px_pointer = (f32::from(pointer.x), f32::from(pointer.y));
+    let mut best: Option<(f32, EdgeEntry)> = None;
+    for (edge, s, t) in edges {
+        let sx = f32::from(s.x);
+        let sy = f32::from(s.y);
+        let tx = f32::from(t.x);
+        let ty = f32::from(t.y);
+        let dx = (tx - sx).abs().max(40.0) * 0.5;
+        let c1 = (sx + dx, sy);
+        let c2 = (tx - dx, ty);
+        let mut prev = (sx, sy);
+        let mut min_dist = f32::INFINITY;
+        for i in 1..=SAMPLES {
+            let t = i as f32 / SAMPLES as f32;
+            let p = cubic_bezier_point(t, (sx, sy), c1, c2, (tx, ty));
+            min_dist = min_dist.min(point_segment_distance(px_pointer, prev, p));
+            prev = p;
+        }
+        if min_dist <= HIT_RADIUS {
+            match &best {
+                Some((d, _)) if *d <= min_dist => {}
+                _ => best = Some((min_dist, edge.clone())),
+            }
+        }
+    }
+    best.map(|(_, e)| e)
+}
+
+fn cubic_bezier_point(
+    t: f32,
+    p0: (f32, f32),
+    p1: (f32, f32),
+    p2: (f32, f32),
+    p3: (f32, f32),
+) -> (f32, f32) {
+    let mt = 1.0 - t;
+    let b0 = mt * mt * mt;
+    let b1 = 3.0 * mt * mt * t;
+    let b2 = 3.0 * mt * t * t;
+    let b3 = t * t * t;
+    (
+        b0 * p0.0 + b1 * p1.0 + b2 * p2.0 + b3 * p3.0,
+        b0 * p0.1 + b1 * p1.1 + b2 * p2.1 + b3 * p3.1,
+    )
+}
+
+fn point_segment_distance(p: (f32, f32), a: (f32, f32), b: (f32, f32)) -> f32 {
+    let ax = b.0 - a.0;
+    let ay = b.1 - a.1;
+    let len2 = ax * ax + ay * ay;
+    if len2 < 1e-6 {
+        let dx = p.0 - a.0;
+        let dy = p.1 - a.1;
+        return (dx * dx + dy * dy).sqrt();
+    }
+    let t = ((p.0 - a.0) * ax + (p.1 - a.1) * ay) / len2;
+    let t = t.clamp(0.0, 1.0);
+    let cx = a.0 + t * ax;
+    let cy = a.1 + t * ay;
+    let dx = p.0 - cx;
+    let dy = p.1 - cy;
+    (dx * dx + dy * dy).sqrt()
 }
 
 fn paint_bezier(
