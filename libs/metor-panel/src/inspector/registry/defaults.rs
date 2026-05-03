@@ -96,7 +96,7 @@ impl InspectorRegistry {
         self.register_field_override::<crate::views::list_plot::ListTrace>(
             "style",
             FieldOverride {
-                enum_allowed: Some(&["Line", "Scatter"]),
+                enum_allowed: Some(&["Line", "Scatter", "Bar"]),
                 ..FieldOverride::default()
             },
         );
