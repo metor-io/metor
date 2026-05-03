@@ -956,10 +956,23 @@ fn plan_trace(
 
         // Extend one sample past each boundary so segments crossing the
         // edge are drawn and clipped by the GPU rather than dropped.
-        // Only meaningful for view-culled time-series traces; XY uses
-        // the same code path with visible == full.
-        let ext_start_idx = pair.y.visible_start().saturating_sub(1);
-        let ext_end_idx = (pair.y.visible_end() + 1).min(pair.y.full_timestamps().len());
+        // Only meaningful for view-culled time-series traces. For XY,
+        // `visible_end` is `min(x_node_len, y_node_len)` and the +1
+        // would invent a cross-component pair `(X[last_x], Y[cap])`
+        // when nodes have unequal fill rates (24-byte Vec3 seals at
+        // ~1.4M while paired Scalar seals at 4M).
+        let extend_boundaries = matches!(
+            (&trace.x, &trace.y),
+            (AxisSource::Timestamps, _),
+        );
+        let (ext_start_idx, ext_end_idx) = if extend_boundaries {
+            (
+                pair.y.visible_start().saturating_sub(1),
+                (pair.y.visible_end() + 1).min(pair.y.full_timestamps().len()),
+            )
+        } else {
+            (pair.y.visible_start(), pair.y.visible_end())
+        };
 
         let lod_start = ext_start_idx / upload_stride;
         let full_decimated = pair.y.full_timestamps().len().div_ceil(upload_stride);

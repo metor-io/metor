@@ -175,8 +175,11 @@ impl XyLinePlot {
     ///
     /// Returns the interactive pan/zoom override when set; otherwise
     /// auto-fits against the visible traces, then applies any
-    /// inspector-exposed bound overrides on top.
-    pub fn effective_view(&self) -> Option<PlotBounds> {
+    /// inspector-exposed bound overrides on top. Hidden traces are
+    /// skipped so legend toggles re-fit the remaining trace. Returns
+    /// `None` when either axis is missing data — partial bounds would
+    /// paint chrome with the wrong range until the second axis settles.
+    pub fn effective_view(&self, cx: &gpui::App) -> Option<PlotBounds> {
         if let Some(v) = self.view_override {
             return Some(v);
         }
@@ -187,6 +190,9 @@ impl XyLinePlot {
         let mut any_x = false;
         let mut any_y = false;
         for trace in &self.traces {
+            if !trace.read(cx).visible {
+                continue;
+            }
             let Some(tracking) = self.tracking.get(&trace.entity_id()) else {
                 continue;
             };
@@ -201,15 +207,13 @@ impl XyLinePlot {
                 any_y = true;
             }
         }
-        if !any_x && !any_y {
+        if !(any_x && any_y) {
             return None;
         }
-        let (auto_x_min, auto_x_max) = if any_x { (x_min, x_max) } else { (0.0, 1.0) };
-        let (auto_y_min, auto_y_max) = if any_y { (y_min, y_max) } else { (0.0, 1.0) };
-        let min_x = self.x_min_override.as_custom().copied().unwrap_or(auto_x_min);
-        let max_x = self.x_max_override.as_custom().copied().unwrap_or(auto_x_max);
-        let min_y = self.y_min_override.as_custom().copied().unwrap_or(auto_y_min);
-        let max_y = self.y_max_override.as_custom().copied().unwrap_or(auto_y_max);
+        let min_x = self.x_min_override.as_custom().copied().unwrap_or(x_min);
+        let max_x = self.x_max_override.as_custom().copied().unwrap_or(x_max);
+        let min_y = self.y_min_override.as_custom().copied().unwrap_or(y_min);
+        let max_y = self.y_max_override.as_custom().copied().unwrap_or(y_max);
         Some(PlotBounds::new(min_x, min_y, max_x, max_y).normalize())
     }
 
@@ -338,7 +342,7 @@ impl Render for XyLinePlot {
                 let scale_factor = window.scale_factor();
                 let (frame, released) = weak
                     .update(cx, |lp, cx| {
-                        if let Some(view) = lp.effective_view() {
+                        if let Some(view) = lp.effective_view(cx) {
                             let draws: Vec<LineDraw<'_>> = lp
                                 .traces
                                 .iter()
@@ -419,9 +423,11 @@ fn derive_title(traces: &[Entity<XyTrace>], cx: &gpui::App) -> SharedString {
     }
     if traces.len() == 1 {
         let t = traces[0].read(cx);
-        if !t.label.is_empty() {
-            return t.label.clone();
-        }
+        return if t.label.is_empty() {
+            "XY Plot".into()
+        } else {
+            t.label.clone()
+        };
     }
     SharedString::from(format!("XY Plot ({} traces)", traces.len()))
 }

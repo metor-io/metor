@@ -20,13 +20,12 @@ use super::XyTrace;
 /// Invoked with the [`XyTrace`] the user built through the wizard.
 pub type OnXyTraceSelected = Arc<dyn Fn(XyTrace, &mut Window, &mut App)>;
 
-/// Draft state carried across the four pages of the wizard. The pickers
-/// fill it in order; the final element-selection page reads it to build
-/// the trace.
+/// Draft state carried across the wizard pages. The Y component+element
+/// reach `build_trace` directly through closure capture from the Y-axis
+/// pages, so only the X selection needs to round-trip through here.
 #[derive(Default)]
 struct XyDraft {
     x: Option<(ComponentId, usize)>,
-    y_component: Option<ComponentId>,
 }
 
 /// Build the wizard's first page: a list of components for the X axis.
@@ -139,10 +138,6 @@ fn y_component_rows(
             label,
             SharedString::new_static(""),
             Box::new(move |_cx| {
-                {
-                    let mut d = draft.lock().unwrap();
-                    d.y_component = Some(id);
-                }
                 y_element_rows(
                     db.clone(),
                     color_basis.clone(),
@@ -270,9 +265,11 @@ impl InspectorRow for HeaderRow {
         &self.text
     }
 
-    fn consumes_search(&self) -> bool {
-        true
-    }
+    // Default `consumes_search: false` so the header is filtered out
+    // when the user types — the inspector pins `consumes_search: true`
+    // rows to the BOTTOM of results (intended for commit affordances
+    // like Continue/Done), and a top-of-page label jumping to the
+    // bottom is more confusing than disappearing.
 
     fn render_row(
         &self,

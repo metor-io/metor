@@ -114,7 +114,7 @@ impl XyPlot {
     }
 
     pub fn view(&self, cx: &gpui::App) -> Option<PlotBounds> {
-        self.line_plot.read(cx).effective_view()
+        self.line_plot.read(cx).effective_view(cx)
     }
 
     fn reset_view(&mut self, cx: &mut Context<Self>) {
@@ -159,7 +159,7 @@ impl Render for XyPlot {
                                     .map(|pa| axis_zone(event.position, pa))
                                     .unwrap_or(AxisZone::Plot);
                                 this.drag_start = Some(event.position);
-                                this.drag_start_view = this.line_plot.read(cx).effective_view();
+                                this.drag_start_view = this.line_plot.read(cx).effective_view(cx);
                                 this.drag_zone = zone;
                             }
                         }),
@@ -196,7 +196,7 @@ impl Render for XyPlot {
                     ))
                     .on_scroll_wheel(cx.listener(
                         |this, event: &gpui::ScrollWheelEvent, _window, cx| {
-                            let Some(view) = this.line_plot.read(cx).effective_view() else {
+                            let Some(view) = this.line_plot.read(cx).effective_view(cx) else {
                                 return;
                             };
                             let Some(pa) = this.last_plot_area else {
@@ -228,7 +228,7 @@ impl Render for XyPlot {
                                         this.last_plot_area = Some(plot_area(bounds));
                                     });
                                     let lp = underlay_lp.read(cx);
-                                    (bounds, lp.effective_view())
+                                    (bounds, lp.effective_view(cx))
                                 }
                             },
                             move |_, (bounds, view), window, cx| {
@@ -253,7 +253,7 @@ impl Render for XyPlot {
                         canvas(
                             move |bounds, _window, cx| {
                                 let lp = overlay_lp.read(cx);
-                                (bounds, lp.effective_view())
+                                (bounds, lp.effective_view(cx))
                             },
                             move |_, (bounds, view), window, cx| {
                                 if let Some(view) = view {
