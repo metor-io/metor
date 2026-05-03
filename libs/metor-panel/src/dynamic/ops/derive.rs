@@ -1,8 +1,7 @@
-//! Single-input value-to-value derivations.
-//!
-//! Phase 1 scope: f64 scalar in, f64 scalar out. Extending to other prim
-//! types or vector shapes is a straight repeat of the same pattern (read
-//! input, transform, write output) — defer until needed.
+//! Single-input value-to-value derivations. Any prim type, any shape — args
+//! are dtype-typed and the output dtype follows NumPy promotion against the
+//! input dtype. Compute happens in `f64` and is cast back at write time; see
+//! [`crate::dynamic::tensor`] for the rationale.
 
 use std::collections::VecDeque;
 use std::hash::Hash;
@@ -12,118 +11,50 @@ use metor_db::ComponentSchema;
 use metor_proto::types::PrimType;
 use rustfft::FftPlanner;
 use rustfft::num_complex::Complex;
+use smallvec::SmallVec;
 
 use crate::dynamic::node::{
     BuildError, DynamicNode, DynamicNodeExt, NodeImpl, ValueType, default_ring_bytes, hash_id,
-    op_tag, require_f64_scalar, write_sample,
+    op_tag, require_value, write_sample,
+};
+use crate::dynamic::tensor::{
+    self, TypedScalar, is_int, is_unsigned_int, promote, read_f64_at, write_f64_as,
 };
 
-/// `require_f64_scalar` plus the single-element-shape allowance derive ops
-/// accept (so a `Vec3<f64>` element pulled out as a scalar still works).
-fn require_f64_derivable(node: &Arc<dyn DynamicNode>) -> Result<ComponentSchema, BuildError> {
-    let schema = require_f64_scalar(node)?;
-    if !schema.dim.is_empty() && schema.dim.iter().product::<usize>() != 1 {
-        return Err(BuildError::SchemaMismatch {
-            a: schema.clone(),
-            b: ComponentSchema::new(PrimType::F64, &[]),
-        });
-    }
-    Ok(schema)
+/// Schema after promoting `input.prim_type` against `arg`'s dtype, preserving
+/// shape. Used by Scale/Offset to widen ints when an `f64` arg is supplied.
+fn promoted_schema(input: &ComponentSchema, arg: TypedScalar) -> ComponentSchema {
+    let dtype = promote(input.prim_type, arg.dtype());
+    ComponentSchema::new(dtype, &input.dim)
 }
 
-fn read_f64(value: &[u8]) -> f64 {
-    f64::from_le_bytes(value.try_into().expect("f64 scalar"))
+/// Generic per-element map. `f` runs in `f64`; results are cast to `out_dtype`.
+fn map_each_element<F>(in_bytes: &[u8], in_dtype: PrimType, n: usize, out_dtype: PrimType, out: &mut Vec<u8>, mut f: F)
+where
+    F: FnMut(f64) -> f64,
+{
+    out.clear();
+    for i in 0..n {
+        let v = read_f64_at(in_bytes, in_dtype, i);
+        write_f64_as(out, out_dtype, f(v));
+    }
 }
 
 fn map(
     tag: &'static [u8],
     input: Arc<dyn DynamicNode>,
+    out_schema: ComponentSchema,
     extra_args: impl FnOnce(&mut std::collections::hash_map::DefaultHasher),
     f: impl Fn(f64) -> f64 + Send + Sync + 'static,
 ) -> Result<Arc<dyn DynamicNode>, BuildError> {
-    let schema = require_f64_derivable(&input)?;
+    let in_schema = require_value(&input)?;
     let id = hash_id(tag, &[input.id()], extra_args);
     let parent_clock = input.parent_clock_id();
     let mut reader = input.subscribe();
-    Ok(NodeImpl::spawn(
-        id,
-        ValueType::Value(schema.clone()),
-        parent_clock,
-        default_ring_bytes(schema.size()),
-        move |output| async move {
-            let _input = input;
-            loop {
-                let grant = reader.next().await;
-                for (ts, value) in grant.samples() {
-                    let v = f(read_f64(value));
-                    write_sample(&output, ts, &v.to_le_bytes());
-                }
-            }
-        },
-    ))
-}
-
-pub fn scale(input: Arc<dyn DynamicNode>, k: f64) -> Result<Arc<dyn DynamicNode>, BuildError> {
-    map(
-        op_tag::SCALE,
-        input,
-        |h| {
-            k.to_bits().hash(h);
-        },
-        move |x| x * k,
-    )
-}
-
-pub fn offset(input: Arc<dyn DynamicNode>, k: f64) -> Result<Arc<dyn DynamicNode>, BuildError> {
-    map(
-        op_tag::OFFSET,
-        input,
-        |h| {
-            k.to_bits().hash(h);
-        },
-        move |x| x + k,
-    )
-}
-
-pub fn abs(input: Arc<dyn DynamicNode>) -> Result<Arc<dyn DynamicNode>, BuildError> {
-    map(op_tag::ABS, input, |_| {}, f64::abs)
-}
-
-pub fn neg(input: Arc<dyn DynamicNode>) -> Result<Arc<dyn DynamicNode>, BuildError> {
-    map(op_tag::NEG, input, |_| {}, |x| -x)
-}
-
-pub fn log(input: Arc<dyn DynamicNode>) -> Result<Arc<dyn DynamicNode>, BuildError> {
-    map(op_tag::LOG, input, |_| {}, f64::ln)
-}
-
-/// One-sided magnitude FFT of a real-valued vector input.
-///
-/// Input must be `Value(F64, [..])` whose total element count is `N >= 2`.
-/// Output is `[f64; N/2 + 1]` — the magnitudes of bins 0..=N/2 from a
-/// forward FFT (`Complex` form internally; the real input fills the real
-/// component, imag stays zero).
-///
-/// Per-tick allocation is bounded: the complex scratch buffer and an
-/// output byte scratch are both reused. The `Arc<dyn Fft<f64>>` returned
-/// by `FftPlanner` is `Send + Sync`, so it lives in the spawn closure.
-pub fn fft(input: Arc<dyn DynamicNode>) -> Result<Arc<dyn DynamicNode>, BuildError> {
-    let in_schema = require_f64_scalar(&input)?;
-    let n: usize = in_schema.dim.iter().product::<usize>().max(1);
-    if n < 2 {
-        return Err(BuildError::InvalidArg {
-            op: "fft",
-            reason: "input must be a vector of length >= 2",
-        });
-    }
-    let out_len = n / 2 + 1;
-    let id = hash_id(op_tag::FFT, &[input.id()], |_| {});
-    let parent_clock = input.parent_clock_id();
-    let out_schema = ComponentSchema::new(PrimType::F64, &[out_len]);
-    let mut reader = input.subscribe();
-    let mut planner = FftPlanner::<f64>::new();
-    let plan = planner.plan_fft_forward(n);
-    let in_size = n * size_of::<f64>();
+    let n = tensor::shape_elems(&in_schema.dim);
+    let in_value_size = in_schema.size();
+    let in_dtype = in_schema.prim_type;
+    let out_dtype = out_schema.prim_type;
     Ok(NodeImpl::spawn(
         id,
         ValueType::Value(out_schema.clone()),
@@ -131,22 +62,143 @@ pub fn fft(input: Arc<dyn DynamicNode>) -> Result<Arc<dyn DynamicNode>, BuildErr
         default_ring_bytes(out_schema.size()),
         move |output| async move {
             let _input = input;
-            let mut buf: Vec<Complex<f64>> = vec![Complex::new(0.0, 0.0); n];
-            let mut scratch: Vec<u8> = Vec::with_capacity(out_len * size_of::<f64>());
+            let mut scratch: Vec<u8> = Vec::with_capacity(out_schema.size());
             loop {
                 let grant = reader.next().await;
                 for (ts, value) in grant.samples() {
-                    if value.len() != in_size {
+                    if value.len() != in_value_size {
                         continue;
                     }
-                    for (i, chunk) in value.chunks_exact(8).enumerate() {
-                        let v = f64::from_le_bytes(chunk.try_into().expect("8-byte chunk"));
-                        buf[i] = Complex::new(v, 0.0);
+                    map_each_element(value, in_dtype, n, out_dtype, &mut scratch, &f);
+                    write_sample(&output, ts, &scratch);
+                }
+            }
+        },
+    ))
+}
+
+pub fn scale(input: Arc<dyn DynamicNode>, k: TypedScalar) -> Result<Arc<dyn DynamicNode>, BuildError> {
+    let in_schema = require_value(&input)?;
+    let out_schema = promoted_schema(&in_schema, k);
+    let kf = k.as_f64();
+    map(
+        op_tag::SCALE,
+        input,
+        out_schema,
+        |h| k.hash(h),
+        move |x| x * kf,
+    )
+}
+
+pub fn offset(input: Arc<dyn DynamicNode>, k: TypedScalar) -> Result<Arc<dyn DynamicNode>, BuildError> {
+    let in_schema = require_value(&input)?;
+    let out_schema = promoted_schema(&in_schema, k);
+    let kf = k.as_f64();
+    map(
+        op_tag::OFFSET,
+        input,
+        out_schema,
+        |h| k.hash(h),
+        move |x| x + kf,
+    )
+}
+
+pub fn abs(input: Arc<dyn DynamicNode>) -> Result<Arc<dyn DynamicNode>, BuildError> {
+    let in_schema = require_value(&input)?;
+    if in_schema.prim_type == PrimType::Bool {
+        return Err(BuildError::UnsupportedDtype { op: "abs", dtype: in_schema.prim_type });
+    }
+    let out_schema = in_schema.clone();
+    // For unsigned ints, abs is identity. For signed/float, real abs.
+    let unsigned = is_unsigned_int(in_schema.prim_type);
+    map(
+        op_tag::ABS,
+        input,
+        out_schema,
+        |_| {},
+        move |x| if unsigned { x } else { x.abs() },
+    )
+}
+
+pub fn neg(input: Arc<dyn DynamicNode>) -> Result<Arc<dyn DynamicNode>, BuildError> {
+    let in_schema = require_value(&input)?;
+    if is_unsigned_int(in_schema.prim_type) || in_schema.prim_type == PrimType::Bool {
+        return Err(BuildError::UnsupportedDtype { op: "neg", dtype: in_schema.prim_type });
+    }
+    let out_schema = in_schema.clone();
+    map(op_tag::NEG, input, out_schema, |_| {}, |x| -x)
+}
+
+pub fn log(input: Arc<dyn DynamicNode>) -> Result<Arc<dyn DynamicNode>, BuildError> {
+    let in_schema = require_value(&input)?;
+    if in_schema.prim_type == PrimType::Bool {
+        return Err(BuildError::UnsupportedDtype { op: "log", dtype: in_schema.prim_type });
+    }
+    // Integer in → f64 out (NumPy convention); float in → preserve width.
+    let out_dtype = if is_int(in_schema.prim_type) { PrimType::F64 } else { in_schema.prim_type };
+    let out_schema = ComponentSchema::new(out_dtype, &in_schema.dim);
+    map(op_tag::LOG, input, out_schema, |_| {}, f64::ln)
+}
+
+/// One-sided magnitude FFT of a real-valued vector input. Computes along the
+/// last axis when input is multi-dimensional; output replaces the last axis
+/// length with `N/2 + 1`. Input must total `>= 2` along that axis.
+///
+/// Output dtype is `f64` regardless of input dtype.
+pub fn fft(input: Arc<dyn DynamicNode>) -> Result<Arc<dyn DynamicNode>, BuildError> {
+    let in_schema = require_value(&input)?;
+    if in_schema.dim.is_empty() {
+        return Err(BuildError::InvalidArg {
+            op: "fft",
+            reason: "input must be at least 1-D",
+        });
+    }
+    let last = *in_schema.dim.last().unwrap();
+    if last < 2 {
+        return Err(BuildError::InvalidArg {
+            op: "fft",
+            reason: "input last-axis length must be >= 2",
+        });
+    }
+    let out_last = last / 2 + 1;
+    let mut out_dim: SmallVec<[usize; 4]> = in_schema.dim.clone();
+    *out_dim.last_mut().unwrap() = out_last;
+    let out_schema = ComponentSchema::new(PrimType::F64, &out_dim);
+    let id = hash_id(op_tag::FFT, &[input.id()], |_| {});
+    let parent_clock = input.parent_clock_id();
+    let in_value_size = in_schema.size();
+    let in_dtype = in_schema.prim_type;
+    let in_total: usize = in_schema.dim.iter().product();
+    let groups = in_total / last;
+    let mut planner = FftPlanner::<f64>::new();
+    let plan = planner.plan_fft_forward(last);
+    let mut reader = input.subscribe();
+    Ok(NodeImpl::spawn(
+        id,
+        ValueType::Value(out_schema.clone()),
+        parent_clock,
+        default_ring_bytes(out_schema.size()),
+        move |output| async move {
+            let _input = input;
+            let mut buf: Vec<Complex<f64>> = vec![Complex::new(0.0, 0.0); last];
+            let mut scratch: Vec<u8> = Vec::with_capacity(out_schema.size());
+            loop {
+                let grant = reader.next().await;
+                for (ts, value) in grant.samples() {
+                    if value.len() != in_value_size {
+                        continue;
                     }
-                    plan.process(&mut buf);
                     scratch.clear();
-                    for c in buf.iter().take(out_len) {
-                        scratch.extend_from_slice(&c.norm().to_le_bytes());
+                    for g in 0..groups {
+                        let base = g * last;
+                        for k in 0..last {
+                            let v = read_f64_at(value, in_dtype, base + k);
+                            buf[k] = Complex::new(v, 0.0);
+                        }
+                        plan.process(&mut buf);
+                        for c in buf.iter().take(out_last) {
+                            scratch.extend_from_slice(&c.norm().to_le_bytes());
+                        }
                     }
                     write_sample(&output, ts, &scratch);
                 }
@@ -155,10 +207,9 @@ pub fn fft(input: Arc<dyn DynamicNode>) -> Result<Arc<dyn DynamicNode>, BuildErr
     ))
 }
 
-/// Sliding window over a scalar f64 stream. Emits an `[f64; size]` vector
-/// on every input tick: the buffer is preloaded with zeros, so emissions
-/// start immediately rather than waiting for `size` samples to accumulate.
-/// The leading zeros wash out after `size` ticks.
+/// Sliding window over a stream. Emits `[size, ...input.shape]` on every input
+/// tick, dtype preserved. The buffer is preloaded with zeros so emissions
+/// start immediately; the leading zeros wash out after `size` ticks.
 pub fn window(
     input: Arc<dyn DynamicNode>,
     size: usize,
@@ -169,29 +220,39 @@ pub fn window(
             reason: "size must be > 0",
         });
     }
-    let _ = require_f64_derivable(&input)?;
+    let in_schema = require_value(&input)?;
+    let in_value_size = in_schema.size();
+    let mut out_dim: SmallVec<[usize; 4]> = SmallVec::with_capacity(in_schema.dim.len() + 1);
+    out_dim.push(size);
+    out_dim.extend(in_schema.dim.iter().copied());
+    let out_schema = ComponentSchema::new(in_schema.prim_type, &out_dim);
     let id = hash_id(op_tag::WINDOW, &[input.id()], |h| size.hash(h));
     let parent_clock = input.parent_clock_id();
-    let schema = ComponentSchema::new(PrimType::F64, &[size]);
     let mut reader = input.subscribe();
     Ok(NodeImpl::spawn(
         id,
-        ValueType::Value(schema.clone()),
+        ValueType::Value(out_schema.clone()),
         parent_clock,
-        default_ring_bytes(schema.size()),
+        default_ring_bytes(out_schema.size()),
         move |output| async move {
             let _input = input;
-            let mut buf: VecDeque<f64> = VecDeque::from(vec![0.0; size]);
-            let mut scratch: Vec<u8> = Vec::with_capacity(size * size_of::<f64>());
+            // Ring of `size` slots, each `in_value_size` bytes.
+            let mut buf: VecDeque<Vec<u8>> =
+                (0..size).map(|_| vec![0u8; in_value_size]).collect();
+            let mut scratch: Vec<u8> = Vec::with_capacity(out_schema.size());
             loop {
                 let grant = reader.next().await;
                 for (ts, value) in grant.samples() {
-                    let v = read_f64(value);
-                    buf.pop_front();
-                    buf.push_back(v);
+                    if value.len() != in_value_size {
+                        continue;
+                    }
+                    let mut slot = buf.pop_front().expect("ring not empty");
+                    slot.clear();
+                    slot.extend_from_slice(value);
+                    buf.push_back(slot);
                     scratch.clear();
-                    for x in buf.iter() {
-                        scratch.extend_from_slice(&x.to_le_bytes());
+                    for s in buf.iter() {
+                        scratch.extend_from_slice(s);
                     }
                     write_sample(&output, ts, &scratch);
                 }

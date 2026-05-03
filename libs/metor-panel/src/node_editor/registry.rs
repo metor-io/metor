@@ -2,7 +2,11 @@
 //! connection validator. Single source of truth for socket counts and types
 //! so the three subsystems can't drift.
 
+use metor_proto::types::PrimType;
+use smallvec::SmallVec;
+
 use crate::dynamic::ops::generators::Waveform;
+use crate::dynamic::tensor::TypedScalar;
 use crate::node_editor::spec::{NodeSpec, NodeSpecKind};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -107,32 +111,41 @@ pub const ALL: &[OpDescriptor] = &[
             freq: 1.0,
             amplitude: 1.0,
             phase: 0.0,
+            dtype: PrimType::F64,
+            out_shape: SmallVec::new(),
         },
         arg_count: 4,
     },
     OpDescriptor {
         kind: NodeSpecKind::Random, label: "Random", category: "Generator",
         inputs: ONE_CLK, output: F64,
-        default_spec: || NodeSpec::Random { seed: 1 },
+        default_spec: || NodeSpec::Random {
+            seed: 1,
+            dtype: PrimType::F64,
+            out_shape: SmallVec::new(),
+        },
         arg_count: 1,
     },
     OpDescriptor {
         kind: NodeSpecKind::Constant, label: "Constant", category: "Generator",
         inputs: ONE_CLK, output: F64,
-        default_spec: || NodeSpec::Constant { value: 0.0 },
+        default_spec: || NodeSpec::Constant {
+            value: TypedScalar::F64(0.0),
+            out_shape: SmallVec::new(),
+        },
         arg_count: 1,
     },
     // Derive
     OpDescriptor {
         kind: NodeSpecKind::Scale, label: "Scale", category: "Derive",
         inputs: ONE_F64, output: F64,
-        default_spec: || NodeSpec::Scale { k: 1.0 },
+        default_spec: || NodeSpec::Scale { k: TypedScalar::F64(1.0) },
         arg_count: 1,
     },
     OpDescriptor {
         kind: NodeSpecKind::Offset, label: "Offset", category: "Derive",
         inputs: ONE_F64, output: F64,
-        default_spec: || NodeSpec::Offset { k: 0.0 },
+        default_spec: || NodeSpec::Offset { k: TypedScalar::F64(0.0) },
         arg_count: 1,
     },
     OpDescriptor {

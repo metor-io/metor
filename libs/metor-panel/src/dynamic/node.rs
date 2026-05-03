@@ -5,6 +5,7 @@ use std::sync::Arc;
 use metor_db::ComponentSchema;
 use metor_db::disruptor::{Disruptor, ReadGrant, Reader};
 use metor_proto::types::{ComponentId, PrimType, Timestamp};
+use smallvec::SmallVec;
 use stellarator::JoinHandleDropGuard;
 
 /// Stable identity of a dynamic node. Hashed from `(op_tag, args, parent_ids)`
@@ -44,19 +45,15 @@ impl ValueType {
     }
 }
 
-/// Validate that `node` is a value-typed f64 scalar; return its schema.
-/// Shared by every op whose Phase 1 scope is f64-only.
-pub fn require_f64_scalar(
+/// Validate that `node` is value-typed (any prim type, any shape) and return
+/// a clone of its schema.
+pub fn require_value(
     node: &std::sync::Arc<dyn DynamicNode>,
 ) -> Result<ComponentSchema, BuildError> {
-    let schema = match node.value_type() {
-        ValueType::Clock => return Err(BuildError::ExpectedValue),
-        ValueType::Value(s) => s,
-    };
-    if schema.prim_type != PrimType::F64 {
-        return Err(BuildError::ExpectedFloat(schema.prim_type));
+    match node.value_type() {
+        ValueType::Clock => Err(BuildError::ExpectedValue),
+        ValueType::Value(s) => Ok(s.clone()),
     }
-    Ok(schema.clone())
 }
 
 /// Validate that `node` is clock-typed.
@@ -80,8 +77,16 @@ pub enum BuildError {
     SchemaMismatch { a: ComponentSchema, b: ComponentSchema },
     #[error("composer inputs must share a clock (parent_clock_id mismatch)")]
     ClockMismatch,
-    #[error("expected a floating-point input, got {0:?}")]
-    ExpectedFloat(PrimType),
+    #[error("shapes are not broadcast-compatible: {a:?} vs {b:?}")]
+    BroadcastMismatch {
+        a: SmallVec<[usize; 4]>,
+        b: SmallVec<[usize; 4]>,
+    },
+    #[error("{op} does not support dtype {dtype:?}")]
+    UnsupportedDtype {
+        op: &'static str,
+        dtype: PrimType,
+    },
     #[error("composer needs at least one input")]
     EmptyInputs,
     #[error("graph contains a cycle")]

@@ -11,10 +11,12 @@ use std::hash::Hash;
 use std::sync::Arc;
 
 use metor_db::DB;
-use metor_proto::types::ComponentId;
+use metor_proto::types::{ComponentId, PrimType};
+use smallvec::SmallVec;
 
 use crate::dynamic::{BuildError, DynamicNode, NodeId, hash_id, op_tag, ops};
 use crate::dynamic::ops::generators::Waveform;
+use crate::dynamic::tensor::TypedScalar;
 
 #[derive(Clone, Debug, PartialEq, facet::Facet)]
 #[repr(u8)]
@@ -26,11 +28,20 @@ pub enum NodeSpec {
         freq: f64,
         amplitude: f64,
         phase: f64,
+        dtype: PrimType,
+        out_shape: SmallVec<[usize; 4]>,
     },
-    Random { seed: u64 },
-    Constant { value: f64 },
-    Scale { k: f64 },
-    Offset { k: f64 },
+    Random {
+        seed: u64,
+        dtype: PrimType,
+        out_shape: SmallVec<[usize; 4]>,
+    },
+    Constant {
+        value: TypedScalar,
+        out_shape: SmallVec<[usize; 4]>,
+    },
+    Scale { k: TypedScalar },
+    Offset { k: TypedScalar },
     Abs,
     Neg,
     Log,
@@ -125,20 +136,25 @@ impl NodeSpec {
                 hz.to_bits().hash(h);
             }
             ClockOf => {}
-            Waveform { shape, freq, amplitude, phase } => {
+            Waveform { shape, freq, amplitude, phase, dtype, out_shape } => {
                 (*shape as u8).hash(h);
                 freq.to_bits().hash(h);
                 amplitude.to_bits().hash(h);
                 phase.to_bits().hash(h);
+                (*dtype as u8).hash(h);
+                for d in out_shape { d.hash(h); }
             }
-            Random { seed } => {
+            Random { seed, dtype, out_shape } => {
                 seed.hash(h);
+                (*dtype as u8).hash(h);
+                for d in out_shape { d.hash(h); }
             }
-            Constant { value } => {
-                value.to_bits().hash(h);
+            Constant { value, out_shape } => {
+                value.hash(h);
+                for d in out_shape { d.hash(h); }
             }
             Scale { k } | Offset { k } => {
-                k.to_bits().hash(h);
+                k.hash(h);
             }
             Abs | Neg | Log | Fft => {}
             Window { size } => {
@@ -219,11 +235,23 @@ pub fn build(
             ops::clock::fixed_rate(*hz)
         }
         ClockOf => Ok(ops::clock::clock_of(p1("clock_of", parents)?)),
-        Waveform { shape, freq, amplitude, phase } => {
-            ops::generators::waveform(p1("waveform", parents)?, *shape, *freq, *amplitude, *phase)
+        Waveform { shape, freq, amplitude, phase, dtype, out_shape } => {
+            ops::generators::waveform(
+                p1("waveform", parents)?,
+                *shape,
+                *freq,
+                *amplitude,
+                *phase,
+                *dtype,
+                out_shape.clone(),
+            )
         }
-        Random { seed } => ops::generators::random(p1("random", parents)?, *seed),
-        Constant { value } => ops::generators::constant(p1("constant", parents)?, *value),
+        Random { seed, dtype, out_shape } => {
+            ops::generators::random(p1("random", parents)?, *seed, *dtype, out_shape.clone())
+        }
+        Constant { value, out_shape } => {
+            ops::generators::constant(p1("constant", parents)?, *value, out_shape.clone())
+        }
         Scale { k } => ops::derive::scale(p1("scale", parents)?, *k),
         Offset { k } => ops::derive::offset(p1("offset", parents)?, *k),
         Abs => ops::derive::abs(p1("abs", parents)?),

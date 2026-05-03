@@ -29,6 +29,7 @@ use gpui::{AnyEntity, App, Entity, SharedString};
 use metor_db::DB;
 
 use crate::dynamic::ops::generators::Waveform;
+use crate::dynamic::tensor::TypedScalar;
 use crate::inspector::registry::InspectorRegistry;
 use crate::inspector::rows::{
     ActionRow, CommandRow, DefaultActionRow, EnumRow, InspectorRow, RowAction, ScalarRow, TextRow,
@@ -283,7 +284,8 @@ fn build_rows(any: AnyEntity, db: &Arc<DB>, cx: &App) -> Vec<Box<dyn InspectorRo
             crate::dynamic::BuildError::EmptyInputs => "no inputs",
             crate::dynamic::BuildError::ExpectedClock(_) => "expected clock",
             crate::dynamic::BuildError::ExpectedValue => "expected value",
-            crate::dynamic::BuildError::ExpectedFloat(_) => "expected float",
+            crate::dynamic::BuildError::BroadcastMismatch { .. } => "broadcast mismatch",
+            crate::dynamic::BuildError::UnsupportedDtype { .. } => "unsupported dtype",
             crate::dynamic::BuildError::SchemaMismatch { .. } => "schema mismatch",
             crate::dynamic::BuildError::WrongArity { .. } => "wrong arity",
             crate::dynamic::BuildError::InvalidArg { .. } => "invalid arg",
@@ -335,7 +337,7 @@ pub fn rows_for_node(
                 },
             ));
         }
-        NodeSpec::Waveform { shape, freq, amplitude, phase } => {
+        NodeSpec::Waveform { shape, freq, amplitude, phase, .. } => {
             let shape_label = SharedString::from(waveform_label(*shape));
             let options: Vec<SharedString> = WAVEFORMS
                 .iter()
@@ -366,7 +368,7 @@ pub fn rows_for_node(
                 if let NodeSpec::Waveform { phase, .. } = s { *phase = v; }
             }));
         }
-        NodeSpec::Random { seed } => {
+        NodeSpec::Random { seed, .. } => {
             rows.push(scalar_arg(
                 "Seed",
                 *seed as f64,
@@ -374,22 +376,22 @@ pub fn rows_for_node(
                 graph.clone(),
                 flow_id.clone(),
                 |spec, v| {
-                    if let NodeSpec::Random { seed } = spec {
+                    if let NodeSpec::Random { seed, .. } = spec {
                         *seed = v as u64;
                     }
                 },
             ));
         }
-        NodeSpec::Constant { value } => {
+        NodeSpec::Constant { value, .. } => {
             rows.push(scalar_arg(
                 "Value",
-                *value,
+                value.as_f64(),
                 editor.clone(),
                 graph.clone(),
                 flow_id.clone(),
                 |spec, v| {
-                    if let NodeSpec::Constant { value } = spec {
-                        *value = v;
+                    if let NodeSpec::Constant { value, .. } = spec {
+                        *value = TypedScalar::from_f64(v, value.dtype());
                     }
                 },
             ));
@@ -397,13 +399,13 @@ pub fn rows_for_node(
         NodeSpec::Scale { k } => {
             rows.push(scalar_arg(
                 "Scale (k)",
-                *k,
+                k.as_f64(),
                 editor.clone(),
                 graph.clone(),
                 flow_id.clone(),
                 |spec, v| {
                     if let NodeSpec::Scale { k } = spec {
-                        *k = v;
+                        *k = TypedScalar::from_f64(v, k.dtype());
                     }
                 },
             ));
@@ -411,13 +413,13 @@ pub fn rows_for_node(
         NodeSpec::Offset { k } => {
             rows.push(scalar_arg(
                 "Offset",
-                *k,
+                k.as_f64(),
                 editor.clone(),
                 graph.clone(),
                 flow_id.clone(),
                 |spec, v| {
                     if let NodeSpec::Offset { k } = spec {
-                        *k = v;
+                        *k = TypedScalar::from_f64(v, k.dtype());
                     }
                 },
             ));

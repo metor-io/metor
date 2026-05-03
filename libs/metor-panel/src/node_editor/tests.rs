@@ -6,6 +6,10 @@ use std::collections::HashSet;
 use std::hash::Hash;
 use std::sync::Arc;
 
+use metor_proto::types::PrimType;
+use smallvec::SmallVec;
+
+use crate::dynamic::tensor::TypedScalar;
 use crate::dynamic::{
     BuildError, DynamicNode, DynamicRegistry, NodeId, hash_id, op_tag, ops,
 };
@@ -13,6 +17,39 @@ use crate::node_editor::config::{NodeEditorConfig, Viewport};
 use crate::node_editor::graph::{BuildState, EdgeEntry, NodeGraph, Position};
 use crate::node_editor::spec::{NodeSpec, compute_node_id};
 use crate::node_editor::validate::{EdgeVerdict, validate_connection};
+
+// Test-only convenience wrappers around the dtype/shape-aware generator API.
+fn const_f64(
+    clock: Arc<dyn DynamicNode>,
+    v: f64,
+) -> Result<Arc<dyn DynamicNode>, BuildError> {
+    ops::generators::constant(clock, TypedScalar::F64(v), SmallVec::new())
+}
+
+fn waveform_f64(
+    clock: Arc<dyn DynamicNode>,
+    shape: ops::generators::Waveform,
+    freq: f64,
+    amplitude: f64,
+    phase: f64,
+) -> Result<Arc<dyn DynamicNode>, BuildError> {
+    ops::generators::waveform(
+        clock,
+        shape,
+        freq,
+        amplitude,
+        phase,
+        PrimType::F64,
+        SmallVec::new(),
+    )
+}
+
+fn random_f64(
+    clock: Arc<dyn DynamicNode>,
+    seed: u64,
+) -> Result<Arc<dyn DynamicNode>, BuildError> {
+    ops::generators::random(clock, seed, PrimType::F64, SmallVec::new())
+}
 
 /// Hash an arbitrary set of args the same way `crate::dynamic::node::hash_id`
 /// does — used by tests that don't have a constructor to call (e.g. FromDb,
@@ -47,7 +84,7 @@ async fn fixed_rate_id_matches() {
 #[stellarator::test]
 async fn clock_of_id_matches() {
     let src_clock = ops::clock::fixed_rate(100.0).unwrap();
-    let src = ops::generators::constant(src_clock, 1.0).unwrap();
+    let src = const_f64(src_clock, 1.0).unwrap();
     let src_id = src.id();
     let derived = ops::clock::clock_of(src);
     assert_eq!(derived.id(), compute_node_id(&NodeSpec::ClockOf, &[src_id]));
@@ -59,11 +96,18 @@ async fn waveform_id_matches() {
     for shape in [Waveform::Sin, Waveform::Cos, Waveform::Square, Waveform::Sawtooth] {
         let clock = ops::clock::fixed_rate(200.0).unwrap();
         let clock_id = clock.id();
-        let built = ops::generators::waveform(clock, shape, 1.5, 2.0, 0.25).unwrap();
+        let built = waveform_f64(clock, shape, 1.5, 2.0, 0.25).unwrap();
         assert_eq!(
             built.id(),
             compute_node_id(
-                &NodeSpec::Waveform { shape, freq: 1.5, amplitude: 2.0, phase: 0.25 },
+                &NodeSpec::Waveform {
+                    shape,
+                    freq: 1.5,
+                    amplitude: 2.0,
+                    phase: 0.25,
+                    dtype: PrimType::F64,
+                    out_shape: SmallVec::new(),
+                },
                 &[clock_id],
             ),
             "shape={shape:?}",
@@ -75,10 +119,10 @@ async fn waveform_id_matches() {
 async fn random_id_matches() {
     let clock = ops::clock::fixed_rate(100.0).unwrap();
     let clock_id = clock.id();
-    let built = ops::generators::random(clock, 42).unwrap();
+    let built = random_f64(clock, 42).unwrap();
     assert_eq!(
         built.id(),
-        compute_node_id(&NodeSpec::Random { seed: 42 }, &[clock_id]),
+        compute_node_id(&NodeSpec::Random { seed: 42, dtype: PrimType::F64, out_shape: SmallVec::new() }, &[clock_id]),
     );
 }
 
@@ -86,38 +130,38 @@ async fn random_id_matches() {
 async fn constant_id_matches() {
     let clock = ops::clock::fixed_rate(100.0).unwrap();
     let clock_id = clock.id();
-    let built = ops::generators::constant(clock, 7.5).unwrap();
+    let built = const_f64(clock, 7.5).unwrap();
     assert_eq!(
         built.id(),
-        compute_node_id(&NodeSpec::Constant { value: 7.5 }, &[clock_id]),
+        compute_node_id(&NodeSpec::Constant { value: TypedScalar::F64(7.5), out_shape: SmallVec::new() }, &[clock_id]),
     );
 }
 
 #[stellarator::test]
 async fn scale_id_matches() {
     let clock = ops::clock::fixed_rate(100.0).unwrap();
-    let src = ops::generators::constant(clock, 1.0).unwrap();
+    let src = const_f64(clock, 1.0).unwrap();
     let src_id = src.id();
-    let built = ops::derive::scale(src, 2.5).unwrap();
-    assert_eq!(built.id(), compute_node_id(&NodeSpec::Scale { k: 2.5 }, &[src_id]));
+    let built = ops::derive::scale(src, TypedScalar::F64(2.5)).unwrap();
+    assert_eq!(built.id(), compute_node_id(&NodeSpec::Scale { k: TypedScalar::F64(2.5) }, &[src_id]));
 }
 
 #[stellarator::test]
 async fn offset_id_matches() {
     let clock = ops::clock::fixed_rate(100.0).unwrap();
-    let src = ops::generators::constant(clock, 1.0).unwrap();
+    let src = const_f64(clock, 1.0).unwrap();
     let src_id = src.id();
-    let built = ops::derive::offset(src, -3.0).unwrap();
+    let built = ops::derive::offset(src, TypedScalar::F64(-3.0)).unwrap();
     assert_eq!(
         built.id(),
-        compute_node_id(&NodeSpec::Offset { k: -3.0 }, &[src_id]),
+        compute_node_id(&NodeSpec::Offset { k: TypedScalar::F64(-3.0) }, &[src_id]),
     );
 }
 
 #[stellarator::test]
 async fn abs_neg_log_ids_match() {
     let clock = ops::clock::fixed_rate(100.0).unwrap();
-    let src = ops::generators::constant(clock, 1.0).unwrap();
+    let src = const_f64(clock, 1.0).unwrap();
     let src_id = src.id();
     let abs = ops::derive::abs(src.clone()).unwrap();
     let neg = ops::derive::neg(src.clone()).unwrap();
@@ -130,7 +174,7 @@ async fn abs_neg_log_ids_match() {
 #[stellarator::test]
 async fn window_id_matches() {
     let clock = ops::clock::fixed_rate(100.0).unwrap();
-    let src = ops::generators::constant(clock, 1.0).unwrap();
+    let src = const_f64(clock, 1.0).unwrap();
     let src_id = src.id();
     let built = ops::derive::window(src, 16).unwrap();
     assert_eq!(
@@ -142,7 +186,7 @@ async fn window_id_matches() {
 #[stellarator::test]
 async fn fft_id_matches() {
     let clock = ops::clock::fixed_rate(100.0).unwrap();
-    let scalar = ops::generators::constant(clock, 1.0).unwrap();
+    let scalar = const_f64(clock, 1.0).unwrap();
     let packed = ops::compose::pack(vec![scalar.clone(), scalar]).unwrap();
     let packed_id = packed.id();
     let built = ops::derive::fft(packed).unwrap();
@@ -152,8 +196,8 @@ async fn fft_id_matches() {
 #[stellarator::test]
 async fn add_sub_mul_ids_match() {
     let clock = ops::clock::fixed_rate(100.0).unwrap();
-    let a = ops::generators::constant(clock.clone(), 1.0).unwrap();
-    let b = ops::generators::constant(clock, 2.0).unwrap();
+    let a = const_f64(clock.clone(), 1.0).unwrap();
+    let b = const_f64(clock, 2.0).unwrap();
     let aid = a.id();
     let bid = b.id();
     let add = ops::compose::add(a.clone(), b.clone()).unwrap();
@@ -167,9 +211,9 @@ async fn add_sub_mul_ids_match() {
 #[stellarator::test]
 async fn mean_id_matches() {
     let clock = ops::clock::fixed_rate(100.0).unwrap();
-    let a = ops::generators::constant(clock.clone(), 1.0).unwrap();
-    let b = ops::generators::constant(clock.clone(), 2.0).unwrap();
-    let c = ops::generators::constant(clock, 3.0).unwrap();
+    let a = const_f64(clock.clone(), 1.0).unwrap();
+    let b = const_f64(clock.clone(), 2.0).unwrap();
+    let c = const_f64(clock, 3.0).unwrap();
     let ids: Vec<NodeId> = vec![a.id(), b.id(), c.id()];
     let built = ops::compose::mean(vec![a, b, c]).unwrap();
     assert_eq!(built.id(), compute_node_id(&NodeSpec::Mean, &ids));
@@ -179,7 +223,7 @@ async fn mean_id_matches() {
 async fn resample_ids_match() {
     let slow = ops::clock::fixed_rate(50.0).unwrap();
     let fast = ops::clock::fixed_rate(400.0).unwrap();
-    let src = ops::generators::constant(slow, 1.0).unwrap();
+    let src = const_f64(slow, 1.0).unwrap();
     let src_id = src.id();
     let fast_id = fast.id();
     let zoh = ops::resample::zoh(src.clone(), fast.clone()).unwrap();
@@ -226,7 +270,7 @@ fn graph_with_clock_and_constant() -> NodeGraph {
     );
     graph.insert_node(
         "k".into(),
-        NodeSpec::Constant { value: 1.0 },
+        NodeSpec::Constant { value: TypedScalar::F64(1.0), out_shape: SmallVec::new() },
         Position { x: 100.0, y: 0.0 },
     );
     graph.add_edge(EdgeEntry {
@@ -303,10 +347,10 @@ async fn rebuild_propagates_parent_failure_downstream() {
     let mut g = NodeGraph::new(1);
     g.insert_node("clk_a".into(), NodeSpec::FixedRate { hz: 100.0 }, Position { x: 0.0, y: 0.0 });
     g.insert_node("clk_b".into(), NodeSpec::FixedRate { hz: 200.0 }, Position { x: 0.0, y: 50.0 });
-    g.insert_node("a".into(), NodeSpec::Constant { value: 1.0 }, Position { x: 100.0, y: 0.0 });
-    g.insert_node("b".into(), NodeSpec::Constant { value: 2.0 }, Position { x: 100.0, y: 50.0 });
+    g.insert_node("a".into(), NodeSpec::Constant { value: TypedScalar::F64(1.0), out_shape: SmallVec::new() }, Position { x: 100.0, y: 0.0 });
+    g.insert_node("b".into(), NodeSpec::Constant { value: TypedScalar::F64(2.0), out_shape: SmallVec::new() }, Position { x: 100.0, y: 50.0 });
     g.insert_node("mul".into(), NodeSpec::Mul, Position { x: 200.0, y: 25.0 });
-    g.insert_node("scale".into(), NodeSpec::Scale { k: 1.0 }, Position { x: 300.0, y: 25.0 });
+    g.insert_node("scale".into(), NodeSpec::Scale { k: TypedScalar::F64(1.0) }, Position { x: 300.0, y: 25.0 });
 
     g.add_edge(EdgeEntry { source: "clk_a".into(), target: "a".into(), target_socket: 0 });
     g.add_edge(EdgeEntry { source: "clk_b".into(), target: "b".into(), target_socket: 0 });
@@ -337,7 +381,7 @@ async fn rebuild_propagates_parent_failure_downstream() {
 fn validate_rejects_clock_into_value_socket() {
     let mut g = NodeGraph::new(1);
     g.insert_node("clk".into(), NodeSpec::FixedRate { hz: 100.0 }, Position { x: 0.0, y: 0.0 });
-    g.insert_node("scale".into(), NodeSpec::Scale { k: 1.0 }, Position { x: 100.0, y: 0.0 });
+    g.insert_node("scale".into(), NodeSpec::Scale { k: TypedScalar::F64(1.0) }, Position { x: 100.0, y: 0.0 });
     let bad = EdgeEntry { source: "clk".into(), target: "scale".into(), target_socket: 0 };
     assert_eq!(validate_connection(&g, &bad), EdgeVerdict::BadSocket);
 }
@@ -346,8 +390,8 @@ fn validate_rejects_clock_into_value_socket() {
 fn validate_accepts_value_into_value_socket() {
     let mut g = NodeGraph::new(1);
     g.insert_node("clk".into(), NodeSpec::FixedRate { hz: 100.0 }, Position { x: 0.0, y: 0.0 });
-    g.insert_node("k".into(), NodeSpec::Constant { value: 1.0 }, Position { x: 100.0, y: 0.0 });
-    g.insert_node("scale".into(), NodeSpec::Scale { k: 2.0 }, Position { x: 200.0, y: 0.0 });
+    g.insert_node("k".into(), NodeSpec::Constant { value: TypedScalar::F64(1.0), out_shape: SmallVec::new() }, Position { x: 100.0, y: 0.0 });
+    g.insert_node("scale".into(), NodeSpec::Scale { k: TypedScalar::F64(2.0) }, Position { x: 200.0, y: 0.0 });
     g.add_edge(EdgeEntry { source: "clk".into(), target: "k".into(), target_socket: 0 });
     let edge = EdgeEntry { source: "k".into(), target: "scale".into(), target_socket: 0 };
     assert_eq!(validate_connection(&g, &edge), EdgeVerdict::Ok);
@@ -356,7 +400,7 @@ fn validate_accepts_value_into_value_socket() {
 #[test]
 fn validate_rejects_self_loop() {
     let mut g = NodeGraph::new(1);
-    g.insert_node("k".into(), NodeSpec::Scale { k: 1.0 }, Position { x: 0.0, y: 0.0 });
+    g.insert_node("k".into(), NodeSpec::Scale { k: TypedScalar::F64(1.0) }, Position { x: 0.0, y: 0.0 });
     let edge = EdgeEntry { source: "k".into(), target: "k".into(), target_socket: 0 };
     assert_eq!(validate_connection(&g, &edge), EdgeVerdict::SelfLoop);
 }
@@ -365,9 +409,9 @@ fn validate_rejects_self_loop() {
 fn add_edge_replaces_on_exact_arity_target() {
     let mut g = NodeGraph::new(1);
     g.insert_node("clk".into(), NodeSpec::FixedRate { hz: 100.0 }, Position { x: 0.0, y: 0.0 });
-    g.insert_node("a".into(), NodeSpec::Constant { value: 1.0 }, Position { x: 100.0, y: 0.0 });
-    g.insert_node("b".into(), NodeSpec::Constant { value: 2.0 }, Position { x: 100.0, y: 50.0 });
-    g.insert_node("scale".into(), NodeSpec::Scale { k: 1.0 }, Position { x: 200.0, y: 0.0 });
+    g.insert_node("a".into(), NodeSpec::Constant { value: TypedScalar::F64(1.0), out_shape: SmallVec::new() }, Position { x: 100.0, y: 0.0 });
+    g.insert_node("b".into(), NodeSpec::Constant { value: TypedScalar::F64(2.0), out_shape: SmallVec::new() }, Position { x: 100.0, y: 50.0 });
+    g.insert_node("scale".into(), NodeSpec::Scale { k: TypedScalar::F64(1.0) }, Position { x: 200.0, y: 0.0 });
     g.add_edge(EdgeEntry { source: "clk".into(), target: "a".into(), target_socket: 0 });
     g.add_edge(EdgeEntry { source: "clk".into(), target: "b".into(), target_socket: 0 });
 
@@ -385,7 +429,7 @@ fn variadic_edges_use_distinct_sockets() {
     g.insert_node("clk".into(), NodeSpec::FixedRate { hz: 100.0 }, Position { x: 0.0, y: 0.0 });
     for i in 0..3 {
         let id = format!("k{i}");
-        g.insert_node(id.clone().into(), NodeSpec::Constant { value: i as f64 }, Position { x: 100.0, y: i as f32 * 20.0 });
+        g.insert_node(id.clone().into(), NodeSpec::Constant { value: TypedScalar::F64(i as f64), out_shape: SmallVec::new() }, Position { x: 100.0, y: i as f32 * 20.0 });
         g.add_edge(EdgeEntry { source: "clk".into(), target: id.into(), target_socket: 0 });
     }
     g.insert_node("mean".into(), NodeSpec::Mean, Position { x: 200.0, y: 0.0 });
@@ -408,7 +452,7 @@ fn variadic_remove_compacts_socket_indices() {
     g.insert_node("clk".into(), NodeSpec::FixedRate { hz: 100.0 }, Position { x: 0.0, y: 0.0 });
     for i in 0..3 {
         let id = format!("k{i}");
-        g.insert_node(id.clone().into(), NodeSpec::Constant { value: i as f64 }, Position { x: 100.0, y: 0.0 });
+        g.insert_node(id.clone().into(), NodeSpec::Constant { value: TypedScalar::F64(i as f64), out_shape: SmallVec::new() }, Position { x: 100.0, y: 0.0 });
         g.add_edge(EdgeEntry { source: "clk".into(), target: id.into(), target_socket: 0 });
     }
     g.insert_node("mean".into(), NodeSpec::Mean, Position { x: 200.0, y: 0.0 });
@@ -429,8 +473,8 @@ fn variadic_remove_compacts_socket_indices() {
 #[test]
 fn validate_rejects_cycle() {
     let mut g = NodeGraph::new(1);
-    g.insert_node("a".into(), NodeSpec::Scale { k: 1.0 }, Position { x: 0.0, y: 0.0 });
-    g.insert_node("b".into(), NodeSpec::Scale { k: 1.0 }, Position { x: 100.0, y: 0.0 });
+    g.insert_node("a".into(), NodeSpec::Scale { k: TypedScalar::F64(1.0) }, Position { x: 0.0, y: 0.0 });
+    g.insert_node("b".into(), NodeSpec::Scale { k: TypedScalar::F64(1.0) }, Position { x: 100.0, y: 0.0 });
     g.add_edge(EdgeEntry { source: "a".into(), target: "b".into(), target_socket: 0 });
     let edge = EdgeEntry { source: "b".into(), target: "a".into(), target_socket: 0 };
     assert_eq!(validate_connection(&g, &edge), EdgeVerdict::WouldCycle);
@@ -440,9 +484,9 @@ fn validate_rejects_cycle() {
 fn variadic_parent_order_follows_target_socket() {
     let mut g = NodeGraph::new(1);
     g.insert_node("clk".into(), NodeSpec::FixedRate { hz: 100.0 }, Position { x: 0.0, y: 100.0 });
-    g.insert_node("a".into(), NodeSpec::Constant { value: 1.0 }, Position { x: 50.0, y: 50.0 });
-    g.insert_node("b".into(), NodeSpec::Constant { value: 2.0 }, Position { x: 50.0, y: 0.0 });
-    g.insert_node("c".into(), NodeSpec::Constant { value: 3.0 }, Position { x: 50.0, y: 75.0 });
+    g.insert_node("a".into(), NodeSpec::Constant { value: TypedScalar::F64(1.0), out_shape: SmallVec::new() }, Position { x: 50.0, y: 50.0 });
+    g.insert_node("b".into(), NodeSpec::Constant { value: TypedScalar::F64(2.0), out_shape: SmallVec::new() }, Position { x: 50.0, y: 0.0 });
+    g.insert_node("c".into(), NodeSpec::Constant { value: TypedScalar::F64(3.0), out_shape: SmallVec::new() }, Position { x: 50.0, y: 75.0 });
     g.insert_node("mean".into(), NodeSpec::Mean, Position { x: 200.0, y: 50.0 });
     for n in ["a", "b", "c"] {
         g.add_edge(EdgeEntry {
@@ -472,10 +516,12 @@ fn config_round_trips_through_facet_json() {
             freq: 1.5,
             amplitude: 2.0,
             phase: 0.25,
+            dtype: PrimType::F64,
+            out_shape: SmallVec::new(),
         },
         Position { x: 100.0, y: 20.0 },
     );
-    g.insert_node("scale".into(), NodeSpec::Scale { k: -0.5 }, Position { x: 200.0, y: 20.0 });
+    g.insert_node("scale".into(), NodeSpec::Scale { k: TypedScalar::F64(-0.5) }, Position { x: 200.0, y: 20.0 });
     g.insert_node("persist".into(), NodeSpec::Persist { name: "speed".into() }, Position { x: 300.0, y: 20.0 });
     g.add_edge(EdgeEntry { source: "clk".into(), target: "sin".into(), target_socket: 0 });
     g.add_edge(EdgeEntry { source: "sin".into(), target: "scale".into(), target_socket: 0 });
