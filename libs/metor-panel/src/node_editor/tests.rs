@@ -45,13 +45,13 @@ fn unique_db_path(label: &str) -> std::path::PathBuf {
 
 #[stellarator::test]
 async fn fixed_rate_id_matches() {
-    let built = ops::clock::fixed_rate(123.5);
+    let built = ops::clock::fixed_rate(123.5).unwrap();
     assert_eq!(built.id(), compute_node_id(&NodeSpec::FixedRate { hz: 123.5 }, &[]));
 }
 
 #[stellarator::test]
 async fn clock_of_id_matches() {
-    let src_clock = ops::clock::fixed_rate(100.0);
+    let src_clock = ops::clock::fixed_rate(100.0).unwrap();
     let src = ops::generators::constant(src_clock, 1.0).unwrap();
     let src_id = src.id();
     let derived = ops::clock::clock_of(src);
@@ -60,7 +60,7 @@ async fn clock_of_id_matches() {
 
 #[stellarator::test]
 async fn sin_id_matches() {
-    let clock = ops::clock::fixed_rate(200.0);
+    let clock = ops::clock::fixed_rate(200.0).unwrap();
     let clock_id = clock.id();
     let built = ops::generators::sin(clock, 1.5, 2.0, 0.25).unwrap();
     assert_eq!(
@@ -74,7 +74,7 @@ async fn sin_id_matches() {
 
 #[stellarator::test]
 async fn square_id_matches() {
-    let clock = ops::clock::fixed_rate(50.0);
+    let clock = ops::clock::fixed_rate(50.0).unwrap();
     let clock_id = clock.id();
     let built = ops::generators::square(clock, 0.5, 3.0, 1.0).unwrap();
     assert_eq!(
@@ -88,7 +88,7 @@ async fn square_id_matches() {
 
 #[stellarator::test]
 async fn random_id_matches() {
-    let clock = ops::clock::fixed_rate(100.0);
+    let clock = ops::clock::fixed_rate(100.0).unwrap();
     let clock_id = clock.id();
     let built = ops::generators::random(clock, 42).unwrap();
     assert_eq!(
@@ -99,7 +99,7 @@ async fn random_id_matches() {
 
 #[stellarator::test]
 async fn constant_id_matches() {
-    let clock = ops::clock::fixed_rate(100.0);
+    let clock = ops::clock::fixed_rate(100.0).unwrap();
     let clock_id = clock.id();
     let built = ops::generators::constant(clock, 7.5).unwrap();
     assert_eq!(
@@ -110,7 +110,7 @@ async fn constant_id_matches() {
 
 #[stellarator::test]
 async fn scale_id_matches() {
-    let clock = ops::clock::fixed_rate(100.0);
+    let clock = ops::clock::fixed_rate(100.0).unwrap();
     let src = ops::generators::constant(clock, 1.0).unwrap();
     let src_id = src.id();
     let built = ops::derive::scale(src, 2.5).unwrap();
@@ -119,7 +119,7 @@ async fn scale_id_matches() {
 
 #[stellarator::test]
 async fn offset_id_matches() {
-    let clock = ops::clock::fixed_rate(100.0);
+    let clock = ops::clock::fixed_rate(100.0).unwrap();
     let src = ops::generators::constant(clock, 1.0).unwrap();
     let src_id = src.id();
     let built = ops::derive::offset(src, -3.0).unwrap();
@@ -131,7 +131,7 @@ async fn offset_id_matches() {
 
 #[stellarator::test]
 async fn abs_neg_log_ids_match() {
-    let clock = ops::clock::fixed_rate(100.0);
+    let clock = ops::clock::fixed_rate(100.0).unwrap();
     let src = ops::generators::constant(clock, 1.0).unwrap();
     let src_id = src.id();
     let abs = ops::derive::abs(src.clone()).unwrap();
@@ -144,7 +144,7 @@ async fn abs_neg_log_ids_match() {
 
 #[stellarator::test]
 async fn add_sub_mul_ids_match() {
-    let clock = ops::clock::fixed_rate(100.0);
+    let clock = ops::clock::fixed_rate(100.0).unwrap();
     let a = ops::generators::constant(clock.clone(), 1.0).unwrap();
     let b = ops::generators::constant(clock, 2.0).unwrap();
     let aid = a.id();
@@ -159,7 +159,7 @@ async fn add_sub_mul_ids_match() {
 
 #[stellarator::test]
 async fn mean_id_matches() {
-    let clock = ops::clock::fixed_rate(100.0);
+    let clock = ops::clock::fixed_rate(100.0).unwrap();
     let a = ops::generators::constant(clock.clone(), 1.0).unwrap();
     let b = ops::generators::constant(clock.clone(), 2.0).unwrap();
     let c = ops::generators::constant(clock, 3.0).unwrap();
@@ -170,8 +170,8 @@ async fn mean_id_matches() {
 
 #[stellarator::test]
 async fn resample_ids_match() {
-    let slow = ops::clock::fixed_rate(50.0);
-    let fast = ops::clock::fixed_rate(400.0);
+    let slow = ops::clock::fixed_rate(50.0).unwrap();
+    let fast = ops::clock::fixed_rate(400.0).unwrap();
     let src = ops::generators::constant(slow, 1.0).unwrap();
     let src_id = src.id();
     let fast_id = fast.id();

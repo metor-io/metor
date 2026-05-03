@@ -201,7 +201,7 @@ pub fn build(
     match spec {
         FixedRate { hz } => {
             p0("fixed_rate", parents)?;
-            Ok(ops::clock::fixed_rate(*hz))
+            ops::clock::fixed_rate(*hz)
         }
         ClockOf => Ok(ops::clock::clock_of(p1("clock_of", parents)?)),
         Sin { freq, amplitude, phase } => {

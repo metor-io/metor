@@ -71,11 +71,15 @@ async fn run_binary(
     f: impl Fn(f64, f64) -> f64 + Send + Sync + 'static,
 ) {
     // Co-clocked invariant: a and b emit the same timestamps in the same
-    // order. We pull one sample from each and combine. If a grant from one
-    // side has multiple samples, drain pairs until we run out, then pull
-    // again from whichever side ran short.
-    let mut buf_a: Vec<(metor_proto::types::Timestamp, f64)> = Vec::new();
-    let mut buf_b: Vec<(metor_proto::types::Timestamp, f64)> = Vec::new();
+    // order. If a producer drops a sample on a full ring (write_sample's
+    // drop-on-full policy), the buffers desync and stay desynced unless we
+    // realign. So whenever the heads don't match, we drop the older head
+    // and re-check — emitting `f(va, vb)` from misaligned positions would
+    // silently combine values from different ticks.
+    let mut buf_a: std::collections::VecDeque<(metor_proto::types::Timestamp, f64)> =
+        std::collections::VecDeque::new();
+    let mut buf_b: std::collections::VecDeque<(metor_proto::types::Timestamp, f64)> =
+        std::collections::VecDeque::new();
     loop {
         if buf_a.is_empty() {
             let grant = a.next().await;
@@ -85,23 +89,33 @@ async fn run_binary(
             let grant = b.next().await;
             buf_b.extend(grant.samples().map(|(ts, v)| (ts, read_f64(v))));
         }
-        let n = buf_a.len().min(buf_b.len());
-        for i in 0..n {
-            let (ts_a, va) = buf_a[i];
-            let (ts_b, vb) = buf_b[i];
-            // Co-clock invariant: timestamps line up. If they don't, prefer
-            // the earlier — but log so callers notice they should resample.
-            let ts = if ts_a == ts_b {
-                ts_a
-            } else {
-                tracing::warn!(?ts_a, ?ts_b, "compose: timestamps drifted; consider resampling");
-                ts_a.min(ts_b)
+        // Realign: drop older head(s) until ts_a == ts_b (or one side empties).
+        loop {
+            let (Some(&(ts_a, _)), Some(&(ts_b, _))) = (buf_a.front(), buf_b.front()) else {
+                break;
             };
-            let v = f(va, vb);
-            write_sample(&output, ts, &v.to_le_bytes());
+            if ts_a == ts_b {
+                break;
+            }
+            tracing::warn!(?ts_a, ?ts_b, "compose: timestamps drifted; dropping older sample");
+            if ts_a.0 < ts_b.0 {
+                buf_a.pop_front();
+            } else {
+                buf_b.pop_front();
+            }
         }
-        buf_a.drain(..n);
-        buf_b.drain(..n);
+        // Emit aligned pairs.
+        while let (Some(&(ts_a, va)), Some(&(ts_b, vb))) = (buf_a.front(), buf_b.front()) {
+            if ts_a != ts_b {
+                break;
+            }
+            buf_a.pop_front();
+            buf_b.pop_front();
+            let v = f(va, vb);
+            write_sample(&output, ts_a, &v.to_le_bytes());
+            // The borrow ends with pop_front; bind for clarity.
+            let _ = ts_b;
+        }
     }
 }
 
@@ -144,8 +158,8 @@ pub fn mean(inputs: Vec<Arc<dyn DynamicNode>>) -> Result<Arc<dyn DynamicNode>, B
         move |output| async move {
             let _inputs = inputs;
             // Per-input buffers, drained in lockstep.
-            let mut bufs: Vec<Vec<(metor_proto::types::Timestamp, f64)>> =
-                vec![Vec::new(); readers.len()];
+            let mut bufs: Vec<std::collections::VecDeque<(metor_proto::types::Timestamp, f64)>> =
+                (0..readers.len()).map(|_| std::collections::VecDeque::new()).collect();
             loop {
                 for (i, reader) in readers.iter_mut().enumerate() {
                     if bufs[i].is_empty() {
@@ -153,15 +167,66 @@ pub fn mean(inputs: Vec<Arc<dyn DynamicNode>>) -> Result<Arc<dyn DynamicNode>, B
                         bufs[i].extend(grant.samples().map(|(ts, v)| (ts, read_f64(v))));
                     }
                 }
-                let take = bufs.iter().map(|b| b.len()).min().unwrap_or(0);
-                for i in 0..take {
-                    let ts = bufs[0][i].0;
-                    let sum: f64 = bufs.iter().map(|b| b[i].1).sum();
-                    let v = sum / n;
-                    write_sample(&output, ts, &v.to_le_bytes());
+                // Realign: while heads aren't all equal, drop the oldest head(s).
+                // If a producer drops a sample on a full ring, the buffers
+                // desync and stay desynced unless we realign — emitting the
+                // mean of misaligned samples silently averages different ticks.
+                loop {
+                    let mut max_ts: Option<metor_proto::types::Timestamp> = None;
+                    let mut min_ts: Option<metor_proto::types::Timestamp> = None;
+                    let mut any_empty = false;
+                    for buf in &bufs {
+                        match buf.front() {
+                            None => {
+                                any_empty = true;
+                                break;
+                            }
+                            Some(&(ts, _)) => {
+                                max_ts = Some(match max_ts {
+                                    None => ts,
+                                    Some(m) if ts.0 > m.0 => ts,
+                                    Some(m) => m,
+                                });
+                                min_ts = Some(match min_ts {
+                                    None => ts,
+                                    Some(m) if ts.0 < m.0 => ts,
+                                    Some(m) => m,
+                                });
+                            }
+                        }
+                    }
+                    if any_empty {
+                        break;
+                    }
+                    let (Some(max_ts), Some(min_ts)) = (max_ts, min_ts) else {
+                        break;
+                    };
+                    if max_ts == min_ts {
+                        break;
+                    }
+                    tracing::warn!(?min_ts, ?max_ts, "mean: timestamps drifted; dropping older samples");
+                    for buf in &mut bufs {
+                        if let Some(&(ts, _)) = buf.front()
+                            && ts.0 < max_ts.0
+                        {
+                            buf.pop_front();
+                        }
+                    }
                 }
-                for buf in &mut bufs {
-                    buf.drain(..take);
+                // Emit aligned tuples while every buffer's head ts matches.
+                loop {
+                    let Some((ts0, _)) = bufs[0].front().copied() else {
+                        break;
+                    };
+                    if !bufs.iter().all(|b| b.front().map(|&(ts, _)| ts) == Some(ts0)) {
+                        break;
+                    }
+                    let sum: f64 = bufs
+                        .iter_mut()
+                        .map(|b| b.pop_front().expect("checked").1)
+                        .sum();
+                    let v = sum / n;
+                    write_sample(&output, ts0, &v.to_le_bytes());
                 }
             }
         },

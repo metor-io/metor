@@ -72,16 +72,20 @@ pub fn persist(
 
     db.with_state_mut(|s| s.insert_component(component_id, schema.clone(), &db.path))
         .map_err(|err| match err {
-            metor_db::Error::SchemaMismatch => BuildError::SchemaMismatch {
-                a: schema.clone(),
-                b: schema.clone(),
-            },
-            other => {
-                tracing::error!(?other, "persist: insert_component failed");
+            metor_db::Error::SchemaMismatch => {
+                // The existing on-disk component has a different schema
+                // than what we're trying to register. We don't have its
+                // schema readily available here, so we report both sides
+                // as the *new* schema; the inspector still surfaces a
+                // clear "schema mismatch" label.
                 BuildError::SchemaMismatch {
                     a: schema.clone(),
                     b: schema.clone(),
                 }
+            }
+            other => {
+                tracing::error!(?other, "persist: insert_component failed");
+                BuildError::DbError(other.to_string())
             }
         })?;
 

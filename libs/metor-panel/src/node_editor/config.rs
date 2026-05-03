@@ -83,9 +83,19 @@ impl NodeEditorConfig {
             );
         }
         for e in self.edges {
+            let source = e.source.into();
+            let target = e.target.into();
+            // Skip edges whose endpoints aren't present in the hydrated
+            // node set — `add_edge` indexes `nodes` directly, and a corrupt
+            // or schema-drifted preset (e.g. a node renamed/removed in a
+            // newer build with stale edges in old preset JSON) would panic
+            // the panel at startup.
+            if !graph.nodes.contains_key(&source) || !graph.nodes.contains_key(&target) {
+                continue;
+            }
             graph.add_edge(EdgeEntry {
-                source: e.source.into(),
-                target: e.target.into(),
+                source,
+                target,
                 target_socket: e.target_socket as usize,
             });
         }

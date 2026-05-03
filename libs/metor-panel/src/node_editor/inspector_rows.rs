@@ -285,6 +285,9 @@ fn build_rows(any: AnyEntity, db: &Arc<DB>, cx: &App) -> Vec<Box<dyn InspectorRo
             crate::dynamic::BuildError::ExpectedFloat(_) => "expected float",
             crate::dynamic::BuildError::SchemaMismatch { .. } => "schema mismatch",
             crate::dynamic::BuildError::WrongArity { .. } => "wrong arity",
+            crate::dynamic::BuildError::InvalidArg { .. } => "invalid arg",
+            crate::dynamic::BuildError::ComponentNotFound(_) => "component not found",
+            crate::dynamic::BuildError::DbError(_) => "db error",
         },
         None => "missing",
     };
@@ -456,6 +459,12 @@ pub fn rows_for_node(
                 SharedString::from("Component Name"),
                 SharedString::from(name.clone()),
                 Arc::new(move |new_name, _window, cx| {
+                    // Empty/whitespace names hash to a fixed `ComponentId`,
+                    // so two empty-named Persist nodes silently alias onto
+                    // the same WAL. The creation wizard rejects them too.
+                    if new_name.trim().is_empty() {
+                        return;
+                    }
                     let id = flow_id.clone();
                     graph.update(cx, |g, _| {
                         if let Some(entry) = g.nodes.get_mut(&id)

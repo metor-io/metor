@@ -37,8 +37,37 @@ struct BuildJob {
     reply: Sender<Result<Arc<dyn DynamicNode>, BuildError>>,
 }
 
-pub struct DynamicWorker {
+/// Cheap clonable handle to the worker. `rebuild_into` takes one of these
+/// instead of `&DynamicWorker` so the caller can clone it out of `cx`'s
+/// global storage before borrowing other globals (e.g. `DynamicRegistry`)
+/// mutably from the same `cx`.
+#[derive(Clone)]
+pub struct WorkerHandle {
     tx: Sender<BuildJob>,
+}
+
+impl WorkerHandle {
+    /// Run `closure` on the worker thread; block until its result returns.
+    /// Used from gpui main during a debounced rebuild.
+    pub fn run(&self, closure: BuildClosure) -> Result<Arc<dyn DynamicNode>, BuildError> {
+        let (reply_tx, reply_rx) = bounded(1);
+        if self
+            .tx
+            .send(BuildJob {
+                closure,
+                reply: reply_tx,
+            })
+            .is_err()
+        {
+            // Worker thread is gone — degrade gracefully.
+            return Err(BuildError::ParentFailed);
+        }
+        reply_rx.recv().unwrap_or(Err(BuildError::ParentFailed))
+    }
+}
+
+pub struct DynamicWorker {
+    handle: WorkerHandle,
     /// Hold the worker thread handle so it lives as long as the global.
     /// gpui doesn't surface a clean app-shutdown hook so we don't bother
     /// joining; the OS reaps the thread on process exit.
@@ -70,28 +99,19 @@ impl DynamicWorker {
                 stellarator::sleep(Duration::from_millis(2)).await;
             }
         });
-        Self { tx, _thread: thread }
+        Self {
+            handle: WorkerHandle { tx },
+            _thread: thread,
+        }
     }
 
     pub fn init(cx: &mut App) {
         cx.set_global(Self::new());
     }
 
-    /// Run `closure` on the worker thread; block until its result returns.
-    /// Used from gpui main during a debounced rebuild.
-    pub fn run(&self, closure: BuildClosure) -> Result<Arc<dyn DynamicNode>, BuildError> {
-        let (reply_tx, reply_rx) = bounded(1);
-        if self
-            .tx
-            .send(BuildJob {
-                closure,
-                reply: reply_tx,
-            })
-            .is_err()
-        {
-            // Worker thread is gone — degrade gracefully.
-            return Err(BuildError::ParentFailed);
-        }
-        reply_rx.recv().unwrap_or(Err(BuildError::ParentFailed))
+    /// Borrow the cheap clonable handle. Clone it before borrowing other
+    /// globals from the same `cx`.
+    pub fn handle(&self) -> &WorkerHandle {
+        &self.handle
     }
 }

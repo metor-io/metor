@@ -33,4 +33,4 @@ pub use graph::{BuildState, EdgeEntry, FlowId, NodeEntry, NodeGraph, Position};
 pub use registry::{Arity, OpDescriptor, SocketKind, descriptor, descriptor_for};
 pub use spec::{NodeSpec, NodeSpecKind, build, compute_node_id};
 pub use validate::{EdgeColor, EdgeVerdict, edge_color, validate_connection};
-pub use worker::DynamicWorker;
+pub use worker::{DynamicWorker, WorkerHandle};

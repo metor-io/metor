@@ -13,7 +13,7 @@ use crate::dynamic::{BuildError, DynamicNode, DynamicRegistry, NodeId};
 use crate::node_editor::coordinator::OwnerId;
 use crate::node_editor::registry::{Arity, descriptor_for};
 use crate::node_editor::spec::{NodeSpec, build as build_spec, compute_node_id};
-use crate::node_editor::worker::DynamicWorker;
+use crate::node_editor::worker::{DynamicWorker, WorkerHandle};
 
 /// Editor-stable handle for a node. Survives spec edits (unlike `NodeId`,
 /// which is content-addressed and changes on any arg mutation).
@@ -214,7 +214,7 @@ impl NodeGraph {
         &mut self,
         db: &Arc<DB>,
         registry: &mut DynamicRegistry,
-        worker: Option<&DynamicWorker>,
+        worker: Option<&WorkerHandle>,
     ) -> HashSet<NodeId> {
         let (order, cycle_members) = self.topo_order();
 
@@ -320,24 +320,12 @@ impl NodeGraph {
     /// the [`GraphCoordinator`](crate::node_editor::coordinator::GraphCoordinator).
     /// Use this from inside `Entity<NodeGraph>::update`.
     pub fn rebuild(&mut self, db: &Arc<DB>, cx: &mut gpui::App) {
-        let alive = {
-            // Detach the worker into a local clone-by-reference: we hold the
-            // global only for the duration of `rebuild_into`, but borrow the
-            // registry mutably from the same `cx`. To satisfy the borrow
-            // checker we route through a raw pointer for the worker (it's a
-            // long-lived global; never moves). Simpler: copy-out the channel
-            // shape would add overhead; the unsafe borrow is bounded in
-            // scope and the worker reference outlives the call.
-            //
-            // Sequencing it explicitly: first take a worker pointer, then
-            // borrow the registry mutably.
-            let worker_ptr: *const DynamicWorker = cx.global::<DynamicWorker>();
-            let registry = cx.global_mut::<DynamicRegistry>();
-            // Safety: the global storage outlives this call; we never store
-            // or escape the pointer beyond the immediate `rebuild_into`.
-            let worker = unsafe { &*worker_ptr };
-            self.rebuild_into(db, registry, Some(worker))
-        };
+        // Clone the cheap channel-backed handle out of the worker global
+        // first so we can borrow the registry mutably from the same `cx`
+        // afterwards.
+        let worker = cx.global::<DynamicWorker>().handle().clone();
+        let registry = cx.global_mut::<DynamicRegistry>();
+        let alive = self.rebuild_into(db, registry, Some(&worker));
         crate::node_editor::coordinator::GraphCoordinator::submit(self.owner_id, alive, cx);
     }
 }

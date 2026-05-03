@@ -23,10 +23,7 @@ use crate::dynamic::node::{
 pub fn from_db(db: &DB, component_id: ComponentId) -> Result<Arc<dyn DynamicNode>, BuildError> {
     let component = db
         .with_state(|s| s.get_component(component_id).cloned())
-        .ok_or(BuildError::SchemaMismatch {
-            a: metor_db::ComponentSchema::new(metor_proto::types::PrimType::F64, &[]),
-            b: metor_db::ComponentSchema::new(metor_proto::types::PrimType::F64, &[]),
-        })?;
+        .ok_or(BuildError::ComponentNotFound(component_id))?;
     let schema = component.schema.clone();
     let value_bytes = schema.size();
 

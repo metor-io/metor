@@ -71,6 +71,15 @@ pub enum BuildError {
     },
     #[error("a parent node failed to build")]
     ParentFailed,
+    #[error("invalid arg for {op}: {reason}")]
+    InvalidArg {
+        op: &'static str,
+        reason: &'static str,
+    },
+    #[error("component {0:?} not found")]
+    ComponentNotFound(ComponentId),
+    #[error("db error: {0}")]
+    DbError(String),
 }
 
 /// A live producer task whose output is a fan-out [`Disruptor`].

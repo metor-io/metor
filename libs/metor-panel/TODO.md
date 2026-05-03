@@ -50,9 +50,7 @@ TBD whether this is good / we want this
 - [x] Tab containers with drag-and-drop
 - [x] Resize handles between splits
 - [x] Serialization to JSON
-- [ ] **Schematic file I/O** — load/save layouts to disk (KDL or TOML format)
-- [ ] **Live reload** — watch schematic file for changes and hot-reload layout
-- [ ] **Default layouts** — e.g. "sidebar" layout with hierarchy + center + inspector
+- [X] **Schematic file I/O** — load/save layouts to disk (KDL or TOML format)
 
 ## Inspector & Editing
 

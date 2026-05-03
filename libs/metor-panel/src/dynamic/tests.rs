@@ -29,7 +29,7 @@ async fn drain_f64(
 
 #[stellarator::test]
 async fn sin_chain_emits_expected_values() {
-    let clock = ops::clock::fixed_rate(200.0);
+    let clock = ops::clock::fixed_rate(200.0).unwrap();
     assert!(matches!(clock.value_type(), ValueType::Clock));
     let sin = ops::generators::sin(clock, 1.0, 1.0, 0.0).expect("sin builds");
     let scaled = ops::derive::scale(sin, 2.0).expect("scale builds");
@@ -47,8 +47,8 @@ async fn sin_chain_emits_expected_values() {
 
 #[stellarator::test]
 async fn compose_clock_mismatch_errors() {
-    let clk_a = ops::clock::fixed_rate(100.0);
-    let clk_b = ops::clock::fixed_rate(200.0);
+    let clk_a = ops::clock::fixed_rate(100.0).unwrap();
+    let clk_b = ops::clock::fixed_rate(200.0).unwrap();
     let a = ops::generators::sin(clk_a, 1.0, 1.0, 0.0).unwrap();
     let b = ops::generators::sin(clk_b, 1.0, 1.0, 0.0).unwrap();
     let err = match ops::compose::add(a, b) {
@@ -60,7 +60,7 @@ async fn compose_clock_mismatch_errors() {
 
 #[stellarator::test]
 async fn compose_add_is_co_clocked() {
-    let clock = ops::clock::fixed_rate(200.0);
+    let clock = ops::clock::fixed_rate(200.0).unwrap();
     let a = ops::generators::constant(clock.clone(), 3.0).unwrap();
     let b = ops::generators::constant(clock, 4.0).unwrap();
     let sum = ops::compose::add(a, b).unwrap();
@@ -72,8 +72,8 @@ async fn compose_add_is_co_clocked() {
 
 #[stellarator::test]
 async fn zoh_resamples_constant_input() {
-    let slow = ops::clock::fixed_rate(50.0);
-    let fast = ops::clock::fixed_rate(400.0);
+    let slow = ops::clock::fixed_rate(50.0).unwrap();
+    let fast = ops::clock::fixed_rate(400.0).unwrap();
     let src = ops::generators::constant(slow, 1.5).unwrap();
     let resampled = ops::resample::zoh(src, fast).unwrap();
     let samples = drain_f64(&resampled, 32).await;
@@ -86,7 +86,7 @@ async fn zoh_resamples_constant_input() {
 async fn registry_drops_unused_nodes() {
     use std::collections::HashSet;
     let mut reg = crate::dynamic::DynamicRegistry::new();
-    let clock = ops::clock::fixed_rate(100.0);
+    let clock = ops::clock::fixed_rate(100.0).unwrap();
     let id = clock.id();
     reg.insert(clock);
     assert_eq!(reg.len(), 1);
@@ -104,7 +104,7 @@ async fn registry_drops_unused_nodes() {
 
 #[stellarator::test]
 async fn clock_of_taps_source_timestamps() {
-    let src_clock = ops::clock::fixed_rate(100.0);
+    let src_clock = ops::clock::fixed_rate(100.0).unwrap();
     let src = ops::generators::constant(src_clock, 0.0).unwrap();
     let derived = ops::clock::clock_of(src);
     assert!(matches!(derived.value_type(), ValueType::Clock));

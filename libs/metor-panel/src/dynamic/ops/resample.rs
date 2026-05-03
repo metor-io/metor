@@ -7,6 +7,7 @@
 //! - `latest_at`: alias for `zoh` semantically; provided for naming
 //!   parallelism with the prompt.
 
+use std::collections::VecDeque;
 use std::sync::Arc;
 
 use crate::dynamic::node::{
@@ -47,41 +48,43 @@ async fn run_resample(
     output: Disruptor,
     interp: Interp,
 ) {
-    // Buffer input samples by timestamp; on each clock tick, emit the
-    // resampled value at that timestamp. We keep only the two most recent
-    // input samples (enough for ZOH and linear) plus any future ones we
-    // haven't reached yet.
+    // Pending future input samples (ts > prev.ts, not yet consumed by a
+    // tick). We walk this in lockstep with the clock so ZOH/Linear get the
+    // correct surrounding pair when input runs faster than the output
+    // clock — collapsing to a 2-slot window discards intermediate samples
+    // and silently picks future-side values for ticks in the past.
+    let mut pending: VecDeque<(Timestamp, f64)> = VecDeque::new();
+    // Most recent input sample whose ts <= last seen tick.
     let mut prev: Option<(Timestamp, f64)> = None;
-    let mut next: Option<(Timestamp, f64)> = None;
 
-    loop {
-        // Try to drain any input first (non-blocking).
-        if let Some(grant) = input_reader.try_next_grant() {
+    /// Drain everything currently available on the input reader into
+    /// `pending`. Non-blocking.
+    fn drain_input(reader: &mut NodeReader, pending: &mut VecDeque<(Timestamp, f64)>) {
+        while let Some(grant) = reader.try_next_grant() {
             for (ts, v) in grant.samples() {
-                let v = read_f64(v);
-                if let Some(n) = next.take() {
-                    prev = Some(n);
-                }
-                next = Some((ts, v));
+                pending.push_back((ts, read_f64(v)));
             }
         }
+    }
+
+    loop {
+        drain_input(&mut input_reader, &mut pending);
 
         let clock_grant = clock_reader.next().await;
         for (tick, _) in clock_grant.samples() {
-            // Advance prev/next so that prev.ts <= tick < next.ts when
-            // possible. Drain any input that's now earlier than `tick`.
-            loop {
-                if let Some(grant) = input_reader.try_next_grant() {
-                    for (ts, v) in grant.samples() {
-                        let v = read_f64(v);
-                        prev = next.take();
-                        next = Some((ts, v));
-                    }
-                } else {
-                    break;
-                }
+            // Re-drain in case more input landed between ticks.
+            drain_input(&mut input_reader, &mut pending);
+
+            // Advance `prev` while the queue front is <= tick.
+            while let Some(&(ts, _)) = pending.front()
+                && ts.0 <= tick.0
+            {
+                prev = pending.pop_front();
             }
-            // No data yet — skip this tick.
+            // `next` is the queue front (the first sample with ts > tick),
+            // peeked without removing — a later tick may still need it.
+            let next = pending.front().copied();
+
             let Some(value) = sample(prev, next, tick, interp) else {
                 continue;
             };
