@@ -8,6 +8,7 @@ use gpui::{AnyElement, App, Hsla, SharedString, Window, div, prelude::*, px};
 
 use crate::theme::theme;
 
+pub mod action;
 pub mod bool;
 pub mod checkbox;
 pub mod color;
@@ -20,6 +21,7 @@ pub mod slider;
 pub mod text;
 pub mod text_field;
 
+pub use action::ActionRow;
 pub use bool::BoolRow;
 pub use checkbox::{check_square, checkbox};
 pub use color::ColorRow;

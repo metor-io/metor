@@ -97,6 +97,9 @@ pub struct Theme {
     /// Dimmed variant of `control_active` used as the track behind a checked
     /// switch knob. Same hue, lower presence.
     pub control_active_track: Hsla,
+    /// Error accent (build failures, invalid arg pills). Used wherever the
+    /// UI needs a "this is wrong" tint.
+    pub error_accent: Hsla,
 }
 
 /// Global wrapper that makes the active [`Theme`] addressable from any view.
@@ -171,6 +174,7 @@ pub static DARK: Theme = Theme {
 
     control_active: hex(0x40b060, 1.0),
     control_active_track: hex(0x40b060, 0.7),
+    error_accent: hex(0xe04040, 1.0),
 };
 
 pub static CATPPUCCIN_MOCHA: Theme = Theme {
@@ -211,6 +215,7 @@ pub static CATPPUCCIN_MOCHA: Theme = Theme {
 
     control_active: hex(0xa6e3a1, 1.0),
     control_active_track: hex(0xa6e3a1, 0.7),
+    error_accent: hex(0xf38ba8, 1.0),
 };
 
 pub static CATPPUCCIN_MACCHIATO: Theme = Theme {
@@ -251,6 +256,7 @@ pub static CATPPUCCIN_MACCHIATO: Theme = Theme {
 
     control_active: hex(0xa6da95, 1.0),
     control_active_track: hex(0xa6da95, 0.7),
+    error_accent: hex(0xed8796, 1.0),
 };
 
 pub static CATPPUCCIN_LATTE: Theme = Theme {
@@ -291,6 +297,7 @@ pub static CATPPUCCIN_LATTE: Theme = Theme {
 
     control_active: hex(0x40a02b, 1.0),
     control_active_track: hex(0x40a02b, 0.7),
+    error_accent: hex(0xd20f39, 1.0),
 };
 
 pub static AYU_DARK: Theme = Theme {
@@ -331,6 +338,7 @@ pub static AYU_DARK: Theme = Theme {
 
     control_active: hex(0x7fd962, 1.0),
     control_active_track: hex(0x7fd962, 0.7),
+    error_accent: hex(0xff3333, 1.0),
 };
 
 pub static EVERFOREST_DARK: Theme = Theme {
@@ -371,6 +379,7 @@ pub static EVERFOREST_DARK: Theme = Theme {
 
     control_active: hex(0xa7c080, 1.0),
     control_active_track: hex(0xa7c080, 0.7),
+    error_accent: hex(0xe67e80, 1.0),
 };
 
 pub static EVERFOREST_LIGHT: Theme = Theme {
@@ -411,6 +420,7 @@ pub static EVERFOREST_LIGHT: Theme = Theme {
 
     control_active: hex(0x8da101, 1.0),
     control_active_track: hex(0x8da101, 0.7),
+    error_accent: hex(0xf85552, 1.0),
 };
 
 pub static ROSE_PINE: Theme = Theme {
@@ -451,6 +461,7 @@ pub static ROSE_PINE: Theme = Theme {
 
     control_active: hex(0x9ccfd8, 1.0),
     control_active_track: hex(0x9ccfd8, 0.7),
+    error_accent: hex(0xeb6f92, 1.0),
 };
 
 pub static ROSE_PINE_MOON: Theme = Theme {
@@ -491,6 +502,7 @@ pub static ROSE_PINE_MOON: Theme = Theme {
 
     control_active: hex(0x9ccfd8, 1.0),
     control_active_track: hex(0x9ccfd8, 0.7),
+    error_accent: hex(0xeb6f92, 1.0),
 };
 
 pub static ROSE_PINE_DAWN: Theme = Theme {
@@ -531,6 +543,7 @@ pub static ROSE_PINE_DAWN: Theme = Theme {
 
     control_active: hex(0x56949f, 1.0),
     control_active_track: hex(0x56949f, 0.7),
+    error_accent: hex(0xb4637a, 1.0),
 };
 
 /// Load the embedded IBM Plex Mono fonts into gpui's text system.

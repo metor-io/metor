@@ -19,6 +19,7 @@ pub mod edits;
 pub mod palette;
 pub mod reflect;
 pub mod registry;
+pub mod row_list;
 pub mod rows;
 pub mod trace_picker;
 

@@ -157,10 +157,10 @@ impl InspectorRegistry {
                 |v| SharedString::from(format!("{}", v)),
                 |label, initial, any_entity, idx| {
                     let write = any_entity.clone();
-                    Box::new(ScalarRow {
+                    Box::new(ScalarRow::new(
                         label,
-                        value: initial,
-                        on_change: Arc::new(move |v, _w, cx| {
+                        initial,
+                        Arc::new(move |v, _w, cx| {
                             crate::inspector::reflect::set_field::<Override<f64>>(
                                 &write,
                                 idx,
@@ -168,7 +168,7 @@ impl InspectorRegistry {
                                 cx,
                             );
                         }),
-                    })
+                    ))
                 },
             )
         }));

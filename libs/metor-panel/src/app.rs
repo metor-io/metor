@@ -62,6 +62,7 @@ impl AppRoot {
             on_open_inspector,
             cx,
         );
+        crate::node_editor::palette_provider::register(tiles.clone(), cx);
         Self {
             db,
             tiles,
@@ -394,6 +395,10 @@ pub fn run(db: Arc<metor_db::DB>) {
             ItemRegistry::init(cx);
             crate::inspector::registry::InspectorRegistry::init(db.clone(), cx);
             crate::views::dashboard::WidgetRegistry::init(cx);
+            crate::dynamic::DynamicRegistry::init(cx);
+            crate::node_editor::GraphCoordinator::init(cx);
+            crate::node_editor::DynamicWorker::init(cx);
+            crate::node_editor::inspector_rows::register_inspector_rows(cx);
             register_pane_item_deserializers(db.clone(), cx);
             set_dock_icon();
             cx.bind_keys([
@@ -402,6 +407,19 @@ pub fn run(db: Arc<metor_db::DB>) {
                 KeyBinding::new("shift-ctrl-tab", CycleTabBackward, None),
                 KeyBinding::new("cmd-l", ToggleCmdLock, None),
                 KeyBinding::new("cmd-shift-e", OpenReviewEdits, None),
+                // Excluded when a `RowList` is focused so editing a node's
+                // inline arg field (typing Backspace, hitting Delete) doesn't
+                // also delete the surrounding node.
+                KeyBinding::new(
+                    "delete",
+                    crate::node_editor::DeleteSelected,
+                    Some("NodeEditor && !RowList"),
+                ),
+                KeyBinding::new(
+                    "backspace",
+                    crate::node_editor::DeleteSelected,
+                    Some("NodeEditor && !RowList"),
+                ),
             ]);
 
             let bounds = Bounds::centered(None, size(px(1024.), px(600.)), cx);
@@ -444,6 +462,11 @@ fn register_pane_item_deserializers(db: Arc<DB>, cx: &mut App) {
         &mut reg,
         db.clone(),
         TrafficLightGridPanel::from_config,
+    );
+    register_panel::<crate::node_editor::pane::NodeEditor>(
+        &mut reg,
+        db.clone(),
+        crate::node_editor::pane::NodeEditor::from_config,
     );
 
     // Dashboard's deserializer returns a fully-constructed entity rather

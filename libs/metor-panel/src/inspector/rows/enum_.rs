@@ -32,6 +32,7 @@ impl InspectorRow for EnumRow {
         let theme = theme(cx);
 
         row_base(row_ix, selected, cx)
+            .gap(px(6.0))
             .child(
                 div()
                     .text_size(px(12.0))
@@ -40,14 +41,23 @@ impl InspectorRow for EnumRow {
             )
             .child(
                 div()
+                    .flex_1()
+                    .min_w_0()
                     .flex()
                     .flex_row()
                     .items_center()
                     .gap(px(6.0))
+                    .justify_end()
                     .child(
                         div()
+                            .flex_1()
+                            .min_w_0()
                             .text_size(px(12.0))
                             .text_color(theme.text_secondary)
+                            .overflow_hidden()
+                            .whitespace_nowrap()
+                            .text_ellipsis()
+                            .text_right()
                             .child(self.selected.clone()),
                     )
                     .child(Icon::ChevronRight.svg(8.0)),

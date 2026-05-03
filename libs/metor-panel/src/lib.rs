@@ -13,10 +13,12 @@ use metor_db::disruptor::{ReadGrant, Reader};
 use metor_db::{Component, ComponentSchema, DB};
 use metor_proto::types::{ComponentId, ComponentView, Timestamp};
 pub mod app;
+pub mod dynamic;
 pub mod gpu_context;
 pub mod icons;
 pub mod inspect;
 pub mod inspector;
+pub mod node_editor;
 pub mod presets;
 pub mod theme;
 pub mod tiles;
@@ -43,16 +45,19 @@ pub trait ComponentStream {
     fn next(&mut self) -> impl std::future::Future<Output = Self::View<'_>>;
 }
 
-/// Resolves a component (by handle or id) into a [`WalComponentStream`].
+/// Resolves a component (by handle, id, or dynamic node) into a [`ComponentStream`].
 ///
 /// The `ComponentId` impl waits for the component to appear in the DB,
 /// letting views subscribe before the producer has registered.
 pub trait ComponentStreamBuilder {
+    type Stream: ComponentStream + Send;
     fn component_id(&self) -> ComponentId;
-    fn into_stream(self, db: &DB) -> impl std::future::Future<Output = WalComponentStream> + Send;
+    fn into_stream(self, db: &DB) -> impl std::future::Future<Output = Self::Stream> + Send;
 }
 
 impl ComponentStreamBuilder for Component {
+    type Stream = WalComponentStream;
+
     fn component_id(&self) -> ComponentId {
         self.component_id
     }
@@ -63,6 +68,8 @@ impl ComponentStreamBuilder for Component {
 }
 
 impl ComponentStreamBuilder for ComponentId {
+    type Stream = WalComponentStream;
+
     fn component_id(&self) -> ComponentId {
         *self
     }
@@ -85,9 +92,19 @@ pub struct WalComponentStream {
 
 impl WalComponentStream {
     pub fn new(component: &Component) -> Self {
+        Self::from_disruptor(&component.wal, component.schema.clone())
+    }
+
+    /// Subscribe to any [`Disruptor`] whose messages are framed as
+    /// `[Timestamp][value bytes]`. Used by `dynamic` nodes to expose
+    /// themselves to existing views.
+    pub fn from_disruptor(
+        disruptor: &metor_db::disruptor::Disruptor,
+        schema: ComponentSchema,
+    ) -> Self {
         Self {
-            reader: component.wal.reader(),
-            schema: component.schema.clone(),
+            reader: disruptor.reader(),
+            schema,
         }
     }
 }
