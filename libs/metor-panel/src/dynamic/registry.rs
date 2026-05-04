@@ -43,15 +43,34 @@ impl DynamicRegistry {
             return existing.clone();
         }
         let node = build();
-        debug_assert_eq!(node.id(), id, "build closure produced a node with a different id");
+        debug_assert_eq!(
+            node.id(),
+            id,
+            "build closure produced a node with a different id"
+        );
         self.nodes.insert(id, node.clone());
         node
     }
 
-    /// Drop every node whose id is not in `alive`. Cancels their tasks via
-    /// `JoinHandleDropGuard` (assuming no external strong refs are held).
-    pub fn reconcile(&mut self, alive: &HashSet<NodeId>) {
-        self.nodes.retain(|id, _| alive.contains(id));
+    /// Drop every node whose id is not in `alive`. Returns the removed
+    /// `Arc`s so the caller can choose where to actually drop them — for
+    /// instance, sending them to the stellarator worker thread to avoid a
+    /// cross-thread spinlock deadlock when a `Sleep`-based task (e.g.
+    /// `fixed_rate`) is dropped on a thread that doesn't own the timer.
+    ///
+    /// Most callers can ignore the return value; the legacy behavior (drop
+    /// in place on the calling thread) is just `let _ = registry.reconcile(&alive);`.
+    pub fn reconcile(&mut self, alive: &HashSet<NodeId>) -> Vec<Arc<dyn DynamicNode>> {
+        let mut removed: Vec<Arc<dyn DynamicNode>> = Vec::new();
+        self.nodes.retain(|id, node| {
+            if alive.contains(id) {
+                true
+            } else {
+                removed.push(node.clone());
+                false
+            }
+        });
+        removed
     }
 
     pub fn len(&self) -> usize {

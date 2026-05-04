@@ -12,6 +12,7 @@ use std::sync::Arc;
 use gpui::{App, Global};
 
 use crate::dynamic::{BuildError, DynamicNode, DynamicRegistry, NodeId};
+use crate::node_editor::worker::DynamicWorker;
 
 pub type OwnerId = u64;
 
@@ -38,7 +39,8 @@ impl GraphCoordinator {
             coord.owners.insert(owner, alive);
             coord.union_alive()
         };
-        cx.global_mut::<DynamicRegistry>().reconcile(&union);
+        let removed = cx.global_mut::<DynamicRegistry>().reconcile(&union);
+        dispose(removed, cx);
     }
 
     /// Forget an owner entirely — call from the editor's `Drop`.
@@ -50,7 +52,8 @@ impl GraphCoordinator {
             }
             coord.union_alive()
         };
-        cx.global_mut::<DynamicRegistry>().reconcile(&union);
+        let removed = cx.global_mut::<DynamicRegistry>().reconcile(&union);
+        dispose(removed, cx);
     }
 
     fn union_alive(&self) -> HashSet<NodeId> {
@@ -66,6 +69,20 @@ impl GraphCoordinator {
 
     pub fn owner_count(&self) -> usize {
         self.owners.len()
+    }
+}
+
+/// Hand `removed` to the worker thread so the underlying tasks are
+/// cancelled and dropped on the thread that owns the stellarator timer,
+/// avoiding the cross-thread spinlock deadlock observed when a `Sleep`-
+/// based task (e.g. `fixed_rate`) is destructed off-runtime.
+fn dispose(removed: Vec<Arc<dyn DynamicNode>>, cx: &App) {
+    if removed.is_empty() {
+        return;
+    }
+    let handle = cx.global::<DynamicWorker>().handle().clone();
+    for arc in removed {
+        handle.dispose(arc);
     }
 }
 

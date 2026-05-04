@@ -76,11 +76,7 @@ impl NodeEditorConfig {
     pub fn into_graph(self) -> NodeGraph {
         let mut graph = NodeGraph::new(self.owner_uuid);
         for n in self.nodes {
-            graph.insert_node(
-                n.flow_id.into(),
-                n.spec,
-                Position { x: n.x, y: n.y },
-            );
+            graph.insert_node(n.flow_id.into(), n.spec, Position { x: n.x, y: n.y });
         }
         for e in self.edges {
             let source = e.source.into();

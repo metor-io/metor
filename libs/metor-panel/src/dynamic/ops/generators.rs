@@ -1,19 +1,18 @@
-//! Generators: nodes that consume a clock and emit one f64 value per tick.
+//! Generators: nodes that consume a clock and emit one (typed, possibly
+//! shaped) value per tick.
 
 use std::hash::Hash;
 use std::sync::Arc;
 
 use metor_db::ComponentSchema;
 use metor_proto::types::PrimType;
+use smallvec::SmallVec;
 
 use crate::dynamic::node::{
     BuildError, DynamicNode, DynamicNodeExt, NodeImpl, ValueType, default_ring_bytes, hash_id,
     op_tag, require_clock, write_sample,
 };
-
-fn f64_scalar_schema() -> ComponentSchema {
-    ComponentSchema::new(PrimType::F64, &[])
-}
+use crate::dynamic::tensor::{TypedScalar, shape_elems, write_f64_as};
 
 /// Periodic waveform shape. Phase 1 set covers the four common shapes; add
 /// new variants here and extend [`Waveform::sample`].
@@ -50,14 +49,20 @@ impl Waveform {
     }
 }
 
-/// `shape(2π·freq·t + phase) · amplitude`, sampled at every clock tick.
-/// `t` is the clock's wall-clock timestamp in seconds since the unix epoch.
+fn schema_from(dtype: PrimType, shape: &[usize]) -> ComponentSchema {
+    ComponentSchema::new(dtype, shape)
+}
+
+/// `shape(2π·freq·t + phase) · amplitude`, sampled at every tick. With a
+/// non-empty `shape` the same scalar value fills every element.
 pub fn waveform(
     clock: Arc<dyn DynamicNode>,
     shape: Waveform,
     freq: f64,
     amplitude: f64,
     phase: f64,
+    dtype: PrimType,
+    out_shape: SmallVec<[usize; 4]>,
 ) -> Result<Arc<dyn DynamicNode>, BuildError> {
     require_clock(&clock)?;
     let id = hash_id(op_tag::WAVEFORM, &[clock.id()], |h| {
@@ -65,10 +70,15 @@ pub fn waveform(
         freq.to_bits().hash(h);
         amplitude.to_bits().hash(h);
         phase.to_bits().hash(h);
+        (dtype as u8).hash(h);
+        for d in &out_shape {
+            d.hash(h);
+        }
     });
-    let schema = f64_scalar_schema();
+    let schema = schema_from(dtype, &out_shape);
     let parent_clock = clock.parent_clock_id();
     let mut reader = clock.subscribe();
+    let n_elems = shape_elems(&out_shape);
     Ok(NodeImpl::spawn(
         id,
         ValueType::Value(schema.clone()),
@@ -77,13 +87,18 @@ pub fn waveform(
         move |output| async move {
             let _clock = clock;
             let two_pi = std::f64::consts::TAU;
+            let mut scratch: Vec<u8> = Vec::with_capacity(schema.size());
             loop {
                 let grant = reader.next().await;
                 for (ts, _) in grant.samples() {
                     let t = (ts.0 as f64) * 1e-6;
                     let theta = two_pi * freq * t + phase;
                     let v = amplitude * shape.sample(theta);
-                    write_sample(&output, ts, &v.to_le_bytes());
+                    scratch.clear();
+                    for _ in 0..n_elems {
+                        write_f64_as(&mut scratch, dtype, v);
+                    }
+                    write_sample(&output, ts, &scratch);
                 }
             }
         },
@@ -91,15 +106,25 @@ pub fn waveform(
 }
 
 /// Pseudo-random uniform in `[0, 1)`. Cheap LCG seeded from `seed` and
-/// advanced once per tick — deterministic given the same seed and clock.
-pub fn random(clock: Arc<dyn DynamicNode>, seed: u64) -> Result<Arc<dyn DynamicNode>, BuildError> {
+/// advanced once per emitted element.
+pub fn random(
+    clock: Arc<dyn DynamicNode>,
+    seed: u64,
+    dtype: PrimType,
+    out_shape: SmallVec<[usize; 4]>,
+) -> Result<Arc<dyn DynamicNode>, BuildError> {
     require_clock(&clock)?;
     let id = hash_id(op_tag::RANDOM, &[clock.id()], |h| {
         seed.hash(h);
+        (dtype as u8).hash(h);
+        for d in &out_shape {
+            d.hash(h);
+        }
     });
-    let schema = f64_scalar_schema();
+    let schema = schema_from(dtype, &out_shape);
     let parent_clock = clock.parent_clock_id();
     let mut reader = clock.subscribe();
+    let n_elems = shape_elems(&out_shape);
     Ok(NodeImpl::spawn(
         id,
         ValueType::Value(schema.clone()),
@@ -108,33 +133,48 @@ pub fn random(clock: Arc<dyn DynamicNode>, seed: u64) -> Result<Arc<dyn DynamicN
         move |output| async move {
             let _clock = clock;
             let mut state: u64 = seed.max(1);
+            let mut scratch: Vec<u8> = Vec::with_capacity(schema.size());
             loop {
                 let grant = reader.next().await;
                 for (ts, _) in grant.samples() {
-                    // splitmix64
-                    state = state.wrapping_add(0x9E3779B97F4A7C15);
-                    let mut z = state;
-                    z = (z ^ (z >> 30)).wrapping_mul(0xBF58476D1CE4E5B9);
-                    z = (z ^ (z >> 27)).wrapping_mul(0x94D049BB133111EB);
-                    z ^= z >> 31;
-                    let v = (z >> 11) as f64 / (1u64 << 53) as f64;
-                    write_sample(&output, ts, &v.to_le_bytes());
+                    scratch.clear();
+                    for _ in 0..n_elems {
+                        // splitmix64
+                        state = state.wrapping_add(0x9E3779B97F4A7C15);
+                        let mut z = state;
+                        z = (z ^ (z >> 30)).wrapping_mul(0xBF58476D1CE4E5B9);
+                        z = (z ^ (z >> 27)).wrapping_mul(0x94D049BB133111EB);
+                        z ^= z >> 31;
+                        let v = (z >> 11) as f64 / (1u64 << 53) as f64;
+                        write_f64_as(&mut scratch, dtype, v);
+                    }
+                    write_sample(&output, ts, &scratch);
                 }
             }
         },
     ))
 }
 
-/// Always emit `value` on every tick. Useful for testing and as a constant
-/// input to composers.
-pub fn constant(clock: Arc<dyn DynamicNode>, value: f64) -> Result<Arc<dyn DynamicNode>, BuildError> {
+/// Always emit `value` (cast to `dtype`) on every tick, broadcasted to
+/// `out_shape`.
+pub fn constant(
+    clock: Arc<dyn DynamicNode>,
+    value: TypedScalar,
+    out_shape: SmallVec<[usize; 4]>,
+) -> Result<Arc<dyn DynamicNode>, BuildError> {
     require_clock(&clock)?;
+    let dtype = value.dtype();
     let id = hash_id(op_tag::CONSTANT, &[clock.id()], |h| {
-        value.to_bits().hash(h);
+        value.hash(h);
+        for d in &out_shape {
+            d.hash(h);
+        }
     });
-    let schema = f64_scalar_schema();
+    let schema = schema_from(dtype, &out_shape);
     let parent_clock = clock.parent_clock_id();
     let mut reader = clock.subscribe();
+    let n_elems = shape_elems(&out_shape);
+    let v_f64 = value.as_f64();
     Ok(NodeImpl::spawn(
         id,
         ValueType::Value(schema.clone()),
@@ -142,7 +182,10 @@ pub fn constant(clock: Arc<dyn DynamicNode>, value: f64) -> Result<Arc<dyn Dynam
         default_ring_bytes(schema.size()),
         move |output| async move {
             let _clock = clock;
-            let bytes = value.to_le_bytes();
+            let mut bytes: Vec<u8> = Vec::with_capacity(schema.size());
+            for _ in 0..n_elems {
+                write_f64_as(&mut bytes, dtype, v_f64);
+            }
             loop {
                 let grant = reader.next().await;
                 for (ts, _) in grant.samples() {

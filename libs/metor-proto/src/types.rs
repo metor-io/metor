@@ -114,6 +114,7 @@ impl mlua::UserData for ComponentId {}
     IntoBytes,
     postcard_schema::Schema,
 )]
+#[cfg_attr(feature = "facet", derive(facet::Facet))]
 #[repr(u64)]
 #[serde(rename_all = "kebab-case")]
 pub enum PrimType {

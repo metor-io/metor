@@ -593,8 +593,8 @@ fn traffic_light_grid_pattern_rows(
                 pattern: input.to_string(),
                 color: None,
             };
-            let config = facet_json::to_string(&cfg)
-                .expect("traffic light grid widget config serializes");
+            let config =
+                facet_json::to_string(&cfg).expect("traffic light grid widget config serializes");
             dashboard.update(cx, |this, cx| {
                 this.add_widget(WidgetKind::traffic_light_grid(), config, cx);
             });

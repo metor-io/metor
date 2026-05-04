@@ -12,6 +12,8 @@ Features from metor-ui parity (excluding 3D rendering) and new ideas for industr
 - [ ] **Map** — geographic map with markers driven by component data (lat/lon from EQL)
 - [X] **Hierarchy** — entity/component tree browser with fuzzy search and expand/collapse
 - [X] **Inspector** — component property editor with type-aware widgets
+- [x] **XY Plot** — phase / correlation plot pairing two `(component, element)` axes
+- [x] **List Plot** — index-vs-value of a vector component's latest sample (FFT/spectrum visualization), with Line / Scatter / Bar styles
 
 ## Plot Features
 
@@ -29,6 +31,59 @@ Features from metor-ui parity (excluding 3D rendering) and new ideas for industr
 - [x] **Legend** — trace labels with color indicators
 - [x] **Manual set x and y bounds** - With the inspector you should be able to select times for the X axis using the same syntax as metor-ui, and be able to set y bounds
 - [x] **Axis zoom and pan**. Scrolling on each axis should just zoom that axis, same for panning
+
+## Dynamic Nodes
+
+The node editor exposes a runtime graph that produces components from clocks, signals, derivations, and DB sources. Each op compiles to a `DynamicNode` and is reused across reconciliations.
+
+### Existing ops
+
+- [x] Clocks: Fixed Rate, Clock Of
+- [x] Generators: Waveform (sin/cos/square/sawtooth), Random, Constant
+- [x] Derive: Scale, Offset, Abs, Neg, Log, **Window** (sliding `[f64; N]`), **FFT** (one-sided magnitude spectrum)
+- [x] Compose: Add, Sub, Mul, Mean, Pack
+- [x] Resample: Zero-Order Hold, Linear, Latest At
+- [x] DB: From DB, Persist
+
+### Proposed: math primitives
+
+- [ ] **Sqrt / Pow / Exp** — round out the f64 math toolkit (Log already exists)
+- [ ] **Sin / Cos / Atan2** — trig (Atan2 takes two scalars; useful for angle-from-(x,y))
+- [ ] **Sign / Clamp** — `Clamp { min, max }` saturates a value to a range
+- [ ] **Linear Map** — single-node `a*x + b` (convenience over Scale → Offset chains)
+- [ ] **Lerp** — three-input `a*(1-t) + b*t` (mix two streams by a third)
+
+### Proposed: sliding statistics over the last N samples
+
+A natural follow-up to Window. Each is `f64 in → f64 out` with one `size` arg.
+
+- [ ] **Sliding Mean** — moving average (smoothing); distinct from the existing co-clocked `Mean` over multiple inputs
+- [ ] **Sliding Min / Max** — running envelope (alarm flooring/ceiling)
+- [ ] **Sliding StdDev / Variance** — noise / jitter quantification
+- [ ] **Differentiate** — discrete derivative (e.g. velocity from position)
+- [ ] **Integrate** — running sum, with optional reset trigger
+
+### Proposed: thresholds and triggers
+
+- [x] **Threshold** — `input > k` → 0/1 f64 (downstream sees a binary signal)
+- [ ] **Hysteresis** — two-threshold debounced version of Threshold (prevents chatter near the edge)
+- [ ] **Edge Detect** — pulse (1 for one tick) on rising / falling / either edge
+- [ ] **Latch** — sample-and-hold; freezes the input value when a trigger goes high
+
+### Proposed: vector ops (operate on vector schemas like Pack/Window/FFT outputs)
+
+- [x] **Slice / Index** — pull element `[i]` of a vector → scalar (the inverse of Pack)
+- [x] **Magnitude / L2 Norm** — `sqrt(sum(x_i²))` of a vector input → scalar; useful for speed-from-velocity
+- [x] **Dot Product** — two vectors → scalar
+- [ ] **Concatenate** — two vectors of length M, N → one vector of length M+N
+- [ ] **Window Function** — multiply a vector by Hann / Hamming / Blackman before FFT (real-world FFT users always want this)
+
+### Proposed: control & sequencing
+
+- [ ] **PID Controller** — `setpoint, measured → output` with P/I/D gains; useful for closed-loop sim demos
+- [ ] **Counter** — increment on each tick (or on a trigger edge)
+- [ ] **Time Since Trigger** — seconds elapsed since input last crossed a threshold; useful for cooldowns and timeouts
+- [ ] **Decimate** — emit every k-th sample (cheap downsample without filtering)
 
 ## Timeline & Playback
 TBD whether this is good / we want this

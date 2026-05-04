@@ -16,8 +16,8 @@ use gpui::{
     SharedString, Window, div, prelude::*, px,
 };
 
-use crate::inspector::rows::{InspectorRow, RowAction, TextField, row_base};
 use crate::inspector::rows::text_field::TextAlign;
+use crate::inspector::rows::{InspectorRow, RowAction, TextField, row_base};
 use crate::inspector::{InspectorMode, InspectorRequest, open_inspector};
 use crate::theme::theme;
 

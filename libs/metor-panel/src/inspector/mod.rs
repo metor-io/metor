@@ -24,8 +24,8 @@ pub mod rows;
 pub mod trace_picker;
 
 use crate::theme::theme;
-use rows::{InspectorRow, RowAction, TextField};
 use rows::text_field::TextAlign;
+use rows::{InspectorRow, RowAction, TextField};
 
 const ROW_HEIGHT: f32 = 28.0;
 
@@ -454,12 +454,7 @@ impl Inspector {
                                             .text_color(theme.text_primary)
                                             .child(label),
                                     )
-                                    .child(
-                                        div()
-                                            .flex_1()
-                                            .min_w_0()
-                                            .child(edit.field.element()),
-                                    )
+                                    .child(div().flex_1().min_w_0().child(edit.field.element()))
                                     .into_any_element()
                             } else {
                                 let page = this.current_page();

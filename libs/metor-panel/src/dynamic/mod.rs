@@ -15,15 +15,17 @@
 mod node;
 pub mod ops;
 mod registry;
+pub mod tensor;
 
 #[cfg(test)]
 mod tests;
 
 pub use node::{
     BuildError, DynamicNode, DynamicNodeExt, NodeGrant, NodeId, NodeImpl, NodeReader, ValueType,
-    default_ring_bytes, hash_id, op_tag, require_clock, require_f64_scalar, write_sample,
+    default_ring_bytes, hash_id, op_tag, require_clock, require_value, write_sample,
 };
 pub use registry::DynamicRegistry;
+pub use tensor::TypedScalar;
 
 use std::sync::Arc;
 
@@ -48,4 +50,3 @@ impl ComponentStreamBuilder for Arc<dyn DynamicNode> {
         WalComponentStream::from_disruptor(self.output(), schema)
     }
 }
-

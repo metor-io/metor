@@ -10,15 +10,13 @@ use std::time::Duration;
 
 use gpui::{
     App, Bounds, Context, Entity, FocusHandle, Focusable, Hsla, IntoElement, MouseButton,
-    PathBuilder, Pixels, Point, Render, SharedString, Task, WeakEntity, Window, canvas, div,
-    point, prelude::*, px,
+    PathBuilder, Pixels, Point, Render, SharedString, Task, WeakEntity, Window, canvas, div, point,
+    prelude::*, px,
 };
 use metor_db::DB;
 
 use crate::node_editor::config::{NodeEditorConfig, Viewport as ConfigViewport};
-use crate::node_editor::graph::{
-    BuildState, EdgeEntry, FlowId, NodeEntry, NodeGraph, Position,
-};
+use crate::node_editor::graph::{BuildState, EdgeEntry, FlowId, NodeEntry, NodeGraph, Position};
 use crate::node_editor::registry::{Arity, OpDescriptor, SocketKind, descriptor_for};
 use crate::node_editor::spec::NodeSpec;
 use crate::node_editor::validate::{EdgeColor, EdgeVerdict, edge_color, validate_connection};
@@ -192,12 +190,7 @@ impl NodeEditor {
     /// Spawn a node with a fully-specified `spec`. Used by the palette
     /// wizards that gather extra input (component name for `Persist`,
     /// component id for `FromDb`) before insertion.
-    pub fn add_node_with_spec(
-        &mut self,
-        kind_label: &str,
-        spec: NodeSpec,
-        cx: &mut Context<Self>,
-    ) {
+    pub fn add_node_with_spec(&mut self, kind_label: &str, spec: NodeSpec, cx: &mut Context<Self>) {
         let (x, y) = self.next_node_position();
         let id = self.next_flow_id(kind_label);
         self.graph.update(cx, |g, _| {
@@ -300,7 +293,8 @@ impl NodeEditor {
                 entry.list.update(cx, |l, cx| l.set_rows(rows, cx));
             } else {
                 let list = cx.new(|cx| crate::inspector::row_list::RowList::new(rows, cx));
-                self.node_row_lists.insert(flow_id, NodeRowEntry { spec, list });
+                self.node_row_lists
+                    .insert(flow_id, NodeRowEntry { spec, list });
             }
         }
     }
@@ -394,9 +388,9 @@ fn output_socket_local_y(input_count: usize, arg_count: usize) -> f32 {
 /// Color a socket dot by its declared kind.
 fn socket_dot_color(kind: SocketKind, theme: &crate::theme::Theme) -> Hsla {
     match kind {
-        SocketKind::Clock => theme.line_colors[1],     // cool blue family
+        SocketKind::Clock => theme.line_colors[1], // cool blue family
         SocketKind::F64Scalar => theme.line_colors[0], // accent orange
-        SocketKind::Value => theme.line_colors[2],     // green — distinct from scalar
+        SocketKind::Value => theme.line_colors[2], // green — distinct from scalar
         SocketKind::Any => theme.text_secondary,
     }
 }
@@ -430,8 +424,7 @@ impl Render for NodeEditor {
         let selected_edge = self.selected_edge.clone();
 
         // Per-node screen position = graph position - viewport offset.
-        let mut node_snapshots: Vec<NodeRenderSnapshot> =
-            Vec::with_capacity(graph_ref.nodes.len());
+        let mut node_snapshots: Vec<NodeRenderSnapshot> = Vec::with_capacity(graph_ref.nodes.len());
         for (id, entry) in &graph_ref.nodes {
             node_snapshots.push(NodeRenderSnapshot {
                 flow_id: id.clone(),
@@ -459,9 +452,11 @@ impl Render for NodeEditor {
                 let s_inputs = input_count(source, &graph_ref.edges, &edge.source);
                 let s_args = args_count(&source.spec);
                 let src_x = source.position.x - viewport.x + NODE_WIDTH;
-                let src_y = source.position.y - viewport.y + output_socket_local_y(s_inputs, s_args);
+                let src_y =
+                    source.position.y - viewport.y + output_socket_local_y(s_inputs, s_args);
                 let tgt_x = target.position.x - viewport.x;
-                let tgt_y = target.position.y - viewport.y + input_socket_local_y(edge.target_socket);
+                let tgt_y =
+                    target.position.y - viewport.y + input_socket_local_y(edge.target_socket);
                 let mut color = edge_color_to_hsla(edge_color(graph_ref, edge), &theme);
                 if Some(edge) == selected_edge.as_ref() {
                     color = theme.line_colors[0];
@@ -481,7 +476,11 @@ impl Render for NodeEditor {
             let s_args = args_count(&source.spec);
             let src_x = source.position.x - viewport.x + NODE_WIDTH;
             let src_y = source.position.y - viewport.y + output_socket_local_y(s_inputs, s_args);
-            Some((point(px(src_x), px(src_y)), draft.pointer, theme.text_secondary))
+            Some((
+                point(px(src_x), px(src_y)),
+                draft.pointer,
+                theme.text_secondary,
+            ))
         });
 
         let _ = graph_ref;
@@ -578,41 +577,39 @@ impl Render for NodeEditor {
                     let _ = this;
                 }),
             )
-            .on_mouse_move(cx.listener(
-                |this, ev: &gpui::MouseMoveEvent, _w, cx| {
-                    let Some(origin) = this.canvas_origin else {
-                        return;
+            .on_mouse_move(cx.listener(|this, ev: &gpui::MouseMoveEvent, _w, cx| {
+                let Some(origin) = this.canvas_origin else {
+                    return;
+                };
+                let local = ev.position - origin;
+                if let Some(pan) = &this.pan_drag {
+                    let dx = f32::from(ev.position.x - pan.pointer_origin.x);
+                    let dy = f32::from(ev.position.y - pan.pointer_origin.y);
+                    // Drag right → world moves right under cursor → viewport.x decreases.
+                    this.viewport.x = pan.viewport_origin.x - dx;
+                    this.viewport.y = pan.viewport_origin.y - dy;
+                    cx.notify();
+                    return;
+                }
+                if let Some(drag) = &this.node_drag {
+                    let dx = f32::from(ev.position.x - drag.pointer_origin.x);
+                    let dy = f32::from(ev.position.y - drag.pointer_origin.y);
+                    let target_id = drag.flow_id.clone();
+                    let new_pos = Position {
+                        x: drag.node_origin.x + dx,
+                        y: drag.node_origin.y + dy,
                     };
-                    let local = ev.position - origin;
-                    if let Some(pan) = &this.pan_drag {
-                        let dx = f32::from(ev.position.x - pan.pointer_origin.x);
-                        let dy = f32::from(ev.position.y - pan.pointer_origin.y);
-                        // Drag right → world moves right under cursor → viewport.x decreases.
-                        this.viewport.x = pan.viewport_origin.x - dx;
-                        this.viewport.y = pan.viewport_origin.y - dy;
-                        cx.notify();
-                        return;
-                    }
-                    if let Some(drag) = &this.node_drag {
-                        let dx = f32::from(ev.position.x - drag.pointer_origin.x);
-                        let dy = f32::from(ev.position.y - drag.pointer_origin.y);
-                        let target_id = drag.flow_id.clone();
-                        let new_pos = Position {
-                            x: drag.node_origin.x + dx,
-                            y: drag.node_origin.y + dy,
-                        };
-                        this.graph.update(cx, |g, _| {
-                            if let Some(entry) = g.nodes.get_mut(&target_id) {
-                                entry.position = new_pos;
-                            }
-                        });
-                        cx.notify();
-                    } else if let Some(draft) = &mut this.edge_draft {
-                        draft.pointer = local;
-                        cx.notify();
-                    }
-                },
-            ))
+                    this.graph.update(cx, |g, _| {
+                        if let Some(entry) = g.nodes.get_mut(&target_id) {
+                            entry.position = new_pos;
+                        }
+                    });
+                    cx.notify();
+                } else if let Some(draft) = &mut this.edge_draft {
+                    draft.pointer = local;
+                    cx.notify();
+                }
+            }))
             .on_mouse_up(
                 MouseButton::Left,
                 cx.listener(|this, _ev: &gpui::MouseUpEvent, _w, cx| {
@@ -638,8 +635,8 @@ impl Render for NodeEditor {
                     }
                 }),
             )
-            .on_scroll_wheel(cx.listener(
-                |this, event: &gpui::ScrollWheelEvent, _window, cx| {
+            .on_scroll_wheel(
+                cx.listener(|this, event: &gpui::ScrollWheelEvent, _window, cx| {
                     let delta = event.delta.pixel_delta(px(20.0));
                     // viewport.{x,y} are positive when scrolled into content;
                     // wheel delta is negative when scrolling down, so subtract.
@@ -647,16 +644,15 @@ impl Render for NodeEditor {
                     this.viewport.y -= f32::from(delta.y);
                     this.clamp_viewport(cx);
                     cx.notify();
-                },
-            ))
+                }),
+            )
             .child(canvas_layer);
 
         // Refresh per-node `RowList`s so each node card has up-to-date
         // inline arg rows. Done after node_snapshots are computed so we
         // know which flow ids are alive, but before render_node so the
         // cards can pull the row-list entity by id.
-        let alive_ids: HashSet<FlowId> =
-            node_snapshots.iter().map(|s| s.flow_id.clone()).collect();
+        let alive_ids: HashSet<FlowId> = node_snapshots.iter().map(|s| s.flow_id.clone()).collect();
         self.refresh_row_lists(&alive_ids, cx);
 
         for snap in node_snapshots {
@@ -815,13 +811,12 @@ impl NodeEditor {
                         this.selection = Some(id.clone());
                         let editor_entity = cx.entity().clone();
                         let graph_entity = this.graph.clone();
-                        let proxy = cx.new(|_| {
-                            crate::node_editor::inspector_rows::SelectedNodeProxy {
+                        let proxy =
+                            cx.new(|_| crate::node_editor::inspector_rows::SelectedNodeProxy {
                                 editor: editor_entity,
                                 graph: graph_entity,
                                 flow_id: id.clone(),
-                            }
-                        });
+                            });
                         window.dispatch_action(
                             Box::new(crate::inspector::InspectEntity {
                                 entity: proxy.into_any(),

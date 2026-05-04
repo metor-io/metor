@@ -1,51 +1,42 @@
-//! XY (phase / correlation) plot. A sibling to the time-series plot that
-//! lets each trace pick two `(component, element)` pairs — one driving X,
-//! one driving Y — instead of using time as X.
+//! List plot. A sibling to the time-series and XY plots that renders the
+//! interior of a single sample as `index → value`. Each new sample fully
+//! replaces the plotted vector — there is no history.
 //!
-//! Most of the time-series machinery is reused: the GPU pipeline (now
-//! generic over X-axis source), `PlotBounds`, `Override`, the per-axis
-//! bound scanner [`crate::views::time_series::expand_value_bounds`], and
-//! the chrome helpers (axis zones, tick generators, label formatting).
-//! Only this module's specifics are new — the trace shape, axis-bound
-//! tracker, paint chrome that uses numeric formatting on both axes, and
-//! the two-step wizard for picking X then Y.
+//! Reuses the GPU pipeline (extended with latest-sample [`AxisSource`]
+//! variants), [`PlotBounds`], [`Override`], the chrome painters from
+//! `xy_plot` (since both axes are numeric), and the trace-picker scaffolding
+//! from `inspector::trace_picker`.
 
 use std::sync::Arc;
 
 use gpui::{
-    Bounds, Context, Entity, Hsla, IntoElement, MouseButton, PathBuilder, Pixels, Point,
-    SharedString, Styled, TextRun, Window, canvas, div, point, prelude::*, px,
+    Bounds, Context, Entity, Hsla, IntoElement, MouseButton, Pixels, Point, SharedString, Styled,
+    Window, canvas, div, prelude::*, px,
 };
 use metor_db::DB;
 use metor_proto::types::ComponentId;
 
 use super::time_series::{
     AxisZone, LABEL_FONT_SIZE, Override, PADDING, PlotBounds, PlotStyle, X_LABEL_HEIGHT,
-    Y_LABEL_WIDTH, axis_zone, format_value_label, plot_area, value_ticks,
+    Y_LABEL_WIDTH, axis_zone, plot_area,
 };
+use super::xy_plot::{paint_xy_overlay, paint_xy_underlay};
 
 mod line_plot;
-pub use line_plot::XyLinePlot;
+pub use line_plot::ListLinePlot;
 
 pub mod trace_picker;
 
-/// One series on an XY plot: a `(component, element)` for each axis,
-/// with its own color, style, and label.
-///
-/// `Bar` is excluded from the inspector for XY (the wizard defaults to
-/// `Scatter`); the GPU layer still renders it correctly if a serialized
-/// config carries `Bar` in.
+/// One series on a list plot: a `(component, len)` pair carrying the
+/// vector length captured at trace creation. `len` is fixed because
+/// component schemas have fixed dimensions in this codebase.
 #[derive(Clone, facet::Facet)]
 #[facet(pod)]
-pub struct XyTrace {
+pub struct ListTrace {
     #[facet(skip)]
-    pub x_component_id: ComponentId,
+    pub component_id: ComponentId,
     #[facet(skip)]
-    pub x_element_index: usize,
-    #[facet(skip)]
-    pub y_component_id: ComponentId,
-    #[facet(skip)]
-    pub y_element_index: usize,
+    pub len: usize,
     pub color: Hsla,
     pub style: PlotStyle,
     pub visible: bool,
@@ -53,21 +44,13 @@ pub struct XyTrace {
     pub stroke_width: f32,
 }
 
-impl XyTrace {
-    pub fn new(
-        x_component_id: impl Into<ComponentId>,
-        x_element_index: usize,
-        y_component_id: impl Into<ComponentId>,
-        y_element_index: usize,
-        color: Hsla,
-    ) -> Self {
+impl ListTrace {
+    pub fn new(component_id: impl Into<ComponentId>, len: usize, color: Hsla) -> Self {
         Self {
-            x_component_id: x_component_id.into(),
-            x_element_index,
-            y_component_id: y_component_id.into(),
-            y_element_index,
+            component_id: component_id.into(),
+            len,
             color,
-            style: PlotStyle::Scatter,
+            style: PlotStyle::Line,
             visible: true,
             label: SharedString::new_static(""),
             stroke_width: 1.5,
@@ -75,23 +58,20 @@ impl XyTrace {
     }
 }
 
-/// Interactive wrapper around an [`XyLinePlot`] that adds axes, legend,
+/// Interactive wrapper around a [`ListLinePlot`] that adds axes, legend,
 /// and pan/zoom input.
-///
-/// Mirrors `TimeSeriesPlot`: all plot state lives in the inner
-/// [`XyLinePlot`]; this entity owns drag state and chrome only.
-pub struct XyPlot {
-    line_plot: Entity<XyLinePlot>,
+pub struct ListPlot {
+    line_plot: Entity<ListLinePlot>,
     drag_start: Option<Point<Pixels>>,
     drag_start_view: Option<PlotBounds>,
     drag_zone: AxisZone,
     last_plot_area: Option<Bounds<Pixels>>,
 }
 
-impl XyPlot {
-    pub fn new(db: Arc<DB>, traces: Vec<XyTrace>, cx: &mut Context<Self>) -> Self {
+impl ListPlot {
+    pub fn new(db: Arc<DB>, traces: Vec<ListTrace>, cx: &mut Context<Self>) -> Self {
         let line_plot = cx.new(|cx| {
-            let mut lp = XyLinePlot::new(db, cx);
+            let mut lp = ListLinePlot::new(db, cx);
             lp.bind_traces(traces, cx);
             lp
         });
@@ -105,7 +85,7 @@ impl XyPlot {
         }
     }
 
-    pub fn line_plot(&self) -> &Entity<XyLinePlot> {
+    pub fn line_plot(&self) -> &Entity<ListLinePlot> {
         &self.line_plot
     }
 
@@ -129,10 +109,10 @@ impl XyPlot {
     }
 }
 
-impl Render for XyPlot {
+impl Render for ListPlot {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = crate::theme::theme(cx);
-        let trace_entities: Vec<Entity<XyTrace>> = self.line_plot.read(cx).traces().to_vec();
+        let trace_entities: Vec<Entity<ListTrace>> = self.line_plot.read(cx).traces().to_vec();
         let show_legend = trace_entities.len() >= 2;
 
         let underlay_lp = self.line_plot.clone();
@@ -340,158 +320,5 @@ impl Render for XyPlot {
         }
 
         root
-    }
-}
-
-/// Paint gridlines and zero lines behind the GPU-rendered XY plot.
-///
-/// Both axes are numeric, so X uses [`value_ticks`] just like Y. Zero
-/// lines are drawn for whichever axes' ranges cross zero.
-pub(crate) fn paint_xy_underlay(
-    outer_bounds: Bounds<Pixels>,
-    view: PlotBounds,
-    window: &mut Window,
-    cx: &mut gpui::App,
-) {
-    let pb = plot_area(outer_bounds);
-    let theme = crate::theme::theme(cx);
-
-    for tick in value_ticks(view.min_y, view.max_y, 5) {
-        let y = view.to_screen(pb, view.min_x, tick).y;
-        if y < pb.origin.y || y > pb.origin.y + pb.size.height {
-            continue;
-        }
-        let mut grid = PathBuilder::stroke(px(0.5));
-        grid.move_to(point(pb.origin.x, y));
-        grid.line_to(point(pb.origin.x + pb.size.width, y));
-        if let Ok(path) = grid.build() {
-            window.paint_path(path, theme.grid_color);
-        }
-    }
-    for tick in value_ticks(view.min_x, view.max_x, 5) {
-        let x = view.to_screen(pb, tick, view.min_y).x;
-        if x < pb.origin.x || x > pb.origin.x + pb.size.width {
-            continue;
-        }
-        let mut grid = PathBuilder::stroke(px(0.5));
-        grid.move_to(point(x, pb.origin.y));
-        grid.line_to(point(x, pb.origin.y + pb.size.height));
-        if let Ok(path) = grid.build() {
-            window.paint_path(path, theme.grid_color);
-        }
-    }
-
-    if view.min_y < 0.0 && view.max_y > 0.0 {
-        let zero_y = view.to_screen(pb, view.min_x, 0.0).y;
-        let mut zp = PathBuilder::stroke(px(1.0));
-        zp.move_to(point(pb.origin.x, zero_y));
-        zp.line_to(point(pb.origin.x + pb.size.width, zero_y));
-        if let Ok(path) = zp.build() {
-            window.paint_path(path, theme.zero_line_color);
-        }
-    }
-    if view.min_x < 0.0 && view.max_x > 0.0 {
-        let zero_x = view.to_screen(pb, 0.0, view.min_y).x;
-        let mut zp = PathBuilder::stroke(px(1.0));
-        zp.move_to(point(zero_x, pb.origin.y));
-        zp.line_to(point(zero_x, pb.origin.y + pb.size.height));
-        if let Ok(path) = zp.build() {
-            window.paint_path(path, theme.zero_line_color);
-        }
-    }
-}
-
-/// Paint axis chrome on top of the GPU-rendered XY plot.
-pub(crate) fn paint_xy_overlay(
-    outer_bounds: Bounds<Pixels>,
-    view: PlotBounds,
-    window: &mut Window,
-    cx: &mut gpui::App,
-) {
-    let pb = plot_area(outer_bounds);
-    let theme = crate::theme::theme(cx);
-    let label_font_size = px(LABEL_FONT_SIZE);
-    let text_style = window.text_style();
-    let font = text_style.font();
-
-    let make_run = |text: &str| TextRun {
-        len: text.len(),
-        font: font.clone(),
-        color: theme.text_secondary,
-        background_color: None,
-        underline: None,
-        strikethrough: None,
-    };
-
-    let axis_bg = Hsla {
-        a: 0.5,
-        ..theme.bg_secondary
-    };
-    let y_axis_bg = Bounds {
-        origin: outer_bounds.origin,
-        size: gpui::Size {
-            width: pb.origin.x - outer_bounds.origin.x,
-            height: outer_bounds.size.height,
-        },
-    };
-    window.paint_quad(gpui::fill(y_axis_bg, axis_bg));
-
-    let x_axis_bg = Bounds {
-        origin: point(pb.origin.x, pb.origin.y + pb.size.height),
-        size: gpui::Size {
-            width: pb.size.width,
-            height: outer_bounds.origin.y + outer_bounds.size.height - pb.origin.y - pb.size.height,
-        },
-    };
-    window.paint_quad(gpui::fill(x_axis_bg, axis_bg));
-
-    for tick in value_ticks(view.min_y, view.max_y, 5) {
-        let y = view.to_screen(pb, view.min_x, tick).y;
-        if y < pb.origin.y || y > pb.origin.y + pb.size.height {
-            continue;
-        }
-        let text = format_value_label(tick);
-        let run = make_run(&text);
-        let shaped = window.text_system().shape_line(
-            SharedString::from(text),
-            label_font_size,
-            &[run],
-            None,
-        );
-        let origin = point(
-            pb.origin.x - shaped.width - px(4.0),
-            y - label_font_size / 2.0,
-        );
-        let _ = shaped.paint(origin, label_font_size, window, cx);
-    }
-    for tick in value_ticks(view.min_x, view.max_x, 5) {
-        let x = view.to_screen(pb, tick, view.min_y).x;
-        if x < pb.origin.x || x > pb.origin.x + pb.size.width {
-            continue;
-        }
-        let text = format_value_label(tick);
-        let run = make_run(&text);
-        let shaped = window.text_system().shape_line(
-            SharedString::from(text),
-            label_font_size,
-            &[run],
-            None,
-        );
-        let origin = point(
-            x - shaped.width / 2.0,
-            pb.origin.y + pb.size.height + px(4.0),
-        );
-        let _ = shaped.paint(origin, label_font_size, window, cx);
-    }
-
-    let mut axes = PathBuilder::stroke(px(1.0));
-    axes.move_to(point(pb.origin.x, pb.origin.y));
-    axes.line_to(point(pb.origin.x, pb.origin.y + pb.size.height));
-    axes.line_to(point(
-        pb.origin.x + pb.size.width,
-        pb.origin.y + pb.size.height,
-    ));
-    if let Ok(path) = axes.build() {
-        window.paint_path(path, theme.axis_color);
     }
 }

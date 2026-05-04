@@ -98,8 +98,7 @@ impl NodeGraph {
 
     pub fn remove_node(&mut self, id: &FlowId) {
         self.nodes.remove(id);
-        self.edges
-            .retain(|e| &e.source != id && &e.target != id);
+        self.edges.retain(|e| &e.source != id && &e.target != id);
     }
 
     /// Drop the edge already at `(target, target_socket)`, then add the new
@@ -140,11 +139,8 @@ impl NodeGraph {
         if !self.nodes.contains_key(flow_id) {
             return Vec::new();
         }
-        let mut incoming: Vec<&EdgeEntry> = self
-            .edges
-            .iter()
-            .filter(|e| &e.target == flow_id)
-            .collect();
+        let mut incoming: Vec<&EdgeEntry> =
+            self.edges.iter().filter(|e| &e.target == flow_id).collect();
         incoming.sort_by_key(|e| e.target_socket);
         incoming.into_iter().map(|e| e.source.clone()).collect()
     }
@@ -154,8 +150,7 @@ impl NodeGraph {
     /// reached because it's in or downstream of a cycle.
     fn topo_order(&self) -> (Vec<FlowId>, HashSet<FlowId>) {
         // Build in-degree from the parent map.
-        let mut indeg: HashMap<FlowId, usize> =
-            self.nodes.keys().map(|k| (k.clone(), 0)).collect();
+        let mut indeg: HashMap<FlowId, usize> = self.nodes.keys().map(|k| (k.clone(), 0)).collect();
         let mut children: HashMap<FlowId, Vec<FlowId>> = HashMap::new();
         for flow_id in self.nodes.keys() {
             let parents = self.parents_of(flow_id);
@@ -304,10 +299,7 @@ impl NodeGraph {
             }
         }
 
-        self.nodes
-            .values()
-            .filter_map(|n| n.build.id())
-            .collect()
+        self.nodes.values().filter_map(|n| n.build.id()).collect()
     }
 
     /// View-layer wrapper around [`rebuild_into`] that pulls the registry

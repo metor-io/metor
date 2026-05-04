@@ -9118,6 +9118,7 @@ dependencies = [
  "pollster 0.4.0",
  "postcard",
  "regex",
+ "rustfft",
  "smallvec 1.15.1",
  "stellarator",
  "thingbuf",

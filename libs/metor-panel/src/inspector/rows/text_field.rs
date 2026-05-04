@@ -392,10 +392,7 @@ impl TextField {
                     TextAlign::Right => (visible_width - shaped.width).max(px(0.0)),
                 };
 
-                let text_origin = point(
-                    bounds.origin.x + align_offset - scroll_offset,
-                    base_y,
-                );
+                let text_origin = point(bounds.origin.x + align_offset - scroll_offset, base_y);
 
                 window.with_content_mask(Some(gpui::ContentMask { bounds }), |window| {
                     if !is_placeholder && mark != cursor {

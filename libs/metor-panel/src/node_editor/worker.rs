@@ -22,7 +22,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use crossbeam_channel::{Sender, bounded, unbounded};
+use crossbeam_channel::{Receiver, Sender, bounded, unbounded};
 use gpui::{App, Global};
 
 use crate::dynamic::{BuildError, DynamicNode};
@@ -44,6 +44,13 @@ struct BuildJob {
 #[derive(Clone)]
 pub struct WorkerHandle {
     tx: Sender<BuildJob>,
+    /// Disposal channel for `Arc<dyn DynamicNode>` whose strong count is
+    /// about to go to 1 (then 0) on a non-worker thread. Routing them here
+    /// guarantees the actual drop — and the cancellation of the underlying
+    /// `JoinHandleDropGuard` — happens on the thread that owns the
+    /// stellarator timer, which avoids the cross-thread spinlock deadlock
+    /// in `maitake::time::Sleep::drop`.
+    dispose_tx: Sender<Arc<dyn DynamicNode>>,
 }
 
 impl WorkerHandle {
@@ -63,6 +70,14 @@ impl WorkerHandle {
             return Err(BuildError::ParentFailed);
         }
         reply_rx.recv().unwrap_or(Err(BuildError::ParentFailed))
+    }
+
+    /// Hand `arc` to the worker thread for disposal. Best-effort: if the
+    /// worker is gone, we drop locally as a fallback.
+    pub fn dispose(&self, arc: Arc<dyn DynamicNode>) {
+        if let Err(crossbeam_channel::SendError(arc)) = self.dispose_tx.send(arc) {
+            drop(arc);
+        }
     }
 }
 
@@ -85,22 +100,12 @@ impl Default for DynamicWorker {
 impl DynamicWorker {
     pub fn new() -> Self {
         let (tx, rx) = unbounded::<BuildJob>();
+        let (dispose_tx, dispose_rx) = unbounded::<Arc<dyn DynamicNode>>();
         let thread = stellarator::struc_con::stellar(move || async move {
-            loop {
-                while let Ok(job) = rx.try_recv() {
-                    let result = (job.closure)();
-                    // If the requester went away, drop the result silently.
-                    let _ = job.reply.send(result);
-                }
-                // Yield to the executor so the producer tasks we just
-                // spawned actually get to run, and poll the inbox again
-                // shortly. Build requests are rare (200 ms debounce) so the
-                // 2 ms re-poll is invisible to the user.
-                stellarator::sleep(Duration::from_millis(2)).await;
-            }
+            run_worker(rx, dispose_rx).await;
         });
         Self {
-            handle: WorkerHandle { tx },
+            handle: WorkerHandle { tx, dispose_tx },
             _thread: thread,
         }
     }
@@ -113,5 +118,32 @@ impl DynamicWorker {
     /// globals from the same `cx`.
     pub fn handle(&self) -> &WorkerHandle {
         &self.handle
+    }
+}
+
+/// Single drainer for both build jobs and Arc disposals. Disposing here —
+/// rather than letting the gpui main thread drop the Arc directly — keeps
+/// `Sleep::drop` (and any other timer-touching destructor inside the
+/// spawned task) on the thread that owns the timer's spinlock.
+async fn run_worker(rx: Receiver<BuildJob>, dispose_rx: Receiver<Arc<dyn DynamicNode>>) {
+    loop {
+        while let Ok(job) = rx.try_recv() {
+            let result = (job.closure)();
+            // If the requester went away, drop the result silently.
+            let _ = job.reply.send(result);
+        }
+        // Drain the graveyard. `drop(arc)` here triggers the
+        // `JoinHandleDropGuard` inside `NodeImpl`, which calls `cancel()`
+        // on the underlying maitake task — and `cancel()` on the same
+        // thread the task was spawned on synchronously deallocates without
+        // needing to fight the timer's spinlock.
+        while let Ok(arc) = dispose_rx.try_recv() {
+            drop(arc);
+        }
+        // Yield to the executor so the producer tasks we just spawned
+        // actually get to run, and poll the inbox again shortly. Build
+        // requests are rare (200 ms debounce) so the 2 ms re-poll is
+        // invisible to the user.
+        stellarator::sleep(Duration::from_millis(2)).await;
     }
 }
