@@ -9,9 +9,9 @@ use metor_proto::types::ComponentId;
 use crate::inspector::rows::{CommandRow, InspectorRow, NavRow};
 use crate::inspector::{InspectorMode, InspectorRequest, OpenInspectorCallback};
 use crate::views::dashboard::DashboardPanel;
+use crate::views::list_plot::{ListLinePlot, ListPlot, ListTrace};
 use crate::views::time_series::{LinePlot, Override, PlotStyle, Trace};
 use crate::views::viewer_3d::Viewer3d;
-use crate::views::list_plot::{ListLinePlot, ListPlot, ListTrace};
 use crate::views::xy_plot::{XyLinePlot, XyPlot, XyTrace};
 use crate::views::{
     ComponentBrowser, ComponentTable, ComponentText, DataTable, TimeSeriesPlot, TrafficLight,
@@ -1267,8 +1267,7 @@ pub fn new_panel_rows(
         Arc::new(move |_window, cx| {
             let db = db.clone();
             pane.update(cx, |pane, cx| {
-                let editor =
-                    cx.new(|cx| crate::node_editor::pane::NodeEditor::new(db.clone(), cx));
+                let editor = cx.new(|cx| crate::node_editor::pane::NodeEditor::new(db.clone(), cx));
                 pane.add_item(Box::new(editor), cx);
             });
         })
@@ -1280,10 +1279,7 @@ pub fn new_panel_rows(
 /// Single-question wizard for "New Panel → Traffic Light Grid": prompts
 /// for a glob pattern, then constructs a [`TrafficLightGridPanel`] seeded
 /// with that pattern.
-fn traffic_light_grid_pattern_rows(
-    db: Arc<DB>,
-    pane: Entity<Pane>,
-) -> Vec<Box<dyn InspectorRow>> {
+fn traffic_light_grid_pattern_rows(db: Arc<DB>, pane: Entity<Pane>) -> Vec<Box<dyn InspectorRow>> {
     vec![crate::views::traffic_light_grid::glob_prompt_row(Arc::new(
         move |pattern, _window, cx| {
             let db = db.clone();

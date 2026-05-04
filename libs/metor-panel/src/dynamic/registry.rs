@@ -43,7 +43,11 @@ impl DynamicRegistry {
             return existing.clone();
         }
         let node = build();
-        debug_assert_eq!(node.id(), id, "build closure produced a node with a different id");
+        debug_assert_eq!(
+            node.id(),
+            id,
+            "build closure produced a node with a different id"
+        );
         self.nodes.insert(id, node.clone());
         node
     }

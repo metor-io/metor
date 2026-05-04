@@ -31,8 +31,10 @@ use metor_proto::types::PrimType;
 use smallvec::SmallVec;
 
 use crate::dynamic::ValueType;
-use crate::dynamic::ops::derive::ThresholdOp;
+use crate::dynamic::ops::compose::BinaryOp;
+use crate::dynamic::ops::derive::{AffineOp, ThresholdOp, UnaryOp};
 use crate::dynamic::ops::generators::Waveform;
+use crate::dynamic::ops::resample::ResampleMode;
 use crate::dynamic::tensor::TypedScalar;
 use crate::inspector::registry::InspectorRegistry;
 use crate::inspector::rows::{
@@ -70,15 +72,10 @@ fn build_editor_rows(any: AnyEntity, db: &Arc<DB>, cx: &App) -> Vec<Box<dyn Insp
     let mut rows: Vec<Box<dyn InspectorRow>> = Vec::new();
 
     rows.push(Box::new(
-        ActionRow::new(
-            SharedString::new_static("Add Node"),
-            {
-                let editor = editor.clone();
-                Arc::new(move |_window, cx| {
-                    RowAction::Cascade(build_add_node_rows(editor.clone(), cx))
-                })
-            },
-        )
+        ActionRow::new(SharedString::new_static("Add Node"), {
+            let editor = editor.clone();
+            Arc::new(move |_window, cx| RowAction::Cascade(build_add_node_rows(editor.clone(), cx)))
+        })
         .with_tag(SharedString::new_static("editor")),
     ));
 
@@ -112,7 +109,11 @@ fn build_editor_rows(any: AnyEntity, db: &Arc<DB>, cx: &App) -> Vec<Box<dyn Insp
     if has_selection || has_edge {
         let editor_for_delete = editor.clone();
         rows.push(Box::new(CommandRow::new(
-            SharedString::new_static(if has_edge { "Delete Edge" } else { "Delete Node" }),
+            SharedString::new_static(if has_edge {
+                "Delete Edge"
+            } else {
+                "Delete Node"
+            }),
             Arc::new(move |_window, cx| {
                 editor_for_delete.update(cx, |ed, cx| ed.delete_selection(cx));
             }),
@@ -164,26 +165,20 @@ fn build_nodes_submenu(
 /// Build the "Add Node" submenu rows. Most ops insert immediately; `Persist`
 /// and `FromDb` cascade into a small wizard that requires the user to
 /// supply the missing field before the node lands in the graph.
-pub fn build_add_node_rows(
-    editor: Entity<NodeEditor>,
-    cx: &App,
-) -> Vec<Box<dyn InspectorRow>> {
+pub fn build_add_node_rows(editor: Entity<NodeEditor>, cx: &App) -> Vec<Box<dyn InspectorRow>> {
     let db = editor.read(cx).db().clone();
     let mut rows: Vec<Box<dyn InspectorRow>> = Vec::new();
     for descriptor in ALL_OPS {
-        let label =
-            SharedString::from(format!("{} · {}", descriptor.category, descriptor.label));
+        let label = SharedString::from(format!("{} · {}", descriptor.category, descriptor.label));
         match descriptor.kind {
             NodeSpecKind::Persist => {
                 let editor = editor.clone();
-                rows.push(Box::new(
-                    ActionRow::new(
-                        label,
-                        Arc::new(move |_window, _cx| {
-                            RowAction::Cascade(build_persist_wizard(editor.clone()))
-                        }),
-                    ),
-                ));
+                rows.push(Box::new(ActionRow::new(
+                    label,
+                    Arc::new(move |_window, _cx| {
+                        RowAction::Cascade(build_persist_wizard(editor.clone()))
+                    }),
+                )));
             }
             NodeSpecKind::FromDb => {
                 let editor = editor.clone();
@@ -225,10 +220,7 @@ fn build_persist_wizard(editor: Entity<NodeEditor>) -> Vec<Box<dyn InspectorRow>
 }
 
 /// Single-row wizard: pick an existing component from the DB.
-fn build_from_db_wizard(
-    editor: Entity<NodeEditor>,
-    db: Arc<DB>,
-) -> Vec<Box<dyn InspectorRow>> {
+fn build_from_db_wizard(editor: Entity<NodeEditor>, db: Arc<DB>) -> Vec<Box<dyn InspectorRow>> {
     let components = crate::inspector::trace_picker::list_components(&db);
     if components.is_empty() {
         return vec![Box::new(TextRow::new_readonly(
@@ -342,7 +334,14 @@ pub fn rows_for_node(
                 },
             ));
         }
-        NodeSpec::Waveform { shape, freq, amplitude, phase, dtype, out_shape } => {
+        NodeSpec::Waveform {
+            shape,
+            freq,
+            amplitude,
+            phase,
+            dtype,
+            out_shape,
+        } => {
             let shape_label = SharedString::from(waveform_label(*shape));
             let options: Vec<SharedString> = WAVEFORMS
                 .iter()
@@ -363,15 +362,42 @@ pub fn rows_for_node(
                     }
                 },
             ));
-            rows.push(scalar_arg("Frequency", *freq, editor.clone(), graph.clone(), flow_id.clone(), |s, v| {
-                if let NodeSpec::Waveform { freq, .. } = s { *freq = v; }
-            }));
-            rows.push(scalar_arg("Amplitude", *amplitude, editor.clone(), graph.clone(), flow_id.clone(), |s, v| {
-                if let NodeSpec::Waveform { amplitude, .. } = s { *amplitude = v; }
-            }));
-            rows.push(scalar_arg("Phase", *phase, editor.clone(), graph.clone(), flow_id.clone(), |s, v| {
-                if let NodeSpec::Waveform { phase, .. } = s { *phase = v; }
-            }));
+            rows.push(scalar_arg(
+                "Frequency",
+                *freq,
+                editor.clone(),
+                graph.clone(),
+                flow_id.clone(),
+                |s, v| {
+                    if let NodeSpec::Waveform { freq, .. } = s {
+                        *freq = v;
+                    }
+                },
+            ));
+            rows.push(scalar_arg(
+                "Amplitude",
+                *amplitude,
+                editor.clone(),
+                graph.clone(),
+                flow_id.clone(),
+                |s, v| {
+                    if let NodeSpec::Waveform { amplitude, .. } = s {
+                        *amplitude = v;
+                    }
+                },
+            ));
+            rows.push(scalar_arg(
+                "Phase",
+                *phase,
+                editor.clone(),
+                graph.clone(),
+                flow_id.clone(),
+                |s, v| {
+                    if let NodeSpec::Waveform { phase, .. } = s {
+                        *phase = v;
+                    }
+                },
+            ));
             rows.push(dtype_arg(
                 "Output dtype",
                 *dtype,
@@ -379,7 +405,9 @@ pub fn rows_for_node(
                 graph.clone(),
                 flow_id.clone(),
                 |s, picked| {
-                    if let NodeSpec::Waveform { dtype, .. } = s { *dtype = picked; }
+                    if let NodeSpec::Waveform { dtype, .. } = s {
+                        *dtype = picked;
+                    }
                 },
             ));
             rows.push(shape_arg(
@@ -389,11 +417,17 @@ pub fn rows_for_node(
                 graph.clone(),
                 flow_id.clone(),
                 |s, new_shape| {
-                    if let NodeSpec::Waveform { out_shape, .. } = s { *out_shape = new_shape; }
+                    if let NodeSpec::Waveform { out_shape, .. } = s {
+                        *out_shape = new_shape;
+                    }
                 },
             ));
         }
-        NodeSpec::Random { seed, dtype, out_shape } => {
+        NodeSpec::Random {
+            seed,
+            dtype,
+            out_shape,
+        } => {
             rows.push(scalar_arg(
                 "Seed",
                 *seed as f64,
@@ -413,7 +447,9 @@ pub fn rows_for_node(
                 graph.clone(),
                 flow_id.clone(),
                 |s, picked| {
-                    if let NodeSpec::Random { dtype, .. } = s { *dtype = picked; }
+                    if let NodeSpec::Random { dtype, .. } = s {
+                        *dtype = picked;
+                    }
                 },
             ));
             rows.push(shape_arg(
@@ -423,7 +459,9 @@ pub fn rows_for_node(
                 graph.clone(),
                 flow_id.clone(),
                 |s, new_shape| {
-                    if let NodeSpec::Random { out_shape, .. } = s { *out_shape = new_shape; }
+                    if let NodeSpec::Random { out_shape, .. } = s {
+                        *out_shape = new_shape;
+                    }
                 },
             ));
         }
@@ -459,11 +497,34 @@ pub fn rows_for_node(
                 graph.clone(),
                 flow_id.clone(),
                 |s, new_shape| {
-                    if let NodeSpec::Constant { out_shape, .. } = s { *out_shape = new_shape; }
+                    if let NodeSpec::Constant { out_shape, .. } = s {
+                        *out_shape = new_shape;
+                    }
                 },
             ));
         }
-        NodeSpec::Scale { k } => {
+        NodeSpec::Affine { op, k } => {
+            // Op picker (Scale vs Offset).
+            let op_label = SharedString::from(affine_op_label(*op));
+            let options: Vec<SharedString> = AFFINE_OPS
+                .iter()
+                .map(|(_, name)| SharedString::new_static(name))
+                .collect();
+            rows.push(enum_arg(
+                "Operation",
+                op_label,
+                options,
+                editor.clone(),
+                graph.clone(),
+                flow_id.clone(),
+                |spec, chosen| {
+                    if let (NodeSpec::Affine { op, .. }, Some(picked)) =
+                        (spec, affine_op_from_label(&chosen))
+                    {
+                        *op = picked;
+                    }
+                },
+            ));
             // Reconcile the arg's dtype with the parent's promoted dtype on
             // render so re-wiring the upstream picks the right widget next
             // pass. Stays a no-op when there is no built parent.
@@ -472,34 +533,85 @@ pub fn rows_for_node(
                 Some(dt) => k.cast(dt),
                 None => *k,
             };
+            let k_label = match op {
+                AffineOp::Scale => "Scale (k)",
+                AffineOp::Offset => "Offset",
+            };
             rows.push(typed_scalar_arg(
-                "Scale (k)",
+                k_label,
                 display_value,
                 editor.clone(),
                 graph.clone(),
                 flow_id.clone(),
                 |spec, v| {
-                    if let NodeSpec::Scale { k } = spec {
+                    if let NodeSpec::Affine { k, .. } = spec {
                         *k = v;
                     }
                 },
             ));
         }
-        NodeSpec::Offset { k } => {
-            let promoted = parent_dtype(&graph.read(_cx), &flow_id);
-            let display_value = match promoted {
-                Some(dt) => k.cast(dt),
-                None => *k,
-            };
-            rows.push(typed_scalar_arg(
-                "Offset",
-                display_value,
+        NodeSpec::Unary { op } => {
+            let op_label = SharedString::from(unary_op_label(*op));
+            let options: Vec<SharedString> = UNARY_OPS
+                .iter()
+                .map(|(_, name)| SharedString::new_static(name))
+                .collect();
+            rows.push(enum_arg(
+                "Operation",
+                op_label,
+                options,
                 editor.clone(),
                 graph.clone(),
                 flow_id.clone(),
-                |spec, v| {
-                    if let NodeSpec::Offset { k } = spec {
-                        *k = v;
+                |spec, chosen| {
+                    if let (NodeSpec::Unary { op }, Some(picked)) =
+                        (spec, unary_op_from_label(&chosen))
+                    {
+                        *op = picked;
+                    }
+                },
+            ));
+        }
+        NodeSpec::Binary { op } => {
+            let op_label = SharedString::from(binary_op_label(*op));
+            let options: Vec<SharedString> = BINARY_OPS
+                .iter()
+                .map(|(_, name)| SharedString::new_static(name))
+                .collect();
+            rows.push(enum_arg(
+                "Operation",
+                op_label,
+                options,
+                editor.clone(),
+                graph.clone(),
+                flow_id.clone(),
+                |spec, chosen| {
+                    if let (NodeSpec::Binary { op }, Some(picked)) =
+                        (spec, binary_op_from_label(&chosen))
+                    {
+                        *op = picked;
+                    }
+                },
+            ));
+        }
+        NodeSpec::Resample { mode } => {
+            let mode_label = SharedString::from(resample_mode_label(*mode));
+            let options: Vec<SharedString> = RESAMPLE_MODES
+                .iter()
+                .map(|(_, name)| SharedString::new_static(name))
+                .collect();
+            rows.push(enum_arg(
+                "Mode",
+                mode_label,
+                options,
+                editor.clone(),
+                graph.clone(),
+                flow_id.clone(),
+                |spec, chosen| {
+                    if let (NodeSpec::Resample { mode }, Some(picked)) =
+                        (spec, resample_mode_from_label(&chosen))
+                    {
+                        *mode = picked;
                     }
                 },
             ));
@@ -511,8 +623,10 @@ pub fn rows_for_node(
                 .find(|(id, _)| id.0 == *component_id)
                 .map(|(_, name)| SharedString::from(name.clone()))
                 .unwrap_or_else(|| SharedString::from(format!("id {component_id}")));
-            let options: Vec<SharedString> =
-                components.iter().map(|(_, name)| SharedString::from(name.clone())).collect();
+            let options: Vec<SharedString> = components
+                .iter()
+                .map(|(_, name)| SharedString::from(name.clone()))
+                .collect();
             let id_by_name: std::collections::HashMap<String, u64> = components
                 .into_iter()
                 .map(|(id, name)| (name, id.0))
@@ -623,20 +737,11 @@ pub fn rows_for_node(
         }
         // No editable args.
         NodeSpec::ClockOf
-        | NodeSpec::Abs
-        | NodeSpec::Neg
-        | NodeSpec::Log
         | NodeSpec::Fft
         | NodeSpec::Magnitude
-        | NodeSpec::Add
-        | NodeSpec::Sub
-        | NodeSpec::Mul
         | NodeSpec::Mean
         | NodeSpec::Pack
-        | NodeSpec::Dot
-        | NodeSpec::Zoh
-        | NodeSpec::Linear
-        | NodeSpec::LatestAt => {}
+        | NodeSpec::Dot => {}
     }
 
     rows
@@ -834,7 +939,9 @@ fn format_shape(shape: &SmallVec<[usize; 4]>) -> String {
     }
     let mut s = String::new();
     for (i, d) in shape.iter().enumerate() {
-        if i > 0 { s.push(','); }
+        if i > 0 {
+            s.push(',');
+        }
         s.push_str(&d.to_string());
     }
     s
@@ -848,7 +955,9 @@ fn parse_shape(text: &str) -> Option<SmallVec<[usize; 4]>> {
     let mut out: SmallVec<[usize; 4]> = SmallVec::new();
     for part in trimmed.split(',') {
         let n: usize = part.trim().parse().ok()?;
-        if n == 0 { return None; }
+        if n == 0 {
+            return None;
+        }
         out.push(n);
     }
     Some(out)
@@ -885,7 +994,11 @@ const DTYPES: &[(PrimType, &str)] = &[
 ];
 
 fn dtype_label(t: PrimType) -> &'static str {
-    DTYPES.iter().find(|(d, _)| *d == t).map(|(_, n)| *n).unwrap_or("f64")
+    DTYPES
+        .iter()
+        .find(|(d, _)| *d == t)
+        .map(|(_, n)| *n)
+        .unwrap_or("f64")
 }
 
 fn dtype_from_label(label: &str) -> Option<PrimType> {
@@ -936,4 +1049,85 @@ fn threshold_op_from_label(label: &str) -> Option<ThresholdOp> {
         .iter()
         .find(|(_, name)| *name == label)
         .map(|(o, _)| *o)
+}
+
+const AFFINE_OPS: &[(AffineOp, &str)] = &[(AffineOp::Scale, "Scale"), (AffineOp::Offset, "Offset")];
+
+fn affine_op_label(op: AffineOp) -> &'static str {
+    AFFINE_OPS
+        .iter()
+        .find(|(o, _)| *o == op)
+        .map(|(_, n)| *n)
+        .unwrap_or("Scale")
+}
+
+fn affine_op_from_label(label: &str) -> Option<AffineOp> {
+    AFFINE_OPS
+        .iter()
+        .find(|(_, n)| *n == label)
+        .map(|(o, _)| *o)
+}
+
+const UNARY_OPS: &[(UnaryOp, &str)] = &[
+    (UnaryOp::Abs, "Abs"),
+    (UnaryOp::Neg, "Neg"),
+    (UnaryOp::Log, "Log"),
+    (UnaryOp::Sqrt, "Sqrt"),
+    (UnaryOp::Exp, "Exp"),
+    (UnaryOp::Floor, "Floor"),
+];
+
+fn unary_op_label(op: UnaryOp) -> &'static str {
+    UNARY_OPS
+        .iter()
+        .find(|(o, _)| *o == op)
+        .map(|(_, n)| *n)
+        .unwrap_or("Abs")
+}
+
+fn unary_op_from_label(label: &str) -> Option<UnaryOp> {
+    UNARY_OPS.iter().find(|(_, n)| *n == label).map(|(o, _)| *o)
+}
+
+const BINARY_OPS: &[(BinaryOp, &str)] = &[
+    (BinaryOp::Add, "Add"),
+    (BinaryOp::Sub, "Sub"),
+    (BinaryOp::Mul, "Mul"),
+    (BinaryOp::Div, "Div"),
+];
+
+fn binary_op_label(op: BinaryOp) -> &'static str {
+    BINARY_OPS
+        .iter()
+        .find(|(o, _)| *o == op)
+        .map(|(_, n)| *n)
+        .unwrap_or("Add")
+}
+
+fn binary_op_from_label(label: &str) -> Option<BinaryOp> {
+    BINARY_OPS
+        .iter()
+        .find(|(_, n)| *n == label)
+        .map(|(o, _)| *o)
+}
+
+const RESAMPLE_MODES: &[(ResampleMode, &str)] = &[
+    (ResampleMode::Zoh, "Zero-Order Hold"),
+    (ResampleMode::Linear, "Linear Interp"),
+    (ResampleMode::LatestAt, "Latest At"),
+];
+
+fn resample_mode_label(mode: ResampleMode) -> &'static str {
+    RESAMPLE_MODES
+        .iter()
+        .find(|(m, _)| *m == mode)
+        .map(|(_, n)| *n)
+        .unwrap_or("Zero-Order Hold")
+}
+
+fn resample_mode_from_label(label: &str) -> Option<ResampleMode> {
+    RESAMPLE_MODES
+        .iter()
+        .find(|(_, n)| *n == label)
+        .map(|(m, _)| *m)
 }

@@ -5,8 +5,10 @@
 use metor_proto::types::PrimType;
 use smallvec::SmallVec;
 
-use crate::dynamic::ops::derive::ThresholdOp;
+use crate::dynamic::ops::compose::BinaryOp;
+use crate::dynamic::ops::derive::{AffineOp, ThresholdOp, UnaryOp};
 use crate::dynamic::ops::generators::Waveform;
+use crate::dynamic::ops::resample::ResampleMode;
 use crate::dynamic::tensor::TypedScalar;
 use crate::node_editor::spec::{NodeSpec, NodeSpecKind};
 
@@ -92,21 +94,30 @@ const ONE_VALUE: Arity = Arity::Exact(&[VAL]);
 pub const ALL: &[OpDescriptor] = &[
     // Clocks
     OpDescriptor {
-        kind: NodeSpecKind::FixedRate, label: "Fixed Rate", category: "Clock",
-        inputs: NO_INPUTS, output: CLK,
+        kind: NodeSpecKind::FixedRate,
+        label: "Fixed Rate",
+        category: "Clock",
+        inputs: NO_INPUTS,
+        output: CLK,
         default_spec: || NodeSpec::FixedRate { hz: 100.0 },
         arg_count: 1,
     },
     OpDescriptor {
-        kind: NodeSpecKind::ClockOf, label: "Clock Of", category: "Clock",
-        inputs: ONE_ANY, output: CLK,
+        kind: NodeSpecKind::ClockOf,
+        label: "Clock Of",
+        category: "Clock",
+        inputs: ONE_ANY,
+        output: CLK,
         default_spec: || NodeSpec::ClockOf,
         arg_count: 0,
     },
     // Generators
     OpDescriptor {
-        kind: NodeSpecKind::Waveform, label: "Waveform", category: "Generator",
-        inputs: ONE_CLK, output: F64,
+        kind: NodeSpecKind::Waveform,
+        label: "Waveform",
+        category: "Generator",
+        inputs: ONE_CLK,
+        output: F64,
         default_spec: || NodeSpec::Waveform {
             shape: Waveform::Sin,
             freq: 1.0,
@@ -119,8 +130,11 @@ pub const ALL: &[OpDescriptor] = &[
         arg_count: 6,
     },
     OpDescriptor {
-        kind: NodeSpecKind::Random, label: "Random", category: "Generator",
-        inputs: ONE_CLK, output: F64,
+        kind: NodeSpecKind::Random,
+        label: "Random",
+        category: "Generator",
+        inputs: ONE_CLK,
+        output: F64,
         default_spec: || NodeSpec::Random {
             seed: 1,
             dtype: PrimType::F64,
@@ -130,8 +144,11 @@ pub const ALL: &[OpDescriptor] = &[
         arg_count: 3,
     },
     OpDescriptor {
-        kind: NodeSpecKind::Constant, label: "Constant", category: "Generator",
-        inputs: ONE_CLK, output: F64,
+        kind: NodeSpecKind::Constant,
+        label: "Constant",
+        category: "Generator",
+        inputs: ONE_CLK,
+        output: F64,
         default_spec: || NodeSpec::Constant {
             value: TypedScalar::F64(0.0),
             out_shape: SmallVec::new(),
@@ -139,64 +156,128 @@ pub const ALL: &[OpDescriptor] = &[
         // value, dtype, out_shape
         arg_count: 3,
     },
-    // Derive
+    // Derive — Affine family
     OpDescriptor {
-        kind: NodeSpecKind::Scale, label: "Scale", category: "Derive",
-        inputs: ONE_F64, output: F64,
-        default_spec: || NodeSpec::Scale { k: TypedScalar::F64(1.0) },
+        kind: NodeSpecKind::Affine,
+        label: "Scale",
+        category: "Derive",
+        inputs: ONE_F64,
+        output: F64,
+        default_spec: || NodeSpec::Affine {
+            op: AffineOp::Scale,
+            k: TypedScalar::F64(1.0),
+        },
+        arg_count: 2,
+    },
+    OpDescriptor {
+        kind: NodeSpecKind::Affine,
+        label: "Offset",
+        category: "Derive",
+        inputs: ONE_F64,
+        output: F64,
+        default_spec: || NodeSpec::Affine {
+            op: AffineOp::Offset,
+            k: TypedScalar::F64(0.0),
+        },
+        arg_count: 2,
+    },
+    // Derive — Unary family
+    OpDescriptor {
+        kind: NodeSpecKind::Unary,
+        label: "Abs",
+        category: "Derive",
+        inputs: ONE_F64,
+        output: F64,
+        default_spec: || NodeSpec::Unary { op: UnaryOp::Abs },
         arg_count: 1,
     },
     OpDescriptor {
-        kind: NodeSpecKind::Offset, label: "Offset", category: "Derive",
-        inputs: ONE_F64, output: F64,
-        default_spec: || NodeSpec::Offset { k: TypedScalar::F64(0.0) },
+        kind: NodeSpecKind::Unary,
+        label: "Neg",
+        category: "Derive",
+        inputs: ONE_F64,
+        output: F64,
+        default_spec: || NodeSpec::Unary { op: UnaryOp::Neg },
         arg_count: 1,
     },
     OpDescriptor {
-        kind: NodeSpecKind::Abs, label: "Abs", category: "Derive",
-        inputs: ONE_F64, output: F64,
-        default_spec: || NodeSpec::Abs,
-        arg_count: 0,
+        kind: NodeSpecKind::Unary,
+        label: "Log",
+        category: "Derive",
+        inputs: ONE_F64,
+        output: F64,
+        default_spec: || NodeSpec::Unary { op: UnaryOp::Log },
+        arg_count: 1,
     },
     OpDescriptor {
-        kind: NodeSpecKind::Neg, label: "Neg", category: "Derive",
-        inputs: ONE_F64, output: F64,
-        default_spec: || NodeSpec::Neg,
-        arg_count: 0,
+        kind: NodeSpecKind::Unary,
+        label: "Sqrt",
+        category: "Derive",
+        inputs: ONE_F64,
+        output: F64,
+        default_spec: || NodeSpec::Unary { op: UnaryOp::Sqrt },
+        arg_count: 1,
     },
     OpDescriptor {
-        kind: NodeSpecKind::Log, label: "Log", category: "Derive",
-        inputs: ONE_F64, output: F64,
-        default_spec: || NodeSpec::Log,
-        arg_count: 0,
+        kind: NodeSpecKind::Unary,
+        label: "Exp",
+        category: "Derive",
+        inputs: ONE_F64,
+        output: F64,
+        default_spec: || NodeSpec::Unary { op: UnaryOp::Exp },
+        arg_count: 1,
     },
     OpDescriptor {
-        kind: NodeSpecKind::Window, label: "Window", category: "Derive",
-        inputs: ONE_F64, output: VAL,
+        kind: NodeSpecKind::Unary,
+        label: "Floor",
+        category: "Derive",
+        inputs: ONE_F64,
+        output: F64,
+        default_spec: || NodeSpec::Unary { op: UnaryOp::Floor },
+        arg_count: 1,
+    },
+    OpDescriptor {
+        kind: NodeSpecKind::Window,
+        label: "Window",
+        category: "Derive",
+        inputs: ONE_F64,
+        output: VAL,
         default_spec: || NodeSpec::Window { size: 64 },
         arg_count: 1,
     },
     OpDescriptor {
-        kind: NodeSpecKind::Fft, label: "FFT", category: "Derive",
-        inputs: ONE_VALUE, output: VAL,
+        kind: NodeSpecKind::Fft,
+        label: "FFT",
+        category: "Derive",
+        inputs: ONE_VALUE,
+        output: VAL,
         default_spec: || NodeSpec::Fft,
         arg_count: 0,
     },
     OpDescriptor {
-        kind: NodeSpecKind::Magnitude, label: "Magnitude", category: "Derive",
-        inputs: ONE_VALUE, output: F64,
+        kind: NodeSpecKind::Magnitude,
+        label: "Magnitude",
+        category: "Derive",
+        inputs: ONE_VALUE,
+        output: F64,
         default_spec: || NodeSpec::Magnitude,
         arg_count: 0,
     },
     OpDescriptor {
-        kind: NodeSpecKind::Index, label: "Index", category: "Derive",
-        inputs: ONE_VALUE, output: F64,
+        kind: NodeSpecKind::Index,
+        label: "Index",
+        category: "Derive",
+        inputs: ONE_VALUE,
+        output: F64,
         default_spec: || NodeSpec::Index { index: 0 },
         arg_count: 1,
     },
     OpDescriptor {
-        kind: NodeSpecKind::Threshold, label: "Threshold", category: "Derive",
-        inputs: ONE_VALUE, output: F64,
+        kind: NodeSpecKind::Threshold,
+        label: "Threshold",
+        category: "Derive",
+        inputs: ONE_VALUE,
+        output: F64,
         default_spec: || NodeSpec::Threshold {
             k: TypedScalar::F64(0.0),
             op: ThresholdOp::Gt,
@@ -204,83 +285,145 @@ pub const ALL: &[OpDescriptor] = &[
         // k, op
         arg_count: 2,
     },
-    // Compose
+    // Compose — Binary family
     OpDescriptor {
-        kind: NodeSpecKind::Add, label: "Add", category: "Compose",
-        inputs: TWO_F64, output: F64,
-        default_spec: || NodeSpec::Add,
-        arg_count: 0,
+        kind: NodeSpecKind::Binary,
+        label: "Add",
+        category: "Compose",
+        inputs: TWO_F64,
+        output: F64,
+        default_spec: || NodeSpec::Binary { op: BinaryOp::Add },
+        arg_count: 1,
     },
     OpDescriptor {
-        kind: NodeSpecKind::Sub, label: "Sub", category: "Compose",
-        inputs: TWO_F64, output: F64,
-        default_spec: || NodeSpec::Sub,
-        arg_count: 0,
+        kind: NodeSpecKind::Binary,
+        label: "Sub",
+        category: "Compose",
+        inputs: TWO_F64,
+        output: F64,
+        default_spec: || NodeSpec::Binary { op: BinaryOp::Sub },
+        arg_count: 1,
     },
     OpDescriptor {
-        kind: NodeSpecKind::Mul, label: "Mul", category: "Compose",
-        inputs: TWO_F64, output: F64,
-        default_spec: || NodeSpec::Mul,
-        arg_count: 0,
+        kind: NodeSpecKind::Binary,
+        label: "Mul",
+        category: "Compose",
+        inputs: TWO_F64,
+        output: F64,
+        default_spec: || NodeSpec::Binary { op: BinaryOp::Mul },
+        arg_count: 1,
     },
     OpDescriptor {
-        kind: NodeSpecKind::Mean, label: "Mean", category: "Compose",
-        inputs: Arity::Variadic { kind: F64, min: 1 }, output: F64,
+        kind: NodeSpecKind::Binary,
+        label: "Div",
+        category: "Compose",
+        inputs: TWO_F64,
+        output: F64,
+        default_spec: || NodeSpec::Binary { op: BinaryOp::Div },
+        arg_count: 1,
+    },
+    OpDescriptor {
+        kind: NodeSpecKind::Mean,
+        label: "Mean",
+        category: "Compose",
+        inputs: Arity::Variadic { kind: F64, min: 1 },
+        output: F64,
         default_spec: || NodeSpec::Mean,
         arg_count: 0,
     },
     OpDescriptor {
-        kind: NodeSpecKind::Pack, label: "Pack", category: "Compose",
-        inputs: Arity::Variadic { kind: F64, min: 1 }, output: VAL,
+        kind: NodeSpecKind::Pack,
+        label: "Pack",
+        category: "Compose",
+        inputs: Arity::Variadic { kind: F64, min: 1 },
+        output: VAL,
         default_spec: || NodeSpec::Pack,
         arg_count: 0,
     },
     OpDescriptor {
-        kind: NodeSpecKind::Dot, label: "Dot Product", category: "Compose",
-        inputs: Arity::Exact(&[VAL, VAL]), output: F64,
+        kind: NodeSpecKind::Dot,
+        label: "Dot Product",
+        category: "Compose",
+        inputs: Arity::Exact(&[VAL, VAL]),
+        output: F64,
         default_spec: || NodeSpec::Dot,
         arg_count: 0,
     },
-    // Resample
+    // Resample family
     OpDescriptor {
-        kind: NodeSpecKind::Zoh, label: "Zero-Order Hold", category: "Resample",
-        inputs: VALUE_AND_CLOCK, output: F64,
-        default_spec: || NodeSpec::Zoh,
-        arg_count: 0,
+        kind: NodeSpecKind::Resample,
+        label: "Zero-Order Hold",
+        category: "Resample",
+        inputs: VALUE_AND_CLOCK,
+        output: F64,
+        default_spec: || NodeSpec::Resample {
+            mode: ResampleMode::Zoh,
+        },
+        arg_count: 1,
     },
     OpDescriptor {
-        kind: NodeSpecKind::Linear, label: "Linear Interp", category: "Resample",
-        inputs: VALUE_AND_CLOCK, output: F64,
-        default_spec: || NodeSpec::Linear,
-        arg_count: 0,
+        kind: NodeSpecKind::Resample,
+        label: "Linear Interp",
+        category: "Resample",
+        inputs: VALUE_AND_CLOCK,
+        output: F64,
+        default_spec: || NodeSpec::Resample {
+            mode: ResampleMode::Linear,
+        },
+        arg_count: 1,
     },
     OpDescriptor {
-        kind: NodeSpecKind::LatestAt, label: "Latest At", category: "Resample",
-        inputs: VALUE_AND_CLOCK, output: F64,
-        default_spec: || NodeSpec::LatestAt,
-        arg_count: 0,
+        kind: NodeSpecKind::Resample,
+        label: "Latest At",
+        category: "Resample",
+        inputs: VALUE_AND_CLOCK,
+        output: F64,
+        default_spec: || NodeSpec::Resample {
+            mode: ResampleMode::LatestAt,
+        },
+        arg_count: 1,
     },
     // DB bridges
     OpDescriptor {
-        kind: NodeSpecKind::FromDb, label: "From DB", category: "DB",
-        inputs: NO_INPUTS, output: F64,
+        kind: NodeSpecKind::FromDb,
+        label: "From DB",
+        category: "DB",
+        inputs: NO_INPUTS,
+        output: F64,
         default_spec: || NodeSpec::FromDb { component_id: 0 },
         arg_count: 1,
     },
     OpDescriptor {
-        kind: NodeSpecKind::Persist, label: "Persist", category: "DB",
-        inputs: ONE_VALUE, output: VAL,
-        default_spec: || NodeSpec::Persist { name: String::new() },
+        kind: NodeSpecKind::Persist,
+        label: "Persist",
+        category: "DB",
+        inputs: ONE_VALUE,
+        output: VAL,
+        default_spec: || NodeSpec::Persist {
+            name: String::new(),
+        },
         arg_count: 1,
     },
 ];
 
+/// First descriptor with this `kind`. For family kinds (`Binary`/`Unary`/
+/// `Affine`/`Resample`) this returns whichever variant happens to be listed
+/// first in [`ALL`]; prefer [`descriptor_for`] when you have an actual spec.
 pub fn descriptor(kind: NodeSpecKind) -> &'static OpDescriptor {
     ALL.iter()
         .find(|d| d.kind == kind)
         .expect("every NodeSpecKind has a descriptor")
 }
 
+/// Find the descriptor that corresponds to `spec`. For family variants this
+/// disambiguates by inner op-discriminant (so `Binary { Add }` resolves to
+/// the "Add" descriptor, not "Sub"). Falls back to the first descriptor of
+/// the spec's kind if no descriptor matches the inner op.
 pub fn descriptor_for(spec: &NodeSpec) -> &'static OpDescriptor {
-    descriptor(spec.kind())
+    let kind = spec.kind();
+    let inner = spec.family_op_id();
+    ALL.iter()
+        .find(|d| d.kind == kind && (d.default_spec)().family_op_id() == inner)
+        .or_else(|| ALL.iter().find(|d| d.kind == kind))
+        .expect("every NodeSpec resolves to a descriptor")
 }

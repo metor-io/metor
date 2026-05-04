@@ -74,7 +74,10 @@ pub enum BuildError {
     #[error("expected a value input, got Clock")]
     ExpectedValue,
     #[error("schema mismatch: {a:?} vs {b:?}")]
-    SchemaMismatch { a: ComponentSchema, b: ComponentSchema },
+    SchemaMismatch {
+        a: ComponentSchema,
+        b: ComponentSchema,
+    },
     #[error("composer inputs must share a clock (parent_clock_id mismatch)")]
     ClockMismatch,
     #[error("shapes are not broadcast-compatible: {a:?} vs {b:?}")]
@@ -83,10 +86,7 @@ pub enum BuildError {
         b: SmallVec<[usize; 4]>,
     },
     #[error("{op} does not support dtype {dtype:?}")]
-    UnsupportedDtype {
-        op: &'static str,
-        dtype: PrimType,
-    },
+    UnsupportedDtype { op: &'static str, dtype: PrimType },
     #[error("composer needs at least one input")]
     EmptyInputs,
     #[error("graph contains a cycle")]
@@ -193,6 +193,21 @@ impl NodeGrant<'_> {
             (Timestamp::from_le_bytes(ts_bytes), value)
         })
     }
+
+    /// Number of complete `[Timestamp][value]` messages in this grant.
+    pub fn sample_count(&self) -> usize {
+        self.grant.len() / self.msg_size
+    }
+
+    /// Borrow the `i`-th sample in this grant. Panics if `i >= sample_count`.
+    pub fn sample_at(&self, i: usize) -> (Timestamp, &[u8]) {
+        let chunk = &self.grant[i * self.msg_size..(i + 1) * self.msg_size];
+        let ts_bytes: [u8; 8] = chunk[..size_of::<Timestamp>()]
+            .try_into()
+            .expect("timestamp slice");
+        let value = &chunk[size_of::<Timestamp>()..];
+        (Timestamp::from_le_bytes(ts_bytes), value)
+    }
 }
 
 /// Push a `[Timestamp][value bytes]` message into a ring. Drops on full —
@@ -297,11 +312,15 @@ pub mod op_tag {
     pub const ABS: &[u8] = b"derive.abs";
     pub const NEG: &[u8] = b"derive.neg";
     pub const LOG: &[u8] = b"derive.log";
+    pub const SQRT: &[u8] = b"derive.sqrt";
+    pub const EXP: &[u8] = b"derive.exp";
+    pub const FLOOR: &[u8] = b"derive.floor";
     pub const WINDOW: &[u8] = b"derive.window";
     pub const FFT: &[u8] = b"derive.fft";
     pub const ADD: &[u8] = b"compose.add";
     pub const SUB: &[u8] = b"compose.sub";
     pub const MUL: &[u8] = b"compose.mul";
+    pub const DIV: &[u8] = b"compose.div";
     pub const MEAN: &[u8] = b"compose.mean";
     pub const PACK: &[u8] = b"compose.pack";
     pub const DOT: &[u8] = b"compose.dot";
@@ -326,7 +345,11 @@ pub fn default_ring_bytes(value_bytes: usize) -> usize {
 /// `args` callback should fold every argument into the hasher in a stable
 /// order. We use `std::hash::DefaultHasher` (SipHash) — same family the rest
 /// of the panel uses; the absolute value is opaque, only equality matters.
-pub fn hash_id(tag: &[u8], parents: &[NodeId], args: impl FnOnce(&mut std::collections::hash_map::DefaultHasher)) -> NodeId {
+pub fn hash_id(
+    tag: &[u8],
+    parents: &[NodeId],
+    args: impl FnOnce(&mut std::collections::hash_map::DefaultHasher),
+) -> NodeId {
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     tag.hash(&mut hasher);
     for parent in parents {

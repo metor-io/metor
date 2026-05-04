@@ -135,11 +135,17 @@ pub fn is_float(t: PrimType) -> bool {
 }
 
 pub fn is_signed_int(t: PrimType) -> bool {
-    matches!(t, PrimType::I8 | PrimType::I16 | PrimType::I32 | PrimType::I64)
+    matches!(
+        t,
+        PrimType::I8 | PrimType::I16 | PrimType::I32 | PrimType::I64
+    )
 }
 
 pub fn is_unsigned_int(t: PrimType) -> bool {
-    matches!(t, PrimType::U8 | PrimType::U16 | PrimType::U32 | PrimType::U64)
+    matches!(
+        t,
+        PrimType::U8 | PrimType::U16 | PrimType::U32 | PrimType::U64
+    )
 }
 
 pub fn is_int(t: PrimType) -> bool {
@@ -375,9 +381,34 @@ pub fn write_f64_as(out: &mut Vec<u8>, dtype: PrimType, value: f64) {
     }
 }
 
+/// Cast `value` to `dtype` and write its little-endian bytes at element index
+/// `idx` of a row-major `out` buffer. Mirror of [`read_f64_at`].
+pub fn write_f64_at(out: &mut [u8], dtype: PrimType, idx: usize, value: f64) {
+    let sz = dtype.size();
+    let off = idx * sz;
+    let dst = &mut out[off..off + sz];
+    match dtype {
+        PrimType::U8 => dst[0] = value as u8,
+        PrimType::U16 => dst.copy_from_slice(&(value as u16).to_le_bytes()),
+        PrimType::U32 => dst.copy_from_slice(&(value as u32).to_le_bytes()),
+        PrimType::U64 => dst.copy_from_slice(&(value as u64).to_le_bytes()),
+        PrimType::I8 => dst.copy_from_slice(&(value as i8).to_le_bytes()),
+        PrimType::I16 => dst.copy_from_slice(&(value as i16).to_le_bytes()),
+        PrimType::I32 => dst.copy_from_slice(&(value as i32).to_le_bytes()),
+        PrimType::I64 => dst.copy_from_slice(&(value as i64).to_le_bytes()),
+        PrimType::Bool => dst[0] = (value != 0.0) as u8,
+        PrimType::F32 => dst.copy_from_slice(&(value as f32).to_le_bytes()),
+        PrimType::F64 => dst.copy_from_slice(&value.to_le_bytes()),
+    }
+}
+
 /// Element count from a shape (scalar = 1).
 pub fn shape_elems(shape: &[usize]) -> usize {
-    if shape.is_empty() { 1 } else { shape.iter().product() }
+    if shape.is_empty() {
+        1
+    } else {
+        shape.iter().product()
+    }
 }
 
 #[cfg(test)]

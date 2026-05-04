@@ -14,10 +14,10 @@ use metor_proto::types::ComponentId;
 use crate::inspector::rows::{
     BoolRow, ColorRow, CommandRow, InspectorRow, NavRow, ScalarRow, TextRow,
 };
+use crate::views::list_plot::{ListLinePlot, ListTrace};
 use crate::views::time_series::time_range::TimeRangeBehavior;
 use crate::views::time_series::{LinePlot, Override, Trace};
 use crate::views::viewer_3d::Viewer3d;
-use crate::views::list_plot::{ListLinePlot, ListTrace};
 use crate::views::xy_plot::{XyLinePlot, XyTrace};
 
 use super::{AddBehavior, FieldOverride, InspectorRegistry, builders};

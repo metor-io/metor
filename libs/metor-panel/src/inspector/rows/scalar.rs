@@ -71,7 +71,13 @@ impl ScalarRow {
 fn format_f64_for_dtype(v: f64, dtype: Option<PrimType>) -> String {
     match dtype {
         None | Some(PrimType::F32) | Some(PrimType::F64) => format!("{v}"),
-        Some(PrimType::Bool) => if v != 0.0 { "true".into() } else { "false".into() },
+        Some(PrimType::Bool) => {
+            if v != 0.0 {
+                "true".into()
+            } else {
+                "false".into()
+            }
+        }
         Some(_) => format!("{}", v as i64),
     }
 }

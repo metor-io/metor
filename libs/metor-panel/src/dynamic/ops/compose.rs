@@ -2,11 +2,12 @@
 //! (`parent_clock_id`); use the resampler ops to align mismatched rates.
 //!
 //! Co-clocked inputs have aligned timestamps, so the composer task pulls one
-//! sample from each, asserts the timestamps match, and emits a combined
-//! value. Per-element compute happens in `f64`; output dtype follows NumPy
-//! promotion across inputs and shapes broadcast NumPy-style.
+//! grant from each reader, processes `min(grant_lens)` aligned tuples in
+//! lockstep, and lets any remaining samples in longer grants drop on release.
+//! Per-element compute happens in `f64`; output dtype follows NumPy promotion
+//! across inputs and shapes broadcast NumPy-style.
 
-use std::collections::VecDeque;
+use std::mem::size_of;
 use std::sync::Arc;
 
 use metor_db::{ComponentSchema, disruptor::Disruptor};
@@ -15,11 +16,11 @@ use smallvec::SmallVec;
 
 use crate::dynamic::node::{
     BuildError, DynamicNode, DynamicNodeExt, NodeId, NodeImpl, NodeReader, ValueType,
-    default_ring_bytes, hash_id, op_tag, require_value, write_sample,
+    default_ring_bytes, hash_id, op_tag, require_value,
 };
 use crate::dynamic::tensor::{
     BroadcastIter, broadcast_shape, broadcast_shape_many, promote, promote_many, read_f64_at,
-    shape_elems, write_f64_as,
+    shape_elems, write_f64_at,
 };
 
 fn require_same_clock(nodes: &[Arc<dyn DynamicNode>]) -> Result<NodeId, BuildError> {
@@ -34,73 +35,59 @@ fn require_same_clock(nodes: &[Arc<dyn DynamicNode>]) -> Result<NodeId, BuildErr
 }
 
 /// Align N co-clocked byte streams. For each aligned tuple, calls `encode`
-/// with the per-input `&[u8]` slices (in input order) to fill the output
-/// sample bytes. Heads desyncs drop oldest until aligned.
+/// with the per-input `&[u8]` slices (in input order) and a `&mut [u8]` slot
+/// of `out_value_size` bytes carved out of the output ring's `WriteGrant`.
+///
+/// Inputs share a clock so grant lengths match in steady state. When they
+/// don't (after a stall, slow consumer, etc.) we process `min(grant_lens)`
+/// tuples and let the leftover samples in longer grants drop when the grants
+/// release — lossy by design, no buffering.
 async fn run_aligned_emit(
     mut readers: Vec<NodeReader>,
     output: Disruptor,
-    mut encode: impl FnMut(&[&[u8]], &mut Vec<u8>),
+    out_value_size: usize,
+    mut encode: impl FnMut(&[&[u8]], &mut [u8]),
 ) {
     let n = readers.len();
-    let mut bufs: Vec<VecDeque<(Timestamp, Vec<u8>)>> =
-        (0..n).map(|_| VecDeque::new()).collect();
-    let mut scratch: Vec<u8> = Vec::new();
+    let out_msg_size = size_of::<Timestamp>() + out_value_size;
     loop {
-        for (i, reader) in readers.iter_mut().enumerate() {
-            if bufs[i].is_empty() {
-                let grant = reader.next().await;
-                for (ts, v) in grant.samples() {
-                    bufs[i].push_back((ts, v.to_vec()));
+        // Sequentially await one grant from each reader. Each future borrows
+        // a distinct &mut NodeReader, so the held grants coexist.
+        let mut grants = Vec::with_capacity(n);
+        for r in readers.iter_mut() {
+            grants.push(r.next().await);
+        }
+        let min_count = grants.iter().map(|g| g.sample_count()).min().unwrap_or(0);
+        // `tuple` holds refs into `grants`; both live for this outer iteration.
+        let mut tuple: SmallVec<[&[u8]; 4]> = SmallVec::with_capacity(n);
+        for i in 0..min_count {
+            let mut ts0: Option<Timestamp> = None;
+            tuple.clear();
+            let mut aligned = true;
+            for g in &grants {
+                let (ts, v) = g.sample_at(i);
+                match ts0 {
+                    None => ts0 = Some(ts),
+                    Some(t0) if t0 != ts => {
+                        tracing::warn!(?t0, ?ts, "compose: timestamps drifted; dropping tuple");
+                        aligned = false;
+                        break;
+                    }
+                    Some(_) => {}
                 }
+                tuple.push(v);
             }
-        }
-        realign_heads(&mut bufs);
-        while let Some(ts) = aligned_head(&bufs) {
-            // Pop fronts so we own the bytes for the encode pass.
-            let owned: Vec<Vec<u8>> = (0..n)
-                .map(|i| bufs[i].pop_front().expect("aligned head").1)
-                .collect();
-            let tuple: Vec<&[u8]> = owned.iter().map(Vec::as_slice).collect();
-            scratch.clear();
-            encode(&tuple, &mut scratch);
-            write_sample(&output, ts, &scratch);
-        }
-    }
-}
-
-fn aligned_head(bufs: &[VecDeque<(Timestamp, Vec<u8>)>]) -> Option<Timestamp> {
-    let ts0 = bufs.first()?.front()?.0;
-    bufs.iter()
-        .all(|b| b.front().map(|(ts, _)| *ts) == Some(ts0))
-        .then_some(ts0)
-}
-
-fn realign_heads(bufs: &mut [VecDeque<(Timestamp, Vec<u8>)>]) {
-    loop {
-        let mut min_ts: Option<Timestamp> = None;
-        let mut max_ts: Option<Timestamp> = None;
-        for buf in bufs.iter() {
-            let Some((ts, _)) = buf.front() else {
-                return;
+            if !aligned {
+                continue;
+            }
+            let ts = ts0.expect("at least one input");
+            let Ok(mut wg) = output.try_grant(out_msg_size) else {
+                continue;
             };
-            let ts = *ts;
-            min_ts = Some(min_ts.map_or(ts, |m| if ts.0 < m.0 { ts } else { m }));
-            max_ts = Some(max_ts.map_or(ts, |m| if ts.0 > m.0 { ts } else { m }));
+            wg[..size_of::<Timestamp>()].copy_from_slice(&ts.to_le_bytes());
+            encode(&tuple, &mut wg[size_of::<Timestamp>()..]);
         }
-        let (Some(min_ts), Some(max_ts)) = (min_ts, max_ts) else {
-            return;
-        };
-        if min_ts == max_ts {
-            return;
-        }
-        tracing::warn!(?min_ts, ?max_ts, "compose: timestamps drifted; dropping older sample(s)");
-        for buf in bufs.iter_mut() {
-            if let Some((ts, _)) = buf.front()
-                && ts.0 < max_ts.0
-            {
-                buf.pop_front();
-            }
-        }
+        // Grants drop here; their full ranges are consumed.
     }
 }
 
@@ -119,33 +106,29 @@ fn binary(
     let out_schema = ComponentSchema::new(out_dtype, &out_dim);
     let id = hash_id(tag, &[a.id(), b.id()], |_| {});
     let readers = vec![a.subscribe(), b.subscribe()];
-    let a_size = a_schema.size();
-    let b_size = b_schema.size();
     let a_dtype = a_schema.prim_type;
     let b_dtype = b_schema.prim_type;
     let a_dim_clone: SmallVec<[usize; 4]> = a_schema.dim.clone();
     let b_dim_clone: SmallVec<[usize; 4]> = b_schema.dim.clone();
     let out_dim_clone: SmallVec<[usize; 4]> = out_dim.clone();
+    let out_value_size = out_schema.size();
     Ok(NodeImpl::spawn(
         id,
-        ValueType::Value(out_schema.clone()),
+        ValueType::Value(out_schema),
         Some(clock),
-        default_ring_bytes(out_schema.size()),
+        default_ring_bytes(out_value_size),
         move |output| async move {
             let _a = a;
             let _b = b;
-            run_aligned_emit(readers, output, move |inputs, out| {
+            run_aligned_emit(readers, output, out_value_size, move |inputs, out| {
                 let av = inputs[0];
                 let bv = inputs[1];
-                if av.len() != a_size || bv.len() != b_size {
-                    return;
-                }
                 let it_a = BroadcastIter::new(&a_dim_clone, &out_dim_clone);
                 let it_b = BroadcastIter::new(&b_dim_clone, &out_dim_clone);
-                for (ai, bi) in it_a.zip(it_b) {
+                for (i, (ai, bi)) in it_a.zip(it_b).enumerate() {
                     let x = read_f64_at(av, a_dtype, ai);
                     let y = read_f64_at(bv, b_dtype, bi);
-                    write_f64_as(out, out_dtype, op(x, y));
+                    write_f64_at(out, out_dtype, i, op(x, y));
                 }
             })
             .await;
@@ -153,16 +136,44 @@ fn binary(
     ))
 }
 
-pub fn add(a: Arc<dyn DynamicNode>, b: Arc<dyn DynamicNode>) -> Result<Arc<dyn DynamicNode>, BuildError> {
-    binary(op_tag::ADD, a, b, |x, y| x + y)
+/// Element-wise binary arithmetic operator. Each variant is a separate node
+/// at runtime — the `op_tag` is per-variant so existing serialized graphs
+/// hash to the same `NodeId` after the consolidation refactor.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, facet::Facet)]
+#[repr(u8)]
+pub enum BinaryOp {
+    Add,
+    Sub,
+    Mul,
+    Div,
 }
 
-pub fn sub(a: Arc<dyn DynamicNode>, b: Arc<dyn DynamicNode>) -> Result<Arc<dyn DynamicNode>, BuildError> {
-    binary(op_tag::SUB, a, b, |x, y| x - y)
+impl BinaryOp {
+    pub fn op_tag(self) -> &'static [u8] {
+        match self {
+            BinaryOp::Add => op_tag::ADD,
+            BinaryOp::Sub => op_tag::SUB,
+            BinaryOp::Mul => op_tag::MUL,
+            BinaryOp::Div => op_tag::DIV,
+        }
+    }
+
+    fn apply(self, x: f64, y: f64) -> f64 {
+        match self {
+            BinaryOp::Add => x + y,
+            BinaryOp::Sub => x - y,
+            BinaryOp::Mul => x * y,
+            BinaryOp::Div => x / y,
+        }
+    }
 }
 
-pub fn mul(a: Arc<dyn DynamicNode>, b: Arc<dyn DynamicNode>) -> Result<Arc<dyn DynamicNode>, BuildError> {
-    binary(op_tag::MUL, a, b, |x, y| x * y)
+pub fn binary_op(
+    a: Arc<dyn DynamicNode>,
+    b: Arc<dyn DynamicNode>,
+    op: BinaryOp,
+) -> Result<Arc<dyn DynamicNode>, BuildError> {
+    binary(op.op_tag(), a, b, move |x, y| op.apply(x, y))
 }
 
 /// Element-wise mean of N co-clocked inputs. Output dtype is the float-wide
@@ -171,7 +182,8 @@ pub fn mean(inputs: Vec<Arc<dyn DynamicNode>>) -> Result<Arc<dyn DynamicNode>, B
     if inputs.is_empty() {
         return Err(BuildError::EmptyInputs);
     }
-    let schemas: Vec<ComponentSchema> = inputs.iter().map(require_value).collect::<Result<_, _>>()?;
+    let schemas: Vec<ComponentSchema> =
+        inputs.iter().map(require_value).collect::<Result<_, _>>()?;
     let clock = require_same_clock(&inputs)?;
     // Float-promote so int/int produces a float (matches NumPy's mean).
     let mut promoted = promote_many(schemas.iter().map(|s| s.prim_type));
@@ -187,33 +199,30 @@ pub fn mean(inputs: Vec<Arc<dyn DynamicNode>>) -> Result<Arc<dyn DynamicNode>, B
     let readers: Vec<NodeReader> = inputs.iter().map(|n| n.subscribe()).collect();
     let in_dims: Vec<SmallVec<[usize; 4]>> = schemas.iter().map(|s| s.dim.clone()).collect();
     let in_dtypes: Vec<PrimType> = schemas.iter().map(|s| s.prim_type).collect();
-    let in_sizes: Vec<usize> = schemas.iter().map(|s| s.size()).collect();
     let out_dim_clone = out_dim.clone();
     let out_total = shape_elems(&out_dim);
+    let out_value_size = out_schema.size();
     Ok(NodeImpl::spawn(
         id,
-        ValueType::Value(out_schema.clone()),
+        ValueType::Value(out_schema),
         Some(clock),
-        default_ring_bytes(out_schema.size()),
+        default_ring_bytes(out_value_size),
         move |output| async move {
             let _inputs = inputs;
             let mut accum: Vec<f64> = vec![0.0; out_total];
-            run_aligned_emit(readers, output, move |inputs_bytes, out| {
+            run_aligned_emit(readers, output, out_value_size, move |inputs_bytes, out| {
                 for v in accum.iter_mut() {
                     *v = 0.0;
                 }
                 for k in 0..n_inputs {
                     let bytes = inputs_bytes[k];
-                    if bytes.len() != in_sizes[k] {
-                        return;
-                    }
                     let it = BroadcastIter::new(&in_dims[k], &out_dim_clone);
                     for (out_idx, src_idx) in it.enumerate() {
                         accum[out_idx] += read_f64_at(bytes, in_dtypes[k], src_idx);
                     }
                 }
-                for v in accum.iter() {
-                    write_f64_as(out, promoted, *v * inv_n);
+                for (i, v) in accum.iter().enumerate() {
+                    write_f64_at(out, promoted, i, *v * inv_n);
                 }
             })
             .await;
@@ -227,7 +236,10 @@ pub fn mean(inputs: Vec<Arc<dyn DynamicNode>>) -> Result<Arc<dyn DynamicNode>, B
 /// The output is float-promoted regardless of input dtype because the sum
 /// of int products can easily overflow narrow int types (matches NumPy's
 /// `np.dot` widening for ints).
-pub fn dot(a: Arc<dyn DynamicNode>, b: Arc<dyn DynamicNode>) -> Result<Arc<dyn DynamicNode>, BuildError> {
+pub fn dot(
+    a: Arc<dyn DynamicNode>,
+    b: Arc<dyn DynamicNode>,
+) -> Result<Arc<dyn DynamicNode>, BuildError> {
     let a_schema = require_value(&a)?;
     let b_schema = require_value(&b)?;
     if a_schema.prim_type == PrimType::Bool || b_schema.prim_type == PrimType::Bool {
@@ -245,27 +257,23 @@ pub fn dot(a: Arc<dyn DynamicNode>, b: Arc<dyn DynamicNode>) -> Result<Arc<dyn D
     let out_schema = ComponentSchema::new(out_dtype, &[]);
     let id = hash_id(op_tag::DOT, &[a.id(), b.id()], |_| {});
     let readers = vec![a.subscribe(), b.subscribe()];
-    let a_size = a_schema.size();
-    let b_size = b_schema.size();
     let a_dtype = a_schema.prim_type;
     let b_dtype = b_schema.prim_type;
     let a_dim_clone: SmallVec<[usize; 4]> = a_schema.dim.clone();
     let b_dim_clone: SmallVec<[usize; 4]> = b_schema.dim.clone();
     let common_shape_clone = common_shape.clone();
+    let out_value_size = out_schema.size();
     Ok(NodeImpl::spawn(
         id,
-        ValueType::Value(out_schema.clone()),
+        ValueType::Value(out_schema),
         Some(clock),
-        default_ring_bytes(out_schema.size()),
+        default_ring_bytes(out_value_size),
         move |output| async move {
             let _a = a;
             let _b = b;
-            run_aligned_emit(readers, output, move |inputs, out| {
+            run_aligned_emit(readers, output, out_value_size, move |inputs, out| {
                 let av = inputs[0];
                 let bv = inputs[1];
-                if av.len() != a_size || bv.len() != b_size {
-                    return;
-                }
                 let it_a = BroadcastIter::new(&a_dim_clone, &common_shape_clone);
                 let it_b = BroadcastIter::new(&b_dim_clone, &common_shape_clone);
                 let mut sum: f64 = 0.0;
@@ -274,7 +282,7 @@ pub fn dot(a: Arc<dyn DynamicNode>, b: Arc<dyn DynamicNode>) -> Result<Arc<dyn D
                     let y = read_f64_at(bv, b_dtype, bi);
                     sum += x * y;
                 }
-                write_f64_as(out, out_dtype, sum);
+                write_f64_at(out, out_dtype, 0, sum);
             })
             .await;
         },
@@ -288,7 +296,8 @@ pub fn pack(inputs: Vec<Arc<dyn DynamicNode>>) -> Result<Arc<dyn DynamicNode>, B
     if inputs.is_empty() {
         return Err(BuildError::EmptyInputs);
     }
-    let schemas: Vec<ComponentSchema> = inputs.iter().map(require_value).collect::<Result<_, _>>()?;
+    let schemas: Vec<ComponentSchema> =
+        inputs.iter().map(require_value).collect::<Result<_, _>>()?;
     let clock = require_same_clock(&inputs)?;
     let promoted = promote_many(schemas.iter().map(|s| s.prim_type));
     let inner_dim = broadcast_shape_many(schemas.iter().map(|s| s.dim.clone()))?;
@@ -302,25 +311,24 @@ pub fn pack(inputs: Vec<Arc<dyn DynamicNode>>) -> Result<Arc<dyn DynamicNode>, B
     let readers: Vec<NodeReader> = inputs.iter().map(|n| n.subscribe()).collect();
     let in_dims: Vec<SmallVec<[usize; 4]>> = schemas.iter().map(|s| s.dim.clone()).collect();
     let in_dtypes: Vec<PrimType> = schemas.iter().map(|s| s.prim_type).collect();
-    let in_sizes: Vec<usize> = schemas.iter().map(|s| s.size()).collect();
     let inner_dim_clone = inner_dim.clone();
+    let inner_size = shape_elems(&inner_dim);
+    let out_value_size = out_schema.size();
     Ok(NodeImpl::spawn(
         id,
-        ValueType::Value(out_schema.clone()),
+        ValueType::Value(out_schema),
         Some(clock),
-        default_ring_bytes(out_schema.size()),
+        default_ring_bytes(out_value_size),
         move |output| async move {
             let _inputs = inputs;
-            run_aligned_emit(readers, output, move |inputs_bytes, out| {
+            run_aligned_emit(readers, output, out_value_size, move |inputs_bytes, out| {
                 for k in 0..n {
                     let bytes = inputs_bytes[k];
-                    if bytes.len() != in_sizes[k] {
-                        return;
-                    }
+                    let base = k * inner_size;
                     let it = BroadcastIter::new(&in_dims[k], &inner_dim_clone);
-                    for src_idx in it {
+                    for (j, src_idx) in it.enumerate() {
                         let v = read_f64_at(bytes, in_dtypes[k], src_idx);
-                        write_f64_as(out, promoted, v);
+                        write_f64_at(out, promoted, base + j, v);
                     }
                 }
             })

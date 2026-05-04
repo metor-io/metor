@@ -6,6 +6,9 @@ use smallvec::SmallVec;
 
 use crate::dynamic::node::{DynamicNodeExt, ValueType};
 use crate::dynamic::ops;
+use crate::dynamic::ops::compose::BinaryOp;
+use crate::dynamic::ops::derive::{AffineOp, UnaryOp};
+use crate::dynamic::ops::resample::ResampleMode;
 use crate::dynamic::tensor::TypedScalar;
 
 // Test-only convenience wrappers around the dtype/shape-aware generator
@@ -24,7 +27,15 @@ fn waveform_f64(
     amplitude: f64,
     phase: f64,
 ) -> Result<std::sync::Arc<dyn crate::dynamic::DynamicNode>, crate::dynamic::BuildError> {
-    ops::generators::waveform(clock, shape, freq, amplitude, phase, PrimType::F64, SmallVec::new())
+    ops::generators::waveform(
+        clock,
+        shape,
+        freq,
+        amplitude,
+        phase,
+        PrimType::F64,
+        SmallVec::new(),
+    )
 }
 
 #[allow(dead_code)]
@@ -63,15 +74,10 @@ async fn drain_f64(
 async fn sin_chain_emits_expected_values() {
     let clock = ops::clock::fixed_rate(200.0).unwrap();
     assert!(matches!(clock.value_type(), ValueType::Clock));
-    let sin = waveform_f64(
-        clock,
-        ops::generators::Waveform::Sin,
-        1.0,
-        1.0,
-        0.0,
-    )
-    .expect("sin builds");
-    let scaled = ops::derive::scale(sin, TypedScalar::F64(2.0)).expect("scale builds");
+    let sin =
+        waveform_f64(clock, ops::generators::Waveform::Sin, 1.0, 1.0, 0.0).expect("sin builds");
+    let scaled =
+        ops::derive::affine(sin, AffineOp::Scale, TypedScalar::F64(2.0)).expect("scale builds");
 
     let samples = drain_f64(&scaled, 32).await;
     for (ts, v) in &samples {
@@ -88,23 +94,9 @@ async fn sin_chain_emits_expected_values() {
 async fn compose_clock_mismatch_errors() {
     let clk_a = ops::clock::fixed_rate(100.0).unwrap();
     let clk_b = ops::clock::fixed_rate(200.0).unwrap();
-    let a = waveform_f64(
-        clk_a,
-        ops::generators::Waveform::Sin,
-        1.0,
-        1.0,
-        0.0,
-    )
-    .unwrap();
-    let b = waveform_f64(
-        clk_b,
-        ops::generators::Waveform::Sin,
-        1.0,
-        1.0,
-        0.0,
-    )
-    .unwrap();
-    let err = match ops::compose::add(a, b) {
+    let a = waveform_f64(clk_a, ops::generators::Waveform::Sin, 1.0, 1.0, 0.0).unwrap();
+    let b = waveform_f64(clk_b, ops::generators::Waveform::Sin, 1.0, 1.0, 0.0).unwrap();
+    let err = match ops::compose::binary_op(a, b, BinaryOp::Add) {
         Ok(_) => panic!("must reject mismatched clocks"),
         Err(e) => e,
     };
@@ -116,7 +108,7 @@ async fn compose_add_is_co_clocked() {
     let clock = ops::clock::fixed_rate(200.0).unwrap();
     let a = const_f64(clock.clone(), 3.0).unwrap();
     let b = const_f64(clock, 4.0).unwrap();
-    let sum = ops::compose::add(a, b).unwrap();
+    let sum = ops::compose::binary_op(a, b, BinaryOp::Add).unwrap();
     let samples = drain_f64(&sum, 16).await;
     for (_, v) in &samples {
         assert!((v - 7.0).abs() < 1e-12);
@@ -127,14 +119,7 @@ async fn compose_add_is_co_clocked() {
 async fn window_buffers_recent_samples() {
     use crate::dynamic::node::DynamicNodeExt;
     let clock = ops::clock::fixed_rate(200.0).unwrap();
-    let sin = waveform_f64(
-        clock,
-        ops::generators::Waveform::Sin,
-        1.0,
-        1.0,
-        0.0,
-    )
-    .unwrap();
+    let sin = waveform_f64(clock, ops::generators::Waveform::Sin, 1.0, 1.0, 0.0).unwrap();
     // Subscribe to the input *before* building the window so both readers
     // start at the same head of the disruptor.
     let mut sin_reader = sin.subscribe();
@@ -294,10 +279,7 @@ async fn fft_impulse_has_flat_magnitude() {
                 .collect();
             // Impulse → flat magnitude spectrum, every bin = 1.
             for (k, m) in bins.iter().enumerate() {
-                assert!(
-                    (m - 1.0).abs() < 1e-9,
-                    "bin {k}: expected 1.0, got {m}"
-                );
+                assert!((m - 1.0).abs() < 1e-9, "bin {k}: expected 1.0, got {m}");
             }
             got += 1;
             if got == 4 {
@@ -358,7 +340,7 @@ async fn zoh_resamples_constant_input() {
     let slow = ops::clock::fixed_rate(50.0).unwrap();
     let fast = ops::clock::fixed_rate(400.0).unwrap();
     let src = const_f64(slow, 1.5).unwrap();
-    let resampled = ops::resample::zoh(src, fast).unwrap();
+    let resampled = ops::resample::resample(src, fast, ResampleMode::Zoh).unwrap();
     let samples = drain_f64(&resampled, 32).await;
     for (_, v) in &samples {
         assert!((v - 1.5).abs() < 1e-12);
@@ -411,7 +393,7 @@ async fn add_promotes_f32_and_f64_to_f64() {
     let clock = ops::clock::fixed_rate(200.0).unwrap();
     let a = const_typed(clock.clone(), TypedScalar::F32(1.5), SmallVec::new()).unwrap();
     let b = const_typed(clock, TypedScalar::F64(2.25), SmallVec::new()).unwrap();
-    let sum = ops::compose::add(a, b).unwrap();
+    let sum = ops::compose::binary_op(a, b, BinaryOp::Add).unwrap();
     let schema = match sum.value_type() {
         ValueType::Value(s) => s,
         _ => panic!(),
@@ -434,7 +416,7 @@ async fn add_broadcasts_scalar_to_vector() {
     )
     .unwrap();
     let scalar = const_f64(clock, 1.0).unwrap();
-    let sum = ops::compose::add(vec_node, scalar).unwrap();
+    let sum = ops::compose::binary_op(vec_node, scalar, BinaryOp::Add).unwrap();
     let schema = match sum.value_type() {
         ValueType::Value(s) => s.clone(),
         _ => panic!(),
@@ -455,7 +437,9 @@ async fn add_broadcasts_scalar_to_vector() {
                 assert!((v - 3.0).abs() < 1e-12);
             }
             got += 1;
-            if got == 4 { break; }
+            if got == 4 {
+                break;
+            }
         }
     }
 }
@@ -469,13 +453,8 @@ async fn add_broadcasts_outer_product_shape() {
         SmallVec::from_slice(&[1, 3]),
     )
     .unwrap();
-    let b = const_typed(
-        clock,
-        TypedScalar::F64(10.0),
-        SmallVec::from_slice(&[4, 1]),
-    )
-    .unwrap();
-    let sum = ops::compose::add(a, b).unwrap();
+    let b = const_typed(clock, TypedScalar::F64(10.0), SmallVec::from_slice(&[4, 1])).unwrap();
+    let sum = ops::compose::binary_op(a, b, BinaryOp::Add).unwrap();
     let schema = match sum.value_type() {
         ValueType::Value(s) => s.clone(),
         _ => panic!(),
@@ -500,7 +479,7 @@ async fn add_broadcasts_outer_product_shape() {
 async fn scale_promotes_int_input_with_f64_arg() {
     let clock = ops::clock::fixed_rate(200.0).unwrap();
     let src = const_typed(clock, TypedScalar::I32(4), SmallVec::new()).unwrap();
-    let scaled = ops::derive::scale(src, TypedScalar::F64(2.5)).unwrap();
+    let scaled = ops::derive::affine(src, AffineOp::Scale, TypedScalar::F64(2.5)).unwrap();
     let schema = match scaled.value_type() {
         ValueType::Value(s) => s,
         _ => panic!(),
@@ -522,18 +501,21 @@ async fn add_rejects_unbroadcastable_shapes() {
     )
     .unwrap();
     let b = const_typed(clock, TypedScalar::F64(1.0), SmallVec::from_slice(&[4])).unwrap();
-    let err = match ops::compose::add(a, b) {
+    let err = match ops::compose::binary_op(a, b, BinaryOp::Add) {
         Ok(_) => panic!("must reject"),
         Err(e) => e,
     };
-    assert!(matches!(err, crate::dynamic::BuildError::BroadcastMismatch { .. }));
+    assert!(matches!(
+        err,
+        crate::dynamic::BuildError::BroadcastMismatch { .. }
+    ));
 }
 
 #[stellarator::test]
 async fn neg_rejects_unsigned_dtype() {
     let clock = ops::clock::fixed_rate(100.0).unwrap();
     let src = const_typed(clock, TypedScalar::U8(5), SmallVec::new()).unwrap();
-    let err = match ops::derive::neg(src) {
+    let err = match ops::derive::unary(src, UnaryOp::Neg) {
         Ok(_) => panic!("must reject u8"),
         Err(e) => e,
     };
@@ -545,7 +527,6 @@ async fn neg_rejects_unsigned_dtype() {
 
 #[stellarator::test]
 async fn magnitude_reduces_vector_to_l2_norm() {
-    use crate::dynamic::node::DynamicNodeExt;
     let clock = ops::clock::fixed_rate(200.0).unwrap();
     // Pack [3.0, 4.0] → expected magnitude = 5.0.
     let a = const_f64(clock.clone(), 3.0).unwrap();
@@ -597,7 +578,10 @@ async fn magnitude_rejects_bool() {
     };
     assert!(matches!(
         err,
-        crate::dynamic::BuildError::UnsupportedDtype { op: "magnitude", .. }
+        crate::dynamic::BuildError::UnsupportedDtype {
+            op: "magnitude",
+            ..
+        }
     ));
 }
 
@@ -695,11 +679,15 @@ async fn index_preserves_int_dtype() {
     while got < 4 {
         let grant = reader.next().await;
         for (_, value) in grant.samples() {
-            if value.len() != 4 { continue; }
+            if value.len() != 4 {
+                continue;
+            }
             let v = i32::from_le_bytes(value.try_into().unwrap());
             assert_eq!(v, 11);
             got += 1;
-            if got == 4 { break; }
+            if got == 4 {
+                break;
+            }
         }
     }
 }
@@ -725,8 +713,18 @@ async fn threshold_emits_one_above_zero_below() {
     let clock = ops::clock::fixed_rate(200.0).unwrap();
     let above = const_f64(clock.clone(), 5.0).unwrap();
     let below = const_f64(clock, -1.0).unwrap();
-    let above_t = ops::derive::threshold(above, TypedScalar::F64(2.0), crate::dynamic::ops::derive::ThresholdOp::Gt).unwrap();
-    let below_t = ops::derive::threshold(below, TypedScalar::F64(2.0), crate::dynamic::ops::derive::ThresholdOp::Gt).unwrap();
+    let above_t = ops::derive::threshold(
+        above,
+        TypedScalar::F64(2.0),
+        crate::dynamic::ops::derive::ThresholdOp::Gt,
+    )
+    .unwrap();
+    let below_t = ops::derive::threshold(
+        below,
+        TypedScalar::F64(2.0),
+        crate::dynamic::ops::derive::ThresholdOp::Gt,
+    )
+    .unwrap();
     let above_samples = drain_f64(&above_t, 4).await;
     for (_, v) in &above_samples {
         assert_eq!(*v, 1.0);
@@ -746,7 +744,12 @@ async fn threshold_preserves_input_shape() {
     let b = const_f64(clock.clone(), 5.0).unwrap();
     let c = const_f64(clock, 3.0).unwrap();
     let packed = ops::compose::pack(vec![a, b, c]).unwrap();
-    let t = ops::derive::threshold(packed, TypedScalar::F64(2.0), crate::dynamic::ops::derive::ThresholdOp::Gt).unwrap();
+    let t = ops::derive::threshold(
+        packed,
+        TypedScalar::F64(2.0),
+        crate::dynamic::ops::derive::ThresholdOp::Gt,
+    )
+    .unwrap();
     let schema = match t.value_type() {
         ValueType::Value(s) => s.clone(),
         _ => panic!(),
@@ -756,7 +759,9 @@ async fn threshold_preserves_input_shape() {
     let mut reader = t.subscribe();
     let grant = reader.next().await;
     for (_, value) in grant.samples() {
-        if value.len() != 24 { continue; }
+        if value.len() != 24 {
+            continue;
+        }
         let bins: Vec<f64> = value
             .chunks_exact(8)
             .map(|c| f64::from_le_bytes(c.try_into().unwrap()))
@@ -766,7 +771,12 @@ async fn threshold_preserves_input_shape() {
     }
 }
 
-async fn check_threshold(x: f64, op: crate::dynamic::ops::derive::ThresholdOp, k: f64, expected: f64) {
+async fn check_threshold(
+    x: f64,
+    op: crate::dynamic::ops::derive::ThresholdOp,
+    k: f64,
+    expected: f64,
+) {
     let clock = ops::clock::fixed_rate(200.0).unwrap();
     let src = const_f64(clock, x).unwrap();
     let node = ops::derive::threshold(src, TypedScalar::F64(k), op).unwrap();
@@ -817,13 +827,20 @@ async fn threshold_le_above_emits_zero() {
 async fn threshold_rejects_bool_input() {
     let clock = ops::clock::fixed_rate(100.0).unwrap();
     let src = const_typed(clock, TypedScalar::Bool(true), SmallVec::new()).unwrap();
-    let err = match ops::derive::threshold(src, TypedScalar::F64(0.5), crate::dynamic::ops::derive::ThresholdOp::Gt) {
+    let err = match ops::derive::threshold(
+        src,
+        TypedScalar::F64(0.5),
+        crate::dynamic::ops::derive::ThresholdOp::Gt,
+    ) {
         Ok(_) => panic!("must reject bool"),
         Err(e) => e,
     };
     assert!(matches!(
         err,
-        crate::dynamic::BuildError::UnsupportedDtype { op: "threshold", .. }
+        crate::dynamic::BuildError::UnsupportedDtype {
+            op: "threshold",
+            ..
+        }
     ));
 }
 
@@ -831,13 +848,8 @@ async fn threshold_rejects_bool_input() {
 async fn zoh_passes_through_typed_vector_bytes() {
     let slow = ops::clock::fixed_rate(50.0).unwrap();
     let fast = ops::clock::fixed_rate(400.0).unwrap();
-    let src = const_typed(
-        slow,
-        TypedScalar::F32(3.5),
-        SmallVec::from_slice(&[3]),
-    )
-    .unwrap();
-    let resampled = ops::resample::zoh(src, fast).unwrap();
+    let src = const_typed(slow, TypedScalar::F32(3.5), SmallVec::from_slice(&[3])).unwrap();
+    let resampled = ops::resample::resample(src, fast, ResampleMode::Zoh).unwrap();
     let schema = match resampled.value_type() {
         ValueType::Value(s) => s.clone(),
         _ => panic!(),
@@ -858,7 +870,9 @@ async fn zoh_passes_through_typed_vector_bytes() {
                 assert!((v - 3.5).abs() < 1e-6);
             }
             got += 1;
-            if got == 4 { break; }
+            if got == 4 {
+                break;
+            }
         }
     }
 }

@@ -913,7 +913,9 @@ fn plan_trace(
     if let (
         AxisSource::LatestSampleIndex { len: x_len },
         AxisSource::LatestSampleElements {
-            component, len: y_len, ..
+            component,
+            len: y_len,
+            ..
         },
     ) = (&trace.x, &trace.y)
     {
@@ -1004,10 +1006,7 @@ fn plan_trace(
         // would invent a cross-component pair `(X[last_x], Y[cap])`
         // when nodes have unequal fill rates (24-byte Vec3 seals at
         // ~1.4M while paired Scalar seals at 4M).
-        let extend_boundaries = matches!(
-            (&trace.x, &trace.y),
-            (AxisSource::Timestamps, _),
-        );
+        let extend_boundaries = matches!((&trace.x, &trace.y), (AxisSource::Timestamps, _),);
         let (ext_start_idx, ext_end_idx) = if extend_boundaries {
             (
                 pair.y.visible_start().saturating_sub(1),
@@ -1105,25 +1104,14 @@ fn upload_pair(
     let epoch_x = cache.epoch_x.unwrap_or(0.0);
 
     materialize_axis(
-        x_source,
-        x_node,
-        lod_stride,
-        lod_start,
-        lod_end,
-        epoch_x,
-        scratch_x,
+        x_source, x_node, lod_stride, lod_start, lod_end, epoch_x, scratch_x,
     );
     materialize_axis(
-        y_source,
-        y_node,
-        lod_stride,
-        lod_start,
-        lod_end,
+        y_source, y_node, lod_stride, lod_start, lod_end,
         // Y axis is never epoch-shifted on the GPU; data magnitudes are
         // expected to be reasonable. (If this ever bites, route Y through
         // the same epoch_y mechanism as X.)
-        0.0,
-        scratch_y,
+        0.0, scratch_y,
     );
 
     let byte_offset = cache.cursor as u64 * 4;
@@ -1638,8 +1626,6 @@ fn convert_latest_sample_strided(
         PrimType::U64 => fill::<u64>(sample_bytes, len, lod_stride, prim_size, out),
         PrimType::U32 => fill::<u32>(sample_bytes, len, lod_stride, prim_size, out),
         PrimType::U16 => fill::<u16>(sample_bytes, len, lod_stride, prim_size, out),
-        PrimType::U8 | PrimType::Bool => {
-            fill::<u8>(sample_bytes, len, lod_stride, prim_size, out)
-        }
+        PrimType::U8 | PrimType::Bool => fill::<u8>(sample_bytes, len, lod_stride, prim_size, out),
     }
 }

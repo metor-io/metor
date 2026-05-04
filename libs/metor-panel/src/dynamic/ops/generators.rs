@@ -71,7 +71,9 @@ pub fn waveform(
         amplitude.to_bits().hash(h);
         phase.to_bits().hash(h);
         (dtype as u8).hash(h);
-        for d in &out_shape { d.hash(h); }
+        for d in &out_shape {
+            d.hash(h);
+        }
     });
     let schema = schema_from(dtype, &out_shape);
     let parent_clock = clock.parent_clock_id();
@@ -115,7 +117,9 @@ pub fn random(
     let id = hash_id(op_tag::RANDOM, &[clock.id()], |h| {
         seed.hash(h);
         (dtype as u8).hash(h);
-        for d in &out_shape { d.hash(h); }
+        for d in &out_shape {
+            d.hash(h);
+        }
     });
     let schema = schema_from(dtype, &out_shape);
     let parent_clock = clock.parent_clock_id();
@@ -162,7 +166,9 @@ pub fn constant(
     let dtype = value.dtype();
     let id = hash_id(op_tag::CONSTANT, &[clock.id()], |h| {
         value.hash(h);
-        for d in &out_shape { d.hash(h); }
+        for d in &out_shape {
+            d.hash(h);
+        }
     });
     let schema = schema_from(dtype, &out_shape);
     let parent_clock = clock.parent_clock_id();

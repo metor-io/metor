@@ -14,15 +14,19 @@ use metor_db::DB;
 use metor_proto::types::{ComponentId, PrimType};
 use smallvec::SmallVec;
 
-use crate::dynamic::{BuildError, DynamicNode, NodeId, hash_id, op_tag, ops};
-use crate::dynamic::ops::derive::ThresholdOp;
+use crate::dynamic::ops::compose::BinaryOp;
+use crate::dynamic::ops::derive::{AffineOp, ThresholdOp, UnaryOp};
 use crate::dynamic::ops::generators::Waveform;
+use crate::dynamic::ops::resample::ResampleMode;
 use crate::dynamic::tensor::TypedScalar;
+use crate::dynamic::{BuildError, DynamicNode, NodeId, hash_id, ops};
 
 #[derive(Clone, Debug, PartialEq, facet::Facet)]
 #[repr(u8)]
 pub enum NodeSpec {
-    FixedRate { hz: f64 },
+    FixedRate {
+        hz: f64,
+    },
     ClockOf,
     Waveform {
         shape: Waveform,
@@ -41,38 +45,68 @@ pub enum NodeSpec {
         value: TypedScalar,
         out_shape: SmallVec<[usize; 4]>,
     },
-    Scale { k: TypedScalar },
-    Offset { k: TypedScalar },
-    Abs,
-    Neg,
-    Log,
-    Window { size: usize },
+    /// Affine-with-constant: `x * k` (Scale) or `x + k` (Offset).
+    Affine {
+        op: AffineOp,
+        k: TypedScalar,
+    },
+    /// Single-input unary math: Abs/Neg/Log/Sqrt/Exp/Floor.
+    Unary {
+        op: UnaryOp,
+    },
+    Window {
+        size: usize,
+    },
     Fft,
     Magnitude,
-    Index { index: usize },
-    Threshold { k: TypedScalar, op: ThresholdOp },
-    Add,
-    Sub,
-    Mul,
+    Index {
+        index: usize,
+    },
+    Threshold {
+        k: TypedScalar,
+        op: ThresholdOp,
+    },
+    /// Two-input element-wise arithmetic: Add/Sub/Mul/Div.
+    Binary {
+        op: BinaryOp,
+    },
     Mean,
     Pack,
     Dot,
-    Zoh,
-    Linear,
-    LatestAt,
-    FromDb { component_id: u64 },
-    Persist { name: String },
+    /// Resample onto a clock: Zoh / Linear / LatestAt.
+    Resample {
+        mode: ResampleMode,
+    },
+    FromDb {
+        component_id: u64,
+    },
+    Persist {
+        name: String,
+    },
 }
 
 /// Compact discriminant used to key things off a spec without comparing args.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum NodeSpecKind {
-    FixedRate, ClockOf,
-    Waveform, Random, Constant,
-    Scale, Offset, Abs, Neg, Log, Window, Fft, Magnitude, Index, Threshold,
-    Add, Sub, Mul, Mean, Pack, Dot,
-    Zoh, Linear, LatestAt,
-    FromDb, Persist,
+    FixedRate,
+    ClockOf,
+    Waveform,
+    Random,
+    Constant,
+    Affine,
+    Unary,
+    Window,
+    Fft,
+    Magnitude,
+    Index,
+    Threshold,
+    Binary,
+    Mean,
+    Pack,
+    Dot,
+    Resample,
+    FromDb,
+    Persist,
 }
 
 impl NodeSpec {
@@ -84,31 +118,39 @@ impl NodeSpec {
             Waveform { .. } => NodeSpecKind::Waveform,
             Random { .. } => NodeSpecKind::Random,
             Constant { .. } => NodeSpecKind::Constant,
-            Scale { .. } => NodeSpecKind::Scale,
-            Offset { .. } => NodeSpecKind::Offset,
-            Abs => NodeSpecKind::Abs,
-            Neg => NodeSpecKind::Neg,
-            Log => NodeSpecKind::Log,
+            Affine { .. } => NodeSpecKind::Affine,
+            Unary { .. } => NodeSpecKind::Unary,
             Window { .. } => NodeSpecKind::Window,
             Fft => NodeSpecKind::Fft,
             Magnitude => NodeSpecKind::Magnitude,
             Index { .. } => NodeSpecKind::Index,
             Threshold { .. } => NodeSpecKind::Threshold,
-            Add => NodeSpecKind::Add,
-            Sub => NodeSpecKind::Sub,
-            Mul => NodeSpecKind::Mul,
+            Binary { .. } => NodeSpecKind::Binary,
             Mean => NodeSpecKind::Mean,
             Pack => NodeSpecKind::Pack,
             Dot => NodeSpecKind::Dot,
-            Zoh => NodeSpecKind::Zoh,
-            Linear => NodeSpecKind::Linear,
-            LatestAt => NodeSpecKind::LatestAt,
+            Resample { .. } => NodeSpecKind::Resample,
             FromDb { .. } => NodeSpecKind::FromDb,
             Persist { .. } => NodeSpecKind::Persist,
         }
     }
 
+    /// Inner op-discriminant for family variants (`Affine`/`Unary`/`Binary`/
+    /// `Resample`). Used by the editor registry to disambiguate descriptors
+    /// that share a [`NodeSpecKind`]. Returns `None` for non-family variants.
+    pub fn family_op_id(&self) -> Option<u8> {
+        use NodeSpec::*;
+        match self {
+            Affine { op, .. } => Some(*op as u8),
+            Unary { op } => Some(*op as u8),
+            Binary { op } => Some(*op as u8),
+            Resample { mode } => Some(*mode as u8),
+            _ => None,
+        }
+    }
+
     pub fn op_tag(&self) -> &'static [u8] {
+        use crate::dynamic::op_tag;
         use NodeSpec::*;
         match self {
             FixedRate { .. } => op_tag::FIXED_RATE_CLOCK,
@@ -116,25 +158,18 @@ impl NodeSpec {
             Waveform { .. } => op_tag::WAVEFORM,
             Random { .. } => op_tag::RANDOM,
             Constant { .. } => op_tag::CONSTANT,
-            Scale { .. } => op_tag::SCALE,
-            Offset { .. } => op_tag::OFFSET,
-            Abs => op_tag::ABS,
-            Neg => op_tag::NEG,
-            Log => op_tag::LOG,
+            Affine { op, .. } => op.op_tag(),
+            Unary { op } => op.op_tag(),
             Window { .. } => op_tag::WINDOW,
             Fft => op_tag::FFT,
             Magnitude => op_tag::MAGNITUDE,
             Index { .. } => op_tag::INDEX,
             Threshold { .. } => op_tag::THRESHOLD,
-            Add => op_tag::ADD,
-            Sub => op_tag::SUB,
-            Mul => op_tag::MUL,
+            Binary { op } => op.op_tag(),
             Mean => op_tag::MEAN,
             Pack => op_tag::PACK,
             Dot => op_tag::DOT,
-            Zoh => op_tag::ZOH,
-            Linear => op_tag::LINEAR,
-            LatestAt => op_tag::LATEST_AT,
+            Resample { mode } => mode.op_tag(),
             FromDb { .. } => op_tag::FROM_DB,
             Persist { .. } => op_tag::PERSIST,
         }
@@ -142,6 +177,9 @@ impl NodeSpec {
 
     /// Mirror the `args` closure each constructor passes to
     /// [`hash_id`](crate::dynamic::node::hash_id). Drift breaks reconciliation.
+    /// The op-discriminant of family variants (`Affine`/`Unary`/`Binary`/
+    /// `Resample`) is encoded in `op_tag()` and intentionally not mixed in
+    /// here — keeping IDs stable across the family-consolidation refactor.
     fn hash_args(&self, h: &mut std::collections::hash_map::DefaultHasher) {
         use NodeSpec::*;
         match self {
@@ -149,27 +187,44 @@ impl NodeSpec {
                 hz.to_bits().hash(h);
             }
             ClockOf => {}
-            Waveform { shape, freq, amplitude, phase, dtype, out_shape } => {
+            Waveform {
+                shape,
+                freq,
+                amplitude,
+                phase,
+                dtype,
+                out_shape,
+            } => {
                 (*shape as u8).hash(h);
                 freq.to_bits().hash(h);
                 amplitude.to_bits().hash(h);
                 phase.to_bits().hash(h);
                 (*dtype as u8).hash(h);
-                for d in out_shape { d.hash(h); }
+                for d in out_shape {
+                    d.hash(h);
+                }
             }
-            Random { seed, dtype, out_shape } => {
+            Random {
+                seed,
+                dtype,
+                out_shape,
+            } => {
                 seed.hash(h);
                 (*dtype as u8).hash(h);
-                for d in out_shape { d.hash(h); }
+                for d in out_shape {
+                    d.hash(h);
+                }
             }
             Constant { value, out_shape } => {
                 value.hash(h);
-                for d in out_shape { d.hash(h); }
+                for d in out_shape {
+                    d.hash(h);
+                }
             }
-            Scale { k } | Offset { k } => {
+            Affine { k, .. } => {
                 k.hash(h);
             }
-            Abs | Neg | Log | Fft | Magnitude => {}
+            Unary { .. } | Fft | Magnitude => {}
             Window { size } => {
                 size.hash(h);
             }
@@ -180,8 +235,8 @@ impl NodeSpec {
                 k.hash(h);
                 (*op as u8).hash(h);
             }
-            Add | Sub | Mul | Mean | Pack | Dot => {}
-            Zoh | Linear | LatestAt => {}
+            Binary { .. } | Mean | Pack | Dot => {}
+            Resample { .. } => {}
             FromDb { component_id } => {
                 component_id.hash(h);
             }
@@ -255,44 +310,40 @@ pub fn build(
             ops::clock::fixed_rate(*hz)
         }
         ClockOf => Ok(ops::clock::clock_of(p1("clock_of", parents)?)),
-        Waveform { shape, freq, amplitude, phase, dtype, out_shape } => {
-            ops::generators::waveform(
-                p1("waveform", parents)?,
-                *shape,
-                *freq,
-                *amplitude,
-                *phase,
-                *dtype,
-                out_shape.clone(),
-            )
-        }
-        Random { seed, dtype, out_shape } => {
-            ops::generators::random(p1("random", parents)?, *seed, *dtype, out_shape.clone())
-        }
+        Waveform {
+            shape,
+            freq,
+            amplitude,
+            phase,
+            dtype,
+            out_shape,
+        } => ops::generators::waveform(
+            p1("waveform", parents)?,
+            *shape,
+            *freq,
+            *amplitude,
+            *phase,
+            *dtype,
+            out_shape.clone(),
+        ),
+        Random {
+            seed,
+            dtype,
+            out_shape,
+        } => ops::generators::random(p1("random", parents)?, *seed, *dtype, out_shape.clone()),
         Constant { value, out_shape } => {
             ops::generators::constant(p1("constant", parents)?, *value, out_shape.clone())
         }
-        Scale { k } => ops::derive::scale(p1("scale", parents)?, *k),
-        Offset { k } => ops::derive::offset(p1("offset", parents)?, *k),
-        Abs => ops::derive::abs(p1("abs", parents)?),
-        Neg => ops::derive::neg(p1("neg", parents)?),
-        Log => ops::derive::log(p1("log", parents)?),
+        Affine { op, k } => ops::derive::affine(p1("affine", parents)?, *op, *k),
+        Unary { op } => ops::derive::unary(p1("unary", parents)?, *op),
         Window { size } => ops::derive::window(p1("window", parents)?, *size),
         Fft => ops::derive::fft(p1("fft", parents)?),
         Magnitude => ops::derive::magnitude(p1("magnitude", parents)?),
         Index { index } => ops::derive::index(p1("index", parents)?, *index),
         Threshold { k, op } => ops::derive::threshold(p1("threshold", parents)?, *k, *op),
-        Add => {
-            let (a, b) = p2("add", parents)?;
-            ops::compose::add(a, b)
-        }
-        Sub => {
-            let (a, b) = p2("sub", parents)?;
-            ops::compose::sub(a, b)
-        }
-        Mul => {
-            let (a, b) = p2("mul", parents)?;
-            ops::compose::mul(a, b)
+        Binary { op } => {
+            let (a, b) = p2("binary", parents)?;
+            ops::compose::binary_op(a, b, *op)
         }
         Mean => {
             if parents.is_empty() {
@@ -310,17 +361,9 @@ pub fn build(
             let (a, b) = p2("dot", parents)?;
             ops::compose::dot(a, b)
         }
-        Zoh => {
-            let (input, clock) = p2("zoh", parents)?;
-            ops::resample::zoh(input, clock)
-        }
-        Linear => {
-            let (input, clock) = p2("linear", parents)?;
-            ops::resample::linear(input, clock)
-        }
-        LatestAt => {
-            let (input, clock) = p2("latest_at", parents)?;
-            ops::resample::latest_at(input, clock)
+        Resample { mode } => {
+            let (input, clock) = p2("resample", parents)?;
+            ops::resample::resample(input, clock, *mode)
         }
         FromDb { component_id } => {
             p0("from_db", parents)?;

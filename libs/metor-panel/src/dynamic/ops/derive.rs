@@ -29,8 +29,14 @@ fn promoted_schema(input: &ComponentSchema, arg: TypedScalar) -> ComponentSchema
 }
 
 /// Generic per-element map. `f` runs in `f64`; results are cast to `out_dtype`.
-fn map_each_element<F>(in_bytes: &[u8], in_dtype: PrimType, n: usize, out_dtype: PrimType, out: &mut Vec<u8>, mut f: F)
-where
+fn map_each_element<F>(
+    in_bytes: &[u8],
+    in_dtype: PrimType,
+    n: usize,
+    out_dtype: PrimType,
+    out: &mut Vec<u8>,
+    mut f: F,
+) where
     F: FnMut(f64) -> f64,
 {
     out.clear();
@@ -77,67 +83,151 @@ fn map(
     ))
 }
 
-pub fn scale(input: Arc<dyn DynamicNode>, k: TypedScalar) -> Result<Arc<dyn DynamicNode>, BuildError> {
-    let in_schema = require_value(&input)?;
-    let out_schema = promoted_schema(&in_schema, k);
-    let kf = k.as_f64();
-    map(
-        op_tag::SCALE,
-        input,
-        out_schema,
-        |h| k.hash(h),
-        move |x| x * kf,
-    )
+/// Affine transformation against a scalar `k`. Same signature for every
+/// variant: one `TypedScalar` arg, dtype promoted against the input dtype.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, facet::Facet)]
+#[repr(u8)]
+pub enum AffineOp {
+    /// `x * k`
+    Scale,
+    /// `x + k`
+    Offset,
 }
 
-pub fn offset(input: Arc<dyn DynamicNode>, k: TypedScalar) -> Result<Arc<dyn DynamicNode>, BuildError> {
-    let in_schema = require_value(&input)?;
-    let out_schema = promoted_schema(&in_schema, k);
-    let kf = k.as_f64();
-    map(
-        op_tag::OFFSET,
-        input,
-        out_schema,
-        |h| k.hash(h),
-        move |x| x + kf,
-    )
-}
-
-pub fn abs(input: Arc<dyn DynamicNode>) -> Result<Arc<dyn DynamicNode>, BuildError> {
-    let in_schema = require_value(&input)?;
-    if in_schema.prim_type == PrimType::Bool {
-        return Err(BuildError::UnsupportedDtype { op: "abs", dtype: in_schema.prim_type });
+impl AffineOp {
+    pub fn op_tag(self) -> &'static [u8] {
+        match self {
+            AffineOp::Scale => op_tag::SCALE,
+            AffineOp::Offset => op_tag::OFFSET,
+        }
     }
-    let out_schema = in_schema.clone();
-    // For unsigned ints, abs is identity. For signed/float, real abs.
-    let unsigned = is_unsigned_int(in_schema.prim_type);
+
+    fn apply(self, x: f64, k: f64) -> f64 {
+        match self {
+            AffineOp::Scale => x * k,
+            AffineOp::Offset => x + k,
+        }
+    }
+}
+
+pub fn affine(
+    input: Arc<dyn DynamicNode>,
+    op: AffineOp,
+    k: TypedScalar,
+) -> Result<Arc<dyn DynamicNode>, BuildError> {
+    let in_schema = require_value(&input)?;
+    let out_schema = promoted_schema(&in_schema, k);
+    let kf = k.as_f64();
     map(
-        op_tag::ABS,
+        op.op_tag(),
+        input,
+        out_schema,
+        |h| k.hash(h),
+        move |x| op.apply(x, kf),
+    )
+}
+
+/// Single-input unary math. Schema and validation rules depend on the
+/// variant — see each variant's docstring.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, facet::Facet)]
+#[repr(u8)]
+pub enum UnaryOp {
+    /// `|x|`. Rejects `Bool`. Identity on unsigned ints. Output dtype: input.
+    Abs,
+    /// `-x`. Rejects `Bool` and unsigned ints. Output dtype: input.
+    Neg,
+    /// `ln(x)`. Rejects `Bool`. Int → F64; float preserved.
+    Log,
+    /// `sqrt(x)`. Rejects `Bool`. Int → F64; float preserved.
+    Sqrt,
+    /// `exp(x)`. Rejects `Bool`. Int → F64; float preserved.
+    Exp,
+    /// `floor(x)`. Rejects `Bool`. Output dtype: input (int input is identity).
+    Floor,
+}
+
+impl UnaryOp {
+    pub fn op_tag(self) -> &'static [u8] {
+        match self {
+            UnaryOp::Abs => op_tag::ABS,
+            UnaryOp::Neg => op_tag::NEG,
+            UnaryOp::Log => op_tag::LOG,
+            UnaryOp::Sqrt => op_tag::SQRT,
+            UnaryOp::Exp => op_tag::EXP,
+            UnaryOp::Floor => op_tag::FLOOR,
+        }
+    }
+
+    fn op_name(self) -> &'static str {
+        match self {
+            UnaryOp::Abs => "abs",
+            UnaryOp::Neg => "neg",
+            UnaryOp::Log => "log",
+            UnaryOp::Sqrt => "sqrt",
+            UnaryOp::Exp => "exp",
+            UnaryOp::Floor => "floor",
+        }
+    }
+
+    fn validate(self, dtype: PrimType) -> Result<(), BuildError> {
+        if dtype == PrimType::Bool {
+            return Err(BuildError::UnsupportedDtype {
+                op: self.op_name(),
+                dtype,
+            });
+        }
+        if matches!(self, UnaryOp::Neg) && is_unsigned_int(dtype) {
+            return Err(BuildError::UnsupportedDtype {
+                op: self.op_name(),
+                dtype,
+            });
+        }
+        Ok(())
+    }
+
+    fn out_dtype(self, in_dtype: PrimType) -> PrimType {
+        match self {
+            UnaryOp::Abs | UnaryOp::Neg | UnaryOp::Floor => in_dtype,
+            UnaryOp::Log | UnaryOp::Sqrt | UnaryOp::Exp => {
+                if is_int(in_dtype) {
+                    PrimType::F64
+                } else {
+                    in_dtype
+                }
+            }
+        }
+    }
+
+    fn apply(self, x: f64, in_dtype: PrimType) -> f64 {
+        match self {
+            UnaryOp::Abs => {
+                if is_unsigned_int(in_dtype) {
+                    x
+                } else {
+                    x.abs()
+                }
+            }
+            UnaryOp::Neg => -x,
+            UnaryOp::Log => x.ln(),
+            UnaryOp::Sqrt => x.sqrt(),
+            UnaryOp::Exp => x.exp(),
+            UnaryOp::Floor => x.floor(),
+        }
+    }
+}
+
+pub fn unary(input: Arc<dyn DynamicNode>, op: UnaryOp) -> Result<Arc<dyn DynamicNode>, BuildError> {
+    let in_schema = require_value(&input)?;
+    let in_dtype = in_schema.prim_type;
+    op.validate(in_dtype)?;
+    let out_schema = ComponentSchema::new(op.out_dtype(in_dtype), &in_schema.dim);
+    map(
+        op.op_tag(),
         input,
         out_schema,
         |_| {},
-        move |x| if unsigned { x } else { x.abs() },
+        move |x| op.apply(x, in_dtype),
     )
-}
-
-pub fn neg(input: Arc<dyn DynamicNode>) -> Result<Arc<dyn DynamicNode>, BuildError> {
-    let in_schema = require_value(&input)?;
-    if is_unsigned_int(in_schema.prim_type) || in_schema.prim_type == PrimType::Bool {
-        return Err(BuildError::UnsupportedDtype { op: "neg", dtype: in_schema.prim_type });
-    }
-    let out_schema = in_schema.clone();
-    map(op_tag::NEG, input, out_schema, |_| {}, |x| -x)
-}
-
-pub fn log(input: Arc<dyn DynamicNode>) -> Result<Arc<dyn DynamicNode>, BuildError> {
-    let in_schema = require_value(&input)?;
-    if in_schema.prim_type == PrimType::Bool {
-        return Err(BuildError::UnsupportedDtype { op: "log", dtype: in_schema.prim_type });
-    }
-    // Integer in → f64 out (NumPy convention); float in → preserve width.
-    let out_dtype = if is_int(in_schema.prim_type) { PrimType::F64 } else { in_schema.prim_type };
-    let out_schema = ComponentSchema::new(out_dtype, &in_schema.dim);
-    map(op_tag::LOG, input, out_schema, |_| {}, f64::ln)
 }
 
 /// One-sided magnitude FFT of a real-valued vector input. Computes along the
@@ -217,9 +307,16 @@ pub fn fft(input: Arc<dyn DynamicNode>) -> Result<Arc<dyn DynamicNode>, BuildErr
 pub fn magnitude(input: Arc<dyn DynamicNode>) -> Result<Arc<dyn DynamicNode>, BuildError> {
     let in_schema = require_value(&input)?;
     if in_schema.prim_type == PrimType::Bool {
-        return Err(BuildError::UnsupportedDtype { op: "magnitude", dtype: in_schema.prim_type });
+        return Err(BuildError::UnsupportedDtype {
+            op: "magnitude",
+            dtype: in_schema.prim_type,
+        });
     }
-    let out_dtype = if is_int(in_schema.prim_type) { PrimType::F64 } else { in_schema.prim_type };
+    let out_dtype = if is_int(in_schema.prim_type) {
+        PrimType::F64
+    } else {
+        in_schema.prim_type
+    };
     let out_schema = ComponentSchema::new(out_dtype, &[]);
     let id = hash_id(op_tag::MAGNITUDE, &[input.id()], |_| {});
     let parent_clock = input.parent_clock_id();
@@ -262,10 +359,7 @@ pub fn magnitude(input: Arc<dyn DynamicNode>) -> Result<Arc<dyn DynamicNode>, Bu
 ///
 /// Build-time validation rejects out-of-range `i`. Bool inputs round-trip
 /// through bytes unchanged (no special handling needed).
-pub fn index(
-    input: Arc<dyn DynamicNode>,
-    i: usize,
-) -> Result<Arc<dyn DynamicNode>, BuildError> {
+pub fn index(input: Arc<dyn DynamicNode>, i: usize) -> Result<Arc<dyn DynamicNode>, BuildError> {
     let in_schema = require_value(&input)?;
     let n = tensor::shape_elems(&in_schema.dim);
     if i >= n {
@@ -340,7 +434,10 @@ pub fn threshold(
 ) -> Result<Arc<dyn DynamicNode>, BuildError> {
     let in_schema = require_value(&input)?;
     if in_schema.prim_type == PrimType::Bool {
-        return Err(BuildError::UnsupportedDtype { op: "threshold", dtype: in_schema.prim_type });
+        return Err(BuildError::UnsupportedDtype {
+            op: "threshold",
+            dtype: in_schema.prim_type,
+        });
     }
     let out_schema = ComponentSchema::new(PrimType::F64, &in_schema.dim);
     let kf = k.as_f64();
@@ -386,8 +483,7 @@ pub fn window(
         move |output| async move {
             let _input = input;
             // Ring of `size` slots, each `in_value_size` bytes.
-            let mut buf: VecDeque<Vec<u8>> =
-                (0..size).map(|_| vec![0u8; in_value_size]).collect();
+            let mut buf: VecDeque<Vec<u8>> = (0..size).map(|_| vec![0u8; in_value_size]).collect();
             let mut scratch: Vec<u8> = Vec::with_capacity(out_schema.size());
             loop {
                 let grant = reader.next().await;

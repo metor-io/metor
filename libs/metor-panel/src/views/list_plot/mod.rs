@@ -112,8 +112,7 @@ impl ListPlot {
 impl Render for ListPlot {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = crate::theme::theme(cx);
-        let trace_entities: Vec<Entity<ListTrace>> =
-            self.line_plot.read(cx).traces().to_vec();
+        let trace_entities: Vec<Entity<ListTrace>> = self.line_plot.read(cx).traces().to_vec();
         let show_legend = trace_entities.len() >= 2;
 
         let underlay_lp = self.line_plot.clone();
