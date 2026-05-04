@@ -15,6 +15,7 @@ use metor_proto::types::{ComponentId, PrimType};
 use smallvec::SmallVec;
 
 use crate::dynamic::{BuildError, DynamicNode, NodeId, hash_id, op_tag, ops};
+use crate::dynamic::ops::derive::ThresholdOp;
 use crate::dynamic::ops::generators::Waveform;
 use crate::dynamic::tensor::TypedScalar;
 
@@ -48,6 +49,8 @@ pub enum NodeSpec {
     Window { size: usize },
     Fft,
     Magnitude,
+    Index { index: usize },
+    Threshold { k: TypedScalar, op: ThresholdOp },
     Add,
     Sub,
     Mul,
@@ -66,7 +69,7 @@ pub enum NodeSpec {
 pub enum NodeSpecKind {
     FixedRate, ClockOf,
     Waveform, Random, Constant,
-    Scale, Offset, Abs, Neg, Log, Window, Fft, Magnitude,
+    Scale, Offset, Abs, Neg, Log, Window, Fft, Magnitude, Index, Threshold,
     Add, Sub, Mul, Mean, Pack, Dot,
     Zoh, Linear, LatestAt,
     FromDb, Persist,
@@ -89,6 +92,8 @@ impl NodeSpec {
             Window { .. } => NodeSpecKind::Window,
             Fft => NodeSpecKind::Fft,
             Magnitude => NodeSpecKind::Magnitude,
+            Index { .. } => NodeSpecKind::Index,
+            Threshold { .. } => NodeSpecKind::Threshold,
             Add => NodeSpecKind::Add,
             Sub => NodeSpecKind::Sub,
             Mul => NodeSpecKind::Mul,
@@ -119,6 +124,8 @@ impl NodeSpec {
             Window { .. } => op_tag::WINDOW,
             Fft => op_tag::FFT,
             Magnitude => op_tag::MAGNITUDE,
+            Index { .. } => op_tag::INDEX,
+            Threshold { .. } => op_tag::THRESHOLD,
             Add => op_tag::ADD,
             Sub => op_tag::SUB,
             Mul => op_tag::MUL,
@@ -165,6 +172,13 @@ impl NodeSpec {
             Abs | Neg | Log | Fft | Magnitude => {}
             Window { size } => {
                 size.hash(h);
+            }
+            Index { index } => {
+                index.hash(h);
+            }
+            Threshold { k, op } => {
+                k.hash(h);
+                (*op as u8).hash(h);
             }
             Add | Sub | Mul | Mean | Pack | Dot => {}
             Zoh | Linear | LatestAt => {}
@@ -266,6 +280,8 @@ pub fn build(
         Window { size } => ops::derive::window(p1("window", parents)?, *size),
         Fft => ops::derive::fft(p1("fft", parents)?),
         Magnitude => ops::derive::magnitude(p1("magnitude", parents)?),
+        Index { index } => ops::derive::index(p1("index", parents)?, *index),
+        Threshold { k, op } => ops::derive::threshold(p1("threshold", parents)?, *k, *op),
         Add => {
             let (a, b) = p2("add", parents)?;
             ops::compose::add(a, b)

@@ -194,6 +194,38 @@ async fn fft_id_matches() {
 }
 
 #[stellarator::test]
+async fn index_id_matches() {
+    let clock = ops::clock::fixed_rate(100.0).unwrap();
+    let a = const_f64(clock.clone(), 1.0).unwrap();
+    let b = const_f64(clock, 2.0).unwrap();
+    let packed = ops::compose::pack(vec![a, b]).unwrap();
+    let packed_id = packed.id();
+    let built = ops::derive::index(packed, 1).unwrap();
+    assert_eq!(
+        built.id(),
+        compute_node_id(&NodeSpec::Index { index: 1 }, &[packed_id]),
+    );
+}
+
+#[stellarator::test]
+async fn threshold_id_matches() {
+    let clock = ops::clock::fixed_rate(100.0).unwrap();
+    let src = const_f64(clock, 1.0).unwrap();
+    let src_id = src.id();
+    let built = ops::derive::threshold(src, TypedScalar::F64(0.5), crate::dynamic::ops::derive::ThresholdOp::Gt).unwrap();
+    assert_eq!(
+        built.id(),
+        compute_node_id(
+            &NodeSpec::Threshold {
+                k: TypedScalar::F64(0.5),
+                op: crate::dynamic::ops::derive::ThresholdOp::Gt,
+            },
+            &[src_id],
+        ),
+    );
+}
+
+#[stellarator::test]
 async fn magnitude_id_matches() {
     let clock = ops::clock::fixed_rate(100.0).unwrap();
     let a = const_f64(clock.clone(), 1.0).unwrap();

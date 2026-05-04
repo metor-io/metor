@@ -31,6 +31,7 @@ use metor_proto::types::PrimType;
 use smallvec::SmallVec;
 
 use crate::dynamic::ValueType;
+use crate::dynamic::ops::derive::ThresholdOp;
 use crate::dynamic::ops::generators::Waveform;
 use crate::dynamic::tensor::TypedScalar;
 use crate::inspector::registry::InspectorRegistry;
@@ -564,6 +565,62 @@ pub fn rows_for_node(
                 },
             ));
         }
+        NodeSpec::Index { index } => {
+            rows.push(scalar_arg(
+                "Index",
+                *index as f64,
+                editor.clone(),
+                graph.clone(),
+                flow_id.clone(),
+                |spec, v| {
+                    if let NodeSpec::Index { index } = spec {
+                        *index = v.max(0.0) as usize;
+                    }
+                },
+            ));
+        }
+        NodeSpec::Threshold { k, op } => {
+            // Render `k` in the parent's promoted dtype so the widget
+            // matches the runtime comparison (same convention as Scale /
+            // Offset above).
+            let promoted = parent_dtype(&graph.read(_cx), &flow_id);
+            let display_value = match promoted {
+                Some(dt) => k.cast(dt),
+                None => *k,
+            };
+            rows.push(typed_scalar_arg(
+                "Threshold (k)",
+                display_value,
+                editor.clone(),
+                graph.clone(),
+                flow_id.clone(),
+                |spec, v| {
+                    if let NodeSpec::Threshold { k, .. } = spec {
+                        *k = v;
+                    }
+                },
+            ));
+            let op_label = SharedString::from(threshold_op_label(*op));
+            let options: Vec<SharedString> = THRESHOLD_OPS
+                .iter()
+                .map(|(_, name)| SharedString::new_static(name))
+                .collect();
+            rows.push(enum_arg(
+                "Comparison",
+                op_label,
+                options,
+                editor.clone(),
+                graph.clone(),
+                flow_id.clone(),
+                |spec, chosen| {
+                    if let (NodeSpec::Threshold { op, .. }, Some(picked)) =
+                        (spec, threshold_op_from_label(&chosen))
+                    {
+                        *op = picked;
+                    }
+                },
+            ));
+        }
         // No editable args.
         NodeSpec::ClockOf
         | NodeSpec::Abs
@@ -857,4 +914,26 @@ fn waveform_from_label(label: &str) -> Option<Waveform> {
         .iter()
         .find(|(_, name)| *name == label)
         .map(|(s, _)| *s)
+}
+
+const THRESHOLD_OPS: &[(ThresholdOp, &str)] = &[
+    (ThresholdOp::Gt, ">"),
+    (ThresholdOp::Ge, ">="),
+    (ThresholdOp::Lt, "<"),
+    (ThresholdOp::Le, "<="),
+];
+
+fn threshold_op_label(op: ThresholdOp) -> &'static str {
+    THRESHOLD_OPS
+        .iter()
+        .find(|(o, _)| *o == op)
+        .map(|(_, name)| *name)
+        .unwrap_or(">")
+}
+
+fn threshold_op_from_label(label: &str) -> Option<ThresholdOp> {
+    THRESHOLD_OPS
+        .iter()
+        .find(|(_, name)| *name == label)
+        .map(|(o, _)| *o)
 }

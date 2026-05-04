@@ -5,6 +5,7 @@
 use metor_proto::types::PrimType;
 use smallvec::SmallVec;
 
+use crate::dynamic::ops::derive::ThresholdOp;
 use crate::dynamic::ops::generators::Waveform;
 use crate::dynamic::tensor::TypedScalar;
 use crate::node_editor::spec::{NodeSpec, NodeSpecKind};
@@ -186,6 +187,22 @@ pub const ALL: &[OpDescriptor] = &[
         inputs: ONE_VALUE, output: F64,
         default_spec: || NodeSpec::Magnitude,
         arg_count: 0,
+    },
+    OpDescriptor {
+        kind: NodeSpecKind::Index, label: "Index", category: "Derive",
+        inputs: ONE_VALUE, output: F64,
+        default_spec: || NodeSpec::Index { index: 0 },
+        arg_count: 1,
+    },
+    OpDescriptor {
+        kind: NodeSpecKind::Threshold, label: "Threshold", category: "Derive",
+        inputs: ONE_VALUE, output: F64,
+        default_spec: || NodeSpec::Threshold {
+            k: TypedScalar::F64(0.0),
+            op: ThresholdOp::Gt,
+        },
+        // k, op
+        arg_count: 2,
     },
     // Compose
     OpDescriptor {

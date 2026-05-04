@@ -306,6 +306,8 @@ pub mod op_tag {
     pub const PACK: &[u8] = b"compose.pack";
     pub const DOT: &[u8] = b"compose.dot";
     pub const MAGNITUDE: &[u8] = b"derive.magnitude";
+    pub const INDEX: &[u8] = b"derive.index";
+    pub const THRESHOLD: &[u8] = b"derive.threshold";
     pub const ZOH: &[u8] = b"resample.zoh";
     pub const LINEAR: &[u8] = b"resample.linear";
     pub const LATEST_AT: &[u8] = b"resample.latest_at";

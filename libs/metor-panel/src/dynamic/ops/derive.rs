@@ -255,6 +255,107 @@ pub fn magnitude(input: Arc<dyn DynamicNode>) -> Result<Arc<dyn DynamicNode>, Bu
     ))
 }
 
+/// Pull element `i` (flat row-major index) from a value, returning a
+/// rank-0 scalar of the input dtype. The inverse of `Pack` in the rank-1
+/// case (`Pack` of N scalars → `[N]`; `Index(packed, i)` → scalar). For
+/// higher-rank inputs the index walks the row-major buffer.
+///
+/// Build-time validation rejects out-of-range `i`. Bool inputs round-trip
+/// through bytes unchanged (no special handling needed).
+pub fn index(
+    input: Arc<dyn DynamicNode>,
+    i: usize,
+) -> Result<Arc<dyn DynamicNode>, BuildError> {
+    let in_schema = require_value(&input)?;
+    let n = tensor::shape_elems(&in_schema.dim);
+    if i >= n {
+        return Err(BuildError::InvalidArg {
+            op: "index",
+            reason: "index out of range",
+        });
+    }
+    let elem_size = in_schema.prim_type.size();
+    let in_value_size = in_schema.size();
+    let out_schema = ComponentSchema::new(in_schema.prim_type, &[]);
+    let id = hash_id(op_tag::INDEX, &[input.id()], |h| i.hash(h));
+    let parent_clock = input.parent_clock_id();
+    let mut reader = input.subscribe();
+    Ok(NodeImpl::spawn(
+        id,
+        ValueType::Value(out_schema.clone()),
+        parent_clock,
+        default_ring_bytes(out_schema.size()),
+        move |output| async move {
+            let _input = input;
+            let off = i * elem_size;
+            loop {
+                let grant = reader.next().await;
+                for (ts, value) in grant.samples() {
+                    if value.len() != in_value_size {
+                        continue;
+                    }
+                    write_sample(&output, ts, &value[off..off + elem_size]);
+                }
+            }
+        },
+    ))
+}
+
+/// Comparison operator for [`threshold`]. Variants name the relation between
+/// the input element and the threshold `k` that produces a `1.0` output.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, facet::Facet)]
+#[repr(u8)]
+pub enum ThresholdOp {
+    /// `input > k`
+    Gt,
+    /// `input >= k`
+    Ge,
+    /// `input < k`
+    Lt,
+    /// `input <= k`
+    Le,
+}
+
+impl ThresholdOp {
+    fn apply(self, x: f64, k: f64) -> f64 {
+        let hit = match self {
+            ThresholdOp::Gt => x > k,
+            ThresholdOp::Ge => x >= k,
+            ThresholdOp::Lt => x < k,
+            ThresholdOp::Le => x <= k,
+        };
+        if hit { 1.0 } else { 0.0 }
+    }
+}
+
+/// Threshold each element of `input` against `k` using comparison `op`.
+/// Output: same shape as input, dtype `f64`, value `1.0` where the relation
+/// holds and `0.0` otherwise. `k` is a `TypedScalar` so the inspector can
+/// render it in the input's dtype, but the comparison runs in `f64` to keep
+/// the per-element pipeline uniform with the rest of the dynamic graph.
+pub fn threshold(
+    input: Arc<dyn DynamicNode>,
+    k: TypedScalar,
+    op: ThresholdOp,
+) -> Result<Arc<dyn DynamicNode>, BuildError> {
+    let in_schema = require_value(&input)?;
+    if in_schema.prim_type == PrimType::Bool {
+        return Err(BuildError::UnsupportedDtype { op: "threshold", dtype: in_schema.prim_type });
+    }
+    let out_schema = ComponentSchema::new(PrimType::F64, &in_schema.dim);
+    let kf = k.as_f64();
+    map(
+        op_tag::THRESHOLD,
+        input,
+        out_schema,
+        |h| {
+            k.hash(h);
+            (op as u8).hash(h);
+        },
+        move |x| op.apply(x, kf),
+    )
+}
+
 /// Sliding window over a stream. Emits `[size, ...input.shape]` on every input
 /// tick, dtype preserved. The buffer is preloaded with zeros so emissions
 /// start immediately; the leading zeros wash out after `size` ticks.

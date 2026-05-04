@@ -65,14 +65,14 @@ A natural follow-up to Window. Each is `f64 in → f64 out` with one `size` arg.
 
 ### Proposed: thresholds and triggers
 
-- [ ] **Threshold** — `input > k` → 0/1 f64 (downstream sees a binary signal)
+- [x] **Threshold** — `input > k` → 0/1 f64 (downstream sees a binary signal)
 - [ ] **Hysteresis** — two-threshold debounced version of Threshold (prevents chatter near the edge)
 - [ ] **Edge Detect** — pulse (1 for one tick) on rising / falling / either edge
 - [ ] **Latch** — sample-and-hold; freezes the input value when a trigger goes high
 
 ### Proposed: vector ops (operate on vector schemas like Pack/Window/FFT outputs)
 
-- [ ] **Slice / Index** — pull element `[i]` of a vector → scalar (the inverse of Pack)
+- [x] **Slice / Index** — pull element `[i]` of a vector → scalar (the inverse of Pack)
 - [x] **Magnitude / L2 Norm** — `sqrt(sum(x_i²))` of a vector input → scalar; useful for speed-from-velocity
 - [x] **Dot Product** — two vectors → scalar
 - [ ] **Concatenate** — two vectors of length M, N → one vector of length M+N

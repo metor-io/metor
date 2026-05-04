@@ -656,6 +656,178 @@ async fn dot_product_rejects_clock_mismatch() {
 }
 
 #[stellarator::test]
+async fn index_extracts_scalar_from_packed_vector() {
+    let clock = ops::clock::fixed_rate(200.0).unwrap();
+    // Pack [10, 20, 30] → index 1 → 20
+    let a = const_f64(clock.clone(), 10.0).unwrap();
+    let b = const_f64(clock.clone(), 20.0).unwrap();
+    let c = const_f64(clock, 30.0).unwrap();
+    let packed = ops::compose::pack(vec![a, b, c]).unwrap();
+    let elem = ops::derive::index(packed, 1).unwrap();
+    let schema = match elem.value_type() {
+        ValueType::Value(s) => s.clone(),
+        _ => panic!(),
+    };
+    assert_eq!(schema.prim_type, PrimType::F64);
+    assert!(schema.dim.is_empty());
+    let samples = drain_f64(&elem, 8).await;
+    for (_, v) in &samples {
+        assert!((v - 20.0).abs() < 1e-12, "got {v}");
+    }
+}
+
+#[stellarator::test]
+async fn index_preserves_int_dtype() {
+    use crate::dynamic::node::DynamicNodeExt;
+    let clock = ops::clock::fixed_rate(200.0).unwrap();
+    let a = const_typed(clock.clone(), TypedScalar::I32(7), SmallVec::new()).unwrap();
+    let b = const_typed(clock, TypedScalar::I32(11), SmallVec::new()).unwrap();
+    let packed = ops::compose::pack(vec![a, b]).unwrap();
+    let elem = ops::derive::index(packed, 1).unwrap();
+    let schema = match elem.value_type() {
+        ValueType::Value(s) => s.clone(),
+        _ => panic!(),
+    };
+    assert_eq!(schema.prim_type, PrimType::I32);
+    assert!(schema.dim.is_empty());
+    let mut reader = elem.subscribe();
+    let mut got = 0;
+    while got < 4 {
+        let grant = reader.next().await;
+        for (_, value) in grant.samples() {
+            if value.len() != 4 { continue; }
+            let v = i32::from_le_bytes(value.try_into().unwrap());
+            assert_eq!(v, 11);
+            got += 1;
+            if got == 4 { break; }
+        }
+    }
+}
+
+#[stellarator::test]
+async fn index_rejects_out_of_range() {
+    let clock = ops::clock::fixed_rate(100.0).unwrap();
+    let a = const_f64(clock.clone(), 1.0).unwrap();
+    let b = const_f64(clock, 2.0).unwrap();
+    let packed = ops::compose::pack(vec![a, b]).unwrap();
+    let err = match ops::derive::index(packed, 5) {
+        Ok(_) => panic!("must reject out-of-range index"),
+        Err(e) => e,
+    };
+    assert!(matches!(
+        err,
+        crate::dynamic::BuildError::InvalidArg { op: "index", .. }
+    ));
+}
+
+#[stellarator::test]
+async fn threshold_emits_one_above_zero_below() {
+    let clock = ops::clock::fixed_rate(200.0).unwrap();
+    let above = const_f64(clock.clone(), 5.0).unwrap();
+    let below = const_f64(clock, -1.0).unwrap();
+    let above_t = ops::derive::threshold(above, TypedScalar::F64(2.0), crate::dynamic::ops::derive::ThresholdOp::Gt).unwrap();
+    let below_t = ops::derive::threshold(below, TypedScalar::F64(2.0), crate::dynamic::ops::derive::ThresholdOp::Gt).unwrap();
+    let above_samples = drain_f64(&above_t, 4).await;
+    for (_, v) in &above_samples {
+        assert_eq!(*v, 1.0);
+    }
+    let below_samples = drain_f64(&below_t, 4).await;
+    for (_, v) in &below_samples {
+        assert_eq!(*v, 0.0);
+    }
+}
+
+#[stellarator::test]
+async fn threshold_preserves_input_shape() {
+    use crate::dynamic::node::DynamicNodeExt;
+    let clock = ops::clock::fixed_rate(200.0).unwrap();
+    // Vector [1, 5, 3] thresholded against 2 → [0, 1, 1]
+    let a = const_f64(clock.clone(), 1.0).unwrap();
+    let b = const_f64(clock.clone(), 5.0).unwrap();
+    let c = const_f64(clock, 3.0).unwrap();
+    let packed = ops::compose::pack(vec![a, b, c]).unwrap();
+    let t = ops::derive::threshold(packed, TypedScalar::F64(2.0), crate::dynamic::ops::derive::ThresholdOp::Gt).unwrap();
+    let schema = match t.value_type() {
+        ValueType::Value(s) => s.clone(),
+        _ => panic!(),
+    };
+    assert_eq!(schema.prim_type, PrimType::F64);
+    assert_eq!(schema.dim.as_slice(), &[3]);
+    let mut reader = t.subscribe();
+    let grant = reader.next().await;
+    for (_, value) in grant.samples() {
+        if value.len() != 24 { continue; }
+        let bins: Vec<f64> = value
+            .chunks_exact(8)
+            .map(|c| f64::from_le_bytes(c.try_into().unwrap()))
+            .collect();
+        assert_eq!(bins, vec![0.0, 1.0, 1.0]);
+        return;
+    }
+}
+
+async fn check_threshold(x: f64, op: crate::dynamic::ops::derive::ThresholdOp, k: f64, expected: f64) {
+    let clock = ops::clock::fixed_rate(200.0).unwrap();
+    let src = const_f64(clock, x).unwrap();
+    let node = ops::derive::threshold(src, TypedScalar::F64(k), op).unwrap();
+    let samples = drain_f64(&node, 2).await;
+    for (_, v) in &samples {
+        assert_eq!(*v, expected, "x={x} op={op:?} k={k}");
+    }
+}
+
+// Boundary (x == k) confirms open/closed semantics of >, >=, <, <=.
+#[stellarator::test]
+async fn threshold_gt_boundary_excludes_equal() {
+    use crate::dynamic::ops::derive::ThresholdOp;
+    check_threshold(2.0, ThresholdOp::Gt, 2.0, 0.0).await;
+}
+
+#[stellarator::test]
+async fn threshold_ge_boundary_includes_equal() {
+    use crate::dynamic::ops::derive::ThresholdOp;
+    check_threshold(2.0, ThresholdOp::Ge, 2.0, 1.0).await;
+}
+
+#[stellarator::test]
+async fn threshold_lt_boundary_excludes_equal() {
+    use crate::dynamic::ops::derive::ThresholdOp;
+    check_threshold(2.0, ThresholdOp::Lt, 2.0, 0.0).await;
+}
+
+#[stellarator::test]
+async fn threshold_lt_below_emits_one() {
+    use crate::dynamic::ops::derive::ThresholdOp;
+    check_threshold(1.0, ThresholdOp::Lt, 2.0, 1.0).await;
+}
+
+#[stellarator::test]
+async fn threshold_le_boundary_includes_equal() {
+    use crate::dynamic::ops::derive::ThresholdOp;
+    check_threshold(2.0, ThresholdOp::Le, 2.0, 1.0).await;
+}
+
+#[stellarator::test]
+async fn threshold_le_above_emits_zero() {
+    use crate::dynamic::ops::derive::ThresholdOp;
+    check_threshold(3.0, ThresholdOp::Le, 2.0, 0.0).await;
+}
+
+#[stellarator::test]
+async fn threshold_rejects_bool_input() {
+    let clock = ops::clock::fixed_rate(100.0).unwrap();
+    let src = const_typed(clock, TypedScalar::Bool(true), SmallVec::new()).unwrap();
+    let err = match ops::derive::threshold(src, TypedScalar::F64(0.5), crate::dynamic::ops::derive::ThresholdOp::Gt) {
+        Ok(_) => panic!("must reject bool"),
+        Err(e) => e,
+    };
+    assert!(matches!(
+        err,
+        crate::dynamic::BuildError::UnsupportedDtype { op: "threshold", .. }
+    ));
+}
+
+#[stellarator::test]
 async fn zoh_passes_through_typed_vector_bytes() {
     let slow = ops::clock::fixed_rate(50.0).unwrap();
     let fast = ops::clock::fixed_rate(400.0).unwrap();
