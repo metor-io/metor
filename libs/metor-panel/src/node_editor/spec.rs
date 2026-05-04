@@ -47,11 +47,13 @@ pub enum NodeSpec {
     Log,
     Window { size: usize },
     Fft,
+    Magnitude,
     Add,
     Sub,
     Mul,
     Mean,
     Pack,
+    Dot,
     Zoh,
     Linear,
     LatestAt,
@@ -64,8 +66,8 @@ pub enum NodeSpec {
 pub enum NodeSpecKind {
     FixedRate, ClockOf,
     Waveform, Random, Constant,
-    Scale, Offset, Abs, Neg, Log, Window, Fft,
-    Add, Sub, Mul, Mean, Pack,
+    Scale, Offset, Abs, Neg, Log, Window, Fft, Magnitude,
+    Add, Sub, Mul, Mean, Pack, Dot,
     Zoh, Linear, LatestAt,
     FromDb, Persist,
 }
@@ -86,11 +88,13 @@ impl NodeSpec {
             Log => NodeSpecKind::Log,
             Window { .. } => NodeSpecKind::Window,
             Fft => NodeSpecKind::Fft,
+            Magnitude => NodeSpecKind::Magnitude,
             Add => NodeSpecKind::Add,
             Sub => NodeSpecKind::Sub,
             Mul => NodeSpecKind::Mul,
             Mean => NodeSpecKind::Mean,
             Pack => NodeSpecKind::Pack,
+            Dot => NodeSpecKind::Dot,
             Zoh => NodeSpecKind::Zoh,
             Linear => NodeSpecKind::Linear,
             LatestAt => NodeSpecKind::LatestAt,
@@ -114,11 +118,13 @@ impl NodeSpec {
             Log => op_tag::LOG,
             Window { .. } => op_tag::WINDOW,
             Fft => op_tag::FFT,
+            Magnitude => op_tag::MAGNITUDE,
             Add => op_tag::ADD,
             Sub => op_tag::SUB,
             Mul => op_tag::MUL,
             Mean => op_tag::MEAN,
             Pack => op_tag::PACK,
+            Dot => op_tag::DOT,
             Zoh => op_tag::ZOH,
             Linear => op_tag::LINEAR,
             LatestAt => op_tag::LATEST_AT,
@@ -156,11 +162,11 @@ impl NodeSpec {
             Scale { k } | Offset { k } => {
                 k.hash(h);
             }
-            Abs | Neg | Log | Fft => {}
+            Abs | Neg | Log | Fft | Magnitude => {}
             Window { size } => {
                 size.hash(h);
             }
-            Add | Sub | Mul | Mean | Pack => {}
+            Add | Sub | Mul | Mean | Pack | Dot => {}
             Zoh | Linear | LatestAt => {}
             FromDb { component_id } => {
                 component_id.hash(h);
@@ -259,6 +265,7 @@ pub fn build(
         Log => ops::derive::log(p1("log", parents)?),
         Window { size } => ops::derive::window(p1("window", parents)?, *size),
         Fft => ops::derive::fft(p1("fft", parents)?),
+        Magnitude => ops::derive::magnitude(p1("magnitude", parents)?),
         Add => {
             let (a, b) = p2("add", parents)?;
             ops::compose::add(a, b)
@@ -282,6 +289,10 @@ pub fn build(
                 return Err(BuildError::EmptyInputs);
             }
             ops::compose::pack(parents)
+        }
+        Dot => {
+            let (a, b) = p2("dot", parents)?;
+            ops::compose::dot(a, b)
         }
         Zoh => {
             let (input, clock) = p2("zoh", parents)?;

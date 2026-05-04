@@ -73,8 +73,8 @@ A natural follow-up to Window. Each is `f64 in → f64 out` with one `size` arg.
 ### Proposed: vector ops (operate on vector schemas like Pack/Window/FFT outputs)
 
 - [ ] **Slice / Index** — pull element `[i]` of a vector → scalar (the inverse of Pack)
-- [ ] **Magnitude / L2 Norm** — `sqrt(sum(x_i²))` of a vector input → scalar; useful for speed-from-velocity
-- [ ] **Dot Product** — two vectors → scalar
+- [x] **Magnitude / L2 Norm** — `sqrt(sum(x_i²))` of a vector input → scalar; useful for speed-from-velocity
+- [x] **Dot Product** — two vectors → scalar
 - [ ] **Concatenate** — two vectors of length M, N → one vector of length M+N
 - [ ] **Window Function** — multiply a vector by Hann / Hamming / Blackman before FFT (real-world FFT users always want this)
 

@@ -207,6 +207,54 @@ pub fn fft(input: Arc<dyn DynamicNode>) -> Result<Arc<dyn DynamicNode>, BuildErr
     ))
 }
 
+/// L2 norm of a vector input — `sqrt(sum(x_i²))`. Reduces over every
+/// element of the input shape, regardless of rank, into a rank-0 scalar.
+/// Output dtype: integer inputs widen to `f64` (NumPy convention); float
+/// inputs preserve their width.
+///
+/// `Bool` is rejected — the operation isn't meaningful and would always
+/// reduce to a count of `true` elements.
+pub fn magnitude(input: Arc<dyn DynamicNode>) -> Result<Arc<dyn DynamicNode>, BuildError> {
+    let in_schema = require_value(&input)?;
+    if in_schema.prim_type == PrimType::Bool {
+        return Err(BuildError::UnsupportedDtype { op: "magnitude", dtype: in_schema.prim_type });
+    }
+    let out_dtype = if is_int(in_schema.prim_type) { PrimType::F64 } else { in_schema.prim_type };
+    let out_schema = ComponentSchema::new(out_dtype, &[]);
+    let id = hash_id(op_tag::MAGNITUDE, &[input.id()], |_| {});
+    let parent_clock = input.parent_clock_id();
+    let in_value_size = in_schema.size();
+    let in_dtype = in_schema.prim_type;
+    let n_elems = tensor::shape_elems(&in_schema.dim);
+    let mut reader = input.subscribe();
+    Ok(NodeImpl::spawn(
+        id,
+        ValueType::Value(out_schema.clone()),
+        parent_clock,
+        default_ring_bytes(out_schema.size()),
+        move |output| async move {
+            let _input = input;
+            let mut scratch: Vec<u8> = Vec::with_capacity(out_schema.size());
+            loop {
+                let grant = reader.next().await;
+                for (ts, value) in grant.samples() {
+                    if value.len() != in_value_size {
+                        continue;
+                    }
+                    let mut sum: f64 = 0.0;
+                    for i in 0..n_elems {
+                        let v = read_f64_at(value, in_dtype, i);
+                        sum += v * v;
+                    }
+                    scratch.clear();
+                    write_f64_as(&mut scratch, out_dtype, sum.sqrt());
+                    write_sample(&output, ts, &scratch);
+                }
+            }
+        },
+    ))
+}
+
 /// Sliding window over a stream. Emits `[size, ...input.shape]` on every input
 /// tick, dtype preserved. The buffer is preloaded with zeros so emissions
 /// start immediately; the leading zeros wash out after `size` ticks.

@@ -8,7 +8,7 @@
 //! built-in persist task (spawned by `Component::create`) handles disk.
 
 use std::hash::Hash;
-use std::sync::Arc;
+use std::sync::{Arc, atomic};
 
 use metor_db::DB;
 use metor_proto::types::ComponentId;
@@ -45,6 +45,11 @@ pub fn persist(
     // Component survives upstream edits.
     let component_id = ComponentId(component_id_for_name(&name));
 
+    // Detect whether `insert_component` actually adds a new entry — it
+    // returns `Ok(())` for both "newly inserted" and "already existed
+    // with matching schema". We need this distinction so we only bump
+    // `vtable_gen` (which wakes view watchers) on actual additions.
+    let was_new = db.with_state(|s| s.get_component(component_id).is_none());
     db.with_state_mut(|s| s.insert_component(component_id, schema.clone(), &db.path))
         .map_err(|err| match err {
             metor_db::Error::SchemaMismatch => {
@@ -63,6 +68,14 @@ pub fn persist(
                 BuildError::DbError(other.to_string())
             }
         })?;
+    if was_new {
+        // Notify any view that's parked on `db.vtable_gen.wait()`
+        // (component browser, monitor, table, ...). Without this, a freshly
+        // persisted node only shows up after something else bumps the gen.
+        // `DB::insert_vtable` does this same fetch_add on the realize_fields
+        // path; we mirror it here for the direct insert.
+        db.vtable_gen.fetch_add(1, atomic::Ordering::SeqCst);
+    }
 
     let mut metadata = metor_proto_wkt::ComponentMetadata {
         component_id,

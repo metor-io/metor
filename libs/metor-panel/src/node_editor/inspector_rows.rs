@@ -570,11 +570,13 @@ pub fn rows_for_node(
         | NodeSpec::Neg
         | NodeSpec::Log
         | NodeSpec::Fft
+        | NodeSpec::Magnitude
         | NodeSpec::Add
         | NodeSpec::Sub
         | NodeSpec::Mul
         | NodeSpec::Mean
         | NodeSpec::Pack
+        | NodeSpec::Dot
         | NodeSpec::Zoh
         | NodeSpec::Linear
         | NodeSpec::LatestAt => {}

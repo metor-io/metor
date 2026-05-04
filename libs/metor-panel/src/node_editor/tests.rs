@@ -194,6 +194,28 @@ async fn fft_id_matches() {
 }
 
 #[stellarator::test]
+async fn magnitude_id_matches() {
+    let clock = ops::clock::fixed_rate(100.0).unwrap();
+    let a = const_f64(clock.clone(), 1.0).unwrap();
+    let b = const_f64(clock, 2.0).unwrap();
+    let packed = ops::compose::pack(vec![a, b]).unwrap();
+    let packed_id = packed.id();
+    let mag = ops::derive::magnitude(packed).unwrap();
+    assert_eq!(mag.id(), compute_node_id(&NodeSpec::Magnitude, &[packed_id]));
+}
+
+#[stellarator::test]
+async fn dot_id_matches() {
+    let clock = ops::clock::fixed_rate(100.0).unwrap();
+    let a = const_f64(clock.clone(), 1.0).unwrap();
+    let b = const_f64(clock, 2.0).unwrap();
+    let aid = a.id();
+    let bid = b.id();
+    let dot = ops::compose::dot(a, b).unwrap();
+    assert_eq!(dot.id(), compute_node_id(&NodeSpec::Dot, &[aid, bid]));
+}
+
+#[stellarator::test]
 async fn add_sub_mul_ids_match() {
     let clock = ops::clock::fixed_rate(100.0).unwrap();
     let a = const_f64(clock.clone(), 1.0).unwrap();
@@ -259,6 +281,36 @@ fn persist_id_matches() {
         &[parent],
     );
     assert_eq!(direct, computed);
+}
+
+#[stellarator::test]
+async fn persist_bumps_vtable_gen_on_new_component() {
+    let db_path = unique_db_path("persist-vtable-gen");
+    let db = Arc::new(metor_db::DB::create(db_path.clone()).unwrap());
+    let before = db.vtable_gen.latest();
+
+    let clock = ops::clock::fixed_rate(100.0).unwrap();
+    let src = const_f64(clock, 1.5).unwrap();
+    let _persisted = ops::persist::persist(&db, "fresh-component".into(), src).unwrap();
+
+    let after = db.vtable_gen.latest();
+    assert!(
+        after > before,
+        "persist of a new component must bump vtable_gen ({before} -> {after})",
+    );
+
+    // Persisting the *same* name shouldn't bump again — the component
+    // already exists so view watchers don't need re-notifying.
+    let clock2 = ops::clock::fixed_rate(100.0).unwrap();
+    let src2 = const_f64(clock2, 1.5).unwrap();
+    let _persisted2 = ops::persist::persist(&db, "fresh-component".into(), src2).unwrap();
+    assert_eq!(
+        db.vtable_gen.latest(),
+        after,
+        "re-persisting an existing name must not bump vtable_gen",
+    );
+
+    let _ = std::fs::remove_dir_all(&db_path);
 }
 
 fn graph_with_clock_and_constant() -> NodeGraph {

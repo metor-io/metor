@@ -181,6 +181,12 @@ pub const ALL: &[OpDescriptor] = &[
         default_spec: || NodeSpec::Fft,
         arg_count: 0,
     },
+    OpDescriptor {
+        kind: NodeSpecKind::Magnitude, label: "Magnitude", category: "Derive",
+        inputs: ONE_VALUE, output: F64,
+        default_spec: || NodeSpec::Magnitude,
+        arg_count: 0,
+    },
     // Compose
     OpDescriptor {
         kind: NodeSpecKind::Add, label: "Add", category: "Compose",
@@ -210,6 +216,12 @@ pub const ALL: &[OpDescriptor] = &[
         kind: NodeSpecKind::Pack, label: "Pack", category: "Compose",
         inputs: Arity::Variadic { kind: F64, min: 1 }, output: VAL,
         default_spec: || NodeSpec::Pack,
+        arg_count: 0,
+    },
+    OpDescriptor {
+        kind: NodeSpecKind::Dot, label: "Dot Product", category: "Compose",
+        inputs: Arity::Exact(&[VAL, VAL]), output: F64,
+        default_spec: || NodeSpec::Dot,
         arg_count: 0,
     },
     // Resample

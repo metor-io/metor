@@ -221,6 +221,66 @@ pub fn mean(inputs: Vec<Arc<dyn DynamicNode>>) -> Result<Arc<dyn DynamicNode>, B
     ))
 }
 
+/// Dot product of two co-clocked vector inputs — `sum(a_i * b_i)` over the
+/// (broadcast) common shape, reduced to a rank-0 scalar.
+///
+/// The output is float-promoted regardless of input dtype because the sum
+/// of int products can easily overflow narrow int types (matches NumPy's
+/// `np.dot` widening for ints).
+pub fn dot(a: Arc<dyn DynamicNode>, b: Arc<dyn DynamicNode>) -> Result<Arc<dyn DynamicNode>, BuildError> {
+    let a_schema = require_value(&a)?;
+    let b_schema = require_value(&b)?;
+    if a_schema.prim_type == PrimType::Bool || b_schema.prim_type == PrimType::Bool {
+        return Err(BuildError::UnsupportedDtype {
+            op: "dot",
+            dtype: PrimType::Bool,
+        });
+    }
+    let clock = require_same_clock(&[a.clone(), b.clone()])?;
+    let common_shape = broadcast_shape(&a_schema.dim, &b_schema.dim)?;
+    let mut out_dtype = promote(a_schema.prim_type, b_schema.prim_type);
+    if !crate::dynamic::tensor::is_float(out_dtype) {
+        out_dtype = PrimType::F64;
+    }
+    let out_schema = ComponentSchema::new(out_dtype, &[]);
+    let id = hash_id(op_tag::DOT, &[a.id(), b.id()], |_| {});
+    let readers = vec![a.subscribe(), b.subscribe()];
+    let a_size = a_schema.size();
+    let b_size = b_schema.size();
+    let a_dtype = a_schema.prim_type;
+    let b_dtype = b_schema.prim_type;
+    let a_dim_clone: SmallVec<[usize; 4]> = a_schema.dim.clone();
+    let b_dim_clone: SmallVec<[usize; 4]> = b_schema.dim.clone();
+    let common_shape_clone = common_shape.clone();
+    Ok(NodeImpl::spawn(
+        id,
+        ValueType::Value(out_schema.clone()),
+        Some(clock),
+        default_ring_bytes(out_schema.size()),
+        move |output| async move {
+            let _a = a;
+            let _b = b;
+            run_aligned_emit(readers, output, move |inputs, out| {
+                let av = inputs[0];
+                let bv = inputs[1];
+                if av.len() != a_size || bv.len() != b_size {
+                    return;
+                }
+                let it_a = BroadcastIter::new(&a_dim_clone, &common_shape_clone);
+                let it_b = BroadcastIter::new(&b_dim_clone, &common_shape_clone);
+                let mut sum: f64 = 0.0;
+                for (ai, bi) in it_a.zip(it_b) {
+                    let x = read_f64_at(av, a_dtype, ai);
+                    let y = read_f64_at(bv, b_dtype, bi);
+                    sum += x * y;
+                }
+                write_f64_as(out, out_dtype, sum);
+            })
+            .await;
+        },
+    ))
+}
+
 /// Pack N co-clocked values into a single component with a leading length-N
 /// axis. Per-input shapes broadcast against each other; dtype promotes across
 /// inputs.

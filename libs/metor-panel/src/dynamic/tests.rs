@@ -544,6 +544,118 @@ async fn neg_rejects_unsigned_dtype() {
 }
 
 #[stellarator::test]
+async fn magnitude_reduces_vector_to_l2_norm() {
+    use crate::dynamic::node::DynamicNodeExt;
+    let clock = ops::clock::fixed_rate(200.0).unwrap();
+    // Pack [3.0, 4.0] → expected magnitude = 5.0.
+    let a = const_f64(clock.clone(), 3.0).unwrap();
+    let b = const_f64(clock, 4.0).unwrap();
+    let packed = ops::compose::pack(vec![a, b]).unwrap();
+    let mag = ops::derive::magnitude(packed).unwrap();
+    let schema = match mag.value_type() {
+        ValueType::Value(s) => s.clone(),
+        _ => panic!(),
+    };
+    assert_eq!(schema.prim_type, PrimType::F64);
+    assert!(schema.dim.is_empty(), "magnitude reduces to a scalar");
+    let samples = drain_f64(&mag, 8).await;
+    for (_, v) in &samples {
+        assert!((v - 5.0).abs() < 1e-9, "got {v}");
+    }
+}
+
+#[stellarator::test]
+async fn magnitude_promotes_int_input_to_f64() {
+    let clock = ops::clock::fixed_rate(200.0).unwrap();
+    // i32 vector [3, 4] — magnitude should be 5.0 as f64.
+    let v = const_typed(clock, TypedScalar::I32(0), SmallVec::from_slice(&[2])).unwrap();
+    // Need a non-zero vector — wrap via pack of two scalars
+    let _ = v;
+    let clock2 = ops::clock::fixed_rate(200.0).unwrap();
+    let a = const_typed(clock2.clone(), TypedScalar::I32(3), SmallVec::new()).unwrap();
+    let b = const_typed(clock2, TypedScalar::I32(4), SmallVec::new()).unwrap();
+    let packed = ops::compose::pack(vec![a, b]).unwrap();
+    let mag = ops::derive::magnitude(packed).unwrap();
+    let schema = match mag.value_type() {
+        ValueType::Value(s) => s.clone(),
+        _ => panic!(),
+    };
+    assert_eq!(schema.prim_type, PrimType::F64);
+    let samples = drain_f64(&mag, 4).await;
+    for (_, v) in &samples {
+        assert!((v - 5.0).abs() < 1e-9);
+    }
+}
+
+#[stellarator::test]
+async fn magnitude_rejects_bool() {
+    let clock = ops::clock::fixed_rate(100.0).unwrap();
+    let src = const_typed(clock, TypedScalar::Bool(true), SmallVec::new()).unwrap();
+    let err = match ops::derive::magnitude(src) {
+        Ok(_) => panic!("must reject bool"),
+        Err(e) => e,
+    };
+    assert!(matches!(
+        err,
+        crate::dynamic::BuildError::UnsupportedDtype { op: "magnitude", .. }
+    ));
+}
+
+#[stellarator::test]
+async fn dot_product_of_vectors() {
+    let clock = ops::clock::fixed_rate(200.0).unwrap();
+    // a = [1, 2, 3], b = [4, 5, 6] → 1*4 + 2*5 + 3*6 = 32
+    let a1 = const_f64(clock.clone(), 1.0).unwrap();
+    let a2 = const_f64(clock.clone(), 2.0).unwrap();
+    let a3 = const_f64(clock.clone(), 3.0).unwrap();
+    let b1 = const_f64(clock.clone(), 4.0).unwrap();
+    let b2 = const_f64(clock.clone(), 5.0).unwrap();
+    let b3 = const_f64(clock, 6.0).unwrap();
+    let a = ops::compose::pack(vec![a1, a2, a3]).unwrap();
+    let b = ops::compose::pack(vec![b1, b2, b3]).unwrap();
+    let dot = ops::compose::dot(a, b).unwrap();
+    let schema = match dot.value_type() {
+        ValueType::Value(s) => s.clone(),
+        _ => panic!(),
+    };
+    assert_eq!(schema.prim_type, PrimType::F64);
+    assert!(schema.dim.is_empty());
+    let samples = drain_f64(&dot, 4).await;
+    for (_, v) in &samples {
+        assert!((v - 32.0).abs() < 1e-9, "got {v}");
+    }
+}
+
+#[stellarator::test]
+async fn dot_product_broadcasts_scalar() {
+    let clock = ops::clock::fixed_rate(200.0).unwrap();
+    // [1,2,3] dot scalar 2 = (1+2+3)*2 = 12 (broadcast scalar replicates)
+    let a1 = const_f64(clock.clone(), 1.0).unwrap();
+    let a2 = const_f64(clock.clone(), 2.0).unwrap();
+    let a3 = const_f64(clock.clone(), 3.0).unwrap();
+    let a = ops::compose::pack(vec![a1, a2, a3]).unwrap();
+    let s = const_f64(clock, 2.0).unwrap();
+    let dot = ops::compose::dot(a, s).unwrap();
+    let samples = drain_f64(&dot, 4).await;
+    for (_, v) in &samples {
+        assert!((v - 12.0).abs() < 1e-9, "got {v}");
+    }
+}
+
+#[stellarator::test]
+async fn dot_product_rejects_clock_mismatch() {
+    let clk_a = ops::clock::fixed_rate(100.0).unwrap();
+    let clk_b = ops::clock::fixed_rate(200.0).unwrap();
+    let a = const_f64(clk_a, 1.0).unwrap();
+    let b = const_f64(clk_b, 1.0).unwrap();
+    let err = match ops::compose::dot(a, b) {
+        Ok(_) => panic!("must reject mismatched clocks"),
+        Err(e) => e,
+    };
+    assert!(matches!(err, crate::dynamic::BuildError::ClockMismatch));
+}
+
+#[stellarator::test]
 async fn zoh_passes_through_typed_vector_bytes() {
     let slow = ops::clock::fixed_rate(50.0).unwrap();
     let fast = ops::clock::fixed_rate(400.0).unwrap();
