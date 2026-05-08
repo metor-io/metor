@@ -289,6 +289,24 @@ async fn magnitude_id_matches() {
 }
 
 #[stellarator::test]
+async fn delta_id_matches() {
+    let clock = ops::clock::fixed_rate(100.0).unwrap();
+    let src = const_f64(clock, 1.0).unwrap();
+    let src_id = src.id();
+    let built = ops::derive::delta(src).unwrap();
+    assert_eq!(built.id(), compute_node_id(&NodeSpec::Delta, &[src_id]));
+}
+
+#[stellarator::test]
+async fn delta_t_id_matches() {
+    let clock = ops::clock::fixed_rate(100.0).unwrap();
+    let src = const_f64(clock, 1.0).unwrap();
+    let src_id = src.id();
+    let built = ops::derive::delta_t(src).unwrap();
+    assert_eq!(built.id(), compute_node_id(&NodeSpec::DeltaT, &[src_id]));
+}
+
+#[stellarator::test]
 async fn dot_id_matches() {
     let clock = ops::clock::fixed_rate(100.0).unwrap();
     let a = const_f64(clock.clone(), 1.0).unwrap();

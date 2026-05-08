@@ -505,3 +505,95 @@ pub fn window(
         },
     ))
 }
+
+/// First-difference: emits `x[n] - x[n-1]` element-wise, preserving input shape.
+/// Output dtype is `f64` so signed differences are always representable. The
+/// first sample is dropped (no prior to diff against); emission begins on the
+/// second sample.
+pub fn delta(input: Arc<dyn DynamicNode>) -> Result<Arc<dyn DynamicNode>, BuildError> {
+    let in_schema = require_value(&input)?;
+    if in_schema.prim_type == PrimType::Bool {
+        return Err(BuildError::UnsupportedDtype {
+            op: "delta",
+            dtype: in_schema.prim_type,
+        });
+    }
+    let in_dtype = in_schema.prim_type;
+    let in_value_size = in_schema.size();
+    let n_elems = tensor::shape_elems(&in_schema.dim);
+    let out_schema = ComponentSchema::new(PrimType::F64, &in_schema.dim);
+    let id = hash_id(op_tag::DELTA, &[input.id()], |_| {});
+    let parent_clock = input.parent_clock_id();
+    let mut reader = input.subscribe();
+    Ok(NodeImpl::spawn(
+        id,
+        ValueType::Value(out_schema.clone()),
+        parent_clock,
+        default_ring_bytes(out_schema.size()),
+        move |output| async move {
+            let _input = input;
+            let mut prev: Option<Vec<f64>> = None;
+            let mut curr: Vec<f64> = vec![0.0; n_elems];
+            let mut scratch: Vec<u8> = Vec::with_capacity(out_schema.size());
+            loop {
+                let grant = reader.next().await;
+                for (ts, value) in grant.samples() {
+                    if value.len() != in_value_size {
+                        continue;
+                    }
+                    for i in 0..n_elems {
+                        curr[i] = read_f64_at(value, in_dtype, i);
+                    }
+                    match prev.as_mut() {
+                        None => {
+                            prev = Some(curr.clone());
+                        }
+                        Some(p) => {
+                            scratch.clear();
+                            for i in 0..n_elems {
+                                scratch.extend_from_slice(&(curr[i] - p[i]).to_le_bytes());
+                            }
+                            write_sample(&output, ts, &scratch);
+                            p.copy_from_slice(&curr);
+                        }
+                    }
+                }
+            }
+        },
+    ))
+}
+
+/// Time-difference: emits `(ts[n] - ts[n-1])` in seconds as an `f64` scalar.
+/// Accepts any input — clock or value — since it only taps the timestamp
+/// stream. The first sample is dropped (no prior timestamp).
+pub fn delta_t(input: Arc<dyn DynamicNode>) -> Result<Arc<dyn DynamicNode>, BuildError> {
+    let out_schema = ComponentSchema::new(PrimType::F64, &[]);
+    let id = hash_id(op_tag::DELTA_T, &[input.id()], |_| {});
+    let parent_clock = input.parent_clock_id();
+    let mut reader = input.subscribe();
+    Ok(NodeImpl::spawn(
+        id,
+        ValueType::Value(out_schema.clone()),
+        parent_clock,
+        default_ring_bytes(out_schema.size()),
+        move |output| async move {
+            let _input = input;
+            let mut prev: Option<metor_proto::types::Timestamp> = None;
+            loop {
+                let grant = reader.next().await;
+                for (ts, _value) in grant.samples() {
+                    match prev {
+                        None => {
+                            prev = Some(ts);
+                        }
+                        Some(p) => {
+                            let dt = (ts.0 - p.0) as f64 * 1e-6;
+                            write_sample(&output, ts, &dt.to_le_bytes());
+                            prev = Some(ts);
+                        }
+                    }
+                }
+            }
+        },
+    ))
+}
