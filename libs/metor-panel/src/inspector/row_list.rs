@@ -98,9 +98,8 @@ impl RowList {
                     );
                 }
             }
-            // `Pop` and `Dismiss` are no-ops for embedded RowList — there's
-            // no page stack to pop and the host owns dismissal.
-            RowAction::Pop | RowAction::Dismiss => {}
+            // Embedded RowList has no page stack and no overlay to dismiss.
+            RowAction::Pop | RowAction::Dismiss | RowAction::CascadeView { .. } => {}
         }
     }
 

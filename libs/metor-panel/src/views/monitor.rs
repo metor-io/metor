@@ -9,6 +9,7 @@ use super::time_series::{LinePlot, Trace};
 use super::value_strip::{ComponentValueStrip, StripBehavior, StripClick, StripStyle};
 use crate::ComponentStreamBuilder;
 use crate::inspector::edits::{EditRequest, pending_edits, pending_edits_mut};
+use crate::inspector::plot_preview::shift_hover_listener;
 use crate::theme::theme;
 
 /// Dashboard tile showing a component's current value, name, and an optional
@@ -230,10 +231,12 @@ impl Render for Monitor {
 
         root = root.child(
             div()
+                .id("monitor-name")
                 .px(px(6.0))
                 .pb(px(4.0))
                 .text_size(px(11.0))
                 .text_color(theme.text_primary)
+                .on_mouse_move(shift_hover_listener(self.component_id, SmallVec::new()))
                 .child(self.name.clone()),
         );
 

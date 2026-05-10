@@ -9,14 +9,15 @@ use std::ops::Range;
 use std::sync::Arc;
 
 use gpui::{
-    AnyElement, App, Bounds, Context, Corner, FocusHandle, Focusable, IntoElement, KeyDownEvent,
-    Pixels, Point, Render, ScrollStrategy, SharedString, UniformListScrollHandle, Window, anchored,
-    canvas, deferred, div, prelude::*, px, uniform_list,
+    AnyElement, AnyView, App, Bounds, Context, Corner, FocusHandle, Focusable, IntoElement,
+    KeyDownEvent, Pixels, Point, Render, ScrollStrategy, SharedString, Size,
+    UniformListScrollHandle, Window, anchored, canvas, deferred, div, prelude::*, px, uniform_list,
 };
 
 pub mod drag_paint;
 pub mod edits;
 pub mod palette;
+pub mod plot_preview;
 pub mod reflect;
 pub mod registry;
 pub mod row_list;
@@ -73,8 +74,19 @@ pub fn open_inspector(cx: &App) -> Option<OpenInspectorCallback> {
     cx.try_global::<OpenInspectorGlobal>().map(|g| g.0.clone())
 }
 
+/// What a single inspector page renders.
+///
+/// `Rows` is the standard fuzzy-searchable list. `View` embeds an arbitrary
+/// gpui view (e.g. a transient plot), reusing the inspector's overlay chrome
+/// — anchored/centered placement, click-outside dismiss, page stack, focus
+/// restoration — without forcing the content into the row model.
+enum InspectorPageKind {
+    Rows(Vec<Box<dyn InspectorRow>>),
+    View { view: AnyView, size: Size<Pixels> },
+}
+
 struct InspectorPage {
-    rows: Vec<Box<dyn InspectorRow>>,
+    kind: InspectorPageKind,
     label: Option<SharedString>,
 }
 
@@ -92,6 +104,11 @@ pub struct Inspector {
     editing: Option<EditState>,
     panel_bounds: Option<Bounds<Pixels>>,
     scroll_handle: UniformListScrollHandle,
+    /// `false` for hover-style previews. Suppresses both keyboard focus
+    /// capture and the full-window occluding overlay used for
+    /// click-outside dismissal — together those keep the underlying
+    /// surface fully interactive while the preview is up.
+    dismiss_on_outside_click: bool,
 }
 
 struct EditState {
@@ -106,8 +123,39 @@ impl Inspector {
         mode: InspectorMode,
         cx: &mut Context<Self>,
     ) -> Self {
+        Self::from_page(
+            InspectorPage {
+                kind: InspectorPageKind::Rows(rows),
+                label: None,
+            },
+            mode,
+            cx,
+        )
+    }
+
+    /// Open the inspector on a view-hosting page rather than a row list.
+    /// `size` is the preferred panel size; the inspector forwards it to
+    /// the embedded view's container.
+    pub fn with_view(
+        view: AnyView,
+        label: Option<SharedString>,
+        size: Size<Pixels>,
+        mode: InspectorMode,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        Self::from_page(
+            InspectorPage {
+                kind: InspectorPageKind::View { view, size },
+                label,
+            },
+            mode,
+            cx,
+        )
+    }
+
+    fn from_page(page: InspectorPage, mode: InspectorMode, cx: &mut Context<Self>) -> Self {
         Self {
-            pages: vec![InspectorPage { rows, label: None }],
+            pages: vec![page],
             mode,
             focus_handle: cx.focus_handle(),
             parent_focus: None,
@@ -117,11 +165,19 @@ impl Inspector {
             editing: None,
             panel_bounds: None,
             scroll_handle: UniformListScrollHandle::new(),
+            dismiss_on_outside_click: true,
         }
     }
 
     pub fn set_parent_focus(&mut self, handle: FocusHandle) {
         self.parent_focus = Some(handle);
+    }
+
+    /// Make the inspector a passive overlay: no focus capture, no
+    /// click-outside dismissal. The caller becomes responsible for the
+    /// lifecycle (typically dropping the entity on some external signal).
+    pub fn set_passive(&mut self) {
+        self.dismiss_on_outside_click = false;
     }
 
     fn current_page(&self) -> &InspectorPage {
@@ -139,17 +195,21 @@ impl Inspector {
 
     fn push_page(
         &mut self,
-        label: Option<SharedString>,
-        rows: Vec<Box<dyn InspectorRow>>,
+        outgoing_label: Option<SharedString>,
+        incoming_label: Option<SharedString>,
+        kind: InspectorPageKind,
         cx: &mut Context<Self>,
     ) {
         // The outgoing page's label becomes a breadcrumb pill above the search box.
         if let Some(current) = self.pages.last_mut()
             && current.label.is_none()
         {
-            current.label = label;
+            current.label = outgoing_label;
         }
-        self.pages.push(InspectorPage { rows, label: None });
+        self.pages.push(InspectorPage {
+            kind,
+            label: incoming_label,
+        });
         self.search.clear();
         self.selected_index = 0;
         cx.notify();
@@ -170,11 +230,20 @@ impl Inspector {
         }
     }
 
+    fn current_rows(&self) -> Option<&[Box<dyn InspectorRow>]> {
+        match &self.current_page().kind {
+            InspectorPageKind::Rows(rows) => Some(rows.as_slice()),
+            InspectorPageKind::View { .. } => None,
+        }
+    }
+
     fn filtered_indices(&self) -> Vec<usize> {
-        let page = self.current_page();
+        let Some(rows) = self.current_rows() else {
+            return Vec::new();
+        };
         let filter = &self.search.text;
         if filter.is_empty() {
-            return (0..page.rows.len()).collect();
+            return (0..rows.len()).collect();
         }
 
         use nucleo_matcher::{
@@ -185,8 +254,7 @@ impl Inspector {
         let mut matcher = Matcher::new(nucleo_matcher::Config::DEFAULT);
         let pattern = Pattern::parse(filter, CaseMatching::Ignore, Normalization::Smart);
 
-        let mut scored: Vec<(usize, u32)> = page
-            .rows
+        let mut scored: Vec<(usize, u32)> = rows
             .iter()
             .enumerate()
             .filter_map(|(i, row)| {
@@ -215,7 +283,10 @@ impl Inspector {
     fn activate_row(&mut self, row_idx: usize, window: &mut Window, cx: &mut Context<Self>) {
         let search = self.search.text.clone();
         let page = self.pages.last_mut().expect("page stack empty");
-        let action = page.rows[row_idx].activate_with_search(&search, window, cx);
+        let InspectorPageKind::Rows(rows) = &mut page.kind else {
+            return;
+        };
+        let action = rows[row_idx].activate_with_search(&search, window, cx);
         self.handle_action(action, row_idx, window, cx);
     }
 
@@ -231,12 +302,23 @@ impl Inspector {
                 cx.notify();
             }
             RowAction::Cascade(child_rows) => {
-                let label = self
-                    .current_page()
-                    .rows
-                    .get(row_idx)
+                let outgoing = self
+                    .current_rows()
+                    .and_then(|rows| rows.get(row_idx))
                     .map(|r| SharedString::from(r.label().to_string()));
-                self.push_page(label, child_rows, cx);
+                self.push_page(outgoing, None, InspectorPageKind::Rows(child_rows), cx);
+            }
+            RowAction::CascadeView { label, view, size } => {
+                let outgoing = self
+                    .current_rows()
+                    .and_then(|rows| rows.get(row_idx))
+                    .map(|r| SharedString::from(r.label().to_string()));
+                self.push_page(
+                    outgoing,
+                    Some(label),
+                    InspectorPageKind::View { view, size },
+                    cx,
+                );
             }
             RowAction::Pop => {
                 self.pop_page(cx);
@@ -286,6 +368,26 @@ impl Inspector {
         cx: &mut Context<Self>,
     ) {
         let key = event.keystroke.key.as_str();
+
+        // View pages only respond to navigation keys; everything else is
+        // ignored so it can propagate to the embedded view's focus tree.
+        if matches!(self.current_page().kind, InspectorPageKind::View { .. }) {
+            match key {
+                "escape" => {
+                    if !self.pop_page(cx) {
+                        self.dismiss(window);
+                    }
+                    cx.notify();
+                }
+                "backspace" => {
+                    if self.pages.len() > 1 {
+                        self.pop_page(cx);
+                    }
+                }
+                _ => {}
+            }
+            return;
+        }
 
         if self.editing.is_some() {
             match key {
@@ -396,7 +498,6 @@ impl Inspector {
         cx: &mut Context<Self>,
     ) -> gpui::Stateful<gpui::Div> {
         let theme = theme(cx);
-        let indices = self.filtered_indices();
 
         let view = cx.entity().clone();
         let bounds_tracker = canvas(
@@ -409,6 +510,40 @@ impl Inspector {
         )
         .size_full()
         .absolute();
+
+        let frame = div()
+            .relative()
+            .flex()
+            .flex_col()
+            .id("inspector-panel")
+            .track_focus(&self.focus_handle)
+            .on_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
+                this.handle_key_down(event, window, cx);
+                cx.notify();
+            }))
+            .bg(theme.bg_elevated)
+            .border_1()
+            .border_color(theme.border_primary)
+            .rounded(px(6.0))
+            .child(bounds_tracker);
+
+        match &self.current_page().kind {
+            InspectorPageKind::Rows(_) => self.render_rows_panel(frame, cx),
+            InspectorPageKind::View { view, size } => {
+                let view = view.clone();
+                let size = *size;
+                self.render_view_panel(frame, view, size, cx)
+            }
+        }
+    }
+
+    fn render_rows_panel(
+        &mut self,
+        frame: gpui::Stateful<gpui::Div>,
+        cx: &mut Context<Self>,
+    ) -> gpui::Stateful<gpui::Div> {
+        let theme = theme(cx);
+        let indices = self.filtered_indices();
 
         let items_element: AnyElement = if indices.is_empty() {
             div()
@@ -442,11 +577,15 @@ impl Inspector {
                                 .as_ref()
                                 .is_some_and(|e| e.row_index == row_idx);
 
+                            let InspectorPageKind::Rows(rows) = &this.current_page().kind
+                            else {
+                                unreachable!("render_rows_panel is only entered on Rows pages");
+                            };
+
                             let element = if is_editing {
                                 let edit = this.editing.as_ref().unwrap();
-                                let page = this.current_page();
                                 let label =
-                                    SharedString::from(page.rows[row_idx].label().to_string());
+                                    SharedString::from(rows[row_idx].label().to_string());
                                 crate::inspector::rows::row_base(vis_ix, selected, cx)
                                     .child(
                                         div()
@@ -457,9 +596,8 @@ impl Inspector {
                                     .child(div().flex_1().min_w_0().child(edit.field.element()))
                                     .into_any_element()
                             } else {
-                                let page = this.current_page();
                                 let row_element =
-                                    page.rows[row_idx].render_row(vis_ix, selected, window, cx);
+                                    rows[row_idx].render_row(vis_ix, selected, window, cx);
                                 let row_idx_click = row_idx;
                                 div()
                                     .on_mouse_down(
@@ -489,25 +627,67 @@ impl Inspector {
             InspectorMode::Centered => px(500.0),
         };
 
-        div()
-            .relative()
-            .flex()
-            .flex_col()
-            .id("inspector-panel")
-            .track_focus(&self.focus_handle)
-            .on_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
-                this.handle_key_down(event, window, cx);
-                cx.notify();
-            }))
+        frame
             .w(width)
             .max_h(px(400.0))
-            .bg(theme.bg_elevated)
-            .border_1()
-            .border_color(theme.border_primary)
-            .rounded(px(6.0))
-            .child(bounds_tracker)
             .child(self.render_input_bar(cx))
             .child(div().py(px(2.0)).child(items_element))
+    }
+
+    fn render_view_panel(
+        &self,
+        frame: gpui::Stateful<gpui::Div>,
+        view: AnyView,
+        size: Size<Pixels>,
+        cx: &App,
+    ) -> gpui::Stateful<gpui::Div> {
+        let theme = theme(cx);
+
+        // Breadcrumb pills for parent pages, plus the current page's label
+        // as a header (the input bar slot is reused so the chrome matches
+        // the rows path).
+        let mut bar = div()
+            .flex()
+            .flex_row()
+            .items_center()
+            .px(px(8.0))
+            .py(px(4.0))
+            .border_b_1()
+            .border_color(theme.border_primary)
+            .text_size(px(12.0));
+        let last_ix = self.pages.len().saturating_sub(1);
+        for page in &self.pages[..last_ix] {
+            if let Some(label) = &page.label {
+                bar = bar.child(
+                    div()
+                        .px(px(6.0))
+                        .py(px(1.0))
+                        .mr(px(4.0))
+                        .bg(theme.pill_bg)
+                        .border_1()
+                        .border_color(theme.pill_border)
+                        .rounded(px(3.0))
+                        .text_size(px(10.0))
+                        .text_color(theme.text_secondary)
+                        .child(label.clone()),
+                );
+            }
+        }
+        if let Some(label) = self.current_page().label.clone() {
+            bar = bar.child(
+                div()
+                    .text_size(px(12.0))
+                    .text_color(theme.text_primary)
+                    .child(label),
+            );
+        }
+
+        let body = div()
+            .w(size.width)
+            .h(size.height)
+            .child(view);
+
+        frame.w(size.width).child(bar).child(body)
     }
 }
 
@@ -525,32 +705,52 @@ impl Render for Inspector {
 
         let panel = self.render_panel(window, cx);
 
-        let panel_with_dismiss =
-            panel.on_mouse_down_out(cx.listener(|this, _: &gpui::MouseDownEvent, window, _cx| {
-                this.dismiss(window);
-            }));
+        // The full-window occluder used for click-outside dismissal also
+        // blocks moves to the surface beneath — incompatible with
+        // hover-driven previews, which need the source to keep firing.
+        let dismiss_on_outside = self.dismiss_on_outside_click;
 
         match self.mode {
             InspectorMode::Anchored(position) => {
+                let panel = if dismiss_on_outside {
+                    panel
+                        .on_mouse_down_out(cx.listener(
+                            |this, _: &gpui::MouseDownEvent, window, _cx| {
+                                this.dismiss(window);
+                            },
+                        ))
+                        .into_any_element()
+                } else {
+                    panel.into_any_element()
+                };
+
                 let anchored_panel = anchored()
                     .position(position)
                     .anchor(Corner::TopLeft)
                     .snap_to_window_with_margin(px(8.0))
-                    .child(panel_with_dismiss);
+                    .child(panel);
 
-                let overlay = div()
-                    .id("inspector-overlay")
-                    .occlude()
-                    .absolute()
-                    .top_0()
-                    .left_0()
-                    .size_full()
-                    .child(anchored_panel)
-                    .shadow_sm();
-
-                deferred(overlay).with_priority(1).into_any_element()
+                if dismiss_on_outside {
+                    let overlay = div()
+                        .id("inspector-overlay")
+                        .occlude()
+                        .absolute()
+                        .top_0()
+                        .left_0()
+                        .size_full()
+                        .child(anchored_panel)
+                        .shadow_sm();
+                    deferred(overlay).with_priority(1).into_any_element()
+                } else {
+                    deferred(anchored_panel).with_priority(1).into_any_element()
+                }
             }
             InspectorMode::Centered => {
+                let panel = panel.on_mouse_down_out(cx.listener(
+                    |this, _: &gpui::MouseDownEvent, window, _cx| {
+                        this.dismiss(window);
+                    },
+                ));
                 let centered = div()
                     .id("inspector-centered")
                     .occlude()
@@ -562,7 +762,7 @@ impl Render for Inspector {
                     .flex_col()
                     .items_center()
                     .pt(px(80.0))
-                    .child(panel_with_dismiss)
+                    .child(panel)
                     .shadow_sm();
 
                 deferred(centered).with_priority(1).into_any_element()

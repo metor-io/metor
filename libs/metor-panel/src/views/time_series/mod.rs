@@ -643,6 +643,45 @@ pub struct TimeSeriesPlot {
     last_plot_area: Option<Bounds<Pixels>>,
 }
 
+/// Build traces for `component_id` × `indices`, cycling theme colors and
+/// labelling each trace `component.element`. Shared by tile and inspector
+/// preview construction so both paths look identical.
+pub fn traces_for_component(
+    db: &DB,
+    component_id: ComponentId,
+    indices: &[usize],
+    cx: &gpui::App,
+) -> Vec<Trace> {
+    let theme = crate::theme::theme(cx);
+    let elem_names =
+        crate::inspector::trace_picker::element_names_for_component(db, component_id);
+    let comp_name = db
+        .with_state(|s| {
+            s.get_component_metadata(component_id)
+                .map(|m| m.name.clone())
+        })
+        .unwrap_or_default();
+    indices
+        .iter()
+        .enumerate()
+        .map(|(i, &idx)| {
+            let label = elem_names
+                .get(idx)
+                .map(|n| format!("{}.{}", comp_name, n))
+                .unwrap_or_else(|| format!("{}[{}]", comp_name, idx));
+            Trace {
+                component_id,
+                element_index: idx,
+                color: theme.line_colors[i % theme.line_colors.len()],
+                style: PlotStyle::default(),
+                visible: true,
+                label: SharedString::from(label),
+                stroke_width: 1.5,
+            }
+        })
+        .collect()
+}
+
 impl TimeSeriesPlot {
     pub fn new(db: Arc<DB>, traces: Vec<Trace>, cx: &mut Context<Self>) -> Self {
         let line_plot = cx.new(|cx| {
@@ -664,6 +703,7 @@ impl TimeSeriesPlot {
 
     /// Convenience constructor: one trace per element, colors cycled from
     /// the theme's categorical palette, labels derived from element names.
+    /// Empty `indexes` defaults to `[0]` to preserve historic behaviour.
     pub fn from_component(
         db: Arc<DB>,
         component_id: impl Into<ComponentId>,
@@ -676,34 +716,7 @@ impl TimeSeriesPlot {
         } else {
             indexes
         };
-        let theme = crate::theme::theme(cx);
-        let elem_names =
-            crate::inspector::trace_picker::element_names_for_component(&db, component_id);
-        let comp_name = db
-            .with_state(|s| {
-                s.get_component_metadata(component_id)
-                    .map(|m| m.name.clone())
-            })
-            .unwrap_or_default();
-        let traces = indexes
-            .iter()
-            .enumerate()
-            .map(|(i, &idx)| {
-                let label = elem_names
-                    .get(idx)
-                    .map(|n| format!("{}.{}", comp_name, n))
-                    .unwrap_or_else(|| format!("{}[{}]", comp_name, idx));
-                Trace {
-                    component_id,
-                    element_index: idx,
-                    color: theme.line_colors[i % theme.line_colors.len()],
-                    style: PlotStyle::default(),
-                    visible: true,
-                    label: SharedString::from(label),
-                    stroke_width: 1.5,
-                }
-            })
-            .collect();
+        let traces = traces_for_component(&db, component_id, indexes, cx);
         Self::new(db, traces, cx)
     }
 

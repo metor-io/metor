@@ -1,7 +1,7 @@
 use std::collections::BTreeSet;
 use std::sync::{Arc, Mutex};
 
-use gpui::{AnyElement, App, SharedString, Window, div, prelude::*, px};
+use gpui::{AnyElement, AnyView, App, Pixels, SharedString, Size, Window, div, prelude::*, px};
 use metor_db::DB;
 use metor_proto::types::ComponentId;
 
@@ -34,6 +34,13 @@ pub fn element_names_for_component(db: &DB, component_id: ComponentId) -> Vec<St
 
 /// Invoked with the [`Trace`]s the user built through the wizard.
 pub type OnTracesSelected = Arc<dyn Fn(Vec<Trace>, &mut Window, &mut App)>;
+
+/// Builds a view to drill into when the wizard commits.
+///
+/// Used by the "Plot Component" palette command to push a transient plot
+/// preview onto the inspector's page stack instead of dismissing.
+pub type BuildPreview =
+    Arc<dyn Fn(Vec<Trace>, &mut App) -> (AnyView, Size<Pixels>, SharedString)>;
 
 /// Starting index into the theme's categorical color palette.
 ///
@@ -117,13 +124,33 @@ pub fn select_traces_wizard_rows(
     on_select: OnTracesSelected,
 ) -> Vec<Box<dyn InspectorRow>> {
     let selection = Arc::new(Mutex::new(TraceSelection::default()));
-    component_list_rows(db, color_basis, on_select, selection)
+    component_list_rows(db, color_basis, ContinueAction::Dismiss(on_select), selection)
+}
+
+/// Variant of [`select_traces_wizard_rows`] that, on Continue, pushes an
+/// inspector view page built from `build` instead of dismissing. The
+/// inspector keeps the wizard pages on its stack so Escape walks back.
+pub fn select_traces_wizard_view(
+    db: Arc<DB>,
+    color_basis: ColorBasis,
+    build: BuildPreview,
+) -> Vec<Box<dyn InspectorRow>> {
+    let selection = Arc::new(Mutex::new(TraceSelection::default()));
+    component_list_rows(db, color_basis, ContinueAction::CascadeView(build), selection)
+}
+
+/// What the wizard's pinned "Continue" row does when the user commits.
+enum ContinueAction {
+    /// Hand traces to a callback and dismiss the inspector.
+    Dismiss(OnTracesSelected),
+    /// Push a view-hosting page onto the inspector stack.
+    CascadeView(BuildPreview),
 }
 
 fn component_list_rows(
     db: Arc<DB>,
     color_basis: ColorBasis,
-    on_select: OnTracesSelected,
+    on_continue: ContinueAction,
     selection: Arc<Mutex<TraceSelection>>,
 ) -> Vec<Box<dyn InspectorRow>> {
     let components: Vec<(ComponentId, String, usize)> = list_components(&db)
@@ -140,7 +167,7 @@ fn component_list_rows(
         selection: selection.clone(),
         db: db.clone(),
         color_basis,
-        on_select,
+        on_continue,
     }));
 
     for (comp_id, comp_name, elem_count) in components {
@@ -222,13 +249,15 @@ fn element_page_rows(
 }
 
 /// Pinned commit row for the component-list page. Shows the current trace
-/// count in its label and dismisses the inspector after handing the built
-/// [`Trace`]s to `on_select`. Activating with an empty selection is a no-op.
+/// count in its label; on activation either dismisses the inspector
+/// (after handing the built [`Trace`]s to a callback) or cascades into a
+/// view page, depending on [`ContinueAction`]. Activating with an empty
+/// selection is a no-op.
 struct ContinueRow {
     selection: Arc<Mutex<TraceSelection>>,
     db: Arc<DB>,
     color_basis: ColorBasis,
-    on_select: OnTracesSelected,
+    on_continue: ContinueAction,
 }
 
 impl InspectorRow for ContinueRow {
@@ -272,8 +301,16 @@ impl InspectorRow for ContinueRow {
             }
             build_traces(&self.db, &sel, &self.color_basis, cx)
         };
-        (self.on_select)(traces, window, cx);
-        RowAction::Dismiss
+        match &self.on_continue {
+            ContinueAction::Dismiss(on_select) => {
+                (on_select)(traces, window, cx);
+                RowAction::Dismiss
+            }
+            ContinueAction::CascadeView(build) => {
+                let (view, size, label) = build(traces, cx);
+                RowAction::CascadeView { label, view, size }
+            }
+        }
     }
 }
 

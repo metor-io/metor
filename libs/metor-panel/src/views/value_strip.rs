@@ -660,6 +660,11 @@ impl Render for ComponentValueStrip {
                 atom
             };
 
+            let atom = atom.on_mouse_move(crate::inspector::plot_preview::shift_hover_listener(
+                component_id,
+                smallvec::smallvec![idx],
+            ));
+
             let child = if has_apply_group {
                 let apply = behavior.on_apply_element.clone().unwrap();
                 let chevron_id =

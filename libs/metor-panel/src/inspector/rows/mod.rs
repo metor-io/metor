@@ -4,7 +4,7 @@
 //! closures needed to read and write its bound data. The inspector itself
 //! only sees [`InspectorRow`] trait objects and a [`RowAction`] reply when
 //! a row is activated, so adding a new widget doesn't touch shared code.
-use gpui::{AnyElement, App, Hsla, SharedString, Window, div, prelude::*, px};
+use gpui::{AnyElement, AnyView, App, Hsla, Pixels, SharedString, Size, Window, div, prelude::*, px};
 
 use crate::theme::theme;
 
@@ -92,6 +92,14 @@ pub enum RowAction {
     StartEdit {
         current_text: String,
         on_commit: Box<dyn FnOnce(String, &mut Window, &mut App)>,
+    },
+    /// Drill into a sub-page that hosts an arbitrary widget instead of a
+    /// row list. Used for transient previews (impromptu plots) that benefit
+    /// from the inspector's overlay chrome and page stack.
+    CascadeView {
+        label: SharedString,
+        view: AnyView,
+        size: Size<Pixels>,
     },
 }
 
