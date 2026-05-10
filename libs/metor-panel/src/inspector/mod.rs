@@ -507,7 +507,7 @@ impl Inspector {
             .rounded(px(6.0))
             .child(bounds_tracker)
             .child(self.render_input_bar(cx))
-            .child(items_element)
+            .child(div().py(px(2.0)).child(items_element))
     }
 }
 

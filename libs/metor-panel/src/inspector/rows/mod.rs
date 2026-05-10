@@ -111,15 +111,22 @@ pub fn tag_pill(tag: SharedString, cx: &App) -> impl IntoElement {
 }
 
 /// Row-chrome the concrete widgets wrap: background, hover, spacing, and id.
+///
+/// The selection/hover highlight is painted as an inset rounded pill behind
+/// the content rather than a full-bleed fill. This keeps the highlight clear
+/// of the panel's rounded corners (gpui content masks are rectangular, so a
+/// full-width fill would bleed past the curve).
 pub fn row_base(row_ix: usize, selected: bool, cx: &App) -> gpui::Stateful<gpui::Div> {
     let theme = theme(cx);
-    let bg = if selected {
+    let pill_bg = if selected {
         theme.selection_bg
     } else {
         Hsla::transparent_black()
     };
     div()
         .id(("inspector-row", row_ix))
+        .group("inspector-row")
+        .relative()
         .flex()
         .flex_row()
         .items_center()
@@ -127,7 +134,16 @@ pub fn row_base(row_ix: usize, selected: bool, cx: &App) -> gpui::Stateful<gpui:
         .w_full()
         .h(px(28.0))
         .px(px(12.0))
-        .bg(bg)
         .cursor_pointer()
-        .hover(|s| s.bg(theme.selection_bg))
+        .child(
+            div()
+                .absolute()
+                .top(px(2.0))
+                .bottom(px(2.0))
+                .left(px(4.0))
+                .right(px(4.0))
+                .rounded(px(4.0))
+                .bg(pill_bg)
+                .group_hover("inspector-row", |s| s.bg(theme.selection_bg)),
+        )
 }

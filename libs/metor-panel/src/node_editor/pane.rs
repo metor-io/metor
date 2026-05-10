@@ -359,6 +359,10 @@ fn input_count(entry: &NodeEntry, edges: &[EdgeEntry], flow_id: &FlowId) -> usiz
 /// math agrees with what gpui actually paints.
 const ARG_ROW_HEIGHT: f32 = 28.0;
 
+/// Vertical padding (top + bottom) added by `RowList` around its rows.
+/// Mirrored here so `node_height` stays in sync with what gets painted.
+const ARG_LIST_PAD: f32 = 4.0;
+
 /// Number of inline arg rows for a spec, used to size the node card.
 fn args_count(spec: &NodeSpec) -> usize {
     descriptor_for(spec).arg_count
@@ -372,7 +376,12 @@ fn node_height(input_count: usize, arg_count: usize) -> f32 {
     let body = if input_count == 0 && arg_count == 0 {
         SOCKET_ROW_HEIGHT
     } else {
-        (input_count as f32) * SOCKET_ROW_HEIGHT + (arg_count as f32) * ARG_ROW_HEIGHT
+        let args_h = if arg_count == 0 {
+            0.0
+        } else {
+            (arg_count as f32) * ARG_ROW_HEIGHT + ARG_LIST_PAD
+        };
+        (input_count as f32) * SOCKET_ROW_HEIGHT + args_h
     };
     HEADER_HEIGHT + body
 }

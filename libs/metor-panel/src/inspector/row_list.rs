@@ -161,6 +161,7 @@ impl Render for RowList {
             .key_context("RowList")
             .flex()
             .flex_col()
+            .py(px(1.0))
             .w_full()
             .track_focus(&self.focus_handle)
             .on_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
