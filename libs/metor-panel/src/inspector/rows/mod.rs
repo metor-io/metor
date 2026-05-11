@@ -78,6 +78,19 @@ pub trait InspectorRow: 'static {
     }
 }
 
+/// A view-hosting inspector page: arbitrary gpui widget, the panel size
+/// to allocate for it, and a header label shown in the chrome.
+///
+/// Shared between [`RowAction::CascadeView`] (drill-in) and
+/// [`Inspector::with_view`](crate::inspector::Inspector::with_view) (open
+/// directly) so the three fields don't have to agree on positional order
+/// at every call site.
+pub struct PreviewSpec {
+    pub view: AnyView,
+    pub size: Size<Pixels>,
+    pub label: SharedString,
+}
+
 /// Reply from [`InspectorRow::activate`] directing what the host should do next.
 pub enum RowAction {
     /// Row mutated its own state; refresh only.
@@ -96,11 +109,7 @@ pub enum RowAction {
     /// Drill into a sub-page that hosts an arbitrary widget instead of a
     /// row list. Used for transient previews (impromptu plots) that benefit
     /// from the inspector's overlay chrome and page stack.
-    CascadeView {
-        label: SharedString,
-        view: AnyView,
-        size: Size<Pixels>,
-    },
+    CascadeView(PreviewSpec),
 }
 
 /// Small pill used for category and tag annotations next to a row label.

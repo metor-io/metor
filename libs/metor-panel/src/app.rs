@@ -247,11 +247,10 @@ impl AppRoot {
             return;
         }
 
-        let (view, size, label) =
-            crate::inspector::plot_preview::build_plot_preview(self.db.clone(), traces, cx);
+        let spec = crate::inspector::plot_preview::build_plot_preview(self.db.clone(), traces, cx);
         let mode = InspectorMode::Anchored(action.anchor);
         let inspector = cx.new(|cx| {
-            let mut insp = Inspector::with_view(view, Some(label), size, mode, cx);
+            let mut insp = Inspector::with_view(spec, mode, cx);
             insp.set_passive();
             insp
         });

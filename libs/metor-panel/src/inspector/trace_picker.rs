@@ -1,9 +1,11 @@
 use std::collections::BTreeSet;
 use std::sync::{Arc, Mutex};
 
-use gpui::{AnyElement, AnyView, App, Pixels, SharedString, Size, Window, div, prelude::*, px};
+use gpui::{AnyElement, App, SharedString, Window, div, prelude::*, px};
 use metor_db::DB;
 use metor_proto::types::ComponentId;
+
+use crate::inspector::rows::PreviewSpec;
 
 use crate::inspector::rows::{BoolRow, InspectorRow, NavRow, RowAction, row_base};
 use crate::theme::theme;
@@ -35,12 +37,11 @@ pub fn element_names_for_component(db: &DB, component_id: ComponentId) -> Vec<St
 /// Invoked with the [`Trace`]s the user built through the wizard.
 pub type OnTracesSelected = Arc<dyn Fn(Vec<Trace>, &mut Window, &mut App)>;
 
-/// Builds a view to drill into when the wizard commits.
+/// Builds an inspector page spec to drill into when the wizard commits.
 ///
 /// Used by the "Plot Component" palette command to push a transient plot
 /// preview onto the inspector's page stack instead of dismissing.
-pub type BuildPreview =
-    Arc<dyn Fn(Vec<Trace>, &mut App) -> (AnyView, Size<Pixels>, SharedString)>;
+pub type BuildPreview = Arc<dyn Fn(Vec<Trace>, &mut App) -> PreviewSpec>;
 
 /// Starting index into the theme's categorical color palette.
 ///
@@ -303,13 +304,10 @@ impl InspectorRow for ContinueRow {
         };
         match &self.on_continue {
             ContinueAction::Dismiss(on_select) => {
-                (on_select)(traces, window, cx);
+                on_select(traces, window, cx);
                 RowAction::Dismiss
             }
-            ContinueAction::CascadeView(build) => {
-                let (view, size, label) = build(traces, cx);
-                RowAction::CascadeView { label, view, size }
-            }
+            ContinueAction::CascadeView(build) => RowAction::CascadeView(build(traces, cx)),
         }
     }
 }

@@ -532,9 +532,10 @@ pub fn delta(input: Arc<dyn DynamicNode>) -> Result<Arc<dyn DynamicNode>, BuildE
         default_ring_bytes(out_schema.size()),
         move |output| async move {
             let _input = input;
-            let mut prev: Option<Vec<f64>> = None;
+            let mut prev: Vec<f64> = vec![0.0; n_elems];
             let mut curr: Vec<f64> = vec![0.0; n_elems];
             let mut scratch: Vec<u8> = Vec::with_capacity(out_schema.size());
+            let mut have_prev = false;
             loop {
                 let grant = reader.next().await;
                 for (ts, value) in grant.samples() {
@@ -544,19 +545,15 @@ pub fn delta(input: Arc<dyn DynamicNode>) -> Result<Arc<dyn DynamicNode>, BuildE
                     for i in 0..n_elems {
                         curr[i] = read_f64_at(value, in_dtype, i);
                     }
-                    match prev.as_mut() {
-                        None => {
-                            prev = Some(curr.clone());
+                    if have_prev {
+                        scratch.clear();
+                        for i in 0..n_elems {
+                            scratch.extend_from_slice(&(curr[i] - prev[i]).to_le_bytes());
                         }
-                        Some(p) => {
-                            scratch.clear();
-                            for i in 0..n_elems {
-                                scratch.extend_from_slice(&(curr[i] - p[i]).to_le_bytes());
-                            }
-                            write_sample(&output, ts, &scratch);
-                            p.copy_from_slice(&curr);
-                        }
+                        write_sample(&output, ts, &scratch);
                     }
+                    prev.copy_from_slice(&curr);
+                    have_prev = true;
                 }
             }
         },
@@ -578,20 +575,17 @@ pub fn delta_t(input: Arc<dyn DynamicNode>) -> Result<Arc<dyn DynamicNode>, Buil
         default_ring_bytes(out_schema.size()),
         move |output| async move {
             let _input = input;
-            let mut prev: Option<metor_proto::types::Timestamp> = None;
+            let mut prev = metor_proto::types::Timestamp(0);
+            let mut have_prev = false;
             loop {
                 let grant = reader.next().await;
                 for (ts, _value) in grant.samples() {
-                    match prev {
-                        None => {
-                            prev = Some(ts);
-                        }
-                        Some(p) => {
-                            let dt = (ts.0 - p.0) as f64 * 1e-6;
-                            write_sample(&output, ts, &dt.to_le_bytes());
-                            prev = Some(ts);
-                        }
+                    if have_prev {
+                        let dt = (ts.0 - prev.0) as f64 * 1e-6;
+                        write_sample(&output, ts, &dt.to_le_bytes());
                     }
+                    prev = ts;
+                    have_prev = true;
                 }
             }
         },

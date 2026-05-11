@@ -26,7 +26,7 @@ pub mod trace_picker;
 
 use crate::theme::theme;
 use rows::text_field::TextAlign;
-use rows::{InspectorRow, RowAction, TextField};
+use rows::{InspectorRow, PreviewSpec, RowAction, TextField, tag_pill};
 
 const ROW_HEIGHT: f32 = 28.0;
 
@@ -134,19 +134,16 @@ impl Inspector {
     }
 
     /// Open the inspector on a view-hosting page rather than a row list.
-    /// `size` is the preferred panel size; the inspector forwards it to
-    /// the embedded view's container.
-    pub fn with_view(
-        view: AnyView,
-        label: Option<SharedString>,
-        size: Size<Pixels>,
-        mode: InspectorMode,
-        cx: &mut Context<Self>,
-    ) -> Self {
+    /// The spec's `size` is the preferred panel size; the inspector
+    /// forwards it to the embedded view's container.
+    pub fn with_view(spec: PreviewSpec, mode: InspectorMode, cx: &mut Context<Self>) -> Self {
         Self::from_page(
             InspectorPage {
-                kind: InspectorPageKind::View { view, size },
-                label,
+                kind: InspectorPageKind::View {
+                    view: spec.view,
+                    size: spec.size,
+                },
+                label: Some(spec.label),
             },
             mode,
             cx,
@@ -308,15 +305,18 @@ impl Inspector {
                     .map(|r| SharedString::from(r.label().to_string()));
                 self.push_page(outgoing, None, InspectorPageKind::Rows(child_rows), cx);
             }
-            RowAction::CascadeView { label, view, size } => {
+            RowAction::CascadeView(spec) => {
                 let outgoing = self
                     .current_rows()
                     .and_then(|rows| rows.get(row_idx))
                     .map(|r| SharedString::from(r.label().to_string()));
                 self.push_page(
                     outgoing,
-                    Some(label),
-                    InspectorPageKind::View { view, size },
+                    Some(spec.label),
+                    InspectorPageKind::View {
+                        view: spec.view,
+                        size: spec.size,
+                    },
                     cx,
                 );
             }
@@ -658,19 +658,7 @@ impl Inspector {
         let last_ix = self.pages.len().saturating_sub(1);
         for page in &self.pages[..last_ix] {
             if let Some(label) = &page.label {
-                bar = bar.child(
-                    div()
-                        .px(px(6.0))
-                        .py(px(1.0))
-                        .mr(px(4.0))
-                        .bg(theme.pill_bg)
-                        .border_1()
-                        .border_color(theme.pill_border)
-                        .rounded(px(3.0))
-                        .text_size(px(10.0))
-                        .text_color(theme.text_secondary)
-                        .child(label.clone()),
-                );
+                bar = bar.child(div().mr(px(4.0)).child(tag_pill(label.clone(), cx)));
             }
         }
         if let Some(label) = self.current_page().label.clone() {
@@ -712,26 +700,18 @@ impl Render for Inspector {
 
         match self.mode {
             InspectorMode::Anchored(position) => {
-                let panel = if dismiss_on_outside {
-                    panel
-                        .on_mouse_down_out(cx.listener(
-                            |this, _: &gpui::MouseDownEvent, window, _cx| {
-                                this.dismiss(window);
-                            },
-                        ))
-                        .into_any_element()
-                } else {
-                    panel.into_any_element()
-                };
-
-                let anchored_panel = anchored()
-                    .position(position)
-                    .anchor(Corner::TopLeft)
-                    .snap_to_window_with_margin(px(8.0))
-                    .child(panel);
-
-                if dismiss_on_outside {
-                    let overlay = div()
+                let element = if dismiss_on_outside {
+                    let panel = panel.on_mouse_down_out(cx.listener(
+                        |this, _: &gpui::MouseDownEvent, window, _cx| {
+                            this.dismiss(window);
+                        },
+                    ));
+                    let anchored_panel = anchored()
+                        .position(position)
+                        .anchor(Corner::TopLeft)
+                        .snap_to_window_with_margin(px(8.0))
+                        .child(panel);
+                    div()
                         .id("inspector-overlay")
                         .occlude()
                         .absolute()
@@ -739,11 +719,17 @@ impl Render for Inspector {
                         .left_0()
                         .size_full()
                         .child(anchored_panel)
-                        .shadow_sm();
-                    deferred(overlay).with_priority(1).into_any_element()
+                        .shadow_sm()
+                        .into_any_element()
                 } else {
-                    deferred(anchored_panel).with_priority(1).into_any_element()
-                }
+                    anchored()
+                        .position(position)
+                        .anchor(Corner::TopLeft)
+                        .snap_to_window_with_margin(px(8.0))
+                        .child(panel)
+                        .into_any_element()
+                };
+                deferred(element).with_priority(1).into_any_element()
             }
             InspectorMode::Centered => {
                 let panel = panel.on_mouse_down_out(cx.listener(
