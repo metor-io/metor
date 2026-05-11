@@ -6,7 +6,7 @@ use gpui::{
     SharedString, Styled, TextRun, Window, canvas, div, point, prelude::*, px,
 };
 use metor_db::{Component, DB};
-use metor_proto::types::{ComponentId, PrimType};
+use metor_proto::types::{ComponentId, PrimType, Timestamp};
 
 #[allow(unused_imports)]
 use crate::inspect;
@@ -25,6 +25,15 @@ pub use override_field::Override;
 
 pub mod time_range;
 pub use time_range::TimeRangeBehavior;
+
+pub mod cursor;
+pub use cursor::{CursorId, MeasurementCursor};
+
+pub mod measurements;
+pub use measurements::{MeasurementKind, MeasurementKindList};
+
+pub mod cursor_inspector;
+pub use cursor_inspector::build_cursor_rows;
 
 /// Iterator of tick values for any value axis on a `[min, max)` range.
 ///
@@ -568,6 +577,249 @@ fn paint_overlay(
     }
 }
 
+/// One colored span in the cursor's readout header.
+///
+/// Per-trace numbers carry the trace's color so the badge legend is
+/// implicit — labels and separators use the secondary text color.
+struct HeaderSegment {
+    text: SharedString,
+    color: Hsla,
+}
+
+/// Snapshot of one cursor's visible state, captured during canvas prepare.
+///
+/// Keeps the paint closure free of any `App` access so the gpui callback can
+/// stay `'static + Fn` without re-entering the entity tree on every frame.
+struct CursorPaint {
+    t_start: Timestamp,
+    t_end: Timestamp,
+    /// `true` for the cursor currently being dragged out. Drives the bright
+    /// selection-color stroke; persistent cursors render muted.
+    active: bool,
+    /// `(value, color)` per visible trace at `t_start` and `t_end` so the
+    /// overlay can drop a dot marker on each line.
+    trace_markers: Vec<(f64, f64, Hsla)>,
+    /// Multi-line readout for the top-of-band badge: one line per measurement
+    /// kind, each split into colored segments so per-trace values can render
+    /// in their trace's color.
+    header: Vec<Vec<HeaderSegment>>,
+}
+
+fn paint_cursors(
+    outer_bounds: Bounds<Pixels>,
+    view: PlotBounds,
+    cursors: &[CursorPaint],
+    window: &mut Window,
+    cx: &mut gpui::App,
+) {
+    if cursors.is_empty() {
+        return;
+    }
+    let pb = plot_area(outer_bounds);
+    let theme = crate::theme::theme(cx);
+    let label_font_size = px(LABEL_FONT_SIZE);
+    let text_style = window.text_style();
+    let font = text_style.font();
+
+    for cursor in cursors {
+        let (a, b) = if cursor.t_start.0 <= cursor.t_end.0 {
+            (cursor.t_start, cursor.t_end)
+        } else {
+            (cursor.t_end, cursor.t_start)
+        };
+
+        let primary = if cursor.active {
+            theme.selection_bg
+        } else {
+            theme.text_secondary
+        };
+        // Brighten the selection-derived stroke so it reads as a line, not a fill.
+        let stroke_color = Hsla { a: 1.0, ..primary };
+
+        for ts in [a, b] {
+            let x = view.to_screen(pb, ts.0 as f64, view.min_y).x;
+            if x < pb.origin.x - px(1.0) || x > pb.origin.x + pb.size.width + px(1.0) {
+                continue;
+            }
+            let mut line = PathBuilder::stroke(px(1.0));
+            line.move_to(point(x, pb.origin.y));
+            line.line_to(point(x, pb.origin.y + pb.size.height));
+            if let Ok(path) = line.build() {
+                window.paint_path(path, stroke_color);
+            }
+        }
+
+        // Shaded band between the two endpoints; subtle so the underlying
+        // traces stay legible.
+        let xa = view.to_screen(pb, a.0 as f64, view.min_y).x;
+        let xb = view.to_screen(pb, b.0 as f64, view.min_y).x;
+        let band_left = xa.max(pb.origin.x);
+        let band_right = xb.min(pb.origin.x + pb.size.width);
+        if band_right > band_left {
+            let band = Bounds {
+                origin: point(band_left, pb.origin.y),
+                size: gpui::Size {
+                    width: band_right - band_left,
+                    height: pb.size.height,
+                },
+            };
+            let band_fill = Hsla {
+                a: 0.08,
+                ..stroke_color
+            };
+            window.paint_quad(gpui::fill(band, band_fill));
+        }
+
+        // Dot marker per visible trace at each endpoint.
+        for (start_value, end_value, color) in &cursor.trace_markers {
+            for (ts, value) in [(a, *start_value), (b, *end_value)] {
+                let screen = view.to_screen(pb, ts.0 as f64, value);
+                if screen.x < pb.origin.x
+                    || screen.x > pb.origin.x + pb.size.width
+                    || screen.y < pb.origin.y
+                    || screen.y > pb.origin.y + pb.size.height
+                {
+                    continue;
+                }
+                let dot = Bounds {
+                    origin: point(screen.x - px(3.0), screen.y - px(3.0)),
+                    size: gpui::Size {
+                        width: px(6.0),
+                        height: px(6.0),
+                    },
+                };
+                window.paint_quad(gpui::fill(dot, *color));
+            }
+        }
+
+        // Readout badge near the top of the cursor band: one line per
+        // enabled scalar measurement. Per-trace values are colored by their
+        // trace so the badge doubles as a legend.
+        if cursor.header.is_empty() {
+            continue;
+        }
+        let mid_x = (xa + xb) / 2.0;
+        let mut y_offset = pb.origin.y + px(2.0);
+        let line_height = label_font_size + px(2.0);
+        for line in &cursor.header {
+            if line.is_empty() {
+                continue;
+            }
+            let mut text = String::new();
+            let mut runs: Vec<TextRun> = Vec::with_capacity(line.len());
+            for seg in line {
+                text.push_str(&seg.text);
+                runs.push(TextRun {
+                    len: seg.text.len(),
+                    font: font.clone(),
+                    color: seg.color,
+                    background_color: None,
+                    underline: None,
+                    strikethrough: None,
+                });
+            }
+            let shaped = window.text_system().shape_line(
+                SharedString::from(text),
+                label_font_size,
+                &runs,
+                None,
+            );
+            let origin = point(
+                (mid_x - shaped.width / 2.0)
+                    .max(pb.origin.x + px(2.0))
+                    .min(pb.origin.x + pb.size.width - shaped.width - px(2.0)),
+                y_offset,
+            );
+            let _ = shaped.paint(origin, label_font_size, window, cx);
+            y_offset += line_height;
+        }
+    }
+}
+
+/// Build the multi-line readout badge for `cursor`.
+///
+/// Each enabled scalar measurement produces one line. Trace-independent
+/// kinds (Δx) print a single segment; per-trace kinds (Δy, Mean, RMS, …)
+/// emit the label followed by one segment per visible trace, colored to
+/// match the trace. FFT is omitted (vector result, lives in a cascade page).
+fn cursor_header(
+    cursor: &MeasurementCursor,
+    line_plot: &LinePlot,
+    cx: &gpui::App,
+) -> Vec<Vec<HeaderSegment>> {
+    use measurements::{collect_samples, format_value, reduce};
+
+    let (start, end) = cursor.ordered();
+    let theme = crate::theme::theme(cx);
+    let label_color = theme.text_secondary;
+
+    // Cache samples per (trace_id, element_index) so all per-trace kinds
+    // share one read pass.
+    let visible_traces: Vec<&Entity<Trace>> = line_plot
+        .traces()
+        .iter()
+        .filter(|t| t.read(cx).visible)
+        .collect();
+    let mut samples_by_trace: HashMap<
+        gpui::EntityId,
+        Option<std::sync::Arc<Vec<(Timestamp, f64)>>>,
+    > = HashMap::new();
+
+    let mut lines: Vec<Vec<HeaderSegment>> = Vec::new();
+    for kind in cursor.enabled.iter().copied() {
+        if matches!(kind, MeasurementKind::DeltaX) {
+            lines.push(vec![HeaderSegment {
+                text: SharedString::from(format!(
+                    "Δt {}",
+                    format_value(kind, (end.0 - start.0) as f64)
+                )),
+                color: label_color,
+            }]);
+            continue;
+        }
+
+        let mut line: Vec<HeaderSegment> = Vec::new();
+        line.push(HeaderSegment {
+            text: SharedString::from(format!("{}  ", kind.label())),
+            color: label_color,
+        });
+        let mut any = false;
+        for (i, trace) in visible_traces.iter().enumerate() {
+            let cfg = trace.read(cx);
+            let element_index = cfg.element_index;
+            let samples = samples_by_trace
+                .entry(trace.entity_id())
+                .or_insert_with(|| {
+                    line_plot
+                        .component_for_trace(trace, cx)
+                        .and_then(|c| collect_samples(&c, element_index, start..end))
+                });
+            let Some(s) = samples.as_ref() else {
+                continue;
+            };
+            let Some(v) = reduce(kind, s) else {
+                continue;
+            };
+            if i > 0 && any {
+                line.push(HeaderSegment {
+                    text: SharedString::new_static("  "),
+                    color: label_color,
+                });
+            }
+            line.push(HeaderSegment {
+                text: SharedString::from(format_value(kind, v).to_string()),
+                color: cfg.color,
+            });
+            any = true;
+        }
+        if any {
+            lines.push(line);
+        }
+    }
+
+    lines
+}
+
 /// Rendering mode for a single [`Trace`].
 #[derive(Clone, Copy, Default, PartialEq, facet::Facet)]
 #[repr(u8)]
@@ -629,6 +881,16 @@ impl Trace {
     }
 }
 
+/// State captured at the moment a right-click measurement drag begins.
+///
+/// `start_view` is snapshotted so the visible bounds stay frozen across the
+/// drag — the same pattern the left-click pan uses to keep coordinates
+/// stable while the user is reaching for an endpoint.
+struct CursorDrag {
+    cursor: Entity<MeasurementCursor>,
+    start_view: PlotBounds,
+}
+
 /// Interactive wrapper around a [`LinePlot`] that adds axes, legend, and
 /// pan/zoom input.
 ///
@@ -641,6 +903,8 @@ pub struct TimeSeriesPlot {
     drag_start_view: Option<PlotBounds>,
     drag_zone: AxisZone,
     last_plot_area: Option<Bounds<Pixels>>,
+    cursors: smallvec::SmallVec<[Entity<MeasurementCursor>; 2]>,
+    cursor_drag: Option<CursorDrag>,
 }
 
 /// Build traces for `component_id` × `indices`, cycling theme colors and
@@ -698,6 +962,77 @@ impl TimeSeriesPlot {
             drag_start_view: None,
             drag_zone: AxisZone::Plot,
             last_plot_area: None,
+            cursors: smallvec::SmallVec::new(),
+            cursor_drag: None,
+        }
+    }
+
+    /// Currently-rendered measurement cursors, including the in-progress
+    /// drag cursor (the last entry while `cursor_drag` is `Some`).
+    pub fn cursors(&self) -> &[Entity<MeasurementCursor>] {
+        &self.cursors
+    }
+
+    /// Replace the cursor list (used by [`PlotPanel::from_config`] to
+    /// rehydrate locked cursors after layout deserialization). Each cursor
+    /// is observed so the plot repaints when its endpoints or enabled
+    /// measurements change.
+    pub fn set_cursors(
+        &mut self,
+        cursors: smallvec::SmallVec<[Entity<MeasurementCursor>; 2]>,
+        cx: &mut Context<Self>,
+    ) {
+        self.cursors = cursors;
+        for cursor in self.cursors.clone() {
+            cx.observe(&cursor, |_, _, cx| cx.notify()).detach();
+        }
+        cx.notify();
+    }
+
+    /// Rehydrate persisted cursors from saved config. Trace-index references
+    /// are clamped to the current trace list, and out-of-range indices fall
+    /// back to "no focused trace" so the cursor still renders.
+    pub fn restore_cursors(
+        &mut self,
+        cfg: &[crate::tiles::panels::MeasurementCursorConfig],
+        cx: &mut Context<Self>,
+    ) {
+        let lp_weak = self.line_plot.downgrade();
+        let host_weak = cx.entity().downgrade();
+        let traces = self.line_plot.read(cx).traces().to_vec();
+        let mut restored: smallvec::SmallVec<[Entity<MeasurementCursor>; 2]> =
+            smallvec::SmallVec::new();
+        for entry in cfg {
+            let focused_trace = if entry.focused_trace_index >= 0 {
+                traces
+                    .get(entry.focused_trace_index as usize)
+                    .map(|t| t.entity_id())
+            } else {
+                None
+            };
+            let enabled: MeasurementKindList = entry.enabled.iter().copied().collect();
+            let cursor = cx.new(|_| {
+                MeasurementCursor::new(
+                    Timestamp(entry.t_start_us),
+                    Timestamp(entry.t_end_us),
+                    focused_trace,
+                    enabled,
+                    lp_weak.clone(),
+                    host_weak.clone(),
+                )
+            });
+            restored.push(cursor);
+        }
+        self.set_cursors(restored, cx);
+    }
+
+    /// Drop the cursor matching `id`. No-op when the id has already been
+    /// removed (the inspector close path races with explicit "Delete").
+    pub fn remove_cursor(&mut self, id: CursorId, cx: &mut Context<Self>) {
+        let len_before = self.cursors.len();
+        self.cursors.retain(|c| c.read(cx).id != id);
+        if self.cursors.len() != len_before {
+            cx.notify();
         }
     }
 
@@ -733,6 +1068,136 @@ impl TimeSeriesPlot {
         self.line_plot.read(cx).effective_view(cx)
     }
 
+    /// Right-click hit-tests existing cursors; landing within a few pixels
+    /// of a cursor line re-opens its inspector. Used by both the new-cursor
+    /// path (after release) and the bare right-click on a locked cursor.
+    fn open_cursor_inspector_at(
+        &mut self,
+        position: Point<Pixels>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(pa) = self.last_plot_area else {
+            return;
+        };
+        if axis_zone(position, pa) != AxisZone::Plot {
+            return;
+        }
+        let Some(view) = self.line_plot.read(cx).effective_view(cx) else {
+            return;
+        };
+        let Some(hit) = cursor::cursor_at(&self.cursors, position.x, pa, view, cx) else {
+            return;
+        };
+        let entity = hit.into_any();
+        window.defer(cx, move |window, cx| {
+            window.dispatch_action(
+                Box::new(crate::inspector::InspectEntity { entity, position }),
+                cx,
+            );
+        });
+    }
+
+    fn start_cursor_drag(
+        &mut self,
+        event: &gpui::MouseDownEvent,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(pa) = self.last_plot_area else {
+            return;
+        };
+        if axis_zone(event.position, pa) != AxisZone::Plot {
+            return;
+        }
+        let Some(view) = self.line_plot.read(cx).effective_view(cx) else {
+            return;
+        };
+
+        // Pin bounds for the duration of the drag (mirrors left-drag pan).
+        self.line_plot
+            .update(cx, |lp, cx| lp.set_view_override(Some(view), cx));
+
+        let x_data = cursor::pixel_to_data_x(event.position.x, pa, view);
+        let focused = cursor::focused_trace_at(
+            self.line_plot.read(cx),
+            Timestamp(x_data as i64),
+            event.position.y,
+            pa,
+            view,
+            cx,
+        );
+        let snapped = cursor::snap_x_to_sample(self.line_plot.read(cx), focused, x_data, cx);
+        let enabled = MeasurementKindList::from_slice(&[
+            MeasurementKind::DeltaX,
+            MeasurementKind::DeltaY,
+            MeasurementKind::Mean,
+        ]);
+        let lp_weak = self.line_plot.downgrade();
+        let host_weak = cx.entity().downgrade();
+        let cursor_entity = cx.new(|_| {
+            MeasurementCursor::new(snapped, snapped, focused, enabled, lp_weak, host_weak)
+        });
+        cx.observe(&cursor_entity, |_, _, cx| cx.notify()).detach();
+        self.cursors.push(cursor_entity.clone());
+        self.cursor_drag = Some(CursorDrag {
+            cursor: cursor_entity,
+            start_view: view,
+        });
+        cx.notify();
+    }
+
+    fn handle_cursor_drag_move(
+        &mut self,
+        event: &gpui::MouseMoveEvent,
+        cx: &mut Context<Self>,
+    ) {
+        let (Some(pa), Some(drag)) = (self.last_plot_area, self.cursor_drag.as_ref()) else {
+            return;
+        };
+        let start_view = drag.start_view;
+        let cursor_entity = drag.cursor.clone();
+        let x_data = cursor::pixel_to_data_x(event.position.x, pa, start_view);
+        let focused = cursor_entity.read(cx).focused_trace;
+        let snapped = cursor::snap_x_to_sample(self.line_plot.read(cx), focused, x_data, cx);
+        cursor_entity.update(cx, |c, cx| {
+            if c.t_end != snapped {
+                c.t_end = snapped;
+                cx.notify();
+            }
+        });
+    }
+
+    fn finish_cursor_drag(
+        &mut self,
+        event: &gpui::MouseUpEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(drag) = self.cursor_drag.take() else {
+            return;
+        };
+        let cursor_entity = drag.cursor;
+        let (start, end) = {
+            let c = cursor_entity.read(cx);
+            (c.t_start, c.t_end)
+        };
+        // Zero-length drag — treat as a click, drop the placeholder cursor.
+        if start == end {
+            let id = cursor_entity.read(cx).id;
+            self.remove_cursor(id, cx);
+            return;
+        }
+        let entity = cursor_entity.into_any();
+        let position = event.position;
+        window.defer(cx, move |window, cx| {
+            window.dispatch_action(
+                Box::new(crate::inspector::InspectEntity { entity, position }),
+                cx,
+            );
+        });
+    }
+
     /// Clear every user-imposed bound so auto-fit resumes on the next frame.
     fn reset_view(&mut self, cx: &mut Context<Self>) {
         self.line_plot.update(cx, |lp, cx| {
@@ -753,6 +1218,8 @@ impl Render for TimeSeriesPlot {
 
         let underlay_lp = self.line_plot.clone();
         let overlay_lp = self.line_plot.clone();
+        let cursors_lp = self.line_plot.clone();
+        let cursors_weak = cx.entity().downgrade();
 
         let mut root = div()
             .flex()
@@ -766,30 +1233,52 @@ impl Render for TimeSeriesPlot {
                     .relative()
                     .on_mouse_down(
                         MouseButton::Left,
-                        cx.listener(|this, event: &gpui::MouseDownEvent, _window, cx| {
+                        cx.listener(|this, event: &gpui::MouseDownEvent, window, cx| {
                             if event.click_count == 2 {
                                 this.reset_view(cx);
-                            } else {
-                                let zone = this
-                                    .last_plot_area
-                                    .map(|pa| axis_zone(event.position, pa))
-                                    .unwrap_or(AxisZone::Plot);
-                                this.drag_start = Some(event.position);
-                                this.drag_start_view = this.line_plot.read(cx).effective_view(cx);
-                                this.drag_zone = zone;
+                                return;
                             }
+                            // Alt+left-drag opens a measurement cursor —
+                            // gpui's mac trackpad backend delivers right-
+                            // mouse-down but not the matching drag/up, so
+                            // the gesture has to ride on the left button.
+                            if event.modifiers.alt {
+                                this.start_cursor_drag(event, window, cx);
+                                return;
+                            }
+                            let zone = this
+                                .last_plot_area
+                                .map(|pa| axis_zone(event.position, pa))
+                                .unwrap_or(AxisZone::Plot);
+                            this.drag_start = Some(event.position);
+                            this.drag_start_view = this.line_plot.read(cx).effective_view(cx);
+                            this.drag_zone = zone;
                         }),
                     )
                     .on_mouse_up(
                         MouseButton::Left,
-                        cx.listener(|this, _event: &gpui::MouseUpEvent, _window, _cx| {
+                        cx.listener(|this, event: &gpui::MouseUpEvent, window, cx| {
+                            if this.cursor_drag.is_some() {
+                                this.finish_cursor_drag(event, window, cx);
+                                return;
+                            }
                             this.drag_start = None;
                             this.drag_start_view = None;
+                        }),
+                    )
+                    .on_mouse_down(
+                        MouseButton::Right,
+                        cx.listener(|this, event: &gpui::MouseDownEvent, window, cx| {
+                            this.open_cursor_inspector_at(event.position, window, cx);
                         }),
                     )
                     .on_mouse_move(cx.listener(
                         |this, event: &gpui::MouseMoveEvent, _window, cx| {
                             if !event.dragging() {
+                                return;
+                            }
+                            if this.cursor_drag.is_some() {
+                                this.handle_cursor_drag_move(event, cx);
                                 return;
                             }
                             let (Some(start), Some(start_view), Some(pa)) =
@@ -882,6 +1371,60 @@ impl Render for TimeSeriesPlot {
                             move |_, (bounds, view, data_start), window, cx| {
                                 if let Some(view) = view {
                                     paint_overlay(bounds, view, data_start, window, cx);
+                                }
+                            },
+                        )
+                        .absolute()
+                        .inset_0(),
+                    )
+                    .child(
+                        canvas(
+                            move |bounds, _window, cx| {
+                                let view = cursors_lp.read(cx).effective_view(cx);
+                                let mut snapshots: Vec<CursorPaint> = Vec::new();
+                                let _ = cursors_weak.update(cx, |this, cx| {
+                                    let active_id = this
+                                        .cursor_drag
+                                        .as_ref()
+                                        .map(|d| d.cursor.read(cx).id);
+                                    let lp = this.line_plot.read(cx);
+                                    for cursor in &this.cursors {
+                                        let c = cursor.read(cx);
+                                        let mut markers: Vec<(f64, f64, Hsla)> = Vec::new();
+                                        for trace in lp.traces() {
+                                            let cfg = trace.read(cx);
+                                            if !cfg.visible {
+                                                continue;
+                                            }
+                                            let v_start = lp.trace_value_at(
+                                                trace.entity_id(),
+                                                c.t_start,
+                                                cx,
+                                            );
+                                            let v_end = lp.trace_value_at(
+                                                trace.entity_id(),
+                                                c.t_end,
+                                                cx,
+                                            );
+                                            if let (Some(vs), Some(ve)) = (v_start, v_end) {
+                                                markers.push((vs, ve, cfg.color));
+                                            }
+                                        }
+                                        let header = cursor_header(c, lp, cx);
+                                        snapshots.push(CursorPaint {
+                                            t_start: c.t_start,
+                                            t_end: c.t_end,
+                                            active: Some(c.id) == active_id,
+                                            trace_markers: markers,
+                                            header,
+                                        });
+                                    }
+                                });
+                                (bounds, view, snapshots)
+                            },
+                            move |_, (bounds, view, cursors), window, cx| {
+                                if let Some(view) = view {
+                                    paint_cursors(bounds, view, &cursors, window, cx);
                                 }
                             },
                         )

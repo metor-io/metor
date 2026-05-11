@@ -255,6 +255,77 @@ impl LinePlot {
         &self.traces
     }
 
+    /// The resolved [`Component`] backing `trace`, if its tracker has caught
+    /// up to the DB. Returned by clone because trackers keep their own
+    /// `Component` and the borrow can't escape `self`.
+    pub fn component_for_trace(&self, trace: &Entity<Trace>, _cx: &gpui::App) -> Option<Component> {
+        self.tracking
+            .get(&trace.entity_id())?
+            .component
+            .as_ref()
+            .cloned()
+    }
+
+    /// Value plotted by `trace` at the sample whose timestamp is closest to
+    /// `ts`. Returns `None` when the trace's component hasn't resolved yet,
+    /// when its element index falls outside the schema, or when the
+    /// component has no samples bracketing `ts`.
+    ///
+    /// Used by measurement-cursor rendering (dot marker per trace) and by
+    /// the Δy / Mean readouts that need a value at the cursor endpoints.
+    pub fn trace_value_at(
+        &self,
+        trace_id: EntityId,
+        ts: Timestamp,
+        cx: &gpui::App,
+    ) -> Option<f64> {
+        let trace = self.traces.iter().find(|t| t.entity_id() == trace_id)?;
+        let cfg = trace.read(cx);
+        let component = self.tracking.get(&trace_id)?.component.as_ref()?;
+        let elem_size = component.schema.size();
+        if elem_size == 0 {
+            return None;
+        }
+        let total_elements: usize = component.schema.dim.iter().product::<usize>().max(1);
+        if cfg.element_index >= total_elements {
+            return None;
+        }
+        for node in component.time_series.list.iter() {
+            let timestamps = node.timestamps();
+            if timestamps.is_empty() {
+                continue;
+            }
+            let idx = match timestamps.binary_search_by_key(&ts.0, |t| t.0) {
+                Ok(i) => i,
+                Err(i) => i,
+            };
+            let mut best: Option<(i64, usize)> = None;
+            for cand_idx in [idx.saturating_sub(1), idx, idx + 1] {
+                let Some(cand) = timestamps.get(cand_idx) else {
+                    continue;
+                };
+                let d = (cand.0 - ts.0).abs();
+                if best.map(|(bd, _)| d < bd).unwrap_or(true) {
+                    best = Some((d, cand_idx));
+                }
+            }
+            let Some((_, sample_idx)) = best else {
+                continue;
+            };
+            let data = node.data.data();
+            let base = sample_idx * elem_size;
+            let Some(buf) = data.get(base..base + elem_size) else {
+                continue;
+            };
+            return Some(crate::dynamic::tensor::read_f64_at(
+                buf,
+                component.schema.prim_type,
+                cfg.element_index,
+            ));
+        }
+        None
+    }
+
     pub fn trace(&self, idx: usize) -> Option<&Entity<Trace>> {
         self.traces.get(idx)
     }

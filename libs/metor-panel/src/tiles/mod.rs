@@ -46,7 +46,12 @@ const RESIZE_HANDLE_SIZE: f32 = 1.0;
 
 /// Layout version this binary writes and accepts on read. Bump in lockstep
 /// with [`TileGroup::serialize`] when the document shape changes.
-const SUPPORTED_LAYOUT_VERSION: u32 = 1;
+///
+/// Version history:
+/// - 1: initial.
+/// - 2: `PlotPanelConfig` gains `default_measurements` and `cursors` for
+///   right-click-drag measurement cursors.
+const SUPPORTED_LAYOUT_VERSION: u32 = 2;
 
 /// Failure modes when loading a layout from JSON.
 #[derive(Debug)]

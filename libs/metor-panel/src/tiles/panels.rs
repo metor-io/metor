@@ -10,7 +10,7 @@ use crate::inspector::rows::{CommandRow, InspectorRow, NavRow};
 use crate::inspector::{InspectorMode, InspectorRequest, OpenInspectorCallback};
 use crate::views::dashboard::DashboardPanel;
 use crate::views::list_plot::{ListLinePlot, ListPlot, ListTrace};
-use crate::views::time_series::{LinePlot, Override, PlotStyle, Trace};
+use crate::views::time_series::{LinePlot, MeasurementKind, Override, PlotStyle, Trace};
 use crate::views::viewer_3d::Viewer3d;
 use crate::views::xy_plot::{XyLinePlot, XyPlot, XyTrace};
 use crate::views::{
@@ -417,6 +417,26 @@ pub struct PlotPanelConfig {
     pub custom_title: Override<String>,
     pub y_min_override: Override<f64>,
     pub y_max_override: Override<f64>,
+    /// Measurement kinds new cursors start with. Editing only affects
+    /// cursors created after the change; existing cursors keep their own
+    /// `enabled` set.
+    pub default_measurements: Vec<MeasurementKind>,
+    /// Locked measurement cursors that survive panel close/reopen. Unlocked
+    /// cursors are transient and never written here.
+    pub cursors: Vec<MeasurementCursorConfig>,
+}
+
+/// Persisted shape of one locked [`MeasurementCursor`].
+///
+/// The focused trace is stored by its position in the panel's trace list at
+/// save-time (not by `EntityId`, which doesn't survive). `t_start`/`t_end`
+/// are raw microseconds because `Timestamp` doesn't implement `Facet` yet.
+#[derive(facet::Facet, Default, Clone)]
+pub struct MeasurementCursorConfig {
+    pub t_start_us: i64,
+    pub t_end_us: i64,
+    pub focused_trace_index: i64,
+    pub enabled: Vec<MeasurementKind>,
 }
 
 /// Persisted shape of one [`Trace`].
@@ -489,6 +509,10 @@ impl PlotPanel {
             lp.y_max_override = cfg.y_max_override;
             cx.notify();
         });
+        if !cfg.cursors.is_empty() {
+            let inner = panel.inner.clone();
+            inner.update(cx, |plot, cx| plot.restore_cursors(&cfg.cursors, cx));
+        }
         panel
     }
 }
@@ -506,6 +530,27 @@ impl PaneItem for PlotPanel {
 
     fn to_config(&self, cx: &App) -> PlotPanelConfig {
         let lp = self.line_plot.read(cx);
+        let trace_ids: Vec<gpui::EntityId> = lp.traces().iter().map(|e| e.entity_id()).collect();
+        let cursors: Vec<MeasurementCursorConfig> = self
+            .inner
+            .read(cx)
+            .cursors()
+            .iter()
+            .map(|c| {
+                let c = c.read(cx);
+                let focused_trace_index = c
+                    .focused_trace
+                    .and_then(|id| trace_ids.iter().position(|t| *t == id))
+                    .map(|i| i as i64)
+                    .unwrap_or(-1);
+                MeasurementCursorConfig {
+                    t_start_us: c.t_start.0,
+                    t_end_us: c.t_end.0,
+                    focused_trace_index,
+                    enabled: c.enabled.iter().copied().collect(),
+                }
+            })
+            .collect();
         PlotPanelConfig {
             label: self.tab_title(cx).to_string(),
             traces: lp
@@ -516,6 +561,8 @@ impl PaneItem for PlotPanel {
             custom_title: lp.custom_title.as_ref().map(|s| s.to_string()),
             y_min_override: lp.y_min_override.clone(),
             y_max_override: lp.y_max_override.clone(),
+            default_measurements: Vec::new(),
+            cursors,
         }
     }
 
@@ -1344,6 +1391,8 @@ mod tests {
             custom_title: Override::Custom("My View".into()),
             y_min_override: Override::Custom(-10.0),
             y_max_override: Override::Auto,
+            default_measurements: Vec::new(),
+            cursors: Vec::new(),
         };
         let s = facet_json::to_string(&plot).unwrap();
         let back: PlotPanelConfig = facet_json::from_str(&s).unwrap();
