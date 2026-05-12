@@ -263,7 +263,9 @@ fn register_command_provider(
         let plot_db = db.clone();
         items.push(InspectionItem::SubMenu {
             label: "Plot Component".into(),
-            summary: SharedString::new_static("Pick traces \u{2192} preview without leaving the palette"),
+            summary: SharedString::new_static(
+                "Pick traces \u{2192} preview without leaving the palette",
+            ),
             build: Arc::new(move |_cx| {
                 let preview_db = plot_db.clone();
                 crate::inspector::trace_picker::select_traces_wizard_view(

@@ -125,7 +125,12 @@ pub fn select_traces_wizard_rows(
     on_select: OnTracesSelected,
 ) -> Vec<Box<dyn InspectorRow>> {
     let selection = Arc::new(Mutex::new(TraceSelection::default()));
-    component_list_rows(db, color_basis, ContinueAction::Dismiss(on_select), selection)
+    component_list_rows(
+        db,
+        color_basis,
+        ContinueAction::Dismiss(on_select),
+        selection,
+    )
 }
 
 /// Variant of [`select_traces_wizard_rows`] that, on Continue, pushes an
@@ -137,7 +142,12 @@ pub fn select_traces_wizard_view(
     build: BuildPreview,
 ) -> Vec<Box<dyn InspectorRow>> {
     let selection = Arc::new(Mutex::new(TraceSelection::default()));
-    component_list_rows(db, color_basis, ContinueAction::CascadeView(build), selection)
+    component_list_rows(
+        db,
+        color_basis,
+        ContinueAction::CascadeView(build),
+        selection,
+    )
 }
 
 /// What the wizard's pinned "Continue" row does when the user commits.

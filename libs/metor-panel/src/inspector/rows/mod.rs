@@ -4,7 +4,9 @@
 //! closures needed to read and write its bound data. The inspector itself
 //! only sees [`InspectorRow`] trait objects and a [`RowAction`] reply when
 //! a row is activated, so adding a new widget doesn't touch shared code.
-use gpui::{AnyElement, AnyView, App, Hsla, Pixels, SharedString, Size, Window, div, prelude::*, px};
+use gpui::{
+    AnyElement, AnyView, App, Hsla, Pixels, SharedString, Size, Window, div, prelude::*, px,
+};
 
 use crate::theme::theme;
 

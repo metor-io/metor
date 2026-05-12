@@ -249,4 +249,3 @@ pub fn pixel_to_data_x(
     let norm = (f32::from(pixel_x) as f64 - pa_x) / pa_w;
     view.min_x + norm.clamp(0.0, 1.0) * (view.max_x - view.min_x)
 }
-

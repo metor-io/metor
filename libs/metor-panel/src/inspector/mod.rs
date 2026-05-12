@@ -577,15 +577,13 @@ impl Inspector {
                                 .as_ref()
                                 .is_some_and(|e| e.row_index == row_idx);
 
-                            let InspectorPageKind::Rows(rows) = &this.current_page().kind
-                            else {
+                            let InspectorPageKind::Rows(rows) = &this.current_page().kind else {
                                 unreachable!("render_rows_panel is only entered on Rows pages");
                             };
 
                             let element = if is_editing {
                                 let edit = this.editing.as_ref().unwrap();
-                                let label =
-                                    SharedString::from(rows[row_idx].label().to_string());
+                                let label = SharedString::from(rows[row_idx].label().to_string());
                                 crate::inspector::rows::row_base(vis_ix, selected, cx)
                                     .child(
                                         div()
@@ -670,10 +668,7 @@ impl Inspector {
             );
         }
 
-        let body = div()
-            .w(size.width)
-            .h(size.height)
-            .child(view);
+        let body = div().w(size.width).h(size.height).child(view);
 
         frame.w(size.width).child(bar).child(body)
     }

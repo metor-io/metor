@@ -4,9 +4,9 @@ use super::monitor::{behavior_snapshot, edit_click};
 use super::table::{Column, ColumnSort, Table, TableDelegate};
 use super::time_series::{LinePlot, Trace};
 use super::value_strip::{ComponentValueStrip, StripClick, StripStyle};
+use crate::inspector::plot_preview::shift_hover_listener;
 use crate::theme::theme;
 use crate::{ComponentStream, WalComponentStream};
-use crate::inspector::plot_preview::shift_hover_listener;
 use gpui::{
     AnyElement, App, AppContext, AsyncApp, Context, Entity, IntoElement, Pixels, SharedString,
     Window, div, prelude::*, px,

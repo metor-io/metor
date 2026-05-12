@@ -16,8 +16,9 @@
 //! renderer.
 
 use gpui::{
-    AnyElement, Context, Entity, Hsla, IntoElement, MouseButton, MouseDownEvent, MouseMoveEvent,
-    MouseUpEvent, Pixels, Point, SharedString, div, prelude::*, px,
+    AnyElement, Context, ElementId, Entity, Hsla, IntoElement, MouseButton, MouseDownEvent,
+    MouseMoveEvent, MouseUpEvent, Pixels, Point, SharedString, Stateful,
+    StatefulInteractiveElement, Styled, div, prelude::*, px,
 };
 
 use super::cursor::MeasurementCursor;
@@ -31,28 +32,13 @@ use crate::theme::theme;
 /// Coordinates are local to the plot's interior `relative()` container so
 /// pinned positions are stable across window moves and round-trip cleanly
 /// through layout serialization.
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub enum PanelPosition {
     /// Per-cursor mini-panels above each cursor's band.
+    #[default]
     Track,
     /// Single consolidated panel at a user-pinned plot-local offset.
     Pinned { x: f32, y: f32 },
-}
-
-impl Default for PanelPosition {
-    fn default() -> Self {
-        Self::Track
-    }
-}
-
-/// In-flight drag of a panel's title bar.
-///
-/// `offset` is the pointer's position relative to the panel's top-left at
-/// drag-start; subsequent moves keep that offset so the panel doesn't
-/// teleport on the first frame.
-#[derive(Clone, Copy, Debug)]
-pub struct PanelDragState {
-    pub offset: Point<Pixels>,
 }
 
 const PANEL_WIDTH: f32 = 240.0;
@@ -63,8 +49,15 @@ const SECTION_BAR_WIDTH: f32 = 3.0;
 const SWATCH_SIZE: f32 = 8.0;
 const LABEL_FONT_SIZE: f32 = 11.0;
 
-/// One renderable panel: its plot-area-local origin (top-left, in the plot's
-/// interior coordinate space) plus the card element.
+/// Generous overestimate of a panel's rendered height, used by
+/// [`clamp_origin`] to keep pinned panels from being placed so low the
+/// title bar drops off the plot. Worst case is a consolidated panel with
+/// several cursors and many enabled measurements; underestimating clips
+/// drag-pinned positions, overestimating is harmless.
+const PANEL_MAX_HEIGHT_ESTIMATE: f32 = 240.0;
+
+/// One renderable panel: its plot-area-local origin (top-left, in the
+/// plot's interior coordinate space) plus the card element.
 pub struct RenderedPanel {
     pub origin: Point<Pixels>,
     pub element: AnyElement,
@@ -83,7 +76,7 @@ pub fn render_panels(
         return Vec::new();
     }
     match plot.panel_position() {
-        PanelPosition::Track => render_track_mode(plot, cx),
+        PanelPosition::Track => render_per_cursor_panels(plot, cx),
         PanelPosition::Pinned { x, y } => {
             let origin = clamp_origin(Point { x: px(x), y: px(y) }, plot);
             let element = render_consolidated(plot, origin, cx);
@@ -92,7 +85,7 @@ pub fn render_panels(
     }
 }
 
-fn render_track_mode(
+fn render_per_cursor_panels(
     plot: &TimeSeriesPlot,
     cx: &mut Context<TimeSeriesPlot>,
 ) -> Vec<RenderedPanel> {
@@ -104,17 +97,15 @@ fn render_track_mode(
 
     let mut out: Vec<RenderedPanel> = Vec::with_capacity(cursors.len());
     for cursor in cursors.iter() {
-        // Read once to snapshot the cursor's data without holding the
-        // borrow across the (mutable) listener-installing render call.
         let (cursor_id, mid_t) = {
             let c = cursor.read(cx);
             let (a, b) = c.ordered();
             (c.id.0, (a.0 + b.0) as f64 / 2.0)
         };
 
-        // Compute the cursor band midpoint in plot-area-local pixels. Fall
-        // back to the top-left if the view isn't resolved yet (e.g. on the
-        // very first frame before the plot has data).
+        // Fall back to the top-left when the view isn't resolved yet —
+        // the cursor band can't be projected until the first frame has
+        // data.
         let mid_x_pa_local = match (plot_area, view) {
             (Some(pa), Some(v)) => v.to_screen(pa, mid_t, v.min_y).x - pa.origin.x,
             _ => px(PANEL_WIDTH / 2.0 + PANEL_PAD),
@@ -133,7 +124,7 @@ fn render_track_mode(
 
 fn render_mini_panel(
     cursor: &Entity<MeasurementCursor>,
-    cursor_id_seed: u64,
+    cursor_id: u64,
     line_plot_entity: &Entity<LinePlot>,
     origin: Point<Pixels>,
     theme: &crate::theme::Theme,
@@ -142,97 +133,37 @@ fn render_mini_panel(
     let (delta_t, row_elements) = {
         let c = cursor.read(cx);
         let (start, end) = c.ordered();
-        let delta_t =
-            measurements::format_value(MeasurementKind::DeltaX, (end.0 - start.0) as f64);
+        let delta_t = measurements::format_value(MeasurementKind::DeltaX, (end.0 - start.0) as f64);
         let line_plot = line_plot_entity.read(cx);
         let rows = measurement_rows_for_cursor(c, line_plot, theme, cx);
         (delta_t, rows)
     };
 
     let title = mini_title_bar(
-        cursor_id_seed,
+        cursor_id,
         SharedString::from(format!("Δt {}", delta_t)),
         theme,
         origin,
         cx,
     );
 
-    div()
-        .id(("measurement-mini-panel", cursor_id_seed as usize))
-        .flex()
-        .flex_col()
-        .w(px(PANEL_WIDTH))
-        .bg(theme.bg_secondary)
-        .border_1()
-        .border_color(theme.border_primary)
-        .rounded(px(4.0))
-        .shadow_sm()
-        // The panel sits over the plot canvas; without this, gpui lets
-        // mouse events fall through to the cursor canvas handlers below.
-        .occlude()
-        // Drag mouse-move/up handlers on the panel root: needed because
-        // `occlude()` blocks the wrapper's `on_mouse_move` from firing
-        // while the cursor is over the panel — and a dragged panel
-        // follows the cursor, so the cursor sits on the panel almost the
-        // whole time. Without these the wrapper handler only fires when
-        // the cursor leaves the panel.
-        .on_mouse_move(cx.listener(
-            |plot, event: &MouseMoveEvent, _window, cx| {
-                if event.dragging() {
-                    plot.advance_panel_drag(event.position, cx);
-                }
-            },
-        ))
-        .on_mouse_up(
-            MouseButton::Left,
-            cx.listener(|plot, _event: &MouseUpEvent, _window, _cx| {
-                plot.end_panel_drag();
-            }),
-        )
+    let card = panel_card(("measurement-mini-panel", cursor_id as usize), theme)
         .child(title)
-        .children(row_elements)
-        .into_any_element()
+        .children(row_elements);
+    attach_panel_drag_handlers(card, cx).into_any_element()
 }
 
 fn render_consolidated(
     plot: &TimeSeriesPlot,
-    _origin: Point<Pixels>,
+    origin: Point<Pixels>,
     cx: &mut Context<TimeSeriesPlot>,
 ) -> AnyElement {
     let theme = theme(cx);
     let cursors: Vec<Entity<MeasurementCursor>> = plot.cursors().to_vec();
     let line_plot_entity = plot.line_plot().clone();
 
-    let title = consolidated_title_bar(theme.text_primary, cx);
-
-    let mut card = div()
-        .id("measurement-consolidated-panel")
-        .flex()
-        .flex_col()
-        .w(px(PANEL_WIDTH))
-        .bg(theme.bg_secondary)
-        .border_1()
-        .border_color(theme.border_primary)
-        .rounded(px(4.0))
-        .shadow_sm()
-        .occlude()
-        // Drag handlers on the panel root — see `render_mini_panel` for
-        // the rationale (`.occlude()` blocks the wrapper's listener when
-        // the cursor is over the panel).
-        .on_mouse_move(cx.listener(
-            |plot, event: &MouseMoveEvent, _window, cx| {
-                if event.dragging() {
-                    plot.advance_panel_drag(event.position, cx);
-                }
-            },
-        ))
-        .on_mouse_up(
-            MouseButton::Left,
-            cx.listener(|plot, _event: &MouseUpEvent, _window, _cx| {
-                plot.end_panel_drag();
-            }),
-        )
-        .child(title);
+    let mut card = panel_card("measurement-consolidated-panel", &theme)
+        .child(consolidated_title_bar(origin, theme.text_primary, cx));
 
     for (idx, cursor) in cursors.iter().enumerate() {
         if idx > 0 {
@@ -241,28 +172,71 @@ fn render_consolidated(
         let line_plot = line_plot_entity.read(cx);
         let cursor_ref = cursor.read(cx);
         let (start, end) = cursor_ref.ordered();
-        let delta_t =
-            measurements::format_value(MeasurementKind::DeltaX, (end.0 - start.0) as f64);
+        let delta_t = measurements::format_value(MeasurementKind::DeltaX, (end.0 - start.0) as f64);
         card = card
             .child(
-                section_header(theme.selection_bg, theme.text_primary, delta_t)
-                    .into_any_element(),
+                section_header(theme.selection_bg, theme.text_primary, delta_t).into_any_element(),
             )
-            .children(measurement_rows_for_cursor(cursor_ref, line_plot, &theme, cx));
+            .children(measurement_rows_for_cursor(
+                cursor_ref, line_plot, &theme, cx,
+            ));
     }
 
-    card.into_any_element()
+    attach_panel_drag_handlers(card, cx).into_any_element()
+}
+
+/// The chrome shared by every panel variant: bg, border, rounded corners,
+/// shadow, plus `.occlude()` so mouse events don't fall through to the
+/// cursor canvas behind the panel.
+fn panel_card(id: impl Into<ElementId>, theme: &crate::theme::Theme) -> Stateful<gpui::Div> {
+    div()
+        .id(id)
+        .flex()
+        .flex_col()
+        .w(px(PANEL_WIDTH))
+        .bg(theme.bg_secondary)
+        .border_1()
+        .border_color(theme.border_primary)
+        .rounded(px(4.0))
+        .shadow_sm()
+        .occlude()
+}
+
+/// Wire the drag move/up listeners on the panel root.
+///
+/// `.occlude()` blocks the wrapper plot div's `on_mouse_move` whenever the
+/// cursor sits on the panel — and a dragged panel follows the cursor, so
+/// the cursor is on the panel for most of the drag. Without panel-local
+/// listeners, the wrapper only sees mouse moves once the cursor leaves the
+/// panel onto bare plot area, producing the "drag only reacts when I
+/// click the plot" symptom.
+fn attach_panel_drag_handlers<E>(el: E, cx: &mut Context<TimeSeriesPlot>) -> E
+where
+    E: StatefulInteractiveElement + 'static,
+{
+    el.on_mouse_move(cx.listener(|plot, event: &MouseMoveEvent, _window, cx| {
+        if event.dragging() {
+            plot.advance_panel_drag(event.position, cx);
+        }
+    }))
+    .on_mouse_up(
+        MouseButton::Left,
+        cx.listener(|plot, _event: &MouseUpEvent, _window, _cx| {
+            plot.end_panel_drag();
+        }),
+    )
 }
 
 fn mini_title_bar(
-    cursor_id_seed: u64,
+    cursor_id: u64,
     label: SharedString,
     theme: &crate::theme::Theme,
     panel_origin: Point<Pixels>,
     cx: &mut Context<TimeSeriesPlot>,
 ) -> AnyElement {
-    div()
-        .id(("measurement-mini-title", cursor_id_seed as usize))
+    let label_color = theme.text_primary;
+    let title = div()
+        .id(("measurement-mini-title", cursor_id as usize))
         .flex()
         .flex_row()
         .items_center()
@@ -273,8 +247,6 @@ fn mini_title_bar(
         .on_mouse_down(
             MouseButton::Left,
             cx.listener(move |plot, event: &MouseDownEvent, _window, cx| {
-                // Drag from a mini-panel collapses everything to a single
-                // pinned panel at this drag location.
                 plot.start_panel_drag(event.position, panel_origin, cx);
                 cx.stop_propagation();
             }),
@@ -282,38 +254,27 @@ fn mini_title_bar(
         .child(
             div()
                 .text_size(px(LABEL_FONT_SIZE))
-                .text_color(theme.text_primary)
+                .text_color(label_color)
                 .child(label),
         )
-        .child(
-            div()
-                .id(("measurement-mini-pin", cursor_id_seed as usize))
-                .flex()
-                .items_center()
-                .justify_center()
-                .w(px(16.0))
-                .h(px(16.0))
-                .cursor_pointer()
-                .on_mouse_down(
-                    MouseButton::Left,
-                    cx.listener(move |plot, _event: &MouseDownEvent, _window, cx| {
-                        // Click-without-drag on the lock icon: pin in
-                        // place. All other mini panels disappear and this
-                        // becomes the single consolidated panel.
-                        plot.pin_panel_at(panel_origin, cx);
-                        cx.stop_propagation();
-                    }),
-                )
-                .child(Icon::LockOpen.svg(12.0)),
-        )
-        .into_any_element()
+        .child(icon_button(
+            ("measurement-mini-pin", cursor_id as usize),
+            Icon::LockOpen,
+            move |plot, _event, _window, cx| {
+                plot.pin_panel_at(panel_origin, cx);
+                cx.stop_propagation();
+            },
+            cx,
+        ));
+    title.into_any_element()
 }
 
 fn consolidated_title_bar(
+    origin: Point<Pixels>,
     text_primary: Hsla,
     cx: &mut Context<TimeSeriesPlot>,
 ) -> AnyElement {
-    div()
+    let title = div()
         .id("measurement-consolidated-title")
         .flex()
         .flex_row()
@@ -324,8 +285,7 @@ fn consolidated_title_bar(
         .cursor_pointer()
         .on_mouse_down(
             MouseButton::Left,
-            cx.listener(|plot, event: &MouseDownEvent, _window, cx| {
-                let origin = plot.consolidated_panel_origin();
+            cx.listener(move |plot, event: &MouseDownEvent, _window, cx| {
                 plot.start_panel_drag(event.position, origin, cx);
                 cx.stop_propagation();
             }),
@@ -336,24 +296,41 @@ fn consolidated_title_bar(
                 .text_color(text_primary)
                 .child(SharedString::new_static("Measurements")),
         )
-        .child(
-            div()
-                .id("measurement-consolidated-track")
-                .flex()
-                .items_center()
-                .justify_center()
-                .w(px(16.0))
-                .h(px(16.0))
-                .cursor_pointer()
-                .on_mouse_down(
-                    MouseButton::Left,
-                    cx.listener(|plot, _event: &MouseDownEvent, _window, cx| {
-                        plot.unpin_panel(cx);
-                        cx.stop_propagation();
-                    }),
-                )
-                .child(Icon::Lock.svg(12.0)),
-        )
+        .child(icon_button(
+            "measurement-consolidated-track",
+            Icon::Lock,
+            |plot, _event, _window, cx| {
+                plot.unpin_panel(cx);
+                cx.stop_propagation();
+            },
+            cx,
+        ));
+    title.into_any_element()
+}
+
+/// Square icon affordance used in both panel title bars. Click is dispatched
+/// through `cx.listener` so the host plot owns the state mutation.
+fn icon_button(
+    id: impl Into<ElementId>,
+    icon: Icon,
+    handler: impl Fn(
+        &mut TimeSeriesPlot,
+        &MouseDownEvent,
+        &mut gpui::Window,
+        &mut Context<TimeSeriesPlot>,
+    ) + 'static,
+    cx: &mut Context<TimeSeriesPlot>,
+) -> AnyElement {
+    div()
+        .id(id)
+        .flex()
+        .items_center()
+        .justify_center()
+        .w(px(16.0))
+        .h(px(16.0))
+        .cursor_pointer()
+        .on_mouse_down(MouseButton::Left, cx.listener(handler))
+        .child(icon.svg(12.0))
         .into_any_element()
 }
 
@@ -417,11 +394,7 @@ fn measurement_rows_for_cursor(
     rows
 }
 
-fn section_header(
-    bar_color: Hsla,
-    text_color: Hsla,
-    delta_t: SharedString,
-) -> impl IntoElement {
+fn section_header(bar_color: Hsla, text_color: Hsla, delta_t: SharedString) -> impl IntoElement {
     div()
         .flex()
         .flex_row()
@@ -505,9 +478,9 @@ fn clamp_origin(preferred: Point<Pixels>, plot: &TimeSeriesPlot) -> Point<Pixels
     let Some(plot_area) = plot.last_plot_area() else {
         return preferred;
     };
-    let panel_height_estimate = px(80.0);
     let max_x = (plot_area.size.width - px(PANEL_WIDTH) - px(PANEL_PAD)).max(px(0.0));
-    let max_y = (plot_area.size.height - panel_height_estimate - px(PANEL_PAD)).max(px(0.0));
+    let max_y =
+        (plot_area.size.height - px(PANEL_MAX_HEIGHT_ESTIMATE) - px(PANEL_PAD)).max(px(0.0));
     Point {
         x: preferred.x.clamp(px(0.0), max_x),
         y: preferred.y.clamp(px(0.0), max_y),

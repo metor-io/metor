@@ -10,7 +10,9 @@ use crate::inspector::rows::{CommandRow, InspectorRow, NavRow};
 use crate::inspector::{InspectorMode, InspectorRequest, OpenInspectorCallback};
 use crate::views::dashboard::DashboardPanel;
 use crate::views::list_plot::{ListLinePlot, ListPlot, ListTrace};
-use crate::views::time_series::{LinePlot, MeasurementKind, Override, PanelPosition, PlotStyle, Trace};
+use crate::views::time_series::{
+    LinePlot, MeasurementKind, Override, PanelPosition, PlotStyle, Trace,
+};
 use crate::views::viewer_3d::Viewer3d;
 use crate::views::xy_plot::{XyLinePlot, XyPlot, XyTrace};
 use crate::views::{
@@ -593,8 +595,7 @@ impl PaneItem for PlotPanel {
                 }
             })
             .collect();
-        let measurement_panel: MeasurementPanelConfig =
-            self.inner.read(cx).panel_position().into();
+        let measurement_panel: MeasurementPanelConfig = self.inner.read(cx).panel_position().into();
         PlotPanelConfig {
             label: self.tab_title(cx).to_string(),
             traces: lp

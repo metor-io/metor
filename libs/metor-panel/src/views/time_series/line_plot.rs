@@ -273,12 +273,7 @@ impl LinePlot {
     ///
     /// Used by measurement-cursor rendering (dot marker per trace) and by
     /// the Δy / Mean readouts that need a value at the cursor endpoints.
-    pub fn trace_value_at(
-        &self,
-        trace_id: EntityId,
-        ts: Timestamp,
-        cx: &gpui::App,
-    ) -> Option<f64> {
+    pub fn trace_value_at(&self, trace_id: EntityId, ts: Timestamp, cx: &gpui::App) -> Option<f64> {
         let trace = self.traces.iter().find(|t| t.entity_id() == trace_id)?;
         let cfg = trace.read(cx);
         let component = self.tracking.get(&trace_id)?.component.as_ref()?;

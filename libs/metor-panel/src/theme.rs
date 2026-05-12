@@ -597,9 +597,9 @@ pub static DEPARTURE: Theme = Theme {
     bg_secondary: hex(0x131210, 1.0),
     bg_elevated: hex(0x252220, 1.0),
 
-    text_primary: hex(0xf0a040, 1.0),    // bright amber
-    text_secondary: hex(0xb07830, 1.0),  // mid amber
-    text_tertiary: hex(0x6e4c20, 1.0),   // dim amber
+    text_primary: hex(0xf0a040, 1.0),   // bright amber
+    text_secondary: hex(0xb07830, 1.0), // mid amber
+    text_tertiary: hex(0x6e4c20, 1.0),  // dim amber
 
     border_primary: hex(0x3a2a18, 1.0),
 

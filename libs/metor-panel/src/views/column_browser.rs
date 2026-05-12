@@ -396,18 +396,19 @@ impl<D: ColumnBrowserDelegate> ColumnBrowser<D> {
             .bg(bg)
             .cursor_pointer()
             .hover(move |s| s.bg(hover_bg))
-            .on_mouse_move(cx.listener(
-                move |this, event: &gpui::MouseMoveEvent, window, cx| {
+            .on_mouse_move(
+                cx.listener(move |this, event: &gpui::MouseMoveEvent, window, cx| {
                     if !event.modifiers.shift {
                         return;
                     }
                     if let Some(action) =
-                        this.delegate.shift_hover_action(&item_hover, event.position, cx)
+                        this.delegate
+                            .shift_hover_action(&item_hover, event.position, cx)
                     {
                         window.dispatch_action(action, cx);
                     }
-                },
-            ))
+                }),
+            )
             .on_mouse_down(
                 MouseButton::Left,
                 cx.listener(move |this, event: &MouseDownEvent, window, cx| {

@@ -767,7 +767,9 @@ pub struct TimeSeriesPlot {
     cursors: smallvec::SmallVec<[Entity<MeasurementCursor>; 2]>,
     cursor_drag: Option<CursorDrag>,
     panel_position: PanelPosition,
-    panel_drag: Option<measurement_panel::PanelDragState>,
+    /// Pointer-to-panel-origin offset captured at drag start, in window
+    /// coordinates. `Some` while a panel drag is in flight.
+    panel_drag: Option<Point<Pixels>>,
 }
 
 /// Build traces for `component_id` × `indices`, cycling theme colors and
@@ -780,8 +782,7 @@ pub fn traces_for_component(
     cx: &gpui::App,
 ) -> Vec<Trace> {
     let theme = crate::theme::theme(cx);
-    let elem_names =
-        crate::inspector::trace_picker::element_names_for_component(db, component_id);
+    let elem_names = crate::inspector::trace_picker::element_names_for_component(db, component_id);
     let comp_name = db
         .with_state(|s| {
             s.get_component_metadata(component_id)
@@ -865,104 +866,76 @@ impl TimeSeriesPlot {
         panel_pa_local: Point<Pixels>,
         cx: &mut Context<Self>,
     ) {
-        let pa_local_x = f32::from(panel_pa_local.x).round();
-        let pa_local_y = f32::from(panel_pa_local.y).round();
         let Some(plot_area) = self.last_plot_area else {
             return;
         };
-        let panel_window_x = f32::from(plot_area.origin.x) + pa_local_x;
-        let panel_window_y = f32::from(plot_area.origin.y) + pa_local_y;
-        let offset = Point {
-            x: px(f32::from(mouse.x) - panel_window_x),
-            y: px(f32::from(mouse.y) - panel_window_y),
+        let pa_local = Point {
+            x: panel_pa_local.x.round(),
+            y: panel_pa_local.y.round(),
         };
+        let panel_window = plot_area.origin + pa_local;
         self.panel_position = PanelPosition::Pinned {
-            x: pa_local_x,
-            y: pa_local_y,
+            x: pa_local.x.into(),
+            y: pa_local.y.into(),
         };
-        self.panel_drag = Some(measurement_panel::PanelDragState { offset });
+        self.panel_drag = Some(mouse - panel_window);
         cx.notify();
     }
 
     /// Click-without-drag handler for a per-cursor mini-panel's lock icon:
     /// pin the consolidated panel at this cursor's current band position.
     pub fn pin_panel_at(&mut self, panel_pa_local: Point<Pixels>, cx: &mut Context<Self>) {
-        self.panel_position = PanelPosition::Pinned {
-            x: f32::from(panel_pa_local.x).round(),
-            y: f32::from(panel_pa_local.y).round(),
-        };
-        cx.notify();
+        self.set_panel_position(
+            PanelPosition::Pinned {
+                x: panel_pa_local.x.round().into(),
+                y: panel_pa_local.y.round().into(),
+            },
+            cx,
+        );
     }
 
     /// Click handler for the consolidated panel's track icon: return to
     /// per-cursor track mode.
     pub fn unpin_panel(&mut self, cx: &mut Context<Self>) {
-        if !matches!(self.panel_position, PanelPosition::Track) {
-            self.panel_position = PanelPosition::Track;
-            cx.notify();
-        }
-    }
-
-    /// Current pinned origin as a `Point<Pixels>`; returns the top-left if
-    /// the panel isn't actually pinned (shouldn't happen in normal flow,
-    /// but the consolidated panel's drag handler asks for the origin
-    /// unconditionally).
-    pub fn consolidated_panel_origin(&self) -> Point<Pixels> {
-        match self.panel_position {
-            PanelPosition::Pinned { x, y } => Point { x: px(x), y: px(y) },
-            PanelPosition::Track => Point {
-                x: px(0.0),
-                y: px(0.0),
-            },
-        }
+        self.set_panel_position(PanelPosition::Track, cx);
     }
 
     /// Advance the panel drag to a new mouse position. Called from both the
-    /// plot wrapper's `on_mouse_move` (fires when the cursor is over the
-    /// plot area) and the panel's own `on_mouse_move` (fires when the
-    /// cursor is over the panel — the panel `occludes` the wrapper so the
-    /// wrapper's handler doesn't fire while the cursor is on the panel).
-    /// Without both, the panel only moves when the cursor leaves it.
+    /// plot wrapper's `on_mouse_move` (fires when the cursor is over bare
+    /// plot area) and each panel's own `on_mouse_move` (fires when the
+    /// cursor is over the panel — the panel `.occlude()`s the wrapper so
+    /// the wrapper's listener doesn't fire while the cursor is on the
+    /// panel). Without both, the panel only moves once the cursor leaves
+    /// it onto plot area.
     ///
     /// Returns `true` when a drag was in flight; the caller uses that to
     /// short-circuit other drag branches.
     pub fn advance_panel_drag(&mut self, mouse: Point<Pixels>, cx: &mut Context<Self>) -> bool {
-        let Some(drag) = self.panel_drag else {
+        let Some(offset) = self.panel_drag else {
             return false;
         };
         let Some(plot_area) = self.last_plot_area else {
             return true;
         };
-        // `mouse` is window-local; convert to plot-area-local before
-        // storing as the pinned position. Round to integer pixels so each
-        // mouse-pixel produces exactly one panel-pixel step — gpui's
-        // taffy layout engine has `enable_rounding` on globally
-        // (taffy.rs:42), so unrounded f32 storage gets re-rounded at
-        // render time and the mismatch makes the panel feel like it
-        // snaps unevenly.
-        let new_pa_x = (f32::from(mouse.x) - f32::from(drag.offset.x)
-            - f32::from(plot_area.origin.x))
-            .round();
-        let new_pa_y = (f32::from(mouse.y) - f32::from(drag.offset.y)
-            - f32::from(plot_area.origin.y))
-            .round();
+        // gpui's taffy layout engine rounds positions to integer pixels
+        // (taffy.rs:42 enable_rounding). Round here so each mouse-pixel
+        // produces exactly one panel-pixel step rather than drifting in
+        // and out of the rounding grid.
+        let new_pa = (mouse - offset - plot_area.origin).map(|p| p.round());
         self.set_panel_position(
             PanelPosition::Pinned {
-                x: new_pa_x,
-                y: new_pa_y,
+                x: new_pa.x.into(),
+                y: new_pa.y.into(),
             },
             cx,
         );
         true
     }
 
-    /// Clear an in-flight panel drag. Mirrors `advance_panel_drag`: callable
-    /// from both the wrapper's and the panel's `on_mouse_up` handler.
+    /// Clear an in-flight panel drag. Returns `true` when a drag was
+    /// active so the caller can short-circuit fall-through handlers.
     pub fn end_panel_drag(&mut self) -> bool {
-        if self.panel_drag.take().is_some() {
-            return true;
-        }
-        false
+        self.panel_drag.take().is_some()
     }
 
     /// Currently-rendered measurement cursors, including the in-progress
@@ -1145,11 +1118,7 @@ impl TimeSeriesPlot {
         cx.notify();
     }
 
-    fn handle_cursor_drag_move(
-        &mut self,
-        event: &gpui::MouseMoveEvent,
-        cx: &mut Context<Self>,
-    ) {
+    fn handle_cursor_drag_move(&mut self, event: &gpui::MouseMoveEvent, cx: &mut Context<Self>) {
         let (Some(pa), Some(drag)) = (self.last_plot_area, self.cursor_drag.as_ref()) else {
             return;
         };
@@ -1219,240 +1188,220 @@ impl Render for TimeSeriesPlot {
         let cursors_lp = self.line_plot.clone();
         let cursors_weak = cx.entity().downgrade();
 
-        let mut root = div()
-            .flex()
-            .flex_col()
-            .size_full()
-            .bg(theme.bg_secondary);
+        let mut root = div().flex().flex_col().size_full().bg(theme.bg_secondary);
 
         let mut inner = div()
             .flex_1()
             .min_h_0()
             .relative()
-                    .on_mouse_down(
-                        MouseButton::Left,
-                        cx.listener(|this, event: &gpui::MouseDownEvent, window, cx| {
-                            if event.click_count == 2 {
-                                this.reset_view(cx);
-                                return;
-                            }
-                            // Alt+left-drag opens a measurement cursor —
-                            // gpui's mac trackpad backend delivers right-
-                            // mouse-down but not the matching drag/up, so
-                            // the gesture has to ride on the left button.
-                            if event.modifiers.alt {
-                                this.start_cursor_drag(event, window, cx);
-                                return;
-                            }
-                            let zone = this
-                                .last_plot_area
-                                .map(|pa| axis_zone(event.position, pa))
-                                .unwrap_or(AxisZone::Plot);
-                            this.drag_start = Some(event.position);
-                            this.drag_start_view = this.line_plot.read(cx).effective_view(cx);
-                            this.drag_zone = zone;
-                        }),
-                    )
-                    .on_mouse_up(
-                        MouseButton::Left,
-                        cx.listener(|this, event: &gpui::MouseUpEvent, window, cx| {
-                            if this.end_panel_drag() {
-                                return;
-                            }
-                            if this.cursor_drag.is_some() {
-                                this.finish_cursor_drag(event, window, cx);
-                                return;
-                            }
-                            this.drag_start = None;
-                            this.drag_start_view = None;
-                        }),
-                    )
-                    .on_mouse_down(
-                        MouseButton::Right,
-                        cx.listener(|this, event: &gpui::MouseDownEvent, window, cx| {
-                            this.open_cursor_inspector_at(event.position, window, cx);
-                        }),
-                    )
-                    .on_mouse_move(cx.listener(
-                        |this, event: &gpui::MouseMoveEvent, _window, cx| {
-                            if !event.dragging() {
-                                return;
-                            }
-                            if this.advance_panel_drag(event.position, cx) {
-                                return;
-                            }
-                            if this.cursor_drag.is_some() {
-                                this.handle_cursor_drag_move(event, cx);
-                                return;
-                            }
-                            let (Some(start), Some(start_view), Some(pa)) =
-                                (this.drag_start, this.drag_start_view, this.last_plot_area)
-                            else {
-                                return;
-                            };
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, event: &gpui::MouseDownEvent, window, cx| {
+                    if event.click_count == 2 {
+                        this.reset_view(cx);
+                        return;
+                    }
+                    // Alt+left-drag opens a measurement cursor —
+                    // gpui's mac trackpad backend delivers right-
+                    // mouse-down but not the matching drag/up, so
+                    // the gesture has to ride on the left button.
+                    if event.modifiers.alt {
+                        this.start_cursor_drag(event, window, cx);
+                        return;
+                    }
+                    let zone = this
+                        .last_plot_area
+                        .map(|pa| axis_zone(event.position, pa))
+                        .unwrap_or(AxisZone::Plot);
+                    this.drag_start = Some(event.position);
+                    this.drag_start_view = this.line_plot.read(cx).effective_view(cx);
+                    this.drag_zone = zone;
+                }),
+            )
+            .on_mouse_up(
+                MouseButton::Left,
+                cx.listener(|this, event: &gpui::MouseUpEvent, window, cx| {
+                    if this.end_panel_drag() {
+                        return;
+                    }
+                    if this.cursor_drag.is_some() {
+                        this.finish_cursor_drag(event, window, cx);
+                        return;
+                    }
+                    this.drag_start = None;
+                    this.drag_start_view = None;
+                }),
+            )
+            .on_mouse_down(
+                MouseButton::Right,
+                cx.listener(|this, event: &gpui::MouseDownEvent, window, cx| {
+                    this.open_cursor_inspector_at(event.position, window, cx);
+                }),
+            )
+            .on_mouse_move(
+                cx.listener(|this, event: &gpui::MouseMoveEvent, _window, cx| {
+                    if !event.dragging() {
+                        return;
+                    }
+                    if this.advance_panel_drag(event.position, cx) {
+                        return;
+                    }
+                    if this.cursor_drag.is_some() {
+                        this.handle_cursor_drag_move(event, cx);
+                        return;
+                    }
+                    let (Some(start), Some(start_view), Some(pa)) =
+                        (this.drag_start, this.drag_start_view, this.last_plot_area)
+                    else {
+                        return;
+                    };
 
-                            let dx = event.position.x - start.x;
-                            let dy = event.position.y - start.y;
-                            let (nx, ny) = start_view.screen_delta_to_norm(pa, dx, dy);
-                            let new_view = match this.drag_zone {
-                                AxisZone::Plot => start_view.offset_by_norm(-nx, ny),
-                                AxisZone::XAxis => start_view.offset_x(-nx),
-                                AxisZone::YAxis => start_view.offset_y(ny),
-                            };
-                            this.line_plot
-                                .update(cx, |lp, cx| lp.set_view_override(Some(new_view), cx));
-                        },
-                    ))
-                    .on_scroll_wheel(cx.listener(
-                        |this, event: &gpui::ScrollWheelEvent, _window, cx| {
-                            let Some(view) = this.line_plot.read(cx).effective_view(cx) else {
-                                return;
-                            };
-                            let Some(pa) = this.last_plot_area else {
-                                return;
-                            };
+                    let dx = event.position.x - start.x;
+                    let dy = event.position.y - start.y;
+                    let (nx, ny) = start_view.screen_delta_to_norm(pa, dx, dy);
+                    let new_view = match this.drag_zone {
+                        AxisZone::Plot => start_view.offset_by_norm(-nx, ny),
+                        AxisZone::XAxis => start_view.offset_x(-nx),
+                        AxisZone::YAxis => start_view.offset_y(ny),
+                    };
+                    this.line_plot
+                        .update(cx, |lp, cx| lp.set_view_override(Some(new_view), cx));
+                }),
+            )
+            .on_scroll_wheel(
+                cx.listener(|this, event: &gpui::ScrollWheelEvent, _window, cx| {
+                    let Some(view) = this.line_plot.read(cx).effective_view(cx) else {
+                        return;
+                    };
+                    let Some(pa) = this.last_plot_area else {
+                        return;
+                    };
 
-                            let delta = event.delta.pixel_delta(px(20.0));
-                            let zoom_amount = f32::from(-delta.y) as f64 / 200.0;
-                            let factor = (1.0_f64 + zoom_amount).clamp(0.5, 2.0);
+                    let delta = event.delta.pixel_delta(px(20.0));
+                    let zoom_amount = f32::from(-delta.y) as f64 / 200.0;
+                    let factor = (1.0_f64 + zoom_amount).clamp(0.5, 2.0);
 
-                            let zone = axis_zone(event.position, pa);
-                            let (ax, ay) = view.screen_anchor(pa, event.position);
-                            let new_view = match zone {
-                                AxisZone::Plot => view.zoom_at(factor, ax, 1.0 - ay),
-                                AxisZone::XAxis => view.zoom_x(factor, ax),
-                                AxisZone::YAxis => view.zoom_y(factor, 1.0 - ay),
-                            };
-                            this.line_plot
-                                .update(cx, |lp, cx| lp.set_view_override(Some(new_view), cx));
-                            cx.stop_propagation();
-                        },
-                    ))
-                    .child(
-                        canvas(
-                            {
-                                let this = cx.entity().downgrade();
-                                move |bounds, _window, cx| {
-                                    let _ = this.update(cx, |this, _| {
-                                        this.last_plot_area = Some(plot_area(bounds));
-                                    });
-                                    let lp = underlay_lp.read(cx);
-                                    (
-                                        bounds,
-                                        lp.effective_view(cx),
-                                        lp.data_start().unwrap_or(0.0),
-                                    )
-                                }
-                            },
-                            move |_, (bounds, view, data_start), window, cx| {
-                                if let Some(view) = view {
-                                    paint_underlay(bounds, view, data_start, window, cx);
-                                }
-                            },
+                    let zone = axis_zone(event.position, pa);
+                    let (ax, ay) = view.screen_anchor(pa, event.position);
+                    let new_view = match zone {
+                        AxisZone::Plot => view.zoom_at(factor, ax, 1.0 - ay),
+                        AxisZone::XAxis => view.zoom_x(factor, ax),
+                        AxisZone::YAxis => view.zoom_y(factor, 1.0 - ay),
+                    };
+                    this.line_plot
+                        .update(cx, |lp, cx| lp.set_view_override(Some(new_view), cx));
+                    cx.stop_propagation();
+                }),
+            )
+            .child(
+                canvas(
+                    {
+                        let this = cx.entity().downgrade();
+                        move |bounds, _window, cx| {
+                            let _ = this.update(cx, |this, _| {
+                                this.last_plot_area = Some(plot_area(bounds));
+                            });
+                            let lp = underlay_lp.read(cx);
+                            (
+                                bounds,
+                                lp.effective_view(cx),
+                                lp.data_start().unwrap_or(0.0),
+                            )
+                        }
+                    },
+                    move |_, (bounds, view, data_start), window, cx| {
+                        if let Some(view) = view {
+                            paint_underlay(bounds, view, data_start, window, cx);
+                        }
+                    },
+                )
+                .absolute()
+                .inset_0(),
+            )
+            .child(
+                div()
+                    .absolute()
+                    .left(px(Y_LABEL_WIDTH + PADDING))
+                    .top(px(PADDING))
+                    .right(px(PADDING))
+                    .bottom(px(X_LABEL_HEIGHT + PADDING))
+                    .child(self.line_plot.clone()),
+            )
+            .child(
+                canvas(
+                    move |bounds, _window, cx| {
+                        let lp = overlay_lp.read(cx);
+                        (
+                            bounds,
+                            lp.effective_view(cx),
+                            lp.data_start().unwrap_or(0.0),
                         )
-                        .absolute()
-                        .inset_0(),
-                    )
-                    .child(
-                        div()
-                            .absolute()
-                            .left(px(Y_LABEL_WIDTH + PADDING))
-                            .top(px(PADDING))
-                            .right(px(PADDING))
-                            .bottom(px(X_LABEL_HEIGHT + PADDING))
-                            .child(self.line_plot.clone()),
-                    )
-                    .child(
-                        canvas(
-                            move |bounds, _window, cx| {
-                                let lp = overlay_lp.read(cx);
-                                (
-                                    bounds,
-                                    lp.effective_view(cx),
-                                    lp.data_start().unwrap_or(0.0),
-                                )
-                            },
-                            move |_, (bounds, view, data_start), window, cx| {
-                                if let Some(view) = view {
-                                    paint_overlay(bounds, view, data_start, window, cx);
-                                }
-                            },
-                        )
-                        .absolute()
-                        .inset_0(),
-                    )
-                    .child(
-                        canvas(
-                            move |bounds, _window, cx| {
-                                let view = cursors_lp.read(cx).effective_view(cx);
-                                let mut snapshots: Vec<CursorPaint> = Vec::new();
-                                let _ = cursors_weak.update(cx, |this, cx| {
-                                    let active_id = this
-                                        .cursor_drag
-                                        .as_ref()
-                                        .map(|d| d.cursor.read(cx).id);
-                                    let lp = this.line_plot.read(cx);
-                                    for cursor in &this.cursors {
-                                        let c = cursor.read(cx);
-                                        let mut markers: Vec<(f64, f64, Hsla)> = Vec::new();
-                                        for trace in lp.traces() {
-                                            let cfg = trace.read(cx);
-                                            if !cfg.visible {
-                                                continue;
-                                            }
-                                            let v_start = lp.trace_value_at(
-                                                trace.entity_id(),
-                                                c.t_start,
-                                                cx,
-                                            );
-                                            let v_end = lp.trace_value_at(
-                                                trace.entity_id(),
-                                                c.t_end,
-                                                cx,
-                                            );
-                                            if let (Some(vs), Some(ve)) = (v_start, v_end) {
-                                                markers.push((vs, ve, cfg.color));
-                                            }
-                                        }
-                                        snapshots.push(CursorPaint {
-                                            t_start: c.t_start,
-                                            t_end: c.t_end,
-                                            active: Some(c.id) == active_id,
-                                            trace_markers: markers,
-                                        });
+                    },
+                    move |_, (bounds, view, data_start), window, cx| {
+                        if let Some(view) = view {
+                            paint_overlay(bounds, view, data_start, window, cx);
+                        }
+                    },
+                )
+                .absolute()
+                .inset_0(),
+            )
+            .child(
+                canvas(
+                    move |bounds, _window, cx| {
+                        let view = cursors_lp.read(cx).effective_view(cx);
+                        let mut snapshots: Vec<CursorPaint> = Vec::new();
+                        let _ = cursors_weak.update(cx, |this, cx| {
+                            let active_id = this.cursor_drag.as_ref().map(|d| d.cursor.read(cx).id);
+                            let lp = this.line_plot.read(cx);
+                            for cursor in &this.cursors {
+                                let c = cursor.read(cx);
+                                let mut markers: Vec<(f64, f64, Hsla)> = Vec::new();
+                                for trace in lp.traces() {
+                                    let cfg = trace.read(cx);
+                                    if !cfg.visible {
+                                        continue;
                                     }
-                                });
-                                (bounds, view, snapshots)
-                            },
-                            move |_, (bounds, view, cursors), window, cx| {
-                                if let Some(view) = view {
-                                    paint_cursors(bounds, view, &cursors, window, cx);
+                                    let v_start =
+                                        lp.trace_value_at(trace.entity_id(), c.t_start, cx);
+                                    let v_end = lp.trace_value_at(trace.entity_id(), c.t_end, cx);
+                                    if let (Some(vs), Some(ve)) = (v_start, v_end) {
+                                        markers.push((vs, ve, cfg.color));
+                                    }
                                 }
-                            },
-                        )
-                        .absolute()
-                        .inset_0(),
-                    );
+                                snapshots.push(CursorPaint {
+                                    t_start: c.t_start,
+                                    t_end: c.t_end,
+                                    active: Some(c.id) == active_id,
+                                    trace_markers: markers,
+                                });
+                            }
+                        });
+                        (bounds, view, snapshots)
+                    },
+                    move |_, (bounds, view, cursors), window, cx| {
+                        if let Some(view) = view {
+                            paint_cursors(bounds, view, &cursors, window, cx);
+                        }
+                    },
+                )
+                .absolute()
+                .inset_0(),
+            );
 
-            // Measurement panels: a native div tree positioned on top of
-            // the cursor overlays. In Track mode this is one mini panel per
-            // cursor; in Pinned mode it's a single consolidated panel.
-            let panels = measurement_panel::render_panels(self, cx);
-            for panel in panels {
-                // Panel origins are plot-area-local; the outer container's
-                // origin is offset by (Y_LABEL_WIDTH + PADDING, PADDING).
-                let left = panel.origin.x + px(Y_LABEL_WIDTH + PADDING);
-                let top = panel.origin.y + px(PADDING);
-                inner = inner.child(
-                    div()
-                        .absolute()
-                        .left(left)
-                        .top(top)
-                        .child(panel.element),
-                );
-            }
+        // Measurement panels: a native div tree positioned on top of
+        // the cursor overlays. In Track mode this is one mini panel per
+        // cursor; in Pinned mode it's a single consolidated panel.
+        let panels = measurement_panel::render_panels(self, cx);
+        for panel in panels {
+            // Panel origins are plot-area-local; the outer container's
+            // origin is offset by (Y_LABEL_WIDTH + PADDING, PADDING).
+            let left = panel.origin.x + px(Y_LABEL_WIDTH + PADDING);
+            let top = panel.origin.y + px(PADDING);
+            inner = inner.child(div().absolute().left(left).top(top).child(panel.element));
+        }
 
-            root = root.child(inner);
+        root = root.child(inner);
 
         if show_legend {
             let legend_bg = Hsla {

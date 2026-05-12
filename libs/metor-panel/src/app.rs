@@ -59,7 +59,10 @@ struct HoverPreview {
     inspector: Entity<Inspector>,
     /// Identifies the source so a redundant `PreviewPlotAction` for the same
     /// (component, indices) is a no-op rather than a flicker-rebuild.
-    key: (metor_proto::types::ComponentId, smallvec::SmallVec<[usize; 4]>),
+    key: (
+        metor_proto::types::ComponentId,
+        smallvec::SmallVec<[usize; 4]>,
+    ),
 }
 
 impl AppRoot {

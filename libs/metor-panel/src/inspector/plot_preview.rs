@@ -38,9 +38,10 @@ pub fn preview_traces(
     cx: &App,
 ) -> Vec<Trace> {
     if indices.is_empty() {
-        let elem_count = crate::inspector::trace_picker::element_names_for_component(db, component_id)
-            .len()
-            .max(1);
+        let elem_count =
+            crate::inspector::trace_picker::element_names_for_component(db, component_id)
+                .len()
+                .max(1);
         let all: Vec<usize> = (0..elem_count).collect();
         traces_for_component(db, component_id, &all, cx)
     } else {
