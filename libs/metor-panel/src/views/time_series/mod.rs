@@ -35,6 +35,9 @@ pub use measurements::{MeasurementKind, MeasurementKindList};
 pub mod cursor_inspector;
 pub use cursor_inspector::build_cursor_rows;
 
+pub mod measurement_panel;
+pub use measurement_panel::PanelPosition;
+
 /// Iterator of tick values for any value axis on a `[min, max)` range.
 ///
 /// Ticks are anchored at zero whenever the range crosses it so the origin
@@ -577,15 +580,6 @@ fn paint_overlay(
     }
 }
 
-/// One colored span in the cursor's readout header.
-///
-/// Per-trace numbers carry the trace's color so the badge legend is
-/// implicit — labels and separators use the secondary text color.
-struct HeaderSegment {
-    text: SharedString,
-    color: Hsla,
-}
-
 /// Snapshot of one cursor's visible state, captured during canvas prepare.
 ///
 /// Keeps the paint closure free of any `App` access so the gpui callback can
@@ -599,10 +593,6 @@ struct CursorPaint {
     /// `(value, color)` per visible trace at `t_start` and `t_end` so the
     /// overlay can drop a dot marker on each line.
     trace_markers: Vec<(f64, f64, Hsla)>,
-    /// Multi-line readout for the top-of-band badge: one line per measurement
-    /// kind, each split into colored segments so per-trace values can render
-    /// in their trace's color.
-    header: Vec<Vec<HeaderSegment>>,
 }
 
 fn paint_cursors(
@@ -617,9 +607,6 @@ fn paint_cursors(
     }
     let pb = plot_area(outer_bounds);
     let theme = crate::theme::theme(cx);
-    let label_font_size = px(LABEL_FONT_SIZE);
-    let text_style = window.text_style();
-    let font = text_style.font();
 
     for cursor in cursors {
         let (a, b) = if cursor.t_start.0 <= cursor.t_end.0 {
@@ -691,133 +678,7 @@ fn paint_cursors(
                 window.paint_quad(gpui::fill(dot, *color));
             }
         }
-
-        // Readout badge near the top of the cursor band: one line per
-        // enabled scalar measurement. Per-trace values are colored by their
-        // trace so the badge doubles as a legend.
-        if cursor.header.is_empty() {
-            continue;
-        }
-        let mid_x = (xa + xb) / 2.0;
-        let mut y_offset = pb.origin.y + px(2.0);
-        let line_height = label_font_size + px(2.0);
-        for line in &cursor.header {
-            if line.is_empty() {
-                continue;
-            }
-            let mut text = String::new();
-            let mut runs: Vec<TextRun> = Vec::with_capacity(line.len());
-            for seg in line {
-                text.push_str(&seg.text);
-                runs.push(TextRun {
-                    len: seg.text.len(),
-                    font: font.clone(),
-                    color: seg.color,
-                    background_color: None,
-                    underline: None,
-                    strikethrough: None,
-                });
-            }
-            let shaped = window.text_system().shape_line(
-                SharedString::from(text),
-                label_font_size,
-                &runs,
-                None,
-            );
-            let origin = point(
-                (mid_x - shaped.width / 2.0)
-                    .max(pb.origin.x + px(2.0))
-                    .min(pb.origin.x + pb.size.width - shaped.width - px(2.0)),
-                y_offset,
-            );
-            let _ = shaped.paint(origin, label_font_size, window, cx);
-            y_offset += line_height;
-        }
     }
-}
-
-/// Build the multi-line readout badge for `cursor`.
-///
-/// Each enabled scalar measurement produces one line. Trace-independent
-/// kinds (Δx) print a single segment; per-trace kinds (Δy, Mean, RMS, …)
-/// emit the label followed by one segment per visible trace, colored to
-/// match the trace. FFT is omitted (vector result, lives in a cascade page).
-fn cursor_header(
-    cursor: &MeasurementCursor,
-    line_plot: &LinePlot,
-    cx: &gpui::App,
-) -> Vec<Vec<HeaderSegment>> {
-    use measurements::{collect_samples, format_value, reduce};
-
-    let (start, end) = cursor.ordered();
-    let theme = crate::theme::theme(cx);
-    let label_color = theme.text_secondary;
-
-    // Cache samples per (trace_id, element_index) so all per-trace kinds
-    // share one read pass.
-    let visible_traces: Vec<&Entity<Trace>> = line_plot
-        .traces()
-        .iter()
-        .filter(|t| t.read(cx).visible)
-        .collect();
-    let mut samples_by_trace: HashMap<
-        gpui::EntityId,
-        Option<std::sync::Arc<Vec<(Timestamp, f64)>>>,
-    > = HashMap::new();
-
-    let mut lines: Vec<Vec<HeaderSegment>> = Vec::new();
-    for kind in cursor.enabled.iter().copied() {
-        if matches!(kind, MeasurementKind::DeltaX) {
-            lines.push(vec![HeaderSegment {
-                text: SharedString::from(format!(
-                    "Δt {}",
-                    format_value(kind, (end.0 - start.0) as f64)
-                )),
-                color: label_color,
-            }]);
-            continue;
-        }
-
-        let mut line: Vec<HeaderSegment> = Vec::new();
-        line.push(HeaderSegment {
-            text: SharedString::from(format!("{}  ", kind.label())),
-            color: label_color,
-        });
-        let mut any = false;
-        for (i, trace) in visible_traces.iter().enumerate() {
-            let cfg = trace.read(cx);
-            let element_index = cfg.element_index;
-            let samples = samples_by_trace
-                .entry(trace.entity_id())
-                .or_insert_with(|| {
-                    line_plot
-                        .component_for_trace(trace, cx)
-                        .and_then(|c| collect_samples(&c, element_index, start..end))
-                });
-            let Some(s) = samples.as_ref() else {
-                continue;
-            };
-            let Some(v) = reduce(kind, s) else {
-                continue;
-            };
-            if i > 0 && any {
-                line.push(HeaderSegment {
-                    text: SharedString::new_static("  "),
-                    color: label_color,
-                });
-            }
-            line.push(HeaderSegment {
-                text: SharedString::from(format_value(kind, v).to_string()),
-                color: cfg.color,
-            });
-            any = true;
-        }
-        if any {
-            lines.push(line);
-        }
-    }
-
-    lines
 }
 
 /// Rendering mode for a single [`Trace`].
@@ -905,6 +766,8 @@ pub struct TimeSeriesPlot {
     last_plot_area: Option<Bounds<Pixels>>,
     cursors: smallvec::SmallVec<[Entity<MeasurementCursor>; 2]>,
     cursor_drag: Option<CursorDrag>,
+    panel_position: PanelPosition,
+    panel_drag: Option<measurement_panel::PanelDragState>,
 }
 
 /// Build traces for `component_id` × `indices`, cycling theme colors and
@@ -964,7 +827,142 @@ impl TimeSeriesPlot {
             last_plot_area: None,
             cursors: smallvec::SmallVec::new(),
             cursor_drag: None,
+            panel_position: PanelPosition::default(),
+            panel_drag: None,
         }
+    }
+
+    pub fn panel_position(&self) -> PanelPosition {
+        self.panel_position
+    }
+
+    pub fn last_plot_area(&self) -> Option<Bounds<Pixels>> {
+        self.last_plot_area
+    }
+
+    pub fn set_panel_position(&mut self, position: PanelPosition, cx: &mut Context<Self>) {
+        if self.panel_position != position {
+            self.panel_position = position;
+            cx.notify();
+        }
+    }
+
+    /// Start dragging a panel from its current screen origin.
+    ///
+    /// Called by both per-cursor mini panels (which pass the cursor's
+    /// band-anchored origin) and the consolidated panel (which passes its
+    /// current pinned origin). Transitions to `Pinned` at that origin so
+    /// the drag has a stable starting point regardless of which mode the
+    /// panel started in.
+    ///
+    /// `mouse` is window-local; `panel_pa_local` is plot-area-local. Both
+    /// are rounded to integer pixels so the f32 storage stays aligned with
+    /// taffy's rounded layout output and the panel doesn't drift sub-pixel
+    /// during the drag.
+    pub fn start_panel_drag(
+        &mut self,
+        mouse: Point<Pixels>,
+        panel_pa_local: Point<Pixels>,
+        cx: &mut Context<Self>,
+    ) {
+        let pa_local_x = f32::from(panel_pa_local.x).round();
+        let pa_local_y = f32::from(panel_pa_local.y).round();
+        let Some(plot_area) = self.last_plot_area else {
+            return;
+        };
+        let panel_window_x = f32::from(plot_area.origin.x) + pa_local_x;
+        let panel_window_y = f32::from(plot_area.origin.y) + pa_local_y;
+        let offset = Point {
+            x: px(f32::from(mouse.x) - panel_window_x),
+            y: px(f32::from(mouse.y) - panel_window_y),
+        };
+        self.panel_position = PanelPosition::Pinned {
+            x: pa_local_x,
+            y: pa_local_y,
+        };
+        self.panel_drag = Some(measurement_panel::PanelDragState { offset });
+        cx.notify();
+    }
+
+    /// Click-without-drag handler for a per-cursor mini-panel's lock icon:
+    /// pin the consolidated panel at this cursor's current band position.
+    pub fn pin_panel_at(&mut self, panel_pa_local: Point<Pixels>, cx: &mut Context<Self>) {
+        self.panel_position = PanelPosition::Pinned {
+            x: f32::from(panel_pa_local.x).round(),
+            y: f32::from(panel_pa_local.y).round(),
+        };
+        cx.notify();
+    }
+
+    /// Click handler for the consolidated panel's track icon: return to
+    /// per-cursor track mode.
+    pub fn unpin_panel(&mut self, cx: &mut Context<Self>) {
+        if !matches!(self.panel_position, PanelPosition::Track) {
+            self.panel_position = PanelPosition::Track;
+            cx.notify();
+        }
+    }
+
+    /// Current pinned origin as a `Point<Pixels>`; returns the top-left if
+    /// the panel isn't actually pinned (shouldn't happen in normal flow,
+    /// but the consolidated panel's drag handler asks for the origin
+    /// unconditionally).
+    pub fn consolidated_panel_origin(&self) -> Point<Pixels> {
+        match self.panel_position {
+            PanelPosition::Pinned { x, y } => Point { x: px(x), y: px(y) },
+            PanelPosition::Track => Point {
+                x: px(0.0),
+                y: px(0.0),
+            },
+        }
+    }
+
+    /// Advance the panel drag to a new mouse position. Called from both the
+    /// plot wrapper's `on_mouse_move` (fires when the cursor is over the
+    /// plot area) and the panel's own `on_mouse_move` (fires when the
+    /// cursor is over the panel — the panel `occludes` the wrapper so the
+    /// wrapper's handler doesn't fire while the cursor is on the panel).
+    /// Without both, the panel only moves when the cursor leaves it.
+    ///
+    /// Returns `true` when a drag was in flight; the caller uses that to
+    /// short-circuit other drag branches.
+    pub fn advance_panel_drag(&mut self, mouse: Point<Pixels>, cx: &mut Context<Self>) -> bool {
+        let Some(drag) = self.panel_drag else {
+            return false;
+        };
+        let Some(plot_area) = self.last_plot_area else {
+            return true;
+        };
+        // `mouse` is window-local; convert to plot-area-local before
+        // storing as the pinned position. Round to integer pixels so each
+        // mouse-pixel produces exactly one panel-pixel step — gpui's
+        // taffy layout engine has `enable_rounding` on globally
+        // (taffy.rs:42), so unrounded f32 storage gets re-rounded at
+        // render time and the mismatch makes the panel feel like it
+        // snaps unevenly.
+        let new_pa_x = (f32::from(mouse.x) - f32::from(drag.offset.x)
+            - f32::from(plot_area.origin.x))
+            .round();
+        let new_pa_y = (f32::from(mouse.y) - f32::from(drag.offset.y)
+            - f32::from(plot_area.origin.y))
+            .round();
+        self.set_panel_position(
+            PanelPosition::Pinned {
+                x: new_pa_x,
+                y: new_pa_y,
+            },
+            cx,
+        );
+        true
+    }
+
+    /// Clear an in-flight panel drag. Mirrors `advance_panel_drag`: callable
+    /// from both the wrapper's and the panel's `on_mouse_up` handler.
+    pub fn end_panel_drag(&mut self) -> bool {
+        if self.panel_drag.take().is_some() {
+            return true;
+        }
+        false
     }
 
     /// Currently-rendered measurement cursors, including the in-progress
@@ -1225,12 +1223,12 @@ impl Render for TimeSeriesPlot {
             .flex()
             .flex_col()
             .size_full()
-            .bg(theme.bg_secondary)
-            .child(
-                div()
-                    .flex_1()
-                    .min_h_0()
-                    .relative()
+            .bg(theme.bg_secondary);
+
+        let mut inner = div()
+            .flex_1()
+            .min_h_0()
+            .relative()
                     .on_mouse_down(
                         MouseButton::Left,
                         cx.listener(|this, event: &gpui::MouseDownEvent, window, cx| {
@@ -1258,6 +1256,9 @@ impl Render for TimeSeriesPlot {
                     .on_mouse_up(
                         MouseButton::Left,
                         cx.listener(|this, event: &gpui::MouseUpEvent, window, cx| {
+                            if this.end_panel_drag() {
+                                return;
+                            }
                             if this.cursor_drag.is_some() {
                                 this.finish_cursor_drag(event, window, cx);
                                 return;
@@ -1275,6 +1276,9 @@ impl Render for TimeSeriesPlot {
                     .on_mouse_move(cx.listener(
                         |this, event: &gpui::MouseMoveEvent, _window, cx| {
                             if !event.dragging() {
+                                return;
+                            }
+                            if this.advance_panel_drag(event.position, cx) {
                                 return;
                             }
                             if this.cursor_drag.is_some() {
@@ -1410,13 +1414,11 @@ impl Render for TimeSeriesPlot {
                                                 markers.push((vs, ve, cfg.color));
                                             }
                                         }
-                                        let header = cursor_header(c, lp, cx);
                                         snapshots.push(CursorPaint {
                                             t_start: c.t_start,
                                             t_end: c.t_end,
                                             active: Some(c.id) == active_id,
                                             trace_markers: markers,
-                                            header,
                                         });
                                     }
                                 });
@@ -1430,8 +1432,27 @@ impl Render for TimeSeriesPlot {
                         )
                         .absolute()
                         .inset_0(),
-                    ),
-            );
+                    );
+
+            // Measurement panels: a native div tree positioned on top of
+            // the cursor overlays. In Track mode this is one mini panel per
+            // cursor; in Pinned mode it's a single consolidated panel.
+            let panels = measurement_panel::render_panels(self, cx);
+            for panel in panels {
+                // Panel origins are plot-area-local; the outer container's
+                // origin is offset by (Y_LABEL_WIDTH + PADDING, PADDING).
+                let left = panel.origin.x + px(Y_LABEL_WIDTH + PADDING);
+                let top = panel.origin.y + px(PADDING);
+                inner = inner.child(
+                    div()
+                        .absolute()
+                        .left(left)
+                        .top(top)
+                        .child(panel.element),
+                );
+            }
+
+            root = root.child(inner);
 
         if show_legend {
             let legend_bg = Hsla {

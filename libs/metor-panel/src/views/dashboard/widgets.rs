@@ -252,6 +252,7 @@ pub fn serialize_widget_state(
             y_max_override: lp.y_max_override.clone(),
             default_measurements: Vec::new(),
             cursors: Vec::new(),
+            measurement_panel: Default::default(),
         };
         return facet_json::to_string(&cfg).ok();
     }

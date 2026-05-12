@@ -51,7 +51,9 @@ const RESIZE_HANDLE_SIZE: f32 = 1.0;
 /// - 1: initial.
 /// - 2: `PlotPanelConfig` gains `default_measurements` and `cursors` for
 ///   right-click-drag measurement cursors.
-const SUPPORTED_LAYOUT_VERSION: u32 = 2;
+/// - 3: `PlotPanelConfig` gains `measurement_panel` (track/pinned position
+///   for the native measurement readout panel).
+const SUPPORTED_LAYOUT_VERSION: u32 = 3;
 
 /// Failure modes when loading a layout from JSON.
 #[derive(Debug)]
