@@ -66,6 +66,10 @@ pub enum NodeSpec {
         k: TypedScalar,
         op: ThresholdOp,
     },
+    /// First-difference: `x[n] - x[n-1]`, element-wise, output dtype `f64`.
+    Delta,
+    /// Time-difference between consecutive samples, in seconds, as an `f64` scalar.
+    DeltaT,
     /// Two-input element-wise arithmetic: Add/Sub/Mul/Div.
     Binary {
         op: BinaryOp,
@@ -100,6 +104,8 @@ pub enum NodeSpecKind {
     Magnitude,
     Index,
     Threshold,
+    Delta,
+    DeltaT,
     Binary,
     Mean,
     Pack,
@@ -125,6 +131,8 @@ impl NodeSpec {
             Magnitude => NodeSpecKind::Magnitude,
             Index { .. } => NodeSpecKind::Index,
             Threshold { .. } => NodeSpecKind::Threshold,
+            Delta => NodeSpecKind::Delta,
+            DeltaT => NodeSpecKind::DeltaT,
             Binary { .. } => NodeSpecKind::Binary,
             Mean => NodeSpecKind::Mean,
             Pack => NodeSpecKind::Pack,
@@ -165,6 +173,8 @@ impl NodeSpec {
             Magnitude => op_tag::MAGNITUDE,
             Index { .. } => op_tag::INDEX,
             Threshold { .. } => op_tag::THRESHOLD,
+            Delta => op_tag::DELTA,
+            DeltaT => op_tag::DELTA_T,
             Binary { op } => op.op_tag(),
             Mean => op_tag::MEAN,
             Pack => op_tag::PACK,
@@ -224,7 +234,7 @@ impl NodeSpec {
             Affine { k, .. } => {
                 k.hash(h);
             }
-            Unary { .. } | Fft | Magnitude => {}
+            Unary { .. } | Fft | Magnitude | Delta | DeltaT => {}
             Window { size } => {
                 size.hash(h);
             }
@@ -341,6 +351,8 @@ pub fn build(
         Magnitude => ops::derive::magnitude(p1("magnitude", parents)?),
         Index { index } => ops::derive::index(p1("index", parents)?, *index),
         Threshold { k, op } => ops::derive::threshold(p1("threshold", parents)?, *k, *op),
+        Delta => ops::derive::delta(p1("delta", parents)?),
+        DeltaT => ops::derive::delta_t(p1("delta_t", parents)?),
         Binary { op } => {
             let (a, b) = p2("binary", parents)?;
             ops::compose::binary_op(a, b, *op)

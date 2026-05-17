@@ -130,6 +130,8 @@ pub fn all_themes() -> &'static [&'static Theme] {
         &ROSE_PINE,
         &ROSE_PINE_MOON,
         &ROSE_PINE_DAWN,
+        &MAKING_SOFTWARE,
+        &DEPARTURE,
     ];
     THEMES
 }
@@ -544,6 +546,88 @@ pub static ROSE_PINE_DAWN: Theme = Theme {
     control_active: hex(0x56949f, 1.0),
     control_active_track: hex(0x56949f, 0.7),
     error_accent: hex(0xb4637a, 1.0),
+};
+
+pub static MAKING_SOFTWARE: Theme = Theme {
+    name: "Making Software",
+    font_family: "Berkeley Mono",
+
+    bg_primary: hex(0xf4f5f9, 1.0),
+    bg_secondary: hex(0xeceef5, 1.0),
+    bg_elevated: hex(0xffffff, 1.0),
+
+    text_primary: hex(0x000000, 1.0),
+    text_secondary: hex(0x3d4358, 1.0),
+    text_tertiary: hex(0x7a819b, 1.0),
+
+    border_primary: hex(0xb9c7fd, 1.0),
+
+    selection_bg: hex(0xe6ebff, 1.0),
+    text_selection: hex(0xffe680, 0.55),
+    drop_target: hex(0x1342ff, 0.12),
+
+    pill_bg: hex(0xe6ebff, 1.0),
+    pill_border: hex(0xb9c7fd, 1.0),
+
+    line_color: hex(0x1342ff, 1.0),
+    line_colors: [
+        hex(0x1342ff, 1.0), // cobalt
+        hex(0xe35d3a, 1.0), // brick / coral
+        hex(0x2f8f4a, 1.0), // forest green
+        hex(0xc02434, 1.0), // ink red
+        hex(0x7a3fd1, 1.0), // violet
+        hex(0x0e8a8a, 1.0), // teal
+        hex(0xd9a200, 1.0), // amber
+        hex(0xc94f9b, 1.0), // magenta
+    ],
+    grid_color: hex(0xe6ebff, 1.0),
+    axis_color: hex(0xb9c7fd, 1.0),
+    zero_line_color: hex(0x97acff, 1.0),
+
+    control_active: hex(0x1342ff, 1.0),
+    control_active_track: hex(0x1342ff, 0.7),
+    error_accent: hex(0xc02434, 1.0),
+};
+
+pub static DEPARTURE: Theme = Theme {
+    name: "Departure",
+    font_family: "Berkeley Mono",
+
+    bg_primary: hex(0x1a1815, 1.0),
+    bg_secondary: hex(0x131210, 1.0),
+    bg_elevated: hex(0x252220, 1.0),
+
+    text_primary: hex(0xf0a040, 1.0),   // bright amber
+    text_secondary: hex(0xb07830, 1.0), // mid amber
+    text_tertiary: hex(0x6e4c20, 1.0),  // dim amber
+
+    border_primary: hex(0x3a2a18, 1.0),
+
+    selection_bg: hex(0x3a2a18, 1.0),
+    text_selection: hex(0xf0a040, 0.25),
+    drop_target: hex(0xf0a040, 0.15),
+
+    pill_bg: hex(0x2a1f12, 1.0),
+    pill_border: hex(0x5a3e20, 1.0),
+
+    line_color: hex(0xf0a040, 1.0),
+    line_colors: [
+        hex(0xf0a040, 1.0), // amber
+        hex(0x4ad0d0, 1.0), // cyan
+        hex(0x80c060, 1.0), // green
+        hex(0xe05050, 1.0), // red
+        hex(0xd870b0, 1.0), // magenta
+        hex(0xf8d080, 1.0), // pale amber
+        hex(0x5090e0, 1.0), // blue
+        hex(0xb0a040, 1.0), // olive
+    ],
+    grid_color: hex(0x2a2018, 1.0),
+    axis_color: hex(0x3a2a18, 1.0),
+    zero_line_color: hex(0x5a3e20, 1.0),
+
+    control_active: hex(0xf0a040, 1.0),
+    control_active_track: hex(0xf0a040, 0.7),
+    error_accent: hex(0xe05050, 1.0),
 };
 
 /// Load the embedded IBM Plex Mono fonts into gpui's text system.

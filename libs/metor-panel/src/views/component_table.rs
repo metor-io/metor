@@ -4,6 +4,7 @@ use super::monitor::{behavior_snapshot, edit_click};
 use super::table::{Column, ColumnSort, Table, TableDelegate};
 use super::time_series::{LinePlot, Trace};
 use super::value_strip::{ComponentValueStrip, StripClick, StripStyle};
+use crate::inspector::plot_preview::shift_hover_listener;
 use crate::theme::theme;
 use crate::{ComponentStream, WalComponentStream};
 use gpui::{
@@ -11,6 +12,7 @@ use gpui::{
     Window, div, prelude::*, px,
 };
 use metor_db::{Component, DB};
+use smallvec::SmallVec;
 
 struct ComponentRow {
     db: Arc<DB>,
@@ -181,10 +183,13 @@ impl TableDelegate for ComponentTableDelegate {
         match col_ix {
             0 => {
                 let name = row.read(cx).name.clone();
+                let component_id = row.read(cx).component_id();
                 div()
+                    .id(("component-table-name", row_ix))
                     .px(px(12.0))
                     .text_size(px(13.0))
                     .text_color(theme.text_primary)
+                    .on_mouse_move(shift_hover_listener(component_id, SmallVec::new()))
                     .child(name)
                     .into_any_element()
             }

@@ -129,6 +129,20 @@ pub trait ColumnBrowserDelegate: Sized + 'static {
     fn auto_extend_selection(&mut self, cx: &mut Context<ColumnBrowser<Self>>) {
         let _ = cx;
     }
+
+    /// Action dispatched while the user shift-hovers `item`. Lets a
+    /// delegate route hover into the impromptu plot preview without the
+    /// browser knowing about plot semantics. Returning `None` disables
+    /// shift-hover for that row. Default: no shift-hover.
+    fn shift_hover_action(
+        &self,
+        item: &Self::Item,
+        anchor: Point<Pixels>,
+        cx: &App,
+    ) -> Option<Box<dyn gpui::Action>> {
+        let _ = (item, anchor, cx);
+        None
+    }
 }
 
 /// Finder-style hierarchical browser.
@@ -363,6 +377,7 @@ impl<D: ColumnBrowserDelegate> ColumnBrowser<D> {
 
         let item_left = item.clone();
         let item_right = item.clone();
+        let item_hover = item.clone();
 
         let mut row = div()
             .id(SharedString::from(format!(
@@ -381,6 +396,19 @@ impl<D: ColumnBrowserDelegate> ColumnBrowser<D> {
             .bg(bg)
             .cursor_pointer()
             .hover(move |s| s.bg(hover_bg))
+            .on_mouse_move(
+                cx.listener(move |this, event: &gpui::MouseMoveEvent, window, cx| {
+                    if !event.modifiers.shift {
+                        return;
+                    }
+                    if let Some(action) =
+                        this.delegate
+                            .shift_hover_action(&item_hover, event.position, cx)
+                    {
+                        window.dispatch_action(action, cx);
+                    }
+                }),
+            )
             .on_mouse_down(
                 MouseButton::Left,
                 cx.listener(move |this, event: &MouseDownEvent, window, cx| {

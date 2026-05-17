@@ -327,6 +327,8 @@ pub mod op_tag {
     pub const MAGNITUDE: &[u8] = b"derive.magnitude";
     pub const INDEX: &[u8] = b"derive.index";
     pub const THRESHOLD: &[u8] = b"derive.threshold";
+    pub const DELTA: &[u8] = b"derive.delta";
+    pub const DELTA_T: &[u8] = b"derive.delta_t";
     pub const ZOH: &[u8] = b"resample.zoh";
     pub const LINEAR: &[u8] = b"resample.linear";
     pub const LATEST_AT: &[u8] = b"resample.latest_at";

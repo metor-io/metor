@@ -12,7 +12,7 @@ use crate::tiles::panels::{
     BrowserPanel, DataTablePanel, ListPlotPanel, PlotPanel, TablePanel, TextPanel,
     TrafficLightGridPanel, TrafficLightPanel, Viewer3dPanel, XyPlotPanel,
 };
-use crate::tiles::{PlotComponentAction, TileGroup, TileGroupEvent};
+use crate::tiles::{PlotComponentAction, PreviewPlotAction, TileGroup, TileGroupEvent};
 use crate::views::dashboard::{DashboardPanel, deserialize_dashboard};
 use gpui::{
     App, Application, Bounds, Context, Entity, FocusHandle, Focusable, IntoElement, KeyBinding,
@@ -44,10 +44,25 @@ struct AppRoot {
     db: Arc<DB>,
     tiles: Entity<TileGroup>,
     inspector: Option<Entity<Inspector>>,
+    /// Anchored, non-focused plot preview shown while the user holds shift
+    /// over a component name. Tracked separately from `inspector` so the
+    /// underlying surface keeps focus and the modifiers-changed listener
+    /// can dismiss without disturbing the regular inspector slot.
+    hover_preview: Option<HoverPreview>,
     pending_inspector_request: Option<(Box<dyn crate::tiles::PaneItemHandle>, Point<Pixels>)>,
     pending_pane_inspector_request: Option<(Entity<crate::tiles::Pane>, Point<Pixels>)>,
     pending_inspector_open: Option<InspectorRequest>,
     focus_handle: FocusHandle,
+}
+
+struct HoverPreview {
+    inspector: Entity<Inspector>,
+    /// Identifies the source so a redundant `PreviewPlotAction` for the same
+    /// (component, indices) is a no-op rather than a flicker-rebuild.
+    key: (
+        metor_proto::types::ComponentId,
+        smallvec::SmallVec<[usize; 4]>,
+    ),
 }
 
 impl AppRoot {
@@ -67,6 +82,7 @@ impl AppRoot {
             db,
             tiles,
             inspector: None,
+            hover_preview: None,
             pending_inspector_request: None,
             pending_pane_inspector_request: None,
             pending_inspector_open: None,
@@ -209,6 +225,42 @@ impl AppRoot {
         pane.update(cx, |pane, cx| pane.add_item(Box::new(plot), cx));
     }
 
+    fn handle_preview_plot_action(
+        &mut self,
+        action: &PreviewPlotAction,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let key = (action.component_id, action.indices.clone());
+        if self
+            .hover_preview
+            .as_ref()
+            .is_some_and(|hp| hp.key == key && !hp.inspector.read(cx).dismissed)
+        {
+            return;
+        }
+
+        let traces = crate::inspector::plot_preview::preview_traces(
+            &self.db,
+            action.component_id,
+            &action.indices,
+            cx,
+        );
+        if traces.is_empty() {
+            return;
+        }
+
+        let spec = crate::inspector::plot_preview::build_plot_preview(self.db.clone(), traces, cx);
+        let mode = InspectorMode::Anchored(action.anchor);
+        let inspector = cx.new(|cx| {
+            let mut insp = Inspector::with_view(spec, mode, cx);
+            insp.set_passive();
+            insp
+        });
+        self.hover_preview = Some(HoverPreview { inspector, key });
+        cx.notify();
+    }
+
     fn handle_tile_event(
         &mut self,
         _tiles: Entity<TileGroup>,
@@ -284,7 +336,15 @@ impl Render for AppRoot {
             .on_action(cx.listener(Self::toggle_cmd_lock))
             .on_action(cx.listener(Self::handle_inspect_entity))
             .on_action(cx.listener(Self::handle_plot_component_action))
+            .on_action(cx.listener(Self::handle_preview_plot_action))
             .on_action(cx.listener(Self::open_review_edits))
+            .on_modifiers_changed(cx.listener(
+                |this, event: &gpui::ModifiersChangedEvent, _window, cx| {
+                    if !event.modifiers.shift && this.hover_preview.take().is_some() {
+                        cx.notify();
+                    }
+                },
+            ))
             .font_family(theme.font_family)
             .flex()
             .flex_col()
@@ -294,6 +354,10 @@ impl Render for AppRoot {
 
         if let Some(inspector) = &self.inspector {
             root = root.child(inspector.clone());
+        }
+
+        if let Some(preview) = &self.hover_preview {
+            root = root.child(preview.inspector.clone());
         }
 
         root

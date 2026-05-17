@@ -739,6 +739,8 @@ pub fn rows_for_node(
         NodeSpec::ClockOf
         | NodeSpec::Fft
         | NodeSpec::Magnitude
+        | NodeSpec::Delta
+        | NodeSpec::DeltaT
         | NodeSpec::Mean
         | NodeSpec::Pack
         | NodeSpec::Dot => {}

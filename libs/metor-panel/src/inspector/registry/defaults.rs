@@ -48,6 +48,7 @@ impl InspectorRegistry {
             AddBehavior::Default(Arc::new(|_cx| crate::views::viewer_3d::ModelEntry::empty())),
         );
         self.register_viewer3d_builder(db.clone());
+        self.register_measurement_cursor_builder();
         self.register_dashboard_builder(db.clone());
         self.register_pane_builder();
         self.register_field_override::<crate::views::time_series::Trace>(
@@ -279,6 +280,16 @@ impl InspectorRegistry {
                     rows
                 }),
             ))
+        }));
+    }
+
+    fn register_measurement_cursor_builder(&mut self) {
+        use crate::views::time_series::MeasurementCursor;
+        self.register_type_builder::<MeasurementCursor>(Arc::new(|any_entity, _db, cx| {
+            let cursor: Entity<MeasurementCursor> = any_entity
+                .downcast()
+                .expect("MeasurementCursor type mismatch");
+            crate::views::time_series::build_cursor_rows(cursor, cx)
         }));
     }
 

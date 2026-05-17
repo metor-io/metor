@@ -23,6 +23,19 @@ pub struct PlotComponentAction {
     pub indices: SmallVec<[usize; 4]>,
 }
 
+/// Dispatched while shift is held over a component name to open a transient
+/// plot preview anchored at the cursor. An empty `indices` means all
+/// elements; surfaces with per-element granularity (value strips) pass a
+/// single index. AppRoot owns the preview lifecycle and dismisses on
+/// shift release.
+#[derive(Clone, PartialEq, gpui::Action)]
+#[action(no_json)]
+pub struct PreviewPlotAction {
+    pub component_id: ComponentId,
+    pub indices: SmallVec<[usize; 4]>,
+    pub anchor: Point<Pixels>,
+}
+
 const TAB_HEIGHT: f32 = 28.0;
 const TAB_CLOSE_SIZE: f32 = 16.0;
 const TAB_RAIL_WIDTH: f32 = 160.0;

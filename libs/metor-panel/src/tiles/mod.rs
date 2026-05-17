@@ -17,7 +17,7 @@ use serial::{SerializedItem, SerializedMember, SerializedPane, SerializedSplit};
 
 pub use drag::SplitDirection;
 pub use item::{PaneItem, PaneItemHandle};
-pub use pane::{Pane, PaneEvent, PlotComponentAction, TabOrientation};
+pub use pane::{Pane, PaneEvent, PlotComponentAction, PreviewPlotAction, TabOrientation};
 pub use serial::{ItemRegistry, SerializedTileGroup};
 
 /// Sequence of member indices locating a node in the split tree.
@@ -46,7 +46,14 @@ const RESIZE_HANDLE_SIZE: f32 = 1.0;
 
 /// Layout version this binary writes and accepts on read. Bump in lockstep
 /// with [`TileGroup::serialize`] when the document shape changes.
-const SUPPORTED_LAYOUT_VERSION: u32 = 1;
+///
+/// Version history:
+/// - 1: initial.
+/// - 2: `PlotPanelConfig` gains `default_measurements` and `cursors` for
+///   right-click-drag measurement cursors.
+/// - 3: `PlotPanelConfig` gains `measurement_panel` (track/pinned position
+///   for the native measurement readout panel).
+const SUPPORTED_LAYOUT_VERSION: u32 = 3;
 
 /// Failure modes when loading a layout from JSON.
 #[derive(Debug)]

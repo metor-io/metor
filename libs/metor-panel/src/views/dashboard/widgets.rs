@@ -250,6 +250,9 @@ pub fn serialize_widget_state(
             custom_title: lp.custom_title.as_ref().map(|s| s.to_string()),
             y_min_override: lp.y_min_override.clone(),
             y_max_override: lp.y_max_override.clone(),
+            default_measurements: Vec::new(),
+            cursors: Vec::new(),
+            measurement_panel: Default::default(),
         };
         return facet_json::to_string(&cfg).ok();
     }

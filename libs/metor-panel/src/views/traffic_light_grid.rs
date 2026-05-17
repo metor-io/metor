@@ -7,6 +7,9 @@ use gpui::{
 use metor_db::DB;
 use metor_proto::types::{ComponentId, ElementValue};
 use regex::Regex;
+use smallvec::SmallVec;
+
+use crate::inspector::plot_preview::shift_hover_listener;
 
 use super::tooltip::TooltipText;
 use super::traffic_light::{component_meta, spawn_on_stream, traffic_light_swatch};
@@ -190,7 +193,8 @@ impl Render for TrafficLightGrid {
                 .tooltip({
                     let name = name.clone();
                     move |_window, cx| TooltipText::build(name.clone(), cx)
-                });
+                })
+                .on_mouse_move(shift_hover_listener(id, SmallVec::new()));
 
             if is_bool {
                 tile = tile.cursor_pointer().on_mouse_down(

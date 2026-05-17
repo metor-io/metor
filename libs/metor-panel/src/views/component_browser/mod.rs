@@ -518,6 +518,20 @@ impl ColumnBrowserDelegate for ComponentBrowserDelegate {
         item.segment.clone()
     }
 
+    fn shift_hover_action(
+        &self,
+        item: &Self::Item,
+        anchor: gpui::Point<gpui::Pixels>,
+        _cx: &App,
+    ) -> Option<Box<dyn gpui::Action>> {
+        let component_id = item.component_id?;
+        Some(Box::new(crate::tiles::PreviewPlotAction {
+            component_id,
+            indices: SmallVec::new(),
+            anchor,
+        }))
+    }
+
     fn column_label(&self, parent: Option<&Self::Item>) -> SharedString {
         match parent {
             Some(node) => node.full_name.clone(),
@@ -900,10 +914,15 @@ fn render_preview_entry(row: &PreviewRow, theme: &Arc<Theme>) -> AnyElement {
                 .gap(px(4.0))
                 .child(
                     div()
+                        .id(("detail-name", icon_id))
                         .flex_1()
                         .overflow_hidden()
                         .text_size(px(12.0))
                         .text_color(theme.text_secondary)
+                        .on_mouse_move(crate::inspector::plot_preview::shift_hover_listener(
+                            component_id,
+                            SmallVec::new(),
+                        ))
                         .child(row.full_name.clone()),
                 )
                 .child(plot_icon),

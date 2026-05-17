@@ -98,9 +98,8 @@ impl RowList {
                     );
                 }
             }
-            // `Pop` and `Dismiss` are no-ops for embedded RowList — there's
-            // no page stack to pop and the host owns dismissal.
-            RowAction::Pop | RowAction::Dismiss => {}
+            // Embedded RowList has no page stack and no overlay to dismiss.
+            RowAction::Pop | RowAction::Dismiss | RowAction::CascadeView { .. } => {}
         }
     }
 
@@ -161,6 +160,7 @@ impl Render for RowList {
             .key_context("RowList")
             .flex()
             .flex_col()
+            .py(px(1.0))
             .w_full()
             .track_focus(&self.focus_handle)
             .on_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {

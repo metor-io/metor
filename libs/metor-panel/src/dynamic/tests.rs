@@ -845,6 +845,156 @@ async fn threshold_rejects_bool_input() {
 }
 
 #[stellarator::test]
+async fn delta_skips_first_sample_then_emits_diffs() {
+    use crate::dynamic::node::DynamicNodeExt;
+    let clock = ops::clock::fixed_rate(200.0).unwrap();
+    let sin = waveform_f64(clock, ops::generators::Waveform::Sin, 1.0, 1.0, 0.0).unwrap();
+    // Subscribe to input before building delta so both share a starting head.
+    let mut sin_reader = sin.subscribe();
+    let delta = ops::derive::delta(sin).unwrap();
+
+    let schema = match delta.value_type() {
+        ValueType::Value(s) => s,
+        _ => panic!("delta must produce a value"),
+    };
+    assert_eq!(schema.prim_type, PrimType::F64);
+    assert!(schema.dim.is_empty());
+
+    let mut delta_reader = delta.subscribe();
+    const TOTAL: usize = 6;
+    let mut sin_vals: Vec<f64> = Vec::with_capacity(TOTAL + 1);
+    let mut deltas: Vec<f64> = Vec::with_capacity(TOTAL);
+    while sin_vals.len() < TOTAL + 1 || deltas.len() < TOTAL {
+        if sin_vals.len() < TOTAL + 1 {
+            let grant = sin_reader.next().await;
+            for (_ts, v) in grant.samples() {
+                if v.len() != 8 {
+                    continue;
+                }
+                sin_vals.push(f64::from_le_bytes(v.try_into().unwrap()));
+                if sin_vals.len() == TOTAL + 1 {
+                    break;
+                }
+            }
+        }
+        if deltas.len() < TOTAL {
+            let grant = delta_reader.next().await;
+            for (_ts, v) in grant.samples() {
+                if v.len() != 8 {
+                    continue;
+                }
+                deltas.push(f64::from_le_bytes(v.try_into().unwrap()));
+                if deltas.len() == TOTAL {
+                    break;
+                }
+            }
+        }
+    }
+    // Delta's i-th output is the diff between sin's (i+1)-th and i-th samples,
+    // because the very first input is consumed silently.
+    for i in 0..TOTAL {
+        let expected = sin_vals[i + 1] - sin_vals[i];
+        assert!(
+            (deltas[i] - expected).abs() < 1e-12,
+            "delta {i}: got {}, expected {expected}",
+            deltas[i],
+        );
+    }
+}
+
+#[stellarator::test]
+async fn delta_preserves_input_shape() {
+    use crate::dynamic::node::DynamicNodeExt;
+    let clock = ops::clock::fixed_rate(200.0).unwrap();
+    // Constant vector [1, 2, 3] — every delta is zero, but schema must keep [3].
+    let a = const_f64(clock.clone(), 1.0).unwrap();
+    let b = const_f64(clock.clone(), 2.0).unwrap();
+    let c = const_f64(clock, 3.0).unwrap();
+    let packed = ops::compose::pack(vec![a, b, c]).unwrap();
+    let delta = ops::derive::delta(packed).unwrap();
+    let schema = match delta.value_type() {
+        ValueType::Value(s) => s.clone(),
+        _ => panic!(),
+    };
+    assert_eq!(schema.prim_type, PrimType::F64);
+    assert_eq!(schema.dim.as_slice(), &[3]);
+    let mut reader = delta.subscribe();
+    let grant = reader.next().await;
+    for (_, value) in grant.samples() {
+        if value.len() != 24 {
+            continue;
+        }
+        let bins: Vec<f64> = value
+            .chunks_exact(8)
+            .map(|c| f64::from_le_bytes(c.try_into().unwrap()))
+            .collect();
+        assert_eq!(bins, vec![0.0, 0.0, 0.0]);
+        return;
+    }
+}
+
+#[stellarator::test]
+async fn delta_widens_int_to_f64() {
+    let clock = ops::clock::fixed_rate(200.0).unwrap();
+    let src = const_typed(clock, TypedScalar::I32(7), SmallVec::new()).unwrap();
+    let delta = ops::derive::delta(src).unwrap();
+    let schema = match delta.value_type() {
+        ValueType::Value(s) => s.clone(),
+        _ => panic!(),
+    };
+    assert_eq!(schema.prim_type, PrimType::F64);
+    let samples = drain_f64(&delta, 4).await;
+    for (_, v) in &samples {
+        assert_eq!(*v, 0.0);
+    }
+}
+
+#[stellarator::test]
+async fn delta_rejects_bool() {
+    let clock = ops::clock::fixed_rate(100.0).unwrap();
+    let src = const_typed(clock, TypedScalar::Bool(true), SmallVec::new()).unwrap();
+    let err = match ops::derive::delta(src) {
+        Ok(_) => panic!("must reject bool"),
+        Err(e) => e,
+    };
+    assert!(matches!(
+        err,
+        crate::dynamic::BuildError::UnsupportedDtype { op: "delta", .. }
+    ));
+}
+
+#[stellarator::test]
+async fn delta_t_emits_seconds_between_samples() {
+    let clock = ops::clock::fixed_rate(100.0).unwrap();
+    let dt = ops::derive::delta_t(clock).unwrap();
+    let schema = match dt.value_type() {
+        ValueType::Value(s) => s.clone(),
+        _ => panic!(),
+    };
+    assert_eq!(schema.prim_type, PrimType::F64);
+    assert!(schema.dim.is_empty());
+    let samples = drain_f64(&dt, 4).await;
+    // Wall-clock jitter from OS scheduling perturbs the exact period; assert
+    // the unit (seconds) and order of magnitude rather than tight equality.
+    for (_, v) in &samples {
+        assert!(*v > 0.0, "dt must be positive, got {v}");
+        assert!((v - 0.01).abs() < 0.005, "expected ~0.01s, got {v}");
+    }
+}
+
+#[stellarator::test]
+async fn delta_t_accepts_value_input() {
+    let clock = ops::clock::fixed_rate(50.0).unwrap();
+    let src = const_typed(clock, TypedScalar::I16(42), SmallVec::new()).unwrap();
+    let dt = ops::derive::delta_t(src).unwrap();
+    let samples = drain_f64(&dt, 4).await;
+    for (_, v) in &samples {
+        assert!(*v > 0.0, "dt must be positive, got {v}");
+        assert!((v - 0.02).abs() < 0.01, "expected ~0.02s, got {v}");
+    }
+}
+
+#[stellarator::test]
 async fn zoh_passes_through_typed_vector_bytes() {
     let slow = ops::clock::fixed_rate(50.0).unwrap();
     let fast = ops::clock::fixed_rate(400.0).unwrap();

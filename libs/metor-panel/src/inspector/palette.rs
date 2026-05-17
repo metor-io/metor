@@ -260,6 +260,28 @@ fn register_command_provider(
             }),
         });
 
+        let plot_db = db.clone();
+        items.push(InspectionItem::SubMenu {
+            label: "Plot Component".into(),
+            summary: SharedString::new_static(
+                "Pick traces \u{2192} preview without leaving the palette",
+            ),
+            build: Arc::new(move |_cx| {
+                let preview_db = plot_db.clone();
+                crate::inspector::trace_picker::select_traces_wizard_view(
+                    plot_db.clone(),
+                    Arc::new(|_| 0),
+                    Arc::new(move |traces, cx| {
+                        crate::inspector::plot_preview::build_plot_preview(
+                            preview_db.clone(),
+                            traces,
+                            cx,
+                        )
+                    }),
+                )
+            }),
+        });
+
         let pending_count = crate::inspector::edits::pending_edits(cx).edits.len();
         if pending_count > 0 {
             let review_db = db.clone();

@@ -4,7 +4,9 @@
 //! closures needed to read and write its bound data. The inspector itself
 //! only sees [`InspectorRow`] trait objects and a [`RowAction`] reply when
 //! a row is activated, so adding a new widget doesn't touch shared code.
-use gpui::{AnyElement, App, Hsla, SharedString, Window, div, prelude::*, px};
+use gpui::{
+    AnyElement, AnyView, App, Hsla, Pixels, SharedString, Size, Window, div, prelude::*, px,
+};
 
 use crate::theme::theme;
 
@@ -78,6 +80,19 @@ pub trait InspectorRow: 'static {
     }
 }
 
+/// A view-hosting inspector page: arbitrary gpui widget, the panel size
+/// to allocate for it, and a header label shown in the chrome.
+///
+/// Shared between [`RowAction::CascadeView`] (drill-in) and
+/// [`Inspector::with_view`](crate::inspector::Inspector::with_view) (open
+/// directly) so the three fields don't have to agree on positional order
+/// at every call site.
+pub struct PreviewSpec {
+    pub view: AnyView,
+    pub size: Size<Pixels>,
+    pub label: SharedString,
+}
+
 /// Reply from [`InspectorRow::activate`] directing what the host should do next.
 pub enum RowAction {
     /// Row mutated its own state; refresh only.
@@ -93,6 +108,10 @@ pub enum RowAction {
         current_text: String,
         on_commit: Box<dyn FnOnce(String, &mut Window, &mut App)>,
     },
+    /// Drill into a sub-page that hosts an arbitrary widget instead of a
+    /// row list. Used for transient previews (impromptu plots) that benefit
+    /// from the inspector's overlay chrome and page stack.
+    CascadeView(PreviewSpec),
 }
 
 /// Small pill used for category and tag annotations next to a row label.
@@ -111,15 +130,22 @@ pub fn tag_pill(tag: SharedString, cx: &App) -> impl IntoElement {
 }
 
 /// Row-chrome the concrete widgets wrap: background, hover, spacing, and id.
+///
+/// The selection/hover highlight is painted as an inset rounded pill behind
+/// the content rather than a full-bleed fill. This keeps the highlight clear
+/// of the panel's rounded corners (gpui content masks are rectangular, so a
+/// full-width fill would bleed past the curve).
 pub fn row_base(row_ix: usize, selected: bool, cx: &App) -> gpui::Stateful<gpui::Div> {
     let theme = theme(cx);
-    let bg = if selected {
+    let pill_bg = if selected {
         theme.selection_bg
     } else {
         Hsla::transparent_black()
     };
     div()
         .id(("inspector-row", row_ix))
+        .group("inspector-row")
+        .relative()
         .flex()
         .flex_row()
         .items_center()
@@ -127,7 +153,16 @@ pub fn row_base(row_ix: usize, selected: bool, cx: &App) -> gpui::Stateful<gpui:
         .w_full()
         .h(px(28.0))
         .px(px(12.0))
-        .bg(bg)
         .cursor_pointer()
-        .hover(|s| s.bg(theme.selection_bg))
+        .child(
+            div()
+                .absolute()
+                .top(px(2.0))
+                .bottom(px(2.0))
+                .left(px(4.0))
+                .right(px(4.0))
+                .rounded(px(4.0))
+                .bg(pill_bg)
+                .group_hover("inspector-row", |s| s.bg(theme.selection_bg)),
+        )
 }
