@@ -156,7 +156,7 @@ impl Render for XyPlot {
                             } else {
                                 let zone = this
                                     .last_plot_area
-                                    .map(|pa| axis_zone(event.position, pa))
+                                    .map(|pa| axis_zone(event.position, pa, 1))
                                     .unwrap_or(AxisZone::Plot);
                                 this.drag_start = Some(event.position);
                                 this.drag_start_view = this.line_plot.read(cx).effective_view(cx);
@@ -188,7 +188,7 @@ impl Render for XyPlot {
                             let new_view = match this.drag_zone {
                                 AxisZone::Plot => start_view.offset_by_norm(-nx, ny),
                                 AxisZone::XAxis => start_view.offset_x(-nx),
-                                AxisZone::YAxis => start_view.offset_y(ny),
+                                AxisZone::YAxis(_) => start_view.offset_y(ny),
                             };
                             this.line_plot
                                 .update(cx, |lp, cx| lp.set_view_override(Some(new_view), cx));
@@ -207,12 +207,12 @@ impl Render for XyPlot {
                             let zoom_amount = f32::from(-delta.y) as f64 / 200.0;
                             let factor = (1.0_f64 + zoom_amount).clamp(0.5, 2.0);
 
-                            let zone = axis_zone(event.position, pa);
+                            let zone = axis_zone(event.position, pa, 1);
                             let (ax, ay) = view.screen_anchor(pa, event.position);
                             let new_view = match zone {
                                 AxisZone::Plot => view.zoom_at(factor, ax, 1.0 - ay),
                                 AxisZone::XAxis => view.zoom_x(factor, ax),
-                                AxisZone::YAxis => view.zoom_y(factor, 1.0 - ay),
+                                AxisZone::YAxis(_) => view.zoom_y(factor, 1.0 - ay),
                             };
                             this.line_plot
                                 .update(cx, |lp, cx| lp.set_view_override(Some(new_view), cx));
@@ -225,7 +225,7 @@ impl Render for XyPlot {
                                 let this = cx.entity().downgrade();
                                 move |bounds, _window, cx| {
                                     let _ = this.update(cx, |this, _| {
-                                        this.last_plot_area = Some(plot_area(bounds));
+                                        this.last_plot_area = Some(plot_area(bounds, 1));
                                     });
                                     let lp = underlay_lp.read(cx);
                                     (bounds, lp.effective_view(cx))
@@ -353,7 +353,7 @@ pub(crate) fn paint_xy_underlay(
     window: &mut Window,
     cx: &mut gpui::App,
 ) {
-    let pb = plot_area(outer_bounds);
+    let pb = plot_area(outer_bounds, 1);
     let theme = crate::theme::theme(cx);
 
     for tick in value_ticks(view.min_y, view.max_y, 5) {
@@ -408,7 +408,7 @@ pub(crate) fn paint_xy_overlay(
     window: &mut Window,
     cx: &mut gpui::App,
 ) {
-    let pb = plot_area(outer_bounds);
+    let pb = plot_area(outer_bounds, 1);
     let theme = crate::theme::theme(cx);
     let label_font_size = px(LABEL_FONT_SIZE);
     let text_style = window.text_style();

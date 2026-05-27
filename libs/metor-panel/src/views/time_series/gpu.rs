@@ -102,9 +102,16 @@ impl<'a> AxisSource<'a> {
 }
 
 /// Draw inputs for one trace; callers build a slice of these per paint.
+///
+/// `y_min`/`y_max` are the data-space Y range of the trace's axis. The
+/// materializer normalizes each Y sample into `[0,1]` against this range, so
+/// the GPU's view uniform maps a fixed `0..1` regardless of axis — that's
+/// what lets several axes with different scales share one render pass.
 pub(crate) struct LineDraw<'a> {
     pub x: AxisSource<'a>,
     pub y: AxisSource<'a>,
+    pub y_min: f64,
+    pub y_max: f64,
     pub style: PlotStyle,
     pub color: Hsla,
     pub stroke_width: f32,
@@ -540,6 +547,9 @@ impl PlotGpu {
 
         let mut plans: Vec<TracePlan> = Vec::with_capacity(traces.len());
         for trace in traces {
+            // Per-trace Y normalization: map [y_min, y_max] onto [0, 1].
+            let y_epoch = trace.y_min;
+            let y_scale = 1.0 / (trace.y_max - trace.y_min).max(1e-12);
             let plan = plan_trace(
                 &self.ctx,
                 &mut self.cache,
@@ -550,6 +560,8 @@ impl PlotGpu {
                 &self.y_buf,
                 trace,
                 view,
+                y_epoch,
+                y_scale,
                 pixel_budget,
             );
             plans.push(plan);
@@ -572,15 +584,14 @@ impl PlotGpu {
         let view_min_x = ((view.min_x - epoch_x) * x_scale_factor) as f32;
         let view_max_x = ((view.max_x - epoch_x) * x_scale_factor) as f32;
         let dx = (view_max_x - view_min_x).max(1e-12);
-        let dy = (view.max_y - view.min_y).max(1e-12);
         let scale_x = 2.0 / dx;
-        let scale_y = (2.0 / dy) as f32;
+        // Y arrives pre-normalized to [0,1] per trace (see `LineDraw`), so the
+        // view uniform maps that fixed range to clip space [-1,1] for every
+        // axis: scale 2, offset -1.
+        let scale_y = 2.0_f32;
         let view_uniform = ViewUniform {
             scale: [scale_x, scale_y],
-            offset: [
-                -1.0 - view_min_x * scale_x,
-                -1.0 - (view.min_y as f32) * scale_y,
-            ],
+            offset: [-1.0 - view_min_x * scale_x, -1.0],
             viewport: [target.width as f32, target.height as f32],
             _pad: [0.0; 2],
         };
@@ -899,6 +910,8 @@ fn plan_trace(
     y_buf: &wgpu::Buffer,
     trace: &LineDraw<'_>,
     view: PlotBounds,
+    y_epoch: f64,
+    y_scale: f64,
     pixel_budget: usize,
 ) -> TracePlan {
     let mut spans = Vec::new();
@@ -931,6 +944,8 @@ fn plan_trace(
             component,
             len,
             trace.style,
+            y_epoch,
+            y_scale,
             pixel_budget,
         );
     }
@@ -1031,6 +1046,8 @@ fn plan_trace(
             &pair.y,
             &trace.x,
             &trace.y,
+            y_epoch,
+            y_scale,
             upload_stride,
             lod_start,
             lod_end,
@@ -1086,6 +1103,8 @@ fn upload_pair(
     y_node: &NodeView,
     x_source: &AxisSource<'_>,
     y_source: &AxisSource<'_>,
+    y_epoch: f64,
+    y_scale: f64,
     lod_stride: usize,
     lod_start: usize,
     lod_end: usize,
@@ -1104,14 +1123,19 @@ fn upload_pair(
     let epoch_x = cache.epoch_x.unwrap_or(0.0);
 
     materialize_axis(
-        x_source, x_node, lod_stride, lod_start, lod_end, epoch_x, scratch_x,
+        x_source,
+        x_node,
+        lod_stride,
+        lod_start,
+        lod_end,
+        epoch_x,
+        x_source.scale(),
+        scratch_x,
     );
+    // Y is shifted by the axis minimum and scaled by 1/(max-min) so it lands
+    // in [0,1]; the view uniform then maps that to clip space.
     materialize_axis(
-        y_source, y_node, lod_stride, lod_start, lod_end,
-        // Y axis is never epoch-shifted on the GPU; data magnitudes are
-        // expected to be reasonable. (If this ever bites, route Y through
-        // the same epoch_y mechanism as X.)
-        0.0, scratch_y,
+        y_source, y_node, lod_stride, lod_start, lod_end, y_epoch, y_scale, scratch_y,
     );
 
     let byte_offset = cache.cursor as u64 * 4;
@@ -1173,6 +1197,7 @@ fn first_axis_value(
 /// The output value is `(raw - epoch) * source.scale()`, written into
 /// `out`. Raw timestamp axes pick up a 1e-9 scaling so f32 storage
 /// retains nanosecond precision over long durations.
+#[allow(clippy::too_many_arguments)]
 fn materialize_axis(
     source: &AxisSource<'_>,
     node: &NodeView,
@@ -1180,11 +1205,11 @@ fn materialize_axis(
     lod_start: usize,
     lod_end: usize,
     epoch: f64,
+    scale: f64,
     out: &mut Vec<f32>,
 ) {
     out.clear();
     out.reserve(lod_end - lod_start);
-    let scale = source.scale();
     match source {
         AxisSource::Timestamps => {
             let ts = node.full_timestamps();
@@ -1500,6 +1525,8 @@ fn plan_list_trace(
     component: &Component,
     len: usize,
     style: PlotStyle,
+    y_epoch: f64,
+    y_scale: f64,
     pixel_budget: usize,
 ) -> TracePlan {
     let mut spans = Vec::new();
@@ -1550,6 +1577,8 @@ fn plan_list_trace(
         len,
         upload_stride,
         prim_size,
+        y_epoch,
+        y_scale,
         upload_y,
     );
 
@@ -1588,19 +1617,25 @@ fn plan_list_trace(
 /// into `out` as `f32`. Sibling to [`convert_element_strided`], but the
 /// stride moves through *element* offsets within one sample rather than
 /// across samples.
+#[allow(clippy::too_many_arguments)]
 fn convert_latest_sample_strided(
     prim: PrimType,
     sample_bytes: &[u8],
     len: usize,
     lod_stride: usize,
     prim_size: usize,
+    epoch: f64,
+    scale: f64,
     out: &mut Vec<f32>,
 ) {
+    #[allow(clippy::too_many_arguments)]
     fn fill<T: PlotValue>(
         data: &[u8],
         len: usize,
         lod_stride: usize,
         prim_size: usize,
+        epoch: f64,
+        scale: f64,
         out: &mut Vec<f32>,
     ) {
         let stride = lod_stride.max(1);
@@ -1612,20 +1647,22 @@ fn convert_latest_sample_strided(
                 .and_then(|b| T::read_from_bytes(b).ok())
                 .map(|v| v.to_f64())
                 .unwrap_or(0.0);
-            out.push(v as f32);
+            out.push(((v - epoch) * scale) as f32);
             i += stride;
         }
     }
     match prim {
-        PrimType::F64 => fill::<f64>(sample_bytes, len, lod_stride, prim_size, out),
-        PrimType::F32 => fill::<f32>(sample_bytes, len, lod_stride, prim_size, out),
-        PrimType::I64 => fill::<i64>(sample_bytes, len, lod_stride, prim_size, out),
-        PrimType::I32 => fill::<i32>(sample_bytes, len, lod_stride, prim_size, out),
-        PrimType::I16 => fill::<i16>(sample_bytes, len, lod_stride, prim_size, out),
-        PrimType::I8 => fill::<i8>(sample_bytes, len, lod_stride, prim_size, out),
-        PrimType::U64 => fill::<u64>(sample_bytes, len, lod_stride, prim_size, out),
-        PrimType::U32 => fill::<u32>(sample_bytes, len, lod_stride, prim_size, out),
-        PrimType::U16 => fill::<u16>(sample_bytes, len, lod_stride, prim_size, out),
-        PrimType::U8 | PrimType::Bool => fill::<u8>(sample_bytes, len, lod_stride, prim_size, out),
+        PrimType::F64 => fill::<f64>(sample_bytes, len, lod_stride, prim_size, epoch, scale, out),
+        PrimType::F32 => fill::<f32>(sample_bytes, len, lod_stride, prim_size, epoch, scale, out),
+        PrimType::I64 => fill::<i64>(sample_bytes, len, lod_stride, prim_size, epoch, scale, out),
+        PrimType::I32 => fill::<i32>(sample_bytes, len, lod_stride, prim_size, epoch, scale, out),
+        PrimType::I16 => fill::<i16>(sample_bytes, len, lod_stride, prim_size, epoch, scale, out),
+        PrimType::I8 => fill::<i8>(sample_bytes, len, lod_stride, prim_size, epoch, scale, out),
+        PrimType::U64 => fill::<u64>(sample_bytes, len, lod_stride, prim_size, epoch, scale, out),
+        PrimType::U32 => fill::<u32>(sample_bytes, len, lod_stride, prim_size, epoch, scale, out),
+        PrimType::U16 => fill::<u16>(sample_bytes, len, lod_stride, prim_size, epoch, scale, out),
+        PrimType::U8 | PrimType::Bool => {
+            fill::<u8>(sample_bytes, len, lod_stride, prim_size, epoch, scale, out)
+        }
     }
 }

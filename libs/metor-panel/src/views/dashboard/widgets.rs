@@ -240,6 +240,14 @@ pub fn serialize_widget_state(
     if *kind == WidgetKind::plot() {
         let plot = entity.clone().downcast::<LinePlot>().ok()?;
         let lp = plot.read(cx);
+        let (y_min_override, y_max_override) = lp
+            .axes
+            .first()
+            .map(|a| {
+                let a = a.read(cx);
+                (a.y_min_override.clone(), a.y_max_override.clone())
+            })
+            .unwrap_or_default();
         let cfg = PlotPanelConfig {
             label: String::new(),
             traces: lp
@@ -248,8 +256,14 @@ pub fn serialize_widget_state(
                 .map(|e| TraceConfig::from(e.read(cx)))
                 .collect(),
             custom_title: lp.custom_title.as_ref().map(|s| s.to_string()),
-            y_min_override: lp.y_min_override.clone(),
-            y_max_override: lp.y_max_override.clone(),
+            y_min_override,
+            y_max_override,
+            axes: lp
+                .axes
+                .iter()
+                .map(|a| crate::tiles::panels::YAxisConfig::from(a.read(cx)))
+                .collect(),
+            x_time_format: lp.x_time_format,
             default_measurements: Vec::new(),
             cursors: Vec::new(),
             measurement_panel: Default::default(),
@@ -302,8 +316,22 @@ fn build_plot(config: &str, db: &Arc<DB>, cx: &mut App) -> (AnyView, gpui::AnyEn
     let line_plot = plot.read(cx).line_plot().clone();
     line_plot.update(cx, |lp, cx| {
         lp.custom_title = cfg.custom_title.map(SharedString::from);
-        lp.y_min_override = cfg.y_min_override;
-        lp.y_max_override = cfg.y_max_override;
+        lp.x_time_format = cfg.x_time_format;
+        if cfg.axes.is_empty() {
+            if let Some(axis) = lp.axes.first().cloned() {
+                axis.update(cx, |a, _| {
+                    a.y_min_override = cfg.y_min_override.clone();
+                    a.y_max_override = cfg.y_max_override.clone();
+                });
+            }
+        } else {
+            lp.axes = cfg
+                .axes
+                .iter()
+                .take(LinePlot::MAX_AXES)
+                .map(|a| cx.new(|_| crate::views::time_series::YAxis::from(a.clone())))
+                .collect();
+        }
         cx.notify();
     });
     (AnyView::from(plot), line_plot.into_any())

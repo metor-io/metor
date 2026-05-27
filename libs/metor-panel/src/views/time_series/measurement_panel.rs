@@ -106,8 +106,8 @@ fn render_per_cursor_panels(
         // Fall back to the top-left when the view isn't resolved yet —
         // the cursor band can't be projected until the first frame has
         // data.
-        let mid_x_pa_local = match (plot_area, view) {
-            (Some(pa), Some(v)) => v.to_screen(pa, mid_t, v.min_y).x - pa.origin.x,
+        let mid_x_pa_local = match (plot_area, &view) {
+            (Some(pa), Some(v)) => v.x_bounds().to_screen(pa, mid_t, 0.0).x - pa.origin.x,
             _ => px(PANEL_WIDTH / 2.0 + PANEL_PAD),
         };
         let preferred = Point {

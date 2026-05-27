@@ -290,6 +290,8 @@ impl Render for ListLinePlot {
                                             component,
                                             len: config.len,
                                         },
+                                        y_min: view.min_y,
+                                        y_max: view.max_y,
                                         style: config.style,
                                         color: config.color,
                                         stroke_width: config.stroke_width,

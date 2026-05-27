@@ -365,6 +365,8 @@ impl Render for XyLinePlot {
                                             component: y_component,
                                             element_index: config.y_element_index,
                                         },
+                                        y_min: view.min_y,
+                                        y_max: view.max_y,
                                         style: config.style,
                                         color: config.color,
                                         stroke_width: config.stroke_width,

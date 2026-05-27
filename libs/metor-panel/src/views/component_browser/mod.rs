@@ -13,6 +13,7 @@ pub mod component_tree;
 
 use super::column_browser::{ColumnBrowser, ColumnBrowserDelegate};
 use super::monitor::{behavior_snapshot, edit_click};
+use super::time_series::Override;
 use super::value_strip::{ComponentValueStrip, StripBehavior, StripClick, StripStyle};
 use crate::icons::Icon;
 use crate::inspector::rows::{CommandRow, DefaultActionRow, InspectorRow, NavRow};
@@ -122,6 +123,13 @@ pub struct ComponentBrowserDelegate {
     filters: Vec<FilterEntry>,
     previews: BTreeMap<SharedString, ComponentPreview>,
     detail_scroll_handle: UniformListScrollHandle,
+    custom_title: Override<SharedString>,
+    /// Re-root path waiting for the watcher to publish a tree it can
+    /// resolve against. Set by [`Self::set_pending_root_path`] (typically
+    /// from a config restore); cleared by a successful [`Self::set_root_path`]
+    /// or by any user-driven `clear_root_override` / `set_root_override`
+    /// so the user's intent wins over a pending restore.
+    pending_root_path: Option<SmallVec<[SharedString; 8]>>,
     _watcher: gpui::Task<()>,
 }
 
@@ -134,6 +142,9 @@ impl ComponentBrowserDelegate {
                     let delegate = browser.delegate_mut();
                     delegate.tree = tree;
                     delegate.refresh_filter_synths();
+                    if let Some(segs) = delegate.pending_root_path.clone() {
+                        delegate.set_root_path(&segs, cx);
+                    }
                     delegate.reconcile_previews(cx);
                     cx.notify();
                 });
@@ -440,6 +451,91 @@ impl ComponentBrowserDelegate {
             );
         }
     }
+
+    /// Effective title for the host panel. Custom override wins; otherwise
+    /// the auto title reflects the current root.
+    pub fn title(&self) -> SharedString {
+        match &self.custom_title {
+            Override::Custom(t) => t.clone(),
+            Override::Auto => self.derive_title(),
+        }
+    }
+
+    fn derive_title(&self) -> SharedString {
+        match &self.selection.root {
+            SelectionRoot::Filter(label) => label.clone(),
+            SelectionRoot::Real => match &self.selection.root_override {
+                Some(segs) if !segs.is_empty() => SharedString::from(
+                    segs.iter()
+                        .map(|s| s.as_ref())
+                        .collect::<Vec<_>>()
+                        .join("."),
+                ),
+                _ => SharedString::new_static("Components"),
+            },
+        }
+    }
+
+    pub fn custom_title(&self) -> &Override<SharedString> {
+        &self.custom_title
+    }
+
+    pub fn set_custom_title(
+        &mut self,
+        title: Override<SharedString>,
+        cx: &mut Context<ComponentBrowser>,
+    ) {
+        self.custom_title = title;
+        cx.notify();
+    }
+
+    pub fn root_override(&self) -> Option<&[SharedString]> {
+        self.selection.root_override.as_deref()
+    }
+
+    /// Restore a re-root from persisted segments. Resolves the chain
+    /// against the real tree; if the tree hasn't populated yet or the
+    /// segments don't match, the call is a no-op. Pair with
+    /// [`Self::set_pending_root_path`] so the watcher retries the apply
+    /// each time it publishes a fresh tree.
+    pub fn set_root_path(
+        &mut self,
+        segs: &[SharedString],
+        cx: &mut Context<ComponentBrowser>,
+    ) {
+        if segs.is_empty() {
+            return;
+        }
+        let chain = resolve_path(&self.tree, segs);
+        if chain.len() != segs.len() {
+            return;
+        }
+        if !matches!(self.selection.root, SelectionRoot::Real) {
+            return;
+        }
+        let segments: SmallVec<[SharedString; 8]> = chain.iter().map(|n| n.segment.clone()).collect();
+        if !self.selection.path.starts_with(&segments[..]) {
+            self.selection.path = segments.clone();
+        }
+        self.selection.root_override = Some(segments);
+        self.pending_root_path = None;
+        self.reconcile_previews(cx);
+        cx.notify();
+    }
+
+    /// Stash a re-root path to apply once the watcher's next tree refresh
+    /// includes the requested segments. Used by config restore: the tree
+    /// may be empty when the panel is first constructed, so a one-shot
+    /// `set_root_path` would silently fail.
+    pub fn set_pending_root_path(&mut self, segs: Option<SmallVec<[SharedString; 8]>>) {
+        self.pending_root_path = segs;
+    }
+}
+
+impl ComponentBrowser {
+    pub fn title(&self) -> SharedString {
+        self.delegate().title()
+    }
 }
 
 /// Build the right-click callback for a strip cell: opens an anchored
@@ -602,16 +698,34 @@ impl ColumnBrowserDelegate for ComponentBrowserDelegate {
         // `cube_sat.sim`), so dot-splitting `full_name` would miss the
         // real child-map keys. Read the compressed segments straight off
         // the ancestor chain.
-        let segments: SmallVec<[SharedString; 8]> =
-            ancestors.iter().map(|a| a.segment.clone()).collect();
+        //
+        // Under an existing override, `ancestors` comes from
+        // `resolved_chain()`, which already walks past `override_depth`
+        // — i.e. it carries only the visible suffix. Prepend the active
+        // override so the new override is a full path from the real tree
+        // root; otherwise `real_root()` would fall back to the full tree
+        // and the reroot would silently no-op while still showing its
+        // (now stale) title.
+        let mut segments: SmallVec<[SharedString; 8]> = self
+            .selection
+            .root_override
+            .as_ref()
+            .map(|p| p.iter().cloned().collect())
+            .unwrap_or_default();
+        segments.extend(ancestors.iter().map(|a| a.segment.clone()));
         if !self.selection.path.starts_with(&segments[..]) {
             self.selection.path = segments.clone();
         }
         self.selection.root_override = Some(segments);
+        // User-driven reroot supersedes any restore-from-config still in flight.
+        self.pending_root_path = None;
         self.reconcile_previews(cx);
     }
 
     fn clear_root_override(&mut self, cx: &mut Context<ComponentBrowser>) {
+        // Drop any pending restore first, otherwise the watcher would
+        // re-apply it on its next tick and clobber the user's clear.
+        self.pending_root_path = None;
         if self.selection.root_override.is_some() {
             self.selection.root_override = None;
             self.reconcile_previews(cx);
@@ -725,6 +839,25 @@ impl ColumnBrowserDelegate for ComponentBrowserDelegate {
     /// branch boundaries (root, filter entry points, post-reroot).
     fn auto_extend_selection(&mut self, cx: &mut Context<ComponentBrowser>) {
         let mut changed = false;
+        // If `selection.path` carries stale segments (e.g., a re-root was
+        // just cleared and the path's prefix no longer resolves against
+        // the full tree), `resolved_chain` returns short of the path and
+        // `detail_target` falls back to `real_root()` — which would let
+        // the loop push from the wrong subtree forever. Truncate the
+        // path to its resolvable prefix first so the extension below
+        // walks from a node that actually matches.
+        let resolved_len = self.resolved_chain().len();
+        let expected_len = self
+            .selection
+            .path
+            .len()
+            .saturating_sub(self.override_depth());
+        if resolved_len < expected_len {
+            self.selection
+                .path
+                .truncate(self.override_depth() + resolved_len);
+            changed = true;
+        }
         loop {
             let tail = self.detail_target();
             if tail.children.len() != 1 {
@@ -781,6 +914,8 @@ pub fn new_component_browser(db: Arc<DB>, cx: &mut Context<ComponentBrowser>) ->
         filters: Vec::new(),
         previews: BTreeMap::new(),
         detail_scroll_handle: UniformListScrollHandle::new(),
+        custom_title: Override::Auto,
+        pending_root_path: None,
         _watcher: watcher,
     };
     ColumnBrowser::new(delegate, cx)

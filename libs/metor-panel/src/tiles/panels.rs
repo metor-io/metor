@@ -11,7 +11,7 @@ use crate::inspector::{InspectorMode, InspectorRequest, OpenInspectorCallback};
 use crate::views::dashboard::DashboardPanel;
 use crate::views::list_plot::{ListLinePlot, ListPlot, ListTrace};
 use crate::views::time_series::{
-    LinePlot, MeasurementKind, Override, PanelPosition, PlotStyle, Trace,
+    LinePlot, MeasurementKind, Override, PanelPosition, PlotStyle, TimeFormat, Trace, YAxis,
 };
 use crate::views::viewer_3d::Viewer3d;
 use crate::views::xy_plot::{XyLinePlot, XyPlot, XyTrace};
@@ -314,27 +314,50 @@ impl PaneItem for DataTablePanel {
     }
 }
 
-/// Persisted shape of a [`BrowserPanel`]. No per-instance configuration today.
+/// Persisted shape of a [`BrowserPanel`].
+///
+/// `root_override` is an empty `Vec` rather than `Option<Vec<_>>` because
+/// "empty path" already encodes the no-override case and round-trips
+/// through facet-json without an extra discriminator. Filter-view state
+/// (`SelectionRoot::Filter`) is not persisted yet.
 #[derive(facet::Facet, Default)]
-pub struct BrowserPanelConfig {}
+pub struct BrowserPanelConfig {
+    pub custom_title: Override<String>,
+    pub root_override: Vec<String>,
+}
 
 /// Pane item with a Finder-style browser over the component namespace tree.
 pub struct BrowserPanel {
     inner: Entity<ComponentBrowser>,
-    label: SharedString,
 }
 
 impl BrowserPanel {
     pub fn new(db: Arc<DB>, cx: &mut Context<Self>) -> Self {
         let inner = cx.new(|cx| new_component_browser(db, cx));
-        Self {
-            inner,
-            label: "Components".into(),
-        }
+        Self { inner }
     }
 
-    pub fn from_config(_cfg: BrowserPanelConfig, db: Arc<DB>, cx: &mut Context<Self>) -> Self {
-        Self::new(db, cx)
+    pub fn from_config(cfg: BrowserPanelConfig, db: Arc<DB>, cx: &mut Context<Self>) -> Self {
+        let panel = Self::new(db, cx);
+        let custom = cfg.custom_title.map(SharedString::from);
+        let segments: smallvec::SmallVec<[SharedString; 8]> = cfg
+            .root_override
+            .into_iter()
+            .map(SharedString::from)
+            .collect();
+        panel.inner.update(cx, |browser, cx| {
+            let delegate = browser.delegate_mut();
+            delegate.set_custom_title(custom, cx);
+            if !segments.is_empty() {
+                // Eager apply for the common case where the tree is
+                // already populated; otherwise the watcher retries on
+                // each tree refresh until `pending_root_path` resolves
+                // or the user overrides intent (clear / new reroot).
+                delegate.set_pending_root_path(Some(segments.clone()));
+                delegate.set_root_path(&segments, cx);
+            }
+        });
+        panel
     }
 }
 
@@ -347,16 +370,28 @@ impl Render for BrowserPanel {
 impl PaneItem for BrowserPanel {
     type Config = BrowserPanelConfig;
 
-    fn tab_title(&self, _cx: &App) -> SharedString {
-        self.label.clone()
+    fn tab_title(&self, cx: &App) -> SharedString {
+        self.inner.read(cx).title()
     }
 
     fn serialization_key() -> &'static str {
         "component_browser"
     }
 
-    fn to_config(&self, _cx: &App) -> BrowserPanelConfig {
-        BrowserPanelConfig {}
+    fn to_config(&self, cx: &App) -> BrowserPanelConfig {
+        let inner = self.inner.read(cx);
+        let delegate = inner.delegate();
+        BrowserPanelConfig {
+            custom_title: delegate.custom_title().clone().map(|s| s.to_string()),
+            root_override: delegate
+                .root_override()
+                .map(|segs| segs.iter().map(|s| s.to_string()).collect())
+                .unwrap_or_default(),
+        }
+    }
+
+    fn inspectable_entity(&self) -> Option<gpui::AnyEntity> {
+        Some(self.inner.clone().into_any())
     }
 }
 
@@ -417,8 +452,17 @@ pub struct PlotPanelConfig {
     pub label: String,
     pub traces: Vec<TraceConfig>,
     pub custom_title: Override<String>,
+    /// Legacy single-axis bounds. Retained for back-compat: on load, when
+    /// `axes` is empty these seed the primary axis; on save they mirror the
+    /// primary axis so older readers still see pinned bounds.
     pub y_min_override: Override<f64>,
     pub y_max_override: Override<f64>,
+    /// Y axes, stacked left-to-right. Empty in pre-multi-axis layouts, which
+    /// then fall back to a single axis seeded from the legacy fields above.
+    pub axes: Vec<YAxisConfig>,
+    /// X-axis tick rendering: relative offsets (default) or absolute
+    /// UTC/local wall-clock. Additive — old layouts default to `Relative`.
+    pub x_time_format: TimeFormat,
     /// Measurement kinds new cursors start with. Editing only affects
     /// cursors created after the change; existing cursors keep their own
     /// `enabled` set.
@@ -493,6 +537,9 @@ pub struct TraceConfig {
     pub visible: bool,
     pub label: String,
     pub stroke_width: f32,
+    /// Which Y axis this trace draws against. Defaults to 0 (the primary
+    /// axis), so pre-multi-axis layouts load with every trace on one axis.
+    pub axis_index: usize,
 }
 
 impl Default for TraceConfig {
@@ -505,6 +552,7 @@ impl Default for TraceConfig {
             visible: true,
             label: String::new(),
             stroke_width: 1.5,
+            axis_index: 0,
         }
     }
 }
@@ -519,6 +567,7 @@ impl From<&Trace> for TraceConfig {
             visible: t.visible,
             label: t.label.to_string(),
             stroke_width: t.stroke_width,
+            axis_index: t.axis_index,
         }
     }
 }
@@ -533,6 +582,52 @@ impl From<TraceConfig> for Trace {
             visible: t.visible,
             label: t.label.into(),
             stroke_width: t.stroke_width,
+            axis_index: t.axis_index,
+            // line_plot is set by the plot's reconcile.
+            line_plot: None,
+        }
+    }
+}
+
+/// Persisted shape of one [`YAxis`]. Parallel struct because the live axis
+/// is held as an `Entity<YAxis>` in the plot.
+#[derive(facet::Facet, Clone)]
+pub struct YAxisConfig {
+    pub label: String,
+    pub y_min_override: Override<f64>,
+    pub y_max_override: Override<f64>,
+    pub color: Override<Hsla>,
+}
+
+impl Default for YAxisConfig {
+    fn default() -> Self {
+        Self {
+            label: String::from("Y"),
+            y_min_override: Override::Auto,
+            y_max_override: Override::Auto,
+            color: Override::Auto,
+        }
+    }
+}
+
+impl From<&YAxis> for YAxisConfig {
+    fn from(a: &YAxis) -> Self {
+        Self {
+            label: a.label.to_string(),
+            y_min_override: a.y_min_override.clone(),
+            y_max_override: a.y_max_override.clone(),
+            color: a.color.clone(),
+        }
+    }
+}
+
+impl From<YAxisConfig> for YAxis {
+    fn from(a: YAxisConfig) -> Self {
+        YAxis {
+            label: a.label.into(),
+            y_min_override: a.y_min_override,
+            y_max_override: a.y_max_override,
+            color: a.color,
         }
     }
 }
@@ -544,8 +639,24 @@ impl PlotPanel {
         let line_plot = panel.line_plot.clone();
         line_plot.update(cx, |lp, cx| {
             lp.custom_title = cfg.custom_title.map(SharedString::from);
-            lp.y_min_override = cfg.y_min_override;
-            lp.y_max_override = cfg.y_max_override;
+            lp.x_time_format = cfg.x_time_format;
+            if cfg.axes.is_empty() {
+                // Pre-multi-axis layout: keep the synthesized primary axis and
+                // seed it from the legacy bounds.
+                if let Some(axis) = lp.axes.first().cloned() {
+                    axis.update(cx, |a, _| {
+                        a.y_min_override = cfg.y_min_override.clone();
+                        a.y_max_override = cfg.y_max_override.clone();
+                    });
+                }
+            } else {
+                lp.axes = cfg
+                    .axes
+                    .iter()
+                    .take(LinePlot::MAX_AXES)
+                    .map(|a| cx.new(|_| YAxis::from(a.clone())))
+                    .collect();
+            }
             cx.notify();
         });
         if !cfg.cursors.is_empty() {
@@ -596,6 +707,16 @@ impl PaneItem for PlotPanel {
             })
             .collect();
         let measurement_panel: MeasurementPanelConfig = self.inner.read(cx).panel_position().into();
+        // Mirror the primary axis's bounds into the legacy fields for
+        // back-compat with readers that predate multi-axis support.
+        let (y_min_override, y_max_override) = lp
+            .axes
+            .first()
+            .map(|a| {
+                let a = a.read(cx);
+                (a.y_min_override.clone(), a.y_max_override.clone())
+            })
+            .unwrap_or((Override::Auto, Override::Auto));
         PlotPanelConfig {
             label: self.tab_title(cx).to_string(),
             traces: lp
@@ -604,8 +725,14 @@ impl PaneItem for PlotPanel {
                 .map(|e| TraceConfig::from(e.read(cx)))
                 .collect(),
             custom_title: lp.custom_title.as_ref().map(|s| s.to_string()),
-            y_min_override: lp.y_min_override.clone(),
-            y_max_override: lp.y_max_override.clone(),
+            y_min_override,
+            y_max_override,
+            axes: lp
+                .axes
+                .iter()
+                .map(|a| YAxisConfig::from(a.read(cx)))
+                .collect(),
+            x_time_format: lp.x_time_format,
             default_measurements: Vec::new(),
             cursors,
             measurement_panel,
@@ -1433,10 +1560,21 @@ mod tests {
                 visible: true,
                 label: "vx".into(),
                 stroke_width: 2.0,
+                axis_index: 1,
             }],
             custom_title: Override::Custom("My View".into()),
             y_min_override: Override::Custom(-10.0),
             y_max_override: Override::Auto,
+            axes: vec![
+                YAxisConfig::default(),
+                YAxisConfig {
+                    label: "rpm".into(),
+                    y_min_override: Override::Custom(0.0),
+                    y_max_override: Override::Custom(8000.0),
+                    color: Override::Auto,
+                },
+            ],
+            x_time_format: TimeFormat::Utc,
             default_measurements: Vec::new(),
             cursors: Vec::new(),
             measurement_panel: Default::default(),
@@ -1444,6 +1582,10 @@ mod tests {
         let s = facet_json::to_string(&plot).unwrap();
         let back: PlotPanelConfig = facet_json::from_str(&s).unwrap();
         assert_eq!(back.label, "speed");
+        assert_eq!(back.traces[0].axis_index, 1);
+        assert_eq!(back.axes.len(), 2);
+        assert_eq!(back.axes[1].label, "rpm");
+        assert!(matches!(back.axes[1].y_max_override, Override::Custom(v) if (v - 8000.0).abs() < 1e-6));
         assert_eq!(back.traces.len(), 1);
         assert_eq!(back.traces[0].component_id, ComponentId(3));
         assert_eq!(back.traces[0].element_index, 1);
@@ -1451,6 +1593,14 @@ mod tests {
         assert!(matches!(back.custom_title, Override::Custom(s) if s == "My View"));
         assert!(matches!(back.y_min_override, Override::Custom(v) if (v + 10.0).abs() < 1e-9));
         assert!(matches!(back.y_max_override, Override::Auto));
+        assert_eq!(back.x_time_format, TimeFormat::Utc);
+
+        // A pre-existing layout written before `x_time_format`/`axes` existed
+        // must still load, defaulting to `Relative` and no explicit axes.
+        let legacy = r#"{"label":"old","traces":[],"custom_title":"Auto","y_min_override":"Auto","y_max_override":"Auto","default_measurements":[],"cursors":[],"measurement_panel":"Track"}"#;
+        let back: PlotPanelConfig = facet_json::from_str(legacy).unwrap();
+        assert_eq!(back.x_time_format, TimeFormat::Relative);
+        assert!(back.axes.is_empty());
 
         let viewer = Viewer3dPanelConfig {
             models: vec![ModelConfig {
