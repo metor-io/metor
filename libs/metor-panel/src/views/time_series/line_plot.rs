@@ -9,7 +9,7 @@
 //! trackers for added or removed traces, invalidates the view override
 //! when a reflected knob changes, and refreshes the cached title.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use gpui::{
@@ -23,6 +23,7 @@ use super::bounds::PlotView;
 use super::gpu::{AxisSource, LineDraw, PlotRenderState};
 use super::override_field::Override;
 use super::{NodeBoundsCache, TimeFormat, Trace, YAxis, expand_value_bounds};
+use crate::views::plot_common::reconcile_trackers;
 use crate::views::time_series::time_range::TimeRangeBehavior;
 use crate::wait_for_component;
 
@@ -198,22 +199,18 @@ impl LinePlot {
             });
         }
 
-        let current_ids: HashSet<EntityId> = self.traces.iter().map(|e| e.entity_id()).collect();
-        let had_tracking_keys: Vec<EntityId> = self.tracking.keys().copied().collect();
-        for id in had_tracking_keys {
-            if !current_ids.contains(&id) {
-                self.tracking.remove(&id);
-                self.tasks.remove(&id);
-            }
-        }
-        for trace in &self.traces {
-            let id = trace.entity_id();
-            if let std::collections::hash_map::Entry::Vacant(slot) = self.tracking.entry(id) {
-                slot.insert(TraceTracking::new());
-                let task = Self::spawn_tracker(id, trace.clone(), self.db.clone(), cx);
-                self.tasks.insert(id, task);
-            }
-        }
+        let db = self.db.clone();
+        reconcile_trackers(
+            &self.traces,
+            &mut self.tracking,
+            &mut self.tasks,
+            |id, trace| {
+                (
+                    TraceTracking::new(),
+                    Self::spawn_tracker(id, trace.clone(), db.clone(), cx),
+                )
+            },
+        );
 
         let snapshot = OverrideSnapshot::capture(self, cx);
         if snapshot != self.last_overrides {

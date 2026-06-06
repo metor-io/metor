@@ -127,6 +127,16 @@ impl PlotBounds {
         }
     }
 
+    /// Bit-pattern key for change detection, dodging `f64`'s lack of `Eq`.
+    pub fn bits(&self) -> (u64, u64, u64, u64) {
+        (
+            self.min_x.to_bits(),
+            self.min_y.to_bits(),
+            self.max_x.to_bits(),
+            self.max_y.to_bits(),
+        )
+    }
+
     pub fn width(&self) -> f64 {
         self.max_x - self.min_x
     }

@@ -7,6 +7,7 @@ pub mod data_table;
 pub mod format;
 pub mod list_plot;
 pub mod monitor;
+pub mod plot_common;
 pub mod scrollbar;
 pub mod table;
 pub mod time_series;
