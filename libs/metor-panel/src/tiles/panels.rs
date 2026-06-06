@@ -1217,7 +1217,7 @@ impl PaneItem for Viewer3dPanel {
 /// Each row adds a freshly-constructed panel to `pane`. The time-series row
 /// detours through the trace picker, then calls `on_open_inspector` (if
 /// provided) so the user can immediately configure the plot.
-pub fn new_panel_rows(
+pub(crate) fn new_panel_rows(
     db: Arc<DB>,
     pane: Entity<Pane>,
     on_open_inspector: Option<OpenInspectorCallback>,
@@ -1513,7 +1513,7 @@ fn traffic_light_grid_pattern_rows(db: Arc<DB>, pane: Entity<Pane>) -> Vec<Box<d
 }
 
 /// Rows listing every known component; selecting one invokes `on_select`.
-pub fn component_picker_rows(
+pub(crate) fn component_picker_rows(
     db: Arc<DB>,
     on_select: impl Fn(ComponentId, String, &mut App) + 'static,
 ) -> Vec<Box<dyn InspectorRow>> {
