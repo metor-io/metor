@@ -11,7 +11,7 @@ use gpui::{App, SharedString, Window};
 use metor_db::DB;
 use metor_proto::types::ComponentId;
 
-use crate::inspector::rows::{CommandRow, InspectorRow, NavRow};
+use crate::inspector::rows::{CommandRow, HeaderRow, InspectorRow, NavRow};
 use crate::inspector::trace_picker::{ColorBasis, element_names_for_component, list_components};
 use crate::theme::theme;
 
@@ -245,56 +245,4 @@ fn build_trace(
     );
     t.label = SharedString::from(label);
     Some(t)
-}
-
-/// Read-only header row shown at the top of each wizard page so the user
-/// remembers what they're picking. Behaves like a static label — no
-/// activation, no search match.
-struct HeaderRow {
-    text: SharedString,
-}
-
-impl HeaderRow {
-    fn new(text: impl Into<SharedString>) -> Self {
-        Self { text: text.into() }
-    }
-}
-
-impl InspectorRow for HeaderRow {
-    fn label(&self) -> &str {
-        &self.text
-    }
-
-    // Default `consumes_search: false` so the header is filtered out
-    // when the user types — the inspector pins `consumes_search: true`
-    // rows to the BOTTOM of results (intended for commit affordances
-    // like Continue/Done), and a top-of-page label jumping to the
-    // bottom is more confusing than disappearing.
-
-    fn render_row(
-        &self,
-        row_ix: usize,
-        selected: bool,
-        _window: &mut gpui::Window,
-        cx: &mut App,
-    ) -> gpui::AnyElement {
-        use gpui::{IntoElement, ParentElement, Styled, div, px};
-        let theme = theme(cx);
-        crate::inspector::rows::row_base(row_ix, selected, cx)
-            .child(
-                div()
-                    .text_size(px(11.0))
-                    .text_color(theme.text_secondary)
-                    .child(self.text.clone()),
-            )
-            .into_any_element()
-    }
-
-    fn activate(
-        &mut self,
-        _window: &mut gpui::Window,
-        _cx: &mut App,
-    ) -> crate::inspector::rows::RowAction {
-        crate::inspector::rows::RowAction::Handled
-    }
 }

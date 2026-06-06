@@ -1,8 +1,8 @@
 use std::sync::Arc;
 
-use gpui::{AnyElement, App, SharedString, Window, div, prelude::*, px};
+use gpui::{AnyElement, App, SharedString, Window};
 
-use super::{InspectorRow, RowAction, row_base};
+use super::{InspectorRow, RowAction, render_label_row};
 use crate::theme::theme;
 
 /// Prompt row whose input is the inspector's search field itself.
@@ -30,15 +30,8 @@ impl InspectorRow for DefaultActionRow {
         _window: &mut Window,
         cx: &mut App,
     ) -> AnyElement {
-        let theme = theme(cx);
-        row_base(row_ix, selected, cx)
-            .child(
-                div()
-                    .text_size(px(12.0))
-                    .text_color(theme.text_tertiary)
-                    .child(self.label.clone()),
-            )
-            .into_any_element()
+        let color = theme(cx).text_tertiary;
+        render_label_row(row_ix, selected, self.label.clone(), None, color, cx)
     }
 
     fn activate(&mut self, _window: &mut Window, _cx: &mut App) -> RowAction {

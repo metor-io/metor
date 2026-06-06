@@ -10,7 +10,7 @@ use gpui::{Entity, SharedString};
 
 use super::cursor::MeasurementCursor;
 use super::measurements::MeasurementKind;
-use crate::inspector::rows::{ActionRow, BoolRow, InspectorRow, NavRow, RowAction};
+use crate::inspector::rows::{BoolRow, CommandRow, InspectorRow, NavRow, RowAction};
 
 /// Top-level rows for `cursor`. Returned via the registered type builder, so
 /// the caller is `rows_for_any_entity` and the inspector handles cascade /
@@ -51,8 +51,8 @@ fn measurements_nav_row(cursor: Entity<MeasurementCursor>) -> NavRow {
     )
 }
 
-fn delete_action_row(cursor: Entity<MeasurementCursor>) -> ActionRow {
-    ActionRow::new(
+fn delete_action_row(cursor: Entity<MeasurementCursor>) -> CommandRow {
+    CommandRow::action(
         "Delete cursor",
         Arc::new(move |_window, cx| {
             let (host, id) = {

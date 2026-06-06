@@ -38,7 +38,7 @@ use crate::dynamic::ops::resample::ResampleMode;
 use crate::dynamic::tensor::TypedScalar;
 use crate::inspector::registry::InspectorRegistry;
 use crate::inspector::rows::{
-    ActionRow, BoolRow, CommandRow, DefaultActionRow, EnumRow, InspectorRow, RowAction, ScalarRow,
+    BoolRow, CommandRow, DefaultActionRow, EnumRow, InspectorRow, RowAction, ScalarRow,
     TextRow,
 };
 use crate::node_editor::graph::{BuildState, FlowId, NodeGraph};
@@ -72,7 +72,7 @@ fn build_editor_rows(any: AnyEntity, db: &Arc<DB>, cx: &App) -> Vec<Box<dyn Insp
     let mut rows: Vec<Box<dyn InspectorRow>> = Vec::new();
 
     rows.push(Box::new(
-        ActionRow::new(SharedString::new_static("Add Node"), {
+        CommandRow::action(SharedString::new_static("Add Node"), {
             let editor = editor.clone();
             Arc::new(move |_window, cx| RowAction::Cascade(build_add_node_rows(editor.clone(), cx)))
         })
@@ -92,7 +92,7 @@ fn build_editor_rows(any: AnyEntity, db: &Arc<DB>, cx: &App) -> Vec<Box<dyn Insp
     if !nodes_listing.is_empty() {
         let editor_for_nodes = editor.clone();
         let db = db.clone();
-        rows.push(Box::new(ActionRow::new(
+        rows.push(Box::new(CommandRow::action(
             SharedString::new_static("Nodes"),
             Arc::new(move |_window, _cx| {
                 RowAction::Cascade(build_nodes_submenu(
@@ -138,7 +138,7 @@ fn build_nodes_submenu(
             let label = SharedString::from(format!("{} · {}", descriptor.label, flow_id));
             let editor = editor.clone();
             let db = db.clone();
-            Box::new(ActionRow::new(
+            Box::new(CommandRow::action(
                 label,
                 Arc::new(move |_window, cx| {
                     let graph = editor.read(cx).graph_entity().clone();
@@ -173,7 +173,7 @@ pub fn build_add_node_rows(editor: Entity<NodeEditor>, cx: &App) -> Vec<Box<dyn 
         match descriptor.kind {
             NodeSpecKind::Persist => {
                 let editor = editor.clone();
-                rows.push(Box::new(ActionRow::new(
+                rows.push(Box::new(CommandRow::action(
                     label,
                     Arc::new(move |_window, _cx| {
                         RowAction::Cascade(build_persist_wizard(editor.clone()))
@@ -183,7 +183,7 @@ pub fn build_add_node_rows(editor: Entity<NodeEditor>, cx: &App) -> Vec<Box<dyn 
             NodeSpecKind::FromDb => {
                 let editor = editor.clone();
                 let db = db.clone();
-                rows.push(Box::new(ActionRow::new(
+                rows.push(Box::new(CommandRow::action(
                     label,
                     Arc::new(move |_window, _cx| {
                         RowAction::Cascade(build_from_db_wizard(editor.clone(), db.clone()))
