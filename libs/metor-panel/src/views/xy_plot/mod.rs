@@ -267,10 +267,7 @@ impl Render for XyPlot {
             );
 
         if show_legend {
-            let legend_bg = Hsla {
-                a: 0.5,
-                ..theme.bg_secondary
-            };
+            let legend_bg = theme.plot_chrome_bg();
             let mut legend_row = div()
                 .flex()
                 .flex_row()
@@ -423,10 +420,7 @@ pub(crate) fn paint_xy_overlay(
         strikethrough: None,
     };
 
-    let axis_bg = Hsla {
-        a: 0.5,
-        ..theme.bg_secondary
-    };
+    let axis_bg = theme.plot_chrome_bg();
     let y_axis_bg = Bounds {
         origin: outer_bounds.origin,
         size: gpui::Size {

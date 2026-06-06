@@ -247,10 +247,7 @@ impl Render for ListPlot {
             );
 
         if show_legend {
-            let legend_bg = Hsla {
-                a: 0.5,
-                ..theme.bg_secondary
-            };
+            let legend_bg = theme.plot_chrome_bg();
             let mut legend_row = div()
                 .flex()
                 .flex_row()

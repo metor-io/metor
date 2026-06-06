@@ -102,6 +102,27 @@ pub struct Theme {
     pub error_accent: Hsla,
 }
 
+impl Theme {
+    /// Semi-transparent `bg_secondary` for plot chrome strips — the legend
+    /// background and the axis fills that mask GPU-frame edges straying into
+    /// the chrome. Derived so it tracks whatever `bg_secondary` a theme picks.
+    pub fn plot_chrome_bg(&self) -> Hsla {
+        Hsla {
+            a: 0.5,
+            ..self.bg_secondary
+        }
+    }
+
+    /// Edge color for a connection awaiting validation in the node editor:
+    /// a faded `text_tertiary`.
+    pub fn edge_pending(&self) -> Hsla {
+        Hsla {
+            a: 0.4,
+            ..self.text_tertiary
+        }
+    }
+}
+
 /// Global wrapper that makes the active [`Theme`] addressable from any view.
 pub struct ActiveTheme(pub Arc<Theme>);
 

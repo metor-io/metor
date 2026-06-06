@@ -573,12 +573,7 @@ fn paint_overlay(
         strikethrough: None,
     };
 
-    // Semi-transparent axis fills mask any GPU-frame edge that strays into
-    // the chrome strips.
-    let axis_bg = Hsla {
-        a: 0.5,
-        ..theme.bg_secondary
-    };
+    let axis_bg = theme.plot_chrome_bg();
     let y_axis_bg = Bounds {
         origin: outer_bounds.origin,
         size: gpui::Size {
@@ -1603,10 +1598,7 @@ impl Render for TimeSeriesPlot {
         root = root.child(inner);
 
         if show_legend {
-            let legend_bg = Hsla {
-                a: 0.5,
-                ..theme.bg_secondary
-            };
+            let legend_bg = theme.plot_chrome_bg();
             let mut legend_row = div()
                 .flex()
                 .flex_row()
