@@ -36,7 +36,7 @@ impl TextRow {
 
     /// Read-only variant that renders muted and rejects activation. The
     /// `on_change` is a no-op so callers don't need to wire anything.
-    pub fn new_readonly(label: SharedString, value: SharedString) -> Self {
+    pub fn readonly(label: SharedString, value: SharedString) -> Self {
         Self {
             label,
             value: Rc::new(RefCell::new(value)),

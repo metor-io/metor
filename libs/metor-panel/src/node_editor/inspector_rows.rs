@@ -223,7 +223,7 @@ fn build_persist_wizard(editor: Entity<NodeEditor>) -> Vec<Box<dyn InspectorRow>
 fn build_from_db_wizard(editor: Entity<NodeEditor>, db: Arc<DB>) -> Vec<Box<dyn InspectorRow>> {
     let components = crate::inspector::trace_picker::list_components(&db);
     if components.is_empty() {
-        return vec![Box::new(TextRow::new_readonly(
+        return vec![Box::new(TextRow::readonly(
             SharedString::new_static("No components"),
             SharedString::new_static("create a Persist first"),
         ))];
@@ -291,7 +291,7 @@ fn build_rows(any: AnyEntity, db: &Arc<DB>, cx: &App) -> Vec<Box<dyn InspectorRo
         },
         None => "missing",
     };
-    rows.push(Box::new(TextRow::new_readonly(
+    rows.push(Box::new(TextRow::readonly(
         SharedString::from(format!("{} · {}", descriptor.category, descriptor.label)),
         SharedString::from(status),
     )));
@@ -836,7 +836,7 @@ fn enum_arg(
 }
 
 /// Dtype-aware scalar row. Picks `BoolRow` for `Bool`, otherwise
-/// `ScalarRow::new_typed` so the displayed text and parser match the dtype.
+/// `ScalarRow::typed` so the displayed text and parser match the dtype.
 /// `apply` receives the new `TypedScalar` keyed to the same dtype.
 fn typed_scalar_arg(
     label: &'static str,
@@ -866,7 +866,7 @@ fn typed_scalar_arg(
             }),
         ));
     }
-    Box::new(ScalarRow::new_typed(
+    Box::new(ScalarRow::typed(
         SharedString::from(label),
         value,
         Arc::new(move |new_value, _window, cx| {
