@@ -14,6 +14,7 @@ use metor_db::{Component, ComponentSchema, DB};
 use metor_proto::types::{ComponentId, ComponentView, Timestamp};
 pub mod alarms;
 pub mod app;
+pub mod config;
 pub mod dynamic;
 pub mod gpu_context;
 pub mod icons;

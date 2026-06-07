@@ -1,0 +1,5 @@
+# The bundled Ioskeley Mono Nerd Font ships as real bytes in git, NOT in LFS:
+# metor-panel embeds it via include_bytes! and must build for consumers who
+# fetch the crate without LFS hydration. Override the workspace-root rule
+# (`*.ttf filter=lfs …`) for these files only.
+IoskeleyMonoNerdFont-*.ttf !filter !diff !merge -text

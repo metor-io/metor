@@ -10,6 +10,7 @@ use std::sync::Arc;
 use gpui::{AnyEntity, App, Entity, Global, PathPromptOptions, SharedString, Window};
 use metor_db::DB;
 
+use crate::config::FontConfig;
 use crate::inspector::OpenInspectorCallback;
 use crate::inspector::rows::{CommandRow, DefaultActionRow, InspectorRow, NavRow};
 use crate::presets;
@@ -318,6 +319,29 @@ fn register_command_provider(
                         )) as Box<dyn InspectorRow>
                     })
                     .collect()
+            }),
+        });
+
+        items.push(InspectionItem::SubMenu {
+            label: "Font".into(),
+            summary: SharedString::new_static("Pick the UI font"),
+            build: Arc::new(|cx| {
+                let mut rows: Vec<Box<dyn InspectorRow>> = Vec::new();
+                rows.push(Box::new(CommandRow::new(
+                    SharedString::new_static("Auto (Berkeley Mono, else bundled)"),
+                    Arc::new(move |_window, cx| {
+                        crate::theme::set_font(cx, FontConfig::Auto);
+                    }),
+                )));
+                for name in cx.text_system().all_font_names() {
+                    rows.push(Box::new(CommandRow::new(
+                        name.clone(),
+                        Arc::new(move |_window, cx| {
+                            crate::theme::set_font(cx, FontConfig::Family(name.clone()));
+                        }),
+                    )) as Box<dyn InspectorRow>);
+                }
+                rows
             }),
         });
 

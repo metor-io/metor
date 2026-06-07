@@ -329,6 +329,7 @@ impl Render for AppRoot {
         }
 
         let theme = crate::theme::theme(cx);
+        let font_family = crate::theme::font_family(cx);
         let titlebar = self.render_titlebar(&theme, cx);
 
         let mut root = div()
@@ -349,7 +350,7 @@ impl Render for AppRoot {
                     }
                 },
             ))
-            .font_family(theme.font_family)
+            .font_family(font_family)
             .flex()
             .flex_col()
             .size_full()
@@ -542,6 +543,12 @@ pub fn run(db: Arc<metor_db::DB>) {
         .with_assets(crate::icons::IconAssets)
         .run(move |cx: &mut App| {
             crate::theme::register_fonts(cx);
+            let cfg = crate::config::load();
+            let family = crate::theme::resolve_font_family(cx, &cfg);
+            cx.set_global(crate::theme::FontSettings {
+                family,
+                config: cfg,
+            });
             cx.set_global(crate::theme::ActiveTheme(Arc::new(
                 crate::theme::DARK.clone(),
             )));
