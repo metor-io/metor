@@ -491,16 +491,73 @@ fn scan_min_max<T: gpu::PlotValue>(
 /// Paint gridlines and the zero line behind the GPU-rendered line plot.
 ///
 /// Called before [`LinePlot`] paints so the grid sits under the series.
+/// Highest-severity active-alarm tint across the plot's visible traces, if any.
+/// `None` when no alarm is active or the alarm store isn't initialized.
+fn alarm_plot_tint(lp: &LinePlot, cx: &gpui::App) -> Option<Hsla> {
+    if !lp.show_alarm_color {
+        return None;
+    }
+    let store = crate::alarms::try_global(cx)?;
+    let store = store.read(cx);
+    let state = store.state();
+    let mut worst: Option<usize> = None;
+    for trace in lp.traces() {
+        let cfg = trace.read(cx);
+        if !cfg.visible {
+            continue;
+        }
+        if let Some(severity) = state.active_severity_for(cfg.component_id, cfg.element_index) {
+            let idx = crate::alarms::severity_index(severity);
+            worst = Some(worst.map_or(idx, |w| w.max(idx)));
+        }
+    }
+    worst.map(|idx| crate::theme::theme(cx).alarm_tint(idx))
+}
+
+/// Display limit lines `(axis_index, value, color, label)` declared for the plot's
+/// visible traces by the control system's alarm definitions.
+fn alarm_limit_lines(lp: &LinePlot, cx: &gpui::App) -> Vec<(usize, f64, Hsla, SharedString)> {
+    if !lp.show_alarm_limits {
+        return Vec::new();
+    }
+    let Some(store) = crate::alarms::try_global(cx) else {
+        return Vec::new();
+    };
+    let store = store.read(cx);
+    let state = store.state();
+    let theme = crate::theme::theme(cx);
+    let mut lines = Vec::new();
+    for trace in lp.traces() {
+        let cfg = trace.read(cx);
+        if !cfg.visible {
+            continue;
+        }
+        for limit in state.limits_for(cfg.component_id, cfg.element_index) {
+            let idx = crate::alarms::severity_index(limit.severity);
+            let label = limit.label.map(SharedString::from).unwrap_or_default();
+            lines.push((cfg.axis_index, limit.value, theme.alarm_color(idx), label));
+        }
+    }
+    lines
+}
+
 fn paint_underlay(
     outer_bounds: Bounds<Pixels>,
     view: &PlotView,
     data_start: f64,
     fmt: TimeFormat,
+    tint: Option<Hsla>,
     window: &mut Window,
     cx: &mut gpui::App,
 ) {
     let pb = plot_area(outer_bounds, view.axis_count());
     let theme = crate::theme::theme(cx);
+
+    // Out-of-bounds tint: a wash over the plot area when a visible trace has an
+    // active alarm. Painted before the gridlines so they stay legible on top.
+    if let Some(tint) = tint {
+        window.paint_quad(gpui::fill(pb, tint));
+    }
     let anchor = x_tick_anchor(fmt, data_start);
     // Horizontal gridlines and the zero line track the primary axis only;
     // secondary axes would draw conflicting lines across the same plot.
@@ -552,6 +609,7 @@ fn paint_overlay(
     view: &PlotView,
     axis_colors: &[Option<Hsla>],
     axis_markers: &[(usize, f64, Hsla)],
+    limit_lines: &[(usize, f64, Hsla, SharedString)],
     data_start: f64,
     fmt: TimeFormat,
     window: &mut Window,
@@ -681,6 +739,36 @@ fn paint_overlay(
             }
         }
     }
+    // Alarm limit lines: horizontal rules at each declared threshold, drawn in the
+    // owning axis's coordinate frame, with the threshold label at the right edge.
+    for (axis_i, value, color, label) in limit_lines {
+        let ab = view.axis_bounds(*axis_i);
+        let y = ab.to_screen(pb, ab.min_x, *value).y;
+        if y < pb.origin.y || y > pb.origin.y + pb.size.height {
+            continue;
+        }
+        let mut line = PathBuilder::stroke(px(1.0));
+        line.move_to(point(pb.origin.x, y));
+        line.line_to(point(pb.origin.x + pb.size.width, y));
+        if let Ok(path) = line.build() {
+            window.paint_path(path, *color);
+        }
+        if !label.is_empty() {
+            let run = make_run(label.as_ref(), *color);
+            let shaped = window.text_system().shape_line(
+                label.clone(),
+                label_font_size,
+                &[run],
+                None,
+            );
+            let origin = point(
+                pb.origin.x + pb.size.width - shaped.width - px(4.0),
+                y - label_font_size - px(2.0),
+            );
+            let _ = shaped.paint(origin, label_font_size, window, cx);
+        }
+    }
+
     let mut x_rule = PathBuilder::stroke(px(1.0));
     x_rule.move_to(point(pb.origin.x, pb.origin.y + pb.size.height));
     x_rule.line_to(point(
@@ -965,6 +1053,11 @@ impl TimeSeriesPlot {
         // Legend and chrome live on this entity; listen to the inner
         // LinePlot so trace toggles and inspector edits trigger a repaint.
         cx.observe(&line_plot, |_, _, cx| cx.notify()).detach();
+        // Repaint when alarms change so limit lines and out-of-bounds tinting
+        // track the control system's broadcast.
+        if let Some(store) = crate::alarms::try_global(cx) {
+            cx.observe(&store, |_, _, cx| cx.notify()).detach();
+        }
         Self {
             line_plot,
             drag_start: None,
@@ -1461,15 +1554,16 @@ impl Render for TimeSeriesPlot {
                             let view = lp.effective_view(cx);
                             let data_start = lp.data_start().unwrap_or(0.0);
                             let fmt = lp.x_time_format;
+                            let tint = alarm_plot_tint(lp, cx);
                             let _ = this.update(cx, |this, _| {
                                 this.last_plot_area = Some(plot_area(bounds, axis_count));
                             });
-                            (bounds, view, data_start, fmt)
+                            (bounds, view, data_start, fmt, tint)
                         }
                     },
-                    move |_, (bounds, view, data_start, fmt), window, cx| {
+                    move |_, (bounds, view, data_start, fmt, tint), window, cx| {
                         if let Some(view) = view {
-                            paint_underlay(bounds, &view, data_start, fmt, window, cx);
+                            paint_underlay(bounds, &view, data_start, fmt, tint, window, cx);
                         }
                     },
                 )
@@ -1508,19 +1602,25 @@ impl Render for TimeSeriesPlot {
                                 }
                             }
                         }
+                        let limit_lines = alarm_limit_lines(lp, cx);
                         (
                             bounds,
                             view,
                             colors,
                             markers,
+                            limit_lines,
                             lp.data_start().unwrap_or(0.0),
                             lp.x_time_format,
                         )
                     },
-                    move |_, (bounds, view, colors, markers, data_start, fmt), window, cx| {
+                    move |_,
+                          (bounds, view, colors, markers, limit_lines, data_start, fmt),
+                          window,
+                          cx| {
                         if let Some(view) = view {
                             paint_overlay(
-                                bounds, &view, &colors, &markers, data_start, fmt, window, cx,
+                                bounds, &view, &colors, &markers, &limit_lines, data_start, fmt,
+                                window, cx,
                             );
                         }
                     },

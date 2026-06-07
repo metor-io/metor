@@ -267,6 +267,8 @@ pub fn serialize_widget_state(
             default_measurements: Vec::new(),
             cursors: Vec::new(),
             measurement_panel: Default::default(),
+            hide_alarm_limits: !lp.show_alarm_limits,
+            hide_alarm_color: !lp.show_alarm_color,
         };
         return facet_json::to_string(&cfg).ok();
     }

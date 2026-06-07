@@ -121,6 +121,26 @@ impl Theme {
             ..self.text_tertiary
         }
     }
+
+    /// Solid color for an alarm severity (`severity_index`: 0 = info, 1 = warning,
+    /// 2 = critical), used for limit lines, severity chips, and the status bar.
+    /// Critical tracks the theme's `error_accent`; warning/info are fixed amber/blue
+    /// that read on both light and dark themes.
+    pub fn alarm_color(&self, severity_index: usize) -> Hsla {
+        match severity_index {
+            2 => self.error_accent,
+            1 => hex(0xe0a030, 1.0),
+            _ => hex(0x4090e0, 1.0),
+        }
+    }
+
+    /// Low-alpha [`alarm_color`](Self::alarm_color) for out-of-bounds plot tinting.
+    pub fn alarm_tint(&self, severity_index: usize) -> Hsla {
+        Hsla {
+            a: 0.10,
+            ..self.alarm_color(severity_index)
+        }
+    }
 }
 
 /// Global wrapper that makes the active [`Theme`] addressable from any view.

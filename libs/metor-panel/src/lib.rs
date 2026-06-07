@@ -12,6 +12,7 @@ use std::mem::size_of;
 use metor_db::disruptor::{ReadGrant, Reader};
 use metor_db::{Component, ComponentSchema, DB};
 use metor_proto::types::{ComponentId, ComponentView, Timestamp};
+pub mod alarms;
 pub mod app;
 pub mod dynamic;
 pub mod gpu_context;

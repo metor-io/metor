@@ -9,7 +9,7 @@ use crate::inspector::edits::{
 use crate::inspector::palette::ItemRegistry;
 use crate::inspector::{InspectorMode, InspectorRequest, OpenInspectorGlobal};
 use crate::tiles::panels::{
-    BrowserPanel, DataTablePanel, ListPlotPanel, PlotPanel, TablePanel, TextPanel,
+    AlarmPanel, BrowserPanel, DataTablePanel, ListPlotPanel, PlotPanel, TablePanel, TextPanel,
     TrafficLightGridPanel, TrafficLightPanel, Viewer3dPanel, XyPlotPanel,
 };
 use crate::tiles::{PlotComponentAction, PreviewPlotAction, TileGroup, TileGroupEvent};
@@ -78,6 +78,10 @@ impl AppRoot {
             cx,
         );
         crate::node_editor::palette_provider::register(tiles.clone(), cx);
+        // Repaint the status bar when alarms change.
+        if let Some(store) = crate::alarms::try_global(cx) {
+            cx.observe(&store, |_, _, cx| cx.notify()).detach();
+        }
         Self {
             db,
             tiles,
@@ -365,7 +369,90 @@ impl Render for AppRoot {
 }
 
 impl AppRoot {
-    fn render_titlebar(&self, theme: &crate::theme::Theme, cx: &App) -> impl IntoElement {
+    /// Active-alarm summary shown on the left of the title bar; clicking opens the alarm
+    /// panel. Colored by the highest active severity.
+    fn render_alarm_summary(
+        &self,
+        theme: &crate::theme::Theme,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
+        let mut bar = div()
+            .id("alarm-summary")
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap(px(8.0))
+            .text_size(px(11.0))
+            .text_color(theme.text_secondary)
+            .cursor_pointer()
+            .on_click(cx.listener(|this, _, _, cx| this.open_alarms(cx)));
+
+        if let Some(store) = crate::alarms::try_global(cx) {
+            let store = store.read(cx);
+            let state = store.state();
+            let active = state.active_count();
+            if active == 0 {
+                // Healthy: a bare green dot keeps the title bar compact.
+                bar = bar.child(div().text_color(theme.control_active).child("\u{25cf}"));
+            } else {
+                if let Some(severity) = state.highest_active_severity() {
+                    let idx = crate::alarms::severity_index(severity);
+                    bar = bar.child(div().text_color(theme.alarm_color(idx)).child("\u{25cf}"));
+                }
+                let counts = state.counts_by_severity();
+                for idx in (0..counts.len()).rev() {
+                    if counts[idx] == 0 {
+                        continue;
+                    }
+                    let label = match idx {
+                        2 => "crit",
+                        1 => "warn",
+                        _ => "info",
+                    };
+                    bar = bar.child(
+                        div()
+                            .text_color(theme.alarm_color(idx))
+                            .child(SharedString::from(format!("{} {}", counts[idx], label))),
+                    );
+                }
+                bar = bar.child(SharedString::from(format!(
+                    "{active} active, {} unacked",
+                    state.unacked_count()
+                )));
+            }
+        }
+
+        bar.into_any_element()
+    }
+
+    /// Open the alarm panel in the first pane, unless one is already open.
+    fn open_alarms(&mut self, cx: &mut Context<Self>) {
+        let panes = self.tiles.read(cx).panes().to_vec();
+        let already_open = panes.iter().any(|pane| {
+            pane.read(cx)
+                .items()
+                .iter()
+                .any(|item| item.serialization_key() == "alarm")
+        });
+        if already_open {
+            return;
+        }
+        let Some(pane) = panes.first().cloned() else {
+            return;
+        };
+        let db = self.db.clone();
+        pane.update(cx, |pane, cx| {
+            let item: Box<dyn crate::tiles::PaneItemHandle> =
+                Box::new(cx.new(|cx| AlarmPanel::new(db, cx)));
+            pane.add_item(item, cx);
+        });
+    }
+
+    fn render_titlebar(
+        &self,
+        theme: &crate::theme::Theme,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
         let pending = pending_edits(cx);
         let edit_count = pending.edits.len();
         let locked = pending.locked;
@@ -401,8 +488,10 @@ impl AppRoot {
             .flex()
             .flex_row()
             .items_center()
-            .gap(px(6.0))
+            .gap(px(10.0))
             .pr(px(8.0));
+
+        right = right.child(self.render_alarm_summary(theme, cx));
 
         if edit_count > 0 {
             let label = SharedString::from(format!("{} pending", edit_count));
@@ -440,6 +529,7 @@ impl AppRoot {
             .items_center()
             .justify_end()
             .child(right)
+            .into_any_element()
     }
 }
 
@@ -463,6 +553,7 @@ pub fn run(db: Arc<metor_db::DB>) {
             crate::node_editor::GraphCoordinator::init(cx);
             crate::node_editor::DynamicWorker::init(cx);
             crate::node_editor::inspector_rows::register_inspector_rows(cx);
+            crate::alarms::AlarmStore::init(db.clone(), cx);
             register_pane_item_deserializers(db.clone(), cx);
             set_dock_icon();
             cx.bind_keys([
@@ -515,6 +606,7 @@ fn register_pane_item_deserializers(db: Arc<DB>, cx: &mut App) {
     let mut reg = PaneItemRegistry::default();
 
     register_panel::<TextPanel>(&mut reg, db.clone(), TextPanel::from_config);
+    register_panel::<AlarmPanel>(&mut reg, db.clone(), AlarmPanel::from_config);
     register_panel::<TablePanel>(&mut reg, db.clone(), TablePanel::from_config);
     register_panel::<DataTablePanel>(&mut reg, db.clone(), DataTablePanel::from_config);
     register_panel::<BrowserPanel>(&mut reg, db.clone(), BrowserPanel::from_config);

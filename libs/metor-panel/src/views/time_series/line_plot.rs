@@ -92,6 +92,10 @@ pub struct LinePlot {
     pub x_range: TimeRangeBehavior,
     pub x_time_format: TimeFormat,
     pub custom_title: Override<SharedString>,
+    /// Draw the control system's alarm limit lines for traces on this plot.
+    pub show_alarm_limits: bool,
+    /// Tint the plot background while a trace has an active alarm.
+    pub show_alarm_color: bool,
 
     #[facet(opaque)]
     db: Arc<DB>,
@@ -123,6 +127,8 @@ impl LinePlot {
             x_range: TimeRangeBehavior::default(),
             x_time_format: TimeFormat::default(),
             custom_title: Override::Auto,
+            show_alarm_limits: true,
+            show_alarm_color: true,
             db,
             tracking: HashMap::new(),
             tasks: HashMap::new(),

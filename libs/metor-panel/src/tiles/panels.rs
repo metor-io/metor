@@ -16,8 +16,8 @@ use crate::views::time_series::{
 use crate::views::viewer_3d::Viewer3d;
 use crate::views::xy_plot::{XyLinePlot, XyPlot, XyTrace};
 use crate::views::{
-    ComponentBrowser, ComponentTable, ComponentText, DataTable, TimeSeriesPlot, TrafficLight,
-    TrafficLightGrid, new_component_browser, new_component_table, new_data_table,
+    AlarmView, ComponentBrowser, ComponentTable, ComponentText, DataTable, TimeSeriesPlot,
+    TrafficLight, TrafficLightGrid, new_component_browser, new_component_table, new_data_table,
 };
 
 use super::item::{PaneItem, PaneItemHandle};
@@ -77,6 +77,55 @@ impl PaneItem for TextPanel {
         TextPanelConfig {
             component: self.label.to_string(),
         }
+    }
+}
+
+/// Persisted shape of an [`AlarmPanel`]. The panel shows global alarm state, so the
+/// only persisted bit is which tab it opens on.
+#[derive(facet::Facet, Default)]
+pub struct AlarmPanelConfig {
+    pub show_history: bool,
+}
+
+/// Pane item listing the control system's alarms with acknowledge controls.
+pub struct AlarmPanel {
+    inner: Entity<AlarmView>,
+}
+
+impl AlarmPanel {
+    pub fn new(_db: Arc<DB>, cx: &mut Context<Self>) -> Self {
+        let inner = cx.new(AlarmView::new);
+        Self { inner }
+    }
+
+    pub fn from_config(_cfg: AlarmPanelConfig, db: Arc<DB>, cx: &mut Context<Self>) -> Self {
+        Self::new(db, cx)
+    }
+}
+
+impl Render for AlarmPanel {
+    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+        div().size_full().child(self.inner.clone())
+    }
+}
+
+impl PaneItem for AlarmPanel {
+    type Config = AlarmPanelConfig;
+
+    fn tab_title(&self, _cx: &App) -> SharedString {
+        SharedString::new_static("Alarms")
+    }
+
+    fn serialization_key() -> &'static str {
+        "alarm"
+    }
+
+    fn to_config(&self, _cx: &App) -> AlarmPanelConfig {
+        AlarmPanelConfig::default()
+    }
+
+    fn inspectable_entity(&self) -> Option<gpui::AnyEntity> {
+        Some(self.inner.clone().into())
     }
 }
 
@@ -473,6 +522,12 @@ pub struct PlotPanelConfig {
     /// Where the measurement readout panel sits inside the plot. Defaults
     /// to `Track`; `Pinned` keeps user-dragged placement across reloads.
     pub measurement_panel: MeasurementPanelConfig,
+    /// Suppress the control system's alarm limit lines on this plot. Stored
+    /// inverted so the default (and old layouts) show them.
+    pub hide_alarm_limits: bool,
+    /// Suppress the alarm out-of-bounds background tint on this plot. Stored
+    /// inverted so the default (and old layouts) show it.
+    pub hide_alarm_color: bool,
 }
 
 /// Serializable shape of [`PanelPosition`].
@@ -640,6 +695,8 @@ impl PlotPanel {
         line_plot.update(cx, |lp, cx| {
             lp.custom_title = cfg.custom_title.map(SharedString::from);
             lp.x_time_format = cfg.x_time_format;
+            lp.show_alarm_limits = !cfg.hide_alarm_limits;
+            lp.show_alarm_color = !cfg.hide_alarm_color;
             if cfg.axes.is_empty() {
                 // Pre-multi-axis layout: keep the synthesized primary axis and
                 // seed it from the legacy bounds.
@@ -736,6 +793,8 @@ impl PaneItem for PlotPanel {
             default_measurements: Vec::new(),
             cursors,
             measurement_panel,
+            hide_alarm_limits: !lp.show_alarm_limits,
+            hide_alarm_color: !lp.show_alarm_color,
         }
     }
 
@@ -1481,6 +1540,18 @@ pub(crate) fn new_panel_rows(
         })
     })));
 
+    rows.push(Box::new(CommandRow::new("Alarms", {
+        let db = db.clone();
+        let pane = pane.clone();
+        Arc::new(move |_window, cx| {
+            let db = db.clone();
+            pane.update(cx, |pane, cx| {
+                let item: Box<dyn PaneItemHandle> = Box::new(cx.new(|cx| AlarmPanel::new(db, cx)));
+                pane.add_item(item, cx);
+            });
+        })
+    })));
+
     rows.push(Box::new(CommandRow::new("Node Editor", {
         let db = db.clone();
         let pane = pane.clone();
@@ -1578,6 +1649,8 @@ mod tests {
             default_measurements: Vec::new(),
             cursors: Vec::new(),
             measurement_panel: Default::default(),
+            hide_alarm_limits: false,
+            hide_alarm_color: false,
         };
         let s = facet_json::to_string(&plot).unwrap();
         let back: PlotPanelConfig = facet_json::from_str(&s).unwrap();
