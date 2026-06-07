@@ -173,7 +173,7 @@ pub fn focused_trace_at(
     x_ts: Timestamp,
     cursor_screen_y: gpui::Pixels,
     plot_area: gpui::Bounds<gpui::Pixels>,
-    view: super::PlotBounds,
+    view: &super::PlotView,
     cx: &gpui::App,
 ) -> Option<EntityId> {
     let mut first_visible: Option<EntityId> = None;
@@ -189,7 +189,11 @@ pub fn focused_trace_at(
         let Some(y) = line_plot.trace_value_at(trace.entity_id(), x_ts, cx) else {
             continue;
         };
-        let screen = view.to_screen(plot_area, x_ts.0 as f64, y);
+        // Project against this trace's own axis so focus is correct even
+        // when axes are zoomed independently.
+        let screen = view
+            .axis_bounds(cfg.axis_index)
+            .to_screen(plot_area, x_ts.0 as f64, y);
         let dist = (f32::from(screen.y) - f32::from(cursor_screen_y)).abs();
         if best.map(|(_, d)| dist < d).unwrap_or(true) {
             best = Some((trace.entity_id(), dist));

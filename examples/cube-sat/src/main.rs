@@ -9,7 +9,10 @@ use metor_fsw_adcs::{mekf, yang_lqr::YangLQR};
 use metor_proto::types::{ComponentId, LenPacket, Msg, OwnedPacket, PacketId, Timestamp};
 use metor_proto_bbq::RxExt;
 use metor_proto_stellar::{PacketSink, PacketStream, queue::spawn_recv};
-use metor_proto_wkt::{ComponentValue, MsgStream, SetDbConfig, UpdateComponent};
+use metor_proto_wkt::{
+    AlarmCleared, AlarmDef, AlarmLimit, AlarmRaised, AlarmTarget, ComponentValue, LimitKind,
+    MsgStream, SetDbConfig, Severity, UpdateComponent,
+};
 use nox::{
     ArrayBuf, Body, DU, Quaternion, Scalar, SpatialForce, SpatialInertia, SpatialMotion,
     SpatialTransform, Vec3, Vector, Vector3, array::Quat, rk4, tensor,
@@ -171,6 +174,10 @@ pub struct ReactionWheel {
     torque_set_point: Vec3<f64>,
     friction: Scalar<f64>,
     torque: Vec3<f64>,
+    healthy: bool,
+    arm: bool,
+    _pad1: u16,
+    _pad: u32,
 }
 
 impl ReactionWheel {
@@ -182,6 +189,10 @@ impl ReactionWheel {
             torque_set_point: Vec3::zeros(),
             friction: 0.0.into(),
             torque: Vec3::zeros(),
+            healthy: true,
+            arm: true,
+            _pad: 0,
+            _pad1: 0,
         }
     }
 
@@ -224,6 +235,15 @@ impl ReactionWheel {
 
     /// Update the reaction wheel state for the next time step
     pub fn update(&mut self) {
+        // A disarmed wheel is offline: it applies no control torque and ignores
+        // its set point, though its stored momentum is retained.
+        if !self.arm {
+            self.torque = Vec3::zeros();
+            self.friction = self.friction_torque().into();
+            self.update_speed();
+            return;
+        }
+
         let rw_force_clamp = 0.002;
 
         let new_ang_momentum = self.ang_momentum + self.torque_set_point * DT;
@@ -510,7 +530,69 @@ pub async fn main() -> anyhow::Result<()> {
     ))
     .await
     .0?;
+
+    // Declare a body-rate alarm. The limits are informational display lines; the firing
+    // decision (with a two-sample debounce) is made below by this "control system".
+    const RATE_ALARM_ID: &str = "ADCS_RATE_HIGH";
+    const RATE_WARN: f64 = 0.5;
+    const RATE_CRIT: f64 = 1.0;
+    tx.send(&AlarmDef {
+        id: RATE_ALARM_ID.into(),
+        name: "Body Rate High".into(),
+        description: "Spacecraft angular rate (gyro Y) outside the safe envelope".into(),
+        target: Some(AlarmTarget {
+            component_id: ComponentId::new("cube_sat.sim.sensors.imu.gyro"),
+            // Element 1 (Y) carries the initial tumble (2 rad/s), so the alarm fires
+            // on startup and clears once the wheels detumble the spacecraft.
+            element_index: Some(1),
+        }),
+        limits: vec![
+            AlarmLimit {
+                kind: LimitKind::Upper,
+                value: RATE_WARN,
+                severity: Severity::Warning,
+                label: Some("Warn".into()),
+            },
+            AlarmLimit {
+                kind: LimitKind::Upper,
+                value: RATE_CRIT,
+                severity: Severity::Critical,
+                label: Some("Crit".into()),
+            },
+            AlarmLimit {
+                kind: LimitKind::Lower,
+                value: -RATE_WARN,
+                severity: Severity::Warning,
+                label: Some("Warn".into()),
+            },
+            AlarmLimit {
+                kind: LimitKind::Lower,
+                value: -RATE_CRIT,
+                severity: Severity::Critical,
+                label: Some("Crit".into()),
+            },
+        ],
+        default_severity: Severity::Warning,
+    })
+    .await
+    .0?;
+
+    // Debounced firing state for the rate alarm.
+    let mut rate_occurrence: u64 = 0;
+    let mut rate_active = false;
+    let mut over_count = 0u8;
+    let mut under_count = 0u8;
+
     let mut cube_sat = CubeSat::default();
+    // `--disarmed` brings the spacecraft up with every reaction wheel offline, so the
+    // operator must arm them from the panel before attitude control takes effect.
+    if std::env::args().any(|arg| arg == "--disarmed") {
+        for wheel in &mut cube_sat.sim.reaction_wheels {
+            wheel.arm = false;
+        }
+        println!("reaction wheels starting disarmed");
+    }
+
     let mut pkt = LenPacket::new(
         metor_proto::types::PacketTy::Table,
         id,
@@ -528,21 +610,79 @@ pub async fn main() -> anyhow::Result<()> {
                         continue;
                     };
                     println!("Received UpdateComponent message {:?}", update_component);
-                    if let ComponentValue::U64(value) = update_component.value {
-                        if update_component.id == ComponentId::new("cube_sat.fsw.mode") {
-                            let mode = value.buf.as_buf()[0];
-                            cube_sat.fsw.mode = match mode {
-                                0 => Mode::NadirPoint,
-                                1 => Mode::HilPoint,
-                                _ => continue,
-                            };
+                    match &update_component.value {
+                        ComponentValue::U64(value) => {
+                            if update_component.id == ComponentId::new("cube_sat.fsw.mode") {
+                                let mode = value.buf.as_buf()[0];
+                                cube_sat.fsw.mode = match mode {
+                                    0 => Mode::NadirPoint,
+                                    1 => Mode::HilPoint,
+                                    _ => continue,
+                                };
+                            }
                         }
+                        // Operator arm/disarm of a reaction wheel from the panel.
+                        ComponentValue::Bool(value) => {
+                            let armed = value.buf.as_buf()[0];
+                            for i in 0..cube_sat.sim.reaction_wheels.len() {
+                                if update_component.id
+                                    == ComponentId::new(&format!(
+                                        "cube_sat.sim.reaction_wheels.{i}.arm"
+                                    ))
+                                {
+                                    cube_sat.sim.reaction_wheels[i].arm = armed;
+                                    println!(
+                                        "reaction wheel {i} {}",
+                                        if armed { "armed" } else { "disarmed" }
+                                    );
+                                }
+                            }
+                        }
+                        _ => {}
                     }
                 }
                 _ => {}
             }
         }
         cube_sat = tick(cube_sat);
+
+        // Evaluate the body-rate alarm with a two-sample debounce, then raise/clear on
+        // transitions only. Y (element 1) holds the initial tumble.
+        let rate = cube_sat.sim.sensors.imu.gyro.into_buf()[1];
+        if rate.abs() > RATE_WARN {
+            over_count = over_count.saturating_add(1);
+            under_count = 0;
+        } else {
+            under_count = under_count.saturating_add(1);
+            over_count = 0;
+        }
+        if !rate_active && over_count >= 2 {
+            rate_active = true;
+            rate_occurrence += 1;
+            let severity = if rate.abs() > RATE_CRIT {
+                Severity::Critical
+            } else {
+                Severity::Warning
+            };
+            tx.send(&AlarmRaised {
+                def_id: RATE_ALARM_ID.into(),
+                occurrence: rate_occurrence,
+                severity,
+                value: Some(rate),
+                message: format!("gyro Y = {rate:.3} rad/s"),
+            })
+            .await
+            .0?;
+        } else if rate_active && under_count >= 2 {
+            rate_active = false;
+            tx.send(&AlarmCleared {
+                def_id: RATE_ALARM_ID.into(),
+                occurrence: rate_occurrence,
+            })
+            .await
+            .0?;
+        }
+
         pkt.extend_from_slice(cube_sat.as_bytes());
         rent!(tx.send(pkt).await, pkt)?;
         pkt.clear();

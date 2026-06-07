@@ -1,17 +1,21 @@
 use std::sync::Arc;
 
-use gpui::{AnyElement, App, SharedString, Window, div, prelude::*, px};
+use gpui::{AnyElement, App, SharedString, Window};
 
-use super::{InspectorRow, RowAction, row_base};
+use super::{InspectorRow, RowAction, render_label_row};
 use crate::theme::theme;
 
-/// Row that runs a callback once and dismisses the inspector.
+/// Leaf row that runs a callback when activated.
 ///
-/// Used for leaf actions like "Reset Camera" or "Add Model" where there's
-/// no follow-up page.
+/// Two flavors share one type because they render identically and differ
+/// only in what happens after the callback:
+/// - [`CommandRow::new`] takes a plain `Fn` and dismisses the inspector —
+///   the common case (e.g. "Reset Camera", "Add Model").
+/// - [`CommandRow::action`] takes a callback that returns its own
+///   [`RowAction`], for rows that drill into a sub-page or stay open.
 pub struct CommandRow {
     pub label: SharedString,
-    pub callback: Arc<dyn Fn(&mut Window, &mut App)>,
+    callback: Arc<dyn Fn(&mut Window, &mut App) -> RowAction>,
     tag: Option<SharedString>,
 }
 
@@ -19,6 +23,20 @@ impl CommandRow {
     pub fn new(
         label: impl Into<SharedString>,
         callback: Arc<dyn Fn(&mut Window, &mut App)>,
+    ) -> Self {
+        Self {
+            label: label.into(),
+            callback: Arc::new(move |window, cx| {
+                callback(window, cx);
+                RowAction::Dismiss
+            }),
+            tag: None,
+        }
+    }
+
+    pub fn action(
+        label: impl Into<SharedString>,
+        callback: Arc<dyn Fn(&mut Window, &mut App) -> RowAction>,
     ) -> Self {
         Self {
             label: label.into(),
@@ -45,21 +63,18 @@ impl InspectorRow for CommandRow {
         _window: &mut Window,
         cx: &mut App,
     ) -> AnyElement {
-        let theme = theme(cx);
-        let mut row = row_base(row_ix, selected, cx).child(
-            div()
-                .text_size(px(12.0))
-                .text_color(theme.text_primary)
-                .child(self.label.clone()),
-        );
-        if let Some(tag) = &self.tag {
-            row = row.child(super::tag_pill(tag.clone(), cx));
-        }
-        row.into_any_element()
+        let color = theme(cx).text_primary;
+        render_label_row(
+            row_ix,
+            selected,
+            self.label.clone(),
+            self.tag.clone(),
+            color,
+            cx,
+        )
     }
 
     fn activate(&mut self, window: &mut Window, cx: &mut App) -> RowAction {
-        (self.callback)(window, cx);
-        RowAction::Dismiss
+        (self.callback)(window, cx)
     }
 }

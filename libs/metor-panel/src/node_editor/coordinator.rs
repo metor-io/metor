@@ -11,7 +11,7 @@ use std::sync::Arc;
 
 use gpui::{App, Global};
 
-use crate::dynamic::{BuildError, DynamicNode, DynamicRegistry, NodeId};
+use crate::dynamic::{DynamicNode, DynamicRegistry, NodeId};
 use crate::node_editor::worker::DynamicWorker;
 
 pub type OwnerId = u64;
@@ -84,25 +84,4 @@ fn dispose(removed: Vec<Arc<dyn DynamicNode>>, cx: &App) {
     for arc in removed {
         handle.dispose(arc);
     }
-}
-
-/// Build helper that goes straight through `DynamicRegistry`. Idempotent: if
-/// `id` already exists (built by us or another editor) we share the `Arc`.
-pub fn get_or_build_node(
-    id: NodeId,
-    cx: &mut App,
-    build: impl FnOnce() -> Result<Arc<dyn DynamicNode>, BuildError>,
-) -> Result<Arc<dyn DynamicNode>, BuildError> {
-    let registry = cx.global_mut::<DynamicRegistry>();
-    if let Some(existing) = registry.get(id) {
-        return Ok(existing);
-    }
-    let node = build()?;
-    debug_assert_eq!(
-        node.id(),
-        id,
-        "spec::build produced a NodeId that doesn't match compute_node_id"
-    );
-    registry.insert(node.clone());
-    Ok(node)
 }

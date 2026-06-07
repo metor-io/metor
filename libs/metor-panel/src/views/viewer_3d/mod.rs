@@ -232,7 +232,7 @@ impl Viewer3d {
         let frame_queue = new_frame_queue();
 
         let render_layer = {
-            let bridge = BevyBridge::get_or_init(cx);
+            let bridge = BevyBridge::or_init(cx);
             let layer = bridge.claim_render_layer();
             let layers = bridge::render_layers_for(layer);
             let entities_cell = entities.clone();

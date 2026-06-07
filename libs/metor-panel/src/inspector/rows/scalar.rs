@@ -16,7 +16,7 @@ use crate::theme::theme;
 /// the row redraws with the new value immediately, instead of waiting for
 /// the underlying entity to refresh.
 ///
-/// When constructed via [`ScalarRow::new_typed`], a `dtype` is stashed and
+/// When constructed via [`ScalarRow::typed`], a `dtype` is stashed and
 /// used to format the displayed text (no decimals for integer dtypes) and to
 /// reject inputs that don't fit the dtype's lexical shape (e.g. a `1.5`
 /// typed into an `i32` field).
@@ -46,7 +46,7 @@ impl ScalarRow {
     /// Dtype-aware constructor. The displayed value is formatted to the
     /// dtype, and on commit the parsed `f64` is cast back through
     /// `TypedScalar::from_f64(v, dtype)` before reaching `on_change`.
-    pub fn new_typed(
+    pub fn typed(
         label: SharedString,
         value: TypedScalar,
         on_change: Arc<dyn Fn(TypedScalar, &mut Window, &mut App)>,

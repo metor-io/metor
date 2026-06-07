@@ -3,7 +3,7 @@
 //! latest sample, so there's no node-bounds cache and no per-element
 //! invalidation.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use gpui::{
@@ -12,6 +12,7 @@ use gpui::{
 };
 use metor_db::{Component, DB};
 
+use crate::views::plot_common::reconcile_trackers;
 use crate::views::time_series::{
     AxisSource, LineDraw, Override, PlotBounds, PlotRenderState, expand_latest_sample_bounds,
 };
@@ -110,7 +111,7 @@ impl ListLinePlot {
     }
 
     pub fn set_view_override(&mut self, view: Option<PlotBounds>, cx: &mut Context<Self>) {
-        if self.view_override.map(bounds_tuple) != view.map(bounds_tuple) {
+        if self.view_override.map(|b| b.bits()) != view.map(|b| b.bits()) {
             self.view_override = view;
             cx.notify();
         }
@@ -121,22 +122,18 @@ impl ListLinePlot {
     }
 
     fn reconcile(&mut self, cx: &mut Context<Self>) {
-        let current_ids: HashSet<EntityId> = self.traces.iter().map(|e| e.entity_id()).collect();
-        let had_tracking_keys: Vec<EntityId> = self.tracking.keys().copied().collect();
-        for id in had_tracking_keys {
-            if !current_ids.contains(&id) {
-                self.tracking.remove(&id);
-                self.tasks.remove(&id);
-            }
-        }
-        for trace in &self.traces {
-            let id = trace.entity_id();
-            if let std::collections::hash_map::Entry::Vacant(slot) = self.tracking.entry(id) {
-                slot.insert(ListTraceTracking::new());
-                let task = Self::spawn_tracker(id, trace.clone(), self.db.clone(), cx);
-                self.tasks.insert(id, task);
-            }
-        }
+        let db = self.db.clone();
+        reconcile_trackers(
+            &self.traces,
+            &mut self.tracking,
+            &mut self.tasks,
+            |id, trace| {
+                (
+                    ListTraceTracking::new(),
+                    Self::spawn_tracker(id, trace.clone(), db.clone(), cx),
+                )
+            },
+        );
 
         let snapshot = OverrideSnapshot::capture(self);
         if snapshot != self.last_overrides {
@@ -290,6 +287,8 @@ impl Render for ListLinePlot {
                                             component,
                                             len: config.len,
                                         },
+                                        y_min: view.min_y,
+                                        y_max: view.max_y,
                                         style: config.style,
                                         color: config.color,
                                         stroke_width: config.stroke_width,
@@ -326,15 +325,6 @@ impl Render for ListLinePlot {
 
 fn list_plot_gpu_state(lp: &mut ListLinePlot) -> &mut PlotRenderState {
     &mut lp.gpu_state
-}
-
-fn bounds_tuple(b: PlotBounds) -> (u64, u64, u64, u64) {
-    (
-        b.min_x.to_bits(),
-        b.min_y.to_bits(),
-        b.max_x.to_bits(),
-        b.max_y.to_bits(),
-    )
 }
 
 fn derive_title(traces: &[Entity<ListTrace>], cx: &gpui::App) -> SharedString {

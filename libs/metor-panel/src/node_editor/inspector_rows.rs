@@ -38,7 +38,7 @@ use crate::dynamic::ops::resample::ResampleMode;
 use crate::dynamic::tensor::TypedScalar;
 use crate::inspector::registry::InspectorRegistry;
 use crate::inspector::rows::{
-    ActionRow, BoolRow, CommandRow, DefaultActionRow, EnumRow, InspectorRow, RowAction, ScalarRow,
+    BoolRow, CommandRow, DefaultActionRow, EnumRow, InspectorRow, RowAction, ScalarRow,
     TextRow,
 };
 use crate::node_editor::graph::{BuildState, FlowId, NodeGraph};
@@ -72,7 +72,7 @@ fn build_editor_rows(any: AnyEntity, db: &Arc<DB>, cx: &App) -> Vec<Box<dyn Insp
     let mut rows: Vec<Box<dyn InspectorRow>> = Vec::new();
 
     rows.push(Box::new(
-        ActionRow::new(SharedString::new_static("Add Node"), {
+        CommandRow::action(SharedString::new_static("Add Node"), {
             let editor = editor.clone();
             Arc::new(move |_window, cx| RowAction::Cascade(build_add_node_rows(editor.clone(), cx)))
         })
@@ -92,7 +92,7 @@ fn build_editor_rows(any: AnyEntity, db: &Arc<DB>, cx: &App) -> Vec<Box<dyn Insp
     if !nodes_listing.is_empty() {
         let editor_for_nodes = editor.clone();
         let db = db.clone();
-        rows.push(Box::new(ActionRow::new(
+        rows.push(Box::new(CommandRow::action(
             SharedString::new_static("Nodes"),
             Arc::new(move |_window, _cx| {
                 RowAction::Cascade(build_nodes_submenu(
@@ -138,7 +138,7 @@ fn build_nodes_submenu(
             let label = SharedString::from(format!("{} · {}", descriptor.label, flow_id));
             let editor = editor.clone();
             let db = db.clone();
-            Box::new(ActionRow::new(
+            Box::new(CommandRow::action(
                 label,
                 Arc::new(move |_window, cx| {
                     let graph = editor.read(cx).graph_entity().clone();
@@ -173,7 +173,7 @@ pub fn build_add_node_rows(editor: Entity<NodeEditor>, cx: &App) -> Vec<Box<dyn 
         match descriptor.kind {
             NodeSpecKind::Persist => {
                 let editor = editor.clone();
-                rows.push(Box::new(ActionRow::new(
+                rows.push(Box::new(CommandRow::action(
                     label,
                     Arc::new(move |_window, _cx| {
                         RowAction::Cascade(build_persist_wizard(editor.clone()))
@@ -183,7 +183,7 @@ pub fn build_add_node_rows(editor: Entity<NodeEditor>, cx: &App) -> Vec<Box<dyn 
             NodeSpecKind::FromDb => {
                 let editor = editor.clone();
                 let db = db.clone();
-                rows.push(Box::new(ActionRow::new(
+                rows.push(Box::new(CommandRow::action(
                     label,
                     Arc::new(move |_window, _cx| {
                         RowAction::Cascade(build_from_db_wizard(editor.clone(), db.clone()))
@@ -223,7 +223,7 @@ fn build_persist_wizard(editor: Entity<NodeEditor>) -> Vec<Box<dyn InspectorRow>
 fn build_from_db_wizard(editor: Entity<NodeEditor>, db: Arc<DB>) -> Vec<Box<dyn InspectorRow>> {
     let components = crate::inspector::trace_picker::list_components(&db);
     if components.is_empty() {
-        return vec![Box::new(TextRow::new_readonly(
+        return vec![Box::new(TextRow::readonly(
             SharedString::new_static("No components"),
             SharedString::new_static("create a Persist first"),
         ))];
@@ -291,7 +291,7 @@ fn build_rows(any: AnyEntity, db: &Arc<DB>, cx: &App) -> Vec<Box<dyn InspectorRo
         },
         None => "missing",
     };
-    rows.push(Box::new(TextRow::new_readonly(
+    rows.push(Box::new(TextRow::readonly(
         SharedString::from(format!("{} · {}", descriptor.category, descriptor.label)),
         SharedString::from(status),
     )));
@@ -836,7 +836,7 @@ fn enum_arg(
 }
 
 /// Dtype-aware scalar row. Picks `BoolRow` for `Bool`, otherwise
-/// `ScalarRow::new_typed` so the displayed text and parser match the dtype.
+/// `ScalarRow::typed` so the displayed text and parser match the dtype.
 /// `apply` receives the new `TypedScalar` keyed to the same dtype.
 fn typed_scalar_arg(
     label: &'static str,
@@ -866,7 +866,7 @@ fn typed_scalar_arg(
             }),
         ));
     }
-    Box::new(ScalarRow::new_typed(
+    Box::new(ScalarRow::typed(
         SharedString::from(label),
         value,
         Arc::new(move |new_value, _window, cx| {

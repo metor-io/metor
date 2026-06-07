@@ -1,7 +1,9 @@
 use std::borrow::Cow;
 use std::sync::Arc;
 
-use gpui::{App, Global, Hsla};
+use gpui::{App, Global, Hsla, SharedString};
+
+use crate::config::{self, FontConfig, PanelConfig};
 
 /// Build an [`Hsla`] from a packed `0xRRGGBB` literal in a const context.
 ///
@@ -61,7 +63,6 @@ const fn hex(rgb: u32, a: f32) -> Hsla {
 #[derive(Clone)]
 pub struct Theme {
     pub name: &'static str,
-    pub font_family: &'static str,
     pub bg_primary: Hsla,
     pub bg_secondary: Hsla,
     /// Surface lifted above the page, used by palettes and popovers.
@@ -100,6 +101,47 @@ pub struct Theme {
     /// Error accent (build failures, invalid arg pills). Used wherever the
     /// UI needs a "this is wrong" tint.
     pub error_accent: Hsla,
+}
+
+impl Theme {
+    /// Semi-transparent `bg_secondary` for plot chrome strips — the legend
+    /// background and the axis fills that mask GPU-frame edges straying into
+    /// the chrome. Derived so it tracks whatever `bg_secondary` a theme picks.
+    pub fn plot_chrome_bg(&self) -> Hsla {
+        Hsla {
+            a: 0.5,
+            ..self.bg_secondary
+        }
+    }
+
+    /// Edge color for a connection awaiting validation in the node editor:
+    /// a faded `text_tertiary`.
+    pub fn edge_pending(&self) -> Hsla {
+        Hsla {
+            a: 0.4,
+            ..self.text_tertiary
+        }
+    }
+
+    /// Solid color for an alarm severity (`severity_index`: 0 = info, 1 = warning,
+    /// 2 = critical), used for limit lines, severity chips, and the status bar.
+    /// Critical tracks the theme's `error_accent`; warning/info are fixed amber/blue
+    /// that read on both light and dark themes.
+    pub fn alarm_color(&self, severity_index: usize) -> Hsla {
+        match severity_index {
+            2 => self.error_accent,
+            1 => hex(0xe0a030, 1.0),
+            _ => hex(0x4090e0, 1.0),
+        }
+    }
+
+    /// Low-alpha [`alarm_color`](Self::alarm_color) for out-of-bounds plot tinting.
+    pub fn alarm_tint(&self, severity_index: usize) -> Hsla {
+        Hsla {
+            a: 0.10,
+            ..self.alarm_color(severity_index)
+        }
+    }
 }
 
 /// Global wrapper that makes the active [`Theme`] addressable from any view.
@@ -149,7 +191,6 @@ const LINE_COLORS: [Hsla; 8] = [
 
 pub static DARK: Theme = Theme {
     name: "Dark",
-    font_family: "Berkeley Mono",
 
     bg_primary: hex(0x1f1d1b, 1.0),
     bg_secondary: hex(0x151413, 1.0),
@@ -181,7 +222,6 @@ pub static DARK: Theme = Theme {
 
 pub static CATPPUCCIN_MOCHA: Theme = Theme {
     name: "Catppuccin Mocha",
-    font_family: "Berkeley Mono",
 
     bg_primary: hex(0x1e1e2e, 1.0),
     bg_secondary: hex(0x11111b, 1.0),
@@ -222,7 +262,6 @@ pub static CATPPUCCIN_MOCHA: Theme = Theme {
 
 pub static CATPPUCCIN_MACCHIATO: Theme = Theme {
     name: "Catppuccin Macchiato",
-    font_family: "Berkeley Mono",
 
     bg_primary: hex(0x24273a, 1.0),
     bg_secondary: hex(0x1e2030, 1.0),
@@ -263,7 +302,6 @@ pub static CATPPUCCIN_MACCHIATO: Theme = Theme {
 
 pub static CATPPUCCIN_LATTE: Theme = Theme {
     name: "Catppuccin Latte",
-    font_family: "Berkeley Mono",
 
     bg_primary: hex(0xeff1f5, 1.0),
     bg_secondary: hex(0xe6e9ef, 1.0),
@@ -304,7 +342,6 @@ pub static CATPPUCCIN_LATTE: Theme = Theme {
 
 pub static AYU_DARK: Theme = Theme {
     name: "Ayu Dark",
-    font_family: "Berkeley Mono",
 
     bg_primary: hex(0x0b0e14, 1.0),
     bg_secondary: hex(0x0f131a, 1.0),
@@ -345,7 +382,6 @@ pub static AYU_DARK: Theme = Theme {
 
 pub static EVERFOREST_DARK: Theme = Theme {
     name: "Everforest Dark",
-    font_family: "Berkeley Mono",
 
     bg_primary: hex(0x2d353b, 1.0),
     bg_secondary: hex(0x232a2e, 1.0),
@@ -386,7 +422,6 @@ pub static EVERFOREST_DARK: Theme = Theme {
 
 pub static EVERFOREST_LIGHT: Theme = Theme {
     name: "Everforest Light",
-    font_family: "Berkeley Mono",
 
     bg_primary: hex(0xfdf6e3, 1.0),
     bg_secondary: hex(0xf4f0d9, 1.0),
@@ -427,7 +462,6 @@ pub static EVERFOREST_LIGHT: Theme = Theme {
 
 pub static ROSE_PINE: Theme = Theme {
     name: "Rosé Pine",
-    font_family: "Berkeley Mono",
 
     bg_primary: hex(0x1f1d2e, 1.0),
     bg_secondary: hex(0x191724, 1.0),
@@ -468,7 +502,6 @@ pub static ROSE_PINE: Theme = Theme {
 
 pub static ROSE_PINE_MOON: Theme = Theme {
     name: "Rosé Pine Moon",
-    font_family: "Berkeley Mono",
 
     bg_primary: hex(0x2a273f, 1.0),
     bg_secondary: hex(0x232136, 1.0),
@@ -509,7 +542,6 @@ pub static ROSE_PINE_MOON: Theme = Theme {
 
 pub static ROSE_PINE_DAWN: Theme = Theme {
     name: "Rosé Pine Dawn",
-    font_family: "Berkeley Mono",
 
     bg_primary: hex(0xfffaf3, 1.0),
     bg_secondary: hex(0xfaf4ed, 1.0),
@@ -550,7 +582,6 @@ pub static ROSE_PINE_DAWN: Theme = Theme {
 
 pub static MAKING_SOFTWARE: Theme = Theme {
     name: "Making Software",
-    font_family: "Berkeley Mono",
 
     bg_primary: hex(0xf4f5f9, 1.0),
     bg_secondary: hex(0xeceef5, 1.0),
@@ -591,7 +622,6 @@ pub static MAKING_SOFTWARE: Theme = Theme {
 
 pub static DEPARTURE: Theme = Theme {
     name: "Departure",
-    font_family: "Berkeley Mono",
 
     bg_primary: hex(0x1a1815, 1.0),
     bg_secondary: hex(0x131210, 1.0),
@@ -630,15 +660,88 @@ pub static DEPARTURE: Theme = Theme {
     error_accent: hex(0xe05050, 1.0),
 };
 
-/// Load the embedded IBM Plex Mono fonts into gpui's text system.
+/// Family name of the font bundled into the binary. This is the guaranteed
+/// fallback — it's always registered, so it always resolves.
+pub const BUNDLED_FAMILY: &str = "IoskeleyMono Nerd Font";
+
+/// Family the [`FontConfig::Auto`] mode reaches for first, when the system has
+/// it installed. Falls back to [`BUNDLED_FAMILY`] otherwise.
+pub const PREFERRED_FAMILY: &str = "Berkeley Mono";
+
+/// Load the embedded fallback font into gpui's text system.
 ///
-/// Call once at startup before any view requests a font.
+/// Call once at startup before any view requests a font. These bytes ship in
+/// git as real data (not LFS), so the call can't fail the way the old
+/// LFS-tracked fonts did when the crate was consumed without LFS hydration.
 pub fn register_fonts(cx: &App) {
     cx.text_system()
         .add_fonts(vec![
-            Cow::Borrowed(include_bytes!("../assets/fonts/IBMPlexMono-Regular.ttf")),
-            Cow::Borrowed(include_bytes!("../assets/fonts/IBMPlexMono-Bold.ttf")),
-            Cow::Borrowed(include_bytes!("../assets/fonts/IBMPlexMono-Italic.ttf")),
+            Cow::Borrowed(include_bytes!(
+                "../assets/fonts/IoskeleyMonoNerdFont-Regular.ttf"
+            )),
+            Cow::Borrowed(include_bytes!(
+                "../assets/fonts/IoskeleyMonoNerdFont-Bold.ttf"
+            )),
+            Cow::Borrowed(include_bytes!(
+                "../assets/fonts/IoskeleyMonoNerdFont-Italic.ttf"
+            )),
         ])
         .expect("failed to register embedded fonts");
+}
+
+/// Resolve a [`FontConfig`] to a concrete family the text system can render.
+///
+/// Both modes degrade to [`BUNDLED_FAMILY`] when their preferred family isn't
+/// available, so the UI never ends up with an unresolvable font. Must be called
+/// after [`register_fonts`] so the bundled family appears in the system list.
+pub fn resolve_font_family(cx: &App, cfg: &PanelConfig) -> SharedString {
+    let available = cx.text_system().all_font_names();
+    let has = |name: &str| available.iter().any(|f| f == name);
+
+    match &cfg.font {
+        FontConfig::Auto => {
+            if has(PREFERRED_FAMILY) {
+                SharedString::new_static(PREFERRED_FAMILY)
+            } else {
+                SharedString::new_static(BUNDLED_FAMILY)
+            }
+        }
+        FontConfig::Family(name) => {
+            if has(name) {
+                SharedString::from(name.clone())
+            } else {
+                eprintln!("font '{name}' not found; using bundled {BUNDLED_FAMILY}");
+                SharedString::new_static(BUNDLED_FAMILY)
+            }
+        }
+    }
+}
+
+/// The resolved UI font plus the [`FontConfig`] it came from.
+///
+/// Installed as a [`Global`] at startup. The render tree reads
+/// [`font_family`] from here instead of from [`Theme`], so the font is
+/// independent of the active color palette.
+pub struct FontSettings {
+    pub family: SharedString,
+    pub config: PanelConfig,
+}
+
+impl Global for FontSettings {}
+
+/// The family the UI should render with. Cheap: clones a [`SharedString`].
+pub fn font_family(cx: &App) -> SharedString {
+    cx.global::<FontSettings>().family.clone()
+}
+
+/// Apply a new font choice: re-resolve, swap the global, and persist it so the
+/// choice survives a restart. The palette dismissal re-renders the root, which
+/// picks up the new family.
+pub fn set_font(cx: &mut App, font: FontConfig) {
+    let config = PanelConfig { font };
+    let family = resolve_font_family(cx, &config);
+    if let Err(e) = config::save(&config) {
+        eprintln!("save config: {e}");
+    }
+    cx.set_global(FontSettings { family, config });
 }

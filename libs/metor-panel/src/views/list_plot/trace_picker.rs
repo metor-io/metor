@@ -11,7 +11,7 @@ use gpui::{App, SharedString, Window};
 use metor_db::DB;
 use metor_proto::types::ComponentId;
 
-use crate::inspector::rows::{CommandRow, InspectorRow};
+use crate::inspector::rows::{CommandRow, HeaderRow, InspectorRow};
 use crate::inspector::trace_picker::ColorBasis;
 use crate::theme::theme;
 
@@ -73,50 +73,4 @@ fn list_vector_components(db: &DB) -> Vec<(ComponentId, String, usize)> {
     });
     out.sort_by(|a, b| a.1.cmp(&b.1));
     out
-}
-
-/// Read-only header row at the top of each wizard page. Mirrors the
-/// `HeaderRow` in `xy_plot::trace_picker` — a static label that
-/// disappears when the user types.
-struct HeaderRow {
-    text: SharedString,
-}
-
-impl HeaderRow {
-    fn new(text: impl Into<SharedString>) -> Self {
-        Self { text: text.into() }
-    }
-}
-
-impl InspectorRow for HeaderRow {
-    fn label(&self) -> &str {
-        &self.text
-    }
-
-    fn render_row(
-        &self,
-        row_ix: usize,
-        selected: bool,
-        _window: &mut gpui::Window,
-        cx: &mut App,
-    ) -> gpui::AnyElement {
-        use gpui::{IntoElement, ParentElement, Styled, div, px};
-        let theme = theme(cx);
-        crate::inspector::rows::row_base(row_ix, selected, cx)
-            .child(
-                div()
-                    .text_size(px(11.0))
-                    .text_color(theme.text_secondary)
-                    .child(self.text.clone()),
-            )
-            .into_any_element()
-    }
-
-    fn activate(
-        &mut self,
-        _window: &mut gpui::Window,
-        _cx: &mut App,
-    ) -> crate::inspector::rows::RowAction {
-        crate::inspector::rows::RowAction::Handled
-    }
 }

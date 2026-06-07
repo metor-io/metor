@@ -9,20 +9,21 @@
 //! trackers for added or removed traces, invalidates the view override
 //! when a reflected knob changes, and refreshes the cached title.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use gpui::{
-    Bounds, Context, Corners, Entity, EntityId, IntoElement, Pixels, Render, SharedString, Window,
-    canvas, prelude::*,
+    Bounds, Context, Corners, Entity, EntityId, Hsla, IntoElement, Pixels, Render, SharedString,
+    Window, canvas, prelude::*,
 };
 use metor_db::{Component, DB};
 use metor_proto::types::{ComponentId, Timestamp};
 
-use super::bounds::PlotBounds;
+use super::bounds::PlotView;
 use super::gpu::{AxisSource, LineDraw, PlotRenderState};
 use super::override_field::Override;
-use super::{NodeBoundsCache, Trace, expand_value_bounds};
+use super::{NodeBoundsCache, TimeFormat, Trace, YAxis, expand_value_bounds};
+use crate::views::plot_common::reconcile_trackers;
 use crate::views::time_series::time_range::TimeRangeBehavior;
 use crate::wait_for_component;
 
@@ -50,18 +51,28 @@ impl TraceTracking {
 
 /// Previous values of the reflected override knobs. Compared on each
 /// reconcile so an inspector edit can clear the interactive view override.
-#[derive(Clone, Copy, PartialEq)]
+#[derive(Clone, PartialEq)]
 struct OverrideSnapshot {
-    y_min: Option<f64>,
-    y_max: Option<f64>,
+    /// Per-axis `(min, max)` overrides, index-aligned with `LinePlot::axes`.
+    axes: smallvec::SmallVec<[(Option<f64>, Option<f64>); 2]>,
     x_range: TimeRangeBehavior,
 }
 
 impl OverrideSnapshot {
-    fn capture(lp: &LinePlot) -> Self {
+    fn capture(lp: &LinePlot, cx: &gpui::App) -> Self {
+        let axes = lp
+            .axes
+            .iter()
+            .map(|axis| {
+                let a = axis.read(cx);
+                (
+                    a.y_min_override.as_custom().copied(),
+                    a.y_max_override.as_custom().copied(),
+                )
+            })
+            .collect();
         Self {
-            y_min: lp.y_min_override.as_custom().copied(),
-            y_max: lp.y_max_override.as_custom().copied(),
+            axes,
             x_range: lp.x_range,
         }
     }
@@ -75,10 +86,16 @@ impl OverrideSnapshot {
 #[derive(facet::Facet)]
 pub struct LinePlot {
     pub traces: Vec<Entity<Trace>>,
+    /// Y axes, stacked left-to-right outward from the plot. Always holds at
+    /// least one (axis 0, the primary). Each trace names its axis by index.
+    pub axes: Vec<Entity<YAxis>>,
     pub x_range: TimeRangeBehavior,
-    pub y_min_override: Override<f64>,
-    pub y_max_override: Override<f64>,
+    pub x_time_format: TimeFormat,
     pub custom_title: Override<SharedString>,
+    /// Draw the control system's alarm limit lines for traces on this plot.
+    pub show_alarm_limits: bool,
+    /// Tint the plot background while a trace has an active alarm.
+    pub show_alarm_color: bool,
 
     #[facet(opaque)]
     db: Arc<DB>,
@@ -87,7 +104,7 @@ pub struct LinePlot {
     #[facet(opaque)]
     tasks: HashMap<EntityId, gpui::Task<()>>,
     #[facet(opaque)]
-    view_override: Option<PlotBounds>,
+    view_override: Option<PlotView>,
     #[facet(opaque)]
     last_overrides: OverrideSnapshot,
     #[facet(opaque)]
@@ -97,21 +114,27 @@ pub struct LinePlot {
 }
 
 impl LinePlot {
+    /// Upper bound on Y axes. Each axis reserves `Y_LABEL_WIDTH` of left
+    /// chrome; beyond this the plot area collapses on a typical panel.
+    pub const MAX_AXES: usize = 4;
+
     pub fn new(db: Arc<DB>, cx: &mut Context<Self>) -> Self {
         cx.observe_self(Self::reconcile).detach();
+        let primary_axis = cx.new(|_| YAxis::new("Y"));
         Self {
             traces: Vec::new(),
+            axes: vec![primary_axis],
             x_range: TimeRangeBehavior::default(),
-            y_min_override: Override::Auto,
-            y_max_override: Override::Auto,
+            x_time_format: TimeFormat::default(),
             custom_title: Override::Auto,
+            show_alarm_limits: true,
+            show_alarm_color: true,
             db,
             tracking: HashMap::new(),
             tasks: HashMap::new(),
             view_override: None,
             last_overrides: OverrideSnapshot {
-                y_min: None,
-                y_max: None,
+                axes: smallvec::SmallVec::new(),
                 x_range: TimeRangeBehavior::default(),
             },
             title_cache: "Plot".into(),
@@ -131,9 +154,11 @@ impl LinePlot {
     /// Pin the view to `view`, or clear the override with `None`.
     ///
     /// Called by pan/zoom handlers. Uses a bit-pattern compare to dodge
-    /// the lack of `PartialEq` on `f64`-containing [`PlotBounds`].
-    pub fn set_view_override(&mut self, view: Option<PlotBounds>, cx: &mut Context<Self>) {
-        if self.view_override.map(bounds_tuple) != view.map(bounds_tuple) {
+    /// the lack of `PartialEq` on `f64`-containing [`PlotView`].
+    pub fn set_view_override(&mut self, view: Option<PlotView>, cx: &mut Context<Self>) {
+        let changed = self.view_override.as_ref().map(PlotView::bits)
+            != view.as_ref().map(PlotView::bits);
+        if changed {
             self.view_override = view;
             cx.notify();
         }
@@ -149,24 +174,51 @@ impl LinePlot {
     /// drops trackers for removed traces, and resets the pan/zoom override
     /// when an inspector edit changes the reflected view knobs.
     fn reconcile(&mut self, cx: &mut Context<Self>) {
-        let current_ids: HashSet<EntityId> = self.traces.iter().map(|e| e.entity_id()).collect();
-        let had_tracking_keys: Vec<EntityId> = self.tracking.keys().copied().collect();
-        for id in had_tracking_keys {
-            if !current_ids.contains(&id) {
-                self.tracking.remove(&id);
-                self.tasks.remove(&id);
-            }
+        // Always keep at least the primary axis so traces have a home and
+        // the chrome has something to render, and never exceed the chrome
+        // budget (the generic "Add" doesn't gate, so cap here).
+        if self.axes.is_empty() {
+            let axis = cx.new(|_| YAxis::new("Y"));
+            self.axes.push(axis);
         }
+        self.axes.truncate(Self::MAX_AXES);
+        // Point each trace back at this plot (so the axis picker can list
+        // sibling axes) and clamp stale axis indices. Mutating the trace
+        // entity without notifying is safe: the plot doesn't observe its
+        // traces, so this can't re-enter reconcile.
+        let self_weak = cx.entity().downgrade();
+        let self_id = cx.entity().entity_id();
+        let axis_count = self.axes.len();
         for trace in &self.traces {
-            let id = trace.entity_id();
-            if let std::collections::hash_map::Entry::Vacant(slot) = self.tracking.entry(id) {
-                slot.insert(TraceTracking::new());
-                let task = Self::spawn_tracker(id, trace.clone(), self.db.clone(), cx);
-                self.tasks.insert(id, task);
-            }
+            trace.update(cx, |t, _| {
+                let linked = t
+                    .line_plot
+                    .as_ref()
+                    .and_then(|w| w.upgrade())
+                    .map(|e| e.entity_id());
+                if linked != Some(self_id) {
+                    t.line_plot = Some(self_weak.clone());
+                }
+                if t.axis_index >= axis_count {
+                    t.axis_index = 0;
+                }
+            });
         }
 
-        let snapshot = OverrideSnapshot::capture(self);
+        let db = self.db.clone();
+        reconcile_trackers(
+            &self.traces,
+            &mut self.tracking,
+            &mut self.tasks,
+            |id, trace| {
+                (
+                    TraceTracking::new(),
+                    Self::spawn_tracker(id, trace.clone(), db.clone(), cx),
+                )
+            },
+        );
+
+        let snapshot = OverrideSnapshot::capture(self, cx);
         if snapshot != self.last_overrides {
             self.view_override = None;
             self.last_overrides = snapshot;
@@ -178,23 +230,26 @@ impl LinePlot {
         };
     }
 
-    /// The bounds the renderer will use this frame.
+    /// The view the renderer will use this frame.
     ///
     /// Returns the interactive pan/zoom override when set; otherwise
-    /// auto-fits against the visible traces, then applies any
-    /// inspector-exposed bound overrides on top.
-    pub fn effective_view(&self, cx: &gpui::App) -> Option<PlotBounds> {
-        if let Some(v) = self.view_override {
-            return Some(v);
+    /// auto-fits the shared X range against every visible trace and each
+    /// axis's Y range against just the traces assigned to it, then applies
+    /// per-axis inspector overrides on top.
+    pub fn effective_view(&self, cx: &gpui::App) -> Option<PlotView> {
+        if let Some(v) = &self.view_override {
+            return Some(v.clone());
         }
+        let axis_count = self.axes.len().max(1);
         let mut start = f64::INFINITY;
         let mut end = f64::NEG_INFINITY;
-        let mut y_min = f64::INFINITY;
-        let mut y_max = f64::NEG_INFINITY;
         let mut any_time = false;
-        let mut any_y = false;
+        let mut y_min = vec![f64::INFINITY; axis_count];
+        let mut y_max = vec![f64::NEG_INFINITY; axis_count];
+        let mut any_y = vec![false; axis_count];
         for trace in &self.traces {
-            if !trace.read(cx).visible {
+            let cfg = trace.read(cx);
+            if !cfg.visible {
                 continue;
             }
             let Some(tracking) = self.tracking.get(&trace.entity_id()) else {
@@ -211,10 +266,11 @@ impl LinePlot {
                 end = end.max(l.timestamp().0 as f64);
                 any_time = true;
             }
+            let ai = cfg.axis_index.min(axis_count - 1);
             if let Some((lo, hi)) = tracking.y_bounds {
-                y_min = y_min.min(lo);
-                y_max = y_max.max(hi);
-                any_y = true;
+                y_min[ai] = y_min[ai].min(lo);
+                y_max[ai] = y_max[ai].max(hi);
+                any_y[ai] = true;
             }
         }
         if !any_time || start >= end {
@@ -223,10 +279,44 @@ impl LinePlot {
         let range = self
             .x_range
             .calculate_range(Timestamp(start as i64), Timestamp(end as i64));
-        let (auto_min, auto_max) = if any_y { (y_min, y_max) } else { (0.0, 1.0) };
-        let min_y = self.y_min_override.as_custom().copied().unwrap_or(auto_min);
-        let max_y = self.y_max_override.as_custom().copied().unwrap_or(auto_max);
-        Some(PlotBounds::new(range.start.0 as f64, min_y, range.end.0 as f64, max_y).normalize())
+        let (min_x, mut max_x) = (range.start.0 as f64, range.end.0 as f64);
+        if min_x >= max_x {
+            max_x = min_x + 1.0;
+        }
+        let mut axes: smallvec::SmallVec<[(f64, f64); 2]> = smallvec::SmallVec::new();
+        for (i, axis) in self.axes.iter().enumerate() {
+            let a = axis.read(cx);
+            let (auto_min, auto_max) = if any_y[i] {
+                (y_min[i], y_max[i])
+            } else {
+                (0.0, 1.0)
+            };
+            let lo = a.y_min_override.as_custom().copied().unwrap_or(auto_min);
+            let mut hi = a.y_max_override.as_custom().copied().unwrap_or(auto_max);
+            if lo >= hi {
+                hi = lo + 1.0;
+            }
+            axes.push((lo, hi));
+        }
+        Some(PlotView {
+            x: (min_x, max_x),
+            axes,
+        })
+    }
+
+    /// Resolved chrome color per axis, index-aligned with `axes`.
+    ///
+    /// `Some` for an explicit `Custom` color; `None` for `Auto`, where the
+    /// caller falls back to the neutral theme color. Axes are neutral by
+    /// default — color is opt-in.
+    pub fn axis_colors(&self, cx: &gpui::App) -> smallvec::SmallVec<[Option<Hsla>; 2]> {
+        self.axes
+            .iter()
+            .map(|axis| match &axis.read(cx).color {
+                Override::Custom(c) => Some(*c),
+                Override::Auto => None,
+            })
+            .collect()
     }
 
     /// Earliest sample timestamp across resolved traces.
@@ -429,6 +519,7 @@ impl Render for LinePlot {
                                     }
                                     let tracking = lp.tracking.get(&trace.entity_id())?;
                                     let component = tracking.component.as_ref()?;
+                                    let axis = view.axis_bounds(config.axis_index);
                                     Some(LineDraw {
                                         x: AxisSource::Timestamps,
                                         y: AxisSource::Element {
@@ -436,15 +527,20 @@ impl Render for LinePlot {
                                             component,
                                             element_index: config.element_index,
                                         },
+                                        y_min: axis.min_y,
+                                        y_max: axis.max_y,
                                         style: config.style,
                                         color: config.color,
                                         stroke_width: config.stroke_width,
                                     })
                                 })
                                 .collect();
+                            // X data + a 0..1 Y placeholder; each trace's Y is
+                            // normalized per axis in the materializer.
+                            let gpu_view = view.x_bounds();
                             if !draws.is_empty()
                                 && let Some(handle) =
-                                    lp.gpu_state.render(cx, bounds, scale_factor, view, &draws)
+                                    lp.gpu_state.render(cx, bounds, scale_factor, gpu_view, &draws)
                             {
                                 handle.spawn_and_set(cx, line_plot_gpu_state);
                             }
@@ -472,17 +568,6 @@ impl Render for LinePlot {
 
 fn line_plot_gpu_state(lp: &mut LinePlot) -> &mut PlotRenderState {
     &mut lp.gpu_state
-}
-
-/// Convert [`PlotBounds`] to a bit-pattern tuple so `PartialEq` fields can
-/// compare bounds despite the `f64` contents.
-fn bounds_tuple(b: PlotBounds) -> (u64, u64, u64, u64) {
-    (
-        b.min_x.to_bits(),
-        b.min_y.to_bits(),
-        b.max_x.to_bits(),
-        b.max_y.to_bits(),
-    )
 }
 
 /// Derive a plot title from the trace list.

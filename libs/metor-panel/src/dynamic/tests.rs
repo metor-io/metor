@@ -38,14 +38,6 @@ fn waveform_f64(
     )
 }
 
-#[allow(dead_code)]
-fn random_f64(
-    clock: std::sync::Arc<dyn crate::dynamic::DynamicNode>,
-    seed: u64,
-) -> Result<std::sync::Arc<dyn crate::dynamic::DynamicNode>, crate::dynamic::BuildError> {
-    ops::generators::random(clock, seed, PrimType::F64, SmallVec::new())
-}
-
 /// Pull `count` f64 samples (with timestamps) off a node. Bails after a
 /// generous timeout so a stuck task doesn't hang the test runner.
 async fn drain_f64(

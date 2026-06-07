@@ -11,6 +11,9 @@ use metor_proto::types::{ComponentId, PrimType, Timestamp};
 #[allow(unused_imports)]
 use crate::inspect;
 
+mod axis;
+pub use axis::YAxis;
+
 mod bounds;
 pub use bounds::*;
 
@@ -134,8 +137,12 @@ fn segment_round(dur: hifitime::Duration) -> hifitime::Duration {
 }
 
 /// Iterator of X-axis tick values (microseconds) aligned to
-/// human-readable offsets from `data_start`.
-fn x_ticks(view: &PlotBounds, target_count: usize, data_start: f64) -> impl Iterator<Item = i64> {
+/// human-readable offsets from `anchor`.
+///
+/// `anchor` is the earliest sample for relative labels (so ticks don't
+/// crawl during pan) and Unix epoch `0` for absolute labels (so ticks land
+/// on wall-clock boundaries like `:00`/`:30`).
+fn x_ticks(view: &PlotBounds, target_count: usize, anchor: f64) -> impl Iterator<Item = i64> {
     let range = view.width();
     let target = (target_count as f64).max(1.0);
     let raw_step_us = range / target;
@@ -144,7 +151,7 @@ fn x_ticks(view: &PlotBounds, target_count: usize, data_start: f64) -> impl Iter
 
     let t_min = view.min_x as i64;
     let t_max = view.max_x as i64;
-    let ds = data_start as i64;
+    let ds = anchor as i64;
     let valid = range > 0.0 && step_i > 0;
 
     // Ticks are snapped to multiples of `step_i` measured from `data_start`
@@ -181,14 +188,51 @@ fn x_ticks(view: &PlotBounds, target_count: usize, data_start: f64) -> impl Iter
     })
 }
 
-/// Render a timestamp relative to `ref_us` as `"0"`, `"30 s"`, `"1 min 30 s"`, etc.
-fn format_time_label(t_us: i64, ref_us: i64) -> String {
-    let offset_us = t_us - ref_us;
-    if offset_us == 0 {
-        return "0".to_string();
+/// Anchor passed to [`x_ticks`]: the earliest sample for relative labels,
+/// Unix epoch `0` for absolute ones (so ticks land on wall-clock boundaries).
+fn x_tick_anchor(fmt: TimeFormat, data_start: f64) -> f64 {
+    match fmt {
+        TimeFormat::Relative => data_start,
+        TimeFormat::Utc | TimeFormat::Local => 0.0,
     }
-    let dur = hifitime::Duration::from_microseconds(offset_us as f64);
-    format!("{}", dur)
+}
+
+/// Render one X-axis tick label.
+///
+/// `Relative` shows the offset from `ref_us` (`"0"`, `"1 min 30 s"`).
+/// `Utc`/`Local` render absolute wall-clock time; `span_us` (the visible
+/// range) picks the granularity — date is folded in once the window spans
+/// more than a day. Falls back to the relative label if the timestamp is
+/// outside jiff's representable range.
+fn format_time_label(t_us: i64, ref_us: i64, fmt: TimeFormat, span_us: f64) -> String {
+    let relative = || {
+        let offset_us = t_us - ref_us;
+        if offset_us == 0 {
+            "0".to_string()
+        } else {
+            format!("{}", hifitime::Duration::from_microseconds(offset_us as f64))
+        }
+    };
+    match fmt {
+        TimeFormat::Relative => relative(),
+        TimeFormat::Utc | TimeFormat::Local => {
+            let Ok(ts) = jiff::Timestamp::from_microsecond(t_us) else {
+                return relative();
+            };
+            let pattern = if span_us > 86_400.0 * 1e6 {
+                "%m-%d %H:%M"
+            } else {
+                "%H:%M:%S"
+            };
+            match fmt {
+                TimeFormat::Local => ts
+                    .to_zoned(jiff::tz::TimeZone::system())
+                    .strftime(pattern)
+                    .to_string(),
+                _ => ts.strftime(pattern).to_string(),
+            }
+        }
+    }
 }
 
 pub(crate) fn format_value_label(v: f64) -> String {
@@ -212,18 +256,35 @@ pub(crate) const X_LABEL_HEIGHT: f32 = 10.0;
 pub(crate) const PADDING: f32 = 8.0;
 pub(crate) const LABEL_FONT_SIZE: f32 = 11.0;
 
-#[derive(Clone, Copy, PartialEq)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) enum AxisZone {
     Plot,
     XAxis,
-    YAxis,
+    /// Pointer is over the Y-axis column for this axis index. Columns stack
+    /// outward to the left: index 0 sits adjacent to the plot, higher indices
+    /// further left.
+    YAxis(usize),
 }
 
-pub(crate) fn axis_zone(pos: Point<Pixels>, plot_area: Bounds<Pixels>) -> AxisZone {
+/// Total left chrome width for `axis_count` stacked Y-axis columns plus the
+/// inner padding. Drives both [`plot_area`] and the overlaid child insets.
+pub(crate) fn left_margin(axis_count: usize) -> f32 {
+    axis_count.max(1) as f32 * Y_LABEL_WIDTH + PADDING
+}
+
+pub(crate) fn axis_zone(
+    pos: Point<Pixels>,
+    plot_area: Bounds<Pixels>,
+    axis_count: usize,
+) -> AxisZone {
     let below_plot = pos.y > plot_area.origin.y + plot_area.size.height;
     let left_of_plot = pos.x < plot_area.origin.x;
     if left_of_plot {
-        AxisZone::YAxis
+        // Columns stack outward: index = how many Y_LABEL_WIDTH steps left of
+        // the plot edge the pointer sits.
+        let dist = f32::from(plot_area.origin.x - pos.x).max(0.0);
+        let idx = (dist / Y_LABEL_WIDTH) as usize;
+        AxisZone::YAxis(idx.min(axis_count.saturating_sub(1)))
     } else if below_plot {
         AxisZone::XAxis
     } else {
@@ -231,14 +292,12 @@ pub(crate) fn axis_zone(pos: Point<Pixels>, plot_area: Bounds<Pixels>) -> AxisZo
     }
 }
 
-pub(crate) fn plot_area(outer: Bounds<Pixels>) -> Bounds<Pixels> {
+pub(crate) fn plot_area(outer: Bounds<Pixels>, axis_count: usize) -> Bounds<Pixels> {
+    let left = left_margin(axis_count);
     Bounds {
-        origin: point(
-            outer.origin.x + px(Y_LABEL_WIDTH + PADDING),
-            outer.origin.y + px(PADDING),
-        ),
+        origin: point(outer.origin.x + px(left), outer.origin.y + px(PADDING)),
         size: gpui::Size {
-            width: (outer.size.width - px(Y_LABEL_WIDTH + PADDING * 2.0)).max(px(1.0)),
+            width: (outer.size.width - px(left + PADDING)).max(px(1.0)),
             height: (outer.size.height - px(X_LABEL_HEIGHT + PADDING * 2.0)).max(px(1.0)),
         },
     }
@@ -432,18 +491,80 @@ fn scan_min_max<T: gpu::PlotValue>(
 /// Paint gridlines and the zero line behind the GPU-rendered line plot.
 ///
 /// Called before [`LinePlot`] paints so the grid sits under the series.
+/// Highest-severity active-alarm tint across the plot's visible traces, if any.
+/// `None` when no alarm is active or the alarm store isn't initialized.
+fn alarm_plot_tint(lp: &LinePlot, cx: &gpui::App) -> Option<Hsla> {
+    if !lp.show_alarm_color {
+        return None;
+    }
+    let store = crate::alarms::try_global(cx)?;
+    let store = store.read(cx);
+    let state = store.state();
+    let mut worst: Option<usize> = None;
+    for trace in lp.traces() {
+        let cfg = trace.read(cx);
+        if !cfg.visible {
+            continue;
+        }
+        if let Some(severity) = state.active_severity_for(cfg.component_id, cfg.element_index) {
+            let idx = crate::alarms::severity_index(severity);
+            worst = Some(worst.map_or(idx, |w| w.max(idx)));
+        }
+    }
+    worst.map(|idx| crate::theme::theme(cx).alarm_tint(idx))
+}
+
+/// Display limit lines `(axis_index, value, color, label)` declared for the plot's
+/// visible traces by the control system's alarm definitions.
+fn alarm_limit_lines(lp: &LinePlot, cx: &gpui::App) -> Vec<(usize, f64, Hsla, SharedString)> {
+    if !lp.show_alarm_limits {
+        return Vec::new();
+    }
+    let Some(store) = crate::alarms::try_global(cx) else {
+        return Vec::new();
+    };
+    let store = store.read(cx);
+    let state = store.state();
+    let theme = crate::theme::theme(cx);
+    let mut lines = Vec::new();
+    for trace in lp.traces() {
+        let cfg = trace.read(cx);
+        if !cfg.visible {
+            continue;
+        }
+        for limit in state.limits_for(cfg.component_id, cfg.element_index) {
+            let idx = crate::alarms::severity_index(limit.severity);
+            let label = limit.label.map(SharedString::from).unwrap_or_default();
+            lines.push((cfg.axis_index, limit.value, theme.alarm_color(idx), label));
+        }
+    }
+    lines
+}
+
 fn paint_underlay(
     outer_bounds: Bounds<Pixels>,
-    view: PlotBounds,
+    view: &PlotView,
     data_start: f64,
+    fmt: TimeFormat,
+    tint: Option<Hsla>,
     window: &mut Window,
     cx: &mut gpui::App,
 ) {
-    let pb = plot_area(outer_bounds);
+    let pb = plot_area(outer_bounds, view.axis_count());
     let theme = crate::theme::theme(cx);
 
-    for tick in value_ticks(view.min_y, view.max_y, 5) {
-        let y = view.to_screen(pb, view.min_x, tick).y;
+    // Out-of-bounds tint: a wash over the plot area when a visible trace has an
+    // active alarm. Painted before the gridlines so they stay legible on top.
+    if let Some(tint) = tint {
+        window.paint_quad(gpui::fill(pb, tint));
+    }
+    let anchor = x_tick_anchor(fmt, data_start);
+    // Horizontal gridlines and the zero line track the primary axis only;
+    // secondary axes would draw conflicting lines across the same plot.
+    let primary = view.axis_bounds(0);
+
+    for tick in value_ticks(primary.min_y, primary.max_y, 5) {
+        let y = primary.to_screen(pb, primary.min_x, tick).y;
         if y < pb.origin.y || y > pb.origin.y + pb.size.height {
             continue;
         }
@@ -454,8 +575,8 @@ fn paint_underlay(
             window.paint_path(path, theme.grid_color);
         }
     }
-    for tick in x_ticks(&view, 5, data_start) {
-        let x = view.to_screen(pb, tick as f64, view.min_y).x;
+    for tick in x_ticks(&primary, 5, anchor) {
+        let x = primary.to_screen(pb, tick as f64, primary.min_y).x;
         if x < pb.origin.x || x > pb.origin.x + pb.size.width {
             continue;
         }
@@ -467,8 +588,8 @@ fn paint_underlay(
         }
     }
 
-    if view.min_y < 0.0 && view.max_y > 0.0 {
-        let zero_y = view.to_screen(pb, view.min_x, 0.0).y;
+    if primary.min_y < 0.0 && primary.max_y > 0.0 {
+        let zero_y = primary.to_screen(pb, primary.min_x, 0.0).y;
         let mut zp = PathBuilder::stroke(px(1.0));
         zp.move_to(point(pb.origin.x, zero_y));
         zp.line_to(point(pb.origin.x + pb.size.width, zero_y));
@@ -482,34 +603,35 @@ fn paint_underlay(
 ///
 /// Renders the semi-transparent axis fills (which mask sub-pixel GPU-frame
 /// bleeds into the chrome), tick labels, and the L-shaped axes.
+#[allow(clippy::too_many_arguments)]
 fn paint_overlay(
     outer_bounds: Bounds<Pixels>,
-    view: PlotBounds,
+    view: &PlotView,
+    axis_colors: &[Option<Hsla>],
+    axis_markers: &[(usize, f64, Hsla)],
+    limit_lines: &[(usize, f64, Hsla, SharedString)],
     data_start: f64,
+    fmt: TimeFormat,
     window: &mut Window,
     cx: &mut gpui::App,
 ) {
-    let pb = plot_area(outer_bounds);
+    let axis_count = view.axis_count();
+    let pb = plot_area(outer_bounds, axis_count);
     let theme = crate::theme::theme(cx);
     let label_font_size = px(LABEL_FONT_SIZE);
     let text_style = window.text_style();
     let font = text_style.font();
 
-    let make_run = |text: &str| TextRun {
+    let make_run = |text: &str, color: Hsla| TextRun {
         len: text.len(),
         font: font.clone(),
-        color: theme.text_secondary,
+        color,
         background_color: None,
         underline: None,
         strikethrough: None,
     };
 
-    // Semi-transparent axis fills mask any GPU-frame edge that strays into
-    // the chrome strips.
-    let axis_bg = Hsla {
-        a: 0.5,
-        ..theme.bg_secondary
-    };
+    let axis_bg = theme.plot_chrome_bg();
     let y_axis_bg = Bounds {
         origin: outer_bounds.origin,
         size: gpui::Size {
@@ -528,54 +650,132 @@ fn paint_overlay(
     };
     window.paint_quad(gpui::fill(x_axis_bg, axis_bg));
 
-    let t_min_i = data_start as i64;
-    for tick in value_ticks(view.min_y, view.max_y, 5) {
-        let y = view.to_screen(pb, view.min_x, tick).y;
-        if y < pb.origin.y || y > pb.origin.y + pb.size.height {
-            continue;
+    // Axes are neutral unless given an explicit color.
+    let label_color =
+        |i: usize| -> Hsla { axis_colors.get(i).copied().flatten().unwrap_or(theme.text_secondary) };
+    let rule_color =
+        |i: usize| -> Hsla { axis_colors.get(i).copied().flatten().unwrap_or(theme.axis_color) };
+
+    // Per-axis Y tick labels, right-aligned within each stacked column.
+    for i in 0..axis_count {
+        let ab = view.axis_bounds(i);
+        let color = label_color(i);
+        // Right edge of column `i` (column 0 abuts the plot, higher indices
+        // step left by Y_LABEL_WIDTH each).
+        let col_right = pb.origin.x - px(i as f32 * Y_LABEL_WIDTH);
+        for tick in value_ticks(ab.min_y, ab.max_y, 5) {
+            let y = ab.to_screen(pb, ab.min_x, tick).y;
+            if y < pb.origin.y || y > pb.origin.y + pb.size.height {
+                continue;
+            }
+            let text = format_value_label(tick);
+            let run = make_run(&text, color);
+            let shaped = window.text_system().shape_line(
+                SharedString::from(text),
+                label_font_size,
+                &[run],
+                None,
+            );
+            let origin = point(col_right - shaped.width - px(4.0), y - label_font_size / 2.0);
+            let _ = shaped.paint(origin, label_font_size, window, cx);
         }
-        let text = format_value_label(tick);
-        let run = make_run(&text);
-        let shaped = window.text_system().shape_line(
-            SharedString::from(text),
-            label_font_size,
-            &[run],
-            None,
-        );
-        let origin = point(
-            pb.origin.x - shaped.width - px(4.0),
-            y - label_font_size / 2.0,
-        );
-        let _ = shaped.paint(origin, label_font_size, window, cx);
     }
-    for tick in x_ticks(&view, 5, data_start) {
-        let x = view.to_screen(pb, tick as f64, view.min_y).x;
+
+    // X tick labels track the primary axis's X range.
+    let primary = view.axis_bounds(0);
+    let t_min_i = data_start as i64;
+    let anchor = x_tick_anchor(fmt, data_start);
+    let span_us = primary.width();
+    for tick in x_ticks(&primary, 5, anchor) {
+        let x = primary.to_screen(pb, tick as f64, primary.min_y).x;
         if x < pb.origin.x || x > pb.origin.x + pb.size.width {
             continue;
         }
-        let text = format_time_label(tick, t_min_i);
-        let run = make_run(&text);
+        let text = format_time_label(tick, t_min_i, fmt, span_us);
+        let run = make_run(&text, theme.text_secondary);
         let shaped = window.text_system().shape_line(
             SharedString::from(text),
             label_font_size,
             &[run],
             None,
         );
-        let origin = point(
-            x - shaped.width / 2.0,
-            pb.origin.y + pb.size.height + px(4.0),
-        );
+        let origin = point(x - shaped.width / 2.0, pb.origin.y + pb.size.height + px(4.0));
         let _ = shaped.paint(origin, label_font_size, window, cx);
     }
 
-    let mut axes = PathBuilder::stroke(px(1.0));
-    axes.move_to(point(pb.origin.x, pb.origin.y));
-    axes.line_to(point(pb.origin.x, pb.origin.y + pb.size.height));
-    axes.line_to(point(
+    // One vertical rule per axis at its column's right edge, colored to
+    // match; plus the shared horizontal X rule along the bottom.
+    for i in 0..axis_count {
+        let col_right = pb.origin.x - px(i as f32 * Y_LABEL_WIDTH);
+        let mut rule = PathBuilder::stroke(px(1.0));
+        rule.move_to(point(col_right, pb.origin.y));
+        rule.line_to(point(col_right, pb.origin.y + pb.size.height));
+        if let Ok(path) = rule.build() {
+            window.paint_path(path, rule_color(i));
+        }
+    }
+
+    // In multi-axis mode, mark each trace's axis membership with a small
+    // triangle pointing into the plot at the line's left-edge value, drawn
+    // in that axis's coordinate frame so it sits where the line begins.
+    if axis_count > 1 {
+        let tip_w = px(6.0);
+        let half_h = px(4.0);
+        for &(axis_i, value, color) in axis_markers {
+            let ab = view.axis_bounds(axis_i);
+            let y = ab.to_screen(pb, ab.min_x, value).y;
+            if y < pb.origin.y || y > pb.origin.y + pb.size.height {
+                continue;
+            }
+            let tip_x = pb.origin.x - px(axis_i as f32 * Y_LABEL_WIDTH);
+            let base_x = tip_x - tip_w;
+            let mut tri = PathBuilder::fill();
+            tri.move_to(point(tip_x, y));
+            tri.line_to(point(base_x, y - half_h));
+            tri.line_to(point(base_x, y + half_h));
+            tri.line_to(point(tip_x, y));
+            if let Ok(path) = tri.build() {
+                window.paint_path(path, color);
+            }
+        }
+    }
+    // Alarm limit lines: horizontal rules at each declared threshold, drawn in the
+    // owning axis's coordinate frame, with the threshold label at the right edge.
+    for (axis_i, value, color, label) in limit_lines {
+        let ab = view.axis_bounds(*axis_i);
+        let y = ab.to_screen(pb, ab.min_x, *value).y;
+        if y < pb.origin.y || y > pb.origin.y + pb.size.height {
+            continue;
+        }
+        let mut line = PathBuilder::stroke(px(1.0));
+        line.move_to(point(pb.origin.x, y));
+        line.line_to(point(pb.origin.x + pb.size.width, y));
+        if let Ok(path) = line.build() {
+            window.paint_path(path, *color);
+        }
+        if !label.is_empty() {
+            let run = make_run(label.as_ref(), *color);
+            let shaped = window.text_system().shape_line(
+                label.clone(),
+                label_font_size,
+                &[run],
+                None,
+            );
+            let origin = point(
+                pb.origin.x + pb.size.width - shaped.width - px(4.0),
+                y - label_font_size - px(2.0),
+            );
+            let _ = shaped.paint(origin, label_font_size, window, cx);
+        }
+    }
+
+    let mut x_rule = PathBuilder::stroke(px(1.0));
+    x_rule.move_to(point(pb.origin.x, pb.origin.y + pb.size.height));
+    x_rule.line_to(point(
         pb.origin.x + pb.size.width,
         pb.origin.y + pb.size.height,
     ));
-    if let Ok(path) = axes.build() {
+    if let Ok(path) = x_rule.build() {
         window.paint_path(path, theme.axis_color);
     }
 }
@@ -590,14 +790,15 @@ struct CursorPaint {
     /// `true` for the cursor currently being dragged out. Drives the bright
     /// selection-color stroke; persistent cursors render muted.
     active: bool,
-    /// `(value, color)` per visible trace at `t_start` and `t_end` so the
-    /// overlay can drop a dot marker on each line.
+    /// `(norm_start, norm_end, color)` per visible trace: the trace's value
+    /// at `t_start`/`t_end` already normalized to `[0,1]` against its axis,
+    /// so the overlay drops dot markers using a fixed `0..1` Y mapping.
     trace_markers: Vec<(f64, f64, Hsla)>,
 }
 
 fn paint_cursors(
     outer_bounds: Bounds<Pixels>,
-    view: PlotBounds,
+    view: &PlotView,
     cursors: &[CursorPaint],
     window: &mut Window,
     cx: &mut gpui::App,
@@ -605,7 +806,10 @@ fn paint_cursors(
     if cursors.is_empty() {
         return;
     }
-    let pb = plot_area(outer_bounds);
+    let pb = plot_area(outer_bounds, view.axis_count());
+    // Lines use X only; markers carry normalized [0,1] Y, so a 0..1 Y view
+    // maps them straight to screen.
+    let view = view.x_bounds();
     let theme = crate::theme::theme(cx);
 
     for cursor in cursors {
@@ -712,6 +916,22 @@ impl PlotStyle {
     }
 }
 
+/// How the X axis renders timestamps.
+///
+/// `Relative` (the default) labels ticks as offsets from the earliest
+/// sample (`"0"`, `"1 min 30 s"`). The absolute variants render wall-clock
+/// time so events can be read against real-world clocks; `Utc` uses UTC and
+/// `Local` the machine's timezone. Data positions are unchanged — only the
+/// tick labels and their anchoring differ.
+#[derive(Clone, Copy, Default, PartialEq, Eq, Debug, facet::Facet)]
+#[repr(u8)]
+pub enum TimeFormat {
+    #[default]
+    Relative,
+    Utc,
+    Local,
+}
+
 /// One series on a plot: a single element of a component with its own
 /// color, style, and label.
 #[derive(Clone, facet::Facet)]
@@ -726,6 +946,15 @@ pub struct Trace {
     pub visible: bool,
     pub label: SharedString,
     pub stroke_width: f32,
+    /// Index into the owning plot's `axes`. Edited via the axis picker, not
+    /// reflected directly. Clamped to a valid axis by the plot's reconcile.
+    #[facet(skip)]
+    pub axis_index: usize,
+    /// Back-reference to the owning plot, set by [`LinePlot::reconcile`].
+    /// Lets the per-trace axis picker enumerate sibling axes (mirrors
+    /// `MeasurementCursor`'s plot handle). `None` until reconcile runs.
+    #[facet(opaque)]
+    pub line_plot: Option<gpui::WeakEntity<LinePlot>>,
 }
 
 impl Trace {
@@ -738,6 +967,8 @@ impl Trace {
             visible: true,
             label: SharedString::new_static(""),
             stroke_width: 1.5,
+            axis_index: 0,
+            line_plot: None,
         }
     }
 }
@@ -749,7 +980,7 @@ impl Trace {
 /// stable while the user is reaching for an endpoint.
 struct CursorDrag {
     cursor: Entity<MeasurementCursor>,
-    start_view: PlotBounds,
+    start_view: PlotView,
 }
 
 /// Interactive wrapper around a [`LinePlot`] that adds axes, legend, and
@@ -761,7 +992,7 @@ struct CursorDrag {
 pub struct TimeSeriesPlot {
     line_plot: Entity<LinePlot>,
     drag_start: Option<Point<Pixels>>,
-    drag_start_view: Option<PlotBounds>,
+    drag_start_view: Option<PlotView>,
     drag_zone: AxisZone,
     last_plot_area: Option<Bounds<Pixels>>,
     cursors: smallvec::SmallVec<[Entity<MeasurementCursor>; 2]>,
@@ -805,6 +1036,8 @@ pub fn traces_for_component(
                 visible: true,
                 label: SharedString::from(label),
                 stroke_width: 1.5,
+                axis_index: 0,
+                line_plot: None,
             }
         })
         .collect()
@@ -820,6 +1053,11 @@ impl TimeSeriesPlot {
         // Legend and chrome live on this entity; listen to the inner
         // LinePlot so trace toggles and inspector edits trigger a repaint.
         cx.observe(&line_plot, |_, _, cx| cx.notify()).detach();
+        // Repaint when alarms change so limit lines and out-of-bounds tinting
+        // track the control system's broadcast.
+        if let Some(store) = crate::alarms::try_global(cx) {
+            cx.observe(&store, |_, _, cx| cx.notify()).detach();
+        }
         Self {
             line_plot,
             drag_start: None,
@@ -1035,7 +1273,7 @@ impl TimeSeriesPlot {
     }
 
     /// Current effective view (auto-fit unless the user has overridden it).
-    pub fn view(&self, cx: &gpui::App) -> Option<PlotBounds> {
+    pub fn view(&self, cx: &gpui::App) -> Option<PlotView> {
         self.line_plot.read(cx).effective_view(cx)
     }
 
@@ -1051,13 +1289,14 @@ impl TimeSeriesPlot {
         let Some(pa) = self.last_plot_area else {
             return;
         };
-        if axis_zone(position, pa) != AxisZone::Plot {
+        let axis_count = self.line_plot.read(cx).axes.len();
+        if axis_zone(position, pa, axis_count) != AxisZone::Plot {
             return;
         }
         let Some(view) = self.line_plot.read(cx).effective_view(cx) else {
             return;
         };
-        let Some(hit) = cursor::cursor_at(&self.cursors, position.x, pa, view, cx) else {
+        let Some(hit) = cursor::cursor_at(&self.cursors, position.x, pa, view.x_bounds(), cx) else {
             return;
         };
         let entity = hit.into_any();
@@ -1078,7 +1317,8 @@ impl TimeSeriesPlot {
         let Some(pa) = self.last_plot_area else {
             return;
         };
-        if axis_zone(event.position, pa) != AxisZone::Plot {
+        let axis_count = self.line_plot.read(cx).axes.len();
+        if axis_zone(event.position, pa, axis_count) != AxisZone::Plot {
             return;
         }
         let Some(view) = self.line_plot.read(cx).effective_view(cx) else {
@@ -1087,15 +1327,15 @@ impl TimeSeriesPlot {
 
         // Pin bounds for the duration of the drag (mirrors left-drag pan).
         self.line_plot
-            .update(cx, |lp, cx| lp.set_view_override(Some(view), cx));
+            .update(cx, |lp, cx| lp.set_view_override(Some(view.clone()), cx));
 
-        let x_data = cursor::pixel_to_data_x(event.position.x, pa, view);
+        let x_data = cursor::pixel_to_data_x(event.position.x, pa, view.x_bounds());
         let focused = cursor::focused_trace_at(
             self.line_plot.read(cx),
             Timestamp(x_data as i64),
             event.position.y,
             pa,
-            view,
+            &view,
             cx,
         );
         let snapped = cursor::snap_x_to_sample(self.line_plot.read(cx), focused, x_data, cx);
@@ -1122,9 +1362,9 @@ impl TimeSeriesPlot {
         let (Some(pa), Some(drag)) = (self.last_plot_area, self.cursor_drag.as_ref()) else {
             return;
         };
-        let start_view = drag.start_view;
+        let start_view = drag.start_view.clone();
         let cursor_entity = drag.cursor.clone();
-        let x_data = cursor::pixel_to_data_x(event.position.x, pa, start_view);
+        let x_data = cursor::pixel_to_data_x(event.position.x, pa, start_view.x_bounds());
         let focused = cursor_entity.read(cx).focused_trace;
         let snapped = cursor::snap_x_to_sample(self.line_plot.read(cx), focused, x_data, cx);
         cursor_entity.update(cx, |c, cx| {
@@ -1169,8 +1409,13 @@ impl TimeSeriesPlot {
     fn reset_view(&mut self, cx: &mut Context<Self>) {
         self.line_plot.update(cx, |lp, cx| {
             lp.x_range = TimeRangeBehavior::default();
-            lp.y_min_override = Override::Auto;
-            lp.y_max_override = Override::Auto;
+            for axis in lp.axes.clone() {
+                axis.update(cx, |a, cx| {
+                    a.y_min_override = Override::Auto;
+                    a.y_max_override = Override::Auto;
+                    cx.notify();
+                });
+            }
             lp.set_view_override(None, cx);
             cx.notify();
         });
@@ -1182,6 +1427,9 @@ impl Render for TimeSeriesPlot {
         let theme = crate::theme::theme(cx);
         let trace_entities: Vec<Entity<Trace>> = self.line_plot.read(cx).traces().to_vec();
         let show_legend = trace_entities.len() >= 2;
+        // Drives the left chrome width: one Y_LABEL_WIDTH column per axis.
+        let axis_count = self.line_plot.read(cx).axes.len();
+        let chrome_left = px(left_margin(axis_count));
 
         let underlay_lp = self.line_plot.clone();
         let overlay_lp = self.line_plot.clone();
@@ -1209,9 +1457,10 @@ impl Render for TimeSeriesPlot {
                         this.start_cursor_drag(event, window, cx);
                         return;
                     }
+                    let axis_count = this.line_plot.read(cx).axes.len();
                     let zone = this
                         .last_plot_area
-                        .map(|pa| axis_zone(event.position, pa))
+                        .map(|pa| axis_zone(event.position, pa, axis_count))
                         .unwrap_or(AxisZone::Plot);
                     this.drag_start = Some(event.position);
                     this.drag_start_view = this.line_plot.read(cx).effective_view(cx);
@@ -1250,19 +1499,21 @@ impl Render for TimeSeriesPlot {
                         this.handle_cursor_drag_move(event, cx);
                         return;
                     }
-                    let (Some(start), Some(start_view), Some(pa)) =
-                        (this.drag_start, this.drag_start_view, this.last_plot_area)
-                    else {
+                    let (Some(start), Some(start_view), Some(pa)) = (
+                        this.drag_start,
+                        this.drag_start_view.clone(),
+                        this.last_plot_area,
+                    ) else {
                         return;
                     };
 
                     let dx = event.position.x - start.x;
                     let dy = event.position.y - start.y;
-                    let (nx, ny) = start_view.screen_delta_to_norm(pa, dx, dy);
+                    let (nx, ny) = start_view.x_bounds().screen_delta_to_norm(pa, dx, dy);
                     let new_view = match this.drag_zone {
-                        AxisZone::Plot => start_view.offset_by_norm(-nx, ny),
+                        AxisZone::Plot => start_view.offset_x(-nx).offset_y_all(ny),
                         AxisZone::XAxis => start_view.offset_x(-nx),
-                        AxisZone::YAxis => start_view.offset_y(ny),
+                        AxisZone::YAxis(i) => start_view.offset_axis_y(i, ny),
                     };
                     this.line_plot
                         .update(cx, |lp, cx| lp.set_view_override(Some(new_view), cx));
@@ -1281,12 +1532,12 @@ impl Render for TimeSeriesPlot {
                     let zoom_amount = f32::from(-delta.y) as f64 / 200.0;
                     let factor = (1.0_f64 + zoom_amount).clamp(0.5, 2.0);
 
-                    let zone = axis_zone(event.position, pa);
-                    let (ax, ay) = view.screen_anchor(pa, event.position);
+                    let zone = axis_zone(event.position, pa, view.axis_count());
+                    let (ax, ay) = view.x_bounds().screen_anchor(pa, event.position);
                     let new_view = match zone {
-                        AxisZone::Plot => view.zoom_at(factor, ax, 1.0 - ay),
+                        AxisZone::Plot => view.zoom_x(factor, ax).zoom_y_all(factor, 1.0 - ay),
                         AxisZone::XAxis => view.zoom_x(factor, ax),
-                        AxisZone::YAxis => view.zoom_y(factor, 1.0 - ay),
+                        AxisZone::YAxis(i) => view.zoom_axis_y(i, factor, 1.0 - ay),
                     };
                     this.line_plot
                         .update(cx, |lp, cx| lp.set_view_override(Some(new_view), cx));
@@ -1298,20 +1549,21 @@ impl Render for TimeSeriesPlot {
                     {
                         let this = cx.entity().downgrade();
                         move |bounds, _window, cx| {
-                            let _ = this.update(cx, |this, _| {
-                                this.last_plot_area = Some(plot_area(bounds));
-                            });
                             let lp = underlay_lp.read(cx);
-                            (
-                                bounds,
-                                lp.effective_view(cx),
-                                lp.data_start().unwrap_or(0.0),
-                            )
+                            let axis_count = lp.axes.len();
+                            let view = lp.effective_view(cx);
+                            let data_start = lp.data_start().unwrap_or(0.0);
+                            let fmt = lp.x_time_format;
+                            let tint = alarm_plot_tint(lp, cx);
+                            let _ = this.update(cx, |this, _| {
+                                this.last_plot_area = Some(plot_area(bounds, axis_count));
+                            });
+                            (bounds, view, data_start, fmt, tint)
                         }
                     },
-                    move |_, (bounds, view, data_start), window, cx| {
+                    move |_, (bounds, view, data_start, fmt, tint), window, cx| {
                         if let Some(view) = view {
-                            paint_underlay(bounds, view, data_start, window, cx);
+                            paint_underlay(bounds, &view, data_start, fmt, tint, window, cx);
                         }
                     },
                 )
@@ -1321,7 +1573,7 @@ impl Render for TimeSeriesPlot {
             .child(
                 div()
                     .absolute()
-                    .left(px(Y_LABEL_WIDTH + PADDING))
+                    .left(chrome_left)
                     .top(px(PADDING))
                     .right(px(PADDING))
                     .bottom(px(X_LABEL_HEIGHT + PADDING))
@@ -1331,15 +1583,45 @@ impl Render for TimeSeriesPlot {
                 canvas(
                     move |bounds, _window, cx| {
                         let lp = overlay_lp.read(cx);
+                        let view = lp.effective_view(cx);
+                        let colors = lp.axis_colors(cx);
+                        // Per-trace axis markers: value at the visible left edge,
+                        // only meaningful once there's more than one axis.
+                        let mut markers: Vec<(usize, f64, Hsla)> = Vec::new();
+                        if let Some(v) = &view
+                            && v.axis_count() > 1
+                        {
+                            let left = Timestamp(v.x.0 as i64);
+                            for trace in lp.traces() {
+                                let cfg = trace.read(cx);
+                                if !cfg.visible {
+                                    continue;
+                                }
+                                if let Some(val) = lp.trace_value_at(trace.entity_id(), left, cx) {
+                                    markers.push((cfg.axis_index, val, cfg.color));
+                                }
+                            }
+                        }
+                        let limit_lines = alarm_limit_lines(lp, cx);
                         (
                             bounds,
-                            lp.effective_view(cx),
+                            view,
+                            colors,
+                            markers,
+                            limit_lines,
                             lp.data_start().unwrap_or(0.0),
+                            lp.x_time_format,
                         )
                     },
-                    move |_, (bounds, view, data_start), window, cx| {
+                    move |_,
+                          (bounds, view, colors, markers, limit_lines, data_start, fmt),
+                          window,
+                          cx| {
                         if let Some(view) = view {
-                            paint_overlay(bounds, view, data_start, window, cx);
+                            paint_overlay(
+                                bounds, &view, &colors, &markers, &limit_lines, data_start, fmt,
+                                window, cx,
+                            );
                         }
                     },
                 )
@@ -1366,7 +1648,18 @@ impl Render for TimeSeriesPlot {
                                         lp.trace_value_at(trace.entity_id(), c.t_start, cx);
                                     let v_end = lp.trace_value_at(trace.entity_id(), c.t_end, cx);
                                     if let (Some(vs), Some(ve)) = (v_start, v_end) {
-                                        markers.push((vs, ve, cfg.color));
+                                        // Pre-normalize to [0,1] against the
+                                        // trace's axis so paint can map with a
+                                        // single fixed 0..1 Y range.
+                                        let (ns, ne) = match &view {
+                                            Some(v) => {
+                                                let b = v.axis_bounds(cfg.axis_index);
+                                                let h = (b.max_y - b.min_y).max(1e-12);
+                                                ((vs - b.min_y) / h, (ve - b.min_y) / h)
+                                            }
+                                            None => (vs, ve),
+                                        };
+                                        markers.push((ns, ne, cfg.color));
                                     }
                                 }
                                 snapshots.push(CursorPaint {
@@ -1381,7 +1674,8 @@ impl Render for TimeSeriesPlot {
                     },
                     move |_, (bounds, view, cursors), window, cx| {
                         if let Some(view) = view {
-                            paint_cursors(bounds, view, &cursors, window, cx);
+                            // Markers carry normalized [0,1] Y; lines use X only.
+                            paint_cursors(bounds, &view, &cursors, window, cx);
                         }
                     },
                 )
@@ -1395,8 +1689,8 @@ impl Render for TimeSeriesPlot {
         let panels = measurement_panel::render_panels(self, cx);
         for panel in panels {
             // Panel origins are plot-area-local; the outer container's
-            // origin is offset by (Y_LABEL_WIDTH + PADDING, PADDING).
-            let left = panel.origin.x + px(Y_LABEL_WIDTH + PADDING);
+            // origin is offset by (left_margin, PADDING).
+            let left = panel.origin.x + chrome_left;
             let top = panel.origin.y + px(PADDING);
             inner = inner.child(div().absolute().left(left).top(top).child(panel.element));
         }
@@ -1404,17 +1698,14 @@ impl Render for TimeSeriesPlot {
         root = root.child(inner);
 
         if show_legend {
-            let legend_bg = Hsla {
-                a: 0.5,
-                ..theme.bg_secondary
-            };
+            let legend_bg = theme.plot_chrome_bg();
             let mut legend_row = div()
                 .flex()
                 .flex_row()
                 .flex_wrap()
                 .gap_1()
                 .gap_y_0()
-                .pl(px(Y_LABEL_WIDTH + PADDING))
+                .pl(chrome_left)
                 .pb_1()
                 .bg(legend_bg);
 

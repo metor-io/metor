@@ -58,7 +58,7 @@ impl Global for BevyBridge {}
 
 impl BevyBridge {
     /// Fetch the bridge, building the Bevy app on the first call.
-    pub fn get_or_init(cx: &mut gpui::App) -> &mut BevyBridge {
+    pub fn or_init(cx: &mut gpui::App) -> &mut BevyBridge {
         if !cx.has_global::<BevyBridge>() {
             let app = bevy_app::build_app();
             cx.set_global(BevyBridge {

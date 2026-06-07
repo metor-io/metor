@@ -275,32 +275,30 @@ pub fn build(
 
     fn p1(
         op: &'static str,
-        mut parents: Vec<Arc<dyn DynamicNode>>,
+        parents: Vec<Arc<dyn DynamicNode>>,
     ) -> Result<Arc<dyn DynamicNode>, BuildError> {
-        if parents.len() != 1 {
-            return Err(BuildError::WrongArity {
+        match <[_; 1]>::try_from(parents) {
+            Ok([a]) => Ok(a),
+            Err(parents) => Err(BuildError::WrongArity {
                 op,
                 expected: 1,
                 got: parents.len(),
-            });
+            }),
         }
-        Ok(parents.pop().unwrap())
     }
 
     fn p2(
         op: &'static str,
-        mut parents: Vec<Arc<dyn DynamicNode>>,
+        parents: Vec<Arc<dyn DynamicNode>>,
     ) -> Result<(Arc<dyn DynamicNode>, Arc<dyn DynamicNode>), BuildError> {
-        if parents.len() != 2 {
-            return Err(BuildError::WrongArity {
+        match <[_; 2]>::try_from(parents) {
+            Ok([a, b]) => Ok((a, b)),
+            Err(parents) => Err(BuildError::WrongArity {
                 op,
                 expected: 2,
                 got: parents.len(),
-            });
+            }),
         }
-        let b = parents.pop().unwrap();
-        let a = parents.pop().unwrap();
-        Ok((a, b))
     }
 
     fn p0(op: &'static str, parents: Vec<Arc<dyn DynamicNode>>) -> Result<(), BuildError> {

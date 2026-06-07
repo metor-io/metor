@@ -415,6 +415,32 @@ fn persist_id_matches() {
     assert_eq!(direct, computed);
 }
 
+#[test]
+fn every_node_spec_kind_has_a_descriptor() {
+    use crate::node_editor::registry::descriptor;
+    use crate::node_editor::spec::NodeSpecKind::{self, *};
+
+    // `descriptor()` does a linear lookup that panics when a kind is missing
+    // from the registry — a failure mode you'd otherwise only hit the first
+    // time that op runs. The match below is the real guard: adding a new
+    // `NodeSpecKind` variant fails to compile until it's listed here, which
+    // forces both this array and the descriptor registry to be updated.
+    fn _exhaustive(k: NodeSpecKind) {
+        match k {
+            FixedRate | ClockOf | Waveform | Random | Constant | Affine | Unary | Window | Fft
+            | Magnitude | Index | Threshold | Delta | DeltaT | Binary | Mean | Pack | Dot
+            | Resample | FromDb | Persist => {}
+        }
+    }
+    let all = [
+        FixedRate, ClockOf, Waveform, Random, Constant, Affine, Unary, Window, Fft, Magnitude,
+        Index, Threshold, Delta, DeltaT, Binary, Mean, Pack, Dot, Resample, FromDb, Persist,
+    ];
+    for kind in all {
+        let _ = descriptor(kind);
+    }
+}
+
 #[stellarator::test]
 async fn persist_bumps_vtable_gen_on_new_component() {
     let db_path = unique_db_path("persist-vtable-gen");

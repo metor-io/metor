@@ -10,26 +10,26 @@ use gpui::{
 
 use crate::theme::theme;
 
-pub mod action;
 pub mod bool;
 pub mod checkbox;
 pub mod color;
 pub mod command;
 pub mod default_action;
 pub mod enum_;
+pub mod header;
 pub mod nav;
 pub mod scalar;
 pub mod slider;
 pub mod text;
 pub mod text_field;
 
-pub use action::ActionRow;
 pub use bool::BoolRow;
 pub use checkbox::{check_square, checkbox};
 pub use color::ColorRow;
 pub use command::CommandRow;
 pub use default_action::DefaultActionRow;
 pub use enum_::EnumRow;
+pub use header::HeaderRow;
 pub use nav::NavRow;
 pub use scalar::ScalarRow;
 pub use slider::SliderRow;
@@ -127,6 +127,30 @@ pub fn tag_pill(tag: SharedString, cx: &App) -> impl IntoElement {
         .text_size(px(10.0))
         .text_color(theme.text_secondary)
         .child(tag)
+}
+
+/// A label row: [`row_base`] chrome wrapping a single text label in `color`,
+/// with an optional trailing [`tag_pill`]. Shared by the callback rows
+/// ([`CommandRow`], [`DefaultActionRow`]) so they don't each re-spell the
+/// same div.
+pub fn render_label_row(
+    row_ix: usize,
+    selected: bool,
+    label: SharedString,
+    tag: Option<SharedString>,
+    color: Hsla,
+    cx: &App,
+) -> AnyElement {
+    let mut row = row_base(row_ix, selected, cx).child(
+        div()
+            .text_size(px(12.0))
+            .text_color(color)
+            .child(label),
+    );
+    if let Some(tag) = tag {
+        row = row.child(tag_pill(tag, cx));
+    }
+    row.into_any_element()
 }
 
 /// Row-chrome the concrete widgets wrap: background, hover, spacing, and id.

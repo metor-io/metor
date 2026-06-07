@@ -409,10 +409,7 @@ fn edge_color_to_hsla(c: EdgeColor, theme: &crate::theme::Theme) -> Hsla {
         EdgeColor::SharedClock(idx) => theme.line_colors[idx % theme.line_colors.len()],
         EdgeColor::Neutral => theme.border_primary,
         EdgeColor::Error => theme.error_accent,
-        EdgeColor::Pending => Hsla {
-            a: 0.4,
-            ..theme.text_tertiary
-        },
+        EdgeColor::Pending => theme.edge_pending(),
     }
 }
 

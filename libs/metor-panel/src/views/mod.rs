@@ -1,3 +1,4 @@
+pub mod alarm_panel;
 pub mod column_browser;
 pub mod component_browser;
 pub mod component_table;
@@ -7,6 +8,7 @@ pub mod data_table;
 pub mod format;
 pub mod list_plot;
 pub mod monitor;
+pub mod plot_common;
 pub mod scrollbar;
 pub mod table;
 pub mod time_series;
@@ -17,6 +19,7 @@ pub mod value_strip;
 pub mod viewer_3d;
 pub mod xy_plot;
 
+pub use alarm_panel::AlarmView;
 pub use column_browser::{ColumnBrowser, ColumnBrowserDelegate};
 pub use component_browser::{BrowserEvent, ComponentBrowser, new_component_browser};
 pub use component_table::{ComponentTable, new_component_table};

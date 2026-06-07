@@ -16,7 +16,7 @@ use crate::inspector::rows::{
 };
 use crate::views::list_plot::{ListLinePlot, ListTrace};
 use crate::views::time_series::time_range::TimeRangeBehavior;
-use crate::views::time_series::{LinePlot, Override, Trace};
+use crate::views::time_series::{LinePlot, Override, Trace, YAxis};
 use crate::views::viewer_3d::Viewer3d;
 use crate::views::xy_plot::{XyLinePlot, XyTrace};
 
@@ -29,8 +29,10 @@ impl InspectorRegistry {
         self.register_component_id(db.clone());
         self.register_override_f64();
         self.register_override_shared_string();
+        self.register_override_hsla();
         self.register_time_range_behavior();
         self.register_inspectable::<crate::views::Monitor>();
+        self.register_inspectable::<crate::views::AlarmView>();
         self.register_inspectable::<crate::views::TrafficLight>();
         self.register_inspectable::<crate::views::TrafficLightGrid>();
         self.register_entity_list::<LinePlot, Trace>(
@@ -40,6 +42,12 @@ impl InspectorRegistry {
             AddBehavior::Wizard(Arc::new(|parent, db, cx| {
                 builders::build_trace_add_wizard(parent, db, cx)
             })),
+        );
+        self.register_entity_list::<LinePlot, YAxis>(
+            db.clone(),
+            |lp| &lp.axes,
+            |lp| &mut lp.axes,
+            AddBehavior::Default(Arc::new(|_cx| YAxis::new("Y"))),
         );
         self.register_entity_list::<Viewer3d, crate::views::viewer_3d::ModelEntry>(
             db.clone(),
@@ -51,6 +59,7 @@ impl InspectorRegistry {
         self.register_measurement_cursor_builder();
         self.register_dashboard_builder(db.clone());
         self.register_pane_builder();
+        self.register_component_browser_builder();
         self.register_field_override::<crate::views::time_series::Trace>(
             "stroke_width",
             FieldOverride {
@@ -58,6 +67,7 @@ impl InspectorRegistry {
                 ..FieldOverride::default()
             },
         );
+        self.register_trace_builder(db.clone());
         self.register_field_override::<crate::views::viewer_3d::Viewer3d>(
             "camera_fov",
             FieldOverride {
@@ -229,6 +239,44 @@ impl InspectorRegistry {
         ));
     }
 
+    /// Row for `Override<Hsla>`: color picker paired with an "Auto" reset.
+    fn register_override_hsla(&mut self) {
+        self.register_field_widget::<Override<Hsla>>(Arc::new(|ctx, peek, any_entity, idx| {
+            let current = peek.get::<Override<Hsla>>().unwrap().clone();
+            builders::build_override_row(
+                ctx.label.clone(),
+                current,
+                any_entity,
+                idx,
+                |_| SharedString::new_static("Custom"),
+                |label, initial, any_entity, idx| {
+                    let read = any_entity.clone();
+                    let write = any_entity.clone();
+                    Box::new(ColorRow {
+                        label,
+                        color: initial,
+                        read_color: Arc::new(move |cx| {
+                            match crate::inspector::reflect::get_field::<Override<Hsla>>(
+                                &read, idx, cx,
+                            ) {
+                                Some(Override::Custom(c)) => c,
+                                _ => initial,
+                            }
+                        }),
+                        on_change: Arc::new(move |c, _w, cx| {
+                            crate::inspector::reflect::set_field::<Override<Hsla>>(
+                                &write,
+                                idx,
+                                Override::Custom(c),
+                                cx,
+                            );
+                        }),
+                    })
+                },
+            )
+        }));
+    }
+
     /// Row for `TimeRangeBehavior`: preset picker plus a custom text field.
     ///
     /// The summary shows the matching preset name or, failing that, the
@@ -290,6 +338,74 @@ impl InspectorRegistry {
                 .downcast()
                 .expect("MeasurementCursor type mismatch");
             crate::views::time_series::build_cursor_rows(cursor, cx)
+        }));
+    }
+
+    /// Trace inspector: the default facet rows plus an axis picker. The
+    /// picker reads the owning plot's `axes` (via the trace's back-ref) and
+    /// writes `axis_index`; it's hidden when the plot has a single axis.
+    fn register_trace_builder(&mut self, _db: Arc<DB>) {
+        self.register_type_builder::<Trace>(Arc::new(|any_entity, db, cx| {
+            let trace: Entity<Trace> = any_entity.clone().downcast().expect("Trace type mismatch");
+            let mut rows = crate::inspector::reflect::default_rows_for_any_entity(&any_entity, db, cx);
+
+            let Some(lp) = trace.read(cx).line_plot.clone().and_then(|w| w.upgrade()) else {
+                return rows;
+            };
+            let axes = lp.read(cx).axes.clone();
+            if axes.len() <= 1 {
+                return rows;
+            }
+
+            let axis_name = |i: usize, label: &SharedString| -> SharedString {
+                if label.is_empty() {
+                    SharedString::from(format!("Axis {i}"))
+                } else {
+                    label.clone()
+                }
+            };
+            let current = trace.read(cx).axis_index.min(axes.len() - 1);
+            let summary = axis_name(current, &axes[current].read(cx).label);
+
+            let trace_for_children = trace.clone();
+            rows.push(Box::new(NavRow::new(
+                SharedString::new_static("Axis"),
+                summary,
+                Box::new(move |cx| {
+                    let axes = match trace_for_children
+                        .read(cx)
+                        .line_plot
+                        .clone()
+                        .and_then(|w| w.upgrade())
+                    {
+                        Some(lp) => lp.read(cx).axes.clone(),
+                        None => return vec![],
+                    };
+                    axes.iter()
+                        .enumerate()
+                        .map(|(i, axis)| {
+                            let name = axis_name(i, &axis.read(cx).label);
+                            let t = trace_for_children.clone();
+                            Box::new(CommandRow::new(
+                                name,
+                                Arc::new(move |_w, cx| {
+                                    t.update(cx, |tr, cx| {
+                                        tr.axis_index = i;
+                                        cx.notify();
+                                    });
+                                    // Repaint the plot so the trace jumps axis.
+                                    if let Some(lp) =
+                                        t.read(cx).line_plot.clone().and_then(|w| w.upgrade())
+                                    {
+                                        lp.update(cx, |_, cx| cx.notify());
+                                    }
+                                }),
+                            )) as Box<dyn InspectorRow>
+                        })
+                        .collect()
+                }),
+            )));
+            rows
         }));
     }
 
@@ -374,6 +490,56 @@ impl InspectorRegistry {
                 Box::new(hide_row),
                 Box::new(lock_row),
             ]
+        }));
+    }
+
+    fn register_component_browser_builder(&mut self) {
+        use crate::views::ComponentBrowser;
+        self.register_type_builder::<ComponentBrowser>(Arc::new(|any_entity, _db, cx| {
+            let browser: Entity<ComponentBrowser> = any_entity
+                .downcast()
+                .expect("ComponentBrowser type mismatch");
+            let summary = match browser.read(cx).delegate().custom_title() {
+                Override::Auto => SharedString::new_static("Auto"),
+                Override::Custom(s) => s.clone(),
+            };
+            let label = SharedString::new_static("Title");
+            let nav_browser = browser.clone();
+            let label_for_nav = label.clone();
+            vec![Box::new(NavRow::new(
+                label.clone(),
+                summary,
+                Box::new(move |cx| {
+                    let initial = match nav_browser.read(cx).delegate().custom_title() {
+                        Override::Custom(s) => s.clone(),
+                        Override::Auto => SharedString::new_static(""),
+                    };
+                    let write = nav_browser.clone();
+                    let auto = nav_browser.clone();
+                    vec![
+                        Box::new(TextRow::new(
+                            label_for_nav.clone(),
+                            initial,
+                            Arc::new(move |s, _w, cx| {
+                                write.update(cx, |b, cx| {
+                                    b.delegate_mut().set_custom_title(
+                                        Override::Custom(SharedString::from(s)),
+                                        cx,
+                                    );
+                                });
+                            }),
+                        )) as Box<dyn InspectorRow>,
+                        Box::new(CommandRow::new(
+                            "Auto",
+                            Arc::new(move |_w, cx| {
+                                auto.update(cx, |b, cx| {
+                                    b.delegate_mut().set_custom_title(Override::Auto, cx);
+                                });
+                            }),
+                        )) as Box<dyn InspectorRow>,
+                    ]
+                }),
+            ))]
         }));
     }
 

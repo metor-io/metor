@@ -551,3 +551,203 @@ pub struct UpdateComponent {
 impl Msg for UpdateComponent {
     const ID: PacketId = [224, 36];
 }
+
+/// Stable, human-readable identity for an alarm definition (e.g. `"BATT_OVERTEMP"`).
+/// Re-publishing an [`AlarmDef`] with the same id updates it; the latest wins.
+pub type AlarmId = String;
+
+/// Unique id for one *firing* of an alarm. Pairs an [`AlarmRaised`] with its later
+/// [`AlarmCleared`] / [`AlarmAck`], so the same definition can fire repeatedly without
+/// ambiguity.
+pub type OccurrenceId = u64;
+
+/// Alarm severity, ordered low → high so consumers can compute the highest active level.
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[serde(rename_all = "snake_case")]
+pub enum Severity {
+    Info,
+    Warning,
+    Critical,
+}
+
+/// Which side of a value a display limit sits on. A band is expressed as an `Upper`
+/// plus a `Lower` entry.
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum LimitKind {
+    Upper,
+    Lower,
+}
+
+/// A single limit line to *display* on a plot. Informational only — limits describe
+/// where to draw guide lines, they are **not** the boundary that decides firing. The
+/// control system evaluates firing (hysteresis, debounce, rate, …) and reports it via
+/// [`AlarmRaised`].
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct AlarmLimit {
+    pub kind: LimitKind,
+    pub value: f64,
+    pub severity: Severity,
+    pub label: Option<String>,
+}
+
+/// The component (and optional element index) an alarm pertains to, enabling plots to
+/// auto-associate limit lines and tinting with the traces that show that data.
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct AlarmTarget {
+    pub component_id: ComponentId,
+    pub element_index: Option<usize>,
+}
+
+/// Declaration / description of an alarm, broadcast by the control system. Carries the
+/// human-readable identity and the informational display limits. The event time is the
+/// message-log timestamp.
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct AlarmDef {
+    pub id: AlarmId,
+    pub name: String,
+    pub description: String,
+    pub target: Option<AlarmTarget>,
+    pub limits: Vec<AlarmLimit>,
+    pub default_severity: Severity,
+}
+
+impl Msg for AlarmDef {
+    const ID: PacketId = [224, 37];
+}
+
+/// The source of truth that an alarm is *firing*, broadcast by the control system. The
+/// event time is the message-log timestamp.
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct AlarmRaised {
+    pub def_id: AlarmId,
+    pub occurrence: OccurrenceId,
+    pub severity: Severity,
+    pub value: Option<f64>,
+    pub message: String,
+}
+
+impl Msg for AlarmRaised {
+    const ID: PacketId = [224, 38];
+}
+
+/// Marks a previously raised [`occurrence`](AlarmRaised::occurrence) as resolved,
+/// broadcast by the control system.
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct AlarmCleared {
+    pub def_id: AlarmId,
+    pub occurrence: OccurrenceId,
+}
+
+impl Msg for AlarmCleared {
+    const ID: PacketId = [224, 39];
+}
+
+/// Operator acknowledgment of an alarm occurrence, published by the panel so every
+/// connected client sees the ack.
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct AlarmAck {
+    pub def_id: AlarmId,
+    pub occurrence: OccurrenceId,
+    pub operator: String,
+    pub note: Option<String>,
+}
+
+impl Msg for AlarmAck {
+    const ID: PacketId = [224, 40];
+}
+
+#[cfg(test)]
+mod alarm_tests {
+    use super::*;
+
+    fn roundtrip<T>(value: &T) -> T
+    where
+        T: Serialize + for<'de> Deserialize<'de>,
+    {
+        let bytes = postcard::to_allocvec(value).expect("encode");
+        postcard::from_bytes(&bytes).expect("decode")
+    }
+
+    #[test]
+    fn alarm_messages_roundtrip() {
+        let def = AlarmDef {
+            id: "BATT_OVERTEMP".into(),
+            name: "Battery Over-Temperature".into(),
+            description: "Pack temperature exceeded safe range".into(),
+            target: Some(AlarmTarget {
+                component_id: ComponentId::new("power.batt_temp"),
+                element_index: Some(0),
+            }),
+            limits: vec![
+                AlarmLimit {
+                    kind: LimitKind::Upper,
+                    value: 80.0,
+                    severity: Severity::Warning,
+                    label: Some("Warn".into()),
+                },
+                AlarmLimit {
+                    kind: LimitKind::Upper,
+                    value: 95.0,
+                    severity: Severity::Critical,
+                    label: Some("Crit".into()),
+                },
+            ],
+            default_severity: Severity::Warning,
+        };
+        let def2 = roundtrip(&def);
+        assert_eq!(def.id, def2.id);
+        assert_eq!(def.limits.len(), def2.limits.len());
+        assert_eq!(def.default_severity, def2.default_severity);
+
+        let raised = AlarmRaised {
+            def_id: "BATT_OVERTEMP".into(),
+            occurrence: 42,
+            severity: Severity::Critical,
+            value: Some(96.2),
+            message: "temp 96.2C".into(),
+        };
+        let raised2 = roundtrip(&raised);
+        assert_eq!(raised.occurrence, raised2.occurrence);
+        assert_eq!(raised.severity, raised2.severity);
+
+        let cleared = AlarmCleared {
+            def_id: "BATT_OVERTEMP".into(),
+            occurrence: 42,
+        };
+        assert_eq!(cleared.occurrence, roundtrip(&cleared).occurrence);
+
+        let ack = AlarmAck {
+            def_id: "BATT_OVERTEMP".into(),
+            occurrence: 42,
+            operator: "sphw".into(),
+            note: Some("looking into it".into()),
+        };
+        assert_eq!(ack.operator, roundtrip(&ack).operator);
+    }
+
+    #[test]
+    fn alarm_packet_ids_are_unique() {
+        let ids = [
+            AlarmDef::ID,
+            AlarmRaised::ID,
+            AlarmCleared::ID,
+            AlarmAck::ID,
+        ];
+        for (i, a) in ids.iter().enumerate() {
+            for b in &ids[i + 1..] {
+                assert_ne!(a, b, "alarm packet ids must be unique");
+            }
+        }
+        // Distinct from the previously highest assigned id (UpdateComponent).
+        for id in ids {
+            assert_ne!(id, UpdateComponent::ID);
+        }
+    }
+
+    #[test]
+    fn severity_orders_low_to_high() {
+        assert!(Severity::Info < Severity::Warning);
+        assert!(Severity::Warning < Severity::Critical);
+    }
+}

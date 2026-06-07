@@ -1,4 +1,109 @@
 use gpui::{Bounds, Pixels, Point, point, px};
+use smallvec::SmallVec;
+
+/// The visible window of a multi-axis plot: one shared X range plus one Y
+/// range per [`YAxis`](super::YAxis), index-aligned with the plot's `axes`.
+///
+/// Downstream rendering normalizes each trace's Y into `[0,1]` against its
+/// axis, so the GPU and cursor markers only ever need [`Self::x_bounds`]
+/// (X data + a `0..1` Y); the real per-axis range is consumed solely by the
+/// Y tick labels via [`Self::axis_bounds`].
+#[derive(Clone, Debug)]
+pub struct PlotView {
+    pub x: (f64, f64),
+    pub axes: SmallVec<[(f64, f64); 2]>,
+}
+
+impl PlotView {
+    /// X data range with a placeholder `0..1` Y — fed to the GPU and to every
+    /// X-only screen calculation.
+    pub fn x_bounds(&self) -> PlotBounds {
+        PlotBounds::new(self.x.0, 0.0, self.x.1, 1.0)
+    }
+
+    /// X range paired with axis `i`'s Y range (falling back to the first axis
+    /// then `0..1`). Used for that axis's tick labels and for hit-testing a
+    /// trace assigned to it.
+    pub fn axis_bounds(&self, i: usize) -> PlotBounds {
+        let (min_y, max_y) = self
+            .axes
+            .get(i)
+            .copied()
+            .or_else(|| self.axes.first().copied())
+            .unwrap_or((0.0, 1.0));
+        PlotBounds::new(self.x.0, min_y, self.x.1, max_y)
+    }
+
+    pub fn axis_count(&self) -> usize {
+        self.axes.len()
+    }
+
+    /// Pan the X range by `frac` of its current width.
+    pub fn offset_x(mut self, frac: f64) -> Self {
+        let dx = frac * (self.x.1 - self.x.0);
+        self.x = (self.x.0 + dx, self.x.1 + dx);
+        self
+    }
+
+    /// Pan every axis's Y range by `frac` of that axis's own height.
+    pub fn offset_y_all(mut self, frac: f64) -> Self {
+        for (lo, hi) in &mut self.axes {
+            let dy = frac * (*hi - *lo);
+            *lo += dy;
+            *hi += dy;
+        }
+        self
+    }
+
+    /// Zoom the X range by `factor` about `anchor` (0 = left edge, 1 = right).
+    pub fn zoom_x(mut self, factor: f64, anchor: f64) -> Self {
+        let b = PlotBounds::new(self.x.0, 0.0, self.x.1, 1.0).zoom_x(factor, anchor);
+        self.x = (b.min_x, b.max_x);
+        self
+    }
+
+    /// Zoom every axis's Y range by `factor` about `anchor` (0 = bottom).
+    pub fn zoom_y_all(mut self, factor: f64, anchor: f64) -> Self {
+        for (lo, hi) in &mut self.axes {
+            let b = PlotBounds::new(0.0, *lo, 0.0, *hi).zoom_y(factor, anchor);
+            *lo = b.min_y;
+            *hi = b.max_y;
+        }
+        self
+    }
+
+    /// Zoom only axis `i`'s Y range about `anchor` (0 = bottom).
+    pub fn zoom_axis_y(mut self, i: usize, factor: f64, anchor: f64) -> Self {
+        if let Some((lo, hi)) = self.axes.get_mut(i) {
+            let b = PlotBounds::new(0.0, *lo, 0.0, *hi).zoom_y(factor, anchor);
+            *lo = b.min_y;
+            *hi = b.max_y;
+        }
+        self
+    }
+
+    /// Pan only axis `i`'s Y range by `frac` of its height.
+    pub fn offset_axis_y(mut self, i: usize, frac: f64) -> Self {
+        if let Some((lo, hi)) = self.axes.get_mut(i) {
+            let dy = frac * (*hi - *lo);
+            *lo += dy;
+            *hi += dy;
+        }
+        self
+    }
+
+    /// Bit-pattern key for change detection, dodging `f64`'s lack of `Eq`.
+    pub fn bits(&self) -> SmallVec<[u64; 6]> {
+        let mut out: SmallVec<[u64; 6]> = SmallVec::new();
+        out.push(self.x.0.to_bits());
+        out.push(self.x.1.to_bits());
+        for (lo, hi) in &self.axes {
+            out.push(lo.to_bits());
+            out.push(hi.to_bits());
+        }
+        out
+    }
+}
 
 /// Data-space rectangle for a plot view.
 ///
@@ -20,6 +125,16 @@ impl PlotBounds {
             max_x,
             max_y,
         }
+    }
+
+    /// Bit-pattern key for change detection, dodging `f64`'s lack of `Eq`.
+    pub fn bits(&self) -> (u64, u64, u64, u64) {
+        (
+            self.min_x.to_bits(),
+            self.min_y.to_bits(),
+            self.max_x.to_bits(),
+            self.max_y.to_bits(),
+        )
     }
 
     pub fn width(&self) -> f64 {
