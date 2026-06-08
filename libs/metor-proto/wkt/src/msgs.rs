@@ -657,6 +657,114 @@ impl Msg for AlarmAck {
     const ID: PacketId = [224, 40];
 }
 
+/// Stable identity for a sequence channel, assigned by the control system. A channel is
+/// a slot that holds at most one loaded sequence at a time.
+pub type ChannelId = u64;
+
+/// Human-readable name of a sequence, e.g. `"deploy_solar_array"`. Sequences are
+/// referenced by name when loaded into a channel.
+pub type SequenceName = String;
+
+/// One channel slot declared by the control system: its identity, display name, and the
+/// set of sequence names that may be loaded into it.
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct SequenceChannelSpec {
+    pub id: ChannelId,
+    pub name: String,
+    pub available: Vec<SequenceName>,
+}
+
+/// Whole-registry declaration of the sequence channels, broadcast by the control system.
+/// Re-publishing replaces the registry — the latest wins. This is the configuration the
+/// sequence UI sources from the control system.
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct SequenceRegistry {
+    pub channels: Vec<SequenceChannelSpec>,
+}
+
+impl Msg for SequenceRegistry {
+    const ID: PacketId = [224, 41];
+}
+
+/// Run state of a channel's loaded sequence, as reported by the control system.
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum SequenceRunState {
+    Idle,
+    Running,
+    Stopped,
+    Aborted,
+    Completed,
+    Failed,
+}
+
+/// A single transition in a channel's lifecycle. Events arrive in order through one log,
+/// so the per-channel state machine (`Loaded` → `Started` → `Progress`* → terminal) is
+/// totally ordered.
+#[derive(Serialize, Deserialize, Debug, Clone)]
+#[serde(rename_all = "snake_case")]
+pub enum SequenceEventKind {
+    /// A sequence was loaded into the channel.
+    Loaded { name: SequenceName },
+    /// The channel's loaded sequence was cleared.
+    Unloaded,
+    Started,
+    /// The sequence made progress — sent a message, advanced a step, etc. The `detail`
+    /// becomes the channel's latest status line.
+    Progress { detail: String },
+    /// Hard-stopped (dropped). May have left the system in an unsafe state.
+    Stopped,
+    /// Commanded safe-termination ran to completion.
+    Aborted,
+    Completed,
+    Failed { reason: String },
+}
+
+/// A granular per-channel state update, broadcast by the control system (control → panel).
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct SequenceChannelEvent {
+    pub channel_id: ChannelId,
+    pub kind: SequenceEventKind,
+}
+
+impl Msg for SequenceChannelEvent {
+    const ID: PacketId = [224, 42];
+}
+
+/// An operator command on a channel, published by the panel (panel → control). The
+/// control system executes it and reports the result via [`SequenceChannelEvent`].
+#[derive(Serialize, Deserialize, Debug, Clone)]
+#[serde(rename_all = "snake_case")]
+pub enum SequenceCommandKind {
+    /// Load the named sequence into the channel.
+    Load { name: SequenceName },
+    Start,
+    /// Commanded safe-termination.
+    Abort,
+    /// Hard-stop (drop) — may leave the system unsafe.
+    Stop,
+}
+
+/// A command targeting one channel, published by the panel.
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct SequenceCommand {
+    pub channel_id: ChannelId,
+    pub command: SequenceCommandKind,
+}
+
+impl Msg for SequenceCommand {
+    const ID: PacketId = [224, 43];
+}
+
+/// Asks the control system to re-read its sequence source(s) (disk, etc.) and re-publish
+/// an updated [`SequenceRegistry`]. Global scope. Published by the panel.
+#[derive(Serialize, Deserialize, Debug, Clone, Default)]
+pub struct ReloadSequences {}
+
+impl Msg for ReloadSequences {
+    const ID: PacketId = [224, 44];
+}
+
 #[cfg(test)]
 mod alarm_tests {
     use super::*;
@@ -749,5 +857,90 @@ mod alarm_tests {
     fn severity_orders_low_to_high() {
         assert!(Severity::Info < Severity::Warning);
         assert!(Severity::Warning < Severity::Critical);
+    }
+}
+
+#[cfg(test)]
+mod sequence_tests {
+    use super::*;
+
+    fn roundtrip<T>(value: &T) -> T
+    where
+        T: Serialize + for<'de> Deserialize<'de>,
+    {
+        let bytes = postcard::to_allocvec(value).expect("encode");
+        postcard::from_bytes(&bytes).expect("decode")
+    }
+
+    #[test]
+    fn sequence_messages_roundtrip() {
+        let registry = SequenceRegistry {
+            channels: vec![
+                SequenceChannelSpec {
+                    id: 1,
+                    name: "Deploy".into(),
+                    available: vec!["deploy_solar_array".into(), "deploy_antenna".into()],
+                },
+                SequenceChannelSpec {
+                    id: 2,
+                    name: "Attitude".into(),
+                    available: vec!["detumble".into()],
+                },
+            ],
+        };
+        let registry2 = roundtrip(&registry);
+        assert_eq!(registry.channels.len(), registry2.channels.len());
+        assert_eq!(
+            registry.channels[0].available,
+            registry2.channels[0].available
+        );
+
+        let event = SequenceChannelEvent {
+            channel_id: 1,
+            kind: SequenceEventKind::Loaded {
+                name: "deploy_solar_array".into(),
+            },
+        };
+        assert_eq!(event.channel_id, roundtrip(&event).channel_id);
+
+        let progress = SequenceChannelEvent {
+            channel_id: 1,
+            kind: SequenceEventKind::Progress {
+                detail: "panel 1 latched".into(),
+            },
+        };
+        assert!(matches!(
+            roundtrip(&progress).kind,
+            SequenceEventKind::Progress { .. }
+        ));
+
+        let command = SequenceCommand {
+            channel_id: 2,
+            command: SequenceCommandKind::Load {
+                name: "detumble".into(),
+            },
+        };
+        assert_eq!(command.channel_id, roundtrip(&command).channel_id);
+
+        let _ = roundtrip(&ReloadSequences {});
+    }
+
+    #[test]
+    fn sequence_packet_ids_are_unique() {
+        let ids = [
+            SequenceRegistry::ID,
+            SequenceChannelEvent::ID,
+            SequenceCommand::ID,
+            ReloadSequences::ID,
+        ];
+        for (i, a) in ids.iter().enumerate() {
+            for b in &ids[i + 1..] {
+                assert_ne!(a, b, "sequence packet ids must be unique");
+            }
+        }
+        // Distinct from the alarm ids that precede them.
+        for id in ids {
+            assert_ne!(id, AlarmAck::ID);
+        }
     }
 }

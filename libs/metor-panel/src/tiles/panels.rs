@@ -16,8 +16,9 @@ use crate::views::time_series::{
 use crate::views::viewer_3d::Viewer3d;
 use crate::views::xy_plot::{XyLinePlot, XyPlot, XyTrace};
 use crate::views::{
-    AlarmView, ComponentBrowser, ComponentTable, ComponentText, DataTable, TimeSeriesPlot,
-    TrafficLight, TrafficLightGrid, new_component_browser, new_component_table, new_data_table,
+    AlarmView, ComponentBrowser, ComponentTable, ComponentText, DataTable, SequenceGrid,
+    SequenceView, TimeSeriesPlot, TrafficLight, TrafficLightGrid, new_component_browser,
+    new_component_table, new_data_table,
 };
 
 use super::item::{PaneItem, PaneItemHandle};
@@ -122,6 +123,102 @@ impl PaneItem for AlarmPanel {
 
     fn to_config(&self, _cx: &App) -> AlarmPanelConfig {
         AlarmPanelConfig::default()
+    }
+
+    fn inspectable_entity(&self) -> Option<gpui::AnyEntity> {
+        Some(self.inner.clone().into())
+    }
+}
+
+/// Persisted shape of a [`SequencePanel`]. Sequence state is global, so the only persisted
+/// bit is the view's list mode (defaulted).
+#[derive(facet::Facet, Default)]
+pub struct SequencePanelConfig {
+    pub show_history: bool,
+}
+
+/// Pane item with the detailed per-channel sequence control list.
+pub struct SequencePanel {
+    inner: Entity<SequenceView>,
+}
+
+impl SequencePanel {
+    pub fn new(_db: Arc<DB>, cx: &mut Context<Self>) -> Self {
+        let inner = cx.new(SequenceView::new);
+        Self { inner }
+    }
+
+    pub fn from_config(_cfg: SequencePanelConfig, db: Arc<DB>, cx: &mut Context<Self>) -> Self {
+        Self::new(db, cx)
+    }
+}
+
+impl Render for SequencePanel {
+    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+        div().size_full().child(self.inner.clone())
+    }
+}
+
+impl PaneItem for SequencePanel {
+    type Config = SequencePanelConfig;
+
+    fn tab_title(&self, _cx: &App) -> SharedString {
+        SharedString::new_static("Sequences")
+    }
+
+    fn serialization_key() -> &'static str {
+        "sequence"
+    }
+
+    fn to_config(&self, _cx: &App) -> SequencePanelConfig {
+        SequencePanelConfig::default()
+    }
+
+    fn inspectable_entity(&self) -> Option<gpui::AnyEntity> {
+        Some(self.inner.clone().into())
+    }
+}
+
+/// Persisted shape of a [`SequenceGridPanel`]. No per-panel config — the grid reads the
+/// global sequence store.
+#[derive(facet::Facet, Default)]
+pub struct SequenceGridPanelConfig {}
+
+/// Pane item with the compact many-channel sequence grid.
+pub struct SequenceGridPanel {
+    inner: Entity<SequenceGrid>,
+}
+
+impl SequenceGridPanel {
+    pub fn new(_db: Arc<DB>, cx: &mut Context<Self>) -> Self {
+        let inner = cx.new(SequenceGrid::new);
+        Self { inner }
+    }
+
+    pub fn from_config(_cfg: SequenceGridPanelConfig, db: Arc<DB>, cx: &mut Context<Self>) -> Self {
+        Self::new(db, cx)
+    }
+}
+
+impl Render for SequenceGridPanel {
+    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+        div().size_full().child(self.inner.clone())
+    }
+}
+
+impl PaneItem for SequenceGridPanel {
+    type Config = SequenceGridPanelConfig;
+
+    fn tab_title(&self, _cx: &App) -> SharedString {
+        SharedString::new_static("Sequence Grid")
+    }
+
+    fn serialization_key() -> &'static str {
+        "sequence_grid"
+    }
+
+    fn to_config(&self, _cx: &App) -> SequenceGridPanelConfig {
+        SequenceGridPanelConfig::default()
     }
 
     fn inspectable_entity(&self) -> Option<gpui::AnyEntity> {
@@ -1547,6 +1644,32 @@ pub(crate) fn new_panel_rows(
             let db = db.clone();
             pane.update(cx, |pane, cx| {
                 let item: Box<dyn PaneItemHandle> = Box::new(cx.new(|cx| AlarmPanel::new(db, cx)));
+                pane.add_item(item, cx);
+            });
+        })
+    })));
+
+    rows.push(Box::new(CommandRow::new("Sequences", {
+        let db = db.clone();
+        let pane = pane.clone();
+        Arc::new(move |_window, cx| {
+            let db = db.clone();
+            pane.update(cx, |pane, cx| {
+                let item: Box<dyn PaneItemHandle> =
+                    Box::new(cx.new(|cx| SequencePanel::new(db, cx)));
+                pane.add_item(item, cx);
+            });
+        })
+    })));
+
+    rows.push(Box::new(CommandRow::new("Sequence Grid", {
+        let db = db.clone();
+        let pane = pane.clone();
+        Arc::new(move |_window, cx| {
+            let db = db.clone();
+            pane.update(cx, |pane, cx| {
+                let item: Box<dyn PaneItemHandle> =
+                    Box::new(cx.new(|cx| SequenceGridPanel::new(db, cx)));
                 pane.add_item(item, cx);
             });
         })

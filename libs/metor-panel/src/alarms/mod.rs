@@ -13,14 +13,14 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 
-use gpui::{App, AsyncApp, Context, Entity, Global, Task, WeakEntity, prelude::*};
+use gpui::{App, Context, Entity, Global, Task, prelude::*};
 use metor_db::DB;
-use metor_db::msg_log::read_msg;
-use metor_proto::types::{ComponentId, Msg, PacketId, Timestamp};
+use metor_proto::types::{ComponentId, Msg, Timestamp};
 use metor_proto_wkt::{
     AlarmAck, AlarmCleared, AlarmDef, AlarmId, AlarmLimit, AlarmRaised, OccurrenceId, Severity,
 };
-use serde::Deserialize;
+
+use crate::msg_ingest::ingest_loop;
 
 #[cfg(test)]
 mod tests;
@@ -258,15 +258,8 @@ impl AlarmStore {
             cx.spawn({
                 let db = db.clone();
                 async move |this, cx| {
-                    ingest_loop(db, AlarmDef::ID, this, cx, |state, _ts, def| state.apply_def(def))
-                        .await
-                }
-            }),
-            cx.spawn({
-                let db = db.clone();
-                async move |this, cx| {
-                    ingest_loop(db, AlarmRaised::ID, this, cx, |state, ts, raised| {
-                        state.apply_raised(ts, raised)
+                    ingest_loop(db, AlarmDef::ID, this, cx, |store, _ts, def| {
+                        store.state.apply_def(def)
                     })
                     .await
                 }
@@ -274,8 +267,8 @@ impl AlarmStore {
             cx.spawn({
                 let db = db.clone();
                 async move |this, cx| {
-                    ingest_loop(db, AlarmCleared::ID, this, cx, |state, ts, cleared| {
-                        state.apply_cleared(ts, cleared)
+                    ingest_loop(db, AlarmRaised::ID, this, cx, |store, ts, raised| {
+                        store.state.apply_raised(ts, raised)
                     })
                     .await
                 }
@@ -283,8 +276,17 @@ impl AlarmStore {
             cx.spawn({
                 let db = db.clone();
                 async move |this, cx| {
-                    ingest_loop(db, AlarmAck::ID, this, cx, |state, ts, ack| {
-                        state.apply_ack(ts, ack)
+                    ingest_loop(db, AlarmCleared::ID, this, cx, |store, ts, cleared| {
+                        store.state.apply_cleared(ts, cleared)
+                    })
+                    .await
+                }
+            }),
+            cx.spawn({
+                let db = db.clone();
+                async move |this, cx| {
+                    ingest_loop(db, AlarmAck::ID, this, cx, |store, ts, ack| {
+                        store.state.apply_ack(ts, ack)
                     })
                     .await
                 }
@@ -336,82 +338,3 @@ impl AlarmStore {
     }
 }
 
-/// Backfill the persisted history for one message type, then live-tail its WAL. The
-/// reader is created before backfill so it captures every write afterwards; live
-/// messages at or before the backfilled timestamp are dropped to avoid double-counting
-/// the overlap.
-async fn ingest_loop<T, F>(
-    db: Arc<DB>,
-    id: PacketId,
-    this: WeakEntity<AlarmStore>,
-    cx: &mut AsyncApp,
-    mut apply: F,
-) where
-    T: for<'de> Deserialize<'de> + 'static,
-    F: FnMut(&mut AlarmState, Timestamp, T) + 'static,
-{
-    let Ok(msg_log) = db.with_state_mut(|s| s.get_or_insert_msg_log(id, &db.path).cloned()) else {
-        return;
-    };
-
-    let mut reader = msg_log.wal_reader();
-
-    let backfill: Vec<(Timestamp, T)> = match msg_log
-        .get_range(Timestamp(i64::MIN)..Timestamp(i64::MAX))
-    {
-        Some(slice) => slice
-            .as_iter()
-            .flat_map(|node| {
-                node.msgs()
-                    .filter_map(|(ts, bytes)| postcard::from_bytes::<T>(bytes).ok().map(|v| (ts, v)))
-                    .collect::<Vec<_>>()
-            })
-            .collect(),
-        None => Vec::new(),
-    };
-    let mut backfill_max = Timestamp(i64::MIN);
-    for (ts, _) in &backfill {
-        if *ts > backfill_max {
-            backfill_max = *ts;
-        }
-    }
-
-    let apply_ref = &mut apply;
-    let applied = this.update(cx, move |store, cx| {
-        for (ts, value) in backfill {
-            apply_ref(&mut store.state, ts, value);
-        }
-        cx.notify();
-    });
-    if applied.is_err() {
-        return;
-    }
-
-    loop {
-        let grant = reader.next().await;
-        let mut items: Vec<(Timestamp, T)> = Vec::new();
-        let mut buf: &[u8] = &grant;
-        while let Some((rest, ts, msg)) = read_msg(buf) {
-            buf = rest;
-            if ts > backfill_max
-                && let Ok(value) = postcard::from_bytes::<T>(msg)
-            {
-                items.push((ts, value));
-            }
-        }
-
-        let apply_ref = &mut apply;
-        let applied = this.update(cx, move |store, cx| {
-            if items.is_empty() {
-                return;
-            }
-            for (ts, value) in items {
-                apply_ref(&mut store.state, ts, value);
-            }
-            cx.notify();
-        });
-        if applied.is_err() {
-            break;
-        }
-    }
-}

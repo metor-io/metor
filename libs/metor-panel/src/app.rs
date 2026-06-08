@@ -1,16 +1,18 @@
 #![allow(unexpected_cfgs)]
 
+use std::net::SocketAddr;
 use std::sync::Arc;
 
 use crate::inspector::Inspector;
 use crate::inspector::edits::{
     self, edit_value_rows, pending_edits, pending_edits_mut, review_rows,
 };
-use crate::inspector::palette::ItemRegistry;
+use crate::inspector::palette::{Category, InspectionItem, ItemProvider, ItemRegistry};
 use crate::inspector::{InspectorMode, InspectorRequest, OpenInspectorGlobal};
 use crate::tiles::panels::{
-    AlarmPanel, BrowserPanel, DataTablePanel, ListPlotPanel, PlotPanel, TablePanel, TextPanel,
-    TrafficLightGridPanel, TrafficLightPanel, Viewer3dPanel, XyPlotPanel,
+    AlarmPanel, BrowserPanel, DataTablePanel, ListPlotPanel, PlotPanel, SequenceGridPanel,
+    SequencePanel, TablePanel, TextPanel, TrafficLightGridPanel, TrafficLightPanel, Viewer3dPanel,
+    XyPlotPanel,
 };
 use crate::tiles::{PlotComponentAction, PreviewPlotAction, TileGroup, TileGroupEvent};
 use crate::views::dashboard::{DashboardPanel, deserialize_dashboard};
@@ -19,7 +21,8 @@ use gpui::{
     Pixels, Point, Render, SharedString, TitlebarOptions, Window, WindowBounds, WindowOptions,
     actions, div, point, prelude::*, px, size,
 };
-use metor_db::DB;
+use metor_db::{DB, Server};
+use stellarator::{net::TcpListener, struc_con::stellar};
 
 actions!(
     metor_panel,
@@ -534,72 +537,178 @@ impl AppRoot {
     }
 }
 
-/// Boot the gpui application and block until the last window closes.
+/// Builder that owns construction of the panel application.
 ///
-/// Registers the theme, fonts, icons, edit queue, palette providers,
-/// inspector registry, and widget registry before opening the root window.
-pub fn run(db: Arc<metor_db::DB>) {
-    Application::new()
-        .with_assets(crate::icons::IconAssets)
-        .run(move |cx: &mut App| {
-            crate::theme::register_fonts(cx);
-            let cfg = crate::config::load();
-            let family = crate::theme::resolve_font_family(cx, &cfg);
-            cx.set_global(crate::theme::FontSettings {
-                family,
-                config: cfg,
-            });
-            cx.set_global(crate::theme::ActiveTheme(Arc::new(
-                crate::theme::DARK.clone(),
-            )));
-            edits::init(cx);
-            ItemRegistry::init(cx);
-            crate::inspector::registry::InspectorRegistry::init(db.clone(), cx);
-            crate::views::dashboard::WidgetRegistry::init(cx);
-            crate::dynamic::DynamicRegistry::init(cx);
-            crate::node_editor::GraphCoordinator::init(cx);
-            crate::node_editor::DynamicWorker::init(cx);
-            crate::node_editor::inspector_rows::register_inspector_rows(cx);
-            crate::alarms::AlarmStore::init(db.clone(), cx);
-            register_pane_item_deserializers(db.clone(), cx);
-            set_dock_icon();
-            cx.bind_keys([
-                KeyBinding::new("cmd-p", OpenPalette, None),
-                KeyBinding::new("ctrl-tab", CycleTabForward, None),
-                KeyBinding::new("shift-ctrl-tab", CycleTabBackward, None),
-                KeyBinding::new("cmd-l", ToggleCmdLock, None),
-                KeyBinding::new("cmd-shift-e", OpenReviewEdits, None),
-                // Excluded when a `RowList` is focused so editing a node's
-                // inline arg field (typing Backspace, hitting Delete) doesn't
-                // also delete the surrounding node.
-                KeyBinding::new(
-                    "delete",
-                    crate::node_editor::DeleteSelected,
-                    Some("NodeEditor && !RowList"),
-                ),
-                KeyBinding::new(
-                    "backspace",
-                    crate::node_editor::DeleteSelected,
-                    Some("NodeEditor && !RowList"),
-                ),
-            ]);
+/// A consumer supplies a [`DB`], optionally asks the builder to boot the
+/// metor-db wire-protocol server, registers custom command-palette providers,
+/// and finally calls [`run`](PanelApp::run) to open the window. Custom
+/// commands reuse the existing [`InspectionItem`]/[`ItemProvider`] types and
+/// reach the tile tree and inspector through the gpui globals installed during
+/// startup, so no extra context has to be threaded into their callbacks.
+///
+/// [`on_init`](PanelApp::on_init) is the general escape hatch: it runs with
+/// `&mut App` after every built-in registry is initialized but before the
+/// window opens, which is where future custom-tile/widget registration will
+/// hook in.
+pub struct PanelApp {
+    db: Arc<DB>,
+    server_addr: Option<SocketAddr>,
+    command_providers: Vec<(Category, ItemProvider)>,
+    init_hooks: Vec<Box<dyn FnOnce(&mut App)>>,
+}
 
-            let bounds = Bounds::centered(None, size(px(1024.), px(600.)), cx);
-            let db = db.clone();
-            cx.open_window(
-                WindowOptions {
-                    window_bounds: Some(WindowBounds::Windowed(bounds)),
-                    titlebar: Some(TitlebarOptions {
-                        appears_transparent: true,
-                        traffic_light_position: Some(point(px(12.0), px(8.0))),
-                        ..Default::default()
-                    }),
-                    ..Default::default()
-                },
-                move |_window, cx| cx.new(|cx| AppRoot::new(db, cx)),
-            )
-            .unwrap();
+impl PanelApp {
+    /// Start from a consumer-owned database.
+    pub fn new(db: Arc<DB>) -> Self {
+        Self {
+            db,
+            server_addr: None,
+            command_providers: Vec::new(),
+            init_hooks: Vec::new(),
+        }
+    }
+
+    /// Boot the metor-db wire-protocol server on `addr` in a background task
+    /// before opening the window. Omit to leave serving to the consumer.
+    pub fn serve(mut self, addr: SocketAddr) -> Self {
+        self.server_addr = Some(addr);
+        self
+    }
+
+    /// Register a custom palette category with a pull-based provider. The
+    /// provider is evaluated on every palette open, so it always reflects the
+    /// current world state.
+    pub fn command_provider(mut self, category: Category, provider: ItemProvider) -> Self {
+        self.command_providers.push((category, provider));
+        self
+    }
+
+    /// Register a single static command under `Category::Custom(category)`.
+    /// Convenience wrapper over [`command_provider`](PanelApp::command_provider)
+    /// for the common "one named command" case.
+    pub fn command(
+        self,
+        category: impl Into<SharedString>,
+        label: impl Into<SharedString>,
+        callback: Arc<dyn Fn(&mut Window, &mut App)>,
+    ) -> Self {
+        let label = label.into();
+        let provider: ItemProvider = Arc::new(move |_cx| {
+            vec![InspectionItem::Command {
+                label: label.clone(),
+                callback: callback.clone(),
+            }]
         });
+        self.command_provider(Category::Custom(category.into()), provider)
+    }
+
+    /// Run arbitrary setup with `&mut App` after all built-in registries are
+    /// initialized but before the window opens. Hooks run in insertion order.
+    pub fn on_init(mut self, hook: impl FnOnce(&mut App) + 'static) -> Self {
+        self.init_hooks.push(Box::new(hook));
+        self
+    }
+
+    /// Boot the gpui application and block until the last window closes.
+    ///
+    /// Registers the theme, fonts, icons, edit queue, palette providers,
+    /// inspector registry, and widget registry, drains any consumer-supplied
+    /// command providers and init hooks, then opens the root window.
+    pub fn run(self) {
+        let PanelApp {
+            db,
+            server_addr,
+            command_providers,
+            init_hooks,
+        } = self;
+
+        if let Some(addr) = server_addr {
+            let server_db = db.clone();
+            stellar(move || async move {
+                let server = Server {
+                    listener: TcpListener::bind(addr).unwrap(),
+                    db: server_db,
+                };
+                server.run().await
+            });
+        }
+
+        let mut command_providers = Some(command_providers);
+        let mut init_hooks = Some(init_hooks);
+        Application::new()
+            .with_assets(crate::icons::IconAssets)
+            .run(move |cx: &mut App| {
+                crate::theme::register_fonts(cx);
+                let cfg = crate::config::load();
+                let family = crate::theme::resolve_font_family(cx, &cfg);
+                cx.set_global(crate::theme::FontSettings {
+                    family,
+                    config: cfg,
+                });
+                cx.set_global(crate::theme::ActiveTheme(Arc::new(
+                    crate::theme::DARK.clone(),
+                )));
+                edits::init(cx);
+                ItemRegistry::init(cx);
+                crate::inspector::registry::InspectorRegistry::init(db.clone(), cx);
+                crate::views::dashboard::WidgetRegistry::init(cx);
+                crate::dynamic::DynamicRegistry::init(cx);
+                crate::node_editor::GraphCoordinator::init(cx);
+                crate::node_editor::DynamicWorker::init(cx);
+                crate::node_editor::inspector_rows::register_inspector_rows(cx);
+                crate::alarms::AlarmStore::init(db.clone(), cx);
+                crate::sequences::SequenceStore::init(db.clone(), cx);
+                register_pane_item_deserializers(db.clone(), cx);
+
+                // Consumer extensions: register custom palette providers, then
+                // run init hooks. Both happen after the built-in registries
+                // exist so hooks can call into any of them.
+                for (category, provider) in command_providers.take().unwrap_or_default() {
+                    ItemRegistry::register(cx, category, provider);
+                }
+                for hook in init_hooks.take().unwrap_or_default() {
+                    hook(cx);
+                }
+
+                set_dock_icon();
+                cx.bind_keys([
+                    KeyBinding::new("cmd-p", OpenPalette, None),
+                    KeyBinding::new("ctrl-tab", CycleTabForward, None),
+                    KeyBinding::new("shift-ctrl-tab", CycleTabBackward, None),
+                    KeyBinding::new("cmd-l", ToggleCmdLock, None),
+                    KeyBinding::new("cmd-shift-e", OpenReviewEdits, None),
+                    // Excluded when a `RowList` is focused so editing a node's
+                    // inline arg field (typing Backspace, hitting Delete) doesn't
+                    // also delete the surrounding node.
+                    KeyBinding::new(
+                        "delete",
+                        crate::node_editor::DeleteSelected,
+                        Some("NodeEditor && !RowList"),
+                    ),
+                    KeyBinding::new(
+                        "backspace",
+                        crate::node_editor::DeleteSelected,
+                        Some("NodeEditor && !RowList"),
+                    ),
+                ]);
+
+                let bounds = Bounds::centered(None, size(px(1024.), px(600.)), cx);
+                let db = db.clone();
+                cx.open_window(
+                    WindowOptions {
+                        window_bounds: Some(WindowBounds::Windowed(bounds)),
+                        titlebar: Some(TitlebarOptions {
+                            appears_transparent: true,
+                            traffic_light_position: Some(point(px(12.0), px(8.0))),
+                            ..Default::default()
+                        }),
+                        ..Default::default()
+                    },
+                    move |_window, cx| cx.new(|cx| AppRoot::new(db, cx)),
+                )
+                .unwrap();
+            });
+    }
 }
 
 /// Populate the pane-item registry so [`TileGroup::from_json`] can rehydrate
@@ -614,6 +723,8 @@ fn register_pane_item_deserializers(db: Arc<DB>, cx: &mut App) {
 
     register_panel::<TextPanel>(&mut reg, db.clone(), TextPanel::from_config);
     register_panel::<AlarmPanel>(&mut reg, db.clone(), AlarmPanel::from_config);
+    register_panel::<SequencePanel>(&mut reg, db.clone(), SequencePanel::from_config);
+    register_panel::<SequenceGridPanel>(&mut reg, db.clone(), SequenceGridPanel::from_config);
     register_panel::<TablePanel>(&mut reg, db.clone(), TablePanel::from_config);
     register_panel::<DataTablePanel>(&mut reg, db.clone(), DataTablePanel::from_config);
     register_panel::<BrowserPanel>(&mut reg, db.clone(), BrowserPanel::from_config);

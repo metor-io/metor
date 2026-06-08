@@ -20,11 +20,16 @@ pub mod gpu_context;
 pub mod icons;
 pub mod inspect;
 pub mod inspector;
+pub(crate) mod msg_ingest;
 pub mod node_editor;
+pub mod sequences;
 pub mod presets;
 pub mod theme;
 pub mod tiles;
 pub mod views;
+
+pub use app::PanelApp;
+pub use inspector::palette::{Category, InspectionItem, ItemProvider};
 
 /// Borrow as a [`ComponentView`] without copying the backing buffer.
 pub trait AsComponentView {
