@@ -142,6 +142,29 @@ impl Theme {
             ..self.alarm_color(severity_index)
         }
     }
+
+    /// Solid color for a sequence channel's run state (`run_state_index`: 0 = idle,
+    /// 1 = running, 2 = completed, 3 = aborted, 4 = stopped, 5 = failed). Tracks the
+    /// theme's `control_active`/`error_accent` for the running/failed poles; the
+    /// intermediate states use fixed hues that read on both light and dark themes.
+    pub fn run_state_color(&self, run_state_index: usize) -> Hsla {
+        match run_state_index {
+            1 => self.control_active,   // running
+            2 => hex(0x4090e0, 1.0),    // completed — calm blue
+            3 => hex(0xe0a030, 1.0),    // aborted — amber (commanded safe stop)
+            4 => hex(0xe06820, 1.0),    // stopped — orange (hard, possibly unsafe)
+            5 => self.error_accent,     // failed
+            _ => self.text_tertiary,    // idle / unknown
+        }
+    }
+
+    /// Low-alpha [`run_state_color`](Self::run_state_color) for swatch/row backgrounds.
+    pub fn run_state_tint(&self, run_state_index: usize) -> Hsla {
+        Hsla {
+            a: 0.12,
+            ..self.run_state_color(run_state_index)
+        }
+    }
 }
 
 /// Global wrapper that makes the active [`Theme`] addressable from any view.
@@ -174,6 +197,7 @@ pub fn all_themes() -> &'static [&'static Theme] {
         &ROSE_PINE_DAWN,
         &MAKING_SOFTWARE,
         &DEPARTURE,
+        &KINTSUGI,
     ];
     THEMES
 }
@@ -658,6 +682,52 @@ pub static DEPARTURE: Theme = Theme {
     control_active: hex(0xf0a040, 1.0),
     control_active_track: hex(0xf0a040, 0.7),
     error_accent: hex(0xe05050, 1.0),
+};
+
+/// Port of the "Kintsugi" VS Code theme (github.com/ahatem/vscode-kintsugi),
+/// **Dark Flared** variant: the same warm charcoal surfaces as the standard
+/// dark theme, but with the Flared variant's hotter, earth-toned accents —
+/// terracotta, burnt orange, and golden amber — like fresh gold seams in the
+/// pottery repair it's named for. The categorical line palette leads with those
+/// warm tones, keeping a few cool anchors so series stay distinguishable.
+pub static KINTSUGI: Theme = Theme {
+    name: "Kintsugi Flared",
+
+    bg_primary: hex(0x161618, 1.0),
+    bg_secondary: hex(0x131314, 1.0),
+    bg_elevated: hex(0x292928, 1.0),
+
+    text_primary: hex(0xdddddd, 1.0),
+    text_secondary: hex(0x969b8c, 1.0),
+    text_tertiary: hex(0x75715e, 1.0),
+
+    border_primary: hex(0x2a2a28, 1.0),
+
+    selection_bg: hex(0x393b31, 1.0),
+    text_selection: hex(0x6c7a8a, 0.4),
+    drop_target: hex(0xdbad49, 0.15),
+
+    pill_bg: hex(0x20201f, 1.0),
+    pill_border: hex(0x3a3a36, 1.0),
+
+    line_color: hex(0xdbad49, 1.0),
+    line_colors: [
+        hex(0xdbad49, 1.0), // golden amber
+        hex(0x6c7a8a, 1.0), // blue
+        hex(0xa3be8c, 1.0), // sage green
+        hex(0xd66848, 1.0), // terracotta
+        hex(0xb3a3d3, 1.0), // purple
+        hex(0x678e87, 1.0), // teal
+        hex(0xe08542, 1.0), // burnt orange
+        hex(0x8fa3b3, 1.0), // slate
+    ],
+    grid_color: hex(0x1d1d1c, 1.0),
+    axis_color: hex(0x444444, 1.0),
+    zero_line_color: hex(0x5c584f, 1.0),
+
+    control_active: hex(0xdbad49, 1.0),
+    control_active_track: hex(0xdbad49, 0.7),
+    error_accent: hex(0xd66848, 1.0),
 };
 
 /// Family name of the font bundled into the binary. This is the guaranteed
