@@ -8,6 +8,8 @@ repository.workspace = true
 # async
 stellarator.path = "../../libs/stellarator"
 stellarator.features = ["miette"]
+maitake.path = "../../libs/stellarator/maitake"
+maitake.features = ["std"]
 metor-proto-stellar.path = "../../libs/metor-proto/stellar"
 
 # ser-de

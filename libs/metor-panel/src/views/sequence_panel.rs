@@ -15,7 +15,7 @@ use metor_proto_wkt::{ChannelId, SequenceRunState};
 
 use crate::inspector::rows::{CommandRow, InspectorRow, NavRow};
 use crate::inspector::{InspectorMode, InspectorRequest, open_inspector};
-use crate::sequences::{self, run_state_index, run_state_label};
+use crate::sequences::{self, is_resettable, run_state_index, run_state_label};
 use crate::theme::theme;
 
 /// Run-state chips to surface in the header, in display order. `Idle` is omitted as noise.
@@ -110,10 +110,12 @@ pub(crate) fn load_picker_rows(
         .collect()
 }
 
-/// Inspector control page for one channel: Load / Start / Abort / Stop. `Stop` drills into
-/// a confirmation row since it is the unsafe hard-drop. Used by the grid's click-through.
+/// Inspector control page for one channel: Load / Reset / Start / Abort / Stop. `Reset` only
+/// appears from a terminal state; `Stop` drills into a confirmation row since it is the unsafe
+/// hard-drop. Used by the grid's click-through.
 pub(crate) fn channel_control_rows(
     channel_id: ChannelId,
+    run_state: SequenceRunState,
     available: Vec<SharedString>,
 ) -> Vec<Box<dyn InspectorRow>> {
     let mut rows: Vec<Box<dyn InspectorRow>> = Vec::new();
@@ -123,6 +125,16 @@ pub(crate) fn channel_control_rows(
         "",
         Box::new(move |_cx| load_picker_rows(channel_id, &available)),
     )));
+    if is_resettable(run_state) {
+        rows.push(Box::new(CommandRow::new(
+            "Reset",
+            Arc::new(move |_window, cx| {
+                if let Some(store) = sequences::try_global(cx) {
+                    store.read(cx).reset(channel_id);
+                }
+            }),
+        )));
+    }
     rows.push(Box::new(CommandRow::new(
         "Start",
         Arc::new(move |_window, cx| {
@@ -349,6 +361,17 @@ impl SequenceView {
             }),
         );
 
+        let resettable = is_resettable(ch.run_state);
+        let reset_btn = pill_button(theme, ("seq-reset", id as usize), "Reset").on_click(
+            cx.listener(move |this, _, _, cx| {
+                this.arming_stop = None;
+                if let Some(store) = sequences::try_global(cx) {
+                    store.read(cx).reset(id);
+                }
+                cx.notify();
+            }),
+        );
+
         let start_btn = pill_button(theme, ("seq-start", id as usize), "Start").on_click(
             cx.listener(move |this, _, _, cx| {
                 this.arming_stop = None;
@@ -438,6 +461,7 @@ impl SequenceView {
                     .flex_row()
                     .gap_1()
                     .child(load_btn)
+                    .when(resettable, |el| el.child(reset_btn))
                     .child(start_btn)
                     .child(abort_btn)
                     .child(stop_btn),
