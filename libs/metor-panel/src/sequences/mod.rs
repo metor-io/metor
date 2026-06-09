@@ -212,6 +212,15 @@ pub fn run_state_index(run_state: SequenceRunState) -> usize {
     }
 }
 
+/// Whether a channel in this run state may be reset to the beginning. Reset is only offered
+/// from a terminal `Completed`/`Aborted` state (the control system enforces the same guard).
+pub fn is_resettable(run_state: SequenceRunState) -> bool {
+    matches!(
+        run_state,
+        SequenceRunState::Completed | SequenceRunState::Aborted
+    )
+}
+
 pub fn run_state_label(run_state: SequenceRunState) -> &'static str {
     match run_state {
         SequenceRunState::Idle => "Idle",
@@ -308,6 +317,12 @@ impl SequenceStore {
     /// a confirmation gesture before calling it.
     pub fn stop(&self, channel_id: ChannelId) {
         self.publish(channel_id, SequenceCommandKind::Stop);
+    }
+
+    /// Rebuild the loaded sequence from the beginning. Only meaningful from a terminal state
+    /// (see [`is_resettable`]); the control system ignores it otherwise.
+    pub fn reset(&self, channel_id: ChannelId) {
+        self.publish(channel_id, SequenceCommandKind::Reset);
     }
 
     /// Ask the control system to re-read its sequence source(s) and re-publish the registry.

@@ -135,6 +135,41 @@ fn history_caps_at_max() {
 }
 
 #[test]
+fn reset_returns_completed_channel_to_idle() {
+    let mut state = SequenceState::default();
+    state.apply_registry(ts(1), registry(&[(10, "Deploy", &["solar"])]));
+    state.apply_event(
+        ts(2),
+        event(10, SequenceEventKind::Loaded { name: "solar".into() }),
+    );
+    state.apply_event(ts(3), event(10, SequenceEventKind::Started));
+    state.apply_event(ts(4), event(10, SequenceEventKind::Completed));
+    assert_eq!(state.channel(10).unwrap().run_state, SequenceRunState::Completed);
+    assert!(super::is_resettable(SequenceRunState::Completed));
+
+    // The control system reports a reset as a fresh `Loaded`, returning the channel to idle.
+    state.apply_event(
+        ts(5),
+        event(10, SequenceEventKind::Loaded { name: "solar".into() }),
+    );
+    let ch = state.channel(10).unwrap();
+    assert_eq!(ch.run_state, SequenceRunState::Idle);
+    assert_eq!(ch.loaded.as_ref().map(|s| s.as_ref()), Some("solar"));
+    assert!(ch.last_message.is_none());
+}
+
+#[test]
+fn is_resettable_only_in_terminal_safe_states() {
+    use super::is_resettable;
+    assert!(is_resettable(SequenceRunState::Completed));
+    assert!(is_resettable(SequenceRunState::Aborted));
+    assert!(!is_resettable(SequenceRunState::Idle));
+    assert!(!is_resettable(SequenceRunState::Running));
+    assert!(!is_resettable(SequenceRunState::Stopped));
+    assert!(!is_resettable(SequenceRunState::Failed));
+}
+
+#[test]
 fn count_in_state_tracks_run_states() {
     let mut state = SequenceState::default();
     state.apply_registry(ts(1), registry(&[(10, "A", &[]), (20, "B", &[]), (30, "C", &[])]));

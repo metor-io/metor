@@ -743,6 +743,9 @@ pub enum SequenceCommandKind {
     Abort,
     /// Hard-stop (drop) — may leave the system unsafe.
     Stop,
+    /// Rebuild the loaded sequence from the beginning, returning the channel to a ready
+    /// (idle) state. Only valid from a terminal `Completed`/`Aborted` state.
+    Reset,
 }
 
 /// A command targeting one channel, published by the panel.
@@ -921,6 +924,15 @@ mod sequence_tests {
             },
         };
         assert_eq!(command.channel_id, roundtrip(&command).channel_id);
+
+        let reset = SequenceCommand {
+            channel_id: 2,
+            command: SequenceCommandKind::Reset,
+        };
+        assert!(matches!(
+            roundtrip(&reset).command,
+            SequenceCommandKind::Reset
+        ));
 
         let _ = roundtrip(&ReloadSequences {});
     }

@@ -96,6 +96,7 @@ impl Render for SequenceGrid {
         for cell in cells {
             let color = theme.run_state_color(run_state_index(cell.run_state));
             let id = cell.id;
+            let run_state = cell.run_state;
             let available = cell.available.clone();
             let tooltip = cell.tooltip.clone();
 
@@ -121,7 +122,7 @@ impl Render for SequenceGrid {
                         let Some(open) = open_inspector(cx) else {
                             return;
                         };
-                        let rows = channel_control_rows(id, available.clone());
+                        let rows = channel_control_rows(id, run_state, available.clone());
                         open(
                             InspectorRequest {
                                 rows,
