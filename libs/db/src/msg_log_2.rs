@@ -247,18 +247,13 @@ impl MsgLog {
             None
         };
 
-        let entries = std::fs::read_dir(path)?;
-        for entry in entries {
-            let entry = entry?;
-            let node_path = entry.path();
-            if node_path.is_dir() && node_path.file_name().unwrap_or_default() != "metadata" {
-                match MsgLogNode::open(&node_path) {
-                    Ok(node) => {
-                        list.push(node);
-                    }
-                    Err(e) => {
-                        warn!(?node_path, ?e, "failed to open msg log node");
-                    }
+        for node_path in crate::time_series_2::node_dirs_oldest_first(path)? {
+            match MsgLogNode::open(&node_path) {
+                Ok(node) => {
+                    list.push(node);
+                }
+                Err(e) => {
+                    warn!(?node_path, ?e, "failed to open msg log node");
                 }
             }
         }

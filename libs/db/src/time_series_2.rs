@@ -75,6 +75,30 @@ impl TimeSeriesNode {
     }
 }
 
+/// Timestamp-named node directories under `path`, oldest first. The stack
+/// makes the last-pushed node its head, so pushing in this order restores
+/// the newest-first iteration invariant that queries and the writer rely
+/// on; `read_dir` alone yields filesystem order, not time order.
+pub(crate) fn node_dirs_oldest_first(path: &Path) -> Result<Vec<PathBuf>, Error> {
+    let mut dirs: Vec<(i64, PathBuf)> = Vec::new();
+    for entry in std::fs::read_dir(path)? {
+        let node_path = entry?.path();
+        if !node_path.is_dir() {
+            continue;
+        }
+        let Some(start_ts) = node_path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .and_then(|name| name.parse::<i64>().ok())
+        else {
+            continue;
+        };
+        dirs.push((start_ts, node_path));
+    }
+    dirs.sort_unstable_by_key(|(start_ts, _)| *start_ts);
+    Ok(dirs.into_iter().map(|(_, path)| path).collect())
+}
+
 #[derive(Clone)]
 pub struct TimestampRef {
     node: Arc<AtomicNode<TimeSeriesNode>>,
@@ -207,20 +231,14 @@ impl TimeSeries {
         let path = path.as_ref();
         let list = Arc::new(AtomicStack::new());
 
-        // Scan directory for existing time series nodes
         if path.exists() {
-            let entries = std::fs::read_dir(path)?;
-            for entry in entries {
-                let entry = entry?;
-                let node_path = entry.path();
-                if node_path.is_dir() {
-                    match TimeSeriesNode::open(&node_path) {
-                        Ok(node) => {
-                            list.push(node);
-                        }
-                        Err(e) => {
-                            warn!(?node_path, ?e, "failed to open time series node");
-                        }
+            for node_path in node_dirs_oldest_first(path)? {
+                match TimeSeriesNode::open(&node_path) {
+                    Ok(node) => {
+                        list.push(node);
+                    }
+                    Err(e) => {
+                        warn!(?node_path, ?e, "failed to open time series node");
                     }
                 }
             }
@@ -407,5 +425,35 @@ impl TimerSeriesWriter {
         };
         head.index.write(&timestamp.to_le_bytes())?;
         Ok(true)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn open_restores_newest_first_order() {
+        let dir = tempfile::tempdir().unwrap();
+        // Starts chosen so lexicographic directory order (100 < 20 < 3 < 9)
+        // disagrees with numeric order, catching any reliance on read_dir
+        // ordering.
+        let starts = [9i64, 100, 20, 3];
+        for start in starts {
+            let node =
+                TimeSeriesNode::create(dir.path().join(start.to_string()), Timestamp(start), 8)
+                    .unwrap();
+            node.data.write(&start.to_le_bytes()).unwrap();
+            node.index.write(&Timestamp(start).to_le_bytes()).unwrap();
+        }
+
+        let series = TimeSeries::open(dir.path()).unwrap();
+        let starts_newest_first: Vec<i64> = series
+            .list
+            .iter()
+            .map(|node| node.timestamps()[0].0)
+            .collect();
+        assert_eq!(starts_newest_first, vec![100, 20, 9, 3]);
+        assert_eq!(series.latest().unwrap().timestamp().0, 100);
     }
 }

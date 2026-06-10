@@ -480,14 +480,14 @@ mod tests {
     async fn test_single_reader_writer() {
         let disruptor = Disruptor::new(1024);
         let mut reader = disruptor.reader();
-        let mut write = disruptor.grant(11).await.unwrap();
+        let mut write = disruptor.try_grant(11).unwrap();
         write.copy_from_slice(b"hello world");
         drop(write);
         {
             let grant = reader.next().await;
             assert_eq!(&grant[..], b"hello world");
         }
-        let mut write = disruptor.grant(3).await.unwrap();
+        let mut write = disruptor.try_grant(3).unwrap();
         write.copy_from_slice(b"foo");
         drop(write);
         {
@@ -501,14 +501,14 @@ mod tests {
         let disruptor = Disruptor::new(1024);
         let mut a = disruptor.reader();
         let mut b = disruptor.reader();
-        let mut write = disruptor.grant(11).await.unwrap();
+        let mut write = disruptor.try_grant(11).unwrap();
         write.copy_from_slice(b"hello world");
         drop(write);
         {
             let grant = a.next().await;
             assert_eq!(&grant[..], b"hello world");
         }
-        let mut write = disruptor.grant(3).await.unwrap();
+        let mut write = disruptor.try_grant(3).unwrap();
         write.copy_from_slice(b"foo");
         drop(write);
         {
@@ -524,14 +524,14 @@ mod tests {
     async fn test_single_reader_writer_wrap() {
         let disruptor = Disruptor::new(12);
         let mut reader = disruptor.reader();
-        let mut write = disruptor.grant(11).await.unwrap();
+        let mut write = disruptor.try_grant(11).unwrap();
         write.copy_from_slice(b"hello world");
         drop(write);
         {
             let grant = reader.next().await;
             assert_eq!(&grant[..], b"hello world");
         }
-        let mut write = disruptor.grant(3).await.unwrap();
+        let mut write = disruptor.try_grant(3).unwrap();
         write.copy_from_slice(b"foo");
         drop(write);
         {
@@ -539,7 +539,7 @@ mod tests {
             assert_eq!(&grant[..], b"foo");
         }
 
-        let mut write = disruptor.grant(3).await.unwrap();
+        let mut write = disruptor.try_grant(3).unwrap();
         write.copy_from_slice(b"foo");
         drop(write);
         {
@@ -553,7 +553,7 @@ mod tests {
         let disruptor = Disruptor::new(12);
         let mut a = disruptor.reader();
         let mut b = disruptor.reader();
-        let mut write = disruptor.grant(11).await.unwrap();
+        let mut write = disruptor.try_grant(11).unwrap();
         write.copy_from_slice(b"hello world");
         drop(write);
         {
@@ -564,7 +564,7 @@ mod tests {
             let grant = b.next().await;
             assert_eq!(&grant[..], b"hello world");
         }
-        let mut write = disruptor.grant(3).await.unwrap();
+        let mut write = disruptor.try_grant(3).unwrap();
         write.copy_from_slice(b"foo");
         drop(write);
         {

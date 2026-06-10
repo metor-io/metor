@@ -78,3 +78,6 @@ parquet.optional = true
 
 # codegen
 postcard-c-codegen.path = "../postcard-c/codegen"
+
+[dev-dependencies]
+tempfile = "3.13.0"
