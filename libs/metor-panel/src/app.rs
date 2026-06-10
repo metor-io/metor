@@ -613,6 +613,7 @@ fn global_time_range_rows(cx: &gpui::App) -> Vec<Box<dyn InspectorRow>> {
 pub struct PanelApp {
     db: Arc<DB>,
     server_addr: Option<SocketAddr>,
+    remote_addr: Option<SocketAddr>,
     command_providers: Vec<(Category, ItemProvider)>,
     init_hooks: Vec<Box<dyn FnOnce(&mut App)>>,
 }
@@ -623,6 +624,7 @@ impl PanelApp {
         Self {
             db,
             server_addr: None,
+            remote_addr: None,
             command_providers: Vec::new(),
             init_hooks: Vec::new(),
         }
@@ -632,6 +634,14 @@ impl PanelApp {
     /// before opening the window. Omit to leave serving to the consumer.
     pub fn serve(mut self, addr: SocketAddr) -> Self {
         self.server_addr = Some(addr);
+        self
+    }
+
+    /// Mirror a long-running remote metor-db at `addr`: live telemetry
+    /// streams into the local DB, and plots hydrate remote-only history on
+    /// demand (gaps render as translucent bands until their nodes land).
+    pub fn remote(mut self, addr: SocketAddr) -> Self {
+        self.remote_addr = Some(addr);
         self
     }
 
@@ -678,6 +688,7 @@ impl PanelApp {
         let PanelApp {
             db,
             server_addr,
+            remote_addr,
             command_providers,
             init_hooks,
         } = self;
@@ -692,6 +703,19 @@ impl PanelApp {
                 server.run().await
             });
         }
+
+        let hydrator = remote_addr.map(|addr| {
+            let remote = metor_db::remote::RemoteDb::new(addr);
+            let hydrator = remote.hydrator();
+            let remote_db = db.clone();
+            stellar(move || async move {
+                remote.spawn(remote_db);
+                // The mirror and hydrator tasks own this thread's runtime;
+                // park so it never winds down.
+                std::future::pending::<()>().await
+            });
+            hydrator
+        });
 
         let mut command_providers = Some(command_providers);
         let mut init_hooks = Some(init_hooks);
@@ -708,6 +732,9 @@ impl PanelApp {
                 cx.set_global(crate::theme::ActiveTheme(Arc::new(
                     crate::theme::DARK.clone(),
                 )));
+                if let Some(hydrator) = hydrator.clone() {
+                    cx.set_global(crate::hydration::HydratorGlobal(hydrator));
+                }
                 edits::init(cx);
                 ItemRegistry::init(cx);
                 crate::inspector::registry::InspectorRegistry::init(db.clone(), cx);

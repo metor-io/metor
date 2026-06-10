@@ -62,6 +62,7 @@ pub mod msg_log_2;
 pub mod remote;
 pub mod seal;
 pub mod store;
+pub mod tiering;
 //pub(crate) mod time_series;
 pub mod time_series_2;
 pub use msg_log_2 as msg_log;

@@ -181,6 +181,55 @@ impl LinePlot {
         }
     }
 
+    /// Remote-only stretches of the visible window, as `(start, width)`
+    /// fractions of the plot width plus an is-downloading flag. As a side
+    /// effect, asks the installed hydrator (if any) to fetch them — the
+    /// request queue is bounded and deduplicated, so per-frame calls are
+    /// cheap and idempotent.
+    fn gap_bands(&self, cx: &gpui::App) -> smallvec::SmallVec<[(f32, f32, bool); 4]> {
+        let mut bands = smallvec::SmallVec::new();
+        let Some(view) = self.effective_view(cx) else {
+            return bands;
+        };
+        let (min_x, max_x) = view.x;
+        let span = (max_x - min_x).max(1.0);
+        let visible = Timestamp(min_x as i64)..Timestamp(max_x as i64);
+        let hydrator = crate::hydration::hydrator(cx);
+        let mut gaps = metor_db::manifest::GapVec::new();
+        for trace in &self.traces {
+            let cfg = trace.read(cx);
+            if !cfg.visible {
+                continue;
+            }
+            let Some(component) = self
+                .tracking
+                .get(&trace.entity_id())
+                .and_then(|t| t.component.as_ref())
+            else {
+                continue;
+            };
+            gaps.clear();
+            component.time_series.coverage(visible.clone(), &mut gaps);
+            for gap in &gaps {
+                if gap.state == metor_db::manifest::SpanState::RemoteOnly
+                    && let Some(hydrator) = &hydrator
+                {
+                    hydrator.request(cfg.component_id, gap.range.clone());
+                }
+                let start = ((gap.range.start.0 as f64 - min_x) / span).clamp(0.0, 1.0) as f32;
+                let end = ((gap.range.end.0 as f64 - min_x) / span).clamp(0.0, 1.0) as f32;
+                if end > start {
+                    bands.push((
+                        start,
+                        end - start,
+                        gap.state == metor_db::manifest::SpanState::Fetching,
+                    ));
+                }
+            }
+        }
+        bands
+    }
+
     /// Bring tracking state and the title cache in sync with `self.traces`.
     ///
     /// Runs on every self-notify. Spawns a tracker for each new trace,
@@ -516,6 +565,7 @@ impl LinePlot {
 impl Render for LinePlot {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let degraded = self.gpu_state.degraded();
+        let gap_bands = self.gap_bands(cx);
         let weak = cx.entity().downgrade();
         let plot_canvas = canvas(
             move |bounds, window, cx| {
@@ -581,6 +631,18 @@ impl Render for LinePlot {
             .size_full()
             .relative()
             .child(plot_canvas)
+            .children(gap_bands.into_iter().map(|(start, width, _fetching)| {
+                // History that lives in a store but not on disk yet; the
+                // hydrator has been asked for it and the band disappears
+                // when the data lands and wakes the trackers.
+                div()
+                    .absolute()
+                    .top_0()
+                    .bottom_0()
+                    .left(gpui::relative(start))
+                    .w(gpui::relative(width))
+                    .bg(crate::theme::DARK.plot_gap_band)
+            }))
             .when(degraded, |el| {
                 // The last frame clamped its uploads: more samples are in
                 // view than the GPU buffers hold, so the trace is shown

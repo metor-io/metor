@@ -17,6 +17,7 @@ pub mod app;
 pub mod config;
 pub mod dynamic;
 pub mod gpu_context;
+pub mod hydration;
 pub mod icons;
 pub mod inspect;
 pub mod inspector;
