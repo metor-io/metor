@@ -1455,11 +1455,13 @@ async fn handle_packet<A: AsyncWrite + 'static>(
             })
             .await?;
         }
-        // The node-transfer/sync range is reserved: a message here that no
-        // arm above matched is from a newer protocol, not telemetry to
-        // record.
-        Packet::Msg(m) if m.id[0] == 224 => {
-            warn!(id = ?m.id, "ignoring unknown reserved protocol message");
+        // Node-transfer protocol messages never carry telemetry: one that
+        // no arm above matched is a stray reply, not a message to record.
+        // Every other unmatched message (alarms, sequences, …) MUST fall
+        // through — recording it in the msg log is the pub/sub mechanism
+        // its views read from.
+        Packet::Msg(m) if NODE_PROTOCOL_MESSAGES.contains(&m.id) => {
+            warn!(id = ?m.id, "ignoring stray node-protocol message");
         }
         Packet::Msg(m) => {
             let timestamp = m.timestamp.unwrap_or(Timestamp::now());

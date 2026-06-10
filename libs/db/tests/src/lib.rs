@@ -41,6 +41,33 @@ mod tests {
         let (_client, _db) = setup_test_db().await.unwrap();
     }
 
+    /// Sequence/alarm messages have no handler arm by design — recording
+    /// them in the msg log IS their pub/sub path. The node-protocol guard
+    /// must not swallow them (it did once; the sequence view went blank).
+    #[test]
+    async fn reserved_wkt_messages_still_record_as_telemetry() {
+        let (addr, db) = setup_test_db().await.unwrap();
+        let mut client = Client::connect(addr).await.unwrap();
+        let event = SequenceChannelEvent {
+            channel_id: 3,
+            kind: SequenceEventKind::Started,
+        };
+        client.send(&event).await.0.unwrap();
+        let mut recorded = false;
+        for _ in 0..40 {
+            sleep(Duration::from_millis(50)).await;
+            recorded = db.with_state_mut(|state| {
+                state
+                    .get_or_insert_msg_log(SequenceChannelEvent::ID, &db.path)
+                    .is_ok_and(|log| log.latest().is_some())
+            });
+            if recorded {
+                break;
+            }
+        }
+        assert!(recorded, "sequence event was not recorded in the msg log");
+    }
+
     #[test]
     async fn peer_store_conforms() {
         let (addr, _db) = setup_test_db().await.unwrap();

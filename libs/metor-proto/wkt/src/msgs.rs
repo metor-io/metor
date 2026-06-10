@@ -947,6 +947,24 @@ impl Msg for NodeAck {
     const ID: PacketId = [224, 55];
 }
 
+/// Every message of the sealed-node transfer protocol. Servers consult
+/// this to keep stray protocol messages out of recorded telemetry; other
+/// unmatched messages (alarms, sequences, …) are telemetry by design —
+/// the msg log is their pub/sub channel.
+pub const NODE_PROTOCOL_MESSAGES: &[PacketId] = &[
+    GetDbInfo::ID,
+    DbInfoResp::ID,
+    GetNodeManifest::ID,
+    NodeManifestResp::ID,
+    FetchNode::ID,
+    NodeChunk::ID,
+    FetchNodeDone::ID,
+    OfferNode::ID,
+    OfferNodeResp::ID,
+    PushNodeDone::ID,
+    NodeAck::ID,
+];
+
 #[cfg(test)]
 mod alarm_tests {
     use super::*;
