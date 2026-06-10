@@ -1408,7 +1408,7 @@ impl TimeSeriesPlot {
     /// Clear every user-imposed bound so auto-fit resumes on the next frame.
     fn reset_view(&mut self, cx: &mut Context<Self>) {
         self.line_plot.update(cx, |lp, cx| {
-            lp.x_range = TimeRangeBehavior::default();
+            lp.x_range = Override::Auto;
             for axis in lp.axes.clone() {
                 axis.update(cx, |a, cx| {
                     a.y_min_override = Override::Auto;

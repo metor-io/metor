@@ -12,6 +12,12 @@ pub struct SerializedTileGroup {
     /// Bumped only on a structural break in the document. Field-level changes
     /// rely on Facet's `#[facet(default)]` instead.
     pub version: u32,
+    /// App-wide default time window in `TimeRangeBehavior`'s string
+    /// grammar; plots with an `Auto` range follow it. Stored as text
+    /// because the behavior's internals aren't `Facet`-serializable.
+    /// Empty (and absent, in older layouts) means full range.
+    #[facet(default)]
+    pub global_time_range: String,
     pub root: SerializedMember,
 }
 
@@ -133,6 +139,7 @@ mod tests {
     fn sample_layout() -> SerializedTileGroup {
         SerializedTileGroup {
             version: 1,
+            global_time_range: String::new(),
             root: SerializedMember::Split(SerializedSplit {
                 axis: SerializedAxis::Horizontal,
                 flexes: vec![1.0, 2.0],

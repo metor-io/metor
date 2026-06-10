@@ -477,6 +477,8 @@ impl TileGroup {
     pub fn serialize(&self, cx: &App) -> SerializedTileGroup {
         SerializedTileGroup {
             version: SUPPORTED_LAYOUT_VERSION,
+            global_time_range: crate::views::time_series::time_range::GlobalTimeRange::get(cx)
+                .to_string(),
             root: self.root.serialize(cx),
         }
     }
@@ -529,6 +531,9 @@ impl TileGroup {
         registry: &ItemRegistry,
         cx: &mut Context<Self>,
     ) -> Self {
+        if let Ok(behavior) = serialized.global_time_range.parse() {
+            crate::views::time_series::time_range::GlobalTimeRange::set(cx, behavior);
+        }
         let mut panes = Vec::new();
         let root = Self::deserialize_member(&serialized.root, registry, &mut panes, cx);
         let mut this = Self {

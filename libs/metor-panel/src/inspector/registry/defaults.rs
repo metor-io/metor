@@ -31,6 +31,7 @@ impl InspectorRegistry {
         self.register_override_shared_string();
         self.register_override_hsla();
         self.register_time_range_behavior();
+        self.register_override_time_range_behavior();
         self.register_inspectable::<crate::views::Monitor>();
         self.register_inspectable::<crate::views::AlarmView>();
         self.register_inspectable::<crate::views::SequenceView>();
@@ -330,6 +331,80 @@ impl InspectorRegistry {
                 }),
             ))
         }));
+    }
+
+    /// Row for `Override<TimeRangeBehavior>`: like the plain range picker,
+    /// with an extra "Auto" choice that resumes following the app-wide
+    /// global range. Presets and custom text pin the plot to its own
+    /// window.
+    fn register_override_time_range_behavior(&mut self) {
+        self.register_field_widget::<Override<TimeRangeBehavior>>(Arc::new(
+            |ctx, peek, any_entity, idx| {
+                let current = peek.get::<Override<TimeRangeBehavior>>().unwrap().clone();
+                let summary = match current.as_custom() {
+                    None => SharedString::new_static("Auto"),
+                    Some(behavior) => builders::preset_label(behavior)
+                        .map(SharedString::from)
+                        .unwrap_or_else(|| SharedString::from(format!("{behavior}"))),
+                };
+                let label = ctx.label.clone();
+                Box::new(NavRow::new(
+                    label,
+                    summary,
+                    Box::new(move |cx| {
+                        let current = crate::inspector::reflect::get_field::<
+                            Override<TimeRangeBehavior>,
+                        >(&any_entity, idx, cx)
+                        .unwrap_or(Override::Auto);
+                        let auto_entity = any_entity.clone();
+                        let mut rows: Vec<Box<dyn InspectorRow>> =
+                            vec![Box::new(CommandRow::new(
+                                "Auto (follow global)",
+                                Arc::new(move |_w, cx| {
+                                    crate::inspector::reflect::set_field::<
+                                        Override<TimeRangeBehavior>,
+                                    >(
+                                        &auto_entity, idx, Override::Auto, cx
+                                    );
+                                }),
+                            ))];
+                        rows.extend(TimeRangeBehavior::PRESETS.iter().map(|(name, value)| {
+                            let entity = any_entity.clone();
+                            let value = *value;
+                            Box::new(CommandRow::new(
+                                *name,
+                                Arc::new(move |_w, cx| {
+                                    crate::inspector::reflect::set_field::<
+                                        Override<TimeRangeBehavior>,
+                                    >(
+                                        &entity, idx, Override::Custom(value), cx
+                                    );
+                                }),
+                            )) as Box<dyn InspectorRow>
+                        }));
+                        let entity = any_entity.clone();
+                        let current_text = current
+                            .as_custom()
+                            .map(|b| SharedString::from(format!("{b}")))
+                            .unwrap_or_default();
+                        rows.push(Box::new(TextRow::new(
+                            SharedString::new_static("Custom"),
+                            current_text,
+                            Arc::new(move |s, _w, cx| {
+                                if let Ok(value) = s.parse::<TimeRangeBehavior>() {
+                                    crate::inspector::reflect::set_field::<
+                                        Override<TimeRangeBehavior>,
+                                    >(
+                                        &entity, idx, Override::Custom(value), cx
+                                    );
+                                }
+                            }),
+                        )));
+                        rows
+                    }),
+                ))
+            },
+        ));
     }
 
     fn register_measurement_cursor_builder(&mut self) {

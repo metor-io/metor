@@ -14,7 +14,7 @@ use std::sync::Arc;
 
 use gpui::{
     Bounds, Context, Corners, Entity, EntityId, Hsla, IntoElement, Pixels, Render, SharedString,
-    Window, canvas, prelude::*,
+    Window, canvas, div, prelude::*,
 };
 use metor_db::{Component, DB};
 use metor_proto::types::{ComponentId, Timestamp};
@@ -24,7 +24,7 @@ use super::gpu::{AxisSource, LineDraw, PlotRenderState};
 use super::override_field::Override;
 use super::{NodeBoundsCache, TimeFormat, Trace, YAxis, expand_value_bounds};
 use crate::views::plot_common::reconcile_trackers;
-use crate::views::time_series::time_range::TimeRangeBehavior;
+use crate::views::time_series::time_range::{GlobalTimeRange, TimeRangeBehavior};
 use crate::wait_for_component;
 
 /// Background state for one trace, keyed by the trace's [`EntityId`] so
@@ -55,6 +55,8 @@ impl TraceTracking {
 struct OverrideSnapshot {
     /// Per-axis `(min, max)` overrides, index-aligned with `LinePlot::axes`.
     axes: smallvec::SmallVec<[(Option<f64>, Option<f64>); 2]>,
+    /// The *resolved* range, so a global-range edit clears the pan/zoom
+    /// override exactly like a per-plot edit does.
     x_range: TimeRangeBehavior,
 }
 
@@ -73,7 +75,7 @@ impl OverrideSnapshot {
             .collect();
         Self {
             axes,
-            x_range: lp.x_range,
+            x_range: lp.resolved_x_range(cx),
         }
     }
 }
@@ -89,7 +91,9 @@ pub struct LinePlot {
     /// Y axes, stacked left-to-right outward from the plot. Always holds at
     /// least one (axis 0, the primary). Each trace names its axis by index.
     pub axes: Vec<Entity<YAxis>>,
-    pub x_range: TimeRangeBehavior,
+    /// `Auto` follows the app-wide [`GlobalTimeRange`]; `Custom` pins this
+    /// plot to its own window.
+    pub x_range: Override<TimeRangeBehavior>,
     pub x_time_format: TimeFormat,
     pub custom_title: Override<SharedString>,
     /// Draw the control system's alarm limit lines for traces on this plot.
@@ -124,7 +128,7 @@ impl LinePlot {
         Self {
             traces: Vec::new(),
             axes: vec![primary_axis],
-            x_range: TimeRangeBehavior::default(),
+            x_range: Override::Auto,
             x_time_format: TimeFormat::default(),
             custom_title: Override::Auto,
             show_alarm_limits: true,
@@ -135,7 +139,7 @@ impl LinePlot {
             view_override: None,
             last_overrides: OverrideSnapshot {
                 axes: smallvec::SmallVec::new(),
-                x_range: TimeRangeBehavior::default(),
+                x_range: TimeRangeBehavior::FULL,
             },
             title_cache: "Plot".into(),
             gpu_state: PlotRenderState::default(),
@@ -166,6 +170,15 @@ impl LinePlot {
 
     pub fn db(&self) -> &Arc<DB> {
         &self.db
+    }
+
+    /// The time window this plot actually uses: its own `Custom` range, or
+    /// the app-wide [`GlobalTimeRange`] when set to `Auto`.
+    pub fn resolved_x_range(&self, cx: &gpui::App) -> TimeRangeBehavior {
+        match self.x_range.as_custom() {
+            Some(behavior) => *behavior,
+            None => GlobalTimeRange::get(cx),
+        }
     }
 
     /// Bring tracking state and the title cache in sync with `self.traces`.
@@ -277,7 +290,7 @@ impl LinePlot {
             return None;
         }
         let range = self
-            .x_range
+            .resolved_x_range(cx)
             .calculate_range(Timestamp(start as i64), Timestamp(end as i64));
         let (min_x, mut max_x) = (range.start.0 as f64, range.end.0 as f64);
         if min_x >= max_x {
@@ -502,8 +515,9 @@ impl LinePlot {
 
 impl Render for LinePlot {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let degraded = self.gpu_state.degraded();
         let weak = cx.entity().downgrade();
-        canvas(
+        let plot_canvas = canvas(
             move |bounds, window, cx| {
                 let scale_factor = window.scale_factor();
                 let (frame, released) = weak
@@ -562,7 +576,26 @@ impl Render for LinePlot {
                 }
             },
         )
-        .size_full()
+        .size_full();
+        div()
+            .size_full()
+            .relative()
+            .child(plot_canvas)
+            .when(degraded, |el| {
+                // The last frame clamped its uploads: more samples are in
+                // view than the GPU buffers hold, so the trace is shown
+                // decimated beyond the usual per-pixel budget.
+                el.child(
+                    div()
+                        .absolute()
+                        .top_1()
+                        .right_1()
+                        .px_1()
+                        .text_xs()
+                        .text_color(crate::theme::DARK.text_tertiary)
+                        .child("decimated"),
+                )
+            })
     }
 }
 

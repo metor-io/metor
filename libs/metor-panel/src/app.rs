@@ -8,7 +8,9 @@ use crate::inspector::edits::{
     self, edit_value_rows, pending_edits, pending_edits_mut, review_rows,
 };
 use crate::inspector::palette::{Category, InspectionItem, ItemProvider, ItemRegistry};
+use crate::inspector::rows::{CommandRow, InspectorRow, TextRow};
 use crate::inspector::{InspectorMode, InspectorRequest, OpenInspectorGlobal};
+use crate::views::time_series::time_range::{GlobalTimeRange, TimeRangeBehavior};
 use crate::tiles::panels::{
     AlarmPanel, BrowserPanel, DataTablePanel, ListPlotPanel, PlotPanel, SequenceGridPanel,
     SequencePanel, TablePanel, TextPanel, TrafficLightGridPanel, TrafficLightPanel, Viewer3dPanel,
@@ -495,6 +497,37 @@ impl AppRoot {
             .gap(px(10.0))
             .pr(px(8.0));
 
+        // Global time-range pill: shows the window every Auto-range plot
+        // follows; clicking opens a preset/custom picker.
+        let range_label = SharedString::from(format!("{}", GlobalTimeRange::get(cx)));
+        right = right.child(
+            div()
+                .id("global-time-range")
+                .px(px(8.0))
+                .py(px(2.0))
+                .bg(theme.pill_bg)
+                .border_1()
+                .border_color(theme.pill_border)
+                .rounded(px(4.0))
+                .text_size(px(12.0))
+                .text_color(theme.text_primary)
+                .child(range_label)
+                .cursor_pointer()
+                .on_mouse_down(gpui::MouseButton::Left, |event, window, cx| {
+                    let Some(open) = crate::inspector::open_inspector(cx) else {
+                        return;
+                    };
+                    open(
+                        InspectorRequest {
+                            rows: global_time_range_rows(cx),
+                            mode: InspectorMode::Anchored(event.position),
+                        },
+                        window,
+                        cx,
+                    );
+                }),
+        );
+
         right = right.child(self.render_alarm_summary(theme, cx));
 
         if edit_count > 0 {
@@ -535,6 +568,33 @@ impl AppRoot {
             .child(right)
             .into_any_element()
     }
+}
+
+/// Picker rows for the global time range: every preset plus a freeform
+/// text field using `TimeRangeBehavior`'s string grammar.
+fn global_time_range_rows(cx: &gpui::App) -> Vec<Box<dyn InspectorRow>> {
+    let mut rows: Vec<Box<dyn InspectorRow>> = TimeRangeBehavior::PRESETS
+        .iter()
+        .map(|(name, value)| {
+            let value = *value;
+            Box::new(CommandRow::new(
+                *name,
+                Arc::new(move |_window, cx| {
+                    GlobalTimeRange::set(cx, value);
+                }),
+            )) as Box<dyn InspectorRow>
+        })
+        .collect();
+    rows.push(Box::new(TextRow::new(
+        SharedString::new_static("Custom"),
+        SharedString::from(format!("{}", GlobalTimeRange::get(cx))),
+        Arc::new(move |s, _window, cx| {
+            if let Ok(behavior) = s.parse::<TimeRangeBehavior>() {
+                GlobalTimeRange::set(cx, behavior);
+            }
+        }),
+    )));
+    rows
 }
 
 /// Builder that owns construction of the panel application.

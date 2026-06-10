@@ -256,6 +256,11 @@ pub fn serialize_widget_state(
                 .map(|e| TraceConfig::from(e.read(cx)))
                 .collect(),
             custom_title: lp.custom_title.as_ref().map(|s| s.to_string()),
+            x_range: lp
+                .x_range
+                .as_custom()
+                .map(|b| b.to_string())
+                .unwrap_or_default(),
             y_min_override,
             y_max_override,
             axes: lp

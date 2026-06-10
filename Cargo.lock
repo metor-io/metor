@@ -9127,6 +9127,7 @@ dependencies = [
  "serde",
  "smallvec 1.15.1",
  "stellarator",
+ "tempfile",
  "thingbuf",
  "thiserror 2.0.18",
  "tracing",

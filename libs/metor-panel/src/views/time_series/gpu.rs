@@ -148,16 +148,21 @@ struct ValueCache {
     /// Per-frame epoch for the X axis in raw plot-space units (nanoseconds
     /// for timestamps, native units for component elements).
     ///
-    /// Lazy-initialized from the first uploaded X sample so the dynamic
-    /// range stays small enough for `f32` precision to hold.
-    epoch_x: Option<f64>,
+    /// Anchored to the view's left edge each frame so `f32` precision is
+    /// spent on the visible window rather than on the distance back to
+    /// the oldest sample.
+    epoch_x: f64,
+    /// An upload this frame was clamped by buffer capacity; the rendered
+    /// frame is missing samples and callers may want to surface that.
+    truncated: bool,
 }
 
 impl ValueCache {
     fn new() -> Self {
         Self {
             cursor: 0,
-            epoch_x: None,
+            epoch_x: 0.0,
+            truncated: false,
         }
     }
 }
@@ -322,6 +327,7 @@ pub(super) struct PlotGpu {
     cache: ValueCache,
     upload_x: Vec<f32>,
     upload_y: Vec<f32>,
+    select_scratch: Vec<u32>,
     idx_scratch: Vec<u32>,
 }
 
@@ -525,6 +531,7 @@ impl PlotGpu {
             cache: ValueCache::new(),
             upload_x: Vec::new(),
             upload_y: Vec::new(),
+            select_scratch: Vec::new(),
             idx_scratch: Vec::with_capacity(INDEX_CAPACITY as usize),
         })
     }
@@ -542,7 +549,8 @@ impl PlotGpu {
     ) -> bool {
         self.idx_scratch.clear();
         self.cache.cursor = 0;
-        self.cache.epoch_x = None;
+        self.cache.epoch_x = view.min_x;
+        self.cache.truncated = false;
         let pixel_budget = target.width as usize;
 
         let mut plans: Vec<TracePlan> = Vec::with_capacity(traces.len());
@@ -555,6 +563,7 @@ impl PlotGpu {
                 &mut self.cache,
                 &mut self.upload_x,
                 &mut self.upload_y,
+                &mut self.select_scratch,
                 &mut self.idx_scratch,
                 &self.x_buf,
                 &self.y_buf,
@@ -566,6 +575,14 @@ impl PlotGpu {
             );
             plans.push(plan);
         }
+        if self.cache.truncated {
+            tracing::debug!(
+                target: "plot::capacity",
+                uploaded = self.cache.cursor,
+                indices = self.idx_scratch.len(),
+                "plot uploads clamped to buffer capacity"
+            );
+        }
         if plans.iter().all(|p| p.spans.is_empty()) {
             return false;
         }
@@ -576,7 +593,7 @@ impl PlotGpu {
         // source is well-defined drives the view uniform; all real-world
         // call sites compose homogeneous traces (all time-series xor all
         // XY), so picking the first is sufficient.
-        let epoch_x = self.cache.epoch_x.unwrap_or(view.min_x);
+        let epoch_x = self.cache.epoch_x;
         let x_scale_factor = traces
             .first()
             .map(|t| t.x.scale())
@@ -716,6 +733,7 @@ pub(crate) struct PlotRenderState {
     current_frame: Option<Arc<RenderImage>>,
     pending_release: Option<Arc<RenderImage>>,
     in_flight: Arc<AtomicBool>,
+    degraded: bool,
 }
 
 impl Default for PlotRenderState {
@@ -725,6 +743,7 @@ impl Default for PlotRenderState {
             current_frame: None,
             pending_release: None,
             in_flight: Arc::new(AtomicBool::new(false)),
+            degraded: false,
         }
     }
 }
@@ -770,6 +789,7 @@ impl PlotRenderState {
             if !gpu.submit(target, view, scale, traces) {
                 return None;
             }
+            self.degraded = gpu.cache.truncated;
             self.in_flight.store(true, Ordering::Release);
             target
                 .staging
@@ -793,6 +813,12 @@ impl PlotRenderState {
 
     pub(crate) fn current_frame(&self) -> Option<Arc<RenderImage>> {
         self.current_frame.clone()
+    }
+
+    /// True when the last submitted frame had uploads clamped by buffer
+    /// capacity — the plot is showing fewer samples than the view holds.
+    pub(crate) fn degraded(&self) -> bool {
+        self.degraded
     }
 
     /// Take the previous frame so the caller can pass it to
@@ -905,6 +931,7 @@ fn plan_trace(
     cache: &mut ValueCache,
     upload_x: &mut Vec<f32>,
     upload_y: &mut Vec<f32>,
+    select_scratch: &mut Vec<u32>,
     idx_scratch: &mut Vec<u32>,
     x_buf: &wgpu::Buffer,
     y_buf: &wgpu::Buffer,
@@ -1040,6 +1067,7 @@ fn plan_trace(
             cache,
             upload_x,
             upload_y,
+            select_scratch,
             x_buf,
             y_buf,
             &pair.x,
@@ -1057,6 +1085,15 @@ fn plan_trace(
 
         let is_line = matches!(trace.style, PlotStyle::Line);
         let span_first = idx_scratch.len() as u32;
+        // Clamp to the index buffer: overflowing it would fail wgpu
+        // validation and silently drop the whole frame.
+        let index_available = (INDEX_CAPACITY as usize).saturating_sub(idx_scratch.len()) as u32;
+        let count = if count > index_available {
+            cache.truncated = true;
+            index_available
+        } else {
+            count
+        };
         let mut count_pushed: u32 = 0;
         for j in 0..count {
             idx_scratch.push(chunk_offset + j);
@@ -1088,15 +1125,17 @@ struct NodePair {
 
 /// Upload one node-pair's decimated samples into the X/Y storage buffers.
 ///
-/// Lazy-initializes `cache.epoch_x` from the first uploaded X sample so
-/// the on-GPU f32 stays numerically stable even when raw values are huge
-/// (e.g., nanosecond timestamps).
+/// Time-series traces with a real stride decimate by min-max selection —
+/// each bin contributes its extreme samples so peaks survive — while
+/// other sources point-sample. Uploads clamp to the shared buffer
+/// capacity instead of vanishing; a clamp flags `cache.truncated`.
 #[allow(clippy::too_many_arguments)]
 fn upload_pair(
     ctx: &GpuContext,
     cache: &mut ValueCache,
     scratch_x: &mut Vec<f32>,
     scratch_y: &mut Vec<f32>,
+    select_scratch: &mut Vec<u32>,
     x_buf: &wgpu::Buffer,
     y_buf: &wgpu::Buffer,
     x_node: &NodeView,
@@ -1112,31 +1151,78 @@ fn upload_pair(
     if lod_end <= lod_start {
         return None;
     }
-    let count = (lod_end - lod_start) as u32;
-    if cache.cursor.checked_add(count)? > VALUE_CAPACITY {
-        return None;
-    }
+    let available = (VALUE_CAPACITY - cache.cursor) as usize;
+    let epoch_x = cache.epoch_x;
 
-    if cache.epoch_x.is_none() {
-        cache.epoch_x = first_axis_value(x_source, x_node, lod_stride, lod_start);
-    }
-    let epoch_x = cache.epoch_x.unwrap_or(0.0);
+    let minmax_y = match (x_source, y_source) {
+        (AxisSource::Timestamps, AxisSource::Element { component, element_index, .. })
+            if lod_stride > 1 =>
+        {
+            Some((&component.schema, *element_index))
+        }
+        _ => None,
+    };
 
-    materialize_axis(
-        x_source,
-        x_node,
-        lod_stride,
-        lod_start,
-        lod_end,
-        epoch_x,
-        x_source.scale(),
-        scratch_x,
-    );
-    // Y is shifted by the axis minimum and scaled by 1/(max-min) so it lands
-    // in [0,1]; the view uniform then maps that to clip space.
-    materialize_axis(
-        y_source, y_node, lod_stride, lod_start, lod_end, y_epoch, y_scale, scratch_y,
-    );
+    let count = if let Some((schema, element_index)) = minmax_y {
+        let data = y_node.full_data();
+        select_minmax_indices(
+            schema,
+            data,
+            element_index,
+            lod_stride,
+            lod_start,
+            lod_end,
+            select_scratch,
+        );
+        if select_scratch.len() > available {
+            cache.truncated = true;
+            select_scratch.truncate(available);
+        }
+        if select_scratch.is_empty() {
+            return None;
+        }
+        let timestamps = y_node.full_timestamps();
+        scratch_x.clear();
+        scratch_x.reserve(select_scratch.len());
+        for &src in select_scratch.iter() {
+            let src = (src as usize).min(timestamps.len().saturating_sub(1));
+            let raw = timestamps.get(src).map(|t| t.0 as f64).unwrap_or(0.0);
+            scratch_x.push(((raw - epoch_x) * x_source.scale()) as f32);
+        }
+        scratch_y.clear();
+        scratch_y.reserve(select_scratch.len());
+        for &src in select_scratch.iter() {
+            let v = read_element_f64(schema, data, src as usize, element_index).unwrap_or(0.0);
+            scratch_y.push(((v - y_epoch) * y_scale) as f32);
+        }
+        select_scratch.len() as u32
+    } else {
+        let want = lod_end - lod_start;
+        let take = want.min(available);
+        if take < want {
+            cache.truncated = true;
+        }
+        if take == 0 {
+            return None;
+        }
+        let lod_end = lod_start + take;
+        materialize_axis(
+            x_source,
+            x_node,
+            lod_stride,
+            lod_start,
+            lod_end,
+            epoch_x,
+            x_source.scale(),
+            scratch_x,
+        );
+        // Y is shifted by the axis minimum and scaled by 1/(max-min) so it
+        // lands in [0,1]; the view uniform then maps that to clip space.
+        materialize_axis(
+            y_source, y_node, lod_stride, lod_start, lod_end, y_epoch, y_scale, scratch_y,
+        );
+        take as u32
+    };
 
     let byte_offset = cache.cursor as u64 * 4;
     ctx.queue
@@ -1149,46 +1235,59 @@ fn upload_pair(
     Some((offset, count))
 }
 
-/// Read the first value the materializer would produce, in raw plot-space
-/// units (i.e. without the axis's scale factor applied). Used to seed the
-/// per-frame epoch.
-fn first_axis_value(
-    source: &AxisSource<'_>,
-    node: &NodeView,
-    lod_stride: usize,
+/// Samples examined per decimation bin when hunting extremes. Bounds the
+/// per-frame scan cost: a full sweep of every visible sample would make
+/// zoomed-out frames O(data), while probing misses only features narrower
+/// than `stride / MINMAX_BIN_PROBES` samples.
+const MINMAX_BIN_PROBES: usize = 32;
+
+/// Pick each bin's extreme samples: for bin `di` covering source samples
+/// `[di*stride, (di+1)*stride)`, probe up to [`MINMAX_BIN_PROBES`] evenly
+/// spaced candidates and emit the argmin and argmax in source order. The
+/// result is an index list (≤ 2 per bin, deduplicated) that the caller
+/// materializes for both axes, keeping `(x, y)` pairs honest.
+fn select_minmax_indices(
+    schema: &ComponentSchema,
+    data: &[u8],
+    element_index: usize,
+    stride: usize,
     lod_start: usize,
-) -> Option<f64> {
-    match source {
-        AxisSource::Timestamps => {
-            let ts = node.full_timestamps();
-            if ts.is_empty() {
-                return None;
+    lod_end: usize,
+    out: &mut Vec<u32>,
+) {
+    out.clear();
+    let elem_size = schema.size();
+    let max_sample = if elem_size == 0 {
+        0
+    } else {
+        data.len() / elem_size
+    };
+    if max_sample == 0 {
+        return;
+    }
+    out.reserve((lod_end - lod_start) * 2);
+    let probe_step = (stride / MINMAX_BIN_PROBES).max(1);
+    for di in lod_start..lod_end {
+        let bin_start = (di * stride).min(max_sample - 1);
+        let bin_end = ((di + 1) * stride).min(max_sample);
+        let mut lo: (f64, usize) = (f64::INFINITY, bin_start);
+        let mut hi: (f64, usize) = (f64::NEG_INFINITY, bin_start);
+        let mut src = bin_start;
+        while src < bin_end {
+            let v = read_element_f64(schema, data, src, element_index).unwrap_or(0.0);
+            if v < lo.0 {
+                lo = (v, src);
             }
-            let src = (lod_start * lod_stride).min(ts.len() - 1);
-            Some(ts[src].0 as f64)
+            if v > hi.0 {
+                hi = (v, src);
+            }
+            src += probe_step;
         }
-        AxisSource::Element {
-            component,
-            element_index,
-            ..
-        } => {
-            let schema = &component.schema;
-            let elem_size = schema.size();
-            let data = node.full_data();
-            if elem_size == 0 || data.is_empty() {
-                return None;
-            }
-            let max_sample = data.len() / elem_size;
-            if max_sample == 0 {
-                return None;
-            }
-            let src = (lod_start * lod_stride).min(max_sample - 1);
-            read_element_f64(schema, data, src, *element_index)
+        let (first, second) = if lo.1 <= hi.1 { (lo.1, hi.1) } else { (hi.1, lo.1) };
+        out.push(first as u32);
+        if second != first {
+            out.push(second as u32);
         }
-        // List-plot axes are dispatched ahead of `upload_pair`; this arm
-        // is only reached if a future caller mixes them with node-walk
-        // axes, in which case zero is a safe placeholder.
-        AxisSource::LatestSampleIndex { .. } | AxisSource::LatestSampleElements { .. } => None,
     }
 }
 
@@ -1545,28 +1644,24 @@ fn plan_list_trace(
 
     let stride = node_stride(len, len, pixel_budget).unwrap_or(1);
     let upload_stride = quantize_stride(stride);
-    let count = len.div_ceil(upload_stride);
+    let want = len.div_ceil(upload_stride);
+    let available = (VALUE_CAPACITY - cache.cursor) as usize;
+    let count = want.min(available);
+    if count < want {
+        cache.truncated = true;
+    }
     let count_u32 = count as u32;
     if count_u32 == 0 {
         return TracePlan { spans };
     }
-    if cache
-        .cursor
-        .checked_add(count_u32)
-        .is_none_or(|n| n > VALUE_CAPACITY)
-    {
-        return TracePlan { spans };
-    }
 
-    // X is the integer index sequence — no epoch needed since the range
-    // is small (0..len).
-    if cache.epoch_x.is_none() {
-        cache.epoch_x = Some(0.0);
-    }
+    // X is the integer index sequence in raw plot space; shift by the
+    // frame epoch like any other axis so it matches the view uniform.
+    let epoch_x = cache.epoch_x;
     upload_x.clear();
     upload_x.reserve(count);
     for i in 0..count {
-        upload_x.push((i * upload_stride) as f32);
+        upload_x.push(((i * upload_stride) as f64 - epoch_x) as f32);
     }
 
     upload_y.clear();
@@ -1592,6 +1687,13 @@ fn plan_list_trace(
 
     let is_line = matches!(style, PlotStyle::Line);
     let span_first = idx_scratch.len() as u32;
+    let index_available = (INDEX_CAPACITY as usize).saturating_sub(idx_scratch.len()) as u32;
+    let count_u32 = if count_u32 > index_available {
+        cache.truncated = true;
+        index_available
+    } else {
+        count_u32
+    };
     for j in 0..count_u32 {
         idx_scratch.push(chunk_offset + j);
     }
@@ -1663,6 +1765,145 @@ fn convert_latest_sample_strided(
         PrimType::U16 => fill::<u16>(sample_bytes, len, lod_stride, prim_size, epoch, scale, out),
         PrimType::U8 | PrimType::Bool => {
             fill::<u8>(sample_bytes, len, lod_stride, prim_size, epoch, scale, out)
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use metor_db::disruptor::Disruptor;
+    use metor_db::time_series::{TimeSeries, TimeSeriesNode};
+    use std::path::Path;
+    use stellarator::util::AtomicCell;
+
+    fn f64_schema() -> ComponentSchema {
+        ComponentSchema::new(PrimType::F64, &[1])
+    }
+
+    #[test]
+    fn minmax_selection_keeps_impulses() {
+        let schema = f64_schema();
+        let n = 32 * 64;
+        let mut data = Vec::with_capacity(n * 8);
+        for i in 0..n {
+            let v = if i % 512 == 100 {
+                1000.0
+            } else {
+                (i as f64 * 0.1).sin()
+            };
+            data.extend_from_slice(&v.to_le_bytes());
+        }
+        // stride == MINMAX_BIN_PROBES probes every sample in each bin.
+        let stride = MINMAX_BIN_PROBES;
+        let mut out = Vec::new();
+        select_minmax_indices(&schema, &data, 0, stride, 0, n / stride, &mut out);
+        for impulse in [100u32, 612, 1124, 1636] {
+            assert!(
+                out.contains(&impulse),
+                "impulse at {impulse} dropped by decimation"
+            );
+        }
+        assert!(out.len() <= 2 * (n / stride), "selection exceeded budget");
+        assert!(out.windows(2).all(|w| w[0] < w[1]), "indices not ascending");
+    }
+
+    /// Build a component from nodes written straight to disk — no DB, no
+    /// runtime — mirroring a reopened long-running session.
+    fn synth_component(
+        dir: &Path,
+        nodes: usize,
+        samples_per_node: usize,
+        start_ns: i64,
+        step_ns: i64,
+    ) -> Component {
+        for n in 0..nodes {
+            let node_start = start_ns + (n * samples_per_node) as i64 * step_ns;
+            let node =
+                TimeSeriesNode::create(dir.join(node_start.to_string()), Timestamp(node_start), 8)
+                    .unwrap();
+            for i in 0..samples_per_node {
+                let ts = node_start + i as i64 * step_ns;
+                let v = (ts as f64 * 1e-9).sin();
+                node.data.write(&v.to_le_bytes()).unwrap();
+                node.index.write(&Timestamp(ts).to_le_bytes()).unwrap();
+            }
+        }
+        Component {
+            component_id: ComponentId(1),
+            time_series: TimeSeries::open(dir).unwrap(),
+            wal: Disruptor::new(1024),
+            schema: f64_schema(),
+            last_timestamp: Arc::new(AtomicCell::new(Timestamp(0))),
+        }
+    }
+
+    /// Long sessions at realistic nanosecond epochs must keep drawing at
+    /// every zoom level: uploads stay inside the shared buffers and the
+    /// epoch rebase keeps materialized x values small and ordered.
+    #[test]
+    fn long_range_renders_at_every_zoom() {
+        let Some(mut gpu) = PlotGpu::try_new() else {
+            eprintln!("skipping: no GPU available");
+            return;
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let start_ns: i64 = 1_700_000_000_000_000_000;
+        let step_ns: i64 = 1_000_000; // 1 kHz
+        let samples_per_node = 200_000;
+        let nodes = 6;
+        let component = synth_component(dir.path(), nodes, samples_per_node, start_ns, step_ns);
+        let end_ns = start_ns + (nodes * samples_per_node) as i64 * step_ns;
+        let target = RenderTarget::new(&gpu.ctx.device, 1500, 600);
+
+        let windows = [
+            (start_ns, end_ns),                           // full range (~20 min)
+            (end_ns - 30_000_000_000, end_ns),            // last 30 s
+            (end_ns - 1_000_000_000, end_ns),             // last 1 s (no decimation)
+            (start_ns, start_ns + 60_000_000_000),        // first minute
+        ];
+        for (min_x, max_x) in windows {
+            let draw = LineDraw {
+                x: AxisSource::Timestamps,
+                y: AxisSource::Element {
+                    component_id: component.component_id,
+                    component: &component,
+                    element_index: 0,
+                },
+                y_min: -1.0,
+                y_max: 1.0,
+                style: PlotStyle::Line,
+                color: Hsla {
+                    h: 0.0,
+                    s: 0.0,
+                    l: 1.0,
+                    a: 1.0,
+                },
+                stroke_width: 1.0,
+            };
+            let view = PlotBounds::new(min_x as f64, 0.0, max_x as f64, 1.0);
+            let drew = gpu.submit(&target, view, 1.0, std::slice::from_ref(&draw));
+            let span_secs = (max_x - min_x) as f64 * 1e-9;
+            assert!(drew, "no spans drawn for window of {span_secs}s");
+            assert!(
+                !gpu.cache.truncated,
+                "decimated upload should fit capacity for window of {span_secs}s"
+            );
+            assert!(gpu.cache.cursor <= VALUE_CAPACITY);
+            assert!(gpu.idx_scratch.len() <= INDEX_CAPACITY as usize);
+            // Epoch rebase: the last uploaded chunk's x values are small
+            // window-relative seconds, ordered, and finite.
+            assert!(!gpu.upload_x.is_empty());
+            assert!(
+                gpu.upload_x
+                    .iter()
+                    .all(|x| x.is_finite() && *x >= -span_secs as f32 && *x <= 2.0 * span_secs as f32),
+                "x values escaped the rebased window for {span_secs}s"
+            );
+            assert!(
+                gpu.upload_x.windows(2).all(|w| w[0] <= w[1]),
+                "x values out of order for {span_secs}s"
+            );
         }
     }
 }
