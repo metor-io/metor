@@ -8,7 +8,7 @@
 //! versa. The copies this implies (a node's payload each way) are
 //! background-only and bounded by one in-flight node.
 //!
-//! Layout: `<component_name>/<start_ts>/{index,data,seal}` under the
+//! Layout: `<component_id>/<start_ts>/{index,data,seal}` under the
 //! store the caller built. The `seal` object is written last and acts as
 //! the commit marker — a node without one is invisible.
 
@@ -17,44 +17,12 @@ use std::sync::Arc;
 use futures_lite::StreamExt as _;
 use metor_proto::types::ComponentId;
 use object_store::path::Path as ObjPath;
-use stellarator::sync::WaitQueue;
+use stellarator::util::{OneshotTx, oneshot};
 use tokio::sync::mpsc;
 
-use crate::seal::SealRecord;
+use crate::seal::{SEAL_FILE, SealRecord};
 
-use super::{BoxFuture, NodeFile, NodeKey, NodeStaging, NodeStore, SealedChunk, SealedNode, StoreError};
-
-const CHUNK_BYTES: usize = 256 * 1024;
-
-/// One-shot reply slot awaitable from stellarator and fillable from the
-/// tokio thread.
-struct Reply<T> {
-    slot: std::sync::Mutex<Option<T>>,
-    waker: WaitQueue,
-}
-
-impl<T> Reply<T> {
-    fn new() -> Arc<Self> {
-        Arc::new(Self {
-            slot: std::sync::Mutex::new(None),
-            waker: WaitQueue::new(),
-        })
-    }
-
-    fn send(&self, value: T) {
-        *self.slot.lock().unwrap() = Some(value);
-        self.waker.wake_all();
-    }
-
-    async fn recv(&self) -> T {
-        loop {
-            if let Some(value) = self.slot.lock().unwrap().take() {
-                return value;
-            }
-            let _ = self.waker.wait().await;
-        }
-    }
-}
+use super::{BoxFuture, CHUNK_BYTES, NodeFile, NodeKey, NodeStaging, NodeStore, SealedNode, StoreError};
 
 /// A node's seal plus its two payloads, fetched whole.
 type FetchedNode = (SealRecord, Vec<u8>, Vec<u8>);
@@ -65,20 +33,20 @@ enum Job {
         seal: Vec<u8>,
         index: Vec<u8>,
         data: Vec<u8>,
-        reply: Arc<Reply<Result<(), StoreError>>>,
+        reply: OneshotTx<Result<(), StoreError>>,
     },
     Get {
         node_path: ObjPath,
-        reply: Arc<Reply<Result<FetchedNode, StoreError>>>,
+        reply: OneshotTx<Result<FetchedNode, StoreError>>,
     },
     List {
         component_path: ObjPath,
-        reply: Arc<Reply<Result<Vec<SealRecord>, StoreError>>>,
+        reply: OneshotTx<Result<Vec<SealRecord>, StoreError>>,
     },
     Contains {
         node_path: ObjPath,
         checksum: u64,
-        reply: Arc<Reply<Result<bool, StoreError>>>,
+        reply: OneshotTx<Result<bool, StoreError>>,
     },
 }
 
@@ -100,14 +68,16 @@ impl ObjectStoreAdapter {
     }
 
     fn node_path(key: &NodeKey<'_>) -> ObjPath {
-        ObjPath::from(format!("{}/{}", key.component_name, key.start_ts.0))
+        ObjPath::from(format!("{}/{}", key.component_id.0, key.start_ts.0))
     }
 
     fn submit(&self, job: Job) -> Result<(), StoreError> {
-        self.jobs
-            .send(job)
-            .map_err(|_| StoreError::Unavailable("object store thread exited".to_string()))
+        self.jobs.send(job).map_err(|_| thread_exited())
     }
+}
+
+fn thread_exited() -> StoreError {
+    StoreError::Unavailable("object store thread exited".to_string())
 }
 
 async fn run_job(store: &dyn object_store::ObjectStore, job: Job) {
@@ -130,7 +100,7 @@ async fn run_job(store: &dyn object_store::ObjectStore, job: Job) {
                     .map_err(obj_err)?;
                 // Last: the commit marker.
                 store
-                    .put(&node_path.child("seal"), seal.into())
+                    .put(&node_path.child(SEAL_FILE), seal.into())
                     .await
                     .map_err(obj_err)?;
                 Ok(())
@@ -157,7 +127,7 @@ async fn run_job(store: &dyn object_store::ObjectStore, job: Job) {
                 let mut listing = store.list(Some(&component_path));
                 while let Some(meta) = listing.next().await {
                     let meta = meta.map_err(obj_err)?;
-                    if meta.location.filename() != Some("seal") {
+                    if meta.location.filename() != Some(SEAL_FILE) {
                         continue;
                     }
                     let bytes = store
@@ -195,7 +165,7 @@ async fn read_seal(
     store: &dyn object_store::ObjectStore,
     node_path: &ObjPath,
 ) -> Result<Option<SealRecord>, StoreError> {
-    match store.get(&node_path.child("seal")).await {
+    match store.get(&node_path.child(SEAL_FILE)).await {
         Ok(result) => {
             let bytes = result.bytes().await.map_err(obj_err)?;
             Ok(Some(
@@ -231,15 +201,15 @@ impl NodeStore for ObjectStoreAdapter {
         Box::pin(async move {
             let seal = postcard::to_allocvec(&node.seal)
                 .map_err(|e| StoreError::Other(e.to_string()))?;
-            let reply = Reply::new();
+            let (reply, rx) = oneshot();
             self.submit(Job::Put {
                 node_path: Self::node_path(&key),
                 seal,
                 index: node.index.to_vec(),
                 data: node.data.to_vec(),
-                reply: reply.clone(),
+                reply,
             })?;
-            reply.recv().await
+            rx.wait().await.ok_or_else(thread_exited)?
         })
     }
 
@@ -249,50 +219,42 @@ impl NodeStore for ObjectStoreAdapter {
         dst: &'a NodeStaging,
     ) -> BoxFuture<'a, Result<SealRecord, StoreError>> {
         Box::pin(async move {
-            let reply = Reply::new();
+            let (reply, rx) = oneshot();
             self.submit(Job::Get {
                 node_path: Self::node_path(&key),
-                reply: reply.clone(),
+                reply,
             })?;
-            let (seal, index, data) = reply.recv().await?;
-            for (file, bytes) in [(NodeFile::Index, &index), (NodeFile::Data, &data)] {
-                for (i, chunk) in bytes.chunks(CHUNK_BYTES).enumerate() {
-                    dst.append(&SealedChunk {
-                        file,
-                        offset: (i * CHUNK_BYTES) as u64,
-                        bytes: chunk,
-                    })
-                    .map_err(|e| StoreError::Other(e.to_string()))?;
-                }
-            }
+            let (seal, index, data) = rx.wait().await.ok_or_else(thread_exited)??;
+            dst.append_file(NodeFile::Index, &index)?;
+            dst.append_file(NodeFile::Data, &data)?;
             Ok(seal)
         })
     }
 
     fn list<'a>(
         &'a self,
-        _component_id: ComponentId,
-        component_name: &'a str,
+        component_id: ComponentId,
+        _component_name: &'a str,
     ) -> BoxFuture<'a, Result<Vec<SealRecord>, StoreError>> {
         Box::pin(async move {
-            let reply = Reply::new();
+            let (reply, rx) = oneshot();
             self.submit(Job::List {
-                component_path: ObjPath::from(component_name),
-                reply: reply.clone(),
+                component_path: ObjPath::from(component_id.0.to_string()),
+                reply,
             })?;
-            reply.recv().await
+            rx.wait().await.ok_or_else(thread_exited)?
         })
     }
 
     fn contains<'a>(&'a self, key: NodeKey<'a>) -> BoxFuture<'a, Result<bool, StoreError>> {
         Box::pin(async move {
-            let reply = Reply::new();
+            let (reply, rx) = oneshot();
             self.submit(Job::Contains {
                 node_path: Self::node_path(&key),
                 checksum: key.checksum,
-                reply: reply.clone(),
+                reply,
             })?;
-            reply.recv().await
+            rx.wait().await.ok_or_else(thread_exited)?
         })
     }
 }

@@ -259,6 +259,10 @@ pub(crate) struct ReadbackHandle {
     height: u32,
     padded_bytes_per_row: u32,
     in_flight: Arc<AtomicBool>,
+    /// Whether this frame's uploads were clamped by buffer capacity.
+    /// Travels with the frame so the degraded badge always describes the
+    /// image actually on screen.
+    truncated: bool,
 }
 
 impl ReadbackHandle {
@@ -291,6 +295,7 @@ impl ReadbackHandle {
         access: fn(&mut T) -> &mut PlotRenderState,
     ) {
         cx.spawn(async move |this, cx| {
+            let truncated = self.truncated;
             let image = cx
                 .background_executor()
                 .spawn(async move { self.read_image() })
@@ -299,7 +304,7 @@ impl ReadbackHandle {
                 return;
             };
             let _ = this.update(cx, |t, cx| {
-                access(t).set_frame(img);
+                access(t).set_frame(img, truncated);
                 cx.notify();
             });
         })
@@ -770,6 +775,7 @@ impl PlotRenderState {
         let width = ((f32::from(bounds.size.width) * scale).round() as u32).max(1);
         let height = ((f32::from(bounds.size.height) * scale).round() as u32).max(1);
         if traces.is_empty() {
+            self.degraded = false;
             return None;
         }
 
@@ -789,7 +795,6 @@ impl PlotRenderState {
             if !gpu.submit(target, view, scale, traces) {
                 return None;
             }
-            self.degraded = gpu.cache.truncated;
             self.in_flight.store(true, Ordering::Release);
             target
                 .staging
@@ -802,20 +807,22 @@ impl PlotRenderState {
                 height: target.height,
                 padded_bytes_per_row: target.padded_bytes_per_row,
                 in_flight: self.in_flight.clone(),
+                truncated: gpu.cache.truncated,
             })
         })
     }
 
     /// Install a newly-read frame and park the previous one for release.
-    pub(crate) fn set_frame(&mut self, image: Arc<RenderImage>) {
+    pub(crate) fn set_frame(&mut self, image: Arc<RenderImage>, truncated: bool) {
         self.pending_release = self.current_frame.replace(image);
+        self.degraded = truncated;
     }
 
     pub(crate) fn current_frame(&self) -> Option<Arc<RenderImage>> {
         self.current_frame.clone()
     }
 
-    /// True when the last submitted frame had uploads clamped by buffer
+    /// True when the displayed frame had uploads clamped by buffer
     /// capacity — the plot is showing fewer samples than the view holds.
     pub(crate) fn degraded(&self) -> bool {
         self.degraded

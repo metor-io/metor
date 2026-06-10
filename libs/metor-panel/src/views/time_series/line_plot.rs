@@ -182,11 +182,10 @@ impl LinePlot {
     }
 
     /// Remote-only stretches of the visible window, as `(start, width)`
-    /// fractions of the plot width plus an is-downloading flag. As a side
-    /// effect, asks the installed hydrator (if any) to fetch them — the
-    /// request queue is bounded and deduplicated, so per-frame calls are
-    /// cheap and idempotent.
-    fn gap_bands(&self, cx: &gpui::App) -> smallvec::SmallVec<[(f32, f32, bool); 4]> {
+    /// fractions of the plot width. As a side effect, asks the installed
+    /// hydrator (if any) to fetch them — the request queue is bounded and
+    /// deduplicated, so per-frame calls are cheap and idempotent.
+    fn gap_bands(&self, cx: &gpui::App) -> smallvec::SmallVec<[(f32, f32); 4]> {
         let mut bands = smallvec::SmallVec::new();
         let Some(view) = self.effective_view(cx) else {
             return bands;
@@ -219,11 +218,7 @@ impl LinePlot {
                 let start = ((gap.range.start.0 as f64 - min_x) / span).clamp(0.0, 1.0) as f32;
                 let end = ((gap.range.end.0 as f64 - min_x) / span).clamp(0.0, 1.0) as f32;
                 if end > start {
-                    bands.push((
-                        start,
-                        end - start,
-                        gap.state == metor_db::manifest::SpanState::Fetching,
-                    ));
+                    bands.push((start, end - start));
                 }
             }
         }
@@ -564,6 +559,7 @@ impl LinePlot {
 
 impl Render for LinePlot {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = crate::theme::theme(cx);
         let degraded = self.gpu_state.degraded();
         let gap_bands = self.gap_bands(cx);
         let weak = cx.entity().downgrade();
@@ -631,17 +627,20 @@ impl Render for LinePlot {
             .size_full()
             .relative()
             .child(plot_canvas)
-            .children(gap_bands.into_iter().map(|(start, width, _fetching)| {
-                // History that lives in a store but not on disk yet; the
-                // hydrator has been asked for it and the band disappears
-                // when the data lands and wakes the trackers.
-                div()
-                    .absolute()
-                    .top_0()
-                    .bottom_0()
-                    .left(gpui::relative(start))
-                    .w(gpui::relative(width))
-                    .bg(crate::theme::DARK.plot_gap_band)
+            .children(gap_bands.into_iter().map({
+                let band_color = theme.plot_gap_band;
+                move |(start, width)| {
+                    // History that lives in a store but not on disk yet; the
+                    // hydrator has been asked for it and the band disappears
+                    // when the data lands and wakes the trackers.
+                    div()
+                        .absolute()
+                        .top_0()
+                        .bottom_0()
+                        .left(gpui::relative(start))
+                        .w(gpui::relative(width))
+                        .bg(band_color)
+                }
             }))
             .when(degraded, |el| {
                 // The last frame clamped its uploads: more samples are in
@@ -654,7 +653,7 @@ impl Render for LinePlot {
                         .right_1()
                         .px_1()
                         .text_xs()
-                        .text_color(crate::theme::DARK.text_tertiary)
+                        .text_color(theme.text_tertiary)
                         .child("decimated"),
                 )
             })

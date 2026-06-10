@@ -100,7 +100,10 @@ impl Hydrator {
         }
         queue.push_back((component_id, range));
         drop(queue);
-        self.inner.waker.wake_all();
+        // wake() stores a wakeup if it lands while run() is between its
+        // queue pop and wait(); one stored wakeup suffices because the
+        // single consumer drains the whole queue before re-waiting.
+        self.inner.waker.wake();
     }
 
     /// Serve requests until the runtime shuts down. Spawn once per DB

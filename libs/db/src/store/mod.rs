@@ -64,11 +64,12 @@ pub struct NodeKey<'a> {
     pub checksum: u64,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum NodeFile {
-    Index,
-    Data,
-}
+/// Which of a sealed node's two payload files a chunk belongs to. The
+/// discriminant is shared with the wire protocol so peer transfer needs
+/// no conversion.
+pub use metor_proto_wkt::NodeFileKind as NodeFile;
+
+pub(crate) const CHUNK_BYTES: usize = 256 * 1024;
 
 /// One streamable piece of a sealed node's payload.
 #[derive(Debug, Clone, Copy)]
@@ -119,10 +120,10 @@ impl<'a> SealedNode<'a> {
 }
 
 /// In-progress download of one node, staged as real [`AppendLog`] files in
-/// a `<start_ts>.fetching` directory beside the component's live nodes.
-/// Stores append payload chunks in order; [`Self::commit`] verifies the
-/// checksum and atomically promotes the directory to `<start_ts>/`, so a
-/// crash at any point leaves either nothing visible or a complete,
+/// a `<start_ts>.<n>.fetching` directory beside the component's live
+/// nodes. Stores append payload chunks in order; [`Self::commit`] verifies
+/// the checksum and atomically promotes the directory to `<start_ts>/`, so
+/// a crash at any point leaves either nothing visible or a complete,
 /// verified node.
 pub struct NodeStaging {
     dir: PathBuf,
@@ -133,11 +134,11 @@ pub struct NodeStaging {
 
 impl NodeStaging {
     pub fn create(component_dir: &std::path::Path, seal: &SealRecord) -> Result<Self, Error> {
-        let dir = component_dir.join(format!("{}.fetching", seal.start_ts.0));
-        if dir.exists() {
-            // Leftover from an interrupted fetch; start clean.
-            std::fs::remove_dir_all(&dir)?;
-        }
+        // Each attempt stages into its own directory so concurrent fetches
+        // of the same span can never delete or commit each other's files.
+        static NEXT_STAGING: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let attempt = NEXT_STAGING.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let dir = component_dir.join(format!("{}.{attempt}.fetching", seal.start_ts.0));
         std::fs::create_dir_all(&dir)?;
         let size = NODE_SIZE
             .max(seal.index_len + 64)
@@ -170,6 +171,19 @@ impl NodeStaging {
         Ok(())
     }
 
+    /// Append a whole payload as ordered [`CHUNK_BYTES`]-sized chunks.
+    pub fn append_file(&self, file: NodeFile, bytes: &[u8]) -> Result<(), StoreError> {
+        for (i, chunk) in bytes.chunks(CHUNK_BYTES).enumerate() {
+            self.append(&SealedChunk {
+                file,
+                offset: (i * CHUNK_BYTES) as u64,
+                bytes: chunk,
+            })
+            .map_err(|e| StoreError::Other(e.to_string()))?;
+        }
+        Ok(())
+    }
+
     /// Verify the staged bytes against `seal` and promote the directory
     /// into place. Returns the final node directory and the (already
     /// mapped) node.
@@ -187,6 +201,13 @@ impl NodeStaging {
         let final_dir = self
             .dir
             .with_file_name(seal.start_ts.0.to_string());
+        if final_dir.exists() {
+            return Err(StoreError::Other(format!(
+                "node {} was committed by a concurrent fetch",
+                seal.start_ts.0
+            ))
+            .into());
+        }
         std::fs::rename(&self.dir, &final_dir)?;
         if let Some(parent) = final_dir.parent() {
             std::fs::File::open(parent)?.sync_all()?;

@@ -4,17 +4,18 @@ use metor_proto::types::{IntoLenPacket, Msg, OwnedPacket};
 use metor_proto_stellar::Client;
 use metor_proto_wkt::{
     DbInfoResp, ErrorResponse, FetchNode, FetchNodeDone, GetDbInfo, GetNodeManifest,
-    NODE_PROTOCOL_VERSION, NodeAck, NodeChunk, NodeFileKind, NodeManifestResp, OfferNode,
-    OfferNodeResp, PushNodeDone,
+    NODE_PROTOCOL_VERSION, NodeAck, NodeChunk, NodeManifestResp, OfferNode, OfferNodeResp,
+    PushNodeDone,
 };
 use stellarator::sync::{Mutex, MutexGuard};
 use tracing::warn;
 
 use crate::seal::SealRecord;
 
-use super::{BoxFuture, NodeFile, NodeKey, NodeStaging, NodeStore, SealedChunk, SealedNode, StoreError};
+use super::{
+    BoxFuture, CHUNK_BYTES, NodeKey, NodeStaging, NodeStore, SealedChunk, SealedNode, StoreError,
+};
 
-const CHUNK_BYTES: u32 = 256 * 1024;
 /// This store owns its connection outright, so bulk streams can use a
 /// fixed request id without colliding with anyone.
 const BULK_REQ_ID: u8 = 251;
@@ -61,16 +62,19 @@ fn unavailable(err: impl std::fmt::Display) -> StoreError {
     StoreError::Unavailable(err.to_string())
 }
 
+/// Poison the connection so the next call redials, passing `err` through.
+fn poison(guard: &mut Option<Client>, err: StoreError) -> StoreError {
+    *guard = None;
+    err
+}
+
 /// Map a request error: a server-side [`ErrorResponse`] leaves the
 /// connection healthy; anything else (transport, parse) poisons it so the
 /// next call redials.
 fn request_err(guard: &mut Option<Client>, err: metor_proto_stellar::Error) -> StoreError {
     match err {
         metor_proto_stellar::Error::Response(resp) => StoreError::Other(resp.description),
-        err => {
-            *guard = None;
-            unavailable(err)
-        }
+        err => poison(guard, unavailable(err)),
     }
 }
 
@@ -100,20 +104,16 @@ impl NodeStore for PeerStore {
                 return Err(StoreError::Other("peer rejected the offer".to_string()));
             }
             let client = guard.as_mut().expect("just connected");
-            for chunk in node.chunks(CHUNK_BYTES as usize) {
+            for chunk in node.chunks(CHUNK_BYTES) {
                 let msg = NodeChunk {
                     component_id: key.component_id,
                     start_ts: key.start_ts,
-                    file: match chunk.file {
-                        NodeFile::Index => NodeFileKind::Index,
-                        NodeFile::Data => NodeFileKind::Data,
-                    },
+                    file: chunk.file,
                     offset: chunk.offset,
                     payload: chunk.bytes.to_vec(),
                 };
                 if let Err(err) = client.send((&msg).with_request_id(BULK_REQ_ID)).await.0 {
-                    *guard = None;
-                    return Err(unavailable(err));
+                    return Err(poison(&mut guard, unavailable(err)));
                 }
             }
             let done = PushNodeDone {
@@ -146,53 +146,39 @@ impl NodeStore for PeerStore {
             let req = FetchNode {
                 component_id: key.component_id,
                 start_ts: key.start_ts,
-                chunk_bytes: CHUNK_BYTES,
+                chunk_bytes: CHUNK_BYTES as u32,
             };
             if let Err(err) = client.send((&req).with_request_id(BULK_REQ_ID)).await.0 {
-                *guard = None;
-                return Err(unavailable(err));
+                return Err(poison(&mut guard, unavailable(err)));
             }
-            let mut buf = vec![0u8; CHUNK_BYTES as usize + 1024];
+            let mut buf = vec![0u8; CHUNK_BYTES + 1024];
             loop {
                 let pkt = match client.rx.next_grow(buf).await {
                     Ok(pkt) => pkt,
-                    Err(err) => {
-                        *guard = None;
-                        return Err(unavailable(err));
-                    }
+                    Err(err) => return Err(poison(&mut guard, unavailable(err))),
                 };
                 let mut finished: Option<SealRecord> = None;
                 match &pkt {
                     OwnedPacket::Msg(m) if m.id == NodeChunk::ID => {
                         let chunk: NodeChunk = match m.parse() {
                             Ok(chunk) => chunk,
-                            Err(err) => {
-                                *guard = None;
-                                return Err(unavailable(err));
-                            }
+                            Err(err) => return Err(poison(&mut guard, unavailable(err))),
                         };
                         let append = dst.append(&SealedChunk {
-                            file: match chunk.file {
-                                NodeFileKind::Index => NodeFile::Index,
-                                NodeFileKind::Data => NodeFile::Data,
-                            },
+                            file: chunk.file,
                             offset: chunk.offset,
                             bytes: &chunk.payload,
                         });
                         if let Err(err) = append {
                             // The stream is mid-flight; drop the
                             // connection rather than resync.
-                            *guard = None;
-                            return Err(StoreError::Other(err.to_string()));
+                            return Err(poison(&mut guard, StoreError::Other(err.to_string())));
                         }
                     }
                     OwnedPacket::Msg(m) if m.id == FetchNodeDone::ID => {
                         let done: FetchNodeDone = match m.parse() {
                             Ok(done) => done,
-                            Err(err) => {
-                                *guard = None;
-                                return Err(unavailable(err));
-                            }
+                            Err(err) => return Err(poison(&mut guard, unavailable(err))),
                         };
                         finished = Some(done.seal);
                     }

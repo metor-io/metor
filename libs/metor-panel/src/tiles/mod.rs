@@ -531,9 +531,12 @@ impl TileGroup {
         registry: &ItemRegistry,
         cx: &mut Context<Self>,
     ) -> Self {
-        if let Ok(behavior) = serialized.global_time_range.parse() {
-            crate::views::time_series::time_range::GlobalTimeRange::set(cx, behavior);
-        }
+        // Always reset: a layout that never narrowed the global range
+        // (or predates it) must not inherit the previous layout's window.
+        crate::views::time_series::time_range::GlobalTimeRange::set(
+            cx,
+            serialized.global_time_range.parse().unwrap_or_default(),
+        );
         let mut panes = Vec::new();
         let root = Self::deserialize_member(&serialized.root, registry, &mut panes, cx);
         let mut this = Self {

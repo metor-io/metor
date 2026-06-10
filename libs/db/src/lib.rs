@@ -587,11 +587,19 @@ impl Component {
 
     pub fn persist(&self) -> impl Future<Output = ()> + 'static {
         let mut reader = self.wal.reader();
-        let mut writer = self.time_series.writer().expect("writer already created");
+        let time_series = self.time_series.clone();
         let msg_size = self.schema.size() + size_of::<Timestamp>();
         async move {
+            // Taken on the first live sample, not at spawn: a component
+            // that only ever receives pushed sealed nodes has no live
+            // head, and `install_node` keys its newer-than-head guard on
+            // the writer's existence.
+            let mut writer = None;
             loop {
                 let buf = reader.next().await;
+                let writer = writer.get_or_insert_with(|| {
+                    time_series.writer().expect("writer already created")
+                });
                 let mut buf = &buf[..];
                 'parse: while let Some(msg) = buf.get(..msg_size) {
                     let Some(timestamp) = msg.get(..size_of::<Timestamp>()) else {
@@ -1340,10 +1348,7 @@ async fn handle_packet<A: AsyncWrite + 'static>(
                 tx.send_msg(&NodeChunk {
                     component_id,
                     start_ts,
-                    file: match chunk.file {
-                        store::NodeFile::Index => NodeFileKind::Index,
-                        store::NodeFile::Data => NodeFileKind::Data,
-                    },
+                    file: chunk.file,
                     offset: chunk.offset,
                     payload: chunk.bytes.to_vec(),
                 })
@@ -1411,10 +1416,7 @@ async fn handle_packet<A: AsyncWrite + 'static>(
                 })
                 .ok_or(Error::BadMessage)?;
             incoming.staging.append(&store::SealedChunk {
-                file: match chunk.file {
-                    NodeFileKind::Index => store::NodeFile::Index,
-                    NodeFileKind::Data => store::NodeFile::Data,
-                },
+                file: chunk.file,
                 offset: chunk.offset,
                 bytes: &chunk.payload,
             })?;

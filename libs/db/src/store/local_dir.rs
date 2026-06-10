@@ -6,11 +6,12 @@ use std::{
 
 use metor_proto::types::ComponentId;
 
-use crate::seal::SealRecord;
+use crate::{
+    Error,
+    seal::{SEAL_FILE, SealRecord, SealRecordExt as _},
+};
 
-use super::{BoxFuture, NodeFile, NodeKey, NodeStaging, NodeStore, SealedChunk, SealedNode, StoreError};
-
-const CHUNK_BYTES: usize = 256 * 1024;
+use super::{BoxFuture, NodeFile, NodeKey, NodeStaging, NodeStore, SealedNode, StoreError};
 
 /// Reference [`NodeStore`] backed by a local directory tree:
 /// `root/<component_id>/<start_ts>/{seal,index,data}`, payloads stored
@@ -32,14 +33,11 @@ impl LocalDirStore {
     }
 
     fn read_seal(&self, key: &NodeKey<'_>) -> Result<Option<SealRecord>, StoreError> {
-        let path = self.node_dir(key.component_id, key.start_ts.0).join("seal");
-        match fs::read(&path) {
-            Ok(buf) => Ok(Some(
-                postcard::from_bytes(&buf).map_err(|e| StoreError::Other(e.to_string()))?,
-            )),
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(None),
-            Err(err) => Err(err.into()),
-        }
+        let dir = self.node_dir(key.component_id, key.start_ts.0);
+        SealRecord::read(&dir).map_err(|err| match err {
+            Error::Io(err) => StoreError::Io(err),
+            err => StoreError::Other(err.to_string()),
+        })
     }
 }
 
@@ -72,7 +70,7 @@ impl NodeStore for LocalDirStore {
             write_file("index", node.index)?;
             write_file("data", node.data)?;
             write_file(
-                "seal",
+                SEAL_FILE,
                 &postcard::to_allocvec(&node.seal).map_err(|e| StoreError::Other(e.to_string()))?,
             )?;
             if final_dir.exists() {
@@ -94,14 +92,7 @@ impl NodeStore for LocalDirStore {
             let dir = self.node_dir(key.component_id, key.start_ts.0);
             for (file, name) in [(NodeFile::Index, "index"), (NodeFile::Data, "data")] {
                 let bytes = fs::read(dir.join(name))?;
-                for (i, chunk) in bytes.chunks(CHUNK_BYTES).enumerate() {
-                    dst.append(&SealedChunk {
-                        file,
-                        offset: (i * CHUNK_BYTES) as u64,
-                        bytes: chunk,
-                    })
-                    .map_err(|e| StoreError::Other(e.to_string()))?;
-                }
+                dst.append_file(file, &bytes)?;
             }
             Ok(seal)
         })
@@ -122,7 +113,7 @@ impl NodeStore for LocalDirStore {
             };
             for entry in entries {
                 let path = entry?.path();
-                let seal_path = path.join("seal");
+                let seal_path = path.join(SEAL_FILE);
                 if !path.is_dir() || !seal_path.exists() {
                     continue;
                 }

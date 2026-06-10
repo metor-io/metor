@@ -58,11 +58,10 @@ pub async fn run(db: Arc<DB>, store: Option<Arc<dyn NodeStore>>, config: Tiering
 }
 
 /// One evictable sealed span, with everything needed to offload it.
-struct Victim {
+struct Victim<'a> {
     component_id: ComponentId,
-    name: String,
-    schema: metor_proto::schema::Schema<Vec<u64>>,
-    component: Component,
+    name: &'a str,
+    component: &'a Component,
     start_ts: Timestamp,
     end_ts: Timestamp,
     bytes: u64,
@@ -71,7 +70,7 @@ struct Victim {
     cache_copy: bool,
 }
 
-impl Victim {
+impl Victim<'_> {
     /// Budget-pass priority: free cache evictions, then spans a store
     /// already acked, then spans that still need an upload.
     fn class(&self) -> u8 {
@@ -92,6 +91,9 @@ pub async fn tier_once(
     config: &TieringConfig,
     now: Timestamp,
 ) -> Result<(), Error> {
+    if config.max_age.is_none() && config.max_db_bytes.is_none() {
+        return Ok(());
+    }
     let components: Vec<(ComponentId, String, Component)> = db.with_state(|state| {
         state
             .components
@@ -107,25 +109,29 @@ pub async fn tier_once(
     });
     let min_resident_cutoff =
         Timestamp(now.0.saturating_sub(config.min_resident.as_micros() as i64));
+    let (mut victims, mut resident_bytes) = collect_victims(&components, min_resident_cutoff);
 
     if let Some(max_age) = config.max_age {
         let cutoff = Timestamp(now.0.saturating_sub(max_age.as_micros() as i64));
-        let (mut victims, _) = collect_victims(&components, min_resident_cutoff);
-        victims.retain(|v| v.end_ts.0 < cutoff.0);
         victims.sort_unstable_by_key(|v| v.end_ts.0);
-        for victim in &victims {
-            evict(victim, store).await?;
+        let mut remaining = Vec::with_capacity(victims.len());
+        for victim in victims {
+            if victim.end_ts.0 < cutoff.0 && try_evict(&victim, store).await {
+                resident_bytes = resident_bytes.saturating_sub(victim.bytes);
+                continue;
+            }
+            remaining.push(victim);
         }
+        victims = remaining;
     }
 
     if let Some(budget) = config.max_db_bytes {
-        let (mut victims, mut resident_bytes) = collect_victims(&components, min_resident_cutoff);
         victims.sort_unstable_by_key(|v| (v.class(), v.end_ts.0));
         for victim in &victims {
             if resident_bytes <= budget {
                 break;
             }
-            if evict(victim, store).await? {
+            if try_evict(victim, store).await {
                 resident_bytes = resident_bytes.saturating_sub(victim.bytes);
             }
         }
@@ -143,10 +149,10 @@ pub async fn tier_once(
 /// total resident sealed bytes (including spans too fresh to evict). The
 /// live head is unsealed and never appears in manifests, so it is
 /// implicitly protected.
-fn collect_victims(
-    components: &[(ComponentId, String, Component)],
+fn collect_victims<'a>(
+    components: &'a [(ComponentId, String, Component)],
     min_resident_cutoff: Timestamp,
-) -> (Vec<Victim>, u64) {
+) -> (Vec<Victim<'a>>, u64) {
     let mut victims = Vec::new();
     let mut resident_bytes = 0u64;
     for (component_id, name, component) in components {
@@ -162,9 +168,8 @@ fn collect_victims(
             }
             victims.push(Victim {
                 component_id: *component_id,
-                name: name.clone(),
-                schema: component.schema.to_schema(),
-                component: component.clone(),
+                name,
+                component,
                 start_ts: span.seal.start_ts,
                 end_ts: span.seal.end_ts,
                 bytes: span.bytes(),
@@ -176,10 +181,28 @@ fn collect_victims(
     (victims, resident_bytes)
 }
 
+/// [`evict`], but a failure only costs this victim: a down store must not
+/// block the rest of the pass, including free evictions that need no
+/// store contact at all.
+async fn try_evict(victim: &Victim<'_>, store: Option<&dyn NodeStore>) -> bool {
+    match evict(victim, store).await {
+        Ok(purged) => purged,
+        Err(err) => {
+            warn!(
+                ?err,
+                component = %victim.name,
+                start_ts = victim.start_ts.0,
+                "failed to evict span"
+            );
+            false
+        }
+    }
+}
+
 /// Offload (when needed and possible) then purge. `Ok(false)` means the
 /// span stayed resident — typically the sole copy with no store to send
 /// it to, which is never an excuse to drop data.
-async fn evict(victim: &Victim, store: Option<&dyn NodeStore>) -> Result<bool, Error> {
+async fn evict(victim: &Victim<'_>, store: Option<&dyn NodeStore>) -> Result<bool, Error> {
     if !victim.acked {
         let Some(store) = store else {
             warn!(
@@ -189,12 +212,13 @@ async fn evict(victim: &Victim, store: Option<&dyn NodeStore>) -> Result<bool, E
             );
             return Ok(false);
         };
+        let schema = victim.component.schema.to_schema();
         offload_span(
             &victim.component.time_series,
             store,
             victim.component_id,
-            &victim.name,
-            &victim.schema,
+            victim.name,
+            &schema,
             victim.start_ts,
         )
         .await?;

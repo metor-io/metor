@@ -300,34 +300,15 @@ impl InspectorRegistry {
                         cx,
                     )
                     .unwrap_or_default();
-                    let mut rows: Vec<Box<dyn InspectorRow>> = TimeRangeBehavior::PRESETS
-                        .iter()
-                        .map(|(name, value)| {
-                            let entity = any_entity.clone();
-                            let value = *value;
-                            Box::new(CommandRow::new(
-                                *name,
-                                Arc::new(move |_w, cx| {
-                                    crate::inspector::reflect::set_field::<TimeRangeBehavior>(
-                                        &entity, idx, value, cx,
-                                    );
-                                }),
-                            )) as Box<dyn InspectorRow>
-                        })
-                        .collect();
                     let entity = any_entity.clone();
-                    rows.push(Box::new(TextRow::new(
-                        SharedString::new_static("Custom"),
+                    crate::views::time_series::time_range::picker_rows(
                         SharedString::from(format!("{}", current)),
-                        Arc::new(move |s, _w, cx| {
-                            if let Ok(value) = s.parse::<TimeRangeBehavior>() {
-                                crate::inspector::reflect::set_field::<TimeRangeBehavior>(
-                                    &entity, idx, value, cx,
-                                );
-                            }
+                        Arc::new(move |value, _w, cx| {
+                            crate::inspector::reflect::set_field::<TimeRangeBehavior>(
+                                &entity, idx, value, cx,
+                            );
                         }),
-                    )));
-                    rows
+                    )
                 }),
             ))
         }));
@@ -356,50 +337,30 @@ impl InspectorRegistry {
                             Override<TimeRangeBehavior>,
                         >(&any_entity, idx, cx)
                         .unwrap_or(Override::Auto);
-                        let auto_entity = any_entity.clone();
+                        let set_override = {
+                            let entity = any_entity.clone();
+                            move |value, cx: &mut gpui::App| {
+                                crate::inspector::reflect::set_field::<Override<TimeRangeBehavior>>(
+                                    &entity, idx, value, cx,
+                                );
+                            }
+                        };
+                        let auto_set = set_override.clone();
                         let mut rows: Vec<Box<dyn InspectorRow>> =
                             vec![Box::new(CommandRow::new(
                                 "Auto (follow global)",
-                                Arc::new(move |_w, cx| {
-                                    crate::inspector::reflect::set_field::<
-                                        Override<TimeRangeBehavior>,
-                                    >(
-                                        &auto_entity, idx, Override::Auto, cx
-                                    );
-                                }),
+                                Arc::new(move |_w, cx| auto_set(Override::Auto, cx)),
                             ))];
-                        rows.extend(TimeRangeBehavior::PRESETS.iter().map(|(name, value)| {
-                            let entity = any_entity.clone();
-                            let value = *value;
-                            Box::new(CommandRow::new(
-                                *name,
-                                Arc::new(move |_w, cx| {
-                                    crate::inspector::reflect::set_field::<
-                                        Override<TimeRangeBehavior>,
-                                    >(
-                                        &entity, idx, Override::Custom(value), cx
-                                    );
-                                }),
-                            )) as Box<dyn InspectorRow>
-                        }));
-                        let entity = any_entity.clone();
                         let current_text = current
                             .as_custom()
                             .map(|b| SharedString::from(format!("{b}")))
                             .unwrap_or_default();
-                        rows.push(Box::new(TextRow::new(
-                            SharedString::new_static("Custom"),
+                        rows.extend(crate::views::time_series::time_range::picker_rows(
                             current_text,
-                            Arc::new(move |s, _w, cx| {
-                                if let Ok(value) = s.parse::<TimeRangeBehavior>() {
-                                    crate::inspector::reflect::set_field::<
-                                        Override<TimeRangeBehavior>,
-                                    >(
-                                        &entity, idx, Override::Custom(value), cx
-                                    );
-                                }
+                            Arc::new(move |value, _w, cx| {
+                                set_override(Override::Custom(value), cx)
                             }),
-                        )));
+                        ));
                         rows
                     }),
                 ))

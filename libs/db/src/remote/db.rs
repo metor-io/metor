@@ -56,16 +56,22 @@ impl RemoteDb {
         } = self;
         stellarator::spawn(hydrator.clone().run(db.clone(), store));
         stellarator::spawn(async move {
-            let mut backoff = Duration::from_millis(250);
+            const INITIAL_BACKOFF: Duration = Duration::from_millis(250);
+            const HEALTHY_CONNECTION: Duration = Duration::from_secs(30);
+            let mut backoff = INITIAL_BACKOFF;
             loop {
+                let connected_at = std::time::Instant::now();
                 match mirror(&db, addr).await {
-                    Ok(()) => backoff = Duration::from_millis(250),
+                    Ok(()) => {}
                     Err(err) if err.is_stream_closed() => {
                         info!(?addr, "remote db disconnected; reconnecting");
                     }
                     Err(err) => {
                         warn!(?err, ?addr, "remote db mirror failed; reconnecting");
                     }
+                }
+                if connected_at.elapsed() >= HEALTHY_CONNECTION {
+                    backoff = INITIAL_BACKOFF;
                 }
                 stellarator::sleep(backoff).await;
                 backoff = (backoff * 2).min(Duration::from_secs(10));
@@ -74,14 +80,29 @@ impl RemoteDb {
     }
 }
 
+const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Bound a handshake request: old-protocol peers record unknown request
+/// messages as telemetry and never reply, which would otherwise hang the
+/// mirror forever.
+async fn handshake_request<T>(
+    fut: impl Future<Output = Result<T, metor_proto_stellar::Error>>,
+) -> Result<T, Error> {
+    futures_lite::future::or(async { fut.await.map_err(Error::from) }, async {
+        stellarator::sleep(HANDSHAKE_TIMEOUT).await;
+        Err(std::io::Error::from(std::io::ErrorKind::TimedOut).into())
+    })
+    .await
+}
+
 /// One connection lifetime: handshake, metadata sync, then ingest the
 /// real-time stream until the connection drops.
 async fn mirror(db: &Arc<DB>, addr: SocketAddr) -> Result<(), Error> {
     let mut client = Client::connect(addr).await?;
-    let info: DbInfoResp = client.request(&GetDbInfo).await?;
+    let info: DbInfoResp = handshake_request(client.request(&GetDbInfo)).await?;
     info!(?addr, peer_version = info.protocol_version, "mirroring remote db");
 
-    let metadata: DumpMetadataResp = client.request(&DumpMetadata).await?;
+    let metadata: DumpMetadataResp = handshake_request(client.request(&DumpMetadata)).await?;
     db.with_state_mut(|state| {
         for component_metadata in metadata.component_metadata {
             if let Err(err) = state.set_component_metadata(component_metadata, &db.path) {
