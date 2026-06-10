@@ -768,6 +768,185 @@ impl Msg for ReloadSequences {
     const ID: PacketId = [224, 44];
 }
 
+/// Version of the sealed-node transfer protocol ([224,45]..[224,55]).
+/// Clients MUST handshake with [`GetDbInfo`] before sending any of these:
+/// servers that predate the handshake record unknown request messages as
+/// telemetry, so probing with anything else pollutes the remote DB.
+pub const NODE_PROTOCOL_VERSION: u32 = 1;
+
+#[derive(Serialize, Deserialize, Debug, Clone, Copy)]
+pub struct GetDbInfo;
+
+impl Msg for GetDbInfo {
+    const ID: PacketId = [224, 45];
+}
+
+impl Request for GetDbInfo {
+    type Reply<B: IoBuf + Clone> = DbInfoResp;
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, Copy)]
+pub struct DbInfoResp {
+    pub protocol_version: u32,
+    /// Reserved capability bits; zero today.
+    pub features: u64,
+}
+
+impl Msg for DbInfoResp {
+    const ID: PacketId = [224, 46];
+}
+
+/// Durable summary of one sealed storage node. Defined here because it is
+/// both the storage-side seal sidecar and the wire-level manifest entry —
+/// `index_len`/`data_len` say exactly which committed bytes are claimed
+/// and `checksum` (xxh3_64 over index bytes then data bytes) lets any
+/// holder verify a transfer without trusting the source.
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SealRecord {
+    pub start_ts: Timestamp,
+    pub end_ts: Timestamp,
+    pub count: u64,
+    pub index_len: u64,
+    pub data_len: u64,
+    pub checksum: u64,
+    pub element_size: u64,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, Copy)]
+pub struct GetNodeManifest {
+    pub component_id: ComponentId,
+}
+
+impl Msg for GetNodeManifest {
+    const ID: PacketId = [224, 47];
+}
+
+impl Request for GetNodeManifest {
+    type Reply<B: IoBuf + Clone> = NodeManifestResp;
+}
+
+/// Every sealed node the server can currently serve for the component,
+/// sorted by start timestamp. The live (unsealed) head is never listed —
+/// its samples arrive via streaming instead.
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct NodeManifestResp {
+    pub component_id: ComponentId,
+    pub nodes: Vec<SealRecord>,
+}
+
+impl Msg for NodeManifestResp {
+    const ID: PacketId = [224, 48];
+}
+
+/// Ask the server to stream one sealed node's payloads as [`NodeChunk`]s
+/// (in order, index file first) followed by a [`FetchNodeDone`], all under
+/// this request's id. An [`crate::ErrorResponse`] means the node is gone
+/// (e.g. purged since the manifest was fetched).
+#[derive(Serialize, Deserialize, Debug, Clone, Copy)]
+pub struct FetchNode {
+    pub component_id: ComponentId,
+    pub start_ts: Timestamp,
+    /// Requested chunk payload size; servers clamp to sane bounds.
+    pub chunk_bytes: u32,
+}
+
+impl Msg for FetchNode {
+    const ID: PacketId = [224, 49];
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NodeFileKind {
+    Index,
+    Data,
+}
+
+/// One streamed piece of a sealed node's committed payload. Used in both
+/// directions: server→client answering [`FetchNode`], client→server
+/// uploading after an accepted [`OfferNode`].
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct NodeChunk {
+    pub component_id: ComponentId,
+    pub start_ts: Timestamp,
+    pub file: NodeFileKind,
+    pub offset: u64,
+    pub payload: Vec<u8>,
+}
+
+impl Msg for NodeChunk {
+    const ID: PacketId = [224, 50];
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, Copy)]
+pub struct FetchNodeDone {
+    pub seal: SealRecord,
+}
+
+impl Msg for FetchNodeDone {
+    const ID: PacketId = [224, 51];
+}
+
+/// Offer a sealed node for archival. The server auto-creates the
+/// component from `schema` if it has never seen it. `already_have` short
+/// circuits re-uploads by checksum.
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct OfferNode {
+    pub component_id: ComponentId,
+    pub component_name: String,
+    pub schema: Schema<Vec<u64>>,
+    pub seal: SealRecord,
+}
+
+impl Msg for OfferNode {
+    const ID: PacketId = [224, 52];
+}
+
+impl Request for OfferNode {
+    type Reply<B: IoBuf + Clone> = OfferNodeResp;
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, Copy)]
+pub struct OfferNodeResp {
+    pub accept: bool,
+    pub already_have: bool,
+}
+
+impl Msg for OfferNodeResp {
+    const ID: PacketId = [224, 53];
+}
+
+/// Sent by the uploader after the last [`NodeChunk`] of an offered node.
+/// The server verifies, persists durably (fsync), and answers with a
+/// [`NodeAck`].
+#[derive(Serialize, Deserialize, Debug, Clone, Copy)]
+pub struct PushNodeDone {
+    pub component_id: ComponentId,
+    pub start_ts: Timestamp,
+    pub checksum: u64,
+}
+
+impl Msg for PushNodeDone {
+    const ID: PacketId = [224, 54];
+}
+
+impl Request for PushNodeDone {
+    type Reply<B: IoBuf + Clone> = NodeAck;
+}
+
+/// `durable: true` is the only signal that permits the uploader to purge
+/// its local copy — it means the bytes are on the server's disk, fsynced,
+/// and checksum-verified.
+#[derive(Serialize, Deserialize, Debug, Clone, Copy)]
+pub struct NodeAck {
+    pub component_id: ComponentId,
+    pub start_ts: Timestamp,
+    pub checksum: u64,
+    pub durable: bool,
+}
+
+impl Msg for NodeAck {
+    const ID: PacketId = [224, 55];
+}
+
 #[cfg(test)]
 mod alarm_tests {
     use super::*;

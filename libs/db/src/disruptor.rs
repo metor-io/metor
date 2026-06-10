@@ -429,6 +429,17 @@ impl<T> ArcAtomic<T> {
             Some(unsafe { Arc::from_raw(old) })
         }
     }
+
+    /// Swap the pointer to null and take ownership of the stored value.
+    /// Only sound while the caller has exclusive access (e.g. in `Drop`).
+    pub(crate) fn take(&self, ordering: Ordering) -> Option<Arc<T>> {
+        let old = self.ptr.swap(ptr::null_mut(), ordering);
+        if old.is_null() {
+            None
+        } else {
+            Some(unsafe { Arc::from_raw(old) })
+        }
+    }
 }
 
 impl<T> From<Arc<T>> for ArcAtomic<T> {

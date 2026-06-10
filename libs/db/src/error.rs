@@ -44,6 +44,8 @@ pub enum Error {
     Parquet(#[from] parquet::errors::ParquetError),
     #[error("schema mismatch")]
     SchemaMismatch,
+    #[error("store {0}")]
+    Store(#[from] crate::store::StoreError),
 }
 
 impl From<metor_proto_stellar::Error> for Error {

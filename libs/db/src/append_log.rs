@@ -155,4 +155,12 @@ impl<E: IntoBytes + Immutable> AppendLog<E> {
     pub fn capacity(&self) -> usize {
         self.map.len() - size_of::<Header<E>>()
     }
+
+    /// Synchronously flush the mapping to disk. Durability is otherwise
+    /// left to OS writeback; call this before recording a durability
+    /// claim about the contents (e.g. a seal record).
+    pub fn flush(&self) -> Result<(), Error> {
+        self.map.flush()?;
+        Ok(())
+    }
 }

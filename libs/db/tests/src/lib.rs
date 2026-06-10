@@ -42,6 +42,62 @@ mod tests {
     }
 
     #[test]
+    async fn peer_store_conforms() {
+        let (addr, _db) = setup_test_db().await.unwrap();
+        let store = metor_db::store::PeerStore::new(addr);
+        let scratch = std::env::temp_dir().join(format!("metor_peer_conf_{}", fastrand::u64(..)));
+        std::fs::create_dir_all(&scratch).unwrap();
+        metor_db::store::conformance::run(&store, &scratch).await;
+        std::fs::remove_dir_all(&scratch).ok();
+    }
+
+    #[test]
+    async fn remote_db_mirrors_live_data() {
+        let (addr, _src_db) = setup_test_db().await.unwrap();
+        let mut producer = Client::connect(addr).await.unwrap();
+        let vtable = vtable([raw_field(
+            0,
+            16,
+            schema(PrimType::F64, &[2], component("mirror_test")),
+        )]);
+        producer
+            .send(&VTableMsg {
+                id: 2u16.to_le_bytes(),
+                vtable,
+            })
+            .await
+            .0
+            .unwrap();
+
+        let local_dir =
+            std::env::temp_dir().join(format!("metor_db_mirror_{}", fastrand::u64(..)));
+        let local_db = Arc::new(DB::create(local_dir).unwrap());
+        metor_db::remote::RemoteDb::new(addr).spawn(local_db.clone());
+        // Let the mirror connect and subscribe before data flows.
+        sleep(Duration::from_millis(300)).await;
+
+        let floats = [4.0f64, 5.0];
+        let mut pkt = LenPacket::table(2u16.to_le_bytes(), 16);
+        pkt.extend_aligned(&floats);
+        producer.send(pkt).await.0.unwrap();
+
+        let mut mirrored = false;
+        for _ in 0..40 {
+            sleep(Duration::from_millis(50)).await;
+            mirrored = local_db.with_state(|state| {
+                state
+                    .get_component(ComponentId::new("mirror_test"))
+                    .and_then(|c| c.time_series.latest())
+                    .is_some_and(|latest| latest.data() == floats.as_bytes())
+            });
+            if mirrored {
+                break;
+            }
+        }
+        assert!(mirrored, "local db never mirrored the live sample");
+    }
+
+    #[test]
     async fn test_send_data() {
         let (addr, db) = setup_test_db().await.unwrap();
         let mut client = Client::connect(addr).await.unwrap();

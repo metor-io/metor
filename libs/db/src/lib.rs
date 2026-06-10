@@ -57,7 +57,11 @@ mod arrow;
 pub mod disruptor;
 mod error;
 //mod msg_log;
+pub mod manifest;
 pub mod msg_log_2;
+pub mod remote;
+pub mod seal;
+pub mod store;
 //pub(crate) mod time_series;
 pub mod time_series_2;
 pub use msg_log_2 as msg_log;
@@ -74,7 +78,9 @@ pub struct DB {
     pub path: PathBuf,
     pub default_stream_time_step: AtomicU64,
     pub last_updated: AtomicCell<Timestamp>,
-    pub earliest_timestamp: Timestamp,
+    /// Earliest timestamp known to this instance. Moves backwards when
+    /// older history is hydrated from a store.
+    pub earliest_timestamp: AtomicCell<Timestamp>,
 }
 
 #[derive(Default)]
@@ -116,7 +122,7 @@ impl DB {
             vtable_gen: AtomicCell::new(0),
             default_stream_time_step,
             last_updated: AtomicCell::new(Timestamp(i64::MIN)),
-            earliest_timestamp: Timestamp::now(),
+            earliest_timestamp: AtomicCell::new(Timestamp::now()),
         };
         db.save_db_state()?;
         Ok(db)
@@ -225,7 +231,7 @@ impl DB {
                 db_state.default_stream_time_step.as_nanos() as u64
             ),
             last_updated: AtomicCell::new(Timestamp(last_updated)),
-            earliest_timestamp,
+            earliest_timestamp: AtomicCell::new(earliest_timestamp),
         })
     }
 
@@ -283,7 +289,7 @@ impl DB {
                     stream_id,
                     Duration::from_nanos(behavior.timestep),
                     match behavior.initial_timestamp {
-                        InitialTimestamp::Earliest => self.earliest_timestamp,
+                        InitialTimestamp::Earliest => self.earliest_timestamp.latest(),
                         InitialTimestamp::Latest => self.last_updated.latest(),
                         InitialTimestamp::Manual(timestamp) => timestamp,
                     },
@@ -551,6 +557,7 @@ impl Component {
             last_timestamp: Arc::new(AtomicCell::new(Timestamp(i64::MIN))),
         };
         stellarator::spawn(this.clone().persist());
+        stellarator::spawn(this.time_series.clone().lifecycle());
         Ok(this)
     }
 
@@ -573,12 +580,13 @@ impl Component {
             last_timestamp: Arc::new(AtomicCell::new(last_timestamp)),
         };
         stellarator::spawn(this.persist());
+        stellarator::spawn(this.time_series.clone().lifecycle());
         Ok(this)
     }
 
     pub fn persist(&self) -> impl Future<Output = ()> + 'static {
         let mut reader = self.wal.reader();
-        let writer = self.time_series.writer().expect("writer already created");
+        let mut writer = self.time_series.writer().expect("writer already created");
         let msg_size = self.schema.size() + size_of::<Timestamp>();
         async move {
             loop {
@@ -730,6 +738,20 @@ pub async fn handle_conn(stream: TcpStream, db: Arc<DB>) {
     }
 }
 
+/// Per-connection protocol state. Node uploads span several packets
+/// (offer, chunks, done), so the in-flight staging lives here rather than
+/// in the DB.
+#[derive(Default)]
+struct ConnState {
+    incoming_node: Option<IncomingNode>,
+}
+
+struct IncomingNode {
+    component_id: ComponentId,
+    seal: SealRecord,
+    staging: store::NodeStaging,
+}
+
 async fn handle_conn_inner<A: AsyncRead + AsyncWrite + 'static>(
     mut tx: Arc<Mutex<PacketSink<OwnedWriter<A>>>>,
     mut rx: PacketStream<OwnedReader<A>>,
@@ -737,6 +759,7 @@ async fn handle_conn_inner<A: AsyncRead + AsyncWrite + 'static>(
 ) -> Result<(), Error> {
     let mut buf = vec![0u8; 1024 * 1024 * 1024];
     let mut resp_pkt = LenPacket::new(PacketTy::Msg, [0, 0], 1024 * 1024 * 1024);
+    let mut conn = ConnState::default();
     loop {
         let pkt = rx.next(buf).await?;
         let req_id = pkt.req_id();
@@ -745,7 +768,7 @@ async fn handle_conn_inner<A: AsyncRead + AsyncWrite + 'static>(
             tx,
             pkt: Some(resp_pkt),
         };
-        let result = handle_packet(&pkt, &db, &mut pkt_tx).await;
+        let result = handle_packet(&pkt, &db, &mut pkt_tx, &mut conn).await;
         buf = pkt.into_buf().into_inner();
         match result {
             Ok(_) => {}
@@ -768,9 +791,9 @@ async fn handle_conn_inner<A: AsyncRead + AsyncWrite + 'static>(
 }
 
 pub struct PacketTx<A: AsyncWrite + 'static> {
-    req_id: RequestId,
-    tx: Arc<Mutex<PacketSink<OwnedWriter<A>>>>,
-    pkt: Option<LenPacket>,
+    pub(crate) req_id: RequestId,
+    pub(crate) tx: Arc<Mutex<PacketSink<OwnedWriter<A>>>>,
+    pub(crate) pkt: Option<LenPacket>,
 }
 
 impl<A: AsyncWrite + 'static> Clone for PacketTx<A> {
@@ -844,6 +867,7 @@ async fn handle_packet<A: AsyncWrite + 'static>(
     pkt: &Packet<Slice<Vec<u8>>>,
     db: &Arc<DB>,
     tx: &mut PacketTx<A>,
+    conn: &mut ConnState,
 ) -> Result<(), Error> {
     trace!(?pkt, "handling pkt");
     match &pkt {
@@ -1073,7 +1097,7 @@ async fn handle_packet<A: AsyncWrite + 'static>(
             tx.send_msg(&db.db_config()).await?;
         }
         Packet::Msg(m) if m.id == GetEarliestTimestamp::ID => {
-            tx.send_msg(&EarliestTimestamp(db.earliest_timestamp))
+            tx.send_msg(&EarliestTimestamp(db.earliest_timestamp.latest()))
                 .await?;
         }
         Packet::Msg(m) if m.id == GetDbSettings::ID => {
@@ -1251,6 +1275,191 @@ async fn handle_packet<A: AsyncWrite + 'static>(
                 state.udp_vtable_streams.insert((addr, id));
                 Ok::<_, Error>(())
             })?;
+        }
+        Packet::Msg(m) if m.id == GetDbInfo::ID => {
+            tx.send_msg(&DbInfoResp {
+                protocol_version: NODE_PROTOCOL_VERSION,
+                features: 0,
+            })
+            .await?;
+        }
+        Packet::Msg(m) if m.id == GetNodeManifest::ID => {
+            let GetNodeManifest { component_id } = m.parse::<GetNodeManifest>()?;
+            // Unknown components list empty rather than erroring: to a
+            // syncing peer "never heard of it" and "no sealed nodes yet"
+            // call for the same response.
+            let component = db.with_state(|state| state.components.get(&component_id).cloned());
+            let nodes: Vec<SealRecord> = component
+                .map(|component| {
+                    component
+                        .time_series
+                        .manifest()
+                        .spans
+                        .iter()
+                        .filter(|s| s.state == manifest::SpanState::Resident)
+                        .map(|s| s.seal)
+                        .collect()
+                })
+                .unwrap_or_default();
+            tx.send_msg(&NodeManifestResp {
+                component_id,
+                nodes,
+            })
+            .await?;
+        }
+        Packet::Msg(m) if m.id == FetchNode::ID => {
+            let FetchNode {
+                component_id,
+                start_ts,
+                chunk_bytes,
+            } = m.parse::<FetchNode>()?;
+            let component = db.with_state(|state| {
+                state
+                    .components
+                    .get(&component_id)
+                    .cloned()
+                    .ok_or(Error::ComponentNotFound(component_id))
+            })?;
+            let manifest = component.time_series.manifest();
+            let seal = manifest
+                .span(start_ts)
+                .filter(|s| s.state == manifest::SpanState::Resident)
+                .map(|s| s.seal)
+                .ok_or(Error::TimeRangeOutOfBounds)?;
+            let node = component
+                .time_series
+                .list
+                .iter()
+                .find(|n| n.timestamps().first() == Some(&start_ts))
+                .ok_or(Error::TimeRangeOutOfBounds)?;
+            let sealed = store::SealedNode::from_node(&node, seal)
+                .ok_or(Error::Store(store::StoreError::ChecksumMismatch))?;
+            let chunk_bytes = (chunk_bytes as usize).clamp(4 * 1024, 1024 * 1024);
+            for chunk in sealed.chunks(chunk_bytes) {
+                tx.send_msg(&NodeChunk {
+                    component_id,
+                    start_ts,
+                    file: match chunk.file {
+                        store::NodeFile::Index => NodeFileKind::Index,
+                        store::NodeFile::Data => NodeFileKind::Data,
+                    },
+                    offset: chunk.offset,
+                    payload: chunk.bytes.to_vec(),
+                })
+                .await?;
+            }
+            tx.send_msg(&FetchNodeDone { seal }).await?;
+        }
+        Packet::Msg(m) if m.id == OfferNode::ID => {
+            let OfferNode {
+                component_id,
+                component_name: _,
+                schema,
+                seal,
+            } = m.parse::<OfferNode>()?;
+            let schema = ComponentSchema::from(schema);
+            if schema.size() as u64 != seal.element_size {
+                return Err(Error::SchemaMismatch);
+            }
+            db.with_state_mut(|state| state.insert_component(component_id, schema, &db.path))?;
+            let component = db.with_state(|state| {
+                state
+                    .components
+                    .get(&component_id)
+                    .cloned()
+                    .ok_or(Error::ComponentNotFound(component_id))
+            })?;
+            let already_have = component
+                .time_series
+                .manifest()
+                .span(seal.start_ts)
+                .is_some_and(|s| {
+                    s.state == manifest::SpanState::Resident && s.seal.checksum == seal.checksum
+                });
+            if already_have {
+                conn.incoming_node = None;
+                tx.send_msg(&OfferNodeResp {
+                    accept: false,
+                    already_have: true,
+                })
+                .await?;
+            } else {
+                let staging = store::NodeStaging::create(
+                    &db.path.join(component_id.to_string()),
+                    &seal,
+                )?;
+                conn.incoming_node = Some(IncomingNode {
+                    component_id,
+                    seal,
+                    staging,
+                });
+                tx.send_msg(&OfferNodeResp {
+                    accept: true,
+                    already_have: false,
+                })
+                .await?;
+            }
+        }
+        Packet::Msg(m) if m.id == NodeChunk::ID => {
+            let chunk = m.parse::<NodeChunk>()?;
+            let incoming = conn
+                .incoming_node
+                .as_ref()
+                .filter(|i| {
+                    i.component_id == chunk.component_id && i.seal.start_ts == chunk.start_ts
+                })
+                .ok_or(Error::BadMessage)?;
+            incoming.staging.append(&store::SealedChunk {
+                file: match chunk.file {
+                    NodeFileKind::Index => store::NodeFile::Index,
+                    NodeFileKind::Data => store::NodeFile::Data,
+                },
+                offset: chunk.offset,
+                bytes: &chunk.payload,
+            })?;
+        }
+        Packet::Msg(m) if m.id == PushNodeDone::ID => {
+            let done = m.parse::<PushNodeDone>()?;
+            let incoming = conn
+                .incoming_node
+                .take()
+                .filter(|i| {
+                    i.component_id == done.component_id
+                        && i.seal.start_ts == done.start_ts
+                        && i.seal.checksum == done.checksum
+                })
+                .ok_or(Error::BadMessage)?;
+            let component = db.with_state(|state| {
+                state
+                    .components
+                    .get(&incoming.component_id)
+                    .cloned()
+                    .ok_or(Error::ComponentNotFound(incoming.component_id))
+            })?;
+            let installed = component.time_series.install_node(
+                incoming.staging,
+                &incoming.seal,
+                manifest::SpanSource::LocalIngest,
+            );
+            if let Err(err) = &installed {
+                warn!(?err, component_id = ?incoming.component_id, "failed to install offered node");
+            } else {
+                db.earliest_timestamp.update_min(incoming.seal.start_ts);
+                db.last_updated.update_max(incoming.seal.end_ts);
+            }
+            tx.send_msg(&NodeAck {
+                component_id: done.component_id,
+                start_ts: done.start_ts,
+                checksum: done.checksum,
+                durable: installed.is_ok(),
+            })
+            .await?;
+        }
+        // The node-transfer/sync range is reserved: a message here that no
+        // arm above matched is from a newer protocol, not telemetry to
+        // record.
+        Packet::Msg(m) if m.id[0] == 224 => {
+            warn!(id = ?m.id, "ignoring unknown reserved protocol message");
         }
         Packet::Msg(m) => {
             let timestamp = m.timestamp.unwrap_or(Timestamp::now());
@@ -1455,7 +1664,7 @@ fn handle_stream<A: AsyncWrite + 'static>(
                 stream.id,
                 Duration::from_nanos(fixed_rate.timestep),
                 match fixed_rate.initial_timestamp {
-                    InitialTimestamp::Earliest => db.earliest_timestamp,
+                    InitialTimestamp::Earliest => db.earliest_timestamp.latest(),
                     InitialTimestamp::Latest => db.last_updated.latest(),
                     InitialTimestamp::Manual(timestamp) => timestamp,
                 },
@@ -1703,11 +1912,17 @@ impl MetadataExt for DbConfig {}
 
 pub trait AtomicTimestampExt {
     fn update_max(&self, val: Timestamp);
+    fn update_min(&self, val: Timestamp);
 }
 
 impl AtomicTimestampExt for AtomicCell<Timestamp> {
     fn update_max(&self, val: Timestamp) {
         self.value.fetch_max(val.0, atomic::Ordering::AcqRel);
+        self.wait_queue.wake_all();
+    }
+
+    fn update_min(&self, val: Timestamp) {
+        self.value.fetch_min(val.0, atomic::Ordering::AcqRel);
         self.wait_queue.wake_all();
     }
 }

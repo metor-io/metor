@@ -3,7 +3,7 @@ use std::{
     ops::{Range, RangeInclusive},
     path::{Path, PathBuf},
     sync::{
-        Arc,
+        Arc, Mutex,
         atomic::{AtomicBool, Ordering},
     },
 };
@@ -20,6 +20,8 @@ use crate::{
     append_log::AppendLog,
     arc_ring::{AtomicNode, AtomicStack, AtomicStackIter},
     disruptor::ArcAtomic,
+    manifest::{ComponentManifest, Coverage, GapVec, ManifestCell, NodeSpan, SpanSource, SpanState},
+    seal::{SealRecord, SealRecordExt, seal_node},
 };
 
 #[derive(Clone)]
@@ -28,6 +30,16 @@ pub struct TimeSeries {
     path: PathBuf,
     data_waker: Arc<WaitQueue>,
     has_writer: Arc<AtomicBool>,
+    /// Sealed-span bookkeeping; see [`ManifestCell`]. The live head node
+    /// is answered by `list`, not the manifest.
+    manifest: Arc<ManifestCell>,
+    /// Serializes multi-step structural work (sealing, hydration install,
+    /// purge) across background tasks. Readers and the ingest writer never
+    /// take it.
+    structural: Arc<Mutex<()>>,
+    /// Woken when the writer rolls to a new node, signalling that the
+    /// previous head is ready to seal.
+    lifecycle_waker: Arc<WaitQueue>,
 }
 
 #[derive(Clone)]
@@ -42,13 +54,16 @@ impl Debug for TimeSeriesNode {
     }
 }
 
+/// Capacity of each node's index and data files. Sealed nodes are sparse
+/// up to this size; only the committed prefix ever travels over a store.
+pub const NODE_SIZE: u64 = 1024 * 1024 * 32;
+
 impl TimeSeriesNode {
     pub fn create(
         path: impl AsRef<Path>,
         start_timestamp: Timestamp,
         element_size: u64,
     ) -> Result<Self, Error> {
-        const NODE_SIZE: u64 = 1024 * 1024 * 32;
         let path = path.as_ref();
         std::fs::create_dir_all(path)?;
         let index = AppendLog::with_size(NODE_SIZE, path.join("index"), start_timestamp)?;
@@ -73,6 +88,50 @@ impl TimeSeriesNode {
     pub fn element_size(&self) -> usize {
         *self.data.extra() as usize
     }
+}
+
+/// Rebuild the manifest on open: the directory scan (already loaded into
+/// `list`) is authoritative for residency; the persisted manifest
+/// contributes remote-only spans and flags (`acked`, `source`) for spans
+/// that are still resident. Nodes without a seal record stay out of the
+/// manifest until the lifecycle task seals them.
+fn reconcile_manifest(
+    path: &Path,
+    list: &AtomicStack<TimeSeriesNode>,
+) -> Result<ComponentManifest, Error> {
+    let persisted = ComponentManifest::read_from(path)?.unwrap_or_default();
+    let mut spans: Vec<NodeSpan> = Vec::new();
+    for node in list.iter() {
+        let Some(start_ts) = node.timestamps().first().copied() else {
+            continue;
+        };
+        let node_dir = path.join(start_ts.0.to_string());
+        let Some(seal) = SealRecord::read(&node_dir)? else {
+            continue;
+        };
+        let flags = persisted.span(start_ts);
+        spans.push(NodeSpan {
+            seal,
+            state: SpanState::Resident,
+            source: flags.map(|s| s.source).unwrap_or(SpanSource::LocalIngest),
+            acked: flags.map(|s| s.acked).unwrap_or(false),
+        });
+    }
+    for span in &persisted.spans {
+        // A span with no resident node was purged (or never fetched);
+        // whatever state was persisted, locally it is remote-only now.
+        if !spans.iter().any(|s| s.seal.start_ts == span.seal.start_ts) {
+            spans.push(NodeSpan {
+                state: SpanState::RemoteOnly,
+                ..*span
+            });
+        }
+    }
+    spans.sort_unstable_by_key(|s| s.seal.start_ts.0);
+    Ok(ComponentManifest {
+        generation: 0,
+        spans: spans.into_boxed_slice(),
+    })
 }
 
 /// Timestamp-named node directories under `path`, oldest first. The stack
@@ -224,6 +283,9 @@ impl TimeSeries {
             path: path.as_ref().to_path_buf(),
             data_waker: Arc::new(WaitQueue::new()),
             has_writer: Arc::new(AtomicBool::new(false)),
+            manifest: Arc::new(ManifestCell::default()),
+            structural: Arc::new(Mutex::new(())),
+            lifecycle_waker: Arc::new(WaitQueue::new()),
         })
     }
 
@@ -244,12 +306,309 @@ impl TimeSeries {
             }
         }
 
+        let manifest = reconcile_manifest(path, &list)?;
         Ok(Self {
             list,
             path: path.to_path_buf(),
             data_waker: Arc::new(WaitQueue::new()),
             has_writer: Arc::new(AtomicBool::new(false)),
+            manifest: Arc::new(ManifestCell::new(manifest)),
+            structural: Arc::new(Mutex::new(())),
+            lifecycle_waker: Arc::new(WaitQueue::new()),
         })
+    }
+
+    /// The current sealed-span snapshot.
+    pub fn manifest(&self) -> Arc<ComponentManifest> {
+        self.manifest.load()
+    }
+
+    /// Classify how much of `range` is locally answerable, appending the
+    /// remote-only sub-ranges to `gaps`. Never blocks and never allocates
+    /// beyond `gaps`' spill; safe to call from a render loop.
+    pub fn coverage(&self, range: Range<Timestamp>, gaps: &mut GapVec) -> Coverage {
+        self.manifest.load().gaps(&range, gaps);
+        if gaps.is_empty() {
+            return Coverage::Complete;
+        }
+        let any_resident = self.list.iter().any(|node| {
+            let timestamps = node.timestamps();
+            match (timestamps.first(), timestamps.last()) {
+                (Some(start), Some(end)) => start.0 < range.end.0 && range.start.0 <= end.0,
+                _ => false,
+            }
+        });
+        if any_resident {
+            Coverage::Partial
+        } else {
+            Coverage::Empty
+        }
+    }
+
+    /// Seal every resident node the writer has rolled past and record it
+    /// in the manifest. Returns true when anything changed. Runs on the
+    /// lifecycle task; checksums and fsyncs make it unsuitable for hot
+    /// paths.
+    pub fn seal_rolled_nodes(&self) -> Result<bool, Error> {
+        let _guard = self.structural.lock().unwrap();
+        let manifest = self.manifest.load();
+        let mut spans: Vec<NodeSpan> = manifest.spans.to_vec();
+        let mut changed = false;
+        // Newest-first; the first node is the live head and must not be
+        // sealed — the writer may still be appending to it.
+        for node in self.list.iter().skip(1) {
+            let Some(start_ts) = node.timestamps().first().copied() else {
+                continue;
+            };
+            if spans.iter().any(|s| s.seal.start_ts == start_ts) {
+                continue;
+            }
+            let node_dir = self.path.join(start_ts.0.to_string());
+            let seal = match SealRecord::read(&node_dir)? {
+                Some(seal) => seal,
+                None => match seal_node(&node, &node_dir)? {
+                    Some(seal) => seal,
+                    None => continue,
+                },
+            };
+            spans.push(NodeSpan {
+                seal,
+                state: SpanState::Resident,
+                source: SpanSource::LocalIngest,
+                acked: false,
+            });
+            changed = true;
+        }
+        if changed {
+            spans.sort_unstable_by_key(|s| s.seal.start_ts.0);
+            let next = ComponentManifest {
+                generation: 0,
+                spans: spans.into_boxed_slice(),
+            };
+            next.write_to(&self.path)?;
+            self.manifest.store(next);
+        }
+        Ok(changed)
+    }
+
+    /// Background task that seals nodes as the writer rolls past them.
+    /// Spawn one per component alongside the persist task.
+    pub async fn lifecycle(self) {
+        loop {
+            if let Err(err) = self.seal_rolled_nodes() {
+                warn!(?err, path = ?self.path, "failed to seal rolled nodes");
+            }
+            let _ = self.lifecycle_waker.wait().await;
+        }
+    }
+
+    pub(crate) fn path(&self) -> &Path {
+        &self.path
+    }
+
+    /// Claim a remote-only span for fetching. Returns the span's seal when
+    /// the claim won; `None` means the span is missing, already resident,
+    /// or another fetch is in flight.
+    pub fn begin_fetch(&self, start_ts: Timestamp) -> Option<SealRecord> {
+        let _guard = self.structural.lock().unwrap();
+        let manifest = self.manifest.load();
+        let span = manifest.span(start_ts)?;
+        if span.state != SpanState::RemoteOnly {
+            return None;
+        }
+        let seal = span.seal;
+        self.update_span_in_memory(&manifest, start_ts, |span| {
+            span.state = SpanState::Fetching;
+        });
+        Some(seal)
+    }
+
+    /// Release a fetch claim after a failed download so a later request
+    /// can retry.
+    pub fn abort_fetch(&self, start_ts: Timestamp) {
+        let _guard = self.structural.lock().unwrap();
+        let manifest = self.manifest.load();
+        if manifest
+            .span(start_ts)
+            .is_none_or(|span| span.state != SpanState::Fetching)
+        {
+            return;
+        }
+        self.update_span_in_memory(&manifest, start_ts, |span| {
+            span.state = SpanState::RemoteOnly;
+        });
+    }
+
+    /// Record that a store holds a durable, verified copy of the span.
+    /// Persisted — the ack is what licenses a later purge, so it must
+    /// survive restarts.
+    pub fn mark_acked(&self, start_ts: Timestamp) -> Result<(), Error> {
+        let _guard = self.structural.lock().unwrap();
+        let manifest = self.manifest.load();
+        if manifest.span(start_ts).is_none() {
+            return Ok(());
+        }
+        let mut spans = manifest.spans.to_vec();
+        for span in &mut spans {
+            if span.seal.start_ts == start_ts {
+                span.acked = true;
+            }
+        }
+        let next = ComponentManifest {
+            generation: 0,
+            spans: spans.into_boxed_slice(),
+        };
+        next.write_to(&self.path)?;
+        self.manifest.store(next);
+        Ok(())
+    }
+
+    /// Drop a resident span's local bytes. Only acked, non-head spans
+    /// qualify — the ack is the proof a store can give the data back, and
+    /// the head belongs to the writer. Ordering is crash-safe: the
+    /// manifest flips to remote-only durably first, then the node is
+    /// unlinked and its directory removed; a crash in between resurrects
+    /// the node as resident on reopen and it is simply purged again.
+    /// Readers holding slices keep the unmapped bytes alive until they
+    /// finish.
+    pub fn purge_span(&self, start_ts: Timestamp) -> Result<bool, Error> {
+        let _guard = self.structural.lock().unwrap();
+        let manifest = self.manifest.load();
+        let Some(span) = manifest.span(start_ts) else {
+            return Ok(false);
+        };
+        if span.state != SpanState::Resident || !span.acked {
+            return Ok(false);
+        }
+        let Some(node) = self
+            .list
+            .iter()
+            .find(|n| n.timestamps().first() == Some(&start_ts))
+        else {
+            return Ok(false);
+        };
+        let node_is_head = self
+            .list
+            .head()
+            .is_some_and(|head| Arc::ptr_eq(&head, &node));
+        if node_is_head && self.has_writer.load(Ordering::Acquire) {
+            return Ok(false);
+        }
+
+        let mut spans = manifest.spans.to_vec();
+        for span in &mut spans {
+            if span.seal.start_ts == start_ts {
+                span.state = SpanState::RemoteOnly;
+            }
+        }
+        let next = ComponentManifest {
+            generation: 0,
+            spans: spans.into_boxed_slice(),
+        };
+        next.write_to(&self.path)?;
+        self.manifest.store(next);
+
+        self.list.unlink(&node);
+        std::fs::remove_dir_all(self.path.join(start_ts.0.to_string()))?;
+        std::fs::File::open(&self.path)?.sync_all()?;
+        Ok(true)
+    }
+
+    /// Swap in a snapshot with `start_ts`'s span passed through `f`.
+    /// In-memory only — transient states (`Fetching`) never persist.
+    /// Caller holds the structural mutex.
+    fn update_span_in_memory(
+        &self,
+        manifest: &ComponentManifest,
+        start_ts: Timestamp,
+        f: impl Fn(&mut NodeSpan),
+    ) {
+        let mut spans = manifest.spans.to_vec();
+        for span in &mut spans {
+            if span.seal.start_ts == start_ts {
+                f(span);
+            }
+        }
+        self.manifest.store(ComponentManifest {
+            generation: 0,
+            spans: spans.into_boxed_slice(),
+        });
+    }
+
+    /// Install a downloaded node: verify it against `seal`, promote the
+    /// staging directory into place, splice the node into the list at its
+    /// timestamp-ordered position, and publish the manifest span.
+    /// Idempotent — re-installing an already-resident span with the same
+    /// checksum is `Ok`.
+    ///
+    /// The live writer never appends into an installed node (it detects
+    /// the sealed head and rolls a fresh node), but installing data newer
+    /// than the live feed can still interleave node time ranges if the
+    /// source's clock ran ahead; hydrators should only request gaps older
+    /// than the live head.
+    pub fn install_node(
+        &self,
+        staging: crate::store::NodeStaging,
+        seal: &SealRecord,
+        source: SpanSource,
+    ) -> Result<(), Error> {
+        use crate::store::StoreError;
+        let _guard = self.structural.lock().unwrap();
+        let manifest = self.manifest.load();
+        if let Some(span) = manifest.span(seal.start_ts)
+            && span.state == SpanState::Resident
+        {
+            return if span.seal.checksum == seal.checksum {
+                Ok(())
+            } else {
+                Err(StoreError::ChecksumMismatch.into())
+            };
+        }
+        // Reject overlap with any resident data; an installed node must
+        // fill a hole, not shadow samples that already exist.
+        let mut succ: Option<Arc<AtomicNode<TimeSeriesNode>>> = None;
+        for node in self.list.iter() {
+            let timestamps = node.timestamps();
+            let (Some(start), Some(end)) = (timestamps.first(), timestamps.last()) else {
+                continue;
+            };
+            if seal.start_ts.0 <= end.0 && start.0 <= seal.end_ts.0 {
+                return Err(StoreError::Other("span overlaps resident data".to_string()).into());
+            }
+            if start.0 > seal.end_ts.0 {
+                // Iteration is newest-first, so the last node we see that
+                // is newer than the install is its direct successor.
+                succ = Some(node);
+            }
+        }
+        let (_, node) = staging.commit(seal)?;
+        match succ {
+            Some(succ) => {
+                if !self.list.insert_older(&succ, node) {
+                    return Err(StoreError::Other("insert lost its anchor".to_string()).into());
+                }
+            }
+            None => self.list.push(node),
+        }
+
+        let mut spans: Vec<NodeSpan> = manifest.spans.to_vec();
+        spans.retain(|s| s.seal.start_ts != seal.start_ts);
+        spans.push(NodeSpan {
+            seal: *seal,
+            state: SpanState::Resident,
+            source,
+            // Whatever store this came from holds a copy by definition.
+            acked: matches!(source, SpanSource::RemoteFetch),
+        });
+        spans.sort_unstable_by_key(|s| s.seal.start_ts.0);
+        let next = ComponentManifest {
+            generation: 0,
+            spans: spans.into_boxed_slice(),
+        };
+        next.write_to(&self.path)?;
+        self.manifest.store(next);
+        self.data_waker.wake_all();
+        Ok(())
     }
 
     pub fn start_timestamp(&self) -> Option<Timestamp> {
@@ -386,6 +745,7 @@ impl TimeSeries {
         } else {
             Some(TimerSeriesWriter {
                 time_series: self.clone(),
+                current: None,
             })
         }
     }
@@ -393,10 +753,15 @@ impl TimeSeries {
 
 pub struct TimerSeriesWriter {
     time_series: TimeSeries,
+    /// The node this writer last appended to. When the head is a node we
+    /// have not written (first write, reopen, a structural splice, or an
+    /// installed node), we re-check that it is safe to append.
+    current: Option<Arc<AtomicNode<TimeSeriesNode>>>,
 }
 
 impl TimerSeriesWriter {
-    pub fn push_buf(&self, timestamp: Timestamp, buf: &[u8]) -> Result<(), Error> {
+    pub fn push_buf(&mut self, timestamp: Timestamp, buf: &[u8]) -> Result<(), Error> {
+        let mut rolled = false;
         loop {
             if self.try_push_buf(timestamp, buf)? {
                 break;
@@ -406,15 +771,30 @@ impl TimerSeriesWriter {
                 timestamp,
                 buf.len() as u64,
             )?);
+            rolled = true;
+        }
+        if rolled {
+            // The previous head is now immutable; let the lifecycle task
+            // seal it off the hot path.
+            self.time_series.lifecycle_waker.wake_all();
         }
         self.time_series.data_waker.wake_all();
         Ok(())
     }
 
-    fn try_push_buf(&self, timestamp: Timestamp, buf: &[u8]) -> Result<bool, Error> {
+    fn try_push_buf(&mut self, timestamp: Timestamp, buf: &[u8]) -> Result<bool, Error> {
         let Some(head) = self.time_series.list.head() else {
             return Ok(false);
         };
+        let head_is_current = self
+            .current
+            .as_ref()
+            .is_some_and(|current| Arc::ptr_eq(current, &head));
+        if !head_is_current && self.head_is_sealed(&head) {
+            // Never append into a sealed node (e.g. one installed from a
+            // store); roll a fresh node above it instead.
+            return Ok(false);
+        }
         match head.data.write(buf) {
             Ok(_) => {}
             Err(Error::MapOverflow) => return Ok(false),
@@ -424,7 +804,19 @@ impl TimerSeriesWriter {
             }
         };
         head.index.write(&timestamp.to_le_bytes())?;
+        self.current = Some(head);
         Ok(true)
+    }
+
+    fn head_is_sealed(&self, head: &Arc<AtomicNode<TimeSeriesNode>>) -> bool {
+        let Some(start_ts) = head.timestamps().first().copied() else {
+            return false;
+        };
+        self.time_series
+            .manifest
+            .load()
+            .span(start_ts)
+            .is_some_and(|span| span.state == SpanState::Resident)
     }
 }
 
@@ -455,5 +847,102 @@ mod tests {
             .collect();
         assert_eq!(starts_newest_first, vec![100, 20, 9, 3]);
         assert_eq!(series.latest().unwrap().timestamp().0, 100);
+    }
+
+    #[test]
+    fn seal_rolled_nodes_skips_head_and_persists() {
+        let dir = tempfile::tempdir().unwrap();
+        for start in [10i64, 20, 30] {
+            let node =
+                TimeSeriesNode::create(dir.path().join(start.to_string()), Timestamp(start), 8)
+                    .unwrap();
+            node.data.write(&start.to_le_bytes()).unwrap();
+            node.index.write(&Timestamp(start).to_le_bytes()).unwrap();
+        }
+
+        let series = TimeSeries::open(dir.path()).unwrap();
+        assert!(series.manifest().spans.is_empty());
+        assert!(series.seal_rolled_nodes().unwrap());
+
+        let manifest = series.manifest();
+        let starts: Vec<i64> = manifest.spans.iter().map(|s| s.seal.start_ts.0).collect();
+        // 30 is the live head and stays unsealed.
+        assert_eq!(starts, vec![10, 20]);
+        assert!(
+            manifest
+                .spans
+                .iter()
+                .all(|s| s.state == SpanState::Resident)
+        );
+        // Idempotent on a second pass.
+        assert!(!series.seal_rolled_nodes().unwrap());
+
+        // A reopen rebuilds the same view from seal files + manifest.
+        drop(series);
+        let series = TimeSeries::open(dir.path()).unwrap();
+        let manifest = series.manifest();
+        let starts: Vec<i64> = manifest.spans.iter().map(|s| s.seal.start_ts.0).collect();
+        assert_eq!(starts, vec![10, 20]);
+    }
+
+    #[test]
+    fn purged_span_survives_reopen_as_remote_only() {
+        let dir = tempfile::tempdir().unwrap();
+        for start in [10i64, 20] {
+            let node =
+                TimeSeriesNode::create(dir.path().join(start.to_string()), Timestamp(start), 8)
+                    .unwrap();
+            node.data.write(&start.to_le_bytes()).unwrap();
+            node.index.write(&Timestamp(start).to_le_bytes()).unwrap();
+        }
+        let series = TimeSeries::open(dir.path()).unwrap();
+        series.seal_rolled_nodes().unwrap();
+        drop(series);
+
+        // Simulate a purge: the node dir is gone but the manifest remembers.
+        std::fs::remove_dir_all(dir.path().join("10")).unwrap();
+        let series = TimeSeries::open(dir.path()).unwrap();
+        let manifest = series.manifest();
+        assert_eq!(manifest.spans.len(), 1);
+        assert_eq!(manifest.spans[0].seal.start_ts, Timestamp(10));
+        assert_eq!(manifest.spans[0].state, SpanState::RemoteOnly);
+
+        let mut gaps = GapVec::new();
+        let coverage = series.coverage(Timestamp(0)..Timestamp(100), &mut gaps);
+        assert_eq!(coverage, Coverage::Partial);
+        assert_eq!(gaps.len(), 1);
+        assert_eq!(gaps[0].range, Timestamp(10)..Timestamp(11));
+    }
+
+    #[test]
+    fn coverage_empty_when_only_remote_data_overlaps() {
+        let dir = tempfile::tempdir().unwrap();
+        for start in [10i64, 200] {
+            let node =
+                TimeSeriesNode::create(dir.path().join(start.to_string()), Timestamp(start), 8)
+                    .unwrap();
+            node.data.write(&start.to_le_bytes()).unwrap();
+            node.index.write(&Timestamp(start).to_le_bytes()).unwrap();
+        }
+        let series = TimeSeries::open(dir.path()).unwrap();
+        series.seal_rolled_nodes().unwrap();
+        drop(series);
+        std::fs::remove_dir_all(dir.path().join("10")).unwrap();
+        // Drop the resident node too so only remote data overlaps the
+        // queried range.
+        std::fs::remove_dir_all(dir.path().join("200")).unwrap();
+
+        let series = TimeSeries::open(dir.path()).unwrap();
+        let mut gaps = GapVec::new();
+        assert_eq!(
+            series.coverage(Timestamp(0)..Timestamp(50), &mut gaps),
+            Coverage::Empty
+        );
+
+        gaps.clear();
+        assert_eq!(
+            series.coverage(Timestamp(500)..Timestamp(600), &mut gaps),
+            Coverage::Complete
+        );
     }
 }
