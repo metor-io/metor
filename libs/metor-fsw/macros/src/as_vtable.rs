@@ -73,6 +73,26 @@ pub fn as_vtable(input: TokenStream) -> TokenStream {
             }.into()
         }
         ast::Data::Struct(fields) => {
+            let mut timestamp_fields = fields.fields.iter().filter(|field| field.timestamp);
+            let timestamp_field = timestamp_fields.next();
+            if timestamp_fields.next().is_some() {
+                panic!("only one field can be marked #[metor_fsw(timestamp)]");
+            }
+            let timestamp_source = timestamp_field.map(|field| {
+                let ident = &field.ident;
+                let ty = &field.ty;
+                quote! {
+                    let timestamp_source = #impeller::vtable::builder::raw_table(
+                        core::mem::offset_of!(Self, #ident) as u32,
+                        core::mem::size_of::<#ty>() as u32,
+                    );
+                }
+            });
+            let timestamp_map = timestamp_field.map(|_| {
+                quote! {
+                    .map(move |field| field.with_timestamp(timestamp_source.clone()))
+                }
+            });
             let vtable_items = fields.fields.iter().map(|field| {
                 let ty = &field.ty;
                 let name = field.component_name();
@@ -93,8 +113,10 @@ pub fn as_vtable(input: TokenStream) -> TokenStream {
             fn vtable_fields(path: impl #crate_name::path::ComponentPath) -> impl Iterator<Item = #impeller::vtable::builder::FieldBuilder> {
                 use #crate_name::path::ComponentPath;
                 let component = |name: &str| #impeller::vtable::builder::component(path.chain(name).to_component_id());
+                #timestamp_source
                 std::iter::empty()
                 #(#vtable_items)*
+                #timestamp_map
             }
         }
     }

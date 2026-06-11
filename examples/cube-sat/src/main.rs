@@ -40,6 +40,11 @@ const K_0: Vec3<f64> = Vec3::from_buf([-30926.00e-9, 5817.00e-9, -2318.00e-9]);
 #[repr(C)]
 #[metor_fsw(parent = "cube_sat")]
 pub struct CubeSat {
+    /// Simulation time; every component in this table is recorded at this
+    /// timestamp instead of the db's wall-clock receive time, so the sim can
+    /// free-run faster (or slower) than real time
+    #[metor_fsw(timestamp)]
+    pub timestamp: Timestamp,
     pub sim: Sim,
     pub fsw: FSW,
 }
@@ -451,7 +456,11 @@ impl Default for CubeSat {
             tick_time: 0.0,
         };
         let control = FSW::default();
-        Self { sim, fsw: control }
+        Self {
+            timestamp: control.start_epoch,
+            sim,
+            fsw: control,
+        }
     }
 }
 
@@ -612,7 +621,11 @@ pub async fn main() -> anyhow::Result<()> {
     let mut under_count = 0u8;
 
     // FSW state is shared with the sequence executor; sim state stays private to this loop.
-    let CubeSat { mut sim, fsw } = CubeSat::default();
+    let CubeSat {
+        timestamp: mut sim_time,
+        mut sim,
+        fsw,
+    } = CubeSat::default();
     let fsw = Rc::new(RefCell::new(fsw));
     // `--disarmed` brings the spacecraft up with every reaction wheel offline, so the
     // operator must arm them from the panel before attitude control takes effect.
@@ -694,6 +707,7 @@ pub async fn main() -> anyhow::Result<()> {
         // then advance the dynamics + FSW for this cycle.
         sequencer.step();
         sim = tick(sim, &fsw);
+        sim_time += Duration::from_secs_f64(DT);
 
         // Evaluate the body-rate alarm with a two-sample debounce, then raise/clear on
         // transitions only. Y (element 1) holds the initial tumble.
@@ -734,6 +748,7 @@ pub async fn main() -> anyhow::Result<()> {
 
         // Re-assemble the table from the split sim + shared FSW for the wire.
         let cube_sat = CubeSat {
+            timestamp: sim_time,
             sim: sim.clone(),
             fsw: fsw.borrow().clone(),
         };
@@ -748,7 +763,7 @@ pub async fn main() -> anyhow::Result<()> {
 
         let sleep = Duration::from_secs_f64(DT).saturating_sub(start.elapsed());
         if sleep > Duration::ZERO {
-            stellarator::sleep(sleep).await;
+          stellarator::sleep(Duration::from_micros(5)).await;
         }
     }
 }

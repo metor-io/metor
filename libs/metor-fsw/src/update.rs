@@ -208,7 +208,7 @@ mod tests {
             pub c: u64,
         }
 
-        let index: VTableSinkIndex<Foo> = VTableSinkIndex::new();
+        let index: VTableSinkIndex<Foo> = VTableSinkIndex::default();
         let mut foo = Foo {
             a: 0,
             b: tensor![0.0; 4],
