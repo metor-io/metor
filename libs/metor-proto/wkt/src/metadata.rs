@@ -63,6 +63,21 @@ impl ComponentMetadata {
     pub fn group_name(&self) -> Option<&str> {
         self.metadata.get("group_name").map(|v| v.as_str())
     }
+
+    /// Hidden components are DB-internal (e.g. derived LoD series): excluded
+    /// from UI listings and live streams, but still queryable by id.
+    pub fn is_hidden(&self) -> bool {
+        self.metadata
+            .get("hidden")
+            .map(|v| v == "true")
+            .unwrap_or_default()
+    }
+
+    pub fn with_hidden(mut self) -> Self {
+        self.metadata
+            .insert("hidden".to_string(), "true".to_string());
+        self
+    }
 }
 
 impl From<&str> for ComponentMetadata {

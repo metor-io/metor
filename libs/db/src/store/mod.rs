@@ -46,8 +46,7 @@ pub enum StoreError {
     ChecksumMismatch,
     #[error("store unavailable: {0}")]
     Unavailable(String),
-    /// The backend cannot answer this kind of request at all (e.g. an
-    /// envelope query against a peer that predates the feature). Callers
+    /// The backend cannot answer this kind of request at all. Callers
     /// should stop asking rather than retry.
     #[error("unsupported by this store")]
     Unsupported,
@@ -287,18 +286,3 @@ pub trait NodeStore: Send + Sync + 'static {
     fn contains<'a>(&'a self, key: NodeKey<'a>) -> BoxFuture<'a, Result<bool, StoreError>>;
 }
 
-/// A backend that can aggregate min/max envelopes server-side. Separate
-/// from [`NodeStore`] because most backends cannot: a directory or object
-/// store holds bytes, only a peer database computes. Backends without the
-/// capability (or peers that predate it) answer
-/// [`StoreError::Unsupported`] and callers fall back to gap bands over
-/// raw hydration.
-pub trait EnvelopeSource: Send + Sync + 'static {
-    fn get_envelope(
-        &self,
-        component_id: ComponentId,
-        element_index: u32,
-        range: std::ops::Range<Timestamp>,
-        max_bins: u32,
-    ) -> BoxFuture<'_, Result<Vec<metor_proto_wkt::EnvelopeBin>, StoreError>>;
-}

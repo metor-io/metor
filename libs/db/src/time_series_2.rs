@@ -4,8 +4,9 @@ use std::{
     path::{Path, PathBuf},
     sync::{
         Arc, Mutex,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicI64, Ordering},
     },
+    time::Duration,
 };
 
 use metor_proto::types::{ComponentView, Timestamp};
@@ -40,6 +41,14 @@ pub struct TimeSeries {
     /// Woken when the writer rolls to a new node, signalling that the
     /// previous head is ready to seal.
     lifecycle_waker: Arc<WaitQueue>,
+    /// Woken after [`Self::seal_rolled_nodes`] seals anything — the signal
+    /// derived consumers (the LoD engine) key on, distinct from
+    /// `lifecycle_waker` which fires before the seal exists.
+    seal_waker: Arc<WaitQueue>,
+    /// Maximum data-time age of the head node in microseconds; a write
+    /// older bound apart forces a roll so slow components still seal.
+    /// Zero means unbounded (the default for raw ingest).
+    max_node_age: Arc<AtomicI64>,
 }
 
 #[derive(Clone)]
@@ -168,26 +177,6 @@ pub(crate) fn node_dirs_oldest_first(path: &Path) -> Result<Vec<PathBuf>, Error>
     Ok(dirs.into_iter().map(|(_, path)| path).collect())
 }
 
-/// Write the node's summary sidecar unless a current one exists. Summary
-/// data is derived — failing to produce it must never fail the seal or
-/// install that triggered it, so errors only warn.
-fn write_summary_sidecar(
-    node: &TimeSeriesNode,
-    schema: &ComponentSchema,
-    seal: &SealRecord,
-    node_dir: &Path,
-) {
-    use crate::summary::NodeSummary;
-    if NodeSummary::read_header(node_dir, seal.checksum).is_some() {
-        return;
-    }
-    if let Some(summary) = NodeSummary::compute(node, schema, seal)
-        && let Err(e) = summary.write(node_dir)
-    {
-        warn!(?node_dir, ?e, "failed to write node summary");
-    }
-}
-
 /// Delete staging directories left behind by fetches that never
 /// committed. Runs at open, before any fetch task exists, so every
 /// `.fetching` directory is guaranteed orphaned.
@@ -281,24 +270,31 @@ pub struct TimeSeriesSlice {
 }
 
 impl TimeSeriesSlice {
+    /// Per-node slices of the range, newest first. The node list's links
+    /// only run newer → older, so iteration must seed from the range's
+    /// newest node (`end`) and stop once the oldest (`start`) has been
+    /// yielded — seeding from `start` can never reach the newer nodes
+    /// that hold the rest of the range.
     pub fn as_iter(&self) -> impl Iterator<Item = TimeSeriesNodeSlice> + '_ {
         let iter: AtomicStackIter<TimeSeriesNode> =
-            AtomicStackIter::new(ArcAtomic::from(self.start.node.clone()));
-        iter.map(move |node| {
-            let start = if Arc::ptr_eq(&node, &self.start.node) {
-                self.start.index
-            } else {
-                0
-            };
+            AtomicStackIter::new(ArcAtomic::from(self.end.node.clone()));
+        let mut done = false;
+        iter.map_while(move |node| {
+            if done {
+                return None;
+            }
+            let is_start = Arc::ptr_eq(&node, &self.start.node);
+            done = is_start;
+            let start = if is_start { self.start.index } else { 0 };
             let end = if Arc::ptr_eq(&node, &self.end.node) {
                 self.end.index
             } else {
                 node.timestamps().len().saturating_sub(1)
             };
-            TimeSeriesNodeSlice {
+            Some(TimeSeriesNodeSlice {
                 range: start..=end,
                 node,
-            }
+            })
         })
     }
 
@@ -334,6 +330,8 @@ impl TimeSeries {
             manifest: Arc::new(ManifestCell::default()),
             structural: Arc::new(Mutex::new(())),
             lifecycle_waker: Arc::new(WaitQueue::new()),
+            seal_waker: Arc::new(WaitQueue::new()),
+            max_node_age: Arc::new(AtomicI64::new(0)),
         })
     }
 
@@ -364,6 +362,8 @@ impl TimeSeries {
             manifest: Arc::new(ManifestCell::new(manifest)),
             structural: Arc::new(Mutex::new(())),
             lifecycle_waker: Arc::new(WaitQueue::new()),
+            seal_waker: Arc::new(WaitQueue::new()),
+            max_node_age: Arc::new(AtomicI64::new(0)),
         })
     }
 
@@ -396,9 +396,9 @@ impl TimeSeries {
 
     /// Seal every resident node the writer has rolled past, summarize it,
     /// and record it in the manifest. Returns true when anything changed.
-    /// Runs on the lifecycle task; checksums, summary passes, and fsyncs
+    /// Runs on the lifecycle task; checksums and fsyncs
     /// make it unsuitable for hot paths.
-    pub fn seal_rolled_nodes(&self, schema: &ComponentSchema) -> Result<bool, Error> {
+    pub fn seal_rolled_nodes(&self) -> Result<bool, Error> {
         let _guard = self.structural.lock().unwrap();
         let manifest = self.manifest.load();
         let mut sealed: Vec<NodeSpan> = Vec::new();
@@ -419,7 +419,6 @@ impl TimeSeries {
                     None => continue,
                 },
             };
-            write_summary_sidecar(&node, schema, &seal, &node_dir);
             sealed.push(NodeSpan::whole(
                 seal,
                 SpanState::Resident,
@@ -431,14 +430,39 @@ impl TimeSeries {
             return Ok(false);
         }
         self.publish_manifest(true, |spans| spans.extend(sealed))?;
+        self.seal_waker.wake_all();
         Ok(true)
+    }
+
+    /// Woken whenever [`Self::seal_rolled_nodes`] adds spans — i.e. when
+    /// new history has become final and derivations over sealed data can
+    /// advance.
+    pub fn seal_waiter(&self) -> Arc<WaitQueue> {
+        self.seal_waker.clone()
+    }
+
+    /// Bound the head node's data-time age; the writer rolls (and so the
+    /// lifecycle task seals) once a write lands more than `age` past the
+    /// head's first sample. Used for slow-writing derived components whose
+    /// 32 MB head would otherwise never fill — sealed spans are the only
+    /// thing manifest seeding ships to mirrors.
+    pub fn set_max_node_age(&self, age: Duration) {
+        self.max_node_age
+            .store(age.as_micros() as i64, Ordering::Relaxed);
+    }
+
+    fn max_node_age_us(&self) -> Option<i64> {
+        match self.max_node_age.load(Ordering::Relaxed) {
+            0 => None,
+            age => Some(age),
+        }
     }
 
     /// Background task that seals nodes as the writer rolls past them.
     /// Spawn one per component alongside the persist task.
-    pub async fn lifecycle(self, schema: ComponentSchema) {
+    pub async fn lifecycle(self) {
         loop {
-            if let Err(err) = self.seal_rolled_nodes(&schema) {
+            if let Err(err) = self.seal_rolled_nodes() {
                 warn!(?err, path = ?self.path, "failed to seal rolled nodes");
             }
             let _ = self.lifecycle_waker.wait().await;
@@ -603,7 +627,6 @@ impl TimeSeries {
         staging: crate::store::NodeStaging,
         seal: &SealRecord,
         source: SpanSource,
-        schema: &ComponentSchema,
     ) -> Result<(), Error> {
         use crate::store::StoreError;
         let _guard = self.structural.lock().unwrap();
@@ -640,8 +663,7 @@ impl TimeSeries {
         {
             return Err(StoreError::Other("span is newer than the live head".to_string()).into());
         }
-        let (node_dir, node) = staging.commit(seal)?;
-        write_summary_sidecar(&node, schema, seal, &node_dir);
+        let (_node_dir, node) = staging.commit(seal)?;
         match succ {
             Some(succ) => {
                 if !self.list.insert_older(&succ, node) {
@@ -947,6 +969,12 @@ impl TimerSeriesWriter {
             // store); roll a fresh node above it instead.
             return Ok(false);
         }
+        if let Some(max_age) = self.time_series.max_node_age_us()
+            && let Some(first) = head.timestamps().first()
+            && timestamp.0.saturating_sub(first.0) > max_age
+        {
+            return Ok(false);
+        }
         match head.data.write(buf) {
             Ok(_) => {}
             Err(Error::MapOverflow) => return Ok(false),
@@ -1087,7 +1115,7 @@ mod tests {
         let local_seal = staging.trim_to(span.cover_end).unwrap();
         assert_eq!(local_seal.end_ts, Timestamp(90));
         series
-            .install_node(staging, &local_seal, SpanSource::RemoteFetch, &test_schema())
+            .install_node(staging, &local_seal, SpanSource::RemoteFetch)
             .unwrap();
 
         let manifest = series.manifest();
@@ -1097,12 +1125,6 @@ mod tests {
         assert_eq!(installed.cover_end, Timestamp(90));
         assert_eq!(series.start_timestamp().unwrap(), Timestamp(0));
         assert_eq!(series.latest().unwrap().timestamp(), Timestamp(101));
-        assert!(
-            dir.path()
-                .join("0")
-                .join(crate::summary::SUMMARY_FILE)
-                .exists()
-        );
         let mut gaps = GapVec::new();
         assert_eq!(
             series.coverage(Timestamp(0)..Timestamp(102), &mut gaps),
@@ -1184,7 +1206,7 @@ mod tests {
 
         let series = TimeSeries::open(dir.path()).unwrap();
         assert!(series.manifest().spans.is_empty());
-        assert!(series.seal_rolled_nodes(&test_schema()).unwrap());
+        assert!(series.seal_rolled_nodes().unwrap());
 
         let manifest = series.manifest();
         let starts: Vec<i64> = manifest.spans.iter().map(|s| s.seal.start_ts.0).collect();
@@ -1196,17 +1218,8 @@ mod tests {
                 .iter()
                 .all(|s| s.state == SpanState::Resident)
         );
-        // Sealing also writes the summary sidecar each span derives from.
-        for start in [10i64, 20] {
-            assert!(
-                dir.path()
-                    .join(start.to_string())
-                    .join(crate::summary::SUMMARY_FILE)
-                    .exists()
-            );
-        }
         // Idempotent on a second pass.
-        assert!(!series.seal_rolled_nodes(&test_schema()).unwrap());
+        assert!(!series.seal_rolled_nodes().unwrap());
 
         // A reopen rebuilds the same view from seal files + manifest.
         drop(series);
@@ -1214,6 +1227,74 @@ mod tests {
         let manifest = series.manifest();
         let starts: Vec<i64> = manifest.spans.iter().map(|s| s.seal.start_ts.0).collect();
         assert_eq!(starts, vec![10, 20]);
+    }
+
+    /// A range spanning several nodes must yield every overlapping node,
+    /// newest first, and nothing older than the range. Regression: the
+    /// iterator used to seed from the range's *oldest* node and walk the
+    /// stack's newer→older links, so everything in newer nodes was
+    /// silently dropped.
+    #[test]
+    fn get_range_spans_multiple_nodes() {
+        let dir = tempfile::tempdir().unwrap();
+        for start in [0i64, 100, 200] {
+            let node =
+                TimeSeriesNode::create(dir.path().join(start.to_string()), Timestamp(start), 8)
+                    .unwrap();
+            for i in 0..10i64 {
+                let ts = start + i * 10;
+                node.data.write(&ts.to_le_bytes()).unwrap();
+                node.index.write(&Timestamp(ts).to_le_bytes()).unwrap();
+            }
+        }
+        let series = TimeSeries::open(dir.path()).unwrap();
+
+        let slice = series
+            .get_range(Timestamp(50)..Timestamp(250))
+            .unwrap();
+        let chunks: Vec<Vec<i64>> = slice
+            .as_iter()
+            .map(|ns| ns.timestamps().iter().map(|t| t.0).collect())
+            .collect();
+        // Newest first, clamped to the range at both ends (the end bound
+        // is inclusive on an exact timestamp match).
+        assert_eq!(chunks.len(), 3);
+        assert_eq!(chunks[0], vec![200, 210, 220, 230, 240, 250]);
+        assert_eq!(chunks[1], (100..200).step_by(10).collect::<Vec<_>>());
+        assert_eq!(chunks[2], vec![50, 60, 70, 80, 90]);
+        assert_eq!(slice.len(), 21);
+
+        // Single-node ranges still clamp to both ends.
+        let slice = series
+            .get_range(Timestamp(110)..Timestamp(150))
+            .unwrap();
+        let chunks: Vec<Vec<i64>> = slice
+            .as_iter()
+            .map(|ns| ns.timestamps().iter().map(|t| t.0).collect())
+            .collect();
+        assert_eq!(chunks, vec![vec![110, 120, 130, 140, 150]]);
+    }
+
+    #[test]
+    fn max_node_age_rolls_and_seals_old_heads() {
+        let dir = tempfile::tempdir().unwrap();
+        let series = TimeSeries::create(dir.path()).unwrap();
+        series.set_max_node_age(Duration::from_micros(100));
+        let mut writer = series.writer().unwrap();
+
+        writer.push_buf(Timestamp(0), &0u64.to_le_bytes()).unwrap();
+        writer.push_buf(Timestamp(50), &1u64.to_le_bytes()).unwrap();
+        assert_eq!(series.list.iter().count(), 1);
+
+        // A write more than the age past the head's first sample rolls,
+        // and the rolled node seals like any full one.
+        writer.push_buf(Timestamp(150), &2u64.to_le_bytes()).unwrap();
+        assert_eq!(series.list.iter().count(), 2);
+        assert!(series.seal_rolled_nodes().unwrap());
+        let manifest = series.manifest();
+        assert_eq!(manifest.spans.len(), 1);
+        assert_eq!(manifest.spans[0].seal.start_ts, Timestamp(0));
+        assert_eq!(manifest.spans[0].seal.end_ts, Timestamp(50));
     }
 
     #[test]
@@ -1227,7 +1308,7 @@ mod tests {
             node.index.write(&Timestamp(start).to_le_bytes()).unwrap();
         }
         let series = TimeSeries::open(dir.path()).unwrap();
-        series.seal_rolled_nodes(&test_schema()).unwrap();
+        series.seal_rolled_nodes().unwrap();
         drop(series);
 
         // Simulate a purge: the node dir is gone but the manifest remembers.
@@ -1282,7 +1363,7 @@ mod tests {
             .unwrap();
         assert!(
             series
-                .install_node(staging, &seal, SpanSource::LocalIngest, &test_schema())
+                .install_node(staging, &seal, SpanSource::LocalIngest)
                 .is_err()
         );
         // The head is untouched and the staging directory cleaned up.
@@ -1302,7 +1383,7 @@ mod tests {
             node.index.write(&Timestamp(start).to_le_bytes()).unwrap();
         }
         let series = TimeSeries::open(dir.path()).unwrap();
-        series.seal_rolled_nodes(&test_schema()).unwrap();
+        series.seal_rolled_nodes().unwrap();
         drop(series);
         std::fs::remove_dir_all(dir.path().join("10")).unwrap();
         // Drop the resident node too so only remote data overlaps the

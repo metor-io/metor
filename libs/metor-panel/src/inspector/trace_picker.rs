@@ -16,6 +16,7 @@ pub(crate) fn list_components(db: &DB) -> Vec<(ComponentId, String)> {
     let mut components: Vec<_> = db.with_state(|state| {
         state
             .component_metadata_iter()
+            .filter(|(_, meta)| !meta.is_hidden())
             .map(|(id, meta)| (*id, meta.name.clone()))
             .collect()
     });

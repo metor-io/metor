@@ -94,9 +94,9 @@ pub struct Theme {
     /// Translucent band over plot regions whose data is remote-only or
     /// still downloading.
     pub plot_gap_band: Hsla,
-    /// Alpha applied to a trace's color when it renders as a summary
-    /// envelope instead of raw samples, so operators can tell the two
-    /// apart at a glance.
+    /// Alpha applied to a trace's color when it renders as a min/max
+    /// envelope (LoD buckets) instead of raw samples, so operators can
+    /// tell the two apart at a glance.
     pub plot_envelope_alpha: f32,
 
     /// "On" color for checkboxes, switches, and traffic-light tiles. Replaces

@@ -183,24 +183,31 @@ pub struct MsgLogSlice {
 }
 
 impl MsgLogSlice {
+    /// Per-node slices of the range, newest first. The node list's links
+    /// only run newer → older, so iteration seeds from the range's newest
+    /// node (`end`) and stops once the oldest (`start`) has been yielded —
+    /// seeding from `start` can never reach the newer nodes that hold the
+    /// rest of the range.
     pub fn as_iter(&self) -> impl Iterator<Item = MsgLogNodeSlice> + '_ {
         let iter: AtomicStackIter<MsgLogNode> =
-            AtomicStackIter::new(ArcAtomic::from(self.start.node.clone()));
-        iter.map(move |node| {
-            let start = if Arc::ptr_eq(&node, &self.start.node) {
-                self.start.index
-            } else {
-                0
-            };
+            AtomicStackIter::new(ArcAtomic::from(self.end.node.clone()));
+        let mut done = false;
+        iter.map_while(move |node| {
+            if done {
+                return None;
+            }
+            let is_start = Arc::ptr_eq(&node, &self.start.node);
+            done = is_start;
+            let start = if is_start { self.start.index } else { 0 };
             let end = if Arc::ptr_eq(&node, &self.end.node) {
                 self.end.index
             } else {
                 node.msg_count().saturating_sub(1)
             };
-            MsgLogNodeSlice {
+            Some(MsgLogNodeSlice {
                 range: start..=end,
                 node,
-            }
+            })
         })
     }
 

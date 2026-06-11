@@ -51,7 +51,7 @@ pub async fn hydrate_span(
         } else {
             seal
         };
-        time_series.install_node(staging, &install_seal, SpanSource::RemoteFetch, schema)
+        time_series.install_node(staging, &install_seal, SpanSource::RemoteFetch)
     }
     .await;
     match result {

@@ -5,12 +5,10 @@
 //! tiering engine); this module owns the how.
 
 mod db;
-mod envelope;
 mod hydrate;
 mod offload;
 
 pub use db::RemoteDb;
-pub use envelope::{EnvelopeBin, EnvelopeData, Envelopes};
 pub use hydrate::Hydrator;
 pub use hydrate::hydrate_span;
 pub use offload::offload_span;
@@ -54,7 +52,7 @@ mod tests {
             }
         }
         let series = TimeSeries::open(dir).unwrap();
-        series.seal_rolled_nodes(&component_schema()).unwrap();
+        series.seal_rolled_nodes().unwrap();
         series
     }
 

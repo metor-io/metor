@@ -136,6 +136,7 @@ impl ComponentTableDelegate {
         let prepared: Vec<(SharedString, Component)> = db.with_state(|state| {
             state
                 .component_metadata_iter()
+                .filter(|(_, meta)| !meta.is_hidden())
                 .filter_map(|(id, meta)| {
                     let name = SharedString::from(meta.name.clone());
                     let component = state.get_component(*id)?.clone();

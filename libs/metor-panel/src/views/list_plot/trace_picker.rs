@@ -60,6 +60,7 @@ fn list_vector_components(db: &DB) -> Vec<(ComponentId, String, usize)> {
     let mut out: Vec<(ComponentId, String, usize)> = db.with_state(|state| {
         state
             .component_metadata_iter()
+            .filter(|(_, meta)| !meta.is_hidden())
             .filter_map(|(id, meta)| {
                 let comp = state.get_component(*id)?;
                 let len: usize = comp.schema.dim.iter().product();

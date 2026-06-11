@@ -31,6 +31,11 @@ pub fn build_tree(db: &DB) -> Arc<ComponentNode> {
     let mut root = Builder::new(SharedString::new_static(""), String::new());
     db.with_state(|state| {
         for (id, meta) in state.component_metadata_iter() {
+            // DB-internal components (derived LoD series) stay queryable
+            // but never list in the browser.
+            if meta.is_hidden() {
+                continue;
+            }
             insert(&mut root, &meta.name, *id);
         }
     });

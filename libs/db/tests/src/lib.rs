@@ -163,14 +163,16 @@ mod tests {
         std::fs::remove_dir_all(&scratch).ok();
     }
 
-    /// The envelope reply must aggregate every sealed span in range to a
-    /// bounded number of bins, with extremes matching the raw data.
+    /// The LoD engine must derive hidden min/max companions from sealed
+    /// history, publish their metadata (which a mirror then syncs), and
+    /// keep them off the live stream — a mirror only ever receives LoD
+    /// data through manifest seeding + hydration of sealed spans.
     #[test]
-    async fn envelope_aggregates_sealed_history() {
+    async fn lod_companions_derive_from_sealed_history() {
         use metor_db::store::{NodeKey, NodeStore, SealedNode};
 
-        let (addr, _db) = setup_test_db().await.unwrap();
-        let scratch = std::env::temp_dir().join(format!("metor_env_{}", fastrand::u64(..)));
+        let (addr, db) = setup_test_db().await.unwrap();
+        let scratch = std::env::temp_dir().join(format!("metor_lod_{}", fastrand::u64(..)));
         std::fs::create_dir_all(&scratch).unwrap();
         let component_id = ComponentId(777);
         let node_schema = metor_proto::schema::Schema::new(PrimType::U64, [1usize]).unwrap();
@@ -192,7 +194,7 @@ mod tests {
                 .put(
                     NodeKey {
                         component_id,
-                        component_name: "envelope.test",
+                        component_name: "lod.test",
                         schema: &node_schema,
                         start_ts: seal.start_ts,
                         checksum: seal.checksum,
@@ -203,58 +205,100 @@ mod tests {
                 .unwrap();
         }
 
-        let mut client = Client::connect(addr).await.unwrap();
-        let info: DbInfoResp = client.request(&GetDbInfo).await.unwrap();
-        assert_ne!(info.features & FEATURE_ENVELOPE, 0);
+        metor_db::lod::spawn(db.clone());
 
-        let resp: EnvelopeResp = client
-            .request(&GetEnvelope {
-                component_id,
-                element_index: 0,
-                start: Timestamp(0),
-                end: Timestamp(1_100),
-                max_bins: 64,
-            })
-            .await
-            .unwrap();
-        assert!(!resp.bins.is_empty());
-        assert!(resp.bins.len() <= 64);
-        assert!(resp.bins.windows(2).all(|w| w[0].ts.0 <= w[1].ts.0));
-        let min = resp.bins.iter().map(|b| b.min).fold(f32::INFINITY, f32::min);
-        let max = resp
-            .bins
-            .iter()
-            .map(|b| b.max)
-            .fold(f32::NEG_INFINITY, f32::max);
-        assert_eq!(min, 0.0);
-        assert_eq!(max, 1_063.0);
+        // The engine derives companions from the sealed history and emits
+        // the complete buckets behind the sealed frontier.
+        let mut lod_ids: Vec<ComponentId> = Vec::new();
+        for _ in 0..40 {
+            sleep(Duration::from_millis(50)).await;
+            lod_ids = db.with_state(|state| {
+                state
+                    .component_metadata_iter()
+                    .filter(|(_, meta)| {
+                        meta.metadata
+                            .get(metor_db::lod::LOD_SOURCE_ID_KEY)
+                            .is_some_and(|v| v == &component_id.0.to_string())
+                    })
+                    .map(|(id, _)| *id)
+                    .collect()
+            });
+            let finest_has_data = lod_ids.iter().any(|id| {
+                db.with_state(|state| {
+                    state
+                        .get_component(*id)
+                        .is_some_and(|c| c.time_series.latest().is_some())
+                })
+            });
+            if finest_has_data {
+                break;
+            }
+        }
+        assert!(!lod_ids.is_empty(), "lod engine never created companions");
 
-        // A narrow range only sees its node's values.
-        let resp: EnvelopeResp = client
-            .request(&GetEnvelope {
-                component_id,
-                element_index: 0,
-                start: Timestamp(1_000),
-                end: Timestamp(1_064),
-                max_bins: 1_000_000,
-            })
-            .await
-            .unwrap();
-        let min = resp.bins.iter().map(|b| b.min).fold(f32::INFINITY, f32::min);
-        assert_eq!(min, 1_000.0);
+        let (finest, bucket_us) = db.with_state(|state| {
+            let mut levels: Vec<(u64, ComponentId, i64)> = lod_ids
+                .iter()
+                .filter_map(|id| {
+                    let meta = state.get_component_metadata(*id)?;
+                    assert!(meta.is_hidden(), "lod companions must be hidden");
+                    let ratio = meta.metadata.get(metor_db::lod::LOD_RATIO_KEY)?.parse().ok()?;
+                    let bucket = meta
+                        .metadata
+                        .get(metor_db::lod::LOD_BUCKET_US_KEY)?
+                        .parse()
+                        .ok()?;
+                    Some((ratio, *id, bucket))
+                })
+                .collect();
+            levels.sort_unstable_by_key(|(ratio, ..)| *ratio);
+            let (_, id, bucket) = levels[0];
+            (state.get_component(id).cloned().unwrap(), bucket)
+        });
+        // Schema is [2, ..source shape] f32: min then max per element.
+        assert_eq!(finest.schema.prim_type, PrimType::F32);
+        assert_eq!(finest.schema.dim.as_slice(), &[2, 1]);
 
-        // Unknown components answer empty rather than erroring.
-        let resp: EnvelopeResp = client
-            .request(&GetEnvelope {
-                component_id: ComponentId(31_337),
-                element_index: 0,
-                start: Timestamp(0),
-                end: Timestamp(100),
-                max_bins: 64,
-            })
-            .await
+        // The first bucket folds the first sealed node's extremes exactly.
+        let latest = finest.time_series.latest().expect("buckets emitted");
+        let slice = finest
+            .time_series
+            .get_range(Timestamp(i64::MIN)..Timestamp(i64::MAX))
             .unwrap();
-        assert!(resp.bins.is_empty());
+        let node_slices: Vec<_> = slice.as_iter().collect();
+        let first = node_slices.last().unwrap();
+        let first_min = f32::from_le_bytes(first.data()[0..4].try_into().unwrap());
+        let first_max = f32::from_le_bytes(first.data()[4..8].try_into().unwrap());
+        assert_eq!(first_min, 0.0);
+        assert_eq!(first_max, 63.0);
+        // Buckets stop at the sealed frontier and stamp midpoints.
+        assert!(latest.timestamp().0 < 1_064 + bucket_us);
+
+        // A mirror syncs the hidden metadata but must not materialize the
+        // LoD component from the live stream — its data arrives only via
+        // sealed-span seeding + hydration.
+        let local_dir =
+            std::env::temp_dir().join(format!("metor_db_lod_local_{}", fastrand::u64(..)));
+        let local_db = Arc::new(DB::create(local_dir).unwrap());
+        metor_db::remote::RemoteDb::new(addr).spawn(local_db.clone());
+        let lod_id = finest.component_id;
+        let mut metadata_synced = false;
+        for _ in 0..40 {
+            sleep(Duration::from_millis(50)).await;
+            metadata_synced = local_db.with_state(|state| {
+                state
+                    .get_component_metadata(lod_id)
+                    .is_some_and(|meta| meta.is_hidden())
+            });
+            if metadata_synced {
+                break;
+            }
+        }
+        assert!(metadata_synced, "mirror never synced lod metadata");
+        assert!(
+            local_db.with_state(|state| state.get_component(lod_id).is_none()),
+            "lod component leaked onto the mirror through the live stream"
+        );
         std::fs::remove_dir_all(&scratch).ok();
     }
 

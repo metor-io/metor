@@ -4,7 +4,7 @@ use metor_proto::schema::Schema;
 use metor_proto::types::{ComponentId, IntoLenPacket, LenPacket, PacketTy, Timestamp};
 use metor_proto_stellar::Client;
 use metor_proto_wkt::{
-    DbInfoResp, DumpMetadata, DumpMetadataResp, DumpSchema, DumpSchemaResp, GetDbInfo, Stream,
+    DbInfoResp, DumpMetadata, DumpMetadataResp, GetDbInfo, Stream,
     StreamBehavior,
 };
 use stellarator::sync::Mutex;
@@ -15,7 +15,7 @@ use crate::{
     store::PeerStore,
 };
 
-use super::{Envelopes, Hydrator};
+use super::Hydrator;
 
 /// Mirror of a long-running remote metor-db: a live-tail connection feeds
 /// the local DB exactly like a directly-attached producer would, while a
@@ -30,7 +30,6 @@ pub struct RemoteDb {
     addr: SocketAddr,
     store: Arc<PeerStore>,
     hydrator: Hydrator,
-    envelopes: Envelopes,
 }
 
 impl RemoteDb {
@@ -39,7 +38,6 @@ impl RemoteDb {
             addr,
             store: Arc::new(PeerStore::new(addr)),
             hydrator: Hydrator::new(),
-            envelopes: Envelopes::new(),
         }
     }
 
@@ -48,35 +46,28 @@ impl RemoteDb {
         self.hydrator.clone()
     }
 
-    /// The handle wide views use to request min/max envelopes.
-    pub fn envelopes(&self) -> Envelopes {
-        self.envelopes.clone()
-    }
-
     /// The bulk store, for offload/tiering against the same peer.
     pub fn store(&self) -> Arc<PeerStore> {
         self.store.clone()
     }
 
     /// Spawn the supervisor: the reconnecting live mirror plus the
-    /// hydration and envelope workers. Tasks run until the runtime shuts
-    /// down.
+    /// hydration worker. Tasks run until the runtime shuts down.
     pub fn spawn(self, db: Arc<DB>) {
         let Self {
             addr,
             store,
             hydrator,
-            envelopes,
         } = self;
         stellarator::spawn(hydrator.clone().run(db.clone(), store.clone()));
-        stellarator::spawn(envelopes.run(store.clone()));
+        stellarator::spawn(seed_loop(db.clone(), store.clone()));
         stellarator::spawn(async move {
             const INITIAL_BACKOFF: Duration = Duration::from_millis(250);
             const HEALTHY_CONNECTION: Duration = Duration::from_secs(30);
             let mut backoff = INITIAL_BACKOFF;
             loop {
                 let connected_at = std::time::Instant::now();
-                match mirror(&db, addr, &store).await {
+                match mirror(&db, addr).await {
                     Ok(()) => {}
                     Err(err) if err.is_stream_closed() => {
                         info!(?addr, "remote db disconnected; reconnecting");
@@ -112,7 +103,7 @@ async fn handshake_request<T>(
 
 /// One connection lifetime: handshake, metadata sync, then ingest the
 /// real-time stream until the connection drops.
-async fn mirror(db: &Arc<DB>, addr: SocketAddr, store: &Arc<PeerStore>) -> Result<(), Error> {
+async fn mirror(db: &Arc<DB>, addr: SocketAddr) -> Result<(), Error> {
     let mut client = Client::connect(addr).await?;
     let info: DbInfoResp = handshake_request(client.request(&GetDbInfo)).await?;
     info!(?addr, peer_version = info.protocol_version, "mirroring remote db");
@@ -125,14 +116,6 @@ async fn mirror(db: &Arc<DB>, addr: SocketAddr, store: &Arc<PeerStore>) -> Resul
             }
         }
     });
-
-    // History recorded before this connection is invisible to the live
-    // stream; the seeding sweep imports it as remote-only coverage. It
-    // runs on the bulk store connection so a year of GetNodeManifest
-    // round trips never delays live ingest, and re-runs per reconnect
-    // (the merge is idempotent).
-    let schemas: DumpSchemaResp = handshake_request(client.request(&DumpSchema)).await?;
-    stellarator::spawn(seed_manifests(db.clone(), store.clone(), schemas.schemas));
 
     let stream = Stream {
         behavior: StreamBehavior::RealTime,
@@ -164,16 +147,36 @@ async fn mirror(db: &Arc<DB>, addr: SocketAddr, store: &Arc<PeerStore>) -> Resul
     }
 }
 
+/// Periodically import the peer's sealed-node manifests, on the bulk
+/// store connection so a year of GetNodeManifest round trips never delays
+/// live ingest. The first pass per peer connect imports pre-connect
+/// history; later passes pick up spans the peer sealed since — hidden
+/// components (derived LoD series) especially, which never ride the live
+/// stream. The merge is idempotent, so re-seeding is cheap when nothing
+/// changed.
+async fn seed_loop(db: Arc<DB>, store: Arc<PeerStore>) {
+    const RESEED_INTERVAL: Duration = Duration::from_secs(60);
+    loop {
+        match store.dump_schema().await {
+            Ok(resp) => seed_manifests(&db, &store, resp.schemas).await,
+            Err(err) => {
+                warn!(?err, "failed to dump peer schemas for manifest seeding");
+            }
+        }
+        stellarator::sleep(RESEED_INTERVAL).await;
+    }
+}
+
 /// Import the peer's sealed-node manifest for every component it knows,
-/// so pre-connect history shows up as fetchable remote-only coverage.
-/// Components are created on demand (a seeded component has no live
-/// writer, so the merge cannot conflict with ingest); ones with no sealed
-/// history are skipped rather than created empty. Per-component failures
-/// are logged and skipped — one bad component must not hide the rest of
-/// the archive.
+/// so history that never rides the live stream shows up as fetchable
+/// remote-only coverage. Components are created on demand (a seeded
+/// component has no live writer, so the merge cannot conflict with
+/// ingest); ones with no sealed history are skipped rather than created
+/// empty. Per-component failures are logged and skipped — one bad
+/// component must not hide the rest of the archive.
 async fn seed_manifests(
-    db: Arc<DB>,
-    store: Arc<PeerStore>,
+    db: &Arc<DB>,
+    store: &Arc<PeerStore>,
     schemas: HashMap<ComponentId, Schema<Vec<u64>>>,
 ) {
     let mut components = 0usize;

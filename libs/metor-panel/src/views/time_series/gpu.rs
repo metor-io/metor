@@ -77,12 +77,15 @@ pub(crate) enum AxisSource<'a> {
         component: &'a Component,
         len: usize,
     },
-    /// Pre-aggregated min/max envelope bins fetched from a remote, sorted
-    /// by timestamp. Renders as a zigzag through the line pipeline: two
-    /// points per bin, so every column spans its bin's extremes — the
-    /// same geometry min-max decimation produces from raw samples.
-    EnvelopeBins {
-        bins: &'a [metor_db::remote::EnvelopeBin],
+    /// A derived min/max LoD component (`metor_db::lod`): each sample holds
+    /// `[min_e0..min_eN, max_e0..max_eN]` f32 buckets. Renders as a zigzag
+    /// through the line pipeline — two points per bucket, so every column
+    /// spans its bucket's extremes, the same geometry min-max decimation
+    /// produces from raw samples.
+    MinMax {
+        component_id: ComponentId,
+        component: &'a Component,
+        element_index: usize,
     },
 }
 
@@ -96,17 +99,16 @@ impl<'a> AxisSource<'a> {
             AxisSource::Element { .. }
             | AxisSource::LatestSampleIndex { .. }
             | AxisSource::LatestSampleElements { .. }
-            | AxisSource::EnvelopeBins { .. } => 1.0,
+            | AxisSource::MinMax { .. } => 1.0,
         }
     }
 
     fn component(&self) -> Option<&'a Component> {
         match self {
-            AxisSource::Timestamps
-            | AxisSource::LatestSampleIndex { .. }
-            | AxisSource::EnvelopeBins { .. } => None,
+            AxisSource::Timestamps | AxisSource::LatestSampleIndex { .. } => None,
             AxisSource::Element { component, .. }
-            | AxisSource::LatestSampleElements { component, .. } => Some(component),
+            | AxisSource::LatestSampleElements { component, .. }
+            | AxisSource::MinMax { component, .. } => Some(component),
         }
     }
 }
@@ -126,8 +128,8 @@ pub(crate) struct LineDraw<'a> {
     pub color: Hsla,
     pub stroke_width: f32,
     /// Narrow the time-range cull below the view, in raw X units. Lets a
-    /// trace render twice in one frame without overlap — an envelope for
-    /// summarized history plus raw samples clipped to the live tail.
+    /// trace render twice in one frame without overlap — min/max buckets
+    /// for summarized history plus raw samples clipped to the live tail.
     pub x_clip: Option<(f64, f64)>,
 }
 
@@ -998,8 +1000,13 @@ fn plan_trace(
         );
     }
 
-    if let AxisSource::EnvelopeBins { bins } = &trace.y {
-        return plan_envelope_trace(
+    if let AxisSource::MinMax {
+        component,
+        element_index,
+        ..
+    } = &trace.y
+    {
+        return plan_min_max_trace(
             ctx,
             cache,
             upload_x,
@@ -1007,10 +1014,12 @@ fn plan_trace(
             idx_scratch,
             x_buf,
             y_buf,
-            bins,
+            component,
+            *element_index,
             view,
             y_epoch,
             y_scale,
+            pixel_budget,
         );
     }
 
@@ -1168,14 +1177,16 @@ struct NodePair {
     y: NodeView,
 }
 
-/// Envelope path: two points per bin, `(ts, min)` then `(ts, max)`, drawn
-/// as one zigzag line so each column spans its bin's extremes. Bypasses
-/// the NodePair pipeline — bins are already decimated server-side and a
-/// year is a few thousand of them. NaN bins (no finite sample) split the
-/// line, so coverage holes render as holes rather than interpolating
+/// Min/max LoD path: two points per bucket, `(ts, min)` then `(ts, max)`,
+/// drawn as one zigzag line so each column spans its bucket's extremes.
+/// Bypasses the NodePair pipeline — bucket samples need their min and max
+/// elements read together, and folding adjacent buckets (min-of-mins /
+/// max-of-maxs) is the exact decimation, so over-budget views stride-fold
+/// instead of point-sampling. NaN buckets (no finite source sample) split
+/// the line, so coverage holes render as holes rather than interpolating
 /// across.
 #[allow(clippy::too_many_arguments)]
-fn plan_envelope_trace(
+fn plan_min_max_trace(
     ctx: &GpuContext,
     cache: &mut ValueCache,
     upload_x: &mut Vec<f32>,
@@ -1183,20 +1194,37 @@ fn plan_envelope_trace(
     idx_scratch: &mut Vec<u32>,
     x_buf: &wgpu::Buffer,
     y_buf: &wgpu::Buffer,
-    bins: &[metor_db::remote::EnvelopeBin],
+    component: &Component,
+    element_index: usize,
     view: PlotBounds,
     y_epoch: f64,
     y_scale: f64,
+    pixel_budget: usize,
 ) -> TracePlan {
     let mut spans = Vec::new();
-    // One bin of margin each side so edge segments clip instead of pop.
-    let lo = bins
-        .partition_point(|b| (b.ts.0 as f64) < view.min_x)
-        .saturating_sub(1);
-    let hi = (bins.partition_point(|b| (b.ts.0 as f64) <= view.max_x) + 1).min(bins.len());
-    if lo >= hi {
+    if pixel_budget == 0 {
         return TracePlan { spans };
     }
+    // Schema is [2, ..source shape]: minima first, then maxima.
+    let n_elements = component.schema.dim.iter().skip(1).product::<usize>().max(1);
+    let sample_size = component.schema.size();
+    let min_offset = element_index * size_of::<f32>();
+    let max_offset = (n_elements + element_index) * size_of::<f32>();
+    if max_offset + size_of::<f32>() > sample_size {
+        return TracePlan { spans };
+    }
+    let Some(slice) = component
+        .time_series
+        .get_range(Timestamp(view.min_x as i64)..Timestamp(view.max_x as i64))
+    else {
+        return TracePlan { spans };
+    };
+    let node_slices: Vec<_> = slice.as_iter().collect();
+    let total: usize = node_slices.iter().map(|s| s.timestamps().len()).sum();
+    if total == 0 {
+        return TracePlan { spans };
+    }
+    let stride = (total * 2).div_ceil(pixel_budget).max(1);
 
     let epoch_x = cache.epoch_x;
     let scale_x = 1.0 / NS_PER_SEC;
@@ -1205,21 +1233,85 @@ fn plan_envelope_trace(
     // Point ranges of contiguous finite runs; each becomes one DrawSpan.
     let mut runs: Vec<(u32, u32)> = Vec::new();
     let mut run_start = 0u32;
-    for bin in &bins[lo..hi] {
-        if !(bin.min.is_finite() && bin.max.is_finite()) {
-            let count = upload_x.len() as u32;
-            if count - run_start >= 2 {
-                runs.push((run_start, count - run_start));
-            }
-            run_start = count;
-            continue;
+    // Fold accumulator over `stride` adjacent buckets.
+    let mut folded = 0usize;
+    let mut fold_min = f32::INFINITY;
+    let mut fold_max = f32::NEG_INFINITY;
+    let mut fold_first_ts = 0i64;
+    let mut fold_last_ts = 0i64;
+
+    fn flush_fold(
+        upload_x: &mut Vec<f32>,
+        upload_y: &mut Vec<f32>,
+        folded: &mut usize,
+        fold_min: &mut f32,
+        fold_max: &mut f32,
+        first_ts: i64,
+        last_ts: i64,
+        epoch_x: f64,
+        scale_x: f64,
+        y_epoch: f64,
+        y_scale: f64,
+    ) {
+        if *folded == 0 {
+            return;
         }
-        let x = ((bin.ts.0 as f64 - epoch_x) * scale_x) as f32;
+        let ts = (first_ts + last_ts) / 2;
+        let x = ((ts as f64 - epoch_x) * scale_x) as f32;
         upload_x.push(x);
         upload_x.push(x);
-        upload_y.push(((bin.min as f64 - y_epoch) * y_scale) as f32);
-        upload_y.push(((bin.max as f64 - y_epoch) * y_scale) as f32);
+        upload_y.push(((*fold_min as f64 - y_epoch) * y_scale) as f32);
+        upload_y.push(((*fold_max as f64 - y_epoch) * y_scale) as f32);
+        *folded = 0;
+        *fold_min = f32::INFINITY;
+        *fold_max = f32::NEG_INFINITY;
     }
+
+    // Newest-first node order, reversed so the zigzag runs left to right.
+    for node_slice in node_slices.iter().rev() {
+        let timestamps = node_slice.timestamps();
+        let data = node_slice.data();
+        for (i, ts) in timestamps.iter().enumerate() {
+            let base = i * sample_size;
+            let (Some(min_bytes), Some(max_bytes)) = (
+                data.get(base + min_offset..base + min_offset + size_of::<f32>()),
+                data.get(base + max_offset..base + max_offset + size_of::<f32>()),
+            ) else {
+                continue;
+            };
+            let bucket_min = f32::from_le_bytes(min_bytes.try_into().expect("sliced to 4"));
+            let bucket_max = f32::from_le_bytes(max_bytes.try_into().expect("sliced to 4"));
+            if !(bucket_min.is_finite() && bucket_max.is_finite()) {
+                flush_fold(
+                    upload_x, upload_y, &mut folded, &mut fold_min, &mut fold_max,
+                    fold_first_ts, fold_last_ts, epoch_x, scale_x, y_epoch, y_scale,
+                );
+                let count = upload_x.len() as u32;
+                if count - run_start >= 2 {
+                    runs.push((run_start, count - run_start));
+                }
+                run_start = count;
+                continue;
+            }
+            if folded == 0 {
+                fold_first_ts = ts.0;
+            }
+            fold_last_ts = ts.0;
+            fold_min = fold_min.min(bucket_min);
+            fold_max = fold_max.max(bucket_max);
+            folded += 1;
+            if folded >= stride {
+                flush_fold(
+                    upload_x, upload_y, &mut folded, &mut fold_min, &mut fold_max,
+                    fold_first_ts, fold_last_ts, epoch_x, scale_x, y_epoch, y_scale,
+                );
+            }
+        }
+    }
+    flush_fold(
+        upload_x, upload_y, &mut folded, &mut fold_min, &mut fold_max,
+        fold_first_ts, fold_last_ts, epoch_x, scale_x, y_epoch, y_scale,
+    );
     let count = upload_x.len() as u32;
     if count - run_start >= 2 {
         runs.push((run_start, count - run_start));
@@ -1491,12 +1583,12 @@ fn materialize_axis(
                 out,
             );
         }
-        // List-plot and envelope axes are handled by their own plan
+        // List-plot and min/max axes are handled by their own plan
         // paths and never routed through `materialize_axis`; fill with
         // zeros if somehow reached so the GPU buffer stays well-defined.
         AxisSource::LatestSampleIndex { .. }
         | AxisSource::LatestSampleElements { .. }
-        | AxisSource::EnvelopeBins { .. } => {
+        | AxisSource::MinMax { .. } => {
             for _ in lod_start..lod_end {
                 out.push(0.0);
             }

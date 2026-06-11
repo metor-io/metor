@@ -9108,6 +9108,7 @@ dependencies = [
  "facet-dessert",
  "facet-format",
  "facet-json",
+ "futures-lite 2.6.1",
  "glam 0.32.1",
  "gpui",
  "hifitime",

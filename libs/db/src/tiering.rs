@@ -277,7 +277,7 @@ mod tests {
             .unwrap();
         component
             .time_series
-            .seal_rolled_nodes(&component.schema)
+            .seal_rolled_nodes()
             .unwrap();
         db
     }

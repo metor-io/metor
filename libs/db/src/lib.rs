@@ -56,13 +56,13 @@ mod arc_ring;
 mod arrow;
 pub mod disruptor;
 mod error;
+pub mod lod;
 //mod msg_log;
 pub mod manifest;
 pub mod msg_log_2;
 pub mod remote;
 pub mod seal;
 pub mod store;
-pub mod summary;
 pub mod tiering;
 //pub(crate) mod time_series;
 pub mod time_series_2;
@@ -83,10 +83,6 @@ pub struct DB {
     /// Earliest timestamp known to this instance. Moves backwards when
     /// older history is hydrated from a store.
     pub earliest_timestamp: AtomicCell<Timestamp>,
-    /// Per-component rollups behind the `GetEnvelope` handler. The mutex
-    /// serializes envelope assembly across connections; held only over
-    /// bounded, capped sidecar reads.
-    envelope_rollups: std::sync::Mutex<HashMap<ComponentId, summary::ComponentRollup>>,
 }
 
 #[derive(Default)]
@@ -129,7 +125,6 @@ impl DB {
             default_stream_time_step,
             last_updated: AtomicCell::new(Timestamp(i64::MIN)),
             earliest_timestamp: AtomicCell::new(Timestamp::now()),
-            envelope_rollups: Default::default(),
         };
         db.save_db_state()?;
         Ok(db)
@@ -180,11 +175,14 @@ impl DB {
             let schema = ComponentSchema::read(path.join("schema"))?;
             let metadata = ComponentMetadata::read(path.join("metadata"))?;
             trace!("Read component metadata for {}", metadata.name);
-            component_metadata.insert(component_id, metadata);
 
             trace!("Opening component file {}", path.display());
 
             let component = Component::open(&path, component_id, schema.clone())?;
+            if lod::is_lod_name(&metadata.name) {
+                component.time_series.set_max_node_age(lod::lod_node_max_age());
+            }
+            component_metadata.insert(component_id, metadata);
             if let Some(latest) = component.time_series.latest() {
                 let timestamp = latest.timestamp();
                 last_updated = timestamp.0.max(last_updated);
@@ -239,7 +237,6 @@ impl DB {
             ),
             last_updated: AtomicCell::new(Timestamp(last_updated)),
             earliest_timestamp: AtomicCell::new(earliest_timestamp),
-            envelope_rollups: Default::default(),
         })
     }
 
@@ -350,6 +347,23 @@ impl State {
         &self,
     ) -> impl Iterator<Item = (&ComponentId, &ComponentMetadata)> {
         self.component_metadata.iter()
+    }
+
+    /// Hidden components are DB-internal (derived LoD series): queryable
+    /// by id, but excluded from live streams and UI listings.
+    pub fn is_component_hidden(&self, component_id: &ComponentId) -> bool {
+        self.component_metadata
+            .get(component_id)
+            .is_some_and(|m| m.is_hidden())
+    }
+
+    /// The components live streams may carry — everything not hidden.
+    fn visible_components(&self) -> HashMap<ComponentId, Component> {
+        self.components
+            .iter()
+            .filter(|(id, _)| !self.is_component_hidden(id))
+            .map(|(id, c)| (*id, c.clone()))
+            .collect()
     }
 
     pub fn set_component_metadata(
@@ -535,6 +549,21 @@ impl MetadataExt for EntityMetadata {}
 impl MetadataExt for ComponentMetadata {}
 impl MetadataExt for MsgMetadata {}
 
+/// Dev knob: `METOR_MAX_NODE_AGE_SECS` rolls (and so seals) every
+/// component's head after that much data time, instead of waiting for the
+/// 32 MB node to fill. Lets manual verification see sealed spans — and
+/// the LoD buckets derived from them — in seconds.
+pub(crate) fn max_node_age_override() -> Option<Duration> {
+    static OVERRIDE: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
+    OVERRIDE
+        .get_or_init(|| {
+            std::env::var("METOR_MAX_NODE_AGE_SECS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+        })
+        .map(Duration::from_secs)
+}
+
 #[derive(Clone)]
 pub struct Component {
     pub component_id: ComponentId,
@@ -557,6 +586,9 @@ impl Component {
             schema.write(component_schema_path)?;
         }
         let time_series = TimeSeries::create(component_path.clone())?;
+        if let Some(age) = max_node_age_override() {
+            time_series.set_max_node_age(age);
+        }
         let this = Component {
             wal: Disruptor::new(schema.size() * 1024),
             component_id,
@@ -565,7 +597,7 @@ impl Component {
             last_timestamp: Arc::new(AtomicCell::new(Timestamp(i64::MIN))),
         };
         stellarator::spawn(this.clone().persist());
-        stellarator::spawn(this.time_series.clone().lifecycle(this.schema.clone()));
+        stellarator::spawn(this.time_series.clone().lifecycle());
         Ok(this)
     }
 
@@ -575,6 +607,9 @@ impl Component {
         schema: ComponentSchema,
     ) -> Result<Self, Error> {
         let time_series = TimeSeries::open(path)?;
+        if let Some(age) = max_node_age_override() {
+            time_series.set_max_node_age(age);
+        }
 
         let last_timestamp = time_series
             .latest()
@@ -588,7 +623,7 @@ impl Component {
             last_timestamp: Arc::new(AtomicCell::new(last_timestamp)),
         };
         stellarator::spawn(this.persist());
-        stellarator::spawn(this.time_series.clone().lifecycle(this.schema.clone()));
+        stellarator::spawn(this.time_series.clone().lifecycle());
         Ok(this)
     }
 
@@ -600,13 +635,21 @@ impl Component {
             // Taken on the first live sample, not at spawn: a component
             // that only ever receives pushed sealed nodes has no live
             // head, and `install_node` keys its newer-than-head guard on
-            // the writer's existence.
+            // the writer's existence. A writer owned elsewhere (the LoD
+            // engine writes its derived components directly) means WAL
+            // traffic for this component is bogus; drop it rather than
+            // fight over the head.
             let mut writer = None;
             loop {
                 let buf = reader.next().await;
-                let writer = writer.get_or_insert_with(|| {
-                    time_series.writer().expect("writer already created")
-                });
+                if writer.is_none() {
+                    writer = time_series.writer();
+                    if writer.is_none() {
+                        warn!("component writer owned elsewhere; dropping wal samples");
+                        continue;
+                    }
+                }
+                let writer = writer.as_mut().expect("checked above");
                 let mut buf = &buf[..];
                 'parse: while let Some(msg) = buf.get(..msg_size) {
                     let Some(timestamp) = msg.get(..size_of::<Timestamp>()) else {
@@ -1295,7 +1338,7 @@ async fn handle_packet<A: AsyncWrite + 'static>(
         Packet::Msg(m) if m.id == GetDbInfo::ID => {
             tx.send_msg(&DbInfoResp {
                 protocol_version: NODE_PROTOCOL_VERSION,
-                features: FEATURE_ENVELOPE,
+                features: 0,
             })
             .await?;
         }
@@ -1320,32 +1363,6 @@ async fn handle_packet<A: AsyncWrite + 'static>(
             tx.send_msg(&NodeManifestResp {
                 component_id,
                 nodes,
-            })
-            .await?;
-        }
-        Packet::Msg(m) if m.id == GetEnvelope::ID => {
-            let req = m.parse::<GetEnvelope>()?;
-            let component =
-                db.with_state(|state| state.components.get(&req.component_id).cloned());
-            // Unknown components answer empty for the same reason
-            // GetNodeManifest does.
-            let bins = component
-                .map(|component| {
-                    let mut rollups = db.envelope_rollups.lock().unwrap();
-                    let rollup = rollups.entry(req.component_id).or_default();
-                    rollup.refresh(&component.time_series, &component.schema);
-                    rollup.envelope(
-                        &component.time_series,
-                        req.element_index as usize,
-                        req.start.0..req.end.0,
-                        req.max_bins as usize,
-                    )
-                })
-                .unwrap_or_default();
-            tx.send_msg(&EnvelopeResp {
-                component_id: req.component_id,
-                element_index: req.element_index,
-                bins,
             })
             .await?;
         }
@@ -1476,7 +1493,6 @@ async fn handle_packet<A: AsyncWrite + 'static>(
                 incoming.staging,
                 &incoming.seal,
                 manifest::SpanSource::LocalIngest,
-                &component.schema,
             );
             if let Err(err) = &installed {
                 warn!(?err, component_id = ?incoming.component_id, "failed to install offered node");
@@ -1733,7 +1749,9 @@ async fn handle_real_time_stream<A: AsyncWrite + 'static>(
     loop {
         db.with_state(|state| {
             DBVisitor.visit(&state.components, |component| {
-                if visited_ids.contains(&component.component_id) {
+                if visited_ids.contains(&component.component_id)
+                    || state.is_component_hidden(&component.component_id)
+                {
                     return Ok(());
                 }
                 visited_ids.insert(component.component_id);
@@ -1807,7 +1825,7 @@ async fn handle_fixed_stream<A: AsyncWrite>(
     let mut current_field_count: Option<usize> = None;
     let id: PacketId = state.stream_id.to_le_bytes()[..2].try_into().unwrap();
     let mut table = LenPacket::table(id, 2048 - 16);
-    let mut components = db.with_state(|state| state.components.clone());
+    let mut components = db.with_state(|state| state.visible_components());
     loop {
         if !state.wait_for_playing().await {
             return Ok(());
@@ -1816,7 +1834,7 @@ async fn handle_fixed_stream<A: AsyncWrite>(
         let current_timestamp = state.current_timestamp();
         let vtable_gen = db.vtable_gen.latest();
         if vtable_gen != current_vtable_gen {
-            components = db.with_state(|state| state.components.clone());
+            components = db.with_state(|state| state.visible_components());
             let stream = stream.lock().await;
             let vtable = DBVisitor.vtable(&components)?;
             let msg = VTableMsg { id, vtable };

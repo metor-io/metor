@@ -689,7 +689,6 @@ impl PanelApp {
         let remote_handles = remote_addr.map(|addr| {
             let remote = metor_db::remote::RemoteDb::new(addr);
             let hydrator = remote.hydrator();
-            let envelopes = remote.envelopes();
             let remote_db = db.clone();
             stellar(move || async move {
                 remote.spawn(remote_db);
@@ -697,8 +696,21 @@ impl PanelApp {
                 // park so it never winds down.
                 std::future::pending::<()>().await
             });
-            (hydrator, envelopes)
+            hydrator
         });
+
+        // This panel is the system of record when it isn't mirroring
+        // someone else; it computes the min/max LoD companions wide plot
+        // views render from. Mirrors receive them via manifest seeding +
+        // hydration instead — locally computed buckets would disagree
+        // with the origin's.
+        if remote_addr.is_none() {
+            let lod_db = db.clone();
+            stellar(move || async move {
+                metor_db::lod::spawn(lod_db);
+                std::future::pending::<()>().await
+            });
+        }
 
         let mut command_providers = Some(command_providers);
         let mut init_hooks = Some(init_hooks);
@@ -715,19 +727,8 @@ impl PanelApp {
                 cx.set_global(crate::theme::ActiveTheme(Arc::new(
                     crate::theme::DARK.clone(),
                 )));
-                if let Some((hydrator, envelopes)) = remote_handles.clone() {
+                if let Some(hydrator) = remote_handles.clone() {
                     cx.set_global(crate::hydration::HydratorGlobal(hydrator));
-                    // Envelope arrivals repaint even when no live data is
-                    // flowing — wide views of pure history depend on it.
-                    let waiter = envelopes.waiter();
-                    cx.set_global(crate::hydration::EnvelopesGlobal(envelopes));
-                    cx.spawn(async move |cx| {
-                        loop {
-                            let _ = waiter.wait().await;
-                            let _ = cx.update(|cx| cx.refresh_windows());
-                        }
-                    })
-                    .detach();
                 }
                 edits::init(cx);
                 ItemRegistry::init(cx);
