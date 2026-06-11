@@ -156,6 +156,14 @@ impl<E: IntoBytes + Immutable> AppendLog<E> {
         self.map.len() - size_of::<Header<E>>()
     }
 
+    /// Discard everything past `len` payload bytes. Only sound while no
+    /// reader can hold a slice past the cut — node staging owns its logs
+    /// exclusively before commit, which is the one intended caller.
+    pub(crate) fn truncate(&self, len: u64) {
+        let absolute = len + size_of::<Header<E>>() as u64;
+        self.committed_len().fetch_min(absolute, Ordering::AcqRel);
+    }
+
     /// Synchronously flush the mapping to disk. Durability is otherwise
     /// left to OS writeback; call this before recording a durability
     /// claim about the contents (e.g. a seal record).

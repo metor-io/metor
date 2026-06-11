@@ -275,7 +275,10 @@ mod tests {
         let component = db
             .with_state(|s| s.components.get(&COMPONENT).cloned())
             .unwrap();
-        component.time_series.seal_rolled_nodes().unwrap();
+        component
+            .time_series
+            .seal_rolled_nodes(&component.schema)
+            .unwrap();
         db
     }
 

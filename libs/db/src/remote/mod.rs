@@ -34,6 +34,10 @@ mod tests {
         Schema::new(PrimType::U64, [1usize]).unwrap()
     }
 
+    fn component_schema() -> crate::ComponentSchema {
+        crate::ComponentSchema::new(PrimType::U64, &[1])
+    }
+
     /// Three nodes at starts 10/20/30 with 4 samples each; 10 and 20 end
     /// up sealed, 30 stays the live head.
     fn series_with_history(dir: &Path) -> TimeSeries {
@@ -48,7 +52,7 @@ mod tests {
             }
         }
         let series = TimeSeries::open(dir).unwrap();
-        series.seal_rolled_nodes().unwrap();
+        series.seal_rolled_nodes(&component_schema()).unwrap();
         series
     }
 
@@ -108,7 +112,7 @@ mod tests {
             &store,
             COMPONENT,
             "round.trip",
-            &schema,
+            &component_schema(),
             Timestamp(10),
         )
         .await
@@ -128,7 +132,7 @@ mod tests {
                 &store,
                 COMPONENT,
                 "round.trip",
-                &schema,
+                &component_schema(),
                 Timestamp(10),
             )
             .await
@@ -170,7 +174,7 @@ mod tests {
                 &store,
                 COMPONENT,
                 "round.trip",
-                &schema,
+                &component_schema(),
                 Timestamp(20),
             )
             .await

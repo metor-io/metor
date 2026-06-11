@@ -78,6 +78,91 @@ mod tests {
         std::fs::remove_dir_all(&scratch).ok();
     }
 
+    /// History sealed on the remote before a mirror ever connects must
+    /// show up locally as fetchable remote-only coverage and hydrate on
+    /// request.
+    #[test]
+    async fn remote_db_seeds_preconnect_history() {
+        use metor_db::store::{NodeKey, NodeStore, SealedNode};
+
+        let (addr, _src_db) = setup_test_db().await.unwrap();
+
+        // Pre-connect history: one sealed node pushed into the server the
+        // same way an offloading peer would.
+        let scratch = std::env::temp_dir().join(format!("metor_seed_{}", fastrand::u64(..)));
+        std::fs::create_dir_all(&scratch).unwrap();
+        let component_id = ComponentId(4242);
+        let node_dir = scratch.join("1000");
+        let node = metor_db::time_series::TimeSeriesNode::create(&node_dir, Timestamp(1_000), 8)
+            .unwrap();
+        for i in 0..64i64 {
+            node.data.write(&(1_000 + i).to_le_bytes()).unwrap();
+            node.index
+                .write(&Timestamp(1_000 + i).to_le_bytes())
+                .unwrap();
+        }
+        let seal = metor_db::seal::seal_node(&node, &node_dir)
+            .unwrap()
+            .unwrap();
+        let node_schema = metor_proto::schema::Schema::new(PrimType::U64, [1usize]).unwrap();
+        let store = metor_db::store::PeerStore::new(addr);
+        store
+            .put(
+                NodeKey {
+                    component_id,
+                    component_name: "seed.test",
+                    schema: &node_schema,
+                    start_ts: seal.start_ts,
+                    checksum: seal.checksum,
+                },
+                SealedNode::from_node(&node, seal).unwrap(),
+            )
+            .await
+            .unwrap();
+
+        let local_dir =
+            std::env::temp_dir().join(format!("metor_db_seed_local_{}", fastrand::u64(..)));
+        let local_db = Arc::new(DB::create(local_dir).unwrap());
+        let remote = metor_db::remote::RemoteDb::new(addr);
+        let hydrator = remote.hydrator();
+        remote.spawn(local_db.clone());
+
+        let mut seeded = false;
+        for _ in 0..40 {
+            sleep(Duration::from_millis(50)).await;
+            seeded = local_db.with_state(|state| {
+                state.get_component(component_id).is_some_and(|c| {
+                    c.time_series
+                        .manifest()
+                        .span(Timestamp(1_000))
+                        .is_some_and(|span| span.seal.checksum == seal.checksum)
+                })
+            });
+            if seeded {
+                break;
+            }
+        }
+        assert!(seeded, "local db never seeded the remote manifest");
+
+        hydrator.request(component_id, Timestamp(1_000)..Timestamp(1_064));
+        let mut hydrated = false;
+        for _ in 0..40 {
+            sleep(Duration::from_millis(50)).await;
+            hydrated = local_db.with_state(|state| {
+                state.get_component(component_id).is_some_and(|c| {
+                    c.time_series
+                        .latest()
+                        .is_some_and(|latest| latest.data() == 1_063i64.to_le_bytes().as_slice())
+                })
+            });
+            if hydrated {
+                break;
+            }
+        }
+        assert!(hydrated, "seeded span never hydrated");
+        std::fs::remove_dir_all(&scratch).ok();
+    }
+
     #[test]
     async fn remote_db_mirrors_live_data() {
         let (addr, _src_db) = setup_test_db().await.unwrap();

@@ -1,14 +1,19 @@
-use std::{net::SocketAddr, sync::Arc, time::Duration};
+use std::{collections::HashMap, net::SocketAddr, sync::Arc, time::Duration};
 
-use metor_proto::types::{IntoLenPacket, LenPacket, PacketTy};
+use metor_proto::schema::Schema;
+use metor_proto::types::{ComponentId, IntoLenPacket, LenPacket, PacketTy, Timestamp};
 use metor_proto_stellar::Client;
 use metor_proto_wkt::{
-    DbInfoResp, DumpMetadata, DumpMetadataResp, GetDbInfo, Stream, StreamBehavior,
+    DbInfoResp, DumpMetadata, DumpMetadataResp, DumpSchema, DumpSchemaResp, GetDbInfo, Stream,
+    StreamBehavior,
 };
 use stellarator::sync::Mutex;
 use tracing::{info, warn};
 
-use crate::{ConnState, DB, Error, PacketTx, store::PeerStore};
+use crate::{
+    AtomicTimestampExt as _, ComponentSchema, ConnState, DB, Error, PacketTx, store::NodeStore,
+    store::PeerStore,
+};
 
 use super::Hydrator;
 
@@ -54,14 +59,14 @@ impl RemoteDb {
             store,
             hydrator,
         } = self;
-        stellarator::spawn(hydrator.clone().run(db.clone(), store));
+        stellarator::spawn(hydrator.clone().run(db.clone(), store.clone()));
         stellarator::spawn(async move {
             const INITIAL_BACKOFF: Duration = Duration::from_millis(250);
             const HEALTHY_CONNECTION: Duration = Duration::from_secs(30);
             let mut backoff = INITIAL_BACKOFF;
             loop {
                 let connected_at = std::time::Instant::now();
-                match mirror(&db, addr).await {
+                match mirror(&db, addr, &store).await {
                     Ok(()) => {}
                     Err(err) if err.is_stream_closed() => {
                         info!(?addr, "remote db disconnected; reconnecting");
@@ -97,7 +102,7 @@ async fn handshake_request<T>(
 
 /// One connection lifetime: handshake, metadata sync, then ingest the
 /// real-time stream until the connection drops.
-async fn mirror(db: &Arc<DB>, addr: SocketAddr) -> Result<(), Error> {
+async fn mirror(db: &Arc<DB>, addr: SocketAddr, store: &Arc<PeerStore>) -> Result<(), Error> {
     let mut client = Client::connect(addr).await?;
     let info: DbInfoResp = handshake_request(client.request(&GetDbInfo)).await?;
     info!(?addr, peer_version = info.protocol_version, "mirroring remote db");
@@ -110,6 +115,14 @@ async fn mirror(db: &Arc<DB>, addr: SocketAddr) -> Result<(), Error> {
             }
         }
     });
+
+    // History recorded before this connection is invisible to the live
+    // stream; the seeding sweep imports it as remote-only coverage. It
+    // runs on the bulk store connection so a year of GetNodeManifest
+    // round trips never delays live ingest, and re-runs per reconnect
+    // (the merge is idempotent).
+    let schemas: DumpSchemaResp = handshake_request(client.request(&DumpSchema)).await?;
+    stellarator::spawn(seed_manifests(db.clone(), store.clone(), schemas.schemas));
 
     let stream = Stream {
         behavior: StreamBehavior::RealTime,
@@ -138,5 +151,77 @@ async fn mirror(db: &Arc<DB>, addr: SocketAddr) -> Result<(), Error> {
         }
         resp_pkt = pkt_tx.pkt.expect("len pkt taken and not given back");
         buf = pkt.into_buf().into_inner();
+    }
+}
+
+/// Import the peer's sealed-node manifest for every component it knows,
+/// so pre-connect history shows up as fetchable remote-only coverage.
+/// Components are created on demand (a seeded component has no live
+/// writer, so the merge cannot conflict with ingest); ones with no sealed
+/// history are skipped rather than created empty. Per-component failures
+/// are logged and skipped — one bad component must not hide the rest of
+/// the archive.
+async fn seed_manifests(
+    db: Arc<DB>,
+    store: Arc<PeerStore>,
+    schemas: HashMap<ComponentId, Schema<Vec<u64>>>,
+) {
+    let mut components = 0usize;
+    let mut spans = 0usize;
+    for (component_id, schema) in schemas {
+        let name = db
+            .with_state(|state| {
+                state
+                    .get_component_metadata(component_id)
+                    .map(|m| m.name.clone())
+            })
+            .unwrap_or_default();
+        let seals = match store.list(component_id, &name).await {
+            Ok(seals) => seals,
+            Err(err) => {
+                warn!(?err, ?component_id, "failed to list remote sealed nodes");
+                continue;
+            }
+        };
+        if seals.is_empty() {
+            continue;
+        }
+        let inserted = db.with_state_mut(|state| {
+            state.insert_component(component_id, ComponentSchema::from(schema), &db.path)
+        });
+        if let Err(err) = inserted {
+            warn!(?err, ?component_id, "failed to create mirrored component");
+            continue;
+        }
+        let Some(component) =
+            db.with_state(|state| state.components.get(&component_id).cloned())
+        else {
+            continue;
+        };
+        let bounds = seals
+            .iter()
+            .fold(None::<(i64, i64)>, |acc, seal| match acc {
+                Some((min, max)) => {
+                    Some((min.min(seal.start_ts.0), max.max(seal.end_ts.0)))
+                }
+                None => Some((seal.start_ts.0, seal.end_ts.0)),
+            });
+        match component.time_series.merge_remote_spans(seals) {
+            Ok(0) => {}
+            Ok(added) => {
+                if let Some((min, max)) = bounds {
+                    db.earliest_timestamp.update_min(Timestamp(min));
+                    db.last_updated.update_max(Timestamp(max));
+                }
+                components += 1;
+                spans += added;
+            }
+            Err(err) => {
+                warn!(?err, ?component_id, "failed to merge remote spans");
+            }
+        }
+    }
+    if spans > 0 {
+        info!(components, spans, "seeded remote manifests");
     }
 }

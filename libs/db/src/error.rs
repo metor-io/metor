@@ -39,6 +39,8 @@ pub enum Error {
     BadMessage,
     #[error("unsupported archive format")]
     UnsupportedArchiveFormat,
+    #[error("unsupported manifest version {0}")]
+    UnsupportedManifestVersion(u32),
     #[cfg(feature = "parquet")]
     #[error("parquet {0}")]
     Parquet(#[from] parquet::errors::ParquetError),

@@ -62,6 +62,7 @@ pub mod msg_log_2;
 pub mod remote;
 pub mod seal;
 pub mod store;
+pub mod summary;
 pub mod tiering;
 //pub(crate) mod time_series;
 pub mod time_series_2;
@@ -558,7 +559,7 @@ impl Component {
             last_timestamp: Arc::new(AtomicCell::new(Timestamp(i64::MIN))),
         };
         stellarator::spawn(this.clone().persist());
-        stellarator::spawn(this.time_series.clone().lifecycle());
+        stellarator::spawn(this.time_series.clone().lifecycle(this.schema.clone()));
         Ok(this)
     }
 
@@ -581,7 +582,7 @@ impl Component {
             last_timestamp: Arc::new(AtomicCell::new(last_timestamp)),
         };
         stellarator::spawn(this.persist());
-        stellarator::spawn(this.time_series.clone().lifecycle());
+        stellarator::spawn(this.time_series.clone().lifecycle(this.schema.clone()));
         Ok(this)
     }
 
@@ -1443,6 +1444,7 @@ async fn handle_packet<A: AsyncWrite + 'static>(
                 incoming.staging,
                 &incoming.seal,
                 manifest::SpanSource::LocalIngest,
+                &component.schema,
             );
             if let Err(err) = &installed {
                 warn!(?err, component_id = ?incoming.component_id, "failed to install offered node");

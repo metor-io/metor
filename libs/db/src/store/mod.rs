@@ -184,6 +184,26 @@ impl NodeStaging {
         Ok(())
     }
 
+    /// Discard staged samples newer than `cover_end` and return the seal
+    /// of what remains. This is how a coverage-trimmed span installs: the
+    /// fetch moves the peer's whole node, but only the prefix this side
+    /// is missing may land — the tail already exists as resident data.
+    /// Call after the full payload verified against the peer's seal, then
+    /// [`Self::commit`] with the returned seal.
+    pub fn trim_to(&self, cover_end: Timestamp) -> Result<SealRecord, Error> {
+        let node = TimeSeriesNode {
+            index: self.index.clone(),
+            data: self.data.clone(),
+        };
+        let keep = node.timestamps().partition_point(|ts| ts.0 <= cover_end.0);
+        self.index
+            .truncate((keep * size_of::<Timestamp>()) as u64);
+        self.data
+            .truncate((keep * node.element_size()) as u64);
+        SealRecord::compute(&node)
+            .ok_or_else(|| StoreError::Other("trim left an empty node".to_string()).into())
+    }
+
     /// Verify the staged bytes against `seal` and promote the directory
     /// into place. Returns the final node directory and the (already
     /// mapped) node.

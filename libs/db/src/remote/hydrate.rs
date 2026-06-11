@@ -1,14 +1,11 @@
 use std::{collections::VecDeque, ops::Range, sync::Arc};
 
-use metor_proto::{
-    schema::Schema,
-    types::{ComponentId, Timestamp},
-};
+use metor_proto::types::{ComponentId, Timestamp};
 use stellarator::sync::WaitQueue;
 use tracing::warn;
 
 use crate::{
-    AtomicTimestampExt, DB, Error,
+    AtomicTimestampExt, ComponentSchema, DB, Error,
     manifest::{GapVec, SpanSource, SpanState},
     store::{NodeKey, NodeStaging, NodeStore, StoreError},
     time_series_2::TimeSeries,
@@ -26,18 +23,20 @@ pub async fn hydrate_span(
     store: &dyn NodeStore,
     component_id: ComponentId,
     component_name: &str,
-    schema: &Schema<Vec<u64>>,
+    schema: &ComponentSchema,
     start_ts: Timestamp,
 ) -> Result<bool, Error> {
-    let Some(seal) = time_series.begin_fetch(start_ts) else {
+    let Some(span) = time_series.begin_fetch(start_ts) else {
         return Ok(false);
     };
+    let seal = span.seal;
     let result: Result<(), Error> = async {
         let staging = NodeStaging::create(time_series.path(), &seal)?;
+        let wire_schema = schema.to_schema();
         let key = NodeKey {
             component_id,
             component_name,
-            schema,
+            schema: &wire_schema,
             start_ts,
             checksum: seal.checksum,
         };
@@ -45,7 +44,14 @@ pub async fn hydrate_span(
         if fetched.checksum != seal.checksum {
             return Err(StoreError::ChecksumMismatch.into());
         }
-        time_series.install_node(staging, &seal, SpanSource::RemoteFetch)
+        // A coverage-trimmed span only installs the prefix this side is
+        // missing; the rest of the node already exists as resident data.
+        let install_seal = if span.cover_end.0 < seal.end_ts.0 {
+            staging.trim_to(span.cover_end)?
+        } else {
+            seal
+        };
+        time_series.install_node(staging, &install_seal, SpanSource::RemoteFetch, schema)
     }
     .await;
     match result {
@@ -138,7 +144,6 @@ impl Hydrator {
         }) else {
             return Ok(());
         };
-        let schema = component.schema.to_schema();
         let mut gaps = GapVec::new();
         component.time_series.coverage(range, &mut gaps);
         for gap in gaps {
@@ -150,7 +155,7 @@ impl Hydrator {
                 store,
                 component_id,
                 &name,
-                &schema,
+                &component.schema,
                 gap.start_ts,
             )
             .await?
