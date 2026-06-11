@@ -77,6 +77,13 @@ pub(crate) enum AxisSource<'a> {
         component: &'a Component,
         len: usize,
     },
+    /// Pre-aggregated min/max envelope bins fetched from a remote, sorted
+    /// by timestamp. Renders as a zigzag through the line pipeline: two
+    /// points per bin, so every column spans its bin's extremes — the
+    /// same geometry min-max decimation produces from raw samples.
+    EnvelopeBins {
+        bins: &'a [metor_db::remote::EnvelopeBin],
+    },
 }
 
 impl<'a> AxisSource<'a> {
@@ -88,13 +95,16 @@ impl<'a> AxisSource<'a> {
             AxisSource::Timestamps => 1.0 / NS_PER_SEC,
             AxisSource::Element { .. }
             | AxisSource::LatestSampleIndex { .. }
-            | AxisSource::LatestSampleElements { .. } => 1.0,
+            | AxisSource::LatestSampleElements { .. }
+            | AxisSource::EnvelopeBins { .. } => 1.0,
         }
     }
 
     fn component(&self) -> Option<&'a Component> {
         match self {
-            AxisSource::Timestamps | AxisSource::LatestSampleIndex { .. } => None,
+            AxisSource::Timestamps
+            | AxisSource::LatestSampleIndex { .. }
+            | AxisSource::EnvelopeBins { .. } => None,
             AxisSource::Element { component, .. }
             | AxisSource::LatestSampleElements { component, .. } => Some(component),
         }
@@ -115,6 +125,10 @@ pub(crate) struct LineDraw<'a> {
     pub style: PlotStyle,
     pub color: Hsla,
     pub stroke_width: f32,
+    /// Narrow the time-range cull below the view, in raw X units. Lets a
+    /// trace render twice in one frame without overlap — an envelope for
+    /// summarized history plus raw samples clipped to the live tail.
+    pub x_clip: Option<(f64, f64)>,
 }
 
 /// Snap a decimation stride to the nearest power of 4.
@@ -984,13 +998,37 @@ fn plan_trace(
         );
     }
 
+    if let AxisSource::EnvelopeBins { bins } = &trace.y {
+        return plan_envelope_trace(
+            ctx,
+            cache,
+            upload_x,
+            upload_y,
+            idx_scratch,
+            x_buf,
+            y_buf,
+            bins,
+            view,
+            y_epoch,
+            y_scale,
+        );
+    }
+
+    let (cull_min_x, cull_max_x) = match trace.x_clip {
+        Some((lo, hi)) => (lo.max(view.min_x), hi.min(view.max_x)),
+        None => (view.min_x, view.max_x),
+    };
+    if cull_max_x <= cull_min_x {
+        return TracePlan { spans };
+    }
+
     // Build the per-axis node lists. Time-series uses time-range culling
     // on the Y axis's component; XY pairs nodes by stack index across two
     // components.
     let pairs: Vec<NodePair> = match (&trace.x, &trace.y) {
         (AxisSource::Timestamps, AxisSource::Element { component, .. }) => {
-            let start = Timestamp(view.min_x as i64);
-            let end = Timestamp(view.max_x as i64);
+            let start = Timestamp(cull_min_x as i64);
+            let end = Timestamp(cull_max_x as i64);
             let Some(slice) = component.time_series.get_range(start..end) else {
                 return TracePlan { spans };
             };
@@ -1128,6 +1166,110 @@ fn plan_trace(
 struct NodePair {
     x: NodeView,
     y: NodeView,
+}
+
+/// Envelope path: two points per bin, `(ts, min)` then `(ts, max)`, drawn
+/// as one zigzag line so each column spans its bin's extremes. Bypasses
+/// the NodePair pipeline — bins are already decimated server-side and a
+/// year is a few thousand of them. NaN bins (no finite sample) split the
+/// line, so coverage holes render as holes rather than interpolating
+/// across.
+#[allow(clippy::too_many_arguments)]
+fn plan_envelope_trace(
+    ctx: &GpuContext,
+    cache: &mut ValueCache,
+    upload_x: &mut Vec<f32>,
+    upload_y: &mut Vec<f32>,
+    idx_scratch: &mut Vec<u32>,
+    x_buf: &wgpu::Buffer,
+    y_buf: &wgpu::Buffer,
+    bins: &[metor_db::remote::EnvelopeBin],
+    view: PlotBounds,
+    y_epoch: f64,
+    y_scale: f64,
+) -> TracePlan {
+    let mut spans = Vec::new();
+    // One bin of margin each side so edge segments clip instead of pop.
+    let lo = bins
+        .partition_point(|b| (b.ts.0 as f64) < view.min_x)
+        .saturating_sub(1);
+    let hi = (bins.partition_point(|b| (b.ts.0 as f64) <= view.max_x) + 1).min(bins.len());
+    if lo >= hi {
+        return TracePlan { spans };
+    }
+
+    let epoch_x = cache.epoch_x;
+    let scale_x = 1.0 / NS_PER_SEC;
+    upload_x.clear();
+    upload_y.clear();
+    // Point ranges of contiguous finite runs; each becomes one DrawSpan.
+    let mut runs: Vec<(u32, u32)> = Vec::new();
+    let mut run_start = 0u32;
+    for bin in &bins[lo..hi] {
+        if !(bin.min.is_finite() && bin.max.is_finite()) {
+            let count = upload_x.len() as u32;
+            if count - run_start >= 2 {
+                runs.push((run_start, count - run_start));
+            }
+            run_start = count;
+            continue;
+        }
+        let x = ((bin.ts.0 as f64 - epoch_x) * scale_x) as f32;
+        upload_x.push(x);
+        upload_x.push(x);
+        upload_y.push(((bin.min as f64 - y_epoch) * y_scale) as f32);
+        upload_y.push(((bin.max as f64 - y_epoch) * y_scale) as f32);
+    }
+    let count = upload_x.len() as u32;
+    if count - run_start >= 2 {
+        runs.push((run_start, count - run_start));
+    }
+
+    let available = VALUE_CAPACITY - cache.cursor;
+    let total = (upload_x.len() as u32).min(available);
+    if total < upload_x.len() as u32 {
+        cache.truncated = true;
+        upload_x.truncate(total as usize);
+        upload_y.truncate(total as usize);
+    }
+    if total == 0 {
+        return TracePlan { spans };
+    }
+
+    let byte_offset = cache.cursor as u64 * 4;
+    ctx.queue
+        .write_buffer(x_buf, byte_offset, bytemuck::cast_slice(upload_x));
+    ctx.queue
+        .write_buffer(y_buf, byte_offset, bytemuck::cast_slice(upload_y));
+    let chunk_offset = cache.cursor;
+    cache.cursor += total;
+
+    for (first, len) in runs {
+        if first >= total {
+            break;
+        }
+        let len = len.min(total - first);
+        let index_available = (INDEX_CAPACITY as usize).saturating_sub(idx_scratch.len()) as u32;
+        let len = if len > index_available {
+            cache.truncated = true;
+            index_available
+        } else {
+            len
+        };
+        if len < 2 {
+            continue;
+        }
+        let span_first = idx_scratch.len() as u32;
+        for j in 0..len {
+            idx_scratch.push(chunk_offset + first + j);
+        }
+        spans.push(DrawSpan {
+            instance_start: span_first,
+            instance_end: span_first + len - 1,
+        });
+    }
+
+    TracePlan { spans }
 }
 
 /// Upload one node-pair's decimated samples into the X/Y storage buffers.
@@ -1349,10 +1491,12 @@ fn materialize_axis(
                 out,
             );
         }
-        // List-plot axes are handled directly by `plan_list_trace` and
-        // never routed through `materialize_axis`; fill with zeros if
-        // somehow reached so the GPU buffer stays well-defined.
-        AxisSource::LatestSampleIndex { .. } | AxisSource::LatestSampleElements { .. } => {
+        // List-plot and envelope axes are handled by their own plan
+        // paths and never routed through `materialize_axis`; fill with
+        // zeros if somehow reached so the GPU buffer stays well-defined.
+        AxisSource::LatestSampleIndex { .. }
+        | AxisSource::LatestSampleElements { .. }
+        | AxisSource::EnvelopeBins { .. } => {
             for _ in lod_start..lod_end {
                 out.push(0.0);
             }
@@ -1887,6 +2031,7 @@ mod tests {
                     a: 1.0,
                 },
                 stroke_width: 1.0,
+                x_clip: None,
             };
             let view = PlotBounds::new(min_x as f64, 0.0, max_x as f64, 1.0);
             let drew = gpu.submit(&target, view, 1.0, std::slice::from_ref(&draw));

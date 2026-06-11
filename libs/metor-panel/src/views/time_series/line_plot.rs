@@ -36,6 +36,13 @@ struct TraceTracking {
     /// when the trace's element index changes.
     node_bounds: NodeBoundsCache,
     cached_element_index: Option<usize>,
+    /// True while the visible window holds more samples than
+    /// [`RAW_SAMPLE_BUDGET`]; the trace then renders a summary envelope
+    /// instead of raw data.
+    envelope_mode: bool,
+    /// Freshest fetched envelope (stale-while-revalidate lives in the
+    /// [`metor_db::remote::Envelopes`] cache).
+    envelope: Option<Arc<metor_db::remote::EnvelopeData>>,
 }
 
 impl TraceTracking {
@@ -45,9 +52,19 @@ impl TraceTracking {
             y_bounds: None,
             node_bounds: NodeBoundsCache::default(),
             cached_element_index: None,
+            envelope_mode: false,
+            envelope: None,
         }
     }
 }
+
+/// Per-trace sample budget for raw rendering: a quarter of the GPU value
+/// capacity, leaving room for several traces per plot. Windows estimated
+/// above it render as a summary envelope.
+const RAW_SAMPLE_BUDGET: u64 = 1_000_000;
+/// Envelope columns requested per view — enough min/max resolution for a
+/// 4k-wide plot at a few kilobytes per reply.
+const ENVELOPE_BINS: u32 = 2048;
 
 /// Previous values of the reflected override knobs. Compared on each
 /// reconcile so an inspector edit can clear the interactive view override.
@@ -181,12 +198,59 @@ impl LinePlot {
         }
     }
 
+    /// Decide raw versus envelope per trace for the current window and
+    /// keep the envelope cache fresh. Hysteresis keeps the boundary from
+    /// flapping while panning near the budget; the request side is cheap
+    /// and deduplicated, so per-frame calls are fine.
+    fn update_envelope_state(&mut self, cx: &gpui::App) {
+        const ENTER: u64 = RAW_SAMPLE_BUDGET + RAW_SAMPLE_BUDGET / 4;
+        const EXIT: u64 = RAW_SAMPLE_BUDGET * 4 / 5;
+        let Some(view) = self.effective_view(cx) else {
+            return;
+        };
+        let (min_x, max_x) = view.x;
+        let range = Timestamp(min_x as i64)..Timestamp(max_x as i64);
+        let envelopes = crate::hydration::envelopes(cx);
+        for trace in &self.traces {
+            let cfg = trace.read(cx);
+            let Some(tracking) = self.tracking.get_mut(&trace.entity_id()) else {
+                continue;
+            };
+            let Some(component) = tracking.component.as_ref() else {
+                continue;
+            };
+            if !cfg.visible {
+                continue;
+            }
+            let estimate = component.time_series.estimate_samples(range.clone());
+            if tracking.envelope_mode {
+                tracking.envelope_mode = estimate >= EXIT;
+            } else {
+                tracking.envelope_mode = estimate > ENTER;
+            }
+            if !tracking.envelope_mode {
+                tracking.envelope = None;
+                continue;
+            }
+            if let Some(envelopes) = &envelopes {
+                tracking.envelope = envelopes.request(
+                    cfg.component_id,
+                    cfg.element_index as u32,
+                    range.clone(),
+                    ENVELOPE_BINS,
+                );
+            }
+        }
+    }
+
     /// Remote-only stretches of the visible window, as `(start, width)`
-    /// fractions of the plot width. As a side effect, asks the installed
-    /// hydrator (if any) to fetch them — the request queue is bounded and
-    /// deduplicated, so per-frame calls are cheap and idempotent.
+    /// fractions of the plot width. In raw mode this also asks the
+    /// installed hydrator (if any) to fetch them — bounded, deduplicated,
+    /// cheap to call per frame. Envelope-mode traces never hydrate raw
+    /// nodes (a year-wide view must not pull the archive); they only show
+    /// bands while their envelope hasn't arrived.
     fn gap_bands(&self, cx: &gpui::App) -> smallvec::SmallVec<[(f32, f32); 4]> {
-        let mut bands = smallvec::SmallVec::new();
+        let mut bands: smallvec::SmallVec<[(f32, f32); 4]> = smallvec::SmallVec::new();
         let Some(view) = self.effective_view(cx) else {
             return bands;
         };
@@ -200,17 +264,21 @@ impl LinePlot {
             if !cfg.visible {
                 continue;
             }
-            let Some(component) = self
-                .tracking
-                .get(&trace.entity_id())
-                .and_then(|t| t.component.as_ref())
-            else {
+            let Some(tracking) = self.tracking.get(&trace.entity_id()) else {
                 continue;
             };
+            let Some(component) = tracking.component.as_ref() else {
+                continue;
+            };
+            if tracking.envelope_mode && tracking.envelope.is_some() {
+                continue;
+            }
+            let hydrate = !tracking.envelope_mode;
             gaps.clear();
             component.time_series.coverage(visible.clone(), &mut gaps);
             for gap in &gaps {
-                if gap.state == metor_db::manifest::SpanState::RemoteOnly
+                if hydrate
+                    && gap.state == metor_db::manifest::SpanState::RemoteOnly
                     && let Some(hydrator) = &hydrator
                 {
                     hydrator.request(cfg.component_id, gap.range.clone());
@@ -222,7 +290,22 @@ impl LinePlot {
                 }
             }
         }
-        bands
+        // A year-wide view over a sparse archive yields hundreds of
+        // sub-pixel gaps; merge anything closer than ~half a pixel so the
+        // overlay stays a handful of divs.
+        bands.sort_unstable_by(|a, b| a.0.total_cmp(&b.0));
+        let mut merged: smallvec::SmallVec<[(f32, f32); 4]> = smallvec::SmallVec::new();
+        for (start, width) in bands {
+            match merged.last_mut() {
+                Some((last_start, last_width))
+                    if start - (*last_start + *last_width) < 0.0005 =>
+                {
+                    *last_width = (start + width - *last_start).max(*last_width);
+                }
+                _ => merged.push((start, width)),
+            }
+        }
+        merged
     }
 
     /// Bring tracking state and the title cache in sync with `self.traces`.
@@ -323,11 +406,35 @@ impl LinePlot {
                 end = end.max(l.timestamp().0 as f64);
                 any_time = true;
             }
+            // Remote-only history has no resident nodes; the manifest is
+            // what lets a full-range view span the whole archive.
+            let manifest = comp.time_series.manifest();
+            if let Some(span) = manifest.spans.first() {
+                start = start.min(span.seal.start_ts.0 as f64);
+                any_time = true;
+            }
+            if let Some(span) = manifest.spans.last() {
+                end = end.max(span.cover_end.0 as f64);
+                any_time = true;
+            }
             let ai = cfg.axis_index.min(axis_count - 1);
             if let Some((lo, hi)) = tracking.y_bounds {
                 y_min[ai] = y_min[ai].min(lo);
                 y_max[ai] = y_max[ai].max(hi);
                 any_y[ai] = true;
+            }
+            // Resident-node bounds only cover hydrated data; the envelope
+            // is the Y authority for summarized history.
+            if tracking.envelope_mode
+                && let Some(envelope) = &tracking.envelope
+            {
+                for bin in envelope.bins.iter() {
+                    if bin.min.is_finite() && bin.max.is_finite() {
+                        y_min[ai] = y_min[ai].min(bin.min as f64);
+                        y_max[ai] = y_max[ai].max(bin.max as f64);
+                        any_y[ai] = true;
+                    }
+                }
             }
         }
         if !any_time || start >= end {
@@ -560,6 +667,8 @@ impl LinePlot {
 impl Render for LinePlot {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = crate::theme::theme(cx);
+        let envelope_alpha = theme.plot_envelope_alpha;
+        self.update_envelope_state(cx);
         let degraded = self.gpu_state.degraded();
         let gap_bands = self.gap_bands(cx);
         let weak = cx.entity().downgrade();
@@ -569,32 +678,65 @@ impl Render for LinePlot {
                 let (frame, released) = weak
                     .update(cx, |lp, cx| {
                         if let Some(view) = lp.effective_view(cx) {
-                            let draws: Vec<LineDraw<'_>> = lp
-                                .traces
-                                .iter()
-                                .filter_map(|trace| {
-                                    let config = trace.read(cx);
-                                    if !config.visible {
-                                        return None;
-                                    }
-                                    let tracking = lp.tracking.get(&trace.entity_id())?;
-                                    let component = tracking.component.as_ref()?;
-                                    let axis = view.axis_bounds(config.axis_index);
-                                    Some(LineDraw {
+                            let mut draws: Vec<LineDraw<'_>> = Vec::new();
+                            for trace in &lp.traces {
+                                let config = trace.read(cx);
+                                if !config.visible {
+                                    continue;
+                                }
+                                let Some(tracking) = lp.tracking.get(&trace.entity_id()) else {
+                                    continue;
+                                };
+                                let Some(component) = tracking.component.as_ref() else {
+                                    continue;
+                                };
+                                let axis = view.axis_bounds(config.axis_index);
+                                let envelope = tracking
+                                    .envelope_mode
+                                    .then(|| tracking.envelope.as_ref())
+                                    .flatten();
+                                // Summarized history draws as a dimmed
+                                // envelope; raw samples cover only the
+                                // live tail past the last envelope bin.
+                                let raw_clip = if let Some(envelope) = envelope {
+                                    let mut color = config.color;
+                                    color.a *= envelope_alpha;
+                                    draws.push(LineDraw {
                                         x: AxisSource::Timestamps,
-                                        y: AxisSource::Element {
-                                            component_id: config.component_id,
-                                            component,
-                                            element_index: config.element_index,
+                                        y: AxisSource::EnvelopeBins {
+                                            bins: &envelope.bins,
                                         },
                                         y_min: axis.min_y,
                                         y_max: axis.max_y,
-                                        style: config.style,
-                                        color: config.color,
+                                        style: super::PlotStyle::Line,
+                                        color,
                                         stroke_width: config.stroke_width,
-                                    })
-                                })
-                                .collect();
+                                        x_clip: None,
+                                    });
+                                    let tail = envelope
+                                        .bins
+                                        .last()
+                                        .map(|b| b.ts.0 as f64)
+                                        .unwrap_or(f64::NEG_INFINITY);
+                                    Some((tail, f64::INFINITY))
+                                } else {
+                                    None
+                                };
+                                draws.push(LineDraw {
+                                    x: AxisSource::Timestamps,
+                                    y: AxisSource::Element {
+                                        component_id: config.component_id,
+                                        component,
+                                        element_index: config.element_index,
+                                    },
+                                    y_min: axis.min_y,
+                                    y_max: axis.max_y,
+                                    style: config.style,
+                                    color: config.color,
+                                    stroke_width: config.stroke_width,
+                                    x_clip: raw_clip,
+                                });
+                            }
                             // X data + a 0..1 Y placeholder; each trace's Y is
                             // normalized per axis in the materializer.
                             let gpu_view = view.x_bounds();

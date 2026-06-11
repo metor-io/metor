@@ -13,7 +13,7 @@ use std::{
 };
 
 use metor_proto::types::{ComponentId, Timestamp};
-use metor_proto_wkt::EnvelopeBin;
+pub use metor_proto_wkt::EnvelopeBin;
 use stellarator::sync::WaitQueue;
 use tracing::warn;
 

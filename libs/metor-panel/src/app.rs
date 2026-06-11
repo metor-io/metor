@@ -686,9 +686,10 @@ impl PanelApp {
             });
         }
 
-        let hydrator = remote_addr.map(|addr| {
+        let remote_handles = remote_addr.map(|addr| {
             let remote = metor_db::remote::RemoteDb::new(addr);
             let hydrator = remote.hydrator();
+            let envelopes = remote.envelopes();
             let remote_db = db.clone();
             stellar(move || async move {
                 remote.spawn(remote_db);
@@ -696,7 +697,7 @@ impl PanelApp {
                 // park so it never winds down.
                 std::future::pending::<()>().await
             });
-            hydrator
+            (hydrator, envelopes)
         });
 
         let mut command_providers = Some(command_providers);
@@ -714,8 +715,19 @@ impl PanelApp {
                 cx.set_global(crate::theme::ActiveTheme(Arc::new(
                     crate::theme::DARK.clone(),
                 )));
-                if let Some(hydrator) = hydrator.clone() {
+                if let Some((hydrator, envelopes)) = remote_handles.clone() {
                     cx.set_global(crate::hydration::HydratorGlobal(hydrator));
+                    // Envelope arrivals repaint even when no live data is
+                    // flowing — wide views of pure history depend on it.
+                    let waiter = envelopes.waiter();
+                    cx.set_global(crate::hydration::EnvelopesGlobal(envelopes));
+                    cx.spawn(async move |cx| {
+                        loop {
+                            let _ = waiter.wait().await;
+                            let _ = cx.update(|cx| cx.refresh_windows());
+                        }
+                    })
+                    .detach();
                 }
                 edits::init(cx);
                 ItemRegistry::init(cx);

@@ -292,6 +292,7 @@ impl Render for ListLinePlot {
                                         style: config.style,
                                         color: config.color,
                                         stroke_width: config.stroke_width,
+                                        x_clip: None,
                                     })
                                 })
                                 .collect();

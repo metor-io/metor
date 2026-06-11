@@ -742,6 +742,27 @@ impl TimeSeries {
         Ok(count)
     }
 
+    /// Estimate how many samples fall inside `range`, counting sealed
+    /// spans from the manifest and the live head from its index — no
+    /// payload access. This is the cost signal plots use to decide
+    /// whether a window is renderable raw or needs the envelope.
+    pub fn estimate_samples(&self, range: Range<Timestamp>) -> u64 {
+        let manifest = self.manifest.load();
+        let mut total = manifest.count_in(&range);
+        if let Some(head) = self.list.head() {
+            let timestamps = head.timestamps();
+            let unsealed = timestamps
+                .first()
+                .is_some_and(|start| manifest.span(*start).is_none());
+            if unsealed {
+                let lo = timestamps.partition_point(|t| t.0 < range.start.0);
+                let hi = timestamps.partition_point(|t| t.0 < range.end.0);
+                total += (hi - lo) as u64;
+            }
+        }
+        total
+    }
+
     pub fn start_timestamp(&self) -> Option<Timestamp> {
         self.list
             .iter()
@@ -1087,6 +1108,26 @@ mod tests {
             series.coverage(Timestamp(0)..Timestamp(102), &mut gaps),
             Coverage::Complete
         );
+    }
+
+    #[test]
+    fn estimate_samples_counts_manifest_and_live_head() {
+        let dir = tempfile::tempdir().unwrap();
+        let node = TimeSeriesNode::create(dir.path().join("100"), Timestamp(100), 8).unwrap();
+        for ts in [100i64, 110, 120, 130] {
+            node.data.write(&ts.to_le_bytes()).unwrap();
+            node.index.write(&Timestamp(ts).to_le_bytes()).unwrap();
+        }
+        let series = TimeSeries::open(dir.path()).unwrap();
+        // 100 sealed samples of remote-only coverage behind the head.
+        series.merge_remote_spans([remote_seal(0, 99)]).unwrap();
+
+        // The unsealed head contributes its in-range samples exactly.
+        assert_eq!(series.estimate_samples(Timestamp(100)..Timestamp(131)), 4);
+        assert_eq!(series.estimate_samples(Timestamp(115)..Timestamp(131)), 2);
+        // Remote coverage prorates from seal counts.
+        assert_eq!(series.estimate_samples(Timestamp(0)..Timestamp(100)), 100);
+        assert_eq!(series.estimate_samples(Timestamp(0)..Timestamp(131)), 104);
     }
 
     #[test]
