@@ -3,9 +3,9 @@ use std::net::SocketAddr;
 use metor_proto::types::{IntoLenPacket, Msg, OwnedPacket};
 use metor_proto_stellar::Client;
 use metor_proto_wkt::{
-    DbInfoResp, ErrorResponse, FetchNode, FetchNodeDone, GetDbInfo, GetNodeManifest,
-    NODE_PROTOCOL_VERSION, NodeAck, NodeChunk, NodeManifestResp, OfferNode, OfferNodeResp,
-    PushNodeDone,
+    DbInfoResp, EnvelopeBin, EnvelopeResp, ErrorResponse, FEATURE_ENVELOPE, FetchNode,
+    FetchNodeDone, GetDbInfo, GetEnvelope, GetNodeManifest, NODE_PROTOCOL_VERSION, NodeAck,
+    NodeChunk, NodeManifestResp, OfferNode, OfferNodeResp, PushNodeDone,
 };
 use stellarator::sync::{Mutex, MutexGuard};
 use tracing::warn;
@@ -30,6 +30,10 @@ const BULK_REQ_ID: u8 = 251;
 pub struct PeerStore {
     addr: SocketAddr,
     client: Mutex<Option<Client>>,
+    /// Capability bits from the last [`GetDbInfo`] handshake. Gates
+    /// post-version-1 requests, which old peers would silently record as
+    /// telemetry instead of answering.
+    features: std::sync::atomic::AtomicU64,
 }
 
 impl PeerStore {
@@ -37,6 +41,7 @@ impl PeerStore {
         Self {
             addr,
             client: Mutex::new(None),
+            features: std::sync::atomic::AtomicU64::new(0),
         }
     }
 
@@ -52,6 +57,8 @@ impl PeerStore {
                     "peer speaks a newer node protocol"
                 );
             }
+            self.features
+                .store(info.features, std::sync::atomic::Ordering::Release);
             *guard = Some(client);
         }
         Ok(guard)
@@ -216,6 +223,35 @@ impl NodeStore for PeerStore {
             Ok(nodes
                 .iter()
                 .any(|s| s.start_ts == key.start_ts && s.checksum == key.checksum))
+        })
+    }
+}
+
+impl super::EnvelopeSource for PeerStore {
+    fn get_envelope(
+        &self,
+        component_id: metor_proto::types::ComponentId,
+        element_index: u32,
+        range: std::ops::Range<metor_proto::types::Timestamp>,
+        max_bins: u32,
+    ) -> BoxFuture<'_, Result<Vec<EnvelopeBin>, StoreError>> {
+        Box::pin(async move {
+            let mut guard = self.lock_connected().await?;
+            if self.features.load(std::sync::atomic::Ordering::Acquire) & FEATURE_ENVELOPE == 0 {
+                return Err(StoreError::Unsupported);
+            }
+            let client = guard.as_mut().expect("just connected");
+            let req = GetEnvelope {
+                component_id,
+                element_index,
+                start: range.start,
+                end: range.end,
+                max_bins,
+            };
+            match client.request(&req).await {
+                Ok(EnvelopeResp { bins, .. }) => Ok(bins),
+                Err(err) => Err(request_err(&mut guard, err)),
+            }
         })
     }
 }

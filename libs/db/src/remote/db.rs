@@ -15,7 +15,7 @@ use crate::{
     store::PeerStore,
 };
 
-use super::Hydrator;
+use super::{Envelopes, Hydrator};
 
 /// Mirror of a long-running remote metor-db: a live-tail connection feeds
 /// the local DB exactly like a directly-attached producer would, while a
@@ -30,6 +30,7 @@ pub struct RemoteDb {
     addr: SocketAddr,
     store: Arc<PeerStore>,
     hydrator: Hydrator,
+    envelopes: Envelopes,
 }
 
 impl RemoteDb {
@@ -38,6 +39,7 @@ impl RemoteDb {
             addr,
             store: Arc::new(PeerStore::new(addr)),
             hydrator: Hydrator::new(),
+            envelopes: Envelopes::new(),
         }
     }
 
@@ -46,20 +48,28 @@ impl RemoteDb {
         self.hydrator.clone()
     }
 
+    /// The handle wide views use to request min/max envelopes.
+    pub fn envelopes(&self) -> Envelopes {
+        self.envelopes.clone()
+    }
+
     /// The bulk store, for offload/tiering against the same peer.
     pub fn store(&self) -> Arc<PeerStore> {
         self.store.clone()
     }
 
     /// Spawn the supervisor: the reconnecting live mirror plus the
-    /// hydration worker. Tasks run until the runtime shuts down.
+    /// hydration and envelope workers. Tasks run until the runtime shuts
+    /// down.
     pub fn spawn(self, db: Arc<DB>) {
         let Self {
             addr,
             store,
             hydrator,
+            envelopes,
         } = self;
         stellarator::spawn(hydrator.clone().run(db.clone(), store.clone()));
+        stellarator::spawn(envelopes.run(store.clone()));
         stellarator::spawn(async move {
             const INITIAL_BACKOFF: Duration = Duration::from_millis(250);
             const HEALTHY_CONNECTION: Duration = Duration::from_secs(30);

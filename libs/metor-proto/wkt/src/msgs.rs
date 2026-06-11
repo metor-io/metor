@@ -768,11 +768,18 @@ impl Msg for ReloadSequences {
     const ID: PacketId = [224, 44];
 }
 
-/// Version of the sealed-node transfer protocol ([224,45]..[224,55]).
+/// Version of the sealed-node transfer protocol ([224,45]..[224,57]).
 /// Clients MUST handshake with [`GetDbInfo`] before sending any of these:
 /// servers that predate the handshake record unknown request messages as
 /// telemetry, so probing with anything else pollutes the remote DB.
-pub const NODE_PROTOCOL_VERSION: u32 = 1;
+/// Messages added after version 1 are additionally feature-gated — see
+/// [`DbInfoResp::features`].
+pub const NODE_PROTOCOL_VERSION: u32 = 2;
+
+/// The server answers [`GetEnvelope`]. Gate on this bit, not the version:
+/// a version-1 server records the unknown request as telemetry and never
+/// replies.
+pub const FEATURE_ENVELOPE: u64 = 1 << 0;
 
 #[derive(Serialize, Deserialize, Debug, Clone, Copy)]
 pub struct GetDbInfo;
@@ -788,7 +795,8 @@ impl Request for GetDbInfo {
 #[derive(Serialize, Deserialize, Debug, Clone, Copy)]
 pub struct DbInfoResp {
     pub protocol_version: u32,
-    /// Reserved capability bits; zero today.
+    /// Capability bits ([`FEATURE_ENVELOPE`], …); clients gate
+    /// post-version-1 requests on these.
     pub features: u64,
 }
 
@@ -947,6 +955,53 @@ impl Msg for NodeAck {
     const ID: PacketId = [224, 55];
 }
 
+/// One output column of a min/max envelope: the extremes of every sample
+/// whose timestamp falls in the bin, stamped with a representative
+/// timestamp inside it. Bins with no samples are simply absent.
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq)]
+pub struct EnvelopeBin {
+    pub ts: Timestamp,
+    pub min: f32,
+    pub max: f32,
+}
+
+/// Ask for a min/max envelope of one element over a time range, sized to
+/// the requester's display. The server aggregates its sealed-node
+/// summaries — the reply stays a few kilobytes whether the range covers
+/// a minute or a year, which is what makes wide views affordable without
+/// moving raw nodes. Feature-gated by [`FEATURE_ENVELOPE`].
+#[derive(Serialize, Deserialize, Debug, Clone, Copy)]
+pub struct GetEnvelope {
+    pub component_id: ComponentId,
+    /// Element index within the component's schema (a vec3 has three).
+    pub element_index: u32,
+    pub start: Timestamp,
+    pub end: Timestamp,
+    /// Upper bound on reply bins; the server clamps to a sane range.
+    pub max_bins: u32,
+}
+
+impl Msg for GetEnvelope {
+    const ID: PacketId = [224, 56];
+}
+
+impl Request for GetEnvelope {
+    type Reply<B: IoBuf + Clone> = EnvelopeResp;
+}
+
+/// Non-empty envelope bins, sorted by timestamp. Covers only sealed
+/// spans — the live head streams raw and is rendered from local data.
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct EnvelopeResp {
+    pub component_id: ComponentId,
+    pub element_index: u32,
+    pub bins: Vec<EnvelopeBin>,
+}
+
+impl Msg for EnvelopeResp {
+    const ID: PacketId = [224, 57];
+}
+
 /// Every message of the sealed-node transfer protocol. Servers consult
 /// this to keep stray protocol messages out of recorded telemetry; other
 /// unmatched messages (alarms, sequences, …) are telemetry by design —
@@ -963,6 +1018,8 @@ pub const NODE_PROTOCOL_MESSAGES: &[PacketId] = &[
     OfferNodeResp::ID,
     PushNodeDone::ID,
     NodeAck::ID,
+    GetEnvelope::ID,
+    EnvelopeResp::ID,
 ];
 
 #[cfg(test)]

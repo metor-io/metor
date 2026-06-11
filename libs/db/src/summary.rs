@@ -159,6 +159,180 @@ impl NodeSummary {
     }
 }
 
+/// One span's whole-node aggregate, kept in memory so envelope assembly
+/// can fold spans far narrower than an output bin without touching disk —
+/// and so purged spans keep contributing after their sidecar is deleted
+/// with the node directory.
+struct SpanRollup {
+    start_ts: i64,
+    end_ts: i64,
+    checksum: u64,
+    /// Per-element whole-node extremes; empty when no sidecar was ever
+    /// readable (a span purged before it was summarized).
+    elem_min: Box<[f32]>,
+    elem_max: Box<[f32]>,
+    resident: bool,
+}
+
+/// Per-component cache behind the `GetEnvelope` handler, refreshed
+/// incrementally off the manifest generation counter: only spans not yet
+/// seen pay a sidecar header read, and resident nodes that predate the
+/// summary feature are backfilled a few per request so a year-wide query
+/// can never pin the executor.
+#[derive(Default)]
+pub struct ComponentRollup {
+    generation: u64,
+    complete: bool,
+    spans: Vec<SpanRollup>,
+}
+
+/// Output-bin clamp: 16 covers a sparkline, 8192 a high-DPI ultrawide.
+const ENVELOPE_MAX_BINS: usize = 8192;
+const ENVELOPE_MIN_BINS: usize = 16;
+/// Missing-sidecar recomputes allowed per refresh (full node passes).
+const BACKFILL_PER_REFRESH: usize = 8;
+/// Full sidecar reads allowed per request; spans past the cap fold their
+/// whole-node aggregate instead, trading edge fidelity for bounded I/O.
+const FULL_READS_PER_REQUEST: usize = 256;
+
+impl ComponentRollup {
+    pub fn refresh(&mut self, series: &crate::time_series_2::TimeSeries, schema: &ComponentSchema) {
+        let manifest = series.manifest();
+        if self.generation == manifest.generation && self.complete {
+            return;
+        }
+        let mut cached: std::collections::HashMap<(i64, u64), SpanRollup> =
+            std::mem::take(&mut self.spans)
+                .into_iter()
+                .map(|s| ((s.start_ts, s.checksum), s))
+                .collect();
+        let mut backfills = BACKFILL_PER_REFRESH;
+        let mut complete = true;
+        let mut spans = Vec::with_capacity(manifest.spans.len());
+        for span in &manifest.spans {
+            let resident = span.state == crate::manifest::SpanState::Resident;
+            let key = (span.seal.start_ts.0, span.seal.checksum);
+            if let Some(mut entry) = cached.remove(&key) {
+                entry.resident = resident;
+                spans.push(entry);
+                continue;
+            }
+            let node_dir = series.path().join(span.seal.start_ts.0.to_string());
+            let mut header = NodeSummary::read_header(&node_dir, span.seal.checksum);
+            if header.is_none() && resident {
+                if backfills == 0 {
+                    // Out of budget; leave the cache incomplete so the
+                    // next request continues the sweep.
+                    complete = false;
+                } else {
+                    backfills -= 1;
+                    header = TimeSeriesNode::open(&node_dir).ok().and_then(|node| {
+                        let summary = NodeSummary::compute(&node, schema, &span.seal)?;
+                        let _ = summary.write(&node_dir);
+                        Some(summary.header)
+                    });
+                }
+            }
+            let (elem_min, elem_max) = header
+                .map(|h| (h.elem_min.into(), h.elem_max.into()))
+                .unwrap_or_default();
+            spans.push(SpanRollup {
+                start_ts: span.seal.start_ts.0,
+                end_ts: span.seal.end_ts.0,
+                checksum: span.seal.checksum,
+                elem_min,
+                elem_max,
+                resident,
+            });
+        }
+        self.spans = spans;
+        self.generation = manifest.generation;
+        self.complete = complete;
+    }
+
+    /// Assemble at most `max_bins` envelope bins for `range`. Spans
+    /// narrower than an output bin fold their whole-node aggregate (no
+    /// I/O at all — the common case for very wide views); wider resident
+    /// spans scatter their sidecar bins. The live head never contributes:
+    /// it streams raw and renders from local data.
+    pub fn envelope(
+        &self,
+        series: &crate::time_series_2::TimeSeries,
+        element_index: usize,
+        range: std::ops::Range<i64>,
+        max_bins: usize,
+    ) -> Vec<metor_proto_wkt::EnvelopeBin> {
+        let bins = max_bins.clamp(ENVELOPE_MIN_BINS, ENVELOPE_MAX_BINS);
+        let total = range.end.saturating_sub(range.start);
+        if total <= 0 {
+            return Vec::new();
+        }
+        let out_width = (total / bins as i64).max(1);
+        let bin_of = |ts: i64| -> usize {
+            ((ts.clamp(range.start, range.end - 1) - range.start) as i128 * bins as i128
+                / total as i128) as usize
+        };
+        let mut mins = vec![f32::INFINITY; bins];
+        let mut maxs = vec![f32::NEG_INFINITY; bins];
+        let mut fold = |b: usize, min: f32, max: f32| {
+            if min.is_finite() && max.is_finite() {
+                mins[b] = mins[b].min(min);
+                maxs[b] = maxs[b].max(max);
+            }
+        };
+
+        let lo = self.spans.partition_point(|s| s.end_ts < range.start);
+        let mut full_reads = 0usize;
+        for span in &self.spans[lo..] {
+            if span.start_ts >= range.end {
+                break;
+            }
+            let Some((&min, &max)) = span
+                .elem_min
+                .get(element_index)
+                .zip(span.elem_max.get(element_index))
+            else {
+                continue;
+            };
+            let span_len = span.end_ts - span.start_ts;
+            let scatter = span_len > out_width && span.resident && full_reads < FULL_READS_PER_REQUEST;
+            if scatter {
+                full_reads += 1;
+                let node_dir = series.path().join(span.start_ts.to_string());
+                if let Some(summary) = NodeSummary::read(&node_dir, span.checksum) {
+                    let n_bins = summary.header.bins as usize;
+                    let base = element_index * n_bins;
+                    for b in 0..n_bins {
+                        let ts = summary.ts[b];
+                        if ts >= range.start && ts < range.end {
+                            fold(bin_of(ts), summary.mins[base + b], summary.maxs[base + b]);
+                        }
+                    }
+                    continue;
+                }
+            }
+            // Whole-node aggregate across every output bin the span
+            // touches: honest about width, conservative about extremes.
+            let first = bin_of(span.start_ts);
+            let last = bin_of(span.end_ts);
+            for b in first..=last {
+                fold(b, min, max);
+            }
+        }
+
+        (0..bins)
+            .filter(|&b| mins[b] <= maxs[b])
+            .map(|b| metor_proto_wkt::EnvelopeBin {
+                ts: metor_proto::types::Timestamp(
+                    range.start + (b as i128 * total as i128 / bins as i128) as i64 + out_width / 2,
+                ),
+                min: mins[b],
+                max: maxs[b],
+            })
+            .collect()
+    }
+}
+
 fn read_f64(prim: PrimType, bytes: &[u8]) -> f64 {
     fn arr<const N: usize>(bytes: &[u8]) -> [u8; N] {
         bytes.try_into().expect("caller sliced to prim size")

@@ -163,6 +163,101 @@ mod tests {
         std::fs::remove_dir_all(&scratch).ok();
     }
 
+    /// The envelope reply must aggregate every sealed span in range to a
+    /// bounded number of bins, with extremes matching the raw data.
+    #[test]
+    async fn envelope_aggregates_sealed_history() {
+        use metor_db::store::{NodeKey, NodeStore, SealedNode};
+
+        let (addr, _db) = setup_test_db().await.unwrap();
+        let scratch = std::env::temp_dir().join(format!("metor_env_{}", fastrand::u64(..)));
+        std::fs::create_dir_all(&scratch).unwrap();
+        let component_id = ComponentId(777);
+        let node_schema = metor_proto::schema::Schema::new(PrimType::U64, [1usize]).unwrap();
+        let store = metor_db::store::PeerStore::new(addr);
+
+        for start in [0i64, 1_000] {
+            let node_dir = scratch.join(start.to_string());
+            let node =
+                metor_db::time_series::TimeSeriesNode::create(&node_dir, Timestamp(start), 8)
+                    .unwrap();
+            for i in 0..64i64 {
+                node.data.write(&((start + i) as u64).to_le_bytes()).unwrap();
+                node.index
+                    .write(&Timestamp(start + i).to_le_bytes())
+                    .unwrap();
+            }
+            let seal = metor_db::seal::seal_node(&node, &node_dir).unwrap().unwrap();
+            store
+                .put(
+                    NodeKey {
+                        component_id,
+                        component_name: "envelope.test",
+                        schema: &node_schema,
+                        start_ts: seal.start_ts,
+                        checksum: seal.checksum,
+                    },
+                    SealedNode::from_node(&node, seal).unwrap(),
+                )
+                .await
+                .unwrap();
+        }
+
+        let mut client = Client::connect(addr).await.unwrap();
+        let info: DbInfoResp = client.request(&GetDbInfo).await.unwrap();
+        assert_ne!(info.features & FEATURE_ENVELOPE, 0);
+
+        let resp: EnvelopeResp = client
+            .request(&GetEnvelope {
+                component_id,
+                element_index: 0,
+                start: Timestamp(0),
+                end: Timestamp(1_100),
+                max_bins: 64,
+            })
+            .await
+            .unwrap();
+        assert!(!resp.bins.is_empty());
+        assert!(resp.bins.len() <= 64);
+        assert!(resp.bins.windows(2).all(|w| w[0].ts.0 <= w[1].ts.0));
+        let min = resp.bins.iter().map(|b| b.min).fold(f32::INFINITY, f32::min);
+        let max = resp
+            .bins
+            .iter()
+            .map(|b| b.max)
+            .fold(f32::NEG_INFINITY, f32::max);
+        assert_eq!(min, 0.0);
+        assert_eq!(max, 1_063.0);
+
+        // A narrow range only sees its node's values.
+        let resp: EnvelopeResp = client
+            .request(&GetEnvelope {
+                component_id,
+                element_index: 0,
+                start: Timestamp(1_000),
+                end: Timestamp(1_064),
+                max_bins: 1_000_000,
+            })
+            .await
+            .unwrap();
+        let min = resp.bins.iter().map(|b| b.min).fold(f32::INFINITY, f32::min);
+        assert_eq!(min, 1_000.0);
+
+        // Unknown components answer empty rather than erroring.
+        let resp: EnvelopeResp = client
+            .request(&GetEnvelope {
+                component_id: ComponentId(31_337),
+                element_index: 0,
+                start: Timestamp(0),
+                end: Timestamp(100),
+                max_bins: 64,
+            })
+            .await
+            .unwrap();
+        assert!(resp.bins.is_empty());
+        std::fs::remove_dir_all(&scratch).ok();
+    }
+
     #[test]
     async fn remote_db_mirrors_live_data() {
         let (addr, _src_db) = setup_test_db().await.unwrap();

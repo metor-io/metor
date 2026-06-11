@@ -83,6 +83,10 @@ pub struct DB {
     /// Earliest timestamp known to this instance. Moves backwards when
     /// older history is hydrated from a store.
     pub earliest_timestamp: AtomicCell<Timestamp>,
+    /// Per-component rollups behind the `GetEnvelope` handler. The mutex
+    /// serializes envelope assembly across connections; held only over
+    /// bounded, capped sidecar reads.
+    envelope_rollups: std::sync::Mutex<HashMap<ComponentId, summary::ComponentRollup>>,
 }
 
 #[derive(Default)]
@@ -125,6 +129,7 @@ impl DB {
             default_stream_time_step,
             last_updated: AtomicCell::new(Timestamp(i64::MIN)),
             earliest_timestamp: AtomicCell::new(Timestamp::now()),
+            envelope_rollups: Default::default(),
         };
         db.save_db_state()?;
         Ok(db)
@@ -234,6 +239,7 @@ impl DB {
             ),
             last_updated: AtomicCell::new(Timestamp(last_updated)),
             earliest_timestamp: AtomicCell::new(earliest_timestamp),
+            envelope_rollups: Default::default(),
         })
     }
 
@@ -1289,7 +1295,7 @@ async fn handle_packet<A: AsyncWrite + 'static>(
         Packet::Msg(m) if m.id == GetDbInfo::ID => {
             tx.send_msg(&DbInfoResp {
                 protocol_version: NODE_PROTOCOL_VERSION,
-                features: 0,
+                features: FEATURE_ENVELOPE,
             })
             .await?;
         }
@@ -1314,6 +1320,32 @@ async fn handle_packet<A: AsyncWrite + 'static>(
             tx.send_msg(&NodeManifestResp {
                 component_id,
                 nodes,
+            })
+            .await?;
+        }
+        Packet::Msg(m) if m.id == GetEnvelope::ID => {
+            let req = m.parse::<GetEnvelope>()?;
+            let component =
+                db.with_state(|state| state.components.get(&req.component_id).cloned());
+            // Unknown components answer empty for the same reason
+            // GetNodeManifest does.
+            let bins = component
+                .map(|component| {
+                    let mut rollups = db.envelope_rollups.lock().unwrap();
+                    let rollup = rollups.entry(req.component_id).or_default();
+                    rollup.refresh(&component.time_series, &component.schema);
+                    rollup.envelope(
+                        &component.time_series,
+                        req.element_index as usize,
+                        req.start.0..req.end.0,
+                        req.max_bins as usize,
+                    )
+                })
+                .unwrap_or_default();
+            tx.send_msg(&EnvelopeResp {
+                component_id: req.component_id,
+                element_index: req.element_index,
+                bins,
             })
             .await?;
         }
