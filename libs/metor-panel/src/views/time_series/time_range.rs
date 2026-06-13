@@ -293,9 +293,11 @@ mod tests {
     /// endpoints must survive Display → FromStr without drifting.
     #[test]
     fn fixed_and_mixed_round_trip_through_display() {
+        // Sub-millisecond endpoints catch lossy f64 Epoch conversions that
+        // millisecond-aligned values can't.
         let pinned = TimeRangeBehavior {
-            start: Offset::Fixed(Timestamp(1_780_000_000_000_000)),
-            end: Offset::Fixed(Timestamp(1_780_000_060_000_000)),
+            start: Offset::Fixed(Timestamp(1_780_000_000_000_001)),
+            end: Offset::Fixed(Timestamp(1_780_000_060_123_457)),
         };
         let mixed = TimeRangeBehavior {
             start: Offset::Earliest(Duration::from_secs(5)),

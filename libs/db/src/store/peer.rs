@@ -20,6 +20,22 @@ use super::{
 /// fixed request id without colliding with anyone.
 const BULK_REQ_ID: u8 = 251;
 
+/// Same policy as `remote::db::HANDSHAKE_TIMEOUT` — the dial + handshake
+/// must be bounded because it runs while holding the client mutex.
+const HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Race `fut` against a timeout, surfacing the loss as an io error.
+async fn bounded<T>(
+    timeout: std::time::Duration,
+    fut: impl Future<Output = T>,
+) -> Result<T, std::io::Error> {
+    futures_lite::future::or(async { Ok(fut.await) }, async {
+        stellarator::sleep(timeout).await;
+        Err(std::io::Error::from(std::io::ErrorKind::TimedOut))
+    })
+    .await
+}
+
 /// [`NodeStore`] backed by a peer metor-db over the wire protocol
 /// (`GetNodeManifest`/`FetchNode`/`OfferNode`…). Maintains one dedicated
 /// TCP connection, separate from any live-telemetry subscription, so bulk
@@ -43,8 +59,18 @@ impl PeerStore {
     async fn lock_connected(&self) -> Result<MutexGuard<'_, Option<Client>>, StoreError> {
         let mut guard = self.client.lock().await;
         if guard.is_none() {
-            let mut client = Client::connect(self.addr).await.map_err(unavailable)?;
-            let info: DbInfoResp = client.request(&GetDbInfo).await.map_err(unavailable)?;
+            // Bounded like `remote::db::handshake_request`: old-protocol
+            // peers record unknown requests as telemetry and never reply,
+            // which would otherwise park this future while it holds the
+            // client mutex — wedging every store consumer forever.
+            let mut client = bounded(HANDSHAKE_TIMEOUT, Client::connect(self.addr))
+                .await
+                .map_err(unavailable)?
+                .map_err(unavailable)?;
+            let info: DbInfoResp = bounded(HANDSHAKE_TIMEOUT, client.request(&GetDbInfo))
+                .await
+                .map_err(unavailable)?
+                .map_err(unavailable)?;
             if info.protocol_version > NODE_PROTOCOL_VERSION {
                 warn!(
                     peer = info.protocol_version,

@@ -111,7 +111,17 @@ async fn run(db: Arc<DB>) {
             tracked.insert(src.component_id);
             stellarator::spawn(downsample_source(db.clone(), src));
         }
-        db.vtable_gen.wait().await;
+        // Raced against a periodic recheck: a registration between the scan
+        // above and the wait registering would otherwise be lost (wake_all
+        // doesn't store wakeups), orphaning the component until some
+        // unrelated vtable change.
+        futures_lite::future::race(
+            async {
+                db.vtable_gen.wait().await;
+            },
+            stellarator::sleep(IDLE_RECHECK),
+        )
+        .await;
     }
 }
 
@@ -127,7 +137,17 @@ async fn downsample_source(db: Arc<DB>, src: Component) {
         if let Some(period) = estimate_period_us(&src.time_series) {
             break period;
         }
-        let _ = seal_waiter.wait().await;
+        // Same lost-wakeup backstop as the pass loop below: a seal firing
+        // between the estimate and the wait registering would otherwise
+        // stall level creation until the *next* seal — days for a slow
+        // component.
+        futures_lite::future::race(
+            async {
+                let _ = seal_waiter.wait().await;
+            },
+            stellarator::sleep(IDLE_RECHECK),
+        )
+        .await;
     };
     // Re-read metadata: eligibility flags (`is_string`) and the real name
     // often arrive after the vtable that created the component.

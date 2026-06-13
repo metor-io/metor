@@ -932,14 +932,19 @@ pub struct Timestamp(pub i64);
 #[cfg(feature = "hifitime")]
 impl From<Timestamp> for hifitime::Epoch {
     fn from(val: Timestamp) -> Self {
-        hifitime::Epoch::from_unix_milliseconds((val.0 as f64) / 1000.0)
+        // Integer-nanosecond path: the f64 unix-milliseconds constructors
+        // lose sub-microsecond precision at present-day epochs.
+        hifitime::Epoch::from_unix_duration(hifitime::Duration::from_total_nanoseconds(
+            val.0 as i128 * 1000,
+        ))
     }
 }
 
 #[cfg(feature = "hifitime")]
 impl From<hifitime::Epoch> for Timestamp {
     fn from(epoch: hifitime::Epoch) -> Self {
-        Timestamp((epoch.to_unix_milliseconds() * 1000.0) as i64)
+        let unix = epoch.to_utc_duration() - hifitime::UNIX_REF_EPOCH.to_utc_duration();
+        Timestamp((unix.total_nanoseconds() / 1000) as i64)
     }
 }
 

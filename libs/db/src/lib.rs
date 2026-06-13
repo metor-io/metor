@@ -1263,20 +1263,18 @@ async fn handle_packet<A: AsyncWrite + 'static>(
             })?;
             let slice = msg_log.get_range(range);
             let data = if let Some(slice) = slice {
+                // Node order is newest-first; reverse so the batch reads
+                // chronologically and `limit` keeps the oldest-first prefix.
+                let node_slices: Vec<_> = slice.as_iter().collect();
                 let mut collected = Vec::new();
-                for node_slice in slice.as_iter() {
+                'outer: for node_slice in node_slices.iter().rev() {
                     for (timestamp, msg) in node_slice.msgs() {
-                        collected.push((timestamp, msg.to_vec()));
                         if let Some(limit) = limit
                             && collected.len() >= limit
                         {
-                            break;
+                            break 'outer;
                         }
-                    }
-                    if let Some(limit) = limit
-                        && collected.len() >= limit
-                    {
-                        break;
+                        collected.push((timestamp, msg.to_vec()));
                     }
                 }
                 collected

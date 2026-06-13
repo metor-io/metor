@@ -37,10 +37,15 @@ pub(crate) async fn ingest_loop<S, T, F>(
 
     let mut reader = msg_log.wal_reader();
 
+    // Node order is newest-first; reverse so order-sensitive folds (alarm
+    // run-state, sequence events) replay history chronologically.
     let backfill: Vec<(Timestamp, T)> =
         match msg_log.get_range(Timestamp(i64::MIN)..Timestamp(i64::MAX)) {
             Some(slice) => slice
                 .as_iter()
+                .collect::<Vec<_>>()
+                .into_iter()
+                .rev()
                 .flat_map(|node| {
                     node.msgs()
                         .filter_map(|(ts, bytes)| {
