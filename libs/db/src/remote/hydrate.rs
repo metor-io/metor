@@ -1,4 +1,9 @@
-use std::{collections::VecDeque, ops::Range, sync::Arc};
+use std::{
+    collections::{HashMap, VecDeque},
+    ops::Range,
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
 use metor_proto::types::{ComponentId, Timestamp};
 use stellarator::sync::WaitQueue;
@@ -14,6 +19,24 @@ use crate::{
 /// Most recent gap requests we keep; render loops re-request visible gaps
 /// every frame, so dropped entries are re-discovered immediately.
 const QUEUE_CAP: usize = 64;
+
+/// First retry delay after a span fails to hydrate; doubles per attempt.
+const BACKOFF_BASE: Duration = Duration::from_secs(1);
+/// Ceiling on the retry delay. A span never gives up permanently — state
+/// can change (the peer comes back, the span becomes installable) — so the
+/// backoff caps rather than abandons.
+const BACKOFF_CAP: Duration = Duration::from_secs(60);
+/// Soft bound on the backoff memo; pruned past this. Render loops only ever
+/// request visible gaps, so the live working set is tiny.
+const MEMO_CAP: usize = 256;
+
+/// Per-span retry state: a deterministically-failing span (corrupt remote
+/// bytes, a never-installable peer span) would otherwise be re-downloaded
+/// every frame forever, since the panel re-requests the same gap each frame.
+struct Backoff {
+    attempts: u32,
+    retry_at: Instant,
+}
 
 /// Fetch one remote-only span into residency. Returns `Ok(false)` when
 /// there is nothing to do — the span is unknown, already resident, or
@@ -80,6 +103,7 @@ impl Default for Hydrator {
 
 struct HydratorInner {
     queue: std::sync::Mutex<VecDeque<(ComponentId, Range<Timestamp>)>>,
+    backoff: std::sync::Mutex<HashMap<(ComponentId, Timestamp), Backoff>>,
     waker: WaitQueue,
 }
 
@@ -88,9 +112,46 @@ impl Hydrator {
         Self {
             inner: Arc::new(HydratorInner {
                 queue: std::sync::Mutex::new(VecDeque::new()),
+                backoff: std::sync::Mutex::new(HashMap::new()),
                 waker: WaitQueue::new(),
             }),
         }
+    }
+
+    /// Whether `key` is still inside its retry backoff window.
+    fn backed_off(&self, key: (ComponentId, Timestamp)) -> bool {
+        self.inner
+            .backoff
+            .lock()
+            .unwrap()
+            .get(&key)
+            .is_some_and(|b| b.retry_at > Instant::now())
+    }
+
+    /// Record a failed hydration: bump the attempt count and push
+    /// `retry_at` out by exponential backoff (capped). Prunes elapsed
+    /// entries when the memo grows past [`MEMO_CAP`].
+    fn record_failure(&self, key: (ComponentId, Timestamp)) {
+        let mut memo = self.inner.backoff.lock().unwrap();
+        let now = Instant::now();
+        let entry = memo.entry(key).or_insert(Backoff {
+            attempts: 0,
+            retry_at: now,
+        });
+        entry.attempts = entry.attempts.saturating_add(1);
+        let shift = entry.attempts.saturating_sub(1).min(31);
+        let delay = BACKOFF_BASE
+            .saturating_mul(1u32 << shift)
+            .min(BACKOFF_CAP);
+        entry.retry_at = now + delay;
+        if memo.len() > MEMO_CAP {
+            memo.retain(|_, b| b.retry_at > now);
+        }
+    }
+
+    /// Clear a span's backoff once it hydrates (or no longer needs to).
+    fn clear_backoff(&self, key: (ComponentId, Timestamp)) {
+        self.inner.backoff.lock().unwrap().remove(&key);
     }
 
     /// Ask for `range` of `component_id` to become resident. Never blocks
@@ -150,7 +211,14 @@ impl Hydrator {
             if gap.state != SpanState::RemoteOnly {
                 continue;
             }
-            if hydrate_span(
+            let key = (component_id, gap.start_ts);
+            if self.backed_off(key) {
+                continue;
+            }
+            // A per-gap failure no longer aborts the whole request: it
+            // records backoff and moves on, so one bad span can't starve
+            // the others sharing this range.
+            match hydrate_span(
                 &component.time_series,
                 store,
                 component_id,
@@ -158,9 +226,23 @@ impl Hydrator {
                 &component.schema,
                 gap.start_ts,
             )
-            .await?
+            .await
             {
-                db.earliest_timestamp.update_min(gap.start_ts);
+                Ok(installed) => {
+                    self.clear_backoff(key);
+                    if installed {
+                        db.earliest_timestamp.update_min(gap.start_ts);
+                    }
+                }
+                Err(err) => {
+                    self.record_failure(key);
+                    warn!(
+                        ?err,
+                        ?component_id,
+                        start_ts = gap.start_ts.0,
+                        "hydrate span failed; backing off"
+                    );
+                }
             }
         }
         Ok(())

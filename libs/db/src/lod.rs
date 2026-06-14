@@ -27,7 +27,7 @@ use std::{
 use metor_proto::types::{ComponentId, PrimType, Timestamp};
 use metor_proto_wkt::ComponentMetadata;
 use smallvec::SmallVec;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 use crate::{
     Component, ComponentSchema, DB, Error,
@@ -197,6 +197,46 @@ fn estimate_period_us(series: &TimeSeries) -> Option<i64> {
     Some((((last - first) as i128) / (count as i128 - 1)).max(1) as i64)
 }
 
+/// The lowest bucket frontier across `source_id`'s LoD levels: the
+/// timestamp up to which *every* level has folded raw history into buckets.
+/// Each level persists its frontier as its own latest sample, so this is
+/// derived from state with no sidecar bookkeeping. Tiering gates purges on
+/// it — a raw span newer than the frontier is still needed to compute its
+/// buckets, so it is not cold yet regardless of age.
+///
+/// `None` when the source has no LoD levels (not eligible, engine not
+/// running, or not yet set up); callers then keep their pre-LoD behavior.
+/// A level that has emitted nothing reports [`i64::MIN`], pinning the min
+/// so no raw history is purged until summarization has actually started.
+pub fn summarized_frontier(db: &DB, source_id: ComponentId) -> Option<i64> {
+    let source_key = source_id.0.to_string();
+    let mut frontier: Option<i64> = None;
+    db.with_state(|state| {
+        for (id, meta) in state.component_metadata_iter() {
+            if meta.metadata.get(LOD_SOURCE_ID_KEY).map(String::as_str) != Some(source_key.as_str())
+            {
+                continue;
+            }
+            let Some(bucket_us) = meta
+                .metadata
+                .get(LOD_BUCKET_US_KEY)
+                .and_then(|v| v.parse::<i64>().ok())
+            else {
+                continue;
+            };
+            let Some(lod) = state.get_component(*id) else {
+                continue;
+            };
+            let level_frontier = match lod.time_series.latest() {
+                Some(latest) => latest.timestamp().0.div_euclid(bucket_us) * bucket_us + bucket_us,
+                None => i64::MIN,
+            };
+            frontier = Some(frontier.map_or(level_frontier, |f| f.min(level_frontier)));
+        }
+    });
+    frontier
+}
+
 struct Level {
     writer: TimerSeriesWriter,
     bucket_us: i64,
@@ -295,7 +335,7 @@ fn create_level(
     let schema = lod_schema(&src.schema);
     let was_new = db.with_state(|s| s.get_component(component_id).is_none());
     db.with_state_mut(|state| {
-        state.insert_component(component_id, schema, &db.path)?;
+        state.insert_engine_component(component_id, schema, &db.path)?;
         let mut meta = ComponentMetadata {
             component_id,
             name,
@@ -326,6 +366,7 @@ impl Level {
     fn run_pass(&mut self, src: &Component) -> Result<bool, Error> {
         let d = self.bucket_us;
         let manifest = src.time_series.manifest();
+        let gen_before = manifest.generation;
         let Some(last_span) = manifest.spans.last() else {
             return Ok(false);
         };
@@ -340,7 +381,11 @@ impl Level {
             emit_end.min(self.cursor.saturating_add(d.saturating_mul(MAX_BUCKETS_PER_PASS)));
 
         // Buckets touching raw history that is not locally resident are
-        // skipped permanently — the bytes to fold may be gone.
+        // skipped: pre-existing RemoteOnly history (e.g. a seeded mirror's
+        // un-hydrated past) has no local bytes to fold. Tiering no longer
+        // purges in-window resident spans (it gates on
+        // [`summarized_frontier`]), so this only fires for history that was
+        // never local to begin with.
         let holes: Vec<(i64, i64)> = manifest
             .spans
             .iter()
@@ -357,6 +402,10 @@ impl Level {
         let mut bucket_start = i64::MIN;
         let mut mins = vec![f64::INFINITY; n];
         let mut maxs = vec![f64::NEG_INFINITY; n];
+        // Folded buckets are buffered and only written after the manifest
+        // generation re-check below, so a snapshot that shifted under us
+        // emits nothing rather than a bucket built from partial data.
+        let mut emitted: Vec<(Timestamp, Vec<u8>)> = Vec::new();
 
         if let Some(slice) = src
             .time_series
@@ -376,7 +425,7 @@ impl Level {
                     let bucket = ts.0.div_euclid(d) * d;
                     if bucket != bucket_start {
                         if bucket_start != i64::MIN {
-                            self.flush_bucket(bucket_start, &mins, &maxs, &holes)?;
+                            Self::fold_bucket(d, bucket_start, &mins, &maxs, &holes, &mut emitted);
                         }
                         bucket_start = bucket;
                         mins.fill(f64::INFINITY);
@@ -397,29 +446,46 @@ impl Level {
                 }
             }
             if bucket_start != i64::MIN {
-                self.flush_bucket(bucket_start, &mins, &maxs, &holes)?;
+                Self::fold_bucket(d, bucket_start, &mins, &maxs, &holes, &mut emitted);
             }
+        }
+
+        // If history shifted under us mid-fold (a seal, install, or purge
+        // bumped the manifest), the buffered buckets may be built from a
+        // window that no longer reflects the data. Drop them and re-run
+        // next pass over a consistent snapshot rather than emit or advance.
+        if src.time_series.manifest().generation != gen_before {
+            return Ok(true);
+        }
+        for (ts, buf) in emitted {
+            self.writer.push_buf(ts, &buf)?;
         }
         self.cursor = pass_end;
         Ok(pass_end < emit_end)
     }
 
-    /// Write one bucket sample at the bucket's midpoint. Elements with no
-    /// finite sample store `(NaN, NaN)` so renderers keep treating holes
-    /// as holes.
-    fn flush_bucket(
-        &mut self,
+    /// Fold one bucket into `emitted` as a sample at the bucket's midpoint.
+    /// Elements with no finite sample store `(NaN, NaN)` so renderers keep
+    /// treating holes as holes; buckets over non-resident raw history are
+    /// dropped entirely (nothing local to summarize).
+    fn fold_bucket(
+        bucket_us: i64,
         bucket_start: i64,
         mins: &[f64],
         maxs: &[f64],
         holes: &[(i64, i64)],
-    ) -> Result<(), Error> {
-        let bucket_end = bucket_start + self.bucket_us;
+        emitted: &mut Vec<(Timestamp, Vec<u8>)>,
+    ) {
+        let bucket_end = bucket_start + bucket_us;
         if holes
             .iter()
             .any(|(start, end)| *start < bucket_end && *end >= bucket_start)
         {
-            return Ok(());
+            debug!(
+                bucket_start,
+                "lod skipping bucket over non-resident raw history"
+            );
+            return;
         }
         let mut buf = Vec::with_capacity((mins.len() + maxs.len()) * size_of::<f32>());
         for v in mins {
@@ -430,8 +496,7 @@ impl Level {
             let v = if v.is_finite() { *v as f32 } else { f32::NAN };
             buf.extend_from_slice(&v.to_le_bytes());
         }
-        self.writer
-            .push_buf(Timestamp(bucket_start + self.bucket_us / 2), &buf)
+        emitted.push((Timestamp(bucket_start + bucket_us / 2), buf));
     }
 }
 
@@ -503,7 +568,7 @@ mod tests {
 
     fn level_for(dir: &Path, src: &Component, bucket_us: i64) -> (Component, Level) {
         let component_id = ComponentId::new("src.lod");
-        let lod = Component::create(dir, component_id, lod_schema(&src.schema)).unwrap();
+        let lod = Component::create(dir, component_id, lod_schema(&src.schema), true).unwrap();
         let writer = lod.time_series.writer().unwrap();
         let cursor = src
             .time_series

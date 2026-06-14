@@ -278,9 +278,20 @@ impl TimeSeriesSlice {
     pub fn as_iter(&self) -> impl Iterator<Item = TimeSeriesNodeSlice> + '_ {
         let iter: AtomicStackIter<TimeSeriesNode> =
             AtomicStackIter::new(ArcAtomic::from(self.end.node.clone()));
+        // Floor the walk at `start`'s oldest sample: should `start` and
+        // `end` ever land on different spines (the `ptr_eq` sentinel
+        // below would then never match), this caps the over-read at one
+        // node instead of letting iteration run to the oldest node in the
+        // archive.
+        let start_floor = self.start.node.timestamps().first().map(|t| t.0);
         let mut done = false;
         iter.map_while(move |node| {
             if done {
+                return None;
+            }
+            if let (Some(floor), Some(newest)) = (start_floor, node.timestamps().last())
+                && newest.0 < floor
+            {
                 return None;
             }
             let is_start = Arc::ptr_eq(&node, &self.start.node);
@@ -615,13 +626,17 @@ impl TimeSeries {
     /// Idempotent — re-installing an already-resident span with the same
     /// checksum is `Ok`.
     ///
-    /// While a live writer exists the span must be strictly older than its
-    /// head: hydration only ever fills gaps behind the live feed, so a
-    /// sealed node that would outrank the head (e.g. pushed by a peer
-    /// whose clock ran ahead) is rejected — installing it would break the
-    /// newest-first node order and race the seal of the in-flight head.
-    /// Without a writer (an archive store receiving pushed nodes) new
-    /// spans legitimately land above the head.
+    /// A span above the head is rejected whenever the head is *unsealed* —
+    /// the working node a writer is appending to, which sealing always
+    /// skips and so never has a manifest span (even across restarts,
+    /// before the first live sample re-creates the writer). Hydration only
+    /// fills gaps behind the live feed, so a sealed node that would outrank
+    /// that head (e.g. pushed by a peer whose clock ran ahead) would break
+    /// the newest-first order and race the seal of the in-flight head.
+    /// An archive's head is always sealed (every node arrived via
+    /// `install_node`, which publishes a Resident span), so pushes above it
+    /// legitimately land. A live writer over an empty-timestamp head still
+    /// rejects, keyed off `has_writer`.
     pub fn install_node(
         &self,
         staging: crate::store::NodeStaging,
@@ -658,10 +673,22 @@ impl TimeSeries {
             }
         }
         if succ.is_none()
-            && self.list.head().is_some()
-            && self.has_writer.load(Ordering::Acquire)
+            && let Some(head) = self.list.head()
         {
-            return Err(StoreError::Other("span is newer than the live head".to_string()).into());
+            // The head is the live writer's working node iff it has no
+            // manifest span; an archive's head is always sealed. Reject
+            // above an unsealed head (the window after reopen, before the
+            // first live sample, that a `has_writer`-only guard misses) or
+            // whenever a writer is live (covers an empty-timestamp head).
+            let head_unsealed = head
+                .timestamps()
+                .first()
+                .is_some_and(|start| manifest.span(*start).is_none());
+            if head_unsealed || self.has_writer.load(Ordering::Acquire) {
+                return Err(
+                    StoreError::Other("span is newer than the live head".to_string()).into(),
+                );
+            }
         }
         let (_node_dir, node) = staging.commit(seal)?;
         match succ {
@@ -771,16 +798,21 @@ impl TimeSeries {
     pub fn estimate_samples(&self, range: Range<Timestamp>) -> u64 {
         let manifest = self.manifest.load();
         let mut total = manifest.count_in(&range);
-        if let Some(head) = self.list.head() {
-            let timestamps = head.timestamps();
-            let unsealed = timestamps
-                .first()
-                .is_some_and(|start| manifest.span(*start).is_none());
-            if unsealed {
-                let lo = timestamps.partition_point(|t| t.0 < range.start.0);
-                let hi = timestamps.partition_point(|t| t.0 < range.end.0);
-                total += (hi - lo) as u64;
+        // Add every resident node the manifest hasn't sealed yet — the
+        // live head plus any nodes rolled off the writer but not yet
+        // sealed. Counting only the head left those rolled-but-unsealed
+        // nodes invisible, skewing the panel's raw/LoD switchover.
+        for node in self.list.iter() {
+            let timestamps = node.timestamps();
+            let Some(start) = timestamps.first() else {
+                continue;
+            };
+            if manifest.span(*start).is_some() {
+                continue;
             }
+            let lo = timestamps.partition_point(|t| t.0 < range.start.0);
+            let hi = timestamps.partition_point(|t| t.0 < range.end.0);
+            total += (hi - lo) as u64;
         }
         total
     }
@@ -834,6 +866,22 @@ impl TimeSeries {
         timestamp: Timestamp,
         inclusive: bool,
     ) -> Option<TimestampRef> {
+        let head = self.list.head()?;
+        Self::binary_search_nearest_from(head, timestamp, inclusive)
+    }
+
+    /// Find the nearest sample to `timestamp` walking the spine seeded
+    /// from `head`. Splitting the search off the captured head (rather
+    /// than re-reading `list.head()` per call) is what lets `get_range`
+    /// run both endpoint searches over a single immutable snapshot: a
+    /// `purge_span`/`install_node` splice between the two would otherwise
+    /// rebuild the newer node shells, landing `start` and `end` on
+    /// different spines so `as_iter`'s `ptr_eq` sentinel never matches.
+    fn binary_search_nearest_from(
+        head: Arc<AtomicNode<TimeSeriesNode>>,
+        timestamp: Timestamp,
+        inclusive: bool,
+    ) -> Option<TimestampRef> {
         // three different cases per node
         // 1. Timestamp > node.end
         //   a. prev_node.end.dist(timestamp) < node.start.dist(timestamp) then prev_node.end
@@ -844,7 +892,7 @@ impl TimeSeries {
         //  node.timestamps.bst(timestamp)
 
         let mut prev_node: Option<TimestampRef> = None;
-        for node in self.list.iter() {
+        for node in AtomicStackIter::new(ArcAtomic::from(head)) {
             let timestamps = node.timestamps();
             let start = timestamps.first()?;
             let end = timestamps.last()?;
@@ -886,8 +934,12 @@ impl TimeSeries {
     }
 
     pub fn get_range(&self, range: Range<Timestamp>) -> Option<TimeSeriesSlice> {
-        let start = self.binary_search_nearest(range.start, false)?;
-        let end = self.binary_search_nearest(range.end, true)?;
+        // Capture the head once so both endpoint searches run over the
+        // same immutable spine; nodes and `prev` links never mutate once
+        // published, so the snapshot stays consistent for the query.
+        let head = self.list.head()?;
+        let start = Self::binary_search_nearest_from(head.clone(), range.start, false)?;
+        let end = Self::binary_search_nearest_from(head, range.end, true)?;
         Some(TimeSeriesSlice { start, end })
     }
 

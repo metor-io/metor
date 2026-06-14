@@ -335,8 +335,21 @@ impl MsgLog {
     }
 
     pub fn binary_search_nearest(&self, timestamp: Timestamp, inclusive: bool) -> Option<MsgRef> {
+        let head = self.list.head()?;
+        Self::binary_search_nearest_from(head, timestamp, inclusive)
+    }
+
+    /// Nearest-sample search seeded from a captured `head`, so
+    /// [`Self::get_range`] can run both endpoint searches over a single
+    /// spine snapshot. See `TimeSeries::binary_search_nearest_from` for
+    /// the two-snapshot race this avoids.
+    fn binary_search_nearest_from(
+        head: Arc<AtomicNode<MsgLogNode>>,
+        timestamp: Timestamp,
+        inclusive: bool,
+    ) -> Option<MsgRef> {
         let mut prev_node: Option<MsgRef> = None;
-        for node in self.list.iter() {
+        for node in AtomicStackIter::new(ArcAtomic::from(head)) {
             let timestamps = node.timestamps();
             let start = timestamps.first()?;
             let end = timestamps.last()?;
@@ -383,8 +396,11 @@ impl MsgLog {
     }
 
     pub fn get_range(&self, range: Range<Timestamp>) -> Option<MsgLogSlice> {
-        let start = self.binary_search_nearest(range.start, false)?;
-        let end = self.binary_search_nearest(range.end, true)?;
+        // One captured head for both endpoint searches; see
+        // `TimeSeries::get_range`.
+        let head = self.list.head()?;
+        let start = Self::binary_search_nearest_from(head.clone(), range.start, false)?;
+        let end = Self::binary_search_nearest_from(head, range.end, true)?;
         Some(MsgLogSlice { start, end })
     }
 

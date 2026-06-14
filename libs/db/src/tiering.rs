@@ -7,13 +7,13 @@
 //! — a span leaves disk only once a store holds a durable, acked copy —
 //! and data with no store copy and no configured store is never touched.
 
-use std::{sync::Arc, time::Duration};
+use std::{collections::HashMap, sync::Arc, time::Duration};
 
 use metor_proto::types::{ComponentId, Timestamp};
 use tracing::{debug, warn};
 
 use crate::{
-    Component, DB, Error,
+    Component, DB, Error, lod,
     manifest::{SpanSource, SpanState},
     remote::offload_span,
     store::NodeStore,
@@ -109,7 +109,15 @@ pub async fn tier_once(
     });
     let min_resident_cutoff =
         Timestamp(now.0.saturating_sub(config.min_resident.as_micros() as i64));
-    let (mut victims, mut resident_bytes) = collect_victims(&components, min_resident_cutoff);
+    // The LoD frontier per source: raw spans newer than this still feed an
+    // un-folded bucket, so they are not cold whatever their age. Sources
+    // with no levels are absent and keep the age/budget-only behavior.
+    let frontiers: HashMap<ComponentId, i64> = components
+        .iter()
+        .filter_map(|(id, _, _)| lod::summarized_frontier(db, *id).map(|f| (*id, f)))
+        .collect();
+    let (mut victims, mut resident_bytes) =
+        collect_victims(&components, min_resident_cutoff, &frontiers);
 
     if let Some(max_age) = config.max_age {
         let cutoff = Timestamp(now.0.saturating_sub(max_age.as_micros() as i64));
@@ -152,11 +160,13 @@ pub async fn tier_once(
 fn collect_victims<'a>(
     components: &'a [(ComponentId, String, Component)],
     min_resident_cutoff: Timestamp,
+    frontiers: &HashMap<ComponentId, i64>,
 ) -> (Vec<Victim<'a>>, u64) {
     let mut victims = Vec::new();
     let mut resident_bytes = 0u64;
     for (component_id, name, component) in components {
         let manifest = component.time_series.manifest();
+        let frontier = frontiers.get(component_id).copied();
         for span in manifest
             .spans
             .iter()
@@ -164,6 +174,12 @@ fn collect_victims<'a>(
         {
             resident_bytes += span.bytes();
             if span.seal.end_ts.0 >= min_resident_cutoff.0 {
+                continue;
+            }
+            // LoD hasn't folded this span into every level yet; folding
+            // reads the raw bytes, so purging now would lose buckets that
+            // can never be recomputed. Not cold until summarized.
+            if frontier.is_some_and(|f| f < span.cover_end.0) {
                 continue;
             }
             victims.push(Victim {

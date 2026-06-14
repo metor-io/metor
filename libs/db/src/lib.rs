@@ -178,8 +178,12 @@ impl DB {
 
             trace!("Opening component file {}", path.display());
 
-            let component = Component::open(&path, component_id, schema.clone())?;
-            if lod::is_lod_name(&metadata.name) {
+            // A LoD component's writer belongs to the engine; open it in
+            // drain mode so its `persist` never claims the writer that
+            // `setup_levels` re-takes after restart.
+            let engine_owned = lod::is_lod_name(&metadata.name);
+            let component = Component::open(&path, component_id, schema.clone(), engine_owned)?;
+            if engine_owned {
                 component.time_series.set_max_node_age(lod::lod_node_max_age());
             }
             component_metadata.insert(component_id, metadata);
@@ -312,6 +316,28 @@ impl State {
         schema: ComponentSchema,
         db_path: &Path,
     ) -> Result<(), Error> {
+        self.insert_component_inner(component_id, schema, db_path, false)
+    }
+
+    /// Like [`Self::insert_component`], but for the LoD engine: the created
+    /// component's writer belongs to the engine, so its `persist` runs in
+    /// drain mode rather than racing to claim the writer.
+    pub fn insert_engine_component(
+        &mut self,
+        component_id: ComponentId,
+        schema: ComponentSchema,
+        db_path: &Path,
+    ) -> Result<(), Error> {
+        self.insert_component_inner(component_id, schema, db_path, true)
+    }
+
+    fn insert_component_inner(
+        &mut self,
+        component_id: ComponentId,
+        schema: ComponentSchema,
+        db_path: &Path,
+        engine_owned: bool,
+    ) -> Result<(), Error> {
         if let Some(existing_component) = self.components.get(&component_id) {
             if existing_component.schema != schema {
                 warn!( ?existing_component.schema, new_component.schema = ?schema,
@@ -327,7 +353,7 @@ impl State {
             name: component_id.to_string(),
             metadata: Default::default(),
         };
-        let component = Component::create(db_path, component_id, schema)?;
+        let component = Component::create(db_path, component_id, schema, engine_owned)?;
         if !self.component_metadata.contains_key(&component_id) {
             self.set_component_metadata(component_metadata, db_path)?;
         }
@@ -574,10 +600,14 @@ pub struct Component {
 }
 
 impl Component {
+    /// `engine_owned` marks a component whose writer belongs to the LoD
+    /// engine (it emits buckets directly); its `persist` runs in drain mode
+    /// so it never races [`lod`]'s `setup_levels` for the writer claim.
     pub fn create(
         db_path: &Path,
         component_id: ComponentId,
         schema: ComponentSchema,
+        engine_owned: bool,
     ) -> Result<Self, Error> {
         let component_path = db_path.join(component_id.to_string());
         std::fs::create_dir_all(&component_path)?;
@@ -596,7 +626,7 @@ impl Component {
             schema,
             last_timestamp: Arc::new(AtomicCell::new(Timestamp(i64::MIN))),
         };
-        stellarator::spawn(this.clone().persist());
+        stellarator::spawn(this.clone().persist(engine_owned));
         stellarator::spawn(this.time_series.clone().lifecycle());
         Ok(this)
     }
@@ -605,6 +635,7 @@ impl Component {
         path: impl AsRef<Path>,
         component_id: ComponentId,
         schema: ComponentSchema,
+        engine_owned: bool,
     ) -> Result<Self, Error> {
         let time_series = TimeSeries::open(path)?;
         if let Some(age) = max_node_age_override() {
@@ -622,26 +653,38 @@ impl Component {
             schema,
             last_timestamp: Arc::new(AtomicCell::new(last_timestamp)),
         };
-        stellarator::spawn(this.persist());
+        stellarator::spawn(this.persist(engine_owned));
         stellarator::spawn(this.time_series.clone().lifecycle());
         Ok(this)
     }
 
-    pub fn persist(&self) -> impl Future<Output = ()> + 'static {
+    pub fn persist(&self, engine_owned: bool) -> impl Future<Output = ()> + 'static {
         let mut reader = self.wal.reader();
         let time_series = self.time_series.clone();
         let msg_size = self.schema.size() + size_of::<Timestamp>();
         async move {
-            // Taken on the first live sample, not at spawn: a component
-            // that only ever receives pushed sealed nodes has no live
-            // head, and `install_node` keys its newer-than-head guard on
-            // the writer's existence. A writer owned elsewhere (the LoD
-            // engine writes its derived components directly) means WAL
-            // traffic for this component is bogus; drop it rather than
-            // fight over the head.
+            // The writer claim is lazy — taken on the first live sample, not
+            // at spawn — because a component that only ever receives pushed
+            // sealed nodes has no live head, and `install_node` keys its
+            // newer-than-head guard on the writer's existence.
+            //
+            // `engine_owned` components are different: the LoD engine owns
+            // their writer and emits buckets directly, so we decide here, at
+            // construction, never to claim it. That removes the race where
+            // this lazy claim and `setup_levels` fought over the writer —
+            // whichever lost degraded silently. Any WAL traffic for such a
+            // component is bogus; warn-drop it.
             let mut writer = None;
+            let mut warned_engine_owned = false;
             loop {
                 let buf = reader.next().await;
+                if engine_owned {
+                    if !warned_engine_owned {
+                        warn!("wal traffic for engine-owned component; dropping samples");
+                        warned_engine_owned = true;
+                    }
+                    continue;
+                }
                 if writer.is_none() {
                     writer = time_series.writer();
                     if writer.is_none() {
@@ -1407,7 +1450,7 @@ async fn handle_packet<A: AsyncWrite + 'static>(
         Packet::Msg(m) if m.id == OfferNode::ID => {
             let OfferNode {
                 component_id,
-                component_name: _,
+                component_name,
                 schema,
                 seal,
             } = m.parse::<OfferNode>()?;
@@ -1415,7 +1458,26 @@ async fn handle_packet<A: AsyncWrite + 'static>(
             if schema.size() as u64 != seal.element_size {
                 return Err(Error::SchemaMismatch);
             }
-            db.with_state_mut(|state| state.insert_component(component_id, schema, &db.path))?;
+            db.with_state_mut(|state| {
+                let is_new = state.get_component(component_id).is_none();
+                state.insert_component(component_id, schema, &db.path)?;
+                // A freshly auto-created component otherwise keeps the
+                // numeric-id placeholder `insert_component` defaults to;
+                // adopt the human name the peer already put on the wire.
+                if is_new
+                    && !component_name.is_empty()
+                    && let Some(meta) = state.get_component_metadata(component_id).cloned()
+                {
+                    state.set_component_metadata(
+                        ComponentMetadata {
+                            name: component_name,
+                            ..meta
+                        },
+                        &db.path,
+                    )?;
+                }
+                Ok::<(), Error>(())
+            })?;
             let component = db.with_state(|state| {
                 state
                     .components
