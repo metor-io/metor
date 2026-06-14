@@ -32,7 +32,7 @@ use tracing::{debug, info, warn};
 use crate::{
     Component, ComponentSchema, DB, Error,
     manifest::SpanState,
-    time_series_2::{TimeSeries, TimerSeriesWriter},
+    time_series_2::{TimeSeries, TimeSeriesNodeSlice, TimerSeriesWriter},
 };
 
 /// Bucket-size cascade, as multiples of the source's mean sample period.
@@ -245,6 +245,26 @@ struct Level {
     /// advanced past scanned-but-empty regions in memory so holes in the
     /// raw history are not rescanned every pass.
     cursor: i64,
+    /// Per-pass scratch, owned by the level so a pass — which runs every
+    /// [`PASS_PAUSE`] during backfill — reuses these buffers instead of
+    /// allocating. All are `clear()`ed/`fill()`ed at the top of each pass;
+    /// capacity warms on the first pass and is held for the task's life.
+    /// `mins`/`maxs` are sized once to the source element count.
+    mins: Vec<f64>,
+    maxs: Vec<f64>,
+    /// Raw spans that are not locally resident, intersected with the pass
+    /// window; buckets touching one are skipped.
+    holes: Vec<(i64, i64)>,
+    /// The pass window's node slices, collected newest-first then walked in
+    /// reverse. `TimeSeriesNodeSlice` owns its `Arc<TimeSeriesNode>`, so it
+    /// lives here across passes with no borrow of the transient slice.
+    node_slices: Vec<TimeSeriesNodeSlice>,
+    /// Folded buckets buffered until the manifest generation re-check, as a
+    /// flat byte arena plus an index of `(midpoint ts, byte length)` — one
+    /// `Vec<u8>` per bucket would otherwise allocate up to
+    /// [`MAX_BUCKETS_PER_PASS`] times per pass.
+    emit_buf: Vec<u8>,
+    emit_index: Vec<(Timestamp, u32)>,
 }
 
 /// Resolve or create the LoD companions for `src`. Existing levels are
@@ -315,11 +335,7 @@ fn setup_levels(db: &Arc<DB>, src: &Component, src_name: &str, period_us: i64) -
                 .map(|s| s.seal.start_ts.0.div_euclid(bucket_us) * bucket_us)
                 .unwrap_or(0),
         };
-        levels.push(Level {
-            writer,
-            bucket_us,
-            cursor,
-        });
+        levels.push(Level::new(writer, bucket_us, cursor, &src.schema));
     }
     levels
 }
@@ -359,6 +375,29 @@ fn create_level(
 }
 
 impl Level {
+    /// Build a level with its per-pass scratch sized to the source element
+    /// count (`mins`/`maxs` hold one f64 per element). The remaining buffers
+    /// start empty and warm their capacity on the first pass.
+    fn new(
+        writer: TimerSeriesWriter,
+        bucket_us: i64,
+        cursor: i64,
+        src_schema: &ComponentSchema,
+    ) -> Self {
+        let n = src_schema.dim.iter().product::<usize>().max(1);
+        Level {
+            writer,
+            bucket_us,
+            cursor,
+            mins: vec![f64::INFINITY; n],
+            maxs: vec![f64::NEG_INFINITY; n],
+            holes: Vec::new(),
+            node_slices: Vec::new(),
+            emit_buf: Vec::new(),
+            emit_index: Vec::new(),
+        }
+    }
+
     /// Emit every complete bucket between the cursor and the source's
     /// sealed frontier, bounded to [`MAX_BUCKETS_PER_PASS`]. Returns true
     /// when more sealed work remains (the caller should run another pass
@@ -380,19 +419,36 @@ impl Level {
         let pass_end =
             emit_end.min(self.cursor.saturating_add(d.saturating_mul(MAX_BUCKETS_PER_PASS)));
 
+        // Disjoint borrows of the per-level scratch: the node walk reads
+        // `node_slices` while the fold writes `mins`/`maxs`/`emit_*`, which a
+        // single `&mut self` would forbid.
+        let Level {
+            mins,
+            maxs,
+            holes,
+            node_slices,
+            emit_buf,
+            emit_index,
+            writer,
+            cursor,
+            ..
+        } = self;
+
         // Buckets touching raw history that is not locally resident are
         // skipped: pre-existing RemoteOnly history (e.g. a seeded mirror's
         // un-hydrated past) has no local bytes to fold. Tiering no longer
         // purges in-window resident spans (it gates on
         // [`summarized_frontier`]), so this only fires for history that was
         // never local to begin with.
-        let holes: Vec<(i64, i64)> = manifest
-            .spans
-            .iter()
-            .filter(|s| s.state != SpanState::Resident)
-            .map(|s| (s.seal.start_ts.0, s.cover_end.0))
-            .filter(|(start, end)| *start < pass_end && *end >= self.cursor)
-            .collect();
+        holes.clear();
+        holes.extend(
+            manifest
+                .spans
+                .iter()
+                .filter(|s| s.state != SpanState::Resident)
+                .map(|s| (s.seal.start_ts.0, s.cover_end.0))
+                .filter(|(start, end)| *start < pass_end && *end >= *cursor),
+        );
 
         let n = src.schema.dim.iter().product::<usize>().max(1);
         let prim = src.schema.prim_type;
@@ -400,32 +456,43 @@ impl Level {
         let element_size = src.schema.size();
 
         let mut bucket_start = i64::MIN;
-        let mut mins = vec![f64::INFINITY; n];
-        let mut maxs = vec![f64::NEG_INFINITY; n];
-        // Folded buckets are buffered and only written after the manifest
-        // generation re-check below, so a snapshot that shifted under us
-        // emits nothing rather than a bucket built from partial data.
-        let mut emitted: Vec<(Timestamp, Vec<u8>)> = Vec::new();
+        mins.fill(f64::INFINITY);
+        maxs.fill(f64::NEG_INFINITY);
+        // Folded buckets are buffered (flat arena + index) and only written
+        // after the manifest generation re-check below, so a snapshot that
+        // shifted under us emits nothing rather than a bucket built from
+        // partial data.
+        emit_buf.clear();
+        emit_index.clear();
 
         if let Some(slice) = src
             .time_series
-            .get_range(Timestamp(self.cursor)..Timestamp(pass_end))
+            .get_range(Timestamp(*cursor)..Timestamp(pass_end))
         {
             // Newest-first node order, reversed so buckets emit in time
             // order; nearest-match boundaries can hand back samples just
             // outside the window, so every sample is range-checked.
-            let node_slices: Vec<_> = slice.as_iter().collect();
+            node_slices.clear();
+            node_slices.extend(slice.as_iter());
             for node_slice in node_slices.iter().rev() {
                 let timestamps = node_slice.timestamps();
                 let data = node_slice.data();
                 for (i, ts) in timestamps.iter().enumerate() {
-                    if ts.0 < self.cursor || ts.0 >= pass_end {
+                    if ts.0 < *cursor || ts.0 >= pass_end {
                         continue;
                     }
                     let bucket = ts.0.div_euclid(d) * d;
                     if bucket != bucket_start {
                         if bucket_start != i64::MIN {
-                            Self::fold_bucket(d, bucket_start, &mins, &maxs, &holes, &mut emitted);
+                            Self::fold_bucket(
+                                d,
+                                bucket_start,
+                                mins,
+                                maxs,
+                                holes,
+                                emit_buf,
+                                emit_index,
+                            );
                         }
                         bucket_start = bucket;
                         mins.fill(f64::INFINITY);
@@ -446,7 +513,7 @@ impl Level {
                 }
             }
             if bucket_start != i64::MIN {
-                Self::fold_bucket(d, bucket_start, &mins, &maxs, &holes, &mut emitted);
+                Self::fold_bucket(d, bucket_start, mins, maxs, holes, emit_buf, emit_index);
             }
         }
 
@@ -457,24 +524,31 @@ impl Level {
         if src.time_series.manifest().generation != gen_before {
             return Ok(true);
         }
-        for (ts, buf) in emitted {
-            self.writer.push_buf(ts, &buf)?;
+        let mut offset = 0usize;
+        for (ts, len) in emit_index.iter() {
+            let len = *len as usize;
+            writer.push_buf(*ts, &emit_buf[offset..offset + len])?;
+            offset += len;
         }
-        self.cursor = pass_end;
+        *cursor = pass_end;
         Ok(pass_end < emit_end)
     }
 
-    /// Fold one bucket into `emitted` as a sample at the bucket's midpoint.
-    /// Elements with no finite sample store `(NaN, NaN)` so renderers keep
-    /// treating holes as holes; buckets over non-resident raw history are
-    /// dropped entirely (nothing local to summarize).
+    /// Fold one bucket into the emit arena as a sample at the bucket's
+    /// midpoint: the min/max f32 bytes are appended to `emit_buf` and the
+    /// midpoint timestamp plus byte length recorded in `emit_index`, so no
+    /// per-bucket `Vec` is allocated. Elements with no finite sample store
+    /// `(NaN, NaN)` so renderers keep treating holes as holes; buckets over
+    /// non-resident raw history are dropped entirely (nothing local to
+    /// summarize).
     fn fold_bucket(
         bucket_us: i64,
         bucket_start: i64,
         mins: &[f64],
         maxs: &[f64],
         holes: &[(i64, i64)],
-        emitted: &mut Vec<(Timestamp, Vec<u8>)>,
+        emit_buf: &mut Vec<u8>,
+        emit_index: &mut Vec<(Timestamp, u32)>,
     ) {
         let bucket_end = bucket_start + bucket_us;
         if holes
@@ -487,16 +561,17 @@ impl Level {
             );
             return;
         }
-        let mut buf = Vec::with_capacity((mins.len() + maxs.len()) * size_of::<f32>());
+        let start = emit_buf.len();
         for v in mins {
             let v = if v.is_finite() { *v as f32 } else { f32::NAN };
-            buf.extend_from_slice(&v.to_le_bytes());
+            emit_buf.extend_from_slice(&v.to_le_bytes());
         }
         for v in maxs {
             let v = if v.is_finite() { *v as f32 } else { f32::NAN };
-            buf.extend_from_slice(&v.to_le_bytes());
+            emit_buf.extend_from_slice(&v.to_le_bytes());
         }
-        emitted.push((Timestamp(bucket_start + bucket_us / 2), buf));
+        let len = (emit_buf.len() - start) as u32;
+        emit_index.push((Timestamp(bucket_start + bucket_us / 2), len));
     }
 }
 
@@ -577,14 +652,7 @@ mod tests {
             .first()
             .map(|s| s.seal.start_ts.0.div_euclid(bucket_us) * bucket_us)
             .unwrap_or(0);
-        (
-            lod,
-            Level {
-                writer,
-                bucket_us,
-                cursor,
-            },
-        )
+        (lod, Level::new(writer, bucket_us, cursor, &src.schema))
     }
 
     fn lod_samples(lod: &Component) -> Vec<(i64, Vec<f32>)> {
@@ -652,6 +720,46 @@ mod tests {
         };
         assert!(!resumed.run_pass(&src).unwrap());
         assert_eq!(lod_samples(&lod), first);
+    }
+
+    /// The passive LoD pass must not allocate once warm: a second pass over
+    /// the same window reuses the level's scratch buffers rather than growing
+    /// their capacity. (`run_pass` runs every `PASS_PAUSE` during backfill.)
+    #[stellarator::test]
+    async fn warm_pass_reuses_scratch_without_growth() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = sealed_source(dir.path(), 100, &vec![2.0f64; 50]);
+        let (_lod, mut level) = level_for(dir.path(), &src, 100);
+
+        // First pass warms capacity; it must actually populate the buffers.
+        let start_cursor = level.cursor;
+        assert!(!level.run_pass(&src).unwrap());
+        assert!(!level.emit_index.is_empty(), "pass emitted no buckets");
+        let caps = (
+            level.mins.capacity(),
+            level.maxs.capacity(),
+            level.holes.capacity(),
+            level.node_slices.capacity(),
+            level.emit_buf.capacity(),
+            level.emit_index.capacity(),
+        );
+
+        // Re-scan the identical window: clear()+extend() back to the same
+        // lengths must not reallocate any buffer.
+        level.cursor = start_cursor;
+        assert!(!level.run_pass(&src).unwrap());
+        assert_eq!(
+            caps,
+            (
+                level.mins.capacity(),
+                level.maxs.capacity(),
+                level.holes.capacity(),
+                level.node_slices.capacity(),
+                level.emit_buf.capacity(),
+                level.emit_index.capacity(),
+            ),
+            "warm pass grew scratch capacity"
+        );
     }
 
     #[stellarator::test]

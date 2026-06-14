@@ -28,7 +28,11 @@ use crate::{
 #[derive(Clone)]
 pub struct TimeSeries {
     pub list: Arc<AtomicStack<TimeSeriesNode>>,
-    path: PathBuf,
+    /// `Arc<Path>` rather than `PathBuf` so cloning a [`TimeSeries`] (and the
+    /// [`Component`](crate::Component) wrapping it) is pure refcount bumps —
+    /// the passive tiering task clones every component each cycle and must not
+    /// allocate.
+    path: Arc<Path>,
     data_waker: Arc<WaitQueue>,
     has_writer: Arc<AtomicBool>,
     /// Sealed-span bookkeeping; see [`ManifestCell`]. The live head node
@@ -335,7 +339,7 @@ impl TimeSeries {
     pub fn create(path: impl AsRef<Path>) -> Result<Self, Error> {
         Ok(Self {
             list: Arc::new(AtomicStack::new()),
-            path: path.as_ref().to_path_buf(),
+            path: Arc::from(path.as_ref()),
             data_waker: Arc::new(WaitQueue::new()),
             has_writer: Arc::new(AtomicBool::new(false)),
             manifest: Arc::new(ManifestCell::default()),
@@ -367,7 +371,7 @@ impl TimeSeries {
         let manifest = reconcile_manifest(path, &list);
         Ok(Self {
             list,
-            path: path.to_path_buf(),
+            path: Arc::from(path),
             data_waker: Arc::new(WaitQueue::new()),
             has_writer: Arc::new(AtomicBool::new(false)),
             manifest: Arc::new(ManifestCell::new(manifest)),

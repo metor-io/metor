@@ -49,28 +49,47 @@ pub fn spawn(db: Arc<DB>, store: Option<Arc<dyn NodeStore>>, config: TieringConf
 }
 
 pub async fn run(db: Arc<DB>, store: Option<Arc<dyn NodeStore>>, config: TieringConfig) {
+    let mut scratch = TieringScratch::default();
     loop {
-        if let Err(err) = tier_once(&db, store.as_deref(), &config, Timestamp::now()).await {
+        if let Err(err) =
+            tier_once(&db, store.as_deref(), &config, Timestamp::now(), &mut scratch).await
+        {
             warn!(?err, "tiering pass failed");
         }
         stellarator::sleep(config.check_interval).await;
     }
 }
 
-/// One evictable sealed span, with everything needed to offload it.
-struct Victim<'a> {
+/// Per-pass scratch owned by the [`run`] task so a cycle reuses these
+/// buffers instead of allocating. Cloning a [`Component`] into `components`
+/// (and into each [`Victim`]) is pure `Arc` refcount bumps — see the
+/// `Arc<Path>` note on [`TimeSeries`](crate::time_series_2::TimeSeries) — so
+/// the whole passive pass is allocation-free once capacity is warm.
+#[derive(Default)]
+pub struct TieringScratch {
+    components: Vec<(ComponentId, Component)>,
+    frontiers: HashMap<ComponentId, i64>,
+    victims: Vec<Victim>,
+}
+
+/// One evictable sealed span, with everything needed to offload it. Owns its
+/// [`Component`] (an `Arc` bundle) so it can live in the reused `victims`
+/// buffer without borrowing the `components` list.
+struct Victim {
     component_id: ComponentId,
-    name: &'a str,
-    component: &'a Component,
+    component: Component,
     start_ts: Timestamp,
     end_ts: Timestamp,
     bytes: u64,
     acked: bool,
     /// Hydrated from a store — purging is free, no upload needed.
     cache_copy: bool,
+    /// Set once the age pass purges this span, so the budget pass skips it
+    /// without a second survivor buffer.
+    evicted: bool,
 }
 
-impl Victim<'_> {
+impl Victim {
     /// Budget-pass priority: free cache evictions, then spans a store
     /// already acked, then spans that still need an upload.
     fn class(&self) -> u8 {
@@ -90,56 +109,60 @@ pub async fn tier_once(
     store: Option<&dyn NodeStore>,
     config: &TieringConfig,
     now: Timestamp,
+    scratch: &mut TieringScratch,
 ) -> Result<(), Error> {
     if config.max_age.is_none() && config.max_db_bytes.is_none() {
         return Ok(());
     }
-    let components: Vec<(ComponentId, String, Component)> = db.with_state(|state| {
-        state
+    // Snapshot the live component set into the reused buffer. The name is no
+    // longer captured here — only the rare offload path needs it, so it is
+    // looked up in `evict` instead of allocated for every component.
+    scratch.components.clear();
+    db.with_state(|state| {
+        scratch
             .components
-            .iter()
-            .map(|(id, component)| {
-                let name = state
-                    .get_component_metadata(*id)
-                    .map(|m| m.name.clone())
-                    .unwrap_or_else(|| id.to_string());
-                (*id, name, component.clone())
-            })
-            .collect()
+            .extend(state.components.iter().map(|(id, component)| (*id, component.clone())));
     });
     let min_resident_cutoff =
         Timestamp(now.0.saturating_sub(config.min_resident.as_micros() as i64));
     // The LoD frontier per source: raw spans newer than this still feed an
     // un-folded bucket, so they are not cold whatever their age. Sources
     // with no levels are absent and keep the age/budget-only behavior.
-    let frontiers: HashMap<ComponentId, i64> = components
-        .iter()
-        .filter_map(|(id, _, _)| lod::summarized_frontier(db, *id).map(|f| (*id, f)))
-        .collect();
-    let (mut victims, mut resident_bytes) =
-        collect_victims(&components, min_resident_cutoff, &frontiers);
+    scratch.frontiers.clear();
+    for (id, _) in &scratch.components {
+        if let Some(f) = lod::summarized_frontier(db, *id) {
+            scratch.frontiers.insert(*id, f);
+        }
+    }
+    scratch.victims.clear();
+    let mut resident_bytes = collect_victims(
+        &scratch.components,
+        min_resident_cutoff,
+        &scratch.frontiers,
+        &mut scratch.victims,
+    );
 
     if let Some(max_age) = config.max_age {
         let cutoff = Timestamp(now.0.saturating_sub(max_age.as_micros() as i64));
-        victims.sort_unstable_by_key(|v| v.end_ts.0);
-        let mut remaining = Vec::with_capacity(victims.len());
-        for victim in victims {
-            if victim.end_ts.0 < cutoff.0 && try_evict(&victim, store).await {
+        scratch.victims.sort_unstable_by_key(|v| v.end_ts.0);
+        for victim in scratch.victims.iter_mut() {
+            if victim.end_ts.0 < cutoff.0 && try_evict(db, victim, store).await {
                 resident_bytes = resident_bytes.saturating_sub(victim.bytes);
-                continue;
+                victim.evicted = true;
             }
-            remaining.push(victim);
         }
-        victims = remaining;
     }
 
     if let Some(budget) = config.max_db_bytes {
-        victims.sort_unstable_by_key(|v| (v.class(), v.end_ts.0));
-        for victim in &victims {
+        scratch.victims.sort_unstable_by_key(|v| (v.class(), v.end_ts.0));
+        for victim in scratch.victims.iter() {
+            if victim.evicted {
+                continue;
+            }
             if resident_bytes <= budget {
                 break;
             }
-            if try_evict(victim, store).await {
+            if try_evict(db, victim, store).await {
                 resident_bytes = resident_bytes.saturating_sub(victim.bytes);
             }
         }
@@ -157,14 +180,14 @@ pub async fn tier_once(
 /// total resident sealed bytes (including spans too fresh to evict). The
 /// live head is unsealed and never appears in manifests, so it is
 /// implicitly protected.
-fn collect_victims<'a>(
-    components: &'a [(ComponentId, String, Component)],
+fn collect_victims(
+    components: &[(ComponentId, Component)],
     min_resident_cutoff: Timestamp,
     frontiers: &HashMap<ComponentId, i64>,
-) -> (Vec<Victim<'a>>, u64) {
-    let mut victims = Vec::new();
+    victims: &mut Vec<Victim>,
+) -> u64 {
     let mut resident_bytes = 0u64;
-    for (component_id, name, component) in components {
+    for (component_id, component) in components {
         let manifest = component.time_series.manifest();
         let frontier = frontiers.get(component_id).copied();
         for span in manifest
@@ -184,29 +207,29 @@ fn collect_victims<'a>(
             }
             victims.push(Victim {
                 component_id: *component_id,
-                name,
-                component,
+                component: component.clone(),
                 start_ts: span.seal.start_ts,
                 end_ts: span.seal.end_ts,
                 bytes: span.bytes(),
                 acked: span.acked,
                 cache_copy: span.source == SpanSource::RemoteFetch,
+                evicted: false,
             });
         }
     }
-    (victims, resident_bytes)
+    resident_bytes
 }
 
 /// [`evict`], but a failure only costs this victim: a down store must not
 /// block the rest of the pass, including free evictions that need no
 /// store contact at all.
-async fn try_evict(victim: &Victim<'_>, store: Option<&dyn NodeStore>) -> bool {
-    match evict(victim, store).await {
+async fn try_evict(db: &Arc<DB>, victim: &Victim, store: Option<&dyn NodeStore>) -> bool {
+    match evict(db, victim, store).await {
         Ok(purged) => purged,
         Err(err) => {
             warn!(
                 ?err,
-                component = %victim.name,
+                component_id = victim.component_id.0,
                 start_ts = victim.start_ts.0,
                 "failed to evict span"
             );
@@ -217,23 +240,31 @@ async fn try_evict(victim: &Victim<'_>, store: Option<&dyn NodeStore>) -> bool {
 
 /// Offload (when needed and possible) then purge. `Ok(false)` means the
 /// span stayed resident — typically the sole copy with no store to send
-/// it to, which is never an excuse to drop data.
-async fn evict(victim: &Victim<'_>, store: Option<&dyn NodeStore>) -> Result<bool, Error> {
+/// it to, which is never an excuse to drop data. The component name (needed
+/// only for the offload object key) is looked up here rather than carried on
+/// every [`Victim`], keeping the passive collection pass allocation-free.
+async fn evict(db: &Arc<DB>, victim: &Victim, store: Option<&dyn NodeStore>) -> Result<bool, Error> {
     if !victim.acked {
         let Some(store) = store else {
             warn!(
-                component = %victim.name,
+                component_id = victim.component_id.0,
                 start_ts = victim.start_ts.0,
                 "span is past its retention policy but holds the only copy; not purging"
             );
             return Ok(false);
         };
+        let name = db
+            .with_state(|s| {
+                s.get_component_metadata(victim.component_id)
+                    .map(|m| m.name.clone())
+            })
+            .unwrap_or_else(|| victim.component_id.to_string());
         let schema = victim.component.schema.to_schema();
         offload_span(
             &victim.component.time_series,
             store,
             victim.component_id,
-            victim.name,
+            &name,
             &schema,
             victim.start_ts,
         )
@@ -324,7 +355,7 @@ mod tests {
         };
         // now=1000: the sealed spans end at 103 and 203, both past
         // max_age. 300 is the unsealed live head — never a candidate.
-        tier_once(&db, Some(&store), &config, Timestamp(1000))
+        tier_once(&db, Some(&store), &config, Timestamp(1000), &mut TieringScratch::default())
             .await
             .unwrap();
         assert_eq!(resident_starts(&db), Vec::<i64>::new());
@@ -358,7 +389,7 @@ mod tests {
             min_resident: Duration::ZERO,
             ..Default::default()
         };
-        tier_once(&db, Some(&store), &config, Timestamp(1000))
+        tier_once(&db, Some(&store), &config, Timestamp(1000), &mut TieringScratch::default())
             .await
             .unwrap();
         assert_eq!(resident_starts(&db), vec![200]);
@@ -374,7 +405,9 @@ mod tests {
             min_resident: Duration::ZERO,
             ..Default::default()
         };
-        tier_once(&db, None, &config, Timestamp(1000)).await.unwrap();
+        tier_once(&db, None, &config, Timestamp(1000), &mut TieringScratch::default())
+            .await
+            .unwrap();
         // The policies wanted everything gone, but the sealed span has no
         // store copy and there is no store to make one.
         assert_eq!(resident_starts(&db), vec![100]);
@@ -391,9 +424,51 @@ mod tests {
             ..Default::default()
         };
         // Everything is newer than now - min_resident; nothing may move.
-        tier_once(&db, Some(&store), &config, Timestamp(1000))
+        tier_once(&db, Some(&store), &config, Timestamp(1000), &mut TieringScratch::default())
             .await
             .unwrap();
         assert_eq!(resident_starts(&db), vec![100]);
+    }
+
+    /// The passive tiering cycle must not allocate once warm: with the DB
+    /// state unchanged between cycles (nothing evictable), reusing one
+    /// `TieringScratch` must not grow any buffer's capacity on the second
+    /// cycle.
+    #[stellarator::test]
+    async fn warm_cycle_reuses_scratch_without_growth() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = build_db(&dir.path().join("db"), &[100, 200]);
+        let store = LocalDirStore::new(dir.path().join("store"));
+        // min_resident protects every span, so no state changes between
+        // cycles and the two passes do identical work.
+        let config = TieringConfig {
+            max_db_bytes: Some(0),
+            min_resident: Duration::from_micros(2000),
+            ..Default::default()
+        };
+        let mut scratch = TieringScratch::default();
+
+        tier_once(&db, Some(&store), &config, Timestamp(1000), &mut scratch)
+            .await
+            .unwrap();
+        assert!(!scratch.components.is_empty(), "cycle saw no components");
+        let caps = (
+            scratch.components.capacity(),
+            scratch.frontiers.capacity(),
+            scratch.victims.capacity(),
+        );
+
+        tier_once(&db, Some(&store), &config, Timestamp(1000), &mut scratch)
+            .await
+            .unwrap();
+        assert_eq!(
+            caps,
+            (
+                scratch.components.capacity(),
+                scratch.frontiers.capacity(),
+                scratch.victims.capacity(),
+            ),
+            "warm cycle grew scratch capacity"
+        );
     }
 }
