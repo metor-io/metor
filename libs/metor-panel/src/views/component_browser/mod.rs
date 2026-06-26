@@ -1,5 +1,7 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
+use std::ops::Range;
 use std::sync::Arc;
+use std::time::Duration;
 
 use gpui::{
     AnyElement, App, Context, Entity, EventEmitter, IntoElement, MouseButton, Pixels, Point,
@@ -12,6 +14,7 @@ use smallvec::{SmallVec, smallvec};
 pub mod component_tree;
 
 use super::column_browser::{ColumnBrowser, ColumnBrowserDelegate};
+use super::lazy_pool::VisibleEntityCache;
 use super::monitor::{behavior_snapshot, edit_click};
 use super::time_series::Override;
 use super::value_strip::{ComponentValueStrip, StripBehavior, StripClick, StripStyle};
@@ -35,13 +38,6 @@ pub enum BrowserEvent {
 }
 
 impl EventEmitter<BrowserEvent> for ColumnBrowser<ComponentBrowserDelegate> {}
-
-/// Cached live preview for a component in the detail column.
-struct ComponentPreview {
-    component_id: ComponentId,
-    full_name: SharedString,
-    strip: Entity<ComponentValueStrip>,
-}
 
 /// User-defined view into the namespace.
 ///
@@ -121,7 +117,11 @@ pub struct ComponentBrowserDelegate {
     tree: Arc<ComponentNode>,
     selection: Selection,
     filters: Vec<FilterEntry>,
-    previews: BTreeMap<SharedString, ComponentPreview>,
+    /// Flat, name-sorted list of every component under the current detail
+    /// target. Cheap to rebuild on selection change; live strips are
+    /// materialized lazily for the visible range via `strip_cache`.
+    detail_components: Vec<(ComponentId, SharedString)>,
+    strip_cache: VisibleEntityCache<ComponentValueStrip>,
     detail_scroll_handle: UniformListScrollHandle,
     custom_title: Override<SharedString>,
     /// Re-root path waiting for the watcher to publish a tree it can
@@ -145,13 +145,18 @@ impl ComponentBrowserDelegate {
                     if let Some(segs) = delegate.pending_root_path.clone() {
                         delegate.set_root_path(&segs, cx);
                     }
-                    delegate.reconcile_previews(cx);
+                    delegate.rebuild_detail_list(cx);
                     cx.notify();
                 });
                 if result.is_err() {
                     break;
                 }
                 db.vtable_gen.wait().await;
+                // vtable_gen bumps once per registered component, so a startup
+                // burst would rebuild the whole tree N times. Debounce so a
+                // burst collapses into one rebuild (build_tree reads the latest
+                // full state regardless).
+                cx.background_executor().timer(VTABLE_DEBOUNCE).await;
             }
         })
     }
@@ -251,7 +256,7 @@ impl ComponentBrowserDelegate {
             regex,
             synth,
         });
-        self.reconcile_previews(cx);
+        self.rebuild_detail_list(cx);
         cx.notify();
         Ok(())
     }
@@ -263,7 +268,7 @@ impl ComponentBrowserDelegate {
             if matches!(&self.selection.root, SelectionRoot::Filter(l) if l == label) {
                 self.selection = Selection::empty();
             }
-            self.reconcile_previews(cx);
+            self.rebuild_detail_list(cx);
             cx.notify();
         }
     }
@@ -403,53 +408,25 @@ impl ComponentBrowserDelegate {
             .unwrap_or_else(|| self.real_root())
     }
 
-    /// Align `previews` with the components currently under the detail
-    /// target: start streams for new entries, drop ones that fell out,
-    /// leave shared entries untouched so existing tasks keep running.
-    fn reconcile_previews(&mut self, cx: &mut Context<ComponentBrowser>) {
+    /// Rebuild the flat list of components under the current detail target.
+    ///
+    /// Only collects ids and names — no entities or streams. The detail view
+    /// materializes a `ComponentValueStrip` lazily for each *visible* row, so
+    /// selecting a node with thousands of descendants (e.g. the root) is cheap
+    /// and revisiting a node reuses its cached, still-live strip.
+    fn rebuild_detail_list(&mut self, cx: &mut Context<ComponentBrowser>) {
         let target = self.detail_target();
-        let mut target_nodes: Vec<Arc<ComponentNode>> = Vec::new();
-        collect_component_nodes(&target, &mut target_nodes);
-
-        let desired: BTreeSet<SharedString> =
-            target_nodes.iter().map(|n| n.full_name.clone()).collect();
-        self.previews.retain(|name, _| desired.contains(name));
-
-        for node in target_nodes {
-            if self.previews.contains_key(&node.full_name) {
-                continue;
-            }
-            let Some(id) = node.component_id else {
-                continue;
-            };
-            let full_name = node.full_name.clone();
-            let click = edit_click(self.db.clone(), id, full_name.clone());
-            let right_click = right_click_plot(self.db.clone(), id);
-            let strip = {
-                let db = self.db.clone();
-                cx.new(|cx| {
-                    ComponentValueStrip::new(
-                        db,
-                        id,
-                        StripStyle::boxes(),
-                        StripBehavior {
-                            on_element_click: Some(click),
-                            on_element_right_click: Some(right_click),
-                            ..Default::default()
-                        },
-                        cx,
-                    )
-                })
-            };
-            self.previews.insert(
-                full_name.clone(),
-                ComponentPreview {
-                    component_id: id,
-                    full_name,
-                    strip,
-                },
-            );
-        }
+        let mut nodes: Vec<Arc<ComponentNode>> = Vec::new();
+        collect_component_nodes(&target, &mut nodes);
+        let mut components: Vec<(ComponentId, SharedString)> = nodes
+            .into_iter()
+            .filter_map(|n| n.component_id.map(|id| (id, n.full_name.clone())))
+            .collect();
+        // Match the prior name-sorted display order (`previews` was keyed by
+        // full name); DFS order is otherwise close but not identical.
+        components.sort_by(|a, b| a.1.cmp(&b.1));
+        self.detail_components = components;
+        cx.notify();
     }
 
     /// Effective title for the host panel. Custom override wins; otherwise
@@ -519,7 +496,7 @@ impl ComponentBrowserDelegate {
         }
         self.selection.root_override = Some(segments);
         self.pending_root_path = None;
-        self.reconcile_previews(cx);
+        self.rebuild_detail_list(cx);
         cx.notify();
     }
 
@@ -665,7 +642,7 @@ impl ColumnBrowserDelegate for ComponentBrowserDelegate {
             };
             self.selection.path.clear();
             self.selection.path.push(item.segment.clone());
-            self.reconcile_previews(cx);
+            self.rebuild_detail_list(cx);
             return;
         }
 
@@ -678,7 +655,7 @@ impl ColumnBrowserDelegate for ComponentBrowserDelegate {
         };
         self.selection.path.truncate(keep);
         self.selection.path.push(item.segment.clone());
-        self.reconcile_previews(cx);
+        self.rebuild_detail_list(cx);
     }
 
     fn set_root_override(
@@ -719,7 +696,7 @@ impl ColumnBrowserDelegate for ComponentBrowserDelegate {
         self.selection.root_override = Some(segments);
         // User-driven reroot supersedes any restore-from-config still in flight.
         self.pending_root_path = None;
-        self.reconcile_previews(cx);
+        self.rebuild_detail_list(cx);
     }
 
     fn clear_root_override(&mut self, cx: &mut Context<ComponentBrowser>) {
@@ -728,7 +705,7 @@ impl ColumnBrowserDelegate for ComponentBrowserDelegate {
         self.pending_root_path = None;
         if self.selection.root_override.is_some() {
             self.selection.root_override = None;
-            self.reconcile_previews(cx);
+            self.rebuild_detail_list(cx);
         }
     }
 
@@ -740,7 +717,7 @@ impl ColumnBrowserDelegate for ComponentBrowserDelegate {
     ) -> Option<AnyElement> {
         let theme = theme(cx);
 
-        if self.previews.is_empty() {
+        if self.detail_components.is_empty() {
             return Some(
                 div()
                     .p(px(8.0))
@@ -751,44 +728,58 @@ impl ColumnBrowserDelegate for ComponentBrowserDelegate {
             );
         }
 
-        // Push the latest pending-edit snapshot into each strip before
-        // the list repaints. Click/right-click callbacks are cheap Arc
-        // captures (`db.clone()` + id) so rebuilding them per frame
-        // avoids caching state that would otherwise need invalidation.
-        let updates: Vec<(Entity<ComponentValueStrip>, StripBehavior)> = self
-            .previews
-            .values()
-            .map(|p| {
-                let click = edit_click(self.db.clone(), p.component_id, p.full_name.clone());
-                let right_click = right_click_plot(self.db.clone(), p.component_id);
-                let mut behavior = behavior_snapshot(cx, self.db.clone(), p.component_id, click);
-                behavior.on_element_right_click = Some(right_click);
-                (p.strip.clone(), behavior)
-            })
-            .collect();
-        for (strip, behavior) in updates {
-            strip.update(cx, |s, cx| s.set_behavior(behavior, cx));
-        }
-
-        let preview_data: Vec<PreviewRow> = self
-            .previews
-            .values()
-            .map(|p| PreviewRow {
-                component_id: p.component_id,
-                full_name: p.full_name.clone(),
-                strip: p.strip.clone(),
-                db: self.db.clone(),
-            })
-            .collect();
-        let count = preview_data.len();
+        let count = self.detail_components.len();
         let scroll_handle = self.detail_scroll_handle.clone();
 
-        let list_view = uniform_list("component-detail-list", count, move |range, _window, cx| {
-            let theme = crate::theme::theme(cx);
-            range
-                .map(|ix| render_preview_entry(&preview_data[ix], &theme))
-                .collect()
-        })
+        // Materialize a live strip only for the visible range. The cache keeps
+        // strips alive across renders and selection changes, so scrolling and
+        // revisiting a node reuse existing tasks instead of re-subscribing.
+        let list_view = uniform_list(
+            "component-detail-list",
+            count,
+            cx.processor(
+                move |this: &mut ComponentBrowser,
+                      range: Range<usize>,
+                      _window: &mut Window,
+                      cx: &mut Context<ComponentBrowser>| {
+                    let theme = crate::theme::theme(cx);
+                    let delegate = this.delegate_mut();
+                    let db = delegate.db.clone();
+                    let mut items = Vec::with_capacity(range.len());
+                    for ix in range {
+                        let (id, full_name) = delegate.detail_components[ix].clone();
+                        let strip = delegate.strip_cache.get_or_create(id, || {
+                            let db = db.clone();
+                            cx.new(|cx| {
+                                ComponentValueStrip::new(
+                                    db,
+                                    id,
+                                    StripStyle::boxes(),
+                                    StripBehavior::default(),
+                                    cx,
+                                )
+                            })
+                        });
+                        // Refresh the pending-edit snapshot each frame; click
+                        // callbacks are cheap Arc captures (`db.clone()` + id).
+                        let click = edit_click(db.clone(), id, full_name.clone());
+                        let right_click = right_click_plot(db.clone(), id);
+                        let mut behavior = behavior_snapshot(cx, db.clone(), id, click);
+                        behavior.on_element_right_click = Some(right_click);
+                        strip.update(cx, |s, cx| s.set_behavior(behavior, cx));
+                        let row = PreviewRow {
+                            component_id: id,
+                            full_name,
+                            strip,
+                            db: db.clone(),
+                        };
+                        items.push(render_preview_entry(&row, &theme));
+                    }
+                    delegate.strip_cache.prune();
+                    items
+                },
+            ),
+        )
         .track_scroll(scroll_handle)
         .h_full();
 
@@ -868,7 +859,7 @@ impl ColumnBrowserDelegate for ComponentBrowserDelegate {
             changed = true;
         }
         if changed {
-            self.reconcile_previews(cx);
+            self.rebuild_detail_list(cx);
         }
     }
 
@@ -912,7 +903,8 @@ pub fn new_component_browser(db: Arc<DB>, cx: &mut Context<ComponentBrowser>) ->
         }),
         selection: Selection::empty(),
         filters: Vec::new(),
-        previews: BTreeMap::new(),
+        detail_components: Vec::new(),
+        strip_cache: VisibleEntityCache::new(DETAIL_STRIP_CACHE_CAP),
         detail_scroll_handle: UniformListScrollHandle::new(),
         custom_title: Override::Auto,
         pending_root_path: None,
@@ -995,6 +987,14 @@ fn prune_to_matches(node: &Arc<ComponentNode>, regex: &regex::Regex) -> Option<A
 }
 
 const PREVIEW_ROW_HEIGHT: f32 = 56.0;
+
+/// Live strips kept alive in the detail column. Well above any plausible
+/// visible-row count so scrolling and short navigations reuse strips, while
+/// still bounding how many stream tasks/WAL readers exist at once.
+const DETAIL_STRIP_CACHE_CAP: usize = 256;
+
+/// Window for coalescing a burst of vtable-generation bumps into one rebuild.
+const VTABLE_DEBOUNCE: Duration = Duration::from_millis(50);
 
 struct PreviewRow {
     component_id: ComponentId,

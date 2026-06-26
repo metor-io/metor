@@ -236,6 +236,25 @@ impl ComponentValueStrip {
                     this.enum_variants = enum_variants.clone();
                     cx.notify();
                 });
+                // A fresh WAL reader only sees samples committed from now on,
+                // so paint the last committed value immediately instead of
+                // leaving the strip blank until the next sample arrives.
+                let seed = db.with_state(|state| {
+                    let component = state.get_component(component_id)?;
+                    let latest = component.time_series.latest()?;
+                    let (_size, view) = component.schema.parse_value(latest.data()).ok()?;
+                    let raw: Vec<ElementValue> = view.iter().collect();
+                    let cells =
+                        format_cells(&view, &element_names, enum_variants.as_deref(), is_string);
+                    Some((cells, raw))
+                });
+                if let Some((cells, raw_values)) = seed {
+                    let _ = this.update(cx, |this, cx| {
+                        this.cells = cells;
+                        this.raw_values = raw_values;
+                        cx.notify();
+                    });
+                }
                 loop {
                     let (cells, raw_values) = {
                         let view = stream.next().await;

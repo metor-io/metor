@@ -102,6 +102,10 @@ pub trait TableDelegate: Sized + 'static {
         cx: &mut Context<Table<Self>>,
     ) -> AnyElement;
     fn sort_column(&mut self, col_ix: usize, sort: ColumnSort, cx: &App);
+    /// Called once after the visible row range has been painted each frame.
+    /// Delegates that materialize rows lazily use it to release entities that
+    /// scrolled out of view.
+    fn frame_rendered(&mut self) {}
 }
 
 struct ColState {
@@ -391,6 +395,7 @@ impl<D: TableDelegate> Render for Table<D> {
 
                         items.push(row.into_any_element());
                     }
+                    this.delegate.frame_rendered();
                     items
                 },
             ),

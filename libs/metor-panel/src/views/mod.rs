@@ -6,6 +6,7 @@ pub mod component_text;
 pub mod dashboard;
 pub mod data_table;
 pub mod format;
+pub mod lazy_pool;
 pub mod list_plot;
 pub mod monitor;
 pub mod plot_common;
