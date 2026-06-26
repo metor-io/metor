@@ -379,16 +379,38 @@ mod tests {
         assert_eq!(contents(&stack), vec![3, 1, 0]);
     }
 
+    /// Pushes a long chain and drops it, exercising `PrevLink`'s *iterative*
+    /// teardown (a naive recursive drop would overflow the stack on long
+    /// chains). Miri's leak check confirms every node is freed exactly once.
+    #[test]
+    fn deep_chain_teardown_sync() {
+        let len = if cfg!(miri) { 200 } else { 100_000 };
+        let stack = AtomicStack::new();
+        for i in 0..len {
+            stack.push(i);
+        }
+        assert_eq!(stack.iter().count(), len as usize);
+        drop(stack);
+    }
+
     #[test]
     fn concurrent_readers_writer_and_splices() {
         use std::sync::atomic::{AtomicBool, Ordering};
+
+        // Miri is ~50-100x slower, so shrink the workload there while keeping
+        // full coverage of the same code paths.
+        let initial = if cfg!(miri) { 16 } else { 32 };
+        let reader_threads = if cfg!(miri) { 2 } else { 4 };
+        let writer_limit = if cfg!(miri) { 1_200 } else { 21_000 };
+        let splices = if cfg!(miri) { 40 } else { 500 };
+
         let stack = Arc::new(AtomicStack::new());
-        for i in 0..32 {
+        for i in 0..initial {
             stack.push(i);
         }
         let stop = Arc::new(AtomicBool::new(false));
 
-        let readers: Vec<_> = (0..4)
+        let readers: Vec<_> = (0..reader_threads)
             .map(|_| {
                 let stack = stack.clone();
                 let stop = stop.clone();
@@ -409,7 +431,7 @@ mod tests {
             let stop = stop.clone();
             std::thread::spawn(move || {
                 let mut next = 1000;
-                while !stop.load(Ordering::Relaxed) && next < 21_000 {
+                while !stop.load(Ordering::Relaxed) && next < writer_limit {
                     stack.push(next);
                     next += 1;
                 }
@@ -419,7 +441,7 @@ mod tests {
         // Splice loop: repeatedly unlink the oldest node and re-insert a
         // replacement above the new oldest, exercising rebuilds while
         // readers and the writer run.
-        for _ in 0..500 {
+        for _ in 0..splices {
             let Some(oldest) = stack.iter().last() else {
                 continue;
             };
