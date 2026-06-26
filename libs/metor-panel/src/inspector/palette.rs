@@ -235,22 +235,23 @@ fn register_command_provider(
     let provider: ItemProvider = Arc::new(move |cx: &App| {
         let mut items: Vec<InspectionItem> = Vec::new();
 
-        // New Panel targets the first pane so palette-created panels always
-        // land somewhere visible, even when multiple panes are open.
-        let pane = tiles.read(cx).panes()[0].clone();
-        let new_db = db.clone();
-        let new_open = on_open_inspector.clone();
-        items.push(InspectionItem::SubMenu {
-            label: "New Panel".into(),
-            summary: SharedString::new_static(""),
-            build: Arc::new(move |_cx| {
-                crate::tiles::panels::new_panel_rows(
-                    new_db.clone(),
-                    pane.clone(),
-                    Some(new_open.clone()),
-                )
-            }),
-        });
+        // New Panel targets the current pane so palette-created panels land in
+        // the tile the user last interacted with (falling back to the first).
+        if let Some(pane) = tiles.read(cx).active_pane(cx) {
+            let new_db = db.clone();
+            let new_open = on_open_inspector.clone();
+            items.push(InspectionItem::SubMenu {
+                label: "New Panel".into(),
+                summary: SharedString::new_static(""),
+                build: Arc::new(move |_cx| {
+                    crate::tiles::panels::new_panel_rows(
+                        new_db.clone(),
+                        pane.clone(),
+                        Some(new_open.clone()),
+                    )
+                }),
+            });
+        }
 
         let update_db = db.clone();
         items.push(InspectionItem::SubMenu {
@@ -306,43 +307,13 @@ fn register_command_provider(
         items.push(InspectionItem::SubMenu {
             label: "Theme".into(),
             summary: SharedString::new_static(""),
-            build: Arc::new(|_cx| {
-                crate::theme::all_themes()
-                    .iter()
-                    .map(|t| {
-                        let theme = Arc::new((*t).clone());
-                        Box::new(CommandRow::new(
-                            t.name,
-                            Arc::new(move |_window, cx| {
-                                crate::theme::set_theme(cx, theme.clone());
-                            }),
-                        )) as Box<dyn InspectorRow>
-                    })
-                    .collect()
-            }),
+            build: Arc::new(|_cx| theme_rows()),
         });
 
         items.push(InspectionItem::SubMenu {
             label: "Font".into(),
             summary: SharedString::new_static("Pick the UI font"),
-            build: Arc::new(|cx| {
-                let mut rows: Vec<Box<dyn InspectorRow>> = Vec::new();
-                rows.push(Box::new(CommandRow::new(
-                    SharedString::new_static("Auto (Berkeley Mono, else bundled)"),
-                    Arc::new(move |_window, cx| {
-                        crate::theme::set_font(cx, FontConfig::Auto);
-                    }),
-                )));
-                for name in cx.text_system().all_font_names() {
-                    rows.push(Box::new(CommandRow::new(
-                        name.clone(),
-                        Arc::new(move |_window, cx| {
-                            crate::theme::set_font(cx, FontConfig::Family(name.clone()));
-                        }),
-                    )) as Box<dyn InspectorRow>);
-                }
-                rows
-            }),
+            build: Arc::new(font_rows),
         });
 
         items.push(InspectionItem::Command {
@@ -384,45 +355,7 @@ fn register_preset_provider(tiles: Entity<TileGroup>, cx: &mut App) {
         items.push(InspectionItem::SubMenu {
             label: SharedString::new_static("Save preset"),
             summary: SharedString::new_static("Type a name, or pick \"Save to file…\""),
-            build: Arc::new(move |_cx| {
-                let mut rows: Vec<Box<dyn InspectorRow>> = Vec::new();
-                let tiles_for_name = tiles_for_save.clone();
-                rows.push(Box::new(DefaultActionRow {
-                    label: SharedString::new_static("Type a name and press Enter"),
-                    callback: Arc::new(move |name, _window, cx| {
-                        let json = tiles_for_name.read(cx).to_json(cx);
-                        if let Err(e) = presets::save_preset(&name, &json) {
-                            eprintln!("save preset {name}: {e}");
-                        }
-                    }),
-                }));
-                let tiles_for_file = tiles_for_save.clone();
-                rows.push(Box::new(CommandRow::new(
-                    SharedString::new_static("Save to file…"),
-                    Arc::new(move |_window, cx| {
-                        let initial_dir = dirs::home_dir().unwrap_or_else(std::env::temp_dir);
-                        let receiver =
-                            cx.prompt_for_new_path(&initial_dir, Some("metor-layout.json"));
-                        let tiles = tiles_for_file.clone();
-                        // Snapshot the layout *after* the user confirms the path,
-                        // so any in-flight edits land in the saved file.
-                        cx.spawn(async move |cx| {
-                            let Ok(Ok(Some(path))) = receiver.await else {
-                                return;
-                            };
-                            let json = match cx.update(|cx| tiles.read(cx).to_json(cx)) {
-                                Ok(j) => j,
-                                Err(_) => return,
-                            };
-                            if let Err(e) = std::fs::write(&path, json) {
-                                eprintln!("save preset to {}: {e}", path.display());
-                            }
-                        })
-                        .detach();
-                    }),
-                )));
-                rows
-            }),
+            build: Arc::new(move |_cx| preset_save_rows(tiles_for_save.clone())),
         });
 
         // Load preset
@@ -430,44 +363,123 @@ fn register_preset_provider(tiles: Entity<TileGroup>, cx: &mut App) {
         items.push(InspectionItem::SubMenu {
             label: SharedString::new_static("Load preset"),
             summary: SharedString::new_static(""),
-            build: Arc::new(move |_cx| {
-                let mut rows: Vec<Box<dyn InspectorRow>> = Vec::new();
-                let entries = presets::list_presets();
-                for (name, path) in entries {
-                    let tiles = tiles_for_load.clone();
-                    rows.push(Box::new(CommandRow::new(
-                        SharedString::from(name),
-                        Arc::new(move |_window, cx| read_and_load(&path, &tiles, cx)),
-                    )));
-                }
-                let tiles_for_file = tiles_for_load.clone();
-                rows.push(Box::new(CommandRow::new(
-                    SharedString::new_static("Load from file…"),
-                    Arc::new(move |_window, cx| {
-                        let receiver = cx.prompt_for_paths(PathPromptOptions {
-                            files: true,
-                            directories: false,
-                            multiple: false,
-                            prompt: Some(SharedString::new_static("Open layout preset")),
-                        });
-                        let tiles = tiles_for_file.clone();
-                        cx.spawn(async move |cx| {
-                            let Ok(Ok(Some(paths))) = receiver.await else {
-                                return;
-                            };
-                            let Some(path) = paths.into_iter().next() else {
-                                return;
-                            };
-                            let _ = cx.update(|cx| read_and_load(&path, &tiles, cx));
-                        })
-                        .detach();
-                    }),
-                )));
-                rows
-            }),
+            build: Arc::new(move |_cx| preset_load_rows(tiles_for_load.clone())),
         });
 
         items
     });
     ItemRegistry::register(cx, Category::Custom("Preset".into()), provider);
+}
+
+/// Rows for the **Theme** submenu: one per registered theme, applied on select.
+/// Shared by the command palette and the transient chord menu.
+pub(crate) fn theme_rows() -> Vec<Box<dyn InspectorRow>> {
+    crate::theme::all_themes()
+        .iter()
+        .map(|t| {
+            let theme = Arc::new((*t).clone());
+            Box::new(CommandRow::new(
+                t.name,
+                Arc::new(move |_window, cx| {
+                    crate::theme::set_theme(cx, theme.clone());
+                }),
+            )) as Box<dyn InspectorRow>
+        })
+        .collect()
+}
+
+/// Rows for the **Font** submenu: an `Auto` entry plus every installed family.
+pub(crate) fn font_rows(cx: &App) -> Vec<Box<dyn InspectorRow>> {
+    let mut rows: Vec<Box<dyn InspectorRow>> = Vec::new();
+    rows.push(Box::new(CommandRow::new(
+        SharedString::new_static("Auto (Berkeley Mono, else bundled)"),
+        Arc::new(move |_window, cx| {
+            crate::theme::set_font(cx, FontConfig::Auto);
+        }),
+    )));
+    for name in cx.text_system().all_font_names() {
+        rows.push(Box::new(CommandRow::new(
+            name.clone(),
+            Arc::new(move |_window, cx| {
+                crate::theme::set_font(cx, FontConfig::Family(name.clone()));
+            }),
+        )) as Box<dyn InspectorRow>);
+    }
+    rows
+}
+
+/// Rows for the **Save preset** submenu: a name prompt plus a "Save to file…"
+/// OS dialog. Shared by the command palette and the transient chord menu.
+pub(crate) fn preset_save_rows(tiles: Entity<TileGroup>) -> Vec<Box<dyn InspectorRow>> {
+    let mut rows: Vec<Box<dyn InspectorRow>> = Vec::new();
+    let tiles_for_name = tiles.clone();
+    rows.push(Box::new(DefaultActionRow {
+        label: SharedString::new_static("Type a name and press Enter"),
+        callback: Arc::new(move |name, _window, cx| {
+            let json = tiles_for_name.read(cx).to_json(cx);
+            if let Err(e) = presets::save_preset(&name, &json) {
+                eprintln!("save preset {name}: {e}");
+            }
+        }),
+    }));
+    rows.push(Box::new(CommandRow::new(
+        SharedString::new_static("Save to file…"),
+        Arc::new(move |_window, cx| {
+            let initial_dir = dirs::home_dir().unwrap_or_else(std::env::temp_dir);
+            let receiver = cx.prompt_for_new_path(&initial_dir, Some("metor-layout.json"));
+            let tiles = tiles.clone();
+            // Snapshot the layout *after* the user confirms the path,
+            // so any in-flight edits land in the saved file.
+            cx.spawn(async move |cx| {
+                let Ok(Ok(Some(path))) = receiver.await else {
+                    return;
+                };
+                let json = match cx.update(|cx| tiles.read(cx).to_json(cx)) {
+                    Ok(j) => j,
+                    Err(_) => return,
+                };
+                if let Err(e) = std::fs::write(&path, json) {
+                    eprintln!("save preset to {}: {e}", path.display());
+                }
+            })
+            .detach();
+        }),
+    )));
+    rows
+}
+
+/// Rows for the **Load preset** submenu: the saved presets plus a "Load from
+/// file…" OS dialog. Shared by the command palette and the transient chord menu.
+pub(crate) fn preset_load_rows(tiles: Entity<TileGroup>) -> Vec<Box<dyn InspectorRow>> {
+    let mut rows: Vec<Box<dyn InspectorRow>> = Vec::new();
+    for (name, path) in presets::list_presets() {
+        let tiles = tiles.clone();
+        rows.push(Box::new(CommandRow::new(
+            SharedString::from(name),
+            Arc::new(move |_window, cx| read_and_load(&path, &tiles, cx)),
+        )));
+    }
+    rows.push(Box::new(CommandRow::new(
+        SharedString::new_static("Load from file…"),
+        Arc::new(move |_window, cx| {
+            let receiver = cx.prompt_for_paths(PathPromptOptions {
+                files: true,
+                directories: false,
+                multiple: false,
+                prompt: Some(SharedString::new_static("Open layout preset")),
+            });
+            let tiles = tiles.clone();
+            cx.spawn(async move |cx| {
+                let Ok(Ok(Some(paths))) = receiver.await else {
+                    return;
+                };
+                let Some(path) = paths.into_iter().next() else {
+                    return;
+                };
+                let _ = cx.update(|cx| read_and_load(&path, &tiles, cx));
+            })
+            .detach();
+        }),
+    )));
+    rows
 }

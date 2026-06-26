@@ -27,6 +27,7 @@ pub mod sequences;
 pub mod presets;
 pub mod theme;
 pub mod tiles;
+pub mod transient;
 pub mod views;
 
 pub use app::PanelApp;

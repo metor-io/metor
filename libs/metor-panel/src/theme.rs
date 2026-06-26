@@ -841,7 +841,9 @@ pub fn font_family(cx: &App) -> SharedString {
 /// choice survives a restart. The palette dismissal re-renders the root, which
 /// picks up the new family.
 pub fn set_font(cx: &mut App, font: FontConfig) {
-    let config = PanelConfig { font };
+    // Start from the live config so unrelated fields (e.g. `leader`) survive.
+    let mut config = cx.global::<FontSettings>().config.clone();
+    config.font = font;
     let family = resolve_font_family(cx, &config);
     if let Err(e) = config::save(&config) {
         eprintln!("save config: {e}");

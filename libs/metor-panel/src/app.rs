@@ -30,6 +30,7 @@ actions!(
     metor_panel,
     [
         OpenPalette,
+        OpenLeader,
         CycleTabForward,
         CycleTabBackward,
         ToggleCmdLock,
@@ -57,6 +58,9 @@ struct AppRoot {
     pending_inspector_request: Option<(Box<dyn crate::tiles::PaneItemHandle>, Point<Pixels>)>,
     pending_pane_inspector_request: Option<(Entity<crate::tiles::Pane>, Point<Pixels>)>,
     pending_inspector_open: Option<InspectorRequest>,
+    /// The transient chord menu, present only while open. Dropped (and focus
+    /// returned to the root) once it dismisses, mirroring `inspector`.
+    transient: Option<Entity<crate::transient::Transient>>,
     focus_handle: FocusHandle,
 }
 
@@ -95,6 +99,7 @@ impl AppRoot {
             pending_inspector_request: None,
             pending_pane_inspector_request: None,
             pending_inspector_open: None,
+            transient: None,
             focus_handle: cx.focus_handle(),
         }
     }
@@ -140,13 +145,40 @@ impl AppRoot {
         self.open_inspector_with(rows, InspectorMode::Centered, window, cx);
     }
 
+    /// Open the transient chord menu. The leader keybinding is suppressed while
+    /// a text field (Inspector search, node-editor inline edit) or the menu
+    /// itself holds focus, so this only fires from the app's normal focus.
+    fn open_leader(&mut self, _: &OpenLeader, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(on_open) = crate::inspector::open_inspector(cx) else {
+            return;
+        };
+        let leader: SharedString = cx
+            .global::<crate::theme::FontSettings>()
+            .config
+            .leader
+            .clone()
+            .into();
+        let nodes = crate::transient::menu::default_menu(self.db.clone(), self.tiles.clone(), on_open);
+        let parent_focus = self.focus_handle.clone();
+        let transient = cx.new(|cx| {
+            let mut t = crate::transient::Transient::new(leader, nodes, cx);
+            t.set_parent_focus(parent_focus);
+            t
+        });
+        transient.focus_handle(cx).focus(window);
+        self.transient = Some(transient);
+        cx.notify();
+    }
+
     fn cycle_tab_forward(
         &mut self,
         _: &CycleTabForward,
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let pane = self.tiles.read(cx).panes()[0].clone();
+        let Some(pane) = self.tiles.read(cx).active_pane(cx) else {
+            return;
+        };
         pane.update(cx, |pane, cx| pane.cycle_forward(cx));
     }
 
@@ -156,7 +188,9 @@ impl AppRoot {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let pane = self.tiles.read(cx).panes()[0].clone();
+        let Some(pane) = self.tiles.read(cx).active_pane(cx) else {
+            return;
+        };
         pane.update(cx, |pane, cx| pane.cycle_backward(cx));
     }
 
@@ -224,7 +258,7 @@ impl AppRoot {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let Some(pane) = self.tiles.read(cx).panes().first().cloned() else {
+        let Some(pane) = self.tiles.read(cx).active_pane(cx) else {
             return;
         };
         let db = self.db.clone();
@@ -306,6 +340,13 @@ impl Render for AppRoot {
             self.focus_handle.focus(window);
         }
 
+        if let Some(transient) = &self.transient
+            && transient.read(cx).dismissed
+        {
+            self.transient = None;
+            self.focus_handle.focus(window);
+        }
+
         if let Some((item, position)) = self.pending_inspector_request.take() {
             self.open_inspector(&*item, position, window, cx);
         }
@@ -339,8 +380,14 @@ impl Render for AppRoot {
 
         let mut root = div()
             .id("app-root")
+            // Names the root so context-gated keybindings (the leader, which is
+            // bound with `!Inspector && !RowList && !Transient`) have a non-empty
+            // context stack to evaluate against — gpui's predicate eval returns
+            // false for an empty stack, so without this the leader never fires.
+            .key_context("AppRoot")
             .track_focus(&self.focus_handle)
             .on_action(cx.listener(Self::toggle_palette))
+            .on_action(cx.listener(Self::open_leader))
             .on_action(cx.listener(Self::cycle_tab_forward))
             .on_action(cx.listener(Self::cycle_tab_backward))
             .on_action(cx.listener(Self::toggle_cmd_lock))
@@ -364,6 +411,10 @@ impl Render for AppRoot {
 
         if let Some(inspector) = &self.inspector {
             root = root.child(inspector.clone());
+        }
+
+        if let Some(transient) = &self.transient {
+            root = root.child(transient.clone());
         }
 
         if let Some(preview) = &self.hover_preview {
@@ -443,7 +494,7 @@ impl AppRoot {
         if already_open {
             return;
         }
-        let Some(pane) = panes.first().cloned() else {
+        let Some(pane) = self.tiles.read(cx).active_pane(cx) else {
             return;
         };
         let db = self.db.clone();
@@ -719,6 +770,9 @@ impl PanelApp {
             .run(move |cx: &mut App| {
                 crate::theme::register_fonts(cx);
                 let cfg = crate::config::load();
+                // Capture the leader before `cfg` moves into the font global; it
+                // parameterizes the chord-menu keybinding below.
+                let leader = cfg.leader.clone();
                 let family = crate::theme::resolve_font_family(cx, &cfg);
                 cx.set_global(crate::theme::FontSettings {
                     family,
@@ -755,6 +809,15 @@ impl PanelApp {
                 set_dock_icon();
                 cx.bind_keys([
                     KeyBinding::new("cmd-p", OpenPalette, None),
+                    // The leader opens the transient chord menu. Suppressed while
+                    // a text field (Inspector search, node-editor inline edit via
+                    // RowList) or the menu itself holds focus, so the key still
+                    // types normally there.
+                    KeyBinding::new(
+                        leader.as_str(),
+                        OpenLeader,
+                        Some("!Inspector && !RowList && !Transient"),
+                    ),
                     KeyBinding::new("ctrl-tab", CycleTabForward, None),
                     KeyBinding::new("shift-ctrl-tab", CycleTabBackward, None),
                     KeyBinding::new("cmd-l", ToggleCmdLock, None),
