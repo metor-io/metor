@@ -1,0 +1,19 @@
+[package]
+name = "metor-fsw-2"
+license = "MIT OR Apache-2.0"
+version.workspace = true
+repository.workspace = true
+edition = "2024"
+publish = false
+description = "Frames & component derives for the metor-fsw-2 flight-software framework"
+authors = ["sascha@metor.io"]
+
+[dependencies]
+metor-proto = { path = "../metor-proto", features = ["std"] }
+# `nox` forces `metor-proto-wkt`'s ComponentValue on via feature unification, so
+# the (pre-existing, nox-gated) wkt build is satisfied for this crate.
+metor-proto-wkt = { path = "../metor-proto/wkt", features = ["nox", "std"] }
+metor-fsw = { path = "../metor-fsw", default-features = false, features = ["std"] }
+metor-fsw-ring = { path = "ring", default-features = false }
+metor-fsw-macros = { path = "../metor-fsw/macros" }
+zerocopy = { version = "0.8.2", features = ["derive"] }

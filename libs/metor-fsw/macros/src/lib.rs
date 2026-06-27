@@ -6,6 +6,9 @@ use quote::quote;
 use syn::Ident;
 
 mod as_vtable;
+mod componentize;
+mod decomponentize;
+mod frame;
 mod metadatatize;
 
 #[derive(Debug, FromField)]
@@ -16,6 +19,16 @@ struct Field {
     component_id: Option<String>,
     #[darling(default)]
     timestamp: bool,
+    /// Descend into a sub-frame/struct instead of treating the field as a leaf
+    /// scalar (Componentize/Decomponentize recurse through the trait).
+    #[darling(default)]
+    nest: bool,
+    /// Max cardinality for a `FrameList`/`FrameMap` field (frames.md §3.4). The
+    /// const-generic on the type is the source of truth; this is accepted for
+    /// forward-compat but unused by the derives.
+    #[darling(default)]
+    #[allow(dead_code)]
+    max: Option<usize>,
 }
 
 impl Field {
@@ -27,6 +40,31 @@ impl Field {
                 ident.to_string()
             }
         }
+    }
+
+    /// Alias for [`component_name`](Field::component_name) used by the
+    /// Componentize/Decomponentize derives.
+    pub fn component_id(&self) -> String {
+        self.component_name()
+    }
+
+    /// Whether this field should recurse rather than emit a scalar leaf: either
+    /// explicitly `#[metor_fsw(nest)]`, or a dynamic `FrameList`/`FrameMap` whose
+    /// slot carries no in-struct value.
+    pub fn is_nested(&self) -> bool {
+        self.nest || self.is_dynamic()
+    }
+
+    /// Whether the field type's outermost path segment is `FrameList`/`FrameMap`.
+    /// Used to size the trailer in `Componentize::MAX_SIZE` and to skip the
+    /// (slot-only) field on the scalar Componentize/Decomponentize paths.
+    pub fn is_dynamic(&self) -> bool {
+        if let syn::Type::Path(p) = &self.ty {
+            if let Some(seg) = p.path.segments.last() {
+                return seg.ident == "FrameList" || seg.ident == "FrameMap";
+            }
+        }
+        false
     }
 }
 
@@ -40,6 +78,21 @@ pub fn as_vtable(input: TokenStream) -> TokenStream {
     as_vtable::as_vtable(input)
 }
 
+#[proc_macro_derive(Componentize, attributes(metor_fsw))]
+pub fn componentize(input: TokenStream) -> TokenStream {
+    componentize::componentize(input)
+}
+
+#[proc_macro_derive(Decomponentize, attributes(metor_fsw))]
+pub fn decomponentize(input: TokenStream) -> TokenStream {
+    decomponentize::decomponentize(input)
+}
+
+#[proc_macro_derive(Frame, attributes(metor_fsw))]
+pub fn frame(input: TokenStream) -> TokenStream {
+    frame::frame(input)
+}
+
 pub(crate) fn metor_fsw_crate_name() -> proc_macro2::TokenStream {
     let name = crate_name("metor-fsw").expect("metor-fsw is present in `Cargo.toml`");
 
@@ -49,5 +102,19 @@ pub(crate) fn metor_fsw_crate_name() -> proc_macro2::TokenStream {
             let ident = Ident::new(&name, Span::call_site());
             quote!( #ident )
         }
+    }
+}
+
+/// Resolves the path to the `metor-fsw-2` framework crate (which defines the
+/// `Frame` trait). Used only by the `Frame` derive so the macro crate needs no
+/// Cargo dependency on `metor-fsw-2`.
+pub(crate) fn metor_fsw_2_crate_name() -> proc_macro2::TokenStream {
+    match crate_name("metor-fsw-2") {
+        Ok(FoundCrate::Itself) => quote!(crate),
+        Ok(FoundCrate::Name(name)) => {
+            let ident = Ident::new(&name, Span::call_site());
+            quote!( #ident )
+        }
+        Err(_) => quote!(metor_fsw_2),
     }
 }

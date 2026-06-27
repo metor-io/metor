@@ -1,9 +1,22 @@
+use metor_proto::hash::PathHasher;
 use metor_proto::types::ComponentId;
 use metor_proto_wkt::ComponentMetadata;
 
 pub trait ComponentPath: Clone {
     fn to_name(&self) -> String;
-    fn to_component_id(&self) -> ComponentId;
+
+    /// Feeds this path's segments into `hasher` in order.
+    ///
+    /// This is the alloc-free basis for [`to_component_id`](ComponentPath::to_component_id):
+    /// a [`PathHasher`] rolls the same fnv1a-64 hash as `ComponentId::new(&self.to_name())`
+    /// but without materializing the dotted string.
+    fn hash_into(&self, hasher: &mut PathHasher);
+
+    fn to_component_id(&self) -> ComponentId {
+        let mut hasher = PathHasher::new();
+        self.hash_into(&mut hasher);
+        hasher.finish()
+    }
     fn chain<B>(&self, other: B) -> ChainPath<Self, B>
     where
         Self: Sized,
@@ -27,9 +40,7 @@ impl ComponentPath for () {
         String::new()
     }
 
-    fn to_component_id(&self) -> ComponentId {
-        ComponentId::new("")
-    }
+    fn hash_into(&self, _hasher: &mut PathHasher) {}
 
     fn is_empty(&self) -> bool {
         true
@@ -41,8 +52,8 @@ impl<C: ComponentPath> ComponentPath for &'_ C {
         C::to_name(*self)
     }
 
-    fn to_component_id(&self) -> ComponentId {
-        C::to_component_id(*self)
+    fn hash_into(&self, hasher: &mut PathHasher) {
+        C::hash_into(*self, hasher)
     }
 }
 
@@ -51,8 +62,8 @@ impl ComponentPath for String {
         self.clone()
     }
 
-    fn to_component_id(&self) -> ComponentId {
-        ComponentId::new(self)
+    fn hash_into(&self, hasher: &mut PathHasher) {
+        hasher.push(self);
     }
 }
 
@@ -61,8 +72,8 @@ impl ComponentPath for &'_ str {
         self.to_string()
     }
 
-    fn to_component_id(&self) -> ComponentId {
-        ComponentId::new(self)
+    fn hash_into(&self, hasher: &mut PathHasher) {
+        hasher.push(self);
     }
 }
 
@@ -94,7 +105,10 @@ where
         }
     }
 
-    fn to_component_id(&self) -> ComponentId {
-        ComponentId::new(&self.to_name()) // TODO: we can do this without an alloc by chaining hash functions
+    fn hash_into(&self, hasher: &mut PathHasher) {
+        // Chaining the two halves into the rolling hasher yields the same id as
+        // `ComponentId::new(&self.to_name())`, but without the intermediate `String`.
+        self.a.hash_into(hasher);
+        self.b.hash_into(hasher);
     }
 }

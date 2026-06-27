@@ -109,6 +109,20 @@ pub async fn handle_vtable_stream<A: AsyncWrite + 'static>(
                     );
                     break 'find;
                 }
+                RealizedOp::Frame(frame) => {
+                    // Frame identity is metadata for the field; streaming doesn't act on
+                    // it directly, so continue resolving the wrapped chain.
+                    realized_op = vtable.realize(frame.arg, None)?;
+                }
+                RealizedOp::List(_) | RealizedOp::Map(_) | RealizedOp::PathComponent(_) => {
+                    // TODO(streaming): DynamicFrameTable, WP2b after frames exist.
+                    // Dynamic frames (vtable-dynamic.md §8.6) need a per-tick packet
+                    // rebuild that the fixed-shard FieldTable here cannot express. This
+                    // is the sequenced follow-up, NOT a silent drop: reject for now so
+                    // callers get a clear error instead of a malformed stream.
+                    warn!("dynamic frame streaming not yet supported (WP2b)");
+                    return Err(Error::Impeller(metor_proto::error::Error::InvalidOp));
+                }
                 _ => return Err(Error::Impeller(metor_proto::error::Error::InvalidOp)),
             }
         }

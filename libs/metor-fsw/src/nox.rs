@@ -177,6 +177,17 @@ macro_rules! impl_prim_component {
                     schema(<$ty>::PRIM_TYPE, &[], component),
                 ))
             }
+
+            // As a dynamic element member, a scalar is a `path_component` leaf named
+            // by its relative dotted path (frames.md §4); its offset is patched by
+            // the enclosing struct's `element_fields`.
+            fn element_fields(prefix: String) -> impl Iterator<Item = FieldBuilder> {
+                std::iter::once(raw_field(
+                    0,
+                    size_of::<$ty>() as u32,
+                    schema(<$ty>::PRIM_TYPE, &[], builder::path_component(&prefix)),
+                ))
+            }
         }
 
         impl Metadatatize for $ty {}

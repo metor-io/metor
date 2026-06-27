@@ -1,9 +1,10 @@
 use darling::FromDeriveInput;
 use darling::ast;
 use proc_macro::TokenStream;
+use proc_macro2::TokenStream as TokenStream2;
 use quote::quote;
 use syn::{Attribute, Meta};
-use syn::{DeriveInput, Generics, Ident, parse_macro_input};
+use syn::{DeriveInput, Generics, Ident};
 
 #[derive(Debug, FromDeriveInput)]
 #[darling(
@@ -16,6 +17,8 @@ pub struct AsVTable {
     generics: Generics,
     data: ast::Data<(), crate::Field>,
     parent: Option<String>,
+    /// Frame name (frames.md §1.3); folds into `parent` as the component prefix.
+    name: Option<String>,
     #[darling(default, rename = "group")]
     _group: darling::util::Ignored,
 }
@@ -36,17 +39,36 @@ fn extract_repr_type(attrs: &[Attribute]) -> Option<Ident> {
 }
 
 pub fn as_vtable(input: TokenStream) -> TokenStream {
+    let input = syn::parse_macro_input!(input as DeriveInput);
+    as_vtable_impl(&input, None).into()
+}
+
+/// Shared `AsVTable` code generator.
+///
+/// `frame_id` is `None` for the standalone `#[derive(AsVTable)]` and
+/// `Some(<ComponentId expr>)` for `#[derive(Frame)]`, which wraps every member's
+/// op chain in a `frame(...)` op so each realized component inherits the frame id.
+///
+/// The `#[metor_fsw(timestamp)]` field is suppressed as a standalone component on
+/// both paths (frames.md Q1) — it contributes only the shared timestamp source.
+pub fn as_vtable_impl(input: &DeriveInput, frame_id: Option<TokenStream2>) -> TokenStream2 {
     let crate_name = crate::metor_fsw_crate_name();
-    let input = parse_macro_input!(input as DeriveInput);
     let AsVTable {
         ident,
         generics,
         data,
         parent,
+        name,
         _group,
-    } = AsVTable::from_derive_input(&input).unwrap();
+    } = AsVTable::from_derive_input(input).unwrap();
+    let parent = parent.or(name);
     let where_clause = &generics.where_clause;
     let impeller = quote! { #crate_name::metor_proto };
+
+    let frame_map = frame_id.as_ref().map(|fid| {
+        quote! { .map(move |field| field.with_frame(#fid)) }
+    });
+
     match data {
         ast::Data::Enum(_) => {
             let name = parent.unwrap_or_else(|| ident.to_string());
@@ -68,9 +90,10 @@ pub fn as_vtable(input: TokenStream) -> TokenStream {
                                 component
                             ))
                         ].into_iter()
+                        #frame_map
                     }
                 }
-            }.into()
+            }
         }
         ast::Data::Struct(fields) => {
             let mut timestamp_fields = fields.fields.iter().filter(|field| field.timestamp);
@@ -93,7 +116,8 @@ pub fn as_vtable(input: TokenStream) -> TokenStream {
                     .map(move |field| field.with_timestamp(timestamp_source.clone()))
                 }
             });
-            let vtable_items = fields.fields.iter().map(|field| {
+            // The timestamp field is the source only; never emitted as a component.
+            let vtable_items = fields.fields.iter().filter(|f| !f.timestamp).map(|field| {
                 let ty = &field.ty;
                 let name = field.component_name();
                 let name = if let Some(parent) = &parent {
@@ -108,19 +132,40 @@ pub fn as_vtable(input: TokenStream) -> TokenStream {
                     )
                 }
             });
+            // Dynamic member-template form (frames.md §4): leaves are
+            // `path_component`, names are relative to the element base.
+            let element_items = fields.fields.iter().filter(|f| !f.timestamp).map(|field| {
+                let ty = &field.ty;
+                let name = field.component_name();
+                let ident = &field.ident;
+                quote! {
+                    .chain(<#ty as #crate_name::AsVTable>::element_fields(child(#name))
+                        .map(|field| field.offset_by(core::mem::offset_of!(Self, #ident) as u32))
+                    )
+                }
+            });
             quote! {
-        impl #crate_name::AsVTable for #ident #generics #where_clause {
-            fn vtable_fields(path: impl #crate_name::path::ComponentPath) -> impl Iterator<Item = #impeller::vtable::builder::FieldBuilder> {
-                use #crate_name::path::ComponentPath;
-                let component = |name: &str| #impeller::vtable::builder::component(path.chain(name).to_component_id());
-                #timestamp_source
-                std::iter::empty()
-                #(#vtable_items)*
-                #timestamp_map
+                impl #crate_name::AsVTable for #ident #generics #where_clause {
+                    fn vtable_fields(path: impl #crate_name::path::ComponentPath) -> impl Iterator<Item = #impeller::vtable::builder::FieldBuilder> {
+                        use #crate_name::path::ComponentPath;
+                        #timestamp_source
+                        std::iter::empty()
+                        #(#vtable_items)*
+                        #timestamp_map
+                        #frame_map
+                    }
+
+                    fn element_fields(prefix: String) -> impl Iterator<Item = #impeller::vtable::builder::FieldBuilder> {
+                        let child = |name: &str| if prefix.is_empty() {
+                            name.to_string()
+                        } else {
+                            format!("{prefix}.{name}")
+                        };
+                        std::iter::empty()
+                        #(#element_items)*
+                    }
+                }
             }
-        }
-    }
-    .into()
         }
     }
 }

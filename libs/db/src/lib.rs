@@ -247,6 +247,12 @@ impl DB {
     pub fn insert_vtable(&self, vtable: VTableMsg) -> Result<(), Error> {
         info!(id = ?vtable.id, "inserting vtable");
         self.with_state_mut(|state| {
+            // For static fields this registers the concrete component. For dynamic
+            // frames (`List`/`Map`), `realize_fields(None)` yields each member *template*
+            // (e.g. `processes.pid`) so its ty/shape is registered up front; the concrete
+            // keyed/indexed components (`processes.htop.pid`) are created lazily when
+            // their first sample arrives. TODO(WP2b): wire lazy creation through the
+            // table-apply ingest path (vtable-dynamic.md §8.5).
             for res in vtable.vtable.realize_fields(None) {
                 let RealizedField {
                     component_id,

@@ -18,6 +18,14 @@
 
 namespace vtable {
 
+// NOTE(WP2b): the Rust `Op` enum also has dynamic-frame variants
+// `Frame`/`List`/`Map`/`PathComponent` (see metor-proto vtable.rs and
+// libs/metor-fsw-2/docs/vtable-dynamic.md). The generated `Op`/`ElementFields`
+// types in db.hpp cover them on the parse side, but this hand-written *builder*
+// intentionally does NOT yet expose them: C++ producers cannot emit dynamic
+// frames until WP2b. This is an explicit, documented omission, not a silent gap —
+// `std::visit` below only ever constructs the static variants it lists.
+
 /// A builder for VTable operations
 class OpBuilder {
 public:
