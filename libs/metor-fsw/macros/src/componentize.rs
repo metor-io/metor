@@ -1,8 +1,9 @@
 use darling::FromDeriveInput;
 use darling::ast::{self};
 use proc_macro::TokenStream;
+use proc_macro2::TokenStream as TokenStream2;
 use quote::quote;
-use syn::{DeriveInput, Generics, Ident, parse_macro_input};
+use syn::{DeriveInput, Generics, Ident};
 
 #[derive(Debug, FromDeriveInput)]
 #[darling(attributes(metor_fsw), supports(struct_named))]
@@ -11,43 +12,66 @@ pub struct Componentize {
     generics: Generics,
     data: ast::Data<(), crate::Field>,
     parent: Option<String>,
+    name: Option<String>,
 }
 
 pub fn componentize(input: TokenStream) -> TokenStream {
+    let input = syn::parse_macro_input!(input as DeriveInput);
+    componentize_impl(&input).into()
+}
+
+pub fn componentize_impl(input: &DeriveInput) -> TokenStream2 {
     let crate_name = crate::metor_fsw_crate_name();
-    let input = parse_macro_input!(input as DeriveInput);
     let Componentize {
         ident,
         generics,
         data,
         parent,
-    } = Componentize::from_derive_input(&input).unwrap();
+        name,
+    } = Componentize::from_derive_input(input).unwrap();
+    let parent = parent.or(name);
     let where_clause = &generics.where_clause;
     let impeller = quote! { #crate_name::metor_proto };
     let fields = data.take_struct().unwrap();
-    let sink_calls = fields.fields.iter().map(|field| {
-        let component_id = field.component_id();
 
-        let component_id = if let Some(parent) = &parent {
-            format!("{parent}.{component_id}")
-        } else {
-            component_id.to_string()
-        };
-        let ident = field.ident.as_ref().expect("only named fields allowed");
-        if !field.nest {
-            quote! {
-                let _ = output.apply_value(
-                    #impeller::types::ComponentId::new(#component_id),
-                    self.#ident.as_component_view(),
-                    None
-                );
+    // sink_columns: scalar fields emit one component; nested/dynamic fields recurse
+    // (a `FrameList`/`FrameMap` slot has no in-struct value, so its `sink_columns`
+    // is a no-op). The timestamp field is the source only — never a component.
+    let sink_calls = fields
+        .fields
+        .iter()
+        .filter(|f| !f.timestamp)
+        .map(|field| {
+            let ident = field.ident.as_ref().expect("only named fields allowed");
+            if field.is_nested() {
+                quote! { self.#ident.sink_columns(output); }
+            } else {
+                let component_id = field.component_id();
+                let component_id = match &parent {
+                    Some(parent) => format!("{parent}.{component_id}"),
+                    None => component_id,
+                };
+                quote! {
+                    let _ = output.apply_value(
+                        #impeller::types::ComponentId::new(#component_id),
+                        self.#ident.as_component_view(),
+                        None,
+                    );
+                }
             }
-        } else {
-            quote! {
-                self.#ident.sink_columns(output);
-            }
-        }
-    });
+        });
+
+    // MAX_SIZE (frames.md §3.4): the fixed region (`size_of::<Self>()`, which already
+    // includes every 8-byte dynamic slot) plus each dynamic field's trailer budget,
+    // plus an 8-byte alignment pad.
+    let dyn_budgets = fields
+        .fields
+        .iter()
+        .filter(|f| f.is_dynamic())
+        .map(|field| {
+            let ty = &field.ty;
+            quote! { + <#ty as #crate_name::Componentize>::MAX_SIZE }
+        });
 
     quote! {
         impl #crate_name::Componentize for #ident #generics #where_clause {
@@ -56,8 +80,7 @@ pub fn componentize(input: TokenStream) -> TokenStream {
                 #(#sink_calls)*
             }
 
-            const MAX_SIZE: usize = 0;
+            const MAX_SIZE: usize = core::mem::size_of::<Self>() #(#dyn_budgets)* + 8;
         }
     }
-    .into()
 }

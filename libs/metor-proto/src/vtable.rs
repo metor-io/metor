@@ -55,6 +55,7 @@ use crate::{
     buf::Buf,
     com_de::Decomponentize,
     error::Error,
+    hash::PathHasher,
     types::{ComponentId, ComponentView, PacketId, PrimType, Timestamp},
 };
 
@@ -92,7 +93,75 @@ pub enum Op {
         id: PacketId,
         data: OpRef,
     },
+
+    /// Tags the field's op chain as belonging to a frame named by `component_id`.
+    ///
+    /// Metadata op (like [`Op::Timestamp`]): records the frame id and continues
+    /// evaluating at `arg`. `component_id` references a [`Op::Data`] op holding the
+    /// frame's [`ComponentId`].
+    Frame {
+        component_id: OpRef,
+        arg: OpRef,
+    },
+
+    /// Dynamic list terminal — a runtime-sized, indexed sequence of element frames.
+    ///
+    /// The owning [`Field`]'s `offset`/`len` address an 8-byte slot
+    /// `{ trailer_off: u32, byte_len: u32 }` in the fixed region. Elements are laid
+    /// out back-to-back in the trailer with byte `stride`; `count = byte_len / stride`.
+    /// `name` references a [`Op::Data`] op holding the field's path prefix
+    /// (e.g. `"processes"`). `members` is a contiguous range of member-template
+    /// [`Field`]s whose offsets are relative to each element's base. A member's chain
+    /// may itself terminate in `List`/`Map`, giving nested dynamics.
+    List {
+        name: OpRef,
+        members: ElementFields,
+        stride: u32,
+    },
+
+    /// Dynamic map terminal — a runtime-sized sequence of name-keyed element frames.
+    ///
+    /// Like [`Op::List`], but each trailer entry is
+    /// `{ key_off: u32, key_len: u32, <pad> value }`: the key *bytes* live in a name
+    /// pool elsewhere in the trailer (addressed by `key_off`/`key_len`), and the value
+    /// sub-frame begins at `value_offset` within the entry. Keys must not contain `.`
+    /// (it would alias the dotted-path grammar) — realization rejects such keys.
+    Map {
+        name: OpRef,
+        members: ElementFields,
+        stride: u32,
+        value_offset: u32,
+    },
+
+    /// Dynamic leaf terminal — used in member templates instead of [`Op::Component`].
+    ///
+    /// Appends `name` (a [`Op::Data`] op holding the member name, e.g. `"pid"`) to the
+    /// running dotted path accumulated by the enclosing `List`/`Map` expansion, then
+    /// finalizes it into a [`ComponentId`]. Equivalent component to
+    /// `ComponentId::new("<prefix>.<key>.<name>")`.
+    PathComponent {
+        name: OpRef,
+    },
 }
+
+/// A contiguous range of member-template [`Field`]s in a [`VTable`]'s `fields` list.
+///
+/// Referenced by [`Op::List`]/[`Op::Map`]; the named fields describe one element and
+/// are *not* iterated as top-level fields (they are claimed templates).
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, postcard_schema::Schema,
+)]
+#[repr(C)]
+pub struct ElementFields {
+    pub start: u32,
+    pub count: u32,
+}
+
+/// Maximum dynamic-frame nesting depth honored during realization.
+///
+/// Bounds recursion (and therefore stack use) on the no-alloc path. Exceeding it is
+/// reported as [`Error::InvalidOp`].
+pub const MAX_DYNAMIC_DEPTH: usize = 8;
 
 /// A field within a VTable
 ///
@@ -205,6 +274,35 @@ pub struct RealizedExt<'a> {
     pub arg: OpRef,
 }
 
+/// A frame-identity op realized from a VTable (see [`Op::Frame`]).
+#[derive(Clone, Copy, Debug)]
+pub struct RealizedFrame {
+    pub component_id: ComponentId,
+    pub arg: OpRef,
+}
+
+/// A dynamic list/map terminal realized from a VTable (see [`Op::List`]/[`Op::Map`]).
+#[derive(Clone, Copy, Debug)]
+pub struct RealizedDynamic<'a> {
+    /// The field's dotted-path prefix (e.g. `"processes"`).
+    pub name: &'a str,
+    /// The member-template field range describing one element.
+    pub members: ElementFields,
+    /// Byte stride of one element (list) or one `(key, value)` entry (map).
+    pub stride: u32,
+    /// Byte offset of the value sub-frame within an entry; `0` for lists.
+    pub value_offset: u32,
+    /// Whether this is a map (`true`) or a list (`false`).
+    pub is_map: bool,
+}
+
+/// A dynamic leaf terminal realized from a VTable (see [`Op::PathComponent`]).
+#[derive(Clone, Copy, Debug)]
+pub struct RealizedPathLeaf<'a> {
+    /// The member name segment (e.g. `"pid"`).
+    pub name: &'a str,
+}
+
 /// A realized operation, which is an operation that has been evaluated against a table
 pub enum RealizedOp<'a> {
     Data(&'a [u8]),
@@ -214,6 +312,48 @@ pub enum RealizedOp<'a> {
     Timestamp(RealizedTimestamp),
     Ext(RealizedExt<'a>),
     None,
+    Frame(RealizedFrame),
+    List(RealizedDynamic<'a>),
+    Map(RealizedDynamic<'a>),
+    PathComponent(RealizedPathLeaf<'a>),
+}
+
+/// Identifies which element of a dynamic frame a [`RealizedField`] came from.
+#[derive(Clone, Copy, Debug)]
+pub enum ElementKey<'a> {
+    /// A list element's positional index.
+    Index(u32),
+    /// A map entry's name key.
+    Key(&'a str),
+}
+
+/// State threaded through the field-realization walk.
+///
+/// For top-level fields this is [`WalkCtx::default`] (base 0, empty path, no inherited
+/// frame/timestamp). Dynamic expansion derives a child context per element with the
+/// element base offset, the extended dotted path, the element key, and the inherited
+/// frame/timestamp.
+#[derive(Clone, Copy)]
+struct WalkCtx<'a> {
+    base: usize,
+    path: PathHasher,
+    element: Option<ElementKey<'a>>,
+    frame: Option<ComponentId>,
+    timestamp: Option<Timestamp>,
+    depth: usize,
+}
+
+impl Default for WalkCtx<'_> {
+    fn default() -> Self {
+        Self {
+            base: 0,
+            path: PathHasher::new(),
+            element: None,
+            frame: None,
+            timestamp: None,
+            depth: 0,
+        }
+    }
 }
 
 /// A field realized from a VTable, containing entity and component IDs,
@@ -225,6 +365,10 @@ pub struct RealizedField<'a> {
     pub offset: usize,
     pub view: Option<ComponentView<'a>>,
     pub timestamp: Option<Timestamp>,
+    /// The frame this field belongs to, if tagged by an [`Op::Frame`].
+    pub frame: Option<ComponentId>,
+    /// The dynamic-frame element this field came from, if any (`None` for static fields).
+    pub element: Option<ElementKey<'a>>,
 }
 
 impl<'a> RealizedOp<'a> {
@@ -353,105 +497,340 @@ impl<Ops: Buf<Op>, Data: Buf<u8>, Fields: Buf<Field>> VTable<Ops, Data, Fields> 
                     arg: *arg,
                 }))
             }
+            Op::Frame { component_id, arg } => {
+                let component_id = self
+                    .realize(*component_id, table)?
+                    .as_component_id()
+                    .ok_or(Error::InvalidOp)?;
+                Ok(RealizedOp::Frame(RealizedFrame {
+                    component_id,
+                    arg: *arg,
+                }))
+            }
+            Op::List {
+                name,
+                members,
+                stride,
+            } => {
+                let name = self.realize_str(*name, table)?;
+                Ok(RealizedOp::List(RealizedDynamic {
+                    name,
+                    members: *members,
+                    stride: *stride,
+                    value_offset: 0,
+                    is_map: false,
+                }))
+            }
+            Op::Map {
+                name,
+                members,
+                stride,
+                value_offset,
+            } => {
+                let name = self.realize_str(*name, table)?;
+                Ok(RealizedOp::Map(RealizedDynamic {
+                    name,
+                    members: *members,
+                    stride: *stride,
+                    value_offset: *value_offset,
+                    is_map: true,
+                }))
+            }
+            Op::PathComponent { name } => {
+                let name = self.realize_str(*name, table)?;
+                Ok(RealizedOp::PathComponent(RealizedPathLeaf { name }))
+            }
         }
     }
 
-    /// Evaluated each `field`, returning a `RealizedField`
+    /// Resolves an op reference to a UTF-8 string held in the VTable's `data` buffer.
+    fn realize_str<'a>(&'a self, op_ref: OpRef, table: Option<&'a [u8]>) -> Result<&'a str, Error> {
+        let bytes = self.realize(op_ref, table)?.as_slice().ok_or(Error::InvalidOp)?;
+        core::str::from_utf8(bytes).map_err(|_| Error::InvalidOp)
+    }
+
+    /// Drives realization of every top-level field, invoking `f` once per realized
+    /// component.
     ///
-    /// `realized_fields` loops through each field, turning each [`Offset`] into a reference, and evaluating any [`Op`]
-    /// Evaluates each field in the VTable, returning an iterator of [`RealizedField`]s
+    /// Unlike a one-field-one-component mapping, a dynamic field ([`Op::List`]/
+    /// [`Op::Map`]) expands into many components — one per element-member — so this
+    /// uses a push-style callback rather than returning an iterator. It is the shared
+    /// engine behind both [`VTable::apply`] and (under `alloc`) [`VTable::realize_fields`],
+    /// and is no-alloc friendly (no heap; recursion bounded by [`MAX_DYNAMIC_DEPTH`]).
     ///
-    /// This turns each [`Offset`] into a reference and evaluates any [`Op`]s
+    /// Member-template fields (those claimed by a `List`/`Map` op) are skipped at the
+    /// top level — they are only realized as part of their owning dynamic field.
+    pub fn for_each_field<'a>(
+        &'a self,
+        table: Option<&'a [u8]>,
+        f: &mut dyn FnMut(RealizedField<'a>) -> Result<(), Error>,
+    ) -> Result<(), Error> {
+        for (i, field) in self.fields.iter().enumerate() {
+            if self.is_template_field(i) {
+                continue;
+            }
+            self.walk_field(field, WalkCtx::default(), table, f)?;
+        }
+        Ok(())
+    }
+
+    /// Returns whether field index `i` is a member template claimed by some `List`/`Map`
+    /// op, and therefore should not be walked as a top-level field.
+    fn is_template_field(&self, i: usize) -> bool {
+        self.ops.iter().any(|op| {
+            let members = match op {
+                Op::List { members, .. } | Op::Map { members, .. } => members,
+                _ => return false,
+            };
+            let start = members.start as usize;
+            i >= start && i < start + members.count as usize
+        })
+    }
+
+    /// Walks a single field's op chain against `table`, emitting realized component(s).
+    ///
+    /// `ctx` carries the containing element's base offset, the accumulated dotted-name
+    /// prefix, the inherited frame/timestamp, the element key, and the recursion depth.
+    fn walk_field<'a>(
+        &'a self,
+        field: &Field,
+        ctx: WalkCtx<'a>,
+        table: Option<&'a [u8]>,
+        f: &mut dyn FnMut(RealizedField<'a>) -> Result<(), Error>,
+    ) -> Result<(), Error> {
+        if ctx.depth > MAX_DYNAMIC_DEPTH {
+            return Err(Error::InvalidOp);
+        }
+        let mut realized_op = self.realize(field.arg, table)?;
+        // Frame and timestamp are inherited from the enclosing frame, but the field's
+        // own `Frame`/`Timestamp` ops override them.
+        let mut timestamp: Option<Timestamp> = ctx.timestamp;
+        let mut schema: Option<RealizedSchema<'a>> = None;
+        let mut frame: Option<ComponentId> = ctx.frame;
+        loop {
+            match realized_op {
+                RealizedOp::Component(RealizedComponent { component_id }) => {
+                    return self.emit_leaf(field, &ctx, component_id, frame, &schema, timestamp, table, f);
+                }
+                RealizedOp::PathComponent(leaf) => {
+                    let mut leaf_path = ctx.path;
+                    leaf_path.push(leaf.name);
+                    let component_id = leaf_path.finish();
+                    return self.emit_leaf(field, &ctx, component_id, frame, &schema, timestamp, table, f);
+                }
+                RealizedOp::Schema(s) => {
+                    let s = schema.insert(s);
+                    realized_op = self.realize(s.arg, table)?;
+                }
+                RealizedOp::Timestamp(t) => {
+                    if t.timestamp.is_some() {
+                        timestamp = t.timestamp;
+                    }
+                    realized_op = self.realize(t.arg, table)?;
+                }
+                RealizedOp::Frame(fr) => {
+                    frame = Some(fr.component_id);
+                    realized_op = self.realize(fr.arg, table)?;
+                }
+                RealizedOp::Ext(e) => {
+                    realized_op = self.realize(e.arg, table)?;
+                }
+                RealizedOp::List(dynm) | RealizedOp::Map(dynm) => {
+                    return self.expand_dynamic(field, &ctx, frame, timestamp, &dynm, table, f);
+                }
+                _ => return Err(Error::InvalidOp),
+            }
+        }
+    }
+
+    /// Builds and emits a single realized component for a leaf (static [`Op::Component`]
+    /// or dynamic [`Op::PathComponent`]).
+    #[allow(clippy::too_many_arguments)]
+    fn emit_leaf<'a>(
+        &'a self,
+        field: &Field,
+        ctx: &WalkCtx<'a>,
+        component_id: ComponentId,
+        frame: Option<ComponentId>,
+        schema: &Option<RealizedSchema<'a>>,
+        timestamp: Option<Timestamp>,
+        table: Option<&'a [u8]>,
+        f: &mut dyn FnMut(RealizedField<'a>) -> Result<(), Error>,
+    ) -> Result<(), Error> {
+        let schema = schema.as_ref().ok_or(Error::SchemaNotFound)?;
+        // NOTE(sphw): bogan version of zerocopy::transmute_ref; see the original
+        // realize_fields for the upstream zerocopy issue this works around.
+        let shape: &[usize] = <[usize]>::ref_from_bytes(schema.dim.as_bytes())?;
+        let offset = ctx.base + field.offset.to_index();
+        let view = if let Some(table) = table {
+            let data = table
+                .get(offset..offset + field.len as usize)
+                .ok_or(Error::BufferUnderflow)?;
+            Some(ComponentView::try_from_bytes_shape(data, shape, schema.ty)?)
+        } else {
+            None
+        };
+        f(RealizedField {
+            component_id,
+            view,
+            timestamp,
+            offset,
+            shape,
+            ty: schema.ty,
+            frame,
+            element: ctx.element,
+        })
+    }
+
+    /// Expands a dynamic [`Op::List`]/[`Op::Map`] terminal, walking each element's
+    /// member templates and threading the dotted-name path and inherited frame/timestamp.
+    ///
+    /// With `table = None` (schema/registration mode) the element count is unknown, so
+    /// each member template is emitted once with no element key and no view — enough to
+    /// surface the member ty/shape.
+    #[allow(clippy::too_many_arguments)]
+    fn expand_dynamic<'a>(
+        &'a self,
+        field: &Field,
+        ctx: &WalkCtx<'a>,
+        frame: Option<ComponentId>,
+        timestamp: Option<Timestamp>,
+        dynm: &RealizedDynamic<'a>,
+        table: Option<&'a [u8]>,
+        f: &mut dyn FnMut(RealizedField<'a>) -> Result<(), Error>,
+    ) -> Result<(), Error> {
+        let mut prefix_path = ctx.path;
+        prefix_path.push(dynm.name);
+        let members_start = dynm.members.start as usize;
+        let members_end = members_start + dynm.members.count as usize;
+
+        let Some(table) = table else {
+            // Schema/registration mode: emit each member template once.
+            let child = WalkCtx {
+                base: 0,
+                path: prefix_path,
+                element: None,
+                frame,
+                timestamp,
+                depth: ctx.depth + 1,
+            };
+            for mi in members_start..members_end {
+                let member = self.fields.as_slice().get(mi).ok_or(Error::OpRefNotFound)?;
+                self.walk_field(member, child, None, f)?;
+            }
+            return Ok(());
+        };
+
+        let stride = dynm.stride as usize;
+        if stride == 0 {
+            return Err(Error::InvalidOp);
+        }
+        let slot_off = ctx.base + field.offset.to_index();
+        let (trailer_off, byte_len) = read_slot(table, slot_off)?;
+        let count = byte_len / stride;
+        for i in 0..count {
+            let entry_base = trailer_off + i * stride;
+            let (member_base, key) = if dynm.is_map {
+                let key_off = read_u32(table, entry_base)? as usize;
+                let key_len = read_u32(table, entry_base + 4)? as usize;
+                let key_bytes = table
+                    .get(key_off..key_off + key_len)
+                    .ok_or(Error::BufferUnderflow)?;
+                let key = core::str::from_utf8(key_bytes).map_err(|_| Error::InvalidOp)?;
+                // A '.' in a key would alias the dotted-path grammar (it would create
+                // an extra, ambiguous path segment); reject it.
+                if key.contains('.') {
+                    return Err(Error::InvalidComponentData);
+                }
+                (entry_base + dynm.value_offset as usize, ElementKey::Key(key))
+            } else {
+                (entry_base, ElementKey::Index(i as u32))
+            };
+            let mut elem_path = prefix_path;
+            match key {
+                ElementKey::Index(idx) => elem_path.push_index(idx),
+                ElementKey::Key(k) => elem_path.push(k),
+            }
+            let child = WalkCtx {
+                base: member_base,
+                path: elem_path,
+                element: Some(key),
+                frame,
+                timestamp,
+                depth: ctx.depth + 1,
+            };
+            for mi in members_start..members_end {
+                let member = self.fields.as_slice().get(mi).ok_or(Error::OpRefNotFound)?;
+                self.walk_field(member, child, Some(table), f)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Evaluates each field in the VTable, returning an iterator of [`RealizedField`]s.
+    ///
+    /// Dynamic fields expand into many realized components, so this collects through
+    /// [`VTable::for_each_field`]; it is therefore `alloc`-gated. No-alloc callers
+    /// should use [`VTable::for_each_field`] directly.
+    #[cfg(feature = "alloc")]
     pub fn realize_fields<'a>(
         &'a self,
         table: Option<&'a [u8]>,
     ) -> impl Iterator<Item = Result<RealizedField<'a>, Error>> + 'a {
-        self.fields.iter().map(move |field| {
-            let mut realized_op = self
-                .realize(field.arg, table)
-                .inspect_err(|err| println!("realize failed {err:?}"))?;
-            let mut timestamp: Option<RealizedTimestamp> = None;
-            let mut schema: Option<RealizedSchema<'_>> = None;
-            loop {
-                match realized_op {
-                    RealizedOp::Component(ref component) => {
-                        let RealizedComponent { component_id } = *component;
-
-                        let schema = schema.as_ref().ok_or(Error::SchemaNotFound)?;
-                        // NOTE(sphw): bogan version of zerocopy::transmute_ref
-                        // In the future this will need to also support 32 bit systems
-                        // remove when https://github.com/google/zerocopy/pull/2428 is merged and released
-                        let shape: &[usize] = <[usize]>::ref_from_bytes(schema.dim.as_bytes())
-                            .inspect_err(|err| {
-                                println!("bad shape {err:?}");
-                            })?;
-                        let offset = field.offset.to_index();
-                        let view = if let Some(table) = table {
-                            let data = table
-                                .get(offset..offset + field.len as usize)
-                                .ok_or(Error::BufferUnderflow)
-                                .inspect_err(|_| {
-                                    print!(
-                                        "table.len = {:?} offset = {:?} field.len = {:?}",
-                                        table.len(),
-                                        offset,
-                                        field.len
-                                    )
-                                })?;
-                            Some(ComponentView::try_from_bytes_shape(data, shape, schema.ty)?)
-                        } else {
-                            None
-                        };
-                        return Ok(RealizedField {
-                            component_id,
-                            view,
-                            timestamp: timestamp.and_then(|t| t.timestamp),
-                            offset,
-                            shape,
-                            ty: schema.ty,
-                        });
-                    }
-                    RealizedOp::Schema(s) => {
-                        let s = schema.insert(s);
-                        realized_op = self.realize(s.arg, table)?;
-                    }
-                    RealizedOp::Timestamp(t) => {
-                        let t = timestamp.insert(t);
-                        realized_op = self.realize(t.arg, table)?;
-                    }
-                    RealizedOp::Ext(e) => {
-                        realized_op = self.realize(e.arg, table)?;
-                    }
-                    _ => return Err(Error::InvalidOp),
-                }
-            }
-        })
+        let mut out: alloc::vec::Vec<Result<RealizedField<'a>, Error>> = alloc::vec::Vec::new();
+        let res = self.for_each_field(table, &mut |rf| {
+            out.push(Ok(rf));
+            Ok(())
+        });
+        if let Err(err) = res {
+            out.push(Err(err));
+        }
+        out.into_iter()
     }
 
-    /// Parses the passed in table, and sinks the values into the sink
-    /// Parses the provided table and applies the values to the sink
+    /// Parses the provided table and applies the values to the sink.
     ///
     /// This evaluates each field in the VTable against the provided table data and
-    /// applies the resulting values to the sink
+    /// applies the resulting values to the sink. Dynamic frames expand into one sink
+    /// value per element-member.
     pub fn apply<D: Decomponentize>(
         &self,
         table: &[u8],
         sink: &mut D,
     ) -> Result<Result<(), D::Error>, Error> {
-        for res in self.realize_fields(Some(table)) {
-            let RealizedField {
-                component_id,
-                view,
-                timestamp,
-                ..
-            } = res?;
-            let view = view.expect("table not found");
-            if let Err(err) = sink.apply_value(component_id, view, timestamp) {
-                return Ok(Err(err));
+        let mut sink_err: Option<D::Error> = None;
+        let res = self.for_each_field(Some(table), &mut |rf| {
+            let view = rf.view.expect("table not found");
+            match sink.apply_value(rf.component_id, view, rf.timestamp) {
+                Ok(()) => Ok(()),
+                Err(err) => {
+                    sink_err = Some(err);
+                    // Sentinel to stop iteration; unwrapped before propagating below.
+                    Err(Error::InvalidOp)
+                }
             }
+        });
+        if let Some(err) = sink_err {
+            return Ok(Err(err));
         }
+        res?;
         Ok(Ok(()))
     }
+}
+
+/// Reads an 8-byte dynamic-field slot `{ trailer_off: u32, byte_len: u32 }`.
+fn read_slot(table: &[u8], offset: usize) -> Result<(usize, usize), Error> {
+    let trailer_off = read_u32(table, offset)? as usize;
+    let byte_len = read_u32(table, offset + 4)? as usize;
+    Ok((trailer_off, byte_len))
+}
+
+/// Reads a little-endian `u32` at `offset`.
+fn read_u32(table: &[u8], offset: usize) -> Result<u32, Error> {
+    let bytes = table
+        .get(offset..offset + 4)
+        .ok_or(Error::BufferUnderflow)?;
+    Ok(u32::from_le_bytes(bytes.try_into().expect("slice is 4 bytes")))
 }
 
 #[cfg(feature = "alloc")]
@@ -490,6 +869,24 @@ pub mod builder {
             data: Arc<OpBuilder>,
             arg: Arc<OpBuilder>,
         },
+        Frame {
+            component_id: Arc<OpBuilder>,
+            arg: Arc<OpBuilder>,
+        },
+        List {
+            name: Arc<OpBuilder>,
+            members: Vec<FieldBuilder>,
+            stride: u32,
+        },
+        Map {
+            name: Arc<OpBuilder>,
+            members: Vec<FieldBuilder>,
+            stride: u32,
+            value_offset: u32,
+        },
+        PathComponent {
+            name: Arc<OpBuilder>,
+        },
     }
 
     /// A builder for VTable fields
@@ -517,6 +914,18 @@ pub mod builder {
         pub fn with_timestamp(self, timestamp: Arc<OpBuilder>) -> Self {
             Self {
                 arg: super::builder::timestamp(timestamp, self.arg),
+                ..self
+            }
+        }
+
+        /// Wraps this field's op chain in a [`frame`] op, tagging every component
+        /// realized from this field as belonging to the frame named by
+        /// `component_id`. Mirrors [`with_timestamp`](FieldBuilder::with_timestamp);
+        /// the shared `frame(...)` `Arc` is deduplicated by [`VTableBuilder`] so the
+        /// frame id is stored once even when every field carries it.
+        pub fn with_frame(self, component_id: impl Into<ComponentId>) -> Self {
+            Self {
+                arg: super::builder::frame(component_id, self.arg),
                 ..self
             }
         }
@@ -573,6 +982,20 @@ pub mod builder {
                     arg: new_arg.unwrap_or_else(|| arg.clone()),
                 }))
             }
+            OpBuilder::Frame { component_id, arg } => {
+                // `component_id` is a Data op (no table ops); only `arg` can shift.
+                offset_table_ops(arg, offset).map(|arg| {
+                    Arc::new(OpBuilder::Frame {
+                        component_id: component_id.clone(),
+                        arg,
+                    })
+                })
+            }
+            // Dynamic terminals carry no shiftable table ops: `name` is a Data op and the
+            // member templates' offsets are relative to the element base, not the table.
+            OpBuilder::List { .. } | OpBuilder::Map { .. } | OpBuilder::PathComponent { .. } => {
+                None
+            }
         }
     }
 
@@ -623,6 +1046,69 @@ pub mod builder {
             id: D::ID,
             data,
             arg,
+        })
+    }
+
+    /// Creates a UTF-8 name op in the data side-table (align 1).
+    ///
+    /// Used for dynamic-frame path prefixes ([`list`]/[`map`]) and member names
+    /// ([`path_component`]).
+    pub fn name(s: &str) -> Arc<OpBuilder> {
+        Arc::new(OpBuilder::Data {
+            align: 1,
+            data: s.as_bytes().to_vec(),
+        })
+    }
+
+    /// Creates a frame-identity op (see [`Op::Frame`]) wrapping `arg`.
+    pub fn frame(component_id: impl Into<ComponentId>, arg: Arc<OpBuilder>) -> Arc<OpBuilder> {
+        let component_id = component_id.into();
+        let component_id = data(&component_id);
+        Arc::new(OpBuilder::Frame { component_id, arg })
+    }
+
+    /// Creates a dynamic-leaf terminal (see [`Op::PathComponent`]) naming `member_name`.
+    ///
+    /// The final component id is the dotted path accumulated by the enclosing
+    /// [`list`]/[`map`] (`<prefix>.<key>.<member_name>`).
+    pub fn path_component(member_name: &str) -> Arc<OpBuilder> {
+        Arc::new(OpBuilder::PathComponent {
+            name: name(member_name),
+        })
+    }
+
+    /// Creates a dynamic list terminal (see [`Op::List`]).
+    ///
+    /// `prefix` is the field's path prefix (e.g. `"processes"`); `members` describe one
+    /// element with offsets relative to the element base; `stride` is the element size.
+    pub fn list(
+        prefix: &str,
+        members: impl IntoIterator<Item = FieldBuilder>,
+        stride: u32,
+    ) -> Arc<OpBuilder> {
+        Arc::new(OpBuilder::List {
+            name: name(prefix),
+            members: members.into_iter().collect(),
+            stride,
+        })
+    }
+
+    /// Creates a dynamic map terminal (see [`Op::Map`]).
+    ///
+    /// Entries are `{ key_off: u32, key_len: u32, <pad> value }`; `value_offset` locates
+    /// the value sub-frame within an entry. Member template offsets are relative to the
+    /// value sub-frame base.
+    pub fn map(
+        prefix: &str,
+        members: impl IntoIterator<Item = FieldBuilder>,
+        stride: u32,
+        value_offset: u32,
+    ) -> Arc<OpBuilder> {
+        Arc::new(OpBuilder::Map {
+            name: name(prefix),
+            members: members.into_iter().collect(),
+            stride,
+            value_offset,
         })
     }
 
@@ -753,11 +1239,67 @@ pub mod builder {
                     let data = self.visit(data);
                     Op::Ext { id: *id, data, arg }
                 }
+                OpBuilder::Frame { component_id, arg } => {
+                    let component_id = self.visit(component_id);
+                    let arg = self.visit(arg);
+                    Op::Frame { component_id, arg }
+                }
+                OpBuilder::PathComponent { name } => {
+                    let name = self.visit(name);
+                    Op::PathComponent { name }
+                }
+                OpBuilder::List {
+                    name,
+                    members,
+                    stride,
+                } => {
+                    let name = self.visit(name);
+                    let members = self.visit_members(members);
+                    Op::List {
+                        name,
+                        members,
+                        stride: *stride,
+                    }
+                }
+                OpBuilder::Map {
+                    name,
+                    members,
+                    stride,
+                    value_offset,
+                } => {
+                    let name = self.visit(name);
+                    let members = self.visit_members(members);
+                    Op::Map {
+                        name,
+                        members,
+                        stride: *stride,
+                        value_offset: *value_offset,
+                    }
+                }
             };
             let op_ref = OpRef(self.vtable.ops.len() as u32);
             self.vtable.ops.push(op);
             self.visited.insert(id, op_ref);
             op_ref
+        }
+
+        /// Appends a dynamic element's member-template fields to the VTable as a
+        /// contiguous block, returning the [`ElementFields`] range that names them.
+        ///
+        /// Each member's op chain is visited first (which may append *nested* template
+        /// fields earlier in the list), then the direct member [`Field`]s are pushed
+        /// together so this op's range stays contiguous.
+        fn visit_members(&mut self, members: &[FieldBuilder]) -> ElementFields {
+            let resolved: Vec<(Offset, u32, OpRef)> = members
+                .iter()
+                .map(|m| (m.offset, m.len, self.visit(&m.arg)))
+                .collect();
+            let start = self.vtable.fields.len() as u32;
+            let count = resolved.len() as u32;
+            for (offset, len, arg) in resolved {
+                self.vtable.fields.push(Field { offset, len, arg });
+            }
+            ElementFields { start, count }
         }
     }
 
@@ -904,5 +1446,215 @@ mod tests {
         let value = sink.f64_components.get(&ComponentId::new("value")).unwrap();
         assert_eq!(value.buf.as_buf(), &[7.0]);
         assert_eq!(sink.timestamp, Some(Timestamp(4242)));
+    }
+
+    // ---- dynamic frame tests (vtable-dynamic.md §5) ----
+
+    use super::builder::*;
+    use super::{Error, RealizedField};
+    use std::collections::HashMap as Map;
+
+    /// Records every scalar component it sees as an `f64`, plus its timestamp.
+    #[derive(Default)]
+    struct DynSink {
+        values: Map<ComponentId, f64>,
+        timestamps: Map<ComponentId, Option<Timestamp>>,
+    }
+
+    impl Decomponentize for DynSink {
+        type Error = Infallible;
+        fn apply_value(
+            &mut self,
+            component_id: ComponentId,
+            value: ComponentView<'_>,
+            timestamp: Option<Timestamp>,
+        ) -> Result<(), Self::Error> {
+            self.values.insert(component_id, value.to_f64());
+            self.timestamps.insert(component_id, timestamp);
+            Ok(())
+        }
+    }
+
+    fn put_u32(buf: &mut Vec<u8>, v: u32) {
+        buf.extend_from_slice(&v.to_le_bytes());
+    }
+    fn put_u64(buf: &mut Vec<u8>, v: u64) {
+        buf.extend_from_slice(&v.to_le_bytes());
+    }
+    fn put_f64(buf: &mut Vec<u8>, v: f64) {
+        buf.extend_from_slice(&v.to_le_bytes());
+    }
+    fn put_i64(buf: &mut Vec<u8>, v: i64) {
+        buf.extend_from_slice(&v.to_le_bytes());
+    }
+
+    fn process_members() -> Vec<super::builder::FieldBuilder> {
+        vec![
+            raw_field(0, 8, schema(PrimType::U64, &[], path_component("pid"))),
+            raw_field(8, 8, schema(PrimType::F64, &[], path_component("cpu_usage"))),
+        ]
+    }
+
+    /// §5a — `FrameList<Process>` with 2 elements.
+    #[test]
+    fn test_dynamic_list() {
+        // top-level `processes` field: offset 8 is the slot, len 8; the list inherits
+        // the frame timestamp at offset 0.
+        let v = vtable([raw_field(
+            8,
+            8,
+            timestamp(raw_table(0, 8), list("processes", process_members(), 16)),
+        )]);
+
+        let mut t = Vec::new();
+        put_i64(&mut t, 1000); // timestamp @0
+        put_u32(&mut t, 16); // slot.trailer_off @8
+        put_u32(&mut t, 32); // slot.byte_len @12
+        put_u64(&mut t, 1001); // [0].pid @16
+        put_f64(&mut t, 0.5); // [0].cpu @24
+        put_u64(&mut t, 1002); // [1].pid @32
+        put_f64(&mut t, 0.25); // [1].cpu @40
+        assert_eq!(t.len(), 48);
+
+        let mut sink = DynSink::default();
+        v.apply(&t, &mut sink).unwrap().unwrap();
+
+        assert_eq!(sink.values[&ComponentId::new("processes.0.pid")], 1001.0);
+        assert_eq!(sink.values[&ComponentId::new("processes.0.cpu_usage")], 0.5);
+        assert_eq!(sink.values[&ComponentId::new("processes.1.pid")], 1002.0);
+        assert_eq!(sink.values[&ComponentId::new("processes.1.cpu_usage")], 0.25);
+        // every element-member inherits the shared frame timestamp
+        for id in ["processes.0.pid", "processes.0.cpu_usage", "processes.1.pid"] {
+            assert_eq!(sink.timestamps[&ComponentId::new(id)], Some(Timestamp(1000)));
+        }
+    }
+
+    /// §5b — `FrameMap<Name, Process>` with 2 entries; keys live in the trailer name pool.
+    #[test]
+    fn test_dynamic_map() {
+        let v = vtable([raw_field(
+            8,
+            8,
+            timestamp(raw_table(0, 8), map("processes", process_members(), 24, 8)),
+        )]);
+
+        let mut t = Vec::new();
+        put_i64(&mut t, 1000); // timestamp @0
+        put_u32(&mut t, 16); // slot.trailer_off @8 (entry array)
+        put_u32(&mut t, 48); // slot.byte_len @12
+        // entry[0] @16
+        put_u32(&mut t, 64); // key_off -> "htop"
+        put_u32(&mut t, 4); // key_len
+        put_u64(&mut t, 1001); // value.pid @24
+        put_f64(&mut t, 0.5); // value.cpu @32
+        // entry[1] @40
+        put_u32(&mut t, 68); // key_off -> "init"
+        put_u32(&mut t, 4); // key_len
+        put_u64(&mut t, 1002); // value.pid @48
+        put_f64(&mut t, 0.25); // value.cpu @56
+        // name pool @64
+        t.extend_from_slice(b"htop");
+        t.extend_from_slice(b"init");
+        assert_eq!(t.len(), 72);
+
+        let mut sink = DynSink::default();
+        v.apply(&t, &mut sink).unwrap().unwrap();
+
+        assert_eq!(sink.values[&ComponentId::new("processes.htop.pid")], 1001.0);
+        assert_eq!(sink.values[&ComponentId::new("processes.htop.cpu_usage")], 0.5);
+        assert_eq!(sink.values[&ComponentId::new("processes.init.pid")], 1002.0);
+        assert_eq!(sink.values[&ComponentId::new("processes.init.cpu_usage")], 0.25);
+        assert_eq!(
+            sink.timestamps[&ComponentId::new("processes.htop.pid")],
+            Some(Timestamp(1000))
+        );
+    }
+
+    /// §5b variant — a map key containing `.` is rejected.
+    #[test]
+    fn test_dynamic_map_dot_key_rejected() {
+        let v = vtable([raw_field(
+            8,
+            8,
+            map("processes", process_members(), 24, 8),
+        )]);
+
+        let mut t = Vec::new();
+        put_i64(&mut t, 0); // timestamp @0 (unused)
+        put_u32(&mut t, 16); // slot.trailer_off
+        put_u32(&mut t, 24); // slot.byte_len (one entry)
+        put_u32(&mut t, 40); // key_off -> "a.b"
+        put_u32(&mut t, 3); // key_len
+        put_u64(&mut t, 1001);
+        put_f64(&mut t, 0.5);
+        t.extend_from_slice(b"a.b"); // @40
+        assert_eq!(t.len(), 43);
+
+        let mut sink = DynSink::default();
+        let err = v.apply(&t, &mut sink).unwrap_err();
+        assert!(matches!(err, Error::InvalidComponentData));
+    }
+
+    /// §5c — nested `FrameMap<Name, Host>` where `Host { threads: FrameList<Thread> }`.
+    #[test]
+    fn test_dynamic_nested() {
+        // Host has a single member, the inner thread list, whose slot is at value
+        // offset 0; Thread has a single `state: u8` member.
+        let thread_members = || vec![raw_field(0, 1, schema(PrimType::U8, &[], path_component("state")))];
+        let host_members = || vec![raw_field(0, 8, list("threads", thread_members(), 1))];
+
+        let v = vtable([raw_field(
+            8,
+            8,
+            timestamp(raw_table(0, 8), map("processes", host_members(), 16, 8)),
+        )]);
+
+        let mut t = Vec::new();
+        put_i64(&mut t, 1000); // timestamp @0
+        put_u32(&mut t, 16); // slot_outer.trailer_off @8
+        put_u32(&mut t, 16); // slot_outer.byte_len @12 (one 16-byte entry)
+        // entry[0] @16
+        put_u32(&mut t, 40); // key_off -> "htop"
+        put_u32(&mut t, 4); // key_len
+        // Host value @24 (entry 16 + value_offset 8): inner list slot
+        put_u32(&mut t, 44); // slot_inner.trailer_off
+        put_u32(&mut t, 1); // slot_inner.byte_len (one 1-byte thread)
+        // pad 32..40 so the name pool / trailer line up with the offsets above
+        while t.len() < 40 {
+            t.push(0);
+        }
+        t.extend_from_slice(b"htop"); // @40
+        t.push(2); // thread[0].state @44
+        assert_eq!(t.len(), 45);
+
+        let mut sink = DynSink::default();
+        v.apply(&t, &mut sink).unwrap().unwrap();
+
+        assert_eq!(
+            sink.values[&ComponentId::new("processes.htop.threads.0.state")],
+            2.0
+        );
+        assert_eq!(
+            sink.timestamps[&ComponentId::new("processes.htop.threads.0.state")],
+            Some(Timestamp(1000))
+        );
+    }
+
+    /// Schema/registration mode (`table = None`) surfaces each member template's ty/shape.
+    #[test]
+    fn test_dynamic_registration_mode() {
+        let v = vtable([raw_field(8, 8, list("processes", process_members(), 16))]);
+
+        let fields: Vec<_> = v.realize_fields(None).map(|r| r.unwrap()).collect();
+        // two member templates, emitted once, with no view
+        assert_eq!(fields.len(), 2);
+        let by_id: Map<ComponentId, &RealizedField> =
+            fields.iter().map(|f| (f.component_id, f)).collect();
+        let pid = by_id[&ComponentId::new("processes.pid")];
+        assert_eq!(pid.ty, PrimType::U64);
+        assert!(pid.shape.is_empty());
+        assert!(pid.view.is_none());
+        let cpu = by_id[&ComponentId::new("processes.cpu_usage")];
+        assert_eq!(cpu.ty, PrimType::F64);
     }
 }

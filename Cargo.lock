@@ -9074,6 +9074,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "metor-fsw-2"
+version = "0.14.2"
+dependencies = [
+ "metor-fsw",
+ "metor-fsw-macros",
+ "metor-fsw-ring",
+ "metor-proto",
+ "metor-proto-wkt",
+ "zerocopy",
+]
+
+[[package]]
 name = "metor-fsw-adcs"
 version = "0.1.0"
 dependencies = [
@@ -9093,6 +9105,15 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 2.0.117",
+]
+
+[[package]]
+name = "metor-fsw-ring"
+version = "0.14.2"
+dependencies = [
+ "memmap2",
+ "stellarator",
+ "tempfile",
 ]
 
 [[package]]

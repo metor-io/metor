@@ -2,9 +2,9 @@ use convert_case::{Case, Casing};
 use darling::FromDeriveInput;
 use darling::ast::{self};
 use proc_macro::TokenStream;
-use proc_macro2::Span;
+use proc_macro2::{Span, TokenStream as TokenStream2};
 use quote::quote;
-use syn::{DeriveInput, Generics, Ident, parse_macro_input};
+use syn::{DeriveInput, Generics, Ident};
 
 #[derive(Debug, FromDeriveInput)]
 #[darling(attributes(metor_fsw), supports(struct_named))]
@@ -13,23 +13,38 @@ pub struct Decomponentize {
     generics: Generics,
     data: ast::Data<(), crate::Field>,
     parent: Option<String>,
+    name: Option<String>,
 }
 
 pub fn decomponentize(input: TokenStream) -> TokenStream {
+    let input = syn::parse_macro_input!(input as DeriveInput);
+    decomponentize_impl(&input).into()
+}
+
+pub fn decomponentize_impl(input: &DeriveInput) -> TokenStream2 {
     let crate_name = crate::metor_fsw_crate_name();
-    let input = parse_macro_input!(input as DeriveInput);
     let Decomponentize {
         ident,
         generics,
         data,
         parent,
-    } = Decomponentize::from_derive_input(&input).unwrap();
+        name,
+    } = Decomponentize::from_derive_input(input).unwrap();
+    let parent = parent.or(name);
     let where_clause = &generics.where_clause;
     let impeller = quote! { #crate_name::metor_proto };
     let fields = data.take_struct().unwrap();
-    let if_arms = fields.fields.iter().map(|field| {
+    let if_arms = fields.fields.iter().filter(|f| !f.timestamp).map(|field| {
         let ty = &field.ty;
         let ident = &field.ident;
+        // Nested/dynamic fields forward every value (a `FrameList`/`FrameMap` slot
+        // can't be reconstructed from individual scalar components, so its
+        // `apply_value` is a no-op).
+        if field.is_nested() {
+            return quote! {
+                self.#ident.apply_value(component_id, view.clone(), timestamp)?;
+            };
+        }
         let name = field
             .ident
             .as_ref()
@@ -37,27 +52,18 @@ pub fn decomponentize(input: TokenStream) -> TokenStream {
             .to_string()
             .to_case(Case::UpperSnake);
         let component_id = field.component_id();
-
-        let component_id = if let Some(parent) = &parent {
-            format!("{parent}.{component_id}")
-        } else {
-            component_id.to_string()
+        let component_id = match &parent {
+            Some(parent) => format!("{parent}.{component_id}"),
+            None => component_id,
         };
         let component_id = quote! { #impeller::types::ComponentId::new(#component_id) };
-        if !field.nest {
-        let const_name = format!("{name}_ID");
-            let const_name = syn::Ident::new(&const_name, Span::call_site());
-            quote! {
-                const #const_name: #impeller::types::ComponentId = #component_id;
-                if component_id == #const_name {
-                    if let Ok(val) = <#ty as #impeller::com_de::FromComponentView>::from_component_view(view.clone()) {
-                        self.#ident = val;
-                    }
+        let const_name = syn::Ident::new(&format!("{name}_ID"), Span::call_site());
+        quote! {
+            const #const_name: #impeller::types::ComponentId = #component_id;
+            if component_id == #const_name {
+                if let Ok(val) = <#ty as #impeller::com_de::FromComponentView>::from_component_view(view.clone()) {
+                    self.#ident = val;
                 }
-            }
-        } else {
-            quote! {
-                self.#ident.apply_value(component_id,  value.clone(), timestamp.clone())?;
             }
         }
     });
@@ -74,5 +80,4 @@ pub fn decomponentize(input: TokenStream) -> TokenStream {
             }
         }
     }
-    .into()
 }

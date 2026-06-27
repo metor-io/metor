@@ -42,6 +42,7 @@ pub mod buf;
 pub mod com_de;
 pub mod component;
 pub mod error;
+pub mod hash;
 pub mod registry;
 pub mod schema;
 pub mod types;
