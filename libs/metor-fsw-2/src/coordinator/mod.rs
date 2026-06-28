@@ -17,8 +17,8 @@ use core::mem::offset_of;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{
-    AtomicBool, AtomicUsize,
-    Ordering::{Acquire, Release},
+    AtomicBool, AtomicU64, AtomicUsize,
+    Ordering::{Acquire, Relaxed, Release},
 };
 use std::time::{Duration, Instant};
 
@@ -932,6 +932,7 @@ impl CoordinatorBuilder {
             status_view,
             stopped: Vec::new(),
             cycle: 0,
+            progress: Arc::new(AtomicU64::new(0)),
             registry,
             // Declared last so the canonical ring handles drop after every port.
             rings: table,
@@ -1031,6 +1032,10 @@ pub struct Coordinator {
     status_view: Input<CoordinatorStatus>,
     stopped: Vec<StoppedSystem>,
     cycle: u64,
+    /// A shared, lock-free mirror of `cycle` that an out-of-loop observer (e.g. the CLI
+    /// runner's heartbeat) can read while `run_for` holds `&mut self` — published each
+    /// cycle. Purely observational; nothing in the loop reads it back.
+    progress: Arc<AtomicU64>,
     /// The broad output registry over every tappable buffer (telemetry.md §2).
     registry: Arc<OutputRegistry>,
     /// Canonical ring handles; declared last so they drop after every port.
@@ -1048,6 +1053,13 @@ impl Coordinator {
     /// in the coordinator status frame.
     pub fn stopped(&self) -> &[StoppedSystem] {
         &self.stopped
+    }
+
+    /// A shared handle to the live cycle counter (0 before the first cycle), readable
+    /// while [`run_for`](Self::run_for) is running — e.g. for a progress heartbeat on
+    /// another task. Lock-free, observational only.
+    pub fn progress(&self) -> Arc<AtomicU64> {
+        self.progress.clone()
     }
 
     /// The broad output registry over every tappable buffer (telemetry.md §2): an
@@ -1094,6 +1106,8 @@ impl Coordinator {
         for k in 0..cycles {
             let start = Instant::now();
             self.cycle += 1;
+            // Publish progress for any out-of-loop observer (the CLI heartbeat).
+            self.progress.store(self.cycle, Relaxed);
             // The per-cycle timestamp every system shares: wall time, or the
             // simulated clock at `epoch + k*dt` (coordinator.md §6, fix #5/#6).
             let now = match self.config.clock {

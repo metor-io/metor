@@ -17,8 +17,11 @@
 //! arbitrary mission's statically-linked systems (a static mission keeps its own host).
 
 use std::ffi::OsString;
-use std::net::SocketAddr;
+use std::net::{SocketAddr, TcpStream};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+use std::time::{Duration, Instant};
 
 use clap::{Args, Parser, Subcommand};
 use miette::IntoDiagnostic;
@@ -186,17 +189,109 @@ fn cmd_package(args: PackageArgs) -> miette::Result<()> {
 }
 
 /// `run` — load the wiring (bundle or source-KDL+`--build`), apply CLI overrides, resolve
-/// against the empty (dl-only) registry, and drive the coordinator on the runtime.
+/// against the empty (dl-only) registry, and drive the coordinator on the runtime. Prints a
+/// config banner (so it is obvious what clock/telemetry are active) and a live progress
+/// heartbeat (so a long run visibly advances).
 fn cmd_run(args: RunArgs) -> miette::Result<()> {
     let mut wiring = load_run_wiring(&args)?;
     apply_overrides(&mut wiring, &args)?;
-    let mut coord = resolve(&wiring, &Registry::new())?;
+    print_run_banner(&args.target, &wiring);
+
     let cycles = args.cycles.unwrap_or(usize::MAX);
-    // Enter the async runtime at the leaf; `run_for` does init → cycle loop → shutdown.
+    let total = args.cycles; // `Some(n)` ⇒ show `cycle n/total`; `None` ⇒ open-ended.
+    let mut coord = resolve(&wiring, &Registry::new())?;
+    let progress = coord.progress();
+
+    // Enter the async runtime at the leaf; `run_for` does init → cycle loop → shutdown. A
+    // side heartbeat task reads the shared progress counter while the loop holds `&mut coord`.
     stellarator::run(move || async move {
+        let _beat = stellarator::spawn(heartbeat(progress, total)).drop_guard();
         coord.run_for(cycles).await;
+        let done = coord.progress().load(Relaxed);
+        let stopped = coord.stopped();
+        if stopped.is_empty() {
+            println!("✓ mission complete — {done} cycles.");
+        } else {
+            let names: Vec<&str> = stopped.iter().map(|s| s.name).collect();
+            println!(
+                "✗ mission stopped after {done} cycles — {} system(s) hard-stopped: {}",
+                stopped.len(),
+                names.join(", ")
+            );
+        }
     });
     Ok(())
+}
+
+/// Print what `run` is about to do — the source, the systems, the active clock, the
+/// telemetry target (with a reachability probe), and the duration — so the run is never a
+/// silent black box. Synchronous; called before the runtime starts.
+fn print_run_banner(target: &Path, wiring: &Wiring) {
+    let names: Vec<&str> = wiring.systems.iter().map(|s| s.name.as_str()).collect();
+    let kind = if target.is_dir() { "bundle" } else { "mission" };
+    println!("metor-fsw — running {kind} {}", target.display());
+    println!("  systems:   {} ({})", wiring.systems.len(), names.join(", "));
+
+    match wiring.coordinator.clock {
+        ClockSpec::Wall => println!(
+            "  clock:     wall, {:.0} Hz (paced, real time)",
+            wiring.coordinator.cycle_rate
+        ),
+        ClockSpec::Simulated { dt_secs } => {
+            println!("  clock:     simulated, dt={dt_secs}s (free-running, as fast as possible)")
+        }
+    }
+
+    match &wiring.telemetry {
+        None => println!(
+            "  telemetry: off — pass `--telemetry <addr>` to stream to metor-panel"
+        ),
+        Some(t) => {
+            let reach = if probe_telemetry(t.addr) {
+                "✓ reachable".to_string()
+            } else {
+                "⚠ not reachable — start metor-panel BEFORE the mission (no auto-reconnect in v1)"
+                    .to_string()
+            };
+            println!("  telemetry: {} ({}) {reach}", t.addr, mode_label(&t.mode));
+            // The sim clock free-runs, so a live downlink would race far ahead of real time.
+            if matches!(wiring.coordinator.clock, ClockSpec::Simulated { .. }) {
+                println!("  note:      simulated clock free-runs; pass `--wall` for real-time panel viewing");
+            }
+        }
+    }
+    println!();
+}
+
+/// A one-shot, best-effort TCP reachability check for the telemetry endpoint, so the banner
+/// can warn when metor-panel is not listening yet (the downlink connects once and does not
+/// retry). A transient probe connection is harmless; never fails the run.
+fn probe_telemetry(addr: SocketAddr) -> bool {
+    TcpStream::connect_timeout(&addr, Duration::from_millis(300)).is_ok()
+}
+
+/// A short human label for the telemetry tap mode.
+fn mode_label(mode: &TelemetryModeSpec) -> &'static str {
+    match mode {
+        TelemetryModeSpec::All => "all",
+        TelemetryModeSpec::Subset { .. } => "subset",
+    }
+}
+
+/// The progress heartbeat: every couple of seconds, print the live cycle counter (read from
+/// the coordinator's shared progress handle) so a long run visibly advances. Cancelled when
+/// its `drop_guard` drops at the end of `run`.
+async fn heartbeat(progress: Arc<AtomicU64>, total: Option<usize>) {
+    let start = Instant::now();
+    loop {
+        stellarator::sleep(Duration::from_secs(2)).await;
+        let n = progress.load(Relaxed);
+        let secs = start.elapsed().as_secs_f64();
+        match total {
+            Some(t) => println!("  … cycle {n}/{t}  ({secs:.0}s elapsed)"),
+            None => println!("  … cycle {n}  ({secs:.0}s elapsed)"),
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------

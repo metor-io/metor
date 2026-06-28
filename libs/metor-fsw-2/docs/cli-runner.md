@@ -146,6 +146,20 @@ which (a directory, or a `*.bundle`, is a bundle). Loading differs:
 `--wall`/`--sim-dt` are mutually exclusive (clap group). `--telemetry`/`--no-telemetry` are
 mutually exclusive.
 
+**Run output.** `run` is not silent: before the runtime starts it prints a banner (the
+systems, the active clock, the telemetry target, the duration), and while running it emits a
+cycle-progress heartbeat (read from a shared `Coordinator::progress()` counter) every couple
+of seconds, then a completion/`hard-stopped` summary. So a long mission visibly advances and
+the active config is never a guess.
+
+**Telemetry operational notes** (surfaced in the banner):
+- The downlink **connects once and does not auto-reconnect** (v1; telemetry.md). So **metor-panel
+  must be listening before the mission starts** — `run` does a one-shot reachability probe and
+  warns (`⚠ not reachable …`) when it is not, before any cycle runs.
+- Under the **simulated** clock the loop free-runs (no pacing), so a live downlink races far
+  ahead of real time; the banner suggests `--wall` whenever telemetry is on with a sim clock.
+  For live panel viewing use `--wall --telemetry <addr>`.
+
 ### 2.4 The build→run shortcut
 
 There is no separate "build-and-run" verb. The shortcut is the `--build` flag on `run`:
