@@ -41,6 +41,21 @@ fn descriptors_body(bundle: &Bundle) -> TokenStream2 {
     }
 }
 
+/// Emits the `BindPorts::bind` body: each port type's `bind(binder)`, in field
+/// order — symmetric to `descriptors()`, so the binder's positional cursor lines
+/// each port up with the ring the coordinator reserved for it.
+fn bind_body(bundle: &Bundle) -> TokenStream2 {
+    let fields = bundle.data.as_ref().take_struct().expect("named struct");
+    let binds = fields.iter().map(|f| {
+        let id = f.ident.as_ref().expect("named field");
+        let ty = &f.ty;
+        quote! { #id: <#ty>::bind(binder) }
+    });
+    quote! {
+        Self { #(#binds),* }
+    }
+}
+
 pub fn system_input(input: TokenStream) -> TokenStream {
     let parsed = syn::parse_macro_input!(input as DeriveInput);
     let bundle = Bundle::from_derive_input(&parsed).unwrap();
@@ -57,6 +72,8 @@ pub fn system_input(input: TokenStream) -> TokenStream {
         quote! { || self.#id.is_lapped() }
     });
 
+    let bind = bind_body(&bundle);
+
     quote! {
         impl #fsw2::SystemInput for #ident #generics #where_clause {
             fn descriptors() -> ::std::vec::Vec<#fsw2::PortDesc> {
@@ -64,6 +81,12 @@ pub fn system_input(input: TokenStream) -> TokenStream {
             }
             fn any_lapped(&self) -> bool {
                 false #(#lapped)*
+            }
+        }
+
+        impl #fsw2::BindPorts for #ident #generics #where_clause {
+            fn bind(binder: &mut #fsw2::Binder) -> Self {
+                #bind
             }
         }
     }
@@ -78,11 +101,18 @@ pub fn system_output(input: TokenStream) -> TokenStream {
     let generics = &bundle.generics;
     let where_clause = &generics.where_clause;
     let descriptors = descriptors_body(&bundle);
+    let bind = bind_body(&bundle);
 
     quote! {
         impl #fsw2::SystemOutput for #ident #generics #where_clause {
             fn descriptors() -> ::std::vec::Vec<#fsw2::PortDesc> {
                 #descriptors
+            }
+        }
+
+        impl #fsw2::BindPorts for #ident #generics #where_clause {
+            fn bind(binder: &mut #fsw2::Binder) -> Self {
+                #bind
             }
         }
     }

@@ -15,6 +15,7 @@ use metor_fsw_ring::{
 use metor_proto::error::Error as ProtoError;
 use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
 
+use crate::binder::Binder;
 use crate::descriptor::PortDesc;
 use crate::dynamic::Slot;
 use crate::frame::Frame;
@@ -66,6 +67,20 @@ impl<F: Frame, B: Backing, WD: WakeSource, WS: WakeSink> Output<F, B, WD, WS> {
     /// This port's static descriptor (for wiring/sizing before any data flows).
     pub fn descriptor() -> PortDesc {
         PortDesc::of::<F>()
+    }
+}
+
+impl<F: Frame, WD, WS> Output<F, BoxBacking, WD, WS>
+where
+    WD: WakeSource + Default + Clone + 'static,
+    WS: WakeSink + Default + Clone + 'static,
+{
+    /// Bind this output over the next ring the [`Binder`] hands out, taking the
+    /// matched writer-side wake endpoints for that buffer (coordinator.md §1.4).
+    /// Walked in `descriptors()` order by the generated bundle `bind`.
+    pub fn bind(binder: &mut Binder) -> Self {
+        let (ring, data, space) = binder.next_output::<WD, WS>();
+        Output::new(ring.writer(data, space))
     }
 }
 
@@ -151,6 +166,23 @@ impl<F: Frame, B: Backing, RD: WakeSink, RS: WakeSource> Input<F, B, RD, RS> {
     /// ports call this on lap to "drop on full and continue" (system.md §3.2).
     pub fn resync(&self) {
         self.view.resync();
+    }
+}
+
+impl<F: Frame, RD, RS> Input<F, BoxBacking, RD, RS>
+where
+    RD: WakeSink + Default + Clone + 'static,
+    RS: WakeSource + Default + Clone + 'static,
+{
+    /// Bind this input over the next ring the [`Binder`] hands out, taking the
+    /// matched reader-side wake endpoints (coordinator.md §1.4). The reader slot
+    /// was reserved at sizing time, so registering the view cannot fail.
+    pub fn bind(binder: &mut Binder) -> Self {
+        let (ring, data, space) = binder.next_input::<RD, RS>();
+        Input::new(
+            ring.view(data, space)
+                .expect("reader slot reserved at sizing time"),
+        )
     }
 }
 

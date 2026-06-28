@@ -173,7 +173,7 @@ fn cyclic_filter_end_to_end() {
             accel: -0.5,
         })
         .unwrap();
-    runner.step();
+    runner.step(Timestamp::now());
 
     // The consumer reads the produced frame: fixed region zero-copy + dynamic member.
     let nav = nav_in.latest().unwrap().expect("nav produced");
@@ -306,7 +306,7 @@ fn health_counters_published() {
     let mut runner = CyclicRunner::new(Filter { gain: 1.0 }, input, output);
     // No IMU is ever published, so every execute bumps the "imu_missing" error.
     for _ in 0..3 {
-        runner.step();
+        runner.step(Timestamp::now());
     }
 
     // Read the freshest health record and apply its vtable.
