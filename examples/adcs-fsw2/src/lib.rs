@@ -50,7 +50,7 @@ use std::time::Duration;
 
 use metor_fsw_2::{
     ClockMode, Coordinator, CoordinatorConfig, CyclicSystem, Input, Out, Output, PortRef, System,
-    SystemInput, SystemOutput, WireError,
+    SystemInput, SystemOutput, TcpTransport, TelemetryConfig, TelemetryMode, WireError,
     wiring::{FromKdlNode, RegisteredSystem, Registry},
 };
 
@@ -456,6 +456,45 @@ pub fn build_code_first() -> Result<Coordinator, WireError> {
         PortRef::new::<AttitudeEstimate>(ctrl),
     )?;
     b.connect_delayed(PortRef::new::<TorqueCmd>(ctrl), PortRef::new::<TorqueCmd>(plant))?;
+    b.build()
+}
+
+/// Wire the same closed loop for a **live run against metor-panel**.
+///
+/// Two differences from [`build_code_first`]: the clock is [`ClockMode::Wall`] (so the
+/// loop is paced at the real 120 Hz and telemetry streams in real time, rather than
+/// free-running to completion instantly), and a TCP telemetry downlink streams *every*
+/// output frame to `addr` — a running metor-panel, which serves a metor-db on
+/// `127.0.0.1:2240`. This is what `cargo run` uses. If nothing is listening the downlink
+/// simply fails to connect and the control loop runs unaffected.
+pub fn build_live(addr: std::net::SocketAddr) -> Result<Coordinator, WireError> {
+    let mut b = Coordinator::builder(CoordinatorConfig {
+        cycle_rate: 120.0,
+        default_depth: metor_fsw_2::DEFAULT_DEPTH,
+        clock: ClockMode::Wall,
+    });
+    let plant = b.add_cyclic(PlantSystem::new(PlantParams {
+        init_angle: 0.5,
+        init_rate: 0.15,
+        meas_sigma: 0.002,
+        seed: 42,
+    }));
+    let nav = b.add_cyclic(NavSystem::new(NavParams { meas_sigma: 0.02 }));
+    let ctrl = b.add_cyclic(CtrlSystem::new(CtrlParams { q_weight: 5.0, r_weight: 8.0 }));
+
+    b.connect(PortRef::new::<Sensors>(plant), PortRef::new::<Sensors>(nav))?;
+    b.connect(
+        PortRef::new::<AttitudeEstimate>(nav),
+        PortRef::new::<AttitudeEstimate>(ctrl),
+    )?;
+    b.connect_delayed(PortRef::new::<TorqueCmd>(ctrl), PortRef::new::<TorqueCmd>(plant))?;
+
+    // Stream every output frame (the ADCS frames + each system's health/log) to the panel.
+    b.add_telemetry(TelemetryConfig {
+        transport: TcpTransport::new(addr),
+        mode: TelemetryMode::All,
+    });
+
     b.build()
 }
 
