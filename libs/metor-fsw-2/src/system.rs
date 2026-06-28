@@ -148,10 +148,11 @@ pub trait System {
     const NAME: &'static str;
 
     /// Runs once before the first `execute`/`run`. May emit initial frames / health.
-    fn init(&mut self, output: &mut Self::Output);
+    /// Defaults to a no-op, so a system that needs no setup can omit it.
+    fn init(&mut self, _output: &mut Self::Output) {}
 
-    /// Runs once at teardown. May flush final frames / health.
-    fn shutdown(&mut self, output: &mut Self::Output);
+    /// Runs once at teardown. May flush final frames / health. Defaults to a no-op.
+    fn shutdown(&mut self, _output: &mut Self::Output) {}
 }
 
 /// A coordinator-driven system: the coordinator calls [`execute`](Self::execute)
@@ -161,10 +162,15 @@ pub trait CyclicSystem: System {
     /// One unit of work: read the latest inputs, write outputs. Reports trouble
     /// through `output.health()`, never a return value.
     ///
+    /// `now` is the coordinator's per-cycle timestamp (the same value for every
+    /// system in one cycle, and the value driving a [`Simulated`](crate::ClockMode)
+    /// clock); a system stamps its output frames with it rather than calling
+    /// `Timestamp::now()` independently.
+    ///
     /// `input` is `&mut` (not `&`, deviating from system.md §1.1): draining a ring
     /// `View` advances its cursor and fills the port's reused scratch, exactly the
     /// `&mut self` reason the doc's own §2.3 `Input::latest` takes.
-    fn execute(&mut self, input: &mut Self::Input, output: &mut Self::Output);
+    fn execute(&mut self, now: Timestamp, input: &mut Self::Input, output: &mut Self::Output);
 
     /// This system's self-description for wiring (system.md §5).
     fn descriptor() -> SystemDescriptor {
@@ -261,7 +267,7 @@ where
             return;
         }
         let start = std::time::Instant::now();
-        self.system.execute(&mut self.input, &mut self.output);
+        self.system.execute(now, &mut self.input, &mut self.output);
         let micros = start.elapsed().as_micros() as u64;
         self.output.health().end_cycle(now, micros);
     }

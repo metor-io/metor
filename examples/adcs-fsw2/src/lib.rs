@@ -18,9 +18,9 @@
 //!   body torque that drives the spacecraft toward the target attitude.
 //!
 //! Registration order is Plant → Nav → Ctrl, so Plant→Nav→Ctrl resolve in the same
-//! cycle and Ctrl→Plant is the one-cycle-delayed feedback back-edge (the WP5
-//! registration-order sampling rule). On the first cycle Plant has no torque yet and
-//! defaults to zero.
+//! cycle; the Ctrl→Plant torque edge is declared `connect_delayed` (KDL `delayed=#true`),
+//! the explicit one-cycle-delayed feedback back-edge that breaks the loop's cycle at
+//! build time. On the first cycle Plant has no torque yet and defaults to zero.
 //!
 //! ## A note on frame field types
 //!
@@ -46,9 +46,11 @@ use rand::rngs::StdRng;
 use rand_distr::{Distribution, Normal};
 use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
 
+use std::time::Duration;
+
 use metor_fsw_2::{
-    Coordinator, CoordinatorConfig, CyclicSystem, Input, Out, Output, PortRef, System, SystemInput,
-    SystemOutput, WireError,
+    ClockMode, Coordinator, CoordinatorConfig, CyclicSystem, Input, Out, Output, PortRef, System,
+    SystemInput, SystemOutput, WireError,
     wiring::{FromKdlNode, RegisteredSystem, Registry},
 };
 
@@ -221,12 +223,10 @@ impl System for PlantSystem {
     type Input = PlantIn;
     type Output = Out<PlantOut>;
     const NAME: &'static str = "plant";
-    fn init(&mut self, _o: &mut Self::Output) {}
-    fn shutdown(&mut self, _o: &mut Self::Output) {}
 }
 
 impl CyclicSystem for PlantSystem {
-    fn execute(&mut self, input: &mut PlantIn, o: &mut Self::Output) {
+    fn execute(&mut self, now: Timestamp, input: &mut PlantIn, o: &mut Self::Output) {
         // Latest commanded torque (zero on the first cycle / if none has arrived).
         let torque: V3 = match input.torque.latest() {
             Ok(Some(cmd)) => cmd.get().torque,
@@ -246,7 +246,6 @@ impl CyclicSystem for PlantSystem {
         let sun_body = (&att_inv * self.sun_ref).normalize() + self.noise(self.meas_sigma);
         let mag_body = (&att_inv * self.mag_ref).normalize() + self.noise(self.meas_sigma);
 
-        let now = Timestamp::now();
         let _ = o.sensors.write(&Sensors {
             timestamp: now,
             gyro,
@@ -314,12 +313,10 @@ impl System for NavSystem {
     type Input = NavIn;
     type Output = Out<NavOut>;
     const NAME: &'static str = "nav";
-    fn init(&mut self, _o: &mut Self::Output) {}
-    fn shutdown(&mut self, _o: &mut Self::Output) {}
 }
 
 impl CyclicSystem for NavSystem {
-    fn execute(&mut self, input: &mut NavIn, o: &mut Self::Output) {
+    fn execute(&mut self, now: Timestamp, input: &mut NavIn, o: &mut Self::Output) {
         let Ok(Some(s)) = input.sensors.latest() else {
             return; // no sample yet
         };
@@ -334,7 +331,7 @@ impl CyclicSystem for NavSystem {
         self.state.reset_if_invalid();
 
         let _ = o.estimate.write(&AttitudeEstimate {
-            timestamp: Timestamp::now(),
+            timestamp: now,
             q_hat: self.state.q_hat.clone(),
             omega: s.gyro, // pass the measured body rate through to the controller
             b_hat: self.state.b_hat,
@@ -388,12 +385,10 @@ impl System for CtrlSystem {
     type Input = CtrlIn;
     type Output = Out<CtrlOut>;
     const NAME: &'static str = "ctrl";
-    fn init(&mut self, _o: &mut Self::Output) {}
-    fn shutdown(&mut self, _o: &mut Self::Output) {}
 }
 
 impl CyclicSystem for CtrlSystem {
-    fn execute(&mut self, input: &mut CtrlIn, o: &mut Self::Output) {
+    fn execute(&mut self, now: Timestamp, input: &mut CtrlIn, o: &mut Self::Output) {
         let Ok(Some(e)) = input.estimate.latest() else {
             return;
         };
@@ -404,7 +399,7 @@ impl CyclicSystem for CtrlSystem {
         let torque = self.lqr.control(q_hat, ang_vel, self.target.clone());
 
         let _ = o.torque.write(&TorqueCmd {
-            timestamp: Timestamp::now(),
+            timestamp: now,
             torque,
         });
     }
@@ -433,14 +428,18 @@ pub fn registry() -> Registry {
 /// Wire the three-system closed loop **code-first** via the coordinator builder.
 ///
 /// Registration order Plant → Nav → Ctrl makes Plant→Nav→Ctrl resolve in the same
-/// cycle; the Ctrl→Plant `torque_cmd` edge is the one-cycle-delayed feedback
-/// back-edge. The `cycle_rate` here is wall-clock pacing only — the physics
-/// integrates at [`DT`] internally, so the loop converges in fixed sim time
-/// regardless of how fast the coordinator is driven.
+/// cycle; the Ctrl→Plant `torque_cmd` edge is wired with [`connect_delayed`] as the
+/// explicit one-cycle-delayed feedback back-edge (so the loop's cycle is broken at
+/// build time, not by registration luck). The clock is [`ClockMode::Simulated`]
+/// with `dt = DT` (1/120 s): the loop free-runs (no wall pacing) and every system's
+/// `now`, and the physics integrator, advance by `DT` per cycle.
 pub fn build_code_first() -> Result<Coordinator, WireError> {
     let mut b = Coordinator::builder(CoordinatorConfig {
-        cycle_rate: 2000.0,
+        cycle_rate: 120.0,
         default_depth: metor_fsw_2::DEFAULT_DEPTH,
+        clock: ClockMode::Simulated {
+            dt: Duration::from_secs_f64(DT),
+        },
     });
     let plant = b.add_cyclic(PlantSystem::new(PlantParams {
         init_angle: 0.5,
@@ -456,13 +455,15 @@ pub fn build_code_first() -> Result<Coordinator, WireError> {
         PortRef::new::<AttitudeEstimate>(nav),
         PortRef::new::<AttitudeEstimate>(ctrl),
     )?;
-    b.connect(PortRef::new::<TorqueCmd>(ctrl), PortRef::new::<TorqueCmd>(plant))?;
+    b.connect_delayed(PortRef::new::<TorqueCmd>(ctrl), PortRef::new::<TorqueCmd>(plant))?;
     b.build()
 }
 
-/// The same three-system closed loop, expressed as a KDL wiring document.
+/// The same three-system closed loop, expressed as a KDL wiring document. `sim_dt`
+/// selects the free-running simulated clock (1/120 s logical step) and the Ctrl →
+/// Plant torque edge is `delayed=#true` — the KDL twin of `connect_delayed`.
 pub const KDL: &str = r#"
-coordinator cycle_rate=2000.0
+coordinator cycle_rate=120.0 sim_dt=0.008333333333333333
 
 system "plant" type="Plant" init_angle=0.5 init_rate=0.15 meas_sigma=0.002 seed=42
 system "nav"   type="Nav"   meas_sigma=0.02
@@ -470,5 +471,5 @@ system "ctrl"  type="Ctrl"  q_weight=5.0 r_weight=8.0
 
 connect "plant" -> "nav"  frame="sensors"
 connect "nav"   -> "ctrl" frame="attitude_estimate"
-connect "ctrl"  -> "plant" frame="torque_cmd"
+connect "ctrl"  -> "plant" frame="torque_cmd" delayed=#true
 "#;
