@@ -34,6 +34,12 @@ pub mod wiring;
 #[cfg(feature = "kdl")]
 pub mod abi;
 
+// WP8 Wave 2 — the host-side `dlopen` loader (`DlSystem`) + the cyclic slot (`DlSlot`)
+// that drives a system `.so` across the ABI (dl-open.md §4). Rides the `kdl` feature
+// with the `abi` module it consumes.
+#[cfg(feature = "kdl")]
+pub mod dl;
+
 pub use dynamic::{FrameList, FrameMap, Name, Slot};
 pub use frame::Frame;
 pub use reader::{ListReader, MapReader};
@@ -79,6 +85,10 @@ pub use metor_fsw_macros::export_system;
 // `metor-fsw` / `metor-proto` / `kdl` dependency.
 pub use metor_fsw::path;
 pub use {metor_proto, metor_proto_wkt};
+
+// WP8 Wave 2 — the host dlopen loader surface.
+#[cfg(feature = "kdl")]
+pub use dl::{DlError, DlSystem};
 
 #[cfg(feature = "kdl")]
 pub use kdl;

@@ -24,6 +24,7 @@
 //! returning an allocation the host would have to free.
 
 use core::ffi::c_void;
+use std::collections::HashMap;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::slice;
 
@@ -31,7 +32,7 @@ use std::sync::Arc;
 
 use metor_fsw_ring::{RawBacking, RingBuffer, WakeSink, WakeSource};
 use metor_proto::types::{ComponentId, Timestamp};
-use metor_proto::vtable::VTable;
+use metor_proto::vtable::{Op, VTable};
 use metor_proto_wkt::ComponentMetadata;
 use postcard_schema::schema::owned::OwnedNamedType;
 use serde::{Deserialize, Serialize};
@@ -103,6 +104,12 @@ impl FswStatus {
             SlotState::Stopped {
                 reason: StopReason::LappedInput,
             } => FswStatus::StoppedLapped,
+            // A `.so`-side `CyclicRunner` never sets `Panicked` through its `SlotState`
+            // (a panic is caught by `catch_unwind` and returned directly as
+            // `FswStatus::Panicked`), but the match must stay total.
+            SlotState::Stopped {
+                reason: StopReason::Panicked,
+            } => FswStatus::Panicked,
         }
     }
 }
@@ -192,14 +199,13 @@ impl PortDescMsg {
     pub fn into_port_desc(self) -> PortDesc {
         let frame_name: &'static str = Box::leak(self.frame_name.into_boxed_str());
         // The `announce` factory closes over the carried unprefixed vtable + metadata
-        // and re-prefixes them by the instance name. Re-prefixing the **metadata**
-        // names is honest (the id is rehashed from the prefixed name). Re-prefixing
-        // the **vtable**'s baked component ids needs the metadata-driven id rewrite of
-        // telemetry.md §6 (an unprefixed→prefixed map over the `Op::Data` bytes); the
-        // host-side consumer (W2b) owns that, so for now the carried vtable is returned
-        // as-is alongside the re-prefixed metadata.
-        // TODO telemetry.md §6: rewrite the vtable's component ids by `prefix`.
-        let vtable = self.vtable.clone();
+        // and re-prefixes them by the instance name. Re-prefixing the **metadata** names
+        // is a rehash from the prefixed name; re-prefixing the **vtable**'s baked
+        // component ids is the metadata-driven id rewrite of telemetry.md §6 —
+        // [`prefix_announce_vtable`] (the WP8 W2b host-side consumer). The result matches
+        // a static system's prefixed announce (WP7 `announce_of::<F>(prefix)`) bit-for-bit,
+        // so telemetry `All` keys a dlopen'd output's components the same way.
+        let unprefixed_vtable = self.vtable.clone();
         let metadata = self.metadata.clone();
         let announce: AnnounceFn = Arc::new(move |prefix: &str| {
             let meta = metadata
@@ -207,9 +213,12 @@ impl PortDescMsg {
                 .cloned()
                 .map(|m| m.with_prefix(prefix))
                 .collect();
-            (vtable.clone(), meta)
+            let vtable = prefix_announce_vtable(&unprefixed_vtable, &metadata, prefix);
+            (vtable, meta)
         });
         PortDesc {
+            // The carried (unprefixed) vtable is what `compatible()` validates against,
+            // so wiring validation is unchanged; prefixing happens only in `announce`.
             frame_id: self.frame_id,
             frame_name,
             vtable: self.vtable,
@@ -218,6 +227,65 @@ impl PortDescMsg {
             announce,
         }
     }
+}
+
+/// Rewrite a dl port's **unprefixed** vtable into its instance-**prefixed** form for
+/// telemetry (dl-open.md §7, telemetry.md §6 — the deferred `into_port_desc` rewrite).
+///
+/// A static system bakes prefixed component ids via WP7's `announce_of::<F>(prefix)`
+/// (`AsVTable::vtable_fields(prefix)` rolls each leaf id as
+/// `ComponentId::new("<prefix>.<frame>.<field>")`). A dlopen'd system has no static `F`,
+/// so it carries the **unprefixed** vtable + per-component `metadata`; this reconstructs
+/// the prefixed ids from that metadata.
+///
+/// Each leaf component id is baked as a standalone 8-byte `Op::Data` blob
+/// (`builder::component` → `data(&id)`), so we build an unprefixed→prefixed id map from
+/// the metadata (a leaf's unprefixed id is `ComponentId::new(meta.name)`; its prefixed id
+/// is `ComponentId::new("<prefix>.<meta.name>")`, exactly `meta.with_prefix(prefix)`'s id)
+/// and rewrite every 8-byte `Op::Data` whose value is a known leaf id. The frame-tag id
+/// (never prefixed — `with_frame` bakes the bare `FRAME_ID`) and the schema `ty`/`dim`
+/// blobs are absent from the map, so they are left untouched; dynamic member templates
+/// use `Op::PathComponent` (runtime path composition, no baked id) and are likewise
+/// unaffected.
+fn prefix_announce_vtable(vtable: &VTable, metadata: &[ComponentMetadata], prefix: &str) -> VTable {
+    let mut vt = vtable.clone();
+    if prefix.is_empty() {
+        // An empty prefix is the unprefixed identity (`PathHasher` skips empty segments);
+        // every `announce` caller supplies a real instance name, but stay total.
+        return vt;
+    }
+    // Unprefixed leaf id (`u64`) → prefixed leaf id (`u64`), from the carried metadata.
+    let map: HashMap<u64, u64> = metadata
+        .iter()
+        .map(|m| {
+            let unprefixed = ComponentId::new(&m.name).0;
+            let prefixed = ComponentId::new(&format!("{prefix}.{}", m.name)).0;
+            (unprefixed, prefixed)
+        })
+        .collect();
+    // Collect the (data-offset, prefixed-id) rewrites first (the `ops` borrow and the
+    // `data` read overlap on `vt`), then apply them to a fresh data buffer.
+    let data = vt.data.as_slice();
+    let mut rewrites: Vec<(usize, u64)> = Vec::new();
+    for op in vt.ops.iter() {
+        if let Op::Data { offset, len } = op
+            && *len as usize == core::mem::size_of::<u64>()
+            && let Some(slot) = data.get(offset.to_index()..offset.to_index() + 8)
+        {
+            let val = u64::from_le_bytes(slot.try_into().expect("8-byte slice"));
+            if let Some(&prefixed) = map.get(&val) {
+                rewrites.push((offset.to_index(), prefixed));
+            }
+        }
+    }
+    if !rewrites.is_empty() {
+        let mut new_data = data.to_vec();
+        for (off, prefixed) in rewrites {
+            new_data[off..off + 8].copy_from_slice(&prefixed.to_le_bytes());
+        }
+        vt.data = new_data;
+    }
+    vt
 }
 
 impl SystemDescriptorMsg {

@@ -33,7 +33,21 @@ kdl = { version = "6.3.4", optional = true }
 miette = { version = "7.0", features = ["fancy"], optional = true }
 thiserror = { version = "2.0", optional = true }
 
+# WP8 dl-open host loader (`dl` module): `dlopen`/`dlsym` a system `.so` and resolve
+# its `fsw_*` C-ABI surface, keeping the `Library` alive for the loaded system's life.
+libloading = { version = "0.8", optional = true }
+
+# The `dl_integration` test builds the fixture cdylib and `dlopen`s it; it drives the
+# coordinator on `stellarator` and defines host-side frames (zerocopy) + params
+# (postcard) matching the fixture's.
+[dev-dependencies]
+stellarator = { path = "../stellarator" }
+zerocopy = { version = "0.8.2", features = ["derive"] }
+postcard = { version = "1.1", features = ["alloc"] }
+
 [features]
 default = ["kdl"]
 # The KDL wiring loader (`wiring` module): registry, FromKdlNode derive, `load()`.
-kdl = ["dep:kdl", "dep:miette", "dep:thiserror"]
+# The `abi`/`dl` dl-open modules ride this feature in v1 (they lean on `wiring`'s
+# `RegisteredSystem` construction contract), so the host loader rides it too.
+kdl = ["dep:kdl", "dep:miette", "dep:thiserror", "dep:libloading"]
