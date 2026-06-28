@@ -10,7 +10,9 @@ use metor_fsw_ring::{BoxBacking, Notifier};
 use metor_proto::types::{ComponentId, Timestamp};
 use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
 
-use crate::wiring::{ClockSpec, FromKdlNode, LoadError, Registry, WiringBuilder, load, parse, resolve};
+use crate::wiring::{
+    ClockSpec, FromKdlNode, LoadError, ParamSource, Registry, WiringBuilder, load, parse, resolve,
+};
 use crate::{
     AsyncSystem, BuildSystem, CyclicSystem, Input, Out, Output, System, SystemInput, SystemOutput,
 };
@@ -672,20 +674,26 @@ async fn builder_wiring_resolves_and_runs() {
 }
 
 // ---------------------------------------------------------------------------
-// Wave 3a: a dl system declared in KDL may carry no params (the schema-guided
-// encoder is Wave 3b); params on a `lib=` system is a clear error. Resolution of
-// the `.so` itself is exercised by `tests/wiring_resolve.rs` (a real dlopen).
+// Wave 3a/3b: a dl system declared in KDL carries its `system`-node config as
+// `ParamSource::Kdl` (Wave 3b schema-encodes it at resolve — dl-open.md §6.3).
+// Resolution of the `.so` itself + the headline KDL≡builder byte-equality is
+// exercised by `tests_abi`/`tests/wiring_resolve.rs` (a real dlopen).
 // ---------------------------------------------------------------------------
 
 #[test]
-fn dl_kdl_params_are_rejected_until_wave_3b() {
+fn dl_kdl_params_are_carried_as_kdl_source() {
+    // Wave 3b: KDL params on a `lib=` system are no longer an error — they are carried as
+    // the node source text for the resolve-time schema-guided encoder (dl-open.md §6.3).
     let kdl = r#"
 coordinator cycle_rate=100.0
 artifact "plant" crate="adcs-plant" lib="libadcs_plant.dylib" type="Plant"
 system "plant" type="Plant" lib="plant" gain=5.0
 "#;
-    let err = parse(kdl).expect_err("KDL params on a dl system are rejected");
-    assert!(matches!(err, LoadError::DlKdlParamsUnsupported { .. }), "{err:?}");
+    let wiring = parse(kdl).expect("KDL params on a dl system parse (Wave 3b)");
+    match &wiring.systems[0].params {
+        ParamSource::Kdl(text) => assert!(text.contains("gain=5.0"), "carried node text: {text}"),
+        other => panic!("expected ParamSource::Kdl, got {other:?}"),
+    }
 }
 
 #[test]
@@ -703,7 +711,7 @@ system "plant" type="Plant" lib="plant"
     assert_eq!(wiring.artifacts[0].system_type, "Plant");
     assert_eq!(wiring.systems.len(), 1);
     assert_eq!(wiring.systems[0].artifact.as_deref(), Some("plant"));
-    assert!(wiring.systems[0].params.is_empty(), "no params (dl, no config)");
+    assert_eq!(wiring.systems[0].params, ParamSource::None, "no params (dl, no config)");
 }
 
 #[test]

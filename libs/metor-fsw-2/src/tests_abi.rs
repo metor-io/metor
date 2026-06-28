@@ -386,3 +386,124 @@ fn abi_panic_is_contained() {
 
     drop((in_ring, out_ring, health_ring, log_ring));
 }
+
+// ---------------------------------------------------------------------------
+// WP8 Wave 3b (dl-open.md §6.3): the schema-guided KDL → postcard params path.
+// These prove the **core byte-equality invariant** (the dynamic encoder produces
+// exactly the bytes the typed Rust builder produces) and the span-aware error
+// cases, all without dlopen — `encode_kdl_params` is driven by an owned schema, so
+// the host never needs to link the system's `Params` type to encode KDL config.
+// ---------------------------------------------------------------------------
+
+use crate::wiring::encode_kdl_params;
+
+/// A multi-field, mixed-type `Params` (the byte-equality gate must hold across types,
+/// not just one field). Mirrors a dl system's `#[derive(Serialize, Deserialize, Schema)]`.
+#[derive(Serialize, Deserialize, Schema, Debug, PartialEq)]
+struct MultiParams {
+    start: u64,
+    scale: f64,
+    enabled: bool,
+    label: String,
+    bias: i64,
+    trim: Option<f64>,
+}
+
+/// THE HARD GATE (dl-open.md §6.3): `encode_kdl_params` (schema-guided, the KDL
+/// front-end) produces byte-identical postcard bytes to `postcard::to_stdvec` of the
+/// typed value (the Rust builder front-end) — across every field type.
+#[test]
+fn kdl_schema_encode_byte_equals_typed_builder() {
+    let schema = OwnedNamedType::from(<MultiParams as Schema>::SCHEMA);
+    let node_text = r#"system "x" type="T" lib="a" start=7 scale=2.5 enabled=#true label="hi" bias=-9 trim=0.25"#;
+
+    let kdl_bytes = encode_kdl_params(node_text, &schema, "x").expect("schema-encode KDL params");
+    let typed_bytes = postcard::to_allocvec(&MultiParams {
+        start: 7,
+        scale: 2.5,
+        enabled: true,
+        label: "hi".into(),
+        bias: -9,
+        trim: Some(0.25),
+    })
+    .unwrap();
+
+    assert_eq!(kdl_bytes, typed_bytes, "KDL schema-encode == typed builder (the wire contract)");
+
+    // And the .so's `fsw_create` would decode it back to the real Params.
+    let decoded: MultiParams = postcard::from_bytes(&kdl_bytes).unwrap();
+    assert_eq!(decoded.start, 7);
+    assert_eq!(decoded.trim, Some(0.25));
+}
+
+/// An `Option` field with no KDL property is `None` (omittable default), and an int
+/// literal where a float is wanted coerces (`scale=3` ⇒ 3.0) — both still byte-match.
+#[test]
+fn kdl_schema_encode_optional_absent_and_int_for_float() {
+    let schema = OwnedNamedType::from(<MultiParams as Schema>::SCHEMA);
+    // `trim` omitted ⇒ None; `scale=3` (int literal) ⇒ 3.0.
+    let node_text = r#"system "x" type="T" lib="a" start=0 scale=3 enabled=#false label="" bias=0"#;
+
+    let kdl_bytes = encode_kdl_params(node_text, &schema, "x").expect("encode with absent Option");
+    let typed_bytes = postcard::to_allocvec(&MultiParams {
+        start: 0,
+        scale: 3.0,
+        enabled: false,
+        label: String::new(),
+        bias: 0,
+        trim: None,
+    })
+    .unwrap();
+    assert_eq!(kdl_bytes, typed_bytes, "absent Option + int-for-float still byte-match");
+}
+
+/// A KDL property whose value type does not match the schema field is a clean
+/// `DlParamTypeMismatch` (not a panic, not a silent divergence).
+#[test]
+fn kdl_schema_encode_type_mismatch_is_clean_error() {
+    let schema = OwnedNamedType::from(<MultiParams as Schema>::SCHEMA);
+    // `start` wants a u64 but is given a string.
+    let node_text = r#"system "x" type="T" lib="a" start="oops" scale=1.0 enabled=#true label="h" bias=0"#;
+    let err = encode_kdl_params(node_text, &schema, "x").expect_err("type mismatch is an error");
+    match err {
+        LoadError::DlParamTypeMismatch { system, property, .. } => {
+            assert_eq!(system, "x");
+            assert_eq!(property, "start");
+        }
+        other => panic!("expected DlParamTypeMismatch, got {other:?}"),
+    }
+}
+
+/// A required (non-`Option`) schema field with no KDL property is a clean
+/// `DlMissingParam`.
+#[test]
+fn kdl_schema_encode_missing_field_is_clean_error() {
+    let schema = OwnedNamedType::from(<MultiParams as Schema>::SCHEMA);
+    // `bias` (a required i64) is absent.
+    let node_text = r#"system "x" type="T" lib="a" start=1 scale=1.0 enabled=#true label="h""#;
+    let err = encode_kdl_params(node_text, &schema, "x").expect_err("missing field is an error");
+    match err {
+        LoadError::DlMissingParam { system, property, .. } => {
+            assert_eq!(system, "x");
+            assert_eq!(property, "bias");
+        }
+        other => panic!("expected DlMissingParam, got {other:?}"),
+    }
+}
+
+/// A KDL property not present in the schema is a clean `DlUnknownParam` (a typo guard;
+/// `type=`/`lib=` are reserved and never treated as params).
+#[test]
+fn kdl_schema_encode_unknown_property_is_clean_error() {
+    let schema = OwnedNamedType::from(<MultiParams as Schema>::SCHEMA);
+    let node_text =
+        r#"system "x" type="T" lib="a" start=1 scale=1.0 enabled=#true label="h" bias=0 typo=5"#;
+    let err = encode_kdl_params(node_text, &schema, "x").expect_err("extra property is an error");
+    match err {
+        LoadError::DlUnknownParam { system, property, .. } => {
+            assert_eq!(system, "x");
+            assert_eq!(property, "typo");
+        }
+        other => panic!("expected DlUnknownParam, got {other:?}"),
+    }
+}

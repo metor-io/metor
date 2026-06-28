@@ -18,17 +18,17 @@
 //! ```
 //!
 //! [`SystemSpecBuilder::params`] postcard-encodes a typed `Params` into the canonical
-//! [`SystemSpec::params`] bytes — byte-identical to what the KDL front-end produces for
-//! a dl system once Wave 3b lands the schema-guided encoder, and what the `.so`'s
-//! `fsw_create` decodes (dl-open.md §6.3). A paramless system gets empty bytes.
+//! [`ParamSource::Postcard`] bytes — byte-identical to what the KDL front-end's
+//! schema-guided encoder produces for a dl system (Wave 3b), and what the `.so`'s
+//! `fsw_create` decodes (dl-open.md §6.3). A paramless system gets [`ParamSource::None`].
 
 use std::net::SocketAddr;
 
 use serde::Serialize;
 
 use super::model::{
-    Artifact, ClockSpec, CoordinatorSpec, EdgeSpec, SystemSpec, TelemetryModeSpec, TelemetrySpec,
-    Wiring,
+    Artifact, ClockSpec, CoordinatorSpec, EdgeSpec, ParamSource, SystemSpec, TelemetryModeSpec,
+    TelemetrySpec, Wiring,
 };
 
 /// Fluent constructor for a [`Wiring`] (dl-open.md §6.2). Start with [`new`](Self::new),
@@ -114,7 +114,7 @@ impl WiringBuilder {
             name: name.into(),
             ty: String::new(),
             artifact: None,
-            params: Vec::new(),
+            params: ParamSource::None,
         }
     }
 
@@ -181,7 +181,7 @@ pub struct SystemSpecBuilder {
     name: String,
     ty: String,
     artifact: Option<String>,
-    params: Vec<u8>,
+    params: ParamSource,
 }
 
 impl SystemSpecBuilder {
@@ -204,12 +204,15 @@ impl SystemSpecBuilder {
         self
     }
 
-    /// Set the typed params, postcard-encoded into the canonical [`SystemSpec::params`]
-    /// bytes (dl-open.md §6.3). For a dl system these are exactly the bytes
-    /// `fsw_create` decodes; a paramless system can omit this (empty bytes).
+    /// Set the typed params, postcard-encoded into the canonical
+    /// [`ParamSource::Postcard`] bytes (dl-open.md §6.3). For a dl system these are exactly
+    /// the bytes `fsw_create` decodes — **byte-identical** to what the KDL front-end's
+    /// schema-guided encoder produces for the same logical value (Wave 3b). A paramless
+    /// system can omit this ([`ParamSource::None`]).
     pub fn params<P: Serialize>(mut self, params: P) -> Self {
-        self.params =
+        let bytes =
             postcard::to_allocvec(&params).expect("params postcard-encode (Serialize is infallible)");
+        self.params = ParamSource::Postcard(bytes);
         self
     }
 

@@ -94,8 +94,9 @@ pub use dl::{DlError, DlSystem};
 // the `kdl` feature with the wiring front-end they share a resolver with.
 #[cfg(feature = "kdl")]
 pub use wiring::{
-    Artifact, BuildError, BuildOptions, ClockSpec, CoordinatorSpec, EdgeSpec, SystemSpec,
-    TelemetryModeSpec, TelemetrySpec, Wiring, WiringBuilder, build_artifacts, parse, resolve,
+    Artifact, BuildError, BuildOptions, ClockSpec, CoordinatorSpec, EdgeSpec, ParamSource,
+    SystemSpec, TelemetryModeSpec, TelemetrySpec, Wiring, WiringBuilder, build_artifacts,
+    encode_kdl_params, parse, resolve,
 };
 
 #[cfg(feature = "kdl")]

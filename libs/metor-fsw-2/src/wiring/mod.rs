@@ -33,6 +33,8 @@ use std::time::Duration;
 
 use kdl::{KdlDocument, KdlNode, KdlValue};
 use miette::{Diagnostic, SourceSpan};
+use postcard_schema::schema::owned::{OwnedDataModelType, OwnedNamedType};
+use serde_json::{Map, Number, Value};
 use thiserror::Error;
 
 use metor_fsw_ring::BoxBacking;
@@ -57,8 +59,8 @@ mod model;
 pub use build_driver::{BuildError, BuildOptions, build_artifacts};
 pub use builder::{SystemSpecBuilder, WiringBuilder};
 pub use model::{
-    Artifact, ClockSpec, CoordinatorSpec, EdgeSpec, SystemSpec, TelemetryModeSpec, TelemetrySpec,
-    Wiring,
+    Artifact, ClockSpec, CoordinatorSpec, EdgeSpec, ParamSource, SystemSpec, TelemetryModeSpec,
+    TelemetrySpec, Wiring,
 };
 
 // Re-export the derive and the registration macro so a system author only needs
@@ -240,19 +242,59 @@ pub enum LoadError {
         span: SourceSpan,
     },
 
-    /// A dl system (`lib=`) carried KDL params, which require the schema-guided encoder
-    /// landing in **Wave 3b**. Until then, give a dl system its params via the Rust
-    /// [`WiringBuilder`](crate::WiringBuilder) (dl-open.md §6.3).
-    #[error(
-        "dl system `{system}` has KDL params, which are not supported yet (Wave 3b): pass params to a \
-         dl system via the Rust `WiringBuilder` for now"
-    )]
-    #[diagnostic(code(fsw_wiring::dl_kdl_params_unsupported))]
-    DlKdlParamsUnsupported {
+    /// A dl system's KDL property has no matching field in the `.so`'s exported `Params`
+    /// schema — a typo or a stale config (dl-open.md §6.3, the schema-guided encoder).
+    #[error("dl system `{system}` has an unknown param `{property}` (not in its `Params` schema)")]
+    #[diagnostic(code(fsw_wiring::dl_unknown_param))]
+    DlUnknownParam {
         system: String,
+        property: String,
         #[source_code]
         src: String,
-        #[label("remove these properties, or build this system via the Rust builder")]
+        #[label("no `Params` field is named this")]
+        span: SourceSpan,
+    },
+
+    /// A dl system's `Params` schema field has no corresponding KDL property, and the
+    /// field is not an `Option` (so it has no default) — dl-open.md §6.3.
+    #[error("dl system `{system}` is missing required param `{property}` (a `Params` schema field)")]
+    #[diagnostic(code(fsw_wiring::dl_missing_param))]
+    DlMissingParam {
+        system: String,
+        property: String,
+        #[source_code]
+        src: String,
+        #[label("add this property to the `system` node")]
+        span: SourceSpan,
+    },
+
+    /// A dl system's KDL property value does not match its `Params` schema field type
+    /// (e.g. a string where the schema wants an integer) — dl-open.md §6.3.
+    #[error(
+        "dl system `{system}` param `{property}` has the wrong type: expected {expected} \
+         (per the `Params` schema)"
+    )]
+    #[diagnostic(code(fsw_wiring::dl_param_type_mismatch))]
+    DlParamTypeMismatch {
+        system: String,
+        property: String,
+        expected: String,
+        #[source_code]
+        src: String,
+        #[label("this value does not match the schema field type")]
+        span: SourceSpan,
+    },
+
+    /// The dl system's `Params` schema could not be encoded from its KDL config (an
+    /// unsupported schema shape, or the dynamic encoder rejected the value) — dl-open.md §6.3.
+    #[error("dl system `{system}` params could not be schema-encoded: {reason}")]
+    #[diagnostic(code(fsw_wiring::dl_param_encode))]
+    DlParamEncode {
+        system: String,
+        reason: String,
+        #[source_code]
+        src: String,
+        #[label("these params could not be encoded against the `Params` schema")]
         span: SourceSpan,
     },
 
@@ -564,15 +606,12 @@ pub fn load(kdl: &str, registry: &Registry) -> Result<Coordinator, LoadError> {
 /// `coordinator`/`system`/`connect`/`telemetry` surface and adds the Wave 3a
 /// `artifact` node + per-`system` `lib=` reference.
 ///
-/// **Static params** (a `system` with no `lib=`) are carried as the KDL node's source
-/// text in [`SystemSpec::params`] when the node has config properties, so the static
-/// [`Registry`] factory re-parses them via `FromKdlNode` at [`resolve`] time
-/// (behavior-identical to WP6); a config-less static system carries empty params.
-///
-/// **Dl params in KDL are deferred to Wave 3b**: a `system` with a `lib=` may carry no
-/// params (the schema-guided postcard encoder is not landed); one that does is a clear
-/// [`LoadError::DlKdlParamsUnsupported`]. Give a dl system params via the Rust
-/// [`WiringBuilder`] until then (dl-open.md §6.3).
+/// **Params** (for either kind) are carried as the KDL `system` node's source text in
+/// [`ParamSource::Kdl`] when the node has config properties; a config-less system carries
+/// [`ParamSource::None`]. The decoder is chosen at [`resolve`] time by
+/// [`SystemSpec::artifact`]: a **static** system re-parses the text via `FromKdlNode`
+/// (behavior-identical to WP6); a **dl** system schema-encodes it against the `.so`'s
+/// exported `Params` schema (Wave 3b — dl-open.md §6.3), so KDL ≡ the Rust builder on the wire.
 pub fn parse(kdl: &str) -> Result<Wiring, LoadError> {
     let doc = kdl.parse::<KdlDocument>().map_err(|source| LoadError::Parse {
         source,
@@ -713,14 +752,14 @@ fn resolve_static(
             src,
         }
     })?;
-    // Reconstruct the node the `FromKdlNode` factory reads its params off.
-    let node_src = if spec.params.is_empty() {
-        format!("system \"{}\" type=\"{}\"", spec.name, spec.ty)
-    } else {
-        // Stored by `parse` as the original `system` node's source text (UTF-8).
-        String::from_utf8(spec.params.clone()).unwrap_or_else(|_| {
-            format!("system \"{}\" type=\"{}\"", spec.name, spec.ty)
-        })
+    // Reconstruct the node the `FromKdlNode` factory reads its params off. A config-less
+    // ([`ParamSource::None`]) or builder-origin ([`ParamSource::Postcard`]) static system
+    // synthesizes a minimal node (the static path is `FromKdlNode`-shaped, not postcard);
+    // a KDL-config static system re-parses its carried node source text (dl-open.md §6.3).
+    let minimal = || format!("system \"{}\" type=\"{}\"", spec.name, spec.ty);
+    let node_src = match &spec.params {
+        ParamSource::None | ParamSource::Postcard(_) => minimal(),
+        ParamSource::Kdl(text) => text.clone(),
     };
     let doc = node_src.parse::<KdlDocument>().map_err(|source| LoadError::Parse {
         source,
@@ -739,9 +778,13 @@ fn resolve_static(
     })
 }
 
-/// Load a **dl** system: find its [`Artifact`], `DlSystem::open` the resolved `.so`, and
-/// register it via [`CoordinatorBuilder::add_dl_cyclic`] with the spec's postcard params
-/// (dl-open.md §4.3/§6.3). The reconstructed descriptor is returned for edge validation.
+/// Load a **dl** system: find its [`Artifact`], `DlSystem::open` the resolved `.so`,
+/// resolve its [`ParamSource`] into the canonical postcard `Params` bytes, and register it
+/// via [`CoordinatorBuilder::add_dl_cyclic`] (dl-open.md §4.3/§6.3). The reconstructed
+/// descriptor is returned for edge validation.
+///
+/// The `.so` is opened **once** and reused for both the params encode (its exported
+/// `Params` schema, [`DlSystem::params_schema`]) and the bound slot — never opened twice.
 fn resolve_dl(
     spec: &SystemSpec,
     artifact_id: &str,
@@ -772,8 +815,18 @@ fn resolve_dl(
         src: src.clone(),
         span,
     })?;
+    // Resolve the params to canonical postcard bytes. `Kdl` is schema-encoded against the
+    // `.so`'s exported `Params` schema (the host never links `Params` — dl-open.md §6.3),
+    // producing the SAME bytes the typed `WiringBuilder::params` (`Postcard`) produces.
+    let params: Vec<u8> = match &spec.params {
+        ParamSource::None => Vec::new(),
+        ParamSource::Postcard(bytes) => bytes.clone(),
+        ParamSource::Kdl(node_text) => {
+            encode_kdl_params(node_text, loaded.params_schema(), &spec.name)?
+        }
+    };
     let desc = loaded.descriptor().clone();
-    let handle = builder.add_dl_cyclic(&spec.name, loaded, spec.params.clone());
+    let handle = builder.add_dl_cyclic(&spec.name, loaded, params);
     Ok((handle, desc))
 }
 
@@ -781,6 +834,156 @@ fn resolve_dl(
 /// no original document text).
 fn system_src(spec: &SystemSpec) -> String {
     format!("system \"{}\" type=\"{}\"", spec.name, spec.ty)
+}
+
+/// Encode a dl system's KDL `system`-node config into the canonical postcard `Params`
+/// bytes, **guided by the `.so`'s exported `Params` schema** (dl-open.md §6.3, the
+/// one-postcard-encoding decision). The host never links the system's `Params` type: it
+/// walks the schema's named fields, pulls the matching KDL property for each, coerces it
+/// to the field's type, builds a dynamic [`serde_json::Value`], and hands it to
+/// [`postcard_dyn::to_stdvec_dyn`] — which produces the **same bytes** the typed Rust
+/// builder's [`WiringBuilder::params`](crate::WiringBuilder) postcard-encodes (the byte
+/// equality is the headline equivalence gate, asserted in `tests_abi`).
+///
+/// `node_text` is the `system` node's source ([`ParamSource::Kdl`]); `schema` is
+/// [`DlSystem::params_schema`]; `system` names the instance for diagnostics. Errors are
+/// span-aware [`LoadError`]s: a property with no schema field
+/// ([`DlUnknownParam`](LoadError::DlUnknownParam)), a non-`Option` schema field with no
+/// property ([`DlMissingParam`](LoadError::DlMissingParam)), a property whose value type
+/// does not match the field ([`DlParamTypeMismatch`](LoadError::DlParamTypeMismatch)), or
+/// an un-encodable schema shape ([`DlParamEncode`](LoadError::DlParamEncode)).
+pub fn encode_kdl_params(
+    node_text: &str,
+    schema: &OwnedNamedType,
+    system: &str,
+) -> Result<Vec<u8>, LoadError> {
+    let span: SourceSpan = (0, node_text.len()).into();
+    let encode_err = |reason: String| LoadError::DlParamEncode {
+        system: system.to_string(),
+        reason,
+        src: node_text.to_string(),
+        span,
+    };
+
+    let doc = node_text.parse::<KdlDocument>().map_err(|e| encode_err(e.to_string()))?;
+    let node = doc
+        .nodes()
+        .first()
+        .ok_or_else(|| encode_err("the carried params text has no `system` node".into()))?;
+
+    // Only a top-level struct (the usual `#[derive(Schema)] struct Params`) — or a unit
+    // (`()`/unit struct, no fields) — maps from flat KDL properties.
+    let fields = match &schema.ty {
+        OwnedDataModelType::Struct(fields) => fields.as_slice(),
+        OwnedDataModelType::Unit | OwnedDataModelType::UnitStruct => &[],
+        other => {
+            return Err(encode_err(format!(
+                "the `Params` schema is `{other:?}`, which KDL properties cannot express \
+                 (only a struct of scalar fields, or a unit)"
+            )));
+        }
+    };
+
+    // Each KDL property (everything but the reserved `type=`/`lib=`) must be a schema field.
+    for entry in node.entries() {
+        if let Some(key) = entry.name().map(|n| n.value())
+            && key != "type"
+            && key != "lib"
+            && !fields.iter().any(|f| f.name == key)
+        {
+            return Err(LoadError::DlUnknownParam {
+                system: system.to_string(),
+                property: key.to_string(),
+                src: node_text.to_string(),
+                span,
+            });
+        }
+    }
+
+    // Walk the schema fields (so JSON object order is canonical, matching the typed
+    // builder's struct-field order — the basis of the byte equality).
+    let mut obj = Map::new();
+    for field in fields {
+        match node.get(field.name.as_str()) {
+            Some(value) => {
+                let json = kdl_value_to_json(&field.ty.ty, value).ok_or_else(|| {
+                    LoadError::DlParamTypeMismatch {
+                        system: system.to_string(),
+                        property: field.name.clone(),
+                        expected: leaf_expected(&field.ty.ty),
+                        src: node_text.to_string(),
+                        span,
+                    }
+                })?;
+                obj.insert(field.name.clone(), json);
+            }
+            // An `Option` field with no property is `None` (encoded as the null byte); any
+            // other absent field is a hard miss (the schema has no defaults — dl-open.md §6.3).
+            None if matches!(field.ty.ty, OwnedDataModelType::Option(_)) => {
+                obj.insert(field.name.clone(), Value::Null);
+            }
+            None => {
+                return Err(LoadError::DlMissingParam {
+                    system: system.to_string(),
+                    property: field.name.clone(),
+                    src: node_text.to_string(),
+                    span,
+                });
+            }
+        }
+    }
+
+    postcard_dyn::to_stdvec_dyn(schema, &Value::Object(obj))
+        .map_err(|e| encode_err(format!("dynamic postcard encode failed: {e:?}")))
+}
+
+/// Coerce one KDL property value to the [`serde_json::Value`] shape
+/// [`postcard_dyn::to_stdvec_dyn`] expects for a schema leaf `ty`, reusing the
+/// [`FromKdlScalar`] coercion rules (integers, floats accepting int literals, bools,
+/// strings). Returns `None` on a type mismatch (→ [`DlParamTypeMismatch`](LoadError::DlParamTypeMismatch)).
+///
+/// Only scalar leaves are expressible as flat KDL properties; a non-scalar schema field
+/// (a nested struct, seq, map, enum, …) yields `None` here and is surfaced as a mismatch.
+fn kdl_value_to_json(ty: &OwnedDataModelType, value: &KdlValue) -> Option<Value> {
+    use OwnedDataModelType as T;
+    match ty {
+        T::Bool => value.as_bool().map(Value::Bool),
+        // Signed integers (incl. the `as_i64`-encoded i128 of postcard-dyn).
+        T::I8 | T::I16 | T::I32 | T::I64 | T::Isize | T::I128 => value
+            .as_integer()
+            .and_then(|i| i64::try_from(i).ok())
+            .map(|i| Value::Number(Number::from(i))),
+        // Unsigned integers (incl. the `as_u64`-encoded u128 of postcard-dyn).
+        T::U8 | T::U16 | T::U32 | T::U64 | T::Usize | T::U128 => value
+            .as_integer()
+            .and_then(|i| u64::try_from(i).ok())
+            .map(|u| Value::Number(Number::from(u))),
+        // Floats accept an int literal (`rate=200` ⇒ 200.0), matching `FromKdlScalar`.
+        T::F32 | T::F64 => value
+            .as_float()
+            .or_else(|| value.as_integer().map(|i| i as f64))
+            .and_then(Number::from_f64)
+            .map(Value::Number),
+        T::String | T::Char => value.as_string().map(|s| Value::String(s.to_string())),
+        // A present `Option<T>` property is the `Some(T)` inner value (a `None` is the
+        // *absent* property, handled by the caller).
+        T::Option(inner) => kdl_value_to_json(&inner.ty, value),
+        _ => None,
+    }
+}
+
+/// A human name of a schema leaf type, for [`DlParamTypeMismatch`](LoadError::DlParamTypeMismatch).
+fn leaf_expected(ty: &OwnedDataModelType) -> String {
+    use OwnedDataModelType as T;
+    match ty {
+        T::Bool => "a boolean (#true/#false)".into(),
+        T::I8 | T::I16 | T::I32 | T::I64 | T::Isize | T::I128 => "a signed integer".into(),
+        T::U8 | T::U16 | T::U32 | T::U64 | T::Usize | T::U128 => "a non-negative integer".into(),
+        T::F32 | T::F64 => "a number".into(),
+        T::String | T::Char => "a string".into(),
+        T::Option(inner) => format!("{} (or omit the property)", leaf_expected(&inner.ty)),
+        other => format!("an unsupported scalar type ({other:?})"),
+    }
 }
 
 /// A best-effort source snippet for an edge's resolve-time errors.
@@ -872,22 +1075,13 @@ fn parse_system(
     let has_config = node.entries().iter().any(|e| {
         matches!(e.name().map(|n| n.value()), Some(k) if k != "type" && k != "lib")
     });
-    let params = if artifact.is_some() {
-        // Dl system: KDL params require the Wave 3b schema-guided encoder (dl-open.md §6.3).
-        if has_config {
-            return Err(LoadError::DlKdlParamsUnsupported {
-                system: name.to_string(),
-                src: src.to_string(),
-                span: node.span(),
-            });
-        }
-        Vec::new()
-    } else if has_config {
-        // Static system with config: carry the node's source so `resolve_static` can
-        // re-parse it through `FromKdlNode` (the host links a static system's `Params`).
-        node.to_string().into_bytes()
+    // Both static and dl systems carry the node's source text when configured; the
+    // decoder is chosen at `resolve` by `artifact` (static ⇒ `FromKdlNode`, dl ⇒
+    // schema-guided postcard encode — dl-open.md §6.3).
+    let params = if has_config {
+        ParamSource::Kdl(node.to_string())
     } else {
-        Vec::new()
+        ParamSource::None
     };
     Ok(SystemSpec {
         name: name.to_string(),

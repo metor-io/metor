@@ -33,6 +33,7 @@ use std::sync::Arc;
 
 use libloading::{Library, Symbol};
 use metor_proto::types::Timestamp;
+use postcard_schema::schema::owned::OwnedNamedType;
 
 use crate::abi::{
     self, ByteSink, FSW_ABI_VERSION, FswRing, FswStatus, SystemDescriptorMsg,
@@ -96,6 +97,10 @@ pub enum DlError {
 pub struct DlSystem {
     lib: Arc<Library>,
     descriptor: SystemDescriptor,
+    /// The `.so`'s exported `Params` schema (dl-open.md §2.1/§6.3), kept so the host can
+    /// schema-encode KDL params **without linking the `Params` type** (Wave 3b). Carried
+    /// on the descriptor mirror; surfaced via [`DlSystem::params_schema`].
+    params_schema: OwnedNamedType,
     create: CreateFn,
     bind_init: BindInitFn,
     execute: ExecuteFn,
@@ -156,7 +161,9 @@ impl DlSystem {
         }
 
         // --- Describe → postcard → SystemDescriptor (dl-open.md §4.1) ------------
-        let descriptor = {
+        // Keep the `Params` schema off the mirror before `into_descriptor` consumes it,
+        // so the host can schema-encode KDL params later (Wave 3b — dl-open.md §6.3).
+        let (descriptor, params_schema) = {
             // SAFETY: the export is the macro's `fsw_describe(sink, ctx) -> i32`.
             let describe: Symbol<DescribeFn> =
                 unsafe { resolve(&lib, abi::SYM_DESCRIBE, "fsw_describe")? };
@@ -169,7 +176,8 @@ impl DlSystem {
             }
             let msg: SystemDescriptorMsg =
                 postcard::from_bytes(&buf).map_err(DlError::Decode)?;
-            msg.into_descriptor()
+            let params_schema = msg.params_schema.clone();
+            (msg.into_descriptor(), params_schema)
         };
 
         // --- Resolve the lifecycle surface, dereferencing each `Symbol` to a bare
@@ -186,6 +194,7 @@ impl DlSystem {
         Ok(Self {
             lib: Arc::new(lib),
             descriptor,
+            params_schema,
             create,
             bind_init,
             execute,
@@ -199,6 +208,14 @@ impl DlSystem {
     /// vtable ids (the dl telemetry rewrite, [`abi`](crate::abi)).
     pub fn descriptor(&self) -> &SystemDescriptor {
         &self.descriptor
+    }
+
+    /// The `.so`'s exported `Params` schema (dl-open.md §2.1/§6.3). The resolver feeds
+    /// this to [`encode_kdl_params`](crate::wiring::encode_kdl_params) to schema-encode a
+    /// dl system's KDL config into the canonical postcard bytes **without linking the
+    /// `Params` type** — the host stays schema-agnostic (Wave 3b).
+    pub fn params_schema(&self) -> &OwnedNamedType {
+        &self.params_schema
     }
 
     /// Consume the handle into a bound, ready-to-init [`DlSlot`] (called by the

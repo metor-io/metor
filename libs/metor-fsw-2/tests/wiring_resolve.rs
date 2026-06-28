@@ -12,8 +12,9 @@
 
 use metor_fsw_2::metor_proto::types::{ComponentId, Timestamp};
 use metor_fsw_2::{
-    BuildSystem, ClockSpec, CyclicSystem, Frame, Input, Out, Output, System, SystemInput,
-    SystemKind, SystemOutput, TelemetryModeSpec, WiringBuilder, build_artifacts, resolve,
+    BuildSystem, ClockSpec, CyclicSystem, DlSystem, Frame, Input, Out, Output, ParamSource, System,
+    SystemInput, SystemKind, SystemOutput, TelemetryModeSpec, Wiring, WiringBuilder,
+    build_artifacts, encode_kdl_params, parse, resolve,
     wiring::{BuildOptions, Registry},
 };
 use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
@@ -44,6 +45,7 @@ struct TickOut {
 #[derive(serde::Serialize, Default)]
 struct CounterParams {
     start: u64,
+    scale: f64,
 }
 
 // ---------------------------------------------------------------------------
@@ -116,7 +118,7 @@ fn dl_graph_via_wiring_resolve_end_to_end() {
         .system("counter")
         .ty("DlCounter")
         .from_artifact("counter")
-        .params(CounterParams { start: 1000 })
+        .params(CounterParams { start: 1000, scale: 1.0 })
         .end()
         .connect("ticker", "tick_in", "counter", "tick_in")
         .telemetry("127.0.0.1:2240".parse().unwrap(), TelemetryModeSpec::All)
@@ -183,4 +185,110 @@ fn dl_graph_via_wiring_resolve_end_to_end() {
         .expect("open the located .so");
     assert_eq!(dl.descriptor().name, "dl_counter");
     assert_eq!(dl.descriptor().kind, SystemKind::Cyclic);
+}
+
+/// WP8 Wave 3b headline equivalence (dl-open.md §6.3): configure the **same** dl system
+/// two ways — the typed Rust `WiringBuilder.params(..)` and a KDL `system "..." lib=".."
+/// start=.. scale=..` — and assert BOTH (a) resolve to **byte-identical** `Params` bytes
+/// and (b) run to the **same** output. The KDL path is schema-encoded from the `.so`'s
+/// exported `Params` schema, so the host never links the fixture's `CounterParams`.
+#[test]
+fn kdl_and_builder_dl_params_are_byte_identical_and_run_equal() {
+    // --- The Rust-builder front-end -------------------------------------------------
+    let mut builder_wiring = WiringBuilder::new()
+        .coordinator(200.0, ClockSpec::Simulated { dt_secs: 0.005 })
+        .artifact("counter", "metor-fsw-2-dl-fixture", fixture_lib_name(), "DlCounter")
+        .system("ticker")
+        .ty("Ticker")
+        .from_static()
+        .end()
+        .system("counter")
+        .ty("DlCounter")
+        .from_artifact("counter")
+        .params(CounterParams { start: 1000, scale: 2.0 })
+        .end()
+        .connect("ticker", "tick_in", "counter", "tick_in")
+        .build();
+
+    // --- The KDL front-end (the SAME mission, params as node properties) ------------
+    let kdl = format!(
+        r#"
+coordinator cycle_rate=200.0 sim_dt=0.005
+artifact "counter" crate="metor-fsw-2-dl-fixture" lib="{lib}" type="DlCounter"
+system "ticker" type="Ticker"
+system "counter" type="DlCounter" lib="counter" start=1000 scale=2.0
+connect "ticker" -> "counter" frame="tick_in"
+"#,
+        lib = fixture_lib_name()
+    );
+    let mut kdl_wiring = parse(&kdl).expect("parse the KDL mission onto Wiring");
+
+    // Build the fixture once; share the located `.so` path with both wirings.
+    if let Err(e) = build_artifacts(&mut builder_wiring, &BuildOptions::default()) {
+        eprintln!("skipping: build_artifacts failed: {e}");
+        return;
+    }
+    kdl_wiring.artifacts[0].path = builder_wiring.artifacts[0].path.clone();
+
+    // --- (a) Byte-identical `SystemSpec` params -------------------------------------
+    // The builder system carries postcard bytes directly; the KDL system carries its node
+    // text, schema-encoded here against the `.so`'s exported schema (the resolve path).
+    let path = builder_wiring.artifacts[0].path.as_ref().unwrap();
+    let builder_bytes = match &builder_wiring.systems[1].params {
+        ParamSource::Postcard(b) => b.clone(),
+        other => panic!("builder dl system should carry Postcard params, got {other:?}"),
+    };
+    let kdl_text = match &kdl_wiring.systems[1].params {
+        ParamSource::Kdl(t) => t.clone(),
+        other => panic!("KDL dl system should carry Kdl params, got {other:?}"),
+    };
+    let kdl_bytes = {
+        let dl = DlSystem::open(path).expect("open the fixture .so for its Params schema");
+        encode_kdl_params(&kdl_text, dl.params_schema(), "counter").expect("schema-encode KDL params")
+    };
+    assert_eq!(
+        builder_bytes, kdl_bytes,
+        "KDL ≡ Rust-builder params on the wire (the one-postcard-encoding invariant)"
+    );
+
+    // --- (b) Both resolve + run to the same output ----------------------------------
+    // Resolve both (sync) and tap each output, then drive both in **one** `stellarator::run`
+    // (the process has a single executor).
+    let resolve_one = |wiring: &Wiring| {
+        let mut registry = Registry::new();
+        registry.register::<Ticker, _>("Ticker");
+        resolve(wiring, &registry).expect("resolve the dl Wiring")
+    };
+    let tap = |coord: &metor_fsw_2::Coordinator| -> Input<TickOut> {
+        Input::new(
+            coord
+                .registry()
+                .view(ComponentId::new("counter.tick_out"))
+                .expect("dl output registered")
+                .expect("a reader slot is available"),
+        )
+    };
+    let builder_coord = resolve_one(&builder_wiring);
+    let kdl_coord = resolve_one(&kdl_wiring);
+    let mut builder_view = tap(&builder_coord);
+    let mut kdl_view = tap(&kdl_coord);
+
+    let (builder_coord, kdl_coord) = stellarator::run(|| async move {
+        let mut bc = builder_coord;
+        let mut kc = kdl_coord;
+        bc.run_for(6).await;
+        kc.run_for(6).await;
+        (bc, kc)
+    });
+
+    let count_of = |view: &mut Input<TickOut>| -> u64 {
+        view.latest().expect("no lap").expect("a tick_out was produced").get().count
+    };
+    let builder_count = count_of(&mut builder_view);
+    let kdl_count = count_of(&mut kdl_view);
+    // start(1000) + value(6) * scale(2.0) = 1012, both front-ends.
+    assert_eq!(builder_count, 1012, "builder front-end output");
+    assert_eq!(kdl_count, builder_count, "KDL front-end runs to the same output");
+
+    drop((builder_view, kdl_view, builder_coord, kdl_coord));
 }
