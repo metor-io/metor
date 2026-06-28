@@ -203,12 +203,18 @@ impl std::error::Error for WireError {}
 pub enum StopReason {
     /// An input was lapped (its data was overwritten before the system read it).
     LappedInput,
+    /// A dlopen'd system panicked inside the `.so` (the boundary caught it and
+    /// returned [`FswStatus::Panicked`](crate::abi::FswStatus); dl-open.md §2.5).
+    /// Only reachable for a [`DlSlot`](crate::dl); a static `CyclicRunner` cannot
+    /// produce it (a panic there unwinds the host directly).
+    Panicked,
 }
 
 impl StopReason {
     fn code(self) -> u8 {
         match self {
             StopReason::LappedInput => 1,
+            StopReason::Panicked => 2,
         }
     }
 }
@@ -446,9 +452,23 @@ where
     }
 }
 
+/// A registered dlopen'd cyclic system (dl-open.md §4.3): the loaded handle plus its
+/// postcard `Params` blob. At `build()` it is turned into a [`DlSlot`](crate::dl)
+/// instead of a typed [`CyclicRunner`]; everything before that (descriptor push, edge
+/// validation, ring sizing/allocation, registry entry) is the static-system path,
+/// unchanged. Rides the `kdl` feature with the `abi`/`dl` modules it consumes.
+#[cfg(feature = "kdl")]
+struct DlReg {
+    system: crate::dl::DlSystem,
+    params: Vec<u8>,
+}
+
 enum Reg {
     Cyclic(Box<dyn CyclicRegistration>),
     Async(Box<dyn AsyncRegistration>),
+    /// A dlopen'd cyclic system, bound to a [`DlSlot`](crate::dl) at `build()`.
+    #[cfg(feature = "kdl")]
+    Dl(DlReg),
 }
 
 // ---------------------------------------------------------------------------
@@ -551,6 +571,40 @@ impl CoordinatorBuilder {
     {
         self.n_registry_consumers += 1;
         self.add_cyclic_named("telemetry", TelemetrySystem::new(config))
+    }
+
+    /// Register a dlopen'd cyclic system under an explicit instance name (dl-open.md
+    /// §4.3). `loaded` is an opened [`DlSystem`](crate::dl); `params` is the canonical
+    /// postcard `Params` blob the `.so` decodes in `fsw_create` (identical on the wire
+    /// from either front-end — dl-open.md §6.3).
+    ///
+    /// This is the dl twin of [`add_cyclic_named`](Self::add_cyclic_named): it pushes
+    /// the `.so`'s reconstructed [`SystemDescriptor`] so the **existing**
+    /// `compatible()`/`WireError` validation and ring sizing/allocation run over it
+    /// unchanged, and records a [`Reg::Dl`] registration whose `bind` (at `build()`)
+    /// gathers the per-port ring regions, `fsw_create`s the state, and produces a
+    /// [`DlSlot`](crate::dl) instead of a typed `CyclicRunner`. Its output buffers land
+    /// in the [`OutputRegistry`] with the (prefixed) announce, so telemetry `All` taps
+    /// them like a static system's.
+    ///
+    /// v1 is cyclic-only (dl-open.md §3.1); a programmatic builder method (KDL
+    /// `artifact`/`lib=` wiring is Wave 3).
+    #[cfg(feature = "kdl")]
+    pub fn add_dl_cyclic(
+        &mut self,
+        name: impl Into<String>,
+        loaded: crate::dl::DlSystem,
+        params: Vec<u8>,
+    ) -> SystemHandle {
+        let id = self.descs.len();
+        self.descs.push(loaded.descriptor().clone());
+        self.kinds.push(SystemKind::Cyclic);
+        self.names.push(name.into());
+        self.regs.push(Reg::Dl(DlReg {
+            system: loaded,
+            params,
+        }));
+        SystemHandle { id }
     }
 
     /// Connect a producer output to a consumer input, addressed by frame id. The
@@ -791,31 +845,72 @@ impl CoordinatorBuilder {
         let mut pending_async: Vec<PendingAsync> = Vec::new();
         let regs = std::mem::take(&mut self.regs);
         for (id, reg) in regs.into_iter().enumerate() {
-            // Outputs: default wakes, the system's own buffers.
-            let outs: Vec<BoundPort> = (0..self.descs[id].outputs.len())
-                .map(|out_idx| BoundPort::new(output_rings[id][out_idx].clone()))
-                .collect();
-            // Inputs: cyclic consumers view the producer's output directly; async
-            // consumers view their private copy-in buffer with the matched wake.
-            let ins: Vec<BoundPort> = (0..self.descs[id].inputs.len())
-                .map(|in_idx| {
-                    let (prod_id, out_idx) = cons_edge[&(id, in_idx)];
-                    if self.kinds[id] == SystemKind::Async {
-                        let (ring, data, space) = private_inputs[&(id, in_idx)].clone();
-                        BoundPort::matched(ring, Box::new(data), Box::new(space))
-                    } else {
-                        BoundPort::new(output_rings[prod_id][out_idx].clone())
-                    }
-                })
-                .collect();
-
-            let mut binder = Binder::new(&outs, &ins, registry.clone());
             match reg {
-                Reg::Cyclic(r) => cyclic.push(r.bind(&mut binder)),
-                Reg::Async(r) => pending_async.push(PendingAsync {
-                    launcher: r.bind(&mut binder),
-                    wake_on_stop: async_wakes[id].clone(),
-                }),
+                // A dlopen'd system binds over **raw** `FswRing` regions, not typed
+                // `BoundPort`s: gather the same per-port rings the coordinator allocated
+                // (outputs = this system's own buffers; inputs = views into the upstream
+                // producers' outputs — the cyclic-consumer path), as `(base, len, role)`
+                // handles in `descriptors()` order, and hand them to a `DlSlot`
+                // (dl-open.md §4.2). Sizing, allocation, validation, and the registry
+                // entry above are identical to a static system's.
+                #[cfg(feature = "kdl")]
+                Reg::Dl(dl) => {
+                    use crate::abi::{FswRing, ROLE_INPUT, ROLE_OUTPUT};
+                    let outputs: Vec<FswRing> = (0..self.descs[id].outputs.len())
+                        .map(|out_idx| {
+                            let (base, len) = output_rings[id][out_idx].region();
+                            FswRing { base, len, role: ROLE_OUTPUT }
+                        })
+                        .collect();
+                    let inputs: Vec<FswRing> = (0..self.descs[id].inputs.len())
+                        .map(|in_idx| {
+                            let (prod_id, out_idx) = cons_edge[&(id, in_idx)];
+                            let (base, len) = output_rings[prod_id][out_idx].region();
+                            FswRing { base, len, role: ROLE_INPUT }
+                        })
+                        .collect();
+                    // SAFETY: every region named here is a `RingTable`-owned ring that
+                    // outlives the slot — the coordinator drops `cyclic` (this slot,
+                    // whose `Drop` calls `fsw_destroy`) before `rings` (dl-open.md §2.5).
+                    let slot = unsafe {
+                        dl.system
+                            .into_slot(&dl.params, inputs, outputs, self.descs[id].name)
+                    };
+                    cyclic.push(Box::new(slot));
+                }
+                // The static (host-side `BoxBacking`) path: build typed `BoundPort`s and
+                // walk them with a `Binder`.
+                reg => {
+                    // Outputs: default wakes, the system's own buffers.
+                    let outs: Vec<BoundPort> = (0..self.descs[id].outputs.len())
+                        .map(|out_idx| BoundPort::new(output_rings[id][out_idx].clone()))
+                        .collect();
+                    // Inputs: cyclic consumers view the producer's output directly; async
+                    // consumers view their private copy-in buffer with the matched wake.
+                    let ins: Vec<BoundPort> = (0..self.descs[id].inputs.len())
+                        .map(|in_idx| {
+                            let (prod_id, out_idx) = cons_edge[&(id, in_idx)];
+                            if self.kinds[id] == SystemKind::Async {
+                                let (ring, data, space) = private_inputs[&(id, in_idx)].clone();
+                                BoundPort::matched(ring, Box::new(data), Box::new(space))
+                            } else {
+                                BoundPort::new(output_rings[prod_id][out_idx].clone())
+                            }
+                        })
+                        .collect();
+
+                    let mut binder = Binder::new(&outs, &ins, registry.clone());
+                    match reg {
+                        Reg::Cyclic(r) => cyclic.push(r.bind(&mut binder)),
+                        Reg::Async(r) => pending_async.push(PendingAsync {
+                            launcher: r.bind(&mut binder),
+                            wake_on_stop: async_wakes[id].clone(),
+                        }),
+                        // The dl arm is handled by the outer match.
+                        #[cfg(feature = "kdl")]
+                        Reg::Dl(_) => unreachable!("dl registration bound by the outer match"),
+                    }
+                }
             }
         }
 

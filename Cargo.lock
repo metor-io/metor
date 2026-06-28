@@ -9095,6 +9095,7 @@ name = "metor-fsw-2"
 version = "0.14.2"
 dependencies = [
  "kdl",
+ "libloading",
  "metor-fsw",
  "metor-fsw-macros",
  "metor-fsw-ring",
@@ -9107,6 +9108,16 @@ dependencies = [
  "serde",
  "stellarator",
  "thiserror 2.0.18",
+ "zerocopy",
+]
+
+[[package]]
+name = "metor-fsw-2-dl-fixture"
+version = "0.14.2"
+dependencies = [
+ "metor-fsw-2",
+ "postcard-schema",
+ "serde",
  "zerocopy",
 ]
 

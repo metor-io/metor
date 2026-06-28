@@ -14,7 +14,8 @@ use core::ptr;
 use std::slice;
 
 use metor_fsw_ring::{Backing, BoxBacking, Config, NoWake, Overrun, RingBuffer};
-use metor_proto::types::Timestamp;
+use metor_proto::types::{ComponentId, Timestamp};
+use metor_proto::vtable::VTable;
 use postcard_schema::Schema;
 use postcard_schema::schema::owned::OwnedNamedType;
 use serde::{Deserialize, Serialize};
@@ -242,6 +243,64 @@ fn abi_describe_round_trips() {
     let rebuilt = msg.into_descriptor();
     assert_eq!(rebuilt.name, "counter");
     assert_eq!(rebuilt.inputs[0].frame_id, TickIn::FRAME_ID);
+}
+
+// ---------------------------------------------------------------------------
+// 3b. Telemetry-prefix rewrite (dl-open.md §7, D): a dl output's `announce(prefix)`
+//     yields instance-prefixed *vtable* ids, matching a static system's WP7 announce.
+// ---------------------------------------------------------------------------
+
+/// Every component id a vtable realizes (registration mode), for asserting which ids
+/// are baked into the schema the telemetry tap downlinks.
+fn realized_ids(vt: &VTable) -> Vec<ComponentId> {
+    vt.realize_fields(None)
+        .flatten()
+        .map(|f| f.component_id)
+        .collect()
+}
+
+#[test]
+fn dl_announce_prefixes_vtable_ids() {
+    // Lower → wire → reconstruct the descriptor exactly as the host loader does.
+    let desc = <Counter as CyclicSystem>::descriptor();
+    let in_meta: Vec<_> = desc.inputs.iter().map(|p| (p.announce)("").1).collect();
+    let out_meta: Vec<_> = desc.outputs.iter().map(|p| (p.announce)("").1).collect();
+    let schema = OwnedNamedType::from(<CounterParams as Schema>::SCHEMA);
+    let msg = SystemDescriptorMsg::lower(&desc, schema, in_meta, out_meta);
+    let rebuilt = msg.into_descriptor();
+
+    // The user output `out` (frame `tick_out`, field `count`) is outputs[0].
+    let port = &rebuilt.outputs[0];
+    let (vtable, metadata) = (port.announce)("inst");
+
+    // The metadata ids are prefixed (the always-worked half).
+    assert!(
+        metadata
+            .iter()
+            .any(|m| m.component_id == ComponentId::new("inst.tick_out.count")),
+        "metadata id is instance-prefixed"
+    );
+
+    // The vtable's *baked* leaf id is now prefixed too (the deferred W2b rewrite): it
+    // matches what a static system bakes via `announce_of::<F>("inst")`, and the
+    // unprefixed id no longer appears.
+    let ids = realized_ids(&vtable);
+    assert!(
+        ids.contains(&ComponentId::new("inst.tick_out.count")),
+        "vtable leaf id is instance-prefixed: {ids:?}"
+    );
+    assert!(
+        !ids.contains(&ComponentId::new("tick_out.count")),
+        "no unprefixed leaf id remains: {ids:?}"
+    );
+
+    // The *unprefixed* vtable on the PortDesc (what `compatible()` validates) is left
+    // alone, so wiring validation still sees the frame-relative ids.
+    let unprefixed = realized_ids(&port.vtable);
+    assert!(
+        unprefixed.contains(&ComponentId::new("tick_out.count")),
+        "PortDesc.vtable stays unprefixed for compatibility: {unprefixed:?}"
+    );
 }
 
 // ---------------------------------------------------------------------------
