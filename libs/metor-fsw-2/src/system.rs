@@ -12,7 +12,7 @@ use core::ops::{Deref, DerefMut};
 use metor_fsw_ring::{Backing, BoxBacking, NoWake, WakeSink, WakeSource};
 use metor_proto::types::Timestamp;
 
-use crate::binder::{BindPorts, Binder};
+use crate::binder::{BindPorts, RingSource};
 use crate::coordinator::{CyclicSlot, SlotState, StopReason};
 use crate::descriptor::{PortDesc, SystemDescriptor, SystemKind};
 use crate::health::{HealthPort, Level, SystemHealth, SystemLog};
@@ -114,19 +114,21 @@ where
     }
 }
 
-impl<O, WD, WS> BindPorts for Out<O, BoxBacking, WD, WS>
+impl<O, B, WD, WS> BindPorts<B> for Out<O, B, WD, WS>
 where
-    O: BindPorts,
+    O: BindPorts<B>,
+    B: Backing,
     WD: WakeSource + Default + Clone + 'static,
     WS: WakeSink + Default + Clone + 'static,
 {
     /// Bind the user ports, then the two implicit health/log ports — symmetric to
     /// [`Out::descriptors`] pushing the health/log descriptors after the user
-    /// ports (coordinator.md §1.4).
-    fn bind(binder: &mut Binder) -> Self {
-        let ports = O::bind(binder);
-        let health: Output<SystemHealth, BoxBacking, WD, WS> = Output::bind(binder);
-        let log: Output<SystemLog, BoxBacking, WD, WS> = Output::bind(binder);
+    /// ports (coordinator.md §1.4). Threads the ring source's backing `B` so a
+    /// dlopen'd system's `Out<O, RawBacking>` binds over the host's regions (dl-open.md §1.2).
+    fn bind<S: RingSource<B = B>>(src: &mut S) -> Self {
+        let ports = O::bind(src);
+        let health: Output<SystemHealth, B, WD, WS> = Output::bind(src);
+        let log: Output<SystemLog, B, WD, WS> = Output::bind(src);
         Out::new(ports, HealthPort::new(health, log))
     }
 }
@@ -138,11 +140,17 @@ where
 /// The shared system surface (system.md §1): the typed input/output bundles, the
 /// wiring name, and the once-each lifecycle hooks. A user implements one of
 /// [`CyclicSystem`]/[`AsyncSystem`], which both require this.
-pub trait System {
+///
+/// `B` is the ring [`Backing`] the bundles are bound over (dl-open.md §1.2). It
+/// defaults to [`BoxBacking`] — the host case — so an ordinary `impl System for Foo`
+/// is unchanged; a system whose bundles are `Backing`-generic writes
+/// `impl<B: Backing> System<B> for Foo` so a future dlopen'd instance can hold
+/// `RawBacking` views into the host's regions.
+pub trait System<B: Backing = BoxBacking> {
     /// The read-only inputs this system consumes.
-    type Input: SystemInput;
+    type Input: SystemInput + BindPorts<B>;
     /// The owned outputs this system produces (wrapped in [`Out`] for health).
-    type Output: SystemOutput;
+    type Output: SystemOutput + BindPorts<B>;
 
     /// Wiring name; the prefix the system's health frame hangs off (system.md §4).
     const NAME: &'static str;
@@ -158,7 +166,7 @@ pub trait System {
 /// A coordinator-driven system: the coordinator calls [`execute`](Self::execute)
 /// once per cycle. Inputs are views straight into upstream output buffers; a lapped
 /// input is a hard error the coordinator acts on (system.md §3.1).
-pub trait CyclicSystem: System {
+pub trait CyclicSystem<B: Backing = BoxBacking>: System<B> {
     /// One unit of work: read the latest inputs, write outputs. Reports trouble
     /// through `output.health()`, never a return value.
     ///
@@ -187,7 +195,7 @@ pub trait CyclicSystem: System {
 /// inputs with the ring `Notifier`. The coordinator spawns [`run`](Self::run)
 /// once and does not tick it (system.md §3.2).
 #[allow(async_fn_in_trait)]
-pub trait AsyncSystem: System {
+pub trait AsyncSystem<B: Backing = BoxBacking>: System<B> {
     /// The system's own loop. Returns when shutting down. Awaits inputs
     /// (`Input::recv`) or sleeps on a timer, calling its work on each wake, and uses
     /// the async output path so a lossless output can suspend for space. `input` is
@@ -215,25 +223,27 @@ pub trait AsyncSystem: System {
 ///
 /// This is the WP4 stand-in for the coordinator (WP5): it owns the bundles between
 /// cycles, exactly as the coordinator will.
-pub struct CyclicRunner<S, O>
+pub struct CyclicRunner<S, O, B = BoxBacking>
 where
-    S: CyclicSystem<Output = Out<O>>,
+    B: Backing,
+    S: CyclicSystem<B, Output = Out<O, B>>,
     O: SystemOutput,
 {
     system: S,
     input: S::Input,
-    output: Out<O>,
+    output: Out<O, B>,
     state: SlotState,
 }
 
-impl<S, O> CyclicRunner<S, O>
+impl<S, O, B> CyclicRunner<S, O, B>
 where
-    S: CyclicSystem<Output = Out<O>>,
+    B: Backing,
+    S: CyclicSystem<B, Output = Out<O, B>>,
     O: SystemOutput,
 {
     /// Assemble a runner from a constructed system and its (hand- or coordinator-
     /// built) port bundles.
-    pub fn new(system: S, input: S::Input, output: Out<O>) -> Self {
+    pub fn new(system: S, input: S::Input, output: Out<O, B>) -> Self {
         Self {
             system,
             input,
@@ -283,7 +293,7 @@ where
     }
 
     /// Borrow the output bundle (e.g. for a test to read a produced port back).
-    pub fn output(&mut self) -> &mut Out<O> {
+    pub fn output(&mut self) -> &mut Out<O, B> {
         &mut self.output
     }
 }
@@ -291,9 +301,10 @@ where
 /// The grown [`CyclicRunner`] erased so the coordinator can hold a heterogeneous
 /// `Vec<Box<dyn CyclicSlot>>` (coordinator.md §3.4). Delegates to the inherent
 /// methods above; `step` threads the cycle's shared timestamp.
-impl<S, O> CyclicSlot for CyclicRunner<S, O>
+impl<S, O, B> CyclicSlot for CyclicRunner<S, O, B>
 where
-    S: CyclicSystem<Output = Out<O>>,
+    B: Backing,
+    S: CyclicSystem<B, Output = Out<O, B>>,
     O: SystemOutput,
 {
     fn init(&mut self) {

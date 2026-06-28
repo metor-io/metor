@@ -23,7 +23,7 @@ use std::any::Any;
 use std::slice;
 use std::sync::Arc;
 
-use metor_fsw_ring::{BoxBacking, RingBuffer, WakeSink, WakeSource};
+use metor_fsw_ring::{Backing, BoxBacking, RingBuffer, WakeSink, WakeSource};
 
 use crate::registry::OutputRegistry;
 
@@ -88,19 +88,49 @@ impl<'a> Binder<'a> {
             registry,
         }
     }
+}
 
-    /// The broad-access output registry (telemetry.md §2.4). A system whose bundle
-    /// wants by-id access to *every* output (the telemetry downlink, a logger, a
-    /// recorder) pulls this in its `BindPorts::bind`, exactly where it pulls its typed
-    /// ports. The registry is complete before the bind loop runs, so this is safe and
-    /// needs no second phase. The returned `Arc` is cheap to clone and store.
-    pub fn output_registry(&self) -> Arc<OutputRegistry> {
-        self.registry.clone()
+/// Where a bound port's pre-allocated ring comes from, abstracted over the ring
+/// [`Backing`] so one generated bundle `bind` serves both providers (dl-open.md §1.2):
+/// the host's [`Binder`] (`B = BoxBacking`, over the coordinator's pre-allocated
+/// [`BoundPort`]s) and — in a future WP — a `RawBinder` (`B = RawBacking`, over the
+/// host's raw regions). The positional contract is unchanged: `bind` pops one ring per
+/// port via [`next_output`](Self::next_output)/[`next_input`](Self::next_input) in
+/// `descriptors()` order.
+pub trait RingSource {
+    /// The ring backing this source hands out.
+    type B: Backing;
+
+    /// Pop the next output ring and its writer-side wake endpoints, of the concrete
+    /// `WD`/`WS` the port type supplies.
+    fn next_output<WD, WS>(&mut self) -> (RingBuffer<Self::B>, WD, WS)
+    where
+        WD: WakeSource + Default + Clone + 'static,
+        WS: WakeSink + Default + Clone + 'static;
+
+    /// Pop the next input ring and its reader-side wake endpoints.
+    fn next_input<RD, RS>(&mut self) -> (RingBuffer<Self::B>, RD, RS)
+    where
+        RD: WakeSink + Default + Clone + 'static,
+        RS: WakeSource + Default + Clone + 'static;
+
+    /// The broad-access output registry (telemetry.md §2.4). A bundle that wants by-id
+    /// access to *every* output (the telemetry downlink, a logger, a recorder) pulls
+    /// this in its `BindPorts::bind`, exactly where it pulls its typed ports. Only the
+    /// host [`Binder`] carries one; a system that needs it is therefore host-only
+    /// (`B = BoxBacking`), so the default — used by any non-host source — panics rather
+    /// than fabricate an empty registry.
+    fn output_registry(&self) -> Arc<OutputRegistry> {
+        panic!("this ring source carries no output registry (host-only capability)")
     }
+}
 
-    /// Pop the next output ring and its writer-side wake endpoints, downcast to
-    /// the concrete `WD`/`WS` the port type supplies.
-    pub fn next_output<WD, WS>(&mut self) -> (RingBuffer<BoxBacking>, WD, WS)
+/// The host's ring source: pops the coordinator's pre-allocated [`BoundPort`]s, in
+/// `descriptors()` order, with their optional matched wake endpoints (the copy-in path).
+impl<'a> RingSource for Binder<'a> {
+    type B = BoxBacking;
+
+    fn next_output<WD, WS>(&mut self) -> (RingBuffer<BoxBacking>, WD, WS)
     where
         WD: WakeSource + Default + Clone + 'static,
         WS: WakeSink + Default + Clone + 'static,
@@ -116,8 +146,7 @@ impl<'a> Binder<'a> {
         )
     }
 
-    /// Pop the next input ring and its reader-side wake endpoints.
-    pub fn next_input<RD, RS>(&mut self) -> (RingBuffer<BoxBacking>, RD, RS)
+    fn next_input<RD, RS>(&mut self) -> (RingBuffer<BoxBacking>, RD, RS)
     where
         RD: WakeSink + Default + Clone + 'static,
         RS: WakeSource + Default + Clone + 'static,
@@ -132,12 +161,20 @@ impl<'a> Binder<'a> {
             BoundPort::wake(&p.space),
         )
     }
+
+    /// The registry is complete before the bind loop runs, so this is safe and needs no
+    /// second phase. The returned `Arc` is cheap to clone and store.
+    fn output_registry(&self) -> Arc<OutputRegistry> {
+        self.registry.clone()
+    }
 }
 
 /// A port bundle (a `#[derive(SystemInput)]`/`#[derive(SystemOutput)]` struct, or
-/// the framework [`Out`](crate::Out) wrapper) constructible from a [`Binder`].
-/// The derives generate this symmetrically to `descriptors()`.
-pub trait BindPorts: Sized {
-    /// Construct every port from the binder, in `descriptors()` order.
-    fn bind(binder: &mut Binder) -> Self;
+/// the framework [`Out`](crate::Out) wrapper) constructible from a [`RingSource`] over
+/// the ring backing `B`. The derives generate this symmetrically to `descriptors()`;
+/// a host bundle is `BindPorts<BoxBacking>`, a `Backing`-generic bundle is
+/// `BindPorts<B>` for all `B` (dl-open.md §1.2).
+pub trait BindPorts<B: Backing>: Sized {
+    /// Construct every port from the ring source, in `descriptors()` order.
+    fn bind<S: RingSource<B = B>>(src: &mut S) -> Self;
 }

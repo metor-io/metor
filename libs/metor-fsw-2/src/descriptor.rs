@@ -7,6 +7,7 @@
 //! allocated, and wiring-validated without constructing it.
 
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use metor_fsw::{AsVTable, Metadatatize};
 use metor_proto::types::{ComponentId, PrimType};
@@ -19,13 +20,19 @@ use crate::frame::Frame;
 /// A unit measured in Hertz; an advisory rate hint for buffer depth / async pacing.
 pub type Hz = f64;
 
+/// The type-erased prefix factory stored on [`PortDesc::announce`]: given an instance
+/// name it returns the prefixed announce vtable + component metadata. An [`Arc`] boxed
+/// closure (not a bare `fn`) so a future dlopen'd port — which has no static `F` — can
+/// carry a closure capturing its metadata-derived prefix rewrite (dl-open.md §7).
+pub type AnnounceFn = Arc<dyn Fn(&str) -> (VTable, Vec<ComponentMetadata>) + Send + Sync>;
+
 /// One port's static shape: the frame identity, its vtable (the authoritative
 /// component layout), its worst-case table size, and an advisory rate.
 ///
 /// Used both for an output (a produced frame) and an input (a required frame
 /// shape) — the two are structurally identical, the direction is which list of a
 /// [`SystemDescriptor`] it sits in.
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct PortDesc {
     /// `F::FRAME_ID`.
     pub frame_id: ComponentId,
@@ -41,14 +48,31 @@ pub struct PortDesc {
     pub max_size: usize,
     /// Advisory rate, for buffer depth / async pacing. `None` ⇒ use a global default.
     pub rate_hint: Option<Hz>,
-    /// Prefix factory closing over `F` (telemetry.md §6): given an instance name, it
-    /// re-derives the **prefixed** announce vtable + component metadata
-    /// (`<instance>.<frame>.<field>` ids/names) by reusing
-    /// `AsVTable::vtable_fields(prefix)` / `Metadatatize::metadata(prefix)`. The
-    /// coordinator calls it once per buffer at `build()` and stores the result as the
-    /// registry entry's canonical external schema. `F` is gone by build time (everything
-    /// is `PortDesc`-erased), which is exactly why this is captured as a fn-pointer.
-    pub announce: fn(&str) -> (VTable, Vec<ComponentMetadata>),
+    /// Prefix factory (telemetry.md §6): given an instance name, it re-derives the
+    /// **prefixed** announce vtable + component metadata (`<instance>.<frame>.<field>`
+    /// ids/names). A statically-linked port captures `F` here by wrapping
+    /// [`announce_of::<F>`] (reusing `AsVTable::vtable_fields(prefix)` /
+    /// `Metadatatize::metadata(prefix)`). The coordinator calls it once per buffer at
+    /// `build()` and stores the result as the registry entry's canonical external schema.
+    /// `F` is gone by build time (everything is `PortDesc`-erased), which is why this is
+    /// type-erased — and it is an [`Arc`] boxed closure (not a bare `fn`) so a future
+    /// dlopen'd port, which has no static `F`, can carry a closure capturing its
+    /// metadata-derived prefix rewrite instead (dl-open.md §7, Q-announce).
+    pub announce: AnnounceFn,
+}
+
+impl std::fmt::Debug for PortDesc {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // `announce` is a boxed closure (no `Debug`); render it as an opaque marker.
+        f.debug_struct("PortDesc")
+            .field("frame_id", &self.frame_id)
+            .field("frame_name", &self.frame_name)
+            .field("vtable", &self.vtable)
+            .field("max_size", &self.max_size)
+            .field("rate_hint", &self.rate_hint)
+            .field("announce", &"<closure>")
+            .finish()
+    }
 }
 
 /// The prefix factory stored on [`PortDesc::announce`]: re-derive `F`'s vtable +
@@ -70,7 +94,9 @@ impl PortDesc {
             vtable: F::as_vtable(),
             max_size: F::MAX_SIZE,
             rate_hint: None,
-            announce: announce_of::<F>,
+            // Coerce the `F`-closing fn item to a plain fn pointer first (erasing `F`, so
+            // no `F: 'static` bound is needed), then box it as the type-erased `Arc<dyn Fn>`.
+            announce: Arc::new(announce_of::<F> as fn(&str) -> (VTable, Vec<ComponentMetadata>)),
         }
     }
 

@@ -35,6 +35,7 @@ use kdl::{KdlDocument, KdlNode, KdlValue};
 use miette::{Diagnostic, SourceSpan};
 use thiserror::Error;
 
+use metor_fsw_ring::BoxBacking;
 use metor_proto::types::ComponentId;
 
 use crate::binder::BindPorts;
@@ -347,8 +348,8 @@ pub trait AddToBuilder<Kind>: Sized {
 impl<S, O> AddToBuilder<CyclicKind> for S
 where
     S: CyclicSystem<Output = Out<O>> + 'static,
-    O: SystemOutput + BindPorts + 'static,
-    S::Input: BindPorts + 'static,
+    O: SystemOutput + BindPorts<BoxBacking> + 'static,
+    S::Input: BindPorts<BoxBacking> + 'static,
 {
     fn add_to(self, name: &str, builder: &mut CoordinatorBuilder) -> SystemHandle {
         builder.add_cyclic_named(name, self)
@@ -361,8 +362,8 @@ where
 impl<S> AddToBuilder<AsyncKind> for S
 where
     S: AsyncSystem + 'static,
-    S::Input: BindPorts + 'static,
-    S::Output: BindPorts + 'static,
+    S::Input: BindPorts<BoxBacking> + 'static,
+    S::Output: BindPorts<BoxBacking> + 'static,
 {
     fn add_to(self, name: &str, builder: &mut CoordinatorBuilder) -> SystemHandle {
         builder.add_async_named(name, self)

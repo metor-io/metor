@@ -15,7 +15,7 @@ use metor_fsw_ring::{
 use metor_proto::error::Error as ProtoError;
 use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
 
-use crate::binder::Binder;
+use crate::binder::RingSource;
 use crate::descriptor::PortDesc;
 use crate::dynamic::Slot;
 use crate::frame::Frame;
@@ -70,16 +70,18 @@ impl<F: Frame, B: Backing, WD: WakeSource, WS: WakeSink> Output<F, B, WD, WS> {
     }
 }
 
-impl<F: Frame, WD, WS> Output<F, BoxBacking, WD, WS>
+impl<F: Frame, B: Backing, WD, WS> Output<F, B, WD, WS>
 where
     WD: WakeSource + Default + Clone + 'static,
     WS: WakeSink + Default + Clone + 'static,
 {
-    /// Bind this output over the next ring the [`Binder`] hands out, taking the
-    /// matched writer-side wake endpoints for that buffer (coordinator.md §1.4).
-    /// Walked in `descriptors()` order by the generated bundle `bind`.
-    pub fn bind(binder: &mut Binder) -> Self {
-        let (ring, data, space) = binder.next_output::<WD, WS>();
+    /// Bind this output over the next ring the [`RingSource`] hands out, taking the
+    /// matched writer-side wake endpoints for that buffer (coordinator.md §1.4). The
+    /// source's backing `B` is this port's backing, so a dlopen'd system binds
+    /// `Output<F, RawBacking>` over the host's regions with the same code path
+    /// (dl-open.md §1.2). Walked in `descriptors()` order by the generated bundle `bind`.
+    pub fn bind<S: RingSource<B = B>>(src: &mut S) -> Self {
+        let (ring, data, space) = src.next_output::<WD, WS>();
         Output::new(ring.writer(data, space))
     }
 }
@@ -169,16 +171,17 @@ impl<F: Frame, B: Backing, RD: WakeSink, RS: WakeSource> Input<F, B, RD, RS> {
     }
 }
 
-impl<F: Frame, RD, RS> Input<F, BoxBacking, RD, RS>
+impl<F: Frame, B: Backing, RD, RS> Input<F, B, RD, RS>
 where
     RD: WakeSink + Default + Clone + 'static,
     RS: WakeSource + Default + Clone + 'static,
 {
-    /// Bind this input over the next ring the [`Binder`] hands out, taking the
-    /// matched reader-side wake endpoints (coordinator.md §1.4). The reader slot
-    /// was reserved at sizing time, so registering the view cannot fail.
-    pub fn bind(binder: &mut Binder) -> Self {
-        let (ring, data, space) = binder.next_input::<RD, RS>();
+    /// Bind this input over the next ring the [`RingSource`] hands out, taking the
+    /// matched reader-side wake endpoints (coordinator.md §1.4). The reader slot was
+    /// reserved at sizing time, so registering the view cannot fail. The source's
+    /// backing `B` is this port's backing (dl-open.md §1.2).
+    pub fn bind<S: RingSource<B = B>>(src: &mut S) -> Self {
+        let (ring, data, space) = src.next_input::<RD, RS>();
         Input::new(
             ring.view(data, space)
                 .expect("reader slot reserved at sizing time"),
