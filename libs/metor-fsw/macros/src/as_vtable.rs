@@ -40,7 +40,7 @@ fn extract_repr_type(attrs: &[Attribute]) -> Option<Ident> {
 
 pub fn as_vtable(input: TokenStream) -> TokenStream {
     let input = syn::parse_macro_input!(input as DeriveInput);
-    as_vtable_impl(&input, None).into()
+    as_vtable_impl(&input, None, &crate::metor_fsw_crate_name()).into()
 }
 
 /// Shared `AsVTable` code generator.
@@ -51,8 +51,14 @@ pub fn as_vtable(input: TokenStream) -> TokenStream {
 ///
 /// The `#[metor_fsw(timestamp)]` field is suppressed as a standalone component on
 /// both paths (frames.md Q1) — it contributes only the shared timestamp source.
-pub fn as_vtable_impl(input: &DeriveInput, frame_id: Option<TokenStream2>) -> TokenStream2 {
-    let crate_name = crate::metor_fsw_crate_name();
+///
+/// `crate_name` is the root path to the crate re-exporting the named trait surface
+/// (`metor-fsw` standalone, `metor-fsw-2` when bundled by `#[derive(Frame)]`).
+pub fn as_vtable_impl(
+    input: &DeriveInput,
+    frame_id: Option<TokenStream2>,
+    crate_name: &TokenStream2,
+) -> TokenStream2 {
     let AsVTable {
         ident,
         generics,

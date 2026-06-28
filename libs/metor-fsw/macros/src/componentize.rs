@@ -17,11 +17,13 @@ pub struct Componentize {
 
 pub fn componentize(input: TokenStream) -> TokenStream {
     let input = syn::parse_macro_input!(input as DeriveInput);
-    componentize_impl(&input).into()
+    componentize_impl(&input, &crate::metor_fsw_crate_name()).into()
 }
 
-pub fn componentize_impl(input: &DeriveInput) -> TokenStream2 {
-    let crate_name = crate::metor_fsw_crate_name();
+/// `crate_name` is the path to the crate that re-exports the trait surface the
+/// generated code names — `metor-fsw` for the standalone derive, `metor-fsw-2`
+/// when bundled by `#[derive(Frame)]` (so a metor-fsw-2-only consumer compiles).
+pub fn componentize_impl(input: &DeriveInput, crate_name: &TokenStream2) -> TokenStream2 {
     let Componentize {
         ident,
         generics,

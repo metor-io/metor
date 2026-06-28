@@ -44,19 +44,44 @@ and is itself named by a `ComponentId` (the fnv1a-64 hash of the frame's dotted 
 bit masked — identical to `ComponentId::new`). The canonical example (DESIGN.md):
 
 ```rust
+use nox::{Quaternion, Vector, array::ArrayRepr};
+
 #[derive(Frame, IntoBytes, Immutable, KnownLayout)]
 #[repr(C)]
 struct IMU {
     #[metor_fsw(timestamp)]
     timestamp: Timestamp,
-    omega: Vec3<f64>,
-    accel: Vec3<f64>,
+    omega: Vector<f64, 3, ArrayRepr>,
+    accel: Vector<f64, 3, ArrayRepr>,
+    attitude: Quaternion<f64, ArrayRepr>,
 }
 ```
 
 Each field is a component (`IMU.omega` → `ComponentId::new("imu.omega")` when named under the
 frame prefix); the shared `timestamp` is marked once and propagated to every field; and the
 whole table is tagged with the frame id `ComponentId::new("imu")`.
+
+### 1.1.1 Field types — scalars, nox vectors/quaternions, and `[T; N]` arrays
+
+A frame field is one component whose primitive type is its scalar element type. Three field
+shapes are supported:
+
+- **Scalars** (`f64`, `u32`, `bool`, …) → one shape-`[]` component.
+- **nox spatial types — the recommended pattern for vectors/quaternions.**
+  `Vector<f64, 3, ArrayRepr>`, `Quaternion<f64, ArrayRepr>`,
+  `SpatialMotion`/`SpatialTransform`/… each serialize to a single multi-element component
+  (`imu.omega` of prim `f64`, shape `[3]`; a quaternion is shape `[4]`). nox types are
+  representation-consistent: the vtable/`apply` path and the in-process
+  `Componentize`/`Decomponentize` path produce the **same** single dotted component, so
+  prefer them for any vector- or quaternion-valued field.
+- **Plain `[T; N]` arrays** (`[f64; 3]`, `[bool; 3]`, …) are also supported as frame fields.
+  The in-process `Componentize`/`Decomponentize` path treats `[T; N]` as one component of
+  prim `T` and shape `[N]` (via `AsComponentView`/`FromComponentView`, mirroring nox).
+  > Caveat: the byte-level vtable/`apply` path currently expands a `[T; N]` field into `N`
+  > **indexed scalar** components (`imu.omega.0`, `imu.omega.1`, `imu.omega.2`), so the two
+  > paths disagree on naming for arrays. If you need a single shape-`[N]` component on both
+  > paths, use the nox `Vector`/`Quaternion` types above. (Unifying the `[T; N]` vtable
+  > representation is tracked for a later pass.)
 
 ### 1.2 The `Frame` trait — a thin marker over existing traits
 
@@ -202,7 +227,7 @@ ring buffers (§3.4).
 #[derive(Frame, IntoBytes, Immutable, KnownLayout)]
 #[repr(C)]
 #[metor_fsw(name = "imu")]   // optional; defaults to snake_case(ident)
-struct IMU { #[metor_fsw(timestamp)] timestamp: Timestamp, omega: Vec3<f64>, accel: Vec3<f64> }
+struct IMU { #[metor_fsw(timestamp)] timestamp: Timestamp, omega: Vector<f64, 3, ArrayRepr>, accel: Vector<f64, 3, ArrayRepr> }
 ```
 
 Reconciliation with the existing standalone derives (**extend, don't fork**):
