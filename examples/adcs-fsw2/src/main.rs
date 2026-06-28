@@ -6,12 +6,18 @@
 //! metor-proto's wire format. Start metor-panel first, then `cargo run -p adcs-fsw2`,
 //! and watch the spacecraft converge in the UI. Ctrl-C to stop.
 //!
-//! If nothing is listening on 2240 the downlink simply fails to connect and the control
-//! loop runs unaffected (you'll still see the convergence printout below).
+//! `Coordinator::run_for` is a complete `init → run → shutdown` lifecycle (it spawns the
+//! telemetry sender + opens the downlink on init and tears them down on shutdown), so it
+//! is called **once** for a single continuous mission — looping it would re-create the
+//! sender and reconnect every chunk. The per-second convergence print therefore runs on a
+//! side task reading the shared `SIM_LOG`, not by chunking the run.
 //!
-//! The fast, headless convergence check lives in `tests/closed_loop.rs`.
+//! If nothing is listening on 2240 the downlink simply fails to connect and the control
+//! loop runs unaffected (you'll still see the convergence printout). The fast, headless
+//! convergence check lives in `tests/closed_loop.rs`.
 
 use std::net::SocketAddr;
+use std::time::Duration;
 
 use adcs_fsw2::{DT, SIM_LOG, build_live, reset_sim_log};
 
@@ -25,19 +31,26 @@ async fn main() -> anyhow::Result<()> {
 
     let mut coord = build_live(addr)?;
 
-    // Wall-clock paced at 120 Hz: run ~1 s of mission per chunk, then print the current
-    // attitude error / body rate so the terminal tracks convergence while the panel plots
-    // the full telemetry. Runs until interrupted.
-    loop {
-        coord.run_for(120).await;
-        let log = SIM_LOG.lock().unwrap();
-        if let (Some(&err), Some(&rate)) = (log.err_angle.last(), log.rate.last()) {
-            let t = log.err_angle.len() as f64 * DT;
-            println!(
-                "t={t:6.1}s   attitude error {:6.2}°   body rate {:.4} rad/s",
-                err.to_degrees(),
-                rate
-            );
+    // Side task: print the current attitude error / body rate once a second from the
+    // shared convergence log, so the terminal tracks progress while the panel plots the
+    // full telemetry. Independent of the coordinator's single continuous run below.
+    let _printer = stellarator::spawn(async {
+        loop {
+            stellarator::sleep(Duration::from_secs(1)).await;
+            let log = SIM_LOG.lock().unwrap();
+            if let (Some(&err), Some(&rate)) = (log.err_angle.last(), log.rate.last()) {
+                let t = log.err_angle.len() as f64 * DT;
+                println!(
+                    "t={t:6.1}s   attitude error {:6.2}°   body rate {:.4} rad/s",
+                    err.to_degrees(),
+                    rate
+                );
+            }
         }
-    }
+    });
+
+    // One continuous run: init once (sender spawned, downlink opened), then cycle on the
+    // wall clock until the process is interrupted.
+    coord.run_for(usize::MAX).await;
+    Ok(())
 }
