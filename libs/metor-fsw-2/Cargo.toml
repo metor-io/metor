@@ -21,6 +21,13 @@ metor-fsw-macros = { path = "../metor-fsw/macros" }
 stellarator = { path = "../stellarator" }
 zerocopy = { version = "0.8.2", features = ["derive"] }
 
+# WP8 dl-open ABI: the serialized descriptor mirrors + the `Params` schema cross
+# the `.so` boundary as postcard bytes; `postcard-schema`'s owned schema form
+# (`use-std`) carries a system's `Params` schema on the descriptor.
+postcard = { version = "1.1", features = ["alloc"] }
+postcard-schema = { version = "0.2", features = ["derive", "use-std"] }
+serde = { version = "1.0", features = ["derive"] }
+
 # Wiring front-end (the `kdl` feature): KDL config language + span-carrying errors.
 kdl = { version = "6.3.4", optional = true }
 miette = { version = "7.0", features = ["fancy"], optional = true }

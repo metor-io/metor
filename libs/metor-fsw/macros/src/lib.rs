@@ -8,6 +8,7 @@ use syn::Ident;
 mod as_vtable;
 mod componentize;
 mod decomponentize;
+mod export;
 mod frame;
 mod from_kdl;
 mod metadatatize;
@@ -103,6 +104,15 @@ pub fn system_input(input: TokenStream) -> TokenStream {
 #[proc_macro_derive(SystemOutput)]
 pub fn system_output(input: TokenStream) -> TokenStream {
     system::system_output(input)
+}
+
+/// `export_system!(MySystem);` — generates the `#[unsafe(no_mangle)] extern "C"`
+/// `fsw_*` surface (dl-open.md §2/§3) of a `dlopen`-loadable system `cdylib`, each
+/// body a one-liner delegating to a `metor_fsw_2::abi::run_*` helper. `MySystem`'s
+/// `Params` must be `Serialize + Deserialize + Schema` (the postcard params contract).
+#[proc_macro]
+pub fn export_system(input: TokenStream) -> TokenStream {
+    export::export_system(input)
 }
 
 /// Derives [`FromKdlNode`] for a system's params struct: a flat struct of

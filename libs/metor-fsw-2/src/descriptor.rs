@@ -112,7 +112,7 @@ impl PortDesc {
 /// How the coordinator drives a system. Carried on the descriptor as metadata for
 /// WP5; the trait a user implements ([`CyclicSystem`](crate::CyclicSystem) vs
 /// [`AsyncSystem`](crate::AsyncSystem)) is the real distinction.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug, serde::Serialize, serde::Deserialize)]
 pub enum SystemKind {
     /// Coordinator-driven: `execute` once per cycle.
     Cyclic,
