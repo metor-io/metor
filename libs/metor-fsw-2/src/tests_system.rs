@@ -104,12 +104,12 @@ impl System for Filter {
             residuals: FrameList::EMPTY,
         });
     }
-
-    fn shutdown(&mut self, _output: &mut Out<FilterOut>) {}
 }
 
 impl CyclicSystem for Filter {
-    fn execute(&mut self, input: &mut FilterIn, output: &mut Out<FilterOut>) {
+    // Carries the input's timestamp through (not `now`), so the test can assert the
+    // sample stamp survives the cycle.
+    fn execute(&mut self, _now: Timestamp, input: &mut FilterIn, output: &mut Out<FilterOut>) {
         // Read the freshest IMU sample; report a health error when starved.
         let (timestamp, angle, accel) = match input.imu.latest() {
             Ok(Some(imu)) => {
@@ -344,9 +344,6 @@ impl System for AsyncFilter {
     type Input = AsyncIn;
     type Output = Out<AsyncOut, BoxBacking, Notifier, Notifier>;
     const NAME: &'static str = "async_filter";
-
-    fn init(&mut self, _output: &mut Self::Output) {}
-    fn shutdown(&mut self, _output: &mut Self::Output) {}
 }
 
 impl AsyncSystem for AsyncFilter {

@@ -14,14 +14,22 @@
 //! deviation). Everything else follows wiring.md §1:
 //!
 //! ```kdl
-//! coordinator cycle_rate=200.0 default_depth=8
+//! coordinator cycle_rate=200.0 default_depth=8           // wall clock, paced
+//! coordinator cycle_rate=200.0 sim_dt=0.00833            // simulated clock, free-run
 //! system "imu" type="ImuDriver" i2c_bus=1 sample_hz=200.0
 //! system "nav" type="MekfFilter" gain=0.8
 //! connect "imu" -> "nav" frame="imu"          // shorthand
 //! connect from="nav" out="nav" to="log" in="nav"   // explicit long form
+//! connect "ctrl" -> "plant" frame="torque_cmd" delayed=#true   // feedback back-edge
 //! ```
+//!
+//! `sim_dt` (seconds, optional) selects a [`ClockMode::Simulated`] clock with that
+//! logical per-cycle step (the loop free-runs, no pacing); absent ⇒ a paced `Wall`
+//! clock holding `cycle_rate`. `delayed=#true` on a `connect` marks the edge as a
+//! one-cycle-delayed feedback back-edge ([`CoordinatorBuilder::connect_delayed`]).
 
 use std::collections::HashMap;
+use std::time::Duration;
 
 use kdl::{KdlDocument, KdlNode, KdlValue};
 use miette::{Diagnostic, SourceSpan};
@@ -30,7 +38,9 @@ use thiserror::Error;
 use metor_proto::types::ComponentId;
 
 use crate::binder::BindPorts;
-use crate::coordinator::{Coordinator, CoordinatorBuilder, CoordinatorConfig, PortRef, SystemHandle, WireError};
+use crate::coordinator::{
+    ClockMode, Coordinator, CoordinatorBuilder, CoordinatorConfig, PortRef, SystemHandle, WireError,
+};
 use crate::descriptor::SystemDescriptor;
 use crate::system::{AsyncSystem, CyclicSystem, Out, SystemOutput};
 
@@ -431,6 +441,8 @@ struct Edge {
     to: String,
     out: String,
     in_: String,
+    /// `delayed=#true` ⇒ a one-cycle-delayed feedback back-edge (`connect_delayed`).
+    delayed: bool,
     span: SourceSpan,
 }
 
@@ -497,13 +509,16 @@ pub fn load(kdl: &str, registry: &Registry) -> Result<Coordinator, LoadError> {
         let producer = resolve(&instances, kdl, &edge.from, &edge.out, Dir::Out, edge.span)?;
         let consumer = resolve(&instances, kdl, &edge.to, &edge.in_, Dir::In, edge.span)?;
         edge_spans.push((producer.frame_id, edge.span));
-        builder
-            .connect(producer, consumer)
-            .map_err(|source| LoadError::Wire {
-                source,
-                src: kdl.to_string(),
-                span: edge.span,
-            })?;
+        let result = if edge.delayed {
+            builder.connect_delayed(producer, consumer)
+        } else {
+            builder.connect(producer, consumer)
+        };
+        result.map_err(|source| LoadError::Wire {
+            source,
+            src: kdl.to_string(),
+            span: edge.span,
+        })?;
     }
 
     // --- Build (wiring.md §3 pass) ---------------------------------------
@@ -531,6 +546,12 @@ fn parse_coordinator(doc: &KdlDocument, src: &str) -> Result<CoordinatorConfig, 
     if let Some(depth) = kdl_optional::<usize>(node, "default_depth", "coordinator", src)? {
         config.default_depth = depth;
     }
+    // `sim_dt` (seconds) present ⇒ a free-running simulated clock; absent ⇒ `Wall`.
+    if let Some(sim_dt) = kdl_optional::<f64>(node, "sim_dt", "coordinator", src)? {
+        config.clock = ClockMode::Simulated {
+            dt: Duration::from_secs_f64(sim_dt),
+        };
+    }
     Ok(config)
 }
 
@@ -543,6 +564,8 @@ fn parse_edge(node: &KdlNode, src: &str) -> Result<Edge, LoadError> {
         src: src.to_string(),
         span,
     };
+    // `delayed=#true` marks a one-cycle-delayed feedback back-edge (default false).
+    let delayed = node.get("delayed").and_then(|v| v.as_bool()).unwrap_or(false);
 
     if let Some(from) = prop_string(node, "from") {
         // Explicit long form.
@@ -554,6 +577,7 @@ fn parse_edge(node: &KdlNode, src: &str) -> Result<Edge, LoadError> {
             to: to.to_string(),
             out: out.to_string(),
             in_: in_.to_string(),
+            delayed,
             span,
         });
     }
@@ -576,6 +600,7 @@ fn parse_edge(node: &KdlNode, src: &str) -> Result<Edge, LoadError> {
         to: to.to_string(),
         out: frame.to_string(),
         in_: frame.to_string(),
+        delayed,
         span,
     })
 }
@@ -629,7 +654,9 @@ fn wire_at_build(err: WireError, src: &str, edges: &[(ComponentId, SourceSpan)])
             .find(|(f, _)| f == frame_id)
             .map(|(_, s)| *s)
             .unwrap_or(doc_span),
-        WireError::UnknownSystem { .. } | WireError::FrameIdMismatch { .. } => doc_span,
+        WireError::UnknownSystem { .. }
+        | WireError::FrameIdMismatch { .. }
+        | WireError::FeedbackCycle { .. } => doc_span,
     };
     LoadError::Wire {
         source: err,

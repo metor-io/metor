@@ -7,14 +7,15 @@ use std::cell::RefCell;
 use std::rc::Rc;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering::Relaxed};
+use std::time::Duration;
 
 use metor_fsw_ring::{BoxBacking, Notifier};
 use metor_proto::types::Timestamp;
 use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
 
 use crate::{
-    AsyncSystem, Coordinator, CoordinatorConfig, CyclicSystem, Input, Out, Output, PortRef,
-    StopReason, System, SystemInput, SystemOutput, WireError,
+    AsyncSystem, ClockMode, Coordinator, CoordinatorConfig, CyclicSystem, Input, Out, Output,
+    PortRef, StopReason, System, SystemInput, SystemOutput, WireError,
 };
 
 // ---------------------------------------------------------------------------
@@ -81,15 +82,14 @@ impl System for Producer {
             c.fetch_add(1, Relaxed);
         }
     }
-    fn shutdown(&mut self, _o: &mut Self::Output) {}
 }
 
 impl CyclicSystem for Producer {
-    fn execute(&mut self, _in: &mut NoIn, o: &mut Self::Output) {
+    fn execute(&mut self, now: Timestamp, _in: &mut NoIn, o: &mut Self::Output) {
         for _ in 0..self.burst {
             self.n += 1.0;
             let _ = o.imu.write(&Imu {
-                timestamp: Timestamp(self.n as i64),
+                timestamp: now,
                 omega: self.n,
             });
         }
@@ -122,11 +122,10 @@ impl System for Consumer {
             c.fetch_add(1, Relaxed);
         }
     }
-    fn shutdown(&mut self, _o: &mut Self::Output) {}
 }
 
 impl CyclicSystem for Consumer {
-    fn execute(&mut self, input: &mut ConsIn, _o: &mut Self::Output) {
+    fn execute(&mut self, _now: Timestamp, input: &mut ConsIn, _o: &mut Self::Output) {
         if let Some(c) = &self.first_exec_init {
             // Record (once) how many inits had run before the first execute.
             if let Some(ic) = &self.init_counter {
@@ -146,6 +145,7 @@ fn config() -> CoordinatorConfig {
     CoordinatorConfig {
         cycle_rate: 1000.0,
         default_depth: crate::DEFAULT_DEPTH,
+        clock: ClockMode::Wall,
     }
 }
 
@@ -234,8 +234,6 @@ impl System for AsyncConsumer {
     type Input = AsyncIn;
     type Output = Out<AsyncNoOut, BoxBacking, Notifier, Notifier>;
     const NAME: &'static str = "async_consumer";
-    fn init(&mut self, _o: &mut Self::Output) {}
-    fn shutdown(&mut self, _o: &mut Self::Output) {}
 }
 
 impl AsyncSystem for AsyncConsumer {
@@ -384,4 +382,156 @@ async fn init_barrier_holds() {
         2,
         "all inits completed before the first execute"
     );
+}
+
+// ---------------------------------------------------------------------------
+// Feedback loops: an unbroken cycle is rejected; `connect_delayed` breaks it.
+// ---------------------------------------------------------------------------
+
+// `Looper` produces `Imu`, consumes `Nav`; `Backer` produces `Nav`, consumes
+// `Imu`. Plain-connecting both directions closes a 2-system cycle.
+struct Looper {
+    n: f64,
+}
+
+#[derive(SystemInput)]
+struct LooperIn {
+    nav: Input<Nav>,
+}
+
+#[derive(SystemOutput)]
+struct LooperOut {
+    imu: Output<Imu>,
+}
+
+impl System for Looper {
+    type Input = LooperIn;
+    type Output = Out<LooperOut>;
+    const NAME: &'static str = "looper";
+}
+
+impl CyclicSystem for Looper {
+    fn execute(&mut self, now: Timestamp, input: &mut LooperIn, o: &mut Self::Output) {
+        let _ = input.nav.latest(); // sample the (one-cycle-late) feedback
+        self.n += 1.0;
+        let _ = o.imu.write(&Imu {
+            timestamp: now,
+            omega: self.n,
+        });
+    }
+}
+
+struct Backer;
+
+#[derive(SystemInput)]
+struct BackerIn {
+    imu: Input<Imu>,
+}
+
+#[derive(SystemOutput)]
+struct BackerOut {
+    nav: Output<Nav>,
+}
+
+impl System for Backer {
+    type Input = BackerIn;
+    type Output = Out<BackerOut>;
+    const NAME: &'static str = "backer";
+}
+
+impl CyclicSystem for Backer {
+    fn execute(&mut self, now: Timestamp, input: &mut BackerIn, o: &mut Self::Output) {
+        let angle = match input.imu.latest() {
+            Ok(Some(imu)) => imu.get().omega,
+            _ => 0.0,
+        };
+        let _ = o.nav.write(&Nav {
+            timestamp: now,
+            angle,
+        });
+    }
+}
+
+#[test]
+fn feedback_cycle_unbroken_is_rejected() {
+    let mut b = Coordinator::builder(config());
+    let looper = b.add_cyclic(Looper { n: 0.0 });
+    let backer = b.add_cyclic(Backer);
+    // Both directions are plain forward edges → an unbroken cycle.
+    b.connect(PortRef::new::<Imu>(looper), PortRef::new::<Imu>(backer))
+        .unwrap();
+    b.connect(PortRef::new::<Nav>(backer), PortRef::new::<Nav>(looper))
+        .unwrap();
+    let err = b.build().err().expect("the cycle is rejected at build");
+    assert!(
+        matches!(&err, WireError::FeedbackCycle { systems } if systems.contains(&"looper") && systems.contains(&"backer")),
+        "{err:?}"
+    );
+}
+
+#[cfg(not(miri))]
+#[stellarator::test]
+async fn delayed_edge_allows_feedback_loop() {
+    let mut b = Coordinator::builder(config());
+    let looper = b.add_cyclic(Looper { n: 0.0 });
+    let backer = b.add_cyclic(Backer);
+    // The forward Imu edge; the Nav back-edge is the explicit one-cycle delay.
+    b.connect(PortRef::new::<Imu>(looper), PortRef::new::<Imu>(backer))
+        .unwrap();
+    b.connect_delayed(PortRef::new::<Nav>(backer), PortRef::new::<Nav>(looper))
+        .unwrap();
+    let mut coord = b.build().expect("connect_delayed breaks the cycle so it builds");
+
+    coord.run_for(5).await;
+
+    // Both systems ran the whole way without lapping/hard-stopping.
+    assert!(coord.stopped().is_empty(), "no system hard-stopped");
+}
+
+// ---------------------------------------------------------------------------
+// Simulated clock: deterministic, monotonic per-cycle timestamps (cycle k at
+// start + k*dt), with no wall-clock pacing.
+// ---------------------------------------------------------------------------
+
+struct StampRec {
+    stamps: Rc<RefCell<Vec<Timestamp>>>,
+}
+
+impl System for StampRec {
+    type Input = NoIn;
+    type Output = Out<NoOut>;
+    const NAME: &'static str = "stamp_rec";
+}
+
+impl CyclicSystem for StampRec {
+    fn execute(&mut self, now: Timestamp, _in: &mut NoIn, _o: &mut Self::Output) {
+        self.stamps.borrow_mut().push(now);
+    }
+}
+
+#[cfg(not(miri))]
+#[stellarator::test]
+async fn simulated_clock_is_deterministic_and_monotonic() {
+    let dt = Duration::from_micros(8333); // ~1/120 s, whole microseconds
+    let stamps = Rc::new(RefCell::new(Vec::new()));
+    let mut b = Coordinator::builder(CoordinatorConfig {
+        cycle_rate: 1000.0,
+        default_depth: crate::DEFAULT_DEPTH,
+        clock: ClockMode::Simulated { dt },
+    });
+    b.add_cyclic(StampRec {
+        stamps: stamps.clone(),
+    });
+    let mut coord = b.build().unwrap();
+
+    coord.run_for(10).await;
+
+    let s = stamps.borrow();
+    assert_eq!(s.len(), 10, "one stamp per cycle");
+    let step = dt.as_micros() as i64;
+    for k in 1..s.len() {
+        // Cycle k sits exactly k*dt past cycle 0, and the clock is strictly rising.
+        assert_eq!(s[k].0 - s[0].0, k as i64 * step, "cycle {k} at start + k*dt");
+        assert!(s[k].0 > s[k - 1].0, "monotonically increasing");
+    }
 }

@@ -82,15 +82,13 @@ impl System for ImuDriver {
     type Input = NoIn;
     type Output = Out<ImuOut>;
     const NAME: &'static str = "imu_driver";
-    fn init(&mut self, _o: &mut Self::Output) {}
-    fn shutdown(&mut self, _o: &mut Self::Output) {}
 }
 
 impl CyclicSystem for ImuDriver {
-    fn execute(&mut self, _in: &mut NoIn, o: &mut Self::Output) {
+    fn execute(&mut self, now: Timestamp, _in: &mut NoIn, o: &mut Self::Output) {
         self.n += 1.0;
         let _ = o.imu.write(&Imu {
-            timestamp: Timestamp(self.n as i64),
+            timestamp: now,
             omega: self.n,
         });
     }
@@ -130,16 +128,14 @@ impl System for NavFilter {
     type Input = NavIn;
     type Output = Out<NavOut>;
     const NAME: &'static str = "nav_filter";
-    fn init(&mut self, _o: &mut Self::Output) {}
-    fn shutdown(&mut self, _o: &mut Self::Output) {}
 }
 
 impl CyclicSystem for NavFilter {
-    fn execute(&mut self, input: &mut NavIn, o: &mut Self::Output) {
+    fn execute(&mut self, now: Timestamp, input: &mut NavIn, o: &mut Self::Output) {
         if let Ok(Some(imu)) = input.imu.latest() {
             let omega = imu.get().omega;
             let _ = o.nav.write(&Nav {
-                timestamp: Timestamp(omega as i64),
+                timestamp: now,
                 angle: omega * self.gain,
             });
         }
@@ -175,8 +171,6 @@ impl System for NavLogger {
     type Input = LogIn;
     type Output = Out<LogNoOut, BoxBacking, Notifier, Notifier>;
     const NAME: &'static str = "nav_logger";
-    fn init(&mut self, _o: &mut Self::Output) {}
-    fn shutdown(&mut self, _o: &mut Self::Output) {}
 }
 
 impl AsyncSystem for NavLogger {
@@ -213,12 +207,10 @@ impl System for PickyConsumer {
     type Input = PickyIn;
     type Output = Out<NoOut>;
     const NAME: &'static str = "picky";
-    fn init(&mut self, _o: &mut Self::Output) {}
-    fn shutdown(&mut self, _o: &mut Self::Output) {}
 }
 
 impl CyclicSystem for PickyConsumer {
-    fn execute(&mut self, input: &mut PickyIn, _o: &mut Self::Output) {
+    fn execute(&mut self, _now: Timestamp, input: &mut PickyIn, _o: &mut Self::Output) {
         let _ = input.imu.latest();
     }
 }
@@ -230,6 +222,49 @@ impl RegisteredSystem for PickyConsumer {
     }
 }
 
+// ---------------------------------------------------------------------------
+// A loop-closer: consumes `nav`, produces `imu`. With `NavFilter` (imu -> nav)
+// this forms a 2-system feedback cycle, used to exercise the KDL `delayed=` edge.
+// ---------------------------------------------------------------------------
+
+struct Closer;
+
+#[derive(SystemInput)]
+struct CloserIn {
+    nav: Input<Nav>,
+}
+
+#[derive(SystemOutput)]
+struct CloserOut {
+    imu: Output<Imu>,
+}
+
+impl System for Closer {
+    type Input = CloserIn;
+    type Output = Out<CloserOut>;
+    const NAME: &'static str = "closer";
+}
+
+impl CyclicSystem for Closer {
+    fn execute(&mut self, now: Timestamp, input: &mut CloserIn, o: &mut Self::Output) {
+        let omega = match input.nav.latest() {
+            Ok(Some(nav)) => nav.get().angle,
+            _ => 0.0,
+        };
+        let _ = o.imu.write(&Imu {
+            timestamp: now,
+            omega,
+        });
+    }
+}
+
+impl RegisteredSystem for Closer {
+    type Params = ();
+    fn new(_params: Self::Params) -> Self {
+        Closer
+    }
+}
+
 /// The app's registry: the visible, auditable list of loadable systems.
 fn registry() -> Registry {
     let mut r = Registry::new();
@@ -237,6 +272,7 @@ fn registry() -> Registry {
     r.register::<NavFilter, _>("NavFilter");
     r.register::<NavLogger, _>("NavLogger");
     r.register::<PickyConsumer, _>("PickyConsumer");
+    r.register::<Closer, _>("Closer");
     r
 }
 
@@ -406,6 +442,45 @@ coordinator cycle_rate=200.0
 "#;
     let err = load_err(kdl);
     assert!(matches!(err, LoadError::MultipleCoordinators { .. }), "{err:?}");
+}
+
+// ---------------------------------------------------------------------------
+// Feedback edges: an unbroken KDL cycle surfaces as a Wire(FeedbackCycle); a
+// `delayed=#true` edge breaks it so the document loads.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn err_unbroken_feedback_cycle() {
+    // nav -> closer (nav) and closer -> nav (imu) with both plain → a cycle.
+    let kdl = r#"
+coordinator cycle_rate=100.0
+system "nav"    type="NavFilter" gain=1.0
+system "closer" type="Closer"
+connect "closer" -> "nav"    frame="imu"
+connect "nav"    -> "closer" frame="nav"
+"#;
+    let err = load_err(kdl);
+    assert!(
+        matches!(err, LoadError::Wire { source: crate::WireError::FeedbackCycle { .. }, .. }),
+        "{err:?}"
+    );
+}
+
+#[cfg(not(miri))]
+#[stellarator::test]
+async fn delayed_kdl_edge_breaks_cycle_and_runs() {
+    // The same loop, but the `nav -> closer` back-edge is `delayed=#true`. Also uses
+    // a `sim_dt` (free-running simulated clock) — both new KDL surfaces at once.
+    let kdl = r#"
+coordinator cycle_rate=100.0 sim_dt=0.00833
+system "nav"    type="NavFilter" gain=1.0
+system "closer" type="Closer"
+connect "closer" -> "nav"    frame="imu"
+connect "nav"    -> "closer" frame="nav" delayed=#true
+"#;
+    let mut coord = load(kdl, &registry()).expect("delayed edge breaks the cycle; doc loads");
+    coord.run_for(5).await;
+    assert!(coord.stopped().is_empty(), "no system hard-stopped");
 }
 
 // ---------------------------------------------------------------------------

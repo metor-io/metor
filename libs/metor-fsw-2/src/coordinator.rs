@@ -52,14 +52,36 @@ const JOIN_TIMEOUT: Duration = Duration::from_millis(20);
 // Public configuration / addressing / errors
 // ---------------------------------------------------------------------------
 
+/// Which clock drives the per-cycle timestamp (and whether the loop paces itself).
+#[derive(Clone, Copy, Debug)]
+pub enum ClockMode {
+    /// Wall-clock time: each cycle's `now` is `Timestamp::now()`, and the loop
+    /// sleeps to hold `cycle_rate` (run-fast-then-wait). The default.
+    Wall,
+    /// A simulated clock: each cycle's `now` advances by `dt` from a start epoch and
+    /// the loop does **not** sleep — it runs cycles as fast as possible. `dt` is the
+    /// logical step (e.g. a physics integrator's), so a mission converges in fixed
+    /// sim time regardless of how fast the host runs it (coordinator.md §6).
+    Simulated { dt: Duration },
+}
+
+impl Default for ClockMode {
+    fn default() -> Self {
+        ClockMode::Wall
+    }
+}
+
 /// Coordinator-wide configuration (coordinator.md §1.1).
 #[derive(Clone, Copy, Debug)]
 pub struct CoordinatorConfig {
-    /// The single global cycle rate the loop holds (run-fast-then-wait). Every
-    /// cyclic system runs every cycle; there is no per-system rate division (v1).
+    /// The single global cycle rate the loop holds (run-fast-then-wait) under a
+    /// [`Wall`](ClockMode::Wall) clock. Every cyclic system runs every cycle; there
+    /// is no per-system rate division (v1). Ignored under a `Simulated` clock.
     pub cycle_rate: Hz,
     /// In-flight record depth for a buffer whose `PortDesc` carries no rate hint.
     pub default_depth: usize,
+    /// The clock driving the per-cycle `now` and loop pacing (default `Wall`).
+    pub clock: ClockMode,
 }
 
 impl Default for CoordinatorConfig {
@@ -67,6 +89,7 @@ impl Default for CoordinatorConfig {
         Self {
             cycle_rate: 100.0,
             default_depth: DEFAULT_DEPTH,
+            clock: ClockMode::Wall,
         }
     }
 }
@@ -124,6 +147,12 @@ pub enum WireError {
         system: &'static str,
         frame_id: ComponentId,
     },
+    /// A feedback loop was left unbroken: a cycle remains in the graph once the
+    /// intentional one-cycle-delayed edges (`connect_delayed`) are removed. Every
+    /// feedback loop must break exactly one of its edges with `connect_delayed`, so
+    /// that the one-cycle-late sampling is explicit rather than an artifact of
+    /// registration order. `systems` names the cycle members in loop order.
+    FeedbackCycle { systems: Vec<&'static str> },
 }
 
 impl std::fmt::Display for WireError {
@@ -151,6 +180,11 @@ impl std::fmt::Display for WireError {
             WireError::DoubleConnect { system, frame_id } => write!(
                 f,
                 "{system} input for frame {frame_id:?} connected more than once"
+            ),
+            WireError::FeedbackCycle { systems } => write!(
+                f,
+                "unbroken feedback cycle {} — break one edge with connect_delayed",
+                systems.join(" -> ")
             ),
         }
     }
@@ -426,7 +460,9 @@ pub struct CoordinatorBuilder {
     /// Per-system instance name (defaults to `System::NAME`; the wiring loader
     /// supplies a distinct KDL instance name — wiring.md §6). Parallel to `descs`.
     names: Vec<String>,
-    edges: Vec<(PortRef, PortRef)>,
+    /// Each registered edge `(producer, consumer, delayed)`. A `delayed` edge is an
+    /// intentional one-cycle-delayed feedback edge, excluded from cycle detection.
+    edges: Vec<(PortRef, PortRef, bool)>,
 }
 
 impl CoordinatorBuilder {
@@ -497,7 +533,35 @@ impl CoordinatorBuilder {
     /// Connect a producer output to a consumer input, addressed by frame id. The
     /// full compatibility/structural validation runs in [`build`](Self::build);
     /// this only catches the cheap frame-id and unknown-system/port mistakes early.
+    ///
+    /// A forward (acyclic) edge. If a `connect` happens to close a feedback loop in
+    /// registration order, `build` rejects it as a [`FeedbackCycle`](WireError::FeedbackCycle):
+    /// the back-edge of a loop must be declared with [`connect_delayed`](Self::connect_delayed).
     pub fn connect(&mut self, producer: PortRef, consumer: PortRef) -> Result<(), WireError> {
+        self.push_edge(producer, consumer, false)
+    }
+
+    /// Connect a producer to a consumer marking the edge as an intentional
+    /// one-cycle-**delayed** feedback edge (the back-edge of a control loop). The
+    /// runtime path is identical to [`connect`](Self::connect) — a `view()` read of
+    /// the latest committed value, which is last cycle's because the producer runs
+    /// after the consumer in registration order — but the edge is excluded from
+    /// cycle detection, so the loop builds. Every feedback loop must break exactly
+    /// one edge this way; an unbroken cycle is a [`FeedbackCycle`](WireError::FeedbackCycle).
+    pub fn connect_delayed(
+        &mut self,
+        producer: PortRef,
+        consumer: PortRef,
+    ) -> Result<(), WireError> {
+        self.push_edge(producer, consumer, true)
+    }
+
+    fn push_edge(
+        &mut self,
+        producer: PortRef,
+        consumer: PortRef,
+        delayed: bool,
+    ) -> Result<(), WireError> {
         if producer.system.id >= self.descs.len() {
             return Err(WireError::UnknownSystem {
                 id: producer.system.id,
@@ -514,7 +578,7 @@ impl CoordinatorBuilder {
                 consumer: consumer.frame_id,
             });
         }
-        self.edges.push((producer, consumer));
+        self.edges.push((producer, consumer, delayed));
         Ok(())
     }
 
@@ -527,7 +591,10 @@ impl CoordinatorBuilder {
         // --- Validate edges, build the connection map ------------------------
         // (cons_id, in_idx) -> (prod_id, out_idx)
         let mut cons_edge: HashMap<(usize, usize), (usize, usize)> = HashMap::new();
-        for (p, c) in &self.edges {
+        // System-level adjacency over the NON-delayed edges only, for cycle
+        // detection: a remaining cycle is an unbroken feedback loop.
+        let mut forward_adj: Vec<Vec<usize>> = vec![Vec::new(); n];
+        for (p, c, delayed) in &self.edges {
             let out_idx = self.descs[p.system.id]
                 .outputs
                 .iter()
@@ -563,6 +630,16 @@ impl CoordinatorBuilder {
                     frame_id: c.frame_id,
                 });
             }
+            if !delayed && p.system.id != c.system.id {
+                forward_adj[p.system.id].push(c.system.id);
+            }
+        }
+
+        // --- Every feedback loop must be broken by a `connect_delayed` --------
+        if let Some(cycle) = find_cycle(&forward_adj) {
+            return Err(WireError::FeedbackCycle {
+                systems: cycle.into_iter().map(|id| self.descs[id].name).collect(),
+            });
         }
 
         // --- Every input must be connected exactly once ----------------------
@@ -726,6 +803,51 @@ impl CoordinatorBuilder {
     }
 }
 
+/// Find any directed cycle in the system graph (over the non-delayed edges),
+/// returning its members in loop order, or `None` if the graph is acyclic. A
+/// plain depth-first search colouring nodes white/grey/black; a back-edge to a
+/// grey (on-stack) node closes a cycle, reconstructed from the DFS stack.
+fn find_cycle(adj: &[Vec<usize>]) -> Option<Vec<usize>> {
+    const WHITE: u8 = 0;
+    const GREY: u8 = 1;
+    const BLACK: u8 = 2;
+    let n = adj.len();
+    let mut color = vec![WHITE; n];
+    let mut stack: Vec<usize> = Vec::new();
+
+    fn dfs(u: usize, adj: &[Vec<usize>], color: &mut [u8], stack: &mut Vec<usize>) -> Option<Vec<usize>> {
+        color[u] = GREY;
+        stack.push(u);
+        for &v in &adj[u] {
+            match color[v] {
+                GREY => {
+                    // Back-edge: the cycle is the stack tail from `v` onward.
+                    let start = stack.iter().position(|&x| x == v).unwrap_or(0);
+                    return Some(stack[start..].to_vec());
+                }
+                WHITE => {
+                    if let Some(c) = dfs(v, adj, color, stack) {
+                        return Some(c);
+                    }
+                }
+                _ => {}
+            }
+        }
+        stack.pop();
+        color[u] = BLACK;
+        None
+    }
+
+    for s in 0..n {
+        if color[s] == WHITE {
+            if let Some(c) = dfs(s, adj, &mut color, &mut stack) {
+                return Some(c);
+            }
+        }
+    }
+    None
+}
+
 fn coord_ring<F: Frame>(depth: usize) -> RingBuffer<BoxBacking> {
     RingBuffer::create_in_memory(Config {
         capacity: buffer_capacity::<F>(depth),
@@ -800,20 +922,36 @@ impl Coordinator {
     pub async fn run_for(&mut self, cycles: usize) {
         let tasks = self.start().await;
         let budget = Duration::from_secs_f64(1.0 / self.config.cycle_rate);
-        for _ in 0..cycles {
+        // The epoch a `Simulated` clock advances from; unused under `Wall`.
+        let epoch = Timestamp::now();
+        for k in 0..cycles {
             let start = Instant::now();
             self.cycle += 1;
-            let now = Timestamp::now();
+            // The per-cycle timestamp every system shares: wall time, or the
+            // simulated clock at `epoch + k*dt` (coordinator.md §6, fix #5/#6).
+            let now = match self.config.clock {
+                ClockMode::Wall => Timestamp::now(),
+                ClockMode::Simulated { dt } => epoch + dt * k as u32,
+            };
             for slot in &mut self.cyclic {
                 slot.step(now);
             }
             self.run_copy_ins();
             self.update_status(now);
-            let elapsed = start.elapsed();
-            if elapsed < budget {
-                stellarator::sleep(budget - elapsed).await;
-            } else {
-                self.telemeter_overrun(now, elapsed, budget);
+            match self.config.clock {
+                // Wall: hold the cycle rate (run-fast-then-wait).
+                ClockMode::Wall => {
+                    let elapsed = start.elapsed();
+                    if elapsed < budget {
+                        stellarator::sleep(budget - elapsed).await;
+                    } else {
+                        self.telemeter_overrun(now, elapsed, budget);
+                    }
+                }
+                // Simulated: no pacing — run as fast as possible. Still yield once so
+                // any spawned async consumer (driven by the copy-in above) gets to run
+                // on this cooperative runtime.
+                ClockMode::Simulated { .. } => stellarator::yield_now().await,
             }
         }
         self.shutdown(tasks).await;

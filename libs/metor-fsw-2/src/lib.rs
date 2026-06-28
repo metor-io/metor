@@ -35,7 +35,7 @@ pub use writer::{FrameWriter, ListWriter, MapWriter, WriteError};
 // `bind`/`Binder` port-construction contract.
 pub use binder::{BindPorts, Binder, BoundPort};
 pub use coordinator::{
-    Coordinator, CoordinatorBuilder, CoordinatorConfig, PortRef, SlotState, StopReason,
+    ClockMode, Coordinator, CoordinatorBuilder, CoordinatorConfig, PortRef, SlotState, StopReason,
     StoppedSystem, SystemHandle, WireError,
 };
 
