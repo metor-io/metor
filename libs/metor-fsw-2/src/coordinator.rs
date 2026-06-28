@@ -31,11 +31,13 @@ use stellarator::{JoinHandle, JoinHandleDropGuard};
 use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
 
 use crate::binder::{BindPorts, Binder, BoundPort};
-use crate::descriptor::{Hz, SystemDescriptor, SystemKind};
+use crate::descriptor::{Hz, PortDesc, SystemDescriptor, SystemKind};
 use crate::dynamic::FrameList;
 use crate::health::{HealthPort, Level};
 use crate::port::{Input, Output, buffer_capacity, capacity_for};
+use crate::registry::{OutputRegistry, RegistryEntry};
 use crate::system::{AsyncSystem, CyclicRunner, CyclicSystem, Out, System, SystemOutput};
+use crate::telemetry::{TelemetryConfig, TelemetrySystem, Transport};
 use crate::{DEFAULT_DEPTH, Frame};
 use crate::descriptor::compatible;
 
@@ -463,6 +465,10 @@ pub struct CoordinatorBuilder {
     /// Each registered edge `(producer, consumer, delayed)`. A `delayed` edge is an
     /// intentional one-cycle-delayed feedback edge, excluded from cycle detection.
     edges: Vec<(PortRef, PortRef, bool)>,
+    /// How many systems pull the broad output registry (telemetry.md §2.5). Each one
+    /// is an extra fan-out consumer on *every* output buffer, so `build()` sizes every
+    /// ring's `max_readers` to include it. Bumped by [`add_telemetry`](Self::add_telemetry).
+    n_registry_consumers: usize,
 }
 
 impl CoordinatorBuilder {
@@ -474,6 +480,7 @@ impl CoordinatorBuilder {
             kinds: Vec::new(),
             names: Vec::new(),
             edges: Vec::new(),
+            n_registry_consumers: 0,
         }
     }
 
@@ -528,6 +535,19 @@ impl CoordinatorBuilder {
         self.names.push(name.into());
         self.regs.push(Reg::Async(Box::new(AsyncReg { system })));
         SystemHandle { id }
+    }
+
+    /// Register the telemetry downlink (telemetry.md §8). This is an ordinary
+    /// [`add_cyclic_named`](Self::add_cyclic_named) of a [`TelemetrySystem`] under the
+    /// instance name `"telemetry"`, registered **last** so its end-of-cycle snapshot
+    /// observes every other system's fresh output. It additionally records one registry
+    /// consumer, so `build()` reserves a reader slot for it on every output buffer.
+    pub fn add_telemetry<T>(&mut self, config: TelemetryConfig<T>) -> SystemHandle
+    where
+        T: Transport + 'static,
+    {
+        self.n_registry_consumers += 1;
+        self.add_cyclic_named("telemetry", TelemetrySystem::new(config))
     }
 
     /// Connect a producer output to a consumer input, addressed by frame id. The
@@ -661,19 +681,27 @@ impl CoordinatorBuilder {
         }
 
         let mut table = RingTable { rings: Vec::new() };
+        // The build-order registry entries, one per tappable output buffer. Collected
+        // alongside allocation and frozen into an `Arc<OutputRegistry>` *before* the
+        // bind loop, so a system can pull it in `BindPorts::bind` (telemetry.md §2.3).
+        let mut reg_entries: Vec<RegistryEntry> = Vec::new();
+        // Each registry consumer is an extra fan-out reader on every output buffer.
+        let n_reg = self.n_registry_consumers;
 
         // --- Allocate one buffer per output port (incl. health/log) ----------
         let mut output_rings: Vec<Vec<RingBuffer<BoxBacking>>> = Vec::with_capacity(n);
         for s in 0..n {
             let mut row = Vec::with_capacity(self.descs[s].outputs.len());
             for (out_idx, port) in self.descs[s].outputs.iter().enumerate() {
-                let readers = fan_out.get(&(s, out_idx)).copied().unwrap_or(0) + READER_SLACK;
+                let readers = fan_out.get(&(s, out_idx)).copied().unwrap_or(0) + n_reg + READER_SLACK;
                 let ring = RingBuffer::create_in_memory(Config {
                     capacity: capacity_for(port.max_size, depth),
                     max_readers: readers,
                     overrun: Overrun::Overwrite,
                 });
                 row.push(ring.clone());
+                let instance = self.names[s].clone();
+                reg_entries.push(registry_entry(&instance, port, ring.clone()));
                 table.rings.push(RingEntry {
                     ring,
                     frame_id: port.frame_id,
@@ -681,11 +709,36 @@ impl CoordinatorBuilder {
                         system: s,
                         port: out_idx,
                     },
-                    instance: Some(self.names[s].clone()),
+                    instance: Some(instance),
                 });
             }
             output_rings.push(row);
         }
+
+        // --- Coordinator's own health / log / status buffers (telemetry.md §2.3) ---
+        // Allocated *before* the bind loop (they depend on no edges) so the registry
+        // handed to systems includes them. Sized for the coordinator-side reader
+        // (status_view) plus the registry consumers.
+        let coord_readers = 1 + n_reg + READER_SLACK;
+        let health_ring = coord_ring::<crate::SystemHealth>(depth, coord_readers);
+        let log_ring = coord_ring::<crate::SystemLog>(depth, coord_readers);
+        let status_ring = coord_ring::<CoordinatorStatus>(depth, coord_readers);
+        for (ring, desc) in [
+            (health_ring.clone(), PortDesc::of::<crate::SystemHealth>()),
+            (log_ring.clone(), PortDesc::of::<crate::SystemLog>()),
+            (status_ring.clone(), PortDesc::of::<CoordinatorStatus>()),
+        ] {
+            reg_entries.push(registry_entry(COORDINATOR_INSTANCE, &desc, ring.clone()));
+            table.rings.push(RingEntry {
+                ring,
+                frame_id: desc.frame_id,
+                role: BufferRole::Coordinator,
+                instance: None,
+            });
+        }
+
+        // Freeze the registry; every consumer's bind pulls this same handle.
+        let registry = Arc::new(OutputRegistry::new(reg_entries));
 
         // --- Private copy-in buffers for async inputs ------------------------
         // (async_sys, in_idx) -> (private ring, matched data notifier, space notifier)
@@ -753,7 +806,7 @@ impl CoordinatorBuilder {
                 })
                 .collect();
 
-            let mut binder = Binder::new(&outs, &ins);
+            let mut binder = Binder::new(&outs, &ins, registry.clone());
             match reg {
                 Reg::Cyclic(r) => cyclic.push(r.bind(&mut binder)),
                 Reg::Async(r) => pending_async.push(PendingAsync {
@@ -763,10 +816,9 @@ impl CoordinatorBuilder {
             }
         }
 
-        // --- Coordinator's own health / log / status buffers -----------------
-        let health_ring = coord_ring::<crate::SystemHealth>(depth);
-        let log_ring = coord_ring::<crate::SystemLog>(depth);
-        let status_ring = coord_ring::<CoordinatorStatus>(depth);
+        // --- Coordinator's own health / log / status ports -------------------
+        // The buffers were allocated up front (above) so the registry includes them;
+        // here we just wrap the writer/view ports over those same ring handles.
         let coord_health = HealthPort::new(
             Output::new(health_ring.writer(NoWake, NoWake)),
             Output::new(log_ring.writer(NoWake, NoWake)),
@@ -774,18 +826,6 @@ impl CoordinatorBuilder {
         let status_out = Output::new(status_ring.writer(NoWake, NoWake));
         let status_view =
             Input::new(status_ring.view(NoWake, NoWake).expect("status reader slot"));
-        for (ring, frame_id) in [
-            (health_ring, crate::SystemHealth::FRAME_ID),
-            (log_ring, crate::SystemLog::FRAME_ID),
-            (status_ring, CoordinatorStatus::FRAME_ID),
-        ] {
-            table.rings.push(RingEntry {
-                ring,
-                frame_id,
-                role: BufferRole::Coordinator,
-                instance: None,
-            });
-        }
 
         Ok(Coordinator {
             config: self.config,
@@ -797,6 +837,7 @@ impl CoordinatorBuilder {
             status_view,
             stopped: Vec::new(),
             cycle: 0,
+            registry,
             // Declared last so the canonical ring handles drop after every port.
             rings: table,
         })
@@ -848,12 +889,33 @@ fn find_cycle(adj: &[Vec<usize>]) -> Option<Vec<usize>> {
     None
 }
 
-fn coord_ring<F: Frame>(depth: usize) -> RingBuffer<BoxBacking> {
+fn coord_ring<F: Frame>(depth: usize, max_readers: usize) -> RingBuffer<BoxBacking> {
     RingBuffer::create_in_memory(Config {
         capacity: buffer_capacity::<F>(depth),
-        max_readers: READER_SLACK,
+        max_readers,
         overrun: Overrun::Overwrite,
     })
+}
+
+/// The synthetic instance prefix coordinator-owned buffers downlink under
+/// (telemetry.md §6): they have no system instance, so their qualified key is
+/// `coordinator.health` / `coordinator.log` / `coordinator.coordinator_status`.
+const COORDINATOR_INSTANCE: &str = "coordinator";
+
+/// Build a [`RegistryEntry`] for one buffer: compute the instance-qualified key and
+/// the prefixed announce vtable+metadata once (telemetry.md §2.1/§6), capturing a
+/// clone of the ring as the read source.
+fn registry_entry(instance: &str, port: &PortDesc, ring: RingBuffer<BoxBacking>) -> RegistryEntry {
+    let key = ComponentId::new(&format!("{instance}.{}", port.frame_name));
+    let (vtable, metadata) = (port.announce)(instance);
+    RegistryEntry {
+        key,
+        instance: Arc::from(instance),
+        frame_id: port.frame_id,
+        vtable,
+        metadata,
+        ring,
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -873,6 +935,8 @@ pub struct Coordinator {
     status_view: Input<CoordinatorStatus>,
     stopped: Vec<StoppedSystem>,
     cycle: u64,
+    /// The broad output registry over every tappable buffer (telemetry.md §2).
+    registry: Arc<OutputRegistry>,
     /// Canonical ring handles; declared last so they drop after every port.
     #[allow(dead_code)]
     rings: RingTable,
@@ -888,6 +952,13 @@ impl Coordinator {
     /// in the coordinator status frame.
     pub fn stopped(&self) -> &[StoppedSystem] {
         &self.stopped
+    }
+
+    /// The broad output registry over every tappable buffer (telemetry.md §2): an
+    /// index a logger, recorder, debugger, or test can use to read any output by its
+    /// instance-qualified id `ComponentId::new("<instance>.<frame>")`.
+    pub fn registry(&self) -> Arc<OutputRegistry> {
+        self.registry.clone()
     }
 
     /// Every owned **output** buffer as `(instance-name, frame-id)`. The instance

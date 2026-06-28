@@ -152,3 +152,36 @@ rkyv / flatbuffers). The dynamic field holds an offset and length into that trai
 fixed data the trailer is zero length and unused; with dynamic data the reader jumps into it.
 Describing this in a VTable requires new list/map ops so that other systems — and metor-db — can
 interpret the trailer rather than treat it as an opaque blob.
+
+## Telemetry Downlink
+
+Flight software is only useful if its state can be observed off-board. metor_fsw provides a
+dedicated **telemetry system** that taps the outputs of other systems and streams them out of the
+process in metor-proto's wire format — the same format metor-db ingests. The downlink and the
+database are therefore two ends of one protocol: a frame produced by a system is streamed out as a
+table, and metor-db stores it with no extra translation. This is the same VTable symmetry that runs
+through the rest of the design, extended to the network edge.
+
+Like any system the telemetry streamer is invoked by the coordinator, and it can in principle run
+at any point in the cycle. In practice it is registered last so it captures an end-of-cycle
+snapshot of every output: each cycle it reads the latest frame from each tapped output buffer and
+emits it.
+
+It has two modes:
+1. **All telemetry** — it taps every output buffer in the running graph (every system's output
+   frames, plus the per-system health and log frames). No wiring is required; the coordinator
+   binds it to the full set of outputs.
+2. **Subset** — it taps a named subset of frames or instances, for a constrained downlink budget.
+
+Because the streamer needs to enumerate and read every output rather than a fixed, compile-time set
+of typed inputs, the coordinator gives it a **tap** over the output ring buffers it owns, together
+with each frame's VTable and the producing system's instance name. Each distinct VTable is
+announced once; thereafter each cycle pushes that frame's latest bytes as a table packet
+referencing the announced VTable. The component paths are prefixed with the producing instance's
+name (so `processes.htop.pid` from the `procmon` instance is downlinked as
+`procmon.processes.htop.pid`) — this is where the per-instance namespacing the wiring records is
+finally applied, so two instances of one system type never collide on the wire.
+
+The transport is pluggable. A TCP stream — to a ground link or a co-located metor-db — is the first
+target; a shared-memory queue is a natural local alternative. Either way the bytes on the wire are
+identical and a consumer needs only the announced VTables to parse them.

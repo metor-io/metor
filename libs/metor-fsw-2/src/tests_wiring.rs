@@ -484,6 +484,33 @@ connect "nav"    -> "closer" frame="nav" delayed=#true
 }
 
 // ---------------------------------------------------------------------------
+// Telemetry: a `telemetry` node loads (registered last) and runs. The TCP endpoint
+// is closed, so the sender just fails to connect and stops downlinking — the control
+// cycle is unaffected and the run completes (telemetry.md §7/§8).
+// ---------------------------------------------------------------------------
+
+#[cfg(not(miri))]
+#[stellarator::test]
+async fn telemetry_node_loads_and_runs() {
+    let kdl = r#"
+coordinator cycle_rate=1000.0 sim_dt=0.001
+
+system "imu" type="ImuDriver" i2c_bus=1 sample_hz=200.0
+system "nav" type="NavFilter" gain=2.0
+
+connect "imu" -> "nav" frame="imu"
+
+telemetry {
+    transport "tcp" addr="127.0.0.1:59421"
+    mode "all"
+}
+"#;
+    let mut coord = load(kdl, &registry()).expect("telemetry node loads");
+    coord.run_for(10).await;
+    assert!(coord.stopped().is_empty(), "no system hard-stopped");
+}
+
+// ---------------------------------------------------------------------------
 // FromKdlNode derive round-trips scalars, a string, an optional, and a default.
 // ---------------------------------------------------------------------------
 

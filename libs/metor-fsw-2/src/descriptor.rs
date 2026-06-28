@@ -8,8 +8,11 @@
 
 use std::collections::HashMap;
 
+use metor_fsw::{AsVTable, Metadatatize};
 use metor_proto::types::{ComponentId, PrimType};
 use metor_proto::vtable::VTable;
+use metor_proto::vtable::builder::vtable;
+use metor_proto_wkt::ComponentMetadata;
 
 use crate::frame::Frame;
 
@@ -26,12 +29,36 @@ pub type Hz = f64;
 pub struct PortDesc {
     /// `F::FRAME_ID`.
     pub frame_id: ComponentId,
-    /// `F::as_vtable()` — enumerated in registration mode for compatibility.
+    /// `F::NAME` — the unprefixed frame name, kept so the coordinator can compute
+    /// the instance-qualified registry key `ComponentId::new("<instance>.<frame>")`
+    /// without a static `F` (telemetry.md §2.2/§6).
+    pub frame_name: &'static str,
+    /// `F::as_vtable()` — enumerated in registration mode for compatibility. This is
+    /// the **frame-relative** (unprefixed) vtable the wiring compatibility check uses;
+    /// the telemetry-facing prefixed vtable is produced on demand by [`announce`](Self::announce).
     pub vtable: VTable,
     /// `F::MAX_SIZE` (worst-case table bytes); size a ring via [`crate::buffer_capacity`].
     pub max_size: usize,
     /// Advisory rate, for buffer depth / async pacing. `None` ⇒ use a global default.
     pub rate_hint: Option<Hz>,
+    /// Prefix factory closing over `F` (telemetry.md §6): given an instance name, it
+    /// re-derives the **prefixed** announce vtable + component metadata
+    /// (`<instance>.<frame>.<field>` ids/names) by reusing
+    /// `AsVTable::vtable_fields(prefix)` / `Metadatatize::metadata(prefix)`. The
+    /// coordinator calls it once per buffer at `build()` and stores the result as the
+    /// registry entry's canonical external schema. `F` is gone by build time (everything
+    /// is `PortDesc`-erased), which is exactly why this is captured as a fn-pointer.
+    pub announce: fn(&str) -> (VTable, Vec<ComponentMetadata>),
+}
+
+/// The prefix factory stored on [`PortDesc::announce`]: re-derive `F`'s vtable +
+/// metadata under the dotted `prefix` (the instance name). A `&str` is a
+/// [`ComponentPath`](metor_fsw::path::ComponentPath), so the leaves roll the same
+/// ids as `ComponentId::new("<prefix>.<frame>.<field>")`.
+fn announce_of<F: Frame>(prefix: &str) -> (VTable, Vec<ComponentMetadata>) {
+    let vt = vtable(<F as AsVTable>::vtable_fields(prefix));
+    let metadata = <F as Metadatatize>::metadata(prefix).collect();
+    (vt, metadata)
 }
 
 impl PortDesc {
@@ -39,9 +66,11 @@ impl PortDesc {
     pub fn of<F: Frame>() -> Self {
         Self {
             frame_id: F::FRAME_ID,
+            frame_name: F::NAME,
             vtable: F::as_vtable(),
             max_size: F::MAX_SIZE,
             rate_hint: None,
+            announce: announce_of::<F>,
         }
     }
 

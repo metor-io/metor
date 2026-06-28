@@ -19,7 +19,9 @@ mod frame;
 mod health;
 mod port;
 mod reader;
+mod registry;
 mod system;
+mod telemetry;
 mod writer;
 
 // WP6 — the KDL wiring front-end (registry, FromKdlNode derive, `load()`).
@@ -37,6 +39,12 @@ pub use binder::{BindPorts, Binder, BoundPort};
 pub use coordinator::{
     ClockMode, Coordinator, CoordinatorBuilder, CoordinatorConfig, PortRef, SlotState, StopReason,
     StoppedSystem, SystemHandle, WireError,
+};
+
+// WP7 — the general output registry and the telemetry downlink (its first consumer).
+pub use registry::{OutputRegistry, RegistryEntry};
+pub use telemetry::{
+    TcpTransport, TelemetryConfig, TelemetryMode, TelemetrySystem, Transport, TransportError,
 };
 
 // WP4 — the system trait family, the typed port wrappers, self-description, and
@@ -72,5 +80,7 @@ mod tests;
 mod tests_coordinator;
 #[cfg(test)]
 mod tests_system;
+#[cfg(test)]
+mod tests_telemetry;
 #[cfg(all(test, feature = "kdl"))]
 mod tests_wiring;

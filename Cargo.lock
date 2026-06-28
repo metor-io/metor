@@ -9099,6 +9099,7 @@ dependencies = [
  "metor-fsw-macros",
  "metor-fsw-ring",
  "metor-proto",
+ "metor-proto-stellar",
  "metor-proto-wkt",
  "miette 7.6.0",
  "stellarator",

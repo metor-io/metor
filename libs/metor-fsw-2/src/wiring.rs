@@ -43,6 +43,7 @@ use crate::coordinator::{
 };
 use crate::descriptor::SystemDescriptor;
 use crate::system::{AsyncSystem, CyclicSystem, Out, SystemOutput};
+use crate::telemetry::{TcpTransport, TelemetryConfig, TelemetryMode};
 
 // Re-export the derive and the registration macro so a system author only needs
 // `metor_fsw_2::wiring`.
@@ -521,8 +522,92 @@ pub fn load(kdl: &str, registry: &Registry) -> Result<Coordinator, LoadError> {
         })?;
     }
 
+    // --- Telemetry pass (telemetry.md §8) --------------------------------
+    // Added after every `system`, so the downlink is registered last (its end-of-cycle
+    // snapshot observes every system's fresh output).
+    for node in doc.nodes() {
+        if node.name().value() != "telemetry" {
+            continue;
+        }
+        let (addr, mode) = parse_telemetry(node, kdl)?;
+        builder.add_telemetry(TelemetryConfig {
+            transport: TcpTransport::new(addr),
+            mode,
+        });
+    }
+
     // --- Build (wiring.md §3 pass) ---------------------------------------
     builder.build().map_err(|e| wire_at_build(e, kdl, &edge_spans))
+}
+
+/// Parse a `telemetry` node into a `(addr, mode)` pair (telemetry.md §8):
+///
+/// ```kdl
+/// telemetry {
+///     transport "tcp" addr="127.0.0.1:2240"
+///     mode "all"                       // or: mode "subset"
+///     // subset only:
+///     // tap instance="imu_left"
+///     // tap frame="control"
+/// }
+/// ```
+fn parse_telemetry(node: &KdlNode, src: &str) -> Result<(std::net::SocketAddr, TelemetryMode), LoadError> {
+    let invalid = |property: &str, expected: &str| LoadError::InvalidParam {
+        property: property.to_string(),
+        system: "telemetry",
+        expected: expected.to_string(),
+        src: src.to_string(),
+        span: node.span(),
+    };
+    let missing = |property: &str| LoadError::MissingParam {
+        property: property.to_string(),
+        system: "telemetry",
+        src: src.to_string(),
+        span: node.span(),
+    };
+
+    let children = node.children().ok_or_else(|| missing("transport"))?;
+
+    // transport "tcp" addr="..."  — v1 supports only "tcp".
+    let transport_node = children
+        .nodes()
+        .iter()
+        .find(|n| n.name().value() == "transport")
+        .ok_or_else(|| missing("transport"))?;
+    match first_arg_string(transport_node) {
+        Some("tcp") => {}
+        _ => return Err(invalid("transport", "\"tcp\" (the only v1 transport)")),
+    }
+    let addr_str = prop_string(transport_node, "addr").ok_or_else(|| missing("addr"))?;
+    let addr = addr_str
+        .parse::<std::net::SocketAddr>()
+        .map_err(|_| invalid("addr", "a socket address like 127.0.0.1:2240"))?;
+
+    // mode "all" | "subset"  — subset taps the `tap instance=.. / frame=..` children.
+    let mode_str = children
+        .nodes()
+        .iter()
+        .find(|n| n.name().value() == "mode")
+        .and_then(first_arg_string)
+        .unwrap_or("all");
+    let mode = match mode_str {
+        "all" => TelemetryMode::All,
+        "subset" => {
+            let mut instances = Vec::new();
+            let mut frames = Vec::new();
+            for tap in children.nodes().iter().filter(|n| n.name().value() == "tap") {
+                if let Some(i) = prop_string(tap, "instance") {
+                    instances.push(i.to_string());
+                }
+                if let Some(f) = prop_string(tap, "frame") {
+                    frames.push(f.to_string());
+                }
+            }
+            TelemetryMode::Subset { instances, frames }
+        }
+        _ => return Err(invalid("mode", "\"all\" or \"subset\"")),
+    };
+    Ok((addr, mode))
 }
 
 /// Read the single `coordinator` node into a [`CoordinatorConfig`] (wiring.md §1.1).
