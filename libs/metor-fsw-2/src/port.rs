@@ -13,6 +13,7 @@ use metor_fsw_ring::{
     Backing, BoxBacking, NoWake, ReadError, View, WakeSink, WakeSource, Writer, frame_len,
 };
 use metor_proto::error::Error as ProtoError;
+use metor_proto::types::LenPacket;
 use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
 
 use crate::binder::RingSource;
@@ -52,6 +53,10 @@ where
     WS: WakeSink,
 {
     writer: Writer<B, WD, WS>,
+    /// A reused table-bytes buffer for the dynamic-member [`write_with`](Self::write_with)
+    /// path, so a per-cycle publish (health, status, dynamic frames) does not
+    /// malloc+free a fresh `LenPacket` every call. `None` until the first such write.
+    scratch: Option<LenPacket>,
     _f: PhantomData<F>,
 }
 
@@ -60,6 +65,7 @@ impl<F: Frame, B: Backing, WD: WakeSource, WS: WakeSink> Output<F, B, WD, WS> {
     pub fn new(writer: Writer<B, WD, WS>) -> Self {
         Self {
             writer,
+            scratch: None,
             _f: PhantomData,
         }
     }
@@ -108,9 +114,16 @@ where
         fixed: &F,
         build: impl FnOnce(&mut FrameWriter<F>),
     ) -> Result<(), metor_fsw_ring::WriteError> {
-        let mut fw = FrameWriter::new(fixed);
+        let packet = self
+            .scratch
+            .take()
+            .unwrap_or_else(|| LenPacket::table([0, 0], F::MAX_SIZE.min(1 << 16)));
+        let mut fw = FrameWriter::from_packet(packet, fixed);
         build(&mut fw);
-        self.writer.try_write(fw.table())
+        let res = self.writer.try_write(fw.table());
+        // Retain the (grown) buffer for the next publish.
+        self.scratch = Some(fw.finish());
+        res
     }
 
     /// Async publish of a fixed frame: suspends (lossless mode only) until there is
