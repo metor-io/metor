@@ -348,3 +348,6 @@ where
         CyclicRunner::state(self)
     }
 }
+
+#[cfg(test)]
+mod tests;

@@ -612,3 +612,6 @@ where
         Err(_) => -1,
     }
 }
+
+#[cfg(all(test, feature = "kdl"))]
+mod tests;

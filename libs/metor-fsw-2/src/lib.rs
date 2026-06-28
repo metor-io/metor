@@ -102,15 +102,7 @@ pub use wiring::{
 #[cfg(feature = "kdl")]
 pub use kdl;
 
+// WP3 frame acceptance tests span frame/dynamic/writer/reader, so they stay a
+// crate-root tests module rather than living under any single module.
 #[cfg(test)]
 mod tests;
-#[cfg(test)]
-mod tests_coordinator;
-#[cfg(test)]
-mod tests_system;
-#[cfg(test)]
-mod tests_telemetry;
-#[cfg(all(test, feature = "kdl"))]
-mod tests_wiring;
-#[cfg(all(test, feature = "kdl"))]
-mod tests_abi;
