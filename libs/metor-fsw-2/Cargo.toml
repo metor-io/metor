@@ -39,6 +39,14 @@ thiserror = { version = "2.0" }
 kdl = { version = "6.3.4", optional = true }
 miette = { version = "7.0", features = ["fancy"], optional = true }
 
+# WP8 dl-open Wave 3b (dl-open.md §6.3): the schema-guided KDL→postcard params path.
+# `postcard-dyn` encodes a dynamic value *guided by* the `.so`'s exported `Params`
+# schema, producing the SAME canonical postcard bytes the typed Rust builder produces —
+# so the host never links the system's `Params` type. `serde_json::Value` is the dynamic
+# value `to_stdvec_dyn` consumes. Both ride the `kdl` feature (only the resolver uses them).
+postcard-dyn = { version = "0.2", optional = true }
+serde_json = { version = "1.0", optional = true }
+
 # The `dl_integration` test builds the fixture cdylib and `dlopen`s it; it drives the
 # coordinator on `stellarator` and defines host-side frames (zerocopy) + params
 # (postcard) matching the fixture's.
@@ -53,4 +61,4 @@ default = ["kdl"]
 # `Wiring` data model + builder + resolver + build driver. The `abi`/`dl` dl-open
 # modules are NO LONGER gated on this (Wave 3a — dl-open.md §3.0): the dlopen ABI and
 # host loader build with `--no-default-features`.
-kdl = ["dep:kdl", "dep:miette"]
+kdl = ["dep:kdl", "dep:miette", "dep:postcard-dyn", "dep:serde_json"]

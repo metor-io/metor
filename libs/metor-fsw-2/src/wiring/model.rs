@@ -96,21 +96,44 @@ pub struct SystemSpec {
     pub ty: String,
     /// `Some(artifact_id)` ⇒ a dlopen'd system; `None` ⇒ a statically-linked one.
     pub artifact: Option<String>,
-    /// The opaque params payload (dl-open.md §6.3). Its meaning depends on `artifact`:
-    ///
-    /// - **dl** (`artifact = Some`): the canonical **postcard `Params` bytes** the host
-    ///   shuttles into `fsw_create` (never decoded host-side).
-    /// - **static** (`artifact = None`): for a system parsed from KDL **with** config
-    ///   properties, the **KDL node source text** the [`Registry`](super::Registry)
-    ///   factory re-parses via `FromKdlNode` at resolve time (the host *does* link a
-    ///   static system's `Params`, but it is `FromKdlNode`-shaped, not postcard — the
-    ///   schema-guided postcard path for static systems is out of scope). A config-less
-    ///   static system (and any system built via [`WiringBuilder`](super::WiringBuilder)
-    ///   `from_static`) carries **empty** params.
-    ///
-    /// This keeps the data model serializable (just opaque bytes) while the static KDL
-    /// path stays behavior-identical (dl-open.md §6.3, the static/parse split note).
-    pub params: Vec<u8>,
+    /// Where this system's params come from (dl-open.md §6.3) — see [`ParamSource`].
+    pub params: ParamSource,
+}
+
+/// Where a [`SystemSpec`]'s params come from — made explicit so the three cases no
+/// longer overload one `Vec<u8>` (dl-open.md §6.3, the one-postcard-encoding decision).
+///
+/// At [`resolve`](super::resolve) each variant becomes the canonical postcard `Params`
+/// bytes that cross `fsw_create` (dl) or the KDL node a `FromKdlNode` factory re-parses
+/// (static):
+///
+/// - [`None`](ParamSource::None) — a paramless system (config-less KDL, or a builder
+///   system with no `.params(..)`): empty postcard bytes / a minimal synthesized node.
+/// - [`Postcard`](ParamSource::Postcard) — the typed Rust [`WiringBuilder::params`](super::SystemSpecBuilder::params)
+///   path: a `Params` value already postcard-encoded to its canonical bytes. For a dl
+///   system these are exactly the bytes `fsw_create` decodes.
+/// - [`Kdl`](ParamSource::Kdl) — the **KDL `system` node's source text**, carried verbatim
+///   so [`resolve`](super::resolve) can re-decode it: a **static** system re-parses it via
+///   [`FromKdlNode`](super::FromKdlNode) (the host links its `Params`); a **dl** system
+///   schema-encodes it against the `.so`'s exported `Params` schema (Wave 3b — the host
+///   stays schema-agnostic), producing the **same** bytes the [`Postcard`](ParamSource::Postcard)
+///   path produces. Which decoder runs is chosen by [`SystemSpec::artifact`], not by the variant.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub enum ParamSource {
+    /// No params: empty postcard bytes (dl) / a minimal synthesized node (static).
+    None,
+    /// Canonical postcard `Params` bytes (the typed Rust builder path).
+    Postcard(Vec<u8>),
+    /// The KDL `system` node's source text, re-decoded at resolve (static: `FromKdlNode`;
+    /// dl: schema-guided postcard encode).
+    Kdl(String),
+}
+
+impl ParamSource {
+    /// `true` for [`None`](ParamSource::None) — a paramless system.
+    pub fn is_none(&self) -> bool {
+        matches!(self, ParamSource::None)
+    }
 }
 
 /// One producer → consumer edge, the serializable mirror of the old `wiring.rs` `Edge`

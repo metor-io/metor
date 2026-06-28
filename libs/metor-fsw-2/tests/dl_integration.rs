@@ -49,10 +49,12 @@ struct TickOut {
     count: u64,
 }
 
-/// Mirror of the fixture's `CounterParams` so the host encodes the same postcard bytes.
+/// Mirror of the fixture's `CounterParams` so the host encodes the same postcard bytes
+/// (same field set + order — the postcard wire contract).
 #[derive(serde::Serialize, Default)]
 struct CounterParams {
     start: u64,
+    scale: f64,
 }
 
 // ---------------------------------------------------------------------------
@@ -171,7 +173,7 @@ fn dlopen_cyclic_system_end_to_end() {
     assert_eq!(desc.outputs[0].frame_id, TickOut::FRAME_ID);
 
     // 2. Wire a static producer → the dlopen'd consumer, with params start=1000.
-    let params = postcard::to_allocvec(&CounterParams { start: 1000 }).unwrap();
+    let params = postcard::to_allocvec(&CounterParams { start: 1000, scale: 1.0 }).unwrap();
     let mut b = Coordinator::builder(CoordinatorConfig {
         cycle_rate: 200.0,
         default_depth: 8,

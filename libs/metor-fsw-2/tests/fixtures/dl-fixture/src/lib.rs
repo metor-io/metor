@@ -43,19 +43,24 @@ pub struct TickOut {
     pub count: u64,
 }
 
-/// The `start` offset added to each tick — crossing `fsw_create` as postcard bytes.
+/// Two params of **differing types** crossing `fsw_create` as postcard bytes (so the
+/// Wave 3b KDL≡builder byte-equality gate is a real multi-field, mixed-type check,
+/// dl-open.md §6.3): a `start` offset (`u64`) and a `scale` factor (`f64`) applied to
+/// each input tick.
 #[derive(Serialize, Deserialize, Schema, Clone, Default, Debug, PartialEq)]
 pub struct CounterParams {
     pub start: u64,
+    pub scale: f64,
 }
 
 // Wave 3a (dl-open.md §3.0/§6.3): a dl system needs **no** `FromKdlNode` impl — it is
 // constructed only via `BuildSystem` (below), decoding canonical postcard `Params`
 // bytes in `fsw_create`. This fixture proves the `RegisteredSystem`/`kdl` decoupling.
 
-/// Adds `start` to each input tick and republishes the sum.
+/// Applies `start + value * scale` to each input tick and republishes the sum.
 pub struct DlCounter {
     start: u64,
+    scale: f64,
 }
 
 #[derive(SystemInput)]
@@ -90,7 +95,7 @@ impl<B: Backing> CyclicSystem<B> for DlCounter {
         };
         let _ = output.out.write(&TickOut {
             timestamp: now,
-            count: self.start + value,
+            count: self.start + (value as f64 * self.scale).round() as u64,
         });
     }
 }
@@ -98,7 +103,10 @@ impl<B: Backing> CyclicSystem<B> for DlCounter {
 impl BuildSystem for DlCounter {
     type Params = CounterParams;
     fn new(params: Self::Params) -> Self {
-        DlCounter { start: params.start }
+        DlCounter {
+            start: params.start,
+            scale: params.scale,
+        }
     }
 }
 
