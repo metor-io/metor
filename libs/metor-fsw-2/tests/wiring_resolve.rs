@@ -87,16 +87,10 @@ impl BuildSystem for Ticker {
     }
 }
 
-/// The platform shared-object file name for the fixture crate's `cdylib`.
-fn fixture_lib_name() -> String {
-    let stem = "metor_fsw_2_dl_fixture";
-    if cfg!(target_os = "macos") {
-        format!("lib{stem}.dylib")
-    } else if cfg!(target_os = "windows") {
-        format!("{stem}.dll")
-    } else {
-        format!("lib{stem}.so")
-    }
+/// The library **stem** for the fixture crate's `cdylib` (both front-ends take a stem;
+/// the framework decorates it to the platform file name via `cdylib_file_name`).
+fn fixture_lib_stem() -> &'static str {
+    "metor_fsw_2_dl_fixture"
 }
 
 #[test]
@@ -108,7 +102,7 @@ fn dl_graph_via_wiring_resolve_end_to_end() {
         .artifact(
             "counter",
             "metor-fsw-2-dl-fixture",
-            fixture_lib_name(),
+            fixture_lib_stem(),
             "DlCounter",
         )
         .system("ticker")
@@ -197,7 +191,7 @@ fn kdl_and_builder_dl_params_are_byte_identical_and_run_equal() {
     // --- The Rust-builder front-end -------------------------------------------------
     let mut builder_wiring = WiringBuilder::new()
         .coordinator(200.0, ClockSpec::Simulated { dt_secs: 0.005 })
-        .artifact("counter", "metor-fsw-2-dl-fixture", fixture_lib_name(), "DlCounter")
+        .artifact("counter", "metor-fsw-2-dl-fixture", fixture_lib_stem(), "DlCounter")
         .system("ticker")
         .ty("Ticker")
         .from_static()
@@ -219,7 +213,7 @@ system "ticker" type="Ticker"
 system "counter" type="DlCounter" lib="counter" start=1000 scale=2.0
 connect "ticker" -> "counter" frame="tick_in"
 "#,
-        lib = fixture_lib_name()
+        lib = fixture_lib_stem()
     );
     let mut kdl_wiring = parse(&kdl).expect("parse the KDL mission onto Wiring");
 

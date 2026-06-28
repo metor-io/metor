@@ -9132,6 +9132,7 @@ dependencies = [
 name = "metor-fsw-2"
 version = "0.14.2"
 dependencies = [
+ "clap 4.6.0",
  "kdl",
  "libloading",
  "metor-fsw",

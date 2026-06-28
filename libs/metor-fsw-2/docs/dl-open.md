@@ -522,7 +522,7 @@ can statically link its stable systems and dlopen only the ones it iterates on.
 ```rust
 let wiring = WiringBuilder::new()
     .coordinator(120.0, ClockSpec::Simulated { dt_secs: DT })
-    .artifact("adcs", "adcs-systems", "libadcs_systems.so", "Plant")
+    .artifact("adcs", "adcs-systems", "adcs_systems", "Plant")  // lib= is a stem (cli-runner.md §4.6)
     .system("plant").ty("Plant").from_artifact("adcs").params(PlantParams { .. }).end()
     .system("nav").ty("Nav").from_static().params(NavParams { .. }).end()
     .connect("plant", "sensors", "nav", "sensors")
@@ -541,7 +541,7 @@ The KDL front-end (`parse`) deserializes the same `Wiring`. Its surface adds an 
 and a per-system `lib=` reference:
 
 ```kdl
-artifact "adcs" crate="adcs-systems" lib="libadcs_systems.so" type="Plant"
+artifact "adcs" crate="adcs-systems" lib="adcs_systems" type="Plant"   // lib= is a stem (cli-runner.md §4.6)
 
 system "plant" type="Plant" lib="adcs" init_angle=0.5 init_rate=0.15
 system "nav"   type="Nav"   meas_sigma=0.02            // no lib= => static

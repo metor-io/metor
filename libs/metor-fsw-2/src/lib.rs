@@ -92,10 +92,17 @@ pub use dl::{DlError, DlSystem};
 // front-end they share a resolver with.
 #[cfg(feature = "kdl")]
 pub use wiring::{
-    Artifact, BuildError, BuildOptions, ClockSpec, CoordinatorSpec, EdgeSpec, ParamSource,
-    SystemSpec, TelemetryModeSpec, TelemetrySpec, Wiring, WiringBuilder, build_artifacts,
-    encode_kdl_params, parse, resolve,
+    Artifact, BuildError, BuildOptions, BundleError, ClockSpec, CoordinatorSpec, EdgeSpec,
+    PackageOptions, ParamSource, SystemSpec, TelemetryModeSpec, TelemetrySpec, Wiring,
+    WiringBuilder, build_artifacts, cdylib_file_name, encode_kdl_params, load_bundle, parse,
+    resolve, write_bundle,
 };
+
+// The clap-based CLI runner (`metor-fsw {build,package,run}`) and the reusable
+// `cli::main()`/`cli::run()` entry points. Rides the `kdl` feature (it uses
+// `parse`/`build_artifacts`/`resolve`); the `metor-fsw` bin delegates to `cli::main()`.
+#[cfg(feature = "kdl")]
+pub mod cli;
 
 #[cfg(feature = "kdl")]
 pub use kdl;

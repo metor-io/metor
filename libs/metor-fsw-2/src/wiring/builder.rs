@@ -7,7 +7,7 @@
 //! # #[derive(serde::Serialize)] struct PlantParams { init_angle: f64 }
 //! let wiring = WiringBuilder::new()
 //!     .coordinator(120.0, ClockSpec::Simulated { dt_secs: 1.0 / 120.0 })
-//!     .artifact("plant", "adcs-plant", "libadcs_plant.dylib", "Plant")
+//!     .artifact("plant", "adcs-plant", "adcs_plant", "Plant")
 //!     .system("plant").ty("Plant").from_artifact("plant")
 //!         .params(PlantParams { init_angle: 0.5 }).end()
 //!     .system("nav").ty("Nav").from_static().end()
@@ -81,21 +81,23 @@ impl WiringBuilder {
         self
     }
 
-    /// Declare a loadable [`Artifact`] (one system type per cdylib).
-    /// `cdylib` is the produced file name (`libfoo.dylib`/`libfoo.so`/`foo.dll`);
+    /// Declare a loadable [`Artifact`] (one system type per cdylib). `lib_stem` is the
+    /// library **stem** (`adcs_plant`); the framework decorates it to the platform's
+    /// produced file name (`libadcs_plant.dylib`/`.so` / `adcs_plant.dll`) via
+    /// [`cdylib_file_name`](super::cdylib_file_name), matching the KDL `lib=` surface.
     /// `system_type` is the `type=` this `.so` exports. Its `path` is filled by the
     /// build driver ([`build_artifacts`](super::build_artifacts)).
     pub fn artifact(
         mut self,
         id: impl Into<String>,
         crate_name: impl Into<String>,
-        cdylib: impl Into<String>,
+        lib_stem: impl AsRef<str>,
         system_type: impl Into<String>,
     ) -> Self {
         self.artifacts.push(Artifact {
             id: id.into(),
             crate_name: crate_name.into(),
-            cdylib: cdylib.into(),
+            cdylib: super::cdylib_file_name(lib_stem.as_ref()),
             system_type: system_type.into(),
             path: None,
         });

@@ -54,9 +54,11 @@ use crate::telemetry::{TcpTransport, TelemetryConfig, TelemetryMode};
 // one shared `resolve` consumes either.
 mod build_driver;
 mod builder;
+mod bundle;
 mod model;
 
 pub use build_driver::{BuildError, BuildOptions, build_artifacts};
+pub use bundle::{BundleError, PackageOptions, load_bundle, write_bundle};
 pub use builder::{SystemSpecBuilder, WiringBuilder};
 pub use model::{
     Artifact, ClockSpec, CoordinatorSpec, EdgeSpec, ParamSource, SystemSpec, TelemetryModeSpec,
@@ -1021,8 +1023,28 @@ fn mode_from_spec(mode: &TelemetryModeSpec) -> TelemetryMode {
     }
 }
 
-/// Parse one `artifact "id" crate="..." lib="libfoo.so" type="Foo"` node into an
-/// [`Artifact`]. `lib=` is the produced cdylib file name.
+/// Decorate a library **stem** into the platform's produced `cdylib` file name:
+/// `lib{stem}.dylib` (macOS), `lib{stem}.so` (Linux/other), `{stem}.dll` (Windows).
+///
+/// The wiring's `artifact` `lib=` and the Rust builder both carry the bare stem
+/// (`adcs_plant`), so a single mission document is portable across a dev mac and a
+/// Linux flight target; the framework computes the concrete file name here at parse
+/// time. [`Artifact::cdylib`](crate::Artifact) then holds that produced name — the
+/// build driver, the bundle, and `resolve` all consume it unchanged.
+pub fn cdylib_file_name(stem: &str) -> String {
+    if cfg!(target_os = "macos") {
+        format!("lib{stem}.dylib")
+    } else if cfg!(target_os = "windows") {
+        format!("{stem}.dll")
+    } else {
+        format!("lib{stem}.so")
+    }
+}
+
+/// Parse one `artifact "id" crate="..." lib="foo" type="Foo"` node into an
+/// [`Artifact`]. `lib=` is the library **stem** (`foo`); the produced file name is
+/// computed per-platform via [`cdylib_file_name`] so a static mission document stays
+/// portable across host OSes.
 fn parse_artifact(node: &KdlNode, src: &str) -> Result<Artifact, LoadError> {
     let missing = |property: &'static str| LoadError::MissingArtifactField {
         property,
@@ -1031,12 +1053,12 @@ fn parse_artifact(node: &KdlNode, src: &str) -> Result<Artifact, LoadError> {
     };
     let id = first_arg_string(node).ok_or_else(|| missing("id"))?;
     let crate_name = prop_string(node, "crate").ok_or_else(|| missing("crate"))?;
-    let cdylib = prop_string(node, "lib").ok_or_else(|| missing("lib"))?;
+    let stem = prop_string(node, "lib").ok_or_else(|| missing("lib"))?;
     let system_type = prop_string(node, "type").ok_or_else(|| missing("type"))?;
     Ok(Artifact {
         id: id.to_string(),
         crate_name: crate_name.to_string(),
-        cdylib: cdylib.to_string(),
+        cdylib: cdylib_file_name(stem),
         system_type: system_type.to_string(),
         path: None,
     })

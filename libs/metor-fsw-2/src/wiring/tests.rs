@@ -685,7 +685,7 @@ fn dl_kdl_params_are_carried_as_kdl_source() {
     // resolve-time schema-guided encoder.
     let kdl = r#"
 coordinator cycle_rate=100.0
-artifact "plant" crate="adcs-plant" lib="libadcs_plant.dylib" type="Plant"
+artifact "plant" crate="adcs-plant" lib="adcs_plant" type="Plant"
 system "plant" type="Plant" lib="plant" gain=5.0
 "#;
     let wiring = parse(kdl).expect("KDL params on a dl system parse");
@@ -699,14 +699,18 @@ system "plant" type="Plant" lib="plant" gain=5.0
 fn dl_system_in_kdl_parses_into_an_artifact_ref() {
     let kdl = r#"
 coordinator cycle_rate=100.0
-artifact "plant" crate="adcs-plant" lib="libadcs_plant.dylib" type="Plant"
+artifact "plant" crate="adcs-plant" lib="adcs_plant" type="Plant"
 system "plant" type="Plant" lib="plant"
 "#;
     let wiring = parse(kdl).expect("parse a dl system + artifact");
     assert_eq!(wiring.artifacts.len(), 1);
     assert_eq!(wiring.artifacts[0].id, "plant");
     assert_eq!(wiring.artifacts[0].crate_name, "adcs-plant");
-    assert_eq!(wiring.artifacts[0].cdylib, "libadcs_plant.dylib");
+    // `lib=` is a stem; the framework decorates it to this platform's produced file name.
+    assert_eq!(
+        wiring.artifacts[0].cdylib,
+        super::cdylib_file_name("adcs_plant")
+    );
     assert_eq!(wiring.artifacts[0].system_type, "Plant");
     assert_eq!(wiring.systems.len(), 1);
     assert_eq!(wiring.systems[0].artifact.as_deref(), Some("plant"));

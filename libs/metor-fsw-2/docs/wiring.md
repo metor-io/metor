@@ -185,12 +185,14 @@ paced [`ClockSpec::Wall`] clock holding `cycle_rate`.
 ### 2.2 `artifact` (dl systems only)
 
 ```kdl
-artifact "plant" crate="adcs-plant" lib="libadcs_plant.dylib" type="Plant"
+artifact "plant" crate="adcs-plant" lib="adcs_plant" type="Plant"
 ```
 
 - The first (nameless) argument, `"plant"`, is the artifact **id** a `system`'s `lib=` references.
 - `crate=` is the cargo package the build driver compiles.
-- `lib=` is the produced cdylib file name.
+- `lib=` is the library **stem**; the framework decorates it to the platform's produced cdylib
+  file name (`libadcs_plant.dylib`/`.so` / `adcs_plant.dll`) so one document is portable
+  (cli-runner.md §4.6).
 - `type=` is the single system type this `.so` exports.
 
 Maps one-to-one onto [`Artifact`] (`path` filled later by the build driver). A static-only mission

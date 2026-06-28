@@ -47,6 +47,10 @@ miette = { version = "7.0", features = ["fancy"], optional = true }
 postcard-dyn = { version = "0.2", optional = true }
 serde_json = { version = "1.0", optional = true }
 
+# The `metor-fsw` CLI runner's arg parser (the `cli` module + bin). Rides the `kdl`
+# feature alongside the wiring surface it drives (`parse`/`build_artifacts`/`resolve`).
+clap = { version = "4", features = ["derive"], optional = true }
+
 # The `dl_integration` test builds the fixture cdylib and `dlopen`s it; it drives the
 # coordinator on `stellarator` and defines host-side frames (zerocopy) + params
 # (postcard) matching the fixture's.
@@ -61,4 +65,12 @@ default = ["kdl"]
 # `Wiring` data model + builder + resolver + build driver. The `abi`/`dl` dl-open
 # modules are not gated on this — the dlopen ABI and host loader build with
 # `--no-default-features`.
-kdl = ["dep:kdl", "dep:miette", "dep:postcard-dyn", "dep:serde_json"]
+kdl = ["dep:kdl", "dep:miette", "dep:postcard-dyn", "dep:serde_json", "dep:clap"]
+
+# The `metor-fsw` runner binary: `fn main() { metor_fsw_2::cli::main() }`. Gated on the
+# `kdl` feature (the `cli` module it calls is `kdl`-only), so `--no-default-features`
+# does not try to build a binary whose module is `#[cfg]`-ed out.
+[[bin]]
+name = "metor-fsw"
+path = "src/bin/metor-fsw.rs"
+required-features = ["kdl"]
