@@ -390,7 +390,7 @@ async fn wait_writer_backpressures() {
 
 // ----- RawBacking / attach_raw (non-owning, same-process) -----
 
-/// Same-process attach round-trip (the exact WP8 v1 scenario): a second
+/// Same-process attach round-trip (the dlopen scenario): a second
 /// `RingBuffer<RawBacking>` reconstructed over the SAME region a
 /// `RingBuffer<BoxBacking>` allocated sees the identical atomics — a record
 /// written through one is read through the other, in both directions. Sync-only,

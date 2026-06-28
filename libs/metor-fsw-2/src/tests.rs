@@ -1,4 +1,4 @@
-//! WP3 acceptance tests (frames.md "Tests").
+//! Frame acceptance tests (frames.md "Tests").
 
 use core::mem::offset_of;
 use std::collections::HashMap;
@@ -174,7 +174,7 @@ fn array_field_frame_round_trip() {
     // `AsVTable for [T; N]` (metor-fsw/src/vtable.rs) expands an array into N indexed
     // scalar components, so the vtable path yields `arr.v.0/1/2` rather than the
     // single shape-[3] `arr.v` that `as_component_view` (part a) produces. This
-    // representation split is pre-existing framework behavior, not part of this fix.
+    // representation split is inherent framework behavior.
     let mut sink = VecSink::default();
     ArrFrame::as_vtable()
         .apply(frame.as_bytes(), &mut sink)
@@ -345,7 +345,7 @@ fn put_i64(buf: &mut Vec<u8>, v: i64) {
 fn nested_dynamic_prefix_rule() {
     // The derived vtable is the contract under test (frames.md §4): the outer map is
     // reached statically → full prefix `processes`; the inner `threads` list is a
-    // member template → own name only. The trailer bytes mirror the landed
+    // member template → own name only. The trailer bytes mirror the
     // `test_dynamic_nested` layout.
     let vtable = SysNested::as_vtable();
 

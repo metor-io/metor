@@ -10,10 +10,10 @@ authors = ["sascha@metor.io"]
 
 [dependencies]
 metor-proto = { path = "../metor-proto", features = ["std"] }
-# `nox` forces `metor-proto-wkt`'s ComponentValue on via feature unification, so
-# the (pre-existing, nox-gated) wkt build is satisfied for this crate.
+# `nox` forces `metor-proto-wkt`'s ComponentValue on via feature unification, so the
+# `nox`-gated wkt build is satisfied for this crate.
 metor-proto-wkt = { path = "../metor-proto/wkt", features = ["nox", "std"] }
-# WP7 telemetry downlink: the TCP transport wraps `PacketSink<TcpStream>`.
+# Telemetry downlink: the TCP transport wraps `PacketSink<TcpStream>`.
 metor-proto-stellar = { path = "../metor-proto/stellar" }
 metor-fsw = { path = "../metor-fsw", default-features = false, features = ["std"] }
 metor-fsw-ring = { path = "ring", default-features = false, features = ["async"] }
@@ -21,17 +21,17 @@ metor-fsw-macros = { path = "../metor-fsw/macros" }
 stellarator = { path = "../stellarator" }
 zerocopy = { version = "0.8.2", features = ["derive"] }
 
-# WP8 dl-open ABI: the serialized descriptor mirrors + the `Params` schema cross
-# the `.so` boundary as postcard bytes; `postcard-schema`'s owned schema form
-# (`use-std`) carries a system's `Params` schema on the descriptor.
+# The dlopen ABI: the serialized descriptor mirrors + the `Params` schema cross the
+# `.so` boundary as postcard bytes; `postcard-schema`'s owned schema form (`use-std`)
+# carries a system's `Params` schema on the descriptor.
 postcard = { version = "1.1", features = ["alloc"] }
 postcard-schema = { version = "0.2", features = ["derive", "use-std"] }
 serde = { version = "1.0", features = ["derive"] }
 
-# WP8 dl-open host loader (`dl` module, Wave 3a): `dlopen`/`dlsym` a system `.so` and
-# resolve its `fsw_*` C-ABI surface, keeping the `Library` alive for the loaded
-# system's life. Non-optional: the dlopen ABI/loader is available without `kdl`
-# (dl-open.md §3.0 fix). `thiserror` is non-optional too — `dl::DlError` derives it.
+# The dlopen host loader (`dl` module): `dlopen`/`dlsym` a system `.so` and resolve its
+# `fsw_*` C-ABI surface, keeping the `Library` alive for the loaded system's life.
+# Non-optional, because the dlopen ABI and loader build without the `kdl` feature.
+# `thiserror` is non-optional too — `dl::DlError` derives it.
 libloading = { version = "0.8" }
 thiserror = { version = "2.0" }
 
@@ -39,11 +39,11 @@ thiserror = { version = "2.0" }
 kdl = { version = "6.3.4", optional = true }
 miette = { version = "7.0", features = ["fancy"], optional = true }
 
-# WP8 dl-open Wave 3b (dl-open.md §6.3): the schema-guided KDL→postcard params path.
-# `postcard-dyn` encodes a dynamic value *guided by* the `.so`'s exported `Params`
-# schema, producing the SAME canonical postcard bytes the typed Rust builder produces —
-# so the host never links the system's `Params` type. `serde_json::Value` is the dynamic
-# value `to_stdvec_dyn` consumes. Both ride the `kdl` feature (only the resolver uses them).
+# The schema-guided KDL→postcard params path for dl systems. `postcard-dyn` encodes a
+# dynamic value *guided by* the `.so`'s exported `Params` schema, producing the SAME
+# canonical postcard bytes the typed Rust builder produces — so the host never links the
+# system's `Params` type. `serde_json::Value` is the dynamic value `to_stdvec_dyn`
+# consumes. Both ride the `kdl` feature (only the resolver uses them).
 postcard-dyn = { version = "0.2", optional = true }
 serde_json = { version = "1.0", optional = true }
 
@@ -59,6 +59,6 @@ postcard = { version = "1.1", features = ["alloc"] }
 default = ["kdl"]
 # The KDL wiring loader (`wiring` module): registry, FromKdlNode derive, `load()`, the
 # `Wiring` data model + builder + resolver + build driver. The `abi`/`dl` dl-open
-# modules are NO LONGER gated on this (Wave 3a — dl-open.md §3.0): the dlopen ABI and
-# host loader build with `--no-default-features`.
+# modules are not gated on this — the dlopen ABI and host loader build with
+# `--no-default-features`.
 kdl = ["dep:kdl", "dep:miette", "dep:postcard-dyn", "dep:serde_json"]

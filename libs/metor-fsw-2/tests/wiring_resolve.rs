@@ -1,5 +1,5 @@
-//! WP8 Wave 3a acceptance gate (dl-open.md §6): a dl graph driven **through the
-//! `Wiring` data model**, not a hand-built `CoordinatorBuilder`.
+//! Acceptance gate for a dl graph driven **through the `Wiring` data model**, not a
+//! hand-built `CoordinatorBuilder`.
 //!
 //! Mirrors `tests/dl_integration.rs` end to end, but expresses the mission as a
 //! [`Wiring`] built with the Rust [`WiringBuilder`] (a static producer + a dlopen'd
@@ -187,8 +187,8 @@ fn dl_graph_via_wiring_resolve_end_to_end() {
     assert_eq!(dl.descriptor().kind, SystemKind::Cyclic);
 }
 
-/// WP8 Wave 3b headline equivalence (dl-open.md §6.3): configure the **same** dl system
-/// two ways — the typed Rust `WiringBuilder.params(..)` and a KDL `system "..." lib=".."
+/// Headline equivalence: configure the **same** dl system two ways — the typed Rust
+/// `WiringBuilder.params(..)` and a KDL `system "..." lib=".."
 /// start=.. scale=..` — and assert BOTH (a) resolve to **byte-identical** `Params` bytes
 /// and (b) run to the **same** output. The KDL path is schema-encoded from the `.so`'s
 /// exported `Params` schema, so the host never links the fixture's `CounterParams`.

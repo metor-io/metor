@@ -5,7 +5,7 @@ version.workspace = true
 repository.workspace = true
 edition = "2024"
 publish = false
-description = "A WP8 dl-open integration-test fixture: one cyclic system exported as a cdylib"
+description = "A dl-open integration-test fixture: one cyclic system exported as a cdylib"
 
 # A real loadable shared object: the `dl_integration` test `dlopen`s the produced
 # `lib*.dylib`/`lib*.so` and drives its `fsw_*` C-ABI surface.

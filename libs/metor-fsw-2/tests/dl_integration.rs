@@ -1,4 +1,4 @@
-//! WP8 Wave 2 host-loader acceptance gate (dl-open.md §4, §8): a **real `dlopen`**.
+//! Host-loader acceptance gate: a **real `dlopen`**.
 //!
 //! Unlike the in-binary `tests_abi` (which calls the generated `fsw_*` symbols in the
 //! same crate), this test builds the `metor-fsw-2-dl-fixture` crate as a `cdylib`,
@@ -218,8 +218,8 @@ fn dlopen_cyclic_system_end_to_end() {
     assert_eq!(out.get().count, 1000 + CYCLES as u64, "start + latest value");
 
     // 6. Clean teardown: dropping the coordinator runs `DlSlot::Drop` → `fsw_destroy`
-    //    before the `Library` unloads and before the `RingTable` frees the regions
-    //    (dl-open.md §2.5). No crash here is the teardown-ordering assertion.
+    //    before the `Library` unloads and before the `RingTable` frees the regions.
+    //    No crash here is the teardown-ordering assertion.
     drop(coord);
     drop(out_view);
 }

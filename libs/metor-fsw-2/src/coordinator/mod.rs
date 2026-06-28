@@ -104,7 +104,8 @@ pub struct SystemHandle {
 }
 
 /// Addresses one port as `(system, frame_id)` — both come straight off the
-/// already-derived `SystemDescriptor`, so WP6 can resolve a KDL edge to a `connect`.
+/// already-derived `SystemDescriptor`, so the wiring loader can resolve a KDL edge
+/// to a `connect`.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct PortRef {
     pub system: SystemHandle,
@@ -204,7 +205,7 @@ pub enum StopReason {
     /// An input was lapped (its data was overwritten before the system read it).
     LappedInput,
     /// A dlopen'd system panicked inside the `.so` (the boundary caught it and
-    /// returned [`FswStatus::Panicked`](crate::abi::FswStatus); dl-open.md §2.5).
+    /// returned [`FswStatus::Panicked`](crate::abi::FswStatus)).
     /// Only reachable for a [`DlSlot`](crate::dl); a static `CyclicRunner` cannot
     /// produce it (a panic there unwinds the host directly).
     Panicked,
@@ -419,8 +420,8 @@ where
 {
     fn bind(self: Box<Self>, binder: &mut Binder) -> Box<dyn CyclicSlot> {
         // The host always binds over `BoxBacking`; the `Binder` is the host's
-        // `RingSource<B = BoxBacking>` (dl-open.md §1.2). A dlopen'd system instead
-        // monomorphizes `CyclicRunner<_, _, RawBacking>` on its own side of the ABI.
+        // `RingSource<B = BoxBacking>`. A dlopen'd system instead monomorphizes
+        // `CyclicRunner<_, _, RawBacking>` on its own side of the ABI.
         let input = <S::Input as BindPorts<BoxBacking>>::bind(binder);
         let output = <Out<O> as BindPorts<BoxBacking>>::bind(binder);
         Box::new(CyclicRunner::new(self.system, input, output))
@@ -452,11 +453,11 @@ where
     }
 }
 
-/// A registered dlopen'd cyclic system (dl-open.md §4.3): the loaded handle plus its
-/// postcard `Params` blob. At `build()` it is turned into a [`DlSlot`](crate::dl)
-/// instead of a typed [`CyclicRunner`]; everything before that (descriptor push, edge
-/// validation, ring sizing/allocation, registry entry) is the static-system path,
-/// unchanged. Available without `kdl` (Wave 3a — dl-open.md §3.0).
+/// A registered dlopen'd cyclic system: the loaded handle plus its postcard `Params`
+/// blob. At `build()` it is turned into a [`DlSlot`](crate::dl) instead of a typed
+/// [`CyclicRunner`]; everything before that (descriptor push, edge validation, ring
+/// sizing/allocation, registry entry) is the same as the static-system path.
+/// Available without `kdl`.
 struct DlReg {
     system: crate::dl::DlSystem,
     params: Vec<u8>,
@@ -473,8 +474,8 @@ enum Reg {
 // Builder
 // ---------------------------------------------------------------------------
 
-/// Registers systems and edges, then `build`s a ready [`Coordinator`]. This is
-/// WP6's target surface (coordinator.md §2.1).
+/// Registers systems and edges, then `build`s a ready [`Coordinator`]. This is the
+/// surface the wiring loader targets (coordinator.md §2.1).
 pub struct CoordinatorBuilder {
     config: CoordinatorConfig,
     regs: Vec<Reg>,
@@ -571,10 +572,10 @@ impl CoordinatorBuilder {
         self.add_cyclic_named("telemetry", TelemetrySystem::new(config))
     }
 
-    /// Register a dlopen'd cyclic system under an explicit instance name (dl-open.md
-    /// §4.3). `loaded` is an opened [`DlSystem`](crate::dl); `params` is the canonical
-    /// postcard `Params` blob the `.so` decodes in `fsw_create` (identical on the wire
-    /// from either front-end — dl-open.md §6.3).
+    /// Register a dlopen'd cyclic system under an explicit instance name. `loaded` is
+    /// an opened [`DlSystem`](crate::dl); `params` is the canonical postcard `Params`
+    /// blob the `.so` decodes in `fsw_create` (identical on the wire from either
+    /// front-end).
     ///
     /// This is the dl twin of [`add_cyclic_named`](Self::add_cyclic_named): it pushes
     /// the `.so`'s reconstructed [`SystemDescriptor`] so the **existing**
@@ -585,8 +586,8 @@ impl CoordinatorBuilder {
     /// in the [`OutputRegistry`] with the (prefixed) announce, so telemetry `All` taps
     /// them like a static system's.
     ///
-    /// v1 is cyclic-only (dl-open.md §3.1). This is the low-level builder method; the
-    /// Wave 3a [`resolve`](crate::resolve) drives it from a [`Wiring`](crate::Wiring)
+    /// Dl systems are cyclic-only. This is the low-level builder method; the
+    /// [`resolve`](crate::resolve) entry point drives it from a [`Wiring`](crate::Wiring)
     /// (built in Rust or parsed from the KDL `artifact`/`lib=` surface).
     pub fn add_dl_cyclic(
         &mut self,
@@ -848,9 +849,9 @@ impl CoordinatorBuilder {
                 // `BoundPort`s: gather the same per-port rings the coordinator allocated
                 // (outputs = this system's own buffers; inputs = views into the upstream
                 // producers' outputs — the cyclic-consumer path), as `(base, len, role)`
-                // handles in `descriptors()` order, and hand them to a `DlSlot`
-                // (dl-open.md §4.2). Sizing, allocation, validation, and the registry
-                // entry above are identical to a static system's.
+                // handles in `descriptors()` order, and hand them to a `DlSlot`.
+                // Sizing, allocation, validation, and the registry entry above are
+                // identical to a static system's.
                 Reg::Dl(dl) => {
                     use crate::abi::{FswRing, ROLE_INPUT, ROLE_OUTPUT};
                     let outputs: Vec<FswRing> = (0..self.descs[id].outputs.len())
@@ -868,7 +869,7 @@ impl CoordinatorBuilder {
                         .collect();
                     // SAFETY: every region named here is a `RingTable`-owned ring that
                     // outlives the slot — the coordinator drops `cyclic` (this slot,
-                    // whose `Drop` calls `fsw_destroy`) before `rings` (dl-open.md §2.5).
+                    // whose `Drop` calls `fsw_destroy`) before `rings`.
                     let slot = unsafe {
                         dl.system
                             .into_slot(&dl.params, inputs, outputs, self.descs[id].name)

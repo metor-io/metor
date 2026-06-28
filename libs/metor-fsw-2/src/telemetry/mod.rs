@@ -46,7 +46,7 @@ use crate::system::{CyclicSystem, Out, System, SystemInput, SystemOutput};
 /// in-cycle snapshot stage keeps running and simply drops).
 #[derive(Debug)]
 pub enum TransportError {
-    /// The link is not (or no longer) connected.
+    /// The link is not connected (never established, or dropped).
     Disconnected,
     /// An underlying I/O error, rendered to a string (transport-agnostic).
     Io(String),
@@ -66,7 +66,7 @@ pub trait Transport {
         meta: &[ComponentMetadata],
     ) -> Result<(), TransportError>;
 
-    /// Send one `Table` packet referencing a previously announced vtable.
+    /// Send one `Table` packet referencing an already-announced vtable.
     async fn send(&mut self, pkt: LenPacket) -> Result<(), TransportError>;
 }
 

@@ -1,6 +1,6 @@
 //! Consumer side, typed-by-index/key access (frames.md §3.5).
 //!
-//! A thin presentation convenience over the same table bytes the landed
+//! A thin presentation convenience over the same table bytes the
 //! `RealizedField`/`expand_dynamic` path realizes: it reads a [`Slot`] from the
 //! fixed region and indexes the trailer as `T` (list) or scans entries by key
 //! (map). The authoritative dotted-id/frame/timestamp semantics remain the vtable

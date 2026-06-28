@@ -1,14 +1,13 @@
-//! Frames & component derives for the `metor-fsw-2` flight-software framework
-//! (Work-Package 3).
+//! Frames & component derives for the `metor-fsw-2` flight-software framework.
 //!
 //! A [`Frame`] is a `#[repr(C)]` struct that, with one `#[derive(Frame)]`, becomes a
 //! timestamped, [`ComponentId`](metor_proto::types::ComponentId)-named group of
 //! components serializing straight to a metor-proto table — and that can carry
 //! runtime-dynamic [`FrameList`]/[`FrameMap`] members. See `docs/frames.md`.
 //!
-//! This crate builds entirely on the landed WP1/WP2 primitives (the vtable
+//! This crate builds on the metor-proto primitives (the vtable
 //! `List`/`Map`/`PathComponent`/`Frame` ops, `PathHasher`, the ring's record
-//! alignment); the genuinely new surface is the [`Frame`] trait, the dynamic types,
+//! alignment); its own surface is the [`Frame`] trait, the dynamic types,
 //! and the [`FrameWriter`] producer API.
 
 mod binder;
@@ -24,18 +23,17 @@ mod system;
 mod telemetry;
 mod writer;
 
-// WP6 — the KDL wiring front-end (registry, FromKdlNode derive, `load()`).
+// The KDL wiring front-end (registry, FromKdlNode derive, `load()`).
 #[cfg(feature = "kdl")]
 pub mod wiring;
 
-// WP8 — the `dlopen` C-ABI a system `cdylib` exports (dl-open.md §2/§3). Wave 3a
-// decoupled construction from KDL (`BuildSystem`), so the ABI is now available with or
-// without the `kdl` feature (dl-open.md §3.0 fix): `fsw_create` leans only on the
-// kdl-independent `BuildSystem` construction contract (`src/system.rs`).
+// The `dlopen` C-ABI a system `cdylib` exports. Construction is decoupled from KDL (the
+// `BuildSystem` contract in `src/system.rs`), so the ABI is available with or without
+// the `kdl` feature: `fsw_create` leans only on that kdl-independent contract.
 pub mod abi;
 
-// WP8 Wave 2 — the host-side `dlopen` loader (`DlSystem`) + the cyclic slot (`DlSlot`)
-// that drives a system `.so` across the ABI (dl-open.md §4). Ungated alongside `abi`.
+// The host-side `dlopen` loader (`DlSystem`) + the cyclic slot (`DlSlot`) that drives a
+// system `.so` across the ABI. Ungated alongside `abi`.
 pub mod dl;
 
 pub use dynamic::{FrameList, FrameMap, Name, Slot};
@@ -43,7 +41,7 @@ pub use frame::Frame;
 pub use reader::{ListReader, MapReader};
 pub use writer::{FrameWriter, ListWriter, MapWriter, WriteError};
 
-// WP5 — the coordinator: builder, graph wiring, the run-phase lifecycle, and the
+// The coordinator: builder, graph wiring, the run-phase lifecycle, and the
 // `bind`/`Binder` port-construction contract.
 pub use binder::{BindPorts, Binder, BoundPort, RingSource};
 pub use coordinator::{
@@ -51,14 +49,14 @@ pub use coordinator::{
     StoppedSystem, SystemHandle, WireError,
 };
 
-// WP7 — the general output registry and the telemetry downlink (its first consumer).
+// The general output registry and the telemetry downlink (its first consumer).
 pub use registry::{OutputRegistry, RegistryEntry};
 pub use telemetry::{
     TcpTransport, TelemetryConfig, TelemetryMode, TelemetrySystem, Transport, TransportError,
 };
 
-// WP4 — the system trait family, the typed port wrappers, self-description, and
-// the standard health/log telemetry.
+// The system trait family, the typed port wrappers, self-description, and the
+// standard health/log telemetry.
 pub use descriptor::{AnnounceFn, Hz, PortDesc, SystemDescriptor, SystemKind, compatible};
 pub use health::{
     HealthPort, LOG_MSG_CAP, Level, LogLine, MAX_ERR_KINDS, MAX_LINES, SystemHealth, SystemLog,
@@ -76,7 +74,7 @@ pub use metor_fsw_ring as ring;
 pub use metor_fsw::{AsVTable, Componentize, Decomponentize, Metadatatize};
 pub use metor_fsw_macros::{Frame, SystemInput, SystemOutput};
 
-// WP8 — the `export_system!` macro that emits a system `cdylib`'s C-ABI surface.
+// The `export_system!` macro that emits a system `cdylib`'s C-ABI surface.
 pub use metor_fsw_macros::export_system;
 
 // Re-exports the `#[derive(Frame)]` / `#[derive(FromKdlNode)]` generated code names
@@ -86,12 +84,12 @@ pub use metor_fsw_macros::export_system;
 pub use metor_fsw::path;
 pub use {metor_proto, metor_proto_wkt};
 
-// WP8 Wave 2 — the host dlopen loader surface (available without `kdl`).
+// The host dlopen loader surface (available without `kdl`).
 pub use dl::{DlError, DlSystem};
 
-// WP8 Wave 3a — the `Wiring` data model, the Rust builder, the shared resolver, and
-// the cargo build driver (the data/serialization split — dl-open.md §6). These ride
-// the `kdl` feature with the wiring front-end they share a resolver with.
+// The `Wiring` data model, the Rust builder, the shared resolver, and the cargo build
+// driver (the data/serialization split). These ride the `kdl` feature with the wiring
+// front-end they share a resolver with.
 #[cfg(feature = "kdl")]
 pub use wiring::{
     Artifact, BuildError, BuildOptions, ClockSpec, CoordinatorSpec, EdgeSpec, ParamSource,
@@ -102,7 +100,7 @@ pub use wiring::{
 #[cfg(feature = "kdl")]
 pub use kdl;
 
-// WP3 frame acceptance tests span frame/dynamic/writer/reader, so they stay a
+// Frame acceptance tests span frame/dynamic/writer/reader, so they stay a
 // crate-root tests module rather than living under any single module.
 #[cfg(test)]
 mod tests;

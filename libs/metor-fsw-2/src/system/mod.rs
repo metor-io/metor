@@ -124,7 +124,7 @@ where
     /// Bind the user ports, then the two implicit health/log ports — symmetric to
     /// [`Out::descriptors`] pushing the health/log descriptors after the user
     /// ports (coordinator.md §1.4). Threads the ring source's backing `B` so a
-    /// dlopen'd system's `Out<O, RawBacking>` binds over the host's regions (dl-open.md §1.2).
+    /// dlopen'd system's `Out<O, RawBacking>` binds over the host's regions.
     fn bind<S: RingSource<B = B>>(src: &mut S) -> Self {
         let ports = O::bind(src);
         let health: Output<SystemHealth, B, WD, WS> = Output::bind(src);
@@ -134,15 +134,15 @@ where
 }
 
 // ---------------------------------------------------------------------------
-// System construction (kdl-independent — dl-open.md §3.0, §6.3)
+// System construction (kdl-independent)
 // ---------------------------------------------------------------------------
 
 /// How a concrete system is constructed from its typed params — the
-/// **format-independent** half of WP6's old `RegisteredSystem` (dl-open.md §3.0).
+/// **format-independent** half of system construction.
 ///
 /// This trait carries *no* KDL coupling: a `cdylib` exported via
 /// [`export_system!`](crate::export_system) only needs `BuildSystem` (its `fsw_create`
-/// postcard-decodes `Params` and calls `new`), so the dlopen ABI no longer rides the
+/// postcard-decodes `Params` and calls `new`), so the dlopen ABI does not ride the
 /// `kdl` feature. The KDL static-registry path layers `RegisteredSystem`
 /// (`wiring::RegisteredSystem`) on top, adding the `Params: FromKdlNode` bound — every
 /// `BuildSystem` whose `Params` is `FromKdlNode` is automatically a `RegisteredSystem`
@@ -166,10 +166,10 @@ pub trait BuildSystem: Sized {
 /// wiring name, and the once-each lifecycle hooks. A user implements one of
 /// [`CyclicSystem`]/[`AsyncSystem`], which both require this.
 ///
-/// `B` is the ring [`Backing`] the bundles are bound over (dl-open.md §1.2). It
-/// defaults to [`BoxBacking`] — the host case — so an ordinary `impl System for Foo`
-/// is unchanged; a system whose bundles are `Backing`-generic writes
-/// `impl<B: Backing> System<B> for Foo` so a future dlopen'd instance can hold
+/// `B` is the ring [`Backing`] the bundles are bound over. It defaults to
+/// [`BoxBacking`] — the host case — so an ordinary `impl System for Foo` needs no `B`;
+/// a system whose bundles are `Backing`-generic writes
+/// `impl<B: Backing> System<B> for Foo` so a dlopen'd instance can hold
 /// `RawBacking` views into the host's regions.
 pub trait System<B: Backing = BoxBacking> {
     /// The read-only inputs this system consumes.
@@ -246,8 +246,7 @@ pub trait AsyncSystem<B: Backing = BoxBacking>: System<B> {
 /// around each `execute` (system.md §4): a lapped input bumps `lapped_inputs`,
 /// the execute duration is timed, and a health record is published per cycle.
 ///
-/// This is the WP4 stand-in for the coordinator (WP5): it owns the bundles between
-/// cycles, exactly as the coordinator will.
+/// It owns the bundles between cycles, on behalf of the coordinator that drives it.
 pub struct CyclicRunner<S, O, B = BoxBacking>
 where
     B: Backing,
