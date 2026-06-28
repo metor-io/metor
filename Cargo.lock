@@ -9077,12 +9077,15 @@ dependencies = [
 name = "metor-fsw-2"
 version = "0.14.2"
 dependencies = [
+ "kdl",
  "metor-fsw",
  "metor-fsw-macros",
  "metor-fsw-ring",
  "metor-proto",
  "metor-proto-wkt",
+ "miette 7.6.0",
  "stellarator",
+ "thiserror 2.0.18",
  "zerocopy",
 ]
 

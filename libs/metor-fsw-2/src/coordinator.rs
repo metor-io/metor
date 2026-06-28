@@ -35,7 +35,7 @@ use crate::descriptor::{Hz, SystemDescriptor, SystemKind};
 use crate::dynamic::FrameList;
 use crate::health::{HealthPort, Level};
 use crate::port::{Input, Output, buffer_capacity, capacity_for};
-use crate::system::{AsyncSystem, CyclicRunner, CyclicSystem, Out, SystemOutput};
+use crate::system::{AsyncSystem, CyclicRunner, CyclicSystem, Out, System, SystemOutput};
 use crate::{DEFAULT_DEPTH, Frame};
 use crate::descriptor::compatible;
 
@@ -263,6 +263,9 @@ struct RingEntry {
     ring: RingBuffer<BoxBacking>,
     frame_id: ComponentId,
     role: BufferRole,
+    /// The KDL/builder instance name of the system owning this buffer (the
+    /// telemetry-sink prefix, wiring.md §6). `None` for coordinator-owned buffers.
+    instance: Option<String>,
 }
 
 /// Owns every `RingBuffer<BoxBacking>`. Holding the canonical handle here keeps a
@@ -420,6 +423,9 @@ pub struct CoordinatorBuilder {
     regs: Vec<Reg>,
     descs: Vec<SystemDescriptor>,
     kinds: Vec<SystemKind>,
+    /// Per-system instance name (defaults to `System::NAME`; the wiring loader
+    /// supplies a distinct KDL instance name — wiring.md §6). Parallel to `descs`.
+    names: Vec<String>,
     edges: Vec<(PortRef, PortRef)>,
 }
 
@@ -430,12 +436,26 @@ impl CoordinatorBuilder {
             regs: Vec::new(),
             descs: Vec::new(),
             kinds: Vec::new(),
+            names: Vec::new(),
             edges: Vec::new(),
         }
     }
 
-    /// Register a cyclic system; returns a handle whose ports can be `connect`ed.
+    /// Register a cyclic system under its type's `System::NAME` instance name; see
+    /// [`add_cyclic_named`](Self::add_cyclic_named) to name the instance explicitly.
     pub fn add_cyclic<S, O>(&mut self, system: S) -> SystemHandle
+    where
+        S: CyclicSystem<Output = Out<O>> + 'static,
+        O: SystemOutput + BindPorts + 'static,
+        S::Input: BindPorts + 'static,
+    {
+        self.add_cyclic_named(<S as System>::NAME, system)
+    }
+
+    /// Register a cyclic system under an explicit instance name; returns a handle
+    /// whose ports can be `connect`ed. The instance name disambiguates two instances
+    /// of one system type at the telemetry sink (wiring.md §6).
+    pub fn add_cyclic_named<S, O>(&mut self, name: impl Into<String>, system: S) -> SystemHandle
     where
         S: CyclicSystem<Output = Out<O>> + 'static,
         O: SystemOutput + BindPorts + 'static,
@@ -444,12 +464,23 @@ impl CoordinatorBuilder {
         let id = self.descs.len();
         self.descs.push(<S as CyclicSystem>::descriptor());
         self.kinds.push(SystemKind::Cyclic);
+        self.names.push(name.into());
         self.regs.push(Reg::Cyclic(Box::new(CyclicReg { system })));
         SystemHandle { id }
     }
 
-    /// Register an async system.
+    /// Register an async system under its type's `System::NAME` instance name.
     pub fn add_async<S>(&mut self, system: S) -> SystemHandle
+    where
+        S: AsyncSystem + 'static,
+        S::Input: BindPorts + 'static,
+        S::Output: BindPorts + 'static,
+    {
+        self.add_async_named(<S as System>::NAME, system)
+    }
+
+    /// Register an async system under an explicit instance name (wiring.md §6).
+    pub fn add_async_named<S>(&mut self, name: impl Into<String>, system: S) -> SystemHandle
     where
         S: AsyncSystem + 'static,
         S::Input: BindPorts + 'static,
@@ -458,6 +489,7 @@ impl CoordinatorBuilder {
         let id = self.descs.len();
         self.descs.push(<S as AsyncSystem>::descriptor());
         self.kinds.push(SystemKind::Async);
+        self.names.push(name.into());
         self.regs.push(Reg::Async(Box::new(AsyncReg { system })));
         SystemHandle { id }
     }
@@ -572,6 +604,7 @@ impl CoordinatorBuilder {
                         system: s,
                         port: out_idx,
                     },
+                    instance: Some(self.names[s].clone()),
                 });
             }
             output_rings.push(row);
@@ -615,6 +648,7 @@ impl CoordinatorBuilder {
                         system: s,
                         input: in_idx,
                     },
+                    instance: Some(self.names[s].clone()),
                 });
             }
         }
@@ -672,6 +706,7 @@ impl CoordinatorBuilder {
                 ring,
                 frame_id,
                 role: BufferRole::Coordinator,
+                instance: None,
             });
         }
 
@@ -731,6 +766,19 @@ impl Coordinator {
     /// in the coordinator status frame.
     pub fn stopped(&self) -> &[StoppedSystem] {
         &self.stopped
+    }
+
+    /// Every owned **output** buffer as `(instance-name, frame-id)`. The instance
+    /// name is the unique per-system handle a telemetry sink prefixes records with
+    /// (`<instance>.<frame>.<component>`), so two instances of one system type emit
+    /// distinct fully-qualified paths despite sharing a `frame_id` (wiring.md §6).
+    pub fn output_instances(&self) -> Vec<(&str, ComponentId)> {
+        self.rings
+            .rings
+            .iter()
+            .filter(|e| matches!(e.role, BufferRole::Output { .. }))
+            .filter_map(|e| e.instance.as_deref().map(|name| (name, e.frame_id)))
+            .collect()
     }
 
     /// Read the latest coordinator status frame back (the stopped systems and
