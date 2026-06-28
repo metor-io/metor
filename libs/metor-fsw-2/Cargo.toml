@@ -14,6 +14,9 @@ metor-proto = { path = "../metor-proto", features = ["std"] }
 # the (pre-existing, nox-gated) wkt build is satisfied for this crate.
 metor-proto-wkt = { path = "../metor-proto/wkt", features = ["nox", "std"] }
 metor-fsw = { path = "../metor-fsw", default-features = false, features = ["std"] }
-metor-fsw-ring = { path = "ring", default-features = false }
+metor-fsw-ring = { path = "ring", default-features = false, features = ["async"] }
 metor-fsw-macros = { path = "../metor-fsw/macros" }
 zerocopy = { version = "0.8.2", features = ["derive"] }
+
+[dev-dependencies]
+stellarator = { path = "../stellarator" }

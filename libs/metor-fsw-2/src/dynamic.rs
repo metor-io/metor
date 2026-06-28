@@ -54,7 +54,7 @@ pub(crate) const fn map_stride<V>() -> u32 {
 /// `#[repr(transparent)]` over the [`Slot`] (the `PhantomData` is a ZST), so the
 /// field is exactly the 8-byte slot and stays trivially `IntoBytes`.
 #[repr(transparent)]
-#[derive(Clone, Copy, Debug, IntoBytes, Immutable, KnownLayout)]
+#[derive(Clone, Copy, Debug, IntoBytes, Immutable, KnownLayout, FromBytes)]
 pub struct FrameList<T, const MAX: usize> {
     slot: Slot,
     _ty: PhantomData<T>,
@@ -134,7 +134,7 @@ impl<T, const MAX: usize> Metadatatize for FrameList<T, MAX> {
 /// `MAX` bounds the entry count and `MAX_KEY` the per-key length for buffer sizing.
 /// Keys must not contain `.` or be empty (rejected loudly at write time).
 #[repr(transparent)]
-#[derive(Clone, Copy, Debug, IntoBytes, Immutable, KnownLayout)]
+#[derive(Clone, Copy, Debug, IntoBytes, Immutable, KnownLayout, FromBytes)]
 pub struct FrameMap<K, V, const MAX: usize, const MAX_KEY: usize = 32> {
     slot: Slot,
     _kv: PhantomData<(K, V)>,

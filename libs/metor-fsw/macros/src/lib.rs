@@ -10,6 +10,7 @@ mod componentize;
 mod decomponentize;
 mod frame;
 mod metadatatize;
+mod system;
 
 #[derive(Debug, FromField)]
 #[darling(attributes(metor_fsw))]
@@ -91,6 +92,16 @@ pub fn decomponentize(input: TokenStream) -> TokenStream {
 #[proc_macro_derive(Frame, attributes(metor_fsw))]
 pub fn frame(input: TokenStream) -> TokenStream {
     frame::frame(input)
+}
+
+#[proc_macro_derive(SystemInput)]
+pub fn system_input(input: TokenStream) -> TokenStream {
+    system::system_input(input)
+}
+
+#[proc_macro_derive(SystemOutput)]
+pub fn system_output(input: TokenStream) -> TokenStream {
+    system::system_output(input)
 }
 
 pub(crate) fn metor_fsw_crate_name() -> proc_macro2::TokenStream {
