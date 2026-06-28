@@ -1,10 +1,15 @@
 # Work-Package 8 — Systems as `dlopen`'d shared objects (`dl-open`)
 
-Status: **reviewed — decisions locked, ready to plan/implement** (2026-06-28). The three reviewer
-forks are resolved: **same-process v1** (Q-scope/Q-backing/Q-handle), the **in-document `artifact`
-node** for the type→cdylib map (Q-manifest), and **one postcard `Params` encoding** for both
-front-ends (Q-params). See §6.3 and §11 for how each lands. The remaining open questions take the
-doc's recommended defaults.
+Status: **v1 IMPLEMENTED** (2026-06-28). Same-process, cyclic-only dlopen works end to end; the
+`adcs-fsw2` mission runs three dlopen'd cdylibs and converges bit-identically to the static build,
+with the host linking neither system nor contract crates at runtime. Landed across WP8 waves
+1A (`RawBacking`/`attach_raw`), 1B (backing-generic `System` stack), 2A (ABI + `export_system!`),
+2C (host loader + `DlSlot`), 3a (`Wiring` model + builder + resolver + build driver), 3b
+(schema-guided KDL params), 4 (the adcs refactor). The three reviewer forks resolved to:
+**same-process v1** (Q-scope/Q-backing/Q-handle), the **in-document `artifact` node** (Q-manifest),
+**one postcard `Params` encoding** via postcard-schema/postcard-dyn (Q-params), plus **one system
+per cdylib** (finest rebuild granularity). Async dlopen, separate processes, cross-process wake,
+and hot reload remain ordered future work (§5, §9) with the ABI seams reserved.
 No Rust in this WP — this document specifies how a `metor-fsw-2` system becomes a runtime-loadable
 **`cdylib`** that the coordinator `dlopen`s, instead of being statically linked into one
 monolithic binary. It fills in DESIGN.md's "What are systems anyway?" section (currently TBD —
