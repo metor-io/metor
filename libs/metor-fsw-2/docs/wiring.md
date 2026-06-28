@@ -1,576 +1,544 @@
-# Work-Package 6 — Wiring (the KDL config front-end)
+# Wiring — describing and building a mission
 
-Status: **design only, pre-implementation**. Reviewer sign-off required before any code lands. No
-Rust in this WP. This document specifies the **wiring layer**: a KDL configuration language and the
-loader that turns a text document into a built [`Coordinator`]. It fills in DESIGN.md's "Wiring up
-systems" section (currently TBD) and is a **pure front-end** onto the **landed** WP5 builder
-(`src/coordinator.rs`): it instantiates systems, calls `add_cyclic`/`add_async`/`connect`, and
-`build()`s. **No coordinator logic lives in WP6** — WP5's report says exactly this (coordinator.md
-§2.1), and this WP holds that line.
+A mission is a graph of systems and the edges between them, plus the coordinator config and an
+optional telemetry downlink. The wiring layer is how that graph is **described**, **serialized**,
+and **built** into a runnable [`Coordinator`].
 
-Relevant landed code (read before implementing):
-- `src/coordinator.rs` — `Coordinator::builder(CoordinatorConfig)`, `CoordinatorBuilder::{add_cyclic,
-  add_async, connect, build}`, `SystemHandle`, `PortRef { system, frame_id }`, `WireError`. **This is
-  the entire surface WP6 drives.** `add_cyclic`/`add_async` return a `SystemHandle`; `connect` takes
-  two `PortRef`s addressed by `(SystemHandle, ComponentId)`; `build()` runs validation/sizing and
-  returns a `Coordinator`.
-- `src/descriptor.rs` — `SystemDescriptor { name, kind, inputs, outputs }`, `PortDesc { frame_id,
-  vtable, max_size, rate_hint }`, `SystemKind::{Cyclic, Async}`, `compatible(..)`. Every port already
-  carries its `frame_id`; the loader matches a KDL frame name to a `PortDesc` by `frame_id`.
-- `src/system.rs` — `CyclicSystem`/`AsyncSystem`/`System`, `System::NAME`, the `descriptor()` each
-  trait derives. WP4 §1.2: a system is **constructible before `init`** — `ConcreteSystem::new(params)`
-  yields a value whose ports do not exist yet; the coordinator binds them at `build()`.
-- `src/frame.rs` — `Frame::NAME` / `Frame::FRAME_ID = ComponentId::new(NAME)`.
-- `libs/metor-proto/src/types.rs` — `ComponentId::new(&str)` (const fnv1a-64, top-bit masked). A
-  frame name hashes to its `frame_id` by exactly this call.
-- `libs/metor-proto/kdl/` — the existing KDL ↔ `Schematic` crate (`metor-proto-kdl`). It depends on
-  the `kdl = "6.3.4"` crate, hand-walks `KdlDocument`/`KdlNode` (`node.get("x").as_float()`,
-  `node.entries()`), and reports errors as `miette`-`Diagnostic`s carrying a `#[source_code]` string
-  and a `SourceSpan` (`node.span()`). **WP6 reuses this crate's dependency, parsing style, and error
-  shape** — see §3. Its `parse_component_monitor` already shows the `frame name → ComponentId::new`
-  step we need (`node.get("component_id").map(ComponentId::new)`).
+It is a pure front-end onto the landed [`CoordinatorBuilder`] (`src/coordinator/`): it instantiates
+systems, calls `add_*`/`connect`, and `build()`s. No coordinator logic lives here. Every failure is
+a span-carrying [`LoadError`] — a `miette` `Diagnostic` mirroring `metor-proto-kdl`'s
+`KdlSchematicError`.
+
+The wiring module lives at `src/wiring/` and is gated behind the `kdl` cargo feature (default-on):
+
+- `src/wiring/mod.rs` — the KDL deserializer (`parse`), the shared resolver (`resolve`), the static
+  system [`Registry`], the [`FromKdlNode`] param trait, and the dl schema-guided param encoder.
+- `src/wiring/model.rs` — the serializable [`Wiring`] data model.
+- `src/wiring/builder.rs` — the fluent Rust [`WiringBuilder`] front-end.
+- `src/wiring/build_driver.rs` — the cargo build driver that locates each artifact's `.so`.
+- `src/wiring/tests.rs` — the wiring unit/acceptance tests.
 
 ---
 
-## 0. Design summary (orientation)
+## 0. The shape of it: two front-ends, one data model, one resolver
 
-KDL is *data*; systems are *Rust types*. The loader must turn
-
-```kdl
-system "imu" type="ImuDriver" { i2c_bus=1 }
+```
+        ┌──────────────┐
+  KDL ──┤    parse     ├──┐
+        └──────────────┘  │      ┌─────────┐      ┌──────────┐      ┌─────────────┐
+                          ├─────▶│ Wiring  │─────▶│ resolve  │─────▶│ Coordinator │
+        ┌──────────────┐  │      └─────────┘      └──────────┘      └─────────────┘
+  Rust ─┤ WiringBuilder├──┘     (data model)      (shared)
+        └──────────────┘
 ```
 
-into `builder.add_cyclic::<ImuDriver>(ImuDriver::new(params))`. Rust has no reflection over an
-arbitrary type named by a runtime string, so WP6 needs a **system registry**: a map from the
-KDL `type="…"` string to a **factory** that (a) deserializes that system's params from its KDL
-config block and (b) constructs the boxed system and calls the right `add_*` on the builder, handing
-back a `SystemHandle`. The app builds this registry once (registering each concrete system type),
-then calls the loader.
+[`Wiring`] (`model.rs`) is the single source of truth for a mission: a plain, serializable
+(`Serialize`/`Deserialize`) Rust description with **no runtime types** in it. There are two
+front-ends that produce a [`Wiring`] and exactly one resolver that consumes it:
 
-The loader runs in three passes over the parsed document:
+- [`parse`]`(kdl: &str) -> Result<Wiring, LoadError>` — deserializes a KDL document into a
+  [`Wiring`]. Parse only: it touches no [`Registry`], `dlopen`s nothing, and does not validate the
+  graph.
+- [`WiringBuilder`] — a fluent Rust builder producing the same [`Wiring`]. Anything KDL can express,
+  the Rust builder can express, because both target this type.
+- [`resolve`]`(wiring: &Wiring, registry: &Registry) -> Result<Coordinator, LoadError>` — walks a
+  [`Wiring`], instantiates every system (static through the [`Registry`], dl by `dlopen`), connects
+  the edges, adds telemetry, and `build()`s. The validation/sizing/telemetry passes are identical
+  for static and dl systems and for both front-ends.
 
-1. **Systems pass.** For every `system` node, look its `type` up in the registry, run the factory
-   (params → `new` → `add_cyclic`/`add_async`), and record `instance-name → (SystemHandle,
-   SystemDescriptor)` in an **instance table**.
-2. **Edges pass.** For every `connect` edge, resolve each `(instance, frame)` endpoint to a
-   `PortRef { system, frame_id }` — `frame_id = ComponentId::new(frame)` — **validated against that
-   instance's descriptor port list** so a typo is a load error, then call `builder.connect(..)`.
-3. **Build.** `builder.build()` runs WP5's compatibility/structural validation and returns the
-   `Coordinator`. Every `WireError` is re-surfaced with the KDL source span of the offending node.
+[`load`]`(kdl, registry)` is the convenience composition `resolve(&parse(kdl)?, registry)`.
 
-Everything below the registry+loader is reuse: parsing is the `kdl` crate (as `metor-proto-kdl`
-uses it), wiring/validation/sizing is the landed WP5 builder, addressing is the landed `PortRef`.
-The genuinely new surface is the **KDL schema**, the **registry + registration macro**, the
-**per-system param-deser trait**, and the **edge resolver**.
+Because [`Wiring`] is format-independent and serializable, a mission can be authored in KDL or in
+Rust, round-tripped through serde, persisted, or shipped, and resolved identically. The unit tests
+assert the two front-ends produce **byte-equal** [`Wiring`] for the same graph, and that a
+builder-origin [`Wiring`] (which has no source text at all) resolves and runs.
 
 ---
 
-## 1. KDL schema
+## 1. The `Wiring` data model
 
-A wiring document has three node kinds at the top level: one `coordinator` block, N `system` nodes,
-and M `connect` edges. Convention follows `metor-proto-kdl` (lowercase node names, `key=value`
-properties, KDL v2 `#true` booleans, children in `{ … }`).
-
-### 1.1 `coordinator`
-
-```kdl
-coordinator {
-    cycle_rate=100.0      // Hz; CoordinatorConfig.cycle_rate
-    default_depth=8       // optional; CoordinatorConfig.default_depth (ring::DEFAULT_DEPTH)
-}
-```
-
-Maps one-to-one onto `CoordinatorConfig` (`src/coordinator.rs`). Exactly one `coordinator` node;
-zero is an error, more than one is an error. `default_depth` is optional (defaults to
-`DEFAULT_DEPTH`).
-
-### 1.2 `system`
-
-```kdl
-system "imu" type="ImuDriver" {
-    i2c_bus=1
-    sample_hz=200.0
-}
-```
-
-- The first (nameless) entry, `"imu"`, is the **instance name** — the unique handle the rest of the
-  document and the telemetry sink use to refer to this system. It is **not** the type name; two
-  instances of one type get two distinct instance names (§6, the collision question).
-- `type="ImuDriver"` is the **registry key** — the string a concrete system registered itself under
-  (§2). Unknown ⇒ load error.
-- The children block is the **param config**, deserialized into the system's params struct (§3).
-- **Cyclic vs async is not declared in KDL.** It is a property of the Rust type
-  (`impl CyclicSystem` vs `impl AsyncSystem`), and the factory already knows which `add_*` to call
-  (§2.3). Restating it in KDL would let the document contradict the type — a class of error we get to
-  not have. (Alternative considered: a `kind="async"` property as documentation/validation — see Q3.)
-
-Instance names must be unique across the document; a duplicate is a load error.
-
-### 1.3 `connect`
-
-An edge names a producer endpoint and a consumer endpoint, each as `(instance, frame)`:
-
-```kdl
-connect from="imu" out="imu" to="nav" in="imu"
-```
-
-Read as: *instance `imu`'s output frame `imu` feeds instance `nav`'s input frame `imu`*. The four
-properties are:
-
-- `from` / `to` — producer and consumer **instance names** (resolved to `SystemHandle`s).
-- `out` / `in` — the **frame names** on each side (resolved to `frame_id = ComponentId::new(name)`,
-  validated against the descriptor — §4).
-
-`out` and `in` are usually the same frame name (a frame is a contract — DESIGN.md), so a shorthand is
-offered for the common case:
-
-```kdl
-connect "imu" -> "nav" frame="imu"        // from="imu" to="nav", out=in="imu"
-```
-
-Both forms desugar to the same `(PortRef, PortRef)` pair. The explicit `out`/`in` form exists for the
-rare case where a producer's port frame name differs from the consumer's, but since `connect`
-requires `producer.frame_id == consumer.frame_id` (WP5's `WireError::FrameIdMismatch`), `out` and
-`in` must hash equal — so in practice they are the same string. (Q4 asks whether the asymmetric form
-is worth keeping at all.)
-
-### 1.4 Worked example (imu-driver → nav-filter → controller, with an async logger)
-
-```kdl
-coordinator {
-    cycle_rate=200.0
-}
-
-// Cyclic IMU driver: no inputs, produces the `imu` frame.
-system "imu" type="ImuDriver" {
-    i2c_bus=1
-    sample_hz=200.0
-}
-
-// Cyclic navigation filter: consumes `imu`, produces `nav`.
-system "nav" type="MekfFilter" {
-    process_noise=1e-6
-    init_quat=(1.0 0.0 0.0 0.0)
-}
-
-// Cyclic attitude controller: consumes `nav`, produces `cmd`.
-system "ctrl" type="YangLqr" {
-    gain=0.8
-}
-
-// Cyclic process-telemetry source producing a *dynamic* frame (FrameList/FrameMap
-// member): the loader treats it like any other producer — the dynamism lives inside
-// the frame's VTable, not in the wiring (§4.4).
-system "procmon" type="ProcessMonitor" { }
-
-// Async telemetry logger: self-paced, consumes `nav` over a private copy-in buffer.
-system "logger" type="NavLogger" {
-    path="/var/log/nav.bin"
-}
-
-connect "imu"  -> "nav"    frame="imu"
-connect "nav"  -> "ctrl"   frame="nav"
-connect "nav"  -> "logger" frame="nav"
-```
-
-This wires four cyclic systems and one async system. `imu`→`nav`→`ctrl` is the cyclic chain;
-`nav`→`logger` crosses into an async consumer (WP5 allocates the private copy-in buffer at `build()`
-automatically — nothing async-specific appears in KDL). `procmon` produces a dynamic frame; its
-`FrameList`/`FrameMap` member is invisible to the wiring layer because compatibility is checked on the
-frame's realized VTable inside `build()` (`compatible`, `src/descriptor.rs`).
-
-Note the edges never mention `kind`, buffer sizes, `max_readers`, or health/log ports — all of that
-is WP5's job at `build()` (sizing from `PortDesc`, fan-out from the edge set, auto-provisioned
-health). WP6 only names systems and edges.
-
----
-
-## 2. The system registry
-
-### 2.1 Why a registry (the reflection gap)
-
-`builder.add_cyclic::<S>(s)` is generic over a concrete `S` chosen at **compile** time. KDL names the
-type with a **runtime** string. Bridging the two requires a value the loader can look up by string
-and call without naming `S` — i.e. a boxed factory closure per concrete system. The registry is the
-`HashMap<&'static str, SystemFactory>` of those factories.
-
-### 2.2 The factory contract
+[`Wiring`] (`model.rs`) and its members are deliberately decoupled from the runtime types — a
+[`ClockSpec`] mirrors [`ClockMode`] without holding a `Duration`, a [`CoordinatorSpec`] mirrors
+[`CoordinatorConfig`] without a clock value, etc. The conversion to runtime types happens in
+[`resolve`], so the model stays a pure serde data format.
 
 ```rust
-/// Everything a factory needs and produces, erased of the concrete system type.
-struct LoadCtx<'a> {
-    node:    &'a KdlNode,            // the `system` node (for params + spans)
-    src:     &'a str,               // full document, for miette source-code context
-    builder: &'a mut CoordinatorBuilder,
+pub struct Wiring {
+    pub coordinator: CoordinatorSpec,   // cycle rate, default depth, clock
+    pub artifacts:   Vec<Artifact>,     // the cdylibs this mission loads
+    pub systems:     Vec<SystemSpec>,   // the system instances
+    pub edges:       Vec<EdgeSpec>,     // producer → consumer edges
+    pub telemetry:   Option<TelemetrySpec>,
+}
+```
+
+### 1.1 `CoordinatorSpec` / `ClockSpec`
+
+```rust
+pub struct CoordinatorSpec {
+    pub cycle_rate:    f64,            // Hz, held under a Wall clock
+    pub default_depth: Option<usize>, // None ⇒ framework DEFAULT_DEPTH
+    pub clock:         ClockSpec,
 }
 
-/// A registered factory: parse params from `ctx.node`, construct the system, add it
-/// to the builder, return the handle + the descriptor (for edge validation, §4).
-type SystemFactory =
-    fn(&mut LoadCtx) -> Result<(SystemHandle, SystemDescriptor), LoadError>;
-
-pub struct Registry {
-    factories: HashMap<&'static str, SystemFactory>,
+pub enum ClockSpec {
+    Wall,                           // paced to cycle_rate
+    Simulated { dt_secs: f64 },     // free-running, advancing dt_secs each cycle
 }
+```
+
+[`resolve`] converts this into a [`CoordinatorConfig`]: `ClockSpec::Wall` → [`ClockMode::Wall`],
+`ClockSpec::Simulated { dt_secs }` → [`ClockMode::Simulated`] with `Duration::from_secs_f64(dt_secs)`.
+
+### 1.2 `Artifact`
+
+A loadable shared object — "which `.so`, and what crate it comes from". One system type per cdylib
+(the fixed `fsw_*` ABI symbols). Multiple [`SystemSpec`]s may reference one `Artifact` to instance
+that type more than once.
+
+```rust
+pub struct Artifact {
+    pub id:          String,        // what SystemSpec::artifact references
+    pub crate_name:  String,        // cargo package, for `cargo build -p <crate_name>`
+    pub cdylib:      String,        // produced file name (libfoo.so / libfoo.dylib / foo.dll)
+    pub system_type: String,        // the single `type=` this .so's export_system! provides
+    pub path:        Option<PathBuf>, // resolved location, filled by the build driver
+}
+```
+
+`path` is `None` until the build driver (§5) builds/locates the `.so`; [`resolve`] errors with
+[`LoadError::ArtifactNotBuilt`] if a dl system's artifact still has no path.
+
+### 1.3 `SystemSpec` / `ParamSource`
+
+```rust
+pub struct SystemSpec {
+    pub name:     String,           // instance name (telemetry prefix, §7)
+    pub ty:       String,           // type= key (registry key, or artifact's system_type)
+    pub artifact: Option<String>,   // Some(id) ⇒ dlopen'd; None ⇒ statically linked
+    pub params:   ParamSource,
+}
+
+pub enum ParamSource {
+    None,            // a paramless system
+    Postcard(Vec<u8>), // canonical postcard Params bytes (the typed Rust builder path)
+    Kdl(String),     // the KDL `system` node's source text, re-decoded at resolve
+}
+```
+
+`artifact` is the static-vs-dl switch: `None` resolves through the [`Registry`], `Some(id)`
+`dlopen`s that [`Artifact`]. [`ParamSource`] is an explicit three-way so the cases never overload a
+single `Vec<u8>`. Each variant becomes the same canonical postcard `Params` bytes (dl) or feeds a
+[`FromKdlNode`] re-parse (static) at resolve time — see §6.
+
+### 1.4 `EdgeSpec`
+
+```rust
+pub struct EdgeSpec {
+    pub from:    String,            // producer instance name
+    pub out:     String,            // producer output port frame name
+    pub to:      String,            // consumer instance name
+    pub in_:     String,            // consumer input port frame name
+    pub delayed: bool,              // true ⇒ a one-cycle-delayed feedback back-edge
+}
+```
+
+`delayed` selects [`CoordinatorBuilder::connect_delayed`] over `connect`: the back-edge of a control
+loop, excluded from cycle detection (§4.3).
+
+### 1.5 `TelemetrySpec`
+
+```rust
+pub struct TelemetrySpec {
+    pub addr: SocketAddr,           // TCP downlink address
+    pub mode: TelemetryModeSpec,
+}
+
+pub enum TelemetryModeSpec {
+    All,                                          // tap every output buffer
+    Subset { instances: Vec<String>, frames: Vec<String> }, // tap matching instances/frames
+}
+```
+
+---
+
+## 2. The KDL schema
+
+A KDL wiring document has up to five node kinds at the top level: exactly one `coordinator`, N
+`artifact` nodes, N `system` nodes, M `connect` edges, and an optional `telemetry` block.
+Conventions follow `metor-proto-kdl` (lowercase node names, `key=value` properties, KDL v2 `#true`
+booleans). Params and config are **properties on the node line**, not a `{ key=value }` children
+block (the latter is not valid KDL v2).
+
+### 2.1 `coordinator`
+
+```kdl
+coordinator cycle_rate=200.0 default_depth=8            // wall clock, paced
+coordinator cycle_rate=200.0 sim_dt=0.00833            // simulated clock, free-running
+```
+
+Exactly one `coordinator` node ([`MissingCoordinator`] / [`MultipleCoordinators`] otherwise).
+`cycle_rate` (Hz) is required; `default_depth` is optional. A `sim_dt` (seconds) property selects a
+[`ClockSpec::Simulated`] clock with that logical per-cycle step (the loop free-runs); absent ⇒ a
+paced [`ClockSpec::Wall`] clock holding `cycle_rate`.
+
+### 2.2 `artifact` (dl systems only)
+
+```kdl
+artifact "plant" crate="adcs-plant" lib="libadcs_plant.dylib" type="Plant"
+```
+
+- The first (nameless) argument, `"plant"`, is the artifact **id** a `system`'s `lib=` references.
+- `crate=` is the cargo package the build driver compiles.
+- `lib=` is the produced cdylib file name.
+- `type=` is the single system type this `.so` exports.
+
+Maps one-to-one onto [`Artifact`] (`path` filled later by the build driver). A static-only mission
+needs no `artifact` nodes.
+
+### 2.3 `system`
+
+```kdl
+system "imu" type="ImuDriver" i2c_bus=1 sample_hz=200.0     // static
+system "plant" type="Plant" lib="plant" gain=5.0            // dl (references artifact "plant")
+```
+
+- The first (nameless) argument, `"imu"`, is the **instance name** — the unique handle the rest of
+  the document refers to, and the telemetry prefix (§7). It is not the type name; two instances of
+  one type get two distinct instance names. Duplicates are a [`DuplicateInstance`] error.
+- `type=` is the **registry key** (static) or must match the artifact's `system_type` (dl). Required
+  ([`MissingType`] otherwise).
+- `lib=` (optional) makes this a **dl** system referencing that `artifact` id; absent ⇒ a **static**
+  system resolved through the [`Registry`].
+- Every other property (anything but the reserved `type=`/`lib=`) is a **param** (§6). A system with
+  any config property carries [`ParamSource::Kdl`] (its node source text, verbatim); a config-less
+  system carries [`ParamSource::None`].
+
+Cyclic vs async is **not** declared in KDL — it is a property of the Rust type (`impl CyclicSystem`
+vs `impl AsyncSystem`), and the factory knows which `add_*` to call (§3.2). The document cannot
+contradict the type.
+
+### 2.4 `connect`
+
+An edge names a producer endpoint and a consumer endpoint, each as `(instance, frame)`. Two
+syntaxes desugar to the same [`EdgeSpec`]:
+
+```kdl
+connect "imu" -> "nav" frame="imu"                  // shorthand (the common case)
+connect from="nav" out="nav" to="log" in="nav"      // explicit long form
+connect "ctrl" -> "plant" frame="torque_cmd" delayed=#true   // feedback back-edge
+```
+
+- Shorthand: nameless `"from"`, an optional `->`, `"to"`, plus `frame="…"` (which becomes both `out`
+  and `in`).
+- Explicit: `from`/`to` instance names and `out`/`in` frame names. The asymmetric form exists for
+  the rare producer/consumer frame-name mismatch, but since `connect` requires
+  `producer.frame_id == consumer.frame_id`, `out` and `in` must hash equal.
+- `delayed=#true` marks the edge a one-cycle-delayed feedback back-edge (default `#false`).
+
+### 2.5 `telemetry`
+
+```kdl
+telemetry {
+    transport "tcp" addr="127.0.0.1:2240"
+    mode "all"                       // or: mode "subset"
+    // subset only:
+    // tap instance="imu_left"
+    // tap frame="control"
+}
+```
+
+`transport "tcp"` is the only v1 transport. `mode "all"` taps every output buffer; `mode "subset"`
+taps the `tap instance=…` / `tap frame=…` children. Absent `mode` ⇒ `all`. Maps onto
+[`TelemetrySpec`].
+
+### 2.6 Worked example
+
+```kdl
+coordinator cycle_rate=200.0
+
+system "imu" type="ImuDriver" i2c_bus=1 sample_hz=200.0   // produces `imu`
+system "nav" type="NavFilter" gain=2.0                    // consumes `imu`, produces `nav`
+system "log" type="NavLogger"                             // async, no params, consumes `nav`
+
+connect "imu" -> "nav" frame="imu"
+connect "nav" -> "log" frame="nav"
+```
+
+`imu`→`nav` is a cyclic chain; `nav`→`log` crosses into an async consumer (the coordinator
+allocates the private copy-in buffer at `build()` automatically — nothing async-specific appears in
+KDL). Edges never mention buffer sizes, `max_readers`, or health/log ports — all of that is the
+coordinator's job at `build()`.
+
+---
+
+## 3. The static system registry
+
+### 3.1 The reflection gap
+
+`builder.add_cyclic_named::<S>(name, s)` is generic over a concrete `S` chosen at **compile** time;
+KDL names the type with a **runtime** string. Bridging the two needs a value the resolver can look
+up by string and call without naming `S` — a boxed factory `fn` pointer per concrete system. The
+[`Registry`] is the map of those factories:
+
+```rust
+pub struct Registry { /* HashMap<&'static str, SystemFactory> */ }
+
+pub type SystemFactory = fn(&mut LoadCtx) -> Result<(SystemHandle, SystemDescriptor), LoadError>;
 
 impl Registry {
-    pub fn new() -> Self { … }
-    /// Register concrete system `S` under `type_name`. `S` supplies its params type
-    /// and which `add_*` to call (§2.3) via the `RegisteredSystem` trait.
-    pub fn register<S: RegisteredSystem>(&mut self, type_name: &'static str) -> &mut Self { … }
+    pub fn new() -> Self;
+    pub fn register<S, K>(&mut self, type_name: &'static str) -> &mut Self
+    where S: BuildSystem + AddToBuilder<K>, S::Params: FromKdlNode;
 }
 ```
 
-The factory captures **no** state; it is a plain `fn` pointer that, given the node and the builder,
-does the whole "params → `new` → `add_*`" dance for one concrete type. It returns the
-`SystemDescriptor` alongside the `SystemHandle` so the loader can validate edge frame names against
-the actual port list (§4) without re-deriving it.
+The factory captures no state; given the node and the builder it does the whole
+"params → `new` → `add_*_named`" dance for one concrete type, returning the [`SystemHandle`] plus the
+[`SystemDescriptor`] (so the resolver can validate edge frame names against the real port list, §4).
 
-### 2.3 How a concrete system opts in — `RegisteredSystem` + a derive
+### 3.2 How a system opts in
 
-A concrete system declares three things: its params type, how to build itself from params, and which
-kind it is. A small trait captures this, and a derive macro generates the factory body so the user
-writes no boilerplate:
+Construction is split in two:
 
-```rust
-pub trait RegisteredSystem: Sized {
-    /// The params struct deserialized from the KDL config block (§3).
-    type Params: FromKdlNode;
-    /// Construct the (pre-init) system from its params — WP4 §1.2 "constructible before init".
-    fn new(params: Self::Params) -> Self;
-    /// Register on the builder with the correct add_*; returns the handle.
-    /// Implemented once per system *kind* (blanket impls below), never by the user.
-    fn add(self, builder: &mut CoordinatorBuilder) -> SystemHandle;
-    /// The descriptor, for edge validation.
-    fn descriptor() -> SystemDescriptor;
-}
-```
+- [`BuildSystem`] (`src/system/`) is the **format-independent** contract: `type Params` + `fn new`,
+  with no KDL coupling. This is what `export_system!`/the dlopen ABI also use.
+- [`RegisteredSystem`] is a **blanket marker** adding only the `Params: FromKdlNode` bound the static
+  factory needs: every `BuildSystem` whose `Params` is [`FromKdlNode`] is automatically a
+  `RegisteredSystem`. A statically-registered system therefore implements [`BuildSystem`] (not this);
+  a dl-only system needs no `FromKdlNode` impl at all.
 
-The `add`/`descriptor` halves are provided by **two blanket impls** keyed on the system trait, so the
-user only ever writes `type Params` + `new`:
+The cyclic-vs-async branch is resolved at **compile** time by the [`AddToBuilder<Kind>`] trait, with
+two non-overlapping blanket impls keyed on a `Kind` marker (`CyclicKind` / `AsyncKind`):
 
 ```rust
-// Cyclic systems dispatch to add_cyclic.
-impl<S> CyclicRegistered for S
-where S: CyclicSystem<Output = Out<…>> + … {
-    fn add(self, b: &mut CoordinatorBuilder) -> SystemHandle { b.add_cyclic(self) }
+impl<S, O> AddToBuilder<CyclicKind> for S where S: CyclicSystem<Output = Out<O>> + … {
+    fn add_to(self, name, b) -> SystemHandle { b.add_cyclic_named(name, self) }
     fn descriptor() -> SystemDescriptor { <S as CyclicSystem>::descriptor() }
 }
-// Async systems dispatch to add_async (mirrored).
-```
-
-The cyclic-vs-async branch is therefore resolved **at compile time** by which system trait `S`
-implements — there is no runtime `kind` switch, and KDL cannot disagree with the type (§1.2). The
-factory `Registry::register::<S>` stores is:
-
-```rust
-|ctx| {
-    let params = S::Params::from_kdl_node(ctx.node, ctx.src)?;  // §3
-    let system = S::new(params);
-    let handle = system.add(ctx.builder);                       // add_cyclic / add_async
-    Ok((handle, S::descriptor()))
+impl<S> AddToBuilder<AsyncKind> for S where S: AsyncSystem + … {
+    fn add_to(self, name, b) -> SystemHandle { b.add_async_named(name, self) }
+    fn descriptor() -> SystemDescriptor { <S as AsyncSystem>::descriptor() }
 }
 ```
 
-### 2.4 Compile-time table vs `inventory` auto-collection
-
-**Recommendation: an explicit, app-built registry table** (the app calls `registry.register::<S>("…")`
-for each system it links), **not** global auto-registration via `inventory`/`linkme`.
-
-Justification, grounded in the repo:
-- **`inventory` is present only transitively** (it appears in `Cargo.lock` but **no** crate under
-  `libs/`/`examples/` depends on it directly, and nothing uses `inventory::submit!`). The existing
-  KDL path (`metor-proto-kdl`) uses an **explicit `match` on `node.name()`** (`parse_schematic_elem`),
-  i.e. a hand-maintained table — the established project convention is explicit dispatch, not magic
-  collection.
-- **Determinism & auditability (it's flight software).** An explicit table makes the set of
-  loadable systems a visible, reviewable list in the app's `main`. `inventory` relies on
-  link-section side effects that can be silently dropped by dead-code elimination when a system crate
-  is a dependency but otherwise unreferenced — a genuinely nasty failure mode for FSW, where "the
-  IMU driver silently isn't registered" must be impossible.
-- **No global mutable state / test isolation.** Each test or mission can build its own `Registry`
-  with exactly the systems it wants; `inventory` is process-global.
-
-A `register_system!` convenience macro can wrap `registry.register::<S>("ImuDriver")` to keep the
-call site terse, and a system crate can expose a `pub fn register(r: &mut Registry)` that registers
-its own systems — so an app composes registries by calling each crate's `register`. This keeps
-opt-in explicit while staying ergonomic. (Q1 asks the reviewer to confirm explicit-table over
-`inventory`; the trait/factory design is identical either way, only *who fills the map* changes.)
-
----
-
-## 3. Param deserialization
-
-### 3.1 Mechanism choice — reuse `metor-proto-kdl`'s hand-walk, behind a `FromKdlNode` trait
-
-A system's config block must become its `Params` struct. Three candidate mechanisms exist in-repo:
-
-| Mechanism | In-repo status | Verdict for WP6 |
-|---|---|---|
-| `metor-proto-kdl` style (hand-walk `KdlNode` via the `kdl` crate, `miette` errors) | **Used today** for the whole `Schematic` ↔ KDL path | **Chosen.** Same dep, same error shape, zero new crates. |
-| `serde` | present (transitive/other paths), **no serde-kdl** in tree | Rejected: no KDL serde adapter in the workspace; would add a dep and a second config idiom. |
-| `facet` / `facet-kdl` | `facet` used by `metor-panel`/`metor-proto`; **`facet-kdl` not yet in tree** | Deferred. `metor-proto-kdl`'s own README says "long term this should be replaced with facet-kdl when it's ready" — adopt it later behind the same `FromKdlNode` trait, no schema change. |
-
-So WP6 deserializes params exactly the way `metor-proto-kdl` deserializes a `Viewport` or a `Graph`:
-walk the `KdlNode`'s properties with `node.get("x").and_then(|v| v.as_float())`, defaulting optionals,
-and raising `KdlSchematicError::MissingProperty`/`InvalidValue` (reused or mirrored as `LoadError`
-variants — §5) with the node's `span()`.
-
-### 3.2 How a system declares its params type
+The `K` type parameter on `register::<S, K>` is inferred from the system trait `S` implements; the
+`register_system!` macro keeps the call site terse:
 
 ```rust
-pub trait FromKdlNode: Sized {
-    fn from_kdl_node(node: &KdlNode, src: &str) -> Result<Self, LoadError>;
-}
+let mut r = Registry::new();
+register_system!(&mut r, ImuDriver => "ImuDriver");   // == r.register::<ImuDriver, _>("ImuDriver")
+r.register::<NavFilter, _>("NavFilter");
+r.register::<NavLogger, _>("NavLogger");               // async — same call, AsyncKind inferred
 ```
 
-A system sets `type Params = ImuParams` and implements `FromKdlNode` for `ImuParams`. For the common
-case (a flat struct of scalars/strings) a **derive** `#[derive(FromKdlNode)]` generates the walk —
-field `f: f64` ⇒ `node.get("f").as_float()` required, `Option<T>` ⇒ optional, `#[kdl(default=…)]` ⇒
-defaulted — directly mirroring the hand-written `parse_*` functions in `metor-proto-kdl/src/de.rs`.
-A system with no params uses `type Params = ()` (empty block, like `procmon` above). When `facet-kdl`
-lands, the derive can be retargeted onto it without touching any system's declaration.
+### 3.3 An explicit table, not `inventory`
 
-This keeps the **param schema owned by the system crate**, next to the system, which is where it
-belongs — the loader never hard-codes any system's fields.
+The registry is an **app-built** table — the app (or each system crate's `pub fn register(&mut
+Registry)`) registers exactly the systems it links — rather than global auto-registration via
+`inventory`/`linkme`. For flight software this is deterministic and auditable (the set of loadable
+systems is a visible list in `main`, with no link-section side effects that dead-code elimination
+could silently drop), and it keeps tests isolated (each builds its own registry).
 
 ---
 
 ## 4. Edge resolution
 
-### 4.1 Instance table
+### 4.1 The instance table
 
-After the systems pass, the loader holds:
+The systems pass of [`resolve`] records, per instance name, an `Instance { handle, desc }`. A
+duplicate name is a [`DuplicateInstance`] error.
 
-```rust
-struct Instance {
-    handle: SystemHandle,
-    desc:   SystemDescriptor,
-    name:   String,          // the KDL instance name (also the telemetry prefix, §6)
-}
-instances: HashMap<String /*instance name*/, Instance>
-```
+### 4.2 Resolving one endpoint
 
-### 4.2 Resolving one endpoint `(instance, frame)` → `PortRef`
+Each `(instance, frame)` endpoint resolves to a [`PortRef`] (`{ system: SystemHandle, frame_id:
+ComponentId }`):
 
-```
-1. inst   = instances.get(instance_name)        else LoadError::UnknownInstance{ span }
-2. fid    = ComponentId::new(frame_name)         // the same hash Frame::FRAME_ID uses
-3. // validate the frame name is actually a port of the right direction on this instance:
-   producer side: inst.desc.outputs.iter().any(|p| p.frame_id == fid)
-   consumer side: inst.desc.inputs .iter().any(|p| p.frame_id == fid)
-       else LoadError::UnknownFrame{ instance, frame, span }
-4. PortRef { system: inst.handle, frame_id: fid }
-```
-
-Step 2 is the **frame-name → `ComponentId`** registry the WP5 report calls for: it is simply
-`ComponentId::new(name)`, the identical construction `Frame::FRAME_ID` performs at compile time
-(`src/frame.rs`), so a KDL string and the Rust frame name land on the same `ComponentId` with no
-shared table to keep in sync. (`metor-proto-kdl`'s `parse_component_monitor` already does exactly
-`node.get("component_id").map(ComponentId::new)`.)
-
-Step 3 is the **typo guard**: because the descriptor enumerates every port's `frame_id`, a misspelled
-or wrong-direction frame name is caught **at load with a source span**, not silently ignored —
-satisfying the WP5 requirement that "a typo is a load error, not a silent miss." (Note `PortRef::new::<F>`
-exists for the code-first path but takes a Rust type; the loader can't name `F`, so it constructs
-`PortRef { system, frame_id }` directly — both fields are public.)
+1. `inst = instances.get(name)` else [`LoadError::UnknownInstance`].
+2. `frame_id = ComponentId::new(frame)` — the identical const hash [`Frame`]`::FRAME_ID` performs at
+   compile time, so a KDL string and the Rust frame name land on the same `ComponentId` with no
+   shared table to keep in sync.
+3. Validate the frame is a port of the right **direction** on that instance: producer side checks
+   `inst.desc.outputs`, consumer side checks `inst.desc.inputs`. A misspelled or wrong-direction
+   frame is [`LoadError::UnknownFrame`] — a typo is a load error with a span, not a silent miss.
 
 ### 4.3 Connecting and surfacing `WireError`
 
-```rust
-let p = resolve_producer(edge.from, edge.out)?;
-let c = resolve_consumer(edge.to,   edge.in)?;
-builder.connect(p, c).map_err(|e| LoadError::Wire { source: e, span: edge.span })?;
-```
+For each edge the resolver calls `builder.connect_delayed(p, c)` if `delayed`, else
+`builder.connect(p, c)`, wrapping any early [`WireError`] (`UnknownSystem`, `FrameIdMismatch`) as
+[`LoadError::Wire`]. The deferred structural checks run at `builder.build()` and surface the same
+way: [`WireError`]`::{UnknownPort, Incompatible, UnconnectedInput, DoubleConnect, FeedbackCycle}`.
+An unbroken feedback loop is a `FeedbackCycle`; declaring the back-edge `delayed=#true` breaks it so
+the document loads.
 
-`connect` returns early `WireError::{UnknownSystem, FrameIdMismatch}` (and `UnknownPort` etc. are
-caught later at `build()`). Each is wrapped with the originating `connect` node's span so the diagnostic
-points at the offending line. Likewise `builder.build()` returns `WireError::{UnknownPort,
-Incompatible, UnconnectedInput, DoubleConnect}`; the loader maps these back to a source span where it
-can (it knows which edge/instance each frame_id+system came from — §5.2).
-
-### 4.4 Dynamic frames need no special handling
-
-A producer of a `FrameList`/`FrameMap`-bearing frame (e.g. `procmon`) is wired exactly like any other:
-the edge names the frame, `ComponentId::new` resolves it, and `compatible()` (inside `build()`)
-compares the **realized** VTable fields, including dynamic member templates (registration mode —
-`realize_set` in `src/descriptor.rs`). The wiring layer is oblivious to the dynamism; it lives inside
-the frame.
+Dynamic frames (a `FrameList`/`FrameMap`-bearing frame) need no special handling: the edge names the
+frame, `ComponentId::new` resolves it, and compatibility is checked on the **realized** VTable inside
+`build()`. The wiring layer is oblivious to the dynamism.
 
 ---
 
-## 5. The loader API
+## 5. Param deserialization (static systems)
 
-### 5.1 Entry point
+A static system's KDL config becomes its `Params` struct via [`FromKdlNode`]:
 
 ```rust
-/// Parse a KDL wiring document, instantiate every system from `registry`, connect the
-/// edges, and return a built coordinator ready to `run`.
-pub fn load(kdl: &str, registry: &Registry) -> Result<Coordinator, LoadError>;
+pub trait FromKdlNode: Sized {
+    fn from_kdl_node(node: &KdlNode, src: &str) -> Result<Self, LoadError>;
+}
+impl FromKdlNode for () { /* a no-params system uses `type Params = ()` */ }
 ```
 
-Pseudo-flow:
+The `#[derive(FromKdlNode)]` macro generates the walk per field over the node's properties, leaning
+on the [`FromKdlScalar`] leaf trait (implemented for the integer types, `f32`/`f64`, `bool`, and
+`String`). Floats accept an integer literal (`rate=200` ⇒ `200.0`). Field kinds:
+
+- `f: T` — a **required** property (`MissingParam` if absent, `InvalidParam` on a type mismatch).
+- `f: Option<T>` — **optional**; absent ⇒ `None`.
+- `#[kdl(default = …)]` — defaulted when absent.
 
 ```rust
-let doc = kdl.parse::<KdlDocument>().map_err(LoadError::parse)?;     // kdl crate, like metor-proto-kdl
-let config = parse_coordinator(&doc)?;                              // §1.1 → CoordinatorConfig
-let mut builder = Coordinator::builder(config);
-let mut instances = HashMap::new();
-
-for node in doc.nodes().filter(|n| n.name().value() == "system") {  // systems pass (§2)
-    let inst_name = first_entry_string(node).ok_or(LoadError::MissingInstanceName{..})?;
-    let ty = node.get("type").and_then(|v| v.as_string()).ok_or(LoadError::MissingType{..})?;
-    let factory = registry.factories.get(ty).ok_or(LoadError::UnknownType{ ty, span })?;
-    let (handle, desc) = factory(&mut LoadCtx { node, src: kdl, builder: &mut builder })?;
-    if instances.insert(inst_name, Instance{ handle, desc, .. }).is_some() {
-        return Err(LoadError::DuplicateInstance{ .. });
-    }
-}
-
-for node in doc.nodes().filter(|n| n.name().value() == "connect") { // edges pass (§4)
-    let edge = parse_edge(node)?;
-    let p = resolve(&instances, edge.from, edge.out, Dir::Out)?;
-    let c = resolve(&instances, edge.to,   edge.in,  Dir::In)?;
-    builder.connect(p, c).map_err(|e| LoadError::wire(e, edge.span))?;
-}
-
-builder.build().map_err(|e| LoadError::wire_at_build(e, &instances))  // §4.3 / §5.2
-```
-
-The loader holds the source string for the lifetime of the parse so every error carries
-`#[source_code]` + span, exactly as `metor-proto-kdl` does.
-
-### 5.2 `LoadError` — every failure with source context
-
-```rust
-#[derive(Error, Diagnostic, Debug)]
-pub enum LoadError {
-    Parse{ source: kdl::KdlError, #[source_code] src, #[label] span },        // bad KDL
-    UnknownType{ ty, #[source_code] src, #[label] span },                     // §2: no registry entry
-    BadParams{ source: /* FromKdlNode err */, #[source_code] src, #[label] span }, // §3
-    MissingInstanceName{ .. } | MissingType{ .. } | DuplicateInstance{ .. },  // §1.2
-    UnknownInstance{ name, #[source_code] src, #[label] span },               // §4.2 step 1
-    UnknownFrame{ instance, frame, #[source_code] src, #[label] span },       // §4.2 step 3 (typo guard)
-    Wire{ #[source] source: WireError, #[source_code] src, #[label] span },   // §4.3: WP5 errors
-    MissingCoordinator | MultipleCoordinators{ .. },                          // §1.1
+#[derive(FromKdlNode)]
+struct RoundTrip {
+    count:  i64,
+    rate:   f64,
+    label:  String,
+    offset: Option<f64>,
+    #[kdl(default = 4)]
+    depth:  i64,
 }
 ```
 
-This mirrors `KdlSchematicError` (`metor-proto-kdl/src/lib.rs`) — same `thiserror`+`miette`
-derive, same `#[source_code]`/`#[label]` pattern — so diagnostics render with the offending KDL line
-highlighted. The five `WireError` variants WP5 already defines are wrapped in `LoadError::Wire`;
-where the error names a `frame_id`/system id, §5.2's instance table lets the loader translate it back
-to the human instance + frame name and the source span (a `build()` error like `Incompatible{ producer,
-consumer, frame_id }` knows the system *names* already, and the loader maps those to the `connect`
-node that introduced the edge).
-
-### 5.3 Code-first builder remains the primary path
-
-The KDL loader is **optional sugar over the builder**, which stays the canonical API (the WP5 tests
-in `tests_coordinator.rs` wire everything code-first via `add_cyclic`/`connect`/`PortRef::new::<F>`).
-KDL buys runtime reconfiguration without recompiling and a reviewable mission description; the typed
-builder buys compile-time port checking (`PortRef::new::<F>` proves the frame exists at compile time,
-where the loader can only check at load). Both produce the identical `Coordinator`. (Q5: is KDL a
-hard requirement for v1, or a fast-follow, given the builder already satisfies every WP5 test?)
+The param schema is owned by the system crate, next to the system — the loader never hard-codes any
+system's fields. The helper functions `kdl_required`/`kdl_optional` back the derive.
 
 ---
 
-## 6. The frame_id collision across two instances of the same system type (first-class problem)
+## 6. The build driver and dl systems
 
-**The problem.** `Frame::FRAME_ID = ComponentId::new(Frame::NAME)` is baked into the *type* at compile
-time. Two instances of the same system type — `system "imu_left" type="ImuDriver"` and `system
-"imu_right" type="ImuDriver"` — both produce the frame named `"imu"`, hence **the same
-`ComponentId`**. This is a real collision the design must address.
+### 6.1 The build driver
 
-**Where it does *not* break: wiring.** WP5 addresses ports by `(SystemHandle, frame_id)`, and the two
-instances have **distinct `SystemHandle`s**. Internally `build()` keys fan-out and edges by
-`(system_id, port_idx)`, never by a global `frame_id` (see `cons_edge`/`fan_out` in
-`coordinator.rs`), so two producers sharing a `frame_id` are unambiguous. The loader's instance table
-keys on the **instance name**, so `connect from="imu_left"` and `connect from="imu_right"` resolve to
-different handles. **Wiring is collision-free** because the instance name disambiguates the producer
-and the `SystemHandle` carries that through.
+Each dl system lives in its own cdylib crate. The build driver (`build_driver.rs`) turns a
+[`Wiring`]'s [`Artifact`]s into located `.so`s:
 
-**Where it *does* break: identity at the db/telemetry sink.** Both instances emit components under the
-frame path `imu.omega` (the `Frame::NAME` prefix). At the db, instance-left's `imu.omega` and
-instance-right's `imu.omega` are **the same fully-qualified component** — they collide. This is
-exactly the `<NAME>` prefixing WP5 **deferred to the sink** (coordinator.md §5.4, Q6), and WP6 is where
-the disambiguating name actually exists.
+```rust
+pub fn build_artifacts(wiring: &mut Wiring, opts: &BuildOptions) -> Result<(), BuildError>;
+```
 
-**The resolution: the prefix is the KDL instance name, not `Frame::NAME` and not `System::NAME`.**
-WP5 proposed prefixing each system's frames with `System::NAME` — but `System::NAME` is a property of
-the *type* (`"ImuDriver"`), so it is **identical** for two instances and does **not** disambiguate.
-WP6 refines this: the disambiguator is the **instance name** from KDL (`"imu_left"` / `"imu_right"`),
-which is unique by construction (§1.2). Concretely:
+For each artifact it runs `cargo build -p <crate_name> --message-format=json`, scans the
+`compiler-artifact` lines for the file matching `cdylib`, and writes the path into [`Artifact::path`]
+so [`resolve`] can `dlopen` it. It is std-only (`std::process::Command`), idempotent, and incremental
+— cargo only rebuilds stale crates. [`BuildOptions`] carries `release` and `extra_args`. Failures are
+clean errors ([`BuildError`]`::{Spawn, CargoFailed, ArtifactNotFound}`), never a panic.
 
-- The loader records, per system, its instance name in the instance table (§5.2). It passes this
-  name down to the coordinator's per-buffer ownership record (the `BufferRole::Output { system, .. }`
-  in `coordinator.rs` already identifies the owning system; WP6/WP5 associates that system index with
-  its instance name).
-- The **telemetry sink applies `<instance-name>.` as the path prefix** when ingesting that buffer's
-  records into db (so `imu_left.imu.omega` vs `imu_right.imu.omega`) — applied at ingest, per
-  instance, not baked into the on-ring frame bytes (whose name stays the fixed `Frame::NAME`). This
-  is precisely WP5 Q6, with the prefix source corrected from `System::NAME` to the instance name.
-- For the **code-first builder** (no KDL), the instance name defaults to `System::NAME`; a future
-  `add_cyclic_named(name, system)` overload supplies an explicit instance name for the
-  two-instances-of-one-type case. (Q2 asks the reviewer to confirm: instance-name prefix at the
-  sink, and whether the builder needs the `_named` overload now or can defer it until a mission
-  actually instantiates a type twice.)
+### 6.2 Resolving a dl system
 
-This ties the deferred per-system prefix to the one place a unique human name for each system
-instance exists — the KDL document.
+For a dl [`SystemSpec`], [`resolve`] finds its [`Artifact`] (else [`UnknownArtifact`]), reads
+`artifact.path` (else [`ArtifactNotBuilt`]), opens the `.so` **once** with `DlSystem::open` (else
+[`DlOpen`]), resolves the params to canonical postcard bytes, and registers it via
+[`CoordinatorBuilder::add_dl_cyclic`]`(name, loaded, params)`. The same open is reused for both the
+param encode and the bound slot.
+
+### 6.3 Schema-guided KDL → postcard params (the one-encoding invariant)
+
+The headline property is that the **same** logical params produce **byte-identical** wire bytes
+whether authored in Rust or in KDL — so KDL ≡ the Rust builder on the wire.
+
+- The Rust builder's [`SystemSpecBuilder::params`]`<P: Serialize>(p)` postcard-encodes `P` into
+  [`ParamSource::Postcard`] — exactly the bytes `fsw_create` decodes.
+- A KDL dl system carries [`ParamSource::Kdl`] (its node text). At resolve, [`encode_kdl_params`]
+  schema-encodes it against the `.so`'s **exported** `Params` schema ([`DlSystem::params_schema`],
+  an `OwnedNamedType` from `postcard-schema`) — the host never links the system's `Params` type.
+
+`encode_kdl_params` walks the schema's named struct fields (so JSON object order is canonical,
+matching the typed builder's struct-field order — the basis of the byte equality), pulls the matching
+KDL property for each, coerces it to the field's leaf type (reusing the [`FromKdlScalar`] coercion
+rules), builds a dynamic `serde_json::Value`, and hands it to `postcard_dyn::to_stdvec_dyn`. Only a
+top-level struct of scalar fields (or a unit) maps from flat KDL properties. The errors are
+span-aware:
+
+- [`DlUnknownParam`] — a property with no matching schema field.
+- [`DlMissingParam`] — a non-`Option` schema field with no property (the schema has no defaults; an
+  `Option` field with no property encodes as `None`).
+- [`DlParamTypeMismatch`] — a property whose value type does not match the field.
+- [`DlParamEncode`] — an un-encodable schema shape, or the dynamic encoder rejected the value.
+
+The byte equality is asserted directly in the integration test (`tests/wiring_resolve.rs`): the same
+dl system configured both ways encodes to identical `Params` bytes and runs to the same output.
 
 ---
 
-## 7. Reused vs. new
+## 7. Instance-name disambiguation and the telemetry prefix
 
-| Concern | Reused (landed) | New in WP6 |
+[`Frame`]`::FRAME_ID = ComponentId::new(Frame::NAME)` is baked into the **type** at compile time, so
+two instances of one system type — `system "imu_left" type="ImuDriver"` and `system "imu_right"
+type="ImuDriver"` — both produce a frame named `"imu"`, hence the same `ComponentId`.
+
+**Wiring is collision-free.** Ports are addressed by `(SystemHandle, frame_id)`, and the two
+instances have distinct `SystemHandle`s. The coordinator keys fan-out and edges by `(system, port)`,
+never by a global `frame_id`, and the instance table keys on the unique instance **name**, so
+`connect from="imu_left"` and `connect from="imu_right"` resolve to different handles.
+
+**Identity at the telemetry sink is disambiguated by the instance name.** Each system is added under
+its instance name (`add_cyclic_named`/`add_async_named`/`add_dl_cyclic` all take a `name`), and that
+name is the path prefix: outputs register under `ComponentId::new("<instance>.<frame>")`
+(`imu_left.imu` vs `imu_right.imu`). The instance name — unique by construction — is the
+disambiguator, not `System::NAME` (which is a property of the type and identical for both instances).
+`Coordinator::output_instances()` exposes the `(instance_name, frame_id)` pairs, and the output
+registry (`src/registry.rs`) indexes each tappable buffer by its instance-qualified id.
+
+---
+
+## 8. Errors
+
+[`LoadError`] is a `thiserror` + `miette` `Diagnostic`, each variant carrying `#[source_code]` +
+`#[label]` so diagnostics render with the offending KDL line highlighted, mirroring
+`metor-proto-kdl`'s `KdlSchematicError`. The variants:
+
+| Variant | When |
+|---|---|
+| `Parse` | bad KDL |
+| `MissingCoordinator` / `MultipleCoordinators` | not exactly one `coordinator` |
+| `MissingInstanceName` / `MissingType` / `DuplicateInstance` | malformed/duplicate `system` |
+| `UnknownType` | `type=` not in the registry |
+| `MissingParam` / `InvalidParam` | static-system param missing / wrong type |
+| `MissingEdgeField` | incomplete `connect` |
+| `UnknownInstance` / `UnknownFrame` | edge endpoint resolution (§4.2) |
+| `Wire` | a `WireError` from `connect`/`build()` (§4.3) |
+| `MissingArtifactField` / `UnknownArtifact` / `ArtifactNotBuilt` / `DlOpen` | dl artifact resolution |
+| `DlUnknownParam` / `DlMissingParam` / `DlParamTypeMismatch` / `DlParamEncode` | dl param encoding (§6.3) |
+
+When [`parse`] produces the [`Wiring`], every error carries the offending document span. When
+[`resolve`] consumes a [`Wiring`], the source spans are not available (a builder-origin [`Wiring`]
+has no text), so resolve-time errors carry a best-effort reconstructed snippet — but the error
+**variant** (what callers and tests match on) is identical either way. `build()`-time `WireError`s
+are wrapped with the error's own rendered message as the snippet.
+
+---
+
+## 9. Reused vs. new
+
+| Concern | Reused | New here |
 |---|---|---|
-| Wiring / validation / sizing | the **entire** WP5 builder: `builder()`, `add_cyclic`/`add_async`/`connect`/`build`, `PortRef`, `SystemHandle`, `WireError`, `compatible` | nothing — WP6 only *drives* it |
-| KDL parsing | the `kdl = "6.3.4"` crate + `metor-proto-kdl`'s hand-walk style (`node.get`, `entries`, `span`) | the wiring document grammar (§1) |
-| Frame addressing | `ComponentId::new(name)` (== `Frame::FRAME_ID`); `SystemDescriptor`/`PortDesc.frame_id` | the frame-name→`ComponentId`→`PortRef` resolver + typo guard (§4) |
-| Error reporting | `thiserror`+`miette` `Diagnostic` with `#[source_code]`/`#[label]` (`KdlSchematicError`) | `LoadError` variants + mapping `WireError` back to spans (§5.2) |
-| Param config | `metor-proto-kdl`'s per-node `parse_*` walk | `FromKdlNode` trait + derive; per-system `Params` (§3) |
-| System construction | `System::new(params)` (WP4 §1.2 "constructible before init") | the `Registry`, `SystemFactory`, `RegisteredSystem` + blanket cyclic/async impls (§2) |
-| Telemetry namespacing | health-as-frames; the deferred `<NAME>` prefix (WP5 §5.4) | the prefix is the **instance name**, recorded by the loader, applied at the sink (§6) |
-
-Genuinely new code: the KDL schema, the registry + registration macro, the `FromKdlNode` param-deser
-trait/derive, the edge resolver, and the `load()` loader with span-carrying `LoadError`. The builder,
-validation, sizing, addressing, and parsing dependency are all reuse.
+| Wiring / validation / sizing | the coordinator builder: `add_*_named`, `connect`/`connect_delayed`, `build`, `PortRef`, `SystemHandle`, `WireError` | nothing — wiring only drives it |
+| KDL parsing | the `kdl` crate + `metor-proto-kdl`'s hand-walk style | the wiring grammar (§2) |
+| Frame addressing | `ComponentId::new(name)` (== `Frame::FRAME_ID`); `SystemDescriptor`/`PortDesc.frame_id` | the resolver + typo guard (§4) |
+| Error reporting | `thiserror` + `miette` `Diagnostic` | `LoadError` (§8) |
+| dl ABI | `DlSystem`, `export_system!`, `fsw_*` symbols, `params_schema` | the build driver, the schema-guided KDL encoder (§6) |
+| System construction | `BuildSystem::new` | `Registry`, `SystemFactory`, `AddToBuilder`, `FromKdlNode` derive (§3, §5) |
+| Mission description | — | the `Wiring` data model + `WiringBuilder` + `parse`/`resolve` (§0, §1) |
 
 ---
 
-## 8. Open questions / risks for the reviewer
+## Tests
 
-1. **Q1 — registration mechanism: explicit table vs `inventory`.** Proposed: an app-built `Registry`
-   (each crate exposes `register(&mut Registry)`), **not** `inventory`/`linkme` global collection —
-   justified by determinism/auditability for FSW, the dead-code-elimination footgun of link-section
-   registration, test isolation, and the fact that `inventory` is only a transitive dep today while
-   `metor-proto-kdl` already uses explicit dispatch. Confirm explicit-table; the trait/factory design
-   is identical either way.
-2. **Q2 — the frame_id-collision / instance-name prefix (the headline risk).** Proposed: wiring is
-   already collision-free (distinct `SystemHandle`s); the collision is at the db sink, resolved by
-   prefixing each system's frames with its **KDL instance name** (correcting WP5's `System::NAME`,
-   which doesn't disambiguate two instances), applied at ingest, not in the frame bytes. Confirm the
-   prefix source is the instance name and the application site is the sink. Does the **code-first**
-   builder need an `add_cyclic_named(name, sys)` overload now, or can the `name == System::NAME`
-   default stand until a mission instantiates one type twice?
-3. **Q3 — cyclic/async declared by type only.** Proposed: KDL does **not** carry `kind`; the factory
-   knows from which system trait `S` implements. Acceptable, or do we want an advisory `kind="async"`
-   property cross-checked against the type (documentation value vs. a way for the document to
-   contradict the code)?
-4. **Q4 — edge syntax.** Proposed: `connect "a" -> "b" frame="f"` shorthand plus the explicit
-   `from/to/out/in` form. Since `connect` requires matching `frame_id`, `out` and `in` must hash
-   equal — is the asymmetric `out`/`in` form worth keeping, or should an edge always name a single
-   `frame`?
-5. **Q5 — is KDL in-scope for v1 at all?** The WP5 builder already satisfies every acceptance test
-   code-first. Is the KDL loader a v1 deliverable, or a fast-follow with the builder as the only v1
-   surface? (Affects how much of §3's derive machinery we build now.)
-6. **Q6 — `FromKdlNode` now vs. wait for `facet-kdl`.** Proposed: hand-walk like `metor-proto-kdl`
-   behind a `FromKdlNode` trait + derive, retargetable onto `facet-kdl` later. Acceptable to ship the
-   hand-walk derive now, or hold params-deser until `facet-kdl` lands (per `metor-proto-kdl`'s own
-   README intent)?
-7. **Q7 — build-time `WireError` → span mapping.** `build()` returns errors naming `frame_id` /
-   system *names*, not the KDL node. The loader can translate via its instance table (§5.2), but the
-   mapping is best-effort (e.g. `UnconnectedInput` names a system+frame with no originating `connect`
-   node to point at — it would highlight the `system` node instead). Is best-effort span mapping
-   acceptable, or must every `build()` error pinpoint an exact source span?
+- `src/wiring/tests.rs` — the in-crate acceptance suite: an end-to-end KDL load + run of a
+  params-bearing cyclic chain into an async logger; instance-name disambiguation of two instances of
+  one type; the span-carrying error cases; feedback-cycle detection and the `delayed=#true` break; a
+  `telemetry` node loading; the `FromKdlNode` derive round-trip; and the **front-end equivalence**
+  tests (`parse` and `WiringBuilder` produce byte-equal [`Wiring`], and a builder-origin [`Wiring`]
+  resolves and runs).
+- `tests/wiring_resolve.rs` — the dl acceptance gate driven **through** the [`Wiring`] data model: a
+  static producer + a dlopen'd consumer, the build driver locating the `.so`, then `resolve` + run;
+  and the headline KDL ≡ Rust-builder byte-equality (§6.3) run to the same output.
+</content>
+</invoke>
