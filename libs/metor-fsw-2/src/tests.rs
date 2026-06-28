@@ -121,6 +121,72 @@ fn static_frame_componentize_round_trip() {
 }
 
 // ---------------------------------------------------------------------------
+// 2b. Array (`[T; N]`) frame field: one multi-element component, round-tripped
+// through `apply` into a recording sink.
+// ---------------------------------------------------------------------------
+
+#[derive(Default)]
+struct VecSink {
+    values: HashMap<ComponentId, Vec<f64>>,
+}
+
+impl metor_fsw::Decomponentize for VecSink {
+    type Error = core::convert::Infallible;
+    fn apply_value(
+        &mut self,
+        component_id: ComponentId,
+        value: ComponentView<'_>,
+        _timestamp: Option<Timestamp>,
+    ) -> Result<(), Self::Error> {
+        self.values
+            .insert(component_id, value.iter().map(|e| e.as_f64()).collect());
+        Ok(())
+    }
+}
+
+#[derive(Frame, IntoBytes, Immutable, KnownLayout, Default, Debug, PartialEq)]
+#[repr(C)]
+#[metor_fsw(name = "arr")]
+struct ArrFrame {
+    #[metor_fsw(timestamp)]
+    timestamp: Timestamp,
+    v: [f64; 3],
+    // `u64` (not `u32`) keeps the `#[repr(C)]` frame padding-free, a prerequisite
+    // for `IntoBytes`.
+    n: u64,
+}
+
+#[test]
+fn array_field_frame_round_trip() {
+    let frame = ArrFrame {
+        timestamp: Timestamp(77),
+        v: [1.5, -2.5, 3.25],
+        n: 42,
+    };
+
+    // (a) Componentize → Decomponentize in-process round-trip.
+    let mut dst = ArrFrame::default();
+    frame.sink_columns(&mut dst);
+    assert_eq!(dst.v, frame.v);
+    assert_eq!(dst.n, frame.n);
+
+    // (b) bytes → vtable `apply` into a recording sink. NOTE: the blanket
+    // `AsVTable for [T; N]` (metor-fsw/src/vtable.rs) expands an array into N indexed
+    // scalar components, so the vtable path yields `arr.v.0/1/2` rather than the
+    // single shape-[3] `arr.v` that `as_component_view` (part a) produces. This
+    // representation split is pre-existing framework behavior, not part of this fix.
+    let mut sink = VecSink::default();
+    ArrFrame::as_vtable()
+        .apply(frame.as_bytes(), &mut sink)
+        .unwrap()
+        .unwrap();
+    assert_eq!(sink.values[&ComponentId::new("arr.v.0")], vec![1.5]);
+    assert_eq!(sink.values[&ComponentId::new("arr.v.1")], vec![-2.5]);
+    assert_eq!(sink.values[&ComponentId::new("arr.v.2")], vec![3.25]);
+    assert_eq!(sink.values[&ComponentId::new("arr.n")], vec![42.0]);
+}
+
+// ---------------------------------------------------------------------------
 // 3. FrameList / FrameMap: build → serialize → apply
 // ---------------------------------------------------------------------------
 

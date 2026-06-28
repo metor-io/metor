@@ -33,9 +33,11 @@ pub fn frame(input: TokenStream) -> TokenStream {
         name,
     } = Frame::from_derive_input(&parsed).unwrap();
 
-    let crate_name = crate::metor_fsw_crate_name();
+    // `#[derive(Frame)]` is a metor-fsw-2 concept, so the bundled sub-derives emit
+    // `::metor_fsw_2::…` re-export paths — a crate depending only on metor-fsw-2 can
+    // then use the derive without a direct metor-fsw / metor-proto dependency.
     let fsw2 = crate::metor_fsw_2_crate_name();
-    let impeller = quote! { #crate_name::metor_proto };
+    let impeller = quote! { #fsw2::metor_proto };
 
     // The frame name: explicit `name`/`parent`, else snake_case of the ident. This
     // is both the dotted component prefix and the `FRAME_ID`.
@@ -57,10 +59,10 @@ pub fn frame(input: TokenStream) -> TokenStream {
 
     // The four sub-derives share the same `Field`/attribute surface; each reads the
     // frame `name` as its component prefix.
-    let as_vtable = crate::as_vtable::as_vtable_impl(&parsed, Some(frame_id.clone()));
-    let metadatatize = crate::metadatatize::metadatatize_impl(&parsed);
-    let componentize = crate::componentize::componentize_impl(&parsed);
-    let decomponentize = crate::decomponentize::decomponentize_impl(&parsed);
+    let as_vtable = crate::as_vtable::as_vtable_impl(&parsed, Some(frame_id.clone()), &fsw2);
+    let metadatatize = crate::metadatatize::metadatatize_impl(&parsed, &fsw2);
+    let componentize = crate::componentize::componentize_impl(&parsed, &fsw2);
+    let decomponentize = crate::decomponentize::decomponentize_impl(&parsed, &fsw2);
 
     let where_clause = &generics.where_clause;
     let frame_trait = quote! {

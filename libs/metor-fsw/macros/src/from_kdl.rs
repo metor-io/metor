@@ -28,7 +28,7 @@ pub fn from_kdl_node(input: TokenStream) -> TokenStream {
                 return quote! {
                     impl #fsw2::wiring::FromKdlNode for #ident {
                         fn from_kdl_node(
-                            _node: &::kdl::KdlNode,
+                            _node: &#fsw2::kdl::KdlNode,
                             _src: &str,
                         ) -> ::core::result::Result<Self, #fsw2::wiring::LoadError> {
                             ::core::result::Result::Ok(#ident)
@@ -84,7 +84,7 @@ pub fn from_kdl_node(input: TokenStream) -> TokenStream {
     quote! {
         impl #fsw2::wiring::FromKdlNode for #ident {
             fn from_kdl_node(
-                node: &::kdl::KdlNode,
+                node: &#fsw2::kdl::KdlNode,
                 src: &str,
             ) -> ::core::result::Result<Self, #fsw2::wiring::LoadError> {
                 ::core::result::Result::Ok(#ident {

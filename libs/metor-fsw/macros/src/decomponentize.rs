@@ -18,11 +18,12 @@ pub struct Decomponentize {
 
 pub fn decomponentize(input: TokenStream) -> TokenStream {
     let input = syn::parse_macro_input!(input as DeriveInput);
-    decomponentize_impl(&input).into()
+    decomponentize_impl(&input, &crate::metor_fsw_crate_name()).into()
 }
 
-pub fn decomponentize_impl(input: &DeriveInput) -> TokenStream2 {
-    let crate_name = crate::metor_fsw_crate_name();
+/// See [`componentize_impl`](crate::componentize::componentize_impl) for the
+/// `crate_name` root-path contract.
+pub fn decomponentize_impl(input: &DeriveInput, crate_name: &TokenStream2) -> TokenStream2 {
     let Decomponentize {
         ident,
         generics,

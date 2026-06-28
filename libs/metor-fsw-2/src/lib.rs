@@ -56,6 +56,16 @@ pub use metor_fsw_ring as ring;
 pub use metor_fsw::{AsVTable, Componentize, Decomponentize, Metadatatize};
 pub use metor_fsw_macros::{Frame, SystemInput, SystemOutput};
 
+// Re-exports the `#[derive(Frame)]` / `#[derive(FromKdlNode)]` generated code names
+// (`::metor_fsw_2::metor_proto::…`, `::metor_fsw_2::path::…`, `::metor_fsw_2::kdl::…`)
+// so a crate depending only on metor-fsw-2 can use those derives without a direct
+// `metor-fsw` / `metor-proto` / `kdl` dependency.
+pub use metor_fsw::path;
+pub use {metor_proto, metor_proto_wkt};
+
+#[cfg(feature = "kdl")]
+pub use kdl;
+
 #[cfg(test)]
 mod tests;
 #[cfg(test)]
