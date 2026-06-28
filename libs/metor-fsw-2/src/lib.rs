@@ -11,9 +11,13 @@
 //! alignment); the genuinely new surface is the [`Frame`] trait, the dynamic types,
 //! and the [`FrameWriter`] producer API.
 
+mod descriptor;
 mod dynamic;
 mod frame;
+mod health;
+mod port;
 mod reader;
+mod system;
 mod writer;
 
 pub use dynamic::{FrameList, FrameMap, Name, Slot};
@@ -21,10 +25,24 @@ pub use frame::Frame;
 pub use reader::{ListReader, MapReader};
 pub use writer::{FrameWriter, ListWriter, MapWriter, WriteError};
 
+// WP4 — the system trait family, the typed port wrappers, self-description, and
+// the standard health/log telemetry.
+pub use descriptor::{Hz, PortDesc, SystemDescriptor, SystemKind, compatible};
+pub use health::{
+    HealthPort, LOG_MSG_CAP, Level, LogLine, MAX_ERR_KINDS, MAX_LINES, SystemHealth, SystemLog,
+};
+pub use port::{DEFAULT_DEPTH, FrameRef, Input, Output, buffer_capacity, capacity_for};
+pub use system::{AsyncSystem, CyclicRunner, CyclicSystem, Out, System, SystemInput, SystemOutput};
+
+// Re-export the ring transport so a system author only needs `metor_fsw_2::*`.
+pub use metor_fsw_ring as ring;
+
 // The derives (re-exported through metor-fsw) and the four component traits, so a
 // user only needs `metor_fsw_2::*`.
 pub use metor_fsw::{AsVTable, Componentize, Decomponentize, Metadatatize};
-pub use metor_fsw_macros::Frame;
+pub use metor_fsw_macros::{Frame, SystemInput, SystemOutput};
 
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod tests_system;

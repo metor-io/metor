@@ -9082,6 +9082,7 @@ dependencies = [
  "metor-fsw-ring",
  "metor-proto",
  "metor-proto-wkt",
+ "stellarator",
  "zerocopy",
 ]
 

@@ -97,8 +97,11 @@ pub const fn round_up8(n: usize) -> usize {
 /// Total bytes a record with `payload_len` payload occupies: an 8-byte header
 /// (`u32` length + `u32` pad) plus the payload padded up to an 8-byte boundary.
 /// Always a multiple of 8, so every record start stays 8-byte aligned.
+///
+/// Public so buffer-sizing callers (fsw-2's system ports, WP4 §2.2) can size a
+/// ring from a frame's `MAX_SIZE` without re-deriving the header rule.
 #[inline]
-const fn frame_len(payload_len: usize) -> usize {
+pub const fn frame_len(payload_len: usize) -> usize {
     8 + round_up8(payload_len)
 }
 
