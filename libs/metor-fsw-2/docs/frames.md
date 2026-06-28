@@ -1,54 +1,47 @@
-# Work-Package 3 — Frames & component derives
+# Frames
 
-Status: **design only, pre-implementation**. Reviewer sign-off required before any code
-lands. No Rust in this WP — this document specifies what WP3 builds on top of the
-**already-landed** WP2 vtable extensions.
+A **frame** is the unit of data a `metor-fsw-2` system publishes: a `#[repr(C)]` struct
+whose fields are components sharing one logical timestamp, the whole group named by a
+`ComponentId`. A single `#[derive(Frame)]` turns such a struct into something that
+serializes straight to a metor-proto table — no separate encode step — and that can carry
+runtime-sized `FrameList`/`FrameMap` members past its fixed region.
 
-This WP turns the WP2 primitives (`Op::{Frame, List, Map, PathComponent}`, `ElementFields`,
-`PathHasher`, `RealizedField::{frame, element}`, the `frame`/`name`/`path_component`/`list`/
-`map` builders) into an ergonomic, derive-driven **frame** surface for `metor-fsw-2`: a
-struct annotated once becomes a timestamped, `ComponentId`-named group of components that
-serializes to a metor-proto table with no extra step, and that can carry runtime-dynamic
-`FrameList`/`FrameMap` members.
+This document is the reference for the frame format and the read/write APIs. The crate
+layout it describes:
 
-Relevant existing code (read before implementing):
-- `libs/metor-proto/src/vtable.rs` — `Op`, `Field`, `VTable`, `RealizedField`, `WalkCtx`,
-  `for_each_field`/`walk_field`/`expand_dynamic`, the `builder` module (`frame`, `name`,
-  `path_component`, `list`, `map`, `FieldBuilder`, `VTableBuilder`, `offset_table_ops`).
-- `libs/metor-proto/src/hash.rs` — `PathHasher` (`push`, `push_bytes`, `push_index`,
-  `finish`).
-- `libs/metor-fsw/src/vtable.rs` — the `AsVTable` trait (`vtable_fields(path)` / `as_vtable`).
-- `libs/metor-fsw/src/metadata.rs` — the `Metadatatize` trait (std-gated).
-- `libs/metor-fsw/src/path.rs` — `ComponentPath`, `ChainPath`, `hash_into`,
-  `to_component_id`, `to_metadata`.
-- `libs/metor-fsw/macros/src/{lib.rs, as_vtable.rs, metadatatize.rs, componentize.rs,
-  decomponentize.rs}` — the derive crate; `componentize.rs`/`decomponentize.rs` are
-  present but **not wired in** (see §2).
-- `libs/metor-proto/src/com_de.rs` — `Componentize` (`sink_columns`, `MAX_SIZE`),
-  `Decomponentize` (`apply_value`), `AsComponentView`, `FromComponentView`.
-- `libs/metor-proto/src/types.rs` — `ComponentId`, `PrimType`, `ComponentView`,
-  `Timestamp`, `LenPacket` (`push`, `push_aligned`, `extend_aligned`, `extend_from_slice`).
-- `libs/metor-proto/wkt/src/metadata.rs` / `msgs.rs` — `ComponentMetadata` (`with_prefix`),
-  `SetComponentMetadata`.
-- `libs/metor-fsw-2/ring/src/lib.rs` — record framing (`round_up8`, `frame_len`); records
-  are always **8-byte aligned**, which fixes the trailer alignment we adopt below.
+| Concern | File |
+|---------|------|
+| The `Frame` trait | `src/frame.rs` |
+| `FrameList`/`FrameMap`/`Slot`/`Name` + their vtable/Componentize impls | `src/dynamic.rs` |
+| `FrameWriter`/`ListWriter`/`MapWriter` (producer) | `src/writer.rs` |
+| `ListReader`/`MapReader` (typed consumer) | `src/reader.rs` |
+| `Output`/`Input`/`FrameRef` (typed ports over a ring) | `src/port.rs` |
+| `#[derive(Frame)]` and the four sub-derives | `../metor-fsw/macros/src/{frame,as_vtable,componentize,decomponentize,metadatatize}.rs` |
+| Acceptance tests (byte layouts pinned here) | `src/tests.rs` |
+
+It builds on the metor-proto primitives — the vtable `Op::{Frame, List, Map, PathComponent}`
+ops, `RealizedField`, `for_each_field`/`expand_dynamic`, `PathHasher`, and the
+`list`/`map`/`path_component`/`component`/`frame` builders — plus the ring's record framing
+(`round_up8`, `frame_len`), all of which records are 8-byte aligned. Frames add the typed
+surface on top.
 
 ---
 
-## 1. Frame concept & trait
+## 1. The frame concept
 
 ### 1.1 What a frame is
 
-A **frame** is a `#[repr(C)]` struct that groups components sharing one logical timestamp
-and is itself named by a `ComponentId` (the fnv1a-64 hash of the frame's dotted name, top
-bit masked — identical to `ComponentId::new`). The canonical example (DESIGN.md):
+A frame groups components that share one timestamp and is itself named by a `ComponentId`
+(the fnv1a-64 hash of the frame's dotted name, top bit masked — `ComponentId::new`). The
+canonical example:
 
 ```rust
 use nox::{Quaternion, Vector, array::ArrayRepr};
 
 #[derive(Frame, IntoBytes, Immutable, KnownLayout)]
 #[repr(C)]
-struct IMU {
+#[metor_fsw(name = "imu")]   // optional; defaults to snake_case(ident)
+struct Imu {
     #[metor_fsw(timestamp)]
     timestamp: Timestamp,
     omega: Vector<f64, 3, ArrayRepr>,
@@ -57,472 +50,432 @@ struct IMU {
 }
 ```
 
-Each field is a component (`IMU.omega` → `ComponentId::new("imu.omega")` when named under the
-frame prefix); the shared `timestamp` is marked once and propagated to every field; and the
-whole table is tagged with the frame id `ComponentId::new("imu")`.
+Each non-timestamp field is a component named under the frame prefix (`Imu.omega` →
+`ComponentId::new("imu.omega")`); the `timestamp` field is the shared timestamp source and
+is propagated to every component; and every component is tagged with the frame id
+`ComponentId::new("imu")`.
 
-### 1.1.1 Field types — scalars, nox vectors/quaternions, and `[T; N]` arrays
+The frame name comes from `#[metor_fsw(name = "...")]` (or the equivalent `parent = "..."`),
+defaulting to `snake_case` of the struct ident. An **empty** name means "no prefix" — the
+member components sit at the root.
+
+### 1.2 Field types — scalars, nox spatial types, and `[T; N]` arrays
 
 A frame field is one component whose primitive type is its scalar element type. Three field
 shapes are supported:
 
-- **Scalars** (`f64`, `u32`, `bool`, …) → one shape-`[]` component.
-- **nox spatial types — the recommended pattern for vectors/quaternions.**
-  `Vector<f64, 3, ArrayRepr>`, `Quaternion<f64, ArrayRepr>`,
-  `SpatialMotion`/`SpatialTransform`/… each serialize to a single multi-element component
-  (`imu.omega` of prim `f64`, shape `[3]`; a quaternion is shape `[4]`). nox types are
-  representation-consistent: the vtable/`apply` path and the in-process
+- **Scalars** (`f64`, `u32`, `u64`, `bool`, …) → one shape-`[]` component.
+- **nox spatial types — the recommended shape for vectors/quaternions.**
+  `Vector<f64, 3, ArrayRepr>`, `Quaternion<f64, ArrayRepr>`, `SpatialMotion`/
+  `SpatialTransform`/… each serialize to a single multi-element component (`imu.omega`,
+  prim `f64`, shape `[3]`; a quaternion is shape `[4]`). nox types are
+  representation-consistent: the byte-level vtable/`apply` path and the in-process
   `Componentize`/`Decomponentize` path produce the **same** single dotted component, so
   prefer them for any vector- or quaternion-valued field.
-- **Plain `[T; N]` arrays** (`[f64; 3]`, `[bool; 3]`, …) are also supported as frame fields.
-  The in-process `Componentize`/`Decomponentize` path treats `[T; N]` as one component of
-  prim `T` and shape `[N]` (via `AsComponentView`/`FromComponentView`, mirroring nox).
-  > Caveat: the byte-level vtable/`apply` path currently expands a `[T; N]` field into `N`
-  > **indexed scalar** components (`imu.omega.0`, `imu.omega.1`, `imu.omega.2`), so the two
-  > paths disagree on naming for arrays. If you need a single shape-`[N]` component on both
-  > paths, use the nox `Vector`/`Quaternion` types above. (Unifying the `[T; N]` vtable
-  > representation is tracked for a later pass.)
+- **Plain `[T; N]` arrays** (`[f64; 3]`, `[bool; 3]`, …) are supported with a known split
+  between the two serialization paths (see the limitation below).
 
-### 1.2 The `Frame` trait — a thin marker over existing traits
+### 1.3 The `Frame` trait
 
-`Frame` is a **new but thin** trait. It does *not* replace `AsVTable`/`Metadatatize`/
-`Componentize`/`Decomponentize`; it bundles them and adds the frame identity + timestamp
-accessor. It is deliberately **not** `metor_proto::component::Component` — `Component`
-requires a `schema()` for a single primitive array, which a multi-field frame is not.
+`Frame` (`src/frame.rs`) is a thin marker bundling the four component traits and adding the
+frame identity plus the shared-timestamp accessor. It does **not** replace
+`AsVTable`/`Metadatatize`/`Componentize`/`Decomponentize` — it requires all four — and it is
+deliberately not `metor_proto::component::Component` (a `Component` has a single primitive
+`schema()`, which a multi-field frame is not):
 
 ```rust
-// libs/metor-fsw-2 (new module, e.g. frame.rs)
 pub trait Frame: AsVTable + Metadatatize + Componentize + Decomponentize {
-    /// Frame name; the dotted prefix all member components hang off.
+    /// Frame name; the dotted prefix all member components hang off (and the
+    /// `Op::Frame` tag id). Empty means "no prefix".
     const NAME: &'static str;
-    /// fnv1a-64 of NAME, top-bit masked — same construction as every ComponentId.
+    /// fnv1a-64 of NAME, top-bit masked — the same construction as every ComponentId.
     const FRAME_ID: ComponentId = ComponentId::new(Self::NAME);
     /// The shared timestamp marked with `#[metor_fsw(timestamp)]`.
     fn timestamp(&self) -> Timestamp;
 }
 ```
 
-Rationale:
-- `AsVTable` already yields the table description; `Frame` only adds the `Op::Frame` wrap
-  (§1.3) and pins `NAME`/`FRAME_ID`.
-- `Componentize`/`Decomponentize` give the in-process struct↔components path (used by
-  systems wiring and by the ring-buffer writer/reader) without going through bytes+vtable.
+The roles of the bundled traits:
+
+- `AsVTable` yields the table description; the frame derive adds the `Op::Frame` wrap (§1.4)
+  and the dynamic member-template form (§2.3).
+- `Componentize`/`Decomponentize` give the in-process struct↔components path (used by systems
+  wiring) without going through bytes+vtable.
 - `Metadatatize` emits the id→name records for the static members.
-- The timestamp accessor lets the coordinator/ring writer stamp the frame uniformly.
+- `timestamp()` lets a port/coordinator read the frame's timestamp uniformly. With no marked
+  field it returns `Timestamp::default()`.
 
-### 1.3 Struct → VTable (the `Op::Frame` wrap)
+### 1.4 Struct → VTable: the frame tag and the timestamp source
 
-The existing `AsVTable` derive (`as_vtable.rs`) already composes nested fields with
-`vtable_fields(path)` and propagates the marked timestamp via `FieldBuilder::with_timestamp`.
-WP3 adds exactly two things on top:
+`#[derive(AsVTable)]` composes nested fields with `vtable_fields(path)`. The frame derive
+generates the same `AsVTable` impl with two additions:
 
-1. **Frame tag.** Each field's op chain is wrapped in the WP2 `frame(FRAME_ID, ...)` builder
-   so `RealizedField::frame` carries `FRAME_ID` for every member. This needs a small
-   `FieldBuilder::with_frame(component_id)` helper in `metor-proto::vtable::builder`
-   (mirroring the existing `with_timestamp`), since `FieldBuilder.arg` is private. The
-   derive then does `.map(|f| f.with_frame(FRAME_ID))` — one line alongside the existing
-   `timestamp_map`.
-2. **Frame name as the root prefix.** The frame derive seeds `vtable_fields` with the frame
-   name (today `#[metor_fsw(parent = "...")]` is already used this way in cube-sat, e.g.
-   `parent = "cube_sat"`). `NAME` defaults to the snake-cased ident and is overridable with
-   `#[metor_fsw(name = "...")]` / `parent`.
+1. **Frame tag.** Every field's op chain is wrapped via `FieldBuilder::with_frame(FRAME_ID)`
+   (`.map(move |field| field.with_frame(frame_id))`), so each `RealizedField` carries
+   `frame = Some(FRAME_ID)`. Because a single shared `frame(...)` Arc is referenced, the
+   builder's Arc-dedup stores the frame id once.
+2. **Timestamp source, not a component.** The `#[metor_fsw(timestamp)]` field becomes the
+   timestamp *source* (`with_timestamp(raw_table(offset, size))`) propagated to every other
+   field, and is itself **suppressed** — it is never emitted as a standalone component on
+   either the vtable path or the `Componentize` path. (Tests assert that `imu.timestamp` does
+   not appear.)
 
-Worked IMU vtable (what the derive expands to, using the landed builders):
+What the derive expands `Imu` (with scalar fields, for brevity) to:
 
 ```rust
-fn as_vtable() -> VTable {
-    let time = table!(IMU::timestamp);                       // raw_table(offset, size)
-    vtable([
-        field!(IMU::omega,
-            schema(PrimType::F64, &[3],
-                component(ComponentId::new("imu.omega"))))
-            .with_timestamp(time.clone())
-            .with_frame(ComponentId::new("imu")),
-        field!(IMU::accel,
-            schema(PrimType::F64, &[3],
-                component(ComponentId::new("imu.accel"))))
-            .with_timestamp(time)
-            .with_frame(ComponentId::new("imu")),
-    ])
+fn vtable_fields(path: impl ComponentPath) -> impl Iterator<Item = FieldBuilder> {
+    let timestamp_source = raw_table(offset_of!(Self, timestamp) as u32, size_of::<Timestamp>() as u32);
+    std::iter::empty()
+        .chain(<f64 as AsVTable>::vtable_fields(path.chain("imu.omega"))
+            .map(|f| f.offset_by(offset_of!(Self, omega) as u32)))
+        .chain(<f64 as AsVTable>::vtable_fields(path.chain("imu.accel"))
+            .map(|f| f.offset_by(offset_of!(Self, accel) as u32)))
+        .map(move |f| f.with_timestamp(timestamp_source.clone()))
+        .map(move |f| f.with_frame(ComponentId::new("imu")))
 }
 ```
 
-`apply` then drives `for_each_field`, and each `RealizedField` arrives at the sink with
-`component_id = imu.omega`, `timestamp = <marked>`, `frame = Some(imu)`. Because `with_frame`
-wraps a single shared `frame(...)` Arc, `VTableBuilder`'s Arc-dedup stores the frame id once
-(matching the WP2 "all fields reference one `Frame` op" decision).
-
-> Note: the `timestamp` field itself is normally *not* emitted as a component (it is the
-> source). Today the cube-sat `AsVTable` derive emits all non-skipped fields; WP3 should make
-> the `#[metor_fsw(timestamp)]` field contribute the timestamp **source** only and not a
-> standalone `timestamp` component, OR keep emitting it as a component — **open question Q1**.
+`as_vtable().apply(bytes, &mut sink)` then drives `for_each_field`, and each component arrives
+with `component_id = imu.omega`, `timestamp = <marked>`, `frame = Some(imu)`. The `frame` id is
+carried on `RealizedField`, not handed to `apply_value`, so tests inspect it via
+`realize_fields(Some(bytes))`.
 
 ---
 
-## 2. Derives — finish & export `Componentize`/`Decomponentize`, add `#[derive(Frame)]`
+## 2. The derives
 
-### 2.1 Current state (what's actually there)
+### 2.1 `#[derive(Frame)]` — the one-annotation entry point
 
-- `macros/src/lib.rs` registers **only** `#[derive(Metadatatize)]` and `#[derive(AsVTable)]`,
-  and declares **only** `mod as_vtable; mod metadatatize;`.
-- `componentize.rs` and `decomponentize.rs` exist and are written, but:
-  - they are **not** `mod`-declared in `lib.rs` and have **no** `#[proc_macro_derive]` entry;
-  - they reference `field.nest` and `field.component_id()`, **neither of which exists** on the
-    current `Field` (which has only `ident`, `ty`, `component_id: Option<String>`,
-    `timestamp: bool`, plus a `component_name()` method).
-- `metor-fsw/src/lib.rs` re-exports `AsVTable`, `Metadatatize` from the macro crate but not
-  Componentize/Decomponentize (the traits live in `metor_proto::com_de`).
-
-So "finish + export" is concrete: extend `Field`, wire the modules, register the derives,
-re-export, and reconcile naming.
-
-### 2.2 Extend the shared `Field`
-
-Add to `macros/src/lib.rs::Field`:
-
-```rust
-#[derive(FromField)]
-#[darling(attributes(metor_fsw))]
-struct Field {
-    ident: Option<syn::Ident>,
-    ty: syn::Type,
-    component_id: Option<String>,
-    #[darling(default)] timestamp: bool,
-    #[darling(default)] nest: bool,        // NEW: descend into a sub-frame instead of leaf
-    #[darling(default)] max: Option<usize>, // NEW: max cardinality for FrameList/FrameMap (§3)
-}
-impl Field {
-    fn component_name(&self) -> String { /* existing */ }
-    fn component_id(&self) -> String { self.component_name() } // NEW: alias the two callsites use
-}
-```
-
-`nest` distinguishes a field that is itself a frame/struct (recurse via the trait) from a
-leaf scalar (emit `apply_value` / `as_component_view`). This matches how `AsVTable` already
-recurses unconditionally through `<#ty as AsVTable>::vtable_fields`; for Componentize/
-Decomponentize the recursion must be explicit because the trait methods differ for leaves vs
-nested.
-
-### 2.3 What each derive generates (after finishing)
-
-| derive | generates | leaf behavior | nested (`#[metor_fsw(nest)]`) |
-|--------|-----------|---------------|-------------------------------|
-| `AsVTable` (extend) | `vtable_fields(path)` **and** new `element_fields()` (§4) | `component(path.chain(name).id)` leaf / `path_component(name)` leaf | `<Ty>::vtable_fields(path.chain(name)).map(offset_by)` |
-| `Metadatatize` | `metadata(prefix)` | `prefix.chain(name).to_metadata()` | `<Ty>::metadata(prefix.chain(name))` |
-| `Componentize` (finish) | `sink_columns(out)` + `MAX_SIZE` | `out.apply_value(id, self.f.as_component_view(), None)` | `self.f.sink_columns(out)` |
-| `Decomponentize` (finish) | `apply_value(id, view, ts)` | match `id == ID const` → `FromComponentView` | `self.f.apply_value(id, view, ts)` |
-| `Frame` (new, §2.4) | the four above + `impl Frame` | — | — |
-
-`Componentize::MAX_SIZE` must change from the hard-coded `0` to the real sum: fixed-field
-sizes plus, for each `FrameList`/`FrameMap` field, its declared `max` cardinality times the
-element stride (+ key-pool budget for maps). This is what lets the coordinator size output
-ring buffers (§3.4).
-
-### 2.4 The unifying `#[derive(Frame)]`
-
-`#[derive(Frame)]` is the one-annotation entry point. It expands to **all four** derives plus
-`impl Frame`, so a user writes:
+`#[derive(Frame)]` expands to **all four** sub-derives (`AsVTable` + `Metadatatize` +
+`Componentize` + `Decomponentize`) plus `impl Frame`. A frame author writes one fsw derive
+and the standard zerocopy derives:
 
 ```rust
 #[derive(Frame, IntoBytes, Immutable, KnownLayout)]
 #[repr(C)]
-#[metor_fsw(name = "imu")]   // optional; defaults to snake_case(ident)
-struct IMU { #[metor_fsw(timestamp)] timestamp: Timestamp, omega: Vector<f64, 3, ArrayRepr>, accel: Vector<f64, 3, ArrayRepr> }
+#[metor_fsw(name = "imu")]
+struct Imu { #[metor_fsw(timestamp)] timestamp: Timestamp, omega: f64, accel: f64 }
 ```
 
-Reconciliation with the existing standalone derives (**extend, don't fork**):
-- `#[derive(Frame)]` is sugar that calls the same code paths as the four individual derives;
-  the individual derives remain usable (cube-sat already stacks `AsVTable, Metadatatize,
-  IntoBytes`). Implement `Frame` by having its proc-macro emit the other four token streams
-  plus the `impl Frame` block (or, simpler, emit only `impl Frame` and require the user to
-  also derive the four — **open question Q2: bundle vs require**; the task asks for "one
-  annotation", so the bundling expansion is preferred).
-- `AsVTable` is **extended** (add `with_frame` wrap + `element_fields`), not replaced, so
-  existing `#[derive(AsVTable)]` users are unaffected unless they opt into `Frame`.
-- The macro crate keeps a single shared `Field`/attribute surface (§2.2) so all five derives
-  parse `#[metor_fsw(timestamp | nest | name | parent | component_id | max | group)]`
-  consistently.
+The individual derives remain usable standalone (a sub-frame element type, for instance,
+derives only `AsVTable` — see §4). `AsVTable` is shared, not forked: the only difference under
+`Frame` is the `with_frame` wrap (driven by passing `Some(FRAME_ID)` into the shared
+generator) and the timestamp suppression. The macro crate keeps one `Field`/attribute surface
+so every derive parses `#[metor_fsw(timestamp | nest | name | parent | component_id | max |
+group)]` consistently.
 
-### 2.5 Wiring checklist (mechanical)
+### 2.2 What each derive generates
 
-1. `macros/src/lib.rs`: add `mod componentize; mod decomponentize;`, `#[proc_macro_derive(
-   Componentize, attributes(metor_fsw))]`, `#[proc_macro_derive(Decomponentize, ...)]`, and a
-   `#[proc_macro_derive(Frame, ...)]` that emits the bundle.
-2. Extend `Field` (§2.2); add `component_id()`; thread `nest`/`max`.
-3. `metor-fsw/src/lib.rs`: re-export `Componentize`, `Decomponentize`, `Frame` from the macro
-   crate (the *traits* stay in `metor_proto::com_de` / the new `frame.rs`).
-4. New `metor-fsw-2` `frame.rs` defines the `Frame` trait (§1.2).
+| derive | generates | leaf field | nested / dynamic field |
+|--------|-----------|------------|------------------------|
+| `AsVTable` | `vtable_fields(path)` **and** `element_fields(prefix)` (§2.3) | recurse into the field type's `vtable_fields(path.chain(name))`, offset-shifted | same recursion; `FrameList`/`FrameMap` emit `Op::List`/`Op::Map` (§3.2) |
+| `Metadatatize` | `metadata(prefix)` | `prefix.chain(name).to_metadata()` | recurse / empty for dynamic types (§5) |
+| `Componentize` | `sink_columns(out)` + `MAX_SIZE` | `out.apply_value(id, self.f.as_component_view(), None)` | `self.f.sink_columns(out)` (a dynamic slot is a no-op) |
+| `Decomponentize` | `apply_value(id, view, ts)` | match `id == ID const` → `FromComponentView` | recurse |
+| `Frame` | the four above + `impl Frame` | — | — |
+
+A field recurses (rather than emitting a scalar leaf) when it is marked `#[metor_fsw(nest)]`
+or when its type is a `FrameList`/`FrameMap` (whose 8-byte slot carries no in-struct value).
+`Componentize::MAX_SIZE` is computed from the fixed size plus each dynamic field's budget
+(§3.5).
+
+### 2.3 `element_fields` — the dynamic member-template form
+
+`AsVTable` has two member iterators:
+
+1. `vtable_fields(path)` — the **static** form. Leaves are absolute
+   `component(path.chain(name).id)` ops, used when the type is reached through compile-time
+   struct nesting.
+2. `element_fields(prefix: String)` — the **dynamic member-template** form. Leaves are
+   `path_component(name)` ops with offsets relative to the element base and no absolute path
+   baked in, because the runtime path is composed by the enclosing `list`/`map` at realize
+   time. `prefix` is the dotted name of the value *relative to the element base* (empty at the
+   element root); it is taken by value so the returned iterator borrows no caller temporary.
+
+`element_fields` is defaulted to empty on the trait, so hand-written `AsVTable` impls (e.g. the
+nox spatial types) keep compiling; only types actually used as dynamic elements override it.
+The derive builds relative names with a `child(name)` closure (`prefix.field`, or just `field`
+at the root) and recurses through `<Ty>::element_fields(child(name))`.
 
 ---
 
-## 3. `FrameList<T>` / `FrameMap<K, V>` dynamic types
+## 3. Dynamic members: `FrameList` / `FrameMap`
 
-These are the Rust types a frame embeds to carry runtime-sized members. The decided dotted
-model: list elements are addressed positionally (`processes.0.pid`), map entries by a
-**name key** with **no `.`** (`processes.htop.pid`). Both are backed by the WP2 trailer.
+These are the types a frame embeds to carry runtime-sized members. Elements are addressed by
+dotted name: list elements positionally (`processes.0.pid`), map entries by a name key with no
+`.` (`processes.htop.pid`). Both live in the table trailer, after the fixed region.
 
-### 3.1 In-struct representation = the 8-byte slot (not the data)
+### 3.1 In-struct representation is the 8-byte slot
 
-The element data lives in the trailer **after** the fixed region, exactly as the landed
-`expand_dynamic` reads it. So inside the `#[repr(C)]` frame, a `FrameList`/`FrameMap` field
-**is the slot** — 8 bytes, `{ trailer_off: u32, byte_len: u32 }` — and nothing more:
+Inside the `#[repr(C)]` frame, a `FrameList`/`FrameMap` field **is** an 8-byte slot — a
+table-absolute offset to the element block in the trailer plus its byte length — and nothing
+more. Each is `#[repr(transparent)]` over `Slot`, so the field is exactly 8 bytes and stays
+trivially `IntoBytes`/`FromBytes`:
 
 ```rust
 #[repr(C)]
-pub struct FrameList<T, const MAX: usize> {
-    slot: Slot,            // { trailer_off: u32, byte_len: u32 }  (8 bytes, the WP2 slot)
-    _ty: PhantomData<T>,
-}
+pub struct Slot { pub trailer_off: u32, pub byte_len: u32 }   // 8 bytes
 
-#[repr(C)]
-pub struct FrameMap<K, V, const MAX: usize, const MAX_KEY: usize = 32> {
-    slot: Slot,
-    _kv: PhantomData<(K, V)>,
-}
+#[repr(transparent)]
+pub struct FrameList<T, const MAX: usize> { slot: Slot, _ty: PhantomData<T> }
 
-#[repr(C)]
-struct Slot { trailer_off: u32, byte_len: u32 }
+#[repr(transparent)]
+pub struct FrameMap<K, V, const MAX: usize, const MAX_KEY: usize = 32> { slot: Slot, _kv: PhantomData<(K, V)> }
 ```
 
-This keeps the frame `#[repr(C)]`/`IntoBytes` fixed-size (so it still fits the ring's
-fixed-shard fast path for the *static* part) while the variable data is appended past it.
-The const generics carry the **max cardinality** (and max key length for maps) so `MAX_SIZE`
-is computable (§3.4). `K` is a name-string key type (`&str`/`String`/a `Name` newtype),
-**not** a `ComponentId` — the DESIGN.md `FrameMap<ComponentId, Process>` sketch is superseded
-by the dotted-name decision in `vtable-dynamic.md §3`.
+Keeping the static part fixed-size means a frame with dynamic members still has a `#[repr(C)]`/
+`IntoBytes` fixed region; the variable data is appended past it. The const generics carry the
+**max cardinality** (`MAX`) and, for maps, the max key length (`MAX_KEY`, default 32), so
+`Componentize::MAX_SIZE` is a `const` (§3.5). Both default to an `EMPTY` slot
+(`trailer_off = 0, byte_len = 0`); construct a frame with `FrameList::EMPTY` / `FrameMap::EMPTY`
+and let the writer patch the slots.
 
-### 3.2 `AsVTable` for the dynamic types (emit `Op::List`/`Op::Map`)
+`K` is a name-key type, not a `ComponentId`. The `Name<'a>` newtype validates the grammar at
+construction (non-empty, no `.`); the tests use `FrameMap<Name<'static>, V, MAX>`.
 
-`FrameList<T, MAX>::vtable_fields(path)` emits **one** field — the slot — whose arg is the
-WP2 `list(prefix, members, stride)`:
+### 3.2 `AsVTable` for the dynamic types
+
+`FrameList<T, MAX>` emits exactly **one** field — the slot at offset 0 — whose arg is the
+`list(prefix, members, stride)` op:
 
 ```rust
 impl<T: AsVTable, const MAX: usize> AsVTable for FrameList<T, MAX> {
     fn vtable_fields(path: impl ComponentPath) -> impl Iterator<Item = FieldBuilder> {
         let prefix = path.to_name();                       // full static dotted prefix, e.g. "processes"
         core::iter::once(raw_field(
-            0, size_of::<Slot>() as u32,                   // the slot, offset patched by offset_by upstream
-            list(&prefix, T::element_fields(), size_of::<T>() as u32),
+            0, size_of::<Slot>() as u32,
+            list(&prefix, T::element_fields(String::new()), size_of::<T>() as u32),
         ))
+    }
+    fn element_fields(prefix: String) -> impl Iterator<Item = FieldBuilder> {
+        // Reached as a member template: name is the relative own name only.
+        core::iter::once(raw_field(0, size_of::<Slot>() as u32,
+            list(&prefix, T::element_fields(String::new()), size_of::<T>() as u32)))
     }
 }
 ```
 
-- `prefix` is the **full static dotted path** from root to this field (`path.to_name()`),
-  because `expand_dynamic` seeds the per-top-level-field `PathHasher` empty and pushes
-  `dynm.name` first. This is why the top-level list in the landed test uses `name = "processes"`.
-- `T::element_fields()` is the new **dynamic member-template** form of `AsVTable` (§4): the
-  members with `path_component` leaves and offsets relative to the element base. The
-  enclosing frame derive then `with_frame`/`with_timestamp`-wraps and `offset_by`-shifts the
-  slot field into the parent struct, exactly as it does for static fields.
+- When reached **statically**, the list's name is the **full dotted prefix** from root
+  (`path.to_name()`), because `expand_dynamic` seeds each top-level field's `PathHasher` empty
+  and pushes the dynamic name first. When reached as a **member template**, the name is the
+  field's own relative name only (§4).
+- The enclosing frame derive `with_frame`/`with_timestamp`-wraps and `offset_by`-shifts this
+  single slot field exactly as it does a static field.
+- `FrameMap` is identical but emits `map(prefix, V::element_fields(...), map_stride::<V>(),
+  map_value_offset::<V>())` — the entry stride and value offset of the entry layout (§3.3).
 
-`FrameMap` is identical but emits `map(prefix, V::element_fields(), stride, value_offset)`,
-where `stride`/`value_offset` come from the producer's chosen entry layout
-`{ key_off: u32, key_len: u32, <pad> value }` (§3.3); the derive computes
-`value_offset = align_up(8, align_of::<V>())` and `stride = value_offset + size_of::<V>()`.
+### 3.3 Trailer byte layout
 
-### 3.3 Producer side — writing a frame with dynamic members
+The table bytes are `LenPacket::table` bytes: an 8-byte header (`TABLE_BASE` = 4-byte length +
+1 ty + 2 id + 1 req_id), then the table itself. **Table offset 0 is the fixed-region start**;
+all slot `trailer_off`/map `key_off` values are table-absolute (relative to that start) — the
+one-global-trailer invariant, which holds across nesting. Each dynamic block is laid down
+**8-byte aligned** (matching the ring's `round_up8`).
 
-This is the hard part. A producing system fills the fixed region normally, then appends the
-trailer and patches each slot. Two layers:
+**List block.** Element bytes back-to-back at the (8-aligned) trailer offset. The slot is
+`{ trailer_off, byte_len = count * size_of::<T> }`; a reader recovers `count = byte_len /
+size_of::<T>`.
 
-**(a) Low-level byte writer (`FrameWriter`).** Wraps a growable buffer — a `LenPacket`
-(`push_aligned`, `extend_aligned`, `extend_from_slice`) or a `&mut [u8]` cursor. The fixed
-region is written first (the `#[repr(C)]` frame struct, slots zeroed); then for each dynamic
-field the writer lays down, **8-byte aligned** (consistent with the ring's `round_up8`/
-`frame_len` record alignment):
+**Map block.** A fixed-stride **entry array** followed by a **name pool**:
 
-- *List:* the element array back-to-back at the current trailer offset, then patches the
-  field's slot to `{ trailer_off, byte_len = count * stride }`.
-- *Map:* the fixed-stride entry array `{ key_off, key_len, <pad> value }` first (slot delimits
-  **just the entry array**, so `count = byte_len / stride` stays exact), then a **name pool**
-  of the key bytes back-to-back after the entry array; each entry's `key_off`/`key_len` point
-  table-absolute into that pool. Matches the landed §5b layout and the `read_slot`/`key_off`/
-  `key_len` reads in `expand_dynamic`.
+```
+entry[i] = { key_off: u32, key_len: u32, <pad to value_offset>, value: V }   // stride bytes
+...
+name pool: key bytes back-to-back; entry[i].key_off points table-absolute into here
+```
 
-Nested dynamics use **one global, table-absolute trailer** (the landed invariant): a nested
-list's slot lives inside its parent element's value region but points table-absolute into the
-same trailer, so the writer just keeps appending and patching. The writer must reject map
-keys containing `.` (the consumer already errors with `Error::InvalidComponentData`; the
-writer should fail earlier/louder).
+The slot delimits the **entry array only** (`{ entry_array_off, count * stride }`), so
+`count = byte_len / stride` stays exact even with the pool after it. Each `key_off` is
+table-absolute into the pool; `key_len` is the byte length. The entry geometry
+(`src/dynamic.rs`):
 
-**(b) Typed convenience (`FrameMap`/`FrameList` builder handles).** A producing system
-mutates a typed builder that records pending elements, then a single `finish`/`serialize`
-pass emits the bytes via `FrameWriter`:
+- `entry_align::<V>() = max(align_of::<V>(), 8)` — entries stay at least 8-aligned.
+- `map_value_offset::<V>() = align_up(8, entry_align::<V>())` — the value sits after the
+  `{ key_off, key_len }` pair (8 bytes for any value of alignment ≤ 8).
+- `map_stride::<V>() = align_up(map_value_offset + size_of::<V>, entry_align::<V>())`.
+
+For a 16-byte, 8-aligned `Process`, that is `value_offset = 8`, `stride = 24`. For a nested
+`Host` whose value is an inner 8-byte slot, `value_offset = 8`, `stride = 16` (the layout the
+nested test pins).
+
+### 3.4 Producer side — `FrameWriter`, `ListWriter`, `MapWriter`
+
+`FrameWriter<F>` (`src/writer.rs`) builds a frame's table bytes over a growable `LenPacket`. It
+writes the fixed `#[repr(C)]` region first (slots zeroed), then for each dynamic field appends
+its 8-aligned block to the trailer and patches the slot:
 
 ```rust
-let mut w = FrameWriter::<SysFrame>::new(&mut packet);   // packet: LenPacket
-w.timestamp(now);
-w.list_field(field!(SysFrame::processes), |l| {          // l: ListWriter<Process>
-    for p in live { l.push(p); }                          // Process: IntoBytes element
+let frame = SysList { timestamp: Timestamp(1000), processes: FrameList::EMPTY };
+let mut w = FrameWriter::new(&frame);                       // seeds the fixed region
+w.list(offset_of!(SysList, processes), |l| {                // l: &mut ListWriter<Process>
+    l.push(Process { pid: 1001, cpu_usage: 0.5 });
+    l.push(Process { pid: 1002, cpu_usage: 0.25 });
 });
-w.map_field(field!(SysFrame::hosts), |m| {               // m: MapWriter<&str, Host>
-    for (name, h) in hosts { m.insert(name, h); }         // rejects '.' in name
-});
-let bytes = w.finish();                                   // fixed region + trailer, slots patched
+let table = w.table();                                      // &[u8]: fixed region + trailer, slots patched
+SysList::as_vtable().apply(table, &mut sink).unwrap().unwrap();
 ```
 
-The static-only case is unchanged: if a frame has no dynamic fields the writer just emits the
-`#[repr(C)]` bytes (zero trailer), so it stays on the existing fixed-shard fast path.
+API surface:
 
-### 3.4 `MAX_SIZE` / max-cardinality declaration
+- `FrameWriter::new(fixed: &F)` allocates a `LenPacket::table([0, 0], F::MAX_SIZE.min(1 << 16))`
+  and copies `fixed.as_bytes()` after the table base.
+- `FrameWriter::from_packet(packet, fixed)` reuses an existing `LenPacket` (cleared back to the
+  table base) instead of allocating a fresh one — the per-write pooling path used by
+  `Output::write_with` to avoid a malloc+free on every dynamic publish. The cleared buffer is
+  byte-equivalent to a fresh `LenPacket::table([0, 0], _)`.
+- `list(slot_off, build)` — `build` drives a `ListWriter<T>` (`push`, `len`, `is_empty`); the
+  writer 8-aligns, appends the element bytes, and patches the slot at `slot_off` (obtained with
+  `core::mem::offset_of!`).
+- `map(slot_off, build) -> Result<(), WriteError>` — `build` drives a `MapWriter<V>` (`insert`).
+  The writer 8-aligns, lays the entry array (each entry zeroed, `key_off`/`key_len` set, value
+  copied at `value_offset`), then appends the name pool; it patches the slot to the entry array
+  only. Keys are validated on `insert` and the first rejection is surfaced here as
+  `Err(WriteError::DotInKey | EmptyKey)`.
+- `finish() -> LenPacket` returns the backing packet; `table() -> &[u8]` returns the table bytes
+  (offset 0 at the fixed region) — feed either to `VTable::apply` or to the ring.
 
-Output ring buffers must be sized at construction, but dynamic frames are runtime-sized. We
-bound them with the const generics + the `#[metor_fsw(max = N)]` attribute, surfaced through
-`Componentize::MAX_SIZE`:
+The static-only case needs none of this: a frame with no dynamic fields has its `#[repr(C)]`
+bytes equal to its table bytes, so it is written directly.
+
+**Through a port (`src/port.rs`).** `Output<F>` wraps the single ring `Writer` a system owns:
+
+```rust
+out.write(&fixed_frame)?;                                   // fixed: one try_write, no serialize
+out.write_with(&fixed, |fw: &mut FrameWriter<F>| {          // dynamic: build trailer, write one record
+    fw.list(offset_of!(F, processes), |l| { /* ... */ });
+})?;
+```
+
+`write_with` keeps a reused `LenPacket` scratch buffer across calls (via `from_packet`) so a
+per-cycle dynamic publish does not reallocate.
+
+### 3.5 `MAX_SIZE` and buffer sizing
+
+Output rings are sized at construction, but dynamic frames are runtime-sized, so the const
+generics bound them. `Componentize::MAX_SIZE` (generated by the derive) is:
 
 ```
-MAX_SIZE(frame) = size_of::<FixedRegion>()
-                + Σ_lists ( MAX_i * stride_i )
-                + Σ_maps  ( MAX_j * stride_j  +  MAX_j * MAX_KEY_j )   // entries + name pool
-                + alignment padding (8-byte)
+MAX_SIZE(frame) = size_of::<Self>()                    // fixed region (already includes every 8-byte slot)
+                + Σ_dynamic  <Field>::MAX_SIZE          // each list/map trailer budget
+                + 8                                     // alignment pad
 ```
 
-`FrameList<T, MAX>` / `FrameMap<K, V, MAX, MAX_KEY>` make `MAX` part of the type, so the
-finished `Componentize` derive computes `MAX_SIZE` as a `const` expression. The coordinator
-sizes the system's output ring to `MAX_SIZE` (rounded up via the ring's `frame_len`). If a
-producer ever exceeds its declared `max`, the writer truncates and telemeters a health error
-(systems report health as telemetry; DESIGN.md §Systems) rather than overflowing the buffer.
+where the dynamic types contribute:
 
-### 3.5 Consumer side — reading elements
+```
+FrameList<T, MAX>::MAX_SIZE          = round_up8( MAX * size_of::<T>() )
+FrameMap<K, V, MAX, MAX_KEY>::MAX_SIZE = round_up8( MAX * map_stride::<V>() + MAX * MAX_KEY )   // entries + name pool
+```
 
-Consumers reuse the **landed** realization unchanged. There are two access modes:
+Worked (the `max_size_formula` test): a frame with `procs: FrameList<Process, 8>` and
+`hosts: FrameMap<Name, Process, 4, 16>` is `24` fixed `+ 128` list `+ 160` map `+ 8` pad =
+`320` bytes. `buffer_capacity::<F>(depth)` / `capacity_for(max_size, depth)` (`src/port.rs`)
+round this up through the ring's `frame_len` to a power-of-two ring capacity.
 
-- **Sink / flat (db, UI, most systems):** call `vtable.apply(table_bytes, &mut sink)`. The
-  landed `expand_dynamic` walks the slot → entry array → name pool, composes the dotted id
-  via `PathHasher`, and pushes each element-member through `Decomponentize::apply_value`
-  exactly like a static component. db/UI need **zero** value-path changes — a dynamic frame is
-  just a runtime-variable *set* of ordinary components (vtable-dynamic.md §6.4).
-- **Typed by index/key:** a consumer that wants `FrameList<T>`/`FrameMap<K, V>` ergonomics
-  uses a thin reader that reads the slot from the fixed struct, derives `count`, and for a
-  list indexes `trailer[trailer_off + i*stride ..]` as `T`, for a map scans entries and
-  matches `key`. This reader is a presentation convenience over the same bytes; the
-  authoritative semantics (including dotted ids, frame/timestamp inheritance, `.`-in-key
-  rejection) are the landed `RealizedField`/`ElementKey` path, which the reader can also use
-  via `realize_fields(Some(bytes))` and the `frame`/`element` fields on each `RealizedField`.
+The const generic on the type is the source of truth for `MAX`. `#[metor_fsw(max = N)]` is
+accepted on the field for forward-compatibility but is not consulted by the derives.
 
----
+### 3.6 Consumer side — flat `apply` and typed readers
 
-## 4. Nested dynamics support at the type level
+Two access modes, over the same bytes:
 
-Nesting (`processes.htop.threads.3.state`) is already correct at the **vtable/realize** level
-(landed `test_dynamic_nested`). WP3's job is to make the **derives** emit those nested ops
-naturally. The mechanism is a second derive output: `element_fields()`.
+**Flat (db, UI, most systems).** `vtable.apply(table_bytes, &mut sink)` — or `FrameRef::apply`
+— walks the slot → entry array → name pool, composes the dotted id via `PathHasher`, inherits
+the frame id and timestamp, and pushes each element-member through `Decomponentize::apply_value`
+exactly like a static component. A dynamic frame is just a runtime-variable *set* of ordinary
+components; consumers on this path need no dynamic-specific code.
 
-`#[derive(AsVTable)]` (extended) generates two member iterators:
+**Typed by index/key.** `FrameRef<'a, F>` (`src/port.rs`) is a zero-copy view of one record's
+table bytes:
 
-1. `vtable_fields(path)` — *static* form, leaves are `component(path.chain(name).id)`. Used
-   when the type is reached through compile-time struct nesting.
-2. `element_fields()` — *dynamic member-template* form, leaves are `path_component(name)`
-   with offsets **relative to the element base** (no `path` prefix baked in, because the
-   runtime path is composed by the enclosing `list`/`map` at realize time). Used when the
-   type is the element of a `FrameList`/`FrameMap`.
+- `get() -> &F` reads the fixed `#[repr(C)]` region directly (`ref_from_prefix`) — the producer
+  wrote `fixed.as_bytes()` there, so no per-field decode.
+- `list::<T>(slot_off) -> ListReader<'a, T>` and `map::<V>(slot_off) -> MapReader<'a, V>` read
+  the slot at `slot_off` and index/scan the trailer.
+- `apply::<D>(sink)` is the uniform escape hatch onto the vtable path above.
 
-Composition rules (matching the landed tests):
-- A leaf scalar member → `path_component(name)` in `element_fields()`.
-- A nested **static** struct member → recurse `<Ty>::element_fields()` with the member name
-  pushed onto the relative path and offsets shifted by the member offset.
-- A nested **dynamic** member (`FrameList`/`FrameMap`) → emit `list(field_name, ...)` /
-  `map(field_name, ...)` with the **relative** field name only (e.g. `"threads"`), because the
-  parent dynamic path (`processes.htop`) is accumulated at runtime. This is exactly the
-  `host_members()`/`thread_members()` shape in `test_dynamic_nested`.
-
-Key distinction, stated once: a dynamic field reached **statically** uses its **full dotted
-prefix** as the `Op::List`/`Op::Map` name (`path.to_name()`); a dynamic field reached as a
-**member template** uses only its **own field name**. Both then rely on the landed
-`PathHasher`-by-value threading in `walk_field`/`expand_dynamic`. Depth is bounded by the
-landed `MAX_DYNAMIC_DEPTH = 8`.
+`ListReader` (`src/reader.rs`) derives `len = byte_len / size_of::<T>()` and reads element `i`
+at `trailer_off + i * size_of::<T>()`. `MapReader` derives `len = byte_len / map_stride::<V>()`,
+reads each entry's `key_off`/`key_len` (resolving the key in the pool) and the value at
+`map_value_offset::<V>()`, and offers `entry(i)`, `get(key)`, and `iter()`. These readers are a
+presentation convenience; the authoritative dotted-id/frame/timestamp semantics remain the
+`apply` path.
 
 ---
 
-## 5. Metadata emission for dynamic names
+## 4. Nested dynamics and the prefix rule
 
-Static members already get one `ComponentMetadata` each from the `Metadatatize` derive
-(`prefix.chain(name).to_metadata()` → `SetComponentMetadata`). Dynamic members can't be
-enumerated at compile time, so the **producer emits metadata lazily, once per newly-seen
-key**, on the existing metadata channel:
+Nesting (`processes.htop.threads.0.state`) is handled by the derives emitting the right ops; the
+realize side (`expand_dynamic`) walks it unchanged, bounded by `MAX_DYNAMIC_DEPTH = 8`. The
+load-bearing rule, exercised by `nested_dynamic_prefix_rule`:
 
-- The frame writer (§3.3) tracks the set of keys/indices it has already announced (per
-  dynamic field). On first sight of a new key `"htop"` (or a new max index for a list), it
-  emits, for each member-template (and nested member) of that element, a `ComponentMetadata`
-  whose `name` is the composed dotted string (`processes.htop.pid`, `processes.htop.cpu_usage`,
-  …) and whose `component_id` is its hash.
-- This reuses `ComponentMetadata::with_prefix` (`format!("{prefix}.{name}")` + rehash): take
-  each member-template's static metadata (`pid`, `cpu_usage`, produced by the element type's
-  `Metadatatize`) and apply prefix `processes.htop`. The full `String` is built here, on the
-  cold "new key" path — never per sample.
-- Wire format: `SetComponentMetadata(ComponentMetadata)` (`wkt/src/msgs.rs`), the same
-  channel db/UI already consume for id→name resolution, so `processes.htop.pid` displays with
-  no new mechanism.
+- A dynamic field reached **statically** uses its **full dotted prefix** (`path.to_name()`) as
+  the `Op::List`/`Op::Map` name.
+- A dynamic field reached as a **member template** (the element type of an enclosing list/map)
+  uses only its **own relative field name** — the parent dynamic path (`processes.htop`) is
+  accumulated at runtime by the enclosing op.
 
-The set of member-templates to expand is available from `vtable.realize_fields(None)` /
-`element_fields()` (registration mode emits each template once with `view = None`,
-`frame = Some`), so the producer can derive "which members exist under this prefix" directly
-from the vtable without hand-maintaining a list.
+Composition in `element_fields` (matching the test):
 
-Open: metadata can burst at startup (many keys at once) — batching/rate-limiting is
-Q (carried from vtable-dynamic.md §9.8). Eviction of stale keys (short-lived PIDs) is Q
-(vtable-dynamic.md §9.6).
+- a leaf scalar member → `path_component(name)`;
+- a nested **static** struct member → recurse `<Ty>::element_fields(prefix.field)`, offsets
+  shifted by the member offset;
+- a nested **dynamic** member (`FrameList`/`FrameMap`) → emit `list`/`map` named by the
+  **relative** field name only (e.g. `"threads"`).
 
----
+The `nested_dynamic_prefix_rule` test constructs the exact trailer for
+`SysNested { processes: FrameMap<Name, Host, 4> }` where `Host { threads: FrameList<Thread, 4> }`,
+and asserts `apply` yields `processes.htop.threads.0.state` with the shared frame timestamp.
+Its byte layout is the contract:
 
-## 6. Reused vs. new
-
-| Concern | Reused (landed) | New in WP3 |
-|---------|-----------------|------------|
-| Dotted-name hashing | `PathHasher`, `ComponentPath::hash_into`, `ChainPath` | — |
-| Frame identity op | `Op::Frame`, `RealizedField::frame`, `frame()` builder | `FieldBuilder::with_frame` helper; frame derive wraps each field |
-| Dynamic ops | `Op::{List, Map, PathComponent}`, `ElementFields`, `list`/`map`/`path_component`/`name` builders, `VTableBuilder::visit_members` | — |
-| Realization | `for_each_field`, `walk_field`, `expand_dynamic`, `read_slot`, `RealizedField::{frame, element}`, `ElementKey`, `MAX_DYNAMIC_DEPTH` | — |
-| `AsVTable` | `vtable_fields(path)`, `with_timestamp`, `offset_by`, the `as_vtable.rs` derive | add `element_fields()` (dynamic member-template form); `with_frame` wrap; `AsVTable for FrameList/FrameMap` |
-| `Metadatatize` | the `metadatatize.rs` derive, `ComponentMetadata::with_prefix`, `SetComponentMetadata` | lazy per-key metadata emission in the producer |
-| `Componentize`/`Decomponentize` | the *traits* (`metor_proto::com_de`), `AsComponentView`/`FromComponentView`, the **unexported** `componentize.rs`/`decomponentize.rs` | finish (`Field.nest`/`component_id()`), register derives, real `MAX_SIZE`, re-export |
-| `Frame` | `Component`/`Timestamp`/`ComponentId` types | the `Frame` **trait** + `#[derive(Frame)]` bundle |
-| Dynamic data types | the WP2 trailer layout + slot semantics | `FrameList<T, MAX>` / `FrameMap<K, V, MAX, MAX_KEY>` Rust types + `FrameWriter`/`ListWriter`/`MapWriter` producer API + typed index/key reader |
-| Buffer sizing | ring `frame_len`/`round_up8`, `LenPacket` | `MAX_SIZE` formula from const-generic cardinalities + `#[metor_fsw(max)]` |
-
-Genuinely new code is concentrated in: the `frame.rs` trait, the macro-crate finishing/wiring,
-`FrameList`/`FrameMap` + their `AsVTable`/`Componentize` impls, and the `FrameWriter` producer
-API. Everything below the vtable line is reuse.
+```
+@0   timestamp i64 = 1000
+@8   slot_outer.trailer_off = 16
+@12  slot_outer.byte_len    = 16          // one 16-byte map entry
+@16  entry[0].key_off = 40                // -> "htop" in the pool
+@20  entry[0].key_len = 4
+@24  Host value (entry@16 + value_offset 8): inner list slot
+@24  slot_inner.trailer_off = 44
+@28  slot_inner.byte_len    = 1           // one 1-byte Thread
+@32  (pad to 40)
+@40  "htop"                               // name pool
+@44  thread[0].state = 2
+```
 
 ---
 
-## 7. Open questions / risks for the reviewer
+## 5. Metadata for dynamic names
 
-1. **Q1 — timestamp field as a component?** Should the `#[metor_fsw(timestamp)]` field be
-   emitted as a standalone component (`imu.timestamp`) in addition to being the timestamp
-   *source*, or suppressed? The current `AsVTable` derive emits all fields; frames may want to
-   suppress the duplicate. Affects db schema and the `Frame::timestamp` accessor.
-2. **Q2 — `#[derive(Frame)]` bundling.** Expand `Frame` into the four sub-derives (one
-   annotation, the task's stated goal) vs. require the user to also derive the four and have
-   `Frame` emit only `impl Frame`? Bundling is more ergonomic but risks attribute/order
-   surprises with `IntoBytes`/`Immutable`. Preference?
-3. **Q3 — `FrameWriter` over `LenPacket` vs `&mut [u8]`.** The producer write API: build on the
-   growable `LenPacket` (matches the ring path, allocates/extends) or a fixed `&mut [u8]`
-   cursor sized by `MAX_SIZE` (no growth, bounded, but needs exact pre-sizing)? The streaming
-   `DynamicFrameTable` (vtable-dynamic.md §8.6) leans toward `LenPacket`.
-4. **Q4 — const-generic cardinality ergonomics.** `FrameList<T, MAX>` / `FrameMap<K, V, MAX,
-   MAX_KEY>` make max-size computable but clutter the type (DESIGN.md shows bare
-   `FrameList<Process>`). Alternative: keep the type bare and carry `max` only via
-   `#[metor_fsw(max = N)]`, computing `MAX_SIZE` from the attribute. Which is the source of
-   truth — the type or the attribute?
-5. **Q5 — map key type `K`.** Settle on a single key type: `&str`/`String`, or a `Name`
-   newtype that enforces "no `.`" at construction. Enforcement point: writer-time (loud) and
-   already realize-time (`InvalidComponentData`). Do we also forbid empty keys (they'd vanish
-   per `PathHasher`'s empty-segment rule, aliasing `processes..pid`)?
-6. **Q6 — `MAX_SIZE` for maps.** The name-pool budget `MAX * MAX_KEY` can dominate; is a single
-   shared/deduped name pool worth the complexity (vtable-dynamic.md §9.4)? And how is the
-   per-frame fixed-region alignment padding accounted so the coordinator never under-sizes?
-7. **Q7 — metadata burst / key churn.** Lazy per-key metadata (and lazy db component
-   registration, vtable-dynamic.md §8.5) grow unboundedly with churning keys (short-lived
-   PIDs). Need a TTL/eviction or "hidden after N idle ticks" policy, and possibly batched
-   `SetComponentMetadata` at startup (Q from §5).
-8. **Q8 — `element_fields()` placement.** Should the dynamic member-template form live on the
-   `AsVTable` trait (extra required method, default-implemented in terms of the static form
-   where possible) or a separate `AsElementVTable` trait? Extra trait keeps `AsVTable` clean
-   but adds a bound on every `FrameList<T>`.
-9. **Q9 — nested static-vs-dynamic prefix rule.** The "full dotted prefix when reached
-   statically, own-name-only when reached as a member template" rule (§4) is load-bearing and
-   currently implicit in the tests. Confirm it is the contract, and that
-   `realize_fields(None)` registration mode composes the registration ids consistently for
-   nested dynamics.
+Static members each get one `ComponentMetadata` from the `Metadatatize` derive
+(`prefix.chain(name).to_metadata()` → `SetComponentMetadata`), so db/UI resolve their dotted
+ids with no extra mechanism.
+
+Dynamic members cannot be enumerated at compile time: `Metadatatize for FrameList`/`FrameMap`
+returns an empty iterator. The intended model is that the **producer announces a dynamic
+member's metadata lazily, once per newly-seen key**, by composing each element member-template's
+name under the live prefix (`processes.htop.pid`, …) — `ComponentMetadata::with_prefix` rehashes
+a member-template's static metadata under `processes.htop` — and emitting it on the same
+`SetComponentMetadata` channel db/UI already consume. The set of member-templates to expand is
+recoverable from the vtable (`element_fields` / `realize_fields(None)` registration mode), so it
+need not be hand-maintained.
+
+**Limitation:** this lazy per-key emission is a producer responsibility that the `FrameWriter`
+does not yet implement (it does not track seen keys or emit metadata). Until it does, a dynamic
+member's dotted ids carry no id→name record. Related open behavior: metadata can burst at
+startup when many keys appear at once (batching/rate-limiting), and stale keys (e.g. short-lived
+PIDs) are not evicted.
+
+---
+
+## 6. Other limitations and future work
+
+- **`[T; N]` representation split.** The in-process `Componentize`/`Decomponentize` path treats
+  a `[T; N]` field as one component of prim `T`, shape `[N]` (via
+  `AsComponentView`/`FromComponentView`). The byte-level vtable/`apply` path, via the blanket
+  `AsVTable for [T; N]` (`metor-fsw/src/vtable.rs`), expands it into `N` **indexed scalar**
+  components (`arr.v.0`, `arr.v.1`, `arr.v.2`). The two paths therefore disagree on naming for
+  plain arrays — `array_field_frame_round_trip` pins both halves. For a single shape-`[N]`
+  component on both paths, use a nox `Vector`/`Quaternion` instead.
+- **Dynamic-member metadata** is not emitted by the producer yet (§5).
+- **`FrameWriter` backing** is the growable `LenPacket` only; there is no fixed `&mut [u8]`
+  cursor variant.

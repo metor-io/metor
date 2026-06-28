@@ -1,254 +1,208 @@
-# Work-Package 2 — VTable extensions (frames + dynamic components)
+# Dynamic frames & the VTable op set
 
-Status: **design only, pre-implementation**. Reviewer sign-off required before any code lands.
+A `metor-fsw-2` system publishes its output as a `#[repr(C)]` table plus a **VTable**
+describing it. The VTable is the same self-describing artifact `metor-db` ingests
+(`VTableMsg` → `insert_vtable` → `realize_fields`), so a frame "serializes" with no extra
+step: the producer fills a struct, hands over the bytes plus its VTable, and the
+coordinator (for wiring/validation) and `metor-db` (for storage) both interpret it through
+one mechanism.
 
-This document designs additions to the `metor-proto` VTable op set so that
-`metor-fsw-2` can describe (1) **frames** — timestamped groups of components named by a
-`ComponentId` — and (2) **runtime-dynamic** list/map fields whose data lives in a padded
-trailer after the fixed portion of a table, including **nested** dynamic fields.
-
-> Revision note (post-review): dynamic element identity is now **fully-qualified dotted
-> names hashed exactly like every other component** (`ComponentId::new("processes.htop.pid")`)
-> — *not* a folded/synthetic hash. Dynamic-frame **streaming** and **nested dynamics** are
-> **in scope for v1**. Sections 3–9 reflect those decisions.
-
-Relevant existing code:
-- `libs/metor-proto/src/vtable.rs` — `Op`, `Field`, `VTable`, `OpRef`, `Offset`,
-  `realize`, `realize_fields`, `apply`, the `builder` module, `_ASSERT_OP_SIZE`.
-- `libs/metor-proto/src/com_de.rs` — `Componentize` / `Decomponentize`.
-- `libs/metor-proto/src/types.rs` — `ComponentId` (fnv1a, top bit masked), `PrimType`,
-  `ComponentView`, `Timestamp`.
-- `libs/metor-fsw/src/path.rs` — `ComponentPath` / `ChainPath`; the dotted-name hashing
-  and the `// TODO: chain hash functions` we factor out here.
-- `libs/metor-proto/wkt/src/metadata.rs` — `ComponentMetadata` (+ `with_prefix`), the
-  id→name channel.
-- `libs/db/src/vtable_stream.rs`, `libs/db/src/lib.rs` (`insert_vtable`), `libs/db/src/main.rs`
-  (`GenCpp`), `libs/db/cpp/vtable.hpp` — db consumers that `match` on `Op`/`RealizedOp`.
+Most frame members are ordinary, fixed-offset components. This document describes the part
+of the model that is **runtime-sized**: list/map members whose element data lives in a
+padded trailer after the fixed portion of a table, including **nested** dynamic members.
+These are described with four VTable ops — `Frame`, `List`, `Map`, `PathComponent` — and a
+shared rolling path-hasher, all defined in `metor-proto` (`libs/metor-proto/src/vtable.rs`,
+`libs/metor-proto/src/hash.rs`). `metor-fsw-2` consumes them through the
+[`FrameList`]/[`FrameMap`] field types ([`src/dynamic.rs`](../src/dynamic.rs)), the
+[`FrameWriter`] producer ([`src/writer.rs`](../src/writer.rs)), the wiring/compatibility
+check ([`src/descriptor.rs`](../src/descriptor.rs)), and the dlopen prefix rewrite
+([`src/abi/mod.rs`](../src/abi/mod.rs)).
 
 ---
 
-## 1. Purpose & the symmetry with metor-db
+## 1. The VTable op model
 
-A `metor-fsw-2` system publishes its output as a `repr(C)` table plus a VTable that
-describes it. That VTable is the *same* artifact metor-db already ingests
-(`VTableMsg` → `insert_vtable` → `realize_fields`), so a frame "serializes" with no extra
-step: the producer fills a struct, hands over the bytes plus its VTable, and both the
-coordinator (for wiring/validation) and metor-db (for storage) interpret it through one
-mechanism. Reusing the VTable op set — rather than inventing a second self-describing
-format — is the core symmetry of the framework. The op set must grow to cover what frames
-need that plain component tables do not: a **frame identity** and **dynamic
-(runtime-sized) members** that still resolve to ordinary, dotted-named components.
-
-### Recap of the current model
+A VTable is `{ ops, fields, data }`:
 
 - `ops: Vec<Op>` is a flat pool; `OpRef(u32)` indexes it. Sub-parts of an op are always
-  `OpRef`s, never inline payloads — this keeps `Op` small.
+  `OpRef`s, never inline payloads — this keeps `Op` small (`size_of::<Op>() <= 64`, asserted
+  by `_ASSERT_OP_SIZE`).
 - `Field { offset: Offset, len: u32, arg: OpRef }`. `offset`/`len` address the **runtime
   table**; `arg` is the head of an **op chain**.
-- `realize(op_ref, table)` evaluates one op into a `RealizedOp`. `Data` reads the VTable's
-  own `data` buffer (static side-table); `Table` reads the runtime `table` argument.
-- `realize_fields(table)` walks each field's chain in a loop: `Schema` records ty+dim,
-  `Timestamp` records the timestamp, `Ext` passes through, and `Component` **terminates**,
-  emitting a `RealizedField { component_id, shape, ty, offset, view, timestamp }`.
-- `apply` drives `realize_fields(Some(table))` and pushes each `RealizedField` into a
-  `Decomponentize` sink via the flat `apply_value(component_id, view, timestamp)`.
+- `data: Vec<u8>` is a static side-table holding constants (component ids, schema `ty`/`dim`
+  blobs, UTF-8 names), addressed by `Op::Data`.
 
-The extensions are expressed as **new ops in the chain / new chain terminals**, reusing
-this loop.
+`realize(op_ref, table)` evaluates one op into a `RealizedOp`: `Op::Data` reads the VTable's
+own `data` buffer; `Op::Table` reads the runtime `table` argument. Realizing a whole VTable
+walks each field's op chain: metadata ops (`Schema`, `Timestamp`, `Frame`, `Ext`) record
+state and continue at `arg`; terminal ops (`Component`, `PathComponent`, `List`, `Map`) end
+the chain and emit one or more `RealizedField`s. The dynamic members are expressed entirely
+as **new ops in the chain / new chain terminals**, reusing this loop.
 
 ---
 
 ## 2. Frame identity — `Op::Frame { component_id, arg }`
 
-(Recommendation from the first revision; **unchanged**.)
-
 A frame is a group of fields that share a timestamp and are collectively named by a frame
-`ComponentId`. We express "this field belongs to frame X" with a metadata op in the
-field's chain — like `Timestamp`. All fields of the frame reference the same `Frame` op
-(dedup by `OpRef`), so the id is stored once. Chosen over adding a `frame` field to
-`Field` (breaks the struct's `repr(C)`/postcard/C++ ABI) or a top-level `VTable` change.
-The realize loop carries `frame: Option<ComponentId>` and emits it on `RealizedField`
-(new field). Old VTables have no `Frame` op ⇒ `frame: None`, identical to today.
+`ComponentId`. "This field belongs to frame X" is expressed with a metadata op in the
+field's chain, exactly like `Timestamp`. All fields of a frame reference the same `Frame`
+op (deduplicated by `OpRef`), so the id is stored once.
 
-`Frame` is orthogonal to the dynamic-naming machinery below: static frames keep using
+`Frame` is a metadata op: `realize` resolves `component_id` (a `Data` op holding the
+`ComponentId`) and returns `RealizedFrame { component_id, arg }`; the realize loop records
+`frame = Some(component_id)` and continues at `arg`. Each emitted `RealizedField` carries
+`frame: Option<ComponentId>`. A VTable with no `Frame` op yields `frame: None`.
+
+This keeps the grouping key out of the `Field` struct (which would break its
+`repr(C)`/postcard/C++ ABI) and off the top-level `VTable`. The builder exposes it as
+`FieldBuilder::with_frame(component_id)`, mirroring `with_timestamp`; the `Frame` trait
+([`src/frame.rs`](../src/frame.rs)) supplies `FRAME_ID = ComponentId::new(NAME)`.
+
+`Frame` is orthogonal to the dynamic-naming machinery: static frames keep using
 compile-time-hashed `Component` ids; `Frame` only adds the grouping key.
 
 ---
 
 ## 3. Dynamic identity model — fully-qualified dotted names
 
-### The rule
-
-Every dynamic element-member resolves to an **ordinary component** whose name is the
-field path prefix, joined with the key/index, joined with the member name:
+Every dynamic element-member resolves to an **ordinary component** whose name is the field
+path prefix, joined with the key/index, joined with the member name:
 
 | shape | example component name | ComponentId |
 |-------|------------------------|-------------|
 | `FrameMap<Name, Process>` | `processes.htop.pid`  | `ComponentId::new("processes.htop.pid")` |
 | `FrameList<Process>`      | `processes.0.pid`     | `ComponentId::new("processes.0.pid")` |
-| nested (list of map)      | `processes.htop.threads.3.state` | `ComponentId::new("processes.htop.threads.3.state")` |
+| nested (map of list)      | `processes.htop.threads.3.state` | `ComponentId::new("processes.htop.threads.3.state")` |
 
-The id is **just the fnv1a hash of the full dotted string**, top bit masked, exactly like
-`ComponentId::new` and exactly like the static dotted names the `path.rs` derive already
-produces. There is **no new hashing scheme and no new sink method**:
-`Decomponentize::apply_value(component_id, view, timestamp)` is unchanged, so db and UI
-need zero value-path changes. A dynamic frame simply emits a runtime-variable *set* of
-ordinary components.
+The id is the fnv1a-64 hash of the full dotted string, top bit masked — exactly like
+`ComponentId::new` and exactly like the static dotted names the `metor-fsw` derive produces.
+There is no separate hashing scheme and no new sink method:
+`Decomponentize::apply_value(component_id, view, timestamp)` is unchanged, so `metor-db` and
+the UI need zero value-path changes. A dynamic frame simply emits a runtime-variable *set*
+of ordinary components.
 
 ### Where each name segment comes from
 
 | segment | example | when known | stored where |
 |---------|---------|-----------|--------------|
-| **prefix** | `processes` | compile time | string in the VTable `data` buffer, referenced by the `List`/`Map` op's `name: OpRef` |
-| **member name** | `pid` | compile time | string in `data`, referenced by the leaf terminal `PathComponent { name: OpRef }` |
-| **map key** | `htop` | **runtime** | UTF-8 in the **trailer** (see §3.2) |
+| **prefix** | `processes` | compile time | UTF-8 in the VTable `data` buffer, referenced by the `List`/`Map` op's `name: OpRef` |
+| **member name** | `pid` | compile time | UTF-8 in `data`, referenced by the leaf terminal `PathComponent { name: OpRef }` |
+| **map key** | `htop` | **runtime** | UTF-8 in the table **trailer** (§5.2) |
 | **list index** | `0`, `3` | runtime (positional) | not stored — the element ordinal, formatted as decimal at realize time |
 
-Compile-time segments live as `Data` ops (the existing `data` side-table; the "names
-side-table" is just `Data` ops holding UTF-8, align 1 — no new buffer, no change to
-`heapless` bounds). Runtime segments are produced by the `List`/`Map` expansion.
+Compile-time segments are `Data` ops holding UTF-8 (align 1) in the existing `data`
+side-table — no new buffer. Runtime segments are produced by the `List`/`Map` expansion.
 
-### 3.1 Chained (rolling) hashing — no full-string alloc on the hot path
+### 3.1 `PathHasher` — chained hashing, no full-string allocation
 
-fnv1a is a rolling hash: `h = OFFSET_BASIS_64; for b in bytes { h = (h ^ b).wrapping_mul(PRIME_64) }`
-(`const-fnv1a-hash` constants `0xcbf29ce484222325` / `0x00000100000001B3`).
-`ComponentId::new(s)` is this over `s.as_bytes()` with the final `& !(1 << 63)` Lua/i64
-mask. Because it is a pure left-fold, feeding `"processes"`, then `"."`, then `"htop"`,
-then `"."`, then `"pid"` in sequence yields **byte-for-byte** the same accumulator as
-hashing the literal `"processes.htop.pid"`.
+fnv1a-64 is a rolling hash:
+`h = OFFSET_BASIS; for b in bytes { h = (h ^ b).wrapping_mul(PRIME) }`
+(constants `0xcbf29ce484222325` / `0x00000100000001B3`). `ComponentId::new(s)` is this fold
+over `s.as_bytes()` with a final `& !(1 << 63)` top-bit mask (keeping the id `i64`/Lua-safe).
+Because the fold is left-associative, feeding `"processes"`, then `"."`, then `"htop"`, then
+`"."`, then `"pid"` in sequence yields **byte-for-byte** the same accumulator as hashing the
+literal `"processes.htop.pid"`.
 
-We factor a small rolling hasher into `metor-proto` and **share it with `path.rs`**
-(resolving its `// TODO: we can do this without an alloc by chaining hash functions`):
+`PathHasher` (`metor-proto/src/hash.rs`) is the rolling hasher, shared with the static
+`ComponentPath`/`ChainPath` derive in `metor-fsw` (via `ComponentPath::hash_into`) so static
+and dynamic paths produce bit-identical ids:
 
 ```rust
-// metor-proto
-pub struct PathHasher(u64); // seeded with FNV_OFFSET_BASIS_64
+pub struct PathHasher { hash: u64, has_content: bool }
 
 impl PathHasher {
-    pub const fn new() -> Self { Self(0xcbf2_9ce4_8422_2325) }
-    /// Append one dotted segment. Replicates ChainPath's empty-segment rule:
-    /// a leading/empty segment emits no separator (so "" + "a" == "a").
-    pub fn push(&mut self, seg: &str) { /* feed '.' if non-first & seg non-empty, then seg bytes */ }
-    pub fn finish(self) -> ComponentId { ComponentId(self.0 & !(1 << 63)) }
+    pub const fn new() -> Self;          // seeded with the fnv1a-64 offset basis
+    pub fn push(&mut self, segment: &str);   // a '.' is fed before a non-empty segment
+                                             // only if a prior non-empty segment exists
+    pub fn push_bytes(&mut self, bytes: &[u8]);
+    pub fn push_index(&mut self, idx: u32);  // formats the decimal into a stack buffer
+    pub fn finish(self) -> ComponentId;      // applies the top-bit mask
 }
 ```
 
-`realize` threads a `PathHasher` (a `Copy` `u64` accumulator) down the dynamic walk:
-`List`/`Map` `push`es the prefix and then the key/index per element; the leaf
-`PathComponent` `push`es the member name and `finish`es. The **hot id path never
-allocates a `String`** — segments are fed directly. `ChainPath::to_component_id` is
-re-expressed on `PathHasher` so static and dynamic paths share one definition (risk: the
-two must stay bit-identical; covered by a cross-check test, see §9).
+The `has_content` flag implements the empty-segment rule: an empty segment contributes
+nothing and emits no separator, so `"" + "a" == "a"` and `["", "a", "", "b"] == "a.b"`,
+matching the `ChainPath` join rules. `PathHasher` is `Copy` (a `u64` plus a `bool`), so it is
+threaded down the dynamic walk **by value**: `List`/`Map` push the prefix and then the
+key/index per element; the leaf `PathComponent` pushes the member name and finishes. The hot
+id path never allocates a `String`. A 2000-iteration property test in `hash.rs` checks
+`PathHasher` against `ComponentId::new` of the joined string for random dotted paths.
 
-### 3.2 Map trailer: variable-length key names with fixed stride
+### 3.2 Display names reach consumers via the metadata channel
 
-The map key is now a variable-length **name**, but the trailer is parsed by a fixed
-`stride` (`count = byte_len / stride`). Two options:
-
-- **(A) fixed-size inline name buffer per entry** — `entry = { name: [u8; K], value }`.
-  Simple, fixed stride, but caps names at `K` and wastes space on short names. Rejected.
-- **(B) relative-slice key, names pooled after the entry array** — `entry = { key_off: u32,
-  key_len: u32, value: <sub-frame> }`, fixed stride; the key *bytes* live in a **name pool**
-  that follows the entry array in the trailer. `key_off`/`key_len` are table-absolute into
-  that pool. **Recommended.**
-
-Rationale for (B): arbitrary-length names with no cap, no per-entry waste, and it reuses
-the exact relative-slice idiom already used for the field slot (rkyv style). Layout:
-
-```
-trailer = [ entry[0 .. N] ][ key-name pool (UTF-8, back-to-back) ]
-entry   = repr(C) { key_off: u32, key_len: u32, <pad> value: <value sub-frame> }
-```
-
-The owning field's slot `{ trailer_off, byte_len }` delimits **just the entry array**
-(so `count = byte_len / stride` is exact); the name pool is reached only through per-entry
-`key_off`/`key_len` (bounds-checked against the table end). `value_offset` (on the `Map`
-op) gives the byte offset of the value sub-frame within an entry. For **lists** no key is
-stored — the index is the ordinal, formatted at realize time.
-
-### 3.3 Names reach consumers via the metadata channel
-
-The hashed id travels in the table; the **display name** travels on the existing
-metadata channel (`ComponentMetadata { component_id, name, metadata }` via
-`SetComponentMetadata`). For static components the derive already emits one `ComponentMetadata`
-per component. For dynamic components the **producer** emits metadata **lazily, once per
-newly-discovered key**: when a `FrameMap` first sees key `"htop"`, the framework emits, for
-each member (and nested member) of that element, a `ComponentMetadata` whose `name` is the
-composed dotted string and whose `component_id` is its hash. This reuses
-`ComponentMetadata::with_prefix` (which already does `format!("{prefix}.{name}")` + rehash)
-— the dynamic path is `prefix.key` applied to each member-template's metadata. Consumers
-(UI/db) already map id→name through this channel, so `processes.htop.pid` displays with no
-new mechanism. (The full `String` is built here, on the cold "new key discovered" path,
-not per-sample.)
+The hashed id travels in the table; the human-readable **display name** travels on the
+existing metadata channel (`ComponentMetadata { component_id, name, metadata }`). Static
+components emit one `ComponentMetadata` per component from the derive. Dynamic components are
+announced **lazily, once per newly-discovered key**, by the producer — `FrameList`/`FrameMap`
+emit an empty static metadata set (`Metadatatize::metadata` returns
+`core::iter::empty()`), because their concrete element-members do not exist until runtime
+keys appear. Consumers already map id→name through this channel, so `processes.htop.pid`
+displays with no new mechanism.
 
 ---
 
-## 4. New `Op` variants
+## 4. The op set
 
 ```rust
-#[derive(Debug, Serialize, Deserialize, Clone, postcard_schema::Schema)]
 #[repr(u8)]
 pub enum Op {
-    // ---- existing, unchanged ----
+    // fixed-table members
     Data { offset: Offset, len: u32 },
     Table { offset: Offset, len: u32 },
     None,
-    Component { component_id: OpRef },              // static: precomputed dotted hash
+    Component { component_id: OpRef },        // static: precomputed dotted-name hash
     Schema { ty: OpRef, dim: OpRef, arg: OpRef },
     Timestamp { source: OpRef, arg: OpRef },
     Ext { arg: OpRef, id: PacketId, data: OpRef },
 
-    // ---- new ----
-
-    /// Frame identity / grouping (§2). Metadata op: records frame id, continues at `arg`.
+    // frame identity & dynamic members
     Frame { component_id: OpRef, arg: OpRef },
-
-    /// Dynamic list terminal. The owning field's `offset`/`len` address an 8-byte slot
-    /// `{ trailer_off: u32, byte_len: u32 }`. Elements are fixed-`stride`, back-to-back;
-    /// `count = byte_len / stride`. `name` -> Data op holding the prefix ("processes").
-    /// `members` are template fields (offsets relative to the element base); a member's
-    /// chain may itself terminate in `List`/`Map` (nesting, §6.3).
     List { name: OpRef, members: ElementFields, stride: u32 },
-
-    /// Dynamic map terminal. Entries are `{ key_off: u32, key_len: u32, <pad> value }`,
-    /// fixed `stride`; key bytes live in the trailer name pool (§3.2). `value_offset` is
-    /// the byte offset of the value sub-frame within an entry.
-    Map { name: OpRef, members: ElementFields, stride: u32, value_offset: u32 },
-
-    /// Dynamic leaf terminal. Appends `name` ("pid") to the running path hash and
-    /// finalizes -> ComponentId. Replaces `Component` for dynamic members.
+    Map  { name: OpRef, members: ElementFields, stride: u32, value_offset: u32 },
     PathComponent { name: OpRef },
 }
 
-/// A contiguous range of member-template fields in `VTable::fields`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, postcard_schema::Schema)]
 #[repr(C)]
 pub struct ElementFields { pub start: u32, pub count: u32 }
 ```
 
-### Constraints addressed
+- **`Op::List`** — dynamic list terminal. The owning `Field`'s `offset`/`len` address an
+  8-byte slot `{ trailer_off: u32, byte_len: u32 }` in the fixed region. Elements are laid
+  out back-to-back in the trailer with byte `stride`; `count = byte_len / stride`. `name`
+  references a `Data` op holding the path prefix (`"processes"`). `members` is a contiguous
+  range of member-template `Field`s whose offsets are relative to each element's base.
+- **`Op::Map`** — dynamic map terminal. Like `List`, but each trailer entry is
+  `{ key_off: u32, key_len: u32, <pad> value }`: the key *bytes* live in a name pool
+  elsewhere in the trailer (addressed by `key_off`/`key_len`), and the value sub-frame begins
+  at `value_offset` within the entry.
+- **`Op::PathComponent`** — dynamic leaf terminal, used in member templates instead of
+  `Component`. Appends `name` (a `Data` op holding the member name, `"pid"`) to the running
+  dotted path accumulated by the enclosing `List`/`Map` expansion, then finalizes it into a
+  `ComponentId`.
+- **`ElementFields { start, count }`** names a contiguous block of member-template `Field`s
+  in `VTable::fields`. These describe one element and are **not** iterated as top-level
+  fields — they are claimed templates, realized only as part of their owning dynamic field.
 
-- **`#[repr(u8)]` + `size_of::<Op>() <= 64`.** Largest new variant is `Map`:
-  `name(u32) + members(8) + stride(u32) + value_offset(u32)` = 20 bytes payload, ~24 with
-  the discriminant — far under 64 and comparable to the existing `Schema`. All multi-op
-  sub-parts use `OpRef`; the only inline payloads are small fixed scalars, mirroring the
-  existing `Data`/`Table` `{ offset, len }` u32 pairs. `_ASSERT_OP_SIZE` stays.
-- **Derives / round-trip.** New variants and `ElementFields` use only `OpRef`/`u32`, all of
-  which already implement `Serialize/Deserialize/Clone/postcard_schema::Schema`; postcard
-  round-trips. Variants are **appended**, so existing discriminants do not shift.
-- **`alloc` vs `heapless`.** No new container types in `Op`/`VTable`. Member templates and
-  name strings live in the existing `fields`/`data` buffers (`Buf<…>`), so no-alloc bounds
-  are unchanged. Only `builder` (already `#[cfg(feature = "alloc")]`) gains constructors.
+A member's chain may itself terminate in `List`/`Map`, giving nested dynamics.
+`MAX_DYNAMIC_DEPTH = 8` bounds the nesting honored during realization (and therefore stack
+use on the no-alloc path); exceeding it is reported as `Error::InvalidOp`.
+
+`Op` stays `repr(u8)` and `<= 64` bytes: the largest new variant is `Map`
+(`name + members(8) + stride + value_offset` ≈ 20 bytes payload). All multi-op sub-parts use
+`OpRef`; the only inline payloads are small fixed scalars. Variants are **appended**, so
+existing discriminants do not shift; everything is `OpRef`/`u32`, so the serde / postcard /
+`postcard_schema` round-trip is preserved. `VTable::is_dynamic()` reports whether any
+`List`/`Map` op is present.
 
 ---
 
-## 5. Trailer encoding — worked byte-level examples
+## 5. Trailer encoding
 
 All examples use prefix `"processes"`, `Process { pid: u64, cpu_usage: f64 }` (size 16,
-align 8), fixed region `{ timestamp: i64 @0, slot @8 }` (fixed size 16). Trailer is
-8-aligned and starts at 16. Integers little-endian. Member templates (relative to the
-element/value base): `{0, 8, schema(U64,[], path_component("pid"))}`,
-`{8, 8, schema(F64,[], path_component("cpu_usage"))}`.
+align 8), fixed region `{ timestamp: i64 @0, slot @8 }` (fixed size 16). The trailer is
+8-aligned and starts at 16. Integers little-endian. Member templates (offsets relative to
+the element/value base): `{0, 8, schema(U64, [], path_component("pid"))}`,
+`{8, 8, schema(F64, [], path_component("cpu_usage"))}`.
 
 ### 5a. `FrameList<Process>`, 2 elements
 
@@ -264,16 +218,15 @@ element/value base): `{0, 8, schema(U64,[], path_component("pid"))}`,
 | 32 | `[1].pid` u64          | `EA 03 00 00 00 00 00 00` | 1002 |
 | 40 | `[1].cpu_usage` f64    | `00 00 00 00 00 00 D0 3F` | 0.25 |
 
-Length 48. Realize: slot→`(16,32)`→`count=2`. For `i in 0..2`, `base = 16 + i*16`; push
-prefix `"processes"`, push index `i` (decimal); walk members ⇒
-`processes.0.pid=1001`, `processes.0.cpu_usage=0.5`, `processes.1.pid=1002`,
-`processes.1.cpu_usage=0.25`.
+Length 48. Realize: slot → `(16, 32)` → `count = 2`. For `i in 0..2`, `base = 16 + i*16`;
+push prefix `"processes"`, push index `i` (decimal); walk members ⇒ `processes.0.pid=1001`,
+`processes.0.cpu_usage=0.5`, `processes.1.pid=1002`, `processes.1.cpu_usage=0.25`.
 
 ### 5b. `FrameMap<Name, Process>`, 2 entries (keys "htop", "init")
 
 Entry `{ key_off: u32 @0, key_len: u32 @4, value: Process @8 }` ⇒ `stride = 24`,
-`value_offset = 8`. Slot delimits the entry array: `{ trailer_off = 16, byte_len = 48 }`
-⇒ `count = 2`. The name pool follows the entry array at offset 64.
+`value_offset = 8`. The slot delimits **just the entry array**: `{ trailer_off = 16,
+byte_len = 48 }` ⇒ `count = 2`. The name pool follows the entry array at offset 64.
 
 | off | field | bytes (LE) | value |
 |----:|-------|-----------|-------|
@@ -291,317 +244,296 @@ Entry `{ key_off: u32 @0, key_len: u32 @4, value: Process @8 }` ⇒ `stride = 24
 | 64 | name pool `"htop"`     | `68 74 6F 70` | "htop" |
 | 68 | name pool `"init"`     | `69 6E 69 74` | "init" |
 
-Length 72. Realize: `count=2`; for `i`, `entry = 16 + i*24`; `key = str(table[key_off .. key_off+key_len])`;
-`value_base = entry + 8`; push `"processes"`, push `key`, walk members ⇒
-`processes.htop.pid=1001`, `processes.htop.cpu_usage=0.5`, `processes.init.pid=1002`,
-`processes.init.cpu_usage=0.25`.
+Length 72. Realize: `count = 2`; for `i`, `entry = 16 + i*24`;
+`key = str(table[key_off .. key_off+key_len])`; `value_base = entry + 8`; push `"processes"`,
+push `key`, walk members ⇒ `processes.htop.pid=1001`, `processes.htop.cpu_usage=0.5`,
+`processes.init.pid=1002`, `processes.init.cpu_usage=0.25`.
+
+A key containing `.` would alias the dotted-path grammar; realization rejects it with
+`Error::InvalidComponentData`. (Keys are also validated at write time — §7, §8.)
+
+### 5.2 Why the relative-slice key layout
+
+The map key is a variable-length name, but the trailer is parsed by a fixed `stride`
+(`count = byte_len / stride`). The entry stores a **relative slice** `{ key_off, key_len }`
+into a name pool that follows the fixed-stride entry array, rather than an inline fixed-size
+name buffer per entry. This allows arbitrary-length keys with no per-entry cap and no wasted
+space on short keys, and it reuses the same relative-slice idiom as the field slot itself.
+`key_off`/`key_len` are table-absolute into the pool (bounds-checked against the table end).
+Lists store no key — the index is the element ordinal, formatted at realize time.
 
 ### 5c. Nested — `FrameMap<Name, Host>` where `Host { threads: FrameList<Thread> }`, `Thread { state: u8 }`
 
-Target names like `processes.htop.threads.3.state`. The map's **value sub-frame** `Host`
-is not a leaf — its single member is itself a `List` whose slot lives inside the entry's
-value region and points into the **same global trailer**. (Design choice: **one global
-trailer, all slots table-absolute**, so nested offset math is uniform; nested trailers are
-*not* per-element-relative.)
+Target names like `processes.htop.threads.3.state`. The map's **value sub-frame** `Host` is
+not a leaf — its single member is itself a `List` whose slot lives inside the entry's value
+region and points into the **same global trailer**. There is **one global trailer; all slots
+are table-absolute**, so nested offset math is uniform — a nested trailer is not
+per-element-relative.
 
 ```
-fixed   { timestamp @0, slot_outer @8 }                       // size 16
-entry[i] (stride 16) = { key_off: u32, key_len: u32, slot_inner: {off:u32,len:u32} }
-                                                              // value sub-frame = the inner List slot
+fixed     { timestamp @0, slot_outer @8 }                        // size 16
+entry[i]  (stride 16) = { key_off: u32, key_len: u32, slot_inner: {off:u32,len:u32} }
+                                                                 // value sub-frame = the inner List slot
 ```
 
-Worked layout for one host "htop" with a single thread (a 1-element list, ordinal 0 ⇒
+One host "htop" with a single thread (a 1-element list, ordinal 0 ⇒
 `processes.htop.threads.0.state`):
 
 | off | field | value |
 |----:|-------|-------|
-| 0  | timestamp                          | 1000 |
-| 8  | slot_outer `{off=16, len=16}`      | one entry (stride 16) |
-| 16 | entry[0].key_off = 40              | → name pool "htop" |
-| 20 | entry[0].key_len = 4               | |
+| 0  | timestamp                            | 1000 |
+| 8  | slot_outer `{off=16, len=16}`        | one entry (stride 16) |
+| 16 | entry[0].key_off = 40                | → name pool "htop" |
+| 20 | entry[0].key_len = 4                 | |
 | 24 | entry[0].slot_inner `{off=44,len=1}` | inner list: 1 thread, stride 1 |
-| 28 | (pad to 8 before pools)            | |
-| 40 | name pool "htop"                   | (4 bytes) |
-| 44 | thread[0].state u8 = 2             | inner-list trailer |
+| 28 | (pad to 8 before pools)              | |
+| 40 | name pool "htop"                     | (4 bytes) |
+| 44 | thread[0].state u8 = 2               | inner-list trailer |
 
 Realize recursion: outer `Map` pushes `"processes"`, then key `"htop"`; the value sub-frame
 member is `List(name="threads", …)`, realized against the entry's value region — it reads
 `slot_inner` at `entry + value_offset`, pushes `"threads"` then index `0`, walks `Thread`'s
 members ⇒ leaf `PathComponent("state")` finalizes `processes.htop.threads.0.state = 2`. The
-`PathHasher` accumulator is **passed down by value** through each level, so the dotted name
-chains correctly with no string building on the sample path. (Producers are free to lay the
-name pool and nested trailers in any order after the fixed region; only the offsets are
-load-bearing — the table above interleaves them to keep the example compact.)
+`PathHasher` accumulator is passed down by value through each level, so the dotted name
+chains with no string building on the sample path. Producers may lay the name pool and nested
+trailers in any order after the fixed region; only the offsets are load-bearing.
 
 ---
 
-## 6. Realization — `realize` / `realize_fields` / `apply`
+## 6. Realization
 
-### 6.1 `realize`
+### 6.1 `realize` and the realized ops
 
-Add `RealizedOp` cases (additive; no existing arm changes):
+`realize(op_ref, table)` adds these `RealizedOp` cases:
+
+- `Frame` resolves `component_id` (`Data` → `ComponentId`) and returns
+  `RealizedFrame { component_id, arg }` — **non-terminal** (the loop follows `arg`).
+- `List`/`Map` resolve `name` (`Data` → `&str`, via the `realize_str` helper) and return a
+  `RealizedDynamic { name, members, stride, value_offset, is_map }` — **expanding terminals**
+  (the slot is read by the field walk, which holds `field.offset`). `value_offset` is `0` for
+  a list.
+- `PathComponent` resolves `name` (`Data` → `&str`) and returns
+  `RealizedPathLeaf { name }`; the field walk finalizes the path hash.
+
+### 6.2 The field walk
+
+Because a dynamic field can yield several components, field realization is a push-style
+driver rather than a one-field-one-component iterator:
 
 ```rust
-pub enum RealizedOp<'a> {
-    Data(&'a [u8]), Table(RealizedTableSlice<'a>), Component(RealizedComponent),
-    Schema(RealizedSchema<'a>), Timestamp(RealizedTimestamp), Ext(RealizedExt<'a>), None,
-    // new:
-    Frame(RealizedFrame),                 // { component_id, arg }
-    List(RealizedDynamic<'a>),            // { name: &str, members, stride, arg-less }
-    Map(RealizedDynamic<'a>),             // + value_offset
-    PathComponent(RealizedPathLeaf<'a>),  // { name: &str }
+pub fn for_each_field<'a>(
+    &'a self,
+    table: Option<&'a [u8]>,
+    f: &mut dyn FnMut(RealizedField<'a>) -> Result<(), Error>,
+) -> Result<(), Error>;
+```
+
+`for_each_field` is the shared engine behind both `VTable::apply` (which sinks each realized
+component into a `Decomponentize`) and, under `alloc`, `VTable::realize_fields` (which
+collects into a `Vec<Result<RealizedField, _>>` iterator). It is no-alloc friendly: no heap,
+recursion bounded by `MAX_DYNAMIC_DEPTH`. No-alloc callers use `for_each_field` directly.
+
+It iterates top-level fields, **skipping member templates** (any field index inside some
+`List`/`Map` op's `members` range, identified by `is_template_field`), and walks each
+remaining field with a default `WalkCtx`:
+
+```rust
+struct WalkCtx<'a> {
+    base: usize,                    // containing element's base offset
+    path: PathHasher,               // accumulated dotted-name prefix
+    element: Option<ElementKey<'a>>,// Index(u32) | Key(&str); None for static
+    frame: Option<ComponentId>,     // inherited frame
+    timestamp: Option<Timestamp>,   // inherited timestamp
+    depth: usize,
 }
 ```
 
-- `Frame` resolves `component_id` (Data → ComponentId), returns `Frame { component_id, arg }`,
-  **non-terminal** (loop follows `arg`).
-- `List`/`Map` resolve `name` (Data → `&str`) and return the descriptor; they are
-  **expanding terminals** — the slot is read by `realize_fields` (which holds `field.offset`).
-- `PathComponent` resolves `name` (Data → `&str`); the loop finalizes the path hash.
+`walk_field` runs the op chain: `Schema` records ty+dim, `Timestamp`/`Frame` record (and
+override the inherited) timestamp/frame, `Ext` passes through. A `Component` terminal emits a
+static leaf; a `PathComponent` terminal pushes its name onto a copy of `ctx.path`, finishes
+the hash, and emits a dynamic leaf; a `List`/`Map` terminal calls `expand_dynamic`. Every
+leaf goes through `emit_leaf`, which requires a `Schema` to have been seen
+(`Error::SchemaNotFound` otherwise), computes `offset = ctx.base + field.offset`, builds a
+`ComponentView` from the table slice (when `table` is `Some`), and invokes the callback.
 
-### 6.2 `realize_fields`
+`expand_dynamic` pushes the dynamic op's `name` onto the path, then:
 
-The loop gains:
-- `Frame(f)` → `frame = Some(f.component_id); realized_op = realize(f.arg)`.
-- `List`/`Map` → **expand** one field into many `RealizedField`s. With `table = Some`: read
-  the slot from `table[field.offset .. +8]`, compute `count`, and for each element seed a
-  `PathHasher` with the prefix + key/index and walk the member-template fields (recursively,
-  re-basing `table` to the element/value slice). With `table = None`: emit each member
-  template **once** (no key/index, `view = None`) so consumers learn member ty/shape.
-- A member template that itself terminates in `List`/`Map` recurses (§6.3), threading the
-  parent's `PathHasher`.
+- With `table = Some` (ingest mode): reads the slot from `table[field.offset .. +8]` (rebased
+  by `ctx.base`), computes `count = byte_len / stride` (rejecting `stride == 0` with
+  `InvalidOp`), and for each element derives a child `WalkCtx` with the element base, the
+  extended path (`push_index` for a list, `push` for a validated map key), the `ElementKey`,
+  and the inherited frame/timestamp, then walks each member-template field. For a map it reads
+  `{ key_off, key_len }`, slices the key from the name pool, and rejects a `.` in the key.
+- With `table = None` (schema/registration mode): the element count is unknown, so it emits
+  each member template **once** with no element key and no view — enough to surface the member
+  ty/shape (e.g. `processes.pid`). Nested dynamics recurse the same way.
 
-Because one field can now yield several outputs, the per-field expansion moves into a
-push-style driver `fn for_each_field(table, ctx, &mut impl FnMut(RealizedField))` carrying
-the `PathHasher`/frame/schema state; `apply` is implemented on top of it. Under `alloc` the
-existing `realize_fields(...) -> impl Iterator` is kept by `flat_map`ing each field's
-outputs into a `SmallVec`. Top-level iteration **skips claimed member-template field
-indices** (collected from every `List`/`Map` `members` range in one pre-pass, or via a
-builder watermark — see §9).
-
-`RealizedField` gains structural context (additive; defaulted for static fields):
+### 6.3 `RealizedField`
 
 ```rust
 pub struct RealizedField<'a> {
-    pub component_id: ComponentId,  // for dynamic members: the composed dotted-name hash
-    pub shape: &'a [usize], pub ty: PrimType, pub offset: usize,
-    pub view: Option<ComponentView<'a>>, pub timestamp: Option<Timestamp>,
-    // new:
-    pub frame: Option<ComponentId>,
-    pub element: Option<ElementKey>,   // Index(u32) | Key(&'a str); None for static
+    pub component_id: ComponentId,        // dynamic members: the composed dotted-name hash
+    pub shape: &'a [usize],
+    pub ty: PrimType,
+    pub offset: usize,
+    pub view: Option<ComponentView<'a>>,  // None in registration mode
+    pub timestamp: Option<Timestamp>,
+    pub frame: Option<ComponentId>,       // the frame this field belongs to, if Frame-tagged
+    pub element: Option<ElementKey<'a>>,  // the dynamic element this came from; None for static
+    pub dynamic: bool,                    // realized through a PathComponent terminal
 }
 ```
 
-### 6.3 Nested recursion
-
-Member templates are realized by the same loop, so nesting is free in the type system: a
-member's chain ends in `PathComponent` (leaf) **or** another `List`/`Map` (nested dynamic).
-Three invariants make the byte math work:
-1. **One global trailer; all slots are table-absolute.** A nested slot is read from the
-   element's value region but its value is an offset into the whole table, so the nested
-   walk re-bases `table` to a table-absolute slice — no per-level relative arithmetic.
-2. **The `PathHasher` is passed by value down each level**, so `processes` → `htop` →
-   `threads` → `0` → `state` composes incrementally; no intermediate `String`.
-3. **Depth is bounded** by the static op graph (the vtable is finite/acyclic), so recursion
-   terminates; no-alloc builds get an explicit max-depth const to bound stack use.
-
-### 6.4 What the consumer/db sees
-
-Each dynamic element-member is an **ordinary flat component** (dotted-name hash + view +
-timestamp) through the unchanged `apply_value`. db/UI need no value-path change; the only
-new thing they observe is that the *set* of component ids for a dynamic frame varies at
-runtime (handled by lazy registration, §8, and metadata emission, §3.3).
+`dynamic` distinguishes a member *template* (`processes.pid`, registration mode, never sampled
+directly) and a concrete element-member (`processes.0.pid`, ingest mode) from a static field.
+Each dynamic element-member is an ordinary flat component (dotted-name hash + view +
+timestamp) through the unchanged `apply_value`; the only new thing a consumer observes is that
+the *set* of component ids for a dynamic frame varies at runtime. Element-members **inherit
+the frame timestamp** unless they carry their own `Timestamp` op.
 
 ---
 
-## 7. Builder API additions (`builder`, `#[cfg(feature = "alloc")]`)
+## 7. Builder API
+
+The `alloc`-gated `builder` module gains:
 
 ```rust
-/// Frame identity (§2).
 pub fn frame(component_id: impl Into<ComponentId>, arg: Arc<OpBuilder>) -> Arc<OpBuilder>;
-
-/// A name string in the data side-table (UTF-8, align 1). Used by list/map prefixes
-/// and path_component leaves.
-pub fn name(s: &str) -> Arc<OpBuilder>;
-
-/// Dynamic leaf terminal: appends `member_name` and finalizes the dotted-name hash.
+pub fn name(s: &str) -> Arc<OpBuilder>;            // UTF-8 Data op, align 1
 pub fn path_component(member_name: &str) -> Arc<OpBuilder>;
-
-/// Runtime list of `Process`-like elements. `prefix` is the field name ("processes");
-/// `members` are the element member templates (offsets relative to element base);
-/// `stride` is the element size. Members may themselves be list/map (nesting).
-pub fn list(
-    prefix: &str,
-    members: impl IntoIterator<Item = FieldBuilder>,
-    stride: u32,
-) -> Arc<OpBuilder>;
-
-/// Runtime map keyed by a name string. Entry layout `{ key_off, key_len, <pad> value }`;
-/// `value_offset` locates the value sub-frame within an entry.
-pub fn map(
-    prefix: &str,
-    members: impl IntoIterator<Item = FieldBuilder>,
-    stride: u32,
-    value_offset: u32,
-) -> Arc<OpBuilder>;
+pub fn list(prefix: &str, members: impl IntoIterator<Item = FieldBuilder>, stride: u32)
+    -> Arc<OpBuilder>;
+pub fn map(prefix: &str, members: impl IntoIterator<Item = FieldBuilder>,
+           stride: u32, value_offset: u32) -> Arc<OpBuilder>;
 ```
 
-`OpBuilder` gains `Frame`, `List { prefix, members: Vec<FieldBuilder>, stride }`,
-`Map { … value_offset }`, `PathComponent { name }`. `VTableBuilder::visit` for `List`/`Map`
-**appends each member `FieldBuilder` to `vtable.fields`** (recording `ElementFields { start,
-count }` and marking those indices claimed) and emits the op; templates are not top-level
-fields. `offset_table_ops` gains pass-through arms for the new builder variants so nested
-member offsets shift correctly. Optional `frame!`/`list!`/`map!` macros mirroring
-`field!`/`table!` are a follow-up.
+`FieldBuilder::with_frame(component_id)` wraps a field's chain in a `Frame` op (deduplicated
+so a frame id shared by every field is stored once). `OpBuilder` gains `Frame`, `List
+{ name, members: Vec<FieldBuilder>, stride }`, `Map { …, value_offset }`, and
+`PathComponent { name }`.
+
+`VTableBuilder::visit` for `List`/`Map` calls `visit_members`, which appends each member
+`FieldBuilder` to `vtable.fields` as a contiguous block and records the `ElementFields
+{ start, count }` range — templates are not top-level fields. Each member's op chain is
+visited first (so a *nested* template block is appended earlier), then the direct member
+`Field`s are pushed together to keep the range contiguous. `offset_table_ops` has
+pass-through arms for the new builder variants: dynamic terminals carry no shiftable table ops
+(`name` is a `Data` op; member offsets are relative to the element base, not the table), and
+`Frame`'s `component_id` is a `Data` op, so only its `arg` can shift.
 
 ---
 
-## 8. db impact / follow-ups
+## 8. The `metor-fsw-2` surface
 
-No existing op's behavior changes; adding variants forces exhaustive `match`es to gain
-arms. Sites and required arms:
+[`src/dynamic.rs`](../src/dynamic.rs) provides the two field types a frame author drops into a
+`#[repr(C)]` struct. Each **is** the 8-byte slot — nothing more:
 
-1. **`metor-proto/src/vtable.rs` — `realize` (exhaustive).** Add `Frame`/`List`/`Map`/
-   `PathComponent` arms (the WP change). *Real handling.*
-2. **`metor-proto/src/vtable.rs` — `realize_fields` loop (`_ => Err(InvalidOp)`).** Add
-   `Frame` passthrough, `List`/`Map` expansion, `PathComponent` finalize. *Real handling.*
-   The `RealizedOp` helper matches keep their `_` fall-through.
-3. **`db/src/vtable_stream.rs:41` — `table_len` (`match op { Op::Table … _ => 0 }`).** The
-   `_ => 0` covers the new ops, and the dynamic slot is an ordinary `Field` already counted
-   by the `fields` map/`max`; the *fixed* length stays correct. The **trailer** is
-   runtime-sized — handled by the new streaming path (§8.6), not this length calc. *Note,
-   no struct change here.*
-4. **`db/src/vtable_stream.rs:54` — streaming realize loop (`_ => Err(InvalidOp)`).** Add
-   `RealizedOp::Frame(f)` passthrough; **dispatch** `List`/`Map`/`PathComponent` into the new
-   dynamic-stream builder (§8.6). *Real handling — no longer a rejection.*
-5. **`db/src/lib.rs:247` — `insert_vtable` via `realize_fields(None)`.** Now receives member
-   templates (`view = None`, `frame = Some`, `element = None`). Follow-up: register the
-   element member **schemas** (ty/shape) as a template under the prefix, but create concrete
-   keyed/indexed components **lazily at apply/push time** when keys/indices appear. The
-   ingest path must `get_or_insert` the component schema on first sample. *Real handling.*
-6. **`db/src/lib.rs` ingest + metadata.** On first sight of a new dynamic component id, db
-   accepts the lazily-created component and stores the matching `ComponentMetadata` (emitted
-   by the producer, §3.3) so queries resolve `processes.htop.pid`. *Real handling.*
-7. **`db/src/main.rs:102` — `vtable::Op::to_cpp()` + hand-written `db/cpp/vtable.hpp`.** New
-   variants enter the generated postcard schema automatically, but the C++ `OpBuilder` mirror
-   must gain `Frame`/`List`/`Map`/`PathComponent` builders (and the C++ table interpreter
-   must learn the trailer/slot + name-pool walk, or explicitly reject). Silent gap if
-   skipped (no compile error). *Real handling on the C++ side.*
-8. **`metor-fsw/src/path.rs`.** Re-express `ChainPath::to_component_id` on the shared
-   `PathHasher` (removes its alloc TODO); must stay bit-identical to `ComponentId::new`.
-9. **Non-matching consumers (no change).** `metor-ui` plot consumes via a flat `apply_value`
-   closure and the `builder` helpers; `metor-fsw/src/vtable.rs` only uses `builder`. No other
-   crate `match`es metor-proto's `Op`/`RealizedOp`.
+```rust
+#[repr(C)]
+pub struct Slot { pub trailer_off: u32, pub byte_len: u32 }
 
-### 8.6 Streaming dynamic frames (in scope for v1)
+#[repr(transparent)]
+pub struct FrameList<T, const MAX: usize> { slot: Slot, _ty: PhantomData<T> }
 
-The blocker is `FieldTable` in `vtable_stream.rs`: it pre-allocates **one fixed-offset shard
-per field** in a single `LenPacket`, with an `AtomicBitVec` of "field filled" flags, and
-sends the *same* buffer every tick. A dynamic trailer is runtime-sized and its component set
-changes, so a fixed shard table cannot hold it.
+#[repr(transparent)]
+pub struct FrameMap<K, V, const MAX: usize, const MAX_KEY: usize = 32> {
+    slot: Slot, _kv: PhantomData<(K, V)>,
+}
+```
 
-Design — a **`DynamicFrameTable`** that **rebuilds the packet each tick** instead of
-overwriting fixed shards:
+`#[repr(transparent)]` over `Slot` (the `PhantomData` is a ZST) keeps the in-struct field
+exactly the 8-byte slot and trivially `IntoBytes`. Both default to `EMPTY`
+(`trailer_off = 0, byte_len = 0`); the producer patches the slot through the `FrameWriter`.
 
-- **Static fields keep the fast path.** A VTable with no `List`/`Map` uses today's
-  `FieldTable` unchanged. A VTable that mixes static + dynamic uses `DynamicFrameTable`,
-  which still writes static fields into fixed positions but appends a freshly built trailer.
-- **Per-tick rebuild.** Each cycle the stage: (1) reads the **producer's latest dynamic
-  table** to learn the **live key/index set** (the producer is authoritative about current
-  membership — which processes exist now); (2) for each live element-member component, pulls
-  its latest value from that component's WAL `Reader` (the same `RealTimeStage` source,
-  keyed by the composed dotted-name id, created lazily as keys appear); (3) **re-serializes**
-  the table: fixed region + slot + entry array + key-name pool, pushing into a growable
-  `LenPacket` (`push`/`extend_aligned`, like `FieldTable::new` but length-varying); (4) sends.
-- **Readiness.** The `AtomicBitVec` "all shards filled" gate is replaced for the dynamic
-  portion by "rebuild on tick or on any contributing-component update"; static shards keep
-  their gate. Backpressure/overrun semantics are unchanged (writers never block; lapped
-  readers are detected exactly as today).
-- **Membership churn.** Keys appearing/disappearing across ticks is expected: the live set is
-  re-derived each tick from the producer table, so a vanished process simply drops out of the
-  next packet; a new one is picked up once db has lazily registered its components (§8.5) and
-  the producer has emitted its metadata (§3.3).
-- **Nested frames** stream the same way: the rebuild walks the nested realize recursion
-  (§6.3) to lay down nested slots + inner trailers into the same growable packet.
+- **`AsVTable`** emits the field's single `Op::List`/`Op::Map`. Reached statically
+  (`vtable_fields`), the op `name` is the full dotted prefix (`path.to_name()`); reached as a
+  member template (`element_fields`), it is the relative own name only. The element member
+  templates are `V::element_fields(String::new())` (offsets relative to the element base; the
+  enclosing frame `offset_by`s the slot).
+- **`Componentize`** sinks nothing directly (the slot holds no in-struct value; elements are
+  sunk through the vtable/trailer path) and sets the worst-case trailer budget:
+  `FrameList::MAX_SIZE = round_up8(MAX * size_of::<T>())`;
+  `FrameMap::MAX_SIZE = round_up8(MAX * map_stride::<V>() + MAX * MAX_KEY)` (entry array plus
+  name pool).
+- **`Metadatatize`** is empty — dynamic members are announced lazily, per new key, by the
+  producer (§3.2).
 
-Cost: the dynamic path trades the zero-copy fixed-shard write for a per-tick re-serialization.
-That is the necessary price of a runtime-sized payload and is bounded by the live element
-count. This is a real lift in `vtable_stream.rs` (new `DynamicFrameTable`, dynamic-aware
-plan construction) and is tracked as the largest WP-2 db task.
+The const helpers fix the map entry layout: `entry_align::<V>()` is `max(align_of::<V>(), 8)`
+so each entry's `{ key_off, key_len }` pair and value stay 8-byte aligned;
+`map_value_offset::<V>() = align_up(8, entry_align::<V>())`;
+`map_stride::<V>() = align_up(value_offset + size_of::<V>(), entry_align::<V>())`.
+
+`Name<'a>` is a map-key newtype enforcing the dotted-name grammar at construction: `Name::new`
+returns `None` for an empty key (an empty segment vanishes under the `PathHasher` rule, which
+would alias `a..b`) or a key containing `.` (which would alias the path separator). This is one
+of three guards: the `Name` newtype and the `FrameWriter`'s `validate_key` reject bad keys
+loudly at write time; `expand_dynamic` rejects a `.`-containing key at realize time with
+`Error::InvalidComponentData`.
 
 ---
 
-## 9. Open questions / risks for the reviewer
+## 9. The producer — `FrameWriter`
 
-1. **`PathHasher` ↔ `ComponentId::new` bit-equality.** The rolling hasher must reproduce
-   `ComponentId::new(full_dotted)` exactly, including `ChainPath`'s empty-segment/separator
-   rules and the final top-bit mask. Proposed: a property test hashing random dotted paths
-   both ways. Confirm the empty-segment rule (leading `.`? trailing `.`?) we must match.
-2. **Map key uniqueness & name validity.** Keys are arbitrary producer strings. Dots inside
-   a key (`"a.b"`) would alias the path grammar (`processes.a.b.pid`). Forbid `.` in keys, or
-   escape? Also dedup policy if a producer emits the same key twice in one table.
-3. **`trailer_off` / slot base.** Proposed table-absolute for both the field slot and nested
-   slots (uniform nesting). Confirm vs trailer-relative.
-4. **Name-pool placement.** §3.2 pools key names after the entry array, addressed by absolute
-   offsets. Alternative: a single shared name pool for the whole table (dedup repeated keys
-   across nested levels). Worth the dedup complexity?
-5. **Claimed-template bookkeeping.** Skipping member templates in the top-level walk needs a
-   pre-pass claimed-set or a builder watermark (templates after real fields). Watermark is
-   cheaper but constrains builder ordering. Preference?
-6. **Lazy dynamic registration & unbounded keys.** §8.5/§8.6 create components lazily and
-   re-derive membership each tick. Churning keys (e.g. short-lived PIDs as map keys) grow the
-   component set without bound. Need eviction/TTL or a "hidden after N idle ticks" policy?
-7. **Streaming cost / max element count.** The per-tick rebuild is O(live elements). Do we
-   need a cap or a slower update rate for very large dynamic frames?
-8. **Metadata volume.** Emitting `ComponentMetadata` per member per new key can burst on
-   startup (many processes at once). Batch into one message? Rate-limit?
-9. **Nesting depth bound.** A `max-depth` const bounds no-alloc recursion. What depth must v1
-   support (`processes.htop.threads.3.state` is depth 3)?
+[`FrameWriter<F>`](../src/writer.rs) builds a frame's table bytes (fixed region + trailer)
+over a growable `LenPacket`. It writes the fixed `#[repr(C)]` region first (slots zeroed —
+authored as `FrameList::EMPTY` / `FrameMap::EMPTY`), then each dynamic field appends its
+element block to the trailer (8-byte aligned via the ring's `round_up8`) and patches its slot
+`{ trailer_off, byte_len }`. All trailer offsets are table-absolute (relative to the
+fixed-region start), matching the one-global-trailer invariant.
+
+- `list(slot_off, build)` collects elements through a `ListWriter<T>`, aligns to 8, appends
+  the back-to-back element bytes, and patches the slot to span them.
+- `map(slot_off, build)` collects `(key, value)` entries through a `MapWriter<V>` (rejecting
+  empty / `.`-containing keys, surfaced as `WriteError::EmptyKey` / `WriteError::DotInKey`),
+  then lays the fixed-stride entry array followed by the name pool: each entry's `key_off`
+  points table-absolute into the pool, and the slot delimits **only the entry array** so
+  `count = byte_len / stride` stays exact.
+
+The result is fed to `VTable::apply`, with table offset 0 at the fixed region (`writer.table()`).
 
 ---
 
-## Implementation Plan
+## 10. Wiring & compatibility
 
-Status: the **testable core landed** (this pass). The streaming rebuild is the
-sequenced follow-up.
+[`src/descriptor.rs`](../src/descriptor.rs) drives compatibility checking in **registration
+mode**. `realize_set(vtable)` calls `vtable.realize_fields(None)` and collects every
+`(component_id, ty, shape)` — including dynamic member *templates* (e.g. `processes.pid`),
+which is the registration-mode contract. `compatible(producer, consumer)` requires the same
+`frame_id` and that the consumer's component set is a **subset** of the producer's with
+matching `ty`/`shape`, so a producer may emit extra fields a consumer ignores. Because a
+dynamic frame's template set is fixed at compile time (only the concrete keyed/indexed members
+vary at runtime), two ports agree on a dynamic member by agreeing on its template.
 
-### Landed (metor-proto)
-- `hash::PathHasher` — rolling fnv1a-64, bit-identical to `ComponentId::new`; `push`,
-  `push_index`, `finish` (top-bit mask). Reused in `metor-fsw/src/path.rs` via a new
-  `ComponentPath::hash_into`, killing the alloc TODO in `ChainPath::to_component_id`.
-- `Op::{Frame, List, Map, PathComponent}` + `ElementFields` (`#[repr(C)]`, two `u32`);
-  `Op` stays ≤ 64 bytes and keeps the serde/postcard_schema derives.
-- `RealizedOp::{Frame, List, Map, PathComponent}`, `RealizedFrame`, `RealizedDynamic`,
-  `RealizedPathLeaf`, `ElementKey`; `RealizedField` gains `frame` + `element`.
-- `realize` arms for the new ops (`realize_str` helper for name data).
-- `for_each_field` push driver (no-alloc; recursion bounded by `MAX_DYNAMIC_DEPTH = 8`)
-  threading a `WalkCtx { base, path, element, frame, timestamp, depth }`; `apply`
-  reimplemented on it; `realize_fields` kept as an `alloc`-gated collecting iterator.
-  Dynamic expansion reads the `{trailer_off, byte_len}` slot, derives `count`, walks
-  member templates, composes dotted names, and **inherits the frame timestamp** into
-  elements. **Map keys containing `.` are rejected** (`Error::InvalidComponentData`).
-- builder: `frame`, `name`, `path_component`, `list`, `map`; `OpBuilder` variants;
-  `visit`/`visit_members` (appends member templates contiguously, records
-  `ElementFields`); `offset_table_ops` pass-throughs; top-level walk skips template
-  fields via `is_template_field`.
+---
 
-### Identity (decisions honored)
-Dynamic component id = `ComponentId::new("<prefix>.<key|index>.<member>")`. Prefix and
-member names are compile-time `Data` ops; the map key is a runtime trailer name (relative
-slice `{key_off,key_len}` into a name pool after the fixed-stride entry array); list keys
-are positional indices. One global table-absolute trailer; nesting via recursion (depth 8).
+## 11. dlopen and prefix rewriting
 
-### Tests (all green)
-`hash.rs`: deterministic + a 2000-iteration property test (`PathHasher` vs
-`ComponentId::new`). `vtable.rs`: §5a list, §5b map (name pool), §5c nested
-(`processes.htop.threads.0.state`), dot-in-key rejection, and `realize_fields(None)`
-registration mode.
+A statically-linked port bakes instance-prefixed component ids by re-deriving its vtable under
+the instance name (`AsVTable::vtable_fields(prefix)`). A `dlopen`'d system has no static frame
+type, so [`src/abi/mod.rs`](../src/abi/mod.rs) carries the **unprefixed** vtable plus per-port
+`ComponentMetadata` across the boundary and reconstructs the prefixed vtable on the host with
+`prefix_announce_vtable`: it builds an unprefixed→prefixed id map from the metadata and
+rewrites every 8-byte `Op::Data` blob whose value is a known leaf id.
 
-### Deferred (WP2b) — db follow-ups
-- **Streaming (`vtable_stream.rs`)**: `Frame` passes through; `List`/`Map`/`PathComponent`
-  return a clear error tagged `// TODO(streaming): DynamicFrameTable, WP2b`. The real
-  `DynamicFrameTable` per-tick rebuild (§8.6) needs WP3 frame producers to integration-test.
-- **`insert_vtable`**: registers member-template ty/shape from `realize_fields(None)`;
-  concrete keyed components must be created lazily at apply/ingest (`// TODO(WP2b)`).
-- **C++**: `ElementFields::to_cpp()` added to `gen-cpp`; the hand-written `cpp/vtable.hpp`
-  builder intentionally omits the dynamic ops (documented), so no silent gap.
+Dynamic member templates need no rewrite there: they use `Op::PathComponent`, which composes
+its id at realize time from the runtime path and bakes **no** id into `data`. The frame-tag id
+(baked bare by `with_frame`) and the schema `ty`/`dim` blobs are likewise absent from the map
+and left untouched. So a dlopen'd dynamic frame keys its components the same way as a static
+one once the runtime prefix flows through the same `PathHasher` walk.
+
+---
+
+## 12. Status of the consumer side
+
+The producer (`FrameWriter`), the realization engine (`for_each_field` / `walk_field` /
+`expand_dynamic`), the op set, `PathHasher`, the `FrameList`/`FrameMap` surface, and the
+wiring/compatibility and dlopen paths are all implemented and tested (see the dynamic-frame
+tests in `metor-proto/src/vtable.rs` covering §5a/§5b/§5c, dot-in-key rejection, and
+registration mode).
+
+`metor-db`'s ingest and streaming of dynamic frames is the one piece not yet built: lazy
+creation of concrete keyed/indexed components on first sample, and re-serializing a
+runtime-sized trailer per subscriber tick. That db-side design lives in
+[`db-dynamic-streaming.md`](db-dynamic-streaming.md). Until it lands, `metor-db` registers the
+member templates from `realize_fields(None)` but does not stream concrete dynamic components;
+no part of the `metor-fsw-2` model above depends on it.

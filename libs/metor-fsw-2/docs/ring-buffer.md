@@ -1,163 +1,140 @@
-# Work-Package 1 — Ring Buffer
+# Ring Buffer (`metor-fsw-ring`)
 
-> Design document only. No implementation exists yet. This describes the data
-> path primitive for `metor-fsw-2`; it is meant to be reviewed before any crate
-> or Rust is written. Where it can, it reuses the proven techniques from the
-> existing `metor-db` disruptor (`libs/db/src/disruptor.rs`); where it must
-> diverge — overwrite semantics and shared memory — that is called out
-> explicitly.
+The lock-free, shared-memory ring buffer is the transport over which
+`metor-fsw-2` systems exchange data. Every system writes its output frames into
+one or more ring buffers and reads its inputs from *views* into other systems'
+buffers (cyclic systems view upstream outputs directly; async systems read
+private input buffers the coordinator fills for them — see `DESIGN.md`). A system
+may run as a dlopen'd library inside the coordinator's process *or* as a separate
+process, so the buffer works identically in-process and across a process
+boundary: it lives in one contiguous region addressed by fixed byte offsets and
+contains no process-local pointers.
 
-## 1. Purpose & role in metor-fsw-2
+The crate generalizes the `metor-db` disruptor (`libs/db/src/disruptor.rs`)
+along two axes — a **writer-chosen overrun policy** (the disruptor only ever
+backpressures) and **shared-memory residence** (the disruptor uses heap
+`Arc`/`Box` structures). Its unsafe core reuses the disruptor's proven
+techniques: absolute monotonic `u64` cursors with `phys = abs & mask`, a
+`committed` Release/Acquire publication handshake, and a `high_water_mark` wrap
+gap.
 
-The ring buffer is the single transport over which `metor-fsw-2` systems
-exchange data. Every system writes its output frames into one or more ring
-buffers and reads its inputs from *views* into other systems' buffers (cyclic
-systems view upstream outputs directly; async systems read private input buffers
-the coordinator fills for them — see `DESIGN.md`). Because a system may be a
-dl-opened library in the coordinator's process *or* a separate process, the ring
-buffer must work identically in-process and across a process boundary, which
-means it must live in shared memory and contain no process-local pointers. The
-defining behavioral requirement is a **writer-chosen overrun policy** with a
-**non-blocking, overwrite-on-lap default**: by default a producing system always
-makes progress and a reader that falls more than a buffer behind is *detected*
-rather than waited on, but a writer may opt into the disruptor's
-guarantee-delivery behavior (error or wait) where its channel needs it. This
-generalizes the db disruptor (which only ever backpressures) and matches
-`DESIGN.md`: "writers do not block by default but may opt to error or wait."
+## 1. Overrun policy
 
-## 2. Requirements (made precise)
+A buffer is created in one of two modes (`Overrun`), fixed at creation and
+recorded in the header. The mode is the read-soundness contract every view
+relies on, so a buffer cannot mix writes of different modes — that would silently
+void the borrow guarantee.
 
-1. **Writer-chosen overrun policy.** When a write would reuse data-region bytes
-   an active reader has not consumed, the *writer* decides the outcome. Three
-   behaviors are supported, selected per buffer (recorded in the header) with a
-   further per-call choice inside the lossless mode:
-   - **Overwrite** (default; never blocks) — the writer proceeds and overwrites;
-     a lapped reader detects it via `is_lapped()` / `Err(Lapped)`. This is the
-     framework default for cyclic-system outputs (matches `DESIGN.md`).
-   - **Error / skip** — `try_write` returns `WouldBlock` if it would overwrite
-     the slowest *active* reader (the disruptor's in-use check), so the writer
-     can drop the write instead of clobbering data.
-   - **Wait** — `write().await` suspends until a reader frees enough space.
+- **`Overrun::Overwrite` (default).** The writer never blocks on readers. When a
+  write would reuse data-region bytes a slow reader has not consumed, the writer
+  overwrites them and proceeds; the lapped reader *detects* this via
+  `View::is_lapped()` / `Err(ReadError::Lapped)` rather than being waited on.
+  This is the framework default for cyclic-system outputs: a producing system
+  always makes progress, and a reader that falls more than a buffer behind is a
+  hard error the coordinator telemeters (per `DESIGN.md`). Because the writer can
+  race a reader on the same bytes, reads in this mode copy the payload out and
+  re-validate — see §6.
+- **`Overrun::Lossless`.** The writer honors the disruptor's in-use check and
+  never overwrites in-flight bytes. `Writer::try_write` returns
+  `Err(WriteError::WouldBlock)` rather than clobbering the slowest active reader;
+  the async `Writer::write` suspends until a reader frees space. A view on a
+  lossless buffer can never become lapped, so reads are tear-free and may borrow
+  the bytes in place (`View::try_read`), exactly as the disruptor does.
 
-   Overwrite is a distinct *buffer* mode (it changes the read-soundness
-   contract — see below and §6); error and wait are two per-call flavors of the
-   single **lossless** mode, which never overwrites in-flight bytes. The mode
-   the buffer was created with is the read contract every view relies on, so a
-   buffer cannot mix overwrite and lossless writes (that would silently void the
-   borrow guarantee).
-2. **Lap detection on the read side.** Each view holds its own absolute read
-   head `r`. A view is *lapped* when `committed - r > capacity`: the writer has
-   advanced more than one full data region past the view's cursor, so the bytes
-   at `r`'s physical slot have been overwritten. The view exposes this directly
-   (`View::is_lapped()`), and every read returns `Err(ReadError::Lapped)` rather
-   than handing back overwritten or torn data. This is the API the coordinator
-   calls before invoking a cyclic system; on `Lapped` it telemeters and stops
-   invoking that module (a hard error, per `DESIGN.md`). In a lossless buffer a
-   view can never become lapped, since the writer respects the in-use check.
-3. **Shared-memory capable, offset-based.** The buffer is a single contiguous
-   region. Everything stateful inside it — write cursor, high-water mark,
-   per-reader cursors, framing — is plain integers/atomics at *fixed byte
-   offsets*; all internal references are relative offsets, never absolute
-   pointers. No `Box`, `Arc`, `Vec`, or any process-local pointer is ever stored
-   inside the region. The backing store is abstracted: a `Box<[UnsafeCell<u8>]>`
-   for in-process use and tests, an `mmap` for shared use.
-4. **Absolute monotonic cursors.** All cursors are `u64` absolute byte counts;
-   the physical offset of absolute position `a` is `a % capacity`. The
-   `committed` Release/Acquire handshake and the high-water-mark wrap handling
-   are taken directly from the disruptor.
-5. **Multiple readers, independent cursors,** stored in a fixed-size reader
-   table at a known offset (capacity-bounded number of readers, chosen at
-   creation). The disruptor's heap linked list of `Arc<ReadNode>` cannot be used
-   — see §7.
-6. **Variable-length messages,** length-prefixed and never straddling the wrap
-   (a wrap gap is left, exactly as the disruptor does).
-7. **Async wake** is behind a trait so the in-process build uses a local
-   notifier and a future cross-process build can use a process-shared primitive.
-   The notifier is *not* part of the shared layout. Cross-process notification
-   is explicitly out of scope for WP1.
+`is_lapped()` is always `false` on a lossless buffer.
 
-## 3. Memory layout
+## 2. Memory layout
 
-One contiguous region (`Box<[u8]>` or `mmap`), three logical zones: a **header**
-(immutable after creation), a **control block** (the live atomics), a
-**reader-cursor table** (fixed array of slots), and the **data region**. All
-multi-byte fields are little-endian; the region is assumed to be shared only
-between processes of the same architecture (see open questions). Control words
-and reader slots are padded to 64-byte cache lines to avoid false sharing.
+One contiguous region (`BoxBacking`, `MmapBacking`, or a borrowed `RawBacking`),
+four logical zones: a **header** (immutable after creation), a **control block**
+(the live writer atomics), a **reader-cursor table** (a fixed array of slots),
+and the **data region**. Multi-byte fields are stored in **native byte order**;
+the `arch_tag` handshake (below) rejects regions written by a different pointer
+width or endianness on attach, so cross-endian reinterpretation never happens.
+Control words and reader slots are padded to 64-byte cache lines to avoid false
+sharing.
 
 ### What is shared-memory-resident vs process-local
 
-- **In the region (shared):** header, control block atomics, reader-cursor
-  table, data bytes. Addressed only by fixed offset.
-- **In the process-local handle (never shared):** the mapping base
-  pointer/`Backing`, the cached `capacity`/`max_readers`, the owned reader-slot
-  *index* a `View` holds, and the async `WakeSource`/`WakeSink`. These are
-  reconstructed on `attach`, never read out of the region.
+- **In the region (shared):** the header, the control-block atomics, the
+  reader-cursor table, and the data bytes. Addressed only by fixed offset.
+- **In the process-local handle (never shared):** the mapping base pointer
+  (`Backing`), the cached `capacity`/`mask`/`max_readers`/`overrun`/offsets, the
+  reader-slot *index* a `View` holds, and the async `WakeSource`/`WakeSink`.
+  These are reconstructed on attach (`from_validated` reads the geometry back out
+  of the header), never stored in the region.
 
 ### Header (cache line 0, bytes `0x00..0x40`)
 
-| Offset | Size | Type   | Field                 | Notes |
-|--------|------|--------|-----------------------|-------|
-| `0x00` | 4    | `u32`  | `magic`               | e.g. `b"MFR1"`; validated on attach |
-| `0x04` | 2    | `u16`  | `version`             | layout version |
-| `0x06` | 2    | `u16`  | `flags`               | bit 0: shared-futex wake word present (future) |
-| `0x08` | 8    | `u64`  | `capacity`            | size of the data region in bytes |
-| `0x10` | 8    | `u64`  | `data_offset`         | region-relative offset of byte 0 of data |
-| `0x18` | 4    | `u32`  | `max_readers`         | number of slots in the reader table |
-| `0x1C` | 4    | `u32`  | `reader_table_offset` | region-relative offset of slot 0 |
-| `0x20` | 8    | `u64`  | `total_size`          | full region size in bytes |
-| `0x28` | 24   | —      | reserved / pad        | to 64 B |
+| Offset | Size | Type  | Field                 | Notes |
+|--------|------|-------|-----------------------|-------|
+| `0x00` | 4    | `u32` | `magic`               | `b"MFR1"` read as a native `u32`; validated on attach |
+| `0x04` | 2    | `u16` | `version`             | layout version (currently `1`) |
+| `0x06` | 2    | `u16` | `flags`               | bit 0 `FLAG_WAKE_SHARED` (reserved, never set); bit 1 `FLAG_LOSSLESS` (set iff lossless) |
+| `0x08` | 8    | `u64` | `capacity`            | data-region size in bytes; a power of two |
+| `0x10` | 8    | `u64` | `data_offset`         | region-relative offset of data byte 0 |
+| `0x18` | 4    | `u32` | `max_readers`         | number of slots in the reader table |
+| `0x1C` | 4    | `u32` | `reader_table_offset` | region-relative offset of slot 0 |
+| `0x20` | 8    | `u64` | `total_size`          | full region size in bytes |
+| `0x28` | 8    | `u64` | `arch_tag`            | pointer-width + endianness tag; validated on attach |
+| `0x30` | 16   | —     | pad                   | to 64 B |
+
+`arch_tag` is `((0x0102_0304u32 as u64) << 32) | size_of::<usize>()`. Its byte
+pattern differs across endianness, and the low word carries the pointer width, so
+a single equality check on attach rejects an incompatible producer
+(`AttachError::ArchMismatch`).
 
 ### Control block (cache line 1, bytes `0x40..0x80`)
 
-| Offset | Size | Type        | Field              | Notes |
-|--------|------|-------------|--------------------|-------|
-| `0x40` | 8    | `AtomicU64` | `committed`        | absolute bytes published; Release by writer, Acquire by readers |
-| `0x48` | 8    | `AtomicU64` | `high_water_mark`  | end of valid data before a pending wrap gap; `u64::MAX` = no gap |
-| `0x50` | 8    | `AtomicU64` | `reserved_end`     | writer-private reservation end (single writer; lets an attacher recover) |
-| `0x58` | 8    | `AtomicU64` | `wake_word`        | reserved for a future cross-process futex/eventfd; unused in WP1 |
-| `0x60` | 32   | —           | reserved / pad     | to next cache line |
+| Offset | Size | Type        | Field             | Notes |
+|--------|------|-------------|-------------------|-------|
+| `0x40` | 8    | `AtomicU64` | `committed`       | absolute bytes published; Release by the writer, Acquire by readers |
+| `0x48` | 8    | `AtomicU64` | `high_water_mark` | absolute end of valid data before a pending wrap gap; `HWM_NONE = u64::MAX` means no gap |
+| `0x50` | 8    | `AtomicU64` | `reserved_end`    | writer-private; reserved for attacher recovery, unused by the live paths |
+| `0x58` | 8    | `AtomicU64` | `wake_word`       | reserved for a future cross-process futex/eventfd |
+| `0x60` | 32   | —           | pad               | to the next cache line |
 
-`committed`, `high_water_mark`, and the wrap gap mechanism are semantically
-identical to the disruptor's `WriteHead`. The disruptor's `write_lock` mutex is
-**not** in the region — see §5 (single writer, no in-region lock).
+`committed`, `high_water_mark`, and the wrap-gap mechanism are semantically
+identical to the disruptor's `WriteHead`. There is **no** in-region mutex: there
+is a single writer per buffer (§5), and a mutex would not be shared-memory-safe
+across processes anyway. The header + control block together are `HEADER_SIZE =
+0x80` bytes; the reader table starts immediately after.
 
-### Reader-cursor table (starts at `reader_table_offset`)
+### Reader-cursor table (starts at `reader_table_offset = 0x80`)
 
-`max_readers` slots, each one 64-byte cache line:
+`max_readers` slots, each a 64-byte cache line (`READER_SLOT_SIZE = 64`):
 
 | Slot offset | Size | Type        | Field    | Notes |
 |-------------|------|-------------|----------|-------|
 | `+0x00`     | 8    | `AtomicU64` | `cursor` | absolute read head, or `FREE_SLOT = u64::MAX` when unclaimed |
-| `+0x08`     | 8    | `AtomicU64` | `epoch`  | generation bumped on claim; for ABA-safe reuse / liveness (see §7, §12) |
+| `+0x08`     | 8    | `AtomicU64` | `epoch`  | generation bumped on claim; ABA-safe reuse hook |
 | `+0x10`     | 48   | —           | pad      | to 64 B |
 
 ### Data region (starts at `data_offset`, length `capacity`)
 
-Raw bytes, framed into **8-byte-aligned records** so payloads can be mapped as
-`repr(C)` frames in place (see below). Each record is:
+Raw bytes framed into **8-byte-aligned records** so payloads can be mapped as
+`repr(C)` frames in place. Each record is:
 
 ```
-[ len: u32 ][ _pad: u32 ][ payload: len bytes ][ tail_pad: (8 - len % 8) % 8 ]
+[ len: u32 ][ _pad: u32 ][ payload: len bytes ][ tail_pad: round_up8(len) - len ]
 └──── 8-byte record header ────┘
 ```
 
-The 8-byte header (a `u32` length plus a `u32` reserved/pad word) puts the
-payload at an 8-byte boundary, and the tail pad rounds the whole record up to a
-multiple of 8. Record total = `8 + round_up(len, 8)`, always a multiple of 8.
-Because `data_offset` is 64-byte aligned (header + control + table are all
-cache-line multiples) and every record length is a multiple of 8, every record
-*start* is 8-byte aligned — and stays so across the wrap as long as `capacity` is
-a multiple of 8 (the wrap gap, `capacity - phys`, is then also a multiple of 8).
-This is why payloads are mappable in place: a borrowed payload (lossless mode) or
-a copy into an 8-aligned destination buffer (overwrite mode) is correctly aligned
-for a `repr(C)` / zerocopy frame with no realignment step.
+The 8-byte header (a `u32` length plus a `u32` pad word — together stored as one
+`u64` whose low 32 bits are the length) puts the payload at an 8-byte boundary,
+and the tail pad rounds the whole record up to a multiple of 8. The total is
+`frame_len(len) = 8 + round_up8(len)`, always a multiple of 8. Because
+`data_offset` is 64-byte aligned (header + control + table are all cache-line
+multiples) and every record length is a multiple of 8, every record *start* is
+8-byte aligned — and stays so across the wrap, because `capacity` is a power of
+two and the wrap gap (`capacity - phys`) is therefore also a multiple of 8. This
+is why payloads are mappable in place with no realignment step.
 
 A record never straddles the wrap: if it would not fit contiguously in the tail,
 the writer leaves a gap from the current physical offset to the end of the data
 region (recording the boundary in `high_water_mark`) and writes the record at
-offset 0 of the next lap. The `len` prefix makes records self-describing so a
-reader recovers boundaries without external metadata.
+offset 0 of the next lap. The `len` prefix makes records self-describing, so a
+reader recovers boundaries with no external metadata.
 
 ```
 region:
@@ -169,463 +146,395 @@ region:
         └──────────────────────────────────────────────┘
 ```
 
-## 4. Cursor model & lap detection
+`frame_len` is public so buffer-sizing callers (fsw-2 system ports) can size a
+ring from a frame's `MAX_SIZE` without re-deriving the header rule.
 
-All cursors are `u64` absolute monotonically increasing byte counts; `phys =
-cursor % capacity`. The disruptor's invariant carries over: a reader cursor is
-never ahead of `committed`, and in-flight (unread) bytes for a reader at `r` are
-`committed - r`.
+## 3. Cursor model & lap detection
 
-**Ordering.** The writer publishes data with a Release store to `committed`; a
-reader does an Acquire load of `committed` before touching any data byte. This is
-the same happens-before edge the disruptor relies on (and that its Miri tests
-exercise). In **lossless** mode this edge is fully sufficient for data-race
-freedom (the writer never overwrites in-flight bytes, exactly as the disruptor),
-so reads can borrow. In **overwrite** mode the writer may race a reader on the
-same bytes, so the edge is the publication mechanism but reads additionally need
-the race-tolerant copy + lap-recheck — see §6 and §12.
+All cursors are `u64` absolute, monotonically increasing byte counts; `phys = abs
+& mask` where `mask = capacity - 1` (capacity is a power of two). The disruptor's
+invariant carries over: a reader cursor is never ahead of `committed`, and the
+in-flight (unread) bytes for a reader at `r` are `committed - r`. Absolute
+counters make "caught up" (`r >= committed`) unambiguous and survive the physical
+wrap. The single 16-EiB `u64` wrap at `committed` is not a concern in practice.
 
 **Lap test.** A view at `r` is lapped iff
 
 ```
-committed - r > capacity
+committed.wrapping_sub(r) > capacity
 ```
 
 The oldest byte still intact is `committed - capacity`; while `r >= committed -
-capacity` (equivalently `committed - r <= capacity`) the bytes at `r` have not
-yet been overwritten. `gap` bytes from a wrap consume absolute cursor space just
-like real bytes (the writer advances `committed` across them), so the test is
-correct in the presence of wrap gaps.
+capacity` (equivalently `committed - r <= capacity`) the bytes at `r`'s physical
+slot have not yet been overwritten. Wrap-gap bytes consume absolute cursor space
+just like real bytes (the writer advances `committed` across them), so the test
+is correct in the presence of gaps.
 
-**Worked wrap example** (`capacity = 104`, 8-byte payloads → 16-byte records:
-8-byte header + 8-byte payload, already a multiple of 8 so no tail pad):
+**Worked example** (`capacity = 64`, 16-byte payloads → 24-byte records: 8-byte
+header + 16-byte payload, already a multiple of 8 so no tail pad):
 
-- Writer has published a long stream; `committed = 1040`.
-- View A at `r = 960`: `1040 - 960 = 80 ≤ 104` → not lapped. Oldest intact byte
-  is `936`; A can still read records at `960, 976, …`.
-- View B at `r = 928`: `1040 - 928 = 112 > 104` → **lapped**. The physical slot
-  `928 % 104 = 96` was overwritten when the writer passed `1032`. B's next read
-  returns `Err(Lapped)`.
-- A wrap gap example: with the writer at `committed = 96` (`phys = 96`), a
-  16-byte record will not fit in the 8 tail bytes, so the writer sets
-  `high_water_mark = 96`, leaves bytes `96..104` as an 8-byte gap, and writes the
-  record at absolute `104..120` (`phys 0..16`). A reader whose cursor reaches `96`
-  exactly skips to `104`, identical to the disruptor's `poll_grant` hwm path. The
-  gap is a multiple of 8, so record-start alignment survives the wrap.
+- The writer has published a long stream; `committed = 200`. The oldest intact
+  byte is `200 - 64 = 136`.
+- View A at `r = 160`: `200 - 160 = 40 ≤ 64` → not lapped; A can still read the
+  record at `160` (`phys = 160 & 63 = 32`).
+- View B at `r = 120`: `200 - 120 = 80 > 64` → **lapped**. Physical slot `120 &
+  63 = 56` was overwritten when the writer passed `184`. B's next read returns
+  `Err(Lapped)`.
+- **Wrap gap.** With the writer at `committed = 240` (`phys = 240 & 63 = 48`), a
+  24-byte record will not fit in the 16 tail bytes (`48 + 24 > 64`), so the
+  writer sets `high_water_mark = 240`, leaves bytes `48..64` as a 16-byte gap,
+  and writes the record at absolute `256..280` (`phys 0..24`). A reader whose
+  cursor reaches `240` exactly skips to `256`, the next lap boundary (`(r &
+  !mask) + capacity`). The gap is a multiple of 8, so record-start alignment
+  survives the wrap.
 
-## 5. Write path
+## 4. Write path
 
 There is exactly one writer per buffer (each system owns its output buffer), so
-the disruptor's `write_lock` mutex is unnecessary and is removed — its purpose
-was to serialize multiple grant callers, and there is only one here. Removing it
-also keeps the control block free of any in-region lock (a mutex is not
-shared-memory-safe across processes). The writer keeps `committed`/`hwm`/
-`reserved_end` purely as atomics.
+the writer is the sole mutator of `committed` and `high_water_mark` and reads
+`committed` Relaxed. `Writer::try_write(bytes)`:
 
-The first steps are common to all modes. `write_message(bytes)`:
+1. `rec = frame_len(bytes.len())`. If `rec > capacity` →
+   `Err(WriteError::InsufficientCapacity)`.
+2. `c = committed` (Relaxed; sole writer). `reserve(c, rec)` computes the wrap:
+   `phys = c & mask`; if `phys + rec > capacity` then `gap = capacity - phys` (a
+   multiple of 8) and `start_abs = c + gap`, else `gap = 0` and `start_abs = c`.
+3. **Mode branch.** In `Lossless` mode, check `fits(c, gap + rec)`: with `slowest
+   = slowest_active_cursor()` (the min cursor over non-free slots, or `c` if no
+   readers), the write fits iff `c.wrapping_sub(slowest) + gap + rec <=
+   capacity`. If it does not → `Err(WriteError::WouldBlock)`. In `Overwrite` mode
+   there is **no** in-use check — the writer proceeds regardless of reader
+   cursors (the key divergence from the disruptor's `try_grant`).
+4. **Commit** (`commit(c, start_abs, gap, bytes)`):
+   - Write the record header + payload at `phys' = start_abs & mask`
+     (`write_record`, mode-specific — see §6).
+   - If `gap > 0`, store `high_water_mark = c` (Release) so readers skip the gap.
+   - `committed.store(start_abs + rec, Release)`, then `data.notify()`.
 
-1. `len = bytes.len()`; `rec = 8 + round_up(len, 8)` (8-byte record header + tail
-   pad). If `rec > capacity` → `Err(InsufficientCapacity)`.
-2. `c = committed` (the writer owns it; Relaxed load suffices, no other writer).
-   `phys = c % capacity`.
-3. **Wrap check:** if `phys + rec > capacity`, set `gap = capacity - phys` (a
-   multiple of 8), `start_abs = c + gap`; else `gap = 0`, `start_abs = c`.
-   `need = gap + rec`.
+The Release store of `committed` hands the freshly written bytes (and the
+`high_water_mark` store) to readers, which Acquire-load `committed` before
+touching any data byte — the same happens-before edge the disruptor relies on.
 
-What happens next depends on the buffer's overrun mode:
+`Writer::write(bytes)` is the async lossless form: it loops, and when the write
+does not fit it awaits the **space-available** sink (`space.wait_until(...)`)
+until a reader frees enough room, then re-evaluates. In overwrite mode `write`
+resolves immediately without ever suspending. In overwrite mode the writer is
+wait-free with respect to readers; the only failure is an over-capacity message.
 
-- **Overwrite mode (default):** skip straight to the publish. There is **no**
-  `slowest_cursor` / in-use check; the writer proceeds regardless of reader
-  cursors. This may write over bytes a slow reader has not consumed — intended,
-  and what the lap test detects. (Key divergence from `try_grant`.)
-- **Lossless mode — `try_write` (error/skip):** compute `slowest =
-  slowest_active_cursor()` (the min cursor over non-free reader slots, like the
-  disruptor's `slowest_cursor`) and `in_use = committed - slowest`. If `in_use +
-  need > capacity` → `Err(WouldBlock)`; the writer drops the message. Otherwise
-  proceed.
-- **Lossless mode — `write().await` (wait):** the same in-use check, but instead
-  of erroring the writer awaits a *space-available* notifier (the reverse-
-  direction wake of §8, woken when a reader advances its cursor) and rechecks,
-  exactly the pattern the disruptor's commented-out async `grant` wanted but
-  without the mutex that made it deadlock-prone.
+## 5. Read path & views
 
-Then, common to all modes:
+A `View` owns one reader-table slot (its index lives in the process-local
+handle) and reads whole records. `locate()` finds the next readable record:
 
-4. If `gap > 0`, store `high_water_mark = c` (Release) so readers skip the gap.
-5. Write the 8-byte record header (`len`, reserved word) then the payload into
-   `phys'..phys'+rec` where `phys' = start_abs % capacity`.
-6. Publish: `committed.store(start_abs + rec, Release)`; then `wake.notify()`.
+1. `r = slot.cursor` (Acquire), `c = committed` (Acquire).
+2. **(Overwrite only) pre-check lap:** if `c.wrapping_sub(r) > capacity` →
+   `Err(Lapped)`.
+3. If `r >= c` → `Ok(None)` (caught up).
+4. **Skip gap:** if `r == high_water_mark`, store the cursor forward to the next
+   lap boundary `(r & !mask) + capacity` (Release), notify the space sink, and
+   retry from step 1.
+5. Read `len` from the record header at `phys = r & mask` (`read_len`).
+6. **(Overwrite only) straddle guard:** a real record never straddles the wrap,
+   so if `phys + rec > capacity` the header was being overwritten by a lapping
+   writer → `Err(Lapped)` (rather than copying out-of-bounds garbage; this also
+   keeps the subsequent payload copy in-bounds).
+7. Return the located record (`r`, `phys`, `len`, `rec`).
 
-The grant form (`try_write(len) -> WriteGrant`) defers the `committed` publish to
-grant drop, mirroring the disruptor's `WriteGrant::drop`; the record header is
-written by the grant constructor and the caller fills the payload. In overwrite
-mode a writer is wait-free with respect to readers (the only failure is an
-over-capacity message); in lossless mode it can additionally return `WouldBlock`
-or suspend.
+The read-soundness contract from here depends on the mode, and this is the crux
+of the writer-policy design.
 
-## 6. Read path & views
+**Lossless buffers: tear-free, borrow is sound.** The writer's in-use check
+provably keeps it from touching the bytes of a record a reader still owns — the
+same guarantee that lets the disruptor hand out a borrowed `&[u8]`. The Acquire
+load of `committed` establishes happens-before against the writer's Release, and
+the in-use check is the happens-after edge that keeps the bytes stable until the
+reader advances. `View::try_read()` therefore returns a `ReadGrant` borrowing the
+payload in place (zero copy); dropping the grant advances the cursor and notifies
+the writer. `is_lapped` can never be true here.
 
-A `View` owns one reader-table slot (index stored in the process-local handle)
-and reads whole records. The common skeleton of `try_read_into(buf)`:
+**Overwrite buffers: the writer races the reader, so copy + recheck.** The writer
+may begin overwriting a record while the reader reads it, so a borrow is unsound
+(`try_read` returns `Err(BorrowNotSupported)`). `View::try_read_into(buf)` instead
+**copies the payload out** with race-tolerant relaxed atomic byte loads — the
+bytes are a genuine concurrent read/write, not a plain `&[u8]` load — and then
+**post-validates**: re-load `committed` (Acquire); if `c2.wrapping_sub(r) >
+capacity` the writer lapped this view *during* the copy and the snapshot may be
+torn → `Err(Lapped)`, do not advance. Otherwise the copy is a consistent snapshot
+and the cursor advances (Release) past `rec`. This is a seqlock-style whole-buffer
+recheck: a single forward-only writer never rewrites the *same* absolute slot
+within a lap, so re-checking the lap condition is sufficient — no per-record
+version word is needed.
 
-1. `r = slot.cursor` (Acquire). `c = committed` (Acquire).
-2. **Pre-check lap:** if `c - r > capacity` → `Err(Lapped)`.
-3. If `r >= c` → `Ok(false)` (nothing new; absolute counters make "caught up"
-   unambiguous, as in the disruptor).
-4. **Skip gap:** if `r == high_water_mark`, advance `r` to the next lap boundary
-   `((r / capacity) + 1) * capacity` and continue (identical to the disruptor's
-   `poll_grant` hwm branch).
-5. Read `len` from the record header at `phys = r % capacity`; the payload is
-   `bytes[phys+8 .. phys+8+len]`.
-6. (overwrite mode only) **Post-validate**, then advance:
-   `slot.cursor.store(r + 8 + round_up(len, 8), Release)`; `Ok(true)`.
+`try_read_into` works on both kinds of buffer and is always safe: on a lossless
+buffer the copy is a plain `copy_nonoverlapping` and the post-validate is skipped
+entirely (it never fires). `View::read_into(buf)` is the async form — it loops
+`try_read_into`, awaiting the **data-available** sink between attempts.
 
-The read-soundness contract for step 5 depends on the buffer's overrun mode, and
-this is the crux of the writer-policy design:
+`is_lapped()` is the standalone lap check (`committed - cursor > capacity`,
+always `false` on a lossless buffer) and is what the coordinator calls before
+invoking a cyclic system. `cursor()` / `committed()` accessors let the
+coordinator or a monitor inspect lag without performing a read. `resync()` stores
+the cursor forward to the current `committed` (Release), abandoning unread
+(possibly lapped) data — the recovery after `Err(Lapped)`.
 
-**Lossless buffers (error/wait writers): tear-free, borrow is sound.** The writer
-honors the in-use check, so it provably will not touch the bytes of a record a
-reader still owns — the same guarantee that lets the disruptor hand out borrowed
-`&[u8]`. Here `View` can offer a zero-copy `try_read()` returning `&[u8]` into the
-ring: the Acquire load of `committed` establishes happens-before against the
-writer's Release, and the writer's in-use check is the happens-after edge that
-keeps the bytes stable until the reader advances. This is exactly the disruptor's
-proven read path. `is_lapped` can never be true on such a buffer.
+## 6. The byte-by-byte atomic copy
 
-**Overwrite buffers (default): the writer races the reader, so copy + recheck.**
-The writer may begin overwriting a record while a reader reads it, so a borrow is
-unsound. The safe read **copies the payload out** using race-tolerant accesses
-(relaxed atomic / `volatile` byte reads, not a plain `&[u8]` load — the bytes are
-a genuine concurrent read/write), then **post-validates**: re-load `committed`
-(Acquire); if `c2 - r > capacity` the writer lapped us *during* the copy and the
-snapshot may be torn → `Err(Lapped)`, do not advance. Otherwise the copy is a
-consistent snapshot and the cursor advances. This is the seqlock-style validate;
-it is required *only* in overwrite mode. The exact mechanism (whole-buffer
-recheck vs. a per-record version word) is the soundness decision in §12, and the
-Miri story (below / §12) targets this path specifically.
+In overwrite mode `write_record` and `copy_payload` deliberately touch the data
+bytes through **relaxed atomics**, not plain memory accesses:
 
-`try_read_into` (copy) works on both kinds of buffer and is always safe — on a
-lossless buffer the post-validate is a cheap no-op that never fires. The
-borrowing `try_read() -> &[u8]` is offered only on lossless buffers (gated by the
-header overrun mode); on an overwrite buffer a borrow remains an `unsafe`/advanced
-escape hatch (§12). `View::read_into` is the async form: `wait().await` then
-`try_read_into` in a loop.
+- `write_record` stores the 8-byte header as one `AtomicU64` (Relaxed) and each
+  payload byte as an `AtomicU8` (Relaxed).
+- `copy_payload` / `read_len` load them back the same way (`AtomicU8` /
+  `AtomicU64`, Relaxed).
 
-`is_lapped(&self) -> bool` is step 2 standalone (`committed - cursor >
-capacity`), and is what the coordinator calls before invoking a cyclic system on
-an overwrite buffer. `committed()` / `cursor()` accessors let the coordinator or
-a monitor process inspect lag without performing a read.
+This is a load-bearing invariant, not a quirk. In overwrite mode the writer and a
+reader can legitimately access the *same* bytes at the same time; under the C/Rust
+memory model a concurrent non-atomic read/write is undefined behavior regardless
+of how the result is later validated. Performing both sides as relaxed atomics
+makes the overlap a **defined data race with an indeterminate (but not UB)
+result**, which the whole-buffer lap recheck then discards if the writer
+overwrote the snapshot mid-copy. The later `committed` Release/Acquire still
+orders the relaxed stores before publication, so a reader that is *not* lapped
+observes exactly the bytes the writer published.
 
-## 7. Reader registration in shared memory
+In lossless mode there is no such overlap, so `write_record`/`copy_payload` use
+plain pointer writes and `copy_nonoverlapping` — race-free purely by the in-use
+check and the `committed` handshake, exactly like the disruptor.
 
-The disruptor registers readers in a heap-allocated, lock-free Treiber list of
-`Arc<ReadNode>` (`Readers` / `ArcAtomic`). **That structure cannot live in
-shared memory:** it stores `Arc` pointers (process-local heap addresses) and
-allocates nodes on the local heap; another process mapping the region would see
-dangling pointers, and the `Arc` strong counts are meaningless cross-process.
+## 7. Reader registration
 
-Instead WP1 uses a **fixed-size reader table** (§3): `max_readers` slots at a
-known offset, addressed by index. Registration mirrors the disruptor's *slot
-reuse* idea (claim a free slot with a single CAS) but over a flat array instead
-of a linked list:
+Readers register in a **fixed-size reader table** (§2): `max_readers` slots at a
+known offset, addressed by index. A heap Treiber list of `Arc<ReadNode>` like the
+disruptor's cannot live in shared memory — it stores process-local heap pointers
+and its `Arc` strong counts are meaningless cross-process — so the table mirrors
+only the disruptor's *slot-reuse-by-CAS* idea over a flat array:
 
-- `view()`: scan slots `0..max_readers`; for each, CAS `cursor` from `FREE_SLOT`
-  to the current `committed` (Acquire-load of `committed` first, so a new reader
-  only sees data committed from now on — same rule as `Disruptor::reader()`). On
-  success, bump `epoch`, return a `View` holding that slot index. If no slot is
-  free → `Err(FullReaderTable)`.
-- `View::drop`: `cursor.store(FREE_SLOT, Release)`, freeing the slot for reuse —
-  a single wait-free store, like `Reader::drop`.
+- **`RingBuffer::view(data, space)`:** Acquire-load `committed` as the start
+  cursor (so a fresh view only sees data committed from now on, never older
+  possibly-lapped data — same rule as `Disruptor::reader`). Scan slots
+  `0..max_readers`, CAS each `cursor` from `FREE_SLOT` to `start` (Acquire
+  success, Relaxed failure). On success, bump `epoch` (`fetch_add(1, Release)`)
+  and return a `View` holding that slot index. If no slot is free →
+  `Err(FullReaderTable)`.
+- **`View::drop`:** `cursor.store(FREE_SLOT, Release)` — a single wait-free store
+  that frees the slot for reuse.
+- **`RingBuffer::reader_count()`** scans the table for non-free cursors.
 
-Trade-offs vs. the linked list: the maximum number of concurrent readers is
-fixed at creation (must be sized for the worst case); registration is an
-`O(max_readers)` scan; but there is **no allocation, no `Arc`, no pointers**, and
-the whole thing is addressable by offset, which is exactly what shared memory
-requires. The `epoch` word guards against ABA on reuse and is the hook for
-crash-reclamation (§12).
+Trade-offs versus the linked list: the maximum number of concurrent readers is
+fixed at creation and registration is an `O(max_readers)` scan, but there is no
+allocation, no `Arc`, no pointers, and the whole structure is addressable by
+offset — exactly what shared memory requires. The `epoch` word guards against ABA
+on slot reuse.
 
-## 8. Async wake abstraction
+## 8. Async wake
 
-Async systems waiting on new data need to be woken when the writer commits. The
-notifier is kept **out of the shared region** and behind a trait so the
-mechanism can vary:
+Async systems are woken across two directions, both expressed through one trait
+pair kept **out of the shared region**:
 
 ```rust
-/// Writer side: signal that new data was committed.
-pub trait WakeSource: Send + Sync {
+/// Signals that progress was made (new data committed, or space freed).
+pub trait WakeSource {
     fn notify(&self);
 }
 
-/// Reader side: await the next notification.
-pub trait WakeSink: Send + Sync {
-    fn wait(&self) -> impl core::future::Future<Output = ()> + '_;
+/// Awaits progress: completes once `ready()` returns true. Implementations must
+/// avoid lost wakeups by re-checking `ready` after arming.
+pub trait WakeSink {
+    async fn wait_until<F: FnMut() -> bool>(&self, ready: F);
 }
 ```
 
-There are two notification directions: **data-available** (writer → readers, on
-commit) and, for the lossless **wait** writer, **space-available** (readers →
-writer, when a reader advances its cursor). Both use the same trait pair.
+- **Data-available** (writer → readers, on commit): the `Writer` holds a
+  `WakeSource` (`data`) it `notify()`s after publishing; each async `View` holds
+  a `WakeSink` (`data`) its `read_into` awaits.
+- **Space-available** (readers → writer, when a reader advances): each `View`
+  holds a `WakeSource` (`space`) it `notify()`s on advance / gap-skip; the
+  lossless `Writer` holds a `WakeSink` (`space`) its async `write` awaits.
 
-- **In-process (v1):** `WaitQueue`-backed notifiers (e.g. stellarator / maitake,
-  the same primitive the disruptor's `new_data_queue` uses) implement both
-  traits. The `Writer` holds a data-available `WakeSource` and (in wait mode) a
-  space-available `WakeSink`; each async `View` holds a data-available `WakeSink`
-  and (against a wait-mode writer) signals a space-available `WakeSource` when it
-  advances. `View::read_into` is `wait().await` then `try_read_into` in a loop,
-  mirroring `Reader::next`.
-- **Cross-process: DEFERRED, room reserved.** A future impl backed by the
-  reserved `wake_word` control slot plus a futex/eventfd/named-semaphore. The
-  header `flags` bit and the `wake_word` slot reserve layout room for it without
-  committing to a mechanism. **v1 does not implement cross-process wake** and is
-  in-process only; a future out-of-process system can poll `try_read_into` until
-  it is built. The `WakeSource`/`WakeSink` traits exist precisely so this drops
-  in later without touching the shared layout.
+The predicate form (`wait_until(ready)`) lets the sink re-check the condition
+after arming, closing the lost-wakeup window.
 
-Synchronous consumers (the coordinator polling cyclic inputs once per cycle) use
-`try_read_into` / `is_lapped` and need no waker at all.
+Implementations:
 
-## 9. Proposed public API surface
+- **`NoWake`** — a no-op source/sink. The `try_*` paths never touch the wake
+  hooks, so this is the right choice for synchronous consumers (the coordinator
+  polling cyclic inputs once per cycle, and the Miri tests). Under `NoWake` the
+  async paths degenerate to caller-driven polling.
+- **`Notifier`** (behind the `async` feature) — backed by a `stellarator`
+  `WaitQueue`, shared by clone between the writer and views for one direction.
 
-Proposal, not implementation. Names and signatures are for review.
+## 9. Public API surface
 
 ```rust
-/// Pluggable backing storage. `Box` for in-proc/tests, mmap for shared.
-pub trait Backing: Send + Sync {
-    /// Base of the region. Interior-mutable byte storage (see §12 / Miri).
-    fn base(&self) -> *mut u8;
-    fn len(&self) -> usize;
-}
+pub const fn round_up8(n: usize) -> usize;
+pub const fn frame_len(payload_len: usize) -> usize; // 8 + round_up8(payload_len)
 
-/// Overrun policy, fixed at creation and recorded in the header. Determines the
-/// read-soundness contract every view relies on, so it cannot be mixed.
-pub enum Overrun {
-    /// Default: writer never blocks, overwrites slow readers; reads copy+recheck.
-    Overwrite,
-    /// Writer honors the in-use check (error or wait per call); reads may borrow.
-    Lossless,
-}
+pub enum Overrun { Overwrite, Lossless }
 
 pub struct Config {
-    pub capacity: usize,    // data-region bytes (multiple of 8)
-    pub max_readers: usize, // reader-table slots (over-provision; see §12)
+    pub capacity: usize,    // data-region bytes; power of two
+    pub max_readers: usize, // reader-table slots (over-provision; see §11)
     pub overrun: Overrun,
 }
 
-pub struct RingBuffer<B: Backing> { /* process-local handle: backing + cached header */ }
+pub unsafe trait Backing: Send + Sync {
+    fn base(&self) -> *mut u8;     // re-derived on every access
+    fn len(&self) -> usize;
+    fn is_empty(&self) -> bool { self.len() == 0 }
+}
+
+pub struct RingBuffer<B: Backing> { /* Arc<Inner<B>>: backing + cached geometry */ }
 
 impl RingBuffer<BoxBacking> {
-    pub fn create_in_memory(cfg: Config) -> Self;          // zeroes + writes header
+    pub fn create_in_memory(cfg: Config) -> Self;            // zeroes + writes header
 }
+#[cfg(feature = "mmap")]
 impl RingBuffer<MmapBacking> {
     pub fn create_mmap(path: &Path, cfg: Config) -> std::io::Result<Self>;
-    /// # Safety: caller asserts the file is a valid, same-arch region.
+    /// # Safety: caller asserts `path` is a compatible region, not being torn down.
     pub unsafe fn attach_mmap(path: &Path) -> std::io::Result<Self>;
+}
+impl RingBuffer<RawBacking> {
+    /// # Safety: `base..base+len` is a live, header-valid region outliving all
+    /// writers/views produced from it and not torn down concurrently.
+    pub unsafe fn attach_raw(base: *mut u8, len: usize) -> Result<Self, AttachError>;
 }
 
 impl<B: Backing> RingBuffer<B> {
-    pub fn writer<W: WakeSource>(&self, wake: W) -> Writer<'_, B, W>; // one per buffer
-    pub fn view<S: WakeSink>(&self, wake: S) -> Result<View<'_, B, S>, FullReaderTable>;
+    pub fn region(&self) -> (*mut u8, usize);   // hand the bytes to a second handle
     pub fn overrun(&self) -> Overrun;
     pub fn committed(&self) -> u64;
+    pub fn reader_count(&self) -> usize;
+    pub fn writer<WD: WakeSource, WS: WakeSink>(&self, data: WD, space: WS) -> Writer<B, WD, WS>;
+    pub fn view<RD: WakeSink, RS: WakeSource>(&self, data: RD, space: RS)
+        -> Result<View<B, RD, RS>, FullReaderTable>;
 }
 
-pub struct Writer<'r, B: Backing, W: WakeSource> { /* … */ }
-impl<'r, B: Backing, W: WakeSource> Writer<'r, B, W> {
-    /// Overwrite mode: always Ok unless the message exceeds capacity.
-    /// Lossless mode: Err(WouldBlock) if it would overwrite the slowest reader.
-    pub fn try_write_message(&mut self, bytes: &[u8]) -> Result<(), WriteError>;
-    pub fn try_write(&mut self, len: usize) -> Result<WriteGrant<'_>, WriteError>;
-
-    /// Lossless mode: suspend until space frees, then write. Overwrite mode:
-    /// resolves immediately (never actually suspends).
-    pub async fn write_message(&mut self, bytes: &[u8]) -> Result<(), WriteError>;
-    pub async fn write(&mut self, len: usize) -> Result<WriteGrant<'_>, WriteError>;
+impl<B, WD: WakeSource, WS: WakeSink> Writer<B, WD, WS> {
+    pub fn try_write(&mut self, bytes: &[u8]) -> Result<(), WriteError>;
+    pub async fn write(&mut self, bytes: &[u8]) -> Result<(), WriteError>;
 }
 
-pub struct View<'r, B: Backing, S: WakeSink> { /* owns a reader slot index */ }
-impl<'r, B: Backing, S: WakeSink> View<'r, B, S> {
-    /// True iff `committed - cursor > capacity`. Always false on a lossless buffer.
+impl<B, RD: WakeSink, RS: WakeSource> View<B, RD, RS> {
     pub fn is_lapped(&self) -> bool;
     pub fn cursor(&self) -> u64;
     pub fn committed(&self) -> u64;
-
-    /// Copy the next record into `buf` (safe on both kinds of buffer).
-    /// `Ok(true)` = a record was read, `Ok(false)` = caught up,
-    /// `Err(Lapped)` = overwritten (overwrite buffers only), stop reading.
+    pub fn resync(&self);
     pub fn try_read_into(&mut self, buf: &mut Vec<u8>) -> Result<bool, ReadError>;
-
-    /// Await + copy one record (async systems).
     pub async fn read_into(&mut self, buf: &mut Vec<u8>) -> Result<(), ReadError>;
-
-    /// Zero-copy borrow of the next record. Available ONLY on a lossless buffer
-    /// (where the writer cannot overwrite a borrowed record); returns
-    /// `Err(BorrowNotSupported)` on an overwrite buffer. The borrow holds the
-    /// cursor until dropped/consumed.
-    pub fn try_read(&mut self) -> Result<Option<ReadGrant<'_>>, ReadError>;
+    pub fn try_read(&mut self) -> Result<Option<ReadGrant<'_, B, RS>>, ReadError>;
 }
 
-pub enum WriteError { InsufficientCapacity, WouldBlock }
-pub enum ReadError  { Lapped, BorrowNotSupported }
+pub enum WriteError  { InsufficientCapacity, WouldBlock }
+pub enum ReadError   { Lapped, BorrowNotSupported }
+pub enum AttachError { BadMagic, BadVersion, ArchMismatch }
 pub struct FullReaderTable;
 ```
 
-## 10. Differences from the db disruptor
+`try_read_into` returns `Ok(true)` (a record was read), `Ok(false)` (caught up),
+or `Err(Lapped)` (overwrite buffers only). `try_read` returns `ReadGrant` only on
+a lossless buffer (`Err(BorrowNotSupported)` otherwise); the grant derefs to the
+payload bytes and advances the cursor on drop. `create_in_memory` / `create_mmap`
+panic if `capacity` is not a non-zero power of two or `max_readers` is zero.
 
-| Aspect | `metor-db` disruptor | `metor-fsw-2` ring (proposed) |
+## 10. Backing storage
+
+`Backing` is an `unsafe trait`: an implementor guarantees `base()` returns a
+pointer to a single allocation of at least `len()` bytes that is interior-mutable,
+8-byte aligned, and stable for the lifetime of `self`. The ring forms
+`&AtomicU64`/`&AtomicU8` references and byte slices over this region, re-deriving
+the pointer from `base()` on every access to keep provenance whole-allocation
+wide.
+
+- **`BoxBacking`** — in-process, heap-backed `Box<[UnsafeCell<u64>]>`:
+  interior-mutable (sound to write through, Miri-clean) and `u64`-aligned for the
+  control/cursor atomics. Default for in-process use and tests.
+- **`MmapBacking`** (behind the `mmap` feature) — a `memmap2::MmapMut`,
+  page-aligned and cross-process capable.
+- **`RawBacking`** — a non-owning `(base, len)` over a region someone else owns
+  (the host's backing, or another process's mmap). Its `Drop` frees nothing; the
+  region's own atomics carry all synchronization. This is the same-process
+  dlopen path: the host calls `region()` to read out `(base, len)` and a dlopen'd
+  system reconstructs a ring over the very same bytes via `attach_raw`.
+
+`create_*` lays out the region (`init_region`) and writes the header
+single-threaded before any handle is published. `attach_mmap` / `attach_raw`
+validate the header (`read_header`: magic, version, `arch_tag`) and read the
+geometry back out of the region rather than from arguments (`from_validated`),
+returning `AttachError` on mismatch. `attach_raw` additionally rejects a region
+smaller than `HEADER_SIZE` before any header read, so the validation loads stay
+in-bounds.
+
+## 11. Memory ordering & Miri
+
+The synchronization discipline, summarized:
+
+- **Publication.** The writer publishes with a Release store to `committed`;
+  readers Acquire-load `committed` before touching any data byte. The
+  `high_water_mark` Release store is ordered before that same `committed` Release,
+  so a reader that observes the new `committed` also observes the gap boundary.
+- **Lossless mode is race-free** exactly like the disruptor: the in-use check
+  keeps the writer off in-flight bytes, so the plain (non-atomic) record stores
+  and reads are ordered solely by the `committed` handshake. Borrows are sound.
+- **Overwrite mode has a defined data race** on the data bytes: both writer and
+  reader use relaxed atomics (§6), and the post-copy whole-buffer lap recheck
+  discards any snapshot the writer overwrote mid-read. No undefined behavior, no
+  torn record ever escapes to the caller.
+- **Reader registration** claims a slot with a CAS (Acquire on success) and frees
+  it with a Release store; `slowest_active_cursor` Acquire-loads each slot.
+
+The unsafe core follows the `libs/db` Miri strategy (`libs/db/MIRI.md`;
+mirrored in this crate's `MIRI.md`): the synchronous tests use only the `try_*`
+APIs over a `BoxBacking` (`UnsafeCell`) with `std::thread`, and pass under Miri
+including Tree Borrows and many-seeds interleavings. `concurrent_overwrite_no_ub`
+is the overwrite race coverage (writer/reader race the same bytes via relaxed
+atomics + lap recheck; every non-lapped record parses as a value the writer
+actually wrote); `concurrent_lossless_full_stream` exercises the lossless
+zero-loss path; `concurrent_reader_churn` stresses the slot CAS/free.
+
+## 12. Differences from the db disruptor
+
+| Aspect | `metor-db` disruptor | `metor-fsw-ring` |
 |---|---|---|
-| Slow-reader handling | **Backpressure only**: `try_grant` returns `WouldBlock` | **Writer-chosen**: overwrite (default), or lossless error/wait |
-| Writer blocked by readers | Always (`slowest_cursor` in-use check) | **Never in overwrite**; lossless error/wait reuses the in-use check |
-| Read soundness | Borrow always safe (writer never overwrites in-flight) | **Borrow safe in lossless**; **copy + lap-recheck in overwrite** |
-| Reader registry | Heap **Treiber linked list** of `Arc<ReadNode>` | **Fixed array** of slots, claimed by CAS, addressed by index |
-| Internal references | `Arc`/`Box`/`AtomicPtr` (process-local pointers) | **Relative offsets only**; no pointers in the region |
-| Backing storage | `Box<[UnsafeCell<u8>]>` only | **`Backing` trait**: `Box` (in-proc) or `mmap` (shared) |
-| Cross-process | No | **Yes** (single mapped region, same layout for both) |
-| Record framing | caller's responsibility (raw bytes) | `[len u32][pad u32][payload][tail pad]`, **8-byte aligned** |
-| Writer serialization | In-region `Mutex` (`write_lock`) | **None** (single writer per buffer; no in-region lock) |
-| Wake mechanism | `WaitQueue` field baked into the core | **`WakeSource`/`WakeSink` traits**, kept out of the shared region |
-| Reader count visibility | `reader_count()` walks the list | Scan the fixed table; cursors observable cross-process |
-| Reused techniques | — | **Absolute cursors, `committed` Release/Acquire, `high_water_mark` wrap gap, slot-reuse-by-CAS** all carry over |
+| Slow-reader handling | Backpressure only (`try_grant` → `WouldBlock`) | Writer-chosen: overwrite (default), or lossless error/wait |
+| Writer blocked by readers | Always (`slowest_cursor` in-use check) | Never in overwrite; lossless reuses the in-use check |
+| Read soundness | Borrow always safe | Borrow safe in lossless; copy + lap-recheck in overwrite |
+| Reader registry | Heap Treiber list of `Arc<ReadNode>` | Fixed slot array, claimed by CAS, addressed by index |
+| Internal references | `Arc`/`Box`/`AtomicPtr` (process-local) | Relative offsets only; no pointers in the region |
+| Backing | `Box<[UnsafeCell<u8>]>` only | `Backing` trait: `Box`, `mmap`, or borrowed `Raw` |
+| Cross-process | No | Yes (single mapped region, same layout both sides) |
+| Record framing | caller's responsibility | `[len u32][pad u32][payload][tail pad]`, 8-byte aligned |
+| Writer serialization | In-region `Mutex` (`write_lock`) | None (single writer; no in-region lock) |
+| Wake mechanism | `WaitQueue` baked into the core | `WakeSource`/`WakeSink` traits, out of the shared region |
+| Carried over | — | Absolute cursors, `committed` Release/Acquire, `high_water_mark` wrap gap, slot-reuse-by-CAS |
 
-## 11. Crate placement proposal
+## 13. Crate placement
 
-- **Location:** `libs/metor-fsw-2/ring/` as its own crate.
-- **Package name:** `metor-fsw-ring` (consistent with the `metor-fsw-*` family;
-  the `-2` is a workspace-path detail, not a published name).
-- **Edition / version:** `edition = "2024"`, `version.workspace = true`,
-  `repository.workspace = true`, matching `libs/db`.
-- **Dependencies (minimal):** `memmap2` (already in tree via `libs/db`) behind an
-  `mmap` feature so the in-memory `Box` backing has no mmap dependency;
-  optionally `stellarator`/`maitake` behind an `async` feature for the in-proc
-  `WakeSource`/`WakeSink` impls. `thiserror` for the small error enums. No
-  `metor-proto` dependency in WP1 — the ring is byte-oriented; framing of
-  metor-proto tables is a layer above.
-- **Workspace registration (proposal only):** add `"libs/metor-fsw-2/ring"` to
-  the `members` list in the root `Cargo.toml`. (Not done in this doc — review
-  first.)
-- **Alternative considered:** a module inside a single `metor-fsw-2` core crate.
-  Rejected for WP1 because a standalone crate keeps the unsafe shared-memory core
-  small, independently Miri-testable (as `libs/db` does for the disruptor), and
-  reusable by both the coordinator and out-of-process systems without pulling in
-  the rest of the framework.
+- **Location / name:** `libs/metor-fsw-2/ring/`, package `metor-fsw-ring`
+  (consistent with the `metor-fsw-*` family; the `-2` is a workspace-path
+  detail). `edition = "2024"`, `version.workspace`/`repository.workspace`,
+  matching `libs/db`.
+- **Features:** `mmap` (memmap2, already in tree via `libs/db`) gates
+  `MmapBacking`; `async` gates the `stellarator`-backed `Notifier`. The in-memory
+  `BoxBacking` path and the `try_*`/`is_lapped` APIs need neither.
+- The ring is byte-oriented: framing of `metor-proto` tables is a layer above it,
+  so the crate has no `metor-proto` dependency. Keeping it standalone keeps the
+  unsafe shared-memory core small and independently Miri-testable, and reusable
+  by both the coordinator and out-of-process systems.
 
-## 12. Open questions / risks for the reviewer
+## 14. Reserved for future work
 
-### Still open
+These are not implemented; layout room is reserved so they drop in without a
+layout change:
 
-1. **Overwrite-path data race & Miri (biggest item).** *Only the overwrite mode*
-   has a genuine concurrent read/write on the same bytes (lossless mode is
-   race-free exactly like the disruptor — no special handling needed). Two
-   candidate fixes for overwrite reads: (a) a **whole-buffer recheck** seqlock
-   (copy with relaxed/volatile byte reads, then re-validate the lap condition —
-   §6), or (b) a **per-record version word** written before/after each record so
-   a reader can detect a torn record locally. Which do we adopt? (b) is more
-   local but costs bytes and a second store per record; (a) is cheaper and, since
-   a single forward-only writer never rewrites the *same* absolute slot within a
-   lap, (a) may suffice. Needs a decision plus a Miri test plan mirroring
-   `libs/db/MIRI.md` (sync-only tests, `UnsafeCell` backing, Tree Borrows pass),
-   focused on the overwrite path.
-2. **Sizing `max_readers` and `capacity`.** Both are fixed at creation. How are
-   they chosen/configured per buffer, and what happens when `view()` returns
-   `FullReaderTable` — hard error like a lap?
-3. **Power-of-two capacity.** Mandating a power-of-two `capacity` turns `% cap`
-   into a mask and keeps `phys` aligned across the `u64` cursor wrap at 16 EiB.
-   The disruptor allows arbitrary `cap` and ignores the 16 EiB wrap; do we
-   mandate power-of-two here? (Independent of that, `capacity` must be a multiple
-   of 8 for record alignment.)
-4. **Overwrite-mode borrow.** The lossless zero-copy borrow (`try_read -> &[u8]`)
-   is decided and in the API. Is a borrowing read on an *overwrite* buffer (where
-   the caller must re-check `is_lapped` before trusting the slice) worth offering
-   as an `unsafe`/advanced escape hatch, or do we keep overwrite reads copy-only?
-5. **Cross-arch / endianness.** The layout assumes same-architecture shared
-   memory (little-endian, same atomic widths). Is heterogeneous sharing ever in
-   scope, or do we assert single-arch in the `magic`/`version` handshake?
-6. **Writer process death mid-record (lower priority for v1).** `committed` gates
-   readers off uncommitted bytes, so a dead writer just stalls the stream. Should
-   an *attaching* replacement writer resume from `reserved_end`/`committed`, and
-   how is a dead writer detected? **Lower priority** because v1 is in-process: a
-   crashed writer takes the coordinator with it. Revisit when out-of-process
-   writers land.
-
-### Decided / deferred (recorded here so the reviewer sees them resolved)
-
-- **Record alignment — DECIDED:** records are 8-byte aligned (8-byte header +
-  tail pad, §3); payloads map as `repr(C)` frames in place. (Was an open
-  question; now closed.)
-- **Crash-slot reclamation — DEFERRED for v1.** A reader that crashes leaks its
-  `CLAIMED` slot. v1 is in-process, so a crashed reader takes the process down;
-  we simply **over-provision `max_readers`**. The `epoch` word and a future
-  owner-pid/liveness sweep remain available; no v1 mechanism.
-- **Cross-process wake — DEFERRED for v1.** v1 is in-process (`WaitQueue`
-  notifiers). The reserved `wake_word` control slot and `flags` bit keep layout
-  room, and the `WakeSource`/`WakeSink` traits keep the seam, but no shared-memory
-  notification is implemented in v1.
-
-## Implementation Plan
-
-Design gate passed; this is the build plan for the v1 crate. Decisions applied:
-overwrite reads use a **whole-buffer lap recheck** (not a per-record version
-word); `Overrun::{Overwrite, Lossless}` is per-buffer in the header; records are
-8-byte aligned; **capacity is mandated power-of-two** (`% cap` → `& mask`); attach
-**asserts single-architecture** via a magic/version/`arch_tag` handshake.
-Crash-slot reclamation and cross-process wake are deferred (room reserved).
-
-Steps:
-
-- **Crate scaffold.** `libs/metor-fsw-2/ring`, package `metor-fsw-ring`,
-  `edition = "2024"`, `version.workspace`/`repository.workspace`. Features:
-  `mmap` (memmap2), `async` (stellarator `WaitQueue` notifier), `async` on by
-  default. Register in the root `Cargo.toml` members.
-- **Backing.** `unsafe trait Backing { fn base(&self) -> *mut u8; fn len(); }`
-  with `BoxBacking` (`Box<[UnsafeCell<u64>]>`, 8-byte aligned, default) and
-  `MmapBacking` (behind `mmap`). Atomics are formed on demand as `&AtomicU64` /
-  `&AtomicU8` at fixed offsets re-derived from `base()` (keeps provenance fresh,
-  like the disruptor's `byte_ptr`).
-- **Layout + header handshake.** Header / control block / reader table / data
-  region at the §3 offsets; `create_*` writes magic/version/`arch_tag`/flags and
-  inits cursors to `FREE_SLOT`; `attach_mmap` validates them (rejects mismatched
-  arch/endianness).
-- **Cursor core.** Absolute `u64` cursors, `phys = abs & mask`, `committed`
-  Release/Acquire, `high_water_mark` wrap gap (multiple of 8). Ported from the
-  disruptor.
-- **Writer.** `try_write(&[u8])` (overwrite: always Ok bar oversize; lossless:
-  `WouldBlock` on the `slowest_active_cursor` in-use check) and async
-  `write(&[u8])` (lossless waits on a space-available notifier). Overwrite path
-  stores the record via relaxed atomics (8-byte header as `AtomicU64`, payload as
-  `AtomicU8`); lossless path stores plainly.
-- **View + reader table.** CAS-claim a free slot (Acquire-load `committed` as the
-  start), free on drop. `try_read_into`/`read_into` copy (overwrite: atomic copy +
-  post-`committed` lap recheck → `Err(Lapped)`; lossless: plain copy). `try_read`
-  returns a tear-free `&[u8]` `ReadGrant` (lossless only; `BorrowNotSupported`
-  otherwise). `is_lapped`, `cursor`, `committed`, `resync` (skip to `committed`
-  after a lap).
-- **Wake.** `WakeSource`/`WakeSink` traits, `NoWake` (sync-only), and a
-  feature-gated `Notifier` (`Arc<WaitQueue>`) for in-proc data- and
-  space-available signalling.
-- **Unsafe discipline.** SAFETY comments on every unsafe block; a `// SAFETY:`
-  invariant block on the `Inner` Sync story, mirroring `disruptor.rs`.
-
-Test list (sync tests Miri-runnable per `libs/db/MIRI.md`: `UnsafeCell` backing,
-sync APIs + `std::thread`, Tree Borrows):
-
-- `roundtrip` — write/read a few records, exact bytes back.
-- `wraparound_aligned` — small power-of-two cap with a payload that forces an
-  8-byte wrap gap; reader skips the gap and reconstructs the stream.
-- `multi_reader` — independent cursors each see the full stream.
-- `reader_table_claim_free` — claim/free slots, `FullReaderTable` when exhausted.
-- `overwrite_slow_reader_lapped` — overwrite buffer, a reader left behind gets
-  `Err(Lapped)` (never torn/garbage); earlier in-range reads returned correct
-  bytes.
-- `lossless_backpressure` — lossless `try_write` returns `WouldBlock` rather than
-  lapping; after a read frees space the next write succeeds.
-- `concurrent_overwrite_no_ub` (Miri race coverage) — writer thread overwrites
-  fast, reader copies + rechecks, every non-lapped record parses as a valid
-  value, `resync` on lap.
-- `concurrent_lossless_lossless` (Miri) — lossless writer (spin on `WouldBlock`)
-  + reader reconstruct the full ordered stream with zero loss (the disruptor's
-  guarantee).
-- `concurrent_reader_churn` (Miri) — register/drop views under a running writer;
-  table returns to all-free.
-- `wait_writer` (async, `cfg(not(miri))`) — lossless `write().await` suspends and
-  resumes as a reader drains; no data lost.
-- `mmap_roundtrip` (`cfg(feature = "mmap")`) — create + attach an mmap region,
-  write/read across the handle.
+- **Cross-process wake.** In-process notification uses `Notifier`/`NoWake`. The
+  `wake_word` control slot and the `FLAG_WAKE_SHARED` flag bit reserve room for a
+  shared-memory futex/eventfd, and the `WakeSource`/`WakeSink` traits keep the
+  seam, but no cross-process notification mechanism exists. An out-of-process
+  reader polls `try_read_into` until one is built.
+- **Crash-slot reclamation.** A reader that crashes leaks its claimed slot.
+  Callers over-provision `max_readers`. The `epoch` word and a future
+  owner-pid/liveness sweep remain available as the reclamation hook.
+- **Writer-death recovery.** `committed` gates readers off uncommitted bytes, so
+  a dead writer simply stalls the stream; the `reserved_end` control word is the
+  hook for an attaching replacement writer to resume.

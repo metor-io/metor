@@ -1,175 +1,185 @@
-# Work-Package 5 — The Coordinator
+# The Coordinator
 
-Status: **design only, pre-implementation**. Reviewer sign-off required before any code lands.
-No Rust in this WP. This document specifies the **coordinator**: the single piece of software
-that owns the ring regions, wires the system graph, drives cyclic systems once per cycle, spawns
-async systems, and provisions health. It builds directly on the **landed** WP1 ring
-(`ring/src/lib.rs`) and WP4 system contract (`src/system.rs`, `src/port.rs`, `src/health.rs`,
-`src/descriptor.rs`). WP6 (the KDL config language) layers on top of the builder defined here.
+The **coordinator** is the single piece of software that owns the ring regions, wires the system
+graph, drives cyclic systems once per cycle, spawns async systems, folds in the async copy-in step,
+and provisions per-system health. It is the runtime that turns a set of independently-written
+systems into a running flight-software graph.
 
-Relevant landed code (read before implementing):
-- `src/system.rs` — `System`/`CyclicSystem`/`AsyncSystem`, `SystemInput`/`SystemOutput`,
-  `Out<O,B,WD,WS>` (the framework wrapper that adds `health()`), `CyclicRunner<S,O>` (the WP4
-  stand-in coordinator — **the seam this WP grows**), `descriptor()`.
-- `src/port.rs` — `Output<F,B,WD,WS>::new`, `Input<F,B,RD,RS>::new`, `capacity_for`,
-  `buffer_capacity::<F>`, `DEFAULT_DEPTH`, `Input::{is_lapped,resync,latest,drain,recv}`.
-- `src/health.rs` — `SystemHealth`/`SystemLog`, `HealthPort::{new,record_lapped,end_cycle,error,log}`.
-- `src/descriptor.rs` — `PortDesc`, `SystemDescriptor`, `SystemKind`, `compatible(producer, consumer)`.
-- `ring/src/lib.rs` — `RingBuffer::{create_in_memory,writer,view}`, `Config { capacity, max_readers,
-  overrun }`, `Overrun::{Overwrite,Lossless}`, `frame_len` (now `pub`), `NoWake`, `Notifier`,
-  `BoxBacking`, `View::{is_lapped,resync,try_read_into,read_into}`, `FullReaderTable`.
-- `stellarator` — `run(|| async { … })` (executor entry), `spawn(fut) -> JoinHandle`,
-  `JoinHandle::drop_guard`, `sleep(Duration)`, `sync::WaitQueue` (behind `Notifier`).
+The code lives in `src/coordinator/mod.rs`, with the acceptance tests in `src/coordinator/tests.rs`.
+The `bind` contract is in `src/binder.rs`; the dlopen slot is in `src/dl.rs`.
+
+Almost everything below the builder is reuse: the data path is the ring (`metor-fsw-ring`), the
+typed port wrappers (`src/port.rs`), the system descriptors (`src/descriptor.rs`), the health port
+(`src/health.rs`), and the `CyclicRunner` per-system owner (`src/system/mod.rs`). The coordinator
+adds the builder and its validation/sizing pass, the `bind`/`Binder` contract, the lapped-to-stop
+slot, the copy-in jobs, the telemetry registry, the dlopen integration, and the lifecycle driver.
 
 ---
 
-## 0. Design summary (orientation)
+## 0. Orientation
 
-The coordinator is built in two phases:
+The coordinator runs in two phases.
 
-1. **Build phase (no cycles running).** A `Coordinator::builder()` registers systems
-   (`add_cyclic`/`add_async`) and edges (`connect`). Registration only records each system's
-   `SystemDescriptor` (WP4 already derives it). `build()` then runs the **validation pass**
-   (`compatible()` on every edge, single-writer + fan-out checks), allocates one
-   `RingBuffer<BoxBacking>` per output port sized from the descriptors and fanned-out from the
-   edge set, binds each system's typed `Output<F>`/`Input<F>` ports over those rings (resolving
-   WP4's deferred `SystemOutput::bind`), auto-provisions a health/log buffer pair per system, and
-   returns a ready `Coordinator`.
+1. **Build phase (no cycles running).** `Coordinator::builder(config)` returns a
+   `CoordinatorBuilder` that registers systems (`add_cyclic`/`add_async`/`add_dl_cyclic`/
+   `add_telemetry`) and edges (`connect`/`connect_delayed`). Registration only records each
+   system's `SystemDescriptor` (the derives already produce it) plus a boxed, type-erased
+   registration. `build()` runs the validation pass (`compatible()` on every edge; single-connect,
+   unconnected-input, and unbroken-feedback-cycle checks), allocates one `RingBuffer<BoxBacking>`
+   per output port sized from the descriptors and the fan-out of the edge set, allocates a private
+   copy-in buffer per async input, auto-provisions the coordinator's own health/log/status buffers,
+   binds every system's typed `Output`/`Input` ports over those rings, and returns a ready
+   `Coordinator`.
 
-2. **Run phase.** `Coordinator::run()` executes on `stellarator`: it `init`s every system, spawns
-   each async system's `run` loop once, then enters the cyclic cycle loop (run-fast-then-wait at
-   the configured rate), folding the async copy-in step into the loop. On teardown it signals and
-   joins the async tasks and `shutdown`s every system.
-
-Everything below the builder is reuse: the data path is the landed ring, the port wrappers, the
-descriptors, the health port, and `CyclicRunner`. The genuinely new surface is the builder, the
-graph/validation/sizing logic, the `Binder`/`bind` contract, the grown per-system slot (lapped →
-permanent stop), and the async copy-in plumbing.
+2. **Run phase.** `Coordinator::run_for(cycles)` executes on `stellarator`. It spawns each async
+   system (each of which `init`s itself and signals readiness), waits on an init barrier, runs the
+   cyclic `init`s, releases the async tasks, then drives the cyclic cycle loop for `cycles`
+   iterations — stepping every cyclic system, running the copy-in step, refreshing the status frame,
+   and pacing the rate. On teardown it signals and joins the async tasks and `shutdown`s every
+   cyclic system.
 
 ---
 
 ## 1. Coordinator types & ownership
 
-### 1.1 Top-level types
+### 1.1 Configuration
 
 ```rust
+pub enum ClockMode {
+    /// Wall-clock time: each cycle's `now` is `Timestamp::now()`, and the loop
+    /// sleeps to hold `cycle_rate` (run-fast-then-wait). The default.
+    Wall,
+    /// A simulated clock: each cycle's `now` advances by `dt` from a start epoch
+    /// and the loop does not sleep — it runs cycles as fast as possible.
+    Simulated { dt: Duration },
+}
+
 pub struct CoordinatorConfig {
-    /// Cycle rate the loop holds (run-fast-then-wait). DESIGN.md "Each cycle".
+    /// The single global cycle rate the loop holds (run-fast-then-wait) under a
+    /// Wall clock. Every cyclic system runs every cycle; there is no per-system
+    /// rate division. Ignored under a Simulated clock.
     pub cycle_rate: Hz,            // e.g. 100.0 → a 10 ms budget
-    /// Default in-flight record depth for a buffer whose PortDesc carries no rate_hint.
-    pub default_depth: usize,      // defaults to ring::DEFAULT_DEPTH (= 8)
-}
-
-pub struct Coordinator {
-    config:    CoordinatorConfig,
-    rings:     RingTable,          // owns every RingBuffer<BoxBacking> (§1.2)
-    cyclic:    Vec<Box<dyn CyclicSlot>>,   // type-erased grown runners, in run order (§3)
-    asyncs:    Vec<AsyncTask>,     // spawned-once async loops + shutdown signal (§4)
-    copy_ins:  Vec<CopyIn>,        // private-buffer copy-in jobs for async inputs (§4)
+    /// In-flight record depth for a buffer whose PortDesc carries no rate hint.
+    pub default_depth: usize,      // defaults to DEFAULT_DEPTH (= 8)
+    /// The clock driving the per-cycle `now` and loop pacing (default Wall).
+    pub clock: ClockMode,
 }
 ```
 
-**The coordinator owns the rings; systems borrow into them.** This is the ownership rule
-DESIGN.md states ("Systems own their outputs and borrow their inputs") realized concretely: a
-`RingBuffer<BoxBacking>` is `Arc`-backed and cheaply clonable (`ring/src/lib.rs` `impl Clone for
-RingBuffer`), so the coordinator holds the canonical handle in `RingTable` and the systems' ports
-hold `Writer`/`View` clones derived from it. Keeping the canonical handle alive in `RingTable`
-guarantees a buffer outlives every port over it, regardless of system teardown order.
+A single global `cycle_rate` drives all cyclic systems: every cyclic system runs every cycle. There
+is no per-system rate division — a cyclic system that wants a slower effective rate divides cycles
+itself. The `Simulated` clock makes a mission converge in fixed logical time regardless of host
+speed: each cycle's `now` is `epoch + k*dt` and the loop never sleeps, which is what the
+deterministic-timestamp test relies on.
 
-### 1.2 `RingTable` — the ring registry
+### 1.2 The coordinator owns the rings; systems borrow into them
 
 ```rust
-struct RingTable {
-    rings: Vec<RingEntry>,         // one per allocated buffer
-}
-struct RingEntry {
-    id:        BufferId,           // dense index, assigned at build time
-    ring:      RingBuffer<BoxBacking>,
-    frame_id:  ComponentId,        // the frame the buffer carries (for diagnostics)
-    role:      BufferRole,         // Output { system, port } | Private { async_system, port } | Health | Log
-    // Pre-created, matched wake endpoints shared by writer- and reader-side ports (§2.3).
-    wake:      WakeEndpoints,
+pub struct Coordinator {
+    config:        CoordinatorConfig,
+    cyclic:        Vec<Box<dyn CyclicSlot>>,   // type-erased slots, in run (registration) order
+    pending_async: Vec<PendingAsync>,          // bound async systems, spawned at run
+    copy_ins:      Vec<CopyIn>,                 // private-buffer copy-in jobs for async inputs
+    coord_health:  HealthPort,                  // the coordinator's own health/log
+    status_out:    Output<CoordinatorStatus>,   // the coordinator status frame writer
+    status_view:   Input<CoordinatorStatus>,    // a reader for status read-back
+    stopped:       Vec<StoppedSystem>,          // currently hard-stopped systems
+    cycle:         u64,
+    registry:      Arc<OutputRegistry>,         // broad by-id index over every tappable buffer
+    rings:         RingTable,                   // owns every RingBuffer<BoxBacking> — drops last
 }
 ```
 
-There is exactly **one writer per `RingEntry`** (§2.4); the table is the place that invariant is
-enforced structurally, because a buffer is created with a single owning producer and the builder
-never hands out a second `Writer`.
+This realizes the ownership rule "systems own their outputs and borrow their inputs" concretely. A
+`RingBuffer<BoxBacking>` is `Arc`-backed and cheaply clonable, so the coordinator holds the
+canonical handle in `RingTable` while each system's ports hold `Writer`/`View` clones derived from
+it. Keeping the canonical handle alive in `RingTable` — declared **last** in the struct so it drops
+after every other field — guarantees a buffer outlives every port over it and every dlopen'd slot
+that attached to its region, regardless of teardown order.
 
-### 1.3 Per-system slot ownership
+### 1.3 `RingTable` — the ring registry
+
+```rust
+struct RingTable { rings: Vec<RingEntry> }
+
+struct RingEntry {
+    ring:     RingBuffer<BoxBacking>,
+    frame_id: ComponentId,            // the frame the buffer carries (for diagnostics)
+    role:     BufferRole,             // Output { system, port } | Private { system, input } | Coordinator
+    instance: Option<String>,         // owning system's instance name; None for coordinator buffers
+}
+```
+
+There is exactly **one writer per `RingEntry`**. The table is where that invariant holds
+structurally: a buffer is created for one producing port (or one copy-in job, or the coordinator),
+and the builder calls `RingBuffer::writer(...)` exactly once for it. `instance` records the owning
+system's instance name so the telemetry sink can prefix that buffer's records (§5).
+
+### 1.4 Per-system slot ownership
 
 A **cyclic** system, its `Input` bundle, and its `Out<Output>` bundle are owned together by the
-coordinator across cycles — exactly what `CyclicRunner<S,O>` already does (`src/system.rs`:
-`CyclicRunner { system, input, output }`). WP5 keeps `CyclicRunner` as the per-system owner and
-**grows it** (§3.4) into a `CyclicSlot` trait object so the coordinator can hold a heterogeneous
-`Vec<Box<dyn CyclicSlot>>`.
+coordinator across cycles. This is exactly what `CyclicRunner<S, O>` (`src/system/mod.rs`,
+`CyclicRunner { system, input, output, state }`) holds. The coordinator stores cyclic systems as a
+heterogeneous `Vec<Box<dyn CyclicSlot>>`; `CyclicRunner` and the dlopen `DlSlot` both implement
+`CyclicSlot` (§3.4).
 
-An **async** system is different: its `run` future borrows `&mut self`, `&mut Input`, `&mut
-Output` for the whole loop, so those three move *into* the spawned task and are owned by it, not by
-the coordinator (§4.1). The coordinator keeps only a handle (`AsyncTask`) to drive lifecycle.
+An **async** system is different: its `run` future borrows `&mut self`, `&mut Input`, `&mut Output`
+for the whole loop, so those three move *into* the spawned task and are owned by it, not by the
+coordinator (§4.1). The coordinator keeps only an `AsyncTask` handle to drive lifecycle.
 
-### 1.4 Resolving `SystemOutput::bind` — the `Binder` / `bind` contract
+### 1.5 The `bind` contract — `BindPorts`, `Binder`, `BoundPort`
 
-WP4 deferred binding: the landed `SystemOutput`/`SystemInput` derives generate only
-`descriptors()`/`any_lapped()` (see `libs/metor-fsw/macros/src/system.rs`, which emits
-`<#ty>::descriptor()` per field). WP5 adds the **parallel** construction path. The key invariant
-is that **`bind()` walks the port fields in the same order as `descriptors()`**, so a positional
-cursor lines each port up with the ring the builder pre-allocated for it.
-
-Per-port `bind` (added to the landed `Output<F>`/`Input<F>`):
+The system derives generate `descriptors()` (for the build pass) and a symmetric `bind` (for
+construction). The key invariant is that **`bind()` walks the port fields in the same order as
+`descriptors()`**, so a positional cursor lines each port up with the ring the builder
+pre-allocated for it.
 
 ```rust
-impl<F: Frame, WD: WakeSource, WS: WakeSink> Output<F, BoxBacking, WD, WS> {
-    /// Bind this output over the next ring in the binder, taking the matched
-    /// writer-side wake endpoints the builder pre-created for that buffer.
-    fn bind(b: &mut Binder) -> Self {
-        let (ring, data, space) = b.next_output::<WD, WS>();   // typed pop, descriptors() order
-        Output::new(ring.writer(data, space))                  // landed Output::new + RingBuffer::writer
-    }
-}
-impl<F: Frame, RD: WakeSink, RS: WakeSource> Input<F, BoxBacking, RD, RS> {
-    fn bind(b: &mut Binder) -> Self {
-        let (ring, data, space) = b.next_input::<RD, RS>();
-        Input::new(ring.view(data, space).expect("reader slot reserved at sizing time"))
-    }
+pub trait BindPorts<B: Backing>: Sized {
+    /// Construct every port from the ring source, in descriptors() order.
+    fn bind<S: RingSource<B = B>>(src: &mut S) -> Self;
 }
 ```
 
-`Binder` is a **concrete** cursor (not `dyn` — it needs generic methods), built by the coordinator
-after sizing, holding the ordered rings and the matched wake endpoints for one system's bundle:
+A `RingSource` hands out one pre-allocated ring per port, abstracted over the ring `Backing` so a
+single generated bundle `bind` serves both providers:
+
+- The host's **`Binder`** (`RingSource<B = BoxBacking>`) walks the coordinator's pre-allocated
+  `BoundPort`s, popping one ring per port via `next_output`/`next_input` in `descriptors()` order.
+- A dlopen'd system's **`RawBinder`** (`RingSource<B = RawBacking>`, on the `.so` side of the ABI)
+  walks the host's raw ring regions. The static-system path never sees this — a `.so`
+  monomorphizes its own `CyclicRunner<_, _, RawBacking>` (§3.6).
 
 ```rust
-struct Binder<'a> {
-    out_cursor: slice::Iter<'a, BoundOutput>,   // one per output PortDesc, in order
-    in_cursor:  slice::Iter<'a, BoundInput>,    // one per input PortDesc, in order
-}
-impl Binder<'_> {
-    fn next_output<WD: WakeSource, WS: WakeSink>(&mut self) -> (RingBuffer<BoxBacking>, WD, WS);
-    fn next_input<RD: WakeSink, RS: WakeSource>(&mut self) -> (RingBuffer<BoxBacking>, RD, RS);
+pub struct BoundPort {
+    ring:  RingBuffer<BoxBacking>,
+    data:  Option<Box<dyn Any>>,   // matched wake endpoints, copy-in path only
+    space: Option<Box<dyn Any>>,
 }
 ```
 
-The derives gain a generated `bind(&mut Binder) -> Self` that calls `<FieldType>::bind(binder)`
-per field — symmetric to the existing `descriptors()` generation and equally free of `F`-parsing.
-`Out<O>` (the framework wrapper) binds its inner `O` then constructs its `HealthPort` from the two
-auto-provisioned health/log rings (§5), mirroring `Out::descriptors()` pushing the health/log
-descriptors after the user ports.
+`Out<O>` (the framework wrapper) binds its inner `O`, then constructs its `HealthPort` from the
+two auto-provisioned health/log rings (§5), mirroring how `Out::descriptors()` pushes the
+health/log descriptors after the user ports.
 
-**Matched wake endpoints (the load-bearing subtlety).** A `Notifier` is `Arc`-backed
-(`ring/src/lib.rs`): the writer side and the view side must hold the **same clone** for a commit to
-wake an awaiting reader (the WP4 test creates `imu_data` once and `.clone()`s it into both
-`writer(...)` and `view(...)`). So `bind` must **not** default-construct wakes independently. The
-`Binder` carries the pre-created, per-buffer `WakeEndpoints` from `RingTable` and hands the matched
-clone to whichever side it is binding. Because a buffer's wake type is fixed by the graph (cyclic
-buffers → `NoWake`; async-fed buffers → `Notifier`), the endpoints are stored type-erased
-(`Box<dyn Any>`) and downcast in `next_output`/`next_input` against the concrete `WD/WS` the port
-type supplies. This works but is fiddly — see **Q3**.
+**Matched wake endpoints.** A `Notifier` is `Arc`-backed: a commit only wakes an awaiting reader
+when the writer side and the view side hold the *same* clone. Every cross-system edge is sampled by
+a polling consumer — a cyclic system each cycle, or a copy-in job each cycle — so its view can use a
+fresh default wake and the match is moot. The one place a matched clone is load-bearing is the
+private copy-in buffer feeding an async input: there the coordinator pre-creates the `Notifier`
+pair, stores it type-erased on the port's `BoundPort` via `BoundPort::matched`, and hands the
+matched clone to the async view. Every other port uses `BoundPort::new` and the `Binder`
+default-constructs the wake.
+
+A bundle that wants by-id access to *every* output — the telemetry downlink, a logger, a recorder —
+pulls the `OutputRegistry` from `RingSource::output_registry()` in its own `bind`, exactly where it
+pulls its typed ports. Only the host `Binder` carries one, so a system that needs it is host-only.
 
 ---
 
 ## 2. Graph builder, compatibility validation, sizing
 
-### 2.1 The builder API (WP6's target)
+### 2.1 The builder API
 
 ```rust
 impl Coordinator {
@@ -177,101 +187,104 @@ impl Coordinator {
 }
 
 impl CoordinatorBuilder {
-    /// Register a cyclic system. Returns a handle whose ports can be named in `connect`.
-    pub fn add_cyclic<S>(&mut self, system: S) -> SystemHandle
-        where S: CyclicSystem<Output = Out<…>> + 'static;
+    pub fn add_cyclic<S, O>(&mut self, system: S) -> SystemHandle;
+    pub fn add_cyclic_named<S, O>(&mut self, name: impl Into<String>, system: S) -> SystemHandle;
+    pub fn add_async<S>(&mut self, system: S) -> SystemHandle;
+    pub fn add_async_named<S>(&mut self, name: impl Into<String>, system: S) -> SystemHandle;
+    pub fn add_telemetry<T: Transport>(&mut self, config: TelemetryConfig<T>) -> SystemHandle;
+    pub fn add_dl_cyclic(&mut self, name: impl Into<String>,
+                         loaded: dl::DlSystem, params: Vec<u8>) -> SystemHandle;
 
-    /// Register an async system.
-    pub fn add_async<S>(&mut self, system: S) -> SystemHandle
-        where S: AsyncSystem + 'static;
-
-    /// Connect "producer system's output frame X" → "consumer system's input frame X".
-    /// Ports are addressed by (SystemHandle, frame_id) — both come straight off the
-    /// already-derived SystemDescriptor, so WP6 can resolve a KDL edge to this call.
     pub fn connect(&mut self, producer: PortRef, consumer: PortRef) -> Result<(), WireError>;
+    pub fn connect_delayed(&mut self, producer: PortRef, consumer: PortRef) -> Result<(), WireError>;
 
-    /// Validate, size, allocate, bind, provision health, return a ready coordinator.
     pub fn build(self) -> Result<Coordinator, WireError>;
 }
 
 pub struct PortRef { pub system: SystemHandle, pub frame_id: ComponentId }
+impl PortRef { pub fn new<F: Frame>(system: SystemHandle) -> Self; }
 ```
 
-`add_*` stores the boxed system plus `S::descriptor()` (the landed `CyclicSystem::descriptor()` /
-`AsyncSystem::descriptor()`, which already enumerate `inputs`/`outputs` as `Vec<PortDesc>`). The
-builder never touches `F` directly — it works entirely off `SystemDescriptor`/`PortDesc`, exactly
-the WP4 "read surface."
+`add_*` stores the boxed system, `S::descriptor()` (which enumerates `inputs`/`outputs` as
+`Vec<PortDesc>`), the system kind, and an instance name. The builder works entirely off
+`SystemDescriptor`/`PortDesc` — it never touches the frame type `F` directly. Registration order
+becomes the run order.
 
-Type erasure: `add_cyclic` immediately wraps the system in its `CyclicRunner`/`CyclicSlot`
-(deferred until ports exist) and stores a thunk; `add_async` stores a boxed launcher. The builder
-keeps the registration order, which becomes the v1 run order (§3.1).
+Each system carries an **instance name** (the `_named` variants set it; the plain variants default
+to `System::NAME`). The instance name disambiguates two instances of one system type at the
+telemetry sink: their records are prefixed `<instance>.<frame>.<component>`, so they emit distinct
+fully-qualified paths despite sharing a `frame_id`. The wiring loader (`wiring.md`) supplies the KDL
+instance names.
 
-WP6 is a pure front-end: a KDL document names systems and edges, the loader instantiates each
-system (params from its config block, per WP4 §1.2 "constructible before init"), calls `add_*`,
-resolves edges to `PortRef`s by frame name, and calls `connect`. No coordinator logic lives in WP6.
+Ports are addressed by `(SystemHandle, frame_id)` via `PortRef`; both come straight off the derived
+`SystemDescriptor`, so a wiring front-end can resolve a named KDL edge to a `connect` call.
 
 ### 2.2 Compatibility validation (build-time, before any cycle)
 
-For every `connect(producer, consumer)` edge, `build()` looks up the producer's matching
-`OutputDesc` and the consumer's matching `InputDesc` (both already on the descriptors) and calls
-the landed `compatible(producer_desc, consumer_desc)` (`src/descriptor.rs`):
+For every edge, `build()` looks up the producer's matching output `PortDesc` and the consumer's
+matching input `PortDesc` (by `frame_id` position in the descriptors) and calls
+`compatible(producer, consumer)` (`src/descriptor.rs`):
 
 - same `frame_id`, and
 - the consumer's realized `(component_id, ty, shape)` set is a **subset** of the producer's
   (forward-compatible: a producer may emit extra fields a consumer ignores).
 
-`compatible` already does the `VTable::realize_fields(None)` registration-mode enumeration and the
-subset/ty/shape comparison. WP5 only *drives* it per edge and turns a `false` into a `WireError`
-naming both ports. This catches every wiring mistake before a byte flows, as DESIGN.md requires
-("the coordinator validating compatibility against the systems' VTables").
+The builder drives `compatible` per edge and turns a `false` into `WireError::Incompatible` naming
+both systems. This catches every wiring mistake before a byte flows.
 
-Additional structural checks in the same pass:
+The same pass enforces the structural rules:
 
-- **Every input port is connected exactly once.** A cyclic/async input with no `connect` is a
-  build error (nothing would ever write it). Two `connect`s into one input is a build error
-  (an input port is a single `View` into a single producer — WP4 §2.4 "N producers → N views",
-  combining is the consumer's job via *separate* ports).
-- **Single writer per buffer (§2.4).**
-- **Frame-id match on the edge** — `connect` rejects an edge whose producer port and consumer port
-  do not even share a `frame_id` early (a friendlier error than the subset failure).
+- **Every input port is connected exactly once.** An input with no edge is
+  `WireError::UnconnectedInput` (nothing would ever write it). Two edges into one input is
+  `WireError::DoubleConnect` (an input is a single `View` into a single producer; combining is the
+  consumer's job, via separate ports).
+- **Frame-id match on the edge** is rejected early at `connect` time (`WireError::FrameIdMismatch`),
+  a friendlier error than the subset failure. `connect` also rejects an unknown system handle
+  (`WireError::UnknownSystem`); an unknown port surfaces at `build` (`WireError::UnknownPort`).
+- **Single writer per buffer** is structural (§2.5), not a checked rule.
+- **Every feedback loop must be broken by a `connect_delayed`** (§3.1), else
+  `WireError::FeedbackCycle`.
 
 ### 2.3 Buffer sizing & `max_readers` derivation
 
-One buffer per **output** port (plus the auto health/log buffers, §5; plus one private buffer per
-**async input**, §4). Each is sized from its `PortDesc` and the edge set:
+One buffer per **output** port, plus the coordinator's own health/log/status buffers (§5), plus one
+private buffer per **async input** (§4). Each is sized from its `PortDesc` and the edge set:
 
 ```
-depth      = ceil(rate_hint ? f(rate_hint, cycle_rate) : config.default_depth)   // ≥ 2
-capacity   = capacity_for(port.max_size, depth)        // landed: frame_len(max_size)*depth, pow2
-max_readers = fan_out(port)                             // count of registered consumers
-overrun    = Overrun::Overwrite                         // v1 default (DESIGN.md "writer-chosen")
+capacity    = capacity_for(port.max_size, default_depth)   // frame_len(max_size) * depth, pow2
+max_readers = fan_out(port) + n_registry_consumers + READER_SLACK
+overrun     = Overrun::Overwrite
 ```
 
-- `capacity_for` / `buffer_capacity::<F>` are the landed sizing helpers (`src/port.rs`); they wrap
-  the now-`pub` `frame_len` (the WP4 Q1 gap is closed — `ring/src/lib.rs` exposes `frame_len`).
-- **`max_readers` = fan-out**, computed from the graph: for an output port, the number of distinct
-  consumers = (cyclic consumers, each a direct `View`) + (async consumers, each **one** copy-in
-  `View`, §4) + (health/db sink readers for health/log buffers, §5). `Config.max_readers` must
-  cover every `view()` the builder will register, because the ring has no crash-slot reclamation
-  in v1 (`ring/src/lib.rs` `Config` doc). Over-provision by a small constant for late attach
-  (e.g. a debugger/db tap) — a tunable.
-- **`depth` from `rate_hint`.** When producer and consumer carry `rate_hint`s (advisory, on
-  `PortDesc`), depth covers the rate ratio so a slower reader does not lap within one of its
-  periods; absent a hint, `default_depth`. v1 may simply use `default_depth` everywhere and treat
-  rate-derived depth as a refinement (**Q10 carried from WP4**).
+- `capacity_for` / `buffer_capacity::<F>` (`src/port.rs`) are the sizing helpers. Depth is
+  `config.default_depth` for every buffer; `PortDesc` carries an advisory `rate_hint`, but the
+  builder does not yet derive depth from it — rate-derived depth is the one piece of buffer sizing
+  not implemented.
+- **`max_readers` must cover every `view()` the builder will register**, because the ring has no
+  crash-slot reclamation: a reader slot is reserved at build time and never reclaimed. It is the
+  sum of:
+  - `fan_out(port)` — the number of distinct consumers of that output (each cyclic consumer is a
+    direct `View`; each async consumer is **one** copy-in `View`, §4);
+  - `n_registry_consumers` — each system that pulls the broad `OutputRegistry` (the telemetry
+    downlink, a logger) is an extra reader on **every** output buffer;
+  - `READER_SLACK` (= 4) — slack for late taps such as a db/telemetry sink or a debugger.
 
-### 2.4 Single-writer-per-buffer enforcement
+### 2.4 The output registry
 
-The ring documents "at most one live writer per buffer" (`ring/src/lib.rs` `Writer` doc) but does
-not enforce it — the builder does, structurally:
+Every output buffer (and the coordinator's own health/log/status buffers) is recorded in a broad
+`OutputRegistry`, keyed by the instance-qualified id `ComponentId::new("<instance>.<frame>")`. The
+registry is frozen into an `Arc<OutputRegistry>` *before* the bind loop, so a system can pull it in
+its own `bind` (the telemetry downlink does this), and is also exposed to callers via
+`Coordinator::registry()` — an index a logger, recorder, debugger, or test uses to read any output
+by id. See `telemetry.md` for the full registry/sink design.
 
-- A buffer is created **for exactly one output port** and the only `Writer` is handed to that
-  port's `Output<F>` during `bind`. The builder calls `RingBuffer::writer(...)` **once** per
-  buffer. A private async buffer's single writer is the coordinator's copy-in job (§4).
-- `connect` only ever adds **`view()`** (reader) registrations to an existing producer buffer; it
-  never creates a second writer. There is no API by which two systems can write one buffer.
+### 2.5 Single-writer-per-buffer enforcement
 
-This makes "single writer" an invariant of the build graph, not a runtime check.
+A buffer is created **for exactly one producer** and its only `Writer` is handed to that producer
+during `bind`. The builder calls `RingBuffer::writer(...)` once per buffer; a private async buffer's
+single writer is the coordinator's copy-in job. `connect` only ever adds `view()` (reader)
+registrations to an existing producer buffer — there is no API by which two systems write one
+buffer. "Single writer" is therefore an invariant of the build graph, not a runtime check.
 
 ---
 
@@ -279,107 +292,161 @@ This makes "single writer" an invariant of the build graph, not a runtime check.
 
 ### 3.1 Ordering & the sampling rule (feedback loops)
 
-v1 runs cyclic systems in a **fixed per-cycle order** (DESIGN.md defers deterministic ordering and
-replay; the loop still needs a defined order). The order is:
+Cyclic systems run in a **fixed per-cycle order: registration order.** The sampling rule is a direct
+consequence of shared overwrite rings plus ordered execution, and needs no extra machinery:
 
-> **Topological order over the acyclic part of the graph, falling back to registration order.**
-> The builder topologically sorts cyclic systems by their `connect` edges; cycles (feedback loops)
-> are broken at a designated **back-edge**, and within an SCC the registration order is used.
+- A cyclic system reads each input with `Input::latest()`, which drains its `View` to the **newest
+  committed record at the instant it runs**.
+- **Forward edge** (producer registered *before* consumer): the consumer sees **this cycle's fresh**
+  output.
+- **Back edge / feedback** (producer registered *after* consumer): the consumer sees the producer's
+  **previous-cycle** output — a natural **one-cycle delay**. No system ever blocks waiting for a
+  not-yet-produced input; it reads the latest available.
 
-The **sampling rule** is a direct consequence of shared overwrite rings + ordered execution, and
-needs no extra machinery:
+Feedback loops are explicit, not implicit. Every directed cycle in the graph must break exactly one
+edge with `connect_delayed`, which marks it as the intentional one-cycle-delayed back-edge. At
+`build()` the builder constructs the system adjacency over the **non-delayed** edges only and runs
+`find_cycle` (§3.1.1); any remaining cycle is an unbroken feedback loop and fails with
+`WireError::FeedbackCycle` naming the loop members. This makes the one-cycle-late sampling a
+declared property of the wiring rather than an artifact of registration order. The runtime path of
+`connect_delayed` is identical to `connect` — a `latest()` read of the committed value, which is
+last cycle's because the producer runs after the consumer.
 
-- A cyclic system reads each input with `Input::latest()` (`src/port.rs`), which drains its `View`
-  to the **newest committed record at the instant it runs**.
-- **Forward edge** (producer runs *before* consumer this cycle): the consumer sees **this cycle's
-  fresh** output. Topological order maximizes these.
-- **Back edge / feedback** (producer runs *after* consumer): the consumer sees the producer's
-  **previous-cycle** output — a natural **one-cycle delay** on feedback edges. No system ever
-  blocks waiting for a not-yet-produced input; it just reads the latest available.
+#### 3.1.1 Cycle detection (`find_cycle`)
 
-So the stated rule is: *"a cyclic system sees the latest committed value of each input at the
-moment it executes; topological ordering makes acyclic edges same-cycle, feedback edges incur a
-one-cycle delay."* This is deterministic given the fixed order and is the v1 contract (full
-determinism/replay deferred per DESIGN.md). **Q1** asks the reviewer to confirm topological+back-
-edge-delay versus plain registration-order-with-delay.
+`find_cycle(adj)` is a plain depth-first search colouring nodes white/grey/black. It pushes each
+node onto a DFS stack as it greys it; a back-edge to a grey (on-stack) node closes a cycle, which is
+reconstructed as the stack tail from that node onward and returned in loop order. It returns the
+first cycle found, or `None` if the graph is acyclic. The builder runs it over the non-delayed
+adjacency only, so delayed back-edges never count toward a cycle.
 
 ### 3.2 Run-fast-then-wait timing
 
-Per DESIGN.md "Each cycle": run every system as fast as possible, then hold the rate by waiting at
-the end. One cycle:
+`run_for(cycles)` runs every cyclic system as fast as possible, then holds the rate by waiting at
+the end of each cycle. One cycle:
 
 ```rust
 let budget = Duration::from_secs_f64(1.0 / config.cycle_rate);
-loop {
+for k in 0..cycles {
     let start = Instant::now();
-    let now = Timestamp::now();
-    for slot in &mut self.cyclic { slot.step(now); }   // §3.3, in fixed order
-    self.run_copy_ins();                               // fold async copy-in here (§4.2)
-    let elapsed = start.elapsed();
-    if elapsed < budget {
-        stellarator::sleep(budget - elapsed).await;    // hold the rate
-    } else {
-        self.telemeter_overrun(elapsed, budget);       // §3.2 overrun: no sleep, next cycle now
+    self.cycle += 1;
+    let now = match config.clock {
+        ClockMode::Wall          => Timestamp::now(),
+        ClockMode::Simulated{dt} => epoch + dt * k,
+    };
+    for slot in &mut self.cyclic { slot.step(now); }   // §3.3, registration order
+    self.run_copy_ins();                               // async copy-in (§4.3)
+    self.update_status(now);                           // refresh status frame (§3.5)
+    match config.clock {
+        ClockMode::Wall => {
+            let elapsed = start.elapsed();
+            if elapsed < budget { stellarator::sleep(budget - elapsed).await; }
+            else { self.telemeter_overrun(now, elapsed, budget); }
+        }
+        ClockMode::Simulated{..} => stellarator::yield_now().await,
     }
-    if self.stopping() { break; }                      // §6 teardown
 }
 ```
 
-- **Overrun** (a cycle exceeds its budget): do **not** sleep; telemeter the overrun (a coordinator-
-  level health frame, §5.3) and start the next cycle immediately. The loop never tries to "catch
-  up" by skipping work — it just runs continuously when saturated.
-- Timing uses `stellarator::sleep` (the loop is a stellarator task), so async system tasks and
-  copy-in share the executor during the wait.
+- **Overrun** under a `Wall` clock (a cycle exceeds its budget): the loop does **not** sleep; it
+  telemeters a coordinator-level health frame (`cycle_overrun`, §5.3) and starts the next cycle
+  immediately. The loop never skips work to "catch up" — it runs continuously when saturated.
+- Under a `Simulated` clock the loop never paces; it still `yield_now()`s once per cycle so spawned
+  async consumers — driven by the copy-in step — get to run on the cooperative runtime.
+- `now` is threaded into every `step` in a cycle, so all systems share one timestamp.
+
+`run_for` runs a bounded number of cycles, which is what the tests and bounded missions use; an
+unbounded mission is a large `cycles` count.
 
 ### 3.3 Lapped input → permanent hard-stop
 
-Before invoking each cyclic system, check `any_lapped()` (`SystemInput::any_lapped`, landed; ORs
-every input port's `View::is_lapped`). The landed `CyclicRunner::step` already *charges* a lapped
-input (`record_lapped`) but **still executes** — WP5 must change this to the DESIGN.md hard-stop:
-**telemeter and permanently stop invoking that system.**
+Before invoking each cyclic system, `CyclicRunner::step` checks `input.any_lapped()` (which ORs
+every input port's `View::is_lapped`). If an input has lapped — its data was overwritten before the
+system read it — the slot **permanently stops**: it charges the lapped input (`record_lapped`), logs
+`Level::Error` ("input lapped; system permanently stopped"), publishes a final health record
+(`end_cycle`), and flips its `SlotState` to `Stopped { reason: LappedInput }`. Once stopped, `step`
+returns immediately on every subsequent cycle — no `execute`, no health publish.
 
-A "stopped" system is represented by a **per-slot `stopped: bool`** in the grown slot (§3.4). Once
-set it is never cleared in v1 (recovery is future work). Surfacing:
+A stopped slot's outputs go stale, so **downstream cyclic consumers of a stopped system will
+themselves eventually lap and stop in turn** — the failure propagates by the same mechanism, which
+is the intended fail-stop behavior, not a special case. A stopped system is never restarted (no
+recovery hook).
 
-- The slot publishes a final health record via `HealthPort::end_cycle` (so `lapped_inputs` is
-  nonzero and `cycles` stops advancing — observable in metor-db), plus a one-shot `Error` **log
-  line** via `HealthPort::log(Level::Error, …)` naming the lapped input.
-- Subsequent cycles skip the slot entirely (no `execute`, no health publish), so its outputs go
-  stale; **downstream cyclic consumers of a stopped system will themselves eventually lap** and
-  stop in turn — the failure propagates by the same mechanism, which is the intended fail-stop
-  behavior, not a special case.
-- The coordinator exposes `stopped` slots in a status query / coordinator health frame so an
-  operator sees which modules fell out (**Q4**: is a bool enough, or do we want an explicit
-  `SlotState { Running, Stopped { reason } }` and a dedicated coordinator status frame?).
+### 3.4 `CyclicSlot` — the per-system slot trait
 
-### 3.4 Growing `CyclicRunner` into `CyclicSlot`
-
-`CyclicRunner<S,O>` (`src/system.rs`) is the WP4 stand-in and the explicit seam. WP5 generalizes
-it minimally and erases it behind a trait so the coordinator holds a heterogeneous set:
+The coordinator drives cyclic systems through a `CyclicSlot` trait object so it can hold a
+heterogeneous set:
 
 ```rust
-trait CyclicSlot {
+pub(crate) trait CyclicSlot {
     fn init(&mut self);
-    fn step(&mut self, now: Timestamp);   // grown: any_lapped → stop; else time execute + end_cycle
+    fn step(&mut self, now: Timestamp);
     fn shutdown(&mut self);
-    fn name(&self) -> &'static str;       // System::NAME
-    fn stopped(&self) -> bool;
+    fn name(&self) -> &'static str;
+    fn state(&self) -> &SlotState;
 }
 ```
 
-`CyclicRunner` already owns `system/input/output`, times `execute` with `Instant::now`, and calls
-`output.health().end_cycle(Timestamp::now(), micros)` — WP5 keeps all of that and only changes
-`step` to: if `stopped` return; if `input.any_lapped()` → `record_lapped()`, publish a final
-health record, log the error, set `stopped`, return; else time `execute` and `end_cycle` as today.
-`now` is threaded from the loop so every system in a cycle shares one timestamp. `init`/`shutdown`
-delegate to the landed methods unchanged.
+`CyclicRunner<S, O>` is the static-system implementation: it owns `system/input/output/state`, times
+`execute` with `Instant::now`, calls `output.health().end_cycle(now, micros)`, and performs the
+lapped-to-stop transition described in §3.3. `DlSlot` is the dlopen implementation (§3.6). Slot
+state is:
 
-### 3.5 Single-threaded vs parallel within a cycle
+```rust
+pub enum StopReason { LappedInput, Panicked }
 
-v1 runs the cyclic loop **single-threaded** on one stellarator task: simplest, and it makes the
-sampling rule (§3.1) exact (no intra-cycle races on read order). Systems are independent enough
-that a future WP could run an acyclic *layer* in parallel, but that interacts with the sampling
-rule and is out of scope (**Q5**).
+pub enum SlotState { Running, Stopped { reason: StopReason } }
+```
+
+`LappedInput` is reachable by any slot. `Panicked` is reachable only by a `DlSlot` — a `.so` that
+panics inside its boundary returns `FswStatus::Panicked` and the slot hard-stops; a static
+`CyclicRunner` cannot produce it (a panic there unwinds the host directly). Once `Stopped`, a slot
+is never cleared.
+
+### 3.5 Surfacing stopped systems
+
+Each cycle, `update_status(now)` scans the slots and collects the currently-stopped set. When that
+set changes it:
+
+- refreshes the `CoordinatorStatus` frame (`publish_status`) — a coordinator-owned output frame
+  (NAME `"coordinator"`, frame name `"coordinator_status"`) carrying a `FrameList<StoppedEntry>` of
+  up to `MAX_STOPPED` (= 32) entries, each a reason code plus a fixed-capacity name buffer
+  (`STATUS_NAME_CAP` = 48); and
+- logs the change to coordinator health (an `system_stopped` error counter plus a `Level::Warn` log
+  line per stopped system, then `end_cycle`).
+
+`Coordinator::stopped()` returns the live `&[StoppedSystem]` and `read_status()` reads the published
+status frame back (name + reason code), for telemetry and test inspection.
+
+### 3.6 dlopen'd systems
+
+A system compiled as a `cdylib` is loaded by `DlSystem` (`src/dl.rs`), which opens the `.so`,
+resolves its `fsw_*` symbols, checks the ABI version word, and `fsw_describe`s it into a
+`SystemDescriptor`. From the builder's view this is the twin of `add_cyclic_named`: `add_dl_cyclic`
+pushes that reconstructed descriptor, so the **same** `compatible()`/`WireError` validation, ring
+sizing, allocation, and registry entry run over it unchanged. dlopen'd systems are cyclic-only.
+
+The difference is at `bind`. Instead of typed `BoundPort`s walked by a `Binder`, the coordinator
+gathers the raw ring regions the dlopen path needs — each port's `(base, len)` and role, as
+`FswRing` handles in `descriptors()` order. Outputs are this system's own buffers; inputs are
+`region()`s of the upstream producers' output buffers (the cyclic-consumer path, read directly). It
+passes them, plus the postcard `params` blob, to `DlSystem::into_slot`, which `fsw_create`s the
+state and returns a `DlSlot`. The `.so` reconstructs each ring over the host's `BoxBacking` region
+via `attach_raw` (same process, no copy, no IPC — it sees the identical atomics the host's other
+systems do), and its `CyclicSlot::step` forwards over the ABI, mapping `FswStatus::StoppedLapped` /
+`Panicked` to the corresponding `SlotState::Stopped`.
+
+Teardown ordering is load-bearing: a `DlSlot`'s `Drop` calls `fsw_destroy` (dropping the `.so`'s
+`RawBacking` ports and the user system) before its `Arc<Library>` field unloads and before the host
+`RingTable` frees the regions. The coordinator drops its `cyclic` slot vec before its `rings` field
+(struct field order), so no `RawBacking` outlives its region and no `.so` code runs after its
+`Library` is gone. See `dl-open.md` for the full ABI.
+
+### 3.7 Single-threaded execution
+
+The cyclic loop runs **single-threaded** on one stellarator task. This keeps the sampling rule
+(§3.1) exact — there are no intra-cycle races on read order — and is the simplest model. Async
+systems and the copy-in step share the same executor cooperatively.
 
 ---
 
@@ -387,226 +454,210 @@ rule and is out of scope (**Q5**).
 
 ### 4.1 Spawn once
 
-For each async system the coordinator spawns its `run` loop exactly once (DESIGN.md: "the
-coordinator does not invoke them"). Because `AsyncSystem::run(&mut self, &mut Input, &mut Output)`
-borrows all three for the loop's lifetime, the system, its `Input` bundle, and its `Out<Output>`
-move **into** the spawned task:
+For each async system the coordinator spawns its `run` loop exactly once. Because
+`AsyncSystem::run(&mut self, &mut Input, &mut Output)` borrows all three for the loop's lifetime, the
+system, its `Input` bundle, and its `Out<Output>` move **into** the spawned task (`AsyncSlot`):
 
 ```rust
-let stop = StopSignal::new();             // shared flag the loop polls / awaits
-let handle = stellarator::spawn(async move {
-    system.init(&mut output);             // §6: init inside the task, before run
+stellarator::spawn(async move {
+    me.system.init(&mut me.output);             // init inside the task, before run
+    ctx.ready_count.fetch_add(1, Release);      // signal the init barrier (§6)
+    ctx.ready.wake_all();
+    ctx.go.wait_for(|| ctx.go_flag.load(Acquire)).await;   // hold at the go-gate
     loop {
-        if stop.is_set() { break; }
-        system.run(&mut input, &mut output).await;   // one pass; system paces itself
+        if ctx.stop.load(Acquire) { break; }
+        me.system.run(&mut me.input, &mut me.output).await;  // one pass; system paces itself
     }
-    system.shutdown(&mut output);         // §6: shutdown inside the task, after the loop
+    me.system.shutdown(&mut me.output);         // shutdown inside the task, after the loop
 });
-self.asyncs.push(AsyncTask { handle: handle.drop_guard(), stop, name });
 ```
 
-The system's own `run` decides pacing — await inputs via `Input::recv` (backed by a `Notifier`
-sink) or `stellarator::sleep` on a timer — exactly as the WP4 `AsyncFilter` test does. The
-coordinator only spawns and later signals teardown (§6). `JoinHandle::drop_guard` ensures a
-dropped coordinator cancels the task.
+The system's own `run` decides pacing — await an input via `Input::recv` (backed by a `Notifier`
+sink) or `stellarator::sleep` on a timer. The coordinator only spawns the task and later signals
+teardown. The `JoinHandleDropGuard` cancels the task if a `Coordinator` is dropped mid-run.
+
+`init`/`shutdown` for an async system run **inside its task** (the only owner of the bundle). The
+init barrier (§6) ensures every system's `init` has completed before any first `run` pass or cycle.
 
 ### 4.2 Private copy-in buffers (the input side)
 
 An async input does **not** view the upstream output directly; it views a **private buffer the
-coordinator owns** (DESIGN.md, WP4 §3.2). For each async input port the builder allocates a private
-`RingBuffer<BoxBacking>` in `Overrun::Overwrite` mode, sized like any buffer (§2.3) with
-`max_readers = 1` (only the async system's `View`). Two ports straddle it:
+coordinator owns**. For each async input port the builder allocates a private
+`RingBuffer<BoxBacking>` in `Overrun::Overwrite` mode, sized like any buffer with `max_readers =
+1 + READER_SLACK` (the async system's view plus slack). Two ports straddle it:
 
-- **Writer side — the copy-in job**, owned by the coordinator (single writer, §2.4). It reads the
-  upstream producer's output `View` and writes records into the private buffer.
-- **Reader side — the async system's `Input` port**, bound with a `Notifier` data sink (`RD =
-  Notifier`) so `Input::recv` wakes when copy-in commits.
+- **Writer side — the copy-in job** (`CopyIn`), owned by the coordinator (the buffer's single
+  writer). It views the upstream producer's output (`NoWake`) and writes records into the private
+  buffer.
+- **Reader side — the async system's `Input` port**, bound with a `Notifier` data sink (the matched
+  wake from §1.5) so `Input::recv` wakes when copy-in commits.
 
-**Drop on full.** The private buffer is `Overwrite`, so the copy-in `Writer::try_write` **never
-blocks and silently overwrites** unconsumed records when the async consumer is behind — this *is*
-DESIGN.md's "if there is no room, the data is dropped," with no extra logic. (Equivalently, the
-copy-in could resync on lap; overwrite already gives drop-on-full for free.)
+The private buffer is `Overwrite`, so the copy-in `try_write` **never blocks and silently overwrites**
+unconsumed records when the async consumer is behind. This is "if there is no room, the data is
+dropped," with no extra logic.
 
 ### 4.3 Where copy-in runs
 
-v1 **folds copy-in into the cycle loop** (`run_copy_ins()` after the cyclic systems each cycle,
-§3.2):
+The coordinator **folds copy-in into the cycle loop** (`run_copy_ins()` after the cyclic systems
+each cycle):
 
 ```rust
 fn run_copy_ins(&mut self) {
     for c in &mut self.copy_ins {
-        // Drain fresh upstream records, mirror into the private buffer (drop-on-full),
-        // notify the async system's view.
-        while let Ok(true) = c.upstream.try_read_into(&mut c.scratch) {
-            let _ = c.private_writer.try_write(&c.scratch);   // overwrite = drop on full
+        loop {
+            match c.upstream.try_read_into(&mut c.scratch) {
+                Ok(true)  => { let _ = c.writer.try_write(&c.scratch); }  // overwrite = drop on full
+                Ok(false) => break,                                       // drained
+                Err(_)    => { c.upstream.resync(); break; }              // lapped: skip to live edge
+            }
         }
     }
 }
 ```
 
-Rationale: keeps the system **single-threaded** and avoids requiring a `Notifier` on every *cyclic*
-producer's output (a cyclic producer writes with `NoWake`; a separate awaiting copy-in task would
-need the producer to notify). The cost is that async input latency is bounded by the cycle rate —
-acceptable for v1. The copy-in `try_write` notifies the private buffer's `Notifier` (its data
-side), which wakes the async `run`'s `recv`.
-
-**Alternative (noted, not chosen): a copy-in task per async input** that awaits the upstream `View`
-directly. More responsive, but requires the upstream producer's output ring to carry a `Notifier`
-data wake (so a commit wakes the copy-in), which complicates buffer wake-typing when the producer
-is cyclic. Deferred (**Q2**).
+This keeps the loop single-threaded and avoids requiring a `Notifier` on every *cyclic* producer's
+output (a cyclic producer writes with `NoWake`; a separate awaiting copy-in task would need the
+producer to notify). The cost is that async input latency is bounded by the cycle rate. The
+`try_write` notifies the private buffer's data `Notifier`, which wakes the async `run`'s `recv`. If
+the copy-in itself laps on the upstream output (the cyclic producer outran the once-per-cycle
+drain), it `resync`s to the live edge and continues — the async consumer gets latest-wins.
 
 ### 4.4 Async outputs feeding cyclic consumers
 
-There is nothing async-specific on the **output** side (WP4 §3.2): an async system writes its
-output ring at its own pace; a cyclic consumer holds an ordinary `View` and reads it with
-`Input::latest()` each cycle. Coherence: the cyclic consumer sees whatever the async system had
-committed by the moment the consumer runs — latest-wins, same as any edge. If the async producer is
-much *faster* than the cycle and the cyclic consumer is slow, the overwrite buffer can lap the
-consumer → the §3.3 hard-stop applies, sized against by `depth` (§2.3). No special handling.
+There is nothing async-specific on the **output** side: an async system writes its output ring at
+its own pace, and a cyclic consumer holds an ordinary `View` it reads with `Input::latest()` each
+cycle — latest-wins, same as any edge. If a fast async producer laps a slow cyclic consumer, the
+§3.3 hard-stop applies. No special handling.
 
 ---
 
-## 5. Health provisioning & counter driving
+## 5. Health & status provisioning
 
-### 5.1 Auto-provisioned health/log buffers
+### 5.1 Per-system health/log buffers
 
-Every system implicitly produces a `SystemHealth` and a `SystemLog` frame (WP4: `Out::descriptors`
-pushes `PortDesc::of::<SystemHealth>()` and `PortDesc::of::<SystemLog>()` after the user ports).
-The coordinator **auto-provisions** the two buffers per system at build time — they are not wired by
-the user. Sizing is identical to any output (§2.3); `max_readers` = number of telemetry consumers
-(at least one db/sink reader, §5.4). During `bind`, `Out::bind` constructs the system's
-`HealthPort` from these two rings (`HealthPort::new(Output::new(health_writer),
-Output::new(log_writer))`).
+Every system implicitly produces a `SystemHealth` and a `SystemLog` frame: `Out::descriptors`
+pushes `PortDesc::of::<SystemHealth>()` and `PortDesc::of::<SystemLog>()` after the user ports, and
+`Out::bind` constructs the system's `HealthPort` from the two corresponding rings. These buffers are
+sized and allocated like any output (§2.3); the user does not wire them.
 
 ### 5.2 Driving the standard counters
 
-The framework already drives the four standard counters around `execute`: `CyclicRunner::step`
-times `execute` with `Instant` and calls `HealthPort::end_cycle(Timestamp::now(), micros)`, which
-bumps `cycles`, stamps `last_execute_micros`, and publishes one `SystemHealth` record plus any
-pending log lines (`src/health.rs`). A lapped input routes through `HealthPort::record_lapped`
-(bumps `lapped_inputs`). WP5 keeps this verbatim in the grown slot (§3.4) and adds only the
-hard-stop transition (one extra `record_lapped` + final publish + error log before stopping).
+The framework drives the standard counters around `execute`: `CyclicRunner::step` times `execute`
+and calls `HealthPort::end_cycle(now, micros)`, which bumps `cycles`, stamps `last_execute_micros`,
+and publishes one `SystemHealth` record plus any pending log lines. A lapped input routes through
+`record_lapped` (bumps `lapped_inputs`) on the way to the hard-stop (§3.3). For async systems the
+same `HealthPort` rides in their `Out<Output>` inside the task, and the counters around their work
+are driven from within `run` — the coordinator does not tick them.
 
-For async systems the same `HealthPort` is in their `Out<Output>` (moved into the task); the
-counters around their work are driven from within `run`/the task wrapper (the async loop calls
-`end_cycle` per pass), since the coordinator does not tick them.
+### 5.3 Coordinator-level health & status
 
-### 5.3 Coordinator-level health
+The coordinator owns its own `HealthPort` (NAME `"coordinator"`) and a `CoordinatorStatus` frame for
+cycle-level events that belong to no single system: **cycle overruns** (§3.2) and **hard-stopped
+systems** (§3.5). The status frame names which systems stopped and why; the health/log frames carry
+the per-event counters and log lines. These reuse the same frame types and ports as any system.
 
-The coordinator emits its own `SystemHealth`/`SystemLog` (NAME = `"coordinator"`) for cycle-level
-events that belong to no single system: **cycle overruns** (§3.2), **systems that hard-stopped**
-(§3.3), and async task exits. This reuses the exact health frames and port — no new telemetry type.
+### 5.4 Where frames go & the instance prefix
 
-### 5.4 Where health frames go & the `<NAME>` prefix
+Health is just frames: the health/log/status buffers are ordinary output rings, so any consumer —
+the telemetry downlink, metor-db, a UI, a test — reads them with a `View` like any other output, via
+the `OutputRegistry` (§2.4).
 
-Health is "just frames" (DESIGN.md): the health/log buffers are ordinary output rings, so any
-consumer — metor-db, a UI, a downstream system — reads them with a `View` like any other output.
-v1 provisions at least one reader slot for a **db/telemetry sink** that drains every system's
-health/log buffer into metor-db (the same ingest path as all component data).
-
-WP4 deferred the `<NAME>.health` / `<NAME>.log` **prefixing**: the frames are derived with fixed
-names `"health"`/`"log"` (`src/health.rs` `#[metor_fsw(name = "health")]`), but each system's
-records must land namespaced under its `System::NAME` so two systems' health do not collide in db
-(`filter.health.cycles` vs `nav.health.cycles`). The coordinator owns the prefix because `NAME` is
-per-system. The prefix is **not** a compile-time frame attribute (it would have to be on every
-system's frame); instead the coordinator records, per health/log buffer, the owning system's
-`NAME`, and the telemetry sink applies the `<NAME>.` path prefix when ingesting that buffer's
-records into db (the frame's `VTable` paths get the system prefix at ingest, mirroring how the
-cube-sat example namespaces a table with `#[metor_fsw(parent = "cube_sat")]`, but applied at
-runtime per instance). **Q6** asks the reviewer to confirm the prefix is applied at the sink rather
-than baked into the on-ring frame.
+Each buffer's records must land namespaced so two systems' health do not collide in db
+(`filter.health.cycles` vs `nav.health.cycles`). The frames are derived with fixed names
+(`"health"`/`"log"`), so the prefix is applied **at the telemetry sink, per buffer**, not baked into
+the on-ring frame bytes: the registry entry for each buffer is keyed by `<instance>.<frame>` and
+carries an `announce` vtable already prefixed with the owning system's instance name. Coordinator
+buffers use the synthetic instance `"coordinator"`, so they downlink under `coordinator.health` /
+`coordinator.log` / `coordinator.coordinator_status`. `Coordinator::output_instances()` and
+`registry()` expose the mapping. See `telemetry.md` / `wiring.md` for the sink and naming.
 
 ---
 
 ## 6. Lifecycle
 
-Order: **init all → run → shutdown all**, honoring the WP4 contract (`init`/`shutdown`
-exactly-once, `execute`/`run` in between).
+Order: **init all (behind a barrier) → run → shutdown all**, honoring the system contract
+(`init`/`shutdown` exactly-once, `execute`/`run` in between).
 
-1. **Init.** For cyclic systems, `CyclicSlot::init` (→ `CyclicRunner::init` → `System::init(&mut
-   output)`) in registration order, on the cyclic loop's thread before the first cycle. For async
-   systems, `init` runs **inside the spawned task** before its first `run` pass (§4.1), so the
-   borrow rules hold and an async system can publish an initial frame. The coordinator spawns the
-   async tasks, then enters the cycle loop.
+1. **Init (barrier).** `start()` spawns every async task first; each async system `init`s itself
+   inside its task, then signals readiness (`ready_count`) and parks at a go-gate. The coordinator
+   waits for **all** async inits to complete, then runs the cyclic `init`s on the loop's task, then
+   sets the go-flag and wakes every async task into its run loop. This guarantees every system's
+   `init` finishes before any `execute` or `run` pass — the property the init-barrier test asserts.
 2. **Run.** The cyclic cycle loop (§3) plus the spawned async tasks, all on the stellarator
-   executor (`stellarator::run(|| async { coordinator.run().await })`).
-3. **Shutdown.** On teardown the coordinator:
-   - **Stops the cyclic loop** (sets `stopping`, breaks after the current cycle — never mid-system,
-     so no `execute` is interrupted).
-   - **Signals each async task** via its `StopSignal` and **notifies** any input `Notifier` so a
-     task parked in `Input::recv` wakes, observes the flag, exits its loop, and runs
-     `System::shutdown(&mut output)` *itself* (shutdown must run on the task that owns the bundle).
-     The coordinator then **awaits each `JoinHandle`** to confirm the task drained. A bounded join
-     timeout guards a misbehaving task (it is then dropped via the `drop_guard`, cancelling it
-     without `shutdown` — telemetered).
-   - **Shuts down cyclic systems** (`CyclicSlot::shutdown`) in reverse registration order.
-   - Drops `RingTable` last, so every buffer outlives every port.
+   executor.
+3. **Shutdown.** `shutdown(tasks)`:
+   - **Signals each async task** by setting its `stop` flag and notifying its input data
+     `Notifier`s so a task can re-poll. (A task parked in `Input::recv` with no pending datum only
+     re-checks on the next commit; the bounded window below covers timer- and data-paced tasks.)
+   - **Waits a bounded `JOIN_TIMEOUT`** (20 ms) for tasks to observe `stop`, finish their current
+     pass, and run their own `System::shutdown` (which must run on the task that owns the bundle),
+     then **drops the tasks** — whose `drop_guard` cancels any still parked (the non-cooperative
+     path).
+   - **Shuts down the cyclic systems** (`CyclicSlot::shutdown`) in **reverse** registration order.
+   - The `RingTable` drops last (struct field order), so every buffer outlives every port and every
+     dlopen'd slot.
 
-In-flight async work: because shutdown is cooperative (flag + wake + join), an async system
-finishes its current `run` pass and flushes final frames in its own `shutdown`, rather than being
-cut mid-write. The hard timeout is the only non-cooperative path.
+Shutdown is cooperative (flag + wake + bounded join), so a well-behaved async system finishes its
+current `run` pass and flushes final frames in its own `shutdown` rather than being cut mid-write.
+The hard timeout is the only non-cooperative path.
 
 ---
 
-## 7. Reused vs. new
+## 7. Reused vs. coordinator-specific
 
-| Concern | Reused (landed) | New in WP5 |
+| Concern | Reused | Coordinator-specific |
 |---|---|---|
-| Per-system owner | `CyclicRunner<S,O>` (`system/input/output`, timed `step`, `end_cycle`) | grow into `CyclicSlot` trait object + permanent `stopped` flag |
-| Ports / data path | `Output<F>::new`, `Input<F>::new`, `latest`/`drain`/`recv`/`resync`/`is_lapped` | `bind()` per port + the `Binder` cursor (resolves `SystemOutput::bind`) |
-| Transport | `RingBuffer::{create_in_memory,writer,view}`, `Config`, `Overrun`, `frame_len` (now `pub`) | `RingTable` ownership, one-writer-per-buffer build invariant |
-| Sizing | `capacity_for`, `buffer_capacity::<F>`, `DEFAULT_DEPTH` | `depth`/`max_readers` derivation from the edge/fan-out graph |
-| Self-description | `SystemDescriptor`, `PortDesc`, `descriptor()`, `SystemInput::any_lapped` | builder consuming descriptors; `connect` addressing by `(system, frame_id)` |
-| Validation | `compatible(producer, consumer)` (frame_id + subset ty/shape) | per-edge driving; single-writer / single-connect / unconnected-input checks |
-| Wake | `NoWake` (cyclic), `Notifier` (async), `WaitQueue` | matched wake-endpoint provisioning per buffer; copy-in `Notifier` plumbing |
-| Health | `SystemHealth`/`SystemLog`, `HealthPort::{new,record_lapped,end_cycle,error,log}` | auto-provisioned buffers; `<NAME>` prefix at the sink; coordinator-level health |
-| Async | `AsyncSystem::run`, `Input::recv`, `Output::write_async` | spawn-once task + `init`/`shutdown` in-task; private copy-in buffers + drop-on-full |
-| Runtime | `stellarator::{run,spawn,sleep,JoinHandle::drop_guard}` | the run-fast-then-wait cycle loop; cooperative teardown |
-
-Genuinely new code: the builder + validation/sizing pass, the `Binder`/`bind` contract, the grown
-`CyclicSlot` (lapped → stop), the copy-in jobs, and the lifecycle driver. The transport, ports,
-descriptors, health, and `CyclicRunner` are reuse.
+| Per-system owner | `CyclicRunner<S,O>` (`system/input/output`, timed `step`, `end_cycle`) | the `CyclicSlot` trait object + `SlotState`/`StopReason`; `DlSlot` |
+| Ports / data path | `Output::new`, `Input::new`, `latest`/`drain`/`recv`/`resync`/`is_lapped` | the `BindPorts`/`Binder`/`BoundPort`/`RingSource` contract |
+| Transport | `RingBuffer::{create_in_memory,writer,view,region}`, `Config`, `Overrun` | `RingTable` ownership, one-writer-per-buffer build invariant |
+| Sizing | `capacity_for`, `buffer_capacity::<F>`, `DEFAULT_DEPTH` | `max_readers` from fan-out + registry consumers + slack |
+| Self-description | `SystemDescriptor`, `PortDesc`, `descriptor()`, `SystemInput::any_lapped` | the builder; `connect`/`connect_delayed` addressing by `(system, frame_id)` |
+| Validation | `compatible(producer, consumer)` | per-edge driving; single-connect / unconnected-input / unbroken-cycle (`find_cycle`) |
+| Wake | `NoWake` (cyclic), `Notifier` (async), `WaitQueue` | matched wake endpoints on the copy-in private buffer |
+| Health | `SystemHealth`/`SystemLog`, `HealthPort` | auto-provisioned buffers; instance prefix at the sink; coordinator health + `CoordinatorStatus` |
+| Async | `AsyncSystem::run`, `Input::recv`, `Output::write_async` | spawn-once task + in-task `init`/`shutdown`; private copy-in buffers + drop-on-full |
+| Telemetry | — | the `OutputRegistry`, `add_telemetry`, registry-consumer sizing |
+| dlopen | `DlSystem`/`DlSlot`/`FswRing` ABI (`dl.rs`/`abi.rs`) | `add_dl_cyclic`, raw-region bind, teardown ordering |
+| Runtime | `stellarator::{run,spawn,sleep,yield_now,JoinHandle::drop_guard}` | the run-fast-then-wait `run_for` loop; cooperative teardown |
 
 ---
 
-## 8. Open questions / risks for the reviewer
+## 8. Not yet implemented
 
-1. **Q1 — cyclic ordering & sampling rule for feedback loops.** Proposed: topological order over
-   the acyclic part, back-edges broken with a one-cycle delay; an input always reads the latest
-   committed value at the moment its system runs (forward edges same-cycle, feedback edges
-   one-cycle-delayed). Is topological-with-back-edge-delay the right v1 rule, or plain
-   registration-order with the same latest-wins sampling (simpler, but acyclic edges may straddle
-   cycles)? DESIGN.md defers full determinism, but the loop needs *a* defined order.
-2. **Q2 — where copy-in runs.** Proposed: fold copy-in into the cycle loop (single-threaded, no
-   `Notifier` needed on cyclic producers, async input latency bounded by the cycle rate). The
-   alternative is a per-async-input task awaiting the upstream `View` (more responsive, but forces
-   a `Notifier` data wake onto every producer feeding an async consumer). Confirm the folded
-   approach for v1.
-3. **Q3 — `Binder`/`bind` ergonomics & matched wakes.** The matched-`Notifier` requirement
-   (writer and view must share the same `Arc`-backed clone) forces the `Binder` to carry
-   per-buffer, type-erased wake endpoints and downcast them against each port's concrete `WD/WS`.
-   Workable but fiddly. Acceptable, or do we want a different bind shape (e.g. the coordinator
-   constructs `Writer`/`View` fully and hands them in, with a small typed registry per system)?
-4. **Q4 — representing a stopped system.** Proposed: a per-slot `stopped: bool`, surfaced via the
-   system's health (`lapped_inputs` > 0, `cycles` frozen) + a one-shot error log + a coordinator
-   status frame. Is a bool enough, or do we want `SlotState { Running, Stopped { reason } }` with a
-   dedicated coordinator status frame, and any operator-driven restart hook (recovery is otherwise
-   future work)?
-5. **Q5 — single-threaded vs intra-cycle parallelism.** v1 runs the cyclic loop single-threaded
-   (exact sampling, simplest). Is that acceptable for v1, with parallel acyclic layers deferred, or
-   is parallelism needed now (and thus the sampling rule must account for it)?
-6. **Q6 — health `<NAME>` prefixing.** Proposed: apply the `<NAME>.health` / `<NAME>.log` path
-   prefix at the **telemetry sink/db ingest**, per buffer, rather than baking it into the on-ring
-   frame (whose name is the fixed `"health"`/`"log"`). Confirm the prefix lives at ingest, not in
-   the frame bytes.
-7. **Q7 — `max_readers` over-provisioning.** With no crash-slot reclamation in v1
-   (`ring/src/lib.rs`), `max_readers` must be set to fan-out at build time, plus a slack constant
-   for late taps (db/debugger). What slack, and is a late attach (a reader added after `build`)
-   in-scope for v1 at all?
-8. **Q8 — async lifecycle in-task.** `init`/`shutdown` for async systems run inside the spawned
-   task (the only owner of the bundle), so an async `init` runs after cyclic `init`s, concurrently
-   with the first cycles. Is that ordering acceptable, or must all `init`s complete before any
-   `run`/cycle starts (requiring a barrier)?
-9. **Q9 — cycle-rate config granularity.** One global `cycle_rate` for all cyclic systems in v1
-   (per-system rate-division is future work). Is a single coordinator rate enough, or do some
-   cyclic systems need to run every Nth cycle now?
+- **Rate-derived buffer depth.** `PortDesc::rate_hint` is advisory; depth is always
+  `config.default_depth`. Deriving depth from the producer/consumer rate ratio (so a slow reader
+  cannot lap within one of its periods) is a refinement.
+- **Per-system rate division.** One global `cycle_rate` drives every cyclic system; a system that
+  wants a slower effective rate divides cycles itself.
+- **Intra-cycle parallelism.** The cyclic loop is single-threaded. Running an acyclic layer in
+  parallel would interact with the sampling rule and is not done.
+- **Stopped-system recovery.** A hard-stopped slot is never restarted; there is no operator restart
+  hook.
+
+---
+
+## 9. Tests
+
+`src/coordinator/tests.rs` registers and wires systems through the builder (no hand-built ports) and
+covers:
+
+- **`two_system_end_to_end`** — a cyclic producer → cyclic consumer graph; the consumer (registered
+  after the producer) samples this cycle's fresh value `1.0..=5.0`, confirming the registration-order
+  forward-edge rule.
+- **`lapped_input_hard_stops`** — a consumer that never drains laps and hard-stops with
+  `StopReason::LappedInput`; it is named in both `stopped()` and the `read_status()` frame, while
+  the input-less producer keeps running.
+- **`async_through_copy_in`** — an async consumer fed through a private copy-in buffer; a bursting
+  producer overflows the buffer and the run completes without blocking (drop-on-full), and the
+  consumer still receives real samples via `recv`.
+- **`validation_*`** — `FrameIdMismatch` (at `connect`), `UnknownPort`, `UnconnectedInput`,
+  `DoubleConnect` (at `build`).
+- **`init_barrier_holds`** — both systems' `init` complete before the first `execute` observes the
+  init counter.
+- **`feedback_cycle_unbroken_is_rejected`** / **`delayed_edge_allows_feedback_loop`** — an unbroken
+  2-system cycle fails with `FeedbackCycle`; breaking the back-edge with `connect_delayed` builds and
+  runs without hard-stopping.
+- **`simulated_clock_is_deterministic_and_monotonic`** — under a `Simulated` clock each cycle's `now`
+  is `start + k*dt`, strictly rising, with no wall-clock pacing.
+</content>
+</invoke>

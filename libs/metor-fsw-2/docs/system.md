@@ -1,519 +1,660 @@
-# Work-Package 4 — The `System` trait
+# The `System` abstraction
 
-Status: **design only, pre-implementation**. Reviewer sign-off required before any code
-lands. No Rust in this WP — this document specifies the `System` trait surface and how it
-sits on top of the **already-landed** ring (WP1), vtable (WP2) and frame (WP3) primitives.
-The coordinator that drives systems is WP5; the wiring/config language is WP6. This document
-defines only the **system-side contract**: what a system *is*, and what a coordinator needs to
-read from it and hand to it.
+A **system** owns some private state, produces frames into a set of **output ports**
+(single-writer ring buffers), and reads a set of **input ports** (read-only views into
+other systems' output buffers). The coordinator owns the ring regions, builds each
+system's port handles at wiring time, validates that producer outputs satisfy consumer
+inputs (using the frames' VTables), then drives the system: a cyclic system is `execute`d
+once per cycle; an async system runs its own loop. Systems never return errors — they emit
+health as ordinary frames over a framework-provided health output port.
 
-Relevant existing code (read before implementing):
-- `libs/metor-fsw-2/ring/src/lib.rs` — `RingBuffer<B>`, `Writer<B,WD,WS>` (`try_write`/async
-  `write`), `View<B,RD,RS>` (`is_lapped`, `try_read_into`/async `read_into`, `try_read` →
-  `ReadGrant`, `resync`, `cursor`/`committed`), `Overrun::{Overwrite,Lossless}`,
-  `Config { capacity, max_readers, overrun }`, `WriteError`, `ReadError::Lapped`,
-  `WakeSource`/`WakeSink`/`NoWake`/`Notifier`, `BoxBacking`/`MmapBacking`/`Backing`,
-  `round_up8` (and the **private** `frame_len`).
-- `libs/metor-fsw-2/src/frame.rs` — `Frame: AsVTable + Metadatatize + Componentize +
-  Decomponentize`, with `NAME`, `FRAME_ID`, `timestamp()`.
-- `libs/metor-fsw-2/src/{writer.rs,reader.rs,dynamic.rs}` — `FrameWriter<F>`
-  (`new`/`list`/`map`/`table`/`finish`), `ListWriter`/`MapWriter`, `ListReader`/`MapReader`,
-  `FrameList`/`FrameMap`/`Slot`.
-- `libs/metor-proto/src/vtable.rs` — `VTable` (`as_vtable`, `apply`, `realize_fields`,
-  `for_each_field`), `RealizedField`, `Op`.
-- `libs/metor-proto/src/com_de.rs` — `Componentize` (`sink_columns`, `MAX_SIZE`),
-  `Decomponentize` (`apply_value`).
-- `libs/metor-fsw/src/{vtable.rs,metadata.rs}` — `AsVTable` (`vtable_fields`/`as_vtable`),
-  `Metadatatize`.
+This document describes the system-side contract: what a system *is*, the typed port
+wrappers around the ring transport, the self-description the coordinator reads, and the
+health/log telemetry. The data path underneath the ports (table bytes == ring payload) is
+the `metor-fsw-ring` / `FrameWriter` / `View` machinery; the system layer adds only frame
+typing, the binding contract, the lifecycle, and health.
+
+The code lives in:
+
+- `src/system/mod.rs` — the `System` / `CyclicSystem` / `AsyncSystem` / `BuildSystem`
+  traits, the `SystemInput` / `SystemOutput` bundle traits, the `Out<O>` health wrapper,
+  and the `CyclicRunner` driver. Unit tests in `src/system/tests.rs`.
+- `src/port.rs` — the typed `Output<F>` / `Input<F>` port wrappers and `FrameRef<F>`.
+- `src/binder.rs` — the `RingSource` / `BindPorts` binding contract and the host `Binder`.
+- `src/descriptor.rs` — `PortDesc`, `SystemDescriptor`, `SystemKind`, and `compatible`.
+- `src/health.rs` — `SystemHealth` / `SystemLog` frames and the `HealthPort` handle.
 
 ---
 
-## 0. Design summary (orientation)
+## 1. The `System` family of traits
 
-A **system** owns some private state and a set of **output ports** (single-writer ring
-buffers it produces frames into) and reads a set of **input ports** (read-only views into
-other systems' output buffers). The coordinator owns the ring regions, builds the per-system
-port handles at wiring time, validates that producer outputs satisfy consumer inputs (using
-the frames' VTables), then drives the system: cyclic systems are `execute`d once per cycle,
-async systems run their own loop. Systems never return errors; they emit health as ordinary
-frames over a framework-provided health output port.
-
-The genuinely new surface in WP4 is small: the `System`/`SystemInput`/`SystemOutput` traits,
-the typed `Output<F>`/`Input<F>` port wrappers around the landed `Writer`/`View`, a
-`SystemDescriptor` self-description struct built from `Frame`/`AsVTable`, and a standard
-health frame. Everything below the port wrappers is reuse.
-
----
-
-## 1. The `System` trait
-
-### 1.1 The trait
+The system surface is split into a shared base and two leaf traits. The base carries
+everything common — the typed port bundles, the wiring name, and the once-each lifecycle
+hooks — and the two leaf traits express the one structural difference: who drives the
+system. A user implements the base plus exactly one leaf trait. The lifecycle is never
+duplicated.
 
 ```rust
-/// What kind of driving a system needs from the coordinator. The *only* structural
-/// distinction between systems (DESIGN.md "Cross System Communication").
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum SystemKind {
-    /// Invoked once per coordinator cycle. Inputs are views straight into upstream
-    /// output buffers; a lapped input is a hard error (§3.1).
-    Cyclic,
-    /// Runs at its own rate / on its own events. Inputs are views into private buffers
-    /// the coordinator copies upstream outputs into (§3.2).
-    Async,
-}
+pub trait System<B: Backing = BoxBacking> {
+    /// The read-only inputs this system consumes.
+    type Input: SystemInput + BindPorts<B>;
+    /// The owned outputs this system produces (wrapped in `Out` for health).
+    type Output: SystemOutput + BindPorts<B>;
 
-pub trait System {
-    /// The read-only inputs this system consumes (a bundle of typed input ports).
-    type Input: SystemInput;
-    /// The owned outputs this system produces (a bundle of typed output ports).
-    type Output: SystemOutput;
-
-    /// How the coordinator drives this system.
-    const KIND: SystemKind;
-    /// Human/wiring name; the prefix the system's health frame hangs off (§4).
+    /// Wiring name; the prefix the system's health frame hangs off (§4).
     const NAME: &'static str;
 
-    /// Runs once before the first `execute`. May emit initial frames / health.
-    fn init(&mut self, output: &mut Self::Output);
+    /// Runs once before the first `execute`/`run`. May emit initial frames / health.
+    fn init(&mut self, _output: &mut Self::Output) {}
 
-    /// One unit of work: read the latest inputs, write outputs. Reports any trouble
-    /// through `output` (health), never through a return value (§4).
-    fn execute(&mut self, input: &Self::Input, output: &mut Self::Output);
-
-    /// Runs once when the system is torn down. May flush final frames / health.
-    fn shutdown(&mut self, output: &mut Self::Output);
+    /// Runs once at teardown. May flush final frames / health.
+    fn shutdown(&mut self, _output: &mut Self::Output) {}
 }
 ```
 
-This is the DESIGN.md sketch made concrete, with three resolved deviations, each justified:
+`init` and `shutdown` default to no-ops, so a system that needs no setup or teardown omits
+them. Both receive `&mut Self::Output` — a driver publishes its first frame in `init` (e.g.
+a default mode) and may flush a final health record in `shutdown`. They take no input:
+there is nothing meaningful to read before or after the run.
 
-1. **`Input`/`Output` are *port-handle bundles*, not raw frame data.** `Output` is the set of
-   `Writer`-backed ports the system owns; `Input` is the set of `View`-backed ports it
-   borrows. Passing frame *values* in/out would force a representation that crosses the
-   process boundary as Rust types — which DESIGN.md explicitly rejects ("dl-open across a
-   stable ABI is genuinely hard … the data path is built on shared memory"). Handles over
-   rings keep the data path as table bytes.
-2. **`execute` takes `&Self::Input` and `&mut Self::Output` (by reference, not by value).**
-   The output ports wrap ring `Writer`s, which need `&mut self` to `try_write` and must
-   **persist across cycles** (a `Writer` holds the single-writer role for a buffer; recreating
-   it each cycle is wrong). The inputs are borrowed read-only, matching DESIGN.md "systems own
-   their outputs and borrow their inputs". The coordinator owns the bundles between cycles.
-3. **`init`/`shutdown` also receive `&mut Self::Output`.** A driver needs to publish its first
-   frame in `init` (e.g. a default mode) and flush a final health record in `shutdown`. They
-   take no input — there is nothing meaningful to read before/after the run.
+### 1.1 `B: Backing` — one system, two deployment shapes
 
-### 1.2 Configuration / parameters vs streamed inputs
+The `B` type parameter is the ring [`Backing`] the bundles are bound over. It defaults to
+`BoxBacking` — the in-process host case — so an ordinary system writes a plain
+`impl System for Foo` with no mention of `B`. A system that may run as a dlopen'd `cdylib`
+instead writes its impls `Backing`-generic (`impl<B: Backing> System<B> for Foo`), so a
+loaded instance can hold `RawBacking` views into the host's shared-memory regions. Because
+the bytes on the wire are described by the VTable rather than by a shared Rust type, the
+same system source serves both shapes; only the backing differs (§6).
 
-These are deliberately different mechanisms:
+### 1.2 Cyclic systems
 
-- **Parameters** — gains, limits, modes, buffer depths, calibration. Fixed (or
-  reconfigured rarely) and *not* a frame stream. They live in the system struct's own fields,
-  set at construction, before `init`:
+```rust
+pub trait CyclicSystem<B: Backing = BoxBacking>: System<B> {
+    /// One unit of work: read the latest inputs, write outputs. Reports trouble
+    /// through `output.health()`, never a return value.
+    fn execute(&mut self, now: Timestamp, input: &mut Self::Input, output: &mut Self::Output);
+
+    /// This system's self-description for wiring (§5).
+    fn descriptor() -> SystemDescriptor { /* SystemKind::Cyclic */ }
+}
+```
+
+The coordinator calls `execute` once per cycle. `now` is the coordinator's per-cycle
+timestamp — the same value handed to every system in one cycle, and the value driving a
+simulated clock — so a system stamps its output frames with it rather than calling
+`Timestamp::now()` independently.
+
+`execute` takes `&mut Self::Input` (not `&`): draining a ring `View` advances its cursor
+and fills the port's reused scratch buffer, so reading is a mutating operation. It takes
+`&mut Self::Output` because the output ports wrap ring `Writer`s, which need `&mut self` to
+write and which must persist across cycles — a `Writer` holds the single-writer role for a
+buffer, so recreating it each cycle would be wrong. The coordinator owns the bundles
+between cycles.
+
+`descriptor()` is provided: it assembles a [`SystemDescriptor`] from `NAME`, the bundle
+descriptors, and `SystemKind::Cyclic`.
+
+### 1.3 Async systems
+
+```rust
+pub trait AsyncSystem<B: Backing = BoxBacking>: System<B> {
+    /// The system's own loop. Returns when shutting down.
+    async fn run(&mut self, input: &mut Self::Input, output: &mut Self::Output);
+
+    /// This system's self-description for wiring (§5).
+    fn descriptor() -> SystemDescriptor { /* SystemKind::Async */ }
+}
+```
+
+An async system owns its own loop. The coordinator spawns `run` **once** and does not tick
+the system. Inside `run`, an event-driven system awaits its input ports with
+`Input::recv` (backed by the ring's `Notifier` wake) and does its work on each wake; a
+rate-driven system sleeps on its own timer and works on each tick. Either way it uses the
+async output path (`Output::write_async`) so a lossless output can suspend for space. The
+input and output references are `&mut` for the same reasons as `CyclicSystem::execute`.
+
+### 1.4 The leaf trait is the structural distinction
+
+The only difference between a cyclic and an async system is who drives it (and, as a
+consequence, where its inputs come from — §3). That difference is carried by *which leaf
+trait the system implements*, not by a runtime flag on the base trait. `SystemKind` exists
+(§5) but only as descriptor metadata for wiring; the trait is the real distinction. This
+keeps a single shared lifecycle while letting each driving model carry exactly the entry
+point it needs.
+
+### 1.5 Construction: parameters vs streamed inputs
+
+Two deliberately different mechanisms:
+
+- **Parameters** — gains, limits, modes, buffer depths, calibration. Fixed (or reconfigured
+  rarely) and *not* a frame stream. They live in the system struct's own fields, set at
+  construction before `init`. A system declares how it is built from its typed params with
+  `BuildSystem`:
+
   ```rust
-  struct NavFilter { q: f64, r: f64, mode: NavMode, /* state… */ }
-  impl NavFilter { fn new(params: NavParams) -> Self { … } }
+  pub trait BuildSystem: Sized {
+      /// The params value the system is constructed from. `()` for a paramless system.
+      type Params;
+      /// Construct the (pre-init) system from its decoded params.
+      fn new(params: Self::Params) -> Self;
+  }
   ```
-  The coordinator/wiring (WP6) constructs the system from a config blob; WP4 only requires
-  that a system is *constructible before `init`* and carries its own params. (Live parameter
-  updates, if ever needed, would arrive as an ordinary input frame — but that is a future
-  extension, not part of the trait.)
-- **Streamed inputs** — IMU samples, nav estimates, commands. These flow as frames over rings
-  and are read through `Self::Input` ports each `execute`.
 
-The split keeps the hot path (`execute`) about frame streams only, and keeps params out of the
-ring transport.
+  `BuildSystem` is the **format-independent** half of construction and carries no KDL
+  coupling: a `cdylib` exported via `export_system!` only needs `BuildSystem` (its
+  `fsw_create` postcard-decodes `Params` and calls `new`), so the dlopen ABI does not ride
+  the `kdl` feature. The KDL static-registry path layers `RegisteredSystem` on top, adding
+  a `Params: FromKdlNode` bound via a blanket impl, so a statically-linked system is
+  registered without extra work.
+
+- **Streamed inputs** — IMU samples, nav estimates, commands. These flow as frames over
+  rings and are read through `Self::Input` ports each `execute`/`run`.
+
+The split keeps the hot path about frame streams only and keeps params out of the ring
+transport. (A live parameter update, if ever needed, arrives as an ordinary input frame.)
 
 ---
 
-## 2. Outputs (owned buffers) & Inputs (views)
+## 2. Ports
 
-### 2.1 Output ports — `SystemOutput`
+### 2.1 Output ports — `Output<F>`
 
 A system's `Output` associated type is a struct of one or more **output ports**, one per
-output frame type. The port wraps the single ring `Writer` the system owns for that frame:
+output frame type. Each port wraps the single ring `Writer` the system owns for that frame:
 
 ```rust
-/// One owned output: the single writer into a ring buffer carrying frame `F`.
-pub struct Output<F: Frame, B: Backing, WD: WakeSource, WS: WakeSink> {
+pub struct Output<F, B = BoxBacking, WD = NoWake, WS = NoWake>
+where B: Backing, WD: WakeSource, WS: WakeSink
+{
     writer: Writer<B, WD, WS>,
-    scratch: FrameWriter<F>-or-LenPacket, // reused build buffer (no per-write alloc)
-}
-
-impl<F: Frame + IntoBytes + Immutable, …> Output<F, …> {
-    /// Publish a *fixed* frame (no dynamic members). Serializes `F`'s table bytes and
-    /// writes one ring record. Overwrite mode never blocks; lossless may error.
-    pub fn write(&mut self, frame: &F) -> Result<(), WriteError> { … }
-
-    /// Publish a frame with dynamic `FrameList`/`FrameMap` members: the closure drives a
-    /// `FrameWriter<F>` (its `list`/`map` builders) to patch the trailer before sending.
-    pub fn write_with(
-        &mut self,
-        fixed: &F,
-        build: impl FnOnce(&mut FrameWriter<F>),
-    ) -> Result<(), WriteError> { … }
+    scratch: Option<LenPacket>,   // reused table-bytes buffer for write_with (no per-call malloc)
+    _f: PhantomData<F>,
 }
 ```
 
-How a write lands as bytes (grounded in WP3): `FrameWriter::new(fixed)` seeds a `LenPacket`
-with `F`'s fixed `#[repr(C)]` region, the closure appends any dynamic trailer via
-`FrameWriter::{list,map}`, and `FrameWriter::table()` yields the table bytes (fixed region +
-trailer, offset 0 at the fixed region). Those table bytes are exactly what `VTable::apply`
-consumes and what the ring record payload carries — there is **no separate serialization
-step**. The port hands `table()` to `Writer::try_write`.
-
-`SystemOutput` is the bundle trait. It exposes (a) the static descriptors for wiring/sizing
-and (b) the binding the coordinator uses to construct the ports from rings it created:
+Cyclic outputs default to `BoxBacking` + `NoWake`; async outputs select a `Notifier` wake
+so a lossless write can suspend for space. The write methods (available when
+`F: Frame + IntoBytes + Immutable`):
 
 ```rust
-pub trait SystemOutput: Sized {
-    /// Static: the frames this output bundle produces — for buffer sizing and wiring
-    /// validation, read *before* any port exists (§5).
-    fn descriptors() -> Vec<OutputDesc>;
+/// Publish a *fixed* frame (no dynamic members). The frame's `#[repr(C)]` bytes
+/// **are** its table bytes (offset 0 at the fixed region), so this is a single
+/// `try_write` with no serialization step.
+pub fn write(&mut self, frame: &F) -> Result<(), WriteError>;
 
-    /// Coordinator-side: build the concrete port bundle from the rings it allocated,
-    /// in `descriptors()` order. (Exact handle type elided; see §6 / WP5.)
-    fn bind(rings: &mut dyn PortBinder) -> Self;
+/// Publish a frame with dynamic `FrameList`/`FrameMap` members: `build` drives a
+/// `FrameWriter<F>` (its `list`/`map` builders) to append the trailer, then the
+/// finished table bytes are written as one record.
+pub fn write_with(&mut self, fixed: &F, build: impl FnOnce(&mut FrameWriter<F>))
+    -> Result<(), WriteError>;
+
+/// Async publish of a fixed frame: suspends (lossless mode only) until there is room.
+pub async fn write_async(&mut self, frame: &F) -> Result<(), WriteError>;
+```
+
+How a write lands as bytes: for a fixed frame, the `#[repr(C)]` `F` value already *is* its
+table bytes at offset 0, so `write` hands `frame.as_bytes()` straight to `Writer::try_write`.
+For a dynamic frame, `FrameWriter` seeds a `LenPacket` with the fixed region, the closure
+appends the trailer via `FrameWriter::{list,map}`, and `FrameWriter::table()` yields the
+table bytes — exactly what the ring record payload carries, with no separate serialization
+step. `write_with` retains the grown `LenPacket` in `scratch` so a per-cycle publish does
+not malloc and free a fresh buffer every call.
+
+Multiple outputs at different rates are just multiple ports in the bundle; each buffer is
+sized independently and the system writes to each whenever it has new data. No output has to
+advance every cycle.
+
+### 2.2 The output bundle — `SystemOutput` and `Out<O>`
+
+A bundle of output ports implements `SystemOutput`, which exposes only the static
+descriptors used for sizing and wiring validation before any port exists:
+
+```rust
+pub trait SystemOutput {
+    /// The produced frame of every output port (§5), in field order.
+    fn descriptors() -> Vec<PortDesc>;
 }
 ```
 
-Multiple outputs at different rates are just multiple ports in the bundle; the coordinator
-sizes each buffer independently and the system writes to each whenever it has new data. There
-is no requirement that all outputs advance every cycle.
-
-### 2.2 Output buffer sizing (from `MAX_SIZE` via the ring's record framing)
-
-Each output buffer is sized from the frame's worst-case table size. WP3 already computes that
-as `F::MAX_SIZE` (`Componentize::MAX_SIZE` — fixed region + the dynamic trailer budget, e.g.
-`FrameList<T, MAX>::MAX_SIZE = round_up8(MAX * size_of::<T>())`). The ring wraps each record in
-an 8-byte header + 8-byte-padded payload (`frame_len(payload) = 8 + round_up8(payload)`). So:
-
-```
-record_bytes  = frame_len(F::MAX_SIZE)            // worst-case one record
-capacity      = (record_bytes * depth).next_power_of_two()   // Config.capacity must be pow2
-```
-
-`depth` is the number of in-flight records the buffer must hold — at least 2 (one being
-written while the slowest active reader still holds one), more for a bursty producer or a lagging
-async consumer. `Config.max_readers` is set to the **fan-out count**: the number of distinct
-consumers (views) the coordinator will register on this output (cyclic consumers + one per
-async private-buffer copy-in). The coordinator derives all three from the wiring graph (WP6) +
-the descriptors (§5).
-
-> **Gap to close (open question Q1).** The ring exposes `round_up8` publicly but **`frame_len`
-> is private**. WP4 needs a public `frame_len`/`record_len` (or a `Config::for_record(max,
-> depth)` helper) on the ring crate to size buffers without re-deriving the 8-byte header rule.
-> Small, additive change to WP1.
-
-### 2.3 Input ports — `SystemInput`
-
-A system's `Input` associated type is a struct of one or more **input ports**, one per input
-frame type, each wrapping a read-only ring `View`:
+The framework wraps a user's output bundle `O` in `Out<O>`, which adds the implicit
+per-system health/log port pair so `output.health()` is always available:
 
 ```rust
-/// One borrowed input: a view into an upstream output buffer (cyclic) or a private
-/// copy-in buffer (async), reading frame `F`.
-pub struct Input<F: Frame, B: Backing, RD: WakeSink, RS: WakeSource> {
+pub struct Out<O, B = BoxBacking, WD = NoWake, WS = NoWake>
+where B: Backing, WD: WakeSource, WS: WakeSink
+{
+    ports: O,
+    health: HealthPort<B, WD, WS>,
+}
+```
+
+`Out` `Deref`/`DerefMut`s to the user bundle `O`, so a system reaches its own ports as
+`output.<port>.write(...)` and reaches the framework handle as `output.health()`. The
+`Out<O>` `SystemOutput::descriptors()` returns the user ports' descriptors followed by the
+two implicit ones (`SystemHealth`, then `SystemLog`) — so a system that declares one user
+output reports three output descriptors. A system's `Output` associated type is therefore
+`Out<MyOutBundle>`.
+
+### 2.3 Input ports — `Input<F>`
+
+A system's `Input` associated type is a struct of one or more **input ports**, one per
+input frame type, each wrapping a read-only ring `View`:
+
+```rust
+pub struct Input<F, B = BoxBacking, RD = NoWake, RS = NoWake>
+where B: Backing, RD: WakeSink, RS: WakeSource
+{
     view: View<B, RD, RS>,
-    scratch: Vec<u8>,   // reused copy-out target (overwrite mode copies bytes)
-    decoded: F,         // reusable decode target for the fixed region
-}
-
-impl<F: Frame + FromBytes + KnownLayout + …, …> Input<F, …> {
-    /// True iff the writer lapped this view (overwrite buffers only). The coordinator
-    /// checks this on cyclic systems *before* `execute` (§3.1).
-    pub fn is_lapped(&self) -> bool { self.view.is_lapped() }
-
-    /// Drain to the newest committed record and return a typed view of it, or `None`
-    /// if no record has arrived yet. Returns `Err(Lapped)` on overwrite lap.
-    pub fn latest(&mut self) -> Result<Option<FrameRef<'_, F>>, ReadError> { … }
+    scratch: Vec<u8>,   // reused copy-out target
+    have: bool,         // whether scratch holds a valid record
+    _f: PhantomData<F>,
 }
 ```
 
-**Typed access.** Two complementary paths, both over the bytes `View::try_read_into` copies
-into `scratch`:
+Lap checking and resync (always available):
 
-1. **Fixed region — zerocopy.** For fixed frames (and the fixed part of dynamic frames) the
-   table bytes *are* the `#[repr(C)]` `F` layout (FrameWriter wrote `fixed.as_bytes()` at table
-   offset 0). The port reads `F` directly via `F::ref_from_prefix(&scratch)` — no per-field
-   decode. This requires `F: FromBytes + KnownLayout` (a bound the typed reader already needs).
-2. **Dynamic members — typed reader.** `FrameList`/`FrameMap` members are read with the WP3
-   `ListReader::new(table, slot)` / `MapReader::new(table, slot)` over the same `scratch`
-   bytes, indexed by position or key. `FrameRef` exposes accessors that hand these out.
+```rust
+/// True iff the writer lapped this view (overwrite buffers only). The coordinator
+/// checks this on cyclic systems *before* `execute` (§3.1).
+pub fn is_lapped(&self) -> bool;
 
-A third, uniform path is available where a system wants components rather than a typed struct:
-`F::as_vtable().apply(&scratch, &mut sink)` drives any `Decomponentize` sink (the same path
-metor-db uses). The typed paths above are the fast paths; the vtable path is the escape hatch.
+/// Skip to the live edge, abandoning unread (possibly lapped) data. Async input
+/// ports call this on lap to "drop on full and continue" (§3.2).
+pub fn resync(&self);
+```
 
-**Latest-wins drain.** `latest()` loops `View::try_read_into` until `Ok(false)` (caught up),
-keeping the last record — cyclic systems want the freshest sample, not a backlog. A system that
-must process *every* record (e.g. a command channel) instead loops and handles each; that is a
-system-author choice, not a trait constraint. Async event-driven systems use the async
-`View::read_into` to await the next record (§3.2).
+Reads (available when `F: Frame + FromBytes + KnownLayout + Immutable`):
 
-### 2.4 Fan-in / fan-out rule
+```rust
+/// Drain to the newest committed record and hand back a typed view of it, or `None`
+/// if no record has ever arrived. Cyclic systems want the freshest sample, not a
+/// backlog. A `Lapped` view is surfaced as `Err`.
+pub fn latest(&mut self) -> Result<Option<FrameRef<'_, F>>, ReadError>;
+
+/// Process *every* record since the last drain, in order (command / event channels
+/// that cannot drop a record). Stops and returns `Err` on lap.
+pub fn drain(&mut self, f: impl FnMut(FrameRef<'_, F>)) -> Result<(), ReadError>;
+
+/// Await the next record (event-driven async systems). Backed by the view's async
+/// `read_into`, which suspends on the `RD` wake until data commits. Propagates `Lapped`.
+pub async fn recv(&mut self) -> Result<FrameRef<'_, F>, ReadError>;
+```
+
+`latest` loops `View::try_read_into` until caught up, keeping the last record — the
+latest-wins drain a cyclic sampler wants. `drain` instead delivers each record to a closure,
+for a channel that must not drop. `recv` awaits the next record for an event-driven async
+system. The choice between them is a system-author decision, not a trait constraint.
+
+### 2.4 Typed access — `FrameRef<F>`
+
+A read hands out a `FrameRef<'_, F>`: a zero-copy typed view over one record's table bytes,
+with three access paths:
+
+```rust
+impl<'a, F: Frame + FromBytes + KnownLayout + Immutable> FrameRef<'a, F> {
+    /// The fixed `#[repr(C)]` region, zero-copy. The table bytes at offset 0 *are* the
+    /// `F` layout, so no per-field decode is needed.
+    pub fn get(&self) -> &'a F;
+    /// The raw table bytes (fixed region + trailer).
+    pub fn table(&self) -> &'a [u8];
+    /// A reader over the `FrameList<T, _>` member whose slot sits at `slot_off`.
+    pub fn list<T: FromBytes>(&self, slot_off: usize) -> ListReader<'a, T>;
+    /// A reader over the `FrameMap<_, V, _>` member whose slot sits at `slot_off`.
+    pub fn map<V: FromBytes>(&self, slot_off: usize) -> MapReader<'a, V>;
+    /// Drive any `Decomponentize` sink via the frame's vtable — the uniform escape hatch.
+    pub fn apply<D: Decomponentize>(&self, sink: &mut D) -> Result<Result<(), D::Error>, ProtoError>;
+}
+```
+
+1. **Fixed region — zerocopy.** Because the producer wrote `fixed.as_bytes()` at table
+   offset 0, `get()` reads `F` directly via `ref_from_prefix` with no per-field decode.
+2. **Dynamic members — typed readers.** `FrameList`/`FrameMap` members are read with
+   `list(offset_of!(F, member))` / `map(...)` over the same table bytes.
+3. **VTable apply — the escape hatch.** `apply` drives any `Decomponentize` sink (the same
+   path metor-db uses) where a system wants components rather than a typed struct.
+
+### 2.5 The input bundle — `SystemInput`
+
+```rust
+pub trait SystemInput {
+    /// The required producer shape of every input port (§5), in field order.
+    fn descriptors() -> Vec<PortDesc>;
+    /// Whether any input port has been lapped (overwrite buffers). The coordinator
+    /// checks this on cyclic systems before `execute` (§3.1).
+    fn any_lapped(&self) -> bool;
+}
+```
+
+### 2.6 Deriving the bundles
+
+Port bundles are plain structs of `Input<F>` / `Output<F>` fields, and `#[derive(SystemInput)]`
+/ `#[derive(SystemOutput)]` generate the boilerplate from the field types: `descriptors()`
+delegates to each port's `descriptor()` in field order, `any_lapped()` ORs each input port's
+`is_lapped()`, and the derive also emits the matching `BindPorts` impl (§5.3). A complete
+cyclic system:
+
+```rust
+#[derive(SystemInput)]
+struct FilterIn { imu: Input<Imu> }
+
+#[derive(SystemOutput)]
+struct FilterOut { nav: Output<NavEstimate> }
+
+struct Filter { gain: f64 }
+
+impl System for Filter {
+    type Input = FilterIn;
+    type Output = Out<FilterOut>;
+    const NAME: &'static str = "filter";
+
+    fn init(&mut self, output: &mut Out<FilterOut>) {
+        let _ = output.nav.write(&NavEstimate { /* default */ });
+    }
+}
+
+impl CyclicSystem for Filter {
+    fn execute(&mut self, now: Timestamp, input: &mut FilterIn, output: &mut Out<FilterOut>) {
+        let Ok(Some(imu)) = input.imu.latest() else {
+            output.health().error("imu_missing");
+            return;
+        };
+        let s = imu.get();
+        let _ = output.nav.write_with(
+            &NavEstimate { timestamp: s.timestamp, angle: s.omega * self.gain, residuals: FrameList::EMPTY },
+            |fw| { fw.list(offset_of!(NavEstimate, residuals), |l| { l.push(Residual { value: s.omega }); }); },
+        );
+    }
+}
+```
+
+### 2.7 Fan-in / fan-out
 
 - **Single writer per buffer.** Every ring buffer has exactly one `Writer` — the producing
-  system's output port. The ring enforces this ("at most one live writer per buffer"); the
+  system's output port. The ring enforces "at most one live writer per buffer"; the
   coordinator upholds it by constructing exactly one `Output<F>` per output buffer.
-- **N producers → N views.** A consumer of N upstream producers holds **N input ports**, each a
-  `View` into a *distinct* single-producer buffer. There is never a shared writer and never a
-  fan-in buffer. Combining N streams is the consumer's job (it reads N ports and fuses them),
-  not the transport's.
+- **N producers → N views.** A consumer of N upstream producers holds N input ports, each a
+  `View` into a *distinct* single-producer buffer. There is never a shared writer and never
+  a fan-in buffer. Combining N streams is the consumer's job, not the transport's.
 
 ---
 
-## 3. Cyclic vs async — representation & lifecycle
+## 3. Cyclic vs async — input source & lifecycle
 
-Per DESIGN.md the only two differences are (a) where inputs come from and (b) how execution is
-triggered. WP4 keeps **one `System` trait** and expresses the difference with the
-`SystemKind` const plus, for async, one extra driver entry point. Two separate traits were
-considered and rejected (open question Q3): they would duplicate the whole lifecycle surface
-for a one-bit difference and make a system hard to reclassify.
+The two driving models differ in where inputs come from and how execution is triggered;
+everything else is shared.
 
 ### 3.1 Cyclic systems
 
-- `KIND = SystemKind::Cyclic`.
-- **Input source:** each input port's `View` is registered directly on the upstream system's
-  output buffer (overwrite mode). No copy.
+- **Input source:** each input port's `View` is registered directly on the upstream
+  system's output buffer (overwrite mode). No copy.
 - **Triggering:** the coordinator calls `execute` once per cycle.
-- **Lap = hard error.** Before invoking, the coordinator calls `is_lapped()` on every input
-  port. A lapped view means the reader is hopelessly behind; per DESIGN.md the coordinator
-  **telemeters it and stops invoking that system** (it does not silently `resync`). WP4's
-  contribution here is only exposing `is_lapped()` per port and the descriptor list so the
-  coordinator can iterate the ports; the stop policy itself is WP5.
+- **Lap = hard stop.** Before invoking, the coordinator checks `any_lapped()` on the input
+  bundle. A lapped view means the reader is hopelessly behind; the framework driver
+  telemeters it and permanently stops the system rather than silently resyncing (§4, the
+  `CyclicRunner`). The `Input` port only *exposes* `is_lapped()`; the stop policy lives in
+  the driver/coordinator.
 - **Wake:** none. Cyclic ports use `NoWake` for both writer and view (the synchronous `try_*`
   paths never touch the wake hooks).
 
 ### 3.2 Async systems
 
-- `KIND = SystemKind::Async`.
 - **Input source:** each input port's `View` reads a **private buffer the coordinator owns**.
   The coordinator runs a copy-in `Writer` into that private buffer, copying the relevant
-  upstream output records in. The system never sees the upstream buffer directly.
-- **Drop on full, not stop.** An async system cannot be gated by skipping invocation, so on lap
-  its input port **`resync()`s to the live edge and continues** (the dropped records are simply
-  lost) — exactly DESIGN.md's "if there is no room, the data is dropped." This is the read-side
-  behavioral difference from cyclic ports and is encapsulated in the async `Input` port.
-- **Triggering:** the system runs its own loop. WP4 models this with an extra entry the
-  coordinator launches **once**:
-  ```rust
-  pub trait AsyncSystem: System {
-      /// The system's own loop. Returns when the system is shutting down. Implemented in
-      /// terms of `self.execute(...)`, paced by either a timer or by awaiting inputs.
-      async fn run(&mut self, input: &Self::Input, output: &mut Self::Output);
-  }
-  ```
-  Inside `run`, an **event-driven** system awaits its input ports with the ring's async
-  `View::read_into` (backed by a `Notifier` `WakeSink`) and calls `execute` on each wake; a
-  **rate-driven** system sleeps on its own timer and calls `execute` on each tick. Either way it
-  uses the async output path (`Writer::write` with a `Notifier`) so a lossless output can
-  suspend for space. The coordinator spawns `run` as a task; it does **not** tick the system.
-- **What the coordinator integrates:** the async system's outputs are ordinary ring buffers; a
-  downstream consumer (cyclic or async) reads them like any other output. The coordinator reads
-  them back out exactly as it would a cyclic system's outputs — there is nothing async-specific
-  on the *output* side. The async-ness is entirely on the *input* side (private copy-in) and in
-  who calls the loop.
+  upstream output records in; the system never sees the upstream buffer directly.
+- **Drop on full, not stop.** An async system cannot be gated by skipping invocation, so on
+  lap its input port `resync()`s to the live edge and continues — the dropped records are
+  simply lost. This is the read-side behavioral difference from cyclic ports.
+- **Triggering:** the system runs its own `run` loop. An event-driven system awaits inputs
+  with `Input::recv` (backed by a `Notifier` `WakeSink`); a rate-driven system sleeps on its
+  own timer. Either way it uses `Output::write_async` so a lossless output can suspend for
+  space. The coordinator spawns `run` as a task and does not tick the system.
+- **Output side is uniform.** An async system's outputs are ordinary ring buffers a
+  downstream consumer (cyclic or async) reads like any other output. The async-ness is
+  entirely on the input side (private copy-in) and in who calls the loop.
 
-### 3.3 Lifecycle ordering (the contract the coordinator honors)
+### 3.3 Lifecycle ordering
 
-`init(&mut output)` → for cyclic, `execute` per cycle while no input is lapped; for async,
-`run` once → `shutdown(&mut output)` once at teardown. `init`/`shutdown` are exactly-once;
-`execute` is many-times (cyclic) or driven from within `run` (async). Deterministic ordering
-and replay across systems are explicitly future work (DESIGN.md "Each cycle").
+`init(&mut output)` runs once before any work. For a cyclic system, `execute` runs per cycle
+while no input is lapped; for an async system, `run` is spawned once. `shutdown(&mut output)`
+runs once at teardown. `init`/`shutdown` are exactly-once; `execute` is many-times (cyclic)
+or driven from within `run` (async).
 
 ---
 
 ## 4. Health / error telemetry
 
-Systems do not return errors (DESIGN.md). A system reports its health as **ordinary frames**
-flowing out over a dedicated, framework-provided **health output port** that every system gets
-implicitly (the coordinator wires a health buffer per system, named `"<System::NAME>.health"`).
-Because health is just frames, it lands in metor-db and any UI through the same path as all
-other data — no special channel.
+Systems do not return errors. A system reports its health as **ordinary frames** flowing out
+over a dedicated, framework-provided **health output port** that every system gets implicitly
+(named under the system's `NAME` prefix). Because health is just frames, it lands in metor-db
+and any UI through the same path as all other data — no special channel.
 
-### 4.1 Shape — a standard health frame plus open-ended counters
+### 4.1 The standard frames
 
 ```rust
-#[derive(Frame, IntoBytes, Immutable, KnownLayout)]
+#[derive(Frame, IntoBytes, Immutable, KnownLayout, FromBytes)]
 #[repr(C)]
-#[metor_fsw(name = "health")]   // full id = "<system>.health" once prefixed
-struct SystemHealth {
-    #[metor_fsw(timestamp)]
-    timestamp: Timestamp,
-    /// Coordinator-maintained standard counters (filled by the port wrapper, not the
-    /// system): cycles run, total errors, lapped-input events, last execute duration.
-    cycles: u64,
-    errors: u64,
-    lapped_inputs: u64,
-    last_execute_micros: u64,
-    /// Domain-specific error counters the system bumps by name (e.g. "imu_timeout",
-    /// "crc_fail"). Open-ended → a dynamic map keyed by error name.
-    error_counts: FrameMap<Name, u64, MAX_ERR_KINDS>,
+#[metor_fsw(name = "health")]
+pub struct SystemHealth {
+    #[metor_fsw(timestamp)] pub timestamp: Timestamp,
+    pub cycles: u64,
+    pub errors: u64,
+    pub lapped_inputs: u64,
+    pub last_execute_micros: u64,
+    pub error_counts: FrameMap<Name<'static>, u64, MAX_ERR_KINDS>,
 }
 ```
 
-- **Error counters** are plain `u64` components. The four standard ones are maintained by the
-  health-port wrapper around `execute` (so they exist even for a system that never touches
-  health); domain-specific kinds use a `FrameMap<Name, u64>` so they need not be enumerated at
-  compile time and still land as fully-qualified components (`<system>.health.error_counts.
-  imu_timeout`) via the WP3 dynamic-frame path.
-- **String logs** ride a separate, parallel **log frame**, because metor-proto `PrimType` has
-  no string type — components are fixed-size scalar arrays. A log line is therefore a
-  fixed-size byte component:
-  ```rust
-  #[derive(Frame, …)]
-  #[metor_fsw(name = "log")]
-  struct SystemLog {
-      #[metor_fsw(timestamp)] timestamp: Timestamp,
-      lines: FrameList<LogLine, MAX_LINES>,
-  }
-  #[derive(AsVTable, IntoBytes, Immutable, KnownLayout)]
-  #[repr(C)]
-  struct LogLine { level: u8, len: u8, msg: [u8; LOG_MSG_CAP] }  // u8 array = a component
-  ```
-  Each line lands as `…log.lines.0.msg` (a `U8` array component) + `level`/`len`, queryable in
-  db like anything else. Capacity is bounded (`MAX_LINES`, `LOG_MSG_CAP`) so the buffer sizes
-  via `MAX_SIZE` like every output.
+The four scalar counters are maintained by the framework around `execute` (so they exist even
+for a system that never touches health). Domain-specific kinds are bumped by name and ride
+the dynamic `FrameMap`, so they need not be enumerated at compile time and still land as
+fully-qualified components (`<system>.health.error_counts.<kind>`) via the dynamic-frame path.
 
-### 4.2 The system-facing handle
-
-The health/log ports are surfaced to the system as a small handle inside `Self::Output` (or a
-distinguished `health()` accessor on it), so error reporting is one call and stays the *only*
-mechanism:
+String logs ride a parallel **log frame**, because metor-proto has no string component type —
+a log line is a fixed-size byte component:
 
 ```rust
-output.health().error("imu_timeout");          // bump a named counter
-output.health().log(Level::Warn, "skipped frame");  // append a log line
+#[derive(Frame, IntoBytes, Immutable, KnownLayout, FromBytes)]
+#[repr(C)]
+#[metor_fsw(name = "log")]
+pub struct SystemLog {
+    #[metor_fsw(timestamp)] pub timestamp: Timestamp,
+    pub lines: FrameList<LogLine, MAX_LINES>,
+}
+
+#[derive(AsVTable, IntoBytes, Immutable, KnownLayout, FromBytes, Clone, Copy)]
+#[repr(C)]
+pub struct LogLine { pub level: u8, pub len: u8, pub _pad: [u8; 6], pub msg: [u8; LOG_MSG_CAP] }
 ```
 
-The wrapper batches counters into one `SystemHealth` record per cycle (or on change) and flushes
-log lines as they arrive. Fault management beyond this telemetry is **out of scope** (DESIGN.md).
+Each line's `msg` lands as a `U8`-array component queryable in db like anything else.
+Capacities are bounded (`MAX_ERR_KINDS = 16`, `MAX_LINES = 16`, `LOG_MSG_CAP = 64`; longer
+lines truncate) so both frames size via `MAX_SIZE` like every output.
+
+### 4.2 The `HealthPort` handle
+
+The health/log port pair and the framework counter state live in `HealthPort`, surfaced to a
+system as `output.health()`:
+
+```rust
+output.health().error("imu_timeout");           // bump a named domain counter (+ the errors total)
+output.health().log(Level::Warn, "skipped frame"); // append a log line, flushed next cycle
+```
+
+`Level` is `Info` / `Warn` / `Error`. `error` and `log` are the *only* error-reporting
+mechanism a system has. The framework drives the counter maintenance:
+
+```rust
+impl HealthPort {
+    pub fn record_lapped(&mut self);                 // bump lapped_inputs
+    pub fn end_cycle(&mut self, timestamp: Timestamp, execute_micros: u64); // bump cycles,
+        // stamp duration, publish one health record + flush any pending log lines
+}
+```
+
+### 4.3 The cyclic driver — `CyclicRunner`
+
+`CyclicRunner<S, O, B>` is the framework wrapper that owns a cyclic system's bundles between
+cycles and maintains the standard counters. It owns the system, its input bundle, its
+`Out<O, B>` output, and a lifecycle `state`:
+
+```rust
+impl<S, O, B> CyclicRunner<S, O, B>
+where B: Backing, S: CyclicSystem<B, Output = Out<O, B>>, O: SystemOutput
+{
+    pub fn new(system: S, input: S::Input, output: Out<O, B>) -> Self;
+    pub fn init(&mut self);              // system.init once
+    pub fn step(&mut self, now: Timestamp);
+    pub fn shutdown(&mut self);          // system.shutdown once
+    pub fn state(&self) -> &SlotState;
+    pub fn output(&mut self) -> &mut Out<O, B>;
+}
+```
+
+`step` is the per-cycle entry. If the slot is already stopped, it does nothing. If any input
+lapped, it charges the lap (`record_lapped`), logs an error, publishes a final health record
+(`end_cycle`), and flips the slot to `Stopped { reason: LappedInput }` — a permanent stop.
+Otherwise it times `execute` and publishes the cycle's health record. `CyclicRunner` also
+implements `CyclicSlot`, the object-safe trait the coordinator uses to hold a heterogeneous
+`Vec<Box<dyn CyclicSlot>>` and drive every system with one shared per-cycle timestamp.
+
+Fault management beyond this telemetry is out of scope.
 
 ---
 
-## 5. Self-description for wiring (what the coordinator reads)
+## 5. Self-description for wiring
 
-Before any port exists, the coordinator must size buffers, allocate reader slots, and validate
-that producers satisfy consumers. A system exposes a **static descriptor** built entirely from
-the frame metadata WP3 already provides:
+Before any port exists, the coordinator sizes buffers, allocates reader slots, and validates
+that producers satisfy consumers. A system exposes a static descriptor built entirely from
+frame metadata, with no instance constructed.
+
+### 5.1 `PortDesc` and `SystemDescriptor`
 
 ```rust
 pub struct PortDesc {
-    pub frame_id: ComponentId,   // F::FRAME_ID
-    pub vtable: VTable,          // F::as_vtable()
-    pub max_size: usize,         // F::MAX_SIZE  (table bytes; size buffers via frame_len)
-    pub rate_hint: Option<Hz>,   // advisory, for buffer depth / async pacing
+    pub frame_id: ComponentId,       // F::FRAME_ID
+    pub frame_name: &'static str,    // F::NAME (the unprefixed frame name)
+    pub vtable: VTable,              // F::as_vtable() — the frame-relative component layout
+    pub max_size: usize,             // F::MAX_SIZE (worst-case table bytes)
+    pub rate_hint: Option<Hz>,       // advisory, for buffer depth / async pacing
+    pub announce: AnnounceFn,        // instance-prefix factory (telemetry schema)
 }
-pub type OutputDesc = PortDesc;   // a produced frame
-pub type InputDesc  = PortDesc;   // a required (expected) frame shape
 
 pub struct SystemDescriptor {
-    pub name: &'static str,       // System::NAME
-    pub kind: SystemKind,         // System::KIND
-    pub inputs: Vec<InputDesc>,   // <Self::Input as SystemInput>::descriptors()
-    pub outputs: Vec<OutputDesc>, // <Self::Output as SystemOutput>::descriptors()
+    pub name: &'static str,          // System::NAME
+    pub kind: SystemKind,            // Cyclic | Async — wiring metadata only
+    pub inputs: Vec<PortDesc>,       // <Self::Input as SystemInput>::descriptors()
+    pub outputs: Vec<PortDesc>,      // <Self::Output as SystemOutput>::descriptors()
 }
 ```
 
-Each `PortDesc` is derived from a `Frame`: `frame_id = F::FRAME_ID`, `vtable = F::as_vtable()`,
-`max_size = F::MAX_SIZE`. The coordinator reads this to:
+`PortDesc::of::<F>()` derives a descriptor from a frame type (`of_at` adds a `rate_hint`).
+The same `PortDesc` describes an output (a produced frame) and an input (a required frame
+shape) — the two are structurally identical; direction is which `SystemDescriptor` list it
+sits in. `announce` is a type-erased prefix factory: given an instance name it re-derives the
+**prefixed** announce vtable + component metadata (`<instance>.<frame>.<field>` ids/names) the
+coordinator records as the buffer's external schema. It is an `Arc<dyn Fn>` rather than a
+`fn` because a dlopen'd port has no static `F` and instead carries a closure capturing its
+metadata-derived prefix rewrite.
 
-1. **Size + allocate** each output buffer (`frame_len(max_size) * depth`, pow2; `max_readers` =
-   fan-out) — §2.2.
-2. **Validate compatibility.** A producer output satisfies a consumer input iff they share a
-   `frame_id` **and** the consumer's component set is a subset of the producer's, with matching
-   `ty`/`shape`. Both sides are enumerated with `VTable::realize_fields(None)` (registration
-   mode — `table = None` surfaces every `(component_id, ty, shape)` including dynamic
-   member templates, per the WP2 test `test_dynamic_registration_mode`). The check is a subset
-   comparison over those triples. This catches "consumer expects a field the producer doesn't
-   emit" and "type/shape mismatch" before a single byte flows.
+The coordinator reads this to:
 
-WP4 defines only this **read surface**. The wiring language that says "system A's `imu` output
-feeds system B's `imu` input", and the machinery that runs the validation and builds the
-buffers, is WP6/WP5 — out of scope here.
+1. **Size + allocate** each output buffer. `buffer_capacity::<F>(depth)` (equivalently
+   `capacity_for(F::MAX_SIZE, depth)`) returns the power-of-two ring capacity for `depth`
+   in-flight records: `frame_len(max_size)` adds the ring's 8-byte record header + 8-byte
+   payload padding, multiplied by `depth` (at least 2) and rounded up to a power of two.
+   `DEFAULT_DEPTH = 8` is used when a port carries no `rate_hint`.
+2. **Validate compatibility** (§5.2).
+
+### 5.2 Compatibility — `compatible`
+
+```rust
+pub fn compatible(producer: &PortDesc, consumer: &PortDesc) -> bool;
+```
+
+A producer output satisfies a consumer input iff they share a `frame_id` *and* the consumer's
+component set is a **subset** of the producer's with matching `ty`/`shape`. Both sides are
+enumerated with `VTable::realize_fields(None)` (registration mode — `table = None` surfaces
+every `(component_id, ty, shape)` triple, including dynamic member templates), and the check
+is a subset comparison over those triples. Subset (not equality) lets a producer emit extra
+fields a consumer ignores — forward-compatible wiring. The check catches "consumer expects a
+field the producer doesn't emit" and "type/shape mismatch" before a byte flows.
+
+### 5.3 Binding — `RingSource` and `BindPorts`
+
+Descriptors size and allocate the rings; binding hands each typed port the ring reserved for
+it. The two are symmetric and positional: binding visits port fields in the *same order* as
+`descriptors()`, so a positional cursor lines each port up with its buffer.
+
+```rust
+pub trait RingSource {
+    type B: Backing;
+    fn next_output<WD, WS>(&mut self) -> (RingBuffer<Self::B>, WD, WS) where /* wake bounds */;
+    fn next_input<RD, RS>(&mut self) -> (RingBuffer<Self::B>, RD, RS) where /* wake bounds */;
+    fn output_registry(&self) -> Arc<OutputRegistry> { /* host-only; default panics */ }
+}
+
+pub trait BindPorts<B: Backing>: Sized {
+    /// Construct every port from the ring source, in `descriptors()` order.
+    fn bind<S: RingSource<B = B>>(src: &mut S) -> Self;
+}
+```
+
+A `RingSource` is where a bound port's ring comes from, abstracted over the backing `B` so one
+generated bundle `bind` serves both providers:
+
+- The host **`Binder`** (`B = BoxBacking`) pops the coordinator's pre-allocated `BoundPort`s
+  in `descriptors()` order, each carrying its optional matched wake endpoints. (The matched
+  endpoints matter only for the private copy-in buffer feeding an async input, where the view
+  must share the writer's `Notifier`; every other port leaves them empty and the binder
+  default-constructs the wake.)
+- A dlopen'd system's **`RawBinder`** (`B = RawBacking`) attaches the host's raw regions by
+  offset (`RingBuffer::attach_raw`) over the same positional contract.
+
+`Output<F>::bind` / `Input<F>::bind` each pop one ring with its matched wake endpoints and
+wrap the resulting writer/view; the `#[derive(SystemInput)]` / `#[derive(SystemOutput)]`
+macros generate the bundle `BindPorts::bind` that calls them in field order. The `Out<O>`
+wrapper binds the user ports first, then the two implicit health/log ports — symmetric to its
+`descriptors()` pushing the health/log descriptors after the user ports — threading the ring
+source's backing `B` so a dlopen'd system's `Out<O, RawBacking>` binds over the host regions.
+`output_registry` is a host-only capability (the broad-access output registry used by a
+telemetry downlink/logger/recorder); a non-host source's default panics rather than fabricate
+an empty registry.
 
 ---
 
-## 6. dl-open / process boundary (noted, deferred)
+## 6. dlopen / process boundary
 
-DESIGN.md: a system is either a dl-opened dynamic library or a separate process, interacting via
-shared-memory ring buffers. WP4 keeps **v1 in-process** and only maps the trait onto the two
-deployment shapes so the boundary is not designed into a corner:
+A system is either an in-process Rust value, a dlopen'd dynamic library, or a separate
+process, interacting over shared-memory ring buffers. The trait surface is designed so the
+same system source covers the first two with no rewrite, because **the bytes are described by
+the VTable, not by a shared Rust type**.
 
-- **In-process (v1, the only one built now).** A `System` is a Rust value behind the trait (a
-  generic or a `Box<dyn>` driver). `execute` is a direct method call. Ports wrap `Writer`/`View`
-  over `BoxBacking` (or `MmapBacking` if cross-process readers attach). Cyclic ports use
-  `NoWake`; async ports use `Notifier`. No Rust type crosses any boundary.
-- **dl-open (later WP).** The ABI surface is deliberately narrow because **the bytes are
-  described by the VTable, not by a shared Rust type**: the only things crossing the `.so`
-  boundary are (a) the ring regions, attached by offset via `MmapBacking`/`attach_mmap`, and (b)
-  the system's `SystemDescriptor` — and `VTable` is already `Serialize`/`Deserialize`
-  (serde/postcard), so descriptors cross as bytes. The entry point is a stable C
-  `system_execute(ctx)` where `ctx` carries the attached ring regions; `init`/`shutdown` get
-  parallel C entries. The Rust `System` trait is the *in-process realization* of that same
-  contract.
-- **Separate process (later WP).** Identical data path; the difference is triggering. The ring
-  header already **reserves** `FLAG_WAKE_SHARED` and `OFF_WAKE_WORD` for a cross-process wake
-  word — that is the hook a future WP uses to notify a process-resident system that its private
-  input buffer has data, replacing the in-process direct call / `Notifier`.
-
-**Explicitly deferred:** the stable C ABI, descriptor marshaling format, cross-process wake
-protocol, and lifecycle of dl-opened handles. v1 ships in-process; this section only records the
-seams (`MmapBacking`, serializable `VTable`, the reserved wake word) so they stay open.
+- **In-process.** A `System` is a Rust value behind the trait. `execute` is a direct method
+  call. Ports wrap `Writer`/`View` over `BoxBacking`. Cyclic ports use `NoWake`; async ports
+  use `Notifier`. No Rust type crosses any boundary.
+- **dlopen.** A `cdylib` is exported with the `export_system!` macro, which emits the stable C
+  entry points. The system writes its impls `Backing`-generic, so a loaded instance holds
+  `RawBacking` ports attached to the host's shared-memory regions via `RawBinder` and
+  `RingBuffer::attach_raw`. The only things crossing the `.so` boundary are (a) the ring
+  regions, attached by offset, and (b) the system's params (postcard bytes decoded by
+  `fsw_create` into `BuildSystem::Params`) and `SystemDescriptor`. The Rust `System` trait is
+  the in-process realization of that same byte-described contract.
+- **Separate process.** Identical data path; the difference is triggering (a cross-process
+  wake word in the ring header rather than an in-process call / `Notifier`).
 
 ---
 
-## 7. Reused vs. new
+## 7. What is reused vs. defined here
 
-| Concern | Reused (landed) | New in WP4 |
-|---------|-----------------|------------|
+| Concern | Reused (ring / proto) | Defined in the system layer |
+|---------|-----------------------|-----------------------------|
 | Transport | `RingBuffer`, `Writer`/`try_write`/`write`, `View`/`try_read_into`/`read_into`/`is_lapped`/`resync`, `Overrun`, `Config` | `Output<F>`/`Input<F>` port wrappers binding a frame type to one ring handle |
-| Wake | `WakeSource`/`WakeSink`/`NoWake`/`Notifier` | cyclic = `NoWake`, async = `Notifier` selection per port kind |
-| Serialization | `FrameWriter` (`new`/`list`/`map`/`table`/`finish`), `ListReader`/`MapReader`, table bytes == ring payload | `Output::write`/`write_with`, `Input::latest`/`FrameRef` typed accessors |
-| Frame identity / shape | `Frame` (`FRAME_ID`, `NAME`, `timestamp`), `AsVTable::as_vtable`, `Componentize::MAX_SIZE` | `PortDesc`/`SystemDescriptor` self-description built from them |
-| Sizing | `round_up8`, `MAX_SIZE`, `Config.capacity` pow2 | buffer-sizing rule `frame_len(MAX_SIZE)*depth`; **needs `frame_len` made public** |
-| Wiring validation | `VTable::realize_fields(None)` registration mode, `RealizedField` | subset/ty/shape compatibility check (run by WP5/WP6) |
-| Health | `Frame`/`FrameMap`/`FrameList`, dynamic-name path, db ingest | `SystemHealth`/`SystemLog` standard frames + `output.health()` handle |
-| The system itself | `Componentize`/`Decomponentize` traits | the `System`/`SystemInput`/`SystemOutput`/`AsyncSystem` traits, `SystemKind` |
-
-Genuinely new code is concentrated in: the `System` family of traits, the `Output<F>`/`Input<F>`
-port wrappers, `SystemDescriptor`, and the standard health/log frames. The data path is reuse.
-
----
-
-## 8. Open questions / risks for the reviewer
-
-1. **Q1 — public `frame_len`.** Buffer sizing needs the ring's record framing, but `frame_len`
-   is private (only `round_up8` is `pub`). Make `frame_len` public, or add a
-   `Config::for_record(max_size, depth)` helper to the ring crate? (Small additive WP1 change.)
-2. **Q2 — `execute` signature (by-ref vs by-value).** This doc takes `&Self::Input` /
-   `&mut Self::Output`, deviating from DESIGN.md's by-value sketch, because writers need `&mut`
-   and must persist across cycles. Confirm the by-ref signature and that `init`/`shutdown` also
-   receive `&mut Self::Output`.
-3. **Q3 — one trait + `KIND` vs two traits.** Cyclic/async modeled as one `System` plus a
-   `SystemKind` const and an extra `AsyncSystem::run`. Is the single-trait approach preferred,
-   or should `CyclicSystem`/`AsyncSystem` be fully separate (clearer but duplicated lifecycle)?
-4. **Q4 — async triggering surface.** Is `async fn run(&mut self, input, output)` the right
-   shape, with the system itself choosing timer-paced vs input-awaited? Or should the
-   coordinator own the loop and call a plain `execute`, with the system only declaring a
-   trigger policy (rate / on-input)? The former gives systems full control; the latter keeps
-   all scheduling in the coordinator.
-5. **Q5 — port-bundle ergonomics.** `Self::Input`/`Self::Output` as hand-written structs of
-   `Input<F>`/`Output<F>` is explicit but verbose. Should a `#[derive(SystemInput)]` /
-   `#[derive(SystemOutput)]` generate `descriptors()`/`bind()` from the field frame types
-   (mirroring the WP3 derives)? Likely yes, but it adds macro surface.
-6. **Q6 — latest-wins vs every-record.** `Input::latest()` drops backlog by design (cyclic wants
-   freshest). Command/event channels need every record. Is a second accessor (`drain(|rec|…)` /
-   an iterator) part of WP4, or deferred until a command channel actually exists?
-7. **Q7 — health buffer provisioning.** Is the per-system health/log port auto-wired by the
-   coordinator (every system always has one, the standard counters always populated), or opt-in?
-   Auto is simplest and matches "the only error mechanism", but costs a buffer per system.
-8. **Q8 — log representation.** Logs as `FrameList<LogLine>` with a fixed `[u8; CAP]` message
-   (truncating long lines) — acceptable, or do we want a dedicated variable-length text path
-   (an `Op::Ext` blob, or a byte-stream lossless ring) so log text isn't capped/padded?
-9. **Q9 — compatibility check strength.** Is exact `frame_id` + subset-with-matching-`ty`/`shape`
-   the right contract, or should it be strict equality of the component sets? Subset allows a
-   producer to emit extra fields a consumer ignores (forward-compatible); confirm that is wanted.
-10. **Q10 — depth/`max_readers` source of truth.** Buffer `depth` and `max_readers` come from the
-    wiring graph + `rate_hint`. Should `rate_hint` be mandatory on outputs (so depth is
-    derivable) or is a global default depth acceptable for v1?
+| Wake | `WakeSource`/`WakeSink`/`NoWake`/`Notifier` | cyclic = `NoWake`, async = `Notifier`, threaded as `WD`/`WS`/`RD`/`RS` |
+| Serialization | `FrameWriter` (`new`/`list`/`map`/`table`/`finish`), `ListReader`/`MapReader`, table bytes == ring payload | `Output::write`/`write_with`/`write_async`, `Input::latest`/`drain`/`recv`, `FrameRef` accessors |
+| Frame identity / shape | `Frame` (`FRAME_ID`, `NAME`, `timestamp`), `AsVTable::as_vtable`, `Componentize::MAX_SIZE`, `Metadatatize` | `PortDesc`/`SystemDescriptor` self-description |
+| Sizing | `round_up8`, `frame_len`, `MAX_SIZE`, `Config.capacity` pow2 | `buffer_capacity`/`capacity_for`, `DEFAULT_DEPTH` |
+| Wiring validation | `VTable::realize_fields(None)` registration mode, `RealizedField` | `compatible` subset / ty / shape check |
+| Health | `Frame`/`FrameMap`/`FrameList`, dynamic-name path, db ingest | `SystemHealth`/`SystemLog` frames, `HealthPort`, `output.health()` |
+| Backing | `BoxBacking`/`MmapBacking`/`RawBacking`, `attach_raw` | `RingSource`/`BindPorts`, host `Binder`, `RawBinder`, `B`-generic threading |
+| The system itself | `Componentize`/`Decomponentize` | `System`/`CyclicSystem`/`AsyncSystem`/`BuildSystem`, `SystemInput`/`SystemOutput`, `Out`, `CyclicRunner`, `SystemKind` |
