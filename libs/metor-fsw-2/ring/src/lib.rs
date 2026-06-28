@@ -241,6 +241,42 @@ unsafe impl Backing for MmapBacking {
     }
 }
 
+/// Non-owning storage over a region someone else owns (the host, or another
+/// process's mmap). Its `Drop` frees nothing; the region's own atomics carry all
+/// synchronization. Used by [`RingBuffer::attach_raw`] for same-process WP8
+/// systems that reconstruct a ring over the host's backing.
+///
+/// # Safety
+///
+/// The `(base, len)` pair handed to [`RingBuffer::attach_raw`] must name a live,
+/// header-valid ring region — `base..base+len` interior-mutable and 8-byte
+/// aligned (e.g. another [`Backing`]'s region) — that **outlives every
+/// [`Writer`]/[`View`] produced from it** and is **not concurrently torn down**.
+pub struct RawBacking {
+    base: *mut u8,
+    len: usize,
+}
+
+// SAFETY: like `BoxBacking`, a `RawBacking` is `!Sync` by construction (a bare
+// pointer), but the ring upholds `Send + Sync` through its own synchronization
+// (the region's atomics + the `committed` handshake): the bytes are only ever
+// touched through that documented discipline.
+unsafe impl Send for RawBacking {}
+unsafe impl Sync for RawBacking {}
+
+// SAFETY: `attach_raw`'s caller asserts `base..base+len` is a stable,
+// interior-mutable, 8-byte-aligned ring region (laid out by `init_region`
+// through an interior-mutable backing). `RawBacking` only borrows it — `Drop`
+// frees nothing — and re-derives the pointer on every access.
+unsafe impl Backing for RawBacking {
+    fn base(&self) -> *mut u8 {
+        self.base
+    }
+    fn len(&self) -> usize {
+        self.len
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Async wake abstraction (kept out of the shared layout)
 // ---------------------------------------------------------------------------
@@ -573,14 +609,54 @@ impl RingBuffer<MmapBacking> {
             .open(path)?;
         // SAFETY: caller asserts a valid region; mapping read+write shared.
         let map = unsafe { memmap2::MmapMut::map_mut(&file)? };
-        let backing = MmapBacking { map };
+        // SAFETY: caller asserts a live, valid region; `from_validated` reads and
+        // checks the header before forming any reference into it.
+        unsafe { Self::from_validated(MmapBacking { map }) }
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, format!("{e:?}")))
+    }
+}
+
+impl RingBuffer<RawBacking> {
+    /// Attach a non-owning handle to a host-provided ring region, validating its
+    /// header and reading geometry back out of it (same-process WP8 path). The
+    /// caller keeps owning the region; this handle's [`RawBacking`] frees nothing.
+    ///
+    /// This is [`RingBuffer::attach_mmap`] with the mapping step removed: the
+    /// caller supplies the `(base, len)` directly (e.g. another backing's
+    /// [`Backing::base`]/[`Backing::len`]).
+    ///
+    /// # Safety
+    /// `base..base+len` is a live ring region (header already laid out and
+    /// validated) that outlives every [`Writer`]/[`View`] produced here and is
+    /// not torn down concurrently.
+    pub unsafe fn attach_raw(base: *mut u8, len: usize) -> Result<Self, AttachError> {
+        // A region too small to hold the header cannot carry a valid one; reject
+        // it here so the header reads never touch out-of-bounds bytes (the raw
+        // pointer path has no page-granular minimum like mmap does).
+        if len < HEADER_SIZE {
+            return Err(AttachError::BadMagic);
+        }
+        // SAFETY: caller asserts a live region; `len >= HEADER_SIZE` bounds the
+        // header reads `from_validated` performs.
+        unsafe { Self::from_validated(RawBacking { base, len }) }
+    }
+}
+
+impl<B: Backing> RingBuffer<B> {
+    /// Rebuild a handle over an already-laid-out region: validate its header and
+    /// read the geometry (capacity/offsets/`max_readers`/overrun) back out of it
+    /// rather than from arguments. Shared by [`RingBuffer::attach_mmap`] and
+    /// [`RingBuffer::attach_raw`].
+    ///
+    /// # Safety
+    /// `backing`'s region is a live ring region of at least [`HEADER_SIZE`] bytes
+    /// that is not being concurrently torn down.
+    unsafe fn from_validated(backing: B) -> Result<Self, AttachError> {
         let base = backing.base();
-        // SAFETY: a valid region is at least HEADER_SIZE bytes; reading immutable
-        // header fields by value is sound.
+        // SAFETY: a live region is at least HEADER_SIZE bytes (caller contract);
+        // reading the immutable header fields by value is sound.
         let (capacity, data_offset, reader_table_offset, max_readers, overrun) =
-            unsafe { read_header(base) }.map_err(|e| {
-                std::io::Error::new(std::io::ErrorKind::InvalidData, format!("{e:?}"))
-            })?;
+            unsafe { read_header(base) }?;
         Ok(RingBuffer {
             inner: Arc::new(Inner {
                 backing,
@@ -593,9 +669,14 @@ impl RingBuffer<MmapBacking> {
             }),
         })
     }
-}
 
-impl<B: Backing> RingBuffer<B> {
+    /// Test-only: the backing region's `(base, len)`, for attaching a second
+    /// handle over the same bytes (the same-process WP8 scenario).
+    #[cfg(test)]
+    pub(crate) fn region(&self) -> (*mut u8, usize) {
+        (self.inner.backing.base(), self.inner.backing.len())
+    }
+
     /// This buffer's overrun policy.
     pub fn overrun(&self) -> Overrun {
         self.inner.overrun
@@ -721,7 +802,6 @@ unsafe fn init_region<B: Backing>(
 ///
 /// # Safety
 /// `base` points at a region of at least `HEADER_SIZE` bytes.
-#[cfg(feature = "mmap")]
 unsafe fn read_header(base: *mut u8) -> Result<(u64, usize, usize, u32, Overrun), AttachError> {
     // SAFETY: header fields are within HEADER_SIZE and written once at creation;
     // reading them by value is sound.
