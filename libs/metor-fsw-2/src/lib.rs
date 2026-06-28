@@ -11,6 +11,8 @@
 //! alignment); the genuinely new surface is the [`Frame`] trait, the dynamic types,
 //! and the [`FrameWriter`] producer API.
 
+mod binder;
+mod coordinator;
 mod descriptor;
 mod dynamic;
 mod frame;
@@ -24,6 +26,14 @@ pub use dynamic::{FrameList, FrameMap, Name, Slot};
 pub use frame::Frame;
 pub use reader::{ListReader, MapReader};
 pub use writer::{FrameWriter, ListWriter, MapWriter, WriteError};
+
+// WP5 — the coordinator: builder, graph wiring, the run-phase lifecycle, and the
+// `bind`/`Binder` port-construction contract.
+pub use binder::{BindPorts, Binder, BoundPort};
+pub use coordinator::{
+    Coordinator, CoordinatorBuilder, CoordinatorConfig, PortRef, SlotState, StopReason,
+    StoppedSystem, SystemHandle, WireError,
+};
 
 // WP4 — the system trait family, the typed port wrappers, self-description, and
 // the standard health/log telemetry.
@@ -44,5 +54,7 @@ pub use metor_fsw_macros::{Frame, SystemInput, SystemOutput};
 
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod tests_coordinator;
 #[cfg(test)]
 mod tests_system;

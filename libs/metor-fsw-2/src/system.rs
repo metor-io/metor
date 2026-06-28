@@ -12,8 +12,11 @@ use core::ops::{Deref, DerefMut};
 use metor_fsw_ring::{Backing, BoxBacking, NoWake, WakeSink, WakeSource};
 use metor_proto::types::Timestamp;
 
+use crate::binder::{BindPorts, Binder};
+use crate::coordinator::{CyclicSlot, SlotState, StopReason};
 use crate::descriptor::{PortDesc, SystemDescriptor, SystemKind};
-use crate::health::{HealthPort, SystemHealth, SystemLog};
+use crate::health::{HealthPort, Level, SystemHealth, SystemLog};
+use crate::port::Output;
 
 // ---------------------------------------------------------------------------
 // Port bundles
@@ -111,6 +114,23 @@ where
     }
 }
 
+impl<O, WD, WS> BindPorts for Out<O, BoxBacking, WD, WS>
+where
+    O: BindPorts,
+    WD: WakeSource + Default + Clone + 'static,
+    WS: WakeSink + Default + Clone + 'static,
+{
+    /// Bind the user ports, then the two implicit health/log ports — symmetric to
+    /// [`Out::descriptors`] pushing the health/log descriptors after the user
+    /// ports (coordinator.md §1.4).
+    fn bind(binder: &mut Binder) -> Self {
+        let ports = O::bind(binder);
+        let health: Output<SystemHealth, BoxBacking, WD, WS> = Output::bind(binder);
+        let log: Output<SystemLog, BoxBacking, WD, WS> = Output::bind(binder);
+        Out::new(ports, HealthPort::new(health, log))
+    }
+}
+
 // ---------------------------------------------------------------------------
 // System traits
 // ---------------------------------------------------------------------------
@@ -197,6 +217,7 @@ where
     system: S,
     input: S::Input,
     output: Out<O>,
+    state: SlotState,
 }
 
 impl<S, O> CyclicRunner<S, O>
@@ -211,6 +232,7 @@ where
             system,
             input,
             output,
+            state: SlotState::Running,
         }
     }
 
@@ -219,15 +241,34 @@ where
         self.system.init(&mut self.output);
     }
 
-    /// Run one cycle: charge a lapped input, time `execute`, publish health.
-    pub fn step(&mut self) {
+    /// Run one cycle (coordinator.md §3.3/§3.4). If already stopped, do nothing.
+    /// If an input has lapped, telemeter and permanently stop: charge the lapped
+    /// input, log an error, publish a final health record, and flip to `Stopped`.
+    /// Otherwise time `execute` and publish health. `now` is threaded from the
+    /// cycle loop so every system in a cycle shares one timestamp.
+    pub fn step(&mut self, now: Timestamp) {
+        if self.state.is_stopped() {
+            return;
+        }
         if self.input.any_lapped() {
-            self.output.health().record_lapped();
+            let h = self.output.health();
+            h.record_lapped();
+            h.log(Level::Error, "input lapped; system permanently stopped");
+            h.end_cycle(now, 0);
+            self.state = SlotState::Stopped {
+                reason: StopReason::LappedInput,
+            };
+            return;
         }
         let start = std::time::Instant::now();
         self.system.execute(&mut self.input, &mut self.output);
         let micros = start.elapsed().as_micros() as u64;
-        self.output.health().end_cycle(Timestamp::now(), micros);
+        self.output.health().end_cycle(now, micros);
+    }
+
+    /// This slot's lifecycle state (running vs hard-stopped).
+    pub fn state(&self) -> &SlotState {
+        &self.state
     }
 
     /// Run the system's `shutdown` once.
@@ -238,5 +279,30 @@ where
     /// Borrow the output bundle (e.g. for a test to read a produced port back).
     pub fn output(&mut self) -> &mut Out<O> {
         &mut self.output
+    }
+}
+
+/// The grown [`CyclicRunner`] erased so the coordinator can hold a heterogeneous
+/// `Vec<Box<dyn CyclicSlot>>` (coordinator.md §3.4). Delegates to the inherent
+/// methods above; `step` threads the cycle's shared timestamp.
+impl<S, O> CyclicSlot for CyclicRunner<S, O>
+where
+    S: CyclicSystem<Output = Out<O>>,
+    O: SystemOutput,
+{
+    fn init(&mut self) {
+        CyclicRunner::init(self)
+    }
+    fn step(&mut self, now: Timestamp) {
+        CyclicRunner::step(self, now)
+    }
+    fn shutdown(&mut self) {
+        CyclicRunner::shutdown(self)
+    }
+    fn name(&self) -> &'static str {
+        S::NAME
+    }
+    fn state(&self) -> &SlotState {
+        CyclicRunner::state(self)
     }
 }
