@@ -1,0 +1,404 @@
+//! WP7 acceptance tests (telemetry.md "Tests"): the general output registry queried
+//! by instance-qualified id, the telemetry downlink end-to-end against a deterministic
+//! in-memory mock transport (announced prefixed vtables/metadata + `Table` packets),
+//! two-instance prefix disambiguation, subset filtering, and the non-blocking
+//! drop-on-full policy with its `telemetry.dropped` health counter.
+
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
+
+use metor_proto::types::{ComponentId, LenPacket, PacketId, Timestamp};
+use metor_proto_wkt::{ComponentMetadata, VTableMsg};
+use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
+
+use crate::{
+    ClockMode, Coordinator, CoordinatorConfig, CyclicSystem, Input, Out, Output, PortRef, System,
+    SystemHealth, SystemInput, SystemOutput, TelemetryConfig, TelemetryMode, Transport,
+    TransportError,
+};
+
+// ---------------------------------------------------------------------------
+// Frames + systems under test (a producer -> consumer chain).
+// ---------------------------------------------------------------------------
+
+#[derive(crate::Frame, IntoBytes, Immutable, KnownLayout, FromBytes, Default)]
+#[repr(C)]
+#[metor_fsw(name = "imu")]
+struct Imu {
+    #[metor_fsw(timestamp)]
+    timestamp: Timestamp,
+    omega: f64,
+}
+
+#[derive(crate::Frame, IntoBytes, Immutable, KnownLayout, FromBytes, Default)]
+#[repr(C)]
+#[metor_fsw(name = "nav")]
+struct Nav {
+    #[metor_fsw(timestamp)]
+    timestamp: Timestamp,
+    angle: f64,
+}
+
+#[derive(SystemInput)]
+struct NoIn {}
+
+/// A cyclic producer writing an incrementing `Imu` (omega = cycle index).
+struct Producer {
+    n: f64,
+}
+
+#[derive(SystemOutput)]
+struct ProdOut {
+    imu: Output<Imu>,
+}
+
+impl System for Producer {
+    type Input = NoIn;
+    type Output = Out<ProdOut>;
+    const NAME: &'static str = "producer";
+}
+
+impl CyclicSystem for Producer {
+    fn execute(&mut self, now: Timestamp, _in: &mut NoIn, o: &mut Self::Output) {
+        self.n += 1.0;
+        let _ = o.imu.write(&Imu {
+            timestamp: now,
+            omega: self.n,
+        });
+    }
+}
+
+/// A cyclic consumer: `nav.angle = imu.omega`.
+struct Consumer;
+
+#[derive(SystemInput)]
+struct ConsIn {
+    imu: Input<Imu>,
+}
+
+#[derive(SystemOutput)]
+struct ConsOut {
+    nav: Output<Nav>,
+}
+
+impl System for Consumer {
+    type Input = ConsIn;
+    type Output = Out<ConsOut>;
+    const NAME: &'static str = "consumer";
+}
+
+impl CyclicSystem for Consumer {
+    fn execute(&mut self, now: Timestamp, input: &mut ConsIn, o: &mut Self::Output) {
+        if let Ok(Some(imu)) = input.imu.latest() {
+            let _ = o.nav.write(&Nav {
+                timestamp: now,
+                angle: imu.get().omega,
+            });
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// A deterministic in-memory mock transport (telemetry.md §7) for the e2e tests.
+// ---------------------------------------------------------------------------
+
+struct MockInner {
+    announces: Mutex<Vec<(PacketId, Vec<ComponentMetadata>)>>,
+    packets: Mutex<Vec<LenPacket>>,
+    /// When set, `send` never completes — saturates the queue for the drop test.
+    block: bool,
+}
+
+#[derive(Clone)]
+struct MockTransport {
+    inner: Arc<MockInner>,
+}
+
+impl MockTransport {
+    fn new(block: bool) -> Self {
+        Self {
+            inner: Arc::new(MockInner {
+                announces: Mutex::new(Vec::new()),
+                packets: Mutex::new(Vec::new()),
+                block,
+            }),
+        }
+    }
+}
+
+impl Transport for MockTransport {
+    async fn announce(
+        &mut self,
+        msg: &VTableMsg,
+        meta: &[ComponentMetadata],
+    ) -> Result<(), TransportError> {
+        self.inner
+            .announces
+            .lock()
+            .unwrap()
+            .push((msg.id, meta.to_vec()));
+        Ok(())
+    }
+
+    async fn send(&mut self, pkt: LenPacket) -> Result<(), TransportError> {
+        if self.inner.block {
+            // Never resolves: the sender parks here, the cycle keeps running, slots fill.
+            std::future::pending::<()>().await;
+        }
+        self.inner.packets.lock().unwrap().push(pkt);
+        Ok(())
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Helpers.
+// ---------------------------------------------------------------------------
+
+/// A free-running simulated clock: `run_for` yields each cycle, so the spawned sender
+/// task is scheduled deterministically.
+fn sim_config() -> CoordinatorConfig {
+    CoordinatorConfig {
+        cycle_rate: 1000.0,
+        default_depth: 8,
+        clock: ClockMode::Simulated {
+            dt: Duration::from_millis(1),
+        },
+    }
+}
+
+/// A `Table` packet's announced id is the 2 bytes after the 4-byte length + 1 ty byte.
+fn packet_id_of(pkt: &LenPacket) -> PacketId {
+    [pkt.inner[5], pkt.inner[6]]
+}
+
+/// A `Table` packet's payload (the table bytes) begins after the 8-byte packet header.
+fn packet_payload(pkt: &LenPacket) -> &[u8] {
+    &pkt.inner[8..]
+}
+
+/// Drain a view to its newest record and return a copy of the bytes, if any.
+fn drain_latest(view: &mut metor_fsw_ring::View<metor_fsw_ring::BoxBacking, metor_fsw_ring::NoWake, metor_fsw_ring::NoWake>) -> Option<Vec<u8>> {
+    let mut buf = Vec::new();
+    let mut last = None;
+    while let Ok(true) = view.try_read_into(&mut buf) {
+        last = Some(buf.clone());
+    }
+    last
+}
+
+// ---------------------------------------------------------------------------
+// 1. Registry: query by instance-qualified id, claim a view, read the bytes.
+// ---------------------------------------------------------------------------
+
+#[cfg(not(miri))]
+#[stellarator::test]
+async fn registry_query_view_and_read() {
+    let mut b = Coordinator::builder(sim_config());
+    let p = b.add_cyclic_named("producer", Producer { n: 0.0 });
+    let c = b.add_cyclic_named("consumer", Consumer);
+    b.connect(PortRef::new::<Imu>(p), PortRef::new::<Imu>(c))
+        .unwrap();
+    let mut coord = b.build().unwrap();
+
+    // The registry indexes every output by `ComponentId::new("<instance>.<frame>")`.
+    let registry = coord.registry();
+    let entry = registry
+        .get(ComponentId::new("producer.imu"))
+        .expect("producer.imu in the registry");
+    assert_eq!(entry.frame_id, ComponentId::new("imu"));
+    assert_eq!(&*entry.instance, "producer");
+    // The consumer's frame and the coordinator's own buffers are indexed too.
+    assert!(registry.get(ComponentId::new("consumer.nav")).is_some());
+    assert!(registry.get(ComponentId::new("coordinator.health")).is_some());
+
+    // Claim a view *before* running (a fresh view only sees later commits), run, read.
+    let mut view = entry.view().expect("reader slot");
+    coord.run_for(5).await;
+    let bytes = drain_latest(&mut view).expect("producer wrote at least one imu");
+    let imu = Imu::read_from_prefix(&bytes).expect("imu bytes").0;
+    assert_eq!(imu.omega, 5.0, "producer increments omega each cycle");
+}
+
+// ---------------------------------------------------------------------------
+// 2. End-to-end (all mode): announced prefixed schema + per-cycle Table packets.
+// ---------------------------------------------------------------------------
+
+#[cfg(not(miri))]
+#[stellarator::test]
+async fn telemetry_end_to_end_all() {
+    let mock = MockTransport::new(false);
+    let rec = mock.inner.clone();
+
+    let mut b = Coordinator::builder(sim_config());
+    let p = b.add_cyclic_named("producer", Producer { n: 0.0 });
+    let c = b.add_cyclic_named("consumer", Consumer);
+    b.connect(PortRef::new::<Imu>(p), PortRef::new::<Imu>(c))
+        .unwrap();
+    b.add_telemetry(TelemetryConfig {
+        transport: mock,
+        mode: TelemetryMode::All,
+    });
+    let mut coord = b.build().unwrap();
+    let n_taps = coord.registry().len();
+    coord.run_for(30).await;
+
+    let announces = rec.announces.lock().unwrap();
+
+    // Every output is announced exactly once — the user frames, every system's implicit
+    // health/log, and the coordinator-owned buffers (telemetry.md §3/§5). The `log`
+    // frames carry only a dynamic `FrameList`, so their announce has an empty metadata
+    // set (the count proves they were announced); the scalar-bearing frames carry their
+    // prefixed component names.
+    assert_eq!(announces.len(), n_taps, "one announce per registry entry");
+    let has_name = |name: &str| {
+        announces
+            .iter()
+            .any(|(_, meta)| meta.iter().any(|m| m.name == name))
+    };
+    let has_prefix = |prefix: &str| {
+        announces
+            .iter()
+            .any(|(_, meta)| meta.iter().any(|m| m.name.starts_with(prefix)))
+    };
+    assert!(has_name("producer.imu.omega"), "producer.imu announced");
+    assert!(has_name("consumer.nav.angle"), "consumer.nav announced");
+    assert!(has_prefix("producer.health"), "producer.health announced");
+    assert!(has_prefix("consumer.health"), "consumer.health announced");
+    assert!(has_prefix("coordinator.health"), "coordinator buffers announced");
+
+    // The producer.imu tap's `Table` packets carry the committed frame bytes verbatim.
+    let imu_pid = announces
+        .iter()
+        .find(|(_, meta)| meta.iter().any(|m| m.name == "producer.imu.omega"))
+        .map(|(id, _)| *id)
+        .expect("producer.imu announced with an id");
+    drop(announces);
+
+    let packets = rec.packets.lock().unwrap();
+    let imu_pkts: Vec<&LenPacket> = packets
+        .iter()
+        .filter(|pkt| packet_id_of(pkt) == imu_pid)
+        .collect();
+    assert!(!imu_pkts.is_empty(), "received Table packets for producer.imu");
+    let last = imu_pkts.last().unwrap();
+    let imu = Imu::read_from_prefix(packet_payload(last))
+        .expect("packet payload is the imu table")
+        .0;
+    assert!(imu.omega > 0.0, "streamed a real omega: {}", imu.omega);
+}
+
+// ---------------------------------------------------------------------------
+// 3. Two instances of one type → distinct qualified ids + distinct prefixed names.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn two_instances_distinct_prefixes() {
+    let mut b = Coordinator::builder(sim_config());
+    // Two producers of the same type; neither has inputs, so the graph builds.
+    b.add_cyclic_named("imu_left", Producer { n: 0.0 });
+    b.add_cyclic_named("imu_right", Producer { n: 0.0 });
+    let coord = b.build().unwrap();
+    let registry = coord.registry();
+
+    let left = registry
+        .get(ComponentId::new("imu_left.imu"))
+        .expect("imu_left.imu");
+    let right = registry
+        .get(ComponentId::new("imu_right.imu"))
+        .expect("imu_right.imu");
+
+    // Same unprefixed frame id, distinct qualified keys — the headline collision, now
+    // disambiguated; their announced names carry distinct instance prefixes.
+    assert_eq!(left.frame_id, right.frame_id);
+    assert_ne!(left.key, right.key);
+    assert!(left.metadata.iter().all(|m| m.name.starts_with("imu_left.")));
+    assert!(right.metadata.iter().all(|m| m.name.starts_with("imu_right.")));
+    assert!(left.metadata.iter().any(|m| m.name == "imu_left.imu.omega"));
+    assert!(right.metadata.iter().any(|m| m.name == "imu_right.imu.omega"));
+}
+
+// ---------------------------------------------------------------------------
+// 4. Subset mode taps only the configured instances/frames.
+// ---------------------------------------------------------------------------
+
+#[cfg(not(miri))]
+#[stellarator::test]
+async fn subset_mode_filters() {
+    let mock = MockTransport::new(false);
+    let rec = mock.inner.clone();
+
+    let mut b = Coordinator::builder(sim_config());
+    let p = b.add_cyclic_named("producer", Producer { n: 0.0 });
+    let c = b.add_cyclic_named("consumer", Consumer);
+    b.connect(PortRef::new::<Imu>(p), PortRef::new::<Imu>(c))
+        .unwrap();
+    b.add_telemetry(TelemetryConfig {
+        transport: mock,
+        mode: TelemetryMode::Subset {
+            instances: vec!["producer".to_string()],
+            frames: Vec::new(),
+        },
+    });
+    let mut coord = b.build().unwrap();
+    coord.run_for(20).await;
+
+    let announces = rec.announces.lock().unwrap();
+    assert!(!announces.is_empty(), "producer was tapped");
+    // Only producer.* was tapped — no consumer, coordinator, or telemetry frames leaked.
+    for (_, meta) in announces.iter() {
+        for m in meta {
+            assert!(
+                m.name.starts_with("producer."),
+                "subset leaked a non-producer tap: {}",
+                m.name
+            );
+        }
+    }
+    assert!(
+        announces
+            .iter()
+            .any(|(_, meta)| meta.iter().any(|m| m.name == "producer.imu.omega")),
+        "producer.imu still tapped"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// 5. Drop policy: a saturated transport never blocks the cycle; drops are surfaced.
+// ---------------------------------------------------------------------------
+
+#[cfg(not(miri))]
+#[stellarator::test]
+async fn drop_policy_never_blocks_and_counts() {
+    // A transport whose `send` never completes: after the first take, slots stay full
+    // and every later snapshot overwrites an un-sent one (a drop).
+    let mock = MockTransport::new(true);
+
+    let mut b = Coordinator::builder(sim_config());
+    b.add_cyclic_named("producer", Producer { n: 0.0 });
+    b.add_telemetry(TelemetryConfig {
+        transport: mock,
+        mode: TelemetryMode::All,
+    });
+    let mut coord = b.build().unwrap();
+
+    // Tap the telemetry system's own health frame to observe its error counter.
+    let registry = coord.registry();
+    let mut health = registry
+        .get(ComponentId::new("telemetry.health"))
+        .expect("telemetry.health")
+        .view()
+        .expect("reader slot");
+
+    // The cycle never blocks on the stalled link: `run_for` completes all cycles.
+    coord.run_for(50).await;
+
+    let bytes = drain_latest(&mut health).expect("telemetry published a health frame");
+    let h = SystemHealth::read_from_prefix(&bytes)
+        .expect("health bytes")
+        .0;
+    assert!(
+        h.errors > 0,
+        "saturated transport should have surfaced telemetry.dropped (errors={})",
+        h.errors
+    );
+}

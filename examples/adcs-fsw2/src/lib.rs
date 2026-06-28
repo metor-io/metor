@@ -462,6 +462,11 @@ pub fn build_code_first() -> Result<Coordinator, WireError> {
 /// The same three-system closed loop, expressed as a KDL wiring document. `sim_dt`
 /// selects the free-running simulated clock (1/120 s logical step) and the Ctrl →
 /// Plant torque edge is `delayed=#true` — the KDL twin of `connect_delayed`.
+///
+/// The trailing `telemetry` node (WP7) streams *every* output frame — the ADCS
+/// `sensors`/`attitude_estimate`/`torque_cmd` plus each system's health/log — out to a
+/// metor-db/ground endpoint in metor-proto's wire format. If nothing is listening, the
+/// sender just fails to connect and stops downlinking; the control loop is unaffected.
 pub const KDL: &str = r#"
 coordinator cycle_rate=120.0 sim_dt=0.008333333333333333
 
@@ -472,4 +477,9 @@ system "ctrl"  type="Ctrl"  q_weight=5.0 r_weight=8.0
 connect "plant" -> "nav"  frame="sensors"
 connect "nav"   -> "ctrl" frame="attitude_estimate"
 connect "ctrl"  -> "plant" frame="torque_cmd" delayed=#true
+
+telemetry {
+    transport "tcp" addr="127.0.0.1:2240"
+    mode "all"
+}
 "#;

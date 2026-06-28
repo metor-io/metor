@@ -21,8 +21,11 @@
 
 use std::any::Any;
 use std::slice;
+use std::sync::Arc;
 
 use metor_fsw_ring::{BoxBacking, RingBuffer, WakeSink, WakeSource};
+
+use crate::registry::OutputRegistry;
 
 /// One pre-allocated ring plus its optional matched wake endpoints, in
 /// `descriptors()` order. `data`/`space` are `Some` only for the copy-in private
@@ -70,14 +73,29 @@ impl BoundPort {
 pub struct Binder<'a> {
     outputs: slice::Iter<'a, BoundPort>,
     inputs: slice::Iter<'a, BoundPort>,
+    registry: Arc<OutputRegistry>,
 }
 
 impl<'a> Binder<'a> {
-    pub(crate) fn new(outputs: &'a [BoundPort], inputs: &'a [BoundPort]) -> Self {
+    pub(crate) fn new(
+        outputs: &'a [BoundPort],
+        inputs: &'a [BoundPort],
+        registry: Arc<OutputRegistry>,
+    ) -> Self {
         Self {
             outputs: outputs.iter(),
             inputs: inputs.iter(),
+            registry,
         }
+    }
+
+    /// The broad-access output registry (telemetry.md §2.4). A system whose bundle
+    /// wants by-id access to *every* output (the telemetry downlink, a logger, a
+    /// recorder) pulls this in its `BindPorts::bind`, exactly where it pulls its typed
+    /// ports. The registry is complete before the bind loop runs, so this is safe and
+    /// needs no second phase. The returned `Arc` is cheap to clone and store.
+    pub fn output_registry(&self) -> Arc<OutputRegistry> {
+        self.registry.clone()
     }
 
     /// Pop the next output ring and its writer-side wake endpoints, downcast to

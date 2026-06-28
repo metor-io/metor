@@ -13,6 +13,8 @@ metor-proto = { path = "../metor-proto", features = ["std"] }
 # `nox` forces `metor-proto-wkt`'s ComponentValue on via feature unification, so
 # the (pre-existing, nox-gated) wkt build is satisfied for this crate.
 metor-proto-wkt = { path = "../metor-proto/wkt", features = ["nox", "std"] }
+# WP7 telemetry downlink: the TCP transport wraps `PacketSink<TcpStream>`.
+metor-proto-stellar = { path = "../metor-proto/stellar" }
 metor-fsw = { path = "../metor-fsw", default-features = false, features = ["std"] }
 metor-fsw-ring = { path = "ring", default-features = false, features = ["async"] }
 metor-fsw-macros = { path = "../metor-fsw/macros" }
