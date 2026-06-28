@@ -172,7 +172,10 @@ The refactor (WP8 1B) is mechanical but cross-cutting; the target shape:
   ```
   The host's `Binder` impls `RingSource<B = BoxBacking>` (from its `BoundPort`s, binder.rs:103); the
   `.so`'s `RawBinder` impls `RingSource<B = RawBacking>` (popping the next `FswRing` and `attach_raw`-ing
-  it, §3). `Output<F, B>::bind`/`Input<F, B>::bind` become generic over the source. **No host ring
+  it, §3). `Output<F, B>::bind`/`Input<F, B>::bind` become generic over the source. `RingSource` also
+  carries a provided `output_registry(&self) -> Arc<OutputRegistry>` that **panics by default** and is
+  overridden only by the host `Binder` (the telemetry downlink's bundle needs it; a dlopen'd system is
+  never the downlink, so its `RawBinder` uses the default) — landed in 1B. **No host ring
   allocation or sizing changes** — only the binder is now one impl of a shared trait.
 - **`CyclicRunner<S, O, B>`** (and the `Out<O, B>`/`HealthPort<B>` it wraps, already `B`-carrying)
   thread `B`; the host instantiates `CyclicRunner<_, _, BoxBacking>`, the `.so`

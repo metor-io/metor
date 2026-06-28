@@ -33,7 +33,7 @@ use stellarator::io::{OwnedReader, OwnedWriter, SplitExt};
 use stellarator::net::TcpStream;
 use stellarator::sync::WaitQueue;
 
-use crate::binder::{BindPorts, Binder};
+use crate::binder::{BindPorts, RingSource};
 use crate::descriptor::PortDesc;
 use crate::registry::{OutputRegistry, RegistryEntry};
 use crate::system::{CyclicSystem, Out, System, SystemInput, SystemOutput};
@@ -288,10 +288,12 @@ impl SystemOutput for TelemetryPorts {
     }
 }
 
-impl BindPorts for TelemetryPorts {
-    fn bind(binder: &mut Binder) -> Self {
+impl BindPorts<BoxBacking> for TelemetryPorts {
+    /// Host-only (`B = BoxBacking`): pulls the broad registry the host [`Binder`]
+    /// carries (telemetry.md §2.4). The telemetry downlink is never dlopen'd.
+    fn bind<S: RingSource<B = BoxBacking>>(src: &mut S) -> Self {
         Self {
-            registry: binder.output_registry(),
+            registry: src.output_registry(),
         }
     }
 }
@@ -308,8 +310,8 @@ impl SystemInput for TelemetryIn {
     }
 }
 
-impl BindPorts for TelemetryIn {
-    fn bind(_binder: &mut Binder) -> Self {
+impl BindPorts<BoxBacking> for TelemetryIn {
+    fn bind<S: RingSource<B = BoxBacking>>(_src: &mut S) -> Self {
         TelemetryIn
     }
 }

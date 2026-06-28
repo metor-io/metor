@@ -35,7 +35,7 @@ pub use writer::{FrameWriter, ListWriter, MapWriter, WriteError};
 
 // WP5 — the coordinator: builder, graph wiring, the run-phase lifecycle, and the
 // `bind`/`Binder` port-construction contract.
-pub use binder::{BindPorts, Binder, BoundPort};
+pub use binder::{BindPorts, Binder, BoundPort, RingSource};
 pub use coordinator::{
     ClockMode, Coordinator, CoordinatorBuilder, CoordinatorConfig, PortRef, SlotState, StopReason,
     StoppedSystem, SystemHandle, WireError,
@@ -49,7 +49,7 @@ pub use telemetry::{
 
 // WP4 — the system trait family, the typed port wrappers, self-description, and
 // the standard health/log telemetry.
-pub use descriptor::{Hz, PortDesc, SystemDescriptor, SystemKind, compatible};
+pub use descriptor::{AnnounceFn, Hz, PortDesc, SystemDescriptor, SystemKind, compatible};
 pub use health::{
     HealthPort, LOG_MSG_CAP, Level, LogLine, MAX_ERR_KINDS, MAX_LINES, SystemHealth, SystemLog,
 };

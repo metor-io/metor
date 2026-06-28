@@ -51,6 +51,7 @@ use std::time::Duration;
 use metor_fsw_2::{
     ClockMode, Coordinator, CoordinatorConfig, CyclicSystem, Input, Out, Output, PortRef, System,
     SystemInput, SystemOutput, TcpTransport, TelemetryConfig, TelemetryMode, WireError,
+    ring::{Backing, BoxBacking},
     wiring::{FromKdlNode, RegisteredSystem, Registry},
 };
 
@@ -174,14 +175,14 @@ pub struct PlantSystem {
 }
 
 #[derive(SystemInput)]
-pub struct PlantIn {
-    pub torque: Input<TorqueCmd>,
+pub struct PlantIn<B: Backing = BoxBacking> {
+    pub torque: Input<TorqueCmd, B>,
 }
 
 #[derive(SystemOutput)]
-pub struct PlantOut {
-    pub sensors: Output<Sensors>,
-    pub truth: Output<Truth>,
+pub struct PlantOut<B: Backing = BoxBacking> {
+    pub sensors: Output<Sensors, B>,
+    pub truth: Output<Truth, B>,
 }
 
 impl PlantSystem {
@@ -219,14 +220,14 @@ impl PlantSystem {
     }
 }
 
-impl System for PlantSystem {
-    type Input = PlantIn;
-    type Output = Out<PlantOut>;
+impl<B: Backing> System<B> for PlantSystem {
+    type Input = PlantIn<B>;
+    type Output = Out<PlantOut<B>, B>;
     const NAME: &'static str = "plant";
 }
 
-impl CyclicSystem for PlantSystem {
-    fn execute(&mut self, now: Timestamp, input: &mut PlantIn, o: &mut Self::Output) {
+impl<B: Backing> CyclicSystem<B> for PlantSystem {
+    fn execute(&mut self, now: Timestamp, input: &mut PlantIn<B>, o: &mut Self::Output) {
         // Latest commanded torque (zero on the first cycle / if none has arrived).
         let torque: V3 = match input.torque.latest() {
             Ok(Some(cmd)) => cmd.get().torque,
@@ -292,13 +293,13 @@ pub struct NavSystem {
 }
 
 #[derive(SystemInput)]
-pub struct NavIn {
-    pub sensors: Input<Sensors>,
+pub struct NavIn<B: Backing = BoxBacking> {
+    pub sensors: Input<Sensors, B>,
 }
 
 #[derive(SystemOutput)]
-pub struct NavOut {
-    pub estimate: Output<AttitudeEstimate>,
+pub struct NavOut<B: Backing = BoxBacking> {
+    pub estimate: Output<AttitudeEstimate, B>,
 }
 
 impl NavSystem {
@@ -309,14 +310,14 @@ impl NavSystem {
     }
 }
 
-impl System for NavSystem {
-    type Input = NavIn;
-    type Output = Out<NavOut>;
+impl<B: Backing> System<B> for NavSystem {
+    type Input = NavIn<B>;
+    type Output = Out<NavOut<B>, B>;
     const NAME: &'static str = "nav";
 }
 
-impl CyclicSystem for NavSystem {
-    fn execute(&mut self, now: Timestamp, input: &mut NavIn, o: &mut Self::Output) {
+impl<B: Backing> CyclicSystem<B> for NavSystem {
+    fn execute(&mut self, now: Timestamp, input: &mut NavIn<B>, o: &mut Self::Output) {
         let Ok(Some(s)) = input.sensors.latest() else {
             return; // no sample yet
         };
@@ -363,13 +364,13 @@ pub struct CtrlSystem {
 }
 
 #[derive(SystemInput)]
-pub struct CtrlIn {
-    pub estimate: Input<AttitudeEstimate>,
+pub struct CtrlIn<B: Backing = BoxBacking> {
+    pub estimate: Input<AttitudeEstimate, B>,
 }
 
 #[derive(SystemOutput)]
-pub struct CtrlOut {
-    pub torque: Output<TorqueCmd>,
+pub struct CtrlOut<B: Backing = BoxBacking> {
+    pub torque: Output<TorqueCmd, B>,
 }
 
 impl CtrlSystem {
@@ -381,14 +382,14 @@ impl CtrlSystem {
     }
 }
 
-impl System for CtrlSystem {
-    type Input = CtrlIn;
-    type Output = Out<CtrlOut>;
+impl<B: Backing> System<B> for CtrlSystem {
+    type Input = CtrlIn<B>;
+    type Output = Out<CtrlOut<B>, B>;
     const NAME: &'static str = "ctrl";
 }
 
-impl CyclicSystem for CtrlSystem {
-    fn execute(&mut self, now: Timestamp, input: &mut CtrlIn, o: &mut Self::Output) {
+impl<B: Backing> CyclicSystem<B> for CtrlSystem {
+    fn execute(&mut self, now: Timestamp, input: &mut CtrlIn<B>, o: &mut Self::Output) {
         let Ok(Some(e)) = input.estimate.latest() else {
             return;
         };

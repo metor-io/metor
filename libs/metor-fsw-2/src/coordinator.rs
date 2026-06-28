@@ -408,12 +408,15 @@ struct CyclicReg<S> {
 impl<S, O> CyclicRegistration for CyclicReg<S>
 where
     S: CyclicSystem<Output = Out<O>> + 'static,
-    O: SystemOutput + BindPorts + 'static,
-    S::Input: BindPorts + 'static,
+    O: SystemOutput + BindPorts<BoxBacking> + 'static,
+    S::Input: BindPorts<BoxBacking> + 'static,
 {
     fn bind(self: Box<Self>, binder: &mut Binder) -> Box<dyn CyclicSlot> {
-        let input = <S::Input as BindPorts>::bind(binder);
-        let output = <Out<O> as BindPorts>::bind(binder);
+        // The host always binds over `BoxBacking`; the `Binder` is the host's
+        // `RingSource<B = BoxBacking>` (dl-open.md §1.2). A dlopen'd system instead
+        // monomorphizes `CyclicRunner<_, _, RawBacking>` on its own side of the ABI.
+        let input = <S::Input as BindPorts<BoxBacking>>::bind(binder);
+        let output = <Out<O> as BindPorts<BoxBacking>>::bind(binder);
         Box::new(CyclicRunner::new(self.system, input, output))
     }
 }
@@ -429,12 +432,12 @@ struct AsyncReg<S> {
 impl<S> AsyncRegistration for AsyncReg<S>
 where
     S: AsyncSystem + 'static,
-    S::Input: BindPorts + 'static,
-    S::Output: BindPorts + 'static,
+    S::Input: BindPorts<BoxBacking> + 'static,
+    S::Output: BindPorts<BoxBacking> + 'static,
 {
     fn bind(self: Box<Self>, binder: &mut Binder) -> Box<dyn AsyncLauncher> {
-        let input = <S::Input as BindPorts>::bind(binder);
-        let output = <S::Output as BindPorts>::bind(binder);
+        let input = <S::Input as BindPorts<BoxBacking>>::bind(binder);
+        let output = <S::Output as BindPorts<BoxBacking>>::bind(binder);
         Box::new(AsyncSlot {
             system: self.system,
             input,
@@ -489,8 +492,8 @@ impl CoordinatorBuilder {
     pub fn add_cyclic<S, O>(&mut self, system: S) -> SystemHandle
     where
         S: CyclicSystem<Output = Out<O>> + 'static,
-        O: SystemOutput + BindPorts + 'static,
-        S::Input: BindPorts + 'static,
+        O: SystemOutput + BindPorts<BoxBacking> + 'static,
+        S::Input: BindPorts<BoxBacking> + 'static,
     {
         self.add_cyclic_named(<S as System>::NAME, system)
     }
@@ -501,8 +504,8 @@ impl CoordinatorBuilder {
     pub fn add_cyclic_named<S, O>(&mut self, name: impl Into<String>, system: S) -> SystemHandle
     where
         S: CyclicSystem<Output = Out<O>> + 'static,
-        O: SystemOutput + BindPorts + 'static,
-        S::Input: BindPorts + 'static,
+        O: SystemOutput + BindPorts<BoxBacking> + 'static,
+        S::Input: BindPorts<BoxBacking> + 'static,
     {
         let id = self.descs.len();
         self.descs.push(<S as CyclicSystem>::descriptor());
@@ -516,8 +519,8 @@ impl CoordinatorBuilder {
     pub fn add_async<S>(&mut self, system: S) -> SystemHandle
     where
         S: AsyncSystem + 'static,
-        S::Input: BindPorts + 'static,
-        S::Output: BindPorts + 'static,
+        S::Input: BindPorts<BoxBacking> + 'static,
+        S::Output: BindPorts<BoxBacking> + 'static,
     {
         self.add_async_named(<S as System>::NAME, system)
     }
@@ -526,8 +529,8 @@ impl CoordinatorBuilder {
     pub fn add_async_named<S>(&mut self, name: impl Into<String>, system: S) -> SystemHandle
     where
         S: AsyncSystem + 'static,
-        S::Input: BindPorts + 'static,
-        S::Output: BindPorts + 'static,
+        S::Input: BindPorts<BoxBacking> + 'static,
+        S::Output: BindPorts<BoxBacking> + 'static,
     {
         let id = self.descs.len();
         self.descs.push(<S as AsyncSystem>::descriptor());
@@ -907,7 +910,8 @@ const COORDINATOR_INSTANCE: &str = "coordinator";
 /// clone of the ring as the read source.
 fn registry_entry(instance: &str, port: &PortDesc, ring: RingBuffer<BoxBacking>) -> RegistryEntry {
     let key = ComponentId::new(&format!("{instance}.{}", port.frame_name));
-    let (vtable, metadata) = (port.announce)(instance);
+    // `announce` is an `Arc<dyn Fn>` (not directly callable); deref to a `&dyn Fn`.
+    let (vtable, metadata) = (*port.announce)(instance);
     RegistryEntry {
         key,
         instance: Arc::from(instance),
