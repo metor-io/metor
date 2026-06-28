@@ -388,6 +388,94 @@ async fn wait_writer_backpressures() {
     assert_eq!(got, expected);
 }
 
+// ----- RawBacking / attach_raw (non-owning, same-process) -----
+
+/// Same-process attach round-trip (the exact WP8 v1 scenario): a second
+/// `RingBuffer<RawBacking>` reconstructed over the SAME region a
+/// `RingBuffer<BoxBacking>` allocated sees the identical atomics — a record
+/// written through one is read through the other, in both directions. Sync-only,
+/// so it runs under Miri (provenance/leak/race check of the raw attach path).
+#[test]
+fn raw_attach_same_process_roundtrip() {
+    let rb = overwrite(1024, 4);
+    let (base, len) = rb.region();
+    // Attach a non-owning handle over the SAME bytes `rb` owns.
+    let raw = unsafe { RingBuffer::<RawBacking>::attach_raw(base, len) }.unwrap();
+
+    let mut buf = Vec::new();
+
+    // Box-side writer -> Raw-side view.
+    {
+        let mut vr = raw.view(NoWake, NoWake).unwrap();
+        let mut wb = rb.writer(NoWake, NoWake);
+        wb.try_write(b"box->raw").unwrap();
+        assert!(vr.try_read_into(&mut buf).unwrap());
+        assert_eq!(&buf[..], b"box->raw");
+    }
+    // Raw-side writer -> Box-side view (same region, identical atomics).
+    {
+        let mut vb = rb.view(NoWake, NoWake).unwrap();
+        let mut wr = raw.writer(NoWake, NoWake);
+        wr.try_write(b"raw->box").unwrap();
+        assert!(vb.try_read_into(&mut buf).unwrap());
+        assert_eq!(&buf[..], b"raw->box");
+    }
+}
+
+/// Geometry is recovered from the region header, not passed to `attach_raw`:
+/// overrun, committed position, and capacity all match the original handle.
+#[test]
+fn raw_attach_recovers_geometry() {
+    let rb = RingBuffer::create_in_memory(Config {
+        capacity: 256,
+        max_readers: 3,
+        overrun: Overrun::Lossless,
+    });
+    // Commit something so the recovered `committed` is non-trivial.
+    rb.writer(NoWake, NoWake).try_write(b"x").unwrap();
+
+    let (base, len) = rb.region();
+    let raw = unsafe { RingBuffer::<RawBacking>::attach_raw(base, len) }.unwrap();
+
+    // Overrun + committed came from the header, not from arguments.
+    assert_eq!(raw.overrun(), Overrun::Lossless);
+    assert_eq!(raw.committed(), rb.committed());
+
+    // Capacity (256) recovered too: the `InsufficientCapacity` boundary is
+    // exactly `frame_len(payload) > 256`, independent of how much is committed.
+    // 249 -> record 264 (rejected); 248 -> record 256 (capacity-allowed, only
+    // backpressured here because the region already holds a byte).
+    let mut w = raw.writer(NoWake, NoWake);
+    assert_eq!(
+        w.try_write(&[0u8; 249]),
+        Err(WriteError::InsufficientCapacity)
+    );
+    assert_ne!(
+        w.try_write(&[0u8; 248]),
+        Err(WriteError::InsufficientCapacity)
+    );
+}
+
+/// A bad region is rejected by header validation (the same `AttachError`
+/// `attach_mmap` would yield) rather than UB or a panic: a zeroed (no magic)
+/// region and a region too small to hold the header both fail cleanly.
+#[test]
+fn raw_attach_bad_region_rejected() {
+    // Zeroed but header-sized region: magic word is 0 -> BadMagic.
+    let zeros = BoxBacking::new(HEADER_SIZE);
+    assert_eq!(
+        unsafe { RingBuffer::<RawBacking>::attach_raw(zeros.base(), zeros.len()) }.err(),
+        Some(AttachError::BadMagic),
+    );
+
+    // Too-short region: guarded before any header read, so no out-of-bounds load.
+    let tiny = BoxBacking::new(8);
+    assert_eq!(
+        unsafe { RingBuffer::<RawBacking>::attach_raw(tiny.base(), tiny.len()) }.err(),
+        Some(AttachError::BadMagic),
+    );
+}
+
 // ----- mmap backing (feature-gated) -----
 
 #[cfg(feature = "mmap")]
