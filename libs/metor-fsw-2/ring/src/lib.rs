@@ -670,10 +670,12 @@ impl<B: Backing> RingBuffer<B> {
         })
     }
 
-    /// Test-only: the backing region's `(base, len)`, for attaching a second
-    /// handle over the same bytes (the same-process WP8 scenario).
-    #[cfg(test)]
-    pub(crate) fn region(&self) -> (*mut u8, usize) {
+    /// The backing region's `(base, len)`, for handing a second handle the same
+    /// bytes to attach to (the same-process WP8 scenario, dl-open.md §2.3): the
+    /// host reads `(base, len)` here to fill an `FswRing` the system reconstructs
+    /// via [`RingBuffer::attach_raw`]. The pointer is only valid while `self` (or
+    /// another handle/backing keeping the region alive) lives.
+    pub fn region(&self) -> (*mut u8, usize) {
         (self.inner.backing.base(), self.inner.backing.len())
     }
 

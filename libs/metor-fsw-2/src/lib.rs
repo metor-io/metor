@@ -28,6 +28,12 @@ mod writer;
 #[cfg(feature = "kdl")]
 pub mod wiring;
 
+// WP8 — the `dlopen` C-ABI a system `cdylib` exports (dl-open.md §2/§3). Rides the
+// `kdl` feature in v1: `fsw_create` leans on WP6's `RegisteredSystem` construction
+// contract (`src/wiring.rs`), so the ABI compiles wherever that does.
+#[cfg(feature = "kdl")]
+pub mod abi;
+
 pub use dynamic::{FrameList, FrameMap, Name, Slot};
 pub use frame::Frame;
 pub use reader::{ListReader, MapReader};
@@ -64,6 +70,9 @@ pub use metor_fsw_ring as ring;
 pub use metor_fsw::{AsVTable, Componentize, Decomponentize, Metadatatize};
 pub use metor_fsw_macros::{Frame, SystemInput, SystemOutput};
 
+// WP8 — the `export_system!` macro that emits a system `cdylib`'s C-ABI surface.
+pub use metor_fsw_macros::export_system;
+
 // Re-exports the `#[derive(Frame)]` / `#[derive(FromKdlNode)]` generated code names
 // (`::metor_fsw_2::metor_proto::…`, `::metor_fsw_2::path::…`, `::metor_fsw_2::kdl::…`)
 // so a crate depending only on metor-fsw-2 can use those derives without a direct
@@ -84,3 +93,5 @@ mod tests_system;
 mod tests_telemetry;
 #[cfg(all(test, feature = "kdl"))]
 mod tests_wiring;
+#[cfg(all(test, feature = "kdl"))]
+mod tests_abi;

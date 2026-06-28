@@ -383,6 +383,32 @@ Because `Output`/`Input` are already `Backing`-generic, the **only** new generic
 `CyclicRunner<S, O, RawBacking>` and the lapped→hard-stop / health / timing logic is reused **verbatim**
 rather than re-emitted by the macro (Q-runner).
 
+### 3.0 Landed notes & deviations (WP8 2A — `abi.rs` + `export_system!`)
+
+The system-side ABI is implemented; real-world deviations from the sketch above, for the host half
+(W2b) and the doc to track:
+
+- **The `now` word is the raw `Timestamp` tick, not nanoseconds.** `Timestamp` is an `i64` of
+  microseconds with no nanos conversion, so `fsw_execute(state, now: u64)` carries `Timestamp.0 as u64`
+  and the `.so` reconstructs `Timestamp(now as i64)`. The host `DlSlot` (§4.2) must pass `now.0 as u64`
+  — a reversible raw-tick contract, unit-agnostic.
+- **One `export_system!` per cdylib (fixed `fsw_*` symbols).** v1 is one system per `.so` — the finest
+  rebuild granularity, and the host loader resolves the fixed symbol names. Multiple systems per `.so`
+  (namespaced `fsw_<name>_*` symbols) is a later option; revisit when the example (§8) is split (it
+  becomes one cdylib per system, or we add namespacing).
+- **`abi` rides the `kdl` feature for now.** `run_create` leans on WP6's `RegisteredSystem` for
+  `Params`+`new`, whose `Params: FromKdlNode` bound lives in the kdl-gated `wiring` module, so
+  `pub mod abi` is `#[cfg(feature = "kdl")]`. This contradicts §6.3 ("a dl system needs no
+  `FromKdlNode`"); the clean fix is a kdl-independent construction trait (`BuildSystem { type Params;
+  fn new }`, with `RegisteredSystem: BuildSystem` adding the kdl bound) — scheduled for the Wave 3
+  wiring refactor. Default features include `kdl`, so v1 works meanwhile.
+- **`into_port_desc`'s `announce` re-prefixes metadata but NOT the vtable's baked component ids**
+  (a `// TODO telemetry.md §6` in `abi.rs`). The host-side metadata-driven vtable-id rewrite (§7,
+  Q-announce) lands in W2b so telemetry prefixing over a dlopen'd system is correct end-to-end.
+- `#[unsafe(no_mangle)]` (edition 2024 spelling); `RingBuffer::region()` promoted to `pub` so the host
+  can fill `FswRing { base, len }`; `metor-fsw-2` gained direct `postcard` / `postcard-schema`
+  (`use-std`, for the owned-schema module) / `serde` deps.
+
 ### 3.1 Async systems
 
 `AsyncSystem` owns a `run` loop driven by `stellarator` and woken by ring `Notifier`s
