@@ -25,10 +25,10 @@ use crate::abi::{
     FswRing, FswStatus, ROLE_INPUT, ROLE_OUTPUT, SystemDescriptorMsg, run_bind_init, run_create,
     run_destroy, run_execute, run_shutdown,
 };
-use crate::wiring::{FromKdlNode, LoadError, RegisteredSystem};
+use crate::wiring::{FromKdlNode, LoadError};
 use crate::{
-    CyclicSystem, Frame, Input, Out, Output, System, SystemHealth, SystemInput, SystemKind,
-    SystemLog, SystemOutput, buffer_capacity,
+    BuildSystem, CyclicSystem, Frame, Input, Out, Output, System, SystemHealth, SystemInput,
+    SystemKind, SystemLog, SystemOutput, buffer_capacity,
 };
 
 // ---------------------------------------------------------------------------
@@ -105,7 +105,7 @@ impl<B: Backing> CyclicSystem<B> for Counter {
     }
 }
 
-impl RegisteredSystem for Counter {
+impl BuildSystem for Counter {
     type Params = CounterParams;
     fn new(params: Self::Params) -> Self {
         Counter { start: params.start }
@@ -334,7 +334,7 @@ impl<B: Backing> CyclicSystem<B> for Boom {
     }
 }
 
-impl RegisteredSystem for Boom {
+impl BuildSystem for Boom {
     type Params = ();
     fn new(_params: ()) -> Self {
         Boom

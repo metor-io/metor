@@ -28,7 +28,7 @@
 //! clock holding `cycle_rate`. `delayed=#true` on a `connect` marks the edge as a
 //! one-cycle-delayed feedback back-edge ([`CoordinatorBuilder::connect_delayed`]).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::time::Duration;
 
 use kdl::{KdlDocument, KdlNode, KdlValue};
@@ -43,8 +43,23 @@ use crate::coordinator::{
     ClockMode, Coordinator, CoordinatorBuilder, CoordinatorConfig, PortRef, SystemHandle, WireError,
 };
 use crate::descriptor::SystemDescriptor;
-use crate::system::{AsyncSystem, CyclicSystem, Out, SystemOutput};
+use crate::dl::{DlError, DlSystem};
+use crate::system::{AsyncSystem, BuildSystem, CyclicSystem, Out, SystemOutput};
 use crate::telemetry::{TcpTransport, TelemetryConfig, TelemetryMode};
+
+// Wave 3a (dl-open.md §6): the `Wiring` data model, the Rust builder, and the cargo
+// build driver. KDL is now *one* deserializer onto `Wiring` (see `parse`/`resolve`
+// below); the builder is the other; one shared `resolve` consumes either.
+mod build_driver;
+mod builder;
+mod model;
+
+pub use build_driver::{BuildError, BuildOptions, build_artifacts};
+pub use builder::{SystemSpecBuilder, WiringBuilder};
+pub use model::{
+    Artifact, ClockSpec, CoordinatorSpec, EdgeSpec, SystemSpec, TelemetryModeSpec, TelemetrySpec,
+    Wiring,
+};
 
 // Re-export the derive and the registration macro so a system author only needs
 // `metor_fsw_2::wiring`.
@@ -187,6 +202,69 @@ pub enum LoadError {
         #[label("introduced here")]
         span: SourceSpan,
     },
+
+    // --- Wave 3a: dl-open resolution (dl-open.md §6) ---------------------------
+    #[error("system `{system}` references unknown artifact `{artifact}`")]
+    #[diagnostic(code(fsw_wiring::unknown_artifact))]
+    UnknownArtifact {
+        system: String,
+        artifact: String,
+        #[source_code]
+        src: String,
+        #[label("declare an `artifact \"{artifact}\" ...` node, or fix the `lib=` ref")]
+        span: SourceSpan,
+    },
+
+    #[error("artifact `{artifact}` has no resolved path (run the build driver first)")]
+    #[diagnostic(code(fsw_wiring::artifact_not_built))]
+    ArtifactNotBuilt {
+        artifact: String,
+        #[source_code]
+        src: String,
+        #[label("`build_artifacts` must set this artifact's `path` before `resolve`")]
+        span: SourceSpan,
+    },
+
+    #[error("failed to load the `.so` for system `{system}` (artifact `{artifact}`): {source}")]
+    #[diagnostic(code(fsw_wiring::dl_open))]
+    DlOpen {
+        system: String,
+        artifact: String,
+        // Boxed: a `DlError` carries a `libloading::Error`, which would otherwise bloat
+        // every `LoadError` (the `result_large_err` lint).
+        #[source]
+        source: Box<DlError>,
+        #[source_code]
+        src: String,
+        #[label("this dl system failed to load")]
+        span: SourceSpan,
+    },
+
+    /// A dl system (`lib=`) carried KDL params, which require the schema-guided encoder
+    /// landing in **Wave 3b**. Until then, give a dl system its params via the Rust
+    /// [`WiringBuilder`](crate::WiringBuilder) (dl-open.md §6.3).
+    #[error(
+        "dl system `{system}` has KDL params, which are not supported yet (Wave 3b): pass params to a \
+         dl system via the Rust `WiringBuilder` for now"
+    )]
+    #[diagnostic(code(fsw_wiring::dl_kdl_params_unsupported))]
+    DlKdlParamsUnsupported {
+        system: String,
+        #[source_code]
+        src: String,
+        #[label("remove these properties, or build this system via the Rust builder")]
+        span: SourceSpan,
+    },
+
+    #[error("`artifact` node is missing required property `{property}`")]
+    #[diagnostic(code(fsw_wiring::missing_artifact_field))]
+    MissingArtifactField {
+        property: &'static str,
+        #[source_code]
+        src: String,
+        #[label("this artifact node is incomplete")]
+        span: SourceSpan,
+    },
 }
 
 // ---------------------------------------------------------------------------
@@ -320,15 +398,28 @@ pub struct LoadCtx<'a> {
 /// validation).
 pub type SystemFactory = fn(&mut LoadCtx) -> Result<(SystemHandle, SystemDescriptor), LoadError>;
 
-/// A concrete system opts in by declaring its params type and how to build itself
-/// (wiring.md §2.3). The `add`/`descriptor` halves come for free from the
-/// [`AddToBuilder`] blanket impls — keyed on the system *kind*, resolved at compile
-/// time, so KDL never declares cyclic vs async.
-pub trait RegisteredSystem: Sized {
-    /// The params struct deserialized from the KDL config (wiring.md §3).
-    type Params: FromKdlNode;
-    /// Construct the (pre-init) system from its params.
-    fn new(params: Self::Params) -> Self;
+/// The KDL static-registry construction contract (wiring.md §2.3): a
+/// [`BuildSystem`](crate::BuildSystem) whose `Params` is [`FromKdlNode`]-parseable.
+///
+/// Wave 3a (dl-open.md §3.0) split construction in two: the format-independent
+/// [`BuildSystem`] (`type Params` + `fn new`, in `system.rs`, with **no** kdl coupling
+/// — what `export_system!`/the dlopen ABI need) and this thin extension that *only*
+/// adds the `Params: FromKdlNode` bound the static factory needs. It is a **blanket
+/// marker**: every `BuildSystem` with a `FromKdlNode` `Params` is automatically a
+/// `RegisteredSystem`, so a statically-linked system registers exactly as before
+/// (it impls [`BuildSystem`], not this) — while a dl-only system needs no `FromKdlNode`
+/// impl at all (dl-open.md §6.3).
+pub trait RegisteredSystem: BuildSystem
+where
+    <Self as BuildSystem>::Params: FromKdlNode,
+{
+}
+
+impl<S> RegisteredSystem for S
+where
+    S: BuildSystem,
+    S::Params: FromKdlNode,
+{
 }
 
 /// Marker for a cyclic system's [`AddToBuilder`] impl.
@@ -374,12 +465,16 @@ where
 }
 
 /// The factory `Registry::register::<S, _>` stores: the whole "params → `new` →
-/// `add_*_named`" dance for one concrete type, erased to a plain `fn` pointer.
+/// `add_*_named`" dance for one concrete type, erased to a plain `fn` pointer. Bounded
+/// on the kdl-independent [`BuildSystem`](crate::BuildSystem) plus the `FromKdlNode`
+/// `Params` the static path needs (i.e. exactly [`RegisteredSystem`]'s premises —
+/// dl-open.md §3.0).
 fn factory<S, K>(ctx: &mut LoadCtx) -> Result<(SystemHandle, SystemDescriptor), LoadError>
 where
-    S: RegisteredSystem + AddToBuilder<K>,
+    S: BuildSystem + AddToBuilder<K>,
+    S::Params: FromKdlNode,
 {
-    let params = S::Params::from_kdl_node(ctx.node, ctx.src)?;
+    let params = <S::Params as FromKdlNode>::from_kdl_node(ctx.node, ctx.src)?;
     let system = S::new(params);
     let handle = system.add_to(ctx.name, ctx.builder);
     Ok((handle, <S as AddToBuilder<K>>::descriptor()))
@@ -400,11 +495,13 @@ impl Registry {
     }
 
     /// Register concrete system `S` under `type_name`. `S` supplies its params type
-    /// and `new` via [`RegisteredSystem`]; the `add_*`/descriptor (and cyclic-vs-
-    /// async branch) come from the [`AddToBuilder`] blanket impl, inferred here.
+    /// and `new` via [`BuildSystem`](crate::BuildSystem) with a [`FromKdlNode`] `Params`
+    /// (i.e. it is a [`RegisteredSystem`]); the `add_*`/descriptor (and cyclic-vs-async
+    /// branch) come from the [`AddToBuilder`] blanket impl, inferred here.
     pub fn register<S, K>(&mut self, type_name: &'static str) -> &mut Self
     where
-        S: RegisteredSystem + AddToBuilder<K>,
+        S: BuildSystem + AddToBuilder<K>,
+        S::Params: FromKdlNode,
     {
         self.factories.insert(type_name, factory::<S, K>);
         self
@@ -445,100 +542,359 @@ struct Edge {
     in_: String,
     /// `delayed=#true` ⇒ a one-cycle-delayed feedback back-edge (`connect_delayed`).
     delayed: bool,
-    span: SourceSpan,
 }
 
 /// Parse a KDL wiring document, instantiate every system from `registry`, connect
 /// the edges, and return a built [`Coordinator`] ready to `run` (wiring.md §5.1).
+///
+/// Wave 3a (dl-open.md §6.3) re-expresses this as the two-stage
+/// `KDL ──[`parse`]──▶ Wiring ──[`resolve`]──▶ Coordinator`, so the data model is the
+/// single source of truth and the Rust [`WiringBuilder`] is an equivalent front-end.
+/// The public entry point and its behavior are unchanged.
 pub fn load(kdl: &str, registry: &Registry) -> Result<Coordinator, LoadError> {
+    let wiring = parse(kdl)?;
+    resolve(&wiring, registry)
+}
+
+/// Deserialize a KDL wiring document into the [`Wiring`] data model (dl-open.md §6.3)
+/// — one of the two front-ends onto `Wiring` (the other is [`WiringBuilder`]).
+///
+/// This is **parse only**: it touches no [`Registry`], `dlopen`s nothing, and does not
+/// validate the graph — those are [`resolve`]'s job. It carries the existing
+/// `coordinator`/`system`/`connect`/`telemetry` surface and adds the Wave 3a
+/// `artifact` node + per-`system` `lib=` reference.
+///
+/// **Static params** (a `system` with no `lib=`) are carried as the KDL node's source
+/// text in [`SystemSpec::params`] when the node has config properties, so the static
+/// [`Registry`] factory re-parses them via `FromKdlNode` at [`resolve`] time
+/// (behavior-identical to WP6); a config-less static system carries empty params.
+///
+/// **Dl params in KDL are deferred to Wave 3b**: a `system` with a `lib=` may carry no
+/// params (the schema-guided postcard encoder is not landed); one that does is a clear
+/// [`LoadError::DlKdlParamsUnsupported`]. Give a dl system params via the Rust
+/// [`WiringBuilder`] until then (dl-open.md §6.3).
+pub fn parse(kdl: &str) -> Result<Wiring, LoadError> {
     let doc = kdl.parse::<KdlDocument>().map_err(|source| LoadError::Parse {
         source,
         src: kdl.to_string(),
         span: (0, kdl.len()).into(),
     })?;
 
-    let config = parse_coordinator(&doc, kdl)?;
-    let mut builder = Coordinator::builder(config);
+    let coordinator = parse_coordinator(&doc, kdl)?;
 
-    // --- Systems pass (wiring.md §2) -------------------------------------
-    let mut instances: HashMap<String, Instance> = HashMap::new();
+    // --- Artifacts pass (dl-open.md §6.3) --------------------------------
+    let mut artifacts: Vec<Artifact> = Vec::new();
+    for node in doc.nodes() {
+        if node.name().value() != "artifact" {
+            continue;
+        }
+        artifacts.push(parse_artifact(node, kdl)?);
+    }
+
+    // --- Systems pass (wiring.md §2; dl `lib=` per dl-open.md §6.3) -------
+    let mut systems: Vec<SystemSpec> = Vec::new();
+    let mut seen: HashSet<String> = HashSet::new();
     for node in doc.nodes() {
         if node.name().value() != "system" {
             continue;
         }
-        let name = first_arg_string(node).ok_or_else(|| LoadError::MissingInstanceName {
-            src: kdl.to_string(),
-            span: node.span(),
-        })?;
-        let ty = prop_string(node, "type").ok_or_else(|| LoadError::MissingType {
-            name: name.to_string(),
-            src: kdl.to_string(),
-            span: node.span(),
-        })?;
-        let factory = registry
-            .factories
-            .get(ty)
-            .ok_or_else(|| LoadError::UnknownType {
-                ty: ty.to_string(),
-                src: kdl.to_string(),
-                span: node.span(),
-            })?;
-        let (handle, desc) = factory(&mut LoadCtx {
-            node,
-            src: kdl,
-            name,
-            builder: &mut builder,
-        })?;
-        if instances
-            .insert(name.to_string(), Instance { handle, desc })
-            .is_some()
-        {
-            return Err(LoadError::DuplicateInstance {
-                name: name.to_string(),
-                src: kdl.to_string(),
-                span: node.span(),
-            });
-        }
+        systems.push(parse_system(node, kdl, &mut seen)?);
     }
 
     // --- Edges pass (wiring.md §4) ---------------------------------------
-    let mut edge_spans: Vec<(ComponentId, SourceSpan)> = Vec::new();
+    let mut edges: Vec<EdgeSpec> = Vec::new();
     for node in doc.nodes() {
         if node.name().value() != "connect" {
             continue;
         }
-        let edge = parse_edge(node, kdl)?;
-        let producer = resolve(&instances, kdl, &edge.from, &edge.out, Dir::Out, edge.span)?;
-        let consumer = resolve(&instances, kdl, &edge.to, &edge.in_, Dir::In, edge.span)?;
-        edge_spans.push((producer.frame_id, edge.span));
-        let result = if edge.delayed {
-            builder.connect_delayed(producer, consumer)
-        } else {
-            builder.connect(producer, consumer)
-        };
-        result.map_err(|source| LoadError::Wire {
-            source,
-            src: kdl.to_string(),
-            span: edge.span,
-        })?;
+        let e = parse_edge(node, kdl)?;
+        edges.push(EdgeSpec {
+            from: e.from,
+            out: e.out,
+            to: e.to,
+            in_: e.in_,
+            delayed: e.delayed,
+        });
     }
 
     // --- Telemetry pass (telemetry.md §8) --------------------------------
-    // Added after every `system`, so the downlink is registered last (its end-of-cycle
-    // snapshot observes every system's fresh output).
+    let mut telemetry: Option<TelemetrySpec> = None;
     for node in doc.nodes() {
         if node.name().value() != "telemetry" {
             continue;
         }
         let (addr, mode) = parse_telemetry(node, kdl)?;
+        telemetry = Some(TelemetrySpec { addr, mode });
+    }
+
+    Ok(Wiring {
+        coordinator,
+        artifacts,
+        systems,
+        edges,
+        telemetry,
+    })
+}
+
+/// Walk a [`Wiring`] and produce a built [`Coordinator`] — the **one shared resolver**
+/// both front-ends feed (dl-open.md §6.3, §4.3). For each system: a static one
+/// (`artifact = None`) is instantiated through the [`Registry`] factory (the WP6 path,
+/// unchanged); a dl one is `DlSystem::open`'d from its [`Artifact::path`] and added via
+/// [`CoordinatorBuilder::add_dl_cyclic`]. Then the edges are connected, telemetry is
+/// added, and the graph is `build()`'d — the validation/sizing/telemetry passes are all
+/// reuse, identical for static and dl systems.
+///
+/// Because a [`Wiring`] is format-independent, resolve-time [`LoadError`]s carry a
+/// best-effort source snippet rather than the original document spans (a builder-origin
+/// `Wiring` has no text at all); the error *variants* are unchanged, so callers (and the
+/// WP6 tests) see the same outcomes.
+pub fn resolve(wiring: &Wiring, registry: &Registry) -> Result<Coordinator, LoadError> {
+    let config = coordinator_config(&wiring.coordinator);
+    let mut builder = Coordinator::builder(config);
+
+    // --- Systems pass: static via the Registry, dl via the loader --------
+    let mut instances: HashMap<String, Instance> = HashMap::new();
+    for spec in &wiring.systems {
+        let (handle, desc) = match &spec.artifact {
+            Some(artifact_id) => resolve_dl(spec, artifact_id, wiring, &mut builder)?,
+            None => resolve_static(spec, registry, &mut builder)?,
+        };
+        if instances
+            .insert(spec.name.clone(), Instance { handle, desc })
+            .is_some()
+        {
+            return Err(LoadError::DuplicateInstance {
+                name: spec.name.clone(),
+                src: system_src(spec),
+                span: (0, system_src(spec).len()).into(),
+            });
+        }
+    }
+
+    // --- Edges pass ------------------------------------------------------
+    for edge in &wiring.edges {
+        let src = edge_src(edge);
+        let span: SourceSpan = (0, src.len()).into();
+        let producer = resolve_endpoint(&instances, &src, &edge.from, &edge.out, Dir::Out, span)?;
+        let consumer = resolve_endpoint(&instances, &src, &edge.to, &edge.in_, Dir::In, span)?;
+        let result = if edge.delayed {
+            builder.connect_delayed(producer, consumer)
+        } else {
+            builder.connect(producer, consumer)
+        };
+        result.map_err(|source| LoadError::Wire { source, src, span })?;
+    }
+
+    // --- Telemetry: registered last (observes every system's fresh output) ---
+    if let Some(t) = &wiring.telemetry {
         builder.add_telemetry(TelemetryConfig {
-            transport: TcpTransport::new(addr),
-            mode,
+            transport: TcpTransport::new(t.addr),
+            mode: mode_from_spec(&t.mode),
         });
     }
 
-    // --- Build (wiring.md §3 pass) ---------------------------------------
-    builder.build().map_err(|e| wire_at_build(e, kdl, &edge_spans))
+    builder.build().map_err(wire_at_build)
+}
+
+/// Instantiate a **static** system through the [`Registry`] factory. The factory parses
+/// params via `FromKdlNode`, so we reconstruct a [`KdlNode`] from the spec: a config-less
+/// system synthesizes a minimal node; a params-bearing one re-parses the KDL source text
+/// the parse stage stored in [`SystemSpec::params`] (dl-open.md §6.3).
+fn resolve_static(
+    spec: &SystemSpec,
+    registry: &Registry,
+    builder: &mut CoordinatorBuilder,
+) -> Result<(SystemHandle, SystemDescriptor), LoadError> {
+    let factory = registry.factories.get(spec.ty.as_str()).ok_or_else(|| {
+        let src = system_src(spec);
+        LoadError::UnknownType {
+            ty: spec.ty.clone(),
+            span: (0, src.len()).into(),
+            src,
+        }
+    })?;
+    // Reconstruct the node the `FromKdlNode` factory reads its params off.
+    let node_src = if spec.params.is_empty() {
+        format!("system \"{}\" type=\"{}\"", spec.name, spec.ty)
+    } else {
+        // Stored by `parse` as the original `system` node's source text (UTF-8).
+        String::from_utf8(spec.params.clone()).unwrap_or_else(|_| {
+            format!("system \"{}\" type=\"{}\"", spec.name, spec.ty)
+        })
+    };
+    let doc = node_src.parse::<KdlDocument>().map_err(|source| LoadError::Parse {
+        source,
+        src: node_src.clone(),
+        span: (0, node_src.len()).into(),
+    })?;
+    let node = doc.nodes().first().ok_or_else(|| LoadError::MissingInstanceName {
+        src: node_src.clone(),
+        span: (0, node_src.len()).into(),
+    })?;
+    factory(&mut LoadCtx {
+        node,
+        src: &node_src,
+        name: &spec.name,
+        builder,
+    })
+}
+
+/// Load a **dl** system: find its [`Artifact`], `DlSystem::open` the resolved `.so`, and
+/// register it via [`CoordinatorBuilder::add_dl_cyclic`] with the spec's postcard params
+/// (dl-open.md §4.3/§6.3). The reconstructed descriptor is returned for edge validation.
+fn resolve_dl(
+    spec: &SystemSpec,
+    artifact_id: &str,
+    wiring: &Wiring,
+    builder: &mut CoordinatorBuilder,
+) -> Result<(SystemHandle, SystemDescriptor), LoadError> {
+    let src = system_src(spec);
+    let span: SourceSpan = (0, src.len()).into();
+    let artifact = wiring
+        .artifacts
+        .iter()
+        .find(|a| a.id == artifact_id)
+        .ok_or_else(|| LoadError::UnknownArtifact {
+            system: spec.name.clone(),
+            artifact: artifact_id.to_string(),
+            src: src.clone(),
+            span,
+        })?;
+    let path = artifact.path.as_ref().ok_or_else(|| LoadError::ArtifactNotBuilt {
+        artifact: artifact_id.to_string(),
+        src: src.clone(),
+        span,
+    })?;
+    let loaded = DlSystem::open(path).map_err(|source| LoadError::DlOpen {
+        system: spec.name.clone(),
+        artifact: artifact_id.to_string(),
+        source: Box::new(source),
+        src: src.clone(),
+        span,
+    })?;
+    let desc = loaded.descriptor().clone();
+    let handle = builder.add_dl_cyclic(&spec.name, loaded, spec.params.clone());
+    Ok((handle, desc))
+}
+
+/// A best-effort source snippet for a system's resolve-time errors (a [`Wiring`] carries
+/// no original document text).
+fn system_src(spec: &SystemSpec) -> String {
+    format!("system \"{}\" type=\"{}\"", spec.name, spec.ty)
+}
+
+/// A best-effort source snippet for an edge's resolve-time errors.
+fn edge_src(edge: &EdgeSpec) -> String {
+    let arrow = if edge.delayed { "~>" } else { "->" };
+    format!(
+        "connect \"{}\" {arrow} \"{}\" out=\"{}\" in=\"{}\"",
+        edge.from, edge.to, edge.out, edge.in_
+    )
+}
+
+/// Convert the serializable [`CoordinatorSpec`] into the runtime
+/// [`CoordinatorConfig`] (the data-model → runtime boundary, dl-open.md §6.1).
+fn coordinator_config(spec: &CoordinatorSpec) -> CoordinatorConfig {
+    let mut config = CoordinatorConfig {
+        cycle_rate: spec.cycle_rate,
+        ..CoordinatorConfig::default()
+    };
+    if let Some(depth) = spec.default_depth {
+        config.default_depth = depth;
+    }
+    config.clock = match spec.clock {
+        ClockSpec::Wall => ClockMode::Wall,
+        ClockSpec::Simulated { dt_secs } => ClockMode::Simulated {
+            dt: Duration::from_secs_f64(dt_secs),
+        },
+    };
+    config
+}
+
+/// Convert the serializable [`TelemetryModeSpec`] into the runtime [`TelemetryMode`].
+fn mode_from_spec(mode: &TelemetryModeSpec) -> TelemetryMode {
+    match mode {
+        TelemetryModeSpec::All => TelemetryMode::All,
+        TelemetryModeSpec::Subset { instances, frames } => TelemetryMode::Subset {
+            instances: instances.clone(),
+            frames: frames.clone(),
+        },
+    }
+}
+
+/// Parse one `artifact "id" crate="..." lib="libfoo.so" type="Foo"` node into an
+/// [`Artifact`] (dl-open.md §6.3). `lib=` is the produced cdylib file name.
+fn parse_artifact(node: &KdlNode, src: &str) -> Result<Artifact, LoadError> {
+    let missing = |property: &'static str| LoadError::MissingArtifactField {
+        property,
+        src: src.to_string(),
+        span: node.span(),
+    };
+    let id = first_arg_string(node).ok_or_else(|| missing("id"))?;
+    let crate_name = prop_string(node, "crate").ok_or_else(|| missing("crate"))?;
+    let cdylib = prop_string(node, "lib").ok_or_else(|| missing("lib"))?;
+    let system_type = prop_string(node, "type").ok_or_else(|| missing("type"))?;
+    Ok(Artifact {
+        id: id.to_string(),
+        crate_name: crate_name.to_string(),
+        cdylib: cdylib.to_string(),
+        system_type: system_type.to_string(),
+        path: None,
+    })
+}
+
+/// Parse one `system` node into a [`SystemSpec`] (dl-open.md §6.3). A `lib=` ⇒ a dl
+/// system referencing that [`Artifact`]; otherwise a static system. See [`parse`] for
+/// the static-params / dl-params-deferred handling.
+fn parse_system(
+    node: &KdlNode,
+    src: &str,
+    seen: &mut HashSet<String>,
+) -> Result<SystemSpec, LoadError> {
+    let name = first_arg_string(node).ok_or_else(|| LoadError::MissingInstanceName {
+        src: src.to_string(),
+        span: node.span(),
+    })?;
+    let ty = prop_string(node, "type").ok_or_else(|| LoadError::MissingType {
+        name: name.to_string(),
+        src: src.to_string(),
+        span: node.span(),
+    })?;
+    if !seen.insert(name.to_string()) {
+        return Err(LoadError::DuplicateInstance {
+            name: name.to_string(),
+            src: src.to_string(),
+            span: node.span(),
+        });
+    }
+    let artifact = prop_string(node, "lib").map(str::to_string);
+    // Any property other than the reserved `type=`/`lib=` is a config (params) property.
+    let has_config = node.entries().iter().any(|e| {
+        matches!(e.name().map(|n| n.value()), Some(k) if k != "type" && k != "lib")
+    });
+    let params = if artifact.is_some() {
+        // Dl system: KDL params require the Wave 3b schema-guided encoder (dl-open.md §6.3).
+        if has_config {
+            return Err(LoadError::DlKdlParamsUnsupported {
+                system: name.to_string(),
+                src: src.to_string(),
+                span: node.span(),
+            });
+        }
+        Vec::new()
+    } else if has_config {
+        // Static system with config: carry the node's source so `resolve_static` can
+        // re-parse it through `FromKdlNode` (the host links a static system's `Params`).
+        node.to_string().into_bytes()
+    } else {
+        Vec::new()
+    };
+    Ok(SystemSpec {
+        name: name.to_string(),
+        ty: ty.to_string(),
+        artifact,
+        params,
+    })
 }
 
 /// Parse a `telemetry` node into a `(addr, mode)` pair (telemetry.md §8):
@@ -552,7 +908,10 @@ pub fn load(kdl: &str, registry: &Registry) -> Result<Coordinator, LoadError> {
 ///     // tap frame="control"
 /// }
 /// ```
-fn parse_telemetry(node: &KdlNode, src: &str) -> Result<(std::net::SocketAddr, TelemetryMode), LoadError> {
+fn parse_telemetry(
+    node: &KdlNode,
+    src: &str,
+) -> Result<(std::net::SocketAddr, TelemetryModeSpec), LoadError> {
     let invalid = |property: &str, expected: &str| LoadError::InvalidParam {
         property: property.to_string(),
         system: "telemetry",
@@ -592,7 +951,7 @@ fn parse_telemetry(node: &KdlNode, src: &str) -> Result<(std::net::SocketAddr, T
         .and_then(first_arg_string)
         .unwrap_or("all");
     let mode = match mode_str {
-        "all" => TelemetryMode::All,
+        "all" => TelemetryModeSpec::All,
         "subset" => {
             let mut instances = Vec::new();
             let mut frames = Vec::new();
@@ -604,15 +963,17 @@ fn parse_telemetry(node: &KdlNode, src: &str) -> Result<(std::net::SocketAddr, T
                     frames.push(f.to_string());
                 }
             }
-            TelemetryMode::Subset { instances, frames }
+            TelemetryModeSpec::Subset { instances, frames }
         }
         _ => return Err(invalid("mode", "\"all\" or \"subset\"")),
     };
     Ok((addr, mode))
 }
 
-/// Read the single `coordinator` node into a [`CoordinatorConfig`] (wiring.md §1.1).
-fn parse_coordinator(doc: &KdlDocument, src: &str) -> Result<CoordinatorConfig, LoadError> {
+/// Read the single `coordinator` node into a [`CoordinatorSpec`] (wiring.md §1.1).
+/// `sim_dt` (seconds) present ⇒ a free-running [`Simulated`](ClockSpec::Simulated)
+/// clock; absent ⇒ [`Wall`](ClockSpec::Wall).
+fn parse_coordinator(doc: &KdlDocument, src: &str) -> Result<CoordinatorSpec, LoadError> {
     let mut found: Option<&KdlNode> = None;
     for node in doc.nodes() {
         if node.name().value() != "coordinator" {
@@ -627,18 +988,17 @@ fn parse_coordinator(doc: &KdlDocument, src: &str) -> Result<CoordinatorConfig, 
         found = Some(node);
     }
     let node = found.ok_or(LoadError::MissingCoordinator)?;
-    let mut config = CoordinatorConfig::default();
-    config.cycle_rate = kdl_required::<f64>(node, "cycle_rate", "coordinator", src)?;
-    if let Some(depth) = kdl_optional::<usize>(node, "default_depth", "coordinator", src)? {
-        config.default_depth = depth;
-    }
-    // `sim_dt` (seconds) present ⇒ a free-running simulated clock; absent ⇒ `Wall`.
-    if let Some(sim_dt) = kdl_optional::<f64>(node, "sim_dt", "coordinator", src)? {
-        config.clock = ClockMode::Simulated {
-            dt: Duration::from_secs_f64(sim_dt),
-        };
-    }
-    Ok(config)
+    let cycle_rate = kdl_required::<f64>(node, "cycle_rate", "coordinator", src)?;
+    let default_depth = kdl_optional::<usize>(node, "default_depth", "coordinator", src)?;
+    let clock = match kdl_optional::<f64>(node, "sim_dt", "coordinator", src)? {
+        Some(dt_secs) => ClockSpec::Simulated { dt_secs },
+        None => ClockSpec::Wall,
+    };
+    Ok(CoordinatorSpec {
+        cycle_rate,
+        default_depth,
+        clock,
+    })
 }
 
 /// Parse a `connect` edge in either the shorthand (`"a" -> "b" frame="f"`) or the
@@ -664,7 +1024,6 @@ fn parse_edge(node: &KdlNode, src: &str) -> Result<Edge, LoadError> {
             out: out.to_string(),
             in_: in_.to_string(),
             delayed,
-            span,
         });
     }
 
@@ -687,14 +1046,13 @@ fn parse_edge(node: &KdlNode, src: &str) -> Result<Edge, LoadError> {
         out: frame.to_string(),
         in_: frame.to_string(),
         delayed,
-        span,
     })
 }
 
 /// Resolve one `(instance, frame)` endpoint to a [`PortRef`], validating the frame
 /// name against the instance descriptor's port list — a typo is a load error
 /// (wiring.md §4.2).
-fn resolve(
+fn resolve_endpoint(
     instances: &HashMap<String, Instance>,
     src: &str,
     name: &str,
@@ -726,27 +1084,16 @@ fn resolve(
     })
 }
 
-/// Best-effort map of a `build()`-time [`WireError`] back to a source span: errors
-/// naming a `frame_id` point at the `connect` that introduced that frame; the rest
-/// point at the whole document (wiring.md §5.2 / Q7).
-fn wire_at_build(err: WireError, src: &str, edges: &[(ComponentId, SourceSpan)]) -> LoadError {
-    let doc_span: SourceSpan = (0, src.len()).into();
-    let span = match &err {
-        WireError::Incompatible { frame_id, .. }
-        | WireError::UnconnectedInput { frame_id, .. }
-        | WireError::DoubleConnect { frame_id, .. }
-        | WireError::UnknownPort { frame_id, .. } => edges
-            .iter()
-            .find(|(f, _)| f == frame_id)
-            .map(|(_, s)| *s)
-            .unwrap_or(doc_span),
-        WireError::UnknownSystem { .. }
-        | WireError::FrameIdMismatch { .. }
-        | WireError::FeedbackCycle { .. } => doc_span,
-    };
+/// Wrap a `build()`-time [`WireError`] as a [`LoadError::Wire`] (wiring.md §5.2 / Q7).
+/// A [`Wiring`] is format-independent, so the diagnostic uses the error's own rendered
+/// message as its source snippet rather than the original document spans — the variant
+/// (what callers/tests match on) is unchanged.
+fn wire_at_build(err: WireError) -> LoadError {
+    let src = err.to_string();
+    let span: SourceSpan = (0, src.len()).into();
     LoadError::Wire {
         source: err,
-        src: src.to_string(),
+        src,
         span,
     }
 }

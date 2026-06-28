@@ -28,16 +28,14 @@ mod writer;
 #[cfg(feature = "kdl")]
 pub mod wiring;
 
-// WP8 — the `dlopen` C-ABI a system `cdylib` exports (dl-open.md §2/§3). Rides the
-// `kdl` feature in v1: `fsw_create` leans on WP6's `RegisteredSystem` construction
-// contract (`src/wiring.rs`), so the ABI compiles wherever that does.
-#[cfg(feature = "kdl")]
+// WP8 — the `dlopen` C-ABI a system `cdylib` exports (dl-open.md §2/§3). Wave 3a
+// decoupled construction from KDL (`BuildSystem`), so the ABI is now available with or
+// without the `kdl` feature (dl-open.md §3.0 fix): `fsw_create` leans only on the
+// kdl-independent `BuildSystem` construction contract (`src/system.rs`).
 pub mod abi;
 
 // WP8 Wave 2 — the host-side `dlopen` loader (`DlSystem`) + the cyclic slot (`DlSlot`)
-// that drives a system `.so` across the ABI (dl-open.md §4). Rides the `kdl` feature
-// with the `abi` module it consumes.
-#[cfg(feature = "kdl")]
+// that drives a system `.so` across the ABI (dl-open.md §4). Ungated alongside `abi`.
 pub mod dl;
 
 pub use dynamic::{FrameList, FrameMap, Name, Slot};
@@ -66,7 +64,9 @@ pub use health::{
     HealthPort, LOG_MSG_CAP, Level, LogLine, MAX_ERR_KINDS, MAX_LINES, SystemHealth, SystemLog,
 };
 pub use port::{DEFAULT_DEPTH, FrameRef, Input, Output, buffer_capacity, capacity_for};
-pub use system::{AsyncSystem, CyclicRunner, CyclicSystem, Out, System, SystemInput, SystemOutput};
+pub use system::{
+    AsyncSystem, BuildSystem, CyclicRunner, CyclicSystem, Out, System, SystemInput, SystemOutput,
+};
 
 // Re-export the ring transport so a system author only needs `metor_fsw_2::*`.
 pub use metor_fsw_ring as ring;
@@ -86,9 +86,17 @@ pub use metor_fsw_macros::export_system;
 pub use metor_fsw::path;
 pub use {metor_proto, metor_proto_wkt};
 
-// WP8 Wave 2 — the host dlopen loader surface.
-#[cfg(feature = "kdl")]
+// WP8 Wave 2 — the host dlopen loader surface (available without `kdl`).
 pub use dl::{DlError, DlSystem};
+
+// WP8 Wave 3a — the `Wiring` data model, the Rust builder, the shared resolver, and
+// the cargo build driver (the data/serialization split — dl-open.md §6). These ride
+// the `kdl` feature with the wiring front-end they share a resolver with.
+#[cfg(feature = "kdl")]
+pub use wiring::{
+    Artifact, BuildError, BuildOptions, ClockSpec, CoordinatorSpec, EdgeSpec, SystemSpec,
+    TelemetryModeSpec, TelemetrySpec, Wiring, WiringBuilder, build_artifacts, parse, resolve,
+};
 
 #[cfg(feature = "kdl")]
 pub use kdl;

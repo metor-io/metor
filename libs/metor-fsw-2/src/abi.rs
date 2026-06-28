@@ -40,8 +40,7 @@ use serde::{Deserialize, Serialize};
 use crate::binder::{BindPorts, RingSource};
 use crate::coordinator::{CyclicSlot, SlotState, StopReason};
 use crate::descriptor::{AnnounceFn, Hz, PortDesc, SystemDescriptor, SystemKind};
-use crate::system::{CyclicRunner, CyclicSystem, Out, SystemOutput};
-use crate::wiring::RegisteredSystem;
+use crate::system::{BuildSystem, CyclicRunner, CyclicSystem, Out, SystemOutput};
 
 // ---------------------------------------------------------------------------
 // Version + identity
@@ -420,7 +419,7 @@ struct AbiState<S> {
 }
 
 /// `fsw_create`: postcard-decode `S::Params`, construct the system via
-/// [`RegisteredSystem::new`], and box the (unbound) [`AbiState`] (dl-open.md §2.2).
+/// [`BuildSystem::new`], and box the (unbound) [`AbiState`] (dl-open.md §2.2).
 /// Returns a null pointer if decoding or construction panics — no unwind escapes.
 ///
 /// # Safety
@@ -429,7 +428,7 @@ struct AbiState<S> {
 /// passed only to the other `run_*` helpers for the same `S`, then [`run_destroy`].
 pub unsafe fn run_create<S>(params: *const u8, params_len: usize) -> *mut c_void
 where
-    S: RegisteredSystem,
+    S: BuildSystem,
     S::Params: for<'de> Deserialize<'de>,
 {
     let outcome = catch_unwind(AssertUnwindSafe(|| {
@@ -468,7 +467,7 @@ pub unsafe fn run_bind_init<S, O>(
     outputs: *const FswRing,
     n_out: usize,
 ) where
-    S: CyclicSystem<RawBacking, Output = Out<O, RawBacking>> + RegisteredSystem + 'static,
+    S: CyclicSystem<RawBacking, Output = Out<O, RawBacking>> + BuildSystem + 'static,
     O: SystemOutput + 'static,
     S::Input: BindPorts<RawBacking>,
     S::Output: BindPorts<RawBacking>,
@@ -515,7 +514,7 @@ pub unsafe fn run_bind_init<S, O>(
 /// `state` is a live pointer from [`run_create`] for this `S`.
 pub unsafe fn run_execute<S>(state: *mut c_void, now: u64) -> FswStatus
 where
-    S: RegisteredSystem,
+    S: BuildSystem,
 {
     if state.is_null() {
         return FswStatus::Panicked;
@@ -549,7 +548,7 @@ where
 /// `state` is a live pointer from [`run_create`] for this `S`.
 pub unsafe fn run_shutdown<S>(state: *mut c_void)
 where
-    S: RegisteredSystem,
+    S: BuildSystem,
 {
     if state.is_null() {
         return;
@@ -571,7 +570,7 @@ where
 /// `state` is a live pointer from [`run_create`] for this `S`, not used afterward.
 pub unsafe fn run_destroy<S>(state: *mut c_void)
 where
-    S: RegisteredSystem,
+    S: BuildSystem,
 {
     if state.is_null() {
         return;
@@ -594,7 +593,7 @@ where
 /// `.so` owns for the duration of the call).
 pub unsafe fn run_describe<S>(sink: ByteSink, ctx: *mut c_void) -> i32
 where
-    S: CyclicSystem<RawBacking> + RegisteredSystem,
+    S: CyclicSystem<RawBacking> + BuildSystem,
     S::Params: postcard_schema::Schema,
 {
     let outcome = catch_unwind(AssertUnwindSafe(|| {

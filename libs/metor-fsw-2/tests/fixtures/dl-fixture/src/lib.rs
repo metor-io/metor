@@ -14,9 +14,8 @@
 // `not_unsafe_ptr_arg_deref` is inherent to that macro surface for any cdylib.
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
 
-use metor_fsw_2::wiring::{FromKdlNode, LoadError, RegisteredSystem, kdl_optional};
 use metor_fsw_2::{
-    CyclicSystem, Input, Out, Output, System, SystemInput, SystemOutput,
+    BuildSystem, CyclicSystem, Input, Out, Output, System, SystemInput, SystemOutput,
 };
 use metor_fsw_2::metor_proto::types::Timestamp;
 use metor_fsw_2::ring::{Backing, BoxBacking};
@@ -50,14 +49,9 @@ pub struct CounterParams {
     pub start: u64,
 }
 
-// Only needed to satisfy `RegisteredSystem::Params: FromKdlNode`; the dl path encodes
-// params as canonical postcard bytes and never calls this (dl-open.md §6.3).
-impl FromKdlNode for CounterParams {
-    fn from_kdl_node(node: &metor_fsw_2::kdl::KdlNode, src: &str) -> Result<Self, LoadError> {
-        let start = kdl_optional::<u64>(node, "start", "dl_counter", src)?.unwrap_or(0);
-        Ok(Self { start })
-    }
-}
+// Wave 3a (dl-open.md §3.0/§6.3): a dl system needs **no** `FromKdlNode` impl — it is
+// constructed only via `BuildSystem` (below), decoding canonical postcard `Params`
+// bytes in `fsw_create`. This fixture proves the `RegisteredSystem`/`kdl` decoupling.
 
 /// Adds `start` to each input tick and republishes the sum.
 pub struct DlCounter {
@@ -101,7 +95,7 @@ impl<B: Backing> CyclicSystem<B> for DlCounter {
     }
 }
 
-impl RegisteredSystem for DlCounter {
+impl BuildSystem for DlCounter {
     type Params = CounterParams;
     fn new(params: Self::Params) -> Self {
         DlCounter { start: params.start }
