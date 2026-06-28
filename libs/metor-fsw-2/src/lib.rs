@@ -22,6 +22,10 @@ mod reader;
 mod system;
 mod writer;
 
+// WP6 — the KDL wiring front-end (registry, FromKdlNode derive, `load()`).
+#[cfg(feature = "kdl")]
+pub mod wiring;
+
 pub use dynamic::{FrameList, FrameMap, Name, Slot};
 pub use frame::Frame;
 pub use reader::{ListReader, MapReader};
@@ -58,3 +62,5 @@ mod tests;
 mod tests_coordinator;
 #[cfg(test)]
 mod tests_system;
+#[cfg(all(test, feature = "kdl"))]
+mod tests_wiring;

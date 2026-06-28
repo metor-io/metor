@@ -18,3 +18,13 @@ metor-fsw-ring = { path = "ring", default-features = false, features = ["async"]
 metor-fsw-macros = { path = "../metor-fsw/macros" }
 stellarator = { path = "../stellarator" }
 zerocopy = { version = "0.8.2", features = ["derive"] }
+
+# Wiring front-end (the `kdl` feature): KDL config language + span-carrying errors.
+kdl = { version = "6.3.4", optional = true }
+miette = { version = "7.0", features = ["fancy"], optional = true }
+thiserror = { version = "2.0", optional = true }
+
+[features]
+default = ["kdl"]
+# The KDL wiring loader (`wiring` module): registry, FromKdlNode derive, `load()`.
+kdl = ["dep:kdl", "dep:miette", "dep:thiserror"]
