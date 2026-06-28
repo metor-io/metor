@@ -34,6 +34,12 @@ pub async fn handle_vtable_stream<A: AsyncWrite + 'static>(
     req_id: RequestId,
 ) -> Result<(), Error> {
     trace!("spawning vtable stream");
+    // A vtable containing any `List`/`Map` terminal is runtime-sized: the fixed
+    // shard `FieldTable` below cannot express it, so dynamic subscriptions take a
+    // separate per-tick rebuild loop (mirroring `handle_fixed_stream`).
+    if vtable.is_dynamic() {
+        return handle_dynamic_vtable_stream(id, vtable, db, tx, req_id).await;
+    }
     let table_len = vtable
         .fields
         .iter()
@@ -172,6 +178,58 @@ pub async fn handle_vtable_stream<A: AsyncWrite + 'static>(
         rent!(tx.send(pkt.with_request_id(req_id)).await, pkt)?;
         table.replace_pkt(pkt).await;
         table.notify_writers();
+    }
+}
+
+/// Streams a dynamic-frame ([`Op::List`]/[`Op::Map`]) subscription.
+///
+/// Mirrors [`crate::handle_fixed_stream`]: a single per-tick loop that resends
+/// the (structurally fixed) VTable whenever the global `vtable_gen` bumps — a
+/// lazily-created keyed component bumps it like any new series — and each tick
+/// forwards the producer's cached latest table for this frame, re-headed with
+/// the subscriber's stream id. Because the trailer's live element count is
+/// parsed from the slot's `byte_len`, authoritative-latest liveness falls out
+/// for free: a key absent from the newest ingested table is simply absent from
+/// the next forwarded packet (vtable-dynamic.md §8.6).
+async fn handle_dynamic_vtable_stream<A: AsyncWrite + 'static>(
+    id: [u8; 2],
+    vtable: VTable,
+    db: Arc<DB>,
+    tx: Arc<Mutex<PacketSink<A>>>,
+    req_id: RequestId,
+) -> Result<(), Error> {
+    trace!("spawning dynamic vtable stream");
+    let mut current_gen = db.vtable_gen.latest();
+    {
+        let mut pkt = VTableMsg {
+            vtable: vtable.clone(),
+            id,
+        }
+        .into_len_packet();
+        let tx = tx.lock().await;
+        rent!(tx.send(pkt.with_request_id(req_id)).await, pkt)?;
+    }
+    let mut last_seen = Timestamp(i64::MIN);
+    loop {
+        let next_gen = db.vtable_gen.latest();
+        if next_gen != current_gen {
+            let mut pkt = VTableMsg {
+                vtable: vtable.clone(),
+                id,
+            }
+            .into_len_packet();
+            let tx = tx.lock().await;
+            rent!(tx.send(pkt.with_request_id(req_id)).await, pkt)?;
+            current_gen = next_gen;
+        }
+        if let Some(mut pkt) = db.dynamic_stream_packet(id) {
+            let tx = tx.lock().await;
+            rent!(tx.send(pkt.with_request_id(req_id)).await, pkt)?;
+        }
+        // Tick on any new sample landing in the db (the same wake source the
+        // realtime/unicast streams use); re-forward the latest table.
+        db.last_updated.wait_for(|t| t > last_seen).await;
+        last_seen = db.last_updated.latest();
     }
 }
 

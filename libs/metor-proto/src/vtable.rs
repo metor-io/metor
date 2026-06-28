@@ -369,6 +369,12 @@ pub struct RealizedField<'a> {
     pub frame: Option<ComponentId>,
     /// The dynamic-frame element this field came from, if any (`None` for static fields).
     pub element: Option<ElementKey<'a>>,
+    /// Whether this field was realized through a dynamic terminal
+    /// ([`Op::PathComponent`], reached via [`Op::List`]/[`Op::Map`]). In
+    /// schema/registration mode (`table = None`) such a field is a member
+    /// *template* (e.g. `processes.pid`) that never receives samples directly;
+    /// in ingest mode it is one concrete element-member (`processes.0.pid`).
+    pub dynamic: bool,
 }
 
 impl<'a> RealizedOp<'a> {
@@ -412,6 +418,15 @@ impl<'a> RealizedOp<'a> {
 }
 
 impl<Ops: Buf<Op>, Data: Buf<u8>, Fields: Buf<Field>> VTable<Ops, Data, Fields> {
+    /// Whether this VTable contains any dynamic terminal ([`Op::List`]/
+    /// [`Op::Map`]) and therefore realizes runtime-sized, lazily-created
+    /// components rather than a fixed component set.
+    pub fn is_dynamic(&self) -> bool {
+        self.ops
+            .iter()
+            .any(|op| matches!(op, Op::List { .. } | Op::Map { .. }))
+    }
+
     /// Retrieves an operation by its reference
     #[inline]
     pub fn get_op(&self, op_ref: OpRef) -> Result<&Op, Error> {
@@ -610,13 +625,13 @@ impl<Ops: Buf<Op>, Data: Buf<u8>, Fields: Buf<Field>> VTable<Ops, Data, Fields> 
         loop {
             match realized_op {
                 RealizedOp::Component(RealizedComponent { component_id }) => {
-                    return self.emit_leaf(field, &ctx, component_id, frame, &schema, timestamp, table, f);
+                    return self.emit_leaf(field, &ctx, component_id, frame, &schema, timestamp, false, table, f);
                 }
                 RealizedOp::PathComponent(leaf) => {
                     let mut leaf_path = ctx.path;
                     leaf_path.push(leaf.name);
                     let component_id = leaf_path.finish();
-                    return self.emit_leaf(field, &ctx, component_id, frame, &schema, timestamp, table, f);
+                    return self.emit_leaf(field, &ctx, component_id, frame, &schema, timestamp, true, table, f);
                 }
                 RealizedOp::Schema(s) => {
                     let s = schema.insert(s);
@@ -654,6 +669,7 @@ impl<Ops: Buf<Op>, Data: Buf<u8>, Fields: Buf<Field>> VTable<Ops, Data, Fields> 
         frame: Option<ComponentId>,
         schema: &Option<RealizedSchema<'a>>,
         timestamp: Option<Timestamp>,
+        dynamic: bool,
         table: Option<&'a [u8]>,
         f: &mut dyn FnMut(RealizedField<'a>) -> Result<(), Error>,
     ) -> Result<(), Error> {
@@ -679,6 +695,7 @@ impl<Ops: Buf<Op>, Data: Buf<u8>, Fields: Buf<Field>> VTable<Ops, Data, Fields> 
             ty: schema.ty,
             frame,
             element: ctx.element,
+            dynamic,
         })
     }
 
