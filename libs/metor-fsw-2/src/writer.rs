@@ -42,7 +42,18 @@ impl<F: Frame + IntoBytes + Immutable> FrameWriter<F> {
     /// Starts a writer, seeding the fixed region from `fixed` (with its dynamic
     /// slots zeroed — construct them as `FrameList::EMPTY` / `FrameMap::EMPTY`).
     pub fn new(fixed: &F) -> Self {
-        let mut packet = LenPacket::table([0, 0], F::MAX_SIZE.min(1 << 16));
+        let packet = LenPacket::table([0, 0], F::MAX_SIZE.min(1 << 16));
+        Self::from_packet(packet, fixed)
+    }
+
+    /// As [`new`](Self::new) but reuses an existing [`LenPacket`] buffer (cleared
+    /// back to the table base) instead of allocating a fresh one — the per-write
+    /// pooling path used by [`Output::write_with`](crate::Output::write_with) to
+    /// avoid a heap alloc+free on every dynamic-member publish (e.g. per-cycle
+    /// health). The reused buffer is byte-equivalent to a fresh
+    /// `LenPacket::table([0, 0], _)` after `clear()`.
+    pub fn from_packet(mut packet: LenPacket, fixed: &F) -> Self {
+        packet.clear();
         debug_assert_eq!(packet.inner.len(), TABLE_BASE);
         let base = packet.inner.len();
         packet.extend_from_slice(fixed.as_bytes());
@@ -95,12 +106,16 @@ impl<F: Frame + IntoBytes + Immutable> FrameWriter<F> {
 
         let mut pool = Vec::new();
         let mut key_cursor = pool_off;
+        // One reused entry buffer (zeroed each iteration) rather than a heap
+        // allocation per map entry.
+        let mut entry = vec![0u8; stride];
         for (key, val) in &mw.entries {
             let kb = key.as_bytes();
-            let mut entry = vec![0u8; stride];
+            let vb = val.as_bytes();
+            entry.fill(0);
             entry[0..4].copy_from_slice(&(key_cursor as u32).to_le_bytes());
             entry[4..8].copy_from_slice(&(kb.len() as u32).to_le_bytes());
-            entry[value_offset..value_offset + val.len()].copy_from_slice(val);
+            entry[value_offset..value_offset + vb.len()].copy_from_slice(vb);
             self.packet.extend_from_slice(&entry);
             pool.extend_from_slice(kb);
             key_cursor += kb.len();
@@ -175,9 +190,8 @@ impl<T: IntoBytes + Immutable> ListWriter<T> {
 /// Records map entries before they are serialized into the trailer. Keys are
 /// validated on insert; the first rejection is surfaced by [`FrameWriter::map`].
 pub struct MapWriter<V> {
-    entries: Vec<(String, Vec<u8>)>,
+    entries: Vec<(String, V)>,
     error: Option<WriteError>,
-    _v: PhantomData<V>,
 }
 
 impl<V: IntoBytes + Immutable> MapWriter<V> {
@@ -185,7 +199,6 @@ impl<V: IntoBytes + Immutable> MapWriter<V> {
         Self {
             entries: Vec::new(),
             error: None,
-            _v: PhantomData,
         }
     }
 
@@ -195,8 +208,9 @@ impl<V: IntoBytes + Immutable> MapWriter<V> {
             self.error.get_or_insert(e);
             return;
         }
-        self.entries
-            .push((key.to_string(), value.as_bytes().to_vec()));
+        // Store `V` directly; its bytes are emitted at serialize time, avoiding a
+        // per-entry heap allocation here.
+        self.entries.push((key.to_string(), value));
     }
 }
 
