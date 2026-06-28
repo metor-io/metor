@@ -467,3 +467,6 @@ impl<T: Transport + 'static> CyclicSystem for TelemetrySystem<T> {
         }
     }
 }
+
+#[cfg(test)]
+mod tests;

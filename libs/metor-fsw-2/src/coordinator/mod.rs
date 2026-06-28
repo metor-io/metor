@@ -1280,3 +1280,6 @@ impl Coordinator {
         }
     }
 }
+
+#[cfg(test)]
+mod tests;

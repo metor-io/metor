@@ -1304,3 +1304,6 @@ fn first_arg_string(node: &KdlNode) -> Option<&str> {
 fn prop_string<'a>(node: &'a KdlNode, key: &str) -> Option<&'a str> {
     node.get(key).and_then(|v| v.as_string())
 }
+
+#[cfg(test)]
+mod tests;
