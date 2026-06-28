@@ -1,19 +1,18 @@
-//! The `dlopen` C-ABI surface a system `cdylib` exports (dl-open.md §2/§3).
+//! The `dlopen` C-ABI surface a system `cdylib` exports.
 //!
-//! A WP8 system `.so` exports a small, versioned, `extern "C"` surface the host
-//! `dlopen`s. This module is the **shared contract both halves compile against**:
-//! the `repr(C)` handles ([`FswRing`], [`FswStatus`]), the serialized descriptor
-//! mirrors ([`PortDescMsg`]/[`SystemDescriptorMsg`]), the resolve-by symbol-name
-//! constants, and the generic `run_*` helpers the [`export_system!`](crate::export_system)
-//! macro delegates to so the generated code stays a one-liner per export.
+//! A system `.so` exports a small, versioned, `extern "C"` surface the host `dlopen`s.
+//! This module is the **shared contract both halves compile against**: the `repr(C)`
+//! handles ([`FswRing`], [`FswStatus`]), the serialized descriptor mirrors
+//! ([`PortDescMsg`]/[`SystemDescriptorMsg`]), the resolve-by symbol-name constants, and
+//! the generic `run_*` helpers the [`export_system!`](crate::export_system) macro
+//! delegates to so the generated code stays a one-liner per export.
 //!
 //! Only **serialized bytes** (the descriptor, the postcard `Params` blob) and
 //! **`repr(C)` handles** ever cross the boundary — never a `Vec`/`Arc`/`VTable`
-//! by value — which is what makes "dlopen across a stable Rust ABI" sound here
-//! (dl-open.md §0, §2.5). Same-process, cyclic-only per the locked v1 scope
-//! (dl-open.md §5, §9): every port uses [`NoWake`].
+//! by value — which is what makes "dlopen across a stable Rust ABI" sound here.
+//! Same-process and cyclic-only: every port uses [`NoWake`].
 //!
-//! ## Containment (dl-open.md §2.5)
+//! ## Containment
 //!
 //! Every `run_*` helper wraps its body in [`std::panic::catch_unwind`] and converts
 //! a caught panic to a null-safe outcome ([`FswStatus::Panicked`] / a null pointer /
@@ -46,9 +45,9 @@ use crate::system::{BuildSystem, CyclicRunner, CyclicSystem, Out, SystemOutput};
 // Version + identity
 // ---------------------------------------------------------------------------
 
-/// The monotonic ABI word a host checks for equality before any other call
-/// (dl-open.md §2.4). **Bump on any change** to the C surface or the `*Msg` wire
-/// structs below; a mismatch fails the load cleanly rather than risking a crash.
+/// The monotonic ABI word a host checks for equality before any other call.
+/// **Bump on any change** to the C surface or the `*Msg` wire structs below; a
+/// mismatch fails the load cleanly rather than risking a crash.
 pub const FSW_ABI_VERSION: u32 = 1;
 
 // ---------------------------------------------------------------------------
@@ -56,7 +55,7 @@ pub const FSW_ABI_VERSION: u32 = 1;
 // ---------------------------------------------------------------------------
 
 /// A ring region handle the host fills from its `RingEntry`/`RingTable` and the
-/// system turns back into a ring via [`RingBuffer::attach_raw`] (dl-open.md §2.3).
+/// system turns back into a ring via [`RingBuffer::attach_raw`].
 ///
 /// Everything else the system needs — capacity, data offset, reader-table offset,
 /// `max_readers`, overrun — is **self-describing in the region header**, so the
@@ -81,8 +80,8 @@ pub const ROLE_INPUT: u8 = 0;
 pub const ROLE_OUTPUT: u8 = 1;
 
 /// The lifecycle status [`run_execute`] returns, mapped to/from [`SlotState`] so
-/// the host can update its status frame without owning the input `View`
-/// (dl-open.md §2.2, Q-status). `repr(u32)` keeps it FFI-stable.
+/// the host can update its status frame without owning the input `View`.
+/// `repr(u32)` keeps it FFI-stable.
 #[repr(u32)]
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum FswStatus {
@@ -91,7 +90,7 @@ pub enum FswStatus {
     /// An input lapped; the system permanently stopped itself (`StopReason::LappedInput`).
     StoppedLapped = 1,
     /// A panic was caught at the boundary, or the state was never bound; the host
-    /// telemeters it and hard-stops the slot (dl-open.md §2.5).
+    /// telemeters it and hard-stops the slot.
     Panicked = 2,
 }
 
@@ -115,7 +114,7 @@ impl FswStatus {
 
 /// The host-owned sink a `describe`-style export hands its serialized bytes to,
 /// so the system frees its own buffer and the host copies — no cross-allocator
-/// free (dl-open.md §2.1/§2.5).
+/// free.
 pub type ByteSink = extern "C" fn(ctx: *mut c_void, buf: *const u8, len: usize);
 
 // ---------------------------------------------------------------------------
@@ -138,10 +137,10 @@ pub const SYM_SHUTDOWN: &[u8] = b"fsw_shutdown\0";
 pub const SYM_DESTROY: &[u8] = b"fsw_destroy\0";
 
 // ---------------------------------------------------------------------------
-// Serialized descriptor mirrors (postcard) — dl-open.md §2.1
+// Serialized descriptor mirrors (postcard)
 // ---------------------------------------------------------------------------
 
-/// The serializable mirror of [`PortDesc`] (dl-open.md §2.1). [`PortDesc`] cannot
+/// The serializable mirror of [`PortDesc`]. [`PortDesc`] cannot
 /// cross by value: its `announce` field is a closure over the frame type `F`, which
 /// does not exist on the host side. So we serialize the **unprefixed** `vtable`
 /// (exactly what `compatible()` needs, so wiring validation runs unchanged) plus the
@@ -160,13 +159,13 @@ pub struct PortDescMsg {
     /// Advisory rate, for buffer depth / async pacing.
     pub rate_hint: Option<Hz>,
     /// The unprefixed component metadata, so the host can synthesize a prefixed
-    /// `announce` for telemetry without the static `F` (dl-open.md §7).
+    /// `announce` for telemetry without the static `F`.
     pub metadata: Vec<ComponentMetadata>,
 }
 
-/// The serializable mirror of [`SystemDescriptor`] (dl-open.md §2.1), carrying the
-/// system's `Params` **schema** so the host can encode params from KDL without
-/// linking the `Params` type (dl-open.md §6.3, the one-postcard-encoding decision).
+/// The serializable mirror of [`SystemDescriptor`], carrying the system's `Params`
+/// **schema** so the host can encode params from KDL without linking the `Params`
+/// type (the one-postcard-encoding decision).
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct SystemDescriptorMsg {
     pub name: String,
@@ -192,18 +191,18 @@ impl PortDescMsg {
     }
 
     /// Reconstruct a [`PortDesc`], synthesizing the `announce` closure from the
-    /// carried `metadata` (dl-open.md §2.1/§7). The frame name is `Box::leak`ed to
-    /// recover the `&'static str` the host wiring path expects — a one-time leak per
-    /// dlopen'd port at load.
+    /// carried `metadata`. The frame name is `Box::leak`ed to recover the
+    /// `&'static str` the host wiring path expects — a one-time leak per dlopen'd
+    /// port at load.
     pub fn into_port_desc(self) -> PortDesc {
         let frame_name: &'static str = Box::leak(self.frame_name.into_boxed_str());
         // The `announce` factory closes over the carried unprefixed vtable + metadata
         // and re-prefixes them by the instance name. Re-prefixing the **metadata** names
         // is a rehash from the prefixed name; re-prefixing the **vtable**'s baked
         // component ids is the metadata-driven id rewrite of telemetry.md §6 —
-        // [`prefix_announce_vtable`] (the WP8 W2b host-side consumer). The result matches
-        // a static system's prefixed announce (WP7 `announce_of::<F>(prefix)`) bit-for-bit,
-        // so telemetry `All` keys a dlopen'd output's components the same way.
+        // [`prefix_announce_vtable`]. The result matches a static system's prefixed
+        // announce (`announce_of::<F>(prefix)`) bit-for-bit, so telemetry `All` keys a
+        // dlopen'd output's components the same way.
         let unprefixed_vtable = self.vtable.clone();
         let metadata = self.metadata.clone();
         let announce: AnnounceFn = Arc::new(move |prefix: &str| {
@@ -229,9 +228,9 @@ impl PortDescMsg {
 }
 
 /// Rewrite a dl port's **unprefixed** vtable into its instance-**prefixed** form for
-/// telemetry (dl-open.md §7, telemetry.md §6 — the deferred `into_port_desc` rewrite).
+/// telemetry (telemetry.md §6 — the `into_port_desc` rewrite).
 ///
-/// A static system bakes prefixed component ids via WP7's `announce_of::<F>(prefix)`
+/// A static system bakes prefixed component ids via `announce_of::<F>(prefix)`
 /// (`AsVTable::vtable_fields(prefix)` rolls each leaf id as
 /// `ComponentId::new("<prefix>.<frame>.<field>")`). A dlopen'd system has no static `F`,
 /// so it carries the **unprefixed** vtable + per-component `metadata`; this reconstructs
@@ -288,8 +287,8 @@ fn prefix_announce_vtable(vtable: &VTable, metadata: &[ComponentMetadata], prefi
 }
 
 impl SystemDescriptorMsg {
-    /// Lower a static [`SystemDescriptor`] into the wire mirror (dl-open.md §2.1):
-    /// drop each port's `announce` fn-pointer, carrying its unprefixed `vtable` (on
+    /// Lower a static [`SystemDescriptor`] into the wire mirror: drop each port's
+    /// `announce` fn-pointer, carrying its unprefixed `vtable` (on
     /// the [`PortDesc`]) and the per-port `metadata` supplied positionally
     /// (`input_metadata`/`output_metadata` parallel to `desc.inputs`/`desc.outputs`).
     pub fn lower(
@@ -338,8 +337,8 @@ impl SystemDescriptorMsg {
 // ---------------------------------------------------------------------------
 
 /// The system's [`RingSource`], the twin of the host's `Binder` (binder.rs) over
-/// **host-provided raw regions** rather than pre-allocated `BoundPort`s
-/// (dl-open.md §1.2/§3). `next_output`/`next_input` pop the next [`FswRing`] and
+/// **host-provided raw regions** rather than pre-allocated `BoundPort`s.
+/// `next_output`/`next_input` pop the next [`FswRing`] and
 /// [`attach_raw`](RingBuffer::attach_raw) it, with the identical positional walk
 /// (`descriptors()` order). Cyclic ⇒ every wake endpoint is [`NoWake`], so the
 /// generic `WD`/`WS` are default-constructed.
@@ -403,10 +402,10 @@ impl<'a> RingSource for RawBinder<'a> {
 }
 
 // ---------------------------------------------------------------------------
-// The opaque state + the generic export helpers (dl-open.md §2.2/§3)
+// The opaque state + the generic export helpers
 // ---------------------------------------------------------------------------
 
-/// The opaque state the lifecycle threads (dl-open.md §2.2), boxed by [`run_create`]
+/// The opaque state the lifecycle threads, boxed by [`run_create`]
 /// and dropped by [`run_destroy`]. `pending` holds the constructed system until
 /// [`run_bind_init`] binds its bundles and grows the verbatim host
 /// [`CyclicRunner`] — type-erased to [`CyclicSlot`] so `run_execute`/`run_shutdown`
@@ -419,7 +418,7 @@ struct AbiState<S> {
 }
 
 /// `fsw_create`: postcard-decode `S::Params`, construct the system via
-/// [`BuildSystem::new`], and box the (unbound) [`AbiState`] (dl-open.md §2.2).
+/// [`BuildSystem::new`], and box the (unbound) [`AbiState`].
 /// Returns a null pointer if decoding or construction panics — no unwind escapes.
 ///
 /// # Safety
@@ -452,8 +451,8 @@ where
 
 /// `fsw_bind_init`: reconstruct the typed bundles from the [`FswRing`] arrays via a
 /// [`RawBinder`] (the positional `descriptors()` walk over `attach_raw`), assemble the
-/// verbatim [`CyclicRunner`], and run `System::init` (dl-open.md §2.2/§3 — bind+init
-/// are fused). A caught panic leaves `runner` unbound, so [`run_execute`] reports
+/// verbatim [`CyclicRunner`], and run `System::init` (bind and init are fused). A
+/// caught panic leaves `runner` unbound, so [`run_execute`] reports
 /// [`FswStatus::Panicked`].
 ///
 /// # Safety
@@ -505,7 +504,7 @@ pub unsafe fn run_bind_init<S, O>(
 }
 
 /// `fsw_execute`: run one cyclic `step` (the verbatim lapped→hard-stop / timing /
-/// health logic, dl-open.md §2.2) and return the mapped [`FswStatus`]. The `now`
+/// health logic) and return the mapped [`FswStatus`]. The `now`
 /// word carries the coordinator's raw [`Timestamp`] tick (see the module note on the
 /// ABI timestamp). A caught `execute` panic latches `poisoned` and returns
 /// [`FswStatus::Panicked`]; an unbound/poisoned state returns it too.
@@ -541,8 +540,8 @@ where
     }
 }
 
-/// `fsw_shutdown`: run `System::shutdown` once (dl-open.md §2.2). A panic is caught
-/// and swallowed; a poisoned/unbound state is a no-op.
+/// `fsw_shutdown`: run `System::shutdown` once. A panic is caught and swallowed; a
+/// poisoned/unbound state is a no-op.
 ///
 /// # Safety
 /// `state` is a live pointer from [`run_create`] for this `S`.
@@ -564,7 +563,7 @@ where
 }
 
 /// `fsw_destroy`: drop the boxed state inside the `.so` (running `S::drop` and every
-/// `RawBacking` port's `Drop`, dl-open.md §2.2/§2.5). Idempotent on null.
+/// `RawBacking` port's `Drop`). Idempotent on null.
 ///
 /// # Safety
 /// `state` is a live pointer from [`run_create`] for this `S`, not used afterward.
@@ -583,7 +582,7 @@ where
 
 /// `fsw_describe`: lower this system's static [`SystemDescriptor`] (plus its `Params`
 /// schema and each port's unprefixed metadata) to a [`SystemDescriptorMsg`],
-/// postcard-encode it, and hand the bytes to the host [`ByteSink`] (dl-open.md §2.1).
+/// postcard-encode it, and hand the bytes to the host [`ByteSink`].
 /// Per-port metadata is derived by calling each `PortDesc::announce` with the **empty**
 /// prefix (`PathHasher` skips an empty segment, so this yields the unprefixed
 /// vtable+metadata). Returns `0` on success, `-1` if anything panics.

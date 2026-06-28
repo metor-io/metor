@@ -1,8 +1,7 @@
 //! The `Wiring` data model — the single source of truth for a mission, independent
-//! of any text format (dl-open.md §6.1).
+//! of any text format.
 //!
-//! Today's seam: KDL used to *be* the model — `wiring.rs` parsed a document straight
-//! into `CoordinatorBuilder` calls. Wave 3a inserts this missing middle layer: a
+//! This is the middle layer between a mission's front-ends and the coordinator: a
 //! plain, serializable Rust description that **both** front-ends produce (the KDL
 //! deserializer in [`parse`](super::parse) and the [`WiringBuilder`](super::WiringBuilder))
 //! and that the one shared [`resolve`](super::resolve) consumes. Anything KDL can
@@ -20,8 +19,8 @@ use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
-/// The authoritative description of a wired mission (dl-open.md §6.1): the coordinator
-/// config, the `cdylib` artifacts it loads, the system instances, the edges, and the
+/// The authoritative description of a wired mission: the coordinator config, the
+/// `cdylib` artifacts it loads, the system instances, the edges, and the
 /// optional telemetry downlink. Produced by [`parse`](super::parse) (from KDL) or
 /// [`WiringBuilder`](super::WiringBuilder) (from Rust); consumed by
 /// [`resolve`](super::resolve).
@@ -34,14 +33,14 @@ pub struct Wiring {
     /// The system instances, static (resolved in the [`Registry`](super::Registry)) or
     /// dl (loaded from an [`Artifact`]).
     pub systems: Vec<SystemSpec>,
-    /// The producer → consumer edges (the old `wiring.rs` `Edge`, lifted to data).
+    /// The producer → consumer edges.
     pub edges: Vec<EdgeSpec>,
     /// The telemetry downlink, if any.
     pub telemetry: Option<TelemetrySpec>,
 }
 
 /// Coordinator-wide configuration, the serializable mirror of
-/// [`CoordinatorConfig`](crate::CoordinatorConfig) (dl-open.md §6.1).
+/// [`CoordinatorConfig`](crate::CoordinatorConfig).
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct CoordinatorSpec {
     /// The global cycle rate (Hz) the loop holds under a [`ClockSpec::Wall`] clock.
@@ -55,7 +54,7 @@ pub struct CoordinatorSpec {
 
 /// Which clock drives the run loop — the serializable mirror of
 /// [`ClockMode`](crate::ClockMode), holding a plain `f64` seconds instead of a
-/// `Duration` so the model carries no runtime type (dl-open.md §6.1).
+/// `Duration` so the model carries no runtime type.
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 pub enum ClockSpec {
     /// Wall-clock time, paced to `cycle_rate`.
@@ -67,9 +66,9 @@ pub enum ClockSpec {
     },
 }
 
-/// A loadable shared object: "which `.so` + what crate it comes from" (dl-open.md
-/// §6.1). One system type per cdylib (the fixed `fsw_*` symbols, §3.0); multiple
-/// [`SystemSpec`]s may reference one `Artifact` to instance that type more than once
+/// A loadable shared object: "which `.so` + what crate it comes from". One system
+/// type per cdylib (the fixed `fsw_*` symbols); multiple [`SystemSpec`]s may
+/// reference one `Artifact` to instance that type more than once
 /// (the loader `dlopen`s once and `fsw_create`s per instance).
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Artifact {
@@ -86,7 +85,7 @@ pub struct Artifact {
     pub path: Option<PathBuf>,
 }
 
-/// One system instance (dl-open.md §6.1). `artifact = None` ⇒ resolve in the static
+/// One system instance. `artifact = None` ⇒ resolve in the static
 /// [`Registry`](super::Registry); `Some(id)` ⇒ `dlopen` that [`Artifact`].
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct SystemSpec {
@@ -96,12 +95,12 @@ pub struct SystemSpec {
     pub ty: String,
     /// `Some(artifact_id)` ⇒ a dlopen'd system; `None` ⇒ a statically-linked one.
     pub artifact: Option<String>,
-    /// Where this system's params come from (dl-open.md §6.3) — see [`ParamSource`].
+    /// Where this system's params come from — see [`ParamSource`].
     pub params: ParamSource,
 }
 
-/// Where a [`SystemSpec`]'s params come from — made explicit so the three cases no
-/// longer overload one `Vec<u8>` (dl-open.md §6.3, the one-postcard-encoding decision).
+/// Where a [`SystemSpec`]'s params come from — an explicit enum so the three cases
+/// do not overload one `Vec<u8>` (the one-postcard-encoding decision).
 ///
 /// At [`resolve`](super::resolve) each variant becomes the canonical postcard `Params`
 /// bytes that cross `fsw_create` (dl) or the KDL node a `FromKdlNode` factory re-parses
@@ -115,8 +114,8 @@ pub struct SystemSpec {
 /// - [`Kdl`](ParamSource::Kdl) — the **KDL `system` node's source text**, carried verbatim
 ///   so [`resolve`](super::resolve) can re-decode it: a **static** system re-parses it via
 ///   [`FromKdlNode`](super::FromKdlNode) (the host links its `Params`); a **dl** system
-///   schema-encodes it against the `.so`'s exported `Params` schema (Wave 3b — the host
-///   stays schema-agnostic), producing the **same** bytes the [`Postcard`](ParamSource::Postcard)
+///   schema-encodes it against the `.so`'s exported `Params` schema (the host stays
+///   schema-agnostic), producing the **same** bytes the [`Postcard`](ParamSource::Postcard)
 ///   path produces. Which decoder runs is chosen by [`SystemSpec::artifact`], not by the variant.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum ParamSource {
@@ -136,8 +135,7 @@ impl ParamSource {
     }
 }
 
-/// One producer → consumer edge, the serializable mirror of the old `wiring.rs` `Edge`
-/// (dl-open.md §6.1).
+/// One producer → consumer edge.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct EdgeSpec {
     /// Producer instance name.
@@ -153,8 +151,8 @@ pub struct EdgeSpec {
 }
 
 /// The telemetry downlink, the serializable mirror of
-/// [`TelemetryConfig`](crate::TelemetryConfig) (v1: TCP only) plus its
-/// [`TelemetryMode`](crate::TelemetryMode) (dl-open.md §6.1).
+/// [`TelemetryConfig`](crate::TelemetryConfig) (TCP only) plus its
+/// [`TelemetryMode`](crate::TelemetryMode).
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct TelemetrySpec {
     /// The TCP downlink address.

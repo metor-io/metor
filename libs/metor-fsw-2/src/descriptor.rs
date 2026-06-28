@@ -2,9 +2,9 @@
 //! §5): the per-port [`PortDesc`], the [`SystemDescriptor`] bundle, and the
 //! producer/consumer [`compatible`] check.
 //!
-//! Everything here is derived from the frame metadata WP2/WP3 already provide —
-//! `F::FRAME_ID`, `F::as_vtable()`, `F::MAX_SIZE` — so a system can be sized,
-//! allocated, and wiring-validated without constructing it.
+//! Everything here is derived from a frame's metadata — `F::FRAME_ID`,
+//! `F::as_vtable()`, `F::MAX_SIZE` — so a system can be sized, allocated, and
+//! wiring-validated without constructing it.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -22,8 +22,8 @@ pub type Hz = f64;
 
 /// The type-erased prefix factory stored on [`PortDesc::announce`]: given an instance
 /// name it returns the prefixed announce vtable + component metadata. An [`Arc`] boxed
-/// closure (not a bare `fn`) so a future dlopen'd port — which has no static `F` — can
-/// carry a closure capturing its metadata-derived prefix rewrite (dl-open.md §7).
+/// closure (not a bare `fn`) so a dlopen'd port — which has no static `F` — can
+/// carry a closure capturing its metadata-derived prefix rewrite.
 pub type AnnounceFn = Arc<dyn Fn(&str) -> (VTable, Vec<ComponentMetadata>) + Send + Sync>;
 
 /// One port's static shape: the frame identity, its vtable (the authoritative
@@ -55,9 +55,9 @@ pub struct PortDesc {
     /// `Metadatatize::metadata(prefix)`). The coordinator calls it once per buffer at
     /// `build()` and stores the result as the registry entry's canonical external schema.
     /// `F` is gone by build time (everything is `PortDesc`-erased), which is why this is
-    /// type-erased — and it is an [`Arc`] boxed closure (not a bare `fn`) so a future
+    /// type-erased — and it is an [`Arc`] boxed closure (not a bare `fn`) so a
     /// dlopen'd port, which has no static `F`, can carry a closure capturing its
-    /// metadata-derived prefix rewrite instead (dl-open.md §7, Q-announce).
+    /// metadata-derived prefix rewrite instead.
     pub announce: AnnounceFn,
 }
 
@@ -109,8 +109,8 @@ impl PortDesc {
     }
 }
 
-/// How the coordinator drives a system. Carried on the descriptor as metadata for
-/// WP5; the trait a user implements ([`CyclicSystem`](crate::CyclicSystem) vs
+/// How the coordinator drives a system. Carried on the descriptor as metadata; the
+/// trait a user implements ([`CyclicSystem`](crate::CyclicSystem) vs
 /// [`AsyncSystem`](crate::AsyncSystem)) is the real distinction.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, serde::Serialize, serde::Deserialize)]
 pub enum SystemKind {
@@ -134,7 +134,7 @@ pub struct SystemDescriptor {
 fn realize_set(vtable: &VTable) -> HashMap<ComponentId, (PrimType, Vec<usize>)> {
     let mut set = HashMap::new();
     // Registration mode (`table = None`): every component, including dynamic member
-    // templates, is surfaced with its ty/shape (the WP2 `test_dynamic_registration_mode`
+    // templates, is surfaced with its ty/shape (the dynamic-registration-mode
     // contract). Malformed fields are skipped — a real frame's vtable never errors here.
     for field in vtable.realize_fields(None).flatten() {
         set.insert(field.component_id, (field.ty, field.shape.to_vec()));

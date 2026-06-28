@@ -1,6 +1,6 @@
-//! Work-Package 6 — the KDL wiring front-end (wiring.md).
+//! The KDL wiring front-end (wiring.md).
 //!
-//! A pure front-end onto the landed WP5 [`CoordinatorBuilder`]: it parses a KDL
+//! A pure front-end onto the [`CoordinatorBuilder`]: it parses a KDL
 //! document, instantiates each `system` from an app-built [`Registry`], resolves
 //! each `connect` edge to a [`PortRef`](crate::PortRef), and `build()`s a
 //! [`Coordinator`]. No coordinator logic lives here — every error surfaced is a
@@ -49,9 +49,9 @@ use crate::dl::{DlError, DlSystem};
 use crate::system::{AsyncSystem, BuildSystem, CyclicSystem, Out, SystemOutput};
 use crate::telemetry::{TcpTransport, TelemetryConfig, TelemetryMode};
 
-// Wave 3a (dl-open.md §6): the `Wiring` data model, the Rust builder, and the cargo
-// build driver. KDL is now *one* deserializer onto `Wiring` (see `parse`/`resolve`
-// below); the builder is the other; one shared `resolve` consumes either.
+// The `Wiring` data model, the Rust builder, and the cargo build driver. KDL is *one*
+// deserializer onto `Wiring` (see `parse`/`resolve` below); the builder is the other;
+// one shared `resolve` consumes either.
 mod build_driver;
 mod builder;
 mod model;
@@ -205,7 +205,7 @@ pub enum LoadError {
         span: SourceSpan,
     },
 
-    // --- Wave 3a: dl-open resolution (dl-open.md §6) ---------------------------
+    // --- dl-open resolution -------------------------------------------------
     #[error("system `{system}` references unknown artifact `{artifact}`")]
     #[diagnostic(code(fsw_wiring::unknown_artifact))]
     UnknownArtifact {
@@ -243,7 +243,7 @@ pub enum LoadError {
     },
 
     /// A dl system's KDL property has no matching field in the `.so`'s exported `Params`
-    /// schema — a typo or a stale config (dl-open.md §6.3, the schema-guided encoder).
+    /// schema — a typo or a stale config (the schema-guided encoder).
     #[error("dl system `{system}` has an unknown param `{property}` (not in its `Params` schema)")]
     #[diagnostic(code(fsw_wiring::dl_unknown_param))]
     DlUnknownParam {
@@ -256,7 +256,7 @@ pub enum LoadError {
     },
 
     /// A dl system's `Params` schema field has no corresponding KDL property, and the
-    /// field is not an `Option` (so it has no default) — dl-open.md §6.3.
+    /// field is not an `Option` (so it has no default).
     #[error("dl system `{system}` is missing required param `{property}` (a `Params` schema field)")]
     #[diagnostic(code(fsw_wiring::dl_missing_param))]
     DlMissingParam {
@@ -269,7 +269,7 @@ pub enum LoadError {
     },
 
     /// A dl system's KDL property value does not match its `Params` schema field type
-    /// (e.g. a string where the schema wants an integer) — dl-open.md §6.3.
+    /// (e.g. a string where the schema wants an integer).
     #[error(
         "dl system `{system}` param `{property}` has the wrong type: expected {expected} \
          (per the `Params` schema)"
@@ -286,7 +286,7 @@ pub enum LoadError {
     },
 
     /// The dl system's `Params` schema could not be encoded from its KDL config (an
-    /// unsupported schema shape, or the dynamic encoder rejected the value) — dl-open.md §6.3.
+    /// unsupported schema shape, or the dynamic encoder rejected the value).
     #[error("dl system `{system}` params could not be schema-encoded: {reason}")]
     #[diagnostic(code(fsw_wiring::dl_param_encode))]
     DlParamEncode {
@@ -443,14 +443,14 @@ pub type SystemFactory = fn(&mut LoadCtx) -> Result<(SystemHandle, SystemDescrip
 /// The KDL static-registry construction contract (wiring.md §2.3): a
 /// [`BuildSystem`](crate::BuildSystem) whose `Params` is [`FromKdlNode`]-parseable.
 ///
-/// Wave 3a (dl-open.md §3.0) split construction in two: the format-independent
-/// [`BuildSystem`] (`type Params` + `fn new`, in `system.rs`, with **no** kdl coupling
-/// — what `export_system!`/the dlopen ABI need) and this thin extension that *only*
-/// adds the `Params: FromKdlNode` bound the static factory needs. It is a **blanket
-/// marker**: every `BuildSystem` with a `FromKdlNode` `Params` is automatically a
-/// `RegisteredSystem`, so a statically-linked system registers exactly as before
-/// (it impls [`BuildSystem`], not this) — while a dl-only system needs no `FromKdlNode`
-/// impl at all (dl-open.md §6.3).
+/// Construction is split in two: the format-independent [`BuildSystem`]
+/// (`type Params` + `fn new`, in `system.rs`, with **no** kdl coupling — what
+/// `export_system!`/the dlopen ABI need) and this thin extension that *only* adds the
+/// `Params: FromKdlNode` bound the static factory needs. It is a **blanket marker**:
+/// every `BuildSystem` with a `FromKdlNode` `Params` is automatically a
+/// `RegisteredSystem`, so a statically-linked system registers by impl'ing
+/// [`BuildSystem`] (not this) — while a dl-only system needs no `FromKdlNode` impl
+/// at all.
 pub trait RegisteredSystem: BuildSystem
 where
     <Self as BuildSystem>::Params: FromKdlNode,
@@ -509,8 +509,7 @@ where
 /// The factory `Registry::register::<S, _>` stores: the whole "params → `new` →
 /// `add_*_named`" dance for one concrete type, erased to a plain `fn` pointer. Bounded
 /// on the kdl-independent [`BuildSystem`](crate::BuildSystem) plus the `FromKdlNode`
-/// `Params` the static path needs (i.e. exactly [`RegisteredSystem`]'s premises —
-/// dl-open.md §3.0).
+/// `Params` the static path needs (i.e. exactly [`RegisteredSystem`]'s premises).
 fn factory<S, K>(ctx: &mut LoadCtx) -> Result<(SystemHandle, SystemDescriptor), LoadError>
 where
     S: BuildSystem + AddToBuilder<K>,
@@ -589,29 +588,28 @@ struct Edge {
 /// Parse a KDL wiring document, instantiate every system from `registry`, connect
 /// the edges, and return a built [`Coordinator`] ready to `run` (wiring.md §5.1).
 ///
-/// Wave 3a (dl-open.md §6.3) re-expresses this as the two-stage
-/// `KDL ──[`parse`]──▶ Wiring ──[`resolve`]──▶ Coordinator`, so the data model is the
-/// single source of truth and the Rust [`WiringBuilder`] is an equivalent front-end.
-/// The public entry point and its behavior are unchanged.
+/// This is the two-stage `KDL ──[`parse`]──▶ Wiring ──[`resolve`]──▶ Coordinator`, so
+/// the [`Wiring`] data model is the single source of truth and the Rust
+/// [`WiringBuilder`] is an equivalent front-end.
 pub fn load(kdl: &str, registry: &Registry) -> Result<Coordinator, LoadError> {
     let wiring = parse(kdl)?;
     resolve(&wiring, registry)
 }
 
-/// Deserialize a KDL wiring document into the [`Wiring`] data model (dl-open.md §6.3)
-/// — one of the two front-ends onto `Wiring` (the other is [`WiringBuilder`]).
+/// Deserialize a KDL wiring document into the [`Wiring`] data model — one of the two
+/// front-ends onto `Wiring` (the other is [`WiringBuilder`]).
 ///
 /// This is **parse only**: it touches no [`Registry`], `dlopen`s nothing, and does not
-/// validate the graph — those are [`resolve`]'s job. It carries the existing
-/// `coordinator`/`system`/`connect`/`telemetry` surface and adds the Wave 3a
-/// `artifact` node + per-`system` `lib=` reference.
+/// validate the graph — those are [`resolve`]'s job. It carries the
+/// `coordinator`/`system`/`connect`/`telemetry` surface plus the `artifact` node +
+/// per-`system` `lib=` reference for dl systems.
 ///
 /// **Params** (for either kind) are carried as the KDL `system` node's source text in
 /// [`ParamSource::Kdl`] when the node has config properties; a config-less system carries
 /// [`ParamSource::None`]. The decoder is chosen at [`resolve`] time by
-/// [`SystemSpec::artifact`]: a **static** system re-parses the text via `FromKdlNode`
-/// (behavior-identical to WP6); a **dl** system schema-encodes it against the `.so`'s
-/// exported `Params` schema (Wave 3b — dl-open.md §6.3), so KDL ≡ the Rust builder on the wire.
+/// [`SystemSpec::artifact`]: a **static** system re-parses the text via `FromKdlNode`;
+/// a **dl** system schema-encodes it against the `.so`'s exported `Params` schema, so
+/// KDL ≡ the Rust builder on the wire.
 pub fn parse(kdl: &str) -> Result<Wiring, LoadError> {
     let doc = kdl.parse::<KdlDocument>().map_err(|source| LoadError::Parse {
         source,
@@ -621,7 +619,7 @@ pub fn parse(kdl: &str) -> Result<Wiring, LoadError> {
 
     let coordinator = parse_coordinator(&doc, kdl)?;
 
-    // --- Artifacts pass (dl-open.md §6.3) --------------------------------
+    // --- Artifacts pass --------------------------------------------------
     let mut artifacts: Vec<Artifact> = Vec::new();
     for node in doc.nodes() {
         if node.name().value() != "artifact" {
@@ -630,7 +628,7 @@ pub fn parse(kdl: &str) -> Result<Wiring, LoadError> {
         artifacts.push(parse_artifact(node, kdl)?);
     }
 
-    // --- Systems pass (wiring.md §2; dl `lib=` per dl-open.md §6.3) -------
+    // --- Systems pass (wiring.md §2; dl systems carry a `lib=` ref) ------
     let mut systems: Vec<SystemSpec> = Vec::new();
     let mut seen: HashSet<String> = HashSet::new();
     for node in doc.nodes() {
@@ -676,17 +674,15 @@ pub fn parse(kdl: &str) -> Result<Wiring, LoadError> {
 }
 
 /// Walk a [`Wiring`] and produce a built [`Coordinator`] — the **one shared resolver**
-/// both front-ends feed (dl-open.md §6.3, §4.3). For each system: a static one
-/// (`artifact = None`) is instantiated through the [`Registry`] factory (the WP6 path,
-/// unchanged); a dl one is `DlSystem::open`'d from its [`Artifact::path`] and added via
-/// [`CoordinatorBuilder::add_dl_cyclic`]. Then the edges are connected, telemetry is
-/// added, and the graph is `build()`'d — the validation/sizing/telemetry passes are all
-/// reuse, identical for static and dl systems.
+/// both front-ends feed. For each system: a static one (`artifact = None`) is
+/// instantiated through the [`Registry`] factory; a dl one is `DlSystem::open`'d from
+/// its [`Artifact::path`] and added via [`CoordinatorBuilder::add_dl_cyclic`]. Then the
+/// edges are connected, telemetry is added, and the graph is `build()`'d — the
+/// validation/sizing/telemetry passes are shared, identical for static and dl systems.
 ///
 /// Because a [`Wiring`] is format-independent, resolve-time [`LoadError`]s carry a
 /// best-effort source snippet rather than the original document spans (a builder-origin
-/// `Wiring` has no text at all); the error *variants* are unchanged, so callers (and the
-/// WP6 tests) see the same outcomes.
+/// `Wiring` has no text at all); the error *variants* are the same either way.
 pub fn resolve(wiring: &Wiring, registry: &Registry) -> Result<Coordinator, LoadError> {
     let config = coordinator_config(&wiring.coordinator);
     let mut builder = Coordinator::builder(config);
@@ -738,7 +734,7 @@ pub fn resolve(wiring: &Wiring, registry: &Registry) -> Result<Coordinator, Load
 /// Instantiate a **static** system through the [`Registry`] factory. The factory parses
 /// params via `FromKdlNode`, so we reconstruct a [`KdlNode`] from the spec: a config-less
 /// system synthesizes a minimal node; a params-bearing one re-parses the KDL source text
-/// the parse stage stored in [`SystemSpec::params`] (dl-open.md §6.3).
+/// the parse stage stored in [`SystemSpec::params`].
 fn resolve_static(
     spec: &SystemSpec,
     registry: &Registry,
@@ -755,7 +751,7 @@ fn resolve_static(
     // Reconstruct the node the `FromKdlNode` factory reads its params off. A config-less
     // ([`ParamSource::None`]) or builder-origin ([`ParamSource::Postcard`]) static system
     // synthesizes a minimal node (the static path is `FromKdlNode`-shaped, not postcard);
-    // a KDL-config static system re-parses its carried node source text (dl-open.md §6.3).
+    // a KDL-config static system re-parses its carried node source text.
     let minimal = || format!("system \"{}\" type=\"{}\"", spec.name, spec.ty);
     let node_src = match &spec.params {
         ParamSource::None | ParamSource::Postcard(_) => minimal(),
@@ -780,8 +776,8 @@ fn resolve_static(
 
 /// Load a **dl** system: find its [`Artifact`], `DlSystem::open` the resolved `.so`,
 /// resolve its [`ParamSource`] into the canonical postcard `Params` bytes, and register it
-/// via [`CoordinatorBuilder::add_dl_cyclic`] (dl-open.md §4.3/§6.3). The reconstructed
-/// descriptor is returned for edge validation.
+/// via [`CoordinatorBuilder::add_dl_cyclic`]. The reconstructed descriptor is returned
+/// for edge validation.
 ///
 /// The `.so` is opened **once** and reused for both the params encode (its exported
 /// `Params` schema, [`DlSystem::params_schema`]) and the bound slot — never opened twice.
@@ -816,8 +812,8 @@ fn resolve_dl(
         span,
     })?;
     // Resolve the params to canonical postcard bytes. `Kdl` is schema-encoded against the
-    // `.so`'s exported `Params` schema (the host never links `Params` — dl-open.md §6.3),
-    // producing the SAME bytes the typed `WiringBuilder::params` (`Postcard`) produces.
+    // `.so`'s exported `Params` schema (the host never links `Params`), producing the
+    // SAME bytes the typed `WiringBuilder::params` (`Postcard`) produces.
     let params: Vec<u8> = match &spec.params {
         ParamSource::None => Vec::new(),
         ParamSource::Postcard(bytes) => bytes.clone(),
@@ -837,8 +833,8 @@ fn system_src(spec: &SystemSpec) -> String {
 }
 
 /// Encode a dl system's KDL `system`-node config into the canonical postcard `Params`
-/// bytes, **guided by the `.so`'s exported `Params` schema** (dl-open.md §6.3, the
-/// one-postcard-encoding decision). The host never links the system's `Params` type: it
+/// bytes, **guided by the `.so`'s exported `Params` schema** (the one-postcard-encoding
+/// decision). The host never links the system's `Params` type: it
 /// walks the schema's named fields, pulls the matching KDL property for each, coerces it
 /// to the field's type, builds a dynamic [`serde_json::Value`], and hands it to
 /// [`postcard_dyn::to_stdvec_dyn`] — which produces the **same bytes** the typed Rust
@@ -918,7 +914,7 @@ pub fn encode_kdl_params(
                 obj.insert(field.name.clone(), json);
             }
             // An `Option` field with no property is `None` (encoded as the null byte); any
-            // other absent field is a hard miss (the schema has no defaults — dl-open.md §6.3).
+            // other absent field is a hard miss (the schema has no defaults).
             None if matches!(field.ty.ty, OwnedDataModelType::Option(_)) => {
                 obj.insert(field.name.clone(), Value::Null);
             }
@@ -996,7 +992,7 @@ fn edge_src(edge: &EdgeSpec) -> String {
 }
 
 /// Convert the serializable [`CoordinatorSpec`] into the runtime
-/// [`CoordinatorConfig`] (the data-model → runtime boundary, dl-open.md §6.1).
+/// [`CoordinatorConfig`] (the data-model → runtime boundary).
 fn coordinator_config(spec: &CoordinatorSpec) -> CoordinatorConfig {
     let mut config = CoordinatorConfig {
         cycle_rate: spec.cycle_rate,
@@ -1026,7 +1022,7 @@ fn mode_from_spec(mode: &TelemetryModeSpec) -> TelemetryMode {
 }
 
 /// Parse one `artifact "id" crate="..." lib="libfoo.so" type="Foo"` node into an
-/// [`Artifact`] (dl-open.md §6.3). `lib=` is the produced cdylib file name.
+/// [`Artifact`]. `lib=` is the produced cdylib file name.
 fn parse_artifact(node: &KdlNode, src: &str) -> Result<Artifact, LoadError> {
     let missing = |property: &'static str| LoadError::MissingArtifactField {
         property,
@@ -1046,9 +1042,9 @@ fn parse_artifact(node: &KdlNode, src: &str) -> Result<Artifact, LoadError> {
     })
 }
 
-/// Parse one `system` node into a [`SystemSpec`] (dl-open.md §6.3). A `lib=` ⇒ a dl
-/// system referencing that [`Artifact`]; otherwise a static system. See [`parse`] for
-/// the static-params / dl-params-deferred handling.
+/// Parse one `system` node into a [`SystemSpec`]. A `lib=` ⇒ a dl system referencing
+/// that [`Artifact`]; otherwise a static system. See [`parse`] for the static-params /
+/// dl-params-deferred handling.
 fn parse_system(
     node: &KdlNode,
     src: &str,
@@ -1077,7 +1073,7 @@ fn parse_system(
     });
     // Both static and dl systems carry the node's source text when configured; the
     // decoder is chosen at `resolve` by `artifact` (static ⇒ `FromKdlNode`, dl ⇒
-    // schema-guided postcard encode — dl-open.md §6.3).
+    // schema-guided postcard encode).
     let params = if has_config {
         ParamSource::Kdl(node.to_string())
     } else {

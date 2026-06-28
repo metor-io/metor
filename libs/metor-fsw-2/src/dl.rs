@@ -1,22 +1,21 @@
-//! The host side of WP8 — the `dlopen` loader (`DlSystem`) and the cyclic slot
-//! (`DlSlot`) that drives a system `.so` across the C ABI (dl-open.md §4).
+//! The host side of the dlopen path — the loader (`DlSystem`) and the cyclic slot
+//! (`DlSlot`) that drives a system `.so` across the C ABI.
 //!
 //! A [`DlSystem`] opens a system `cdylib`, resolves its `fsw_*` symbols by the
 //! [`abi::SYM_*`](crate::abi) constants, checks the ABI word, and `fsw_describe`s
-//! it into a [`SystemDescriptor`] the **existing** wiring/validation/sizing passes
-//! consume unchanged (dl-open.md §4.1) — a dlopen'd system is wiring-validated
-//! exactly like a statically-linked one. [`CoordinatorBuilder::add_dl_cyclic`]
-//! registers it; at `build()` the coordinator allocates and sizes its rings like any
-//! cyclic system and, instead of a typed [`CyclicRunner`](crate::CyclicRunner), binds
-//! a [`DlSlot`] that forwards `init`/`step`/`shutdown` over the ABI by passing the
-//! per-port ring regions as raw [`FswRing`] handles (dl-open.md §4.2).
+//! it into a [`SystemDescriptor`] the wiring/validation/sizing passes consume
+//! unchanged — a dlopen'd system is wiring-validated exactly like a statically-linked
+//! one. [`CoordinatorBuilder::add_dl_cyclic`] registers it; at `build()` the
+//! coordinator allocates and sizes its rings like any cyclic system and, instead of a
+//! typed [`CyclicRunner`](crate::CyclicRunner), binds a [`DlSlot`] that forwards
+//! `init`/`step`/`shutdown` over the ABI by passing the per-port ring regions as raw
+//! [`FswRing`] handles.
 //!
-//! Same-process, cyclic-only per the locked v1 scope (dl-open.md §5, §9): the `.so`
-//! reconstructs each ring over the host's `BoxBacking` region via `attach_raw`, so
-//! there is no copy and no IPC — the system sees the identical atomics the host's
-//! other systems do.
+//! Same-process and cyclic-only: the `.so` reconstructs each ring over the host's
+//! `BoxBacking` region via `attach_raw`, so there is no copy and no IPC — the system
+//! sees the identical atomics the host's other systems do.
 //!
-//! ## Teardown ordering (dl-open.md §2.5) — load-bearing
+//! ## Teardown ordering — load-bearing
 //!
 //! A [`DlSlot`] owns an `Arc<Library>` and the opaque `*mut state`. Its [`Drop`]
 //! calls `fsw_destroy` (dropping the `.so`'s `RawBacking` ports and the user system)
@@ -42,7 +41,7 @@ use crate::coordinator::{CyclicSlot, SlotState, StopReason};
 use crate::descriptor::SystemDescriptor;
 
 // ---------------------------------------------------------------------------
-// Resolved C-ABI function-pointer types (dl-open.md §2)
+// Resolved C-ABI function-pointer types
 // ---------------------------------------------------------------------------
 
 type AbiVersionFn = unsafe extern "C" fn() -> u32;
@@ -57,8 +56,8 @@ type DestroyFn = unsafe extern "C" fn(*mut c_void);
 // Errors
 // ---------------------------------------------------------------------------
 
-/// A failure loading or describing a system `.so` (dl-open.md §4.1). Every variant
-/// is a clean error — a bad artifact never crashes the host.
+/// A failure loading or describing a system `.so`. Every variant is a clean error —
+/// a bad artifact never crashes the host.
 #[derive(Debug, thiserror::Error)]
 pub enum DlError {
     /// `dlopen` failed (missing file, bad object, unresolved symbol at load).
@@ -72,7 +71,7 @@ pub enum DlError {
         source: libloading::Error,
     },
     /// `fsw_abi_version()` did not equal the host's [`FSW_ABI_VERSION`]: the `.so`
-    /// was built against a different ABI and must be rebuilt (dl-open.md §2.4).
+    /// was built against a different ABI and must be rebuilt.
     #[error("ABI version mismatch: .so reports {found}, host expects {expected}")]
     VersionMismatch { found: u32, expected: u32 },
     /// `fsw_describe` returned a non-zero (failure) code.
@@ -88,18 +87,18 @@ pub enum DlError {
 // ---------------------------------------------------------------------------
 
 /// A loaded system `cdylib`: the kept-alive [`Library`], the resolved lifecycle
-/// function pointers, and the reconstructed [`SystemDescriptor`] for wiring
-/// (dl-open.md §4.1). The handle **owns** the `Library` (an `Arc` it shares with the
-/// [`DlSlot`] it builds) so the `.so` outlives every slot and `*mut state`.
+/// function pointers, and the reconstructed [`SystemDescriptor`] for wiring. The
+/// handle **owns** the `Library` (an `Arc` it shares with the [`DlSlot`] it builds)
+/// so the `.so` outlives every slot and `*mut state`.
 ///
 /// Construct with [`DlSystem::open`], hand to
 /// [`CoordinatorBuilder::add_dl_cyclic`](crate::CoordinatorBuilder::add_dl_cyclic).
 pub struct DlSystem {
     lib: Arc<Library>,
     descriptor: SystemDescriptor,
-    /// The `.so`'s exported `Params` schema (dl-open.md §2.1/§6.3), kept so the host can
-    /// schema-encode KDL params **without linking the `Params` type** (Wave 3b). Carried
-    /// on the descriptor mirror; surfaced via [`DlSystem::params_schema`].
+    /// The `.so`'s exported `Params` schema, kept so the host can schema-encode KDL
+    /// params **without linking the `Params` type**. Carried on the descriptor mirror;
+    /// surfaced via [`DlSystem::params_schema`].
     params_schema: OwnedNamedType,
     create: CreateFn,
     bind_init: BindInitFn,
@@ -110,7 +109,7 @@ pub struct DlSystem {
 
 /// The host [`ByteSink`] `fsw_describe` writes its postcard bytes to: append them to
 /// the `Vec<u8>` passed as `ctx`. The `.so` owns the buffer for the call's duration
-/// and frees it itself — the host only copies (dl-open.md §2.1/§2.5, no cross-free).
+/// and frees it itself — the host only copies (no cross-allocator free).
 extern "C" fn collect_sink(ctx: *mut c_void, buf: *const u8, len: usize) {
     // SAFETY: `open` passes `&mut Vec<u8>` as `ctx`; `buf`/`len` is the descriptor
     // buffer the `.so` owns for this call.
@@ -136,7 +135,7 @@ unsafe fn resolve<'lib, T>(
 
 impl DlSystem {
     /// `dlopen` the artifact at `path`, resolve every `fsw_*` symbol, check the ABI
-    /// word, and `fsw_describe` it into a [`SystemDescriptor`] (dl-open.md §4.1).
+    /// word, and `fsw_describe` it into a [`SystemDescriptor`].
     ///
     /// On any failure returns a [`DlError`] (never a crash): a missing/incompatible
     /// artifact is a clean load error.
@@ -145,7 +144,7 @@ impl DlSystem {
         // beyond Rust's, and the path is caller-chosen. There is no safer form.
         let lib = unsafe { Library::new(path) }.map_err(DlError::Open)?;
 
-        // --- ABI word: equality before any other call (dl-open.md §2.4) ----------
+        // --- ABI word: equality before any other call ----------------------------
         let found = {
             // SAFETY: the export is a `fn() -> u32` (the macro's `fsw_abi_version`).
             let f: Symbol<AbiVersionFn> =
@@ -160,9 +159,9 @@ impl DlSystem {
             });
         }
 
-        // --- Describe → postcard → SystemDescriptor (dl-open.md §4.1) ------------
+        // --- Describe → postcard → SystemDescriptor ------------------------------
         // Keep the `Params` schema off the mirror before `into_descriptor` consumes it,
-        // so the host can schema-encode KDL params later (Wave 3b — dl-open.md §6.3).
+        // so the host can schema-encode KDL params later.
         let (descriptor, params_schema) = {
             // SAFETY: the export is the macro's `fsw_describe(sink, ctx) -> i32`.
             let describe: Symbol<DescribeFn> =
@@ -203,17 +202,17 @@ impl DlSystem {
         })
     }
 
-    /// The reconstructed self-description the builder validates wiring against
-    /// (dl-open.md §4.1). Its ports' `announce` closures already prefix the carried
-    /// vtable ids (the dl telemetry rewrite, [`abi`](crate::abi)).
+    /// The reconstructed self-description the builder validates wiring against. Its
+    /// ports' `announce` closures already prefix the carried vtable ids (the dl
+    /// telemetry rewrite, [`abi`](crate::abi)).
     pub fn descriptor(&self) -> &SystemDescriptor {
         &self.descriptor
     }
 
-    /// The `.so`'s exported `Params` schema (dl-open.md §2.1/§6.3). The resolver feeds
-    /// this to [`encode_kdl_params`](crate::wiring::encode_kdl_params) to schema-encode a
+    /// The `.so`'s exported `Params` schema. The resolver feeds this to
+    /// [`encode_kdl_params`](crate::wiring::encode_kdl_params) to schema-encode a
     /// dl system's KDL config into the canonical postcard bytes **without linking the
-    /// `Params` type** — the host stays schema-agnostic (Wave 3b).
+    /// `Params` type** — the host stays schema-agnostic.
     pub fn params_schema(&self) -> &OwnedNamedType {
         &self.params_schema
     }
@@ -221,8 +220,8 @@ impl DlSystem {
     /// Consume the handle into a bound, ready-to-init [`DlSlot`] (called by the
     /// coordinator at `build()`): `fsw_create` the opaque state from the postcard
     /// `params`, and capture the host-built per-port [`FswRing`] arrays the slot hands
-    /// `fsw_bind_init` at `init` (dl-open.md §4.2). The `Arc<Library>` moves into the
-    /// slot, so the `.so` outlives the state.
+    /// `fsw_bind_init` at `init`. The `Arc<Library>` moves into the slot, so the `.so`
+    /// outlives the state.
     ///
     /// # Safety
     /// Every region named by an `FswRing` in `inputs`/`outputs` must satisfy
@@ -261,13 +260,13 @@ impl DlSystem {
 }
 
 // ---------------------------------------------------------------------------
-// DlSlot — the dlopen twin of CyclicRunner's CyclicSlot impl (dl-open.md §4.2)
+// DlSlot — the dlopen twin of CyclicRunner's CyclicSlot impl
 // ---------------------------------------------------------------------------
 
 /// A bound dlopen'd cyclic system the coordinator drives as a `Box<dyn CyclicSlot>`,
 /// indistinguishable from a static [`CyclicRunner`](crate::CyclicRunner) in the
-/// per-cycle loop (dl-open.md §4.2). It forwards `init`/`step`/`shutdown` across the C
-/// ABI: `init` hands the `.so` the per-port [`FswRing`] arrays for `fsw_bind_init`,
+/// per-cycle loop. It forwards `init`/`step`/`shutdown` across the C ABI: `init` hands
+/// the `.so` the per-port [`FswRing`] arrays for `fsw_bind_init`,
 /// `step` calls `fsw_execute` and maps the returned [`FswStatus`] into a tracked
 /// [`SlotState`] (the lapped/panic check lives inside the `.so`, which owns the input
 /// `View`), and `Drop` calls `fsw_destroy` (see the module teardown note).
@@ -296,7 +295,7 @@ pub(crate) struct DlSlot {
 
 impl CyclicSlot for DlSlot {
     /// `fsw_bind_init`: hand the `.so` the per-port ring regions so it reconstructs
-    /// its typed `Input`/`Output` bundles and runs `System::init` (dl-open.md §4.2).
+    /// its typed `Input`/`Output` bundles and runs `System::init`.
     fn init(&mut self) {
         if self.state.is_null() {
             return;
@@ -316,7 +315,7 @@ impl CyclicSlot for DlSlot {
 
     /// `fsw_execute`: run one cycle and fold the returned status into the slot state.
     /// `now` carries the coordinator's **raw `Timestamp` tick** (`now.0 as u64`), the
-    /// unit-agnostic reversible contract — NOT nanoseconds (dl-open.md §3.0).
+    /// unit-agnostic reversible contract — NOT nanoseconds.
     /// `StoppedLapped` and `Panicked` are permanent hard-stops surfaced through the
     /// coordinator status frame (a `Panicked` slot is also telemetered there); once
     /// stopped the slot is never ticked again, mirroring [`CyclicRunner::step`].
@@ -358,7 +357,7 @@ impl CyclicSlot for DlSlot {
 impl Drop for DlSlot {
     /// `fsw_destroy` the state **before** the `Library` unloads (the `Arc<Library>`
     /// field drops after this body) and before the host `RingTable` frees the regions
-    /// (the coordinator drops `cyclic` before `rings`) — dl-open.md §2.5.
+    /// (the coordinator drops `cyclic` before `rings`).
     fn drop(&mut self) {
         if !self.state.is_null() {
             // SAFETY: `state` is the live `fsw_create` pointer, transferred to

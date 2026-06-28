@@ -1,4 +1,4 @@
-//! WP7 acceptance tests (telemetry.md "Tests"): the general output registry queried
+//! Telemetry acceptance tests (telemetry.md "Tests"): the general output registry queried
 //! by instance-qualified id, the telemetry downlink end-to-end against a deterministic
 //! in-memory mock transport (announced prefixed vtables/metadata + `Table` packets),
 //! two-instance prefix disambiguation, subset filtering, and the non-blocking

@@ -1,4 +1,4 @@
-//! WP6 acceptance tests (wiring.md "Tests"): an end-to-end KDL load + run wiring a
+//! Wiring acceptance tests (wiring.md "Tests"): an end-to-end KDL load + run wiring a
 //! params-bearing cyclic chain into an async logger, instance-name disambiguation
 //! of two instances of one system type, the span-carrying error cases, and the
 //! `FromKdlNode` derive round-trip. Systems are tiny but real `CyclicSystem`/
@@ -226,7 +226,7 @@ impl BuildSystem for PickyConsumer {
 
 // ---------------------------------------------------------------------------
 // A loop-closer: consumes `nav`, produces `imu`. With `NavFilter` (imu -> nav)
-// this forms a 2-system feedback cycle, used to exercise the KDL `delayed=` edge.
+// this forms a 2-system feedback cycle that exercises the KDL `delayed=` edge.
 // ---------------------------------------------------------------------------
 
 struct Closer;
@@ -628,10 +628,9 @@ fn from_kdl_node_round_trip_explicit() {
 }
 
 // ---------------------------------------------------------------------------
-// Wave 3a: the Rust `WiringBuilder` and the KDL `parse` are two front-ends onto
-// the same `Wiring` data model (dl-open.md §6.2/§6.3) — they produce byte-equal
-// `Wiring` for a (config-less, static) graph, and resolve to an equivalent
-// running coordinator.
+// The Rust `WiringBuilder` and the KDL `parse` are two front-ends onto the same
+// `Wiring` data model — they produce byte-equal `Wiring` for a (config-less, static)
+// graph, and resolve to an equivalent running coordinator.
 // ---------------------------------------------------------------------------
 
 /// The same graph expressed in Rust, used by both equivalence tests below.
@@ -674,22 +673,22 @@ async fn builder_wiring_resolves_and_runs() {
 }
 
 // ---------------------------------------------------------------------------
-// Wave 3a/3b: a dl system declared in KDL carries its `system`-node config as
-// `ParamSource::Kdl` (Wave 3b schema-encodes it at resolve — dl-open.md §6.3).
-// Resolution of the `.so` itself + the headline KDL≡builder byte-equality is
-// exercised by `tests_abi`/`tests/wiring_resolve.rs` (a real dlopen).
+// A dl system declared in KDL carries its `system`-node config as `ParamSource::Kdl`
+// (schema-encoded at resolve). Resolution of the `.so` itself + the headline
+// KDL≡builder byte-equality is exercised by `tests_abi`/`tests/wiring_resolve.rs`
+// (a real dlopen).
 // ---------------------------------------------------------------------------
 
 #[test]
 fn dl_kdl_params_are_carried_as_kdl_source() {
-    // Wave 3b: KDL params on a `lib=` system are no longer an error — they are carried as
-    // the node source text for the resolve-time schema-guided encoder (dl-open.md §6.3).
+    // KDL params on a `lib=` system are carried as the node source text for the
+    // resolve-time schema-guided encoder.
     let kdl = r#"
 coordinator cycle_rate=100.0
 artifact "plant" crate="adcs-plant" lib="libadcs_plant.dylib" type="Plant"
 system "plant" type="Plant" lib="plant" gain=5.0
 "#;
-    let wiring = parse(kdl).expect("KDL params on a dl system parse (Wave 3b)");
+    let wiring = parse(kdl).expect("KDL params on a dl system parse");
     match &wiring.systems[0].params {
         ParamSource::Kdl(text) => assert!(text.contains("gain=5.0"), "carried node text: {text}"),
         other => panic!("expected ParamSource::Kdl, got {other:?}"),

@@ -1,5 +1,4 @@
-//! The [`WiringBuilder`] — a fluent Rust front-end onto the [`Wiring`] data model
-//! (dl-open.md §6.2).
+//! The [`WiringBuilder`] — a fluent Rust front-end onto the [`Wiring`] data model.
 //!
 //! Everything KDL expresses, Rust expresses, because both produce the same [`Wiring`]:
 //!
@@ -19,8 +18,8 @@
 //!
 //! [`SystemSpecBuilder::params`] postcard-encodes a typed `Params` into the canonical
 //! [`ParamSource::Postcard`] bytes — byte-identical to what the KDL front-end's
-//! schema-guided encoder produces for a dl system (Wave 3b), and what the `.so`'s
-//! `fsw_create` decodes (dl-open.md §6.3). A paramless system gets [`ParamSource::None`].
+//! schema-guided encoder produces for a dl system, and what the `.so`'s `fsw_create`
+//! decodes. A paramless system gets [`ParamSource::None`].
 
 use std::net::SocketAddr;
 
@@ -31,8 +30,8 @@ use super::model::{
     TelemetrySpec, Wiring,
 };
 
-/// Fluent constructor for a [`Wiring`] (dl-open.md §6.2). Start with [`new`](Self::new),
-/// set the coordinator, declare artifacts, add systems (via the per-system
+/// Fluent constructor for a [`Wiring`]. Start with [`new`](Self::new), set the
+/// coordinator, declare artifacts, add systems (via the per-system
 /// [`SystemSpecBuilder`]), wire edges, optionally add telemetry, and [`build`](Self::build).
 pub struct WiringBuilder {
     coordinator: CoordinatorSpec,
@@ -82,7 +81,7 @@ impl WiringBuilder {
         self
     }
 
-    /// Declare a loadable [`Artifact`] (one system type per cdylib — dl-open.md §6.1).
+    /// Declare a loadable [`Artifact`] (one system type per cdylib).
     /// `cdylib` is the produced file name (`libfoo.dylib`/`libfoo.so`/`foo.dll`);
     /// `system_type` is the `type=` this `.so` exports. Its `path` is filled by the
     /// build driver ([`build_artifacts`](super::build_artifacts)).
@@ -191,23 +190,23 @@ impl SystemSpecBuilder {
         self
     }
 
-    /// Resolve this system by `dlopen`'ing the named [`Artifact`] (dl-open.md §6.1).
+    /// Resolve this system by `dlopen`'ing the named [`Artifact`].
     pub fn from_artifact(mut self, artifact_id: impl Into<String>) -> Self {
         self.artifact = Some(artifact_id.into());
         self
     }
 
-    /// Resolve this system statically through the [`Registry`](super::Registry) (the
-    /// WP6 path). The default if neither `from_*` is called.
+    /// Resolve this system statically through the [`Registry`](super::Registry).
+    /// The default if neither `from_*` is called.
     pub fn from_static(mut self) -> Self {
         self.artifact = None;
         self
     }
 
     /// Set the typed params, postcard-encoded into the canonical
-    /// [`ParamSource::Postcard`] bytes (dl-open.md §6.3). For a dl system these are exactly
-    /// the bytes `fsw_create` decodes — **byte-identical** to what the KDL front-end's
-    /// schema-guided encoder produces for the same logical value (Wave 3b). A paramless
+    /// [`ParamSource::Postcard`] bytes. For a dl system these are exactly the bytes
+    /// `fsw_create` decodes — **byte-identical** to what the KDL front-end's
+    /// schema-guided encoder produces for the same logical value. A paramless
     /// system can omit this ([`ParamSource::None`]).
     pub fn params<P: Serialize>(mut self, params: P) -> Self {
         let bytes =

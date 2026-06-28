@@ -2,7 +2,7 @@
 //!
 //! [`Output<F>`] wraps the single ring [`Writer`] a system owns for frame `F`;
 //! [`Input<F>`] wraps a read-only [`View`]. Both are thin: the data path (table
-//! bytes == ring payload) is entirely the landed `FrameWriter`/`View` machinery —
+//! bytes == ring payload) is entirely the `FrameWriter`/`View` machinery —
 //! these add only the frame typing, the latest-wins / every-record drains, and the
 //! zero-copy fixed-region accessor.
 
@@ -84,8 +84,8 @@ where
     /// Bind this output over the next ring the [`RingSource`] hands out, taking the
     /// matched writer-side wake endpoints for that buffer (coordinator.md §1.4). The
     /// source's backing `B` is this port's backing, so a dlopen'd system binds
-    /// `Output<F, RawBacking>` over the host's regions with the same code path
-    /// (dl-open.md §1.2). Walked in `descriptors()` order by the generated bundle `bind`.
+    /// `Output<F, RawBacking>` over the host's regions with the same code path.
+    /// Walked in `descriptors()` order by the generated bundle `bind`.
     pub fn bind<S: RingSource<B = B>>(src: &mut S) -> Self {
         let (ring, data, space) = src.next_output::<WD, WS>();
         Output::new(ring.writer(data, space))
@@ -172,7 +172,7 @@ impl<F: Frame, B: Backing, RD: WakeSink, RS: WakeSource> Input<F, B, RD, RS> {
 
     /// True iff the writer lapped this view (overwrite buffers only). The
     /// coordinator checks this on cyclic systems *before* `execute` (system.md §3.1);
-    /// the stop policy itself is WP5.
+    /// the stop policy itself lives in the coordinator.
     pub fn is_lapped(&self) -> bool {
         self.view.is_lapped()
     }
@@ -192,7 +192,7 @@ where
     /// Bind this input over the next ring the [`RingSource`] hands out, taking the
     /// matched reader-side wake endpoints (coordinator.md §1.4). The reader slot was
     /// reserved at sizing time, so registering the view cannot fail. The source's
-    /// backing `B` is this port's backing (dl-open.md §1.2).
+    /// backing `B` is this port's backing.
     pub fn bind<S: RingSource<B = B>>(src: &mut S) -> Self {
         let (ring, data, space) = src.next_input::<RD, RS>();
         Input::new(
@@ -254,7 +254,7 @@ where
 // ---------------------------------------------------------------------------
 
 /// A typed, zero-copy view of one record's table bytes (system.md §2.3): the fixed
-/// region is read directly as `F`; dynamic members are read with the WP3
+/// region is read directly as `F`; dynamic members are read with the
 /// `ListReader`/`MapReader`; the vtable `apply` is the uniform escape hatch.
 pub struct FrameRef<'a, F> {
     table: &'a [u8],

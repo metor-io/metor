@@ -1,4 +1,4 @@
-//! The `bind` contract that resolves WP4's deferred port construction
+//! The `bind` contract that resolves a system's deferred port construction
 //! (coordinator.md §1.4).
 //!
 //! The build phase pre-allocates one [`RingBuffer`] per port and walks each
@@ -91,12 +91,12 @@ impl<'a> Binder<'a> {
 }
 
 /// Where a bound port's pre-allocated ring comes from, abstracted over the ring
-/// [`Backing`] so one generated bundle `bind` serves both providers (dl-open.md §1.2):
-/// the host's [`Binder`] (`B = BoxBacking`, over the coordinator's pre-allocated
-/// [`BoundPort`]s) and — in a future WP — a `RawBinder` (`B = RawBacking`, over the
-/// host's raw regions). The positional contract is unchanged: `bind` pops one ring per
-/// port via [`next_output`](Self::next_output)/[`next_input`](Self::next_input) in
-/// `descriptors()` order.
+/// [`Backing`] so one generated bundle `bind` serves both providers: the host's
+/// [`Binder`] (`B = BoxBacking`, over the coordinator's pre-allocated [`BoundPort`]s)
+/// and a dlopen'd system's [`RawBinder`](crate::abi::RawBinder) (`B = RawBacking`, over
+/// the host's raw regions). The positional contract is the same for both: `bind` pops
+/// one ring per port via [`next_output`](Self::next_output)/[`next_input`](Self::next_input)
+/// in `descriptors()` order.
 pub trait RingSource {
     /// The ring backing this source hands out.
     type B: Backing;
@@ -173,7 +173,7 @@ impl<'a> RingSource for Binder<'a> {
 /// the framework [`Out`](crate::Out) wrapper) constructible from a [`RingSource`] over
 /// the ring backing `B`. The derives generate this symmetrically to `descriptors()`;
 /// a host bundle is `BindPorts<BoxBacking>`, a `Backing`-generic bundle is
-/// `BindPorts<B>` for all `B` (dl-open.md §1.2).
+/// `BindPorts<B>` for all `B`.
 pub trait BindPorts<B: Backing>: Sized {
     /// Construct every port from the ring source, in `descriptors()` order.
     fn bind<S: RingSource<B = B>>(src: &mut S) -> Self;

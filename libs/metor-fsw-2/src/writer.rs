@@ -5,7 +5,7 @@
 //! written first (slots zeroed), then each dynamic field appends its element block
 //! to the trailer — 8-byte aligned, reusing the ring's [`round_up8`] alignment — and
 //! patches its slot `{ trailer_off, byte_len }`. All trailer offsets are
-//! table-absolute (relative to the fixed-region start), matching the landed
+//! table-absolute (relative to the fixed-region start), matching the
 //! one-global-trailer invariant.
 
 use core::marker::PhantomData;

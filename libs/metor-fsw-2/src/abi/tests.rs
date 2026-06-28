@@ -1,8 +1,8 @@
-//! WP8 Wave 2 acceptance tests (dl-open.md §2/§3): the generated `export_system!`
-//! C-ABI exercised **in-process, without dlopen/libloading** (W2b is the host
-//! loader). A direct in-crate call of the generated `#[unsafe(no_mangle)]` `fsw_*`
-//! functions proves the macro + `RawBinder` + `attach_raw` + the verbatim
-//! `CyclicRunner<…, RawBacking>` + the descriptor serialization all compose.
+//! ABI acceptance tests: the generated `export_system!` C-ABI exercised
+//! **in-process, without dlopen/libloading**. A direct in-crate call of the generated
+//! `#[unsafe(no_mangle)]` `fsw_*` functions proves the macro + `RawBinder` +
+//! `attach_raw` + the verbatim `CyclicRunner<…, RawBacking>` + the descriptor
+//! serialization all compose.
 //!
 //! The host side is emulated by hand: it allocates `RingBuffer<BoxBacking>`s, hands
 //! the system their `(base, len, role)` as `FswRing`s, and reads results back through
@@ -54,7 +54,7 @@ struct TickOut {
 }
 
 /// A real `Params` struct: `Serialize + Deserialize + Schema` (the postcard params
-/// contract) plus the WP6 `FromKdlNode` the `RegisteredSystem` construction needs.
+/// contract) plus the `FromKdlNode` the `RegisteredSystem` construction needs.
 #[derive(Serialize, Deserialize, Schema, Clone, Default, Debug, PartialEq)]
 struct CounterParams {
     start: u64,
@@ -246,8 +246,8 @@ fn abi_describe_round_trips() {
 }
 
 // ---------------------------------------------------------------------------
-// 3b. Telemetry-prefix rewrite (dl-open.md §7, D): a dl output's `announce(prefix)`
-//     yields instance-prefixed *vtable* ids, matching a static system's WP7 announce.
+// 3b. Telemetry-prefix rewrite: a dl output's `announce(prefix)` yields
+//     instance-prefixed *vtable* ids, matching a static system's announce.
 // ---------------------------------------------------------------------------
 
 /// Every component id a vtable realizes (registration mode), for asserting which ids
@@ -273,7 +273,7 @@ fn dl_announce_prefixes_vtable_ids() {
     let port = &rebuilt.outputs[0];
     let (vtable, metadata) = (port.announce)("inst");
 
-    // The metadata ids are prefixed (the always-worked half).
+    // The metadata ids are prefixed.
     assert!(
         metadata
             .iter()
@@ -281,9 +281,9 @@ fn dl_announce_prefixes_vtable_ids() {
         "metadata id is instance-prefixed"
     );
 
-    // The vtable's *baked* leaf id is now prefixed too (the deferred W2b rewrite): it
+    // The vtable's *baked* leaf id is prefixed too (the metadata-driven id rewrite): it
     // matches what a static system bakes via `announce_of::<F>("inst")`, and the
-    // unprefixed id no longer appears.
+    // unprefixed id is absent.
     let ids = realized_ids(&vtable);
     assert!(
         ids.contains(&ComponentId::new("inst.tick_out.count")),
@@ -388,7 +388,7 @@ fn abi_panic_is_contained() {
 }
 
 // ---------------------------------------------------------------------------
-// WP8 Wave 3b (dl-open.md §6.3): the schema-guided KDL → postcard params path.
+// The schema-guided KDL → postcard params path.
 // These prove the **core byte-equality invariant** (the dynamic encoder produces
 // exactly the bytes the typed Rust builder produces) and the span-aware error
 // cases, all without dlopen — `encode_kdl_params` is driven by an owned schema, so
@@ -409,8 +409,8 @@ struct MultiParams {
     trim: Option<f64>,
 }
 
-/// THE HARD GATE (dl-open.md §6.3): `encode_kdl_params` (schema-guided, the KDL
-/// front-end) produces byte-identical postcard bytes to `postcard::to_stdvec` of the
+/// THE HARD GATE: `encode_kdl_params` (schema-guided, the KDL front-end) produces
+/// byte-identical postcard bytes to `postcard::to_stdvec` of the
 /// typed value (the Rust builder front-end) — across every field type.
 #[test]
 fn kdl_schema_encode_byte_equals_typed_builder() {

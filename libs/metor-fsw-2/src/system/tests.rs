@@ -1,6 +1,6 @@
-//! WP4 acceptance tests (system.md "Tests"): the cyclic & async system paths, the
+//! System acceptance tests (system.md "Tests"): the cyclic & async system paths, the
 //! self-descriptor + compatibility check, the standard health counters, and the
-//! cyclic lapped-input semantics. Ports are built by hand (no coordinator yet — WP5).
+//! cyclic lapped-input semantics. Ports are built by hand, without a coordinator.
 
 use core::mem::offset_of;
 use std::collections::HashMap;
@@ -187,7 +187,7 @@ fn cyclic_filter_end_to_end() {
 }
 
 // ---------------------------------------------------------------------------
-// is_lapped: a lapped cyclic input is observable (the stop policy itself is WP5).
+// is_lapped: a lapped cyclic input is observable (the stop policy lives in the coordinator).
 // ---------------------------------------------------------------------------
 
 #[test]

@@ -28,7 +28,7 @@ pub const LOG_MSG_CAP: usize = 64;
 
 /// The standard per-system health frame. The four scalar counters are framework-
 /// maintained; `error_counts` holds the system's named counters (lands as
-/// `health.error_counts.<kind>` via the WP3 dynamic-frame path).
+/// `health.error_counts.<kind>` via the dynamic-frame path).
 #[derive(Frame, IntoBytes, Immutable, KnownLayout, FromBytes)]
 #[repr(C)]
 #[metor_fsw(name = "health")]

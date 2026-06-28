@@ -1,5 +1,5 @@
 //! The build driver — turn a [`Wiring`]'s [`Artifact`](super::Artifact)s into located
-//! `.so`s (dl-open.md §6.4).
+//! `.so`s.
 //!
 //! For each artifact it runs `cargo build -p <crate_name>` and locates the produced
 //! `cdylib`, writing its path back into [`Artifact::path`](super::Artifact::path) so the
@@ -17,7 +17,7 @@ use std::process::Command;
 
 use super::model::Wiring;
 
-/// Options for the build driver (dl-open.md §6.4).
+/// Options for the build driver.
 #[derive(Clone, Debug, Default)]
 pub struct BuildOptions {
     /// Build the `--release` profile (default: debug, matching `cargo build`).
@@ -26,8 +26,8 @@ pub struct BuildOptions {
     pub extra_args: Vec<String>,
 }
 
-/// A build-driver failure (dl-open.md §6.4). Each is a clean error — a build problem
-/// never panics the caller.
+/// A build-driver failure. Each is a clean error — a build problem never panics the
+/// caller.
 #[derive(Debug, thiserror::Error)]
 pub enum BuildError {
     /// `cargo` could not be spawned.
@@ -58,8 +58,8 @@ pub enum BuildError {
 }
 
 /// Build every [`Artifact`](super::Artifact) in `wiring` and fill in its
-/// [`path`](super::Artifact::path) (dl-open.md §6.4). Idempotent and incremental —
-/// re-running only rebuilds crates cargo considers stale.
+/// [`path`](super::Artifact::path). Idempotent and incremental — re-running only
+/// rebuilds crates cargo considers stale.
 pub fn build_artifacts(wiring: &mut Wiring, opts: &BuildOptions) -> Result<(), BuildError> {
     for artifact in &mut wiring.artifacts {
         let path = build_one(&artifact.crate_name, &artifact.cdylib, opts)?;

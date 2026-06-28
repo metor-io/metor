@@ -2,7 +2,7 @@
 //!
 //! In the `#[repr(C)]` frame, a list/map field **is** the 8-byte [`Slot`]
 //! `{ trailer_off, byte_len }` — nothing more. The element data lives in the table
-//! trailer past the fixed region, exactly as the landed `expand_dynamic` reads it.
+//! trailer past the fixed region, exactly as `expand_dynamic` reads it.
 //! The const generics carry the max cardinality (and, for maps, the max key length)
 //! so `Componentize::MAX_SIZE` is a `const` expression (frames.md §3.4).
 
@@ -17,8 +17,8 @@ use metor_proto_wkt::ComponentMetadata;
 use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
 
 /// The 8-byte dynamic-field slot in a frame's fixed region: a table-absolute offset
-/// to the element block in the trailer and its byte length. Matches the layout the
-/// landed `read_slot` reads.
+/// to the element block in the trailer and its byte length. Matches the layout
+/// `read_slot` reads.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, IntoBytes, Immutable, KnownLayout, FromBytes)]
 pub struct Slot {

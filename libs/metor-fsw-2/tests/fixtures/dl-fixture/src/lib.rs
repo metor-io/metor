@@ -1,17 +1,17 @@
-//! A WP8 dl-open integration-test fixture (dl-open.md §3, §8): one ordinary
-//! `impl CyclicSystem` made `dlopen`-loadable with a single `export_system!`. The
-//! `dl_integration` host test builds this crate as a `cdylib`, `dlopen`s the produced
-//! shared object, and drives it through the real C ABI.
+//! A dl-open integration-test fixture: one ordinary `impl CyclicSystem` made
+//! `dlopen`-loadable with a single `export_system!`. The `dl_integration` host test
+//! builds this crate as a `cdylib`, `dlopen`s the produced shared object, and drives
+//! it through the real C ABI.
 //!
 //! `DlCounter` consumes a `tick_in` frame and republishes `start + value` as a
 //! `tick_out` frame — enough to prove the input view, the output writer, the params
 //! blob, and the descriptor all cross a real `.so` boundary. The frame definitions
 //! match the host test's byte-for-byte (same name + layout), the compile-time contract
-//! `compatible()` enforces (dl-open.md §8).
+//! `compatible()` enforces.
 
 // The `export_system!`-generated `extern "C" fn fsw_*` exports take raw pointers by
-// ABI contract (the host owns their validity, dl-open.md §2.5); clippy's
-// `not_unsafe_ptr_arg_deref` is inherent to that macro surface for any cdylib.
+// ABI contract (the host owns their validity); clippy's `not_unsafe_ptr_arg_deref` is
+// inherent to that macro surface for any cdylib.
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
 
 use metor_fsw_2::{
@@ -44,18 +44,17 @@ pub struct TickOut {
 }
 
 /// Two params of **differing types** crossing `fsw_create` as postcard bytes (so the
-/// Wave 3b KDL≡builder byte-equality gate is a real multi-field, mixed-type check,
-/// dl-open.md §6.3): a `start` offset (`u64`) and a `scale` factor (`f64`) applied to
-/// each input tick.
+/// KDL≡builder byte-equality gate is a real multi-field, mixed-type check): a `start`
+/// offset (`u64`) and a `scale` factor (`f64`) applied to each input tick.
 #[derive(Serialize, Deserialize, Schema, Clone, Default, Debug, PartialEq)]
 pub struct CounterParams {
     pub start: u64,
     pub scale: f64,
 }
 
-// Wave 3a (dl-open.md §3.0/§6.3): a dl system needs **no** `FromKdlNode` impl — it is
-// constructed only via `BuildSystem` (below), decoding canonical postcard `Params`
-// bytes in `fsw_create`. This fixture proves the `RegisteredSystem`/`kdl` decoupling.
+// A dl system needs **no** `FromKdlNode` impl — it is constructed only via
+// `BuildSystem` (below), decoding canonical postcard `Params` bytes in `fsw_create`.
+// This fixture proves the `RegisteredSystem`/`kdl` decoupling.
 
 /// Applies `start + value * scale` to each input tick and republishes the sum.
 pub struct DlCounter {

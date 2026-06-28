@@ -98,7 +98,7 @@ pub const fn round_up8(n: usize) -> usize {
 /// (`u32` length + `u32` pad) plus the payload padded up to an 8-byte boundary.
 /// Always a multiple of 8, so every record start stays 8-byte aligned.
 ///
-/// Public so buffer-sizing callers (fsw-2's system ports, WP4 §2.2) can size a
+/// Public so buffer-sizing callers (fsw-2's system ports) can size a
 /// ring from a frame's `MAX_SIZE` without re-deriving the header rule.
 #[inline]
 pub const fn frame_len(payload_len: usize) -> usize {
@@ -243,7 +243,7 @@ unsafe impl Backing for MmapBacking {
 
 /// Non-owning storage over a region someone else owns (the host, or another
 /// process's mmap). Its `Drop` frees nothing; the region's own atomics carry all
-/// synchronization. Used by [`RingBuffer::attach_raw`] for same-process WP8
+/// synchronization. Used by [`RingBuffer::attach_raw`] for same-process dlopen'd
 /// systems that reconstruct a ring over the host's backing.
 ///
 /// # Safety
@@ -618,7 +618,7 @@ impl RingBuffer<MmapBacking> {
 
 impl RingBuffer<RawBacking> {
     /// Attach a non-owning handle to a host-provided ring region, validating its
-    /// header and reading geometry back out of it (same-process WP8 path). The
+    /// header and reading geometry back out of it (the same-process dlopen path). The
     /// caller keeps owning the region; this handle's [`RawBacking`] frees nothing.
     ///
     /// This is [`RingBuffer::attach_mmap`] with the mapping step removed: the
@@ -671,8 +671,8 @@ impl<B: Backing> RingBuffer<B> {
     }
 
     /// The backing region's `(base, len)`, for handing a second handle the same
-    /// bytes to attach to (the same-process WP8 scenario, dl-open.md §2.3): the
-    /// host reads `(base, len)` here to fill an `FswRing` the system reconstructs
+    /// bytes to attach to (the same-process dlopen scenario): the host reads
+    /// `(base, len)` here to fill an `FswRing` the system reconstructs
     /// via [`RingBuffer::attach_raw`]. The pointer is only valid while `self` (or
     /// another handle/backing keeping the region alive) lives.
     pub fn region(&self) -> (*mut u8, usize) {

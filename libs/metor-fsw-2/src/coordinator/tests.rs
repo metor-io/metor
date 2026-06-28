@@ -1,4 +1,4 @@
-//! WP5 acceptance tests (coordinator.md "Tests"): the two-cyclic-system graph end
+//! Coordinator acceptance tests (coordinator.md "Tests"): the two-cyclic-system graph end
 //! to end, the lapped hard-stop, an async system wired through a private copy-in
 //! buffer, build-time wiring validation, and the init barrier. Systems are
 //! registered and wired through the `Coordinator` builder — no hand-built ports.
