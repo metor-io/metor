@@ -6,12 +6,13 @@ repository.workspace = true
 publish = false
 
 [dependencies]
-# The mission host links ONLY the framework: it describes the mission as a `Wiring`, builds
-# the system cdylibs, and dlopens them. It links neither the system crates nor the shared
+# The mission host links ONLY the framework: `main` delegates to `metor_fsw_2::cli::main()`
+# (the runner reads `mission.kdl`), and the convergence test's `build_sim_coordinator` builds
+# + dlopens the system cdylibs. It links neither the system crates nor the shared
 # `adcs-contracts` — frames are validated from serialized VTables and params encoded from the
-# exported schema, so the host stays schema-agnostic (dl-open.md §6.3, §8).
+# exported schema, so the host stays schema-agnostic (dl-open.md §6.3, §8; cli-runner.md §6).
+# No `stellarator` here: the `main` shim is sync; the CLI enters the runtime internally.
 metor-fsw-2.path = "../../libs/metor-fsw-2"
-stellarator.path = "../../libs/stellarator"
 anyhow = "1"
 
 [dev-dependencies]
