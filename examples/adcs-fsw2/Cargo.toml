@@ -1,0 +1,24 @@
+[package]
+name = "adcs-fsw2"
+version.workspace = true
+edition.workspace = true
+repository.workspace = true
+publish = false
+
+[dependencies]
+metor-fsw-2.path = "../../libs/metor-fsw-2"
+# Required directly even though we only use it through metor-fsw-2: the re-exported
+# `#[derive(Frame)]` expands to `::metor_fsw::...` paths and the macro's crate
+# resolution panics unless `metor-fsw` is a direct dependency.
+metor-fsw = { path = "../../libs/metor-fsw", default-features = false, features = ["std"] }
+metor-fsw-adcs.path = "../../libs/metor-fsw/adcs"
+metor-proto = { path = "../../libs/metor-proto", features = ["std"] }
+nox.path = "../../libs/nox"
+stellarator.path = "../../libs/stellarator"
+zerocopy = { version = "0.8.2", features = ["derive"] }
+rand = "0.9"
+rand_distr = "0.5"
+anyhow = "1"
+# Required directly: the re-exported `#[derive(FromKdlNode)]` expands to `::kdl::`
+# paths, so the `kdl` crate must be a direct dependency of any crate that uses it.
+kdl = "6.3"
