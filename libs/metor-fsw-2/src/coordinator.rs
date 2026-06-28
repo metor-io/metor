@@ -456,8 +456,7 @@ where
 /// postcard `Params` blob. At `build()` it is turned into a [`DlSlot`](crate::dl)
 /// instead of a typed [`CyclicRunner`]; everything before that (descriptor push, edge
 /// validation, ring sizing/allocation, registry entry) is the static-system path,
-/// unchanged. Rides the `kdl` feature with the `abi`/`dl` modules it consumes.
-#[cfg(feature = "kdl")]
+/// unchanged. Available without `kdl` (Wave 3a — dl-open.md §3.0).
 struct DlReg {
     system: crate::dl::DlSystem,
     params: Vec<u8>,
@@ -467,7 +466,6 @@ enum Reg {
     Cyclic(Box<dyn CyclicRegistration>),
     Async(Box<dyn AsyncRegistration>),
     /// A dlopen'd cyclic system, bound to a [`DlSlot`](crate::dl) at `build()`.
-    #[cfg(feature = "kdl")]
     Dl(DlReg),
 }
 
@@ -587,9 +585,9 @@ impl CoordinatorBuilder {
     /// in the [`OutputRegistry`] with the (prefixed) announce, so telemetry `All` taps
     /// them like a static system's.
     ///
-    /// v1 is cyclic-only (dl-open.md §3.1); a programmatic builder method (KDL
-    /// `artifact`/`lib=` wiring is Wave 3).
-    #[cfg(feature = "kdl")]
+    /// v1 is cyclic-only (dl-open.md §3.1). This is the low-level builder method; the
+    /// Wave 3a [`resolve`](crate::resolve) drives it from a [`Wiring`](crate::Wiring)
+    /// (built in Rust or parsed from the KDL `artifact`/`lib=` surface).
     pub fn add_dl_cyclic(
         &mut self,
         name: impl Into<String>,
@@ -853,7 +851,6 @@ impl CoordinatorBuilder {
                 // handles in `descriptors()` order, and hand them to a `DlSlot`
                 // (dl-open.md §4.2). Sizing, allocation, validation, and the registry
                 // entry above are identical to a static system's.
-                #[cfg(feature = "kdl")]
                 Reg::Dl(dl) => {
                     use crate::abi::{FswRing, ROLE_INPUT, ROLE_OUTPUT};
                     let outputs: Vec<FswRing> = (0..self.descs[id].outputs.len())
@@ -907,7 +904,6 @@ impl CoordinatorBuilder {
                             wake_on_stop: async_wakes[id].clone(),
                         }),
                         // The dl arm is handled by the outer match.
-                        #[cfg(feature = "kdl")]
                         Reg::Dl(_) => unreachable!("dl registration bound by the outer match"),
                     }
                 }

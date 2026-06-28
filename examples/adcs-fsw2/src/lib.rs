@@ -49,10 +49,11 @@ use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
 use std::time::Duration;
 
 use metor_fsw_2::{
-    ClockMode, Coordinator, CoordinatorConfig, CyclicSystem, Input, Out, Output, PortRef, System,
-    SystemInput, SystemOutput, TcpTransport, TelemetryConfig, TelemetryMode, WireError,
+    BuildSystem, ClockMode, Coordinator, CoordinatorConfig, CyclicSystem, Input, Out, Output,
+    PortRef, System, SystemInput, SystemOutput, TcpTransport, TelemetryConfig, TelemetryMode,
+    WireError,
     ring::{Backing, BoxBacking},
-    wiring::{FromKdlNode, RegisteredSystem, Registry},
+    wiring::{FromKdlNode, Registry},
 };
 
 /// A body-frame / world-frame 3-vector in nox's array representation.
@@ -270,7 +271,7 @@ impl<B: Backing> CyclicSystem<B> for PlantSystem {
     }
 }
 
-impl RegisteredSystem for PlantSystem {
+impl BuildSystem for PlantSystem {
     type Params = PlantParams;
     fn new(params: Self::Params) -> Self {
         PlantSystem::new(params)
@@ -340,7 +341,7 @@ impl<B: Backing> CyclicSystem<B> for NavSystem {
     }
 }
 
-impl RegisteredSystem for NavSystem {
+impl BuildSystem for NavSystem {
     type Params = NavParams;
     fn new(params: Self::Params) -> Self {
         NavSystem::new(params)
@@ -406,7 +407,7 @@ impl<B: Backing> CyclicSystem<B> for CtrlSystem {
     }
 }
 
-impl RegisteredSystem for CtrlSystem {
+impl BuildSystem for CtrlSystem {
     type Params = CtrlParams;
     fn new(params: Self::Params) -> Self {
         CtrlSystem::new(params)

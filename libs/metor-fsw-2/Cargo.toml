@@ -28,14 +28,16 @@ postcard = { version = "1.1", features = ["alloc"] }
 postcard-schema = { version = "0.2", features = ["derive", "use-std"] }
 serde = { version = "1.0", features = ["derive"] }
 
+# WP8 dl-open host loader (`dl` module, Wave 3a): `dlopen`/`dlsym` a system `.so` and
+# resolve its `fsw_*` C-ABI surface, keeping the `Library` alive for the loaded
+# system's life. Non-optional: the dlopen ABI/loader is available without `kdl`
+# (dl-open.md §3.0 fix). `thiserror` is non-optional too — `dl::DlError` derives it.
+libloading = { version = "0.8" }
+thiserror = { version = "2.0" }
+
 # Wiring front-end (the `kdl` feature): KDL config language + span-carrying errors.
 kdl = { version = "6.3.4", optional = true }
 miette = { version = "7.0", features = ["fancy"], optional = true }
-thiserror = { version = "2.0", optional = true }
-
-# WP8 dl-open host loader (`dl` module): `dlopen`/`dlsym` a system `.so` and resolve
-# its `fsw_*` C-ABI surface, keeping the `Library` alive for the loaded system's life.
-libloading = { version = "0.8", optional = true }
 
 # The `dl_integration` test builds the fixture cdylib and `dlopen`s it; it drives the
 # coordinator on `stellarator` and defines host-side frames (zerocopy) + params
@@ -47,7 +49,8 @@ postcard = { version = "1.1", features = ["alloc"] }
 
 [features]
 default = ["kdl"]
-# The KDL wiring loader (`wiring` module): registry, FromKdlNode derive, `load()`.
-# The `abi`/`dl` dl-open modules ride this feature in v1 (they lean on `wiring`'s
-# `RegisteredSystem` construction contract), so the host loader rides it too.
-kdl = ["dep:kdl", "dep:miette", "dep:thiserror", "dep:libloading"]
+# The KDL wiring loader (`wiring` module): registry, FromKdlNode derive, `load()`, the
+# `Wiring` data model + builder + resolver + build driver. The `abi`/`dl` dl-open
+# modules are NO LONGER gated on this (Wave 3a — dl-open.md §3.0): the dlopen ABI and
+# host loader build with `--no-default-features`.
+kdl = ["dep:kdl", "dep:miette"]

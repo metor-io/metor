@@ -10,9 +10,9 @@ use metor_fsw_ring::{BoxBacking, Notifier};
 use metor_proto::types::{ComponentId, Timestamp};
 use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
 
-use crate::wiring::{FromKdlNode, LoadError, Registry, RegisteredSystem, load};
+use crate::wiring::{ClockSpec, FromKdlNode, LoadError, Registry, WiringBuilder, load, parse, resolve};
 use crate::{
-    AsyncSystem, CyclicSystem, Input, Out, Output, System, SystemInput, SystemOutput,
+    AsyncSystem, BuildSystem, CyclicSystem, Input, Out, Output, System, SystemInput, SystemOutput,
 };
 
 // ---------------------------------------------------------------------------
@@ -94,7 +94,7 @@ impl CyclicSystem for ImuDriver {
     }
 }
 
-impl RegisteredSystem for ImuDriver {
+impl BuildSystem for ImuDriver {
     type Params = ImuParams;
     fn new(params: Self::Params) -> Self {
         Self { params, n: 0.0 }
@@ -142,7 +142,7 @@ impl CyclicSystem for NavFilter {
     }
 }
 
-impl RegisteredSystem for NavFilter {
+impl BuildSystem for NavFilter {
     type Params = NavParams;
     fn new(params: Self::Params) -> Self {
         Self { gain: params.gain }
@@ -185,7 +185,7 @@ impl AsyncSystem for NavLogger {
     }
 }
 
-impl RegisteredSystem for NavLogger {
+impl BuildSystem for NavLogger {
     type Params = ();
     fn new(_params: Self::Params) -> Self {
         NavLogger
@@ -215,7 +215,7 @@ impl CyclicSystem for PickyConsumer {
     }
 }
 
-impl RegisteredSystem for PickyConsumer {
+impl BuildSystem for PickyConsumer {
     type Params = ();
     fn new(_params: Self::Params) -> Self {
         PickyConsumer
@@ -258,10 +258,71 @@ impl CyclicSystem for Closer {
     }
 }
 
-impl RegisteredSystem for Closer {
+impl BuildSystem for Closer {
     type Params = ();
     fn new(_params: Self::Params) -> Self {
         Closer
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Two paramless cyclic systems (for the builder ≡ KDL equivalence test): a `Src`
+// producing `imu`, a `Sink` consuming it. Config-less, so both front-ends produce
+// byte-equal `SystemSpec`s (empty params).
+// ---------------------------------------------------------------------------
+
+struct Src;
+
+#[derive(SystemOutput)]
+struct SrcOut {
+    imu: Output<Imu>,
+}
+
+impl System for Src {
+    type Input = NoIn;
+    type Output = Out<SrcOut>;
+    const NAME: &'static str = "src";
+}
+
+impl CyclicSystem for Src {
+    fn execute(&mut self, now: Timestamp, _in: &mut NoIn, o: &mut Self::Output) {
+        let _ = o.imu.write(&Imu {
+            timestamp: now,
+            omega: 1.0,
+        });
+    }
+}
+
+impl BuildSystem for Src {
+    type Params = ();
+    fn new(_params: ()) -> Self {
+        Src
+    }
+}
+
+struct Sink;
+
+#[derive(SystemInput)]
+struct SinkIn {
+    imu: Input<Imu>,
+}
+
+impl System for Sink {
+    type Input = SinkIn;
+    type Output = Out<NoOut>;
+    const NAME: &'static str = "sink";
+}
+
+impl CyclicSystem for Sink {
+    fn execute(&mut self, _now: Timestamp, input: &mut SinkIn, _o: &mut Self::Output) {
+        let _ = input.imu.latest();
+    }
+}
+
+impl BuildSystem for Sink {
+    type Params = ();
+    fn new(_params: ()) -> Self {
+        Sink
     }
 }
 
@@ -273,6 +334,8 @@ fn registry() -> Registry {
     r.register::<NavLogger, _>("NavLogger");
     r.register::<PickyConsumer, _>("PickyConsumer");
     r.register::<Closer, _>("Closer");
+    r.register::<Src, _>("Src");
+    r.register::<Sink, _>("Sink");
     r
 }
 
@@ -560,4 +623,100 @@ fn from_kdl_node_round_trip_explicit() {
             depth: 9,
         }
     );
+}
+
+// ---------------------------------------------------------------------------
+// Wave 3a: the Rust `WiringBuilder` and the KDL `parse` are two front-ends onto
+// the same `Wiring` data model (dl-open.md §6.2/§6.3) — they produce byte-equal
+// `Wiring` for a (config-less, static) graph, and resolve to an equivalent
+// running coordinator.
+// ---------------------------------------------------------------------------
+
+/// The same graph expressed in Rust, used by both equivalence tests below.
+fn equiv_builder() -> WiringBuilder {
+    WiringBuilder::new()
+        .coordinator(100.0, ClockSpec::Wall)
+        .system("a")
+        .ty("Src")
+        .from_static()
+        .end()
+        .system("b")
+        .ty("Sink")
+        .from_static()
+        .end()
+        .connect("a", "imu", "b", "imu")
+}
+
+#[test]
+fn builder_and_kdl_produce_equal_wiring() {
+    let kdl = r#"
+coordinator cycle_rate=100.0
+system "a" type="Src"
+system "b" type="Sink"
+connect "a" -> "b" frame="imu"
+"#;
+    let from_kdl = parse(kdl).expect("parse onto the Wiring data model");
+    let from_builder = equiv_builder().build();
+    assert_eq!(from_kdl, from_builder, "the two front-ends produce equal Wiring");
+}
+
+#[cfg(not(miri))]
+#[stellarator::test]
+async fn builder_wiring_resolves_and_runs() {
+    // The builder-origin Wiring (no text at all) resolves through the one shared
+    // resolver and runs without any system hard-stopping.
+    let wiring = equiv_builder().build();
+    let mut coord = resolve(&wiring, &registry()).expect("resolve the builder Wiring");
+    coord.run_for(5).await;
+    assert!(coord.stopped().is_empty(), "no system hard-stopped");
+}
+
+// ---------------------------------------------------------------------------
+// Wave 3a: a dl system declared in KDL may carry no params (the schema-guided
+// encoder is Wave 3b); params on a `lib=` system is a clear error. Resolution of
+// the `.so` itself is exercised by `tests/wiring_resolve.rs` (a real dlopen).
+// ---------------------------------------------------------------------------
+
+#[test]
+fn dl_kdl_params_are_rejected_until_wave_3b() {
+    let kdl = r#"
+coordinator cycle_rate=100.0
+artifact "plant" crate="adcs-plant" lib="libadcs_plant.dylib" type="Plant"
+system "plant" type="Plant" lib="plant" gain=5.0
+"#;
+    let err = parse(kdl).expect_err("KDL params on a dl system are rejected");
+    assert!(matches!(err, LoadError::DlKdlParamsUnsupported { .. }), "{err:?}");
+}
+
+#[test]
+fn dl_system_in_kdl_parses_into_an_artifact_ref() {
+    let kdl = r#"
+coordinator cycle_rate=100.0
+artifact "plant" crate="adcs-plant" lib="libadcs_plant.dylib" type="Plant"
+system "plant" type="Plant" lib="plant"
+"#;
+    let wiring = parse(kdl).expect("parse a dl system + artifact");
+    assert_eq!(wiring.artifacts.len(), 1);
+    assert_eq!(wiring.artifacts[0].id, "plant");
+    assert_eq!(wiring.artifacts[0].crate_name, "adcs-plant");
+    assert_eq!(wiring.artifacts[0].cdylib, "libadcs_plant.dylib");
+    assert_eq!(wiring.artifacts[0].system_type, "Plant");
+    assert_eq!(wiring.systems.len(), 1);
+    assert_eq!(wiring.systems[0].artifact.as_deref(), Some("plant"));
+    assert!(wiring.systems[0].params.is_empty(), "no params (dl, no config)");
+}
+
+#[test]
+fn unknown_artifact_ref_is_a_clean_error() {
+    // A dl system referencing an undeclared artifact resolves to UnknownArtifact.
+    let kdl = r#"
+coordinator cycle_rate=100.0
+system "plant" type="Plant" lib="missing"
+"#;
+    let wiring = parse(kdl).expect("parses (resolution is deferred)");
+    let err = match resolve(&wiring, &registry()) {
+        Ok(_) => panic!("expected an UnknownArtifact error"),
+        Err(e) => e,
+    };
+    assert!(matches!(err, LoadError::UnknownArtifact { .. }), "{err:?}");
 }

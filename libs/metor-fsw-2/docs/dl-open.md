@@ -396,12 +396,17 @@ The system-side ABI is implemented; real-world deviations from the sketch above,
   rebuild granularity, and the host loader resolves the fixed symbol names. Multiple systems per `.so`
   (namespaced `fsw_<name>_*` symbols) is a later option; revisit when the example (§8) is split (it
   becomes one cdylib per system, or we add namespacing).
-- **`abi` rides the `kdl` feature for now.** `run_create` leans on WP6's `RegisteredSystem` for
-  `Params`+`new`, whose `Params: FromKdlNode` bound lives in the kdl-gated `wiring` module, so
-  `pub mod abi` is `#[cfg(feature = "kdl")]`. This contradicts §6.3 ("a dl system needs no
-  `FromKdlNode`"); the clean fix is a kdl-independent construction trait (`BuildSystem { type Params;
-  fn new }`, with `RegisteredSystem: BuildSystem` adding the kdl bound) — scheduled for the Wave 3
-  wiring refactor. Default features include `kdl`, so v1 works meanwhile.
+- **`abi`/`dl` no longer ride the `kdl` feature (FIXED in Wave 3a).** `run_create` used to lean on
+  WP6's `RegisteredSystem` for `Params`+`new`, whose `Params: FromKdlNode` bound lived in the
+  kdl-gated `wiring` module, so `abi`/`dl` were `#[cfg(feature = "kdl")]`. Wave 3a introduced the
+  kdl-independent construction trait `BuildSystem { type Params; fn new }` (in `system.rs`); the
+  `abi` `run_*` helpers + `export_system!` now bound on `BuildSystem` (plus `Deserialize`/`Schema`
+  where needed), and `RegisteredSystem: BuildSystem` is a **blanket marker** that only adds the
+  `Params: FromKdlNode` bound for the static-registry path. `pub mod abi` / `pub mod dl` /
+  `Reg::Dl` / `add_dl_cyclic` are ungated; `libloading`/`thiserror` are now non-optional deps. Both
+  `--no-default-features` and `--features kdl` build, and a dl system (the fixture) needs **no**
+  `FromKdlNode` impl at all (§6.3). The `Wiring` data model / builder / resolver / build driver
+  stay in the kdl-gated `wiring` module (they share the `Registry`/`LoadError` surface).
 - **`into_port_desc`'s `announce` re-prefixes metadata but NOT the vtable's baked component ids**
   (a `// TODO telemetry.md §6` in `abi.rs`). The host-side metadata-driven vtable-id rewrite (§7,
   Q-announce) lands in W2b so telemetry prefixing over a dlopen'd system is correct end-to-end.
@@ -537,13 +542,17 @@ pub struct Wiring {
     pub edges:       Vec<EdgeSpec>,              // from/out/to/in/delayed (== the wiring.rs Edge)
     pub telemetry:   Option<TelemetrySpec>,
 }
-pub struct Artifact {                            // "which shared objects + what crate they come from"
+pub struct Artifact {                            // "which shared object + what crate it comes from"
     pub id:        ArtifactId,                    // referenced by SystemSpec
     pub crate_name: String,                       // cargo package, for the build driver
-    pub cdylib:    String,                         // libfoo.so / libfoo.dylib
-    pub exports:   Vec<String>,                    // the `type=` names this .so's export_system!s provide
+    pub cdylib:    String,                         // libfoo.so / libfoo.dylib / libfoo.dll
+    pub system_type: String,                       // the ONE `type=` this .so's export_system! provides
     pub path:      Option<PathBuf>,               // resolved artifact location (build output)
 }
+// Reviewed: ONE system per cdylib (fixed fsw_* symbols, §3.0). An Artifact therefore exports a single
+// system type; multiple `system` nodes may still reference one Artifact to instance that type more than
+// once (the loader dlopens the .so once and `fsw_create`s per instance). Finest rebuild granularity:
+// editing one control law rebuilds only its cdylib.
 pub struct SystemSpec {
     pub name:     String,                          // instance name (the telemetry prefix, wiring.md §6)
     pub ty:       String,                          // the `type=` key
