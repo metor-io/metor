@@ -1,56 +1,50 @@
-//! Runs the ADCS closed loop **live** against a running metor-panel.
+//! Runs the ADCS closed loop **live** against a running metor-panel, with the three
+//! systems loaded from `dlopen`'d `cdylib`s (dl-open.md §8).
 //!
-//! The loop is paced on a wall clock at 120 Hz and streams every output frame
-//! (`sensors` / `attitude_estimate` / `torque_cmd` / `truth` plus each system's
-//! health/log) to a metor-panel — which serves a metor-db on `127.0.0.1:2240` — in
-//! metor-proto's wire format. Start metor-panel first, then `cargo run -p adcs-fsw2`,
-//! and watch the spacecraft converge in the UI. Ctrl-C to stop.
+//! On startup the host builds the three system `cdylib`s (`cargo build -p adcs-{plant,nav,
+//! ctrl}` — incremental, so only changed crates recompile), `dlopen`s them, and resolves
+//! the wiring into a coordinator. The loop is then paced on a wall clock at 120 Hz and
+//! streams every output frame (`sensors` / `attitude_estimate` / `torque_cmd` / `truth`
+//! plus each system's health/log) to metor-panel over TCP, in metor-proto's wire format.
 //!
-//! `Coordinator::run_for` is a complete `init → run → shutdown` lifecycle (it spawns the
-//! telemetry sender + opens the downlink on init and tears them down on shutdown), so it
-//! is called **once** for a single continuous mission — looping it would re-create the
-//! sender and reconnect every chunk. The per-second convergence print therefore runs on a
-//! side task reading the shared `SIM_LOG`, not by chunking the run.
+//! Start metor-panel first, then `cargo run -p adcs-fsw2`, and watch the spacecraft
+//! converge in the UI (plot `nav.attitude_estimate.q_hat` against `plant.truth.q_true`).
+//! Ctrl-C to stop. If nothing is listening on the panel port the downlink simply fails to
+//! connect and the control loop runs unaffected. The fast, headless convergence check
+//! lives in `tests/closed_loop.rs`.
 //!
-//! If nothing is listening on 2240 the downlink simply fails to connect and the control
-//! loop runs unaffected (you'll still see the convergence printout). The fast, headless
-//! convergence check lives in `tests/closed_loop.rs`.
+//! The terminal prints only a heartbeat: this binary stays **schema-agnostic** (it links
+//! neither the system crates nor `adcs-contracts`), so it does not decode the `truth`
+//! frame to read out convergence — the panel plots it, and the test asserts it.
 
 use std::net::SocketAddr;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
-use adcs_fsw2::{DT, SIM_LOG, build_live, reset_sim_log};
+use adcs_fsw2::{PANEL_ADDR, build_live_coordinator};
 
 #[stellarator::main]
 async fn main() -> anyhow::Result<()> {
-    reset_sim_log();
-
-    let addr: SocketAddr = ([127, 0, 0, 1], 2240).into();
-    println!("ADCS mission — streaming telemetry to metor-panel at {addr}");
+    let addr: SocketAddr = PANEL_ADDR.into();
+    println!("ADCS mission (dlopen) — building the plant/nav/ctrl cdylibs…");
+    let mut coord = build_live_coordinator(addr)?;
+    println!("systems loaded; streaming telemetry to metor-panel at {addr}.");
     println!("(start metor-panel first; it serves the db on :2240).  Ctrl-C to stop.\n");
 
-    let mut coord = build_live(addr)?;
-
-    // Side task: print the current attitude error / body rate once a second from the
-    // shared convergence log, so the terminal tracks progress while the panel plots the
-    // full telemetry. Independent of the coordinator's single continuous run below.
-    let _printer = stellarator::spawn(async {
+    // Heartbeat side task: this binary doesn't decode frames, so it just reports that the
+    // mission is alive; convergence is watched in the panel (or asserted by `cargo test`).
+    let start = Instant::now();
+    let _printer = stellarator::spawn(async move {
         loop {
-            stellarator::sleep(Duration::from_secs(1)).await;
-            let log = SIM_LOG.lock().unwrap();
-            if let (Some(&err), Some(&rate)) = (log.err_angle.last(), log.rate.last()) {
-                let t = log.err_angle.len() as f64 * DT;
-                println!(
-                    "t={t:6.1}s   attitude error {:6.2}°   body rate {:.4} rad/s",
-                    err.to_degrees(),
-                    rate
-                );
-            }
+            stellarator::sleep(Duration::from_secs(5)).await;
+            println!(
+                "t={:5.0}s — streaming dlopen'd ADCS telemetry to the panel",
+                start.elapsed().as_secs_f64()
+            );
         }
     });
 
-    // One continuous run: init once (sender spawned, downlink opened), then cycle on the
-    // wall clock until the process is interrupted.
+    // One continuous run: init once (fsw_bind_init per system, sender spawned, downlink
+    // opened), then cycle on the wall clock until the process is interrupted.
     coord.run_for(usize::MAX).await;
     Ok(())
 }
