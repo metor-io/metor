@@ -106,10 +106,15 @@ whole design:
    allocated (lib.rs:569). **In the same address space, a `.so` reconstructing a ring over the host's
    `base` pointer sees the identical atomics the host's other systems do.** No copy, no IPC.
 
-2. **The ports are `Backing`-generic.** `Output<F, B, …>` / `Input<F, B, …>` already take the backing
-   as a type parameter (port.rs:48, 128). The host's in-process rings are `BoxBacking`; a dlopen'd
-   system reconstructs `Output<F, RawBacking>` / `Input<F, RawBacking>` over the same bytes. Same
-   frame type, same write/read code, different (non-owning) backing.
+2. **The ports are `Backing`-generic — but the *bundles* and the *bind path* are not (yet).**
+   `Output<F, B, …>` / `Input<F, B, …>` already take the backing as a type parameter (port.rs:48, 128)
+   and their read/write methods work for any `B`. **However**, a user's bundle (`struct PlantOut {
+   sensors: Output<Sensors> }`) pins `B = BoxBacking` in its field types, `type Output = Out<PlantOut>`
+   pins it in the associated type, `Binder::next_output` returns `RingBuffer<BoxBacking>`
+   (binder.rs:103), and `Output::bind` is impl'd only for `BoxBacking` (port.rs:81). So a dlopen'd
+   system that must hold `Output<F, RawBacking>` views into the host's regions requires the **whole
+   `System`/bundle/bind stack to become `Backing`-generic** — see §1.4. (Reviewed decision: we take
+   this refactor to preserve zero-copy views, rather than the host-mediated copy-in alternative.)
 
 3. **The host already deals in erased descriptors.** `PortDesc`/`SystemDescriptor` (descriptor.rs)
    are how the coordinator sizes, allocates, and validates a system *without constructing it*. WP8
@@ -140,6 +145,40 @@ impl RingBuffer<RawBacking> {
 "`from_raw`-style path" the WP brief names. Same-process v1 uses it directly over the host's
 `BoxBacking.base()`; the cross-process future (§5) uses `MmapBacking`/`attach_mmap` — **the same
 ports and the same `RawBacking` reconstruction logic, only the region's provenance differs.**
+*(Landed in WP8 1A: `RawBacking` + `attach_raw`, sharing a private `from_validated` with `attach_mmap`.)*
+
+### 1.2 Making the `System` stack `Backing`-generic (the real shape)
+
+Because a dlopen'd cyclic system holds `Output<F, RawBacking>`/`Input<F, RawBacking>` views into the
+host's regions, the bundle, the `System` traits, and the bind path must all parameterize over `B`.
+The refactor (WP8 1B) is mechanical but cross-cutting; the target shape:
+
+- **Traits gain a defaulted backing param.** `trait System<B: Backing = BoxBacking>` and
+  `trait CyclicSystem<B: Backing = BoxBacking>: System<B>`, with `type Input: SystemInput + BindPorts<B>`
+  / `type Output: SystemOutput + BindPorts<B>`. Every existing `impl System for Foo` becomes
+  `impl<B: Backing> System<B> for Foo`. Static call sites (`add_cyclic`, `CyclicSystem::descriptor`)
+  resolve `B = BoxBacking` through the default, so the host path stays **source-compatible**.
+- **Bundles become generic.** The author writes `struct PlantOut<B: Backing = BoxBacking> { sensors:
+  Output<Sensors, B>, … }`. `SystemInput`/`SystemOutput` stay non-generic traits (their `descriptors()`
+  is static metadata and `any_lapped(&self)` has no `B` in its signature), impl'd for the generic
+  bundle for all `B`. The `#[derive(SystemInput/SystemOutput)]` already propagates `#generics`
+  (macros/src/system.rs:78,87) — it is extended to emit a `BindPorts<B>` impl over a ring source.
+- **Bind is abstracted over a `RingSource`** so one bundle `bind` serves both providers:
+  ```rust
+  trait RingSource { type B: Backing;
+      fn next_output<WD, WS>(&mut self) -> (RingBuffer<Self::B>, WD, WS);
+      fn next_input <RD, RS>(&mut self) -> (RingBuffer<Self::B>, RD, RS); }
+  trait BindPorts<B: Backing> { fn bind<S: RingSource<B = B>>(src: &mut S) -> Self; }
+  ```
+  The host's `Binder` impls `RingSource<B = BoxBacking>` (from its `BoundPort`s, binder.rs:103); the
+  `.so`'s `RawBinder` impls `RingSource<B = RawBacking>` (popping the next `FswRing` and `attach_raw`-ing
+  it, §3). `Output<F, B>::bind`/`Input<F, B>::bind` become generic over the source. **No host ring
+  allocation or sizing changes** — only the binder is now one impl of a shared trait.
+- **`CyclicRunner<S, O, B>`** (and the `Out<O, B>`/`HealthPort<B>` it wraps, already `B`-carrying)
+  thread `B`; the host instantiates `CyclicRunner<_, _, BoxBacking>`, the `.so`
+  `CyclicRunner<_, _, RawBacking>` — the lapped→stop/health/timing logic (system.rs:255–273) is reused
+  verbatim. `dyn CyclicSlot` stays backing-free: a host slot is a `CyclicRunner<…, BoxBacking>`, a
+  dlopen'd slot is a `DlSlot` that forwards across the ABI (§4.2), so no `B` leaks into the trait object.
 
 ---
 
@@ -722,12 +761,14 @@ the build driver. The data path, validation, sizing, telemetry tap, and health a
    `PortDesc.announce` from a bare `fn` to a boxed closure so a dl entry can capture its metadata —
    confirm that change is acceptable.)
 
-7. **Q-runner — generalize `CyclicRunner` over `Backing`?** Recommended: yes — make `CyclicRunner`
-   (and the `Out`/`HealthPort` it wraps, already mostly `Backing`-generic) generic over `B` so the
-   macro instantiates `CyclicRunner<S, O, RawBacking>` and the lapped/health/timing logic
-   (system.rs:255–273) is reused **verbatim**. Alternative: have the macro emit a parallel raw runner
-   (no host-type change, but duplicates the standard-counter logic and risks drift). (Recommend
-   generalize.)
+7. **Q-runner — make the `System` stack `Backing`-generic? [RESOLVED: yes — full backing-generic
+   refactor.]** The reviewed decision (over host-mediated copy-in) is to give a dlopen'd system real
+   zero-copy `RawBacking` views, which requires `System<B>`/`CyclicSystem<B>` (defaulted to
+   `BoxBacking`), generic bundles (author-visible `<B = BoxBacking>`), a `RingSource`-abstracted
+   `BindPorts<B>` with `Binder`(BoxBacking)/`RawBinder`(RawBacking) impls, generic port `bind`, and
+   `CyclicRunner<S, O, B>` — see §1.2. Static call sites stay source-compatible via the `B = BoxBacking`
+   default; the lapped/health/timing logic is reused verbatim. Cost: every bundle struct (incl. the
+   example's) gains `<B>`, and the derives emit the `BindPorts<B>` impl.
 
 8. **Q-manifest — `type → artifact` in-document vs sibling file. [RESOLVED: in-document.]** An
    in-document `artifact` node + per-system `lib=` ref (one source of truth, mirrors the builder's

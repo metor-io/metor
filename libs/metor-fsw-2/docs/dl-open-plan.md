@@ -14,10 +14,17 @@ before the next wave (memory: commit at task boundaries). Existing suites stay g
   `attach_raw` = `attach_mmap` minus the mmap step (validate header via `read_header`, build `Inner`).
   Tests: attach over a `BoxBacking` region in the same process; writer-in-region / view-in-region
   round-trip; arch-tag mismatch rejected. Miri over the attach/read path.
-- **1B · generalize `CyclicRunner` over `Backing`** (`src/system.rs`) + **broaden `PortDesc.announce`
-  to a boxed closure** (`src/descriptor.rs`). `CyclicRunner<S,O,B>` so the `.so` reuses the
-  lapped→stop/health/timing logic verbatim (system.rs:255–273). `announce: Arc<dyn Fn(&str)->(VTable,
-  Vec<ComponentMetadata>)>` so a dl entry can capture metadata. All WP4–WP7 tests stay green.
+- **1B · make the `System` stack `Backing`-generic** (the reviewed zero-copy decision; doc §1.2).
+  Cross-cutting but mechanical: `System<B = BoxBacking>`/`CyclicSystem<B = BoxBacking>`; generic
+  bundles (`PlantOut<B>`); a `RingSource` trait abstracting bind with `Binder`(BoxBacking) +
+  `RawBinder`(RawBacking) impls; `BindPorts<B>::bind<S: RingSource<B=B>>`; generic `Output/Input::bind`;
+  `CyclicRunner<S,O,B>`; thread `B` through `Out<O,B>`/`HealthPort<B>`. Extend the
+  `SystemInput`/`SystemOutput` derives to emit the `BindPorts<B>` impl. Static call sites stay
+  source-compatible via the `B = BoxBacking` default. **Spike the trait/derive shape to a compiling
+  minimal slice first**, then thread it through. Update the `adcs-fsw2` bundles to `<B>`. All WP3–WP7
+  tests + the example stay green. (Separately, **broaden `PortDesc.announce` to a boxed closure** —
+  `Arc<dyn Fn(&str)->(VTable, Vec<ComponentMetadata>)>` — so a dl registry entry can carry its
+  metadata-derived announce; needed by §7 regardless of model.)
 
 ## Wave 2 — the ABI (needs Wave 1)
 
