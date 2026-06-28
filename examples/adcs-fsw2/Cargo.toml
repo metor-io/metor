@@ -6,19 +6,21 @@ repository.workspace = true
 publish = false
 
 [dependencies]
+# The mission host links ONLY the framework: it describes the mission as a `Wiring`, builds
+# the system cdylibs, and dlopens them. It links neither the system crates nor the shared
+# `adcs-contracts` — frames are validated from serialized VTables and params encoded from the
+# exported schema, so the host stays schema-agnostic (dl-open.md §6.3, §8).
 metor-fsw-2.path = "../../libs/metor-fsw-2"
-# Required directly even though we only use it through metor-fsw-2: the re-exported
-# `#[derive(Frame)]` expands to `::metor_fsw::...` paths and the macro's crate
-# resolution panics unless `metor-fsw` is a direct dependency.
-metor-fsw = { path = "../../libs/metor-fsw", default-features = false, features = ["std"] }
-metor-fsw-adcs.path = "../../libs/metor-fsw/adcs"
-metor-proto = { path = "../../libs/metor-proto", features = ["std"] }
-nox.path = "../../libs/nox"
 stellarator.path = "../../libs/stellarator"
-zerocopy = { version = "0.8.2", features = ["derive"] }
-rand = "0.9"
-rand_distr = "0.5"
 anyhow = "1"
-# Required directly: the re-exported `#[derive(FromKdlNode)]` expands to `::kdl::`
-# paths, so the `kdl` crate must be a direct dependency of any crate that uses it.
-kdl = "6.3"
+
+[dev-dependencies]
+# The convergence test links the system crates as **rlibs** (default-features = false, so
+# their `fsw_*` C-ABI symbols are excluded and three system rlibs link cleanly into one test
+# binary) for the static-vs-dlopen parity comparison, and `adcs-contracts` to decode the
+# tapped `truth` output. The runtime/dlopen path stays decoupled (dl-open.md §8).
+adcs-contracts = { path = "contracts" }
+adcs-plant = { path = "systems/plant", default-features = false }
+adcs-nav = { path = "systems/nav", default-features = false }
+adcs-ctrl = { path = "systems/ctrl", default-features = false }
+stellarator.path = "../../libs/stellarator"

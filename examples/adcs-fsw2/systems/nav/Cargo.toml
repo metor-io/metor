@@ -1,0 +1,22 @@
+[package]
+name = "adcs-nav"
+version.workspace = true
+edition.workspace = true
+repository.workspace = true
+publish = false
+description = "The MEKF navigation-filter system of the adcs-fsw2 mission, as a dlopen'd cdylib"
+
+# cdylib (host `dlopen`s it) + rlib (the test links `NavSystem` for the static parity path);
+# the `export` feature keeps the `fsw_*` symbols out of the rlib — see adcs-plant.
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[features]
+default = ["export"]
+export = []
+
+[dependencies]
+adcs-contracts = { path = "../../contracts" }
+metor-fsw-2 = { path = "../../../../libs/metor-fsw-2" }
+metor-fsw-adcs = { workspace = true }
+nox = { workspace = true }

@@ -71,20 +71,58 @@ dependencies = [
 ]
 
 [[package]]
+name = "adcs-contracts"
+version = "0.14.2"
+dependencies = [
+ "metor-fsw-2",
+ "nox",
+ "postcard-schema",
+ "serde",
+ "zerocopy",
+]
+
+[[package]]
+name = "adcs-ctrl"
+version = "0.14.2"
+dependencies = [
+ "adcs-contracts",
+ "metor-fsw-2",
+ "metor-fsw-adcs",
+ "nox",
+]
+
+[[package]]
 name = "adcs-fsw2"
 version = "0.14.2"
 dependencies = [
+ "adcs-contracts",
+ "adcs-ctrl",
+ "adcs-nav",
+ "adcs-plant",
  "anyhow",
- "kdl",
- "metor-fsw",
+ "metor-fsw-2",
+ "stellarator",
+]
+
+[[package]]
+name = "adcs-nav"
+version = "0.14.2"
+dependencies = [
+ "adcs-contracts",
  "metor-fsw-2",
  "metor-fsw-adcs",
- "metor-proto",
+ "nox",
+]
+
+[[package]]
+name = "adcs-plant"
+version = "0.14.2"
+dependencies = [
+ "adcs-contracts",
+ "metor-fsw-2",
  "nox",
  "rand 0.9.2",
  "rand_distr 0.5.1",
- "stellarator",
- "zerocopy",
 ]
 
 [[package]]
