@@ -1,12 +1,25 @@
 # Slots & sequences (`sequences-slots`)
 
-> **Status: DECISIONS LOCKED — ready for planning (not yet implemented).** This proposes a
-> runtime-loadable-system layer (`slots`) and an ergonomic author surface for the most common
-> occupant, a futures-driven state machine (`sequences`, via a `#[sequence]` decorator). It
-> builds directly on the existing dlopen path (dl-open.md) and the coordinator's cyclic slot
-> model (coordinator.md §3). Every design fork has been resolved; the chosen answers (with the
-> trade-off prose retained) are recorded as the **resolved decisions** in §9, and the body
-> reflects them.
+> **Status: v1 IMPLEMENTED.** This proposed a runtime-loadable-system layer (`slots`) and an
+> ergonomic author surface for the most common occupant, a futures-driven state machine
+> (`sequences`, via a `#[sequence]` decorator). It is now built (WP10, plan
+> `sequences-slots-plan.md`); the body and the **resolved decisions** in §9 describe the
+> shipped design. Two decisions landed differently than the prose above and are worth calling
+> out:
+>
+> 1. **Ring reclamation (§2.3 / §9 Q2) needed no change.** Grounding the premise in the tree
+>    showed the ring already frees a reader slot on `View::drop` and a `Writer` holds no claim,
+>    so the swap re-acquires with zero ring surgery — Wave 1 is verification-only (the §2.3/Q2
+>    text is corrected).
+> 2. **v1 slots hold *sequence* occupants only.** A slot's implicit `SlotControlIn` cancel input
+>    and `SequenceStatus`/health/log output tail make the occupant contract sequence-shaped, so
+>    v1 restricts the allowed set to `#[sequence]` occupants (their descriptors carry those
+>    implicit ports). Loading an arbitrary plain-cyclic `.so` into a slot is future work.
+>
+> One operational rough edge surfaced: `Coordinator::run_for` re-runs `start()` (and thus each
+> dl/slot occupant's `fsw_bind_init`) on every call, which is not idempotent for dl occupants —
+> so a mission with slots is driven by a single `run_for`, with runtime commands injected via
+> `control_handle()` during that run. Making `run_for` re-entrant is a separate follow-up.
 
 The cube-sat example (`examples/cube-sat/src/sequencer.rs`) has a feature `metor-fsw-2`
 does not: **sequences** — small re-entrant programs that command the spacecraft through
