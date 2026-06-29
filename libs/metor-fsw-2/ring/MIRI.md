@@ -20,6 +20,10 @@ use only the `try_*` APIs + `std::thread`:
 - The race coverage: `concurrent_overwrite_no_ub` (writer/reader race the same
   bytes via relaxed atomics + lap recheck), `concurrent_lossless_full_stream`
   (backpressured plain read/write, zero loss), `concurrent_reader_churn`.
+- The slot-swap reclaim path: `swap_writer_and_reader_reacquire`,
+  `raw_attach_swap_reacquire` (drop a writer+view over a region, then re-acquire a
+  fresh pair — the Load→Stop→Load cycle a coordinator slot runs; checks reader-slot
+  free/reuse and the raw re-attach for provenance/leaks under reuse).
 
 Loop bounds shrink under `cfg!(miri)`. Leak checking is on by default.
 

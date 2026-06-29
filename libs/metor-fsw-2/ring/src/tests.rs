@@ -476,6 +476,96 @@ fn raw_attach_bad_region_rejected() {
     );
 }
 
+// ----- slot-swap re-acquisition (the Load -> Stop -> Load cycle) -----
+
+/// Slot-swap at the ring layer: dropping a writer+view and creating a fresh pair
+/// over the SAME `RingBuffer` re-acquires the writer role and a reader slot, and
+/// the new view starts at the live edge (it never sees the previous occupant's
+/// data). This is exactly the Load -> Stop -> Load cycle a coordinator slot runs;
+/// it works today with no ring change because `View::drop` frees its slot and a
+/// `Writer` holds no claim. `max_readers = 1` makes reclaim load-bearing: if the
+/// slot were leaked, the second `view()` would return `FullReaderTable`.
+#[test]
+fn swap_writer_and_reader_reacquire() {
+    let rb = overwrite(256, 1);
+    let mut buf = Vec::new();
+
+    // Occupant 1: claim, write+read, then drop the pair (the slot teardown).
+    {
+        let mut w1 = rb.writer(NoWake, NoWake);
+        let mut v1 = rb.view(NoWake, NoWake).unwrap();
+        assert_eq!(rb.reader_count(), 1);
+        w1.try_write(b"occ1-a").unwrap();
+        w1.try_write(b"occ1-b").unwrap();
+        assert!(v1.try_read_into(&mut buf).unwrap());
+        assert_eq!(&buf[..], b"occ1-a");
+        // leave "occ1-b" unread, to prove occupant 2 does not inherit it.
+    }
+    assert_eq!(rb.reader_count(), 0, "occupant 1's reader slot freed on drop");
+
+    // Occupant 2: a fresh pair re-acquires over the same region.
+    let mut w2 = rb.writer(NoWake, NoWake);
+    let mut v2 = rb.view(NoWake, NoWake).unwrap();
+    assert_eq!(
+        rb.reader_count(),
+        1,
+        "the single reader slot was reclaimed, not exhausted"
+    );
+    // The new view starts at the live edge: occupant 1's unread tail is invisible.
+    assert!(
+        !v2.try_read_into(&mut buf).unwrap(),
+        "fresh view sees only post-attach data"
+    );
+    w2.try_write(b"occ2").unwrap();
+    assert!(v2.try_read_into(&mut buf).unwrap());
+    assert_eq!(&buf[..], b"occ2");
+}
+
+/// The occupant-side swap a dlopen'd `.so` performs: each Load `attach_raw`s a
+/// fresh `RingBuffer<RawBacking>` over the host region, claims writer+view, and on
+/// `fsw_destroy` drops them (and the handle); a later Load re-attaches and
+/// re-acquires the freed reader slot over the SAME host-owned region. Sync-only,
+/// so Miri checks the reclaim path's provenance/leaks under reuse.
+#[test]
+fn raw_attach_swap_reacquire() {
+    let host = overwrite(256, 1); // host owns the region for the whole "mission"
+    let (base, len) = host.region();
+    let mut buf = Vec::new();
+
+    // Occupant 1: attach, claim, use, then drop everything (fsw_destroy).
+    {
+        let raw = unsafe { RingBuffer::<RawBacking>::attach_raw(base, len) }.unwrap();
+        let mut w = raw.writer(NoWake, NoWake);
+        let mut v = raw.view(NoWake, NoWake).unwrap();
+        assert_eq!(host.reader_count(), 1);
+        w.try_write(b"raw-occ1").unwrap();
+        assert!(v.try_read_into(&mut buf).unwrap());
+        assert_eq!(&buf[..], b"raw-occ1");
+    }
+    assert_eq!(
+        host.reader_count(),
+        0,
+        "raw occupant's reader slot freed on drop"
+    );
+
+    // Occupant 2: a fresh attach re-acquires the reclaimed slot over the same region.
+    let raw2 = unsafe { RingBuffer::<RawBacking>::attach_raw(base, len) }.unwrap();
+    let mut w2 = raw2.writer(NoWake, NoWake);
+    let mut v2 = raw2.view(NoWake, NoWake).unwrap();
+    assert_eq!(
+        host.reader_count(),
+        1,
+        "single reader slot reclaimed across raw re-attach"
+    );
+    assert!(
+        !v2.try_read_into(&mut buf).unwrap(),
+        "fresh raw view starts at the live edge"
+    );
+    w2.try_write(b"raw-occ2").unwrap();
+    assert!(v2.try_read_into(&mut buf).unwrap());
+    assert_eq!(&buf[..], b"raw-occ2");
+}
+
 // ----- mmap backing (feature-gated) -----
 
 #[cfg(feature = "mmap")]
