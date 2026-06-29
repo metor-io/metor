@@ -16,6 +16,7 @@ mod descriptor;
 mod dynamic;
 mod frame;
 mod health;
+mod message;
 mod port;
 mod reader;
 mod registry;
@@ -56,7 +57,7 @@ pub use coordinator::{
 };
 
 // The general output registry and the telemetry downlink (its first consumer).
-pub use registry::{OutputRegistry, RegistryEntry};
+pub use registry::{MessageRegistry, MessageEntry, OutputRegistry, RegistryEntry};
 pub use telemetry::{
     TcpTransport, TelemetryConfig, TelemetryMode, TelemetrySystem, Transport, TransportError,
 };
@@ -68,6 +69,10 @@ pub use health::{
     HealthPort, LOG_MSG_CAP, Level, LogLine, MAX_ERR_KINDS, MAX_LINES, SystemHealth, SystemLog,
 };
 pub use port::{DEFAULT_DEPTH, FrameRef, Input, Output, buffer_capacity, capacity_for};
+
+// The general message channel — the `(PacketId, postcard)` record format, the
+// type-erased emit port, and its sizing/record helpers (`docs/messages.md` §1, §2).
+pub use message::{MAX_MSG_BYTES, MSG_DEPTH, MsgOut, msg_capacity, split_record};
 pub use system::{
     AsyncSystem, BuildSystem, CyclicRunner, CyclicSystem, Out, System, SystemInput, SystemOutput,
 };
