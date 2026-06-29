@@ -33,6 +33,10 @@ pub struct Wiring {
     /// The system instances, static (resolved in the [`Registry`](super::Registry)) or
     /// dl (loaded from an [`Artifact`]).
     pub systems: Vec<SystemSpec>,
+    /// The runtime-loadable sequence **slots** (sequences-slots.md §5). Each is an
+    /// instance like a [`SystemSpec`] — it `connect`s by name — but its occupant is
+    /// `Load`ed/`Start`ed/`Stop`ped at runtime from a pre-opened allowed set.
+    pub slots: Vec<SlotSpec>,
     /// The producer → consumer edges.
     pub edges: Vec<EdgeSpec>,
     /// The telemetry downlink, if any.
@@ -133,6 +137,60 @@ impl ParamSource {
     pub fn is_none(&self) -> bool {
         matches!(self, ParamSource::None)
     }
+}
+
+/// A runtime-loadable **slot** instance (sequences-slots.md §5): a fixed position in the
+/// cyclic chain whose occupant the host swaps at runtime. The `inputs`/`outputs` are the
+/// declared user-port contract (validated at [`resolve`](super::resolve) against the
+/// allowed occupants' shared descriptor); `allow` is the pre-opened candidate set; an
+/// optional `initial` occupant is applied at startup. A slot `connect`s by `name` exactly
+/// like a [`SystemSpec`].
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct SlotSpec {
+    /// The slot instance name (the telemetry prefix + `connect`/command address).
+    pub name: String,
+    /// The declared **input** user-port frame names (the validated contract).
+    pub inputs: Vec<String>,
+    /// The declared **output** user-port frame names (the validated contract).
+    pub outputs: Vec<String>,
+    /// The allowed occupants, each an [`Artifact`] referenced by id (1:1 with the `Load`
+    /// name for v1). Non-empty is required at [`resolve`](super::resolve).
+    pub allow: Vec<AllowedOccupantSpec>,
+    /// The occupant to apply at startup, if any.
+    pub initial: Option<InitialOccupantSpec>,
+}
+
+/// One allowed occupant of a [`SlotSpec`]: an [`Artifact`] referenced by id (the `Load`
+/// name == the artifact id for v1), plus optional default params (a `system`-node-shaped
+/// [`ParamSource`], schema-encoded against the occupant `.so` at resolve).
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct AllowedOccupantSpec {
+    /// The occupant id — the [`Artifact::id`] of the sequence cdylib, and its `Load` name.
+    pub occupant: String,
+    /// Where this occupant's default params come from — see [`ParamSource`].
+    pub params: ParamSource,
+}
+
+/// The occupant a [`SlotSpec`] applies at startup (sequences-slots.md §5): which allowed
+/// occupant and what lifecycle state to bring it to.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct InitialOccupantSpec {
+    /// The allowed-set occupant id to `Load` at startup.
+    pub occupant: String,
+    /// The startup lifecycle state to drive it to.
+    pub state: SlotInitState,
+}
+
+/// The startup lifecycle state of a [`SlotSpec`]'s initial occupant: leave the slot empty,
+/// `Load` the occupant, or `Load` + `Start` it (running from the first cycle).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum SlotInitState {
+    /// No initial occupant (the slot starts empty).
+    Empty,
+    /// `Load` the occupant at startup (built but not polling).
+    Loaded,
+    /// `Load` + `Start` the occupant (running from the first cycle).
+    Running,
 }
 
 /// One producer → consumer edge.

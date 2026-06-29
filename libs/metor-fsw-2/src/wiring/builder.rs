@@ -26,8 +26,8 @@ use std::net::SocketAddr;
 use serde::Serialize;
 
 use super::model::{
-    Artifact, ClockSpec, CoordinatorSpec, EdgeSpec, ParamSource, SystemSpec, TelemetryModeSpec,
-    TelemetrySpec, Wiring,
+    AllowedOccupantSpec, Artifact, ClockSpec, CoordinatorSpec, EdgeSpec, InitialOccupantSpec,
+    ParamSource, SlotInitState, SlotSpec, SystemSpec, TelemetryModeSpec, TelemetrySpec, Wiring,
 };
 
 /// Fluent constructor for a [`Wiring`]. Start with [`new`](Self::new), set the
@@ -37,6 +37,7 @@ pub struct WiringBuilder {
     coordinator: CoordinatorSpec,
     artifacts: Vec<Artifact>,
     systems: Vec<SystemSpec>,
+    slots: Vec<SlotSpec>,
     edges: Vec<EdgeSpec>,
     telemetry: Option<TelemetrySpec>,
 }
@@ -59,6 +60,7 @@ impl WiringBuilder {
             },
             artifacts: Vec::new(),
             systems: Vec::new(),
+            slots: Vec::new(),
             edges: Vec::new(),
             telemetry: None,
         }
@@ -163,15 +165,107 @@ impl WiringBuilder {
         self
     }
 
+    /// Begin a runtime-loadable **slot** named `name`; finish it with
+    /// [`SlotSpecBuilder::end`]. Declare its allowed occupants
+    /// ([`allow`](SlotSpecBuilder::allow)), its `input`/`output` contract
+    /// ([`input`](SlotSpecBuilder::input)/[`output`](SlotSpecBuilder::output)), and an
+    /// optional [`initial`](SlotSpecBuilder::initial) occupant before `end` — the Rust
+    /// mirror of the KDL `slot` node (sequences-slots.md §5).
+    pub fn slot(self, name: impl Into<String>) -> SlotSpecBuilder {
+        SlotSpecBuilder {
+            parent: self,
+            spec: SlotSpec {
+                name: name.into(),
+                inputs: Vec::new(),
+                outputs: Vec::new(),
+                allow: Vec::new(),
+                initial: None,
+            },
+        }
+    }
+
+    /// Push a fully-built [`SlotSpec`] (the escape hatch for a programmatically-assembled
+    /// slot; [`slot`](Self::slot) is the fluent path).
+    pub fn add_slot_spec(mut self, spec: SlotSpec) -> Self {
+        self.slots.push(spec);
+        self
+    }
+
     /// Finish the [`Wiring`].
     pub fn build(self) -> Wiring {
         Wiring {
             coordinator: self.coordinator,
             artifacts: self.artifacts,
             systems: self.systems,
+            slots: self.slots,
             edges: self.edges,
             telemetry: self.telemetry,
         }
+    }
+}
+
+/// The per-slot fluent sub-builder returned by [`WiringBuilder::slot`]; owns the parent
+/// builder so the chain flows back through [`end`](Self::end). The Rust mirror of the KDL
+/// `slot` node.
+pub struct SlotSpecBuilder {
+    parent: WiringBuilder,
+    spec: SlotSpec,
+}
+
+impl SlotSpecBuilder {
+    /// Declare an **allowed** occupant by artifact id (the `Load` name, 1:1 for v1), with
+    /// no default params ([`ParamSource::None`]). Use
+    /// [`allow_with_params`](Self::allow_with_params) for typed default params.
+    pub fn allow(mut self, occupant: impl Into<String>) -> Self {
+        self.spec.allow.push(AllowedOccupantSpec {
+            occupant: occupant.into(),
+            params: ParamSource::None,
+        });
+        self
+    }
+
+    /// Declare an allowed occupant carrying typed default params, postcard-encoded into the
+    /// canonical [`ParamSource::Postcard`] bytes (byte-identical to the KDL schema-guided
+    /// encode — the same equivalence as [`SystemSpecBuilder::params`]).
+    pub fn allow_with_params<P: Serialize>(
+        mut self,
+        occupant: impl Into<String>,
+        params: P,
+    ) -> Self {
+        let bytes = postcard::to_allocvec(&params)
+            .expect("params postcard-encode (Serialize is infallible)");
+        self.spec.allow.push(AllowedOccupantSpec {
+            occupant: occupant.into(),
+            params: ParamSource::Postcard(bytes),
+        });
+        self
+    }
+
+    /// Declare an `input` user-port frame name (the validated contract).
+    pub fn input(mut self, frame: impl Into<String>) -> Self {
+        self.spec.inputs.push(frame.into());
+        self
+    }
+
+    /// Declare an `output` user-port frame name (the validated contract).
+    pub fn output(mut self, frame: impl Into<String>) -> Self {
+        self.spec.outputs.push(frame.into());
+        self
+    }
+
+    /// Set the startup occupant and its [`SlotInitState`].
+    pub fn initial(mut self, occupant: impl Into<String>, state: SlotInitState) -> Self {
+        self.spec.initial = Some(InitialOccupantSpec {
+            occupant: occupant.into(),
+            state,
+        });
+        self
+    }
+
+    /// Finish this slot, push it onto the [`Wiring`], and return the parent builder.
+    pub fn end(mut self) -> WiringBuilder {
+        self.parent.slots.push(self.spec);
+        self.parent
     }
 }
 
