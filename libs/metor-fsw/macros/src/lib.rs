@@ -12,6 +12,7 @@ mod export;
 mod frame;
 mod from_kdl;
 mod metadatatize;
+mod sequence;
 mod system;
 
 #[derive(Debug, FromField)]
@@ -113,6 +114,20 @@ pub fn system_output(input: TokenStream) -> TokenStream {
 #[proc_macro]
 pub fn export_system(input: TokenStream) -> TokenStream {
     export::export_system(input)
+}
+
+/// `#[sequence]` / `#[sequence(name = "…")]` — turns an `async fn` whose parameters are
+/// `Input<T, B>`/`Output<T, B>` ports into a complete dl-loadable sequence occupant
+/// (sequences-slots.md §4): a future-driven state machine plus the `fsw_*` C-ABI
+/// exports (delegating to `metor_fsw_2::abi::run_seq_*`, the sequence twins of the
+/// `run_*` helpers `export_system!` uses). The ports are read off the signature and
+/// **moved into the future**; the macro appends the implicit `SlotControlIn` input and
+/// the `SequenceStatus` + health/log output tail. `name` defaults to the fn name. A
+/// sequence may be paramless (`Params = ()`) or take one params parameter
+/// (`Serialize + Deserialize + Schema`, the postcard contract).
+#[proc_macro_attribute]
+pub fn sequence(attr: TokenStream, item: TokenStream) -> TokenStream {
+    sequence::sequence(attr, item)
 }
 
 /// Derives [`FromKdlNode`] for a system's params struct: a flat struct of

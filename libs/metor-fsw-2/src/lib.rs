@@ -23,6 +23,11 @@ mod system;
 mod telemetry;
 mod writer;
 
+// The sequence-occupant runtime (the future-driven state machine a `#[sequence]`
+// async fn becomes). Ungated alongside `abi`/`dl` — sequences are an ABI/runtime
+// feature, not KDL.
+pub mod sequence;
+
 // The KDL wiring front-end (registry, FromKdlNode derive, `load()`).
 #[cfg(feature = "kdl")]
 pub mod wiring;
@@ -76,6 +81,18 @@ pub use metor_fsw_macros::{Frame, SystemInput, SystemOutput};
 
 // The `export_system!` macro that emits a system `cdylib`'s C-ABI surface.
 pub use metor_fsw_macros::export_system;
+
+// The `#[sequence]` attribute macro that turns an `async fn` into a dl-loadable
+// occupant (the sequence twin of `export_system!`). Coexists with the `sequence`
+// module above (module in the type namespace, macro in the macro namespace).
+pub use metor_fsw_macros::sequence;
+
+// The sequence-occupant runtime surface (the free author API, the telemetry/cancel
+// frames, and the `SeqSystem` seam the `#[sequence]` macro implements).
+pub use sequence::{
+    Outcome, Seq, SeqBound, SeqClock, SeqStatusOut, SeqSystem, SequenceStatus, SlotControlIn, Step,
+    Wait, aborted, progress, wait, with_clock,
+};
 
 // Re-exports the `#[derive(Frame)]` / `#[derive(FromKdlNode)]` generated code names
 // (`::metor_fsw_2::metor_proto::…`, `::metor_fsw_2::path::…`, `::metor_fsw_2::kdl::…`)
