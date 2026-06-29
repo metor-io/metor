@@ -26,7 +26,9 @@ use metor_fsw_ring::{
     BoxBacking, Config, NoWake, Notifier, Overrun, RingBuffer, View, WakeSource, Writer,
 };
 use metor_proto::types::{ComponentId, Timestamp};
-use metor_proto_wkt::{ChannelId, SequenceChannelSpec, SequenceRegistry};
+use metor_proto_wkt::{
+    ChannelId, SequenceChannelSpec, SequenceCommandKind, SequenceRegistry,
+};
 use stellarator::sync::WaitQueue;
 use stellarator::{JoinHandle, JoinHandleDropGuard};
 use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
@@ -39,7 +41,9 @@ use crate::port::{Input, Output, buffer_capacity, capacity_for};
 use crate::message::{MAX_MSG_BYTES, MSG_DEPTH, MsgOut, msg_capacity};
 use crate::registry::{MessageEntry, MessageRegistry, OutputRegistry, RegistryEntry};
 use crate::system::{AsyncSystem, CyclicRunner, CyclicSystem, Out, System, SystemOutput};
-use crate::telemetry::{TelemetryConfig, TelemetrySystem, Transport};
+use crate::telemetry::{
+    MsgInbox, RecvTransport, TelemetryConfig, TelemetrySystem, Transport, run_receiver,
+};
 use crate::{DEFAULT_DEPTH, Frame};
 use crate::descriptor::compatible;
 use crate::sequence::{SequenceStatus, SlotControlIn};
@@ -479,6 +483,23 @@ where
     }
 }
 
+/// A registered **uplink** reader (`docs/messages.md` §4): erased so the coordinator can
+/// hold one regardless of the concrete [`RecvTransport`], and bound at `start()` into a
+/// spawned [`run_receiver`] task filling the shared [`MsgInbox`].
+trait UplinkLauncher {
+    fn launch(self: Box<Self>, inbox: Arc<MsgInbox>, stop: Arc<AtomicBool>) -> JoinHandle<()>;
+}
+
+struct UplinkReg<R> {
+    recv: R,
+}
+
+impl<R: RecvTransport + 'static> UplinkLauncher for UplinkReg<R> {
+    fn launch(self: Box<Self>, inbox: Arc<MsgInbox>, stop: Arc<AtomicBool>) -> JoinHandle<()> {
+        stellarator::spawn(run_receiver(self.recv, inbox, stop))
+    }
+}
+
 /// A registered dlopen'd cyclic system: the loaded handle plus its postcard `Params`
 /// blob. At `build()` it is turned into a [`DlSlot`](crate::dl) instead of a typed
 /// [`CyclicRunner`]; everything before that (descriptor push, edge validation, ring
@@ -519,6 +540,10 @@ pub struct CoordinatorBuilder {
     /// is an extra fan-out consumer on *every* output buffer, so `build()` sizes every
     /// ring's `max_readers` to include it. Bumped by [`add_telemetry`](Self::add_telemetry).
     n_registry_consumers: usize,
+    /// The optional uplink reader (`docs/messages.md` §4), registered by
+    /// [`add_uplink`](Self::add_uplink); `build()` mints its [`MsgInbox`] and `start()`
+    /// spawns its [`run_receiver`] task. `None` for a downlink-only mission.
+    uplink: Option<Box<dyn UplinkLauncher>>,
 }
 
 impl CoordinatorBuilder {
@@ -531,6 +556,7 @@ impl CoordinatorBuilder {
             names: Vec::new(),
             edges: Vec::new(),
             n_registry_consumers: 0,
+            uplink: None,
         }
     }
 
@@ -598,6 +624,24 @@ impl CoordinatorBuilder {
     {
         self.n_registry_consumers += 1;
         self.add_cyclic_named("telemetry", TelemetrySystem::new(config))
+    }
+
+    /// Register the optional **uplink** (`docs/messages.md` §4): an async reader that
+    /// ingests panel `SequenceCommand` Msgs off `recv` into the coordinator's
+    /// [`MsgInbox`], which the head of [`run_for`](Coordinator::run_for) drains — mapping
+    /// each command through the channel↔slot map ([`channel_map`](Coordinator::channel_map))
+    /// into a [`SlotCommand`] on the existing command ring — the **same cycle** it arrives.
+    /// Optional: a downlink-only mission omits it and is unaffected.
+    ///
+    /// For a shared bidirectional TCP link, pair the read half from
+    /// [`connect_once`](crate::telemetry::connect_once) here with its write half in
+    /// [`add_telemetry`](Self::add_telemetry); the Mock test path supplies a
+    /// [`RecvTransport`] directly.
+    pub fn add_uplink<R>(&mut self, recv: R)
+    where
+        R: RecvTransport + 'static,
+    {
+        self.uplink = Some(Box::new(UplinkReg { recv }));
     }
 
     /// Register a dlopen'd cyclic system under an explicit instance name. `loaded` is
@@ -1021,12 +1065,23 @@ impl CoordinatorBuilder {
         let command_ring = coord_ring::<SlotCommand>(depth, 1 + READER_SLACK);
         let command_view =
             Input::new(command_ring.view(NoWake, NoWake).expect("command reader slot"));
+        // The uplink's writer over the same ring (`docs/messages.md` §4): the head-of-cycle
+        // stage writes mapped `SlotCommand`s here, drained by `drain_commands` the same
+        // cycle. Single-writer discipline — only the uplink stage writes through it (the
+        // in-proc `control_handle` is the alternate, mutually-exclusive driver).
+        let command_out = slot_writer::<SlotCommand>(&command_ring);
         table.rings.push(RingEntry {
             ring: command_ring.clone(),
             frame_id: SlotCommand::FRAME_ID,
             role: BufferRole::Coordinator,
             instance: None,
         });
+
+        // --- Uplink: mint the shared inbox + take the registered reader (§4) ------------
+        // The reader task (spawned at `start()`) fills the inbox; `run_for`'s head stage
+        // drains it. `None` for a downlink-only mission.
+        let uplink = self.uplink.take();
+        let inbox = uplink.as_ref().map(|_| Arc::new(MsgInbox::new()));
 
         // Freeze the registry; every consumer's bind pulls this same handle.
         let registry = Arc::new(OutputRegistry::new(reg_entries));
@@ -1236,10 +1291,16 @@ impl CoordinatorBuilder {
             message_registry,
             command_ring,
             command_view,
+            command_out,
             channel_map,
             seq_registry_out,
             seq_registry,
             seq_registry_emitted: false,
+            uplink,
+            inbox,
+            uplink_stop: Arc::new(AtomicBool::new(false)),
+            uplink_task: None,
+            uplink_dropped: 0,
             // Declared last so the canonical ring handles drop after every port.
             rings: table,
         })
@@ -1386,6 +1447,9 @@ pub struct Coordinator {
     command_ring: RingBuffer<BoxBacking>,
     /// The coordinator's drain view over the command ring (drained before the slot steps).
     command_view: Input<SlotCommand>,
+    /// The uplink's writer over the command ring (`docs/messages.md` §4): the head-of-cycle
+    /// stage writes mapped `SlotCommand`s here for `drain_commands` to dispatch same-cycle.
+    command_out: Output<SlotCommand>,
     /// The channel↔slot map built once at `build()` (R4): `ChannelId` (the slot's
     /// build-order index among slots) → slot instance name. W4 reads it for the boot
     /// [`SequenceRegistry`]; W3's uplink reuses the **same** map to address commands.
@@ -1398,6 +1462,20 @@ pub struct Coordinator {
     /// Whether the boot `SequenceRegistry` has been emitted (emit-once; the re-emit hook
     /// for a future `ReloadSequences` is [`emit_sequence_registry`](Coordinator::emit_sequence_registry)).
     seq_registry_emitted: bool,
+    /// The registered uplink reader (`docs/messages.md` §4), taken and spawned in
+    /// [`start`](Coordinator::start); `None` for a downlink-only mission (or after start).
+    uplink: Option<Box<dyn UplinkLauncher>>,
+    /// The shared inbox the uplink reader fills and the head of `run_for` drains. `Some`
+    /// iff an uplink was registered.
+    inbox: Option<Arc<MsgInbox>>,
+    /// Signals the uplink reader to stop (set at teardown). Its `drop_guard` cancels the
+    /// task regardless when the coordinator is dropped.
+    uplink_stop: Arc<AtomicBool>,
+    /// Holds the spawned uplink reader task; its `Drop` cancels it on teardown.
+    #[allow(dead_code)]
+    uplink_task: Option<JoinHandleDropGuard<()>>,
+    /// How many inbox overflow-drops we have already surfaced to health (once each).
+    uplink_dropped: u64,
     /// Canonical ring handles; declared last so they drop after every port.
     #[allow(dead_code)]
     rings: RingTable,
@@ -1516,7 +1594,12 @@ impl Coordinator {
                 ClockMode::Wall => Timestamp::now(),
                 ClockMode::Simulated { dt } => epoch + dt * k as u32,
             };
-            // Control plane (§3): drain the slot-command uplink and broadcast each command
+            // Uplink head stage (`docs/messages.md` §4): drain the inbox the reader task
+            // fills, map each panel `SequenceCommand` → `SlotCommand` via the channel↔slot
+            // map, and write it to the command ring **before** the drain below — so a panel
+            // command dispatches the *same* cycle it arrives (no off-by-one).
+            self.drain_uplink();
+            // Control plane (§3): drain the slot-command ring and broadcast each command
             // to every slot *before* stepping. `drain` (not `latest`) so no command is
             // dropped; the per-slot `command` default no-op makes non-slots ignore it, and
             // a `SlotRunner` filters by name.
@@ -1583,10 +1666,59 @@ impl Coordinator {
         for slot in &mut self.cyclic {
             slot.init();
         }
+        // Spawn the uplink reader (`docs/messages.md` §4), if registered: it fills the
+        // shared inbox the head of `run_for` drains. Guarded by `uplink_stop` (set at
+        // teardown); its drop guard cancels it if it is parked in `recv` when we tear down.
+        if let (Some(launcher), Some(inbox)) = (self.uplink.take(), self.inbox.clone()) {
+            let handle = launcher.launch(inbox, self.uplink_stop.clone());
+            self.uplink_task = Some(handle.drop_guard());
+        }
+
         // Release the async tasks into their run loops.
         go_flag.store(true, Release);
         go.wake_all();
         tasks
+    }
+
+    /// The uplink head-of-cycle stage (`docs/messages.md` §4): drain the inbox the reader
+    /// task fills, translate each panel `SequenceCommand { channel_id, command }` into a
+    /// [`SlotCommand`] addressed by the channel↔slot map, and write it to the command ring
+    /// for [`drain_commands`](Self::drain_commands) to dispatch the **same cycle**. An
+    /// unknown `channel_id` is dropped and logged; inbox overflow-drops are surfaced once
+    /// each. A no-op when no uplink is registered.
+    fn drain_uplink(&mut self) {
+        let Some(inbox) = self.inbox.clone() else {
+            return;
+        };
+        for cmd in inbox.drain() {
+            // Resolve the channel id → slot name (the borrow ends before the writes below).
+            let slot = self
+                .channel_map
+                .iter()
+                .find(|(id, _)| *id == cmd.channel_id)
+                .map(|(_, name)| *name);
+            let Some(slot) = slot else {
+                self.coord_health.log(
+                    Level::Warn,
+                    &format!("uplink: unknown channel_id {}", cmd.channel_id),
+                );
+                continue;
+            };
+            let slot_cmd = match cmd.command {
+                SequenceCommandKind::Load { name } => SlotCommand::load(slot, &name),
+                SequenceCommandKind::Start => SlotCommand::start(slot),
+                SequenceCommandKind::Abort => SlotCommand::abort(slot),
+                SequenceCommandKind::Stop => SlotCommand::stop(slot),
+                SequenceCommandKind::Reset => SlotCommand::reset(slot),
+            };
+            let _ = self.command_out.write(&slot_cmd);
+        }
+        // Surface any commands the inbox dropped-oldest on overflow (once each).
+        let dropped = inbox.dropped();
+        while self.uplink_dropped < dropped {
+            self.coord_health.error("uplink.dropped");
+            self.uplink_dropped += 1;
+        }
     }
 
     /// Drain the slot-command ring and dispatch each command to every slot
@@ -1702,6 +1834,8 @@ impl Coordinator {
     /// `shutdown` the cyclic systems in reverse registration order. The
     /// `RingTable` drops last (struct field order).
     async fn shutdown(&mut self, tasks: Vec<AsyncTask>) {
+        // Stop the uplink reader (its drop guard cancels it if parked in `recv`).
+        self.uplink_stop.store(true, Release);
         for t in &tasks {
             t.stop.store(true, Release);
             for n in &t.wake_on_stop {
