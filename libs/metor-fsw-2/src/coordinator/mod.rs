@@ -26,6 +26,7 @@ use metor_fsw_ring::{
     BoxBacking, Config, NoWake, Notifier, Overrun, RingBuffer, View, WakeSource, Writer,
 };
 use metor_proto::types::{ComponentId, Timestamp};
+use metor_proto_wkt::{ChannelId, SequenceChannelSpec, SequenceRegistry};
 use stellarator::sync::WaitQueue;
 use stellarator::{JoinHandle, JoinHandleDropGuard};
 use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
@@ -35,13 +36,13 @@ use crate::descriptor::{Hz, PortDesc, SystemDescriptor, SystemKind};
 use crate::dynamic::FrameList;
 use crate::health::{HealthPort, Level};
 use crate::port::{Input, Output, buffer_capacity, capacity_for};
-use crate::message::{MsgOut, msg_capacity};
+use crate::message::{MAX_MSG_BYTES, MSG_DEPTH, MsgOut, msg_capacity};
 use crate::registry::{MessageEntry, MessageRegistry, OutputRegistry, RegistryEntry};
 use crate::system::{AsyncSystem, CyclicRunner, CyclicSystem, Out, System, SystemOutput};
 use crate::telemetry::{TelemetryConfig, TelemetrySystem, Transport};
 use crate::{DEFAULT_DEPTH, Frame};
 use crate::descriptor::compatible;
-use crate::sequence::SlotControlIn;
+use crate::sequence::{SequenceStatus, SlotControlIn};
 
 mod slot;
 pub use slot::{
@@ -411,6 +412,18 @@ struct AsyncTask {
 struct PendingAsync {
     launcher: Box<dyn AsyncLauncher>,
     wake_on_stop: Vec<Notifier>,
+}
+
+/// The per-slot auxiliary ports the build pass allocates ahead of the bind loop and
+/// hands to the [`SlotRunner`]: the host control/status writers' rings, the slot's
+/// message channel (the events `MsgOut`), a read view on the occupant's own
+/// [`SequenceStatus`] output, and the slot's [`ChannelId`] (`docs/messages.md` §5).
+struct SlotAux {
+    control_ring: RingBuffer<BoxBacking>,
+    status_ring: RingBuffer<BoxBacking>,
+    events: MsgOut<BoxBacking>,
+    seq_status: Input<SequenceStatus>,
+    channel_id: ChannelId,
 }
 
 // ---------------------------------------------------------------------------
@@ -838,10 +851,9 @@ impl CoordinatorBuilder {
         // bind loop, so a system can pull it in `BindPorts::bind` (telemetry.md §2.3).
         let mut reg_entries: Vec<RegistryEntry> = Vec::new();
         // The parallel message-channel index (`docs/messages.md` §2), collected and frozen
-        // beside `reg_entries`. v1 allocates no message rings from generic systems — W4
-        // adds the per-slot sequence channels via the `msg_ring`/`msg_writer` helpers — so
-        // this is empty for now; the plumbing/freeze/accessor is what this wave lands.
-        let msg_entries: Vec<MessageEntry> = Vec::new();
+        // beside `reg_entries`. W4 fills it with the per-slot sequence event channels plus
+        // the coordinator's boot-`SequenceRegistry` channel (allocated below).
+        let mut msg_entries: Vec<MessageEntry> = Vec::new();
         // Each registry consumer is an extra fan-out reader on every output buffer.
         let n_reg = self.n_registry_consumers;
 
@@ -894,16 +906,37 @@ impl CoordinatorBuilder {
             });
         }
 
-        // --- Slot aux rings (control input + SlotStatus output) --------------
-        // Allocated *before* the registry freeze so the SlotStatus tap lands in the
-        // registry like any output. The control ring is host-written / occupant-read
-        // (uplink), so it is owned but not telemetered.
-        let mut slot_aux: HashMap<usize, (RingBuffer<BoxBacking>, RingBuffer<BoxBacking>)> =
-            HashMap::new();
+        // --- Slot aux rings (control input + SlotStatus output + events) -----
+        // Allocated *before* the registry freeze so the SlotStatus tap + the message
+        // channel land in their registries like any output. The control ring is
+        // host-written / occupant-read (uplink), so it is owned but not telemetered.
+        //
+        // This loop also builds the **channel↔slot map** once (R4): `channel_id` = the
+        // slot's build-order index *among slots*, `name` = the slot instance name. The
+        // uplink (W3) reuses this map to address commands; here W4 reads it for the boot
+        // `SequenceRegistry` payload (`seq_specs`) — built once, never recomputed.
+        let mut slot_aux: HashMap<usize, SlotAux> = HashMap::new();
+        let mut channel_map: Vec<(ChannelId, &'static str)> = Vec::new();
+        let mut seq_specs: Vec<SequenceChannelSpec> = Vec::new();
+        let mut next_channel: ChannelId = 0;
+        // `s` indexes several disjoint collections (`regs`/`descs`/`names`/`output_rings`),
+        // so the range loop is clearer than zipping five iterators.
+        #[allow(clippy::needless_range_loop)]
         for s in 0..n {
-            if !matches!(self.regs[s], Reg::Slot(_)) {
+            let Reg::Slot(slot_reg) = &self.regs[s] else {
                 continue;
-            }
+            };
+            let channel_id = next_channel;
+            next_channel += 1;
+            let slot_name: &'static str = self.descs[s].name;
+            channel_map.push((channel_id, slot_name));
+            // One `SequenceChannelSpec` per slot: its channel id, instance name, and the
+            // allowed-occupant names the panel may `Load` (`docs/messages.md` §5).
+            seq_specs.push(SequenceChannelSpec {
+                id: channel_id,
+                name: slot_name.to_string(),
+                available: slot_reg.allowed.iter().map(|a| a.name.clone()).collect(),
+            });
             // SlotStatus: a normal output, sized for the registry consumers (+ slack);
             // nothing edge-connects to it (fan-out 0).
             let status_ring = coord_ring::<SlotStatus>(depth, n_reg + READER_SLACK);
@@ -917,7 +950,7 @@ impl CoordinatorBuilder {
                     system: s,
                     port: self.descs[s].outputs.len(),
                 },
-                instance: Some(instance),
+                instance: Some(instance.clone()),
             });
             // Control: the occupant attaches one `View` over it per Load (released on
             // each Stop/Reset/Unload), so 1 reader slot + slack covers the reload cycle.
@@ -928,8 +961,59 @@ impl CoordinatorBuilder {
                 role: BufferRole::Coordinator,
                 instance: None,
             });
-            slot_aux.insert(s, (control_ring, status_ring));
+            // Events: the slot's own message channel — a single-writer `MsgOut`, tapped
+            // by the registry consumers like an output (the downlink, W2).
+            let events_ring = msg_ring(MAX_MSG_BYTES, MSG_DEPTH, n_reg + READER_SLACK);
+            let events = msg_writer(&events_ring);
+            let events_entry = message_entry(&instance, "sequences", events_ring.clone());
+            table.rings.push(RingEntry {
+                ring: events_ring,
+                frame_id: events_entry.key,
+                role: BufferRole::Coordinator,
+                instance: Some(instance),
+            });
+            msg_entries.push(events_entry);
+            // A read view on the slot's *own* SequenceStatus output (one extra reader,
+            // covered by READER_SLACK) — the runner drains it for Progress + outcome.
+            let seq_idx = self.descs[s]
+                .outputs
+                .iter()
+                .position(|p| p.frame_id == SequenceStatus::FRAME_ID)
+                .expect("a v1 slot occupant publishes a SequenceStatus output");
+            let seq_status = Input::new(
+                output_rings[s][seq_idx]
+                    .view(NoWake, NoWake)
+                    .expect("SequenceStatus reader slot (READER_SLACK)"),
+            );
+            slot_aux.insert(
+                s,
+                SlotAux {
+                    control_ring,
+                    status_ring,
+                    events,
+                    seq_status,
+                    channel_id,
+                },
+            );
         }
+
+        // --- Coordinator-owned boot-`SequenceRegistry` message channel (§5) ---
+        // A single-writer `MsgOut` the coordinator emits one `SequenceRegistry` over at
+        // startup (in `run_for`, not here — a tap claimed after `build()` would miss an
+        // emit-at-build, the overwrite ring starting at the live edge). Registry-tapped
+        // so the downlink (W2) carries it.
+        let seq_registry_ring = msg_ring(MAX_MSG_BYTES, MSG_DEPTH, n_reg + READER_SLACK);
+        let seq_registry_out = msg_writer(&seq_registry_ring);
+        let seq_registry_entry =
+            message_entry(COORDINATOR_INSTANCE, "sequences", seq_registry_ring.clone());
+        table.rings.push(RingEntry {
+            ring: seq_registry_ring,
+            frame_id: seq_registry_entry.key,
+            role: BufferRole::Coordinator,
+            instance: None,
+        });
+        msg_entries.push(seq_registry_entry);
+        let seq_registry = SequenceRegistry { channels: seq_specs };
 
         // --- Coordinator-owned slot-command ring (the control-plane uplink, §3) ---
         // Drained once per cycle (a single coordinator `View`); `control_handle()` hands
@@ -1036,8 +1120,13 @@ impl CoordinatorBuilder {
                 // — only `init`/`Load` (runtime) does.
                 Reg::Slot(slot_reg) => {
                     use crate::abi::{FswRing, ROLE_INPUT, ROLE_OUTPUT};
-                    let (control_ring, status_ring) =
-                        slot_aux.remove(&id).expect("slot aux rings allocated");
+                    let SlotAux {
+                        control_ring,
+                        status_ring,
+                        events,
+                        seq_status,
+                        channel_id,
+                    } = slot_aux.remove(&id).expect("slot aux rings allocated");
                     // The user inputs (registered descriptor) view their producers...
                     let mut inputs: Vec<FswRing> = (0..self.descs[id].inputs.len())
                         .map(|in_idx| {
@@ -1078,6 +1167,9 @@ impl CoordinatorBuilder {
                         outputs,
                         slot_writer::<SlotControlIn>(&control_ring),
                         slot_writer::<SlotStatus>(&status_ring),
+                        events,
+                        seq_status,
+                        channel_id,
                     );
                     cyclic.push(Box::new(runner));
                 }
@@ -1144,6 +1236,10 @@ impl CoordinatorBuilder {
             message_registry,
             command_ring,
             command_view,
+            channel_map,
+            seq_registry_out,
+            seq_registry,
+            seq_registry_emitted: false,
             // Declared last so the canonical ring handles drop after every port.
             rings: table,
         })
@@ -1205,9 +1301,8 @@ fn coord_ring<F: Frame>(depth: usize, max_readers: usize) -> RingBuffer<BoxBacki
 
 /// A coordinator-owned **message** ring, sized for `depth` records of up to `max_bytes`
 /// payload (the [`coord_ring`] twin for the `(id, postcard)` channel, `docs/messages.md`
-/// §2). Overwrite, like every owned ring; the registry consumers tap it. v1 mints none —
-/// W4 allocates the per-slot sequence channels through this pair.
-#[allow(dead_code)] // wired now (plumbing); first caller is W4's sequence coupling.
+/// §2). Overwrite, like every owned ring; the registry consumers tap it. W4 mints the
+/// per-slot sequence event channels + the coordinator's boot-registry channel through it.
 fn msg_ring(max_bytes: usize, depth: usize, max_readers: usize) -> RingBuffer<BoxBacking> {
     RingBuffer::create_in_memory(Config {
         capacity: msg_capacity(max_bytes, depth),
@@ -1219,9 +1314,21 @@ fn msg_ring(max_bytes: usize, depth: usize, max_readers: usize) -> RingBuffer<Bo
 /// A fresh host [`MsgOut`] over a coordinator-owned message ring — the [`slot_writer`]
 /// analogue for the message channel (`slot.rs:547`), exactly how the coordinator mints
 /// its own `status_out`/`control` writers. Single-writer discipline is the caller's.
-#[allow(dead_code)] // wired now (plumbing); first caller is W4's sequence coupling.
 fn msg_writer(ring: &RingBuffer<BoxBacking>) -> MsgOut<BoxBacking> {
     MsgOut::new(ring.writer(NoWake, NoWake))
+}
+
+/// Build a [`MessageEntry`] for one message channel: the instance-qualified key
+/// `ComponentId::new("<instance>.<channel>")` (the on-wire identity) over a clone of the
+/// ring — the [`registry_entry`] twin for the self-describing message channel
+/// (`docs/messages.md` §2). No vtable/announce; the record's 2-byte id is the schema.
+fn message_entry(instance: &str, channel: &str, ring: RingBuffer<BoxBacking>) -> MessageEntry {
+    MessageEntry {
+        key: ComponentId::new(&format!("{instance}.{channel}")),
+        instance: Arc::from(instance),
+        channel: Arc::from(channel),
+        ring,
+    }
 }
 
 /// The synthetic instance prefix coordinator-owned buffers downlink under
@@ -1279,6 +1386,18 @@ pub struct Coordinator {
     command_ring: RingBuffer<BoxBacking>,
     /// The coordinator's drain view over the command ring (drained before the slot steps).
     command_view: Input<SlotCommand>,
+    /// The channel↔slot map built once at `build()` (R4): `ChannelId` (the slot's
+    /// build-order index among slots) → slot instance name. W4 reads it for the boot
+    /// [`SequenceRegistry`]; W3's uplink reuses the **same** map to address commands.
+    channel_map: Vec<(ChannelId, &'static str)>,
+    /// The sole writer of the coordinator's boot-`SequenceRegistry` message channel (§5).
+    seq_registry_out: MsgOut<BoxBacking>,
+    /// The prebuilt boot [`SequenceRegistry`] payload (the slots + their allowed
+    /// occupants), emitted once at the head of [`run_for`](Coordinator::run_for).
+    seq_registry: SequenceRegistry,
+    /// Whether the boot `SequenceRegistry` has been emitted (emit-once; the re-emit hook
+    /// for a future `ReloadSequences` is [`emit_sequence_registry`](Coordinator::emit_sequence_registry)).
+    seq_registry_emitted: bool,
     /// Canonical ring handles; declared last so they drop after every port.
     #[allow(dead_code)]
     rings: RingTable,
@@ -1316,6 +1435,23 @@ impl Coordinator {
     /// allocates the per-slot sequence channels.
     pub fn message_registry(&self) -> Arc<MessageRegistry> {
         self.message_registry.clone()
+    }
+
+    /// The channel↔slot map (R4): `(ChannelId, slot instance name)` for every slot, the
+    /// `ChannelId` being the slot's build-order index among slots. Built once at
+    /// `build()`; it is the boot [`SequenceRegistry`]'s identity (W4) and the address
+    /// table W3's uplink resolves a `SequenceCommand`'s `channel_id` through — one map,
+    /// so the published id and the commanded id always agree.
+    pub fn channel_map(&self) -> &[(ChannelId, &'static str)] {
+        &self.channel_map
+    }
+
+    /// Emit the boot [`SequenceRegistry`] on the coordinator's message channel (§5): the
+    /// slots and their allowed occupants the panel's sequence view sources from. Called
+    /// once at the head of [`run_for`](Self::run_for); exposed as the re-emit hook a
+    /// future `ReloadSequences` would drive after rebuilding the payload.
+    pub fn emit_sequence_registry(&mut self) {
+        let _ = self.seq_registry_out.emit(&self.seq_registry);
     }
 
     /// A writer over the slot-command control ring (sequences-slots.md §3, Resolved Q1):
@@ -1360,6 +1496,12 @@ impl Coordinator {
     /// → shutdown all. Convenient for tests and bounded missions.
     pub async fn run_for(&mut self, cycles: usize) {
         let tasks = self.start().await;
+        // Emit the boot `SequenceRegistry` once, before the first cycle's events flow, so
+        // a tap claimed after `build()` observes it ahead of any `SequenceChannelEvent`.
+        if !self.seq_registry_emitted {
+            self.emit_sequence_registry();
+            self.seq_registry_emitted = true;
+        }
         let budget = Duration::from_secs_f64(1.0 / self.config.cycle_rate);
         // The epoch a `Simulated` clock advances from; unused under `Wall`.
         let epoch = Timestamp::now();
