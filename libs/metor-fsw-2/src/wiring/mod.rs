@@ -42,10 +42,13 @@ use metor_proto::types::ComponentId;
 
 use crate::binder::BindPorts;
 use crate::coordinator::{
-    ClockMode, Coordinator, CoordinatorBuilder, CoordinatorConfig, PortRef, SystemHandle, WireError,
+    ClockMode, Coordinator, CoordinatorBuilder, CoordinatorConfig, InitialOccupant, PortRef,
+    SystemHandle, WireError,
 };
-use crate::descriptor::SystemDescriptor;
+use crate::descriptor::{SystemDescriptor, compatible};
 use crate::dl::{DlError, DlSystem};
+use crate::frame::Frame;
+use crate::sequence::SlotControlIn;
 use crate::system::{AsyncSystem, BuildSystem, CyclicSystem, Out, SystemOutput};
 use crate::telemetry::{TcpTransport, TelemetryConfig, TelemetryMode};
 
@@ -59,10 +62,10 @@ mod model;
 
 pub use build_driver::{BuildError, BuildOptions, build_artifacts};
 pub use bundle::{BundleError, PackageOptions, load_bundle, write_bundle};
-pub use builder::{SystemSpecBuilder, WiringBuilder};
+pub use builder::{SlotSpecBuilder, SystemSpecBuilder, WiringBuilder};
 pub use model::{
-    Artifact, ClockSpec, CoordinatorSpec, EdgeSpec, ParamSource, SystemSpec, TelemetryModeSpec,
-    TelemetrySpec, Wiring,
+    AllowedOccupantSpec, Artifact, ClockSpec, CoordinatorSpec, EdgeSpec, InitialOccupantSpec,
+    ParamSource, SlotInitState, SlotSpec, SystemSpec, TelemetryModeSpec, TelemetrySpec, Wiring,
 };
 
 // Re-export the derive and the registration macro so a system author only needs
@@ -307,6 +310,67 @@ pub enum LoadError {
         #[source_code]
         src: String,
         #[label("this artifact node is incomplete")]
+        span: SourceSpan,
+    },
+
+    // --- slots (sequences-slots.md §5) --------------------------------------
+    #[error("`slot` node has an unknown child `{child}` (expected `input`/`output`/`allow`/`initial`)")]
+    #[diagnostic(code(fsw_wiring::unknown_slot_child))]
+    UnknownSlotChild {
+        child: String,
+        #[source_code]
+        src: String,
+        #[label("remove or rename this child")]
+        span: SourceSpan,
+    },
+
+    #[error("`slot \"{slot}\"` has no `allow` occupant (a slot needs at least one)")]
+    #[diagnostic(code(fsw_wiring::empty_slot))]
+    EmptySlot {
+        slot: String,
+        #[source_code]
+        src: String,
+        #[label("add an `allow occupant=\"...\"` child")]
+        span: SourceSpan,
+    },
+
+    #[error("`slot \"{slot}\"` has an invalid initial `state=\"{state}\"` (expected `empty`/`loaded`/`running`)")]
+    #[diagnostic(code(fsw_wiring::bad_slot_state))]
+    BadSlotState {
+        slot: String,
+        state: String,
+        #[source_code]
+        src: String,
+        #[label("use `empty`, `loaded`, or `running`")]
+        span: SourceSpan,
+    },
+
+    /// A `slot`'s declared `input`/`output frame="…"` contract names a frame that the
+    /// slot's resolved (registered) descriptor has no matching user port for — a typo or
+    /// a stale contract (the explicit-contract validation, Resolved Q4).
+    #[error("`slot \"{slot}\"` declares {dir} frame `{frame}` but its occupants have no such user port")]
+    #[diagnostic(code(fsw_wiring::slot_contract_mismatch))]
+    SlotContractMismatch {
+        slot: String,
+        dir: &'static str,
+        frame: String,
+        #[source_code]
+        src: String,
+        #[label("no occupant {dir} port is named this")]
+        span: SourceSpan,
+    },
+
+    /// Two allowed occupants of one `slot` have incompatible descriptors — the slot derives
+    /// its single contract from the allowed set's shared shape (v1 holds sequence occupants
+    /// only, so they must agree). A clean error in place of `add_slot`'s build-time panic.
+    #[error("`slot \"{slot}\"` occupant `{occupant}` is incompatible with the slot contract")]
+    #[diagnostic(code(fsw_wiring::slot_occupant_mismatch))]
+    SlotOccupantMismatch {
+        slot: String,
+        occupant: String,
+        #[source_code]
+        src: String,
+        #[label("this occupant's ports differ from the first allowed occupant's")]
         span: SourceSpan,
     },
 }
@@ -640,6 +704,16 @@ pub fn parse(kdl: &str) -> Result<Wiring, LoadError> {
         systems.push(parse_system(node, kdl, &mut seen)?);
     }
 
+    // --- Slots pass (sequences-slots.md §5; a slot is an instance like a system) ---
+    let mut slots: Vec<SlotSpec> = Vec::new();
+    for node in doc.nodes() {
+        if node.name().value() != "slot" {
+            continue;
+        }
+        let slot = parse_slot(node, kdl, &mut seen)?;
+        slots.push(slot);
+    }
+
     // --- Edges pass (wiring.md §4) ---------------------------------------
     let mut edges: Vec<EdgeSpec> = Vec::new();
     for node in doc.nodes() {
@@ -670,6 +744,7 @@ pub fn parse(kdl: &str) -> Result<Wiring, LoadError> {
         coordinator,
         artifacts,
         systems,
+        slots,
         edges,
         telemetry,
     })
@@ -704,6 +779,22 @@ pub fn resolve(wiring: &Wiring, registry: &Registry) -> Result<Coordinator, Load
                 name: spec.name.clone(),
                 src: system_src(spec),
                 span: (0, system_src(spec).len()).into(),
+            });
+        }
+    }
+
+    // --- Slots pass: a slot resolves to an instance like a system (it `connect`s by
+    //     name), so it joins `instances` before the edges pass (sequences-slots.md §5).
+    for slot in &wiring.slots {
+        let (handle, desc) = resolve_slot(slot, wiring, &mut builder)?;
+        if instances
+            .insert(slot.name.clone(), Instance { handle, desc })
+            .is_some()
+        {
+            return Err(LoadError::DuplicateInstance {
+                name: slot.name.clone(),
+                src: slot_src(slot),
+                span: (0, slot_src(slot).len()).into(),
             });
         }
     }
@@ -832,6 +923,152 @@ fn resolve_dl(
 /// no original document text).
 fn system_src(spec: &SystemSpec) -> String {
     format!("system \"{}\" type=\"{}\"", spec.name, spec.ty)
+}
+
+/// A best-effort source snippet for a slot's resolve-time errors.
+fn slot_src(slot: &SlotSpec) -> String {
+    format!("slot \"{}\"", slot.name)
+}
+
+/// Resolve a [`SlotSpec`] into a registered slot, mirroring [`resolve_dl`] **per allowed
+/// occupant**: find each occupant's [`Artifact`] by id, `DlSystem::open` its built `.so`,
+/// resolve its [`ParamSource`] to canonical postcard bytes (the same schema-guided encoder
+/// `resolve_dl` uses), and assemble the `(name, DlSystem, params)` allowed set. The slot's
+/// **registered descriptor** (the first occupant's descriptor with the trailing
+/// [`SlotControlIn`] input removed — what `add_slot`/`build()` register) is returned for
+/// the edges pass and validated against the declared `input`/`output` contract.
+fn resolve_slot(
+    slot: &SlotSpec,
+    wiring: &Wiring,
+    builder: &mut CoordinatorBuilder,
+) -> Result<(SystemHandle, SystemDescriptor), LoadError> {
+    let src = slot_src(slot);
+    let span: SourceSpan = (0, src.len()).into();
+
+    if slot.allow.is_empty() {
+        return Err(LoadError::EmptySlot {
+            slot: slot.name.clone(),
+            src,
+            span,
+        });
+    }
+
+    // Open + param-encode each allowed occupant (the per-occupant `resolve_dl` logic).
+    let mut allowed: Vec<(String, DlSystem, Vec<u8>)> = Vec::with_capacity(slot.allow.len());
+    for occ in &slot.allow {
+        let artifact = wiring
+            .artifacts
+            .iter()
+            .find(|a| a.id == occ.occupant)
+            .ok_or_else(|| LoadError::UnknownArtifact {
+                system: slot.name.clone(),
+                artifact: occ.occupant.clone(),
+                src: src.clone(),
+                span,
+            })?;
+        let path = artifact.path.as_ref().ok_or_else(|| LoadError::ArtifactNotBuilt {
+            artifact: occ.occupant.clone(),
+            src: src.clone(),
+            span,
+        })?;
+        let loaded = DlSystem::open(path).map_err(|source| LoadError::DlOpen {
+            system: slot.name.clone(),
+            artifact: occ.occupant.clone(),
+            source: Box::new(source),
+            src: src.clone(),
+            span,
+        })?;
+        let params: Vec<u8> = match &occ.params {
+            ParamSource::None => Vec::new(),
+            ParamSource::Postcard(bytes) => bytes.clone(),
+            ParamSource::Kdl(node_text) => {
+                encode_kdl_params(node_text, loaded.params_schema(), &slot.name)?
+            }
+        };
+        allowed.push((occ.occupant.clone(), loaded, params));
+    }
+
+    // The registered descriptor = the first occupant's descriptor with the trailing
+    // `SlotControlIn` input dropped (what `add_slot`/`build()` register for edge wiring).
+    let base = allowed[0].1.descriptor().clone();
+    let mut inputs = base.inputs.clone();
+    if inputs.last().map(|p| p.frame_id) == Some(SlotControlIn::FRAME_ID) {
+        inputs.pop();
+    }
+    let registered = SystemDescriptor {
+        name: base.name,
+        kind: base.kind,
+        inputs,
+        outputs: base.outputs.clone(),
+    };
+
+    // Every other allowed occupant must share the contract (the slot derives one shape from
+    // the allowed set; v1 holds sequence occupants only). A clean error in place of the
+    // build-time panic `add_slot` would otherwise raise.
+    let ports_match = |a: &[crate::descriptor::PortDesc], b: &[crate::descriptor::PortDesc]| {
+        a.len() == b.len()
+            && a.iter()
+                .zip(b)
+                .all(|(x, y)| compatible(x, y) && compatible(y, x))
+    };
+    for (occ_name, sys, _) in &allowed[1..] {
+        let d = sys.descriptor();
+        if !(ports_match(&d.inputs, &base.inputs) && ports_match(&d.outputs, &base.outputs)) {
+            return Err(LoadError::SlotOccupantMismatch {
+                slot: slot.name.clone(),
+                occupant: occ_name.clone(),
+                src: src.clone(),
+                span,
+            });
+        }
+    }
+
+    // Validate the declared user-port contract: every declared `input`/`output` frame name
+    // must name a registered user port (the explicit-contract check, Resolved Q4). The
+    // registered inputs are user inputs only (the `SlotControlIn` was dropped); the outputs
+    // include the implicit `SequenceStatus`/health/log tail, which a declaration may name
+    // but need not.
+    for frame in &slot.inputs {
+        if !registered.inputs.iter().any(|p| p.frame_name == frame) {
+            return Err(LoadError::SlotContractMismatch {
+                slot: slot.name.clone(),
+                dir: "input",
+                frame: frame.clone(),
+                src: src.clone(),
+                span,
+            });
+        }
+    }
+    for frame in &slot.outputs {
+        if !registered.outputs.iter().any(|p| p.frame_name == frame) {
+            return Err(LoadError::SlotContractMismatch {
+                slot: slot.name.clone(),
+                dir: "output",
+                frame: frame.clone(),
+                src: src.clone(),
+                span,
+            });
+        }
+    }
+
+    // Map the startup state to the runtime `InitialOccupant`.
+    let initial = match &slot.initial {
+        None => None,
+        Some(i) => match i.state {
+            SlotInitState::Empty => None,
+            SlotInitState::Loaded => Some(InitialOccupant {
+                occupant: i.occupant.clone(),
+                start: false,
+            }),
+            SlotInitState::Running => Some(InitialOccupant {
+                occupant: i.occupant.clone(),
+                start: true,
+            }),
+        },
+    };
+
+    let handle = builder.add_slot(slot.name.clone(), allowed, initial);
+    Ok((handle, registered))
 }
 
 /// Encode a dl system's KDL `system`-node config into the canonical postcard `Params`
@@ -1106,6 +1343,134 @@ fn parse_system(
         ty: ty.to_string(),
         artifact,
         params,
+    })
+}
+
+/// Parse one `slot "name" { input/output/allow/initial }` node into a [`SlotSpec`]
+/// (sequences-slots.md §5). The slot name is the node's first string arg (like a
+/// `system`/`artifact` name) and shares the instance namespace (`seen`), so a name
+/// colliding with a system is a [`DuplicateInstance`](LoadError::DuplicateInstance).
+///
+/// Children: `input frame="…"`/`output frame="…"` declare the user-port contract;
+/// `allow occupant="…" { <optional params> }` is one allowed occupant (its params are
+/// carried as [`ParamSource::Kdl`] when the node has child params, else
+/// [`ParamSource::None`] — mirroring [`parse_system`]); `initial occupant="…" state="…"`
+/// is the startup occupant.
+fn parse_slot(
+    node: &KdlNode,
+    src: &str,
+    seen: &mut HashSet<String>,
+) -> Result<SlotSpec, LoadError> {
+    let name = first_arg_string(node).ok_or_else(|| LoadError::MissingInstanceName {
+        src: src.to_string(),
+        span: node.span(),
+    })?;
+    if !seen.insert(name.to_string()) {
+        return Err(LoadError::DuplicateInstance {
+            name: name.to_string(),
+            src: src.to_string(),
+            span: node.span(),
+        });
+    }
+
+    let mut inputs: Vec<String> = Vec::new();
+    let mut outputs: Vec<String> = Vec::new();
+    let mut allow: Vec<AllowedOccupantSpec> = Vec::new();
+    let mut initial: Option<InitialOccupantSpec> = None;
+
+    if let Some(children) = node.children() {
+        for child in children.nodes() {
+            match child.name().value() {
+                "input" => {
+                    let frame = prop_string(child, "frame").ok_or_else(|| {
+                        LoadError::MissingParam {
+                            property: "frame".to_string(),
+                            system: "slot",
+                            src: src.to_string(),
+                            span: child.span(),
+                        }
+                    })?;
+                    inputs.push(frame.to_string());
+                }
+                "output" => {
+                    let frame = prop_string(child, "frame").ok_or_else(|| {
+                        LoadError::MissingParam {
+                            property: "frame".to_string(),
+                            system: "slot",
+                            src: src.to_string(),
+                            span: child.span(),
+                        }
+                    })?;
+                    outputs.push(frame.to_string());
+                }
+                "allow" => {
+                    let occupant = prop_string(child, "occupant").ok_or_else(|| {
+                        LoadError::MissingParam {
+                            property: "occupant".to_string(),
+                            system: "slot",
+                            src: src.to_string(),
+                            span: child.span(),
+                        }
+                    })?;
+                    // A params child block ⇒ carry the `allow` node's source text for the
+                    // resolve-time schema-guided encoder (mirrors `parse_system`'s `Kdl`
+                    // decision); no children ⇒ paramless.
+                    let params = if child.children().is_some_and(|c| !c.nodes().is_empty()) {
+                        ParamSource::Kdl(child.to_string())
+                    } else {
+                        ParamSource::None
+                    };
+                    allow.push(AllowedOccupantSpec {
+                        occupant: occupant.to_string(),
+                        params,
+                    });
+                }
+                "initial" => {
+                    let occupant = prop_string(child, "occupant").ok_or_else(|| {
+                        LoadError::MissingParam {
+                            property: "occupant".to_string(),
+                            system: "slot",
+                            src: src.to_string(),
+                            span: child.span(),
+                        }
+                    })?;
+                    // `state` is optional; an `initial` with no `state` defaults to
+                    // `loaded` (built but not auto-started — the conservative default).
+                    let state = match prop_string(child, "state") {
+                        None | Some("loaded") => SlotInitState::Loaded,
+                        Some("running") => SlotInitState::Running,
+                        Some("empty") => SlotInitState::Empty,
+                        Some(other) => {
+                            return Err(LoadError::BadSlotState {
+                                slot: name.to_string(),
+                                state: other.to_string(),
+                                src: src.to_string(),
+                                span: child.span(),
+                            });
+                        }
+                    };
+                    initial = Some(InitialOccupantSpec {
+                        occupant: occupant.to_string(),
+                        state,
+                    });
+                }
+                other => {
+                    return Err(LoadError::UnknownSlotChild {
+                        child: other.to_string(),
+                        src: src.to_string(),
+                        span: child.span(),
+                    });
+                }
+            }
+        }
+    }
+
+    Ok(SlotSpec {
+        name: name.to_string(),
+        inputs,
+        outputs,
+        allow,
+        initial,
     })
 }
 

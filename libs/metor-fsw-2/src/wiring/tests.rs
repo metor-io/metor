@@ -11,7 +11,8 @@ use metor_proto::types::{ComponentId, Timestamp};
 use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
 
 use crate::wiring::{
-    ClockSpec, FromKdlNode, LoadError, ParamSource, Registry, WiringBuilder, load, parse, resolve,
+    ClockSpec, FromKdlNode, LoadError, ParamSource, Registry, SlotInitState, WiringBuilder, load,
+    parse, resolve,
 };
 use crate::{
     AsyncSystem, BuildSystem, CyclicSystem, Input, Out, Output, System, SystemInput, SystemOutput,
@@ -715,6 +716,132 @@ system "plant" type="Plant" lib="plant"
     assert_eq!(wiring.systems.len(), 1);
     assert_eq!(wiring.systems[0].artifact.as_deref(), Some("plant"));
     assert_eq!(wiring.systems[0].params, ParamSource::None, "no params (dl, no config)");
+}
+
+// ---------------------------------------------------------------------------
+// Slots: a `slot` KDL node round-trips to a `SlotSpec` (name, inputs, outputs,
+// allow list with per-occupant params, initial), and shares the instance namespace.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn slot_node_round_trips_to_slot_spec() {
+    let kdl = r#"
+coordinator cycle_rate=100.0
+artifact "commissioning" crate="adcs-seqs" lib="adcs_commissioning" type="commissioning"
+artifact "safe_mode"     crate="adcs-seqs" lib="adcs_safe_mode"     type="safe_mode"
+
+slot "adcs" {
+    input  frame="sensors"
+    output frame="mode"
+    allow occupant="commissioning" {
+        gain 0.8
+    }
+    allow occupant="safe_mode"
+    initial occupant="commissioning" state="running"
+}
+"#;
+    let wiring = parse(kdl).expect("parse a slot node onto Wiring");
+    assert_eq!(wiring.slots.len(), 1);
+    let slot = &wiring.slots[0];
+    assert_eq!(slot.name, "adcs");
+    assert_eq!(slot.inputs, vec!["sensors".to_string()]);
+    assert_eq!(slot.outputs, vec!["mode".to_string()]);
+    assert_eq!(slot.allow.len(), 2);
+    assert_eq!(slot.allow[0].occupant, "commissioning");
+    // The first `allow` carries a params child block ⇒ `ParamSource::Kdl`.
+    match &slot.allow[0].params {
+        ParamSource::Kdl(text) => assert!(text.contains("gain"), "carried allow text: {text}"),
+        other => panic!("expected ParamSource::Kdl, got {other:?}"),
+    }
+    // The second `allow` has no params block ⇒ `ParamSource::None`.
+    assert_eq!(slot.allow[1].occupant, "safe_mode");
+    assert_eq!(slot.allow[1].params, ParamSource::None);
+    let initial = slot.initial.as_ref().expect("an initial occupant");
+    assert_eq!(initial.occupant, "commissioning");
+    assert_eq!(initial.state, SlotInitState::Running);
+}
+
+#[test]
+fn slot_state_defaults_to_loaded_and_rejects_garbage() {
+    // No `state=` ⇒ Loaded (the conservative default).
+    let ok = parse(
+        r#"
+coordinator cycle_rate=100.0
+slot "s" {
+    allow occupant="x"
+    initial occupant="x"
+}
+"#,
+    )
+    .expect("parse a slot with a state-less initial");
+    assert_eq!(ok.slots[0].initial.as_ref().unwrap().state, SlotInitState::Loaded);
+
+    // A bogus `state=` is a clean `BadSlotState`.
+    let err = parse(
+        r#"
+coordinator cycle_rate=100.0
+slot "s" {
+    allow occupant="x"
+    initial occupant="x" state="frobnicate"
+}
+"#,
+    )
+    .expect_err("a bad state is rejected");
+    assert!(matches!(err, LoadError::BadSlotState { .. }), "{err:?}");
+}
+
+#[test]
+fn slot_unknown_child_is_a_clean_error() {
+    let err = parse(
+        r#"
+coordinator cycle_rate=100.0
+slot "s" {
+    allow occupant="x"
+    bogus thing="here"
+}
+"#,
+    )
+    .expect_err("an unknown slot child is rejected");
+    assert!(matches!(err, LoadError::UnknownSlotChild { .. }), "{err:?}");
+}
+
+#[test]
+fn slot_name_collides_with_a_system_as_duplicate_instance() {
+    // A slot and a system sharing a name is a duplicate-instance error (shared namespace).
+    let err = parse(
+        r#"
+coordinator cycle_rate=100.0
+system "adcs" type="Src"
+slot "adcs" {
+    allow occupant="x"
+}
+"#,
+    )
+    .expect_err("a slot/system name collision is rejected");
+    assert!(matches!(err, LoadError::DuplicateInstance { .. }), "{err:?}");
+}
+
+#[test]
+fn slot_builder_mirrors_kdl() {
+    // The Rust front-end expresses the same slot the KDL `slot` node does.
+    let wiring = WiringBuilder::new()
+        .coordinator(100.0, ClockSpec::Wall)
+        .artifact("commissioning", "adcs-seqs", "adcs_commissioning", "commissioning")
+        .slot("adcs")
+        .input("sensors")
+        .output("mode")
+        .allow("commissioning")
+        .initial("commissioning", SlotInitState::Running)
+        .end()
+        .build();
+    assert_eq!(wiring.slots.len(), 1);
+    let slot = &wiring.slots[0];
+    assert_eq!(slot.name, "adcs");
+    assert_eq!(slot.inputs, vec!["sensors".to_string()]);
+    assert_eq!(slot.outputs, vec!["mode".to_string()]);
+    assert_eq!(slot.allow.len(), 1);
+    assert_eq!(slot.allow[0].occupant, "commissioning");
+    assert_eq!(slot.initial.as_ref().unwrap().state, SlotInitState::Running);
 }
 
 #[test]
