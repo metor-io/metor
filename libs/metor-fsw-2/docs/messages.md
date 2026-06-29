@@ -1,6 +1,19 @@
 # Messages (`messages`)
 
-> **Status: DECISIONS LOCKED, ready for planning.** A second, parallel payload kind for the
+> **Status: v1 IMPLEMENTED.** Built across WP11 (W1 message channel → W2 downlink → W4
+> sequence coupling → W3 uplink → W5 example e2e; plan `messages-plan.md`). The body and the
+> resolved decisions (§8) describe the shipped design. One deviation worth noting: the uplink is
+> registered via a sibling `CoordinatorBuilder::add_uplink(recv)` rather than a `TelemetryConfig`
+> field — it is a coordinator control-plane concern (it owns the command ring, the `MsgInbox`, and
+> the `run_for` head stage), and `connect_once(addr) -> (TcpTransport, TcpRecvTransport)`
+> preserves the one-shared-bidirectional-socket invariant by splitting a single connect. Verified
+> on the real adcs mission: `SequenceRegistry` + the commissioning `SequenceChannelEvent`s
+> (Loaded/Started/Progress/Completed, with the real progress strings) are on the downlink, and a
+> panel `SequenceCommand` lands the addressed `SlotCommand` the same cycle.
+>
+> ---
+>
+> A second, parallel payload kind for the
 > framework: **messages** — arbitrary `serde` types (`metor_proto::types::Msg`, `const ID:
 > PacketId`) serialized with postcard to variable-length bytes, carried on **byte rings** beside
 > the fixed component frames, tapped by telemetry, and downlinked as `OwnedPacket::Msg { id,
