@@ -25,7 +25,7 @@ use std::sync::Arc;
 
 use metor_fsw_ring::{Backing, BoxBacking, RingBuffer, WakeSink, WakeSource};
 
-use crate::registry::OutputRegistry;
+use crate::registry::{MessageRegistry, OutputRegistry};
 
 /// One pre-allocated ring plus its optional matched wake endpoints, in
 /// `descriptors()` order. `data`/`space` are `Some` only for the copy-in private
@@ -74,6 +74,7 @@ pub struct Binder<'a> {
     outputs: slice::Iter<'a, BoundPort>,
     inputs: slice::Iter<'a, BoundPort>,
     registry: Arc<OutputRegistry>,
+    messages: Arc<MessageRegistry>,
 }
 
 impl<'a> Binder<'a> {
@@ -81,11 +82,13 @@ impl<'a> Binder<'a> {
         outputs: &'a [BoundPort],
         inputs: &'a [BoundPort],
         registry: Arc<OutputRegistry>,
+        messages: Arc<MessageRegistry>,
     ) -> Self {
         Self {
             outputs: outputs.iter(),
             inputs: inputs.iter(),
             registry,
+            messages,
         }
     }
 }
@@ -122,6 +125,15 @@ pub trait RingSource {
     /// than fabricate an empty registry.
     fn output_registry(&self) -> Arc<OutputRegistry> {
         panic!("this ring source carries no output registry (host-only capability)")
+    }
+
+    /// The broad-access **message** registry (`docs/messages.md` §2), the message twin of
+    /// [`output_registry`](Self::output_registry). A bundle that taps every message channel
+    /// (the telemetry downlink, W2) pulls this in its `BindPorts::bind` alongside its typed
+    /// ports. Only the host [`Binder`] carries one; any non-host source panics rather than
+    /// fabricate an empty registry, exactly as the output registry does.
+    fn message_registry(&self) -> Arc<MessageRegistry> {
+        panic!("this ring source carries no message registry (host-only capability)")
     }
 }
 
@@ -166,6 +178,12 @@ impl<'a> RingSource for Binder<'a> {
     /// second phase. The returned `Arc` is cheap to clone and store.
     fn output_registry(&self) -> Arc<OutputRegistry> {
         self.registry.clone()
+    }
+
+    /// The message registry is frozen alongside the output registry before the bind loop
+    /// runs (`docs/messages.md` §2), so this is safe and needs no second phase.
+    fn message_registry(&self) -> Arc<MessageRegistry> {
+        self.messages.clone()
     }
 }
 

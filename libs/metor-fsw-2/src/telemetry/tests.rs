@@ -402,3 +402,200 @@ async fn drop_policy_never_blocks_and_counts() {
         h.errors
     );
 }
+
+// ---------------------------------------------------------------------------
+// 6. Message downlink: every record forwarded as a self-describing `Msg` packet, in
+//    FIFO order, never coalesced, no announce — and the message FIFO and the component
+//    hand-off share the one sender independently (`docs/messages.md` §3).
+// ---------------------------------------------------------------------------
+
+#[cfg(not(miri))]
+#[stellarator::test]
+async fn message_downlink_fifo_no_coalesce() {
+    use std::sync::atomic::{AtomicBool, Ordering::Release};
+
+    use metor_fsw_ring::{Config, NoWake, Overrun, RingBuffer};
+    use metor_proto::types::{Msg, OwnedPacket};
+    use metor_proto_wkt::{
+        SequenceChannelSpec, SequenceCommand, SequenceCommandKind, SequenceRegistry,
+    };
+    use stellarator::sync::WaitQueue;
+
+    use crate::message::{MAX_MSG_BYTES, MSG_DEPTH, MsgOut, msg_capacity, split_record};
+    use crate::registry::MessageEntry;
+
+    use super::{HandOff, MsgHandOff, run_sender};
+
+    // A by-hand message channel — the exact shape the coordinator registers (W4) and the
+    // telemetry `execute` message-tap drains.
+    let ring = RingBuffer::create_in_memory(Config {
+        capacity: msg_capacity(MAX_MSG_BYTES, MSG_DEPTH),
+        max_readers: 4,
+        overrun: Overrun::Overwrite,
+    });
+    let entry = MessageEntry {
+        key: ComponentId::new("mode.events"),
+        instance: Arc::from("mode"),
+        channel: Arc::from("events"),
+        ring: ring.clone(),
+    };
+    // Claim the tap before any write (an overwrite-ring view starts at the live edge).
+    let mut view = entry.view().expect("reader slot");
+    let mut out: MsgOut = MsgOut::new(ring.writer(NoWake, NoWake));
+
+    // An event/command *log* of three records — two of one Msg type, one of another,
+    // interleaved. A snapshot would coalesce the two `SequenceCommand`s; a log must not.
+    out.emit(&SequenceCommand {
+        channel_id: 0,
+        command: SequenceCommandKind::Start,
+    })
+    .expect("emit start");
+    out.emit(&SequenceRegistry {
+        channels: vec![SequenceChannelSpec {
+            id: 0,
+            name: "mode".to_string(),
+            available: vec!["commissioning".to_string()],
+        }],
+    })
+    .expect("emit registry");
+    out.emit(&SequenceCommand {
+        channel_id: 7,
+        command: SequenceCommandKind::Abort,
+    })
+    .expect("emit abort");
+
+    // The shared wait queue + both hand-offs (one sender drains both).
+    let wq = Arc::new(WaitQueue::new());
+    let handoff = Arc::new(HandOff::new(1, wq.clone()));
+    let msg_handoff = Arc::new(MsgHandOff::new(wq.clone()));
+
+    // A component snapshot through the latest-wins hand-off, to prove the two queues are
+    // independent and the one sender forwards both.
+    let mut table = LenPacket::table([9, 9], 4);
+    table.extend_from_slice(&[1, 2, 3, 4]);
+    handoff.push(0, table);
+
+    // Drain *every* message record (the `execute` message-tap logic) into the FIFO.
+    let mut scratch = Vec::new();
+    while let Ok(true) = view.try_read_into(&mut scratch) {
+        let (id, payload) = split_record(&scratch).expect("split record");
+        let mut pkt = LenPacket::msg(id, payload.len());
+        pkt.extend_from_slice(payload);
+        msg_handoff.push(pkt);
+    }
+
+    // Drive the async sender: no announces (no component taps), forward each queued packet.
+    let mock = MockTransport::new(false);
+    let rec = mock.inner.clone();
+    let stop = Arc::new(AtomicBool::new(false));
+    let handle = stellarator::spawn(run_sender(
+        mock,
+        Vec::new(),
+        handoff,
+        msg_handoff,
+        wq.clone(),
+        stop.clone(),
+    ));
+
+    // Let the sender drain (it sends synchronously, then parks), then stop + join.
+    for _ in 0..32 {
+        if rec.packets.lock().unwrap().len() >= 4 {
+            break;
+        }
+        stellarator::yield_now().await;
+    }
+    stop.store(true, Release);
+    wq.wake_all();
+    let _ = handle.await;
+
+    // No message is announced (self-describing); only the component tap would announce,
+    // and we passed none.
+    assert!(
+        rec.announces.lock().unwrap().is_empty(),
+        "messages carry no announce"
+    );
+
+    let packets = rec.packets.lock().unwrap();
+    // A `LenPacket`'s bytes carry a 4-byte length prefix the wire reader strips before
+    // `OwnedPacket::parse` sees the packet header; skip it here too.
+    let parsed: Vec<OwnedPacket<Vec<u8>>> = packets
+        .iter()
+        .map(|p| OwnedPacket::parse(p.inner[4..].to_vec()).expect("parse packet"))
+        .collect();
+
+    // The component snapshot came through as a `Table`, proving the shared sender drains
+    // both hand-offs.
+    assert_eq!(
+        parsed
+            .iter()
+            .filter(|p| matches!(p, OwnedPacket::Table(_)))
+            .count(),
+        1,
+        "the component snapshot was forwarded too"
+    );
+
+    // The three message records arrived as `Msg` packets, in FIFO order, none coalesced —
+    // both `SequenceCommand`s are present despite sharing an id (a snapshot would lose one).
+    let msgs: Vec<_> = parsed
+        .iter()
+        .filter_map(|p| match p {
+            OwnedPacket::Msg(m) => Some(m),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(msgs.len(), 3, "every message record forwarded, none coalesced");
+    assert_eq!(
+        msgs.iter().map(|m| m.id).collect::<Vec<_>>(),
+        vec![
+            SequenceCommand::ID,
+            SequenceRegistry::ID,
+            SequenceCommand::ID
+        ],
+        "FIFO order preserved"
+    );
+    let first: SequenceCommand = msgs[0].parse().expect("parse start");
+    assert!(matches!(first.command, SequenceCommandKind::Start));
+    let third: SequenceCommand = msgs[2].parse().expect("parse abort");
+    assert_eq!(third.channel_id, 7);
+    assert!(matches!(third.command, SequenceCommandKind::Abort));
+}
+
+// ---------------------------------------------------------------------------
+// 7. The message FIFO is bounded: past capacity it drops the *oldest* record (never the
+//    newest) and counts each drop — the non-coalescing event-log overflow policy.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn message_handoff_drops_oldest_on_overflow() {
+    use std::sync::atomic::Ordering::Relaxed;
+
+    use stellarator::sync::WaitQueue;
+
+    use super::{MSG_HANDOFF_CAP, MsgHandOff};
+
+    let wq = Arc::new(WaitQueue::new());
+    let handoff = MsgHandOff::new(wq);
+
+    // Push two past capacity; each packet carries a unique id byte so we can identify it.
+    let overflow = 2usize;
+    for i in 0..(MSG_HANDOFF_CAP + overflow) {
+        handoff.push(LenPacket::msg([(i & 0xff) as u8, (i >> 8) as u8], 0));
+    }
+
+    assert_eq!(
+        handoff.dropped.load(Relaxed) as usize,
+        overflow,
+        "two records past cap were dropped"
+    );
+
+    let drained = handoff.drain();
+    assert_eq!(drained.len(), MSG_HANDOFF_CAP, "the FIFO is bounded to its cap");
+    // The *oldest* (records 0,1) were dropped; the queue holds records `overflow..`, in
+    // order — the newest survive, the front is shed.
+    let first_id = [drained[0].inner[5], drained[0].inner[6]];
+    assert_eq!(
+        first_id,
+        [(overflow & 0xff) as u8, (overflow >> 8) as u8],
+        "the oldest records were dropped, not the newest"
+    );
+}
