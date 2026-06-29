@@ -18,14 +18,16 @@ use std::path::PathBuf;
 use std::process::Command;
 use std::time::Duration;
 
-use metor_fsw_2::metor_proto::types::{ComponentId, Msg};
+use metor_fsw_2::metor_proto::types::{ComponentId, IntoLenPacket, Msg, OwnedPacket};
 use metor_fsw_2::metor_proto_wkt::{
-    SequenceChannelEvent, SequenceEventKind, SequenceRegistry,
+    SequenceChannelEvent, SequenceCommand, SequenceCommandKind, SequenceEventKind,
+    SequenceRegistry,
 };
 use metor_fsw_2::{
-    ClockMode, Coordinator, CoordinatorConfig, DlSystem, Input, Output, SequenceStatus,
-    SlotCommand, SlotStatus, SystemKind, split_record,
+    ClockMode, Coordinator, CoordinatorConfig, DlSystem, Input, Output, RecvTransport,
+    SequenceStatus, SlotCommand, SlotStatus, SystemKind, TransportError, split_record,
 };
+use stellarator::buf::{IoBuf, Slice};
 
 // ---------------------------------------------------------------------------
 // Build + locate the sequence fixture cdylib (mirrors dl_integration).
@@ -451,4 +453,108 @@ fn slot_emits_ordered_sequence_events_and_boot_registry() {
     assert!(1 < waiting && waiting < done && done < kinds.len() - 1, "Progress ordered: {kinds:?}");
 
     drop((coord, events_view, boot_view, control));
+}
+
+// ---------------------------------------------------------------------------
+// 6. The uplink (Wave 3): a panel `SequenceCommand` injected through a mock
+//    `RecvTransport` lands in the slot command ring at the head of the cycle and
+//    dispatches the SAME cycle (no off-by-one) — driving an initially-empty slot
+//    Empty → Loaded → Running with no observable bare-Loaded cycle.
+// ---------------------------------------------------------------------------
+
+/// A mock [`RecvTransport`] yielding a fixed script of `SequenceCommand`s, then a
+/// `Disconnected` (the reader stops, like a dropped link). Each command is encoded to the
+/// real wire bytes and re-parsed, so the loopback exercises the same `OwnedPacket::Msg` /
+/// `parse::<SequenceCommand>` path the TCP reader uses.
+struct MockRecv {
+    queue: std::collections::VecDeque<SequenceCommand>,
+}
+
+impl MockRecv {
+    fn new(cmds: Vec<SequenceCommand>) -> Self {
+        Self {
+            queue: cmds.into(),
+        }
+    }
+}
+
+impl RecvTransport for MockRecv {
+    async fn recv(&mut self) -> Result<OwnedPacket<Slice<Vec<u8>>>, TransportError> {
+        match self.queue.pop_front() {
+            Some(cmd) => {
+                // Encode to the wire `LenPacket` then strip its 4-byte length prefix, the
+                // same framing the panel sends and `OwnedPacket::parse` expects.
+                let pkt = (&cmd).into_len_packet();
+                let bytes = pkt.inner[4..].to_vec();
+                let slice = bytes.try_slice(..).expect("non-empty packet");
+                OwnedPacket::parse(slice).map_err(|e| TransportError::Io(format!("{e}")))
+            }
+            None => Err(TransportError::Disconnected),
+        }
+    }
+}
+
+#[test]
+fn uplink_command_loads_and_starts_same_cycle() {
+    let Some(lib) = locate_fixture() else {
+        return;
+    };
+    let loaded = open_waiter(&lib);
+
+    let mut b = Coordinator::builder(sim_config());
+    // One slot, started EMPTY (no initial occupant) — the interactive panel scenario.
+    let _slot = b.add_slot("adcs", vec![("waiter".into(), loaded, Vec::new())], None);
+    // The uplink: a panel `Load { waiter }` then `Start`, both addressed to channel 0 (the
+    // slot's build-order index, per `channel_map`).
+    b.add_uplink(MockRecv::new(vec![
+        SequenceCommand {
+            channel_id: 0,
+            command: SequenceCommandKind::Load {
+                name: "waiter".to_string(),
+            },
+        },
+        SequenceCommand {
+            channel_id: 0,
+            command: SequenceCommandKind::Start,
+        },
+    ]));
+    let mut coord = b.build().expect("the slot + uplink graph builds");
+
+    // Channel 0 addresses the slot the commands target.
+    assert_eq!(coord.channel_map(), &[(0u64, "adcs")]);
+
+    // Tap the host SlotStatus before running (an overwrite ring starts at the live edge).
+    let mut slot_view: Input<SlotStatus> = Input::new(
+        coord
+            .registry()
+            .view(ComponentId::new("adcs.slot_status"))
+            .expect("slot status is registered")
+            .expect("reader slot available"),
+    );
+
+    let coord = stellarator::run(|| async move {
+        coord.run_for(6).await;
+        coord
+    });
+
+    let phases = slot_phases(&mut slot_view);
+    // The slot ran: the uplink Load + Start drove it past Empty into Running (and on to
+    // Done, as the `waiter` occupant completes).
+    assert!(
+        phases.contains(&RUNNING),
+        "the uplink drove the slot to Running: {phases:?}"
+    );
+    assert_eq!(
+        phases.last(),
+        Some(&DONE),
+        "the started occupant ran to Done: {phases:?}"
+    );
+    // No off-by-one: Load and Start dispatched the *same* cycle, so the slot never
+    // published a bare `Loaded` phase (which a one-cycle-late Start would have shown).
+    assert!(
+        !phases.contains(&LOADED),
+        "Load and Start landed the same cycle (no bare Loaded): {phases:?}"
+    );
+
+    drop((coord, slot_view));
 }

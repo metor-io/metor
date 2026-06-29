@@ -36,11 +36,12 @@ use std::sync::atomic::{
 use std::sync::{Arc, Mutex};
 
 use metor_fsw_ring::{BoxBacking, NoWake, View};
-use metor_proto::types::{ComponentId, LenPacket, PacketId, Timestamp};
+use metor_proto::types::{ComponentId, LenPacket, Msg, OwnedPacket, PacketId, Timestamp};
 use metor_proto::vtable::VTable;
-use metor_proto_stellar::PacketSink;
-use metor_proto_wkt::{ComponentMetadata, SetComponentMetadata, VTableMsg};
+use metor_proto_stellar::{PacketSink, PacketStream};
+use metor_proto_wkt::{ComponentMetadata, SequenceCommand, SetComponentMetadata, VTableMsg};
 use stellarator::JoinHandleDropGuard;
+use stellarator::buf::Slice;
 use stellarator::io::{OwnedReader, OwnedWriter, SplitExt};
 use stellarator::net::TcpStream;
 use stellarator::sync::WaitQueue;
@@ -83,12 +84,26 @@ pub trait Transport {
     async fn send(&mut self, pkt: LenPacket) -> Result<(), TransportError>;
 }
 
-/// A live TCP connection's write half plus the read half held only to keep the socket
-/// open (v1 does not read replies).
+/// The read twin of [`Transport`] (`docs/messages.md` §4): yields the next inbound
+/// `OwnedPacket` off the connection's read half — the uplink's source of panel
+/// `SequenceCommand`s. v1 ships [`TcpRecvTransport`] (a [`PacketStream`] over the read
+/// half, the inverse of [`Transport`]'s [`PacketSink`]); tests drive an in-memory mock
+/// against the same trait. Like the sender, the reader stops on the first error
+/// (drop-on-disconnect, telemetry.md §7) — no reconnect.
+#[allow(async_fn_in_trait)]
+pub trait RecvTransport {
+    /// Receive the next packet, or an error if the link dropped.
+    async fn recv(&mut self) -> Result<OwnedPacket<Slice<Vec<u8>>>, TransportError>;
+}
+
+/// A live TCP connection's write half plus the read half. In the downlink-only (lazy)
+/// path the read half is held only to keep the socket open (`rx = Some`, unused, v1 does
+/// not read replies on a downlink-only link); in the shared bidirectional path it is
+/// handed to the uplink reader by [`connect_once`] (`rx = None`).
 struct TcpConn {
     sink: PacketSink<OwnedWriter<TcpStream>>,
     #[allow(dead_code)]
-    rx: OwnedReader<TcpStream>,
+    rx: Option<OwnedReader<TcpStream>>,
 }
 
 /// The v1 transport: connect-once to a ground/db endpoint and stream `LenPacket`s,
@@ -115,7 +130,7 @@ impl TcpTransport {
             let (rx, tx) = stream.split();
             self.conn = Some(TcpConn {
                 sink: PacketSink::new(tx),
-                rx,
+                rx: Some(rx),
             });
         }
         Ok(&self.conn.as_ref().expect("just connected").sink)
@@ -150,6 +165,54 @@ impl Transport for TcpTransport {
             .map_err(|e| TransportError::Io(format!("{e}")))?;
         Ok(())
     }
+}
+
+/// The v1 uplink read path (`docs/messages.md` §4.2): a [`PacketStream`] over a
+/// connection's read half — the inverse of [`TcpTransport`]'s [`PacketSink`], mirroring
+/// cube-sat's `PacketStream`/`spawn_recv` (`examples/cube-sat/src/main.rs:545`). Built by
+/// [`connect_once`] from the same split socket the downlink writes, so it shares the
+/// connection's lifetime: a dropped socket fails `recv` and stops the reader, exactly as
+/// it stops the sender.
+pub struct TcpRecvTransport {
+    stream: PacketStream<OwnedReader<TcpStream>>,
+}
+
+impl RecvTransport for TcpRecvTransport {
+    async fn recv(&mut self) -> Result<OwnedPacket<Slice<Vec<u8>>>, TransportError> {
+        self.stream
+            .next_grow(vec![0u8; 1024])
+            .await
+            .map_err(|e| TransportError::Io(format!("{e}")))
+    }
+}
+
+/// Establish the **one shared bidirectional link** and split it (`docs/messages.md` §4,
+/// Q7): a single `TcpStream::connect(addr).split()` whose write half drives the downlink
+/// [`TcpTransport`] (returned already connected — no lazy `ensure`) and whose read half
+/// drives the uplink [`TcpRecvTransport`]. Both observe the *same* socket, so a drop stops
+/// the sender and the reader together — preserving connect-once / no-reconnect /
+/// silent-drop-on-disconnect (telemetry.md §7), now shared by both halves. Hand the write
+/// half to [`add_telemetry`](crate::CoordinatorBuilder::add_telemetry) and the read half to
+/// [`add_uplink`](crate::CoordinatorBuilder::add_uplink). A downlink-only mission instead
+/// keeps using [`TcpTransport::new`] (lazy connect) and omits the uplink entirely.
+pub async fn connect_once(
+    addr: std::net::SocketAddr,
+) -> Result<(TcpTransport, TcpRecvTransport), TransportError> {
+    let stream = TcpStream::connect(addr)
+        .await
+        .map_err(|e| TransportError::Io(format!("{e}")))?;
+    let (rx, tx) = stream.split();
+    let tx = TcpTransport {
+        addr,
+        conn: Some(TcpConn {
+            sink: PacketSink::new(tx),
+            rx: None,
+        }),
+    };
+    let rx = TcpRecvTransport {
+        stream: PacketStream::new(rx),
+    };
+    Ok((tx, rx))
 }
 
 // ---------------------------------------------------------------------------
@@ -308,6 +371,83 @@ impl MsgHandOff {
     fn drain(&self) -> Vec<LenPacket> {
         let mut queue = self.queue.lock().expect("msg handoff poisoned");
         queue.drain(..).collect()
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Uplink (the inbound twin of the hand-off + sender, `docs/messages.md` §4)
+// ---------------------------------------------------------------------------
+
+/// The bound on the uplink [`MsgInbox`]: panel commands are rare, so a shallow FIFO is
+/// ample; past it the oldest queued command is dropped (and counted) — the inbound
+/// analogue of [`MSG_HANDOFF_CAP`].
+const MSG_INBOX_CAP: usize = 256;
+
+/// The inbound twin of [`MsgHandOff`] (`docs/messages.md` §4.1): the async reader task
+/// ([`run_receiver`]) fills it; the coordinator's head-of-cycle stage polls it each tick
+/// (it never parks on it) and maps each `SequenceCommand` into the slot command ring the
+/// **same cycle**. Bounded FIFO — on overflow the **oldest** command is dropped and
+/// `dropped` bumped (loss surfaced, never silent reordering).
+pub(crate) struct MsgInbox {
+    queue: Mutex<VecDeque<SequenceCommand>>,
+    /// Count of commands dropped-oldest on overflow (surfaced by the coordinator as
+    /// `coordinator` health when it drains).
+    dropped: AtomicU64,
+}
+
+impl MsgInbox {
+    pub(crate) fn new() -> Self {
+        Self {
+            queue: Mutex::new(VecDeque::new()),
+            dropped: AtomicU64::new(0),
+        }
+    }
+
+    /// Reader side: append `cmd`, dropping the oldest queued command (and counting it) if
+    /// the FIFO is already at [`MSG_INBOX_CAP`].
+    fn push(&self, cmd: SequenceCommand) {
+        let mut q = self.queue.lock().expect("msg inbox poisoned");
+        if q.len() >= MSG_INBOX_CAP {
+            q.pop_front();
+            self.dropped.fetch_add(1, Relaxed);
+        }
+        q.push_back(cmd);
+    }
+
+    /// Cycle side: take every queued command in FIFO order.
+    pub(crate) fn drain(&self) -> Vec<SequenceCommand> {
+        let mut q = self.queue.lock().expect("msg inbox poisoned");
+        q.drain(..).collect()
+    }
+
+    /// The running overflow-drop count, for the coordinator's health surface.
+    pub(crate) fn dropped(&self) -> u64 {
+        self.dropped.load(Relaxed)
+    }
+}
+
+/// The async uplink reader (`docs/messages.md` §4.1): the inbound twin of [`run_sender`].
+/// Loop `recv`, keep only `SequenceCommand` Msgs (cube-sat's exact filter,
+/// `examples/cube-sat/src/main.rs:690`), push each into the [`MsgInbox`]; ignore any other
+/// packet; `return` on the first error (drop-on-disconnect, like the sender) or when `stop`
+/// is set.
+pub(crate) async fn run_receiver<R: RecvTransport>(
+    mut rx: R,
+    inbox: Arc<MsgInbox>,
+    stop: Arc<AtomicBool>,
+) {
+    while !stop.load(Acquire) {
+        match rx.recv().await {
+            Ok(OwnedPacket::Msg(m)) if m.id == SequenceCommand::ID => {
+                if let Ok(cmd) = m.parse::<SequenceCommand>() {
+                    inbox.push(cmd);
+                }
+            }
+            // Other Msgs / Tables are ignored — the uplink is commands only.
+            Ok(_) => {}
+            // A dropped link (or an exhausted mock) ends the reader, like the sender.
+            Err(_) => return,
+        }
     }
 }
 

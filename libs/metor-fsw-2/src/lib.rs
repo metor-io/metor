@@ -59,7 +59,8 @@ pub use coordinator::{
 // The general output registry and the telemetry downlink (its first consumer).
 pub use registry::{MessageRegistry, MessageEntry, OutputRegistry, RegistryEntry};
 pub use telemetry::{
-    TcpTransport, TelemetryConfig, TelemetryMode, TelemetrySystem, Transport, TransportError,
+    RecvTransport, TcpRecvTransport, TcpTransport, TelemetryConfig, TelemetryMode,
+    TelemetrySystem, Transport, TransportError, connect_once,
 };
 
 // The system trait family, the typed port wrappers, self-description, and the
