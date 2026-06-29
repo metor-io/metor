@@ -1102,7 +1102,8 @@ impl CoordinatorBuilder {
                         })
                         .collect();
 
-                    let mut binder = Binder::new(&outs, &ins, registry.clone());
+                    let mut binder =
+                        Binder::new(&outs, &ins, registry.clone(), message_registry.clone());
                     match reg {
                         Reg::Cyclic(r) => cyclic.push(r.bind(&mut binder)),
                         Reg::Async(r) => pending_async.push(PendingAsync {
