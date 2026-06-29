@@ -1,0 +1,347 @@
+//! Slots/sequences acceptance gate (WP10 Wave 4): a **real `dlopen`** of a `#[sequence]`
+//! occupant driven through a runtime **slot**.
+//!
+//! This builds the `metor-fsw-2-seq-fixture` crate as a `cdylib`, `dlopen`s the produced
+//! shared object through [`DlSystem`], registers it as the allowed occupant of a slot in
+//! a real [`Coordinator`], and drives the slot's lifecycle through
+//! [`Coordinator::control_handle`] — proving the slot ring topology (the slot-owned
+//! control ring appended to the occupant's input array + the `SlotStatus` output tap),
+//! the command→phase state machine, and clean teardown across a genuine `.so` boundary.
+//!
+//! Slots/sequences are **ungated** (no `kdl`), so unlike `dl_integration` this test does
+//! not need the wiring feature. As with `dl_integration` the fixture build runs inside
+//! the test and the body is skipped (not failed) if the build plumbing is unavailable.
+
+#![cfg(not(miri))]
+
+use std::path::PathBuf;
+use std::process::Command;
+use std::time::Duration;
+
+use metor_fsw_2::metor_proto::types::ComponentId;
+use metor_fsw_2::{
+    ClockMode, Coordinator, CoordinatorConfig, DlSystem, Input, Output, SequenceStatus,
+    SlotCommand, SlotStatus, SystemKind,
+};
+
+// ---------------------------------------------------------------------------
+// Build + locate the sequence fixture cdylib (mirrors dl_integration).
+// ---------------------------------------------------------------------------
+
+fn fixture_lib_name() -> String {
+    let stem = "metor_fsw_2_seq_fixture";
+    if cfg!(target_os = "macos") {
+        format!("lib{stem}.dylib")
+    } else if cfg!(target_os = "windows") {
+        format!("{stem}.dll")
+    } else {
+        format!("lib{stem}.so")
+    }
+}
+
+/// `cargo build -p metor-fsw-2-seq-fixture` and return the produced shared object's path
+/// (parsed from cargo's JSON artifact messages). `None` (with a stderr note) if the build
+/// plumbing is unavailable, so the caller skips rather than fails spuriously.
+fn locate_fixture() -> Option<PathBuf> {
+    let output = Command::new(env!("CARGO"))
+        .args([
+            "build",
+            "-p",
+            "metor-fsw-2-seq-fixture",
+            "--message-format=json",
+        ])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        eprintln!(
+            "skipping: fixture build failed:\n{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        return None;
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let want = fixture_lib_name();
+    for line in stdout.lines() {
+        if !line.contains("compiler-artifact") || !line.contains(&want) {
+            continue;
+        }
+        for tok in line.split('"') {
+            if tok.ends_with(&want) {
+                let path = PathBuf::from(tok);
+                if path.exists() {
+                    return Some(path);
+                }
+            }
+        }
+    }
+    eprintln!("skipping: built the fixture but could not locate {want} in cargo output");
+    None
+}
+
+fn sim_config() -> CoordinatorConfig {
+    CoordinatorConfig {
+        cycle_rate: 1000.0,
+        default_depth: 8,
+        // 2µs per cycle: the `waiter` future's `wait(2µs)` elapses after one step.
+        clock: ClockMode::Simulated {
+            dt: Duration::from_micros(2),
+        },
+    }
+}
+
+/// Open the fixture once, asserting its reconstructed descriptor is a sequence with the
+/// implicit `SlotControlIn` input + the `SequenceStatus`/health/log output tail.
+fn open_waiter(lib: &PathBuf) -> DlSystem {
+    let loaded = DlSystem::open(lib).expect("DlSystem::open the sequence .so");
+    let desc = loaded.descriptor();
+    assert_eq!(desc.name, "waiter");
+    assert_eq!(desc.kind, SystemKind::Cyclic);
+    // inputs = [SlotControlIn] (no user ports); outputs = [SequenceStatus, health, log].
+    assert_eq!(desc.inputs.len(), 1, "just the implicit SlotControlIn input");
+    assert_eq!(desc.outputs.len(), 3, "SequenceStatus + health + log tail");
+    loaded
+}
+
+/// Drain every `SlotStatus.phase` published over a run.
+fn slot_phases(view: &mut Input<SlotStatus>) -> Vec<u8> {
+    let mut phases = Vec::new();
+    view.drain(|f| phases.push(f.get().phase)).expect("no lap");
+    phases
+}
+
+/// Drain every `SequenceStatus.run_state` the occupant published.
+fn seq_run_states(view: &mut Input<SequenceStatus>) -> Vec<u8> {
+    let mut states = Vec::new();
+    view.drain(|f| states.push(f.get().run_state)).expect("no lap");
+    states
+}
+
+// SlotPhase wire codes (slot.rs): Empty=0, Loaded=1, Running=2, Done=3, Stopped=4.
+const LOADED: u8 = 1;
+const RUNNING: u8 = 2;
+const DONE: u8 = 3;
+// Outcome::run_state codes (sequence/mod.rs): Completed=1, Aborted=2.
+const COMPLETED: u8 = 1;
+const ABORTED: u8 = 2;
+
+// ---------------------------------------------------------------------------
+// 1. Load → Start → run to Done (Completed), asserting the phase transitions and
+//    the occupant's own SequenceStatus terminal run_state.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn slot_load_start_runs_to_done() {
+    let Some(lib) = locate_fixture() else {
+        return;
+    };
+    let loaded = open_waiter(&lib);
+
+    let mut b = Coordinator::builder(sim_config());
+    let _slot = b.add_slot("adcs", vec![("waiter".into(), loaded, Vec::new())], None);
+    let mut coord = b.build().expect("the slot graph builds");
+
+    // Tap the host SlotStatus + the occupant SequenceStatus before running.
+    let mut slot_view: Input<SlotStatus> = Input::new(
+        coord
+            .registry()
+            .view(ComponentId::new("adcs.slot_status"))
+            .expect("slot status is registered")
+            .expect("reader slot available"),
+    );
+    let mut seq_view: Input<SequenceStatus> = Input::new(
+        coord
+            .registry()
+            .view(ComponentId::new("adcs.sequence"))
+            .expect("occupant SequenceStatus is registered")
+            .expect("reader slot available"),
+    );
+
+    // Drive Load + Start through the in-proc control handle (drained at cycle 0).
+    let mut control: Output<SlotCommand> = coord.control_handle();
+    control.write(&SlotCommand::load("adcs", "waiter")).unwrap();
+    control.write(&SlotCommand::start("adcs")).unwrap();
+
+    let coord = stellarator::run(|| async move {
+        coord.run_for(4).await;
+        coord
+    });
+
+    let phases = slot_phases(&mut slot_view);
+    assert!(phases.contains(&RUNNING), "the slot ran: {phases:?}");
+    assert_eq!(phases.last(), Some(&DONE), "the slot finished Done: {phases:?}");
+
+    let states = seq_run_states(&mut seq_view);
+    assert_eq!(
+        states.last(),
+        Some(&COMPLETED),
+        "the occupant reached Completed: {states:?}"
+    );
+
+    // Done is a terminal success, not an error-stop: nothing in the stopped surface.
+    assert!(coord.stopped().is_empty(), "Done is not a hard-stop");
+
+    drop((coord, slot_view, seq_view, control));
+}
+
+// ---------------------------------------------------------------------------
+// 2. Abort: a cooperative cancel reaches the occupant as ring data; it folds it at
+//    its next wait and completes Done{Aborted}.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn slot_abort_completes_aborted() {
+    let Some(lib) = locate_fixture() else {
+        return;
+    };
+    let loaded = open_waiter(&lib);
+
+    let mut b = Coordinator::builder(sim_config());
+    let _slot = b.add_slot("adcs", vec![("waiter".into(), loaded, Vec::new())], None);
+    let mut coord = b.build().expect("the slot graph builds");
+
+    let mut seq_view: Input<SequenceStatus> = Input::new(
+        coord
+            .registry()
+            .view(ComponentId::new("adcs.sequence"))
+            .expect("occupant SequenceStatus is registered")
+            .expect("reader slot available"),
+    );
+    let mut slot_view: Input<SlotStatus> = Input::new(
+        coord
+            .registry()
+            .view(ComponentId::new("adcs.slot_status"))
+            .expect("slot status is registered")
+            .expect("reader slot available"),
+    );
+
+    // Load + Start + Abort, all drained at cycle 0 (before the wait deadline), so the
+    // very first poll observes the cancel and bails out via the safing branch.
+    let mut control: Output<SlotCommand> = coord.control_handle();
+    control.write(&SlotCommand::load("adcs", "waiter")).unwrap();
+    control.write(&SlotCommand::start("adcs")).unwrap();
+    control.write(&SlotCommand::abort("adcs")).unwrap();
+
+    let coord = stellarator::run(|| async move {
+        coord.run_for(3).await;
+        coord
+    });
+
+    let states = seq_run_states(&mut seq_view);
+    assert_eq!(
+        states.last(),
+        Some(&ABORTED),
+        "the occupant cooperatively aborted: {states:?}"
+    );
+    let phases = slot_phases(&mut slot_view);
+    assert_eq!(phases.last(), Some(&DONE), "Aborted is still terminal Done: {phases:?}");
+
+    drop((coord, seq_view, slot_view, control));
+}
+
+// ---------------------------------------------------------------------------
+// 3. Stop (hard-drop): the occupant's future is dropped (fsw_destroy releases its
+//    ring roles), leaving the slot Loaded with no live future — it never polls.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn slot_stop_hard_drops_occupant() {
+    let Some(lib) = locate_fixture() else {
+        return;
+    };
+    let loaded = open_waiter(&lib);
+
+    let mut b = Coordinator::builder(sim_config());
+    let _slot = b.add_slot("adcs", vec![("waiter".into(), loaded, Vec::new())], None);
+    let mut coord = b.build().expect("the slot graph builds");
+
+    let mut slot_view: Input<SlotStatus> = Input::new(
+        coord
+            .registry()
+            .view(ComponentId::new("adcs.slot_status"))
+            .expect("slot status is registered")
+            .expect("reader slot available"),
+    );
+    let mut seq_view: Input<SequenceStatus> = Input::new(
+        coord
+            .registry()
+            .view(ComponentId::new("adcs.sequence"))
+            .expect("occupant SequenceStatus is registered")
+            .expect("reader slot available"),
+    );
+
+    // Load + Start + Stop: the hard-drop returns the slot to Loaded with the future gone.
+    let mut control: Output<SlotCommand> = coord.control_handle();
+    control.write(&SlotCommand::load("adcs", "waiter")).unwrap();
+    control.write(&SlotCommand::start("adcs")).unwrap();
+    control.write(&SlotCommand::stop("adcs")).unwrap();
+
+    let coord = stellarator::run(|| async move {
+        coord.run_for(3).await;
+        coord
+    });
+
+    let phases = slot_phases(&mut slot_view);
+    assert_eq!(
+        phases.last(),
+        Some(&LOADED),
+        "after a hard-drop Stop the slot is Loaded (no live future): {phases:?}"
+    );
+    // The occupant was destroyed before it ever polled, so it published no SequenceStatus.
+    assert!(
+        seq_run_states(&mut seq_view).is_empty(),
+        "a hard-dropped occupant never executed"
+    );
+    assert!(coord.stopped().is_empty(), "a hard-drop is not an error-stop");
+
+    drop((coord, slot_view, seq_view, control));
+}
+
+// ---------------------------------------------------------------------------
+// 4. Reset: after a terminal Done, Reset rebuilds the occupant from the start and a
+//    fresh Start runs it to completion again (the slot reloads over the same rings).
+// ---------------------------------------------------------------------------
+
+#[test]
+fn slot_reset_reruns_from_start() {
+    let Some(lib) = locate_fixture() else {
+        return;
+    };
+    let loaded = open_waiter(&lib);
+
+    let mut b = Coordinator::builder(sim_config());
+    let _slot = b.add_slot("adcs", vec![("waiter".into(), loaded, Vec::new())], None);
+    let mut coord = b.build().expect("the slot graph builds");
+
+    let mut seq_view: Input<SequenceStatus> = Input::new(
+        coord
+            .registry()
+            .view(ComponentId::new("adcs.sequence"))
+            .expect("occupant SequenceStatus is registered")
+            .expect("reader slot available"),
+    );
+
+    // Two bounded runs in one executor scope (`stellarator::run` owns the executor for
+    // its closure). Run #1: Load + Start → Completed. Between runs, Reset (rebuild the
+    // selected occupant over the same rings) + Start; Run #2 reloads and completes again.
+    let mut control: Output<SlotCommand> = coord.control_handle();
+    control.write(&SlotCommand::load("adcs", "waiter")).unwrap();
+    control.write(&SlotCommand::start("adcs")).unwrap();
+    let coord = stellarator::run(|| async move {
+        coord.run_for(3).await;
+        control.write(&SlotCommand::reset("adcs")).unwrap();
+        control.write(&SlotCommand::start("adcs")).unwrap();
+        coord.run_for(3).await;
+        drop(control);
+        coord
+    });
+
+    // Two completed runs across the reload: at least two terminal Completed records.
+    let states = seq_run_states(&mut seq_view);
+    let completed = states.iter().filter(|&&s| s == COMPLETED).count();
+    assert!(
+        completed >= 2,
+        "the occupant completed once per run across the Reset reload: {states:?}"
+    );
+
+    drop((coord, seq_view));
+}

@@ -236,6 +236,29 @@ impl DlSystem {
         outputs: Vec<FswRing>,
         name: &'static str,
     ) -> DlSlot {
+        // SAFETY: forwarded verbatim — the caller's `attach_raw` contract holds.
+        unsafe { self.make_slot(params, inputs, outputs, name) }
+    }
+
+    /// Build a fresh [`DlSlot`] over this handle **without** consuming it (the runtime
+    /// slot twin of [`into_slot`]): `fsw_create` a new opaque state and **clone** the
+    /// `Arc<Library>` so the [`DlSystem`] survives for the next Load. A [`SlotRunner`](crate::coordinator)
+    /// calls this on every `Load`/`Reset`, so the same loaded handle reloads N times,
+    /// each `make_slot` → a fresh `fsw_create` state over the slot's owned rings.
+    ///
+    /// # Safety
+    /// Same as [`into_slot`]: every region named by an `FswRing` in `inputs`/`outputs`
+    /// must satisfy [`RingBuffer::attach_raw`](metor_fsw_ring::RingBuffer::attach_raw)'s
+    /// contract — a live, header-valid ring region that outlives the slot (until its
+    /// `Drop` calls `fsw_destroy`). The coordinator guarantees this by keeping the owning
+    /// `RingTable` alive past the slot.
+    pub(crate) unsafe fn make_slot(
+        &self,
+        params: &[u8],
+        inputs: Vec<FswRing>,
+        outputs: Vec<FswRing>,
+        name: &'static str,
+    ) -> DlSlot {
         let (ptr, len) = if params.is_empty() {
             (core::ptr::null(), 0)
         } else {
@@ -245,7 +268,7 @@ impl DlSystem {
         // decodes them immediately, so they need not outlive the call.
         let state = unsafe { (self.create)(ptr, len) };
         DlSlot {
-            lib: self.lib,
+            lib: self.lib.clone(),
             bind_init: self.bind_init,
             execute: self.execute,
             shutdown: self.shutdown,
@@ -291,6 +314,23 @@ pub(crate) struct DlSlot {
     /// The system's descriptor name (the `dyn CyclicSlot` identity in status/health).
     name: &'static str,
     slot_state: SlotState,
+}
+
+impl DlSlot {
+    /// `fsw_execute` returning the **raw** [`FswStatus`] (incl. the terminal
+    /// [`Done`](FswStatus::Done)), guarded on a null/unbound state. Unlike
+    /// [`CyclicSlot::step`] — which folds the status into the 2-variant
+    /// [`SlotState`] and so cannot represent `Done` — this hands the raw word back to
+    /// the caller. The runtime [`SlotRunner`](crate::coordinator) drives an occupant
+    /// through this and maps the status into its own richer slot phase, so a
+    /// completed sequence becomes a terminal phase rather than a benign keep-running.
+    pub(crate) fn execute_raw(&mut self, now: Timestamp) -> FswStatus {
+        if self.state.is_null() {
+            return FswStatus::Panicked;
+        }
+        // SAFETY: `state` is the live, bound `fsw_create` pointer.
+        unsafe { (self.execute)(self.state, now.0 as u64) }
+    }
 }
 
 impl CyclicSlot for DlSlot {
