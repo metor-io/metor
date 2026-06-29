@@ -31,7 +31,7 @@ members = [
     "libs/db/eql",
     "libs/metor-proto/kdl",
     "examples/cube-sat"
-, "libs/metor-panel", "libs/metor-fsw-2/ring", "libs/metor-fsw-2", "examples/adcs-fsw2", "examples/adcs-fsw2/contracts", "examples/adcs-fsw2/systems/plant", "examples/adcs-fsw2/systems/nav", "examples/adcs-fsw2/systems/ctrl", "libs/metor-fsw-2/tests/fixtures/dl-fixture", "libs/metor-fsw-2/tests/fixtures/seq-fixture"]
+, "libs/metor-panel", "libs/metor-fsw-2/ring", "libs/metor-fsw-2", "examples/adcs-fsw2", "examples/adcs-fsw2/contracts", "examples/adcs-fsw2/systems/plant", "examples/adcs-fsw2/systems/nav", "examples/adcs-fsw2/systems/ctrl", "examples/adcs-fsw2/systems/commissioning", "examples/adcs-fsw2/systems/safe-mode", "libs/metor-fsw-2/tests/fixtures/dl-fixture", "libs/metor-fsw-2/tests/fixtures/seq-fixture"]
 exclude = ["fsw/sensor-fw", "fsw/blackbox", "docs/memserve", "apps/metor"]
 
 [workspace.package]
