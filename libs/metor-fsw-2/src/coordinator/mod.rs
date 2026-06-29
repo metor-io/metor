@@ -35,7 +35,8 @@ use crate::descriptor::{Hz, PortDesc, SystemDescriptor, SystemKind};
 use crate::dynamic::FrameList;
 use crate::health::{HealthPort, Level};
 use crate::port::{Input, Output, buffer_capacity, capacity_for};
-use crate::registry::{OutputRegistry, RegistryEntry};
+use crate::message::{MsgOut, msg_capacity};
+use crate::registry::{MessageEntry, MessageRegistry, OutputRegistry, RegistryEntry};
 use crate::system::{AsyncSystem, CyclicRunner, CyclicSystem, Out, System, SystemOutput};
 use crate::telemetry::{TelemetryConfig, TelemetrySystem, Transport};
 use crate::{DEFAULT_DEPTH, Frame};
@@ -836,6 +837,11 @@ impl CoordinatorBuilder {
         // alongside allocation and frozen into an `Arc<OutputRegistry>` *before* the
         // bind loop, so a system can pull it in `BindPorts::bind` (telemetry.md §2.3).
         let mut reg_entries: Vec<RegistryEntry> = Vec::new();
+        // The parallel message-channel index (`docs/messages.md` §2), collected and frozen
+        // beside `reg_entries`. v1 allocates no message rings from generic systems — W4
+        // adds the per-slot sequence channels via the `msg_ring`/`msg_writer` helpers — so
+        // this is empty for now; the plumbing/freeze/accessor is what this wave lands.
+        let msg_entries: Vec<MessageEntry> = Vec::new();
         // Each registry consumer is an extra fan-out reader on every output buffer.
         let n_reg = self.n_registry_consumers;
 
@@ -940,6 +946,9 @@ impl CoordinatorBuilder {
 
         // Freeze the registry; every consumer's bind pulls this same handle.
         let registry = Arc::new(OutputRegistry::new(reg_entries));
+        // Freeze the parallel message registry next to it (`docs/messages.md` §2); the
+        // telemetry tap (W2) and the sequence coupling (W4) read this same handle.
+        let message_registry = Arc::new(MessageRegistry::new(msg_entries));
 
         // --- Private copy-in buffers for async inputs ------------------------
         // (async_sys, in_idx) -> (private ring, matched data notifier, space notifier)
@@ -1131,6 +1140,7 @@ impl CoordinatorBuilder {
             cycle: 0,
             progress: Arc::new(AtomicU64::new(0)),
             registry,
+            message_registry,
             command_ring,
             command_view,
             // Declared last so the canonical ring handles drop after every port.
@@ -1192,6 +1202,27 @@ fn coord_ring<F: Frame>(depth: usize, max_readers: usize) -> RingBuffer<BoxBacki
     })
 }
 
+/// A coordinator-owned **message** ring, sized for `depth` records of up to `max_bytes`
+/// payload (the [`coord_ring`] twin for the `(id, postcard)` channel, `docs/messages.md`
+/// §2). Overwrite, like every owned ring; the registry consumers tap it. v1 mints none —
+/// W4 allocates the per-slot sequence channels through this pair.
+#[allow(dead_code)] // wired now (plumbing); first caller is W4's sequence coupling.
+fn msg_ring(max_bytes: usize, depth: usize, max_readers: usize) -> RingBuffer<BoxBacking> {
+    RingBuffer::create_in_memory(Config {
+        capacity: msg_capacity(max_bytes, depth),
+        max_readers,
+        overrun: Overrun::Overwrite,
+    })
+}
+
+/// A fresh host [`MsgOut`] over a coordinator-owned message ring — the [`slot_writer`]
+/// analogue for the message channel (`slot.rs:547`), exactly how the coordinator mints
+/// its own `status_out`/`control` writers. Single-writer discipline is the caller's.
+#[allow(dead_code)] // wired now (plumbing); first caller is W4's sequence coupling.
+fn msg_writer(ring: &RingBuffer<BoxBacking>) -> MsgOut<BoxBacking> {
+    MsgOut::new(ring.writer(NoWake, NoWake))
+}
+
 /// The synthetic instance prefix coordinator-owned buffers downlink under
 /// (telemetry.md §6): they have no system instance, so their qualified key is
 /// `coordinator.health` / `coordinator.log` / `coordinator.coordinator_status`.
@@ -1237,6 +1268,10 @@ pub struct Coordinator {
     progress: Arc<AtomicU64>,
     /// The broad output registry over every tappable buffer (telemetry.md §2).
     registry: Arc<OutputRegistry>,
+    /// The parallel registry over every tappable message channel (`docs/messages.md`
+    /// §2). Empty until W4 allocates the per-slot sequence channels; the freeze +
+    /// accessor land here so the downlink tap (W2) and the coupling (W4) have it.
+    message_registry: Arc<MessageRegistry>,
     /// The coordinator-owned slot-command ring (the control-plane uplink, §3). A
     /// canonical handle kept so [`control_handle`](Coordinator::control_handle) can mint
     /// a fresh writer over it.
@@ -1272,6 +1307,14 @@ impl Coordinator {
     /// instance-qualified id `ComponentId::new("<instance>.<frame>")`.
     pub fn registry(&self) -> Arc<OutputRegistry> {
         self.registry.clone()
+    }
+
+    /// The parallel registry over every tappable **message** channel
+    /// (`docs/messages.md` §2): the message twin of [`registry`](Self::registry) the
+    /// telemetry downlink taps and the sequence coupling publishes onto. Empty until W4
+    /// allocates the per-slot sequence channels.
+    pub fn message_registry(&self) -> Arc<MessageRegistry> {
+        self.message_registry.clone()
     }
 
     /// A writer over the slot-command control ring (sequences-slots.md §3, Resolved Q1):

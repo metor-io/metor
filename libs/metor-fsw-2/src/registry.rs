@@ -95,3 +95,85 @@ impl OutputRegistry {
         self.entries.is_empty()
     }
 }
+
+// ---------------------------------------------------------------------------
+// MessageRegistry — the parallel index over message channels
+// ---------------------------------------------------------------------------
+
+/// One tappable **message** channel, indexed by its instance-qualified id
+/// (`docs/messages.md` §2). The message twin of [`RegistryEntry`] — but messages are
+/// **self-describing** (`(PacketId, postcard)` records), so this carries **no**
+/// `vtable`/`metadata`/`frame_id`/announce: a tap decodes a record from its 2-byte id
+/// alone (`docs/messages.md` Q3).
+pub struct MessageEntry {
+    /// The instance-qualified id `ComponentId::new("<instance>.<channel>")` — the
+    /// channel's stable identity, parallel to [`RegistryEntry::key`].
+    pub key: ComponentId,
+    /// The owning system's instance name (`"mode"`), or `"coordinator"` for the
+    /// coordinator-owned channels. Kept for human-readable subset filtering.
+    pub instance: Arc<str>,
+    /// The channel name within the instance (`"events"`) — the message analogue of the
+    /// output's frame id, but a plain name (messages have no frame type).
+    pub channel: Arc<str>,
+    /// The read source. Crate-private so external callers go through
+    /// [`view()`](Self::view), which claims a slot-accounted reader (never the raw
+    /// buffer); the coordinator sets it at `build()`.
+    pub(crate) ring: RingBuffer<BoxBacking>,
+}
+
+impl MessageEntry {
+    /// Claim a read [`View`] into this channel, consuming one reader slot from the
+    /// buffer's fixed `max_readers` table. Fails with [`FullReaderTable`] if the
+    /// build-time slot budget is exhausted — exactly [`RegistryEntry::view`].
+    pub fn view(&self) -> Result<View<BoxBacking, NoWake, NoWake>, FullReaderTable> {
+        self.ring.view(NoWake, NoWake)
+    }
+}
+
+/// The message registry: a by-key index over the build-order [`MessageEntry`] list, the
+/// [`OutputRegistry`] shape verbatim for message channels (`docs/messages.md` §2).
+pub struct MessageRegistry {
+    entries: Vec<MessageEntry>,
+    by_key: HashMap<ComponentId, usize>,
+}
+
+impl MessageRegistry {
+    /// Assemble the registry from the build-order entries the coordinator collected.
+    pub(crate) fn new(entries: Vec<MessageEntry>) -> Self {
+        let by_key = entries
+            .iter()
+            .enumerate()
+            .map(|(i, e)| (e.key, i))
+            .collect();
+        Self { entries, by_key }
+    }
+
+    /// Every tappable message channel, in build order.
+    pub fn entries(&self) -> &[MessageEntry] {
+        &self.entries
+    }
+
+    /// Look up one channel by its instance-qualified id (`ComponentId::new("<instance>.<channel>")`).
+    pub fn get(&self, key: ComponentId) -> Option<&MessageEntry> {
+        self.by_key.get(&key).map(|&i| &self.entries[i])
+    }
+
+    /// Claim a read [`View`] into the channel identified by `key`, or `None` if no such
+    /// channel exists. The inner `Result` is the slot-budget check.
+    pub fn view(
+        &self,
+        key: ComponentId,
+    ) -> Option<Result<View<BoxBacking, NoWake, NoWake>, FullReaderTable>> {
+        self.get(key).map(MessageEntry::view)
+    }
+
+    /// Number of tappable message channels.
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    /// Whether the graph produced no message channels.
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+}
