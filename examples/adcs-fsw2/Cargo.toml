@@ -25,3 +25,8 @@ adcs-plant = { path = "systems/plant", default-features = false }
 adcs-nav = { path = "systems/nav", default-features = false }
 adcs-ctrl = { path = "systems/ctrl", default-features = false }
 stellarator.path = "../../libs/stellarator"
+# The downlink message-emission regression test (`tests/sequences.rs`) decodes the slot's
+# `SequenceChannelEvent`/`SequenceRegistry` records off the message ring — the same
+# `(PacketId, postcard)` tap the telemetry downlink performs (docs/messages.md §3).
+postcard = { version = "1.1", features = ["alloc"] }
+serde = { version = "1.0", features = ["derive"] }

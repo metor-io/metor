@@ -24,11 +24,12 @@ use std::cell::RefCell;
 use std::rc::Rc;
 
 use adcs_contracts::ModeCmd;
-use metor_fsw_2::metor_proto::types::ComponentId;
+use metor_fsw_2::metor_proto::types::{ComponentId, Msg};
+use metor_fsw_2::metor_proto_wkt::{SequenceChannelEvent, SequenceEventKind, SequenceRegistry};
 use metor_fsw_2::wiring::Registry;
 use metor_fsw_2::{
     BuildOptions, Coordinator, Input, Output, SequenceStatus, SlotCommand, build_artifacts,
-    parse, resolve,
+    parse, resolve, split_record,
 };
 
 /// The mission wiring document — the same file the CLI runner and the other tests read.
@@ -194,4 +195,109 @@ fn interactive_load_then_abort_safes() {
         !modes.contains(&ModeCmd::POINTING),
         "it was aborted before pointing: {modes:?}"
     );
+}
+
+// ---------------------------------------------------------------------------
+// 3. Downlink (Wave 5): the real mission's `mode` slot emits the ordered
+//    commissioning lifecycle as `SequenceChannelEvent`s on its message channel, and
+//    the coordinator emits a boot `SequenceRegistry` listing the slot's allowed
+//    occupants — the exact wire path the panel's sequence view sources. Taps the
+//    message rings via `Coordinator::message_registry()` (docs/messages.md §5).
+// ---------------------------------------------------------------------------
+
+/// Drain a message ring into the decoded `Msg`s of one type, asserting the 2-byte id and
+/// postcard-round-tripping each record — the downlink tap's decode (`docs/messages.md` §3),
+/// reused verbatim from the framework's `slot_integration` test.
+fn drain_msgs<M: Msg + serde::de::DeserializeOwned>(
+    view: &mut metor_fsw_2::ring::View<
+        metor_fsw_2::ring::BoxBacking,
+        metor_fsw_2::ring::NoWake,
+        metor_fsw_2::ring::NoWake,
+    >,
+) -> Vec<M> {
+    let mut out = Vec::new();
+    let mut buf = Vec::new();
+    while view.try_read_into(&mut buf).expect("no lap on the message tap") {
+        let (id, payload) = split_record(&buf).expect("a 2-byte-id record");
+        assert_eq!(id, M::ID, "every record on this channel carries M::ID");
+        out.push(postcard::from_bytes::<M>(payload).expect("postcard round-trip"));
+    }
+    out
+}
+
+#[test]
+fn commissioning_emits_ordered_sequence_messages() {
+    let Some(mut coord) = build_mission(true) else {
+        return;
+    };
+
+    // Tap the `mode` slot's events channel + the coordinator's boot-registry channel BEFORE
+    // the run — the message rings are overwrite, starting at the live edge, so the taps must
+    // precede the emits. Only transition records land (6 events + 1 registry over the run),
+    // far under the message ring depth, so a post-run drain never laps.
+    let messages = coord.message_registry();
+    let mut events_view = messages
+        .view(ComponentId::new("mode.sequences"))
+        .expect("the slot events channel is registered")
+        .expect("a reader slot is available");
+    let mut boot_view = messages
+        .view(ComponentId::new("coordinator.sequences"))
+        .expect("the coordinator boot-registry channel is registered")
+        .expect("a reader slot is available");
+
+    // The same ~400-cycle auto-run window the `commissioning_auto_runs_to_completion` test
+    // uses — far more than the ~30 cycles commissioning needs to walk to `Completed`.
+    let coord = stellarator::run(|| async move {
+        coord.run_for(400).await;
+        coord
+    });
+
+    // (a) The boot `SequenceRegistry` lists the `mode` channel with both allowed occupants.
+    let registries = drain_msgs::<SequenceRegistry>(&mut boot_view);
+    let registry = registries.last().expect("a boot SequenceRegistry was emitted");
+    let channel = registry
+        .channels
+        .iter()
+        .find(|c| c.name == "mode")
+        .expect("the registry lists the `mode` slot channel");
+    assert!(
+        channel.available.contains(&"commissioning".to_string())
+            && channel.available.contains(&"safe_mode".to_string()),
+        "the `mode` channel advertises both allowed occupants: {:?}",
+        channel.available
+    );
+
+    // (b) The `mode` slot's events, IN ORDER with no coalescing: the full commissioning
+    //     lifecycle. The progress detail strings match `systems/commissioning/src/lib.rs`.
+    let events = drain_msgs::<SequenceChannelEvent>(&mut events_view);
+    assert!(
+        events.iter().all(|e| e.channel_id == channel.id),
+        "every event is tagged with the `mode` channel's id"
+    );
+    let kinds: Vec<&SequenceEventKind> = events.iter().map(|e| &e.kind).collect();
+    assert_eq!(
+        kinds.len(),
+        6,
+        "the full commissioning lifecycle, every-record (no coalescing): {kinds:?}"
+    );
+    assert!(
+        matches!(kinds[0], SequenceEventKind::Loaded { name } if name == "commissioning"),
+        "[0] Loaded {{ commissioning }}: {kinds:?}"
+    );
+    assert!(matches!(kinds[1], SequenceEventKind::Started), "[1] Started: {kinds:?}");
+    assert!(
+        matches!(kinds[2], SequenceEventKind::Progress { detail } if detail == "warming up"),
+        "[2] Progress {{ warming up }}: {kinds:?}"
+    );
+    assert!(
+        matches!(kinds[3], SequenceEventKind::Progress { detail } if detail == "reaction wheels enabled"),
+        "[3] Progress {{ reaction wheels enabled }}: {kinds:?}"
+    );
+    assert!(
+        matches!(kinds[4], SequenceEventKind::Progress { detail } if detail == "pointing"),
+        "[4] Progress {{ pointing }}: {kinds:?}"
+    );
+    assert!(matches!(kinds[5], SequenceEventKind::Completed), "[5] Completed: {kinds:?}");
+
+    drop((coord, events_view, boot_view, messages));
 }
