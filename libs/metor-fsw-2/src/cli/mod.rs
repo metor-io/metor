@@ -231,6 +231,23 @@ fn print_run_banner(target: &Path, wiring: &Wiring) {
     let kind = if target.is_dir() { "bundle" } else { "mission" };
     println!("metor-fsw — running {kind} {}", target.display());
     println!("  systems:   {} ({})", wiring.systems.len(), names.join(", "));
+    if !wiring.slots.is_empty() {
+        // Each slot is a runtime-loadable position; show its initial occupant (or
+        // "empty") so the run output reflects the sequences in the mission.
+        let slots: Vec<String> = wiring
+            .slots
+            .iter()
+            .map(|s| {
+                let occ = s
+                    .initial
+                    .as_ref()
+                    .map(|i| i.occupant.as_str())
+                    .unwrap_or("empty");
+                format!("{}[{occ}]", s.name)
+            })
+            .collect();
+        println!("  slots:     {} ({})", wiring.slots.len(), slots.join(", "));
+    }
 
     match wiring.coordinator.clock {
         ClockSpec::Wall => println!(
