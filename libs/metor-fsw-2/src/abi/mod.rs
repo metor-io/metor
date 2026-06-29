@@ -23,8 +23,10 @@
 //! returning an allocation the host would have to free.
 
 use core::ffi::c_void;
+use core::task::{Context, Poll, Waker};
 use std::collections::HashMap;
 use std::panic::{AssertUnwindSafe, catch_unwind};
+use std::rc::Rc;
 use std::slice;
 
 use std::sync::Arc;
@@ -39,6 +41,7 @@ use serde::{Deserialize, Serialize};
 use crate::binder::{BindPorts, RingSource};
 use crate::coordinator::{CyclicSlot, SlotState, StopReason};
 use crate::descriptor::{AnnounceFn, Hz, PortDesc, SystemDescriptor, SystemKind};
+use crate::sequence::{SeqBound, SeqClock, SeqSystem, publish_status, with_clock};
 use crate::system::{BuildSystem, CyclicRunner, CyclicSystem, Out, SystemOutput};
 
 // ---------------------------------------------------------------------------
@@ -48,7 +51,10 @@ use crate::system::{BuildSystem, CyclicRunner, CyclicSystem, Out, SystemOutput};
 /// The monotonic ABI word a host checks for equality before any other call.
 /// **Bump on any change** to the C surface or the `*Msg` wire structs below; a
 /// mismatch fails the load cleanly rather than risking a crash.
-pub const FSW_ABI_VERSION: u32 = 1;
+///
+/// `2` adds the terminal [`FswStatus::Done`] code a sequence occupant returns when
+/// its future is `Ready` (the only ABI addition for slots/sequences, §8).
+pub const FSW_ABI_VERSION: u32 = 2;
 
 // ---------------------------------------------------------------------------
 // repr(C) handles
@@ -92,6 +98,14 @@ pub enum FswStatus {
     /// A panic was caught at the boundary, or the state was never bound; the host
     /// telemeters it and hard-stops the slot.
     Panicked = 2,
+    /// A sequence occupant's future returned `Ready` — a **terminal, non-error**
+    /// stop (§8). The host maps it to the slot-layer terminal state and stops
+    /// polling; the `Completed`/`Aborted`/`Failed` detail rides the
+    /// [`SequenceStatus`](crate::sequence::SequenceStatus) frame, not this word. A
+    /// `CyclicRunner`-driven (`export_system!`) system never returns it, so
+    /// [`from_slot`](FswStatus::from_slot) — which maps a [`SlotState`] with no
+    /// `Done` — is unchanged; sequences return it directly from `run_seq_execute`.
+    Done = 3,
 }
 
 impl FswStatus {
@@ -597,6 +611,232 @@ where
 {
     let outcome = catch_unwind(AssertUnwindSafe(|| {
         let desc = <S as CyclicSystem<RawBacking>>::descriptor();
+        let input_metadata = desc.inputs.iter().map(|p| (p.announce)("").1).collect();
+        let output_metadata = desc.outputs.iter().map(|p| (p.announce)("").1).collect();
+        let params_schema = OwnedNamedType::from(<S::Params as postcard_schema::Schema>::SCHEMA);
+        let msg = SystemDescriptorMsg::lower(&desc, params_schema, input_metadata, output_metadata);
+        postcard::to_allocvec(&msg).expect("descriptor encodes (postcard)")
+    }));
+    match outcome {
+        Ok(bytes) => {
+            sink(ctx, bytes.as_ptr(), bytes.len());
+            0
+        }
+        Err(_) => -1,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Sequence occupants — the `run_seq_*` twins of the `run_*` helpers
+// ---------------------------------------------------------------------------
+
+/// The opaque state a sequence occupant's lifecycle threads — the twin of
+/// [`AbiState`] for a future-driven occupant (§4.2). `params` holds the decoded
+/// params until [`run_seq_bind_init`] consumes them; `bound` holds the owned future
+/// (with the user ports moved inside it) + the wrapper-owned `Out` tail + the cancel
+/// input, built at bind; `clock` is the per-cycle ambient ([`SeqClock`]); `poisoned`
+/// latches a caught `execute` panic so later cycles short-circuit to
+/// [`FswStatus::Panicked`].
+struct SeqState<S: SeqSystem> {
+    params: Option<S::Params>,
+    bound: Option<SeqBound>,
+    clock: Rc<SeqClock>,
+    poisoned: bool,
+}
+
+/// `fsw_create` (sequence): postcard-decode `S::Params` and box an **unbound**
+/// [`SeqState`] (a fresh [`SeqClock`], no future yet). Mirrors [`run_create`],
+/// including the empty/null-params path. Returns null on panic.
+///
+/// # Safety
+/// As [`run_create`]: `params`/`params_len` name a readable byte range (or null/0);
+/// the returned pointer is owned by the caller and passed only to the other
+/// `run_seq_*` helpers for the same `S`, then [`run_seq_destroy`].
+pub unsafe fn run_seq_create<S>(params: *const u8, params_len: usize) -> *mut c_void
+where
+    S: SeqSystem,
+    S::Params: for<'de> Deserialize<'de>,
+{
+    let outcome = catch_unwind(AssertUnwindSafe(|| {
+        let bytes: &[u8] = if params.is_null() || params_len == 0 {
+            &[]
+        } else {
+            // SAFETY: caller asserts `params..params+params_len` is readable.
+            unsafe { slice::from_raw_parts(params, params_len) }
+        };
+        let params: S::Params = postcard::from_bytes(bytes).expect("params decode (postcard)");
+        let state = Box::new(SeqState::<S> {
+            params: Some(params),
+            bound: None,
+            clock: Rc::new(SeqClock::default()),
+            poisoned: false,
+        });
+        Box::into_raw(state) as *mut c_void
+    }));
+    outcome.unwrap_or(core::ptr::null_mut())
+}
+
+/// `fsw_bind_init` (sequence): build a [`RawBinder`] over the host's [`FswRing`]
+/// arrays and hand it to `S::build`, which binds the ports in `descriptor()` order —
+/// the user ports + [`SlotControlIn`](crate::sequence::SlotControlIn) **move into the
+/// future**, the [`SequenceStatus`](crate::sequence::SequenceStatus) + health/log tail
+/// stays in the state. A caught panic leaves `bound = None`, so [`run_seq_execute`]
+/// reports [`FswStatus::Panicked`].
+///
+/// # Safety
+/// As [`run_bind_init`]: `state` is a live [`SeqState`] from [`run_seq_create`];
+/// `inputs`/`outputs` name `n_in`/`n_out` valid [`FswRing`] handles whose regions
+/// satisfy [`RingBuffer::attach_raw`]'s contract and outlive the future (until
+/// [`run_seq_destroy`]).
+pub unsafe fn run_seq_bind_init<S>(
+    state: *mut c_void,
+    inputs: *const FswRing,
+    n_in: usize,
+    outputs: *const FswRing,
+    n_out: usize,
+) where
+    S: SeqSystem,
+{
+    if state.is_null() {
+        return;
+    }
+    // SAFETY: caller asserts `state` is a live `SeqState<S>` from `run_seq_create`.
+    let st = unsafe { &mut *(state as *mut SeqState<S>) };
+    let _ = catch_unwind(AssertUnwindSafe(|| {
+        let in_slice: &[FswRing] = if inputs.is_null() || n_in == 0 {
+            &[]
+        } else {
+            // SAFETY: caller asserts `n_in` valid handles at `inputs`.
+            unsafe { slice::from_raw_parts(inputs, n_in) }
+        };
+        let out_slice: &[FswRing] = if outputs.is_null() || n_out == 0 {
+            &[]
+        } else {
+            // SAFETY: caller asserts `n_out` valid handles at `outputs`.
+            unsafe { slice::from_raw_parts(outputs, n_out) }
+        };
+        // SAFETY: caller asserts each region outlives the future (until run_seq_destroy).
+        let mut binder = unsafe { RawBinder::new(in_slice, out_slice) };
+        let params = st
+            .params
+            .take()
+            .expect("run_seq_create populated params before run_seq_bind_init");
+        st.bound = Some(S::build(params, &mut binder, &st.clock));
+    }));
+}
+
+/// `fsw_execute` (sequence): refresh `clock.now`, fold the latched cancel from the
+/// control input, poll the future **once** with `Waker::noop()` under the task-local
+/// clock, publish a [`SequenceStatus`](crate::sequence::SequenceStatus) record + drive
+/// `Out::health().end_cycle` on the wrapper tail, and map `Ready(outcome)` →
+/// [`FswStatus::Done`] / `Pending` → [`FswStatus::Running`]. A caught panic latches
+/// `poisoned` and returns [`FswStatus::Panicked`] (as does an unbound/poisoned state).
+///
+/// # Safety
+/// `state` is a live pointer from [`run_seq_create`] for this `S`.
+pub unsafe fn run_seq_execute<S>(state: *mut c_void, now: u64) -> FswStatus
+where
+    S: SeqSystem,
+{
+    if state.is_null() {
+        return FswStatus::Panicked;
+    }
+    // SAFETY: caller asserts `state` is a live `SeqState<S>` from `run_seq_create`.
+    let st = unsafe { &mut *(state as *mut SeqState<S>) };
+    if st.poisoned {
+        return FswStatus::Panicked;
+    }
+    let Some(bound) = st.bound.as_mut() else {
+        return FswStatus::Panicked;
+    };
+    let now_ts = Timestamp(now as i64);
+    st.clock.now.set(now_ts);
+    // Fold the cancel control frame (latched once seen, §4.4).
+    if let Ok(Some(f)) = bound.control.latest()
+        && f.get().cancel != 0
+    {
+        st.clock.cancel.set(true);
+    }
+    let start = std::time::Instant::now();
+    let clock = &st.clock;
+    let outcome = catch_unwind(AssertUnwindSafe(|| {
+        with_clock(clock, || {
+            bound
+                .future
+                .as_mut()
+                .poll(&mut Context::from_waker(Waker::noop()))
+        })
+    }));
+    let micros = start.elapsed().as_micros() as u64;
+    match outcome {
+        Ok(Poll::Ready(outcome)) => {
+            let lines = st.clock.drain_progress();
+            publish_status(&mut bound.status, now_ts, outcome.run_state(), &lines);
+            bound.status.health().end_cycle(now_ts, micros);
+            FswStatus::Done
+        }
+        Ok(Poll::Pending) => {
+            let lines = st.clock.drain_progress();
+            publish_status(&mut bound.status, now_ts, 0, &lines);
+            bound.status.health().end_cycle(now_ts, micros);
+            FswStatus::Running
+        }
+        Err(_) => {
+            st.poisoned = true;
+            FswStatus::Panicked
+        }
+    }
+}
+
+/// `fsw_shutdown` (sequence): a no-op — v1 sequences have no shutdown hook (the
+/// future is dropped at [`run_seq_destroy`]). Provided so the symbol surface stays
+/// uniform with `export_system!`. Safe on null/poisoned.
+///
+/// # Safety
+/// `state` is a live pointer from [`run_seq_create`] for this `S` (or null).
+pub unsafe fn run_seq_shutdown<S>(state: *mut c_void)
+where
+    S: SeqSystem,
+{
+    let _ = state;
+}
+
+/// `fsw_destroy` (sequence): drop the boxed [`SeqState`] inside the `.so` — dropping
+/// the future drops its owned [`RawBacking`] ports (releasing their ring roles), and
+/// the wrapper tail/control drop too. Idempotent on null.
+///
+/// # Safety
+/// `state` is a live pointer from [`run_seq_create`] for this `S`, transferred here
+/// exactly once and not used afterward.
+pub unsafe fn run_seq_destroy<S>(state: *mut c_void)
+where
+    S: SeqSystem,
+{
+    if state.is_null() {
+        return;
+    }
+    // SAFETY: caller asserts `state` is a live `SeqState<S>` from `run_seq_create`,
+    // transferred here exactly once.
+    let st = unsafe { Box::from_raw(state as *mut SeqState<S>) };
+    let _ = catch_unwind(AssertUnwindSafe(|| drop(st)));
+}
+
+/// `fsw_describe` (sequence): lower the macro's signature-derived `S::descriptor()`
+/// (plus its `Params` schema and each port's unprefixed metadata) to a
+/// [`SystemDescriptorMsg`], postcard-encode it, and hand the bytes to the host
+/// [`ByteSink`]. Mirrors [`run_describe`], but over `S::descriptor()` (the sequence's
+/// own descriptor) rather than `CyclicSystem::descriptor`.
+///
+/// # Safety
+/// As [`run_describe`]: `sink`/`ctx` form a valid host callback (`sink` is called once
+/// with a buffer the `.so` owns for the duration of the call).
+pub unsafe fn run_seq_describe<S>(sink: ByteSink, ctx: *mut c_void) -> i32
+where
+    S: SeqSystem,
+    S::Params: postcard_schema::Schema,
+{
+    let outcome = catch_unwind(AssertUnwindSafe(|| {
+        let desc = S::descriptor();
         let input_metadata = desc.inputs.iter().map(|p| (p.announce)("").1).collect();
         let output_metadata = desc.outputs.iter().map(|p| (p.announce)("").1).collect();
         let params_schema = OwnedNamedType::from(<S::Params as postcard_schema::Schema>::SCHEMA);

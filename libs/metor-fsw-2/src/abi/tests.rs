@@ -22,8 +22,13 @@ use serde::{Deserialize, Serialize};
 use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
 
 use crate::abi::{
-    FswRing, FswStatus, ROLE_INPUT, ROLE_OUTPUT, SystemDescriptorMsg, run_bind_init, run_create,
-    run_destroy, run_execute, run_shutdown,
+    FswRing, FswStatus, RawBinder, ROLE_INPUT, ROLE_OUTPUT, SystemDescriptorMsg, run_bind_init,
+    run_create, run_destroy, run_execute, run_seq_bind_init, run_seq_create, run_seq_destroy,
+    run_seq_execute, run_seq_shutdown, run_shutdown,
+};
+use crate::binder::BindPorts;
+use crate::sequence::{
+    Outcome, SeqBound, SeqClock, SeqStatusOut, SeqSystem, SequenceStatus, SlotControlIn, wait,
 };
 use crate::wiring::{FromKdlNode, LoadError};
 use crate::{
@@ -506,4 +511,112 @@ fn kdl_schema_encode_unknown_property_is_clean_error() {
         }
         other => panic!("expected DlUnknownParam, got {other:?}"),
     }
+}
+
+// ---------------------------------------------------------------------------
+// Sequence occupant: a hand-written `SeqSystem` driven through the `run_seq_*`
+// helpers in-proc (no dlopen, the house pattern). It has no user ports — just the
+// implicit `SlotControlIn` input and the `SequenceStatus` + health/log output tail —
+// and a future that `wait`s ~2 sim-us then returns `Completed`.
+// ---------------------------------------------------------------------------
+
+use std::rc::Rc;
+use std::time::Duration;
+
+use metor_fsw_ring::RawBacking;
+
+use crate::SystemDescriptor;
+
+struct WaitSeq;
+
+impl SeqSystem for WaitSeq {
+    type Params = ();
+
+    fn descriptor() -> SystemDescriptor {
+        // inputs = [SlotControlIn]; outputs = the Out<SeqStatusOut> tail
+        // (SequenceStatus, health, log).
+        let inputs = vec![<Input<SlotControlIn, BoxBacking>>::descriptor()];
+        let outputs =
+            <Out<SeqStatusOut<BoxBacking>, BoxBacking> as SystemOutput>::descriptors();
+        SystemDescriptor {
+            name: "wait_seq",
+            kind: SystemKind::Cyclic,
+            inputs,
+            outputs,
+        }
+    }
+
+    fn build(_params: (), binder: &mut RawBinder, clock: &Rc<SeqClock>) -> SeqBound {
+        let control = <Input<SlotControlIn, RawBacking>>::bind(binder);
+        let status =
+            <Out<SeqStatusOut<RawBacking>, RawBacking> as BindPorts<RawBacking>>::bind(binder);
+        let _ = clock;
+        let future: std::pin::Pin<Box<dyn std::future::Future<Output = Outcome>>> =
+            Box::pin(async {
+                // Deadline = now-at-first-poll + 2us; resolves once `now` reaches it.
+                wait(Duration::from_micros(2)).await;
+                Outcome::Completed
+            });
+        SeqBound {
+            future,
+            status,
+            control,
+        }
+    }
+}
+
+#[test]
+fn seq_abi_runs_to_done() {
+    // Descriptor-order rings: input [control]; outputs [status, health, log].
+    let control_ring = overwrite_ring::<SlotControlIn>(8, 1);
+    let status_ring = overwrite_ring::<SequenceStatus>(8, 1);
+    let health_ring = overwrite_ring::<SystemHealth>(8, 1);
+    let log_ring = overwrite_ring::<SystemLog>(8, 1);
+
+    // Host view over the status ring, registered before the occupant writes.
+    let mut status_view = Input::<SequenceStatus>::new(status_ring.view(NoWake, NoWake).unwrap());
+
+    let inputs = [handle(&control_ring, ROLE_INPUT)];
+    let outputs = [
+        handle(&status_ring, ROLE_OUTPUT),
+        handle(&health_ring, ROLE_OUTPUT),
+        handle(&log_ring, ROLE_OUTPUT),
+    ];
+
+    // `()` params → empty blob.
+    // SAFETY: null/0 is the documented empty-params case.
+    let state = unsafe { run_seq_create::<WaitSeq>(std::ptr::null(), 0) };
+    assert!(!state.is_null(), "run_seq_create returned state");
+    // SAFETY: live state + valid handle regions that outlive the future.
+    unsafe {
+        run_seq_bind_init::<WaitSeq>(
+            state,
+            inputs.as_ptr(),
+            inputs.len(),
+            outputs.as_ptr(),
+            outputs.len(),
+        )
+    };
+
+    // t=0: the future suspends on `wait` → Running.
+    // SAFETY: live, bound state.
+    assert_eq!(unsafe { run_seq_execute::<WaitSeq>(state, 0) }, FswStatus::Running);
+    // t=2: deadline elapsed → the future completes → Done.
+    // SAFETY: live, bound state.
+    assert_eq!(unsafe { run_seq_execute::<WaitSeq>(state, 2) }, FswStatus::Done);
+
+    // A terminal `SequenceStatus` (run_state == Completed) was published on the tail.
+    let rec = status_view
+        .latest()
+        .unwrap()
+        .expect("a SequenceStatus record was written");
+    assert_eq!(rec.get().run_state, Outcome::Completed.run_state());
+    assert_eq!(rec.get().timestamp, Timestamp(2));
+
+    // SAFETY: live state, torn down once before the host rings drop.
+    unsafe {
+        run_seq_shutdown::<WaitSeq>(state);
+        run_seq_destroy::<WaitSeq>(state);
+    }
+    drop((control_ring, status_ring, health_ring, log_ring, status_view));
 }

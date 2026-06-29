@@ -333,6 +333,13 @@ impl CyclicSlot for DlSlot {
             FswStatus::Panicked => SlotState::Stopped {
                 reason: StopReason::Panicked,
             },
+            // `Done` (terminal sequence outcome) is unreachable for a build-time
+            // `DlSlot`: an `export_system!` system is `CyclicRunner`-driven and never
+            // returns it (only a `#[sequence]` occupant does, via `run_seq_execute`).
+            // The slot-layer `SlotRunner` (W4) is where `Done` is meaningful; here it
+            // can only arrive from a misbehaving `.so`, so treat it as a benign
+            // keep-running (the 2-variant `SlotState` has no terminal-success state).
+            FswStatus::Done => SlotState::Running,
         };
     }
 
