@@ -50,8 +50,9 @@ pub use writer::{FrameWriter, ListWriter, MapWriter, WriteError};
 // `bind`/`Binder` port-construction contract.
 pub use binder::{BindPorts, Binder, BoundPort, RingSource};
 pub use coordinator::{
-    ClockMode, Coordinator, CoordinatorBuilder, CoordinatorConfig, PortRef, SlotState, StopReason,
-    StoppedSystem, SystemHandle, WireError,
+    AllowedOccupant, ClockMode, Coordinator, CoordinatorBuilder, CoordinatorConfig,
+    InitialOccupant, PortRef, SLOT_NAME_CAP, SlotCommand, SlotPhase, SlotState, SlotStatus,
+    StopReason, StoppedSystem, SystemHandle, WireError,
 };
 
 // The general output registry and the telemetry downlink (its first consumer).

@@ -40,6 +40,13 @@ use crate::system::{AsyncSystem, CyclicRunner, CyclicSystem, Out, System, System
 use crate::telemetry::{TelemetryConfig, TelemetrySystem, Transport};
 use crate::{DEFAULT_DEPTH, Frame};
 use crate::descriptor::compatible;
+use crate::sequence::SlotControlIn;
+
+mod slot;
+pub use slot::{
+    AllowedOccupant, InitialOccupant, SlotCommand, SlotPhase, SlotStatus, SLOT_NAME_CAP,
+};
+use slot::{SlotReg, SlotRunner, slot_writer};
 
 /// Slack reader slots added on top of a buffer's fan-out, covering late taps such
 /// as a db/telemetry sink or a debugger (v1 has no crash-slot reclamation, so
@@ -250,6 +257,11 @@ pub(crate) trait CyclicSlot {
     fn shutdown(&mut self);
     fn name(&self) -> &'static str;
     fn state(&self) -> &SlotState;
+    /// Apply a runtime slot command (sequences-slots.md §3). The default is a **no-op**
+    /// so static [`CyclicRunner`](crate::CyclicRunner) / build-time [`DlSlot`](crate::dl)
+    /// slots ignore the per-cycle command broadcast; only a [`SlotRunner`](slot::SlotRunner)
+    /// overrides it, filtering by its own name.
+    fn command(&mut self, _cmd: &SlotCommand) {}
 }
 
 // ---------------------------------------------------------------------------
@@ -468,6 +480,8 @@ enum Reg {
     Async(Box<dyn AsyncRegistration>),
     /// A dlopen'd cyclic system, bound to a [`DlSlot`](crate::dl) at `build()`.
     Dl(DlReg),
+    /// A runtime-swappable slot, bound to a [`SlotRunner`](slot::SlotRunner) at `build()`.
+    Slot(SlotReg),
 }
 
 // ---------------------------------------------------------------------------
@@ -603,6 +617,87 @@ impl CoordinatorBuilder {
             system: loaded,
             params,
         }));
+        SystemHandle { id }
+    }
+
+    /// Register a runtime-swappable **slot** (sequences-slots.md §6): a fixed position in
+    /// the cyclic call chain whose occupant the host `Load`s/`Start`s/`Stop`s/`Abort`s/
+    /// `Reset`s/`Unload`s at runtime. `allowed` is the pre-opened candidate set — each
+    /// `(Load-name, opened DlSystem, postcard params)` a sequence occupant. `initial`
+    /// optionally applies one at startup.
+    ///
+    /// The registered descriptor is the occupant descriptor **with the trailing
+    /// `SlotControlIn` input removed**, so the existing `compatible()`/`WireError`
+    /// validation and ring sizing/allocation run over it unchanged: every registered
+    /// input is an ordinary edge-connected user input, every output a normally-allocated,
+    /// registry-tapped occupant output. The slot additionally owns a control ring (the
+    /// host writes the cancel frame, appended to the occupant's input array) and a
+    /// [`SlotStatus`] output ring. The returned handle's user ports `connect` exactly
+    /// like a system's.
+    ///
+    /// Panics if `allowed` is empty or an allowed occupant is not `compatible()` with the
+    /// first occupant's contract (a build-time wiring error — the slot derives its
+    /// contract from the allowed set's shared descriptor; v1 holds sequence occupants
+    /// only).
+    pub fn add_slot(
+        &mut self,
+        name: impl Into<String>,
+        allowed: Vec<(String, crate::dl::DlSystem, Vec<u8>)>,
+        initial: Option<InitialOccupant>,
+    ) -> SystemHandle {
+        assert!(
+            !allowed.is_empty(),
+            "a slot needs at least one allowed occupant"
+        );
+        let base = allowed[0].1.descriptor().clone();
+        // Every allowed occupant must share the contract (the slot sizes/validates to the
+        // first occupant's descriptor). v1 requires a shared shape (mutual subset).
+        for (occ_name, sys, _) in &allowed[1..] {
+            let d = sys.descriptor();
+            let ports_match = |a: &[PortDesc], b: &[PortDesc]| {
+                a.len() == b.len()
+                    && a.iter()
+                        .zip(b)
+                        .all(|(x, y)| compatible(x, y) && compatible(y, x))
+            };
+            assert!(
+                ports_match(&d.inputs, &base.inputs) && ports_match(&d.outputs, &base.outputs),
+                "allowed occupant {occ_name:?} is incompatible with the slot contract \
+                 (derived from {:?})",
+                allowed[0].0
+            );
+        }
+
+        let name: String = name.into();
+        // The registered descriptor name is the slot's instance name (a leaked
+        // `&'static str` for the descriptor field + the `SlotRunner` identity).
+        let leaked: &'static str = Box::leak(name.clone().into_boxed_str());
+        let mut inputs = base.inputs.clone();
+        // Drop the trailing slot-owned `SlotControlIn` input (host-written, not edge-connected).
+        if inputs.last().map(|p| p.frame_id) == Some(SlotControlIn::FRAME_ID) {
+            inputs.pop();
+        }
+        let registered = SystemDescriptor {
+            name: leaked,
+            kind: SystemKind::Cyclic,
+            inputs,
+            outputs: base.outputs.clone(),
+        };
+
+        let allowed = allowed
+            .into_iter()
+            .map(|(name, system, params)| AllowedOccupant {
+                name,
+                system,
+                params,
+            })
+            .collect();
+
+        let id = self.descs.len();
+        self.descs.push(registered);
+        self.kinds.push(SystemKind::Cyclic);
+        self.names.push(name);
+        self.regs.push(Reg::Slot(SlotReg { allowed, initial }));
         SystemHandle { id }
     }
 
@@ -793,6 +888,56 @@ impl CoordinatorBuilder {
             });
         }
 
+        // --- Slot aux rings (control input + SlotStatus output) --------------
+        // Allocated *before* the registry freeze so the SlotStatus tap lands in the
+        // registry like any output. The control ring is host-written / occupant-read
+        // (uplink), so it is owned but not telemetered.
+        let mut slot_aux: HashMap<usize, (RingBuffer<BoxBacking>, RingBuffer<BoxBacking>)> =
+            HashMap::new();
+        for s in 0..n {
+            if !matches!(self.regs[s], Reg::Slot(_)) {
+                continue;
+            }
+            // SlotStatus: a normal output, sized for the registry consumers (+ slack);
+            // nothing edge-connects to it (fan-out 0).
+            let status_ring = coord_ring::<SlotStatus>(depth, n_reg + READER_SLACK);
+            let instance = self.names[s].clone();
+            let status_desc = PortDesc::of::<SlotStatus>();
+            reg_entries.push(registry_entry(&instance, &status_desc, status_ring.clone()));
+            table.rings.push(RingEntry {
+                ring: status_ring.clone(),
+                frame_id: SlotStatus::FRAME_ID,
+                role: BufferRole::Output {
+                    system: s,
+                    port: self.descs[s].outputs.len(),
+                },
+                instance: Some(instance),
+            });
+            // Control: the occupant attaches one `View` over it per Load (released on
+            // each Stop/Reset/Unload), so 1 reader slot + slack covers the reload cycle.
+            let control_ring = coord_ring::<SlotControlIn>(depth, 1 + READER_SLACK);
+            table.rings.push(RingEntry {
+                ring: control_ring.clone(),
+                frame_id: SlotControlIn::FRAME_ID,
+                role: BufferRole::Coordinator,
+                instance: None,
+            });
+            slot_aux.insert(s, (control_ring, status_ring));
+        }
+
+        // --- Coordinator-owned slot-command ring (the control-plane uplink, §3) ---
+        // Drained once per cycle (a single coordinator `View`); `control_handle()` hands
+        // out writers over the same region. Owned but not telemetered.
+        let command_ring = coord_ring::<SlotCommand>(depth, 1 + READER_SLACK);
+        let command_view =
+            Input::new(command_ring.view(NoWake, NoWake).expect("command reader slot"));
+        table.rings.push(RingEntry {
+            ring: command_ring.clone(),
+            frame_id: SlotCommand::FRAME_ID,
+            role: BufferRole::Coordinator,
+            instance: None,
+        });
+
         // Freeze the registry; every consumer's bind pulls this same handle.
         let registry = Arc::new(OutputRegistry::new(reg_entries));
 
@@ -876,6 +1021,57 @@ impl CoordinatorBuilder {
                     };
                     cyclic.push(Box::new(slot));
                 }
+                // A runtime slot: gather the same per-port regions as the Dl arm, but
+                // append the slot's owned control ring to the occupant's input array and
+                // hand the runner the control/status writers. No occupant is created here
+                // — only `init`/`Load` (runtime) does.
+                Reg::Slot(slot_reg) => {
+                    use crate::abi::{FswRing, ROLE_INPUT, ROLE_OUTPUT};
+                    let (control_ring, status_ring) =
+                        slot_aux.remove(&id).expect("slot aux rings allocated");
+                    // The user inputs (registered descriptor) view their producers...
+                    let mut inputs: Vec<FswRing> = (0..self.descs[id].inputs.len())
+                        .map(|in_idx| {
+                            let (prod_id, out_idx) = cons_edge[&(id, in_idx)];
+                            let (base, len) = output_rings[prod_id][out_idx].region();
+                            FswRing {
+                                base,
+                                len,
+                                role: ROLE_INPUT,
+                            }
+                        })
+                        .collect();
+                    // ...then the slot-owned control region, matching the occupant's
+                    // descriptor order `[user inputs…, SlotControlIn]`.
+                    let (cbase, clen) = control_ring.region();
+                    inputs.push(FswRing {
+                        base: cbase,
+                        len: clen,
+                        role: ROLE_INPUT,
+                    });
+                    // Outputs = the slot's own buffers (user outputs + SequenceStatus +
+                    // health + log), the registered descriptor's outputs in order.
+                    let outputs: Vec<FswRing> = (0..self.descs[id].outputs.len())
+                        .map(|out_idx| {
+                            let (base, len) = output_rings[id][out_idx].region();
+                            FswRing {
+                                base,
+                                len,
+                                role: ROLE_OUTPUT,
+                            }
+                        })
+                        .collect();
+                    let runner = SlotRunner::new(
+                        self.descs[id].name,
+                        slot_reg.allowed,
+                        slot_reg.initial,
+                        inputs,
+                        outputs,
+                        slot_writer::<SlotControlIn>(&control_ring),
+                        slot_writer::<SlotStatus>(&status_ring),
+                    );
+                    cyclic.push(Box::new(runner));
+                }
                 // The static (host-side `BoxBacking`) path: build typed `BoundPort`s and
                 // walk them with a `Binder`.
                 reg => {
@@ -904,8 +1100,9 @@ impl CoordinatorBuilder {
                             launcher: r.bind(&mut binder),
                             wake_on_stop: async_wakes[id].clone(),
                         }),
-                        // The dl arm is handled by the outer match.
+                        // The dl/slot arms are handled by the outer match.
                         Reg::Dl(_) => unreachable!("dl registration bound by the outer match"),
+                        Reg::Slot(_) => unreachable!("slot registration bound by the outer match"),
                     }
                 }
             }
@@ -934,6 +1131,8 @@ impl CoordinatorBuilder {
             cycle: 0,
             progress: Arc::new(AtomicU64::new(0)),
             registry,
+            command_ring,
+            command_view,
             // Declared last so the canonical ring handles drop after every port.
             rings: table,
         })
@@ -1038,6 +1237,12 @@ pub struct Coordinator {
     progress: Arc<AtomicU64>,
     /// The broad output registry over every tappable buffer (telemetry.md §2).
     registry: Arc<OutputRegistry>,
+    /// The coordinator-owned slot-command ring (the control-plane uplink, §3). A
+    /// canonical handle kept so [`control_handle`](Coordinator::control_handle) can mint
+    /// a fresh writer over it.
+    command_ring: RingBuffer<BoxBacking>,
+    /// The coordinator's drain view over the command ring (drained before the slot steps).
+    command_view: Input<SlotCommand>,
     /// Canonical ring handles; declared last so they drop after every port.
     #[allow(dead_code)]
     rings: RingTable,
@@ -1067,6 +1272,17 @@ impl Coordinator {
     /// instance-qualified id `ComponentId::new("<instance>.<frame>")`.
     pub fn registry(&self) -> Arc<OutputRegistry> {
         self.registry.clone()
+    }
+
+    /// A writer over the slot-command control ring (sequences-slots.md §3, Resolved Q1):
+    /// the in-proc convenience for driving slot `Load`/`Start`/`Stop`/`Abort`/`Reset`/
+    /// `Unload` — the host / CLI / a test writes [`SlotCommand`]s the loop drains once per
+    /// cycle (the same ring an uplink system could `connect` into). Mirrors
+    /// [`progress`](Self::progress): each call mints a fresh `Output` over the ring, so
+    /// the **single-writer discipline** is the caller's to keep (drive commands from one
+    /// place).
+    pub fn control_handle(&self) -> Output<SlotCommand> {
+        slot_writer::<SlotCommand>(&self.command_ring)
     }
 
     /// Every owned **output** buffer as `(instance-name, frame-id)`. The instance
@@ -1114,6 +1330,11 @@ impl Coordinator {
                 ClockMode::Wall => Timestamp::now(),
                 ClockMode::Simulated { dt } => epoch + dt * k as u32,
             };
+            // Control plane (§3): drain the slot-command uplink and broadcast each command
+            // to every slot *before* stepping. `drain` (not `latest`) so no command is
+            // dropped; the per-slot `command` default no-op makes non-slots ignore it, and
+            // a `SlotRunner` filters by name.
+            self.drain_commands();
             for slot in &mut self.cyclic {
                 slot.step(now);
             }
@@ -1180,6 +1401,23 @@ impl Coordinator {
         go_flag.store(true, Release);
         go.wake_all();
         tasks
+    }
+
+    /// Drain the slot-command ring and dispatch each command to every slot
+    /// (sequences-slots.md §3). Commands are collected first (the drain borrows
+    /// `command_view`; the dispatch borrows `cyclic`), then broadcast — the default
+    /// `CyclicSlot::command` no-op makes non-slots ignore them. A lapped command ring
+    /// (more than a buffer of un-drained commands in one cycle) resyncs to the live edge.
+    fn drain_commands(&mut self) {
+        let mut cmds: Vec<SlotCommand> = Vec::new();
+        if self.command_view.drain(|c| cmds.push(*c.get())).is_err() {
+            self.command_view.resync();
+        }
+        for cmd in &cmds {
+            for slot in &mut self.cyclic {
+                slot.command(cmd);
+            }
+        }
     }
 
     /// Mirror fresh upstream records into each async system's private buffer
