@@ -1,0 +1,18 @@
+[package]
+name = "adcs-commissioning"
+version.workspace = true
+edition.workspace = true
+repository.workspace = true
+publish = false
+description = "The ADCS commissioning sequence of the adcs-fsw2 mission, as a #[sequence] cdylib slot occupant"
+
+# A loadable shared object only: a sequence occupant is `dlopen`'d into the `mode` slot and
+# driven through the `fsw_*` C-ABI exactly like any cyclic `.so`. Unlike the system crates
+# there is no static-parity rlib path (a sequence is never linked statically), so no `export`
+# feature — the `#[sequence]` macro emits the `fsw_*` exports unconditionally for the cdylib.
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+adcs-contracts = { path = "../../contracts" }
+metor-fsw-2 = { path = "../../../../libs/metor-fsw-2" }

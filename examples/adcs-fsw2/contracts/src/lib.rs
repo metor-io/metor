@@ -63,6 +63,54 @@ pub struct AttitudeEstimate {
     pub b_hat: V3,
 }
 
+/// The mission-mode command a slot sequence emits each transition (sequences-slots.md §4):
+/// the discrete ADCS mode the spacecraft should be in. Produced by the `mode` slot's occupant
+/// (`adcs-commissioning` / `adcs-safe-mode`) and, in this graph, telemetered only — no system
+/// consumes it, so it demonstrates the slot writing its own frame alongside the plant/nav/ctrl
+/// loop. `_pad` keeps the `#[repr(C)]` layout padding-free (zerocopy `IntoBytes` requires it).
+#[derive(metor_fsw_2::Frame, IntoBytes, Immutable, KnownLayout, FromBytes, Clone)]
+#[repr(C)]
+#[metor_fsw(name = "mode_cmd")]
+pub struct ModeCmd {
+    #[metor_fsw(timestamp)]
+    pub timestamp: Timestamp,
+    /// The commanded mode: `0` idle, `1` settling, `2` pointing, `3` safe.
+    pub mode: u8,
+    _pad: [u8; 7],
+}
+
+impl ModeCmd {
+    /// The mode byte values, mirrored by the example test's assertions.
+    pub const IDLE: u8 = 0;
+    pub const SETTLING: u8 = 1;
+    pub const POINTING: u8 = 2;
+    pub const SAFE: u8 = 3;
+
+    /// A `ModeCmd` for `mode`, with a zero timestamp (the sequence has no per-cycle `now`
+    /// handle; the field is telemetry ordering only — the slot's `SequenceStatus` carries the
+    /// authoritative run state).
+    const fn at(mode: u8) -> Self {
+        Self { timestamp: Timestamp(0), mode, _pad: [0; 7] }
+    }
+
+    /// Idle — no active pointing.
+    pub const fn idle() -> Self {
+        Self::at(Self::IDLE)
+    }
+    /// Settling — reaction wheels enabled, damping toward the target.
+    pub const fn settling() -> Self {
+        Self::at(Self::SETTLING)
+    }
+    /// Pointing — converged, holding the target attitude.
+    pub const fn pointing() -> Self {
+        Self::at(Self::POINTING)
+    }
+    /// Safe — the safing branch (entered on abort).
+    pub const fn safe() -> Self {
+        Self::at(Self::SAFE)
+    }
+}
+
 /// The commanded body-frame control torque (the feedback back-edge into the plant).
 #[derive(metor_fsw_2::Frame, IntoBytes, Immutable, KnownLayout, FromBytes, Clone)]
 #[repr(C)]
