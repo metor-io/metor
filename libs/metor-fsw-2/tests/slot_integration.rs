@@ -18,10 +18,13 @@ use std::path::PathBuf;
 use std::process::Command;
 use std::time::Duration;
 
-use metor_fsw_2::metor_proto::types::ComponentId;
+use metor_fsw_2::metor_proto::types::{ComponentId, Msg};
+use metor_fsw_2::metor_proto_wkt::{
+    SequenceChannelEvent, SequenceEventKind, SequenceRegistry,
+};
 use metor_fsw_2::{
     ClockMode, Coordinator, CoordinatorConfig, DlSystem, Input, Output, SequenceStatus,
-    SlotCommand, SlotStatus, SystemKind,
+    SlotCommand, SlotStatus, SystemKind, split_record,
 };
 
 // ---------------------------------------------------------------------------
@@ -344,4 +347,108 @@ fn slot_reset_reruns_from_start() {
     );
 
     drop((coord, seq_view));
+}
+
+// ---------------------------------------------------------------------------
+// 5. The sequence coupling (Wave 4): the slot's message channel emits ordered
+//    SequenceChannelEvents (Loaded → Started → Progress* → Completed, no coalescing)
+//    and the coordinator emits a boot SequenceRegistry listing the slot + its allowed
+//    occupants. Taps the message rings via `message_registry()`.
+// ---------------------------------------------------------------------------
+
+/// Drain a message ring into the decoded `Msg`s of one type, asserting the 2-byte id and
+/// postcard-round-tripping each record (the downlink tap's decode, `docs/messages.md` §3).
+fn drain_msgs<M: Msg + serde::de::DeserializeOwned>(
+    view: &mut metor_fsw_2::ring::View<
+        metor_fsw_2::ring::BoxBacking,
+        metor_fsw_2::ring::NoWake,
+        metor_fsw_2::ring::NoWake,
+    >,
+) -> Vec<M> {
+    let mut out = Vec::new();
+    let mut buf = Vec::new();
+    while view.try_read_into(&mut buf).expect("no lap on the message tap") {
+        let (id, payload) = split_record(&buf).expect("a 2-byte-id record");
+        assert_eq!(id, M::ID, "every record on this channel carries M::ID");
+        out.push(postcard::from_bytes::<M>(payload).expect("postcard round-trip"));
+    }
+    out
+}
+
+#[test]
+fn slot_emits_ordered_sequence_events_and_boot_registry() {
+    let Some(lib) = locate_fixture() else {
+        return;
+    };
+    let loaded = open_waiter(&lib);
+
+    let mut b = Coordinator::builder(sim_config());
+    let _slot = b.add_slot("adcs", vec![("waiter".into(), loaded, Vec::new())], None);
+    let coord = b.build().expect("the slot graph builds");
+
+    // Tap the slot's events channel + the coordinator's boot-registry channel BEFORE the
+    // run — an overwrite ring starts at the live edge, so the taps must precede the emits.
+    let messages = coord.message_registry();
+    let mut events_view = messages
+        .view(ComponentId::new("adcs.sequences"))
+        .expect("the slot events channel is registered")
+        .expect("reader slot available");
+    let mut boot_view = messages
+        .view(ComponentId::new("coordinator.sequences"))
+        .expect("the coordinator boot-registry channel is registered")
+        .expect("reader slot available");
+
+    // The channel↔slot map (R4): one slot at build-order index 0.
+    assert_eq!(coord.channel_map(), &[(0u64, "adcs")]);
+
+    // Drive Load + Start (drained at cycle 0), run to the occupant's Completed.
+    let mut control: Output<SlotCommand> = coord.control_handle();
+    control.write(&SlotCommand::load("adcs", "waiter")).unwrap();
+    control.write(&SlotCommand::start("adcs")).unwrap();
+    let mut coord = coord;
+    let coord = stellarator::run(|| async move {
+        coord.run_for(4).await;
+        coord
+    });
+
+    // The boot SequenceRegistry lists the slot with its allowed-occupant set.
+    let registries = drain_msgs::<SequenceRegistry>(&mut boot_view);
+    let registry = registries.last().expect("a boot SequenceRegistry was emitted");
+    assert_eq!(registry.channels.len(), 1, "one slot channel");
+    assert_eq!(registry.channels[0].id, 0);
+    assert_eq!(registry.channels[0].name, "adcs");
+    assert_eq!(registry.channels[0].available, vec!["waiter".to_string()]);
+
+    // The slot's events, IN ORDER, with no coalescing: Loaded → Started → Progress* →
+    // Completed (the `waiter` occupant emits "waiting" then "done").
+    let events = drain_msgs::<SequenceChannelEvent>(&mut events_view);
+    assert!(
+        events.iter().all(|e| e.channel_id == 0),
+        "every event is tagged with the slot's channel id"
+    );
+    let kinds: Vec<&SequenceEventKind> = events.iter().map(|e| &e.kind).collect();
+    assert!(
+        matches!(kinds[0], SequenceEventKind::Loaded { name } if name == "waiter"),
+        "first event is Loaded {{ waiter }}: {kinds:?}"
+    );
+    assert!(
+        matches!(kinds[1], SequenceEventKind::Started),
+        "second event is Started: {kinds:?}"
+    );
+    assert!(
+        matches!(kinds.last().unwrap(), SequenceEventKind::Completed),
+        "last event is Completed: {kinds:?}"
+    );
+    // The progress lines arrive in order, between Started and Completed.
+    let waiting = kinds
+        .iter()
+        .position(|k| matches!(k, SequenceEventKind::Progress { detail } if detail == "waiting"))
+        .expect("a Progress{waiting} event");
+    let done = kinds
+        .iter()
+        .position(|k| matches!(k, SequenceEventKind::Progress { detail } if detail == "done"))
+        .expect("a Progress{done} event");
+    assert!(1 < waiting && waiting < done && done < kinds.len() - 1, "Progress ordered: {kinds:?}");
+
+    drop((coord, events_view, boot_view, control));
 }
