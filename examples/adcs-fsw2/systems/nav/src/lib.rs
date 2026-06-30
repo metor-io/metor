@@ -7,7 +7,7 @@
 
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
 
-use adcs_contracts::{AttitudeEstimate, DT, NavParams, OrbitState, Sensors, V3, mag_field};
+use adcs_contracts::{AttitudeEstimate, DT, NavParams, OrbitState, Sensors, V3, mag_field_eci};
 use metor_fsw_2::metor_proto::types::Timestamp;
 use metor_fsw_2::ring::{Backing, BoxBacking};
 use metor_fsw_2::{
@@ -55,27 +55,27 @@ impl<B: Backing> CyclicSystem<B> for NavSystem {
         };
         let s = s.get().clone();
 
-        // Model the inertial references from the orbit state (cube-sat `Nav::from_sensors`):
-        // a fixed sun direction and the dipole field at the current position.
-        let sun_ref: V3 = tensor![0.0, 0.0, 1.0];
-        let mag_ref: V3 = match input.orbit.latest() {
-            Ok(Some(orbit)) => mag_field(&orbit.get().pos).normalize(),
+        // Model the inertial (ECI) references from the orbit state (cube-sat
+        // `Nav::from_sensors`): a fixed sun direction and the dipole field at the position.
+        let sun_eci: V3 = tensor![0.0, 0.0, 1.0];
+        let mag_eci: V3 = match input.orbit.latest() {
+            Ok(Some(orbit)) => mag_field_eci(&orbit.get().pos_eci).normalize(),
             _ => tensor![1.0, 0.0, 0.0],
         };
 
-        self.state.omega = s.gyro;
+        self.state.omega = s.gyro_b;
         self.state = self.state.clone().estimate_attitude(
-            [s.sun_body, s.mag_body],
-            [sun_ref, mag_ref],
+            [s.sun_b, s.mag_b],
+            [sun_eci, mag_eci],
             [self.sigma, self.sigma],
         );
         self.state.reset_if_invalid();
 
         let _ = o.estimate.write(&AttitudeEstimate {
             timestamp: now,
-            q_hat: self.state.q_hat,
-            omega: s.gyro, // pass the measured body rate through to the controller
-            b_hat: self.state.b_hat,
+            q_hat_b_eci: self.state.q_hat,
+            omega_b: s.gyro_b, // pass the measured body rate through to the controller
+            b_hat_b: self.state.b_hat,
         });
     }
 }

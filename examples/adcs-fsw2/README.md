@@ -67,11 +67,11 @@ ingests.
    (Load/Start/Abort `commissioning` or `safe_mode`). Uplink and downlink use separate
    connections (docs/messages.md §4.5) — both point at the same metor-db endpoint.
 3. In the panel, the `plant` / `nav` / `ctrl` / `mode` (and `coordinator`) instances appear
-   in the component tree. Plot e.g. `nav.attitude_estimate.q_hat` against
-   `plant.truth.q_true` and watch the estimate track truth as the controller slews the
-   spacecraft onto the commanded pointing target; `plant.sensors.gyro` shows the rate
-   damping, `plant.wheels.momentum` the reaction-wheel momentum building up, and
-   `ctrl.torque_cmd.torque` the commanded torque. The sequence view shows `commissioning`
+   in the component tree. Plot e.g. `nav.attitude_estimate.q_hat_b_eci` against
+   `plant.truth.q_true_b_eci` and watch the estimate track truth as the controller slews the
+   spacecraft onto the commanded pointing target; `plant.sensors.gyro_b` shows the rate
+   damping, `plant.wheels.momentum_b` the reaction-wheel momentum building up, and
+   `ctrl.torque_cmd.torque_b` the commanded torque. The sequence view shows `commissioning`
    stepping to completion; Load/Start `safe_mode` from there to command nadir safing.
 
 The mission converges in ~30 s of real time. The terminal prints only a heartbeat — the
@@ -79,7 +79,7 @@ host stays schema-agnostic (it doesn't decode the frames), so convergence is wat
 panel (or asserted headlessly by `cargo test`). Ctrl-C to stop. If the panel isn't running
 the downlink/uplink just fail to connect and the control loop runs unaffected.
 
-> Component names are prefixed by the **instance** name (`nav.attitude_estimate.q_hat`),
+> Component names are prefixed by the **instance** name (`nav.attitude_estimate.q_hat_b_eci`),
 > so two instances of one system type never collide — the metor-fsw-2 output registry
 > applies that prefix when announcing each frame's schema to the panel.
 
