@@ -53,11 +53,11 @@ pub fn k0() -> V3 {
     tensor![-30926.00e-9, 5817.00e-9, -2318.00e-9]
 }
 
-/// The modeled Earth magnetic field at an inertial position `pos`, from the tilted dipole
-/// `k0()` (cube-sat `Mag::from_body` / `Nav::from_sensors`). Returned **un-normalized**.
-pub fn mag_field(pos: &V3) -> V3 {
-    let pos_norm = pos.norm().into_buf();
-    let e_hat = pos.normalize();
+/// The modeled Earth magnetic field (ECI) at an inertial position `pos_eci`, from the tilted
+/// dipole `k0()` (cube-sat `Mag::from_body` / `Nav::from_sensors`). Returned **un-normalized**.
+pub fn mag_field_eci(pos_eci: &V3) -> V3 {
+    let pos_norm = pos_eci.norm().into_buf();
+    let e_hat = pos_eci.normalize();
     ((EARTH_RADIUS / pos_norm).powi(3)) * (3.0 * k0().dot(&e_hat) * e_hat - k0())
 }
 
@@ -75,9 +75,12 @@ pub fn mag_field(pos: &V3) -> V3 {
 pub struct Sensors {
     #[metor_fsw(timestamp)]
     pub timestamp: Timestamp,
-    pub gyro: V3,
-    pub sun_body: V3,
-    pub mag_body: V3,
+    /// Measured body-frame angular rate (rad/s).
+    pub gyro_b: V3,
+    /// Normalized sun observation in the body frame.
+    pub sun_b: V3,
+    /// Normalized magnetometer observation in the body frame.
+    pub mag_b: V3,
 }
 
 /// The navigation filter's attitude estimate.
@@ -87,9 +90,12 @@ pub struct Sensors {
 pub struct AttitudeEstimate {
     #[metor_fsw(timestamp)]
     pub timestamp: Timestamp,
-    pub q_hat: Quat,
-    pub omega: V3,
-    pub b_hat: V3,
+    /// Estimated attitude: the body←ECI rotation.
+    pub q_hat_b_eci: Quat,
+    /// Estimated body-frame angular rate (rad/s).
+    pub omega_b: V3,
+    /// Estimated gyro bias in the body frame (rad/s).
+    pub b_hat_b: V3,
 }
 
 /// The spacecraft's inertial **orbit state** (the GPS product): position and velocity. The
@@ -102,8 +108,10 @@ pub struct AttitudeEstimate {
 pub struct OrbitState {
     #[metor_fsw(timestamp)]
     pub timestamp: Timestamp,
-    pub pos: V3,
-    pub vel: V3,
+    /// Inertial (ECI) position (m).
+    pub pos_eci: V3,
+    /// Inertial (ECI) velocity (m/s).
+    pub vel_eci: V3,
 }
 
 /// Reaction-wheel telemetry: per-wheel speed, stored angular momentum, and applied torque
@@ -116,9 +124,12 @@ pub struct OrbitState {
 pub struct Wheels {
     #[metor_fsw(timestamp)]
     pub timestamp: Timestamp,
+    /// Per-wheel angular speed (rad/s); element i is the body-axis-i wheel.
     pub speed: V3,
-    pub momentum: V3,
-    pub torque: V3,
+    /// Per-wheel stored angular momentum about its body axis (N·m·s).
+    pub momentum_b: V3,
+    /// Per-wheel applied torque about its body axis (N·m).
+    pub torque_b: V3,
 }
 
 /// The mission-mode command a slot sequence emits each transition (sequences-slots.md §4):
@@ -182,7 +193,8 @@ impl ModeCmd {
 pub struct TorqueCmd {
     #[metor_fsw(timestamp)]
     pub timestamp: Timestamp,
-    pub torque: V3,
+    /// Commanded control torque in the body frame (N·m).
+    pub torque_b: V3,
 }
 
 /// Ground-truth attitude + body rate the plant knows (for the convergence assertion).
@@ -195,18 +207,20 @@ pub struct TorqueCmd {
 pub struct Truth {
     #[metor_fsw(timestamp)]
     pub timestamp: Timestamp,
-    pub q_true: Quat,
-    pub omega_true: V3,
+    /// True attitude: the body←ECI rotation.
+    pub q_true_b_eci: Quat,
+    /// True body-frame angular rate (rad/s).
+    pub omega_true_b: V3,
 }
 
 // ---------------------------------------------------------------------------
 // Pointing laws — the controller target as a function of the orbit state
 // ---------------------------------------------------------------------------
 
-/// The shortest-arc quaternion that rotates the spacecraft's `-Y` body axis onto the
-/// inertial direction `dir` (cube-sat `FSW::nadir_point` / `hil_point`).
-fn point_minus_y_at(dir: V3) -> Quat {
-    let r = dir.normalize();
+/// The shortest-arc body←ECI quaternion that rotates the spacecraft's `-Y` body axis onto the
+/// inertial direction `dir_eci` (cube-sat `FSW::nadir_point` / `hil_point`).
+fn point_minus_y_at(dir_eci: V3) -> Quat {
+    let r = dir_eci.normalize();
     let body_axis: V3 = tensor![0.0, -1.0, 0.0];
     let [x, y, z] = body_axis.cross(&r).into_buf();
     let w = 1.0 + body_axis.dot(&r).into_buf();
@@ -214,21 +228,21 @@ fn point_minus_y_at(dir: V3) -> Quat {
 }
 
 /// Nadir-pointing target: point at the (negated) position vector — i.e. down at Earth.
-pub fn nadir_point(pos: &V3) -> Quat {
-    point_minus_y_at(pos.normalize())
+pub fn nadir_point(pos_eci: &V3) -> Quat {
+    point_minus_y_at(pos_eci.normalize())
 }
 
 /// Velocity-vector ("HIL") pointing target: point along the orbital velocity.
-pub fn hil_point(vel: &V3) -> Quat {
-    point_minus_y_at(vel.normalize())
+pub fn hil_point(vel_eci: &V3) -> Quat {
+    point_minus_y_at(vel_eci.normalize())
 }
 
 /// The controller's target attitude for a given pointing `law` and orbit state, with the
 /// NaN-guard from cube-sat (`main.rs:405`): a non-finite target falls back to identity.
-pub fn target_for(law: u8, pos: &V3, vel: &V3) -> Quat {
+pub fn target_for(law: u8, pos_eci: &V3, vel_eci: &V3) -> Quat {
     let t = match law {
-        ModeCmd::LAW_NADIR => nadir_point(pos),
-        ModeCmd::LAW_HIL => hil_point(vel),
+        ModeCmd::LAW_NADIR => nadir_point(pos_eci),
+        ModeCmd::LAW_HIL => hil_point(vel_eci),
         _ => Quat::identity(),
     };
     if t.0.into_buf().iter().any(|f| !f.is_finite()) {
@@ -246,8 +260,8 @@ pub fn target_for(law: u8, pos: &V3, vel: &V3) -> Quat {
 /// `(attitude_error_rad, body_rate_rad_s)`. Retained for a fixed-target reference.
 pub fn convergence_sample(t: &Truth) -> (f64, f64) {
     let target = Quat::identity();
-    let err = t.q_true.angular_distance(&target).into_buf().abs();
-    let rate = t.omega_true.norm().into_buf();
+    let err = t.q_true_b_eci.angular_distance(&target).into_buf().abs();
+    let rate = t.omega_true_b.norm().into_buf();
     (err, rate)
 }
 
@@ -256,9 +270,9 @@ pub fn convergence_sample(t: &Truth) -> (f64, f64) {
 /// magnitude (rad/s). This is how the closed loop is judged once the controller points at a
 /// moving (nadir/velocity-vector) target rather than a fixed identity attitude.
 pub fn tracking_sample(truth: &Truth, orbit: &OrbitState, law: u8) -> (f64, f64) {
-    let target = target_for(law, &orbit.pos, &orbit.vel);
-    let err = truth.q_true.angular_distance(&target).into_buf().abs();
-    let rate = truth.omega_true.norm().into_buf();
+    let target = target_for(law, &orbit.pos_eci, &orbit.vel_eci);
+    let err = truth.q_true_b_eci.angular_distance(&target).into_buf().abs();
+    let rate = truth.omega_true_b.norm().into_buf();
     (err, rate)
 }
 

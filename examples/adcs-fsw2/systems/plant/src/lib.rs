@@ -15,7 +15,7 @@
 
 use adcs_contracts::{
     ALTITUDE, DT, EARTH_RADIUS, G, M, MASS, OrbitState, PlantParams, Sensors, TorqueCmd, Truth, V3,
-    Wheels, inertia_diag, mag_field,
+    Wheels, inertia_diag, mag_field_eci,
 };
 use metor_fsw_2::metor_proto::types::Timestamp;
 use metor_fsw_2::ring::{Backing, BoxBacking};
@@ -206,46 +206,46 @@ impl<B: Backing> System<B> for PlantSystem {
 
 impl<B: Backing> CyclicSystem<B> for PlantSystem {
     fn execute(&mut self, now: Timestamp, input: &mut PlantIn<B>, o: &mut Self::Output) {
-        // Latest commanded torque (zero on the first cycle / if none has arrived). Project it
-        // onto each wheel's axis to form that wheel's set point, then step the wheels.
-        let torque: V3 = match input.torque.latest() {
-            Ok(Some(cmd)) => cmd.get().torque,
+        // Latest commanded body torque (zero on the first cycle / if none has arrived).
+        // Project it onto each wheel's axis to form that wheel's set point, then step them.
+        let torque_b: V3 = match input.torque.latest() {
+            Ok(Some(cmd)) => cmd.get().torque_b,
             _ => V3::zeros(),
         };
         for wheel in &mut self.wheels {
-            wheel.torque_set_point = wheel.axis.dot(&torque) * wheel.axis;
+            wheel.torque_set_point = wheel.axis.dot(&torque_b) * wheel.axis;
             wheel.update();
         }
-        let rw_torque: V3 = self
+        let rw_torque_b: V3 = self
             .wheels
             .iter()
             .fold(V3::zeros(), |acc, w| acc + w.torque);
 
         // Sample the sensors off the CURRENT body (cube-sat samples before integrating).
-        let att = self.body.pos.angular();
-        let att_inv = att.inverse();
-        // Gyro: world-frame rate brought into the body frame, plus a slow bias walk.
-        let gyro_body = att_inv * self.body.vel.angular();
+        let q_b_eci = self.body.pos.angular();
+        let q_eci_b = q_b_eci.inverse();
+        // Gyro: ECI rate brought into the body frame, plus a slow bias walk.
+        let omega_b_true = q_eci_b * self.body.vel.angular();
         self.bias = self.bias + self.noise(self.meas_sigma * 1e-2);
-        let gyro = gyro_body + self.bias + self.noise(self.meas_sigma);
+        let gyro_b = omega_b_true + self.bias + self.noise(self.meas_sigma);
         // Two normalized vector observations in the body frame: the sun (a fixed inertial
         // direction) and the modeled magnetic field at the true position.
-        let pos = self.body.pos.linear();
-        let vel = self.body.vel.linear();
-        let sun_inertial: V3 = tensor![0.0, 0.0, 1.0];
-        let sun_body = (att_inv * sun_inertial).normalize() + self.noise(self.meas_sigma);
-        let mag_body = (att_inv * mag_field(&pos)).normalize() + self.noise(self.meas_sigma);
+        let pos_eci = self.body.pos.linear();
+        let vel_eci = self.body.vel.linear();
+        let sun_eci: V3 = tensor![0.0, 0.0, 1.0];
+        let sun_b = (q_eci_b * sun_eci).normalize() + self.noise(self.meas_sigma);
+        let mag_b = (q_eci_b * mag_field_eci(&pos_eci)).normalize() + self.noise(self.meas_sigma);
 
         let _ = o.sensors.write(&Sensors {
             timestamp: now,
-            gyro,
-            sun_body,
-            mag_body,
+            gyro_b,
+            sun_b,
+            mag_b,
         });
         let _ = o.orbit.write(&OrbitState {
             timestamp: now,
-            pos,
-            vel,
+            pos_eci,
+            vel_eci,
         });
         // Per-wheel telemetry (each wheel is axis-aligned, so its scalar value sits on the
         // wheel's own body axis).
@@ -259,18 +259,18 @@ impl<B: Backing> CyclicSystem<B> for PlantSystem {
         let _ = o.wheels.write(&Wheels {
             timestamp: now,
             speed: V3::from_buf([self.wheels[0].speed, self.wheels[1].speed, self.wheels[2].speed]),
-            momentum: proj(&|w| w.ang_momentum),
-            torque: proj(&|w| w.torque),
+            momentum_b: proj(&|w| w.ang_momentum),
+            torque_b: proj(&|w| w.torque),
         });
         let _ = o.truth.write(&Truth {
             timestamp: now,
-            q_true: att,
-            omega_true: gyro_body,
+            q_true_b_eci: q_b_eci,
+            omega_true_b: omega_b_true,
         });
 
         // Integrate the body forward one step under gravity + the net wheel torque.
         self.body = six_dof_rk4(DT, self.body.clone(), |b| {
-            SpatialForce::from_torque(rw_torque) + SpatialForce::from_linear(gravity(b))
+            SpatialForce::from_torque(rw_torque_b) + SpatialForce::from_linear(gravity(b))
         });
     }
 }

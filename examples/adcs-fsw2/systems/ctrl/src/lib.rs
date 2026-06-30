@@ -57,7 +57,7 @@ impl<B: Backing> CyclicSystem<B> for CtrlSystem {
             return;
         };
         let e = e.get();
-        let q_hat = e.q_hat;
+        let q_hat_b_eci = e.q_hat_b_eci;
 
         // Latch the commanded pointing law (the slot may not have written one yet).
         if let Ok(Some(m)) = input.mode.latest() {
@@ -69,18 +69,18 @@ impl<B: Backing> CyclicSystem<B> for CtrlSystem {
         let target = match (self.law, input.orbit.latest()) {
             (Some(law), Ok(Some(orbit))) => {
                 let orbit = orbit.get();
-                target_for(law, &orbit.pos, &orbit.vel)
+                target_for(law, &orbit.pos_eci, &orbit.vel_eci)
             }
             _ => Quaternion::identity(),
         };
 
-        // Body rate rotated into the world frame, matching the cube-sat recipe.
-        let ang_vel = q_hat * e.omega;
-        let torque = self.lqr.control(q_hat, ang_vel, target);
+        // Body rate rotated into the ECI frame, matching the cube-sat recipe.
+        let ang_vel = q_hat_b_eci * e.omega_b;
+        let torque_b = self.lqr.control(q_hat_b_eci, ang_vel, target);
 
         let _ = o.torque.write(&TorqueCmd {
             timestamp: now,
-            torque,
+            torque_b,
         });
     }
 }
