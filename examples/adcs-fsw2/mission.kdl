@@ -1,16 +1,18 @@
 // The ADCS closed-loop mission, wired declaratively (dl-open.md §8, cli-runner.md §6).
 //
-//   plant ──sensors──▶ nav ──attitude_estimate──▶ ctrl
-//     ▲                  │                         │
-//     │                  └──attitude_estimate──▶ mode (sequence slot, telemetry-only output)
-//     └──────────────── torque_cmd ───────────────┘   (one-cycle-delayed feedback)
+//   plant ──sensors / orbit_state──▶ nav ──attitude_estimate──▶ ctrl
+//     ▲                  │                                       ▲ │
+//     │   orbit_state ───┴───────────────────────────────────────┘ │
+//     │                  └──attitude_estimate──▶ mode ──mode_cmd──▶ ctrl
+//     └──────────────────────── torque_cmd ───────────────────────┘   (one-cycle-delayed)
 //
 // Three dlopen'd systems (plant/nav/ctrl), each its own cdylib built against the shared
 // `adcs-contracts`, plus a runtime sequence **slot** `mode` (sequences-slots.md §5): two
 // `#[sequence]` cdylib occupants (`adcs-commissioning` / `adcs-safe-mode`) that read nav's
 // estimate and emit a `mode_cmd` frame. The slot auto-runs `commissioning` at startup, so a
-// plain `metor-fsw run` shows the sequence stepping idle → settling → pointing. The slot only
-// reads nav and writes its own frame; the plant/nav/ctrl convergence loop is untouched.
+// plain `metor-fsw run` shows the sequence stepping idle → settling → pointing while the
+// controller follows the commanded pointing law (velocity-vector). `mode_cmd` drives `ctrl`;
+// the plant propagates a real 400 km orbit so the Nadir/HIL targets are meaningful.
 // Run it with the framework runner:
 //
 //   cargo run -p adcs-fsw2 -- run examples/adcs-fsw2/mission.kdl --build            # headless sim
@@ -37,14 +39,16 @@ artifact "safe_mode"     crate="adcs-safe-mode"     lib="adcs_safe_mode"     typ
 
 // System instances. `lib=` references the artifact id; the remaining properties are the
 // system's params, schema-encoded at resolve against the `.so`'s exported `Params` schema.
-system "plant" type="Plant" lib="plant" init_angle=0.5 init_rate=0.15 meas_sigma=0.002 seed=42
+// `disarmed=#true` brings every reaction wheel up offline (the cube-sat `--disarmed`
+// parity): the plant applies no control torque until the wheels are armed.
+system "plant" type="Plant" lib="plant" init_angle=0.5 init_rate=0.15 meas_sigma=0.002 seed=42 disarmed=#false
 system "nav"   type="Nav"   lib="nav"   meas_sigma=0.02
 system "ctrl"  type="Ctrl"  lib="ctrl"  q_weight=5.0 r_weight=8.0
 
 // The runtime sequence slot. Its `input`/`output` lines declare the port contract every
 // allowed occupant is validated against; `initial ... state="running"` auto-loads + starts
 // `commissioning` at the first cycle (so `metor-fsw run` shows it execute). The `mode_cmd`
-// output is unconsumed — telemetered only (fan-out 0); nav's new `attitude_estimate` reader
+// output now drives `ctrl` (the commanded pointing law); nav's `attitude_estimate` reader
 // is covered by READER_SLACK.
 slot "mode" {
     input  frame="attitude_estimate"
@@ -55,6 +59,9 @@ slot "mode" {
 }
 
 connect "plant" -> "nav"  frame="sensors"
+connect "plant" -> "nav"  frame="orbit_state"
+connect "plant" -> "ctrl" frame="orbit_state"
 connect "nav"   -> "ctrl" frame="attitude_estimate"
 connect "nav"   -> "mode" frame="attitude_estimate"
+connect "mode"  -> "ctrl" frame="mode_cmd"
 connect "ctrl"  -> "plant" frame="torque_cmd" delayed=#true

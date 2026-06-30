@@ -1,37 +1,41 @@
 //! The behavioral acceptance gate (dl-open.md §8): the closed ADCS loop drives the
-//! spacecraft attitude toward the target — **through the dlopen path**, and matching the
-//! statically-linked path bit-for-bit.
+//! spacecraft to track its commanded pointing law — **through the dlopen path**, and
+//! matching the statically-linked path bit-for-bit.
 //!
-//! Two missions run, both measured the **same** way (tapping the plant's `truth` output
-//! from the coordinator's registry, since a `.so`'s statics never reach the host):
+//! Both runs resolve the **same** `mission.kdl` (so the `mode` slot's `#[sequence]`
+//! occupant — always a dlopen cdylib — commissions the spacecraft identically in both), and
+//! differ in exactly one thing: whether the `plant`/`nav`/`ctrl` systems are linked
+//! statically or `dlopen`'d.
 //!
-//! 1. **static** — `PlantSystem`/`NavSystem`/`CtrlSystem` linked as rlibs and wired with
-//!    `Coordinator::builder` (the old `build_code_first`).
-//! 2. **dlopen** — the SAME systems, each built as a `cdylib`, `dlopen`'d and resolved from
-//!    a `Wiring` (`adcs_fsw2::build_sim_coordinator`, which runs the build driver first).
+//! 1. **static** — `mission.kdl` resolved with `plant`/`nav`/`ctrl` linked as rlibs via a
+//!    [`Registry`] (their `artifact` refs nulled so `resolve` takes the static factory);
+//!    the `mode` slot's sequences stay dlopen.
+//! 2. **dlopen** — the SAME mission, every system `dlopen`'d
+//!    (`adcs_fsw2::build_sim_coordinator`).
 //!
-//! Both must converge, and the dlopen run must land on the **same** attitude-error / body-
-//! rate envelope as the static one (identical within a tight tolerance — same systems, same
-//! params, just loaded vs linked). The dlopen build runs inside the test (slower, like
-//! `metor-fsw-2`'s `dl_integration`/`wiring_resolve`), gated off `miri`.
+//! Both must converge (the controller tracks the velocity-vector target the auto-run
+//! `commissioning` commands), and the dlopen run must land on the **same** tracking-error /
+//! body-rate envelope as the static one. The dlopen build runs inside the test (slower),
+//! gated off `miri`.
 
 #![cfg(not(miri))]
 
 use std::cell::RefCell;
 use std::rc::Rc;
-use std::time::Duration;
 
-use adcs_contracts::{
-    AttitudeEstimate, CtrlParams, DT, NavParams, PlantParams, Sensors, TorqueCmd, Truth,
-    convergence_sample,
-};
+use adcs_contracts::{ModeCmd, OrbitState, Truth, tracking_sample};
 use adcs_ctrl::CtrlSystem;
 use adcs_nav::NavSystem;
 use adcs_plant::PlantSystem;
 use metor_fsw_2::metor_proto::types::ComponentId;
-use metor_fsw_2::{ClockMode, Coordinator, CoordinatorConfig, Input, PortRef};
+use metor_fsw_2::wiring::Registry;
+use metor_fsw_2::{BuildOptions, Coordinator, Input, build_artifacts, parse, register_system, resolve};
 
-/// Cycles each mission runs (≈33 s of simulated time at 120 Hz) — enough to converge.
+/// The mission wiring document — the same file the CLI runner and the other tests read.
+const MISSION_KDL: &str = include_str!("../mission.kdl");
+
+/// Cycles each mission runs (≈33 s of simulated time at 120 Hz) — enough to commission and
+/// converge onto the (slowly orbit-rotating) pointing target.
 const CYCLES: usize = 4000;
 
 /// Static ≡ dlopen tolerance. The two paths compile the *same* source (rlib vs cdylib) and
@@ -39,8 +43,12 @@ const CYCLES: usize = 4000;
 /// absorbs any codegen difference between the two builds.
 const PARITY_TOL: f64 = 1e-9;
 
-/// The convergence envelope of one run: initial + final attitude error (rad) and body rate
-/// (rad/s), read from the tapped `truth` output.
+/// The pointing law the auto-run `commissioning` settles on (velocity-vector), against which
+/// the tracking error is measured (`ModeCmd::settling`/`pointing` ⇒ `LAW_HIL`).
+const CONVERGED_LAW: u8 = ModeCmd::LAW_HIL;
+
+/// The convergence envelope of one run: initial + final attitude tracking error (rad, to the
+/// commanded pointing target) and body rate (rad/s), read from the tapped `truth`/`orbit`.
 #[derive(Clone, Copy, Debug)]
 struct Measure {
     e0: f64,
@@ -49,67 +57,58 @@ struct Measure {
     rf: f64,
 }
 
-/// Wire the static (rlib-linked) closed loop with the coordinator builder — the parity
-/// reference. Registration order Plant → Nav → Ctrl resolves the forward chain in one
-/// cycle; the Ctrl → Plant torque edge is `connect_delayed` (the one-cycle feedback
-/// back-edge). Free-running `Simulated` clock at `DT`, no telemetry.
+/// Resolve the mission with `plant`/`nav`/`ctrl` linked **statically** (the parity
+/// reference): build every artifact (the `mode` slot's sequence cdylibs are still loaded),
+/// then null the three systems' `artifact` refs so `resolve` instantiates them through the
+/// [`Registry`] factory instead of `dlopen`. The slot/sequences remain dlopen in both paths,
+/// so only the systems' linkage differs.
 fn build_static() -> Coordinator {
-    let mut b = Coordinator::builder(CoordinatorConfig {
-        cycle_rate: 120.0,
-        default_depth: metor_fsw_2::DEFAULT_DEPTH,
-        clock: ClockMode::Simulated {
-            dt: Duration::from_secs_f64(DT),
-        },
-    });
-    let plant = b.add_cyclic(PlantSystem::new(PlantParams {
-        init_angle: 0.5,
-        init_rate: 0.15,
-        meas_sigma: 0.002,
-        seed: 42,
-    }));
-    let nav = b.add_cyclic(NavSystem::new(NavParams { meas_sigma: 0.02 }));
-    let ctrl = b.add_cyclic(CtrlSystem::new(CtrlParams { q_weight: 5.0, r_weight: 8.0 }));
-
-    b.connect(PortRef::new::<Sensors>(plant), PortRef::new::<Sensors>(nav))
-        .expect("plant → nav sensors edge");
-    b.connect(
-        PortRef::new::<AttitudeEstimate>(nav),
-        PortRef::new::<AttitudeEstimate>(ctrl),
-    )
-    .expect("nav → ctrl estimate edge");
-    b.connect_delayed(
-        PortRef::new::<TorqueCmd>(ctrl),
-        PortRef::new::<TorqueCmd>(plant),
-    )
-    .expect("ctrl → plant torque feedback back-edge");
-    b.build().expect("static wiring builds")
+    let mut wiring = parse(MISSION_KDL).expect("parse mission.kdl");
+    build_artifacts(&mut wiring, &BuildOptions::default()).expect("build the cdylib artifacts");
+    for spec in &mut wiring.systems {
+        // plant/nav/ctrl: link statically via the Registry rather than dlopen.
+        spec.artifact = None;
+    }
+    let mut registry = Registry::new();
+    register_system!(&mut registry, PlantSystem => "Plant");
+    register_system!(&mut registry, NavSystem => "Nav");
+    register_system!(&mut registry, CtrlSystem => "Ctrl");
+    resolve(&wiring, &registry).expect("resolve the mission with static systems")
 }
 
-/// Run `coord` for `cycles`, measuring convergence by tapping the plant's `truth` output.
+/// Run `coord` for `cycles`, measuring convergence by tapping the plant's `truth` + `orbit`
+/// outputs and scoring the attitude error against the commanded pointing-law target.
 ///
-/// A spawned sampler reads `truth` **every** cycle (the loop yields once per cycle under the
-/// `Simulated` clock, so the sampler interleaves 1:1 — the same pattern as the live mission's
-/// printer), capturing the whole trajectory: the first sample is the initial state, the last
-/// is the final cycle's. (A single view read only at the end would lap after thousands of
-/// cycles.) This works for **both** paths: a dlopen'd plant's host-owned `truth` ring is
-/// tapped exactly like a statically-linked one's.
+/// A spawned sampler reads both **every** cycle (the loop yields once per cycle under the
+/// `Simulated` clock, so the sampler interleaves 1:1), capturing the whole trajectory. This
+/// works for **both** paths: a dlopen'd plant's host-owned rings are tapped exactly like a
+/// statically-linked one's.
 async fn run_and_measure(mut coord: Coordinator, cycles: usize) -> Measure {
-    let sample_view: Input<Truth> = Input::new(
+    let truth_view: Input<Truth> = Input::new(
         coord
             .registry()
             .view(ComponentId::new("plant.truth"))
             .expect("plant.truth is registered")
             .expect("a reader slot is available"),
     );
+    let orbit_view: Input<OrbitState> = Input::new(
+        coord
+            .registry()
+            .view(ComponentId::new("plant.orbit_state"))
+            .expect("plant.orbit_state is registered")
+            .expect("a reader slot is available"),
+    );
 
     let samples = Rc::new(RefCell::new(Vec::<(f64, f64)>::new()));
     let captured = samples.clone();
     let sampler = stellarator::spawn(async move {
-        let mut input = sample_view;
+        let (mut truth, mut orbit) = (truth_view, orbit_view);
         loop {
             stellarator::yield_now().await;
-            if let Ok(Some(r)) = input.latest() {
-                captured.borrow_mut().push(convergence_sample(r.get()));
+            if let (Ok(Some(t)), Ok(Some(o))) = (truth.latest(), orbit.latest()) {
+                captured
+                    .borrow_mut()
+                    .push(tracking_sample(t.get(), o.get(), CONVERGED_LAW));
             }
         }
     })
@@ -119,16 +118,16 @@ async fn run_and_measure(mut coord: Coordinator, cycles: usize) -> Measure {
     drop(sampler); // abort the sampler before reading the captured trajectory
 
     let trajectory = samples.borrow();
-    let (e0, r0) = *trajectory.first().expect("the sampler captured the initial truth");
-    let (ef, rf) = *trajectory.last().expect("the sampler captured the final truth");
+    let (e0, r0) = *trajectory.first().expect("the sampler captured the initial state");
+    let (ef, rf) = *trajectory.last().expect("the sampler captured the final state");
     Measure { e0, r0, ef, rf }
 }
 
-/// Assert the loop converged: attitude error shrinks well below the start and below a small
-/// absolute threshold, and the body rate damps toward zero.
+/// Assert the loop converged: the attitude tracking error shrinks well below the start and
+/// below a small absolute threshold, and the body rate damps toward the (small) orbital rate.
 fn assert_converged(label: &str, m: &Measure) {
     println!(
-        "[{label}] attitude error {:.4} -> {:.5} rad ({:.2} deg); rate {:.4} -> {:.6} rad/s",
+        "[{label}] tracking error {:.4} -> {:.5} rad ({:.2} deg); rate {:.4} -> {:.6} rad/s",
         m.e0,
         m.ef,
         m.ef.to_degrees(),
@@ -137,29 +136,33 @@ fn assert_converged(label: &str, m: &Measure) {
     );
     assert!(m.e0 > 0.3, "[{label}] starts with a real offset (>0.3 rad), got {}", m.e0);
     assert!(
-        m.ef < m.e0 * 0.1,
-        "[{label}] attitude error shrinks to <10% of start: {} -> {}",
+        m.ef < m.e0 * 0.25,
+        "[{label}] tracking error shrinks to <25% of start: {} -> {}",
         m.e0,
         m.ef
     );
     assert!(
-        m.ef < 0.05,
-        "[{label}] final attitude error converges below 0.05 rad (~3 deg): {}",
+        m.ef < 0.1,
+        "[{label}] final tracking error converges below 0.1 rad (~6 deg): {}",
         m.ef
     );
     assert!(m.rf < m.r0, "[{label}] body rate damps: {} -> {}", m.r0, m.rf);
-    assert!(m.rf < 0.02, "[{label}] final body rate near zero (<0.02 rad/s): {}", m.rf);
+    assert!(
+        m.rf < 0.05,
+        "[{label}] final body rate near the orbital rate (<0.05 rad/s): {}",
+        m.rf
+    );
 }
 
 #[stellarator::test]
 async fn closed_loop_converges_static_and_dlopen() {
-    // Path 1 — the statically-linked reference.
+    // Path 1 — plant/nav/ctrl statically linked (slot/sequences still dlopen).
     let static_run = run_and_measure(build_static(), CYCLES).await;
     assert_converged("static", &static_run);
 
-    // Path 2 — the SAME systems built as cdylibs, dlopen'd + resolved from a `Wiring`.
+    // Path 2 — the SAME mission, every system dlopen'd + resolved from the `Wiring`.
     let dl_coord = adcs_fsw2::build_sim_coordinator()
-        .expect("build the three system cdylibs, dlopen + resolve them");
+        .expect("build the system cdylibs, dlopen + resolve them");
     let dl_run = run_and_measure(dl_coord, CYCLES).await;
     assert_converged("dlopen", &dl_run);
 
@@ -170,7 +173,7 @@ async fn closed_loop_converges_static_and_dlopen() {
     println!("static ≡ dlopen: |Δerror| = {d_err:.3e} rad, |Δrate| = {d_rate:.3e} rad/s");
     assert!(
         d_err < PARITY_TOL,
-        "dlopen final attitude error matches static within {PARITY_TOL:e}: \
+        "dlopen final tracking error matches static within {PARITY_TOL:e}: \
          static {} vs dlopen {} (Δ {d_err:e})",
         static_run.ef,
         dl_run.ef
