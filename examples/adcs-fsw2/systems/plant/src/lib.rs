@@ -15,7 +15,7 @@
 
 use adcs_contracts::{
     ALTITUDE, BodyState, DT, EARTH_RADIUS, G, M, MASS, PlantParams, Sensors, TorqueCmd, V3, Wheels,
-    inertia_diag, mag_field_eci,
+    World, epoch_at, inertia_diag, mag_field_eci, sun_dir_eci,
 };
 use metor_fsw_2::metor_proto::types::Timestamp;
 use metor_fsw_2::ring::{Backing, BoxBacking};
@@ -133,6 +133,9 @@ pub struct PlantSystem {
     bias: V3,
     meas_sigma: f64,
     rng: StdRng,
+    /// Seconds of simulated mission time (a deterministic per-cycle counter, not wall time)
+    /// — drives the epoch the real sun direction is evaluated at.
+    t_sim: f64,
 }
 
 #[derive(SystemInput)]
@@ -145,6 +148,7 @@ pub struct PlantOut<B: Backing = BoxBacking> {
     pub sensors: Output<Sensors, B>,
     pub wheels: Output<Wheels, B>,
     pub body: Output<BodyState, B>,
+    pub world: Output<World, B>,
 }
 
 impl PlantSystem {
@@ -177,6 +181,7 @@ impl PlantSystem {
             bias: V3::zeros(),
             meas_sigma: p.meas_sigma,
             rng: StdRng::seed_from_u64(p.seed),
+            t_sim: 0.0,
         }
     }
 
@@ -227,19 +232,27 @@ impl<B: Backing> CyclicSystem<B> for PlantSystem {
         let omega_b_true = q_eci_b * self.body.vel.angular();
         self.bias = self.bias + self.noise(self.meas_sigma * 1e-2);
         let gyro_b = omega_b_true + self.bias + self.noise(self.meas_sigma);
-        // Two normalized vector observations in the body frame: the sun (a fixed inertial
-        // direction) and the modeled magnetic field at the true position.
+        // The true ECI environment at this epoch/position: the real sun direction (nox-frames
+        // Vallado model at the deterministic mission epoch) and the dipole magnetic field.
         let pos_eci = self.body.pos.linear();
         let vel_eci = self.body.vel.linear();
-        let sun_eci: V3 = tensor![0.0, 0.0, 1.0];
+        let sun_eci = sun_dir_eci(epoch_at(self.t_sim));
+        let mag_eci = mag_field_eci(&pos_eci);
+        // The two normalized vector observations, those ECI references brought into the body
+        // frame plus sensor noise.
         let sun_b = (q_eci_b * sun_eci).normalize() + self.noise(self.meas_sigma);
-        let mag_b = (q_eci_b * mag_field_eci(&pos_eci)).normalize() + self.noise(self.meas_sigma);
+        let mag_b = (q_eci_b * mag_eci).normalize() + self.noise(self.meas_sigma);
 
         let _ = o.sensors.write(&Sensors {
             timestamp: now,
             gyro_b,
             sun_b,
             mag_b,
+        });
+        let _ = o.world.write(&World {
+            timestamp: now,
+            sun_eci,
+            mag_eci,
         });
         // Per-wheel telemetry (each wheel is axis-aligned, so its scalar value sits on the
         // wheel's own body axis).
@@ -269,6 +282,8 @@ impl<B: Backing> CyclicSystem<B> for PlantSystem {
         self.body = six_dof_rk4(DT, self.body.clone(), |b| {
             SpatialForce::from_torque(rw_torque_b) + SpatialForce::from_linear(gravity(b))
         });
+        // Advance the deterministic mission clock (drives the sun epoch — never wall time).
+        self.t_sim += DT;
     }
 }
 

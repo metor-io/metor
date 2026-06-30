@@ -11,6 +11,9 @@ description = "Shared compile-time contracts (frames + per-system Params) for th
 # `::metor_fsw_2::…` paths, so this crate needs only metor-fsw-2 (no direct metor-fsw).
 metor-fsw-2 = { path = "../../../libs/metor-fsw-2" }
 nox = { workspace = true }
+# Real-world environment models: the ECI sun direction (Vallado) at an epoch.
+nox-frames = { path = "../../../libs/nox-frames", features = ["earth"] }
+hifitime = "4.0"
 zerocopy = { version = "0.8.2", features = ["derive"] }
 # `Params` cross the dlopen boundary as canonical postcard bytes, schema-guided from the
 # `.so`'s exported `Schema` (dl-open.md §6.3) — hence the Serialize/Deserialize/Schema triple.

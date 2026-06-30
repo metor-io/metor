@@ -7,7 +7,7 @@
 
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
 
-use adcs_contracts::{AttitudeEstimate, BodyState, DT, NavParams, Sensors, V3, mag_field_eci};
+use adcs_contracts::{AttitudeEstimate, DT, NavParams, Sensors, V3, World};
 use metor_fsw_2::metor_proto::types::Timestamp;
 use metor_fsw_2::ring::{Backing, BoxBacking};
 use metor_fsw_2::{
@@ -23,7 +23,7 @@ pub struct NavSystem {
 #[derive(SystemInput)]
 pub struct NavIn<B: Backing = BoxBacking> {
     pub sensors: Input<Sensors, B>,
-    pub body: Input<BodyState, B>,
+    pub world: Input<World, B>,
 }
 
 #[derive(SystemOutput)]
@@ -55,12 +55,14 @@ impl<B: Backing> CyclicSystem<B> for NavSystem {
         };
         let s = s.get().clone();
 
-        // Model the inertial (ECI) references from the orbit state (cube-sat
-        // `Nav::from_sensors`): a fixed sun direction and the dipole field at the position.
-        let sun_eci: V3 = tensor![0.0, 0.0, 1.0];
-        let mag_eci: V3 = match input.body.latest() {
-            Ok(Some(body)) => mag_field_eci(&body.get().pos_eci).normalize(),
-            _ => tensor![1.0, 0.0, 0.0],
+        // The inertial (ECI) references for the two observations come from the world frame:
+        // the sun direction (already a unit vector) and the magnetic field (normalized here).
+        let (sun_eci, mag_eci): (V3, V3) = match input.world.latest() {
+            Ok(Some(w)) => {
+                let w = w.get();
+                (w.sun_eci, w.mag_eci.normalize())
+            }
+            _ => (tensor![0.0, 0.0, 1.0], tensor![1.0, 0.0, 0.0]),
         };
 
         self.state.omega = s.gyro_b;
