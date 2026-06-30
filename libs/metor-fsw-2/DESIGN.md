@@ -382,6 +382,26 @@ a `view()` factory, so every reader is slot-accounted against the buffer's build
 `max_readers` budget. The coordinator sizes that budget to include each known registry
 consumer, so an `All`-mode downlink always has a reader slot on every buffer.
 
+## Messages, the uplink, and the command plane
+
+Beside the fixed-frame data path is a second payload kind: **messages** — self-describing
+`(PacketId, postcard)` records carried on byte rings, indexed by a parallel `MessageRegistry`,
+and tapped by telemetry just like outputs. Messages carry variable-length `serde` types (the
+panel's sequence registry and per-channel events) that do not fit the `#[repr(C)]` frame mold.
+
+The framework closes the operator loop in **both** directions over messages. The **downlink**
+taps every message channel and streams each record off-board (the message twin of the output
+tap). The **uplink** is its read twin: an ordinary `AsyncSystem` (`UplinkSystem`) that owns its
+own connection, receives panel-published `SequenceCommand` messages, and re-emits them onto a
+reserved **`"commands"`** message channel. The coordinator runs a generic **command bus**: at the
+head of each cycle it drains every `"commands"` channel from the `MessageRegistry` (plus one
+coordinator-owned channel backing an in-process `control_handle()`), decodes each `SequenceCommand`,
+and dispatches it to the addressed runtime slot by `channel_id` — before stepping the slots, so a
+command lands the same cycle it arrives. The coordinator is command-generic: it knows nothing of
+sequences, only how to drain a command bus and dispatch. Uplink and downlink use **separate
+connections**: a connection is an owned resource the system/ring model cannot distribute the way it
+hands out ring views, so sharing one socket across two systems is deferred. See `docs/messages.md`.
+
 ## Limitations and future work
 
 The design intentionally leaves several capabilities for later; they are noted here in one
@@ -399,6 +419,10 @@ place rather than scattered through the prose:
   channels are a future extension.
 - **Automatic transport reconnect.** The TCP downlink connects once and stops downlinking on
   disconnect; reconnect/backoff is future work.
+- **Shared uplink+downlink connection.** The uplink and downlink each open their own connection.
+  A connection is an owned OS resource the system/ring model cannot split into independent handles
+  the way it distributes ring views, so sharing one socket across two systems needs a "shared owned
+  resource" abstraction that does not exist yet (`docs/messages.md` §4.5).
 
 ## Document map
 
@@ -413,5 +437,8 @@ of each subsystem:
 - `docs/wiring.md` — the `Wiring` data model, the KDL front-end, and the Rust builder.
 - `docs/dl-open.md` — the `cdylib` C-ABI, the loader, and schema-guided params.
 - `docs/telemetry.md` — the output registry and the telemetry downlink.
+- `docs/cli-runner.md` — the `metor-fsw` CLI: loading a wiring, packaging a bundle, and running a mission.
+- `docs/sequences-slots.md` — runtime-loadable slots and the `#[sequence]` author surface.
+- `docs/messages.md` — the message channel (a second payload kind), the telemetry uplink/downlink of messages, and the `SequenceCommand` command plane.
 </content>
 </invoke>

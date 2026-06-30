@@ -25,11 +25,13 @@ use std::rc::Rc;
 
 use adcs_contracts::ModeCmd;
 use metor_fsw_2::metor_proto::types::{ComponentId, Msg};
-use metor_fsw_2::metor_proto_wkt::{SequenceChannelEvent, SequenceEventKind, SequenceRegistry};
+use metor_fsw_2::metor_proto_wkt::{
+    SequenceChannelEvent, SequenceCommand, SequenceCommandKind, SequenceEventKind, SequenceRegistry,
+};
 use metor_fsw_2::wiring::Registry;
 use metor_fsw_2::{
-    BuildOptions, Coordinator, Input, Output, SequenceStatus, SlotCommand, build_artifacts,
-    parse, resolve, split_record,
+    BuildOptions, Coordinator, Input, SequenceStatus, build_artifacts, parse, resolve,
+    split_record,
 };
 
 /// The mission wiring document — the same file the CLI runner and the other tests read.
@@ -154,7 +156,8 @@ fn interactive_load_then_abort_safes() {
         return;
     };
     let (seq, mode) = tap_slot(&mut coord);
-    let mut control: Output<SlotCommand> = coord.control_handle();
+    let ch = coord.channel_id("mode").expect("mode slot channel");
+    let mut control = coord.control_handle();
 
     // `run_for` re-runs the dl systems' (non-idempotent) `init` each call, so the slot is
     // driven inside a SINGLE `run_for`: `Load` + `Start` are issued before it, and a spawned
@@ -164,13 +167,30 @@ fn interactive_load_then_abort_safes() {
         let ((run_states, modes), sampler) = spawn_sampler(seq, mode);
         let sampler = sampler.drop_guard();
 
-        control.write(&SlotCommand::load("mode", "commissioning")).unwrap();
-        control.write(&SlotCommand::start("mode")).unwrap();
+        control
+            .emit(&SequenceCommand {
+                channel_id: ch,
+                command: SequenceCommandKind::Load {
+                    name: "commissioning".to_string(),
+                },
+            })
+            .unwrap();
+        control
+            .emit(&SequenceCommand {
+                channel_id: ch,
+                command: SequenceCommandKind::Start,
+            })
+            .unwrap();
         let aborter = stellarator::spawn(async move {
             for _ in 0..4 {
                 stellarator::yield_now().await;
             }
-            control.write(&SlotCommand::abort("mode")).unwrap();
+            control
+                .emit(&SequenceCommand {
+                    channel_id: ch,
+                    command: SequenceCommandKind::Abort,
+                })
+                .unwrap();
         })
         .drop_guard();
 
