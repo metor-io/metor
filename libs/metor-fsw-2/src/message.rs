@@ -15,8 +15,13 @@
 //! `MsgOut`s coordinator-side (the `msg_writer` helper); the user-bundle/binder path is
 //! deferred (`docs/messages.md` Q4).
 
-use metor_fsw_ring::{Backing, BoxBacking, NoWake, WakeSink, WakeSource, WriteError, Writer, frame_len};
+use core::marker::PhantomData;
+
+use metor_fsw_ring::{
+    Backing, BoxBacking, NoWake, View, WakeSink, WakeSource, WriteError, Writer, frame_len,
+};
 use metor_proto::types::{Msg, PacketId};
+use serde::de::DeserializeOwned;
 
 use crate::binder::RingSource;
 
@@ -113,6 +118,78 @@ where
     }
 }
 
+// ---------------------------------------------------------------------------
+// MsgIn
+// ---------------------------------------------------------------------------
+
+/// One owned **message** input: a [`View`] over a byte ring carrying `(id, postcard)`
+/// records, decoding each into the [`Msg`] type `M` — the in-FSW subscribe twin of
+/// [`MsgOut`] (`docs/messages.md` §4). Where [`emit`](MsgOut::emit) writes the 2-byte
+/// [`Msg::ID`] then the postcard payload, [`drain`](Self::drain) reads each committed
+/// record, keeps only those whose id is `M::ID`, and postcard-decodes the payload —
+/// reusing [`split_record`] (the downlink tap's decode). A record of another `Msg` type
+/// on a heterogeneous channel is skipped, and a lapped view resyncs to the live edge (the
+/// in-FSW analogue of the downlink message tap's `resync`, `src/telemetry/mod.rs`).
+///
+/// v1's consumer is the coordinator's command-bus drain (one `MsgIn<SequenceCommand>` per
+/// command channel); the user-bundle/binder path is the deferred [`bind`](Self::bind) seam,
+/// symmetric to [`MsgOut::bind`].
+pub struct MsgIn<M, B = BoxBacking, RD = NoWake, RS = NoWake>
+where
+    B: Backing,
+    RD: WakeSink,
+    RS: WakeSource,
+{
+    view: View<B, RD, RS>,
+    /// A reused record buffer, so a per-cycle drain grows in place rather than allocating —
+    /// the [`MsgOut`] `scratch` mirror.
+    scratch: Vec<u8>,
+    _marker: PhantomData<fn() -> M>,
+}
+
+impl<M, B, RD, RS> MsgIn<M, B, RD, RS>
+where
+    M: Msg + DeserializeOwned,
+    B: Backing,
+    RD: WakeSink,
+    RS: WakeSource,
+{
+    /// Wrap a [`View`] the coordinator/registry claimed over a [`msg_capacity`]-sized byte
+    /// ring (the message twin of [`Input::new`](crate::Input)).
+    pub fn new(view: View<B, RD, RS>) -> Self {
+        Self {
+            view,
+            scratch: Vec::new(),
+            _marker: PhantomData,
+        }
+    }
+
+    /// Drain every record committed since the last call, decoding each `M::ID` record and
+    /// handing the decoded payload to `f` in commit order. Records of a different id (a
+    /// heterogeneous channel) and records that fail to postcard-decode are skipped. A lapped
+    /// view resyncs to the live edge and the drain stops for this pass (best-effort, like the
+    /// message-log downlink — `docs/messages.md` §3).
+    pub fn drain(&mut self, mut f: impl FnMut(M)) {
+        loop {
+            match self.view.try_read_into(&mut self.scratch) {
+                Ok(true) => {
+                    if let Some((id, payload)) = split_record(&self.scratch)
+                        && id == M::ID
+                        && let Ok(msg) = postcard::from_bytes::<M>(payload)
+                    {
+                        f(msg);
+                    }
+                }
+                Ok(false) => return,
+                Err(_) => {
+                    self.view.resync();
+                    return;
+                }
+            }
+        }
+    }
+}
+
 /// A postcard serialization sink that appends into a borrowed, reused byte buffer — the
 /// `&mut LenPacket` flavor's twin (`../metor-proto/src/types.rs:747`), so each
 /// [`emit`](MsgOut::emit) grows `scratch` in place rather than allocating.
@@ -144,7 +221,7 @@ mod tests {
         SequenceChannelSpec, SequenceCommand, SequenceCommandKind, SequenceRegistry,
     };
 
-    use super::{MAX_MSG_BYTES, MSG_DEPTH, MsgOut, msg_capacity, split_record};
+    use super::{MAX_MSG_BYTES, MSG_DEPTH, MsgIn, MsgOut, msg_capacity, split_record};
     use crate::registry::MessageEntry;
 
     /// Mint a `MsgOut` over a fresh byte ring, emit two *different* `Msg` types through
@@ -211,6 +288,55 @@ mod tests {
 
         // No third record.
         assert!(!view.try_read_into(&mut buf).expect("no more records"));
+    }
+
+    /// `MsgIn` drains a heterogeneous channel, decoding only the records whose id matches
+    /// its `Msg` type and skipping the rest — the command-bus drain shape. Emit a
+    /// `SequenceRegistry` then two `SequenceCommand`s through one `MsgOut`; a
+    /// `MsgIn<SequenceCommand>` yields exactly the two commands, in order.
+    #[test]
+    fn msg_in_drains_and_id_filters() {
+        let ring = RingBuffer::create_in_memory(Config {
+            capacity: msg_capacity(MAX_MSG_BYTES, MSG_DEPTH),
+            max_readers: 4,
+            overrun: Overrun::Overwrite,
+        });
+        let mut out: MsgOut = MsgOut::new(ring.writer(NoWake, NoWake));
+        // Claim the read view before any write (overwrite ring starts at the live edge).
+        let mut inbox: MsgIn<SequenceCommand> = MsgIn::new(ring.view(NoWake, NoWake).expect("slot"));
+
+        // A different Msg type interleaved with the commands — it must be skipped.
+        out.emit(&SequenceRegistry {
+            channels: vec![SequenceChannelSpec {
+                id: 0,
+                name: "mode".to_string(),
+                available: vec![],
+            }],
+        })
+        .expect("emit registry");
+        out.emit(&SequenceCommand {
+            channel_id: 1,
+            command: SequenceCommandKind::Start,
+        })
+        .expect("emit start");
+        out.emit(&SequenceCommand {
+            channel_id: 2,
+            command: SequenceCommandKind::Stop,
+        })
+        .expect("emit stop");
+
+        let mut got: Vec<SequenceCommand> = Vec::new();
+        inbox.drain(|c| got.push(c));
+        assert_eq!(got.len(), 2, "the SequenceRegistry record is filtered out");
+        assert_eq!(got[0].channel_id, 1);
+        assert!(matches!(got[0].command, SequenceCommandKind::Start));
+        assert_eq!(got[1].channel_id, 2);
+        assert!(matches!(got[1].command, SequenceCommandKind::Stop));
+
+        // Drained dry — a second drain yields nothing.
+        let mut again = 0;
+        inbox.drain(|_| again += 1);
+        assert_eq!(again, 0);
     }
 
     /// `split_record` rejects a record too short to carry a 2-byte id.

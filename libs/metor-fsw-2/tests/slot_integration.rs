@@ -24,10 +24,29 @@ use metor_fsw_2::metor_proto_wkt::{
     SequenceRegistry,
 };
 use metor_fsw_2::{
-    ClockMode, Coordinator, CoordinatorConfig, DlSystem, Input, Output, RecvTransport,
-    SequenceStatus, SlotCommand, SlotStatus, SystemKind, TransportError, split_record,
+    ClockMode, Coordinator, CoordinatorConfig, DlSystem, Input, RecvTransport, SequenceStatus,
+    SlotStatus, SystemKind, TransportError, split_record,
 };
 use stellarator::buf::{IoBuf, Slice};
+
+/// A `Load { occupant }` command addressed to channel `ch` — the in-proc twin of a panel
+/// uplink, the `SlotCommand::load`/`channel_map` collapse to one `SequenceCommand` type.
+fn load(ch: u64, occupant: &str) -> SequenceCommand {
+    SequenceCommand {
+        channel_id: ch,
+        command: SequenceCommandKind::Load {
+            name: occupant.to_string(),
+        },
+    }
+}
+
+/// A non-`Load` command (`Start`/`Stop`/`Abort`/`Reset`) addressed to channel `ch`.
+fn cmd(ch: u64, command: SequenceCommandKind) -> SequenceCommand {
+    SequenceCommand {
+        channel_id: ch,
+        command,
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Build + locate the sequence fixture cdylib (mirrors dl_integration).
@@ -162,9 +181,10 @@ fn slot_load_start_runs_to_done() {
     );
 
     // Drive Load + Start through the in-proc control handle (drained at cycle 0).
-    let mut control: Output<SlotCommand> = coord.control_handle();
-    control.write(&SlotCommand::load("adcs", "waiter")).unwrap();
-    control.write(&SlotCommand::start("adcs")).unwrap();
+    let ch = coord.channel_id("adcs").expect("adcs slot channel");
+    let mut control = coord.control_handle();
+    control.emit(&load(ch, "waiter")).unwrap();
+    control.emit(&cmd(ch, SequenceCommandKind::Start)).unwrap();
 
     let coord = stellarator::run(|| async move {
         coord.run_for(4).await;
@@ -221,10 +241,11 @@ fn slot_abort_completes_aborted() {
 
     // Load + Start + Abort, all drained at cycle 0 (before the wait deadline), so the
     // very first poll observes the cancel and bails out via the safing branch.
-    let mut control: Output<SlotCommand> = coord.control_handle();
-    control.write(&SlotCommand::load("adcs", "waiter")).unwrap();
-    control.write(&SlotCommand::start("adcs")).unwrap();
-    control.write(&SlotCommand::abort("adcs")).unwrap();
+    let ch = coord.channel_id("adcs").expect("adcs slot channel");
+    let mut control = coord.control_handle();
+    control.emit(&load(ch, "waiter")).unwrap();
+    control.emit(&cmd(ch, SequenceCommandKind::Start)).unwrap();
+    control.emit(&cmd(ch, SequenceCommandKind::Abort)).unwrap();
 
     let coord = stellarator::run(|| async move {
         coord.run_for(3).await;
@@ -275,10 +296,11 @@ fn slot_stop_hard_drops_occupant() {
     );
 
     // Load + Start + Stop: the hard-drop returns the slot to Loaded with the future gone.
-    let mut control: Output<SlotCommand> = coord.control_handle();
-    control.write(&SlotCommand::load("adcs", "waiter")).unwrap();
-    control.write(&SlotCommand::start("adcs")).unwrap();
-    control.write(&SlotCommand::stop("adcs")).unwrap();
+    let ch = coord.channel_id("adcs").expect("adcs slot channel");
+    let mut control = coord.control_handle();
+    control.emit(&load(ch, "waiter")).unwrap();
+    control.emit(&cmd(ch, SequenceCommandKind::Start)).unwrap();
+    control.emit(&cmd(ch, SequenceCommandKind::Stop)).unwrap();
 
     let coord = stellarator::run(|| async move {
         coord.run_for(3).await;
@@ -328,13 +350,14 @@ fn slot_reset_reruns_from_start() {
     // Two bounded runs in one executor scope (`stellarator::run` owns the executor for
     // its closure). Run #1: Load + Start → Completed. Between runs, Reset (rebuild the
     // selected occupant over the same rings) + Start; Run #2 reloads and completes again.
-    let mut control: Output<SlotCommand> = coord.control_handle();
-    control.write(&SlotCommand::load("adcs", "waiter")).unwrap();
-    control.write(&SlotCommand::start("adcs")).unwrap();
+    let ch = coord.channel_id("adcs").expect("adcs slot channel");
+    let mut control = coord.control_handle();
+    control.emit(&load(ch, "waiter")).unwrap();
+    control.emit(&cmd(ch, SequenceCommandKind::Start)).unwrap();
     let coord = stellarator::run(|| async move {
         coord.run_for(3).await;
-        control.write(&SlotCommand::reset("adcs")).unwrap();
-        control.write(&SlotCommand::start("adcs")).unwrap();
+        control.emit(&cmd(ch, SequenceCommandKind::Reset)).unwrap();
+        control.emit(&cmd(ch, SequenceCommandKind::Start)).unwrap();
         coord.run_for(3).await;
         drop(control);
         coord
@@ -404,9 +427,10 @@ fn slot_emits_ordered_sequence_events_and_boot_registry() {
     assert_eq!(coord.channel_map(), &[(0u64, "adcs")]);
 
     // Drive Load + Start (drained at cycle 0), run to the occupant's Completed.
-    let mut control: Output<SlotCommand> = coord.control_handle();
-    control.write(&SlotCommand::load("adcs", "waiter")).unwrap();
-    control.write(&SlotCommand::start("adcs")).unwrap();
+    let ch = coord.channel_id("adcs").expect("adcs slot channel");
+    let mut control = coord.control_handle();
+    control.emit(&load(ch, "waiter")).unwrap();
+    control.emit(&cmd(ch, SequenceCommandKind::Start)).unwrap();
     let mut coord = coord;
     let coord = stellarator::run(|| async move {
         coord.run_for(4).await;

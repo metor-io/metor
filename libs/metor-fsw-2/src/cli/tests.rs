@@ -121,6 +121,19 @@ fn no_telemetry_override_disables_kdl_telemetry() {
 }
 
 #[test]
+fn uplink_override_sets_wiring_uplink() {
+    let mut wiring = WiringBuilder::new()
+        .coordinator(120.0, ClockSpec::Wall)
+        .build();
+    assert!(wiring.uplink.is_none(), "no uplink by default");
+    let args = run_args(&[
+        "metor-fsw", "run", "m.kdl", "--build", "--uplink", "127.0.0.1:2241",
+    ]);
+    apply_overrides(&mut wiring, &args).unwrap();
+    assert_eq!(wiring.uplink, Some("127.0.0.1:2241".parse().unwrap()));
+}
+
+#[test]
 fn sim_dt_override_sets_simulated_clock() {
     let mut wiring = WiringBuilder::new().coordinator(120.0, ClockSpec::Wall).build();
     let args = run_args(&["metor-fsw", "run", "m.kdl", "--build", "--sim-dt", "0.005"]);

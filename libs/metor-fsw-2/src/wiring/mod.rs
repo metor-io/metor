@@ -50,7 +50,7 @@ use crate::dl::{DlError, DlSystem};
 use crate::frame::Frame;
 use crate::sequence::SlotControlIn;
 use crate::system::{AsyncSystem, BuildSystem, CyclicSystem, Out, SystemOutput};
-use crate::telemetry::{TcpTransport, TelemetryConfig, TelemetryMode};
+use crate::telemetry::{TcpRecvTransport, TcpTransport, TelemetryConfig, TelemetryMode};
 
 // The `Wiring` data model, the Rust builder, and the cargo build driver. KDL is *one*
 // deserializer onto `Wiring` (see `parse`/`resolve` below); the builder is the other;
@@ -747,6 +747,8 @@ pub fn parse(kdl: &str) -> Result<Wiring, LoadError> {
         slots,
         edges,
         telemetry,
+        // No KDL surface for the uplink yet (`docs/messages.md` §7); set via `--uplink`.
+        uplink: None,
     })
 }
 
@@ -811,6 +813,11 @@ pub fn resolve(wiring: &Wiring, registry: &Registry) -> Result<Coordinator, Load
             builder.connect(producer, consumer)
         };
         result.map_err(|source| LoadError::Wire { source, src, span })?;
+    }
+
+    // --- Uplink: an async system on its own connection (`docs/messages.md` §4.4/§4.5) ---
+    if let Some(addr) = wiring.uplink {
+        builder.add_uplink(TcpRecvTransport::new(addr));
     }
 
     // --- Telemetry: registered last (observes every system's fresh output) ---

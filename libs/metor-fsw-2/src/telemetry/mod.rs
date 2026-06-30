@@ -34,12 +34,15 @@ use std::sync::atomic::{
     Ordering::{AcqRel, Acquire, Relaxed, Release},
 };
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use metor_fsw_ring::{BoxBacking, NoWake, View};
 use metor_proto::types::{ComponentId, LenPacket, Msg, OwnedPacket, PacketId, Timestamp};
 use metor_proto::vtable::VTable;
 use metor_proto_stellar::{PacketSink, PacketStream};
-use metor_proto_wkt::{ComponentMetadata, SequenceCommand, SetComponentMetadata, VTableMsg};
+use metor_proto_wkt::{
+    ComponentMetadata, MsgStream, SequenceCommand, SetComponentMetadata, VTableMsg,
+};
 use stellarator::JoinHandleDropGuard;
 use stellarator::buf::Slice;
 use stellarator::io::{OwnedReader, OwnedWriter, SplitExt};
@@ -48,9 +51,9 @@ use stellarator::sync::WaitQueue;
 
 use crate::binder::{BindPorts, RingSource};
 use crate::descriptor::PortDesc;
-use crate::message::split_record;
+use crate::message::{MsgOut, split_record};
 use crate::registry::{MessageEntry, MessageRegistry, OutputRegistry, RegistryEntry};
-use crate::system::{CyclicSystem, Out, System, SystemInput, SystemOutput};
+use crate::system::{AsyncSystem, CyclicSystem, Out, System, SystemInput, SystemOutput};
 
 // ---------------------------------------------------------------------------
 // Transport (telemetry.md §7)
@@ -96,14 +99,13 @@ pub trait RecvTransport {
     async fn recv(&mut self) -> Result<OwnedPacket<Slice<Vec<u8>>>, TransportError>;
 }
 
-/// A live TCP connection's write half plus the read half. In the downlink-only (lazy)
-/// path the read half is held only to keep the socket open (`rx = Some`, unused, v1 does
-/// not read replies on a downlink-only link); in the shared bidirectional path it is
-/// handed to the uplink reader by [`connect_once`] (`rx = None`).
+/// A live TCP connection's write half plus the parked read half. The downlink only writes;
+/// the read half is held to keep the full socket open (the downlink does not read replies —
+/// the uplink owns its own separate connection, `docs/messages.md` §4.5).
 struct TcpConn {
     sink: PacketSink<OwnedWriter<TcpStream>>,
     #[allow(dead_code)]
-    rx: Option<OwnedReader<TcpStream>>,
+    rx: OwnedReader<TcpStream>,
 }
 
 /// The v1 transport: connect-once to a ground/db endpoint and stream `LenPacket`s,
@@ -130,7 +132,7 @@ impl TcpTransport {
             let (rx, tx) = stream.split();
             self.conn = Some(TcpConn {
                 sink: PacketSink::new(tx),
-                rx: Some(rx),
+                rx,
             });
         }
         Ok(&self.conn.as_ref().expect("just connected").sink)
@@ -167,52 +169,70 @@ impl Transport for TcpTransport {
     }
 }
 
-/// The v1 uplink read path (`docs/messages.md` §4.2): a [`PacketStream`] over a
-/// connection's read half — the inverse of [`TcpTransport`]'s [`PacketSink`], mirroring
-/// cube-sat's `PacketStream`/`spawn_recv` (`examples/cube-sat/src/main.rs:545`). Built by
-/// [`connect_once`] from the same split socket the downlink writes, so it shares the
-/// connection's lifetime: a dropped socket fails `recv` and stops the reader, exactly as
-/// it stops the sender.
+/// The v1 uplink read path (`docs/messages.md` §4.2/§4.5): the uplink's **own** connection to
+/// the metor-db broker, mirroring cube-sat (`examples/cube-sat/src/main.rs:541-559`). It connects
+/// lazily on first `recv` (inside the uplink system's async task, as the downlink's
+/// [`TcpTransport`] connects on first announce), then — crucially — **subscribes** to the panel's
+/// command stream: the db relays a message id only to clients that send a [`MsgStream`] for it
+/// (`metor-db` `MsgStream` handler), so without this the uplink would read nothing. The write half
+/// (the [`PacketSink`] the subscription is sent over) is held for the connection's lifetime; the
+/// read half is a [`PacketStream`] yielding the streamed `SequenceCommand` Msgs. A dropped socket
+/// fails `recv` and stops the reader (no reconnect); uplink and downlink no longer share a socket
+/// (shared link is deferred, §4.5).
 pub struct TcpRecvTransport {
-    stream: PacketStream<OwnedReader<TcpStream>>,
+    addr: std::net::SocketAddr,
+    stream: Option<PacketStream<OwnedReader<TcpStream>>>,
+    /// The write half, held open so the db keeps streaming (it is the channel the [`MsgStream`]
+    /// subscription was sent on; dropping it could half-close the socket and end the stream).
+    #[allow(dead_code)]
+    sink: Option<PacketSink<OwnedWriter<TcpStream>>>,
+}
+
+impl TcpRecvTransport {
+    /// A reader that will connect to `addr` (the metor-db broker) and subscribe on its first
+    /// `recv` (connecting is async, so it cannot happen at build). The uplink's own connection,
+    /// distinct from the downlink's.
+    pub fn new(addr: std::net::SocketAddr) -> Self {
+        Self {
+            addr,
+            stream: None,
+            sink: None,
+        }
+    }
+
+    /// Connect lazily on first use, send the `SequenceCommand` [`MsgStream`] subscription, then
+    /// reuse the open read half. Subsequent calls reuse the established stream.
+    async fn ensure(&mut self) -> Result<&mut PacketStream<OwnedReader<TcpStream>>, TransportError> {
+        if self.stream.is_none() {
+            let stream = TcpStream::connect(self.addr)
+                .await
+                .map_err(|e| TransportError::Io(format!("{e}")))?;
+            let (rx, tx) = stream.split();
+            // Subscribe to the panel's command stream before reading (`docs/messages.md` §4.4):
+            // the db only forwards a message id to clients that asked for it. Mirrors cube-sat
+            // (`examples/cube-sat/src/main.rs:555`). v1 subscribes to `SequenceCommand` only.
+            let sink = PacketSink::new(tx);
+            sink.send(&MsgStream {
+                msg_id: SequenceCommand::ID,
+            })
+            .await
+            .0
+            .map_err(|e| TransportError::Io(format!("{e}")))?;
+            self.sink = Some(sink);
+            self.stream = Some(PacketStream::new(rx));
+        }
+        Ok(self.stream.as_mut().expect("just connected"))
+    }
 }
 
 impl RecvTransport for TcpRecvTransport {
     async fn recv(&mut self) -> Result<OwnedPacket<Slice<Vec<u8>>>, TransportError> {
-        self.stream
+        let stream = self.ensure().await?;
+        stream
             .next_grow(vec![0u8; 1024])
             .await
             .map_err(|e| TransportError::Io(format!("{e}")))
     }
-}
-
-/// Establish the **one shared bidirectional link** and split it (`docs/messages.md` §4,
-/// Q7): a single `TcpStream::connect(addr).split()` whose write half drives the downlink
-/// [`TcpTransport`] (returned already connected — no lazy `ensure`) and whose read half
-/// drives the uplink [`TcpRecvTransport`]. Both observe the *same* socket, so a drop stops
-/// the sender and the reader together — preserving connect-once / no-reconnect /
-/// silent-drop-on-disconnect (telemetry.md §7), now shared by both halves. Hand the write
-/// half to [`add_telemetry`](crate::CoordinatorBuilder::add_telemetry) and the read half to
-/// [`add_uplink`](crate::CoordinatorBuilder::add_uplink). A downlink-only mission instead
-/// keeps using [`TcpTransport::new`] (lazy connect) and omits the uplink entirely.
-pub async fn connect_once(
-    addr: std::net::SocketAddr,
-) -> Result<(TcpTransport, TcpRecvTransport), TransportError> {
-    let stream = TcpStream::connect(addr)
-        .await
-        .map_err(|e| TransportError::Io(format!("{e}")))?;
-    let (rx, tx) = stream.split();
-    let tx = TcpTransport {
-        addr,
-        conn: Some(TcpConn {
-            sink: PacketSink::new(tx),
-            rx: None,
-        }),
-    };
-    let rx = TcpRecvTransport {
-        stream: PacketStream::new(rx),
-    };
-    Ok((tx, rx))
 }
 
 // ---------------------------------------------------------------------------
@@ -375,78 +395,99 @@ impl MsgHandOff {
 }
 
 // ---------------------------------------------------------------------------
-// Uplink (the inbound twin of the hand-off + sender, `docs/messages.md` §4)
+// Uplink — the command-plane ingest system (`docs/messages.md` §4.4)
 // ---------------------------------------------------------------------------
 
-/// The bound on the uplink [`MsgInbox`]: panel commands are rare, so a shallow FIFO is
-/// ample; past it the oldest queued command is dropped (and counted) — the inbound
-/// analogue of [`MSG_HANDOFF_CAP`].
-const MSG_INBOX_CAP: usize = 256;
+/// Idle pause one [`UplinkSystem::run`] pass takes once its link has dropped, so the
+/// coordinator's async-run loop does not busy-spin a dead reader (teardown cancels the task
+/// via its drop guard regardless).
+const UPLINK_IDLE: Duration = Duration::from_millis(50);
 
-/// The inbound twin of [`MsgHandOff`] (`docs/messages.md` §4.1): the async reader task
-/// ([`run_receiver`]) fills it; the coordinator's head-of-cycle stage polls it each tick
-/// (it never parks on it) and maps each `SequenceCommand` into the slot command ring the
-/// **same cycle**. Bounded FIFO — on overflow the **oldest** command is dropped and
-/// `dropped` bumped (loss surfaced, never silent reordering).
-pub(crate) struct MsgInbox {
-    queue: Mutex<VecDeque<SequenceCommand>>,
-    /// Count of commands dropped-oldest on overflow (surfaced by the coordinator as
-    /// `coordinator` health when it drains).
-    dropped: AtomicU64,
+/// The uplink's output bundle (`docs/messages.md` §4.3/§4.4): a single command-channel
+/// [`MsgOut`] it re-emits each decoded `SequenceCommand` onto. No typed frame ports — the
+/// command channel is the system's only output (besides the implicit health/log [`Out`] adds).
+pub struct UplinkPorts {
+    commands: MsgOut<BoxBacking>,
 }
 
-impl MsgInbox {
-    pub(crate) fn new() -> Self {
+impl SystemOutput for UplinkPorts {
+    fn descriptors() -> Vec<PortDesc> {
+        Vec::new()
+    }
+}
+
+impl BindPorts<BoxBacking> for UplinkPorts {
+    /// Host-only (`B = BoxBacking`): pull the command-bus emit capability the host [`Binder`]
+    /// carries (`docs/messages.md` §4.3) — declaring this system a command emitter just by asking.
+    fn bind<S: RingSource<B = BoxBacking>>(src: &mut S) -> Self {
         Self {
-            queue: Mutex::new(VecDeque::new()),
-            dropped: AtomicU64::new(0),
+            commands: src.command_out(),
         }
-    }
-
-    /// Reader side: append `cmd`, dropping the oldest queued command (and counting it) if
-    /// the FIFO is already at [`MSG_INBOX_CAP`].
-    fn push(&self, cmd: SequenceCommand) {
-        let mut q = self.queue.lock().expect("msg inbox poisoned");
-        if q.len() >= MSG_INBOX_CAP {
-            q.pop_front();
-            self.dropped.fetch_add(1, Relaxed);
-        }
-        q.push_back(cmd);
-    }
-
-    /// Cycle side: take every queued command in FIFO order.
-    pub(crate) fn drain(&self) -> Vec<SequenceCommand> {
-        let mut q = self.queue.lock().expect("msg inbox poisoned");
-        q.drain(..).collect()
-    }
-
-    /// The running overflow-drop count, for the coordinator's health surface.
-    pub(crate) fn dropped(&self) -> u64 {
-        self.dropped.load(Relaxed)
     }
 }
 
-/// The async uplink reader (`docs/messages.md` §4.1): the inbound twin of [`run_sender`].
-/// Loop `recv`, keep only `SequenceCommand` Msgs (cube-sat's exact filter,
-/// `examples/cube-sat/src/main.rs:690`), push each into the [`MsgInbox`]; ignore any other
-/// packet; `return` on the first error (drop-on-disconnect, like the sender) or when `stop`
-/// is set.
-pub(crate) async fn run_receiver<R: RecvTransport>(
-    mut rx: R,
-    inbox: Arc<MsgInbox>,
-    stop: Arc<AtomicBool>,
-) {
-    while !stop.load(Acquire) {
-        match rx.recv().await {
+/// The uplink's (empty) input bundle — it sources commands from its own connection, not edges.
+pub struct UplinkIn;
+
+impl SystemInput for UplinkIn {
+    fn descriptors() -> Vec<PortDesc> {
+        Vec::new()
+    }
+    fn any_lapped(&self) -> bool {
+        false
+    }
+}
+
+impl BindPorts<BoxBacking> for UplinkIn {
+    fn bind<S: RingSource<B = BoxBacking>>(_src: &mut S) -> Self {
+        UplinkIn
+    }
+}
+
+/// The command-plane ingest system (`docs/messages.md` §4.4): the read twin of
+/// [`TelemetrySystem`], an ordinary [`AsyncSystem`] that owns its **own** [`RecvTransport`]
+/// connection (§4.5) and re-emits each panel `SequenceCommand` onto the command bus the
+/// coordinator drains at head-of-cycle. A near pass-through — wire and internal command type
+/// are now identical (`SequenceCommand`), so there is no mapping, no inbox, no translation.
+pub struct UplinkSystem<R: RecvTransport> {
+    /// The read transport, taken `None` on drop-on-disconnect (no reconnect, telemetry.md §7).
+    recv: Option<R>,
+}
+
+impl<R: RecvTransport> UplinkSystem<R> {
+    /// Construct the (pre-init) uplink from its read transport (its own connection).
+    pub fn new(recv: R) -> Self {
+        Self { recv: Some(recv) }
+    }
+}
+
+impl<R: RecvTransport + 'static> System for UplinkSystem<R> {
+    type Input = UplinkIn;
+    type Output = Out<UplinkPorts>;
+    const NAME: &'static str = "uplink";
+}
+
+impl<R: RecvTransport + 'static> AsyncSystem for UplinkSystem<R> {
+    /// One ingest pass (the coordinator's async-run loop calls it repeatedly): `recv` the next
+    /// packet, keep only `SequenceCommand` Msgs (cube-sat's exact filter,
+    /// `examples/cube-sat/src/main.rs:690`), and `emit` each onto the command channel; ignore any
+    /// other packet. On the first error the link is dropped (no reconnect) and subsequent passes
+    /// idle so the loop does not spin a dead reader.
+    async fn run(&mut self, _input: &mut Self::Input, output: &mut Self::Output) {
+        let Some(recv) = self.recv.as_mut() else {
+            stellarator::sleep(UPLINK_IDLE).await;
+            return;
+        };
+        match recv.recv().await {
             Ok(OwnedPacket::Msg(m)) if m.id == SequenceCommand::ID => {
                 if let Ok(cmd) = m.parse::<SequenceCommand>() {
-                    inbox.push(cmd);
+                    let _ = output.commands.emit(&cmd);
                 }
             }
             // Other Msgs / Tables are ignored — the uplink is commands only.
             Ok(_) => {}
             // A dropped link (or an exhausted mock) ends the reader, like the sender.
-            Err(_) => return,
+            Err(_) => self.recv = None,
         }
     }
 }

@@ -118,6 +118,10 @@ struct RunArgs {
     /// Tap mode for `--telemetry` (v1: `all`).
     #[arg(long, value_name = "MODE", default_value = "all")]
     telemetry_mode: String,
+    /// Enable the command uplink, reading panel `SequenceCommand`s off its own TCP
+    /// connection to this address (separate from `--telemetry`'s connection).
+    #[arg(long, value_name = "ADDR")]
+    uplink: Option<SocketAddr>,
     /// Run this many cycles, then stop (default: run until interrupted).
     #[arg(long, value_name = "N")]
     cycles: Option<usize>,
@@ -277,6 +281,19 @@ fn print_run_banner(target: &Path, wiring: &Wiring) {
             }
         }
     }
+
+    match wiring.uplink {
+        None => println!("  uplink:    off — pass `--uplink <addr>` to receive panel commands"),
+        Some(addr) => {
+            let reach = if probe_telemetry(addr) {
+                "✓ reachable".to_string()
+            } else {
+                "⚠ not reachable — start metor-panel BEFORE the mission (no auto-reconnect in v1)"
+                    .to_string()
+            };
+            println!("  uplink:    {addr} {reach}");
+        }
+    }
     println!();
 }
 
@@ -371,6 +388,9 @@ fn apply_overrides(wiring: &mut Wiring, args: &RunArgs) -> miette::Result<()> {
             }
         };
         wiring.telemetry = Some(TelemetrySpec { addr, mode });
+    }
+    if let Some(addr) = args.uplink {
+        wiring.uplink = Some(addr);
     }
     Ok(())
 }

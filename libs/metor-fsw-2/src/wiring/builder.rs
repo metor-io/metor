@@ -40,6 +40,7 @@ pub struct WiringBuilder {
     slots: Vec<SlotSpec>,
     edges: Vec<EdgeSpec>,
     telemetry: Option<TelemetrySpec>,
+    uplink: Option<SocketAddr>,
 }
 
 impl Default for WiringBuilder {
@@ -63,6 +64,7 @@ impl WiringBuilder {
             slots: Vec::new(),
             edges: Vec::new(),
             telemetry: None,
+            uplink: None,
         }
     }
 
@@ -165,6 +167,14 @@ impl WiringBuilder {
         self
     }
 
+    /// Add the command uplink (`docs/messages.md` §4.4): an [`UplinkSystem`](crate::UplinkSystem)
+    /// reading panel `SequenceCommand`s off its **own** TCP connection to `addr`, separate from
+    /// the telemetry downlink's connection (shared connection is deferred, §4.5).
+    pub fn uplink(mut self, addr: SocketAddr) -> Self {
+        self.uplink = Some(addr);
+        self
+    }
+
     /// Begin a runtime-loadable **slot** named `name`; finish it with
     /// [`SlotSpecBuilder::end`]. Declare its allowed occupants
     /// ([`allow`](SlotSpecBuilder::allow)), its `input`/`output` contract
@@ -200,6 +210,7 @@ impl WiringBuilder {
             slots: self.slots,
             edges: self.edges,
             telemetry: self.telemetry,
+            uplink: self.uplink,
         }
     }
 }

@@ -27,7 +27,9 @@
 use core::mem::offset_of;
 
 use metor_proto::types::Timestamp;
-use metor_proto_wkt::{ChannelId, SequenceChannelEvent, SequenceEventKind};
+use metor_proto_wkt::{
+    ChannelId, SequenceChannelEvent, SequenceCommand, SequenceCommandKind, SequenceEventKind,
+};
 use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
 
 use metor_fsw_ring::{BoxBacking, NoWake};
@@ -108,132 +110,14 @@ pub struct SlotStatus {
     pub occupant: [u8; SLOT_NAME_CAP],
 }
 
-/// The slot-command kind, mirroring the lifecycle edges (sequences-slots.md §2.1).
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum SlotCommandKind {
-    /// Select an allowed occupant by name, `fsw_create` + `fsw_bind_init` it. Empty→Loaded.
-    Load = 0,
-    /// Begin polling the occupant. Loaded(live)→Running.
-    Start = 1,
-    /// Hard-drop the occupant's future (`fsw_destroy`). Running→Loaded (no live future).
-    Stop = 2,
-    /// Cooperative cancel: write a cancel frame the occupant folds. Stays Running until Done.
-    Abort = 3,
-    /// Rebuild the occupant from the beginning (`fsw_destroy` + `fsw_create` + `fsw_bind_init`).
-    Reset = 4,
-    /// Drop the occupant. →Empty.
-    Unload = 5,
-}
-
-impl SlotCommandKind {
-    fn from_code(code: u8) -> Option<Self> {
-        Some(match code {
-            0 => SlotCommandKind::Load,
-            1 => SlotCommandKind::Start,
-            2 => SlotCommandKind::Stop,
-            3 => SlotCommandKind::Abort,
-            4 => SlotCommandKind::Reset,
-            5 => SlotCommandKind::Unload,
-            _ => return None,
-        })
-    }
-}
-
-/// One runtime slot command, crossing the coordinator's control ring as an ordinary
-/// frame (sequences-slots.md §3, Resolved Q1). Addressed by `slot` name; `occupant`
-/// names the allowed-set entry on `Load`. Fixed-shape: a params blob on `Load` is out
-/// of scope for the v1 frame (the allowed default params are used) — carrying one is
-/// future work.
-#[derive(crate::Frame, IntoBytes, Immutable, KnownLayout, FromBytes, Clone, Copy)]
-#[repr(C)]
-#[metor_fsw(name = "slot_command")]
-pub struct SlotCommand {
-    #[metor_fsw(timestamp)]
-    pub timestamp: Timestamp,
-    /// The [`SlotCommandKind`] code (Load=0/Start=1/Stop=2/Abort=3/Reset=4/Unload=5).
-    pub kind: u8,
-    /// Used length of `slot`.
-    pub slot_len: u8,
-    /// Used length of `occupant` (Load only).
-    pub occ_len: u8,
-    pub _pad: [u8; 5],
-    /// The target slot's name, fixed buffer + length.
-    pub slot: [u8; SLOT_NAME_CAP],
-    /// The occupant name (Load only), fixed buffer + length.
-    pub occupant: [u8; SLOT_NAME_CAP],
-}
-
-impl SlotCommand {
-    fn make(kind: SlotCommandKind, slot: &str, occupant: &str) -> Self {
-        let (slot_buf, slot_len) = pack_name(slot);
-        let (occ_buf, occ_len) = pack_name(occupant);
-        Self {
-            timestamp: Timestamp(0),
-            kind: kind as u8,
-            slot_len,
-            occ_len,
-            _pad: [0; 5],
-            slot: slot_buf,
-            occupant: occ_buf,
-        }
-    }
-
-    /// A `Load` command selecting `occupant` (an allowed-set name) into `slot`.
-    pub fn load(slot: &str, occupant: &str) -> Self {
-        Self::make(SlotCommandKind::Load, slot, occupant)
-    }
-    /// A `Start` command for `slot`.
-    pub fn start(slot: &str) -> Self {
-        Self::make(SlotCommandKind::Start, slot, "")
-    }
-    /// A hard-drop `Stop` command for `slot`.
-    pub fn stop(slot: &str) -> Self {
-        Self::make(SlotCommandKind::Stop, slot, "")
-    }
-    /// A cooperative `Abort` command for `slot`.
-    pub fn abort(slot: &str) -> Self {
-        Self::make(SlotCommandKind::Abort, slot, "")
-    }
-    /// A `Reset` (rebuild) command for `slot`.
-    pub fn reset(slot: &str) -> Self {
-        Self::make(SlotCommandKind::Reset, slot, "")
-    }
-    /// An `Unload` command for `slot`.
-    pub fn unload(slot: &str) -> Self {
-        Self::make(SlotCommandKind::Unload, slot, "")
-    }
-
-    /// The target slot name.
-    pub fn slot_name(&self) -> &str {
-        read_name(&self.slot, self.slot_len)
-    }
-    /// The occupant name (meaningful on `Load`).
-    pub fn occupant_name(&self) -> &str {
-        read_name(&self.occupant, self.occ_len)
-    }
-    fn kind(&self) -> Option<SlotCommandKind> {
-        SlotCommandKind::from_code(self.kind)
-    }
-}
-
-/// Pack a name into a fixed `SLOT_NAME_CAP` buffer + used length (truncating).
+/// Pack a name into a fixed `SLOT_NAME_CAP` buffer + used length (truncating) — used by
+/// the host-side [`SlotStatus`] occupant field.
 fn pack_name(name: &str) -> ([u8; SLOT_NAME_CAP], u8) {
     let bytes = name.as_bytes();
     let n = bytes.len().min(SLOT_NAME_CAP);
     let mut buf = [0u8; SLOT_NAME_CAP];
     buf[..n].copy_from_slice(&bytes[..n]);
     (buf, n as u8)
-}
-
-/// Read a fixed-buffer name back as a `&str` (lossy on non-UTF8 boundaries is avoided —
-/// the writer only ever packs valid UTF-8 prefixes, but a truncation could split a
-/// multibyte char; we fall back to the longest valid prefix).
-fn read_name(buf: &[u8; SLOT_NAME_CAP], len: u8) -> &str {
-    let n = (len as usize).min(SLOT_NAME_CAP);
-    match core::str::from_utf8(&buf[..n]) {
-        Ok(s) => s,
-        Err(e) => core::str::from_utf8(&buf[..e.valid_up_to()]).unwrap_or(""),
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -492,15 +376,6 @@ impl SlotRunner {
         self.emit_event(SequenceEventKind::Loaded { name });
     }
 
-    /// `Unload`: drop the occupant and return to Empty.
-    fn do_unload(&mut self) {
-        self.slot = None;
-        self.selected = None;
-        self.phase = SlotPhase::Empty;
-        self.sync_slot_state();
-        self.emit_event(SequenceEventKind::Unloaded);
-    }
-
     /// Drain every occupant [`SequenceStatus`] record published since the last cycle:
     /// emit a `Progress { detail }` per new progress line (each record carries only the
     /// lines pushed that cycle — the occupant's `drain_progress` empties its buffer on
@@ -631,22 +506,22 @@ impl CyclicSlot for SlotRunner {
         &self.slot_state
     }
 
-    /// Dispatch a runtime command addressed to this slot (the default no-op on the trait
-    /// makes every non-slot `CyclicSlot` ignore it; the coordinator broadcasts each
-    /// drained command to every slot). Filters by name to stay total even though the
-    /// dispatcher already targets by name.
-    fn command(&mut self, cmd: &SlotCommand) {
-        if cmd.slot_name() != self.name {
+    /// Dispatch a runtime [`SequenceCommand`] addressed to this slot (`docs/messages.md` §4.1).
+    /// The default no-op on the trait makes every non-slot `CyclicSlot` ignore it; the
+    /// coordinator broadcasts each drained command to every slot, so this filters by
+    /// **`channel_id`** — the slot's own build-order id, the same id the boot `SequenceRegistry`
+    /// and the panel address. The kind maps straight onto the lifecycle handlers, no
+    /// intermediate type.
+    fn command(&mut self, cmd: &SequenceCommand) {
+        if cmd.channel_id != self.channel_id {
             return;
         }
-        match cmd.kind() {
-            Some(SlotCommandKind::Load) => self.do_load(cmd.occupant_name()),
-            Some(SlotCommandKind::Start) => self.do_start(),
-            Some(SlotCommandKind::Stop) => self.do_stop(),
-            Some(SlotCommandKind::Abort) => self.do_abort(),
-            Some(SlotCommandKind::Reset) => self.do_reset(),
-            Some(SlotCommandKind::Unload) => self.do_unload(),
-            None => {} // unknown kind code: ignore
+        match &cmd.command {
+            SequenceCommandKind::Load { name } => self.do_load(name),
+            SequenceCommandKind::Start => self.do_start(),
+            SequenceCommandKind::Stop => self.do_stop(),
+            SequenceCommandKind::Abort => self.do_abort(),
+            SequenceCommandKind::Reset => self.do_reset(),
         }
     }
 }

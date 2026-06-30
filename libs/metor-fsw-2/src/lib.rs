@@ -52,15 +52,16 @@ pub use writer::{FrameWriter, ListWriter, MapWriter, WriteError};
 pub use binder::{BindPorts, Binder, BoundPort, RingSource};
 pub use coordinator::{
     AllowedOccupant, ClockMode, Coordinator, CoordinatorBuilder, CoordinatorConfig,
-    InitialOccupant, PortRef, SLOT_NAME_CAP, SlotCommand, SlotPhase, SlotState, SlotStatus,
+    InitialOccupant, PortRef, SLOT_NAME_CAP, SlotPhase, SlotState, SlotStatus,
     StopReason, StoppedSystem, SystemHandle, WireError,
 };
 
-// The general output registry and the telemetry downlink (its first consumer).
+// The general output registry and the telemetry downlink (its first consumer) + the uplink
+// command-plane ingest system (its read twin).
 pub use registry::{MessageRegistry, MessageEntry, OutputRegistry, RegistryEntry};
 pub use telemetry::{
     RecvTransport, TcpRecvTransport, TcpTransport, TelemetryConfig, TelemetryMode,
-    TelemetrySystem, Transport, TransportError, connect_once,
+    TelemetrySystem, Transport, TransportError, UplinkSystem,
 };
 
 // The system trait family, the typed port wrappers, self-description, and the
@@ -73,7 +74,7 @@ pub use port::{DEFAULT_DEPTH, FrameRef, Input, Output, buffer_capacity, capacity
 
 // The general message channel — the `(PacketId, postcard)` record format, the
 // type-erased emit port, and its sizing/record helpers (`docs/messages.md` §1, §2).
-pub use message::{MAX_MSG_BYTES, MSG_DEPTH, MsgOut, msg_capacity, split_record};
+pub use message::{MAX_MSG_BYTES, MSG_DEPTH, MsgIn, MsgOut, msg_capacity, split_record};
 pub use system::{
     AsyncSystem, BuildSystem, CyclicRunner, CyclicSystem, Out, System, SystemInput, SystemOutput,
 };
