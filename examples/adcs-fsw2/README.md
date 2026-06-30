@@ -16,11 +16,12 @@ Yang-LQR controller in a closed feedback loop (reusing the `metor-fsw/adcs` math
 The **plant** propagates a real 400 km orbit (point-mass gravity + the orbital velocity) and
 the attitude dynamics, driven by a three-wheel **reaction-wheel** actuator (friction +
 momentum saturation + per-wheel arming). It emits a simulated sensor suite (gyro with bias
-walk, a sun observation, and a dipole-model magnetometer), reaction-wheel telemetry, and the
-ground-truth **body** state (true attitude + body rate + the ECI orbit/GPS position/velocity).
+walk, a sun observation, and a dipole-model magnetometer), reaction-wheel telemetry, the
+ground-truth **body** state (true attitude + body rate + the ECI orbit/GPS position/velocity),
+and the **world** environment — the true ECI sun direction (nox-frames' Vallado model at the
+mission epoch) and magnetic field that the sensors observe.
 
-The **nav** filter models the inertial sun/magnetic references from the body's orbit state and
-runs
+The **nav** filter takes its inertial sun/magnetic references from the `world` frame and runs
 the MEKF. The **ctrl** controller follows the **pointing law** the `mode` slot commands
 (`ModeCmd.law` — Nadir or velocity-vector/HIL), computing its target attitude from the orbit
 state, and produces the body torque that closes the loop back into the plant.
@@ -34,7 +35,7 @@ nadir-pointing safe state).
 
 | Crate | Path | Role |
 |---|---|---|
-| `adcs-contracts` | `contracts/` | The shared compile-time contract: the frame structs (sensors / body / attitude_estimate / mode_cmd / torque_cmd / wheels), the per-system `Params`, and the shared physics (orbital constants, the magnetic-field model, and the Nadir/HIL pointing laws). Linked by the cdylibs (and the test), **not** by the host. |
+| `adcs-contracts` | `contracts/` | The shared compile-time contract: the frame structs (sensors / body / world / attitude_estimate / mode_cmd / torque_cmd / wheels), the per-system `Params`, and the shared physics (orbital constants, the magnetic-field + sun-direction models, and the Nadir/HIL pointing laws). Linked by the cdylibs (and the test), **not** by the host. |
 | `adcs-plant` | `systems/plant/` | The orbiting rigid-body plant + reaction wheels + sensor suite, a `cdylib` ending in `export_system!(PlantSystem)`. |
 | `adcs-nav` | `systems/nav/` | The MEKF filter cdylib (models the sun/mag references from the orbit state). |
 | `adcs-ctrl` | `systems/ctrl/` | The Yang-LQR controller cdylib (selects the pointing-law target from `ModeCmd`). |
@@ -71,8 +72,9 @@ ingests.
    in the component tree. Plot e.g. `nav.attitude_estimate.q_hat_b_eci` against
    `plant.body.q_b_eci` and watch the estimate track truth as the controller slews the
    spacecraft onto the commanded pointing target; `plant.sensors.gyro_b` shows the rate
-   damping, `plant.wheels.momentum_b` the reaction-wheel momentum building up, and
-   `ctrl.torque_cmd.torque_b` the commanded torque. The sequence view shows `commissioning`
+   damping, `plant.wheels.momentum_b` the reaction-wheel momentum building up,
+   `ctrl.torque_cmd.torque_b` the commanded torque, and `plant.world.sun_eci` /
+   `plant.world.mag_eci` the real ECI sun direction and magnetic field. The sequence view shows `commissioning`
    stepping to completion; Load/Start `safe_mode` from there to command nadir safing.
 
 The mission converges in ~30 s of real time. The terminal prints only a heartbeat — the

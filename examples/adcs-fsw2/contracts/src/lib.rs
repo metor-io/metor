@@ -12,6 +12,7 @@
 //! serialized `VTable`s and encodes params from the exported `Params` schema, never linking
 //! a frame or param Rust type.
 
+use hifitime::{Duration, Epoch};
 use metor_fsw_2::metor_proto::types::Timestamp;
 use nox::{ArrayRepr, Quaternion, Vector, tensor};
 use postcard_schema::Schema;
@@ -59,6 +60,25 @@ pub fn mag_field_eci(pos_eci: &V3) -> V3 {
     let pos_norm = pos_eci.norm().into_buf();
     let e_hat = pos_eci.normalize();
     ((EARTH_RADIUS / pos_norm).powi(3)) * (3.0 * k0().dot(&e_hat) * e_hat - k0())
+}
+
+/// The mission start epoch (UTC) the environment models are evaluated against. A **fixed**
+/// constant (not wall-clock) so a `Simulated` run is reproducible — the parity test relies on
+/// the static and dlopen runs computing the identical sun direction.
+pub fn mission_epoch() -> Epoch {
+    Epoch::from_gregorian_utc(2024, 1, 1, 0, 0, 0, 0)
+}
+
+/// The epoch `t_sim_s` seconds into the mission (the plant advances this from a deterministic
+/// per-cycle counter, never wall time).
+pub fn epoch_at(t_sim_s: f64) -> Epoch {
+    mission_epoch() + Duration::from_seconds(t_sim_s)
+}
+
+/// The unit vector pointing at the sun in ECI at `epoch` — the real-world sun direction from
+/// nox-frames' Vallado model, replacing the fixed fake sun direction.
+pub fn sun_dir_eci(epoch: Epoch) -> V3 {
+    nox_frames::earth::sun_vec(epoch)
 }
 
 // ---------------------------------------------------------------------------
@@ -136,6 +156,22 @@ pub struct Wheels {
     pub momentum_b: V3,
     /// Per-wheel applied torque about its body axis (N·m).
     pub torque_b: V3,
+}
+
+/// The true **world** (inertial/ECI) environment at the spacecraft each cycle: the sun
+/// direction and the magnetic field — the inertial references the attitude sensors observe.
+/// Produced by the plant (which knows the true epoch + position) and consumed by nav as its
+/// MEKF references; also telemetered so the real ECI sun/field are visible in the panel.
+#[derive(metor_fsw_2::Frame, IntoBytes, Immutable, KnownLayout, FromBytes, Clone)]
+#[repr(C)]
+#[metor_fsw(name = "world")]
+pub struct World {
+    #[metor_fsw(timestamp)]
+    pub timestamp: Timestamp,
+    /// Unit vector pointing at the sun, in ECI.
+    pub sun_eci: V3,
+    /// Earth magnetic field in ECI (Tesla), the tilted-dipole model at the true position.
+    pub mag_eci: V3,
 }
 
 /// The mission-mode command a slot sequence emits each transition (sequences-slots.md §4):

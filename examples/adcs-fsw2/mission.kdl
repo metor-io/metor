@@ -62,7 +62,7 @@ slot "mode" {
 }
 
 connect "plant" -> "nav"  frame="sensors"
-connect "plant" -> "nav"  frame="body"
+connect "plant" -> "nav"  frame="world"
 connect "plant" -> "ctrl" frame="body"
 connect "nav"   -> "ctrl" frame="attitude_estimate"
 connect "nav"   -> "mode" frame="attitude_estimate"
