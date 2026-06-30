@@ -98,16 +98,22 @@ pub struct AttitudeEstimate {
     pub b_hat_b: V3,
 }
 
-/// The spacecraft's inertial **orbit state** (the GPS product): position and velocity. The
-/// plant propagates a real 400 km orbit (gravity + the orbital velocity), and this frame
-/// feeds both nav (the magnetic-field reference is a function of position) and the
+/// The plant's ground-truth **body state**: the true attitude + body rate and the inertial
+/// orbit state (position/velocity), the spacecraft's real condition each cycle. The plant
+/// propagates a real 400 km orbit (gravity + the orbital velocity); this frame is tapped from
+/// the registry to measure convergence (the truth a `.so`'s statics never reach the host with)
+/// and feeds both nav (the magnetic-field reference is a function of position) and the
 /// controller (the Nadir/HIL pointing-law target is a function of position/velocity).
 #[derive(metor_fsw_2::Frame, IntoBytes, Immutable, KnownLayout, FromBytes, Clone)]
 #[repr(C)]
-#[metor_fsw(name = "orbit_state")]
-pub struct OrbitState {
+#[metor_fsw(name = "body")]
+pub struct BodyState {
     #[metor_fsw(timestamp)]
     pub timestamp: Timestamp,
+    /// True attitude: the body←ECI rotation.
+    pub q_b_eci: Quat,
+    /// True body-frame angular rate (rad/s).
+    pub omega_b: V3,
     /// Inertial (ECI) position (m).
     pub pos_eci: V3,
     /// Inertial (ECI) velocity (m/s).
@@ -197,22 +203,6 @@ pub struct TorqueCmd {
     pub torque_b: V3,
 }
 
-/// Ground-truth attitude + body rate the plant knows (for the convergence assertion).
-/// Produced but, in this graph, not consumed by another system — tapped from the output
-/// registry to measure convergence (dl-open.md §8), which is how the dlopen run is
-/// observed without a process-global shared log (a `.so`'s statics never reach the host).
-#[derive(metor_fsw_2::Frame, IntoBytes, Immutable, KnownLayout, FromBytes, Clone)]
-#[repr(C)]
-#[metor_fsw(name = "truth")]
-pub struct Truth {
-    #[metor_fsw(timestamp)]
-    pub timestamp: Timestamp,
-    /// True attitude: the body←ECI rotation.
-    pub q_true_b_eci: Quat,
-    /// True body-frame angular rate (rad/s).
-    pub omega_true_b: V3,
-}
-
 // ---------------------------------------------------------------------------
 // Pointing laws — the controller target as a function of the orbit state
 // ---------------------------------------------------------------------------
@@ -256,23 +246,23 @@ pub fn target_for(law: u8, pos_eci: &V3, vel_eci: &V3) -> Quat {
 // Convergence sampling (the test reads these off the tapped truth/orbit outputs)
 // ---------------------------------------------------------------------------
 
-/// The convergence sample a [`Truth`] frame yields against the **identity** target:
+/// The convergence sample a [`BodyState`] yields against the **identity** target:
 /// `(attitude_error_rad, body_rate_rad_s)`. Retained for a fixed-target reference.
-pub fn convergence_sample(t: &Truth) -> (f64, f64) {
+pub fn convergence_sample(b: &BodyState) -> (f64, f64) {
     let target = Quat::identity();
-    let err = t.q_true_b_eci.angular_distance(&target).into_buf().abs();
-    let rate = t.omega_true_b.norm().into_buf();
+    let err = b.q_b_eci.angular_distance(&target).into_buf().abs();
+    let rate = b.omega_b.norm().into_buf();
     (err, rate)
 }
 
 /// The convergence sample against the **commanded** pointing-law target: the attitude
-/// tracking error (rad) to the `law`'s target for this orbit state, and the body-rate
+/// tracking error (rad) to the `law`'s target for this body/orbit state, and the body-rate
 /// magnitude (rad/s). This is how the closed loop is judged once the controller points at a
 /// moving (nadir/velocity-vector) target rather than a fixed identity attitude.
-pub fn tracking_sample(truth: &Truth, orbit: &OrbitState, law: u8) -> (f64, f64) {
-    let target = target_for(law, &orbit.pos_eci, &orbit.vel_eci);
-    let err = truth.q_true_b_eci.angular_distance(&target).into_buf().abs();
-    let rate = truth.omega_true_b.norm().into_buf();
+pub fn tracking_sample(body: &BodyState, law: u8) -> (f64, f64) {
+    let target = target_for(law, &body.pos_eci, &body.vel_eci);
+    let err = body.q_b_eci.angular_distance(&target).into_buf().abs();
+    let rate = body.omega_b.norm().into_buf();
     (err, rate)
 }
 
