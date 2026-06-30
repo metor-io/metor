@@ -1,10 +1,13 @@
 // The ADCS closed-loop mission, wired declaratively (dl-open.md §8, cli-runner.md §6).
 //
-//   plant ──sensors / orbit_state──▶ nav ──attitude_estimate──▶ ctrl
-//     ▲                  │                                       ▲ │
-//     │   orbit_state ───┴───────────────────────────────────────┘ │
+//   plant ──sensors / body──▶ nav ──attitude_estimate──▶ ctrl
+//     ▲                  │                                ▲ │
+//     │   body ──────────┴────────────────────────────────┘ │
 //     │                  └──attitude_estimate──▶ mode ──mode_cmd──▶ ctrl
-//     └──────────────────────── torque_cmd ───────────────────────┘   (one-cycle-delayed)
+//     └──────────────────── torque_cmd ────────────────────┘   (one-cycle-delayed)
+//
+// `body` is the plant's ground-truth state (attitude + rate + ECI orbit), tapped for
+// convergence and consumed by nav (mag reference) and ctrl (pointing-law target).
 //
 // Three dlopen'd systems (plant/nav/ctrl), each its own cdylib built against the shared
 // `adcs-contracts`, plus a runtime sequence **slot** `mode` (sequences-slots.md §5): two
@@ -59,8 +62,8 @@ slot "mode" {
 }
 
 connect "plant" -> "nav"  frame="sensors"
-connect "plant" -> "nav"  frame="orbit_state"
-connect "plant" -> "ctrl" frame="orbit_state"
+connect "plant" -> "nav"  frame="body"
+connect "plant" -> "ctrl" frame="body"
 connect "nav"   -> "ctrl" frame="attitude_estimate"
 connect "nav"   -> "mode" frame="attitude_estimate"
 connect "mode"  -> "ctrl" frame="mode_cmd"

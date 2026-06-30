@@ -23,7 +23,7 @@
 use std::cell::RefCell;
 use std::rc::Rc;
 
-use adcs_contracts::{ModeCmd, OrbitState, Truth, tracking_sample};
+use adcs_contracts::{BodyState, ModeCmd, tracking_sample};
 use adcs_ctrl::CtrlSystem;
 use adcs_nav::NavSystem;
 use adcs_plant::PlantSystem;
@@ -76,39 +76,33 @@ fn build_static() -> Coordinator {
     resolve(&wiring, &registry).expect("resolve the mission with static systems")
 }
 
-/// Run `coord` for `cycles`, measuring convergence by tapping the plant's `truth` + `orbit`
-/// outputs and scoring the attitude error against the commanded pointing-law target.
+/// Run `coord` for `cycles`, measuring convergence by tapping the plant's `body` output (the
+/// ground-truth attitude/rate + orbit) and scoring the attitude error against the commanded
+/// pointing-law target.
 ///
-/// A spawned sampler reads both **every** cycle (the loop yields once per cycle under the
+/// A spawned sampler reads it **every** cycle (the loop yields once per cycle under the
 /// `Simulated` clock, so the sampler interleaves 1:1), capturing the whole trajectory. This
 /// works for **both** paths: a dlopen'd plant's host-owned rings are tapped exactly like a
 /// statically-linked one's.
 async fn run_and_measure(mut coord: Coordinator, cycles: usize) -> Measure {
-    let truth_view: Input<Truth> = Input::new(
+    let body_view: Input<BodyState> = Input::new(
         coord
             .registry()
-            .view(ComponentId::new("plant.truth"))
-            .expect("plant.truth is registered")
-            .expect("a reader slot is available"),
-    );
-    let orbit_view: Input<OrbitState> = Input::new(
-        coord
-            .registry()
-            .view(ComponentId::new("plant.orbit_state"))
-            .expect("plant.orbit_state is registered")
+            .view(ComponentId::new("plant.body"))
+            .expect("plant.body is registered")
             .expect("a reader slot is available"),
     );
 
     let samples = Rc::new(RefCell::new(Vec::<(f64, f64)>::new()));
     let captured = samples.clone();
     let sampler = stellarator::spawn(async move {
-        let (mut truth, mut orbit) = (truth_view, orbit_view);
+        let mut body = body_view;
         loop {
             stellarator::yield_now().await;
-            if let (Ok(Some(t)), Ok(Some(o))) = (truth.latest(), orbit.latest()) {
+            if let Ok(Some(b)) = body.latest() {
                 captured
                     .borrow_mut()
-                    .push(tracking_sample(t.get(), o.get(), CONVERGED_LAW));
+                    .push(tracking_sample(b.get(), CONVERGED_LAW));
             }
         }
     })

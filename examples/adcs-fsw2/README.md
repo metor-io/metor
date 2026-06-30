@@ -6,20 +6,21 @@ Yang-LQR controller in a closed feedback loop (reusing the `metor-fsw/adcs` math
 `nox` six-dof dynamics), commissioned by a runtime **sequence slot**.
 
 ```text
-  plant ──sensors / orbit_state──▶ nav ──attitude_estimate──▶ ctrl
-    ▲                  │                                       ▲ │
-    │   orbit_state ───┴─────────────────────────────────────-┘ │
+  plant ──sensors / body──▶ nav ──attitude_estimate──▶ ctrl
+    ▲                  │                                ▲ │
+    │   body ──────────┴────────────────────────────────┘ │
     │                  └──attitude_estimate──▶ mode ──mode_cmd──▶ ctrl
-    └──────────────────────── torque_cmd ───────────────────────┘   (one-cycle-delayed)
+    └──────────────────── torque_cmd ────────────────────┘   (one-cycle-delayed)
 ```
 
 The **plant** propagates a real 400 km orbit (point-mass gravity + the orbital velocity) and
 the attitude dynamics, driven by a three-wheel **reaction-wheel** actuator (friction +
 momentum saturation + per-wheel arming). It emits a simulated sensor suite (gyro with bias
-walk, a sun observation, and a dipole-model magnetometer), the **orbit state** (the GPS
-product), reaction-wheel telemetry, and a ground-`truth` frame.
+walk, a sun observation, and a dipole-model magnetometer), reaction-wheel telemetry, and the
+ground-truth **body** state (true attitude + body rate + the ECI orbit/GPS position/velocity).
 
-The **nav** filter models the inertial sun/magnetic references from the orbit state and runs
+The **nav** filter models the inertial sun/magnetic references from the body's orbit state and
+runs
 the MEKF. The **ctrl** controller follows the **pointing law** the `mode` slot commands
 (`ModeCmd.law` — Nadir or velocity-vector/HIL), computing its target attitude from the orbit
 state, and produces the body torque that closes the loop back into the plant.
@@ -33,7 +34,7 @@ nadir-pointing safe state).
 
 | Crate | Path | Role |
 |---|---|---|
-| `adcs-contracts` | `contracts/` | The shared compile-time contract: the frame structs (sensors / orbit_state / attitude_estimate / mode_cmd / torque_cmd / wheels / truth), the per-system `Params`, and the shared physics (orbital constants, the magnetic-field model, and the Nadir/HIL pointing laws). Linked by the cdylibs (and the test), **not** by the host. |
+| `adcs-contracts` | `contracts/` | The shared compile-time contract: the frame structs (sensors / body / attitude_estimate / mode_cmd / torque_cmd / wheels), the per-system `Params`, and the shared physics (orbital constants, the magnetic-field model, and the Nadir/HIL pointing laws). Linked by the cdylibs (and the test), **not** by the host. |
 | `adcs-plant` | `systems/plant/` | The orbiting rigid-body plant + reaction wheels + sensor suite, a `cdylib` ending in `export_system!(PlantSystem)`. |
 | `adcs-nav` | `systems/nav/` | The MEKF filter cdylib (models the sun/mag references from the orbit state). |
 | `adcs-ctrl` | `systems/ctrl/` | The Yang-LQR controller cdylib (selects the pointing-law target from `ModeCmd`). |
@@ -68,7 +69,7 @@ ingests.
    connections (docs/messages.md §4.5) — both point at the same metor-db endpoint.
 3. In the panel, the `plant` / `nav` / `ctrl` / `mode` (and `coordinator`) instances appear
    in the component tree. Plot e.g. `nav.attitude_estimate.q_hat_b_eci` against
-   `plant.truth.q_true_b_eci` and watch the estimate track truth as the controller slews the
+   `plant.body.q_b_eci` and watch the estimate track truth as the controller slews the
    spacecraft onto the commanded pointing target; `plant.sensors.gyro_b` shows the rate
    damping, `plant.wheels.momentum_b` the reaction-wheel momentum building up, and
    `ctrl.torque_cmd.torque_b` the commanded torque. The sequence view shows `commissioning`

@@ -9,7 +9,7 @@
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
 
 use adcs_contracts::{
-    AttitudeEstimate, CtrlParams, ModeCmd, OrbitState, TorqueCmd, inertia_diag, target_for,
+    AttitudeEstimate, BodyState, CtrlParams, ModeCmd, TorqueCmd, inertia_diag, target_for,
 };
 use metor_fsw_2::metor_proto::types::Timestamp;
 use metor_fsw_2::ring::{Backing, BoxBacking};
@@ -27,7 +27,7 @@ pub struct CtrlSystem {
 #[derive(SystemInput)]
 pub struct CtrlIn<B: Backing = BoxBacking> {
     pub estimate: Input<AttitudeEstimate, B>,
-    pub orbit: Input<OrbitState, B>,
+    pub body: Input<BodyState, B>,
     pub mode: Input<ModeCmd, B>,
 }
 
@@ -64,12 +64,12 @@ impl<B: Backing> CyclicSystem<B> for CtrlSystem {
             self.law = Some(m.get().law);
         }
 
-        // Select the target attitude from the law + the current orbit state; identity until
-        // a law and an orbit sample are both available.
-        let target = match (self.law, input.orbit.latest()) {
-            (Some(law), Ok(Some(orbit))) => {
-                let orbit = orbit.get();
-                target_for(law, &orbit.pos_eci, &orbit.vel_eci)
+        // Select the target attitude from the law + the current body/orbit state; identity
+        // until a law and a body sample are both available.
+        let target = match (self.law, input.body.latest()) {
+            (Some(law), Ok(Some(body))) => {
+                let body = body.get();
+                target_for(law, &body.pos_eci, &body.vel_eci)
             }
             _ => Quaternion::identity(),
         };

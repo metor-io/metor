@@ -7,7 +7,7 @@
 
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
 
-use adcs_contracts::{AttitudeEstimate, DT, NavParams, OrbitState, Sensors, V3, mag_field_eci};
+use adcs_contracts::{AttitudeEstimate, BodyState, DT, NavParams, Sensors, V3, mag_field_eci};
 use metor_fsw_2::metor_proto::types::Timestamp;
 use metor_fsw_2::ring::{Backing, BoxBacking};
 use metor_fsw_2::{
@@ -23,7 +23,7 @@ pub struct NavSystem {
 #[derive(SystemInput)]
 pub struct NavIn<B: Backing = BoxBacking> {
     pub sensors: Input<Sensors, B>,
-    pub orbit: Input<OrbitState, B>,
+    pub body: Input<BodyState, B>,
 }
 
 #[derive(SystemOutput)]
@@ -58,8 +58,8 @@ impl<B: Backing> CyclicSystem<B> for NavSystem {
         // Model the inertial (ECI) references from the orbit state (cube-sat
         // `Nav::from_sensors`): a fixed sun direction and the dipole field at the position.
         let sun_eci: V3 = tensor![0.0, 0.0, 1.0];
-        let mag_eci: V3 = match input.orbit.latest() {
-            Ok(Some(orbit)) => mag_field_eci(&orbit.get().pos_eci).normalize(),
+        let mag_eci: V3 = match input.body.latest() {
+            Ok(Some(body)) => mag_field_eci(&body.get().pos_eci).normalize(),
             _ => tensor![1.0, 0.0, 0.0],
         };
 

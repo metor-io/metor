@@ -14,8 +14,8 @@
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
 
 use adcs_contracts::{
-    ALTITUDE, DT, EARTH_RADIUS, G, M, MASS, OrbitState, PlantParams, Sensors, TorqueCmd, Truth, V3,
-    Wheels, inertia_diag, mag_field_eci,
+    ALTITUDE, BodyState, DT, EARTH_RADIUS, G, M, MASS, PlantParams, Sensors, TorqueCmd, V3, Wheels,
+    inertia_diag, mag_field_eci,
 };
 use metor_fsw_2::metor_proto::types::Timestamp;
 use metor_fsw_2::ring::{Backing, BoxBacking};
@@ -143,9 +143,8 @@ pub struct PlantIn<B: Backing = BoxBacking> {
 #[derive(SystemOutput)]
 pub struct PlantOut<B: Backing = BoxBacking> {
     pub sensors: Output<Sensors, B>,
-    pub orbit: Output<OrbitState, B>,
     pub wheels: Output<Wheels, B>,
-    pub truth: Output<Truth, B>,
+    pub body: Output<BodyState, B>,
 }
 
 impl PlantSystem {
@@ -242,11 +241,6 @@ impl<B: Backing> CyclicSystem<B> for PlantSystem {
             sun_b,
             mag_b,
         });
-        let _ = o.orbit.write(&OrbitState {
-            timestamp: now,
-            pos_eci,
-            vel_eci,
-        });
         // Per-wheel telemetry (each wheel is axis-aligned, so its scalar value sits on the
         // wheel's own body axis).
         let proj = |f: &dyn Fn(&ReactionWheel) -> V3| -> V3 {
@@ -262,10 +256,13 @@ impl<B: Backing> CyclicSystem<B> for PlantSystem {
             momentum_b: proj(&|w| w.ang_momentum),
             torque_b: proj(&|w| w.torque),
         });
-        let _ = o.truth.write(&Truth {
+        // The ground-truth body state: attitude + rate (truth) and the orbit (GPS) together.
+        let _ = o.body.write(&BodyState {
             timestamp: now,
-            q_true_b_eci: q_b_eci,
-            omega_true_b: omega_b_true,
+            q_b_eci,
+            omega_b: omega_b_true,
+            pos_eci,
+            vel_eci,
         });
 
         // Integrate the body forward one step under gravity + the net wheel torque.
