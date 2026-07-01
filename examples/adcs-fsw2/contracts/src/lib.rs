@@ -140,22 +140,139 @@ pub struct BodyState {
     pub vel_eci: V3,
 }
 
-/// Reaction-wheel telemetry: per-wheel speed, stored angular momentum, and applied torque
-/// (each wheel is body-axis-aligned, so the i-th element is wheel i, on body axis i). The
-/// wheels are the plant's actuator — this frame is telemetered (fan-out 0) so the panel can
-/// plot the momentum building up as the spacecraft detumbles.
+/// One body-axis-aligned reaction wheel — the plant's actuator **and** its telemetry, one and
+/// the same struct. It integrates its stored angular momentum under the commanded set point,
+/// with Stribeck/Coulomb/viscous friction and a momentum-saturation clamp; a disarmed wheel
+/// applies no torque (the `--disarmed` / safing gate). Ported from cube-sat `ReactionWheel`.
+#[derive(
+    metor_fsw_2::AsVTable,
+    metor_fsw_2::Metadatatize,
+    metor_fsw_2::Componentize,
+    metor_fsw_2::Decomponentize,
+    IntoBytes,
+    Immutable,
+    KnownLayout,
+    FromBytes,
+    Clone,
+    Debug,
+)]
+#[repr(C)]
+pub struct ReactionWheel {
+    /// Body-frame spin axis (a unit vector; body axis i for wheel i).
+    pub axis: V3,
+    /// Stored angular momentum about the spin axis (N·m·s).
+    pub ang_momentum: V3,
+    /// The commanded torque set point (the projection of the control torque onto `axis`).
+    pub torque_set_point: V3,
+    /// The torque actually applied this step (after saturation/clamp), N·m.
+    pub torque: V3,
+    /// Wheel speed (rad/s).
+    pub speed: f64,
+    /// Modeled friction torque (N·m) — telemetered, not fed into the dynamics (cube-sat parity).
+    pub friction: f64,
+    /// `1` armed, `0` disarmed (offline — applies no control torque).
+    pub arm: u8,
+    _pad: [u8; 7],
+}
+
+impl ReactionWheel {
+    /// A wheel on `axis`, armed or disarmed at boot.
+    pub fn new(axis: V3, arm: bool) -> Self {
+        Self {
+            axis,
+            ang_momentum: V3::zeros(),
+            torque_set_point: V3::zeros(),
+            torque: V3::zeros(),
+            speed: 0.0,
+            friction: 0.0,
+            arm: arm as u8,
+            _pad: [0; 7],
+        }
+    }
+
+    /// Whether the wheel is armed (online).
+    pub fn armed(&self) -> bool {
+        self.arm != 0
+    }
+
+    fn moment_of_inertia(&self) -> f64 {
+        0.185 * (0.05 / 2.0_f64).powi(2) / 2.0
+    }
+
+    fn update_speed(&mut self) {
+        let i = self.moment_of_inertia();
+        let momentum_norm: f64 = self.ang_momentum.norm().into_buf();
+        self.speed = momentum_norm / i;
+    }
+
+    /// Friction torque (the cube-sat `rw_drag`): Stribeck near zero speed, Coulomb + viscous
+    /// otherwise.
+    fn friction_torque(&self) -> f64 {
+        let static_fric = 0.0005;
+        let columb_fric = 0.0005;
+        let stribeck_coef = 0.0005;
+        let cv = 0.00005;
+        let omega_limit = 0.1;
+        let speed = self.speed;
+
+        let stribeck_torque = -(2.0 * std::f64::consts::E).sqrt()
+            * (static_fric - columb_fric)
+            * (-((speed / stribeck_coef).powi(2))).exp()
+            - columb_fric * (10.0 * speed / stribeck_coef).tanh()
+            - cv * speed;
+
+        let torque_norm: f64 = self.torque_set_point.norm().into_buf();
+        let use_stribeck =
+            speed.abs() < 0.01 * omega_limit && speed.signum() == torque_norm.signum();
+
+        if use_stribeck {
+            stribeck_torque
+        } else {
+            -columb_fric * speed.signum() - cv * speed
+        }
+    }
+
+    /// Advance the wheel one step: integrate momentum under the set point (gated by arm and
+    /// by the 0.04 momentum-saturation limit), clamp the applied torque, and update speed.
+    pub fn update(&mut self) {
+        if !self.armed() {
+            self.torque = V3::zeros();
+            self.friction = self.friction_torque();
+            self.update_speed();
+            return;
+        }
+
+        let rw_force_clamp = 0.002;
+
+        let new_ang_momentum = self.ang_momentum + self.torque_set_point * DT;
+        let new_momentum_norm: f64 = new_ang_momentum.norm().into_buf();
+        let torque = if new_momentum_norm < 0.04 {
+            self.torque_set_point
+        } else {
+            V3::zeros()
+        };
+
+        let clamped_torque =
+            V3::from_buf(torque.into_buf().map(|t| t.clamp(-rw_force_clamp, rw_force_clamp)));
+
+        self.ang_momentum = self.ang_momentum + clamped_torque * DT;
+        self.friction = self.friction_torque();
+        self.torque = clamped_torque;
+        self.update_speed();
+    }
+}
+
+/// Reaction-wheel telemetry: the three wheels themselves (each body-axis-aligned, element i on
+/// body axis i). The wheels are the plant's actuator; this is the same `[ReactionWheel; 3]` the
+/// plant integrates, telemetered directly so the panel can plot each wheel's momentum/torque.
 #[derive(metor_fsw_2::Frame, IntoBytes, Immutable, KnownLayout, FromBytes, Clone)]
 #[repr(C)]
 #[metor_fsw(name = "wheels")]
 pub struct Wheels {
     #[metor_fsw(timestamp)]
     pub timestamp: Timestamp,
-    /// Per-wheel angular speed (rad/s); element i is the body-axis-i wheel.
-    pub speed: V3,
-    /// Per-wheel stored angular momentum about its body axis (N·m·s).
-    pub momentum_b: V3,
-    /// Per-wheel applied torque about its body axis (N·m).
-    pub torque_b: V3,
+    #[metor_fsw(nest)]
+    pub wheels: [ReactionWheel; 3],
 }
 
 /// The true **world** (inertial/ECI) environment at the spacecraft each cycle: the sun

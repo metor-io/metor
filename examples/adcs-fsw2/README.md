@@ -72,7 +72,7 @@ ingests.
    in the component tree. Plot e.g. `nav.attitude_estimate.q_hat_b_eci` against
    `plant.body.q_b_eci` and watch the estimate track truth as the controller slews the
    spacecraft onto the commanded pointing target; `plant.sensors.gyro_b` shows the rate
-   damping, `plant.wheels.momentum_b` the reaction-wheel momentum building up,
+   damping, `plant.wheels.0.ang_momentum` a reaction wheel's momentum building up,
    `ctrl.torque_cmd.torque_b` the commanded torque, and `plant.world.sun_eci` /
    `plant.world.mag_eci` the real ECI sun direction and magnetic field. The sequence view shows `commissioning`
    stepping to completion; Load/Start `safe_mode` from there to command nadir safing.

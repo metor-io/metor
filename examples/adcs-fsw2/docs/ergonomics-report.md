@@ -134,11 +134,31 @@ publicly mutable and on every `Params` deriving `FromKdlNode` (§5).
 path, or a static-sequence/slot API, so this is a first-class testing affordance rather than a
 field-poking trick.
 
-## 7. Smaller notes
+## 7. Nested component structs are awkward in a metor-fsw-2-only crate
 
-- **Frame fan-out 0 is fine but undocumented as a pattern.** `truth` and `wheels` are emitted
-  purely for the registry/telemetry tap with no edge consumer; this works but a reader has to
-  infer it. A short note (or a `#[telemetry_only]` marker) would help.
+Sharing one `ReactionWheel` struct as both the plant's internal state and its telemetry (a
+`[ReactionWheel; 3]` field on the `wheels` frame) hit two framework gaps:
+
+- **The component sub-derives target `::metor_fsw`, not `::metor_fsw-2`.** A nested component
+  type (one that is *not* a top-level `Frame`) must derive `AsVTable`/`Metadatatize`/
+  `Componentize`/`Decomponentize` standalone, and those derives expand to `::metor_fsw` paths
+  (`metor_fsw_crate_name()` hard-`expect`s `metor-fsw` in `Cargo.toml`). `#[derive(Frame)]`
+  bundles them with `::metor_fsw-2` paths, but there is no fsw2-flavored *standalone* derive —
+  so a schema crate that otherwise depends only on `metor-fsw-2` must add a `metor-fsw`
+  dependency purely to derive a nested component. **Recommendation:** a fsw2 `#[derive(Component)]`
+  (or re-exported fsw2-pathed sub-derives) so a nested group needs no fsw1 dependency.
+- **`Componentize`/`Decomponentize` had no array impl.** `AsVTable`/`Metadatatize` already
+  implement `[T; N]` (indexing `field.i.*`), but the columnar `com_de` traits did not, so a
+  `[Struct; N]` frame field would not compile even though the VTable side supports it. Added the
+  two array impls (mirroring the existing tuple impls) in `metor-proto/src/com_de.rs`. Like a
+  same-typed tuple they are index-lossy on the columnar path (unused here — the ring path is raw
+  bytes + VTable), but they complete the set so arrays-of-structs are usable as frame fields.
+
+## 8. Smaller notes
+
+- **Frame fan-out 0 is fine but undocumented as a pattern.** `body` and `wheels` are emitted
+  for the registry/telemetry tap (and `body` is also consumed); a frame with no edge consumer
+  works but a reader has to infer it. A short note (or a `#[telemetry_only]` marker) would help.
 - **Pointing-law singularity is the app's problem, correctly.** The shortest-arc target
   degenerates when the pointing direction is anti-parallel to the body axis (the velocity-
   vector law at orbit injection); the `target_for` NaN-guard handles it. Nothing for the

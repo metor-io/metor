@@ -14,8 +14,8 @@
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
 
 use adcs_contracts::{
-    ALTITUDE, BodyState, DT, EARTH_RADIUS, G, M, MASS, PlantParams, Sensors, TorqueCmd, V3, Wheels,
-    World, epoch_at, inertia_diag, mag_field_eci, sun_dir_eci,
+    ALTITUDE, BodyState, DT, EARTH_RADIUS, G, M, MASS, PlantParams, ReactionWheel, Sensors,
+    TorqueCmd, V3, Wheels, World, epoch_at, inertia_diag, mag_field_eci, sun_dir_eci,
 };
 use metor_fsw_2::metor_proto::types::Timestamp;
 use metor_fsw_2::ring::{Backing, BoxBacking};
@@ -30,103 +30,9 @@ use rand::SeedableRng;
 use rand::rngs::StdRng;
 use rand_distr::{Distribution, Normal};
 
-/// One body-axis-aligned reaction wheel: integrates its stored angular momentum under the
-/// commanded set point, with Stribeck/Coulomb/viscous friction and a momentum-saturation
-/// clamp. A disarmed wheel applies no torque (the `--disarmed` / safing gate). Ported from
-/// cube-sat `ReactionWheel`.
-struct ReactionWheel {
-    axis: V3,
-    speed: f64,
-    ang_momentum: V3,
-    torque_set_point: V3,
-    torque: V3,
-    arm: bool,
-}
-
-impl ReactionWheel {
-    fn new(axis: V3, arm: bool) -> Self {
-        Self {
-            axis,
-            speed: 0.0,
-            ang_momentum: V3::zeros(),
-            torque_set_point: V3::zeros(),
-            torque: V3::zeros(),
-            arm,
-        }
-    }
-
-    fn moment_of_inertia(&self) -> f64 {
-        0.185 * (0.05 / 2.0_f64).powi(2) / 2.0
-    }
-
-    fn update_speed(&mut self) {
-        let i = self.moment_of_inertia();
-        let momentum_norm: f64 = self.ang_momentum.norm().into_buf();
-        self.speed = momentum_norm / i;
-    }
-
-    /// Friction torque (the cube-sat `rw_drag`): Stribeck near zero speed, Coulomb + viscous
-    /// otherwise. Kept for fidelity with the cube-sat wheel model, which computes friction but
-    /// (per its `// TODO: add friction`) does not yet feed it back into the dynamics either.
-    #[allow(dead_code)]
-    fn friction_torque(&self) -> f64 {
-        let static_fric = 0.0005;
-        let columb_fric = 0.0005;
-        let stribeck_coef = 0.0005;
-        let cv = 0.00005;
-        let omega_limit = 0.1;
-        let speed = self.speed;
-
-        let stribeck_torque = -(2.0 * std::f64::consts::E).sqrt()
-            * (static_fric - columb_fric)
-            * (-((speed / stribeck_coef).powi(2))).exp()
-            - columb_fric * (10.0 * speed / stribeck_coef).tanh()
-            - cv * speed;
-
-        let torque_norm: f64 = self.torque_set_point.norm().into_buf();
-        let use_stribeck =
-            speed.abs() < 0.01 * omega_limit && speed.signum() == torque_norm.signum();
-
-        if use_stribeck {
-            stribeck_torque
-        } else {
-            -columb_fric * speed.signum() - cv * speed
-        }
-    }
-
-    /// Advance the wheel one step: integrate momentum under the set point (gated by arm and
-    /// by the 0.04 momentum-saturation limit), clamp the applied torque, and update speed.
-    fn update(&mut self) {
-        if !self.arm {
-            self.torque = V3::zeros();
-            self.update_speed();
-            return;
-        }
-
-        let rw_force_clamp = 0.002;
-
-        let new_ang_momentum = self.ang_momentum + self.torque_set_point * DT;
-        let new_momentum_norm: f64 = new_ang_momentum.norm().into_buf();
-        let torque = if new_momentum_norm < 0.04 {
-            self.torque_set_point
-        } else {
-            V3::zeros()
-        };
-
-        let clamped_torque = V3::from_buf(
-            torque
-                .into_buf()
-                .map(|t| t.clamp(-rw_force_clamp, rw_force_clamp)),
-        );
-
-        self.ang_momentum = self.ang_momentum + clamped_torque * DT;
-        self.torque = clamped_torque;
-        self.update_speed();
-    }
-}
-
 /// The rigid-body plant: an orbiting spacecraft whose attitude is driven by three reaction
-/// wheels, emitting a noisy sensor suite.
+/// wheels, emitting a noisy sensor suite. The wheels are the shared [`ReactionWheel`] contract
+/// type — the same struct the `wheels` telemetry frame carries.
 pub struct PlantSystem {
     body: Body,
     wheels: [ReactionWheel; 3],
@@ -254,20 +160,10 @@ impl<B: Backing> CyclicSystem<B> for PlantSystem {
             sun_eci,
             mag_eci,
         });
-        // Per-wheel telemetry (each wheel is axis-aligned, so its scalar value sits on the
-        // wheel's own body axis).
-        let proj = |f: &dyn Fn(&ReactionWheel) -> V3| -> V3 {
-            let mut v = [0.0; 3];
-            for (i, w) in self.wheels.iter().enumerate() {
-                v[i] = w.axis.dot(&f(w)).into_buf();
-            }
-            V3::from_buf(v)
-        };
+        // Per-wheel telemetry — the wheels themselves, the same structs the plant integrates.
         let _ = o.wheels.write(&Wheels {
             timestamp: now,
-            speed: V3::from_buf([self.wheels[0].speed, self.wheels[1].speed, self.wheels[2].speed]),
-            momentum_b: proj(&|w| w.ang_momentum),
-            torque_b: proj(&|w| w.torque),
+            wheels: self.wheels.clone(),
         });
         // The ground-truth body state: attitude + rate (truth) and the orbit (GPS) together.
         let _ = o.body.write(&BodyState {
