@@ -49,7 +49,7 @@ pub use writer::{FrameWriter, ListWriter, MapWriter, WriteError};
 
 // The coordinator: builder, graph wiring, the run-phase lifecycle, and the
 // `bind`/`Binder` port-construction contract.
-pub use binder::{BindPorts, Binder, BoundPort, RingSource};
+pub use binder::{BindPorts, Binder, BoundInput, BoundPort, RingSource};
 pub use coordinator::{
     AllowedOccupant, ClockMode, Coordinator, CoordinatorBuilder, CoordinatorConfig,
     InitialOccupant, PortRef, SLOT_NAME_CAP, SlotPhase, SlotState, SlotStatus,

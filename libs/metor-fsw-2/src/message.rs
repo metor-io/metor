@@ -139,16 +139,19 @@ where
 /// on a heterogeneous channel is skipped, and a lapped view resyncs to the live edge (the
 /// in-FSW analogue of the downlink message tap's `resync`, `src/telemetry/mod.rs`).
 ///
-/// v1's consumer is the coordinator's command-bus drain (one `MsgIn<SequenceCommand>` per
-/// command channel); the user-bundle/binder path is the deferred [`bind`](Self::bind) seam,
-/// symmetric to [`MsgOut::bind`].
+/// A message input may have **several producers** (`docs/message-wiring.md` §3.2/§3.3):
+/// fan-in is legal (many emitters → one command consumer), so the port holds **K views**,
+/// one per wired producer edge, and [`drain`](Self::drain) drains them all. A cyclic
+/// consumer holds the producer views directly (generalizing the coordinator's
+/// `command_sources: Vec<MsgIn>`); an async consumer holds one view over a private merge
+/// ring (WP4). K = 1 is the common single-producer case; K = 0 is a legal unconnected input.
 pub struct MsgIn<M, B = BoxBacking, RD = NoWake, RS = NoWake>
 where
     B: Backing,
     RD: WakeSink,
     RS: WakeSource,
 {
-    view: View<B, RD, RS>,
+    views: Vec<View<B, RD, RS>>,
     /// A reused record buffer, so a per-cycle drain grows in place rather than allocating —
     /// the [`MsgOut`] `scratch` mirror.
     scratch: Vec<u8>,
@@ -162,39 +165,78 @@ where
     RD: WakeSink,
     RS: WakeSource,
 {
-    /// Wrap a [`View`] the coordinator/registry claimed over a [`msg_capacity`]-sized byte
-    /// ring (the message twin of [`Input::new`](crate::Input)).
+    /// Wrap a single [`View`] the coordinator/registry claimed over a [`msg_capacity`]-sized
+    /// byte ring (the message twin of [`Input::new`](crate::Input), the K = 1 case).
     pub fn new(view: View<B, RD, RS>) -> Self {
+        Self::from_views(vec![view])
+    }
+
+    /// Wrap K producer [`View`]s (the fan-in case — many emitters into one input).
+    pub fn from_views(views: Vec<View<B, RD, RS>>) -> Self {
         Self {
-            view,
+            views,
             scratch: Vec::new(),
             _marker: PhantomData,
         }
     }
 
-    /// Drain every record committed since the last call, decoding each `M::ID` record and
-    /// handing the decoded payload to `f` in commit order. Records of a different id (a
-    /// heterogeneous channel) and records that fail to postcard-decode are skipped. A lapped
-    /// view resyncs to the live edge and the drain stops for this pass (best-effort, like the
-    /// message-log downlink — `docs/messages.md` §3).
+    /// This port's static descriptor — same edge key as the [`MsgOut<M>`](MsgOut) it consumes.
+    pub fn descriptor() -> PortDesc {
+        PortDesc::msg::<M>()
+    }
+
+    /// Drain every record committed since the last call across **all** producer views,
+    /// decoding each `M::ID` record and handing the decoded payload to `f`. Per-producer
+    /// order is preserved; the cross-producer interleave is arbitrary (and irrelevant — each
+    /// record self-addresses). Records of a different id (a heterogeneous channel) and records
+    /// that fail to postcard-decode are skipped. A lapped view resyncs to the live edge and
+    /// that view's drain stops for this pass (best-effort, like the message-log downlink —
+    /// `docs/messages.md` §3).
     pub fn drain(&mut self, mut f: impl FnMut(M)) {
-        loop {
-            match self.view.try_read_into(&mut self.scratch) {
-                Ok(true) => {
-                    if let Some((id, payload)) = split_record(&self.scratch)
-                        && id == M::ID
-                        && let Ok(msg) = postcard::from_bytes::<M>(payload)
-                    {
-                        f(msg);
+        for view in &mut self.views {
+            loop {
+                match view.try_read_into(&mut self.scratch) {
+                    Ok(true) => {
+                        if let Some((id, payload)) = split_record(&self.scratch)
+                            && id == M::ID
+                            && let Ok(msg) = postcard::from_bytes::<M>(payload)
+                        {
+                            f(msg);
+                        }
                     }
-                }
-                Ok(false) => return,
-                Err(_) => {
-                    self.view.resync();
-                    return;
+                    Ok(false) => break,
+                    Err(_) => {
+                        view.resync();
+                        break;
+                    }
                 }
             }
         }
+    }
+}
+
+impl<M, B, RD, RS> MsgIn<M, B, RD, RS>
+where
+    M: Msg + DeserializeOwned,
+    B: Backing,
+    RD: WakeSink + Default + Clone + 'static,
+    RS: WakeSource + Default + Clone + 'static,
+{
+    /// Bind this port over **every** producer ring wired to the next message input — the
+    /// [`Input::bind`](crate::Input) mirror, but claiming the fan-in list
+    /// ([`next_input_fanin`](RingSource::next_input_fanin)). An empty list is a legal,
+    /// unconnected message input (drains nothing). Walked by the derive when a `MsgIn<M>` is
+    /// declared in a `SystemInput` bundle.
+    pub fn bind<S: RingSource<B = B>>(src: &mut S) -> Self {
+        let rings = src.next_input_fanin::<RD, RS>();
+        let views = rings
+            .into_iter()
+            .map(|(ring, data, space)| {
+                ring.view(data, space)
+                    .expect("message input reader slot (sized at build)")
+            })
+            .collect();
+        Self::from_views(views)
     }
 }
 
@@ -360,6 +402,53 @@ mod tests {
         let mut again = 0;
         inbox.drain(|_| again += 1);
         assert_eq!(again, 0);
+    }
+
+    /// A fan-in `MsgIn` (`from_views`) drains **every** producer view: two emitters on two
+    /// rings, one `MsgIn<SequenceCommand>` over both views, yields all records
+    /// (`docs/message-wiring.md` §3.3). This is the multi-view path WP4 wires as message edges.
+    #[test]
+    fn msg_in_fans_in_multiple_views() {
+        let mk = || {
+            RingBuffer::create_in_memory(Config {
+                capacity: msg_capacity(MAX_MSG_BYTES, MSG_DEPTH),
+                max_readers: 4,
+                overrun: Overrun::Overwrite,
+            })
+        };
+        let ring_a = mk();
+        let ring_b = mk();
+        let mut out_a: MsgOut<SequenceCommand> = MsgOut::new(ring_a.writer(NoWake, NoWake));
+        let mut out_b: MsgOut<SequenceCommand> = MsgOut::new(ring_b.writer(NoWake, NoWake));
+        // Two producer views into one input (the fan-in shape).
+        let mut inbox: MsgIn<SequenceCommand> = MsgIn::from_views(vec![
+            ring_a.view(NoWake, NoWake).expect("slot a"),
+            ring_b.view(NoWake, NoWake).expect("slot b"),
+        ]);
+
+        out_a
+            .emit(&SequenceCommand {
+                channel_id: 1,
+                command: SequenceCommandKind::Start,
+            })
+            .expect("emit a");
+        out_b
+            .emit(&SequenceCommand {
+                channel_id: 2,
+                command: SequenceCommandKind::Stop,
+            })
+            .expect("emit b");
+
+        let mut got: Vec<u64> = Vec::new();
+        inbox.drain(|c| got.push(c.channel_id));
+        got.sort_unstable();
+        assert_eq!(got, vec![1, 2], "both producers' records are drained");
+
+        // An empty fan-in (unconnected input) drains nothing.
+        let mut empty: MsgIn<SequenceCommand> = MsgIn::from_views(vec![]);
+        let mut n = 0;
+        empty.drain(|_| n += 1);
+        assert_eq!(n, 0);
     }
 
     /// `split_record` rejects a record too short to carry a 2-byte id.

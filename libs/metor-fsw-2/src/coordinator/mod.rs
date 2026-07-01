@@ -33,7 +33,7 @@ use stellarator::sync::WaitQueue;
 use stellarator::{JoinHandle, JoinHandleDropGuard};
 use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
 
-use crate::binder::{BindPorts, Binder, BoundPort};
+use crate::binder::{BindPorts, Binder, BoundInput, BoundPort};
 use crate::descriptor::compatible;
 use crate::descriptor::{Hz, PortDesc, PortId, SystemDescriptor, SystemKind};
 use crate::dynamic::FrameList;
@@ -1226,16 +1226,19 @@ impl CoordinatorBuilder {
                         .map(|out_idx| BoundPort::new(output_rings[id][out_idx].clone()))
                         .collect();
                     // Inputs: cyclic consumers view the producer's output directly; async
-                    // consumers view their private copy-in buffer with the matched wake.
-                    let ins: Vec<BoundPort> = (0..self.descs[id].inputs.len())
+                    // consumers view their private copy-in buffer with the matched wake. Every
+                    // input is a frame port here (`BoundInput::One`); message fan-in
+                    // (`BoundInput::Many`) arrives with message edges (WP4).
+                    let ins: Vec<BoundInput> = (0..self.descs[id].inputs.len())
                         .map(|in_idx| {
                             let (prod_id, out_idx) = cons_edge[&(id, in_idx)];
-                            if self.kinds[id] == SystemKind::Async {
+                            let port = if self.kinds[id] == SystemKind::Async {
                                 let (ring, data, space) = private_inputs[&(id, in_idx)].clone();
                                 BoundPort::matched(ring, Box::new(data), Box::new(space))
                             } else {
                                 BoundPort::new(output_rings[prod_id][out_idx].clone())
-                            }
+                            };
+                            BoundInput::One(port)
                         })
                         .collect();
 
