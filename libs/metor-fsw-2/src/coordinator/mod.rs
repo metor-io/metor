@@ -271,11 +271,6 @@ pub(crate) trait CyclicSlot {
     fn shutdown(&mut self);
     fn name(&self) -> &'static str;
     fn state(&self) -> &SlotState;
-    /// Apply a runtime [`SequenceCommand`] (`docs/messages.md` §4.1). The default is a **no-op**
-    /// so static [`CyclicRunner`](crate::CyclicRunner) / build-time [`DlSlot`](crate::dl)
-    /// slots ignore the per-cycle command broadcast; only a [`SlotRunner`](slot::SlotRunner)
-    /// overrides it, filtering by its own `channel_id`.
-    fn command(&mut self, _cmd: &SequenceCommand) {}
 }
 
 // ---------------------------------------------------------------------------
@@ -806,6 +801,14 @@ impl CoordinatorBuilder {
     pub fn build(mut self) -> Result<Coordinator, WireError> {
         let n = self.descs.len();
         let depth = self.config.default_depth;
+        // Every slot reads every command producer (the coordinator-collected fan-out,
+        // `docs/message-wiring.md` §6): each `SequenceCommand` ring is viewed by all `n_slots`
+        // slots, so their `max_readers` must reserve that many.
+        let n_slots = self
+            .regs
+            .iter()
+            .filter(|r| matches!(r, Reg::Slot(_)))
+            .count();
 
         // --- Validate edges, build the connection map ------------------------
         // (cons_id, in_idx) -> (prod_id, out_idx) — FRAME inputs (exactly one producer).
@@ -952,10 +955,17 @@ impl CoordinatorBuilder {
                     PortKind::Message { telemetered } => {
                         // A wired message output: variable-record sizing, indexed in the
                         // `MessageRegistry` so the downlink/`AllOutputs` taps it (unless the port
-                        // opted out via `telemetered = false`, e.g. a command channel, §6.4).
+                        // opted out via `telemetered = false`, e.g. a command channel, §6.4). A
+                        // `SequenceCommand` output is a command producer read by every slot, so it
+                        // reserves `n_slots` extra readers on top of its edge fan-out.
+                        let cmd_readers = if port.id == PortId::Msg(SequenceCommand::ID) {
+                            n_slots
+                        } else {
+                            0
+                        };
                         let ring = RingBuffer::create_in_memory(Config {
                             capacity: msg_capacity(MAX_MSG_BYTES, MSG_DEPTH),
-                            max_readers: readers,
+                            max_readers: readers + cmd_readers,
                             overrun: Overrun::Overwrite,
                         });
                         let entry = message_entry(&instance, port.name, ring.clone(), *telemetered);
@@ -1118,19 +1128,31 @@ impl CoordinatorBuilder {
             channels: seq_specs,
         };
 
-        // --- Coordinator-owned command channel (the in-proc control_handle, §4.3) ---
-        // A message channel carrying postcard `SequenceCommand`s: the in-proc twin of an
-        // uplink's per-emitter command channel. `control_handle()` mints `MsgOut`s over it and
-        // the head-of-cycle `drain_command_bus` drains it exactly like an emitter's channel.
-        // Owned but not telemetered — commands are inbound control, not downlink (so the command
-        // bus is drained directly via `command_sources`, not the `MessageRegistry`).
-        let command_ring = msg_ring(MAX_MSG_BYTES, MSG_DEPTH, 1 + READER_SLACK);
+        // --- Coordinator-owned command channel (the in-proc control_handle, §6) ------
+        // A message channel carrying postcard `SequenceCommand`s: the one *reserved* command
+        // producer. `control_handle()` mints `MsgOut`s over it and every slot's command fan-in
+        // reads it — so it reserves `n_slots` readers. Owned but not telemetered (inbound
+        // control, not downlink), so it is not in the `MessageRegistry`.
+        let command_ring = msg_ring(MAX_MSG_BYTES, MSG_DEPTH, n_slots + READER_SLACK);
         table.rings.push(RingEntry {
             ring: command_ring.clone(),
             frame_id: ComponentId::new("coordinator.commands"),
             role: BufferRole::Coordinator,
             instance: None,
         });
+
+        // The command producers every slot fans in from (`docs/message-wiring.md` §6): the
+        // coordinator's reserved in-proc channel, plus every system's `SequenceCommand` output
+        // (the uplink's `CommandOut`, a future autonomy emitter). Collected by type — the
+        // coordinator wires the fan-out; the emitter is a fully ordinary message producer.
+        let mut command_producers: Vec<RingBuffer<BoxBacking>> = vec![command_ring.clone()];
+        for s in 0..n {
+            for (out_idx, port) in self.descs[s].outputs.iter().enumerate() {
+                if port.id == PortId::Msg(SequenceCommand::ID) {
+                    command_producers.push(output_rings[s][out_idx].clone());
+                }
+            }
+        }
 
         // Freeze the registry; every consumer's bind pulls this same handle.
         let registry = Arc::new(OutputRegistry::new(reg_entries));
@@ -1192,10 +1214,6 @@ impl CoordinatorBuilder {
         // --- Bind every system's ports over the allocated rings --------------
         let mut cyclic: Vec<Box<dyn CyclicSlot>> = Vec::new();
         let mut pending_async: Vec<PendingAsync> = Vec::new();
-        // The command bus (`docs/messages.md` §4.3): every `RingSource::command_out` call (an
-        // uplink, a scripted test, a future autonomy system) appends its freshly-allocated
-        // command channel here; the coordinator claims a drain `MsgIn` over each below.
-        let mut command_rings: Vec<RingBuffer<BoxBacking>> = Vec::new();
         let regs = std::mem::take(&mut self.regs);
         for (id, reg) in regs.into_iter().enumerate() {
             match reg {
@@ -1283,6 +1301,18 @@ impl CoordinatorBuilder {
                             }
                         })
                         .collect();
+                    // The slot's command fan-in: a view on every command producer (the
+                    // coordinator's reserved channel + every `SequenceCommand` output). The
+                    // `SlotRunner` drains + filters by `channel_id` each step (§6).
+                    let commands = MsgIn::from_views(
+                        command_producers
+                            .iter()
+                            .map(|r| {
+                                r.view(NoWake, NoWake)
+                                    .expect("slot command reader slot (sized for n_slots)")
+                            })
+                            .collect(),
+                    );
                     let runner = SlotRunner::new(
                         self.descs[id].name,
                         slot_reg.allowed,
@@ -1294,6 +1324,7 @@ impl CoordinatorBuilder {
                         events,
                         seq_status,
                         channel_id,
+                        commands,
                     );
                     cyclic.push(Box::new(runner));
                 }
@@ -1343,13 +1374,8 @@ impl CoordinatorBuilder {
                         })
                         .collect();
 
-                    let mut binder = Binder::new(
-                        &outs,
-                        &ins,
-                        registry.clone(),
-                        message_registry.clone(),
-                        &mut command_rings,
-                    );
+                    let mut binder =
+                        Binder::new(&outs, &ins, registry.clone(), message_registry.clone());
                     match reg {
                         Reg::Cyclic(r) => cyclic.push(r.bind(&mut binder)),
                         Reg::Async(r) => pending_async.push(PendingAsync {
@@ -1362,30 +1388,6 @@ impl CoordinatorBuilder {
                     }
                 }
             }
-        }
-
-        // --- The command bus drain set (`docs/messages.md` §4.3) -------------
-        // One `MsgIn<SequenceCommand>` per command channel: the coordinator's own (the in-proc
-        // `control_handle`) first, then every emitter channel `command_out` allocated during the
-        // bind loop (the uplink, etc.). `drain_command_bus` drains them all at head-of-cycle.
-        let mut command_sources: Vec<MsgIn<SequenceCommand>> = Vec::new();
-        command_sources.push(MsgIn::new(
-            command_ring
-                .view(NoWake, NoWake)
-                .expect("coordinator command-channel reader slot"),
-        ));
-        for ring in &command_rings {
-            command_sources.push(MsgIn::new(
-                ring.view(NoWake, NoWake)
-                    .expect("command-channel reader slot (COMMAND_READER_SLACK)"),
-            ));
-            // Keep a canonical handle so the ring outlives the emitter's `MsgOut` + our `MsgIn`.
-            table.rings.push(RingEntry {
-                ring: ring.clone(),
-                frame_id: ComponentId::new("commands"),
-                role: BufferRole::Coordinator,
-                instance: None,
-            });
         }
 
         // --- Coordinator's own health / log / status ports -------------------
@@ -1416,7 +1418,6 @@ impl CoordinatorBuilder {
             registry,
             message_registry,
             command_ring,
-            command_sources,
             channel_map,
             seq_registry_out,
             seq_registry,
@@ -1572,16 +1573,11 @@ pub struct Coordinator {
     /// §2). Empty until W4 allocates the per-slot sequence channels; the freeze +
     /// accessor land here so the downlink tap (W2) and the coupling (W4) have it.
     message_registry: Arc<MessageRegistry>,
-    /// The coordinator-owned command channel (`docs/messages.md` §4.3): a message ring carrying
-    /// postcard `SequenceCommand`s, the in-proc twin of an uplink's per-emitter channel. A
-    /// canonical handle kept so [`control_handle`](Coordinator::control_handle) can mint a fresh
-    /// [`MsgOut`] over it. Its drain `MsgIn` is the first entry in `command_sources`.
+    /// The coordinator-owned command channel (`docs/message-wiring.md` §6): the one *reserved*
+    /// `SequenceCommand` producer, the in-proc twin of a system's `CommandOut`. A canonical handle
+    /// kept so [`control_handle`](Coordinator::control_handle) can mint a fresh [`MsgOut`] over it;
+    /// every slot's command fan-in reads it. The coordinator no longer drains commands — slots do.
     command_ring: RingBuffer<BoxBacking>,
-    /// The command bus drain set (`docs/messages.md` §4.3): one `MsgIn<SequenceCommand>` per
-    /// command channel — the coordinator's own (above) plus every emitter's `command_out`
-    /// channel — drained at head-of-cycle by [`drain_command_bus`](Self::drain_command_bus) and
-    /// dispatched to slots by `channel_id`. The coordinator knows nothing of sequences here.
-    command_sources: Vec<MsgIn<SequenceCommand>>,
     /// The channel↔slot map built once at `build()`: `ChannelId` (the slot's build-order index
     /// among slots) → slot instance name. Read for the boot [`SequenceRegistry`]; it no longer
     /// translates commands (slots self-filter by `channel_id`, `docs/messages.md` §4.1).
@@ -1725,12 +1721,10 @@ impl Coordinator {
                 ClockMode::Wall => Timestamp::now(),
                 ClockMode::Simulated { dt } => epoch + dt * k as u32,
             };
-            // Command bus (`docs/messages.md` §4.3): drain every command channel — the
-            // coordinator's own (`control_handle`) and every emitter's (the uplink) — and
-            // broadcast each `SequenceCommand` to every slot *before* stepping, so a command
-            // dispatches the *same* cycle it lands (no off-by-one). The per-slot `command`
-            // default no-op makes non-slots ignore it; a `SlotRunner` filters by `channel_id`.
-            self.drain_command_bus();
+            // Commands are drained per-slot at the head of each `step` (`docs/message-wiring.md`
+            // §6): every slot's fan-in reads every command producer (the coordinator's in-proc
+            // channel + the uplink's `CommandOut`) and filters by `channel_id`, so a command
+            // dispatches the *same* cycle it lands — no coordinator-side command stage.
             for slot in &mut self.cyclic {
                 slot.step(now);
             }
@@ -1800,25 +1794,6 @@ impl Coordinator {
         go_flag.store(true, Release);
         go.wake_all();
         tasks
-    }
-
-    /// Drain the command bus and dispatch each command to every slot (`docs/messages.md` §4.3).
-    /// Every command channel — the coordinator's own (`control_handle`) and every emitter's
-    /// (the uplink) — is `MsgIn`-decoded into `SequenceCommand`s (collected first, since the
-    /// drain borrows `command_sources` and the dispatch borrows `cyclic`), then broadcast to
-    /// every `CyclicSlot::command`; the default no-op makes non-slots ignore them and a
-    /// `SlotRunner` filters by `channel_id`. A lapped command channel resyncs to the live edge
-    /// inside `MsgIn::drain` (commands are best-effort, like the message log).
-    fn drain_command_bus(&mut self) {
-        let mut cmds: Vec<SequenceCommand> = Vec::new();
-        for src in &mut self.command_sources {
-            src.drain(|c| cmds.push(c));
-        }
-        for cmd in &cmds {
-            for slot in &mut self.cyclic {
-                slot.command(cmd);
-            }
-        }
     }
 
     /// Mirror fresh upstream records into each async system's private buffer
