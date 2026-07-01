@@ -73,12 +73,21 @@ impl BoundPort {
     }
 }
 
+/// One input port's bound ring(s), in `descriptors()` order. A frame input (or a
+/// single-producer message input) is [`One`](BoundInput::One); a fanned-in message input
+/// (`docs/message-wiring.md` §3.3) is [`Many`](BoundInput::Many) — zero, one, or many
+/// producer rings. Frame ports always bind `One`.
+pub enum BoundInput {
+    One(BoundPort),
+    Many(Vec<BoundPort>),
+}
+
 /// A positional cursor over one system's pre-allocated ports. The generated
 /// [`BindPorts::bind`] pops one ring per port via [`next_output`](Self::next_output)
 /// / [`next_input`](Self::next_input) in `descriptors()` order.
 pub struct Binder<'a> {
     outputs: slice::Iter<'a, BoundPort>,
-    inputs: slice::Iter<'a, BoundPort>,
+    inputs: slice::Iter<'a, BoundInput>,
     registry: Arc<OutputRegistry>,
     messages: Arc<MessageRegistry>,
     /// The command-bus collector (`docs/messages.md` §4.3): each [`command_out`](RingSource::command_out)
@@ -91,7 +100,7 @@ pub struct Binder<'a> {
 impl<'a> Binder<'a> {
     pub(crate) fn new(
         outputs: &'a [BoundPort],
-        inputs: &'a [BoundPort],
+        inputs: &'a [BoundInput],
         registry: Arc<OutputRegistry>,
         messages: Arc<MessageRegistry>,
         command_rings: &'a mut Vec<RingBuffer<BoxBacking>>,
@@ -124,11 +133,25 @@ pub trait RingSource {
         WD: WakeSource + Default + Clone + 'static,
         WS: WakeSink + Default + Clone + 'static;
 
-    /// Pop the next input ring and its reader-side wake endpoints.
+    /// Pop the next input ring and its reader-side wake endpoints (a frame port, or a
+    /// single-producer message port).
     fn next_input<RD, RS>(&mut self) -> (RingBuffer<Self::B>, RD, RS)
     where
         RD: WakeSink + Default + Clone + 'static,
         RS: WakeSource + Default + Clone + 'static;
+
+    /// Pop **every** producer ring wired to the next (message) input port — the fan-in list
+    /// (`docs/message-wiring.md` §3.3). `Vec::new()` is a legal, unconnected message input
+    /// (reads nothing). Frame ports call [`next_input`](Self::next_input) instead; only
+    /// [`MsgIn::bind`](crate::MsgIn) calls this. The default (non-host sources, which never
+    /// carry message ports) yields no producers.
+    fn next_input_fanin<RD, RS>(&mut self) -> Vec<(RingBuffer<Self::B>, RD, RS)>
+    where
+        RD: WakeSink + Default + Clone + 'static,
+        RS: WakeSource + Default + Clone + 'static,
+    {
+        Vec::new()
+    }
 
     /// The broad-access output registry (telemetry.md §2.4). A bundle that wants by-id
     /// access to *every* output (the telemetry downlink, a logger, a recorder) pulls
@@ -187,15 +210,46 @@ impl<'a> RingSource for Binder<'a> {
         RD: WakeSink + Default + Clone + 'static,
         RS: WakeSource + Default + Clone + 'static,
     {
-        let p = self
+        let p = match self
             .inputs
             .next()
-            .expect("bind() walks input ports in descriptors() order");
+            .expect("bind() walks input ports in descriptors() order")
+        {
+            BoundInput::One(p) => p,
+            BoundInput::Many(_) => {
+                panic!("a frame input was laid out as a message fan-in (BoundInput::Many)")
+            }
+        };
         (
             p.ring.clone(),
             BoundPort::wake(&p.data),
             BoundPort::wake(&p.space),
         )
+    }
+
+    fn next_input_fanin<RD, RS>(&mut self) -> Vec<(RingBuffer<BoxBacking>, RD, RS)>
+    where
+        RD: WakeSink + Default + Clone + 'static,
+        RS: WakeSource + Default + Clone + 'static,
+    {
+        let ports: &[BoundPort] = match self
+            .inputs
+            .next()
+            .expect("bind() walks input ports in descriptors() order")
+        {
+            BoundInput::One(p) => slice::from_ref(p),
+            BoundInput::Many(v) => v,
+        };
+        ports
+            .iter()
+            .map(|p| {
+                (
+                    p.ring.clone(),
+                    BoundPort::wake(&p.data),
+                    BoundPort::wake(&p.space),
+                )
+            })
+            .collect()
     }
 
     /// The registry is complete before the bind loop runs, so this is safe and needs no
