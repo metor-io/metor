@@ -10,7 +10,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use metor_fsw::{AsVTable, Metadatatize};
-use metor_proto::types::{ComponentId, PrimType};
+use metor_proto::types::{ComponentId, PacketId, PrimType};
 use metor_proto::vtable::VTable;
 use metor_proto::vtable::builder::vtable;
 use metor_proto_wkt::ComponentMetadata;
@@ -26,52 +26,99 @@ pub type Hz = f64;
 /// carry a closure capturing its metadata-derived prefix rewrite.
 pub type AnnounceFn = Arc<dyn Fn(&str) -> (VTable, Vec<ComponentMetadata>) + Send + Sync>;
 
-/// One port's static shape: the frame identity, its vtable (the authoritative
-/// component layout), its worst-case table size, and an advisory rate.
+/// The edge key of a port: a frame id (component space) or a message id (the disjoint
+/// 2-byte [`PacketId`] space). A frame port and a message port live in different value
+/// spaces, so they can never accidentally match on an edge.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub enum PortId {
+    /// `F::FRAME_ID`.
+    Frame(ComponentId),
+    /// `M::ID`.
+    Msg(PacketId),
+}
+
+impl PortId {
+    /// The frame [`ComponentId`] of a frame port. Frame-only paths (the registry, the
+    /// ring table, the dl ABI, health/log/status, and today's wiring diagnostics) call
+    /// this; a message port's id is a 2-byte [`PacketId`], not a `ComponentId`, so this
+    /// panics on one.
+    pub fn frame_id(self) -> ComponentId {
+        match self {
+            PortId::Frame(f) => f,
+            PortId::Msg(_) => panic!("PortId::frame_id() on a message port"),
+        }
+    }
+}
+
+/// The kind-specific payload of a [`PortDesc`]. Only [`Frame`](PortKind::Frame) carries
+/// the vtable + announce factory the wiring compatibility check and telemetry announce
+/// need; a [`Message`](PortKind::Message) port is self-describing (its 2-byte id is its
+/// schema), and [`ReceiveAll`](PortKind::ReceiveAll) is a broadcast registry tap that
+/// reserves no ring and connects no edge.
+#[derive(Clone)]
+pub enum PortKind {
+    /// A component-frame port. See [`PortDesc::announce`] for the prefix factory.
+    Frame {
+        /// `F::as_vtable()` — the **frame-relative** (unprefixed) vtable the wiring
+        /// compatibility check uses; the prefixed vtable is produced on demand by the
+        /// announce factory.
+        vtable: VTable,
+        /// Prefix factory (telemetry.md §6): given an instance name, it re-derives the
+        /// **prefixed** announce vtable + component metadata. Type-erased ([`Arc`] boxed
+        /// closure) so a dlopen'd port, which has no static `F`, can carry a closure
+        /// capturing its metadata-derived prefix rewrite instead.
+        announce: AnnounceFn,
+    },
+    /// A message-channel port (`docs/messages.md`). Self-describing — no vtable/announce.
+    Message {
+        /// Whether the telemetry downlink / `AllOutputs` taps this channel
+        /// (`docs/message-wiring.md` §6.4). Command channels set this `false`.
+        telemetered: bool,
+    },
+    /// A broadcast tap over every output + message channel (`docs/message-wiring.md` §4).
+    ReceiveAll,
+}
+
+/// One port's static shape: its edge key ([`id`](PortDesc::id)), display name, worst-case
+/// size, advisory rate, and [`kind`](PortDesc::kind)-specific payload.
 ///
-/// Used both for an output (a produced frame) and an input (a required frame
-/// shape) — the two are structurally identical, the direction is which list of a
+/// Used both for an output (a produced frame/message) and an input (a required shape) —
+/// the two are structurally identical, the direction is which list of a
 /// [`SystemDescriptor`] it sits in.
 #[derive(Clone)]
 pub struct PortDesc {
-    /// `F::FRAME_ID`.
-    pub frame_id: ComponentId,
-    /// `F::NAME` — the unprefixed frame name, kept so the coordinator can compute
-    /// the instance-qualified registry key `ComponentId::new("<instance>.<frame>")`
-    /// without a static `F` (telemetry.md §2.2/§6).
-    pub frame_name: &'static str,
-    /// `F::as_vtable()` — enumerated in registration mode for compatibility. This is
-    /// the **frame-relative** (unprefixed) vtable the wiring compatibility check uses;
-    /// the telemetry-facing prefixed vtable is produced on demand by [`announce`](Self::announce).
-    pub vtable: VTable,
-    /// `F::MAX_SIZE` (worst-case table bytes); size a ring via [`crate::buffer_capacity`].
+    /// The edge key: `PortId::Frame(F::FRAME_ID)` or `PortId::Msg(M::ID)`.
+    pub id: PortId,
+    /// `F::NAME` / the message schema name / `""` for a receive-all tap — kept so the
+    /// coordinator can compute the instance-qualified registry key
+    /// `ComponentId::new("<instance>.<name>")` without a static type (telemetry.md §2.2/§6).
+    pub name: &'static str,
+    /// `F::MAX_SIZE` / `MAX_MSG_BYTES` (worst-case bytes); size a ring via
+    /// [`crate::buffer_capacity`]. `0` for a receive-all tap.
     pub max_size: usize,
     /// Advisory rate, for buffer depth / async pacing. `None` ⇒ use a global default.
     pub rate_hint: Option<Hz>,
-    /// Prefix factory (telemetry.md §6): given an instance name, it re-derives the
-    /// **prefixed** announce vtable + component metadata (`<instance>.<frame>.<field>`
-    /// ids/names). A statically-linked port captures `F` here by wrapping
-    /// [`announce_of::<F>`] (reusing `AsVTable::vtable_fields(prefix)` /
-    /// `Metadatatize::metadata(prefix)`). The coordinator calls it once per buffer at
-    /// `build()` and stores the result as the registry entry's canonical external schema.
-    /// `F` is gone by build time (everything is `PortDesc`-erased), which is why this is
-    /// type-erased — and it is an [`Arc`] boxed closure (not a bare `fn`) so a
-    /// dlopen'd port, which has no static `F`, can carry a closure capturing its
-    /// metadata-derived prefix rewrite instead.
-    pub announce: AnnounceFn,
+    /// The kind-specific payload (frame vtable/announce, message telemetered-flag, or tap).
+    pub kind: PortKind,
 }
 
 impl std::fmt::Debug for PortDesc {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        // `announce` is a boxed closure (no `Debug`); render it as an opaque marker.
-        f.debug_struct("PortDesc")
-            .field("frame_id", &self.frame_id)
-            .field("frame_name", &self.frame_name)
-            .field("vtable", &self.vtable)
+        // `announce` (inside `PortKind::Frame`) is a boxed closure (no `Debug`); the
+        // manual impl renders the kind without it.
+        let mut s = f.debug_struct("PortDesc");
+        s.field("id", &self.id)
+            .field("name", &self.name)
             .field("max_size", &self.max_size)
-            .field("rate_hint", &self.rate_hint)
-            .field("announce", &"<closure>")
-            .finish()
+            .field("rate_hint", &self.rate_hint);
+        match &self.kind {
+            PortKind::Frame { vtable, .. } => s.field("kind", &"Frame").field("vtable", vtable),
+            PortKind::Message { telemetered } => {
+                s.field("kind", &"Message").field("telemetered", telemetered)
+            }
+            PortKind::ReceiveAll => s.field("kind", &"ReceiveAll"),
+        };
+        s.finish()
     }
 }
 
@@ -89,14 +136,19 @@ impl PortDesc {
     /// Derives the descriptor for a frame type. Pure metadata — no instance needed.
     pub fn of<F: Frame>() -> Self {
         Self {
-            frame_id: F::FRAME_ID,
-            frame_name: F::NAME,
-            vtable: F::as_vtable(),
+            id: PortId::Frame(F::FRAME_ID),
+            name: F::NAME,
             max_size: F::MAX_SIZE,
             rate_hint: None,
-            // Coerce the `F`-closing fn item to a plain fn pointer first (erasing `F`, so
-            // no `F: 'static` bound is needed), then box it as the type-erased `Arc<dyn Fn>`.
-            announce: Arc::new(announce_of::<F> as fn(&str) -> (VTable, Vec<ComponentMetadata>)),
+            kind: PortKind::Frame {
+                vtable: F::as_vtable(),
+                // Coerce the `F`-closing fn item to a plain fn pointer first (erasing `F`,
+                // so no `F: 'static` bound is needed), then box it as the type-erased
+                // `Arc<dyn Fn>`.
+                announce: Arc::new(
+                    announce_of::<F> as fn(&str) -> (VTable, Vec<ComponentMetadata>),
+                ),
+            },
         }
     }
 
@@ -105,6 +157,30 @@ impl PortDesc {
         Self {
             rate_hint: Some(rate_hint),
             ..Self::of::<F>()
+        }
+    }
+
+    /// The frame [`ComponentId`] of a frame port — see [`PortId::frame_id`]. The
+    /// registry / ring-table / dl-ABI / health paths (all frame-only) call this; it
+    /// panics on a message or receive-all port.
+    pub fn frame_id(&self) -> ComponentId {
+        self.id.frame_id()
+    }
+
+    /// The frame-relative vtable of a frame port (wiring compatibility / telemetry
+    /// announce). Panics on a non-frame port.
+    pub fn vtable(&self) -> &VTable {
+        match &self.kind {
+            PortKind::Frame { vtable, .. } => vtable,
+            _ => panic!("PortDesc::vtable() on a non-frame port"),
+        }
+    }
+
+    /// The prefix-announce factory of a frame port. Panics on a non-frame port.
+    pub fn announce(&self) -> &AnnounceFn {
+        match &self.kind {
+            PortKind::Frame { announce, .. } => announce,
+            _ => panic!("PortDesc::announce() on a non-frame port"),
         }
     }
 }
@@ -142,18 +218,29 @@ fn realize_set(vtable: &VTable) -> HashMap<ComponentId, (PrimType, Vec<usize>)> 
     set
 }
 
-/// Whether a `producer` output satisfies a `consumer` input (system.md §5.2):
-/// same `frame_id`, and the consumer's component set is a **subset** of the
-/// producer's with matching `ty`/`shape`. Subset (not equality) lets a producer
-/// emit extra fields a consumer ignores (forward-compatible wiring).
+/// Whether a `producer` output satisfies a `consumer` input:
+///
+/// - **Frame ports** (system.md §5.2): same `frame_id`, and the consumer's component set
+///   is a **subset** of the producer's with matching `ty`/`shape`. Subset (not equality)
+///   lets a producer emit extra fields a consumer ignores (forward-compatible wiring).
+/// - **Message ports** (`docs/message-wiring.md` §3.5): pure [`PacketId`] equality —
+///   messages are opaque postcard blobs with no component structure, so there is no
+///   subset relation.
+/// - A frame port and a message port (or a receive-all tap) never satisfy an edge.
 pub fn compatible(producer: &PortDesc, consumer: &PortDesc) -> bool {
-    if producer.frame_id != consumer.frame_id {
-        return false;
+    match (&producer.kind, &consumer.kind) {
+        (PortKind::Frame { vtable: pv, .. }, PortKind::Frame { vtable: cv, .. }) => {
+            if producer.id != consumer.id {
+                return false;
+            }
+            let prod = realize_set(pv);
+            let cons = realize_set(cv);
+            cons.iter().all(|(id, want)| match prod.get(id) {
+                Some(have) => have == want,
+                None => false,
+            })
+        }
+        (PortKind::Message { .. }, PortKind::Message { .. }) => producer.id == consumer.id,
+        _ => false,
     }
-    let prod = realize_set(&producer.vtable);
-    let cons = realize_set(&consumer.vtable);
-    cons.iter().all(|(id, want)| match prod.get(id) {
-        Some(have) => have == want,
-        None => false,
-    })
 }

@@ -45,7 +45,7 @@ use crate::coordinator::{
     ClockMode, Coordinator, CoordinatorBuilder, CoordinatorConfig, InitialOccupant, PortRef,
     SystemHandle, WireError,
 };
-use crate::descriptor::{SystemDescriptor, compatible};
+use crate::descriptor::{PortId, SystemDescriptor, compatible};
 use crate::dl::{DlError, DlSystem};
 use crate::frame::Frame;
 use crate::sequence::SlotControlIn;
@@ -999,7 +999,7 @@ fn resolve_slot(
     // `SlotControlIn` input dropped (what `add_slot`/`build()` register for edge wiring).
     let base = allowed[0].1.descriptor().clone();
     let mut inputs = base.inputs.clone();
-    if inputs.last().map(|p| p.frame_id) == Some(SlotControlIn::FRAME_ID) {
+    if inputs.last().map(|p| p.id) == Some(PortId::Frame(SlotControlIn::FRAME_ID)) {
         inputs.pop();
     }
     let registered = SystemDescriptor {
@@ -1036,7 +1036,7 @@ fn resolve_slot(
     // include the implicit `SequenceStatus`/health/log tail, which a declaration may name
     // but need not.
     for frame in &slot.inputs {
-        if !registered.inputs.iter().any(|p| p.frame_name == frame) {
+        if !registered.inputs.iter().any(|p| p.name == frame) {
             return Err(LoadError::SlotContractMismatch {
                 slot: slot.name.clone(),
                 dir: "input",
@@ -1047,7 +1047,7 @@ fn resolve_slot(
         }
     }
     for frame in &slot.outputs {
-        if !registered.outputs.iter().any(|p| p.frame_name == frame) {
+        if !registered.outputs.iter().any(|p| p.name == frame) {
             return Err(LoadError::SlotContractMismatch {
                 slot: slot.name.clone(),
                 dir: "output",
@@ -1650,11 +1650,12 @@ fn resolve_endpoint(
         span,
     })?;
     let frame_id = ComponentId::new(frame);
+    let port = PortId::Frame(frame_id);
     let ports = match dir {
         Dir::Out => &inst.desc.outputs,
         Dir::In => &inst.desc.inputs,
     };
-    if !ports.iter().any(|p| p.frame_id == frame_id) {
+    if !ports.iter().any(|p| p.id == port) {
         return Err(LoadError::UnknownFrame {
             instance: name.to_string(),
             frame: frame.to_string(),
@@ -1664,7 +1665,7 @@ fn resolve_endpoint(
     }
     Ok(PortRef {
         system: inst.handle,
-        frame_id,
+        port,
     })
 }
 

@@ -40,7 +40,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::binder::{BindPorts, RingSource};
 use crate::coordinator::{CyclicSlot, SlotState, StopReason};
-use crate::descriptor::{AnnounceFn, Hz, PortDesc, SystemDescriptor, SystemKind};
+use crate::descriptor::{AnnounceFn, Hz, PortDesc, PortId, PortKind, SystemDescriptor, SystemKind};
 use crate::sequence::{SeqBound, SeqClock, SeqSystem, publish_status, with_clock};
 use crate::system::{BuildSystem, CyclicRunner, CyclicSystem, Out, SystemOutput};
 
@@ -194,10 +194,12 @@ impl PortDescMsg {
     /// Lower one static [`PortDesc`] (its `vtable` already unprefixed) plus the
     /// port's unprefixed `metadata` into the wire mirror.
     fn lower(desc: &PortDesc, metadata: Vec<ComponentMetadata>) -> Self {
+        // dlopen'd systems carry frame ports only (a `.so` cannot declare a message port),
+        // so the frame accessors are always valid here.
         Self {
-            frame_id: desc.frame_id,
-            frame_name: desc.frame_name.to_string(),
-            vtable: desc.vtable.clone(),
+            frame_id: desc.frame_id(),
+            frame_name: desc.name.to_string(),
+            vtable: desc.vtable().clone(),
             max_size: desc.max_size,
             rate_hint: desc.rate_hint,
             metadata,
@@ -229,14 +231,16 @@ impl PortDescMsg {
             (vtable, meta)
         });
         PortDesc {
-            // The carried (unprefixed) vtable is what `compatible()` validates against,
-            // so wiring validation is unchanged; prefixing happens only in `announce`.
-            frame_id: self.frame_id,
-            frame_name,
-            vtable: self.vtable,
+            id: PortId::Frame(self.frame_id),
+            name: frame_name,
             max_size: self.max_size,
             rate_hint: self.rate_hint,
-            announce,
+            // The carried (unprefixed) vtable is what `compatible()` validates against,
+            // so wiring validation is unchanged; prefixing happens only in `announce`.
+            kind: PortKind::Frame {
+                vtable: self.vtable,
+                announce,
+            },
         }
     }
 }
@@ -611,8 +615,8 @@ where
 {
     let outcome = catch_unwind(AssertUnwindSafe(|| {
         let desc = <S as CyclicSystem<RawBacking>>::descriptor();
-        let input_metadata = desc.inputs.iter().map(|p| (p.announce)("").1).collect();
-        let output_metadata = desc.outputs.iter().map(|p| (p.announce)("").1).collect();
+        let input_metadata = desc.inputs.iter().map(|p| (p.announce())("").1).collect();
+        let output_metadata = desc.outputs.iter().map(|p| (p.announce())("").1).collect();
         let params_schema = OwnedNamedType::from(<S::Params as postcard_schema::Schema>::SCHEMA);
         let msg = SystemDescriptorMsg::lower(&desc, params_schema, input_metadata, output_metadata);
         postcard::to_allocvec(&msg).expect("descriptor encodes (postcard)")
@@ -837,8 +841,8 @@ where
 {
     let outcome = catch_unwind(AssertUnwindSafe(|| {
         let desc = S::descriptor();
-        let input_metadata = desc.inputs.iter().map(|p| (p.announce)("").1).collect();
-        let output_metadata = desc.outputs.iter().map(|p| (p.announce)("").1).collect();
+        let input_metadata = desc.inputs.iter().map(|p| (p.announce())("").1).collect();
+        let output_metadata = desc.outputs.iter().map(|p| (p.announce())("").1).collect();
         let params_schema = OwnedNamedType::from(<S::Params as postcard_schema::Schema>::SCHEMA);
         let msg = SystemDescriptorMsg::lower(&desc, params_schema, input_metadata, output_metadata);
         postcard::to_allocvec(&msg).expect("descriptor encodes (postcard)")

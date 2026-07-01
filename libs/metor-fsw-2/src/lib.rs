@@ -66,7 +66,9 @@ pub use telemetry::{
 
 // The system trait family, the typed port wrappers, self-description, and the
 // standard health/log telemetry.
-pub use descriptor::{AnnounceFn, Hz, PortDesc, SystemDescriptor, SystemKind, compatible};
+pub use descriptor::{
+    AnnounceFn, Hz, PortDesc, PortId, PortKind, SystemDescriptor, SystemKind, compatible,
+};
 pub use health::{
     HealthPort, LOG_MSG_CAP, Level, LogLine, MAX_ERR_KINDS, MAX_LINES, SystemHealth, SystemLog,
 };
