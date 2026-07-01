@@ -163,6 +163,15 @@ Sharing one `ReactionWheel` struct as both the plant's internal state and its te
   degenerates when the pointing direction is anti-parallel to the body axis (the velocity-
   vector law at orbit injection); the `target_for` NaN-guard handles it. Nothing for the
   framework here — just a reminder that app math owns its singularities.
+- **No deterministic mission epoch — systems roll their own sim-time.** The `Simulated` clock
+  seeds its start epoch from `Timestamp::now()` (wall clock), so the per-cycle `now` a system
+  receives is not a reproducible mission time. Any system that needs a deterministic epoch (here
+  the plant and nav both do — for the sun ephemeris and the WMM field) must keep a **private
+  `t_sim` counter** (`+= DT` each cycle from a fixed `mission_epoch()`), and two systems that
+  must agree on the epoch (plant generates a measurement, nav references it) rely on both
+  counters starting at 0 and advancing in lockstep. A framework-provided deterministic
+  `sim_time()`/mission-epoch handle (seeded from the mission, not the wall clock) would remove
+  the duplicated counters and the lockstep assumption. Related to the sequence-`now` gap (§4).
 - **`disarmed` is a KDL edit, not a CLI flag.** The runner exposes `--build/--wall/
   --telemetry/--uplink` but no mission-specific flags, so the `--disarmed` parity is a
   `mission.kdl` property. Fine, but worth a generic "override any system param from the CLI"
@@ -174,7 +183,7 @@ Sharing one `ReactionWheel` struct as both the plant's internal state and its te
 
 | Feature | Outcome | Where |
 |---|---|---|
-| Plant physics (wheels, orbit/gravity, IMU/mag/sun sensors, GPS) | **done** | example (`adcs-plant`, `adcs-contracts`) |
+| Plant physics (wheels, orbit/gravity, IMU/sun sensors, WMM magnetometer, noisy GPS) | **done** | example (`adcs-plant`, `adcs-contracts`) |
 | Pointing modes (Nadir/HIL) wired slot → ctrl | **done** | example (`adcs-ctrl`, `mode_cmd` edge) |
 | Nav reference modeling from orbit state | **done** | example (`adcs-nav`) |
 | Live uplink (panel drives the `mode` slot) | **done** | `--uplink` (already in the framework) |

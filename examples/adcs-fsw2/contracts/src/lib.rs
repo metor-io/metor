@@ -15,9 +15,16 @@
 use hifitime::{Duration, Epoch};
 use metor_fsw_2::metor_proto::types::Timestamp;
 use nox::{ArrayRepr, Quaternion, Vector, tensor};
+use nox_frames::earth::{ecef_to_eci, eci_to_ecef, ned_to_ecef};
 use postcard_schema::Schema;
 use serde::{Deserialize, Serialize};
+use wmm::GeodeticCoords;
 use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
+
+/// The WMM magnetic model handle — re-exported so the plant (true field) and nav (reference
+/// field) can each own one without a direct `wmm` dependency. Holds C-library state and is
+/// stepped with `&mut self`, so build it once per system.
+pub use wmm::MagneticModel;
 
 /// A body-frame / world-frame 3-vector in nox's array representation.
 pub type V3 = Vector<f64, 3, ArrayRepr>;
@@ -48,18 +55,67 @@ pub fn inertia_diag() -> V3 {
     tensor![15204079.70002e-9, 14621352.61765e-9, 6237758.3131e-9]
 }
 
-/// The Earth dipole coefficient vector (T) — the magnetometer reference model. Shared by
-/// the plant (true field at its position) and nav (reference field at the GPS position).
-pub fn k0() -> V3 {
-    tensor![-30926.00e-9, 5817.00e-9, -2318.00e-9]
+// --- GPS error model (first-order Gauss-Markov position, white velocity) -----
+// The "good" basic GPS model (Brown & Hwang): position error is dominated by slowly-varying
+// iono/ephemeris terms, so it is exponentially correlated (a first-order Gauss-Markov process)
+// rather than white; velocity from Doppler/carrier is far less correlated, so it is white.
+// Spaceborne single-frequency SPS figures. Used by the plant to corrupt the true orbit state
+// into the `Gps` measurement the controller flies on.
+
+/// GPS position error 1-sigma per axis (m) — the Gauss-Markov steady-state.
+pub const GPS_POS_SIGMA: f64 = 5.0;
+/// GPS position-error correlation time (s) — the Gauss-Markov time constant.
+pub const GPS_TAU: f64 = 100.0;
+/// GPS velocity error 1-sigma per axis (m/s), modeled as white noise.
+pub const GPS_VEL_SIGMA: f64 = 0.05;
+
+// --- WMM magnetic field ------------------------------------------------------
+// The true (plant, at its real position) and reference (nav, at the GPS position) Earth
+// magnetic field, from the NOAA World Magnetic Model, replacing the crude tilted dipole.
+
+/// WGS84 ellipsoid semi-major axis (m) and first-eccentricity-squared, for the ECEF→geodetic
+/// conversion WMM's input needs.
+const WGS84_A: f64 = 6378137.0;
+const WGS84_E2: f64 = 6.694379990141316e-3; // e² = 2f - f², f = 1/298.257223563
+
+/// ECEF Cartesian → WGS84 geodetic `(latitude_rad, longitude_rad, altitude_m)`, by the standard
+/// iterative (Bowring-seeded) method — nox-frames has the ECI↔ECEF↔NED rotations but no geodetic
+/// conversion, and WMM takes geodetic coordinates.
+pub fn ecef_to_geodetic(ecef: &V3) -> (f64, f64, f64) {
+    let [x, y, z] = ecef.into_buf();
+    let lon = y.atan2(x);
+    let p = (x * x + y * y).sqrt();
+    // Seed latitude assuming spherical, then refine (a handful of iterations converge to well
+    // below meter level at orbital altitude).
+    let mut lat = z.atan2(p * (1.0 - WGS84_E2));
+    let mut n = WGS84_A;
+    for _ in 0..5 {
+        n = WGS84_A / (1.0 - WGS84_E2 * lat.sin().powi(2)).sqrt();
+        let alt = p / lat.cos() - n;
+        lat = z.atan2(p * (1.0 - WGS84_E2 * n / (n + alt)));
+    }
+    let alt = p / lat.cos() - n;
+    (lat, lon, alt)
 }
 
-/// The modeled Earth magnetic field (ECI) at an inertial position `pos_eci`, from the tilted
-/// dipole `k0()` (cube-sat `Mag::from_body` / `Nav::from_sensors`). Returned **un-normalized**.
-pub fn mag_field_eci(pos_eci: &V3) -> V3 {
-    let pos_norm = pos_eci.norm().into_buf();
-    let e_hat = pos_eci.normalize();
-    ((EARTH_RADIUS / pos_norm).powi(3)) * (3.0 * k0().dot(&e_hat) * e_hat - k0())
+/// The Earth magnetic field in ECI (Tesla) at an inertial position `pos_eci` and `epoch`, from
+/// the NOAA WMM: rotate the position into ECEF, convert to geodetic, evaluate the model (WMM
+/// wants latitude/longitude in degrees and height above the ellipsoid in **km**), then rotate
+/// the NED field back through ECEF into ECI. Returned **un-normalized**. Shared by the plant
+/// (true field at its real position) and nav (reference field at the GPS position).
+pub fn mag_field_eci(model: &mut MagneticModel, epoch: Epoch, pos_eci: &V3) -> V3 {
+    let ecef = eci_to_ecef(epoch).dot(pos_eci);
+    let (lat, lon, alt) = ecef_to_geodetic(&ecef);
+    let geodetic = GeodeticCoords::with_elliposid_height(
+        lat.to_degrees(),
+        lon.to_degrees(),
+        alt / 1000.0, // WMM height is in km
+    );
+    let (elements, _) = model.calculate_field(epoch, geodetic);
+    // WMM returns the field in the local NED frame (X north, Y east, Z down), in Tesla.
+    let b_ned = V3::from_buf(elements.b_field());
+    let b_ecef = ned_to_ecef(lat, lon).dot(&b_ned);
+    ecef_to_eci(epoch).dot(&b_ecef)
 }
 
 /// The mission start epoch (UTC) the environment models are evaluated against. A **fixed**
@@ -103,6 +159,23 @@ pub struct Sensors {
     pub mag_b: V3,
 }
 
+/// The **GPS** measurement: the spacecraft's inertial (ECI) position + velocity, corrupted by
+/// the GPS error model (a first-order Gauss-Markov position error + white velocity noise —
+/// [`GPS_POS_SIGMA`]/[`GPS_TAU`]/[`GPS_VEL_SIGMA`]). This is the noisy orbit state the flight
+/// software actually flies on (cube-sat's `GPS` sensor, now with noise): the controller derives
+/// its pointing-law target from it, and nav evaluates its sun/magnetic references at it.
+#[derive(metor_fsw_2::Frame, IntoBytes, Immutable, KnownLayout, FromBytes, Clone)]
+#[repr(C)]
+#[metor_fsw(name = "gps")]
+pub struct Gps {
+    #[metor_fsw(timestamp)]
+    pub timestamp: Timestamp,
+    /// Measured inertial (ECI) position (m).
+    pub pos_eci: V3,
+    /// Measured inertial (ECI) velocity (m/s).
+    pub vel_eci: V3,
+}
+
 /// The navigation filter's attitude estimate.
 #[derive(metor_fsw_2::Frame, IntoBytes, Immutable, KnownLayout, FromBytes, Clone)]
 #[repr(C)]
@@ -120,10 +193,10 @@ pub struct AttitudeEstimate {
 
 /// The plant's ground-truth **body state**: the true attitude + body rate and the inertial
 /// orbit state (position/velocity), the spacecraft's real condition each cycle. The plant
-/// propagates a real 400 km orbit (gravity + the orbital velocity); this frame is tapped from
-/// the registry to measure convergence (the truth a `.so`'s statics never reach the host with)
-/// and feeds both nav (the magnetic-field reference is a function of position) and the
-/// controller (the Nadir/HIL pointing-law target is a function of position/velocity).
+/// propagates a real 400 km orbit (gravity + the orbital velocity); this frame is the truth a
+/// `.so`'s statics never reach the host with, tapped from the registry to measure convergence.
+/// The flight software does not consume it — nav and the controller fly on the noisy [`Gps`]
+/// measurement instead — so it is truth telemetry only.
 #[derive(metor_fsw_2::Frame, IntoBytes, Immutable, KnownLayout, FromBytes, Clone)]
 #[repr(C)]
 #[metor_fsw(name = "body")]
@@ -276,18 +349,19 @@ pub struct Wheels {
 }
 
 /// The true **world** (inertial/ECI) environment at the spacecraft each cycle: the sun
-/// direction and the magnetic field — the inertial references the attitude sensors observe.
-/// Produced by the plant (which knows the true epoch + position) and consumed by nav as its
-/// MEKF references; also telemetered so the real ECI sun/field are visible in the panel.
+/// direction and the magnetic field the attitude sensors observe. Produced by the plant (which
+/// knows the true epoch + position). Truth telemetry only — nav no longer consumes it (it
+/// models its own references from the GPS position), so this is what makes the real ECI
+/// sun/field visible in the panel next to nav's noisy estimate.
 #[derive(metor_fsw_2::Frame, IntoBytes, Immutable, KnownLayout, FromBytes, Clone)]
 #[repr(C)]
 #[metor_fsw(name = "world")]
 pub struct World {
     #[metor_fsw(timestamp)]
     pub timestamp: Timestamp,
-    /// Unit vector pointing at the sun, in ECI.
+    /// Unit vector pointing at the sun, in ECI (nox-frames' Vallado model).
     pub sun_eci: V3,
-    /// Earth magnetic field in ECI (Tesla), the tilted-dipole model at the true position.
+    /// Earth magnetic field in ECI (Tesla), the NOAA WMM at the true position/epoch.
     pub mag_eci: V3,
 }
 
@@ -458,4 +532,45 @@ pub struct CtrlParams {
     /// LQR attitude/rate state weight (q) and control weight (r).
     pub q_weight: f64,
     pub r_weight: f64,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The WMM field chain (ECI → ECEF → geodetic → WMM → ECI) returns a physically sane field
+    /// at a 400 km orbit: an Earth surface field is ~25–65 µT, weaker aloft, so the magnitude
+    /// should land in the tens-of-µT band — a guard that the km/deg units and frame rotations
+    /// are right (a meters-for-km height slip, say, would blow WMM far out of range).
+    #[test]
+    fn wmm_field_is_sane_at_orbit() {
+        let mut model = MagneticModel::default();
+        let radius = EARTH_RADIUS + ALTITUDE;
+        // A few positions around the orbit, so we exercise more than one geodetic latitude.
+        for pos in [
+            tensor![radius, 0.0, 0.0],
+            tensor![0.0, radius, 0.0],
+            (tensor![1.0, 1.0, 1.0] as V3).normalize() * radius,
+        ] {
+            let b = mag_field_eci(&mut model, mission_epoch(), &pos);
+            let mag = b.norm().into_buf();
+            assert!(
+                (1.0e-5..6.0e-5).contains(&mag),
+                "WMM field magnitude at 400 km should be tens of µT, got {mag} T"
+            );
+        }
+    }
+
+    /// `ecef_to_geodetic` recovers the altitude of a known orbit radius (on the equator, the
+    /// geodetic height above the ellipsoid is `|r| - a`).
+    #[test]
+    fn geodetic_recovers_equatorial_altitude() {
+        let radius = EARTH_RADIUS + ALTITUDE;
+        let (lat, _lon, alt) = ecef_to_geodetic(&tensor![radius, 0.0, 0.0]);
+        assert!(lat.abs() < 1e-9, "equatorial point has ~zero latitude, got {lat}");
+        assert!(
+            (alt - (radius - WGS84_A)).abs() < 1.0,
+            "recovered altitude within 1 m of |r| - a: {alt}"
+        );
+    }
 }
