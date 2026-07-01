@@ -407,7 +407,7 @@ const UPLINK_IDLE: Duration = Duration::from_millis(50);
 /// [`MsgOut`] it re-emits each decoded `SequenceCommand` onto. No typed frame ports — the
 /// command channel is the system's only output (besides the implicit health/log [`Out`] adds).
 pub struct UplinkPorts {
-    commands: MsgOut<BoxBacking>,
+    commands: MsgOut<SequenceCommand>,
 }
 
 impl SystemOutput for UplinkPorts {

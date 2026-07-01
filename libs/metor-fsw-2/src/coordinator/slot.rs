@@ -32,7 +32,7 @@ use metor_proto_wkt::{
 };
 use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
 
-use metor_fsw_ring::{BoxBacking, NoWake};
+use metor_fsw_ring::NoWake;
 
 use super::{CyclicSlot, SlotState, StopReason};
 use crate::abi::FswStatus;
@@ -198,7 +198,7 @@ pub(crate) struct SlotRunner {
     /// per-slot events ring, emitting a [`SequenceChannelEvent`] at every lifecycle
     /// transition and a `Progress` line per occupant progress record. Single-writer
     /// discipline — distinct from the coordinator's boot-`SequenceRegistry` ring.
-    events: MsgOut<BoxBacking>,
+    events: MsgOut<SequenceChannelEvent>,
     /// A read view on the slot's **own** occupant [`SequenceStatus`] output ring,
     /// drained every cycle while Running to source `Progress` lines and the terminal
     /// outcome the host-side `FswStatus` word cannot carry (`docs/messages.md` §5.1).
@@ -235,7 +235,7 @@ impl SlotRunner {
         output_regions: Vec<crate::abi::FswRing>,
         control: Output<SlotControlIn>,
         status_out: Output<SlotStatus>,
-        events: MsgOut<BoxBacking>,
+        events: MsgOut<SequenceChannelEvent>,
         seq_status: Input<SequenceStatus>,
         channel_id: ChannelId,
     ) -> Self {

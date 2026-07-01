@@ -9,11 +9,10 @@
 //! decodes a record with nothing but the id. Messages are an event/command **log**:
 //! every record is preserved in order, never coalesced like a latest-wins snapshot.
 //!
-//! [`MsgOut`] is the emit port — the message twin of [`Output`](crate::Output). It is
-//! **type-erased** over the payload type ([`emit`](MsgOut::emit) is generic per call),
-//! so one writer carries a heterogeneous stream of `Msg`s onto a single ring. v1 mints
-//! `MsgOut`s coordinator-side (the `msg_writer` helper); the user-bundle/binder path is
-//! deferred (`docs/messages.md` Q4).
+//! [`MsgOut<M>`](MsgOut) is the emit port — the message twin of [`Output<F>`](crate::Output),
+//! **typed on one [`Msg`] type `M`** so it can be a first-class wired port
+//! (`docs/message-wiring.md` §2.1): the edge key is `M::ID`, exactly parallel to a frame
+//! port's `F::FRAME_ID`. A channel that carries several `Msg` types becomes several ports.
 
 use core::marker::PhantomData;
 
@@ -24,6 +23,7 @@ use metor_proto::types::{Msg, PacketId};
 use serde::de::DeserializeOwned;
 
 use crate::binder::RingSource;
+use crate::descriptor::PortDesc;
 
 /// Default worst-case message payload size, the [`Frame::MAX_SIZE`](crate::Frame)
 /// analogue for the variable-record ring sizing (`docs/messages.md` §2.1). Generous —
@@ -61,11 +61,12 @@ pub fn split_record(rec: &[u8]) -> Option<(PacketId, &[u8])> {
 // ---------------------------------------------------------------------------
 
 /// One owned **message** output: the single [`Writer`] into a byte ring carrying
-/// `(id, postcard)` records, type-erased over the payload (`docs/messages.md` §1.2).
-/// The message twin of [`Output`](crate::Output) — same single-writer discipline, same
-/// `BoxBacking`/`NoWake` cyclic default — but [`emit`](Self::emit) is generic per call,
-/// so one port carries a heterogeneous stream of [`Msg`] types onto a single ring.
-pub struct MsgOut<B = BoxBacking, WD = NoWake, WS = NoWake>
+/// `(id, postcard)` records, **typed on one [`Msg`] type `M`** (`docs/message-wiring.md`
+/// §2.1). The message twin of [`Output<F>`](crate::Output) — same single-writer discipline,
+/// same `BoxBacking`/`NoWake` cyclic default, and the same `descriptor()`/`bind()` port
+/// contract, so it drops into a `SystemOutput` bundle beside frame ports with no macro
+/// change. The edge key is `M::ID`.
+pub struct MsgOut<M, B = BoxBacking, WD = NoWake, WS = NoWake>
 where
     B: Backing,
     WD: WakeSource,
@@ -76,14 +77,16 @@ where
     /// per-cycle emit grows in place rather than allocating a fresh `Vec` every call —
     /// exactly the [`Output::write_with`](crate::Output) scratch discipline.
     scratch: Vec<u8>,
+    _m: PhantomData<fn() -> M>,
 }
 
-impl<B: Backing, WD: WakeSource, WS: WakeSink> MsgOut<B, WD, WS> {
+impl<M: Msg, B: Backing, WD: WakeSource, WS: WakeSink> MsgOut<M, B, WD, WS> {
     /// Wrap a writer the coordinator created over a [`msg_capacity`]-sized byte ring.
     pub fn new(writer: Writer<B, WD, WS>) -> Self {
         Self {
             writer,
             scratch: Vec::new(),
+            _m: PhantomData,
         }
     }
 
@@ -92,26 +95,31 @@ impl<B: Backing, WD: WakeSource, WS: WakeSink> MsgOut<B, WD, WS> {
     /// into the reused `scratch` via the same `serialize_with_flavor` path the
     /// `IntoLenPacket` impl uses (`../metor-proto/src/types.rs:620`); only the ring
     /// `try_write` can fail, so this surfaces a [`WriteError`] and nothing else.
-    pub fn emit<M: Msg>(&mut self, msg: &M) -> Result<(), WriteError> {
+    pub fn emit(&mut self, msg: &M) -> Result<(), WriteError> {
         self.scratch.clear();
         self.scratch.extend_from_slice(&M::ID);
         postcard::serialize_with_flavor(msg, ScratchFlavor(&mut self.scratch))
             .expect("postcard serialization into an in-memory buffer is infallible");
         self.writer.try_write(&self.scratch)
     }
+
+    /// This port's static descriptor — the message twin of
+    /// [`Output::<F>::descriptor`](crate::Output) (`docs/message-wiring.md` §2.1).
+    pub fn descriptor() -> PortDesc {
+        PortDesc::msg::<M>()
+    }
 }
 
-impl<B, WD, WS> MsgOut<B, WD, WS>
+impl<M, B, WD, WS> MsgOut<M, B, WD, WS>
 where
+    M: Msg,
     B: Backing,
     WD: WakeSource + Default + Clone + 'static,
     WS: WakeSink + Default + Clone + 'static,
 {
-    /// Bind this port over the next ring the [`RingSource`] hands out, taking the
-    /// matched writer-side wake endpoints — the [`Output::bind`](crate::Output) mirror
-    /// for the future user-bundle path. v1 mints `MsgOut`s coordinator-side via the
-    /// `msg_writer` helper, so this is the not-yet-walked binder seam
-    /// (`docs/messages.md` Q4).
+    /// Bind this port over the next ring the [`RingSource`] hands out, taking the matched
+    /// writer-side wake endpoints — the [`Output::bind`](crate::Output) mirror. Walked by
+    /// the derive when a `MsgOut<M>` is declared in a `SystemOutput` bundle.
     pub fn bind<S: RingSource<B = B>>(src: &mut S) -> Self {
         let (ring, data, space) = src.next_output::<WD, WS>();
         MsgOut::new(ring.writer(data, space))
@@ -222,11 +230,13 @@ mod tests {
     };
 
     use super::{MAX_MSG_BYTES, MSG_DEPTH, MsgIn, MsgOut, msg_capacity, split_record};
+    use crate::PortId;
     use crate::registry::MessageEntry;
 
-    /// Mint a `MsgOut` over a fresh byte ring, emit two *different* `Msg` types through
-    /// the one type-erased port, read them back via a `MessageEntry` `View`, and assert
-    /// `split_record` recovers each id and that the payloads postcard-round-trip.
+    /// A heterogeneous channel is now N typed ports (`docs/message-wiring.md` §2.1): mint a
+    /// `MsgOut<SequenceRegistry>` and a `MsgOut<SequenceCommand>` over one ring, emit one of
+    /// each, read them back via a `MessageEntry` `View`, and assert `split_record` recovers
+    /// each id and the payloads postcard-round-trip. Also checks `MsgOut::descriptor`.
     #[test]
     fn msg_out_emits_and_round_trips() {
         let ring = RingBuffer::create_in_memory(Config {
@@ -241,7 +251,15 @@ mod tests {
             ring: ring.clone(),
         };
 
-        let mut out: MsgOut = MsgOut::new(ring.writer(NoWake, NoWake));
+        // A typed port per Msg type (each keyed on its own `M::ID`).
+        let mut reg_out: MsgOut<SequenceRegistry> = MsgOut::new(ring.writer(NoWake, NoWake));
+        let mut cmd_out: MsgOut<SequenceCommand> = MsgOut::new(ring.writer(NoWake, NoWake));
+
+        // The descriptor carries the port's edge key.
+        assert_eq!(
+            MsgOut::<SequenceCommand>::descriptor().id,
+            PortId::Msg(SequenceCommand::ID)
+        );
 
         // Claim the tap before any write — a view on an overwrite ring starts at the
         // live edge, so the tap must exist before data flows (the telemetry-tap order).
@@ -255,14 +273,14 @@ mod tests {
                 available: vec!["commissioning".to_string(), "safe_mode".to_string()],
             }],
         };
-        out.emit(&registry).expect("emit registry");
+        reg_out.emit(&registry).expect("emit registry");
 
-        // Second record: a *different* Msg type on the same port — the type-erasure proof.
+        // Second record: a *different* Msg type, its own typed port on the same ring.
         let command = SequenceCommand {
             channel_id: 0,
             command: SequenceCommandKind::Start,
         };
-        out.emit(&command).expect("emit command");
+        cmd_out.emit(&command).expect("emit command");
 
         let mut buf = Vec::new();
 
@@ -301,29 +319,34 @@ mod tests {
             max_readers: 4,
             overrun: Overrun::Overwrite,
         });
-        let mut out: MsgOut = MsgOut::new(ring.writer(NoWake, NoWake));
+        // Two typed writers share the ring so the drained view sees a heterogeneous stream.
+        let mut reg_out: MsgOut<SequenceRegistry> = MsgOut::new(ring.writer(NoWake, NoWake));
+        let mut cmd_out: MsgOut<SequenceCommand> = MsgOut::new(ring.writer(NoWake, NoWake));
         // Claim the read view before any write (overwrite ring starts at the live edge).
         let mut inbox: MsgIn<SequenceCommand> = MsgIn::new(ring.view(NoWake, NoWake).expect("slot"));
 
         // A different Msg type interleaved with the commands — it must be skipped.
-        out.emit(&SequenceRegistry {
-            channels: vec![SequenceChannelSpec {
-                id: 0,
-                name: "mode".to_string(),
-                available: vec![],
-            }],
-        })
-        .expect("emit registry");
-        out.emit(&SequenceCommand {
-            channel_id: 1,
-            command: SequenceCommandKind::Start,
-        })
-        .expect("emit start");
-        out.emit(&SequenceCommand {
-            channel_id: 2,
-            command: SequenceCommandKind::Stop,
-        })
-        .expect("emit stop");
+        reg_out
+            .emit(&SequenceRegistry {
+                channels: vec![SequenceChannelSpec {
+                    id: 0,
+                    name: "mode".to_string(),
+                    available: vec![],
+                }],
+            })
+            .expect("emit registry");
+        cmd_out
+            .emit(&SequenceCommand {
+                channel_id: 1,
+                command: SequenceCommandKind::Start,
+            })
+            .expect("emit start");
+        cmd_out
+            .emit(&SequenceCommand {
+                channel_id: 2,
+                command: SequenceCommandKind::Stop,
+            })
+            .expect("emit stop");
 
         let mut got: Vec<SequenceCommand> = Vec::new();
         inbox.drain(|c| got.push(c));

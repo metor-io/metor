@@ -24,6 +24,7 @@ use std::slice;
 use std::sync::Arc;
 
 use metor_fsw_ring::{Backing, BoxBacking, Config, NoWake, Overrun, RingBuffer, WakeSink, WakeSource};
+use metor_proto_wkt::SequenceCommand;
 
 use crate::message::{MAX_MSG_BYTES, MSG_DEPTH, MsgOut, msg_capacity};
 use crate::registry::{MessageRegistry, OutputRegistry};
@@ -155,7 +156,7 @@ pub trait RingSource {
     /// emitter just by asking. Single-writer per channel: each call mints a *distinct* ring, so
     /// two emitters never contend. Only the host [`Binder`] carries one; any non-host source
     /// panics, as the registries do.
-    fn command_out(&mut self) -> MsgOut<Self::B> {
+    fn command_out(&mut self) -> MsgOut<SequenceCommand, Self::B> {
         panic!("this ring source has no command bus (host-only capability)")
     }
 }
@@ -213,7 +214,7 @@ impl<'a> RingSource for Binder<'a> {
     /// the system the single [`MsgOut`] writer over it (`docs/messages.md` §4.3). Overwrite (like
     /// every coordinator-owned ring); sized for `MSG_DEPTH` rare commands. The coordinator claims
     /// the matching drain `MsgIn` from `command_rings` after the bind loop.
-    fn command_out(&mut self) -> MsgOut<BoxBacking> {
+    fn command_out(&mut self) -> MsgOut<SequenceCommand> {
         let ring = RingBuffer::create_in_memory(Config {
             capacity: msg_capacity(MAX_MSG_BYTES, MSG_DEPTH),
             max_readers: 1 + COMMAND_READER_SLACK,

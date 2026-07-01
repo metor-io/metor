@@ -441,28 +441,34 @@ async fn message_downlink_fifo_no_coalesce() {
     };
     // Claim the tap before any write (an overwrite-ring view starts at the live edge).
     let mut view = entry.view().expect("reader slot");
-    let mut out: MsgOut = MsgOut::new(ring.writer(NoWake, NoWake));
+    // Typed ports — a heterogeneous channel is N ports now (`docs/message-wiring.md` §2.1);
+    // both writers share the ring so the tap drains one interleaved stream.
+    let mut cmd_out: MsgOut<SequenceCommand> = MsgOut::new(ring.writer(NoWake, NoWake));
+    let mut reg_out: MsgOut<SequenceRegistry> = MsgOut::new(ring.writer(NoWake, NoWake));
 
     // An event/command *log* of three records — two of one Msg type, one of another,
     // interleaved. A snapshot would coalesce the two `SequenceCommand`s; a log must not.
-    out.emit(&SequenceCommand {
-        channel_id: 0,
-        command: SequenceCommandKind::Start,
-    })
-    .expect("emit start");
-    out.emit(&SequenceRegistry {
-        channels: vec![SequenceChannelSpec {
-            id: 0,
-            name: "mode".to_string(),
-            available: vec!["commissioning".to_string()],
-        }],
-    })
-    .expect("emit registry");
-    out.emit(&SequenceCommand {
-        channel_id: 7,
-        command: SequenceCommandKind::Abort,
-    })
-    .expect("emit abort");
+    cmd_out
+        .emit(&SequenceCommand {
+            channel_id: 0,
+            command: SequenceCommandKind::Start,
+        })
+        .expect("emit start");
+    reg_out
+        .emit(&SequenceRegistry {
+            channels: vec![SequenceChannelSpec {
+                id: 0,
+                name: "mode".to_string(),
+                available: vec!["commissioning".to_string()],
+            }],
+        })
+        .expect("emit registry");
+    cmd_out
+        .emit(&SequenceCommand {
+            channel_id: 7,
+            command: SequenceCommandKind::Abort,
+        })
+        .expect("emit abort");
 
     // The shared wait queue + both hand-offs (one sender drains both).
     let wq = Arc::new(WaitQueue::new());
