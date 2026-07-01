@@ -10,6 +10,10 @@ description = "Shared compile-time contracts (frames + per-system Params) for th
 # The frame derives (`Frame`/`AsVTable`/…) are self-contained — they expand to
 # `::metor_fsw_2::…` paths, so this crate needs only metor-fsw-2 (no direct metor-fsw).
 metor-fsw-2 = { path = "../../../libs/metor-fsw-2" }
+# The standalone component sub-derives (AsVTable/Componentize/… on the nested `ReactionWheel`,
+# which is not a top-level `Frame`) expand to `::metor_fsw` paths, so the derive needs
+# metor-fsw in scope (metor-fsw-2 re-bundles these only inside `#[derive(Frame)]`).
+metor-fsw = { path = "../../../libs/metor-fsw" }
 nox = { workspace = true }
 # Real-world environment models: the ECI sun direction (Vallado) at an epoch.
 nox-frames = { path = "../../../libs/nox-frames", features = ["earth"] }

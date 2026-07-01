@@ -64,6 +64,21 @@ impl_componentize!(
     T1, T2, T3, T4, T5, T6, T7, T9, T10, T11, T12, T13, T14, T15, T16, T17, T18
 );
 
+/// A fixed-size array sinks each element in order — the array analogue of the tuple impl
+/// above (and the sink twin of the `AsVTable`/`Metadatatize` array impls that let a
+/// `[Struct; N]` group be a frame field). Element component-ids are not index-scoped, so as
+/// with a same-typed tuple this is lossy on the columnar path; the frame's `VTable` (which
+/// indexes `field.i.*`) is the addressed view.
+impl<const N: usize, T: Componentize> Componentize for [T; N] {
+    fn sink_columns(&self, output: &mut impl Decomponentize) {
+        for item in self {
+            item.sink_columns(output);
+        }
+    }
+
+    const MAX_SIZE: usize = T::MAX_SIZE.saturating_mul(N);
+}
+
 pub trait Decomponentize {
     type Error;
     fn apply_value(
@@ -149,6 +164,23 @@ impl_decomponentize!(
 impl_decomponentize!(
     T1, T2, T3, T4, T5, T6, T7, T9, T10, T11, T12, T13, T14, T15, T16, T17, T18
 );
+
+/// A fixed-size array applies each incoming value to every element (each self-filters by its
+/// own component ids) — the array analogue of the same-typed tuple impl above.
+impl<const N: usize, E, T: Decomponentize<Error = E>> Decomponentize for [T; N] {
+    type Error = E;
+    fn apply_value(
+        &mut self,
+        component_id: ComponentId,
+        value: ComponentView<'_>,
+        timestamp: Option<Timestamp>,
+    ) -> Result<(), Self::Error> {
+        for item in self {
+            item.apply_value(component_id, value.clone(), timestamp)?;
+        }
+        Ok(())
+    }
+}
 
 pub trait FromComponentView: Sized {
     fn from_component_view(view: ComponentView<'_>) -> Result<Self, Error>;
