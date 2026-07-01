@@ -35,7 +35,7 @@ use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
 
 use crate::binder::{BindPorts, Binder, BoundInput, BoundPort};
 use crate::descriptor::compatible;
-use crate::descriptor::{Hz, PortDesc, PortId, SystemDescriptor, SystemKind};
+use crate::descriptor::{Hz, PortDesc, PortId, PortKind, SystemDescriptor, SystemKind};
 use crate::dynamic::FrameList;
 use crate::health::{HealthPort, Level};
 use crate::message::{MAX_MSG_BYTES, MSG_DEPTH, MsgIn, MsgOut, msg_capacity};
@@ -143,31 +143,33 @@ impl PortRef {
 pub enum WireError {
     /// A `PortRef` named a system index that was never registered.
     UnknownSystem { id: usize },
-    /// A system has no port carrying the named frame.
+    /// A system has no port carrying the named frame or message.
     UnknownPort {
         system: usize,
-        frame_id: ComponentId,
+        port: PortId,
     },
-    /// `connect` named a producer and consumer port that do not share a frame id.
+    /// `connect` named a producer and consumer port that do not share a port id.
     FrameIdMismatch {
-        producer: ComponentId,
-        consumer: ComponentId,
+        producer: PortId,
+        consumer: PortId,
     },
-    /// The producer's frame does not satisfy the consumer's required shape.
+    /// The producer's frame/message does not satisfy the consumer's required shape.
     Incompatible {
         producer: &'static str,
         consumer: &'static str,
-        frame_id: ComponentId,
+        port: PortId,
     },
-    /// An input port was never connected (nothing would ever write it).
+    /// A **frame** input port was never connected (nothing would ever write it). Message
+    /// inputs may be unconnected (zero producers is legal, `docs/message-wiring.md` §3.2).
     UnconnectedInput {
         system: &'static str,
-        frame_id: ComponentId,
+        port: PortId,
     },
-    /// Two producers were connected into one input port.
+    /// Two producers were connected into one **frame** input port. Message inputs allow
+    /// fan-in (`docs/message-wiring.md` §3.2), so this never fires for them.
     DoubleConnect {
         system: &'static str,
-        frame_id: ComponentId,
+        port: PortId,
     },
     /// A feedback loop was left unbroken: a cycle remains in the graph once the
     /// intentional one-cycle-delayed edges (`connect_delayed`) are removed. Every
@@ -181,27 +183,27 @@ impl std::fmt::Display for WireError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             WireError::UnknownSystem { id } => write!(f, "unknown system handle #{id}"),
-            WireError::UnknownPort { system, frame_id } => {
-                write!(f, "system #{system} has no port for frame {frame_id:?}")
+            WireError::UnknownPort { system, port } => {
+                write!(f, "system #{system} has no port {port:?}")
             }
             WireError::FrameIdMismatch { producer, consumer } => write!(
                 f,
-                "connect frame-id mismatch: producer {producer:?} vs consumer {consumer:?}"
+                "connect port-id mismatch: producer {producer:?} vs consumer {consumer:?}"
             ),
             WireError::Incompatible {
                 producer,
                 consumer,
-                frame_id,
+                port,
             } => write!(
                 f,
-                "incompatible edge {producer} -> {consumer} on frame {frame_id:?}"
+                "incompatible edge {producer} -> {consumer} on port {port:?}"
             ),
-            WireError::UnconnectedInput { system, frame_id } => {
-                write!(f, "{system} input for frame {frame_id:?} is not connected")
+            WireError::UnconnectedInput { system, port } => {
+                write!(f, "{system} input for port {port:?} is not connected")
             }
-            WireError::DoubleConnect { system, frame_id } => write!(
+            WireError::DoubleConnect { system, port } => write!(
                 f,
-                "{system} input for frame {frame_id:?} connected more than once"
+                "{system} input for port {port:?} connected more than once"
             ),
             WireError::FeedbackCycle { systems } => write!(
                 f,
@@ -768,6 +770,16 @@ impl CoordinatorBuilder {
         self.push_edge(producer, consumer, true)
     }
 
+    /// Connect a producer's message output to a consumer's message input
+    /// (`docs/message-wiring.md` §3). Both endpoints must be `PortId::Msg` ports carrying
+    /// the same `M::ID`. Unlike a frame edge, a message edge is many-to-many (fan-in and
+    /// fan-out) and is excluded from feedback-cycle detection — a message channel is a
+    /// decoupled event/command bus, so a command loop needs no `connect_delayed`. Use
+    /// [`PortRef::msg`] to address the endpoints.
+    pub fn connect_msg(&mut self, producer: PortRef, consumer: PortRef) -> Result<(), WireError> {
+        self.push_edge(producer, consumer, false)
+    }
+
     fn push_edge(
         &mut self,
         producer: PortRef,
@@ -786,8 +798,8 @@ impl CoordinatorBuilder {
         }
         if producer.port != consumer.port {
             return Err(WireError::FrameIdMismatch {
-                producer: producer.port.frame_id(),
-                consumer: consumer.port.frame_id(),
+                producer: producer.port,
+                consumer: consumer.port,
             });
         }
         self.edges.push((producer, consumer, delayed));
@@ -801,10 +813,14 @@ impl CoordinatorBuilder {
         let depth = self.config.default_depth;
 
         // --- Validate edges, build the connection map ------------------------
-        // (cons_id, in_idx) -> (prod_id, out_idx)
+        // (cons_id, in_idx) -> (prod_id, out_idx) — FRAME inputs (exactly one producer).
         let mut cons_edge: HashMap<(usize, usize), (usize, usize)> = HashMap::new();
-        // System-level adjacency over the NON-delayed edges only, for cycle
-        // detection: a remaining cycle is an unbroken feedback loop.
+        // (cons_id, in_idx) -> [(prod_id, out_idx)] — MESSAGE inputs (fan-in: zero/one/many
+        // producers, `docs/message-wiring.md` §3.2).
+        let mut msg_cons_edges: HashMap<(usize, usize), Vec<(usize, usize)>> = HashMap::new();
+        // System-level adjacency over the NON-delayed FRAME edges only, for cycle detection: a
+        // remaining cycle is an unbroken feedback loop. Message edges are excluded — a message
+        // channel is a decoupled event/command bus, not a same-cycle dependency (§3.6).
         let mut forward_adj: Vec<Vec<usize>> = vec![Vec::new(); n];
         for (p, c, delayed) in &self.edges {
             let out_idx = self.descs[p.system.id]
@@ -813,7 +829,7 @@ impl CoordinatorBuilder {
                 .position(|d| d.id == p.port)
                 .ok_or(WireError::UnknownPort {
                     system: p.system.id,
-                    frame_id: p.port.frame_id(),
+                    port: p.port,
                 })?;
             let in_idx = self.descs[c.system.id]
                 .inputs
@@ -821,7 +837,7 @@ impl CoordinatorBuilder {
                 .position(|d| d.id == c.port)
                 .ok_or(WireError::UnknownPort {
                     system: c.system.id,
-                    frame_id: c.port.frame_id(),
+                    port: c.port,
                 })?;
             if !compatible(
                 &self.descs[p.system.id].outputs[out_idx],
@@ -830,20 +846,32 @@ impl CoordinatorBuilder {
                 return Err(WireError::Incompatible {
                     producer: self.descs[p.system.id].name,
                     consumer: self.descs[c.system.id].name,
-                    frame_id: c.port.frame_id(),
+                    port: c.port,
                 });
             }
-            if cons_edge
-                .insert((c.system.id, in_idx), (p.system.id, out_idx))
-                .is_some()
-            {
-                return Err(WireError::DoubleConnect {
-                    system: self.descs[c.system.id].name,
-                    frame_id: c.port.frame_id(),
-                });
-            }
-            if !delayed && p.system.id != c.system.id {
-                forward_adj[p.system.id].push(c.system.id);
+            match c.port {
+                // Frame edge: exactly-one producer per input; participates in cycle detection.
+                PortId::Frame(_) => {
+                    if cons_edge
+                        .insert((c.system.id, in_idx), (p.system.id, out_idx))
+                        .is_some()
+                    {
+                        return Err(WireError::DoubleConnect {
+                            system: self.descs[c.system.id].name,
+                            port: c.port,
+                        });
+                    }
+                    if !delayed && p.system.id != c.system.id {
+                        forward_adj[p.system.id].push(c.system.id);
+                    }
+                }
+                // Message edge: fan-in (append), no double-connect, excluded from cycles.
+                PortId::Msg(_) => {
+                    msg_cons_edges
+                        .entry((c.system.id, in_idx))
+                        .or_default()
+                        .push((p.system.id, out_idx));
+                }
             }
         }
 
@@ -854,22 +882,28 @@ impl CoordinatorBuilder {
             });
         }
 
-        // --- Every input must be connected exactly once ----------------------
+        // --- Every FRAME input must be connected exactly once ----------------
+        // A message input may have zero producers (fan-in is optional, §3.2).
         for s in 0..n {
             for (in_idx, port) in self.descs[s].inputs.iter().enumerate() {
-                if !cons_edge.contains_key(&(s, in_idx)) {
+                if matches!(port.id, PortId::Frame(_)) && !cons_edge.contains_key(&(s, in_idx)) {
                     return Err(WireError::UnconnectedInput {
                         system: self.descs[s].name,
-                        frame_id: port.frame_id(),
+                        port: port.id,
                     });
                 }
             }
         }
 
-        // --- Fan-out per output port -----------------------------------------
+        // --- Fan-out per output port (frame + message consumers) -------------
         let mut fan_out: HashMap<(usize, usize), usize> = HashMap::new();
         for &(prod_id, out_idx) in cons_edge.values() {
             *fan_out.entry((prod_id, out_idx)).or_insert(0) += 1;
+        }
+        for producers in msg_cons_edges.values() {
+            for &(prod_id, out_idx) in producers {
+                *fan_out.entry((prod_id, out_idx)).or_insert(0) += 1;
+            }
         }
 
         let mut table = RingTable { rings: Vec::new() };
@@ -891,23 +925,49 @@ impl CoordinatorBuilder {
             for (out_idx, port) in self.descs[s].outputs.iter().enumerate() {
                 let readers =
                     fan_out.get(&(s, out_idx)).copied().unwrap_or(0) + n_reg + READER_SLACK;
-                let ring = RingBuffer::create_in_memory(Config {
-                    capacity: capacity_for(port.max_size, depth),
-                    max_readers: readers,
-                    overrun: Overrun::Overwrite,
-                });
-                row.push(ring.clone());
                 let instance = self.names[s].clone();
-                reg_entries.push(registry_entry(&instance, port, ring.clone()));
-                table.rings.push(RingEntry {
-                    ring,
-                    frame_id: port.frame_id(),
-                    role: BufferRole::Output {
-                        system: s,
-                        port: out_idx,
-                    },
-                    instance: Some(instance),
-                });
+                let role = BufferRole::Output {
+                    system: s,
+                    port: out_idx,
+                };
+                let ring = match &port.kind {
+                    PortKind::Frame { .. } => {
+                        let ring = RingBuffer::create_in_memory(Config {
+                            capacity: capacity_for(port.max_size, depth),
+                            max_readers: readers,
+                            overrun: Overrun::Overwrite,
+                        });
+                        reg_entries.push(registry_entry(&instance, port, ring.clone()));
+                        table.rings.push(RingEntry {
+                            ring: ring.clone(),
+                            frame_id: port.frame_id(),
+                            role,
+                            instance: Some(instance),
+                        });
+                        ring
+                    }
+                    PortKind::Message { .. } => {
+                        // A wired message output: variable-record sizing. Its telemetry-tap
+                        // `MessageRegistry` entry (with the `telemetered` flag) is added in WP6;
+                        // here the ring is allocated + kept alive so consumers fan in from it.
+                        let ring = RingBuffer::create_in_memory(Config {
+                            capacity: msg_capacity(MAX_MSG_BYTES, MSG_DEPTH),
+                            max_readers: readers,
+                            overrun: Overrun::Overwrite,
+                        });
+                        table.rings.push(RingEntry {
+                            ring: ring.clone(),
+                            frame_id: ComponentId::new(&format!("{instance}.{}", port.name)),
+                            role,
+                            instance: Some(instance),
+                        });
+                        ring
+                    }
+                    PortKind::ReceiveAll => {
+                        unreachable!("receive-all tap ports are wired in WP6, not as ring outputs")
+                    }
+                };
+                row.push(ring);
             }
             output_rings.push(row);
         }
@@ -1078,6 +1138,12 @@ impl CoordinatorBuilder {
                 continue;
             }
             for in_idx in 0..self.descs[s].inputs.len() {
+                // Message inputs use a direct fan-in multi-view (§3.3), not a private copy-in
+                // buffer — messages are a best-effort log, so an async consumer polls the shared
+                // producer rings directly (`MsgIn` resyncs on lap).
+                if matches!(self.descs[s].inputs[in_idx].id, PortId::Msg(_)) {
+                    continue;
+                }
                 let (prod_id, out_idx) = cons_edge[&(s, in_idx)];
                 let port = &self.descs[s].inputs[in_idx];
                 let private = RingBuffer::create_in_memory(Config {
@@ -1225,20 +1291,37 @@ impl CoordinatorBuilder {
                     let outs: Vec<BoundPort> = (0..self.descs[id].outputs.len())
                         .map(|out_idx| BoundPort::new(output_rings[id][out_idx].clone()))
                         .collect();
-                    // Inputs: cyclic consumers view the producer's output directly; async
-                    // consumers view their private copy-in buffer with the matched wake. Every
-                    // input is a frame port here (`BoundInput::One`); message fan-in
-                    // (`BoundInput::Many`) arrives with message edges (WP4).
+                    // Inputs, in `descriptors()` order. A frame input is `One`: cyclic consumers
+                    // view the producer's output directly, async consumers view their private
+                    // copy-in buffer with the matched wake. A message input is `Many`: a direct
+                    // multi-view over every producer ring wired to it (fan-in, §3.3), NoWake — a
+                    // best-effort log the consumer poll-drains (no copy-in, cyclic or async).
                     let ins: Vec<BoundInput> = (0..self.descs[id].inputs.len())
-                        .map(|in_idx| {
-                            let (prod_id, out_idx) = cons_edge[&(id, in_idx)];
-                            let port = if self.kinds[id] == SystemKind::Async {
-                                let (ring, data, space) = private_inputs[&(id, in_idx)].clone();
-                                BoundPort::matched(ring, Box::new(data), Box::new(space))
-                            } else {
-                                BoundPort::new(output_rings[prod_id][out_idx].clone())
-                            };
-                            BoundInput::One(port)
+                        .map(|in_idx| match self.descs[id].inputs[in_idx].id {
+                            PortId::Frame(_) => {
+                                let (prod_id, out_idx) = cons_edge[&(id, in_idx)];
+                                let port = if self.kinds[id] == SystemKind::Async {
+                                    let (ring, data, space) = private_inputs[&(id, in_idx)].clone();
+                                    BoundPort::matched(ring, Box::new(data), Box::new(space))
+                                } else {
+                                    BoundPort::new(output_rings[prod_id][out_idx].clone())
+                                };
+                                BoundInput::One(port)
+                            }
+                            PortId::Msg(_) => {
+                                let ports = msg_cons_edges
+                                    .get(&(id, in_idx))
+                                    .map(|producers| {
+                                        producers
+                                            .iter()
+                                            .map(|&(prod_id, out_idx)| {
+                                                BoundPort::new(output_rings[prod_id][out_idx].clone())
+                                            })
+                                            .collect()
+                                    })
+                                    .unwrap_or_default();
+                                BoundInput::Many(ports)
+                            }
                         })
                         .collect();
 
