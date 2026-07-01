@@ -113,14 +113,14 @@ fn macro_descriptor_shape() {
 
     // inputs = [user `att` (SystemHealth), then the implicit SlotControlIn].
     assert_eq!(d.inputs.len(), 2);
-    assert_eq!(d.inputs[0].frame_id, SystemHealth::FRAME_ID);
-    assert_eq!(d.inputs[1].frame_id, SlotControlIn::FRAME_ID);
+    assert_eq!(d.inputs[0].frame_id(), SystemHealth::FRAME_ID);
+    assert_eq!(d.inputs[1].frame_id(), SlotControlIn::FRAME_ID);
 
     // outputs = [user `out` (SystemHealth), then the Out<SeqStatusOut> tail:
     // SequenceStatus, health, log].
     assert_eq!(d.outputs.len(), 4);
-    assert_eq!(d.outputs[0].frame_id, SystemHealth::FRAME_ID);
-    assert_eq!(d.outputs[1].frame_id, SequenceStatus::FRAME_ID);
-    assert_eq!(d.outputs[2].frame_id, SystemHealth::FRAME_ID);
-    assert_eq!(d.outputs[3].frame_id, SystemLog::FRAME_ID);
+    assert_eq!(d.outputs[0].frame_id(), SystemHealth::FRAME_ID);
+    assert_eq!(d.outputs[1].frame_id(), SequenceStatus::FRAME_ID);
+    assert_eq!(d.outputs[2].frame_id(), SystemHealth::FRAME_ID);
+    assert_eq!(d.outputs[3].frame_id(), SystemLog::FRAME_ID);
 }

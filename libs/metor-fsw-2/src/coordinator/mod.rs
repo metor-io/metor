@@ -25,7 +25,7 @@ use std::time::{Duration, Instant};
 use metor_fsw_ring::{
     BoxBacking, Config, NoWake, Notifier, Overrun, RingBuffer, View, WakeSource, Writer,
 };
-use metor_proto::types::{ComponentId, Timestamp};
+use metor_proto::types::{ComponentId, Msg, Timestamp};
 use metor_proto_wkt::{ChannelId, SequenceChannelSpec, SequenceCommand, SequenceRegistry};
 use stellarator::sync::WaitQueue;
 use stellarator::{JoinHandle, JoinHandleDropGuard};
@@ -33,7 +33,7 @@ use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
 
 use crate::binder::{BindPorts, Binder, BoundPort};
 use crate::descriptor::compatible;
-use crate::descriptor::{Hz, PortDesc, SystemDescriptor, SystemKind};
+use crate::descriptor::{Hz, PortDesc, PortId, SystemDescriptor, SystemKind};
 use crate::dynamic::FrameList;
 use crate::health::{HealthPort, Level};
 use crate::message::{MAX_MSG_BYTES, MSG_DEPTH, MsgIn, MsgOut, msg_capacity};
@@ -110,13 +110,12 @@ pub struct SystemHandle {
     id: usize,
 }
 
-/// Addresses one port as `(system, frame_id)` — both come straight off the
-/// already-derived `SystemDescriptor`, so the wiring loader can resolve a KDL edge
-/// to a `connect`.
+/// Addresses one port as `(system, port)` — both come straight off the already-derived
+/// `SystemDescriptor`, so the wiring loader can resolve a KDL edge to a `connect`.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct PortRef {
     pub system: SystemHandle,
-    pub frame_id: ComponentId,
+    pub port: PortId,
 }
 
 impl PortRef {
@@ -124,7 +123,15 @@ impl PortRef {
     pub fn new<F: Frame>(system: SystemHandle) -> Self {
         Self {
             system,
-            frame_id: F::FRAME_ID,
+            port: PortId::Frame(F::FRAME_ID),
+        }
+    }
+
+    /// Address the port carrying message `M` on `system` (`docs/message-wiring.md` §3).
+    pub fn msg<M: Msg>(system: SystemHandle) -> Self {
+        Self {
+            system,
+            port: PortId::Msg(M::ID),
         }
     }
 }
@@ -706,7 +713,7 @@ impl CoordinatorBuilder {
         let leaked: &'static str = Box::leak(name.clone().into_boxed_str());
         let mut inputs = base.inputs.clone();
         // Drop the trailing slot-owned `SlotControlIn` input (host-written, not edge-connected).
-        if inputs.last().map(|p| p.frame_id) == Some(SlotControlIn::FRAME_ID) {
+        if inputs.last().map(|p| p.id) == Some(PortId::Frame(SlotControlIn::FRAME_ID)) {
             inputs.pop();
         }
         let registered = SystemDescriptor {
@@ -775,10 +782,10 @@ impl CoordinatorBuilder {
                 id: consumer.system.id,
             });
         }
-        if producer.frame_id != consumer.frame_id {
+        if producer.port != consumer.port {
             return Err(WireError::FrameIdMismatch {
-                producer: producer.frame_id,
-                consumer: consumer.frame_id,
+                producer: producer.port.frame_id(),
+                consumer: consumer.port.frame_id(),
             });
         }
         self.edges.push((producer, consumer, delayed));
@@ -801,18 +808,18 @@ impl CoordinatorBuilder {
             let out_idx = self.descs[p.system.id]
                 .outputs
                 .iter()
-                .position(|d| d.frame_id == p.frame_id)
+                .position(|d| d.id == p.port)
                 .ok_or(WireError::UnknownPort {
                     system: p.system.id,
-                    frame_id: p.frame_id,
+                    frame_id: p.port.frame_id(),
                 })?;
             let in_idx = self.descs[c.system.id]
                 .inputs
                 .iter()
-                .position(|d| d.frame_id == c.frame_id)
+                .position(|d| d.id == c.port)
                 .ok_or(WireError::UnknownPort {
                     system: c.system.id,
-                    frame_id: c.frame_id,
+                    frame_id: c.port.frame_id(),
                 })?;
             if !compatible(
                 &self.descs[p.system.id].outputs[out_idx],
@@ -821,7 +828,7 @@ impl CoordinatorBuilder {
                 return Err(WireError::Incompatible {
                     producer: self.descs[p.system.id].name,
                     consumer: self.descs[c.system.id].name,
-                    frame_id: c.frame_id,
+                    frame_id: c.port.frame_id(),
                 });
             }
             if cons_edge
@@ -830,7 +837,7 @@ impl CoordinatorBuilder {
             {
                 return Err(WireError::DoubleConnect {
                     system: self.descs[c.system.id].name,
-                    frame_id: c.frame_id,
+                    frame_id: c.port.frame_id(),
                 });
             }
             if !delayed && p.system.id != c.system.id {
@@ -851,7 +858,7 @@ impl CoordinatorBuilder {
                 if !cons_edge.contains_key(&(s, in_idx)) {
                     return Err(WireError::UnconnectedInput {
                         system: self.descs[s].name,
-                        frame_id: port.frame_id,
+                        frame_id: port.frame_id(),
                     });
                 }
             }
@@ -892,7 +899,7 @@ impl CoordinatorBuilder {
                 reg_entries.push(registry_entry(&instance, port, ring.clone()));
                 table.rings.push(RingEntry {
                     ring,
-                    frame_id: port.frame_id,
+                    frame_id: port.frame_id(),
                     role: BufferRole::Output {
                         system: s,
                         port: out_idx,
@@ -919,7 +926,7 @@ impl CoordinatorBuilder {
             reg_entries.push(registry_entry(COORDINATOR_INSTANCE, &desc, ring.clone()));
             table.rings.push(RingEntry {
                 ring,
-                frame_id: desc.frame_id,
+                frame_id: desc.frame_id(),
                 role: BufferRole::Coordinator,
                 instance: None,
             });
@@ -997,7 +1004,7 @@ impl CoordinatorBuilder {
             let seq_idx = self.descs[s]
                 .outputs
                 .iter()
-                .position(|p| p.frame_id == SequenceStatus::FRAME_ID)
+                .position(|p| p.id == PortId::Frame(SequenceStatus::FRAME_ID))
                 .expect("a v1 slot occupant publishes a SequenceStatus output");
             let seq_status = Input::new(
                 output_rings[s][seq_idx]
@@ -1091,7 +1098,7 @@ impl CoordinatorBuilder {
                 async_wakes[s].push(data);
                 table.rings.push(RingEntry {
                     ring: private,
-                    frame_id: port.frame_id,
+                    frame_id: port.frame_id(),
                     role: BufferRole::Private {
                         system: s,
                         input: in_idx,
@@ -1413,13 +1420,13 @@ const COORDINATOR_INSTANCE: &str = "coordinator";
 /// the prefixed announce vtable+metadata once (telemetry.md §2.1/§6), capturing a
 /// clone of the ring as the read source.
 fn registry_entry(instance: &str, port: &PortDesc, ring: RingBuffer<BoxBacking>) -> RegistryEntry {
-    let key = ComponentId::new(&format!("{instance}.{}", port.frame_name));
+    let key = ComponentId::new(&format!("{instance}.{}", port.name));
     // `announce` is an `Arc<dyn Fn>` (not directly callable); deref to a `&dyn Fn`.
-    let (vtable, metadata) = (*port.announce)(instance);
+    let (vtable, metadata) = (*port.announce())(instance);
     RegistryEntry {
         key,
         instance: Arc::from(instance),
-        frame_id: port.frame_id,
+        frame_id: port.frame_id(),
         vtable,
         metadata,
         ring,
