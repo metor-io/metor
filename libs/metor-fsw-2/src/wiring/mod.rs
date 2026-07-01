@@ -64,8 +64,9 @@ pub use build_driver::{BuildError, BuildOptions, build_artifacts};
 pub use bundle::{BundleError, PackageOptions, load_bundle, write_bundle};
 pub use builder::{SlotSpecBuilder, SystemSpecBuilder, WiringBuilder};
 pub use model::{
-    AllowedOccupantSpec, Artifact, ClockSpec, CoordinatorSpec, EdgeSpec, InitialOccupantSpec,
-    ParamSource, SlotInitState, SlotSpec, SystemSpec, TelemetryModeSpec, TelemetrySpec, Wiring,
+    AllowedOccupantSpec, Artifact, ClockSpec, CoordinatorSpec, EdgeKind, EdgeSpec,
+    InitialOccupantSpec, ParamSource, SlotInitState, SlotSpec, SystemSpec, TelemetryModeSpec,
+    TelemetrySpec, Wiring,
 };
 
 // Re-export the derive and the registration macro so a system author only needs
@@ -196,6 +197,17 @@ pub enum LoadError {
         #[source_code]
         src: String,
         #[label("misspelled or wrong-direction frame")]
+        span: SourceSpan,
+    },
+
+    #[error("instance `{instance}` has no message port for `{msg}`")]
+    #[diagnostic(code(fsw_wiring::unknown_msg))]
+    UnknownMsg {
+        instance: String,
+        msg: String,
+        #[source_code]
+        src: String,
+        #[label("misspelled or wrong-direction message type")]
         span: SourceSpan,
     },
 
@@ -649,6 +661,8 @@ struct Edge {
     in_: String,
     /// `delayed=#true` ⇒ a one-cycle-delayed feedback back-edge (`connect_delayed`).
     delayed: bool,
+    /// Frame (`frame=`) vs message (`msg=`) edge.
+    kind: EdgeKind,
 }
 
 /// Parse a KDL wiring document, instantiate every system from `registry`, connect
@@ -727,6 +741,7 @@ pub fn parse(kdl: &str) -> Result<Wiring, LoadError> {
             to: e.to,
             in_: e.in_,
             delayed: e.delayed,
+            kind: e.kind,
         });
     }
 
@@ -805,12 +820,14 @@ pub fn resolve(wiring: &Wiring, registry: &Registry) -> Result<Coordinator, Load
     for edge in &wiring.edges {
         let src = edge_src(edge);
         let span: SourceSpan = (0, src.len()).into();
-        let producer = resolve_endpoint(&instances, &src, &edge.from, &edge.out, Dir::Out, span)?;
-        let consumer = resolve_endpoint(&instances, &src, &edge.to, &edge.in_, Dir::In, span)?;
-        let result = if edge.delayed {
-            builder.connect_delayed(producer, consumer)
-        } else {
-            builder.connect(producer, consumer)
+        let producer =
+            resolve_endpoint(&instances, &src, &edge.from, &edge.out, edge.kind, Dir::Out, span)?;
+        let consumer =
+            resolve_endpoint(&instances, &src, &edge.to, &edge.in_, edge.kind, Dir::In, span)?;
+        let result = match edge.kind {
+            EdgeKind::Msg => builder.connect_msg(producer, consumer),
+            EdgeKind::Frame if edge.delayed => builder.connect_delayed(producer, consumer),
+            EdgeKind::Frame => builder.connect(producer, consumer),
         };
         result.map_err(|source| LoadError::Wire { source, src, span })?;
     }
@@ -1598,7 +1615,7 @@ fn parse_edge(node: &KdlNode, src: &str) -> Result<Edge, LoadError> {
     let delayed = node.get("delayed").and_then(|v| v.as_bool()).unwrap_or(false);
 
     if let Some(from) = prop_string(node, "from") {
-        // Explicit long form.
+        // Explicit long form — frame edges only (a message edge uses the `msg=` shorthand).
         let to = prop_string(node, "to").ok_or_else(|| missing("to"))?;
         let out = prop_string(node, "out").ok_or_else(|| missing("out"))?;
         let in_ = prop_string(node, "in").ok_or_else(|| missing("in"))?;
@@ -1608,10 +1625,12 @@ fn parse_edge(node: &KdlNode, src: &str) -> Result<Edge, LoadError> {
             out: out.to_string(),
             in_: in_.to_string(),
             delayed,
+            kind: EdgeKind::Frame,
         });
     }
 
-    // Shorthand: the nameless arguments are `"from"`, (optional `->`), `"to"`.
+    // Shorthand: the nameless arguments are `"from"`, (optional `->`), `"to"`; the port is
+    // named by exactly one of `frame=` (a component frame) or `msg=` (a message type).
     let args: Vec<&str> = node
         .entries()
         .iter()
@@ -1623,13 +1642,19 @@ fn parse_edge(node: &KdlNode, src: &str) -> Result<Edge, LoadError> {
         [from, to] => (*from, *to),
         _ => return Err(missing("from/to")),
     };
-    let frame = prop_string(node, "frame").ok_or_else(|| missing("frame"))?;
+    let (port_name, kind) = match (prop_string(node, "frame"), prop_string(node, "msg")) {
+        (Some(frame), None) => (frame, EdgeKind::Frame),
+        (None, Some(msg)) => (msg, EdgeKind::Msg),
+        (Some(_), Some(_)) => return Err(missing("frame/msg (name exactly one)")),
+        (None, None) => return Err(missing("frame")),
+    };
     Ok(Edge {
         from: from.to_string(),
         to: to.to_string(),
-        out: frame.to_string(),
-        in_: frame.to_string(),
+        out: port_name.to_string(),
+        in_: port_name.to_string(),
         delayed,
+        kind,
     })
 }
 
@@ -1640,7 +1665,8 @@ fn resolve_endpoint(
     instances: &HashMap<String, Instance>,
     src: &str,
     name: &str,
-    frame: &str,
+    port_name: &str,
+    kind: EdgeKind,
     dir: Dir,
     span: SourceSpan,
 ) -> Result<PortRef, LoadError> {
@@ -1649,20 +1675,43 @@ fn resolve_endpoint(
         src: src.to_string(),
         span,
     })?;
-    let frame_id = ComponentId::new(frame);
-    let port = PortId::Frame(frame_id);
     let ports = match dir {
         Dir::Out => &inst.desc.outputs,
         Dir::In => &inst.desc.inputs,
     };
-    if !ports.iter().any(|p| p.id == port) {
-        return Err(LoadError::UnknownFrame {
-            instance: name.to_string(),
-            frame: frame.to_string(),
-            src: src.to_string(),
-            span,
-        });
-    }
+    let port = match kind {
+        EdgeKind::Frame => {
+            let id = PortId::Frame(ComponentId::new(port_name));
+            if !ports.iter().any(|p| p.id == id) {
+                return Err(LoadError::UnknownFrame {
+                    instance: name.to_string(),
+                    frame: port_name.to_string(),
+                    src: src.to_string(),
+                    span,
+                });
+            }
+            id
+        }
+        // A message port is matched by its display name (the Msg type name); the `PacketId`
+        // comes from the matched port, not a name hash — the wkt sequence Msgs hand-assign
+        // their ids (`docs/message-wiring.md` §3.4).
+        EdgeKind::Msg => {
+            let found = ports
+                .iter()
+                .find(|p| matches!(p.id, PortId::Msg(_)) && p.name == port_name);
+            match found {
+                Some(p) => p.id,
+                None => {
+                    return Err(LoadError::UnknownMsg {
+                        instance: name.to_string(),
+                        msg: port_name.to_string(),
+                        src: src.to_string(),
+                        span,
+                    });
+                }
+            }
+        }
+    };
     Ok(PortRef {
         system: inst.handle,
         port,
