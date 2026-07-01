@@ -37,7 +37,7 @@ use metor_fsw_ring::NoWake;
 use super::{CyclicSlot, SlotState, StopReason};
 use crate::abi::FswStatus;
 use crate::dl::{DlSlot, DlSystem};
-use crate::message::MsgOut;
+use crate::message::{MsgIn, MsgOut};
 use crate::port::{Input, Output};
 use crate::sequence::{PROGRESS_MSG_CAP, ProgressLine, SequenceStatus, SlotControlIn};
 
@@ -206,6 +206,13 @@ pub(crate) struct SlotRunner {
     /// This slot's [`ChannelId`] — its build-order index among slots (Q2), the id the
     /// boot `SequenceRegistry` and every emitted [`SequenceChannelEvent`] address.
     channel_id: ChannelId,
+    /// This slot's command input (`docs/message-wiring.md` §6): a fan-in
+    /// [`MsgIn<SequenceCommand>`](MsgIn) over **every** command producer (the coordinator's
+    /// in-proc `control_handle` channel + every system's `SequenceCommand` output). Drained at
+    /// the head of each [`step`](CyclicSlot::step) and filtered by `channel_id`, so a command
+    /// addressed to this slot dispatches the cycle it arrives — the per-slot replacement for the
+    /// coordinator's old broadcast `drain_command_bus`.
+    commands: MsgIn<SequenceCommand>,
     /// The latest occupant `run_state` drained while Running, used to refine the terminal
     /// `Done` into `Completed`/`Aborted`/`Failed` (the ABI status word carries no detail).
     last_run_state: u8,
@@ -238,6 +245,7 @@ impl SlotRunner {
         events: MsgOut<SequenceChannelEvent>,
         seq_status: Input<SequenceStatus>,
         channel_id: ChannelId,
+        commands: MsgIn<SequenceCommand>,
     ) -> Self {
         Self {
             name,
@@ -250,6 +258,7 @@ impl SlotRunner {
             events,
             seq_status,
             channel_id,
+            commands,
             last_run_state: 0,
             phase: SlotPhase::Empty,
             slot: None,
@@ -298,6 +307,23 @@ impl SlotRunner {
             channel_id: self.channel_id,
             kind,
         });
+    }
+
+    /// Apply a runtime [`SequenceCommand`] addressed to this slot (`docs/message-wiring.md` §6).
+    /// Filters by **`channel_id`** — the slot's own build-order id, the same id the boot
+    /// `SequenceRegistry` and the panel address — since every slot's command fan-in sees every
+    /// command producer. The kind maps straight onto the lifecycle handlers, no intermediate type.
+    fn apply_command(&mut self, cmd: &SequenceCommand) {
+        if cmd.channel_id != self.channel_id {
+            return;
+        }
+        match &cmd.command {
+            SequenceCommandKind::Load { name } => self.do_load(name),
+            SequenceCommandKind::Start => self.do_start(),
+            SequenceCommandKind::Stop => self.do_stop(),
+            SequenceCommandKind::Abort => self.do_abort(),
+            SequenceCommandKind::Reset => self.do_reset(),
+        }
     }
 
     /// `Load`: select an allowed occupant by name and build it. Allowed only from Empty
@@ -451,6 +477,14 @@ impl CyclicSlot for SlotRunner {
     /// stops calling `execute_raw` (the phase leaves Running).
     fn step(&mut self, now: Timestamp) {
         self.last_now = now;
+        // Drain this slot's command fan-in (every command producer) and apply each addressed
+        // command *before* stepping the occupant, so a command lands the cycle it arrives — the
+        // per-slot replacement for the coordinator's old head-of-cycle broadcast.
+        let mut cmds: Vec<SequenceCommand> = Vec::new();
+        self.commands.drain(|c| cmds.push(c));
+        for cmd in &cmds {
+            self.apply_command(cmd);
+        }
         self.publish_status(now);
         if matches!(self.phase, SlotPhase::Running)
             && let Some(slot) = self.slot.as_mut()
@@ -504,25 +538,6 @@ impl CyclicSlot for SlotRunner {
 
     fn state(&self) -> &SlotState {
         &self.slot_state
-    }
-
-    /// Dispatch a runtime [`SequenceCommand`] addressed to this slot (`docs/messages.md` §4.1).
-    /// The default no-op on the trait makes every non-slot `CyclicSlot` ignore it; the
-    /// coordinator broadcasts each drained command to every slot, so this filters by
-    /// **`channel_id`** — the slot's own build-order id, the same id the boot `SequenceRegistry`
-    /// and the panel address. The kind maps straight onto the lifecycle handlers, no
-    /// intermediate type.
-    fn command(&mut self, cmd: &SequenceCommand) {
-        if cmd.channel_id != self.channel_id {
-            return;
-        }
-        match &cmd.command {
-            SequenceCommandKind::Load { name } => self.do_load(name),
-            SequenceCommandKind::Start => self.do_start(),
-            SequenceCommandKind::Stop => self.do_stop(),
-            SequenceCommandKind::Abort => self.do_abort(),
-            SequenceCommandKind::Reset => self.do_reset(),
-        }
     }
 }
 

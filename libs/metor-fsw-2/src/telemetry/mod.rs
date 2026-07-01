@@ -51,7 +51,7 @@ use stellarator::sync::WaitQueue;
 
 use crate::binder::{BindPorts, RingSource};
 use crate::descriptor::PortDesc;
-use crate::message::{MsgOut, split_record};
+use crate::message::{CommandOut, split_record};
 use crate::registry::{AllOutputs, MessageEntry, RegistryEntry};
 use crate::system::{AsyncSystem, CyclicSystem, Out, System, SystemInput, SystemOutput};
 
@@ -403,25 +403,25 @@ impl MsgHandOff {
 /// via its drop guard regardless).
 const UPLINK_IDLE: Duration = Duration::from_millis(50);
 
-/// The uplink's output bundle (`docs/messages.md` §4.3/§4.4): a single command-channel
-/// [`MsgOut`] it re-emits each decoded `SequenceCommand` onto. No typed frame ports — the
-/// command channel is the system's only output (besides the implicit health/log [`Out`] adds).
+/// The uplink's output bundle (`docs/message-wiring.md` §6): a single ordinary
+/// [`CommandOut<SequenceCommand>`](CommandOut) message output it re-emits each decoded
+/// `SequenceCommand` onto — a fully normal message producer, no bespoke command-bus capability.
+/// The coordinator collects every `SequenceCommand` output as a command producer every slot fans
+/// in from. Untelemetered (inbound control), so it is never echoed on the downlink.
 pub struct UplinkPorts {
-    commands: MsgOut<SequenceCommand>,
+    commands: CommandOut<SequenceCommand>,
 }
 
 impl SystemOutput for UplinkPorts {
     fn descriptors() -> Vec<PortDesc> {
-        Vec::new()
+        vec![CommandOut::<SequenceCommand>::descriptor()]
     }
 }
 
 impl BindPorts<BoxBacking> for UplinkPorts {
-    /// Host-only (`B = BoxBacking`): pull the command-bus emit capability the host [`Binder`]
-    /// carries (`docs/messages.md` §4.3) — declaring this system a command emitter just by asking.
     fn bind<S: RingSource<B = BoxBacking>>(src: &mut S) -> Self {
         Self {
-            commands: src.command_out(),
+            commands: CommandOut::bind(src),
         }
     }
 }

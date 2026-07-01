@@ -23,15 +23,9 @@ use std::any::Any;
 use std::slice;
 use std::sync::Arc;
 
-use metor_fsw_ring::{Backing, BoxBacking, Config, NoWake, Overrun, RingBuffer, WakeSink, WakeSource};
-use metor_proto_wkt::SequenceCommand;
+use metor_fsw_ring::{Backing, BoxBacking, RingBuffer, WakeSink, WakeSource};
 
-use crate::message::{MAX_MSG_BYTES, MSG_DEPTH, MsgOut, msg_capacity};
 use crate::registry::{MessageRegistry, OutputRegistry};
-
-/// Slack reader slots on a command channel on top of the one coordinator drain view
-/// (a debugger/recorder may also tap it). Mirrors the coordinator's `READER_SLACK`.
-const COMMAND_READER_SLACK: usize = 4;
 
 /// One pre-allocated ring plus its optional matched wake endpoints, in
 /// `descriptors()` order. `data`/`space` are `Some` only for the copy-in private
@@ -90,11 +84,6 @@ pub struct Binder<'a> {
     inputs: slice::Iter<'a, BoundInput>,
     registry: Arc<OutputRegistry>,
     messages: Arc<MessageRegistry>,
-    /// The command-bus collector (`docs/messages.md` §4.3): each [`command_out`](RingSource::command_out)
-    /// call allocates a fresh command channel and appends its ring here, so the coordinator
-    /// can claim a drain `MsgIn` over every emitter's channel after the bind loop. Shared
-    /// across all systems' per-system binders (the bind loop reborrows it each iteration).
-    command_rings: &'a mut Vec<RingBuffer<BoxBacking>>,
 }
 
 impl<'a> Binder<'a> {
@@ -103,14 +92,12 @@ impl<'a> Binder<'a> {
         inputs: &'a [BoundInput],
         registry: Arc<OutputRegistry>,
         messages: Arc<MessageRegistry>,
-        command_rings: &'a mut Vec<RingBuffer<BoxBacking>>,
     ) -> Self {
         Self {
             outputs: outputs.iter(),
             inputs: inputs.iter(),
             registry,
             messages,
-            command_rings,
         }
     }
 }
@@ -170,17 +157,6 @@ pub trait RingSource {
     /// fabricate an empty registry, exactly as the output registry does.
     fn message_registry(&self) -> Arc<MessageRegistry> {
         panic!("this ring source carries no message registry (host-only capability)")
-    }
-
-    /// The command-bus emit capability (`docs/messages.md` §4.3): a fresh [`MsgOut`] over a
-    /// newly-allocated command channel the coordinator drains each cycle. A system that emits
-    /// commands (the uplink, a scripted test, a future autonomy system) pulls this in its
-    /// `BindPorts::bind` exactly where it pulls its typed ports — declaring itself a command
-    /// emitter just by asking. Single-writer per channel: each call mints a *distinct* ring, so
-    /// two emitters never contend. Only the host [`Binder`] carries one; any non-host source
-    /// panics, as the registries do.
-    fn command_out(&mut self) -> MsgOut<SequenceCommand, Self::B> {
-        panic!("this ring source has no command bus (host-only capability)")
     }
 }
 
@@ -264,19 +240,6 @@ impl<'a> RingSource for Binder<'a> {
         self.messages.clone()
     }
 
-    /// Allocate a fresh command channel, record its ring for the coordinator's drain, and hand
-    /// the system the single [`MsgOut`] writer over it (`docs/messages.md` §4.3). Overwrite (like
-    /// every coordinator-owned ring); sized for `MSG_DEPTH` rare commands. The coordinator claims
-    /// the matching drain `MsgIn` from `command_rings` after the bind loop.
-    fn command_out(&mut self) -> MsgOut<SequenceCommand> {
-        let ring = RingBuffer::create_in_memory(Config {
-            capacity: msg_capacity(MAX_MSG_BYTES, MSG_DEPTH),
-            max_readers: 1 + COMMAND_READER_SLACK,
-            overrun: Overrun::Overwrite,
-        });
-        self.command_rings.push(ring.clone());
-        MsgOut::new(ring.writer(NoWake, NoWake))
-    }
 }
 
 /// A port bundle (a `#[derive(SystemInput)]`/`#[derive(SystemOutput)]` struct, or
