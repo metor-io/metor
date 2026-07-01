@@ -606,3 +606,12 @@ fn message_handoff_drops_oldest_on_overflow() {
         "the oldest records were dropped, not the newest"
     );
 }
+
+/// The uplink derives its ground subscription from its declared message-output ports — exactly
+/// the `SequenceCommand` it re-emits (`docs/message-wiring.md` §5.2), not a hardcoded id.
+#[test]
+fn uplink_subscribes_to_its_declared_command_ids() {
+    use metor_proto::types::Msg;
+    use metor_proto_wkt::SequenceCommand;
+    assert_eq!(super::uplink_subscribe_ids(), vec![SequenceCommand::ID]);
+}

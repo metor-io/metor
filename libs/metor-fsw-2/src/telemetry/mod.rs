@@ -50,7 +50,7 @@ use stellarator::net::TcpStream;
 use stellarator::sync::WaitQueue;
 
 use crate::binder::{BindPorts, RingSource};
-use crate::descriptor::PortDesc;
+use crate::descriptor::{PortDesc, PortId};
 use crate::message::{CommandOut, split_record};
 use crate::registry::{AllOutputs, MessageEntry, RegistryEntry};
 use crate::system::{AsyncSystem, CyclicSystem, Out, System, SystemInput, SystemOutput};
@@ -97,6 +97,11 @@ pub trait Transport {
 pub trait RecvTransport {
     /// Receive the next packet, or an error if the link dropped.
     async fn recv(&mut self) -> Result<OwnedPacket<Slice<Vec<u8>>>, TransportError>;
+
+    /// Declare the message ids this transport should subscribe to on connect
+    /// (`docs/message-wiring.md` §5.2). Called once by the uplink before its first `recv`, with
+    /// the ids of its declared message-output ports. The default is a no-op (a mock ignores it).
+    fn subscribe(&mut self, _ids: &[PacketId]) {}
 }
 
 /// A live TCP connection's write half plus the parked read half. The downlink only writes;
@@ -186,6 +191,10 @@ pub struct TcpRecvTransport {
     /// subscription was sent on; dropping it could half-close the socket and end the stream).
     #[allow(dead_code)]
     sink: Option<PacketSink<OwnedWriter<TcpStream>>>,
+    /// The message ids to subscribe to on connect (`docs/message-wiring.md` §5.2), set by
+    /// [`subscribe`](RecvTransport::subscribe) before the first `recv`. Falls back to
+    /// `SequenceCommand::ID` if the uplink never set it.
+    subscribe_ids: Vec<PacketId>,
 }
 
 impl TcpRecvTransport {
@@ -197,6 +206,7 @@ impl TcpRecvTransport {
             addr,
             stream: None,
             sink: None,
+            subscribe_ids: Vec::new(),
         }
     }
 
@@ -212,12 +222,19 @@ impl TcpRecvTransport {
             // the db only forwards a message id to clients that asked for it. Mirrors cube-sat
             // (`examples/cube-sat/src/main.rs:555`). v1 subscribes to `SequenceCommand` only.
             let sink = PacketSink::new(tx);
-            sink.send(&MsgStream {
-                msg_id: SequenceCommand::ID,
-            })
-            .await
-            .0
-            .map_err(|e| TransportError::Io(format!("{e}")))?;
+            // Subscribe to every id the uplink declared (its message-output ports, §5.2), or
+            // `SequenceCommand` if it never set them (the historical default).
+            let ids: Vec<PacketId> = if self.subscribe_ids.is_empty() {
+                vec![SequenceCommand::ID]
+            } else {
+                self.subscribe_ids.clone()
+            };
+            for msg_id in ids {
+                sink.send(&MsgStream { msg_id })
+                    .await
+                    .0
+                    .map_err(|e| TransportError::Io(format!("{e}")))?;
+            }
             self.sink = Some(sink);
             self.stream = Some(PacketStream::new(rx));
         }
@@ -232,6 +249,10 @@ impl RecvTransport for TcpRecvTransport {
             .next_grow(vec![0u8; 1024])
             .await
             .map_err(|e| TransportError::Io(format!("{e}")))
+    }
+
+    fn subscribe(&mut self, ids: &[PacketId]) {
+        self.subscribe_ids = ids.to_vec();
     }
 }
 
@@ -452,13 +473,32 @@ impl BindPorts<BoxBacking> for UplinkIn {
 pub struct UplinkSystem<R: RecvTransport> {
     /// The read transport, taken `None` on drop-on-disconnect (no reconnect, telemetry.md §7).
     recv: Option<R>,
+    /// Whether the ground subscription has been sent (once, before the first `recv`).
+    subscribed: bool,
 }
 
 impl<R: RecvTransport> UplinkSystem<R> {
     /// Construct the (pre-init) uplink from its read transport (its own connection).
     pub fn new(recv: R) -> Self {
-        Self { recv: Some(recv) }
+        Self {
+            recv: Some(recv),
+            subscribed: false,
+        }
     }
+}
+
+/// The message ids the uplink subscribes to on the ground: the `PacketId`s of its declared
+/// message-output ports (`docs/message-wiring.md` §5.2). Derived from the bundle descriptor, so a
+/// future uplink that forwards a second command type just declares a second output — the
+/// subscription follows automatically.
+fn uplink_subscribe_ids() -> Vec<PacketId> {
+    <UplinkPorts as SystemOutput>::descriptors()
+        .iter()
+        .filter_map(|p| match p.id {
+            PortId::Msg(id) => Some(id),
+            _ => None,
+        })
+        .collect()
 }
 
 impl<R: RecvTransport + 'static> System for UplinkSystem<R> {
@@ -474,6 +514,14 @@ impl<R: RecvTransport + 'static> AsyncSystem for UplinkSystem<R> {
     /// other packet. On the first error the link is dropped (no reconnect) and subsequent passes
     /// idle so the loop does not spin a dead reader.
     async fn run(&mut self, _input: &mut Self::Input, output: &mut Self::Output) {
+        // Subscribe once, before the first read, to the ids of the uplink's declared outputs.
+        if !self.subscribed {
+            let ids = uplink_subscribe_ids();
+            if let Some(recv) = self.recv.as_mut() {
+                recv.subscribe(&ids);
+            }
+            self.subscribed = true;
+        }
         let Some(recv) = self.recv.as_mut() else {
             stellarator::sleep(UPLINK_IDLE).await;
             return;
