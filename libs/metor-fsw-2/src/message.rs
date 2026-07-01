@@ -185,6 +185,14 @@ where
         PortDesc::msg::<M>()
     }
 
+    /// Message inputs are a **best-effort log**: a lapped view resyncs to the live edge inside
+    /// [`drain`](Self::drain) rather than hard-stopping the consumer (unlike a frame
+    /// [`Input`](crate::Input), whose lap is a fatal `LappedInput`). So a message input never
+    /// reports lapped to the framework's per-cycle check — it always returns `false`.
+    pub fn is_lapped(&self) -> bool {
+        false
+    }
+
     /// Drain every record committed since the last call across **all** producer views,
     /// decoding each `M::ID` record and handing the decoded payload to `f`. Per-producer
     /// order is preserved; the cross-producer interleave is arbitrary (and irrelevant — each

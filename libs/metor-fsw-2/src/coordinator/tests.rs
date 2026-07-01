@@ -14,8 +14,8 @@ use metor_proto::types::Timestamp;
 use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
 
 use crate::{
-    AsyncSystem, ClockMode, Coordinator, CoordinatorConfig, CyclicSystem, Input, Out, Output,
-    PortRef, StopReason, System, SystemInput, SystemOutput, WireError,
+    AsyncSystem, ClockMode, Coordinator, CoordinatorConfig, CyclicSystem, Input, MsgIn, MsgOut,
+    Out, Output, PortRef, StopReason, System, SystemInput, SystemOutput, WireError,
 };
 
 // ---------------------------------------------------------------------------
@@ -534,4 +534,162 @@ async fn simulated_clock_is_deterministic_and_monotonic() {
         assert_eq!(s[k].0 - s[0].0, k as i64 * step, "cycle {k} at start + k*dt");
         assert!(s[k].0 > s[k - 1].0, "monotonically increasing");
     }
+}
+
+// ---------------------------------------------------------------------------
+// Message edges (docs/message-wiring.md §3): typed `MsgOut<M>` -> `MsgIn<M>`,
+// fan-in, and the wiring-validation behaviour (id-mismatch, optional inputs).
+// ---------------------------------------------------------------------------
+
+#[derive(serde::Serialize, serde::Deserialize, postcard_schema::Schema)]
+struct TestEvent {
+    seq: u64,
+}
+
+#[derive(serde::Serialize, serde::Deserialize, postcard_schema::Schema)]
+struct OtherEvent {
+    x: u32,
+}
+
+// A cyclic producer emitting one `TestEvent` per cycle. No frame inputs.
+struct MsgProducer {
+    n: u64,
+}
+
+#[derive(SystemOutput)]
+struct MsgProdOut {
+    events: MsgOut<TestEvent>,
+}
+
+impl System for MsgProducer {
+    type Input = NoIn;
+    type Output = Out<MsgProdOut>;
+    const NAME: &'static str = "msg_producer";
+}
+
+impl CyclicSystem for MsgProducer {
+    fn execute(&mut self, _now: Timestamp, _in: &mut NoIn, o: &mut Self::Output) {
+        self.n += 1;
+        let _ = o.events.emit(&TestEvent { seq: self.n });
+    }
+}
+
+// A cyclic consumer draining every `TestEvent` it sees.
+struct MsgConsumer {
+    seen: Rc<RefCell<Vec<u64>>>,
+}
+
+#[derive(SystemInput)]
+struct MsgConsIn {
+    events: MsgIn<TestEvent>,
+}
+
+impl System for MsgConsumer {
+    type Input = MsgConsIn;
+    type Output = Out<NoOut>;
+    const NAME: &'static str = "msg_consumer";
+}
+
+impl CyclicSystem for MsgConsumer {
+    fn execute(&mut self, _now: Timestamp, input: &mut MsgConsIn, _o: &mut Self::Output) {
+        input.events.drain(|e| self.seen.borrow_mut().push(e.seq));
+    }
+}
+
+// A consumer of a *different* Msg type, for the id-mismatch check.
+struct OtherConsumer;
+
+#[derive(SystemInput)]
+struct OtherConsIn {
+    events: MsgIn<OtherEvent>,
+}
+
+impl System for OtherConsumer {
+    type Input = OtherConsIn;
+    type Output = Out<NoOut>;
+    const NAME: &'static str = "other_consumer";
+}
+
+impl CyclicSystem for OtherConsumer {
+    fn execute(&mut self, _now: Timestamp, input: &mut OtherConsIn, _o: &mut Self::Output) {
+        input.events.drain(|_| {});
+    }
+}
+
+#[cfg(not(miri))]
+#[stellarator::test]
+async fn msg_edge_two_cyclic_systems() {
+    let seen = Rc::new(RefCell::new(Vec::new()));
+    let mut b = Coordinator::builder(config());
+    let prod = b.add_cyclic(MsgProducer { n: 0 });
+    let cons = b.add_cyclic(MsgConsumer { seen: seen.clone() });
+    b.connect_msg(
+        PortRef::msg::<TestEvent>(prod),
+        PortRef::msg::<TestEvent>(cons),
+    )
+    .unwrap();
+    let mut coord = b.build().unwrap();
+
+    coord.run_for(4).await;
+
+    // Producer emits 1..=4; the consumer drains each the same cycle (producer runs first).
+    assert_eq!(*seen.borrow(), vec![1, 2, 3, 4]);
+}
+
+#[cfg(not(miri))]
+#[stellarator::test]
+async fn msg_fanin_two_emitters_one_consumer() {
+    let seen = Rc::new(RefCell::new(Vec::new()));
+    let mut b = Coordinator::builder(config());
+    let prod_a = b.add_cyclic_named("emitter_a", MsgProducer { n: 0 });
+    let prod_b = b.add_cyclic_named("emitter_b", MsgProducer { n: 100 });
+    let cons = b.add_cyclic(MsgConsumer { seen: seen.clone() });
+    // Two producers fan in to one message input — no `DoubleConnect`.
+    b.connect_msg(
+        PortRef::msg::<TestEvent>(prod_a),
+        PortRef::msg::<TestEvent>(cons),
+    )
+    .unwrap();
+    b.connect_msg(
+        PortRef::msg::<TestEvent>(prod_b),
+        PortRef::msg::<TestEvent>(cons),
+    )
+    .unwrap();
+    let mut coord = b.build().unwrap();
+
+    coord.run_for(2).await;
+
+    // Both producers' records arrive (emitter_a: 1,2; emitter_b: 101,102).
+    let mut got = seen.borrow().clone();
+    got.sort_unstable();
+    assert_eq!(got, vec![1, 2, 101, 102]);
+}
+
+#[test]
+fn msg_edge_mismatched_type_is_rejected() {
+    let mut b = Coordinator::builder(config());
+    let prod = b.add_cyclic(MsgProducer { n: 0 });
+    let cons = b.add_cyclic(OtherConsumer);
+    // `MsgOut<TestEvent>` -> `MsgIn<OtherEvent>`: distinct `M::ID`, so the two PortRefs name
+    // different ports — rejected at `connect_msg` (the same guard a frame-id mismatch hits).
+    let err = b
+        .connect_msg(
+            PortRef::msg::<TestEvent>(prod),
+            PortRef::msg::<OtherEvent>(cons),
+        )
+        .unwrap_err();
+    assert!(matches!(err, WireError::FrameIdMismatch { .. }));
+}
+
+#[cfg(not(miri))]
+#[stellarator::test]
+async fn msg_input_may_be_unconnected() {
+    // A message input with zero producers builds fine and drains nothing (§3.2) — unlike a
+    // frame input, which would be an `UnconnectedInput` build error.
+    let seen = Rc::new(RefCell::new(Vec::new()));
+    let mut b = Coordinator::builder(config());
+    let _cons = b.add_cyclic(MsgConsumer { seen: seen.clone() });
+    let mut coord = b.build().unwrap();
+    coord.run_for(3).await;
+    assert!(seen.borrow().is_empty());
 }
