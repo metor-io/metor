@@ -2,14 +2,14 @@
 //! (dl-open.md §3, §8). It wraps [`metor_fsw_adcs::yang_lqr::YangLQR`] and produces the body
 //! torque that drives the spacecraft toward its target attitude — the feedback back-edge
 //! into the plant. The target is selected by the **pointing law** the `mode` slot commands
-//! (`ModeCmd.law`): nadir or velocity-vector, computed from the orbit state (cube-sat's
-//! `FSW::nadir_point` / `hil_point`). Before any `ModeCmd` arrives it holds the identity
-//! reference.
+//! (`ModeCmd.law`): nadir or velocity-vector, computed from the **GPS** orbit measurement
+//! (cube-sat's `FSW::nadir_point` / `hil_point`). Before any `ModeCmd` arrives it holds the
+//! identity reference.
 
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
 
 use adcs_contracts::{
-    AttitudeEstimate, BodyState, CtrlParams, ModeCmd, TorqueCmd, inertia_diag, target_for,
+    AttitudeEstimate, CtrlParams, Gps, ModeCmd, TorqueCmd, inertia_diag, target_for,
 };
 use metor_fsw_2::metor_proto::types::Timestamp;
 use metor_fsw_2::ring::{Backing, BoxBacking};
@@ -27,7 +27,7 @@ pub struct CtrlSystem {
 #[derive(SystemInput)]
 pub struct CtrlIn<B: Backing = BoxBacking> {
     pub estimate: Input<AttitudeEstimate, B>,
-    pub body: Input<BodyState, B>,
+    pub gps: Input<Gps, B>,
     pub mode: Input<ModeCmd, B>,
 }
 
@@ -64,12 +64,12 @@ impl<B: Backing> CyclicSystem<B> for CtrlSystem {
             self.law = Some(m.get().law);
         }
 
-        // Select the target attitude from the law + the current body/orbit state; identity
-        // until a law and a body sample are both available.
-        let target = match (self.law, input.body.latest()) {
-            (Some(law), Ok(Some(body))) => {
-                let body = body.get();
-                target_for(law, &body.pos_eci, &body.vel_eci)
+        // Select the target attitude from the law + the current GPS orbit measurement; identity
+        // until a law and a GPS fix are both available.
+        let target = match (self.law, input.gps.latest()) {
+            (Some(law), Ok(Some(gps))) => {
+                let gps = gps.get();
+                target_for(law, &gps.pos_eci, &gps.vel_eci)
             }
             _ => Quaternion::identity(),
         };

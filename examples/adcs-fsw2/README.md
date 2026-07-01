@@ -6,25 +6,28 @@ Yang-LQR controller in a closed feedback loop (reusing the `metor-fsw/adcs` math
 `nox` six-dof dynamics), commissioned by a runtime **sequence slot**.
 
 ```text
-  plant ──sensors / body──▶ nav ──attitude_estimate──▶ ctrl
-    ▲                  │                                ▲ │
-    │   body ──────────┴────────────────────────────────┘ │
-    │                  └──attitude_estimate──▶ mode ──mode_cmd──▶ ctrl
-    └──────────────────── torque_cmd ────────────────────┘   (one-cycle-delayed)
+  plant ──sensors / gps──▶ nav ──attitude_estimate──▶ ctrl
+    ▲                 │                                ▲ │
+    │   gps ──────────┴────────────────────────────────┘ │
+    │                 └──attitude_estimate──▶ mode ──mode_cmd──▶ ctrl
+    └─────────────────── torque_cmd ────────────────────┘   (one-cycle-delayed)
 ```
 
 The **plant** propagates a real 400 km orbit (point-mass gravity + the orbital velocity) and
 the attitude dynamics, driven by a three-wheel **reaction-wheel** actuator (friction +
 momentum saturation + per-wheel arming). It emits a simulated sensor suite (gyro with bias
-walk, a sun observation, and a dipole-model magnetometer), reaction-wheel telemetry, the
-ground-truth **body** state (true attitude + body rate + the ECI orbit/GPS position/velocity),
-and the **world** environment — the true ECI sun direction (nox-frames' Vallado model at the
-mission epoch) and magnetic field that the sensors observe.
+walk, a sun observation, and a magnetometer sampling the **NOAA WMM** field), a noisy **GPS**
+measurement (a first-order Gauss-Markov position error + white velocity noise — the orbit state
+the flight software flies on), reaction-wheel telemetry, the ground-truth **body** state (true
+attitude + body rate + ECI orbit), and the **world** environment — the true ECI sun direction
+(nox-frames' Vallado model at the mission epoch) and the WMM magnetic field the sensors observe.
 
-The **nav** filter takes its inertial sun/magnetic references from the `world` frame and runs
-the MEKF. The **ctrl** controller follows the **pointing law** the `mode` slot commands
-(`ModeCmd.law` — Nadir or velocity-vector/HIL), computing its target attitude from the orbit
-state, and produces the body torque that closes the loop back into the plant.
+The **nav** filter models its own inertial sun/magnetic references — the sun from the ephemeris
+at its sim-time epoch, the field from the WMM evaluated at the **GPS** position — and runs the
+MEKF (it never sees the plant's truth). The **ctrl** controller follows the **pointing law** the
+`mode` slot commands (`ModeCmd.law` — Nadir or velocity-vector/HIL), computing its target
+attitude from the **GPS** orbit measurement, and produces the body torque that closes the loop
+back into the plant.
 
 The `mode` **slot** auto-runs the `commissioning` sequence at startup, walking the spacecraft
 idle → settling → pointing as the controller drives it onto the velocity-vector target; a
@@ -35,9 +38,9 @@ nadir-pointing safe state).
 
 | Crate | Path | Role |
 |---|---|---|
-| `adcs-contracts` | `contracts/` | The shared compile-time contract: the frame structs (sensors / body / world / attitude_estimate / mode_cmd / torque_cmd / wheels), the per-system `Params`, and the shared physics (orbital constants, the magnetic-field + sun-direction models, and the Nadir/HIL pointing laws). Linked by the cdylibs (and the test), **not** by the host. |
-| `adcs-plant` | `systems/plant/` | The orbiting rigid-body plant + reaction wheels + sensor suite, a `cdylib` ending in `export_system!(PlantSystem)`. |
-| `adcs-nav` | `systems/nav/` | The MEKF filter cdylib (models the sun/mag references from the orbit state). |
+| `adcs-contracts` | `contracts/` | The shared compile-time contract: the frame structs (sensors / gps / body / world / attitude_estimate / mode_cmd / torque_cmd / wheels), the per-system `Params`, and the shared physics (orbital constants, the WMM magnetic-field + sun-direction models, the GPS error model, and the Nadir/HIL pointing laws). Linked by the cdylibs (and the test), **not** by the host. |
+| `adcs-plant` | `systems/plant/` | The orbiting rigid-body plant + reaction wheels + sensor suite (WMM magnetometer + noisy GPS), a `cdylib` ending in `export_system!(PlantSystem)`. |
+| `adcs-nav` | `systems/nav/` | The MEKF filter cdylib (models its own sun/WMM-mag references at the GPS position). |
 | `adcs-ctrl` | `systems/ctrl/` | The Yang-LQR controller cdylib (selects the pointing-law target from `ModeCmd`). |
 | `adcs-commissioning` / `adcs-safe-mode` | `systems/commissioning/`, `systems/safe-mode/` | The `#[sequence]` occupants of the `mode` slot. |
 | `adcs-fsw2` | (this crate) | The mission **host**: builds + `dlopen`s the cdylibs and runs the coordinator. Links only `metor-fsw-2` — it is fully schema-agnostic (frames validated from serialized VTables, params encoded from each `.so`'s exported schema). |
@@ -73,9 +76,11 @@ ingests.
    `plant.body.q_b_eci` and watch the estimate track truth as the controller slews the
    spacecraft onto the commanded pointing target; `plant.sensors.gyro_b` shows the rate
    damping, `plant.wheels.0.ang_momentum` a reaction wheel's momentum building up,
-   `ctrl.torque_cmd.torque_b` the commanded torque, and `plant.world.sun_eci` /
-   `plant.world.mag_eci` the real ECI sun direction and magnetic field. The sequence view shows `commissioning`
-   stepping to completion; Load/Start `safe_mode` from there to command nadir safing.
+   `ctrl.torque_cmd.torque_b` the commanded torque, `plant.gps.pos_eci` against
+   `plant.body.pos_eci` the GPS position error, and `plant.world.sun_eci` /
+   `plant.world.mag_eci` the real ECI sun direction and WMM magnetic field. The sequence view
+   shows `commissioning` stepping to completion; Load/Start `safe_mode` from there to command
+   nadir safing.
 
 The mission converges in ~30 s of real time. The terminal prints only a heartbeat — the
 host stays schema-agnostic (it doesn't decode the frames), so convergence is watched in the

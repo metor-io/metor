@@ -1,13 +1,15 @@
 // The ADCS closed-loop mission, wired declaratively (dl-open.md §8, cli-runner.md §6).
 //
-//   plant ──sensors / body──▶ nav ──attitude_estimate──▶ ctrl
-//     ▲                  │                                ▲ │
-//     │   body ──────────┴────────────────────────────────┘ │
-//     │                  └──attitude_estimate──▶ mode ──mode_cmd──▶ ctrl
-//     └──────────────────── torque_cmd ────────────────────┘   (one-cycle-delayed)
+//   plant ──sensors / gps──▶ nav ──attitude_estimate──▶ ctrl
+//     ▲                 │                                ▲ │
+//     │   gps ──────────┴────────────────────────────────┘ │
+//     │                 └──attitude_estimate──▶ mode ──mode_cmd──▶ ctrl
+//     └─────────────────── torque_cmd ────────────────────┘   (one-cycle-delayed)
 //
-// `body` is the plant's ground-truth state (attitude + rate + ECI orbit), tapped for
-// convergence and consumed by nav (mag reference) and ctrl (pointing-law target).
+// The flight software flies on the noisy `gps` measurement: nav references its sun/WMM-field
+// at the GPS position, ctrl derives its pointing-law target from it. The plant's ground-truth
+// `body` and `world` frames are emitted for telemetry (and `body` is tapped for convergence),
+// but no system consumes them.
 //
 // Three dlopen'd systems (plant/nav/ctrl), each its own cdylib built against the shared
 // `adcs-contracts`, plus a runtime sequence **slot** `mode` (sequences-slots.md §5): two
@@ -62,8 +64,8 @@ slot "mode" {
 }
 
 connect "plant" -> "nav"  frame="sensors"
-connect "plant" -> "nav"  frame="world"
-connect "plant" -> "ctrl" frame="body"
+connect "plant" -> "nav"  frame="gps"
+connect "plant" -> "ctrl" frame="gps"
 connect "nav"   -> "ctrl" frame="attitude_estimate"
 connect "nav"   -> "mode" frame="attitude_estimate"
 connect "mode"  -> "ctrl" frame="mode_cmd"

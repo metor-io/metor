@@ -58,6 +58,9 @@ impl IERS {
     pub fn get_ut1_utc(&self, mjd: f64) -> Option<f64> {
         let a = self.get_floor(mjd)?;
         let b = self.get_ceil(mjd)?;
+        if a.mjd == b.mjd {
+            return a.ut1_utc.as_ref().map(|ut1_utc| ut1_utc.x);
+        }
         let t = (mjd - a.mjd) / (b.mjd - a.mjd);
         match (a.ut1_utc.as_ref(), b.ut1_utc.as_ref()) {
             (None, None) => None,
@@ -69,6 +72,9 @@ impl IERS {
     pub fn get_nutation(&self, mjd: f64) -> Option<[f64; 2]> {
         let a = self.get_floor(mjd)?;
         let b = self.get_ceil(mjd)?;
+        if a.mjd == b.mjd {
+            return a.nutation.as_ref().map(|nutation| [nutation.x, nutation.y]);
+        }
         let t = (mjd - a.mjd) / (b.mjd - a.mjd);
         match (a.nutation.as_ref(), b.nutation.as_ref()) {
             (None, None) => None,

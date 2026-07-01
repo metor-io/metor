@@ -5,8 +5,10 @@
 //!
 //! Each cycle it projects the commanded control torque onto the wheels, steps the wheels
 //! (Euler) and the body (`six_dof_rk4` under gravity + the net wheel torque), and emits the
-//! simulated sensor suite (gyro + sun + magnetometer), the orbit state (GPS), the wheel
-//! telemetry, and a `truth` frame the host taps to measure convergence.
+//! simulated sensor suite (gyro + sun + magnetometer, the field from the NOAA WMM), a noisy
+//! `gps` measurement the flight software flies on (a Gauss-Markov position error + white
+//! velocity noise), the wheel telemetry, the true `world` environment, and a `body` truth
+//! frame the host taps to measure convergence.
 
 // The `export_system!`-generated `extern "C" fn fsw_*` exports take raw pointers by ABI
 // contract (the host owns their validity, dl-open.md §2.5); clippy's
@@ -14,8 +16,9 @@
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
 
 use adcs_contracts::{
-    ALTITUDE, BodyState, DT, EARTH_RADIUS, G, M, MASS, PlantParams, ReactionWheel, Sensors,
-    TorqueCmd, V3, Wheels, World, epoch_at, inertia_diag, mag_field_eci, sun_dir_eci,
+    ALTITUDE, BodyState, DT, EARTH_RADIUS, G, GPS_POS_SIGMA, GPS_TAU, GPS_VEL_SIGMA, Gps, M,
+    MASS, MagneticModel, PlantParams, ReactionWheel, Sensors, TorqueCmd, V3, Wheels, World,
+    epoch_at, inertia_diag, mag_field_eci, sun_dir_eci,
 };
 use metor_fsw_2::metor_proto::types::Timestamp;
 use metor_fsw_2::ring::{Backing, BoxBacking};
@@ -40,8 +43,13 @@ pub struct PlantSystem {
     meas_sigma: f64,
     rng: StdRng,
     /// Seconds of simulated mission time (a deterministic per-cycle counter, not wall time)
-    /// — drives the epoch the real sun direction is evaluated at.
+    /// — drives the epoch the real sun direction + WMM field are evaluated at.
     t_sim: f64,
+    /// The NOAA WMM handle for the true magnetic field (built once — holds C-library state).
+    mag_model: MagneticModel,
+    /// The GPS position error: a first-order Gauss-Markov (exponentially-correlated) state,
+    /// stepped each cycle and added to the true position to form the [`Gps`] measurement.
+    gps_pos_err: V3,
 }
 
 #[derive(SystemInput)]
@@ -52,6 +60,7 @@ pub struct PlantIn<B: Backing = BoxBacking> {
 #[derive(SystemOutput)]
 pub struct PlantOut<B: Backing = BoxBacking> {
     pub sensors: Output<Sensors, B>,
+    pub gps: Output<Gps, B>,
     pub wheels: Output<Wheels, B>,
     pub body: Output<BodyState, B>,
     pub world: Output<World, B>,
@@ -88,6 +97,8 @@ impl PlantSystem {
             meas_sigma: p.meas_sigma,
             rng: StdRng::seed_from_u64(p.seed),
             t_sim: 0.0,
+            mag_model: MagneticModel::default(),
+            gps_pos_err: V3::zeros(),
         }
     }
 
@@ -139,21 +150,37 @@ impl<B: Backing> CyclicSystem<B> for PlantSystem {
         self.bias = self.bias + self.noise(self.meas_sigma * 1e-2);
         let gyro_b = omega_b_true + self.bias + self.noise(self.meas_sigma);
         // The true ECI environment at this epoch/position: the real sun direction (nox-frames
-        // Vallado model at the deterministic mission epoch) and the dipole magnetic field.
+        // Vallado model) and the NOAA WMM magnetic field, both at the deterministic mission epoch.
+        let epoch = epoch_at(self.t_sim);
         let pos_eci = self.body.pos.linear();
         let vel_eci = self.body.vel.linear();
-        let sun_eci = sun_dir_eci(epoch_at(self.t_sim));
-        let mag_eci = mag_field_eci(&pos_eci);
+        let sun_eci = sun_dir_eci(epoch);
+        let mag_eci = mag_field_eci(&mut self.mag_model, epoch, &pos_eci);
         // The two normalized vector observations, those ECI references brought into the body
         // frame plus sensor noise.
         let sun_b = (q_eci_b * sun_eci).normalize() + self.noise(self.meas_sigma);
         let mag_b = (q_eci_b * mag_eci).normalize() + self.noise(self.meas_sigma);
+
+        // The GPS measurement: the true orbit state corrupted by the GPS error model. Position
+        // error is a first-order Gauss-Markov process (exponentially correlated); velocity error
+        // is white. These RNG draws come AFTER the sensor draws above so the sensor noise stays
+        // byte-identical regardless of the GPS model.
+        let gps_phi = (-DT / GPS_TAU).exp();
+        let gps_drive_sigma = GPS_POS_SIGMA * (1.0 - gps_phi * gps_phi).sqrt();
+        self.gps_pos_err = gps_phi * self.gps_pos_err + self.noise(gps_drive_sigma);
+        let gps_pos_eci = pos_eci + self.gps_pos_err;
+        let gps_vel_eci = vel_eci + self.noise(GPS_VEL_SIGMA);
 
         let _ = o.sensors.write(&Sensors {
             timestamp: now,
             gyro_b,
             sun_b,
             mag_b,
+        });
+        let _ = o.gps.write(&Gps {
+            timestamp: now,
+            pos_eci: gps_pos_eci,
+            vel_eci: gps_vel_eci,
         });
         let _ = o.world.write(&World {
             timestamp: now,
