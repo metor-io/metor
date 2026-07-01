@@ -52,7 +52,7 @@ use stellarator::sync::WaitQueue;
 use crate::binder::{BindPorts, RingSource};
 use crate::descriptor::PortDesc;
 use crate::message::{MsgOut, split_record};
-use crate::registry::{MessageEntry, MessageRegistry, OutputRegistry, RegistryEntry};
+use crate::registry::{AllOutputs, MessageEntry, RegistryEntry};
 use crate::system::{AsyncSystem, CyclicSystem, Out, System, SystemInput, SystemOutput};
 
 // ---------------------------------------------------------------------------
@@ -557,28 +557,26 @@ async fn run_sender<T: Transport>(
 // Ports (no typed inputs; the output bundle carries the registry handle)
 // ---------------------------------------------------------------------------
 
-/// The telemetry system has no typed inputs (telemetry.md §3); its output bundle pulls
-/// the broad registry handle so `init` can reach it through the framework's `output`.
+/// The telemetry system has no typed inputs (telemetry.md §3); its output bundle is a single
+/// [`AllOutputs`] receive-all tap (`docs/message-wiring.md` §4) — the reusable generalization
+/// of what this bundle used to hand-pull. `init` reaches both registries through it, and the
+/// `ReceiveAll` port is what earns the downlink a reader slot on every buffer.
 pub struct TelemetryPorts {
-    registry: Arc<OutputRegistry>,
-    messages: Arc<MessageRegistry>,
+    all: AllOutputs,
 }
 
 impl SystemOutput for TelemetryPorts {
     fn descriptors() -> Vec<PortDesc> {
-        Vec::new()
+        vec![AllOutputs::descriptor()]
     }
 }
 
 impl BindPorts<BoxBacking> for TelemetryPorts {
-    /// Host-only (`B = BoxBacking`): pulls both broad registries the host [`Binder`]
-    /// carries (telemetry.md §2.4, `docs/messages.md` §3) — the output registry for the
-    /// component-frame taps and the message registry for the message downlink. The
-    /// telemetry downlink is never dlopen'd.
+    /// Host-only (`B = BoxBacking`): the receive-all tap pulls both broad registries the host
+    /// [`Binder`] carries. The telemetry downlink is never dlopen'd.
     fn bind<S: RingSource<B = BoxBacking>>(src: &mut S) -> Self {
         Self {
-            registry: src.output_registry(),
-            messages: src.message_registry(),
+            all: AllOutputs::bind(src),
         }
     }
 }
@@ -673,8 +671,8 @@ impl<T: Transport + 'static> System for TelemetrySystem<T> {
     /// `start()`, so `stellarator::spawn` has a runtime; the sender announces before any
     /// data is queued (nothing is pushed until the first `execute`).
     fn init(&mut self, output: &mut Self::Output) {
-        let registry = output.registry.clone();
-        let messages = output.messages.clone();
+        let registry = output.all.outputs.clone();
+        let messages = output.all.messages.clone();
         let mut taps = Vec::new();
         let mut announces = Vec::new();
         for entry in registry.entries() {
@@ -711,7 +709,9 @@ impl<T: Transport + 'static> System for TelemetrySystem<T> {
         // reader slot is surfaced and skipped exactly like an output tap.
         let mut msg_taps = Vec::new();
         for entry in messages.entries() {
-            if !self.mode.matches_message(entry) {
+            // Command channels (`telemetered = false`) are inbound control — never downlinked
+            // (`docs/message-wiring.md` §6.4).
+            if !entry.telemetered || !self.mode.matches_message(entry) {
                 continue;
             }
             let view = match entry.view() {

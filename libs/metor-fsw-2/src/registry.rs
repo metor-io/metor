@@ -19,6 +19,9 @@ use metor_proto::types::ComponentId;
 use metor_proto::vtable::VTable;
 use metor_proto_wkt::ComponentMetadata;
 
+use crate::binder::RingSource;
+use crate::descriptor::PortDesc;
+
 /// One tappable output buffer, indexed by its instance-qualified id (telemetry.md §2.1).
 pub struct RegistryEntry {
     /// The instance-qualified id `ComponentId::new("<instance>.<frame>")` — also the
@@ -115,6 +118,9 @@ pub struct MessageEntry {
     /// The channel name within the instance (`"events"`) — the message analogue of the
     /// output's frame id, but a plain name (messages have no frame type).
     pub channel: Arc<str>,
+    /// Whether the downlink / [`AllOutputs`] taps this channel (`docs/message-wiring.md`
+    /// §6.4). `false` for command channels (inbound control, never echoed to the panel).
+    pub telemetered: bool,
     /// The read source. Crate-private so external callers go through
     /// [`view()`](Self::view), which claims a slot-accounted reader (never the raw
     /// buffer); the coordinator sets it at `build()`.
@@ -175,5 +181,39 @@ impl MessageRegistry {
     /// Whether the graph produced no message channels.
     pub fn is_empty(&self) -> bool {
         self.entries.is_empty()
+    }
+}
+
+// ---------------------------------------------------------------------------
+// AllOutputs — the reusable receive-all tap port
+// ---------------------------------------------------------------------------
+
+/// A broadcast tap over **every** telemetered output frame and message channel in the graph
+/// (`docs/message-wiring.md` §4) — the reusable generalization of the telemetry downlink's
+/// twin-registry pull. It reserves no ring and connects no edge; it is a *capability* port
+/// (`PortKind::ReceiveAll`) that appears in a bundle like any port and binds by pulling both
+/// registries, so any system (a downlink, a logger, a recorder) taps the whole graph just by
+/// declaring an `AllOutputs` field. Each such port counts one extra reader on every buffer,
+/// which `build()` derives into every ring's `max_readers` budget.
+pub struct AllOutputs {
+    /// Every tappable component-frame output.
+    pub outputs: Arc<OutputRegistry>,
+    /// Every tappable message channel (skip `!telemetered` entries — command channels).
+    pub messages: Arc<MessageRegistry>,
+}
+
+impl AllOutputs {
+    /// The receive-all tap descriptor (`PortKind::ReceiveAll`) — ring-less, edge-less.
+    pub fn descriptor() -> PortDesc {
+        PortDesc::receive_all()
+    }
+
+    /// Pull both broad registries the host [`Binder`](crate::Binder) carries. Host-only, like
+    /// the underlying `output_registry()`/`message_registry()` capabilities.
+    pub fn bind<S: RingSource>(src: &mut S) -> Self {
+        Self {
+            outputs: src.output_registry(),
+            messages: src.message_registry(),
+        }
     }
 }

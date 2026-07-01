@@ -126,6 +126,63 @@ where
     }
 }
 
+/// A **command-channel** message output: a [`MsgOut<M>`](MsgOut) whose descriptor marks the
+/// channel **untelemetered** (`docs/message-wiring.md` §6.4), so the downlink / `AllOutputs`
+/// never echo inbound commands back to the panel. Emit through it exactly like a `MsgOut<M>`
+/// (it [`Deref`]s to one); only the port's telemetry flag differs. This is the opt-out spelling
+/// the (type-blind) `SystemOutput` derive picks up for free via `descriptor()`/`bind()`.
+pub struct CommandOut<M, B = BoxBacking, WD = NoWake, WS = NoWake>
+where
+    B: Backing,
+    WD: WakeSource,
+    WS: WakeSink,
+{
+    inner: MsgOut<M, B, WD, WS>,
+}
+
+impl<M: Msg, B: Backing, WD: WakeSource, WS: WakeSink> CommandOut<M, B, WD, WS> {
+    /// Wrap a writer the coordinator created over a command message ring.
+    pub fn new(writer: Writer<B, WD, WS>) -> Self {
+        Self {
+            inner: MsgOut::new(writer),
+        }
+    }
+
+    /// The port descriptor — an **untelemetered** message port keyed on `M::ID`.
+    pub fn descriptor() -> PortDesc {
+        PortDesc::msg_untelemetered::<M>()
+    }
+}
+
+impl<M, B, WD, WS> CommandOut<M, B, WD, WS>
+where
+    M: Msg,
+    B: Backing,
+    WD: WakeSource + Default + Clone + 'static,
+    WS: WakeSink + Default + Clone + 'static,
+{
+    /// Bind this command output over the next ring the [`RingSource`] hands out — the
+    /// [`MsgOut::bind`] wrapper. Walked by the derive like any output port.
+    pub fn bind<S: RingSource<B = B>>(src: &mut S) -> Self {
+        Self {
+            inner: MsgOut::bind(src),
+        }
+    }
+}
+
+impl<M, B: Backing, WD: WakeSource, WS: WakeSink> core::ops::Deref for CommandOut<M, B, WD, WS> {
+    type Target = MsgOut<M, B, WD, WS>;
+    fn deref(&self) -> &Self::Target {
+        &self.inner
+    }
+}
+
+impl<M, B: Backing, WD: WakeSource, WS: WakeSink> core::ops::DerefMut for CommandOut<M, B, WD, WS> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.inner
+    }
+}
+
 // ---------------------------------------------------------------------------
 // MsgIn
 // ---------------------------------------------------------------------------
@@ -298,6 +355,7 @@ mod tests {
             key: metor_proto::types::ComponentId::new("coordinator.sequences"),
             instance: std::sync::Arc::from("coordinator"),
             channel: std::sync::Arc::from("sequences"),
+            telemetered: true,
             ring: ring.clone(),
         };
 

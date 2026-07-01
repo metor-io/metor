@@ -174,15 +174,38 @@ impl PortDesc {
     }
 
     /// Derives the descriptor for a message type `M` (`docs/message-wiring.md` §2.2). The
-    /// edge key is `M::ID`; the name is the type's own name (see [`msg_name`]). Telemetered
-    /// by default — a command channel opts out via a `CommandOut` port (WP6).
+    /// edge key is `M::ID`; the name is the type's own name (see [`msg_name`]). Telemetered —
+    /// a command channel opts out via [`PortDesc::msg_untelemetered`] (a [`crate::CommandOut`]).
     pub fn msg<M: Msg>() -> Self {
+        Self::msg_with::<M>(true)
+    }
+
+    /// As [`PortDesc::msg`] but **not** telemetered: the channel is a first-class wired
+    /// message port yet is never tapped by the downlink / `AllOutputs`
+    /// (`docs/message-wiring.md` §6.4). Used for command channels (inbound control).
+    pub fn msg_untelemetered<M: Msg>() -> Self {
+        Self::msg_with::<M>(false)
+    }
+
+    fn msg_with<M: Msg>(telemetered: bool) -> Self {
         Self {
             id: PortId::Msg(M::ID),
             name: msg_name::<M>(),
             max_size: MAX_MSG_BYTES,
             rate_hint: None,
-            kind: PortKind::Message { telemetered: true },
+            kind: PortKind::Message { telemetered },
+        }
+    }
+
+    /// The descriptor of a receive-all tap port (`docs/message-wiring.md` §4): it reserves no
+    /// ring and connects no edge, so its `id` is a never-matched sentinel and its size is 0.
+    pub fn receive_all() -> Self {
+        Self {
+            id: PortId::Frame(ComponentId::new("")),
+            name: "",
+            max_size: 0,
+            rate_hint: None,
+            kind: PortKind::ReceiveAll,
         }
     }
 
