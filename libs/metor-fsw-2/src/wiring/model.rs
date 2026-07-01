@@ -199,19 +199,34 @@ pub enum SlotInitState {
     Running,
 }
 
+/// Whether an [`EdgeSpec`] wires a component **frame** or a **message** channel
+/// (`docs/message-wiring.md` §3). `out`/`in_` name a frame for `Frame` and a message type
+/// for `Msg`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum EdgeKind {
+    /// A component-frame edge (`connect`/`connect_delayed`), validated by subset compatibility.
+    #[default]
+    Frame,
+    /// A message edge (`connect_msg`), many-to-many and excluded from cycle detection.
+    Msg,
+}
+
 /// One producer → consumer edge.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct EdgeSpec {
     /// Producer instance name.
     pub from: String,
-    /// Producer output port frame name.
+    /// Producer output port name (a frame name for `Frame`, a message type name for `Msg`).
     pub out: String,
     /// Consumer instance name.
     pub to: String,
-    /// Consumer input port frame name.
+    /// Consumer input port name (a frame name for `Frame`, a message type name for `Msg`).
     pub in_: String,
-    /// `true` ⇒ a one-cycle-delayed feedback back-edge (`connect_delayed`).
+    /// `true` ⇒ a one-cycle-delayed feedback back-edge (`connect_delayed`). Frame edges only.
     pub delayed: bool,
+    /// Frame vs message edge. Defaults to `Frame` (serde back-compat for existing docs).
+    #[serde(default)]
+    pub kind: EdgeKind,
 }
 
 /// The telemetry downlink, the serializable mirror of

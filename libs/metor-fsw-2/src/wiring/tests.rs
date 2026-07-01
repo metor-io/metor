@@ -15,7 +15,8 @@ use crate::wiring::{
     parse, resolve,
 };
 use crate::{
-    AsyncSystem, BuildSystem, CyclicSystem, Input, Out, Output, System, SystemInput, SystemOutput,
+    AsyncSystem, BuildSystem, CyclicSystem, Input, MsgIn, MsgOut, Out, Output, System, SystemInput,
+    SystemOutput,
 };
 
 // ---------------------------------------------------------------------------
@@ -339,6 +340,8 @@ fn registry() -> Registry {
     r.register::<Closer, _>("Closer");
     r.register::<Src, _>("Src");
     r.register::<Sink, _>("Sink");
+    r.register::<MsgSrc, _>("MsgSrc");
+    r.register::<MsgSink, _>("MsgSink");
     r
 }
 
@@ -857,4 +860,149 @@ system "plant" type="Plant" lib="missing"
         Err(e) => e,
     };
     assert!(matches!(err, LoadError::UnknownArtifact { .. }), "{err:?}");
+}
+
+// ---------------------------------------------------------------------------
+// Message edges through the wiring front-ends (docs/message-wiring.md §3.4):
+// KDL `msg=` and `WiringBuilder::connect_msg`.
+// ---------------------------------------------------------------------------
+
+static WIRE_SINK_COUNT: AtomicU64 = AtomicU64::new(0);
+static WIRE_SINK_LAST: AtomicU64 = AtomicU64::new(0);
+
+#[derive(serde::Serialize, serde::Deserialize, postcard_schema::Schema)]
+struct WireEvent {
+    seq: u64,
+}
+
+// A cyclic message producer (no params): emits one `WireEvent` per cycle.
+struct MsgSrc {
+    n: u64,
+}
+
+#[derive(SystemOutput)]
+struct MsgSrcOut {
+    events: MsgOut<WireEvent>,
+}
+
+impl System for MsgSrc {
+    type Input = NoIn;
+    type Output = Out<MsgSrcOut>;
+    const NAME: &'static str = "msg_src";
+}
+
+impl CyclicSystem for MsgSrc {
+    fn execute(&mut self, _now: Timestamp, _in: &mut NoIn, o: &mut Self::Output) {
+        self.n += 1;
+        let _ = o.events.emit(&WireEvent { seq: self.n });
+    }
+}
+
+impl BuildSystem for MsgSrc {
+    type Params = ();
+    fn new(_params: Self::Params) -> Self {
+        Self { n: 0 }
+    }
+}
+
+// A cyclic message consumer (no params): records each drained `WireEvent` to statics.
+struct MsgSink;
+
+#[derive(SystemInput)]
+struct MsgSinkIn {
+    events: MsgIn<WireEvent>,
+}
+
+impl System for MsgSink {
+    type Input = MsgSinkIn;
+    type Output = Out<NoOut>;
+    const NAME: &'static str = "msg_sink";
+}
+
+impl CyclicSystem for MsgSink {
+    fn execute(&mut self, _now: Timestamp, input: &mut MsgSinkIn, _o: &mut Self::Output) {
+        input.events.drain(|e| {
+            WIRE_SINK_COUNT.fetch_add(1, Relaxed);
+            WIRE_SINK_LAST.store(e.seq, Relaxed);
+        });
+    }
+}
+
+impl BuildSystem for MsgSink {
+    type Params = ();
+    fn new(_params: Self::Params) -> Self {
+        MsgSink
+    }
+}
+
+#[cfg(not(miri))]
+#[stellarator::test]
+async fn msg_edge_kdl_round_trip() {
+    WIRE_SINK_COUNT.store(0, Relaxed);
+    WIRE_SINK_LAST.store(0, Relaxed);
+
+    let kdl = r#"
+coordinator cycle_rate=1000.0
+
+system "src"  type="MsgSrc"
+system "sink" type="MsgSink"
+
+connect "src" -> "sink" msg="WireEvent"
+"#;
+
+    // The `msg=` shorthand parses to an `EdgeKind::Msg` `EdgeSpec`...
+    let wiring = parse(kdl).expect("parse succeeds");
+    assert_eq!(wiring.edges.len(), 1);
+    assert_eq!(wiring.edges[0].kind, crate::wiring::EdgeKind::Msg);
+    assert_eq!(wiring.edges[0].out, "WireEvent");
+
+    // ...and resolves + builds + runs, delivering the messages.
+    let mut coord = load(kdl, &registry()).expect("load succeeds");
+    coord.run_for(4).await;
+    assert!(WIRE_SINK_COUNT.load(Relaxed) >= 4, "sink drained events");
+    assert_eq!(WIRE_SINK_LAST.load(Relaxed), 4, "last seq = cycle 4");
+}
+
+#[test]
+fn msg_edge_unknown_type_is_a_clean_error() {
+    let kdl = r#"
+coordinator cycle_rate=100.0
+
+system "src"  type="MsgSrc"
+system "sink" type="MsgSink"
+
+connect "src" -> "sink" msg="Nope"
+"#;
+    // `Coordinator` is not `Debug`, so match rather than `unwrap_err`.
+    let err = match load(kdl, &registry()) {
+        Err(e) => e,
+        Ok(_) => panic!("expected UnknownMsg for a misspelled message type"),
+    };
+    assert!(
+        matches!(err, LoadError::UnknownMsg { .. }),
+        "unexpected error: {err:?}"
+    );
+}
+
+#[cfg(not(miri))]
+#[stellarator::test]
+async fn msg_edge_builder_matches_kdl() {
+    WIRE_SINK_COUNT.store(0, Relaxed);
+
+    // The fluent builder's `connect_msg` produces the same `EdgeKind::Msg` edge as KDL.
+    let wiring = WiringBuilder::new()
+        .coordinator(1000.0, ClockSpec::Wall)
+        .system("src")
+        .ty("MsgSrc")
+        .end()
+        .system("sink")
+        .ty("MsgSink")
+        .end()
+        .connect_msg("src", "sink", "WireEvent")
+        .build();
+    assert_eq!(wiring.edges[0].kind, crate::wiring::EdgeKind::Msg);
+
+    let mut coord = resolve(&wiring, &registry()).expect("resolve succeeds");
+    coord.run_for(3).await;
+    assert!(WIRE_SINK_COUNT.load(Relaxed) >= 3);
 }

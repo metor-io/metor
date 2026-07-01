@@ -26,8 +26,9 @@ use std::net::SocketAddr;
 use serde::Serialize;
 
 use super::model::{
-    AllowedOccupantSpec, Artifact, ClockSpec, CoordinatorSpec, EdgeSpec, InitialOccupantSpec,
-    ParamSource, SlotInitState, SlotSpec, SystemSpec, TelemetryModeSpec, TelemetrySpec, Wiring,
+    AllowedOccupantSpec, Artifact, ClockSpec, CoordinatorSpec, EdgeKind, EdgeSpec,
+    InitialOccupantSpec, ParamSource, SlotInitState, SlotSpec, SystemSpec, TelemetryModeSpec,
+    TelemetrySpec, Wiring,
 };
 
 /// Fluent constructor for a [`Wiring`]. Start with [`new`](Self::new), set the
@@ -138,6 +139,7 @@ impl WiringBuilder {
             to: to.into(),
             in_: in_.into(),
             delayed: false,
+            kind: EdgeKind::Frame,
         });
         self
     }
@@ -157,6 +159,28 @@ impl WiringBuilder {
             to: to.into(),
             in_: in_.into(),
             delayed: true,
+            kind: EdgeKind::Frame,
+        });
+        self
+    }
+
+    /// Add a **message** edge (`connect_msg`, `docs/message-wiring.md` §3): route the message
+    /// type `msg` from producer `from` to consumer `to`. Both endpoints carry the same message
+    /// type (id-equality); message edges are many-to-many and excluded from cycle detection.
+    pub fn connect_msg(
+        mut self,
+        from: impl Into<String>,
+        to: impl Into<String>,
+        msg: impl Into<String>,
+    ) -> Self {
+        let msg = msg.into();
+        self.edges.push(EdgeSpec {
+            from: from.into(),
+            out: msg.clone(),
+            to: to.into(),
+            in_: msg,
+            delayed: false,
+            kind: EdgeKind::Msg,
         });
         self
     }
