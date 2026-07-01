@@ -1,5 +1,26 @@
 # Messages (`messages`)
 
+> **Status update (2026-07-01): messages are now first-class WIRED PORTS and the command plane has
+> been REFRAMED — see `docs/message-wiring.md` (the current design of record).** §1–§3, §5, §6
+> (the message channel, the downlink, the sequence coupling, and the ABI note) remain accurate.
+> **§1.2/§1.4 and all of §4 are SUPERSEDED**, as follows:
+> - `MsgOut` is now **typed** (`MsgOut<M>`) and, with `MsgIn<M>`, is a first-class port that drops
+>   into a `SystemInput`/`SystemOutput` bundle and is wired by an ordinary edge (`connect_msg` /
+>   `msg="Type"`), keyed on `M::ID`. A heterogeneous channel is modelled as N typed ports.
+> - The **command plane** is not a coordinator-drained "command bus" as §4 describes. The
+>   `RingSource::command_out` capability, the per-emitter `"commands"` `MessageRegistry` channels,
+>   the coordinator's `command_sources` + `drain_command_bus` head-of-cycle stage, and the
+>   `CyclicSlot::command` broadcast are all **deleted**. Instead: the uplink is a fully ordinary
+>   `CommandOut<SequenceCommand>` producer; the coordinator collects every command producer (its one
+>   reserved in-proc `control_handle()` channel + every `SequenceCommand` output, by type); and each
+>   slot's `SlotRunner` holds a fan-in `MsgIn<SequenceCommand>` over all of them, draining + filtering
+>   by `channel_id` at the head of its own `step`. Per-slot targeting is the command's `channel_id`.
+> - The uplink's ground subscription is derived from its declared message-output ports, not hardcoded.
+>
+> Everything below (§1–§8) is retained as the historical WP11 + redesign narrative.
+>
+> ---
+
 > **Status: v1 IMPLEMENTED; command plane being REDESIGNED.** The message channel + downlink +
 > sequence coupling shipped across WP11 (W1 message channel → W2 downlink → W4 sequence coupling →
 > W3 uplink → W5 example e2e; plan `messages-plan.md`) and remain as described (§1–§3, §5, §6).
