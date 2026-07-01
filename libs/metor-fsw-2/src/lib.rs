@@ -58,7 +58,7 @@ pub use coordinator::{
 
 // The general output registry and the telemetry downlink (its first consumer) + the uplink
 // command-plane ingest system (its read twin).
-pub use registry::{MessageRegistry, MessageEntry, OutputRegistry, RegistryEntry};
+pub use registry::{AllOutputs, MessageEntry, MessageRegistry, OutputRegistry, RegistryEntry};
 pub use telemetry::{
     RecvTransport, TcpRecvTransport, TcpTransport, TelemetryConfig, TelemetryMode,
     TelemetrySystem, Transport, TransportError, UplinkSystem,
@@ -76,7 +76,9 @@ pub use port::{DEFAULT_DEPTH, FrameRef, Input, Output, buffer_capacity, capacity
 
 // The general message channel — the `(PacketId, postcard)` record format, the
 // type-erased emit port, and its sizing/record helpers (`docs/messages.md` §1, §2).
-pub use message::{MAX_MSG_BYTES, MSG_DEPTH, MsgIn, MsgOut, msg_capacity, split_record};
+pub use message::{
+    CommandOut, MAX_MSG_BYTES, MSG_DEPTH, MsgIn, MsgOut, msg_capacity, split_record,
+};
 pub use system::{
     AsyncSystem, BuildSystem, CyclicRunner, CyclicSystem, Out, System, SystemInput, SystemOutput,
 };

@@ -527,10 +527,6 @@ pub struct CoordinatorBuilder {
     /// Each registered edge `(producer, consumer, delayed)`. A `delayed` edge is an
     /// intentional one-cycle-delayed feedback edge, excluded from cycle detection.
     edges: Vec<(PortRef, PortRef, bool)>,
-    /// How many systems pull the broad output registry (telemetry.md §2.5). Each one
-    /// is an extra fan-out consumer on *every* output buffer, so `build()` sizes every
-    /// ring's `max_readers` to include it. Bumped by [`add_telemetry`](Self::add_telemetry).
-    n_registry_consumers: usize,
 }
 
 impl CoordinatorBuilder {
@@ -542,7 +538,6 @@ impl CoordinatorBuilder {
             kinds: Vec::new(),
             names: Vec::new(),
             edges: Vec::new(),
-            n_registry_consumers: 0,
         }
     }
 
@@ -602,13 +597,13 @@ impl CoordinatorBuilder {
     /// Register the telemetry downlink (telemetry.md §8). This is an ordinary
     /// [`add_cyclic_named`](Self::add_cyclic_named) of a [`TelemetrySystem`] under the
     /// instance name `"telemetry"`, registered **last** so its end-of-cycle snapshot
-    /// observes every other system's fresh output. It additionally records one registry
-    /// consumer, so `build()` reserves a reader slot for it on every output buffer.
+    /// observes every other system's fresh output. The downlink's `AllOutputs` receive-all
+    /// port is what reserves it a reader slot on every buffer — `build()` derives that budget
+    /// by counting `ReceiveAll` ports, so no manual bookkeeping is needed here.
     pub fn add_telemetry<T>(&mut self, config: TelemetryConfig<T>) -> SystemHandle
     where
         T: Transport + 'static,
     {
-        self.n_registry_consumers += 1;
         self.add_cyclic_named("telemetry", TelemetrySystem::new(config))
     }
 
@@ -915,8 +910,16 @@ impl CoordinatorBuilder {
         // beside `reg_entries`. W4 fills it with the per-slot sequence event channels plus
         // the coordinator's boot-`SequenceRegistry` channel (allocated below).
         let mut msg_entries: Vec<MessageEntry> = Vec::new();
-        // Each registry consumer is an extra fan-out reader on every output buffer.
-        let n_reg = self.n_registry_consumers;
+        // Each `AllOutputs` receive-all tap (`docs/message-wiring.md` §4) is an extra fan-out
+        // reader on *every* output + message buffer, so `build()` sizes every ring's
+        // `max_readers` to include it. Self-derived from the declared `ReceiveAll` ports across
+        // all systems — no manual `add_telemetry` bookkeeping.
+        let n_reg = self
+            .descs
+            .iter()
+            .flat_map(|d| d.inputs.iter().chain(d.outputs.iter()))
+            .filter(|p| matches!(p.kind, PortKind::ReceiveAll))
+            .count();
 
         // --- Allocate one buffer per output port (incl. health/log) ----------
         let mut output_rings: Vec<Vec<RingBuffer<BoxBacking>>> = Vec::with_capacity(n);
@@ -946,25 +949,35 @@ impl CoordinatorBuilder {
                         });
                         ring
                     }
-                    PortKind::Message { .. } => {
-                        // A wired message output: variable-record sizing. Its telemetry-tap
-                        // `MessageRegistry` entry (with the `telemetered` flag) is added in WP6;
-                        // here the ring is allocated + kept alive so consumers fan in from it.
+                    PortKind::Message { telemetered } => {
+                        // A wired message output: variable-record sizing, indexed in the
+                        // `MessageRegistry` so the downlink/`AllOutputs` taps it (unless the port
+                        // opted out via `telemetered = false`, e.g. a command channel, §6.4).
                         let ring = RingBuffer::create_in_memory(Config {
                             capacity: msg_capacity(MAX_MSG_BYTES, MSG_DEPTH),
                             max_readers: readers,
                             overrun: Overrun::Overwrite,
                         });
+                        let entry = message_entry(&instance, port.name, ring.clone(), *telemetered);
                         table.rings.push(RingEntry {
                             ring: ring.clone(),
-                            frame_id: ComponentId::new(&format!("{instance}.{}", port.name)),
+                            frame_id: entry.key,
                             role,
                             instance: Some(instance),
                         });
+                        msg_entries.push(entry);
                         ring
                     }
                     PortKind::ReceiveAll => {
-                        unreachable!("receive-all tap ports are wired in WP6, not as ring outputs")
+                        // A receive-all tap reserves no ring and connects no edge. Push a
+                        // minimal placeholder so `output_rings[s]` stays aligned with the output
+                        // PortDesc indices (edges index by position); it is never bound
+                        // (`AllOutputs::bind` pulls the registries) nor edge-referenced.
+                        RingBuffer::create_in_memory(Config {
+                            capacity: msg_capacity(1, 2),
+                            max_readers: 1,
+                            overrun: Overrun::Overwrite,
+                        })
                     }
                 };
                 row.push(ring);
@@ -1053,7 +1066,7 @@ impl CoordinatorBuilder {
             // by the registry consumers like an output (the downlink, W2).
             let events_ring = msg_ring(MAX_MSG_BYTES, MSG_DEPTH, n_reg + READER_SLACK);
             let events = msg_writer(&events_ring);
-            let events_entry = message_entry(&instance, "sequences", events_ring.clone());
+            let events_entry = message_entry(&instance, "sequences", events_ring.clone(), true);
             table.rings.push(RingEntry {
                 ring: events_ring,
                 frame_id: events_entry.key,
@@ -1093,7 +1106,7 @@ impl CoordinatorBuilder {
         let seq_registry_ring = msg_ring(MAX_MSG_BYTES, MSG_DEPTH, n_reg + READER_SLACK);
         let seq_registry_out = msg_writer(&seq_registry_ring);
         let seq_registry_entry =
-            message_entry(COORDINATOR_INSTANCE, "sequences", seq_registry_ring.clone());
+            message_entry(COORDINATOR_INSTANCE, "sequences", seq_registry_ring.clone(), true);
         table.rings.push(RingEntry {
             ring: seq_registry_ring,
             frame_id: seq_registry_entry.key,
@@ -1287,8 +1300,13 @@ impl CoordinatorBuilder {
                 // The static (host-side `BoxBacking`) path: build typed `BoundPort`s and
                 // walk them with a `Binder`.
                 reg => {
-                    // Outputs: default wakes, the system's own buffers.
+                    // Outputs: default wakes, the system's own buffers. Skip `ReceiveAll` tap
+                    // ports — they bind no ring (`AllOutputs::bind` pulls the registries), so the
+                    // positional cursor must not offer them one.
                     let outs: Vec<BoundPort> = (0..self.descs[id].outputs.len())
+                        .filter(|&out_idx| {
+                            !matches!(self.descs[id].outputs[out_idx].kind, PortKind::ReceiveAll)
+                        })
                         .map(|out_idx| BoundPort::new(output_rings[id][out_idx].clone()))
                         .collect();
                     // Inputs, in `descriptors()` order. A frame input is `One`: cyclic consumers
@@ -1490,11 +1508,17 @@ fn msg_writer<M: Msg>(ring: &RingBuffer<BoxBacking>) -> MsgOut<M> {
 /// `ComponentId::new("<instance>.<channel>")` (the on-wire identity) over a clone of the
 /// ring — the [`registry_entry`] twin for the self-describing message channel
 /// (`docs/messages.md` §2). No vtable/announce; the record's 2-byte id is the schema.
-fn message_entry(instance: &str, channel: &str, ring: RingBuffer<BoxBacking>) -> MessageEntry {
+fn message_entry(
+    instance: &str,
+    channel: &str,
+    ring: RingBuffer<BoxBacking>,
+    telemetered: bool,
+) -> MessageEntry {
     MessageEntry {
         key: ComponentId::new(&format!("{instance}.{channel}")),
         instance: Arc::from(instance),
         channel: Arc::from(channel),
+        telemetered,
         ring,
     }
 }

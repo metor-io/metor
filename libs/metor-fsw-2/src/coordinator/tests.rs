@@ -14,8 +14,8 @@ use metor_proto::types::Timestamp;
 use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
 
 use crate::{
-    AsyncSystem, ClockMode, Coordinator, CoordinatorConfig, CyclicSystem, Input, MsgIn, MsgOut,
-    Out, Output, PortRef, StopReason, System, SystemInput, SystemOutput, WireError,
+    AllOutputs, AsyncSystem, ClockMode, Coordinator, CoordinatorConfig, CyclicSystem, Input, MsgIn,
+    MsgOut, Out, Output, PortRef, StopReason, System, SystemInput, SystemOutput, WireError,
 };
 
 // ---------------------------------------------------------------------------
@@ -692,4 +692,57 @@ async fn msg_input_may_be_unconnected() {
     let mut coord = b.build().unwrap();
     coord.run_for(3).await;
     assert!(seen.borrow().is_empty());
+}
+
+// ---------------------------------------------------------------------------
+// AllOutputs receive-all tap (docs/message-wiring.md §4): a non-telemetry system
+// declaring `AllOutputs` sees every frame output and telemetered message channel,
+// and self-derives its reader-slot budget on every buffer.
+// ---------------------------------------------------------------------------
+
+struct AllTap {
+    frame_outs: Rc<std::cell::Cell<usize>>,
+    msg_chans: Rc<std::cell::Cell<usize>>,
+}
+
+#[derive(SystemOutput)]
+struct AllTapOut {
+    all: AllOutputs,
+}
+
+impl System for AllTap {
+    type Input = NoIn;
+    type Output = Out<AllTapOut>;
+    const NAME: &'static str = "all_tap";
+    fn init(&mut self, o: &mut Self::Output) {
+        // The registries are frozen by build time, so init observes the whole graph.
+        self.frame_outs.set(o.all.outputs.entries().len());
+        self.msg_chans.set(o.all.messages.entries().len());
+    }
+}
+
+impl CyclicSystem for AllTap {
+    fn execute(&mut self, _now: Timestamp, _in: &mut NoIn, _o: &mut Self::Output) {}
+}
+
+#[cfg(not(miri))]
+#[stellarator::test]
+async fn all_outputs_taps_the_whole_graph() {
+    let frame_outs = Rc::new(std::cell::Cell::new(0));
+    let msg_chans = Rc::new(std::cell::Cell::new(0));
+    let mut b = Coordinator::builder(config());
+    // A producer of a (telemetered) message channel + its implicit health/log frame outputs.
+    let _prod = b.add_cyclic(MsgProducer { n: 0 });
+    let _tap = b.add_cyclic(AllTap {
+        frame_outs: frame_outs.clone(),
+        msg_chans: msg_chans.clone(),
+    });
+    let mut coord = b.build().unwrap();
+    coord.run_for(1).await;
+
+    // The tap — with no wired edges — sees the producer's message channel and the frame
+    // outputs (health/log of both systems + the coordinator's own), proving the broad tap
+    // and that the `ReceiveAll` port reserved itself a reader slot everywhere (build succeeded).
+    assert!(msg_chans.get() >= 1, "sees the message channel: {}", msg_chans.get());
+    assert!(frame_outs.get() >= 2, "sees frame outputs: {}", frame_outs.get());
 }

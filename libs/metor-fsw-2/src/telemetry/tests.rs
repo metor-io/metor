@@ -437,6 +437,7 @@ async fn message_downlink_fifo_no_coalesce() {
         key: ComponentId::new("mode.events"),
         instance: Arc::from("mode"),
         channel: Arc::from("events"),
+        telemetered: true,
         ring: ring.clone(),
     };
     // Claim the tap before any write (an overwrite-ring view starts at the live edge).
