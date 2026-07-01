@@ -1,5 +1,25 @@
 # Implementation plan — message wiring parity (`message-wiring`)
 
+> **STATUS: IMPLEMENTED (all 9 WPs landed, each a green commit).** Whole workspace builds; all
+> `metor-fsw-2` tests + the `adcs-fsw2` example (sequences/closed-loop/bundle) pass;
+> `--no-default-features` clean; `tests/slot_integration.rs` unchanged. **Deviations from the plan,
+> all confirmed with the reviewer:**
+> - **WP5 (KDL resolution):** message endpoints resolve by matching the port's display name
+>   (`msg_name::<M>()`), **not** by hashing the KDL name to a `PacketId` — the wkt sequence `Msg`s
+>   hand-assign their ids and don't derive `Schema`, so no name hashes to them.
+> - **WP7 (command reframe):** realized as **coordinator-collected fan-out** (each slot's host-side
+>   `MsgIn<SequenceCommand>` views every command producer — the reserved `control_handle` ring +
+>   every `SequenceCommand` output found by type), not the edge-based "slots as wired consumers"
+>   form. Per-slot targeting is the command's `channel_id`, so no slot descriptor port, no
+>   synthesized edges, no synthetic coordinator system. `CommandOut<M>` makes the uplink a fully
+>   normal producer; `drain_command_bus`/`command_sources`/`CyclicSlot::command`/`command_out` are
+>   gone.
+> - **WP8 (uplink subscription):** derived from the uplink's **declared message-output ports**
+>   (no out-edges exist under WP7's approach), via `RecvTransport::subscribe` — simpler than the
+>   planned edge-derived `out_msg_ids` + Binder threading.
+
+
+
 Design: `docs/message-wiring.md` (approved; §9 decisions 1-7 locked, §10 open questions Q1-Q10 all
 resolved by the reviewer 2026-06-30 — **Q7 = implicit fan-out default + explicit `connect … msg=`
 override; Q8 = keep command channels OFF the downlink via a `telemetered` bool**). Read that doc
