@@ -26,7 +26,9 @@ use metor_fsw_ring::{
     BoxBacking, Config, NoWake, Notifier, Overrun, RingBuffer, View, WakeSource, Writer,
 };
 use metor_proto::types::{ComponentId, Msg, Timestamp};
-use metor_proto_wkt::{ChannelId, SequenceChannelSpec, SequenceCommand, SequenceRegistry};
+use metor_proto_wkt::{
+    ChannelId, SequenceChannelEvent, SequenceChannelSpec, SequenceCommand, SequenceRegistry,
+};
 use stellarator::sync::WaitQueue;
 use stellarator::{JoinHandle, JoinHandleDropGuard};
 use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
@@ -429,7 +431,7 @@ struct PendingAsync {
 struct SlotAux {
     control_ring: RingBuffer<BoxBacking>,
     status_ring: RingBuffer<BoxBacking>,
-    events: MsgOut<BoxBacking>,
+    events: MsgOut<SequenceChannelEvent>,
     seq_status: Input<SequenceStatus>,
     channel_id: ChannelId,
 }
@@ -1394,7 +1396,7 @@ fn msg_ring(max_bytes: usize, depth: usize, max_readers: usize) -> RingBuffer<Bo
 /// A fresh host [`MsgOut`] over a coordinator-owned message ring — the [`slot_writer`]
 /// analogue for the message channel (`slot.rs:547`), exactly how the coordinator mints
 /// its own `status_out`/`control` writers. Single-writer discipline is the caller's.
-fn msg_writer(ring: &RingBuffer<BoxBacking>) -> MsgOut<BoxBacking> {
+fn msg_writer<M: Msg>(ring: &RingBuffer<BoxBacking>) -> MsgOut<M> {
     MsgOut::new(ring.writer(NoWake, NoWake))
 }
 
@@ -1475,7 +1477,7 @@ pub struct Coordinator {
     /// translates commands (slots self-filter by `channel_id`, `docs/messages.md` §4.1).
     channel_map: Vec<(ChannelId, &'static str)>,
     /// The sole writer of the coordinator's boot-`SequenceRegistry` message channel (§5).
-    seq_registry_out: MsgOut<BoxBacking>,
+    seq_registry_out: MsgOut<SequenceRegistry>,
     /// The prebuilt boot [`SequenceRegistry`] payload (the slots + their allowed
     /// occupants), emitted once at the head of [`run_for`](Coordinator::run_for).
     seq_registry: SequenceRegistry,
@@ -1558,7 +1560,7 @@ impl Coordinator {
     /// [`channel_map`](Self::channel_map)). Mirrors [`progress`](Self::progress): each call mints
     /// a fresh [`MsgOut`] over the ring, so the **single-writer discipline** is the caller's
     /// (drive commands from one place).
-    pub fn control_handle(&self) -> MsgOut<BoxBacking> {
+    pub fn control_handle(&self) -> MsgOut<SequenceCommand> {
         MsgOut::new(self.command_ring.writer(NoWake, NoWake))
     }
 

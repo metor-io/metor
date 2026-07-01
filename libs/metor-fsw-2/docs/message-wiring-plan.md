@@ -348,9 +348,15 @@ land any time after WP4.
 - KDL: `parse_edge` accepts `msg="SequenceCommand"` beside `frame=` (exactly one required); store the
   Msg name into `out`+`in_` (like `frame=`) and set `EdgeSpec.kind = Msg` (**[Q3 resolved:
   explicit kind discriminant]**). A precise diagnostic falls out.
-- `resolve_endpoint` branches on `EdgeKind`: for `Msg`, map the name to `PacketId` with the **same
-  hash the `Msg` derive uses** — `fnv1a_hash_str_16_xor(name)` (`../metor-proto/src/types.rs:595`) —
-  and match against the instance's `PortId::Msg` ports (`:1657` becomes `match p.id`). Emit a new
+- `resolve_endpoint` branches on `EdgeKind`: for `Msg`, **match the name against the instance's
+  `PortId::Msg` ports by `port.name`** — i.e. `ports.iter().find(|p| matches!(p.id, PortId::Msg(_))
+  && p.name == msg)` → use that port's `p.id`. **[VERIFY — corrected in WP2]** the design/plan
+  originally proposed hashing the name to a `PacketId` (`fnv1a_hash_str_16_xor`), on the assumption
+  `M::ID == fnv1a16(M::SCHEMA.name)`. That is **false** for the wkt sequence types: `SequenceCommand`
+  / `SequenceRegistry` / `SequenceChannelEvent` hand-assign `Msg::ID` (`[224,41/42/43]`,
+  `../metor-proto/wkt/src/msgs.rs:685,730,758`) and do **not** derive `Schema`, so no name hashes to
+  their id. Matching by `port.name` (the `msg_name::<M>()` = type-name string set in WP2's
+  `PortDesc::msg`) is the robust resolution and needs no hash. Emit a new
   `LoadError::UnknownMsg { instance, msg, .. }` (parallel to `UnknownFrame` `:191-200`; **[VERIFY]**
   `UnknownMsg` does **not** exist yet — add it). The edges pass (`:804-816`) routes `Msg` edges to
   `builder.connect_msg` / `connect_msg_delayed`.

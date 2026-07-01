@@ -10,12 +10,13 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use metor_fsw::{AsVTable, Metadatatize};
-use metor_proto::types::{ComponentId, PacketId, PrimType};
+use metor_proto::types::{ComponentId, Msg, PacketId, PrimType};
 use metor_proto::vtable::VTable;
 use metor_proto::vtable::builder::vtable;
 use metor_proto_wkt::ComponentMetadata;
 
 use crate::frame::Frame;
+use crate::message::MAX_MSG_BYTES;
 
 /// A unit measured in Hertz; an advisory rate hint for buffer depth / async pacing.
 pub type Hz = f64;
@@ -132,6 +133,18 @@ fn announce_of<F: Frame>(prefix: &str) -> (VTable, Vec<ComponentMetadata>) {
     (vt, metadata)
 }
 
+/// The display / KDL-addressing name of a message port: the message type's own name (the
+/// last `::` segment of its type path). Unlike a frame's `F::NAME`, a [`Msg`] carries no
+/// name constant — many wkt `Msg`s (e.g. `SequenceCommand`) hand-assign [`Msg::ID`] and do
+/// not implement `postcard_schema::Schema` — so the type name is the stable,
+/// zero-boilerplate token a user writes as `msg="SequenceCommand"`
+/// (`docs/message-wiring.md` §3.4). The real edge key is [`Msg::ID`]; this is only for
+/// addressing / telemetry keying.
+fn msg_name<M: Msg>() -> &'static str {
+    let path = std::any::type_name::<M>();
+    path.rsplit("::").next().unwrap_or(path)
+}
+
 impl PortDesc {
     /// Derives the descriptor for a frame type. Pure metadata — no instance needed.
     pub fn of<F: Frame>() -> Self {
@@ -157,6 +170,19 @@ impl PortDesc {
         Self {
             rate_hint: Some(rate_hint),
             ..Self::of::<F>()
+        }
+    }
+
+    /// Derives the descriptor for a message type `M` (`docs/message-wiring.md` §2.2). The
+    /// edge key is `M::ID`; the name is the type's own name (see [`msg_name`]). Telemetered
+    /// by default — a command channel opts out via a `CommandOut` port (WP6).
+    pub fn msg<M: Msg>() -> Self {
+        Self {
+            id: PortId::Msg(M::ID),
+            name: msg_name::<M>(),
+            max_size: MAX_MSG_BYTES,
+            rate_hint: None,
+            kind: PortKind::Message { telemetered: true },
         }
     }
 
