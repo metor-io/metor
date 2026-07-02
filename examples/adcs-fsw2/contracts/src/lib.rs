@@ -497,13 +497,13 @@ pub fn tracking_sample(body: &BodyState, law: u8) -> (f64, f64) {
 // Per-system Params — the config each constructor needs (dl-open.md §6.3)
 // ---------------------------------------------------------------------------
 //
-// Each derives `Schema` (so the dlopen host can encode it across `fsw_create`) AND
-// `FromKdlNode` (so the same params parse when a system is linked statically and resolved
-// from the same `mission.kdl` via a `Registry` — the parity test's static path).
+// Each derives `Serialize`/`Deserialize`/`Schema` — the postcard contract across
+// `fsw_create`, and `Deserialize` is also what the static `Registry` path uses to
+// read the same params off `mission.kdl` (the parity test's static path).
 
 /// Plant parameters: the initial attitude/rate offset, the sensor-noise sigma, the RNG seed
 /// (so a run is reproducible), and whether the reaction wheels boot disarmed.
-#[derive(Serialize, Deserialize, Schema, metor_fsw_2::wiring::FromKdlNode, Clone, Debug, PartialEq)]
+#[derive(Serialize, Deserialize, Schema, Clone, Debug, PartialEq)]
 pub struct PlantParams {
     /// Initial attitude offset from the target, radians about the [1,1,1] axis.
     pub init_angle: f64,
@@ -520,14 +520,14 @@ pub struct PlantParams {
 }
 
 /// Navigation-filter (MEKF) parameters.
-#[derive(Serialize, Deserialize, Schema, metor_fsw_2::wiring::FromKdlNode, Clone, Debug, PartialEq)]
+#[derive(Serialize, Deserialize, Schema, Clone, Debug, PartialEq)]
 pub struct NavParams {
     /// MEKF measurement 1-sigma for the two vector observations.
     pub meas_sigma: f64,
 }
 
 /// Controller (Yang-LQR) parameters.
-#[derive(Serialize, Deserialize, Schema, metor_fsw_2::wiring::FromKdlNode, Clone, Debug, PartialEq)]
+#[derive(Serialize, Deserialize, Schema, Clone, Debug, PartialEq)]
 pub struct CtrlParams {
     /// LQR attitude/rate state weight (q) and control weight (r).
     pub q_weight: f64,

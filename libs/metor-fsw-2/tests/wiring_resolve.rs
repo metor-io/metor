@@ -182,7 +182,7 @@ fn dl_graph_via_wiring_resolve_end_to_end() {
 }
 
 /// Headline equivalence: configure the **same** dl system two ways — the typed Rust
-/// `WiringBuilder.params(..)` and a KDL `system "..." lib=".."
+/// `WiringBuilder.params(..)` and a KDL `system "..." artifact=".."
 /// start=.. scale=..` — and assert BOTH (a) resolve to **byte-identical** `Params` bytes
 /// and (b) run to the **same** output. The KDL path is schema-encoded from the `.so`'s
 /// exported `Params` schema, so the host never links the fixture's `CounterParams`.
@@ -210,7 +210,7 @@ fn kdl_and_builder_dl_params_are_byte_identical_and_run_equal() {
 coordinator cycle_rate=200.0 sim_dt=0.005
 artifact "counter" crate="metor-fsw-2-dl-fixture" lib="{lib}" type="DlCounter"
 system "ticker" type="Ticker"
-system "counter" type="DlCounter" lib="counter" start=1000 scale=2.0
+system "counter" type="DlCounter" artifact="counter" start=1000 scale=2.0
 connect "ticker" -> "counter" frame="tick_in"
 "#,
         lib = fixture_lib_stem()
@@ -238,7 +238,8 @@ connect "ticker" -> "counter" frame="tick_in"
     };
     let kdl_bytes = {
         let dl = DlSystem::open(path).expect("open the fixture .so for its Params schema");
-        encode_kdl_params(&kdl_text, dl.params_schema(), "counter").expect("schema-encode KDL params")
+        encode_kdl_params(&kdl_text, dl.params_schema(), "counter", &["type", "artifact"], 1)
+            .expect("schema-encode KDL params")
     };
     assert_eq!(
         builder_bytes, kdl_bytes,
@@ -285,4 +286,51 @@ connect "ticker" -> "counter" frame="tick_in"
     assert_eq!(kdl_count, builder_count, "KDL front-end runs to the same output");
 
     drop((builder_view, kdl_view, builder_coord, kdl_coord));
+}
+
+/// E5a: `type=` is optional on a dl system (the artifact's `system_type` is
+/// authoritative) — the mission resolves and runs without it; and an explicit
+/// `type=` contradicting the artifact is the clean spanned `TypeMismatchesArtifact`.
+#[test]
+fn dl_type_optional_and_validated_against_artifact() {
+    use metor_fsw_2::wiring::LoadError;
+
+    let kdl = format!(
+        r#"
+coordinator cycle_rate=200.0 sim_dt=0.005
+artifact "counter" crate="metor-fsw-2-dl-fixture" lib="{lib}" type="DlCounter"
+system "ticker" type="Ticker"
+system "counter" artifact="counter" start=5 scale=1.0
+connect "ticker" -> "counter" frame="tick_in"
+"#,
+        lib = fixture_lib_stem()
+    );
+    let mut wiring = parse(&kdl).expect("type= is optional with artifact=");
+    assert_eq!(wiring.systems[1].ty, None, "no explicit type on the dl system");
+
+    if let Err(e) = build_artifacts(&mut wiring, &BuildOptions::default()) {
+        eprintln!("skipping: build_artifacts failed: {e}");
+        return;
+    }
+
+    let mut registry = Registry::new();
+    registry.register::<Ticker, _>("Ticker");
+    let coord = resolve(&wiring, &registry).expect("a type-less dl system resolves");
+    drop(coord);
+
+    // A `type=` that contradicts the artifact's exported type is rejected.
+    let mut bad = wiring.clone();
+    bad.systems[1].ty = Some("WrongType".to_string());
+    let err = match resolve(&bad, &registry) {
+        Ok(_) => panic!("expected TypeMismatchesArtifact"),
+        Err(e) => e,
+    };
+    match err {
+        LoadError::TypeMismatchesArtifact { system, ty, artifact_type, .. } => {
+            assert_eq!(system, "counter");
+            assert_eq!(ty, "WrongType");
+            assert_eq!(artifact_type, "DlCounter");
+        }
+        other => panic!("expected TypeMismatchesArtifact, got {other:?}"),
+    }
 }

@@ -10,7 +10,6 @@ mod componentize;
 mod decomponentize;
 mod export;
 mod frame;
-mod from_kdl;
 mod metadatatize;
 mod sequence;
 mod system;
@@ -128,15 +127,6 @@ pub fn export_system(input: TokenStream) -> TokenStream {
 #[proc_macro_attribute]
 pub fn sequence(attr: TokenStream, item: TokenStream) -> TokenStream {
     sequence::sequence(attr, item)
-}
-
-/// Derives [`FromKdlNode`] for a system's params struct: a flat struct of
-/// scalars/strings deserialized from a `system` node's KDL properties (wiring.md
-/// §3). `Option<T>` fields are optional; `#[kdl(default = expr)]` supplies a
-/// fallback; every other field is required.
-#[proc_macro_derive(FromKdlNode, attributes(kdl))]
-pub fn from_kdl_node(input: TokenStream) -> TokenStream {
-    from_kdl::from_kdl_node(input)
 }
 
 pub(crate) fn metor_fsw_crate_name() -> proc_macro2::TokenStream {

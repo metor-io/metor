@@ -1,0 +1,20 @@
+[package]
+name = "metor-fsw-2-seq-param-fixture"
+license = "MIT OR Apache-2.0"
+version.workspace = true
+repository.workspace = true
+edition = "2024"
+publish = false
+description = "A slots/sequences integration-test fixture: one PARAMETERED #[sequence] occupant exported as a cdylib"
+
+# A real loadable shared object: the `slot_wiring` test `dlopen`s the produced
+# `lib*.dylib`/`lib*.so` through a KDL `slot` and asserts its `allow` params
+# (the B1 regression) reach the running occupant.
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+metor-fsw-2 = { path = "../../.." }
+zerocopy = { version = "0.8.2", features = ["derive"] }
+serde = { version = "1.0", features = ["derive"] }
+postcard-schema = { version = "0.2", features = ["derive", "use-std"] }

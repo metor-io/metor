@@ -52,9 +52,9 @@ pub struct CounterParams {
     pub scale: f64,
 }
 
-// A dl system needs **no** `FromKdlNode` impl — it is constructed only via
+// A dl system needs no KDL coupling at all — it is constructed only via
 // `BuildSystem` (below), decoding canonical postcard `Params` bytes in `fsw_create`.
-// This fixture proves the `RegisteredSystem`/`kdl` decoupling.
+// This fixture proves the `BuildSystem`/`kdl` decoupling.
 
 /// Applies `start + value * scale` to each input tick and republishes the sum.
 pub struct DlCounter {

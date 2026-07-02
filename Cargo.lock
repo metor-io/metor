@@ -9193,6 +9193,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "metor-fsw-2-seq-param-fixture"
+version = "0.14.2"
+dependencies = [
+ "metor-fsw-2",
+ "postcard-schema",
+ "serde",
+ "zerocopy",
+]
+
+[[package]]
 name = "metor-fsw-adcs"
 version = "0.1.0"
 dependencies = [

@@ -102,7 +102,11 @@ pub struct SystemSpec {
     /// The instance name (the telemetry prefix, wiring.md §6).
     pub name: String,
     /// The `type=` key (the registry key, or the artifact's `system_type`).
-    pub ty: String,
+    /// Required for a static system; optional for a dl system (the artifact's
+    /// `system_type` is authoritative, and a given `ty` is validated against it
+    /// at [`resolve`](super::resolve)).
+    #[serde(default)]
+    pub ty: Option<String>,
     /// `Some(artifact_id)` ⇒ a dlopen'd system; `None` ⇒ a statically-linked one.
     pub artifact: Option<String>,
     /// Where this system's params come from — see [`ParamSource`].
@@ -113,28 +117,29 @@ pub struct SystemSpec {
 /// do not overload one `Vec<u8>` (the one-postcard-encoding decision).
 ///
 /// At [`resolve`](super::resolve) each variant becomes the canonical postcard `Params`
-/// bytes that cross `fsw_create` (dl) or the KDL node a `FromKdlNode` factory re-parses
-/// (static):
+/// bytes that cross `fsw_create` (dl) or the KDL node the registry factory
+/// deserializes (static):
 ///
 /// - [`None`](ParamSource::None) — a paramless system (config-less KDL, or a builder
 ///   system with no `.params(..)`): empty postcard bytes / a minimal synthesized node.
 /// - [`Postcard`](ParamSource::Postcard) — the typed Rust [`WiringBuilder::params`](super::SystemSpecBuilder::params)
 ///   path: a `Params` value already postcard-encoded to its canonical bytes. For a dl
 ///   system these are exactly the bytes `fsw_create` decodes.
-/// - [`Kdl`](ParamSource::Kdl) — the **KDL `system` node's source text**, carried verbatim
-///   so [`resolve`](super::resolve) can re-decode it: a **static** system re-parses it via
-///   [`FromKdlNode`](super::FromKdlNode) (the host links its `Params`); a **dl** system
-///   schema-encodes it against the `.so`'s exported `Params` schema (the host stays
-///   schema-agnostic), producing the **same** bytes the [`Postcard`](ParamSource::Postcard)
-///   path produces. Which decoder runs is chosen by [`SystemSpec::artifact`], not by the variant.
+/// - [`Kdl`](ParamSource::Kdl) — the **KDL node's source text**, carried verbatim so
+///   [`resolve`](super::resolve) can re-decode it through the shared KDL params
+///   deserializer: a **static** system deserializes it into its typed `Params` (the
+///   host links `Params`); a **dl** system schema-encodes it against the `.so`'s
+///   exported `Params` schema (the host stays schema-agnostic), producing the **same**
+///   bytes the [`Postcard`](ParamSource::Postcard) path produces. Which decoder runs is
+///   chosen by [`SystemSpec::artifact`], not by the variant.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum ParamSource {
     /// No params: empty postcard bytes (dl) / a minimal synthesized node (static).
     None,
     /// Canonical postcard `Params` bytes (the typed Rust builder path).
     Postcard(Vec<u8>),
-    /// The KDL `system` node's source text, re-decoded at resolve (static: `FromKdlNode`;
-    /// dl: schema-guided postcard encode).
+    /// The KDL node's source text, re-decoded at resolve (static: typed serde
+    /// deserialize; dl: schema-guided postcard encode).
     Kdl(String),
 }
 

@@ -1,7 +1,7 @@
 //! Wiring acceptance tests (wiring.md "Tests"): an end-to-end KDL load + run wiring a
 //! params-bearing cyclic chain into an async logger, instance-name disambiguation
 //! of two instances of one system type, the span-carrying error cases, and the
-//! `FromKdlNode` derive round-trip. Systems are tiny but real `CyclicSystem`/
+//! serde-over-KDL params round-trip. Systems are tiny but real `CyclicSystem`/
 //! `AsyncSystem` impls registered in a [`Registry`].
 
 use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
@@ -11,8 +11,8 @@ use metor_proto::types::{ComponentId, Timestamp};
 use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
 
 use crate::wiring::{
-    ClockSpec, FromKdlNode, LoadError, ParamSource, Registry, SlotInitState, WiringBuilder, load,
-    parse, resolve,
+    ClockSpec, LoadError, ParamSource, Registry, SlotInitState, WiringBuilder, load, parse,
+    resolve,
 };
 use crate::{
     AsyncSystem, BuildSystem, CyclicSystem, Input, MsgIn, MsgOut, Out, Output, System, SystemInput,
@@ -63,7 +63,7 @@ struct NoOut {}
 // A params-bearing cyclic producer: writes an incrementing `Imu` every cycle.
 // ---------------------------------------------------------------------------
 
-#[derive(FromKdlNode)]
+#[derive(serde::Deserialize)]
 struct ImuParams {
     #[allow(dead_code)]
     i2c_bus: i64,
@@ -109,7 +109,7 @@ impl BuildSystem for ImuDriver {
 // A params-bearing cyclic filter: consumes `imu`, produces `nav` = omega * gain.
 // ---------------------------------------------------------------------------
 
-#[derive(FromKdlNode)]
+#[derive(serde::Deserialize)]
 struct NavParams {
     gain: f64,
 }
@@ -582,16 +582,21 @@ telemetry {
 }
 
 // ---------------------------------------------------------------------------
-// FromKdlNode derive round-trips scalars, a string, an optional, and a default.
+// The serde-over-KDL params deserializer round-trips scalars, a string, an
+// optional, and a `#[serde(default)]` (the old derive's `#[kdl(default)]`).
 // ---------------------------------------------------------------------------
 
-#[derive(FromKdlNode, Debug, PartialEq)]
+fn default_depth() -> i64 {
+    4
+}
+
+#[derive(serde::Deserialize, Debug, PartialEq)]
 struct RoundTrip {
     count: i64,
     rate: f64,
     label: String,
     offset: Option<f64>,
-    #[kdl(default = 4)]
+    #[serde(default = "default_depth")]
     depth: i64,
 }
 
@@ -599,11 +604,17 @@ fn first_node(src: &str) -> kdl::KdlNode {
     src.parse::<kdl::KdlDocument>().unwrap().nodes()[0].clone()
 }
 
+/// Deserialize a params struct off a bare (reserved-key-less, arg-less) node —
+/// the derive-replacement entry the registry factory uses.
+fn round_trip(src: &str) -> Result<RoundTrip, LoadError> {
+    let node = first_node(src);
+    super::de::from_kdl_node::<RoundTrip>(&node, src, "params", &[], 0)
+}
+
 #[test]
 fn from_kdl_node_round_trip_defaults() {
     let src = r#"params count=3 rate=1.5 label="hi""#;
-    let node = first_node(src);
-    let got = RoundTrip::from_kdl_node(&node, src).unwrap();
+    let got = round_trip(src).unwrap();
     assert_eq!(
         got,
         RoundTrip {
@@ -611,7 +622,7 @@ fn from_kdl_node_round_trip_defaults() {
             rate: 1.5,
             label: "hi".to_string(),
             offset: None,
-            depth: 4, // the #[kdl(default = 4)] fallback
+            depth: 4, // the #[serde(default = "default_depth")] fallback
         }
     );
 }
@@ -619,8 +630,7 @@ fn from_kdl_node_round_trip_defaults() {
 #[test]
 fn from_kdl_node_round_trip_explicit() {
     let src = r#"params count=7 rate=2 label="full" offset=0.25 depth=9"#;
-    let node = first_node(src);
-    let got = RoundTrip::from_kdl_node(&node, src).unwrap();
+    let got = round_trip(src).unwrap();
     assert_eq!(
         got,
         RoundTrip {
@@ -631,6 +641,176 @@ fn from_kdl_node_round_trip_explicit() {
             depth: 9,
         }
     );
+}
+
+// ---------------------------------------------------------------------------
+// Params-surface errors through the full load path: unknown params (static path,
+// previously silently ignored), entry-precise spans, duplicate keys, and the
+// E5 surface fixes (unknown top-level nodes, the `lib=` -> `artifact=` rename,
+// `type=` optional on dl systems).
+// ---------------------------------------------------------------------------
+
+#[test]
+fn err_unknown_param_on_static_system() {
+    // A typo'd property on a static system is a spanned `UnknownParam` naming the
+    // key (the old `FromKdlNode` walk silently ignored it).
+    let kdl = r#"
+coordinator cycle_rate=100.0
+system "nav" type="NavFilter" gain=0.8 gian=0.5
+"#;
+    let err = load_err(kdl);
+    match err {
+        LoadError::UnknownParam { property, system, span, .. } => {
+            assert_eq!(property, "gian");
+            assert_eq!(system, "nav");
+            // The span points at the `gian=0.5` entry (within the carried node
+            // text), not at offset 0 (the whole node).
+            assert!(span.offset() > 0, "entry-precise span, got {span:?}");
+        }
+        other => panic!("expected UnknownParam, got {other:?}"),
+    }
+}
+
+#[test]
+fn err_invalid_param_span_points_at_the_entry() {
+    // `gain` wants a number; the span points inside the `gain="fast"` entry, not
+    // at the node start.
+    let kdl = r#"
+coordinator cycle_rate=100.0
+system "nav" type="NavFilter" gain="fast"
+"#;
+    let err = load_err(kdl);
+    match err {
+        LoadError::InvalidParam { property, src, span, .. } => {
+            assert_eq!(property, "gain");
+            let at = src.find("gain=").expect("the carried text holds the entry");
+            assert!(
+                span.offset() >= at,
+                "span {span:?} points at the entry (at {at}) in {src:?}"
+            );
+        }
+        other => panic!("expected InvalidParam, got {other:?}"),
+    }
+}
+
+#[test]
+fn err_unit_params_reject_stray_properties() {
+    // `Src` is paramless (`type Params = ()`): a stray property is an UnknownParam,
+    // not a silent no-op.
+    let kdl = r#"
+coordinator cycle_rate=100.0
+system "src" type="Src" bogus=1
+"#;
+    let err = load_err(kdl);
+    assert!(
+        matches!(err, LoadError::UnknownParam { ref property, .. } if property == "bogus"),
+        "{err:?}"
+    );
+}
+
+#[test]
+fn err_repeated_property_is_rejected() {
+    // KDL's last-wins for a repeated property is NOT honored for params — explicit
+    // is better than a silently-dropped first value.
+    let kdl = r#"
+coordinator cycle_rate=100.0
+system "nav" type="NavFilter" gain=1.0 gain=2.0
+"#;
+    let err = load_err(kdl);
+    assert!(matches!(err, LoadError::InvalidParam { .. }), "{err:?}");
+}
+
+#[test]
+fn err_unknown_coordinator_property() {
+    // The coordinator props ride the same deserializer: a misspelled knob is a
+    // spanned UnknownParam rather than a silent skip.
+    let kdl = r#"
+coordinator cycle_rate=100.0 default_dept=8
+system "src" type="Src"
+"#;
+    let err = load_err(kdl);
+    assert!(
+        matches!(err, LoadError::UnknownParam { ref property, .. } if property == "default_dept"),
+        "{err:?}"
+    );
+}
+
+#[test]
+fn err_unknown_top_level_node() {
+    let kdl = r#"
+coordinator cycle_rate=100.0
+frobnicate "x"
+"#;
+    let err = load_err(kdl);
+    assert!(
+        matches!(err, LoadError::UnknownTopLevelNode { ref node, .. } if node == "frobnicate"),
+        "{err:?}"
+    );
+}
+
+#[test]
+fn err_lib_on_system_is_a_rename_guidance_error() {
+    // The pre-rename `lib=` spelling on a `system` node gets a dedicated spanned
+    // error pointing at the entry (`artifact` nodes keep `lib=` for the stem).
+    let kdl = r#"
+coordinator cycle_rate=100.0
+artifact "plant" crate="adcs-plant" lib="adcs_plant" type="Plant"
+system "plant" type="Plant" lib="plant"
+"#;
+    let err = load_err(kdl);
+    match err {
+        LoadError::SystemLibRenamed { src, span } => {
+            let at = src.rfind("lib=\"plant\"").expect("the system's lib= entry");
+            assert!(span.offset() >= at, "span {span:?} at the system's lib= (at {at})");
+        }
+        other => panic!("expected SystemLibRenamed, got {other:?}"),
+    }
+}
+
+#[test]
+fn type_is_optional_when_artifact_is_given() {
+    // A dl system may omit `type=` (the artifact's `system_type` is authoritative,
+    // filled at resolve); a static system still requires it.
+    let kdl = r#"
+coordinator cycle_rate=100.0
+artifact "plant" crate="adcs-plant" lib="adcs_plant" type="Plant"
+system "plant" artifact="plant"
+"#;
+    let wiring = parse(kdl).expect("type= is optional with artifact=");
+    assert_eq!(wiring.systems[0].ty, None);
+    assert_eq!(wiring.systems[0].artifact.as_deref(), Some("plant"));
+
+    let err = match parse(
+        r#"
+coordinator cycle_rate=100.0
+system "nav"
+"#,
+    ) {
+        Ok(_) => panic!("a static system without type= must not parse"),
+        Err(e) => e,
+    };
+    assert!(matches!(err, LoadError::MissingType { .. }), "{err:?}");
+}
+
+#[test]
+fn allow_line_property_params_are_carried() {
+    // B1 (parse half): params as line properties on an `allow` node — not just a
+    // child block — are carried as `ParamSource::Kdl` for the resolve-time encoder.
+    let kdl = r#"
+coordinator cycle_rate=100.0
+slot "adcs" {
+    allow occupant="commissioning" gain=0.8
+    allow occupant="safe_mode"
+}
+"#;
+    let wiring = parse(kdl).expect("parse a slot with line-property allow params");
+    match &wiring.slots[0].allow[0].params {
+        ParamSource::Kdl(text) => {
+            assert!(text.contains("gain=0.8"), "carried allow text: {text}")
+        }
+        other => panic!("expected ParamSource::Kdl, got {other:?}"),
+    }
+    assert_eq!(wiring.slots[0].allow[1].params, ParamSource::None);
 }
 
 // ---------------------------------------------------------------------------
@@ -687,12 +867,12 @@ async fn builder_wiring_resolves_and_runs() {
 
 #[test]
 fn dl_kdl_params_are_carried_as_kdl_source() {
-    // KDL params on a `lib=` system are carried as the node source text for the
-    // resolve-time schema-guided encoder.
+    // KDL params on an `artifact=` system are carried as the node source text for
+    // the resolve-time schema-guided encoder.
     let kdl = r#"
 coordinator cycle_rate=100.0
 artifact "plant" crate="adcs-plant" lib="adcs_plant" type="Plant"
-system "plant" type="Plant" lib="plant" gain=5.0
+system "plant" type="Plant" artifact="plant" gain=5.0
 "#;
     let wiring = parse(kdl).expect("KDL params on a dl system parse");
     match &wiring.systems[0].params {
@@ -706,7 +886,7 @@ fn dl_system_in_kdl_parses_into_an_artifact_ref() {
     let kdl = r#"
 coordinator cycle_rate=100.0
 artifact "plant" crate="adcs-plant" lib="adcs_plant" type="Plant"
-system "plant" type="Plant" lib="plant"
+system "plant" type="Plant" artifact="plant"
 "#;
     let wiring = parse(kdl).expect("parse a dl system + artifact");
     assert_eq!(wiring.artifacts.len(), 1);
@@ -854,7 +1034,7 @@ fn unknown_artifact_ref_is_a_clean_error() {
     // A dl system referencing an undeclared artifact resolves to UnknownArtifact.
     let kdl = r#"
 coordinator cycle_rate=100.0
-system "plant" type="Plant" lib="missing"
+system "plant" type="Plant" artifact="missing"
 "#;
     let wiring = parse(kdl).expect("parses (resolution is deferred)");
     let err = match resolve(&wiring, &registry()) {
@@ -867,7 +1047,7 @@ system "plant" type="Plant" lib="missing"
 #[test]
 fn err_static_system_with_typed_params() {
     // Typed builder params on a *static* system have no decode path (the Registry
-    // factory is `FromKdlNode`-shaped, not postcard) — rejected at resolve, never
+    // factory deserializes KDL, not postcard) — rejected at resolve, never
     // silently dropped onto defaults.
     #[derive(serde::Serialize)]
     struct Gain {

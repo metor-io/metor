@@ -30,7 +30,7 @@ use crate::binder::BindPorts;
 use crate::sequence::{
     Outcome, SeqBound, SeqClock, SeqStatusOut, SeqSystem, SequenceStatus, SlotControlIn, wait,
 };
-use crate::wiring::{FromKdlNode, LoadError};
+use crate::wiring::LoadError;
 use crate::{
     BuildSystem, CyclicSystem, Frame, Input, Out, Output, System, SystemHealth, SystemInput,
     SystemKind, SystemLog, SystemOutput, buffer_capacity,
@@ -59,17 +59,11 @@ struct TickOut {
 }
 
 /// A real `Params` struct: `Serialize + Deserialize + Schema` (the postcard params
-/// contract) plus the `FromKdlNode` the `RegisteredSystem` construction needs.
+/// contract) — `Deserialize` is also all the static KDL registry path needs.
 #[derive(Serialize, Deserialize, Schema, Clone, Default, Debug, PartialEq)]
 struct CounterParams {
+    #[serde(default)]
     start: u64,
-}
-
-impl FromKdlNode for CounterParams {
-    fn from_kdl_node(node: &kdl::KdlNode, src: &str) -> Result<Self, LoadError> {
-        let start = crate::wiring::kdl_optional::<u64>(node, "start", "counter", src)?.unwrap_or(0);
-        Ok(Self { start })
-    }
 }
 
 /// Adds `start` to each input tick and republishes the sum — enough to prove the
@@ -174,7 +168,7 @@ fn abi_lifecycle_end_to_end() {
 
     // The host writes one input record through a BoxBacking writer over `in_ring`,
     // which the system reads through its RawBacking view over the same region.
-    let mut in_writer = Output::<TickIn>::new(in_ring.writer(NoWake, NoWake));
+    let mut in_writer = Output::<TickIn>::new(in_ring.writer(NoWake, NoWake).unwrap());
     in_writer
         .write(&TickIn {
             timestamp: Timestamp(7),
@@ -420,6 +414,16 @@ fn from_raw_folds_out_of_range_to_panicked() {
 
 use crate::wiring::encode_kdl_params;
 
+/// `encode_kdl_params` with the `system`-node surface (reserved `type=`/`artifact=`,
+/// one leading instance-name argument) — what `resolve_dl` passes.
+fn encode_system_params(
+    node_text: &str,
+    schema: &OwnedNamedType,
+    system: &str,
+) -> Result<Vec<u8>, LoadError> {
+    encode_kdl_params(node_text, schema, system, &["type", "artifact"], 1)
+}
+
 /// A multi-field, mixed-type `Params` (the byte-equality gate must hold across types,
 /// not just one field). Mirrors a dl system's `#[derive(Serialize, Deserialize, Schema)]`.
 #[derive(Serialize, Deserialize, Schema, Debug, PartialEq)]
@@ -438,9 +442,9 @@ struct MultiParams {
 #[test]
 fn kdl_schema_encode_byte_equals_typed_builder() {
     let schema = OwnedNamedType::from(<MultiParams as Schema>::SCHEMA);
-    let node_text = r#"system "x" type="T" lib="a" start=7 scale=2.5 enabled=#true label="hi" bias=-9 trim=0.25"#;
+    let node_text = r#"system "x" type="T" artifact="a" start=7 scale=2.5 enabled=#true label="hi" bias=-9 trim=0.25"#;
 
-    let kdl_bytes = encode_kdl_params(node_text, &schema, "x").expect("schema-encode KDL params");
+    let kdl_bytes = encode_system_params(node_text, &schema, "x").expect("schema-encode KDL params");
     let typed_bytes = postcard::to_allocvec(&MultiParams {
         start: 7,
         scale: 2.5,
@@ -465,9 +469,9 @@ fn kdl_schema_encode_byte_equals_typed_builder() {
 fn kdl_schema_encode_optional_absent_and_int_for_float() {
     let schema = OwnedNamedType::from(<MultiParams as Schema>::SCHEMA);
     // `trim` omitted ⇒ None; `scale=3` (int literal) ⇒ 3.0.
-    let node_text = r#"system "x" type="T" lib="a" start=0 scale=3 enabled=#false label="" bias=0"#;
+    let node_text = r#"system "x" type="T" artifact="a" start=0 scale=3 enabled=#false label="" bias=0"#;
 
-    let kdl_bytes = encode_kdl_params(node_text, &schema, "x").expect("encode with absent Option");
+    let kdl_bytes = encode_system_params(node_text, &schema, "x").expect("encode with absent Option");
     let typed_bytes = postcard::to_allocvec(&MultiParams {
         start: 0,
         scale: 3.0,
@@ -481,54 +485,116 @@ fn kdl_schema_encode_optional_absent_and_int_for_float() {
 }
 
 /// A KDL property whose value type does not match the schema field is a clean
-/// `DlParamTypeMismatch` (not a panic, not a silent divergence).
+/// spanned `InvalidParam` (not a panic, not a silent divergence).
 #[test]
 fn kdl_schema_encode_type_mismatch_is_clean_error() {
     let schema = OwnedNamedType::from(<MultiParams as Schema>::SCHEMA);
     // `start` wants a u64 but is given a string.
-    let node_text = r#"system "x" type="T" lib="a" start="oops" scale=1.0 enabled=#true label="h" bias=0"#;
-    let err = encode_kdl_params(node_text, &schema, "x").expect_err("type mismatch is an error");
+    let node_text = r#"system "x" type="T" artifact="a" start="oops" scale=1.0 enabled=#true label="h" bias=0"#;
+    let err = encode_system_params(node_text, &schema, "x").expect_err("type mismatch is an error");
     match err {
-        LoadError::DlParamTypeMismatch { system, property, .. } => {
+        LoadError::InvalidParam { system, property, span, .. } => {
             assert_eq!(system, "x");
             assert_eq!(property, "start");
+            // The span points at the offending `start="oops"` entry.
+            let at = node_text.find("start=").unwrap();
+            assert!(span.offset() >= at, "entry-precise span, got {span:?}");
         }
-        other => panic!("expected DlParamTypeMismatch, got {other:?}"),
+        other => panic!("expected InvalidParam, got {other:?}"),
     }
 }
 
 /// A required (non-`Option`) schema field with no KDL property is a clean
-/// `DlMissingParam`.
+/// `MissingParam`.
 #[test]
 fn kdl_schema_encode_missing_field_is_clean_error() {
     let schema = OwnedNamedType::from(<MultiParams as Schema>::SCHEMA);
     // `bias` (a required i64) is absent.
-    let node_text = r#"system "x" type="T" lib="a" start=1 scale=1.0 enabled=#true label="h""#;
-    let err = encode_kdl_params(node_text, &schema, "x").expect_err("missing field is an error");
+    let node_text = r#"system "x" type="T" artifact="a" start=1 scale=1.0 enabled=#true label="h""#;
+    let err = encode_system_params(node_text, &schema, "x").expect_err("missing field is an error");
     match err {
-        LoadError::DlMissingParam { system, property, .. } => {
+        LoadError::MissingParam { system, property, .. } => {
             assert_eq!(system, "x");
             assert_eq!(property, "bias");
         }
-        other => panic!("expected DlMissingParam, got {other:?}"),
+        other => panic!("expected MissingParam, got {other:?}"),
     }
 }
 
-/// A KDL property not present in the schema is a clean `DlUnknownParam` (a typo guard;
-/// `type=`/`lib=` are reserved and never treated as params).
+/// A KDL property not present in the schema is a clean spanned `UnknownParam` (a
+/// typo guard; `type=`/`artifact=` are reserved and never treated as params).
 #[test]
 fn kdl_schema_encode_unknown_property_is_clean_error() {
     let schema = OwnedNamedType::from(<MultiParams as Schema>::SCHEMA);
     let node_text =
-        r#"system "x" type="T" lib="a" start=1 scale=1.0 enabled=#true label="h" bias=0 typo=5"#;
-    let err = encode_kdl_params(node_text, &schema, "x").expect_err("extra property is an error");
+        r#"system "x" type="T" artifact="a" start=1 scale=1.0 enabled=#true label="h" bias=0 typo=5"#;
+    let err = encode_system_params(node_text, &schema, "x").expect_err("extra property is an error");
     match err {
-        LoadError::DlUnknownParam { system, property, .. } => {
+        LoadError::UnknownParam { system, property, span, .. } => {
             assert_eq!(system, "x");
             assert_eq!(property, "typo");
+            let at = node_text.find("typo=5").unwrap();
+            assert!(span.offset() >= at, "entry-precise span, got {span:?}");
         }
-        other => panic!("expected DlUnknownParam, got {other:?}"),
+        other => panic!("expected UnknownParam, got {other:?}"),
     }
+}
+
+/// Nested params through the dl path: a nested struct, a `Vec` (both the
+/// multi-arg and the repeated-children spellings), and an absent `Option`,
+/// expressed as children — byte-equal to the typed postcard encode.
+#[derive(Serialize, Deserialize, Schema, Debug, PartialEq)]
+struct NestedParams {
+    pid: PidParams,
+    taps: Vec<u64>,
+    label: Option<String>,
+}
+
+#[derive(Serialize, Deserialize, Schema, Debug, PartialEq)]
+struct PidParams {
+    p: f64,
+    i: f64,
+    d: f64,
+}
+
+#[test]
+fn kdl_schema_encode_nested_struct_and_vec_byte_equal() {
+    let schema = OwnedNamedType::from(<NestedParams as Schema>::SCHEMA);
+    let typed_bytes = postcard::to_allocvec(&NestedParams {
+        pid: PidParams { p: 1.0, i: 0.5, d: 0.1 },
+        taps: vec![1, 2, 3],
+        label: None,
+    })
+    .unwrap();
+
+    // Multi-arg child form for the Vec.
+    let node_text = r#"system "x" type="T" artifact="a" {
+    pid p=1.0 i=0.5 d=0.1
+    taps 1 2 3
+}"#;
+    let kdl_bytes = encode_system_params(node_text, &schema, "x").expect("nested encode");
+    assert_eq!(kdl_bytes, typed_bytes, "nested struct + multi-arg Vec byte-match");
+
+    // Repeated-children form for the Vec is the same wire.
+    let node_text = r#"system "x" type="T" artifact="a" {
+    pid p=1.0 i=0.5 d=0.1
+    taps 1
+    taps 2
+    taps 3
+}"#;
+    let kdl_bytes = encode_system_params(node_text, &schema, "x").expect("repeated-children encode");
+    assert_eq!(kdl_bytes, typed_bytes, "repeated-children Vec byte-match");
+
+    // A wrong-typed nested leaf is a named error carrying the nested field name.
+    let node_text = r#"system "x" type="T" artifact="a" {
+    pid p="oops" i=0.5 d=0.1
+    taps 1 2 3
+}"#;
+    let err = encode_system_params(node_text, &schema, "x").expect_err("nested mismatch errors");
+    assert!(
+        matches!(err, LoadError::InvalidParam { ref property, .. } if property == "p"),
+        "{err:?}"
+    );
 }
 
 // ---------------------------------------------------------------------------
