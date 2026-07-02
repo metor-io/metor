@@ -7,17 +7,21 @@
 //! span-carrying [`LoadError`] (a `miette` [`Diagnostic`](miette::Diagnostic)
 //! mirroring `metor-proto-kdl`'s `KdlSchematicError`).
 //!
-//! ## Schema (properties on the node line)
+//! ## Schema (the params surface)
 //!
-//! Params and coordinator config are **properties on the node line**, not a
-//! `{ key=value }` children block — the latter is not valid KDL v2 (see the report
-//! deviation). Everything else follows wiring.md §1:
+//! Scalar params and coordinator config are canonically **properties on the node
+//! line**; nested/sequence params are **child nodes** (`docs/design-kdl-serde.md` —
+//! both surfaces feed one serde deserializer, `de.rs`). Everything else follows
+//! wiring.md §1:
 //!
 //! ```kdl
 //! coordinator cycle_rate=200.0 default_depth=8           // wall clock, paced
 //! coordinator cycle_rate=200.0 sim_dt=0.00833            // simulated clock, free-run
 //! system "imu" type="ImuDriver" i2c_bus=1 sample_hz=200.0
-//! system "nav" type="MekfFilter" gain=0.8
+//! system "nav" type="MekfFilter" gain=0.8 {
+//!     pid p=1.0 i=0.5 d=0.1                  // a nested params struct
+//!     taps 1 2 3                             // a sequence param
+//! }
 //! connect "imu" -> "nav" frame="imu"          // shorthand
 //! connect from="nav" out="nav" to="log" in="nav"   // explicit long form
 //! connect "ctrl" -> "plant" frame="torque_cmd" delayed=#true   // feedback back-edge
@@ -31,10 +35,10 @@
 use std::collections::{HashMap, HashSet};
 use std::time::Duration;
 
-use kdl::{KdlDocument, KdlNode, KdlValue};
+use kdl::{KdlDocument, KdlNode};
 use miette::{Diagnostic, SourceSpan};
 use postcard_schema::schema::owned::{OwnedDataModelType, OwnedNamedType};
-use serde_json::{Map, Number, Value};
+use serde_json::{Map, Value};
 use thiserror::Error;
 
 use metor_fsw_ring::BoxBacking;
@@ -58,6 +62,7 @@ use crate::telemetry::{TcpRecvTransport, TcpTransport, TelemetryConfig, Telemetr
 mod build_driver;
 mod builder;
 mod bundle;
+mod de;
 mod model;
 
 pub use build_driver::{BuildError, BuildOptions, build_artifacts};
@@ -69,10 +74,9 @@ pub use model::{
     TelemetrySpec, Wiring,
 };
 
-// Re-export the derive and the registration macro so a system author only needs
+// Re-export the registration macro so a system author only needs
 // `metor_fsw_2::wiring`.
 pub use crate::register_system;
-pub use metor_fsw_macros::FromKdlNode;
 
 // ---------------------------------------------------------------------------
 // Errors — every failure with source context (wiring.md §5.2)
@@ -146,26 +150,44 @@ pub enum LoadError {
         span: SourceSpan,
     },
 
-    #[error("missing required property `{property}` for system `{system}`")]
+    /// A required params field (per the typed `Params` struct or the dl `Params`
+    /// schema) has no matching property/child on the node.
+    #[error("missing required param `{property}` for system `{system}`")]
     #[diagnostic(code(fsw_wiring::missing_param))]
     MissingParam {
         property: String,
-        system: &'static str,
+        system: String,
         #[source_code]
         src: String,
-        #[label("this node is missing the property")]
+        #[label("this node is missing the param")]
         span: SourceSpan,
     },
 
+    /// A params value that does not decode as the field's type (or a params
+    /// surface shape error: a stray positional argument, a repeated property, …).
     #[error("invalid value for `{property}` on system `{system}`: expected {expected}")]
     #[diagnostic(code(fsw_wiring::invalid_param))]
     InvalidParam {
         property: String,
-        system: &'static str,
+        system: String,
         expected: String,
         #[source_code]
         src: String,
         #[label("invalid value here")]
+        span: SourceSpan,
+    },
+
+    /// A property/child with no matching params field — a typo or a stale config.
+    /// Raised uniformly by the static path (the serde deserializer) and the dl
+    /// path (the `Params`-schema validation).
+    #[error("unknown param `{property}` for system `{system}`")]
+    #[diagnostic(code(fsw_wiring::unknown_param))]
+    UnknownParam {
+        property: String,
+        system: String,
+        #[source_code]
+        src: String,
+        #[label("no params field is named this")]
         span: SourceSpan,
     },
 
@@ -230,7 +252,7 @@ pub enum LoadError {
         artifact: String,
         #[source_code]
         src: String,
-        #[label("declare an `artifact \"{artifact}\" ...` node, or fix the `lib=` ref")]
+        #[label("declare an `artifact \"{artifact}\" ...` node, or fix the `artifact=` ref")]
         span: SourceSpan,
     },
 
@@ -259,49 +281,6 @@ pub enum LoadError {
         span: SourceSpan,
     },
 
-    /// A dl system's KDL property has no matching field in the `.so`'s exported `Params`
-    /// schema — a typo or a stale config (the schema-guided encoder).
-    #[error("dl system `{system}` has an unknown param `{property}` (not in its `Params` schema)")]
-    #[diagnostic(code(fsw_wiring::dl_unknown_param))]
-    DlUnknownParam {
-        system: String,
-        property: String,
-        #[source_code]
-        src: String,
-        #[label("no `Params` field is named this")]
-        span: SourceSpan,
-    },
-
-    /// A dl system's `Params` schema field has no corresponding KDL property, and the
-    /// field is not an `Option` (so it has no default).
-    #[error("dl system `{system}` is missing required param `{property}` (a `Params` schema field)")]
-    #[diagnostic(code(fsw_wiring::dl_missing_param))]
-    DlMissingParam {
-        system: String,
-        property: String,
-        #[source_code]
-        src: String,
-        #[label("add this property to the `system` node")]
-        span: SourceSpan,
-    },
-
-    /// A dl system's KDL property value does not match its `Params` schema field type
-    /// (e.g. a string where the schema wants an integer).
-    #[error(
-        "dl system `{system}` param `{property}` has the wrong type: expected {expected} \
-         (per the `Params` schema)"
-    )]
-    #[diagnostic(code(fsw_wiring::dl_param_type_mismatch))]
-    DlParamTypeMismatch {
-        system: String,
-        property: String,
-        expected: String,
-        #[source_code]
-        src: String,
-        #[label("this value does not match the schema field type")]
-        span: SourceSpan,
-    },
-
     /// The dl system's `Params` schema could not be encoded from its KDL config (an
     /// unsupported schema shape, or the dynamic encoder rejected the value).
     #[error("dl system `{system}` params could not be schema-encoded: {reason}")]
@@ -317,13 +296,13 @@ pub enum LoadError {
 
     /// A **static** (`from_static`) system carries typed builder params
     /// ([`ParamSource::Postcard`]). The static path has no postcard decoder: the
-    /// [`Registry`] factory constructs the system by parsing its params off the KDL
-    /// `system` node via [`FromKdlNode`] ([`Registry::register`]), so the postcard
-    /// bytes would be silently dropped and the system would run on defaults.
+    /// [`Registry`] factory constructs the system by deserializing its params off the
+    /// KDL `system` node ([`Registry::register`]), so the postcard bytes would be
+    /// silently dropped and the system would run on defaults.
     #[error(
         "static system `{system}` (type `{ty}`) has typed builder params, but a static \
-         system takes params through its registered `FromKdlNode` factory — express them \
-         as KDL config properties (`system \"{system}\" type=\"{ty}\" key=value`), or \
+         system takes params through its registered KDL-deserializing factory — express \
+         them as KDL config properties (`system \"{system}\" type=\"{ty}\" key=value`), or \
          resolve the system `from_artifact` (only the dl path decodes postcard params)"
     )]
     #[diagnostic(code(fsw_wiring::static_postcard_params))]
@@ -343,6 +322,48 @@ pub enum LoadError {
         #[source_code]
         src: String,
         #[label("this artifact node is incomplete")]
+        span: SourceSpan,
+    },
+
+    /// A top-level node name the wiring schema does not know — a typo would
+    /// otherwise be silently skipped.
+    #[error("unknown top-level node `{node}`")]
+    #[diagnostic(code(fsw_wiring::unknown_top_level_node))]
+    UnknownTopLevelNode {
+        node: String,
+        #[source_code]
+        src: String,
+        #[label("expected `coordinator`/`artifact`/`system`/`slot`/`connect`/`telemetry`")]
+        span: SourceSpan,
+    },
+
+    /// `lib=` on a `system` node — renamed to `artifact=` (a guidance error for the
+    /// pre-rename spelling; `lib=` on `artifact` nodes still means the library stem).
+    #[error(
+        "`lib=` on `system` nodes was renamed to `artifact=` (it references an artifact \
+         id; `lib=` on `artifact` nodes still means the library stem)"
+    )]
+    #[diagnostic(code(fsw_wiring::system_lib_renamed))]
+    SystemLibRenamed {
+        #[source_code]
+        src: String,
+        #[label("write `artifact=` here")]
+        span: SourceSpan,
+    },
+
+    /// A dl system's explicit `type=` contradicts the `.so` type its artifact
+    /// exports (`type=` is optional on dl systems; when given it must match).
+    #[error(
+        "system `{system}` declares type `{ty}` but its artifact exports `{artifact_type}`"
+    )]
+    #[diagnostic(code(fsw_wiring::type_mismatches_artifact))]
+    TypeMismatchesArtifact {
+        system: String,
+        ty: String,
+        artifact_type: String,
+        #[source_code]
+        src: String,
+        #[label("drop the `type=` or make it `{artifact_type}`")]
         span: SourceSpan,
     },
 
@@ -430,112 +451,19 @@ pub enum LoadError {
 // ---------------------------------------------------------------------------
 // Param deserialization (wiring.md §3)
 // ---------------------------------------------------------------------------
+//
+// One in-house `serde::Deserializer` over a KDL node's params surface (`de.rs`)
+// serves BOTH paths: the static registry factory deserializes a typed
+// `S::Params: DeserializeOwned`, and the dl path deserializes a
+// `serde_json::Value` that the `Params`-schema validation feeds to postcard-dyn.
+// The reserved wiring keys (`type=`/`artifact=` on `system` nodes, `occupant=`
+// on `allow` nodes) and the leading instance-name argument never reach the
+// params struct at all.
 
-/// Deserialize a system's params from its `system` node's KDL properties. Derive
-/// with `#[derive(FromKdlNode)]`; a no-params system uses `type Params = ()`.
-pub trait FromKdlNode: Sized {
-    fn from_kdl_node(node: &KdlNode, src: &str) -> Result<Self, LoadError>;
-}
-
-/// A system with no configurable params.
-impl FromKdlNode for () {
-    fn from_kdl_node(_node: &KdlNode, _src: &str) -> Result<Self, LoadError> {
-        Ok(())
-    }
-}
-
-/// A scalar/string a KDL property value can decode into — the leaf the
-/// [`FromKdlNode`] derive walks for each field.
-pub trait FromKdlScalar: Sized {
-    /// Decode from a KDL value, or `None` if the value is the wrong shape.
-    fn from_value(value: &KdlValue) -> Option<Self>;
-    /// A human name of the expected shape, for `LoadError::InvalidParam`.
-    const EXPECTED: &'static str;
-}
-
-macro_rules! int_scalar {
-    ($($t:ty),*) => {$(
-        impl FromKdlScalar for $t {
-            fn from_value(value: &KdlValue) -> Option<Self> {
-                value.as_integer().map(|i| i as $t)
-            }
-            const EXPECTED: &'static str = "an integer";
-        }
-    )*};
-}
-int_scalar!(i8, i16, i32, i64, isize, u8, u16, u32, u64, usize);
-
-macro_rules! float_scalar {
-    ($($t:ty),*) => {$(
-        impl FromKdlScalar for $t {
-            fn from_value(value: &KdlValue) -> Option<Self> {
-                // Accept an integer literal where a float is wanted (`rate=200`).
-                value
-                    .as_float()
-                    .or_else(|| value.as_integer().map(|i| i as f64))
-                    .map(|f| f as $t)
-            }
-            const EXPECTED: &'static str = "a number";
-        }
-    )*};
-}
-float_scalar!(f32, f64);
-
-impl FromKdlScalar for bool {
-    fn from_value(value: &KdlValue) -> Option<Self> {
-        value.as_bool()
-    }
-    const EXPECTED: &'static str = "a boolean (#true/#false)";
-}
-
-impl FromKdlScalar for String {
-    fn from_value(value: &KdlValue) -> Option<Self> {
-        value.as_string().map(|s| s.to_string())
-    }
-    const EXPECTED: &'static str = "a string";
-}
-
-/// Read a **required** property `key` off `node` (used by the derive).
-pub fn kdl_required<T: FromKdlScalar>(
-    node: &KdlNode,
-    key: &str,
-    system: &'static str,
-    src: &str,
-) -> Result<T, LoadError> {
-    let value = node.get(key).ok_or_else(|| LoadError::MissingParam {
-        property: key.to_string(),
-        system,
-        src: src.to_string(),
-        span: node.span(),
-    })?;
-    T::from_value(value).ok_or_else(|| LoadError::InvalidParam {
-        property: key.to_string(),
-        system,
-        expected: T::EXPECTED.to_string(),
-        src: src.to_string(),
-        span: node.span(),
-    })
-}
-
-/// Read an **optional** property `key` off `node` (used by the derive for
-/// `Option<T>` and `#[kdl(default = ..)]` fields). Absent ⇒ `Ok(None)`.
-pub fn kdl_optional<T: FromKdlScalar>(
-    node: &KdlNode,
-    key: &str,
-    system: &'static str,
-    src: &str,
-) -> Result<Option<T>, LoadError> {
-    match node.get(key) {
-        None => Ok(None),
-        Some(value) => T::from_value(value).map(Some).ok_or_else(|| LoadError::InvalidParam {
-            property: key.to_string(),
-            system,
-            expected: T::EXPECTED.to_string(),
-            src: src.to_string(),
-            span: node.span(),
-        }),
-    }
-}
+/// The reserved line-property keys of a `system` node (its wiring surface).
+const SYSTEM_RESERVED: &[&str] = &["type", "artifact"];
+/// The reserved line-property keys of a slot `allow` node.
+const ALLOW_RESERVED: &[&str] = &["occupant"];
 
 // ---------------------------------------------------------------------------
 // The registry (wiring.md §2)
@@ -557,30 +485,6 @@ pub struct LoadCtx<'a> {
 /// to the builder under `ctx.name`, and return its handle + descriptor (for edge
 /// validation).
 pub type SystemFactory = fn(&mut LoadCtx) -> Result<(SystemHandle, SystemDescriptor), LoadError>;
-
-/// The KDL static-registry construction contract (wiring.md §2.3): a
-/// [`BuildSystem`](crate::BuildSystem) whose `Params` is [`FromKdlNode`]-parseable.
-///
-/// Construction is split in two: the format-independent [`BuildSystem`]
-/// (`type Params` + `fn new`, in `system.rs`, with **no** kdl coupling — what
-/// `export_system!`/the dlopen ABI need) and this thin extension that *only* adds the
-/// `Params: FromKdlNode` bound the static factory needs. It is a **blanket marker**:
-/// every `BuildSystem` with a `FromKdlNode` `Params` is automatically a
-/// `RegisteredSystem`, so a statically-linked system registers by impl'ing
-/// [`BuildSystem`] (not this) — while a dl-only system needs no `FromKdlNode` impl
-/// at all.
-pub trait RegisteredSystem: BuildSystem
-where
-    <Self as BuildSystem>::Params: FromKdlNode,
-{
-}
-
-impl<S> RegisteredSystem for S
-where
-    S: BuildSystem,
-    S::Params: FromKdlNode,
-{
-}
 
 /// Marker for a cyclic system's [`AddToBuilder`] impl.
 pub struct CyclicKind;
@@ -626,14 +530,16 @@ where
 
 /// The factory `Registry::register::<S, _>` stores: the whole "params → `new` →
 /// `add_*_named`" dance for one concrete type, erased to a plain `fn` pointer. Bounded
-/// on the kdl-independent [`BuildSystem`](crate::BuildSystem) plus the `FromKdlNode`
-/// `Params` the static path needs (i.e. exactly [`RegisteredSystem`]'s premises).
+/// on the kdl-independent [`BuildSystem`](crate::BuildSystem) plus the
+/// `Params: DeserializeOwned` the static path's KDL deserializer needs. `()` params
+/// deserialize from a param-less node (and reject stray properties).
 fn factory<S, K>(ctx: &mut LoadCtx) -> Result<(SystemHandle, SystemDescriptor), LoadError>
 where
     S: BuildSystem + AddToBuilder<K>,
-    S::Params: FromKdlNode,
+    S::Params: serde::de::DeserializeOwned,
 {
-    let params = <S::Params as FromKdlNode>::from_kdl_node(ctx.node, ctx.src)?;
+    let params =
+        de::from_kdl_node::<S::Params>(ctx.node, ctx.src, ctx.name, SYSTEM_RESERVED, 1)?;
     let system = S::new(params);
     let handle = system.add_to(ctx.name, ctx.builder);
     Ok((handle, <S as AddToBuilder<K>>::descriptor()))
@@ -654,13 +560,16 @@ impl Registry {
     }
 
     /// Register concrete system `S` under `type_name`. `S` supplies its params type
-    /// and `new` via [`BuildSystem`](crate::BuildSystem) with a [`FromKdlNode`] `Params`
-    /// (i.e. it is a [`RegisteredSystem`]); the `add_*`/descriptor (and cyclic-vs-async
-    /// branch) come from the [`AddToBuilder`] blanket impl, inferred here.
+    /// and `new` via the format-independent [`BuildSystem`](crate::BuildSystem); the
+    /// only KDL-facing requirement is `S::Params: serde::de::DeserializeOwned` (the
+    /// same derive the postcard/dl contract already needs), so a statically-linked
+    /// system registers by impl'ing `BuildSystem` alone. The `add_*`/descriptor (and
+    /// cyclic-vs-async branch) come from the [`AddToBuilder`] blanket impl, inferred
+    /// here.
     pub fn register<S, K>(&mut self, type_name: &'static str) -> &mut Self
     where
         S: BuildSystem + AddToBuilder<K>,
-        S::Params: FromKdlNode,
+        S::Params: serde::de::DeserializeOwned,
     {
         self.factories.insert(type_name, factory::<S, K>);
         self
@@ -722,14 +631,14 @@ pub fn load(kdl: &str, registry: &Registry) -> Result<Coordinator, LoadError> {
 /// This is **parse only**: it touches no [`Registry`], `dlopen`s nothing, and does not
 /// validate the graph — those are [`resolve`]'s job. It carries the
 /// `coordinator`/`system`/`connect`/`telemetry` surface plus the `artifact` node +
-/// per-`system` `lib=` reference for dl systems.
+/// per-`system` `artifact=` reference for dl systems.
 ///
 /// **Params** (for either kind) are carried as the KDL `system` node's source text in
-/// [`ParamSource::Kdl`] when the node has config properties; a config-less system carries
-/// [`ParamSource::None`]. The decoder is chosen at [`resolve`] time by
-/// [`SystemSpec::artifact`]: a **static** system re-parses the text via `FromKdlNode`;
-/// a **dl** system schema-encodes it against the `.so`'s exported `Params` schema, so
-/// KDL ≡ the Rust builder on the wire.
+/// [`ParamSource::Kdl`] when the node has config properties/children; a config-less
+/// system carries [`ParamSource::None`]. The decoder is chosen at [`resolve`] time by
+/// [`SystemSpec::artifact`]: a **static** system re-deserializes the text into its
+/// typed `Params` (`serde`); a **dl** system schema-encodes it against the `.so`'s
+/// exported `Params` schema, so KDL ≡ the Rust builder on the wire.
 pub fn parse(kdl: &str) -> Result<Wiring, LoadError> {
     let doc = kdl.parse::<KdlDocument>().map_err(|source| LoadError::Parse {
         source,
@@ -737,63 +646,57 @@ pub fn parse(kdl: &str) -> Result<Wiring, LoadError> {
         span: (0, kdl.len()).into(),
     })?;
 
-    let coordinator = parse_coordinator(&doc, kdl)?;
-
-    // --- Artifacts pass --------------------------------------------------
+    // One pass over the top-level nodes; each list keeps document order, and an
+    // unknown node name is a spanned error rather than a silent skip.
+    let mut coordinator: Option<CoordinatorSpec> = None;
     let mut artifacts: Vec<Artifact> = Vec::new();
-    for node in doc.nodes() {
-        if node.name().value() != "artifact" {
-            continue;
-        }
-        artifacts.push(parse_artifact(node, kdl)?);
-    }
-
-    // --- Systems pass (wiring.md §2; dl systems carry a `lib=` ref) ------
     let mut systems: Vec<SystemSpec> = Vec::new();
-    let mut seen: HashSet<String> = HashSet::new();
-    for node in doc.nodes() {
-        if node.name().value() != "system" {
-            continue;
-        }
-        systems.push(parse_system(node, kdl, &mut seen)?);
-    }
-
-    // --- Slots pass (sequences-slots.md §5; a slot is an instance like a system) ---
     let mut slots: Vec<SlotSpec> = Vec::new();
-    for node in doc.nodes() {
-        if node.name().value() != "slot" {
-            continue;
-        }
-        let slot = parse_slot(node, kdl, &mut seen)?;
-        slots.push(slot);
-    }
-
-    // --- Edges pass (wiring.md §4) ---------------------------------------
     let mut edges: Vec<EdgeSpec> = Vec::new();
+    let mut telemetry: Option<TelemetrySpec> = None;
+    let mut seen: HashSet<String> = HashSet::new();
+
     for node in doc.nodes() {
-        if node.name().value() != "connect" {
-            continue;
+        match node.name().value() {
+            "coordinator" => {
+                if coordinator.is_some() {
+                    return Err(LoadError::MultipleCoordinators {
+                        src: kdl.to_string(),
+                        span: node.span(),
+                    });
+                }
+                coordinator = Some(parse_coordinator(node, kdl)?);
+            }
+            "artifact" => artifacts.push(parse_artifact(node, kdl)?),
+            "system" => systems.push(parse_system(node, kdl, &mut seen)?),
+            // sequences-slots.md §5: a slot is an instance like a system.
+            "slot" => slots.push(parse_slot(node, kdl, &mut seen)?),
+            "connect" => {
+                let e = parse_edge(node, kdl)?;
+                edges.push(EdgeSpec {
+                    from: e.from,
+                    out: e.out,
+                    to: e.to,
+                    in_: e.in_,
+                    delayed: e.delayed,
+                    kind: e.kind,
+                });
+            }
+            "telemetry" => {
+                let (addr, mode) = parse_telemetry(node, kdl)?;
+                telemetry = Some(TelemetrySpec { addr, mode });
+            }
+            other => {
+                return Err(LoadError::UnknownTopLevelNode {
+                    node: other.to_string(),
+                    src: kdl.to_string(),
+                    span: node.span(),
+                });
+            }
         }
-        let e = parse_edge(node, kdl)?;
-        edges.push(EdgeSpec {
-            from: e.from,
-            out: e.out,
-            to: e.to,
-            in_: e.in_,
-            delayed: e.delayed,
-            kind: e.kind,
-        });
     }
 
-    // --- Telemetry pass (telemetry.md §8) --------------------------------
-    let mut telemetry: Option<TelemetrySpec> = None;
-    for node in doc.nodes() {
-        if node.name().value() != "telemetry" {
-            continue;
-        }
-        let (addr, mode) = parse_telemetry(node, kdl)?;
-        telemetry = Some(TelemetrySpec { addr, mode });
-    }
+    let coordinator = coordinator.ok_or(LoadError::MissingCoordinator)?;
 
     Ok(Wiring {
         coordinator,
@@ -888,36 +791,47 @@ pub fn resolve(wiring: &Wiring, registry: &Registry) -> Result<Coordinator, Load
     builder.build().map_err(wire_at_build)
 }
 
-/// Instantiate a **static** system through the [`Registry`] factory. The factory parses
-/// params via `FromKdlNode`, so we reconstruct a [`KdlNode`] from the spec: a config-less
-/// system synthesizes a minimal node; a params-bearing one re-parses the KDL source text
-/// the parse stage stored in [`SystemSpec::params`].
+/// Instantiate a **static** system through the [`Registry`] factory. The factory
+/// deserializes params off the `system` node, so we reconstruct a [`KdlNode`] from the
+/// spec: a config-less system synthesizes a minimal node; a params-bearing one
+/// re-parses the KDL source text the parse stage stored in [`SystemSpec::params`].
 fn resolve_static(
     spec: &SystemSpec,
     registry: &Registry,
     builder: &mut CoordinatorBuilder,
 ) -> Result<(SystemHandle, SystemDescriptor), LoadError> {
-    let factory = registry.factories.get(spec.ty.as_str()).ok_or_else(|| {
+    // `type=` is required for a static system (only a dl system can derive it from
+    // its artifact) — the KDL front-end enforces this at parse; a builder-origin
+    // spec could omit it.
+    let ty = spec.ty.as_deref().ok_or_else(|| {
         let src = system_src(spec);
-        LoadError::UnknownType {
-            ty: spec.ty.clone(),
+        LoadError::MissingType {
+            name: spec.name.clone(),
             span: (0, src.len()).into(),
             src,
         }
     })?;
-    // Reconstruct the node the `FromKdlNode` factory reads its params off. A config-less
+    let factory = registry.factories.get(ty).ok_or_else(|| {
+        let src = system_src(spec);
+        LoadError::UnknownType {
+            ty: ty.to_string(),
+            span: (0, src.len()).into(),
+            src,
+        }
+    })?;
+    // Reconstruct the node the factory deserializes its params off. A config-less
     // ([`ParamSource::None`]) static system synthesizes a minimal node; a KDL-config
     // static system re-parses its carried node source text. Typed builder params
-    // ([`ParamSource::Postcard`]) are **rejected**: the static path is
-    // `FromKdlNode`-shaped, not postcard, so the bytes have no decode path and would be
-    // silently dropped (the system would run on defaults).
+    // ([`ParamSource::Postcard`]) are **rejected**: the static path deserializes KDL,
+    // not postcard, so the bytes have no decode path and would be silently dropped
+    // (the system would run on defaults).
     let node_src = match &spec.params {
-        ParamSource::None => format!("system \"{}\" type=\"{}\"", spec.name, spec.ty),
+        ParamSource::None => format!("system \"{}\" type=\"{}\"", spec.name, ty),
         ParamSource::Postcard(_) => {
             let src = system_src(spec);
             return Err(LoadError::StaticPostcardParams {
                 system: spec.name.clone(),
-                ty: spec.ty.clone(),
+                ty: ty.to_string(),
                 span: (0, src.len()).into(),
                 src,
             });
@@ -971,6 +885,19 @@ fn resolve_dl(
         src: src.clone(),
         span,
     })?;
+    // `type=` is optional on a dl system (the artifact's `system_type` is
+    // authoritative); when given, it must agree.
+    if let Some(ty) = &spec.ty
+        && ty != &artifact.system_type
+    {
+        return Err(LoadError::TypeMismatchesArtifact {
+            system: spec.name.clone(),
+            ty: ty.clone(),
+            artifact_type: artifact.system_type.clone(),
+            src: src.clone(),
+            span,
+        });
+    }
     let loaded = DlSystem::open(path).map_err(|source| LoadError::DlOpen {
         system: spec.name.clone(),
         artifact: artifact_id.to_string(),
@@ -985,7 +912,7 @@ fn resolve_dl(
         ParamSource::None => Vec::new(),
         ParamSource::Postcard(bytes) => bytes.clone(),
         ParamSource::Kdl(node_text) => {
-            encode_kdl_params(node_text, loaded.params_schema(), &spec.name)?
+            encode_kdl_params(node_text, loaded.params_schema(), &spec.name, SYSTEM_RESERVED, 1)?
         }
     };
     let desc = loaded.descriptor().clone();
@@ -996,7 +923,10 @@ fn resolve_dl(
 /// A best-effort source snippet for a system's resolve-time errors (a [`Wiring`] carries
 /// no original document text).
 fn system_src(spec: &SystemSpec) -> String {
-    format!("system \"{}\" type=\"{}\"", spec.name, spec.ty)
+    match &spec.ty {
+        Some(ty) => format!("system \"{}\" type=\"{}\"", spec.name, ty),
+        None => format!("system \"{}\"", spec.name),
+    }
 }
 
 /// A best-effort source snippet for a slot's resolve-time errors.
@@ -1077,8 +1007,10 @@ fn resolve_slot(
         let params: Vec<u8> = match &occ.params {
             ParamSource::None => Vec::new(),
             ParamSource::Postcard(bytes) => bytes.clone(),
+            // `occupant=` is the allow node's only reserved key (no leading name
+            // arg), so both line-property and child-node params reach the encoder.
             ParamSource::Kdl(node_text) => {
-                encode_kdl_params(node_text, loaded.params_schema(), &slot.name)?
+                encode_kdl_params(node_text, loaded.params_schema(), &slot.name, ALLOW_RESERVED, 0)?
             }
         };
         allowed.push((occ.occupant.clone(), loaded, params));
@@ -1167,26 +1099,30 @@ fn resolve_slot(
     Ok((handle, registered))
 }
 
-/// Encode a dl system's KDL `system`-node config into the canonical postcard `Params`
-/// bytes, **guided by the `.so`'s exported `Params` schema** (the one-postcard-encoding
-/// decision). The host never links the system's `Params` type: it
-/// walks the schema's named fields, pulls the matching KDL property for each, coerces it
-/// to the field's type, builds a dynamic [`serde_json::Value`], and hands it to
-/// [`postcard_dyn::to_stdvec_dyn`] — which produces the **same bytes** the typed Rust
-/// builder's [`WiringBuilder::params`](crate::WiringBuilder) postcard-encodes (the byte
+/// Encode a dl system's KDL node config into the canonical postcard `Params` bytes,
+/// **guided by the `.so`'s exported `Params` schema** (the one-postcard-encoding
+/// decision). The host never links the system's `Params` type: the shared KDL
+/// deserializer ([`de`]) reads the node's params surface into a dynamic
+/// [`serde_json::Value`] (plus a key → span table), the value is conformed to the
+/// schema ([`conform_to_schema`]: unknown/missing/type-mismatched fields become
+/// named, spanned errors; absent `Option` fields become explicit nulls), and
+/// [`postcard_dyn::to_stdvec_dyn`] emits the **same bytes** the typed Rust builder's
+/// [`WiringBuilder::params`](crate::WiringBuilder) postcard-encodes (the byte
 /// equality is the headline equivalence gate, asserted in `tests_abi`).
 ///
-/// `node_text` is the `system` node's source ([`ParamSource::Kdl`]); `schema` is
-/// [`DlSystem::params_schema`]; `system` names the instance for diagnostics. Errors are
-/// span-aware [`LoadError`]s: a property with no schema field
-/// ([`DlUnknownParam`](LoadError::DlUnknownParam)), a non-`Option` schema field with no
-/// property ([`DlMissingParam`](LoadError::DlMissingParam)), a property whose value type
-/// does not match the field ([`DlParamTypeMismatch`](LoadError::DlParamTypeMismatch)), or
-/// an un-encodable schema shape ([`DlParamEncode`](LoadError::DlParamEncode)).
+/// `node_text` is the carried node source ([`ParamSource::Kdl`]); `schema` is
+/// [`DlSystem::params_schema`]; `system` names the instance for diagnostics;
+/// `reserved`/`skip_args` name the node's wiring surface (`type=`/`artifact=` + the
+/// instance name on `system` nodes, `occupant=` on `allow` nodes). Errors are
+/// span-aware [`LoadError`]s: [`UnknownParam`](LoadError::UnknownParam),
+/// [`MissingParam`](LoadError::MissingParam), [`InvalidParam`](LoadError::InvalidParam),
+/// or [`DlParamEncode`](LoadError::DlParamEncode) for an un-encodable schema shape.
 pub fn encode_kdl_params(
     node_text: &str,
     schema: &OwnedNamedType,
     system: &str,
+    reserved: &'static [&'static str],
+    skip_args: usize,
 ) -> Result<Vec<u8>, LoadError> {
     let span: SourceSpan = (0, node_text.len()).into();
     let encode_err = |reason: String| LoadError::DlParamEncode {
@@ -1200,110 +1136,193 @@ pub fn encode_kdl_params(
     let node = doc
         .nodes()
         .first()
-        .ok_or_else(|| encode_err("the carried params text has no `system` node".into()))?;
+        .ok_or_else(|| encode_err("the carried params text has no node".into()))?;
 
-    // Only a top-level struct (the usual `#[derive(Schema)] struct Params`) — or a unit
-    // (`()`/unit struct, no fields) — maps from flat KDL properties.
-    let fields = match &schema.ty {
+    let (value, spans) = de::params_value(node, node_text, system, reserved, skip_args)?;
+    let value = conform_to_schema(&schema.ty, value, &spans, system, node_text, node.span())
+        .map_err(|e| match e {
+            Conform::Load(err) => *err,
+            Conform::Shape(reason) => encode_err(reason),
+        })?;
+
+    postcard_dyn::to_stdvec_dyn(schema, &value)
+        .map_err(|e| encode_err(format!("dynamic postcard encode failed: {e:?}")))
+}
+
+/// A [`conform_to_schema`] failure: a named, spanned params diagnostic, or a schema
+/// shape the walk cannot model (surfaced as [`DlParamEncode`](LoadError::DlParamEncode)).
+enum Conform {
+    Load(Box<LoadError>),
+    Shape(String),
+}
+
+impl From<LoadError> for Conform {
+    fn from(e: LoadError) -> Self {
+        Conform::Load(Box::new(e))
+    }
+}
+
+/// Conform a deserialized params [`Value`] to a `Params` schema **struct** (or unit):
+/// every JSON key must be a schema field ([`UnknownParam`](LoadError::UnknownParam)),
+/// every non-`Option` schema field must be present ([`MissingParam`](LoadError::MissingParam),
+/// absent `Option`s get an explicit `Null` — postcard-dyn requires it), and each field
+/// value is checked/recursed by [`conform_value`]. The output object holds schema
+/// field order (order is irrelevant to postcard-dyn, which iterates the schema).
+fn conform_to_schema(
+    ty: &OwnedDataModelType,
+    value: Value,
+    spans: &HashMap<String, SourceSpan>,
+    system: &str,
+    src: &str,
+    node_span: SourceSpan,
+) -> Result<Value, Conform> {
+    let fields = match ty {
         OwnedDataModelType::Struct(fields) => fields.as_slice(),
         OwnedDataModelType::Unit | OwnedDataModelType::UnitStruct => &[],
         other => {
-            return Err(encode_err(format!(
-                "the `Params` schema is `{other:?}`, which KDL properties cannot express \
-                 (only a struct of scalar fields, or a unit)"
+            return Err(Conform::Shape(format!(
+                "the `Params` schema is `{other:?}`, which a KDL params surface cannot \
+                 express (only a struct, or a unit)"
+            )));
+        }
+    };
+    let mut obj = match value {
+        Value::Object(map) => map,
+        other => {
+            return Err(Conform::Shape(format!(
+                "expected a params object for a struct schema, got `{other}`"
             )));
         }
     };
 
-    // Each KDL property (everything but the reserved `type=`/`lib=`) must be a schema field.
-    for entry in node.entries() {
-        if let Some(key) = entry.name().map(|n| n.value())
-            && key != "type"
-            && key != "lib"
-            && !fields.iter().any(|f| f.name == key)
-        {
-            return Err(LoadError::DlUnknownParam {
+    // Every key must name a schema field (the typo guard, with the entry's span).
+    for key in obj.keys() {
+        if !fields.iter().any(|f| f.name == *key) {
+            return Err(LoadError::UnknownParam {
+                property: key.clone(),
                 system: system.to_string(),
-                property: key.to_string(),
-                src: node_text.to_string(),
-                span,
-            });
+                src: src.to_string(),
+                span: spans.get(key).copied().unwrap_or(node_span),
+            }
+            .into());
         }
     }
 
-    // Walk the schema fields (so JSON object order is canonical, matching the typed
-    // builder's struct-field order — the basis of the byte equality).
-    let mut obj = Map::new();
+    let mut out = Map::new();
     for field in fields {
-        match node.get(field.name.as_str()) {
-            Some(value) => {
-                let json = kdl_value_to_json(&field.ty.ty, value).ok_or_else(|| {
-                    LoadError::DlParamTypeMismatch {
-                        system: system.to_string(),
-                        property: field.name.clone(),
-                        expected: leaf_expected(&field.ty.ty),
-                        src: node_text.to_string(),
-                        span,
-                    }
-                })?;
-                obj.insert(field.name.clone(), json);
+        let span = spans.get(&field.name).copied().unwrap_or(node_span);
+        match obj.remove(&field.name) {
+            Some(v) => {
+                let v = conform_value(&field.ty.ty, v, &field.name, span, system, src)?;
+                out.insert(field.name.clone(), v);
             }
-            // An `Option` field with no property is `None` (encoded as the null byte); any
-            // other absent field is a hard miss (the schema has no defaults).
+            // An `Option` field with no property is `None` (postcard-dyn needs the
+            // explicit null); any other absent field is a hard miss (no defaults).
             None if matches!(field.ty.ty, OwnedDataModelType::Option(_)) => {
-                obj.insert(field.name.clone(), Value::Null);
+                out.insert(field.name.clone(), Value::Null);
             }
             None => {
-                return Err(LoadError::DlMissingParam {
-                    system: system.to_string(),
+                return Err(LoadError::MissingParam {
                     property: field.name.clone(),
-                    src: node_text.to_string(),
-                    span,
-                });
+                    system: system.to_string(),
+                    src: src.to_string(),
+                    span: node_span,
+                }
+                .into());
             }
         }
     }
-
-    postcard_dyn::to_stdvec_dyn(schema, &Value::Object(obj))
-        .map_err(|e| encode_err(format!("dynamic postcard encode failed: {e:?}")))
+    Ok(Value::Object(out))
 }
 
-/// Coerce one KDL property value to the [`serde_json::Value`] shape
-/// [`postcard_dyn::to_stdvec_dyn`] expects for a schema leaf `ty`, reusing the
-/// [`FromKdlScalar`] coercion rules (integers, floats accepting int literals, bools,
-/// strings). Returns `None` on a type mismatch (→ [`DlParamTypeMismatch`](LoadError::DlParamTypeMismatch)).
-///
-/// Only scalar leaves are expressible as flat KDL properties; a non-scalar schema field
-/// (a nested struct, seq, map, enum, …) yields `None` here and is surfaced as a mismatch.
-fn kdl_value_to_json(ty: &OwnedDataModelType, value: &KdlValue) -> Option<Value> {
+/// Check/recurse one field value against its schema type. Leaves are type- and
+/// range-checked with [`leaf_expected`] wording; nested structs/sequences/options
+/// recurse (nested errors carry the **top-level** property's span — the side table
+/// is top-level only, v1). Any schema shape the walk does not model passes through
+/// to postcard-dyn, whose failure surfaces as
+/// [`DlParamEncode`](LoadError::DlParamEncode) — never silently wrong bytes.
+fn conform_value(
+    ty: &OwnedDataModelType,
+    value: Value,
+    property: &str,
+    span: SourceSpan,
+    system: &str,
+    src: &str,
+) -> Result<Value, Conform> {
     use OwnedDataModelType as T;
+    let mismatch = || -> Conform {
+        LoadError::InvalidParam {
+            property: property.to_string(),
+            system: system.to_string(),
+            expected: leaf_expected(ty),
+            src: src.to_string(),
+            span,
+        }
+        .into()
+    };
+    // The signed/unsigned width an integer leaf must fit.
+    let int_ok = |min: i128, max: i128| -> bool {
+        match &value {
+            Value::Number(n) => n
+                .as_i64()
+                .map(|i| (i as i128) >= min && (i as i128) <= max)
+                .or_else(|| n.as_u64().map(|u| (u as i128) <= max))
+                .unwrap_or(false),
+            _ => false,
+        }
+    };
     match ty {
-        T::Bool => value.as_bool().map(Value::Bool),
-        // Signed integers (incl. the `as_i64`-encoded i128 of postcard-dyn).
-        T::I8 | T::I16 | T::I32 | T::I64 | T::Isize | T::I128 => value
-            .as_integer()
-            .and_then(|i| i64::try_from(i).ok())
-            .map(|i| Value::Number(Number::from(i))),
-        // Unsigned integers (incl. the `as_u64`-encoded u128 of postcard-dyn).
-        T::U8 | T::U16 | T::U32 | T::U64 | T::Usize | T::U128 => value
-            .as_integer()
-            .and_then(|i| u64::try_from(i).ok())
-            .map(|u| Value::Number(Number::from(u))),
-        // Floats accept an int literal (`rate=200` ⇒ 200.0), matching `FromKdlScalar`.
-        T::F32 | T::F64 => value
-            .as_float()
-            .or_else(|| value.as_integer().map(|i| i as f64))
-            .and_then(Number::from_f64)
-            .map(Value::Number),
-        T::String | T::Char => value.as_string().map(|s| Value::String(s.to_string())),
-        // A present `Option<T>` property is the `Some(T)` inner value (a `None` is the
-        // *absent* property, handled by the caller).
-        T::Option(inner) => kdl_value_to_json(&inner.ty, value),
-        _ => None,
+        T::Bool => value.is_boolean().then_some(value).ok_or_else(mismatch),
+        T::I8 => int_ok(i8::MIN as i128, i8::MAX as i128).then_some(value).ok_or_else(mismatch),
+        T::I16 => int_ok(i16::MIN as i128, i16::MAX as i128).then_some(value).ok_or_else(mismatch),
+        T::I32 => int_ok(i32::MIN as i128, i32::MAX as i128).then_some(value).ok_or_else(mismatch),
+        // postcard-dyn reads i64/isize/i128 via `as_i64` — i64 range on the wire.
+        T::I64 | T::Isize | T::I128 => {
+            int_ok(i64::MIN as i128, i64::MAX as i128).then_some(value).ok_or_else(mismatch)
+        }
+        T::U8 => int_ok(0, u8::MAX as i128).then_some(value).ok_or_else(mismatch),
+        T::U16 => int_ok(0, u16::MAX as i128).then_some(value).ok_or_else(mismatch),
+        T::U32 => int_ok(0, u32::MAX as i128).then_some(value).ok_or_else(mismatch),
+        // postcard-dyn reads u64/usize/u128 via `as_u64` — u64 range on the wire.
+        T::U64 | T::Usize | T::U128 => {
+            int_ok(0, u64::MAX as i128).then_some(value).ok_or_else(mismatch)
+        }
+        // postcard-dyn's `as_f64` accepts integer literals (`rate=200` ⇒ 200.0).
+        T::F32 | T::F64 => value.is_number().then_some(value).ok_or_else(mismatch),
+        T::String => value.is_string().then_some(value).ok_or_else(mismatch),
+        T::Char => match &value {
+            Value::String(s) if s.chars().count() == 1 => Ok(value),
+            _ => Err(mismatch()),
+        },
+        // A present `Option<T>` is the `Some(T)` inner value; `#null` is `None`.
+        T::Option(inner) => match value {
+            Value::Null => Ok(Value::Null),
+            v => conform_value(&inner.ty, v, property, span, system, src),
+        },
+        // Nested structs recurse with the same rules; the top-level property's span
+        // is the fallback for everything inside.
+        T::Struct(_) | T::Unit | T::UnitStruct => {
+            conform_to_schema(ty, value, &HashMap::new(), system, src, span)
+        }
+        T::Seq(inner) => match value {
+            Value::Array(items) => {
+                let items = items
+                    .into_iter()
+                    .map(|v| conform_value(&inner.ty, v, property, span, system, src))
+                    .collect::<Result<Vec<_>, _>>()?;
+                Ok(Value::Array(items))
+            }
+            _ => Err(mismatch()),
+        },
+        T::NewtypeStruct(inner) => conform_value(&inner.ty, value, property, span, system, src),
+        // Tuples/maps/enums/etc.: pass through — postcard-dyn models them, and its
+        // failure surfaces as `DlParamEncode` (never silently wrong bytes).
+        _ => Ok(value),
     }
 }
 
-/// A human name of a schema leaf type, for [`DlParamTypeMismatch`](LoadError::DlParamTypeMismatch).
+/// A human name of a schema leaf type, for [`InvalidParam`](LoadError::InvalidParam)
+/// on the dl (schema-guided) path.
 fn leaf_expected(ty: &OwnedDataModelType) -> String {
     use OwnedDataModelType as T;
     match ty {
@@ -1313,7 +1332,9 @@ fn leaf_expected(ty: &OwnedDataModelType) -> String {
         T::F32 | T::F64 => "a number".into(),
         T::String | T::Char => "a string".into(),
         T::Option(inner) => format!("{} (or omit the property)", leaf_expected(&inner.ty)),
-        other => format!("an unsupported scalar type ({other:?})"),
+        T::Seq(inner) => format!("a sequence of {}", leaf_expected(&inner.ty)),
+        T::Struct(_) => "a nested node of params".into(),
+        other => format!("an unsupported type ({other:?})"),
     }
 }
 
@@ -1397,9 +1418,11 @@ fn parse_artifact(node: &KdlNode, src: &str) -> Result<Artifact, LoadError> {
     })
 }
 
-/// Parse one `system` node into a [`SystemSpec`]. A `lib=` ⇒ a dl system referencing
-/// that [`Artifact`]; otherwise a static system. See [`parse`] for the static-params /
-/// dl-params-deferred handling.
+/// Parse one `system` node into a [`SystemSpec`]. An `artifact=` ⇒ a dl system
+/// referencing that [`Artifact`] (its `type=` is then optional — the artifact's
+/// `system_type` is authoritative, and a given `type=` is validated at resolve);
+/// otherwise a static system, whose `type=` is required. See [`parse`] for the
+/// static-params / dl-params-deferred handling.
 fn parse_system(
     node: &KdlNode,
     src: &str,
@@ -1409,11 +1432,26 @@ fn parse_system(
         src: src.to_string(),
         span: node.span(),
     })?;
-    let ty = prop_string(node, "type").ok_or_else(|| LoadError::MissingType {
-        name: name.to_string(),
-        src: src.to_string(),
-        span: node.span(),
-    })?;
+    // The pre-rename `lib=` spelling gets a guidance error pointing at the entry.
+    if let Some(entry) = node
+        .entries()
+        .iter()
+        .find(|e| e.name().map(|n| n.value()) == Some("lib"))
+    {
+        return Err(LoadError::SystemLibRenamed {
+            src: src.to_string(),
+            span: entry.span(),
+        });
+    }
+    let artifact = prop_string(node, "artifact").map(str::to_string);
+    let ty = prop_string(node, "type").map(str::to_string);
+    if ty.is_none() && artifact.is_none() {
+        return Err(LoadError::MissingType {
+            name: name.to_string(),
+            src: src.to_string(),
+            span: node.span(),
+        });
+    }
     if !seen.insert(name.to_string()) {
         return Err(LoadError::DuplicateInstance {
             name: name.to_string(),
@@ -1421,14 +1459,16 @@ fn parse_system(
             span: node.span(),
         });
     }
-    let artifact = prop_string(node, "lib").map(str::to_string);
-    // Any property other than the reserved `type=`/`lib=` is a config (params) property.
-    let has_config = node.entries().iter().any(|e| {
-        matches!(e.name().map(|n| n.value()), Some(k) if k != "type" && k != "lib")
-    });
+    // Any property other than the reserved `type=`/`artifact=`, or any child node,
+    // is params config.
+    let has_config = node
+        .entries()
+        .iter()
+        .any(|e| matches!(e.name().map(|n| n.value()), Some(k) if !SYSTEM_RESERVED.contains(&k)))
+        || node.children().is_some_and(|c| !c.nodes().is_empty());
     // Both static and dl systems carry the node's source text when configured; the
-    // decoder is chosen at `resolve` by `artifact` (static ⇒ `FromKdlNode`, dl ⇒
-    // schema-guided postcard encode).
+    // decoder is chosen at `resolve` by `artifact` (static ⇒ the typed serde
+    // deserialize, dl ⇒ schema-guided postcard encode).
     let params = if has_config {
         ParamSource::Kdl(node.to_string())
     } else {
@@ -1436,7 +1476,7 @@ fn parse_system(
     };
     Ok(SystemSpec {
         name: name.to_string(),
-        ty: ty.to_string(),
+        ty,
         artifact,
         params,
     })
@@ -1448,10 +1488,11 @@ fn parse_system(
 /// colliding with a system is a [`DuplicateInstance`](LoadError::DuplicateInstance).
 ///
 /// Children: `input frame="…"`/`output frame="…"` declare the user-port contract;
-/// `allow occupant="…" { <optional params> }` is one allowed occupant (its params are
-/// carried as [`ParamSource::Kdl`] when the node has child params, else
-/// [`ParamSource::None`] — mirroring [`parse_system`]); `initial occupant="…" state="…"`
-/// is the startup occupant.
+/// `allow occupant="…" …` is one allowed occupant — everything on it other than the
+/// reserved `occupant=` is its default params, as line properties
+/// (`allow occupant="x" gain=0.8`) and/or children (`allow occupant="x" { gain 0.8 }`),
+/// carried as [`ParamSource::Kdl`] (else [`ParamSource::None`] — mirroring
+/// [`parse_system`]); `initial occupant="…" state="…"` is the startup occupant.
 fn parse_slot(
     node: &KdlNode,
     src: &str,
@@ -1481,7 +1522,7 @@ fn parse_slot(
                     let frame = prop_string(child, "frame").ok_or_else(|| {
                         LoadError::MissingParam {
                             property: "frame".to_string(),
-                            system: "slot",
+                            system: "slot".to_string(),
                             src: src.to_string(),
                             span: child.span(),
                         }
@@ -1492,7 +1533,7 @@ fn parse_slot(
                     let frame = prop_string(child, "frame").ok_or_else(|| {
                         LoadError::MissingParam {
                             property: "frame".to_string(),
-                            system: "slot",
+                            system: "slot".to_string(),
                             src: src.to_string(),
                             span: child.span(),
                         }
@@ -1503,15 +1544,18 @@ fn parse_slot(
                     let occupant = prop_string(child, "occupant").ok_or_else(|| {
                         LoadError::MissingParam {
                             property: "occupant".to_string(),
-                            system: "slot",
+                            system: "slot".to_string(),
                             src: src.to_string(),
                             span: child.span(),
                         }
                     })?;
-                    // A params child block ⇒ carry the `allow` node's source text for the
-                    // resolve-time schema-guided encoder (mirrors `parse_system`'s `Kdl`
-                    // decision); no children ⇒ paramless.
-                    let params = if child.children().is_some_and(|c| !c.nodes().is_empty()) {
+                    // Any non-reserved line property OR any child ⇒ params: carry the
+                    // `allow` node's source text for the resolve-time schema-guided
+                    // encoder (mirrors `parse_system`'s `Kdl` decision); else paramless.
+                    let has_config = child.entries().iter().any(|e| {
+                        matches!(e.name().map(|n| n.value()), Some(k) if !ALLOW_RESERVED.contains(&k))
+                    }) || child.children().is_some_and(|c| !c.nodes().is_empty());
+                    let params = if has_config {
                         ParamSource::Kdl(child.to_string())
                     } else {
                         ParamSource::None
@@ -1525,7 +1569,7 @@ fn parse_slot(
                     let occupant = prop_string(child, "occupant").ok_or_else(|| {
                         LoadError::MissingParam {
                             property: "occupant".to_string(),
-                            system: "slot",
+                            system: "slot".to_string(),
                             src: src.to_string(),
                             span: child.span(),
                         }
@@ -1587,14 +1631,14 @@ fn parse_telemetry(
 ) -> Result<(std::net::SocketAddr, TelemetryModeSpec), LoadError> {
     let invalid = |property: &str, expected: &str| LoadError::InvalidParam {
         property: property.to_string(),
-        system: "telemetry",
+        system: "telemetry".to_string(),
         expected: expected.to_string(),
         src: src.to_string(),
         span: node.span(),
     };
     let missing = |property: &str| LoadError::MissingParam {
         property: property.to_string(),
-        system: "telemetry",
+        system: "telemetry".to_string(),
         src: src.to_string(),
         span: node.span(),
     };
@@ -1643,33 +1687,26 @@ fn parse_telemetry(
     Ok((addr, mode))
 }
 
-/// Read the single `coordinator` node into a [`CoordinatorSpec`] (wiring.md §1.1).
+/// Read one `coordinator` node into a [`CoordinatorSpec`] (wiring.md §1.1).
 /// `sim_dt` (seconds) present ⇒ a free-running [`Simulated`](ClockSpec::Simulated)
-/// clock; absent ⇒ [`Wall`](ClockSpec::Wall).
-fn parse_coordinator(doc: &KdlDocument, src: &str) -> Result<CoordinatorSpec, LoadError> {
-    let mut found: Option<&KdlNode> = None;
-    for node in doc.nodes() {
-        if node.name().value() != "coordinator" {
-            continue;
-        }
-        if found.is_some() {
-            return Err(LoadError::MultipleCoordinators {
-                src: src.to_string(),
-                span: node.span(),
-            });
-        }
-        found = Some(node);
+/// clock; absent ⇒ [`Wall`](ClockSpec::Wall). Deserialized through the shared KDL
+/// params deserializer, so an unknown/misspelled coordinator property is a spanned
+/// [`UnknownParam`](LoadError::UnknownParam) and a bad value is entry-precise.
+fn parse_coordinator(node: &KdlNode, src: &str) -> Result<CoordinatorSpec, LoadError> {
+    #[derive(serde::Deserialize)]
+    struct CoordinatorProps {
+        cycle_rate: f64,
+        default_depth: Option<usize>,
+        sim_dt: Option<f64>,
     }
-    let node = found.ok_or(LoadError::MissingCoordinator)?;
-    let cycle_rate = kdl_required::<f64>(node, "cycle_rate", "coordinator", src)?;
-    let default_depth = kdl_optional::<usize>(node, "default_depth", "coordinator", src)?;
-    let clock = match kdl_optional::<f64>(node, "sim_dt", "coordinator", src)? {
+    let props: CoordinatorProps = de::from_kdl_node(node, src, "coordinator", &[], 0)?;
+    let clock = match props.sim_dt {
         Some(dt_secs) => ClockSpec::Simulated { dt_secs },
         None => ClockSpec::Wall,
     };
     Ok(CoordinatorSpec {
-        cycle_rate,
-        default_depth,
+        cycle_rate: props.cycle_rate,
+        default_depth: props.default_depth,
         clock,
     })
 }

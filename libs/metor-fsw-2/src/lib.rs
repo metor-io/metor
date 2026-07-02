@@ -29,7 +29,7 @@ mod writer;
 // feature, not KDL.
 pub mod sequence;
 
-// The KDL wiring front-end (registry, FromKdlNode derive, `load()`).
+// The KDL wiring front-end (registry, the KDL params deserializer, `load()`).
 #[cfg(feature = "kdl")]
 pub mod wiring;
 
@@ -106,7 +106,7 @@ pub use sequence::{
     Wait, aborted, progress, wait, with_clock,
 };
 
-// Re-exports the `#[derive(Frame)]` / `#[derive(FromKdlNode)]` generated code names
+// Re-exports the `#[derive(Frame)]` generated code names
 // (`::metor_fsw_2::metor_proto::…`, `::metor_fsw_2::path::…`, `::metor_fsw_2::kdl::…`)
 // so a crate depending only on metor-fsw-2 can use those derives without a direct
 // `metor-fsw` / `metor-proto` / `kdl` dependency.

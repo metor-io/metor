@@ -42,13 +42,14 @@ artifact "ctrl"  crate="adcs-ctrl"  lib="adcs_ctrl"  type="Ctrl"
 artifact "commissioning" crate="adcs-commissioning" lib="adcs_commissioning" type="commissioning"
 artifact "safe_mode"     crate="adcs-safe-mode"     lib="adcs_safe_mode"     type="safe_mode"
 
-// System instances. `lib=` references the artifact id; the remaining properties are the
-// system's params, schema-encoded at resolve against the `.so`'s exported `Params` schema.
-// `disarmed=#true` brings every reaction wheel up offline (the cube-sat `--disarmed`
-// parity): the plant applies no control torque until the wheels are armed.
-system "plant" type="Plant" lib="plant" init_angle=0.5 init_rate=0.15 meas_sigma=0.002 seed=42 disarmed=#false
-system "nav"   type="Nav"   lib="nav"   meas_sigma=0.02
-system "ctrl"  type="Ctrl"  lib="ctrl"  q_weight=5.0 r_weight=8.0
+// System instances. `artifact=` references the artifact id; the remaining properties are
+// the system's params, schema-encoded at resolve against the `.so`'s exported `Params`
+// schema. `type=` is optional here (the artifact's type is authoritative) but kept as
+// documentation. `disarmed=#true` brings every reaction wheel up offline (the cube-sat
+// `--disarmed` parity): the plant applies no control torque until the wheels are armed.
+system "plant" type="Plant" artifact="plant" init_angle=0.5 init_rate=0.15 meas_sigma=0.002 seed=42 disarmed=#false
+system "nav"   type="Nav"   artifact="nav"   meas_sigma=0.02
+system "ctrl"  type="Ctrl"  artifact="ctrl"  q_weight=5.0 r_weight=8.0
 
 // The runtime sequence slot. Its `input`/`output` lines declare the port contract every
 // allowed occupant is validated against; `initial ... state="running"` auto-loads + starts

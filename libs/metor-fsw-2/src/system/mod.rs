@@ -143,16 +143,16 @@ where
 /// This trait carries *no* KDL coupling: a `cdylib` exported via
 /// [`export_system!`](crate::export_system) only needs `BuildSystem` (its `fsw_create`
 /// postcard-decodes `Params` and calls `new`), so the dlopen ABI does not ride the
-/// `kdl` feature. The KDL static-registry path layers `RegisteredSystem`
-/// (`wiring::RegisteredSystem`) on top, adding the `Params: FromKdlNode` bound — every
-/// `BuildSystem` whose `Params` is `FromKdlNode` is automatically a `RegisteredSystem`
-/// (a blanket impl), so a statically-linked system is registered exactly as before.
+/// `kdl` feature. The KDL static-registry path (`wiring::Registry::register`) adds
+/// only a `Params: serde::de::DeserializeOwned` bound — the same derive the postcard
+/// contract already needs — so a statically-linked system registers by impl'ing
+/// `BuildSystem` alone.
 ///
 /// `Params` is the value `fsw_create`/the registry factory decodes and hands to
 /// [`new`](BuildSystem::new); a paramless system uses `type Params = ()`.
 pub trait BuildSystem: Sized {
     /// The params value the system is constructed from (postcard bytes on the dl wire;
-    /// a `FromKdlNode`-parsed struct on the static-registry path).
+    /// serde-deserialized off the KDL node on the static-registry path).
     type Params;
     /// Construct the (pre-init) system from its decoded params.
     fn new(params: Self::Params) -> Self;

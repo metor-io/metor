@@ -118,7 +118,7 @@ impl WiringBuilder {
         SystemSpecBuilder {
             parent: self,
             name: name.into(),
-            ty: String::new(),
+            ty: None,
             artifact: None,
             params: ParamSource::None,
         }
@@ -309,15 +309,18 @@ impl SlotSpecBuilder {
 pub struct SystemSpecBuilder {
     parent: WiringBuilder,
     name: String,
-    ty: String,
+    ty: Option<String>,
     artifact: Option<String>,
     params: ParamSource,
 }
 
 impl SystemSpecBuilder {
-    /// Set the system `type=` key.
+    /// Set the system `type=` key. Required for a [`from_static`](Self::from_static)
+    /// system (the registry key); optional for a [`from_artifact`](Self::from_artifact)
+    /// one, whose artifact's `system_type` is authoritative (a given `ty` is validated
+    /// against it at resolve).
     pub fn ty(mut self, ty: impl Into<String>) -> Self {
-        self.ty = ty.into();
+        self.ty = Some(ty.into());
         self
     }
 
@@ -341,8 +344,8 @@ impl SystemSpecBuilder {
     /// system can omit this ([`ParamSource::None`]).
     ///
     /// **[`from_artifact`](Self::from_artifact) systems only.** A static system takes
-    /// its params through its registered `FromKdlNode` factory — there is no postcard
-    /// decode path, so `resolve` rejects the combination with
+    /// its params through its registered KDL-deserializing factory — there is no
+    /// postcard decode path, so `resolve` rejects the combination with
     /// [`LoadError::StaticPostcardParams`](super::LoadError::StaticPostcardParams)
     /// rather than silently running the system on defaults.
     pub fn params<P: Serialize>(mut self, params: P) -> Self {
