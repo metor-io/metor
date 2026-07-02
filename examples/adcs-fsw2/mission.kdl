@@ -68,5 +68,8 @@ connect "plant" -> "nav"  frame="gps"
 connect "plant" -> "ctrl" frame="gps"
 connect "nav"   -> "ctrl" frame="attitude_estimate"
 connect "nav"   -> "mode" frame="attitude_estimate"
-connect "mode"  -> "ctrl" frame="mode_cmd"
+// Slots register after every system, so `mode` steps after `ctrl` and ctrl reads the
+// previous cycle's mode_cmd — declared explicitly (a plain backward edge is a
+// build-time StaleFrameEdge error). A one-cycle-late mode command is fine.
+connect "mode"  -> "ctrl" frame="mode_cmd" delayed=#true
 connect "ctrl"  -> "plant" frame="torque_cmd" delayed=#true

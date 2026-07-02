@@ -328,6 +328,9 @@ impl SlotRunner {
 
     /// `Load`: select an allowed occupant by name and build it. Allowed only from Empty
     /// or a terminal phase (Done/Stopped); from a live/post-Stop Loaded it is ignored.
+    /// A name outside the allowed set is **rejected loudly** — a `Failed` event naming
+    /// it (and the allowed set) on the slot's events channel — never silently swallowed:
+    /// the phase is untouched, so the operator sees the rejection, not a stuck `Empty`.
     fn do_load(&mut self, occupant: &str) {
         if !matches!(
             self.phase,
@@ -336,7 +339,18 @@ impl SlotRunner {
             return; // ignore: a live or post-Stop Loaded slot is not re-Loadable
         }
         let Some(idx) = self.allowed.iter().position(|a| a.name == occupant) else {
-            return; // unknown occupant name: ignore
+            // Unknown occupant name (a typo'd panel/uplink Load, or a bad builder-path
+            // `InitialOccupant` at init): diagnosable, not dropped.
+            let reason = format!(
+                "unknown occupant `{occupant}` (allowed: {})",
+                self.allowed
+                    .iter()
+                    .map(|a| a.name.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            );
+            self.emit_event(SequenceEventKind::Failed { reason });
+            return;
         };
         // Drop any terminal occupant's state before reusing the rings.
         self.slot = None;

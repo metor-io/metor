@@ -315,6 +315,27 @@ pub enum LoadError {
         span: SourceSpan,
     },
 
+    /// A **static** (`from_static`) system carries typed builder params
+    /// ([`ParamSource::Postcard`]). The static path has no postcard decoder: the
+    /// [`Registry`] factory constructs the system by parsing its params off the KDL
+    /// `system` node via [`FromKdlNode`] ([`Registry::register`]), so the postcard
+    /// bytes would be silently dropped and the system would run on defaults.
+    #[error(
+        "static system `{system}` (type `{ty}`) has typed builder params, but a static \
+         system takes params through its registered `FromKdlNode` factory — express them \
+         as KDL config properties (`system \"{system}\" type=\"{ty}\" key=value`), or \
+         resolve the system `from_artifact` (only the dl path decodes postcard params)"
+    )]
+    #[diagnostic(code(fsw_wiring::static_postcard_params))]
+    StaticPostcardParams {
+        system: String,
+        ty: String,
+        #[source_code]
+        src: String,
+        #[label("typed `params(...)` cannot reach a static system")]
+        span: SourceSpan,
+    },
+
     #[error("`artifact` node is missing required property `{property}`")]
     #[diagnostic(code(fsw_wiring::missing_artifact_field))]
     MissingArtifactField {
@@ -369,6 +390,25 @@ pub enum LoadError {
         #[source_code]
         src: String,
         #[label("no occupant {dir} port is named this")]
+        span: SourceSpan,
+    },
+
+    /// A `slot`'s `initial occupant="…"` names an occupant that is not in the slot's
+    /// `allow` set — a typo the slot would otherwise boot `Empty` on with no diagnostic
+    /// (the runtime `Load` path validates the same set).
+    #[error(
+        "`slot \"{slot}\"` initial occupant `{occupant}` is not in the allowed set \
+         (allowed: {allowed})"
+    )]
+    #[diagnostic(code(fsw_wiring::unknown_initial_occupant))]
+    UnknownInitialOccupant {
+        slot: String,
+        occupant: String,
+        /// The comma-joined allowed occupant names, for the message/label.
+        allowed: String,
+        #[source_code]
+        src: String,
+        #[label("no `allow occupant=` names this (allowed: {allowed})")]
         span: SourceSpan,
     },
 
@@ -866,12 +906,22 @@ fn resolve_static(
         }
     })?;
     // Reconstruct the node the `FromKdlNode` factory reads its params off. A config-less
-    // ([`ParamSource::None`]) or builder-origin ([`ParamSource::Postcard`]) static system
-    // synthesizes a minimal node (the static path is `FromKdlNode`-shaped, not postcard);
-    // a KDL-config static system re-parses its carried node source text.
-    let minimal = || format!("system \"{}\" type=\"{}\"", spec.name, spec.ty);
+    // ([`ParamSource::None`]) static system synthesizes a minimal node; a KDL-config
+    // static system re-parses its carried node source text. Typed builder params
+    // ([`ParamSource::Postcard`]) are **rejected**: the static path is
+    // `FromKdlNode`-shaped, not postcard, so the bytes have no decode path and would be
+    // silently dropped (the system would run on defaults).
     let node_src = match &spec.params {
-        ParamSource::None | ParamSource::Postcard(_) => minimal(),
+        ParamSource::None => format!("system \"{}\" type=\"{}\"", spec.name, spec.ty),
+        ParamSource::Postcard(_) => {
+            let src = system_src(spec);
+            return Err(LoadError::StaticPostcardParams {
+                system: spec.name.clone(),
+                ty: spec.ty.clone(),
+                span: (0, src.len()).into(),
+                src,
+            });
+        }
         ParamSource::Kdl(text) => text.clone(),
     };
     let doc = node_src.parse::<KdlDocument>().map_err(|source| LoadError::Parse {
@@ -972,6 +1022,28 @@ fn resolve_slot(
     if slot.allow.is_empty() {
         return Err(LoadError::EmptySlot {
             slot: slot.name.clone(),
+            src,
+            span,
+        });
+    }
+
+    // A named `initial` occupant must be in the allowed set — a typo would otherwise
+    // boot the slot `Empty` with no diagnostic. Pure spec validation, so it runs before
+    // any artifact is opened (and regardless of `state=`: even an `empty` initial names
+    // an occupant, and a name that matches nothing is always a mistake).
+    if let Some(init) = &slot.initial
+        && !slot.allow.iter().any(|a| a.occupant == init.occupant)
+    {
+        let allowed = slot
+            .allow
+            .iter()
+            .map(|a| a.occupant.as_str())
+            .collect::<Vec<_>>()
+            .join(", ");
+        return Err(LoadError::UnknownInitialOccupant {
+            slot: slot.name.clone(),
+            occupant: init.occupant.clone(),
+            allowed,
             src,
             span,
         });

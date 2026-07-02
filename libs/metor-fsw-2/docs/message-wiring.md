@@ -142,7 +142,6 @@ pub struct PortDesc {
     pub id: PortId,           // the edge key
     pub name: &'static str,   // F::NAME / M::SCHEMA.name / "" for ReceiveAll
     pub max_size: usize,      // F::MAX_SIZE / MAX_MSG_BYTES / 0
-    pub rate_hint: Option<Hz>,
     pub kind: PortKind,
 }
 
@@ -150,7 +149,7 @@ impl PortDesc {
     pub fn of<F: Frame>() -> Self { /* Frame{vtable,announce}, id=Frame(F::FRAME_ID) … */ }
     pub fn msg<M: Msg>() -> Self {
         PortDesc { id: PortId::Msg(M::ID), name: msg_name::<M>(),
-                   max_size: MAX_MSG_BYTES, rate_hint: None, kind: PortKind::Message }
+                   max_size: MAX_MSG_BYTES, kind: PortKind::Message }
     }
     pub fn receive_all() -> Self { /* id irrelevant, kind = ReceiveAll */ }
 }
@@ -162,7 +161,7 @@ This is what makes KDL name-addressing work (§3.4) with no side table.
 
 **Blast radius (honest accounting).** Making `PortDesc` kind-tagged touches every current
 reader of `port.frame_id` / `port.vtable` / `port.announce`. Verified sites:
-`compatible` (`src/descriptor.rs:149`), `PortDesc::of`/`of_at` (`:90,104`),
+`compatible` (`src/descriptor.rs:149`), `PortDesc::of` (`:90`),
 `Input/Output::descriptor` (`src/port.rs:74,169`), `Out::descriptors` push
 (`src/system/mod.rs:111-112`), the `build()` port lookups and ring loop
 (`src/coordinator/mod.rs:801-816,882-904`, `registry_entry` `:1415`), the slot-aux frame-id

@@ -392,6 +392,24 @@ fn abi_panic_is_contained() {
     drop((in_ring, out_ring, health_ring, log_ring));
 }
 
+/// `FswStatus::from_raw` is the dlopen consuming side's trust-boundary conversion
+/// (review R2): the four declared discriminants round-trip, and anything outside
+/// `0..=3` — the range a well-behaved `.so`'s `fsw_execute` sends — folds to
+/// `Panicked` rather than being trusted as a valid `repr(u32)` value.
+#[test]
+fn from_raw_folds_out_of_range_to_panicked() {
+    assert_eq!(FswStatus::from_raw(0), FswStatus::Running);
+    assert_eq!(FswStatus::from_raw(1), FswStatus::StoppedLapped);
+    assert_eq!(FswStatus::from_raw(2), FswStatus::Panicked);
+    assert_eq!(FswStatus::from_raw(3), FswStatus::Done);
+    // Never sent by the host's own `run_execute`/`run_seq_execute` exports, but a
+    // stale/mismatched build, a hand-rolled non-Rust exporter, or memory corruption
+    // could hand back any word — none of these must be trusted verbatim.
+    assert_eq!(FswStatus::from_raw(4), FswStatus::Panicked);
+    assert_eq!(FswStatus::from_raw(255), FswStatus::Panicked);
+    assert_eq!(FswStatus::from_raw(u32::MAX), FswStatus::Panicked);
+}
+
 // ---------------------------------------------------------------------------
 // The schema-guided KDL → postcard params path.
 // These prove the **core byte-equality invariant** (the dynamic encoder produces

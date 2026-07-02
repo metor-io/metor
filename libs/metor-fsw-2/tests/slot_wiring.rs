@@ -11,9 +11,12 @@
 
 #![cfg(all(feature = "kdl", not(miri)))]
 
-use metor_fsw_2::metor_proto::types::ComponentId;
+use metor_fsw_2::metor_proto::types::{ComponentId, Msg};
+use metor_fsw_2::metor_proto_wkt::{
+    SequenceChannelEvent, SequenceCommand, SequenceCommandKind, SequenceEventKind,
+};
 use metor_fsw_2::{
-    Frame, Input, SlotStatus, build_artifacts, parse, resolve,
+    Frame, Input, SlotStatus, build_artifacts, parse, resolve, split_record,
     wiring::{BuildOptions, LoadError, Registry},
 };
 
@@ -131,4 +134,83 @@ slot "adcs" {{
         matches!(err, LoadError::SlotContractMismatch { dir: "input", .. }),
         "{err:?}"
     );
+}
+
+/// Drain a message ring into the decoded `Msg`s of one type (the downlink tap's decode,
+/// mirrors `slot_integration`).
+fn drain_msgs<M: Msg + serde::de::DeserializeOwned>(
+    view: &mut metor_fsw_2::ring::View<
+        metor_fsw_2::ring::BoxBacking,
+        metor_fsw_2::ring::NoWake,
+        metor_fsw_2::ring::NoWake,
+    >,
+) -> Vec<M> {
+    let mut out = Vec::new();
+    let mut buf = Vec::new();
+    while view.try_read_into(&mut buf).expect("no lap on the message tap") {
+        let (id, payload) = split_record(&buf).expect("a 2-byte-id record");
+        assert_eq!(id, M::ID, "every record on this channel carries M::ID");
+        out.push(postcard::from_bytes::<M>(payload).expect("postcard round-trip"));
+    }
+    out
+}
+
+#[test]
+fn unknown_runtime_load_is_rejected_with_a_failed_event() {
+    // A runtime `Load` naming an occupant outside the allowed set is rejected loudly —
+    // a `Failed` event naming the bad occupant + the allowed set on the slot's events
+    // channel — not silently swallowed leaving the slot stuck `Empty` with no diagnostic.
+    let kdl = format!(
+        r#"
+coordinator cycle_rate=1000.0 sim_dt=0.000002
+artifact "waiter" crate="{FIXTURE_CRATE}" lib="{FIXTURE_STEM}" type="waiter"
+slot "adcs" {{
+    allow occupant="waiter"
+}}
+"#
+    );
+    let mut wiring = parse(&kdl).expect("parse the slot mission");
+    if let Err(e) = build_artifacts(&mut wiring, &BuildOptions::default()) {
+        eprintln!("skipping: build_artifacts failed: {e}");
+        return;
+    }
+    let mut coord = resolve(&wiring, &Registry::new()).expect("resolve the slot Wiring");
+
+    // Tap the slot's events channel BEFORE the run (an overwrite ring starts at the
+    // live edge, so the tap must precede the emit).
+    let messages = coord.message_registry();
+    let mut events_view = messages
+        .view(ComponentId::new("adcs.sequences"))
+        .expect("the slot events channel is registered")
+        .expect("reader slot available");
+
+    // A typo'd panel/uplink Load, injected through the in-proc control handle.
+    let ch = coord.channel_id("adcs").expect("adcs slot channel");
+    let mut control = coord.control_handle();
+    control
+        .emit(&SequenceCommand {
+            channel_id: ch,
+            command: SequenceCommandKind::Load {
+                name: "nonesuch".to_string(),
+            },
+        })
+        .unwrap();
+
+    let coord = stellarator::run(|| async move {
+        coord.run_for(2).await;
+        coord
+    });
+
+    let events = drain_msgs::<SequenceChannelEvent>(&mut events_view);
+    let failed = events
+        .iter()
+        .find_map(|e| match &e.kind {
+            SequenceEventKind::Failed { reason } => Some(reason.clone()),
+            _ => None,
+        })
+        .expect("the unknown-occupant Load emitted a Failed event");
+    assert!(failed.contains("nonesuch"), "names the bad occupant: {failed}");
+    assert!(failed.contains("waiter"), "lists the allowed set: {failed}");
+
+    drop((coord, events_view, control));
 }

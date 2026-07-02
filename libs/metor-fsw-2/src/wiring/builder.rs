@@ -339,6 +339,12 @@ impl SystemSpecBuilder {
     /// `fsw_create` decodes — **byte-identical** to what the KDL front-end's
     /// schema-guided encoder produces for the same logical value. A paramless
     /// system can omit this ([`ParamSource::None`]).
+    ///
+    /// **[`from_artifact`](Self::from_artifact) systems only.** A static system takes
+    /// its params through its registered `FromKdlNode` factory — there is no postcard
+    /// decode path, so `resolve` rejects the combination with
+    /// [`LoadError::StaticPostcardParams`](super::LoadError::StaticPostcardParams)
+    /// rather than silently running the system on defaults.
     pub fn params<P: Serialize>(mut self, params: P) -> Self {
         let bytes =
             postcard::to_allocvec(&params).expect("params postcard-encode (Serialize is infallible)");

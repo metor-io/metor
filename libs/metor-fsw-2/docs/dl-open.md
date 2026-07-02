@@ -247,7 +247,6 @@ pub struct PortDescMsg {
     pub frame_name: String,                 // was &'static str
     pub vtable:     VTable,                  // unprefixed; what compatible() validates against
     pub max_size:   usize,
-    pub rate_hint:  Option<Hz>,
     pub metadata:   Vec<ComponentMetadata>, // unprefixed; lets the host re-derive `announce`
 }
 

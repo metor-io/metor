@@ -257,9 +257,8 @@ overrun     = Overrun::Overwrite
 ```
 
 - `capacity_for` / `buffer_capacity::<F>` (`src/port.rs`) are the sizing helpers. Depth is
-  `config.default_depth` for every buffer; `PortDesc` carries an advisory `rate_hint`, but the
-  builder does not yet derive depth from it — rate-derived depth is the one piece of buffer sizing
-  not implemented.
+  `config.default_depth` for every buffer — there is no rate-derived depth (review finding C1:
+  the earlier advisory `PortDesc::rate_hint` had no consumer and was deleted).
 - **`max_readers` must cover every `view()` the builder will register**, because the ring has no
   crash-slot reclamation: a reader slot is reserved at build time and never reclaimed. It is the
   sum of:
@@ -624,9 +623,10 @@ The hard timeout is the only non-cooperative path.
 
 ## 8. Not yet implemented
 
-- **Rate-derived buffer depth.** `PortDesc::rate_hint` is advisory; depth is always
-  `config.default_depth`. Deriving depth from the producer/consumer rate ratio (so a slow reader
-  cannot lap within one of its periods) is a refinement.
+- **Rate-derived buffer depth.** Depth is always `config.default_depth`. Deriving depth from the
+  producer/consumer rate ratio (so a slow reader cannot lap within one of its periods) is a
+  refinement (review finding C1: the earlier advisory `PortDesc::rate_hint` had no consumer and
+  was deleted).
 - **Per-system rate division.** One global `cycle_rate` drives every cyclic system; a system that
   wants a slower effective rate divides cycles itself.
 - **Intra-cycle parallelism.** The cyclic loop is single-threaded. Running an acyclic layer in

@@ -538,14 +538,16 @@ connect "nav"    -> "closer" frame="nav"
 #[cfg(not(miri))]
 #[stellarator::test]
 async fn delayed_kdl_edge_breaks_cycle_and_runs() {
-    // The same loop, but the `nav -> closer` back-edge is `delayed=#true`. Also uses
-    // a `sim_dt` (free-running simulated clock) — both new KDL surfaces at once.
+    // The same loop, but the `closer -> nav` back-edge (backward in registration
+    // order: nav registers first, so it reads closer one cycle late) is
+    // `delayed=#true`. Also uses a `sim_dt` (free-running simulated clock) — both
+    // new KDL surfaces at once.
     let kdl = r#"
 coordinator cycle_rate=100.0 sim_dt=0.00833
 system "nav"    type="NavFilter" gain=1.0
 system "closer" type="Closer"
-connect "closer" -> "nav"    frame="imu"
-connect "nav"    -> "closer" frame="nav" delayed=#true
+connect "closer" -> "nav"    frame="imu" delayed=#true
+connect "nav"    -> "closer" frame="nav"
 "#;
     let mut coord = load(kdl, &registry()).expect("delayed edge breaks the cycle; doc loads");
     coord.run_for(5).await;
@@ -860,6 +862,59 @@ system "plant" type="Plant" lib="missing"
         Err(e) => e,
     };
     assert!(matches!(err, LoadError::UnknownArtifact { .. }), "{err:?}");
+}
+
+#[test]
+fn err_static_system_with_typed_params() {
+    // Typed builder params on a *static* system have no decode path (the Registry
+    // factory is `FromKdlNode`-shaped, not postcard) — rejected at resolve, never
+    // silently dropped onto defaults.
+    #[derive(serde::Serialize)]
+    struct Gain {
+        gain: f64,
+    }
+    let wiring = WiringBuilder::new()
+        .coordinator(100.0, ClockSpec::Wall)
+        .system("nav")
+        .ty("NavFilter")
+        .from_static()
+        .params(Gain { gain: 2.0 })
+        .end()
+        .build();
+    let err = match resolve(&wiring, &registry()) {
+        Ok(_) => panic!("expected a StaticPostcardParams error"),
+        Err(e) => e,
+    };
+    assert!(matches!(err, LoadError::StaticPostcardParams { .. }), "{err:?}");
+}
+
+#[test]
+fn err_unknown_initial_occupant() {
+    // A typo'd `initial occupant=` is a resolve-time error naming the bad occupant and
+    // the allowed set — not a slot that silently boots `Empty`. Pure spec validation,
+    // so it fires before any artifact is built or opened.
+    let kdl = r#"
+coordinator cycle_rate=100.0
+artifact "waiter" crate="seqs" lib="seq_waiter" type="waiter"
+slot "adcs" {
+    allow occupant="waiter"
+    initial occupant="waiterr" state="running"
+}
+"#;
+    let err = load_err(kdl);
+    match err {
+        LoadError::UnknownInitialOccupant {
+            slot,
+            occupant,
+            allowed,
+            ..
+        } => {
+            assert_eq!(slot, "adcs");
+            assert_eq!(occupant, "waiterr");
+            assert_eq!(allowed, "waiter");
+        }
+        other => panic!("expected UnknownInitialOccupant, got {other:?}"),
+    }
 }
 
 // ---------------------------------------------------------------------------

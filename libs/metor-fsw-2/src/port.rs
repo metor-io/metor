@@ -23,8 +23,8 @@ use crate::frame::Frame;
 use crate::reader::{ListReader, MapReader};
 use crate::writer::FrameWriter;
 
-/// Default in-flight record depth when a port carries no `rate_hint` (system.md
-/// §2.2 / Q10). At least 2 (one in-flight while the slowest reader holds one).
+/// Default in-flight record depth for every port (system.md §2.2 / Q10). At least 2
+/// (one in-flight while the slowest reader holds one).
 pub const DEFAULT_DEPTH: usize = 8;
 
 /// Power-of-two ring capacity for `depth` records of a frame with `max_size`

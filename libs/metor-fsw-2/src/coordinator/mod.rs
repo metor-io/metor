@@ -139,7 +139,10 @@ impl PortRef {
 }
 
 /// A wiring error caught at build time, before any byte flows (coordinator.md §2.2).
-#[derive(Clone, Debug, PartialEq, Eq)]
+///
+/// Not `Eq`: [`InvalidCycleRate`](WireError::InvalidCycleRate) carries the offending
+/// `f64` rate so the message can name it.
+#[derive(Clone, Debug, PartialEq)]
 pub enum WireError {
     /// A `PortRef` named a system index that was never registered.
     UnknownSystem { id: usize },
@@ -166,11 +169,41 @@ pub enum WireError {
         port: PortId,
     },
     /// Two producers were connected into one **frame** input port. Message inputs allow
-    /// fan-in (`docs/message-wiring.md` §3.2), so this never fires for them.
+    /// fan-in (`docs/message-wiring.md` §3.2), so this never fires for them — but an
+    /// *exact duplicate* of one message edge is a [`DuplicateMsgEdge`](Self::DuplicateMsgEdge).
     DoubleConnect {
         system: &'static str,
         port: PortId,
     },
+    /// The exact same message edge — one `(producer, consumer, port)` triple — was
+    /// connected twice. Fan-in of *distinct* producers is legal (`docs/message-wiring.md`
+    /// §3.2); a copy-pasted duplicate edge would deliver every record to the consumer
+    /// twice (a double-applied command), so it is rejected.
+    DuplicateMsgEdge {
+        producer: &'static str,
+        consumer: &'static str,
+        port: PortId,
+    },
+    /// A non-delayed **frame** edge points *backward* in registration order between two
+    /// cyclic systems: the cyclic step loop runs in registration order, so the consumer
+    /// would execute before its producer every cycle and permanently read the previous
+    /// cycle's value — the exact staleness [`connect_delayed`](CoordinatorBuilder::connect_delayed)
+    /// exists to make explicit. Fix by registering the producer before the consumer, or
+    /// declare the one-cycle delay with `connect_delayed`. Message edges are exempt (a
+    /// decoupled log, not a same-cycle dependency), as are edges touching an async
+    /// endpoint (async systems run off the copy-in step / their own task, not the
+    /// registration-ordered step loop).
+    StaleFrameEdge {
+        producer: &'static str,
+        consumer: &'static str,
+        port: PortId,
+    },
+    /// The configured `cycle_rate` cannot pace a [`Wall`](ClockMode::Wall) clock: it must
+    /// be finite and positive to become a per-cycle `Duration` budget (a 0/negative/NaN/
+    /// infinite rate would panic in `Duration::from_secs_f64` at run time). A
+    /// [`Simulated`](ClockMode::Simulated) clock ignores the rate, so it is not
+    /// validated there.
+    InvalidCycleRate { rate: Hz },
     /// A feedback loop was left unbroken: a cycle remains in the graph once the
     /// intentional one-cycle-delayed edges (`connect_delayed`) are removed. Every
     /// feedback loop must break exactly one of its edges with `connect_delayed`, so
@@ -204,6 +237,30 @@ impl std::fmt::Display for WireError {
             WireError::DoubleConnect { system, port } => write!(
                 f,
                 "{system} input for port {port:?} connected more than once"
+            ),
+            WireError::DuplicateMsgEdge {
+                producer,
+                consumer,
+                port,
+            } => write!(
+                f,
+                "duplicate message edge {producer} -> {consumer} on port {port:?} — \
+                 the same edge was connected twice (every record would deliver twice)"
+            ),
+            WireError::StaleFrameEdge {
+                producer,
+                consumer,
+                port,
+            } => write!(
+                f,
+                "{consumer} is registered before {producer} but consumes its {port:?} \
+                 output: it would step first every cycle and permanently read the \
+                 previous cycle's value — register {producer} before {consumer}, or \
+                 declare the one-cycle delay with connect_delayed"
+            ),
+            WireError::InvalidCycleRate { rate } => write!(
+                f,
+                "cycle_rate {rate} cannot pace a Wall clock — it must be finite and positive"
             ),
             WireError::FeedbackCycle { systems } => write!(
                 f,
@@ -738,9 +795,14 @@ impl CoordinatorBuilder {
     /// full compatibility/structural validation runs in [`build`](Self::build);
     /// this only catches the cheap frame-id and unknown-system/port mistakes early.
     ///
-    /// A forward (acyclic) edge. If a `connect` happens to close a feedback loop in
-    /// registration order, `build` rejects it as a [`FeedbackCycle`](WireError::FeedbackCycle):
-    /// the back-edge of a loop must be declared with [`connect_delayed`](Self::connect_delayed).
+    /// A forward (acyclic) edge. If a `connect` happens to close a feedback loop —
+    /// including a system connected to itself — `build` rejects it as a
+    /// [`FeedbackCycle`](WireError::FeedbackCycle): the back-edge of a loop must be
+    /// declared with [`connect_delayed`](Self::connect_delayed). Likewise a frame edge
+    /// between two cyclic systems must point *forward* in registration order (the step
+    /// loop's execution order), or the consumer would permanently read last cycle's
+    /// value — `build` rejects the backward edge as a
+    /// [`StaleFrameEdge`](WireError::StaleFrameEdge) unless it is `connect_delayed`.
     pub fn connect(&mut self, producer: PortRef, consumer: PortRef) -> Result<(), WireError> {
         self.push_edge(producer, consumer, false)
     }
@@ -799,6 +861,18 @@ impl CoordinatorBuilder {
     /// Validate the graph, size and allocate every ring, bind ports, auto-provision
     /// health/log buffers, and return a ready coordinator (coordinator.md §2).
     pub fn build(mut self) -> Result<Coordinator, WireError> {
+        // A Wall clock turns `cycle_rate` into the per-cycle pacing budget in `run_for`;
+        // reject an unusable rate here so the failure is a build-time `WireError`, not a
+        // `Duration::from_secs_f64` panic mid-run. A `Simulated` clock ignores the rate
+        // (coordinator.md §6), so it is deliberately not validated there.
+        if matches!(self.config.clock, ClockMode::Wall)
+            && !(self.config.cycle_rate.is_finite() && self.config.cycle_rate > 0.0)
+        {
+            return Err(WireError::InvalidCycleRate {
+                rate: self.config.cycle_rate,
+            });
+        }
+
         let n = self.descs.len();
         let depth = self.config.default_depth;
         // Every slot reads every command producer (the coordinator-collected fan-out,
@@ -859,16 +933,27 @@ impl CoordinatorBuilder {
                             port: c.port,
                         });
                     }
-                    if !delayed && p.system.id != c.system.id {
+                    // Self-edges included: a system plainly connected to itself is the
+                    // tightest feedback loop (it can only ever read its own previous
+                    // cycle's value), so it must be declared with `connect_delayed` like
+                    // any other loop — the DFS reports it as a one-member `FeedbackCycle`.
+                    if !delayed {
                         forward_adj[p.system.id].push(c.system.id);
                     }
                 }
-                // Message edge: fan-in (append), no double-connect, excluded from cycles.
+                // Message edge: fan-in (append), excluded from cycles. Distinct producers
+                // may fan in freely (§3.2), but an exact duplicate of one edge would
+                // deliver every record twice, so it is rejected.
                 PortId::Msg(_) => {
-                    msg_cons_edges
-                        .entry((c.system.id, in_idx))
-                        .or_default()
-                        .push((p.system.id, out_idx));
+                    let producers = msg_cons_edges.entry((c.system.id, in_idx)).or_default();
+                    if producers.contains(&(p.system.id, out_idx)) {
+                        return Err(WireError::DuplicateMsgEdge {
+                            producer: self.descs[p.system.id].name,
+                            consumer: self.descs[c.system.id].name,
+                            port: c.port,
+                        });
+                    }
+                    producers.push((p.system.id, out_idx));
                 }
             }
         }
@@ -878,6 +963,31 @@ impl CoordinatorBuilder {
             return Err(WireError::FeedbackCycle {
                 systems: cycle.into_iter().map(|id| self.descs[id].name).collect(),
             });
+        }
+
+        // --- Registration order must agree with the dataflow ------------------
+        // The cyclic step loop runs in registration order, so a non-delayed frame edge
+        // between two cyclic systems whose consumer registered *before* its producer
+        // would read last cycle's value forever — silent staleness that must instead be
+        // declared with `connect_delayed`. Checked after cycle detection so a genuine
+        // unbroken loop (which always contains a backward edge) reports the clearer
+        // `FeedbackCycle`. Message edges are exempt (a decoupled log, §3.6); so are
+        // edges with an async endpoint (async systems run off the post-step copy-in /
+        // their own task, so their registration index carries no ordering semantics).
+        // Self-edges never reach here (rejected above as a one-member cycle).
+        for (p, c, delayed) in &self.edges {
+            if *delayed || !matches!(c.port, PortId::Frame(_)) {
+                continue;
+            }
+            let both_cyclic = self.kinds[p.system.id] == SystemKind::Cyclic
+                && self.kinds[c.system.id] == SystemKind::Cyclic;
+            if both_cyclic && c.system.id < p.system.id {
+                return Err(WireError::StaleFrameEdge {
+                    producer: self.descs[p.system.id].name,
+                    consumer: self.descs[c.system.id].name,
+                    port: c.port,
+                });
+            }
         }
 
         // --- Every FRAME input must be connected exactly once ----------------
@@ -1422,6 +1532,7 @@ impl CoordinatorBuilder {
             seq_registry_out,
             seq_registry,
             seq_registry_emitted: false,
+            started: false,
             // Declared last so the canonical ring handles drop after every port.
             rings: table,
         })
@@ -1476,6 +1587,29 @@ fn find_cycle(adj: &[Vec<usize>]) -> Option<Vec<usize>> {
         }
     }
     None
+}
+
+/// The `Simulated` per-cycle timestamp: `epoch + k*dt`, computed in wide integer
+/// nanoseconds so the cycle index is never truncated (the previous `dt * k as u32`
+/// wrapped the timeline back to `epoch` every 2³² cycles, breaking monotonicity and
+/// stalling in-flight `Wait`s). The u128 product cannot overflow for any realistic
+/// run; the final i64-microsecond cast holds ~292k years of simulated time.
+fn simulated_now(epoch: Timestamp, dt: Duration, k: u64) -> Timestamp {
+    Timestamp(epoch.0 + (dt.as_nanos() * k as u128 / 1_000) as i64)
+}
+
+/// Whether the freshly scanned stopped set differs from the previously published one.
+/// Both slices come from the same in-order scan of the cyclic slots, so an element-wise
+/// `(name, reason)` compare is an exact membership compare — no set structure, no
+/// allocation. A length-only check is not enough: stops are no longer monotonic (a slot
+/// recovers via `Load`/`Reset`), so slot A can recover the same cycle slot B stops,
+/// changing the membership while the count stays put.
+fn stopped_set_changed(cur: &[StoppedSystem], prev: &[StoppedSystem]) -> bool {
+    cur.len() != prev.len()
+        || cur
+            .iter()
+            .zip(prev)
+            .any(|(a, b)| a.name != b.name || a.reason != b.reason)
 }
 
 fn coord_ring<F: Frame>(depth: usize, max_readers: usize) -> RingBuffer<BoxBacking> {
@@ -1590,6 +1724,11 @@ pub struct Coordinator {
     /// Whether the boot `SequenceRegistry` has been emitted (emit-once; the re-emit hook
     /// for a future `ReloadSequences` is [`emit_sequence_registry`](Coordinator::emit_sequence_registry)).
     seq_registry_emitted: bool,
+    /// Latched by the first [`run_for`](Coordinator::run_for): a run consumes the
+    /// coordinator (spawned async systems and their transports are gone after
+    /// shutdown), so a second run would silently re-init everything over dead
+    /// plumbing — it panics instead.
+    started: bool,
     /// Canonical ring handles; declared last so they drop after every port.
     #[allow(dead_code)]
     rings: RingTable,
@@ -1699,7 +1838,21 @@ impl Coordinator {
 
     /// Run the lifecycle for a bounded number of cycles: init all (barrier) → run
     /// → shutdown all. Convenient for tests and bounded missions.
+    ///
+    /// # Panics
+    ///
+    /// Panics if called a second time on the same coordinator: a run *consumes* it —
+    /// the async systems were moved into their (now torn-down) tasks and a transport's
+    /// connection is gone — so a rerun would re-init every cyclic system over dead
+    /// plumbing. Build a fresh `Coordinator` to run again.
     pub async fn run_for(&mut self, cycles: usize) {
+        assert!(
+            !self.started,
+            "Coordinator::run_for called twice — a coordinator drives exactly one run \
+             (its async systems/transports are consumed by the first); build a fresh \
+             Coordinator to run again"
+        );
+        self.started = true;
         let tasks = self.start().await;
         // Emit the boot `SequenceRegistry` once, before the first cycle's events flow, so
         // a tap claimed after `build()` observes it ahead of any `SequenceChannelEvent`.
@@ -1707,7 +1860,14 @@ impl Coordinator {
             self.emit_sequence_registry();
             self.seq_registry_emitted = true;
         }
-        let budget = Duration::from_secs_f64(1.0 / self.config.cycle_rate);
+        // The Wall pacing budget. Only computed under a `Wall` clock — `cycle_rate` is
+        // documented ignored under `Simulated`, so an unusable rate must not panic
+        // there; under `Wall` the rate was validated at `build()` (`InvalidCycleRate`),
+        // so the conversion cannot panic.
+        let budget = match self.config.clock {
+            ClockMode::Wall => Duration::from_secs_f64(1.0 / self.config.cycle_rate),
+            ClockMode::Simulated { .. } => Duration::ZERO,
+        };
         // The epoch a `Simulated` clock advances from; unused under `Wall`.
         let epoch = Timestamp::now();
         for k in 0..cycles {
@@ -1719,7 +1879,7 @@ impl Coordinator {
             // simulated clock at `epoch + k*dt` (coordinator.md §6, fix #5/#6).
             let now = match self.config.clock {
                 ClockMode::Wall => Timestamp::now(),
-                ClockMode::Simulated { dt } => epoch + dt * k as u32,
+                ClockMode::Simulated { dt } => simulated_now(epoch, dt, k as u64),
             };
             // Commands are drained per-slot at the head of each `step` (`docs/message-wiring.md`
             // §6): every slot's fan-in reads every command producer (the coordinator's in-proc
@@ -1829,7 +1989,7 @@ impl Coordinator {
                 });
             }
         }
-        if cur.len() == self.stopped.len() {
+        if !stopped_set_changed(&cur, &self.stopped) {
             return;
         }
         self.stopped = cur;

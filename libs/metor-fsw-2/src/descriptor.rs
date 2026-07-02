@@ -18,7 +18,7 @@ use metor_proto_wkt::ComponentMetadata;
 use crate::frame::Frame;
 use crate::message::MAX_MSG_BYTES;
 
-/// A unit measured in Hertz; an advisory rate hint for buffer depth / async pacing.
+/// A unit measured in Hertz.
 pub type Hz = f64;
 
 /// The type-erased prefix factory stored on [`PortDesc::announce`]: given an instance
@@ -81,7 +81,7 @@ pub enum PortKind {
 }
 
 /// One port's static shape: its edge key ([`id`](PortDesc::id)), display name, worst-case
-/// size, advisory rate, and [`kind`](PortDesc::kind)-specific payload.
+/// size, and [`kind`](PortDesc::kind)-specific payload.
 ///
 /// Used both for an output (a produced frame/message) and an input (a required shape) —
 /// the two are structurally identical, the direction is which list of a
@@ -97,8 +97,6 @@ pub struct PortDesc {
     /// `F::MAX_SIZE` / `MAX_MSG_BYTES` (worst-case bytes); size a ring via
     /// [`crate::buffer_capacity`]. `0` for a receive-all tap.
     pub max_size: usize,
-    /// Advisory rate, for buffer depth / async pacing. `None` ⇒ use a global default.
-    pub rate_hint: Option<Hz>,
     /// The kind-specific payload (frame vtable/announce, message telemetered-flag, or tap).
     pub kind: PortKind,
 }
@@ -110,8 +108,7 @@ impl std::fmt::Debug for PortDesc {
         let mut s = f.debug_struct("PortDesc");
         s.field("id", &self.id)
             .field("name", &self.name)
-            .field("max_size", &self.max_size)
-            .field("rate_hint", &self.rate_hint);
+            .field("max_size", &self.max_size);
         match &self.kind {
             PortKind::Frame { vtable, .. } => s.field("kind", &"Frame").field("vtable", vtable),
             PortKind::Message { telemetered } => {
@@ -152,7 +149,6 @@ impl PortDesc {
             id: PortId::Frame(F::FRAME_ID),
             name: F::NAME,
             max_size: F::MAX_SIZE,
-            rate_hint: None,
             kind: PortKind::Frame {
                 vtable: F::as_vtable(),
                 // Coerce the `F`-closing fn item to a plain fn pointer first (erasing `F`,
@@ -162,14 +158,6 @@ impl PortDesc {
                     announce_of::<F> as fn(&str) -> (VTable, Vec<ComponentMetadata>),
                 ),
             },
-        }
-    }
-
-    /// As [`PortDesc::of`] but carrying an advisory rate hint.
-    pub fn of_at<F: Frame>(rate_hint: Hz) -> Self {
-        Self {
-            rate_hint: Some(rate_hint),
-            ..Self::of::<F>()
         }
     }
 
@@ -192,7 +180,6 @@ impl PortDesc {
             id: PortId::Msg(M::ID),
             name: msg_name::<M>(),
             max_size: MAX_MSG_BYTES,
-            rate_hint: None,
             kind: PortKind::Message { telemetered },
         }
     }
@@ -204,7 +191,6 @@ impl PortDesc {
             id: PortId::Frame(ComponentId::new("")),
             name: "",
             max_size: 0,
-            rate_hint: None,
             kind: PortKind::ReceiveAll,
         }
     }
