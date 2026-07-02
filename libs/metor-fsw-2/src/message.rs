@@ -122,7 +122,12 @@ where
     /// the derive when a `MsgOut<M>` is declared in a `SystemOutput` bundle.
     pub fn bind<S: RingSource<B = B>>(src: &mut S) -> Self {
         let (ring, data, space) = src.next_output::<WD, WS>();
-        MsgOut::new(ring.writer(data, space))
+        // Invariant: the coordinator allocates one ring per message output and
+        // binds it exactly once, so the region's writer claim is always free here.
+        let writer = ring
+            .writer(data, space)
+            .expect("message ring is bound to exactly one writer at build");
+        MsgOut::new(writer)
     }
 }
 
@@ -359,10 +364,6 @@ mod tests {
             ring: ring.clone(),
         };
 
-        // A typed port per Msg type (each keyed on its own `M::ID`).
-        let mut reg_out: MsgOut<SequenceRegistry> = MsgOut::new(ring.writer(NoWake, NoWake));
-        let mut cmd_out: MsgOut<SequenceCommand> = MsgOut::new(ring.writer(NoWake, NoWake));
-
         // The descriptor carries the port's edge key.
         assert_eq!(
             MsgOut::<SequenceCommand>::descriptor().id,
@@ -373,6 +374,8 @@ mod tests {
         // live edge, so the tap must exist before data flows (the telemetry-tap order).
         let mut view = entry.view().expect("reader slot");
 
+        // A typed port per Msg type (each keyed on its own `M::ID`). The ring enforces a
+        // single live writer, so the ports take it in turn (drop frees the claim).
         // First record: a whole-registry declaration.
         let registry = SequenceRegistry {
             channels: vec![SequenceChannelSpec {
@@ -381,9 +384,15 @@ mod tests {
                 available: vec!["commissioning".to_string(), "safe_mode".to_string()],
             }],
         };
-        reg_out.emit(&registry).expect("emit registry");
+        {
+            let mut reg_out: MsgOut<SequenceRegistry> =
+                MsgOut::new(ring.writer(NoWake, NoWake).expect("first writer"));
+            reg_out.emit(&registry).expect("emit registry");
+        }
 
         // Second record: a *different* Msg type, its own typed port on the same ring.
+        let mut cmd_out: MsgOut<SequenceCommand> =
+            MsgOut::new(ring.writer(NoWake, NoWake).expect("claim freed on drop"));
         let command = SequenceCommand {
             channel_id: 0,
             command: SequenceCommandKind::Start,
@@ -427,22 +436,27 @@ mod tests {
             max_readers: 4,
             overrun: Overrun::Overwrite,
         });
-        // Two typed writers share the ring so the drained view sees a heterogeneous stream.
-        let mut reg_out: MsgOut<SequenceRegistry> = MsgOut::new(ring.writer(NoWake, NoWake));
-        let mut cmd_out: MsgOut<SequenceCommand> = MsgOut::new(ring.writer(NoWake, NoWake));
         // Claim the read view before any write (overwrite ring starts at the live edge).
         let mut inbox: MsgIn<SequenceCommand> = MsgIn::new(ring.view(NoWake, NoWake).expect("slot"));
 
-        // A different Msg type interleaved with the commands — it must be skipped.
-        reg_out
-            .emit(&SequenceRegistry {
-                channels: vec![SequenceChannelSpec {
-                    id: 0,
-                    name: "mode".to_string(),
-                    available: vec![],
-                }],
-            })
-            .expect("emit registry");
+        // Two typed ports take the ring's single writer in turn (drop frees the claim),
+        // so the drained view sees a heterogeneous stream.
+        // A different Msg type ahead of the commands — it must be skipped.
+        {
+            let mut reg_out: MsgOut<SequenceRegistry> =
+                MsgOut::new(ring.writer(NoWake, NoWake).expect("first writer"));
+            reg_out
+                .emit(&SequenceRegistry {
+                    channels: vec![SequenceChannelSpec {
+                        id: 0,
+                        name: "mode".to_string(),
+                        available: vec![],
+                    }],
+                })
+                .expect("emit registry");
+        }
+        let mut cmd_out: MsgOut<SequenceCommand> =
+            MsgOut::new(ring.writer(NoWake, NoWake).expect("claim freed on drop"));
         cmd_out
             .emit(&SequenceCommand {
                 channel_id: 1,
@@ -484,8 +498,10 @@ mod tests {
         };
         let ring_a = mk();
         let ring_b = mk();
-        let mut out_a: MsgOut<SequenceCommand> = MsgOut::new(ring_a.writer(NoWake, NoWake));
-        let mut out_b: MsgOut<SequenceCommand> = MsgOut::new(ring_b.writer(NoWake, NoWake));
+        let mut out_a: MsgOut<SequenceCommand> =
+            MsgOut::new(ring_a.writer(NoWake, NoWake).expect("one writer per ring"));
+        let mut out_b: MsgOut<SequenceCommand> =
+            MsgOut::new(ring_b.writer(NoWake, NoWake).expect("one writer per ring"));
         // Two producer views into one input (the fan-in shape).
         let mut inbox: MsgIn<SequenceCommand> = MsgIn::from_views(vec![
             ring_a.view(NoWake, NoWake).expect("slot a"),

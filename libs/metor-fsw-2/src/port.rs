@@ -88,7 +88,12 @@ where
     /// Walked in `descriptors()` order by the generated bundle `bind`.
     pub fn bind<S: RingSource<B = B>>(src: &mut S) -> Self {
         let (ring, data, space) = src.next_output::<WD, WS>();
-        Output::new(ring.writer(data, space))
+        // Invariant: the coordinator allocates one ring per output port and binds
+        // it exactly once, so the region's writer claim is always free here.
+        let writer = ring
+            .writer(data, space)
+            .expect("output ring is bound to exactly one writer at build");
+        Output::new(writer)
     }
 }
 

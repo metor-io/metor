@@ -157,7 +157,7 @@ fn interactive_load_then_abort_safes() {
     };
     let (seq, mode) = tap_slot(&mut coord);
     let ch = coord.channel_id("mode").expect("mode slot channel");
-    let mut control = coord.control_handle();
+    let mut control = coord.control_handle().expect("taken once per coordinator");
 
     // `run_for` re-runs the dl systems' (non-idempotent) `init` each call, so the slot is
     // driven inside a SINGLE `run_for`: `Load` + `Start` are issued before it, and a spawned

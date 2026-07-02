@@ -1240,9 +1240,10 @@ impl CoordinatorBuilder {
 
         // --- Coordinator-owned command channel (the in-proc control_handle, §6) ------
         // A message channel carrying postcard `SequenceCommand`s: the one *reserved* command
-        // producer. `control_handle()` mints `MsgOut`s over it and every slot's command fan-in
-        // reads it — so it reserves `n_slots` readers. Owned but not telemetered (inbound
-        // control, not downlink), so it is not in the `MessageRegistry`.
+        // producer. Its single `MsgOut` is minted below (handed out once by
+        // `control_handle()`) and every slot's command fan-in reads it — so it reserves
+        // `n_slots` readers. Owned but not telemetered (inbound control, not downlink), so
+        // it is not in the `MessageRegistry`.
         let command_ring = msg_ring(MAX_MSG_BYTES, MSG_DEPTH, n_slots + READER_SLACK);
         table.rings.push(RingEntry {
             ring: command_ring.clone(),
@@ -1250,6 +1251,9 @@ impl CoordinatorBuilder {
             role: BufferRole::Coordinator,
             instance: None,
         });
+        // The channel's single writer, minted once here (the region's writer claim
+        // enforces one live writer per ring); `control_handle()` hands it out once.
+        let control_out = Some(msg_writer::<SequenceCommand>(&command_ring));
 
         // The command producers every slot fans in from (`docs/message-wiring.md` §6): the
         // coordinator's reserved in-proc channel, plus every system's `SequenceCommand` output
@@ -1298,7 +1302,11 @@ impl CoordinatorBuilder {
                 });
                 let data = Notifier::default();
                 let space = Notifier::default();
-                let writer = private.writer(data.clone(), space.clone());
+                // Invariant: each private copy-in ring is created here and gets
+                // this one writer, so the claim is always free.
+                let writer = private
+                    .writer(data.clone(), space.clone())
+                    .expect("private copy-in ring has exactly one writer");
                 let upstream = output_rings[prod_id][out_idx]
                     .view(NoWake, NoWake)
                     .expect("producer reader slot reserved at sizing time");
@@ -1503,11 +1511,25 @@ impl CoordinatorBuilder {
         // --- Coordinator's own health / log / status ports -------------------
         // The buffers were allocated up front (above) so the registry includes them;
         // here we just wrap the writer/view ports over those same ring handles.
+        // Invariant (all three): the coordinator allocated these rings above and
+        // mints their single writer exactly once here, so the claims are free.
         let coord_health = HealthPort::new(
-            Output::new(health_ring.writer(NoWake, NoWake)),
-            Output::new(log_ring.writer(NoWake, NoWake)),
+            Output::new(
+                health_ring
+                    .writer(NoWake, NoWake)
+                    .expect("coordinator health ring has exactly one writer"),
+            ),
+            Output::new(
+                log_ring
+                    .writer(NoWake, NoWake)
+                    .expect("coordinator log ring has exactly one writer"),
+            ),
         );
-        let status_out = Output::new(status_ring.writer(NoWake, NoWake));
+        let status_out = Output::new(
+            status_ring
+                .writer(NoWake, NoWake)
+                .expect("coordinator status ring has exactly one writer"),
+        );
         let status_view = Input::new(
             status_ring
                 .view(NoWake, NoWake)
@@ -1527,7 +1549,7 @@ impl CoordinatorBuilder {
             progress: Arc::new(AtomicU64::new(0)),
             registry,
             message_registry,
-            command_ring,
+            control_out,
             channel_map,
             seq_registry_out,
             seq_registry,
@@ -1634,9 +1656,15 @@ fn msg_ring(max_bytes: usize, depth: usize, max_readers: usize) -> RingBuffer<Bo
 
 /// A fresh host [`MsgOut`] over a coordinator-owned message ring — the [`slot_writer`]
 /// analogue for the message channel (`slot.rs:547`), exactly how the coordinator mints
-/// its own `status_out`/`control` writers. Single-writer discipline is the caller's.
+/// its own `status_out`/`control` writers. Called exactly once per ring at build (the
+/// region's writer claim enforces it).
 fn msg_writer<M: Msg>(ring: &RingBuffer<BoxBacking>) -> MsgOut<M> {
-    MsgOut::new(ring.writer(NoWake, NoWake))
+    // Invariant: each coordinator-owned message ring gets its single writer
+    // minted exactly once at build, so the claim is always free here.
+    let writer = ring
+        .writer(NoWake, NoWake)
+        .expect("coordinator message ring has exactly one writer");
+    MsgOut::new(writer)
 }
 
 /// Build a [`MessageEntry`] for one message channel: the instance-qualified key
@@ -1707,11 +1735,13 @@ pub struct Coordinator {
     /// §2). Empty until W4 allocates the per-slot sequence channels; the freeze +
     /// accessor land here so the downlink tap (W2) and the coupling (W4) have it.
     message_registry: Arc<MessageRegistry>,
-    /// The coordinator-owned command channel (`docs/message-wiring.md` §6): the one *reserved*
-    /// `SequenceCommand` producer, the in-proc twin of a system's `CommandOut`. A canonical handle
-    /// kept so [`control_handle`](Coordinator::control_handle) can mint a fresh [`MsgOut`] over it;
-    /// every slot's command fan-in reads it. The coordinator no longer drains commands — slots do.
-    command_ring: RingBuffer<BoxBacking>,
+    /// The single writer over the coordinator-owned command channel
+    /// (`docs/message-wiring.md` §6): the one *reserved* `SequenceCommand` producer, the
+    /// in-proc twin of a system's `CommandOut`; every slot's command fan-in reads it. The
+    /// coordinator no longer drains commands — slots do. Minted once at `build()` (the
+    /// ring's writer claim enforces one live writer) and handed out by
+    /// [`control_handle`](Coordinator::control_handle), which takes it — `None` afterwards.
+    control_out: Option<MsgOut<SequenceCommand>>,
     /// The channel↔slot map built once at `build()`: `ChannelId` (the slot's build-order index
     /// among slots) → slot instance name. Read for the boot [`SequenceRegistry`]; it no longer
     /// translates commands (slots self-filter by `channel_id`, `docs/messages.md` §4.1).
@@ -1797,16 +1827,19 @@ impl Coordinator {
         let _ = self.seq_registry_out.emit(&self.seq_registry);
     }
 
-    /// A writer over the coordinator's command channel (`docs/messages.md` §4.3): the in-proc
+    /// The writer over the coordinator's command channel (`docs/messages.md` §4.3): the in-proc
     /// convenience for driving slots `Load`/`Start`/`Stop`/`Abort`/`Reset` — the host / CLI / a
-    /// test [`emit`](MsgOut::emit)s [`SequenceCommand`]s the loop drains once per cycle (the same
+    /// test [`emit`](MsgOut::emit)s [`SequenceCommand`]s the slots drain once per cycle (the same
     /// mechanism the uplink system uses, just an in-proc channel instead of a wire one). Address
     /// a slot by its `channel_id` (its build-order index among slots; see
-    /// [`channel_map`](Self::channel_map)). Mirrors [`progress`](Self::progress): each call mints
-    /// a fresh [`MsgOut`] over the ring, so the **single-writer discipline** is the caller's
-    /// (drive commands from one place).
-    pub fn control_handle(&self) -> MsgOut<SequenceCommand> {
-        MsgOut::new(self.command_ring.writer(NoWake, NoWake))
+    /// [`channel_map`](Self::channel_map)).
+    ///
+    /// The channel has exactly **one** writer (the ring's writer claim enforces it), minted at
+    /// `build()` and handed out here **once**: the first call returns it, every later call
+    /// returns `None`. Take it once and hold it for the run — driving commands from one place is
+    /// now structural, not a discipline note.
+    pub fn control_handle(&mut self) -> Option<MsgOut<SequenceCommand>> {
+        self.control_out.take()
     }
 
     /// Every owned **output** buffer as `(instance-name, frame-id)`. The instance
