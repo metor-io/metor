@@ -75,8 +75,14 @@ are not ours to commit.
       (`ring/MIRI.md` recipe). → **Commit.**
 
 ### Wave 3 — KDL serde refactor (after D2; rebases on wave 1)
-- [ ] Deserializer, migration, delete bespoke traits, B1 regression test,
+- [x] Deserializer, migration, delete bespoke traits, B1 regression test,
       E5 fixes. → **Commit.**
+      (done 2026-07-02: wiring/de.rs + 18 unit tests; seq-param-fixture crate;
+      lib=→artifact= hard rename; unknown top-level nodes rejected; Dl* error
+      variants folded; FromKdlNode derive deleted from old macros crate.
+      Deviations: telemetry/slot child nodes stay hand-parsed (shape);
+      BadSlotState kept. Known pre-existing: metor-fsw standalone build broken
+      at HEAD via metor-proto-wkt nox-gating — unrelated. 138 lib tests green.)
 
 ### Wave 4 — A1 unification (after D3), then A2+A3 (after D4)
 - [ ] A1 first (biggest churn), then A2+A3 on the unified model.

@@ -182,7 +182,7 @@ fn slot_load_start_runs_to_done() {
 
     // Drive Load + Start through the in-proc control handle (drained at cycle 0).
     let ch = coord.channel_id("adcs").expect("adcs slot channel");
-    let mut control = coord.control_handle();
+    let mut control = coord.control_handle().expect("taken once per coordinator");
     control.emit(&load(ch, "waiter")).unwrap();
     control.emit(&cmd(ch, SequenceCommandKind::Start)).unwrap();
 
@@ -242,7 +242,7 @@ fn slot_abort_completes_aborted() {
     // Load + Start + Abort, all drained at cycle 0 (before the wait deadline), so the
     // very first poll observes the cancel and bails out via the safing branch.
     let ch = coord.channel_id("adcs").expect("adcs slot channel");
-    let mut control = coord.control_handle();
+    let mut control = coord.control_handle().expect("taken once per coordinator");
     control.emit(&load(ch, "waiter")).unwrap();
     control.emit(&cmd(ch, SequenceCommandKind::Start)).unwrap();
     control.emit(&cmd(ch, SequenceCommandKind::Abort)).unwrap();
@@ -297,7 +297,7 @@ fn slot_stop_hard_drops_occupant() {
 
     // Load + Start + Stop: the hard-drop returns the slot to Loaded with the future gone.
     let ch = coord.channel_id("adcs").expect("adcs slot channel");
-    let mut control = coord.control_handle();
+    let mut control = coord.control_handle().expect("taken once per coordinator");
     control.emit(&load(ch, "waiter")).unwrap();
     control.emit(&cmd(ch, SequenceCommandKind::Start)).unwrap();
     control.emit(&cmd(ch, SequenceCommandKind::Stop)).unwrap();
@@ -353,7 +353,7 @@ fn slot_reset_reruns_from_start() {
     // selected occupant over the same rings) + Start, which the slot drains at the
     // head of cycle 4; cycles 4-6 reload and complete again.
     let ch = coord.channel_id("adcs").expect("adcs slot channel");
-    let mut control = coord.control_handle();
+    let mut control = coord.control_handle().expect("taken once per coordinator");
     control.emit(&load(ch, "waiter")).unwrap();
     control.emit(&cmd(ch, SequenceCommandKind::Start)).unwrap();
     let progress = coord.progress();
@@ -417,7 +417,7 @@ fn slot_emits_ordered_sequence_events_and_boot_registry() {
 
     let mut b = Coordinator::builder(sim_config());
     let _slot = b.add_slot("adcs", vec![("waiter".into(), loaded, Vec::new())], None);
-    let coord = b.build().expect("the slot graph builds");
+    let mut coord = b.build().expect("the slot graph builds");
 
     // Tap the slot's events channel + the coordinator's boot-registry channel BEFORE the
     // run — an overwrite ring starts at the live edge, so the taps must precede the emits.
@@ -436,7 +436,7 @@ fn slot_emits_ordered_sequence_events_and_boot_registry() {
 
     // Drive Load + Start (drained at cycle 0), run to the occupant's Completed.
     let ch = coord.channel_id("adcs").expect("adcs slot channel");
-    let mut control = coord.control_handle();
+    let mut control = coord.control_handle().expect("taken once per coordinator");
     control.emit(&load(ch, "waiter")).unwrap();
     control.emit(&cmd(ch, SequenceCommandKind::Start)).unwrap();
     let mut coord = coord;

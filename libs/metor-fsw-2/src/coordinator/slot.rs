@@ -560,5 +560,10 @@ impl CyclicSlot for SlotRunner {
 pub(crate) fn slot_writer<F: crate::Frame + IntoBytes + Immutable>(
     ring: &metor_fsw_ring::RingBuffer<metor_fsw_ring::BoxBacking>,
 ) -> Output<F> {
-    Output::new(ring.writer(NoWake, NoWake))
+    // Invariant: each control/command/status ring gets its single host writer
+    // minted exactly once at build, so the claim is always free here.
+    let writer = ring
+        .writer(NoWake, NoWake)
+        .expect("slot ring is bound to exactly one host writer at build");
+    Output::new(writer)
 }

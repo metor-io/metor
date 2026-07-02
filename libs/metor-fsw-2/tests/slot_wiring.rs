@@ -186,7 +186,7 @@ slot "adcs" {{
 
     // A typo'd panel/uplink Load, injected through the in-proc control handle.
     let ch = coord.channel_id("adcs").expect("adcs slot channel");
-    let mut control = coord.control_handle();
+    let mut control = coord.control_handle().expect("taken once per coordinator");
     control
         .emit(&SequenceCommand {
             channel_id: ch,
@@ -213,4 +213,141 @@ slot "adcs" {{
     assert!(failed.contains("waiter"), "lists the allowed set: {failed}");
 
     drop((coord, events_view, control));
+}
+
+// ---------------------------------------------------------------------------
+// B1 regression: slot `allow` occupant params resolve and run — in BOTH forms
+// (line properties and a child block), byte-identical to the typed
+// `WiringBuilder::allow_with_params` postcard bytes, and observably applied by
+// the running occupant (the seq-param-fixture republishes its configured gain).
+// ---------------------------------------------------------------------------
+
+/// The parametered seq fixture's cargo crate name + cdylib library stem.
+const PARAM_FIXTURE_CRATE: &str = "metor-fsw-2-seq-param-fixture";
+const PARAM_FIXTURE_STEM: &str = "metor_fsw_2_seq_param_fixture";
+
+/// Host-side mirror of the fixture's `GainerParams` (the typed builder path).
+#[derive(serde::Serialize)]
+struct GainerParams {
+    gain: f64,
+}
+
+/// Host-side mirror of the fixture's `gain_out` frame (byte-for-byte).
+#[derive(Frame, zerocopy::IntoBytes, zerocopy::Immutable, zerocopy::KnownLayout, zerocopy::FromBytes, Default)]
+#[repr(C)]
+#[metor_fsw(name = "gain_out")]
+struct GainOut {
+    #[metor_fsw(timestamp)]
+    timestamp: metor_fsw_2::metor_proto::types::Timestamp,
+    gain: f64,
+}
+
+/// A slot mission whose single allowed occupant carries params, spelled `allow_line`
+/// (properties) or as a child block.
+fn param_slot_kdl(allow_line: &str) -> String {
+    format!(
+        r#"
+coordinator cycle_rate=1000.0 sim_dt=0.000002
+artifact "gainer" crate="{PARAM_FIXTURE_CRATE}" lib="{PARAM_FIXTURE_STEM}" type="gainer"
+slot "gslot" {{
+    output frame="gain_out"
+    {allow_line}
+    initial occupant="gainer" state="running"
+}}
+"#
+    )
+}
+
+#[test]
+fn slot_allow_params_resolve_and_run_b1() {
+    use metor_fsw_2::{DlSystem, ParamSource, SlotInitState, WiringBuilder, encode_kdl_params};
+
+    // Both canonical forms of occupant params.
+    let line_form = param_slot_kdl(r#"allow occupant="gainer" gain=0.8"#);
+    let child_form = param_slot_kdl(r#"allow occupant="gainer" { gain 0.8 }"#);
+
+    let mut wiring = parse(&line_form).expect("parse the line-property allow params");
+    let child_wiring = parse(&child_form).expect("parse the child-block allow params");
+
+    // Both parse to carried KDL params (line properties were previously dropped —
+    // half of B1).
+    let carried = |w: &metor_fsw_2::Wiring| match &w.slots[0].allow[0].params {
+        ParamSource::Kdl(text) => text.clone(),
+        other => panic!("expected ParamSource::Kdl, got {other:?}"),
+    };
+    let line_text = carried(&wiring);
+    let child_text = carried(&child_wiring);
+
+    if let Err(e) = build_artifacts(&mut wiring, &BuildOptions::default()) {
+        eprintln!("skipping: build_artifacts failed: {e}");
+        return;
+    }
+    let so_path = wiring.artifacts[0].path.clone().expect("located fixture .so");
+
+    // (a) Byte equality: both KDL forms schema-encode to exactly the bytes the
+    // typed Rust `allow_with_params` carries (the one-postcard-encoding invariant).
+    let builder_wiring = WiringBuilder::new()
+        .coordinator(1000.0, metor_fsw_2::ClockSpec::Simulated { dt_secs: 0.000002 })
+        .artifact("gainer", PARAM_FIXTURE_CRATE, PARAM_FIXTURE_STEM, "gainer")
+        .slot("gslot")
+        .output("gain_out")
+        .allow_with_params("gainer", GainerParams { gain: 0.8 })
+        .initial("gainer", SlotInitState::Running)
+        .end()
+        .build();
+    let builder_bytes = match &builder_wiring.slots[0].allow[0].params {
+        ParamSource::Postcard(b) => b.clone(),
+        other => panic!("expected Postcard params from the builder, got {other:?}"),
+    };
+    let dl = DlSystem::open(&so_path).expect("open the fixture .so for its Params schema");
+    let encode = |text: &str| {
+        encode_kdl_params(text, dl.params_schema(), "gslot", &["occupant"], 0)
+            .expect("schema-encode the allow params")
+    };
+    assert_eq!(encode(&line_text), builder_bytes, "line-property form byte-matches");
+    assert_eq!(encode(&child_text), builder_bytes, "child-block form byte-matches");
+    drop(dl);
+
+    // (b) End to end: the resolved slot runs and the occupant publishes the
+    // params-derived gain on its user output.
+    let mut coord = resolve(&wiring, &Registry::new()).expect("resolve the parametered slot");
+    let mut gain_view: Input<GainOut> = Input::new(
+        coord
+            .registry()
+            .view(ComponentId::new("gslot.gain_out"))
+            .expect("the slot's user output is registered")
+            .expect("a reader slot is available"),
+    );
+    let coord = stellarator::run(|| async move {
+        coord.run_for(6).await;
+        coord
+    });
+    let out = gain_view
+        .latest()
+        .expect("no lap on the gain tap")
+        .expect("the occupant published its configured gain");
+    assert_eq!(out.get().gain, 0.8, "allow params reached the running occupant");
+    assert!(coord.stopped().is_empty(), "Done is not a hard-stop");
+
+    drop((coord, gain_view));
+}
+
+#[test]
+fn slot_allow_unknown_param_is_a_clean_error() {
+    // A typo'd allow param is a spanned UnknownParam at resolve (the schema pass),
+    // naming the property — not a silent drop.
+    let kdl = param_slot_kdl(r#"allow occupant="gainer" gian=0.8"#);
+    let mut wiring = parse(&kdl).expect("parse the typo'd allow params");
+    if let Err(e) = build_artifacts(&mut wiring, &BuildOptions::default()) {
+        eprintln!("skipping: build_artifacts failed: {e}");
+        return;
+    }
+    let err = match resolve(&wiring, &Registry::new()) {
+        Ok(_) => panic!("expected an UnknownParam error"),
+        Err(e) => e,
+    };
+    assert!(
+        matches!(err, LoadError::UnknownParam { ref property, .. } if property == "gian"),
+        "{err:?}"
+    );
 }

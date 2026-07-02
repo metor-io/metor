@@ -90,9 +90,15 @@ a single equality check on attach rejects an incompatible producer
 |--------|------|-------------|-------------------|-------|
 | `0x40` | 8    | `AtomicU64` | `committed`       | absolute bytes published; Release by the writer, Acquire by readers |
 | `0x48` | 8    | `AtomicU64` | `high_water_mark` | absolute end of valid data before a pending wrap gap; `HWM_NONE = u64::MAX` means no gap |
-| `0x50` | 8    | `AtomicU64` | `reserved_end`    | writer-private; reserved for attacher recovery, unused by the live paths |
+| `0x50` | 8    | `AtomicU64` | `reserved_end`    | seqlock write reservation: the absolute end of the record the writer has *started* writing, stored (with a Release fence) before any data byte; `committed <= reserved_end` at every instant (§4/§5) |
 | `0x58` | 8    | `AtomicU64` | `wake_word`       | reserved for a future cross-process futex/eventfd |
-| `0x60` | 32   | —           | pad               | to the next cache line |
+| `0x60` | 8    | `AtomicU64` | `writer_claim`    | single-writer enforcement: `0` = free, `1` = a live `Writer` exists (§4) |
+| `0x68` | 24   | —           | pad               | to the next cache line |
+
+> **Pre-1.0 layout note.** `reserved_end` going live and `writer_claim` being
+> added changed the control block's meaning **without a `version` bump** —
+> regions are ephemeral IPC state, not archives, so stale dev regions are simply
+> recreated. Post-1.0, any such change bumps `version`.
 
 `committed`, `high_water_mark`, and the wrap-gap mechanism are semantically
 identical to the disruptor's `WriteHead`. There is **no** in-region mutex: there
@@ -168,7 +174,16 @@ The oldest byte still intact is `committed - capacity`; while `r >= committed -
 capacity` (equivalently `committed - r <= capacity`) the bytes at `r`'s physical
 slot have not yet been overwritten. Wrap-gap bytes consume absolute cursor space
 just like real bytes (the writer advances `committed` across them), so the test
-is correct in the presence of gaps.
+is correct in the presence of gaps — with one refinement: a cursor parked
+**exactly on a gap start** (`r == high_water_mark`) effectively sits at the next
+lap boundary (`(r & !mask) + capacity`), because the gap bytes were never data.
+`is_lapped()` and `locate()` both evaluate the lap at that effective cursor;
+testing at `r` itself would spuriously hard-stop a reader whose next real record
+is intact. `is_lapped()` additionally tests against `reserved_end` rather than
+`committed`, so an *in-flight* overwrite of the reader's next bytes already
+reads as lapped (one lap definition crate-wide with the read path's recheck,
+§5), and a caught-up reader (`r_eff >= committed`) is never lapped — it has no
+unread bytes to lose.
 
 **Worked example** (`capacity = 64`, 16-byte payloads → 24-byte records: 8-byte
 header + 16-byte payload, already a multiple of 8 so no tail pad):
@@ -190,9 +205,17 @@ header + 16-byte payload, already a multiple of 8 so no tail pad):
 
 ## 4. Write path
 
-There is exactly one writer per buffer (each system owns its output buffer), so
-the writer is the sole mutator of `committed` and `high_water_mark` and reads
-`committed` Relaxed. `Writer::try_write(bytes)`:
+There is exactly one writer per buffer (each system owns its output buffer), and
+the ring **enforces** it: `RingBuffer::writer()` CAS-claims the in-region
+`writer_claim` word (`0 → 1`, Acquire success / Relaxed failure) and returns
+`Err(WriterClaimed)` if a live writer already exists — the claim lives in the
+region, so enforcement is cross-handle and cross-process. `Writer::drop` frees
+the claim with a Release store, handing the whole region state to the next
+claimer's Acquire CAS. A crashed process leaks its claim; the supervising host
+reclaims it with the `unsafe fn force_release_writer()` escape hatch (it must
+assert the claiming writer is truly gone). The writer is the sole mutator of
+`committed`, `high_water_mark`, and `reserved_end`, and reads `committed`
+Relaxed. `Writer::try_write(bytes)`:
 
 1. `rec = frame_len(bytes.len())`. If `rec > capacity` →
    `Err(WriteError::InsufficientCapacity)`.
@@ -201,11 +224,18 @@ the writer is the sole mutator of `committed` and `high_water_mark` and reads
    multiple of 8) and `start_abs = c + gap`, else `gap = 0` and `start_abs = c`.
 3. **Mode branch.** In `Lossless` mode, check `fits(c, gap + rec)`: with `slowest
    = slowest_active_cursor()` (the min cursor over non-free slots, or `c` if no
-   readers), the write fits iff `c.wrapping_sub(slowest) + gap + rec <=
-   capacity`. If it does not → `Err(WriteError::WouldBlock)`. In `Overwrite` mode
-   there is **no** in-use check — the writer proceeds regardless of reader
-   cursors (the key divergence from the disruptor's `try_grant`).
+   readers; the scan opens with a `SeqCst` fence — see §7), the write fits iff
+   `c.wrapping_sub(slowest) + gap + rec <= capacity`. If it does not →
+   `Err(WriteError::WouldBlock)`. In `Overwrite` mode there is **no** in-use
+   check — the writer proceeds regardless of reader cursors (the key divergence
+   from the disruptor's `try_grant`).
 4. **Commit** (`commit(c, start_abs, gap, bytes)`):
+   - **Seqlock begin:** `reserved_end.store(start_abs + rec, Relaxed)`, then
+     `fence(Release)` — the reservation is published *before* any data byte is
+     touched, in both modes. (A Release *store* would not be enough: it orders
+     prior accesses, not the subsequent relaxed data stores; the fence-to-fence
+     pairing with the reader's Acquire fence is what closes the torn-read
+     window, §5.)
    - Write the record header + payload at `phys' = start_abs & mask`
      (`write_record`, mode-specific — see §6).
    - If `gap > 0`, store `high_water_mark = c` (Release) so readers skip the gap.
@@ -226,19 +256,37 @@ wait-free with respect to readers; the only failure is an over-capacity message.
 A `View` owns one reader-table slot (its index lives in the process-local
 handle) and reads whole records. `locate()` finds the next readable record:
 
-1. `r = slot.cursor` (Acquire), `c = committed` (Acquire).
-2. **(Overwrite only) pre-check lap:** if `c.wrapping_sub(r) > capacity` →
-   `Err(Lapped)`.
-3. If `r >= c` → `Ok(None)` (caught up).
-4. **Skip gap:** if `r == high_water_mark`, store the cursor forward to the next
-   lap boundary `(r & !mask) + capacity` (Release), notify the space sink, and
-   retry from step 1.
-5. Read `len` from the record header at `phys = r & mask` (`read_len`).
-6. **(Overwrite only) straddle guard:** a real record never straddles the wrap,
-   so if `phys + rec > capacity` the header was being overwritten by a lapping
-   writer → `Err(Lapped)` (rather than copying out-of-bounds garbage; this also
-   keeps the subsequent payload copy in-bounds).
-7. Return the located record (`r`, `phys`, `len`, `rec`).
+1. `r = slot.cursor` (Acquire), `c = committed` (Acquire), then `hwm =
+   high_water_mark` (Acquire). The load order is load-bearing: seeing a
+   post-wrap `committed` implies seeing that wrap's `hwm` store (it is
+   sequenced before the `committed` Release), so a reader whose next bytes are
+   a gap always sees the marker before it could misread stale gap bytes as a
+   record header.
+2. **Skip gap:** if `r == hwm`, store the cursor forward to the next lap
+   boundary `(r & !mask) + capacity` (Release), notify the space sink, and
+   retry from step 1. This runs *before* the lap test — a cursor parked on a
+   gap start is effectively at the lap boundary (§3), and testing the lap at
+   `r` would spuriously hard-stop it. The skip never accepts data; the next
+   iteration re-runs the lap test at the boundary, so a real lap is still
+   caught.
+3. If `r >= c` → `Ok(None)` (caught up). Checked before the lap test because
+   the gap skip can transiently park the cursor ahead of `committed`.
+4. **(Overwrite only) pre-check lap:** if `c.wrapping_sub(r) > capacity` →
+   `Err(Lapped)` (fast-path filter; the post-copy recheck is the authority).
+5. Read `len` from the record header at `phys = r & mask` (`read_len` returns
+   the raw `u32` widened to `u64` — under a lap race it can be arbitrary
+   payload bytes).
+6. **Straddle/length guard, both modes, u64 math:** if `len > capacity - 8 -
+   phys` (the `phys + rec > capacity` predicate rewritten overflow-free), the
+   length field is not a real record's. On an overwrite buffer a lapping
+   writer was rewriting the header → `Err(Lapped)`; on a lossless buffer no
+   lap can explain it → `Err(Corrupt)` (external corruption of the shared
+   region — degrade to an error, never an out-of-bounds borrow). Validating in
+   `u64` *before* any `usize` conversion matters on 32-bit targets, where
+   `frame_len(garbage)` would wrap `usize` and defeat the check itself.
+7. Return the located record (`r`, `phys`, `len`, `rec`) — every offset now
+   proven in-bounds, so the downstream copy/borrow is bounded even under a
+   concurrently scribbled length.
 
 The read-soundness contract from here depends on the mode, and this is the crux
 of the writer-policy design.
@@ -252,30 +300,42 @@ reader advances. `View::try_read()` therefore returns a `ReadGrant` borrowing th
 payload in place (zero copy); dropping the grant advances the cursor and notifies
 the writer. `is_lapped` can never be true here.
 
-**Overwrite buffers: the writer races the reader, so copy + recheck.** The writer
-may begin overwriting a record while the reader reads it, so a borrow is unsound
-(`try_read` returns `Err(BorrowNotSupported)`). `View::try_read_into(buf)` instead
-**copies the payload out** with race-tolerant relaxed atomic byte loads — the
-bytes are a genuine concurrent read/write, not a plain `&[u8]` load — and then
-**post-validates**: re-load `committed` (Acquire); if `c2.wrapping_sub(r) >
-capacity` the writer lapped this view *during* the copy and the snapshot may be
-torn → `Err(Lapped)`, do not advance. Otherwise the copy is a consistent snapshot
-and the cursor advances (Release) past `rec`. This is a seqlock-style whole-buffer
-recheck: a single forward-only writer never rewrites the *same* absolute slot
-within a lap, so re-checking the lap condition is sufficient — no per-record
-version word is needed.
+**Overwrite buffers: the writer races the reader, so copy + seqlock recheck.**
+The writer may begin overwriting a record while the reader reads it, so a borrow
+is unsound (`try_read` returns `Err(BorrowNotSupported)`). `View::try_read_into
+(buf)` instead **copies the payload out** with race-tolerant relaxed atomic byte
+loads — the bytes are a genuine concurrent read/write, not a plain `&[u8]` load —
+and then **post-validates** against the write reservation: `fence(Acquire)`, then
+load `reserved_end` (Relaxed; the fence carries the ordering). If
+`reserved_end.wrapping_sub(r) > capacity`, a write that could have touched this
+record's bytes was in flight during the copy → `Err(Lapped)`, do not advance.
+The fence pairs with the writer's Release fence between its reservation store
+and its data stores: if any relaxed payload load read a byte from an overlapping
+write, that write's reservation (which exceeds `r + capacity`) is visible to the
+recheck — so a passing recheck proves no copied byte came from an overlapping
+write. Rechecking `committed` would **not** suffice: the writer scribbles data
+bytes *before* its `committed` Release store, so a writer exactly one lap ahead
+could tear the copy while `committed` still passes. (Tear-*old* is excluded by
+`locate`'s Acquire on `committed`.) At steady state `reserved_end == committed`,
+so an up-to-date reader never sees a spurious `Lapped`; a reservation-triggered
+`Lapped` on an intact record means "about to be overwritten" — indistinguishable
+from a lap one instruction later. Otherwise the copy is a consistent snapshot
+and the cursor advances (Release) past `rec`. A single forward-only writer never
+rewrites the *same* absolute slot within a lap, so this whole-buffer check is
+sufficient — no per-record version word is needed.
 
 `try_read_into` works on both kinds of buffer and is always safe: on a lossless
 buffer the copy is a plain `copy_nonoverlapping` and the post-validate is skipped
 entirely (it never fires). `View::read_into(buf)` is the async form — it loops
 `try_read_into`, awaiting the **data-available** sink between attempts.
 
-`is_lapped()` is the standalone lap check (`committed - cursor > capacity`,
-always `false` on a lossless buffer) and is what the coordinator calls before
-invoking a cyclic system. `cursor()` / `committed()` accessors let the
-coordinator or a monitor inspect lag without performing a read. `resync()` stores
-the cursor forward to the current `committed` (Release), abandoning unread
-(possibly lapped) data — the recovery after `Err(Lapped)`.
+`is_lapped()` is the standalone lap check (`reserved_end - r_eff > capacity`
+with the gap-start effective cursor and caught-up short-circuit of §3; always
+`false` on a lossless buffer) and is what the coordinator calls before invoking
+a cyclic system. `cursor()` / `committed()` accessors let the coordinator or a
+monitor inspect lag without performing a read. `resync()` stores the cursor
+forward to the current `committed` (Release), abandoning unread (possibly
+lapped) data — the recovery after `Err(Lapped)`.
 
 ## 6. The byte-by-byte atomic copy
 
@@ -312,10 +372,28 @@ only the disruptor's *slot-reuse-by-CAS* idea over a flat array:
 - **`RingBuffer::view(data, space)`:** Acquire-load `committed` as the start
   cursor (so a fresh view only sees data committed from now on, never older
   possibly-lapped data — same rule as `Disruptor::reader`). Scan slots
-  `0..max_readers`, CAS each `cursor` from `FREE_SLOT` to `start` (Acquire
-  success, Relaxed failure). On success, bump `epoch` (`fetch_add(1, Release)`)
-  and return a `View` holding that slot index. If no slot is free →
-  `Err(FullReaderTable)`.
+  `0..max_readers`, CAS each `cursor` from `FREE_SLOT` to `start` (AcqRel
+  success — Acquire pairs with `View::drop`'s Release for the slot-state
+  handoff, Release publishes the claim; Relaxed failure). On success, bump
+  `epoch` (`fetch_add(1, Release)`) and return a `View` holding that slot
+  index. If no slot is free → `Err(FullReaderTable)`.
+- **Lossless registration handshake.** On a lossless buffer, the fresh claim
+  must be *provably visible* to the writer's `fits()` scan before the view is
+  returned, or the writer could lap the new cursor and invalidate a later
+  borrow. Release/Acquire alone cannot prove it — reader
+  (`store cursor; load committed`) vs. writer (`store committed; load cursor`)
+  is Dekker's pattern, where both sides may read the older values. So `view()`
+  loops: `fence(SeqCst)`, re-load `committed`; if it moved, advance the claim
+  to the new edge (a semantic no-op for a fresh view) and repeat, until
+  `committed` is *stable* across the fence. The pairing `fence(SeqCst)` sits at
+  the top of `slowest_active_cursor()`: in the fence total order, either the
+  writer's scan is later and must observe the claim, or the reader's recheck is
+  later and must observe that writer's `committed` — a stable `committed`
+  therefore proves every unseen write was bounded by some other cursor at or
+  below ours. The loop converges in 1–2 iterations (each extra one needs a
+  commit inside a ~3-instruction window) and is deliberately unbounded —
+  registration is a cold path. Overwrite mode skips the handshake: its reads
+  self-validate via the seqlock recheck (§5).
 - **`View::drop`:** `cursor.store(FREE_SLOT, Release)` — a single wait-free store
   that frees the slot for reuse.
 - **`RingBuffer::reader_count()`** scans the table for non-free cursors.
@@ -405,7 +483,10 @@ impl<B: Backing> RingBuffer<B> {
     pub fn overrun(&self) -> Overrun;
     pub fn committed(&self) -> u64;
     pub fn reader_count(&self) -> usize;
-    pub fn writer<WD: WakeSource, WS: WakeSink>(&self, data: WD, space: WS) -> Writer<B, WD, WS>;
+    pub fn writer<WD: WakeSource, WS: WakeSink>(&self, data: WD, space: WS)
+        -> Result<Writer<B, WD, WS>, WriterClaimed>;   // claims the in-region writer word
+    /// # Safety: the claiming writer no longer exists (crashed/leaked).
+    pub unsafe fn force_release_writer(&self);
     pub fn view<RD: WakeSink, RS: WakeSource>(&self, data: RD, space: RS)
         -> Result<View<B, RD, RS>, FullReaderTable>;
 }
@@ -426,16 +507,26 @@ impl<B, RD: WakeSink, RS: WakeSource> View<B, RD, RS> {
 }
 
 pub enum WriteError  { InsufficientCapacity, WouldBlock }
-pub enum ReadError   { Lapped, BorrowNotSupported }
-pub enum AttachError { BadMagic, BadVersion, ArchMismatch }
+pub enum ReadError   { Lapped, BorrowNotSupported, Corrupt }
+pub enum AttachError {
+    BadMagic, BadVersion, ArchMismatch,
+    TooSmall,        // region shorter than the fixed header
+    Misaligned,      // attach_raw base not 8-byte aligned
+    BadGeometry,     // header fields internally inconsistent (§10)
+    RegionTruncated, // header self-consistent but total_size exceeds the backing
+}
 pub struct FullReaderTable;
+pub struct WriterClaimed;
 ```
 
 `try_read_into` returns `Ok(true)` (a record was read), `Ok(false)` (caught up),
-or `Err(Lapped)` (overwrite buffers only). `try_read` returns `ReadGrant` only on
-a lossless buffer (`Err(BorrowNotSupported)` otherwise); the grant derefs to the
-payload bytes and advances the cursor on drop. `create_in_memory` / `create_mmap`
-panic if `capacity` is not a non-zero power of two or `max_readers` is zero.
+`Err(Lapped)` (overwrite buffers only), or `Err(Corrupt)` (lossless buffers whose
+region violated a structural invariant — unreachable from the crate's own
+behavior, reachable only via external corruption of a shared mapping). `try_read`
+returns `ReadGrant` only on a lossless buffer (`Err(BorrowNotSupported)`
+otherwise); the grant derefs to the payload bytes and advances the cursor on
+drop. `create_in_memory` / `create_mmap` panic if `capacity` is not a non-zero
+power of two or `max_readers` is zero.
 
 ## 10. Backing storage
 
@@ -459,11 +550,32 @@ wide.
 
 `create_*` lays out the region (`init_region`) and writes the header
 single-threaded before any handle is published. `attach_mmap` / `attach_raw`
-validate the header (`read_header`: magic, version, `arch_tag`) and read the
-geometry back out of the region rather than from arguments (`from_validated`),
-returning `AttachError` on mismatch. `attach_raw` additionally rejects a region
-smaller than `HEADER_SIZE` before any header read, so the validation loads stay
-in-bounds.
+validate the header (`read_header`) and read the geometry back out of the region
+rather than from arguments (`from_validated`), returning `AttachError` on
+mismatch. Validation is exhaustive, in checked `u64` arithmetic so a hostile
+header cannot overflow its way past a bound:
+
+1. `region_len >= HEADER_SIZE` → `TooSmall` (shared path, so a sub-header mmap
+   of a truncated file is rejected before any header read).
+2. `attach_raw` base pointer 8-byte aligned → `Misaligned` (mmap/Box backings
+   are aligned by construction).
+3. Magic / version / `arch_tag` → `BadMagic` / `BadVersion` / `ArchMismatch`.
+4. `capacity` a power of two, `>= 8` (one record header — `read_len`'s bounds
+   contract), and `<= usize::MAX` (a 32-bit target attaching a 64-bit-sized
+   region) → `BadGeometry`.
+5. `max_readers > 0` → `BadGeometry`.
+6. Reader table in bounds: `>= HEADER_SIZE`, 8-aligned, ending at or before
+   `data_offset` (checked mul/add) → `BadGeometry`.
+7. Data region in bounds: `data_offset` 8-aligned, `data_offset + capacity <=
+   total_size` (checked add) → `BadGeometry`.
+8. `total_size <= region_len` → `RegionTruncated` (its own variant — the
+   truncated-on-disk file is the diagnosable real-world failure).
+
+After a successful attach, every offset the ring ever dereferences — control
+words, all reader slots, `data_offset + phys` for `phys < capacity` — is inside
+`[0, region_len)` and 8-aligned: attach restores the same geometry invariant
+`layout()` + `init_region` establish at creation, which is what the `SAFETY`
+comments on `atomic_u64`/`data_ptr` assume.
 
 ## 11. Memory ordering & Miri
 
@@ -472,25 +584,47 @@ The synchronization discipline, summarized:
 - **Publication.** The writer publishes with a Release store to `committed`;
   readers Acquire-load `committed` before touching any data byte. The
   `high_water_mark` Release store is ordered before that same `committed` Release,
-  so a reader that observes the new `committed` also observes the gap boundary.
+  so a reader that observes the new `committed` also observes the gap boundary
+  (readers therefore load `hwm` *after* `committed` — §5).
+- **Seqlock reservation (overwrite reads).** The writer stores `reserved_end`
+  (Relaxed) and issues a `fence(Release)` before any data store; the reader
+  issues a `fence(Acquire)` after its payload loads and rechecks `reserved_end`
+  (Relaxed). Per the C++ fence rules, if any payload load read an overlapping
+  write's byte, that write's reservation is visible to the recheck — a passing
+  recheck proves a tear-free snapshot (§5).
 - **Lossless mode is race-free** exactly like the disruptor: the in-use check
   keeps the writer off in-flight bytes, so the plain (non-atomic) record stores
-  and reads are ordered solely by the `committed` handshake. Borrows are sound.
+  and reads are ordered solely by the `committed` handshake. Borrows are sound —
+  *given* the registration handshake below.
 - **Overwrite mode has a defined data race** on the data bytes: both writer and
-  reader use relaxed atomics (§6), and the post-copy whole-buffer lap recheck
-  discards any snapshot the writer overwrote mid-read. No undefined behavior, no
-  torn record ever escapes to the caller.
-- **Reader registration** claims a slot with a CAS (Acquire on success) and frees
-  it with a Release store; `slowest_active_cursor` Acquire-loads each slot.
+  reader use relaxed atomics (§6), and the post-copy seqlock recheck discards
+  any snapshot an overlapping write could have touched. No undefined behavior,
+  no torn record ever escapes to the caller.
+- **Reader registration** claims a slot with a CAS (AcqRel on success) and frees
+  it with a Release store; `slowest_active_cursor` Acquire-loads each slot. On a
+  lossless buffer, registration additionally runs the `SeqCst` fence handshake
+  against the writer's cursor scan (§7) — Dekker's pattern needs the fences'
+  total order; Release/Acquire alone admits the both-sides-stale outcome.
+- **Writer claim.** `writer()` CAS (Acquire success / Relaxed failure) pairs
+  with `Writer::drop`'s Release store, handing the region state from one writer
+  to its successor.
 
 The unsafe core follows the `libs/db` Miri strategy (`libs/db/MIRI.md`;
 mirrored in this crate's `MIRI.md`): the synchronous tests use only the `try_*`
 APIs over a `BoxBacking` (`UnsafeCell`) with `std::thread`, and pass under Miri
-including Tree Borrows and many-seeds interleavings. `concurrent_overwrite_no_ub`
-is the overwrite race coverage (writer/reader race the same bytes via relaxed
-atomics + lap recheck; every non-lapped record parses as a value the writer
-actually wrote); `concurrent_lossless_full_stream` exercises the lossless
-zero-loss path; `concurrent_reader_churn` stresses the slot CAS/free.
+including Tree Borrows, many-seeds interleavings, and a 32-bit
+(`i686-unknown-linux-gnu`) target run that executes the R3 length-overflow
+path. `concurrent_overwrite_no_ub` is the overwrite race coverage (writer/reader
+race the same bytes via relaxed atomics + the seqlock recheck; the payload is
+the record index encoded twice, so a torn old/new mix is detected, not just a
+garbage value); `concurrent_lossless_full_stream` exercises the lossless
+zero-loss path; `concurrent_lossless_view_churn` hammers the registration
+handshake under a live writer; `concurrent_reader_churn` /
+`concurrent_writer_claim_churn` stress the slot and writer-claim CAS. The
+deterministic seqlock/gap/corruption windows are hand-driven single-threaded
+tests (`torn_read_rejected_by_reservation`, `reader_on_gap_start_*`,
+`garbage_length_bounded`, `lossless_garbage_length_is_corrupt`) — see `MIRI.md`
+for what runs under Miri and why.
 
 ## 12. Differences from the db disruptor
 
@@ -504,7 +638,7 @@ zero-loss path; `concurrent_reader_churn` stresses the slot CAS/free.
 | Backing | `Box<[UnsafeCell<u8>]>` only | `Backing` trait: `Box`, `mmap`, or borrowed `Raw` |
 | Cross-process | No | Yes (single mapped region, same layout both sides) |
 | Record framing | caller's responsibility | `[len u32][pad u32][payload][tail pad]`, 8-byte aligned |
-| Writer serialization | In-region `Mutex` (`write_lock`) | None (single writer; no in-region lock) |
+| Writer serialization | In-region `Mutex` (`write_lock`) | Single writer, enforced by the in-region `writer_claim` CAS (no lock) |
 | Wake mechanism | `WaitQueue` baked into the core | `WakeSource`/`WakeSink` traits, out of the shared region |
 | Carried over | — | Absolute cursors, `committed` Release/Acquire, `high_water_mark` wrap gap, slot-reuse-by-CAS |
 
@@ -534,7 +668,14 @@ layout change:
   reader polls `try_read_into` until one is built.
 - **Crash-slot reclamation.** A reader that crashes leaks its claimed slot.
   Callers over-provision `max_readers`. The `epoch` word and a future
-  owner-pid/liveness sweep remain available as the reclamation hook.
+  owner-pid/liveness sweep remain available as the reclamation hook. (If ever
+  implemented, the reclaimer must bump `epoch` *before* freeing the cursor, and
+  cursor stores through a `View` must become epoch-checked — a plain Release
+  store on a reclaimed slot would corrupt the new owner's cursor.) A crashed
+  **writer** likewise leaks the `writer_claim` word; `force_release_writer` is
+  the supervised escape hatch until real cross-process liveness exists.
 - **Writer-death recovery.** `committed` gates readers off uncommitted bytes, so
-  a dead writer simply stalls the stream; the `reserved_end` control word is the
-  hook for an attaching replacement writer to resume.
+  a dead writer simply stalls the stream. `reserved_end` (now live as the
+  seqlock reservation, §4) doubles as the recovery hook: a replacement writer
+  (after `force_release_writer`) can see how far the dead one had reserved and
+  resume past it.

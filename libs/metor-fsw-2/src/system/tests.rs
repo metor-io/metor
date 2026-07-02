@@ -146,19 +146,19 @@ fn cyclic_filter_end_to_end() {
     let log_ring = overwrite_ring::<SystemLog>(8, 1);
 
     // Upstream producer + downstream consumer, both built by hand.
-    let mut imu_w = Output::<Imu>::new(imu_ring.writer(NoWake, NoWake));
+    let mut imu_w = Output::<Imu>::new(imu_ring.writer(NoWake, NoWake).unwrap());
     let mut nav_in = Input::<NavEstimate>::new(nav_ring.view(NoWake, NoWake).unwrap());
 
     let input = FilterIn {
         imu: Input::new(imu_ring.view(NoWake, NoWake).unwrap()),
     };
     let health = HealthPort::new(
-        Output::new(health_ring.writer(NoWake, NoWake)),
-        Output::new(log_ring.writer(NoWake, NoWake)),
+        Output::new(health_ring.writer(NoWake, NoWake).unwrap()),
+        Output::new(log_ring.writer(NoWake, NoWake).unwrap()),
     );
     let output = Out::new(
         FilterOut {
-            nav: Output::new(nav_ring.writer(NoWake, NoWake)),
+            nav: Output::new(nav_ring.writer(NoWake, NoWake).unwrap()),
         },
         health,
     );
@@ -196,7 +196,7 @@ fn cyclic_input_lap_is_observable() {
     let input = FilterIn {
         imu: Input::new(imu_ring.view(NoWake, NoWake).unwrap()),
     };
-    let mut w = imu_ring.writer(NoWake, NoWake);
+    let mut w = imu_ring.writer(NoWake, NoWake).unwrap();
 
     assert!(!input.imu.is_lapped());
     assert!(!input.any_lapped());
@@ -293,12 +293,12 @@ fn health_counters_published() {
         imu: Input::new(imu_ring.view(NoWake, NoWake).unwrap()),
     };
     let health = HealthPort::new(
-        Output::new(health_ring.writer(NoWake, NoWake)),
-        Output::new(log_ring.writer(NoWake, NoWake)),
+        Output::new(health_ring.writer(NoWake, NoWake).unwrap()),
+        Output::new(log_ring.writer(NoWake, NoWake).unwrap()),
     );
     let output = Out::new(
         FilterOut {
-            nav: Output::new(nav_ring.writer(NoWake, NoWake)),
+            nav: Output::new(nav_ring.writer(NoWake, NoWake).unwrap()),
         },
         health,
     );
@@ -386,12 +386,12 @@ async fn async_filter_one_cycle() {
     };
     let mut nav_in = Input::<NavEstimate>::new(nav_ring.view(NoWake, NoWake).unwrap());
     let health = HealthPort::new(
-        Output::new(health_ring.writer(Notifier::default(), Notifier::default())),
-        Output::new(log_ring.writer(Notifier::default(), Notifier::default())),
+        Output::new(health_ring.writer(Notifier::default(), Notifier::default()).unwrap()),
+        Output::new(log_ring.writer(Notifier::default(), Notifier::default()).unwrap()),
     );
     let mut output = Out::new(
         AsyncOut {
-            nav: Output::new(nav_ring.writer(nav_data.clone(), nav_space.clone())),
+            nav: Output::new(nav_ring.writer(nav_data.clone(), nav_space.clone()).unwrap()),
         },
         health,
     );
@@ -402,7 +402,7 @@ async fn async_filter_one_cycle() {
         let imu_data = imu_data.clone();
         let imu_space = imu_space.clone();
         stellarator::spawn(async move {
-            let mut w = imu_ring.writer(imu_data, imu_space);
+            let mut w = imu_ring.writer(imu_data, imu_space).unwrap();
             w.write(
                 Imu {
                     timestamp: Timestamp(7),

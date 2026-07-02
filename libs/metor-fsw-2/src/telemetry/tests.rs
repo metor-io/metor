@@ -443,27 +443,35 @@ async fn message_downlink_fifo_no_coalesce() {
     // Claim the tap before any write (an overwrite-ring view starts at the live edge).
     let mut view = entry.view().expect("reader slot");
     // Typed ports — a heterogeneous channel is N ports now (`docs/message-wiring.md` §2.1);
-    // both writers share the ring so the tap drains one interleaved stream.
-    let mut cmd_out: MsgOut<SequenceCommand> = MsgOut::new(ring.writer(NoWake, NoWake));
-    let mut reg_out: MsgOut<SequenceRegistry> = MsgOut::new(ring.writer(NoWake, NoWake));
-
+    // the ring enforces a single live writer, so the ports take it in turn (each drop
+    // frees the claim) and the tap drains one interleaved stream.
     // An event/command *log* of three records — two of one Msg type, one of another,
     // interleaved. A snapshot would coalesce the two `SequenceCommand`s; a log must not.
-    cmd_out
-        .emit(&SequenceCommand {
-            channel_id: 0,
-            command: SequenceCommandKind::Start,
-        })
-        .expect("emit start");
-    reg_out
-        .emit(&SequenceRegistry {
-            channels: vec![SequenceChannelSpec {
-                id: 0,
-                name: "mode".to_string(),
-                available: vec!["commissioning".to_string()],
-            }],
-        })
-        .expect("emit registry");
+    {
+        let mut cmd_out: MsgOut<SequenceCommand> =
+            MsgOut::new(ring.writer(NoWake, NoWake).expect("first writer"));
+        cmd_out
+            .emit(&SequenceCommand {
+                channel_id: 0,
+                command: SequenceCommandKind::Start,
+            })
+            .expect("emit start");
+    }
+    {
+        let mut reg_out: MsgOut<SequenceRegistry> =
+            MsgOut::new(ring.writer(NoWake, NoWake).expect("claim freed on drop"));
+        reg_out
+            .emit(&SequenceRegistry {
+                channels: vec![SequenceChannelSpec {
+                    id: 0,
+                    name: "mode".to_string(),
+                    available: vec!["commissioning".to_string()],
+                }],
+            })
+            .expect("emit registry");
+    }
+    let mut cmd_out: MsgOut<SequenceCommand> =
+        MsgOut::new(ring.writer(NoWake, NoWake).expect("claim freed on drop"));
     cmd_out
         .emit(&SequenceCommand {
             channel_id: 7,
