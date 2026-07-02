@@ -22,7 +22,7 @@ use std::process::Command;
 use metor_fsw_2::metor_proto::types::{ComponentId, Timestamp};
 use metor_fsw_2::{
     ClockMode, Coordinator, CoordinatorConfig, CyclicSystem, DlSystem, Frame, Input, Out, Output,
-    PortRef, System, SystemInput, SystemKind, SystemOutput,
+    PortRef, StopReason, System, SystemInput, SystemKind, SystemOutput,
 };
 use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
 
@@ -222,4 +222,56 @@ fn dlopen_cyclic_system_end_to_end() {
     //    No crash here is the teardown-ordering assertion.
     drop(coord);
     drop(out_view);
+}
+
+/// R5 (review-findings.md): a `fsw_create` that fails (here, params that don't
+/// postcard-decode as `CounterParams`, so `run_create`'s `catch_unwind` returns null
+/// per the fixture's real `.so`) must not leave the slot looking permanently
+/// `Running`. It must surface through the coordinator's stopped-systems telemetry
+/// from the very first cycle, exactly like a lapped input or an in-cycle panic would.
+#[test]
+fn dlopen_null_create_reports_stopped() {
+    let Some(lib_path) = locate_fixture() else {
+        // Build plumbing unavailable: skip (tests_abi covers the loader logic in-binary).
+        return;
+    };
+
+    let loaded = DlSystem::open(&lib_path).expect("DlSystem::open the fixture .so");
+
+    // Deliberately malformed: `CounterParams` is `{ start: u64, scale: f64 }`; three
+    // bytes cannot postcard-decode as either field, so the fixture's `fsw_create`
+    // panics inside its own `catch_unwind` and returns a null state (never a crash
+    // across the `extern "C"` boundary — see `abi_panic_is_contained` for the direct
+    // in-binary version of that containment guarantee).
+    let bad_params = vec![0xFF, 0xFF, 0xFF];
+    let mut b = Coordinator::builder(CoordinatorConfig {
+        cycle_rate: 200.0,
+        default_depth: 8,
+        clock: ClockMode::Simulated {
+            dt: std::time::Duration::from_millis(5),
+        },
+    });
+    let ticker = b.add_cyclic_named("ticker", Ticker { n: 0 });
+    let counter = b.add_dl_cyclic("dl_counter", loaded, bad_params);
+    b.connect(PortRef::new::<TickIn>(ticker), PortRef::new::<TickIn>(counter))
+        .expect("compatible tick_in edge validated");
+
+    // `build()` itself calls `fsw_create` (`into_slot`, at bind time) — the null state
+    // is latched into the slot right there, before any cycle runs.
+    let mut coord = b.build().expect("graph builds even though fsw_create failed inside it");
+
+    let coord = stellarator::run(|| async move {
+        coord.run_for(3).await;
+        coord
+    });
+
+    // The zombie-slot bug (pre-fix): a null-state `DlSlot::step` early-returns without
+    // touching `slot_state`, which defaulted to `Running`, so `stopped()` would stay
+    // empty forever. Fixed: `make_slot` latches `Stopped(Panicked)` up front.
+    let stopped = coord.stopped();
+    assert_eq!(stopped.len(), 1, "the failed-create dl system is reported stopped");
+    assert_eq!(stopped[0].name, "dl_counter");
+    assert_eq!(stopped[0].reason, StopReason::Panicked);
+
+    drop(coord);
 }

@@ -536,7 +536,6 @@ pub struct PortDesc {
     pub frame_name: &'static str,    // F::NAME (the unprefixed frame name)
     pub vtable: VTable,              // F::as_vtable() — the frame-relative component layout
     pub max_size: usize,             // F::MAX_SIZE (worst-case table bytes)
-    pub rate_hint: Option<Hz>,       // advisory, for buffer depth / async pacing
     pub announce: AnnounceFn,        // instance-prefix factory (telemetry schema)
 }
 
@@ -548,7 +547,7 @@ pub struct SystemDescriptor {
 }
 ```
 
-`PortDesc::of::<F>()` derives a descriptor from a frame type (`of_at` adds a `rate_hint`).
+`PortDesc::of::<F>()` derives a descriptor from a frame type.
 The same `PortDesc` describes an output (a produced frame) and an input (a required frame
 shape) — the two are structurally identical; direction is which `SystemDescriptor` list it
 sits in. `announce` is a type-erased prefix factory: given an instance name it re-derives the
@@ -563,7 +562,7 @@ The coordinator reads this to:
    `capacity_for(F::MAX_SIZE, depth)`) returns the power-of-two ring capacity for `depth`
    in-flight records: `frame_len(max_size)` adds the ring's 8-byte record header + 8-byte
    payload padding, multiplied by `depth` (at least 2) and rounded up to a power of two.
-   `DEFAULT_DEPTH = 8` is used when a port carries no `rate_hint`.
+   `DEFAULT_DEPTH = 8` is used unless the coordinator config overrides `default_depth`.
 2. **Validate compatibility** (§5.2).
 
 ### 5.2 Compatibility — `compatible`

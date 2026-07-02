@@ -48,7 +48,13 @@ type AbiVersionFn = unsafe extern "C" fn() -> u32;
 type DescribeFn = unsafe extern "C" fn(ByteSink, *mut c_void) -> i32;
 type CreateFn = unsafe extern "C" fn(*const u8, usize) -> *mut c_void;
 type BindInitFn = unsafe extern "C" fn(*mut c_void, *const FswRing, usize, *const FswRing, usize);
-type ExecuteFn = unsafe extern "C" fn(*mut c_void, u64) -> FswStatus;
+// `ExecuteFn` returns the **raw** `u32` word, not `FswStatus` directly: the callee is a
+// foreign `.so` the host does not control, and constructing an `FswStatus` (`repr(u32)`)
+// straight from an out-of-range discriminant is instant UB — the one place a Rust
+// validity invariant crosses the dlopen boundary (review R2). Every call site converts
+// through [`FswStatus::from_raw`], which folds anything outside the declared range to
+// `Panicked` instead of trusting it.
+type ExecuteFn = unsafe extern "C" fn(*mut c_void, u64) -> u32;
 type ShutdownFn = unsafe extern "C" fn(*mut c_void);
 type DestroyFn = unsafe extern "C" fn(*mut c_void);
 
@@ -267,6 +273,22 @@ impl DlSystem {
         // SAFETY: `params`/`len` name a readable byte range (or null/0); the export
         // decodes them immediately, so they need not outlive the call.
         let state = unsafe { (self.create)(ptr, len) };
+        // R5: a null `state` (params decode/construction panicked inside the `.so`,
+        // caught by `run_create`'s `catch_unwind`) must not leave the slot looking
+        // `Running` forever. `DlSlot::step` early-returns on a null state *without*
+        // touching `slot_state` (it never calls `fsw_execute` on a state that was never
+        // created), so an initial `Running` would zombie the slot: `update_status`
+        // (coordinator/mod.rs) reads `state()` and would never see a stop, and the
+        // build-time direct-bind path (`into_slot`) is driven straight as `CyclicSlot`
+        // with no other place to notice. Latch the failure here instead, so the very
+        // first `state()` read after `init`/`step` reports it.
+        let slot_state = if state.is_null() {
+            SlotState::Stopped {
+                reason: StopReason::Panicked,
+            }
+        } else {
+            SlotState::Running
+        };
         DlSlot {
             lib: self.lib.clone(),
             bind_init: self.bind_init,
@@ -277,7 +299,7 @@ impl DlSystem {
             inputs,
             outputs,
             name,
-            slot_state: SlotState::Running,
+            slot_state,
         }
     }
 }
@@ -329,7 +351,10 @@ impl DlSlot {
             return FswStatus::Panicked;
         }
         // SAFETY: `state` is the live, bound `fsw_create` pointer.
-        unsafe { (self.execute)(self.state, now.0 as u64) }
+        let raw = unsafe { (self.execute)(self.state, now.0 as u64) };
+        // R2: `raw` is an untrusted word from a foreign `.so` — route it through the
+        // trust-boundary conversion rather than trusting it as a valid discriminant.
+        FswStatus::from_raw(raw)
     }
 }
 
@@ -364,7 +389,10 @@ impl CyclicSlot for DlSlot {
             return;
         }
         // SAFETY: `state` is the live, bound `fsw_create` pointer.
-        let status = unsafe { (self.execute)(self.state, now.0 as u64) };
+        let raw = unsafe { (self.execute)(self.state, now.0 as u64) };
+        // R2: `raw` is an untrusted word from a foreign `.so` — route it through the
+        // trust-boundary conversion rather than trusting it as a valid discriminant.
+        let status = FswStatus::from_raw(raw);
         self.slot_state = match status {
             FswStatus::Running => SlotState::Running,
             FswStatus::StoppedLapped => SlotState::Stopped {

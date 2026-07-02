@@ -40,7 +40,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::binder::{BindPorts, RingSource};
 use crate::coordinator::{CyclicSlot, SlotState, StopReason};
-use crate::descriptor::{AnnounceFn, Hz, PortDesc, PortId, PortKind, SystemDescriptor, SystemKind};
+use crate::descriptor::{AnnounceFn, PortDesc, PortId, PortKind, SystemDescriptor, SystemKind};
 use crate::sequence::{SeqBound, SeqClock, SeqSystem, publish_status, with_clock};
 use crate::system::{BuildSystem, CyclicRunner, CyclicSystem, Out, SystemOutput};
 
@@ -54,7 +54,9 @@ use crate::system::{BuildSystem, CyclicRunner, CyclicSystem, Out, SystemOutput};
 ///
 /// `2` adds the terminal [`FswStatus::Done`] code a sequence occupant returns when
 /// its future is `Ready` (the only ABI addition for slots/sequences, §8).
-pub const FSW_ABI_VERSION: u32 = 2;
+/// `3` drops the unused `rate_hint` field from [`PortDescMsg`] (review finding C1 —
+/// the field was carried and serialized but had no consumer).
+pub const FSW_ABI_VERSION: u32 = 3;
 
 // ---------------------------------------------------------------------------
 // repr(C) handles
@@ -109,6 +111,33 @@ pub enum FswStatus {
 }
 
 impl FswStatus {
+    /// Convert an **untrusted raw `u32`** — the bare ABI word a foreign `fsw_execute`
+    /// export returned — into an `FswStatus`, defending the dlopen trust boundary.
+    ///
+    /// `FswStatus` is `repr(u32)`, so building one directly from an arbitrary `u32` (a
+    /// bald `transmute`, or a fn-pointer typed to return `FswStatus` and trusted
+    /// verbatim) is a validity-invariant violation — instant UB — the moment the `.so`
+    /// returns anything outside `0..=3`. The host `run_execute`/`run_seq_execute`
+    /// exports genuinely only ever return one of the four declared discriminants (this
+    /// is what a *well-behaved* `.so` sends), but a `.so` is foreign code the host
+    /// cannot make Rust trust: a stale/mismatched build, a hand-rolled non-Rust
+    /// exporter, or memory corruption could hand back any word. Any value outside the
+    /// declared range folds to [`Panicked`](FswStatus::Panicked) — the same outcome a
+    /// caught panic or an unbound state already produces — rather than being trusted.
+    ///
+    /// Callers that read the raw `u32` off a resolved dlopen symbol
+    /// ([`dl::DlSlot`](crate::dl::DlSlot)) must route it through here instead of
+    /// constructing an `FswStatus` directly.
+    pub(crate) fn from_raw(raw: u32) -> Self {
+        match raw {
+            0 => FswStatus::Running,
+            1 => FswStatus::StoppedLapped,
+            2 => FswStatus::Panicked,
+            3 => FswStatus::Done,
+            _ => FswStatus::Panicked,
+        }
+    }
+
     /// Map a runner's [`SlotState`] (after a `step`) to the FFI status.
     fn from_slot(state: SlotState) -> Self {
         match state {
@@ -170,8 +199,6 @@ pub struct PortDescMsg {
     pub vtable: VTable,
     /// `F::MAX_SIZE` (worst-case table bytes).
     pub max_size: usize,
-    /// Advisory rate, for buffer depth / async pacing.
-    pub rate_hint: Option<Hz>,
     /// The unprefixed component metadata, so the host can synthesize a prefixed
     /// `announce` for telemetry without the static `F`.
     pub metadata: Vec<ComponentMetadata>,
@@ -201,7 +228,6 @@ impl PortDescMsg {
             frame_name: desc.name.to_string(),
             vtable: desc.vtable().clone(),
             max_size: desc.max_size,
-            rate_hint: desc.rate_hint,
             metadata,
         }
     }
@@ -234,7 +260,6 @@ impl PortDescMsg {
             id: PortId::Frame(self.frame_id),
             name: frame_name,
             max_size: self.max_size,
-            rate_hint: self.rate_hint,
             // The carried (unprefixed) vtable is what `compatible()` validates against,
             // so wiring validation is unchanged; prefixing happens only in `announce`.
             kind: PortKind::Frame {

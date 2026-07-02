@@ -347,19 +347,27 @@ fn slot_reset_reruns_from_start() {
             .expect("reader slot available"),
     );
 
-    // Two bounded runs in one executor scope (`stellarator::run` owns the executor for
-    // its closure). Run #1: Load + Start → Completed. Between runs, Reset (rebuild the
-    // selected occupant over the same rings) + Start; Run #2 reloads and completes again.
+    // One bounded run (a coordinator drives exactly one `run_for`; a rerun would
+    // re-init everything). Cycles 1-3: Load + Start → Completed. An injector task —
+    // polled at the Simulated loop's per-cycle yield — then emits Reset (rebuild the
+    // selected occupant over the same rings) + Start, which the slot drains at the
+    // head of cycle 4; cycles 4-6 reload and complete again.
     let ch = coord.channel_id("adcs").expect("adcs slot channel");
     let mut control = coord.control_handle();
     control.emit(&load(ch, "waiter")).unwrap();
     control.emit(&cmd(ch, SequenceCommandKind::Start)).unwrap();
+    let progress = coord.progress();
     let coord = stellarator::run(|| async move {
-        coord.run_for(3).await;
-        control.emit(&cmd(ch, SequenceCommandKind::Reset)).unwrap();
-        control.emit(&cmd(ch, SequenceCommandKind::Start)).unwrap();
-        coord.run_for(3).await;
-        drop(control);
+        let injector = stellarator::spawn(async move {
+            use std::sync::atomic::Ordering::Relaxed;
+            while progress.load(Relaxed) < 3 {
+                stellarator::yield_now().await;
+            }
+            control.emit(&cmd(ch, SequenceCommandKind::Reset)).unwrap();
+            control.emit(&cmd(ch, SequenceCommandKind::Start)).unwrap();
+        });
+        coord.run_for(6).await;
+        let _ = injector.await;
         coord
     });
 

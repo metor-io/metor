@@ -286,7 +286,7 @@ factory captured when the descriptor is derived:
 
 ```text
 PortDesc {
-    frame_id, vtable, max_size, rate_hint,
+    frame_id, vtable, max_size,
     announce: AnnounceFn,   // Arc<dyn Fn(&str) -> (VTable, Vec<ComponentMetadata>)>
 }
 ```
