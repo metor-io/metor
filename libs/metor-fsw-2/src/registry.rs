@@ -191,7 +191,7 @@ impl MessageRegistry {
 /// A broadcast tap over **every** telemetered output frame and message channel in the graph
 /// (`docs/message-wiring.md` §4) — the reusable generalization of the telemetry downlink's
 /// twin-registry pull. It reserves no ring and connects no edge; it is a *capability* port
-/// (`PortKind::ReceiveAll`) that appears in a bundle like any port and binds by pulling both
+/// that appears in a bundle like any port and binds by pulling both
 /// registries, so any system (a downlink, a logger, a recorder) taps the whole graph just by
 /// declaring an `AllOutputs` field. Each such port counts one extra reader on every buffer,
 /// which `build()` derives into every ring's `max_readers` budget.
@@ -203,7 +203,7 @@ pub struct AllOutputs {
 }
 
 impl AllOutputs {
-    /// The receive-all tap descriptor (`PortKind::ReceiveAll`) — ring-less, edge-less.
+    /// The receive-all tap descriptor — ring-less, edge-less (a temporary sentinel).
     pub fn descriptor() -> PortDesc {
         PortDesc::receive_all()
     }

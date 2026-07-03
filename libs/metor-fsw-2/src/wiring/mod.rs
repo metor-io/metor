@@ -1020,7 +1020,7 @@ fn resolve_slot(
     // `SlotControlIn` input dropped (what `add_slot`/`build()` register for edge wiring).
     let base = allowed[0].1.descriptor().clone();
     let mut inputs = base.inputs.clone();
-    if inputs.last().map(|p| p.id) == Some(PortId::Frame(SlotControlIn::FRAME_ID)) {
+    if inputs.last().map(|p| p.id) == Some(PortId::Component(SlotControlIn::FRAME_ID)) {
         inputs.pop();
     }
     let registered = SystemDescriptor {
@@ -1790,7 +1790,7 @@ fn resolve_endpoint(
     };
     let port = match kind {
         EdgeKind::Frame => {
-            let id = PortId::Frame(ComponentId::new(port_name));
+            let id = PortId::Component(ComponentId::new(port_name));
             if !ports.iter().any(|p| p.id == id) {
                 return Err(LoadError::UnknownFrame {
                     instance: name.to_string(),
@@ -1807,7 +1807,7 @@ fn resolve_endpoint(
         EdgeKind::Msg => {
             let found = ports
                 .iter()
-                .find(|p| matches!(p.id, PortId::Msg(_)) && p.name == port_name);
+                .find(|p| matches!(p.id, PortId::Packet(_)) && p.name == port_name);
             match found {
                 Some(p) => p.id,
                 None => {

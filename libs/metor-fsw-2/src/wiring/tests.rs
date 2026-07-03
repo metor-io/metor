@@ -1110,6 +1110,11 @@ struct WireEvent {
     seq: u64,
 }
 
+// A wired message port needs the explicit, stable name token (A10).
+impl crate::NamedMsg for WireEvent {
+    const NAME: &'static str = "WireEvent";
+}
+
 // A cyclic message producer (no params): emits one `WireEvent` per cycle.
 struct MsgSrc {
     n: u64,

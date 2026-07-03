@@ -220,14 +220,14 @@ fn abi_describe_round_trips() {
     assert_eq!(msg.inputs.len(), desc.inputs.len());
     assert_eq!(msg.inputs.len(), 1);
     assert_eq!(msg.inputs[0].frame_id, TickIn::FRAME_ID);
-    assert_eq!(msg.inputs[0].frame_id, desc.inputs[0].frame_id());
+    assert_eq!(msg.inputs[0].frame_id, desc.inputs[0].id.component().expect("table port"));
 
     // user `out` + implicit health + implicit log.
     assert_eq!(msg.outputs.len(), desc.outputs.len());
     assert_eq!(msg.outputs.len(), 3);
     assert_eq!(msg.outputs[0].frame_id, TickOut::FRAME_ID);
     for (m, d) in msg.outputs.iter().zip(&desc.outputs) {
-        assert_eq!(m.frame_id, d.frame_id());
+        assert_eq!(m.frame_id, d.id.component().expect("table port"));
         assert_eq!(m.frame_name, d.name);
     }
 
@@ -241,7 +241,7 @@ fn abi_describe_round_trips() {
     // The descriptor mirror reconstructs a usable SystemDescriptor (host side).
     let rebuilt = msg.into_descriptor();
     assert_eq!(rebuilt.name, "counter");
-    assert_eq!(rebuilt.inputs[0].frame_id(), TickIn::FRAME_ID);
+    assert_eq!(rebuilt.inputs[0].id.component().expect("table port"), TickIn::FRAME_ID);
 }
 
 // ---------------------------------------------------------------------------
@@ -262,15 +262,15 @@ fn realized_ids(vt: &VTable) -> Vec<ComponentId> {
 fn dl_announce_prefixes_vtable_ids() {
     // Lower → wire → reconstruct the descriptor exactly as the host loader does.
     let desc = <Counter as CyclicSystem>::descriptor();
-    let in_meta: Vec<_> = desc.inputs.iter().map(|p| (p.announce())("").1).collect();
-    let out_meta: Vec<_> = desc.outputs.iter().map(|p| (p.announce())("").1).collect();
+    let in_meta: Vec<_> = desc.inputs.iter().map(|p| (p.announce().expect("table port"))("").1).collect();
+    let out_meta: Vec<_> = desc.outputs.iter().map(|p| (p.announce().expect("table port"))("").1).collect();
     let schema = OwnedNamedType::from(<CounterParams as Schema>::SCHEMA);
     let msg = SystemDescriptorMsg::lower(&desc, schema, in_meta, out_meta);
     let rebuilt = msg.into_descriptor();
 
     // The user output `out` (frame `tick_out`, field `count`) is outputs[0].
     let port = &rebuilt.outputs[0];
-    let (vtable, metadata) = (port.announce())("inst");
+    let (vtable, metadata) = (port.announce().expect("table port"))("inst");
 
     // The metadata ids are prefixed.
     assert!(
@@ -295,7 +295,7 @@ fn dl_announce_prefixes_vtable_ids() {
 
     // The *unprefixed* vtable on the PortDesc (what `compatible()` validates) is left
     // alone, so wiring validation still sees the frame-relative ids.
-    let unprefixed = realized_ids(port.vtable());
+    let unprefixed = realized_ids(port.vtable().expect("table port"));
     assert!(
         unprefixed.contains(&ComponentId::new("tick_out.count")),
         "PortDesc.vtable stays unprefixed for compatibility: {unprefixed:?}"

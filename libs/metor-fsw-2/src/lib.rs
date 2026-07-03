@@ -67,7 +67,8 @@ pub use telemetry::{
 // The system trait family, the typed port wrappers, self-description, and the
 // standard health/log telemetry.
 pub use descriptor::{
-    AnnounceFn, Hz, PortDesc, PortId, PortKind, SystemDescriptor, SystemKind, compatible,
+    AnnounceFn, Delivery, FanIn, Hz, OnLap, PortDesc, PortId, PortSchema, SystemDescriptor,
+    SystemKind, compatible,
 };
 pub use health::{
     HealthPort, LOG_MSG_CAP, Level, LogLine, MAX_ERR_KINDS, MAX_LINES, SystemHealth, SystemLog,
@@ -77,7 +78,7 @@ pub use port::{DEFAULT_DEPTH, FrameRef, Input, Output, buffer_capacity, capacity
 // The general message channel — the `(PacketId, postcard)` record format, the
 // type-erased emit port, and its sizing/record helpers (`docs/messages.md` §1, §2).
 pub use message::{
-    CommandOut, MAX_MSG_BYTES, MSG_DEPTH, MsgIn, MsgOut, msg_capacity, split_record,
+    CommandOut, MAX_MSG_BYTES, MSG_DEPTH, MsgIn, MsgOut, NamedMsg, msg_capacity, split_record,
 };
 pub use system::{
     AsyncSystem, BuildSystem, CyclicRunner, CyclicSystem, Out, System, SystemInput, SystemOutput,
