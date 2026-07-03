@@ -225,7 +225,7 @@ fn cyclic_input_lap_is_observable() {
 // SystemDescriptor + compatibility (subset / ty-shape).
 // ---------------------------------------------------------------------------
 
-#[derive(crate::Frame, IntoBytes, Immutable, KnownLayout)]
+#[derive(crate::Frame, IntoBytes, Immutable, KnownLayout, FromBytes)]
 #[repr(C)]
 #[metor_fsw(name = "imu")]
 struct ImuSubset {
@@ -234,7 +234,7 @@ struct ImuSubset {
     omega: f64, // a strict subset of Imu's {omega, accel}
 }
 
-#[derive(crate::Frame, IntoBytes, Immutable, KnownLayout)]
+#[derive(crate::Frame, IntoBytes, Immutable, KnownLayout, FromBytes)]
 #[repr(C)]
 #[metor_fsw(name = "imu")]
 struct ImuWrongTy {
@@ -244,7 +244,7 @@ struct ImuWrongTy {
     accel: f32,
 }
 
-#[derive(crate::Frame, IntoBytes, Immutable, KnownLayout)]
+#[derive(crate::Frame, IntoBytes, Immutable, KnownLayout, FromBytes)]
 #[repr(C)]
 #[metor_fsw(name = "imu")]
 struct ImuExtra {

@@ -152,6 +152,13 @@ impl Registry {
 /// frame) is simply invisible through this surface. The full unfiltered [`Registry`]
 /// remains reachable via the host-side
 /// [`Coordinator::registry()`](crate::Coordinator::registry).
+///
+/// **Init-time emit gap (B9)**: a view claimed off an entry starts at the buffer's
+/// live edge, so records emitted *before* the claim — e.g. during an
+/// earlier-registered system's `init`, before the holder's own `init` ran — are
+/// never observed. A consumer that must not miss boot-time records should have its
+/// producers (re-)publish from their first `execute` (the coordinator's boot
+/// `SequenceRegistry` emits at the head of `run_for` for exactly this reason).
 pub struct AllOutputs {
     registry: Arc<Registry>,
 }

@@ -8,6 +8,9 @@ publish = false
 description = "Frames & component derives for the metor-fsw-2 flight-software framework"
 authors = ["sascha@metor.io"]
 
+[lints]
+workspace = true
+
 [dependencies]
 metor-proto = { path = "../metor-proto", features = ["std"] }
 # `nox` forces `metor-proto-wkt`'s ComponentValue on via feature unification, so the

@@ -13,6 +13,9 @@ pub struct Decomponentize {
     data: ast::Data<(), crate::Field>,
     parent: Option<String>,
     name: Option<String>,
+    /// Tolerated here; consumed by the bundling `Frame` derive (E4 opt-out).
+    #[darling(default, rename = "no_timestamp")]
+    _no_timestamp: darling::util::Ignored,
 }
 
 /// See [`componentize_impl`](crate::componentize::componentize_impl) for the
@@ -24,6 +27,7 @@ pub fn decomponentize_impl(input: &DeriveInput, crate_name: &TokenStream2) -> To
         data,
         parent,
         name,
+        _no_timestamp: _,
     } = Decomponentize::from_derive_input(input).unwrap();
     let parent = parent.or(name);
     let where_clause = &generics.where_clause;

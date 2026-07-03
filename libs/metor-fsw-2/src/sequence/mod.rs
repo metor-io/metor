@@ -317,10 +317,18 @@ pub struct SeqStatusOut<B: Backing = BoxBacking> {
 /// TODO(E6, seq path): a sequence's *user* output ports move into the future, so
 /// their [`publish`](crate::Output::publish) drop counters are unreachable from this
 /// wrapper — unlike [`CyclicRunner::step`](crate::CyclicRunner), the per-poll driver
-/// (`abi::run_seq_execute`, in-flight in the slot-addressing work) cannot fold them
-/// into `health.error("publish_dropped")` yet. Folding needs either a shared counter
-/// cell threaded into the ports at `build()` or a poll-side hook on this struct; wire
-/// it up when the seq execute path is next touched.
+/// (`abi::run_seq_execute`) cannot fold them into
+/// `health.error("publish_dropped")`. Concrete plan (deferred — it touches the hot
+/// `Output` type): add a `dropped: Rc<Cell<u64>>` field here, mint it in the
+/// `#[sequence]`-generated `SeqSystem::build` beside the clock, and thread a clone
+/// into each user `Output`/`MsgOut` via a `share_drop_counter(Rc<Cell<u64>>)`
+/// builder step before the ports move into the future (the ports then bump the
+/// shared cell instead of their inline `dropped: u64`; `Rc` is fine — a sequence
+/// poll is single-threaded by construction). `run_seq_execute` reads-and-clears the
+/// cell after each poll and folds a nonzero count into
+/// `status.health().error("publish_dropped")`. Not done in the cleanup wave because
+/// the counter-cell indirection taxes every cyclic `publish` for a seq-only need —
+/// revisit if `Output` grows a cheap counter-sink seam.
 pub struct SeqBound {
     pub future: Pin<Box<dyn Future<Output = Outcome>>>,
     pub status: Out<SeqStatusOut<RawBacking>, RawBacking>,

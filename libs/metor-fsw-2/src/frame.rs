@@ -3,6 +3,7 @@
 
 use metor_fsw::{AsVTable, Componentize, Decomponentize, Metadatatize};
 use metor_proto::types::{ComponentId, Timestamp};
+use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
 
 /// A frame: a `#[repr(C)]` struct whose fields are components sharing one logical
 /// timestamp, named by a [`ComponentId`].
@@ -11,7 +12,16 @@ use metor_proto::types::{ComponentId, Timestamp};
 /// [`Decomponentize`] — it bundles them and pins the frame name/id plus the shared
 /// timestamp. Derive it with `#[derive(Frame)]`, which expands to all four
 /// sub-derives + this impl.
-pub trait Frame: AsVTable + Metadatatize + Componentize + Decomponentize {
+///
+/// The zerocopy traits are **supertraits** (E4): a frame's `#[repr(C)]` bytes *are*
+/// its wire bytes, so every port path needs them anyway — making them supertraits
+/// moves a forgotten `#[derive(IntoBytes, Immutable, KnownLayout, FromBytes)]` from
+/// an opaque error in some consumer crate to a clear error **on the definition**.
+/// `IntoBytes` also rejects implicit `#[repr(C)]` padding at the definition site
+/// (pad explicitly with `_pad` arrays).
+pub trait Frame:
+    AsVTable + Metadatatize + Componentize + Decomponentize + IntoBytes + FromBytes + KnownLayout + Immutable
+{
     /// Frame name; the dotted prefix all member components hang off (and the
     /// `Op::Frame` tag id). Empty means "no prefix" (components sit at the root).
     const NAME: &'static str;

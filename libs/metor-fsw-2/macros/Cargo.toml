@@ -7,6 +7,9 @@ edition = "2024"
 publish = false
 description = "Proc macros for the metor-fsw-2 flight-software framework"
 
+[lints]
+workspace = true
+
 [lib]
 proc-macro = true
 

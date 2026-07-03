@@ -13,6 +13,9 @@ pub struct Metadatatize {
     data: ast::Data<Ident, crate::Field>,
     parent: Option<String>,
     name: Option<String>,
+    /// Tolerated here; consumed by the bundling `Frame` derive (E4 opt-out).
+    #[darling(default, rename = "no_timestamp")]
+    _no_timestamp: darling::util::Ignored,
     /// `#[metor_fsw(group)]` emits a metadata-only parent entry with
     /// `group_name = <Ident>`. `#[metor_fsw(group = "Custom")]` overrides.
     #[darling(default)]
@@ -29,6 +32,7 @@ pub fn metadatatize_impl(input: &DeriveInput, crate_name: &TokenStream2) -> Toke
         parent,
         name,
         group,
+        _no_timestamp: _,
     } = Metadatatize::from_derive_input(input).unwrap();
     let parent = parent.or(name);
     let where_clause = &generics.where_clause;

@@ -878,6 +878,14 @@ impl CoordinatorBuilder {
     /// observes every other system's fresh output. The downlink's `AllOutputs` receive-all
     /// port is what reserves it a reader slot on every buffer — `build()` derives that budget
     /// by counting `ReceiveAll` capabilities, so no manual bookkeeping is needed here.
+    ///
+    /// **Init-time emit gap (B9)**: the downlink claims its read views in its own
+    /// `init`, which runs *after* earlier-registered systems' `init`s — a frame or
+    /// message a system emits during `init` is therefore **not** downlinked (the
+    /// view starts at the live edge past it). Values that must reach the ground
+    /// should be (re-)published from the first `execute`; the coordinator's own boot
+    /// `SequenceRegistry` deliberately emits at the head of `run_for`, after every
+    /// `init`, for exactly this reason.
     pub fn add_telemetry<T>(&mut self, config: TelemetryConfig<T>) -> SystemHandle
     where
         T: Transport + 'static,
