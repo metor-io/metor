@@ -1270,6 +1270,30 @@ fn command_ring_registered_but_untelemetered() {
 }
 
 #[test]
+fn coordinator_bundle_registry_keys_are_golden() {
+    // A9: the coordinator's channels come off its declared #0 bundle now — the
+    // registry keys must stay byte-identical to the historical hand-rolled ones so
+    // nothing downstream (Subset filters, db paths, panel taps) moves.
+    let mut b = Coordinator::builder(config());
+    b.add_cyclic(Producer::new());
+    let coord = b.build().unwrap();
+    let registry = coord.registry();
+    for (key, telemetered) in [
+        ("coordinator.health", true),
+        ("coordinator.log", true),
+        ("coordinator.coordinator_status", true),
+        ("coordinator.sequences", true),
+        ("coordinator.commands", false),
+    ] {
+        let entry = registry
+            .get(metor_proto::types::ComponentId::new(key))
+            .unwrap_or_else(|| panic!("{key} is registered"));
+        assert_eq!(entry.telemetered, telemetered, "{key}");
+        assert_eq!(&*entry.instance, "coordinator", "{key}");
+    }
+}
+
+#[test]
 fn duplicate_registry_key_is_rejected() {
     // Two systems registered under the same instance name compute colliding
     // `<instance>.<name>` keys for every port (user frame + health + log). One

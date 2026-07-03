@@ -40,8 +40,8 @@ use crate::descriptor::{
     SystemKind,
 };
 use crate::dynamic::FrameList;
-use crate::health::{HealthPort, Level};
-use crate::message::{LOG_DEPTH, MAX_MSG_BYTES, MsgIn, MsgOut};
+use crate::health::{HealthPort, Level, SystemHealth, SystemLog};
+use crate::message::{LOG_DEPTH, MsgIn, MsgOut};
 use crate::port::{Input, Output, capacity_for};
 use crate::registry::{EntrySchema, Registry, RegistryEntry};
 use crate::sequence::{SequenceStatus, SlotControlIn};
@@ -535,9 +535,12 @@ struct CoordinatorStatus {
 #[allow(dead_code)]
 #[derive(Clone, Copy, Debug)]
 enum BufferRole {
+    /// A system's declared output buffer (the coordinator's own #0 outputs
+    /// included — A9 removed the special `Coordinator` role).
     Output { system: usize, port: usize },
+    /// A dedicated input-side ring: an async copy-in buffer, or a Host-connected
+    /// input's ring (A3).
     Private { system: usize, input: usize },
-    Coordinator,
 }
 
 /// One owned ring plus its identity. `ring` is the canonical handle whose sole job
@@ -754,19 +757,34 @@ impl CoordinatorBuilder {
         // The coordinator registers itself as system #0 under the reserved instance
         // name `"coordinator"` (`docs/design-command-slots.md` §2.6): an ordinary
         // declared bundle, so its channels are wired/sized/registered by the same
-        // passes as every system's. The `commands` output is the operator command
-        // channel behind the take-once [`Coordinator::control_handle`]; commands
-        // reach a slot only over an explicit `"coordinator" -> <slot>` edge.
-        // Untelemetered (inbound control is never echoed on the downlink); named
-        // "commands" so the registry key stays `coordinator.commands`.
+        // passes as every system's — no hand-rolled allocation blocks. Every output
+        // is Host-connected (the coordinator itself holds the writers; a Host OUTPUT
+        // still accepts consumer edges); the registry keys are byte-identical to the
+        // historical hand-rolled ones (`coordinator.health` / `.log` /
+        // `.coordinator_status` / `.sequences` / `.commands`).
+        //
+        // - `commands` is the operator channel behind the take-once
+        //   [`Coordinator::control_handle`]; commands reach a slot only over an
+        //   explicit `"coordinator" -> <slot>` edge. Untelemetered (inbound control
+        //   is never echoed on the downlink).
+        // - `sequences` carries the boot `SequenceRegistry` (telemetered — the
+        //   panel's sequence view sources it).
+        // - the `status` SelfTap is `read_status`'s view over the coordinator's own
+        //   status output.
         let desc = SystemDescriptor {
             name: COORDINATOR_INSTANCE,
             kind: SystemKind::Cyclic,
-            inputs: Vec::new(),
-            // Host-connected: the coordinator itself holds the writer (the take-once
-            // control_handle) — a Host OUTPUT still accepts consumer edges, which is
-            // exactly how slots read it.
+            inputs: vec![
+                PortDesc::of::<CoordinatorStatus>().with_conn(PortConn::SelfTap(
+                    PortId::Component(CoordinatorStatus::FRAME_ID),
+                )),
+            ],
             outputs: vec![
+                PortDesc::of::<crate::SystemHealth>().with_conn(PortConn::Host),
+                PortDesc::of::<crate::SystemLog>().with_conn(PortConn::Host),
+                PortDesc::of::<CoordinatorStatus>().with_conn(PortConn::Host),
+                PortDesc::msg_named::<SequenceRegistry>("sequences")
+                    .with_conn(PortConn::Host),
                 PortDesc::msg_named::<SequenceCommand>("commands")
                     .untelemetered()
                     .with_conn(PortConn::Host),
@@ -1444,28 +1462,6 @@ impl CoordinatorBuilder {
             output_rings.push(row);
         }
 
-        // --- Coordinator's own health / log / status buffers (telemetry.md §2.3) ---
-        // Allocated *before* the bind loop (they depend on no edges) so the registry
-        // handed to systems includes them. Sized for the coordinator-side reader
-        // (status_view) plus the registry consumers.
-        let coord_readers = 1 + n_reg + READER_SLACK;
-        let health_ring = coord_ring::<crate::SystemHealth>(depth, coord_readers);
-        let log_ring = coord_ring::<crate::SystemLog>(depth, coord_readers);
-        let status_ring = coord_ring::<CoordinatorStatus>(depth, coord_readers);
-        for (ring, desc) in [
-            (health_ring.clone(), PortDesc::of::<crate::SystemHealth>()),
-            (log_ring.clone(), PortDesc::of::<crate::SystemLog>()),
-            (status_ring.clone(), PortDesc::of::<CoordinatorStatus>()),
-        ] {
-            reg_entries.push(registry_entry(COORDINATOR_INSTANCE, &desc, ring.clone()));
-            table.rings.push(RingEntry {
-                ring,
-                frame_id: desc.id.component().expect("coordinator frames are table ports"),
-                role: BufferRole::Coordinator,
-                instance: None,
-            });
-        }
-
         // --- Dedicated rings for Host-connected inputs (A3) -------------------
         // A Host input's counterpart is its runner's writer (the slot's cancel
         // frame), so it gets its own ring instead of a producer edge: the occupant
@@ -1510,23 +1506,6 @@ impl CoordinatorBuilder {
             }
         }
 
-        // --- Coordinator-owned boot-`SequenceRegistry` message channel (§5) ---
-        // A single-writer `MsgOut` the coordinator emits one `SequenceRegistry` over at
-        // startup (in `run_for`, not here — a tap claimed after `build()` would miss an
-        // emit-at-build, the overwrite ring starting at the live edge). Registry-tapped
-        // so the downlink (W2) carries it.
-        let seq_registry_ring =
-            alloc_ring(Delivery::Log, MAX_MSG_BYTES, depth, n_reg + READER_SLACK);
-        let seq_registry_out = owned_writer(&seq_registry_ring);
-        let seq_registry_entry =
-            postcard_entry(COORDINATOR_INSTANCE, "sequences", seq_registry_ring.clone(), true);
-        table.rings.push(RingEntry {
-            ring: seq_registry_ring,
-            frame_id: seq_registry_entry.key,
-            role: BufferRole::Coordinator,
-            instance: None,
-        });
-        reg_entries.push(seq_registry_entry);
         let seq_registry = SequenceRegistry {
             channels: seq_specs,
         };
@@ -1605,24 +1584,52 @@ impl CoordinatorBuilder {
         // --- Bind every system's ports over the allocated rings --------------
         let mut cyclic: Vec<Box<dyn CyclicSlot>> = Vec::new();
         let mut pending_async: Vec<PendingAsync> = Vec::new();
-        // The operator command writer, minted once by the coordinator's own (#0)
-        // bind arm; `control_handle()` hands it out once.
+        // The coordinator's own (#0) ports, wrapped by its bind arm below and
+        // unwrapped after the loop (`Reg::Coordinator` is always registered first).
         let mut control_out: Option<MsgOut<SequenceCommand>> = None;
+        let mut coord_health: Option<HealthPort> = None;
+        let mut status_out: Option<Output<CoordinatorStatus>> = None;
+        let mut status_view: Option<Input<CoordinatorStatus>> = None;
+        let mut seq_registry_out: Option<MsgOut<SequenceRegistry>> = None;
         let regs = std::mem::take(&mut self.regs);
         for (id, reg) in regs.into_iter().enumerate() {
             match reg {
                 // The coordinator's own bundle (§2.6): a marker registration — not a
-                // cyclic slot (the coordinator IS the loop). Its declared outputs were
-                // allocated/registered by the uniform passes above; wrap the writers
-                // into the coordinator's fields here, single-writer by construction.
+                // cyclic slot (the coordinator IS the loop). Its declared Host outputs
+                // were allocated/registered by the uniform passes above; wrap the
+                // writers into the coordinator's fields here, single-writer by
+                // construction, and claim the status SelfTap view (`read_status`).
                 Reg::Coordinator => {
-                    let commands_idx = self.descs[id]
-                        .outputs
-                        .iter()
-                        .position(|p| p.id == PortId::Packet(SequenceCommand::ID))
-                        .expect("the coordinator #0 bundle declares its commands output");
+                    let desc = &self.descs[id];
+                    let out_idx = |pid: PortId| {
+                        desc.outputs
+                            .iter()
+                            .position(|p| p.id == pid)
+                            .expect("the coordinator #0 bundle declares this output")
+                    };
+                    let health_ring =
+                        &output_rings[id][out_idx(PortId::Component(SystemHealth::FRAME_ID))];
+                    let log_ring =
+                        &output_rings[id][out_idx(PortId::Component(SystemLog::FRAME_ID))];
+                    coord_health = Some(HealthPort::new(
+                        slot_writer::<SystemHealth>(health_ring),
+                        slot_writer::<SystemLog>(log_ring),
+                    ));
+                    let status_idx = out_idx(PortId::Component(CoordinatorStatus::FRAME_ID));
+                    status_out =
+                        Some(slot_writer::<CoordinatorStatus>(&output_rings[id][status_idx]));
+                    // The declared SelfTap over the coordinator's own status output
+                    // (+1 fan-out counted at sizing).
+                    status_view = Some(Input::new(
+                        output_rings[id][status_idx]
+                            .view(NoWake, NoWake)
+                            .expect("status self-tap reader (fan-out sized)"),
+                    ));
+                    seq_registry_out = Some(owned_writer::<SequenceRegistry>(
+                        &output_rings[id][out_idx(PortId::Packet(SequenceRegistry::ID))],
+                    ));
                     control_out = Some(owned_writer::<SequenceCommand>(
-                        &output_rings[id][commands_idx],
+                        &output_rings[id][out_idx(PortId::Packet(SequenceCommand::ID))],
                     ));
                 }
                 // A dlopen'd system binds over **raw** `FswRing` regions, not typed
@@ -1874,33 +1881,13 @@ impl CoordinatorBuilder {
             }
         }
 
-        // --- Coordinator's own health / log / status ports -------------------
-        // The buffers were allocated up front (above) so the registry includes them;
-        // here we just wrap the writer/view ports over those same ring handles.
-        // Invariant (all three): the coordinator allocated these rings above and
-        // mints their single writer exactly once here, so the claims are free.
-        let coord_health = HealthPort::new(
-            Output::new(
-                health_ring
-                    .writer(NoWake, NoWake)
-                    .expect("coordinator health ring has exactly one writer"),
-            ),
-            Output::new(
-                log_ring
-                    .writer(NoWake, NoWake)
-                    .expect("coordinator log ring has exactly one writer"),
-            ),
-        );
-        let status_out = Output::new(
-            status_ring
-                .writer(NoWake, NoWake)
-                .expect("coordinator status ring has exactly one writer"),
-        );
-        let status_view = Input::new(
-            status_ring
-                .view(NoWake, NoWake)
-                .expect("status reader slot"),
-        );
+        // The coordinator's own ports were wrapped by its #0 bind arm — always
+        // registered (CoordinatorBuilder::new), so the unwraps are structural.
+        let coord_health = coord_health.expect("coordinator #0 bound its health port");
+        let status_out = status_out.expect("coordinator #0 bound its status writer");
+        let status_view = status_view.expect("coordinator #0 bound its status view");
+        let seq_registry_out =
+            seq_registry_out.expect("coordinator #0 bound its sequences writer");
 
         Ok(Coordinator {
             config: self.config,
@@ -2017,12 +2004,6 @@ fn alloc_ring(
         max_readers,
         overrun: Overrun::Overwrite,
     })
-}
-
-/// A coordinator-owned Snapshot ring for frame `F` — [`alloc_ring`] with the frame's
-/// worst-case record size.
-fn coord_ring<F: Frame>(default_depth: usize, max_readers: usize) -> RingBuffer<BoxBacking> {
-    alloc_ring(Delivery::Snapshot, F::MAX_SIZE, default_depth, max_readers)
 }
 
 /// Mint the single [`MsgOut`] writer over a coordinator-owned ring — the
