@@ -131,7 +131,7 @@ fn commissioning_auto_runs_to_completion() {
         "commissioning reached terminal Completed: {run_states:?}"
     );
     assert!(
-        run_states.iter().any(|&s| s == RUNNING),
+        run_states.contains(&RUNNING),
         "it published running status before completing: {run_states:?}"
     );
 
