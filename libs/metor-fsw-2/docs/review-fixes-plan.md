@@ -67,12 +67,25 @@ are not ours to commit.
 - [x] W1d descriptor/abi: delete `rate_hint` + `of_at`, bump FSW_ABI_VERSION
       (done 2026-07-02: ABI 2→3; Hz kept — cycle_rate uses it; fixtures build
       from source, nothing to regenerate; docs updated; tests green).
-- [ ] B9: document init-time emit gap (defer real fix).
+- [x] B9: document init-time emit gap (defer real fix).
+      (done 2026-07-02, docs pass: `docs/telemetry.md` §3 — a fresh registry `View` starts at
+      the buffer's current commit point, so a frame/message emitted only during another
+      system's `init` — which always completes before telemetry's own `init` claims its taps,
+      since telemetry is registered last — is invisible to the downlink for the rest of the
+      run; same hazard for a live panel connecting mid-mission. Real fix (a backlog
+      replay/re-publish) stays deferred.)
 → **Commit** per group when tests pass.
 
 ### Wave 2 — ring safety implementation (after D1)
-- [ ] R1, R6, R7, R3, B6, R8, R4 per design; ring tests + Miri
+- [x] R1, R6, R7, R3, B6, R8, R4 per design; ring tests + Miri
       (`ring/MIRI.md` recipe). → **Commit.**
+      (done 2026-07-02, commit 07406cfc: fence-to-fence seqlock closing the torn-read window
+      (R1, is_lapped moved to reserved_end); OFF_WRITER CAS claim word (R7); lossless
+      registration loops until `committed` is stable across the cursor CAS + a SeqCst fence in
+      `slowest_active_cursor` (R6), plus new `ReadError::Corrupt` for lossless length/straddle
+      validation; 32-bit-safe straddle math (R3); gap-skip-before-lap-test (B6); ordering
+      comment (R8); attach geometry validation (R4). `docs/ring-buffer.md` already reflects
+      this shape — verified accurate against the code in this docs pass, not rewritten.)
 
 ### Wave 3 — KDL serde refactor (after D2; rebases on wave 1)
 - [x] Deserializer, migration, delete bespoke traits, B1 regression test,
@@ -111,9 +124,17 @@ are not ours to commit.
       (documented, no warn channel in resolve). metor-panel unchanged
       (wire format stable since W4a). (2026-07-02)
 
-### Wave 5 — E2 `#[system]` macro (after wave 4 trait surface settles)
-- [ ] Macro + migrate adcs-fsw2 example + static-linking example (E8d).
+### Wave 5 — E2 `#[system]` macro (landed BEFORE wave 4, per the design's recommended order)
+- [x] Macro + migrate adcs-fsw2 example + static-linking example (E8d).
       → **Commit.**
+      (done 2026-07-02, commit 9ea79274: `metor-fsw-2-macros` crate; `#[system]` attribute on
+      the inherent impl block, reading ports off `execute`/`run`'s signature; E3 `latest() ->
+      Option<FrameRef>` (no `Result`), E6 infallible `publish`/`publish_with` +
+      `SystemOutput::take_dropped`, `Out::split`, E7 sequence `now()`/`Seq::now()` + injected
+      `<B: Backing>`. nav/ctrl/plant/commissioning/safe-mode examples converted — see
+      `examples/adcs-fsw2/systems/nav/src/lib.rs`. `docs/system.md` §7 and
+      `docs/sequences-slots.md` §4.1 updated to the shipped authoring surface in this docs
+      pass.)
 
 ### Wave 6 — cleanliness + style batch (cheap models OK)
 - [ ] C2 build() split (post-A1 residue), C3 dedup, C4 remnants not subsumed
@@ -143,3 +164,10 @@ are not ours to commit.
 ## Status log
 - 2026-07-02: Wave 0 designs complete (D1-D5). Wave 1 complete (W1a-W1d),
   B9 doc deferral pending, committing now.
+- 2026-07-02: Docs sweep (parallel with the wave-6 code pass): DESIGN.md, `docs/*.md` prose
+  reconciled against the code through wave 5 + A1/A2/A3/A8/A9 (waves 2/3/5 checkboxes above
+  corrected; B9 documented and checked off). `docs/design-*.md` marked LANDED (status headers
+  only). See individual doc diffs for per-file detail; `docs/ring-buffer.md`,
+  `docs/frames.md`, `docs/vtable-dynamic.md` were verified already-accurate and left
+  unchanged. `db-dynamic-streaming.md` is unrelated to this refactor (a metor-db design doc)
+  and was skipped.

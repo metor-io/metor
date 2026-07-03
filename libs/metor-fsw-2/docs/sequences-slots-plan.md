@@ -1,5 +1,13 @@
 # Implementation plan — slots & sequences
 
+> **Since superseded:** the "commands flow as frames" plane below was replaced by a
+> `SequenceCommand` **message** channel (`docs/messages.md` §4), then reframed again to
+> name-addressed, explicitly-edged per-slot fan-in (`docs/design-command-slots.md`,
+> `docs/review-fixes-plan.md` waves 4a-4c). The `#[sequence]` authoring surface also gained E7
+> ergonomics (injected `Backing`, free `now()`) after this plan landed — see
+> `docs/sequences-slots.md` §4.1 and `docs/design-system-macro.md`. Kept as the W1-W7
+> implementation history.
+
 Design: `docs/sequences-slots.md` (approved, decisions locked). Summary of what we build: a
 runtime-loadable **slot** (a swappable `CyclicSlot` position with a fixed port contract,
 pre-allocated rings, and an allowed occupant set) plus a `#[sequence]` decorator that turns

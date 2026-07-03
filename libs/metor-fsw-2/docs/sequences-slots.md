@@ -225,27 +225,56 @@ cube-sat commands its sequencer with an in-process `SequenceCommand` enum routed
 stellarator task holding `&mut self` (`Coordinator::run_for`, `src/coordinator/mod.rs:1101`),
 so an operator command must reach a *running* loop without a second mutable borrow.
 
-**Decided (§9 Q1): commands are frames, drained once per cycle.** This matches the framework's
-"everything is frames; live updates arrive as ordinary input frames" stance (system.md §1.5)
-and mirrors telemetry being the downlink: slot control is the **uplink**.
+**Decided (§9 Q1, since superseded in shape but not in spirit — see below): commands are
+`Msg`-carried, drained once per cycle.** This matches the framework's "everything flows as ordinary
+ports; live updates arrive as ordinary input records" stance (system.md §1.5) and mirrors telemetry
+being the downlink: slot control is the **uplink**.
 
-- The coordinator owns a `SlotControl` **input ring** (allocated like its status output,
-  coordinator.md §5.3). A `SlotCommand` frame carries `{ slot, command, occupant?, params? }`.
-- Each cycle, **before** stepping the slots, the coordinator drains the control ring
-  (`Input::drain`, not `latest` — commands must not be dropped) and applies each command to
-  the addressed `SlotRunner`. This is the fsw-2 analogue of `handle_command`
-  (`sequencer.rs:260`), folded into the loop instead of called from `main`.
-- **Who writes commands**, by the same dataflow rules: an uplink/command system
-  (`connect "uplink" -> "coordinator" frame="slot_command"`), or an in-process
-  `Coordinator::control_handle()` returning a cheap `Output<SlotCommand>` writer the host /
-  CLI / a test writes directly. We expose **both** — the frame is the model; the handle is the
-  in-proc convenience (cf. `Coordinator::progress()`, `src/coordinator/mod.rs:1110`).
+> **Superseded (2026-07-02): the mechanism below shipped, then was redesigned twice more** —
+> once to move commands off a bespoke `SlotCommand` zerocopy frame onto a `SequenceCommand`
+> **message** channel (`docs/messages.md` §4), and again to replace the coordinator-drained
+> broadcast with **per-slot explicit message edges** and **name** addressing
+> (`docs/message-wiring.md` §6, `docs/design-command-slots.md`). What is actually wired today:
+>
+> - Each slot declares an ordinary `commands: MsgIn<SequenceCommand>` **fan-in** port (a wired
+>   port with `FanIn::Many`, not a coordinator capability) — every producer that should reach a
+>   given slot is connected to it by an **explicit** KDL/builder edge; there is no implicit
+>   broadcast-to-every-slot sugar. A mission wires each producer × slot pair it wants:
+>   ```kdl
+>   uplink { transport "tcp" addr="127.0.0.1:2241" }
+>   connect "uplink"      -> "mode" msg="SequenceCommand"   // ground commands
+>   connect "coordinator" -> "mode" msg="SequenceCommand"   // in-proc control_handle()
+>   ```
+> - At the head of its own `step`, **before** polling its occupant, a slot drains its `commands`
+>   fan-in (`MsgIn::drain`, every-record — commands must not be dropped) and applies each one
+>   whose `cmd.channel` (a `String`) equals the slot's own **instance name**
+>   (`SlotRunner::apply_command`, `src/coordinator/slot.rs`) — filtering by name, not by a numeric
+>   `channel_id`/`ChannelId` (that type is gone; `SequenceCommand`/`SequenceChannelEvent` are
+>   name-addressed end-to-end, matching how the panel already addresses a slot).
+> - The coordinator is registered as an ordinary system **#0** under the reserved instance name
+>   `"coordinator"` (`docs/design-command-slots.md` §2.6): `Coordinator::control_handle()` returns
+>   a take-once `Option<MsgOut<SequenceCommand>>` over that bundle's own `commands` output, so the
+>   in-proc convenience is wired exactly like the uplink's — `connect "coordinator" -> "<slot>"
+>   msg="SequenceCommand"` is an ordinary edge, not a coordinator special case. There is **no**
+>   coordinator-side command-drain stage anymore; the coordinator does not know slots exist.
+> - The **uplink** is an ordinary `AsyncSystem` (`UplinkSystem`) with one `CommandOut<M>` output
+>   per forwarded command type (`CommandOut<M>` is `MsgOut<M>` sugar, untelemetered by default);
+>   it routes each received wire `Msg` to the declared output whose `PacketId` matches
+>   (`RouteMsg::route`, A8) and subscribes on the ground to exactly its declared outputs' ids.
+>
+> See `docs/messages.md` and `docs/message-wiring.md` for the full history and rationale; this
+> section is kept for the original "why frames/messages, not a `&mut` API" argument, which still
+> holds.
 
-Why frames rather than a `&mut` API: it needs no lock, no second executor handle, no change
-to the single-threaded cycle invariant (coordinator.md §3.7); commands are serialized through
-the same ring discipline as data and are themselves telemetered (the operator sees the
-command that loaded a sequence). The cooperative **Abort** signal then crosses to the
-occupant as ordinary ring data too — see §4.4 — so cancellation needs no new ABI either.
+Why a message channel rather than a `&mut` API: it needs no lock, no second executor handle, no
+change to the single-threaded cycle invariant (coordinator.md §3.7); commands are serialized
+through the same ring discipline as data. Unlike the original all-frame design, `commands` is
+**untelemetered by construction** at the producer (the uplink's/coordinator's `CommandOut`
+outputs) — inbound control is not automatically echoed onto the downlink, though a slot's own
+lifecycle *transitions* (Loaded/Started/Stopped/…) are still telemetered on its `SequenceChannelEvent`
+channel (§7), so the operator still sees the effect of a command even though the raw command
+Msg itself is not relayed. The cooperative **Abort** signal then crosses to the occupant as
+ordinary ring data too — see §4.4 — so cancellation needs no new ABI either.
 
 `Load` carries an **occupant id** (a name in the allowed set), not a path: the coordinator
 resolves it against the slot's pre-opened `DlSystem`s and `fsw_create`s with the carried
@@ -270,36 +299,48 @@ borrows" problem (and its refresh-cell machinery) evaporates.
 
 ### 4.1 Author shape
 
+> **Updated (E7, `docs/design-system-macro.md` §3.5/§7.4, landed):** the ring-`Backing` generic is
+> now **injected** by the macro rather than hand-written — a plain `async fn seq(mut x: Input<T>,
+> …)` gains a hidden `__B: Backing` and each port parameter type is rewritten to `Input<T, __B>`;
+> a hand-written `<B: Backing>` is still accepted (the macro uses it instead — no forced
+> migration). A free `now()` (and `Seq::now()` on an explicit handle) reads the ambient
+> `SeqClock`, so a sequence can stamp the frames it emits without threading `Timestamp` through by
+> hand, and output ports gained the infallible `publish()`/`publish_with()` (E6, system.md §2.1) —
+> `#[sequence]` adopts it the same way `#[system]` does. The example below is the current shape;
+> `att.latest().ok().flatten()`/`cmd.write(...).ok()` from an earlier revision of this doc are gone.
+
 ```rust
-use metor_fsw_2::sequence::{sequence, wait, progress, Outcome};
+// examples/adcs-fsw2/systems/commissioning/src/lib.rs, as shipped:
+use core::time::Duration;
+use adcs_contracts::{AttitudeEstimate, ModeCmd};
+use metor_fsw_2::sequence::{now, progress, wait};
+use metor_fsw_2::{Input, Outcome, Output};
 
 // `name` defaults to the fn name; override with #[sequence(name = "...")].
-#[sequence]
-async fn commissioning<B: Backing>(
-    att:  Input<AttitudeEstimate, B>,    // every Input<T,B>/Output<T,B> param is a port
-    gyro: Input<GyroBias, B>,
-    mut cmd: Output<AttitudeCmd, B>,
-) -> Outcome {
-    progress("warming up");                                  // free fn — ambient (§4.3)
-    if wait(Duration::from_secs(2)).await.aborted() { return safing(&mut cmd); }
-    let est = att.latest().ok().flatten();                  // ports owned: plain method calls
-    cmd.write(&AttitudeCmd::settle()).ok();
+#[metor_fsw_2::sequence]
+async fn commissioning(mut att: Input<AttitudeEstimate>, mut mode: Output<ModeCmd>) -> Outcome {
+    progress("warming up");                                        // free fn — ambient (§4.3)
+    if wait(Duration::from_millis(100)).await.aborted() {
+        mode.publish(&ModeCmd::safe().stamped(now()));              // E6 publish + E7 now()
+        return Outcome::Aborted;
+    }
+    let _ = att.latest();                                          // E3: Option, no Result
+    mode.publish(&ModeCmd::settling().stamped(now()));
     progress("reaction wheels enabled");
-    if wait(Duration::from_secs(3)).await.aborted() { return safing(&mut cmd); }
-    cmd.write(&AttitudeCmd::hil_point()).ok();
+    if wait(Duration::from_millis(150)).await.aborted() {
+        mode.publish(&ModeCmd::safe().stamped(now()));
+        return Outcome::Aborted;
+    }
+    mode.publish(&ModeCmd::pointing().stamped(now()));
+    progress("pointing");
     Outcome::Completed
 }
 ```
 
 This is cube-sat's `commissioning` body (`sequencer.rs:149-162`) almost verbatim, with the
-shared `FSW` handle replaced by typed owned ports and the timer replaced by the free
-`wait`/`progress` functions. The function is `Backing`-generic so the generated occupant
-loads as a `cdylib`. `#[sequence(name = "safe_mode")]` overrides the name:
-
-```rust
-#[sequence(name = "safe_mode")]
-async fn safe(mut cmd: Output<AttitudeCmd, B>) -> Outcome { /* ... */ }
-```
+shared `FSW` handle replaced by typed owned ports (`Input<AttitudeEstimate>`/`Output<ModeCmd>`, no
+`<B: Backing>` written by hand — injected) and the timer replaced by the free `wait`/`progress`
+API. `#[sequence(name = "safe_mode")]` overrides the name (`examples/adcs-fsw2/systems/safe-mode`).
 
 The **port set is read straight off the signature** — no separate `SystemInput`/
 `SystemOutput` bundle structs to declare. (Alternative considered: an attribute list

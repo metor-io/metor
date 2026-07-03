@@ -120,8 +120,8 @@ system's instance name so the telemetry sink can prefix that buffer's records (�
 A **cyclic** system, its `Input` bundle, and its `Out<Output>` bundle are owned together by the
 coordinator across cycles. This is exactly what `CyclicRunner<S, O>` (`src/system/mod.rs`,
 `CyclicRunner { system, input, output, state }`) holds. The coordinator stores cyclic systems as a
-heterogeneous `Vec<Box<dyn CyclicSlot>>`; `CyclicRunner` and the dlopen `DlSlot` both implement
-`CyclicSlot` (§3.4).
+heterogeneous `Vec<Box<dyn CyclicSlot>>`; `CyclicRunner`, the dlopen `DlSlot`, and the
+runtime-loadable `SlotRunner` (`docs/sequences-slots.md`) all implement `CyclicSlot` (§3.4).
 
 An **async** system is different: its `run` future borrows `&mut self`, `&mut Input`, `&mut Output`
 for the whole loop, so those three move *into* the spawned task and are owned by it, not by the
@@ -388,19 +388,32 @@ pub(crate) trait CyclicSlot {
 
 `CyclicRunner<S, O>` is the static-system implementation: it owns `system/input/output/state`, times
 `execute` with `Instant::now`, calls `output.health().end_cycle(now, micros)`, and performs the
-lapped-to-stop transition described in §3.3. `DlSlot` is the dlopen implementation (§3.6). Slot
-state is:
+lapped-to-stop transition described in §3.3. `DlSlot` is the dlopen implementation (§3.6);
+`SlotRunner` (`docs/sequences-slots.md`) is the third, a runtime-swappable slot whose *occupant* can
+be loaded/started/stopped/reset at runtime rather than being fixed at `build()`. `SlotState` is
+shared by all three, since a runtime slot's lifecycle is a strict superset of the static two-state
+one:
 
 ```rust
 pub enum StopReason { LappedInput, Panicked }
 
-pub enum SlotState { Running, Stopped { reason: StopReason } }
+pub enum SlotState {
+    Empty,              // no occupant yet (SlotRunner only)
+    Loaded,              // occupant built, not yet polling (SlotRunner only)
+    Running,             // polled every cycle — the only state CyclicRunner/DlSlot ever reach
+    Done { outcome: u8 }, // the occupant's future returned Ready — terminal success (SlotRunner only)
+    Stopped { reason: StopReason },
+}
 ```
 
-`LappedInput` is reachable by any slot. `Panicked` is reachable only by a `DlSlot` — a `.so` that
-panics inside its boundary returns `FswStatus::Panicked` and the slot hard-stops; a static
-`CyclicRunner` cannot produce it (a panic there unwinds the host directly). Once `Stopped`, a slot
-is never cleared.
+`LappedInput` is reachable by any slot kind. `Panicked` is reachable only by a `.so`-backed slot
+(`DlSlot`, or a `SlotRunner` whose occupant panics inside its boundary) — it returns
+`FswStatus::Panicked` and the slot hard-stops; a static `CyclicRunner` cannot produce it (a panic
+there unwinds the host directly). A static `CyclicRunner`/`DlSlot` only ever occupies `Running` or
+`Stopped`; `Empty`/`Loaded`/`Done` are reachable only through a `SlotRunner`'s runtime lifecycle
+commands (`docs/sequences-slots.md` §3, `docs/messages.md` §4). Once `Stopped`, a slot is never
+cleared by any kind (a `SlotRunner`'s `Stopped` still needs an explicit `Reset` to become `Loaded`
+again, not an automatic clear).
 
 ### 3.5 Surfacing stopped systems
 

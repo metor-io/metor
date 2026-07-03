@@ -12,7 +12,9 @@ a span-carrying [`LoadError`] — a `miette` `Diagnostic` mirroring `metor-proto
 The wiring module lives at `src/wiring/` and is gated behind the `kdl` cargo feature (default-on):
 
 - `src/wiring/mod.rs` — the KDL deserializer (`parse`), the shared resolver (`resolve`), the static
-  system [`Registry`], the [`FromKdlNode`] param trait, and the dl schema-guided param encoder.
+  system [`Registry`], and the dl schema-guided param encoder (`encode_kdl_params`).
+- `src/wiring/de.rs` — the in-house `serde::Deserializer` over `kdl-rs` nodes (`from_kdl_node` for
+  a typed static path, `params_value` for the dl `serde_json::Value` path) — `docs/design-kdl-serde.md`.
 - `src/wiring/model.rs` — the serializable [`Wiring`] data model.
 - `src/wiring/builder.rs` — the fluent Rust [`WiringBuilder`] front-end.
 - `src/wiring/build_driver.rs` — the cargo build driver that locates each artifact's `.so`.
@@ -128,8 +130,8 @@ pub enum ParamSource {
 
 `artifact` is the static-vs-dl switch: `None` resolves through the [`Registry`], `Some(id)`
 `dlopen`s that [`Artifact`]. [`ParamSource`] is an explicit three-way so the cases never overload a
-single `Vec<u8>`. Each variant becomes the same canonical postcard `Params` bytes (dl) or feeds a
-[`FromKdlNode`] re-parse (static) at resolve time — see §6.
+single `Vec<u8>`. Each variant becomes the same canonical postcard `Params` bytes (dl) or feeds the
+`serde::Deserializer` re-decode (static) at resolve time — see §5.
 
 ### 1.4 `EdgeSpec`
 
@@ -202,19 +204,23 @@ needs no `artifact` nodes.
 
 ```kdl
 system "imu" type="ImuDriver" i2c_bus=1 sample_hz=200.0     // static
-system "plant" type="Plant" lib="plant" gain=5.0            // dl (references artifact "plant")
+system "plant" type="Plant" artifact="plant" gain=5.0       // dl (references artifact "plant")
 ```
 
 - The first (nameless) argument, `"imu"`, is the **instance name** — the unique handle the rest of
   the document refers to, and the telemetry prefix (§7). It is not the type name; two instances of
   one type get two distinct instance names. Duplicates are a [`DuplicateInstance`] error.
-- `type=` is the **registry key** (static) or must match the artifact's `system_type` (dl). Required
-  ([`MissingType`] otherwise).
-- `lib=` (optional) makes this a **dl** system referencing that `artifact` id; absent ⇒ a **static**
-  system resolved through the [`Registry`].
-- Every other property (anything but the reserved `type=`/`lib=`) is a **param** (§6). A system with
-  any config property carries [`ParamSource::Kdl`] (its node source text, verbatim); a config-less
-  system carries [`ParamSource::None`].
+- `type=` is the **registry key** (static) or must match the artifact's `system_type` (dl); it is
+  optional for a dl system (the artifact's `system_type` is authoritative and a given `type=` is
+  validated against it) but required for a static one ([`MissingType`] otherwise).
+- `artifact=` (optional) makes this a **dl** system referencing that `artifact` id; absent ⇒ a
+  **static** system resolved through the [`Registry`]. (This property was originally spelled `lib=`
+  — same as the `artifact` node's own stem property — and was hard-renamed to `artifact=` so the
+  two could not be confused; there is no `lib=` alias.)
+- Every other property (anything but the reserved `type=`/`artifact=`) is a **param** (§6). A system
+  with any config property carries [`ParamSource::Kdl`] (its node source text, verbatim); a
+  config-less system carries [`ParamSource::None`]. A repeated property or an unrecognized top-level
+  node is a load error (stricter than KDL's own last-wins).
 
 Cyclic vs async is **not** declared in KDL — it is a property of the Rust type (`impl CyclicSystem`
 vs `impl AsyncSystem`), and the factory knows which `add_*` to call (§3.2). The document cannot
@@ -222,21 +228,34 @@ contradict the type.
 
 ### 2.4 `connect`
 
-An edge names a producer endpoint and a consumer endpoint, each as `(instance, frame)`. Two
-syntaxes desugar to the same [`EdgeSpec`]:
+An edge names a producer endpoint and a consumer endpoint, each as `(instance, port)`. There is
+**one** `connect` node kind; whether it is a **frame** edge or a **message** edge is inferred from
+which property is present — `frame=` or `msg=` (`EdgeSpec::kind: EdgeKind { Frame, Msg }`,
+`docs/message-wiring.md` §3.4). Two syntaxes desugar to the same [`EdgeSpec`]:
 
 ```kdl
-connect "imu" -> "nav" frame="imu"                  // shorthand (the common case)
+connect "imu" -> "nav" frame="imu"                  // shorthand, frame edge (the common case)
 connect from="nav" out="nav" to="log" in="nav"      // explicit long form
 connect "ctrl" -> "plant" frame="torque_cmd" delayed=#true   // feedback back-edge
+connect "uplink" -> "mode" msg="SequenceCommand"    // message edge (many-to-many, no cycle check)
 ```
 
-- Shorthand: nameless `"from"`, an optional `->`, `"to"`, plus `frame="…"` (which becomes both `out`
-  and `in`).
-- Explicit: `from`/`to` instance names and `out`/`in` frame names. The asymmetric form exists for
-  the rare producer/consumer frame-name mismatch, but since `connect` requires
-  `producer.frame_id == consumer.frame_id`, `out` and `in` must hash equal.
-- `delayed=#true` marks the edge a one-cycle-delayed feedback back-edge (default `#false`).
+- Shorthand: nameless `"from"`, an optional `->`, `"to"`, plus `frame="…"`/`msg="…"` (which becomes
+  both `out` and `in`).
+- Explicit: `from`/`to` instance names and `out`/`in` port names. The asymmetric form exists for the
+  rare producer/consumer name mismatch, but since `connect` requires the two ports' edge keys to
+  match (`F::FRAME_ID` for a frame edge, `M::ID` for a message edge), `out` and `in` must hash
+  equal.
+- `delayed=#true` marks the edge a one-cycle-delayed feedback back-edge (default `#false`; frame
+  edges only — message edges are excluded from feedback-cycle detection in the first place, so
+  `delayed` is meaningless on one).
+- A **message** edge (`msg=`) is many-to-many (an input may take zero, one, or many producers,
+  unlike a frame input's exactly-one rule) and does not participate in cycle detection — a command
+  channel is a decoupled event bus, not a same-cycle data dependency. The `WiringBuilder` exposes
+  the same two kinds as `connect`/`connect_delayed` (frame) and `connect_msg` (message) — an
+  ergonomic split kept in the Rust front-end even though the lower-level
+  `CoordinatorBuilder`/`PortRef` API needs only one `connect`, inferring the kind from the
+  `PortRef`'s `PortId` (`Component` vs `Packet`).
 
 ### 2.5 `telemetry`
 
@@ -291,7 +310,7 @@ pub type SystemFactory = fn(&mut LoadCtx) -> Result<(SystemHandle, SystemDescrip
 impl Registry {
     pub fn new() -> Self;
     pub fn register<S, K>(&mut self, type_name: &'static str) -> &mut Self
-    where S: BuildSystem + AddToBuilder<K>, S::Params: FromKdlNode;
+    where S: BuildSystem + AddToBuilder<K>, S::Params: serde::de::DeserializeOwned;
 }
 ```
 
@@ -305,10 +324,10 @@ Construction is split in two:
 
 - [`BuildSystem`] (`src/system/`) is the **format-independent** contract: `type Params` + `fn new`,
   with no KDL coupling. This is what `export_system!`/the dlopen ABI also use.
-- [`RegisteredSystem`] is a **blanket marker** adding only the `Params: FromKdlNode` bound the static
-  factory needs: every `BuildSystem` whose `Params` is [`FromKdlNode`] is automatically a
-  `RegisteredSystem`. A statically-registered system therefore implements [`BuildSystem`] (not this);
-  a dl-only system needs no `FromKdlNode` impl at all.
+- The static factory adds only one more bound: `S::Params: serde::de::DeserializeOwned` — every
+  `BuildSystem` whose `Params` derives (or hand-implements) `serde::Deserialize` can register
+  statically. A dl-only system needs no `Deserialize` impl on `Params` at all (its params reach the
+  host as opaque postcard bytes, §6).
 
 The cyclic-vs-async branch is resolved at **compile** time by the [`AddToBuilder<Kind>`] trait, with
 two non-overlapping blanket impls keyed on a `Kind` marker (`CyclicKind` / `AsyncKind`):
@@ -381,37 +400,38 @@ frame, `ComponentId::new` resolves it, and compatibility is checked on the **rea
 
 ## 5. Param deserialization (static systems)
 
-A static system's KDL config becomes its `Params` struct via [`FromKdlNode`]:
+A static system's KDL config becomes its `Params` struct through an **in-house `serde::Deserializer`
+over `kdl-rs` nodes** (`src/wiring/de.rs`, `docs/design-kdl-serde.md`) — there is no
+`FromKdlNode`/`FromKdlScalar` trait or derive anymore. `Params` is an ordinary
+`#[derive(serde::Deserialize)]` struct:
 
 ```rust
-pub trait FromKdlNode: Sized {
-    fn from_kdl_node(node: &KdlNode, src: &str) -> Result<Self, LoadError>;
-}
-impl FromKdlNode for () { /* a no-params system uses `type Params = ()` */ }
-```
-
-The `#[derive(FromKdlNode)]` macro generates the walk per field over the node's properties, leaning
-on the [`FromKdlScalar`] leaf trait (implemented for the integer types, `f32`/`f64`, `bool`, and
-`String`). Floats accept an integer literal (`rate=200` ⇒ `200.0`). Field kinds:
-
-- `f: T` — a **required** property (`MissingParam` if absent, `InvalidParam` on a type mismatch).
-- `f: Option<T>` — **optional**; absent ⇒ `None`.
-- `#[kdl(default = …)]` — defaulted when absent.
-
-```rust
-#[derive(FromKdlNode)]
+#[derive(serde::Deserialize)]
 struct RoundTrip {
     count:  i64,
     rate:   f64,
     label:  String,
     offset: Option<f64>,
-    #[kdl(default = 4)]
+    #[serde(default = "four")]
     depth:  i64,
 }
+fn four() -> i64 { 4 }
 ```
 
+`from_kdl_node::<T>(node, src, system, reserved, skip_args)` (`de.rs:47`) drives `T::deserialize`
+against the node: each KDL property becomes a struct field (a required field absent ⇒
+`MissingParam`, a value whose KDL type doesn't coerce to the field's ⇒ `InvalidParam`; floats accept
+an integer literal, `rate=200` ⇒ `200.0`); a field missing from the node but with a serde `#[serde(default
+= …)]` uses that default; a `Option<T>` field absent ⇒ `None`; an `f: bool` reads a KDL `#true`/`#false`.
+`reserved` is the wiring-owned property keys the node's own surface consumes and the deserializer
+must skip (`&["type", "artifact"]` on a `system` node, `&["occupant"]` on an `allow` node);
+`skip_args` is the count of leading positional arguments the wiring surface owns (1 for the instance
+name on `system`, 0 on a node with none). An unknown top-level node or a **repeated** property is a
+load error — stricter than KDL's own last-wins semantics. This is the same deserializer the dl path's
+`params_value` uses (§6.3), just decoding to a concrete `T` instead of `serde_json::Value`.
+
 The param schema is owned by the system crate, next to the system — the loader never hard-codes any
-system's fields. The helper functions `kdl_required`/`kdl_optional` back the derive.
+system's fields. A paramless system uses `type Params = ()`.
 
 ---
 
@@ -451,17 +471,18 @@ whether authored in Rust or in KDL — so KDL ≡ the Rust builder on the wire.
   schema-encodes it against the `.so`'s **exported** `Params` schema ([`DlSystem::params_schema`],
   an `OwnedNamedType` from `postcard-schema`) — the host never links the system's `Params` type.
 
-`encode_kdl_params` walks the schema's named struct fields (so JSON object order is canonical,
-matching the typed builder's struct-field order — the basis of the byte equality), pulls the matching
-KDL property for each, coerces it to the field's leaf type (reusing the [`FromKdlScalar`] coercion
-rules), builds a dynamic `serde_json::Value`, and hands it to `postcard_dyn::to_stdvec_dyn`. Only a
-top-level struct of scalar fields (or a unit) maps from flat KDL properties. The errors are
-span-aware:
+`encode_kdl_params` first runs the node through the **same** `de.rs` deserializer §5 uses (via
+`params_value`), targeting a dynamic `serde_json::Value` rather than a concrete `T` — so KDL parsing
+itself is one code path for both the static and dl surfaces. It then `conform_to_schema`s that value
+against the `.so`'s schema (so JSON object order becomes canonical, matching the typed builder's
+struct-field order — the basis of the byte equality), recursing per field with `conform_value`, and
+hands the conformed value to `postcard_dyn::to_stdvec_dyn`. Only a top-level struct of scalar fields
+(or a unit) maps from flat KDL properties. The errors are span-aware (`src/wiring/mod.rs`):
 
-- [`DlUnknownParam`] — a property with no matching schema field.
-- [`DlMissingParam`] — a non-`Option` schema field with no property (the schema has no defaults; an
+- [`UnknownParam`] — a property with no matching schema field.
+- [`MissingParam`] — a non-`Option` schema field with no property (the schema has no defaults; an
   `Option` field with no property encodes as `None`).
-- [`DlParamTypeMismatch`] — a property whose value type does not match the field.
+- [`InvalidParam`] — a property whose value type does not match the field.
 - [`DlParamEncode`] — an un-encodable schema shape, or the dynamic encoder rejected the value.
 
 The byte equality is asserted directly in the integration test (`tests/wiring_resolve.rs`): the same
@@ -502,12 +523,12 @@ registry (`src/registry.rs`) indexes each tappable buffer by its instance-qualif
 | `MissingCoordinator` / `MultipleCoordinators` | not exactly one `coordinator` |
 | `MissingInstanceName` / `MissingType` / `DuplicateInstance` | malformed/duplicate `system` |
 | `UnknownType` | `type=` not in the registry |
-| `MissingParam` / `InvalidParam` | static-system param missing / wrong type |
+| `UnknownParam` / `MissingParam` / `InvalidParam` | a param property with no schema field / a required field absent / a type mismatch — shared by the static deserializer (§5) and the dl schema-conform pass (§6.3) |
 | `MissingEdgeField` | incomplete `connect` |
 | `UnknownInstance` / `UnknownFrame` | edge endpoint resolution (§4.2) |
 | `Wire` | a `WireError` from `connect`/`build()` (§4.3) |
 | `MissingArtifactField` / `UnknownArtifact` / `ArtifactNotBuilt` / `DlOpen` | dl artifact resolution |
-| `DlUnknownParam` / `DlMissingParam` / `DlParamTypeMismatch` / `DlParamEncode` | dl param encoding (§6.3) |
+| `DlParamEncode` | dl param encoding: an un-encodable schema shape, or the dynamic postcard encoder rejected the value (§6.3) |
 
 When [`parse`] produces the [`Wiring`], every error carries the offending document span. When
 [`resolve`] consumes a [`Wiring`], the source spans are not available (a builder-origin [`Wiring`]
@@ -526,7 +547,7 @@ are wrapped with the error's own rendered message as the snippet.
 | Frame addressing | `ComponentId::new(name)` (== `Frame::FRAME_ID`); `SystemDescriptor`/`PortDesc.frame_id` | the resolver + typo guard (§4) |
 | Error reporting | `thiserror` + `miette` `Diagnostic` | `LoadError` (§8) |
 | dl ABI | `DlSystem`, `export_system!`, `fsw_*` symbols, `params_schema` | the build driver, the schema-guided KDL encoder (§6) |
-| System construction | `BuildSystem::new` | `Registry`, `SystemFactory`, `AddToBuilder`, `FromKdlNode` derive (§3, §5) |
+| System construction | `BuildSystem::new` | `Registry`, `SystemFactory`, `AddToBuilder`, the KDL `serde::Deserializer` (§3, §5) |
 | Mission description | — | the `Wiring` data model + `WiringBuilder` + `parse`/`resolve` (§0, §1) |
 
 ---
@@ -536,7 +557,7 @@ are wrapped with the error's own rendered message as the snippet.
 - `src/wiring/tests.rs` — the in-crate acceptance suite: an end-to-end KDL load + run of a
   params-bearing cyclic chain into an async logger; instance-name disambiguation of two instances of
   one type; the span-carrying error cases; feedback-cycle detection and the `delayed=#true` break; a
-  `telemetry` node loading; the `FromKdlNode` derive round-trip; and the **front-end equivalence**
+  `telemetry` node loading; the KDL `serde::Deserializer` round-trip (`src/wiring/de.rs`); and the **front-end equivalence**
   tests (`parse` and `WiringBuilder` produce byte-equal [`Wiring`], and a builder-origin [`Wiring`]
   resolves and runs).
 - `tests/wiring_resolve.rs` — the dl acceptance gate driven **through** the [`Wiring`] data model: a

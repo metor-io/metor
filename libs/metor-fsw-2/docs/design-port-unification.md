@@ -1,5 +1,10 @@
 # Port unification (`design-port-unification`)
 
+> **Status: LANDED** — implemented across commits `0ba6c284`..`8e628dfd` (A1/C1-C7, 7 staged
+> commits: unified port descriptor axes, single-pathed `build()`, ONE registry, one telemetry
+> Tap/HandOff/drain loop, lap policy + `CommandOut` sugar, `ReceiveAll` as a capability, the
+> schema-tagged dl ABI). `docs/system.md` §5 and `docs/telemetry.md` reflect the shipped shape.
+
 **Status:** design, not yet implemented.
 **Covers review findings:** A1 (primary), A5, A6, A7, A10, A4, plus the parts of C4
 subsumed by A1 and S5's panicking descriptor accessors.
