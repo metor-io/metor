@@ -15,7 +15,8 @@
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
 
 use metor_fsw_2::{
-    BuildSystem, CyclicSystem, Input, Out, Output, System, SystemInput, SystemOutput,
+    BuildSystem, CyclicSystem, Input, MsgOut, NamedMsg, Out, Output, System, SystemInput,
+    SystemOutput,
 };
 use metor_fsw_2::metor_proto::types::Timestamp;
 use metor_fsw_2::ring::{Backing, BoxBacking};
@@ -41,6 +42,20 @@ pub struct TickOut {
     #[metor_fsw(timestamp)]
     pub timestamp: Timestamp,
     pub count: u64,
+}
+
+/// A self-describing `(PacketId, postcard)` **message** this system also emits — the
+/// Postcard-schema port crossing the dl ABI (`fsw_describe` carries it as
+/// `PortSchemaMsg::Postcard`; the host wires + taps it like any message channel).
+/// The `Msg` impl is the blanket `Serialize + Schema` one; the id hashes the schema
+/// name, so the host's byte-identical mirror decodes it with nothing but the id.
+#[derive(Serialize, Deserialize, Schema, Debug, PartialEq)]
+pub struct TickEvent {
+    pub count: u64,
+}
+
+impl NamedMsg for TickEvent {
+    const NAME: &'static str = "TickEvent";
 }
 
 /// Two params of **differing types** crossing `fsw_create` as postcard bytes (so the
@@ -70,6 +85,8 @@ pub struct DlCounterIn<B: Backing = BoxBacking> {
 #[derive(SystemOutput)]
 pub struct DlCounterOut<B: Backing = BoxBacking> {
     out: Output<TickOut, B>,
+    /// The Postcard port beside the Table port — one bundle, both schemas.
+    events: MsgOut<TickEvent, B>,
 }
 
 impl<B: Backing> System<B> for DlCounter {
@@ -92,10 +109,13 @@ impl<B: Backing> CyclicSystem<B> for DlCounter {
                 return;
             }
         };
+        let count = self.start + (value as f64 * self.scale).round() as u64;
         let _ = output.out.write(&TickOut {
             timestamp: now,
-            count: self.start + (value as f64 * self.scale).round() as u64,
+            count,
         });
+        // The message twin: every cycle's count as a self-describing log record.
+        let _ = output.events.emit(&TickEvent { count });
     }
 }
 

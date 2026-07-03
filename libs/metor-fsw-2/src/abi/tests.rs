@@ -22,7 +22,8 @@ use serde::{Deserialize, Serialize};
 use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
 
 use crate::abi::{
-    FswRing, FswStatus, RawBinder, ROLE_INPUT, ROLE_OUTPUT, SystemDescriptorMsg, run_bind_init,
+    FswRing, FswStatus, PortDescMsg, PortSchemaMsg, RawBinder, ROLE_INPUT, ROLE_OUTPUT,
+    SystemDescriptorMsg, run_bind_init,
     run_create, run_destroy, run_execute, run_seq_bind_init, run_seq_create, run_seq_destroy,
     run_seq_execute, run_seq_shutdown, run_shutdown,
 };
@@ -219,17 +220,32 @@ fn abi_describe_round_trips() {
     // Ports / frame ids match the static descriptor.
     assert_eq!(msg.inputs.len(), desc.inputs.len());
     assert_eq!(msg.inputs.len(), 1);
-    assert_eq!(msg.inputs[0].frame_id, TickIn::FRAME_ID);
-    assert_eq!(msg.inputs[0].frame_id, desc.inputs[0].id.component().expect("table port"));
+    let table_frame_id = |m: &PortDescMsg| match &m.schema {
+        PortSchemaMsg::Table { frame_id, .. } => *frame_id,
+        PortSchemaMsg::Postcard { .. } => panic!("expected a Table port"),
+    };
+    assert_eq!(table_frame_id(&msg.inputs[0]), TickIn::FRAME_ID);
+    assert_eq!(
+        table_frame_id(&msg.inputs[0]),
+        desc.inputs[0].id.component().expect("table port")
+    );
 
     // user `out` + implicit health + implicit log.
     assert_eq!(msg.outputs.len(), desc.outputs.len());
     assert_eq!(msg.outputs.len(), 3);
-    assert_eq!(msg.outputs[0].frame_id, TickOut::FRAME_ID);
+    assert_eq!(table_frame_id(&msg.outputs[0]), TickOut::FRAME_ID);
     for (m, d) in msg.outputs.iter().zip(&desc.outputs) {
-        assert_eq!(m.frame_id, d.id.component().expect("table port"));
-        assert_eq!(m.frame_name, d.name);
+        assert_eq!(table_frame_id(m), d.id.component().expect("table port"));
+        assert_eq!(m.name, d.name);
+        // The axes + telemetry flag ride the wire verbatim.
+        assert_eq!(m.delivery, d.delivery);
+        assert_eq!(m.fan_in, d.fan_in);
+        assert_eq!(m.on_lap, d.on_lap);
+        assert_eq!(m.telemetered, d.telemetered);
     }
+
+    // Every static system declares no host capabilities.
+    assert!(msg.capabilities.is_empty());
 
     // params_schema present and correct.
     assert_eq!(
@@ -262,10 +278,8 @@ fn realized_ids(vt: &VTable) -> Vec<ComponentId> {
 fn dl_announce_prefixes_vtable_ids() {
     // Lower → wire → reconstruct the descriptor exactly as the host loader does.
     let desc = <Counter as CyclicSystem>::descriptor();
-    let in_meta: Vec<_> = desc.inputs.iter().map(|p| (p.announce().expect("table port"))("").1).collect();
-    let out_meta: Vec<_> = desc.outputs.iter().map(|p| (p.announce().expect("table port"))("").1).collect();
     let schema = OwnedNamedType::from(<CounterParams as Schema>::SCHEMA);
-    let msg = SystemDescriptorMsg::lower(&desc, schema, in_meta, out_meta);
+    let msg = SystemDescriptorMsg::lower(&desc, schema);
     let rebuilt = msg.into_descriptor();
 
     // The user output `out` (frame `tick_out`, field `count`) is outputs[0].
@@ -703,4 +717,53 @@ fn seq_abi_runs_to_done() {
         run_seq_destroy::<WaitSeq>(state);
     }
     drop((control_ring, status_ring, health_ring, log_ring, status_view));
+}
+
+// ---------------------------------------------------------------------------
+// 3c. The schema-tagged PortDescMsg (C7): both arms postcard round-trip with
+//     their axes; the Postcard arm reconstructs a wire-usable message port.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn port_desc_msg_round_trips_both_arms() {
+    use metor_proto::types::Msg;
+    use metor_proto_wkt::SequenceCommand;
+
+    use crate::{Delivery, FanIn, OnLap, PortDesc, PortId, PortSchema};
+
+    // Postcard arm — with non-default axes, so the overrides ride the wire too.
+    let d = PortDesc::msg::<SequenceCommand>()
+        .untelemetered()
+        .with_on_lap(OnLap::Stop);
+    let m = PortDescMsg::lower(&d);
+    let bytes = postcard::to_allocvec(&m).expect("encodes");
+    let back: PortDescMsg = postcard::from_bytes(&bytes).expect("decodes");
+    let rd = back.into_port_desc();
+    assert_eq!(rd.id, PortId::Packet(SequenceCommand::ID));
+    assert_eq!(rd.name, "SequenceCommand");
+    assert_eq!(rd.max_size, d.max_size);
+    assert!(matches!(rd.schema, PortSchema::Postcard));
+    assert!(rd.vtable().is_none(), "no vtable on a Postcard port (checked, S5)");
+    assert_eq!(rd.delivery, Delivery::Log);
+    assert_eq!(rd.fan_in, FanIn::Many);
+    assert_eq!(rd.on_lap, OnLap::Stop, "the override survived the wire");
+    assert!(!rd.telemetered, "the opt-out survived the wire");
+    // The reconstructed desc satisfies an edge against the static twin.
+    assert!(crate::compatible(&rd, &PortDesc::msg::<SequenceCommand>()));
+
+    // Table arm — axes at their frame defaults.
+    let d = PortDesc::of::<TickOut>();
+    let m = PortDescMsg::lower(&d);
+    let bytes = postcard::to_allocvec(&m).expect("encodes");
+    let back: PortDescMsg = postcard::from_bytes(&bytes).expect("decodes");
+    let rd = back.into_port_desc();
+    assert_eq!(rd.id, PortId::Component(TickOut::FRAME_ID));
+    assert_eq!(rd.name, "tick_out");
+    assert_eq!(rd.delivery, Delivery::Snapshot);
+    assert_eq!(rd.fan_in, FanIn::One);
+    assert_eq!(rd.on_lap, OnLap::Stop);
+    assert!(rd.telemetered);
+    // Wiring compatibility runs over the carried unprefixed vtable, unchanged.
+    assert!(crate::compatible(&PortDesc::of::<TickOut>(), &rd));
+    assert!(crate::compatible(&rd, &PortDesc::of::<TickOut>()));
 }

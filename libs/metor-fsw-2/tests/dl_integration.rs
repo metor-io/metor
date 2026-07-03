@@ -19,11 +19,13 @@
 use std::path::PathBuf;
 use std::process::Command;
 
-use metor_fsw_2::metor_proto::types::{ComponentId, Timestamp};
+use metor_fsw_2::metor_proto::types::{ComponentId, Msg, Timestamp};
 use metor_fsw_2::{
-    ClockMode, Coordinator, CoordinatorConfig, CyclicSystem, DlSystem, Frame, Input, Out, Output,
-    PortRef, StopReason, System, SystemInput, SystemKind, SystemOutput,
+    ClockMode, Coordinator, CoordinatorConfig, CyclicSystem, Delivery, DlSystem, FanIn, Frame,
+    Input, MsgIn, OnLap, Out, Output, PortRef, StopReason, System, SystemInput, SystemKind,
+    SystemOutput,
 };
+use postcard_schema::Schema;
 use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
 
 // ---------------------------------------------------------------------------
@@ -55,6 +57,14 @@ struct TickOut {
 struct CounterParams {
     start: u64,
     scale: f64,
+}
+
+/// Mirror of the fixture's `TickEvent` message: same schema name → same hashed
+/// `PacketId`, so the host decodes the dl system's Postcard records with nothing
+/// but the id (self-describing — no vtable, no announce).
+#[derive(serde::Serialize, serde::Deserialize, Schema, Debug)]
+struct TickEvent {
+    count: u64,
 }
 
 // ---------------------------------------------------------------------------
@@ -168,9 +178,19 @@ fn dlopen_cyclic_system_end_to_end() {
     assert_eq!(desc.kind, SystemKind::Cyclic);
     assert_eq!(desc.inputs.len(), 1, "one user input (tick_in)");
     assert_eq!(desc.inputs[0].id.component().expect("table port"), TickIn::FRAME_ID);
-    // user `out` + implicit health + implicit log.
-    assert_eq!(desc.outputs.len(), 3);
+    // user `out` + user `events` (the Postcard port) + implicit health + implicit log.
+    assert_eq!(desc.outputs.len(), 4);
     assert_eq!(desc.outputs[0].id.component().expect("table port"), TickOut::FRAME_ID);
+    // The message port crossed the ABI schema-tagged, axes intact (C7): a `.so`
+    // declares a Postcard port exactly like a static system.
+    let events = &desc.outputs[1];
+    assert_eq!(events.id.packet().expect("postcard port"), TickEvent::ID);
+    assert_eq!(events.name, "TickEvent", "the NamedMsg token survives the wire");
+    assert_eq!(events.delivery, Delivery::Log);
+    assert_eq!(events.fan_in, FanIn::Many);
+    assert_eq!(events.on_lap, OnLap::Resync);
+    assert!(events.telemetered);
+    assert!(desc.capabilities.is_empty(), "a .so can hold no host capabilities");
 
     // 2. Wire a static producer → the dlopen'd consumer, with params start=1000.
     let params = postcard::to_allocvec(&CounterParams { start: 1000, scale: 1.0 }).unwrap();
@@ -199,6 +219,15 @@ fn dlopen_cyclic_system_end_to_end() {
             .expect("dl output is registered for telemetry `All`")
             .expect("a reader slot is available"),
     );
+    // The Postcard port is a registered message channel like any static system's:
+    // keyed `<instance>.<NAME>`, drained with an ordinary host-side MsgIn.
+    let mut events_in: MsgIn<TickEvent> = MsgIn::new(
+        coord
+            .registry()
+            .view(ComponentId::new("dl_counter.TickEvent"))
+            .expect("dl message channel is registered")
+            .expect("a reader slot is available"),
+    );
 
     // 4. Run several cycles (producer runs before consumer each cycle, so the consumer
     //    samples this cycle's fresh value). `run_for` does init (fsw_bind_init) → run
@@ -216,11 +245,21 @@ fn dlopen_cyclic_system_end_to_end() {
         .expect("the dl system produced a tick_out");
     assert_eq!(out.get().count, 1000 + CYCLES as u64, "start + latest value");
 
+    // 5b. The dl system's Postcard port wired end-to-end: every cycle's event is on
+    //     the log channel, in order, decoded purely from the self-describing id.
+    let mut counts: Vec<u64> = Vec::new();
+    events_in.drain(|e| counts.push(e.count));
+    assert_eq!(
+        counts,
+        (1..=CYCLES as u64).map(|v| 1000 + v).collect::<Vec<_>>(),
+        "every-record log semantics across the dl boundary"
+    );
+
     // 6. Clean teardown: dropping the coordinator runs `DlSlot::Drop` → `fsw_destroy`
     //    before the `Library` unloads and before the `RingTable` frees the regions.
     //    No crash here is the teardown-ordering assertion.
     drop(coord);
-    drop(out_view);
+    drop((out_view, events_in));
 }
 
 /// R5 (review-findings.md): a `fsw_create` that fails (here, params that don't

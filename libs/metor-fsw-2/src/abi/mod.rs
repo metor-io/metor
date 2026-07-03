@@ -32,7 +32,7 @@ use std::slice;
 use std::sync::Arc;
 
 use metor_fsw_ring::{RawBacking, RingBuffer, WakeSink, WakeSource};
-use metor_proto::types::{ComponentId, Timestamp};
+use metor_proto::types::{ComponentId, PacketId, Timestamp};
 use metor_proto::vtable::{Op, VTable};
 use metor_proto_wkt::ComponentMetadata;
 use postcard_schema::schema::owned::OwnedNamedType;
@@ -56,8 +56,13 @@ use crate::system::{BuildSystem, CyclicRunner, CyclicSystem, Out, SystemOutput};
 ///
 /// `2` adds the terminal [`FswStatus::Done`] code a sequence occupant returns when
 /// its future is `Ready` (the only ABI addition for slots/sequences, §8).
-/// `3` drops the unused `rate_hint` field from [`PortDescMsg`] (review finding C1 —
-/// the field was carried and serialized but had no consumer).
+/// `3` (unshipped; one bump per released ABI shape) re-shapes the descriptor wire
+/// for the port unification: drops the unused `rate_hint` field, makes
+/// [`PortDescMsg`] schema-tagged ([`PortSchemaMsg`]: `Table` | `Postcard` — a `.so`
+/// can now declare a message port) and carries the behavior axes
+/// (`delivery`/`fan_in`/`on_lap`) + the `telemetered` flag, and adds
+/// `capabilities` to [`SystemDescriptorMsg`] (rejected non-empty at load in v1 —
+/// every capability is host-only).
 pub const FSW_ABI_VERSION: u32 = 3;
 
 // ---------------------------------------------------------------------------
@@ -188,25 +193,55 @@ pub const SYM_DESTROY: &[u8] = b"fsw_destroy\0";
 // Serialized descriptor mirrors (postcard)
 // ---------------------------------------------------------------------------
 
-/// The serializable mirror of [`PortDesc`]. [`PortDesc`] cannot
-/// cross by value: its `announce` field is a closure over the frame type `F`, which
-/// does not exist on the host side. So we serialize the **unprefixed** `vtable`
-/// (exactly what `compatible()` needs, so wiring validation runs unchanged) plus the
-/// **unprefixed** `metadata`, from which the host re-derives the missing `announce`
-/// closure (the telemetry.md §6 metadata-driven prefix rewrite).
+/// The serializable mirror of the [`PortSchema`] axis. A Table port cannot cross by
+/// value ([`PortSchema::Table`]'s `announce` is a closure over the frame type `F`,
+/// which does not exist on the host side), so the Table arm serializes the
+/// **unprefixed** `vtable` (exactly what `compatible()` needs, so wiring validation
+/// runs unchanged) plus the **unprefixed** `metadata`, from which the host
+/// re-derives the missing `announce` closure (the telemetry.md §6 metadata-driven
+/// prefix rewrite). A Postcard port is self-describing — the 2-byte id *is* the
+/// schema — so its arm is just the id (the [`NamedMsg`](crate::NamedMsg) token
+/// rides [`PortDescMsg::name`], as every port's name does).
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub enum PortSchemaMsg {
+    /// A component-frame table port.
+    Table {
+        /// `F::FRAME_ID`.
+        frame_id: ComponentId,
+        /// `F::as_vtable()` — the unprefixed, frame-relative vtable (wiring
+        /// compatibility).
+        vtable: VTable,
+        /// The unprefixed component metadata, so the host can synthesize a prefixed
+        /// `announce` for telemetry without the static `F`.
+        metadata: Vec<ComponentMetadata>,
+    },
+    /// A self-describing `(PacketId, postcard)` message port.
+    Postcard {
+        /// `M::ID`.
+        id: PacketId,
+    },
+}
+
+/// The serializable mirror of [`PortDesc`]: the port name, worst-case size, the
+/// schema axis ([`PortSchemaMsg`]), the three behavior axes, and the telemetry flag
+/// — a `.so` declares message ports and axis overrides exactly like a static
+/// system.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct PortDescMsg {
-    /// `F::FRAME_ID`.
-    pub frame_id: ComponentId,
-    /// `F::NAME` — was `&'static str`; reconstructed by leaking at load.
-    pub frame_name: String,
-    /// `F::as_vtable()` — the unprefixed, frame-relative vtable (wiring compatibility).
-    pub vtable: VTable,
-    /// `F::MAX_SIZE` (worst-case table bytes).
+    /// `F::NAME` / `M::NAME` — was `&'static str`; reconstructed by leaking at load.
+    pub name: String,
+    /// `F::MAX_SIZE` / `MAX_MSG_BYTES` (worst-case record bytes).
     pub max_size: usize,
-    /// The unprefixed component metadata, so the host can synthesize a prefixed
-    /// `announce` for telemetry without the static `F`.
-    pub metadata: Vec<ComponentMetadata>,
+    /// Axis 1 — what a record is.
+    pub schema: PortSchemaMsg,
+    /// Axis 2 — latest-wins snapshot vs every-record log.
+    pub delivery: Delivery,
+    /// Axis 3 — producer cardinality for an input.
+    pub fan_in: FanIn,
+    /// Axis 4 — the reader's lap policy.
+    pub on_lap: OnLap,
+    /// Whether the downlink / `AllOutputs` taps this port (A6).
+    pub telemetered: bool,
 }
 
 /// The serializable mirror of [`SystemDescriptor`], carrying the system's `Params`
@@ -220,68 +255,98 @@ pub struct SystemDescriptorMsg {
     pub outputs: Vec<PortDescMsg>,
     /// `<Params as postcard_schema::Schema>::SCHEMA`, in its owned form.
     pub params_schema: OwnedNamedType,
+    /// The non-port [`Capability`](crate::Capability) set. Every v1 capability is
+    /// **host-only** (`ReceiveAll` — the host registry cannot cross the ABI), so
+    /// the loader rejects a non-empty list
+    /// ([`DlError::UnsupportedCapabilities`](crate::dl::DlError)).
+    pub capabilities: Vec<crate::Capability>,
 }
 
 impl PortDescMsg {
-    /// Lower one static [`PortDesc`] (its `vtable` already unprefixed) plus the
-    /// port's unprefixed `metadata` into the wire mirror.
-    fn lower(desc: &PortDesc, metadata: Vec<ComponentMetadata>) -> Self {
-        // dlopen'd systems carry frame ports only (a `.so` cannot declare a message
-        // port yet — the unified PortDescMsg lands with the ABI commit), so the
-        // Table-schema accessors are always `Some` here.
+    /// Lower one static [`PortDesc`] into the wire mirror. A Table port's
+    /// unprefixed metadata is re-derived from its own `announce` factory with the
+    /// empty prefix (`PathHasher` skips empty segments); a Postcard port carries
+    /// only its id.
+    fn lower(desc: &PortDesc) -> Self {
+        let schema = match &desc.schema {
+            PortSchema::Table { vtable, announce } => {
+                let (_, metadata) = announce("");
+                PortSchemaMsg::Table {
+                    frame_id: desc
+                        .id
+                        .component()
+                        .expect("a Table port keys on a frame ComponentId"),
+                    vtable: vtable.clone(),
+                    metadata,
+                }
+            }
+            PortSchema::Postcard => PortSchemaMsg::Postcard {
+                id: desc
+                    .id
+                    .packet()
+                    .expect("a Postcard port keys on a PacketId"),
+            },
+        };
         Self {
-            frame_id: desc
-                .id
-                .component()
-                .expect("dl ports are table ports (frame ComponentId keys)"),
-            frame_name: desc.name.to_string(),
-            vtable: desc
-                .vtable()
-                .expect("dl ports are table ports (vtable-described)")
-                .clone(),
+            name: desc.name.to_string(),
             max_size: desc.max_size,
-            metadata,
+            schema,
+            delivery: desc.delivery,
+            fan_in: desc.fan_in,
+            on_lap: desc.on_lap,
+            telemetered: desc.telemetered,
         }
     }
 
-    /// Reconstruct a [`PortDesc`], synthesizing the `announce` closure from the
-    /// carried `metadata`. The frame name is `Box::leak`ed to recover the
+    /// Reconstruct a [`PortDesc`]. The port name is `Box::leak`ed to recover the
     /// `&'static str` the host wiring path expects — a one-time leak per dlopen'd
-    /// port at load.
+    /// port at load. A Table port's `announce` closure is synthesized from the
+    /// carried `metadata`; a Postcard port needs none (self-describing).
     pub fn into_port_desc(self) -> PortDesc {
-        let frame_name: &'static str = Box::leak(self.frame_name.into_boxed_str());
-        // The `announce` factory closes over the carried unprefixed vtable + metadata
-        // and re-prefixes them by the instance name. Re-prefixing the **metadata** names
-        // is a rehash from the prefixed name; re-prefixing the **vtable**'s baked
-        // component ids is the metadata-driven id rewrite of telemetry.md §6 —
-        // [`prefix_announce_vtable`]. The result matches a static system's prefixed
-        // announce (`announce_of::<F>(prefix)`) bit-for-bit, so telemetry `All` keys a
-        // dlopen'd output's components the same way.
-        let unprefixed_vtable = self.vtable.clone();
-        let metadata = self.metadata.clone();
-        let announce: AnnounceFn = Arc::new(move |prefix: &str| {
-            let meta = metadata
-                .iter()
-                .cloned()
-                .map(|m| m.with_prefix(prefix))
-                .collect();
-            let vtable = prefix_announce_vtable(&unprefixed_vtable, &metadata, prefix);
-            (vtable, meta)
-        });
+        let name: &'static str = Box::leak(self.name.into_boxed_str());
+        let (id, schema) = match self.schema {
+            PortSchemaMsg::Table {
+                frame_id,
+                vtable,
+                metadata,
+            } => {
+                // The `announce` factory closes over the carried unprefixed vtable +
+                // metadata and re-prefixes them by the instance name. Re-prefixing the
+                // **metadata** names is a rehash from the prefixed name; re-prefixing
+                // the **vtable**'s baked component ids is the metadata-driven id
+                // rewrite of telemetry.md §6 — [`prefix_announce_vtable`]. The result
+                // matches a static system's prefixed announce
+                // (`announce_of::<F>(prefix)`) bit-for-bit, so telemetry `All` keys a
+                // dlopen'd output's components the same way.
+                let unprefixed_vtable = vtable.clone();
+                let announce: AnnounceFn = Arc::new(move |prefix: &str| {
+                    let meta = metadata
+                        .iter()
+                        .cloned()
+                        .map(|m| m.with_prefix(prefix))
+                        .collect();
+                    let vt = prefix_announce_vtable(&unprefixed_vtable, &metadata, prefix);
+                    (vt, meta)
+                });
+                (
+                    PortId::Component(frame_id),
+                    // The carried (unprefixed) vtable is what `compatible()` validates
+                    // against, so wiring validation is unchanged; prefixing happens
+                    // only in `announce`.
+                    PortSchema::Table { vtable, announce },
+                )
+            }
+            PortSchemaMsg::Postcard { id } => (PortId::Packet(id), PortSchema::Postcard),
+        };
         PortDesc {
-            id: PortId::Component(self.frame_id),
-            name: frame_name,
+            id,
+            name,
             max_size: self.max_size,
-            // The carried (unprefixed) vtable is what `compatible()` validates against,
-            // so wiring validation is unchanged; prefixing happens only in `announce`.
-            schema: PortSchema::Table {
-                vtable: self.vtable,
-                announce,
-            },
-            delivery: Delivery::Snapshot,
-            fan_in: FanIn::One,
-            on_lap: OnLap::Stop,
-            telemetered: true,
+            schema,
+            delivery: self.delivery,
+            fan_in: self.fan_in,
+            on_lap: self.on_lap,
+            telemetered: self.telemetered,
         }
     }
 }
@@ -346,34 +411,18 @@ fn prefix_announce_vtable(vtable: &VTable, metadata: &[ComponentMetadata], prefi
 }
 
 impl SystemDescriptorMsg {
-    /// Lower a static [`SystemDescriptor`] into the wire mirror: drop each port's
-    /// `announce` fn-pointer, carrying its unprefixed `vtable` (on
-    /// the [`PortDesc`]) and the per-port `metadata` supplied positionally
-    /// (`input_metadata`/`output_metadata` parallel to `desc.inputs`/`desc.outputs`).
-    pub fn lower(
-        desc: &SystemDescriptor,
-        params_schema: OwnedNamedType,
-        input_metadata: Vec<Vec<ComponentMetadata>>,
-        output_metadata: Vec<Vec<ComponentMetadata>>,
-    ) -> Self {
-        let inputs = desc
-            .inputs
-            .iter()
-            .zip(input_metadata)
-            .map(|(p, m)| PortDescMsg::lower(p, m))
-            .collect();
-        let outputs = desc
-            .outputs
-            .iter()
-            .zip(output_metadata)
-            .map(|(p, m)| PortDescMsg::lower(p, m))
-            .collect();
+    /// Lower a static [`SystemDescriptor`] into the wire mirror: drop each Table
+    /// port's `announce` closure, carrying its unprefixed `vtable` + `metadata`
+    /// (re-derived per port inside [`PortDescMsg::lower`]) so the host can
+    /// synthesize the announce at load; Postcard ports lower to their bare id.
+    pub fn lower(desc: &SystemDescriptor, params_schema: OwnedNamedType) -> Self {
         Self {
             name: desc.name.to_string(),
             kind: desc.kind,
-            inputs,
-            outputs,
+            inputs: desc.inputs.iter().map(PortDescMsg::lower).collect(),
+            outputs: desc.outputs.iter().map(PortDescMsg::lower).collect(),
             params_schema,
+            capabilities: desc.capabilities.clone(),
         }
     }
 
@@ -387,9 +436,9 @@ impl SystemDescriptorMsg {
             kind: self.kind,
             inputs: self.inputs.into_iter().map(PortDescMsg::into_port_desc).collect(),
             outputs: self.outputs.into_iter().map(PortDescMsg::into_port_desc).collect(),
-            // A dlopen'd system holds no host capabilities (ReceiveAll is host-only);
-            // the ABI mirror gains (and load-rejects) an explicit list with C7.
-            capabilities: Vec::new(),
+            // Carried verbatim; the loader has already rejected a non-empty list
+            // (every v1 capability is host-only).
+            capabilities: self.capabilities,
         }
     }
 }
@@ -643,11 +692,11 @@ where
 }
 
 /// `fsw_describe`: lower this system's static [`SystemDescriptor`] (plus its `Params`
-/// schema and each port's unprefixed metadata) to a [`SystemDescriptorMsg`],
-/// postcard-encode it, and hand the bytes to the host [`ByteSink`].
-/// Per-port metadata is derived by calling each `PortDesc::announce` with the **empty**
-/// prefix (`PathHasher` skips an empty segment, so this yields the unprefixed
-/// vtable+metadata). Returns `0` on success, `-1` if anything panics.
+/// schema) to a [`SystemDescriptorMsg`], postcard-encode it, and hand the bytes to
+/// the host [`ByteSink`]. A Table port's unprefixed metadata is derived inside the
+/// lowering by calling its `announce` with the **empty** prefix (`PathHasher` skips
+/// an empty segment); Postcard ports carry only their id. Returns `0` on success,
+/// `-1` if anything panics.
 ///
 /// # Safety
 /// `sink`/`ctx` form a valid host callback (`sink` is called once with a buffer the
@@ -659,10 +708,8 @@ where
 {
     let outcome = catch_unwind(AssertUnwindSafe(|| {
         let desc = <S as CyclicSystem<RawBacking>>::descriptor();
-        let input_metadata = desc.inputs.iter().map(|p| (p.announce().expect("dl ports are table ports"))("").1).collect();
-        let output_metadata = desc.outputs.iter().map(|p| (p.announce().expect("dl ports are table ports"))("").1).collect();
         let params_schema = OwnedNamedType::from(<S::Params as postcard_schema::Schema>::SCHEMA);
-        let msg = SystemDescriptorMsg::lower(&desc, params_schema, input_metadata, output_metadata);
+        let msg = SystemDescriptorMsg::lower(&desc, params_schema);
         postcard::to_allocvec(&msg).expect("descriptor encodes (postcard)")
     }));
     match outcome {
@@ -870,10 +917,10 @@ where
 }
 
 /// `fsw_describe` (sequence): lower the macro's signature-derived `S::descriptor()`
-/// (plus its `Params` schema and each port's unprefixed metadata) to a
-/// [`SystemDescriptorMsg`], postcard-encode it, and hand the bytes to the host
-/// [`ByteSink`]. Mirrors [`run_describe`], but over `S::descriptor()` (the sequence's
-/// own descriptor) rather than `CyclicSystem::descriptor`.
+/// (plus its `Params` schema) to a [`SystemDescriptorMsg`], postcard-encode it, and
+/// hand the bytes to the host [`ByteSink`]. Mirrors [`run_describe`], but over
+/// `S::descriptor()` (the sequence's own descriptor) rather than
+/// `CyclicSystem::descriptor`.
 ///
 /// # Safety
 /// As [`run_describe`]: `sink`/`ctx` form a valid host callback (`sink` is called once
@@ -885,10 +932,8 @@ where
 {
     let outcome = catch_unwind(AssertUnwindSafe(|| {
         let desc = S::descriptor();
-        let input_metadata = desc.inputs.iter().map(|p| (p.announce().expect("dl ports are table ports"))("").1).collect();
-        let output_metadata = desc.outputs.iter().map(|p| (p.announce().expect("dl ports are table ports"))("").1).collect();
         let params_schema = OwnedNamedType::from(<S::Params as postcard_schema::Schema>::SCHEMA);
-        let msg = SystemDescriptorMsg::lower(&desc, params_schema, input_metadata, output_metadata);
+        let msg = SystemDescriptorMsg::lower(&desc, params_schema);
         postcard::to_allocvec(&msg).expect("descriptor encodes (postcard)")
     }));
     match outcome {
