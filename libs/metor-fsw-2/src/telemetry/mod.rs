@@ -684,6 +684,17 @@ enum Wire {
     Msg,
 }
 
+/// Everything `init` starts, bundled (C6 — one `Option<Started>` instead of three
+/// parallel `Option`s that were only ever set together).
+struct Started {
+    handoff: Arc<HandOff>,
+    stop: Arc<AtomicBool>,
+    /// Holds the sender task; its `Drop` cancels the task on teardown. `None` when
+    /// the transport was already taken (a re-init) — the taps still drain.
+    #[allow(dead_code)]
+    sender: Option<JoinHandleDropGuard<()>>,
+}
+
 /// The telemetry downlink system (telemetry.md §3). Generic over the [`Transport`]; the
 /// concrete `T` is chosen by the builder/loader (TCP) or a test (mock).
 pub struct TelemetrySystem<T: Transport> {
@@ -691,11 +702,9 @@ pub struct TelemetrySystem<T: Transport> {
     mode: TelemetryMode,
     /// ONE tap list (C4): each tap carries its own lane + wire framing.
     taps: Vec<Tap>,
-    handoff: Option<Arc<HandOff>>,
-    stop: Option<Arc<AtomicBool>>,
-    /// Holds the sender task; its `Drop` cancels the task on teardown.
-    #[allow(dead_code)]
-    sender: Option<JoinHandleDropGuard<()>>,
+    /// The running state `init` assembles: the hand-off, the sender's stop flag, and
+    /// the sender task guard. `None` before `init`.
+    started: Option<Started>,
     /// Snapshot drops already surfaced to health (each new one reported once).
     last_dropped: u64,
     /// The Log-lane twin of `last_dropped` (surfaced as `telemetry.msg_dropped`).
@@ -710,9 +719,7 @@ impl<T: Transport> TelemetrySystem<T> {
             transport: Some(config.transport),
             mode: config.mode,
             taps: Vec::new(),
-            handoff: None,
-            stop: None,
-            sender: None,
+            started: None,
             last_dropped: 0,
             last_msg_dropped: 0,
         }
@@ -795,29 +802,30 @@ impl<T: Transport + 'static> System for TelemetrySystem<T> {
         let wq = Arc::new(WaitQueue::new());
         let handoff = Arc::new(HandOff::new(n_slots, wq.clone()));
         let stop = Arc::new(AtomicBool::new(false));
-        if let Some(transport) = self.transport.take() {
-            let handle = stellarator::spawn(run_sender(
+        let sender = self.transport.take().map(|transport| {
+            stellarator::spawn(run_sender(
                 transport,
                 announces,
                 handoff.clone(),
                 wq,
                 stop.clone(),
-            ));
-            self.sender = Some(handle.drop_guard());
-        }
+            ))
+            .drop_guard()
+        });
         self.taps = taps;
-        self.handoff = Some(handoff);
-        self.stop = Some(stop);
+        self.started = Some(Started {
+            handoff,
+            stop,
+            sender,
+        });
     }
 
     /// Signal the sender to stop and wake it so it exits cooperatively (the drop guard
     /// cancels it regardless when the system is dropped at coordinator teardown).
     fn shutdown(&mut self, _output: &mut Self::Output) {
-        if let Some(stop) = &self.stop {
-            stop.store(true, Release);
-        }
-        if let Some(handoff) = &self.handoff {
-            handoff.wq.wake_all();
+        if let Some(started) = &self.started {
+            started.stop.store(true, Release);
+            started.handoff.wq.wake_all();
         }
     }
 }
@@ -848,10 +856,10 @@ impl<T: Transport + 'static> CyclicSystem for TelemetrySystem<T> {
     /// live edge (the cycle never blocks). Drops detected since last cycle surface
     /// as `telemetry.dropped` (snapshot lane) / `telemetry.msg_dropped` (log lane).
     fn execute(&mut self, _now: Timestamp, _input: &mut Self::Input, output: &mut Self::Output) {
-        let handoff = match &self.handoff {
-            Some(h) => h.clone(),
-            None => return,
+        let Some(started) = &self.started else {
+            return;
         };
+        let handoff = started.handoff.clone();
         for tap in &mut self.taps {
             match tap.lane {
                 // Latest-wins: drain to the newest committed record; no new record

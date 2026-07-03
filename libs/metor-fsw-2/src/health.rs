@@ -16,7 +16,7 @@ use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
 // `FromBytes` lets the health/log frames be read back through a typed `Input` port.
 
 use crate::Frame;
-use crate::dynamic::{FrameList, FrameMap, Name};
+use crate::dynamic::{FrameList, FrameMap, pack_str};
 use crate::port::Output;
 
 /// Max distinct domain-error kinds carried in one health record.
@@ -39,7 +39,7 @@ pub struct SystemHealth {
     pub errors: u64,
     pub lapped_inputs: u64,
     pub last_execute_micros: u64,
-    pub error_counts: FrameMap<Name<'static>, u64, MAX_ERR_KINDS>,
+    pub error_counts: FrameMap<u64, MAX_ERR_KINDS>,
 }
 
 /// One log line: a level, a used-length, and a fixed-size message buffer. The
@@ -55,15 +55,12 @@ pub struct LogLine {
 
 impl LogLine {
     fn new(level: Level, msg: &str) -> Self {
-        let bytes = msg.as_bytes();
-        let len = bytes.len().min(LOG_MSG_CAP);
-        let mut buf = [0u8; LOG_MSG_CAP];
-        buf[..len].copy_from_slice(&bytes[..len]);
+        let (msg, len) = pack_str::<LOG_MSG_CAP>(msg);
         Self {
             level: level as u8,
-            len: len as u8,
+            len,
             _pad: [0; 6],
-            msg: buf,
+            msg,
         }
     }
 }

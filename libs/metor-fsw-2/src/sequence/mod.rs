@@ -26,6 +26,7 @@ use metor_proto::types::Timestamp;
 use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
 
 use crate::abi::RawBinder;
+use crate::dynamic::pack_str;
 use crate::{Frame, FrameList, Input, Out, Output, SystemDescriptor, SystemOutput};
 
 #[cfg(test)]
@@ -259,14 +260,11 @@ pub struct ProgressLine {
 impl ProgressLine {
     /// Wrap a progress message, truncating to [`PROGRESS_MSG_CAP`] like `LogLine::new`.
     pub fn new(msg: &str) -> Self {
-        let bytes = msg.as_bytes();
-        let len = bytes.len().min(PROGRESS_MSG_CAP);
-        let mut buf = [0u8; PROGRESS_MSG_CAP];
-        buf[..len].copy_from_slice(&bytes[..len]);
+        let (msg, len) = pack_str::<PROGRESS_MSG_CAP>(msg);
         Self {
-            len: len as u8,
+            len,
             _pad: [0; 7],
-            msg: buf,
+            msg,
         }
     }
 }

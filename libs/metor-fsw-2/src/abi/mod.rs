@@ -532,6 +532,57 @@ struct AbiState<S> {
     poisoned: bool,
 }
 
+/// View a nullable `(ptr, len)` byte range as a slice (`&[]` for null/0) — the
+/// params decode shared by [`run_create`]/[`run_seq_create`] (C4).
+///
+/// # Safety
+/// `ptr..ptr+len` is a readable byte range, or `ptr` is null / `len == 0`.
+unsafe fn bytes_from_raw<'a>(ptr: *const u8, len: usize) -> &'a [u8] {
+    if ptr.is_null() || len == 0 {
+        &[]
+    } else {
+        // SAFETY: caller asserts `ptr..ptr+len` is readable.
+        unsafe { slice::from_raw_parts(ptr, len) }
+    }
+}
+
+/// View a nullable `(ptr, n)` [`FswRing`] array as a slice (`&[]` for null/0) — the
+/// bind-time handle walk shared by [`run_bind_init`]/[`run_seq_bind_init`] (C4).
+///
+/// # Safety
+/// `ptr` names `n` valid [`FswRing`] handles, or is null / `n == 0`.
+unsafe fn rings_from_raw<'a>(ptr: *const FswRing, n: usize) -> &'a [FswRing] {
+    if ptr.is_null() || n == 0 {
+        &[]
+    } else {
+        // SAFETY: caller asserts `n` valid handles at `ptr`.
+        unsafe { slice::from_raw_parts(ptr, n) }
+    }
+}
+
+/// The describe tail shared by [`run_describe`]/[`run_seq_describe`] (C4): lower the
+/// descriptor + `Params` schema to a [`SystemDescriptorMsg`], postcard-encode it
+/// under `catch_unwind`, and hand the bytes to the host [`ByteSink`]. Returns `0`
+/// on success, `-1` if anything panics.
+fn describe_common(
+    desc: impl FnOnce() -> SystemDescriptor + std::panic::UnwindSafe,
+    params_schema: OwnedNamedType,
+    sink: ByteSink,
+    ctx: *mut c_void,
+) -> i32 {
+    let outcome = catch_unwind(AssertUnwindSafe(|| {
+        let msg = SystemDescriptorMsg::lower(&desc(), params_schema);
+        postcard::to_allocvec(&msg).expect("descriptor encodes (postcard)")
+    }));
+    match outcome {
+        Ok(bytes) => {
+            sink(ctx, bytes.as_ptr(), bytes.len());
+            0
+        }
+        Err(_) => -1,
+    }
+}
+
 /// `fsw_create`: postcard-decode `S::Params`, construct the system via
 /// [`BuildSystem::new`], and box the (unbound) [`AbiState`].
 /// Returns a null pointer if decoding or construction panics — no unwind escapes.
@@ -545,13 +596,9 @@ where
     S: BuildSystem,
     S::Params: for<'de> Deserialize<'de>,
 {
+    // SAFETY: caller asserts `params..params+params_len` is readable (or null/0).
+    let bytes = unsafe { bytes_from_raw(params, params_len) };
     let outcome = catch_unwind(AssertUnwindSafe(|| {
-        let bytes: &[u8] = if params.is_null() || params_len == 0 {
-            &[]
-        } else {
-            // SAFETY: caller asserts `params..params+params_len` is readable.
-            unsafe { slice::from_raw_parts(params, params_len) }
-        };
         let params: S::Params = postcard::from_bytes(bytes).expect("params decode (postcard)");
         let system = S::new(params);
         let state = Box::new(AbiState::<S> {
@@ -591,19 +638,10 @@ pub unsafe fn run_bind_init<S, O>(
     }
     // SAFETY: caller asserts `state` is a live `AbiState<S>` from `run_create`.
     let st = unsafe { &mut *(state as *mut AbiState<S>) };
+    // SAFETY: caller asserts the handle arrays are valid (or null/0).
+    let (in_slice, out_slice) =
+        unsafe { (rings_from_raw(inputs, n_in), rings_from_raw(outputs, n_out)) };
     let _ = catch_unwind(AssertUnwindSafe(|| {
-        let in_slice: &[FswRing] = if inputs.is_null() || n_in == 0 {
-            &[]
-        } else {
-            // SAFETY: caller asserts `n_in` valid handles at `inputs`.
-            unsafe { slice::from_raw_parts(inputs, n_in) }
-        };
-        let out_slice: &[FswRing] = if outputs.is_null() || n_out == 0 {
-            &[]
-        } else {
-            // SAFETY: caller asserts `n_out` valid handles at `outputs`.
-            unsafe { slice::from_raw_parts(outputs, n_out) }
-        };
         // SAFETY: caller asserts each region outlives the runner (until run_destroy).
         let mut binder = unsafe { RawBinder::new(in_slice, out_slice) };
         let input = <S::Input as BindPorts<RawBacking>>::bind(&mut binder);
@@ -710,19 +748,13 @@ where
     S: CyclicSystem<RawBacking> + BuildSystem,
     S::Params: postcard_schema::Schema,
 {
-    let outcome = catch_unwind(AssertUnwindSafe(|| {
-        let desc = <S as CyclicSystem<RawBacking>>::descriptor();
-        let params_schema = OwnedNamedType::from(<S::Params as postcard_schema::Schema>::SCHEMA);
-        let msg = SystemDescriptorMsg::lower(&desc, params_schema);
-        postcard::to_allocvec(&msg).expect("descriptor encodes (postcard)")
-    }));
-    match outcome {
-        Ok(bytes) => {
-            sink(ctx, bytes.as_ptr(), bytes.len());
-            0
-        }
-        Err(_) => -1,
-    }
+    let params_schema = OwnedNamedType::from(<S::Params as postcard_schema::Schema>::SCHEMA);
+    describe_common(
+        <S as CyclicSystem<RawBacking>>::descriptor,
+        params_schema,
+        sink,
+        ctx,
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -756,13 +788,9 @@ where
     S: SeqSystem,
     S::Params: for<'de> Deserialize<'de>,
 {
+    // SAFETY: caller asserts `params..params+params_len` is readable (or null/0).
+    let bytes = unsafe { bytes_from_raw(params, params_len) };
     let outcome = catch_unwind(AssertUnwindSafe(|| {
-        let bytes: &[u8] = if params.is_null() || params_len == 0 {
-            &[]
-        } else {
-            // SAFETY: caller asserts `params..params+params_len` is readable.
-            unsafe { slice::from_raw_parts(params, params_len) }
-        };
         let params: S::Params = postcard::from_bytes(bytes).expect("params decode (postcard)");
         let state = Box::new(SeqState::<S> {
             params: Some(params),
@@ -801,19 +829,10 @@ pub unsafe fn run_seq_bind_init<S>(
     }
     // SAFETY: caller asserts `state` is a live `SeqState<S>` from `run_seq_create`.
     let st = unsafe { &mut *(state as *mut SeqState<S>) };
+    // SAFETY: caller asserts the handle arrays are valid (or null/0).
+    let (in_slice, out_slice) =
+        unsafe { (rings_from_raw(inputs, n_in), rings_from_raw(outputs, n_out)) };
     let _ = catch_unwind(AssertUnwindSafe(|| {
-        let in_slice: &[FswRing] = if inputs.is_null() || n_in == 0 {
-            &[]
-        } else {
-            // SAFETY: caller asserts `n_in` valid handles at `inputs`.
-            unsafe { slice::from_raw_parts(inputs, n_in) }
-        };
-        let out_slice: &[FswRing] = if outputs.is_null() || n_out == 0 {
-            &[]
-        } else {
-            // SAFETY: caller asserts `n_out` valid handles at `outputs`.
-            unsafe { slice::from_raw_parts(outputs, n_out) }
-        };
         // SAFETY: caller asserts each region outlives the future (until run_seq_destroy).
         let mut binder = unsafe { RawBinder::new(in_slice, out_slice) };
         let params = st
@@ -934,19 +953,8 @@ where
     S: SeqSystem,
     S::Params: postcard_schema::Schema,
 {
-    let outcome = catch_unwind(AssertUnwindSafe(|| {
-        let desc = S::descriptor();
-        let params_schema = OwnedNamedType::from(<S::Params as postcard_schema::Schema>::SCHEMA);
-        let msg = SystemDescriptorMsg::lower(&desc, params_schema);
-        postcard::to_allocvec(&msg).expect("descriptor encodes (postcard)")
-    }));
-    match outcome {
-        Ok(bytes) => {
-            sink(ctx, bytes.as_ptr(), bytes.len());
-            0
-        }
-        Err(_) => -1,
-    }
+    let params_schema = OwnedNamedType::from(<S::Params as postcard_schema::Schema>::SCHEMA);
+    describe_common(S::descriptor, params_schema, sink, ctx)
 }
 
 #[cfg(all(test, feature = "kdl"))]

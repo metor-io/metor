@@ -489,14 +489,10 @@ const _: () = assert!(NAME_CAP == metor_proto_wkt::SEQUENCE_CHANNEL_NAME_CAP);
 /// Capacity of one stopped-system name in the status frame (longer truncated).
 pub const STATUS_NAME_CAP: usize = NAME_CAP;
 
-/// Pack a name into a fixed [`NAME_CAP`] buffer + used length (truncating) — the one
-/// packing helper for every fixed-size name field in the host frames.
+/// Pack a name into a fixed [`NAME_CAP`] buffer + used length (truncating) — the
+/// [`NAME_CAP`]-sized instantiation of the crate's one [`pack_str`] helper.
 pub(crate) fn pack_name(name: &str) -> ([u8; NAME_CAP], u8) {
-    let bytes = name.as_bytes();
-    let n = bytes.len().min(NAME_CAP);
-    let mut buf = [0u8; NAME_CAP];
-    buf[..n].copy_from_slice(&bytes[..n]);
-    (buf, n as u8)
+    crate::dynamic::pack_str::<NAME_CAP>(name)
 }
 /// Max stopped systems named in one status record.
 pub const MAX_STOPPED: usize = 32;
@@ -530,7 +526,9 @@ struct CoordinatorStatus {
 // ---------------------------------------------------------------------------
 
 /// What a buffer carries — for diagnostics and to make ownership explicit. The
-/// fields are kept for diagnostics/debugging even though nothing reads them yet.
+/// variant payloads are debug-only (rendered via `Debug`, read by nothing) — the
+/// `allow` covers exactly them; the variants themselves are matched
+/// (`output_instances`).
 #[allow(dead_code)]
 #[derive(Clone, Copy, Debug)]
 enum BufferRole {
@@ -544,8 +542,9 @@ enum BufferRole {
 
 /// One owned ring plus its identity. `ring` is the canonical handle whose sole job
 /// is to outlive every port over it (the ports hold their own `Arc` clones).
-#[allow(dead_code)]
 struct RingEntry {
+    /// Held for ownership only (the ports clone their own `Arc`s) — never read.
+    #[allow(dead_code)]
     ring: RingBuffer<BoxBacking>,
     frame_id: ComponentId,
     role: BufferRole,
@@ -933,8 +932,9 @@ impl CoordinatorBuilder {
     /// Register a runtime-swappable **slot** (sequences-slots.md §6): a fixed position in
     /// the cyclic call chain whose occupant the host `Load`s/`Start`s/`Stop`s/`Abort`s/
     /// `Reset`s/`Unload`s at runtime. `allowed` is the pre-opened candidate set — each
-    /// `(Load-name, opened DlSystem, postcard params)` a sequence occupant. `initial`
-    /// optionally applies one at startup.
+    /// [`AllowedOccupant`] a sequence occupant (its `Load` name, opened `DlSystem`, and
+    /// postcard params — E8e: the public type, not a tuple). `initial` optionally
+    /// applies one at startup.
     ///
     /// The registered descriptor is derived from the occupant descriptor **by
     /// extension, not surgery** (`docs/design-command-slots.md` §2.2): the occupant's
@@ -958,18 +958,18 @@ impl CoordinatorBuilder {
     pub fn add_slot(
         &mut self,
         name: impl Into<String>,
-        allowed: Vec<(String, crate::dl::DlSystem, Vec<u8>)>,
+        allowed: Vec<AllowedOccupant>,
         initial: Option<InitialOccupant>,
     ) -> SystemHandle {
         assert!(
             !allowed.is_empty(),
             "a slot needs at least one allowed occupant"
         );
-        let base = allowed[0].1.descriptor().clone();
+        let base = allowed[0].system.descriptor().clone();
         // Every allowed occupant must share the contract (the slot sizes/validates to the
         // first occupant's descriptor). v1 requires a shared shape (mutual subset).
-        for (occ_name, sys, _) in &allowed[1..] {
-            let d = sys.descriptor();
+        for occ in &allowed[1..] {
+            let d = occ.system.descriptor();
             let ports_match = |a: &[PortDesc], b: &[PortDesc]| {
                 a.len() == b.len()
                     && a.iter()
@@ -978,9 +978,10 @@ impl CoordinatorBuilder {
             };
             assert!(
                 ports_match(&d.inputs, &base.inputs) && ports_match(&d.outputs, &base.outputs),
-                "allowed occupant {occ_name:?} is incompatible with the slot contract \
+                "allowed occupant {:?} is incompatible with the slot contract \
                  (derived from {:?})",
-                allowed[0].0
+                occ.name,
+                allowed[0].name
             );
         }
         // W1b: the builder path validates the initial occupant against the allowed
@@ -988,12 +989,12 @@ impl CoordinatorBuilder {
         // would otherwise surface only as a runtime `Failed` event.
         if let Some(init) = &initial {
             assert!(
-                allowed.iter().any(|(n, _, _)| n == &init.occupant),
+                allowed.iter().any(|a| a.name == init.occupant),
                 "initial occupant {:?} is not in the allowed set ({})",
                 init.occupant,
                 allowed
                     .iter()
-                    .map(|(n, _, _)| n.as_str())
+                    .map(|a| a.name.as_str())
                     .collect::<Vec<_>>()
                     .join(", ")
             );
@@ -1050,15 +1051,6 @@ impl CoordinatorBuilder {
             // Sequence occupants declare wired ports only (ReceiveAll is host-only).
             capabilities: Vec::new(),
         };
-
-        let allowed = allowed
-            .into_iter()
-            .map(|(name, system, params)| AllowedOccupant {
-                name,
-                system,
-                params,
-            })
-            .collect();
 
         let id = self.descs.len();
         self.descs.push(registered);
@@ -1663,10 +1655,11 @@ impl CoordinatorBuilder {
                         .collect();
                     // SAFETY: every region named here is a `RingTable`-owned ring that
                     // outlives the slot — the coordinator drops `cyclic` (this slot,
-                    // whose `Drop` calls `fsw_destroy`) before `rings`.
+                    // whose `Drop` calls `fsw_destroy`) before `rings`. The `DlSystem`
+                    // handle drops right after; the slot keeps its own `Arc<Library>`.
                     let slot = unsafe {
                         dl.system
-                            .into_slot(&dl.params, inputs, outputs, self.descs[id].name)
+                            .make_slot(&dl.params, inputs, outputs, self.descs[id].name)
                     };
                     cyclic.push(Box::new(slot));
                 }

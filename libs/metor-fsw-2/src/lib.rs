@@ -45,7 +45,7 @@ pub mod abi;
 // system `.so` across the ABI. Ungated alongside `abi`.
 pub mod dl;
 
-pub use dynamic::{FrameList, FrameMap, Name, Slot};
+pub use dynamic::{FrameList, FrameMap, Slot};
 pub use frame::Frame;
 pub use reader::{ListReader, MapReader};
 pub use writer::{FrameWriter, KeyError, ListWriter, MapWriter};

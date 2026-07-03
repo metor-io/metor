@@ -1037,14 +1037,15 @@ fn attach_mmap_rejects_truncated_file() {
     let err = unsafe { RingBuffer::<MmapBacking>::attach_mmap(&path) }
         .err()
         .expect("truncated file must be rejected");
-    assert!(format!("{err}").contains("RegionTruncated"), "{err}");
+    // The io::Error wraps the AttachError (its Display, no longer a Debug dump).
+    assert!(format!("{err}").contains("exceeds the backing region"), "{err}");
 
     // Below even the header: TooSmall (previously an out-of-bounds header read).
     truncate(64);
     let err = unsafe { RingBuffer::<MmapBacking>::attach_mmap(&path) }
         .err()
         .expect("truncated file must be rejected");
-    assert!(format!("{err}").contains("TooSmall"), "{err}");
+    assert!(format!("{err}").contains("shorter than the fixed header"), "{err}");
 }
 
 // ----- R6: lossless view churn under a live writer -----

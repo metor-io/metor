@@ -24,9 +24,18 @@ use metor_fsw_2::metor_proto_wkt::{
     SequenceRegistry,
 };
 use metor_fsw_2::{
-    ClockMode, Coordinator, CoordinatorConfig, DlSystem, Input, PortRef, RecvTransport,
-    SequenceStatus, SlotStatus, SystemKind, TransportError, split_record,
+    AllowedOccupant, ClockMode, Coordinator, CoordinatorConfig, DlSystem, Input, PortRef,
+    RecvTransport, SequenceStatus, SlotStatus, SystemKind, TransportError, split_record,
 };
+
+/// One paramless allowed occupant (the E8e `AllowedOccupant` shape).
+fn occ(name: &str, system: DlSystem) -> AllowedOccupant {
+    AllowedOccupant {
+        name: name.to_string(),
+        system,
+        params: Vec::new(),
+    }
+}
 use stellarator::buf::{IoBuf, Slice};
 
 /// A `Load { occupant }` command addressed to the channel named `ch` (the slot's
@@ -161,7 +170,7 @@ fn slot_load_start_runs_to_done() {
     let loaded = open_waiter(&lib);
 
     let mut b = Coordinator::builder(sim_config());
-    let slot = b.add_slot("adcs", vec![("waiter".into(), loaded, Vec::new())], None);
+    let slot = b.add_slot("adcs", vec![occ("waiter", loaded)], None);
     // A2: commands are explicit dataflow — the in-proc control handle reaches the
     // slot only over this declared edge.
     b.connect(
@@ -228,7 +237,7 @@ fn slot_abort_completes_aborted() {
     let loaded = open_waiter(&lib);
 
     let mut b = Coordinator::builder(sim_config());
-    let slot = b.add_slot("adcs", vec![("waiter".into(), loaded, Vec::new())], None);
+    let slot = b.add_slot("adcs", vec![occ("waiter", loaded)], None);
     // A2: commands are explicit dataflow — the in-proc control handle reaches the
     // slot only over this declared edge.
     b.connect(
@@ -290,7 +299,7 @@ fn slot_stop_hard_drops_occupant() {
     let loaded = open_waiter(&lib);
 
     let mut b = Coordinator::builder(sim_config());
-    let slot = b.add_slot("adcs", vec![("waiter".into(), loaded, Vec::new())], None);
+    let slot = b.add_slot("adcs", vec![occ("waiter", loaded)], None);
     // A2: commands are explicit dataflow — the in-proc control handle reaches the
     // slot only over this declared edge.
     b.connect(
@@ -355,7 +364,7 @@ fn slot_reset_reruns_from_start() {
     let loaded = open_waiter(&lib);
 
     let mut b = Coordinator::builder(sim_config());
-    let slot = b.add_slot("adcs", vec![("waiter".into(), loaded, Vec::new())], None);
+    let slot = b.add_slot("adcs", vec![occ("waiter", loaded)], None);
     // A2: commands are explicit dataflow — the in-proc control handle reaches the
     // slot only over this declared edge.
     b.connect(
@@ -441,7 +450,7 @@ fn slot_emits_ordered_sequence_events_and_boot_registry() {
     let loaded = open_waiter(&lib);
 
     let mut b = Coordinator::builder(sim_config());
-    let slot = b.add_slot("adcs", vec![("waiter".into(), loaded, Vec::new())], None);
+    let slot = b.add_slot("adcs", vec![occ("waiter", loaded)], None);
     // A2: commands are explicit dataflow — the in-proc control handle reaches the
     // slot only over this declared edge.
     b.connect(
@@ -572,7 +581,7 @@ fn uplink_command_loads_and_starts_same_cycle() {
 
     let mut b = Coordinator::builder(sim_config());
     // One slot, started EMPTY (no initial occupant) — the interactive panel scenario.
-    let slot = b.add_slot("adcs", vec![("waiter".into(), loaded, Vec::new())], None);
+    let slot = b.add_slot("adcs", vec![occ("waiter", loaded)], None);
     // The uplink: a panel `Load { waiter }` then `Start`, both addressed to the slot by
     // its instance name — and reaching it over an explicit command edge (A2).
     let uplink = b.add_uplink(MockRecv::new(vec![
@@ -648,7 +657,7 @@ fn slot_name_over_the_cap_is_a_build_error() {
     // One byte over the cap: would telemeter truncated while addressing untruncated.
     let long = "a".repeat(NAME_CAP + 1);
     let mut b = Coordinator::builder(sim_config());
-    let _slot = b.add_slot(long.clone(), vec![("waiter".into(), loaded, Vec::new())], None);
+    let _slot = b.add_slot(long.clone(), vec![occ("waiter", loaded)], None);
     let err = b.build().err().expect("an over-cap slot name fails the build");
     match err {
         WireError::SlotNameTooLong { name, len } => {
@@ -667,7 +676,7 @@ fn misaddressed_command_matches_no_slot() {
     let loaded = open_waiter(&lib);
 
     let mut b = Coordinator::builder(sim_config());
-    let slot = b.add_slot("adcs", vec![("waiter".into(), loaded, Vec::new())], None);
+    let slot = b.add_slot("adcs", vec![occ("waiter", loaded)], None);
     // A2: commands are explicit dataflow — the in-proc control handle reaches the
     // slot only over this declared edge.
     b.connect(
@@ -732,7 +741,7 @@ fn drive_adcs_of_two_slots(adcs_first: bool) {
     let add = |b: &mut metor_fsw_2::CoordinatorBuilder, name: &str| {
         let slot = b.add_slot(
             name,
-            vec![("waiter".to_string(), open_waiter(&lib), Vec::new())],
+            vec![occ("waiter", open_waiter(&lib))],
             None,
         );
         // Fan-out: the ONE producer is edged to BOTH slots; only the slot the
@@ -854,7 +863,7 @@ fn autonomy_phases(edged: bool) -> Option<Vec<u8>> {
 
     let mut b = Coordinator::builder(sim_config());
     let autonomy = b.add_cyclic(Autonomy { sent: false });
-    let slot = b.add_slot("adcs", vec![("waiter".into(), loaded, Vec::new())], None);
+    let slot = b.add_slot("adcs", vec![occ("waiter", loaded)], None);
     if edged {
         b.connect(
             PortRef::msg::<SequenceCommand>(autonomy),
@@ -925,7 +934,7 @@ fn registered_descriptor_is_the_extended_occupant_shape() {
     let loaded = open_waiter(&lib);
 
     let mut b = Coordinator::builder(sim_config());
-    let slot = b.add_slot("adcs", vec![("waiter".into(), loaded, Vec::new())], None);
+    let slot = b.add_slot("adcs", vec![occ("waiter", loaded)], None);
     let d = b.descriptor_of(slot);
     assert_eq!(d.name, "adcs", "registered under the slot's instance name");
 
@@ -974,8 +983,8 @@ fn edge_into_a_host_connected_input_is_rejected() {
     // this connect must fail as a HostPort, never bind a foreign producer into a
     // runner-held view.
     let mut b = Coordinator::builder(sim_config());
-    let a = b.add_slot("a", vec![("waiter".into(), open_waiter(&lib), Vec::new())], None);
-    let bslot = b.add_slot("b", vec![("waiter".into(), open_waiter(&lib), Vec::new())], None);
+    let a = b.add_slot("a", vec![occ("waiter", open_waiter(&lib))], None);
+    let bslot = b.add_slot("b", vec![occ("waiter", open_waiter(&lib))], None);
     b.connect(
         PortRef::new::<SeqStatusFrame>(a),
         PortRef::new::<SeqStatusFrame>(bslot),
@@ -1003,7 +1012,7 @@ fn builder_initial_occupant_outside_allowed_set_panics() {
     let result = std::panic::catch_unwind(AssertUnwindSafe(|| {
         b.add_slot(
             "adcs",
-            vec![("waiter".into(), loaded, Vec::new())],
+            vec![occ("waiter", loaded)],
             Some(InitialOccupant::loaded("nonesuch")),
         )
     }));
