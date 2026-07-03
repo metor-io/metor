@@ -50,7 +50,7 @@ use stellarator::net::TcpStream;
 use stellarator::sync::WaitQueue;
 
 use crate::binder::{BindPorts, RingSource};
-use crate::descriptor::{PortDesc, PortId};
+use crate::descriptor::{Delivery, PortDesc, PortId};
 use crate::message::{CommandOut, split_record};
 use crate::registry::{AllOutputs, EntrySchema, RegistryEntry};
 use crate::system::{AsyncSystem, CyclicSystem, Out, System, SystemInput, SystemOutput};
@@ -303,38 +303,59 @@ pub struct TelemetryConfig<T: Transport> {
 // Hand-off (the bounded, per-tap-coalescing queue, telemetry.md §4)
 // ---------------------------------------------------------------------------
 
-/// One pending packet slot per tap: a newer snapshot overwrites an older un-sent one
-/// (latest-wins coalescing — the Overwrite ring semantics, one level up). Overwriting an
-/// *occupied* slot means a snapshot was dropped (the link is backed up), bumping `dropped`.
+/// The bound on the shared Log-lane FIFO. A backed-up link drops the **oldest**
+/// queued record past this depth (and counts it), bounding memory while keeping the
+/// link's most recent log of events/commands.
+const LOG_HANDOFF_CAP: usize = 1024;
+
+/// THE hand-off (C4): one struct, one wait queue, one sender — two lanes keyed on
+/// the entry's [`Delivery`](crate::Delivery) axis.
+///
+/// **Snapshot lane** — one coalescing slot per Snapshot tap: a newer snapshot
+/// overwrites an older un-sent one (latest-wins — the Overwrite ring semantics, one
+/// level up); overwriting an *occupied* slot counts a drop (`telemetry.dropped`).
+///
+/// **Log lane** — one bounded FIFO shared by every Log tap: an event/command record
+/// must never be coalesced, so every drained record is appended in order and
+/// forwarded verbatim (cross-channel order is irrelevant — each record
+/// self-addresses). Overflow drops the **oldest** and counts it
+/// (`telemetry.msg_dropped` — the health key is kept).
 struct HandOff {
+    /// Snapshot lane: one coalescing slot per Snapshot tap.
     slots: Mutex<Vec<Option<LenPacket>>>,
-    /// Set when a slot is filled; cleared by the sender when it parks. Just avoids busy
-    /// spinning — a missed wake is harmless because the sender always drains *all* slots.
+    /// Log lane: one bounded FIFO shared by every Log tap.
+    fifo: Mutex<VecDeque<LenPacket>>,
+    /// Set when either lane is filled; cleared by the sender when it parks. Just
+    /// avoids busy spinning — a missed wake is harmless because the sender always
+    /// drains both lanes fully.
     pending: AtomicBool,
-    /// Count of snapshots dropped by overwrite (surfaced as `telemetry.dropped` health).
-    dropped: AtomicU64,
-    /// Wakes the parked sender when a snapshot is pushed (or on shutdown). Shared with the
-    /// [`MsgHandOff`] so either hand-off can rouse the one sender task.
+    /// Snapshots dropped by coalescing overwrite (surfaced as `telemetry.dropped`).
+    dropped_snapshots: AtomicU64,
+    /// Log records dropped-oldest on overflow (surfaced as `telemetry.msg_dropped`).
+    dropped_logs: AtomicU64,
+    /// Wakes the parked sender when either lane fills (or on shutdown).
     wq: Arc<WaitQueue>,
 }
 
 impl HandOff {
-    fn new(n_taps: usize, wq: Arc<WaitQueue>) -> Self {
+    fn new(n_slots: usize, wq: Arc<WaitQueue>) -> Self {
         Self {
-            slots: Mutex::new((0..n_taps).map(|_| None).collect()),
+            slots: Mutex::new((0..n_slots).map(|_| None).collect()),
+            fifo: Mutex::new(VecDeque::new()),
             pending: AtomicBool::new(false),
-            dropped: AtomicU64::new(0),
+            dropped_snapshots: AtomicU64::new(0),
+            dropped_logs: AtomicU64::new(0),
             wq,
         }
     }
 
     /// Cycle side (never blocks): coalesce `pkt` into `slot`, counting a drop if it
     /// overwrote an un-sent packet, then wake the sender.
-    fn push(&self, slot: usize, pkt: LenPacket) {
+    fn push_snapshot(&self, slot: usize, pkt: LenPacket) {
         {
             let mut slots = self.slots.lock().expect("handoff poisoned");
             if slots[slot].is_some() {
-                self.dropped.fetch_add(1, Relaxed);
+                self.dropped_snapshots.fetch_add(1, Relaxed);
             }
             slots[slot] = Some(pkt);
         }
@@ -342,67 +363,33 @@ impl HandOff {
         self.wq.wake_all();
     }
 
-    /// Sender side: take every pending packet (drops the lock before any `.await`).
-    fn drain(&self) -> Vec<LenPacket> {
-        let mut slots = self.slots.lock().expect("handoff poisoned");
-        slots.iter_mut().filter_map(Option::take).collect()
-    }
-}
-
-/// The bound on the shared message FIFO ([`MsgHandOff`]). A backed-up link drops the
-/// **oldest** queued message past this depth (and counts it), bounding memory while
-/// keeping the link's most recent log of events/commands.
-const MSG_HANDOFF_CAP: usize = 1024;
-
-/// The **non-coalescing** message hand-off (`docs/messages.md` §3.2): one bounded FIFO
-/// shared across *all* message taps. Unlike the latest-wins component [`HandOff`], a
-/// message is an event/command log record — it must not be coalesced — so every drained
-/// record is appended in FIFO order and forwarded verbatim. Cross-channel order is
-/// irrelevant (each `Msg` self-addresses by id), so one shared queue suffices. On
-/// overflow the **oldest** record is dropped and `dropped` bumped (surfaced as
-/// `telemetry.msg_dropped`).
-struct MsgHandOff {
-    queue: Mutex<VecDeque<LenPacket>>,
-    /// Set when a record is queued; cleared by the sender when it parks (a missed wake is
-    /// harmless — the sender always drains the whole queue).
-    pending: AtomicBool,
-    /// Count of records dropped-oldest on overflow (surfaced as `telemetry.msg_dropped`).
-    dropped: AtomicU64,
-    /// The same [`WaitQueue`] the component [`HandOff`] holds, so a queued message wakes
-    /// the one shared sender task.
-    wq: Arc<WaitQueue>,
-}
-
-impl MsgHandOff {
-    fn new(wq: Arc<WaitQueue>) -> Self {
-        Self {
-            queue: Mutex::new(VecDeque::new()),
-            pending: AtomicBool::new(false),
-            dropped: AtomicU64::new(0),
-            wq,
-        }
-    }
-
-    /// Cycle side (never blocks): append `pkt`, dropping the oldest queued record (and
-    /// counting it) if the FIFO is already at [`MSG_HANDOFF_CAP`], then wake the sender.
-    fn push(&self, pkt: LenPacket) {
+    /// Cycle side (never blocks): append `pkt` to the Log lane, dropping the oldest
+    /// queued record (and counting it) past [`LOG_HANDOFF_CAP`], then wake the sender.
+    fn push_log(&self, pkt: LenPacket) {
         {
-            let mut queue = self.queue.lock().expect("msg handoff poisoned");
-            if queue.len() >= MSG_HANDOFF_CAP {
-                queue.pop_front();
-                self.dropped.fetch_add(1, Relaxed);
+            let mut fifo = self.fifo.lock().expect("handoff poisoned");
+            if fifo.len() >= LOG_HANDOFF_CAP {
+                fifo.pop_front();
+                self.dropped_logs.fetch_add(1, Relaxed);
             }
-            queue.push_back(pkt);
+            fifo.push_back(pkt);
         }
         self.pending.store(true, Release);
         self.wq.wake_all();
     }
 
-    /// Sender side: take every queued record in FIFO order (drops the lock before any
-    /// `.await`).
-    fn drain(&self) -> Vec<LenPacket> {
-        let mut queue = self.queue.lock().expect("msg handoff poisoned");
-        queue.drain(..).collect()
+    /// Sender side: take every pending packet from both lanes
+    /// `(snapshots, log records)` — drops the locks before any `.await`.
+    fn drain(&self) -> (Vec<LenPacket>, Vec<LenPacket>) {
+        let snapshots = {
+            let mut slots = self.slots.lock().expect("handoff poisoned");
+            slots.iter_mut().filter_map(Option::take).collect()
+        };
+        let logs = {
+            let mut fifo = self.fifo.lock().expect("handoff poisoned");
+            fifo.drain(..).collect()
+        };
+        (snapshots, logs)
     }
 }
 
@@ -538,14 +525,13 @@ struct Announce {
     metadata: Vec<ComponentMetadata>,
 }
 
-/// The async sender task (telemetry.md §4): announce every tap once on connect, then
-/// drain the hand-off and send `Table` packets. Stops downlinking on any transport error
-/// or when `stop` is set (the cycle is unaffected either way).
+/// The async sender task (telemetry.md §4): announce every Table tap once on
+/// connect, then drain the one two-lane hand-off and send. Stops downlinking on any
+/// transport error or when `stop` is set (the cycle is unaffected either way).
 async fn run_sender<T: Transport>(
     mut transport: T,
     announces: Vec<Announce>,
     handoff: Arc<HandOff>,
-    msg_handoff: Arc<MsgHandOff>,
     wq: Arc<WaitQueue>,
     stop: Arc<AtomicBool>,
 ) {
@@ -562,29 +548,16 @@ async fn run_sender<T: Transport>(
         if stop.load(Acquire) {
             return;
         }
-        // Component snapshots (latest-wins) and message-log records (FIFO) share the one
-        // sender; drain both, park on the shared wait queue only when both are empty.
-        let pkts = handoff.drain();
-        let msgs = msg_handoff.drain();
-        if pkts.is_empty() && msgs.is_empty() {
+        // Snapshots (latest-wins) and log records (FIFO) share the one sender; drain
+        // both lanes, park on the wait queue only when both are empty.
+        let (pkts, logs) = handoff.drain();
+        if pkts.is_empty() && logs.is_empty() {
             let _ = wq
-                .wait_for(|| {
-                    // Clear *both* pending flags (non-short-circuiting) so neither hand-off
-                    // leaves a stale set bit, then also honor `stop`.
-                    let woke = handoff.pending.swap(false, AcqRel);
-                    let woke_msg = msg_handoff.pending.swap(false, AcqRel);
-                    woke || woke_msg || stop.load(Acquire)
-                })
+                .wait_for(|| handoff.pending.swap(false, AcqRel) || stop.load(Acquire))
                 .await;
             continue;
         }
-        for pkt in pkts {
-            if transport.send(pkt).await.is_err() {
-                return;
-            }
-        }
-        // Messages carry no announce — `Transport::send` writes the `Msg` packet verbatim.
-        for pkt in msgs {
+        for pkt in pkts.into_iter().chain(logs) {
             if transport.send(pkt).await.is_err() {
                 return;
             }
@@ -642,22 +615,31 @@ impl BindPorts<BoxBacking> for TelemetryIn {
 // The system
 // ---------------------------------------------------------------------------
 
-/// One resolved tap: a read view into a buffer, its assigned packet id, and the reused
-/// snapshot scratch.
+/// ONE resolved tap (C4): a read view into a registered buffer plus the two axes
+/// that drive it — the hand-off lane (from the entry's `delivery`) and the wire
+/// framing (from the entry's `schema`). The generic `Table × Log` combination falls
+/// out for free: FIFO lane + announced Table packets.
 struct Tap {
-    slot: usize,
-    packet_id: PacketId,
     view: View<BoxBacking, NoWake, NoWake>,
     scratch: Vec<u8>,
+    lane: Lane,
+    wire: Wire,
 }
 
-/// One resolved **message** tap: a read view into a message channel plus the reused
-/// record scratch. Unlike a [`Tap`] it carries no `packet_id` — each record's id is the
-/// first two bytes ([`split_record`]), so the downlink reads the id from the record
-/// itself rather than from a build-time assignment.
-struct MsgTap {
-    view: View<BoxBacking, NoWake, NoWake>,
-    scratch: Vec<u8>,
+/// Which hand-off lane a tap pushes to — the entry's `Delivery` projection.
+enum Lane {
+    /// Latest-wins: coalesce into this tap's dedicated slot.
+    Coalesce { slot: usize },
+    /// Every record, in order, into the shared FIFO.
+    Fifo,
+}
+
+/// How a tap frames a drained record — the entry's schema projection.
+enum Wire {
+    /// A `Table` packet under the announce-assigned packet id.
+    Table { packet_id: PacketId },
+    /// A self-describing `Msg` packet; the id is the record's first two bytes.
+    Msg,
 }
 
 /// The telemetry downlink system (telemetry.md §3). Generic over the [`Transport`]; the
@@ -665,19 +647,16 @@ struct MsgTap {
 pub struct TelemetrySystem<T: Transport> {
     transport: Option<T>,
     mode: TelemetryMode,
+    /// ONE tap list (C4): each tap carries its own lane + wire framing.
     taps: Vec<Tap>,
-    /// The message-channel taps (`docs/messages.md` §3): every record drained, never
-    /// coalesced, into the shared [`MsgHandOff`].
-    msg_taps: Vec<MsgTap>,
     handoff: Option<Arc<HandOff>>,
-    msg_handoff: Option<Arc<MsgHandOff>>,
     stop: Option<Arc<AtomicBool>>,
     /// Holds the sender task; its `Drop` cancels the task on teardown.
     #[allow(dead_code)]
     sender: Option<JoinHandleDropGuard<()>>,
-    /// How many drops we have already surfaced to health (so each new one is reported once).
+    /// Snapshot drops already surfaced to health (each new one reported once).
     last_dropped: u64,
-    /// The message-FIFO twin of `last_dropped` (surfaced as `telemetry.msg_dropped`).
+    /// The Log-lane twin of `last_dropped` (surfaced as `telemetry.msg_dropped`).
     last_msg_dropped: u64,
 }
 
@@ -689,9 +668,7 @@ impl<T: Transport> TelemetrySystem<T> {
             transport: Some(config.transport),
             mode: config.mode,
             taps: Vec::new(),
-            msg_taps: Vec::new(),
             handoff: None,
-            msg_handoff: None,
             stop: None,
             sender: None,
             last_dropped: 0,
@@ -714,8 +691,8 @@ impl<T: Transport + 'static> System for TelemetrySystem<T> {
         // already telemetered-only (the A6 source-side filter), so a command channel
         // or an opted-out frame never even reaches the matcher here.
         let mut taps = Vec::new();
-        let mut msg_taps = Vec::new();
         let mut announces = Vec::new();
+        let mut n_slots = 0usize;
         // Deferred health reports: iterating `output.all` borrows the output bundle,
         // so `output.health()` (a `&mut` borrow) is driven after the loop.
         let mut reader_slot_errors = 0usize;
@@ -733,60 +710,61 @@ impl<T: Transport + 'static> System for TelemetrySystem<T> {
                     continue;
                 }
             };
-            match &entry.schema {
-                // Announce-then-Table wire form: an assigned packet id + a replayed
-                // announce per tap.
+            // The two tap axes are independent projections of the entry: the LANE
+            // comes off `delivery` (coalesce vs FIFO), the WIRE off `schema`
+            // (announced Table id vs self-describing record). The generic
+            // `Table × Log` combination — an every-record frame log — falls out with
+            // zero extra code.
+            let lane = match entry.delivery {
+                Delivery::Snapshot => {
+                    let slot = n_slots;
+                    n_slots += 1;
+                    Lane::Coalesce { slot }
+                }
+                Delivery::Log => Lane::Fifo,
+            };
+            let wire = match &entry.schema {
                 EntrySchema::Table {
                     vtable, metadata, ..
                 } => {
-                    let slot = taps.len();
-                    let packet_id = (slot as u16).to_le_bytes();
-                    taps.push(Tap {
-                        slot,
-                        packet_id,
-                        view,
-                        scratch: Vec::new(),
-                    });
+                    let packet_id = (announces.len() as u16).to_le_bytes();
                     announces.push(Announce {
                         packet_id,
                         vtable: vtable.clone(),
                         metadata: metadata.clone(),
                     });
+                    Wire::Table { packet_id }
                 }
-                // Self-describing records: no announce, the id is read per record.
-                EntrySchema::Postcard => {
-                    msg_taps.push(MsgTap {
-                        view,
-                        scratch: Vec::new(),
-                    });
-                }
-            }
+                EntrySchema::Postcard => Wire::Msg,
+            };
+            taps.push(Tap {
+                view,
+                scratch: Vec::new(),
+                lane,
+                wire,
+            });
         }
 
         for _ in 0..reader_slot_errors {
             output.health().error("telemetry.reader_slot");
         }
 
-        // One wait queue shared by both hand-offs wakes the single sender task.
+        // One wait queue on the one two-lane hand-off wakes the single sender task.
         let wq = Arc::new(WaitQueue::new());
-        let handoff = Arc::new(HandOff::new(taps.len(), wq.clone()));
-        let msg_handoff = Arc::new(MsgHandOff::new(wq.clone()));
+        let handoff = Arc::new(HandOff::new(n_slots, wq.clone()));
         let stop = Arc::new(AtomicBool::new(false));
         if let Some(transport) = self.transport.take() {
             let handle = stellarator::spawn(run_sender(
                 transport,
                 announces,
                 handoff.clone(),
-                msg_handoff.clone(),
                 wq,
                 stop.clone(),
             ));
             self.sender = Some(handle.drop_guard());
         }
         self.taps = taps;
-        self.msg_taps = msg_taps;
         self.handoff = Some(handoff);
-        self.msg_handoff = Some(msg_handoff);
         self.stop = Some(stop);
     }
 
@@ -802,73 +780,79 @@ impl<T: Transport + 'static> System for TelemetrySystem<T> {
     }
 }
 
+/// Frame one drained record for the wire per the tap's [`Wire`]: a `Table` packet
+/// under the announce-assigned id, or a self-describing `Msg` packet (the record's
+/// own 2-byte id — `None` if the record is too short to carry one).
+fn frame_packet(wire: &Wire, rec: &[u8]) -> Option<LenPacket> {
+    match wire {
+        Wire::Table { packet_id } => {
+            let mut pkt = LenPacket::table(*packet_id, rec.len());
+            pkt.extend_from_slice(rec);
+            Some(pkt)
+        }
+        Wire::Msg => split_record(rec).map(|(id, payload)| {
+            let mut pkt = LenPacket::msg(id, payload.len());
+            pkt.extend_from_slice(payload);
+            pkt
+        }),
+    }
+}
+
 impl<T: Transport + 'static> CyclicSystem for TelemetrySystem<T> {
-    /// End-of-cycle snapshot (telemetry.md §3/§4): for each tap with a fresh record,
-    /// copy the latest table bytes into a `LenPacket` and hand it to the sender; never
-    /// awaits. Any drops detected since last cycle are surfaced as `telemetry.dropped`.
-    /// Message taps are drained too — **every** record, non-coalescing — into the shared
-    /// [`MsgHandOff`] (`docs/messages.md` §3).
+    /// End-of-cycle drain (telemetry.md §3/§4) — ONE loop over the one tap list;
+    /// never awaits. A Coalesce tap keeps only the newest record and pushes one
+    /// latest-wins snapshot; a Fifo tap pushes **every** record in order. Either way
+    /// the packet is framed per the tap's wire form and a lapped view resyncs to the
+    /// live edge (the cycle never blocks). Drops detected since last cycle surface
+    /// as `telemetry.dropped` (snapshot lane) / `telemetry.msg_dropped` (log lane).
     fn execute(&mut self, _now: Timestamp, _input: &mut Self::Input, output: &mut Self::Output) {
         let handoff = match &self.handoff {
             Some(h) => h.clone(),
             None => return,
         };
         for tap in &mut self.taps {
-            // Drain to the newest committed record (latest-wins); a lapped view skips to
-            // the live edge. No new record this cycle ⇒ nothing to send for this tap.
-            let mut got = false;
-            loop {
-                match tap.view.try_read_into(&mut tap.scratch) {
-                    Ok(true) => got = true,
-                    Ok(false) => break,
-                    Err(_) => {
-                        tap.view.resync();
-                        break;
+            match tap.lane {
+                // Latest-wins: drain to the newest committed record; no new record
+                // this cycle means nothing to send for this tap.
+                Lane::Coalesce { slot } => {
+                    let mut got = false;
+                    crate::port::drain_view(
+                        &mut tap.view,
+                        &mut tap.scratch,
+                        crate::OnLap::Resync,
+                        |_| got = true,
+                    );
+                    if got && let Some(pkt) = frame_packet(&tap.wire, &tap.scratch) {
+                        handoff.push_snapshot(slot, pkt);
                     }
                 }
-            }
-            if got {
-                let mut pkt = LenPacket::table(tap.packet_id, tap.scratch.len());
-                pkt.extend_from_slice(&tap.scratch);
-                handoff.push(tap.slot, pkt);
+                // Every record, in order, onto the shared FIFO.
+                Lane::Fifo => {
+                    let wire = &tap.wire;
+                    let handoff = &handoff;
+                    crate::port::drain_view(
+                        &mut tap.view,
+                        &mut tap.scratch,
+                        crate::OnLap::Resync,
+                        |rec| {
+                            if let Some(pkt) = frame_packet(wire, rec) {
+                                handoff.push_log(pkt);
+                            }
+                        },
+                    );
+                }
             }
         }
-        // Surface any snapshots the sender's backlog forced us to drop (telemetry.md §4).
-        let dropped = handoff.dropped.load(Relaxed);
+        // Surface any packets the sender's backlog forced us to drop (telemetry.md §4).
+        let dropped = handoff.dropped_snapshots.load(Relaxed);
         while self.last_dropped < dropped {
             output.health().error("telemetry.dropped");
             self.last_dropped += 1;
         }
-
-        // Message taps: drain **every** record (the `Input::drain` shape, not latest-wins),
-        // re-frame each `(id, payload)` as a `Msg` packet, and FIFO it to the sender. A
-        // lapped view skips to the live edge (the cycle never blocks); no announce.
-        if let Some(msg_handoff) = &self.msg_handoff {
-            let msg_handoff = msg_handoff.clone();
-            for tap in &mut self.msg_taps {
-                loop {
-                    match tap.view.try_read_into(&mut tap.scratch) {
-                        Ok(true) => {
-                            if let Some((id, payload)) = split_record(&tap.scratch) {
-                                let mut pkt = LenPacket::msg(id, payload.len());
-                                pkt.extend_from_slice(payload);
-                                msg_handoff.push(pkt);
-                            }
-                        }
-                        Ok(false) => break,
-                        Err(_) => {
-                            tap.view.resync();
-                            break;
-                        }
-                    }
-                }
-            }
-            // Surface any records the FIFO dropped-oldest on overflow.
-            let msg_dropped = msg_handoff.dropped.load(Relaxed);
-            while self.last_msg_dropped < msg_dropped {
-                output.health().error("telemetry.msg_dropped");
-                self.last_msg_dropped += 1;
-            }
+        let msg_dropped = handoff.dropped_logs.load(Relaxed);
+        while self.last_msg_dropped < msg_dropped {
+            output.health().error("telemetry.msg_dropped");
+            self.last_msg_dropped += 1;
         }
     }
 }

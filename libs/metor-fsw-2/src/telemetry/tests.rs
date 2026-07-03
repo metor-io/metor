@@ -451,7 +451,7 @@ async fn message_downlink_fifo_no_coalesce() {
     use crate::port::capacity_for;
     use crate::registry::{EntrySchema, RegistryEntry};
 
-    use super::{HandOff, MsgHandOff, run_sender};
+    use super::{HandOff, run_sender};
 
     // A by-hand message channel — the exact shape the coordinator registers (W4) and the
     // telemetry `execute` message-tap drains.
@@ -507,16 +507,15 @@ async fn message_downlink_fifo_no_coalesce() {
         })
         .expect("emit abort");
 
-    // The shared wait queue + both hand-offs (one sender drains both).
+    // The one two-lane hand-off (one sender drains both lanes).
     let wq = Arc::new(WaitQueue::new());
     let handoff = Arc::new(HandOff::new(1, wq.clone()));
-    let msg_handoff = Arc::new(MsgHandOff::new(wq.clone()));
 
     // A component snapshot through the latest-wins hand-off, to prove the two queues are
     // independent and the one sender forwards both.
     let mut table = LenPacket::table([9, 9], 4);
     table.extend_from_slice(&[1, 2, 3, 4]);
-    handoff.push(0, table);
+    handoff.push_snapshot(0, table);
 
     // Drain *every* message record (the `execute` message-tap logic) into the FIFO.
     let mut scratch = Vec::new();
@@ -524,7 +523,7 @@ async fn message_downlink_fifo_no_coalesce() {
         let (id, payload) = split_record(&scratch).expect("split record");
         let mut pkt = LenPacket::msg(id, payload.len());
         pkt.extend_from_slice(payload);
-        msg_handoff.push(pkt);
+        handoff.push_log(pkt);
     }
 
     // Drive the async sender: no announces (no component taps), forward each queued packet.
@@ -535,7 +534,6 @@ async fn message_downlink_fifo_no_coalesce() {
         mock,
         Vec::new(),
         handoff,
-        msg_handoff,
         wq.clone(),
         stop.clone(),
     ));
@@ -604,6 +602,106 @@ async fn message_downlink_fifo_no_coalesce() {
 }
 
 // ---------------------------------------------------------------------------
+// 6b. The generic Table × Log combination (the axis product's fourth cell): an
+//     every-record FRAME log downlinks each record via the FIFO lane, framed as an
+//     announced Table packet — no coalescing, one announce.
+// ---------------------------------------------------------------------------
+
+/// A producer whose `Imu` output declares `Delivery::Log` — an every-record frame
+/// log. Writes THREE records per cycle; a Snapshot tap would coalesce them.
+struct BurstLogProducer {
+    n: f64,
+}
+
+struct BurstLogOut {
+    imu: Output<Imu>,
+}
+
+impl SystemOutput for BurstLogOut {
+    fn descriptors() -> Vec<crate::PortDesc> {
+        vec![crate::PortDesc::of::<Imu>().with_delivery(crate::Delivery::Log)]
+    }
+}
+
+impl crate::BindPorts<crate::ring::BoxBacking> for BurstLogOut {
+    fn bind<S: crate::RingSource<B = crate::ring::BoxBacking>>(src: &mut S) -> Self {
+        Self {
+            imu: Output::bind(src),
+        }
+    }
+}
+
+impl System for BurstLogProducer {
+    type Input = NoIn;
+    type Output = Out<BurstLogOut>;
+    const NAME: &'static str = "burst_log";
+}
+
+impl CyclicSystem for BurstLogProducer {
+    fn execute(&mut self, now: Timestamp, _in: &mut NoIn, o: &mut Self::Output) {
+        for _ in 0..3 {
+            self.n += 1.0;
+            let _ = o.imu.write(&Imu {
+                timestamp: now,
+                omega: self.n,
+            });
+        }
+    }
+}
+
+#[cfg(not(miri))]
+#[stellarator::test]
+async fn table_log_entry_downlinks_every_record() {
+    let mock = MockTransport::new(false);
+    let rec = mock.inner.clone();
+
+    let mut b = Coordinator::builder(sim_config());
+    b.add_cyclic(BurstLogProducer { n: 0.0 });
+    b.add_telemetry(TelemetryConfig {
+        transport: mock,
+        mode: TelemetryMode::Subset {
+            instances: Vec::new(),
+            frames: vec!["imu".to_string()],
+        },
+    });
+    let mut coord = b.build().unwrap();
+    let cycles = 4;
+    coord.run_for(cycles).await;
+    // Let the parked sender drain the FIFO tail.
+    stellarator::sleep(Duration::from_millis(20)).await;
+
+    // The Log frame entry is announced exactly once (a valid Table announce)...
+    let announces = rec.announces.lock().unwrap();
+    assert_eq!(announces.len(), 1, "one announce for the one tapped entry");
+    assert!(
+        announces[0].1.iter().any(|m| m.name == "burst_log.imu.omega"),
+        "prefixed announce metadata"
+    );
+    let packet_id = announces[0].0;
+
+    // ...and EVERY record arrives as its own Table packet under that id — the
+    // FIFO lane never coalesces (3 records x N cycles), and each omega is distinct.
+    let packets = rec.packets.lock().unwrap();
+    let omegas: Vec<f64> = packets
+        .iter()
+        .filter(|p| packet_id_of(p) == packet_id)
+        .map(|p| {
+            Imu::read_from_prefix(packet_payload(p))
+                .expect("imu bytes")
+                .0
+                .omega
+        })
+        .collect();
+    assert_eq!(
+        omegas.len(),
+        3 * cycles,
+        "every record downlinked, none coalesced: {omegas:?}"
+    );
+    let want: Vec<f64> = (1..=(3 * cycles)).map(|i| i as f64).collect();
+    assert_eq!(omegas, want, "in order");
+}
+
+// ---------------------------------------------------------------------------
 // 7. The message FIFO is bounded: past capacity it drops the *oldest* record (never the
 //    newest) and counts each drop — the non-coalescing event-log overflow policy.
 // ---------------------------------------------------------------------------
@@ -614,25 +712,26 @@ fn message_handoff_drops_oldest_on_overflow() {
 
     use stellarator::sync::WaitQueue;
 
-    use super::{MSG_HANDOFF_CAP, MsgHandOff};
+    use super::{HandOff, LOG_HANDOFF_CAP};
 
     let wq = Arc::new(WaitQueue::new());
-    let handoff = MsgHandOff::new(wq);
+    let handoff = HandOff::new(0, wq);
 
     // Push two past capacity; each packet carries a unique id byte so we can identify it.
     let overflow = 2usize;
-    for i in 0..(MSG_HANDOFF_CAP + overflow) {
-        handoff.push(LenPacket::msg([(i & 0xff) as u8, (i >> 8) as u8], 0));
+    for i in 0..(LOG_HANDOFF_CAP + overflow) {
+        handoff.push_log(LenPacket::msg([(i & 0xff) as u8, (i >> 8) as u8], 0));
     }
 
     assert_eq!(
-        handoff.dropped.load(Relaxed) as usize,
+        handoff.dropped_logs.load(Relaxed) as usize,
         overflow,
         "two records past cap were dropped"
     );
 
-    let drained = handoff.drain();
-    assert_eq!(drained.len(), MSG_HANDOFF_CAP, "the FIFO is bounded to its cap");
+    let (snapshots, drained) = handoff.drain();
+    assert!(snapshots.is_empty(), "nothing on the snapshot lane");
+    assert_eq!(drained.len(), LOG_HANDOFF_CAP, "the FIFO is bounded to its cap");
     // The *oldest* (records 0,1) were dropped; the queue holds records `overflow..`, in
     // order — the newest survive, the front is shed.
     let first_id = [drained[0].inner[5], drained[0].inner[6]];

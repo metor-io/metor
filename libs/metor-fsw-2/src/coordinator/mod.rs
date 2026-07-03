@@ -2209,20 +2209,12 @@ impl Coordinator {
     /// (drop-on-full via overwrite), waking the async `recv` (coordinator.md §4.3).
     fn run_copy_ins(&mut self) {
         for c in &mut self.copy_ins {
-            loop {
-                match c.upstream.try_read_into(&mut c.scratch) {
-                    Ok(true) => {
-                        let _ = c.writer.try_write(&c.scratch);
-                    }
-                    Ok(false) => break,
-                    Err(_) => {
-                        // Copy-in lapped on the upstream output: skip to the live
-                        // edge and continue (the async consumer gets latest-wins).
-                        c.upstream.resync();
-                        break;
-                    }
-                }
-            }
+            // A lap on the upstream output resyncs to the live edge and keeps
+            // draining (the async consumer gets latest-wins) — the Resync policy.
+            let writer = &mut c.writer;
+            crate::port::drain_view(&mut c.upstream, &mut c.scratch, OnLap::Resync, |rec| {
+                let _ = writer.try_write(rec);
+            });
         }
     }
 
