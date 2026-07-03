@@ -58,7 +58,7 @@ pub use coordinator::{
 
 // The general output registry and the telemetry downlink (its first consumer) + the uplink
 // command-plane ingest system (its read twin).
-pub use registry::{AllOutputs, MessageEntry, MessageRegistry, OutputRegistry, RegistryEntry};
+pub use registry::{AllOutputs, EntrySchema, Registry, RegistryEntry};
 pub use telemetry::{
     RecvTransport, TcpRecvTransport, TcpTransport, TelemetryConfig, TelemetryMode,
     TelemetrySystem, Transport, TransportError, UplinkSystem,

@@ -402,11 +402,11 @@ mod tests {
     use super::{LOG_DEPTH, MAX_MSG_BYTES, MsgIn, MsgOut, split_record};
     use crate::port::capacity_for;
     use crate::PortId;
-    use crate::registry::MessageEntry;
+    use crate::registry::{EntrySchema, RegistryEntry};
 
     /// A heterogeneous channel is now N typed ports (`docs/message-wiring.md` §2.1): mint a
     /// `MsgOut<SequenceRegistry>` and a `MsgOut<SequenceCommand>` over one ring, emit one of
-    /// each, read them back via a `MessageEntry` `View`, and assert `split_record` recovers
+    /// each, read them back via a `RegistryEntry` `View`, and assert `split_record` recovers
     /// each id and the payloads postcard-round-trip. Also checks `MsgOut::descriptor`.
     #[test]
     fn msg_out_emits_and_round_trips() {
@@ -415,10 +415,12 @@ mod tests {
             max_readers: 4,
             overrun: Overrun::Overwrite,
         });
-        let entry = MessageEntry {
+        let entry = RegistryEntry {
             key: metor_proto::types::ComponentId::new("coordinator.sequences"),
             instance: std::sync::Arc::from("coordinator"),
-            channel: std::sync::Arc::from("sequences"),
+            name: std::sync::Arc::from("sequences"),
+            schema: EntrySchema::Postcard,
+            delivery: crate::Delivery::Log,
             telemetered: true,
             ring: ring.clone(),
         };

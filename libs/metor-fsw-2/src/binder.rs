@@ -26,7 +26,7 @@ use std::sync::Arc;
 
 use metor_fsw_ring::{Backing, BoxBacking, RingBuffer, WakeSink, WakeSource};
 
-use crate::registry::{MessageRegistry, OutputRegistry};
+use crate::registry::Registry;
 
 /// One pre-allocated ring plus its optional matched data-wake endpoint, in
 /// `descriptors()` order. `data` is `Some` only for the copy-in private buffer that
@@ -79,22 +79,19 @@ pub enum BoundInput {
 pub struct Binder<'a> {
     outputs: slice::Iter<'a, BoundPort>,
     inputs: slice::Iter<'a, BoundInput>,
-    registry: Arc<OutputRegistry>,
-    messages: Arc<MessageRegistry>,
+    registry: Arc<Registry>,
 }
 
 impl<'a> Binder<'a> {
     pub(crate) fn new(
         outputs: &'a [BoundPort],
         inputs: &'a [BoundInput],
-        registry: Arc<OutputRegistry>,
-        messages: Arc<MessageRegistry>,
+        registry: Arc<Registry>,
     ) -> Self {
         Self {
             outputs: outputs.iter(),
             inputs: inputs.iter(),
             registry,
-            messages,
         }
     }
 }
@@ -137,23 +134,14 @@ pub trait RingSource {
         Vec::new()
     }
 
-    /// The broad-access output registry (telemetry.md §2.4). A bundle that wants by-id
-    /// access to *every* output (the telemetry downlink, a logger, a recorder) pulls
-    /// this in its `BindPorts::bind`, exactly where it pulls its typed ports. Only the
-    /// host [`Binder`] carries one; a system that needs it is therefore host-only
-    /// (`B = BoxBacking`), so the default — used by any non-host source — panics rather
-    /// than fabricate an empty registry.
-    fn output_registry(&self) -> Arc<OutputRegistry> {
-        panic!("this ring source carries no output registry (host-only capability)")
-    }
-
-    /// The broad-access **message** registry (`docs/messages.md` §2), the message twin of
-    /// [`output_registry`](Self::output_registry). A bundle that taps every message channel
-    /// (the telemetry downlink, W2) pulls this in its `BindPorts::bind` alongside its typed
-    /// ports. Only the host [`Binder`] carries one; any non-host source panics rather than
-    /// fabricate an empty registry, exactly as the output registry does.
-    fn message_registry(&self) -> Arc<MessageRegistry> {
-        panic!("this ring source carries no message registry (host-only capability)")
+    /// The broad-access registry over every registered buffer (telemetry.md §2.4).
+    /// A bundle that wants by-id access to *every* output (the telemetry downlink, a
+    /// logger, a recorder) pulls this in its `BindPorts::bind`, exactly where it
+    /// pulls its typed ports. Only the host [`Binder`] carries one; a system that
+    /// needs it is therefore host-only (`B = BoxBacking`), so the default — used by
+    /// any non-host source — panics rather than fabricate an empty registry.
+    fn registry(&self) -> Arc<Registry> {
+        panic!("this ring source carries no registry (host-only capability)")
     }
 }
 
@@ -213,16 +201,9 @@ impl<'a> RingSource for Binder<'a> {
 
     /// The registry is complete before the bind loop runs, so this is safe and needs no
     /// second phase. The returned `Arc` is cheap to clone and store.
-    fn output_registry(&self) -> Arc<OutputRegistry> {
+    fn registry(&self) -> Arc<Registry> {
         self.registry.clone()
     }
-
-    /// The message registry is frozen alongside the output registry before the bind loop
-    /// runs (`docs/messages.md` §2), so this is safe and needs no second phase.
-    fn message_registry(&self) -> Arc<MessageRegistry> {
-        self.messages.clone()
-    }
-
 }
 
 /// A port bundle (a `#[derive(SystemInput)]`/`#[derive(SystemOutput)]` struct, or

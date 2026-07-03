@@ -1148,8 +1148,12 @@ impl System for AllTap {
     const NAME: &'static str = "all_tap";
     fn init(&mut self, o: &mut Self::Output) {
         // The registries are frozen by build time, so init observes the whole graph.
-        self.frame_outs.set(o.all.outputs.entries().len());
-        self.msg_chans.set(o.all.messages.entries().len());
+        let (frames, msgs) = o.all.entries().fold((0, 0), |(f, m), e| match e.schema {
+            crate::EntrySchema::Table { .. } => (f + 1, m),
+            crate::EntrySchema::Postcard => (f, m + 1),
+        });
+        self.frame_outs.set(frames);
+        self.msg_chans.set(msgs);
     }
 }
 
@@ -1177,4 +1181,99 @@ async fn all_outputs_taps_the_whole_graph() {
     // and that the `ReceiveAll` port reserved itself a reader slot everywhere (build succeeded).
     assert!(msg_chans.get() >= 1, "sees the message channel: {}", msg_chans.get());
     assert!(frame_outs.get() >= 2, "sees frame outputs: {}", frame_outs.get());
+}
+
+#[test]
+fn command_ring_registered_but_untelemetered() {
+    // The coordinator's command channel is an ordinary registered entry now (A6):
+    // findable by key through the full registry (debugger/test surface), flagged
+    // untelemetered — the AllOutputs/downlink surface must never see it. No more
+    // opt-out-by-omission.
+    let mut b = Coordinator::builder(config());
+    b.add_cyclic(Producer::new());
+    let coord = b.build().unwrap();
+    let registry = coord.registry();
+    let key = metor_proto::types::ComponentId::new("coordinator.commands");
+    let entry = registry.get(key).expect("command ring is registered");
+    assert!(!entry.telemetered, "inbound control is never downlinked");
+    assert!(matches!(entry.schema, crate::EntrySchema::Postcard));
+    assert!(matches!(entry.delivery, crate::Delivery::Log));
+}
+
+#[test]
+fn duplicate_registry_key_is_rejected() {
+    // Two systems registered under the same instance name compute colliding
+    // `<instance>.<name>` keys for every port (user frame + health + log). One
+    // keyspace makes the collision a build error instead of a silent shadowing.
+    let mut b = Coordinator::builder(config());
+    b.add_cyclic_named("dup", Producer::new());
+    b.add_cyclic_named("dup", Producer::new());
+    let err = b.build().err().expect("colliding registry keys are rejected");
+    assert!(
+        matches!(&err, WireError::DuplicateRegistryKey { key } if key == "dup.imu"),
+        "{err:?}"
+    );
+}
+
+// A producer whose frame output opts out of telemetry (the A6 frame-side opt-out).
+struct QuietProducer;
+
+struct QuietOut {
+    imu: Output<Imu>,
+}
+
+impl SystemOutput for QuietOut {
+    fn descriptors() -> Vec<crate::PortDesc> {
+        vec![crate::PortDesc::of::<Imu>().untelemetered()]
+    }
+}
+
+impl crate::BindPorts<BoxBacking> for QuietOut {
+    fn bind<S: crate::RingSource<B = BoxBacking>>(src: &mut S) -> Self {
+        Self {
+            imu: Output::bind(src),
+        }
+    }
+}
+
+impl System for QuietProducer {
+    type Input = NoIn;
+    type Output = Out<QuietOut>;
+    const NAME: &'static str = "quiet";
+}
+
+impl CyclicSystem for QuietProducer {
+    fn execute(&mut self, now: Timestamp, _in: &mut NoIn, o: &mut Self::Output) {
+        let _ = o.imu.write(&Imu {
+            timestamp: now,
+            omega: 1.0,
+        });
+    }
+}
+
+#[cfg(not(miri))]
+#[stellarator::test]
+async fn untelemetered_frame_output_hidden_from_all_outputs() {
+    // A frame output with `telemetered = false` stays a fully registered, readable
+    // buffer (full-registry surface) but is invisible through `AllOutputs` — the
+    // frame-side twin of the command-channel opt-out (A6).
+    let frame_outs = Rc::new(std::cell::Cell::new(0));
+    let msg_chans = Rc::new(std::cell::Cell::new(0));
+    let mut b = Coordinator::builder(config());
+    b.add_cyclic(QuietProducer);
+    b.add_cyclic(AllTap {
+        frame_outs: frame_outs.clone(),
+        msg_chans: msg_chans.clone(),
+    });
+    let mut coord = b.build().unwrap();
+
+    let registry = coord.registry();
+    let key = metor_proto::types::ComponentId::new("quiet.imu");
+    let entry = registry.get(key).expect("untelemetered frame is registered");
+    assert!(!entry.telemetered);
+
+    coord.run_for(1).await;
+    // The tap sees the two systems' health/log frames (4) + coordinator health/log/
+    // status (3), but NOT quiet.imu. Exact count so a filter regression is loud.
+    assert_eq!(frame_outs.get(), 7, "quiet.imu is filtered at the source");
 }

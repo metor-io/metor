@@ -221,7 +221,7 @@ fn interactive_load_then_abort_safes() {
 //    commissioning lifecycle as `SequenceChannelEvent`s on its message channel, and
 //    the coordinator emits a boot `SequenceRegistry` listing the slot's allowed
 //    occupants — the exact wire path the panel's sequence view sources. Taps the
-//    message rings via `Coordinator::message_registry()` (docs/messages.md §5).
+//    message rings via `Coordinator::registry()` (docs/messages.md §5).
 // ---------------------------------------------------------------------------
 
 /// Drain a message ring into the decoded `Msg`s of one type, asserting the 2-byte id and
@@ -254,7 +254,7 @@ fn commissioning_emits_ordered_sequence_messages() {
     // the run — the message rings are overwrite, starting at the live edge, so the taps must
     // precede the emits. Only transition records land (6 events + 1 registry over the run),
     // far under the message ring depth, so a post-run drain never laps.
-    let messages = coord.message_registry();
+    let messages = coord.registry();
     let mut events_view = messages
         .view(ComponentId::new("mode.sequences"))
         .expect("the slot events channel is registered")
