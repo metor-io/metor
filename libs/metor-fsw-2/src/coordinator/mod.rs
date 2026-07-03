@@ -42,7 +42,7 @@ use crate::dynamic::FrameList;
 use crate::health::{HealthPort, Level};
 use crate::message::{LOG_DEPTH, MAX_MSG_BYTES, MsgIn, MsgOut};
 use crate::port::{Input, Output, capacity_for};
-use crate::registry::{MessageEntry, MessageRegistry, OutputRegistry, RegistryEntry};
+use crate::registry::{EntrySchema, Registry, RegistryEntry};
 use crate::sequence::{SequenceStatus, SlotControlIn};
 use crate::system::{AsyncSystem, CyclicRunner, CyclicSystem, Out, System, SystemOutput};
 use crate::telemetry::{RecvTransport, TelemetryConfig, TelemetrySystem, Transport, UplinkSystem};
@@ -243,6 +243,10 @@ pub enum WireError {
     /// that the one-cycle-late sampling is explicit rather than an artifact of
     /// registration order. `systems` names the cycle members in loop order.
     FeedbackCycle { systems: Vec<&'static str> },
+    /// Two registered buffers computed the same instance-qualified registry key
+    /// `"<instance>.<name>"` — one keyspace over frames and channels makes the
+    /// collision detectable instead of silently shadowing one entry (A1/C3).
+    DuplicateRegistryKey { key: String },
     /// A slot instance name exceeds [`NAME_CAP`] bytes. Slot names are the sequence
     /// channels' **wire address** (`SequenceCommand::channel`) *and* must round-trip
     /// losslessly into the fixed-size frames that carry them (`SlotStatus::occupant`,
@@ -330,6 +334,11 @@ impl std::fmt::Display for WireError {
             WireError::InvalidCycleRate { rate } => write!(
                 f,
                 "cycle_rate {rate} cannot pace a Wall clock — it must be finite and positive"
+            ),
+            WireError::DuplicateRegistryKey { key } => write!(
+                f,
+                "two buffers share the registry key {key:?} — rename one instance or port \
+                 so every '<instance>.<name>' is unique"
             ),
             WireError::SlotNameTooLong { name, len } => write!(
                 f,
@@ -829,7 +838,7 @@ impl CoordinatorBuilder {
     /// unchanged, and records a [`Reg::Dl`] registration whose `bind` (at `build()`)
     /// gathers the per-port ring regions, `fsw_create`s the state, and produces a
     /// [`DlSlot`](crate::dl) instead of a typed `CyclicRunner`. Its output buffers land
-    /// in the [`OutputRegistry`] with the (prefixed) announce, so telemetry `All` taps
+    /// in the [`Registry`] with the (prefixed) announce, so telemetry `All` taps
     /// them like a static system's.
     ///
     /// Dl systems are cyclic-only. This is the low-level builder method; the
@@ -1236,14 +1245,11 @@ impl CoordinatorBuilder {
         }
 
         let mut table = RingTable { rings: Vec::new() };
-        // The build-order registry entries, one per tappable output buffer. Collected
-        // alongside allocation and frozen into an `Arc<OutputRegistry>` *before* the
-        // bind loop, so a system can pull it in `BindPorts::bind` (telemetry.md §2.3).
+        // The build-order registry entries — ONE list over every registered buffer,
+        // frames and message channels alike (telemetry.md §2). Collected alongside
+        // allocation and frozen into an `Arc<Registry>` *before* the bind loop, so a
+        // system can pull it in `BindPorts::bind` (telemetry.md §2.3).
         let mut reg_entries: Vec<RegistryEntry> = Vec::new();
-        // The parallel message-channel index (`docs/messages.md` §2), collected and frozen
-        // beside `reg_entries`. W4 fills it with the per-slot sequence event channels plus
-        // the coordinator's boot-`SequenceRegistry` channel (allocated below).
-        let mut msg_entries: Vec<MessageEntry> = Vec::new();
         // Each `AllOutputs` receive-all tap (`docs/message-wiring.md` §4) is an extra fan-out
         // reader on *every* output + message buffer, so `build()` sizes every ring's
         // `max_readers` to include it. Self-derived from the declared `ReceiveAll` ports across
@@ -1304,18 +1310,18 @@ impl CoordinatorBuilder {
                             });
                         }
                         PortSchema::Postcard => {
-                            // Indexed in the `MessageRegistry` so the downlink /
-                            // `AllOutputs` taps it (unless the port opted out via
-                            // `telemetered = false`, e.g. a command channel, §6.4).
+                            // Registered like any buffer; the downlink / `AllOutputs`
+                            // taps it unless the port opted out via
+                            // `telemetered = false` (e.g. a command channel, §6.4).
                             let entry =
-                                message_entry(&instance, port.name, ring.clone(), port.telemetered);
+                                postcard_entry(&instance, port.name, ring.clone(), port.telemetered);
                             table.rings.push(RingEntry {
                                 ring: ring.clone(),
                                 frame_id: entry.key,
                                 role,
                                 instance: Some(instance),
                             });
-                            msg_entries.push(entry);
+                            reg_entries.push(entry);
                         }
                     }
                     ring
@@ -1400,14 +1406,14 @@ impl CoordinatorBuilder {
             let events_ring =
                 alloc_ring(Delivery::Log, MAX_MSG_BYTES, depth, n_reg + READER_SLACK);
             let events = owned_writer(&events_ring);
-            let events_entry = message_entry(&instance, "sequences", events_ring.clone(), true);
+            let events_entry = postcard_entry(&instance, "sequences", events_ring.clone(), true);
             table.rings.push(RingEntry {
                 ring: events_ring,
                 frame_id: events_entry.key,
                 role: BufferRole::Coordinator,
                 instance: Some(instance),
             });
-            msg_entries.push(events_entry);
+            reg_entries.push(events_entry);
             // A read view on the slot's *own* SequenceStatus output (one extra reader,
             // covered by READER_SLACK) — the runner drains it for Progress + outcome.
             let seq_idx = self.descs[s]
@@ -1440,14 +1446,14 @@ impl CoordinatorBuilder {
             alloc_ring(Delivery::Log, MAX_MSG_BYTES, depth, n_reg + READER_SLACK);
         let seq_registry_out = owned_writer(&seq_registry_ring);
         let seq_registry_entry =
-            message_entry(COORDINATOR_INSTANCE, "sequences", seq_registry_ring.clone(), true);
+            postcard_entry(COORDINATOR_INSTANCE, "sequences", seq_registry_ring.clone(), true);
         table.rings.push(RingEntry {
             ring: seq_registry_ring,
             frame_id: seq_registry_entry.key,
             role: BufferRole::Coordinator,
             instance: None,
         });
-        msg_entries.push(seq_registry_entry);
+        reg_entries.push(seq_registry_entry);
         let seq_registry = SequenceRegistry {
             channels: seq_specs,
         };
@@ -1456,16 +1462,21 @@ impl CoordinatorBuilder {
         // A message channel carrying postcard `SequenceCommand`s: the one *reserved* command
         // producer. Its single `MsgOut` is minted below (handed out once by
         // `control_handle()`) and every slot's command fan-in reads it — so it reserves
-        // `n_slots` readers. Owned but not telemetered (inbound control, not downlink), so
-        // it is not in the `MessageRegistry`.
+        // `n_slots` readers. Registered like every buffer but **untelemetered** (A6):
+        // inbound control is findable by key (`coordinator.commands`) through the full
+        // `Registry` for a debugger/test, yet never surfaced through `AllOutputs` /
+        // the downlink — no more opt-out-by-omission.
         let command_ring =
             alloc_ring(Delivery::Log, MAX_MSG_BYTES, depth, n_slots + READER_SLACK);
+        let command_entry =
+            postcard_entry(COORDINATOR_INSTANCE, "commands", command_ring.clone(), false);
         table.rings.push(RingEntry {
             ring: command_ring.clone(),
-            frame_id: ComponentId::new("coordinator.commands"),
+            frame_id: command_entry.key,
             role: BufferRole::Coordinator,
             instance: None,
         });
+        reg_entries.push(command_entry);
         // The channel's single writer, minted once here (the region's writer claim
         // enforces one live writer per ring); `control_handle()` hands it out once.
         let control_out = Some(owned_writer::<SequenceCommand>(&command_ring));
@@ -1483,11 +1494,19 @@ impl CoordinatorBuilder {
             }
         }
 
-        // Freeze the registry; every consumer's bind pulls this same handle.
-        let registry = Arc::new(OutputRegistry::new(reg_entries));
-        // Freeze the parallel message registry next to it (`docs/messages.md` §2); the
-        // telemetry tap (W2) and the sequence coupling (W4) read this same handle.
-        let message_registry = Arc::new(MessageRegistry::new(msg_entries));
+        // One keyspace: a same-instance name collision between a frame and a channel
+        // (both `"<instance>.<name>"`) is now detectable instead of shadowing.
+        let mut seen_keys: HashMap<ComponentId, usize> = HashMap::new();
+        for (i, e) in reg_entries.iter().enumerate() {
+            if seen_keys.insert(e.key, i).is_some() {
+                return Err(WireError::DuplicateRegistryKey {
+                    key: format!("{}.{}", e.instance, e.name),
+                });
+            }
+        }
+
+        // Freeze the ONE registry; every consumer's bind pulls this same handle.
+        let registry = Arc::new(Registry::new(reg_entries));
 
         // --- Private copy-in buffers for async inputs ------------------------
         // Keyed on the delivery axis (§2.3): an async system cannot be step-gated, so
@@ -1708,8 +1727,7 @@ impl CoordinatorBuilder {
                         })
                         .collect();
 
-                    let mut binder =
-                        Binder::new(&outs, &ins, registry.clone(), message_registry.clone());
+                    let mut binder = Binder::new(&outs, &ins, registry.clone());
                     match reg {
                         Reg::Cyclic(r) => cyclic.push(r.bind(&mut binder)),
                         Reg::Async(r) => pending_async.push(PendingAsync {
@@ -1764,7 +1782,6 @@ impl CoordinatorBuilder {
             cycle: 0,
             progress: Arc::new(AtomicU64::new(0)),
             registry,
-            message_registry,
             control_out,
             seq_registry_out,
             seq_registry,
@@ -1889,20 +1906,22 @@ fn owned_writer<M: Msg>(ring: &RingBuffer<BoxBacking>) -> MsgOut<M> {
     MsgOut::new(writer)
 }
 
-/// Build a [`MessageEntry`] for one message channel: the instance-qualified key
-/// `ComponentId::new("<instance>.<channel>")` (the on-wire identity) over a clone of the
-/// ring — the [`registry_entry`] twin for the self-describing message channel
+/// Build a Postcard [`RegistryEntry`] for one message channel: the instance-qualified
+/// key `ComponentId::new("<instance>.<name>")` (the on-wire identity) over a clone of
+/// the ring — the [`registry_entry`] sibling for the self-describing record
 /// (`docs/messages.md` §2). No vtable/announce; the record's 2-byte id is the schema.
-fn message_entry(
+fn postcard_entry(
     instance: &str,
-    channel: &str,
+    name: &str,
     ring: RingBuffer<BoxBacking>,
     telemetered: bool,
-) -> MessageEntry {
-    MessageEntry {
-        key: ComponentId::new(&format!("{instance}.{channel}")),
+) -> RegistryEntry {
+    RegistryEntry {
+        key: ComponentId::new(&format!("{instance}.{name}")),
         instance: Arc::from(instance),
-        channel: Arc::from(channel),
+        name: Arc::from(name),
+        schema: EntrySchema::Postcard,
+        delivery: Delivery::Log,
         telemetered,
         ring,
     }
@@ -1918,17 +1937,22 @@ const COORDINATOR_INSTANCE: &str = "coordinator";
 /// clone of the ring as the read source.
 fn registry_entry(instance: &str, port: &PortDesc, ring: RingBuffer<BoxBacking>) -> RegistryEntry {
     let key = ComponentId::new(&format!("{instance}.{}", port.name));
-    // Invariant: only Table ports get frame registry entries (the caller branches on
-    // the schema), so the checked accessors are always `Some` here.
+    // Invariant: only Table ports come through here (the caller branches on the
+    // schema), so the checked accessors are always `Some`.
     // `announce` is an `Arc<dyn Fn>` (not directly callable); deref to a `&dyn Fn`.
     let announce = port.announce().expect("table port carries an announce factory");
     let (vtable, metadata) = (**announce)(instance);
     RegistryEntry {
         key,
         instance: Arc::from(instance),
-        frame_id: port.id.component().expect("table port keys on a ComponentId"),
-        vtable,
-        metadata,
+        name: Arc::from(port.name),
+        schema: EntrySchema::Table {
+            frame_id: port.id.component().expect("table port keys on a ComponentId"),
+            vtable,
+            metadata,
+        },
+        delivery: port.delivery,
+        telemetered: port.telemetered,
         ring,
     }
 }
@@ -1954,12 +1978,9 @@ pub struct Coordinator {
     /// runner's heartbeat) can read while `run_for` holds `&mut self` — published each
     /// cycle. Purely observational; nothing in the loop reads it back.
     progress: Arc<AtomicU64>,
-    /// The broad output registry over every tappable buffer (telemetry.md §2).
-    registry: Arc<OutputRegistry>,
-    /// The parallel registry over every tappable message channel (`docs/messages.md`
-    /// §2). Empty until W4 allocates the per-slot sequence channels; the freeze +
-    /// accessor land here so the downlink tap (W2) and the coupling (W4) have it.
-    message_registry: Arc<MessageRegistry>,
+    /// The ONE broad registry over every registered buffer — frames and message
+    /// channels alike, untelemetered entries included (telemetry.md §2).
+    registry: Arc<Registry>,
     /// The single writer over the coordinator-owned command channel
     /// (`docs/message-wiring.md` §6): the one *reserved* `SequenceCommand` producer, the
     /// in-proc twin of a system's `CommandOut`; every slot's command fan-in reads it. The
@@ -2004,19 +2025,14 @@ impl Coordinator {
         self.progress.clone()
     }
 
-    /// The broad output registry over every tappable buffer (telemetry.md §2): an
-    /// index a logger, recorder, debugger, or test can use to read any output by its
-    /// instance-qualified id `ComponentId::new("<instance>.<frame>")`.
-    pub fn registry(&self) -> Arc<OutputRegistry> {
+    /// The ONE broad registry over every registered buffer (telemetry.md §2): an
+    /// index a logger, recorder, debugger, or test can use to read any buffer —
+    /// frame output or message channel — by its instance-qualified id
+    /// `ComponentId::new("<instance>.<name>")`. Unfiltered: untelemetered entries
+    /// (e.g. `coordinator.commands`) are visible here, unlike through
+    /// [`AllOutputs`](crate::AllOutputs).
+    pub fn registry(&self) -> Arc<Registry> {
         self.registry.clone()
-    }
-
-    /// The parallel registry over every tappable **message** channel
-    /// (`docs/messages.md` §2): the message twin of [`registry`](Self::registry) the
-    /// telemetry downlink taps and the sequence coupling publishes onto. Empty until W4
-    /// allocates the per-slot sequence channels.
-    pub fn message_registry(&self) -> Arc<MessageRegistry> {
-        self.message_registry.clone()
     }
 
     /// Emit the boot [`SequenceRegistry`] on the coordinator's message channel (§5): the

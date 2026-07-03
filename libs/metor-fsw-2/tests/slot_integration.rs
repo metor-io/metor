@@ -418,7 +418,7 @@ fn slot_emits_ordered_sequence_events_and_boot_registry() {
 
     // Tap the slot's events channel + the coordinator's boot-registry channel BEFORE the
     // run — an overwrite ring starts at the live edge, so the taps must precede the emits.
-    let messages = coord.message_registry();
+    let messages = coord.registry();
     let mut events_view = messages
         .view(ComponentId::new("adcs.sequences"))
         .expect("the slot events channel is registered")
@@ -627,7 +627,7 @@ fn misaddressed_command_matches_no_slot() {
             .expect("slot status is registered")
             .expect("reader slot available"),
     );
-    let messages = coord.message_registry();
+    let messages = coord.registry();
     let mut events_view = messages
         .view(ComponentId::new("adcs.sequences"))
         .expect("the slot events channel is registered")

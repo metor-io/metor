@@ -19,8 +19,8 @@
 //!
 //! ## Message downlink (`docs/messages.md` §3)
 //!
-//! Beside the component-frame snapshots, telemetry also taps every [`MessageRegistry`]
-//! channel and downlinks each `(id, postcard)` record as an `OwnedPacket::Msg` — **no
+//! Beside the component-frame snapshots, telemetry also taps every Postcard registry
+//! entry and downlinks each `(id, postcard)` record as an `OwnedPacket::Msg` — **no
 //! announce** (a message is self-describing; its 2-byte id *is* its schema). Messages are
 //! an event/command **log**, so they must never be coalesced like the latest-wins
 //! component hand-off: the in-cycle stage drains **every** record of each message ring
@@ -37,7 +37,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use metor_fsw_ring::{BoxBacking, NoWake, View};
-use metor_proto::types::{ComponentId, LenPacket, Msg, OwnedPacket, PacketId, Timestamp};
+use metor_proto::types::{LenPacket, Msg, OwnedPacket, PacketId, Timestamp};
 use metor_proto::vtable::VTable;
 use metor_proto_stellar::{PacketSink, PacketStream};
 use metor_proto_wkt::{
@@ -52,7 +52,7 @@ use stellarator::sync::WaitQueue;
 use crate::binder::{BindPorts, RingSource};
 use crate::descriptor::{PortDesc, PortId};
 use crate::message::{CommandOut, split_record};
-use crate::registry::{AllOutputs, MessageEntry, RegistryEntry};
+use crate::registry::{AllOutputs, EntrySchema, RegistryEntry};
 use crate::system::{AsyncSystem, CyclicSystem, Out, System, SystemInput, SystemOutput};
 
 // ---------------------------------------------------------------------------
@@ -275,25 +275,16 @@ pub enum TelemetryMode {
 }
 
 impl TelemetryMode {
+    /// ONE matcher for every entry kind: the `frames` subset list matches
+    /// [`RegistryEntry::name`], which covers both frame names (`F::NAME` — the same
+    /// string a frame id hashes) and channel names; instance matching is identical
+    /// for both.
     fn matches(&self, entry: &RegistryEntry) -> bool {
         match self {
             TelemetryMode::All => true,
             TelemetryMode::Subset { instances, frames } => {
                 instances.iter().any(|i| i.as_str() == &*entry.instance)
-                    || frames.iter().any(|f| ComponentId::new(f) == entry.frame_id)
-            }
-        }
-    }
-
-    /// The message-channel twin of [`matches`](Self::matches). A message channel has no
-    /// frame type, so the `frames` subset list is matched against the channel name (the
-    /// message analogue of a frame id); instance matching is identical.
-    fn matches_message(&self, entry: &MessageEntry) -> bool {
-        match self {
-            TelemetryMode::All => true,
-            TelemetryMode::Subset { instances, frames } => {
-                instances.iter().any(|i| i.as_str() == &*entry.instance)
-                    || frames.iter().any(|f| f.as_str() == &*entry.channel)
+                    || frames.iter().any(|f| f.as_str() == &*entry.name)
             }
         }
     }
@@ -719,11 +710,16 @@ impl<T: Transport + 'static> System for TelemetrySystem<T> {
     /// `start()`, so `stellarator::spawn` has a runtime; the sender announces before any
     /// data is queued (nothing is pushed until the first `execute`).
     fn init(&mut self, output: &mut Self::Output) {
-        let registry = output.all.outputs.clone();
-        let messages = output.all.messages.clone();
+        // ONE loop over the unified registry surface — `AllOutputs::entries()` is
+        // already telemetered-only (the A6 source-side filter), so a command channel
+        // or an opted-out frame never even reaches the matcher here.
         let mut taps = Vec::new();
+        let mut msg_taps = Vec::new();
         let mut announces = Vec::new();
-        for entry in registry.entries() {
+        // Deferred health reports: iterating `output.all` borrows the output bundle,
+        // so `output.health()` (a `&mut` borrow) is driven after the loop.
+        let mut reader_slot_errors = 0usize;
+        for entry in output.all.entries() {
             if !self.mode.matches(entry) {
                 continue;
             }
@@ -733,46 +729,42 @@ impl<T: Transport + 'static> System for TelemetrySystem<T> {
                 // panicking (telemetry.md §2.5). Build-time sizing makes this unreachable
                 // for the known consumers, but a hand-built over-subscription is observable.
                 Err(_) => {
-                    output.health().error("telemetry.reader_slot");
+                    reader_slot_errors += 1;
                     continue;
                 }
             };
-            let slot = taps.len();
-            let packet_id = (slot as u16).to_le_bytes();
-            taps.push(Tap {
-                slot,
-                packet_id,
-                view,
-                scratch: Vec::new(),
-            });
-            announces.push(Announce {
-                packet_id,
-                vtable: entry.vtable.clone(),
-                metadata: entry.metadata.clone(),
-            });
+            match &entry.schema {
+                // Announce-then-Table wire form: an assigned packet id + a replayed
+                // announce per tap.
+                EntrySchema::Table {
+                    vtable, metadata, ..
+                } => {
+                    let slot = taps.len();
+                    let packet_id = (slot as u16).to_le_bytes();
+                    taps.push(Tap {
+                        slot,
+                        packet_id,
+                        view,
+                        scratch: Vec::new(),
+                    });
+                    announces.push(Announce {
+                        packet_id,
+                        vtable: vtable.clone(),
+                        metadata: metadata.clone(),
+                    });
+                }
+                // Self-describing records: no announce, the id is read per record.
+                EntrySchema::Postcard => {
+                    msg_taps.push(MsgTap {
+                        view,
+                        scratch: Vec::new(),
+                    });
+                }
+            }
         }
 
-        // Message taps (`docs/messages.md` §3): claim a view per channel, **no announce**
-        // (a message is self-describing — its id is its schema). A lapped/over-subscribed
-        // reader slot is surfaced and skipped exactly like an output tap.
-        let mut msg_taps = Vec::new();
-        for entry in messages.entries() {
-            // Command channels (`telemetered = false`) are inbound control — never downlinked
-            // (`docs/message-wiring.md` §6.4).
-            if !entry.telemetered || !self.mode.matches_message(entry) {
-                continue;
-            }
-            let view = match entry.view() {
-                Ok(v) => v,
-                Err(_) => {
-                    output.health().error("telemetry.reader_slot");
-                    continue;
-                }
-            };
-            msg_taps.push(MsgTap {
-                view,
-                scratch: Vec::new(),
-            });
+        for _ in 0..reader_slot_errors {
+            output.health().error("telemetry.reader_slot");
         }
 
         // One wait queue shared by both hand-offs wakes the single sender task.

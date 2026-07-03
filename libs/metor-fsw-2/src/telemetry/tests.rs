@@ -205,7 +205,10 @@ async fn registry_query_view_and_read() {
     let entry = registry
         .get(ComponentId::new("producer.imu"))
         .expect("producer.imu in the registry");
-    assert_eq!(entry.frame_id, ComponentId::new("imu"));
+    let crate::EntrySchema::Table { frame_id, .. } = &entry.schema else {
+        panic!("frame entry carries a Table schema");
+    };
+    assert_eq!(*frame_id, ComponentId::new("imu"));
     assert_eq!(&*entry.instance, "producer");
     // The consumer's frame and the coordinator's own buffers are indexed too.
     assert!(registry.get(ComponentId::new("consumer.nav")).is_some());
@@ -239,7 +242,14 @@ async fn telemetry_end_to_end_all() {
         mode: TelemetryMode::All,
     });
     let mut coord = b.build().unwrap();
-    let n_taps = coord.registry().len();
+    // Only Table entries are announced (Postcard entries — the coordinator's
+    // `sequences`/`commands` channels — are self-describing, no announce).
+    let n_taps = coord
+        .registry()
+        .entries()
+        .iter()
+        .filter(|e| matches!(e.schema, crate::EntrySchema::Table { .. }))
+        .count();
     coord.run_for(30).await;
 
     let announces = rec.announces.lock().unwrap();
@@ -309,12 +319,28 @@ fn two_instances_distinct_prefixes() {
 
     // Same unprefixed frame id, distinct qualified keys — the headline collision, now
     // disambiguated; their announced names carry distinct instance prefixes.
-    assert_eq!(left.frame_id, right.frame_id);
+    let crate::EntrySchema::Table {
+        frame_id: left_id,
+        metadata: left_meta,
+        ..
+    } = &left.schema
+    else {
+        panic!("frame entry carries a Table schema");
+    };
+    let crate::EntrySchema::Table {
+        frame_id: right_id,
+        metadata: right_meta,
+        ..
+    } = &right.schema
+    else {
+        panic!("frame entry carries a Table schema");
+    };
+    assert_eq!(left_id, right_id);
     assert_ne!(left.key, right.key);
-    assert!(left.metadata.iter().all(|m| m.name.starts_with("imu_left.")));
-    assert!(right.metadata.iter().all(|m| m.name.starts_with("imu_right.")));
-    assert!(left.metadata.iter().any(|m| m.name == "imu_left.imu.omega"));
-    assert!(right.metadata.iter().any(|m| m.name == "imu_right.imu.omega"));
+    assert!(left_meta.iter().all(|m| m.name.starts_with("imu_left.")));
+    assert!(right_meta.iter().all(|m| m.name.starts_with("imu_right.")));
+    assert!(left_meta.iter().any(|m| m.name == "imu_left.imu.omega"));
+    assert!(right_meta.iter().any(|m| m.name == "imu_right.imu.omega"));
 }
 
 // ---------------------------------------------------------------------------
@@ -423,7 +449,7 @@ async fn message_downlink_fifo_no_coalesce() {
 
     use crate::message::{LOG_DEPTH, MAX_MSG_BYTES, MsgOut, split_record};
     use crate::port::capacity_for;
-    use crate::registry::MessageEntry;
+    use crate::registry::{EntrySchema, RegistryEntry};
 
     use super::{HandOff, MsgHandOff, run_sender};
 
@@ -434,10 +460,12 @@ async fn message_downlink_fifo_no_coalesce() {
         max_readers: 4,
         overrun: Overrun::Overwrite,
     });
-    let entry = MessageEntry {
+    let entry = RegistryEntry {
         key: ComponentId::new("mode.events"),
         instance: Arc::from("mode"),
-        channel: Arc::from("events"),
+        name: Arc::from("events"),
+        schema: EntrySchema::Postcard,
+        delivery: crate::Delivery::Log,
         telemetered: true,
         ring: ring.clone(),
     };

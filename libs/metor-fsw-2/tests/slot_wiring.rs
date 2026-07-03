@@ -178,7 +178,7 @@ slot "adcs" {{
 
     // Tap the slot's events channel BEFORE the run (an overwrite ring starts at the
     // live edge, so the tap must precede the emit).
-    let messages = coord.message_registry();
+    let messages = coord.registry();
     let mut events_view = messages
         .view(ComponentId::new("adcs.sequences"))
         .expect("the slot events channel is registered")
