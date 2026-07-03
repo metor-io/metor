@@ -137,9 +137,21 @@ are not ours to commit.
       pass.)
 
 ### Wave 6 — cleanliness + style batch (cheap models OK)
-- [ ] C2 build() split (post-A1 residue), C3 dedup, C4 remnants not subsumed
-      by A1, C5 dead state, C6 structure, S1-S5, E3/E4/E6 API fixes.
-      → **Commit.**
+- [x] C2 build() split (post-A1 residue), C3 dedup, C4 remnants not subsumed
+      by A1, C5 dead state, C6 structure, S1-S5, E4/E8b/E8e, B9 doc comments.
+      → landed as 5 code commits (f05c74c5, 2ddd80a2, e623daf2, ef2099d6,
+      860ace53) + 2 docs commits (a54d9633, a7cb29a8). Zero clippy warnings;
+      workspace lints pinned for the fsw-2 crates. Deliberate keeps:
+      WiringBuilder::connect_msg (model has no descriptors to infer from),
+      dual wait()/Seq API (E7 design outcome), Box::leak'd slot names
+      (descriptor name type change out of scope). Deferred with plan:
+      TODO(E6, seq path) drop-counter fold. (2026-07-02)
+
+## CAMPAIGN COMPLETE (2026-07-03)
+24 commits, 69b59405..860ace53. All review findings addressed except the
+deliberate keeps/deferrals noted per wave. Final gate: 245 tests across
+metor-fsw-2 (169 lib + 26 integration + 1 doc), ring (37), macros (9),
+adcs-fsw2 (5) — zero failures, zero clippy warnings.
 
 ## Decisions (2026-07-02, confirmed with Sascha)
 - Ring header layout change lands WITHOUT a version bump (early dev, breaking
