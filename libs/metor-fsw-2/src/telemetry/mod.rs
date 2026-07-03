@@ -495,7 +495,7 @@ fn uplink_subscribe_ids() -> Vec<PacketId> {
     <UplinkPorts as SystemOutput>::descriptors()
         .iter()
         .filter_map(|p| match p.id {
-            PortId::Msg(id) => Some(id),
+            PortId::Packet(id) => Some(id),
             _ => None,
         })
         .collect()

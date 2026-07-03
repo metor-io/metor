@@ -803,6 +803,14 @@ struct OtherEvent {
     x: u32,
 }
 
+// A wired message port needs the explicit, stable name token (A10).
+impl crate::NamedMsg for TestEvent {
+    const NAME: &'static str = "TestEvent";
+}
+impl crate::NamedMsg for OtherEvent {
+    const NAME: &'static str = "OtherEvent";
+}
+
 // A cyclic producer emitting one `TestEvent` per cycle. No frame inputs.
 struct MsgProducer {
     n: u64,

@@ -20,10 +20,37 @@ use metor_fsw_ring::{
     Backing, BoxBacking, NoWake, View, WakeSink, WakeSource, WriteError, Writer, frame_len,
 };
 use metor_proto::types::{Msg, PacketId};
+use metor_proto_wkt::{SequenceChannelEvent, SequenceCommand, SequenceRegistry};
 use serde::de::DeserializeOwned;
 
 use crate::binder::RingSource;
 use crate::descriptor::PortDesc;
+
+/// A [`Msg`] usable as a wired port: carries an explicit, stable wire/KDL/registry
+/// name beside its [`Msg::ID`] edge key (review A10).
+///
+/// The derived `type_name` token is gone — renaming a Rust type silently changed the
+/// KDL token and registry key, generics produced garbage, and the format is
+/// unspecified. `NAME` is the token a mission file writes (`msg="SequenceCommand"`)
+/// and the channel part of the registry key `<instance>.<NAME>`; renaming the Rust
+/// type must not change it. (Coordinator-minted channels that pass an explicit
+/// channel string — `"sequences"` — keep doing so; `NAME` is the default, not a cage.)
+pub trait NamedMsg: Msg {
+    /// The stable wire/KDL/registry token for this message type.
+    const NAME: &'static str;
+}
+
+// The wkt migration set: names frozen to today's tokens so every existing
+// mission.kdl and registry key is unchanged.
+impl NamedMsg for SequenceCommand {
+    const NAME: &'static str = "SequenceCommand";
+}
+impl NamedMsg for SequenceRegistry {
+    const NAME: &'static str = "SequenceRegistry";
+}
+impl NamedMsg for SequenceChannelEvent {
+    const NAME: &'static str = "SequenceChannelEvent";
+}
 
 /// Default worst-case message payload size, the [`Frame::MAX_SIZE`](crate::Frame)
 /// analogue for the variable-record ring sizing (`docs/messages.md` §2.1). Generous —
@@ -124,8 +151,12 @@ impl<M: Msg, B: Backing, WD: WakeSource, WS: WakeSink> MsgOut<M, B, WD, WS> {
         self.writer.try_write(&self.scratch)
     }
 
+}
+
+impl<M: NamedMsg, B: Backing, WD: WakeSource, WS: WakeSink> MsgOut<M, B, WD, WS> {
     /// This port's static descriptor — the message twin of
     /// [`Output::<F>::descriptor`](crate::Output) (`docs/message-wiring.md` §2.1).
+    /// Requires [`NamedMsg`]: a wired port needs the stable name token.
     pub fn descriptor() -> PortDesc {
         PortDesc::msg::<M>()
     }
@@ -173,10 +204,12 @@ impl<M: Msg, B: Backing, WD: WakeSource, WS: WakeSink> CommandOut<M, B, WD, WS> 
             inner: MsgOut::new(writer),
         }
     }
+}
 
+impl<M: NamedMsg, B: Backing, WD: WakeSource, WS: WakeSink> CommandOut<M, B, WD, WS> {
     /// The port descriptor — an **untelemetered** message port keyed on `M::ID`.
     pub fn descriptor() -> PortDesc {
-        PortDesc::msg_untelemetered::<M>()
+        PortDesc::msg::<M>().untelemetered()
     }
 }
 
@@ -263,11 +296,6 @@ where
         }
     }
 
-    /// This port's static descriptor — same edge key as the [`MsgOut<M>`](MsgOut) it consumes.
-    pub fn descriptor() -> PortDesc {
-        PortDesc::msg::<M>()
-    }
-
     /// Message inputs are a **best-effort log**: a lapped view resyncs to the live edge inside
     /// [`drain`](Self::drain) rather than hard-stopping the consumer (unlike a frame
     /// [`Input`](crate::Input), whose lap is a fatal `LappedInput`). So a message input never
@@ -303,6 +331,20 @@ where
                 }
             }
         }
+    }
+}
+
+impl<M, B, RD, RS> MsgIn<M, B, RD, RS>
+where
+    M: NamedMsg + DeserializeOwned,
+    B: Backing,
+    RD: WakeSink,
+    RS: WakeSource,
+{
+    /// This port's static descriptor — same edge key as the [`MsgOut<M>`](MsgOut) it
+    /// consumes. Requires [`NamedMsg`]: a wired port needs the stable name token.
+    pub fn descriptor() -> PortDesc {
+        PortDesc::msg::<M>()
     }
 }
 
@@ -388,7 +430,7 @@ mod tests {
         // The descriptor carries the port's edge key.
         assert_eq!(
             MsgOut::<SequenceCommand>::descriptor().id,
-            PortId::Msg(SequenceCommand::ID)
+            PortId::Packet(SequenceCommand::ID)
         );
 
         // Claim the tap before any write — a view on an overwrite ring starts at the

@@ -35,7 +35,7 @@ use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
 
 use crate::binder::{BindPorts, Binder, BoundInput, BoundPort};
 use crate::descriptor::compatible;
-use crate::descriptor::{Hz, PortDesc, PortId, PortKind, SystemDescriptor, SystemKind};
+use crate::descriptor::{Hz, PortDesc, PortId, PortSchema, SystemDescriptor, SystemKind};
 use crate::dynamic::FrameList;
 use crate::health::{HealthPort, Level};
 use crate::message::{MAX_MSG_BYTES, MSG_DEPTH, MsgIn, MsgOut, msg_capacity};
@@ -125,7 +125,7 @@ impl PortRef {
     pub fn new<F: Frame>(system: SystemHandle) -> Self {
         Self {
             system,
-            port: PortId::Frame(F::FRAME_ID),
+            port: PortId::Component(F::FRAME_ID),
         }
     }
 
@@ -133,7 +133,7 @@ impl PortRef {
     pub fn msg<M: Msg>(system: SystemHandle) -> Self {
         Self {
             system,
-            port: PortId::Msg(M::ID),
+            port: PortId::Packet(M::ID),
         }
     }
 }
@@ -849,7 +849,7 @@ impl CoordinatorBuilder {
         let leaked: &'static str = Box::leak(name.clone().into_boxed_str());
         let mut inputs = base.inputs.clone();
         // Drop the trailing slot-owned `SlotControlIn` input (host-written, not edge-connected).
-        if inputs.last().map(|p| p.id) == Some(PortId::Frame(SlotControlIn::FRAME_ID)) {
+        if inputs.last().map(|p| p.id) == Some(PortId::Component(SlotControlIn::FRAME_ID)) {
             inputs.pop();
         }
         let registered = SystemDescriptor {
@@ -976,7 +976,7 @@ impl CoordinatorBuilder {
                 .inputs
                 .iter()
                 .chain(self.descs[s].outputs.iter())
-                .any(|p| matches!(p.kind, PortKind::ReceiveAll));
+                .any(|p| p.is_receive_all());
             if has_receive_all {
                 first_receive_all.get_or_insert(s);
             } else if let Some(t) = first_receive_all {
@@ -1048,7 +1048,7 @@ impl CoordinatorBuilder {
             }
             match c.port {
                 // Frame edge: exactly-one producer per input; participates in cycle detection.
-                PortId::Frame(_) => {
+                PortId::Component(_) => {
                     if cons_edge
                         .insert((c.system.id, in_idx), (p.system.id, out_idx))
                         .is_some()
@@ -1069,7 +1069,7 @@ impl CoordinatorBuilder {
                 // Message edge: fan-in (append), excluded from cycles. Distinct producers
                 // may fan in freely (§3.2), but an exact duplicate of one edge would
                 // deliver every record twice, so it is rejected.
-                PortId::Msg(_) => {
+                PortId::Packet(_) => {
                     let producers = msg_cons_edges.entry((c.system.id, in_idx)).or_default();
                     if producers.contains(&(p.system.id, out_idx)) {
                         return Err(WireError::DuplicateMsgEdge {
@@ -1101,7 +1101,7 @@ impl CoordinatorBuilder {
         // their own task, so their registration index carries no ordering semantics).
         // Self-edges never reach here (rejected above as a one-member cycle).
         for (p, c, delayed) in &self.edges {
-            if *delayed || !matches!(c.port, PortId::Frame(_)) {
+            if *delayed || !matches!(c.port, PortId::Component(_)) {
                 continue;
             }
             let both_cyclic = self.kinds[p.system.id] == SystemKind::Cyclic
@@ -1119,7 +1119,7 @@ impl CoordinatorBuilder {
         // A message input may have zero producers (fan-in is optional, §3.2).
         for s in 0..n {
             for (in_idx, port) in self.descs[s].inputs.iter().enumerate() {
-                if matches!(port.id, PortId::Frame(_)) && !cons_edge.contains_key(&(s, in_idx)) {
+                if matches!(port.id, PortId::Component(_)) && !cons_edge.contains_key(&(s, in_idx)) {
                     return Err(WireError::UnconnectedInput {
                         system: self.descs[s].name,
                         port: port.id,
@@ -1156,7 +1156,7 @@ impl CoordinatorBuilder {
             .descs
             .iter()
             .flat_map(|d| d.inputs.iter().chain(d.outputs.iter()))
-            .filter(|p| matches!(p.kind, PortKind::ReceiveAll))
+            .filter(|p| p.is_receive_all())
             .count();
 
         // --- Allocate one buffer per output port (incl. health/log) ----------
@@ -1171,58 +1171,63 @@ impl CoordinatorBuilder {
                     system: s,
                     port: out_idx,
                 };
-                let ring = match &port.kind {
-                    PortKind::Frame { .. } => {
-                        let ring = RingBuffer::create_in_memory(Config {
-                            capacity: capacity_for(port.max_size, depth),
-                            max_readers: readers,
-                            overrun: Overrun::Overwrite,
-                        });
-                        reg_entries.push(registry_entry(&instance, port, ring.clone()));
-                        table.rings.push(RingEntry {
-                            ring: ring.clone(),
-                            frame_id: port.frame_id(),
-                            role,
-                            instance: Some(instance),
-                        });
-                        ring
-                    }
-                    PortKind::Message { telemetered } => {
-                        // A wired message output: variable-record sizing, indexed in the
-                        // `MessageRegistry` so the downlink/`AllOutputs` taps it (unless the port
-                        // opted out via `telemetered = false`, e.g. a command channel, §6.4). A
-                        // `SequenceCommand` output is a command producer read by every slot, so it
-                        // reserves `n_slots` extra readers on top of its edge fan-out.
-                        let cmd_readers = if port.id == PortId::Msg(SequenceCommand::ID) {
-                            n_slots
-                        } else {
-                            0
-                        };
-                        let ring = RingBuffer::create_in_memory(Config {
-                            capacity: msg_capacity(MAX_MSG_BYTES, MSG_DEPTH),
-                            max_readers: readers + cmd_readers,
-                            overrun: Overrun::Overwrite,
-                        });
-                        let entry = message_entry(&instance, port.name, ring.clone(), *telemetered);
-                        table.rings.push(RingEntry {
-                            ring: ring.clone(),
-                            frame_id: entry.key,
-                            role,
-                            instance: Some(instance),
-                        });
-                        msg_entries.push(entry);
-                        ring
-                    }
-                    PortKind::ReceiveAll => {
-                        // A receive-all tap reserves no ring and connects no edge. Push a
-                        // minimal placeholder so `output_rings[s]` stays aligned with the output
-                        // PortDesc indices (edges index by position); it is never bound
-                        // (`AllOutputs::bind` pulls the registries) nor edge-referenced.
-                        RingBuffer::create_in_memory(Config {
-                            capacity: msg_capacity(1, 2),
-                            max_readers: 1,
-                            overrun: Overrun::Overwrite,
-                        })
+                let ring = if port.is_receive_all() {
+                    // A receive-all tap reserves no ring and connects no edge. Push a
+                    // minimal placeholder so `output_rings[s]` stays aligned with the output
+                    // PortDesc indices (edges index by position); it is never bound
+                    // (`AllOutputs::bind` pulls the registries) nor edge-referenced.
+                    RingBuffer::create_in_memory(Config {
+                        capacity: msg_capacity(1, 2),
+                        max_readers: 1,
+                        overrun: Overrun::Overwrite,
+                    })
+                } else {
+                    match &port.schema {
+                        PortSchema::Table { .. } => {
+                            let ring = RingBuffer::create_in_memory(Config {
+                                capacity: capacity_for(port.max_size, depth),
+                                max_readers: readers,
+                                overrun: Overrun::Overwrite,
+                            });
+                            reg_entries.push(registry_entry(&instance, port, ring.clone()));
+                            table.rings.push(RingEntry {
+                                ring: ring.clone(),
+                                frame_id: port
+                                    .id
+                                    .component()
+                                    .expect("table port keys on a ComponentId"),
+                                role,
+                                instance: Some(instance),
+                            });
+                            ring
+                        }
+                        PortSchema::Postcard => {
+                            // A wired message output: variable-record sizing, indexed in the
+                            // `MessageRegistry` so the downlink/`AllOutputs` taps it (unless the port
+                            // opted out via `telemetered = false`, e.g. a command channel, §6.4). A
+                            // `SequenceCommand` output is a command producer read by every slot, so it
+                            // reserves `n_slots` extra readers on top of its edge fan-out.
+                            let cmd_readers = if port.id == PortId::Packet(SequenceCommand::ID) {
+                                n_slots
+                            } else {
+                                0
+                            };
+                            let ring = RingBuffer::create_in_memory(Config {
+                                capacity: msg_capacity(MAX_MSG_BYTES, MSG_DEPTH),
+                                max_readers: readers + cmd_readers,
+                                overrun: Overrun::Overwrite,
+                            });
+                            let entry =
+                                message_entry(&instance, port.name, ring.clone(), port.telemetered);
+                            table.rings.push(RingEntry {
+                                ring: ring.clone(),
+                                frame_id: entry.key,
+                                role,
+                                instance: Some(instance),
+                            });
+                            msg_entries.push(entry);
+                            ring
+                        }
                     }
                 };
                 row.push(ring);
@@ -1246,7 +1251,7 @@ impl CoordinatorBuilder {
             reg_entries.push(registry_entry(COORDINATOR_INSTANCE, &desc, ring.clone()));
             table.rings.push(RingEntry {
                 ring,
-                frame_id: desc.frame_id(),
+                frame_id: desc.id.component().expect("coordinator frames are table ports"),
                 role: BufferRole::Coordinator,
                 instance: None,
             });
@@ -1317,7 +1322,7 @@ impl CoordinatorBuilder {
             let seq_idx = self.descs[s]
                 .outputs
                 .iter()
-                .position(|p| p.id == PortId::Frame(SequenceStatus::FRAME_ID))
+                .position(|p| p.id == PortId::Component(SequenceStatus::FRAME_ID))
                 .expect("a v1 slot occupant publishes a SequenceStatus output");
             let seq_status = Input::new(
                 output_rings[s][seq_idx]
@@ -1379,7 +1384,7 @@ impl CoordinatorBuilder {
         let mut command_producers: Vec<RingBuffer<BoxBacking>> = vec![command_ring.clone()];
         for s in 0..n {
             for (out_idx, port) in self.descs[s].outputs.iter().enumerate() {
-                if port.id == PortId::Msg(SequenceCommand::ID) {
+                if port.id == PortId::Packet(SequenceCommand::ID) {
                     command_producers.push(output_rings[s][out_idx].clone());
                 }
             }
@@ -1407,7 +1412,7 @@ impl CoordinatorBuilder {
                 // Message inputs use a direct fan-in multi-view (§3.3), not a private copy-in
                 // buffer — messages are a best-effort log, so an async consumer polls the shared
                 // producer rings directly (`MsgIn` resyncs on lap).
-                if matches!(self.descs[s].inputs[in_idx].id, PortId::Msg(_)) {
+                if matches!(self.descs[s].inputs[in_idx].id, PortId::Packet(_)) {
                     continue;
                 }
                 let (prod_id, out_idx) = cons_edge[&(s, in_idx)];
@@ -1436,7 +1441,7 @@ impl CoordinatorBuilder {
                 async_wakes[s].push(data);
                 table.rings.push(RingEntry {
                     ring: private,
-                    frame_id: port.frame_id(),
+                    frame_id: port.id.component().expect("copy-in inputs are table ports"),
                     role: BufferRole::Private {
                         system: s,
                         input: in_idx,
@@ -1568,9 +1573,7 @@ impl CoordinatorBuilder {
                     // ports — they bind no ring (`AllOutputs::bind` pulls the registries), so the
                     // positional cursor must not offer them one.
                     let outs: Vec<BoundPort> = (0..self.descs[id].outputs.len())
-                        .filter(|&out_idx| {
-                            !matches!(self.descs[id].outputs[out_idx].kind, PortKind::ReceiveAll)
-                        })
+                        .filter(|&out_idx| !self.descs[id].outputs[out_idx].is_receive_all())
                         .map(|out_idx| BoundPort::new(output_rings[id][out_idx].clone()))
                         .collect();
                     // Inputs, in `descriptors()` order. A frame input is `One`: cyclic consumers
@@ -1580,7 +1583,7 @@ impl CoordinatorBuilder {
                     // best-effort log the consumer poll-drains (no copy-in, cyclic or async).
                     let ins: Vec<BoundInput> = (0..self.descs[id].inputs.len())
                         .map(|in_idx| match self.descs[id].inputs[in_idx].id {
-                            PortId::Frame(_) => {
+                            PortId::Component(_) => {
                                 let (prod_id, out_idx) = cons_edge[&(id, in_idx)];
                                 let port = if self.kinds[id] == SystemKind::Async {
                                     let (ring, data, space) = private_inputs[&(id, in_idx)].clone();
@@ -1590,7 +1593,7 @@ impl CoordinatorBuilder {
                                 };
                                 BoundInput::One(port)
                             }
-                            PortId::Msg(_) => {
+                            PortId::Packet(_) => {
                                 let ports = msg_cons_edges
                                     .get(&(id, in_idx))
                                     .map(|producers| {
@@ -1810,12 +1813,15 @@ const COORDINATOR_INSTANCE: &str = "coordinator";
 /// clone of the ring as the read source.
 fn registry_entry(instance: &str, port: &PortDesc, ring: RingBuffer<BoxBacking>) -> RegistryEntry {
     let key = ComponentId::new(&format!("{instance}.{}", port.name));
+    // Invariant: only Table ports get frame registry entries (the caller branches on
+    // the schema), so the checked accessors are always `Some` here.
     // `announce` is an `Arc<dyn Fn>` (not directly callable); deref to a `&dyn Fn`.
-    let (vtable, metadata) = (*port.announce())(instance);
+    let announce = port.announce().expect("table port carries an announce factory");
+    let (vtable, metadata) = (**announce)(instance);
     RegistryEntry {
         key,
         instance: Arc::from(instance),
-        frame_id: port.frame_id(),
+        frame_id: port.id.component().expect("table port keys on a ComponentId"),
         vtable,
         metadata,
         ring,

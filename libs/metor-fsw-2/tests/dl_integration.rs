@@ -167,10 +167,10 @@ fn dlopen_cyclic_system_end_to_end() {
     assert_eq!(desc.name, "dl_counter");
     assert_eq!(desc.kind, SystemKind::Cyclic);
     assert_eq!(desc.inputs.len(), 1, "one user input (tick_in)");
-    assert_eq!(desc.inputs[0].frame_id(), TickIn::FRAME_ID);
+    assert_eq!(desc.inputs[0].id.component().expect("table port"), TickIn::FRAME_ID);
     // user `out` + implicit health + implicit log.
     assert_eq!(desc.outputs.len(), 3);
-    assert_eq!(desc.outputs[0].frame_id(), TickOut::FRAME_ID);
+    assert_eq!(desc.outputs[0].id.component().expect("table port"), TickOut::FRAME_ID);
 
     // 2. Wire a static producer → the dlopen'd consumer, with params start=1000.
     let params = postcard::to_allocvec(&CounterParams { start: 1000, scale: 1.0 }).unwrap();

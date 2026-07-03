@@ -258,10 +258,10 @@ fn descriptor_and_compatibility() {
     assert_eq!(desc.name, "filter");
     assert_eq!(desc.kind, SystemKind::Cyclic);
     assert_eq!(desc.inputs.len(), 1);
-    assert_eq!(desc.inputs[0].frame_id(), Imu::FRAME_ID);
+    assert_eq!(desc.inputs[0].id.component().expect("table port"), Imu::FRAME_ID);
     // user nav port + the two implicit health/log ports.
     assert_eq!(desc.outputs.len(), 3);
-    assert_eq!(desc.outputs[0].frame_id(), NavEstimate::FRAME_ID);
+    assert_eq!(desc.outputs[0].id.component().expect("table port"), NavEstimate::FRAME_ID);
 
     let producer = PortDesc::of::<Imu>();
     // A matching subset consumer is compatible.

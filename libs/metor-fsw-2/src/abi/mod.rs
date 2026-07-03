@@ -40,7 +40,9 @@ use serde::{Deserialize, Serialize};
 
 use crate::binder::{BindPorts, RingSource};
 use crate::coordinator::{CyclicSlot, SlotState, StopReason};
-use crate::descriptor::{AnnounceFn, PortDesc, PortId, PortKind, SystemDescriptor, SystemKind};
+use crate::descriptor::{
+    AnnounceFn, Delivery, FanIn, OnLap, PortDesc, PortId, PortSchema, SystemDescriptor, SystemKind,
+};
 use crate::sequence::{SeqBound, SeqClock, SeqSystem, publish_status, with_clock};
 use crate::system::{BuildSystem, CyclicRunner, CyclicSystem, Out, SystemOutput};
 
@@ -224,12 +226,19 @@ impl PortDescMsg {
     /// Lower one static [`PortDesc`] (its `vtable` already unprefixed) plus the
     /// port's unprefixed `metadata` into the wire mirror.
     fn lower(desc: &PortDesc, metadata: Vec<ComponentMetadata>) -> Self {
-        // dlopen'd systems carry frame ports only (a `.so` cannot declare a message port),
-        // so the frame accessors are always valid here.
+        // dlopen'd systems carry frame ports only (a `.so` cannot declare a message
+        // port yet — the unified PortDescMsg lands with the ABI commit), so the
+        // Table-schema accessors are always `Some` here.
         Self {
-            frame_id: desc.frame_id(),
+            frame_id: desc
+                .id
+                .component()
+                .expect("dl ports are table ports (frame ComponentId keys)"),
             frame_name: desc.name.to_string(),
-            vtable: desc.vtable().clone(),
+            vtable: desc
+                .vtable()
+                .expect("dl ports are table ports (vtable-described)")
+                .clone(),
             max_size: desc.max_size,
             metadata,
         }
@@ -260,15 +269,19 @@ impl PortDescMsg {
             (vtable, meta)
         });
         PortDesc {
-            id: PortId::Frame(self.frame_id),
+            id: PortId::Component(self.frame_id),
             name: frame_name,
             max_size: self.max_size,
             // The carried (unprefixed) vtable is what `compatible()` validates against,
             // so wiring validation is unchanged; prefixing happens only in `announce`.
-            kind: PortKind::Frame {
+            schema: PortSchema::Table {
                 vtable: self.vtable,
                 announce,
             },
+            delivery: Delivery::Snapshot,
+            fan_in: FanIn::One,
+            on_lap: OnLap::Stop,
+            telemetered: true,
         }
     }
 }
@@ -643,8 +656,8 @@ where
 {
     let outcome = catch_unwind(AssertUnwindSafe(|| {
         let desc = <S as CyclicSystem<RawBacking>>::descriptor();
-        let input_metadata = desc.inputs.iter().map(|p| (p.announce())("").1).collect();
-        let output_metadata = desc.outputs.iter().map(|p| (p.announce())("").1).collect();
+        let input_metadata = desc.inputs.iter().map(|p| (p.announce().expect("dl ports are table ports"))("").1).collect();
+        let output_metadata = desc.outputs.iter().map(|p| (p.announce().expect("dl ports are table ports"))("").1).collect();
         let params_schema = OwnedNamedType::from(<S::Params as postcard_schema::Schema>::SCHEMA);
         let msg = SystemDescriptorMsg::lower(&desc, params_schema, input_metadata, output_metadata);
         postcard::to_allocvec(&msg).expect("descriptor encodes (postcard)")
@@ -869,8 +882,8 @@ where
 {
     let outcome = catch_unwind(AssertUnwindSafe(|| {
         let desc = S::descriptor();
-        let input_metadata = desc.inputs.iter().map(|p| (p.announce())("").1).collect();
-        let output_metadata = desc.outputs.iter().map(|p| (p.announce())("").1).collect();
+        let input_metadata = desc.inputs.iter().map(|p| (p.announce().expect("dl ports are table ports"))("").1).collect();
+        let output_metadata = desc.outputs.iter().map(|p| (p.announce().expect("dl ports are table ports"))("").1).collect();
         let params_schema = OwnedNamedType::from(<S::Params as postcard_schema::Schema>::SCHEMA);
         let msg = SystemDescriptorMsg::lower(&desc, params_schema, input_metadata, output_metadata);
         postcard::to_allocvec(&msg).expect("descriptor encodes (postcard)")
