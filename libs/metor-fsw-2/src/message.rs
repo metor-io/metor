@@ -17,7 +17,7 @@
 use core::marker::PhantomData;
 
 use metor_fsw_ring::{
-    Backing, BoxBacking, NoWake, View, WakeSink, WakeSource, WriteError, Writer, frame_len,
+    Backing, BoxBacking, NoWake, View, WakeSink, WakeSource, WriteError, Writer,
 };
 use metor_proto::types::{Msg, PacketId};
 use metor_proto_wkt::{SequenceChannelEvent, SequenceCommand, SequenceRegistry};
@@ -58,18 +58,13 @@ impl NamedMsg for SequenceChannelEvent {
 /// telemetry snapshot.
 pub const MAX_MSG_BYTES: usize = 4096;
 
-/// Default in-flight record depth for a message ring (`docs/messages.md` §2.1). Deep
-/// because messages are an every-record event/command log — a slow tap must not drop a
-/// transition — not a one-deep snapshot like a component output.
-pub const MSG_DEPTH: usize = 64;
-
-/// Power-of-two ring capacity for `depth` message records each up to `max_msg_bytes`
-/// payload bytes — the [`capacity_for`](crate::capacity_for) analogue for the variable
-/// `(id, postcard)` record (`docs/messages.md` §2.1). `frame_len` adds the per-record
-/// header + payload padding the ring stores around each write.
-pub fn msg_capacity(max_msg_bytes: usize, depth: usize) -> usize {
-    (frame_len(max_msg_bytes) * depth.max(2)).next_power_of_two()
-}
+/// Default in-flight record depth for a [`Delivery::Log`](crate::Delivery) ring
+/// (`docs/messages.md` §2.1). Deep because a log is an every-record event/command
+/// stream — a slow tap must not drop a transition — not a one-deep snapshot like a
+/// component output. An internal sizing constant (the coordinator's `alloc_ring`
+/// keys on the delivery axis); size a ring by hand via
+/// [`capacity_for`](crate::capacity_for).
+pub(crate) const LOG_DEPTH: usize = 64;
 
 /// Split a raw message record back into its `(id, payload)` halves — the inverse of an
 /// [`emit`](MsgOut::emit) (the downlink tap's decode, W2). The first 2 bytes are the
@@ -112,7 +107,7 @@ where
 }
 
 impl<M: Msg, B: Backing, WD: WakeSource, WS: WakeSink> MsgOut<M, B, WD, WS> {
-    /// Wrap a writer the coordinator created over a [`msg_capacity`]-sized byte ring.
+    /// Wrap a writer the coordinator created over a Log-sized byte ring.
     pub fn new(writer: Writer<B, WD, WS>) -> Self {
         Self {
             writer,
@@ -281,8 +276,8 @@ where
     RD: WakeSink,
     RS: WakeSource,
 {
-    /// Wrap a single [`View`] the coordinator/registry claimed over a [`msg_capacity`]-sized
-    /// byte ring (the message twin of [`Input::new`](crate::Input), the K = 1 case).
+    /// Wrap a single [`View`] the coordinator/registry claimed over a Log-sized byte
+    /// ring (the message twin of [`Input::new`](crate::Input), the K = 1 case).
     pub fn new(view: View<B, RD, RS>) -> Self {
         Self::from_views(vec![view])
     }
@@ -404,7 +399,8 @@ mod tests {
         SequenceChannelSpec, SequenceCommand, SequenceCommandKind, SequenceRegistry,
     };
 
-    use super::{MAX_MSG_BYTES, MSG_DEPTH, MsgIn, MsgOut, msg_capacity, split_record};
+    use super::{LOG_DEPTH, MAX_MSG_BYTES, MsgIn, MsgOut, split_record};
+    use crate::port::capacity_for;
     use crate::PortId;
     use crate::registry::MessageEntry;
 
@@ -415,7 +411,7 @@ mod tests {
     #[test]
     fn msg_out_emits_and_round_trips() {
         let ring = RingBuffer::create_in_memory(Config {
-            capacity: msg_capacity(MAX_MSG_BYTES, MSG_DEPTH),
+            capacity: capacity_for(MAX_MSG_BYTES, LOG_DEPTH),
             max_readers: 4,
             overrun: Overrun::Overwrite,
         });
@@ -494,7 +490,7 @@ mod tests {
     #[test]
     fn msg_in_drains_and_id_filters() {
         let ring = RingBuffer::create_in_memory(Config {
-            capacity: msg_capacity(MAX_MSG_BYTES, MSG_DEPTH),
+            capacity: capacity_for(MAX_MSG_BYTES, LOG_DEPTH),
             max_readers: 4,
             overrun: Overrun::Overwrite,
         });
@@ -552,7 +548,7 @@ mod tests {
     fn msg_in_fans_in_multiple_views() {
         let mk = || {
             RingBuffer::create_in_memory(Config {
-                capacity: msg_capacity(MAX_MSG_BYTES, MSG_DEPTH),
+                capacity: capacity_for(MAX_MSG_BYTES, LOG_DEPTH),
                 max_readers: 4,
                 overrun: Overrun::Overwrite,
             })

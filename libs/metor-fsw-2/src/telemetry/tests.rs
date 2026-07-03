@@ -421,7 +421,8 @@ async fn message_downlink_fifo_no_coalesce() {
     };
     use stellarator::sync::WaitQueue;
 
-    use crate::message::{MAX_MSG_BYTES, MSG_DEPTH, MsgOut, msg_capacity, split_record};
+    use crate::message::{LOG_DEPTH, MAX_MSG_BYTES, MsgOut, split_record};
+    use crate::port::capacity_for;
     use crate::registry::MessageEntry;
 
     use super::{HandOff, MsgHandOff, run_sender};
@@ -429,7 +430,7 @@ async fn message_downlink_fifo_no_coalesce() {
     // A by-hand message channel — the exact shape the coordinator registers (W4) and the
     // telemetry `execute` message-tap drains.
     let ring = RingBuffer::create_in_memory(Config {
-        capacity: msg_capacity(MAX_MSG_BYTES, MSG_DEPTH),
+        capacity: capacity_for(MAX_MSG_BYTES, LOG_DEPTH),
         max_readers: 4,
         overrun: Overrun::Overwrite,
     });

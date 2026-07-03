@@ -767,10 +767,14 @@ pub fn resolve(wiring: &Wiring, registry: &Registry) -> Result<Coordinator, Load
             resolve_endpoint(&instances, &src, &edge.from, &edge.out, edge.kind, Dir::Out, span)?;
         let consumer =
             resolve_endpoint(&instances, &src, &edge.to, &edge.in_, edge.kind, Dir::In, span)?;
-        let result = match edge.kind {
-            EdgeKind::Msg => builder.connect_msg(producer, consumer),
-            EdgeKind::Frame if edge.delayed => builder.connect_delayed(producer, consumer),
-            EdgeKind::Frame => builder.connect(producer, consumer),
+        // One `connect` entry point for every edge (A7): the edge's behavior is
+        // inferred from the connected ports' descriptors. `EdgeKind` only picked the
+        // name-lookup space above; `delayed=#true` into a Log input surfaces
+        // `WireError::DelayedLogEdge` at build (previously accepted-and-ignored).
+        let result = if edge.delayed {
+            builder.connect_delayed(producer, consumer)
+        } else {
+            builder.connect(producer, consumer)
         };
         result.map_err(|source| LoadError::Wire { source, src, span })?;
     }

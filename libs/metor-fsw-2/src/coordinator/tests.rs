@@ -294,7 +294,7 @@ fn validation_incompatible_frame_id_mismatch() {
     let err = b
         .connect(PortRef::new::<Nav>(prod), PortRef::new::<Imu>(cons))
         .unwrap_err();
-    assert!(matches!(err, WireError::FrameIdMismatch { .. }));
+    assert!(matches!(err, WireError::PortIdMismatch { .. }));
 }
 
 #[test]
@@ -883,7 +883,7 @@ async fn msg_edge_two_cyclic_systems() {
     let mut b = Coordinator::builder(config());
     let prod = b.add_cyclic(MsgProducer { n: 0 });
     let cons = b.add_cyclic(MsgConsumer { seen: seen.clone() });
-    b.connect_msg(
+    b.connect(
         PortRef::msg::<TestEvent>(prod),
         PortRef::msg::<TestEvent>(cons),
     )
@@ -905,12 +905,12 @@ async fn msg_fanin_two_emitters_one_consumer() {
     let prod_b = b.add_cyclic_named("emitter_b", MsgProducer { n: 100 });
     let cons = b.add_cyclic(MsgConsumer { seen: seen.clone() });
     // Two producers fan in to one message input — no `DoubleConnect`.
-    b.connect_msg(
+    b.connect(
         PortRef::msg::<TestEvent>(prod_a),
         PortRef::msg::<TestEvent>(cons),
     )
     .unwrap();
-    b.connect_msg(
+    b.connect(
         PortRef::msg::<TestEvent>(prod_b),
         PortRef::msg::<TestEvent>(cons),
     )
@@ -934,13 +934,13 @@ fn msg_exact_duplicate_edge_is_rejected() {
     let cons = b.add_cyclic(MsgConsumer {
         seen: Rc::new(RefCell::new(Vec::new())),
     });
-    b.connect_msg(
+    b.connect(
         PortRef::msg::<TestEvent>(prod),
         PortRef::msg::<TestEvent>(cons),
     )
     .unwrap();
     // The copy-pasted duplicate: same producer, same consumer, same port.
-    b.connect_msg(
+    b.connect(
         PortRef::msg::<TestEvent>(prod),
         PortRef::msg::<TestEvent>(cons),
     )
@@ -949,7 +949,7 @@ fn msg_exact_duplicate_edge_is_rejected() {
     assert!(
         matches!(
             err,
-            WireError::DuplicateMsgEdge {
+            WireError::DuplicateEdge {
                 producer: "msg_producer",
                 consumer: "msg_consumer",
                 ..
@@ -965,14 +965,152 @@ fn msg_edge_mismatched_type_is_rejected() {
     let prod = b.add_cyclic(MsgProducer { n: 0 });
     let cons = b.add_cyclic(OtherConsumer);
     // `MsgOut<TestEvent>` -> `MsgIn<OtherEvent>`: distinct `M::ID`, so the two PortRefs name
-    // different ports — rejected at `connect_msg` (the same guard a frame-id mismatch hits).
+    // different ports — rejected at `connect` (the same cheap port-id guard).
     let err = b
-        .connect_msg(
+        .connect(
             PortRef::msg::<TestEvent>(prod),
             PortRef::msg::<OtherEvent>(cons),
         )
         .unwrap_err();
-    assert!(matches!(err, WireError::FrameIdMismatch { .. }));
+    assert!(matches!(err, WireError::PortIdMismatch { .. }));
+}
+
+#[test]
+fn delayed_edge_into_log_input_is_rejected() {
+    // `delayed` marks a one-cycle-late snapshot sample; on a Log input it is
+    // meaningless — previously accepted-and-ignored, now a build error (A7).
+    let mut b = Coordinator::builder(config());
+    let prod = b.add_cyclic(MsgProducer { n: 0 });
+    let cons = b.add_cyclic(MsgConsumer {
+        seen: Rc::new(RefCell::new(Vec::new())),
+    });
+    b.connect_delayed(
+        PortRef::msg::<TestEvent>(prod),
+        PortRef::msg::<TestEvent>(cons),
+    )
+    .unwrap();
+    let err = b.build().err().expect("delayed Log edge is rejected");
+    assert!(
+        matches!(
+            err,
+            WireError::DelayedLogEdge {
+                producer: "msg_producer",
+                consumer: "msg_consumer",
+                ..
+            }
+        ),
+        "{err:?}"
+    );
+}
+
+// A consumer whose hand-written input descriptor declares the ill-defined
+// FanIn::Many × Delivery::Snapshot combination.
+struct SnapshotFanInConsumer;
+
+struct SnapshotFanInIn {
+    imu: Input<Imu>,
+}
+
+impl SystemInput for SnapshotFanInIn {
+    fn descriptors() -> Vec<crate::PortDesc> {
+        vec![crate::PortDesc::of::<Imu>().with_fan_in(crate::FanIn::Many)]
+    }
+    fn any_lapped(&self) -> bool {
+        self.imu.is_lapped()
+    }
+}
+
+impl crate::BindPorts<BoxBacking> for SnapshotFanInIn {
+    fn bind<S: crate::RingSource<B = BoxBacking>>(src: &mut S) -> Self {
+        Self {
+            imu: Input::bind(src),
+        }
+    }
+}
+
+impl System for SnapshotFanInConsumer {
+    type Input = SnapshotFanInIn;
+    type Output = Out<NoOut>;
+    const NAME: &'static str = "snapshot_fan_in";
+}
+
+impl CyclicSystem for SnapshotFanInConsumer {
+    fn execute(&mut self, _now: Timestamp, _in: &mut SnapshotFanInIn, _o: &mut Self::Output) {}
+}
+
+#[test]
+fn snapshot_fan_in_is_rejected() {
+    // Latest-wins across several producers is ill-defined, so Many × Snapshot is a
+    // build error even before any edge is connected.
+    let mut b = Coordinator::builder(config());
+    b.add_cyclic(Producer::new());
+    b.add_cyclic(SnapshotFanInConsumer);
+    let err = b.build().err().expect("Many × Snapshot is rejected");
+    assert!(
+        matches!(
+            err,
+            WireError::SnapshotFanIn {
+                system: "snapshot_fan_in",
+                ..
+            }
+        ),
+        "{err:?}"
+    );
+}
+
+// An async consumer whose hand-written Log input declares OnLap::Stop — the one
+// unenforceable declaration (an async system cannot be step-gated).
+struct StopLogAsync;
+
+struct StopLogAsyncIn {
+    events: MsgIn<TestEvent>,
+}
+
+impl SystemInput for StopLogAsyncIn {
+    fn descriptors() -> Vec<crate::PortDesc> {
+        vec![MsgIn::<TestEvent>::descriptor().with_on_lap(crate::OnLap::Stop)]
+    }
+    fn any_lapped(&self) -> bool {
+        false
+    }
+}
+
+impl crate::BindPorts<BoxBacking> for StopLogAsyncIn {
+    fn bind<S: crate::RingSource<B = BoxBacking>>(src: &mut S) -> Self {
+        Self {
+            events: MsgIn::bind(src),
+        }
+    }
+}
+
+impl System for StopLogAsync {
+    type Input = StopLogAsyncIn;
+    type Output = Out<NoOut>;
+    const NAME: &'static str = "stop_log_async";
+}
+
+impl AsyncSystem for StopLogAsync {
+    async fn run(&mut self, input: &mut StopLogAsyncIn, _o: &mut Self::Output) {
+        input.events.drain(|_| {});
+        stellarator::sleep(Duration::from_millis(5)).await;
+    }
+}
+
+#[test]
+fn stop_on_async_log_input_is_rejected() {
+    let mut b = Coordinator::builder(config());
+    b.add_async(StopLogAsync);
+    let err = b.build().err().expect("OnLap::Stop on an async Log input is rejected");
+    assert!(
+        matches!(
+            err,
+            WireError::StopOnAsyncInput {
+                system: "stop_log_async",
+                ..
+            }
+        ),
+        "{err:?}"
+    );
 }
 
 #[cfg(not(miri))]

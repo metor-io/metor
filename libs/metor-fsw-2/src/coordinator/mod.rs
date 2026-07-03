@@ -35,11 +35,13 @@ use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
 
 use crate::binder::{BindPorts, Binder, BoundInput, BoundPort};
 use crate::descriptor::compatible;
-use crate::descriptor::{Hz, PortDesc, PortId, PortSchema, SystemDescriptor, SystemKind};
+use crate::descriptor::{
+    Delivery, FanIn, Hz, OnLap, PortDesc, PortId, PortSchema, SystemDescriptor, SystemKind,
+};
 use crate::dynamic::FrameList;
 use crate::health::{HealthPort, Level};
-use crate::message::{MAX_MSG_BYTES, MSG_DEPTH, MsgIn, MsgOut, msg_capacity};
-use crate::port::{Input, Output, buffer_capacity, capacity_for};
+use crate::message::{LOG_DEPTH, MAX_MSG_BYTES, MsgIn, MsgOut};
+use crate::port::{Input, Output, capacity_for};
 use crate::registry::{MessageEntry, MessageRegistry, OutputRegistry, RegistryEntry};
 use crate::sequence::{SequenceStatus, SlotControlIn};
 use crate::system::{AsyncSystem, CyclicRunner, CyclicSystem, Out, System, SystemOutput};
@@ -152,46 +154,77 @@ pub enum WireError {
         port: PortId,
     },
     /// `connect` named a producer and consumer port that do not share a port id.
-    FrameIdMismatch {
+    PortIdMismatch {
         producer: PortId,
         consumer: PortId,
     },
-    /// The producer's frame/message does not satisfy the consumer's required shape.
+    /// The producer's record shape does not satisfy the consumer's required shape
+    /// (the Table subset rule / Postcard id equality / delivery agreement —
+    /// [`compatible`](crate::compatible)).
     Incompatible {
         producer: &'static str,
         consumer: &'static str,
         port: PortId,
     },
-    /// A **frame** input port was never connected (nothing would ever write it). Message
-    /// inputs may be unconnected (zero producers is legal, `docs/message-wiring.md` §3.2).
+    /// A [`FanIn::One`](crate::FanIn) input port was never connected (nothing would
+    /// ever write it). [`FanIn::Many`](crate::FanIn) inputs may be unconnected (zero
+    /// producers is legal, `docs/message-wiring.md` §3.2).
     UnconnectedInput {
         system: &'static str,
         port: PortId,
     },
-    /// Two producers were connected into one **frame** input port. Message inputs allow
-    /// fan-in (`docs/message-wiring.md` §3.2), so this never fires for them — but an
-    /// *exact duplicate* of one message edge is a [`DuplicateMsgEdge`](Self::DuplicateMsgEdge).
+    /// Two producers were connected into one [`FanIn::One`](crate::FanIn) input port.
+    /// [`FanIn::Many`](crate::FanIn) inputs allow fan-in, so this never fires for
+    /// them — but an *exact duplicate* of one edge is a
+    /// [`DuplicateEdge`](Self::DuplicateEdge).
     DoubleConnect {
         system: &'static str,
         port: PortId,
     },
-    /// The exact same message edge — one `(producer, consumer, port)` triple — was
+    /// The exact same fan-in edge — one `(producer, consumer, port)` triple — was
     /// connected twice. Fan-in of *distinct* producers is legal (`docs/message-wiring.md`
     /// §3.2); a copy-pasted duplicate edge would deliver every record to the consumer
     /// twice (a double-applied command), so it is rejected.
-    DuplicateMsgEdge {
+    DuplicateEdge {
         producer: &'static str,
         consumer: &'static str,
         port: PortId,
     },
-    /// A non-delayed **frame** edge points *backward* in registration order between two
-    /// cyclic systems: the cyclic step loop runs in registration order, so the consumer
-    /// would execute before its producer every cycle and permanently read the previous
-    /// cycle's value — the exact staleness [`connect_delayed`](CoordinatorBuilder::connect_delayed)
-    /// exists to make explicit. Fix by registering the producer before the consumer, or
-    /// declare the one-cycle delay with `connect_delayed`. Message edges are exempt (a
-    /// decoupled log, not a same-cycle dependency), as are edges touching an async
-    /// endpoint (async systems run off the copy-in step / their own task, not the
+    /// `connect_delayed` (or KDL `delayed=#true`) on an edge into a
+    /// [`Delivery::Log`](crate::Delivery) input (A7). `delayed` marks a one-cycle-late
+    /// *snapshot* sample; a log is a decoupled event/command stream with no same-cycle
+    /// dependency, so the delay is meaningless — rejected instead of silently ignored.
+    DelayedLogEdge {
+        producer: &'static str,
+        consumer: &'static str,
+        port: PortId,
+    },
+    /// An **async** system declared a [`Delivery::Log`](crate::Delivery) input with
+    /// [`OnLap::Stop`](crate::OnLap). An async system cannot be step-gated, so the
+    /// framework has no way to honor a hard-stop-on-lap doctrine there: its Log
+    /// inputs poll-drain the shared producer rings directly. (A Snapshot input's
+    /// default Stop is instead the documented coercion — effectively Resync,
+    /// implemented by the drop-on-full copy-in ring.)
+    StopOnAsyncInput {
+        system: &'static str,
+        port: PortId,
+    },
+    /// An input declared [`FanIn::Many`](crate::FanIn) with
+    /// [`Delivery::Snapshot`](crate::Delivery): latest-wins across several producers
+    /// is ill-defined without cross-ring ordering, so the combination is rejected.
+    SnapshotFanIn {
+        system: &'static str,
+        port: PortId,
+    },
+    /// A non-delayed **Snapshot** edge points *backward* in registration order between
+    /// two cyclic systems: the cyclic step loop runs in registration order, so the
+    /// consumer would execute before its producer every cycle and permanently read the
+    /// previous cycle's value — the exact staleness
+    /// [`connect_delayed`](CoordinatorBuilder::connect_delayed) exists to make
+    /// explicit. Fix by registering the producer before the consumer, or declare the
+    /// one-cycle delay with `connect_delayed`. Log edges are exempt (a decoupled
+    /// stream, not a same-cycle dependency), as are edges touching an async endpoint
+    /// (async systems run off the copy-in step / their own task, not the
     /// registration-ordered step loop).
     StaleFrameEdge {
         producer: &'static str,
@@ -233,7 +266,7 @@ impl std::fmt::Display for WireError {
             WireError::UnknownPort { system, port } => {
                 write!(f, "system #{system} has no port {port:?}")
             }
-            WireError::FrameIdMismatch { producer, consumer } => write!(
+            WireError::PortIdMismatch { producer, consumer } => write!(
                 f,
                 "connect port-id mismatch: producer {producer:?} vs consumer {consumer:?}"
             ),
@@ -252,14 +285,36 @@ impl std::fmt::Display for WireError {
                 f,
                 "{system} input for port {port:?} connected more than once"
             ),
-            WireError::DuplicateMsgEdge {
+            WireError::DuplicateEdge {
                 producer,
                 consumer,
                 port,
             } => write!(
                 f,
-                "duplicate message edge {producer} -> {consumer} on port {port:?} — \
+                "duplicate edge {producer} -> {consumer} on port {port:?} — \
                  the same edge was connected twice (every record would deliver twice)"
+            ),
+            WireError::DelayedLogEdge {
+                producer,
+                consumer,
+                port,
+            } => write!(
+                f,
+                "delayed edge {producer} -> {consumer} on Log port {port:?}: `delayed` \
+                 marks a one-cycle-late snapshot sample, which is meaningless on a \
+                 decoupled event/command log — drop the delayed flag"
+            ),
+            WireError::StopOnAsyncInput { system, port } => write!(
+                f,
+                "async system {system} declares OnLap::Stop on input {port:?}: an async \
+                 consumer cannot be step-gated, so the framework cannot honor a \
+                 hard-stop-on-lap policy there — use OnLap::Resync"
+            ),
+            WireError::SnapshotFanIn { system, port } => write!(
+                f,
+                "{system} input {port:?} declares FanIn::Many with Delivery::Snapshot: \
+                 latest-wins across several producers is ill-defined — use Delivery::Log \
+                 or FanIn::One"
             ),
             WireError::StaleFrameEdge {
                 producer,
@@ -490,7 +545,9 @@ struct RingTable {
 /// overwrites unconsumed records when the async consumer is behind (drop-on-full).
 struct CopyIn {
     upstream: View<BoxBacking, NoWake, NoWake>,
-    writer: Writer<BoxBacking, Notifier, Notifier>,
+    /// The private ring's sole writer: the matched data `Notifier` wakes the parked
+    /// async `recv`; the space side is `NoWake` — an Overwrite write never suspends.
+    writer: Writer<BoxBacking, Notifier, NoWake>,
     scratch: Vec<u8>,
 }
 
@@ -876,18 +933,22 @@ impl CoordinatorBuilder {
         SystemHandle { id }
     }
 
-    /// Connect a producer output to a consumer input, addressed by frame id. The
-    /// full compatibility/structural validation runs in [`build`](Self::build);
-    /// this only catches the cheap frame-id and unknown-system/port mistakes early.
+    /// Connect a producer output to a consumer input, addressed by port id. The full
+    /// compatibility/structural validation runs in [`build`](Self::build); this only
+    /// catches the cheap port-id and unknown-system/port mistakes early. **One entry
+    /// point for every edge** (A7): the edge's behavior — fan-in rule, cycle-detection
+    /// membership, lap policy — is inferred from the connected ports' descriptors, so
+    /// a Snapshot (frame) edge and a Log (message) edge spell identically.
     ///
-    /// A forward (acyclic) edge. If a `connect` happens to close a feedback loop —
-    /// including a system connected to itself — `build` rejects it as a
-    /// [`FeedbackCycle`](WireError::FeedbackCycle): the back-edge of a loop must be
-    /// declared with [`connect_delayed`](Self::connect_delayed). Likewise a frame edge
-    /// between two cyclic systems must point *forward* in registration order (the step
-    /// loop's execution order), or the consumer would permanently read last cycle's
-    /// value — `build` rejects the backward edge as a
+    /// A forward (acyclic) edge. If a `connect` happens to close a feedback loop over
+    /// Snapshot edges — including a system connected to itself — `build` rejects it as
+    /// a [`FeedbackCycle`](WireError::FeedbackCycle): the back-edge of a loop must be
+    /// declared with [`connect_delayed`](Self::connect_delayed). Likewise a Snapshot
+    /// edge between two cyclic systems must point *forward* in registration order (the
+    /// step loop's execution order), or the consumer would permanently read last
+    /// cycle's value — `build` rejects the backward edge as a
     /// [`StaleFrameEdge`](WireError::StaleFrameEdge) unless it is `connect_delayed`.
+    /// Log edges are exempt from both (a decoupled event/command stream).
     pub fn connect(&mut self, producer: PortRef, consumer: PortRef) -> Result<(), WireError> {
         self.push_edge(producer, consumer, false)
     }
@@ -899,22 +960,14 @@ impl CoordinatorBuilder {
     /// after the consumer in registration order — but the edge is excluded from
     /// cycle detection, so the loop builds. Every feedback loop must break exactly
     /// one edge this way; an unbroken cycle is a [`FeedbackCycle`](WireError::FeedbackCycle).
+    /// Only meaningful on a Snapshot edge; `delayed` into a Log input is rejected at
+    /// build as a [`DelayedLogEdge`](WireError::DelayedLogEdge).
     pub fn connect_delayed(
         &mut self,
         producer: PortRef,
         consumer: PortRef,
     ) -> Result<(), WireError> {
         self.push_edge(producer, consumer, true)
-    }
-
-    /// Connect a producer's message output to a consumer's message input
-    /// (`docs/message-wiring.md` §3). Both endpoints must be `PortId::Msg` ports carrying
-    /// the same `M::ID`. Unlike a frame edge, a message edge is many-to-many (fan-in and
-    /// fan-out) and is excluded from feedback-cycle detection — a message channel is a
-    /// decoupled event/command bus, so a command loop needs no `connect_delayed`. Use
-    /// [`PortRef::msg`] to address the endpoints.
-    pub fn connect_msg(&mut self, producer: PortRef, consumer: PortRef) -> Result<(), WireError> {
-        self.push_edge(producer, consumer, false)
     }
 
     fn push_edge(
@@ -934,7 +987,7 @@ impl CoordinatorBuilder {
             });
         }
         if producer.port != consumer.port {
-            return Err(WireError::FrameIdMismatch {
+            return Err(WireError::PortIdMismatch {
                 producer: producer.port,
                 consumer: consumer.port,
             });
@@ -1009,15 +1062,45 @@ impl CoordinatorBuilder {
             .filter(|r| matches!(r, Reg::Slot(_)))
             .count();
 
-        // --- Validate edges, build the connection map ------------------------
-        // (cons_id, in_idx) -> (prod_id, out_idx) — FRAME inputs (exactly one producer).
-        let mut cons_edge: HashMap<(usize, usize), (usize, usize)> = HashMap::new();
-        // (cons_id, in_idx) -> [(prod_id, out_idx)] — MESSAGE inputs (fan-in: zero/one/many
-        // producers, `docs/message-wiring.md` §3.2).
-        let mut msg_cons_edges: HashMap<(usize, usize), Vec<(usize, usize)>> = HashMap::new();
-        // System-level adjacency over the NON-delayed FRAME edges only, for cycle detection: a
-        // remaining cycle is an unbroken feedback loop. Message edges are excluded — a message
-        // channel is a decoupled event/command bus, not a same-cycle dependency (§3.6).
+        // --- Per-descriptor axis validation (no edges needed) ----------------
+        // FanIn::Many × Delivery::Snapshot: latest-wins across producers is
+        // ill-defined. OnLap::Stop on an async system's input: an async consumer
+        // cannot be step-gated, so the hard-stop doctrine is unenforceable there
+        // (§2.3). A Snapshot input *defaults* Stop (the cyclic doctrine), so on an
+        // async system that combination is the documented coercion — effectively
+        // Resync, implemented by the drop-on-full copy-in ring — not an error; only
+        // the non-default Log × Stop (necessarily an explicit declaration, since Log
+        // defaults Resync) is rejected, because nothing decouples a Log input.
+        for s in 0..n {
+            for port in &self.descs[s].inputs {
+                if port.fan_in == FanIn::Many && port.delivery == Delivery::Snapshot {
+                    return Err(WireError::SnapshotFanIn {
+                        system: self.descs[s].name,
+                        port: port.id,
+                    });
+                }
+                if self.kinds[s] == SystemKind::Async
+                    && port.on_lap == OnLap::Stop
+                    && port.delivery == Delivery::Log
+                {
+                    return Err(WireError::StopOnAsyncInput {
+                        system: self.descs[s].name,
+                        port: port.id,
+                    });
+                }
+            }
+        }
+
+        // --- Validate edges, build the ONE connection map ---------------------
+        // (cons_id, in_idx) -> [(prod_id, out_idx)] for EVERY input — a FanIn::One
+        // input holds exactly one entry (enforced below), a FanIn::Many input zero or
+        // more. Every rule from here on branches on a descriptor axis, never on
+        // frame-vs-message.
+        let mut cons_edges: HashMap<(usize, usize), Vec<(usize, usize)>> = HashMap::new();
+        // System-level adjacency over the NON-delayed SNAPSHOT edges only, for cycle
+        // detection: a remaining cycle is an unbroken feedback loop. Log edges are
+        // excluded — a log is a decoupled event/command stream, not a same-cycle
+        // dependency (§3.6).
         let mut forward_adj: Vec<Vec<usize>> = vec![Vec::new(); n];
         for (p, c, delayed) in &self.edges {
             let out_idx = self.descs[p.system.id]
@@ -1046,33 +1129,33 @@ impl CoordinatorBuilder {
                     port: c.port,
                 });
             }
-            match c.port {
-                // Frame edge: exactly-one producer per input; participates in cycle detection.
-                PortId::Component(_) => {
-                    if cons_edge
-                        .insert((c.system.id, in_idx), (p.system.id, out_idx))
-                        .is_some()
-                    {
+            let in_desc = &self.descs[c.system.id].inputs[in_idx];
+            // `delayed` marks a one-cycle-late snapshot sample; on a Log input it is
+            // meaningless and now rejected instead of silently ignored (A7).
+            if *delayed && in_desc.delivery == Delivery::Log {
+                return Err(WireError::DelayedLogEdge {
+                    producer: self.descs[p.system.id].name,
+                    consumer: self.descs[c.system.id].name,
+                    port: c.port,
+                });
+            }
+            let producers = cons_edges.entry((c.system.id, in_idx)).or_default();
+            match in_desc.fan_in {
+                // Exactly one edge per input (the frame doctrine).
+                FanIn::One => {
+                    if !producers.is_empty() {
                         return Err(WireError::DoubleConnect {
                             system: self.descs[c.system.id].name,
                             port: c.port,
                         });
                     }
-                    // Self-edges included: a system plainly connected to itself is the
-                    // tightest feedback loop (it can only ever read its own previous
-                    // cycle's value), so it must be declared with `connect_delayed` like
-                    // any other loop — the DFS reports it as a one-member `FeedbackCycle`.
-                    if !delayed {
-                        forward_adj[p.system.id].push(c.system.id);
-                    }
+                    producers.push((p.system.id, out_idx));
                 }
-                // Message edge: fan-in (append), excluded from cycles. Distinct producers
-                // may fan in freely (§3.2), but an exact duplicate of one edge would
-                // deliver every record twice, so it is rejected.
-                PortId::Packet(_) => {
-                    let producers = msg_cons_edges.entry((c.system.id, in_idx)).or_default();
+                // Fan-in (append). Distinct producers may fan in freely (§3.2), but an
+                // exact duplicate of one edge would deliver every record twice (B7).
+                FanIn::Many => {
                     if producers.contains(&(p.system.id, out_idx)) {
-                        return Err(WireError::DuplicateMsgEdge {
+                        return Err(WireError::DuplicateEdge {
                             producer: self.descs[p.system.id].name,
                             consumer: self.descs[c.system.id].name,
                             port: c.port,
@@ -1080,6 +1163,13 @@ impl CoordinatorBuilder {
                     }
                     producers.push((p.system.id, out_idx));
                 }
+            }
+            // Self-edges included: a system plainly connected to itself is the
+            // tightest feedback loop (it can only ever read its own previous
+            // cycle's value), so it must be declared with `connect_delayed` like
+            // any other loop — the DFS reports it as a one-member `FeedbackCycle`.
+            if in_desc.delivery == Delivery::Snapshot && !delayed {
+                forward_adj[p.system.id].push(c.system.id);
             }
         }
 
@@ -1091,17 +1181,25 @@ impl CoordinatorBuilder {
         }
 
         // --- Registration order must agree with the dataflow ------------------
-        // The cyclic step loop runs in registration order, so a non-delayed frame edge
-        // between two cyclic systems whose consumer registered *before* its producer
-        // would read last cycle's value forever — silent staleness that must instead be
-        // declared with `connect_delayed`. Checked after cycle detection so a genuine
-        // unbroken loop (which always contains a backward edge) reports the clearer
-        // `FeedbackCycle`. Message edges are exempt (a decoupled log, §3.6); so are
-        // edges with an async endpoint (async systems run off the post-step copy-in /
-        // their own task, so their registration index carries no ordering semantics).
-        // Self-edges never reach here (rejected above as a one-member cycle).
+        // The cyclic step loop runs in registration order, so a non-delayed Snapshot
+        // edge between two cyclic systems whose consumer registered *before* its
+        // producer would read last cycle's value forever — silent staleness that must
+        // instead be declared with `connect_delayed`. Checked after cycle detection so
+        // a genuine unbroken loop (which always contains a backward edge) reports the
+        // clearer `FeedbackCycle`. Log edges are exempt (a decoupled stream, §3.6); so
+        // are edges with an async endpoint (async systems run off the post-step
+        // copy-in / their own task, so their registration index carries no ordering
+        // semantics). Self-edges never reach here (rejected above as a one-member cycle).
         for (p, c, delayed) in &self.edges {
-            if *delayed || !matches!(c.port, PortId::Component(_)) {
+            if *delayed {
+                continue;
+            }
+            let in_delivery = self.descs[c.system.id]
+                .inputs
+                .iter()
+                .find(|d| d.id == c.port)
+                .map(|d| d.delivery);
+            if in_delivery != Some(Delivery::Snapshot) {
                 continue;
             }
             let both_cyclic = self.kinds[p.system.id] == SystemKind::Cyclic
@@ -1115,11 +1213,12 @@ impl CoordinatorBuilder {
             }
         }
 
-        // --- Every FRAME input must be connected exactly once ----------------
-        // A message input may have zero producers (fan-in is optional, §3.2).
+        // --- Input coverage: a FanIn::One input must be connected exactly once ---
+        // (exactly-once is the edge pass above; existence is here). A FanIn::Many
+        // input may have zero producers (fan-in is optional, §3.2).
         for s in 0..n {
             for (in_idx, port) in self.descs[s].inputs.iter().enumerate() {
-                if matches!(port.id, PortId::Component(_)) && !cons_edge.contains_key(&(s, in_idx)) {
+                if port.fan_in == FanIn::One && !cons_edges.contains_key(&(s, in_idx)) {
                     return Err(WireError::UnconnectedInput {
                         system: self.descs[s].name,
                         port: port.id,
@@ -1128,12 +1227,9 @@ impl CoordinatorBuilder {
             }
         }
 
-        // --- Fan-out per output port (frame + message consumers) -------------
+        // --- Fan-out per output port: one uniform count over the one map -----
         let mut fan_out: HashMap<(usize, usize), usize> = HashMap::new();
-        for &(prod_id, out_idx) in cons_edge.values() {
-            *fan_out.entry((prod_id, out_idx)).or_insert(0) += 1;
-        }
-        for producers in msg_cons_edges.values() {
+        for producers in cons_edges.values() {
             for &(prod_id, out_idx) in producers {
                 *fan_out.entry((prod_id, out_idx)).or_insert(0) += 1;
             }
@@ -1177,18 +1273,25 @@ impl CoordinatorBuilder {
                     // PortDesc indices (edges index by position); it is never bound
                     // (`AllOutputs::bind` pulls the registries) nor edge-referenced.
                     RingBuffer::create_in_memory(Config {
-                        capacity: msg_capacity(1, 2),
+                        capacity: capacity_for(1, 2),
                         max_readers: 1,
                         overrun: Overrun::Overwrite,
                     })
                 } else {
+                    // ONE sizing path (depth by delivery — `alloc_ring`); only the
+                    // registry-entry shape still splits on the schema. A
+                    // `SequenceCommand` output is a command producer read by every
+                    // slot, so it reserves `n_slots` extra readers on top of its edge
+                    // fan-out (an A2 residue `docs/design-command-slots.md` deletes by
+                    // making command edges explicit).
+                    let cmd_readers = if port.id == PortId::Packet(SequenceCommand::ID) {
+                        n_slots
+                    } else {
+                        0
+                    };
+                    let ring = alloc_ring(port.delivery, port.max_size, depth, readers + cmd_readers);
                     match &port.schema {
                         PortSchema::Table { .. } => {
-                            let ring = RingBuffer::create_in_memory(Config {
-                                capacity: capacity_for(port.max_size, depth),
-                                max_readers: readers,
-                                overrun: Overrun::Overwrite,
-                            });
                             reg_entries.push(registry_entry(&instance, port, ring.clone()));
                             table.rings.push(RingEntry {
                                 ring: ring.clone(),
@@ -1199,24 +1302,11 @@ impl CoordinatorBuilder {
                                 role,
                                 instance: Some(instance),
                             });
-                            ring
                         }
                         PortSchema::Postcard => {
-                            // A wired message output: variable-record sizing, indexed in the
-                            // `MessageRegistry` so the downlink/`AllOutputs` taps it (unless the port
-                            // opted out via `telemetered = false`, e.g. a command channel, §6.4). A
-                            // `SequenceCommand` output is a command producer read by every slot, so it
-                            // reserves `n_slots` extra readers on top of its edge fan-out.
-                            let cmd_readers = if port.id == PortId::Packet(SequenceCommand::ID) {
-                                n_slots
-                            } else {
-                                0
-                            };
-                            let ring = RingBuffer::create_in_memory(Config {
-                                capacity: msg_capacity(MAX_MSG_BYTES, MSG_DEPTH),
-                                max_readers: readers + cmd_readers,
-                                overrun: Overrun::Overwrite,
-                            });
+                            // Indexed in the `MessageRegistry` so the downlink /
+                            // `AllOutputs` taps it (unless the port opted out via
+                            // `telemetered = false`, e.g. a command channel, §6.4).
                             let entry =
                                 message_entry(&instance, port.name, ring.clone(), port.telemetered);
                             table.rings.push(RingEntry {
@@ -1226,9 +1316,9 @@ impl CoordinatorBuilder {
                                 instance: Some(instance),
                             });
                             msg_entries.push(entry);
-                            ring
                         }
                     }
+                    ring
                 };
                 row.push(ring);
             }
@@ -1307,8 +1397,9 @@ impl CoordinatorBuilder {
             });
             // Events: the slot's own message channel — a single-writer `MsgOut`, tapped
             // by the registry consumers like an output (the downlink, W2).
-            let events_ring = msg_ring(MAX_MSG_BYTES, MSG_DEPTH, n_reg + READER_SLACK);
-            let events = msg_writer(&events_ring);
+            let events_ring =
+                alloc_ring(Delivery::Log, MAX_MSG_BYTES, depth, n_reg + READER_SLACK);
+            let events = owned_writer(&events_ring);
             let events_entry = message_entry(&instance, "sequences", events_ring.clone(), true);
             table.rings.push(RingEntry {
                 ring: events_ring,
@@ -1345,8 +1436,9 @@ impl CoordinatorBuilder {
         // startup (in `run_for`, not here — a tap claimed after `build()` would miss an
         // emit-at-build, the overwrite ring starting at the live edge). Registry-tapped
         // so the downlink (W2) carries it.
-        let seq_registry_ring = msg_ring(MAX_MSG_BYTES, MSG_DEPTH, n_reg + READER_SLACK);
-        let seq_registry_out = msg_writer(&seq_registry_ring);
+        let seq_registry_ring =
+            alloc_ring(Delivery::Log, MAX_MSG_BYTES, depth, n_reg + READER_SLACK);
+        let seq_registry_out = owned_writer(&seq_registry_ring);
         let seq_registry_entry =
             message_entry(COORDINATOR_INSTANCE, "sequences", seq_registry_ring.clone(), true);
         table.rings.push(RingEntry {
@@ -1366,7 +1458,8 @@ impl CoordinatorBuilder {
         // `control_handle()`) and every slot's command fan-in reads it — so it reserves
         // `n_slots` readers. Owned but not telemetered (inbound control, not downlink), so
         // it is not in the `MessageRegistry`.
-        let command_ring = msg_ring(MAX_MSG_BYTES, MSG_DEPTH, n_slots + READER_SLACK);
+        let command_ring =
+            alloc_ring(Delivery::Log, MAX_MSG_BYTES, depth, n_slots + READER_SLACK);
         table.rings.push(RingEntry {
             ring: command_ring.clone(),
             frame_id: ComponentId::new("coordinator.commands"),
@@ -1375,7 +1468,7 @@ impl CoordinatorBuilder {
         });
         // The channel's single writer, minted once here (the region's writer claim
         // enforces one live writer per ring); `control_handle()` hands it out once.
-        let control_out = Some(msg_writer::<SequenceCommand>(&command_ring));
+        let control_out = Some(owned_writer::<SequenceCommand>(&command_ring));
 
         // The command producers every slot fans in from (`docs/message-wiring.md` §6): the
         // coordinator's reserved in-proc channel, plus every system's `SequenceCommand` output
@@ -1397,11 +1490,14 @@ impl CoordinatorBuilder {
         let message_registry = Arc::new(MessageRegistry::new(msg_entries));
 
         // --- Private copy-in buffers for async inputs ------------------------
-        // (async_sys, in_idx) -> (private ring, matched data notifier, space notifier)
-        let mut private_inputs: HashMap<
-            (usize, usize),
-            (RingBuffer<BoxBacking>, Notifier, Notifier),
-        > = HashMap::new();
+        // Keyed on the delivery axis (§2.3): an async system cannot be step-gated, so
+        // an async SNAPSHOT input is effectively Resync, implemented by a private
+        // drop-on-full copy-in ring (which also supplies the matched data `Notifier`
+        // the async `recv` parks on). Log inputs use a direct fan-in multi-view
+        // (§3.3) — a best-effort log the consumer poll-drains, no copy-in.
+        // (async_sys, in_idx) -> (private ring, matched data notifier)
+        let mut private_inputs: HashMap<(usize, usize), (RingBuffer<BoxBacking>, Notifier)> =
+            HashMap::new();
         let mut async_wakes: Vec<Vec<Notifier>> = vec![Vec::new(); n];
         let mut copy_ins: Vec<CopyIn> = Vec::new();
         for s in 0..n {
@@ -1409,25 +1505,20 @@ impl CoordinatorBuilder {
                 continue;
             }
             for in_idx in 0..self.descs[s].inputs.len() {
-                // Message inputs use a direct fan-in multi-view (§3.3), not a private copy-in
-                // buffer — messages are a best-effort log, so an async consumer polls the shared
-                // producer rings directly (`MsgIn` resyncs on lap).
-                if matches!(self.descs[s].inputs[in_idx].id, PortId::Packet(_)) {
+                if self.descs[s].inputs[in_idx].delivery == Delivery::Log {
                     continue;
                 }
-                let (prod_id, out_idx) = cons_edge[&(s, in_idx)];
+                let (prod_id, out_idx) = cons_edges[&(s, in_idx)][0];
                 let port = &self.descs[s].inputs[in_idx];
-                let private = RingBuffer::create_in_memory(Config {
-                    capacity: capacity_for(port.max_size, depth),
-                    max_readers: 1 + READER_SLACK,
-                    overrun: Overrun::Overwrite,
-                });
+                let private = alloc_ring(port.delivery, port.max_size, depth, 1 + READER_SLACK);
                 let data = Notifier::default();
-                let space = Notifier::default();
+                // The private ring is Overwrite, so a write never suspends for space —
+                // only the matched DATA notifier is load-bearing (it wakes the parked
+                // async `recv`); the writer's space side is `NoWake`.
                 // Invariant: each private copy-in ring is created here and gets
                 // this one writer, so the claim is always free.
                 let writer = private
-                    .writer(data.clone(), space.clone())
+                    .writer(data.clone(), NoWake)
                     .expect("private copy-in ring has exactly one writer");
                 let upstream = output_rings[prod_id][out_idx]
                     .view(NoWake, NoWake)
@@ -1437,7 +1528,7 @@ impl CoordinatorBuilder {
                     writer,
                     scratch: Vec::new(),
                 });
-                private_inputs.insert((s, in_idx), (private.clone(), data.clone(), space.clone()));
+                private_inputs.insert((s, in_idx), (private.clone(), data.clone()));
                 async_wakes[s].push(data);
                 table.rings.push(RingEntry {
                     ring: private,
@@ -1478,7 +1569,7 @@ impl CoordinatorBuilder {
                         .collect();
                     let inputs: Vec<FswRing> = (0..self.descs[id].inputs.len())
                         .map(|in_idx| {
-                            let (prod_id, out_idx) = cons_edge[&(id, in_idx)];
+                            let (prod_id, out_idx) = cons_edges[&(id, in_idx)][0];
                             let (base, len) = output_rings[prod_id][out_idx].region();
                             FswRing {
                                 base,
@@ -1511,7 +1602,7 @@ impl CoordinatorBuilder {
                     // The user inputs (registered descriptor) view their producers...
                     let mut inputs: Vec<FswRing> = (0..self.descs[id].inputs.len())
                         .map(|in_idx| {
-                            let (prod_id, out_idx) = cons_edge[&(id, in_idx)];
+                            let (prod_id, out_idx) = cons_edges[&(id, in_idx)][0];
                             let (base, len) = output_rings[prod_id][out_idx].region();
                             FswRing {
                                 base,
@@ -1576,25 +1667,32 @@ impl CoordinatorBuilder {
                         .filter(|&out_idx| !self.descs[id].outputs[out_idx].is_receive_all())
                         .map(|out_idx| BoundPort::new(output_rings[id][out_idx].clone()))
                         .collect();
-                    // Inputs, in `descriptors()` order. A frame input is `One`: cyclic consumers
-                    // view the producer's output directly, async consumers view their private
-                    // copy-in buffer with the matched wake. A message input is `Many`: a direct
-                    // multi-view over every producer ring wired to it (fan-in, §3.3), NoWake — a
-                    // best-effort log the consumer poll-drains (no copy-in, cyclic or async).
+                    // Inputs, in `descriptors()` order, chosen by the FAN-IN axis. A
+                    // `One` input: cyclic consumers view the producer's output
+                    // directly, async consumers view their private copy-in buffer with
+                    // the matched data wake. A `Many` input: a direct multi-view over
+                    // every producer ring wired to it (fan-in, §3.3), NoWake — a
+                    // best-effort log the consumer poll-drains (no copy-in, cyclic or
+                    // async).
                     let ins: Vec<BoundInput> = (0..self.descs[id].inputs.len())
-                        .map(|in_idx| match self.descs[id].inputs[in_idx].id {
-                            PortId::Component(_) => {
-                                let (prod_id, out_idx) = cons_edge[&(id, in_idx)];
-                                let port = if self.kinds[id] == SystemKind::Async {
-                                    let (ring, data, space) = private_inputs[&(id, in_idx)].clone();
-                                    BoundPort::matched(ring, Box::new(data), Box::new(space))
-                                } else {
-                                    BoundPort::new(output_rings[prod_id][out_idx].clone())
+                        .map(|in_idx| match self.descs[id].inputs[in_idx].fan_in {
+                            FanIn::One => {
+                                let (prod_id, out_idx) = cons_edges[&(id, in_idx)][0];
+                                // The copy-in pass keyed on (Async, Snapshot); anything
+                                // it decoupled binds the private ring + matched wake,
+                                // everything else views the producer directly.
+                                let port = match private_inputs.get(&(id, in_idx)) {
+                                    Some((ring, data)) => {
+                                        BoundPort::matched(ring.clone(), Box::new(data.clone()))
+                                    }
+                                    None => {
+                                        BoundPort::new(output_rings[prod_id][out_idx].clone())
+                                    }
                                 };
                                 BoundInput::One(port)
                             }
-                            PortId::Packet(_) => {
-                                let ports = msg_cons_edges
+                            FanIn::Many => {
+                                let ports = cons_edges
                                     .get(&(id, in_idx))
                                     .map(|producers| {
                                         producers
@@ -1751,31 +1849,38 @@ fn stopped_set_changed(cur: &[StoppedSystem], prev: &[StoppedSystem]) -> bool {
             .any(|(a, b)| a.name != b.name || a.reason != b.reason)
 }
 
-fn coord_ring<F: Frame>(depth: usize, max_readers: usize) -> RingBuffer<BoxBacking> {
+/// The ONE ring-sizing helper (`docs/design-port-unification.md` §4 PASS 5): a
+/// Snapshot port is sized at the configured default depth (a latest-wins sample needs
+/// little history), a Log port at [`LOG_DEPTH`] (an every-record stream must absorb a
+/// slow tap). Overwrite, like every owned ring.
+fn alloc_ring(
+    delivery: Delivery,
+    max_size: usize,
+    default_depth: usize,
+    max_readers: usize,
+) -> RingBuffer<BoxBacking> {
+    let depth = match delivery {
+        Delivery::Snapshot => default_depth,
+        Delivery::Log => LOG_DEPTH,
+    };
     RingBuffer::create_in_memory(Config {
-        capacity: buffer_capacity::<F>(depth),
+        capacity: capacity_for(max_size, depth),
         max_readers,
         overrun: Overrun::Overwrite,
     })
 }
 
-/// A coordinator-owned **message** ring, sized for `depth` records of up to `max_bytes`
-/// payload (the [`coord_ring`] twin for the `(id, postcard)` channel, `docs/messages.md`
-/// §2). Overwrite, like every owned ring; the registry consumers tap it. W4 mints the
-/// per-slot sequence event channels + the coordinator's boot-registry channel through it.
-fn msg_ring(max_bytes: usize, depth: usize, max_readers: usize) -> RingBuffer<BoxBacking> {
-    RingBuffer::create_in_memory(Config {
-        capacity: msg_capacity(max_bytes, depth),
-        max_readers,
-        overrun: Overrun::Overwrite,
-    })
+/// A coordinator-owned Snapshot ring for frame `F` — [`alloc_ring`] with the frame's
+/// worst-case record size.
+fn coord_ring<F: Frame>(default_depth: usize, max_readers: usize) -> RingBuffer<BoxBacking> {
+    alloc_ring(Delivery::Snapshot, F::MAX_SIZE, default_depth, max_readers)
 }
 
-/// A fresh host [`MsgOut`] over a coordinator-owned message ring — the [`slot_writer`]
-/// analogue for the message channel (`slot.rs:547`), exactly how the coordinator mints
-/// its own `status_out`/`control` writers. Called exactly once per ring at build (the
-/// region's writer claim enforces it).
-fn msg_writer<M: Msg>(ring: &RingBuffer<BoxBacking>) -> MsgOut<M> {
+/// Mint the single [`MsgOut`] writer over a coordinator-owned ring — the
+/// [`slot_writer`] analogue for the message channel, exactly how the coordinator
+/// mints its own `status_out`/`control` writers. Called exactly once per ring at
+/// build (the region's writer claim enforces it).
+fn owned_writer<M: Msg>(ring: &RingBuffer<BoxBacking>) -> MsgOut<M> {
     // Invariant: each coordinator-owned message ring gets its single writer
     // minted exactly once at build, so the claim is always free here.
     let writer = ring
