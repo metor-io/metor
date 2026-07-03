@@ -7,7 +7,7 @@ use metor_fsw::{AsVTable, Componentize};
 use metor_proto::types::{ComponentId, ComponentView, Timestamp};
 use zerocopy::{Immutable, IntoBytes, KnownLayout};
 
-use crate::{Frame, FrameList, FrameMap, FrameWriter, Name, KeyError};
+use crate::{Frame, FrameList, FrameMap, FrameWriter, KeyError};
 
 // ---------------------------------------------------------------------------
 // Shared recording sink
@@ -245,7 +245,7 @@ fn frame_list_build_and_apply() {
 struct SysMap {
     #[metor_fsw(timestamp)]
     timestamp: Timestamp,
-    processes: FrameMap<Name<'static>, Process, 8>,
+    processes: FrameMap<Process, 8>,
 }
 
 #[test]
@@ -331,7 +331,7 @@ struct Host {
 struct SysNested {
     #[metor_fsw(timestamp)]
     timestamp: Timestamp,
-    processes: FrameMap<Name<'static>, Host, 4>,
+    processes: FrameMap<Host, 4>,
 }
 
 fn put_u32(buf: &mut Vec<u8>, v: u32) {
@@ -389,7 +389,7 @@ struct SysBoth {
     #[metor_fsw(timestamp)]
     timestamp: Timestamp,
     procs: FrameList<Process, 8>,
-    hosts: FrameMap<Name<'static>, Process, 4, 16>,
+    hosts: FrameMap<Process, 4, 16>,
 }
 
 #[test]

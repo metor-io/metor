@@ -240,40 +240,18 @@ impl DlSystem {
         &self.params_schema
     }
 
-    /// Consume the handle into a bound, ready-to-init [`DlSlot`] (called by the
-    /// coordinator at `build()`): `fsw_create` the opaque state from the postcard
-    /// `params`, and capture the host-built per-port [`FswRing`] arrays the slot hands
-    /// `fsw_bind_init` at `init`. The `Arc<Library>` moves into the slot, so the `.so`
-    /// outlives the state.
+    /// Build a fresh [`DlSlot`] over this handle **without** consuming it: `fsw_create`
+    /// a new opaque state and **clone** the `Arc<Library>` so the [`DlSystem`] survives
+    /// for another build. The coordinator's build-time dl bind calls this once (and
+    /// drops the handle after); a [`SlotRunner`](crate::coordinator) calls it on every
+    /// `Load`/`Reset`, so the same loaded handle reloads N times, each `make_slot` → a
+    /// fresh `fsw_create` state over the slot's owned rings.
     ///
     /// # Safety
     /// Every region named by an `FswRing` in `inputs`/`outputs` must satisfy
     /// [`RingBuffer::attach_raw`](metor_fsw_ring::RingBuffer::attach_raw)'s contract —
     /// a live, header-valid ring region that outlives the slot (until its `Drop` calls
     /// `fsw_destroy`). The coordinator guarantees this by keeping the owning
-    /// `RingTable` alive past the slot.
-    pub(crate) unsafe fn into_slot(
-        self,
-        params: &[u8],
-        inputs: Vec<FswRing>,
-        outputs: Vec<FswRing>,
-        name: &'static str,
-    ) -> DlSlot {
-        // SAFETY: forwarded verbatim — the caller's `attach_raw` contract holds.
-        unsafe { self.make_slot(params, inputs, outputs, name) }
-    }
-
-    /// Build a fresh [`DlSlot`] over this handle **without** consuming it (the runtime
-    /// slot twin of [`into_slot`]): `fsw_create` a new opaque state and **clone** the
-    /// `Arc<Library>` so the [`DlSystem`] survives for the next Load. A [`SlotRunner`](crate::coordinator)
-    /// calls this on every `Load`/`Reset`, so the same loaded handle reloads N times,
-    /// each `make_slot` → a fresh `fsw_create` state over the slot's owned rings.
-    ///
-    /// # Safety
-    /// Same as [`into_slot`]: every region named by an `FswRing` in `inputs`/`outputs`
-    /// must satisfy [`RingBuffer::attach_raw`](metor_fsw_ring::RingBuffer::attach_raw)'s
-    /// contract — a live, header-valid ring region that outlives the slot (until its
-    /// `Drop` calls `fsw_destroy`). The coordinator guarantees this by keeping the owning
     /// `RingTable` alive past the slot.
     pub(crate) unsafe fn make_slot(
         &self,

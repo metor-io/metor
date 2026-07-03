@@ -31,6 +31,17 @@ pub(crate) const fn align_up(n: usize, a: usize) -> usize {
     (n + a - 1) & !(a - 1)
 }
 
+/// Pack a string into a fixed `N`-byte buffer plus its used length (truncating) —
+/// the ONE packing helper behind every fixed-size name/message field in the host
+/// frames (`LogLine`, `ProgressLine`, the coordinator/slot status names — C4).
+pub(crate) fn pack_str<const N: usize>(s: &str) -> ([u8; N], u8) {
+    let bytes = s.as_bytes();
+    let n = bytes.len().min(N);
+    let mut buf = [0u8; N];
+    buf[..n].copy_from_slice(&bytes[..n]);
+    (buf, n as u8)
+}
+
 /// Entry alignment for a map value type — at least 8 so each entry's `key_off`/
 /// `key_len` pair and value stay 8-byte aligned in the trailer.
 pub(crate) const fn entry_align<V>() -> usize {
@@ -132,21 +143,23 @@ impl<T, const MAX: usize> Metadatatize for FrameList<T, MAX> {
 
 /// A runtime-sized, name-keyed sequence of element frames (`processes.htop.pid`).
 /// `MAX` bounds the entry count and `MAX_KEY` the per-key length for buffer sizing.
-/// Keys must not contain `.` or be empty (rejected loudly at write time).
+/// Keys are `&str`s, validated at write time by [`MapWriter::insert`]
+/// (`crate::MapWriter`) — no `.`, non-empty — so there is no key type parameter
+/// (the former phantom `K` carried no behavior — C5).
 #[repr(transparent)]
 #[derive(Clone, Copy, Debug, IntoBytes, Immutable, KnownLayout, FromBytes)]
-pub struct FrameMap<K, V, const MAX: usize, const MAX_KEY: usize = 32> {
+pub struct FrameMap<V, const MAX: usize, const MAX_KEY: usize = 32> {
     slot: Slot,
-    _kv: PhantomData<(K, V)>,
+    _kv: PhantomData<V>,
 }
 
-impl<K, V, const MAX: usize, const MAX_KEY: usize> Default for FrameMap<K, V, MAX, MAX_KEY> {
+impl<V, const MAX: usize, const MAX_KEY: usize> Default for FrameMap<V, MAX, MAX_KEY> {
     fn default() -> Self {
         Self::EMPTY
     }
 }
 
-impl<K, V, const MAX: usize, const MAX_KEY: usize> FrameMap<K, V, MAX, MAX_KEY> {
+impl<V, const MAX: usize, const MAX_KEY: usize> FrameMap<V, MAX, MAX_KEY> {
     /// An empty map slot.
     pub const EMPTY: Self = Self {
         slot: Slot { trailer_off: 0, byte_len: 0 },
@@ -159,8 +172,8 @@ impl<K, V, const MAX: usize, const MAX_KEY: usize> FrameMap<K, V, MAX, MAX_KEY> 
     }
 }
 
-impl<K, V: AsVTable, const MAX: usize, const MAX_KEY: usize> AsVTable
-    for FrameMap<K, V, MAX, MAX_KEY>
+impl<V: AsVTable, const MAX: usize, const MAX_KEY: usize> AsVTable
+    for FrameMap<V, MAX, MAX_KEY>
 {
     fn vtable_fields(path: impl ComponentPath) -> impl Iterator<Item = FieldBuilder> {
         let prefix = path.to_name();
@@ -190,7 +203,7 @@ impl<K, V: AsVTable, const MAX: usize, const MAX_KEY: usize> AsVTable
     }
 }
 
-impl<K, V, const MAX: usize, const MAX_KEY: usize> Componentize for FrameMap<K, V, MAX, MAX_KEY> {
+impl<V, const MAX: usize, const MAX_KEY: usize> Componentize for FrameMap<V, MAX, MAX_KEY> {
     fn sink_columns(&self, _output: &mut impl Decomponentize) {}
 
     // Trailer budget: `MAX` entries at the entry stride, plus the name pool
@@ -199,7 +212,7 @@ impl<K, V, const MAX: usize, const MAX_KEY: usize> Componentize for FrameMap<K, 
         metor_fsw_ring::round_up8(MAX * map_stride::<V>() as usize + MAX * MAX_KEY);
 }
 
-impl<K, V, const MAX: usize, const MAX_KEY: usize> Decomponentize for FrameMap<K, V, MAX, MAX_KEY> {
+impl<V, const MAX: usize, const MAX_KEY: usize> Decomponentize for FrameMap<V, MAX, MAX_KEY> {
     type Error = core::convert::Infallible;
     fn apply_value(
         &mut self,
@@ -211,30 +224,8 @@ impl<K, V, const MAX: usize, const MAX_KEY: usize> Decomponentize for FrameMap<K
     }
 }
 
-impl<K, V, const MAX: usize, const MAX_KEY: usize> Metadatatize for FrameMap<K, V, MAX, MAX_KEY> {
+impl<V, const MAX: usize, const MAX_KEY: usize> Metadatatize for FrameMap<V, MAX, MAX_KEY> {
     fn metadata(_prefix: impl ComponentPath) -> impl Iterator<Item = ComponentMetadata> {
         core::iter::empty()
-    }
-}
-
-/// A map key newtype enforcing the dotted-name grammar at construction: no `.`
-/// (it would alias the path separator) and non-empty (an empty segment vanishes
-/// per the `PathHasher` rule, aliasing `a..b`). The realize path also rejects bad
-/// keys with `Error::InvalidComponentData`; this is the loud, write-time guard.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct Name<'a>(&'a str);
-
-impl<'a> Name<'a> {
-    /// Validates and wraps a key, returning `None` if it is empty or contains `.`.
-    pub fn new(s: &'a str) -> Option<Self> {
-        if s.is_empty() || s.contains('.') {
-            None
-        } else {
-            Some(Name(s))
-        }
-    }
-
-    pub fn as_str(&self) -> &'a str {
-        self.0
     }
 }
