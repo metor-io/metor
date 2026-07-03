@@ -1016,7 +1016,7 @@ impl SystemInput for SnapshotFanInIn {
         vec![crate::PortDesc::of::<Imu>().with_fan_in(crate::FanIn::Many)]
     }
     fn any_lapped(&self) -> bool {
-        self.imu.is_lapped()
+        self.imu.lap_fault()
     }
 }
 
