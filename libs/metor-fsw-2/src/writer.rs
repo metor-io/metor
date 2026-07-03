@@ -21,12 +21,18 @@ use crate::frame::Frame;
 /// 2 id + 1 req_id).
 const TABLE_BASE: usize = 8;
 
-/// Errors raised while building a frame's bytes.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum WriteError {
+/// A frame-builder **key** error, raised while building a frame's bytes.
+///
+/// Renamed from `WriteError` (S2): the ring transport has its own
+/// [`WriteError`](metor_fsw_ring::WriteError) — the one `Output::write` /
+/// `MsgOut::emit` return — and the two must not collide at the crate root.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
+pub enum KeyError {
     /// A map key contained `.`, which would alias the dotted-path grammar.
+    #[error("map key contains `.`, which would alias the dotted-path grammar")]
     DotInKey,
     /// A map key was empty (an empty segment vanishes per the `PathHasher` rule).
+    #[error("map key is empty (an empty segment vanishes per the PathHasher rule)")]
     EmptyKey,
 }
 
@@ -86,7 +92,7 @@ impl<F: Frame + IntoBytes + Immutable> FrameWriter<F> {
         &mut self,
         slot_off: usize,
         build: impl FnOnce(&mut MapWriter<V>),
-    ) -> Result<(), WriteError> {
+    ) -> Result<(), KeyError> {
         let mut mw = MapWriter::new();
         build(&mut mw);
         if let Some(err) = mw.error {
@@ -191,7 +197,7 @@ impl<T: IntoBytes + Immutable> ListWriter<T> {
 /// validated on insert; the first rejection is surfaced by [`FrameWriter::map`].
 pub struct MapWriter<V> {
     entries: Vec<(String, V)>,
-    error: Option<WriteError>,
+    error: Option<KeyError>,
 }
 
 impl<V: IntoBytes + Immutable> MapWriter<V> {
@@ -214,11 +220,11 @@ impl<V: IntoBytes + Immutable> MapWriter<V> {
     }
 }
 
-fn validate_key(key: &str) -> Result<(), WriteError> {
+fn validate_key(key: &str) -> Result<(), KeyError> {
     if key.is_empty() {
-        Err(WriteError::EmptyKey)
+        Err(KeyError::EmptyKey)
     } else if key.contains('.') {
-        Err(WriteError::DotInKey)
+        Err(KeyError::DotInKey)
     } else {
         Ok(())
     }

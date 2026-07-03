@@ -749,7 +749,7 @@ fn port_desc_msg_round_trips_both_arms() {
     assert_eq!(rd.on_lap, OnLap::Stop, "the override survived the wire");
     assert!(!rd.telemetered, "the opt-out survived the wire");
     // The reconstructed desc satisfies an edge against the static twin.
-    assert!(crate::compatible(&rd, &PortDesc::msg::<SequenceCommand>()));
+    assert!(crate::descriptor::compatible(&rd, &PortDesc::msg::<SequenceCommand>()));
 
     // Table arm — axes at their frame defaults.
     let d = PortDesc::of::<TickOut>();
@@ -764,6 +764,6 @@ fn port_desc_msg_round_trips_both_arms() {
     assert_eq!(rd.on_lap, OnLap::Stop);
     assert!(rd.telemetered);
     // Wiring compatibility runs over the carried unprefixed vtable, unchanged.
-    assert!(crate::compatible(&PortDesc::of::<TickOut>(), &rd));
-    assert!(crate::compatible(&rd, &PortDesc::of::<TickOut>()));
+    assert!(crate::descriptor::compatible(&PortDesc::of::<TickOut>(), &rd));
+    assert!(crate::descriptor::compatible(&rd, &PortDesc::of::<TickOut>()));
 }

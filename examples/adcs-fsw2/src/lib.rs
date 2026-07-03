@@ -24,7 +24,8 @@
 //! get the dlopen'd sim coordinator and compare it against a statically-linked build.
 
 use metor_fsw_2::wiring::Registry;
-use metor_fsw_2::{BuildOptions, Coordinator, build_artifacts, parse, resolve};
+use metor_fsw_2::wiring::{build_artifacts, parse, resolve};
+use metor_fsw_2::{BuildOptions, Coordinator};
 
 /// The mission wiring document, compiled into the test binary so the headless convergence
 /// check needs no on-disk path. This is the **same** file the CLI runner reads.

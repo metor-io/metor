@@ -29,10 +29,8 @@ use metor_fsw_2::metor_proto_wkt::{
     SequenceChannelEvent, SequenceCommand, SequenceCommandKind, SequenceEventKind, SequenceRegistry,
 };
 use metor_fsw_2::wiring::Registry;
-use metor_fsw_2::{
-    BuildOptions, Coordinator, Input, SequenceStatus, build_artifacts, parse, resolve,
-    split_record,
-};
+use metor_fsw_2::wiring::{build_artifacts, parse, resolve};
+use metor_fsw_2::{BuildOptions, Coordinator, Input, SequenceStatus, split_record};
 
 /// The mission wiring document — the same file the CLI runner and the other tests read.
 const MISSION_KDL: &str = include_str!("../mission.kdl");

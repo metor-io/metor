@@ -16,8 +16,8 @@ use metor_fsw_2::metor_proto_wkt::{
     SequenceChannelEvent, SequenceCommand, SequenceCommandKind, SequenceEventKind,
 };
 use metor_fsw_2::{
-    Frame, Input, SlotStatus, build_artifacts, parse, resolve, split_record,
-    wiring::{BuildOptions, LoadError, Registry},
+    Frame, Input, SlotStatus, split_record,
+    wiring::{BuildOptions, LoadError, Registry, build_artifacts, parse, resolve},
 };
 
 /// The seq-fixture's cargo crate name + cdylib library stem.
@@ -263,7 +263,8 @@ slot "gslot" {{
 
 #[test]
 fn slot_allow_params_resolve_and_run_b1() {
-    use metor_fsw_2::{DlSystem, ParamSource, SlotInitState, WiringBuilder, encode_kdl_params};
+    use metor_fsw_2::wiring::encode_kdl_params;
+    use metor_fsw_2::{DlSystem, ParamSource, SlotInitState, WiringBuilder};
 
     // Both canonical forms of occupant params.
     let line_form = param_slot_kdl(r#"allow occupant="gainer" gain=0.8"#);
