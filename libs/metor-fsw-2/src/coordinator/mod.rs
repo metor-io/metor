@@ -36,7 +36,8 @@ use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
 use crate::binder::{BindPorts, Binder, BoundInput, BoundPort};
 use crate::descriptor::compatible;
 use crate::descriptor::{
-    Delivery, FanIn, Hz, OnLap, PortDesc, PortId, PortSchema, SystemDescriptor, SystemKind,
+    Delivery, FanIn, Hz, OnLap, PortConn, PortDesc, PortId, PortSchema, SystemDescriptor,
+    SystemKind,
 };
 use crate::dynamic::FrameList;
 use crate::health::{HealthPort, Level};
@@ -216,6 +217,14 @@ pub enum WireError {
         system: &'static str,
         port: PortId,
     },
+    /// An edge targets a **host-connected** input (`PortConn::Host`/`SelfTap`, A3):
+    /// its counterpart is held by the system's runner (the slot runner's cancel
+    /// writer, a self-tap view over the system's own output), never an edge — a slot
+    /// occupant's `slot_control` is written by `Abort`, not by another system.
+    HostPort {
+        system: &'static str,
+        port: PortId,
+    },
     /// A non-delayed **Snapshot** edge points *backward* in registration order between
     /// two cyclic systems: the cyclic step loop runs in registration order, so the
     /// consumer would execute before its producer every cycle and permanently read the
@@ -319,6 +328,11 @@ impl std::fmt::Display for WireError {
                 "{system} input {port:?} declares FanIn::Many with Delivery::Snapshot: \
                  latest-wins across several producers is ill-defined — use Delivery::Log \
                  or FanIn::One"
+            ),
+            WireError::HostPort { system, port } => write!(
+                f,
+                "{system} input {port:?} is host-connected: its counterpart is held by \
+                 the system's runner, not an edge — remove the edge"
             ),
             WireError::StaleFrameEdge {
                 producer,
@@ -629,18 +643,6 @@ struct PendingAsync {
     wake_on_stop: Vec<Notifier>,
 }
 
-/// The per-slot auxiliary ports the build pass allocates ahead of the bind loop and
-/// hands to the [`SlotRunner`]: the host control/status writers' rings, the slot's
-/// message channel (the events `MsgOut`), and a read view on the occupant's own
-/// [`SequenceStatus`] output. Commands address the slot by its **instance name**
-/// (`docs/messages.md` §5), so no channel id is minted.
-struct SlotAux {
-    control_ring: RingBuffer<BoxBacking>,
-    status_ring: RingBuffer<BoxBacking>,
-    events: MsgOut<SequenceChannelEvent>,
-    seq_status: Input<SequenceStatus>,
-}
-
 // ---------------------------------------------------------------------------
 // Registration (type erasure of the boxed systems)
 // ---------------------------------------------------------------------------
@@ -761,7 +763,14 @@ impl CoordinatorBuilder {
             name: COORDINATOR_INSTANCE,
             kind: SystemKind::Cyclic,
             inputs: Vec::new(),
-            outputs: vec![PortDesc::msg_named::<SequenceCommand>("commands").untelemetered()],
+            // Host-connected: the coordinator itself holds the writer (the take-once
+            // control_handle) — a Host OUTPUT still accepts consumer edges, which is
+            // exactly how slots read it.
+            outputs: vec![
+                PortDesc::msg_named::<SequenceCommand>("commands")
+                    .untelemetered()
+                    .with_conn(PortConn::Host),
+            ],
             capabilities: Vec::new(),
         };
         b.descs.push(desc);
@@ -779,9 +788,11 @@ impl CoordinatorBuilder {
         SystemHandle { id: 0 }
     }
 
-    /// The registered descriptor of `handle` (the wiring loader reads back a slot's
-    /// registered contract and the coordinator's own bundle for edge resolution).
-    pub(crate) fn descriptor_of(&self, handle: SystemHandle) -> &SystemDescriptor {
+    /// The **registered** descriptor of `handle` — what `build()` validates, sizes,
+    /// and wires. For a slot this is the derived contract (`add_slot` docs), which a
+    /// front-end reads back instead of re-deriving; for everything else it is the
+    /// system's own `descriptor()`.
+    pub fn descriptor_of(&self, handle: SystemHandle) -> &SystemDescriptor {
         &self.descs[handle.id]
     }
 
@@ -908,19 +919,25 @@ impl CoordinatorBuilder {
     /// `(Load-name, opened DlSystem, postcard params)` a sequence occupant. `initial`
     /// optionally applies one at startup.
     ///
-    /// The registered descriptor is the occupant descriptor **with the trailing
-    /// `SlotControlIn` input removed**, so the existing `compatible()`/`WireError`
-    /// validation and ring sizing/allocation run over it unchanged: every registered
-    /// input is an ordinary edge-connected user input, every output a normally-allocated,
-    /// registry-tapped occupant output. The slot additionally owns a control ring (the
-    /// host writes the cancel frame, appended to the occupant's input array) and a
-    /// [`SlotStatus`] output ring. The returned handle's user ports `connect` exactly
-    /// like a system's.
+    /// The registered descriptor is derived from the occupant descriptor **by
+    /// extension, not surgery** (`docs/design-command-slots.md` §2.2): the occupant's
+    /// ports form the *prefix* of each list in the occupant's own order (its trailing
+    /// [`SlotControlIn`] input re-marked [`PortConn::Host`] in place — the runner
+    /// holds the cancel writer), and the runner's ports are the *tail*: a declared
+    /// `commands` `MsgIn<SequenceCommand>` fan-in (Edge — command wiring is ordinary
+    /// message wiring, §2.5) and a [`PortConn::SelfTap`] view over the occupant's own
+    /// [`SequenceStatus`] output on the input side; a [`SlotStatus`] output and the
+    /// `"sequences"` events channel (both `Host`, registry-tapped) on the output
+    /// side. [`SlotReg`] records the prefix split indices, so the bind arm maps the
+    /// occupant `FswRing` arrays as a straight prefix walk — the occupant-side
+    /// positional bind contract (and so the dl ABI) is untouched.
     ///
-    /// Panics if `allowed` is empty or an allowed occupant is not `compatible()` with the
-    /// first occupant's contract (a build-time wiring error — the slot derives its
-    /// contract from the allowed set's shared descriptor; v1 holds sequence occupants
-    /// only).
+    /// Panics on a build-time contract violation: `allowed` is empty, an allowed
+    /// occupant is not `compatible()` with the first occupant's contract, the
+    /// occupant is not a v1 sequence shape (no trailing `SlotControlIn` input /
+    /// `SequenceStatus` output), or `initial` names an occupant outside the allowed
+    /// set (W1b — the KDL front-end surfaces the same checks as clean `LoadError`s
+    /// before calling this).
     pub fn add_slot(
         &mut self,
         name: impl Into<String>,
@@ -949,29 +966,70 @@ impl CoordinatorBuilder {
                 allowed[0].0
             );
         }
+        // W1b: the builder path validates the initial occupant against the allowed
+        // set at build, like the resolve path's `UnknownInitialOccupant` — a typo
+        // would otherwise surface only as a runtime `Failed` event.
+        if let Some(init) = &initial {
+            assert!(
+                allowed.iter().any(|(n, _, _)| n == &init.occupant),
+                "initial occupant {:?} is not in the allowed set ({})",
+                init.occupant,
+                allowed
+                    .iter()
+                    .map(|(n, _, _)| n.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            );
+        }
 
         let name: String = name.into();
         // The registered descriptor name is the slot's instance name (a leaked
         // `&'static str` for the descriptor field + the `SlotRunner` identity).
         let leaked: &'static str = Box::leak(name.clone().into_boxed_str());
+
+        // --- Inputs: occupant prefix (SlotControlIn re-marked Host), runner tail ---
         let mut inputs = base.inputs.clone();
-        // Drop the trailing slot-owned `SlotControlIn` input (host-written, not edge-connected).
-        if inputs.last().map(|p| p.id) == Some(PortId::Component(SlotControlIn::FRAME_ID)) {
-            inputs.pop();
-        }
-        // The slot's declared command input (`docs/design-command-slots.md` §2.2/§2.5):
-        // an ordinary fan-in message input, so command wiring is ordinary message
-        // wiring — a producer commands this slot only over an explicit edge
-        // (`connect "<producer>" -> "<slot>" msg="SequenceCommand"`). Zero edges is
-        // legal (an autonomy-free, wiring-frozen slot receives no commands). The
-        // runner drains it at the head of each step; it is never handed to the
-        // occupant.
+        let control = inputs
+            .iter_mut()
+            .find(|p| p.id == PortId::Component(SlotControlIn::FRAME_ID))
+            .expect("a v1 sequence occupant declares the implicit SlotControlIn input");
+        // Host-connected: the RUNNER holds the cancel writer over a dedicated ring;
+        // the occupant reads it. Exempt from UnconnectedInput; edges are rejected.
+        control.conn = PortConn::Host;
+        let n_occ_inputs = inputs.len();
+        // The slot's declared command input (§2.5): an ordinary fan-in message
+        // input, so command wiring is ordinary message wiring — a producer commands
+        // this slot only over an explicit edge (`connect … msg="SequenceCommand"`).
+        // Zero edges is legal (an autonomy-free, wiring-frozen slot). The runner
+        // drains it at the head of each step; it is never handed to the occupant.
         inputs.push(PortDesc::msg::<SequenceCommand>());
+        // The runner's read view over the occupant's own SequenceStatus output
+        // (Progress lines + the terminal outcome): a declared self-tap — no ring,
+        // +1 fan-out on that output at sizing time.
+        let seq_status_id = PortId::Component(SequenceStatus::FRAME_ID);
+        assert!(
+            base.outputs.iter().any(|p| p.id == seq_status_id),
+            "a v1 sequence occupant publishes a SequenceStatus output"
+        );
+        inputs.push(PortDesc::of::<SequenceStatus>().with_conn(PortConn::SelfTap(seq_status_id)));
+
+        // --- Outputs: occupant prefix, runner tail (both Host, registry-tapped) ---
+        let mut outputs = base.outputs.clone();
+        let n_occ_outputs = outputs.len();
+        // Host-side slot telemetry: the RUNNER writes the phase/occupant frame each
+        // step; tapped like any output ("<slot>.slot_status").
+        outputs.push(PortDesc::of::<SlotStatus>().with_conn(PortConn::Host));
+        // The slot's events channel: the RUNNER emits a SequenceChannelEvent per
+        // lifecycle transition; keyed "<slot>.sequences" (msg_named), telemetered.
+        outputs.push(
+            PortDesc::msg_named::<SequenceChannelEvent>("sequences").with_conn(PortConn::Host),
+        );
+
         let registered = SystemDescriptor {
             name: leaked,
             kind: SystemKind::Cyclic,
             inputs,
-            outputs: base.outputs.clone(),
+            outputs,
             // Sequence occupants declare wired ports only (ReceiveAll is host-only).
             capabilities: Vec::new(),
         };
@@ -989,7 +1047,12 @@ impl CoordinatorBuilder {
         self.descs.push(registered);
         self.kinds.push(SystemKind::Cyclic);
         self.names.push(name);
-        self.regs.push(Reg::Slot(SlotReg { allowed, initial }));
+        self.regs.push(Reg::Slot(SlotReg {
+            allowed,
+            initial,
+            n_occ_inputs,
+            n_occ_outputs,
+        }));
         SystemHandle { id }
     }
 
@@ -1179,6 +1242,17 @@ impl CoordinatorBuilder {
                 });
             }
             let in_desc = &self.descs[c.system.id].inputs[in_idx];
+            // A host-connected input's counterpart is held by the system's runner
+            // (the slot's cancel writer, a self-tap over its own output) — an edge
+            // into it is rejected (A3). Host *outputs* keep accepting consumer edges:
+            // the coordinator's `commands` channel is exactly a Host output slots
+            // read over explicit edges.
+            if in_desc.conn != PortConn::Edge {
+                return Err(WireError::HostPort {
+                    system: self.descs[c.system.id].name,
+                    port: c.port,
+                });
+            }
             // `delayed` marks a one-cycle-late snapshot sample; on a Log input it is
             // meaningless and now rejected instead of silently ignored (A7).
             if *delayed && in_desc.delivery == Delivery::Log {
@@ -1264,10 +1338,14 @@ impl CoordinatorBuilder {
 
         // --- Input coverage: a FanIn::One input must be connected exactly once ---
         // (exactly-once is the edge pass above; existence is here). A FanIn::Many
-        // input may have zero producers (fan-in is optional, §3.2).
+        // input may have zero producers (fan-in is optional, §3.2); a non-Edge input
+        // is fed by its runner, never an edge (A3).
         for s in 0..n {
             for (in_idx, port) in self.descs[s].inputs.iter().enumerate() {
-                if port.fan_in == FanIn::One && !cons_edges.contains_key(&(s, in_idx)) {
+                if port.conn == PortConn::Edge
+                    && port.fan_in == FanIn::One
+                    && !cons_edges.contains_key(&(s, in_idx))
+                {
                     return Err(WireError::UnconnectedInput {
                         system: self.descs[s].name,
                         port: port.id,
@@ -1281,6 +1359,21 @@ impl CoordinatorBuilder {
         for producers in cons_edges.values() {
             for &(prod_id, out_idx) in producers {
                 *fan_out.entry((prod_id, out_idx)).or_insert(0) += 1;
+            }
+        }
+        // A declared self-tap (A3) is one more reader on the system's *own* output —
+        // counted here so the budget is explicit, not slack-covered.
+        for s in 0..n {
+            for port in &self.descs[s].inputs {
+                let PortConn::SelfTap(pid) = port.conn else {
+                    continue;
+                };
+                let out_idx = self.descs[s]
+                    .outputs
+                    .iter()
+                    .position(|o| o.id == pid)
+                    .expect("a SelfTap names one of the system's own outputs");
+                *fan_out.entry((s, out_idx)).or_insert(0) += 1;
             }
         }
 
@@ -1373,88 +1466,48 @@ impl CoordinatorBuilder {
             });
         }
 
-        // --- Slot aux rings (control input + SlotStatus output + events) -----
-        // Allocated *before* the registry freeze so the SlotStatus tap + the message
-        // channel land in their registries like any output. The control ring is
-        // host-written / occupant-read (uplink), so it is owned but not telemetered.
-        //
-        // This loop also builds the boot `SequenceRegistry` payload (`seq_specs`) once:
-        // one spec per slot, keyed by the slot's **instance name** — the channel's wire
-        // address (`docs/messages.md` §5); there is no build-order channel id.
-        let mut slot_aux: HashMap<usize, SlotAux> = HashMap::new();
-        let mut seq_specs: Vec<SequenceChannelSpec> = Vec::new();
-        // `s` indexes several disjoint collections (`regs`/`descs`/`names`/`output_rings`),
-        // so the range loop is clearer than zipping five iterators.
-        #[allow(clippy::needless_range_loop)]
+        // --- Dedicated rings for Host-connected inputs (A3) -------------------
+        // A Host input's counterpart is its runner's writer (the slot's cancel
+        // frame), so it gets its own ring instead of a producer edge: the occupant
+        // attaches one read `View` per Load (released on each Stop/Reset/Unload), so
+        // 1 reader slot + slack covers the reload cycle. No registry entry — it is
+        // inbound control, not an output. SelfTap inputs allocate nothing (they view
+        // the system's own output, already counted in `fan_out`).
+        let mut host_input_rings: HashMap<(usize, usize), RingBuffer<BoxBacking>> =
+            HashMap::new();
         for s in 0..n {
-            let Reg::Slot(slot_reg) = &self.regs[s] else {
-                continue;
-            };
-            let slot_name: &'static str = self.descs[s].name;
-            // One `SequenceChannelSpec` per slot: its instance name and the
-            // allowed-occupant names the panel may `Load` (`docs/messages.md` §5).
-            seq_specs.push(SequenceChannelSpec {
-                name: slot_name.to_string(),
-                available: slot_reg.allowed.iter().map(|a| a.name.clone()).collect(),
-            });
-            // SlotStatus: a normal output, sized for the registry consumers (+ slack);
-            // nothing edge-connects to it (fan-out 0).
-            let status_ring = coord_ring::<SlotStatus>(depth, n_reg + READER_SLACK);
-            let instance = self.names[s].clone();
-            let status_desc = PortDesc::of::<SlotStatus>();
-            reg_entries.push(registry_entry(&instance, &status_desc, status_ring.clone()));
-            table.rings.push(RingEntry {
-                ring: status_ring.clone(),
-                frame_id: SlotStatus::FRAME_ID,
-                role: BufferRole::Output {
-                    system: s,
-                    port: self.descs[s].outputs.len(),
-                },
-                instance: Some(instance.clone()),
-            });
-            // Control: the occupant attaches one `View` over it per Load (released on
-            // each Stop/Reset/Unload), so 1 reader slot + slack covers the reload cycle.
-            let control_ring = coord_ring::<SlotControlIn>(depth, 1 + READER_SLACK);
-            table.rings.push(RingEntry {
-                ring: control_ring.clone(),
-                frame_id: SlotControlIn::FRAME_ID,
-                role: BufferRole::Coordinator,
-                instance: None,
-            });
-            // Events: the slot's own message channel — a single-writer `MsgOut`, tapped
-            // by the registry consumers like an output (the downlink, W2).
-            let events_ring =
-                alloc_ring(Delivery::Log, MAX_MSG_BYTES, depth, n_reg + READER_SLACK);
-            let events = owned_writer(&events_ring);
-            let events_entry = postcard_entry(&instance, "sequences", events_ring.clone(), true);
-            table.rings.push(RingEntry {
-                ring: events_ring,
-                frame_id: events_entry.key,
-                role: BufferRole::Coordinator,
-                instance: Some(instance),
-            });
-            reg_entries.push(events_entry);
-            // A read view on the slot's *own* SequenceStatus output (one extra reader,
-            // covered by READER_SLACK) — the runner drains it for Progress + outcome.
-            let seq_idx = self.descs[s]
-                .outputs
-                .iter()
-                .position(|p| p.id == PortId::Component(SequenceStatus::FRAME_ID))
-                .expect("a v1 slot occupant publishes a SequenceStatus output");
-            let seq_status = Input::new(
-                output_rings[s][seq_idx]
-                    .view(NoWake, NoWake)
-                    .expect("SequenceStatus reader slot (READER_SLACK)"),
-            );
-            slot_aux.insert(
-                s,
-                SlotAux {
-                    control_ring,
-                    status_ring,
-                    events,
-                    seq_status,
-                },
-            );
+            for (in_idx, port) in self.descs[s].inputs.iter().enumerate() {
+                if port.conn != PortConn::Host {
+                    continue;
+                }
+                let ring = alloc_ring(port.delivery, port.max_size, depth, 1 + READER_SLACK);
+                table.rings.push(RingEntry {
+                    ring: ring.clone(),
+                    frame_id: port
+                        .id
+                        .component()
+                        .expect("v1 host-connected inputs are table ports"),
+                    role: BufferRole::Private {
+                        system: s,
+                        input: in_idx,
+                    },
+                    instance: Some(self.names[s].clone()),
+                });
+                host_input_rings.insert((s, in_idx), ring);
+            }
+        }
+
+        // --- Boot `SequenceRegistry` payload -----------------------------------
+        // One spec per slot, keyed by the slot's **instance name** — the channel's
+        // wire address (`docs/messages.md` §5); there is no build-order channel id.
+        let mut seq_specs: Vec<SequenceChannelSpec> = Vec::new();
+        for (s, reg) in self.regs.iter().enumerate() {
+            if let Reg::Slot(slot_reg) = reg {
+                seq_specs.push(SequenceChannelSpec {
+                    name: self.descs[s].name.to_string(),
+                    available: slot_reg.allowed.iter().map(|a| a.name.clone()).collect(),
+                });
+            }
         }
 
         // --- Coordinator-owned boot-`SequenceRegistry` message channel (§5) ---
@@ -1508,7 +1561,11 @@ impl CoordinatorBuilder {
                 continue;
             }
             for in_idx in 0..self.descs[s].inputs.len() {
-                if self.descs[s].inputs[in_idx].delivery == Delivery::Log {
+                // Only edge-connected Snapshot inputs are copy-in decoupled; a
+                // Host/SelfTap input is fed by its runner, not a producer edge (A3).
+                if self.descs[s].inputs[in_idx].delivery == Delivery::Log
+                    || self.descs[s].inputs[in_idx].conn != PortConn::Edge
+                {
                     continue;
                 }
                 let (prod_id, out_idx) = cons_edges[&(s, in_idx)][0];
@@ -1613,26 +1670,31 @@ impl CoordinatorBuilder {
                 // — only `init`/`Load` (runtime) does.
                 Reg::Slot(slot_reg) => {
                     use crate::abi::{FswRing, ROLE_INPUT, ROLE_OUTPUT};
-                    let SlotAux {
-                        control_ring,
-                        status_ring,
-                        events,
-                        seq_status,
-                    } = slot_aux.remove(&id).expect("slot aux rings allocated");
-                    // The registered inputs are the occupant's user inputs plus the
-                    // slot's own trailing `commands` fan-in (runner-drained, never
-                    // handed to the occupant) — split them here.
-                    let cmd_in_idx = self.descs[id]
-                        .inputs
-                        .iter()
-                        .position(|p| p.id == PortId::Packet(SequenceCommand::ID))
-                        .expect("a slot's registered descriptor declares its commands input");
-                    // The user inputs (registered descriptor) view their producers...
-                    let mut inputs: Vec<FswRing> = (0..self.descs[id].inputs.len())
-                        .filter(|in_idx| *in_idx != cmd_in_idx)
+                    let SlotReg {
+                        allowed,
+                        initial,
+                        n_occ_inputs,
+                        n_occ_outputs,
+                    } = slot_reg;
+                    let desc = &self.descs[id];
+                    // The prefix/tail invariant (§2.2): the occupant's ports are the
+                    // prefix of each registered list, in the occupant descriptor's own
+                    // order — so the occupant `FswRing` arrays are a straight prefix
+                    // map (Edge inputs view their producers; the Host `SlotControlIn`
+                    // input its dedicated ring) and the occupant-side positional bind
+                    // contract (the dl ABI) is untouched.
+                    let inputs: Vec<FswRing> = (0..n_occ_inputs)
                         .map(|in_idx| {
-                            let (prod_id, out_idx) = cons_edges[&(id, in_idx)][0];
-                            let (base, len) = output_rings[prod_id][out_idx].region();
+                            let (base, len) = match desc.inputs[in_idx].conn {
+                                PortConn::Edge => {
+                                    let (prod_id, out_idx) = cons_edges[&(id, in_idx)][0];
+                                    output_rings[prod_id][out_idx].region()
+                                }
+                                PortConn::Host => host_input_rings[&(id, in_idx)].region(),
+                                PortConn::SelfTap(_) => {
+                                    unreachable!("the occupant input prefix holds no self-tap")
+                                }
+                            };
                             FswRing {
                                 base,
                                 len,
@@ -1640,17 +1702,9 @@ impl CoordinatorBuilder {
                             }
                         })
                         .collect();
-                    // ...then the slot-owned control region, matching the occupant's
-                    // descriptor order `[user inputs…, SlotControlIn]`.
-                    let (cbase, clen) = control_ring.region();
-                    inputs.push(FswRing {
-                        base: cbase,
-                        len: clen,
-                        role: ROLE_INPUT,
-                    });
-                    // Outputs = the slot's own buffers (user outputs + SequenceStatus +
-                    // health + log), the registered descriptor's outputs in order.
-                    let outputs: Vec<FswRing> = (0..self.descs[id].outputs.len())
+                    // Occupant outputs = the prefix of the slot's own buffers (user
+                    // outputs + SequenceStatus + health + log, in descriptor order).
+                    let outputs: Vec<FswRing> = (0..n_occ_outputs)
                         .map(|out_idx| {
                             let (base, len) = output_rings[id][out_idx].region();
                             FswRing {
@@ -1660,10 +1714,28 @@ impl CoordinatorBuilder {
                             }
                         })
                         .collect();
+
+                    // --- The runner's tail ports, located by their declared shape ---
+                    // Host cancel writer over the SlotControlIn input's dedicated ring.
+                    let control_in_idx = desc.inputs[..n_occ_inputs]
+                        .iter()
+                        .position(|p| p.conn == PortConn::Host)
+                        .expect("a slot declares its Host SlotControlIn input");
+                    let control = slot_writer::<SlotControlIn>(
+                        &host_input_rings[&(id, control_in_idx)],
+                    );
                     // The slot's command fan-in: one view per producer explicitly
                     // edged into the declared `commands` input (A2 — no type-keyed
                     // broadcast; zero edges is a legal, command-less slot). The
                     // `SlotRunner` drains + filters by its instance name each step.
+                    let cmd_in_idx = desc
+                        .inputs
+                        .iter()
+                        .position(|p| {
+                            p.conn == PortConn::Edge
+                                && p.id == PortId::Packet(SequenceCommand::ID)
+                        })
+                        .expect("a slot's registered descriptor declares its commands input");
                     let commands = MsgIn::from_views(
                         cons_edges
                             .get(&(id, cmd_in_idx))
@@ -1679,14 +1751,53 @@ impl CoordinatorBuilder {
                             })
                             .unwrap_or_default(),
                     );
+                    // The declared self-tap over the occupant's own SequenceStatus
+                    // output (+1 fan-out counted at sizing) — Progress + outcome.
+                    let seq_tap = desc
+                        .inputs
+                        .iter()
+                        .find_map(|p| match p.conn {
+                            PortConn::SelfTap(pid) => Some(pid),
+                            _ => None,
+                        })
+                        .expect("a slot declares its SequenceStatus self-tap");
+                    let seq_out_idx = desc
+                        .outputs
+                        .iter()
+                        .position(|o| o.id == seq_tap)
+                        .expect("a SelfTap names one of the slot's own outputs");
+                    let seq_status = Input::new(
+                        output_rings[id][seq_out_idx]
+                            .view(NoWake, NoWake)
+                            .expect("SequenceStatus self-tap reader (fan-out sized)"),
+                    );
+                    // Host writers over the runner's declared output tail: SlotStatus
+                    // + the "sequences" events channel (real output indices now — no
+                    // off-by-the-end BufferRole, no side allocation).
+                    let status_out_idx = desc
+                        .outputs
+                        .iter()
+                        .position(|o| o.id == PortId::Component(SlotStatus::FRAME_ID))
+                        .expect("a slot declares its Host SlotStatus output");
+                    let status_out =
+                        slot_writer::<SlotStatus>(&output_rings[id][status_out_idx]);
+                    let events_out_idx = desc
+                        .outputs
+                        .iter()
+                        .position(|o| o.id == PortId::Packet(SequenceChannelEvent::ID))
+                        .expect("a slot declares its Host events output");
+                    let events = owned_writer::<SequenceChannelEvent>(
+                        &output_rings[id][events_out_idx],
+                    );
+
                     let runner = SlotRunner::new(
                         self.descs[id].name,
-                        slot_reg.allowed,
-                        slot_reg.initial,
+                        allowed,
+                        initial,
                         inputs,
                         outputs,
-                        slot_writer::<SlotControlIn>(&control_ring),
-                        slot_writer::<SlotStatus>(&status_ring),
+                        control,
+                        status_out,
                         events,
                         seq_status,
                         commands,

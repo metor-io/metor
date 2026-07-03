@@ -895,3 +895,110 @@ fn command_output_with_an_edge_drives_the_slot() {
     );
     assert_eq!(phases.last(), Some(&DONE), "and it ran to Done: {phases:?}");
 }
+
+// ---------------------------------------------------------------------------
+// 9. A3 — the slot's registered descriptor is derived by extension: occupant
+//    prefix (SlotControlIn re-marked Host in place), runner tail (commands fan-in,
+//    SequenceStatus self-tap; SlotStatus + "sequences" Host outputs). Host/SelfTap
+//    inputs reject edges; the builder path validates the initial occupant (W1b).
+// ---------------------------------------------------------------------------
+
+#[test]
+fn registered_descriptor_is_the_extended_occupant_shape() {
+    use metor_fsw_2::{
+        Delivery, FanIn, Frame, PortConn, PortId, SequenceStatus as SeqStatusFrame,
+    };
+    use metor_fsw_2::metor_proto::types::Msg;
+    let Some(lib) = locate_fixture() else {
+        return;
+    };
+    let loaded = open_waiter(&lib);
+
+    let mut b = Coordinator::builder(sim_config());
+    let slot = b.add_slot("adcs", vec![("waiter".into(), loaded, Vec::new())], None);
+    let d = b.descriptor_of(slot);
+    assert_eq!(d.name, "adcs", "registered under the slot's instance name");
+
+    // waiter has no user ports: inputs = [slot_control (Host), commands (Edge,
+    // fan-in), sequence self-tap]; outputs = [sequence, health, log (occupant
+    // prefix), slot_status (Host), sequences events (Host)].
+    let ins: Vec<(&str, PortConn)> = d.inputs.iter().map(|p| (p.name, p.conn)).collect();
+    assert_eq!(ins.len(), 3, "{ins:?}");
+    assert_eq!(ins[0], ("slot_control", PortConn::Host), "{ins:?}");
+    assert_eq!(ins[1].0, "SequenceCommand");
+    assert_eq!(ins[1].1, PortConn::Edge);
+    assert_eq!(d.inputs[1].fan_in, FanIn::Many);
+    assert_eq!(d.inputs[1].delivery, Delivery::Log);
+    assert_eq!(
+        ins[2].1,
+        PortConn::SelfTap(PortId::Component(SeqStatusFrame::FRAME_ID)),
+        "{ins:?}"
+    );
+
+    let outs: Vec<(&str, PortConn)> = d.outputs.iter().map(|p| (p.name, p.conn)).collect();
+    assert_eq!(outs.len(), 5, "{outs:?}");
+    assert_eq!(outs[0], ("sequence", PortConn::Edge), "occupant prefix: {outs:?}");
+    assert_eq!(outs[1], ("health", PortConn::Edge), "{outs:?}");
+    assert_eq!(outs[2], ("log", PortConn::Edge), "{outs:?}");
+    assert_eq!(outs[3], ("slot_status", PortConn::Host), "{outs:?}");
+    // The events channel keys "<slot>.sequences" and stays telemetered.
+    assert_eq!(outs[4], ("sequences", PortConn::Host), "{outs:?}");
+    assert_eq!(
+        d.outputs[4].id,
+        PortId::Packet(metor_fsw_2::metor_proto_wkt::SequenceChannelEvent::ID)
+    );
+    assert!(d.outputs[4].telemetered, "the events channel is downlinked");
+}
+
+#[test]
+fn edge_into_a_host_connected_input_is_rejected() {
+    use metor_fsw_2::{SequenceStatus as SeqStatusFrame, WireError};
+    #[allow(unused_imports)]
+    use metor_fsw_2::Frame;
+    let Some(lib) = locate_fixture() else {
+        return;
+    };
+
+    // Slot A's occupant-bound SequenceStatus output shares its PortId with slot B's
+    // SequenceStatus SELF-TAP input — the only edge-addressable non-Edge input — so
+    // this connect must fail as a HostPort, never bind a foreign producer into a
+    // runner-held view.
+    let mut b = Coordinator::builder(sim_config());
+    let a = b.add_slot("a", vec![("waiter".into(), open_waiter(&lib), Vec::new())], None);
+    let bslot = b.add_slot("b", vec![("waiter".into(), open_waiter(&lib), Vec::new())], None);
+    b.connect(
+        PortRef::new::<SeqStatusFrame>(a),
+        PortRef::new::<SeqStatusFrame>(bslot),
+    )
+    .expect("push_edge only checks ids");
+    let err = b.build().err().expect("an edge into a self-tap input fails");
+    match err {
+        WireError::HostPort { system, .. } => assert_eq!(system, "b"),
+        other => panic!("expected HostPort, got {other:?}"),
+    }
+}
+
+#[test]
+fn builder_initial_occupant_outside_allowed_set_panics() {
+    use metor_fsw_2::InitialOccupant;
+    use std::panic::AssertUnwindSafe;
+    let Some(lib) = locate_fixture() else {
+        return;
+    };
+    let loaded = open_waiter(&lib);
+
+    // W1b: the builder path validates the initial occupant against the allowed set
+    // at build (the KDL path surfaces the same as UnknownInitialOccupant).
+    let mut b = Coordinator::builder(sim_config());
+    let result = std::panic::catch_unwind(AssertUnwindSafe(|| {
+        b.add_slot(
+            "adcs",
+            vec![("waiter".into(), loaded, Vec::new())],
+            Some(InitialOccupant::loaded("nonesuch")),
+        )
+    }));
+    assert!(
+        result.is_err(),
+        "an initial occupant outside the allowed set is a build-time contract panic"
+    );
+}

@@ -1103,12 +1103,18 @@ fn resolve_slot(
     let registered = builder.descriptor_of(handle).clone();
 
     // Validate the declared user-port contract: every declared `input`/`output` frame name
-    // must name a registered user port (the explicit-contract check, Resolved Q4). The
-    // registered inputs are the user inputs plus the slot's own `commands` fan-in; the
-    // outputs include the implicit `SequenceStatus`/health/log tail — a declaration may
-    // name those but need not.
+    // must name an **edge-connected** registered port (the explicit-contract check,
+    // Resolved Q4) — the runner-held tail (the Host `slot_control`/`slot_status`/
+    // `sequences`, the `SequenceStatus` self-tap) is not part of the user contract.
+    // The Edge outputs include the implicit `SequenceStatus`/health/log tail, which a
+    // declaration may name but need not.
+    use crate::descriptor::PortConn;
     for frame in &slot.inputs {
-        if !registered.inputs.iter().any(|p| p.name == frame) {
+        if !registered
+            .inputs
+            .iter()
+            .any(|p| p.conn == PortConn::Edge && p.name == frame)
+        {
             return Err(LoadError::SlotContractMismatch {
                 slot: slot.name.clone(),
                 dir: "input",
@@ -1119,7 +1125,11 @@ fn resolve_slot(
         }
     }
     for frame in &slot.outputs {
-        if !registered.outputs.iter().any(|p| p.name == frame) {
+        if !registered
+            .outputs
+            .iter()
+            .any(|p| p.conn == PortConn::Edge && p.name == frame)
+        {
             return Err(LoadError::SlotContractMismatch {
                 slot: slot.name.clone(),
                 dir: "output",

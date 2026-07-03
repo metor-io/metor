@@ -124,6 +124,31 @@ pub enum OnLap {
     Resync,
 }
 
+/// Who provides the other end of this port (`docs/design-command-slots.md` §2.1) —
+/// a fifth axis beside schema × delivery × fan-in × on-lap.
+///
+/// Not carried across the dl ABI: a dlopen'd system's ports are always
+/// edge-connected (`Host`/`SelfTap` are host-runner constructs — the slot runner's
+/// control/status/events ports, the coordinator's own bundle).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum PortConn {
+    /// Edge-connected (the default): wired by `connect` / KDL edges under the
+    /// fan-in axis rules.
+    Edge,
+    /// Host-connected: the system's *runner* (the slot runner, or the coordinator
+    /// itself) holds the port's counterpart — the writer of an input's dedicated
+    /// ring, or the writer of an output ring the bind walk would otherwise hand to
+    /// the system. A Host **output** is still ring-allocated and registry-tapped
+    /// like any output (and may be consumed over ordinary edges); a Host **input**
+    /// gets a dedicated ring, is exempt from `UnconnectedInput`, and rejects edges
+    /// (`WireError::HostPort`).
+    Host,
+    /// A declared reader over one of this system's *own* outputs, named by
+    /// [`PortId`]. Allocates no ring; adds +1 to that output's fan-out; the view
+    /// goes to the runner. Inputs only; rejects edges (`WireError::HostPort`).
+    SelfTap(PortId),
+}
+
 /// A non-port resource a system needs from the host at bind time
 /// (`docs/design-port-unification.md` §2.5). Unlike a port it reserves no ring and
 /// connects no edge — it is granted, not wired.
@@ -217,6 +242,9 @@ pub struct PortDesc {
     /// Output-side: whether the downlink / `AllOutputs` taps this port (A6). A plain
     /// field on *every* port — frames get the opt-out too.
     pub telemetered: bool,
+    /// Axis 5 — who provides the other end ([`PortConn::Edge`] everywhere except the
+    /// slot runner's and coordinator's own bundles).
+    pub conn: PortConn,
 }
 
 impl std::fmt::Debug for PortDesc {
@@ -236,7 +264,8 @@ impl std::fmt::Debug for PortDesc {
         s.field("delivery", &self.delivery)
             .field("fan_in", &self.fan_in)
             .field("on_lap", &self.on_lap)
-            .field("telemetered", &self.telemetered);
+            .field("telemetered", &self.telemetered)
+            .field("conn", &self.conn);
         s.finish()
     }
 }
@@ -272,6 +301,7 @@ impl PortDesc {
             fan_in: FanIn::One,
             on_lap: OnLap::Stop,
             telemetered: true,
+            conn: PortConn::Edge,
         }
     }
 
@@ -288,6 +318,7 @@ impl PortDesc {
             fan_in: FanIn::Many,
             on_lap: OnLap::Resync,
             telemetered: true,
+            conn: PortConn::Edge,
         }
     }
 
@@ -315,6 +346,13 @@ impl PortDesc {
     /// Override the lap policy (axis 4).
     pub fn with_on_lap(mut self, p: OnLap) -> Self {
         self.on_lap = p;
+        self
+    }
+
+    /// Override the port-connection axis (axis 5) — used only by the slot runner's
+    /// and coordinator's own bundle derivations; user ports stay [`PortConn::Edge`].
+    pub fn with_conn(mut self, c: PortConn) -> Self {
+        self.conn = c;
         self
     }
 
