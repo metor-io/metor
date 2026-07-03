@@ -17,7 +17,7 @@ use metor_proto::types::LenPacket;
 use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
 
 use crate::binder::RingSource;
-use crate::descriptor::PortDesc;
+use crate::descriptor::{OnLap, PortDesc};
 use crate::dynamic::Slot;
 use crate::frame::Frame;
 use crate::reader::{ListReader, MapReader};
@@ -37,6 +37,42 @@ pub fn capacity_for(max_size: usize, depth: usize) -> usize {
 /// As [`capacity_for`] but reading the worst-case size straight from the frame type.
 pub fn buffer_capacity<F: Frame>(depth: usize) -> usize {
     capacity_for(F::MAX_SIZE, depth)
+}
+
+/// THE shared drain loop (C4): drain `view` into `scratch`, calling `f` once per
+/// committed record. On a lap, apply `on_lap` — [`OnLap::Resync`] skips to the live
+/// edge and keeps draining; [`OnLap::Stop`] stops draining immediately. Returns
+/// whether a lap was **observed** (raw, policy-free — the caller derives its
+/// `lap_fault` from its own policy, so a Resync port can still latch the
+/// observation for diagnostics).
+///
+/// Used by [`Input::latest`]/[`Input::drain`], [`MsgIn::drain`](crate::MsgIn), the
+/// coordinator's copy-in jobs, and both telemetry tap lanes.
+pub(crate) fn drain_view<B, RD, RS>(
+    view: &mut View<B, RD, RS>,
+    scratch: &mut Vec<u8>,
+    on_lap: OnLap,
+    mut f: impl FnMut(&[u8]),
+) -> bool
+where
+    B: Backing,
+    RD: WakeSink,
+    RS: WakeSource,
+{
+    let mut lapped = false;
+    loop {
+        match view.try_read_into(scratch) {
+            Ok(true) => f(scratch),
+            Ok(false) => return lapped,
+            Err(_) => {
+                lapped = true;
+                match on_lap {
+                    OnLap::Resync => view.resync(),
+                    OnLap::Stop => return lapped,
+                }
+            }
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -263,32 +299,31 @@ where
     /// the freshest already-read record keeps being served. Lossless/async callers
     /// that must see the error use [`recv`](Self::recv)/[`drain`](Self::drain).
     pub fn latest(&mut self) -> Option<FrameRef<'_, F>> {
-        loop {
-            match self.view.try_read_into(&mut self.scratch) {
-                Ok(true) => self.have = true,
-                Ok(false) => break,
-                Err(_) => {
-                    self.lapped = true;
-                    self.view.resync();
-                }
-            }
-        }
+        let Self {
+            view,
+            scratch,
+            have,
+            lapped,
+            ..
+        } = self;
+        *lapped |= drain_view(view, scratch, OnLap::Resync, |_| *have = true);
         self.have.then(|| FrameRef::new(&self.scratch))
     }
 
     /// Process **every** record since the last drain, in order (for command / event
     /// channels that cannot drop a record). Stops and returns `Err` on lap.
     pub fn drain(&mut self, mut f: impl FnMut(FrameRef<'_, F>)) -> Result<(), ReadError> {
-        loop {
-            match self.view.try_read_into(&mut self.scratch) {
-                Ok(true) => {
-                    self.have = true;
-                    f(FrameRef::new(&self.scratch));
-                }
-                Ok(false) => return Ok(()),
-                Err(e) => return Err(e),
-            }
-        }
+        let Self {
+            view,
+            scratch,
+            have,
+            ..
+        } = self;
+        let lapped = drain_view(view, scratch, OnLap::Stop, |rec| {
+            *have = true;
+            f(FrameRef::new(rec));
+        });
+        if lapped { Err(ReadError::Lapped) } else { Ok(()) }
     }
 
     /// Await the next record (event-driven async systems, system.md §3.2). Backed by

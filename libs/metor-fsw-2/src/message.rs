@@ -308,23 +308,14 @@ where
     /// `docs/messages.md` §3).
     pub fn drain(&mut self, mut f: impl FnMut(M)) {
         for view in &mut self.views {
-            loop {
-                match view.try_read_into(&mut self.scratch) {
-                    Ok(true) => {
-                        if let Some((id, payload)) = split_record(&self.scratch)
-                            && id == M::ID
-                            && let Ok(msg) = postcard::from_bytes::<M>(payload)
-                        {
-                            f(msg);
-                        }
-                    }
-                    Ok(false) => break,
-                    Err(_) => {
-                        view.resync();
-                        break;
-                    }
+            crate::port::drain_view(view, &mut self.scratch, crate::OnLap::Resync, |rec| {
+                if let Some((id, payload)) = split_record(rec)
+                    && id == M::ID
+                    && let Ok(msg) = postcard::from_bytes::<M>(payload)
+                {
+                    f(msg);
                 }
-            }
+            });
         }
     }
 }
