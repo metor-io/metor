@@ -689,12 +689,17 @@ producers' records are present when the slot drains at the head of its step. The
 
 ## 7. Migration / impact
 
-**ABI impact: none.** Every change is host-side (`docs/messages.md` §6 confirmed against the
-code: occupant `fsw_*`, `FSW_ABI_VERSION`, and `RawBinder` are untouched). Message rings remain
-plain byte rings; the slot's new `MsgIn` is host-owned in `SlotRunner`. The `RawBinder`
-(`src/abi/mod.rs`) never sees message ports (a dlopen'd system cannot declare `MsgOut`/`MsgIn` —
-`command_out`/registries already panic for non-host sources, `src/binder.rs:139,148,159`; the
-new message-port `bind` paths are host-only the same way).
+**ABI impact: none** (at the time of this wave). Every change was host-side
+(`docs/messages.md` §6 confirmed against the code: occupant `fsw_*`, `FSW_ABI_VERSION`, and
+`RawBinder` were untouched). Message rings remain plain byte rings; the slot's new `MsgIn` is
+host-owned in `SlotRunner`.
+
+> **Superseded by the port unification (A1/C7,** `docs/design-port-unification.md` **§7):**
+> `PortDescMsg` is now schema-tagged (`PortSchemaMsg::Table | Postcard`) and carries the
+> behavior axes + `telemetered`, so a dlopen'd system **can** declare `MsgOut`/`MsgIn` ports —
+> `RawBinder` binds them positionally like any port (the dl fixture exercises a Postcard
+> output end-to-end). Only the host *capabilities* (`AllOutputs`/`ReceiveAll`, the registry
+> pull) remain host-only: a `.so` declaring one is rejected at load.
 
 ### 7.1 Deletions (with file:line) and replacements
 

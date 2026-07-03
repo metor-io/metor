@@ -166,10 +166,11 @@ telemetry schema from the metadata the descriptor carries (see
 
 ### Version word
 
-`FSW_ABI_VERSION` is a single monotonic `u32` (currently `1`), exported as `fsw_abi_version`.
-The host checks it for equality before any other call. It is bumped on any change to the C
-surface or the `*Msg` wire structs. A mismatch fails the load cleanly as
-`DlError::VersionMismatch` — never a crash.
+`FSW_ABI_VERSION` is a single monotonic `u32` (currently `3` — the version-history comment on
+the constant in `src/abi/mod.rs` is the changelog), exported as `fsw_abi_version`. The host
+checks it for equality before any other call. It is bumped on any change to the C surface or
+the `*Msg` wire structs — exactly once per released ABI shape. A mismatch fails the load
+cleanly as `DlError::VersionMismatch` — never a crash.
 
 This layers on the ring's own guards: the region header stamps an `arch_tag` (pointer width +
 endianness), so `attach_raw` rejects a foreign-arch region at the header handshake, and the
@@ -235,19 +236,35 @@ contract.
 
 ## The serialized descriptor
 
-`PortDesc` cannot cross by value: its `announce` field is a closure over the frame type `F`
-(it produces the prefixed `VTable` + metadata for telemetry), and `F` does not exist on the
-host side of the boundary. So the `.so` serializes mirrors that drop the closure and carry the
-data the host needs to reconstruct everything:
+`PortDesc` cannot cross by value: a Table port's `announce` field is a closure over the frame
+type `F` (it produces the prefixed `VTable` + metadata for telemetry), and `F` does not exist
+on the host side of the boundary. So the `.so` serializes mirrors of the unified descriptor
+(`docs/design-port-unification.md`) that drop the closure and carry the data the host needs
+to reconstruct everything — schema-tagged, so a `.so` declares message ports exactly like a
+static system:
 
 ```rust
 #[derive(Serialize, Deserialize)]
+pub enum PortSchemaMsg {
+    Table {
+        frame_id: ComponentId,
+        vtable:   VTable,                  // unprefixed; what compatible() validates against
+        metadata: Vec<ComponentMetadata>,  // unprefixed; lets the host re-derive `announce`
+    },
+    Postcard {
+        id: PacketId,                      // self-describing — the 2-byte id IS the schema
+    },
+}
+
+#[derive(Serialize, Deserialize)]
 pub struct PortDescMsg {
-    pub frame_id:   ComponentId,
-    pub frame_name: String,                 // was &'static str
-    pub vtable:     VTable,                  // unprefixed; what compatible() validates against
-    pub max_size:   usize,
-    pub metadata:   Vec<ComponentMetadata>, // unprefixed; lets the host re-derive `announce`
+    pub name:        String,              // F::NAME / M::NAME (was &'static str)
+    pub max_size:    usize,
+    pub schema:      PortSchemaMsg,       // axis 1
+    pub delivery:    Delivery,            // axis 2 — Snapshot | Log
+    pub fan_in:      FanIn,               // axis 3 — One | Many
+    pub on_lap:      OnLap,               // axis 4 — Stop | Resync
+    pub telemetered: bool,                // the downlink/AllOutputs opt-out (A6)
 }
 
 #[derive(Serialize, Deserialize)]
@@ -256,21 +273,26 @@ pub struct SystemDescriptorMsg {
     pub kind:    SystemKind,
     pub inputs:  Vec<PortDescMsg>,
     pub outputs: Vec<PortDescMsg>,
-    pub params_schema: OwnedNamedType,       // <Params as postcard_schema::Schema>::SCHEMA
+    pub params_schema: OwnedNamedType,     // <Params as postcard_schema::Schema>::SCHEMA
+    pub capabilities: Vec<Capability>,     // host-only; non-empty is REJECTED at load (v1)
 }
 ```
 
 Serialization is **postcard** (the format `VTable`'s derives already target). `fsw_describe`
-lowers the system's static `SystemDescriptor` (deriving each port's unprefixed vtable +
-metadata by calling its `announce` with the empty prefix), postcard-encodes the
-`SystemDescriptorMsg`, and hands the bytes to the host `ByteSink`. The host deserializes it,
-calls `SystemDescriptorMsg::into_descriptor()` to rebuild a `SystemDescriptor` — reconstructing
-each `PortDesc` and synthesizing the missing `announce` closure from the carried metadata —
-and feeds that descriptor to the existing builder path. The frame name and system name are
-`Box::leak`ed once at load to recover the `&'static str` the wiring path expects.
+lowers the system's static `SystemDescriptor` (deriving each Table port's unprefixed vtable +
+metadata by calling its `announce` with the empty prefix; a Postcard port lowers to its bare
+id), postcard-encodes the `SystemDescriptorMsg`, and hands the bytes to the host `ByteSink`.
+The host deserializes it, rejects a non-empty `capabilities` list (`ReceiveAll` needs the host
+registry, which cannot cross the ABI — `DlError::UnsupportedCapabilities`), and calls
+`SystemDescriptorMsg::into_descriptor()` to rebuild a `SystemDescriptor` — reconstructing each
+`PortDesc` with its carried axes and synthesizing the missing `announce` closure from a Table
+port's metadata — and feeds that descriptor to the existing builder path. The port name and
+system name are `Box::leak`ed once at load to recover the `&'static str` the wiring path
+expects.
 
-The unprefixed `vtable` on each reconstructed `PortDesc` is exactly what `compatible()` needs,
-so **wiring validation runs unchanged** on a dlopen'd system.
+The unprefixed `vtable` on each reconstructed Table `PortDesc` is exactly what `compatible()`
+needs (a Postcard edge is pure id equality), so **wiring validation runs unchanged** on a
+dlopen'd system.
 
 `params_schema` is the load-bearing piece behind the single-encoding params model: it lets the
 host **encode a system's params without linking that system's `Params` type** (see

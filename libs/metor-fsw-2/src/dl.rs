@@ -86,6 +86,11 @@ pub enum DlError {
     /// The postcard-encoded [`SystemDescriptorMsg`] could not be decoded.
     #[error("failed to decode the system descriptor: {0}")]
     Decode(#[source] postcard::Error),
+    /// The `.so` declares host [`Capability`](crate::Capability)s. Every v1
+    /// capability is host-only (`ReceiveAll` needs the host registry, which cannot
+    /// cross the ABI), so a non-empty list is rejected at load.
+    #[error("shared object declares host-only capabilities {0:?}; a dlopen'd system cannot hold them")]
+    UnsupportedCapabilities(Vec<crate::Capability>),
 }
 
 // ---------------------------------------------------------------------------
@@ -111,6 +116,17 @@ pub struct DlSystem {
     execute: ExecuteFn,
     shutdown: ShutdownFn,
     destroy: DestroyFn,
+}
+
+/// v1 gate: every [`Capability`](crate::Capability) is host-only (`ReceiveAll`
+/// needs the host registry, which cannot cross the ABI), so a decoded descriptor
+/// declaring any is a clean load rejection — never a bind-time panic.
+fn reject_capabilities(msg: SystemDescriptorMsg) -> Result<SystemDescriptorMsg, DlError> {
+    if msg.capabilities.is_empty() {
+        Ok(msg)
+    } else {
+        Err(DlError::UnsupportedCapabilities(msg.capabilities))
+    }
 }
 
 /// The host [`ByteSink`] `fsw_describe` writes its postcard bytes to: append them to
@@ -181,6 +197,7 @@ impl DlSystem {
             }
             let msg: SystemDescriptorMsg =
                 postcard::from_bytes(&buf).map_err(DlError::Decode)?;
+            let msg = reject_capabilities(msg)?;
             let params_schema = msg.params_schema.clone();
             (msg.into_descriptor(), params_schema)
         };
@@ -441,5 +458,33 @@ impl Drop for DlSlot {
             unsafe { (self.destroy)(self.state) };
             self.state = core::ptr::null_mut();
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A `.so` descriptor declaring a host capability is rejected at load (C7): every
+    /// v1 capability is host-only, and the failure is a clean `DlError`, not a
+    /// bind-time panic. An empty list (every real export) passes through.
+    #[test]
+    fn load_rejects_declared_capabilities() {
+        let mk = |capabilities| SystemDescriptorMsg {
+            name: "rogue".to_string(),
+            kind: crate::SystemKind::Cyclic,
+            inputs: Vec::new(),
+            outputs: Vec::new(),
+            params_schema: OwnedNamedType::from(<() as postcard_schema::Schema>::SCHEMA),
+            capabilities,
+        };
+
+        assert!(reject_capabilities(mk(Vec::new())).is_ok());
+        let err = reject_capabilities(mk(vec![crate::Capability::ReceiveAll]))
+            .expect_err("host-only capability rejected");
+        assert!(
+            matches!(&err, DlError::UnsupportedCapabilities(c) if c == &[crate::Capability::ReceiveAll]),
+            "{err:?}"
+        );
     }
 }
