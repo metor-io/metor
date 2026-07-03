@@ -155,6 +155,12 @@ impl<M: NamedMsg, B: Backing, WD: WakeSource, WS: WakeSink> MsgOut<M, B, WD, WS>
     pub fn descriptor() -> PortDesc {
         PortDesc::msg::<M>()
     }
+
+    /// What this field contributes to the bundle's `decls` walk: an ordinary
+    /// wired port.
+    pub fn decl() -> crate::PortDecl {
+        crate::PortDecl::Port(Self::descriptor())
+    }
 }
 
 impl<M, B, WD, WS> MsgOut<M, B, WD, WS>
@@ -312,6 +318,12 @@ where
     /// consumes. Requires [`NamedMsg`]: a wired port needs the stable name token.
     pub fn descriptor() -> PortDesc {
         PortDesc::msg::<M>()
+    }
+
+    /// What this field contributes to the bundle's `decls` walk: an ordinary
+    /// wired port.
+    pub fn decl() -> crate::PortDecl {
+        crate::PortDecl::Port(Self::descriptor())
     }
 }
 

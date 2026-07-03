@@ -50,7 +50,7 @@ use stellarator::net::TcpStream;
 use stellarator::sync::WaitQueue;
 
 use crate::binder::{BindPorts, RingSource};
-use crate::descriptor::{Delivery, PortDesc, PortId};
+use crate::descriptor::{Delivery, PortDecl, PortId};
 use crate::message::{CommandOut, split_record};
 use crate::registry::{AllOutputs, EntrySchema, RegistryEntry};
 use crate::system::{AsyncSystem, CyclicSystem, Out, System, SystemInput, SystemOutput};
@@ -418,7 +418,7 @@ pub struct UplinkPorts {
 pub struct UplinkIn;
 
 impl SystemInput for UplinkIn {
-    fn descriptors() -> Vec<PortDesc> {
+    fn decls() -> Vec<PortDecl> {
         Vec::new()
     }
     fn any_lapped(&self) -> bool {
@@ -459,7 +459,7 @@ impl<R: RecvTransport> UplinkSystem<R> {
 /// future uplink that forwards a second command type just declares a second output — the
 /// subscription follows automatically.
 fn uplink_subscribe_ids() -> Vec<PacketId> {
-    <UplinkPorts as SystemOutput>::descriptors()
+    <UplinkPorts as SystemOutput>::port_descs()
         .iter()
         .filter_map(|p| match p.id {
             PortId::Packet(id) => Some(id),
@@ -559,34 +559,21 @@ async fn run_sender<T: Transport>(
 // ---------------------------------------------------------------------------
 
 /// The telemetry system has no typed inputs (telemetry.md §3); its output bundle is a single
-/// [`AllOutputs`] receive-all tap (`docs/message-wiring.md` §4) — the reusable generalization
-/// of what this bundle used to hand-pull. `init` reaches both registries through it, and the
-/// `ReceiveAll` port is what earns the downlink a reader slot on every buffer.
+/// [`AllOutputs`] receive-all field (`docs/message-wiring.md` §4) — no longer a port but the
+/// [`Capability::ReceiveAll`](crate::Capability) grant its `decl()` contributes to the
+/// descriptor. `init` reaches the registry through it, the capability earns the downlink a
+/// reader slot on every buffer at sizing time, and the derived `bind` walk skips it on the
+/// ring cursor (`AllOutputs::bind` pulls the host registry — the downlink is never dlopen'd).
+#[derive(crate::SystemOutput)]
 pub struct TelemetryPorts {
     all: AllOutputs,
-}
-
-impl SystemOutput for TelemetryPorts {
-    fn descriptors() -> Vec<PortDesc> {
-        vec![AllOutputs::descriptor()]
-    }
-}
-
-impl BindPorts<BoxBacking> for TelemetryPorts {
-    /// Host-only (`B = BoxBacking`): the receive-all tap pulls both broad registries the host
-    /// [`Binder`] carries. The telemetry downlink is never dlopen'd.
-    fn bind<S: RingSource<B = BoxBacking>>(src: &mut S) -> Self {
-        Self {
-            all: AllOutputs::bind(src),
-        }
-    }
 }
 
 /// The empty input bundle (the streamer pulls outputs via the registry, not typed edges).
 pub struct TelemetryIn;
 
 impl SystemInput for TelemetryIn {
-    fn descriptors() -> Vec<PortDesc> {
+    fn decls() -> Vec<PortDecl> {
         Vec::new()
     }
     fn any_lapped(&self) -> bool {

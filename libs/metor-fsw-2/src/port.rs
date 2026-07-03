@@ -17,7 +17,7 @@ use metor_proto::types::LenPacket;
 use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
 
 use crate::binder::RingSource;
-use crate::descriptor::{OnLap, PortDesc};
+use crate::descriptor::{OnLap, PortDecl, PortDesc};
 use crate::dynamic::Slot;
 use crate::frame::Frame;
 use crate::reader::{ListReader, MapReader};
@@ -115,6 +115,12 @@ impl<F: Frame, B: Backing, WD: WakeSource, WS: WakeSink> Output<F, B, WD, WS> {
     /// This port's static descriptor (for wiring/sizing before any data flows).
     pub fn descriptor() -> PortDesc {
         PortDesc::of::<F>()
+    }
+
+    /// What this field contributes to the bundle's [`decls`](crate::SystemOutput::decls)
+    /// walk: an ordinary wired port.
+    pub fn decl() -> PortDecl {
+        PortDecl::Port(Self::descriptor())
     }
 
     /// Take (sum-and-clear) the [`publish`](Self::publish) drop counter. Called by
@@ -252,6 +258,12 @@ impl<F: Frame, B: Backing, RD: WakeSink, RS: WakeSource> Input<F, B, RD, RS> {
     /// This port's static descriptor (the required producer shape).
     pub fn descriptor() -> PortDesc {
         PortDesc::of::<F>()
+    }
+
+    /// What this field contributes to the bundle's [`decls`](crate::SystemInput::decls)
+    /// walk: an ordinary wired port.
+    pub fn decl() -> PortDecl {
+        PortDecl::Port(Self::descriptor())
     }
 
     /// Override the runtime lap policy — chainable, mirroring the descriptor-level

@@ -14,7 +14,7 @@ use metor_proto::types::Timestamp;
 
 use crate::binder::{BindPorts, RingSource};
 use crate::coordinator::{CyclicSlot, SlotState, StopReason};
-use crate::descriptor::{PortDesc, SystemDescriptor, SystemKind};
+use crate::descriptor::{PortDecl, PortDesc, SystemDescriptor, SystemKind, split_decls};
 use crate::health::{HealthPort, Level, SystemHealth, SystemLog};
 use crate::port::Output;
 
@@ -23,15 +23,23 @@ use crate::port::Output;
 // ---------------------------------------------------------------------------
 
 /// A system's input bundle: a struct of [`Input<F>`](crate::Input) ports. Derive
-/// with `#[derive(SystemInput)]` to generate `descriptors`/`any_lapped` from the
-/// port fields.
+/// with `#[derive(SystemInput)]` to generate `decls`/`any_lapped` from the port
+/// fields.
 pub trait SystemInput {
-    /// The required producer shape of every input port (system.md §5), in field
-    /// order. Read before any port exists.
-    fn descriptors() -> Vec<PortDesc>;
+    /// What every field contributes (system.md §5), in field order: the required
+    /// producer shape of each wired port, or a bind-time [`Capability`]. Read
+    /// before any port exists.
+    fn decls() -> Vec<PortDecl>;
 
-    /// Whether any input port has been lapped (overwrite buffers). The coordinator
-    /// checks this on cyclic systems before `execute` (system.md §3.1).
+    /// The wired-port projection of [`decls`](Self::decls) (capabilities filtered
+    /// out) — what edge validation and ring sizing consume.
+    fn port_descs() -> Vec<PortDesc> {
+        Self::decls().into_iter().filter_map(PortDecl::into_port).collect()
+    }
+
+    /// Whether any input port is in lap fault (a lap observed on a port whose
+    /// policy is [`OnLap::Stop`](crate::OnLap)). The coordinator checks this on
+    /// cyclic systems before `execute` (system.md §3.1).
     fn any_lapped(&self) -> bool;
 }
 
@@ -39,8 +47,16 @@ pub trait SystemInput {
 /// with `#[derive(SystemOutput)]`. The framework wraps it in [`Out`] to add the
 /// implicit health/log ports.
 pub trait SystemOutput {
-    /// The produced frame of every output port (system.md §5), in field order.
-    fn descriptors() -> Vec<PortDesc>;
+    /// What every field contributes (system.md §5), in field order: the produced
+    /// shape of each wired port, or a bind-time [`Capability`] (e.g. the
+    /// downlink's [`AllOutputs`](crate::AllOutputs) → `ReceiveAll`).
+    fn decls() -> Vec<PortDecl>;
+
+    /// The wired-port projection of [`decls`](Self::decls) (capabilities filtered
+    /// out).
+    fn port_descs() -> Vec<PortDesc> {
+        Self::decls().into_iter().filter_map(PortDecl::into_port).collect()
+    }
 
     /// Sum-and-clear the ports' [`publish`](crate::Output::publish) drop counters
     /// (review E6). Derive-generated; the runner folds a nonzero sum into a
@@ -121,12 +137,12 @@ where
     WD: WakeSource,
     WS: WakeSink,
 {
-    fn descriptors() -> Vec<PortDesc> {
-        // The user's ports, then the two implicit health/log ports every system gets.
-        let mut descs = O::descriptors();
-        descs.push(PortDesc::of::<SystemHealth>());
-        descs.push(PortDesc::of::<SystemLog>());
-        descs
+    fn decls() -> Vec<PortDecl> {
+        // The user's decls, then the two implicit health/log ports every system gets.
+        let mut decls = O::decls();
+        decls.push(PortDecl::Port(PortDesc::of::<SystemHealth>()));
+        decls.push(PortDecl::Port(PortDesc::of::<SystemLog>()));
+        decls
     }
 
     /// Forward to the user bundle's counters (the framework's own health/log ports
@@ -227,13 +243,18 @@ pub trait CyclicSystem<B: Backing = BoxBacking>: System<B> {
     /// `&mut self` reason the doc's own §2.3 `Input::latest` takes.
     fn execute(&mut self, now: Timestamp, input: &mut Self::Input, output: &mut Self::Output);
 
-    /// This system's self-description for wiring (system.md §5).
+    /// This system's self-description for wiring (system.md §5): the wired ports
+    /// per direction, plus the merged capability set of both bundles.
     fn descriptor() -> SystemDescriptor {
+        let (inputs, mut capabilities) = split_decls(<Self::Input as SystemInput>::decls());
+        let (outputs, out_caps) = split_decls(<Self::Output as SystemOutput>::decls());
+        capabilities.extend(out_caps);
         SystemDescriptor {
             name: Self::NAME,
             kind: SystemKind::Cyclic,
-            inputs: <Self::Input as SystemInput>::descriptors(),
-            outputs: <Self::Output as SystemOutput>::descriptors(),
+            inputs,
+            outputs,
+            capabilities,
         }
     }
 }
@@ -249,13 +270,18 @@ pub trait AsyncSystem<B: Backing = BoxBacking>: System<B> {
     /// `&mut` for the same reason as [`CyclicSystem::execute`].
     async fn run(&mut self, input: &mut Self::Input, output: &mut Self::Output);
 
-    /// This system's self-description for wiring (system.md §5).
+    /// This system's self-description for wiring (system.md §5): the wired ports
+    /// per direction, plus the merged capability set of both bundles.
     fn descriptor() -> SystemDescriptor {
+        let (inputs, mut capabilities) = split_decls(<Self::Input as SystemInput>::decls());
+        let (outputs, out_caps) = split_decls(<Self::Output as SystemOutput>::decls());
+        capabilities.extend(out_caps);
         SystemDescriptor {
             name: Self::NAME,
             kind: SystemKind::Async,
-            inputs: <Self::Input as SystemInput>::descriptors(),
-            outputs: <Self::Output as SystemOutput>::descriptors(),
+            inputs,
+            outputs,
+            capabilities,
         }
     }
 }

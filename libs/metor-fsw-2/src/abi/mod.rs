@@ -387,6 +387,9 @@ impl SystemDescriptorMsg {
             kind: self.kind,
             inputs: self.inputs.into_iter().map(PortDescMsg::into_port_desc).collect(),
             outputs: self.outputs.into_iter().map(PortDescMsg::into_port_desc).collect(),
+            // A dlopen'd system holds no host capabilities (ReceiveAll is host-only);
+            // the ABI mirror gains (and load-rejects) an explicit list with C7.
+            capabilities: Vec::new(),
         }
     }
 }

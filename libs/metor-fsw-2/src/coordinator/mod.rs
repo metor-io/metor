@@ -802,7 +802,7 @@ impl CoordinatorBuilder {
     /// instance name `"telemetry"`, registered **last** so its end-of-cycle snapshot
     /// observes every other system's fresh output. The downlink's `AllOutputs` receive-all
     /// port is what reserves it a reader slot on every buffer — `build()` derives that budget
-    /// by counting `ReceiveAll` ports, so no manual bookkeeping is needed here.
+    /// by counting `ReceiveAll` capabilities, so no manual bookkeeping is needed here.
     pub fn add_telemetry<T>(&mut self, config: TelemetryConfig<T>) -> SystemHandle
     where
         T: Transport + 'static,
@@ -923,6 +923,8 @@ impl CoordinatorBuilder {
             kind: SystemKind::Cyclic,
             inputs,
             outputs: base.outputs.clone(),
+            // Sequence occupants declare wired ports only (ReceiveAll is host-only).
+            capabilities: Vec::new(),
         };
 
         let allowed = allowed
@@ -1035,10 +1037,8 @@ impl CoordinatorBuilder {
                 continue;
             }
             let has_receive_all = self.descs[s]
-                .inputs
-                .iter()
-                .chain(self.descs[s].outputs.iter())
-                .any(|p| p.is_receive_all());
+                .capabilities
+                .contains(&crate::Capability::ReceiveAll);
             if has_receive_all {
                 first_receive_all.get_or_insert(s);
             } else if let Some(t) = first_receive_all {
@@ -1250,15 +1250,15 @@ impl CoordinatorBuilder {
         // allocation and frozen into an `Arc<Registry>` *before* the bind loop, so a
         // system can pull it in `BindPorts::bind` (telemetry.md §2.3).
         let mut reg_entries: Vec<RegistryEntry> = Vec::new();
-        // Each `AllOutputs` receive-all tap (`docs/message-wiring.md` §4) is an extra fan-out
-        // reader on *every* output + message buffer, so `build()` sizes every ring's
-        // `max_readers` to include it. Self-derived from the declared `ReceiveAll` ports across
-        // all systems — no manual `add_telemetry` bookkeeping.
+        // Each `AllOutputs` receive-all capability (`docs/message-wiring.md` §4) is an extra
+        // fan-out reader on *every* output + message buffer, so `build()` sizes every ring's
+        // `max_readers` to include it. Self-derived from the declared `ReceiveAll`
+        // capabilities across all systems — no manual `add_telemetry` bookkeeping.
         let n_reg = self
             .descs
             .iter()
-            .flat_map(|d| d.inputs.iter().chain(d.outputs.iter()))
-            .filter(|p| p.is_receive_all())
+            .flat_map(|d| d.capabilities.iter())
+            .filter(|c| **c == crate::Capability::ReceiveAll)
             .count();
 
         // --- Allocate one buffer per output port (incl. health/log) ----------
@@ -1273,59 +1273,46 @@ impl CoordinatorBuilder {
                     system: s,
                     port: out_idx,
                 };
-                let ring = if port.is_receive_all() {
-                    // A receive-all tap reserves no ring and connects no edge. Push a
-                    // minimal placeholder so `output_rings[s]` stays aligned with the output
-                    // PortDesc indices (edges index by position); it is never bound
-                    // (`AllOutputs::bind` pulls the registries) nor edge-referenced.
-                    RingBuffer::create_in_memory(Config {
-                        capacity: capacity_for(1, 2),
-                        max_readers: 1,
-                        overrun: Overrun::Overwrite,
-                    })
+                // ONE sizing path (depth by delivery — `alloc_ring`); only the
+                // registry-entry shape still splits on the schema. A
+                // `SequenceCommand` output is a command producer read by every
+                // slot, so it reserves `n_slots` extra readers on top of its edge
+                // fan-out (an A2 residue `docs/design-command-slots.md` deletes by
+                // making command edges explicit).
+                let cmd_readers = if port.id == PortId::Packet(SequenceCommand::ID) {
+                    n_slots
                 } else {
-                    // ONE sizing path (depth by delivery — `alloc_ring`); only the
-                    // registry-entry shape still splits on the schema. A
-                    // `SequenceCommand` output is a command producer read by every
-                    // slot, so it reserves `n_slots` extra readers on top of its edge
-                    // fan-out (an A2 residue `docs/design-command-slots.md` deletes by
-                    // making command edges explicit).
-                    let cmd_readers = if port.id == PortId::Packet(SequenceCommand::ID) {
-                        n_slots
-                    } else {
-                        0
-                    };
-                    let ring = alloc_ring(port.delivery, port.max_size, depth, readers + cmd_readers);
-                    match &port.schema {
-                        PortSchema::Table { .. } => {
-                            reg_entries.push(registry_entry(&instance, port, ring.clone()));
-                            table.rings.push(RingEntry {
-                                ring: ring.clone(),
-                                frame_id: port
-                                    .id
-                                    .component()
-                                    .expect("table port keys on a ComponentId"),
-                                role,
-                                instance: Some(instance),
-                            });
-                        }
-                        PortSchema::Postcard => {
-                            // Registered like any buffer; the downlink / `AllOutputs`
-                            // taps it unless the port opted out via
-                            // `telemetered = false` (e.g. a command channel, §6.4).
-                            let entry =
-                                postcard_entry(&instance, port.name, ring.clone(), port.telemetered);
-                            table.rings.push(RingEntry {
-                                ring: ring.clone(),
-                                frame_id: entry.key,
-                                role,
-                                instance: Some(instance),
-                            });
-                            reg_entries.push(entry);
-                        }
-                    }
-                    ring
+                    0
                 };
+                let ring = alloc_ring(port.delivery, port.max_size, depth, readers + cmd_readers);
+                match &port.schema {
+                    PortSchema::Table { .. } => {
+                        reg_entries.push(registry_entry(&instance, port, ring.clone()));
+                        table.rings.push(RingEntry {
+                            ring: ring.clone(),
+                            frame_id: port
+                                .id
+                                .component()
+                                .expect("table port keys on a ComponentId"),
+                            role,
+                            instance: Some(instance),
+                        });
+                    }
+                    PortSchema::Postcard => {
+                        // Registered like any buffer; the downlink / `AllOutputs`
+                        // taps it unless the port opted out via
+                        // `telemetered = false` (e.g. a command channel, §6.4).
+                        let entry =
+                            postcard_entry(&instance, port.name, ring.clone(), port.telemetered);
+                        table.rings.push(RingEntry {
+                            ring: ring.clone(),
+                            frame_id: entry.key,
+                            role,
+                            instance: Some(instance),
+                        });
+                        reg_entries.push(entry);
+                    }
+                }
                 row.push(ring);
             }
             output_rings.push(row);
@@ -1679,11 +1666,12 @@ impl CoordinatorBuilder {
                 // The static (host-side `BoxBacking`) path: build typed `BoundPort`s and
                 // walk them with a `Binder`.
                 reg => {
-                    // Outputs: default wakes, the system's own buffers. Skip `ReceiveAll` tap
-                    // ports — they bind no ring (`AllOutputs::bind` pulls the registries), so the
-                    // positional cursor must not offer them one.
+                    // Outputs: default wakes, the system's own buffers. Capabilities
+                    // never appear here — they live on `descs[id].capabilities`, not
+                    // in the port lists, so the positional cursor covers exactly the
+                    // wired ports (`AllOutputs::bind` pulls the registry instead of
+                    // consuming a cursor position).
                     let outs: Vec<BoundPort> = (0..self.descs[id].outputs.len())
-                        .filter(|&out_idx| !self.descs[id].outputs[out_idx].is_receive_all())
                         .map(|out_idx| BoundPort::new(output_rings[id][out_idx].clone()))
                         .collect();
                     // Inputs, in `descriptors()` order, chosen by the FAN-IN axis. A

@@ -813,13 +813,13 @@ fn cmd(channel: &str) -> SequenceCommand {
 /// flip exactly the telemetry flag.
 #[test]
 fn fsw_attrs_lower_onto_descriptors() {
-    let ins = <GuardIn as SystemInput>::descriptors();
+    let ins = <GuardIn as SystemInput>::port_descs();
     assert_eq!(ins.len(), 1);
     assert_eq!(ins[0].on_lap, crate::OnLap::Stop, "the attribute override");
     assert_eq!(ins[0].delivery, crate::Delivery::Log, "other axes keep the MsgIn defaults");
     assert_eq!(ins[0].fan_in, crate::FanIn::Many);
 
-    let outs = <QuietOut as SystemOutput>::descriptors();
+    let outs = <QuietOut as SystemOutput>::port_descs();
     assert_eq!(outs.len(), 2);
     assert!(!outs[0].telemetered, "#[fsw(telemetered = false)] on a FRAME output");
     assert_eq!(outs[0].id, crate::PortId::Component(NavEstimate::FRAME_ID));

@@ -1012,8 +1012,10 @@ struct SnapshotFanInIn {
 }
 
 impl SystemInput for SnapshotFanInIn {
-    fn descriptors() -> Vec<crate::PortDesc> {
-        vec![crate::PortDesc::of::<Imu>().with_fan_in(crate::FanIn::Many)]
+    fn decls() -> Vec<crate::PortDecl> {
+        vec![crate::PortDecl::Port(
+            crate::PortDesc::of::<Imu>().with_fan_in(crate::FanIn::Many),
+        )]
     }
     fn any_lapped(&self) -> bool {
         self.imu.lap_fault()
@@ -1067,8 +1069,10 @@ struct StopLogAsyncIn {
 }
 
 impl SystemInput for StopLogAsyncIn {
-    fn descriptors() -> Vec<crate::PortDesc> {
-        vec![MsgIn::<TestEvent>::descriptor().with_on_lap(crate::OnLap::Stop)]
+    fn decls() -> Vec<crate::PortDecl> {
+        vec![crate::PortDecl::Port(
+            MsgIn::<TestEvent>::descriptor().with_on_lap(crate::OnLap::Stop),
+        )]
     }
     fn any_lapped(&self) -> bool {
         false
@@ -1183,6 +1187,71 @@ async fn all_outputs_taps_the_whole_graph() {
     assert!(frame_outs.get() >= 2, "sees frame outputs: {}", frame_outs.get());
 }
 
+// ---------------------------------------------------------------------------
+// Capabilities (A4/C6): AllOutputs is a SystemDescriptor capability, not a port —
+// no sentinel desc, no placeholder ring, no bind-cursor position.
+// ---------------------------------------------------------------------------
+
+struct MixedTap;
+
+/// A capability field FIRST, a real port after it: if the capability consumed a
+/// bind-cursor position, `imu` would bind over the wrong ring.
+#[derive(SystemOutput)]
+struct MixedTapOut {
+    all: AllOutputs,
+    imu: crate::Output<Imu>,
+}
+
+impl System for MixedTap {
+    type Input = NoIn;
+    type Output = Out<MixedTapOut>;
+    const NAME: &'static str = "mixed_tap";
+}
+
+impl CyclicSystem for MixedTap {
+    fn execute(&mut self, now: Timestamp, _in: &mut NoIn, o: &mut Self::Output) {
+        o.imu.publish(&Imu {
+            timestamp: now,
+            omega: 7.5,
+        });
+    }
+}
+
+/// The descriptor splits ports from capabilities: the port lists carry ONLY wired
+/// ports (no receive-all sentinel), and the capability set carries `ReceiveAll`.
+#[test]
+fn capability_lifts_out_of_the_port_lists() {
+    let d = <MixedTap as CyclicSystem>::descriptor();
+    assert_eq!(d.capabilities, vec![crate::Capability::ReceiveAll]);
+    let names: Vec<&str> = d.outputs.iter().map(|p| p.name).collect();
+    assert_eq!(names, vec!["imu", "health", "log"], "wired ports only, in field order");
+}
+
+/// End-to-end bind alignment: with the capability declared BEFORE a real port, the
+/// port still binds its own ring — its records are readable under its registry key.
+#[cfg(not(miri))]
+#[stellarator::test]
+async fn capability_field_consumes_no_bind_cursor() {
+    let mut b = Coordinator::builder(config());
+    b.add_cyclic(Producer::new());
+    // Registered last: a cyclic ReceiveAll holder must step after everything else.
+    b.add_cyclic(MixedTap);
+    let mut coord = b.build().unwrap();
+    // Claim the tap before any cycle runs — a view on an overwrite ring starts at
+    // the live edge, so it must exist before data flows.
+    let registry = coord.registry();
+    let key = metor_proto::types::ComponentId::new("mixed_tap.imu");
+    let entry = registry.get(key).expect("the port after the capability is registered");
+    let mut view = entry.view().expect("reader slot");
+    coord.run_for(2).await;
+
+    let mut buf = Vec::new();
+    assert!(
+        view.try_read_into(&mut buf).expect("readable ring"),
+        "the port bound the ring the coordinator reserved for it"
+    );
+}
+
 #[test]
 fn command_ring_registered_but_untelemetered() {
     // The coordinator's command channel is an ordinary registered entry now (A6):
@@ -1223,8 +1292,8 @@ struct QuietOut {
 }
 
 impl SystemOutput for QuietOut {
-    fn descriptors() -> Vec<crate::PortDesc> {
-        vec![crate::PortDesc::of::<Imu>().untelemetered()]
+    fn decls() -> Vec<crate::PortDecl> {
+        vec![crate::PortDecl::Port(crate::PortDesc::of::<Imu>().untelemetered())]
     }
 }
 
