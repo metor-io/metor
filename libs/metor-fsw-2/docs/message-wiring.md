@@ -1,22 +1,30 @@
 # Message wiring parity (`message-wiring`)
 
-> **Status: DESIGN / PROPOSED.** This document designs the next step for the message
-> channel: giving **messages full wiring parity with component frames**. Today messages
-> (`MsgOut`/`MsgIn`, `src/message.rs`) live *outside* the typed bundle/descriptor/edge
-> system — they reach systems only through three bind-time capabilities on `RingSource`
-> (`output_registry()` / `message_registry()` / `command_out()`, `src/binder.rs:138-160`),
-> and the coordinator hard-wires the command plane (`drain_command_bus` +
-> `CyclicSlot::command` broadcast, `src/coordinator/mod.rs:1693`, `:267`). This design
-> promotes messages to first-class **ports** and **edges**, makes the uplink and downlink
+> **Status: IMPLEMENTED (2026-07-02), then further reframed.** This document's message-wiring-parity
+> design landed as WP1-WP9 (`docs/message-wiring-plan.md` — its own status banner lists the shipped
+> deviations, chiefly WP7/WP8's command-plane realization). **The command plane it designed (§6,
+> §9 item 5, §10 Q7) was then reframed again** by `docs/review-fixes-plan.md` waves 4a-4c
+> (landed): `ChannelId`/`channel_id` is deleted (`SequenceCommand`/`SequenceChannelEvent` are
+> name-addressed, `channel: String`); the "fan out to every slot, slot self-filters" shape (§9 item
+> 5, §10 Q7's "implicit fan-out default") did **not** survive — every command producer × slot pair
+> is now an **explicit** message edge, no broadcast sugar; `CommandOut<M>` shipped as a `MsgOut<M>`
+> type alias, not a newtype; and the coordinator is an ordinary system #0 (`"coordinator"`), not a
+> hand-registered special case. See `docs/messages.md`'s status banner and
+> `docs/design-command-slots.md` for the current shape; this document's §1-§5, §7-§8 (the port
+> unification itself — kind-tagged `PortDesc`, typed `MsgOut<M>`/`MsgIn<M>`, `AllOutputs`,
+> reader-slot self-derivation) remain accurate and are what actually shipped. §6 and the
+> command-routing parts of §9/§10 are historical design rationale, superseded as above.
+>
+> This design promotes messages to first-class **ports** and **edges**, makes the uplink and downlink
 > **fully ordinary systems**, and deletes every command-plane special case in the
 > coordinator. It builds directly on the *shipped* message channel (`docs/messages.md`
-> §1-§7, already implemented and verified against the code); read that first — this doc
-> only changes how messages are *wired*, not their record format, ring semantics, or the
-> downlink FIFO.
+> §1-§7); read that first — this doc changes how messages are *wired*, not their record format,
+> ring semantics, or the downlink FIFO.
 >
-> Decisions 1-7 (`docs/message-wiring.md` §9) were **locked** by the reviewer. Every NEW
-> fork this design surfaced is collected in **§10 (Open questions for review)** — please
-> confirm those; they are flagged inline as **[OPEN Qn]** where they arise.
+> Decisions 1-7 (`docs/message-wiring.md` §9) were **locked** by the reviewer at design time (item 5
+> is superseded, per above). Every NEW fork this design surfaced is collected in **§10 (Open
+> questions for review)** — resolutions are recorded there; Q7's resolution (implicit fan-out) is
+> likewise superseded.
 
 ---
 
@@ -809,11 +817,14 @@ raised (each cross-referenced to its **[OPEN Qn]** in §10).
    *Trade-off:* the central bus was one place to reason about command timing; now timing is a
    property of edges + the slot's head-of-step drain (same-cycle preserved). (§6.)
 
-5. **Command routing = fan-out to all slots, slot self-filters by `channel_id` — LOCKED.**
-   Behaviour identical to today's broadcast-then-filter, expressed as edges + the unchanged
-   `cmd.channel_id == self.channel_id` filter (`slot.rs:516`). `channel_id` + `SequenceRegistry`
-   unchanged. *Trade-off:* fan-out is N_emitters × N_slots edges — mitigated by the implicit
-   fan-out convenience. (§6.2, **[OPEN Q7]**.)
+5. **Command routing = fan-out to all slots, slot self-filters by `channel_id` — LOCKED, then
+   SUPERSEDED.** As designed: behaviour identical to today's broadcast-then-filter, expressed as
+   edges + the unchanged `cmd.channel_id == self.channel_id` filter. *As shipped
+   (`docs/review-fixes-plan.md` wave 4a/4c):* `channel_id` is gone (name-addressed, `cmd.channel ==
+   self.name`), and the "implicit fan-out convenience" below (§10 Q7) was **not** kept — every
+   producer × slot pair needing a command edge is wired explicitly in KDL/the builder (no broadcast
+   sugar, "fan-out connect sugar out of scope v1" per the review's executive call). (§6.2, **[OPEN
+   Q7]**, superseded.)
 
 6. **In-proc control: coordinator is a normal command emitter — LOCKED.** A reserved,
    hand-registered `coordinator.commands` producer (one ring/`MsgOut`) keeps `control_handle()`
@@ -839,10 +850,14 @@ Q7 (implicit vs explicit command fan-out), Q8 (are command channels telemetered)
 ## 10. Open questions for review
 
 **ALL RESOLVED (reviewer, 2026-06-30).** Q1–Q6, Q9, Q10 confirmed as the recommended answer
-below. **Q7 = implicit fan-out default + explicit `connect … msg=` override.** **Q8 REVERSED
-from the recommendation: keep command channels OFF the downlink** via a `telemetered` bool on
-the message `PortDesc`/`MessageEntry` (default true; false for the coordinator + uplink command
-outputs) — see the updated §6.4 / §2.2 / §4. Original analysis retained below for context.
+below. **Q7 = implicit fan-out default + explicit `connect … msg=` override** — as designed;
+**superseded as shipped**: the review's later command-plane pass (`docs/review-fixes-plan.md` wave
+4c) dropped the implicit-fan-out default entirely in favor of always-explicit command edges (no
+broadcast sugar; see the §9 item 5 update above). **Q8 REVERSED from the recommendation: keep
+command channels OFF the downlink** via a `telemetered` bool on the port descriptor/registry entry
+(default true; false for the coordinator + uplink command outputs, via the `CommandOut<M>`
+`.untelemetered()` sugar) — this part shipped as designed. Original analysis retained below for
+context.
 
 1. **[Q1] `PortDesc` shape.** Widen the existing struct to a single **kind-tagged `PortDesc`
    (`PortId` + `PortKind`)** — keeps the derive macro unchanged and graph algorithms single-pass,

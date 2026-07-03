@@ -189,9 +189,25 @@ pub fn write(&mut self, frame: &F) -> Result<(), WriteError>;
 pub fn write_with(&mut self, fixed: &F, build: impl FnOnce(&mut FrameWriter<F>))
     -> Result<(), WriteError>;
 
+/// **Infallible (E6)** publish of a fixed frame: on the framework's `Overwrite`
+/// rings a `try_write` only fails on `InsufficientCapacity` (a sizing bug, not a
+/// runtime condition a system can act on), so `publish` counts the drop instead of
+/// returning it — the port has no `HealthPort` to report through directly.
+pub fn publish(&mut self, frame: &F);
+
+/// The `write_with` twin of `publish` — same infallible/counted-drop contract.
+pub fn publish_with(&mut self, fixed: &F, build: impl FnOnce(&mut FrameWriter<F>));
+
 /// Async publish of a fixed frame: suspends (lossless mode only) until there is room.
 pub async fn write_async(&mut self, frame: &F) -> Result<(), WriteError>;
 ```
+
+`write`/`write_with` stay for sizing-aware callers that want the `Result`; `publish`/`publish_with`
+are what `#[system]`-authored `execute` bodies use (§7) — the framework folds each port's dropped
+count into `health.error("publish_dropped")` once per cycle via `SystemOutput::take_dropped` (a
+derive-generated sum-and-clear over every port), rather than making the author check a `Result` for
+a condition that (on a correctly sized ring) never actually happens. `MsgOut`/`CommandOut` get the
+same `publish`/counter.
 
 How a write lands as bytes: for a fixed frame, the `#[repr(C)]` `F` value already *is* its
 table bytes at offset 0, so `write` hands `frame.as_bytes()` straight to `Writer::try_write`.
@@ -212,10 +228,28 @@ descriptors used for sizing and wiring validation before any port exists:
 
 ```rust
 pub trait SystemOutput {
-    /// The produced frame of every output port (§5), in field order.
-    fn descriptors() -> Vec<PortDesc>;
+    /// What every field contributes (§5), in field order: an ordinary wired port's
+    /// `PortDesc`, or a bind-time `Capability` (e.g. the downlink's `AllOutputs` →
+    /// `ReceiveAll`) that reserves no ring.
+    fn decls() -> Vec<PortDecl>;
+    /// The wired-port projection of `decls()` (capabilities filtered out) — what
+    /// edge validation and ring sizing consume. Has a default impl in terms of
+    /// `decls()`.
+    fn port_descs() -> Vec<PortDesc> { /* filter_map(PortDecl::into_port) */ }
+    /// Sum-and-clear every port's `publish`/`publish_with` drop counter (E6).
+    /// Derive-generated; the runner folds a nonzero sum into a `publish_dropped`
+    /// health error each cycle. Defaults to `0` so a hand-written bundle (which
+    /// tracks no drops) still compiles.
+    fn take_dropped(&mut self) -> u64 { 0 }
 }
 ```
+
+`SystemInput` is the input-side twin (`decls`/`port_descs`, plus `any_lapped` in place of
+`take_dropped` — §2.5). Both traits are `decls()`-first rather than `descriptors()`-first because a
+bundle field is not always a port: a `Capability` (currently only `ReceiveAll`) reserves no ring and
+wires no edge, so it cannot be represented as a `PortDesc` — `decls()` is the one type-blind walk
+both the derive and the binder use, and `port_descs()` is a convenience filter over it for callers
+that only care about wired ports.
 
 The framework wraps a user's output bundle `O` in `Out<O>`, which adds the implicit
 per-system health/log port pair so `output.health()` is always available:
@@ -267,10 +301,13 @@ pub fn resync(&self);
 Reads (available when `F: Frame + FromBytes + KnownLayout + Immutable`):
 
 ```rust
-/// Drain to the newest committed record and hand back a typed view of it, or `None`
-/// if no record has ever arrived. Cyclic systems want the freshest sample, not a
-/// backlog. A `Lapped` view is surfaced as `Err`.
-pub fn latest(&mut self) -> Result<Option<FrameRef<'_, F>>, ReadError>;
+/// Drain to the newest record and hand back a typed view of it, or `None` if no
+/// record has arrived since the last call. Cyclic systems want the freshest sample,
+/// not a backlog. **Infallible (E3)**: on a lap it resyncs to the live edge and
+/// latches the lap internally — `is_lapped()` still surfaces it for the runner's
+/// pre-execute hard-stop check, but a same-cycle lap racing an async producer just
+/// resyncs and reports rather than propagating an error from inside `execute`.
+pub fn latest(&mut self) -> Option<FrameRef<'_, F>>;
 
 /// Process *every* record since the last drain, in order (command / event channels
 /// that cannot drop a record). Stops and returns `Err` on lap.
@@ -285,6 +322,10 @@ pub async fn recv(&mut self) -> Result<FrameRef<'_, F>, ReadError>;
 latest-wins drain a cyclic sampler wants. `drain` instead delivers each record to a closure,
 for a channel that must not drop. `recv` awaits the next record for an event-driven async
 system. The choice between them is a system-author decision, not a trait constraint.
+`drain`/`recv` are unaffected by E3 — only `latest`'s signature dropped the `Result`, because
+the coordinator already hard-stops a cyclic system on lap *before* `execute` runs (§3.1), so
+inside `execute` a same-thread producer's lap is unreachable and only an async producer's lap
+can still race it — in which case "resync and report" is the only sensible cyclic policy.
 
 ### 2.4 Typed access — `FrameRef<F>`
 
@@ -318,10 +359,16 @@ impl<'a, F: Frame + FromBytes + KnownLayout + Immutable> FrameRef<'a, F> {
 
 ```rust
 pub trait SystemInput {
-    /// The required producer shape of every input port (§5), in field order.
-    fn descriptors() -> Vec<PortDesc>;
-    /// Whether any input port has been lapped (overwrite buffers). The coordinator
-    /// checks this on cyclic systems before `execute` (§3.1).
+    /// What every field contributes (§5), in field order: the required producer
+    /// shape of every wired input port, or a bind-time `Capability`.
+    fn decls() -> Vec<PortDecl>;
+    /// The wired-port projection of `decls()` — what edge validation and ring
+    /// sizing consume. Has a default impl in terms of `decls()`.
+    fn port_descs() -> Vec<PortDesc> { /* filter_map(PortDecl::into_port) */ }
+    /// Whether any input port is in lap fault — a lap observed on a port whose
+    /// `OnLap` policy is `Stop` (the cyclic frame-input default; a `Resync`-policy
+    /// port, e.g. a message input, never contributes here). The coordinator checks
+    /// this on cyclic systems before `execute` (§3.1).
     fn any_lapped(&self) -> bool;
 }
 ```
@@ -530,31 +577,60 @@ frame metadata, with no instance constructed.
 
 ### 5.1 `PortDesc` and `SystemDescriptor`
 
+A port is one concept along **four orthogonal behavior axes**, plus its edge key and a fifth
+"who connects the other end" axis (`docs/design-port-unification.md`, `docs/design-command-slots.md`
+§2.1). A component-frame ("Table") port and a message ("Postcard") port are two *configurations* of
+the same struct, not two types:
+
 ```rust
+pub enum PortId {
+    Component(ComponentId),  // F::FRAME_ID — a Table port's edge key
+    Packet(PacketId),        // M::ID — a Postcard port's edge key
+}
+
+pub enum PortSchema {
+    Table { vtable: VTable, announce: AnnounceFn },  // component-frame table bytes + vtable
+    Postcard,                                        // self-describing (PacketId, postcard) — no vtable
+}
+
+pub enum Delivery { Snapshot, Log }   // latest-wins vs every-record
+pub enum FanIn    { One, Many }       // exactly one producer vs zero-or-more (inputs only)
+pub enum OnLap    { Stop, Resync }    // a lap is a hard fault vs skip-to-live-edge (inputs only)
+
 pub struct PortDesc {
-    pub frame_id: ComponentId,       // F::FRAME_ID
-    pub frame_name: &'static str,    // F::NAME (the unprefixed frame name)
-    pub vtable: VTable,              // F::as_vtable() — the frame-relative component layout
-    pub max_size: usize,             // F::MAX_SIZE (worst-case table bytes)
-    pub announce: AnnounceFn,        // instance-prefix factory (telemetry schema)
+    pub id: PortId,
+    pub name: &'static str,      // F::NAME / M::NAME — display / KDL-token / registry-key name
+    pub max_size: usize,         // F::MAX_SIZE / MAX_MSG_BYTES — worst-case record bytes
+    pub schema: PortSchema,      // axis 1 — what a record is
+    pub delivery: Delivery,      // axis 2 — what a consumer reads
+    pub fan_in: FanIn,           // axis 3 — no-op on outputs
+    pub on_lap: OnLap,           // axis 4 — no-op on outputs
+    pub telemetered: bool,       // does the downlink / AllOutputs tap this port (output-side)
+    pub conn: PortConn,          // axis 5 — Edge (default) | Host | SelfTap(PortId)
 }
 
 pub struct SystemDescriptor {
-    pub name: &'static str,          // System::NAME
-    pub kind: SystemKind,            // Cyclic | Async — wiring metadata only
-    pub inputs: Vec<PortDesc>,       // <Self::Input as SystemInput>::descriptors()
-    pub outputs: Vec<PortDesc>,      // <Self::Output as SystemOutput>::descriptors()
+    pub name: &'static str,           // System::NAME
+    pub kind: SystemKind,             // Cyclic | Async — wiring metadata only
+    pub inputs: Vec<PortDesc>,        // <Self::Input as SystemInput>::port_descs()
+    pub outputs: Vec<PortDesc>,       // <Self::Output as SystemOutput>::port_descs()
+    pub capabilities: Vec<Capability>, // non-port host resources (e.g. ReceiveAll), §5.4
 }
 ```
 
-`PortDesc::of::<F>()` derives a descriptor from a frame type.
-The same `PortDesc` describes an output (a produced frame) and an input (a required frame
-shape) — the two are structurally identical; direction is which `SystemDescriptor` list it
-sits in. `announce` is a type-erased prefix factory: given an instance name it re-derives the
-**prefixed** announce vtable + component metadata (`<instance>.<frame>.<field>` ids/names) the
-coordinator records as the buffer's external schema. It is an `Arc<dyn Fn>` rather than a
-`fn` because a dlopen'd port has no static `F` and instead carries a closure capturing its
-metadata-derived prefix rewrite.
+`PortDesc::of::<F>()` mints `Table × Snapshot × One × Stop`, telemetered, `Edge`-connected — the
+frame-port defaults. `PortDesc::msg::<M>()` (`M: NamedMsg`) mints `Postcard × Log × Many × Resync`,
+telemetered, `Edge`-connected — the message-port defaults; `PortDesc::msg_named::<M>(name)` overrides
+the display name (used for the coordinator's own reserved channels, e.g. `"commands"`,
+`"sequences"`). Builder methods flip individual axes without touching the rest: `.untelemetered()`
+(opt a port out of the downlink/`AllOutputs` — this is what the `CommandOut<M>` token lowers to,
+`docs/messages.md`), `.with_on_lap(p)`, `.with_conn(c)`.
+
+The same `PortDesc` describes an output (a produced record stream) and an input (a required
+shape) — the two are structurally identical; direction is which `SystemDescriptor` list it sits
+in. `PortSchema::Table`'s `announce` is the type-erased instance-prefix factory (telemetry.md §6);
+`PortSchema::Postcard` carries none — a `(PacketId, postcard)` record is self-describing, no vtable,
+no announce.
 
 The coordinator reads this to:
 
@@ -565,21 +641,49 @@ The coordinator reads this to:
    `DEFAULT_DEPTH = 8` is used unless the coordinator config overrides `default_depth`.
 2. **Validate compatibility** (§5.2).
 
+A bundle field that is not a wired port at all — a bind-time capability like `AllOutputs` — is not a
+`PortDesc`: `SystemInput`/`SystemOutput::decls()` returns `Vec<PortDecl>` (`PortDecl::Port(PortDesc)`
+or `PortDecl::Capability(Capability)`), and `port_descs()` filters to the wired ones (§2.2, §2.5,
+§5.4).
+
 ### 5.2 Compatibility — `compatible`
 
 ```rust
 pub fn compatible(producer: &PortDesc, consumer: &PortDesc) -> bool;
 ```
 
-A producer output satisfies a consumer input iff they share a `frame_id` *and* the consumer's
-component set is a **subset** of the producer's with matching `ty`/`shape`. Both sides are
-enumerated with `VTable::realize_fields(None)` (registration mode — `table = None` surfaces
-every `(component_id, ty, shape)` triple, including dynamic member templates), and the check
-is a subset comparison over those triples. Subset (not equality) lets a producer emit extra
-fields a consumer ignores — forward-compatible wiring. The check catches "consumer expects a
-field the producer doesn't emit" and "type/shape mismatch" before a byte flows.
+A producer output satisfies a consumer input iff their `PortId`s match (Table and Postcard keys live
+in disjoint value spaces, so a cross-schema pair can never match) *and* their `Delivery` agrees, and
+then:
 
-### 5.3 Binding — `RingSource` and `BindPorts`
+- **Table/Table**: the consumer's component set is a **subset** of the producer's with matching
+  `ty`/`shape`. Both sides are enumerated with `VTable::realize_fields(None)` (registration mode —
+  `table = None` surfaces every `(component_id, ty, shape)` triple, including dynamic member
+  templates), and the check is a subset comparison over those triples. Subset (not equality) lets a
+  producer emit extra fields a consumer ignores — forward-compatible wiring.
+- **Postcard/Postcard**: pure `PacketId` equality (already checked via `PortId`) — a message record
+  is an opaque postcard blob with no component structure to subset-check.
+
+The check catches "consumer expects a field the producer doesn't emit," "type/shape mismatch," and
+"a Log consumer wired to a Snapshot producer (or vice versa)" before a byte flows.
+
+### 5.3 Capabilities — non-port host resources
+
+```rust
+pub enum Capability {
+    /// A read view over every telemetered output in the graph (`AllOutputs`). Counts
+    /// one reader slot on every buffer at sizing time. Host-only.
+    ReceiveAll,
+}
+```
+
+A `Capability` is granted, not wired: it reserves no ring, connects no edge, and is exempt from
+`build()`'s edge-validation and ring-allocation passes — only its reader-slot accounting
+participates in sizing (telemetry.md §2.5). `AllOutputs` (the downlink's receive-all tap) is the one
+shipped capability; a bundle field of that type contributes `PortDecl::Capability(Capability::ReceiveAll)`
+to `decls()` instead of a `PortDesc`.
+
+### 5.4 Binding — `RingSource` and `BindPorts`
 
 Descriptors size and allocate the rings; binding hands each typed port the ring reserved for
 it. The two are symmetric and positional: binding visits port fields in the *same order* as
@@ -644,7 +748,58 @@ the VTable, not by a shared Rust type**.
 
 ---
 
-## 7. What is reused vs. defined here
+## 7. Authoring with `#[system]`
+
+Everything in §1-§6 is what the framework generates for you. Hand-writing it — the `Input`/`Output`
+bundle structs, `impl System`, `impl CyclicSystem`/`AsyncSystem`, `impl BuildSystem`, the `#[cfg]`'d
+`export_system!` — is ceremony derivable entirely from one method's signature. The
+`#[system]` attribute macro (`metor-fsw-2-macros`, `docs/design-system-macro.md`) reads the ports
+straight off `execute`'s (cyclic) or `run`'s (async) parameter list, in signature order, and emits
+the bundles, trait impls, and (optionally) the dl ABI exports from that one source of truth —
+exactly the model `#[sequence]` already proved for stateless sequence bodies (`docs/sequences-slots.md`
+§4).
+
+```rust
+use metor_fsw_2::{Input, Output, Timestamp, system};
+
+#[system(name = "nav", export = "export")]
+impl NavSystem {
+    pub fn new(p: NavParams) -> Self { /* … */ }
+
+    fn execute(
+        &mut self,
+        now: Timestamp,
+        sensors: &mut Input<Sensors>,
+        gps: &mut Input<Gps>,
+        estimate: &mut Output<AttitudeEstimate>,
+    ) {
+        let Some(s) = sensors.latest() else { return };   // E3: latest() -> Option, no Result
+        // …
+        estimate.publish(&AttitudeEstimate { /* … */ });  // E6: infallible publish()
+    }
+}
+```
+
+This is `examples/adcs-fsw2/systems/nav/src/lib.rs` as actually shipped — no `B: Backing`, no
+`NavIn`/`NavOut` bundle structs, no `Out<>` wrapper, no `BuildSystem` impl, no `#[cfg]`'d
+`export_system!` call; `fn new` (optional; absent ⇒ `Self: Default`) drives `BuildSystem::Params`,
+and `#[system(export = "export")]` gates the `fsw_*` dl exports on the crate's own `export` feature
+(bare `#[system]` emits none — a static-link-only crate stays warning-free). Recognized parameter
+forms, by the last path segment of the type: `now: Timestamp` (the cycle timestamp, required on
+`execute`, rejected on `run`), `&mut Input<T>`/`&mut Output<T>` (frame ports), `&mut
+MsgIn<M>`/`&mut MsgOut<M>`/`&mut CommandOut<M>` (message ports), `&mut HealthPort` (optional, at
+most one). Ports must be `&mut` borrows — the macro owns the ring `Backing` and rewrites each port
+parameter's type to `PortType<T, __B>`; a genuinely backing-specific system still writes the traits
+by hand (§1-§6 stay the documented escape hatch, and the macro emits exactly what this document
+describes — nothing here changes because a system happens to be authored with it).
+
+`#[metor_fsw_2::sequence]` (`docs/sequences-slots.md` §4) shares the same signature classifier for
+stateless async sequence bodies, plus a `now()`/`Seq::now()` ambient clock so a sequence can stamp
+the frames it emits without threading `Timestamp` through by hand.
+
+---
+
+## 8. What is reused vs. defined here
 
 | Concern | Reused (ring / proto) | Defined in the system layer |
 |---------|-----------------------|-----------------------------|

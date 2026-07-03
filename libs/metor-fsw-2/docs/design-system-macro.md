@@ -1,5 +1,10 @@
 # `#[system]` — killing per-system authoring ceremony (E2, E3, E6, E7, E8a/c)
 
+> **Status: LANDED** — implemented in commit `9ea79274` ("feat(fsw2): wave-5 — #[system]
+> attribute macro + cyclic API ergonomics"), `macros/` (crate `metor-fsw-2-macros`). Landed
+> BEFORE port unification, per this doc's own recommended order (§9). `docs/system.md` §7 and
+> `docs/sequences-slots.md` §4.1 reflect the shipped authoring surface.
+
 Status: **design** (2026-07-02). Companion to `docs/review-findings.md` §4 and the
 in-flight `docs/design-port-unification.md` (§9 states exactly which emitted pieces
 track that outcome). This doc specifies an attribute macro, the small framework API

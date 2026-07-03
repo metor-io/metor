@@ -106,7 +106,7 @@ locator — so it was dropped during impl (§8.3); `package` is always self-suff
 $ metor-fsw package mission.kdl -o dist/adcs.bundle
   built 3 cdylibs, copied into dist/adcs.bundle/
   wrote dist/adcs.bundle/mission.kdl  (3 artifacts, 3 systems, 3 edges)
-  wrote dist/adcs.bundle/meta.kdl     (abi=1, profile=debug)
+  wrote dist/adcs.bundle/meta.kdl     (abi=3, profile=debug)
 ```
 
 ### 2.3 `run`
@@ -116,6 +116,7 @@ metor-fsw run <TARGET>
     [--build] [--release] [--cargo-arg <ARG>]...
     [--wall | --sim-dt <SECS>] [--cycle-rate <HZ>]
     [--telemetry <ADDR> [--telemetry-mode all]] [--no-telemetry]
+    [--uplink <ADDR>]
     [--cycles <N>]
 ```
 
@@ -141,6 +142,7 @@ which (a directory, or a `*.bundle`, is a bundle). Loading differs:
 | `--telemetry <ADDR>` | `telemetry = Some(TelemetrySpec { addr, mode })` (enables it) |
 | `--telemetry-mode all` | sets the mode of `--telemetry` (v1: `all`; `subset` stays KDL-only) |
 | `--no-telemetry` | `telemetry = None` (disable even if the KDL declares it) |
+| `--uplink <ADDR>` | `wiring.uplink = Some(UplinkSpec { addr })` — enables the command uplink (its own connection, reading panel `SequenceCommand`s, `docs/messages.md` §4.4) even if the KDL doesn't declare an `uplink { … }` node |
 | `--cycles <N>` | `run_for(N)`; default `usize::MAX` (run until interrupted) |
 
 `--wall`/`--sim-dt` are mutually exclusive (clap group). `--telemetry`/`--no-telemetry` are
@@ -159,6 +161,9 @@ the active config is never a guess.
 - Under the **simulated** clock the loop free-runs (no pacing), so a live downlink races far
   ahead of real time; the banner suggests `--wall` whenever telemetry is on with a sim clock.
   For live panel viewing use `--wall --telemetry <addr>`.
+- The uplink gets the same one-shot reachability probe as telemetry, reported on its own banner
+  line; with no `--uplink`/KDL `uplink { … }` node the banner says `uplink: off — pass
+  \`--uplink <addr>\` to receive panel commands` (`src/cli/mod.rs`).
 
 ### 2.4 The build→run shortcut
 
@@ -285,21 +290,20 @@ Metadata that is *about* the bundle rather than the wiring:
 
 ```kdl
 meta {
-    abi_version 1                 // FSW_ABI_VERSION the cdylibs were built against
+    abi_version 3                 // FSW_ABI_VERSION the cdylibs were built against
     profile "release"            // build profile
-    built_at "2026-06-28T12:00:00Z"
-    // per-system params schemas, for offline (no-.so) config validation / tooling:
-    schema "Plant" { /* OwnedNamedType dump */ }
-    // ...
+    built_at_unix 1782000000     // epoch seconds — no date-formatting dep
 }
 ```
 
 `abi_version` is the **load-time guard**: `run` refuses a bundle whose `abi_version` differs
-from the host `FSW_ABI_VERSION` (1) with a clear error, before opening any `.so`. The
-per-system schemas are recorded for offline tooling (a ground station validating a config
-edit without the binaries); they are **not** required by `run`, which still opens each `.so`
-and reads its live `params_schema()` at resolve. Schemas may be omitted in v1 and added when
-offline validation lands.
+from the host `FSW_ABI_VERSION` (3 today — it has bumped twice since v1, see `src/abi/mod.rs`'s
+version-history comment) with a clear error, before opening any `.so`. **As shipped, `meta.kdl`
+carries only these three fields** (`abi_version`/`profile`/`built_at_unix`,
+`src/wiring/bundle.rs`'s `write_bundle`) — the per-system params-schema dump sketched in an
+earlier draft of this doc was **not implemented**; `run` still opens each `.so` and reads its
+live `params_schema()` at resolve, so offline (no-`.so`) schema validation stays future work
+(§8.6).
 
 ### 4.4 How `run` loads a bundle vs a source KDL
 
@@ -405,9 +409,9 @@ artifact "plant" crate="adcs-plant" lib="adcs_plant" type="Plant"
 artifact "nav"   crate="adcs-nav"   lib="adcs_nav"   type="Nav"
 artifact "ctrl"  crate="adcs-ctrl"  lib="adcs_ctrl"  type="Ctrl"
 
-system "plant" type="Plant" lib="plant" init_angle=0.5 init_rate=0.15 meas_sigma=0.002 seed=42
-system "nav"   type="Nav"   lib="nav"   meas_sigma=0.02
-system "ctrl"  type="Ctrl"  lib="ctrl"  q_weight=5.0 r_weight=8.0
+system "plant" type="Plant" artifact="plant" init_angle=0.5 init_rate=0.15 meas_sigma=0.002 seed=42
+system "nav"   type="Nav"   artifact="nav"   meas_sigma=0.02
+system "ctrl"  type="Ctrl"  artifact="ctrl"  q_weight=5.0 r_weight=8.0
 
 connect "plant" -> "nav"  frame="sensors"
 connect "nav"   -> "ctrl" frame="attitude_estimate"
@@ -417,7 +421,9 @@ connect "ctrl"  -> "plant" frame="torque_cmd" delayed=#true
 The dynamic bits of `kdl_doc()` are gone: the per-platform `cdylib_name` interpolation is
 replaced by **stems** (`lib="adcs_plant"`, decorated by the framework — §4.6); the live
 clock + telemetry that `build_live_coordinator` injected become `--wall --telemetry <addr>`
-flags. (`system … lib="plant"` still references the *artifact id*, unchanged.)
+flags. (`system … artifact="plant"` still references the *artifact id*; the property on a
+`system` node was later hard-renamed from `lib=` to `artifact=` so it can't be confused with
+the `artifact` node's own `lib=` stem — `examples/adcs-fsw2/mission.kdl:50-52`.)
 
 **`src/main.rs`** (replaces the bespoke runner + heartbeat):
 

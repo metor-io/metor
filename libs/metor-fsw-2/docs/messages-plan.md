@@ -1,5 +1,12 @@
 # Implementation plan — messages (downlink + uplink + sequence coupling)
 
+> **Since superseded:** messages gained full wiring-parity ports/edges (`docs/message-wiring.md`,
+> WP1-WP9), and the WP11 command plane this plan built (a `SlotCommand` Frame ring, a shared
+> uplink/downlink socket, `channel_id` dispatch) was reframed twice more — see `docs/messages.md`'s
+> status banner for the fully current shape (name-addressed commands, explicit per-slot message
+> edges, separate uplink/downlink connections, one unified `Registry`). Kept as the W1-W5
+> implementation history.
+
 Design: `docs/messages.md` (approved, decisions locked; Q7 resolved — one shared bidirectional
 socket, established once and split, broker shape owned by this plan). Summary of what we build: a
 second payload kind — **messages** (`(PacketId, postcard-bytes)` records on byte rings, the

@@ -1,5 +1,9 @@
 # Ring safety fixes (`metor-fsw-ring`) — design
 
+> **Status: LANDED** — implemented in commit `07406cfc` ("fix(ring): wave-2 — seqlock
+> torn-read fix, writer claim, lossless registration race, 32-bit soundness").
+> `docs/ring-buffer.md` reflects the shipped shape.
+
 Design for the ring-crate items from `docs/review-findings.md` §1–§2: **R1**
 (overwrite-mode torn read), **R6** (lossless view-registration race), **R7**
 (single-writer enforcement), **R3** (32-bit OOB on garbage length), **B6**

@@ -499,8 +499,10 @@ pub struct Wiring {
     pub coordinator: CoordinatorSpec,   // cycle_rate, default_depth, clock
     pub artifacts:   Vec<Artifact>,     // the cdylibs this mission loads
     pub systems:     Vec<SystemSpec>,
-    pub edges:       Vec<EdgeSpec>,     // from/out/to/in/delayed
+    pub edges:       Vec<EdgeSpec>,     // from/out/to/in/delayed/kind (Frame|Msg)
     pub telemetry:   Option<TelemetrySpec>,
+    pub slots:       Vec<SlotSpec>,     // runtime-loadable slots (sequences-slots.md)
+    pub uplink:      Option<UplinkSpec>, // the command uplink (messages.md §4.4)
 }
 
 pub struct Artifact {
@@ -559,22 +561,30 @@ exactly the bytes a dl system's `fsw_create` decodes.
 ### KDL as one deserializer
 
 The KDL front-end (`parse`) deserializes the same `Wiring`. Its surface adds an `artifact` node
-and a per-system `lib=` reference:
+and a per-system `artifact=` reference:
 
 ```kdl
 artifact "adcs" crate="adcs-systems" lib="adcs_systems" type="Plant"   // lib= is a stem (cli-runner.md §4.6)
 
-system "plant" type="Plant" lib="adcs" init_angle=0.5 init_rate=0.15
-system "nav"   type="Nav"   meas_sigma=0.02            // no lib= => static
+system "plant" type="Plant" artifact="adcs" init_angle=0.5 init_rate=0.15
+system "nav"   type="Nav"   meas_sigma=0.02            // no artifact= => static
 
 connect "plant" -> "nav"  frame="sensors"
 connect "ctrl"  -> "plant" frame="torque_cmd" delayed=#true
 telemetry { transport "tcp" addr="127.0.0.1:2240"; mode "all" }
 ```
 
-A `system` with no `lib=` resolves statically. A `system` node's params are carried verbatim as
-`ParamSource::Kdl(source_text)` and re-decoded at `resolve`: a static system re-parses them via
-`FromKdlNode`; a dl system schema-encodes them (below).
+Note the two properties are spelled differently on purpose: the `artifact` node's own `lib=` is
+the library **stem** (unchanged, cli-runner.md §4.6); a `system` node's `artifact=` references
+that node's `id`. (`system … lib=…` was the original spelling but was hard-renamed to `artifact=`
+— a guidance error, no alias — precisely so the two could not be confused.)
+
+A `system` with no `artifact=` resolves statically. A `system` node's params are carried verbatim
+as `ParamSource::Kdl(source_text)` and re-decoded at `resolve` through one shared serde
+`Deserializer` over the KDL node (`src/wiring/de.rs`, `docs/design-kdl-serde.md`): a static system
+deserializes them straight into its `Params: serde::de::DeserializeOwned` type; a dl system
+deserializes the same node into a `serde_json::Value` and schema-encodes it (below). There is no
+`FromKdlNode`/`FromKdlScalar` trait anymore — both paths share the one KDL-to-serde walk.
 
 ### Params: the single encoding
 
@@ -586,13 +596,15 @@ the concrete `Params` type:
 
 - The `.so`'s `fsw_describe` exports its `Params` **schema** as an `OwnedNamedType`
   (`<Params as postcard_schema::Schema>::SCHEMA`), carried on `SystemDescriptorMsg`.
-- **KDL front-end:** `encode_kdl_params(node_text, schema, system_name)` walks the schema's
-  named fields, pulls the matching KDL property for each, coerces it to the field's type,
-  builds a dynamic value, and hands it to `postcard_dyn::to_stdvec_dyn` — producing the
-  **same bytes** the typed Rust builder postcard-encodes. No `FromKdlNode`, no host-linked
-  `Params`. Errors are span-aware `LoadError`s: `DlUnknownParam` (a property with no schema
-  field), `DlMissingParam` (a required field with no property), `DlParamTypeMismatch` (a
-  property whose type does not match the field), `DlParamEncode` (an un-encodable schema shape).
+- **KDL front-end:** `encode_kdl_params(node_text, schema, system, reserved, skip_args)`
+  (`src/wiring/mod.rs`) first deserializes the node into a `serde_json::Value` through the shared
+  `de::params_value` walk (the same one the static path uses), then `conform_to_schema` checks
+  that value against the `.so`'s schema field-by-field (`conform_value` coerces/recurses) and
+  hands the conformed value to `postcard_dyn::to_stdvec_dyn` — producing the **same bytes** the
+  typed Rust builder postcard-encodes. No `FromKdlNode`, no host-linked `Params`. Errors are
+  span-aware `LoadError`s: `UnknownParam` (a property with no schema field), `MissingParam` (a
+  required field with no property), `InvalidParam` (a property whose type does not match the
+  field), `DlParamEncode` (an un-encodable schema shape).
 - **Rust-builder front-end:** the app has the `Params` type (from the shared contract crate),
   so a typed value postcard-encodes directly to the same bytes.
 - **`.so` side:** `fsw_create` postcard-decodes the bytes into the real `Params`.

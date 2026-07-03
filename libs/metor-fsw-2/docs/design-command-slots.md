@@ -1,6 +1,11 @@
 # Design — explicit command plane + slots as ordinary systems (A2 + A3)
 
-> **Status: DESIGN (D4 of `review-fixes-plan.md`, wave 0).** Covers findings **A2**
+> **Status: LANDED** — implemented across commits `90715ed9` (A2), `739b0d52` (A3), `c5090d17`
+> (A9), `d9e3b4fd` (A8), on top of `94b91143` (wave-4a: name-addressed
+> `SequenceCommand`/`SequenceChannelEvent`, `ChannelId` deleted). `docs/messages.md`'s status
+> banner and `docs/sequences-slots.md` §3 reflect the shipped shape.
+>
+> **Status (original): DESIGN (D4 of `review-fixes-plan.md`, wave 0).** Covers findings **A2**
 > (command edges become explicit dataflow), **A3** (slots stop being a third system
 > kind; name-based addressing), and the attached items **A8** (uplink dispatch), **A9**
 > (coordinator as system #0), **B5-runtime** (unknown-occupant Load surfaces), and

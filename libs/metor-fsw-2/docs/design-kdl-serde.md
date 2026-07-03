@@ -1,5 +1,9 @@
 # Design: KDL params via a serde Deserializer
 
+> **Status: LANDED** — implemented in commit `1aee7d1b` ("refactor(fsw2): wave-3 — KDL params
+> via one in-house serde Deserializer"), `src/wiring/de.rs`. `docs/wiring.md` §5/§6.3 and
+> `docs/dl-open.md` reflect the shipped shape.
+
 Status: DESIGN — approved decision is an **in-house `serde::Deserializer` over
 `&kdl::KdlNode`** (not knus/knuffel; `serde` is already a non-optional dep, `kdl`
 6.5 + `miette` stay behind the `kdl` feature). This replaces the bespoke

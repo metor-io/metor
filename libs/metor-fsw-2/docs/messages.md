@@ -1,23 +1,54 @@
 # Messages (`messages`)
 
-> **Status update (2026-07-01): messages are now first-class WIRED PORTS and the command plane has
-> been REFRAMED — see `docs/message-wiring.md` (the current design of record).** §1–§3, §5, §6
-> (the message channel, the downlink, the sequence coupling, and the ABI note) remain accurate.
-> **§1.2/§1.4 and all of §4 are SUPERSEDED**, as follows:
-> - `MsgOut` is now **typed** (`MsgOut<M>`) and, with `MsgIn<M>`, is a first-class port that drops
->   into a `SystemInput`/`SystemOutput` bundle and is wired by an ordinary edge (`connect_msg` /
->   `msg="Type"`), keyed on `M::ID`. A heterogeneous channel is modelled as N typed ports.
-> - The **command plane** is not a coordinator-drained "command bus" as §4 describes. The
->   `RingSource::command_out` capability, the per-emitter `"commands"` `MessageRegistry` channels,
->   the coordinator's `command_sources` + `drain_command_bus` head-of-cycle stage, and the
->   `CyclicSlot::command` broadcast are all **deleted**. Instead: the uplink is a fully ordinary
->   `CommandOut<SequenceCommand>` producer; the coordinator collects every command producer (its one
->   reserved in-proc `control_handle()` channel + every `SequenceCommand` output, by type); and each
->   slot's `SlotRunner` holds a fan-in `MsgIn<SequenceCommand>` over all of them, draining + filtering
->   by `channel_id` at the head of its own `step`. Per-slot targeting is the command's `channel_id`.
-> - The uplink's ground subscription is derived from its declared message-output ports, not hardcoded.
+> **Status update (2026-07-02): messages are first-class WIRED PORTS, the command plane has been
+> REFRAMED, and it has since been REFRAMED AGAIN — see `docs/message-wiring.md` for the wiring-parity
+> design, and `docs/review-fixes-plan.md` waves 4a-4c for the final shape (landed).** §1.1, §1.3, §2.1,
+> §3, §5, §6 (the record format, the downlink, the sequence coupling, and the ABI note) remain
+> accurate in substance. **§1.2/§1.4, §2.2, and all of §4 are SUPERSEDED — twice over**, as follows.
 >
-> Everything below (§1–§8) is retained as the historical WP11 + redesign narrative.
+> **First supersession (`docs/message-wiring.md`, landed):**
+> - `MsgOut` is now **typed** (`MsgOut<M>`) and, with `MsgIn<M>`, is a first-class port that drops
+>   into a `SystemInput`/`SystemOutput` bundle and is wired by an ordinary edge — one `connect` KDL
+>   node, kind (frame vs message) inferred from whether `frame=` or `msg=` is present — keyed on
+>   `M::ID`. A heterogeneous channel is modelled as N typed ports. (The low-level
+>   `CoordinatorBuilder::connect`/`connect_delayed` need only one `connect`, inferring the kind from
+>   the `PortRef`'s `PortId::{Component,Packet}`; the higher-level `WiringBuilder` keeps
+>   `connect_msg` as ergonomic sugar over the same edge — it was **not** deleted, contra an earlier
+>   draft of this note.)
+> - §2.2's separate `MessageRegistry` is **gone**: there is now **one** `Registry` for both frames
+>   and messages (`EntrySchema::{Table, Postcard}`, `src/registry.rs`), so a same-instance
+>   frame/channel name collision is detectable (`WireError::DuplicateRegistryKey`) instead of
+>   shadowed across two tables. `AllOutputs` is a `Capability`, not a "receive-all pseudo-port."
+>
+> **Second supersession (`docs/review-fixes-plan.md` waves 4a-4c, landed 2026-07-02) — the command
+> plane described just below is ALSO gone:**
+> - `ChannelId`/`channel_id` (a `u64` build-order index) is **deleted**. `SequenceCommand` /
+>   `SequenceChannelEvent` carry `channel: String` and are addressed by the slot's **instance
+>   name** end-to-end — matching how the panel and the wiring document already name a slot.
+> - There is **no coordinator-collected fan-out "by type"** and no coordinator-side drain/dispatch
+>   stage at all. Each slot declares an ordinary `commands: MsgIn<SequenceCommand>` **fan-in** port
+>   (`FanIn::Many`); every command producer that should reach a given slot is wired to it by an
+>   **explicit edge** (`connect "uplink" -> "mode" msg="SequenceCommand"`,
+>   `connect "coordinator" -> "mode" msg="SequenceCommand"`) — there is no implicit
+>   broadcast-to-every-slot sugar (the "fan out, self-filter" shape below did not survive). At the
+>   head of its own `step`, a slot drains its fan-in and applies commands whose `channel` equals its
+>   own name (`SlotRunner::apply_command`, `src/coordinator/slot.rs`).
+> - `CommandOut<M>` is **not a distinct type**: it is `pub type CommandOut<M, ...> = MsgOut<M, ...>`
+>   sugar the `SystemOutput` derive/`#[system]` macro recognizes and lowers to an
+>   `.untelemetered()` `PortDesc` (`src/message.rs`) — so inbound control is not echoed on the
+>   downlink, without a bespoke capability.
+> - The coordinator is registered as an ordinary system **#0** under the reserved instance name
+>   `"coordinator"` (`docs/design-command-slots.md` §2.6); `control_handle()` returns a take-once
+>   `Option<MsgOut<SequenceCommand>>` over that bundle's own `commands` output, wired like any other
+>   producer — not a hand-rolled ring outside the descriptor system.
+> - The uplink routes each received wire `Msg` to whichever of its declared `CommandOut<M>` outputs'
+>   `PacketId` matches (`RouteMsg::route`, multi-output dispatch), rather than forwarding a single
+>   command type pass-through; its ground subscription is still derived from its declared outputs.
+>
+> Everything below (§1–§8) is retained as the historical WP11 + redesign narrative; **read
+> `docs/message-wiring.md` and this banner for the wiring-parity shape, and treat every mention of
+> `channel_id`, a coordinator-drained command bus, or an implicit fan-out below as historical, not
+> current.**
 >
 > ---
 

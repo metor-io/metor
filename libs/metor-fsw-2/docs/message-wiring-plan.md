@@ -1,5 +1,13 @@
 # Implementation plan — message wiring parity (`message-wiring`)
 
+> **Since superseded (`docs/review-fixes-plan.md` waves 4a-4c, landed 2026-07-02):** the WP7
+> command-plane realization described below (coordinator-collected fan-out, `channel_id`
+> targeting) was reframed again — `ChannelId`/`channel_id` is deleted (name-addressed
+> `channel: String`), and per-slot targeting is now **explicit message edges** (each producer ×
+> slot pair wired individually), not a coordinator-collected broadcast. See `docs/messages.md`'s
+> status banner for the current shape. The record below is kept as the WP1-WP9 implementation
+> history.
+
 > **STATUS: IMPLEMENTED (all 9 WPs landed, each a green commit).** Whole workspace builds; all
 > `metor-fsw-2` tests + the `adcs-fsw2` example (sequences/closed-loop/bundle) pass;
 > `--no-default-features` clean; `tests/slot_integration.rs` unchanged. **Deviations from the plan,
