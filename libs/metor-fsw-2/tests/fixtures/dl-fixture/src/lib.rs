@@ -86,8 +86,8 @@ impl<B: Backing> CyclicSystem<B> for DlCounter {
         output: &mut Out<DlCounterOut<B>, B>,
     ) {
         let value = match input.tick.latest() {
-            Ok(Some(t)) => t.get().value,
-            _ => {
+            Some(t) => t.get().value,
+            None => {
                 output.health().error("no_tick");
                 return;
             }

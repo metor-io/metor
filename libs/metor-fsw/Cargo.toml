@@ -18,6 +18,9 @@ stellar = ["dep:stellarator", "metor-proto-stellar", "metor-proto/thingbuf", "fa
 metor-proto.path = "../metor-proto"
 metor-proto.features = ["std"]
 metor-proto-wkt.path = "../metor-proto/wkt"
+# `UpdateComponent` (a `ComponentValue` carrier) is `nox`-gated in wkt, and this crate
+# already requires `metor-proto/std`, so wkt's std-gated impls must come along.
+metor-proto-wkt.features = ["nox", "std"]
 
 # data structures
 heapless = "0.8"

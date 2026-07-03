@@ -27,7 +27,7 @@ use metor_fsw_ring::{
 };
 use metor_proto::types::{ComponentId, Msg, Timestamp};
 use metor_proto_wkt::{
-    ChannelId, SequenceChannelEvent, SequenceChannelSpec, SequenceCommand, SequenceRegistry,
+    SequenceChannelEvent, SequenceChannelSpec, SequenceCommand, SequenceRegistry,
 };
 use stellarator::sync::WaitQueue;
 use stellarator::{JoinHandle, JoinHandleDropGuard};
@@ -47,7 +47,7 @@ use crate::telemetry::{RecvTransport, TelemetryConfig, TelemetrySystem, Transpor
 use crate::{DEFAULT_DEPTH, Frame};
 
 mod slot;
-pub use slot::{AllowedOccupant, InitialOccupant, SLOT_NAME_CAP, SlotPhase, SlotStatus};
+pub use slot::{AllowedOccupant, InitialOccupant, SLOT_NAME_CAP, SlotStatus};
 use slot::{SlotReg, SlotRunner, slot_writer};
 
 /// Slack reader slots added on top of a buffer's fan-out, covering late taps such
@@ -210,6 +210,20 @@ pub enum WireError {
     /// that the one-cycle-late sampling is explicit rather than an artifact of
     /// registration order. `systems` names the cycle members in loop order.
     FeedbackCycle { systems: Vec<&'static str> },
+    /// A slot instance name exceeds [`NAME_CAP`] bytes. Slot names are the sequence
+    /// channels' **wire address** (`SequenceCommand::channel`) *and* must round-trip
+    /// losslessly into the fixed-size frames that carry them (`SlotStatus::occupant`,
+    /// the coordinator status entries) — a longer name would telemeter truncated while
+    /// addressing untruncated, so it is rejected at build instead of silently truncated.
+    SlotNameTooLong { name: String, len: usize },
+    /// A cyclic system **without** a receive-all port was registered after one **with**
+    /// it (the telemetry downlink). The downlink's end-of-cycle snapshot only observes
+    /// systems that step *before* it, so a later registration would telemeter one cycle
+    /// stale — enforced, not silently reordered (reordering would change the step order
+    /// the stale-edge diagnostics validate). Fix: register `system` before the
+    /// receive-all system. Async systems are exempt (they are not in the step order).
+    /// Both fields are **instance** names.
+    ReceiveAllNotLast { system: String, receive_all: String },
 }
 
 impl std::fmt::Display for WireError {
@@ -262,6 +276,20 @@ impl std::fmt::Display for WireError {
                 f,
                 "cycle_rate {rate} cannot pace a Wall clock — it must be finite and positive"
             ),
+            WireError::SlotNameTooLong { name, len } => write!(
+                f,
+                "slot instance name {name:?} is {len} bytes; the sequence-channel wire \
+                 address is capped at {NAME_CAP} bytes"
+            ),
+            WireError::ReceiveAllNotLast {
+                system,
+                receive_all,
+            } => write!(
+                f,
+                "cyclic system '{system}' is registered after the receive-all system \
+                 '{receive_all}' (the telemetry downlink), whose end-of-cycle snapshot \
+                 would miss it; register '{system}' before the telemetry downlink"
+            ),
             WireError::FeedbackCycle { systems } => write!(
                 f,
                 "unbroken feedback cycle {} — break one edge with connect_delayed",
@@ -298,17 +326,54 @@ impl StopReason {
     }
 }
 
-/// A cyclic slot's lifecycle state. Once `Stopped` it is never cleared in v1
-/// (recovery is future work).
+/// A cyclic slot's lifecycle state — the **one** lifecycle enum every slot kind shares.
+/// A static [`CyclicRunner`](crate::CyclicRunner) and a build-time
+/// [`DlSlot`](crate::dl::DlSlot) only ever inhabit `Running`/`Stopped` (once `Stopped`
+/// they are never cleared in v1); the runtime [`SlotRunner`](slot) uses all five, and a
+/// runtime slot recovers from a terminal state via `Load`/`Reset`.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum SlotState {
+    /// No occupant; `step` is a cheap no-op. (Runtime slots only.)
+    Empty,
+    /// An occupant is created and bound (its future built) but not yet polling. After a
+    /// hard-drop `Stop` the state returns to `Loaded` with no live future. (Runtime
+    /// slots only.)
+    Loaded,
+    /// The slot is polled every cycle.
     Running,
+    /// The occupant's future returned `Ready` — terminal **success**, not an error-stop.
+    /// The `Completed`/`Aborted`/`Failed` detail rides the occupant's own
+    /// [`SequenceStatus`](crate::sequence::SequenceStatus) frame; `outcome` is its
+    /// latched `run_state` byte. (Runtime slots only.)
+    Done { outcome: u8 },
+    /// Hard-stopped: an input was lapped or the `.so` panicked.
     Stopped { reason: StopReason },
 }
 
 impl SlotState {
+    /// The projection the coordinator's stopped-systems status uses: only a
+    /// lapped/panicked stop is an error-stop (`Done`/`Empty`/`Loaded` are not).
+    pub fn stop_reason(&self) -> Option<StopReason> {
+        match self {
+            SlotState::Stopped { reason } => Some(*reason),
+            _ => None,
+        }
+    }
+
+    /// The wire phase code published in [`SlotStatus::phase`]
+    /// (Empty=0/Loaded=1/Running=2/Done=3/Stopped=4).
+    pub fn code(&self) -> u8 {
+        match self {
+            SlotState::Empty => 0,
+            SlotState::Loaded => 1,
+            SlotState::Running => 2,
+            SlotState::Done { .. } => 3,
+            SlotState::Stopped { .. } => 4,
+        }
+    }
+
     pub fn is_stopped(&self) -> bool {
-        matches!(self, SlotState::Stopped { .. })
+        self.stop_reason().is_some()
     }
 }
 
@@ -334,8 +399,28 @@ pub(crate) trait CyclicSlot {
 // Coordinator status frame (coordinator.md §3.3/§5.3)
 // ---------------------------------------------------------------------------
 
+/// The one shared byte cap on every name packed into a fixed-size host frame (a stopped
+/// system in [`CoordinatorStatus`], the occupant in [`SlotStatus`]) — and the validated
+/// cap on slot instance names, which double as the sequence channels' **wire address**
+/// (`SequenceCommand::channel`). Matches
+/// [`SEQUENCE_CHANNEL_NAME_CAP`](metor_proto_wkt::SEQUENCE_CHANNEL_NAME_CAP).
+pub const NAME_CAP: usize = 48;
+
+// The build-validated cap and the wire protocol's documented cap are one invariant.
+const _: () = assert!(NAME_CAP == metor_proto_wkt::SEQUENCE_CHANNEL_NAME_CAP);
+
 /// Capacity of one stopped-system name in the status frame (longer truncated).
-pub const STATUS_NAME_CAP: usize = 48;
+pub const STATUS_NAME_CAP: usize = NAME_CAP;
+
+/// Pack a name into a fixed [`NAME_CAP`] buffer + used length (truncating) — the one
+/// packing helper for every fixed-size name field in the host frames.
+pub(crate) fn pack_name(name: &str) -> ([u8; NAME_CAP], u8) {
+    let bytes = name.as_bytes();
+    let n = bytes.len().min(NAME_CAP);
+    let mut buf = [0u8; NAME_CAP];
+    buf[..n].copy_from_slice(&bytes[..n]);
+    (buf, n as u8)
+}
 /// Max stopped systems named in one status record.
 pub const MAX_STOPPED: usize = 32;
 
@@ -480,14 +565,14 @@ struct PendingAsync {
 
 /// The per-slot auxiliary ports the build pass allocates ahead of the bind loop and
 /// hands to the [`SlotRunner`]: the host control/status writers' rings, the slot's
-/// message channel (the events `MsgOut`), a read view on the occupant's own
-/// [`SequenceStatus`] output, and the slot's [`ChannelId`] (`docs/messages.md` §5).
+/// message channel (the events `MsgOut`), and a read view on the occupant's own
+/// [`SequenceStatus`] output. Commands address the slot by its **instance name**
+/// (`docs/messages.md` §5), so no channel id is minted.
 struct SlotAux {
     control_ring: RingBuffer<BoxBacking>,
     status_ring: RingBuffer<BoxBacking>,
     events: MsgOut<SequenceChannelEvent>,
     seq_status: Input<SequenceStatus>,
-    channel_id: ChannelId,
 }
 
 // ---------------------------------------------------------------------------
@@ -875,6 +960,46 @@ impl CoordinatorBuilder {
 
         let n = self.descs.len();
         let depth = self.config.default_depth;
+
+        // --- Receive-all (telemetry) systems register last (A11(b): enforced) --------
+        // The downlink's end-of-cycle snapshot only observes systems stepping *before*
+        // it, so a cyclic system registered after it would telemeter one cycle stale.
+        // Enforced, not silently reordered: reordering registrations would change the
+        // step order the stale-edge diagnostics validate. Async systems are exempt
+        // (they run off their own task, not the registration-ordered step loop).
+        let mut first_receive_all: Option<usize> = None;
+        for s in 0..n {
+            if self.kinds[s] != SystemKind::Cyclic {
+                continue;
+            }
+            let has_receive_all = self.descs[s]
+                .inputs
+                .iter()
+                .chain(self.descs[s].outputs.iter())
+                .any(|p| matches!(p.kind, PortKind::ReceiveAll));
+            if has_receive_all {
+                first_receive_all.get_or_insert(s);
+            } else if let Some(t) = first_receive_all {
+                return Err(WireError::ReceiveAllNotLast {
+                    system: self.names[s].clone(),
+                    receive_all: self.names[t].clone(),
+                });
+            }
+        }
+
+        // --- Slot instance names are wire addresses: enforce the NAME_CAP ------------
+        // A `SequenceCommand` addresses a slot by its instance name, and the same name
+        // packs into fixed-size status frames; > NAME_CAP would telemeter truncated
+        // while addressing untruncated, so it is a build error, never a truncation.
+        for s in 0..n {
+            if matches!(self.regs[s], Reg::Slot(_)) && self.descs[s].name.len() > NAME_CAP {
+                return Err(WireError::SlotNameTooLong {
+                    name: self.descs[s].name.to_string(),
+                    len: self.descs[s].name.len(),
+                });
+            }
+        }
+
         // Every slot reads every command producer (the coordinator-collected fan-out,
         // `docs/message-wiring.md` §6): each `SequenceCommand` ring is viewed by all `n_slots`
         // slots, so their `max_readers` must reserve that many.
@@ -1132,14 +1257,11 @@ impl CoordinatorBuilder {
         // channel land in their registries like any output. The control ring is
         // host-written / occupant-read (uplink), so it is owned but not telemetered.
         //
-        // This loop also builds the **channel↔slot map** once (R4): `channel_id` = the
-        // slot's build-order index *among slots*, `name` = the slot instance name. The
-        // uplink (W3) reuses this map to address commands; here W4 reads it for the boot
-        // `SequenceRegistry` payload (`seq_specs`) — built once, never recomputed.
+        // This loop also builds the boot `SequenceRegistry` payload (`seq_specs`) once:
+        // one spec per slot, keyed by the slot's **instance name** — the channel's wire
+        // address (`docs/messages.md` §5); there is no build-order channel id.
         let mut slot_aux: HashMap<usize, SlotAux> = HashMap::new();
-        let mut channel_map: Vec<(ChannelId, &'static str)> = Vec::new();
         let mut seq_specs: Vec<SequenceChannelSpec> = Vec::new();
-        let mut next_channel: ChannelId = 0;
         // `s` indexes several disjoint collections (`regs`/`descs`/`names`/`output_rings`),
         // so the range loop is clearer than zipping five iterators.
         #[allow(clippy::needless_range_loop)]
@@ -1147,14 +1269,10 @@ impl CoordinatorBuilder {
             let Reg::Slot(slot_reg) = &self.regs[s] else {
                 continue;
             };
-            let channel_id = next_channel;
-            next_channel += 1;
             let slot_name: &'static str = self.descs[s].name;
-            channel_map.push((channel_id, slot_name));
-            // One `SequenceChannelSpec` per slot: its channel id, instance name, and the
+            // One `SequenceChannelSpec` per slot: its instance name and the
             // allowed-occupant names the panel may `Load` (`docs/messages.md` §5).
             seq_specs.push(SequenceChannelSpec {
-                id: channel_id,
                 name: slot_name.to_string(),
                 available: slot_reg.allowed.iter().map(|a| a.name.clone()).collect(),
             });
@@ -1213,7 +1331,6 @@ impl CoordinatorBuilder {
                     status_ring,
                     events,
                     seq_status,
-                    channel_id,
                 },
             );
         }
@@ -1385,7 +1502,6 @@ impl CoordinatorBuilder {
                         status_ring,
                         events,
                         seq_status,
-                        channel_id,
                     } = slot_aux.remove(&id).expect("slot aux rings allocated");
                     // The user inputs (registered descriptor) view their producers...
                     let mut inputs: Vec<FswRing> = (0..self.descs[id].inputs.len())
@@ -1421,7 +1537,7 @@ impl CoordinatorBuilder {
                         .collect();
                     // The slot's command fan-in: a view on every command producer (the
                     // coordinator's reserved channel + every `SequenceCommand` output). The
-                    // `SlotRunner` drains + filters by `channel_id` each step (§6).
+                    // `SlotRunner` drains + filters by its instance name each step (§6).
                     let commands = MsgIn::from_views(
                         command_producers
                             .iter()
@@ -1441,7 +1557,6 @@ impl CoordinatorBuilder {
                         slot_writer::<SlotStatus>(&status_ring),
                         events,
                         seq_status,
-                        channel_id,
                         commands,
                     );
                     cyclic.push(Box::new(runner));
@@ -1550,7 +1665,6 @@ impl CoordinatorBuilder {
             registry,
             message_registry,
             control_out,
-            channel_map,
             seq_registry_out,
             seq_registry,
             seq_registry_emitted: false,
@@ -1742,10 +1856,6 @@ pub struct Coordinator {
     /// ring's writer claim enforces one live writer) and handed out by
     /// [`control_handle`](Coordinator::control_handle), which takes it — `None` afterwards.
     control_out: Option<MsgOut<SequenceCommand>>,
-    /// The channel↔slot map built once at `build()`: `ChannelId` (the slot's build-order index
-    /// among slots) → slot instance name. Read for the boot [`SequenceRegistry`]; it no longer
-    /// translates commands (slots self-filter by `channel_id`, `docs/messages.md` §4.1).
-    channel_map: Vec<(ChannelId, &'static str)>,
     /// The sole writer of the coordinator's boot-`SequenceRegistry` message channel (§5).
     seq_registry_out: MsgOut<SequenceRegistry>,
     /// The prebuilt boot [`SequenceRegistry`] payload (the slots + their allowed
@@ -1798,27 +1908,6 @@ impl Coordinator {
         self.message_registry.clone()
     }
 
-    /// The channel↔slot map (R4): `(ChannelId, slot instance name)` for every slot, the
-    /// `ChannelId` being the slot's build-order index among slots. Built once at
-    /// `build()`; it is the boot [`SequenceRegistry`]'s identity (W4) and the address
-    /// table W3's uplink resolves a `SequenceCommand`'s `channel_id` through — one map,
-    /// so the published id and the commanded id always agree.
-    pub fn channel_map(&self) -> &[(ChannelId, &'static str)] {
-        &self.channel_map
-    }
-
-    /// The [`ChannelId`] of the slot registered under instance `name`, or `None` if no slot
-    /// has that name. The ergonomic address for driving a slot through
-    /// [`control_handle`](Self::control_handle) in-proc: a `SequenceCommand` carries a
-    /// `channel_id`, not a name (`docs/messages.md` §4.1), so a host/CLI/test resolves the
-    /// name once here rather than hard-coding the build-order index.
-    pub fn channel_id(&self, name: &str) -> Option<ChannelId> {
-        self.channel_map
-            .iter()
-            .find(|(_, n)| *n == name)
-            .map(|(id, _)| *id)
-    }
-
     /// Emit the boot [`SequenceRegistry`] on the coordinator's message channel (§5): the
     /// slots and their allowed occupants the panel's sequence view sources from. Called
     /// once at the head of [`run_for`](Self::run_for); exposed as the re-emit hook a
@@ -1831,8 +1920,8 @@ impl Coordinator {
     /// convenience for driving slots `Load`/`Start`/`Stop`/`Abort`/`Reset` — the host / CLI / a
     /// test [`emit`](MsgOut::emit)s [`SequenceCommand`]s the slots drain once per cycle (the same
     /// mechanism the uplink system uses, just an in-proc channel instead of a wire one). Address
-    /// a slot by its `channel_id` (its build-order index among slots; see
-    /// [`channel_map`](Self::channel_map)).
+    /// a slot by its **instance name** (`SequenceCommand::channel`) — the same key the wiring,
+    /// the telemetry prefix, and the boot [`SequenceRegistry`] use.
     ///
     /// The channel has exactly **one** writer (the ring's writer claim enforces it), minted at
     /// `build()` and handed out here **once**: the first call returns it, every later call
@@ -1858,7 +1947,7 @@ impl Coordinator {
     /// Read the latest coordinator status frame back (the stopped systems and
     /// their reason codes), for telemetry/test inspection.
     pub fn read_status(&mut self) -> Option<Vec<(String, u8)>> {
-        let rec = self.status_view.latest().ok().flatten()?;
+        let rec = self.status_view.latest()?;
         let list = rec.list::<StoppedEntry>(offset_of!(CoordinatorStatus, stopped));
         let mut out = Vec::new();
         for e in list.iter() {
@@ -1916,8 +2005,8 @@ impl Coordinator {
             };
             // Commands are drained per-slot at the head of each `step` (`docs/message-wiring.md`
             // §6): every slot's fan-in reads every command producer (the coordinator's in-proc
-            // channel + the uplink's `CommandOut`) and filters by `channel_id`, so a command
-            // dispatches the *same* cycle it lands — no coordinator-side command stage.
+            // channel + the uplink's `CommandOut`) and filters by its instance name, so a
+            // command dispatches the *same* cycle it lands — no coordinator-side command stage.
             for slot in &mut self.cyclic {
                 slot.step(now);
             }
@@ -2015,10 +2104,12 @@ impl Coordinator {
     fn update_status(&mut self, now: Timestamp) {
         let mut cur: Vec<StoppedSystem> = Vec::new();
         for slot in &self.cyclic {
-            if let SlotState::Stopped { reason } = slot.state() {
+            // Only a lapped/panicked stop is an error-stop; a runtime slot's
+            // Empty/Loaded/Done states are not (the `stop_reason` projection).
+            if let Some(reason) = slot.state().stop_reason() {
                 cur.push(StoppedSystem {
                     name: slot.name(),
-                    reason: *reason,
+                    reason,
                 });
             }
         }
@@ -2050,13 +2141,10 @@ impl Coordinator {
         let _ = self.status_out.write_with(&frame, |fw| {
             fw.list(offset_of!(CoordinatorStatus, stopped), |l| {
                 for (reason, name) in &entries {
-                    let bytes = name.as_bytes();
-                    let len = bytes.len().min(STATUS_NAME_CAP);
-                    let mut buf = [0u8; STATUS_NAME_CAP];
-                    buf[..len].copy_from_slice(&bytes[..len]);
+                    let (buf, len) = pack_name(name);
                     l.push(StoppedEntry {
                         reason: *reason,
-                        len: len as u8,
+                        len,
                         _pad: [0; 6],
                         name: buf,
                     });

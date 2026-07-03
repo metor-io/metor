@@ -141,7 +141,6 @@ impl FswStatus {
     /// Map a runner's [`SlotState`] (after a `step`) to the FFI status.
     fn from_slot(state: SlotState) -> Self {
         match state {
-            SlotState::Running => FswStatus::Running,
             SlotState::Stopped {
                 reason: StopReason::LappedInput,
             } => FswStatus::StoppedLapped,
@@ -151,6 +150,10 @@ impl FswStatus {
             SlotState::Stopped {
                 reason: StopReason::Panicked,
             } => FswStatus::Panicked,
+            // A `.so`-side `CyclicRunner` only ever inhabits Running/Stopped (the
+            // runtime-slot states Empty/Loaded/Done are host-side `SlotRunner`
+            // territory and never cross the ABI); everything not Stopped keeps running.
+            _ => FswStatus::Running,
         }
     }
 }
@@ -781,7 +784,7 @@ where
     let now_ts = Timestamp(now as i64);
     st.clock.now.set(now_ts);
     // Fold the cancel control frame (latched once seen, §4.4).
-    if let Ok(Some(f)) = bound.control.latest()
+    if let Some(f) = bound.control.latest()
         && f.get().cancel != 0
     {
         st.clock.cancel.set(true);

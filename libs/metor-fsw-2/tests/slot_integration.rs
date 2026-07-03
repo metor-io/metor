@@ -29,21 +29,21 @@ use metor_fsw_2::{
 };
 use stellarator::buf::{IoBuf, Slice};
 
-/// A `Load { occupant }` command addressed to channel `ch` — the in-proc twin of a panel
-/// uplink, the `SlotCommand::load`/`channel_map` collapse to one `SequenceCommand` type.
-fn load(ch: u64, occupant: &str) -> SequenceCommand {
+/// A `Load { occupant }` command addressed to the channel named `ch` (the slot's
+/// instance name) — the in-proc twin of a panel uplink.
+fn load(ch: &str, occupant: &str) -> SequenceCommand {
     SequenceCommand {
-        channel_id: ch,
+        channel: ch.to_string(),
         command: SequenceCommandKind::Load {
             name: occupant.to_string(),
         },
     }
 }
 
-/// A non-`Load` command (`Start`/`Stop`/`Abort`/`Reset`) addressed to channel `ch`.
-fn cmd(ch: u64, command: SequenceCommandKind) -> SequenceCommand {
+/// A non-`Load` command (`Start`/`Stop`/`Abort`/`Reset`) addressed to the channel named `ch`.
+fn cmd(ch: &str, command: SequenceCommandKind) -> SequenceCommand {
     SequenceCommand {
-        channel_id: ch,
+        channel: ch.to_string(),
         command,
     }
 }
@@ -140,7 +140,7 @@ fn seq_run_states(view: &mut Input<SequenceStatus>) -> Vec<u8> {
     states
 }
 
-// SlotPhase wire codes (slot.rs): Empty=0, Loaded=1, Running=2, Done=3, Stopped=4.
+// SlotState wire codes (SlotState::code): Empty=0, Loaded=1, Running=2, Done=3, Stopped=4.
 const LOADED: u8 = 1;
 const RUNNING: u8 = 2;
 const DONE: u8 = 3;
@@ -180,11 +180,11 @@ fn slot_load_start_runs_to_done() {
             .expect("reader slot available"),
     );
 
-    // Drive Load + Start through the in-proc control handle (drained at cycle 0).
-    let ch = coord.channel_id("adcs").expect("adcs slot channel");
+    // Drive Load + Start through the in-proc control handle (drained at cycle 0),
+    // addressed by the slot's instance name.
     let mut control = coord.control_handle().expect("taken once per coordinator");
-    control.emit(&load(ch, "waiter")).unwrap();
-    control.emit(&cmd(ch, SequenceCommandKind::Start)).unwrap();
+    control.emit(&load("adcs", "waiter")).unwrap();
+    control.emit(&cmd("adcs", SequenceCommandKind::Start)).unwrap();
 
     let coord = stellarator::run(|| async move {
         coord.run_for(4).await;
@@ -241,11 +241,10 @@ fn slot_abort_completes_aborted() {
 
     // Load + Start + Abort, all drained at cycle 0 (before the wait deadline), so the
     // very first poll observes the cancel and bails out via the safing branch.
-    let ch = coord.channel_id("adcs").expect("adcs slot channel");
     let mut control = coord.control_handle().expect("taken once per coordinator");
-    control.emit(&load(ch, "waiter")).unwrap();
-    control.emit(&cmd(ch, SequenceCommandKind::Start)).unwrap();
-    control.emit(&cmd(ch, SequenceCommandKind::Abort)).unwrap();
+    control.emit(&load("adcs", "waiter")).unwrap();
+    control.emit(&cmd("adcs", SequenceCommandKind::Start)).unwrap();
+    control.emit(&cmd("adcs", SequenceCommandKind::Abort)).unwrap();
 
     let coord = stellarator::run(|| async move {
         coord.run_for(3).await;
@@ -296,11 +295,10 @@ fn slot_stop_hard_drops_occupant() {
     );
 
     // Load + Start + Stop: the hard-drop returns the slot to Loaded with the future gone.
-    let ch = coord.channel_id("adcs").expect("adcs slot channel");
     let mut control = coord.control_handle().expect("taken once per coordinator");
-    control.emit(&load(ch, "waiter")).unwrap();
-    control.emit(&cmd(ch, SequenceCommandKind::Start)).unwrap();
-    control.emit(&cmd(ch, SequenceCommandKind::Stop)).unwrap();
+    control.emit(&load("adcs", "waiter")).unwrap();
+    control.emit(&cmd("adcs", SequenceCommandKind::Start)).unwrap();
+    control.emit(&cmd("adcs", SequenceCommandKind::Stop)).unwrap();
 
     let coord = stellarator::run(|| async move {
         coord.run_for(3).await;
@@ -352,10 +350,9 @@ fn slot_reset_reruns_from_start() {
     // polled at the Simulated loop's per-cycle yield — then emits Reset (rebuild the
     // selected occupant over the same rings) + Start, which the slot drains at the
     // head of cycle 4; cycles 4-6 reload and complete again.
-    let ch = coord.channel_id("adcs").expect("adcs slot channel");
     let mut control = coord.control_handle().expect("taken once per coordinator");
-    control.emit(&load(ch, "waiter")).unwrap();
-    control.emit(&cmd(ch, SequenceCommandKind::Start)).unwrap();
+    control.emit(&load("adcs", "waiter")).unwrap();
+    control.emit(&cmd("adcs", SequenceCommandKind::Start)).unwrap();
     let progress = coord.progress();
     let coord = stellarator::run(|| async move {
         let injector = stellarator::spawn(async move {
@@ -363,8 +360,8 @@ fn slot_reset_reruns_from_start() {
             while progress.load(Relaxed) < 3 {
                 stellarator::yield_now().await;
             }
-            control.emit(&cmd(ch, SequenceCommandKind::Reset)).unwrap();
-            control.emit(&cmd(ch, SequenceCommandKind::Start)).unwrap();
+            control.emit(&cmd("adcs", SequenceCommandKind::Reset)).unwrap();
+            control.emit(&cmd("adcs", SequenceCommandKind::Start)).unwrap();
         });
         coord.run_for(6).await;
         let _ = injector.await;
@@ -431,14 +428,10 @@ fn slot_emits_ordered_sequence_events_and_boot_registry() {
         .expect("the coordinator boot-registry channel is registered")
         .expect("reader slot available");
 
-    // The channel↔slot map (R4): one slot at build-order index 0.
-    assert_eq!(coord.channel_map(), &[(0u64, "adcs")]);
-
     // Drive Load + Start (drained at cycle 0), run to the occupant's Completed.
-    let ch = coord.channel_id("adcs").expect("adcs slot channel");
     let mut control = coord.control_handle().expect("taken once per coordinator");
-    control.emit(&load(ch, "waiter")).unwrap();
-    control.emit(&cmd(ch, SequenceCommandKind::Start)).unwrap();
+    control.emit(&load("adcs", "waiter")).unwrap();
+    control.emit(&cmd("adcs", SequenceCommandKind::Start)).unwrap();
     let mut coord = coord;
     let coord = stellarator::run(|| async move {
         coord.run_for(4).await;
@@ -449,7 +442,6 @@ fn slot_emits_ordered_sequence_events_and_boot_registry() {
     let registries = drain_msgs::<SequenceRegistry>(&mut boot_view);
     let registry = registries.last().expect("a boot SequenceRegistry was emitted");
     assert_eq!(registry.channels.len(), 1, "one slot channel");
-    assert_eq!(registry.channels[0].id, 0);
     assert_eq!(registry.channels[0].name, "adcs");
     assert_eq!(registry.channels[0].available, vec!["waiter".to_string()]);
 
@@ -457,8 +449,8 @@ fn slot_emits_ordered_sequence_events_and_boot_registry() {
     // Completed (the `waiter` occupant emits "waiting" then "done").
     let events = drain_msgs::<SequenceChannelEvent>(&mut events_view);
     assert!(
-        events.iter().all(|e| e.channel_id == 0),
-        "every event is tagged with the slot's channel id"
+        events.iter().all(|e| e.channel == "adcs"),
+        "every event is tagged with the slot's instance name"
     );
     let kinds: Vec<&SequenceEventKind> = events.iter().map(|e| &e.kind).collect();
     assert!(
@@ -536,24 +528,21 @@ fn uplink_command_loads_and_starts_same_cycle() {
     let mut b = Coordinator::builder(sim_config());
     // One slot, started EMPTY (no initial occupant) — the interactive panel scenario.
     let _slot = b.add_slot("adcs", vec![("waiter".into(), loaded, Vec::new())], None);
-    // The uplink: a panel `Load { waiter }` then `Start`, both addressed to channel 0 (the
-    // slot's build-order index, per `channel_map`).
+    // The uplink: a panel `Load { waiter }` then `Start`, both addressed to the slot by
+    // its instance name.
     b.add_uplink(MockRecv::new(vec![
         SequenceCommand {
-            channel_id: 0,
+            channel: "adcs".to_string(),
             command: SequenceCommandKind::Load {
                 name: "waiter".to_string(),
             },
         },
         SequenceCommand {
-            channel_id: 0,
+            channel: "adcs".to_string(),
             command: SequenceCommandKind::Start,
         },
     ]));
     let mut coord = b.build().expect("the slot + uplink graph builds");
-
-    // Channel 0 addresses the slot the commands target.
-    assert_eq!(coord.channel_map(), &[(0u64, "adcs")]);
 
     // Tap the host SlotStatus before running (an overwrite ring starts at the live edge).
     let mut slot_view: Input<SlotStatus> = Input::new(
@@ -589,4 +578,164 @@ fn uplink_command_loads_and_starts_same_cycle() {
     );
 
     drop((coord, slot_view));
+}
+
+// ---------------------------------------------------------------------------
+// 7. Name addressing (design-command-slots.md §2.3): the slot's instance name IS the
+//    wire address, so it is validated at build (the NAME_CAP), a command naming no
+//    slot is dropped by every slot's filter, and reordering slot declarations does
+//    not re-address commands (the ChannelId regression).
+// ---------------------------------------------------------------------------
+
+#[test]
+fn slot_name_over_the_cap_is_a_build_error() {
+    use metor_fsw_2::{NAME_CAP, WireError};
+    let Some(lib) = locate_fixture() else {
+        return;
+    };
+    let loaded = open_waiter(&lib);
+
+    // One byte over the cap: would telemeter truncated while addressing untruncated.
+    let long = "a".repeat(NAME_CAP + 1);
+    let mut b = Coordinator::builder(sim_config());
+    let _slot = b.add_slot(long.clone(), vec![("waiter".into(), loaded, Vec::new())], None);
+    let err = b.build().err().expect("an over-cap slot name fails the build");
+    match err {
+        WireError::SlotNameTooLong { name, len } => {
+            assert_eq!(name, long);
+            assert_eq!(len, NAME_CAP + 1);
+        }
+        other => panic!("expected SlotNameTooLong, got {other:?}"),
+    }
+}
+
+#[test]
+fn misaddressed_command_matches_no_slot() {
+    let Some(lib) = locate_fixture() else {
+        return;
+    };
+    let loaded = open_waiter(&lib);
+
+    let mut b = Coordinator::builder(sim_config());
+    let _slot = b.add_slot("adcs", vec![("waiter".into(), loaded, Vec::new())], None);
+    let mut coord = b.build().expect("the slot graph builds");
+
+    let mut slot_view: Input<SlotStatus> = Input::new(
+        coord
+            .registry()
+            .view(ComponentId::new("adcs.slot_status"))
+            .expect("slot status is registered")
+            .expect("reader slot available"),
+    );
+    let messages = coord.message_registry();
+    let mut events_view = messages
+        .view(ComponentId::new("adcs.sequences"))
+        .expect("the slot events channel is registered")
+        .expect("reader slot available");
+
+    // A command for another channel and one whose name exceeds the cap: both simply
+    // match no slot (dropped by the per-slot name filter — no panic, no state change).
+    let mut control = coord.control_handle().expect("taken once per coordinator");
+    control.emit(&load("other", "waiter")).unwrap();
+    control.emit(&load(&"x".repeat(64), "waiter")).unwrap();
+    control
+        .emit(&cmd("other", SequenceCommandKind::Start))
+        .unwrap();
+
+    let coord = stellarator::run(|| async move {
+        coord.run_for(3).await;
+        coord
+    });
+
+    let phases = slot_phases(&mut slot_view);
+    assert!(
+        phases.iter().all(|&p| p == 0),
+        "the misaddressed commands left the slot Empty: {phases:?}"
+    );
+    let events = drain_msgs::<SequenceChannelEvent>(&mut events_view);
+    assert!(
+        events.is_empty(),
+        "no event was emitted for commands addressed elsewhere: {events:?}"
+    );
+
+    drop((coord, slot_view, events_view, control));
+}
+
+/// The ChannelId regression body: commands used to address the slot's build-order index,
+/// so swapping two slot declarations silently re-targeted ground commands. Build a
+/// two-slot mission in the given declaration order; the command addressed to "adcs" must
+/// drive the adcs slot either way, and the recovery slot must never leave Empty. (One
+/// order per `#[test]` — `stellarator::run` is once-per-thread.)
+fn drive_adcs_of_two_slots(adcs_first: bool) {
+    let Some(lib) = locate_fixture() else {
+        return;
+    };
+
+    let mut b = Coordinator::builder(sim_config());
+    let add = |b: &mut metor_fsw_2::CoordinatorBuilder, name: &str| {
+        b.add_slot(
+            name,
+            vec![("waiter".to_string(), open_waiter(&lib), Vec::new())],
+            None,
+        );
+    };
+    if adcs_first {
+        add(&mut b, "adcs");
+        add(&mut b, "recovery");
+    } else {
+        add(&mut b, "recovery");
+        add(&mut b, "adcs");
+    }
+    let mut coord = b.build().expect("the two-slot graph builds");
+
+    let mut adcs_view: Input<SlotStatus> = Input::new(
+        coord
+            .registry()
+            .view(ComponentId::new("adcs.slot_status"))
+            .expect("adcs slot status is registered")
+            .expect("reader slot available"),
+    );
+    let mut recovery_view: Input<SlotStatus> = Input::new(
+        coord
+            .registry()
+            .view(ComponentId::new("recovery.slot_status"))
+            .expect("recovery slot status is registered")
+            .expect("reader slot available"),
+    );
+
+    let mut control = coord.control_handle().expect("taken once per coordinator");
+    control.emit(&load("adcs", "waiter")).unwrap();
+    control
+        .emit(&cmd("adcs", SequenceCommandKind::Start))
+        .unwrap();
+
+    let coord = stellarator::run(|| async move {
+        coord.run_for(4).await;
+        coord
+    });
+
+    let phases = slot_phases(&mut adcs_view);
+    assert!(
+        phases.contains(&RUNNING),
+        "adcs ran (declared {} first): {phases:?}",
+        if adcs_first { "adcs" } else { "recovery" }
+    );
+    assert_eq!(phases.last(), Some(&DONE), "adcs finished Done: {phases:?}");
+    let recovery = slot_phases(&mut recovery_view);
+    assert!(
+        recovery.iter().all(|&p| p == 0),
+        "the recovery slot never left Empty: {recovery:?}"
+    );
+
+    drop((coord, adcs_view, recovery_view, control));
+}
+
+#[test]
+fn command_addresses_slot_by_name_adcs_declared_first() {
+    drive_adcs_of_two_slots(true);
+}
+
+#[test]
+fn reordering_slots_does_not_readdress_commands() {
+    drive_adcs_of_two_slots(false);
 }

@@ -11,7 +11,7 @@ use std::sync::Arc;
 
 use gpui::{AnyElement, Context, IntoElement, SharedString, Window, div, prelude::*, px};
 use metor_proto::types::Timestamp;
-use metor_proto_wkt::{ChannelId, SequenceRunState};
+use metor_proto_wkt::SequenceRunState;
 
 use crate::inspector::rows::{CommandRow, InspectorRow, NavRow};
 use crate::inspector::{InspectorMode, InspectorRequest, open_inspector};
@@ -40,9 +40,10 @@ pub enum SequenceListMode {
 #[derive(facet::Facet)]
 pub struct SequenceView {
     pub mode: SequenceListMode,
-    /// The channel whose `Stop` is armed for confirmation, if any. Transient UI state.
+    /// The channel (by name) whose `Stop` is armed for confirmation, if any. Transient
+    /// UI state.
     #[facet(skip)]
-    arming_stop: Option<ChannelId>,
+    arming_stop: Option<SharedString>,
 }
 
 impl SequenceView {
@@ -59,9 +60,9 @@ impl SequenceView {
 }
 
 /// Snapshot of one channel for rendering, owned so the store borrow is released before we
-/// build listeners that need `&mut Context`.
+/// build listeners that need `&mut Context`. The name is the channel's identity — the
+/// address every published command carries.
 struct ChannelRow {
-    id: ChannelId,
     name: SharedString,
     loaded: Option<SharedString>,
     available: Vec<SharedString>,
@@ -88,21 +89,23 @@ fn format_age(at: Timestamp) -> String {
     }
 }
 
-/// Inspector rows listing the sequences loadable into `channel_id`; selecting one publishes
-/// a load command. Shared by this panel's `Load` button and the grid's control page.
+/// Inspector rows listing the sequences loadable into the channel named `channel`;
+/// selecting one publishes a load command. Shared by this panel's `Load` button and the
+/// grid's control page.
 pub(crate) fn load_picker_rows(
-    channel_id: ChannelId,
+    channel: SharedString,
     available: &[SharedString],
 ) -> Vec<Box<dyn InspectorRow>> {
     available
         .iter()
         .map(|name| {
             let name = name.clone();
+            let channel = channel.clone();
             Box::new(CommandRow::new(
                 name.clone(),
                 Arc::new(move |_window, cx| {
                     if let Some(store) = sequences::try_global(cx) {
-                        store.read(cx).load(channel_id, name.to_string());
+                        store.read(cx).load(&channel, name.to_string());
                     }
                 }),
             )) as Box<dyn InspectorRow>
@@ -114,7 +117,7 @@ pub(crate) fn load_picker_rows(
 /// appears from a terminal state; `Stop` drills into a confirmation row since it is the unsafe
 /// hard-drop. Used by the grid's click-through.
 pub(crate) fn channel_control_rows(
-    channel_id: ChannelId,
+    channel: SharedString,
     run_state: SequenceRunState,
     available: Vec<SharedString>,
 ) -> Vec<Box<dyn InspectorRow>> {
@@ -123,31 +126,43 @@ pub(crate) fn channel_control_rows(
     rows.push(Box::new(NavRow::new(
         "Load",
         "",
-        Box::new(move |_cx| load_picker_rows(channel_id, &available)),
+        Box::new({
+            let channel = channel.clone();
+            move |_cx| load_picker_rows(channel.clone(), &available)
+        }),
     )));
     if is_resettable(run_state) {
         rows.push(Box::new(CommandRow::new(
             "Reset",
-            Arc::new(move |_window, cx| {
-                if let Some(store) = sequences::try_global(cx) {
-                    store.read(cx).reset(channel_id);
+            Arc::new({
+                let channel = channel.clone();
+                move |_window, cx| {
+                    if let Some(store) = sequences::try_global(cx) {
+                        store.read(cx).reset(&channel);
+                    }
                 }
             }),
         )));
     }
     rows.push(Box::new(CommandRow::new(
         "Start",
-        Arc::new(move |_window, cx| {
-            if let Some(store) = sequences::try_global(cx) {
-                store.read(cx).start(channel_id);
+        Arc::new({
+            let channel = channel.clone();
+            move |_window, cx| {
+                if let Some(store) = sequences::try_global(cx) {
+                    store.read(cx).start(&channel);
+                }
             }
         }),
     )));
     rows.push(Box::new(CommandRow::new(
         "Abort",
-        Arc::new(move |_window, cx| {
-            if let Some(store) = sequences::try_global(cx) {
-                store.read(cx).abort(channel_id);
+        Arc::new({
+            let channel = channel.clone();
+            move |_window, cx| {
+                if let Some(store) = sequences::try_global(cx) {
+                    store.read(cx).abort(&channel);
+                }
             }
         }),
     )));
@@ -155,11 +170,12 @@ pub(crate) fn channel_control_rows(
         "Stop",
         "",
         Box::new(move |_cx| {
+            let channel = channel.clone();
             vec![Box::new(CommandRow::new(
                 "Confirm stop — may leave the system unsafe",
                 Arc::new(move |_window, cx| {
                     if let Some(store) = sequences::try_global(cx) {
-                        store.read(cx).stop(channel_id);
+                        store.read(cx).stop(&channel);
                     }
                 }),
             )) as Box<dyn InspectorRow>]
@@ -290,7 +306,6 @@ impl Render for SequenceView {
                     .channels_ordered()
                     .iter()
                     .map(|c| ChannelRow {
-                        id: c.id,
                         name: c.name.clone(),
                         loaded: c.loaded.clone(),
                         available: c.available.clone(),
@@ -302,8 +317,8 @@ impl Render for SequenceView {
                 if channels.is_empty() {
                     list = list.child(empty_row(&theme, "No channels declared"));
                 } else {
-                    for ch in channels {
-                        list = list.child(self.channel_row(ch, &theme, cx));
+                    for (ix, ch) in channels.into_iter().enumerate() {
+                        list = list.child(self.channel_row(ix, ch, &theme, cx));
                     }
                 }
             }
@@ -324,14 +339,15 @@ impl Render for SequenceView {
 impl SequenceView {
     fn channel_row(
         &self,
+        ix: usize,
         ch: ChannelRow,
         theme: &crate::theme::Theme,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let idx = run_state_index(ch.run_state);
         let color = theme.run_state_color(idx);
-        let id = ch.id;
-        let arming = self.arming_stop == Some(id);
+        let name = ch.name.clone();
+        let arming = self.arming_stop.as_ref() == Some(&name);
 
         let loaded_line = ch
             .loaded
@@ -343,13 +359,14 @@ impl SequenceView {
             .unwrap_or_else(|| SharedString::from(run_state_label(ch.run_state)));
 
         let available = ch.available.clone();
-        let load_btn = pill_button(theme, ("seq-load", id as usize), "Load").on_click(
-            cx.listener(move |this, _, window, cx| {
+        let load_btn = pill_button(theme, ("seq-load", ix), "Load").on_click(cx.listener({
+            let name = name.clone();
+            move |this, _, window, cx| {
                 this.arming_stop = None;
                 let Some(open) = open_inspector(cx) else {
                     return;
                 };
-                let rows = load_picker_rows(id, &available);
+                let rows = load_picker_rows(name.clone(), &available);
                 open(
                     InspectorRequest {
                         rows,
@@ -358,54 +375,60 @@ impl SequenceView {
                     window,
                     cx,
                 );
-            }),
-        );
+            }
+        }));
 
         let resettable = is_resettable(ch.run_state);
-        let reset_btn = pill_button(theme, ("seq-reset", id as usize), "Reset").on_click(
-            cx.listener(move |this, _, _, cx| {
+        let reset_btn = pill_button(theme, ("seq-reset", ix), "Reset").on_click(cx.listener({
+            let name = name.clone();
+            move |this, _, _, cx| {
                 this.arming_stop = None;
                 if let Some(store) = sequences::try_global(cx) {
-                    store.read(cx).reset(id);
+                    store.read(cx).reset(&name);
                 }
                 cx.notify();
-            }),
-        );
+            }
+        }));
 
-        let start_btn = pill_button(theme, ("seq-start", id as usize), "Start").on_click(
-            cx.listener(move |this, _, _, cx| {
+        let start_btn = pill_button(theme, ("seq-start", ix), "Start").on_click(cx.listener({
+            let name = name.clone();
+            move |this, _, _, cx| {
                 this.arming_stop = None;
                 if let Some(store) = sequences::try_global(cx) {
-                    store.read(cx).start(id);
+                    store.read(cx).start(&name);
                 }
                 cx.notify();
-            }),
-        );
+            }
+        }));
 
-        let abort_btn = pill_button(theme, ("seq-abort", id as usize), "Abort").on_click(
-            cx.listener(move |this, _, _, cx| {
+        let abort_btn = pill_button(theme, ("seq-abort", ix), "Abort").on_click(cx.listener({
+            let name = name.clone();
+            move |this, _, _, cx| {
                 this.arming_stop = None;
                 if let Some(store) = sequences::try_global(cx) {
-                    store.read(cx).abort(id);
+                    store.read(cx).abort(&name);
                 }
                 cx.notify();
-            }),
-        );
+            }
+        }));
 
         let stop_label = if arming { "Confirm stop" } else { "Stop" };
-        let stop_btn = pill_button(theme, ("seq-stop", id as usize), stop_label)
+        let stop_btn = pill_button(theme, ("seq-stop", ix), stop_label)
             .text_color(theme.error_accent)
             .when(arming, |el| el.bg(theme.run_state_tint(run_state_index(SequenceRunState::Failed))))
-            .on_click(cx.listener(move |this, _, _, cx| {
-                if this.arming_stop == Some(id) {
-                    if let Some(store) = sequences::try_global(cx) {
-                        store.read(cx).stop(id);
+            .on_click(cx.listener({
+                let name = name.clone();
+                move |this, _, _, cx| {
+                    if this.arming_stop.as_ref() == Some(&name) {
+                        if let Some(store) = sequences::try_global(cx) {
+                            store.read(cx).stop(&name);
+                        }
+                        this.arming_stop = None;
+                    } else {
+                        this.arming_stop = Some(name.clone());
                     }
-                    this.arming_stop = None;
-                } else {
-                    this.arming_stop = Some(id);
+                    cx.notify();
                 }
-                cx.notify();
             }));
 
         div()

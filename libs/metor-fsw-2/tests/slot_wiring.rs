@@ -24,7 +24,7 @@ use metor_fsw_2::{
 const FIXTURE_CRATE: &str = "metor-fsw-2-seq-fixture";
 const FIXTURE_STEM: &str = "metor_fsw_2_seq_fixture";
 
-// SlotPhase wire codes (slot.rs): Empty=0, Loaded=1, Running=2, Done=3, Stopped=4.
+// SlotState wire codes (SlotState::code): Empty=0, Loaded=1, Running=2, Done=3, Stopped=4.
 const RUNNING: u8 = 2;
 const DONE: u8 = 3;
 
@@ -184,12 +184,12 @@ slot "adcs" {{
         .expect("the slot events channel is registered")
         .expect("reader slot available");
 
-    // A typo'd panel/uplink Load, injected through the in-proc control handle.
-    let ch = coord.channel_id("adcs").expect("adcs slot channel");
+    // A typo'd panel/uplink Load, injected through the in-proc control handle and
+    // addressed to the slot by its instance name.
     let mut control = coord.control_handle().expect("taken once per coordinator");
     control
         .emit(&SequenceCommand {
-            channel_id: ch,
+            channel: "adcs".to_string(),
             command: SequenceCommandKind::Load {
                 name: "nonesuch".to_string(),
             },
@@ -324,7 +324,6 @@ fn slot_allow_params_resolve_and_run_b1() {
     });
     let out = gain_view
         .latest()
-        .expect("no lap on the gain tap")
         .expect("the occupant published its configured gain");
     assert_eq!(out.get().gain, 0.8, "allow params reached the running occupant");
     assert!(coord.stopped().is_empty(), "Done is not a hard-stop");

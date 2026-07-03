@@ -341,11 +341,12 @@ pub(crate) struct DlSlot {
 impl DlSlot {
     /// `fsw_execute` returning the **raw** [`FswStatus`] (incl. the terminal
     /// [`Done`](FswStatus::Done)), guarded on a null/unbound state. Unlike
-    /// [`CyclicSlot::step`] — which folds the status into the 2-variant
-    /// [`SlotState`] and so cannot represent `Done` — this hands the raw word back to
-    /// the caller. The runtime [`SlotRunner`](crate::coordinator) drives an occupant
-    /// through this and maps the status into its own richer slot phase, so a
-    /// completed sequence becomes a terminal phase rather than a benign keep-running.
+    /// [`CyclicSlot::step`] — which folds the status straight into the
+    /// [`SlotState`] and treats `Done` as keep-running (a build-time slot has no
+    /// occupant outcome to refine it with) — this hands the raw word back to the
+    /// caller. The runtime [`SlotRunner`](crate::coordinator) drives an occupant
+    /// through this and maps the status into the full lifecycle, so a completed
+    /// sequence becomes a terminal `Done` rather than a benign keep-running.
     pub(crate) fn execute_raw(&mut self, now: Timestamp) -> FswStatus {
         if self.state.is_null() {
             return FswStatus::Panicked;
@@ -406,7 +407,7 @@ impl CyclicSlot for DlSlot {
             // returns it (only a `#[sequence]` occupant does, via `run_seq_execute`).
             // The slot-layer `SlotRunner` (W4) is where `Done` is meaningful; here it
             // can only arrive from a misbehaving `.so`, so treat it as a benign
-            // keep-running (the 2-variant `SlotState` has no terminal-success state).
+            // keep-running (a build-time slot has no occupant outcome to refine it).
             FswStatus::Done => SlotState::Running,
         };
     }

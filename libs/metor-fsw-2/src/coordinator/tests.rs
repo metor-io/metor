@@ -135,7 +135,7 @@ impl CyclicSystem for Consumer {
         if !self.drain {
             return; // ignore the input so it eventually laps
         }
-        if let Ok(Some(imu)) = input.imu.latest() {
+        if let Some(imu) = input.imu.latest() {
             self.seen.borrow_mut().push(imu.get().omega);
         }
     }
@@ -477,8 +477,8 @@ impl System for Backer {
 impl CyclicSystem for Backer {
     fn execute(&mut self, now: Timestamp, input: &mut BackerIn, o: &mut Self::Output) {
         let angle = match input.imu.latest() {
-            Ok(Some(imu)) => imu.get().omega,
-            _ => 0.0,
+            Some(imu) => imu.get().omega,
+            None => 0.0,
         };
         let _ = o.nav.write(&Nav {
             timestamp: now,

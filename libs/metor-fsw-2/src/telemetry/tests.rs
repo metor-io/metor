@@ -89,7 +89,7 @@ impl System for Consumer {
 
 impl CyclicSystem for Consumer {
     fn execute(&mut self, now: Timestamp, input: &mut ConsIn, o: &mut Self::Output) {
-        if let Ok(Some(imu)) = input.imu.latest() {
+        if let Some(imu) = input.imu.latest() {
             let _ = o.nav.write(&Nav {
                 timestamp: now,
                 angle: imu.get().omega,
@@ -452,7 +452,7 @@ async fn message_downlink_fifo_no_coalesce() {
             MsgOut::new(ring.writer(NoWake, NoWake).expect("first writer"));
         cmd_out
             .emit(&SequenceCommand {
-                channel_id: 0,
+                channel: "mode".to_string(),
                 command: SequenceCommandKind::Start,
             })
             .expect("emit start");
@@ -463,7 +463,6 @@ async fn message_downlink_fifo_no_coalesce() {
         reg_out
             .emit(&SequenceRegistry {
                 channels: vec![SequenceChannelSpec {
-                    id: 0,
                     name: "mode".to_string(),
                     available: vec!["commissioning".to_string()],
                 }],
@@ -474,7 +473,7 @@ async fn message_downlink_fifo_no_coalesce() {
         MsgOut::new(ring.writer(NoWake, NoWake).expect("claim freed on drop"));
     cmd_out
         .emit(&SequenceCommand {
-            channel_id: 7,
+            channel: "mode".to_string(),
             command: SequenceCommandKind::Abort,
         })
         .expect("emit abort");
@@ -571,7 +570,7 @@ async fn message_downlink_fifo_no_coalesce() {
     let first: SequenceCommand = msgs[0].parse().expect("parse start");
     assert!(matches!(first.command, SequenceCommandKind::Start));
     let third: SequenceCommand = msgs[2].parse().expect("parse abort");
-    assert_eq!(third.channel_id, 7);
+    assert_eq!(third.channel, "mode");
     assert!(matches!(third.command, SequenceCommandKind::Abort));
 }
 
@@ -622,4 +621,30 @@ fn uplink_subscribes_to_its_declared_command_ids() {
     use metor_proto::types::Msg;
     use metor_proto_wkt::SequenceCommand;
     assert_eq!(super::uplink_subscribe_ids(), vec![SequenceCommand::ID]);
+}
+
+/// A11(b): "the telemetry downlink registers last" is enforced, not silently reordered —
+/// a cyclic system registered *after* the receive-all downlink would telemeter one cycle
+/// stale, so `build()` rejects it by name.
+#[test]
+fn cyclic_after_receive_all_is_a_build_error() {
+    let mut b = Coordinator::builder(sim_config());
+    b.add_cyclic_named("producer", Producer { n: 0.0 });
+    b.add_telemetry(TelemetryConfig {
+        transport: MockTransport::new(false),
+        mode: TelemetryMode::All,
+    });
+    // A second producer (no inputs, so nothing else can fail first) after the downlink.
+    b.add_cyclic_named("late", Producer { n: 0.0 });
+    let err = b.build().err().expect("a late cyclic system fails the build");
+    match err {
+        crate::WireError::ReceiveAllNotLast {
+            system,
+            receive_all,
+        } => {
+            assert_eq!(system, "late");
+            assert_eq!(receive_all, "telemetry");
+        }
+        other => panic!("expected ReceiveAllNotLast, got {other:?}"),
+    }
 }

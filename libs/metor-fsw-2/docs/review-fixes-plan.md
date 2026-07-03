@@ -85,8 +85,15 @@ are not ours to commit.
       at HEAD via metor-proto-wkt nox-gating — unrelated. 138 lib tests green.)
 
 ### Wave 4 — A1 unification (after D3), then A2+A3 (after D4)
-- [ ] A1 first (biggest churn), then A2+A3 on the unified model.
-      → **Commit each.**
+- [x] W4a: command/slots PHASE 1 (A1-independent): name-addressed
+      SequenceCommand/Event (fresh PacketIds 224,58-60 — design's 45-47
+      collide with node protocol), SlotState merge, ChannelId deleted,
+      telemetry-last WireError, full ground migration (panel 137 tests green,
+      cube-sat, db). Also fixed pre-existing metor-fsw wkt gating build break
+      and a silent dl_integration skip-pass. Docs still say channel_id →
+      wave-6 docs pass. (2026-07-02)
+- [ ] A1 unification (biggest churn), then command/slots phases 2-5 on the
+      unified model. → **Commit each.**
 
 ### Wave 5 — E2 `#[system]` macro (after wave 4 trait surface settles)
 - [ ] Macro + migrate adcs-fsw2 example + static-linking example (E8d).

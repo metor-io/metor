@@ -49,7 +49,7 @@ mod tests {
         let (addr, db) = setup_test_db().await.unwrap();
         let mut client = Client::connect(addr).await.unwrap();
         let event = SequenceChannelEvent {
-            channel_id: 3,
+            channel: "adcs".to_string(),
             kind: SequenceEventKind::Started,
         };
         client.send(&event).await.0.unwrap();
