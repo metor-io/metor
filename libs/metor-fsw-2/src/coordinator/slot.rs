@@ -156,12 +156,13 @@ pub(crate) struct SlotRunner {
     /// drained every cycle while Running to source `Progress` lines and the terminal
     /// outcome the host-side `FswStatus` word cannot carry (`docs/messages.md` §5.1).
     seq_status: Input<SequenceStatus>,
-    /// This slot's command input (`docs/message-wiring.md` §6): a fan-in
-    /// [`MsgIn<SequenceCommand>`](MsgIn) over **every** command producer (the coordinator's
-    /// in-proc `control_handle` channel + every system's `SequenceCommand` output). Drained at
-    /// the head of each [`step`](CyclicSlot::step) and filtered by the slot's **instance
-    /// name**, so a command addressed to this slot dispatches the cycle it arrives — the
-    /// per-slot replacement for the coordinator's old broadcast `drain_command_bus`.
+    /// This slot's declared command input (`docs/design-command-slots.md` §2.5): a
+    /// fan-in [`MsgIn<SequenceCommand>`](MsgIn) over exactly the producers explicitly
+    /// edged into it (`connect … msg="SequenceCommand"` — the coordinator's
+    /// `control_handle` channel, the uplink, an autonomy emitter). Zero edges is a
+    /// legal, command-less slot. Drained at the head of each
+    /// [`step`](CyclicSlot::step) and filtered by the slot's **instance name**, so a
+    /// command addressed to this slot dispatches the cycle it arrives.
     commands: MsgIn<SequenceCommand>,
     /// The latest occupant `run_state` drained while Running, used to refine the terminal
     /// `Done` into `Completed`/`Aborted`/`Failed` (the ABI status word carries no detail).

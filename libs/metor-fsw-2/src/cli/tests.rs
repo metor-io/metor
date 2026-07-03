@@ -130,7 +130,12 @@ fn uplink_override_sets_wiring_uplink() {
         "metor-fsw", "run", "m.kdl", "--build", "--uplink", "127.0.0.1:2241",
     ]);
     apply_overrides(&mut wiring, &args).unwrap();
-    assert_eq!(wiring.uplink, Some("127.0.0.1:2241".parse().unwrap()));
+    assert_eq!(
+        wiring.uplink,
+        Some(crate::wiring::UplinkSpec {
+            addr: "127.0.0.1:2241".parse().unwrap()
+        })
+    );
 }
 
 #[test]

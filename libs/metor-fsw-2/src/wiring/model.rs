@@ -41,12 +41,25 @@ pub struct Wiring {
     pub edges: Vec<EdgeSpec>,
     /// The telemetry downlink, if any.
     pub telemetry: Option<TelemetrySpec>,
-    /// The command uplink endpoint, if any (`docs/messages.md` §4.4/§4.5). When set,
+    /// The command uplink, if any (`docs/messages.md` §4.4/§4.5). When set,
     /// [`resolve`](super::resolve) registers an [`UplinkSystem`](crate::UplinkSystem) reading
-    /// panel `SequenceCommand`s off **its own** TCP connection to this address (separate from
-    /// the telemetry downlink's). v1 has no KDL surface for it — set via the CLI `--uplink`
-    /// flag or [`WiringBuilder::uplink`](super::WiringBuilder::uplink).
-    pub uplink: Option<SocketAddr>,
+    /// panel command Msgs off **its own** TCP connection (separate from the telemetry
+    /// downlink's) under the instance name `"uplink"`, **before** the edges pass — so
+    /// command edges name it (`connect "uplink" -> "<slot>" msg="SequenceCommand"`).
+    /// Declared with the KDL `uplink { … }` node, the CLI `--uplink` flag, or
+    /// [`WiringBuilder::uplink`](super::WiringBuilder::uplink).
+    pub uplink: Option<UplinkSpec>,
+}
+
+/// The command uplink, the read twin of [`TelemetrySpec`] (`docs/messages.md` §4.4):
+///
+/// ```kdl
+/// uplink { transport "tcp" addr="127.0.0.1:2241" }   // instance name "uplink"
+/// ```
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+pub struct UplinkSpec {
+    /// The TCP address of the metor-db broker the uplink subscribes to.
+    pub addr: SocketAddr,
 }
 
 /// Coordinator-wide configuration, the serializable mirror of

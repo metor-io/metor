@@ -711,6 +711,13 @@ enum Reg {
     Dl(DlReg),
     /// A runtime-swappable slot, bound to a [`SlotRunner`](slot::SlotRunner) at `build()`.
     Slot(SlotReg),
+    /// The coordinator itself, registered as system #0 under the reserved instance
+    /// name `"coordinator"` (`docs/design-command-slots.md` §2.6). A **marker**
+    /// registration: its declared outputs are allocated/registered by the uniform
+    /// passes like any system's, but it is never pushed into `cyclic` (the
+    /// coordinator *is* the loop) — the bind arm wraps the allocated rings into the
+    /// coordinator's own fields instead.
+    Coordinator,
 }
 
 // ---------------------------------------------------------------------------
@@ -734,14 +741,48 @@ pub struct CoordinatorBuilder {
 
 impl CoordinatorBuilder {
     fn new(config: CoordinatorConfig) -> Self {
-        Self {
+        let mut b = Self {
             config,
             regs: Vec::new(),
             descs: Vec::new(),
             kinds: Vec::new(),
             names: Vec::new(),
             edges: Vec::new(),
-        }
+        };
+        // The coordinator registers itself as system #0 under the reserved instance
+        // name `"coordinator"` (`docs/design-command-slots.md` §2.6): an ordinary
+        // declared bundle, so its channels are wired/sized/registered by the same
+        // passes as every system's. The `commands` output is the operator command
+        // channel behind the take-once [`Coordinator::control_handle`]; commands
+        // reach a slot only over an explicit `"coordinator" -> <slot>` edge.
+        // Untelemetered (inbound control is never echoed on the downlink); named
+        // "commands" so the registry key stays `coordinator.commands`.
+        let desc = SystemDescriptor {
+            name: COORDINATOR_INSTANCE,
+            kind: SystemKind::Cyclic,
+            inputs: Vec::new(),
+            outputs: vec![PortDesc::msg_named::<SequenceCommand>("commands").untelemetered()],
+            capabilities: Vec::new(),
+        };
+        b.descs.push(desc);
+        b.kinds.push(SystemKind::Cyclic);
+        b.names.push(COORDINATOR_INSTANCE.to_string());
+        b.regs.push(Reg::Coordinator);
+        b
+    }
+
+    /// The handle addressing the coordinator's own system-#0 bundle (§2.6), so a
+    /// front-end can wire the operator command edge:
+    /// `connect(PortRef::msg::<SequenceCommand>(b.coordinator_handle()), …)` — the
+    /// Rust twin of the KDL `connect "coordinator" -> "<slot>" msg="SequenceCommand"`.
+    pub fn coordinator_handle(&self) -> SystemHandle {
+        SystemHandle { id: 0 }
+    }
+
+    /// The registered descriptor of `handle` (the wiring loader reads back a slot's
+    /// registered contract and the coordinator's own bundle for edge resolution).
+    pub(crate) fn descriptor_of(&self, handle: SystemHandle) -> &SystemDescriptor {
+        &self.descs[handle.id]
     }
 
     /// Register a cyclic system under its type's `System::NAME` instance name; see
@@ -918,6 +959,14 @@ impl CoordinatorBuilder {
         if inputs.last().map(|p| p.id) == Some(PortId::Component(SlotControlIn::FRAME_ID)) {
             inputs.pop();
         }
+        // The slot's declared command input (`docs/design-command-slots.md` §2.2/§2.5):
+        // an ordinary fan-in message input, so command wiring is ordinary message
+        // wiring — a producer commands this slot only over an explicit edge
+        // (`connect "<producer>" -> "<slot>" msg="SequenceCommand"`). Zero edges is
+        // legal (an autonomy-free, wiring-frozen slot receives no commands). The
+        // runner drains it at the head of each step; it is never handed to the
+        // occupant.
+        inputs.push(PortDesc::msg::<SequenceCommand>());
         let registered = SystemDescriptor {
             name: leaked,
             kind: SystemKind::Cyclic,
@@ -1061,15 +1110,6 @@ impl CoordinatorBuilder {
                 });
             }
         }
-
-        // Every slot reads every command producer (the coordinator-collected fan-out,
-        // `docs/message-wiring.md` §6): each `SequenceCommand` ring is viewed by all `n_slots`
-        // slots, so their `max_readers` must reserve that many.
-        let n_slots = self
-            .regs
-            .iter()
-            .filter(|r| matches!(r, Reg::Slot(_)))
-            .count();
 
         // --- Per-descriptor axis validation (no edges needed) ----------------
         // FanIn::Many × Delivery::Snapshot: latest-wins across producers is
@@ -1274,17 +1314,10 @@ impl CoordinatorBuilder {
                     port: out_idx,
                 };
                 // ONE sizing path (depth by delivery — `alloc_ring`); only the
-                // registry-entry shape still splits on the schema. A
-                // `SequenceCommand` output is a command producer read by every
-                // slot, so it reserves `n_slots` extra readers on top of its edge
-                // fan-out (an A2 residue `docs/design-command-slots.md` deletes by
-                // making command edges explicit).
-                let cmd_readers = if port.id == PortId::Packet(SequenceCommand::ID) {
-                    n_slots
-                } else {
-                    0
-                };
-                let ring = alloc_ring(port.delivery, port.max_size, depth, readers + cmd_readers);
+                // registry-entry shape still splits on the schema. Command channels
+                // are ordinary outputs here: a slot reads a producer only over an
+                // explicit edge, so the edge fan-out counts its readers exactly (A2).
+                let ring = alloc_ring(port.delivery, port.max_size, depth, readers);
                 match &port.schema {
                     PortSchema::Table { .. } => {
                         reg_entries.push(registry_entry(&instance, port, ring.clone()));
@@ -1445,42 +1478,6 @@ impl CoordinatorBuilder {
             channels: seq_specs,
         };
 
-        // --- Coordinator-owned command channel (the in-proc control_handle, §6) ------
-        // A message channel carrying postcard `SequenceCommand`s: the one *reserved* command
-        // producer. Its single `MsgOut` is minted below (handed out once by
-        // `control_handle()`) and every slot's command fan-in reads it — so it reserves
-        // `n_slots` readers. Registered like every buffer but **untelemetered** (A6):
-        // inbound control is findable by key (`coordinator.commands`) through the full
-        // `Registry` for a debugger/test, yet never surfaced through `AllOutputs` /
-        // the downlink — no more opt-out-by-omission.
-        let command_ring =
-            alloc_ring(Delivery::Log, MAX_MSG_BYTES, depth, n_slots + READER_SLACK);
-        let command_entry =
-            postcard_entry(COORDINATOR_INSTANCE, "commands", command_ring.clone(), false);
-        table.rings.push(RingEntry {
-            ring: command_ring.clone(),
-            frame_id: command_entry.key,
-            role: BufferRole::Coordinator,
-            instance: None,
-        });
-        reg_entries.push(command_entry);
-        // The channel's single writer, minted once here (the region's writer claim
-        // enforces one live writer per ring); `control_handle()` hands it out once.
-        let control_out = Some(owned_writer::<SequenceCommand>(&command_ring));
-
-        // The command producers every slot fans in from (`docs/message-wiring.md` §6): the
-        // coordinator's reserved in-proc channel, plus every system's `SequenceCommand` output
-        // (the uplink's `CommandOut`, a future autonomy emitter). Collected by type — the
-        // coordinator wires the fan-out; the emitter is a fully ordinary message producer.
-        let mut command_producers: Vec<RingBuffer<BoxBacking>> = vec![command_ring.clone()];
-        for s in 0..n {
-            for (out_idx, port) in self.descs[s].outputs.iter().enumerate() {
-                if port.id == PortId::Packet(SequenceCommand::ID) {
-                    command_producers.push(output_rings[s][out_idx].clone());
-                }
-            }
-        }
-
         // One keyspace: a same-instance name collision between a frame and a channel
         // (both `"<instance>.<name>"`) is now detectable instead of shadowing.
         let mut seen_keys: HashMap<ComponentId, usize> = HashMap::new();
@@ -1551,9 +1548,26 @@ impl CoordinatorBuilder {
         // --- Bind every system's ports over the allocated rings --------------
         let mut cyclic: Vec<Box<dyn CyclicSlot>> = Vec::new();
         let mut pending_async: Vec<PendingAsync> = Vec::new();
+        // The operator command writer, minted once by the coordinator's own (#0)
+        // bind arm; `control_handle()` hands it out once.
+        let mut control_out: Option<MsgOut<SequenceCommand>> = None;
         let regs = std::mem::take(&mut self.regs);
         for (id, reg) in regs.into_iter().enumerate() {
             match reg {
+                // The coordinator's own bundle (§2.6): a marker registration — not a
+                // cyclic slot (the coordinator IS the loop). Its declared outputs were
+                // allocated/registered by the uniform passes above; wrap the writers
+                // into the coordinator's fields here, single-writer by construction.
+                Reg::Coordinator => {
+                    let commands_idx = self.descs[id]
+                        .outputs
+                        .iter()
+                        .position(|p| p.id == PortId::Packet(SequenceCommand::ID))
+                        .expect("the coordinator #0 bundle declares its commands output");
+                    control_out = Some(owned_writer::<SequenceCommand>(
+                        &output_rings[id][commands_idx],
+                    ));
+                }
                 // A dlopen'd system binds over **raw** `FswRing` regions, not typed
                 // `BoundPort`s: gather the same per-port rings the coordinator allocated
                 // (outputs = this system's own buffers; inputs = views into the upstream
@@ -1605,8 +1619,17 @@ impl CoordinatorBuilder {
                         events,
                         seq_status,
                     } = slot_aux.remove(&id).expect("slot aux rings allocated");
+                    // The registered inputs are the occupant's user inputs plus the
+                    // slot's own trailing `commands` fan-in (runner-drained, never
+                    // handed to the occupant) — split them here.
+                    let cmd_in_idx = self.descs[id]
+                        .inputs
+                        .iter()
+                        .position(|p| p.id == PortId::Packet(SequenceCommand::ID))
+                        .expect("a slot's registered descriptor declares its commands input");
                     // The user inputs (registered descriptor) view their producers...
                     let mut inputs: Vec<FswRing> = (0..self.descs[id].inputs.len())
+                        .filter(|in_idx| *in_idx != cmd_in_idx)
                         .map(|in_idx| {
                             let (prod_id, out_idx) = cons_edges[&(id, in_idx)][0];
                             let (base, len) = output_rings[prod_id][out_idx].region();
@@ -1637,17 +1660,24 @@ impl CoordinatorBuilder {
                             }
                         })
                         .collect();
-                    // The slot's command fan-in: a view on every command producer (the
-                    // coordinator's reserved channel + every `SequenceCommand` output). The
-                    // `SlotRunner` drains + filters by its instance name each step (§6).
+                    // The slot's command fan-in: one view per producer explicitly
+                    // edged into the declared `commands` input (A2 — no type-keyed
+                    // broadcast; zero edges is a legal, command-less slot). The
+                    // `SlotRunner` drains + filters by its instance name each step.
                     let commands = MsgIn::from_views(
-                        command_producers
-                            .iter()
-                            .map(|r| {
-                                r.view(NoWake, NoWake)
-                                    .expect("slot command reader slot (sized for n_slots)")
+                        cons_edges
+                            .get(&(id, cmd_in_idx))
+                            .map(|producers| {
+                                producers
+                                    .iter()
+                                    .map(|&(prod_id, out_idx)| {
+                                        output_rings[prod_id][out_idx]
+                                            .view(NoWake, NoWake)
+                                            .expect("command reader slot (edge fan-out sized)")
+                                    })
+                                    .collect()
                             })
-                            .collect(),
+                            .unwrap_or_default(),
                     );
                     let runner = SlotRunner::new(
                         self.descs[id].name,
@@ -1722,9 +1752,12 @@ impl CoordinatorBuilder {
                             launcher: r.bind(&mut binder),
                             wake_on_stop: async_wakes[id].clone(),
                         }),
-                        // The dl/slot arms are handled by the outer match.
+                        // The dl/slot/coordinator arms are handled by the outer match.
                         Reg::Dl(_) => unreachable!("dl registration bound by the outer match"),
                         Reg::Slot(_) => unreachable!("slot registration bound by the outer match"),
+                        Reg::Coordinator => {
+                            unreachable!("coordinator registration bound by the outer match")
+                        }
                     }
                 }
             }
@@ -1969,12 +2002,13 @@ pub struct Coordinator {
     /// The ONE broad registry over every registered buffer — frames and message
     /// channels alike, untelemetered entries included (telemetry.md §2).
     registry: Arc<Registry>,
-    /// The single writer over the coordinator-owned command channel
-    /// (`docs/message-wiring.md` §6): the one *reserved* `SequenceCommand` producer, the
-    /// in-proc twin of a system's `CommandOut`; every slot's command fan-in reads it. The
-    /// coordinator no longer drains commands — slots do. Minted once at `build()` (the
-    /// ring's writer claim enforces one live writer) and handed out by
-    /// [`control_handle`](Coordinator::control_handle), which takes it — `None` afterwards.
+    /// The single writer over the coordinator's declared `commands` output (its #0
+    /// bundle, §2.6): the in-proc `SequenceCommand` producer. A slot reads it only
+    /// over an explicit `"coordinator" -> <slot>` edge — the same wiring surface the
+    /// uplink uses; with no edge the handle is inert (visible in the graph, A2).
+    /// Minted once at `build()` (the ring's writer claim enforces one live writer)
+    /// and handed out by [`control_handle`](Coordinator::control_handle), which
+    /// takes it — `None` afterwards.
     control_out: Option<MsgOut<SequenceCommand>>,
     /// The sole writer of the coordinator's boot-`SequenceRegistry` message channel (§5).
     seq_registry_out: MsgOut<SequenceRegistry>,
@@ -2042,6 +2076,10 @@ impl Coordinator {
     /// `build()` and handed out here **once**: the first call returns it, every later call
     /// returns `None`. Take it once and hold it for the run — driving commands from one place is
     /// now structural, not a discipline note.
+    ///
+    /// Commands reach a slot only over an explicit `"coordinator" -> <slot>` edge
+    /// (`connect … msg="SequenceCommand"`, A2): with no edge the handle is inert —
+    /// visible in the wiring, diagnosable from the graph.
     pub fn control_handle(&mut self) -> Option<MsgOut<SequenceCommand>> {
         self.control_out.take()
     }
@@ -2118,10 +2156,10 @@ impl Coordinator {
                 ClockMode::Wall => Timestamp::now(),
                 ClockMode::Simulated { dt } => simulated_now(epoch, dt, k as u64),
             };
-            // Commands are drained per-slot at the head of each `step` (`docs/message-wiring.md`
-            // §6): every slot's fan-in reads every command producer (the coordinator's in-proc
-            // channel + the uplink's `CommandOut`) and filters by its instance name, so a
-            // command dispatches the *same* cycle it lands — no coordinator-side command stage.
+            // Commands are drained per-slot at the head of each `step`: a slot's
+            // declared `commands` fan-in reads exactly the producers explicitly edged
+            // into it (A2) and filters by its instance name, so a command dispatches
+            // the *same* cycle it lands — no coordinator-side command stage.
             for slot in &mut self.cyclic {
                 slot.step(now);
             }

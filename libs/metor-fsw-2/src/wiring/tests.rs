@@ -1275,3 +1275,175 @@ async fn msg_edge_builder_matches_kdl() {
     coord.run_for(3).await;
     assert!(WIRE_SINK_COUNT.load(Relaxed) >= 3);
 }
+
+// ---------------------------------------------------------------------------
+// The command plane through the KDL front-end (A2): the reserved "coordinator"
+// instance, the `uplink { … }` node, and msg-edge resolution by packet id when the
+// producer's display name is overridden (`coordinator.commands`).
+// ---------------------------------------------------------------------------
+
+static CMD_SINK_COUNT: AtomicU64 = AtomicU64::new(0);
+
+// A cyclic consumer of the wkt `SequenceCommand` (no params): counts drained commands.
+struct CmdSink;
+
+#[derive(SystemInput)]
+struct CmdSinkIn {
+    commands: MsgIn<metor_proto_wkt::SequenceCommand>,
+}
+
+impl System for CmdSink {
+    type Input = CmdSinkIn;
+    type Output = Out<NoOut>;
+    const NAME: &'static str = "cmd_sink";
+}
+
+impl CyclicSystem for CmdSink {
+    fn execute(&mut self, _now: Timestamp, input: &mut CmdSinkIn, _o: &mut Self::Output) {
+        input.commands.drain(|_| {
+            CMD_SINK_COUNT.fetch_add(1, Relaxed);
+        });
+    }
+}
+
+impl BuildSystem for CmdSink {
+    type Params = ();
+    fn new(_params: Self::Params) -> Self {
+        CmdSink
+    }
+}
+
+fn cmd_registry() -> Registry {
+    let mut r = Registry::new();
+    r.register::<CmdSink, _>("CmdSink");
+    r
+}
+
+/// `uplink { transport "tcp" addr=… }` parses onto `Wiring.uplink` (the design's
+/// KDL surface for the instance name "uplink").
+#[test]
+fn uplink_node_parses() {
+    let kdl = r#"
+coordinator cycle_rate=100.0
+uplink { transport "tcp" addr="127.0.0.1:2241" }
+"#;
+    let wiring = parse(kdl).expect("parse succeeds");
+    assert_eq!(
+        wiring.uplink,
+        Some(crate::wiring::UplinkSpec {
+            addr: "127.0.0.1:2241".parse().unwrap()
+        })
+    );
+}
+
+/// `"coordinator"` is a reserved instance name: a user system claiming it is a
+/// clean `DuplicateInstance`, not a silent registry-key collision.
+#[test]
+fn user_system_named_coordinator_is_rejected() {
+    let kdl = r#"
+coordinator cycle_rate=100.0
+system "coordinator" type="CmdSink"
+"#;
+    let err = match load(kdl, &cmd_registry()) {
+        Err(e) => e,
+        Ok(_) => panic!("expected DuplicateInstance for the reserved name"),
+    };
+    assert!(
+        matches!(err, LoadError::DuplicateInstance { ref name, .. } if name == "coordinator"),
+        "unexpected error: {err:?}"
+    );
+}
+
+/// The operator command edge resolves through KDL: the `msg="SequenceCommand"` token
+/// names the message TYPE; the coordinator's producer port (display name
+/// `"commands"`, registry key `coordinator.commands`) is matched by packet id via the
+/// consumer the token resolved on — and the in-proc `control_handle` emit reaches the
+/// consumer over that edge.
+#[cfg(not(miri))]
+#[stellarator::test]
+async fn coordinator_command_edge_resolves_and_delivers() {
+    use metor_proto_wkt::{SequenceCommand, SequenceCommandKind};
+    CMD_SINK_COUNT.store(0, Relaxed);
+
+    let kdl = r#"
+coordinator cycle_rate=1000.0
+
+system "sink" type="CmdSink"
+
+connect "coordinator" -> "sink" msg="SequenceCommand"
+"#;
+    let mut coord = load(kdl, &cmd_registry()).expect("load succeeds");
+    let mut control = coord.control_handle().expect("taken once");
+    control
+        .emit(&SequenceCommand {
+            channel: "anything".to_string(),
+            command: SequenceCommandKind::Start,
+        })
+        .expect("emit over the declared operator channel");
+    coord.run_for(2).await;
+    assert_eq!(CMD_SINK_COUNT.load(Relaxed), 1, "the edged command arrived");
+}
+
+/// Without the edge the operator channel is inert (the A2 opt-in, KDL spelling).
+/// Asserted through the SLOT-FREE consumer's own drain: the sink's `MsgIn` binds
+/// zero producer views, so the emit cannot arrive. (Reads the sink's fan-in shape
+/// off the built graph rather than a shared counter — the counter tests run in
+/// parallel.)
+#[cfg(not(miri))]
+#[stellarator::test]
+async fn coordinator_commands_without_edge_are_inert() {
+    use metor_proto_wkt::{SequenceCommand, SequenceCommandKind};
+
+    let kdl = r#"
+coordinator cycle_rate=1000.0
+
+system "isolated_sink" type="CmdSinkInert"
+"#;
+    let mut r = Registry::new();
+    r.register::<CmdSinkInert, _>("CmdSinkInert");
+    let mut coord = load(kdl, &r).expect("load succeeds");
+    let mut control = coord.control_handle().expect("taken once");
+    control
+        .emit(&SequenceCommand {
+            channel: "anything".to_string(),
+            command: SequenceCommandKind::Start,
+        })
+        .expect("emit over the declared operator channel");
+    coord.run_for(2).await;
+    assert_eq!(
+        CMD_INERT_COUNT.load(Relaxed),
+        0,
+        "no edge, no delivery — the handle is inert by wiring"
+    );
+}
+
+static CMD_INERT_COUNT: AtomicU64 = AtomicU64::new(0);
+
+/// The inert-path twin of [`CmdSink`], with its own counter (tests run in parallel).
+struct CmdSinkInert;
+
+#[derive(SystemInput)]
+struct CmdSinkInertIn {
+    commands: MsgIn<metor_proto_wkt::SequenceCommand>,
+}
+
+impl System for CmdSinkInert {
+    type Input = CmdSinkInertIn;
+    type Output = Out<NoOut>;
+    const NAME: &'static str = "cmd_sink_inert";
+}
+
+impl CyclicSystem for CmdSinkInert {
+    fn execute(&mut self, _now: Timestamp, input: &mut CmdSinkInertIn, _o: &mut Self::Output) {
+        input.commands.drain(|_| {
+            CMD_INERT_COUNT.fetch_add(1, Relaxed);
+        });
+    }
+}
+
+impl BuildSystem for CmdSinkInert {
+    type Params = ();
+    fn new(_params: Self::Params) -> Self {
+        CmdSinkInert
+    }
+}
