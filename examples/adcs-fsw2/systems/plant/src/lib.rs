@@ -9,22 +9,16 @@
 //! `gps` measurement the flight software flies on (a Gauss-Markov position error + white
 //! velocity noise), the wheel telemetry, the true `world` environment, and a `body` truth
 //! frame the host taps to measure convergence.
-
-// The `export_system!`-generated `extern "C" fn fsw_*` exports take raw pointers by ABI
-// contract (the host owns their validity, dl-open.md §2.5); clippy's
-// `not_unsafe_ptr_arg_deref` is inherent to that macro surface for any cdylib.
-#![allow(clippy::not_unsafe_ptr_arg_deref)]
+//!
+//! Authored with `#[system]` (`docs/design-system-macro.md`): the port set is the `execute`
+//! signature, and the bundles/trait impls/`BuildSystem`/`fsw_*` exports are all generated.
 
 use adcs_contracts::{
     ALTITUDE, BodyState, DT, EARTH_RADIUS, G, GPS_POS_SIGMA, GPS_TAU, GPS_VEL_SIGMA, Gps, M,
     MASS, MagneticModel, PlantParams, ReactionWheel, Sensors, TorqueCmd, V3, Wheels, World,
     epoch_at, inertia_diag, mag_field_eci, sun_dir_eci,
 };
-use metor_fsw_2::metor_proto::types::Timestamp;
-use metor_fsw_2::ring::{Backing, BoxBacking};
-use metor_fsw_2::{
-    BuildSystem, CyclicSystem, Input, Out, Output, System, SystemInput, SystemOutput,
-};
+use metor_fsw_2::{Input, Output, Timestamp, system};
 use nox::{
     Body, Quaternion, SpatialForce, SpatialInertia, SpatialMotion, SpatialTransform, six_dof_rk4,
     tensor,
@@ -52,20 +46,14 @@ pub struct PlantSystem {
     gps_pos_err: V3,
 }
 
-#[derive(SystemInput)]
-pub struct PlantIn<B: Backing = BoxBacking> {
-    pub torque: Input<TorqueCmd, B>,
+/// Point-mass Earth gravity force on `body`: `-G·M·m / |r|³ · r`.
+fn gravity(body: &Body) -> V3 {
+    let r = body.pos.linear();
+    let r_mag = r.norm().into_buf();
+    r * (-G * M * MASS / r_mag.powi(3))
 }
 
-#[derive(SystemOutput)]
-pub struct PlantOut<B: Backing = BoxBacking> {
-    pub sensors: Output<Sensors, B>,
-    pub gps: Output<Gps, B>,
-    pub wheels: Output<Wheels, B>,
-    pub body: Output<BodyState, B>,
-    pub world: Output<World, B>,
-}
-
+#[system(name = "plant", export = "export")]
 impl PlantSystem {
     pub fn new(p: PlantParams) -> Self {
         // A 400 km circular orbit: position along +X at orbital radius, velocity along +Y at
@@ -110,28 +98,22 @@ impl PlantSystem {
             d.sample(&mut self.rng)
         ]
     }
-}
 
-/// Point-mass Earth gravity force on `body`: `-G·M·m / |r|³ · r`.
-fn gravity(body: &Body) -> V3 {
-    let r = body.pos.linear();
-    let r_mag = r.norm().into_buf();
-    r * (-G * M * MASS / r_mag.powi(3))
-}
-
-impl<B: Backing> System<B> for PlantSystem {
-    type Input = PlantIn<B>;
-    type Output = Out<PlantOut<B>, B>;
-    const NAME: &'static str = "plant";
-}
-
-impl<B: Backing> CyclicSystem<B> for PlantSystem {
-    fn execute(&mut self, now: Timestamp, input: &mut PlantIn<B>, o: &mut Self::Output) {
+    fn execute(
+        &mut self,
+        now: Timestamp,
+        torque: &mut Input<TorqueCmd>,
+        sensors: &mut Output<Sensors>,
+        gps: &mut Output<Gps>,
+        wheels: &mut Output<Wheels>,
+        body: &mut Output<BodyState>,
+        world: &mut Output<World>,
+    ) {
         // Latest commanded body torque (zero on the first cycle / if none has arrived).
         // Project it onto each wheel's axis to form that wheel's set point, then step them.
-        let torque_b: V3 = match input.torque.latest() {
-            Ok(Some(cmd)) => cmd.get().torque_b,
-            _ => V3::zeros(),
+        let torque_b: V3 = match torque.latest() {
+            Some(cmd) => cmd.get().torque_b,
+            None => V3::zeros(),
         };
         for wheel in &mut self.wheels {
             wheel.torque_set_point = wheel.axis.dot(&torque_b) * wheel.axis;
@@ -171,29 +153,29 @@ impl<B: Backing> CyclicSystem<B> for PlantSystem {
         let gps_pos_eci = pos_eci + self.gps_pos_err;
         let gps_vel_eci = vel_eci + self.noise(GPS_VEL_SIGMA);
 
-        let _ = o.sensors.write(&Sensors {
+        sensors.publish(&Sensors {
             timestamp: now,
             gyro_b,
             sun_b,
             mag_b,
         });
-        let _ = o.gps.write(&Gps {
+        gps.publish(&Gps {
             timestamp: now,
             pos_eci: gps_pos_eci,
             vel_eci: gps_vel_eci,
         });
-        let _ = o.world.write(&World {
+        world.publish(&World {
             timestamp: now,
             sun_eci,
             mag_eci,
         });
         // Per-wheel telemetry — the wheels themselves, the same structs the plant integrates.
-        let _ = o.wheels.write(&Wheels {
+        wheels.publish(&Wheels {
             timestamp: now,
             wheels: self.wheels.clone(),
         });
         // The ground-truth body state: attitude + rate (truth) and the orbit (GPS) together.
-        let _ = o.body.write(&BodyState {
+        body.publish(&BodyState {
             timestamp: now,
             q_b_eci,
             omega_b: omega_b_true,
@@ -209,15 +191,3 @@ impl<B: Backing> CyclicSystem<B> for PlantSystem {
         self.t_sim += DT;
     }
 }
-
-impl BuildSystem for PlantSystem {
-    type Params = PlantParams;
-    fn new(params: Self::Params) -> Self {
-        PlantSystem::new(params)
-    }
-}
-
-// The C-ABI surface this cdylib exports (the `fsw_*` symbols the host resolves). Gated so
-// the rlib the test links statically carries no `fsw_*` symbols (dl-open.md §8 note).
-#[cfg(feature = "export")]
-metor_fsw_2::export_system!(PlantSystem);

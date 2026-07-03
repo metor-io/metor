@@ -9,20 +9,15 @@
 //! occupant must declare the same input even though safing ignores it — hence the unused
 //! `_att` port. The commanded `ModeCmd` output is the contract's sole user output.
 
-// The `#[sequence]` macro emits the `fsw_*` C-ABI exports (raw-pointer entry points), as
-// `export_system!` does for the system crates — same crate-level allow (see ctrl).
-#![allow(clippy::not_unsafe_ptr_arg_deref)]
-
 use adcs_contracts::{AttitudeEstimate, ModeCmd};
-use metor_fsw_2::ring::Backing;
-use metor_fsw_2::sequence::progress;
+use metor_fsw_2::sequence::{now, progress};
 use metor_fsw_2::{Input, Outcome, Output};
 
 /// Command safe and complete. `_att` is the contract input the slot shares with
 /// `commissioning` (unused here); `mode` is the commanded-mode output.
 #[metor_fsw_2::sequence(name = "safe_mode")]
-async fn safe<B: Backing>(_att: Input<AttitudeEstimate, B>, mut mode: Output<ModeCmd, B>) -> Outcome {
+async fn safe(_att: Input<AttitudeEstimate>, mut mode: Output<ModeCmd>) -> Outcome {
     progress("safing");
-    mode.write(&ModeCmd::safe()).ok();
+    mode.publish(&ModeCmd::safe().stamped(now()));
     Outcome::Completed
 }

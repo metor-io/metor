@@ -77,6 +77,10 @@ where
     /// per-cycle emit grows in place rather than allocating a fresh `Vec` every call —
     /// exactly the [`Output::write_with`](crate::Output) scratch discipline.
     scratch: Vec<u8>,
+    /// Records dropped by the infallible [`publish`](Self::publish) path (review E6) —
+    /// the [`Output`](crate::Output) drop-counter mirror, folded into health by the
+    /// runner via `SystemOutput::take_dropped`.
+    dropped: u64,
     _m: PhantomData<fn() -> M>,
 }
 
@@ -86,8 +90,25 @@ impl<M: Msg, B: Backing, WD: WakeSource, WS: WakeSink> MsgOut<M, B, WD, WS> {
         Self {
             writer,
             scratch: Vec::new(),
+            dropped: 0,
             _m: PhantomData,
         }
+    }
+
+    /// Emit one message, **infallibly** (review E6): the only failure on the
+    /// framework's Overwrite rings is `InsufficientCapacity` (a sizing bug), so the
+    /// drop is counted for the runner to fold into health rather than returned.
+    /// Sizing-aware callers keep [`emit`](Self::emit).
+    pub fn publish(&mut self, msg: &M) {
+        if self.emit(msg).is_err() {
+            self.dropped += 1;
+        }
+    }
+
+    /// Take (sum-and-clear) the [`publish`](Self::publish) drop counter — the
+    /// [`Output::take_dropped`](crate::Output) mirror.
+    pub fn take_dropped(&mut self) -> u64 {
+        core::mem::take(&mut self.dropped)
     }
 
     /// Emit one message: write the 2-byte [`Msg::ID`] then the postcard-serialized
@@ -379,7 +400,6 @@ mod tests {
         // First record: a whole-registry declaration.
         let registry = SequenceRegistry {
             channels: vec![SequenceChannelSpec {
-                id: 0,
                 name: "mode".to_string(),
                 available: vec!["commissioning".to_string(), "safe_mode".to_string()],
             }],
@@ -394,7 +414,7 @@ mod tests {
         let mut cmd_out: MsgOut<SequenceCommand> =
             MsgOut::new(ring.writer(NoWake, NoWake).expect("claim freed on drop"));
         let command = SequenceCommand {
-            channel_id: 0,
+            channel: "mode".to_string(),
             command: SequenceCommandKind::Start,
         };
         cmd_out.emit(&command).expect("emit command");
@@ -418,7 +438,7 @@ mod tests {
         assert_ne!(SequenceCommand::ID, SequenceRegistry::ID);
         let decoded: SequenceCommand =
             postcard::from_bytes(payload).expect("round-trip command");
-        assert_eq!(decoded.channel_id, 0);
+        assert_eq!(decoded.channel, "mode");
         assert!(matches!(decoded.command, SequenceCommandKind::Start));
 
         // No third record.
@@ -448,7 +468,6 @@ mod tests {
             reg_out
                 .emit(&SequenceRegistry {
                     channels: vec![SequenceChannelSpec {
-                        id: 0,
                         name: "mode".to_string(),
                         available: vec![],
                     }],
@@ -459,13 +478,13 @@ mod tests {
             MsgOut::new(ring.writer(NoWake, NoWake).expect("claim freed on drop"));
         cmd_out
             .emit(&SequenceCommand {
-                channel_id: 1,
+                channel: "adcs".to_string(),
                 command: SequenceCommandKind::Start,
             })
             .expect("emit start");
         cmd_out
             .emit(&SequenceCommand {
-                channel_id: 2,
+                channel: "recovery".to_string(),
                 command: SequenceCommandKind::Stop,
             })
             .expect("emit stop");
@@ -473,9 +492,9 @@ mod tests {
         let mut got: Vec<SequenceCommand> = Vec::new();
         inbox.drain(|c| got.push(c));
         assert_eq!(got.len(), 2, "the SequenceRegistry record is filtered out");
-        assert_eq!(got[0].channel_id, 1);
+        assert_eq!(got[0].channel, "adcs");
         assert!(matches!(got[0].command, SequenceCommandKind::Start));
-        assert_eq!(got[1].channel_id, 2);
+        assert_eq!(got[1].channel, "recovery");
         assert!(matches!(got[1].command, SequenceCommandKind::Stop));
 
         // Drained dry — a second drain yields nothing.
@@ -510,21 +529,21 @@ mod tests {
 
         out_a
             .emit(&SequenceCommand {
-                channel_id: 1,
+                channel: "adcs".to_string(),
                 command: SequenceCommandKind::Start,
             })
             .expect("emit a");
         out_b
             .emit(&SequenceCommand {
-                channel_id: 2,
+                channel: "recovery".to_string(),
                 command: SequenceCommandKind::Stop,
             })
             .expect("emit b");
 
-        let mut got: Vec<u64> = Vec::new();
-        inbox.drain(|c| got.push(c.channel_id));
+        let mut got: Vec<String> = Vec::new();
+        inbox.drain(|c| got.push(c.channel));
         got.sort_unstable();
-        assert_eq!(got, vec![1, 2], "both producers' records are drained");
+        assert_eq!(got, vec!["adcs", "recovery"], "both producers' records are drained");
 
         // An empty fan-in (unconnected input) drains nothing.
         let mut empty: MsgIn<SequenceCommand> = MsgIn::from_views(vec![]);

@@ -52,7 +52,7 @@ pub use writer::{FrameWriter, ListWriter, MapWriter, WriteError};
 pub use binder::{BindPorts, Binder, BoundInput, BoundPort, RingSource};
 pub use coordinator::{
     AllowedOccupant, ClockMode, Coordinator, CoordinatorBuilder, CoordinatorConfig,
-    InitialOccupant, PortRef, SLOT_NAME_CAP, SlotPhase, SlotState, SlotStatus,
+    InitialOccupant, NAME_CAP, PortRef, SLOT_NAME_CAP, SlotState, SlotStatus,
     StopReason, StoppedSystem, SystemHandle, WireError,
 };
 
@@ -86,18 +86,30 @@ pub use system::{
 // Re-export the ring transport so a system author only needs `metor_fsw_2::*`.
 pub use metor_fsw_ring as ring;
 
-// The derives (re-exported through metor-fsw) and the four component traits, so a
-// user only needs `metor_fsw_2::*`.
+// The four component traits (defined by metor-fsw) and the fsw-2 derives (owned by
+// the metor-fsw-2-macros crate), so a user only needs `metor_fsw_2::*`.
 pub use metor_fsw::{AsVTable, Componentize, Decomponentize, Metadatatize};
-pub use metor_fsw_macros::{Frame, SystemInput, SystemOutput};
+pub use metor_fsw_2_macros::{Frame, SystemInput, SystemOutput};
 
-// The `export_system!` macro that emits a system `cdylib`'s C-ABI surface.
-pub use metor_fsw_macros::export_system;
+// The `export_system!` macro that emits a system `cdylib`'s C-ABI surface (the
+// hand-written escape hatch; `#[system(export)]` emits the same surface).
+pub use metor_fsw_2_macros::export_system;
 
 // The `#[sequence]` attribute macro that turns an `async fn` into a dl-loadable
 // occupant (the sequence twin of `export_system!`). Coexists with the `sequence`
 // module above (module in the type namespace, macro in the macro namespace).
-pub use metor_fsw_macros::sequence;
+pub use metor_fsw_2_macros::sequence;
+
+// The `#[system]` attribute macro: annotates a system's inherent impl block and
+// derives the port bundles, `System` + `CyclicSystem`/`AsyncSystem`, `BuildSystem`,
+// and (opt-in) the `fsw_*` exports from the `execute`/`run` signature
+// (`docs/design-system-macro.md`).
+pub use metor_fsw_2_macros::system;
+
+// The coordinator cycle timestamp every `execute` receives — re-exported at the root
+// so `#[system]`-authored code writes `now: Timestamp` without reaching into
+// `metor_proto::types` (`docs/design-system-macro.md` §3.1).
+pub use metor_proto::types::Timestamp;
 
 // The sequence-occupant runtime surface (the free author API, the telemetry/cancel
 // frames, and the `SeqSystem` seam the `#[sequence]` macro implements).
@@ -105,6 +117,9 @@ pub use sequence::{
     Outcome, Seq, SeqBound, SeqClock, SeqStatusOut, SeqSystem, SequenceStatus, SlotControlIn, Step,
     Wait, aborted, progress, wait, with_clock,
 };
+
+// `sequence::now()` is deliberately NOT root-re-exported (`metor_fsw_2::now()` would
+// read as wall time); authors import it as `sequence::now` (review E7).
 
 // Re-exports the `#[derive(Frame)]` generated code names
 // (`::metor_fsw_2::metor_proto::…`, `::metor_fsw_2::path::…`, `::metor_fsw_2::kdl::…`)

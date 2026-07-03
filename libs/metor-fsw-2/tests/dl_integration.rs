@@ -213,7 +213,6 @@ fn dlopen_cyclic_system_end_to_end() {
     // 5. The dlopen'd system produced correct output: count = start(1000) + value(6).
     let out = out_view
         .latest()
-        .expect("no lap on the tapped output")
         .expect("the dl system produced a tick_out");
     assert_eq!(out.get().count, 1000 + CYCLES as u64, "start + latest value");
 

@@ -169,6 +169,17 @@ pub fn wait(dur: Duration) -> Wait {
     Wait { deadline: now + dur }
 }
 
+/// The coordinator time of the current cycle (review E7) — the same value every
+/// system's `execute` receives as `now` this cycle, refreshed before each poll. The
+/// timestamp a sequence stamps the frames it emits with (never wall time, so it is
+/// deterministic under a [`Simulated`](crate::ClockMode) clock).
+pub fn now() -> Timestamp {
+    current()
+        .expect("now() called outside a sequence poll")
+        .now
+        .get()
+}
+
 /// Record a progress line for the next [`SequenceStatus`] publish (§7).
 pub fn progress(msg: impl Into<String>) {
     current()
@@ -215,6 +226,11 @@ impl Seq {
     /// As [`aborted`], but off this handle's clock.
     pub fn aborted(&self) -> bool {
         self.clock.cancel.get()
+    }
+
+    /// As [`now`], but off this handle's clock.
+    pub fn now(&self) -> Timestamp {
+        self.clock.now.get()
     }
 }
 
@@ -296,6 +312,14 @@ pub struct SeqStatusOut<B: Backing = BoxBacking> {
 /// inside it), the wrapper-owned [`SequenceStatus`] / health / log tail (an [`Out`]),
 /// and the cancel input the cycle reads. All over [`RawBacking`] — a dlopen'd
 /// occupant's views into the host's regions.
+///
+/// TODO(E6, seq path): a sequence's *user* output ports move into the future, so
+/// their [`publish`](crate::Output::publish) drop counters are unreachable from this
+/// wrapper — unlike [`CyclicRunner::step`](crate::CyclicRunner), the per-poll driver
+/// (`abi::run_seq_execute`, in-flight in the slot-addressing work) cannot fold them
+/// into `health.error("publish_dropped")` yet. Folding needs either a shared counter
+/// cell threaded into the ports at `build()` or a poll-side hook on this struct; wire
+/// it up when the seq execute path is next touched.
 pub struct SeqBound {
     pub future: Pin<Box<dyn Future<Output = Outcome>>>,
     pub status: Out<SeqStatusOut<RawBacking>, RawBacking>,

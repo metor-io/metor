@@ -417,6 +417,13 @@ impl ModeCmd {
     pub const fn safe() -> Self {
         Self::at(Self::SAFE, Self::LAW_NADIR)
     }
+
+    /// The same command stamped with the sequence's cycle time (`sequence::now()`,
+    /// review E7) instead of the constructors' zero placeholder.
+    pub const fn stamped(mut self, now: Timestamp) -> Self {
+        self.timestamp = now;
+        self
+    }
 }
 
 /// The commanded body-frame control torque (the feedback back-edge into the plant).

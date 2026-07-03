@@ -8,11 +8,7 @@ use syn::Ident;
 mod as_vtable;
 mod componentize;
 mod decomponentize;
-mod export;
-mod frame;
 mod metadatatize;
-mod sequence;
-mod system;
 
 #[derive(Debug, FromField)]
 #[darling(attributes(metor_fsw))]
@@ -91,44 +87,6 @@ pub fn decomponentize(input: TokenStream) -> TokenStream {
     decomponentize::decomponentize(input)
 }
 
-#[proc_macro_derive(Frame, attributes(metor_fsw))]
-pub fn frame(input: TokenStream) -> TokenStream {
-    frame::frame(input)
-}
-
-#[proc_macro_derive(SystemInput)]
-pub fn system_input(input: TokenStream) -> TokenStream {
-    system::system_input(input)
-}
-
-#[proc_macro_derive(SystemOutput)]
-pub fn system_output(input: TokenStream) -> TokenStream {
-    system::system_output(input)
-}
-
-/// `export_system!(MySystem);` — generates the `#[unsafe(no_mangle)] extern "C"`
-/// `fsw_*` surface (dl-open.md §2/§3) of a `dlopen`-loadable system `cdylib`, each
-/// body a one-liner delegating to a `metor_fsw_2::abi::run_*` helper. `MySystem`'s
-/// `Params` must be `Serialize + Deserialize + Schema` (the postcard params contract).
-#[proc_macro]
-pub fn export_system(input: TokenStream) -> TokenStream {
-    export::export_system(input)
-}
-
-/// `#[sequence]` / `#[sequence(name = "…")]` — turns an `async fn` whose parameters are
-/// `Input<T, B>`/`Output<T, B>` ports into a complete dl-loadable sequence occupant
-/// (sequences-slots.md §4): a future-driven state machine plus the `fsw_*` C-ABI
-/// exports (delegating to `metor_fsw_2::abi::run_seq_*`, the sequence twins of the
-/// `run_*` helpers `export_system!` uses). The ports are read off the signature and
-/// **moved into the future**; the macro appends the implicit `SlotControlIn` input and
-/// the `SequenceStatus` + health/log output tail. `name` defaults to the fn name. A
-/// sequence may be paramless (`Params = ()`) or take one params parameter
-/// (`Serialize + Deserialize + Schema`, the postcard contract).
-#[proc_macro_attribute]
-pub fn sequence(attr: TokenStream, item: TokenStream) -> TokenStream {
-    sequence::sequence(attr, item)
-}
-
 pub(crate) fn metor_fsw_crate_name() -> proc_macro2::TokenStream {
     let name = crate_name("metor-fsw").expect("metor-fsw is present in `Cargo.toml`");
 
@@ -141,16 +99,3 @@ pub(crate) fn metor_fsw_crate_name() -> proc_macro2::TokenStream {
     }
 }
 
-/// Resolves the path to the `metor-fsw-2` framework crate (which defines the
-/// `Frame` trait). Used only by the `Frame` derive so the macro crate needs no
-/// Cargo dependency on `metor-fsw-2`.
-pub(crate) fn metor_fsw_2_crate_name() -> proc_macro2::TokenStream {
-    match crate_name("metor-fsw-2") {
-        Ok(FoundCrate::Itself) => quote!(crate),
-        Ok(FoundCrate::Name(name)) => {
-            let ident = Ident::new(&name, Span::call_site());
-            quote!( #ident )
-        }
-        Err(_) => quote!(metor_fsw_2),
-    }
-}

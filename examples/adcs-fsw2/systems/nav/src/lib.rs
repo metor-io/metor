@@ -5,18 +5,15 @@
 //! the sun direction from the Vallado ephemeris at its own sim-time epoch, and the magnetic
 //! field from the NOAA WMM evaluated at the **GPS** position. It knows only what the flight
 //! software knows — the noisy GPS measurement — not the plant's truth `world` frame.
-
-#![allow(clippy::not_unsafe_ptr_arg_deref)]
+//!
+//! Authored with `#[system]` (`docs/design-system-macro.md`): the port set is the `execute`
+//! signature, and the bundles/trait impls/`BuildSystem`/`fsw_*` exports are all generated.
 
 use adcs_contracts::{
     AttitudeEstimate, DT, Gps, MagneticModel, NavParams, Sensors, V3, epoch_at, mag_field_eci,
     sun_dir_eci,
 };
-use metor_fsw_2::metor_proto::types::Timestamp;
-use metor_fsw_2::ring::{Backing, BoxBacking};
-use metor_fsw_2::{
-    BuildSystem, CyclicSystem, Input, Out, Output, System, SystemInput, SystemOutput,
-};
+use metor_fsw_2::{Input, Output, Timestamp, system};
 use nox::tensor;
 
 pub struct NavSystem {
@@ -30,17 +27,7 @@ pub struct NavSystem {
     t_sim: f64,
 }
 
-#[derive(SystemInput)]
-pub struct NavIn<B: Backing = BoxBacking> {
-    pub sensors: Input<Sensors, B>,
-    pub gps: Input<Gps, B>,
-}
-
-#[derive(SystemOutput)]
-pub struct NavOut<B: Backing = BoxBacking> {
-    pub estimate: Output<AttitudeEstimate, B>,
-}
-
+#[system(name = "nav", export = "export")]
 impl NavSystem {
     pub fn new(p: NavParams) -> Self {
         let state = metor_fsw_adcs::mekf::State::new(
@@ -55,27 +42,25 @@ impl NavSystem {
             t_sim: 0.0,
         }
     }
-}
 
-impl<B: Backing> System<B> for NavSystem {
-    type Input = NavIn<B>;
-    type Output = Out<NavOut<B>, B>;
-    const NAME: &'static str = "nav";
-}
-
-impl<B: Backing> CyclicSystem<B> for NavSystem {
-    fn execute(&mut self, now: Timestamp, input: &mut NavIn<B>, o: &mut Self::Output) {
+    fn execute(
+        &mut self,
+        now: Timestamp,
+        sensors: &mut Input<Sensors>,
+        gps: &mut Input<Gps>,
+        estimate: &mut Output<AttitudeEstimate>,
+    ) {
         // Advance the deterministic mission clock in lockstep with the plant (every cycle,
         // regardless of whether a sample is ready), so the reference epoch matches the epoch the
         // plant stamped this cycle's measurement at.
         let epoch = epoch_at(self.t_sim);
         self.t_sim += DT;
 
-        let Ok(Some(s)) = input.sensors.latest() else {
+        let Some(s) = sensors.latest() else {
             return; // no sensor sample yet
         };
         let s = s.get().clone();
-        let Ok(Some(g)) = input.gps.latest() else {
+        let Some(g) = gps.latest() else {
             return; // no GPS fix yet
         };
         let gps_pos: V3 = g.get().pos_eci;
@@ -94,7 +79,7 @@ impl<B: Backing> CyclicSystem<B> for NavSystem {
         );
         self.state.reset_if_invalid();
 
-        let _ = o.estimate.write(&AttitudeEstimate {
+        estimate.publish(&AttitudeEstimate {
             timestamp: now,
             q_hat_b_eci: self.state.q_hat,
             omega_b: s.gyro_b, // pass the measured body rate through to the controller
@@ -102,13 +87,3 @@ impl<B: Backing> CyclicSystem<B> for NavSystem {
         });
     }
 }
-
-impl BuildSystem for NavSystem {
-    type Params = NavParams;
-    fn new(params: Self::Params) -> Self {
-        NavSystem::new(params)
-    }
-}
-
-#[cfg(feature = "export")]
-metor_fsw_2::export_system!(NavSystem);

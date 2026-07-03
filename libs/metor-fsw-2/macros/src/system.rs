@@ -1,9 +1,14 @@
 //! `#[derive(SystemInput)]` / `#[derive(SystemOutput)]` (system.md §2, Q5).
 //!
-//! A system's input/output bundle is a named struct of `Input<F>` / `Output<F>`
-//! ports. These derives generate the static `descriptors()` (and, for inputs,
-//! `any_lapped()`) by delegating to each port type's own `descriptor()`/
-//! `is_lapped()` — so the macro never has to parse `F` out of the field type.
+//! A system's input/output bundle is a named struct of `Input<F>` / `Output<F>` /
+//! `MsgIn<M>` / `MsgOut<M>` ports. These derives generate the static `descriptors()`
+//! (and, for inputs, `any_lapped()`; for outputs, `take_dropped()`) by delegating to
+//! each port type's own `descriptor()`/`is_lapped()`/`take_dropped()` — so the macro
+//! never has to parse `F` out of the field type.
+//!
+//! A `PhantomData` field is skipped everywhere (and default-constructed by `bind`):
+//! `#[system]`'s generated bundles carry one to anchor the `__B: Backing` param when
+//! a direction has no ports.
 
 use darling::FromDeriveInput;
 use darling::ast;
@@ -19,6 +24,13 @@ struct BundleField {
     ty: syn::Type,
 }
 
+impl BundleField {
+    /// Whether this field is a `PhantomData` anchor rather than a port.
+    fn is_phantom(&self) -> bool {
+        crate::sig::type_head(&self.ty).is_some_and(|h| h == "PhantomData")
+    }
+}
+
 #[derive(Debug, FromDeriveInput)]
 #[darling(supports(struct_named))]
 struct Bundle {
@@ -27,10 +39,22 @@ struct Bundle {
     data: ast::Data<Ignored, BundleField>,
 }
 
+impl Bundle {
+    /// The port fields, in declaration order (`PhantomData` anchors skipped).
+    fn ports(&self) -> Vec<&BundleField> {
+        self.data
+            .as_ref()
+            .take_struct()
+            .expect("named struct")
+            .into_iter()
+            .filter(|f| !f.is_phantom())
+            .collect()
+    }
+}
+
 /// Emits the `descriptors()` body: each port type's `descriptor()`, in field order.
 fn descriptors_body(bundle: &Bundle) -> TokenStream2 {
-    let fields = bundle.data.as_ref().take_struct().expect("named struct");
-    let calls = fields.iter().map(|f| {
+    let calls = bundle.ports().into_iter().map(|f| {
         let ty = &f.ty;
         quote! { descs.push(<#ty>::descriptor()); }
     });
@@ -43,13 +67,18 @@ fn descriptors_body(bundle: &Bundle) -> TokenStream2 {
 
 /// Emits the `BindPorts::bind` body: each port type's `bind(src)`, in field order —
 /// symmetric to `descriptors()`, so the ring source's positional cursor lines each
-/// port up with the ring the coordinator reserved for it.
+/// port up with the ring the coordinator reserved for it. `PhantomData` anchors are
+/// default-constructed (they consume no ring).
 fn bind_body(bundle: &Bundle) -> TokenStream2 {
     let fields = bundle.data.as_ref().take_struct().expect("named struct");
     let binds = fields.iter().map(|f| {
         let id = f.ident.as_ref().expect("named field");
         let ty = &f.ty;
-        quote! { #id: <#ty>::bind(src) }
+        if f.is_phantom() {
+            quote! { #id: ::core::marker::PhantomData }
+        } else {
+            quote! { #id: <#ty>::bind(src) }
+        }
     });
     quote! {
         Self { #(#binds),* }
@@ -72,38 +101,15 @@ fn strip_defaults(generics: &Generics) -> Generics {
     g
 }
 
-/// Detect the bundle's ring-[`Backing`] type param (dl-open.md §1.2): the one whose
-/// bounds name `Backing`. A `Backing`-generic bundle (`struct PlantOut<B: Backing>`)
-/// returns `Some(B)`, so the generated `BindPorts<B>` impl is over *that* param; a
-/// non-generic bundle (whose ports pin `BoxBacking`) returns `None`, so the impl is
-/// over `BoxBacking`.
-fn backing_param(generics: &Generics) -> Option<Ident> {
-    for p in generics.params.iter() {
-        if let syn::GenericParam::Type(t) = p {
-            let is_backing = t.bounds.iter().any(|b| {
-                matches!(b, syn::TypeParamBound::Trait(tb)
-                    if tb.path.segments.last().is_some_and(|s| s.ident == "Backing"))
-            });
-            if is_backing {
-                return Some(t.ident.clone());
-            }
-        }
-    }
-    None
-}
-
 /// Emit the `BindPorts<B>` impl for a bundle: over the bundle's own `Backing` param if
-/// it has one, else over `BoxBacking` (the bundle's ports pin `BoxBacking`). Generics
-/// are default-stripped for the `impl<…>` header (dl-open.md §1.2).
-fn bind_ports_impl(
-    bundle: &Bundle,
-    fsw2: &TokenStream2,
-    bind: &TokenStream2,
-) -> TokenStream2 {
+/// it has one (detected by bound, `sig::backing_param`), else over `BoxBacking` (the
+/// bundle's ports pin `BoxBacking`). Generics are default-stripped for the `impl<…>`
+/// header (dl-open.md §1.2).
+fn bind_ports_impl(bundle: &Bundle, fsw2: &TokenStream2, bind: &TokenStream2) -> TokenStream2 {
     let ident = &bundle.ident;
     let stripped = strip_defaults(&bundle.generics);
     let (impl_generics, ty_generics, where_clause) = stripped.split_for_impl();
-    let backing = match backing_param(&bundle.generics) {
+    let backing = match crate::sig::backing_param(&bundle.generics) {
         Some(b) => quote! { #b },
         None => quote! { #fsw2::ring::BoxBacking },
     };
@@ -128,8 +134,7 @@ pub fn system_input(input: TokenStream) -> TokenStream {
     let descriptors = descriptors_body(&bundle);
 
     // any_lapped: OR every input port's `is_lapped()`.
-    let fields = bundle.data.as_ref().take_struct().expect("named struct");
-    let lapped = fields.iter().map(|f| {
+    let lapped = bundle.ports().into_iter().map(|f| {
         let id = f.ident.as_ref().expect("named field");
         quote! { || self.#id.is_lapped() }
     });
@@ -163,10 +168,19 @@ pub fn system_output(input: TokenStream) -> TokenStream {
     let bind = bind_body(&bundle);
     let bind_ports = bind_ports_impl(&bundle, &fsw2, &bind);
 
+    // take_dropped: sum-and-clear every output port's publish-drop counter (E6).
+    let dropped = bundle.ports().into_iter().map(|f| {
+        let id = f.ident.as_ref().expect("named field");
+        quote! { + self.#id.take_dropped() }
+    });
+
     quote! {
         impl #impl_generics #fsw2::SystemOutput for #ident #ty_generics #where_clause {
             fn descriptors() -> ::std::vec::Vec<#fsw2::PortDesc> {
                 #descriptors
+            }
+            fn take_dropped(&mut self) -> u64 {
+                0 #(#dropped)*
             }
         }
 

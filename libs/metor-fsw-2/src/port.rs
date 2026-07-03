@@ -57,6 +57,11 @@ where
     /// path, so a per-cycle publish (health, status, dynamic frames) does not
     /// malloc+free a fresh `LenPacket` every call. `None` until the first such write.
     scratch: Option<LenPacket>,
+    /// Records dropped by the infallible [`publish`](Self::publish) path (review E6):
+    /// on the framework's Overwrite rings a write failure is only ever
+    /// `InsufficientCapacity` — a sizing bug — so the port counts it here and the
+    /// runner folds the count into health via [`take_dropped`](Self::take_dropped).
+    dropped: u64,
     _f: PhantomData<F>,
 }
 
@@ -66,6 +71,7 @@ impl<F: Frame, B: Backing, WD: WakeSource, WS: WakeSink> Output<F, B, WD, WS> {
         Self {
             writer,
             scratch: None,
+            dropped: 0,
             _f: PhantomData,
         }
     }
@@ -73,6 +79,13 @@ impl<F: Frame, B: Backing, WD: WakeSource, WS: WakeSink> Output<F, B, WD, WS> {
     /// This port's static descriptor (for wiring/sizing before any data flows).
     pub fn descriptor() -> PortDesc {
         PortDesc::of::<F>()
+    }
+
+    /// Take (sum-and-clear) the [`publish`](Self::publish) drop counter. Called by
+    /// the derived `SystemOutput::take_dropped`, whose sum the runner telemeteres as
+    /// a `publish_dropped` health error (review E6).
+    pub fn take_dropped(&mut self) -> u64 {
+        core::mem::take(&mut self.dropped)
     }
 }
 
@@ -109,6 +122,24 @@ where
     /// `try_write` with no serialization step (system.md §2.1).
     pub fn write(&mut self, frame: &F) -> Result<(), metor_fsw_ring::WriteError> {
         self.writer.try_write(frame.as_bytes())
+    }
+
+    /// Publish a fixed frame, **infallibly** (review E6): the only failure on the
+    /// framework's Overwrite rings is `InsufficientCapacity` (a sizing bug), so
+    /// instead of a `Result` the drop is counted for the runner to fold into health
+    /// (`publish_dropped`). Sizing-aware callers keep [`write`](Self::write).
+    pub fn publish(&mut self, frame: &F) {
+        if self.writer.try_write(frame.as_bytes()).is_err() {
+            self.dropped += 1;
+        }
+    }
+
+    /// The [`write_with`](Self::write_with) twin of [`publish`](Self::publish):
+    /// publish a frame with dynamic members, counting (not returning) a failure.
+    pub fn publish_with(&mut self, fixed: &F, build: impl FnOnce(&mut FrameWriter<F>)) {
+        if self.write_with(fixed, build).is_err() {
+            self.dropped += 1;
+        }
     }
 
     /// Publish a frame with dynamic `FrameList`/`FrameMap` members: `build` drives a
@@ -156,6 +187,10 @@ where
     /// Whether `scratch` holds a valid record (so `latest` can keep returning the
     /// freshest one across calls with no new data).
     have: bool,
+    /// A lap [`latest`](Self::latest) observed and resynced over (review E3). Latched
+    /// (never cleared) so the runner's post-execute [`is_lapped`](Self::is_lapped)
+    /// check telemeteres a mid-execute lap the same cycle.
+    lapped: bool,
     _f: PhantomData<F>,
 }
 
@@ -166,6 +201,7 @@ impl<F: Frame, B: Backing, RD: WakeSink, RS: WakeSource> Input<F, B, RD, RS> {
             view,
             scratch: Vec::new(),
             have: false,
+            lapped: false,
             _f: PhantomData,
         }
     }
@@ -175,11 +211,13 @@ impl<F: Frame, B: Backing, RD: WakeSink, RS: WakeSource> Input<F, B, RD, RS> {
         PortDesc::of::<F>()
     }
 
-    /// True iff the writer lapped this view (overwrite buffers only). The
-    /// coordinator checks this on cyclic systems *before* `execute` (system.md §3.1);
-    /// the stop policy itself lives in the coordinator.
+    /// True iff the writer lapped this view (overwrite buffers only), or a past
+    /// [`latest`](Self::latest) resynced over a lap (the E3 latch). The coordinator
+    /// checks this on cyclic systems *before* `execute` (system.md §3.1) and the
+    /// runner re-checks it *after* (a mid-execute lap); the stop policy itself lives
+    /// in the coordinator.
     pub fn is_lapped(&self) -> bool {
-        self.view.is_lapped()
+        self.lapped || self.view.is_lapped()
     }
 
     /// Skip to the live edge, abandoning unread (possibly lapped) data. Async input
@@ -216,17 +254,26 @@ where
 {
     /// Drain to the newest committed record and hand back a typed view of it, or
     /// `None` if no record has ever arrived. Cyclic systems want the freshest
-    /// sample, not a backlog (system.md §2.3); a `Lapped` view is surfaced as
-    /// `Err`.
-    pub fn latest(&mut self) -> Result<Option<FrameRef<'_, F>>, ReadError> {
+    /// sample, not a backlog (system.md §2.3).
+    ///
+    /// A lap mid-drain (an async producer racing this cycle — the coordinator
+    /// already hard-stops on a lap seen *before* `execute`) is **resync-latched**
+    /// (review E3): the view skips to the live edge, the lap is remembered for the
+    /// runner's post-execute [`is_lapped`](Self::is_lapped) check to telemeter, and
+    /// the freshest already-read record keeps being served. Lossless/async callers
+    /// that must see the error use [`recv`](Self::recv)/[`drain`](Self::drain).
+    pub fn latest(&mut self) -> Option<FrameRef<'_, F>> {
         loop {
             match self.view.try_read_into(&mut self.scratch) {
                 Ok(true) => self.have = true,
                 Ok(false) => break,
-                Err(e) => return Err(e),
+                Err(_) => {
+                    self.lapped = true;
+                    self.view.resync();
+                }
             }
         }
-        Ok(self.have.then(|| FrameRef::new(&self.scratch)))
+        self.have.then(|| FrameRef::new(&self.scratch))
     }
 
     /// Process **every** record since the last drain, in order (for command / event
