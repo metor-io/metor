@@ -406,23 +406,12 @@ const UPLINK_IDLE: Duration = Duration::from_millis(50);
 /// [`CommandOut<SequenceCommand>`](CommandOut) message output it re-emits each decoded
 /// `SequenceCommand` onto — a fully normal message producer, no bespoke command-bus capability.
 /// The coordinator collects every `SequenceCommand` output as a command producer every slot fans
-/// in from. Untelemetered (inbound control), so it is never echoed on the downlink.
+/// in from. Untelemetered (inbound control), so it is never echoed on the downlink — the
+/// `CommandOut` token *is* the opt-out spelling the derive lowers to `.untelemetered()`
+/// (`CommandOut` itself is a pure `MsgOut` alias; the flag lives on the descriptor).
+#[derive(crate::SystemOutput)]
 pub struct UplinkPorts {
     commands: CommandOut<SequenceCommand>,
-}
-
-impl SystemOutput for UplinkPorts {
-    fn descriptors() -> Vec<PortDesc> {
-        vec![CommandOut::<SequenceCommand>::descriptor()]
-    }
-}
-
-impl BindPorts<BoxBacking> for UplinkPorts {
-    fn bind<S: RingSource<B = BoxBacking>>(src: &mut S) -> Self {
-        Self {
-            commands: CommandOut::bind(src),
-        }
-    }
 }
 
 /// The uplink's (empty) input bundle — it sources commands from its own connection, not edges.

@@ -776,3 +776,20 @@ fn cyclic_after_receive_all_is_a_build_error() {
         other => panic!("expected ReceiveAllNotLast, got {other:?}"),
     }
 }
+
+/// The uplink's command port is UNTELEMETERED through its real spelling — the
+/// `CommandOut` token in the derived `UplinkPorts` bundle (a pure `MsgOut` alias;
+/// the flag lives on the descriptor via the derive's token lowering). Guards the
+/// A6 regression where the downlink would echo inbound commands back to the panel.
+#[test]
+fn uplink_command_port_is_untelemetered() {
+    use metor_proto::types::Msg;
+    let descs = <super::UplinkPorts as crate::SystemOutput>::descriptors();
+    assert_eq!(descs.len(), 1);
+    assert!(!descs[0].telemetered, "inbound commands are never downlinked");
+    assert_eq!(
+        descs[0].id,
+        crate::PortId::Packet(metor_proto_wkt::SequenceCommand::ID)
+    );
+    assert_eq!(descs[0].delivery, crate::Delivery::Log);
+}

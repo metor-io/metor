@@ -178,64 +178,18 @@ where
     }
 }
 
-/// A **command-channel** message output: a [`MsgOut<M>`](MsgOut) whose descriptor marks the
-/// channel **untelemetered** (`docs/message-wiring.md` §6.4), so the downlink / `AllOutputs`
-/// never echo inbound commands back to the panel. Emit through it exactly like a `MsgOut<M>`
-/// (it [`Deref`]s to one); only the port's telemetry flag differs. This is the opt-out spelling
-/// the (type-blind) `SystemOutput` derive picks up for free via `descriptor()`/`bind()`.
-pub struct CommandOut<M, B = BoxBacking, WD = NoWake, WS = NoWake>
-where
-    B: Backing,
-    WD: WakeSource,
-    WS: WakeSink,
-{
-    inner: MsgOut<M, B, WD, WS>,
-}
-
-impl<M: Msg, B: Backing, WD: WakeSource, WS: WakeSink> CommandOut<M, B, WD, WS> {
-    /// Wrap a writer the coordinator created over a command message ring.
-    pub fn new(writer: Writer<B, WD, WS>) -> Self {
-        Self {
-            inner: MsgOut::new(writer),
-        }
-    }
-}
-
-impl<M: NamedMsg, B: Backing, WD: WakeSource, WS: WakeSink> CommandOut<M, B, WD, WS> {
-    /// The port descriptor — an **untelemetered** message port keyed on `M::ID`.
-    pub fn descriptor() -> PortDesc {
-        PortDesc::msg::<M>().untelemetered()
-    }
-}
-
-impl<M, B, WD, WS> CommandOut<M, B, WD, WS>
-where
-    M: Msg,
-    B: Backing,
-    WD: WakeSource + Default + Clone + 'static,
-    WS: WakeSink + Default + Clone + 'static,
-{
-    /// Bind this command output over the next ring the [`RingSource`] hands out — the
-    /// [`MsgOut::bind`] wrapper. Walked by the derive like any output port.
-    pub fn bind<S: RingSource<B = B>>(src: &mut S) -> Self {
-        Self {
-            inner: MsgOut::bind(src),
-        }
-    }
-}
-
-impl<M, B: Backing, WD: WakeSource, WS: WakeSink> core::ops::Deref for CommandOut<M, B, WD, WS> {
-    type Target = MsgOut<M, B, WD, WS>;
-    fn deref(&self) -> &Self::Target {
-        &self.inner
-    }
-}
-
-impl<M, B: Backing, WD: WakeSource, WS: WakeSink> core::ops::DerefMut for CommandOut<M, B, WD, WS> {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        &mut self.inner
-    }
-}
+/// A **command-channel** message output: pure sugar for a [`MsgOut<M>`] whose port
+/// is marked **untelemetered** (`docs/message-wiring.md` §6.4), so the downlink /
+/// `AllOutputs` never echo inbound commands back to the panel.
+///
+/// The flag lives on the *descriptor*, not the type: the `SystemInput`/
+/// `SystemOutput` derives and `#[system]` recognize the `CommandOut` **token** and
+/// lower it to `MsgOut` + `PortDesc::untelemetered()` (identical to spelling
+/// `#[fsw(telemetered = false)]` on a `MsgOut` field). A hand-written
+/// `SystemOutput` impl must spell the descriptor itself
+/// (`PortDesc::msg::<M>().untelemetered()`) — calling `CommandOut::descriptor()`
+/// resolves through the alias to the *telemetered* `MsgOut` descriptor.
+pub type CommandOut<M, B = BoxBacking, WD = NoWake, WS = NoWake> = MsgOut<M, B, WD, WS>;
 
 // ---------------------------------------------------------------------------
 // MsgIn
@@ -266,6 +220,13 @@ where
     /// A reused record buffer, so a per-cycle drain grows in place rather than allocating —
     /// the [`MsgOut`] `scratch` mirror.
     scratch: Vec<u8>,
+    /// A lap [`drain`](Self::drain) observed, latched — policy-free (see
+    /// [`lap_fault`](Self::lap_fault)).
+    lapped: bool,
+    /// The lap policy (axis 4), default [`OnLap`](crate::OnLap)`::Resync` (a message
+    /// input is a best-effort log); a guaranteed-delivery command input overrides to
+    /// `Stop` via [`with_on_lap`](Self::with_on_lap) / `#[fsw(on_lap = "stop")]`.
+    on_lap: crate::OnLap,
     _marker: PhantomData<fn() -> M>,
 }
 
@@ -287,28 +248,48 @@ where
         Self {
             views,
             scratch: Vec::new(),
+            lapped: false,
+            on_lap: crate::OnLap::Resync,
             _marker: PhantomData,
         }
     }
 
-    /// Message inputs are a **best-effort log**: a lapped view resyncs to the live edge inside
-    /// [`drain`](Self::drain) rather than hard-stopping the consumer (unlike a frame
-    /// [`Input`](crate::Input), whose lap is a fatal `LappedInput`). So a message input never
-    /// reports lapped to the framework's per-cycle check — it always returns `false`.
-    pub fn is_lapped(&self) -> bool {
-        false
+    /// Override the runtime lap policy — chainable, mirroring the descriptor-level
+    /// [`PortDesc::with_on_lap`](crate::PortDesc::with_on_lap). The
+    /// `#[fsw(on_lap = "…")]` derive attribute lowers onto both so descriptor and
+    /// runtime can never disagree.
+    pub fn with_on_lap(mut self, p: crate::OnLap) -> Self {
+        self.on_lap = p;
+        self
+    }
+
+    /// Whether this port is in **lap fault**: a lap was observed — latched by a past
+    /// [`drain`](Self::drain), or live on any producer view (a writer overran unread
+    /// records between cycles, the [`Input::lap_fault`](crate::Input) mirror) — *and*
+    /// the port's policy says laps are fatal ([`OnLap::Stop`](crate::OnLap)). The
+    /// default Resync policy reports `false` *because laps are not faults there* —
+    /// derived from the policy, no longer the hard-coded `false` the old
+    /// `is_lapped()` lied (A5). The runner gates a cyclic consumer on this before
+    /// and after `execute`.
+    pub fn lap_fault(&self) -> bool {
+        self.on_lap == crate::OnLap::Stop
+            && (self.lapped || self.views.iter().any(|v| v.is_lapped()))
     }
 
     /// Drain every record committed since the last call across **all** producer views,
     /// decoding each `M::ID` record and handing the decoded payload to `f`. Per-producer
     /// order is preserved; the cross-producer interleave is arbitrary (and irrelevant — each
     /// record self-addresses). Records of a different id (a heterogeneous channel) and records
-    /// that fail to postcard-decode are skipped. A lapped view resyncs to the live edge and
-    /// that view's drain stops for this pass (best-effort, like the message-log downlink —
-    /// `docs/messages.md` §3).
+    /// that fail to postcard-decode are skipped.
+    ///
+    /// A lap follows the port's policy: under the default `Resync` a lapped view
+    /// skips to the live edge and keeps draining (best-effort, like the message-log
+    /// downlink — `docs/messages.md` §3); under `Stop` the view's drain stops and
+    /// [`lap_fault`](Self::lap_fault) reports, so the runner hard-stops a cyclic
+    /// consumer that must never lose a record.
     pub fn drain(&mut self, mut f: impl FnMut(M)) {
         for view in &mut self.views {
-            crate::port::drain_view(view, &mut self.scratch, crate::OnLap::Resync, |rec| {
+            self.lapped |= crate::port::drain_view(view, &mut self.scratch, self.on_lap, |rec| {
                 if let Some((id, payload)) = split_record(rec)
                     && id == M::ID
                     && let Ok(msg) = postcard::from_bytes::<M>(payload)

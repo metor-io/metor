@@ -198,7 +198,7 @@ fn cyclic_input_lap_is_observable() {
     };
     let mut w = imu_ring.writer(NoWake, NoWake).unwrap();
 
-    assert!(!input.imu.is_lapped());
+    assert!(!input.imu.lap_fault());
     assert!(!input.any_lapped());
 
     // Overrun the small buffer far past capacity without the view advancing.
@@ -214,7 +214,7 @@ fn cyclic_input_lap_is_observable() {
         .unwrap();
     }
 
-    assert!(input.imu.is_lapped(), "writer lapped the idle view");
+    assert!(input.imu.lap_fault(), "writer lapped the idle view");
     assert!(input.any_lapped(), "bundle surfaces the lapped port");
 }
 
@@ -589,6 +589,15 @@ impl crate::RingSource for TestSource {
     {
         (self.pop(), RD::default(), RS::default())
     }
+
+    fn next_input_fanin<RD, RS>(&mut self) -> Vec<(RingBuffer<BoxBacking>, RD, RS)>
+    where
+        RD: metor_fsw_ring::WakeSink + Default + Clone + 'static,
+        RS: metor_fsw_ring::WakeSource + Default + Clone + 'static,
+    {
+        // Single-producer fan-in: pop one ring per message input.
+        vec![(self.pop(), RD::default(), RS::default())]
+    }
 }
 
 #[test]
@@ -704,7 +713,7 @@ impl SelfFlooder {
         // The E3 contract: no Err — the lap is latched and the view resyncs to the
         // live edge (unread records, including the flood, are abandoned).
         assert!(imu.latest().is_none(), "nothing read before the lap to re-serve");
-        assert!(imu.is_lapped(), "the resynced-over lap stays latched");
+        assert!(imu.lap_fault(), "the resynced-over lap stays latched");
         // Reads resume normally after the resync: a fresh record is served.
         let _ = writer.write(&Imu {
             timestamp: now,
@@ -757,4 +766,169 @@ fn mid_execute_lap_latches_and_stops() {
     let mut sink = RecSink::default();
     record.apply(&mut sink).unwrap().unwrap();
     assert_eq!(sink.values[&ComponentId::new("health.cycles")], 1.0);
+}
+
+// ---------------------------------------------------------------------------
+// #[fsw(...)] attribute lowering + the Log × Stop fourth cell (A5/A6, C5).
+// ---------------------------------------------------------------------------
+
+use metor_proto_wkt::{SequenceCommand, SequenceCommandKind};
+
+/// A command log that must never lose a record — the Log × Stop fourth cell the
+/// unification made expressible (`docs/design-port-unification.md` §2.3).
+#[derive(crate::SystemInput)]
+struct GuardIn {
+    #[fsw(on_lap = "stop")]
+    cmds: crate::MsgIn<SequenceCommand>,
+}
+
+#[derive(crate::SystemOutput)]
+struct QuietOut {
+    /// A frame output opted out of the downlink (A6 — frames get the opt-out too).
+    #[fsw(telemetered = false)]
+    nav: Output<NavEstimate>,
+    /// The `CommandOut` token: pure `MsgOut` sugar the derive lowers to
+    /// `.untelemetered()` (the alias itself carries no flag).
+    cmds: crate::CommandOut<SequenceCommand>,
+}
+
+/// A tiny Log-sized message ring (small enough to lap with a handful of records).
+fn msg_ring(readers: usize) -> RingBuffer<BoxBacking> {
+    RingBuffer::create_in_memory(Config {
+        capacity: crate::capacity_for(64, 2),
+        max_readers: readers,
+        overrun: Overrun::Overwrite,
+    })
+}
+
+fn cmd(channel: &str) -> SequenceCommand {
+    SequenceCommand {
+        channel: channel.to_string(),
+        command: SequenceCommandKind::Start,
+    }
+}
+
+/// `#[fsw(...)]` overrides land on the generated descriptors: `on_lap = "stop"`
+/// flips exactly the lap axis; `telemetered = false` and the `CommandOut` token
+/// flip exactly the telemetry flag.
+#[test]
+fn fsw_attrs_lower_onto_descriptors() {
+    let ins = <GuardIn as SystemInput>::descriptors();
+    assert_eq!(ins.len(), 1);
+    assert_eq!(ins[0].on_lap, crate::OnLap::Stop, "the attribute override");
+    assert_eq!(ins[0].delivery, crate::Delivery::Log, "other axes keep the MsgIn defaults");
+    assert_eq!(ins[0].fan_in, crate::FanIn::Many);
+
+    let outs = <QuietOut as SystemOutput>::descriptors();
+    assert_eq!(outs.len(), 2);
+    assert!(!outs[0].telemetered, "#[fsw(telemetered = false)] on a FRAME output");
+    assert_eq!(outs[0].id, crate::PortId::Component(NavEstimate::FRAME_ID));
+    assert!(!outs[1].telemetered, "the CommandOut token is the same opt-out");
+    assert_eq!(
+        outs[1].id,
+        crate::PortId::Packet(<SequenceCommand as metor_proto::types::Msg>::ID)
+    );
+}
+
+/// The `on_lap` attribute reaches the BOUND port too (descriptor and runtime can
+/// never disagree): a lapped Stop input reports `lap_fault`, while the default
+/// Resync policy keeps flowing and reports none.
+#[test]
+fn fsw_on_lap_governs_the_bound_port() {
+    let ring = msg_ring(2);
+    // Bind through the derive walk (the fan-in cursor), so the chained
+    // `.with_on_lap(Stop)` in the generated `bind` is what's under test.
+    let input: GuardIn = crate::BindPorts::bind(&mut TestSource {
+        rings: vec![ring.clone()],
+        next: 0,
+    });
+    let mut stop_in = input.cmds;
+    // A hand-built twin on the same ring with the default (Resync) policy.
+    let mut resync_in: crate::MsgIn<SequenceCommand> =
+        crate::MsgIn::new(ring.view(NoWake, NoWake).unwrap());
+
+    let mut w: crate::MsgOut<SequenceCommand> =
+        crate::MsgOut::new(ring.writer(NoWake, NoWake).unwrap());
+    for i in 0..32 {
+        w.emit(&cmd(&format!("c{i}"))).unwrap();
+    }
+
+    // Live lap observation, before any drain (the runner's pre-execute gate).
+    assert!(stop_in.lap_fault(), "Stop policy: a live lap is a fault");
+    assert!(!resync_in.lap_fault(), "Resync policy: laps are not faults");
+
+    // Stop: the drain stops at the lap (no records) and the fault latches.
+    let mut got = 0;
+    stop_in.drain(|_| got += 1);
+    assert_eq!(got, 0, "a Stop port does not read past a lap");
+    assert!(stop_in.lap_fault());
+
+    // Resync: the drain skips to the live edge (abandoning the flood, best-effort)
+    // and the port keeps flowing — records emitted after the lap arrive normally.
+    let mut got = 0;
+    resync_in.drain(|_| got += 1);
+    assert_eq!(got, 0, "resync abandons unread records up to the live edge");
+    assert!(!resync_in.lap_fault());
+    w.emit(&cmd("after")).unwrap();
+    let mut got = 0;
+    resync_in.drain(|_| got += 1);
+    assert_eq!(got, 1, "a Resync port keeps flowing after the lap");
+    assert!(!resync_in.lap_fault());
+}
+
+/// The fourth cell end-to-end: a cyclic consumer of a Log × Stop command input is
+/// permanently hard-stopped by the runner when the channel laps — the same doctrine
+/// as a lapped frame input, now policy-derived instead of frame-hard-coded.
+#[test]
+fn log_stop_input_hard_stops_cyclic_consumer() {
+    #[derive(crate::SystemOutput)]
+    struct NothingOut {}
+
+    struct Guard {
+        seen: usize,
+    }
+    impl System for Guard {
+        type Input = GuardIn;
+        type Output = Out<NothingOut>;
+        const NAME: &'static str = "guard";
+    }
+    impl CyclicSystem for Guard {
+        fn execute(&mut self, _now: Timestamp, input: &mut GuardIn, _o: &mut Self::Output) {
+            input.cmds.drain(|_| self.seen += 1);
+        }
+    }
+
+    let ring = msg_ring(1);
+    let health_ring = overwrite_ring::<SystemHealth>(8, 1);
+    let log_ring = overwrite_ring::<SystemLog>(8, 1);
+
+    let input: GuardIn = crate::BindPorts::bind(&mut TestSource {
+        rings: vec![ring.clone()],
+        next: 0,
+    });
+    let output = Out::new(
+        NothingOut {},
+        HealthPort::new(
+            Output::new(health_ring.writer(NoWake, NoWake).unwrap()),
+            Output::new(log_ring.writer(NoWake, NoWake).unwrap()),
+        ),
+    );
+    let mut w: crate::MsgOut<SequenceCommand> =
+        crate::MsgOut::new(ring.writer(NoWake, NoWake).unwrap());
+    let mut runner = CyclicRunner::new(Guard { seen: 0 }, input, output);
+
+    // A normal cycle: one command in, one command drained.
+    w.emit(&cmd("mode")).unwrap();
+    runner.step(Timestamp(1));
+    assert!(matches!(runner.state(), crate::SlotState::Running));
+
+    // Flood far past the ring depth: the idle view is lapped.
+    for i in 0..32 {
+        w.emit(&cmd(&format!("c{i}"))).unwrap();
+    }
+    runner.step(Timestamp(2));
+    assert!(
+        matches!(runner.state(), crate::SlotState::Stopped { reason: crate::StopReason::LappedInput }),
+        "a lapped Stop command log permanently stops the consumer"
+    );
 }

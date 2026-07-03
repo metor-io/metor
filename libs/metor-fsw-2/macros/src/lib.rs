@@ -93,12 +93,20 @@ pub fn frame(input: TokenStream) -> TokenStream {
     frame::frame(input)
 }
 
-#[proc_macro_derive(SystemInput)]
+/// `#[derive(SystemInput)]` — generates `SystemInput` (`descriptors`/`any_lapped`)
+/// and `BindPorts` from the bundle's port fields. Field attribute:
+/// `#[fsw(on_lap = "stop" | "resync")]` overrides the port's lap policy on both
+/// the descriptor and the bound port.
+#[proc_macro_derive(SystemInput, attributes(fsw))]
 pub fn system_input(input: TokenStream) -> TokenStream {
     system::system_input(input)
 }
 
-#[proc_macro_derive(SystemOutput)]
+/// `#[derive(SystemOutput)]` — generates `SystemOutput` (`descriptors`/
+/// `take_dropped`) and `BindPorts` from the bundle's port fields. Field attribute:
+/// `#[fsw(telemetered = false)]` opts the output out of the downlink/`AllOutputs`
+/// tap (the `CommandOut<M>` type token is recognized as the same opt-out).
+#[proc_macro_derive(SystemOutput, attributes(fsw))]
 pub fn system_output(input: TokenStream) -> TokenStream {
     system::system_output(input)
 }

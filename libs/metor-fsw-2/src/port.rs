@@ -223,10 +223,16 @@ where
     /// Whether `scratch` holds a valid record (so `latest` can keep returning the
     /// freshest one across calls with no new data).
     have: bool,
-    /// A lap [`latest`](Self::latest) observed and resynced over (review E3). Latched
-    /// (never cleared) so the runner's post-execute [`is_lapped`](Self::is_lapped)
-    /// check telemeteres a mid-execute lap the same cycle.
+    /// A lap this port observed — pre-read (`view.is_lapped()`) or mid-drain (the E3
+    /// latch). Latched (never cleared) so the runner's post-execute
+    /// [`lap_fault`](Self::lap_fault) check telemeteres a mid-execute lap the same
+    /// cycle. Policy-free: whether the observation is a *fault* is the port's
+    /// [`OnLap`] policy.
     lapped: bool,
+    /// The lap policy (axis 4), default [`OnLap::Stop`] (the cyclic frame doctrine);
+    /// set at bind from the field's descriptor attribute via
+    /// [`with_on_lap`](Self::with_on_lap).
+    on_lap: OnLap,
     _f: PhantomData<F>,
 }
 
@@ -238,6 +244,7 @@ impl<F: Frame, B: Backing, RD: WakeSink, RS: WakeSource> Input<F, B, RD, RS> {
             scratch: Vec::new(),
             have: false,
             lapped: false,
+            on_lap: OnLap::Stop,
             _f: PhantomData,
         }
     }
@@ -247,13 +254,22 @@ impl<F: Frame, B: Backing, RD: WakeSink, RS: WakeSource> Input<F, B, RD, RS> {
         PortDesc::of::<F>()
     }
 
-    /// True iff the writer lapped this view (overwrite buffers only), or a past
-    /// [`latest`](Self::latest) resynced over a lap (the E3 latch). The coordinator
-    /// checks this on cyclic systems *before* `execute` (system.md §3.1) and the
-    /// runner re-checks it *after* (a mid-execute lap); the stop policy itself lives
-    /// in the coordinator.
-    pub fn is_lapped(&self) -> bool {
-        self.lapped || self.view.is_lapped()
+    /// Override the runtime lap policy — chainable, mirroring the descriptor-level
+    /// [`PortDesc::with_on_lap`]. The `#[fsw(on_lap = "…")]` derive attribute lowers
+    /// onto both so descriptor and runtime can never disagree.
+    pub fn with_on_lap(mut self, p: OnLap) -> Self {
+        self.on_lap = p;
+        self
+    }
+
+    /// Whether this port is in **lap fault**: a lap was observed (the writer
+    /// overwrote unread data — before a read, or resynced-over mid-drain, the E3
+    /// latch) *and* the port's policy says laps are fatal ([`OnLap::Stop`]). A
+    /// Resync port reports `false` because its policy says laps are not faults —
+    /// derived, not lied (A5). The runner checks this before and after `execute`;
+    /// the stop policy itself lives in the coordinator.
+    pub fn lap_fault(&self) -> bool {
+        (self.lapped || self.view.is_lapped()) && self.on_lap == OnLap::Stop
     }
 
     /// Skip to the live edge, abandoning unread (possibly lapped) data. Async input
@@ -293,11 +309,16 @@ where
     /// sample, not a backlog (system.md §2.3).
     ///
     /// A lap mid-drain (an async producer racing this cycle — the coordinator
-    /// already hard-stops on a lap seen *before* `execute`) is **resync-latched**
-    /// (review E3): the view skips to the live edge, the lap is remembered for the
-    /// runner's post-execute [`is_lapped`](Self::is_lapped) check to telemeter, and
-    /// the freshest already-read record keeps being served. Lossless/async callers
-    /// that must see the error use [`recv`](Self::recv)/[`drain`](Self::drain).
+    /// already hard-stops a Stop port on a lap seen *before* `execute`) is
+    /// **resync-latched** (review E3): the view skips to the live edge, the lap is
+    /// remembered, and the freshest record keeps being served. The mechanics are
+    /// policy-free on purpose — whether the latched lap is a *fault* is
+    /// [`lap_fault`](Self::lap_fault)'s call: on a Stop port the runner's pre/post
+    /// execute check hard-stops the consumer (so the resynced read only ever feeds
+    /// the doomed cycle, exactly today's doctrine); on a Resync port — including
+    /// the async copy-in coercion, where the port cannot know its consumer is
+    /// async — data keeps flowing. Lossless/async callers that must see the error
+    /// use [`recv`](Self::recv)/[`drain`](Self::drain).
     pub fn latest(&mut self) -> Option<FrameRef<'_, F>> {
         let Self {
             view,
@@ -311,19 +332,29 @@ where
     }
 
     /// Process **every** record since the last drain, in order (for command / event
-    /// channels that cannot drop a record). Stops and returns `Err` on lap.
+    /// channels that cannot drop a record). On a lap, follows the port's policy:
+    /// a Stop port stops draining and returns `Err(Lapped)`; a Resync port skips to
+    /// the live edge, keeps draining, and returns `Ok` (laps are not faults there —
+    /// the latch still records the observation).
     pub fn drain(&mut self, mut f: impl FnMut(FrameRef<'_, F>)) -> Result<(), ReadError> {
         let Self {
             view,
             scratch,
             have,
+            lapped,
+            on_lap,
             ..
         } = self;
-        let lapped = drain_view(view, scratch, OnLap::Stop, |rec| {
+        let saw_lap = drain_view(view, scratch, *on_lap, |rec| {
             *have = true;
             f(FrameRef::new(rec));
         });
-        if lapped { Err(ReadError::Lapped) } else { Ok(()) }
+        *lapped |= saw_lap;
+        if saw_lap && *on_lap == OnLap::Stop {
+            Err(ReadError::Lapped)
+        } else {
+            Ok(())
+        }
     }
 
     /// Await the next record (event-driven async systems, system.md §3.2). Backed by
