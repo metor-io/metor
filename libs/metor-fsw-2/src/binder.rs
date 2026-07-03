@@ -15,9 +15,10 @@
 //! system each cycle, or a copy-in job each cycle), so its view can use a fresh
 //! default wake and the match is moot. The one place a matched clone is
 //! load-bearing is the private copy-in buffer feeding an async input: there the
-//! coordinator pre-creates the `Notifier` pair, stores it type-erased on the
+//! coordinator pre-creates the data `Notifier`, stores it type-erased on the
 //! port's [`BoundPort`], and hands the matched clone to the async view. Every
-//! other port leaves the endpoints empty and the binder default-constructs.
+//! other endpoint is default-constructed by the binder (the framework's rings are
+//! all Overwrite, so no writer ever awaits a space wake).
 
 use std::any::Any;
 use std::slice;
@@ -27,32 +28,28 @@ use metor_fsw_ring::{Backing, BoxBacking, RingBuffer, WakeSink, WakeSource};
 
 use crate::registry::{MessageRegistry, OutputRegistry};
 
-/// One pre-allocated ring plus its optional matched wake endpoints, in
-/// `descriptors()` order. `data`/`space` are `Some` only for the copy-in private
-/// buffer that feeds an async input (where the view must share the writer's
-/// `Notifier`); otherwise the binder default-constructs the wake.
+/// One pre-allocated ring plus its optional matched data-wake endpoint, in
+/// `descriptors()` order. `data` is `Some` only for the copy-in private buffer that
+/// feeds an async input (where the view must share the writer's `Notifier` to be
+/// woken); otherwise the binder default-constructs the wake. There is no matched
+/// *space* endpoint: every framework ring is Overwrite, so a write never suspends
+/// for space and the reader-side space notification has no listener.
 pub struct BoundPort {
     ring: RingBuffer<BoxBacking>,
     data: Option<Box<dyn Any>>,
-    space: Option<Box<dyn Any>>,
 }
 
 impl BoundPort {
     /// A port whose wake endpoints are default-constructed at bind time.
     pub(crate) fn new(ring: RingBuffer<BoxBacking>) -> Self {
-        Self {
-            ring,
-            data: None,
-            space: None,
-        }
+        Self { ring, data: None }
     }
 
-    /// A port carrying pre-created, matched wake endpoints (the copy-in path).
-    pub(crate) fn matched(ring: RingBuffer<BoxBacking>, data: Box<dyn Any>, space: Box<dyn Any>) -> Self {
+    /// A port carrying the pre-created, matched data-wake endpoint (the copy-in path).
+    pub(crate) fn matched(ring: RingBuffer<BoxBacking>, data: Box<dyn Any>) -> Self {
         Self {
             ring,
             data: Some(data),
-            space: Some(space),
         }
     }
 
@@ -174,11 +171,7 @@ impl<'a> RingSource for Binder<'a> {
             .outputs
             .next()
             .expect("bind() walks output ports in descriptors() order");
-        (
-            p.ring.clone(),
-            BoundPort::wake(&p.data),
-            BoundPort::wake(&p.space),
-        )
+        (p.ring.clone(), BoundPort::wake(&p.data), WS::default())
     }
 
     fn next_input<RD, RS>(&mut self) -> (RingBuffer<BoxBacking>, RD, RS)
@@ -196,11 +189,7 @@ impl<'a> RingSource for Binder<'a> {
                 panic!("a frame input was laid out as a message fan-in (BoundInput::Many)")
             }
         };
-        (
-            p.ring.clone(),
-            BoundPort::wake(&p.data),
-            BoundPort::wake(&p.space),
-        )
+        (p.ring.clone(), BoundPort::wake(&p.data), RS::default())
     }
 
     fn next_input_fanin<RD, RS>(&mut self) -> Vec<(RingBuffer<BoxBacking>, RD, RS)>
@@ -218,13 +207,7 @@ impl<'a> RingSource for Binder<'a> {
         };
         ports
             .iter()
-            .map(|p| {
-                (
-                    p.ring.clone(),
-                    BoundPort::wake(&p.data),
-                    BoundPort::wake(&p.space),
-                )
-            })
+            .map(|p| (p.ring.clone(), BoundPort::wake(&p.data), RS::default()))
             .collect()
     }
 

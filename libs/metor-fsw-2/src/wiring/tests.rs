@@ -1204,6 +1204,35 @@ connect "src" -> "sink" msg="WireEvent"
 }
 
 #[test]
+fn msg_edge_delayed_is_rejected_at_build() {
+    // `delayed=#true` on a `msg=` edge parses (no parse-time schema knowledge) but
+    // surfaces `WireError::DelayedLogEdge` at build — previously it was silently
+    // meaningless (A7).
+    let kdl = r#"
+coordinator cycle_rate=1000.0
+
+system "src"  type="MsgSrc"
+system "sink" type="MsgSink"
+
+connect "src" -> "sink" msg="WireEvent" delayed=#true
+"#;
+    let err = match load(kdl, &registry()) {
+        Err(e) => e,
+        Ok(_) => panic!("expected DelayedLogEdge for delayed msg edge"),
+    };
+    assert!(
+        matches!(
+            &err,
+            LoadError::Wire {
+                source: crate::WireError::DelayedLogEdge { .. },
+                ..
+            }
+        ),
+        "unexpected error: {err:?}"
+    );
+}
+
+#[test]
 fn msg_edge_unknown_type_is_a_clean_error() {
     let kdl = r#"
 coordinator cycle_rate=100.0

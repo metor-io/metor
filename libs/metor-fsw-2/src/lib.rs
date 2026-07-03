@@ -77,9 +77,7 @@ pub use port::{DEFAULT_DEPTH, FrameRef, Input, Output, buffer_capacity, capacity
 
 // The general message channel — the `(PacketId, postcard)` record format, the
 // type-erased emit port, and its sizing/record helpers (`docs/messages.md` §1, §2).
-pub use message::{
-    CommandOut, MAX_MSG_BYTES, MSG_DEPTH, MsgIn, MsgOut, NamedMsg, msg_capacity, split_record,
-};
+pub use message::{CommandOut, MAX_MSG_BYTES, MsgIn, MsgOut, NamedMsg, split_record};
 pub use system::{
     AsyncSystem, BuildSystem, CyclicRunner, CyclicSystem, Out, System, SystemInput, SystemOutput,
 };
