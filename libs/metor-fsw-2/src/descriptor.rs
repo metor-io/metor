@@ -124,9 +124,68 @@ pub enum OnLap {
     Resync,
 }
 
-/// The reserved name of the temporary receive-all sentinel port (deleted when
-/// capabilities land — `docs/design-port-unification.md` §2.5).
-pub(crate) const RECEIVE_ALL_NAME: &str = "__receive_all";
+/// A non-port resource a system needs from the host at bind time
+/// (`docs/design-port-unification.md` §2.5). Unlike a port it reserves no ring and
+/// connects no edge — it is granted, not wired.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, serde::Serialize, serde::Deserialize)]
+pub enum Capability {
+    /// A read view over every telemetered output in the graph
+    /// ([`AllOutputs`](crate::AllOutputs)). Counts one reader slot on every buffer
+    /// at sizing time. Host-only (a dlopen'd system cannot hold it).
+    ReceiveAll,
+}
+
+/// What one bundle field contributes to the descriptor: an ordinary wired port, or
+/// a bind-time [`Capability`]. The `SystemInput`/`SystemOutput` derives collect one
+/// per field (`<Field>::decl()`), so a single type-blind walk covers both — the
+/// bind cursor skips capability decls (they consume no ring).
+#[derive(Clone, Debug)]
+pub enum PortDecl {
+    Port(PortDesc),
+    Capability(Capability),
+}
+
+impl PortDecl {
+    /// The derive-facing twin of [`PortDesc::untelemetered`]: applies to a
+    /// [`Port`](PortDecl::Port) decl; a capability has no axes, so it passes
+    /// through untouched.
+    pub fn untelemetered(self) -> Self {
+        match self {
+            PortDecl::Port(p) => PortDecl::Port(p.untelemetered()),
+            cap => cap,
+        }
+    }
+
+    /// The derive-facing twin of [`PortDesc::with_on_lap`] (same port-only rule).
+    pub fn with_on_lap(self, p: OnLap) -> Self {
+        match self {
+            PortDecl::Port(d) => PortDecl::Port(d.with_on_lap(p)),
+            cap => cap,
+        }
+    }
+
+    /// The port shape of a [`Port`](PortDecl::Port) decl, `None` for a capability.
+    pub fn into_port(self) -> Option<PortDesc> {
+        match self {
+            PortDecl::Port(p) => Some(p),
+            PortDecl::Capability(_) => None,
+        }
+    }
+}
+
+/// Split one direction's decls into its wired ports (order preserved — the bind
+/// cursor contract) and its capabilities.
+pub fn split_decls(decls: Vec<PortDecl>) -> (Vec<PortDesc>, Vec<Capability>) {
+    let mut ports = Vec::with_capacity(decls.len());
+    let mut caps = Vec::new();
+    for d in decls {
+        match d {
+            PortDecl::Port(p) => ports.push(p),
+            PortDecl::Capability(c) => caps.push(c),
+        }
+    }
+    (ports, caps)
+}
 
 /// One port's static shape: its edge key, display name, worst-case size, and the
 /// four behavior axes.
@@ -259,28 +318,6 @@ impl PortDesc {
         self
     }
 
-    /// The descriptor of a receive-all tap port: it reserves no ring and connects no
-    /// edge, so its `id` is a never-matched sentinel and its size is 0. Temporary —
-    /// the capabilities commit (§2.5) lifts `AllOutputs` out of the port lists.
-    pub fn receive_all() -> Self {
-        Self {
-            id: PortId::Packet([0xFF, 0xFF]),
-            name: RECEIVE_ALL_NAME,
-            max_size: 0,
-            schema: PortSchema::Postcard,
-            delivery: Delivery::Log,
-            fan_in: FanIn::Many,
-            on_lap: OnLap::Resync,
-            telemetered: false,
-        }
-    }
-
-    /// Whether this desc is the temporary receive-all sentinel (never a real port:
-    /// no ring, no edge, no registry entry).
-    pub(crate) fn is_receive_all(&self) -> bool {
-        self.name == RECEIVE_ALL_NAME
-    }
-
     /// The frame-relative vtable of a Table port (wiring compatibility / telemetry
     /// announce), or `None` on a Postcard port (checked — S5).
     pub fn vtable(&self) -> Option<&VTable> {
@@ -311,14 +348,16 @@ pub enum SystemKind {
     Async,
 }
 
-/// A system's full self-description: its name, driving kind, and the static shapes
-/// of every input and output port.
+/// A system's full self-description: its name, driving kind, the static shapes of
+/// every input and output port, and the non-port [`Capability`] set it needs from
+/// the host at bind time (§2.5 — e.g. the downlink's `ReceiveAll`).
 #[derive(Clone, Debug)]
 pub struct SystemDescriptor {
     pub name: &'static str,
     pub kind: SystemKind,
     pub inputs: Vec<PortDesc>,
     pub outputs: Vec<PortDesc>,
+    pub capabilities: Vec<Capability>,
 }
 
 /// A `(component_id, ty, shape)` triple — the unit a compatibility check compares.

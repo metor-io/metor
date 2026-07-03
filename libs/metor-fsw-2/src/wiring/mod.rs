@@ -1032,6 +1032,7 @@ fn resolve_slot(
         kind: base.kind,
         inputs,
         outputs: base.outputs.clone(),
+        capabilities: base.capabilities.clone(),
     };
 
     // Every other allowed occupant must share the contract (the slot derives one shape from

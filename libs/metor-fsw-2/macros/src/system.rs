@@ -1,10 +1,12 @@
 //! `#[derive(SystemInput)]` / `#[derive(SystemOutput)]` (system.md §2, Q5).
 //!
 //! A system's input/output bundle is a named struct of `Input<F>` / `Output<F>` /
-//! `MsgIn<M>` / `MsgOut<M>` ports. These derives generate the static `descriptors()`
-//! (and, for inputs, `any_lapped()`; for outputs, `take_dropped()`) by delegating to
-//! each port type's own `descriptor()`/`lap_fault()`/`take_dropped()` — so the macro
-//! never has to parse `F` out of the field type.
+//! `MsgIn<M>` / `MsgOut<M>` ports (plus capability fields like `AllOutputs`).
+//! These derives generate the static `decls()` (and, for inputs, `any_lapped()`;
+//! for outputs, `take_dropped()`) by delegating to each field type's own
+//! `decl()`/`lap_fault()`/`take_dropped()` — so the macro never has to parse `F`
+//! out of the field type, and a capability field rides the same walk (its
+//! `decl()` is a `PortDecl::Capability`; its `bind` consumes no ring).
 //!
 //! ## `#[fsw(...)]` field attributes
 //!
@@ -136,29 +138,31 @@ impl Bundle {
     }
 }
 
-/// Emits the `descriptors()` body: each port type's `descriptor()`, in field order,
-/// with the `#[fsw(...)]` axis overrides (and the `CommandOut` sugar) chained on.
-fn descriptors_body(bundle: &Bundle, fsw2: &TokenStream2) -> TokenStream2 {
+/// Emits the `decls()` body: each field type's `decl()` (a wired port, or a
+/// capability like `AllOutputs`), in field order, with the `#[fsw(...)]` axis
+/// overrides (and the `CommandOut` sugar) chained on. The overrides are
+/// `PortDecl`-level so the walk stays type-blind; they only touch `Port` decls.
+fn decls_body(bundle: &Bundle, fsw2: &TokenStream2) -> TokenStream2 {
     let calls = bundle.ports().into_iter().map(|f| {
         let ty = &f.ty;
-        let mut desc = quote! { <#ty>::descriptor() };
+        let mut decl = quote! { <#ty>::decl() };
         if f.is_command_out() || f.telemetered == Some(false) {
-            desc = quote! { #desc.untelemetered() };
+            decl = quote! { #decl.untelemetered() };
         }
         if let Ok(Some(v)) = f.on_lap_variant() {
-            desc = quote! { #desc.with_on_lap(#fsw2::OnLap::#v) };
+            decl = quote! { #decl.with_on_lap(#fsw2::OnLap::#v) };
         }
-        quote! { descs.push(#desc); }
+        quote! { decls.push(#decl); }
     });
     quote! {
-        let mut descs = ::std::vec::Vec::new();
+        let mut decls = ::std::vec::Vec::new();
         #(#calls)*
-        descs
+        decls
     }
 }
 
 /// Emits the `BindPorts::bind` body: each port type's `bind(src)`, in field order —
-/// symmetric to `descriptors()`, so the ring source's positional cursor lines each
+/// symmetric to `decls()`, so the ring source's positional cursor lines each
 /// port up with the ring the coordinator reserved for it. An `on_lap` override is
 /// chained onto the bound port too (descriptor and runtime can never disagree).
 /// `PhantomData` anchors are default-constructed (they consume no ring).
@@ -241,7 +245,7 @@ fn expand_input(parsed: DeriveInput) -> TokenStream2 {
     // `Backing` param: strip defaults for the impl header (dl-open.md §1.2).
     let stripped = strip_defaults(&bundle.generics);
     let (impl_generics, ty_generics, where_clause) = stripped.split_for_impl();
-    let descriptors = descriptors_body(&bundle, &fsw2);
+    let decls = decls_body(&bundle, &fsw2);
 
     // any_lapped: OR every input port's policy-derived `lap_fault()` (A5).
     let lapped = bundle.ports().into_iter().map(|f| {
@@ -254,8 +258,8 @@ fn expand_input(parsed: DeriveInput) -> TokenStream2 {
 
     quote! {
         impl #impl_generics #fsw2::SystemInput for #ident #ty_generics #where_clause {
-            fn descriptors() -> ::std::vec::Vec<#fsw2::PortDesc> {
-                #descriptors
+            fn decls() -> ::std::vec::Vec<#fsw2::PortDecl> {
+                #decls
             }
             fn any_lapped(&self) -> bool {
                 false #(#lapped)*
@@ -284,7 +288,7 @@ fn expand_output(parsed: DeriveInput) -> TokenStream2 {
     let ident = &bundle.ident;
     let stripped = strip_defaults(&bundle.generics);
     let (impl_generics, ty_generics, where_clause) = stripped.split_for_impl();
-    let descriptors = descriptors_body(&bundle, &fsw2);
+    let decls = decls_body(&bundle, &fsw2);
     let bind = bind_body(&bundle, &fsw2);
     let bind_ports = bind_ports_impl(&bundle, &fsw2, &bind);
 
@@ -296,8 +300,8 @@ fn expand_output(parsed: DeriveInput) -> TokenStream2 {
 
     quote! {
         impl #impl_generics #fsw2::SystemOutput for #ident #ty_generics #where_clause {
-            fn descriptors() -> ::std::vec::Vec<#fsw2::PortDesc> {
-                #descriptors
+            fn decls() -> ::std::vec::Vec<#fsw2::PortDecl> {
+                #decls
             }
             fn take_dropped(&mut self) -> u64 {
                 0 #(#dropped)*
@@ -346,7 +350,7 @@ mod tests {
             }
         });
         assert!(
-            out.contains("<MsgIn<GuardCmd>>::descriptor().with_on_lap(metor_fsw_2::OnLap::Stop)"),
+            out.contains("<MsgIn<GuardCmd>>::decl().with_on_lap(metor_fsw_2::OnLap::Stop)"),
             "{out}"
         );
         assert!(
@@ -354,7 +358,7 @@ mod tests {
             "{out}"
         );
         // The unattributed field expands exactly as before (no chained override).
-        assert!(out.contains("descs.push(<Input<Imu>>::descriptor());"), "{out}");
+        assert!(out.contains("decls.push(<Input<Imu>>::decl());"), "{out}");
         assert!(out.contains("imu: <Input<Imu>>::bind(src)"), "{out}");
         // any_lapped ORs the policy-derived lap_fault (A5).
         assert!(out.contains("false || self.cmds.lap_fault() || self.imu.lap_fault()"), "{out}");
@@ -373,12 +377,12 @@ mod tests {
                 beat: Output<Heartbeat>,
             }
         });
-        assert!(out.contains("<Output<Nav>>::descriptor().untelemetered()"), "{out}");
+        assert!(out.contains("<Output<Nav>>::decl().untelemetered()"), "{out}");
         assert!(
-            out.contains("<CommandOut<SequenceCommand>>::descriptor().untelemetered()"),
+            out.contains("<CommandOut<SequenceCommand>>::decl().untelemetered()"),
             "{out}"
         );
-        assert!(out.contains("descs.push(<Output<Heartbeat>>::descriptor());"), "{out}");
+        assert!(out.contains("decls.push(<Output<Heartbeat>>::decl());"), "{out}");
         // Bind never chains a telemetry override.
         assert!(out.contains("nav: <Output<Nav>>::bind(src)"), "{out}");
         assert!(!out.contains("bind(src).untelemetered"), "{out}");

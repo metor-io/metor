@@ -26,7 +26,7 @@ use metor_proto::vtable::VTable;
 use metor_proto_wkt::ComponentMetadata;
 
 use crate::binder::RingSource;
-use crate::descriptor::{Delivery, PortDesc};
+use crate::descriptor::{Capability, Delivery, PortDecl};
 
 /// What a tap needs to know about an entry's records — the registry projection of
 /// the port's [`PortSchema`](crate::PortSchema) axis.
@@ -135,16 +135,17 @@ impl Registry {
 }
 
 // ---------------------------------------------------------------------------
-// AllOutputs — the reusable receive-all tap port
+// AllOutputs — the reusable receive-all tap capability
 // ---------------------------------------------------------------------------
 
 /// A broadcast tap over **every telemetered** buffer in the graph
 /// (`docs/message-wiring.md` §4) — the reusable generalization of the telemetry
-/// downlink's registry pull. It reserves no ring and connects no edge; it appears in
-/// a bundle like any port and binds by pulling the one [`Registry`], so any system
-/// (a downlink, a logger, a recorder) taps the whole graph just by declaring an
-/// `AllOutputs` field. Each such port counts one extra reader on every buffer, which
-/// `build()` derives into every ring's `max_readers` budget.
+/// downlink's registry pull. Not a port but a [`Capability::ReceiveAll`] grant: it
+/// reserves no ring and connects no edge; it appears in a bundle like any field and
+/// binds by pulling the one [`Registry`] (consuming no bind-cursor position), so any
+/// system (a downlink, a logger, a recorder) taps the whole graph just by declaring
+/// an `AllOutputs` field. Each such capability counts one extra reader on every
+/// buffer, which `build()` derives into every ring's `max_readers` budget.
 ///
 /// The telemetered filter lives HERE, at the source (A6): consumers can no longer
 /// forget the convention — an untelemetered entry (a command channel, an opted-out
@@ -156,10 +157,12 @@ pub struct AllOutputs {
 }
 
 impl AllOutputs {
-    /// The receive-all tap descriptor — ring-less, edge-less (a temporary sentinel
-    /// until the capabilities rework lifts it out of the port lists).
-    pub fn descriptor() -> PortDesc {
-        PortDesc::receive_all()
+    /// What this field contributes to the bundle's `decls` walk: not a port at all
+    /// but the [`Capability::ReceiveAll`] grant — no ring, no edge, no registry
+    /// entry, and the bind cursor skips it ([`bind`](Self::bind) pulls the registry
+    /// instead of consuming a bound ring).
+    pub fn decl() -> PortDecl {
+        PortDecl::Capability(Capability::ReceiveAll)
     }
 
     /// Pull the one broad registry the host [`Binder`](crate::Binder) carries.

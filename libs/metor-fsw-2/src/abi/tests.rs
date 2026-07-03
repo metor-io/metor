@@ -621,12 +621,13 @@ impl SeqSystem for WaitSeq {
         // (SequenceStatus, health, log).
         let inputs = vec![<Input<SlotControlIn, BoxBacking>>::descriptor()];
         let outputs =
-            <Out<SeqStatusOut<BoxBacking>, BoxBacking> as SystemOutput>::descriptors();
+            <Out<SeqStatusOut<BoxBacking>, BoxBacking> as SystemOutput>::port_descs();
         SystemDescriptor {
             name: "wait_seq",
             kind: SystemKind::Cyclic,
             inputs,
             outputs,
+            capabilities: Vec::new(),
         }
     }
 

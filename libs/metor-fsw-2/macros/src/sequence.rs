@@ -254,13 +254,15 @@ pub fn sequence(attr: TokenStream, item: TokenStream) -> TokenStream {
                 inputs.push(<#fsw2::Input<#fsw2::sequence::SlotControlIn, #fsw2::ring::BoxBacking>>::descriptor());
                 let mut outputs = ::std::vec![ #(#output_descs,)* ];
                 outputs.extend(
-                    <#fsw2::Out<#fsw2::sequence::SeqStatusOut<#fsw2::ring::BoxBacking>, #fsw2::ring::BoxBacking> as #fsw2::SystemOutput>::descriptors(),
+                    <#fsw2::Out<#fsw2::sequence::SeqStatusOut<#fsw2::ring::BoxBacking>, #fsw2::ring::BoxBacking> as #fsw2::SystemOutput>::port_descs(),
                 );
                 #fsw2::SystemDescriptor {
                     name: #name,
                     kind: #fsw2::SystemKind::Cyclic,
                     inputs,
                     outputs,
+                    // A sequence declares wired ports only (no host capabilities).
+                    capabilities: ::std::vec::Vec::new(),
                 }
             }
 

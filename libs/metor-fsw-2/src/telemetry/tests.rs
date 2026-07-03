@@ -618,8 +618,10 @@ struct BurstLogOut {
 }
 
 impl SystemOutput for BurstLogOut {
-    fn descriptors() -> Vec<crate::PortDesc> {
-        vec![crate::PortDesc::of::<Imu>().with_delivery(crate::Delivery::Log)]
+    fn decls() -> Vec<crate::PortDecl> {
+        vec![crate::PortDecl::Port(
+            crate::PortDesc::of::<Imu>().with_delivery(crate::Delivery::Log),
+        )]
     }
 }
 
@@ -784,7 +786,7 @@ fn cyclic_after_receive_all_is_a_build_error() {
 #[test]
 fn uplink_command_port_is_untelemetered() {
     use metor_proto::types::Msg;
-    let descs = <super::UplinkPorts as crate::SystemOutput>::descriptors();
+    let descs = <super::UplinkPorts as crate::SystemOutput>::port_descs();
     assert_eq!(descs.len(), 1);
     assert!(!descs[0].telemetered, "inbound commands are never downlinked");
     assert_eq!(
