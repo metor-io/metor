@@ -41,7 +41,8 @@ use metor_proto::types::{LenPacket, Msg, OwnedPacket, PacketId, Timestamp};
 use metor_proto::vtable::VTable;
 use metor_proto_stellar::{PacketSink, PacketStream};
 use metor_proto_wkt::{
-    ComponentMetadata, MsgStream, SequenceCommand, SetComponentMetadata, VTableMsg,
+    ComponentMetadata, MsgStream, ReloadSequences, SequenceCommand, SetComponentMetadata,
+    VTableMsg,
 };
 use stellarator::JoinHandleDropGuard;
 use stellarator::buf::Slice;
@@ -402,16 +403,59 @@ impl HandOff {
 /// via its drop guard regardless).
 const UPLINK_IDLE: Duration = Duration::from_millis(50);
 
-/// The uplink's output bundle (`docs/message-wiring.md` §6): a single ordinary
-/// [`CommandOut<SequenceCommand>`](CommandOut) message output it re-emits each decoded
-/// `SequenceCommand` onto — a fully normal message producer, no bespoke command-bus capability.
-/// The coordinator collects every `SequenceCommand` output as a command producer every slot fans
-/// in from. Untelemetered (inbound control), so it is never echoed on the downlink — the
+/// The uplink's output bundle (`docs/message-wiring.md` §6): one ordinary
+/// [`CommandOut`](CommandOut) message output **per forwarded command type** — fully
+/// normal message producers, no bespoke command-bus capability. A consumer receives a
+/// command type only over an explicit edge (`connect "uplink" -> … msg="…"`, A2).
+/// Untelemetered (inbound control), so nothing here is echoed on the downlink — the
 /// `CommandOut` token *is* the opt-out spelling the derive lowers to `.untelemetered()`
 /// (`CommandOut` itself is a pure `MsgOut` alias; the flag lives on the descriptor).
+///
+/// This bundle is the **one table** subscription and dispatch derive from (A8): the
+/// ground subscription is the declared ports' `PacketId`s ([`uplink_subscribe_ids`]),
+/// and [`RouteMsg::route`] emits on the port whose id matches — adding a command type
+/// is one field + one route arm, and the subscription follows automatically.
 #[derive(crate::SystemOutput)]
 pub struct UplinkPorts {
     commands: CommandOut<SequenceCommand>,
+    reloads: CommandOut<ReloadSequences>,
+}
+
+/// Route one received wire Msg to the declared output whose [`PacketId`] matches
+/// (A8, `docs/design-command-slots.md` §2.7). Returns `false` when no declared port
+/// matches — the uplink bumps its `uplink.unroutable` health counter. Ground bytes
+/// are never forwarded unparsed: each arm postcard-decodes before emitting, so a
+/// malformed payload for a known id is dropped (the link stays up).
+///
+/// Hand-written per bundle today, one arm per declared message output; the
+/// `#[system]` derive can generate it from the bundle later (E2).
+pub trait RouteMsg {
+    /// Decode-and-emit `bytes` on the declared output keyed `id`; `false` if no
+    /// declared output carries `id`.
+    fn route(&mut self, id: PacketId, bytes: &[u8]) -> bool;
+}
+
+/// Decode `bytes` as `M` and emit it on `port` — one [`RouteMsg`] arm's body. A
+/// decode failure is a dropped record, not an unroutable id (the id *did* match a
+/// declared port), so this returns `true` either way.
+fn decode_emit<M: Msg + serde::de::DeserializeOwned>(
+    port: &mut crate::MsgOut<M>,
+    bytes: &[u8],
+) -> bool {
+    if let Ok(msg) = postcard::from_bytes::<M>(bytes) {
+        let _ = port.emit(&msg);
+    }
+    true
+}
+
+impl RouteMsg for UplinkPorts {
+    fn route(&mut self, id: PacketId, bytes: &[u8]) -> bool {
+        match id {
+            SequenceCommand::ID => decode_emit(&mut self.commands, bytes),
+            ReloadSequences::ID => decode_emit(&mut self.reloads, bytes),
+            _ => false,
+        }
+    }
 }
 
 /// The uplink's (empty) input bundle — it sources commands from its own connection, not edges.
@@ -476,10 +520,13 @@ impl<R: RecvTransport + 'static> System for UplinkSystem<R> {
 
 impl<R: RecvTransport + 'static> AsyncSystem for UplinkSystem<R> {
     /// One ingest pass (the coordinator's async-run loop calls it repeatedly): `recv` the next
-    /// packet, keep only `SequenceCommand` Msgs (cube-sat's exact filter,
-    /// `examples/cube-sat/src/main.rs:690`), and `emit` each onto the command channel; ignore any
-    /// other packet. On the first error the link is dropped (no reconnect) and subsequent passes
-    /// idle so the loop does not spin a dead reader.
+    /// packet and [`route`](RouteMsg::route) it to the declared output whose id matches (A8) —
+    /// subscription and dispatch derive from the one declared bundle, so they cannot diverge.
+    /// A Msg no declared port carries bumps `uplink.unroutable` (the db should only relay
+    /// subscribed ids, so this signals a broker/config mismatch); Tables are silently ignored
+    /// (the downlink's traffic class, never expected here). On the first error the link is
+    /// dropped (no reconnect) and subsequent passes idle so the loop does not spin a dead
+    /// reader.
     async fn run(&mut self, _input: &mut Self::Input, output: &mut Self::Output) {
         // Subscribe once, before the first read, to the ids of the uplink's declared outputs.
         if !self.subscribed {
@@ -494,12 +541,19 @@ impl<R: RecvTransport + 'static> AsyncSystem for UplinkSystem<R> {
             return;
         };
         match recv.recv().await {
-            Ok(OwnedPacket::Msg(m)) if m.id == SequenceCommand::ID => {
-                if let Ok(cmd) = m.parse::<SequenceCommand>() {
-                    let _ = output.commands.emit(&cmd);
+            Ok(OwnedPacket::Msg(m)) => {
+                // Disjoint borrows: `route` takes the ports, the miss takes health.
+                let (ports, health) = output.split();
+                if !ports.route(m.id, &m.buf) {
+                    health.error("uplink.unroutable");
+                    // An async system has no per-cycle driver flushing its health
+                    // (`CyclicRunner::step` does that for cyclic systems), so
+                    // publish the miss immediately — otherwise the counter would
+                    // never reach the wire.
+                    health.end_cycle(Timestamp::now(), 0);
                 }
             }
-            // Other Msgs / Tables are ignored — the uplink is commands only.
+            // Tables are ignored — the uplink is commands only.
             Ok(_) => {}
             // A dropped link (or an exhausted mock) ends the reader, like the sender.
             Err(_) => self.recv = None,

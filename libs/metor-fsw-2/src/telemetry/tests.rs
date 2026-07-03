@@ -744,13 +744,17 @@ fn message_handoff_drops_oldest_on_overflow() {
     );
 }
 
-/// The uplink derives its ground subscription from its declared message-output ports — exactly
-/// the `SequenceCommand` it re-emits (`docs/message-wiring.md` §5.2), not a hardcoded id.
+/// The uplink derives its ground subscription from its declared message-output ports — the
+/// one table dispatch also derives from (A8), not a hardcoded id: declaring a second command
+/// output (ReloadSequences) put its id in the subscription with no other change.
 #[test]
 fn uplink_subscribes_to_its_declared_command_ids() {
     use metor_proto::types::Msg;
-    use metor_proto_wkt::SequenceCommand;
-    assert_eq!(super::uplink_subscribe_ids(), vec![SequenceCommand::ID]);
+    use metor_proto_wkt::{ReloadSequences, SequenceCommand};
+    assert_eq!(
+        super::uplink_subscribe_ids(),
+        vec![SequenceCommand::ID, ReloadSequences::ID]
+    );
 }
 
 /// A11(b): "the telemetry downlink registers last" is enforced, not silently reordered —
@@ -784,14 +788,20 @@ fn cyclic_after_receive_all_is_a_build_error() {
 /// the flag lives on the descriptor via the derive's token lowering). Guards the
 /// A6 regression where the downlink would echo inbound commands back to the panel.
 #[test]
-fn uplink_command_port_is_untelemetered() {
+fn uplink_command_ports_are_untelemetered() {
     use metor_proto::types::Msg;
     let descs = <super::UplinkPorts as crate::SystemOutput>::port_descs();
-    assert_eq!(descs.len(), 1);
-    assert!(!descs[0].telemetered, "inbound commands are never downlinked");
+    assert_eq!(descs.len(), 2);
+    for d in &descs {
+        assert!(!d.telemetered, "inbound commands are never downlinked");
+        assert_eq!(d.delivery, crate::Delivery::Log);
+    }
     assert_eq!(
         descs[0].id,
         crate::PortId::Packet(metor_proto_wkt::SequenceCommand::ID)
     );
-    assert_eq!(descs[0].delivery, crate::Delivery::Log);
+    assert_eq!(
+        descs[1].id,
+        crate::PortId::Packet(metor_proto_wkt::ReloadSequences::ID)
+    );
 }

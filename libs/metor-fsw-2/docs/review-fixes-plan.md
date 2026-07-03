@@ -92,8 +92,24 @@ are not ours to commit.
       cube-sat, db). Also fixed pre-existing metor-fsw wkt gating build break
       and a silent dl_integration skip-pass. Docs still say channel_id →
       wave-6 docs pass. (2026-07-02)
-- [ ] A1 unification (biggest churn), then command/slots phases 2-5 on the
-      unified model. → **Commit each.**
+- [x] W4b: A1 unification landed as 7 staged commits (0ba6c284, 5e5f9ad0,
+      c79fa21a, 16b1b20c, c171bd28, 2e52afa4, 8e628dfd): four-axis PortDesc
+      (schema × delivery × fan-in × on-lap) + telemetered flag + capabilities;
+      PortId::Component/Packet; NamedMsg; one registry/tap/handoff/drain;
+      connect_msg + CommandOut-type deleted (alias + token lowering);
+      schema-tagged ABI folded into unshipped v3. (2026-07-02)
+- [x] W4c: command/slots phases 2-5 landed as 4 commits (A2 90715ed9, A3
+      739b0d52, A9 c5090d17, A8): explicit command edges (n_slots/
+      command_producers residue deleted; slot declares a MsgIn<SequenceCommand>
+      fan-in; KDL uplink{} node + reserved "coordinator" name + joint msg-edge
+      resolution); PortConn axis {Edge, Host, SelfTap} — SlotAux/pop/re-append
+      die, W1b builder-path initial-occupant check folded in; coordinator #0
+      full bundle (keys golden); uplink RouteMsg dispatch + ReloadSequences
+      second output + uplink.unroutable. Deviations: HostPort rejects
+      consumer-side host inputs only (a Host OUTPUT must accept edges —
+      coordinator.commands); zero-command-edge slots allowed silently
+      (documented, no warn channel in resolve). metor-panel unchanged
+      (wire format stable since W4a). (2026-07-02)
 
 ### Wave 5 — E2 `#[system]` macro (after wave 4 trait surface settles)
 - [ ] Macro + migrate adcs-fsw2 example + static-linking example (E8d).
