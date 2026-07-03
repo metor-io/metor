@@ -521,18 +521,32 @@ fn slot_emits_ordered_sequence_events_and_boot_registry() {
 //    Empty → Loaded → Running with no observable bare-Loaded cycle.
 // ---------------------------------------------------------------------------
 
-/// A mock [`RecvTransport`] yielding a fixed script of `SequenceCommand`s, then a
-/// `Disconnected` (the reader stops, like a dropped link). Each command is encoded to the
-/// real wire bytes and re-parsed, so the loopback exercises the same `OwnedPacket::Msg` /
-/// `parse::<SequenceCommand>` path the TCP reader uses.
+/// A mock [`RecvTransport`] yielding a fixed script of pre-encoded wire packets, then a
+/// `Disconnected` (the reader stops, like a dropped link). Each packet is real wire
+/// bytes re-parsed, so the loopback exercises the same `OwnedPacket::Msg` / route path
+/// the TCP reader uses.
 struct MockRecv {
-    queue: std::collections::VecDeque<SequenceCommand>,
+    queue: std::collections::VecDeque<Vec<u8>>,
+}
+
+/// Encode one Msg to its framed wire bytes, stripping the `LenPacket` 4-byte length
+/// prefix — the framing the panel sends and `OwnedPacket::parse` expects.
+fn wire_msg<M: Msg + serde::Serialize>(msg: &M) -> Vec<u8> {
+    let pkt = msg.into_len_packet();
+    pkt.inner[4..].to_vec()
 }
 
 impl MockRecv {
     fn new(cmds: Vec<SequenceCommand>) -> Self {
         Self {
-            queue: cmds.into(),
+            queue: cmds.iter().map(wire_msg).collect(),
+        }
+    }
+
+    /// A script of arbitrary pre-encoded packets (the A8 multi-type/garbage cases).
+    fn from_packets(packets: Vec<Vec<u8>>) -> Self {
+        Self {
+            queue: packets.into(),
         }
     }
 }
@@ -540,11 +554,7 @@ impl MockRecv {
 impl RecvTransport for MockRecv {
     async fn recv(&mut self) -> Result<OwnedPacket<Slice<Vec<u8>>>, TransportError> {
         match self.queue.pop_front() {
-            Some(cmd) => {
-                // Encode to the wire `LenPacket` then strip its 4-byte length prefix, the
-                // same framing the panel sends and `OwnedPacket::parse` expects.
-                let pkt = (&cmd).into_len_packet();
-                let bytes = pkt.inner[4..].to_vec();
+            Some(bytes) => {
                 let slice = bytes.try_slice(..).expect("non-empty packet");
                 OwnedPacket::parse(slice).map_err(|e| TransportError::Io(format!("{e}")))
             }
@@ -1001,4 +1011,135 @@ fn builder_initial_occupant_outside_allowed_set_panics() {
         result.is_err(),
         "an initial occupant outside the allowed set is a build-time contract panic"
     );
+}
+
+// ---------------------------------------------------------------------------
+// 10. A8 — uplink multi-output dispatch: received Msgs route by declared output
+//     id (the RouteMsg seam); a second declared command type Just Works; an
+//     unknown id bumps `uplink.unroutable`; a malformed payload for a known id
+//     is dropped with the link staying up.
+// ---------------------------------------------------------------------------
+
+use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+
+use metor_fsw_2::metor_proto_wkt::ReloadSequences;
+
+static RELOADS_SEEN: AtomicU64 = AtomicU64::new(0);
+static CMDS_SEEN: AtomicU64 = AtomicU64::new(0);
+
+/// A cyclic consumer of BOTH uplink command types, each over its own explicit edge.
+struct CmdTap;
+
+#[derive(metor_fsw_2::SystemInput)]
+struct CmdTapIn {
+    reloads: metor_fsw_2::MsgIn<ReloadSequences>,
+    commands: metor_fsw_2::MsgIn<SequenceCommand>,
+}
+
+#[derive(metor_fsw_2::SystemOutput)]
+struct CmdTapOut {}
+
+impl metor_fsw_2::System for CmdTap {
+    type Input = CmdTapIn;
+    type Output = metor_fsw_2::Out<CmdTapOut>;
+    const NAME: &'static str = "cmd_tap";
+}
+
+impl metor_fsw_2::CyclicSystem for CmdTap {
+    fn execute(
+        &mut self,
+        _now: metor_fsw_2::Timestamp,
+        input: &mut CmdTapIn,
+        _o: &mut Self::Output,
+    ) {
+        input.reloads.drain(|_| {
+            RELOADS_SEEN.fetch_add(1, Relaxed);
+        });
+        input.commands.drain(|_| {
+            CMDS_SEEN.fetch_add(1, Relaxed);
+        });
+    }
+}
+
+#[test]
+fn uplink_routes_by_declared_output_and_survives_garbage() {
+    use metor_fsw_2::metor_proto::types::LenPacket;
+
+    RELOADS_SEEN.store(0, Relaxed);
+    CMDS_SEEN.store(0, Relaxed);
+
+    // The script: a second-type command (routes to `reloads`), an id the uplink
+    // declares no output for (unroutable — SequenceChannelEvent is downlink
+    // traffic), a malformed payload under a KNOWN id (dropped; the link must stay
+    // up), then a valid SequenceCommand — received only if the garbage did not
+    // kill the reader.
+    let unroutable = wire_msg(&SequenceChannelEvent {
+        channel: "adcs".to_string(),
+        kind: SequenceEventKind::Started,
+    });
+    let malformed = {
+        // A SequenceCommand-id Msg whose payload cannot postcard-decode (a string
+        // length varint pointing far past the end).
+        let mut pkt = LenPacket::msg(SequenceCommand::ID, 4);
+        pkt.extend_from_slice(&[0xFF, 0xFF, 0xFF, 0xFF]);
+        pkt.inner[4..].to_vec()
+    };
+    let valid = wire_msg(&SequenceCommand {
+        channel: "anything".to_string(),
+        command: SequenceCommandKind::Start,
+    });
+    let reload = wire_msg(&ReloadSequences {});
+
+    let mut b = Coordinator::builder(sim_config());
+    let tap = b.add_cyclic(CmdTap);
+    let uplink = b.add_uplink(MockRecv::from_packets(vec![
+        reload, unroutable, malformed, valid,
+    ]));
+    b.connect(
+        PortRef::msg::<ReloadSequences>(uplink),
+        PortRef::msg::<ReloadSequences>(tap),
+    )
+    .expect("the reloads edge connects");
+    b.connect(
+        PortRef::msg::<SequenceCommand>(uplink),
+        PortRef::msg::<SequenceCommand>(tap),
+    )
+    .expect("the commands edge connects");
+    let mut coord = b.build().expect("the uplink + tap graph builds");
+
+    // Tap the uplink's health BEFORE the run (overwrite rings start at the live edge).
+    let mut health: Input<metor_fsw_2::SystemHealth> = Input::new(
+        coord
+            .registry()
+            .view(ComponentId::new("uplink.health"))
+            .expect("the uplink's health is registered")
+            .expect("reader slot available"),
+    );
+
+    let coord = stellarator::run(|| async move {
+        // Plenty of cycles for the async uplink to drain its 4-packet script.
+        coord.run_for(40).await;
+        coord
+    });
+
+    assert_eq!(
+        RELOADS_SEEN.load(Relaxed),
+        1,
+        "the second declared command type routed to its own output"
+    );
+    assert_eq!(
+        CMDS_SEEN.load(Relaxed),
+        1,
+        "the valid command AFTER the malformed one arrived — the link stayed up \
+         and the garbage payload was dropped"
+    );
+    // The unroutable id was counted on uplink health (`uplink.unroutable`).
+    let mut errors = 0;
+    let _ = health.drain(|f| errors = errors.max(f.get().errors));
+    assert!(
+        errors >= 1,
+        "the unknown-id Msg bumped the uplink's unroutable counter: {errors}"
+    );
+
+    drop((coord, health));
 }

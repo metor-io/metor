@@ -20,7 +20,7 @@ use metor_fsw_ring::{
     Backing, BoxBacking, NoWake, View, WakeSink, WakeSource, WriteError, Writer,
 };
 use metor_proto::types::{Msg, PacketId};
-use metor_proto_wkt::{SequenceChannelEvent, SequenceCommand, SequenceRegistry};
+use metor_proto_wkt::{ReloadSequences, SequenceChannelEvent, SequenceCommand, SequenceRegistry};
 use serde::de::DeserializeOwned;
 
 use crate::binder::RingSource;
@@ -50,6 +50,9 @@ impl NamedMsg for SequenceRegistry {
 }
 impl NamedMsg for SequenceChannelEvent {
     const NAME: &'static str = "SequenceChannelEvent";
+}
+impl NamedMsg for ReloadSequences {
+    const NAME: &'static str = "ReloadSequences";
 }
 
 /// Default worst-case message payload size, the [`Frame::MAX_SIZE`](crate::Frame)
