@@ -5,7 +5,7 @@ use std::collections::HashMap;
 
 use metor_fsw::{AsVTable, Componentize};
 use metor_proto::types::{ComponentId, ComponentView, Timestamp};
-use zerocopy::{Immutable, IntoBytes, KnownLayout};
+use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
 
 use crate::{Frame, FrameList, FrameMap, FrameWriter, KeyError};
 
@@ -37,7 +37,7 @@ impl metor_fsw::Decomponentize for RecSink {
 // 1. IMU frame: frame tag + shared timestamp + timestamp suppression
 // ---------------------------------------------------------------------------
 
-#[derive(Frame, IntoBytes, Immutable, KnownLayout)]
+#[derive(Frame, IntoBytes, Immutable, KnownLayout, FromBytes)]
 #[repr(C)]
 #[metor_fsw(name = "imu")]
 struct Imu {
@@ -91,7 +91,7 @@ fn imu_frame_tag_and_timestamp_suppression() {
 // 2. Static-frame Componentize / Decomponentize round-trip
 // ---------------------------------------------------------------------------
 
-#[derive(Frame, IntoBytes, Immutable, KnownLayout, Default, Debug, PartialEq)]
+#[derive(Frame, IntoBytes, Immutable, KnownLayout, FromBytes, Default, Debug, PartialEq)]
 #[repr(C)]
 #[metor_fsw(name = "imu")]
 struct ImuRt {
@@ -144,7 +144,7 @@ impl metor_fsw::Decomponentize for VecSink {
     }
 }
 
-#[derive(Frame, IntoBytes, Immutable, KnownLayout, Default, Debug, PartialEq)]
+#[derive(Frame, IntoBytes, Immutable, KnownLayout, FromBytes, Default, Debug, PartialEq)]
 #[repr(C)]
 #[metor_fsw(name = "arr")]
 struct ArrFrame {
@@ -197,7 +197,7 @@ struct Process {
     cpu_usage: f64,
 }
 
-#[derive(Frame, IntoBytes, Immutable, KnownLayout)]
+#[derive(Frame, IntoBytes, Immutable, KnownLayout, FromBytes)]
 #[repr(C)]
 struct SysList {
     #[metor_fsw(timestamp)]
@@ -240,7 +240,7 @@ fn frame_list_build_and_apply() {
     );
 }
 
-#[derive(Frame, IntoBytes, Immutable, KnownLayout)]
+#[derive(Frame, IntoBytes, Immutable, KnownLayout, FromBytes)]
 #[repr(C)]
 struct SysMap {
     #[metor_fsw(timestamp)]
@@ -326,7 +326,7 @@ struct Host {
     threads: FrameList<Thread, 4>,
 }
 
-#[derive(Frame, IntoBytes, Immutable, KnownLayout)]
+#[derive(Frame, IntoBytes, Immutable, KnownLayout, FromBytes)]
 #[repr(C)]
 struct SysNested {
     #[metor_fsw(timestamp)]
@@ -383,7 +383,7 @@ fn nested_dynamic_prefix_rule() {
 // 5. MAX_SIZE formula (frames.md §3.4)
 // ---------------------------------------------------------------------------
 
-#[derive(Frame, IntoBytes, Immutable, KnownLayout)]
+#[derive(Frame, IntoBytes, Immutable, KnownLayout, FromBytes)]
 #[repr(C)]
 struct SysBoth {
     #[metor_fsw(timestamp)]

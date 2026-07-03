@@ -8,6 +8,9 @@ publish = false
 description = "Overwrite-on-lap, shared-memory ring buffer for metor-fsw-2"
 authors = ["sascha@metor.io"]
 
+[lints]
+workspace = true
+
 [features]
 default = ["async"]
 # In-process async wake (data-available / space-available) via a stellarator

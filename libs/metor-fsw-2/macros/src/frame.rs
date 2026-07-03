@@ -16,6 +16,12 @@ struct Frame {
     data: ast::Data<(), crate::Field>,
     parent: Option<String>,
     name: Option<String>,
+    /// Explicit opt-out of the shared-timestamp requirement (E4): a frame without a
+    /// `#[metor_fsw(timestamp)]` field must say `#[metor_fsw(no_timestamp)]`, so a
+    /// forgotten timestamp is a derive error instead of every record silently
+    /// stamping `Timestamp(0)`.
+    #[darling(default)]
+    no_timestamp: bool,
 }
 
 /// `#[derive(Frame)]` — the one-annotation entry point (frames.md §2.4).
@@ -31,6 +37,7 @@ pub fn frame(input: TokenStream) -> TokenStream {
         data,
         parent,
         name,
+        no_timestamp,
     } = Frame::from_derive_input(&parsed).unwrap();
 
     // `#[derive(Frame)]` is a metor-fsw-2 concept, so the bundled sub-derives emit
@@ -47,14 +54,37 @@ pub fn frame(input: TokenStream) -> TokenStream {
     let frame_id = quote! { #impeller::types::ComponentId::new(#frame_name) };
 
     // The shared timestamp accessor reads the `#[metor_fsw(timestamp)]` field.
+    // E4 strictness: a missing marker is a **derive error** (previously every record
+    // silently stamped `Timestamp(0)`); a genuinely timestamp-free frame opts out
+    // explicitly with `#[metor_fsw(no_timestamp)]` (its accessor then returns the
+    // default stamp, documented rather than accidental).
     let fields = data.take_struct().expect("Frame requires a named struct");
     let ts_field = fields.fields.iter().find(|f| f.timestamp);
-    let timestamp_body = match ts_field {
-        Some(f) => {
+    let timestamp_body = match (ts_field, no_timestamp) {
+        (Some(_), true) => {
+            return syn::Error::new_spanned(
+                &parsed.ident,
+                "#[metor_fsw(no_timestamp)] contradicts the #[metor_fsw(timestamp)] field — \
+                 remove one",
+            )
+            .to_compile_error()
+            .into();
+        }
+        (Some(f), false) => {
             let id = f.ident.as_ref().expect("named field");
             quote! { self.#id }
         }
-        None => quote! { #impeller::types::Timestamp::default() },
+        (None, true) => quote! { #impeller::types::Timestamp::default() },
+        (None, false) => {
+            return syn::Error::new_spanned(
+                &parsed.ident,
+                "#[derive(Frame)] requires a #[metor_fsw(timestamp)] field (the frame's \
+                 shared timestamp); mark one, or opt out explicitly with \
+                 #[metor_fsw(no_timestamp)] to stamp every record Timestamp(0)",
+            )
+            .to_compile_error()
+            .into();
+        }
     };
 
     // The four sub-derives share the same `Field`/attribute surface; each reads the

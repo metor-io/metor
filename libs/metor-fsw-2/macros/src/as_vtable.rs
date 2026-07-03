@@ -20,6 +20,9 @@ pub struct AsVTable {
     name: Option<String>,
     #[darling(default, rename = "group")]
     _group: darling::util::Ignored,
+    /// Tolerated here; consumed by the bundling `Frame` derive (E4 opt-out).
+    #[darling(default, rename = "no_timestamp")]
+    _no_timestamp: darling::util::Ignored,
 }
 
 fn extract_repr_type(attrs: &[Attribute]) -> Option<Ident> {
@@ -59,6 +62,7 @@ pub fn as_vtable_impl(
         parent,
         name,
         _group,
+        _no_timestamp: _,
     } = AsVTable::from_derive_input(input).unwrap();
     let parent = parent.or(name);
     let where_clause = &generics.where_clause;

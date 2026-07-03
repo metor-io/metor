@@ -12,6 +12,9 @@ pub struct Componentize {
     data: ast::Data<(), crate::Field>,
     parent: Option<String>,
     name: Option<String>,
+    /// Tolerated here; consumed by the bundling `Frame` derive (E4 opt-out).
+    #[darling(default, rename = "no_timestamp")]
+    _no_timestamp: darling::util::Ignored,
 }
 
 /// `crate_name` is the path to the crate that re-exports the trait surface the
@@ -24,6 +27,7 @@ pub fn componentize_impl(input: &DeriveInput, crate_name: &TokenStream2) -> Toke
         data,
         parent,
         name,
+        _no_timestamp: _,
     } = Componentize::from_derive_input(input).unwrap();
     let parent = parent.or(name);
     let where_clause = &generics.where_clause;
