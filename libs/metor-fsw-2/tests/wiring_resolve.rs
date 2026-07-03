@@ -162,7 +162,6 @@ fn dl_graph_via_wiring_resolve_end_to_end() {
     // 6. The typed params took effect: count = start(1000) + latest value(6).
     let out = out_view
         .latest()
-        .expect("no lap on the tapped output")
         .expect("the dl system produced a tick_out");
     assert_eq!(
         out.get().count,
@@ -277,7 +276,7 @@ connect "ticker" -> "counter" frame="tick_in"
     });
 
     let count_of = |view: &mut Input<TickOut>| -> u64 {
-        view.latest().expect("no lap").expect("a tick_out was produced").get().count
+        view.latest().expect("a tick_out was produced").get().count
     };
     let builder_count = count_of(&mut builder_view);
     let kdl_count = count_of(&mut kdl_view);

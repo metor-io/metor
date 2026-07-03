@@ -9,7 +9,7 @@ use syn::{DeriveInput, Generics, Ident, parse_macro_input};
 /// component-id prefix and the `FRAME_ID` tag (frames.md §1.3). When absent, no
 /// prefix is applied and `FRAME_ID` defaults to `snake_case(ident)`.
 #[derive(Debug, FromDeriveInput)]
-#[darling(attributes(metor_fsw), supports(struct_named))]
+#[darling(attributes(fsw, metor_fsw), supports(struct_named))]
 struct Frame {
     ident: Ident,
     generics: Generics,

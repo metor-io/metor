@@ -99,7 +99,7 @@ async fn run_and_measure(mut coord: Coordinator, cycles: usize) -> Measure {
         let mut body = body_view;
         loop {
             stellarator::yield_now().await;
-            if let Ok(Some(b)) = body.latest() {
+            if let Some(b) = body.latest() {
                 captured
                     .borrow_mut()
                     .push(tracking_sample(b.get(), CONVERGED_LAW));

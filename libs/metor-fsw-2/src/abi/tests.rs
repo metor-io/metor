@@ -91,7 +91,7 @@ impl<B: Backing> System<B> for Counter {
 impl<B: Backing> CyclicSystem<B> for Counter {
     fn execute(&mut self, now: Timestamp, input: &mut CounterIn<B>, output: &mut Out<CounterOut<B>, B>) {
         let value = match input.tick.latest() {
-            Ok(Some(t)) => t.get().value,
+            Some(t) => t.get().value,
             _ => {
                 output.health().error("no_tick");
                 return;
@@ -181,7 +181,7 @@ fn abi_lifecycle_end_to_end() {
     assert_eq!(status, FswStatus::Running);
 
     // Read the produced frame back through the host's view.
-    let out = out_view.latest().unwrap().expect("system produced an output");
+    let out = out_view.latest().expect("system produced an output");
     assert_eq!(out.get().count, 105, "start(100) + value(5)");
     assert_eq!(out.get().timestamp, Timestamp(1000), "stamped with `now`");
 
@@ -692,7 +692,6 @@ fn seq_abi_runs_to_done() {
     // A terminal `SequenceStatus` (run_state == Completed) was published on the tail.
     let rec = status_view
         .latest()
-        .unwrap()
         .expect("a SequenceStatus record was written");
     assert_eq!(rec.get().run_state, Outcome::Completed.run_state());
     assert_eq!(rec.get().timestamp, Timestamp(2));

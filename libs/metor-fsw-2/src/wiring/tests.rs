@@ -136,7 +136,7 @@ impl System for NavFilter {
 
 impl CyclicSystem for NavFilter {
     fn execute(&mut self, now: Timestamp, input: &mut NavIn, o: &mut Self::Output) {
-        if let Ok(Some(imu)) = input.imu.latest() {
+        if let Some(imu) = input.imu.latest() {
             let omega = imu.get().omega;
             let _ = o.nav.write(&Nav {
                 timestamp: now,
@@ -252,7 +252,7 @@ impl System for Closer {
 impl CyclicSystem for Closer {
     fn execute(&mut self, now: Timestamp, input: &mut CloserIn, o: &mut Self::Output) {
         let omega = match input.nav.latest() {
-            Ok(Some(nav)) => nav.get().angle,
+            Some(nav) => nav.get().angle,
             _ => 0.0,
         };
         let _ = o.imu.write(&Imu {

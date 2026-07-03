@@ -216,4 +216,11 @@ impl AllOutputs {
             messages: src.message_registry(),
         }
     }
+
+    /// A tap reads, it never publishes — no drop counter to fold (review E6). Present
+    /// so `#[derive(SystemOutput)]`'s generated `take_dropped` sum compiles over a
+    /// bundle that carries an `AllOutputs` field.
+    pub fn take_dropped(&mut self) -> u64 {
+        0
+    }
 }

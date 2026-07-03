@@ -41,6 +41,14 @@ pub trait SystemInput {
 pub trait SystemOutput {
     /// The produced frame of every output port (system.md §5), in field order.
     fn descriptors() -> Vec<PortDesc>;
+
+    /// Sum-and-clear the ports' [`publish`](crate::Output::publish) drop counters
+    /// (review E6). Derive-generated; the runner folds a nonzero sum into a
+    /// `publish_dropped` health error each cycle. The default keeps hand-written
+    /// bundles (which may not track drops) compiling.
+    fn take_dropped(&mut self) -> u64 {
+        0
+    }
 }
 
 /// The framework wrapper around a system's user output bundle `O`: it adds the
@@ -72,6 +80,14 @@ where
     /// `.log(level, msg)` (system.md §4.2). The only error-reporting mechanism.
     pub fn health(&mut self) -> &mut HealthPort<B, WD, WS> {
         &mut self.health
+    }
+
+    /// Disjoint borrows of the user ports and the health handle (review E8a), so
+    /// generated delegation (`#[system]`) can lend a `&mut` port *and* the health
+    /// handle to the user `execute` at once — `health()` borrows the whole `Out`,
+    /// which would conflict with `&mut out.<port>`.
+    pub fn split(&mut self) -> (&mut O, &mut HealthPort<B, WD, WS>) {
+        (&mut self.ports, &mut self.health)
     }
 }
 
@@ -111,6 +127,12 @@ where
         descs.push(PortDesc::of::<SystemHealth>());
         descs.push(PortDesc::of::<SystemLog>());
         descs
+    }
+
+    /// Forward to the user bundle's counters (the framework's own health/log ports
+    /// publish through the sizing-aware `write_with`, so they never count drops).
+    fn take_dropped(&mut self) -> u64 {
+        self.ports.take_dropped()
     }
 }
 
@@ -303,6 +325,24 @@ where
         let start = std::time::Instant::now();
         self.system.execute(now, &mut self.input, &mut self.output);
         let micros = start.elapsed().as_micros() as u64;
+        // E6: fold the ports' publish-drop counters into health — a nonzero sum is a
+        // ring-sizing bug the system itself could not report (publish is infallible).
+        if self.output.take_dropped() > 0 {
+            self.output.health().error("publish_dropped");
+        }
+        // E3: a lap *during* execute (an async producer racing the drain — latched by
+        // `Input::latest`'s resync) is charged the same cycle, mirroring the
+        // pre-execute check above.
+        if self.input.any_lapped() {
+            let h = self.output.health();
+            h.record_lapped();
+            h.log(Level::Error, "input lapped; system permanently stopped");
+            h.end_cycle(now, micros);
+            self.state = SlotState::Stopped {
+                reason: StopReason::LappedInput,
+            };
+            return;
+        }
         self.output.health().end_cycle(now, micros);
     }
 

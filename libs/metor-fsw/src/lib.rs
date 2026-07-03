@@ -1,6 +1,6 @@
 pub use metor_proto;
 pub use metor_proto_wkt;
-pub use metor_fsw_macros::{AsVTable, Componentize, Decomponentize, Frame, Metadatatize};
+pub use metor_fsw_macros::{AsVTable, Componentize, Decomponentize, Metadatatize};
 pub use metor_proto::com_de::{Componentize, Decomponentize};
 pub use vtable::AsVTable;
 pub use zerocopy;

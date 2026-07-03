@@ -73,6 +73,22 @@ fn progress_and_aborted_free_fns() {
 }
 
 #[test]
+fn now_reads_the_stepped_ambient_clock() {
+    // E7: `now()` is the coordinator cycle time, refreshed before each poll — a
+    // sequence stamps its emitted frames with it (never wall time).
+    let clock = Rc::new(SeqClock::default());
+    clock.now.set(Timestamp(42));
+    with_clock(&clock, || {
+        assert_eq!(super::now(), Timestamp(42));
+        let seq = super::Seq::new(clock.clone());
+        assert_eq!(seq.now(), Timestamp(42), "the handle reads the same clock");
+    });
+    // The next cycle's refresh is observed by the next poll.
+    clock.now.set(Timestamp(43));
+    with_clock(&clock, || assert_eq!(super::now(), Timestamp(43)));
+}
+
+#[test]
 fn clock_is_cleared_after_with_clock() {
     let clock = Rc::new(SeqClock::default());
     assert!(current().is_none(), "no ambient clock outside a poll");

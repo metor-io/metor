@@ -112,7 +112,7 @@ impl CyclicSystem for Filter {
     fn execute(&mut self, _now: Timestamp, input: &mut FilterIn, output: &mut Out<FilterOut>) {
         // Read the freshest IMU sample; report a health error when starved.
         let (timestamp, angle, accel) = match input.imu.latest() {
-            Ok(Some(imu)) => {
+            Some(imu) => {
                 let s = imu.get();
                 (s.timestamp, s.omega * self.gain, s.accel)
             }
@@ -176,7 +176,7 @@ fn cyclic_filter_end_to_end() {
     runner.step(Timestamp::now());
 
     // The consumer reads the produced frame: fixed region zero-copy + dynamic member.
-    let nav = nav_in.latest().unwrap().expect("nav produced");
+    let nav = nav_in.latest().expect("nav produced");
     let est = nav.get();
     assert_eq!(est.angle, 3.0, "omega * gain");
     assert_eq!(est.timestamp, Timestamp(42), "timestamp carried through");
@@ -310,7 +310,7 @@ fn health_counters_published() {
     }
 
     // Read the freshest health record and apply its vtable.
-    let record = health_in.latest().unwrap().expect("health published");
+    let record = health_in.latest().expect("health published");
     let mut sink = RecSink::default();
     record.apply(&mut sink).unwrap().unwrap();
 
@@ -420,7 +420,341 @@ async fn async_filter_one_cycle() {
     sys.run(&mut input, &mut output).await;
     let _ = writer.await;
 
-    let nav = nav_in.latest().unwrap().expect("async system produced a nav");
+    let nav = nav_in.latest().expect("async system produced a nav");
     assert_eq!(nav.get().angle, 2.0);
     assert_eq!(nav.get().timestamp, Timestamp(7));
+}
+
+// ---------------------------------------------------------------------------
+// #[system] parity: the hand-written trait impls and the attribute macro produce
+// an identical descriptor and identical run behavior (design-system-macro.md §11.2).
+// ---------------------------------------------------------------------------
+
+/// The hand-written form: bundles + System + CyclicSystem + BuildSystem spelled out.
+struct HandDoubler {
+    gain: f64,
+}
+
+#[derive(SystemInput)]
+struct HandDoublerIn {
+    imu: Input<Imu>,
+}
+
+#[derive(SystemOutput)]
+struct HandDoublerOut {
+    nav: Output<NavEstimate>,
+}
+
+impl System for HandDoubler {
+    type Input = HandDoublerIn;
+    type Output = Out<HandDoublerOut>;
+    const NAME: &'static str = "doubler";
+}
+
+impl CyclicSystem for HandDoubler {
+    fn execute(&mut self, now: Timestamp, input: &mut HandDoublerIn, output: &mut Self::Output) {
+        match input.imu.latest() {
+            Some(imu) => {
+                let angle = imu.get().omega * self.gain;
+                output.nav.publish(&NavEstimate {
+                    timestamp: now,
+                    angle,
+                    residuals: FrameList::EMPTY,
+                });
+            }
+            None => output.health().error("imu_missing"),
+        }
+    }
+}
+
+impl crate::BuildSystem for HandDoubler {
+    type Params = f64;
+    fn new(gain: f64) -> Self {
+        Self { gain }
+    }
+}
+
+/// The macro form: same name, same ports in the same order, same body — everything
+/// else generated.
+struct MacroDoubler {
+    gain: f64,
+}
+
+#[crate::system(name = "doubler")]
+impl MacroDoubler {
+    fn new(gain: f64) -> Self {
+        Self { gain }
+    }
+
+    fn execute(
+        &mut self,
+        now: Timestamp,
+        imu: &mut Input<Imu>,
+        nav: &mut Output<NavEstimate>,
+        health: &mut HealthPort,
+    ) {
+        match imu.latest() {
+            Some(imu) => {
+                let angle = imu.get().omega * self.gain;
+                nav.publish(&NavEstimate {
+                    timestamp: now,
+                    angle,
+                    residuals: FrameList::EMPTY,
+                });
+            }
+            None => health.error("imu_missing"),
+        }
+    }
+}
+
+/// A tiny 3-cycle harness: feed `samples` (None ⇒ starve the cycle), return every
+/// produced angle and the final health record's scalar components.
+fn run_doubler<S, O>(system: S, samples: &[Option<f64>]) -> (Vec<f64>, HashMap<ComponentId, f64>)
+where
+    S: CyclicSystem<Output = Out<O>>,
+    S::Input: crate::BindPorts<BoxBacking>,
+    O: SystemOutput + crate::BindPorts<BoxBacking>,
+{
+    let imu_ring = overwrite_ring::<Imu>(8, 2);
+    let nav_ring = overwrite_ring::<NavEstimate>(8, 2);
+    let health_ring = overwrite_ring::<SystemHealth>(8, 1);
+    let log_ring = overwrite_ring::<SystemLog>(8, 1);
+
+    let mut imu_w = Output::<Imu>::new(imu_ring.writer(NoWake, NoWake).unwrap());
+    let mut nav_in = Input::<NavEstimate>::new(nav_ring.view(NoWake, NoWake).unwrap());
+    let mut health_in = Input::<SystemHealth>::new(health_ring.view(NoWake, NoWake).unwrap());
+
+    let input = crate::BindPorts::bind(&mut TestSource {
+        rings: vec![imu_ring.clone()],
+        next: 0,
+    });
+    let output = crate::BindPorts::bind(&mut TestSource {
+        rings: vec![nav_ring.clone(), health_ring.clone(), log_ring.clone()],
+        next: 0,
+    });
+
+    let mut runner = CyclicRunner::new(system, input, output);
+    let mut angles = Vec::new();
+    for (i, s) in samples.iter().enumerate() {
+        if let Some(omega) = s {
+            imu_w
+                .write(&Imu {
+                    timestamp: Timestamp(i as i64),
+                    omega: *omega,
+                    accel: 0.0,
+                })
+                .unwrap();
+        }
+        runner.step(Timestamp(i as i64));
+        if let Some(nav) = nav_in.latest() {
+            angles.push(nav.get().angle);
+        }
+    }
+
+    let record = health_in.latest().expect("health published");
+    let mut sink = RecSink::default();
+    record.apply(&mut sink).unwrap().unwrap();
+    (angles, sink.values)
+}
+
+/// A positional `RingSource` over pre-created rings (the coordinator's job, by hand).
+struct TestSource {
+    rings: Vec<RingBuffer<BoxBacking>>,
+    next: usize,
+}
+
+impl TestSource {
+    fn pop(&mut self) -> RingBuffer<BoxBacking> {
+        let ring = self.rings[self.next].clone();
+        self.next += 1;
+        ring
+    }
+}
+
+impl crate::RingSource for TestSource {
+    type B = BoxBacking;
+
+    fn next_output<WD, WS>(&mut self) -> (RingBuffer<BoxBacking>, WD, WS)
+    where
+        WD: metor_fsw_ring::WakeSource + Default + Clone + 'static,
+        WS: metor_fsw_ring::WakeSink + Default + Clone + 'static,
+    {
+        (self.pop(), WD::default(), WS::default())
+    }
+
+    fn next_input<RD, RS>(&mut self) -> (RingBuffer<BoxBacking>, RD, RS)
+    where
+        RD: metor_fsw_ring::WakeSink + Default + Clone + 'static,
+        RS: metor_fsw_ring::WakeSource + Default + Clone + 'static,
+    {
+        (self.pop(), RD::default(), RS::default())
+    }
+}
+
+#[test]
+fn system_macro_matches_hand_written() {
+    // 1. Identical descriptors (name, kind, port order/ids/sizes — via the stable
+    //    Debug rendering, PortDesc carries a non-Eq announce closure).
+    let hand = <HandDoubler as CyclicSystem>::descriptor();
+    let mac = <MacroDoubler as CyclicSystem>::descriptor();
+    assert_eq!(format!("{hand:?}"), format!("{mac:?}"));
+
+    // 2. Identical BuildSystem params + construction.
+    let h: HandDoubler = crate::BuildSystem::new(2.0);
+    let m: MacroDoubler = crate::BuildSystem::new(2.0);
+
+    // 3. Identical behavior over 3 cycles, including the starved first cycle's
+    //    health error (later cycles re-serve the freshest read record, so only a
+    //    never-fed input counts as missing).
+    let samples = [None, Some(1.5), Some(-2.0)];
+    let (ha, mut hh) = run_doubler(h, &samples);
+    let (ma, mut mh) = run_doubler(m, &samples);
+    assert_eq!(ha, ma, "same outputs");
+    assert_eq!(ha, vec![3.0, -4.0], "gain applied once samples flow");
+    // The execute duration is wall time — the one legitimately different component.
+    hh.remove(&ComponentId::new("health.last_execute_micros"));
+    mh.remove(&ComponentId::new("health.last_execute_micros"));
+    assert_eq!(hh, mh, "same health counters");
+    assert_eq!(hh[&ComponentId::new("health.cycles")], 3.0);
+    assert_eq!(hh[&ComponentId::new("health.error_counts.imu_missing")], 1.0);
+}
+
+// ---------------------------------------------------------------------------
+// E6: an infallible publish onto an undersized ring counts the drop, and the
+// runner folds it into a `publish_dropped` health error.
+// ---------------------------------------------------------------------------
+
+#[derive(Default)]
+struct Chatter;
+
+#[crate::system(name = "chatter")]
+impl Chatter {
+    fn execute(&mut self, now: Timestamp, imu: &mut Output<Imu>) {
+        // An `Imu` record can never fit the 16-byte ring below: the publish fails
+        // with `InsufficientCapacity` (a sizing bug) and is counted, not returned.
+        imu.publish(&Imu {
+            timestamp: now,
+            omega: 1.0,
+            accel: 0.0,
+        });
+    }
+}
+
+#[test]
+fn publish_drop_folds_to_health() {
+    // 16 bytes cannot hold one Imu record (24-byte frame + record header).
+    let tiny = RingBuffer::create_in_memory(Config {
+        capacity: 16,
+        max_readers: 1,
+        overrun: Overrun::Overwrite,
+    });
+    let health_ring = overwrite_ring::<SystemHealth>(8, 1);
+    let log_ring = overwrite_ring::<SystemLog>(8, 1);
+    let mut health_in = Input::<SystemHealth>::new(health_ring.view(NoWake, NoWake).unwrap());
+
+    let input = crate::BindPorts::bind(&mut TestSource { rings: vec![], next: 0 });
+    let output = crate::BindPorts::bind(&mut TestSource {
+        rings: vec![tiny, health_ring.clone(), log_ring.clone()],
+        next: 0,
+    });
+    let mut runner = CyclicRunner::new(Chatter::default(), input, output);
+    runner.step(Timestamp(1));
+
+    let record = health_in.latest().expect("health published");
+    let mut sink = RecSink::default();
+    record.apply(&mut sink).unwrap().unwrap();
+    assert_eq!(sink.values[&ComponentId::new("health.errors")], 1.0);
+    assert_eq!(
+        sink.values[&ComponentId::new("health.error_counts.publish_dropped")],
+        1.0,
+        "the port's counted drop is telemetered by the runner (E6)"
+    );
+    assert!(matches!(runner.state(), crate::SlotState::Running), "a drop is an error, not a stop");
+}
+
+// ---------------------------------------------------------------------------
+// E3: a lap *during* execute is resync-latched by `latest()` (the body keeps the
+// freshest record) and charged post-execute: health + a permanent stop.
+// ---------------------------------------------------------------------------
+
+/// Writes into its own input ring mid-execute (standing in for an async producer
+/// racing the drain), then re-reads: `latest()` must resync over the lap and serve
+/// the newest record while latching `is_lapped` for the runner. The `Option` writer
+/// keeps the (macro-required) `Default` construction path compiling; the test
+/// installs the real writer before running.
+#[derive(Default)]
+struct SelfFlooder {
+    writer: Option<Output<Imu>>,
+    seen: Vec<f64>,
+}
+
+#[crate::system(name = "self_flooder")]
+impl SelfFlooder {
+    fn execute(&mut self, now: Timestamp, imu: &mut Input<Imu>) {
+        let _ = imu.latest();
+        // Lap the (depth-2) view: far more records than the ring holds.
+        let writer = self.writer.as_mut().expect("test installs the writer");
+        for i in 0..32 {
+            let _ = writer.write(&Imu {
+                timestamp: now,
+                omega: i as f64,
+                accel: 0.0,
+            });
+        }
+        // The E3 contract: no Err — the lap is latched and the view resyncs to the
+        // live edge (unread records, including the flood, are abandoned).
+        assert!(imu.latest().is_none(), "nothing read before the lap to re-serve");
+        assert!(imu.is_lapped(), "the resynced-over lap stays latched");
+        // Reads resume normally after the resync: a fresh record is served.
+        let _ = writer.write(&Imu {
+            timestamp: now,
+            omega: 99.0,
+            accel: 0.0,
+        });
+        let newest = imu.latest().expect("post-resync reads resume");
+        self.seen.push(newest.get().omega);
+    }
+}
+
+#[test]
+fn mid_execute_lap_latches_and_stops() {
+    let imu_ring = overwrite_ring::<Imu>(2, 1);
+    let health_ring = overwrite_ring::<SystemHealth>(8, 1);
+    let log_ring = overwrite_ring::<SystemLog>(8, 1);
+    let mut health_in = Input::<SystemHealth>::new(health_ring.view(NoWake, NoWake).unwrap());
+
+    let input = crate::BindPorts::bind(&mut TestSource {
+        rings: vec![imu_ring.clone()],
+        next: 0,
+    });
+    let output = crate::BindPorts::bind(&mut TestSource {
+        rings: vec![health_ring.clone(), log_ring.clone()],
+        next: 0,
+    });
+    let system = SelfFlooder {
+        writer: Some(Output::new(imu_ring.writer(NoWake, NoWake).unwrap())),
+        seen: Vec::new(),
+    };
+    let mut runner = CyclicRunner::new(system, input, output);
+    runner.step(Timestamp(1));
+
+    assert!(
+        matches!(runner.state(), crate::SlotState::Stopped { reason: crate::StopReason::LappedInput }),
+        "a mid-execute lap permanently stops the system the same cycle"
+    );
+    let record = health_in.latest().expect("final health published");
+    let mut sink = RecSink::default();
+    record.apply(&mut sink).unwrap().unwrap();
+    assert_eq!(
+        sink.values[&ComponentId::new("health.lapped_inputs")],
+        1.0,
+        "the latched lap is charged to health (E3)"
+    );
+
+    // A stopped slot never executes again.
+    runner.step(Timestamp(2));
+    let record = health_in.latest().expect("health record");
+    let mut sink = RecSink::default();
+    record.apply(&mut sink).unwrap().unwrap();
+    assert_eq!(sink.values[&ComponentId::new("health.cycles")], 1.0);
 }

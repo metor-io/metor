@@ -5,17 +5,14 @@
 //! (`ModeCmd.law`): nadir or velocity-vector, computed from the **GPS** orbit measurement
 //! (cube-sat's `FSW::nadir_point` / `hil_point`). Before any `ModeCmd` arrives it holds the
 //! identity reference.
-
-#![allow(clippy::not_unsafe_ptr_arg_deref)]
+//!
+//! Authored with `#[system]` (`docs/design-system-macro.md`): the port set is the `execute`
+//! signature, and the bundles/trait impls/`BuildSystem`/`fsw_*` exports are all generated.
 
 use adcs_contracts::{
     AttitudeEstimate, CtrlParams, Gps, ModeCmd, TorqueCmd, inertia_diag, target_for,
 };
-use metor_fsw_2::metor_proto::types::Timestamp;
-use metor_fsw_2::ring::{Backing, BoxBacking};
-use metor_fsw_2::{
-    BuildSystem, CyclicSystem, Input, Out, Output, System, SystemInput, SystemOutput,
-};
+use metor_fsw_2::{Input, Output, Timestamp, system};
 use nox::{Quaternion, tensor};
 
 pub struct CtrlSystem {
@@ -24,18 +21,7 @@ pub struct CtrlSystem {
     law: Option<u8>,
 }
 
-#[derive(SystemInput)]
-pub struct CtrlIn<B: Backing = BoxBacking> {
-    pub estimate: Input<AttitudeEstimate, B>,
-    pub gps: Input<Gps, B>,
-    pub mode: Input<ModeCmd, B>,
-}
-
-#[derive(SystemOutput)]
-pub struct CtrlOut<B: Backing = BoxBacking> {
-    pub torque: Output<TorqueCmd, B>,
-}
-
+#[system(name = "ctrl", export = "export")]
 impl CtrlSystem {
     pub fn new(p: CtrlParams) -> Self {
         let q = tensor![p.q_weight, p.q_weight, p.q_weight];
@@ -43,31 +29,30 @@ impl CtrlSystem {
         let lqr = metor_fsw_adcs::yang_lqr::YangLQR::new(inertia_diag(), q, q, r);
         Self { lqr, law: None }
     }
-}
 
-impl<B: Backing> System<B> for CtrlSystem {
-    type Input = CtrlIn<B>;
-    type Output = Out<CtrlOut<B>, B>;
-    const NAME: &'static str = "ctrl";
-}
-
-impl<B: Backing> CyclicSystem<B> for CtrlSystem {
-    fn execute(&mut self, now: Timestamp, input: &mut CtrlIn<B>, o: &mut Self::Output) {
-        let Ok(Some(e)) = input.estimate.latest() else {
+    fn execute(
+        &mut self,
+        now: Timestamp,
+        estimate: &mut Input<AttitudeEstimate>,
+        gps: &mut Input<Gps>,
+        mode: &mut Input<ModeCmd>,
+        torque: &mut Output<TorqueCmd>,
+    ) {
+        let Some(e) = estimate.latest() else {
             return;
         };
         let e = e.get();
         let q_hat_b_eci = e.q_hat_b_eci;
 
         // Latch the commanded pointing law (the slot may not have written one yet).
-        if let Ok(Some(m)) = input.mode.latest() {
+        if let Some(m) = mode.latest() {
             self.law = Some(m.get().law);
         }
 
         // Select the target attitude from the law + the current GPS orbit measurement; identity
         // until a law and a GPS fix are both available.
-        let target = match (self.law, input.gps.latest()) {
-            (Some(law), Ok(Some(gps))) => {
+        let target = match (self.law, gps.latest()) {
+            (Some(law), Some(gps)) => {
                 let gps = gps.get();
                 target_for(law, &gps.pos_eci, &gps.vel_eci)
             }
@@ -78,19 +63,9 @@ impl<B: Backing> CyclicSystem<B> for CtrlSystem {
         let ang_vel = q_hat_b_eci * e.omega_b;
         let torque_b = self.lqr.control(q_hat_b_eci, ang_vel, target);
 
-        let _ = o.torque.write(&TorqueCmd {
+        torque.publish(&TorqueCmd {
             timestamp: now,
             torque_b,
         });
     }
 }
-
-impl BuildSystem for CtrlSystem {
-    type Params = CtrlParams;
-    fn new(params: Self::Params) -> Self {
-        CtrlSystem::new(params)
-    }
-}
-
-#[cfg(feature = "export")]
-metor_fsw_2::export_system!(CtrlSystem);

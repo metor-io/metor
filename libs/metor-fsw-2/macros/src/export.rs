@@ -11,24 +11,45 @@
 //! params blob crosses `fsw_create` as canonical postcard bytes, and `fsw_describe`
 //! exports `<Params as postcard_schema::Schema>::SCHEMA` so the host can encode params
 //! from KDL without linking the `Params` type (dl-open.md §6.3).
+//!
+//! [`export_items`] is the shared generator: `export_system!` emits it ungated;
+//! `#[system(export)]`/`#[system(export = "feature")]` emit it behind a `cfg` gate.
+//! Every item carries `#[allow(clippy::not_unsafe_ptr_arg_deref)]` (the raw-pointer
+//! params are the ABI contract), so consuming crates need no crate-level allow.
 
 use proc_macro::TokenStream;
+use proc_macro2::TokenStream as TokenStream2;
 use quote::quote;
 use syn::{Type, parse_macro_input};
 
 pub fn export_system(input: TokenStream) -> TokenStream {
     let ty = parse_macro_input!(input as Type);
     let fsw2 = crate::metor_fsw_2_crate_name();
+    export_items(&quote! { #ty }, &fsw2, None).into()
+}
 
+/// The `fsw_*` C-ABI items for cyclic system `ty`, each optionally wrapped in the
+/// `cfg` `gate` (`#[system]`'s `not(test)` / feature gating; `export_system!` passes
+/// `None` — a pure-cdylib crate exports unconditionally).
+pub fn export_items(
+    ty: &TokenStream2,
+    fsw2: &TokenStream2,
+    gate: Option<TokenStream2>,
+) -> TokenStream2 {
+    let gate = &gate;
     quote! {
         /// The ABI word the host checks for equality before any other call.
+        #gate
         #[unsafe(no_mangle)]
+        #[allow(clippy::not_unsafe_ptr_arg_deref)]
         pub extern "C" fn fsw_abi_version() -> u32 {
             #fsw2::abi::FSW_ABI_VERSION
         }
 
         /// Serialize this system's descriptor (postcard) to the host sink.
+        #gate
         #[unsafe(no_mangle)]
+        #[allow(clippy::not_unsafe_ptr_arg_deref)]
         pub extern "C" fn fsw_describe(
             sink: #fsw2::abi::ByteSink,
             ctx: *mut ::core::ffi::c_void,
@@ -38,7 +59,9 @@ pub fn export_system(input: TokenStream) -> TokenStream {
         }
 
         /// Decode the postcard `Params` blob, construct the system, box the state.
+        #gate
         #[unsafe(no_mangle)]
+        #[allow(clippy::not_unsafe_ptr_arg_deref)]
         pub extern "C" fn fsw_create(
             params: *const u8,
             params_len: usize,
@@ -48,7 +71,9 @@ pub fn export_system(input: TokenStream) -> TokenStream {
         }
 
         /// Reconstruct the typed bundles from the host's ring handles, run `init`.
+        #gate
         #[unsafe(no_mangle)]
+        #[allow(clippy::not_unsafe_ptr_arg_deref)]
         pub extern "C" fn fsw_bind_init(
             state: *mut ::core::ffi::c_void,
             inputs: *const #fsw2::abi::FswRing,
@@ -61,7 +86,9 @@ pub fn export_system(input: TokenStream) -> TokenStream {
         }
 
         /// Run one cyclic `step`, returning an `FswStatus`.
+        #gate
         #[unsafe(no_mangle)]
+        #[allow(clippy::not_unsafe_ptr_arg_deref)]
         pub extern "C" fn fsw_execute(
             state: *mut ::core::ffi::c_void,
             now: u64,
@@ -71,18 +98,21 @@ pub fn export_system(input: TokenStream) -> TokenStream {
         }
 
         /// Run `System::shutdown` once.
+        #gate
         #[unsafe(no_mangle)]
+        #[allow(clippy::not_unsafe_ptr_arg_deref)]
         pub extern "C" fn fsw_shutdown(state: *mut ::core::ffi::c_void) {
             // SAFETY: `state` is a live pointer from `fsw_create`.
             unsafe { #fsw2::abi::run_shutdown::<#ty>(state) }
         }
 
         /// Drop the boxed state inside this `.so`.
+        #gate
         #[unsafe(no_mangle)]
+        #[allow(clippy::not_unsafe_ptr_arg_deref)]
         pub extern "C" fn fsw_destroy(state: *mut ::core::ffi::c_void) {
             // SAFETY: `state` is from `fsw_create`, transferred here exactly once.
             unsafe { #fsw2::abi::run_destroy::<#ty>(state) }
         }
     }
-    .into()
 }
