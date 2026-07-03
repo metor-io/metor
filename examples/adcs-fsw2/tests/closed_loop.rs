@@ -29,7 +29,8 @@ use adcs_nav::NavSystem;
 use adcs_plant::PlantSystem;
 use metor_fsw_2::metor_proto::types::ComponentId;
 use metor_fsw_2::wiring::Registry;
-use metor_fsw_2::{BuildOptions, Coordinator, Input, build_artifacts, parse, register_system, resolve};
+use metor_fsw_2::wiring::{build_artifacts, parse, resolve};
+use metor_fsw_2::{BuildOptions, Coordinator, Input, register_system};
 
 /// The mission wiring document — the same file the CLI runner and the other tests read.
 const MISSION_KDL: &str = include_str!("../mission.kdl");

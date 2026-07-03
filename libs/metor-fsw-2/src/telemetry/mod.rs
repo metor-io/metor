@@ -62,12 +62,24 @@ use crate::system::{AsyncSystem, CyclicSystem, Out, System, SystemInput, SystemO
 
 /// An async error a [`Transport`] surfaces; v1 stops downlinking on any error (the
 /// in-cycle snapshot stage keeps running and simply drops).
-#[derive(Debug)]
+#[derive(Debug, thiserror::Error)]
 pub enum TransportError {
     /// The link is not connected (never established, or dropped).
+    #[error("transport is not connected")]
     Disconnected,
-    /// An underlying I/O error, rendered to a string (transport-agnostic).
-    Io(String),
+    /// An underlying I/O error, carried as its boxed source (transport-agnostic —
+    /// the TCP paths raise `stellarator`/`metor-proto-stellar` errors) so the
+    /// chain survives a `?` into anyhow/miette instead of flattening to a string.
+    #[error("transport I/O error: {0}")]
+    Io(#[source] Box<dyn std::error::Error + Send + Sync + 'static>),
+}
+
+impl TransportError {
+    /// Wrap any transport-level error as the boxed [`Io`](TransportError::Io) source
+    /// — the one conversion every TCP call site funnels through.
+    fn io(e: impl std::error::Error + Send + Sync + 'static) -> Self {
+        TransportError::Io(Box::new(e))
+    }
 }
 
 /// Isolates the wire from the streamer (telemetry.md §7). v1 ships [`TcpTransport`];
@@ -134,7 +146,7 @@ impl TcpTransport {
         if self.conn.is_none() {
             let stream = TcpStream::connect(self.addr)
                 .await
-                .map_err(|e| TransportError::Io(format!("{e}")))?;
+                .map_err(TransportError::io)?;
             let (rx, tx) = stream.split();
             self.conn = Some(TcpConn {
                 sink: PacketSink::new(tx),
@@ -155,12 +167,12 @@ impl Transport for TcpTransport {
         sink.send(msg)
             .await
             .0
-            .map_err(|e| TransportError::Io(format!("{e}")))?;
+            .map_err(TransportError::io)?;
         for m in meta {
             sink.send(&SetComponentMetadata(m.clone()))
                 .await
                 .0
-                .map_err(|e| TransportError::Io(format!("{e}")))?;
+                .map_err(TransportError::io)?;
         }
         Ok(())
     }
@@ -170,7 +182,7 @@ impl Transport for TcpTransport {
         sink.send(pkt)
             .await
             .0
-            .map_err(|e| TransportError::Io(format!("{e}")))?;
+            .map_err(TransportError::io)?;
         Ok(())
     }
 }
@@ -217,7 +229,7 @@ impl TcpRecvTransport {
         if self.stream.is_none() {
             let stream = TcpStream::connect(self.addr)
                 .await
-                .map_err(|e| TransportError::Io(format!("{e}")))?;
+                .map_err(TransportError::io)?;
             let (rx, tx) = stream.split();
             // Subscribe to the panel's command stream before reading (`docs/messages.md` §4.4):
             // the db only forwards a message id to clients that asked for it. Mirrors cube-sat
@@ -234,7 +246,7 @@ impl TcpRecvTransport {
                 sink.send(&MsgStream { msg_id })
                     .await
                     .0
-                    .map_err(|e| TransportError::Io(format!("{e}")))?;
+                    .map_err(TransportError::io)?;
             }
             self.sink = Some(sink);
             self.stream = Some(PacketStream::new(rx));
@@ -249,7 +261,7 @@ impl RecvTransport for TcpRecvTransport {
         stream
             .next_grow(vec![0u8; 1024])
             .await
-            .map_err(|e| TransportError::Io(format!("{e}")))
+            .map_err(TransportError::io)
     }
 
     fn subscribe(&mut self, ids: &[PacketId]) {

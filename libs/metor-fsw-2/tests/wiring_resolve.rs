@@ -14,8 +14,7 @@ use metor_fsw_2::metor_proto::types::{ComponentId, Timestamp};
 use metor_fsw_2::{
     BuildSystem, ClockSpec, CyclicSystem, DlSystem, Frame, Input, Out, Output, ParamSource, System,
     SystemInput, SystemKind, SystemOutput, TelemetryModeSpec, Wiring, WiringBuilder,
-    build_artifacts, encode_kdl_params, parse, resolve,
-    wiring::{BuildOptions, Registry},
+    wiring::{BuildOptions, Registry, build_artifacts, encode_kdl_params, parse, resolve},
 };
 use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
 

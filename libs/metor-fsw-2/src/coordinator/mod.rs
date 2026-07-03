@@ -160,8 +160,7 @@ pub enum WireError {
         consumer: PortId,
     },
     /// The producer's record shape does not satisfy the consumer's required shape
-    /// (the Table subset rule / Postcard id equality / delivery agreement —
-    /// [`compatible`](crate::compatible)).
+    /// (the Table subset rule / Postcard id equality / delivery agreement).
     Incompatible {
         producer: &'static str,
         consumer: &'static str,
@@ -912,7 +911,7 @@ impl CoordinatorBuilder {
     /// them like a static system's.
     ///
     /// Dl systems are cyclic-only. This is the low-level builder method; the
-    /// [`resolve`](crate::resolve) entry point drives it from a [`Wiring`](crate::Wiring)
+    /// [`resolve`](crate::wiring::resolve) entry point drives it from a [`Wiring`](crate::Wiring)
     /// (built in Rust or parsed from the KDL `artifact`/`lib=` surface).
     pub fn add_dl_cyclic(
         &mut self,

@@ -11,9 +11,8 @@
 use std::path::PathBuf;
 
 use metor_fsw_2::wiring::Registry;
-use metor_fsw_2::{
-    BuildOptions, PackageOptions, build_artifacts, load_bundle, parse, resolve, write_bundle,
-};
+use metor_fsw_2::wiring::{build_artifacts, load_bundle, parse, resolve, write_bundle};
+use metor_fsw_2::{BuildOptions, PackageOptions};
 
 const MISSION_KDL: &str = include_str!("../mission.kdl");
 

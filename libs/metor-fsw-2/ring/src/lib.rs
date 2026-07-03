@@ -94,7 +94,7 @@ const HWM_NONE: u64 = u64::MAX;
 /// attach rejects regions produced by a different pointer width or endianness:
 /// the byte pattern of this native `u64` differs across endianness, and the low
 /// word carries the pointer width.
-fn arch_tag() -> u64 {
+const fn arch_tag() -> u64 {
     ((0x0102_0304u32 as u64) << 32) | (core::mem::size_of::<usize>() as u64)
 }
 
@@ -151,6 +151,24 @@ pub enum WriteError {
     WouldBlock,
 }
 
+// This crate is dependency-free by design, so the error types carry manual
+// `Display`/`Error` impls rather than a `thiserror` derive (S1).
+impl core::fmt::Display for WriteError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            WriteError::InsufficientCapacity => {
+                write!(f, "record is larger than the ring's whole data region")
+            }
+            WriteError::WouldBlock => write!(
+                f,
+                "lossless ring is full: writing now would overwrite the slowest active reader"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for WriteError {}
+
 /// A read could not be performed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ReadError {
@@ -168,14 +186,53 @@ pub enum ReadError {
     Corrupt,
 }
 
+impl core::fmt::Display for ReadError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            ReadError::Lapped => {
+                write!(f, "the writer lapped this view; unread data was overwritten")
+            }
+            ReadError::BorrowNotSupported => write!(
+                f,
+                "tear-free borrow requested on an overwrite ring; use try_read_into"
+            ),
+            ReadError::Corrupt => write!(
+                f,
+                "ring region violates a structural invariant (possible external corruption)"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for ReadError {}
+
 /// The reader table is full; no free slot to register another view.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct FullReaderTable;
+
+impl core::fmt::Display for FullReaderTable {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(f, "the ring's reader table is full; no free slot for another view")
+    }
+}
+
+impl std::error::Error for FullReaderTable {}
 
 /// A writer already exists for this buffer (or a crashed process leaked its
 /// claim — see [`RingBuffer::force_release_writer`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct WriterClaimed;
+
+impl core::fmt::Display for WriterClaimed {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(
+            f,
+            "a writer already exists for this ring (or a crashed process leaked its claim)"
+        )
+    }
+}
+
+impl std::error::Error for WriterClaimed {}
 
 /// A region's header was invalid or written by an incompatible build.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -196,6 +253,32 @@ pub enum AttachError {
     /// (e.g. a truncated file).
     RegionTruncated,
 }
+
+impl core::fmt::Display for AttachError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            AttachError::BadMagic => write!(f, "region header has the wrong magic"),
+            AttachError::BadVersion => {
+                write!(f, "region was written by an incompatible ring version")
+            }
+            AttachError::ArchMismatch => write!(
+                f,
+                "region was written by a different pointer width or endianness"
+            ),
+            AttachError::TooSmall => write!(f, "region is shorter than the fixed header"),
+            AttachError::Misaligned => write!(f, "region base pointer is not 8-byte aligned"),
+            AttachError::BadGeometry => {
+                write!(f, "region header fields are internally inconsistent")
+            }
+            AttachError::RegionTruncated => write!(
+                f,
+                "region header's total_size exceeds the backing region (truncated file?)"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for AttachError {}
 
 // ---------------------------------------------------------------------------
 // Backing storage
@@ -681,7 +764,7 @@ impl RingBuffer<MmapBacking> {
         // SAFETY: caller asserts a live, valid region; `from_validated` reads and
         // checks the header before forming any reference into it.
         unsafe { Self::from_validated(MmapBacking { map }) }
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, format!("{e:?}")))
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
     }
 }
 

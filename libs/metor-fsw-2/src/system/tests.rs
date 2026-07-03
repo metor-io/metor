@@ -13,7 +13,10 @@ use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
 use crate::{
     AsyncSystem, CyclicRunner, CyclicSystem, Frame, FrameList, HealthPort, Input, Out, Output,
     PortDesc, SystemHealth, SystemInput, SystemKind, SystemLog, SystemOutput, System,
-    buffer_capacity, compatible,
+    buffer_capacity,
+};
+use crate::descriptor::{
+    compatible,
 };
 
 // ---------------------------------------------------------------------------

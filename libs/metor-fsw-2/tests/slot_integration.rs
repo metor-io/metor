@@ -556,7 +556,7 @@ impl RecvTransport for MockRecv {
         match self.queue.pop_front() {
             Some(bytes) => {
                 let slice = bytes.try_slice(..).expect("non-empty packet");
-                OwnedPacket::parse(slice).map_err(|e| TransportError::Io(format!("{e}")))
+                OwnedPacket::parse(slice).map_err(|e| TransportError::Io(Box::new(e)))
             }
             None => Err(TransportError::Disconnected),
         }

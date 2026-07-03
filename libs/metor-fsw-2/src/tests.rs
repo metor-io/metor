@@ -7,7 +7,7 @@ use metor_fsw::{AsVTable, Componentize};
 use metor_proto::types::{ComponentId, ComponentView, Timestamp};
 use zerocopy::{Immutable, IntoBytes, KnownLayout};
 
-use crate::{Frame, FrameList, FrameMap, FrameWriter, Name, WriteError};
+use crate::{Frame, FrameList, FrameMap, FrameWriter, Name, KeyError};
 
 // ---------------------------------------------------------------------------
 // Shared recording sink
@@ -307,7 +307,7 @@ fn frame_map_rejects_dot_key_at_write_time() {
             },
         );
     });
-    assert_eq!(res, Err(WriteError::DotInKey));
+    assert_eq!(res, Err(KeyError::DotInKey));
 }
 
 // ---------------------------------------------------------------------------

@@ -141,6 +141,7 @@ impl Step {
 /// [`SeqClock::now`] — no maitake timer wheel, so it is driven entirely by
 /// coordinator time and deterministic under a `Simulated` clock (§4.3). It also
 /// short-circuits to [`Step::Aborted`] the moment `cancel` is latched.
+#[must_use = "a Wait does nothing unless .awaited — `wait(d);` without `.await` is a no-op"]
 pub struct Wait {
     deadline: Timestamp,
 }
@@ -164,6 +165,7 @@ impl Future for Wait {
 
 /// Suspend until `dur` of coordinator time has elapsed (or the sequence is aborted).
 /// The deadline is `now + dur` computed **at the call**, off the ambient clock.
+#[must_use = "wait() returns a future that does nothing unless .awaited"]
 pub fn wait(dur: Duration) -> Wait {
     let now = current().expect("wait() called outside a sequence poll").now.get();
     Wait { deadline: now + dur }
@@ -212,6 +214,7 @@ impl Seq {
     }
 
     /// As [`wait`], but off this handle's clock.
+    #[must_use = "wait() returns a future that does nothing unless .awaited"]
     pub fn wait(&self, dur: Duration) -> Wait {
         Wait {
             deadline: self.clock.now.get() + dur,

@@ -15,7 +15,6 @@ mod coordinator;
 mod descriptor;
 mod dynamic;
 mod frame;
-mod health;
 mod message;
 mod port;
 mod reader;
@@ -23,6 +22,10 @@ mod registry;
 mod system;
 mod telemetry;
 mod writer;
+
+// Public: `health::Level` is deliberately namespaced (a bare `Level` at the root
+// is collision-prone — S3); the frame types themselves stay root re-exports.
+pub mod health;
 
 // The sequence-occupant runtime (the future-driven state machine a `#[sequence]`
 // async fn becomes). Ungated alongside `abi`/`dl` — sequences are an ABI/runtime
@@ -45,7 +48,12 @@ pub mod dl;
 pub use dynamic::{FrameList, FrameMap, Name, Slot};
 pub use frame::Frame;
 pub use reader::{ListReader, MapReader};
-pub use writer::{FrameWriter, ListWriter, MapWriter, WriteError};
+pub use writer::{FrameWriter, KeyError, ListWriter, MapWriter};
+
+// The transport-level errors the port APIs actually return (`Output::write` /
+// `MsgOut::emit` → `WriteError`; `Input::drain`/`recv` → `ReadError`) — re-exported
+// at the root so `?`-ing them needs no `metor_fsw_ring` path (S2).
+pub use metor_fsw_ring::{ReadError, WriteError};
 
 // The coordinator: builder, graph wiring, the run-phase lifecycle, and the
 // `bind`/`Binder` port-construction contract.
@@ -66,12 +74,16 @@ pub use telemetry::{
 
 // The system trait family, the typed port wrappers, self-description, and the
 // standard health/log telemetry.
+// `compatible`/`split_decls` stay off the root: generic free-function names are
+// collision-prone under a glob import (S3). Wiring resolves compatibility itself;
+// the derives call `split_decls` through `crate::` paths.
 pub use descriptor::{
     AnnounceFn, Capability, Delivery, FanIn, Hz, OnLap, PortConn, PortDecl, PortDesc, PortId,
-    PortSchema, SystemDescriptor, SystemKind, compatible, split_decls,
+    PortSchema, SystemDescriptor, SystemKind, split_decls,
 };
+// `health::Level` stays namespaced (S3) — write `health::Level::Warn`.
 pub use health::{
-    HealthPort, LOG_MSG_CAP, Level, LogLine, MAX_ERR_KINDS, MAX_LINES, SystemHealth, SystemLog,
+    HealthPort, LOG_MSG_CAP, LogLine, MAX_ERR_KINDS, MAX_LINES, SystemHealth, SystemLog,
 };
 pub use port::{DEFAULT_DEPTH, FrameRef, Input, Output, buffer_capacity, capacity_for};
 
@@ -110,15 +122,14 @@ pub use metor_fsw_2_macros::system;
 // `metor_proto::types` (`docs/design-system-macro.md` §3.1).
 pub use metor_proto::types::Timestamp;
 
-// The sequence-occupant runtime surface (the free author API, the telemetry/cancel
-// frames, and the `SeqSystem` seam the `#[sequence]` macro implements).
+// The sequence-occupant runtime surface: the **types** the macro/seam name. The free
+// author API (`wait`/`progress`/`aborted`/`now`) and the generic-named `Step`/`Wait`
+// stay namespaced under [`sequence`] (S3) — `metor_fsw_2::wait()` or a bare `Wait`
+// at the root would be collision-prone, and `metor_fsw_2::now()` would read as wall
+// time (review E7).
 pub use sequence::{
-    Outcome, Seq, SeqBound, SeqClock, SeqStatusOut, SeqSystem, SequenceStatus, SlotControlIn, Step,
-    Wait, aborted, progress, wait, with_clock,
+    Outcome, Seq, SeqBound, SeqClock, SeqStatusOut, SeqSystem, SequenceStatus, SlotControlIn,
 };
-
-// `sequence::now()` is deliberately NOT root-re-exported (`metor_fsw_2::now()` would
-// read as wall time); authors import it as `sequence::now` (review E7).
 
 // Re-exports the `#[derive(Frame)]` generated code names
 // (`::metor_fsw_2::metor_proto::…`, `::metor_fsw_2::path::…`, `::metor_fsw_2::kdl::…`)
@@ -133,12 +144,15 @@ pub use dl::{DlError, DlSystem};
 // The `Wiring` data model, the Rust builder, the shared resolver, and the cargo build
 // driver (the data/serialization split). These ride the `kdl` feature with the wiring
 // front-end they share a resolver with.
+// Types only (S3): the wiring free functions (`wiring::parse`, `wiring::resolve`,
+// `wiring::load`, `wiring::build_artifacts`, `wiring::load_bundle`, …) stay
+// namespaced — `metor_fsw_2::parse`/`resolve` at the root are collision-prone
+// under the glob imports the docs recommend.
 #[cfg(feature = "kdl")]
 pub use wiring::{
     AllowedOccupantSpec, Artifact, BuildError, BuildOptions, BundleError, ClockSpec,
     CoordinatorSpec, EdgeSpec, InitialOccupantSpec, PackageOptions, ParamSource, SlotInitState,
-    SlotSpec, SystemSpec, TelemetryModeSpec, TelemetrySpec, Wiring, WiringBuilder, build_artifacts,
-    cdylib_file_name, encode_kdl_params, load_bundle, parse, resolve, write_bundle,
+    SlotSpec, SystemSpec, TelemetryModeSpec, TelemetrySpec, Wiring, WiringBuilder,
 };
 
 // The clap-based CLI runner (`metor-fsw {build,package,run}`) and the reusable
