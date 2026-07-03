@@ -17,12 +17,14 @@
 //! fresh `fsw_create` state over the slot's pre-allocated rings.
 //!
 //! The slot's contract is the **registered descriptor** the generic `build()` pass sees
-//! (`src/coordinator/mod.rs`): the occupant descriptor with the trailing
-//! [`SlotControlIn`] input removed. Every registered input is therefore an ordinary
-//! edge-connected user input, and every output a normally-allocated, registry-tapped
-//! occupant output. The slot additionally owns one control ring (the host writes the
-//! cancel frame the occupant folds, §4.4) appended to the occupant's input array, and
-//! one [`SlotStatus`] output ring it telemeters its host-side phase through (§7).
+//! (`src/coordinator/mod.rs`), derived from the occupant descriptor **by extension**
+//! (`docs/design-command-slots.md` §2.2): the occupant's ports are the *prefix* of
+//! each list (its trailing [`SlotControlIn`] input re-marked `PortConn::Host` — the
+//! runner holds the cancel writer over a dedicated ring the occupant reads, §4.4),
+//! and the runner's ports are the declared *tail*: a `commands`
+//! `MsgIn<SequenceCommand>` fan-in (ordinary explicit edges) + a `SequenceStatus`
+//! self-tap on the input side, and the Host [`SlotStatus`] + `"sequences"` events
+//! channels on the output side — all allocated/tapped by the uniform build passes.
 
 use core::mem::offset_of;
 
@@ -111,9 +113,23 @@ impl InitialOccupant {
 
 /// The slot registration the builder records and `build()` turns into a [`SlotRunner`]
 /// (the slot twin of [`DlReg`](super::Reg)).
+///
+/// `n_occ_inputs`/`n_occ_outputs` are the **prefix split indices** of the registered
+/// descriptor (`docs/design-command-slots.md` §2.2): the occupant's own ports form the
+/// prefix of each port list (in the occupant descriptor's order), the runner's ports
+/// the tail. The bind arm maps the occupant `FswRing` arrays as a straight prefix
+/// walk, so the occupant-side positional bind contract (the dl ABI) never changes.
 pub(crate) struct SlotReg {
     pub allowed: Vec<AllowedOccupant>,
     pub initial: Option<InitialOccupant>,
+    /// Occupant inputs = `registered.inputs[..n_occ_inputs]` (user ports + the
+    /// Host-conn `SlotControlIn`); the tail is the runner's `commands` fan-in +
+    /// `SequenceStatus` self-tap.
+    pub n_occ_inputs: usize,
+    /// Occupant outputs = `registered.outputs[..n_occ_outputs]` (user ports +
+    /// `SequenceStatus`/health/log); the tail is the runner's `SlotStatus` +
+    /// `"sequences"` events channel.
+    pub n_occ_outputs: usize,
 }
 
 // ---------------------------------------------------------------------------

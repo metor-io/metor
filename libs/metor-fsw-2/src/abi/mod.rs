@@ -347,6 +347,10 @@ impl PortDescMsg {
             fan_in: self.fan_in,
             on_lap: self.on_lap,
             telemetered: self.telemetered,
+            // Not carried across the ABI: a dlopen'd system's ports are always
+            // edge-connected (Host/SelfTap are host-runner constructs; the slot
+            // derivation marks its occupant's SlotControlIn Host on the host side).
+            conn: crate::descriptor::PortConn::Edge,
         }
     }
 }
