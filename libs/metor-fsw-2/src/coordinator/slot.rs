@@ -193,6 +193,11 @@ pub(crate) struct SlotRunner {
     /// The last `now` seen in `step`, used to stamp an `Abort` cancel frame (which does
     /// not need an accurate stamp — `command` has no `now` of its own).
     last_now: Timestamp,
+    /// Reused per-step command buffer (S5: no per-cycle allocation in the hot loop).
+    cmd_scratch: Vec<SequenceCommand>,
+    /// Reused per-step progress-detail buffer (the `String`s themselves are fresh,
+    /// but the carrying `Vec` is retained).
+    detail_scratch: Vec<String>,
 }
 
 impl SlotRunner {
@@ -228,6 +233,8 @@ impl SlotRunner {
             slot: None,
             selected: None,
             last_now: Timestamp(0),
+            cmd_scratch: Vec::new(),
+            detail_scratch: Vec::new(),
         }
     }
 
@@ -373,7 +380,7 @@ impl SlotRunner {
     /// publish) and latch the latest `run_state` for the terminal fold. Every-record,
     /// never coalesced (`docs/messages.md` §5.1). A lapped view resyncs to the live edge.
     fn drain_progress(&mut self) {
-        let mut details: Vec<String> = Vec::new();
+        let mut details = core::mem::take(&mut self.detail_scratch);
         let mut state = self.last_run_state;
         let res = self.seq_status.drain(|f| {
             state = f.get().run_state;
@@ -389,9 +396,10 @@ impl SlotRunner {
             self.seq_status.resync();
         }
         self.last_run_state = state;
-        for detail in details {
+        for detail in details.drain(..) {
             self.emit_event(SequenceEventKind::Progress { detail });
         }
+        self.detail_scratch = details;
     }
 
     /// Emit the terminal [`SequenceChannelEvent`] for a `Done` fold, mapping the latched
@@ -444,12 +452,16 @@ impl CyclicSlot for SlotRunner {
         self.last_now = now;
         // Drain this slot's command fan-in (every command producer) and apply each addressed
         // command *before* stepping the occupant, so a command lands the cycle it arrives — the
-        // per-slot replacement for the coordinator's old head-of-cycle broadcast.
-        let mut cmds: Vec<SequenceCommand> = Vec::new();
+        // per-slot replacement for the coordinator's old head-of-cycle broadcast. The buffer is
+        // taken/returned around the loop (apply_command needs `&mut self`), retained across
+        // steps so the steady state allocates nothing.
+        let mut cmds = core::mem::take(&mut self.cmd_scratch);
         self.commands.drain(|c| cmds.push(c));
         for cmd in &cmds {
             self.apply_command(cmd);
         }
+        cmds.clear();
+        self.cmd_scratch = cmds;
         self.publish_status(now);
         if matches!(self.state, SlotState::Running)
             && let Some(slot) = self.slot.as_mut()

@@ -163,6 +163,7 @@ fn sim_config() -> CoordinatorConfig {
         clock: ClockMode::Simulated {
             dt: Duration::from_millis(1),
         },
+        ..CoordinatorConfig::default()
     }
 }
 

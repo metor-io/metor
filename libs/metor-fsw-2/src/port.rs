@@ -286,7 +286,9 @@ impl<F: Frame, B: Backing, RD: WakeSink, RS: WakeSource> Input<F, B, RD, RS> {
 
     /// Skip to the live edge, abandoning unread (possibly lapped) data. Async input
     /// ports call this on lap to "drop on full and continue" (system.md §3.2).
-    pub fn resync(&self) {
+    /// `&mut self` for consistency with `latest`/`drain` (S5): every read-side
+    /// cursor move spells the same way (the ring's own `View::resync` is interior).
+    pub fn resync(&mut self) {
         self.view.resync();
     }
 }

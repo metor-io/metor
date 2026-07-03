@@ -669,7 +669,7 @@ fn publish_drop_folds_to_health() {
         rings: vec![tiny, health_ring.clone(), log_ring.clone()],
         next: 0,
     });
-    let mut runner = CyclicRunner::new(Chatter::default(), input, output);
+    let mut runner = CyclicRunner::new(Chatter, input, output);
     runner.step(Timestamp(1));
 
     let record = health_in.latest().expect("health published");

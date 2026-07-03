@@ -146,6 +146,7 @@ fn config() -> CoordinatorConfig {
         cycle_rate: 1000.0,
         default_depth: crate::DEFAULT_DEPTH,
         clock: ClockMode::Wall,
+        ..CoordinatorConfig::default()
     }
 }
 
@@ -338,6 +339,7 @@ fn validation_invalid_cycle_rate_wall_clock() {
             cycle_rate: rate,
             default_depth: crate::DEFAULT_DEPTH,
             clock: ClockMode::Wall,
+            ..CoordinatorConfig::default()
         });
         b.add_cyclic(Producer::new());
         assert!(
@@ -358,6 +360,7 @@ async fn simulated_clock_ignores_cycle_rate() {
         clock: ClockMode::Simulated {
             dt: Duration::from_micros(100),
         },
+        ..CoordinatorConfig::default()
     });
     b.add_cyclic(Producer::new());
     let mut coord = b.build().expect("cycle_rate is not validated under Simulated");
@@ -750,6 +753,7 @@ async fn simulated_clock_is_deterministic_and_monotonic() {
         cycle_rate: 1000.0,
         default_depth: crate::DEFAULT_DEPTH,
         clock: ClockMode::Simulated { dt },
+        ..CoordinatorConfig::default()
     });
     b.add_cyclic(StampRec {
         stamps: stamps.clone(),

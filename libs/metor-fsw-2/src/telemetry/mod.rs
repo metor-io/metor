@@ -744,18 +744,21 @@ impl<T: Transport + 'static> System for TelemetrySystem<T> {
         let mut n_slots = 0usize;
         // Deferred health reports: iterating `output.all` borrows the output bundle,
         // so `output.health()` (a `&mut` borrow) is driven after the loop.
-        let mut reader_slot_errors = 0usize;
+        let mut exhausted: Vec<String> = Vec::new();
         for entry in output.all.entries() {
             if !self.mode.matches(entry) {
                 continue;
             }
             let view = match entry.view() {
                 Ok(v) => v,
-                // Reader-slot budget exhausted: surface it and skip this tap rather than
-                // panicking (telemetry.md §2.5). Build-time sizing makes this unreachable
-                // for the known consumers, but a hand-built over-subscription is observable.
+                // Reader-slot budget exhausted: surface it — a health error plus a log
+                // line NAMING the buffer (E8b) — and skip this tap rather than
+                // panicking (telemetry.md §2.5). Build-time sizing makes this
+                // unreachable for the known consumers, but a hand-built
+                // over-subscription (or a too-small `CoordinatorConfig::reader_slack`)
+                // is diagnosable.
                 Err(_) => {
-                    reader_slot_errors += 1;
+                    exhausted.push(format!("{}.{}", entry.instance, entry.name));
                     continue;
                 }
             };
@@ -794,8 +797,13 @@ impl<T: Transport + 'static> System for TelemetrySystem<T> {
             });
         }
 
-        for _ in 0..reader_slot_errors {
-            output.health().error("telemetry.reader_slot");
+        for key in &exhausted {
+            let health = output.health();
+            health.error("telemetry.reader_slot");
+            health.log(
+                crate::health::Level::Warn,
+                &format!("no reader slot left on `{key}` — raise CoordinatorConfig::reader_slack"),
+            );
         }
 
         // One wait queue on the one two-lane hand-off wakes the single sender task.
