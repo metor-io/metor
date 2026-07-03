@@ -28,64 +28,22 @@ use core::mem::offset_of;
 
 use metor_proto::types::Timestamp;
 use metor_proto_wkt::{
-    ChannelId, SequenceChannelEvent, SequenceCommand, SequenceCommandKind, SequenceEventKind,
+    SequenceChannelEvent, SequenceCommand, SequenceCommandKind, SequenceEventKind,
 };
 use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
 
 use metor_fsw_ring::NoWake;
 
-use super::{CyclicSlot, SlotState, StopReason};
+use super::{CyclicSlot, NAME_CAP, SlotState, StopReason, pack_name};
 use crate::abi::FswStatus;
 use crate::dl::{DlSlot, DlSystem};
 use crate::message::{MsgIn, MsgOut};
 use crate::port::{Input, Output};
 use crate::sequence::{PROGRESS_MSG_CAP, ProgressLine, SequenceStatus, SlotControlIn};
 
-/// Capacity of one occupant/slot name in the host frames below (longer truncated).
-pub const SLOT_NAME_CAP: usize = 48;
-
-// ---------------------------------------------------------------------------
-// SlotPhase — the slot-layer lifecycle (sequences-slots.md §2, Resolved Q6)
-// ---------------------------------------------------------------------------
-
-/// The slot's runtime lifecycle — the richer machine §2 introduces for the slot layer,
-/// distinct from (and not overloading) the build-time 2-variant
-/// [`SlotState`](crate::SlotState) that static/dl slots use.
-///
-/// The live occupant is tracked **separately** as [`SlotRunner::slot`]
-/// (`Option<DlSlot>`): `slot.is_some()` means "has a live future." After a hard-drop
-/// `Stop` the phase returns to `Loaded` but `slot` is `None`, so `Start` is rejected and
-/// only `Reset` (a rebuild) can re-run it (sequences-slots.md §2 note).
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum SlotPhase {
-    /// No occupant; `step` is a cheap no-op.
-    Empty,
-    /// An occupant is `fsw_create`d + `fsw_bind_init`'d (its future built) but not yet
-    /// polling. After a hard-drop `Stop` the phase is `Loaded` with no live future.
-    Loaded,
-    /// The occupant is polled (`fsw_execute`) every cycle.
-    Running,
-    /// The occupant's future returned `Ready` — terminal. The
-    /// `Completed`/`Aborted`/`Failed` detail rides the occupant's own
-    /// [`SequenceStatus`](crate::sequence::SequenceStatus) frame, not the `outcome`
-    /// byte here (the ABI status word carries no detail, §2.2).
-    Done { outcome: u8 },
-    /// The occupant lapped an input or panicked inside the `.so` — terminal (§2.2).
-    Stopped { reason: StopReason },
-}
-
-impl SlotPhase {
-    /// The wire phase code published in [`SlotStatus::phase`].
-    pub fn code(self) -> u8 {
-        match self {
-            SlotPhase::Empty => 0,
-            SlotPhase::Loaded => 1,
-            SlotPhase::Running => 2,
-            SlotPhase::Done { .. } => 3,
-            SlotPhase::Stopped { .. } => 4,
-        }
-    }
-}
+/// Capacity of one occupant/slot name in the host frames below — the shared
+/// [`NAME_CAP`](super::NAME_CAP).
+pub const SLOT_NAME_CAP: usize = NAME_CAP;
 
 // ---------------------------------------------------------------------------
 // Host telemetry / control frames
@@ -101,23 +59,13 @@ impl SlotPhase {
 pub struct SlotStatus {
     #[metor_fsw(timestamp)]
     pub timestamp: Timestamp,
-    /// The current [`SlotPhase::code`] (Empty=0/Loaded=1/Running=2/Done=3/Stopped=4).
+    /// The current [`SlotState::code`] (Empty=0/Loaded=1/Running=2/Done=3/Stopped=4).
     pub phase: u8,
     /// Used length of `occupant` (0 when no occupant is selected).
     pub occ_len: u8,
     pub _pad: [u8; 6],
     /// The selected occupant's name (the allowed-set entry), fixed buffer + length.
     pub occupant: [u8; SLOT_NAME_CAP],
-}
-
-/// Pack a name into a fixed `SLOT_NAME_CAP` buffer + used length (truncating) — used by
-/// the host-side [`SlotStatus`] occupant field.
-fn pack_name(name: &str) -> ([u8; SLOT_NAME_CAP], u8) {
-    let bytes = name.as_bytes();
-    let n = bytes.len().min(SLOT_NAME_CAP);
-    let mut buf = [0u8; SLOT_NAME_CAP];
-    buf[..n].copy_from_slice(&bytes[..n]);
-    (buf, n as u8)
 }
 
 // ---------------------------------------------------------------------------
@@ -175,9 +123,14 @@ pub(crate) struct SlotReg {
 /// The runtime-swappable slot the coordinator drives as a `Box<dyn CyclicSlot>`. It
 /// holds the slot's pre-built per-port [`FswRing`](crate::abi::FswRing) templates (the
 /// host owns the rings for the whole mission), the allowed-occupant set, the live
-/// occupant (`Option<DlSlot>`), the [`SlotPhase`], and the host-owned control/status
+/// occupant (`Option<DlSlot>`), the [`SlotState`], and the host-owned control/status
 /// writers. The occupant is **not** created at `build()` — only `Load` (init or a
 /// runtime command) creates it.
+///
+/// The live occupant is tracked **separately** as [`SlotRunner::slot`]
+/// (`Option<DlSlot>`): `slot.is_some()` means "has a live future." After a hard-drop
+/// `Stop` the state returns to `Loaded` but `slot` is `None`, so `Start` is rejected and
+/// only `Reset` (a rebuild) can re-run it (sequences-slots.md §2 note).
 pub(crate) struct SlotRunner {
     /// The slot's instance name (its `CyclicSlot` identity and the command address).
     name: &'static str,
@@ -203,20 +156,19 @@ pub(crate) struct SlotRunner {
     /// drained every cycle while Running to source `Progress` lines and the terminal
     /// outcome the host-side `FswStatus` word cannot carry (`docs/messages.md` §5.1).
     seq_status: Input<SequenceStatus>,
-    /// This slot's [`ChannelId`] — its build-order index among slots (Q2), the id the
-    /// boot `SequenceRegistry` and every emitted [`SequenceChannelEvent`] address.
-    channel_id: ChannelId,
     /// This slot's command input (`docs/message-wiring.md` §6): a fan-in
     /// [`MsgIn<SequenceCommand>`](MsgIn) over **every** command producer (the coordinator's
     /// in-proc `control_handle` channel + every system's `SequenceCommand` output). Drained at
-    /// the head of each [`step`](CyclicSlot::step) and filtered by `channel_id`, so a command
-    /// addressed to this slot dispatches the cycle it arrives — the per-slot replacement for the
-    /// coordinator's old broadcast `drain_command_bus`.
+    /// the head of each [`step`](CyclicSlot::step) and filtered by the slot's **instance
+    /// name**, so a command addressed to this slot dispatches the cycle it arrives — the
+    /// per-slot replacement for the coordinator's old broadcast `drain_command_bus`.
     commands: MsgIn<SequenceCommand>,
     /// The latest occupant `run_state` drained while Running, used to refine the terminal
     /// `Done` into `Completed`/`Aborted`/`Failed` (the ABI status word carries no detail).
     last_run_state: u8,
-    phase: SlotPhase,
+    /// The one lifecycle state (all five [`SlotState`] variants), the same value the
+    /// coordinator's stopped-systems accessor reads through [`CyclicSlot::state`].
+    state: SlotState,
     /// The live occupant (a fresh `fsw_create` future), or `None` (Empty / post-Stop).
     slot: Option<DlSlot>,
     /// The selected allowed index (the live/last occupant), for `Reset` + status naming.
@@ -224,9 +176,6 @@ pub(crate) struct SlotRunner {
     /// The last `now` seen in `step`, used to stamp an `Abort` cancel frame (which does
     /// not need an accurate stamp — `command` has no `now` of its own).
     last_now: Timestamp,
-    /// The 2-variant [`SlotState`] the coordinator's stopped-systems accessor reads,
-    /// derived from `phase` (Stopped→Stopped, everything else incl. Done→Running).
-    slot_state: SlotState,
 }
 
 impl SlotRunner {
@@ -244,7 +193,6 @@ impl SlotRunner {
         status_out: Output<SlotStatus>,
         events: MsgOut<SequenceChannelEvent>,
         seq_status: Input<SequenceStatus>,
-        channel_id: ChannelId,
         commands: MsgIn<SequenceCommand>,
     ) -> Self {
         Self {
@@ -257,25 +205,13 @@ impl SlotRunner {
             status_out,
             events,
             seq_status,
-            channel_id,
             commands,
             last_run_state: 0,
-            phase: SlotPhase::Empty,
+            state: SlotState::Empty,
             slot: None,
             selected: None,
             last_now: Timestamp(0),
-            slot_state: SlotState::Running,
         }
-    }
-
-    /// Refresh the 2-variant `slot_state` accessor from the live phase. A completed slot
-    /// (`Done`) is **not** an error-stop, so it maps to `Running` for the coordinator's
-    /// stopped-systems telemetry; only `Stopped` (lapped/panicked) surfaces there.
-    fn sync_slot_state(&mut self) {
-        self.slot_state = match self.phase {
-            SlotPhase::Stopped { reason } => SlotState::Stopped { reason },
-            _ => SlotState::Running,
-        };
     }
 
     /// `make_slot` the selected occupant over the slot's ring templates and `init` it
@@ -300,21 +236,23 @@ impl SlotRunner {
     }
 
     /// Emit one [`SequenceChannelEvent`] on this slot's message channel, tagged with the
-    /// slot's [`ChannelId`] (`docs/messages.md` §5). Best-effort: a full overwrite ring
-    /// drops the oldest record, surfaced (not silently reordered) by the downlink.
+    /// slot's **instance name** (`docs/messages.md` §5). Best-effort: a full overwrite
+    /// ring drops the oldest record, surfaced (not silently reordered) by the downlink.
     fn emit_event(&mut self, kind: SequenceEventKind) {
         let _ = self.events.emit(&SequenceChannelEvent {
-            channel_id: self.channel_id,
+            channel: self.name.to_string(),
             kind,
         });
     }
 
     /// Apply a runtime [`SequenceCommand`] addressed to this slot (`docs/message-wiring.md` §6).
-    /// Filters by **`channel_id`** — the slot's own build-order id, the same id the boot
-    /// `SequenceRegistry` and the panel address — since every slot's command fan-in sees every
-    /// command producer. The kind maps straight onto the lifecycle handlers, no intermediate type.
+    /// Filters by the slot's **instance name** — the same key the boot `SequenceRegistry`
+    /// publishes and the panel addresses — since every slot's command fan-in sees every command
+    /// producer. A command naming no slot (a typo, or a name over the cap) simply matches
+    /// nothing and is dropped by every slot's filter. The kind maps straight onto the lifecycle
+    /// handlers, no intermediate type.
     fn apply_command(&mut self, cmd: &SequenceCommand) {
-        if cmd.channel_id != self.channel_id {
+        if cmd.channel != self.name {
             return;
         }
         match &cmd.command {
@@ -327,14 +265,14 @@ impl SlotRunner {
     }
 
     /// `Load`: select an allowed occupant by name and build it. Allowed only from Empty
-    /// or a terminal phase (Done/Stopped); from a live/post-Stop Loaded it is ignored.
+    /// or a terminal state (Done/Stopped); from a live/post-Stop Loaded it is ignored.
     /// A name outside the allowed set is **rejected loudly** — a `Failed` event naming
     /// it (and the allowed set) on the slot's events channel — never silently swallowed:
-    /// the phase is untouched, so the operator sees the rejection, not a stuck `Empty`.
+    /// the state is untouched, so the operator sees the rejection, not a stuck `Empty`.
     fn do_load(&mut self, occupant: &str) {
         if !matches!(
-            self.phase,
-            SlotPhase::Empty | SlotPhase::Done { .. } | SlotPhase::Stopped { .. }
+            self.state,
+            SlotState::Empty | SlotState::Done { .. } | SlotState::Stopped { .. }
         ) {
             return; // ignore: a live or post-Stop Loaded slot is not re-Loadable
         }
@@ -356,9 +294,8 @@ impl SlotRunner {
         self.slot = None;
         self.build_occupant(idx);
         self.selected = Some(idx);
-        self.phase = SlotPhase::Loaded;
+        self.state = SlotState::Loaded;
         self.last_run_state = 0;
-        self.sync_slot_state();
         // Emit at the transition (every-record, never diffed from the latest-wins
         // SlotStatus): two commands can apply in one drain, so a snapshot would lose this.
         let name = self.allowed[idx].name.clone();
@@ -367,9 +304,8 @@ impl SlotRunner {
 
     /// `Start`: begin polling. Only from a Loaded slot with a live future.
     fn do_start(&mut self) {
-        if self.slot.is_some() && matches!(self.phase, SlotPhase::Loaded) {
-            self.phase = SlotPhase::Running;
-            self.sync_slot_state();
+        if self.slot.is_some() && matches!(self.state, SlotState::Loaded) {
+            self.state = SlotState::Running;
             self.emit_event(SequenceEventKind::Started);
         }
     }
@@ -377,18 +313,17 @@ impl SlotRunner {
     /// `Stop` (hard-drop): drop the occupant's future (its `Drop` runs `fsw_destroy`,
     /// releasing the ring roles), leaving Loaded with no live future. Re-run via `Reset`.
     fn do_stop(&mut self) {
-        if matches!(self.phase, SlotPhase::Running) {
+        if matches!(self.state, SlotState::Running) {
             self.slot = None;
-            self.phase = SlotPhase::Loaded;
-            self.sync_slot_state();
+            self.state = SlotState::Loaded;
             self.emit_event(SequenceEventKind::Stopped);
         }
     }
 
     /// `Abort`: write a cancel frame the occupant folds at its next `fsw_execute`. The
-    /// phase stays Running until the future returns Done (cooperative, §4.4).
+    /// state stays Running until the future returns Done (cooperative, §4.4).
     fn do_abort(&mut self) {
-        if matches!(self.phase, SlotPhase::Running) {
+        if matches!(self.state, SlotState::Running) {
             let _ = self.control.write(&SlotControlIn {
                 timestamp: self.last_now,
                 cancel: 1,
@@ -403,14 +338,13 @@ impl SlotRunner {
         let Some(idx) = self.selected else {
             return;
         };
-        if matches!(self.phase, SlotPhase::Running) {
+        if matches!(self.state, SlotState::Running) {
             return; // a live, running occupant is not Reset (Stop first)
         }
         self.slot = None;
         self.build_occupant(idx);
-        self.phase = SlotPhase::Loaded;
+        self.state = SlotState::Loaded;
         self.last_run_state = 0;
-        self.sync_slot_state();
         // Reset re-arms to idle — the panel sees the channel back at `Loaded { name }`.
         let name = self.allowed[idx].name.clone();
         self.emit_event(SequenceEventKind::Loaded { name });
@@ -458,7 +392,7 @@ impl SlotRunner {
         self.emit_event(kind);
     }
 
-    /// Publish the host-side [`SlotStatus`] (phase + occupant name).
+    /// Publish the host-side [`SlotStatus`] (phase code + occupant name).
     fn publish_status(&mut self, now: Timestamp) {
         let (occupant, occ_len) = match self.selected {
             Some(idx) => pack_name(&self.allowed[idx].name),
@@ -466,7 +400,7 @@ impl SlotRunner {
         };
         let frame = SlotStatus {
             timestamp: now,
-            phase: self.phase.code(),
+            phase: self.state.code(),
             occ_len,
             _pad: [0; 6],
             occupant,
@@ -500,7 +434,7 @@ impl CyclicSlot for SlotRunner {
             self.apply_command(cmd);
         }
         self.publish_status(now);
-        if matches!(self.phase, SlotPhase::Running)
+        if matches!(self.state, SlotState::Running)
             && let Some(slot) = self.slot.as_mut()
         {
             let st = slot.execute_raw(now);
@@ -508,14 +442,14 @@ impl CyclicSlot for SlotRunner {
             // lines + run_state) *before* folding the terminal event, so the panel sees
             // Progress* ahead of the Completed/Aborted/Failed it derives below.
             self.drain_progress();
-            self.phase = match st {
-                FswStatus::Running => SlotPhase::Running,
+            self.state = match st {
+                FswStatus::Running => SlotState::Running,
                 // The FswStatus word carries no outcome detail — the
                 // Completed/Aborted/Failed detail rides the occupant's SequenceStatus
                 // frame (latched in `last_run_state`); refine the terminal Done from it.
                 FswStatus::Done => {
                     self.emit_terminal_done();
-                    SlotPhase::Done {
+                    SlotState::Done {
                         outcome: self.last_run_state,
                     }
                 }
@@ -523,7 +457,7 @@ impl CyclicSlot for SlotRunner {
                     self.emit_event(SequenceEventKind::Failed {
                         reason: "lapped".to_string(),
                     });
-                    SlotPhase::Stopped {
+                    SlotState::Stopped {
                         reason: StopReason::LappedInput,
                     }
                 }
@@ -531,12 +465,11 @@ impl CyclicSlot for SlotRunner {
                     self.emit_event(SequenceEventKind::Failed {
                         reason: "panicked".to_string(),
                     });
-                    SlotPhase::Stopped {
+                    SlotState::Stopped {
                         reason: StopReason::Panicked,
                     }
                 }
             };
-            self.sync_slot_state();
         }
     }
 
@@ -551,7 +484,7 @@ impl CyclicSlot for SlotRunner {
     }
 
     fn state(&self) -> &SlotState {
-        &self.slot_state
+        &self.state
     }
 }
 

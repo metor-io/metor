@@ -93,7 +93,7 @@ fn spawn_sampler(seq: Input<SequenceStatus>, mode: Input<ModeCmd>) -> (Captured,
         let (mut seq, mut mode) = (seq, mode);
         loop {
             stellarator::yield_now().await;
-            if let Ok(Some(r)) = seq.latest() {
+            if let Some(r) = seq.latest() {
                 rs.borrow_mut().push(r.get().run_state);
             }
             let _ = mode.drain(|f| ms.borrow_mut().push(f.get().mode));
@@ -156,7 +156,6 @@ fn interactive_load_then_abort_safes() {
         return;
     };
     let (seq, mode) = tap_slot(&mut coord);
-    let ch = coord.channel_id("mode").expect("mode slot channel");
     let mut control = coord.control_handle().expect("taken once per coordinator");
 
     // `run_for` re-runs the dl systems' (non-idempotent) `init` each call, so the slot is
@@ -169,7 +168,7 @@ fn interactive_load_then_abort_safes() {
 
         control
             .emit(&SequenceCommand {
-                channel_id: ch,
+                channel: "mode".to_string(),
                 command: SequenceCommandKind::Load {
                     name: "commissioning".to_string(),
                 },
@@ -177,7 +176,7 @@ fn interactive_load_then_abort_safes() {
             .unwrap();
         control
             .emit(&SequenceCommand {
-                channel_id: ch,
+                channel: "mode".to_string(),
                 command: SequenceCommandKind::Start,
             })
             .unwrap();
@@ -187,7 +186,7 @@ fn interactive_load_then_abort_safes() {
             }
             control
                 .emit(&SequenceCommand {
-                    channel_id: ch,
+                    channel: "mode".to_string(),
                     command: SequenceCommandKind::Abort,
                 })
                 .unwrap();
@@ -291,8 +290,8 @@ fn commissioning_emits_ordered_sequence_messages() {
     //     lifecycle. The progress detail strings match `systems/commissioning/src/lib.rs`.
     let events = drain_msgs::<SequenceChannelEvent>(&mut events_view);
     assert!(
-        events.iter().all(|e| e.channel_id == channel.id),
-        "every event is tagged with the `mode` channel's id"
+        events.iter().all(|e| e.channel == channel.name),
+        "every event is tagged with the `mode` channel's name"
     );
     let kinds: Vec<&SequenceEventKind> = events.iter().map(|e| &e.kind).collect();
     assert_eq!(

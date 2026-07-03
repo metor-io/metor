@@ -7,7 +7,7 @@
 //! state already lives in the global store, so each render reads it directly.
 
 use gpui::{Context, IntoElement, SharedString, Window, div, prelude::*, px};
-use metor_proto_wkt::{ChannelId, SequenceRunState};
+use metor_proto_wkt::SequenceRunState;
 
 use crate::inspector::{InspectorMode, InspectorRequest, open_inspector};
 use crate::sequences::{self, run_state_index, run_state_label};
@@ -28,8 +28,9 @@ impl SequenceGrid {
     }
 }
 
+/// One channel tile. The name is the channel's identity — the address every published
+/// command carries.
 struct Cell {
-    id: ChannelId,
     name: SharedString,
     available: Vec<SharedString>,
     run_state: SequenceRunState,
@@ -57,7 +58,6 @@ impl Render for SequenceGrid {
                         tip.push_str(&format!("\n{msg}"));
                     }
                     Cell {
-                        id: c.id,
                         name: c.name.clone(),
                         available: c.available.clone(),
                         run_state: c.run_state,
@@ -93,16 +93,16 @@ impl Render for SequenceGrid {
             );
         }
 
-        for cell in cells {
+        for (ix, cell) in cells.into_iter().enumerate() {
             let color = theme.run_state_color(run_state_index(cell.run_state));
-            let id = cell.id;
+            let name = cell.name.clone();
             let run_state = cell.run_state;
             let available = cell.available.clone();
             let tooltip = cell.tooltip.clone();
 
             grid = grid.child(
                 div()
-                    .id(("seq-grid-cell", id as usize))
+                    .id(("seq-grid-cell", ix))
                     .flex()
                     .flex_row()
                     .items_center()
@@ -122,7 +122,7 @@ impl Render for SequenceGrid {
                         let Some(open) = open_inspector(cx) else {
                             return;
                         };
-                        let rows = channel_control_rows(id, run_state, available.clone());
+                        let rows = channel_control_rows(name.clone(), run_state, available.clone());
                         open(
                             InspectorRequest {
                                 rows,

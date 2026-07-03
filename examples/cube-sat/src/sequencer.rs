@@ -26,7 +26,7 @@ use std::time::Duration;
 
 use maitake::time::{Clock, Sleep, Timer};
 use metor_proto_wkt::{
-    ChannelId, SequenceChannelEvent, SequenceChannelSpec, SequenceCommand, SequenceCommandKind,
+    SequenceChannelEvent, SequenceChannelSpec, SequenceCommand, SequenceCommandKind,
     SequenceEventKind, SequenceRegistry, SequenceRunState,
 };
 
@@ -184,11 +184,11 @@ fn safing(ctx: &SequenceCtx) -> Outcome {
     Outcome::Aborted
 }
 
-/// One executor channel: holds at most one loaded/running sequence. `run_state` mirrors what
-/// the panel folds from this channel's events, so the executor can gate `Reset` to terminal
-/// states without re-deriving it.
+/// One executor channel: holds at most one loaded/running sequence. The channel's **name**
+/// is its identity — the address every [`SequenceCommand::channel`] carries. `run_state`
+/// mirrors what the panel folds from this channel's events, so the executor can gate
+/// `Reset` to terminal states without re-deriving it.
 struct Slot {
-    channel_id: ChannelId,
     name: String,
     available: Vec<String>,
     loaded: Option<String>,
@@ -200,9 +200,8 @@ struct Slot {
 }
 
 impl Slot {
-    fn new(channel_id: ChannelId, name: &str, available: Vec<String>) -> Self {
+    fn new(name: &str, available: Vec<String>) -> Self {
         Self {
-            channel_id,
             name: name.to_string(),
             available,
             loaded: None,
@@ -231,8 +230,8 @@ impl Sequencer {
         let timer: &'static Timer = Box::leak(Box::new(Timer::new(sim_clock())));
         let available = vec!["commissioning".to_string(), "safe_mode".to_string()];
         let slots = vec![
-            Slot::new(0, "ADCS", available.clone()),
-            Slot::new(1, "Recovery", available),
+            Slot::new("ADCS", available.clone()),
+            Slot::new("Recovery", available),
         ];
         Self {
             timer,
@@ -249,7 +248,6 @@ impl Sequencer {
                 .slots
                 .iter()
                 .map(|s| SequenceChannelSpec {
-                    id: s.channel_id,
                     name: s.name.clone(),
                     available: s.available.clone(),
                 })
@@ -258,11 +256,8 @@ impl Sequencer {
     }
 
     pub fn handle_command(&mut self, cmd: SequenceCommand) {
-        let Some(idx) = self
-            .slots
-            .iter()
-            .position(|s| s.channel_id == cmd.channel_id)
-        else {
+        // Channels are addressed by name; a command naming no channel is dropped.
+        let Some(idx) = self.slots.iter().position(|s| s.name == cmd.channel) else {
             return;
         };
         match cmd.command {
@@ -279,8 +274,8 @@ impl Sequencer {
                 if self.slots[idx].future.is_some() && !self.slots[idx].running {
                     self.slots[idx].running = true;
                     self.slots[idx].run_state = SequenceRunState::Running;
-                    let channel_id = self.slots[idx].channel_id;
-                    self.emit(channel_id, SequenceEventKind::Started);
+                    let channel = self.slots[idx].name.clone();
+                    self.emit(channel, SequenceEventKind::Started);
                 }
             }
             SequenceCommandKind::Abort => {
@@ -296,8 +291,8 @@ impl Sequencer {
                     self.slots[idx].future = None;
                     self.slots[idx].running = false;
                     self.slots[idx].run_state = SequenceRunState::Stopped;
-                    let channel_id = self.slots[idx].channel_id;
-                    self.emit(channel_id, SequenceEventKind::Stopped);
+                    let channel = self.slots[idx].name.clone();
+                    self.emit(channel, SequenceEventKind::Stopped);
                 }
             }
             SequenceCommandKind::Reset => {
@@ -330,13 +325,13 @@ impl Sequencer {
         let Some(future) = build(&name, ctx) else {
             return;
         };
-        let channel_id = self.slots[idx].channel_id;
+        let channel = self.slots[idx].name.clone();
         self.slots[idx].future = Some(future);
         self.slots[idx].cancel = cancel;
         self.slots[idx].loaded = Some(name.clone());
         self.slots[idx].running = false;
         self.slots[idx].run_state = SequenceRunState::Idle;
-        self.emit(channel_id, SequenceEventKind::Loaded { name });
+        self.emit(channel, SequenceEventKind::Loaded { name });
     }
 
     /// Poll every running sequence once. Called exactly once per control cycle, before the
@@ -353,10 +348,10 @@ impl Sequencer {
                 Some(future) => future.as_mut().poll(&mut cx),
                 None => continue,
             };
-            let channel_id = self.slots[i].channel_id;
+            let channel = self.slots[i].name.clone();
             let drained: Vec<String> = self.slots[i].progress.borrow_mut().drain(..).collect();
             for detail in drained {
-                self.emit(channel_id, SequenceEventKind::Progress { detail });
+                self.emit(channel.clone(), SequenceEventKind::Progress { detail });
             }
             if let Poll::Ready(outcome) = result {
                 self.slots[i].future = None;
@@ -371,7 +366,7 @@ impl Sequencer {
                         SequenceEventKind::Aborted
                     }
                 };
-                self.emit(channel_id, kind);
+                self.emit(channel, kind);
             }
         }
     }
@@ -381,8 +376,7 @@ impl Sequencer {
         std::mem::take(&mut self.pending)
     }
 
-    fn emit(&mut self, channel_id: ChannelId, kind: SequenceEventKind) {
-        self.pending
-            .push(SequenceChannelEvent { channel_id, kind });
+    fn emit(&mut self, channel: String, kind: SequenceEventKind) {
+        self.pending.push(SequenceChannelEvent { channel, kind });
     }
 }
