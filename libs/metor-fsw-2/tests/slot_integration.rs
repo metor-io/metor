@@ -24,8 +24,8 @@ use metor_fsw_2::metor_proto_wkt::{
     SequenceRegistry,
 };
 use metor_fsw_2::{
-    ClockMode, Coordinator, CoordinatorConfig, DlSystem, Input, RecvTransport, SequenceStatus,
-    SlotStatus, SystemKind, TransportError, split_record,
+    ClockMode, Coordinator, CoordinatorConfig, DlSystem, Input, PortRef, RecvTransport,
+    SequenceStatus, SlotStatus, SystemKind, TransportError, split_record,
 };
 use stellarator::buf::{IoBuf, Slice};
 
@@ -161,7 +161,14 @@ fn slot_load_start_runs_to_done() {
     let loaded = open_waiter(&lib);
 
     let mut b = Coordinator::builder(sim_config());
-    let _slot = b.add_slot("adcs", vec![("waiter".into(), loaded, Vec::new())], None);
+    let slot = b.add_slot("adcs", vec![("waiter".into(), loaded, Vec::new())], None);
+    // A2: commands are explicit dataflow — the in-proc control handle reaches the
+    // slot only over this declared edge.
+    b.connect(
+        PortRef::msg::<SequenceCommand>(b.coordinator_handle()),
+        PortRef::msg::<SequenceCommand>(slot),
+    )
+    .expect("the coordinator command edge connects");
     let mut coord = b.build().expect("the slot graph builds");
 
     // Tap the host SlotStatus + the occupant SequenceStatus before running.
@@ -221,7 +228,14 @@ fn slot_abort_completes_aborted() {
     let loaded = open_waiter(&lib);
 
     let mut b = Coordinator::builder(sim_config());
-    let _slot = b.add_slot("adcs", vec![("waiter".into(), loaded, Vec::new())], None);
+    let slot = b.add_slot("adcs", vec![("waiter".into(), loaded, Vec::new())], None);
+    // A2: commands are explicit dataflow — the in-proc control handle reaches the
+    // slot only over this declared edge.
+    b.connect(
+        PortRef::msg::<SequenceCommand>(b.coordinator_handle()),
+        PortRef::msg::<SequenceCommand>(slot),
+    )
+    .expect("the coordinator command edge connects");
     let mut coord = b.build().expect("the slot graph builds");
 
     let mut seq_view: Input<SequenceStatus> = Input::new(
@@ -276,7 +290,14 @@ fn slot_stop_hard_drops_occupant() {
     let loaded = open_waiter(&lib);
 
     let mut b = Coordinator::builder(sim_config());
-    let _slot = b.add_slot("adcs", vec![("waiter".into(), loaded, Vec::new())], None);
+    let slot = b.add_slot("adcs", vec![("waiter".into(), loaded, Vec::new())], None);
+    // A2: commands are explicit dataflow — the in-proc control handle reaches the
+    // slot only over this declared edge.
+    b.connect(
+        PortRef::msg::<SequenceCommand>(b.coordinator_handle()),
+        PortRef::msg::<SequenceCommand>(slot),
+    )
+    .expect("the coordinator command edge connects");
     let mut coord = b.build().expect("the slot graph builds");
 
     let mut slot_view: Input<SlotStatus> = Input::new(
@@ -334,7 +355,14 @@ fn slot_reset_reruns_from_start() {
     let loaded = open_waiter(&lib);
 
     let mut b = Coordinator::builder(sim_config());
-    let _slot = b.add_slot("adcs", vec![("waiter".into(), loaded, Vec::new())], None);
+    let slot = b.add_slot("adcs", vec![("waiter".into(), loaded, Vec::new())], None);
+    // A2: commands are explicit dataflow — the in-proc control handle reaches the
+    // slot only over this declared edge.
+    b.connect(
+        PortRef::msg::<SequenceCommand>(b.coordinator_handle()),
+        PortRef::msg::<SequenceCommand>(slot),
+    )
+    .expect("the coordinator command edge connects");
     let mut coord = b.build().expect("the slot graph builds");
 
     let mut seq_view: Input<SequenceStatus> = Input::new(
@@ -413,7 +441,14 @@ fn slot_emits_ordered_sequence_events_and_boot_registry() {
     let loaded = open_waiter(&lib);
 
     let mut b = Coordinator::builder(sim_config());
-    let _slot = b.add_slot("adcs", vec![("waiter".into(), loaded, Vec::new())], None);
+    let slot = b.add_slot("adcs", vec![("waiter".into(), loaded, Vec::new())], None);
+    // A2: commands are explicit dataflow — the in-proc control handle reaches the
+    // slot only over this declared edge.
+    b.connect(
+        PortRef::msg::<SequenceCommand>(b.coordinator_handle()),
+        PortRef::msg::<SequenceCommand>(slot),
+    )
+    .expect("the coordinator command edge connects");
     let mut coord = b.build().expect("the slot graph builds");
 
     // Tap the slot's events channel + the coordinator's boot-registry channel BEFORE the
@@ -527,10 +562,10 @@ fn uplink_command_loads_and_starts_same_cycle() {
 
     let mut b = Coordinator::builder(sim_config());
     // One slot, started EMPTY (no initial occupant) — the interactive panel scenario.
-    let _slot = b.add_slot("adcs", vec![("waiter".into(), loaded, Vec::new())], None);
+    let slot = b.add_slot("adcs", vec![("waiter".into(), loaded, Vec::new())], None);
     // The uplink: a panel `Load { waiter }` then `Start`, both addressed to the slot by
-    // its instance name.
-    b.add_uplink(MockRecv::new(vec![
+    // its instance name — and reaching it over an explicit command edge (A2).
+    let uplink = b.add_uplink(MockRecv::new(vec![
         SequenceCommand {
             channel: "adcs".to_string(),
             command: SequenceCommandKind::Load {
@@ -542,6 +577,11 @@ fn uplink_command_loads_and_starts_same_cycle() {
             command: SequenceCommandKind::Start,
         },
     ]));
+    b.connect(
+        PortRef::msg::<SequenceCommand>(uplink),
+        PortRef::msg::<SequenceCommand>(slot),
+    )
+    .expect("the uplink command edge connects");
     let mut coord = b.build().expect("the slot + uplink graph builds");
 
     // Tap the host SlotStatus before running (an overwrite ring starts at the live edge).
@@ -617,7 +657,14 @@ fn misaddressed_command_matches_no_slot() {
     let loaded = open_waiter(&lib);
 
     let mut b = Coordinator::builder(sim_config());
-    let _slot = b.add_slot("adcs", vec![("waiter".into(), loaded, Vec::new())], None);
+    let slot = b.add_slot("adcs", vec![("waiter".into(), loaded, Vec::new())], None);
+    // A2: commands are explicit dataflow — the in-proc control handle reaches the
+    // slot only over this declared edge.
+    b.connect(
+        PortRef::msg::<SequenceCommand>(b.coordinator_handle()),
+        PortRef::msg::<SequenceCommand>(slot),
+    )
+    .expect("the coordinator command edge connects");
     let mut coord = b.build().expect("the slot graph builds");
 
     let mut slot_view: Input<SlotStatus> = Input::new(
@@ -673,11 +720,19 @@ fn drive_adcs_of_two_slots(adcs_first: bool) {
 
     let mut b = Coordinator::builder(sim_config());
     let add = |b: &mut metor_fsw_2::CoordinatorBuilder, name: &str| {
-        b.add_slot(
+        let slot = b.add_slot(
             name,
             vec![("waiter".to_string(), open_waiter(&lib), Vec::new())],
             None,
         );
+        // Fan-out: the ONE producer is edged to BOTH slots; only the slot the
+        // command's `channel` names may act (name addressing makes broad fan-out
+        // harmless).
+        b.connect(
+            PortRef::msg::<SequenceCommand>(b.coordinator_handle()),
+            PortRef::msg::<SequenceCommand>(slot),
+        )
+        .expect("the coordinator command edge connects");
     };
     if adcs_first {
         add(&mut b, "adcs");
@@ -738,4 +793,105 @@ fn command_addresses_slot_by_name_adcs_declared_first() {
 #[test]
 fn reordering_slots_does_not_readdress_commands() {
     drive_adcs_of_two_slots(false);
+}
+
+// ---------------------------------------------------------------------------
+// 8. The A2 headline: command edges are explicit dataflow. A system that merely
+//    *declares* a `MsgOut<SequenceCommand>` output commands nothing — only an
+//    explicit `connect … msg="SequenceCommand"` edge lets its emits reach a slot.
+// ---------------------------------------------------------------------------
+
+/// A stand-in autonomy emitter: a cyclic system that emits `Load { waiter }` +
+/// `Start` for the `adcs` channel on its first cycle.
+struct Autonomy {
+    sent: bool,
+}
+
+#[derive(metor_fsw_2::SystemInput)]
+struct AutonomyIn {}
+
+#[derive(metor_fsw_2::SystemOutput)]
+struct AutonomyOut {
+    commands: metor_fsw_2::CommandOut<SequenceCommand>,
+}
+
+impl metor_fsw_2::System for Autonomy {
+    type Input = AutonomyIn;
+    type Output = metor_fsw_2::Out<AutonomyOut>;
+    const NAME: &'static str = "autonomy";
+}
+
+impl metor_fsw_2::CyclicSystem for Autonomy {
+    fn execute(
+        &mut self,
+        _now: metor_fsw_2::Timestamp,
+        _in: &mut AutonomyIn,
+        o: &mut Self::Output,
+    ) {
+        if !self.sent {
+            self.sent = true;
+            let _ = o.commands.emit(&load("adcs", "waiter"));
+            let _ = o.commands.emit(&cmd("adcs", SequenceCommandKind::Start));
+        }
+    }
+}
+
+/// Build one slot + the autonomy emitter, with or without the command edge, and
+/// return the phases the slot published over a short run.
+fn autonomy_phases(edged: bool) -> Option<Vec<u8>> {
+    let lib = locate_fixture()?;
+    let loaded = open_waiter(&lib);
+
+    let mut b = Coordinator::builder(sim_config());
+    let autonomy = b.add_cyclic(Autonomy { sent: false });
+    let slot = b.add_slot("adcs", vec![("waiter".into(), loaded, Vec::new())], None);
+    if edged {
+        b.connect(
+            PortRef::msg::<SequenceCommand>(autonomy),
+            PortRef::msg::<SequenceCommand>(slot),
+        )
+        .expect("the autonomy command edge connects");
+    }
+    let mut coord = b.build().expect("the autonomy + slot graph builds");
+
+    let mut slot_view: Input<SlotStatus> = Input::new(
+        coord
+            .registry()
+            .view(ComponentId::new("adcs.slot_status"))
+            .expect("slot status is registered")
+            .expect("reader slot available"),
+    );
+    let coord = stellarator::run(|| async move {
+        coord.run_for(5).await;
+        coord
+    });
+    let phases = slot_phases(&mut slot_view);
+    drop((coord, slot_view));
+    Some(phases)
+}
+
+#[test]
+fn command_output_without_an_edge_commands_nothing() {
+    // The old type-keyed collection would have broadcast the emitter's commands to
+    // every slot; with explicit edges an un-edged producer is inert.
+    let Some(phases) = autonomy_phases(false) else {
+        return;
+    };
+    assert!(
+        phases.iter().all(|&p| p == 0),
+        "an un-edged SequenceCommand producer drives no slot: {phases:?}"
+    );
+}
+
+#[test]
+fn command_output_with_an_edge_drives_the_slot() {
+    // The same emit, now over a declared edge, drives the slot to completion.
+    let Some(phases) = autonomy_phases(true) else {
+        return;
+    };
+    assert!(
+        phases.contains(&RUNNING),
+        "the edged emitter drove the slot: {phases:?}"
+    );
+    assert_eq!(phases.last(), Some(&DONE), "and it ran to Done: {phases:?}");
 }

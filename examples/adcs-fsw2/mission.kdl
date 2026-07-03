@@ -74,3 +74,11 @@ connect "nav"   -> "mode" frame="attitude_estimate"
 // build-time StaleFrameEdge error). A one-cycle-late mode command is fine.
 connect "mode"  -> "ctrl" frame="mode_cmd" delayed=#true
 connect "ctrl"  -> "plant" frame="torque_cmd" delayed=#true
+
+// The command plane — previously-invisible dataflow, now explicit edges (A2). The
+// uplink ingests panel commands off its own connection (it connects lazily; a
+// headless run without a broker just idles), and the in-proc `control_handle` is the
+// "coordinator" producer. A producer with no edge here commands nothing.
+uplink { transport "tcp" addr="127.0.0.1:2241" }
+connect "uplink"      -> "mode" msg="SequenceCommand"   // ground commands
+connect "coordinator" -> "mode" msg="SequenceCommand"   // in-proc control_handle

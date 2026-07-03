@@ -167,6 +167,9 @@ artifact "waiter" crate="{FIXTURE_CRATE}" lib="{FIXTURE_STEM}" type="waiter"
 slot "adcs" {{
     allow occupant="waiter"
 }}
+// A2: the in-proc control handle reaches the slot only over this explicit edge —
+// "coordinator" is the reserved instance name of the coordinator's own #0 bundle.
+connect "coordinator" -> "adcs" msg="SequenceCommand"
 "#
     );
     let mut wiring = parse(&kdl).expect("parse the slot mission");

@@ -291,6 +291,19 @@ impl PortDesc {
         }
     }
 
+    /// [`msg`](Self::msg) with an explicit channel-name override: `name` (not
+    /// `M::NAME`) becomes the display/KDL/registry token, so a coordinator-minted
+    /// channel keyed `"<instance>.sequences"` or `"<instance>.commands"` survives the
+    /// move from hand-built registry entries to descriptor-driven allocation. The
+    /// edge key stays `M::ID`, so `connect`/`msg="<M::NAME>"` edges still resolve to
+    /// it by packet id.
+    pub fn msg_named<M: NamedMsg>(name: &'static str) -> Self {
+        Self {
+            name,
+            ..Self::msg::<M>()
+        }
+    }
+
     /// Opt this output out of the downlink / `AllOutputs` tap (A6): the port stays a
     /// first-class registered buffer (debugger/test visible by key) but is never
     /// downlinked. Command channels use this; frame outputs may too.

@@ -27,8 +27,8 @@ use clap::{Args, Parser, Subcommand};
 use miette::IntoDiagnostic;
 
 use crate::wiring::{
-    BuildOptions, ClockSpec, PackageOptions, Registry, TelemetryModeSpec, TelemetrySpec, Wiring,
-    build_artifacts, load_bundle, parse, resolve, write_bundle,
+    BuildOptions, ClockSpec, PackageOptions, Registry, TelemetryModeSpec, TelemetrySpec,
+    UplinkSpec, Wiring, build_artifacts, load_bundle, parse, resolve, write_bundle,
 };
 
 // ---------------------------------------------------------------------------
@@ -284,7 +284,7 @@ fn print_run_banner(target: &Path, wiring: &Wiring) {
 
     match wiring.uplink {
         None => println!("  uplink:    off — pass `--uplink <addr>` to receive panel commands"),
-        Some(addr) => {
+        Some(UplinkSpec { addr }) => {
             let reach = if probe_telemetry(addr) {
                 "✓ reachable".to_string()
             } else {
@@ -390,7 +390,7 @@ fn apply_overrides(wiring: &mut Wiring, args: &RunArgs) -> miette::Result<()> {
         wiring.telemetry = Some(TelemetrySpec { addr, mode });
     }
     if let Some(addr) = args.uplink {
-        wiring.uplink = Some(addr);
+        wiring.uplink = Some(UplinkSpec { addr });
     }
     Ok(())
 }

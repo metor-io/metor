@@ -28,7 +28,7 @@ use serde::Serialize;
 use super::model::{
     AllowedOccupantSpec, Artifact, ClockSpec, CoordinatorSpec, EdgeKind, EdgeSpec,
     InitialOccupantSpec, ParamSource, SlotInitState, SlotSpec, SystemSpec, TelemetryModeSpec,
-    TelemetrySpec, Wiring,
+    TelemetrySpec, UplinkSpec, Wiring,
 };
 
 /// Fluent constructor for a [`Wiring`]. Start with [`new`](Self::new), set the
@@ -41,7 +41,7 @@ pub struct WiringBuilder {
     slots: Vec<SlotSpec>,
     edges: Vec<EdgeSpec>,
     telemetry: Option<TelemetrySpec>,
-    uplink: Option<SocketAddr>,
+    uplink: Option<UplinkSpec>,
 }
 
 impl Default for WiringBuilder {
@@ -192,10 +192,12 @@ impl WiringBuilder {
     }
 
     /// Add the command uplink (`docs/messages.md` §4.4): an [`UplinkSystem`](crate::UplinkSystem)
-    /// reading panel `SequenceCommand`s off its **own** TCP connection to `addr`, separate from
-    /// the telemetry downlink's connection (shared connection is deferred, §4.5).
+    /// reading panel command Msgs off its **own** TCP connection to `addr`, separate from
+    /// the telemetry downlink's connection (shared connection is deferred, §4.5). It
+    /// registers under the instance name `"uplink"`; route its commands with explicit
+    /// edges (`connect("uplink", …, msg)` / KDL `connect "uplink" -> … msg="…"`).
     pub fn uplink(mut self, addr: SocketAddr) -> Self {
-        self.uplink = Some(addr);
+        self.uplink = Some(UplinkSpec { addr });
         self
     }
 

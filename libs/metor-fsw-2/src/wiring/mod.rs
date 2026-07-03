@@ -51,8 +51,6 @@ use crate::coordinator::{
 };
 use crate::descriptor::{PortId, SystemDescriptor, compatible};
 use crate::dl::{DlError, DlSystem};
-use crate::frame::Frame;
-use crate::sequence::SlotControlIn;
 use crate::system::{AsyncSystem, BuildSystem, CyclicSystem, Out, SystemOutput};
 use crate::telemetry::{TcpRecvTransport, TcpTransport, TelemetryConfig, TelemetryMode};
 
@@ -71,7 +69,7 @@ pub use builder::{SlotSpecBuilder, SystemSpecBuilder, WiringBuilder};
 pub use model::{
     AllowedOccupantSpec, Artifact, ClockSpec, CoordinatorSpec, EdgeKind, EdgeSpec,
     InitialOccupantSpec, ParamSource, SlotInitState, SlotSpec, SystemSpec, TelemetryModeSpec,
-    TelemetrySpec, Wiring,
+    TelemetrySpec, UplinkSpec, Wiring,
 };
 
 // Re-export the registration macro so a system author only needs
@@ -333,7 +331,7 @@ pub enum LoadError {
         node: String,
         #[source_code]
         src: String,
-        #[label("expected `coordinator`/`artifact`/`system`/`slot`/`connect`/`telemetry`")]
+        #[label("expected `coordinator`/`artifact`/`system`/`slot`/`connect`/`telemetry`/`uplink`")]
         span: SourceSpan,
     },
 
@@ -654,6 +652,7 @@ pub fn parse(kdl: &str) -> Result<Wiring, LoadError> {
     let mut slots: Vec<SlotSpec> = Vec::new();
     let mut edges: Vec<EdgeSpec> = Vec::new();
     let mut telemetry: Option<TelemetrySpec> = None;
+    let mut uplink: Option<UplinkSpec> = None;
     let mut seen: HashSet<String> = HashSet::new();
 
     for node in doc.nodes() {
@@ -686,6 +685,12 @@ pub fn parse(kdl: &str) -> Result<Wiring, LoadError> {
                 let (addr, mode) = parse_telemetry(node, kdl)?;
                 telemetry = Some(TelemetrySpec { addr, mode });
             }
+            // The command uplink (`docs/messages.md` §4.4): registers the instance
+            // name "uplink" so command edges can name it.
+            "uplink" => {
+                let addr = parse_transport_addr(node, kdl, "uplink")?;
+                uplink = Some(UplinkSpec { addr });
+            }
             other => {
                 return Err(LoadError::UnknownTopLevelNode {
                     node: other.to_string(),
@@ -705,8 +710,7 @@ pub fn parse(kdl: &str) -> Result<Wiring, LoadError> {
         slots,
         edges,
         telemetry,
-        // No KDL surface for the uplink yet (`docs/messages.md` §7); set via `--uplink`.
-        uplink: None,
+        uplink,
     })
 }
 
@@ -726,6 +730,19 @@ pub fn resolve(wiring: &Wiring, registry: &Registry) -> Result<Coordinator, Load
 
     // --- Systems pass: static via the Registry, dl via the loader --------
     let mut instances: HashMap<String, Instance> = HashMap::new();
+    // The coordinator's own #0 bundle joins the instance namespace up front
+    // (`docs/design-command-slots.md` §2.6): `"coordinator"` is reserved — command
+    // edges name it (`connect "coordinator" -> … msg="SequenceCommand"`), and a user
+    // `system "coordinator"` is a `DuplicateInstance` error instead of a silent
+    // registry-key collision.
+    let coord_handle = builder.coordinator_handle();
+    instances.insert(
+        "coordinator".to_string(),
+        Instance {
+            handle: coord_handle,
+            desc: builder.descriptor_of(coord_handle).clone(),
+        },
+    );
     for spec in &wiring.systems {
         let (handle, desc) = match &spec.artifact {
             Some(artifact_id) => resolve_dl(spec, artifact_id, wiring, &mut builder)?,
@@ -759,14 +776,40 @@ pub fn resolve(wiring: &Wiring, registry: &Registry) -> Result<Coordinator, Load
         }
     }
 
+    // --- Uplink: an async system on its own connection (`docs/messages.md` §4.4/§4.5).
+    // Registered BEFORE the edges pass so command edges can name it — its commands
+    // reach a slot only over an explicit `connect "uplink" -> … msg="…"` edge (A2).
+    if let Some(spec) = &wiring.uplink {
+        let handle = builder.add_uplink(TcpRecvTransport::new(spec.addr));
+        let desc = builder.descriptor_of(handle).clone();
+        if instances
+            .insert("uplink".to_string(), Instance { handle, desc })
+            .is_some()
+        {
+            let src = "uplink { … }".to_string();
+            return Err(LoadError::DuplicateInstance {
+                name: "uplink".to_string(),
+                span: (0, src.len()).into(),
+                src,
+            });
+        }
+    }
+
     // --- Edges pass ------------------------------------------------------
     for edge in &wiring.edges {
         let src = edge_src(edge);
         let span: SourceSpan = (0, src.len()).into();
-        let producer =
-            resolve_endpoint(&instances, &src, &edge.from, &edge.out, edge.kind, Dir::Out, span)?;
-        let consumer =
-            resolve_endpoint(&instances, &src, &edge.to, &edge.in_, edge.kind, Dir::In, span)?;
+        // A message edge resolves both endpoints jointly: the `msg=` token names the
+        // *message type*, and a port whose display name was overridden (a
+        // coordinator-minted channel like `"commands"`) is matched by packet id via
+        // the endpoint the token did resolve on.
+        let (producer, consumer) = match edge.kind {
+            EdgeKind::Frame => (
+                resolve_endpoint(&instances, &src, &edge.from, &edge.out, edge.kind, Dir::Out, span)?,
+                resolve_endpoint(&instances, &src, &edge.to, &edge.in_, edge.kind, Dir::In, span)?,
+            ),
+            EdgeKind::Msg => resolve_msg_edge(&instances, &src, edge, span)?,
+        };
         // One `connect` entry point for every edge (A7): the edge's behavior is
         // inferred from the connected ports' descriptors. `EdgeKind` only picked the
         // name-lookup space above; `delayed=#true` into a Log input surfaces
@@ -777,11 +820,6 @@ pub fn resolve(wiring: &Wiring, registry: &Registry) -> Result<Coordinator, Load
             builder.connect(producer, consumer)
         };
         result.map_err(|source| LoadError::Wire { source, src, span })?;
-    }
-
-    // --- Uplink: an async system on its own connection (`docs/messages.md` §4.4/§4.5) ---
-    if let Some(addr) = wiring.uplink {
-        builder.add_uplink(TcpRecvTransport::new(addr));
     }
 
     // --- Telemetry: registered last (observes every system's fresh output) ---
@@ -1020,24 +1058,10 @@ fn resolve_slot(
         allowed.push((occ.occupant.clone(), loaded, params));
     }
 
-    // The registered descriptor = the first occupant's descriptor with the trailing
-    // `SlotControlIn` input dropped (what `add_slot`/`build()` register for edge wiring).
-    let base = allowed[0].1.descriptor().clone();
-    let mut inputs = base.inputs.clone();
-    if inputs.last().map(|p| p.id) == Some(PortId::Component(SlotControlIn::FRAME_ID)) {
-        inputs.pop();
-    }
-    let registered = SystemDescriptor {
-        name: base.name,
-        kind: base.kind,
-        inputs,
-        outputs: base.outputs.clone(),
-        capabilities: base.capabilities.clone(),
-    };
-
-    // Every other allowed occupant must share the contract (the slot derives one shape from
+    // Every allowed occupant must share the contract (the slot derives one shape from
     // the allowed set; v1 holds sequence occupants only). A clean error in place of the
     // build-time panic `add_slot` would otherwise raise.
+    let base = allowed[0].1.descriptor().clone();
     let ports_match = |a: &[crate::descriptor::PortDesc], b: &[crate::descriptor::PortDesc]| {
         a.len() == b.len()
             && a.iter()
@@ -1056,11 +1080,33 @@ fn resolve_slot(
         }
     }
 
+    // Map the startup state to the runtime `InitialOccupant`.
+    let initial = match &slot.initial {
+        None => None,
+        Some(i) => match i.state {
+            SlotInitState::Empty => None,
+            SlotInitState::Loaded => Some(InitialOccupant {
+                occupant: i.occupant.clone(),
+                start: false,
+            }),
+            SlotInitState::Running => Some(InitialOccupant {
+                occupant: i.occupant.clone(),
+                start: true,
+            }),
+        },
+    };
+
+    // Register the slot, then read its **registered** descriptor back off the builder
+    // — `add_slot` is the ONE place the registered contract (user ports + the slot's
+    // own command fan-in) is derived, so the front-end cannot drift from it.
+    let handle = builder.add_slot(slot.name.clone(), allowed, initial);
+    let registered = builder.descriptor_of(handle).clone();
+
     // Validate the declared user-port contract: every declared `input`/`output` frame name
     // must name a registered user port (the explicit-contract check, Resolved Q4). The
-    // registered inputs are user inputs only (the `SlotControlIn` was dropped); the outputs
-    // include the implicit `SequenceStatus`/health/log tail, which a declaration may name
-    // but need not.
+    // registered inputs are the user inputs plus the slot's own `commands` fan-in; the
+    // outputs include the implicit `SequenceStatus`/health/log tail — a declaration may
+    // name those but need not.
     for frame in &slot.inputs {
         if !registered.inputs.iter().any(|p| p.name == frame) {
             return Err(LoadError::SlotContractMismatch {
@@ -1084,23 +1130,6 @@ fn resolve_slot(
         }
     }
 
-    // Map the startup state to the runtime `InitialOccupant`.
-    let initial = match &slot.initial {
-        None => None,
-        Some(i) => match i.state {
-            SlotInitState::Empty => None,
-            SlotInitState::Loaded => Some(InitialOccupant {
-                occupant: i.occupant.clone(),
-                start: false,
-            }),
-            SlotInitState::Running => Some(InitialOccupant {
-                occupant: i.occupant.clone(),
-                start: true,
-            }),
-        },
-    };
-
-    let handle = builder.add_slot(slot.name.clone(), allowed, initial);
     Ok((handle, registered))
 }
 
@@ -1492,6 +1521,13 @@ fn parse_system(
 /// `system`/`artifact` name) and shares the instance namespace (`seen`), so a name
 /// colliding with a system is a [`DuplicateInstance`](LoadError::DuplicateInstance).
 ///
+/// Command wiring is ordinary message wiring (A2): a slot receives commands only from
+/// producers explicitly edged into it (`connect "<producer>" -> "<slot>"
+/// msg="SequenceCommand"`). A slot with **zero** command edges is legal and silently
+/// command-less (an autonomy-free, wiring-frozen slot) — deliberate: `resolve` has no
+/// non-fatal diagnostics surface, and warning on every such mission would be noise;
+/// the absence is visible in the wiring document itself.
+///
 /// Children: `input frame="…"`/`output frame="…"` declare the user-port contract;
 /// `allow occupant="…" …` is one allowed occupant — everything on it other than the
 /// reserved `occupant=` is its default params, as line properties
@@ -1630,6 +1666,44 @@ fn parse_slot(
 ///     // tap frame="control"
 /// }
 /// ```
+/// Parse the shared `transport "tcp" addr="…"` child of a `telemetry`/`uplink` node
+/// into its socket address (v1 supports only `"tcp"`); `label` names the node in
+/// diagnostics.
+fn parse_transport_addr(
+    node: &KdlNode,
+    src: &str,
+    label: &str,
+) -> Result<std::net::SocketAddr, LoadError> {
+    let invalid = |property: &str, expected: &str| LoadError::InvalidParam {
+        property: property.to_string(),
+        system: label.to_string(),
+        expected: expected.to_string(),
+        src: src.to_string(),
+        span: node.span(),
+    };
+    let missing = |property: &str| LoadError::MissingParam {
+        property: property.to_string(),
+        system: label.to_string(),
+        src: src.to_string(),
+        span: node.span(),
+    };
+
+    let children = node.children().ok_or_else(|| missing("transport"))?;
+    let transport_node = children
+        .nodes()
+        .iter()
+        .find(|n| n.name().value() == "transport")
+        .ok_or_else(|| missing("transport"))?;
+    match first_arg_string(transport_node) {
+        Some("tcp") => {}
+        _ => return Err(invalid("transport", "\"tcp\" (the only v1 transport)")),
+    }
+    let addr_str = prop_string(transport_node, "addr").ok_or_else(|| missing("addr"))?;
+    addr_str
+        .parse::<std::net::SocketAddr>()
+        .map_err(|_| invalid("addr", "a socket address like 127.0.0.1:2240"))
+}
+
 fn parse_telemetry(
     node: &KdlNode,
     src: &str,
@@ -1641,29 +1715,9 @@ fn parse_telemetry(
         src: src.to_string(),
         span: node.span(),
     };
-    let missing = |property: &str| LoadError::MissingParam {
-        property: property.to_string(),
-        system: "telemetry".to_string(),
-        src: src.to_string(),
-        span: node.span(),
-    };
 
-    let children = node.children().ok_or_else(|| missing("transport"))?;
-
-    // transport "tcp" addr="..."  — v1 supports only "tcp".
-    let transport_node = children
-        .nodes()
-        .iter()
-        .find(|n| n.name().value() == "transport")
-        .ok_or_else(|| missing("transport"))?;
-    match first_arg_string(transport_node) {
-        Some("tcp") => {}
-        _ => return Err(invalid("transport", "\"tcp\" (the only v1 transport)")),
-    }
-    let addr_str = prop_string(transport_node, "addr").ok_or_else(|| missing("addr"))?;
-    let addr = addr_str
-        .parse::<std::net::SocketAddr>()
-        .map_err(|_| invalid("addr", "a socket address like 127.0.0.1:2240"))?;
+    let addr = parse_transport_addr(node, src, "telemetry")?;
+    let children = node.children().expect("parse_transport_addr requires children");
 
     // mode "all" | "subset"  — subset taps the `tap instance=.. / frame=..` children.
     let mode_str = children
@@ -1770,6 +1824,70 @@ fn parse_edge(node: &KdlNode, src: &str) -> Result<Edge, LoadError> {
         delayed,
         kind,
     })
+}
+
+/// Resolve a `msg=` edge's two endpoints **jointly** (`docs/design-command-slots.md`
+/// §2.6): the token names the *message type* (`NamedMsg::NAME`), matched against each
+/// endpoint's Postcard-port display names; an endpoint whose port carries an
+/// overridden display name (a coordinator-minted channel like `"commands"`) is then
+/// matched by the **packet id** the token resolved to on the other endpoint. Neither
+/// endpoint matching the token is an [`UnknownMsg`](LoadError::UnknownMsg).
+fn resolve_msg_edge(
+    instances: &HashMap<String, Instance>,
+    src: &str,
+    edge: &EdgeSpec,
+    span: SourceSpan,
+) -> Result<(PortRef, PortRef), LoadError> {
+    let inst = |name: &str| {
+        instances.get(name).ok_or_else(|| LoadError::UnknownInstance {
+            name: name.to_string(),
+            src: src.to_string(),
+            span,
+        })
+    };
+    let prod = inst(&edge.from)?;
+    let cons = inst(&edge.to)?;
+
+    let by_name = |ports: &[crate::descriptor::PortDesc], token: &str| {
+        ports
+            .iter()
+            .find(|p| matches!(p.id, PortId::Packet(_)) && p.name == token)
+            .map(|p| p.id)
+    };
+    let by_id = |ports: &[crate::descriptor::PortDesc], id: PortId| {
+        ports.iter().find(|p| p.id == id).map(|p| p.id)
+    };
+    let unknown = |instance: &str, msg: &str| LoadError::UnknownMsg {
+        instance: instance.to_string(),
+        msg: msg.to_string(),
+        src: src.to_string(),
+        span,
+    };
+
+    let p_named = by_name(&prod.desc.outputs, &edge.out);
+    let c_named = by_name(&cons.desc.inputs, &edge.in_);
+    let (p_port, c_port) = match (p_named, c_named) {
+        (Some(p), Some(c)) => (p, c),
+        (Some(p), None) => (
+            p,
+            by_id(&cons.desc.inputs, p).ok_or_else(|| unknown(&edge.to, &edge.in_))?,
+        ),
+        (None, Some(c)) => (
+            by_id(&prod.desc.outputs, c).ok_or_else(|| unknown(&edge.from, &edge.out))?,
+            c,
+        ),
+        (None, None) => return Err(unknown(&edge.from, &edge.out)),
+    };
+    Ok((
+        PortRef {
+            system: prod.handle,
+            port: p_port,
+        },
+        PortRef {
+            system: cons.handle,
+            port: c_port,
+        },
+    ))
 }
 
 /// Resolve one `(instance, frame)` endpoint to a [`PortRef`], validating the frame
