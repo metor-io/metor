@@ -148,7 +148,7 @@ impl<F: Frame + IntoBytes + Immutable> FrameWriter<F> {
     }
 
     fn align8(&mut self) {
-        while self.table_len() % 8 != 0 {
+        while !self.table_len().is_multiple_of(8) {
             self.packet.push(0);
         }
     }

@@ -53,9 +53,8 @@ mod slot;
 pub use slot::{AllowedOccupant, InitialOccupant, SLOT_NAME_CAP, SlotStatus};
 use slot::{SlotReg, SlotRunner, slot_writer};
 
-/// Slack reader slots added on top of a buffer's fan-out, covering late taps such
-/// as a db/telemetry sink or a debugger (v1 has no crash-slot reclamation, so
-/// `max_readers` must be set at build time — coordinator.md §2.3, Q7).
+/// The default [`CoordinatorConfig::reader_slack`] (E8b: the knob is on the config;
+/// this is only its default value).
 const READER_SLACK: usize = 4;
 
 /// Bounded window a teardown gives async tasks to exit cooperatively before their
@@ -67,22 +66,17 @@ const JOIN_TIMEOUT: Duration = Duration::from_millis(20);
 // ---------------------------------------------------------------------------
 
 /// Which clock drives the per-cycle timestamp (and whether the loop paces itself).
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, Default)]
 pub enum ClockMode {
     /// Wall-clock time: each cycle's `now` is `Timestamp::now()`, and the loop
     /// sleeps to hold `cycle_rate` (run-fast-then-wait). The default.
+    #[default]
     Wall,
     /// A simulated clock: each cycle's `now` advances by `dt` from a start epoch and
     /// the loop does **not** sleep — it runs cycles as fast as possible. `dt` is the
     /// logical step (e.g. a physics integrator's), so a mission converges in fixed
     /// sim time regardless of how fast the host runs it (coordinator.md §6).
     Simulated { dt: Duration },
-}
-
-impl Default for ClockMode {
-    fn default() -> Self {
-        ClockMode::Wall
-    }
 }
 
 /// Coordinator-wide configuration (coordinator.md §1.1).
@@ -96,6 +90,13 @@ pub struct CoordinatorConfig {
     pub default_depth: usize,
     /// The clock driving the per-cycle `now` and loop pacing (default `Wall`).
     pub clock: ClockMode,
+    /// Slack reader slots added on top of every buffer's computed fan-out (E8b),
+    /// covering late taps claimed through the [`Registry`](crate::Registry) after
+    /// `build()` — a db recorder, a debugger. v1 has no crash-slot reclamation, so
+    /// each buffer's `max_readers` is fixed at build time (coordinator.md §2.3, Q7);
+    /// exhausting the budget surfaces as a [`FullReaderTable`](metor_fsw_ring::FullReaderTable)
+    /// error at the claim site (`RegistryEntry::view`), naming no panic. Default `4`.
+    pub reader_slack: usize,
 }
 
 impl Default for CoordinatorConfig {
@@ -104,6 +105,7 @@ impl Default for CoordinatorConfig {
             cycle_rate: 100.0,
             default_depth: DEFAULT_DEPTH,
             clock: ClockMode::Wall,
+            reader_slack: READER_SLACK,
         }
     }
 }
@@ -727,16 +729,22 @@ enum Reg {
 // Builder
 // ---------------------------------------------------------------------------
 
+/// One registered system: its type-erased registration, its **registered**
+/// descriptor (what `build()` validates, sizes, and wires), and its instance name
+/// (defaults to `System::NAME`; the wiring loader supplies a distinct KDL instance
+/// name — wiring.md §6). One `Vec<Registration>` replaces the former four parallel
+/// vectors (C5) — in particular the `kinds` vec, which always equaled `desc.kind`.
+struct Registration {
+    reg: Reg,
+    desc: SystemDescriptor,
+    name: String,
+}
+
 /// Registers systems and edges, then `build`s a ready [`Coordinator`]. This is the
 /// surface the wiring loader targets (coordinator.md §2.1).
 pub struct CoordinatorBuilder {
     config: CoordinatorConfig,
-    regs: Vec<Reg>,
-    descs: Vec<SystemDescriptor>,
-    kinds: Vec<SystemKind>,
-    /// Per-system instance name (defaults to `System::NAME`; the wiring loader
-    /// supplies a distinct KDL instance name — wiring.md §6). Parallel to `descs`.
-    names: Vec<String>,
+    systems: Vec<Registration>,
     /// Each registered edge `(producer, consumer, delayed)`. A `delayed` edge is an
     /// intentional one-cycle-delayed feedback edge, excluded from cycle detection.
     edges: Vec<(PortRef, PortRef, bool)>,
@@ -746,10 +754,7 @@ impl CoordinatorBuilder {
     fn new(config: CoordinatorConfig) -> Self {
         let mut b = Self {
             config,
-            regs: Vec::new(),
-            descs: Vec::new(),
-            kinds: Vec::new(),
-            names: Vec::new(),
+            systems: Vec::new(),
             edges: Vec::new(),
         };
         // The coordinator registers itself as system #0 under the reserved instance
@@ -789,11 +794,15 @@ impl CoordinatorBuilder {
             ],
             capabilities: Vec::new(),
         };
-        b.descs.push(desc);
-        b.kinds.push(SystemKind::Cyclic);
-        b.names.push(COORDINATOR_INSTANCE.to_string());
-        b.regs.push(Reg::Coordinator);
+        b.push_system(desc, COORDINATOR_INSTANCE.to_string(), Reg::Coordinator);
         b
+    }
+
+    /// Record one registration; the returned handle indexes `systems`.
+    fn push_system(&mut self, desc: SystemDescriptor, name: String, reg: Reg) -> SystemHandle {
+        let id = self.systems.len();
+        self.systems.push(Registration { reg, desc, name });
+        SystemHandle { id }
     }
 
     /// The handle addressing the coordinator's own system-#0 bundle (§2.6), so a
@@ -809,7 +818,7 @@ impl CoordinatorBuilder {
     /// front-end reads back instead of re-deriving; for everything else it is the
     /// system's own `descriptor()`.
     pub fn descriptor_of(&self, handle: SystemHandle) -> &SystemDescriptor {
-        &self.descs[handle.id]
+        &self.systems[handle.id].desc
     }
 
     /// Register a cyclic system under its type's `System::NAME` instance name; see
@@ -832,12 +841,11 @@ impl CoordinatorBuilder {
         O: SystemOutput + BindPorts<BoxBacking> + 'static,
         S::Input: BindPorts<BoxBacking> + 'static,
     {
-        let id = self.descs.len();
-        self.descs.push(<S as CyclicSystem>::descriptor());
-        self.kinds.push(SystemKind::Cyclic);
-        self.names.push(name.into());
-        self.regs.push(Reg::Cyclic(Box::new(CyclicReg { system })));
-        SystemHandle { id }
+        self.push_system(
+            <S as CyclicSystem>::descriptor(),
+            name.into(),
+            Reg::Cyclic(Box::new(CyclicReg { system })),
+        )
     }
 
     /// Register an async system under its type's `System::NAME` instance name.
@@ -857,12 +865,11 @@ impl CoordinatorBuilder {
         S::Input: BindPorts<BoxBacking> + 'static,
         S::Output: BindPorts<BoxBacking> + 'static,
     {
-        let id = self.descs.len();
-        self.descs.push(<S as AsyncSystem>::descriptor());
-        self.kinds.push(SystemKind::Async);
-        self.names.push(name.into());
-        self.regs.push(Reg::Async(Box::new(AsyncReg { system })));
-        SystemHandle { id }
+        self.push_system(
+            <S as AsyncSystem>::descriptor(),
+            name.into(),
+            Reg::Async(Box::new(AsyncReg { system })),
+        )
     }
 
     /// Register the telemetry downlink (telemetry.md §8). This is an ordinary
@@ -918,15 +925,19 @@ impl CoordinatorBuilder {
         loaded: crate::dl::DlSystem,
         params: Vec<u8>,
     ) -> SystemHandle {
-        let id = self.descs.len();
-        self.descs.push(loaded.descriptor().clone());
-        self.kinds.push(SystemKind::Cyclic);
-        self.names.push(name.into());
-        self.regs.push(Reg::Dl(DlReg {
-            system: loaded,
-            params,
-        }));
-        SystemHandle { id }
+        let mut desc = loaded.descriptor().clone();
+        // Dl systems are cyclic-only: the registered kind is pinned here (as the
+        // former parallel `kinds` vec hard-coded it), never trusted from the
+        // decoded wire mirror.
+        desc.kind = SystemKind::Cyclic;
+        self.push_system(
+            desc,
+            name.into(),
+            Reg::Dl(DlReg {
+                system: loaded,
+                params,
+            }),
+        )
     }
 
     /// Register a runtime-swappable **slot** (sequences-slots.md §6): a fixed position in
@@ -1052,17 +1063,16 @@ impl CoordinatorBuilder {
             capabilities: Vec::new(),
         };
 
-        let id = self.descs.len();
-        self.descs.push(registered);
-        self.kinds.push(SystemKind::Cyclic);
-        self.names.push(name);
-        self.regs.push(Reg::Slot(SlotReg {
-            allowed,
-            initial,
-            n_occ_inputs,
-            n_occ_outputs,
-        }));
-        SystemHandle { id }
+        self.push_system(
+            registered,
+            name,
+            Reg::Slot(SlotReg {
+                allowed,
+                initial,
+                n_occ_inputs,
+                n_occ_outputs,
+            }),
+        )
     }
 
     /// Connect a producer output to a consumer input, addressed by port id. The full
@@ -1108,12 +1118,12 @@ impl CoordinatorBuilder {
         consumer: PortRef,
         delayed: bool,
     ) -> Result<(), WireError> {
-        if producer.system.id >= self.descs.len() {
+        if producer.system.id >= self.systems.len() {
             return Err(WireError::UnknownSystem {
                 id: producer.system.id,
             });
         }
-        if consumer.system.id >= self.descs.len() {
+        if consumer.system.id >= self.systems.len() {
             return Err(WireError::UnknownSystem {
                 id: consumer.system.id,
             });
@@ -1130,11 +1140,62 @@ impl CoordinatorBuilder {
 
     /// Validate the graph, size and allocate every ring, bind ports, auto-provision
     /// health/log buffers, and return a ready coordinator (coordinator.md §2).
-    pub fn build(mut self) -> Result<Coordinator, WireError> {
-        // A Wall clock turns `cycle_rate` into the per-cycle pacing budget in `run_for`;
-        // reject an unusable rate here so the failure is a build-time `WireError`, not a
-        // `Duration::from_secs_f64` panic mid-run. A `Simulated` clock ignores the rate
-        // (coordinator.md §6), so it is deliberately not validated there.
+    ///
+    /// One orchestrator over named passes (C2): each pass owns one former section of
+    /// the monolith and hands its product to the next — validation, edge resolution,
+    /// fan-out counting, ring allocation, registry freeze, copy-in planning, bind.
+    pub fn build(self) -> Result<Coordinator, WireError> {
+        self.validate_cycle_rate()?;
+        self.validate_receive_all_last()?;
+        self.validate_slot_name_caps()?;
+        self.validate_port_axes()?;
+        let cons_edges = self.resolve_edges()?;
+        let fan_out = self.count_fan_out(&cons_edges);
+        let mut alloc = self.alloc_rings(&fan_out);
+        let seq_registry = self.seq_registry_payload();
+        let registry = freeze_registry(std::mem::take(&mut alloc.reg_entries))?;
+        let mut plumbing = self.plan_copy_ins(&cons_edges, &mut alloc);
+        let Self {
+            config, systems, ..
+        } = self;
+        let BoundSystems {
+            cyclic,
+            pending_async,
+            coord,
+        } = bind_systems(systems, &cons_edges, &alloc, &mut plumbing, &registry);
+
+        Ok(Coordinator {
+            config,
+            cyclic,
+            pending_async,
+            copy_ins: plumbing.copy_ins,
+            coord_health: coord.health,
+            status_out: coord.status_out,
+            status_view: coord.status_view,
+            stopped: Vec::new(),
+            stopped_scratch: Vec::new(),
+            cycle: 0,
+            progress: Arc::new(AtomicU64::new(0)),
+            registry,
+            control_out: Some(coord.control_out),
+            seq_registry_out: coord.seq_registry_out,
+            seq_registry,
+            seq_registry_emitted: false,
+            started: false,
+            // Declared last so the canonical ring handles drop after every port.
+            rings: alloc.table,
+        })
+    }
+
+    // -----------------------------------------------------------------------
+    // build() passes (C2) — each one former section of the monolith, in order.
+    // -----------------------------------------------------------------------
+
+    /// A Wall clock turns `cycle_rate` into the per-cycle pacing budget in `run_for`;
+    /// reject an unusable rate here so the failure is a build-time `WireError`, not a
+    /// `Duration::from_secs_f64` panic mid-run. A `Simulated` clock ignores the rate
+    /// (coordinator.md §6), so it is deliberately not validated there.
+    fn validate_cycle_rate(&self) -> Result<(), WireError> {
         if matches!(self.config.clock, ClockMode::Wall)
             && !(self.config.cycle_rate.is_finite() && self.config.cycle_rate > 0.0)
         {
@@ -1142,89 +1203,101 @@ impl CoordinatorBuilder {
                 rate: self.config.cycle_rate,
             });
         }
+        Ok(())
+    }
 
-        let n = self.descs.len();
-        let depth = self.config.default_depth;
-
-        // --- Receive-all (telemetry) systems register last (A11(b): enforced) --------
-        // The downlink's end-of-cycle snapshot only observes systems stepping *before*
-        // it, so a cyclic system registered after it would telemeter one cycle stale.
-        // Enforced, not silently reordered: reordering registrations would change the
-        // step order the stale-edge diagnostics validate. Async systems are exempt
-        // (they run off their own task, not the registration-ordered step loop).
+    /// Receive-all (telemetry) systems register last (A11(b): enforced). The
+    /// downlink's end-of-cycle snapshot only observes systems stepping *before* it,
+    /// so a cyclic system registered after it would telemeter one cycle stale.
+    /// Enforced, not silently reordered: reordering registrations would change the
+    /// step order the stale-edge diagnostics validate. Async systems are exempt
+    /// (they run off their own task, not the registration-ordered step loop).
+    fn validate_receive_all_last(&self) -> Result<(), WireError> {
         let mut first_receive_all: Option<usize> = None;
-        for s in 0..n {
-            if self.kinds[s] != SystemKind::Cyclic {
+        for (s, sys) in self.systems.iter().enumerate() {
+            if sys.desc.kind != SystemKind::Cyclic {
                 continue;
             }
-            let has_receive_all = self.descs[s]
-                .capabilities
-                .contains(&crate::Capability::ReceiveAll);
+            let has_receive_all = sys.desc.capabilities.contains(&crate::Capability::ReceiveAll);
             if has_receive_all {
                 first_receive_all.get_or_insert(s);
             } else if let Some(t) = first_receive_all {
                 return Err(WireError::ReceiveAllNotLast {
-                    system: self.names[s].clone(),
-                    receive_all: self.names[t].clone(),
+                    system: sys.name.clone(),
+                    receive_all: self.systems[t].name.clone(),
                 });
             }
         }
+        Ok(())
+    }
 
-        // --- Slot instance names are wire addresses: enforce the NAME_CAP ------------
-        // A `SequenceCommand` addresses a slot by its instance name, and the same name
-        // packs into fixed-size status frames; > NAME_CAP would telemeter truncated
-        // while addressing untruncated, so it is a build error, never a truncation.
-        for s in 0..n {
-            if matches!(self.regs[s], Reg::Slot(_)) && self.descs[s].name.len() > NAME_CAP {
+    /// Slot instance names are wire addresses: enforce the [`NAME_CAP`]. A
+    /// `SequenceCommand` addresses a slot by its instance name, and the same name
+    /// packs into fixed-size status frames; > NAME_CAP would telemeter truncated
+    /// while addressing untruncated, so it is a build error, never a truncation.
+    fn validate_slot_name_caps(&self) -> Result<(), WireError> {
+        for sys in &self.systems {
+            if matches!(sys.reg, Reg::Slot(_)) && sys.desc.name.len() > NAME_CAP {
                 return Err(WireError::SlotNameTooLong {
-                    name: self.descs[s].name.to_string(),
-                    len: self.descs[s].name.len(),
+                    name: sys.desc.name.to_string(),
+                    len: sys.desc.name.len(),
                 });
             }
         }
+        Ok(())
+    }
 
-        // --- Per-descriptor axis validation (no edges needed) ----------------
-        // FanIn::Many × Delivery::Snapshot: latest-wins across producers is
-        // ill-defined. OnLap::Stop on an async system's input: an async consumer
-        // cannot be step-gated, so the hard-stop doctrine is unenforceable there
-        // (§2.3). A Snapshot input *defaults* Stop (the cyclic doctrine), so on an
-        // async system that combination is the documented coercion — effectively
-        // Resync, implemented by the drop-on-full copy-in ring — not an error; only
-        // the non-default Log × Stop (necessarily an explicit declaration, since Log
-        // defaults Resync) is rejected, because nothing decouples a Log input.
-        for s in 0..n {
-            for port in &self.descs[s].inputs {
+    /// Per-descriptor axis validation (no edges needed).
+    /// FanIn::Many × Delivery::Snapshot: latest-wins across producers is
+    /// ill-defined. OnLap::Stop on an async system's input: an async consumer
+    /// cannot be step-gated, so the hard-stop doctrine is unenforceable there
+    /// (§2.3). A Snapshot input *defaults* Stop (the cyclic doctrine), so on an
+    /// async system that combination is the documented coercion — effectively
+    /// Resync, implemented by the drop-on-full copy-in ring — not an error; only
+    /// the non-default Log × Stop (necessarily an explicit declaration, since Log
+    /// defaults Resync) is rejected, because nothing decouples a Log input.
+    fn validate_port_axes(&self) -> Result<(), WireError> {
+        for sys in &self.systems {
+            for port in &sys.desc.inputs {
                 if port.fan_in == FanIn::Many && port.delivery == Delivery::Snapshot {
                     return Err(WireError::SnapshotFanIn {
-                        system: self.descs[s].name,
+                        system: sys.desc.name,
                         port: port.id,
                     });
                 }
-                if self.kinds[s] == SystemKind::Async
+                if sys.desc.kind == SystemKind::Async
                     && port.on_lap == OnLap::Stop
                     && port.delivery == Delivery::Log
                 {
                     return Err(WireError::StopOnAsyncInput {
-                        system: self.descs[s].name,
+                        system: sys.desc.name,
                         port: port.id,
                     });
                 }
             }
         }
+        Ok(())
+    }
 
-        // --- Validate edges, build the ONE connection map ---------------------
-        // (cons_id, in_idx) -> [(prod_id, out_idx)] for EVERY input — a FanIn::One
-        // input holds exactly one entry (enforced below), a FanIn::Many input zero or
-        // more. Every rule from here on branches on a descriptor axis, never on
-        // frame-vs-message.
-        let mut cons_edges: HashMap<(usize, usize), Vec<(usize, usize)>> = HashMap::new();
+    /// Validate every edge and build the ONE connection map:
+    /// `(cons_id, in_idx) -> [(prod_id, out_idx)]` for EVERY input — a FanIn::One
+    /// input holds exactly one entry (enforced here), a FanIn::Many input zero or
+    /// more. Every rule branches on a descriptor axis, never on frame-vs-message.
+    /// Also runs the graph-shape checks over the map: every feedback loop must be
+    /// broken by a `connect_delayed`, registration order must agree with the
+    /// dataflow, and every FanIn::One input must be connected.
+    fn resolve_edges(&self) -> Result<ConsEdges, WireError> {
+        let n = self.systems.len();
+        let mut cons_edges: ConsEdges = HashMap::new();
         // System-level adjacency over the NON-delayed SNAPSHOT edges only, for cycle
         // detection: a remaining cycle is an unbroken feedback loop. Log edges are
         // excluded — a log is a decoupled event/command stream, not a same-cycle
         // dependency (§3.6).
         let mut forward_adj: Vec<Vec<usize>> = vec![Vec::new(); n];
         for (p, c, delayed) in &self.edges {
-            let out_idx = self.descs[p.system.id]
+            let prod = &self.systems[p.system.id].desc;
+            let cons = &self.systems[c.system.id].desc;
+            let out_idx = prod
                 .outputs
                 .iter()
                 .position(|d| d.id == p.port)
@@ -1232,7 +1305,7 @@ impl CoordinatorBuilder {
                     system: p.system.id,
                     port: p.port,
                 })?;
-            let in_idx = self.descs[c.system.id]
+            let in_idx = cons
                 .inputs
                 .iter()
                 .position(|d| d.id == c.port)
@@ -1240,17 +1313,14 @@ impl CoordinatorBuilder {
                     system: c.system.id,
                     port: c.port,
                 })?;
-            if !compatible(
-                &self.descs[p.system.id].outputs[out_idx],
-                &self.descs[c.system.id].inputs[in_idx],
-            ) {
+            if !compatible(&prod.outputs[out_idx], &cons.inputs[in_idx]) {
                 return Err(WireError::Incompatible {
-                    producer: self.descs[p.system.id].name,
-                    consumer: self.descs[c.system.id].name,
+                    producer: prod.name,
+                    consumer: cons.name,
                     port: c.port,
                 });
             }
-            let in_desc = &self.descs[c.system.id].inputs[in_idx];
+            let in_desc = &cons.inputs[in_idx];
             // A host-connected input's counterpart is held by the system's runner
             // (the slot's cancel writer, a self-tap over its own output) — an edge
             // into it is rejected (A3). Host *outputs* keep accepting consumer edges:
@@ -1258,16 +1328,16 @@ impl CoordinatorBuilder {
             // read over explicit edges.
             if in_desc.conn != PortConn::Edge {
                 return Err(WireError::HostPort {
-                    system: self.descs[c.system.id].name,
+                    system: cons.name,
                     port: c.port,
                 });
             }
             // `delayed` marks a one-cycle-late snapshot sample; on a Log input it is
-            // meaningless and now rejected instead of silently ignored (A7).
+            // meaningless and rejected instead of silently ignored (A7).
             if *delayed && in_desc.delivery == Delivery::Log {
                 return Err(WireError::DelayedLogEdge {
-                    producer: self.descs[p.system.id].name,
-                    consumer: self.descs[c.system.id].name,
+                    producer: prod.name,
+                    consumer: cons.name,
                     port: c.port,
                 });
             }
@@ -1277,7 +1347,7 @@ impl CoordinatorBuilder {
                 FanIn::One => {
                     if !producers.is_empty() {
                         return Err(WireError::DoubleConnect {
-                            system: self.descs[c.system.id].name,
+                            system: cons.name,
                             port: c.port,
                         });
                     }
@@ -1288,8 +1358,8 @@ impl CoordinatorBuilder {
                 FanIn::Many => {
                     if producers.contains(&(p.system.id, out_idx)) {
                         return Err(WireError::DuplicateEdge {
-                            producer: self.descs[p.system.id].name,
-                            consumer: self.descs[c.system.id].name,
+                            producer: prod.name,
+                            consumer: cons.name,
                             port: c.port,
                         });
                     }
@@ -1308,7 +1378,10 @@ impl CoordinatorBuilder {
         // --- Every feedback loop must be broken by a `connect_delayed` --------
         if let Some(cycle) = find_cycle(&forward_adj) {
             return Err(WireError::FeedbackCycle {
-                systems: cycle.into_iter().map(|id| self.descs[id].name).collect(),
+                systems: cycle
+                    .into_iter()
+                    .map(|id| self.systems[id].desc.name)
+                    .collect(),
             });
         }
 
@@ -1326,20 +1399,18 @@ impl CoordinatorBuilder {
             if *delayed {
                 continue;
             }
-            let in_delivery = self.descs[c.system.id]
-                .inputs
-                .iter()
-                .find(|d| d.id == c.port)
-                .map(|d| d.delivery);
+            let prod = &self.systems[p.system.id].desc;
+            let cons = &self.systems[c.system.id].desc;
+            let in_delivery = cons.inputs.iter().find(|d| d.id == c.port).map(|d| d.delivery);
             if in_delivery != Some(Delivery::Snapshot) {
                 continue;
             }
-            let both_cyclic = self.kinds[p.system.id] == SystemKind::Cyclic
-                && self.kinds[c.system.id] == SystemKind::Cyclic;
+            let both_cyclic =
+                prod.kind == SystemKind::Cyclic && cons.kind == SystemKind::Cyclic;
             if both_cyclic && c.system.id < p.system.id {
                 return Err(WireError::StaleFrameEdge {
-                    producer: self.descs[p.system.id].name,
-                    consumer: self.descs[c.system.id].name,
+                    producer: prod.name,
+                    consumer: cons.name,
                     port: c.port,
                 });
             }
@@ -1349,70 +1420,82 @@ impl CoordinatorBuilder {
         // (exactly-once is the edge pass above; existence is here). A FanIn::Many
         // input may have zero producers (fan-in is optional, §3.2); a non-Edge input
         // is fed by its runner, never an edge (A3).
-        for s in 0..n {
-            for (in_idx, port) in self.descs[s].inputs.iter().enumerate() {
+        for (sid, sys) in self.systems.iter().enumerate() {
+            for (in_idx, port) in sys.desc.inputs.iter().enumerate() {
                 if port.conn == PortConn::Edge
                     && port.fan_in == FanIn::One
-                    && !cons_edges.contains_key(&(s, in_idx))
+                    && !cons_edges.contains_key(&(sid, in_idx))
                 {
                     return Err(WireError::UnconnectedInput {
-                        system: self.descs[s].name,
+                        system: sys.desc.name,
                         port: port.id,
                     });
                 }
             }
         }
 
-        // --- Fan-out per output port: one uniform count over the one map -----
+        Ok(cons_edges)
+    }
+
+    /// Fan-out per output port: one uniform count over the one connection map. A
+    /// declared self-tap (A3) is one more reader on the system's *own* output —
+    /// counted here so the budget is explicit, not slack-covered.
+    fn count_fan_out(&self, cons_edges: &ConsEdges) -> HashMap<(usize, usize), usize> {
         let mut fan_out: HashMap<(usize, usize), usize> = HashMap::new();
         for producers in cons_edges.values() {
             for &(prod_id, out_idx) in producers {
                 *fan_out.entry((prod_id, out_idx)).or_insert(0) += 1;
             }
         }
-        // A declared self-tap (A3) is one more reader on the system's *own* output —
-        // counted here so the budget is explicit, not slack-covered.
-        for s in 0..n {
-            for port in &self.descs[s].inputs {
+        for (sid, sys) in self.systems.iter().enumerate() {
+            for port in &sys.desc.inputs {
                 let PortConn::SelfTap(pid) = port.conn else {
                     continue;
                 };
-                let out_idx = self.descs[s]
+                let out_idx = sys
+                    .desc
                     .outputs
                     .iter()
                     .position(|o| o.id == pid)
                     .expect("a SelfTap names one of the system's own outputs");
-                *fan_out.entry((s, out_idx)).or_insert(0) += 1;
+                *fan_out.entry((sid, out_idx)).or_insert(0) += 1;
             }
         }
+        fan_out
+    }
 
-        let mut table = RingTable { rings: Vec::new() };
-        // The build-order registry entries — ONE list over every registered buffer,
-        // frames and message channels alike (telemetry.md §2). Collected alongside
-        // allocation and frozen into an `Arc<Registry>` *before* the bind loop, so a
-        // system can pull it in `BindPorts::bind` (telemetry.md §2.3).
-        let mut reg_entries: Vec<RegistryEntry> = Vec::new();
-        // Each `AllOutputs` receive-all capability (`docs/message-wiring.md` §4) is an extra
-        // fan-out reader on *every* output + message buffer, so `build()` sizes every ring's
-        // `max_readers` to include it. Self-derived from the declared `ReceiveAll`
-        // capabilities across all systems — no manual `add_telemetry` bookkeeping.
+    /// Allocate one buffer per output port (incl. health/log) plus a dedicated ring
+    /// per Host-connected input (A3), collecting the build-order registry entries —
+    /// ONE list over every registered buffer, frames and message channels alike
+    /// (telemetry.md §2). Each `AllOutputs` receive-all capability
+    /// (`docs/message-wiring.md` §4) is an extra fan-out reader on *every* buffer, so
+    /// every ring's `max_readers` includes it — self-derived from the declared
+    /// `ReceiveAll` capabilities, no manual `add_telemetry` bookkeeping.
+    fn alloc_rings(&self, fan_out: &HashMap<(usize, usize), usize>) -> RingAlloc {
+        let depth = self.config.default_depth;
+        let slack = self.config.reader_slack;
         let n_reg = self
-            .descs
+            .systems
             .iter()
-            .flat_map(|d| d.capabilities.iter())
+            .flat_map(|sys| sys.desc.capabilities.iter())
             .filter(|c| **c == crate::Capability::ReceiveAll)
             .count();
 
-        // --- Allocate one buffer per output port (incl. health/log) ----------
-        let mut output_rings: Vec<Vec<RingBuffer<BoxBacking>>> = Vec::with_capacity(n);
-        for s in 0..n {
-            let mut row = Vec::with_capacity(self.descs[s].outputs.len());
-            for (out_idx, port) in self.descs[s].outputs.iter().enumerate() {
-                let readers =
-                    fan_out.get(&(s, out_idx)).copied().unwrap_or(0) + n_reg + READER_SLACK;
-                let instance = self.names[s].clone();
+        let mut alloc = RingAlloc {
+            table: RingTable { rings: Vec::new() },
+            output_rings: Vec::with_capacity(self.systems.len()),
+            host_input_rings: HashMap::new(),
+            reg_entries: Vec::new(),
+        };
+
+        // --- One buffer per output port -----------------------------------
+        for (sid, sys) in self.systems.iter().enumerate() {
+            let mut row = Vec::with_capacity(sys.desc.outputs.len());
+            for (out_idx, port) in sys.desc.outputs.iter().enumerate() {
+                let readers = fan_out.get(&(sid, out_idx)).copied().unwrap_or(0) + n_reg + slack;
+                let instance = sys.name.clone();
                 let role = BufferRole::Output {
-                    system: s,
+                    system: sid,
                     port: out_idx,
                 };
                 // ONE sizing path (depth by delivery — `alloc_ring`); only the
@@ -1422,8 +1505,10 @@ impl CoordinatorBuilder {
                 let ring = alloc_ring(port.delivery, port.max_size, depth, readers);
                 match &port.schema {
                     PortSchema::Table { .. } => {
-                        reg_entries.push(registry_entry(&instance, port, ring.clone()));
-                        table.rings.push(RingEntry {
+                        alloc
+                            .reg_entries
+                            .push(registry_entry(&instance, port, ring.clone()));
+                        alloc.table.rings.push(RingEntry {
                             ring: ring.clone(),
                             frame_id: port
                                 .id
@@ -1439,108 +1524,96 @@ impl CoordinatorBuilder {
                         // `telemetered = false` (e.g. a command channel, §6.4).
                         let entry =
                             postcard_entry(&instance, port.name, ring.clone(), port.telemetered);
-                        table.rings.push(RingEntry {
+                        alloc.table.rings.push(RingEntry {
                             ring: ring.clone(),
                             frame_id: entry.key,
                             role,
                             instance: Some(instance),
                         });
-                        reg_entries.push(entry);
+                        alloc.reg_entries.push(entry);
                     }
                 }
                 row.push(ring);
             }
-            output_rings.push(row);
+            alloc.output_rings.push(row);
         }
 
-        // --- Dedicated rings for Host-connected inputs (A3) -------------------
+        // --- Dedicated rings for Host-connected inputs (A3) ----------------
         // A Host input's counterpart is its runner's writer (the slot's cancel
         // frame), so it gets its own ring instead of a producer edge: the occupant
         // attaches one read `View` per Load (released on each Stop/Reset/Unload), so
         // 1 reader slot + slack covers the reload cycle. No registry entry — it is
         // inbound control, not an output. SelfTap inputs allocate nothing (they view
         // the system's own output, already counted in `fan_out`).
-        let mut host_input_rings: HashMap<(usize, usize), RingBuffer<BoxBacking>> =
-            HashMap::new();
-        for s in 0..n {
-            for (in_idx, port) in self.descs[s].inputs.iter().enumerate() {
+        for (sid, sys) in self.systems.iter().enumerate() {
+            for (in_idx, port) in sys.desc.inputs.iter().enumerate() {
                 if port.conn != PortConn::Host {
                     continue;
                 }
-                let ring = alloc_ring(port.delivery, port.max_size, depth, 1 + READER_SLACK);
-                table.rings.push(RingEntry {
+                let ring = alloc_ring(port.delivery, port.max_size, depth, 1 + slack);
+                alloc.table.rings.push(RingEntry {
                     ring: ring.clone(),
                     frame_id: port
                         .id
                         .component()
                         .expect("v1 host-connected inputs are table ports"),
                     role: BufferRole::Private {
-                        system: s,
+                        system: sid,
                         input: in_idx,
                     },
-                    instance: Some(self.names[s].clone()),
+                    instance: Some(sys.name.clone()),
                 });
-                host_input_rings.insert((s, in_idx), ring);
+                alloc.host_input_rings.insert((sid, in_idx), ring);
             }
         }
 
-        // --- Boot `SequenceRegistry` payload -----------------------------------
-        // One spec per slot, keyed by the slot's **instance name** — the channel's
-        // wire address (`docs/messages.md` §5); there is no build-order channel id.
-        let mut seq_specs: Vec<SequenceChannelSpec> = Vec::new();
-        for (s, reg) in self.regs.iter().enumerate() {
-            if let Reg::Slot(slot_reg) = reg {
-                seq_specs.push(SequenceChannelSpec {
-                    name: self.descs[s].name.to_string(),
+        alloc
+    }
+
+    /// The boot `SequenceRegistry` payload: one spec per slot, keyed by the slot's
+    /// **instance name** — the channel's wire address (`docs/messages.md` §5); there
+    /// is no build-order channel id.
+    fn seq_registry_payload(&self) -> SequenceRegistry {
+        let channels = self
+            .systems
+            .iter()
+            .filter_map(|sys| match &sys.reg {
+                Reg::Slot(slot_reg) => Some(SequenceChannelSpec {
+                    name: sys.desc.name.to_string(),
                     available: slot_reg.allowed.iter().map(|a| a.name.clone()).collect(),
-                });
-            }
-        }
+                }),
+                _ => None,
+            })
+            .collect();
+        SequenceRegistry { channels }
+    }
 
-        let seq_registry = SequenceRegistry {
-            channels: seq_specs,
+    /// Private copy-in buffers for async inputs, keyed on the delivery axis (§2.3):
+    /// an async system cannot be step-gated, so an async SNAPSHOT input is
+    /// effectively Resync, implemented by a private drop-on-full copy-in ring (which
+    /// also supplies the matched data `Notifier` the async `recv` parks on). Log
+    /// inputs use a direct fan-in multi-view (§3.3) — a best-effort log the consumer
+    /// poll-drains, no copy-in.
+    fn plan_copy_ins(&self, cons_edges: &ConsEdges, alloc: &mut RingAlloc) -> AsyncPlumbing {
+        let depth = self.config.default_depth;
+        let slack = self.config.reader_slack;
+        let mut plumbing = AsyncPlumbing {
+            private_inputs: HashMap::new(),
+            async_wakes: vec![Vec::new(); self.systems.len()],
+            copy_ins: Vec::new(),
         };
-
-        // One keyspace: a same-instance name collision between a frame and a channel
-        // (both `"<instance>.<name>"`) is now detectable instead of shadowing.
-        let mut seen_keys: HashMap<ComponentId, usize> = HashMap::new();
-        for (i, e) in reg_entries.iter().enumerate() {
-            if seen_keys.insert(e.key, i).is_some() {
-                return Err(WireError::DuplicateRegistryKey {
-                    key: format!("{}.{}", e.instance, e.name),
-                });
-            }
-        }
-
-        // Freeze the ONE registry; every consumer's bind pulls this same handle.
-        let registry = Arc::new(Registry::new(reg_entries));
-
-        // --- Private copy-in buffers for async inputs ------------------------
-        // Keyed on the delivery axis (§2.3): an async system cannot be step-gated, so
-        // an async SNAPSHOT input is effectively Resync, implemented by a private
-        // drop-on-full copy-in ring (which also supplies the matched data `Notifier`
-        // the async `recv` parks on). Log inputs use a direct fan-in multi-view
-        // (§3.3) — a best-effort log the consumer poll-drains, no copy-in.
-        // (async_sys, in_idx) -> (private ring, matched data notifier)
-        let mut private_inputs: HashMap<(usize, usize), (RingBuffer<BoxBacking>, Notifier)> =
-            HashMap::new();
-        let mut async_wakes: Vec<Vec<Notifier>> = vec![Vec::new(); n];
-        let mut copy_ins: Vec<CopyIn> = Vec::new();
-        for s in 0..n {
-            if self.kinds[s] != SystemKind::Async {
+        for (sid, sys) in self.systems.iter().enumerate() {
+            if sys.desc.kind != SystemKind::Async {
                 continue;
             }
-            for in_idx in 0..self.descs[s].inputs.len() {
+            for (in_idx, port) in sys.desc.inputs.iter().enumerate() {
                 // Only edge-connected Snapshot inputs are copy-in decoupled; a
                 // Host/SelfTap input is fed by its runner, not a producer edge (A3).
-                if self.descs[s].inputs[in_idx].delivery == Delivery::Log
-                    || self.descs[s].inputs[in_idx].conn != PortConn::Edge
-                {
+                if port.delivery == Delivery::Log || port.conn != PortConn::Edge {
                     continue;
                 }
-                let (prod_id, out_idx) = cons_edges[&(s, in_idx)][0];
-                let port = &self.descs[s].inputs[in_idx];
-                let private = alloc_ring(port.delivery, port.max_size, depth, 1 + READER_SLACK);
+                let (prod_id, out_idx) = cons_edges[&(sid, in_idx)][0];
+                let private = alloc_ring(port.delivery, port.max_size, depth, 1 + slack);
                 let data = Notifier::default();
                 // The private ring is Overwrite, so a write never suspends for space —
                 // only the matched DATA notifier is load-bearing (it wakes the parked
@@ -1550,358 +1623,424 @@ impl CoordinatorBuilder {
                 let writer = private
                     .writer(data.clone(), NoWake)
                     .expect("private copy-in ring has exactly one writer");
-                let upstream = output_rings[prod_id][out_idx]
+                let upstream = alloc.output_rings[prod_id][out_idx]
                     .view(NoWake, NoWake)
                     .expect("producer reader slot reserved at sizing time");
-                copy_ins.push(CopyIn {
+                plumbing.copy_ins.push(CopyIn {
                     upstream,
                     writer,
                     scratch: Vec::new(),
                 });
-                private_inputs.insert((s, in_idx), (private.clone(), data.clone()));
-                async_wakes[s].push(data);
-                table.rings.push(RingEntry {
+                plumbing
+                    .private_inputs
+                    .insert((sid, in_idx), (private.clone(), data.clone()));
+                plumbing.async_wakes[sid].push(data);
+                alloc.table.rings.push(RingEntry {
                     ring: private,
                     frame_id: port.id.component().expect("copy-in inputs are table ports"),
                     role: BufferRole::Private {
-                        system: s,
+                        system: sid,
                         input: in_idx,
                     },
-                    instance: Some(self.names[s].clone()),
+                    instance: Some(sys.name.clone()),
                 });
             }
         }
+        plumbing
+    }
+}
 
-        // --- Bind every system's ports over the allocated rings --------------
-        let mut cyclic: Vec<Box<dyn CyclicSlot>> = Vec::new();
-        let mut pending_async: Vec<PendingAsync> = Vec::new();
-        // The coordinator's own (#0) ports, wrapped by its bind arm below and
-        // unwrapped after the loop (`Reg::Coordinator` is always registered first).
-        let mut control_out: Option<MsgOut<SequenceCommand>> = None;
-        let mut coord_health: Option<HealthPort> = None;
-        let mut status_out: Option<Output<CoordinatorStatus>> = None;
-        let mut status_view: Option<Input<CoordinatorStatus>> = None;
-        let mut seq_registry_out: Option<MsgOut<SequenceRegistry>> = None;
-        let regs = std::mem::take(&mut self.regs);
-        for (id, reg) in regs.into_iter().enumerate() {
-            match reg {
-                // The coordinator's own bundle (§2.6): a marker registration — not a
-                // cyclic slot (the coordinator IS the loop). Its declared Host outputs
-                // were allocated/registered by the uniform passes above; wrap the
-                // writers into the coordinator's fields here, single-writer by
-                // construction, and claim the status SelfTap view (`read_status`).
-                Reg::Coordinator => {
-                    let desc = &self.descs[id];
-                    let out_idx = |pid: PortId| {
-                        desc.outputs
-                            .iter()
-                            .position(|p| p.id == pid)
-                            .expect("the coordinator #0 bundle declares this output")
-                    };
-                    let health_ring =
-                        &output_rings[id][out_idx(PortId::Component(SystemHealth::FRAME_ID))];
-                    let log_ring =
-                        &output_rings[id][out_idx(PortId::Component(SystemLog::FRAME_ID))];
-                    coord_health = Some(HealthPort::new(
-                        slot_writer::<SystemHealth>(health_ring),
-                        slot_writer::<SystemLog>(log_ring),
-                    ));
-                    let status_idx = out_idx(PortId::Component(CoordinatorStatus::FRAME_ID));
-                    status_out =
-                        Some(slot_writer::<CoordinatorStatus>(&output_rings[id][status_idx]));
-                    // The declared SelfTap over the coordinator's own status output
-                    // (+1 fan-out counted at sizing).
-                    status_view = Some(Input::new(
-                        output_rings[id][status_idx]
-                            .view(NoWake, NoWake)
-                            .expect("status self-tap reader (fan-out sized)"),
-                    ));
-                    seq_registry_out = Some(owned_writer::<SequenceRegistry>(
-                        &output_rings[id][out_idx(PortId::Packet(SequenceRegistry::ID))],
-                    ));
-                    control_out = Some(owned_writer::<SequenceCommand>(
-                        &output_rings[id][out_idx(PortId::Packet(SequenceCommand::ID))],
-                    ));
-                }
-                // A dlopen'd system binds over **raw** `FswRing` regions, not typed
-                // `BoundPort`s: gather the same per-port rings the coordinator allocated
-                // (outputs = this system's own buffers; inputs = views into the upstream
-                // producers' outputs — the cyclic-consumer path), as `(base, len, role)`
-                // handles in `descriptors()` order, and hand them to a `DlSlot`.
-                // Sizing, allocation, validation, and the registry entry above are
-                // identical to a static system's.
-                Reg::Dl(dl) => {
-                    use crate::abi::{FswRing, ROLE_INPUT, ROLE_OUTPUT};
-                    let outputs: Vec<FswRing> = (0..self.descs[id].outputs.len())
-                        .map(|out_idx| {
-                            let (base, len) = output_rings[id][out_idx].region();
-                            FswRing {
-                                base,
-                                len,
-                                role: ROLE_OUTPUT,
-                            }
-                        })
-                        .collect();
-                    let inputs: Vec<FswRing> = (0..self.descs[id].inputs.len())
-                        .map(|in_idx| {
+// ---------------------------------------------------------------------------
+// build() products + the bind pass (C2)
+// ---------------------------------------------------------------------------
+
+/// The ONE connection map: `(consumer, input-index)` → the producer endpoints
+/// explicitly wired into it. Product of [`CoordinatorBuilder::resolve_edges`];
+/// consumed by fan-out counting, copy-in planning, and the bind pass.
+type ConsEdges = HashMap<(usize, usize), Vec<(usize, usize)>>;
+
+/// The ring-allocation pass product: the canonical owning [`RingTable`], one buffer
+/// row per system's outputs, the dedicated Host-input rings, and the build-order
+/// registry entries (drained by [`freeze_registry`]).
+struct RingAlloc {
+    table: RingTable,
+    output_rings: Vec<Vec<RingBuffer<BoxBacking>>>,
+    host_input_rings: HashMap<(usize, usize), RingBuffer<BoxBacking>>,
+    reg_entries: Vec<RegistryEntry>,
+}
+
+/// The copy-in planning product: each async Snapshot input's private ring + matched
+/// data notifier, the per-system wake lists (for teardown), and the copy-in jobs.
+struct AsyncPlumbing {
+    private_inputs: HashMap<(usize, usize), (RingBuffer<BoxBacking>, Notifier)>,
+    async_wakes: Vec<Vec<Notifier>>,
+    copy_ins: Vec<CopyIn>,
+}
+
+/// The coordinator's own (#0) bound ports, wrapped by [`bind_coordinator`].
+struct CoordinatorPorts {
+    health: HealthPort,
+    status_out: Output<CoordinatorStatus>,
+    status_view: Input<CoordinatorStatus>,
+    seq_registry_out: MsgOut<SequenceRegistry>,
+    control_out: MsgOut<SequenceCommand>,
+}
+
+/// The bind pass product: every cyclic slot, every pending async system, and the
+/// coordinator's own ports.
+struct BoundSystems {
+    cyclic: Vec<Box<dyn CyclicSlot>>,
+    pending_async: Vec<PendingAsync>,
+    coord: CoordinatorPorts,
+}
+
+/// One keyspace over frames and channels: a same-instance name collision between a
+/// frame and a channel (both `"<instance>.<name>"`) is detectable instead of
+/// shadowing. Freezes the ONE registry; every consumer's bind pulls this handle.
+fn freeze_registry(reg_entries: Vec<RegistryEntry>) -> Result<Arc<Registry>, WireError> {
+    let mut seen_keys: HashMap<ComponentId, usize> = HashMap::new();
+    for (i, e) in reg_entries.iter().enumerate() {
+        if seen_keys.insert(e.key, i).is_some() {
+            return Err(WireError::DuplicateRegistryKey {
+                key: format!("{}.{}", e.instance, e.name),
+            });
+        }
+    }
+    Ok(Arc::new(Registry::new(reg_entries)))
+}
+
+/// Bind every system's ports over the allocated rings — the pass that consumes the
+/// registrations. Each arm mirrors one registration kind; the static (host-side
+/// `BoxBacking`) arm builds typed `BoundPort`s and walks them with a [`Binder`].
+fn bind_systems(
+    systems: Vec<Registration>,
+    cons_edges: &ConsEdges,
+    alloc: &RingAlloc,
+    plumbing: &mut AsyncPlumbing,
+    registry: &Arc<Registry>,
+) -> BoundSystems {
+    let mut cyclic: Vec<Box<dyn CyclicSlot>> = Vec::new();
+    let mut pending_async: Vec<PendingAsync> = Vec::new();
+    // The coordinator's own (#0) ports, wrapped by its bind arm below and
+    // unwrapped after the loop (`Reg::Coordinator` is always registered first).
+    let mut coord: Option<CoordinatorPorts> = None;
+    for (id, registration) in systems.into_iter().enumerate() {
+        let Registration { reg, desc, .. } = registration;
+        match reg {
+            Reg::Coordinator => coord = Some(bind_coordinator(id, &desc, &alloc.output_rings)),
+            Reg::Dl(dl) => cyclic.push(Box::new(bind_dl(
+                id,
+                dl,
+                &desc,
+                cons_edges,
+                &alloc.output_rings,
+            ))),
+            Reg::Slot(slot_reg) => cyclic.push(Box::new(bind_slot(
+                id, slot_reg, &desc, cons_edges, alloc,
+            ))),
+            // The static (host-side `BoxBacking`) path: build typed `BoundPort`s and
+            // walk them with a `Binder`.
+            reg => {
+                // Outputs: default wakes, the system's own buffers. Capabilities
+                // never appear here — they live on `desc.capabilities`, not in the
+                // port lists, so the positional cursor covers exactly the wired
+                // ports (`AllOutputs::bind` pulls the registry instead of consuming
+                // a cursor position).
+                let outs: Vec<BoundPort> = (0..desc.outputs.len())
+                    .map(|out_idx| BoundPort::new(alloc.output_rings[id][out_idx].clone()))
+                    .collect();
+                // Inputs, in `descriptors()` order, chosen by the FAN-IN axis. A
+                // `One` input: cyclic consumers view the producer's output
+                // directly, async consumers view their private copy-in buffer with
+                // the matched data wake. A `Many` input: a direct multi-view over
+                // every producer ring wired to it (fan-in, §3.3), NoWake — a
+                // best-effort log the consumer poll-drains (no copy-in, cyclic or
+                // async).
+                let ins: Vec<BoundInput> = (0..desc.inputs.len())
+                    .map(|in_idx| match desc.inputs[in_idx].fan_in {
+                        FanIn::One => {
                             let (prod_id, out_idx) = cons_edges[&(id, in_idx)][0];
-                            let (base, len) = output_rings[prod_id][out_idx].region();
-                            FswRing {
-                                base,
-                                len,
-                                role: ROLE_INPUT,
-                            }
-                        })
-                        .collect();
-                    // SAFETY: every region named here is a `RingTable`-owned ring that
-                    // outlives the slot — the coordinator drops `cyclic` (this slot,
-                    // whose `Drop` calls `fsw_destroy`) before `rings`. The `DlSystem`
-                    // handle drops right after; the slot keeps its own `Arc<Library>`.
-                    let slot = unsafe {
-                        dl.system
-                            .make_slot(&dl.params, inputs, outputs, self.descs[id].name)
-                    };
-                    cyclic.push(Box::new(slot));
-                }
-                // A runtime slot: gather the same per-port regions as the Dl arm, but
-                // append the slot's owned control ring to the occupant's input array and
-                // hand the runner the control/status writers. No occupant is created here
-                // — only `init`/`Load` (runtime) does.
-                Reg::Slot(slot_reg) => {
-                    use crate::abi::{FswRing, ROLE_INPUT, ROLE_OUTPUT};
-                    let SlotReg {
-                        allowed,
-                        initial,
-                        n_occ_inputs,
-                        n_occ_outputs,
-                    } = slot_reg;
-                    let desc = &self.descs[id];
-                    // The prefix/tail invariant (§2.2): the occupant's ports are the
-                    // prefix of each registered list, in the occupant descriptor's own
-                    // order — so the occupant `FswRing` arrays are a straight prefix
-                    // map (Edge inputs view their producers; the Host `SlotControlIn`
-                    // input its dedicated ring) and the occupant-side positional bind
-                    // contract (the dl ABI) is untouched.
-                    let inputs: Vec<FswRing> = (0..n_occ_inputs)
-                        .map(|in_idx| {
-                            let (base, len) = match desc.inputs[in_idx].conn {
-                                PortConn::Edge => {
-                                    let (prod_id, out_idx) = cons_edges[&(id, in_idx)][0];
-                                    output_rings[prod_id][out_idx].region()
+                            // The copy-in pass keyed on (Async, Snapshot); anything
+                            // it decoupled binds the private ring + matched wake,
+                            // everything else views the producer directly.
+                            let port = match plumbing.private_inputs.get(&(id, in_idx)) {
+                                Some((ring, data)) => {
+                                    BoundPort::matched(ring.clone(), Box::new(data.clone()))
                                 }
-                                PortConn::Host => host_input_rings[&(id, in_idx)].region(),
-                                PortConn::SelfTap(_) => {
-                                    unreachable!("the occupant input prefix holds no self-tap")
+                                None => {
+                                    BoundPort::new(alloc.output_rings[prod_id][out_idx].clone())
                                 }
                             };
-                            FswRing {
-                                base,
-                                len,
-                                role: ROLE_INPUT,
-                            }
-                        })
-                        .collect();
-                    // Occupant outputs = the prefix of the slot's own buffers (user
-                    // outputs + SequenceStatus + health + log, in descriptor order).
-                    let outputs: Vec<FswRing> = (0..n_occ_outputs)
-                        .map(|out_idx| {
-                            let (base, len) = output_rings[id][out_idx].region();
-                            FswRing {
-                                base,
-                                len,
-                                role: ROLE_OUTPUT,
-                            }
-                        })
-                        .collect();
-
-                    // --- The runner's tail ports, located by their declared shape ---
-                    // Host cancel writer over the SlotControlIn input's dedicated ring.
-                    let control_in_idx = desc.inputs[..n_occ_inputs]
-                        .iter()
-                        .position(|p| p.conn == PortConn::Host)
-                        .expect("a slot declares its Host SlotControlIn input");
-                    let control = slot_writer::<SlotControlIn>(
-                        &host_input_rings[&(id, control_in_idx)],
-                    );
-                    // The slot's command fan-in: one view per producer explicitly
-                    // edged into the declared `commands` input (A2 — no type-keyed
-                    // broadcast; zero edges is a legal, command-less slot). The
-                    // `SlotRunner` drains + filters by its instance name each step.
-                    let cmd_in_idx = desc
-                        .inputs
-                        .iter()
-                        .position(|p| {
-                            p.conn == PortConn::Edge
-                                && p.id == PortId::Packet(SequenceCommand::ID)
-                        })
-                        .expect("a slot's registered descriptor declares its commands input");
-                    let commands = MsgIn::from_views(
-                        cons_edges
-                            .get(&(id, cmd_in_idx))
-                            .map(|producers| {
-                                producers
-                                    .iter()
-                                    .map(|&(prod_id, out_idx)| {
-                                        output_rings[prod_id][out_idx]
-                                            .view(NoWake, NoWake)
-                                            .expect("command reader slot (edge fan-out sized)")
-                                    })
-                                    .collect()
-                            })
-                            .unwrap_or_default(),
-                    );
-                    // The declared self-tap over the occupant's own SequenceStatus
-                    // output (+1 fan-out counted at sizing) — Progress + outcome.
-                    let seq_tap = desc
-                        .inputs
-                        .iter()
-                        .find_map(|p| match p.conn {
-                            PortConn::SelfTap(pid) => Some(pid),
-                            _ => None,
-                        })
-                        .expect("a slot declares its SequenceStatus self-tap");
-                    let seq_out_idx = desc
-                        .outputs
-                        .iter()
-                        .position(|o| o.id == seq_tap)
-                        .expect("a SelfTap names one of the slot's own outputs");
-                    let seq_status = Input::new(
-                        output_rings[id][seq_out_idx]
-                            .view(NoWake, NoWake)
-                            .expect("SequenceStatus self-tap reader (fan-out sized)"),
-                    );
-                    // Host writers over the runner's declared output tail: SlotStatus
-                    // + the "sequences" events channel (real output indices now — no
-                    // off-by-the-end BufferRole, no side allocation).
-                    let status_out_idx = desc
-                        .outputs
-                        .iter()
-                        .position(|o| o.id == PortId::Component(SlotStatus::FRAME_ID))
-                        .expect("a slot declares its Host SlotStatus output");
-                    let status_out =
-                        slot_writer::<SlotStatus>(&output_rings[id][status_out_idx]);
-                    let events_out_idx = desc
-                        .outputs
-                        .iter()
-                        .position(|o| o.id == PortId::Packet(SequenceChannelEvent::ID))
-                        .expect("a slot declares its Host events output");
-                    let events = owned_writer::<SequenceChannelEvent>(
-                        &output_rings[id][events_out_idx],
-                    );
-
-                    let runner = SlotRunner::new(
-                        self.descs[id].name,
-                        allowed,
-                        initial,
-                        inputs,
-                        outputs,
-                        control,
-                        status_out,
-                        events,
-                        seq_status,
-                        commands,
-                    );
-                    cyclic.push(Box::new(runner));
-                }
-                // The static (host-side `BoxBacking`) path: build typed `BoundPort`s and
-                // walk them with a `Binder`.
-                reg => {
-                    // Outputs: default wakes, the system's own buffers. Capabilities
-                    // never appear here — they live on `descs[id].capabilities`, not
-                    // in the port lists, so the positional cursor covers exactly the
-                    // wired ports (`AllOutputs::bind` pulls the registry instead of
-                    // consuming a cursor position).
-                    let outs: Vec<BoundPort> = (0..self.descs[id].outputs.len())
-                        .map(|out_idx| BoundPort::new(output_rings[id][out_idx].clone()))
-                        .collect();
-                    // Inputs, in `descriptors()` order, chosen by the FAN-IN axis. A
-                    // `One` input: cyclic consumers view the producer's output
-                    // directly, async consumers view their private copy-in buffer with
-                    // the matched data wake. A `Many` input: a direct multi-view over
-                    // every producer ring wired to it (fan-in, §3.3), NoWake — a
-                    // best-effort log the consumer poll-drains (no copy-in, cyclic or
-                    // async).
-                    let ins: Vec<BoundInput> = (0..self.descs[id].inputs.len())
-                        .map(|in_idx| match self.descs[id].inputs[in_idx].fan_in {
-                            FanIn::One => {
-                                let (prod_id, out_idx) = cons_edges[&(id, in_idx)][0];
-                                // The copy-in pass keyed on (Async, Snapshot); anything
-                                // it decoupled binds the private ring + matched wake,
-                                // everything else views the producer directly.
-                                let port = match private_inputs.get(&(id, in_idx)) {
-                                    Some((ring, data)) => {
-                                        BoundPort::matched(ring.clone(), Box::new(data.clone()))
-                                    }
-                                    None => {
-                                        BoundPort::new(output_rings[prod_id][out_idx].clone())
-                                    }
-                                };
-                                BoundInput::One(port)
-                            }
-                            FanIn::Many => {
-                                let ports = cons_edges
-                                    .get(&(id, in_idx))
-                                    .map(|producers| {
-                                        producers
-                                            .iter()
-                                            .map(|&(prod_id, out_idx)| {
-                                                BoundPort::new(output_rings[prod_id][out_idx].clone())
-                                            })
-                                            .collect()
-                                    })
-                                    .unwrap_or_default();
-                                BoundInput::Many(ports)
-                            }
-                        })
-                        .collect();
-
-                    let mut binder = Binder::new(&outs, &ins, registry.clone());
-                    match reg {
-                        Reg::Cyclic(r) => cyclic.push(r.bind(&mut binder)),
-                        Reg::Async(r) => pending_async.push(PendingAsync {
-                            launcher: r.bind(&mut binder),
-                            wake_on_stop: async_wakes[id].clone(),
-                        }),
-                        // The dl/slot/coordinator arms are handled by the outer match.
-                        Reg::Dl(_) => unreachable!("dl registration bound by the outer match"),
-                        Reg::Slot(_) => unreachable!("slot registration bound by the outer match"),
-                        Reg::Coordinator => {
-                            unreachable!("coordinator registration bound by the outer match")
+                            BoundInput::One(port)
                         }
+                        FanIn::Many => {
+                            let ports = cons_edges
+                                .get(&(id, in_idx))
+                                .map(|producers| {
+                                    producers
+                                        .iter()
+                                        .map(|&(prod_id, out_idx)| {
+                                            BoundPort::new(
+                                                alloc.output_rings[prod_id][out_idx].clone(),
+                                            )
+                                        })
+                                        .collect()
+                                })
+                                .unwrap_or_default();
+                            BoundInput::Many(ports)
+                        }
+                    })
+                    .collect();
+
+                let mut binder = Binder::new(&outs, &ins, registry.clone());
+                match reg {
+                    Reg::Cyclic(r) => cyclic.push(r.bind(&mut binder)),
+                    Reg::Async(r) => pending_async.push(PendingAsync {
+                        launcher: r.bind(&mut binder),
+                        wake_on_stop: std::mem::take(&mut plumbing.async_wakes[id]),
+                    }),
+                    // The dl/slot/coordinator arms are handled by the outer match.
+                    Reg::Dl(_) => unreachable!("dl registration bound by the outer match"),
+                    Reg::Slot(_) => unreachable!("slot registration bound by the outer match"),
+                    Reg::Coordinator => {
+                        unreachable!("coordinator registration bound by the outer match")
                     }
                 }
             }
         }
-
-        // The coordinator's own ports were wrapped by its #0 bind arm — always
-        // registered (CoordinatorBuilder::new), so the unwraps are structural.
-        let coord_health = coord_health.expect("coordinator #0 bound its health port");
-        let status_out = status_out.expect("coordinator #0 bound its status writer");
-        let status_view = status_view.expect("coordinator #0 bound its status view");
-        let seq_registry_out =
-            seq_registry_out.expect("coordinator #0 bound its sequences writer");
-
-        Ok(Coordinator {
-            config: self.config,
-            cyclic,
-            pending_async,
-            copy_ins,
-            coord_health,
-            status_out,
-            status_view,
-            stopped: Vec::new(),
-            cycle: 0,
-            progress: Arc::new(AtomicU64::new(0)),
-            registry,
-            control_out,
-            seq_registry_out,
-            seq_registry,
-            seq_registry_emitted: false,
-            started: false,
-            // Declared last so the canonical ring handles drop after every port.
-            rings: table,
-        })
     }
+
+    BoundSystems {
+        cyclic,
+        pending_async,
+        // Always registered by CoordinatorBuilder::new, so the unwrap is structural.
+        coord: coord.expect("coordinator #0 bound its ports"),
+    }
+}
+
+/// The coordinator's own bundle (§2.6): a marker registration — not a cyclic slot
+/// (the coordinator IS the loop). Its declared Host outputs were allocated and
+/// registered by the uniform passes; wrap the writers into the coordinator's ports
+/// here, single-writer by construction, and claim the status SelfTap view
+/// (`read_status`).
+fn bind_coordinator(
+    id: usize,
+    desc: &SystemDescriptor,
+    output_rings: &[Vec<RingBuffer<BoxBacking>>],
+) -> CoordinatorPorts {
+    let out_idx = |pid: PortId| {
+        desc.outputs
+            .iter()
+            .position(|p| p.id == pid)
+            .expect("the coordinator #0 bundle declares this output")
+    };
+    let health_ring = &output_rings[id][out_idx(PortId::Component(SystemHealth::FRAME_ID))];
+    let log_ring = &output_rings[id][out_idx(PortId::Component(SystemLog::FRAME_ID))];
+    let health = HealthPort::new(
+        slot_writer::<SystemHealth>(health_ring),
+        slot_writer::<SystemLog>(log_ring),
+    );
+    let status_idx = out_idx(PortId::Component(CoordinatorStatus::FRAME_ID));
+    let status_out = slot_writer::<CoordinatorStatus>(&output_rings[id][status_idx]);
+    // The declared SelfTap over the coordinator's own status output (+1 fan-out
+    // counted at sizing).
+    let status_view = Input::new(
+        output_rings[id][status_idx]
+            .view(NoWake, NoWake)
+            .expect("status self-tap reader (fan-out sized)"),
+    );
+    let seq_registry_out = owned_writer::<SequenceRegistry>(
+        &output_rings[id][out_idx(PortId::Packet(SequenceRegistry::ID))],
+    );
+    let control_out = owned_writer::<SequenceCommand>(
+        &output_rings[id][out_idx(PortId::Packet(SequenceCommand::ID))],
+    );
+    CoordinatorPorts {
+        health,
+        status_out,
+        status_view,
+        seq_registry_out,
+        control_out,
+    }
+}
+
+/// A dlopen'd system binds over **raw** `FswRing` regions, not typed `BoundPort`s:
+/// gather the same per-port rings the coordinator allocated (outputs = this system's
+/// own buffers; inputs = views into the upstream producers' outputs — the
+/// cyclic-consumer path), as `(base, len, role)` handles in `descriptors()` order,
+/// and hand them to a `DlSlot`. Sizing, allocation, validation, and the registry
+/// entry are identical to a static system's.
+fn bind_dl(
+    id: usize,
+    dl: DlReg,
+    desc: &SystemDescriptor,
+    cons_edges: &ConsEdges,
+    output_rings: &[Vec<RingBuffer<BoxBacking>>],
+) -> crate::dl::DlSlot {
+    use crate::abi::{FswRing, ROLE_INPUT, ROLE_OUTPUT};
+    let outputs: Vec<FswRing> = (0..desc.outputs.len())
+        .map(|out_idx| {
+            let (base, len) = output_rings[id][out_idx].region();
+            FswRing {
+                base,
+                len,
+                role: ROLE_OUTPUT,
+            }
+        })
+        .collect();
+    let inputs: Vec<FswRing> = (0..desc.inputs.len())
+        .map(|in_idx| {
+            let (prod_id, out_idx) = cons_edges[&(id, in_idx)][0];
+            let (base, len) = output_rings[prod_id][out_idx].region();
+            FswRing {
+                base,
+                len,
+                role: ROLE_INPUT,
+            }
+        })
+        .collect();
+    // SAFETY: every region named here is a `RingTable`-owned ring that outlives the
+    // slot — the coordinator drops `cyclic` (this slot, whose `Drop` calls
+    // `fsw_destroy`) before `rings`. The `DlSystem` handle drops right after; the
+    // slot keeps its own `Arc<Library>`.
+    unsafe { dl.system.make_slot(&dl.params, inputs, outputs, desc.name) }
+}
+
+/// A runtime slot: gather the same per-port regions as the dl arm, but locate the
+/// runner's tail ports by their declared shape and hand the runner the
+/// control/status writers. No occupant is created here — only `init`/`Load`
+/// (runtime) does.
+fn bind_slot(
+    id: usize,
+    slot_reg: SlotReg,
+    desc: &SystemDescriptor,
+    cons_edges: &ConsEdges,
+    alloc: &RingAlloc,
+) -> SlotRunner {
+    use crate::abi::{FswRing, ROLE_INPUT, ROLE_OUTPUT};
+    let SlotReg {
+        allowed,
+        initial,
+        n_occ_inputs,
+        n_occ_outputs,
+    } = slot_reg;
+    let output_rings = &alloc.output_rings;
+    // The prefix/tail invariant (§2.2): the occupant's ports are the prefix of each
+    // registered list, in the occupant descriptor's own order — so the occupant
+    // `FswRing` arrays are a straight prefix map (Edge inputs view their producers;
+    // the Host `SlotControlIn` input its dedicated ring) and the occupant-side
+    // positional bind contract (the dl ABI) is untouched.
+    let inputs: Vec<FswRing> = (0..n_occ_inputs)
+        .map(|in_idx| {
+            let (base, len) = match desc.inputs[in_idx].conn {
+                PortConn::Edge => {
+                    let (prod_id, out_idx) = cons_edges[&(id, in_idx)][0];
+                    output_rings[prod_id][out_idx].region()
+                }
+                PortConn::Host => alloc.host_input_rings[&(id, in_idx)].region(),
+                PortConn::SelfTap(_) => {
+                    unreachable!("the occupant input prefix holds no self-tap")
+                }
+            };
+            FswRing {
+                base,
+                len,
+                role: ROLE_INPUT,
+            }
+        })
+        .collect();
+    // Occupant outputs = the prefix of the slot's own buffers (user outputs +
+    // SequenceStatus + health + log, in descriptor order).
+    let outputs: Vec<FswRing> = (0..n_occ_outputs)
+        .map(|out_idx| {
+            let (base, len) = output_rings[id][out_idx].region();
+            FswRing {
+                base,
+                len,
+                role: ROLE_OUTPUT,
+            }
+        })
+        .collect();
+
+    // --- The runner's tail ports, located by their declared shape --------------
+    // Host cancel writer over the SlotControlIn input's dedicated ring.
+    let control_in_idx = desc.inputs[..n_occ_inputs]
+        .iter()
+        .position(|p| p.conn == PortConn::Host)
+        .expect("a slot declares its Host SlotControlIn input");
+    let control = slot_writer::<SlotControlIn>(&alloc.host_input_rings[&(id, control_in_idx)]);
+    // The slot's command fan-in: one view per producer explicitly edged into the
+    // declared `commands` input (A2 — no type-keyed broadcast; zero edges is a
+    // legal, command-less slot). The `SlotRunner` drains + filters by its instance
+    // name each step.
+    let cmd_in_idx = desc
+        .inputs
+        .iter()
+        .position(|p| p.conn == PortConn::Edge && p.id == PortId::Packet(SequenceCommand::ID))
+        .expect("a slot's registered descriptor declares its commands input");
+    let commands = MsgIn::from_views(
+        cons_edges
+            .get(&(id, cmd_in_idx))
+            .map(|producers| {
+                producers
+                    .iter()
+                    .map(|&(prod_id, out_idx)| {
+                        output_rings[prod_id][out_idx]
+                            .view(NoWake, NoWake)
+                            .expect("command reader slot (edge fan-out sized)")
+                    })
+                    .collect()
+            })
+            .unwrap_or_default(),
+    );
+    // The declared self-tap over the occupant's own SequenceStatus output (+1
+    // fan-out counted at sizing) — Progress + outcome.
+    let seq_tap = desc
+        .inputs
+        .iter()
+        .find_map(|p| match p.conn {
+            PortConn::SelfTap(pid) => Some(pid),
+            _ => None,
+        })
+        .expect("a slot declares its SequenceStatus self-tap");
+    let seq_out_idx = desc
+        .outputs
+        .iter()
+        .position(|o| o.id == seq_tap)
+        .expect("a SelfTap names one of the slot's own outputs");
+    let seq_status = Input::new(
+        output_rings[id][seq_out_idx]
+            .view(NoWake, NoWake)
+            .expect("SequenceStatus self-tap reader (fan-out sized)"),
+    );
+    // Host writers over the runner's declared output tail: SlotStatus + the
+    // "sequences" events channel (real output indices — no off-by-the-end
+    // BufferRole, no side allocation).
+    let status_out_idx = desc
+        .outputs
+        .iter()
+        .position(|o| o.id == PortId::Component(SlotStatus::FRAME_ID))
+        .expect("a slot declares its Host SlotStatus output");
+    let status_out = slot_writer::<SlotStatus>(&output_rings[id][status_out_idx]);
+    let events_out_idx = desc
+        .outputs
+        .iter()
+        .position(|o| o.id == PortId::Packet(SequenceChannelEvent::ID))
+        .expect("a slot declares its Host events output");
+    let events = owned_writer::<SequenceChannelEvent>(&output_rings[id][events_out_idx]);
+
+    SlotRunner::new(
+        desc.name,
+        allowed,
+        initial,
+        inputs,
+        outputs,
+        control,
+        status_out,
+        events,
+        seq_status,
+        commands,
+    )
 }
 
 /// Find any directed cycle in the system graph (over the non-delayed edges),
@@ -1945,10 +2084,10 @@ fn find_cycle(adj: &[Vec<usize>]) -> Option<Vec<usize>> {
     }
 
     for s in 0..n {
-        if color[s] == WHITE {
-            if let Some(c) = dfs(s, adj, &mut color, &mut stack) {
-                return Some(c);
-            }
+        if color[s] == WHITE
+            && let Some(c) = dfs(s, adj, &mut color, &mut stack)
+        {
+            return Some(c);
         }
     }
     None
@@ -2078,6 +2217,9 @@ pub struct Coordinator {
     status_out: Output<CoordinatorStatus>,
     status_view: Input<CoordinatorStatus>,
     stopped: Vec<StoppedSystem>,
+    /// Scratch for `update_status`'s per-cycle scan, swapped with `stopped` on a
+    /// change — no per-cycle allocation in the hot loop (S5).
+    stopped_scratch: Vec<StoppedSystem>,
     cycle: u64,
     /// A shared, lock-free mirror of `cycle` that an out-of-loop observer (e.g. the CLI
     /// runner's heartbeat) can read while `run_for` holds `&mut self` — published each
@@ -2329,26 +2471,27 @@ impl Coordinator {
     }
 
     /// Scan the slots; when the stopped set changes, refresh the status frame and
-    /// log the change to coordinator health.
+    /// log the change to coordinator health. The scan fills a retained scratch and
+    /// swaps it with `stopped` on a change — no per-cycle allocation (S5).
     fn update_status(&mut self, now: Timestamp) {
-        let mut cur: Vec<StoppedSystem> = Vec::new();
+        self.stopped_scratch.clear();
         for slot in &self.cyclic {
             // Only a lapped/panicked stop is an error-stop; a runtime slot's
             // Empty/Loaded/Done states are not (the `stop_reason` projection).
             if let Some(reason) = slot.state().stop_reason() {
-                cur.push(StoppedSystem {
+                self.stopped_scratch.push(StoppedSystem {
                     name: slot.name(),
                     reason,
                 });
             }
         }
-        if !stopped_set_changed(&cur, &self.stopped) {
+        if !stopped_set_changed(&self.stopped_scratch, &self.stopped) {
             return;
         }
-        self.stopped = cur;
+        core::mem::swap(&mut self.stopped, &mut self.stopped_scratch);
         self.publish_status(now);
-        let names: Vec<&'static str> = self.stopped.iter().map(|s| s.name).collect();
-        for name in names {
+        for i in 0..self.stopped.len() {
+            let name = self.stopped[i].name;
             self.coord_health.error("system_stopped");
             self.coord_health.log(Level::Warn, name);
         }
@@ -2356,26 +2499,24 @@ impl Coordinator {
     }
 
     fn publish_status(&mut self, now: Timestamp) {
-        let entries: Vec<(u8, &'static str)> = self
-            .stopped
-            .iter()
-            .map(|s| (s.reason.code(), s.name))
-            .collect();
         let frame = CoordinatorStatus {
             timestamp: now,
             cycle: self.cycle,
-            stopped_count: entries.len() as u64,
+            stopped_count: self.stopped.len() as u64,
             stopped: FrameList::EMPTY,
         };
+        // Split borrows: the writer takes `status_out`, the closure reads `stopped`
+        // — no intermediate entries Vec (S5).
+        let stopped = &self.stopped;
         let _ = self.status_out.write_with(&frame, |fw| {
             fw.list(offset_of!(CoordinatorStatus, stopped), |l| {
-                for (reason, name) in &entries {
-                    let (buf, len) = pack_name(name);
+                for sys in stopped {
+                    let (name, len) = pack_name(sys.name);
                     l.push(StoppedEntry {
-                        reason: *reason,
+                        reason: sys.reason.code(),
                         len,
                         _pad: [0; 6],
-                        name: buf,
+                        name,
                     });
                 }
             });

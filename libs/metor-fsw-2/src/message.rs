@@ -74,11 +74,8 @@ pub(crate) const LOG_DEPTH: usize = 64;
 /// [`Msg::ID`]; the rest is the postcard payload. `None` if the record is too short to
 /// carry an id.
 pub fn split_record(rec: &[u8]) -> Option<(PacketId, &[u8])> {
-    if rec.len() < 2 {
-        return None;
-    }
-    let id = [rec[0], rec[1]];
-    Some((id, &rec[2..]))
+    let (id, payload) = rec.split_first_chunk::<2>()?;
+    Some((*id, payload))
 }
 
 // ---------------------------------------------------------------------------

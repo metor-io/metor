@@ -200,6 +200,7 @@ fn dlopen_cyclic_system_end_to_end() {
         clock: ClockMode::Simulated {
             dt: std::time::Duration::from_millis(5),
         },
+        ..CoordinatorConfig::default()
     });
     let ticker = b.add_cyclic_named("ticker", Ticker { n: 0 });
     let counter = b.add_dl_cyclic("dl_counter", loaded, params);
@@ -288,6 +289,7 @@ fn dlopen_null_create_reports_stopped() {
         clock: ClockMode::Simulated {
             dt: std::time::Duration::from_millis(5),
         },
+        ..CoordinatorConfig::default()
     });
     let ticker = b.add_cyclic_named("ticker", Ticker { n: 0 });
     let counter = b.add_dl_cyclic("dl_counter", loaded, bad_params);
