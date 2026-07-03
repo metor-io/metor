@@ -137,8 +137,11 @@ The input and output bundles are plain structs of typed ports, derived with
 exactly one of two leaf traits expressing how the system is driven:
 
 - **`CyclicSystem`** is coordinator-driven. The coordinator calls
-  `execute(now, input, output)` once per cycle. Its inputs are read-only views straight into
-  the upstream producers' output buffers.
+  `execute(now, input, output)` once per cycle. `input` is `&mut Self::Input`, not `&`: each
+  port wraps a ring `View` whose read (`latest`/`drain`) advances a cursor and fills a reused
+  scratch buffer, so consuming it is a mutating operation even though the *data* it exposes is a
+  read-only view straight into the upstream producer's output buffer — the system cannot write
+  through it, only advance past it.
 - **`AsyncSystem`** owns its own loop. The coordinator spawns `run(input, output)` once and
   never ticks it; the system paces itself on a timer or by awaiting its inputs. Its inputs
   read from private buffers the coordinator copies into (see below).
@@ -278,8 +281,10 @@ accident of registration order. An unbroken cycle is rejected at `build()` as a
 
 A mission's graph is described by the `Wiring` data model (`src/wiring/model.rs`): a plain,
 serde-serializable Rust description of the coordinator config, the loadable artifacts, the
-system instances, the edges, and the optional telemetry downlink. `Wiring` is the single
-source of truth, and it has two equivalent front-ends:
+system instances, the edges (frame and message), the optional telemetry downlink, the
+runtime-loadable slots (`docs/sequences-slots.md`), and the optional command uplink
+(`docs/messages.md` §4.4). `Wiring` is the single source of truth, and it has two equivalent
+front-ends:
 
 - A **KDL document**, deserialized by `parse` — a text format for declaring systems, their
   params, and their connections.
@@ -371,36 +376,77 @@ with a shared-memory queue a natural future alternative. The bytes on the wire a
 either way, and a consumer needs only the announced VTables to parse them. See
 `docs/telemetry.md`.
 
-## The output registry
+## The registry
 
-Underneath the downlink is a general capability: the `OutputRegistry` (`src/registry.rs`), a
-queryable index over every tappable output buffer in the graph, keyed by each buffer's
-instance-qualified id `ComponentId::new("<instance>.<frame>")`. The telemetry downlink is its
+Underneath the downlink is a general capability: the `Registry` (`src/registry.rs`), a
+queryable index over every tappable buffer in the graph — component frames *and* message
+channels alike, one keyspace (`EntrySchema::{Table, Postcard}`) — keyed by each buffer's
+instance-qualified id `ComponentId::new("<instance>.<name>")`. The telemetry downlink is its
 first consumer, but it is general — any broad or dynamic reader (a logger, a recorder, a
 debugger, a test) reaches outputs the same way. The registry never exposes a raw buffer, only
 a `view()` factory, so every reader is slot-accounted against the buffer's build-time
-`max_readers` budget. The coordinator sizes that budget to include each known registry
-consumer, so an `All`-mode downlink always has a reader slot on every buffer.
+`max_readers` budget. A system declares broad access with an `AllOutputs` field in its output
+bundle — a bind-time `Capability`, not a wired port — and the coordinator self-derives the
+reader-slot budget by counting `ReceiveAll` capabilities across every registered system, so an
+`All`-mode downlink always has a reader slot on every buffer with no manual bookkeeping.
 
 ## Messages, the uplink, and the command plane
 
 Beside the fixed-frame data path is a second payload kind: **messages** — self-describing
-`(PacketId, postcard)` records carried on byte rings, indexed by a parallel `MessageRegistry`,
-and tapped by telemetry just like outputs. Messages carry variable-length `serde` types (the
-panel's sequence registry and per-channel events) that do not fit the `#[repr(C)]` frame mold.
+`(PacketId, postcard)` records carried on byte rings, indexed by the same `Registry` as
+component frames (one keyspace for both, `EntrySchema::{Table, Postcard}`, `src/registry.rs`).
+Messages carry variable-length `serde` types (the panel's sequence registry, per-channel events,
+and commands) that do not fit the `#[repr(C)]` frame mold.
 
-The framework closes the operator loop in **both** directions over messages. The **downlink**
-taps every message channel and streams each record off-board (the message twin of the output
-tap). The **uplink** is its read twin: an ordinary `AsyncSystem` (`UplinkSystem`) that owns its
-own connection, receives panel-published `SequenceCommand` messages, and re-emits them onto a
-reserved **`"commands"`** message channel. The coordinator runs a generic **command bus**: at the
-head of each cycle it drains every `"commands"` channel from the `MessageRegistry` (plus one
-coordinator-owned channel backing an in-process `control_handle()`), decodes each `SequenceCommand`,
-and dispatches it to the addressed runtime slot by `channel_id` — before stepping the slots, so a
-command lands the same cycle it arrives. The coordinator is command-generic: it knows nothing of
-sequences, only how to drain a command bus and dispatch. Uplink and downlink use **separate
-connections**: a connection is an owned resource the system/ring model cannot distribute the way it
-hands out ring views, so sharing one socket across two systems is deferred. See `docs/messages.md`.
+Messages have **full wiring parity with frames**: a system declares typed `MsgOut<M>` / `MsgIn<M>`
+ports in its bundles alongside `Output<F>` / `Input<F>`, and a message connection is an ordinary
+edge keyed on the message type's `PacketId` — `msg="Type"` in KDL, one node with the frame/message
+kind inferred from whether `frame=` or `msg=` is present (the same `connect` node either way). At
+the low level `CoordinatorBuilder::connect`/`connect_delayed` take a `PortRef` whose `PortId` is
+either `Component` (a frame) or `Packet` (a message), so kind is inferred there too; the higher-level
+`WiringBuilder` keeps `connect_msg` as ergonomic sugar over the same `EdgeSpec { kind: EdgeKind::Msg,
+.. }` a `connect`-with-`msg=` KDL node produces (`src/wiring/builder.rs`). Unlike frame edges,
+message edges are **many-to-many** (fan-in and fan-out) and are excluded from feedback-cycle
+detection, because a message channel is a decoupled event/command bus, not a same-cycle data
+dependency. A broad reader that wants *every telemetered* output declares a single `AllOutputs`
+receive-all capability (frames **and** messages, `Capability::ReceiveAll` — it reserves no ring and
+is not itself a port); the telemetry downlink is its first consumer, and the coordinator sizes every
+ring's reader budget by counting these. See `docs/message-wiring.md`.
+
+The framework closes the operator loop in **both** directions. The **downlink** taps every
+telemetered message channel and streams each record off-board (the message twin of the output tap).
+The **uplink** is its read twin: an ordinary `AsyncSystem` (`UplinkSystem`) that owns its own
+connection, receives panel-published Msgs, and routes each by `PacketId` to whichever of its
+declared `CommandOut<M>` outputs matches (multi-output `RouteMsg` dispatch — a Msg matching no
+declared output bumps an `uplink.unroutable` health counter) — a **fully normal message producer**,
+subscribing on the ground to exactly the message ids of its declared outputs. `CommandOut<M>` is not
+a distinct type: it is `pub type CommandOut<M, ...> = MsgOut<M, ...>` sugar the `SystemOutput` derive
+recognizes and lowers to an `.untelemetered()` `PortDesc` (`src/message.rs`), so inbound control is
+never echoed back out the downlink. Commands reach the runtime slots with **no coordinator-side
+command stage**: each slot declares a `commands: MsgIn<SequenceCommand>` fan-in port wired by
+**explicit edges** — every command producer that should reach a given slot is connected to it by
+name in KDL, and a KDL `uplink { transport "tcp" addr="…" }` node declares the uplink itself
+(closing the earlier Rust-builder-only gap — the uplink has full KDL parity with every other
+system):
+
+```kdl
+uplink { transport "tcp" addr="127.0.0.1:2241" }
+connect "uplink"      -> "mode" msg="SequenceCommand"   // ground commands
+connect "coordinator" -> "mode" msg="SequenceCommand"   // in-proc control_handle()
+```
+
+there is no implicit broadcast sugar. At the head of its own step
+each slot drains its fan-in and applies the commands addressed to it, filtering by the command's
+`channel: String` against its own instance **name** (`SequenceCommand`/`SequenceChannelEvent` are
+name-addressed on the wire — the earlier numeric `ChannelId`/`channel_id` build-order index is
+gone). The coordinator itself is registered as system #0 under the reserved instance name
+`"coordinator"` (`docs/design-command-slots.md` §2.6): `control_handle()` returns a take-once
+`Option<MsgOut<SequenceCommand>>` over that bundle's own `commands` output, so the in-proc control
+path is wired exactly like the uplink's — `connect "coordinator" -> "<slot>" msg="SequenceCommand"`
+is an ordinary edge, not a special case. Uplink and downlink use **separate connections**: a
+connection is an owned resource the system/ring model cannot split into cheap handles the way it
+distributes ring views, so sharing one socket across two systems is deferred. See `docs/messages.md`
+and `docs/message-wiring.md`.
 
 ## Limitations and future work
 
@@ -436,9 +482,10 @@ of each subsystem:
 - `docs/coordinator.md` — the builder, graph validation, scheduling, clocks, and lifecycle.
 - `docs/wiring.md` — the `Wiring` data model, the KDL front-end, and the Rust builder.
 - `docs/dl-open.md` — the `cdylib` C-ABI, the loader, and schema-guided params.
-- `docs/telemetry.md` — the output registry and the telemetry downlink.
+- `docs/telemetry.md` — the registry (frames and messages, one keyspace) and the telemetry downlink.
 - `docs/cli-runner.md` — the `metor-fsw` CLI: loading a wiring, packaging a bundle, and running a mission.
 - `docs/sequences-slots.md` — runtime-loadable slots and the `#[sequence]` author surface.
 - `docs/messages.md` — the message channel (a second payload kind), the telemetry uplink/downlink of messages, and the `SequenceCommand` command plane.
+- `docs/message-wiring.md` — messages as first-class wired ports/edges (`MsgOut<M>`/`MsgIn<M>`, `msg=`/`connect_msg`), the `AllOutputs` receive-all capability, and the port-unification axes (schema × delivery × fan-in × on-lap, plus the `PortConn` axis). The command-plane shape it originally designed is further reframed — see `docs/messages.md`'s status banner and `docs/design-command-slots.md` for what actually shipped (name-addressed commands, explicit per-slot edges, the uplink's multi-output `CommandOut` dispatch).
 </content>
 </invoke>
