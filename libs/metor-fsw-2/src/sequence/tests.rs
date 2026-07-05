@@ -113,7 +113,6 @@ async fn demo<B: Backing>(att: Input<SystemHealth, B>, mut out: Output<SystemHea
         timestamp: Timestamp(0),
         cycles: 0,
         errors: 0,
-        lapped_inputs: 0,
         last_execute_micros: 0,
         error_counts: crate::FrameMap::EMPTY,
     });

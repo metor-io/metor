@@ -2,22 +2,17 @@
 //!
 //! A system's input/output bundle is a named struct of `Input<F>` / `Output<F>` /
 //! `MsgIn<M>` / `MsgOut<M>` ports (plus capability fields like `AllOutputs`).
-//! These derives generate the static `decls()` (and, for inputs, `any_lapped()`;
-//! for outputs, `take_dropped()`) by delegating to each field type's own
-//! `decl()`/`lap_fault()`/`take_dropped()` — so the macro never has to parse `F`
-//! out of the field type, and a capability field rides the same walk (its
-//! `decl()` is a `PortDecl::Capability`; its `bind` consumes no ring).
+//! These derives generate the static `decls()` (and, for outputs,
+//! `take_dropped()`) by delegating to each field type's own
+//! `decl()`/`take_dropped()` — so the macro never has to parse `F` out of the
+//! field type, and a capability field rides the same walk (its `decl()` is a
+//! `PortDecl::Capability`; its `bind` consumes no ring).
 //!
 //! ## `#[fsw(...)]` field attributes
-//!
-//! Axis overrides lower onto **both** generated fns (descriptor + bind), so the
-//! static shape and the runtime port can never disagree:
 //!
 //! - `#[fsw(telemetered = false)]` (outputs) — the downlink / `AllOutputs` opt-out
 //!   (A6); lowers to `.untelemetered()` on the descriptor. The `CommandOut<M>` type
 //!   token is recognized as sugar for exactly this on a `MsgOut<M>`.
-//! - `#[fsw(on_lap = "stop" | "resync")]` (inputs) — the lap policy (axis 4);
-//!   lowers to `.with_on_lap(..)` on the descriptor *and* the bound port.
 //!
 //! A `PhantomData` field is skipped everywhere (and default-constructed by `bind`):
 //! `#[system]`'s generated bundles carry one to anchor the `__B: Backing` param when
@@ -32,7 +27,7 @@ use quote::quote;
 use syn::{DeriveInput, Generics, Ident};
 
 /// Which derive is running — the two directions accept different `#[fsw(...)]`
-/// keys (`telemetered` is output-only, `on_lap` input-only).
+/// keys (`telemetered` is output-only).
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Dir {
     Input,
@@ -47,9 +42,6 @@ struct BundleField {
     /// `#[fsw(telemetered = false)]` — output-only downlink opt-out (A6).
     #[darling(default)]
     telemetered: Option<bool>,
-    /// `#[fsw(on_lap = "stop" | "resync")]` — input-only lap policy (axis 4).
-    #[darling(default)]
-    on_lap: Option<syn::LitStr>,
 }
 
 impl BundleField {
@@ -64,22 +56,6 @@ impl BundleField {
         crate::sig::type_head(&self.ty).is_some_and(|h| h == "CommandOut")
     }
 
-    /// The parsed `on_lap` policy variant ident (`Stop`/`Resync`), or an error on an
-    /// unknown value.
-    fn on_lap_variant(&self) -> Result<Option<Ident>, syn::Error> {
-        let Some(lit) = &self.on_lap else {
-            return Ok(None);
-        };
-        match lit.value().as_str() {
-            "stop" => Ok(Some(Ident::new("Stop", lit.span()))),
-            "resync" => Ok(Some(Ident::new("Resync", lit.span()))),
-            other => Err(syn::Error::new(
-                lit.span(),
-                format!(r#"unknown on_lap policy `{other}`; expected "stop" or "resync""#),
-            )),
-        }
-    }
-
     /// Validate the attributes against the derive direction.
     fn validate(&self, dir: Dir) -> Result<(), syn::Error> {
         if dir == Dir::Input && self.telemetered.is_some() {
@@ -89,14 +65,7 @@ impl BundleField {
                  (an input is never downlinked)",
             ));
         }
-        if dir == Dir::Output && self.on_lap.is_some() {
-            return Err(syn::Error::new_spanned(
-                &self.ty,
-                "`#[fsw(on_lap = ..)]` applies to input ports only \
-                 (the lap policy is a reader concern)",
-            ));
-        }
-        self.on_lap_variant().map(|_| ())
+        Ok(())
     }
 }
 
@@ -142,15 +111,12 @@ impl Bundle {
 /// capability like `AllOutputs`), in field order, with the `#[fsw(...)]` axis
 /// overrides (and the `CommandOut` sugar) chained on. The overrides are
 /// `PortDecl`-level so the walk stays type-blind; they only touch `Port` decls.
-fn decls_body(bundle: &Bundle, fsw2: &TokenStream2) -> TokenStream2 {
+fn decls_body(bundle: &Bundle, _fsw2: &TokenStream2) -> TokenStream2 {
     let calls = bundle.ports().into_iter().map(|f| {
         let ty = &f.ty;
         let mut decl = quote! { <#ty>::decl() };
         if f.is_command_out() || f.telemetered == Some(false) {
             decl = quote! { #decl.untelemetered() };
-        }
-        if let Ok(Some(v)) = f.on_lap_variant() {
-            decl = quote! { #decl.with_on_lap(#fsw2::OnLap::#v) };
         }
         quote! { decls.push(#decl); }
     });
@@ -163,10 +129,9 @@ fn decls_body(bundle: &Bundle, fsw2: &TokenStream2) -> TokenStream2 {
 
 /// Emits the `BindPorts::bind` body: each port type's `bind(src)`, in field order —
 /// symmetric to `decls()`, so the ring source's positional cursor lines each
-/// port up with the ring the coordinator reserved for it. An `on_lap` override is
-/// chained onto the bound port too (descriptor and runtime can never disagree).
-/// `PhantomData` anchors are default-constructed (they consume no ring).
-fn bind_body(bundle: &Bundle, fsw2: &TokenStream2) -> TokenStream2 {
+/// port up with the ring the coordinator reserved for it. `PhantomData` anchors
+/// are default-constructed (they consume no ring).
+fn bind_body(bundle: &Bundle, _fsw2: &TokenStream2) -> TokenStream2 {
     let fields = bundle.data.as_ref().take_struct().expect("named struct");
     let binds = fields.iter().map(|f| {
         let id = f.ident.as_ref().expect("named field");
@@ -174,11 +139,7 @@ fn bind_body(bundle: &Bundle, fsw2: &TokenStream2) -> TokenStream2 {
         if f.is_phantom() {
             quote! { #id: ::core::marker::PhantomData }
         } else {
-            let mut bind = quote! { <#ty>::bind(src) };
-            if let Ok(Some(v)) = f.on_lap_variant() {
-                bind = quote! { #bind.with_on_lap(#fsw2::OnLap::#v) };
-            }
-            quote! { #id: #bind }
+            quote! { #id: <#ty>::bind(src) }
         }
     });
     quote! {
@@ -246,13 +207,6 @@ fn expand_input(parsed: DeriveInput) -> TokenStream2 {
     let stripped = strip_defaults(&bundle.generics);
     let (impl_generics, ty_generics, where_clause) = stripped.split_for_impl();
     let decls = decls_body(&bundle, &fsw2);
-
-    // any_lapped: OR every input port's policy-derived `lap_fault()` (A5).
-    let lapped = bundle.ports().into_iter().map(|f| {
-        let id = f.ident.as_ref().expect("named field");
-        quote! { || self.#id.lap_fault() }
-    });
-
     let bind = bind_body(&bundle, &fsw2);
     let bind_ports = bind_ports_impl(&bundle, &fsw2, &bind);
 
@@ -260,9 +214,6 @@ fn expand_input(parsed: DeriveInput) -> TokenStream2 {
         impl #impl_generics #fsw2::SystemInput for #ident #ty_generics #where_clause {
             fn decls() -> ::std::vec::Vec<#fsw2::PortDecl> {
                 #decls
-            }
-            fn any_lapped(&self) -> bool {
-                false #(#lapped)*
             }
         }
 
@@ -338,30 +289,20 @@ mod tests {
         prettyplease::unparse(&file)
     }
 
-    /// `#[fsw(on_lap = "…")]` lowers onto BOTH generated fns — the descriptor and
-    /// the bound port — so the static shape and the runtime policy cannot disagree.
+    /// The input derive delegates every field to its type's `decl()`/`bind(src)`,
+    /// in field order.
     #[test]
-    fn on_lap_lowers_onto_descriptor_and_bind() {
+    fn input_delegates_decl_and_bind() {
         let out = input_ok(quote! {
             struct GuardIn {
-                #[fsw(on_lap = "stop")]
                 cmds: MsgIn<GuardCmd>,
                 imu: Input<Imu>,
             }
         });
-        assert!(
-            out.contains("<MsgIn<GuardCmd>>::decl().with_on_lap(metor_fsw_2::OnLap::Stop)"),
-            "{out}"
-        );
-        assert!(
-            out.contains("<MsgIn<GuardCmd>>::bind(src).with_on_lap(metor_fsw_2::OnLap::Stop)"),
-            "{out}"
-        );
-        // The unattributed field expands exactly as before (no chained override).
+        assert!(out.contains("decls.push(<MsgIn<GuardCmd>>::decl());"), "{out}");
         assert!(out.contains("decls.push(<Input<Imu>>::decl());"), "{out}");
+        assert!(out.contains("cmds: <MsgIn<GuardCmd>>::bind(src)"), "{out}");
         assert!(out.contains("imu: <Input<Imu>>::bind(src)"), "{out}");
-        // any_lapped ORs the policy-derived lap_fault (A5).
-        assert!(out.contains("false || self.cmds.lap_fault() || self.imu.lap_fault()"), "{out}");
     }
 
     /// `#[fsw(telemetered = false)]` and the `CommandOut` type token both lower to
@@ -388,8 +329,8 @@ mod tests {
         assert!(!out.contains("bind(src).untelemetered"), "{out}");
     }
 
-    /// Direction misuse and a bad `on_lap` value are compile errors, not silent
-    /// no-ops; an unknown `#[fsw(...)]` key errs via darling.
+    /// Direction misuse is a compile error, not a silent no-op; an unknown
+    /// `#[fsw(...)]` key errs via darling.
     #[test]
     fn attribute_errors() {
         let err = |dir_input: bool, item: TokenStream2| -> String {
@@ -407,18 +348,6 @@ mod tests {
             struct A { #[fsw(telemetered = false)] x: MsgIn<M> }
         });
         assert!(out.contains("applies to output ports only"), "{out}");
-
-        // on_lap on an output.
-        let out = err(false, quote! {
-            struct A { #[fsw(on_lap = "stop")] x: MsgOut<M> }
-        });
-        assert!(out.contains("applies to input ports only"), "{out}");
-
-        // Unknown policy value.
-        let out = err(true, quote! {
-            struct A { #[fsw(on_lap = "panic")] x: MsgIn<M> }
-        });
-        assert!(out.contains("unknown on_lap policy"), "{out}");
 
         // Unknown key (darling), surfaced as a compile error — never a macro panic.
         let out = err(false, quote! {

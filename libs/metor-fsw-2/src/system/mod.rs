@@ -13,9 +13,9 @@ use metor_fsw_ring::{Backing, BoxBacking, NoWake, WakeSink, WakeSource};
 use metor_proto::types::Timestamp;
 
 use crate::binder::{BindPorts, RingSource};
-use crate::coordinator::{CyclicSlot, SlotState, StopReason};
+use crate::coordinator::{CyclicSlot, SlotState};
 use crate::descriptor::{PortDecl, PortDesc, SystemDescriptor, SystemKind, split_decls};
-use crate::health::{HealthPort, Level, SystemHealth, SystemLog};
+use crate::health::{HealthPort, SystemHealth, SystemLog};
 use crate::port::Output;
 
 // ---------------------------------------------------------------------------
@@ -23,8 +23,7 @@ use crate::port::Output;
 // ---------------------------------------------------------------------------
 
 /// A system's input bundle: a struct of [`Input<F>`](crate::Input) ports. Derive
-/// with `#[derive(SystemInput)]` to generate `decls`/`any_lapped` from the port
-/// fields.
+/// with `#[derive(SystemInput)]` to generate `decls` from the port fields.
 pub trait SystemInput {
     /// What every field contributes (system.md §5), in field order: the required
     /// producer shape of each wired port, or a bind-time [`Capability`]. Read
@@ -36,11 +35,6 @@ pub trait SystemInput {
     fn port_descs() -> Vec<PortDesc> {
         Self::decls().into_iter().filter_map(PortDecl::into_port).collect()
     }
-
-    /// Whether any input port is in lap fault (a lap observed on a port whose
-    /// policy is [`OnLap::Stop`](crate::OnLap)). The coordinator checks this on
-    /// cyclic systems before `execute` (system.md §3.1).
-    fn any_lapped(&self) -> bool;
 }
 
 /// A system's output bundle: a struct of [`Output<F>`](crate::Output) ports. Derive
@@ -227,8 +221,8 @@ pub trait System<B: Backing = BoxBacking> {
 }
 
 /// A coordinator-driven system: the coordinator calls [`execute`](Self::execute)
-/// once per cycle. Inputs are views straight into upstream output buffers; a lapped
-/// input is a hard error the coordinator acts on (system.md §3.1).
+/// once per cycle. Inputs are views straight into upstream output buffers; a slow
+/// consumer backpressures its producers rather than losing data (system.md §3.1).
 pub trait CyclicSystem<B: Backing = BoxBacking>: System<B> {
     /// One unit of work: read the latest inputs, write outputs. Reports trouble
     /// through `output.health()`, never a return value.
@@ -239,8 +233,8 @@ pub trait CyclicSystem<B: Backing = BoxBacking>: System<B> {
     /// `Timestamp::now()` independently.
     ///
     /// `input` is `&mut` (not `&`, deviating from system.md §1.1): draining a ring
-    /// `View` advances its cursor and fills the port's reused scratch, exactly the
-    /// `&mut self` reason the doc's own §2.3 `Input::latest` takes.
+    /// `View` advances its cursor, exactly the `&mut self` reason the doc's own
+    /// §2.3 `Input::latest` takes.
     fn execute(&mut self, now: Timestamp, input: &mut Self::Input, output: &mut Self::Output);
 
     /// This system's self-description for wiring (system.md §5): the wired ports
@@ -290,9 +284,9 @@ pub trait AsyncSystem<B: Backing = BoxBacking>: System<B> {
 // Cyclic driver (the framework wrapper that maintains the standard counters)
 // ---------------------------------------------------------------------------
 
-/// Drives a [`CyclicSystem`] and maintains the four standard health counters
-/// around each `execute` (system.md §4): a lapped input bumps `lapped_inputs`,
-/// the execute duration is timed, and a health record is published per cycle.
+/// Drives a [`CyclicSystem`] and maintains the standard health counters around
+/// each `execute` (system.md §4): the execute duration is timed and a health
+/// record is published per cycle.
 ///
 /// It owns the bundles between cycles, on behalf of the coordinator that drives it.
 pub struct CyclicRunner<S, O, B = BoxBacking>
@@ -330,44 +324,20 @@ where
     }
 
     /// Run one cycle (coordinator.md §3.3/§3.4). If already stopped, do nothing.
-    /// If an input has lapped, telemeter and permanently stop: charge the lapped
-    /// input, log an error, publish a final health record, and flip to `Stopped`.
     /// Otherwise time `execute` and publish health. `now` is threaded from the
     /// cycle loop so every system in a cycle shares one timestamp.
     pub fn step(&mut self, now: Timestamp) {
         if self.state.is_stopped() {
             return;
         }
-        if self.input.any_lapped() {
-            let h = self.output.health();
-            h.record_lapped();
-            h.log(Level::Error, "input lapped; system permanently stopped");
-            h.end_cycle(now, 0);
-            self.state = SlotState::Stopped {
-                reason: StopReason::LappedInput,
-            };
-            return;
-        }
         let start = std::time::Instant::now();
         self.system.execute(now, &mut self.input, &mut self.output);
         let micros = start.elapsed().as_micros() as u64;
         // E6: fold the ports' publish-drop counters into health — a nonzero sum is a
-        // ring-sizing bug the system itself could not report (publish is infallible).
+        // ring-sizing bug or a backpressuring reader the system itself could not
+        // report (publish is infallible).
         if self.output.take_dropped() > 0 {
             self.output.health().error("publish_dropped");
-        }
-        // E3: a lap *during* execute (an async producer racing the drain — latched by
-        // `Input::latest`'s resync) is charged the same cycle, mirroring the
-        // pre-execute check above.
-        if self.input.any_lapped() {
-            let h = self.output.health();
-            h.record_lapped();
-            h.log(Level::Error, "input lapped; system permanently stopped");
-            h.end_cycle(now, micros);
-            self.state = SlotState::Stopped {
-                reason: StopReason::LappedInput,
-            };
-            return;
         }
         self.output.health().end_cycle(now, micros);
     }

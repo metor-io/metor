@@ -1,12 +1,12 @@
 //! System acceptance tests (system.md "Tests"): the cyclic & async system paths, the
 //! self-descriptor + compatibility check, the standard health counters, and the
-//! cyclic lapped-input semantics. Ports are built by hand, without a coordinator.
+//! lossless backpressure semantics. Ports are built by hand, without a coordinator.
 
 use core::mem::offset_of;
 use std::collections::HashMap;
 
 use metor_fsw::Decomponentize;
-use metor_fsw_ring::{BoxBacking, Config, NoWake, Notifier, Overrun, RingBuffer};
+use metor_fsw_ring::{BoxBacking, Config, NoWake, Notifier, RingBuffer, WriteError};
 use metor_proto::types::{ComponentId, ComponentView, Timestamp};
 use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
 
@@ -68,11 +68,10 @@ impl Decomponentize for RecSink {
     }
 }
 
-fn overwrite_ring<F: crate::Frame>(depth: usize, readers: usize) -> RingBuffer<BoxBacking> {
+fn ring_for<F: crate::Frame>(depth: usize, readers: usize) -> RingBuffer<BoxBacking> {
     RingBuffer::create_in_memory(Config {
         capacity: buffer_capacity::<F>(depth),
         max_readers: readers,
-        overrun: Overrun::Overwrite,
     })
 }
 
@@ -143,10 +142,10 @@ impl CyclicSystem for Filter {
 
 #[test]
 fn cyclic_filter_end_to_end() {
-    let imu_ring = overwrite_ring::<Imu>(8, 2);
-    let nav_ring = overwrite_ring::<NavEstimate>(8, 2);
-    let health_ring = overwrite_ring::<SystemHealth>(8, 1);
-    let log_ring = overwrite_ring::<SystemLog>(8, 1);
+    let imu_ring = ring_for::<Imu>(8, 2);
+    let nav_ring = ring_for::<NavEstimate>(8, 2);
+    let health_ring = ring_for::<SystemHealth>(8, 1);
+    let log_ring = ring_for::<SystemLog>(8, 1);
 
     // Upstream producer + downstream consumer, both built by hand.
     let mut imu_w = Output::<Imu>::new(imu_ring.writer(NoWake, NoWake).unwrap());
@@ -190,35 +189,56 @@ fn cyclic_filter_end_to_end() {
 }
 
 // ---------------------------------------------------------------------------
-// is_lapped: a lapped cyclic input is observable (the stop policy lives in the coordinator).
+// Backpressure: an idle reader is never overwritten — the writer blocks instead —
+// and `latest()` frees older records while pinning (protecting) the newest.
 // ---------------------------------------------------------------------------
 
 #[test]
-fn cyclic_input_lap_is_observable() {
-    let imu_ring = overwrite_ring::<Imu>(2, 1);
-    let input = FilterIn {
+fn idle_input_backpressures_writer_and_latest_frees() {
+    let imu_ring = ring_for::<Imu>(2, 1);
+    let mut input = FilterIn {
         imu: Input::new(imu_ring.view(NoWake, NoWake).unwrap()),
     };
-    let mut w = imu_ring.writer(NoWake, NoWake).unwrap();
+    let mut w = Output::<Imu>::new(imu_ring.writer(NoWake, NoWake).unwrap());
+    let imu = |omega: f64| Imu {
+        timestamp: Timestamp(0),
+        omega,
+        accel: 0.0,
+    };
 
-    assert!(!input.imu.lap_fault());
-    assert!(!input.any_lapped());
-
-    // Overrun the small buffer far past capacity without the view advancing.
-    for i in 0..32 {
-        w.try_write(
-            Imu {
-                timestamp: Timestamp(i),
-                omega: 0.0,
-                accel: 0.0,
-            }
-            .as_bytes(),
-        )
-        .unwrap();
+    // Fill until the idle view backpressures the writer (never overwritten).
+    let mut wrote = 0u32;
+    loop {
+        match w.write(&imu(wrote as f64)) {
+            Ok(()) => wrote += 1,
+            Err(WriteError::WouldBlock) => break,
+            Err(e) => panic!("unexpected {e:?}"),
+        }
     }
+    assert!(wrote >= 2, "the depth-2 ring holds at least two records");
 
-    assert!(input.imu.lap_fault(), "writer lapped the idle view");
-    assert!(input.any_lapped(), "bundle surfaces the lapped port");
+    // `latest()` serves the newest committed record, consuming the older ones...
+    assert_eq!(
+        input.imu.latest().expect("newest").get().omega,
+        (wrote - 1) as f64
+    );
+    // ...which frees room for the writer — but only up to the pinned newest
+    // record, which is never overwritten (the exact pin geometry is covered by
+    // the ring's own `latest_pin_backpressures_writer` test).
+    let mut wrote2 = 0u32;
+    loop {
+        match w.write(&imu(100.0 + wrote2 as f64)) {
+            Ok(()) => wrote2 += 1,
+            Err(WriteError::WouldBlock) => break,
+            Err(e) => panic!("unexpected {e:?}"),
+        }
+    }
+    assert!(wrote2 >= 1, "the freed records admitted new writes");
+    assert!(wrote2 < wrote, "the pinned record still holds its slot");
+    assert_eq!(
+        input.imu.latest().expect("follow the edge").get().omega,
+        100.0 + (wrote2 - 1) as f64
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -285,10 +305,10 @@ fn descriptor_and_compatibility() {
 
 #[test]
 fn health_counters_published() {
-    let imu_ring = overwrite_ring::<Imu>(8, 1);
-    let nav_ring = overwrite_ring::<NavEstimate>(8, 1);
-    let health_ring = overwrite_ring::<SystemHealth>(8, 1);
-    let log_ring = overwrite_ring::<SystemLog>(8, 1);
+    let imu_ring = ring_for::<Imu>(8, 1);
+    let nav_ring = ring_for::<NavEstimate>(8, 1);
+    let health_ring = ring_for::<SystemHealth>(8, 1);
+    let log_ring = ring_for::<SystemLog>(8, 1);
 
     let mut health_in = Input::<SystemHealth>::new(health_ring.view(NoWake, NoWake).unwrap());
 
@@ -319,7 +339,6 @@ fn health_counters_published() {
 
     assert_eq!(sink.values[&ComponentId::new("health.cycles")], 3.0);
     assert_eq!(sink.values[&ComponentId::new("health.errors")], 3.0);
-    assert_eq!(sink.values[&ComponentId::new("health.lapped_inputs")], 0.0);
     assert_eq!(
         sink.values[&ComponentId::new("health.error_counts.imu_missing")],
         3.0,
@@ -370,10 +389,10 @@ impl AsyncSystem for AsyncFilter {
 #[cfg(not(miri))]
 #[stellarator::test]
 async fn async_filter_one_cycle() {
-    let imu_ring = overwrite_ring::<Imu>(8, 2);
-    let nav_ring = overwrite_ring::<NavEstimate>(8, 2);
-    let health_ring = overwrite_ring::<SystemHealth>(8, 1);
-    let log_ring = overwrite_ring::<SystemLog>(8, 1);
+    let imu_ring = ring_for::<Imu>(8, 2);
+    let nav_ring = ring_for::<NavEstimate>(8, 2);
+    let health_ring = ring_for::<SystemHealth>(8, 1);
+    let log_ring = ring_for::<SystemLog>(8, 1);
 
     let imu_data = Notifier::default();
     let imu_space = Notifier::default();
@@ -518,10 +537,10 @@ where
     S::Input: crate::BindPorts<BoxBacking>,
     O: SystemOutput + crate::BindPorts<BoxBacking>,
 {
-    let imu_ring = overwrite_ring::<Imu>(8, 2);
-    let nav_ring = overwrite_ring::<NavEstimate>(8, 2);
-    let health_ring = overwrite_ring::<SystemHealth>(8, 1);
-    let log_ring = overwrite_ring::<SystemLog>(8, 1);
+    let imu_ring = ring_for::<Imu>(8, 2);
+    let nav_ring = ring_for::<NavEstimate>(8, 2);
+    let health_ring = ring_for::<SystemHealth>(8, 1);
+    let log_ring = ring_for::<SystemLog>(8, 1);
 
     let mut imu_w = Output::<Imu>::new(imu_ring.writer(NoWake, NoWake).unwrap());
     let mut nav_in = Input::<NavEstimate>::new(nav_ring.view(NoWake, NoWake).unwrap());
@@ -658,10 +677,9 @@ fn publish_drop_folds_to_health() {
     let tiny = RingBuffer::create_in_memory(Config {
         capacity: 16,
         max_readers: 1,
-        overrun: Overrun::Overwrite,
     });
-    let health_ring = overwrite_ring::<SystemHealth>(8, 1);
-    let log_ring = overwrite_ring::<SystemLog>(8, 1);
+    let health_ring = ring_for::<SystemHealth>(8, 1);
+    let log_ring = ring_for::<SystemLog>(8, 1);
     let mut health_in = Input::<SystemHealth>::new(health_ring.view(NoWake, NoWake).unwrap());
 
     let input = crate::BindPorts::bind(&mut TestSource { rings: vec![], next: 0 });
@@ -685,103 +703,15 @@ fn publish_drop_folds_to_health() {
 }
 
 // ---------------------------------------------------------------------------
-// E3: a lap *during* execute is resync-latched by `latest()` (the body keeps the
-// freshest record) and charged post-execute: health + a permanent stop.
-// ---------------------------------------------------------------------------
-
-/// Writes into its own input ring mid-execute (standing in for an async producer
-/// racing the drain), then re-reads: `latest()` must resync over the lap and serve
-/// the newest record while latching `is_lapped` for the runner. The `Option` writer
-/// keeps the (macro-required) `Default` construction path compiling; the test
-/// installs the real writer before running.
-#[derive(Default)]
-struct SelfFlooder {
-    writer: Option<Output<Imu>>,
-    seen: Vec<f64>,
-}
-
-#[crate::system(name = "self_flooder")]
-impl SelfFlooder {
-    fn execute(&mut self, now: Timestamp, imu: &mut Input<Imu>) {
-        let _ = imu.latest();
-        // Lap the (depth-2) view: far more records than the ring holds.
-        let writer = self.writer.as_mut().expect("test installs the writer");
-        for i in 0..32 {
-            let _ = writer.write(&Imu {
-                timestamp: now,
-                omega: i as f64,
-                accel: 0.0,
-            });
-        }
-        // The E3 contract: no Err — the lap is latched and the view resyncs to the
-        // live edge (unread records, including the flood, are abandoned).
-        assert!(imu.latest().is_none(), "nothing read before the lap to re-serve");
-        assert!(imu.lap_fault(), "the resynced-over lap stays latched");
-        // Reads resume normally after the resync: a fresh record is served.
-        let _ = writer.write(&Imu {
-            timestamp: now,
-            omega: 99.0,
-            accel: 0.0,
-        });
-        let newest = imu.latest().expect("post-resync reads resume");
-        self.seen.push(newest.get().omega);
-    }
-}
-
-#[test]
-fn mid_execute_lap_latches_and_stops() {
-    let imu_ring = overwrite_ring::<Imu>(2, 1);
-    let health_ring = overwrite_ring::<SystemHealth>(8, 1);
-    let log_ring = overwrite_ring::<SystemLog>(8, 1);
-    let mut health_in = Input::<SystemHealth>::new(health_ring.view(NoWake, NoWake).unwrap());
-
-    let input = crate::BindPorts::bind(&mut TestSource {
-        rings: vec![imu_ring.clone()],
-        next: 0,
-    });
-    let output = crate::BindPorts::bind(&mut TestSource {
-        rings: vec![health_ring.clone(), log_ring.clone()],
-        next: 0,
-    });
-    let system = SelfFlooder {
-        writer: Some(Output::new(imu_ring.writer(NoWake, NoWake).unwrap())),
-        seen: Vec::new(),
-    };
-    let mut runner = CyclicRunner::new(system, input, output);
-    runner.step(Timestamp(1));
-
-    assert!(
-        matches!(runner.state(), crate::SlotState::Stopped { reason: crate::StopReason::LappedInput }),
-        "a mid-execute lap permanently stops the system the same cycle"
-    );
-    let record = health_in.latest().expect("final health published");
-    let mut sink = RecSink::default();
-    record.apply(&mut sink).unwrap().unwrap();
-    assert_eq!(
-        sink.values[&ComponentId::new("health.lapped_inputs")],
-        1.0,
-        "the latched lap is charged to health (E3)"
-    );
-
-    // A stopped slot never executes again.
-    runner.step(Timestamp(2));
-    let record = health_in.latest().expect("health record");
-    let mut sink = RecSink::default();
-    record.apply(&mut sink).unwrap().unwrap();
-    assert_eq!(sink.values[&ComponentId::new("health.cycles")], 1.0);
-}
-
-// ---------------------------------------------------------------------------
-// #[fsw(...)] attribute lowering + the Log × Stop fourth cell (A5/A6, C5).
+// #[fsw(...)] attribute lowering + message-log delivery guarantees (A5/A6, C5).
 // ---------------------------------------------------------------------------
 
 use metor_proto_wkt::{SequenceCommand, SequenceCommandKind};
 
-/// A command log that must never lose a record — the Log × Stop fourth cell the
-/// unification made expressible (`docs/design-port-unification.md` §2.3).
+/// A command log input — never loses a record (the lossless ring backpressures
+/// the emitter instead).
 #[derive(crate::SystemInput)]
 struct GuardIn {
-    #[fsw(on_lap = "stop")]
     cmds: crate::MsgIn<SequenceCommand>,
 }
 
@@ -795,12 +725,11 @@ struct QuietOut {
     cmds: crate::CommandOut<SequenceCommand>,
 }
 
-/// A tiny Log-sized message ring (small enough to lap with a handful of records).
+/// A tiny Log-sized message ring (small enough to fill with a handful of records).
 fn msg_ring(readers: usize) -> RingBuffer<BoxBacking> {
     RingBuffer::create_in_memory(Config {
         capacity: crate::capacity_for(64, 2),
         max_readers: readers,
-        overrun: Overrun::Overwrite,
     })
 }
 
@@ -811,15 +740,14 @@ fn cmd(channel: &str) -> SequenceCommand {
     }
 }
 
-/// `#[fsw(...)]` overrides land on the generated descriptors: `on_lap = "stop"`
-/// flips exactly the lap axis; `telemetered = false` and the `CommandOut` token
-/// flip exactly the telemetry flag.
+/// `#[fsw(...)]` overrides land on the generated descriptors: `telemetered =
+/// false` and the `CommandOut` token flip exactly the telemetry flag; other
+/// axes keep their facade defaults.
 #[test]
 fn fsw_attrs_lower_onto_descriptors() {
     let ins = <GuardIn as SystemInput>::port_descs();
     assert_eq!(ins.len(), 1);
-    assert_eq!(ins[0].on_lap, crate::OnLap::Stop, "the attribute override");
-    assert_eq!(ins[0].delivery, crate::Delivery::Log, "other axes keep the MsgIn defaults");
+    assert_eq!(ins[0].delivery, crate::Delivery::Log, "axes keep the MsgIn defaults");
     assert_eq!(ins[0].fan_in, crate::FanIn::Many);
 
     let outs = <QuietOut as SystemOutput>::port_descs();
@@ -833,62 +761,52 @@ fn fsw_attrs_lower_onto_descriptors() {
     );
 }
 
-/// The `on_lap` attribute reaches the BOUND port too (descriptor and runtime can
-/// never disagree): a lapped Stop input reports `lap_fault`, while the default
-/// Resync policy keeps flowing and reports none.
+/// A message log never loses a record: a full ring backpressures the emitter
+/// (`WouldBlock`), every accepted record arrives in order, and draining frees
+/// space for the next emit.
 #[test]
-fn fsw_on_lap_governs_the_bound_port() {
-    let ring = msg_ring(2);
-    // Bind through the derive walk (the fan-in cursor), so the chained
-    // `.with_on_lap(Stop)` in the generated `bind` is what's under test.
-    let input: GuardIn = crate::BindPorts::bind(&mut TestSource {
-        rings: vec![ring.clone()],
-        next: 0,
-    });
-    let mut stop_in = input.cmds;
-    // A hand-built twin on the same ring with the default (Resync) policy.
-    let mut resync_in: crate::MsgIn<SequenceCommand> =
+fn msg_log_never_loses_records() {
+    let ring = msg_ring(1);
+    let mut inbox: crate::MsgIn<SequenceCommand> =
         crate::MsgIn::new(ring.view(NoWake, NoWake).unwrap());
-
     let mut w: crate::MsgOut<SequenceCommand> =
         crate::MsgOut::new(ring.writer(NoWake, NoWake).unwrap());
-    for i in 0..32 {
-        w.emit(&cmd(&format!("c{i}"))).unwrap();
+
+    // Fill until the idle inbox backpressures the emitter.
+    let mut sent = 0u32;
+    loop {
+        match w.emit(&cmd(&format!("c{sent}"))) {
+            Ok(()) => sent += 1,
+            Err(WriteError::WouldBlock) => break,
+            Err(e) => panic!("unexpected {e:?}"),
+        }
     }
+    assert!(sent >= 1);
 
-    // Live lap observation, before any drain (the runner's pre-execute gate).
-    assert!(stop_in.lap_fault(), "Stop policy: a live lap is a fault");
-    assert!(!resync_in.lap_fault(), "Resync policy: laps are not faults");
+    // Every accepted record arrives, in order — nothing was overwritten.
+    let mut got = Vec::new();
+    inbox.drain(|c| got.push(c.channel));
+    let expected: Vec<String> = (0..sent).map(|i| format!("c{i}")).collect();
+    assert_eq!(got, expected, "the log lost or reordered records");
 
-    // Stop: the drain stops at the lap (no records) and the fault latches.
-    let mut got = 0;
-    stop_in.drain(|_| got += 1);
-    assert_eq!(got, 0, "a Stop port does not read past a lap");
-    assert!(stop_in.lap_fault());
-
-    // Resync: the drain skips to the live edge (abandoning the flood, best-effort)
-    // and the port keeps flowing — records emitted after the lap arrive normally.
-    let mut got = 0;
-    resync_in.drain(|_| got += 1);
-    assert_eq!(got, 0, "resync abandons unread records up to the live edge");
-    assert!(!resync_in.lap_fault());
+    // The drain freed space: the emitter proceeds.
     w.emit(&cmd("after")).unwrap();
     let mut got = 0;
-    resync_in.drain(|_| got += 1);
-    assert_eq!(got, 1, "a Resync port keeps flowing after the lap");
-    assert!(!resync_in.lap_fault());
+    inbox.drain(|_| got += 1);
+    assert_eq!(got, 1);
 }
 
-/// The fourth cell end-to-end: a cyclic consumer of a Log × Stop command input is
-/// permanently hard-stopped by the runner when the channel laps — the same doctrine
-/// as a lapped frame input, now policy-derived instead of frame-hard-coded.
+/// Guaranteed delivery through the runner: a cyclic consumer of a command log
+/// sees **every** emitted record across cycles — a full ring holds the emitter
+/// back rather than dropping, and the consumer stays `Running`.
 #[test]
-fn log_stop_input_hard_stops_cyclic_consumer() {
+fn log_input_guaranteed_delivery_through_runner() {
     #[derive(crate::SystemOutput)]
     struct NothingOut {}
 
+    #[derive(Default)]
     struct Guard {
-        seen: usize,
+        seen: std::rc::Rc<core::cell::Cell<usize>>,
     }
     impl System for Guard {
         type Input = GuardIn;
@@ -897,13 +815,14 @@ fn log_stop_input_hard_stops_cyclic_consumer() {
     }
     impl CyclicSystem for Guard {
         fn execute(&mut self, _now: Timestamp, input: &mut GuardIn, _o: &mut Self::Output) {
-            input.cmds.drain(|_| self.seen += 1);
+            let seen = self.seen.clone();
+            input.cmds.drain(|_| seen.set(seen.get() + 1));
         }
     }
 
     let ring = msg_ring(1);
-    let health_ring = overwrite_ring::<SystemHealth>(8, 1);
-    let log_ring = overwrite_ring::<SystemLog>(8, 1);
+    let health_ring = ring_for::<SystemHealth>(8, 1);
+    let log_ring = ring_for::<SystemLog>(8, 1);
 
     let input: GuardIn = crate::BindPorts::bind(&mut TestSource {
         rings: vec![ring.clone()],
@@ -918,20 +837,19 @@ fn log_stop_input_hard_stops_cyclic_consumer() {
     );
     let mut w: crate::MsgOut<SequenceCommand> =
         crate::MsgOut::new(ring.writer(NoWake, NoWake).unwrap());
-    let mut runner = CyclicRunner::new(Guard { seen: 0 }, input, output);
+    let seen = std::rc::Rc::new(core::cell::Cell::new(0));
+    let mut runner = CyclicRunner::new(Guard { seen: seen.clone() }, input, output);
 
-    // A normal cycle: one command in, one command drained.
-    w.emit(&cmd("mode")).unwrap();
-    runner.step(Timestamp(1));
-    assert!(matches!(runner.state(), crate::SlotState::Running));
-
-    // Flood far past the ring depth: the idle view is lapped.
-    for i in 0..32 {
-        w.emit(&cmd(&format!("c{i}"))).unwrap();
+    // Emit across cycles, pausing whenever the ring backpressures; every record
+    // is eventually delivered and the consumer never stops.
+    let mut sent = 0;
+    while sent < 32 {
+        while sent < 32 && w.emit(&cmd(&format!("c{sent}"))).is_ok() {
+            sent += 1;
+        }
+        runner.step(Timestamp(sent as i64));
+        assert!(matches!(runner.state(), crate::SlotState::Running));
     }
-    runner.step(Timestamp(2));
-    assert!(
-        matches!(runner.state(), crate::SlotState::Stopped { reason: crate::StopReason::LappedInput }),
-        "a lapped Stop command log permanently stops the consumer"
-    );
+    runner.step(Timestamp(33));
+    assert_eq!(seen.get(), 32, "every emitted command was delivered");
 }

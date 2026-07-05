@@ -179,12 +179,10 @@ impl System for NavLogger {
 
 impl AsyncSystem for NavLogger {
     async fn run(&mut self, input: &mut Self::Input, _o: &mut Self::Output) {
-        match input.nav.recv().await {
-            Ok(nav) => {
-                LOG_COUNT.fetch_add(1, Relaxed);
-                LOG_LAST_ANGLE_BITS.store(nav.get().angle.to_bits(), Relaxed);
-            }
-            Err(_) => input.nav.resync(),
+        // Corrupt (the only recv error) is unreachable in practice; skip the wake.
+        if let Ok(nav) = input.nav.recv().await {
+            LOG_COUNT.fetch_add(1, Relaxed);
+            LOG_LAST_ANGLE_BITS.store(nav.get().angle.to_bits(), Relaxed);
         }
     }
 }

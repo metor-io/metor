@@ -260,8 +260,8 @@ impl SlotRunner {
     }
 
     /// Emit one [`SequenceChannelEvent`] on this slot's message channel, tagged with the
-    /// slot's **instance name** (`docs/messages.md` §5). Best-effort: a full overwrite
-    /// ring drops the oldest record, surfaced (not silently reordered) by the downlink.
+    /// slot's **instance name** (`docs/messages.md` §5). Best-effort: a full ring
+    /// (a stalled tap) drops this event rather than blocking the cycle.
     fn emit_event(&mut self, kind: SequenceEventKind) {
         let _ = self.events.emit(&SequenceChannelEvent {
             channel: self.name.to_string(),
@@ -378,11 +378,12 @@ impl SlotRunner {
     /// emit a `Progress { detail }` per new progress line (each record carries only the
     /// lines pushed that cycle — the occupant's `drain_progress` empties its buffer on
     /// publish) and latch the latest `run_state` for the terminal fold. Every-record,
-    /// never coalesced (`docs/messages.md` §5.1). A lapped view resyncs to the live edge.
+    /// never coalesced (`docs/messages.md` §5.1); the lossless ring guarantees no
+    /// record is dropped (a corrupt view — unreachable in practice — stops the drain).
     fn drain_progress(&mut self) {
         let mut details = core::mem::take(&mut self.detail_scratch);
         let mut state = self.last_run_state;
-        let res = self.seq_status.drain(|f| {
+        let _ = self.seq_status.drain(|f| {
             state = f.get().run_state;
             let list = f.list::<ProgressLine>(offset_of!(SequenceStatus, progress));
             for line in list.iter() {
@@ -392,9 +393,6 @@ impl SlotRunner {
                 }
             }
         });
-        if res.is_err() {
-            self.seq_status.resync();
-        }
         self.last_run_state = state;
         for detail in details.drain(..) {
             self.emit_event(SequenceEventKind::Progress { detail });
@@ -480,14 +478,6 @@ impl CyclicSlot for SlotRunner {
                     self.emit_terminal_done();
                     SlotState::Done {
                         outcome: self.last_run_state,
-                    }
-                }
-                FswStatus::StoppedLapped => {
-                    self.emit_event(SequenceEventKind::Failed {
-                        reason: "lapped".to_string(),
-                    });
-                    SlotState::Stopped {
-                        reason: StopReason::LappedInput,
                     }
                 }
                 FswStatus::Panicked => {

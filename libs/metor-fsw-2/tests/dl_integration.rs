@@ -22,7 +22,7 @@ use std::process::Command;
 use metor_fsw_2::metor_proto::types::{ComponentId, Msg, Timestamp};
 use metor_fsw_2::{
     ClockMode, Coordinator, CoordinatorConfig, CyclicSystem, Delivery, DlSystem, FanIn, Frame,
-    Input, MsgIn, OnLap, Out, Output, PortRef, StopReason, System, SystemInput, SystemKind,
+    Input, MsgIn, Out, Output, PortRef, StopReason, System, SystemInput, SystemKind,
     SystemOutput,
 };
 use postcard_schema::Schema;
@@ -188,7 +188,6 @@ fn dlopen_cyclic_system_end_to_end() {
     assert_eq!(events.name, "TickEvent", "the NamedMsg token survives the wire");
     assert_eq!(events.delivery, Delivery::Log);
     assert_eq!(events.fan_in, FanIn::Many);
-    assert_eq!(events.on_lap, OnLap::Resync);
     assert!(events.telemetered);
     assert!(desc.capabilities.is_empty(), "a .so can hold no host capabilities");
 
@@ -241,10 +240,12 @@ fn dlopen_cyclic_system_end_to_end() {
     });
 
     // 5. The dlopen'd system produced correct output: count = start(1000) + value(6).
-    let out = out_view
-        .latest()
-        .expect("the dl system produced a tick_out");
-    assert_eq!(out.get().count, 1000 + CYCLES as u64, "start + latest value");
+    {
+        let out = out_view
+            .latest()
+            .expect("the dl system produced a tick_out");
+        assert_eq!(out.get().count, 1000 + CYCLES as u64, "start + latest value");
+    }
 
     // 5b. The dl system's Postcard port wired end-to-end: every cycle's event is on
     //     the log channel, in order, decoded purely from the self-describing id.

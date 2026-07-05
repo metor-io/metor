@@ -377,9 +377,11 @@ impl CyclicSlot for DlSlot {
     /// `fsw_execute`: run one cycle and fold the returned status into the slot state.
     /// `now` carries the coordinator's **raw `Timestamp` tick** (`now.0 as u64`), the
     /// unit-agnostic reversible contract — NOT nanoseconds.
-    /// `StoppedLapped` and `Panicked` are permanent hard-stops surfaced through the
-    /// coordinator status frame (a `Panicked` slot is also telemetered there); once
-    /// stopped the slot is never ticked again, mirroring [`CyclicRunner::step`].
+    /// `Panicked` is a permanent hard-stop surfaced through the coordinator status
+    /// frame; once stopped the slot is never ticked again, and its foreign state is
+    /// destroyed **immediately** (not at teardown): on a lossless ring a stopped
+    /// system's live input `View`s would backpressure every upstream producer
+    /// forever, so the stop must release its reader slots.
     fn step(&mut self, now: Timestamp) {
         if self.slot_state.is_stopped() || self.state.is_null() {
             return;
@@ -391,9 +393,6 @@ impl CyclicSlot for DlSlot {
         let status = FswStatus::from_raw(raw);
         self.slot_state = match status {
             FswStatus::Running => SlotState::Running,
-            FswStatus::StoppedLapped => SlotState::Stopped {
-                reason: StopReason::LappedInput,
-            },
             FswStatus::Panicked => SlotState::Stopped {
                 reason: StopReason::Panicked,
             },
@@ -405,6 +404,14 @@ impl CyclicSlot for DlSlot {
             // keep-running (a build-time slot has no occupant outcome to refine it).
             FswStatus::Done => SlotState::Running,
         };
+        if self.slot_state.is_stopped() {
+            // `fsw_destroy` drops the `.so`'s `RawBacking` ports, freeing its reader
+            // slots so producers are not backpressured by a dead consumer. Nulled so
+            // `shutdown`/`Drop` stay no-ops (a panicked system gets no `shutdown`).
+            // SAFETY: `state` is the live pointer, transferred to destroy exactly once.
+            unsafe { (self.destroy)(self.state) };
+            self.state = core::ptr::null_mut();
+        }
     }
 
     /// `fsw_shutdown`: run `System::shutdown` once inside the `.so`.

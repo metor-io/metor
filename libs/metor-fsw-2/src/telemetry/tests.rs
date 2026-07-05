@@ -441,7 +441,7 @@ async fn drop_policy_never_blocks_and_counts() {
 async fn message_downlink_fifo_no_coalesce() {
     use std::sync::atomic::{AtomicBool, Ordering::Release};
 
-    use metor_fsw_ring::{Config, NoWake, Overrun, RingBuffer};
+    use metor_fsw_ring::{Config, NoWake, RingBuffer};
     use metor_proto::types::{Msg, OwnedPacket};
     use metor_proto_wkt::{
         SequenceChannelSpec, SequenceCommand, SequenceCommandKind, SequenceRegistry,
@@ -459,7 +459,6 @@ async fn message_downlink_fifo_no_coalesce() {
     let ring = RingBuffer::create_in_memory(Config {
         capacity: capacity_for(MAX_MSG_BYTES, LOG_DEPTH),
         max_readers: 4,
-        overrun: Overrun::Overwrite,
     });
     let entry = RegistryEntry {
         key: ComponentId::new("mode.events"),

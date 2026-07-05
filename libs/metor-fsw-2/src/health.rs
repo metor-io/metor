@@ -2,8 +2,8 @@
 //!
 //! Systems never return errors; they report trouble as ordinary frames over a
 //! framework-provided health output port that every system implicitly gets. The
-//! four standard counters (cycles / errors / lapped inputs / last execute micros)
-//! are maintained by the framework around `execute`; domain-specific error kinds
+//! three standard counters (cycles / errors / last execute micros) are
+//! maintained by the framework around `execute`; domain-specific error kinds
 //! are bumped by name and ride a dynamic `FrameMap`. String logs ride a parallel
 //! [`SystemLog`] frame as fixed-size byte components (metor-proto has no string
 //! type).
@@ -26,7 +26,7 @@ pub const MAX_LINES: usize = 16;
 /// Fixed capacity of one log line's message (longer lines are truncated, §Q8).
 pub const LOG_MSG_CAP: usize = 64;
 
-/// The standard per-system health frame. The four scalar counters are framework-
+/// The standard per-system health frame. The scalar counters are framework-
 /// maintained; `error_counts` holds the system's named counters (lands as
 /// `health.error_counts.<kind>` via the dynamic-frame path).
 #[derive(Frame, IntoBytes, Immutable, KnownLayout, FromBytes)]
@@ -37,7 +37,6 @@ pub struct SystemHealth {
     pub timestamp: Timestamp,
     pub cycles: u64,
     pub errors: u64,
-    pub lapped_inputs: u64,
     pub last_execute_micros: u64,
     pub error_counts: FrameMap<u64, MAX_ERR_KINDS>,
 }
@@ -97,7 +96,6 @@ where
     log: Output<SystemLog, B, WD, WS>,
     cycles: u64,
     errors: u64,
-    lapped_inputs: u64,
     last_execute_micros: u64,
     error_counts: Vec<(String, u64)>,
     pending: Vec<LogLine>,
@@ -116,7 +114,6 @@ where
             log,
             cycles: 0,
             errors: 0,
-            lapped_inputs: 0,
             last_execute_micros: 0,
             error_counts: Vec::new(),
             pending: Vec::new(),
@@ -144,11 +141,6 @@ where
 
     // ---- framework-side counter maintenance ----
 
-    /// Record that a cyclic input was lapped this cycle (system.md §3.1).
-    pub fn record_lapped(&mut self) {
-        self.lapped_inputs += 1;
-    }
-
     /// Close a cycle: bump `cycles`, stamp the execute duration, and publish one
     /// health record (with the named counters) plus any pending log lines.
     pub fn end_cycle(&mut self, timestamp: Timestamp, execute_micros: u64) {
@@ -163,7 +155,6 @@ where
             timestamp,
             cycles: self.cycles,
             errors: self.errors,
-            lapped_inputs: self.lapped_inputs,
             last_execute_micros: self.last_execute_micros,
             error_counts: FrameMap::EMPTY,
         };

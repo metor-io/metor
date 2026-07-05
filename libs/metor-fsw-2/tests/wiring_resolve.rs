@@ -159,14 +159,16 @@ fn dl_graph_via_wiring_resolve_end_to_end() {
     });
 
     // 6. The typed params took effect: count = start(1000) + latest value(6).
-    let out = out_view
-        .latest()
-        .expect("the dl system produced a tick_out");
-    assert_eq!(
-        out.get().count,
-        1000 + CYCLES as u64,
-        "start (from .params) + latest value"
-    );
+    {
+        let out = out_view
+            .latest()
+            .expect("the dl system produced a tick_out");
+        assert_eq!(
+            out.get().count,
+            1000 + CYCLES as u64,
+            "start (from .params) + latest value"
+        );
+    }
 
     // 7. Descriptor sanity: the resolved dl system is the fixture's cyclic counter.
     drop(out_view);
