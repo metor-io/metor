@@ -2,26 +2,16 @@
 //!
 //! The synchronous tests use only `try_*` APIs + `std::thread`, so they run
 //! under Miri (which cannot drive the async runtime). They exercise the unsafe
-//! pointer/atomic paths so Miri can check provenance, leaks, and data races —
-//! especially the overwrite-mode concurrent read/write. See `libs/db/MIRI.md`;
-//! this crate follows the same strategy (`UnsafeCell` backing, sync tests,
-//! Tree Borrows). Loop bounds shrink under `cfg!(miri)`.
+//! pointer/atomic paths so Miri can check provenance, leaks, and data races.
+//! See `libs/db/MIRI.md`; this crate follows the same strategy (`UnsafeCell`
+//! backing, sync tests, Tree Borrows). Loop bounds shrink under `cfg!(miri)`.
 
 use super::*;
 
-fn overwrite(capacity: usize, max_readers: usize) -> RingBuffer<BoxBacking> {
+fn ring(capacity: usize, max_readers: usize) -> RingBuffer<BoxBacking> {
     RingBuffer::create_in_memory(Config {
         capacity,
         max_readers,
-        overrun: Overrun::Overwrite,
-    })
-}
-
-fn lossless(capacity: usize, max_readers: usize) -> RingBuffer<BoxBacking> {
-    RingBuffer::create_in_memory(Config {
-        capacity,
-        max_readers,
-        overrun: Overrun::Lossless,
     })
 }
 
@@ -29,7 +19,7 @@ fn lossless(capacity: usize, max_readers: usize) -> RingBuffer<BoxBacking> {
 
 #[test]
 fn roundtrip() {
-    let rb = overwrite(1024, 4);
+    let rb = ring(1024, 4);
     let mut w = rb.writer(NoWake, NoWake).unwrap();
     let mut v = rb.view(NoWake, NoWake).unwrap();
 
@@ -45,13 +35,13 @@ fn roundtrip() {
 }
 
 /// Small power-of-two capacity with a payload that does not divide it, forcing
-/// an 8-byte wrap gap. The reader (kept up, so never lapped) must skip the gap
-/// and reconstruct each message.
+/// an 8-byte wrap gap. The reader (kept up, so the writer never blocks) must
+/// skip the gap and reconstruct each message.
 #[test]
 fn wraparound_aligned() {
     // cap 64, payload 16 -> record 24. 24,48 fit; the third would straddle
     // (48+24 > 64), so the writer leaves a 16-byte gap and wraps to offset 0.
-    let rb = overwrite(64, 1);
+    let rb = ring(64, 1);
     let mut w = rb.writer(NoWake, NoWake).unwrap();
     let mut v = rb.view(NoWake, NoWake).unwrap();
     let mut buf = Vec::new();
@@ -69,7 +59,7 @@ fn wraparound_aligned() {
 
 #[test]
 fn multi_reader() {
-    let rb = lossless(1024, 4);
+    let rb = ring(1024, 4);
     let mut w = rb.writer(NoWake, NoWake).unwrap();
     let mut a = rb.view(NoWake, NoWake).unwrap();
     let mut b = rb.view(NoWake, NoWake).unwrap();
@@ -89,7 +79,7 @@ fn multi_reader() {
 
 #[test]
 fn reader_table_claim_free() {
-    let rb = overwrite(256, 2);
+    let rb = ring(256, 2);
     assert_eq!(rb.reader_count(), 0);
 
     let a = rb.view(NoWake, NoWake).unwrap();
@@ -106,46 +96,13 @@ fn reader_table_claim_free() {
     assert_eq!(rb.reader_count(), 1);
 }
 
-// ----- The two policy-specific behaviors -----
+// ----- Backpressure / borrow semantics -----
 
-/// Overwrite mode: a reader left behind is lapped and gets `Err(Lapped)` — never
-/// torn or garbage data. Earlier in-range reads returned the correct bytes.
+/// The writer backpressures (`WouldBlock`) rather than overwrite a reader;
+/// freeing space lets the next write through. No data is ever lost.
 #[test]
-fn overwrite_slow_reader_lapped() {
-    let rb = overwrite(64, 1);
-    let mut w = rb.writer(NoWake, NoWake).unwrap();
-    let mut v = rb.view(NoWake, NoWake).unwrap();
-    let mut buf = Vec::new();
-
-    // Two records (record = 24) fit in 64 with no overwrite; read them.
-    w.try_write(&[1u8; 16]).unwrap();
-    w.try_write(&[2u8; 16]).unwrap();
-    assert!(v.try_read_into(&mut buf).unwrap());
-    assert_eq!(&buf[..], &[1u8; 16]);
-    assert!(v.try_read_into(&mut buf).unwrap());
-    assert_eq!(&buf[..], &[2u8; 16]);
-    assert!(!v.is_lapped());
-
-    // Now flood the buffer, lapping the (idle) reader.
-    for _ in 0..16 {
-        w.try_write(&[9u8; 16]).unwrap();
-    }
-    assert!(v.is_lapped());
-    assert_eq!(v.try_read_into(&mut buf), Err(ReadError::Lapped));
-
-    // After resync the reader resumes from the live edge.
-    v.resync();
-    assert!(!v.is_lapped());
-    w.try_write(&[7u8; 16]).unwrap();
-    assert!(v.try_read_into(&mut buf).unwrap());
-    assert_eq!(&buf[..], &[7u8; 16]);
-}
-
-/// Lossless mode: the writer backpressures (`WouldBlock`) rather than lapping a
-/// reader; freeing space lets the next write through. No data is ever lost.
-#[test]
-fn lossless_backpressure() {
-    let rb = lossless(64, 1);
+fn backpressure() {
+    let rb = ring(64, 1);
     let mut w = rb.writer(NoWake, NoWake).unwrap();
     let mut v = rb.view(NoWake, NoWake).unwrap();
     let mut buf = Vec::new();
@@ -155,7 +112,7 @@ fn lossless_backpressure() {
     w.try_write(&[2u8; 16]).unwrap();
     assert_eq!(w.try_write(&[3u8; 16]), Err(WriteError::WouldBlock));
 
-    // The reader is never lapped, so it reads the first record correctly.
+    // The reader was never overwritten, so it reads the first record correctly.
     assert!(v.try_read_into(&mut buf).unwrap());
     assert_eq!(&buf[..], &[1u8; 16]);
 
@@ -168,8 +125,8 @@ fn lossless_backpressure() {
 }
 
 #[test]
-fn lossless_borrow_read() {
-    let rb = lossless(256, 1);
+fn borrow_read() {
+    let rb = ring(256, 1);
     let mut w = rb.writer(NoWake, NoWake).unwrap();
     let mut v = rb.view(NoWake, NoWake).unwrap();
 
@@ -182,18 +139,68 @@ fn lossless_borrow_read() {
 }
 
 #[test]
-fn overwrite_borrow_unsupported() {
-    let rb = overwrite(256, 1);
-    let mut v = rb.view(NoWake, NoWake).unwrap();
-    assert_eq!(v.try_read().err(), Some(ReadError::BorrowNotSupported));
-}
-
-#[test]
 fn oversize_message_rejected() {
-    let rb = overwrite(64, 1);
+    let rb = ring(64, 1);
     let mut w = rb.writer(NoWake, NoWake).unwrap();
     // 64-byte payload -> record 72 > capacity 64.
     assert_eq!(w.try_write(&[0u8; 64]), Err(WriteError::InsufficientCapacity));
+}
+
+// ----- try_latest: the latest-wins read -----
+
+/// `try_latest` consumes every older record, pins the newest (re-served across
+/// calls with no new data), and follows the live edge as records land.
+#[test]
+fn latest_pins_newest() {
+    let rb = ring(256, 1);
+    let mut w = rb.writer(NoWake, NoWake).unwrap();
+    let mut v = rb.view(NoWake, NoWake).unwrap();
+
+    assert!(
+        v.try_latest().unwrap().is_none(),
+        "no record committed yet"
+    );
+
+    w.try_write(&[1u8; 16]).unwrap();
+    w.try_write(&[2u8; 16]).unwrap();
+    w.try_write(&[3u8; 16]).unwrap();
+
+    // Newest wins; the two older records are consumed.
+    assert_eq!(&v.try_latest().unwrap().expect("newest")[..], &[3u8; 16]);
+    // No new data: the pinned record is served again.
+    assert_eq!(&v.try_latest().unwrap().expect("re-served")[..], &[3u8; 16]);
+
+    w.try_write(&[4u8; 16]).unwrap();
+    assert_eq!(&v.try_latest().unwrap().expect("follows the edge")[..], &[4u8; 16]);
+}
+
+/// The pin is load-bearing: the writer cannot reclaim the pinned record's bytes
+/// (`WouldBlock`), and the next `try_latest` moves the pin so the writer
+/// proceeds. Geometry (cap 64, record 24): after two writes the reader pins the
+/// record at abs 24..48; the third write wraps (gap at 48, record abs 64..88 =
+/// phys 0..24) and fits, but the fourth (phys 24..48) would overwrite the pin.
+#[test]
+fn latest_pin_backpressures_writer() {
+    let rb = ring(64, 1);
+    let mut w = rb.writer(NoWake, NoWake).unwrap();
+    let mut v = rb.view(NoWake, NoWake).unwrap();
+
+    w.try_write(&[1u8; 16]).unwrap();
+    w.try_write(&[2u8; 16]).unwrap();
+    assert_eq!(&v.try_latest().unwrap().expect("pin record 2")[..], &[2u8; 16]);
+
+    w.try_write(&[3u8; 16]).unwrap(); // wraps; does not touch the pin
+    assert_eq!(
+        w.try_write(&[4u8; 16]),
+        Err(WriteError::WouldBlock),
+        "the pinned record's bytes are protected"
+    );
+
+    // The reader moves its pin to the newest record, freeing the old one...
+    assert_eq!(&v.try_latest().unwrap().expect("pin record 3")[..], &[3u8; 16]);
+    // ...and the blocked write now goes through.
+    w.try_write(&[4u8; 16]).unwrap();
+    assert_eq!(&v.try_latest().unwrap().expect("record 4")[..], &[4u8; 16]);
 }
 
 // ----- Concurrency / Miri data-race coverage -----
@@ -201,77 +208,14 @@ fn oversize_message_rejected() {
 use std::sync::atomic::{AtomicBool, Ordering as O};
 use std::thread;
 
-/// Writer thread overwrites a tiny buffer as fast as it can while a reader copies
-/// records out. This is the data-race coverage for Miri: the writer's relaxed
-/// atomic stores and the reader's relaxed atomic loads on the *same* bytes,
-/// resolved by the seqlock reservation recheck. Every non-lapped record the
-/// reader observes must be a value the writer actually wrote — the payload is
-/// the record index encoded **twice**, so an old/new byte mix across a lap
-/// disagrees between the halves (a plain "value < n" check cannot see a tear);
-/// on a lap the reader resyncs. Loop bounds shrink under Miri.
+/// Delivery is guaranteed: a writer that spins on `WouldBlock` and a reader
+/// draining concurrently must reconstruct the full ordered stream with zero
+/// loss (the disruptor's invariant). Also Miri race coverage for the plain
+/// read/write path (race-free via backpressure + `committed`).
 #[test]
-fn concurrent_overwrite_no_ub() {
-    let n: u64 = if cfg!(miri) { 64 } else { 5_000 };
-    let rb = overwrite(64, 1);
-    let v = rb.view(NoWake, NoWake).unwrap();
-    let done = std::sync::Arc::new(AtomicBool::new(false));
-
-    let consumer = {
-        let done = done.clone();
-        thread::spawn(move || {
-            let mut v = v;
-            let mut buf = Vec::new();
-            let mut seen = 0u64;
-            loop {
-                match v.try_read_into(&mut buf) {
-                    Ok(true) => {
-                        let lo = u64::from_le_bytes(buf[..8].try_into().unwrap());
-                        let hi = u64::from_le_bytes(buf[8..16].try_into().unwrap());
-                        assert_eq!(lo, hi, "torn record: halves disagree");
-                        assert!(lo < n, "torn/garbage value {lo}");
-                        seen += 1;
-                    }
-                    Ok(false) => {
-                        if done.load(O::Relaxed) {
-                            break;
-                        }
-                        thread::yield_now();
-                    }
-                    Err(ReadError::Lapped) => v.resync(),
-                    Err(e) => panic!("unexpected {e:?}"),
-                }
-            }
-            seen
-        })
-    };
-
-    let producer = {
-        let rb = rb.clone();
-        let done = done.clone();
-        thread::spawn(move || {
-            let mut w = rb.writer(NoWake, NoWake).unwrap();
-            for i in 0..n {
-                let mut payload = [0u8; 16];
-                payload[..8].copy_from_slice(&i.to_le_bytes());
-                payload[8..].copy_from_slice(&i.to_le_bytes());
-                w.try_write(&payload).unwrap();
-            }
-            done.store(true, O::Relaxed);
-        })
-    };
-
-    producer.join().unwrap();
-    let _seen = consumer.join().unwrap();
-}
-
-/// Lossless mode guarantees delivery: a writer that spins on `WouldBlock` and a
-/// reader draining concurrently must reconstruct the full ordered stream with
-/// zero loss (the disruptor's invariant). Also Miri race coverage for the
-/// lossless plain read/write path (race-free via backpressure + `committed`).
-#[test]
-fn concurrent_lossless_full_stream() {
+fn concurrent_full_stream() {
     let n: u64 = if cfg!(miri) { 48 } else { 4_000 };
-    let rb = lossless(128, 1);
+    let rb = ring(128, 1);
     let v = rb.view(NoWake, NoWake).unwrap();
 
     let consumer = thread::spawn(move || {
@@ -282,7 +226,7 @@ fn concurrent_lossless_full_stream() {
             match v.try_read_into(&mut buf) {
                 Ok(true) => got.push(u64::from_le_bytes(buf[..8].try_into().unwrap())),
                 Ok(false) => thread::yield_now(),
-                Err(e) => panic!("lossless reader must never error: {e:?}"),
+                Err(e) => panic!("reader must never error: {e:?}"),
             }
         }
         got
@@ -312,11 +256,13 @@ fn concurrent_lossless_full_stream() {
 
 /// Register/drop views from several threads while a writer runs. Stresses the
 /// CAS slot claim and the wait-free slot free; at the end every slot is free.
+/// A live churner view can backpressure the writer, so the writer tolerates
+/// `WouldBlock` (that is the mode's contract, not a failure).
 #[test]
 fn concurrent_reader_churn() {
     let churn = if cfg!(miri) { 3 } else { 8 };
     let rounds = if cfg!(miri) { 4 } else { 200 };
-    let rb = overwrite(128, 16);
+    let rb = ring(128, 16);
     let stop = std::sync::Arc::new(AtomicBool::new(false));
 
     let writer = {
@@ -326,8 +272,11 @@ fn concurrent_reader_churn() {
             let mut w = rb.writer(NoWake, NoWake).unwrap();
             let mut i = 0u64;
             while !stop.load(O::Relaxed) {
-                w.try_write(&i.to_le_bytes()).unwrap();
-                i = i.wrapping_add(1);
+                match w.try_write(&i.to_le_bytes()) {
+                    Ok(()) => i = i.wrapping_add(1),
+                    Err(WriteError::WouldBlock) => {}
+                    Err(e) => panic!("unexpected {e:?}"),
+                }
                 thread::yield_now();
             }
         })
@@ -359,13 +308,13 @@ fn concurrent_reader_churn() {
 
 // ----- Async (needs the runtime; skipped under Miri) -----
 
-/// Lossless `write().await` must suspend when the buffer fills and resume as the
-/// reader drains, losing nothing. A small capacity guarantees real backpressure;
-/// the cooperative single-threaded executor ping-pongs writer and reader.
+/// `write().await` must suspend when the buffer fills and resume as the reader
+/// drains, losing nothing. A small capacity guarantees real backpressure; the
+/// cooperative single-threaded executor ping-pongs writer and reader.
 #[cfg(all(feature = "async", not(miri)))]
 #[stellarator::test]
 async fn wait_writer_backpressures() {
-    let rb = lossless(64, 1);
+    let rb = ring(64, 1);
     let data = Notifier::default();
     let space = Notifier::default();
     let mut view = rb.view(data.clone(), space.clone()).unwrap();
@@ -395,6 +344,40 @@ async fn wait_writer_backpressures() {
     assert_eq!(got, expected);
 }
 
+/// The borrowing twin: `read().await` suspends for data and hands out a grant;
+/// dropping the grant frees space for the suspended writer.
+#[cfg(all(feature = "async", not(miri)))]
+#[stellarator::test]
+async fn wait_reader_borrows() {
+    let rb = ring(64, 1);
+    let data = Notifier::default();
+    let space = Notifier::default();
+    let mut view = rb.view(data.clone(), space.clone()).unwrap();
+    let n: u64 = 50;
+
+    let writer = {
+        let rb = rb.clone();
+        let data = data.clone();
+        let space = space.clone();
+        stellarator::spawn(async move {
+            let mut w = rb.writer(data, space).unwrap();
+            for i in 0..n {
+                w.write(&i.to_le_bytes()).await.unwrap();
+            }
+        })
+    };
+
+    let mut got = Vec::with_capacity(n as usize);
+    for _ in 0..n {
+        let grant = view.read().await.unwrap();
+        got.push(u64::from_le_bytes(grant[..8].try_into().unwrap()));
+    }
+    let _ = writer.await;
+
+    let expected: Vec<u64> = (0..n).collect();
+    assert_eq!(got, expected);
+}
+
 // ----- RawBacking / attach_raw (non-owning, same-process) -----
 
 /// Same-process attach round-trip (the dlopen scenario): a second
@@ -404,7 +387,7 @@ async fn wait_writer_backpressures() {
 /// so it runs under Miri (provenance/leak/race check of the raw attach path).
 #[test]
 fn raw_attach_same_process_roundtrip() {
-    let rb = overwrite(1024, 4);
+    let rb = ring(1024, 4);
     let (base, len) = rb.region();
     // Attach a non-owning handle over the SAME bytes `rb` owns.
     let raw = unsafe { RingBuffer::<RawBacking>::attach_raw(base, len) }.unwrap();
@@ -430,22 +413,17 @@ fn raw_attach_same_process_roundtrip() {
 }
 
 /// Geometry is recovered from the region header, not passed to `attach_raw`:
-/// overrun, committed position, and capacity all match the original handle.
+/// committed position and capacity both match the original handle.
 #[test]
 fn raw_attach_recovers_geometry() {
-    let rb = RingBuffer::create_in_memory(Config {
-        capacity: 256,
-        max_readers: 3,
-        overrun: Overrun::Lossless,
-    });
+    let rb = ring(256, 3);
     // Commit something so the recovered `committed` is non-trivial.
     rb.writer(NoWake, NoWake).unwrap().try_write(b"x").unwrap();
 
     let (base, len) = rb.region();
     let raw = unsafe { RingBuffer::<RawBacking>::attach_raw(base, len) }.unwrap();
 
-    // Overrun + committed came from the header, not from arguments.
-    assert_eq!(raw.overrun(), Overrun::Lossless);
+    // Committed came from the header region, not from arguments.
     assert_eq!(raw.committed(), rb.committed());
 
     // Capacity (256) recovered too: the `InsufficientCapacity` boundary is
@@ -489,12 +467,13 @@ fn raw_attach_bad_region_rejected() {
 /// over the SAME `RingBuffer` re-acquires the writer role and a reader slot, and
 /// the new view starts at the live edge (it never sees the previous occupant's
 /// data). This is exactly the Load -> Stop -> Load cycle a coordinator slot runs;
-/// it works today with no ring change because `View::drop` frees its slot and a
+/// it works with no ring change because `View::drop` frees its slot and a
 /// `Writer` holds no claim. `max_readers = 1` makes reclaim load-bearing: if the
-/// slot were leaked, the second `view()` would return `FullReaderTable`.
+/// slot were leaked, the second `view()` would return `FullReaderTable` — and
+/// the leaked cursor would backpressure the new writer forever.
 #[test]
 fn swap_writer_and_reader_reacquire() {
-    let rb = overwrite(256, 1);
+    let rb = ring(256, 1);
     let mut buf = Vec::new();
 
     // Occupant 1: claim, write+read, then drop the pair (the slot teardown).
@@ -535,7 +514,7 @@ fn swap_writer_and_reader_reacquire() {
 /// so Miri checks the reclaim path's provenance/leaks under reuse.
 #[test]
 fn raw_attach_swap_reacquire() {
-    let host = overwrite(256, 1); // host owns the region for the whole "mission"
+    let host = ring(256, 1); // host owns the region for the whole "mission"
     let (base, len) = host.region();
     let mut buf = Vec::new();
 
@@ -583,7 +562,6 @@ fn mmap_roundtrip() {
     let cfg = Config {
         capacity: 1024,
         max_readers: 4,
-        overrun: Overrun::Lossless,
     };
     let rb = RingBuffer::create_mmap(&path, cfg).unwrap();
     let mut w = rb.writer(NoWake, NoWake).unwrap();
@@ -596,130 +574,47 @@ fn mmap_roundtrip() {
 
     // A second handle attaches to the same region and sees matching geometry.
     let attached = unsafe { RingBuffer::attach_mmap(&path) }.unwrap();
-    assert_eq!(attached.overrun(), Overrun::Lossless);
     assert_eq!(attached.committed(), rb.committed());
-}
-
-// ----- R1: seqlock write reservation (torn-read rejection) -----
-
-/// The exact torn-read window the reservation closes, hand-driven: with the
-/// writer exactly one lap ahead (`committed == r + capacity`, legal — reader not
-/// lapped), emulate the first half of the next commit via `inner` (reserve +
-/// Release fence + scribble the bytes at `phys(r)`) **without** publishing
-/// `committed`. The read must reject as `Lapped`: before the fix the recheck
-/// compared against the still-unpublished `committed` and returned `Ok(true)`
-/// with an old/new byte mix. Then complete the commit and prove recovery.
-#[test]
-fn torn_read_rejected_by_reservation() {
-    let rb = overwrite(64, 1);
-    let mut w = rb.writer(NoWake, NoWake).unwrap();
-    let mut v = rb.view(NoWake, NoWake).unwrap();
-    let mut buf = Vec::new();
-
-    // Two 24-byte payloads -> two 32-byte records; committed = 64 = r + cap.
-    w.try_write(&[1u8; 24]).unwrap();
-    w.try_write(&[2u8; 24]).unwrap();
-    assert_eq!(rb.committed(), 64);
-    assert!(!v.is_lapped(), "one full lap ahead is still legal");
-
-    // Hand-emulate `Writer::commit`'s pre-publication half for the next record
-    // (abs 64..96, phys 0..32): reserve, fence, scribble — no `committed` store.
-    rb.inner.reserved_end().store(96, Relaxed);
-    fence(Release);
-    // SAFETY: phys 0 + rec 32 <= capacity; we drive the single writer's phases
-    // by hand (the real `w` is idle).
-    unsafe { rb.inner.write_record(0, &[9u8; 24]) };
-
-    // The reader's record at r = 0 is now half-overwritten. The seqlock recheck
-    // must reject it; the old `committed`-based recheck saw 64 - 0 <= 64 and
-    // accepted the torn copy.
-    assert_eq!(v.try_read_into(&mut buf), Err(ReadError::Lapped));
-
-    // Complete the commit, resync, and read normally to prove recovery.
-    rb.inner.committed().store(96, Release);
-    v.resync();
-    w.try_write(&[7u8; 24]).unwrap();
-    assert!(v.try_read_into(&mut buf).unwrap());
-    assert_eq!(&buf[..], &[7u8; 24]);
-}
-
-/// Steady state: after every completed write `reserved_end == committed`, and an
-/// up-to-date reader never sees a spurious `Lapped` from the reservation check.
-#[test]
-fn reservation_no_false_lap() {
-    let rb = overwrite(64, 1);
-    let mut w = rb.writer(NoWake, NoWake).unwrap();
-    let mut v = rb.view(NoWake, NoWake).unwrap();
-    let mut buf = Vec::new();
-
-    for i in 0u8..20 {
-        let msg = [i; 16];
-        w.try_write(&msg).unwrap();
-        assert_eq!(
-            rb.inner.reserved_end().load(Acquire),
-            rb.inner.committed().load(Acquire),
-            "writer idle => reservation fully published"
-        );
-        assert!(!v.is_lapped());
-        assert!(v.try_read_into(&mut buf).unwrap());
-        assert_eq!(&buf[..], &msg[..]);
-    }
 }
 
 // ----- R3/R6: garbage length is bounded, never an OOB copy/borrow -----
 
-/// Overwrite mode: a record whose length field was scribbled to `0xFFFF_FFFF`
-/// (as a lapping writer's payload bytes could leave it) is rejected as `Lapped`
-/// — the u64 straddle check bounds the copy before any pointer math (on a
-/// 32-bit target `frame_len(0xFFFF_FFFF)` would wrap `usize`), and under Miri
-/// this proves no out-of-bounds access. Restoring the header recovers the read.
+/// A record whose length field was scribbled to `0xFFFF_FFFF` is structural
+/// corruption (the writer can never lap a reader, so nothing in-crate can
+/// explain it) — both the copying read and the borrowing read must return
+/// `Corrupt` instead of building an out-of-bounds slice. The u64 straddle
+/// check bounds the length before any pointer math (on a 32-bit target
+/// `frame_len(0xFFFF_FFFF)` would wrap `usize`); under Miri this proves no
+/// out-of-bounds access.
 #[test]
-fn garbage_length_bounded() {
-    let rb = overwrite(64, 1);
+fn garbage_length_is_corrupt() {
+    let rb = ring(64, 1);
     let mut w = rb.writer(NoWake, NoWake).unwrap();
     let mut v = rb.view(NoWake, NoWake).unwrap();
     let mut buf = Vec::new();
 
     w.try_write(&[5u8; 16]).unwrap(); // record at phys 0, len 16
-    // Poke the header's length word (relaxed atomic, matching overwrite reads).
-    // SAFETY: phys 0 is in-bounds; the header is the first 8 bytes.
-    let hdr = unsafe { &*(rb.inner.data_ptr(0) as *const AtomicU64) };
-    hdr.store(0xFFFF_FFFF, Relaxed);
-    assert_eq!(v.try_read_into(&mut buf), Err(ReadError::Lapped));
+    // SAFETY: phys 0 is in-bounds; headers are plain words and nothing reads
+    // concurrently in this single-threaded test.
+    unsafe { (rb.inner.data_ptr(0) as *mut u64).write(0xFFFF_FFFF) };
+    assert_eq!(v.try_read_into(&mut buf), Err(ReadError::Corrupt));
+    assert!(v.try_read().is_err());
 
     // Restore the true length: the record reads back intact (cursor never moved).
-    hdr.store(16, Relaxed);
+    // SAFETY: as above.
+    unsafe { (rb.inner.data_ptr(0) as *mut u64).write(16) };
     assert!(v.try_read_into(&mut buf).unwrap());
     assert_eq!(&buf[..], &[5u8; 16]);
 }
 
-/// Lossless mode: the same scribbled length is structural corruption (no lap can
-/// explain it) — both the copying read and the borrowing read must return
-/// `Corrupt` instead of building an out-of-bounds slice. Pins the
-/// defense-in-depth validation independently of the registration handshake.
+// ----- R6: view registration -----
+
+/// `view()` returns with a *stable* cursor: equal to `committed` both on a
+/// quiescent ring and after heavy prior write/drain traffic (exercising the
+/// stabilization loop's convergence on the cold path).
 #[test]
-fn lossless_garbage_length_is_corrupt() {
-    let rb = lossless(64, 1);
-    let mut w = rb.writer(NoWake, NoWake).unwrap();
-    let mut v = rb.view(NoWake, NoWake).unwrap();
-    let mut buf = Vec::new();
-
-    w.try_write(&[5u8; 16]).unwrap(); // record at phys 0, len 16
-    // SAFETY: phys 0 is in-bounds; lossless headers are plain (non-atomic) words
-    // and nothing reads concurrently in this single-threaded test.
-    unsafe { (rb.inner.data_ptr(0) as *mut u64).write(0xFFFF_FFFF) };
-    assert_eq!(v.try_read_into(&mut buf), Err(ReadError::Corrupt));
-    assert_eq!(v.try_read().err(), Some(ReadError::Corrupt));
-}
-
-// ----- R6: lossless view registration -----
-
-/// `view()` on a lossless ring returns with a *stable* cursor: equal to
-/// `committed` both on a quiescent ring and after heavy prior write/drain
-/// traffic (exercising the stabilization loop's convergence on the cold path).
-#[test]
-fn lossless_view_starts_stable() {
-    let rb = lossless(128, 2);
+fn view_starts_stable() {
+    let rb = ring(128, 2);
     let v = rb.view(NoWake, NoWake).unwrap();
     assert_eq!(v.cursor(), rb.committed());
     drop(v);
@@ -748,7 +643,7 @@ fn lossless_view_starts_stable() {
 /// clone; dropping the first frees the claim for a successor.
 #[test]
 fn second_writer_rejected() {
-    let rb = overwrite(256, 1);
+    let rb = ring(256, 1);
     let w1 = rb.writer(NoWake, NoWake).unwrap();
     assert!(rb.writer(NoWake, NoWake).is_err());
     assert!(rb.clone().writer(NoWake, NoWake).is_err());
@@ -760,7 +655,7 @@ fn second_writer_rejected() {
 /// claimer: the successor continues the same absolute stream.
 #[test]
 fn writer_claim_freed_on_drop() {
-    let rb = overwrite(256, 2);
+    let rb = ring(256, 2);
     let mut v = rb.view(NoWake, NoWake).unwrap();
     let mut buf = Vec::new();
 
@@ -782,7 +677,7 @@ fn writer_claim_freed_on_drop() {
 /// vice versa once the first writer drops.
 #[test]
 fn writer_claim_shared_across_attach() {
-    let rb = overwrite(256, 1);
+    let rb = ring(256, 1);
     let (base, len) = rb.region();
     let raw = unsafe { RingBuffer::<RawBacking>::attach_raw(base, len) }.unwrap();
 
@@ -800,7 +695,7 @@ fn writer_claim_shared_across_attach() {
 /// region state a crash leaves behind.
 #[test]
 fn force_release_writer_reclaims() {
-    let rb = overwrite(256, 1);
+    let rb = ring(256, 1);
     rb.inner.writer_claim().store(1, Release);
     assert!(rb.writer(NoWake, NoWake).is_err());
 
@@ -817,7 +712,7 @@ fn force_release_writer_reclaims() {
 fn concurrent_writer_claim_churn() {
     let threads: u64 = if cfg!(miri) { 3 } else { 8 };
     let rounds = if cfg!(miri) { 8 } else { 400 };
-    let rb = overwrite(128, 1);
+    let rb = ring(128, 1);
     let successes = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
 
     let claimers: Vec<_> = (0..threads)
@@ -828,6 +723,8 @@ fn concurrent_writer_claim_churn() {
                 for i in 0..rounds {
                     match rb.writer(NoWake, NoWake) {
                         Ok(mut w) => {
+                            // No reader is registered, so the ring recycles
+                            // freely and the write always fits.
                             w.try_write(&(t * rounds + i).to_le_bytes()).unwrap();
                             successes.fetch_add(1, O::Relaxed);
                         }
@@ -844,25 +741,15 @@ fn concurrent_writer_claim_churn() {
     assert!(rb.writer(NoWake, NoWake).is_ok(), "claim free after churn");
 }
 
-// ----- B6: a reader parked on a wrap-gap start is not lapped -----
+// ----- B6: a reader parked on a wrap-gap start reads through the gap -----
 
 /// cap 64: records 0..24 and 24..48 are drained (cursor = 48); a third 16-byte
-/// payload forces the wrap gap (hwm = 48, record at 64..88); two 8-byte payloads
-/// advance `committed` to 120. The old order tested the lap before the gap skip:
-/// `120 - 48 = 72 > 64` -> a spurious, unrecoverable `Lapped` even though every
-/// unread record is intact. The skip-first order reads all three back.
-///
-/// Not run under Miri: the gap-start window mathematically requires **mixed
-/// record sizes** (uniform records tile every lap identically), and a later
-/// record's `AtomicU64` header store then lands partially over a previous lap's
-/// `AtomicU8` payload bytes — a mixed-size atomic access Miri's weak-memory
-/// store buffer ICEs on ("cannot have partially overlapping store buffer").
-/// The test is deterministic single-threaded logic; its unsafe surface is the
-/// same write/read path the uniform-size tests cover under Miri.
-#[cfg(not(miri))]
+/// payload forces the wrap gap (hwm = 48, record at 64..88). The reader parked
+/// exactly on the gap start must skip it and read the post-wrap record — the
+/// gap bytes were never data.
 #[test]
-fn reader_on_gap_start_not_lapped() {
-    let rb = overwrite(64, 1);
+fn reader_on_gap_start_reads_through() {
+    let rb = ring(64, 1);
     let mut w = rb.writer(NoWake, NoWake).unwrap();
     let mut v = rb.view(NoWake, NoWake).unwrap();
     let mut buf = Vec::new();
@@ -874,60 +761,16 @@ fn reader_on_gap_start_not_lapped() {
     assert_eq!(v.cursor(), 48);
 
     w.try_write(&[3u8; 16]).unwrap(); // wraps: hwm = 48, record at abs 64..88
-    w.try_write(&[4u8; 8]).unwrap(); // 88..104
-    w.try_write(&[5u8; 8]).unwrap(); // 104..120
-    assert_eq!(rb.committed(), 120);
-
-    assert!(!v.is_lapped(), "gap-start cursor is effectively at the lap boundary");
-    for (payload, len) in [(3u8, 16usize), (4, 8), (5, 8)] {
-        assert!(v.try_read_into(&mut buf).unwrap());
-        assert_eq!(&buf[..], &vec![payload; len][..], "record {payload} intact");
-    }
+    assert!(v.try_read_into(&mut buf).unwrap(), "gap skipped, record read");
+    assert_eq!(&buf[..], &[3u8; 16]);
     assert!(!v.try_read_into(&mut buf).unwrap());
-}
-
-/// Adversarial companion: the same gap-start parking, but the writer then truly
-/// laps (wraps again and passes `lap_end + capacity`). The reordered skip must
-/// NOT mask it: the second wrap's `hwm` store breaks the `r == hwm` match, so
-/// the ordinary lap test fires on both `is_lapped` and the read path.
-///
-/// Not run under Miri: mixed record sizes — see `reader_on_gap_start_not_lapped`.
-#[cfg(not(miri))]
-#[test]
-fn reader_on_gap_start_real_lap_detected() {
-    let rb = overwrite(64, 1);
-    let mut w = rb.writer(NoWake, NoWake).unwrap();
-    let mut v = rb.view(NoWake, NoWake).unwrap();
-    let mut buf = Vec::new();
-
-    w.try_write(&[1u8; 16]).unwrap();
-    w.try_write(&[2u8; 16]).unwrap();
-    assert!(v.try_read_into(&mut buf).unwrap());
-    assert!(v.try_read_into(&mut buf).unwrap());
-    w.try_write(&[3u8; 16]).unwrap(); // hwm = 48; reader parked on the gap start
-    assert_eq!(v.cursor(), 48);
-
-    // Keep writing past lap_end + capacity = 128: 88..104, 104..120, then a
-    // second wrap (hwm = 120) and the record 128..144.
-    w.try_write(&[4u8; 8]).unwrap();
-    w.try_write(&[5u8; 8]).unwrap();
-    w.try_write(&[6u8; 8]).unwrap();
-    assert_eq!(rb.committed(), 144);
-
-    assert!(v.is_lapped(), "a real lap past the gap boundary is detected");
-    assert_eq!(v.try_read_into(&mut buf), Err(ReadError::Lapped));
-
-    v.resync();
-    w.try_write(&[7u8; 8]).unwrap();
-    assert!(v.try_read_into(&mut buf).unwrap());
-    assert_eq!(&buf[..], &[7u8; 8]);
 }
 
 // ----- R4: attach geometry validation -----
 
 /// A handle to a valid region plus a byte-poke helper for corrupting its header.
 fn valid_region() -> (RingBuffer<BoxBacking>, *mut u8, usize) {
-    let rb = overwrite(64, 2);
+    let rb = ring(64, 2);
     let (base, len) = rb.region();
     (rb, base, len)
 }
@@ -1019,7 +862,6 @@ fn attach_mmap_rejects_truncated_file() {
     let cfg = Config {
         capacity: 1024,
         max_readers: 2,
-        overrun: Overrun::Overwrite,
     };
     drop(RingBuffer::create_mmap(&path, cfg).unwrap());
 
@@ -1048,19 +890,19 @@ fn attach_mmap_rejects_truncated_file() {
     assert!(format!("{err}").contains("shorter than the fixed header"), "{err}");
 }
 
-// ----- R6: lossless view churn under a live writer -----
+// ----- R6: view churn under a live writer -----
 
-/// One bounded lossless writer, one fast drainer, and a churner that repeatedly
-/// registers a fresh view, borrow-reads one record with full content validation,
-/// and drops it. Before the registration handshake, the writer's cursor scan
-/// could miss the fresh claim and lap it, handing the borrow overwritten bytes
-/// (UB Miri reports); after, every borrowed record is coherent. Bounded
-/// iterations, no free-running wrap stress.
+/// One bounded writer, one fast drainer, and a churner that repeatedly
+/// registers a fresh view, borrow-reads one record with full content
+/// validation, and drops it. Without the registration handshake, the writer's
+/// cursor scan could miss the fresh claim and write past it, handing the borrow
+/// overwritten bytes (UB Miri reports); with it, every borrowed record is
+/// coherent. Bounded iterations, no free-running wrap stress.
 #[test]
-fn concurrent_lossless_view_churn() {
+fn concurrent_view_churn() {
     let n: u64 = if cfg!(miri) { 32 } else { 2_000 };
     let churn_rounds = if cfg!(miri) { 8 } else { 300 };
-    let rb = lossless(128, 4);
+    let rb = ring(128, 4);
     let drainer = rb.view(NoWake, NoWake).unwrap();
 
     let consumer = thread::spawn(move || {
@@ -1077,7 +919,7 @@ fn concurrent_lossless_view_churn() {
                     count += 1;
                 }
                 Ok(false) => thread::yield_now(),
-                Err(e) => panic!("lossless drainer must never error: {e:?}"),
+                Err(e) => panic!("drainer must never error: {e:?}"),
             }
         }
     });

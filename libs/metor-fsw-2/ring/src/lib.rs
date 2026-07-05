@@ -1,36 +1,32 @@
-//! Overwrite-on-lap, shared-memory ring buffer for `metor-fsw-2`.
+//! Lossless, shared-memory ring buffer for `metor-fsw-2`.
 //!
 //! This is the transport over which fsw-2 systems exchange data. It generalizes
-//! the `metor-db` disruptor (`libs/db/src/disruptor.rs`) along two axes:
+//! the `metor-db` disruptor (`libs/db/src/disruptor.rs`) along one axis:
+//! **shared memory.** The entire stateful buffer lives in one contiguous region
+//! addressed by fixed byte offsets — no `Box`/`Arc`/process-local pointers
+//! inside it — so the same mechanism works in-process and (with the `mmap`
+//! feature) across processes.
 //!
-//! 1. **Writer-chosen overrun policy.** A buffer is created in one of two modes
-//!    (recorded in its header, [`Overrun`]):
-//!    - [`Overrun::Overwrite`] (default): the writer never blocks; when it would
-//!      reuse bytes a slow reader has not consumed it overwrites them, and the
-//!      reader detects this via [`View::is_lapped`] / [`ReadError::Lapped`].
-//!    - [`Overrun::Lossless`]: the writer honors the disruptor's in-use check —
-//!      [`Writer::try_write`] returns [`WriteError::WouldBlock`] and the async
-//!      [`Writer::write`] suspends until a reader frees space. It never laps a
-//!      reader, so reads may borrow tear-free ([`View::try_read`]).
-//! 2. **Shared memory.** The entire stateful buffer lives in one contiguous
-//!    region addressed by fixed byte offsets — no `Box`/`Arc`/process-local
-//!    pointers inside it — so the same mechanism works in-process and (with the
-//!    `mmap` feature) across processes.
+//! The buffer is **lossless**: the writer honors the disruptor's in-use check —
+//! [`Writer::try_write`] returns [`WriteError::WouldBlock`] rather than
+//! overwrite bytes a registered reader has not consumed, and the async
+//! [`Writer::write`] suspends until a reader frees space. Because the writer
+//! can never scribble a record a reader is looking at, reads borrow tear-free
+//! ([`View::try_read`], [`View::try_latest`]) with no copy and no revalidation.
 //!
-//! The unsafe core borrows the disruptor's proven techniques: absolute monotonic
-//! `u64` cursors with `phys = abs & mask`, a `committed` Release/Acquire
-//! publication handshake, and a `high_water_mark` wrap gap. On top of those,
-//! overwrite-mode reads are guarded by a seqlock-style write reservation
-//! (`reserved_end`, see `Writer::commit`), the single-writer rule is enforced by
-//! an in-region claim word ([`RingBuffer::writer`]), and lossless registration
-//! runs a `SeqCst` handshake against the writer's cursor scan (see
-//! [`RingBuffer::view`]). See `libs/metor-fsw-2/docs/ring-buffer.md` for the
-//! full design and `libs/db/MIRI.md` for the Miri strategy this crate follows.
+//! The unsafe core borrows the disruptor's proven techniques: absolute
+//! monotonic `u64` cursors with `phys = abs & mask`, a `committed`
+//! Release/Acquire publication handshake, and a `high_water_mark` wrap gap. On
+//! top of those, the single-writer rule is enforced by an in-region claim word
+//! ([`RingBuffer::writer`]), and view registration runs a `SeqCst` handshake
+//! against the writer's cursor scan (see [`RingBuffer::view`]). See
+//! `libs/metor-fsw-2/docs/ring-buffer.md` for the full design and
+//! `libs/db/MIRI.md` for the Miri strategy this crate follows.
 
 use std::cell::UnsafeCell;
 use std::sync::Arc;
 use std::sync::atomic::{
-    AtomicU8, AtomicU64, fence,
+    AtomicU64, fence,
     Ordering::{AcqRel, Acquire, Relaxed, Release, SeqCst},
 };
 
@@ -46,11 +42,11 @@ use std::sync::atomic::{
 const MAGIC: u32 = u32::from_ne_bytes(*b"MFR1");
 /// Layout version. Bumped on any incompatible layout change.
 ///
-/// Pre-1.0 note: the layout changed under version 1 without a bump — `reserved_end`
-/// (0x50) went live as the seqlock write reservation and the writer-claim word
-/// (0x60) was added. Regions are ephemeral IPC state, not archives; stale dev
-/// regions are simply recreated. Post-1.0, any such change bumps this.
-const VERSION: u16 = 1;
+/// Version 2 removed the overwrite mode: the `reserved_end` seqlock word left
+/// the control block (shifting `wake_word` and the writer claim down one word)
+/// and the lossless flag bit was retired. Regions are ephemeral IPC state, not
+/// archives; stale dev regions are simply recreated.
+const VERSION: u16 = 2;
 
 // Header (cache line 0).
 const OFF_MAGIC: usize = 0x00; // u32
@@ -66,9 +62,8 @@ const OFF_ARCH_TAG: usize = 0x28; // u64
 // Control block (cache line 1).
 const OFF_COMMITTED: usize = 0x40; // AtomicU64
 const OFF_HWM: usize = 0x48; // AtomicU64
-const OFF_RESERVED_END: usize = 0x50; // AtomicU64: seqlock write reservation (see `Writer::commit`)
-const OFF_WAKE_WORD: usize = 0x58; // AtomicU64 (reserved; future cross-proc wake)
-const OFF_WRITER: usize = 0x60; // AtomicU64: writer claim, 0 = free (see `RingBuffer::writer`)
+const OFF_WAKE_WORD: usize = 0x50; // AtomicU64 (reserved; future cross-proc wake)
+const OFF_WRITER: usize = 0x58; // AtomicU64: writer claim, 0 = free (see `RingBuffer::writer`)
 
 /// Header + control block size; the reader table starts here.
 const HEADER_SIZE: usize = 0x80;
@@ -78,11 +73,9 @@ const SLOT_OFF_CURSOR: usize = 0x00; // AtomicU64
 const SLOT_OFF_EPOCH: usize = 0x08; // AtomicU64
 
 /// `flags` bit 0: a shared-memory wake word is present (reserved; never set in
-/// v1, but the bit and [`OFF_WAKE_WORD`] reserve room for cross-process wake).
+/// v2, but the bit and [`OFF_WAKE_WORD`] reserve room for cross-process wake).
 #[allow(dead_code)]
 const FLAG_WAKE_SHARED: u16 = 1 << 0;
-/// `flags` bit 1: the buffer is in [`Overrun::Lossless`] mode.
-const FLAG_LOSSLESS: u16 = 1 << 1;
 
 /// Sentinel `cursor` value marking a reader slot as free. A real absolute byte
 /// cursor can never reach this (16 EiB committed).
@@ -116,18 +109,8 @@ pub const fn frame_len(payload_len: usize) -> usize {
 }
 
 // ---------------------------------------------------------------------------
-// Public modes / config / errors
+// Public config / errors
 // ---------------------------------------------------------------------------
-
-/// Overrun policy, fixed at creation and recorded in the header. It is the
-/// read-soundness contract every view relies on, so a buffer cannot mix modes.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Overrun {
-    /// Writer never blocks; overwrites slow readers. Reads copy + lap-recheck.
-    Overwrite,
-    /// Writer honors the in-use check (error or wait). Reads may borrow.
-    Lossless,
-}
 
 /// Buffer geometry.
 #[derive(Debug, Clone, Copy)]
@@ -135,11 +118,9 @@ pub struct Config {
     /// Data-region size in bytes. **Must be a power of two** (so `% cap` is a
     /// mask) and is therefore also a multiple of 8 (record alignment).
     pub capacity: usize,
-    /// Number of reader-table slots. Over-provision: v1 has no crash-slot
+    /// Number of reader-table slots. Over-provision: v2 has no crash-slot
     /// reclamation (see the design doc).
     pub max_readers: usize,
-    /// Overrun policy.
-    pub overrun: Overrun,
 }
 
 /// A write could not be performed.
@@ -147,7 +128,7 @@ pub struct Config {
 pub enum WriteError {
     /// The single message is larger than the whole data region.
     InsufficientCapacity,
-    /// Lossless mode: writing now would overwrite the slowest active reader.
+    /// Writing now would overwrite the slowest active reader.
     WouldBlock,
 }
 
@@ -161,7 +142,7 @@ impl core::fmt::Display for WriteError {
             }
             WriteError::WouldBlock => write!(
                 f,
-                "lossless ring is full: writing now would overwrite the slowest active reader"
+                "ring is full: writing now would overwrite the slowest active reader"
             ),
         }
     }
@@ -172,30 +153,17 @@ impl std::error::Error for WriteError {}
 /// A read could not be performed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ReadError {
-    /// The writer lapped this view; its data was overwritten. Stop reading
-    /// (or [`View::resync`] to skip to the live edge).
-    Lapped,
-    /// A tear-free borrow ([`View::try_read`]) was requested on an overwrite
-    /// buffer, where the writer can race the reader. Use [`View::try_read_into`].
-    BorrowNotSupported,
     /// The region violated a structural invariant (a record's length field says
-    /// it straddles the wrap or overruns the data region) on a lossless buffer,
-    /// where no lap can explain it: possible external corruption — stop reading.
-    /// Unreachable from this crate's own behavior; it exists so a corrupted
-    /// shared mapping degrades to an error instead of an out-of-bounds borrow.
+    /// it straddles the wrap or overruns the data region): possible external
+    /// corruption — stop reading. Unreachable from this crate's own behavior;
+    /// it exists so a corrupted shared mapping degrades to an error instead of
+    /// an out-of-bounds borrow.
     Corrupt,
 }
 
 impl core::fmt::Display for ReadError {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
-            ReadError::Lapped => {
-                write!(f, "the writer lapped this view; unread data was overwritten")
-            }
-            ReadError::BorrowNotSupported => write!(
-                f,
-                "tear-free borrow requested on an overwrite ring; use try_read_into"
-            ),
             ReadError::Corrupt => write!(
                 f,
                 "ring region violates a structural invariant (possible external corruption)"
@@ -292,7 +260,7 @@ impl std::error::Error for AttachError {}
 /// single allocation of at least [`Backing::len`] bytes that is **interior
 /// mutable** (writes through `*mut` derived from it are sound), **8-byte
 /// aligned**, and **stable** for the lifetime of `self`. The ring forms
-/// `&AtomicU64`/`&AtomicU8` references and plain byte slices over this region.
+/// `&AtomicU64` references and plain byte slices over this region.
 pub unsafe trait Backing: Send + Sync {
     /// Base of the region. Re-derived on every access to keep provenance fresh.
     fn base(&self) -> *mut u8;
@@ -472,15 +440,12 @@ struct Inner<B: Backing> {
     data_offset: usize,
     reader_table_offset: usize,
     max_readers: u32,
-    overrun: Overrun,
 }
 
 // SAFETY: every access to the shared region goes through atomics or the
-// `committed` Release/Acquire handshake. In overwrite mode the data bytes are
-// touched only via relaxed atomics (so a writer/reader overlap is a defined
-// atomic race, resolved by the lap recheck, not UB); in lossless mode the
-// in-use check gives the writer-then-reader happens-before that makes plain
-// accesses race-free, exactly as in the db disruptor. `B: Send + Sync`.
+// `committed` Release/Acquire handshake. The in-use check gives the
+// writer-then-reader happens-before that makes the plain data accesses
+// race-free, exactly as in the db disruptor. `B: Send + Sync`.
 unsafe impl<B: Backing> Send for Inner<B> {}
 unsafe impl<B: Backing> Sync for Inner<B> {}
 
@@ -512,15 +477,6 @@ impl<B: Backing> Inner<B> {
     fn hwm(&self) -> &AtomicU64 {
         // SAFETY: OFF_HWM is a fixed, 8-aligned, in-bounds control word.
         unsafe { self.atomic_u64(OFF_HWM) }
-    }
-
-    /// The seqlock write reservation: the absolute end of the record the writer
-    /// has *started* writing (stored before any data byte; `committed <=
-    /// reserved_end` at every instant). See `Writer::commit`.
-    #[inline]
-    fn reserved_end(&self) -> &AtomicU64 {
-        // SAFETY: OFF_RESERVED_END is a fixed, 8-aligned, in-bounds control word.
-        unsafe { self.atomic_u64(OFF_RESERVED_END) }
     }
 
     /// The writer-claim word: `0` = free, `1` = a live [`Writer`] exists (or a
@@ -557,17 +513,17 @@ impl<B: Backing> Inner<B> {
     }
 
     /// The smallest cursor over all *active* readers, or `None` if there are no
-    /// active readers. Used by the lossless in-use check (mirrors the
-    /// disruptor's `slowest_cursor`).
+    /// active readers. Used by the in-use check (mirrors the disruptor's
+    /// `slowest_cursor`).
     fn slowest_active_cursor(&self) -> Option<u64> {
-        // SeqCst: pairs with the registration fence in `view()` (only lossless
-        // paths call this scan). This is Dekker's pattern on two locations —
-        // reader: `store(cursor); load(committed)`, writer: `store(committed);
-        // load(cursor)` — where Release/Acquire alone allows *both* loads to
-        // read the older values (StoreLoad reordering). The fence sits between
-        // this writer's previous `committed` store and this scan, so for every
-        // write W: either W's scan observes a new reader's claim, or that
-        // reader's registration recheck observes committed_{W-1} (see `view()`).
+        // SeqCst: pairs with the registration fence in `view()`. This is
+        // Dekker's pattern on two locations — reader: `store(cursor);
+        // load(committed)`, writer: `store(committed); load(cursor)` — where
+        // Release/Acquire alone allows *both* loads to read the older values
+        // (StoreLoad reordering). The fence sits between this writer's previous
+        // `committed` store and this scan, so for every write W: either W's
+        // scan observes a new reader's claim, or that reader's registration
+        // recheck observes committed_{W-1} (see `view()`).
         fence(SeqCst);
         let mut slowest: Option<u64> = None;
         for slot in 0..self.max_readers {
@@ -593,7 +549,10 @@ impl<B: Backing> Inner<B> {
         }
     }
 
-    /// Write a record's header + payload at physical offset `phys`.
+    /// Write a record's header + payload at physical offset `phys`. Plain
+    /// stores are race-free: the in-use check guarantees no reader is inside
+    /// these bytes, and publication happens-before every read via the
+    /// `committed` Release/Acquire pair — exactly the disruptor's write path.
     ///
     /// # Safety
     /// `phys + frame_len(payload.len()) <= capacity` (record does not straddle
@@ -602,76 +561,42 @@ impl<B: Backing> Inner<B> {
         // SAFETY: phys is 8-aligned and in-bounds (caller contract).
         let p = unsafe { self.data_ptr(phys) };
         let len = payload.len() as u64; // low 32 bits = length, high = pad.
-        match self.overrun {
-            Overrun::Overwrite => {
-                // Overwrite mode races readers, so every store is a relaxed
-                // atomic. The 8-byte header goes as one `AtomicU64`; the payload
-                // byte-by-byte as `AtomicU8`. The later `committed` Release
-                // orders all of these before publication.
-                // SAFETY: p is 8-aligned, header fits in [phys, phys+8).
-                unsafe { (*(p as *const AtomicU64)).store(len, Relaxed) };
-                for (i, b) in payload.iter().enumerate() {
-                    // SAFETY: phys+8+i < capacity by the caller's contract.
-                    unsafe { (*(p.add(8 + i) as *const AtomicU8)).store(*b, Relaxed) };
-                }
-            }
-            Overrun::Lossless => {
-                // Lossless mode never overwrites in-flight bytes, so plain stores
-                // are race-free (publication via `committed`, exclusivity via the
-                // in-use check) — exactly the disruptor's write path.
-                // SAFETY: p is 8-aligned; [phys, phys+frame_len) is in-bounds.
-                unsafe {
-                    (p as *mut u64).write(len);
-                    std::ptr::copy_nonoverlapping(payload.as_ptr(), p.add(8), payload.len());
-                }
-            }
+        // SAFETY: p is 8-aligned; [phys, phys+frame_len) is in-bounds.
+        unsafe {
+            (p as *mut u64).write(len);
+            std::ptr::copy_nonoverlapping(payload.as_ptr(), p.add(8), payload.len());
         }
     }
 
     /// Read a record's length field at physical offset `phys`. Returns the raw
-    /// `u32` widened to `u64`: under a lap race it can be arbitrary payload
-    /// bytes, so the caller must validate it against the data region *before*
-    /// any `usize` conversion or pointer math (on a 32-bit target,
-    /// `frame_len(garbage)` would wrap `usize` and defeat the straddle check).
+    /// `u32` widened to `u64`: a corrupted region can carry arbitrary bytes, so
+    /// the caller must validate it against the data region *before* any `usize`
+    /// conversion or pointer math (on a 32-bit target, `frame_len(garbage)`
+    /// would wrap `usize` and defeat the straddle check).
     ///
     /// # Safety
-    /// `phys + 8 <= capacity`.
+    /// `phys + 8 <= capacity`, and the record was published (its write
+    /// happens-before this read via `committed`).
     unsafe fn read_len(&self, phys: usize) -> u64 {
-        // SAFETY: phys is 8-aligned and in-bounds (caller contract).
-        let p = unsafe { self.data_ptr(phys) };
-        let hdr = match self.overrun {
-            // SAFETY: header occupies [phys, phys+8); atomic load matches the
-            // writer's atomic store.
-            Overrun::Overwrite => unsafe { (*(p as *const AtomicU64)).load(Relaxed) },
-            // SAFETY: lossless reads are ordered after the write via `committed`.
-            Overrun::Lossless => unsafe { (p as *const u64).read() },
-        };
+        // SAFETY: phys is 8-aligned and in-bounds (caller contract); the read
+        // is ordered after the write via `committed`.
+        let hdr = unsafe { (self.data_ptr(phys) as *const u64).read() };
         hdr & 0xFFFF_FFFF
     }
 
     /// Copy `len` payload bytes starting at `phys + 8` into `dst`.
     ///
     /// # Safety
-    /// `phys + 8 + len <= capacity`.
+    /// `phys + 8 + len <= capacity`, and the record was published (its write
+    /// happens-before this read via `committed`).
     unsafe fn copy_payload(&self, phys: usize, len: usize, dst: &mut Vec<u8>) {
         dst.clear();
-        // SAFETY: payload occupies [phys+8, phys+8+len) (caller contract).
-        let p = unsafe { self.data_ptr(phys + 8) };
-        match self.overrun {
-            Overrun::Overwrite => {
-                dst.reserve(len);
-                for i in 0..len {
-                    // SAFETY: phys+8+i < capacity; atomic load matches writer.
-                    let b = unsafe { (*(p.add(i) as *const AtomicU8)).load(Relaxed) };
-                    dst.push(b);
-                }
-            }
-            Overrun::Lossless => {
-                dst.resize(len, 0);
-                // SAFETY: ordered after the write via `committed`; non-overlapping.
-                unsafe { std::ptr::copy_nonoverlapping(p, dst.as_mut_ptr(), len) };
-            }
-        }
+        dst.resize(len, 0);
+        // SAFETY: payload occupies [phys+8, phys+8+len) (caller contract);
+        // ordered after the write via `committed`; non-overlapping.
+        unsafe {
+            std::ptr::copy_nonoverlapping(self.data_ptr(phys + 8), dst.as_mut_ptr(), len)
+        };
     }
 }
 
@@ -712,7 +637,6 @@ impl RingBuffer<BoxBacking> {
                 data_offset,
                 reader_table_offset,
                 max_readers: cfg.max_readers as u32,
-                overrun: cfg.overrun,
             }),
         }
     }
@@ -743,7 +667,6 @@ impl RingBuffer<MmapBacking> {
                 data_offset,
                 reader_table_offset,
                 max_readers: cfg.max_readers as u32,
-                overrun: cfg.overrun,
             }),
         })
     }
@@ -797,8 +720,8 @@ impl RingBuffer<RawBacking> {
 
 impl<B: Backing> RingBuffer<B> {
     /// Rebuild a handle over an already-laid-out region: validate its header and
-    /// read the geometry (capacity/offsets/`max_readers`/overrun) back out of it
-    /// rather than from arguments. Shared by [`RingBuffer::attach_mmap`] and
+    /// read the geometry (capacity/offsets/`max_readers`) back out of it rather
+    /// than from arguments. Shared by [`RingBuffer::attach_mmap`] and
     /// [`RingBuffer::attach_raw`].
     ///
     /// # Safety
@@ -819,7 +742,6 @@ impl<B: Backing> RingBuffer<B> {
                 data_offset: geo.data_offset,
                 reader_table_offset: geo.reader_table_offset,
                 max_readers: geo.max_readers,
-                overrun: geo.overrun,
             }),
         })
     }
@@ -831,11 +753,6 @@ impl<B: Backing> RingBuffer<B> {
     /// another handle/backing keeping the region alive) lives.
     pub fn region(&self) -> (*mut u8, usize) {
         (self.inner.backing.base(), self.inner.backing.len())
-    }
-
-    /// This buffer's overrun policy.
-    pub fn overrun(&self) -> Overrun {
-        self.inner.overrun
     }
 
     /// The absolute number of bytes published so far.
@@ -851,7 +768,7 @@ impl<B: Backing> RingBuffer<B> {
     /// leaks it (see [`RingBuffer::force_release_writer`]).
     ///
     /// `data` is notified after every commit (data-available); `space` is awaited
-    /// by the async lossless [`Writer::write`] until a reader frees room. Use
+    /// by the async [`Writer::write`] until a reader frees room. Use
     /// [`NoWake`] for both when only the synchronous APIs are used.
     pub fn writer<WD: WakeSource, WS: WakeSink>(
         &self,
@@ -860,9 +777,9 @@ impl<B: Backing> RingBuffer<B> {
     ) -> Result<Writer<B, WD, WS>, WriterClaimed> {
         // Acquire on success: pairs with the Release store in `Writer::drop` /
         // `force_release_writer`, so drop→claim forms a synchronizes-with edge
-        // handing the whole region state (committed/hwm/reserved_end and data
-        // bytes) from the previous writer to this one. Relaxed on failure: no
-        // state is read when the claim is lost.
+        // handing the whole region state (committed/hwm and data bytes) from
+        // the previous writer to this one. Relaxed on failure: no state is read
+        // when the claim is lost.
         self.inner
             .writer_claim()
             .compare_exchange(0, 1, Acquire, Relaxed)
@@ -890,7 +807,7 @@ impl<B: Backing> RingBuffer<B> {
     /// Register a new view (reader), claiming a free slot in the reader table.
     ///
     /// `data` is awaited by the async [`View::read_into`] for new data; `space`
-    /// is notified whenever the view advances (waking a lossless waiting writer).
+    /// is notified whenever the view advances (waking a waiting writer).
     /// A fresh view only sees data committed from now on.
     pub fn view<RD: WakeSink, RS: WakeSource>(
         &self,
@@ -898,20 +815,20 @@ impl<B: Backing> RingBuffer<B> {
         space: RS,
     ) -> Result<View<B, RD, RS>, FullReaderTable> {
         // A new reader starts at the current commit point (mirrors
-        // `Disruptor::reader`): it never sees older, possibly-lapped data.
+        // `Disruptor::reader`): it never sees older data.
         let mut start = self.inner.committed().load(Acquire);
         for slot in 0..self.inner.max_readers {
             // Claim ordering: AcqRel — Acquire pairs with `View::drop`'s Release
             // store of FREE_SLOT (slot-state handoff between successive owners);
             // Release publishes the claim store itself. NOTE: visibility of this
-            // claim to the *lossless writer's* `fits()` scan is guaranteed by the
-            // SeqCst registration handshake below, not by this CAS. The epoch
-            // word is a generation counter reserved for crash reclamation; it is
-            // written (Release) but never yet read. If reclamation is ever
-            // implemented, the reclaimer must bump the epoch *before* freeing
-            // the cursor, and every cursor store made through a View handle must
-            // be preceded by an epoch check (or become a CAS on (epoch, cursor))
-            // — a plain Release store on a reclaimed slot would corrupt the new
+            // claim to the *writer's* `fits()` scan is guaranteed by the SeqCst
+            // registration handshake below, not by this CAS. The epoch word is a
+            // generation counter reserved for crash reclamation; it is written
+            // (Release) but never yet read. If reclamation is ever implemented,
+            // the reclaimer must bump the epoch *before* freeing the cursor,
+            // and every cursor store made through a View handle must be
+            // preceded by an epoch check (or become a CAS on (epoch, cursor)) —
+            // a plain Release store on a reclaimed slot would corrupt the new
             // owner's cursor.
             if self
                 .inner
@@ -922,39 +839,35 @@ impl<B: Backing> RingBuffer<B> {
                 // Bump the generation so a stale handle to a reused slot is
                 // distinguishable (reserved for future crash reclamation).
                 self.inner.slot_epoch(slot).fetch_add(1, Release);
-                if self.inner.overrun == Overrun::Lossless {
-                    // Registration handshake: loop until the claim is provably
-                    // stable. Until the writer's `fits()` scan observes the
-                    // claim, its in-use check is vacuous and it could lap past
-                    // `start + capacity` — after which the lossless borrow path
-                    // would hand out overwritten bytes. The SeqCst fence pairs
-                    // with the one in `slowest_active_cursor()`: in the fence
-                    // total order, either the writer's scan is later and must
-                    // observe our cursor store, or our recheck is later and must
-                    // observe that writer's `committed` — requiring a *stable*
-                    // `committed` therefore proves every unseen write was bounded
-                    // by some other cursor <= ours. Converges in 1-2 iterations
-                    // (each extra one needs a commit inside a ~3-instruction
-                    // window); registration is a cold path, so no iteration
-                    // bound is imposed. Overwrite mode skips this: its reads
-                    // self-validate via the seqlock recheck.
-                    loop {
-                        fence(SeqCst);
-                        // Acquire: on the break path, orders this view's later
-                        // record reads after the writes committed before `start`.
-                        let c2 = self.inner.committed().load(Acquire);
-                        if c2 == start {
-                            break;
-                        }
-                        // The writer committed while our claim may not have been
-                        // visible to its scan; those writes were validated
-                        // without us. Advance the claim to the new edge and
-                        // re-verify. "A fresh view only sees data committed from
-                        // now on" makes this a semantic no-op.
-                        start = c2;
-                        // Release: publishes the cursor for the writer's scan.
-                        self.inner.slot_cursor(slot).store(start, Release);
+                // Registration handshake: loop until the claim is provably
+                // stable. Until the writer's `fits()` scan observes the claim,
+                // its in-use check is vacuous and it could write past
+                // `start + capacity` — after which the borrow path would hand
+                // out overwritten bytes. The SeqCst fence pairs with the one in
+                // `slowest_active_cursor()`: in the fence total order, either
+                // the writer's scan is later and must observe our cursor store,
+                // or our recheck is later and must observe that writer's
+                // `committed` — requiring a *stable* `committed` therefore
+                // proves every unseen write was bounded by some other cursor
+                // <= ours. Converges in 1-2 iterations (each extra one needs a
+                // commit inside a ~3-instruction window); registration is a
+                // cold path, so no iteration bound is imposed.
+                loop {
+                    fence(SeqCst);
+                    // Acquire: on the break path, orders this view's later
+                    // record reads after the writes committed before `start`.
+                    let c2 = self.inner.committed().load(Acquire);
+                    if c2 == start {
+                        break;
                     }
+                    // The writer committed while our claim may not have been
+                    // visible to its scan; those writes were validated
+                    // without us. Advance the claim to the new edge and
+                    // re-verify. "A fresh view only sees data committed from
+                    // now on" makes this a semantic no-op.
+                    start = c2;
+                    // Release: publishes the cursor for the writer's scan.
+                    self.inner.slot_cursor(slot).store(start, Release);
                 }
                 return Ok(View {
                     inner: self.inner.clone(),
@@ -1010,16 +923,12 @@ unsafe fn init_region<B: Backing>(
 ) {
     let base = backing.base();
     debug_assert!(backing.len() >= total);
-    let mut flags = 0u16;
-    if cfg.overrun == Overrun::Lossless {
-        flags |= FLAG_LOSSLESS;
-    }
     // SAFETY: all offsets are within `total` bytes and correctly aligned; no
     // other thread can observe these writes yet.
     unsafe {
         (base.add(OFF_MAGIC) as *mut u32).write(MAGIC);
         (base.add(OFF_VERSION) as *mut u16).write(VERSION);
-        (base.add(OFF_FLAGS) as *mut u16).write(flags);
+        (base.add(OFF_FLAGS) as *mut u16).write(0);
         (base.add(OFF_CAPACITY) as *mut u64).write(cfg.capacity as u64);
         (base.add(OFF_DATA_OFFSET) as *mut u64).write(data_offset as u64);
         (base.add(OFF_MAX_READERS) as *mut u32).write(cfg.max_readers as u32);
@@ -1028,7 +937,6 @@ unsafe fn init_region<B: Backing>(
         (base.add(OFF_ARCH_TAG) as *mut u64).write(arch_tag());
         (base.add(OFF_COMMITTED) as *mut u64).write(0);
         (base.add(OFF_HWM) as *mut u64).write(HWM_NONE);
-        (base.add(OFF_RESERVED_END) as *mut u64).write(0);
         (base.add(OFF_WAKE_WORD) as *mut u64).write(0);
         (base.add(OFF_WRITER) as *mut u64).write(0);
         for slot in 0..cfg.max_readers {
@@ -1045,7 +953,6 @@ struct Geometry {
     data_offset: usize,
     reader_table_offset: usize,
     max_readers: u32,
-    overrun: Overrun,
 }
 
 /// Validate and read the immutable header fields from an existing region.
@@ -1083,7 +990,6 @@ unsafe fn read_header(base: *mut u8, region_len: usize) -> Result<Geometry, Atta
         let max_readers = (base.add(OFF_MAX_READERS) as *const u32).read();
         let reader_table_offset = (base.add(OFF_READER_TABLE_OFFSET) as *const u32).read() as u64;
         let total_size = (base.add(OFF_TOTAL_SIZE) as *const u64).read();
-        let flags = (base.add(OFF_FLAGS) as *const u16).read();
 
         // Capacity: a power of two (so `mask = capacity - 1` is well-defined),
         // at least one record header (8 bytes — `read_len`'s `phys + 8 <=
@@ -1122,18 +1028,12 @@ unsafe fn read_header(base: *mut u8, region_len: usize) -> Result<Geometry, Atta
             return Err(AttachError::RegionTruncated);
         }
 
-        let overrun = if flags & FLAG_LOSSLESS != 0 {
-            Overrun::Lossless
-        } else {
-            Overrun::Overwrite
-        };
         Ok(Geometry {
             capacity,
             // Both fit usize: they are <= total_size <= region_len: usize.
             data_offset: data_offset as usize,
             reader_table_offset: reader_table_offset as usize,
             max_readers,
-            overrun,
         })
     }
 }
@@ -1151,12 +1051,8 @@ pub struct Writer<B: Backing, WD: WakeSource, WS: WakeSink> {
 }
 
 impl<B: Backing, WD: WakeSource, WS: WakeSink> Writer<B, WD, WS> {
-    /// Write one message without blocking.
-    ///
-    /// - Overwrite mode: always succeeds (overwriting slow readers) unless the
-    ///   message exceeds capacity.
-    /// - Lossless mode: returns [`WriteError::WouldBlock`] if writing now would
-    ///   overwrite the slowest active reader.
+    /// Write one message without blocking. Returns [`WriteError::WouldBlock`]
+    /// if writing now would overwrite the slowest active reader.
     pub fn try_write(&mut self, bytes: &[u8]) -> Result<(), WriteError> {
         let rec = frame_len(bytes.len()) as u64;
         if rec > self.inner.capacity {
@@ -1164,7 +1060,7 @@ impl<B: Backing, WD: WakeSource, WS: WakeSink> Writer<B, WD, WS> {
         }
         let c = self.inner.committed().load(Relaxed); // sole writer
         let (start_abs, gap) = self.inner.reserve(c, rec);
-        if self.inner.overrun == Overrun::Lossless && !self.fits(c, gap + rec) {
+        if !self.fits(c, gap + rec) {
             return Err(WriteError::WouldBlock);
         }
         // SAFETY: rec <= capacity and the wrap was computed, so the record does
@@ -1173,8 +1069,7 @@ impl<B: Backing, WD: WakeSource, WS: WakeSink> Writer<B, WD, WS> {
         Ok(())
     }
 
-    /// Write one message, suspending (lossless mode) until there is room. In
-    /// overwrite mode this never actually suspends.
+    /// Write one message, suspending until there is room.
     pub async fn write(&mut self, bytes: &[u8]) -> Result<(), WriteError> {
         let rec = frame_len(bytes.len()) as u64;
         if rec > self.inner.capacity {
@@ -1183,12 +1078,12 @@ impl<B: Backing, WD: WakeSource, WS: WakeSink> Writer<B, WD, WS> {
         loop {
             let c = self.inner.committed().load(Relaxed);
             let (start_abs, gap) = self.inner.reserve(c, rec);
-            if self.inner.overrun == Overrun::Overwrite || self.fits(c, gap + rec) {
+            if self.fits(c, gap + rec) {
                 // SAFETY: see `try_write`.
                 unsafe { self.commit(c, start_abs, gap, bytes) };
                 return Ok(());
             }
-            // Wait for a reader to free `need` bytes, then re-evaluate.
+            // Wait for a reader to free enough bytes, then re-evaluate.
             let inner = self.inner.clone();
             self.space
                 .wait_until(|| {
@@ -1202,7 +1097,7 @@ impl<B: Backing, WD: WakeSource, WS: WakeSink> Writer<B, WD, WS> {
     }
 
     /// Whether a write needing `need` bytes fits without overwriting the slowest
-    /// active reader (lossless in-use check; mirrors the disruptor).
+    /// active reader (the in-use check; mirrors the disruptor).
     #[inline]
     fn fits(&self, committed: u64, need: u64) -> bool {
         let slowest = self.inner.slowest_active_cursor().unwrap_or(committed);
@@ -1214,24 +1109,10 @@ impl<B: Backing, WD: WakeSource, WS: WakeSink> Writer<B, WD, WS> {
     ///
     /// # Safety
     /// `start_abs & mask` plus `frame_len(bytes.len())` does not exceed
-    /// `capacity` (record is contiguous), and we hold the single-writer role.
+    /// `capacity` (record is contiguous), we hold the single-writer role, and
+    /// the in-use check passed (no reader cursor inside the reused bytes).
     unsafe fn commit(&self, committed: u64, start_abs: u64, gap: u64, bytes: &[u8]) {
         let end_abs = start_abs + frame_len(bytes.len()) as u64;
-        // Seqlock begin: reserve `[start_abs, end_abs)` before touching data
-        // (unconditionally, both modes, so `committed <= reserved_end` is a
-        // uniform invariant). `start_abs` already includes the wrap-gap skip, so
-        // the reservation covers exactly the bytes `write_record` stores.
-        //
-        // Ordering: Relaxed store + Release *fence* — a Release store on
-        // `reserved_end` would only order *prior* accesses before itself and
-        // would not stop the subsequent relaxed data stores from becoming
-        // visible first, reopening the torn-read window. The fence-to-fence
-        // seqlock is the correct shape: if a reader's relaxed payload load reads
-        // a value stored after this fence, this fence synchronizes-with the
-        // reader's Acquire fence (C++ [atomics.fences]), making the reservation
-        // visible to its recheck (see `try_read_into`).
-        self.inner.reserved_end().store(end_abs, Relaxed);
-        fence(Release);
         let phys = (start_abs & self.inner.mask) as usize;
         // SAFETY: record is contiguous and in-bounds (caller contract).
         unsafe { self.inner.write_record(phys, bytes) };
@@ -1249,8 +1130,8 @@ impl<B: Backing, WD: WakeSource, WS: WakeSink> Writer<B, WD, WS> {
 impl<B: Backing, WD: WakeSource, WS: WakeSink> Drop for Writer<B, WD, WS> {
     fn drop(&mut self) {
         // Free the region's writer claim. Release: pairs with the Acquire CAS in
-        // `RingBuffer::writer`, handing the whole region state (committed / hwm /
-        // reserved_end and the data bytes) to the next claimer.
+        // `RingBuffer::writer`, handing the whole region state (committed / hwm
+        // and the data bytes) to the next claimer.
         self.inner.writer_claim().store(0, Release);
     }
 }
@@ -1291,94 +1172,22 @@ impl<B: Backing, RD: WakeSink, RS: WakeSource> View<B, RD, RS> {
         self.inner.committed().load(Acquire)
     }
 
-    /// Whether the writer has lapped this view (its next bytes were overwritten).
-    /// Always `false` on a lossless buffer. This is the check the coordinator
-    /// runs before invoking a cyclic system.
-    pub fn is_lapped(&self) -> bool {
-        if self.inner.overrun == Overrun::Lossless {
-            return false;
-        }
-        let r = self.inner.slot_cursor(self.slot).load(Acquire);
-        // Load order is load-bearing (same chain as `locate`): `hwm` after
-        // `committed` — seeing a post-wrap `committed` implies seeing its `hwm`
-        // store — and `reserved_end` after `hwm` — the commit's reservation
-        // store is sequenced before its `hwm` Release store, so a seen gap
-        // marker implies `reserved_end >= lap_end` and the subtraction below
-        // cannot spuriously wrap.
-        let c = self.inner.committed().load(Acquire);
-        let hwm = self.inner.hwm().load(Acquire);
-        // A cursor parked exactly on a wrap gap effectively sits at the next lap
-        // boundary (the gap bytes were never data) — evaluate the lap there, or
-        // a reader at a gap start would be declared lapped while its next real
-        // record is intact (see `locate`'s gap skip).
-        let r_eff = if r == hwm {
-            (r & !self.inner.mask) + self.inner.capacity
-        } else {
-            r
-        };
-        // Caught up (or transiently parked ahead of `committed` by the gap
-        // skip): no unread bytes exist, so nothing can have been overwritten.
-        // This also filters the wrap-in-flight artifact where a stale `hwm`
-        // read leaves `r_eff = r` while the writer's reservation is already
-        // visible past the gap.
-        if r_eff >= c {
-            return false;
-        }
-        // Compare against `reserved_end`, not `committed`: an *in-flight* write
-        // that has reserved past `r_eff + capacity` is already scribbling this
-        // reader's next bytes, and the read path's seqlock recheck would reject
-        // the read anyway — one lap definition crate-wide.
-        let re = self.inner.reserved_end().load(Acquire);
-        re.wrapping_sub(r_eff) > self.inner.capacity
-    }
-
-    /// Skip to the live edge, abandoning any unread (possibly lapped) data. Use
-    /// after [`ReadError::Lapped`] to resume from current data.
-    pub fn resync(&self) {
-        let c = self.inner.committed().load(Acquire);
-        self.inner.slot_cursor(self.slot).store(c, Release);
-    }
-
     /// Copy the next record into `buf`. `Ok(true)` = a record was read,
-    /// `Ok(false)` = caught up (nothing new), `Err(Lapped)` = overwritten.
-    ///
-    /// Safe on both kinds of buffer: overwrite buffers copy via relaxed atomics
-    /// and re-validate the lap condition (whole-buffer recheck); lossless buffers
-    /// copy plainly (the recheck never fires).
+    /// `Ok(false)` = caught up (nothing new). Prefer [`View::try_read`] — the
+    /// writer can never overwrite an unread record, so borrowing is always
+    /// tear-free; this copying form exists for callers that must own the bytes.
     pub fn try_read_into(&mut self, buf: &mut Vec<u8>) -> Result<bool, ReadError> {
         let Some(loc) = self.locate()? else {
             return Ok(false);
         };
         // SAFETY: `loc` came from `locate`, so the record is contiguous and
-        // in-bounds (`rec <= capacity`).
+        // in-bounds (`rec <= capacity`), and published via `committed`.
         unsafe { self.inner.copy_payload(loc.phys, loc.len, buf) };
-        if self.inner.overrun == Overrun::Overwrite {
-            // Seqlock validate: any write that touched a byte of this record sits
-            // at absolute `p >= r + capacity` and reserved `reserved_end > p`
-            // *before* storing that byte (behind its Release fence). If any of
-            // our relaxed payload loads saw such a store, this Acquire fence
-            // pairs with that Release fence, so the recheck load must observe
-            // `reserved_end > r + capacity` -> `Lapped`. Contrapositive: recheck
-            // passes => no copied byte came from an overlapping write. Checking
-            // `committed` here is NOT enough: the writer scribbles data bytes
-            // before its `committed` Release store, so a writer exactly one lap
-            // ahead can tear the copy while `committed` still passes the check.
-            // (Tear-old is excluded by `locate`'s Acquire on `committed`.)
-            fence(Acquire);
-            // Relaxed: the fence above carries the ordering. `reserved_end >=
-            // committed >= r + rec > r` for any record `locate` returns, so the
-            // subtraction never wraps in a passing case.
-            let re = self.inner.reserved_end().load(Relaxed);
-            if re.wrapping_sub(loc.r) > self.inner.capacity {
-                return Err(ReadError::Lapped);
-            }
-        }
         self.advance(loc.r + loc.rec as u64);
         Ok(true)
     }
 
-    /// Await and copy the next record (async systems). Propagates
-    /// [`ReadError::Lapped`].
+    /// Await and copy the next record (async consumers that must own the bytes).
     pub async fn read_into(&mut self, buf: &mut Vec<u8>) -> Result<(), ReadError> {
         loop {
             if self.try_read_into(buf)? {
@@ -1394,20 +1203,18 @@ impl<B: Backing, RD: WakeSink, RS: WakeSource> View<B, RD, RS> {
         }
     }
 
-    /// Tear-free, zero-copy borrow of the next record. Available only on a
-    /// lossless buffer (where the writer cannot overwrite a borrowed record);
-    /// returns [`ReadError::BorrowNotSupported`] on an overwrite buffer. The
-    /// returned grant holds this view's cursor until dropped, at which point the
-    /// cursor advances and a waiting writer is woken.
+    /// Tear-free, zero-copy borrow of the next record. The writer cannot
+    /// overwrite a record this view has not consumed (the in-use check), so the
+    /// borrow is stable for its whole lifetime. The returned grant holds this
+    /// view's cursor until dropped, at which point the cursor advances past the
+    /// record and a waiting writer is woken.
     pub fn try_read(&mut self) -> Result<Option<ReadGrant<'_, B, RS>>, ReadError> {
-        if self.inner.overrun != Overrun::Lossless {
-            return Err(ReadError::BorrowNotSupported);
-        }
         let Some(loc) = self.locate()? else {
             return Ok(None);
         };
-        // SAFETY: lossless mode + `locate` ⇒ the writer will not overwrite these
-        // bytes while the borrow lives (in-use check), and they are in-bounds.
+        // SAFETY: `locate` ⇒ the record is in-bounds, and the writer will not
+        // overwrite these bytes while the borrow lives (in-use check: the
+        // cursor stays at or before `loc.r` until the grant drops).
         let slice = unsafe {
             let p = self.inner.data_ptr(loc.phys + 8);
             std::slice::from_raw_parts(p as *const u8, loc.len)
@@ -1421,9 +1228,64 @@ impl<B: Backing, RD: WakeSink, RS: WakeSource> View<B, RD, RS> {
         }))
     }
 
+    /// Await the next record and borrow it (event-driven async consumers) — the
+    /// grant twin of [`View::read_into`].
+    pub async fn read(&mut self) -> Result<ReadGrant<'_, B, RS>, ReadError> {
+        // Await-then-borrow is split from `try_read` for borrowck: a grant
+        // taken inside the wait loop would pin the `self` borrow across every
+        // iteration. Nothing else can consume between the successful `locate`
+        // and the `try_read` — we hold `&mut self`.
+        while self.locate()?.is_none() {
+            let inner = self.inner.clone();
+            let slot = self.slot;
+            self.data
+                .wait_until(|| {
+                    inner.committed().load(Acquire) > inner.slot_cursor(slot).load(Acquire)
+                })
+                .await;
+        }
+        Ok(self.try_read()?.expect("record located above"))
+    }
+
+    /// Tear-free, zero-copy borrow of the **newest** committed record,
+    /// consuming (freeing for the writer) every older unread record — the
+    /// latest-wins read. The cursor parks at the returned record's *start*, so
+    /// the record stays pinned (the writer cannot reclaim it) and a later call
+    /// with no new data returns the same record again. `Ok(None)` only before
+    /// the first record is committed (or after the stream was fully consumed
+    /// through [`View::try_read`]/[`View::try_read_into`]).
+    pub fn try_latest(&mut self) -> Result<Option<ReadGrant<'_, B, RS>>, ReadError> {
+        loop {
+            let Some(loc) = self.locate()? else {
+                return Ok(None);
+            };
+            let end = loc.r + loc.rec as u64;
+            // Newest iff nothing is committed past it (re-snapshotted each
+            // pass; a racing commit just means one more skip iteration).
+            if end >= self.inner.committed().load(Acquire) {
+                // SAFETY: as in `try_read`; the cursor stays at `loc.r` (the
+                // grant's drop re-stores it), so the record stays pinned.
+                let slice = unsafe {
+                    let p = self.inner.data_ptr(loc.phys + 8);
+                    std::slice::from_raw_parts(p as *const u8, loc.len)
+                };
+                return Ok(Some(ReadGrant {
+                    inner: &self.inner,
+                    space: &self.space,
+                    slot: self.slot,
+                    // Park at the record start, not its end: the pin that makes
+                    // the next `try_latest` re-serve this record.
+                    end_abs: loc.r,
+                    slice,
+                }));
+            }
+            // An older record: consume it so the writer can reuse its bytes.
+            self.advance(end);
+        }
+    }
+
     /// Find the next readable record, skipping a wrap gap if the cursor sits on
-    /// one. Returns `Ok(None)` when caught up, `Err(Lapped)` (overwrite mode) if
-    /// lapped.
+    /// one. Returns `Ok(None)` when caught up.
     fn locate(&self) -> Result<Option<Located>, ReadError> {
         let cap = self.inner.capacity;
         loop {
@@ -1437,56 +1299,45 @@ impl<B: Backing, RD: WakeSink, RS: WakeSource> View<B, RD, RS> {
             let c = self.inner.committed().load(Acquire);
             let hwm = self.inner.hwm().load(Acquire);
             if r == hwm {
-                // Skip the wrap gap and resume at the next lap boundary — and do
-                // it *before* the lap test: a cursor parked exactly on a gap
-                // start effectively sits at `lap_end` (the gap bytes were never
-                // data), so testing the lap at `r` would spuriously hard-stop a
-                // reader whose next real record is intact. The skip itself never
-                // accepts data; the next iteration re-runs the lap test against
-                // `lap_end` with a fresh `committed`, so a real lap is still
-                // caught. A given `r` can match at most one gap ever (`hwm`
-                // values strictly increase), so a stale `hwm` cannot re-trigger.
+                // Skip the wrap gap and resume at the next lap boundary (the
+                // gap bytes were never data). The skip itself never accepts
+                // data; the next iteration re-runs against a fresh `committed`.
+                // A given `r` can match at most one gap ever (`hwm` values
+                // strictly increase), so a stale `hwm` cannot re-trigger.
                 let lap_end = (r & !self.inner.mask) + cap;
                 self.inner.slot_cursor(self.slot).store(lap_end, Release);
                 self.space.notify();
                 continue;
             }
-            // Caught-up before the lap test: the gap skip can transiently park
-            // the cursor *ahead* of `committed` (the wrap's `hwm` publishes
-            // before its `committed`), and `c - r` would wrap to a huge value.
-            // A reader at or ahead of the live edge has no unread bytes to lose.
+            // Caught-up check: the gap skip can transiently park the cursor
+            // *ahead* of `committed` (the wrap's `hwm` publishes before its
+            // `committed`); a reader at or ahead of the live edge has nothing
+            // to read.
             if r >= c {
                 return Ok(None); // caught up
             }
-            if self.inner.overrun == Overrun::Overwrite && c.wrapping_sub(r) > cap {
-                return Err(ReadError::Lapped);
-            }
             let phys = (r & self.inner.mask) as usize;
             // SAFETY: phys is an 8-aligned, in-bounds record start (attach
-            // geometry guarantees `capacity >= 8`, so `phys <= cap - 8`).
+            // geometry guarantees `capacity >= 8`, so `phys <= cap - 8`), and
+            // `r < c` orders this read after the record's publication.
             let len = unsafe { self.inner.read_len(phys) };
             // Bound the length in u64 *before* any usize conversion or pointer
-            // math: under a lap race the header word can be arbitrary payload
-            // bytes, and on a 32-bit target `frame_len(garbage)` would wrap
-            // `usize` and defeat this very check. `len > cap - 8 - phys` is the
-            // straddle predicate `phys + rec > cap` rewritten overflow-free
+            // math: a corrupted region can carry arbitrary header bytes, and on
+            // a 32-bit target `frame_len(garbage)` would wrap `usize` and
+            // defeat this very check. `len > cap - 8 - phys` is the straddle
+            // predicate `phys + rec > cap` rewritten overflow-free
             // (`cap - phys - 8` is a multiple of 8 and cannot underflow since
-            // record starts are 8-aligned with `phys <= cap - 8`; for a multiple
-            // of 8 `m`, `round_up8(len) > m <=> len > m`). Validated in *both*
-            // modes: a real record never straddles the wrap, so on overwrite an
-            // apparent straddle means a lapping writer was rewriting the header
-            // (`Lapped`); on lossless no lap can explain it — the region is
-            // structurally corrupt (`Corrupt`) and must not be borrowed from.
+            // record starts are 8-aligned with `phys <= cap - 8`; for a
+            // multiple of 8 `m`, `round_up8(len) > m <=> len > m`). A real
+            // record never straddles the wrap, and the writer can never lap a
+            // reader, so no in-crate behavior can explain it — the region is
+            // structurally corrupt and must not be borrowed from.
             if len > cap - 8 - phys as u64 {
-                return Err(match self.inner.overrun {
-                    Overrun::Overwrite => ReadError::Lapped,
-                    Overrun::Lossless => ReadError::Corrupt,
-                });
+                return Err(ReadError::Corrupt);
             }
             // In-bounds now: len <= cap <= usize::MAX and phys + rec <= cap, so
-            // every downstream `unsafe` (copy_payload / from_raw_parts) inherits
-            // an in-bounds range even if the length was concurrently scribbled
-            // (acceptance is then still gated by the seqlock recheck).
+            // every downstream `unsafe` (copy_payload / from_raw_parts)
+            // inherits an in-bounds range.
             let len = len as usize;
             let rec = frame_len(len);
             return Ok(Some(Located { r, phys, len, rec }));
@@ -1508,8 +1359,10 @@ impl<B: Backing, RD: WakeSink, RS: WakeSource> Drop for View<B, RD, RS> {
     }
 }
 
-/// A borrowed, tear-free view of one record on a lossless buffer. Derefs to the
-/// payload bytes; on drop, advances the cursor past this record.
+/// A borrowed, tear-free view of one record. Derefs to the payload bytes; on
+/// drop, moves the view's cursor to `end_abs` — past the record for a
+/// [`View::try_read`]/[`View::read`] grant (consume), back to its start for a
+/// [`View::try_latest`] grant (pin) — and wakes a waiting writer.
 pub struct ReadGrant<'a, B: Backing, RS: WakeSource> {
     inner: &'a Inner<B>,
     space: &'a RS,
