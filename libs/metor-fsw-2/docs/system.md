@@ -19,7 +19,8 @@ The code lives in:
 - `src/system/mod.rs` — the `System` / `CyclicSystem` / `AsyncSystem` / `BuildSystem`
   traits, the `SystemInput` / `SystemOutput` bundle traits, the `Out<O>` health wrapper,
   and the `CyclicRunner` driver. Unit tests in `src/system/tests.rs`.
-- `src/port.rs` — the typed `Output<F>` / `Input<F>` port wrappers and `FrameRef<F>`.
+- `src/port.rs` — the typed `Output<F>` / `Input<F>` port wrappers and `FrameRef<F>` /
+  `FrameGrant<F>`.
 - `src/binder.rs` — the `RingSource` / `BindPorts` binding contract and the host `Binder`.
 - `src/descriptor.rs` — `PortDesc`, `SystemDescriptor`, `SystemKind`, and `compatible`.
 - `src/health.rs` — `SystemHealth` / `SystemLog` frames and the `HealthPort` handle.
@@ -85,8 +86,9 @@ timestamp — the same value handed to every system in one cycle, and the value 
 simulated clock — so a system stamps its output frames with it rather than calling
 `Timestamp::now()` independently.
 
-`execute` takes `&mut Self::Input` (not `&`): draining a ring `View` advances its cursor
-and fills the port's reused scratch buffer, so reading is a mutating operation. It takes
+`execute` takes `&mut Self::Input` (not `&`): reading a ring `View` advances (or pins) its
+cursor, so reading is a mutating operation even though the data it exposes is a zero-copy
+borrow off the upstream ring. It takes
 `&mut Self::Output` because the output ports wrap ring `Writer`s, which need `&mut self` to
 write and which must persist across cycles — a `Writer` holds the single-writer role for a
 buffer, so recreating it each cycle would be wrong. The coordinator owns the bundles
@@ -111,7 +113,7 @@ An async system owns its own loop. The coordinator spawns `run` **once** and doe
 the system. Inside `run`, an event-driven system awaits its input ports with
 `Input::recv` (backed by the ring's `Notifier` wake) and does its work on each wake; a
 rate-driven system sleeps on its own timer and works on each tick. Either way it uses the
-async output path (`Output::write_async`) so a lossless output can suspend for space. The
+async output path (`Output::write_async`) so a full output can suspend for space. The
 input and output references are `&mut` for the same reasons as `CyclicSystem::execute`.
 
 ### 1.4 The leaf trait is the structural distinction
@@ -174,7 +176,7 @@ where B: Backing, WD: WakeSource, WS: WakeSink
 ```
 
 Cyclic outputs default to `BoxBacking` + `NoWake`; async outputs select a `Notifier` wake
-so a lossless write can suspend for space. The write methods (available when
+so a write can suspend for space. The write methods (available when
 `F: Frame + IntoBytes + Immutable`):
 
 ```rust
@@ -189,16 +191,17 @@ pub fn write(&mut self, frame: &F) -> Result<(), WriteError>;
 pub fn write_with(&mut self, fixed: &F, build: impl FnOnce(&mut FrameWriter<F>))
     -> Result<(), WriteError>;
 
-/// **Infallible (E6)** publish of a fixed frame: on the framework's `Overwrite`
-/// rings a `try_write` only fails on `InsufficientCapacity` (a sizing bug, not a
-/// runtime condition a system can act on), so `publish` counts the drop instead of
-/// returning it — the port has no `HealthPort` to report through directly.
+/// **Infallible (E6)** publish of a fixed frame: a failed `try_write` is either
+/// `InsufficientCapacity` (a sizing bug) or `WouldBlock` (a slow reader
+/// backpressuring the ring), neither a condition the system can act on mid-cycle,
+/// so `publish` counts the drop instead of returning it — the port has no
+/// `HealthPort` to report through directly.
 pub fn publish(&mut self, frame: &F);
 
 /// The `write_with` twin of `publish` — same infallible/counted-drop contract.
 pub fn publish_with(&mut self, fixed: &F, build: impl FnOnce(&mut FrameWriter<F>));
 
-/// Async publish of a fixed frame: suspends (lossless mode only) until there is room.
+/// Async publish of a fixed frame: suspends until a reader frees room.
 pub async fn write_async(&mut self, frame: &F) -> Result<(), WriteError>;
 ```
 
@@ -244,8 +247,8 @@ pub trait SystemOutput {
 }
 ```
 
-`SystemInput` is the input-side twin (`decls`/`port_descs`, plus `any_lapped` in place of
-`take_dropped` — §2.5). Both traits are `decls()`-first rather than `descriptors()`-first because a
+`SystemInput` is the input-side twin (`decls`/`port_descs`, with no counter to take — §2.5).
+Both traits are `decls()`-first rather than `descriptors()`-first because a
 bundle field is not always a port: a `Capability` (currently only `ReceiveAll`) reserves no ring and
 wires no edge, so it cannot be represented as a `PortDesc` — `decls()` is the one type-blind walk
 both the derive and the binder use, and `port_descs()` is a convenience filter over it for callers
@@ -280,57 +283,50 @@ pub struct Input<F, B = BoxBacking, RD = NoWake, RS = NoWake>
 where B: Backing, RD: WakeSink, RS: WakeSource
 {
     view: View<B, RD, RS>,
-    scratch: Vec<u8>,   // reused copy-out target
-    have: bool,         // whether scratch holds a valid record
     _f: PhantomData<F>,
 }
 ```
 
-Lap checking and resync (always available):
-
-```rust
-/// True iff the writer lapped this view (overwrite buffers only). The coordinator
-/// checks this on cyclic systems *before* `execute` (§3.1).
-pub fn is_lapped(&self) -> bool;
-
-/// Skip to the live edge, abandoning unread (possibly lapped) data. Async input
-/// ports call this on lap to "drop on full and continue" (§3.2).
-pub fn resync(&self);
-```
+There is no scratch buffer: reads are zero-copy borrows straight off the ring. This is safe
+because the ring is **lossless** — the writer can never overwrite a record a reader has not
+consumed, so a borrowed record is valid for as long as the grant holding it lives.
 
 Reads (available when `F: Frame + FromBytes + KnownLayout + Immutable`):
 
 ```rust
-/// Drain to the newest record and hand back a typed view of it, or `None` if no
-/// record has arrived since the last call. Cyclic systems want the freshest sample,
-/// not a backlog. **Infallible (E3)**: on a lap it resyncs to the live edge and
-/// latches the lap internally — `is_lapped()` still surfaces it for the runner's
-/// pre-execute hard-stop check, but a same-cycle lap racing an async producer just
-/// resyncs and reports rather than propagating an error from inside `execute`.
-pub fn latest(&mut self) -> Option<FrameRef<'_, F>>;
+/// The newest committed record as a typed zero-copy borrow, or `None` if no record
+/// has ever arrived. Cyclic systems want the freshest sample, not a backlog. Older
+/// unread records are consumed (freed for the writer) on the way; the newest stays
+/// **pinned** on the ring, so a later cycle with no new data is served the same
+/// record again, and the writer backpressures rather than overwrite it
+/// (`DEFAULT_DEPTH` absorbs the one pinned record per latest-wins consumer).
+pub fn latest(&mut self) -> Option<FrameGrant<'_, F>>;
 
 /// Process *every* record since the last drain, in order (command / event channels
-/// that cannot drop a record). Stops and returns `Err` on lap.
+/// that cannot drop a record). Each record is borrowed in place as a `FrameRef` and
+/// freed for the writer as soon as `f` returns.
 pub fn drain(&mut self, f: impl FnMut(FrameRef<'_, F>)) -> Result<(), ReadError>;
 
 /// Await the next record (event-driven async systems). Backed by the view's async
-/// `read_into`, which suspends on the `RD` wake until data commits. Propagates `Lapped`.
-pub async fn recv(&mut self) -> Result<FrameRef<'_, F>, ReadError>;
+/// `read`, which suspends on the `RD` wake until data commits. The record is
+/// consumed (freed for the writer) when the grant drops.
+pub async fn recv(&mut self) -> Result<FrameGrant<'_, F>, ReadError>;
 ```
 
-`latest` loops `View::try_read_into` until caught up, keeping the last record — the
-latest-wins drain a cyclic sampler wants. `drain` instead delivers each record to a closure,
-for a channel that must not drop. `recv` awaits the next record for an event-driven async
-system. The choice between them is a system-author decision, not a trait constraint.
-`drain`/`recv` are unaffected by E3 — only `latest`'s signature dropped the `Result`, because
-the coordinator already hard-stops a cyclic system on lap *before* `execute` runs (§3.1), so
-inside `execute` a same-thread producer's lap is unreachable and only an async producer's lap
-can still race it — in which case "resync and report" is the only sensible cyclic policy.
+`latest` gives the latest-wins read a cyclic sampler wants; `drain` instead delivers each
+record to a closure, for a channel that must not drop; `recv` awaits the next record for an
+event-driven async system. The choice between them is a system-author decision, not a trait
+constraint. `ReadError` has a single variant, `Corrupt` — a structurally invalid region,
+defense-in-depth for a corrupted shared mapping and unreachable from in-crate behavior
+(`latest` folds it to `None`; `drain`/`recv` propagate it).
 
-### 2.4 Typed access — `FrameRef<F>`
+### 2.4 Typed access — `FrameRef<F>` / `FrameGrant<F>`
 
-A read hands out a `FrameRef<'_, F>`: a zero-copy typed view over one record's table bytes,
-with three access paths:
+A callback drain hands out a `FrameRef<'_, F>`: a zero-copy typed view over one record's
+table bytes. The reads that *hand back* a record (`latest`, `recv`) return a
+`FrameGrant<'_, F>` — a ring `ReadGrant` (the borrow of the record in place, holding the
+view's cursor) wrapped with the same accessor surface; dropping it releases the record per
+the grant's semantics (consume for `recv`, keep-pinned for `latest`). Three access paths:
 
 ```rust
 impl<'a, F: Frame + FromBytes + KnownLayout + Immutable> FrameRef<'a, F> {
@@ -365,21 +361,20 @@ pub trait SystemInput {
     /// The wired-port projection of `decls()` — what edge validation and ring
     /// sizing consume. Has a default impl in terms of `decls()`.
     fn port_descs() -> Vec<PortDesc> { /* filter_map(PortDecl::into_port) */ }
-    /// Whether any input port is in lap fault — a lap observed on a port whose
-    /// `OnLap` policy is `Stop` (the cyclic frame-input default; a `Resync`-policy
-    /// port, e.g. a message input, never contributes here). The coordinator checks
-    /// this on cyclic systems before `execute` (§3.1).
-    fn any_lapped(&self) -> bool;
 }
 ```
+
+The input side carries no runtime state to collect: reads borrow off the ring, and a slow
+reader shows up on the *producer's* side as a counted `publish` drop (§2.1), not as an
+input-side fault.
 
 ### 2.6 Deriving the bundles
 
 Port bundles are plain structs of `Input<F>` / `Output<F>` fields, and `#[derive(SystemInput)]`
-/ `#[derive(SystemOutput)]` generate the boilerplate from the field types: `descriptors()`
-delegates to each port's `descriptor()` in field order, `any_lapped()` ORs each input port's
-`is_lapped()`, and the derive also emits the matching `BindPorts` impl (§5.3). A complete
-cyclic system:
+/ `#[derive(SystemOutput)]` generate the boilerplate from the field types: `decls()`
+delegates to each port's `decl()` in field order, `take_dropped()` sums-and-clears the output
+ports' drop counters, and the derive also emits the matching `BindPorts` impl (§5.4). A
+complete cyclic system:
 
 ```rust
 #[derive(SystemInput)]
@@ -402,7 +397,7 @@ impl System for Filter {
 
 impl CyclicSystem for Filter {
     fn execute(&mut self, now: Timestamp, input: &mut FilterIn, output: &mut Out<FilterOut>) {
-        let Ok(Some(imu)) = input.imu.latest() else {
+        let Some(imu) = input.imu.latest() else {
             output.health().error("imu_missing");
             return;
         };
@@ -434,27 +429,29 @@ everything else is shared.
 ### 3.1 Cyclic systems
 
 - **Input source:** each input port's `View` is registered directly on the upstream
-  system's output buffer (overwrite mode). No copy.
+  system's output buffer. No copy — reads are in-place borrows.
 - **Triggering:** the coordinator calls `execute` once per cycle.
-- **Lap = hard stop.** Before invoking, the coordinator checks `any_lapped()` on the input
-  bundle. A lapped view means the reader is hopelessly behind; the framework driver
-  telemeters it and permanently stops the system rather than silently resyncing (§4, the
-  `CyclicRunner`). The `Input` port only *exposes* `is_lapped()`; the stop policy lives in
-  the driver/coordinator.
+- **Backpressure, not laps.** The ring is lossless, so a slow consumer can never be lapped;
+  instead its unread records hold ring space and the *producer's* `publish` starts returning
+  `WouldBlock`, which the producer's runner counts and telemeters as a `publish_dropped`
+  health error (§4). A `latest()` consumer pins only the newest record, so a healthy cyclic
+  graph never backpressures on the default depth.
 - **Wake:** none. Cyclic ports use `NoWake` for both writer and view (the synchronous `try_*`
   paths never touch the wake hooks).
 
 ### 3.2 Async systems
 
 - **Input source:** each input port's `View` reads a **private buffer the coordinator owns**.
-  The coordinator runs a copy-in `Writer` into that private buffer, copying the relevant
-  upstream output records in; the system never sees the upstream buffer directly.
-- **Drop on full, not stop.** An async system cannot be gated by skipping invocation, so on
-  lap its input port `resync()`s to the live edge and continues — the dropped records are
-  simply lost. This is the read-side behavioral difference from cyclic ports.
+  The coordinator runs a copy-in `Writer` into that private buffer, mirroring the newest
+  upstream record in (at most once per new upstream commit); the system never sees the
+  upstream buffer directly.
+- **Latest-wins, never suspend.** An async consumer that falls behind fills its private
+  ring; the coordinator then skips that cycle's mirror and retries next cycle with whatever
+  is newest — intermediate records are superseded, and neither the cycle loop nor the
+  upstream producer ever blocks on the async consumer.
 - **Triggering:** the system runs its own `run` loop. An event-driven system awaits inputs
   with `Input::recv` (backed by a `Notifier` `WakeSink`); a rate-driven system sleeps on its
-  own timer. Either way it uses `Output::write_async` so a lossless output can suspend for
+  own timer. Either way it uses `Output::write_async` so a full output can suspend for
   space. The coordinator spawns `run` as a task and does not tick the system.
 - **Output side is uniform.** An async system's outputs are ordinary ring buffers a
   downstream consumer (cyclic or async) reads like any other output. The async-ness is
@@ -463,7 +460,7 @@ everything else is shared.
 ### 3.3 Lifecycle ordering
 
 `init(&mut output)` runs once before any work. For a cyclic system, `execute` runs per cycle
-while no input is lapped; for an async system, `run` is spawned once. `shutdown(&mut output)`
+while the slot is running; for an async system, `run` is spawned once. `shutdown(&mut output)`
 runs once at teardown. `init`/`shutdown` are exactly-once; `execute` is many-times (cyclic)
 or driven from within `run` (async).
 
@@ -486,13 +483,12 @@ pub struct SystemHealth {
     #[metor_fsw(timestamp)] pub timestamp: Timestamp,
     pub cycles: u64,
     pub errors: u64,
-    pub lapped_inputs: u64,
     pub last_execute_micros: u64,
-    pub error_counts: FrameMap<Name<'static>, u64, MAX_ERR_KINDS>,
+    pub error_counts: FrameMap<u64, MAX_ERR_KINDS>,
 }
 ```
 
-The four scalar counters are maintained by the framework around `execute` (so they exist even
+The three scalar counters are maintained by the framework around `execute` (so they exist even
 for a system that never touches health). Domain-specific kinds are bumped by name and ride
 the dynamic `FrameMap`, so they need not be enumerated at compile time and still land as
 fully-qualified components (`<system>.health.error_counts.<kind>`) via the dynamic-frame path.
@@ -533,7 +529,6 @@ mechanism a system has. The framework drives the counter maintenance:
 
 ```rust
 impl HealthPort {
-    pub fn record_lapped(&mut self);                 // bump lapped_inputs
     pub fn end_cycle(&mut self, timestamp: Timestamp, execute_micros: u64); // bump cycles,
         // stamp duration, publish one health record + flush any pending log lines
 }
@@ -558,10 +553,11 @@ where B: Backing, S: CyclicSystem<B, Output = Out<O, B>>, O: SystemOutput
 }
 ```
 
-`step` is the per-cycle entry. If the slot is already stopped, it does nothing. If any input
-lapped, it charges the lap (`record_lapped`), logs an error, publishes a final health record
-(`end_cycle`), and flips the slot to `Stopped { reason: LappedInput }` — a permanent stop.
-Otherwise it times `execute` and publishes the cycle's health record. `CyclicRunner` also
+`step` is the per-cycle entry. If the slot is already stopped, it does nothing. Otherwise it
+times `execute`, folds the output bundle's `take_dropped()` sum (if nonzero) into a
+`publish_dropped` health error, and publishes the cycle's health record (`end_cycle`). The
+only permanent stop is a `.so`-boundary panic (`StopReason::Panicked`, coordinator.md §3.3);
+a slow reader is a backpressure/drop condition, never a stop. `CyclicRunner` also
 implements `CyclicSlot`, the object-safe trait the coordinator uses to hold a heterogeneous
 `Vec<Box<dyn CyclicSlot>>` and drive every system with one shared per-cycle timestamp.
 
@@ -577,10 +573,11 @@ frame metadata, with no instance constructed.
 
 ### 5.1 `PortDesc` and `SystemDescriptor`
 
-A port is one concept along **four orthogonal behavior axes**, plus its edge key and a fifth
-"who connects the other end" axis (`docs/design-port-unification.md`, `docs/design-command-slots.md`
-§2.1). A component-frame ("Table") port and a message ("Postcard") port are two *configurations* of
-the same struct, not two types:
+A port is one concept along **three orthogonal behavior axes**, plus its edge key, the
+`telemetered` flag, and a "who connects the other end" `conn` axis
+(`docs/design-port-unification.md`, `docs/design-command-slots.md` §2.1). A component-frame
+("Table") port and a message ("Postcard") port are two *configurations* of the same struct, not two
+types:
 
 ```rust
 pub enum PortId {
@@ -595,7 +592,6 @@ pub enum PortSchema {
 
 pub enum Delivery { Snapshot, Log }   // latest-wins vs every-record
 pub enum FanIn    { One, Many }       // exactly one producer vs zero-or-more (inputs only)
-pub enum OnLap    { Stop, Resync }    // a lap is a hard fault vs skip-to-live-edge (inputs only)
 
 pub struct PortDesc {
     pub id: PortId,
@@ -604,9 +600,8 @@ pub struct PortDesc {
     pub schema: PortSchema,      // axis 1 — what a record is
     pub delivery: Delivery,      // axis 2 — what a consumer reads
     pub fan_in: FanIn,           // axis 3 — no-op on outputs
-    pub on_lap: OnLap,           // axis 4 — no-op on outputs
     pub telemetered: bool,       // does the downlink / AllOutputs tap this port (output-side)
-    pub conn: PortConn,          // axis 5 — Edge (default) | Host | SelfTap(PortId)
+    pub conn: PortConn,          // Edge (default) | Host | SelfTap(PortId)
 }
 
 pub struct SystemDescriptor {
@@ -618,13 +613,13 @@ pub struct SystemDescriptor {
 }
 ```
 
-`PortDesc::of::<F>()` mints `Table × Snapshot × One × Stop`, telemetered, `Edge`-connected — the
-frame-port defaults. `PortDesc::msg::<M>()` (`M: NamedMsg`) mints `Postcard × Log × Many × Resync`,
+`PortDesc::of::<F>()` mints `Table × Snapshot × One`, telemetered, `Edge`-connected — the
+frame-port defaults. `PortDesc::msg::<M>()` (`M: NamedMsg`) mints `Postcard × Log × Many`,
 telemetered, `Edge`-connected — the message-port defaults; `PortDesc::msg_named::<M>(name)` overrides
 the display name (used for the coordinator's own reserved channels, e.g. `"commands"`,
 `"sequences"`). Builder methods flip individual axes without touching the rest: `.untelemetered()`
 (opt a port out of the downlink/`AllOutputs` — this is what the `CommandOut<M>` token lowers to,
-`docs/messages.md`), `.with_on_lap(p)`, `.with_conn(c)`.
+`docs/messages.md`), `.with_delivery(d)`, `.with_fan_in(f)`, `.with_conn(c)`.
 
 The same `PortDesc` describes an output (a produced record stream) and an input (a required
 shape) — the two are structurally identical; direction is which `SystemDescriptor` list it sits
@@ -803,9 +798,9 @@ the frames it emits without threading `Timestamp` through by hand.
 
 | Concern | Reused (ring / proto) | Defined in the system layer |
 |---------|-----------------------|-----------------------------|
-| Transport | `RingBuffer`, `Writer`/`try_write`/`write`, `View`/`try_read_into`/`read_into`/`is_lapped`/`resync`, `Overrun`, `Config` | `Output<F>`/`Input<F>` port wrappers binding a frame type to one ring handle |
+| Transport | `RingBuffer`, `Writer`/`try_write`/`write`, `View`/`try_read`/`read`/`try_latest`, `ReadGrant`, `Config` | `Output<F>`/`Input<F>` port wrappers binding a frame type to one ring handle |
 | Wake | `WakeSource`/`WakeSink`/`NoWake`/`Notifier` | cyclic = `NoWake`, async = `Notifier`, threaded as `WD`/`WS`/`RD`/`RS` |
-| Serialization | `FrameWriter` (`new`/`list`/`map`/`table`/`finish`), `ListReader`/`MapReader`, table bytes == ring payload | `Output::write`/`write_with`/`write_async`, `Input::latest`/`drain`/`recv`, `FrameRef` accessors |
+| Serialization | `FrameWriter` (`new`/`list`/`map`/`table`/`finish`), `ListReader`/`MapReader`, table bytes == ring payload | `Output::write`/`write_with`/`publish`/`write_async`, `Input::latest`/`drain`/`recv`, `FrameRef`/`FrameGrant` accessors |
 | Frame identity / shape | `Frame` (`FRAME_ID`, `NAME`, `timestamp`), `AsVTable::as_vtable`, `Componentize::MAX_SIZE`, `Metadatatize` | `PortDesc`/`SystemDescriptor` self-description |
 | Sizing | `round_up8`, `frame_len`, `MAX_SIZE`, `Config.capacity` pow2 | `buffer_capacity`/`capacity_for`, `DEFAULT_DEPTH` |
 | Wiring validation | `VTable::realize_fields(None)` registration mode, `RealizedField` | `compatible` subset / ty / shape check |

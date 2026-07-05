@@ -98,12 +98,12 @@ running, it forwards `fsw_execute` to the occupant.
       │           Reset │    └──── Reset ────────┤   Done   │ (Completed/Aborted/Failed)
       │ (rebuild future)│                        └──────────┘
       │                 └──────── Reset ──────── ┌──────────┐
-      └──────────────── Unload ──────────────────┤ Stopped  │ (LappedInput/Panicked, terminal)
+      └──────────────── Unload ──────────────────┤ Stopped  │ (Panicked, terminal)
                                                  └──────────┘
 ```
 
 Edges, in words: `Load` Empty→Loaded; `Start` Loaded→Running; `Stop` Running→Loaded (hard-drop,
-§2.1); the future returning `Ready` takes Running→`Done`; a lapped/panicked occupant takes
+§2.1); the future returning `Ready` takes Running→`Done`; a panicked occupant takes
 Running→`Stopped`; `Reset` rebuilds from any of Loaded(post-Stop)/`Done`/`Stopped`; `Unload`
 returns any state to `Empty`.
 
@@ -113,7 +113,7 @@ pub enum SlotState {
     Loaded   { occupant: OccupantId },  // created+bound+init'd; future built but NOT yet polling
     Running  { occupant: OccupantId },  // polled every cycle
     Done     { occupant: OccupantId, outcome: Outcome },  // future returned Ready; terminal
-    Stopped  { occupant: OccupantId, reason: StopReason }, // lapped/panicked; terminal
+    Stopped  { occupant: OccupantId, reason: StopReason }, // panicked; terminal
 }
 ```
 
@@ -168,7 +168,7 @@ fn step(&mut self, now: Timestamp) {
         SlotState::Running { .. } => {
             // forward to the occupant exactly as DlSlot::step does:
             let status = self.occupant.as_mut().unwrap().execute(now);  // fsw_execute → polls the future once
-            self.fold_status(status, now);     // Running | Done | Stopped(Lapped|Panicked)
+            self.fold_status(status, now);     // Running | Done | Stopped(Panicked)
         }
         _ => { /* Empty/Loaded/Done/Stopped: no fsw_execute this cycle */ }
     }
@@ -176,11 +176,11 @@ fn step(&mut self, now: Timestamp) {
 ```
 
 Empty/Loaded/Done/Stopped slots cost one status publish and a branch — they do not touch the
-occupant. The occupant, when polled, runs the verbatim `CyclicRunner::step` lapped→hard-stop
-/ timing / health logic inside the `.so` (`src/abi/mod.rs` `run_execute`), so a slot
-occupant gets the standard health counters for free. The lapped-input rule (a slot whose
-input is overwritten before it reads) hard-stops the occupant exactly as for any cyclic
-system (coordinator.md §3.3); the slot folds `StoppedLapped` into `SlotState::Stopped`.
+occupant. The occupant, when polled, runs the verbatim `CyclicRunner::step`
+timing / health logic inside the `.so` (`src/abi/mod.rs` `run_execute`), so a slot
+occupant gets the standard health counters for free. An input can never be lapped (the rings
+are lossless — a slow occupant backpressures its producer instead); the only occupant
+hard-stop is a caught panic, which the slot folds into `SlotState::Stopped`.
 
 ### 2.3 Rings are host-owned for the whole run; the occupant borrows transiently
 
@@ -635,12 +635,13 @@ existing symbols (§2.1):
   host loader/`DlSlot` is unchanged — the sequence path is new code *inside* `src/abi`, not a
   new ABI surface.
 - **One new `FswStatus` code** for terminal success: a sequence whose future is `Ready` is
-  not an error stop. Today `FswStatus` is `Running`/`StoppedLapped`/`Panicked`
-  (`src/abi/mod.rs:87`, dl-open.md). *Decided (§9 Q6):* add `Done = 3`; the host maps it to the
-  slot-layer `SlotState::Done`. The `Completed`/`Aborted`/`Failed` detail rides the
+  not an error stop. *Decided (§9 Q6):* add `Done`; the host maps it to the
+  slot-layer `SlotState::Done`. (The status word is now `Running = 0`/`Panicked = 1`/`Done = 2`
+  — the lap retirement deleted `StoppedLapped` and renumbered, `src/abi/mod.rs`, dl-open.md.)
+  The `Completed`/`Aborted`/`Failed` detail rides the
   `SequenceStatus` frame, **not** the status word.
-- **`FSW_ABI_VERSION` bumps to 2** for the new status code (the version word guards exactly
-  this, dl-open.md §"Version word").
+- **`FSW_ABI_VERSION` bumped to 2** for the new status code (the version word guards exactly
+  this, dl-open.md §"Version word"; it has since bumped again — `4` today).
 - The cancel signal and all commands are **ring frames**, so they ride the existing data
   path with no ABI surface.
 
@@ -715,7 +716,8 @@ the rationale survives.
    descriptor and emitting its own `run_seq_*` lifecycle instead of reusing
    `CyclicRunner`/`export_system!`. (See §4.)
 
-6. **Terminal completion — DECIDED: new `FswStatus::Done = 3` (ABI v2), outcome in the frame,
+6. **Terminal completion — DECIDED: new `FswStatus::Done` (ABI v2; renumbered to `2` at v4,
+   §8), outcome in the frame,
    a slot-layer `SlotState`.** The host needs only the terminal bit; `Completed`/`Aborted`/
    `Failed` rides the `SequenceStatus` frame. A **new** slot-layer `SlotState` is introduced
    rather than overloading the existing 2-variant `SlotState`/`StopReason`. *Trade-off:* one

@@ -138,13 +138,13 @@ exactly one of two leaf traits expressing how the system is driven:
 
 - **`CyclicSystem`** is coordinator-driven. The coordinator calls
   `execute(now, input, output)` once per cycle. `input` is `&mut Self::Input`, not `&`: each
-  port wraps a ring `View` whose read (`latest`/`drain`) advances a cursor and fills a reused
-  scratch buffer, so consuming it is a mutating operation even though the *data* it exposes is a
-  read-only view straight into the upstream producer's output buffer — the system cannot write
-  through it, only advance past it.
+  port wraps a ring `View` whose read (`latest`/`drain`) advances a cursor, so consuming it is
+  a mutating operation even though the *data* it exposes is a zero-copy, read-only borrow
+  straight off the upstream producer's ring — the system cannot write through it, only
+  advance past it.
 - **`AsyncSystem`** owns its own loop. The coordinator spawns `run(input, output)` once and
   never ticks it; the system paces itself on a timer or by awaiting its inputs. Its inputs
-  read from private buffers the coordinator copies into (see below).
+  read from private buffers the coordinator mirrors upstream records into (see below).
 
 ```rust
 pub trait CyclicSystem<B: Backing = BoxBacking>: System<B> {
@@ -168,8 +168,8 @@ output.health().error("i2c_timeout");          // bump a named error counter
 output.health().log(Level::Warn, "retrying");  // append a log line
 ```
 
-The framework maintains four standard counters around each `execute` — cycles, total errors,
-lapped inputs, and last-execute microseconds — and publishes a `SystemHealth` frame plus a
+The framework maintains three standard counters around each `execute` — cycles, total errors,
+and last-execute microseconds — and publishes a `SystemHealth` frame plus a
 `SystemLog` frame every cycle (`src/health.rs`). Named error counts ride a dynamic `FrameMap`
 inside the health frame, so they land as ordinary components (`health.error_counts.<kind>`).
 Health and logs flow out like any other frame data, so a system's troubles are observable
@@ -182,9 +182,10 @@ Data moves over ring buffers (the `metor_fsw_ring` crate, re-exported as
 inputs. A typed `Output<F>` port (`src/port.rs`) wraps the single ring `Writer` a system
 holds for frame `F`; a typed `Input<F>` wraps a read-only `View`. The ports are thin: because
 a frame's `#[repr(C)]` bytes *are* its table bytes, publishing a fixed frame is a single ring
-write with no serialization, and reading hands back a zero-copy typed `FrameRef<'_, F>`.
+write with no serialization, and reading hands back a zero-copy typed grant
+(`FrameGrant<'_, F>`) borrowed in place off the ring — no scratch copy anywhere.
 
-A consumer reads with `latest()` (drain to the newest committed record — what a cyclic system
+A consumer reads with `latest()` (borrow the newest committed record — what a cyclic system
 wants), `drain()` (process every record in order — for command/event channels that cannot
 drop), or `recv()` (await the next record — for event-driven async systems).
 
@@ -193,29 +194,27 @@ offset-addressed region with no process-local pointers inside it, so the same me
 whether two systems share an address space or (with the ring's `mmap` feature) span
 processes. See `docs/ring-buffer.md`.
 
-### Overrun semantics
+### Backpressure semantics
 
-The overrun policy is the writer's choice, fixed when the buffer is created and recorded in
-its header (`Overrun` in the ring crate):
+The ring is **lossless**: a writer can never overwrite data a registered reader has not
+consumed. A synchronous `try_write` returns `WouldBlock` when a slow reader is in the way,
+and the async `write` suspends until a reader frees space. A reader can never be lapped, so
+every read is a valid in-place borrow — which is what makes the zero-copy read path safe.
 
-- **`Overwrite`** (the default) — the writer never blocks on readers. When it would reuse
-  bytes a slow reader has not consumed, it overwrites them; the slow reader detects this on
-  the read side as a **lap**.
-- **`Lossless`** — the writer honors the in-use check: a synchronous `try_write` returns
-  `WouldBlock`, and the async `write` suspends until a reader frees space. It never laps a
-  reader, so guaranteed delivery is available where a channel needs it.
+Slowness therefore surfaces on the **write side**, and the framework keeps it non-blocking
+per system kind:
 
-The framework favors bounded, non-blocking writers with live lap detection over guaranteed
-delivery by default. In `Overwrite` mode, slowness is handled differently per system kind:
-
-- **Cyclic systems:** before invoking a cyclic system, the framework checks whether any of
-  its input views were lapped. A lapped input means the reader is hopelessly behind, which is
-  treated as a **hard error**: it is telemetered, and the coordinator permanently stops
-  invoking that system (recovery is future work).
-- **Async systems:** they cannot be gated by simply not invoking them, so the coordinator
-  mirrors upstream output into each async system's **private input buffer**, which is itself
-  an `Overwrite` ring. If the async consumer is behind, the oldest unconsumed record is
-  dropped (drop-on-full).
+- **Cyclic systems:** `Output::publish` never blocks the cycle — a rejected write
+  (`WouldBlock` from a slow reader, or `InsufficientCapacity` from a sizing bug) is counted,
+  and the framework folds the count into the producer's health as a `publish_dropped` error.
+  On the read side, `Input::latest()` keeps the newest committed record **pinned** so it can
+  be re-served on cycles with no new data; the default ring depth (`DEFAULT_DEPTH = 8`)
+  absorbs that one pinned record per latest-wins consumer.
+- **Async systems:** they run at their own pace, so the coordinator decouples them by
+  mirroring each async input's upstream output into a **private input ring**: only the
+  newest upstream record is copied in, at most once per new upstream commit. If the private
+  ring is full (the async consumer is behind), that cycle's mirror is skipped — latest-wins,
+  and the cycle loop never suspends.
 
 ## The coordinator
 
@@ -365,12 +364,13 @@ prefixed by the producing instance's name (so `processes.htop.pid` from the `pro
 downlinks as `procmon.processes.htop.pid`). This is where the per-instance namespacing the
 wiring records becomes load-bearing on the wire.
 
-The control cycle is synchronous but the socket is async, so the in-cycle stage only
-*snapshots* each tapped buffer (a memcpy) into a bounded, per-tap-coalescing hand-off, and a
-spawned sender task drains it and does the awaiting I/O. The cycle never blocks on the link: a
-backed-up transport just causes newer snapshots to overwrite un-sent ones (latest-wins),
-bumping a `telemetry.dropped` health counter — loss, never delay, the same philosophy as the
-`Overwrite` rings one level down. The transport is pluggable behind the `Transport` trait;
+The control cycle is synchronous but the socket is async, so the in-cycle stage only borrows
+each tapped buffer's newest committed record off its ring (at most once per new commit — no
+tap scratch buffers) and pushes it into a bounded, per-tap-coalescing hand-off; a spawned
+sender task drains it and does the awaiting I/O. The cycle never blocks on the link: a
+backed-up transport just causes newer snapshots to overwrite un-sent ones in the hand-off
+(latest-wins), bumping a `telemetry.dropped` health counter — loss on the downlink, never
+delay in the cycle. The transport is pluggable behind the `Transport` trait;
 `TcpTransport` is the shipped implementation (a stream to a ground link or co-located metor-db),
 with a shared-memory queue a natural future alternative. The bytes on the wire are identical
 either way, and a consumer needs only the announced VTables to parse them. See
@@ -456,13 +456,10 @@ place rather than scattered through the prose:
 - **Cross-process systems.** Systems run statically linked or dlopen'd in one process today.
   The shared-memory ring (with its `mmap` feature) is designed to carry the data path across
   process boundaries, but the cross-process notification/launch mechanism is not built.
-- **Recovery from a hard stop.** A cyclic system that laps an input or panics (in a `.so`) is
-  permanently stopped; there is no restart or quarantine-and-resume path.
+- **Recovery from a hard stop.** A cyclic system that panics (in a `.so`) is permanently
+  stopped; there is no restart or quarantine-and-resume path.
 - **Per-system rates.** Every cyclic system runs every cycle; there is no rate division beyond
   the single global cycle rate (a system can still self-pace by running async).
-- **Lossless command/event channels end-to-end.** The ring supports a `Lossless` overrun mode,
-  but the default cross-system edges are `Overwrite`; first-class guaranteed-delivery command
-  channels are a future extension.
 - **Automatic transport reconnect.** The TCP downlink connects once and stops downlinking on
   disconnect; reconnect/backoff is future work.
 - **Shared uplink+downlink connection.** The uplink and downlink each open their own connection.
@@ -478,7 +475,7 @@ of each subsystem:
 - `docs/frames.md` — frames, components, dynamic `FrameList`/`FrameMap`, the trailer layout.
 - `docs/vtable-dynamic.md` — the VTable op-set extensions for frames and dynamic data.
 - `docs/system.md` — the system trait family, typed ports, and per-system health.
-- `docs/ring-buffer.md` — the shared-memory ring buffer and its overrun semantics.
+- `docs/ring-buffer.md` — the shared-memory ring buffer and its lossless backpressure semantics.
 - `docs/coordinator.md` — the builder, graph validation, scheduling, clocks, and lifecycle.
 - `docs/wiring.md` — the `Wiring` data model, the KDL front-end, and the Rust builder.
 - `docs/dl-open.md` — the `cdylib` C-ABI, the loader, and schema-guided params.
@@ -486,6 +483,6 @@ of each subsystem:
 - `docs/cli-runner.md` — the `metor-fsw` CLI: loading a wiring, packaging a bundle, and running a mission.
 - `docs/sequences-slots.md` — runtime-loadable slots and the `#[sequence]` author surface.
 - `docs/messages.md` — the message channel (a second payload kind), the telemetry uplink/downlink of messages, and the `SequenceCommand` command plane.
-- `docs/message-wiring.md` — messages as first-class wired ports/edges (`MsgOut<M>`/`MsgIn<M>`, `msg=`/`connect_msg`), the `AllOutputs` receive-all capability, and the port-unification axes (schema × delivery × fan-in × on-lap, plus the `PortConn` axis). The command-plane shape it originally designed is further reframed — see `docs/messages.md`'s status banner and `docs/design-command-slots.md` for what actually shipped (name-addressed commands, explicit per-slot edges, the uplink's multi-output `CommandOut` dispatch).
+- `docs/message-wiring.md` — messages as first-class wired ports/edges (`MsgOut<M>`/`MsgIn<M>`, `msg=`/`connect_msg`), the `AllOutputs` receive-all capability, and the port-unification axes (schema × delivery × fan-in, plus the `PortConn` axis). The command-plane shape it originally designed is further reframed — see `docs/messages.md`'s status banner and `docs/design-command-slots.md` for what actually shipped (name-addressed commands, explicit per-slot edges, the uplink's multi-output `CommandOut` dispatch).
 </content>
 </invoke>

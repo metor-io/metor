@@ -1,5 +1,13 @@
 # Delete `Overrun::Overwrite` — lossless-only ring, zero-copy reads
 
+> **Status: COMPLETE** — landed in three commits on `sphw/metor-fsw-2`:
+> WP1 (ring crate, layout v2), WP2–WP6 (lap machinery retired, grant reads,
+> ABI v4), WP7 (docs reconciled: ring-buffer.md, DESIGN.md, system.md,
+> coordinator.md, messages.md, telemetry.md, message-wiring.md, dl-open.md,
+> sequences-slots.md, cli-runner.md, ring/MIRI.md; superseded notes added to
+> design-ring-safety.md and design-port-unification.md). All test suites,
+> clippy, and Miri (host tree-borrows, x86_64 many-seeds, i686) pass.
+
 Goal (user request): the ring's two-mode design (`Overrun::Overwrite` vs
 `Overrun::Lossless`) causes most of the crate's complexity — the seqlock write
 reservation, per-byte atomic data paths, lap detection, and the whole

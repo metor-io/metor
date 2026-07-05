@@ -3,6 +3,11 @@
 > **Status: LANDED** — implemented in commit `07406cfc` ("fix(ring): wave-2 — seqlock
 > torn-read fix, writer claim, lossless registration race, 32-bit soundness").
 > `docs/ring-buffer.md` reflects the shipped shape.
+>
+> **Since superseded in part**: the overwrite mode (and with it the R1 seqlock
+> reservation and the B6 lap semantics this doc designs) was later **removed** —
+> the ring is lossless-only (see `docs/delete-overrun-plan.md`). The lossless-mode
+> analysis here (R6/R7/R3/R4) still describes the shipped code.
 
 Design for the ring-crate items from `docs/review-findings.md` §1–§2: **R1**
 (overwrite-mode torn read), **R6** (lossless view-registration race), **R7**

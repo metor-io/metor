@@ -11,8 +11,9 @@ The `bind` contract is in `src/binder.rs`; the dlopen slot is in `src/dl.rs`.
 Almost everything below the builder is reuse: the data path is the ring (`metor-fsw-ring`), the
 typed port wrappers (`src/port.rs`), the system descriptors (`src/descriptor.rs`), the health port
 (`src/health.rs`), and the `CyclicRunner` per-system owner (`src/system/mod.rs`). The coordinator
-adds the builder and its validation/sizing pass, the `bind`/`Binder` contract, the lapped-to-stop
-slot, the copy-in jobs, the telemetry registry, the dlopen integration, and the lifecycle driver.
+adds the builder and its validation/sizing pass, the `bind`/`Binder` contract, the per-system
+slot lifecycle, the copy-in jobs, the telemetry registry, the dlopen integration, and the
+lifecycle driver.
 
 ---
 
@@ -251,14 +252,18 @@ One buffer per **output** port, plus the coordinator's own health/log/status buf
 private buffer per **async input** (§4). Each is sized from its `PortDesc` and the edge set:
 
 ```
-capacity    = capacity_for(port.max_size, default_depth)   // frame_len(max_size) * depth, pow2
-max_readers = fan_out(port) + n_registry_consumers + READER_SLACK
-overrun     = Overrun::Overwrite
+capacity    = capacity_for(port.max_size, depth)   // frame_len(max_size) * depth, pow2
+max_readers = fan_out(port) + n_registry_consumers + reader_slack
 ```
 
-- `capacity_for` / `buffer_capacity::<F>` (`src/port.rs`) are the sizing helpers. Depth is
-  `config.default_depth` for every buffer — there is no rate-derived depth (review finding C1:
-  the earlier advisory `PortDesc::rate_hint` had no consumer and was deleted).
+Every ring is **lossless** — there is no per-buffer overrun policy to choose (`alloc_ring` is
+the one sizing path).
+
+- `capacity_for` / `buffer_capacity::<F>` (`src/port.rs`) are the sizing helpers. Depth is by
+  delivery: a Snapshot port gets `config.default_depth` (a latest-wins sample needs little
+  history), a Log port gets `LOG_DEPTH` (an every-record stream must absorb a slow tap). There
+  is no rate-derived depth (review finding C1: the earlier advisory `PortDesc::rate_hint` had
+  no consumer and was deleted).
 - **`max_readers` must cover every `view()` the builder will register**, because the ring has no
   crash-slot reclamation: a reader slot is reserved at build time and never reclaimed. It is the
   sum of:
@@ -266,7 +271,8 @@ overrun     = Overrun::Overwrite
     direct `View`; each async consumer is **one** copy-in `View`, §4);
   - `n_registry_consumers` — each system that pulls the broad `OutputRegistry` (the telemetry
     downlink, a logger) is an extra reader on **every** output buffer;
-  - `READER_SLACK` (= 4) — slack for late taps such as a db/telemetry sink or a debugger.
+  - `config.reader_slack` (default 4) — slack for late taps such as a db/telemetry sink or a
+    debugger.
 
 ### 2.4 The output registry
 
@@ -292,10 +298,10 @@ buffer. "Single writer" is therefore an invariant of the build graph, not a runt
 ### 3.1 Ordering & the sampling rule (feedback loops)
 
 Cyclic systems run in a **fixed per-cycle order: registration order.** The sampling rule is a direct
-consequence of shared overwrite rings plus ordered execution, and needs no extra machinery:
+consequence of shared rings plus ordered execution, and needs no extra machinery:
 
-- A cyclic system reads each input with `Input::latest()`, which drains its `View` to the **newest
-  committed record at the instant it runs**.
+- A cyclic system reads each input with `Input::latest()`, which borrows the **newest
+  committed record at the instant it runs** (consuming older unread records on the way).
 - **Forward edge** (producer registered *before* consumer): the consumer sees **this cycle's fresh**
   output.
 - **Back edge / feedback** (producer registered *after* consumer): the consumer sees the producer's
@@ -357,19 +363,22 @@ for k in 0..cycles {
 `run_for` runs a bounded number of cycles, which is what the tests and bounded missions use; an
 unbounded mission is a large `cycles` count.
 
-### 3.3 Lapped input → permanent hard-stop
+### 3.3 Backpressure instead of laps
 
-Before invoking each cyclic system, `CyclicRunner::step` checks `input.any_lapped()` (which ORs
-every input port's `View::is_lapped`). If an input has lapped — its data was overwritten before the
-system read it — the slot **permanently stops**: it charges the lapped input (`record_lapped`), logs
-`Level::Error` ("input lapped; system permanently stopped"), publishes a final health record
-(`end_cycle`), and flips its `SlotState` to `Stopped { reason: LappedInput }`. Once stopped, `step`
-returns immediately on every subsequent cycle — no `execute`, no health publish.
+The ring is **lossless**: a writer can never overwrite a record a reader has not consumed, so
+a slow consumer can never be lapped and there is no lap-triggered stop. Slowness surfaces on
+the write side instead — a producer whose `publish` is rejected (`WouldBlock` from a slow
+reader, or `InsufficientCapacity` from a sizing bug) drops that record with a counted drop,
+which `CyclicRunner::step` folds into the producer's health as a `publish_dropped` error.
+Both systems keep running.
 
-A stopped slot's outputs go stale, so **downstream cyclic consumers of a stopped system will
-themselves eventually lap and stop in turn** — the failure propagates by the same mechanism, which
-is the intended fail-stop behavior, not a special case. A stopped system is never restarted (no
-recovery hook).
+`step` itself is simple: if the slot is stopped it does nothing; otherwise it times
+`execute`, folds the output bundle's `take_dropped()` sum into health, and publishes the
+cycle's health record (`end_cycle`). The only permanent hard-stop left is a `.so`-boundary
+panic (`StopReason::Panicked`, §3.6). A permanently stopped `DlSlot` releases its foreign
+state (and thus its reader slots) **immediately** on stop — on a lossless ring a dead
+consumer's pinned views would otherwise backpressure every upstream producer forever (§3.6).
+A stopped system is never restarted (no recovery hook).
 
 ### 3.4 `CyclicSlot` — the per-system slot trait
 
@@ -387,15 +396,15 @@ pub(crate) trait CyclicSlot {
 ```
 
 `CyclicRunner<S, O>` is the static-system implementation: it owns `system/input/output/state`, times
-`execute` with `Instant::now`, calls `output.health().end_cycle(now, micros)`, and performs the
-lapped-to-stop transition described in §3.3. `DlSlot` is the dlopen implementation (§3.6);
+`execute` with `Instant::now`, folds `take_dropped()` into a `publish_dropped` health error, and
+calls `output.health().end_cycle(now, micros)` (§3.3). `DlSlot` is the dlopen implementation (§3.6);
 `SlotRunner` (`docs/sequences-slots.md`) is the third, a runtime-swappable slot whose *occupant* can
 be loaded/started/stopped/reset at runtime rather than being fixed at `build()`. `SlotState` is
 shared by all three, since a runtime slot's lifecycle is a strict superset of the static two-state
 one:
 
 ```rust
-pub enum StopReason { LappedInput, Panicked }
+pub enum StopReason { Panicked }
 
 pub enum SlotState {
     Empty,              // no occupant yet (SlotRunner only)
@@ -406,14 +415,14 @@ pub enum SlotState {
 }
 ```
 
-`LappedInput` is reachable by any slot kind. `Panicked` is reachable only by a `.so`-backed slot
-(`DlSlot`, or a `SlotRunner` whose occupant panics inside its boundary) — it returns
-`FswStatus::Panicked` and the slot hard-stops; a static `CyclicRunner` cannot produce it (a panic
-there unwinds the host directly). A static `CyclicRunner`/`DlSlot` only ever occupies `Running` or
-`Stopped`; `Empty`/`Loaded`/`Done` are reachable only through a `SlotRunner`'s runtime lifecycle
-commands (`docs/sequences-slots.md` §3, `docs/messages.md` §4). Once `Stopped`, a slot is never
-cleared by any kind (a `SlotRunner`'s `Stopped` still needs an explicit `Reset` to become `Loaded`
-again, not an automatic clear).
+`Panicked` — the only stop reason — is reachable only by a `.so`-backed slot (`DlSlot`, or a
+`SlotRunner` whose occupant panics inside its boundary): it returns `FswStatus::Panicked` and
+the slot hard-stops. A static `CyclicRunner` cannot produce it (a panic there unwinds the host
+directly), so a static `CyclicRunner` never actually stops; it and a `DlSlot` only ever occupy
+`Running` or `Stopped`. `Empty`/`Loaded`/`Done` are reachable only through a `SlotRunner`'s
+runtime lifecycle commands (`docs/sequences-slots.md` §3, `docs/messages.md` §4). Once
+`Stopped`, a slot is never cleared by any kind (a `SlotRunner`'s `Stopped` still needs an
+explicit `Reset` to become `Loaded` again, not an automatic clear).
 
 ### 3.5 Surfacing stopped systems
 
@@ -445,14 +454,19 @@ gathers the raw ring regions the dlopen path needs — each port's `(base, len)`
 passes them, plus the postcard `params` blob, to `DlSystem::into_slot`, which `fsw_create`s the
 state and returns a `DlSlot`. The `.so` reconstructs each ring over the host's `BoxBacking` region
 via `attach_raw` (same process, no copy, no IPC — it sees the identical atomics the host's other
-systems do), and its `CyclicSlot::step` forwards over the ABI, mapping `FswStatus::StoppedLapped` /
-`Panicked` to the corresponding `SlotState::Stopped`.
+systems do), and its `CyclicSlot::step` forwards over the ABI, mapping `FswStatus::Panicked` to
+`SlotState::Stopped { reason: Panicked }`.
 
-Teardown ordering is load-bearing: a `DlSlot`'s `Drop` calls `fsw_destroy` (dropping the `.so`'s
-`RawBacking` ports and the user system) before its `Arc<Library>` field unloads and before the host
-`RingTable` frees the regions. The coordinator drops its `cyclic` slot vec before its `rings` field
-(struct field order), so no `RawBacking` outlives its region and no `.so` code runs after its
-`Library` is gone. See `dl-open.md` for the full ABI.
+A permanent stop destroys the foreign state **immediately**, not at teardown: on the stop
+transition the slot calls `fsw_destroy` at once, dropping the `.so`'s `RawBacking` ports and
+freeing its reader slots — on a lossless ring a dead consumer's pinned views would otherwise
+backpressure every upstream producer forever.
+
+Teardown ordering is load-bearing: a `DlSlot`'s `Drop` calls `fsw_destroy` (idempotent — a
+no-op if the stop already destroyed the state) before its `Arc<Library>` field unloads and
+before the host `RingTable` frees the regions. The coordinator drops its `cyclic` slot vec
+before its `rings` field (struct field order), so no `RawBacking` outlives its region and no
+`.so` code runs after its `Library` is gone. See `dl-open.md` for the full ABI.
 
 ### 3.7 Single-threaded execution
 
@@ -493,20 +507,21 @@ init barrier (§6) ensures every system's `init` has completed before any first 
 
 ### 4.2 Private copy-in buffers (the input side)
 
-An async input does **not** view the upstream output directly; it views a **private buffer the
-coordinator owns**. For each async input port the builder allocates a private
-`RingBuffer<BoxBacking>` in `Overrun::Overwrite` mode, sized like any buffer with `max_readers =
-1 + READER_SLACK` (the async system's view plus slack). Two ports straddle it:
+An async **Snapshot** input does **not** view the upstream output directly; it views a **private
+buffer the coordinator owns**. For each such input port the builder allocates a private
+`RingBuffer<BoxBacking>` (lossless, like every ring), sized like any buffer with `max_readers =
+1 + reader_slack` (the async system's view plus slack). Two ports straddle it:
 
 - **Writer side — the copy-in job** (`CopyIn`), owned by the coordinator (the buffer's single
-  writer). It views the upstream producer's output (`NoWake`) and writes records into the private
+  writer). It views the upstream producer's output (`NoWake`) and mirrors records into the private
   buffer.
 - **Reader side — the async system's `Input` port**, bound with a `Notifier` data sink (the matched
   wake from §1.5) so `Input::recv` wakes when copy-in commits.
 
-The private buffer is `Overwrite`, so the copy-in `try_write` **never blocks and silently overwrites**
-unconsumed records when the async consumer is behind. This is "if there is no room, the data is
-dropped," with no extra logic.
+The copy-in mirrors only the **newest** upstream record, and its `try_write` never blocks: a full
+private ring (the async consumer is behind) means that cycle's mirror is simply skipped and the
+next cycle retries with whatever is newest then. Latest-wins, no intermediate buffer, and the
+cycle loop never suspends on an async consumer.
 
 ### 4.3 Where copy-in runs
 
@@ -516,12 +531,14 @@ each cycle):
 ```rust
 fn run_copy_ins(&mut self) {
     for c in &mut self.copy_ins {
-        loop {
-            match c.upstream.try_read_into(&mut c.scratch) {
-                Ok(true)  => { let _ = c.writer.try_write(&c.scratch); }  // overwrite = drop on full
-                Ok(false) => break,                                       // drained
-                Err(_)    => { c.upstream.resync(); break; }              // lapped: skip to live edge
-            }
+        // Skip untouched upstreams: `committed` moves iff a record landed on this
+        // ring — this also keeps the pinned newest record from being re-mirrored
+        // (and the consumer re-woken) every cycle.
+        let committed = c.upstream.committed();
+        if committed == c.last_committed { continue; }
+        c.last_committed = committed;
+        if let Ok(Some(grant)) = c.upstream.try_latest() {
+            let _ = c.writer.try_write(&grant);   // full private ring = skip this mirror
         }
     }
 }
@@ -529,17 +546,19 @@ fn run_copy_ins(&mut self) {
 
 This keeps the loop single-threaded and avoids requiring a `Notifier` on every *cyclic* producer's
 output (a cyclic producer writes with `NoWake`; a separate awaiting copy-in task would need the
-producer to notify). The cost is that async input latency is bounded by the cycle rate. The
-`try_write` notifies the private buffer's data `Notifier`, which wakes the async `run`'s `recv`. If
-the copy-in itself laps on the upstream output (the cyclic producer outran the once-per-cycle
-drain), it `resync`s to the live edge and continues — the async consumer gets latest-wins.
+producer to notify). The cost is that async input latency is bounded by the cycle rate. The mirror
+runs **at most once per new upstream commit** — the `committed`-word cache dedups unchanged
+upstreams — and the record is borrowed in place off the upstream ring (`try_latest`) and written
+straight through, with no scratch copy. The `try_write` notifies the private buffer's data
+`Notifier`, which wakes the async `run`'s `recv`.
 
 ### 4.4 Async outputs feeding cyclic consumers
 
 There is nothing async-specific on the **output** side: an async system writes its output ring at
 its own pace, and a cyclic consumer holds an ordinary `View` it reads with `Input::latest()` each
-cycle — latest-wins, same as any edge. If a fast async producer laps a slow cyclic consumer, the
-§3.3 hard-stop applies. No special handling.
+cycle — latest-wins, same as any edge. A fast async producer that fills the ring is backpressured
+like any writer: its `write_async` suspends until the consumer frees room (§3.3). No special
+handling.
 
 ---
 
@@ -554,10 +573,10 @@ sized and allocated like any output (§2.3); the user does not wire them.
 
 ### 5.2 Driving the standard counters
 
-The framework drives the standard counters around `execute`: `CyclicRunner::step` times `execute`
-and calls `HealthPort::end_cycle(now, micros)`, which bumps `cycles`, stamps `last_execute_micros`,
-and publishes one `SystemHealth` record plus any pending log lines. A lapped input routes through
-`record_lapped` (bumps `lapped_inputs`) on the way to the hard-stop (§3.3). For async systems the
+The framework drives the standard counters around `execute`: `CyclicRunner::step` times `execute`,
+folds any counted `publish` drops into a `publish_dropped` health error (§3.3), and calls
+`HealthPort::end_cycle(now, micros)`, which bumps `cycles`, stamps `last_execute_micros`,
+and publishes one `SystemHealth` record plus any pending log lines. For async systems the
 same `HealthPort` rides in their `Out<Output>` inside the task, and the counters around their work
 are driven from within `run` — the coordinator does not tick them.
 
@@ -620,14 +639,14 @@ The hard timeout is the only non-cooperative path.
 | Concern | Reused | Coordinator-specific |
 |---|---|---|
 | Per-system owner | `CyclicRunner<S,O>` (`system/input/output`, timed `step`, `end_cycle`) | the `CyclicSlot` trait object + `SlotState`/`StopReason`; `DlSlot` |
-| Ports / data path | `Output::new`, `Input::new`, `latest`/`drain`/`recv`/`resync`/`is_lapped` | the `BindPorts`/`Binder`/`BoundPort`/`RingSource` contract |
-| Transport | `RingBuffer::{create_in_memory,writer,view,region}`, `Config`, `Overrun` | `RingTable` ownership, one-writer-per-buffer build invariant |
+| Ports / data path | `Output::new`, `Input::new`, `latest`/`drain`/`recv` | the `BindPorts`/`Binder`/`BoundPort`/`RingSource` contract |
+| Transport | `RingBuffer::{create_in_memory,writer,view,region}`, `Config` | `RingTable` ownership, one-writer-per-buffer build invariant |
 | Sizing | `capacity_for`, `buffer_capacity::<F>`, `DEFAULT_DEPTH` | `max_readers` from fan-out + registry consumers + slack |
-| Self-description | `SystemDescriptor`, `PortDesc`, `descriptor()`, `SystemInput::any_lapped` | the builder; `connect`/`connect_delayed` addressing by `(system, frame_id)` |
+| Self-description | `SystemDescriptor`, `PortDesc`, `descriptor()` | the builder; `connect`/`connect_delayed` addressing by `(system, frame_id)` |
 | Validation | `compatible(producer, consumer)` | per-edge driving; single-connect / unconnected-input / unbroken-cycle (`find_cycle`) |
 | Wake | `NoWake` (cyclic), `Notifier` (async), `WaitQueue` | matched wake endpoints on the copy-in private buffer |
 | Health | `SystemHealth`/`SystemLog`, `HealthPort` | auto-provisioned buffers; instance prefix at the sink; coordinator health + `CoordinatorStatus` |
-| Async | `AsyncSystem::run`, `Input::recv`, `Output::write_async` | spawn-once task + in-task `init`/`shutdown`; private copy-in buffers + drop-on-full |
+| Async | `AsyncSystem::run`, `Input::recv`, `Output::write_async` | spawn-once task + in-task `init`/`shutdown`; private copy-in buffers + newest-record mirror |
 | Telemetry | — | the `OutputRegistry`, `add_telemetry`, registry-consumer sizing |
 | dlopen | `DlSystem`/`DlSlot`/`FswRing` ABI (`dl.rs`/`abi.rs`) | `add_dl_cyclic`, raw-region bind, teardown ordering |
 | Runtime | `stellarator::{run,spawn,sleep,yield_now,JoinHandle::drop_guard}` | the run-fast-then-wait `run_for` loop; cooperative teardown |
@@ -636,10 +655,10 @@ The hard timeout is the only non-cooperative path.
 
 ## 8. Not yet implemented
 
-- **Rate-derived buffer depth.** Depth is always `config.default_depth`. Deriving depth from the
-  producer/consumer rate ratio (so a slow reader cannot lap within one of its periods) is a
-  refinement (review finding C1: the earlier advisory `PortDesc::rate_hint` had no consumer and
-  was deleted).
+- **Rate-derived buffer depth.** Depth is fixed per delivery kind (`config.default_depth` /
+  `LOG_DEPTH`). Deriving depth from the producer/consumer rate ratio (so a slow reader never
+  backpressures the producer within one of its periods) is a refinement (review finding C1:
+  the earlier advisory `PortDesc::rate_hint` had no consumer and was deleted).
 - **Per-system rate division.** One global `cycle_rate` drives every cyclic system; a system that
   wants a slower effective rate divides cycles itself.
 - **Intra-cycle parallelism.** The cyclic loop is single-threaded. Running an acyclic layer in
@@ -657,12 +676,12 @@ covers:
 - **`two_system_end_to_end`** — a cyclic producer → cyclic consumer graph; the consumer (registered
   after the producer) samples this cycle's fresh value `1.0..=5.0`, confirming the registration-order
   forward-edge rule.
-- **`lapped_input_hard_stops`** — a consumer that never drains laps and hard-stops with
-  `StopReason::LappedInput`; it is named in both `stopped()` and the `read_status()` frame, while
-  the input-less producer keeps running.
+- **`idle_consumer_backpressures_producer`** — a consumer that never drains fills the ring;
+  neither system stops (`stopped()` stays empty — backpressure never stops a system), and the
+  producer's rejected writes are counted drops.
 - **`async_through_copy_in`** — an async consumer fed through a private copy-in buffer; a bursting
-  producer overflows the buffer and the run completes without blocking (drop-on-full), and the
-  consumer still receives real samples via `recv`.
+  producer outruns the per-cycle mirror and the run completes without blocking (latest-wins), and
+  the consumer still receives real samples via `recv`.
 - **`validation_*`** — `FrameIdMismatch` (at `connect`), `UnknownPort`, `UnconnectedInput`,
   `DoubleConnect` (at `build`).
 - **`init_barrier_holds`** — both systems' `init` complete before the first `execute` observes the
