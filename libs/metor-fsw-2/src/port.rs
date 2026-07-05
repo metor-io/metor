@@ -4,27 +4,31 @@
 //! [`Input<F>`] wraps a read-only [`View`]. Both are thin: the data path (table
 //! bytes == ring payload) is entirely the `FrameWriter`/`View` machinery —
 //! these add only the frame typing, the latest-wins / every-record drains, and the
-//! zero-copy fixed-region accessor.
+//! zero-copy fixed-region accessor. Reads are zero-copy borrows straight off the
+//! ring (the lossless writer can never overwrite an unread record), handed out as
+//! a typed [`FrameRef`] / [`FrameGrant`].
 
 use core::marker::PhantomData;
 
 use metor_fsw::Decomponentize;
 use metor_fsw_ring::{
-    Backing, BoxBacking, NoWake, ReadError, View, WakeSink, WakeSource, Writer, frame_len,
+    Backing, BoxBacking, NoWake, ReadError, ReadGrant, View, WakeSink, WakeSource, Writer,
+    frame_len,
 };
 use metor_proto::error::Error as ProtoError;
 use metor_proto::types::LenPacket;
 use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
 
 use crate::binder::RingSource;
-use crate::descriptor::{OnLap, PortDecl, PortDesc};
+use crate::descriptor::{PortDecl, PortDesc};
 use crate::dynamic::Slot;
 use crate::frame::Frame;
 use crate::reader::{ListReader, MapReader};
 use crate::writer::FrameWriter;
 
 /// Default in-flight record depth for every port (system.md §2.2 / Q10). At least 2
-/// (one in-flight while the slowest reader holds one).
+/// (one in-flight while the slowest reader holds one — a latest-wins consumer
+/// permanently pins the newest record, see [`Input::latest`]).
 pub const DEFAULT_DEPTH: usize = 8;
 
 /// Power-of-two ring capacity for `depth` records of a frame with `max_size`
@@ -39,38 +43,27 @@ pub fn buffer_capacity<F: Frame>(depth: usize) -> usize {
     capacity_for(F::MAX_SIZE, depth)
 }
 
-/// THE shared drain loop (C4): drain `view` into `scratch`, calling `f` once per
-/// committed record. On a lap, apply `on_lap` — [`OnLap::Resync`] skips to the live
-/// edge and keeps draining; [`OnLap::Stop`] stops draining immediately. Returns
-/// whether a lap was **observed** (raw, policy-free — the caller derives its
-/// `lap_fault` from its own policy, so a Resync port can still latch the
-/// observation for diagnostics).
+/// THE shared drain loop (C4): hand `f` a zero-copy borrow of every committed
+/// record since the last drain, in order. Each grant drops (freeing the record
+/// for the writer) before the next is taken. [`ReadError::Corrupt`] — a
+/// structurally invalid region, unreachable from in-crate behavior — stops the
+/// drain and propagates.
 ///
-/// Used by [`Input::latest`]/[`Input::drain`], [`MsgIn::drain`](crate::MsgIn), the
-/// coordinator's copy-in jobs, and both telemetry tap lanes.
+/// Used by [`Input::drain`], [`MsgIn::drain`](crate::MsgIn), and the telemetry
+/// tap's log lane.
 pub(crate) fn drain_view<B, RD, RS>(
     view: &mut View<B, RD, RS>,
-    scratch: &mut Vec<u8>,
-    on_lap: OnLap,
     mut f: impl FnMut(&[u8]),
-) -> bool
+) -> Result<(), ReadError>
 where
     B: Backing,
     RD: WakeSink,
     RS: WakeSource,
 {
-    let mut lapped = false;
     loop {
-        match view.try_read_into(scratch) {
-            Ok(true) => f(scratch),
-            Ok(false) => return lapped,
-            Err(_) => {
-                lapped = true;
-                match on_lap {
-                    OnLap::Resync => view.resync(),
-                    OnLap::Stop => return lapped,
-                }
-            }
+        match view.try_read()? {
+            Some(grant) => f(&grant),
+            None => return Ok(()),
         }
     }
 }
@@ -81,7 +74,7 @@ where
 
 /// One owned output: the single [`Writer`] into a ring carrying frame `F`. Cyclic
 /// outputs default to [`BoxBacking`] + [`NoWake`]; async outputs select a
-/// `Notifier` wake so a lossless write can suspend for space.
+/// `Notifier` wake so a write can suspend for space.
 pub struct Output<F, B = BoxBacking, WD = NoWake, WS = NoWake>
 where
     B: Backing,
@@ -94,9 +87,10 @@ where
     /// malloc+free a fresh `LenPacket` every call. `None` until the first such write.
     scratch: Option<LenPacket>,
     /// Records dropped by the infallible [`publish`](Self::publish) path (review E6):
-    /// on the framework's Overwrite rings a write failure is only ever
-    /// `InsufficientCapacity` — a sizing bug — so the port counts it here and the
-    /// runner folds the count into health via [`take_dropped`](Self::take_dropped).
+    /// a write failure is `InsufficientCapacity` (a sizing bug) or `WouldBlock`
+    /// (a slow reader backpressuring this ring) — either way the port counts it
+    /// here and the runner folds the count into health via
+    /// [`take_dropped`](Self::take_dropped).
     dropped: u64,
     _f: PhantomData<F>,
 }
@@ -166,10 +160,11 @@ where
         self.writer.try_write(frame.as_bytes())
     }
 
-    /// Publish a fixed frame, **infallibly** (review E6): the only failure on the
-    /// framework's Overwrite rings is `InsufficientCapacity` (a sizing bug), so
-    /// instead of a `Result` the drop is counted for the runner to fold into health
-    /// (`publish_dropped`). Sizing-aware callers keep [`write`](Self::write).
+    /// Publish a fixed frame, **infallibly** (review E6): a failed write —
+    /// `InsufficientCapacity` (a sizing bug) or `WouldBlock` (a slow reader
+    /// backpressuring the ring; the record is dropped rather than blocking the
+    /// cycle) — is counted for the runner to fold into health (`publish_dropped`)
+    /// instead of returned. Sizing-aware callers keep [`write`](Self::write).
     pub fn publish(&mut self, frame: &F) {
         if self.writer.try_write(frame.as_bytes()).is_err() {
             self.dropped += 1;
@@ -204,8 +199,8 @@ where
         res
     }
 
-    /// Async publish of a fixed frame: suspends (lossless mode only) until there is
-    /// room. The async output path async systems use (system.md §3.2).
+    /// Async publish of a fixed frame: suspends until a reader frees room. The
+    /// async output path async systems use (system.md §3.2).
     pub async fn write_async(&mut self, frame: &F) -> Result<(), metor_fsw_ring::WriteError> {
         self.writer.write(frame.as_bytes()).await
     }
@@ -216,8 +211,9 @@ where
 // ---------------------------------------------------------------------------
 
 /// One borrowed input: a [`View`] into an upstream output buffer (cyclic) or a
-/// private copy-in buffer (async). Reads copy the newest record(s) into a reused
-/// `scratch` and hand them out as a zero-copy typed [`FrameRef`].
+/// private copy-in buffer (async). Reads are zero-copy: the ring hands out a
+/// borrow of the record in place (the writer can never overwrite an unread
+/// record), wrapped as a typed [`FrameGrant`] / [`FrameRef`].
 pub struct Input<F, B = BoxBacking, RD = NoWake, RS = NoWake>
 where
     B: Backing,
@@ -225,20 +221,6 @@ where
     RS: WakeSource,
 {
     view: View<B, RD, RS>,
-    scratch: Vec<u8>,
-    /// Whether `scratch` holds a valid record (so `latest` can keep returning the
-    /// freshest one across calls with no new data).
-    have: bool,
-    /// A lap this port observed — pre-read (`view.is_lapped()`) or mid-drain (the E3
-    /// latch). Latched (never cleared) so the runner's post-execute
-    /// [`lap_fault`](Self::lap_fault) check telemeteres a mid-execute lap the same
-    /// cycle. Policy-free: whether the observation is a *fault* is the port's
-    /// [`OnLap`] policy.
-    lapped: bool,
-    /// The lap policy (axis 4), default [`OnLap::Stop`] (the cyclic frame doctrine);
-    /// set at bind from the field's descriptor attribute via
-    /// [`with_on_lap`](Self::with_on_lap).
-    on_lap: OnLap,
     _f: PhantomData<F>,
 }
 
@@ -247,10 +229,6 @@ impl<F: Frame, B: Backing, RD: WakeSink, RS: WakeSource> Input<F, B, RD, RS> {
     pub fn new(view: View<B, RD, RS>) -> Self {
         Self {
             view,
-            scratch: Vec::new(),
-            have: false,
-            lapped: false,
-            on_lap: OnLap::Stop,
             _f: PhantomData,
         }
     }
@@ -264,32 +242,6 @@ impl<F: Frame, B: Backing, RD: WakeSink, RS: WakeSource> Input<F, B, RD, RS> {
     /// walk: an ordinary wired port.
     pub fn decl() -> PortDecl {
         PortDecl::Port(Self::descriptor())
-    }
-
-    /// Override the runtime lap policy — chainable, mirroring the descriptor-level
-    /// [`PortDesc::with_on_lap`]. The `#[fsw(on_lap = "…")]` derive attribute lowers
-    /// onto both so descriptor and runtime can never disagree.
-    pub fn with_on_lap(mut self, p: OnLap) -> Self {
-        self.on_lap = p;
-        self
-    }
-
-    /// Whether this port is in **lap fault**: a lap was observed (the writer
-    /// overwrote unread data — before a read, or resynced-over mid-drain, the E3
-    /// latch) *and* the port's policy says laps are fatal ([`OnLap::Stop`]). A
-    /// Resync port reports `false` because its policy says laps are not faults —
-    /// derived, not lied (A5). The runner checks this before and after `execute`;
-    /// the stop policy itself lives in the coordinator.
-    pub fn lap_fault(&self) -> bool {
-        (self.lapped || self.view.is_lapped()) && self.on_lap == OnLap::Stop
-    }
-
-    /// Skip to the live edge, abandoning unread (possibly lapped) data. Async input
-    /// ports call this on lap to "drop on full and continue" (system.md §3.2).
-    /// `&mut self` for consistency with `latest`/`drain` (S5): every read-side
-    /// cursor move spells the same way (the ring's own `View::resync` is interior).
-    pub fn resync(&mut self) {
-        self.view.resync();
     }
 }
 
@@ -318,71 +270,37 @@ where
     RD: WakeSink,
     RS: WakeSource,
 {
-    /// Drain to the newest committed record and hand back a typed view of it, or
-    /// `None` if no record has ever arrived. Cyclic systems want the freshest
-    /// sample, not a backlog (system.md §2.3).
+    /// The newest committed record as a typed zero-copy borrow, or `None` if no
+    /// record has ever arrived. Cyclic systems want the freshest sample, not a
+    /// backlog (system.md §2.3).
     ///
-    /// A lap mid-drain (an async producer racing this cycle — the coordinator
-    /// already hard-stops a Stop port on a lap seen *before* `execute`) is
-    /// **resync-latched** (review E3): the view skips to the live edge, the lap is
-    /// remembered, and the freshest record keeps being served. The mechanics are
-    /// policy-free on purpose — whether the latched lap is a *fault* is
-    /// [`lap_fault`](Self::lap_fault)'s call: on a Stop port the runner's pre/post
-    /// execute check hard-stops the consumer (so the resynced read only ever feeds
-    /// the doomed cycle, exactly today's doctrine); on a Resync port — including
-    /// the async copy-in coercion, where the port cannot know its consumer is
-    /// async — data keeps flowing. Lossless/async callers that must see the error
-    /// use [`recv`](Self::recv)/[`drain`](Self::drain).
-    pub fn latest(&mut self) -> Option<FrameRef<'_, F>> {
-        let Self {
-            view,
-            scratch,
-            have,
-            lapped,
-            ..
-        } = self;
-        *lapped |= drain_view(view, scratch, OnLap::Resync, |_| *have = true);
-        self.have.then(|| FrameRef::new(&self.scratch))
+    /// Older unread records are consumed (freed for the writer) on the way; the
+    /// newest stays **pinned** on the ring — the view's cursor parks at its start —
+    /// so a later cycle with no new data is served the same record again, and the
+    /// writer backpressures rather than overwrite it (`DEFAULT_DEPTH` absorbs the
+    /// one pinned record). A corrupt region (unreachable from in-crate behavior)
+    /// reads as `None`.
+    pub fn latest(&mut self) -> Option<FrameGrant<'_, F, B, RS>> {
+        self.view.try_latest().ok().flatten().map(FrameGrant::new)
     }
 
     /// Process **every** record since the last drain, in order (for command / event
-    /// channels that cannot drop a record). On a lap, follows the port's policy:
-    /// a Stop port stops draining and returns `Err(Lapped)`; a Resync port skips to
-    /// the live edge, keeps draining, and returns `Ok` (laps are not faults there —
-    /// the latch still records the observation).
+    /// channels that cannot drop a record). Each record is handed to `f` as a
+    /// zero-copy [`FrameRef`] and freed for the writer as soon as `f` returns.
     pub fn drain(&mut self, mut f: impl FnMut(FrameRef<'_, F>)) -> Result<(), ReadError> {
-        let Self {
-            view,
-            scratch,
-            have,
-            lapped,
-            on_lap,
-            ..
-        } = self;
-        let saw_lap = drain_view(view, scratch, *on_lap, |rec| {
-            *have = true;
-            f(FrameRef::new(rec));
-        });
-        *lapped |= saw_lap;
-        if saw_lap && *on_lap == OnLap::Stop {
-            Err(ReadError::Lapped)
-        } else {
-            Ok(())
-        }
+        drain_view(&mut self.view, |rec| f(FrameRef::new(rec)))
     }
 
     /// Await the next record (event-driven async systems, system.md §3.2). Backed by
-    /// the view's async `read_into`, which suspends on the `RD` wake until data
-    /// commits. Propagates `Lapped`.
-    pub async fn recv(&mut self) -> Result<FrameRef<'_, F>, ReadError> {
-        self.view.read_into(&mut self.scratch).await?;
-        self.have = true;
-        Ok(FrameRef::new(&self.scratch))
+    /// the view's async `read`, which suspends on the `RD` wake until data commits.
+    /// The record is consumed (freed for the writer) when the grant drops.
+    pub async fn recv(&mut self) -> Result<FrameGrant<'_, F, B, RS>, ReadError> {
+        Ok(FrameGrant::new(self.view.read().await?))
     }
 }
 
 // ---------------------------------------------------------------------------
-// FrameRef — typed access over one record's table bytes
+// FrameRef / FrameGrant — typed access over one record's table bytes
 // ---------------------------------------------------------------------------
 
 /// A typed, zero-copy view of one record's table bytes (system.md §2.3): the fixed
@@ -441,5 +359,64 @@ where
             .and_then(|b| Slot::read_from_prefix(b).ok())
             .map(|(s, _)| s)
             .unwrap_or_default()
+    }
+}
+
+/// An owning typed read guard: a ring [`ReadGrant`] (the zero-copy borrow of one
+/// record, holding the view's cursor) plus the [`FrameRef`] accessor surface.
+/// Returned by the reads that *hand back* a record ([`Input::latest`],
+/// [`Input::recv`]) — a callback drain passes a plain [`FrameRef`] instead.
+/// Dropping it releases the record per the grant's semantics (consume for
+/// `recv`, keep-pinned for `latest`).
+pub struct FrameGrant<'a, F, B = BoxBacking, RS = NoWake>
+where
+    B: Backing,
+    RS: WakeSource,
+{
+    grant: ReadGrant<'a, B, RS>,
+    _f: PhantomData<F>,
+}
+
+impl<'a, F, B, RS> FrameGrant<'a, F, B, RS>
+where
+    F: Frame + FromBytes + KnownLayout + Immutable,
+    B: Backing,
+    RS: WakeSource,
+{
+    pub(crate) fn new(grant: ReadGrant<'a, B, RS>) -> Self {
+        Self {
+            grant,
+            _f: PhantomData,
+        }
+    }
+
+    /// The borrowed record as a [`FrameRef`] (for passing to `FrameRef`-taking code).
+    pub fn as_ref(&self) -> FrameRef<'_, F> {
+        FrameRef::new(&self.grant)
+    }
+
+    /// The fixed `#[repr(C)]` region, zero-copy (see [`FrameRef::get`]).
+    pub fn get(&self) -> &F {
+        self.as_ref().get()
+    }
+
+    /// The raw table bytes (fixed region + trailer).
+    pub fn table(&self) -> &[u8] {
+        &self.grant
+    }
+
+    /// A reader over the `FrameList<T, _>` member whose slot sits at `slot_off`.
+    pub fn list<T: FromBytes>(&self, slot_off: usize) -> ListReader<'_, T> {
+        self.as_ref().list(slot_off)
+    }
+
+    /// A reader over the `FrameMap<_, V, _>` member whose slot sits at `slot_off`.
+    pub fn map<V: FromBytes>(&self, slot_off: usize) -> MapReader<'_, V> {
+        self.as_ref().map(slot_off)
+    }
+
+    /// Drive any [`Decomponentize`] sink from this record (see [`FrameRef::apply`]).
+    pub fn apply<D: Decomponentize>(&self, sink: &mut D) -> Result<Result<(), D::Error>, ProtoError> {
+        self.as_ref().apply(sink)
     }
 }

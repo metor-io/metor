@@ -23,7 +23,7 @@ use std::sync::atomic::{
 use std::time::{Duration, Instant};
 
 use metor_fsw_ring::{
-    BoxBacking, Config, NoWake, Notifier, Overrun, RingBuffer, View, WakeSource, Writer,
+    BoxBacking, Config, NoWake, Notifier, RingBuffer, View, WakeSource, Writer,
 };
 use metor_proto::types::{ComponentId, Msg, Timestamp};
 use metor_proto_wkt::{
@@ -36,7 +36,7 @@ use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
 use crate::binder::{BindPorts, Binder, BoundInput, BoundPort};
 use crate::descriptor::compatible;
 use crate::descriptor::{
-    Delivery, FanIn, Hz, OnLap, PortConn, PortDesc, PortId, PortSchema, SystemDescriptor,
+    Delivery, FanIn, Hz, PortConn, PortDesc, PortId, PortSchema, SystemDescriptor,
     SystemKind,
 };
 use crate::dynamic::FrameList;
@@ -201,16 +201,6 @@ pub enum WireError {
         consumer: &'static str,
         port: PortId,
     },
-    /// An **async** system declared a [`Delivery::Log`](crate::Delivery) input with
-    /// [`OnLap::Stop`](crate::OnLap). An async system cannot be step-gated, so the
-    /// framework has no way to honor a hard-stop-on-lap doctrine there: its Log
-    /// inputs poll-drain the shared producer rings directly. (A Snapshot input's
-    /// default Stop is instead the documented coercion — effectively Resync,
-    /// implemented by the drop-on-full copy-in ring.)
-    StopOnAsyncInput {
-        system: &'static str,
-        port: PortId,
-    },
     /// An input declared [`FanIn::Many`](crate::FanIn) with
     /// [`Delivery::Snapshot`](crate::Delivery): latest-wins across several producers
     /// is ill-defined without cross-ring ordering, so the combination is rejected.
@@ -318,12 +308,6 @@ impl std::fmt::Display for WireError {
                  marks a one-cycle-late snapshot sample, which is meaningless on a \
                  decoupled event/command log — drop the delayed flag"
             ),
-            WireError::StopOnAsyncInput { system, port } => write!(
-                f,
-                "async system {system} declares OnLap::Stop on input {port:?}: an async \
-                 consumer cannot be step-gated, so the framework cannot honor a \
-                 hard-stop-on-lap policy there — use OnLap::Resync"
-            ),
             WireError::SnapshotFanIn { system, port } => write!(
                 f,
                 "{system} input {port:?} declares FanIn::Many with Delivery::Snapshot: \
@@ -381,14 +365,12 @@ impl std::fmt::Display for WireError {
 impl std::error::Error for WireError {}
 
 // ---------------------------------------------------------------------------
-// Slot state (the lapped → permanent hard-stop, coordinator.md §3.3/§3.4)
+// Slot state (the permanent hard-stop, coordinator.md §3.3/§3.4)
 // ---------------------------------------------------------------------------
 
 /// Why a cyclic slot hard-stopped.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum StopReason {
-    /// An input was lapped (its data was overwritten before the system read it).
-    LappedInput,
     /// A dlopen'd system panicked inside the `.so` (the boundary caught it and
     /// returned [`FswStatus::Panicked`](crate::abi::FswStatus)).
     /// Only reachable for a [`DlSlot`](crate::dl); a static `CyclicRunner` cannot
@@ -399,7 +381,7 @@ pub enum StopReason {
 impl StopReason {
     fn code(self) -> u8 {
         match self {
-            StopReason::LappedInput => 1,
+            // `1` was `LappedInput`, retired with the ring's overwrite mode.
             StopReason::Panicked => 2,
         }
     }
@@ -565,16 +547,21 @@ struct RingTable {
 // Async plumbing
 // ---------------------------------------------------------------------------
 
-/// A private-buffer copy-in job (coordinator.md §4.2/§4.3): drains an upstream
-/// producer's output and mirrors it into the async system's private buffer. The
-/// private buffer is `Overwrite`, so `try_write` never blocks and silently
-/// overwrites unconsumed records when the async consumer is behind (drop-on-full).
+/// A private-buffer copy-in job (coordinator.md §4.2/§4.3): mirrors the **newest**
+/// upstream record (Snapshot semantics — the copy-in exists only for Snapshot
+/// inputs) into the async system's private buffer, at most once per new upstream
+/// commit. The record is borrowed in place off the upstream ring and written
+/// through; no intermediate buffer.
 struct CopyIn {
     upstream: View<BoxBacking, NoWake, NoWake>,
     /// The private ring's sole writer: the matched data `Notifier` wakes the parked
-    /// async `recv`; the space side is `NoWake` — an Overwrite write never suspends.
+    /// async `recv`; the space side is `NoWake` — a full private ring (the consumer
+    /// is behind) drops this cycle's mirror rather than suspending the cycle loop.
     writer: Writer<BoxBacking, Notifier, NoWake>,
-    scratch: Vec<u8>,
+    /// The upstream ring's `committed` at the last mirror, so an unchanged upstream
+    /// (no new record) is skipped instead of re-waking the consumer with the same
+    /// pinned record every cycle. `u64::MAX` = nothing mirrored yet.
+    last_committed: u64,
 }
 
 /// Per-task signals the coordinator hands a spawned async system: a stop flag, an
@@ -1257,27 +1244,12 @@ impl CoordinatorBuilder {
 
     /// Per-descriptor axis validation (no edges needed).
     /// FanIn::Many × Delivery::Snapshot: latest-wins across producers is
-    /// ill-defined. OnLap::Stop on an async system's input: an async consumer
-    /// cannot be step-gated, so the hard-stop doctrine is unenforceable there
-    /// (§2.3). A Snapshot input *defaults* Stop (the cyclic doctrine), so on an
-    /// async system that combination is the documented coercion — effectively
-    /// Resync, implemented by the drop-on-full copy-in ring — not an error; only
-    /// the non-default Log × Stop (necessarily an explicit declaration, since Log
-    /// defaults Resync) is rejected, because nothing decouples a Log input.
+    /// ill-defined.
     fn validate_port_axes(&self) -> Result<(), WireError> {
         for sys in &self.systems {
             for port in &sys.desc.inputs {
                 if port.fan_in == FanIn::Many && port.delivery == Delivery::Snapshot {
                     return Err(WireError::SnapshotFanIn {
-                        system: sys.desc.name,
-                        port: port.id,
-                    });
-                }
-                if sys.desc.kind == SystemKind::Async
-                    && port.on_lap == OnLap::Stop
-                    && port.delivery == Delivery::Log
-                {
-                    return Err(WireError::StopOnAsyncInput {
                         system: sys.desc.name,
                         port: port.id,
                     });
@@ -1597,11 +1569,10 @@ impl CoordinatorBuilder {
     }
 
     /// Private copy-in buffers for async inputs, keyed on the delivery axis (§2.3):
-    /// an async system cannot be step-gated, so an async SNAPSHOT input is
-    /// effectively Resync, implemented by a private drop-on-full copy-in ring (which
-    /// also supplies the matched data `Notifier` the async `recv` parks on). Log
-    /// inputs use a direct fan-in multi-view (§3.3) — a best-effort log the consumer
-    /// poll-drains, no copy-in.
+    /// an async system cannot be step-gated, so an async SNAPSHOT input is decoupled
+    /// through a private latest-wins copy-in ring (which also supplies the matched
+    /// data `Notifier` the async `recv` parks on). Log inputs use a direct fan-in
+    /// multi-view (§3.3) — an every-record log the consumer poll-drains, no copy-in.
     fn plan_copy_ins(&self, cons_edges: &ConsEdges, alloc: &mut RingAlloc) -> AsyncPlumbing {
         let depth = self.config.default_depth;
         let slack = self.config.reader_slack;
@@ -1623,9 +1594,9 @@ impl CoordinatorBuilder {
                 let (prod_id, out_idx) = cons_edges[&(sid, in_idx)][0];
                 let private = alloc_ring(port.delivery, port.max_size, depth, 1 + slack);
                 let data = Notifier::default();
-                // The private ring is Overwrite, so a write never suspends for space —
-                // only the matched DATA notifier is load-bearing (it wakes the parked
-                // async `recv`); the writer's space side is `NoWake`.
+                // Only the matched DATA notifier is load-bearing (it wakes the
+                // parked async `recv`); the writer's space side is `NoWake` — the
+                // copy-in uses `try_write` and skips a full private ring.
                 // Invariant: each private copy-in ring is created here and gets
                 // this one writer, so the claim is always free.
                 let writer = private
@@ -1637,7 +1608,7 @@ impl CoordinatorBuilder {
                 plumbing.copy_ins.push(CopyIn {
                     upstream,
                     writer,
-                    scratch: Vec::new(),
+                    last_committed: u64::MAX,
                 });
                 plumbing
                     .private_inputs
@@ -2127,7 +2098,7 @@ fn stopped_set_changed(cur: &[StoppedSystem], prev: &[StoppedSystem]) -> bool {
 /// The ONE ring-sizing helper (`docs/design-port-unification.md` §4 PASS 5): a
 /// Snapshot port is sized at the configured default depth (a latest-wins sample needs
 /// little history), a Log port at [`LOG_DEPTH`] (an every-record stream must absorb a
-/// slow tap). Overwrite, like every owned ring.
+/// slow tap).
 fn alloc_ring(
     delivery: Delivery,
     max_size: usize,
@@ -2141,7 +2112,6 @@ fn alloc_ring(
     RingBuffer::create_in_memory(Config {
         capacity: capacity_for(max_size, depth),
         max_readers,
-        overrun: Overrun::Overwrite,
     })
 }
 
@@ -2465,16 +2435,26 @@ impl Coordinator {
         tasks
     }
 
-    /// Mirror fresh upstream records into each async system's private buffer
-    /// (drop-on-full via overwrite), waking the async `recv` (coordinator.md §4.3).
+    /// Mirror the newest upstream record into each async system's private buffer,
+    /// waking the async `recv` (coordinator.md §4.3). Snapshot semantics: older
+    /// unread upstream records are consumed on the way (freed for the producer) and
+    /// only the newest is mirrored, at most once per new upstream commit. A full
+    /// private ring (the consumer is behind) skips this cycle's mirror — the next
+    /// cycle retries with whatever is newest then.
     fn run_copy_ins(&mut self) {
         for c in &mut self.copy_ins {
-            // A lap on the upstream output resyncs to the live edge and keeps
-            // draining (the async consumer gets latest-wins) — the Resync policy.
-            let writer = &mut c.writer;
-            crate::port::drain_view(&mut c.upstream, &mut c.scratch, OnLap::Resync, |rec| {
-                let _ = writer.try_write(rec);
-            });
+            // Skip untouched upstreams: `committed` moves iff a record landed on
+            // this ring, so this also keeps the pinned newest record from being
+            // re-mirrored (and the consumer re-woken) every cycle.
+            let committed = c.upstream.committed();
+            if committed == c.last_committed {
+                continue;
+            }
+            c.last_committed = committed;
+            // Corrupt (unreachable from in-crate behavior) reads as "nothing new".
+            if let Ok(Some(grant)) = c.upstream.try_latest() {
+                let _ = c.writer.try_write(&grant);
+            }
         }
     }
 
@@ -2484,7 +2464,7 @@ impl Coordinator {
     fn update_status(&mut self, now: Timestamp) {
         self.stopped_scratch.clear();
         for slot in &self.cyclic {
-            // Only a lapped/panicked stop is an error-stop; a runtime slot's
+            // Only a panicked stop is an error-stop; a runtime slot's
             // Empty/Loaded/Done states are not (the `stop_reason` projection).
             if let Some(reason) = slot.state().stop_reason() {
                 self.stopped_scratch.push(StoppedSystem {

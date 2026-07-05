@@ -178,18 +178,20 @@ async fn two_system_end_to_end() {
 }
 
 // ---------------------------------------------------------------------------
-// Lapped input → permanent hard-stop, surfaced in the coordinator status frame.
+// A consumer that never drains backpressures its producer: nothing is
+// overwritten, nothing hard-stops, and the cycle loop never blocks (the
+// producer's failed publishes are counted, not returned).
 // ---------------------------------------------------------------------------
 
 #[cfg(not(miri))]
 #[stellarator::test]
-async fn lapped_input_hard_stops() {
+async fn idle_consumer_backpressures_producer() {
     let seen = Rc::new(RefCell::new(Vec::new()));
     let mut b = Coordinator::builder(config());
     let prod = b.add_cyclic(Producer::new());
     let cons = b.add_cyclic(Consumer {
         seen: seen.clone(),
-        drain: false, // never reads → its view laps as the producer writes
+        drain: false, // never reads → its view eventually fills the ring
         init_counter: None,
         first_exec_init: None,
     });
@@ -199,19 +201,10 @@ async fn lapped_input_hard_stops() {
 
     coord.run_for(60).await;
 
-    // The consumer hard-stopped and is named in the status surface; the producer
-    // (no inputs) keeps running.
-    let stopped = coord.stopped();
-    assert_eq!(stopped.len(), 1, "exactly the consumer stopped");
-    assert_eq!(stopped[0].name, "consumer");
-    assert_eq!(stopped[0].reason, StopReason::LappedInput);
-
-    // And it appears in the coordinator status *frame*.
-    let frame = coord.read_status().expect("status frame published");
-    assert!(
-        frame.iter().any(|(name, code)| name == "consumer" && *code == 1),
-        "consumer named in status frame: {frame:?}"
-    );
+    // No hard-stop doctrine anymore: both systems keep running; the writer's
+    // rejected writes were dropped (and counted on the producer's health).
+    assert!(coord.stopped().is_empty(), "backpressure never stops a system");
+    assert!(seen.borrow().is_empty(), "the consumer never drained");
 }
 
 // ---------------------------------------------------------------------------
@@ -239,12 +232,10 @@ impl System for AsyncConsumer {
 
 impl AsyncSystem for AsyncConsumer {
     async fn run(&mut self, input: &mut Self::Input, _o: &mut Self::Output) {
-        match input.imu.recv().await {
-            Ok(imu) => {
-                self.count.fetch_add(1, Relaxed);
-                self.last.store(imu.get().omega as u64, Relaxed);
-            }
-            Err(_) => input.imu.resync(), // lapped: drop-on-full, keep going
+        // Corrupt (the only recv error) is unreachable in practice; skip the wake.
+        if let Ok(imu) = input.imu.recv().await {
+            self.count.fetch_add(1, Relaxed);
+            self.last.store(imu.get().omega as u64, Relaxed);
         }
     }
 }
@@ -255,7 +246,7 @@ async fn async_through_copy_in() {
     let count = Arc::new(AtomicU64::new(0));
     let last = Arc::new(AtomicU64::new(0));
     let mut producer = Producer::new();
-    producer.burst = 8; // burst past the private buffer to exercise drop-on-full
+    producer.burst = 8; // burst past the copy-in's per-cycle mirror (latest-wins)
 
     let mut b = Coordinator::builder(config());
     let prod = b.add_cyclic(producer);
@@ -267,7 +258,8 @@ async fn async_through_copy_in() {
         .unwrap();
     let mut coord = b.build().unwrap();
 
-    // Completes without blocking despite overflow (overwrite private buffer).
+    // Completes without blocking despite the burst (the copy-in mirrors only the
+    // newest record per cycle; a full private ring skips, never suspends).
     coord.run_for(30).await;
 
     assert!(
@@ -702,21 +694,15 @@ fn stopped_set_change_detection_compares_membership() {
     use super::{StoppedSystem, stopped_set_changed};
     let a = StoppedSystem {
         name: "a",
-        reason: StopReason::LappedInput,
+        reason: StopReason::Panicked,
     };
     let b = StoppedSystem {
         name: "b",
-        reason: StopReason::LappedInput,
-    };
-    let a_panicked = StoppedSystem {
-        name: "a",
         reason: StopReason::Panicked,
     };
     // Equal length, different member (a slot recovered the same cycle another
     // stopped) — the length-only check missed exactly this.
     assert!(stopped_set_changed(&[a], &[b]));
-    // Equal length, same system, new reason.
-    assert!(stopped_set_changed(&[a], &[a_panicked]));
     // Identical sets are unchanged; length changes still register.
     assert!(!stopped_set_changed(&[a, b], &[a, b]));
     assert!(stopped_set_changed(&[a], &[]));
@@ -1012,6 +998,8 @@ fn delayed_edge_into_log_input_is_rejected() {
 struct SnapshotFanInConsumer;
 
 struct SnapshotFanInIn {
+    // Bound but never drained: the test only exercises build-time validation.
+    #[allow(dead_code)]
     imu: Input<Imu>,
 }
 
@@ -1020,9 +1008,6 @@ impl SystemInput for SnapshotFanInIn {
         vec![crate::PortDecl::Port(
             crate::PortDesc::of::<Imu>().with_fan_in(crate::FanIn::Many),
         )]
-    }
-    fn any_lapped(&self) -> bool {
-        self.imu.lap_fault()
     }
 }
 
@@ -1057,63 +1042,6 @@ fn snapshot_fan_in_is_rejected() {
             err,
             WireError::SnapshotFanIn {
                 system: "snapshot_fan_in",
-                ..
-            }
-        ),
-        "{err:?}"
-    );
-}
-
-// An async consumer whose hand-written Log input declares OnLap::Stop — the one
-// unenforceable declaration (an async system cannot be step-gated).
-struct StopLogAsync;
-
-struct StopLogAsyncIn {
-    events: MsgIn<TestEvent>,
-}
-
-impl SystemInput for StopLogAsyncIn {
-    fn decls() -> Vec<crate::PortDecl> {
-        vec![crate::PortDecl::Port(
-            MsgIn::<TestEvent>::descriptor().with_on_lap(crate::OnLap::Stop),
-        )]
-    }
-    fn any_lapped(&self) -> bool {
-        false
-    }
-}
-
-impl crate::BindPorts<BoxBacking> for StopLogAsyncIn {
-    fn bind<S: crate::RingSource<B = BoxBacking>>(src: &mut S) -> Self {
-        Self {
-            events: MsgIn::bind(src),
-        }
-    }
-}
-
-impl System for StopLogAsync {
-    type Input = StopLogAsyncIn;
-    type Output = Out<NoOut>;
-    const NAME: &'static str = "stop_log_async";
-}
-
-impl AsyncSystem for StopLogAsync {
-    async fn run(&mut self, input: &mut StopLogAsyncIn, _o: &mut Self::Output) {
-        input.events.drain(|_| {});
-        stellarator::sleep(Duration::from_millis(5)).await;
-    }
-}
-
-#[test]
-fn stop_on_async_log_input_is_rejected() {
-    let mut b = Coordinator::builder(config());
-    b.add_async(StopLogAsync);
-    let err = b.build().err().expect("OnLap::Stop on an async Log input is rejected");
-    assert!(
-        matches!(
-            err,
-            WireError::StopOnAsyncInput {
-                system: "stop_log_async",
                 ..
             }
         ),

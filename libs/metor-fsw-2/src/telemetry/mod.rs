@@ -477,9 +477,6 @@ impl SystemInput for UplinkIn {
     fn decls() -> Vec<PortDecl> {
         Vec::new()
     }
-    fn any_lapped(&self) -> bool {
-        false
-    }
 }
 
 impl BindPorts<BoxBacking> for UplinkIn {
@@ -642,9 +639,6 @@ impl SystemInput for TelemetryIn {
     fn decls() -> Vec<PortDecl> {
         Vec::new()
     }
-    fn any_lapped(&self) -> bool {
-        false
-    }
 }
 
 impl BindPorts<BoxBacking> for TelemetryIn {
@@ -663,9 +657,12 @@ impl BindPorts<BoxBacking> for TelemetryIn {
 /// out for free: FIFO lane + announced Table packets.
 struct Tap {
     view: View<BoxBacking, NoWake, NoWake>,
-    scratch: Vec<u8>,
     lane: Lane,
     wire: Wire,
+    /// Coalesce lane only: the ring's `committed` at the last push, so a cycle with
+    /// no new record pushes nothing (the pinned newest record is not re-sent).
+    /// `u64::MAX` = nothing pushed yet.
+    last_committed: u64,
 }
 
 /// Which hand-off lane a tap pushes to — the entry's `Delivery` projection.
@@ -791,9 +788,9 @@ impl<T: Transport + 'static> System for TelemetrySystem<T> {
             };
             taps.push(Tap {
                 view,
-                scratch: Vec::new(),
                 lane,
                 wire,
+                last_committed: u64::MAX,
             });
         }
 
@@ -858,11 +855,12 @@ fn frame_packet(wire: &Wire, rec: &[u8]) -> Option<LenPacket> {
 
 impl<T: Transport + 'static> CyclicSystem for TelemetrySystem<T> {
     /// End-of-cycle drain (telemetry.md §3/§4) — ONE loop over the one tap list;
-    /// never awaits. A Coalesce tap keeps only the newest record and pushes one
-    /// latest-wins snapshot; a Fifo tap pushes **every** record in order. Either way
-    /// the packet is framed per the tap's wire form and a lapped view resyncs to the
-    /// live edge (the cycle never blocks). Drops detected since last cycle surface
-    /// as `telemetry.dropped` (snapshot lane) / `telemetry.msg_dropped` (log lane).
+    /// never awaits. A Coalesce tap borrows only the newest record and pushes one
+    /// latest-wins snapshot (nothing when no new record landed); a Fifo tap pushes
+    /// **every** record in order. Either way the record is borrowed in place off
+    /// the ring and framed per the tap's wire form. Drops detected since last cycle
+    /// surface as `telemetry.dropped` (snapshot lane) / `telemetry.msg_dropped`
+    /// (log lane).
     fn execute(&mut self, _now: Timestamp, _input: &mut Self::Input, output: &mut Self::Output) {
         let Some(started) = &self.started else {
             return;
@@ -870,17 +868,19 @@ impl<T: Transport + 'static> CyclicSystem for TelemetrySystem<T> {
         let handoff = started.handoff.clone();
         for tap in &mut self.taps {
             match tap.lane {
-                // Latest-wins: drain to the newest committed record; no new record
-                // this cycle means nothing to send for this tap.
+                // Latest-wins: borrow the newest committed record; an unchanged
+                // `committed` means no new record this cycle — nothing to send
+                // (and the pinned record is not re-pushed).
                 Lane::Coalesce { slot } => {
-                    let mut got = false;
-                    crate::port::drain_view(
-                        &mut tap.view,
-                        &mut tap.scratch,
-                        crate::OnLap::Resync,
-                        |_| got = true,
-                    );
-                    if got && let Some(pkt) = frame_packet(&tap.wire, &tap.scratch) {
+                    let committed = tap.view.committed();
+                    if committed == tap.last_committed {
+                        continue;
+                    }
+                    tap.last_committed = committed;
+                    // Corrupt (unreachable in practice) reads as "nothing new".
+                    if let Ok(Some(grant)) = tap.view.try_latest()
+                        && let Some(pkt) = frame_packet(&tap.wire, &grant)
+                    {
                         handoff.push_snapshot(slot, pkt);
                     }
                 }
@@ -888,16 +888,11 @@ impl<T: Transport + 'static> CyclicSystem for TelemetrySystem<T> {
                 Lane::Fifo => {
                     let wire = &tap.wire;
                     let handoff = &handoff;
-                    crate::port::drain_view(
-                        &mut tap.view,
-                        &mut tap.scratch,
-                        crate::OnLap::Resync,
-                        |rec| {
-                            if let Some(pkt) = frame_packet(wire, rec) {
-                                handoff.push_log(pkt);
-                            }
-                        },
-                    );
+                    let _ = crate::port::drain_view(&mut tap.view, |rec| {
+                        if let Some(pkt) = frame_packet(wire, rec) {
+                            handoff.push_log(pkt);
+                        }
+                    });
                 }
             }
         }

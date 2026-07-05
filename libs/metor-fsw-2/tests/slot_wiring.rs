@@ -326,10 +326,12 @@ fn slot_allow_params_resolve_and_run_b1() {
         coord.run_for(6).await;
         coord
     });
-    let out = gain_view
-        .latest()
-        .expect("the occupant published its configured gain");
-    assert_eq!(out.get().gain, 0.8, "allow params reached the running occupant");
+    {
+        let out = gain_view
+            .latest()
+            .expect("the occupant published its configured gain");
+        assert_eq!(out.get().gain, 0.8, "allow params reached the running occupant");
+    }
     assert!(coord.stopped().is_empty(), "Done is not a hard-stop");
 
     drop((coord, gain_view));

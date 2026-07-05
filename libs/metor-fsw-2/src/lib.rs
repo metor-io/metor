@@ -78,7 +78,7 @@ pub use telemetry::{
 // collision-prone under a glob import (S3). Wiring resolves compatibility itself;
 // the derives call `split_decls` through `crate::` paths.
 pub use descriptor::{
-    AnnounceFn, Capability, Delivery, FanIn, Hz, OnLap, PortConn, PortDecl, PortDesc, PortId,
+    AnnounceFn, Capability, Delivery, FanIn, Hz, PortConn, PortDecl, PortDesc, PortId,
     PortSchema, SystemDescriptor, SystemKind, split_decls,
 };
 // `health::Level` stays namespaced (S3) — write `health::Level::Warn`.

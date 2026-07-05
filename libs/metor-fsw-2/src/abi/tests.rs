@@ -13,7 +13,7 @@ use core::ffi::c_void;
 use core::ptr;
 use std::slice;
 
-use metor_fsw_ring::{Backing, BoxBacking, Config, NoWake, Overrun, RingBuffer};
+use metor_fsw_ring::{Backing, BoxBacking, Config, NoWake, RingBuffer};
 use metor_proto::types::{ComponentId, Timestamp};
 use metor_proto::vtable::VTable;
 use postcard_schema::Schema;
@@ -121,11 +121,10 @@ crate::export_system!(Counter);
 // Host-emulation helpers.
 // ---------------------------------------------------------------------------
 
-fn overwrite_ring<F: Frame>(depth: usize, readers: usize) -> RingBuffer<BoxBacking> {
+fn ring_for<F: Frame>(depth: usize, readers: usize) -> RingBuffer<BoxBacking> {
     RingBuffer::create_in_memory(Config {
         capacity: buffer_capacity::<F>(depth),
         max_readers: readers,
-        overrun: Overrun::Overwrite,
     })
 }
 
@@ -143,10 +142,10 @@ fn handle(ring: &RingBuffer<BoxBacking>, role: u8) -> FswRing {
 fn abi_lifecycle_end_to_end() {
     // Host-side rings (the coordinator owns these). Descriptor order on the output
     // side is [user `out`, implicit health, implicit log].
-    let in_ring = overwrite_ring::<TickIn>(8, 1);
-    let out_ring = overwrite_ring::<TickOut>(8, 1);
-    let health_ring = overwrite_ring::<SystemHealth>(8, 1);
-    let log_ring = overwrite_ring::<SystemLog>(8, 1);
+    let in_ring = ring_for::<TickIn>(8, 1);
+    let out_ring = ring_for::<TickOut>(8, 1);
+    let health_ring = ring_for::<SystemHealth>(8, 1);
+    let log_ring = ring_for::<SystemLog>(8, 1);
 
     // The host reads results through its own view; register it before the system
     // writes (a fresh view only sees data committed from now on).
@@ -181,10 +180,13 @@ fn abi_lifecycle_end_to_end() {
     let status = fsw_execute(state, 1000);
     assert_eq!(status, FswStatus::Running);
 
-    // Read the produced frame back through the host's view.
-    let out = out_view.latest().expect("system produced an output");
-    assert_eq!(out.get().count, 105, "start(100) + value(5)");
-    assert_eq!(out.get().timestamp, Timestamp(1000), "stamped with `now`");
+    // Read the produced frame back through the host's view (scoped: the grant
+    // borrows the view, which is dropped below).
+    {
+        let out = out_view.latest().expect("system produced an output");
+        assert_eq!(out.get().count, 105, "start(100) + value(5)");
+        assert_eq!(out.get().timestamp, Timestamp(1000), "stamped with `now`");
+    }
 
     // Teardown: shutdown + destroy inside the `.so` *before* the host rings drop.
     fsw_shutdown(state);
@@ -240,7 +242,6 @@ fn abi_describe_round_trips() {
         // The axes + telemetry flag ride the wire verbatim.
         assert_eq!(m.delivery, d.delivery);
         assert_eq!(m.fan_in, d.fan_in);
-        assert_eq!(m.on_lap, d.on_lap);
         assert_eq!(m.telemetered, d.telemetered);
     }
 
@@ -324,6 +325,8 @@ struct Boom;
 
 #[derive(SystemInput)]
 struct BoomIn<B: Backing = BoxBacking> {
+    // Bound by the ABI but never drained (Boom panics first).
+    #[allow(dead_code)]
     tick: Input<TickIn, B>,
 }
 
@@ -363,10 +366,10 @@ extern "C" fn boom_execute(state: *mut c_void, now: u64) -> FswStatus {
 
 #[test]
 fn abi_panic_is_contained() {
-    let in_ring = overwrite_ring::<TickIn>(8, 1);
-    let out_ring = overwrite_ring::<TickOut>(8, 1);
-    let health_ring = overwrite_ring::<SystemHealth>(8, 1);
-    let log_ring = overwrite_ring::<SystemLog>(8, 1);
+    let in_ring = ring_for::<TickIn>(8, 1);
+    let out_ring = ring_for::<TickOut>(8, 1);
+    let health_ring = ring_for::<SystemHealth>(8, 1);
+    let log_ring = ring_for::<SystemLog>(8, 1);
 
     let inputs = [handle(&in_ring, ROLE_INPUT)];
     let outputs = [
@@ -401,19 +404,18 @@ fn abi_panic_is_contained() {
 }
 
 /// `FswStatus::from_raw` is the dlopen consuming side's trust-boundary conversion
-/// (review R2): the four declared discriminants round-trip, and anything outside
-/// `0..=3` — the range a well-behaved `.so`'s `fsw_execute` sends — folds to
+/// (review R2): the three declared discriminants round-trip, and anything outside
+/// `0..=2` — the range a well-behaved `.so`'s `fsw_execute` sends — folds to
 /// `Panicked` rather than being trusted as a valid `repr(u32)` value.
 #[test]
 fn from_raw_folds_out_of_range_to_panicked() {
     assert_eq!(FswStatus::from_raw(0), FswStatus::Running);
-    assert_eq!(FswStatus::from_raw(1), FswStatus::StoppedLapped);
-    assert_eq!(FswStatus::from_raw(2), FswStatus::Panicked);
-    assert_eq!(FswStatus::from_raw(3), FswStatus::Done);
+    assert_eq!(FswStatus::from_raw(1), FswStatus::Panicked);
+    assert_eq!(FswStatus::from_raw(2), FswStatus::Done);
     // Never sent by the host's own `run_execute`/`run_seq_execute` exports, but a
     // stale/mismatched build, a hand-rolled non-Rust exporter, or memory corruption
     // could hand back any word — none of these must be trusted verbatim.
-    assert_eq!(FswStatus::from_raw(4), FswStatus::Panicked);
+    assert_eq!(FswStatus::from_raw(3), FswStatus::Panicked);
     assert_eq!(FswStatus::from_raw(255), FswStatus::Panicked);
     assert_eq!(FswStatus::from_raw(u32::MAX), FswStatus::Panicked);
 }
@@ -667,10 +669,10 @@ impl SeqSystem for WaitSeq {
 #[test]
 fn seq_abi_runs_to_done() {
     // Descriptor-order rings: input [control]; outputs [status, health, log].
-    let control_ring = overwrite_ring::<SlotControlIn>(8, 1);
-    let status_ring = overwrite_ring::<SequenceStatus>(8, 1);
-    let health_ring = overwrite_ring::<SystemHealth>(8, 1);
-    let log_ring = overwrite_ring::<SystemLog>(8, 1);
+    let control_ring = ring_for::<SlotControlIn>(8, 1);
+    let status_ring = ring_for::<SequenceStatus>(8, 1);
+    let health_ring = ring_for::<SystemHealth>(8, 1);
+    let log_ring = ring_for::<SystemLog>(8, 1);
 
     // Host view over the status ring, registered before the occupant writes.
     let mut status_view = Input::<SequenceStatus>::new(status_ring.view(NoWake, NoWake).unwrap());
@@ -705,11 +707,13 @@ fn seq_abi_runs_to_done() {
     assert_eq!(unsafe { run_seq_execute::<WaitSeq>(state, 2) }, FswStatus::Done);
 
     // A terminal `SequenceStatus` (run_state == Completed) was published on the tail.
-    let rec = status_view
-        .latest()
-        .expect("a SequenceStatus record was written");
-    assert_eq!(rec.get().run_state, Outcome::Completed.run_state());
-    assert_eq!(rec.get().timestamp, Timestamp(2));
+    {
+        let rec = status_view
+            .latest()
+            .expect("a SequenceStatus record was written");
+        assert_eq!(rec.get().run_state, Outcome::Completed.run_state());
+        assert_eq!(rec.get().timestamp, Timestamp(2));
+    }
 
     // SAFETY: live state, torn down once before the host rings drop.
     unsafe {
@@ -729,12 +733,11 @@ fn port_desc_msg_round_trips_both_arms() {
     use metor_proto::types::Msg;
     use metor_proto_wkt::SequenceCommand;
 
-    use crate::{Delivery, FanIn, OnLap, PortDesc, PortId, PortSchema};
+    use crate::{Delivery, FanIn, PortDesc, PortId, PortSchema};
 
-    // Postcard arm — with non-default axes, so the overrides ride the wire too.
-    let d = PortDesc::msg::<SequenceCommand>()
-        .untelemetered()
-        .with_on_lap(OnLap::Stop);
+    // Postcard arm — with a non-default telemetry flag, so the override rides
+    // the wire too.
+    let d = PortDesc::msg::<SequenceCommand>().untelemetered();
     let m = PortDescMsg::lower(&d);
     let bytes = postcard::to_allocvec(&m).expect("encodes");
     let back: PortDescMsg = postcard::from_bytes(&bytes).expect("decodes");
@@ -746,7 +749,6 @@ fn port_desc_msg_round_trips_both_arms() {
     assert!(rd.vtable().is_none(), "no vtable on a Postcard port (checked, S5)");
     assert_eq!(rd.delivery, Delivery::Log);
     assert_eq!(rd.fan_in, FanIn::Many);
-    assert_eq!(rd.on_lap, OnLap::Stop, "the override survived the wire");
     assert!(!rd.telemetered, "the opt-out survived the wire");
     // The reconstructed desc satisfies an edge against the static twin.
     assert!(crate::descriptor::compatible(&rd, &PortDesc::msg::<SequenceCommand>()));
@@ -761,7 +763,6 @@ fn port_desc_msg_round_trips_both_arms() {
     assert_eq!(rd.name, "tick_out");
     assert_eq!(rd.delivery, Delivery::Snapshot);
     assert_eq!(rd.fan_in, FanIn::One);
-    assert_eq!(rd.on_lap, OnLap::Stop);
     assert!(rd.telemetered);
     // Wiring compatibility runs over the carried unprefixed vtable, unchanged.
     assert!(crate::descriptor::compatible(&PortDesc::of::<TickOut>(), &rd));

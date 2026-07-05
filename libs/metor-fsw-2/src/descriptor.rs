@@ -2,18 +2,17 @@
 //! §5): the per-port [`PortDesc`], the [`SystemDescriptor`] bundle, and the
 //! producer/consumer [`compatible`] check.
 //!
-//! One port concept, four orthogonal axes (`docs/design-port-unification.md`):
+//! One port concept, three orthogonal axes (`docs/design-port-unification.md`):
 //!
 //! ```text
 //! schema     Table(VTable) | Postcard(PacketId)      what a record is
 //! delivery   Snapshot | Log                          what a consumer reads
 //! fan-in     One | Many                              how many producers an input takes
-//! on-lap     Stop | Resync                           what a lap means for the reader
 //! ```
 //!
 //! "Frame port" and "message port" are two *configurations* of this one concept:
-//! [`PortDesc::of`] mints `Table × Snapshot × One × Stop`, [`PortDesc::msg`] mints
-//! `Postcard × Log × Many × Resync`. Everything here is derived from static metadata
+//! [`PortDesc::of`] mints `Table × Snapshot × One`, [`PortDesc::msg`] mints
+//! `Postcard × Log × Many`. Everything here is derived from static metadata
 //! (`F::FRAME_ID`, `F::as_vtable()`, `M::ID`), so a system can be sized, allocated,
 //! and wiring-validated without constructing it.
 
@@ -113,19 +112,8 @@ pub enum FanIn {
     Many,
 }
 
-/// Axis 4 — what a writer lap means for this *input*'s reader. (Ignored on outputs.)
-#[derive(Clone, Copy, PartialEq, Eq, Debug, serde::Serialize, serde::Deserialize)]
-pub enum OnLap {
-    /// A lap is a hard fault: the framework telemeters it and permanently stops
-    /// the consumer (the cyclic frame doctrine).
-    Stop,
-    /// A lap means skip to the live edge and continue (best-effort; the message
-    /// and async-copy-in behavior).
-    Resync,
-}
-
 /// Who provides the other end of this port (`docs/design-command-slots.md` §2.1) —
-/// a fifth axis beside schema × delivery × fan-in × on-lap.
+/// a fourth axis beside schema × delivery × fan-in.
 ///
 /// Not carried across the dl ABI: a dlopen'd system's ports are always
 /// edge-connected (`Host`/`SelfTap` are host-runner constructs — the slot runner's
@@ -181,14 +169,6 @@ impl PortDecl {
         }
     }
 
-    /// The derive-facing twin of [`PortDesc::with_on_lap`] (same port-only rule).
-    pub fn with_on_lap(self, p: OnLap) -> Self {
-        match self {
-            PortDecl::Port(d) => PortDecl::Port(d.with_on_lap(p)),
-            cap => cap,
-        }
-    }
-
     /// The port shape of a [`Port`](PortDecl::Port) decl, `None` for a capability.
     pub fn into_port(self) -> Option<PortDesc> {
         match self {
@@ -213,12 +193,12 @@ pub fn split_decls(decls: Vec<PortDecl>) -> (Vec<PortDesc>, Vec<Capability>) {
 }
 
 /// One port's static shape: its edge key, display name, worst-case size, and the
-/// four behavior axes.
+/// behavior axes.
 ///
 /// Used both for an output (a produced record stream) and an input (a required
 /// shape) — the two are structurally identical; the direction is which list of a
-/// [`SystemDescriptor`] it sits in. `fan_in`/`on_lap` are documented no-ops on
-/// outputs; `telemetered` is a no-op on inputs.
+/// [`SystemDescriptor`] it sits in. `fan_in` is a documented no-op on outputs;
+/// `telemetered` is a no-op on inputs.
 #[derive(Clone)]
 pub struct PortDesc {
     /// Edge key, derived from schema by the constructors:
@@ -237,8 +217,6 @@ pub struct PortDesc {
     pub delivery: Delivery,
     /// Axis 3 — producer cardinality for an input (no-op on outputs).
     pub fan_in: FanIn,
-    /// Axis 4 — lap policy for an input's reader (no-op on outputs).
-    pub on_lap: OnLap,
     /// Output-side: whether the downlink / `AllOutputs` taps this port (A6). A plain
     /// field on *every* port — frames get the opt-out too.
     pub telemetered: bool,
@@ -263,7 +241,6 @@ impl std::fmt::Debug for PortDesc {
         };
         s.field("delivery", &self.delivery)
             .field("fan_in", &self.fan_in)
-            .field("on_lap", &self.on_lap)
             .field("telemetered", &self.telemetered)
             .field("conn", &self.conn);
         s.finish()
@@ -281,7 +258,7 @@ fn announce_of<F: Frame>(prefix: &str) -> (VTable, Vec<ComponentMetadata>) {
 }
 
 impl PortDesc {
-    /// Derives the descriptor for a frame type: `Table × Snapshot × One × Stop`,
+    /// Derives the descriptor for a frame type: `Table × Snapshot × One`,
     /// telemetered. Pure metadata — no instance needed.
     pub fn of<F: Frame>() -> Self {
         Self {
@@ -299,13 +276,12 @@ impl PortDesc {
             },
             delivery: Delivery::Snapshot,
             fan_in: FanIn::One,
-            on_lap: OnLap::Stop,
             telemetered: true,
             conn: PortConn::Edge,
         }
     }
 
-    /// Derives the descriptor for a message type: `Postcard × Log × Many × Resync`,
+    /// Derives the descriptor for a message type: `Postcard × Log × Many`,
     /// telemetered. The edge key is `M::ID`; the name is the explicit, stable
     /// [`NamedMsg::NAME`] token (A10 — never the Rust type path).
     pub fn msg<M: NamedMsg>() -> Self {
@@ -316,7 +292,6 @@ impl PortDesc {
             schema: PortSchema::Postcard,
             delivery: Delivery::Log,
             fan_in: FanIn::Many,
-            on_lap: OnLap::Resync,
             telemetered: true,
             conn: PortConn::Edge,
         }
@@ -343,13 +318,7 @@ impl PortDesc {
         self
     }
 
-    /// Override the lap policy (axis 4).
-    pub fn with_on_lap(mut self, p: OnLap) -> Self {
-        self.on_lap = p;
-        self
-    }
-
-    /// Override the port-connection axis (axis 5) — used only by the slot runner's
+    /// Override the port-connection axis (axis 4) — used only by the slot runner's
     /// and coordinator's own bundle derivations; user ports stay [`PortConn::Edge`].
     pub fn with_conn(mut self, c: PortConn) -> Self {
         self.conn = c;
@@ -474,9 +443,8 @@ mod tests {
     }
 
     /// Constructor axis defaults match the facade table (§2.2): `of` mints
-    /// `Table × Snapshot × One × Stop`, telemetered; `msg` mints
-    /// `Postcard × Log × Many × Resync`, telemetered — and each `id` is consistent
-    /// with its schema's value space.
+    /// `Table × Snapshot × One`, telemetered; `msg` mints `Postcard × Log × Many`,
+    /// telemetered — and each `id` is consistent with its schema's value space.
     #[test]
     fn constructor_axis_defaults() {
         let f = PortDesc::of::<AxisProbe>();
@@ -485,7 +453,6 @@ mod tests {
         assert!(matches!(f.schema, PortSchema::Table { .. }));
         assert_eq!(f.delivery, Delivery::Snapshot);
         assert_eq!(f.fan_in, FanIn::One);
-        assert_eq!(f.on_lap, OnLap::Stop);
         assert!(f.telemetered);
 
         let m = PortDesc::msg::<SequenceCommand>();
@@ -494,7 +461,6 @@ mod tests {
         assert!(matches!(m.schema, PortSchema::Postcard));
         assert_eq!(m.delivery, Delivery::Log);
         assert_eq!(m.fan_in, FanIn::Many);
-        assert_eq!(m.on_lap, OnLap::Resync);
         assert!(m.telemetered);
     }
 
@@ -505,13 +471,9 @@ mod tests {
         assert!(!d.telemetered);
         assert_eq!(d.delivery, Delivery::Snapshot);
 
-        let d = PortDesc::msg::<SequenceCommand>().with_on_lap(OnLap::Stop);
-        assert_eq!(d.on_lap, OnLap::Stop);
-        assert_eq!(d.fan_in, FanIn::Many);
-
         let d = PortDesc::of::<AxisProbe>().with_fan_in(FanIn::Many);
         assert_eq!(d.fan_in, FanIn::Many);
-        assert_eq!(d.on_lap, OnLap::Stop);
+        assert_eq!(d.delivery, Delivery::Snapshot);
 
         // The generic fourth combination: an every-record frame log.
         let d = PortDesc::of::<AxisProbe>().with_delivery(Delivery::Log);

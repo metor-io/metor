@@ -41,7 +41,7 @@ use serde::{Deserialize, Serialize};
 use crate::binder::{BindPorts, RingSource};
 use crate::coordinator::{CyclicSlot, SlotState, StopReason};
 use crate::descriptor::{
-    AnnounceFn, Delivery, FanIn, OnLap, PortDesc, PortId, PortSchema, SystemDescriptor, SystemKind,
+    AnnounceFn, Delivery, FanIn, PortDesc, PortId, PortSchema, SystemDescriptor, SystemKind,
 };
 use crate::sequence::{SeqBound, SeqClock, SeqSystem, publish_status, with_clock};
 use crate::system::{BuildSystem, CyclicRunner, CyclicSystem, Out, SystemOutput};
@@ -60,10 +60,13 @@ use crate::system::{BuildSystem, CyclicRunner, CyclicSystem, Out, SystemOutput};
 /// for the port unification: drops the unused `rate_hint` field, makes
 /// [`PortDescMsg`] schema-tagged ([`PortSchemaMsg`]: `Table` | `Postcard` — a `.so`
 /// can now declare a message port) and carries the behavior axes
-/// (`delivery`/`fan_in`/`on_lap`) + the `telemetered` flag, and adds
-/// `capabilities` to [`SystemDescriptorMsg`] (rejected non-empty at load in v1 —
-/// every capability is host-only).
-pub const FSW_ABI_VERSION: u32 = 3;
+/// (`delivery`/`fan_in`) + the `telemetered` flag, and adds `capabilities` to
+/// [`SystemDescriptorMsg`] (rejected non-empty at load in v1 — every capability is
+/// host-only).
+/// `4` (unshipped) retires the ring's overwrite mode: the `on_lap` axis leaves
+/// [`PortDescMsg`] and the `StoppedLapped` status word is gone
+/// ([`FswStatus`] renumbers to Running=0 / Panicked=1 / Done=2).
+pub const FSW_ABI_VERSION: u32 = 4;
 
 // ---------------------------------------------------------------------------
 // repr(C) handles
@@ -102,11 +105,9 @@ pub const ROLE_OUTPUT: u8 = 1;
 pub enum FswStatus {
     /// The system ran (or is runnable); keep cycling it.
     Running = 0,
-    /// An input lapped; the system permanently stopped itself (`StopReason::LappedInput`).
-    StoppedLapped = 1,
     /// A panic was caught at the boundary, or the state was never bound; the host
     /// telemeters it and hard-stops the slot.
-    Panicked = 2,
+    Panicked = 1,
     /// A sequence occupant's future returned `Ready` — a **terminal, non-error**
     /// stop (§8). The host maps it to the slot-layer terminal state and stops
     /// polling; the `Completed`/`Aborted`/`Failed` detail rides the
@@ -114,7 +115,7 @@ pub enum FswStatus {
     /// `CyclicRunner`-driven (`export_system!`) system never returns it, so
     /// [`from_slot`](FswStatus::from_slot) — which maps a [`SlotState`] with no
     /// `Done` — is unchanged; sequences return it directly from `run_seq_execute`.
-    Done = 3,
+    Done = 2,
 }
 
 impl FswStatus {
@@ -138,9 +139,8 @@ impl FswStatus {
     pub(crate) fn from_raw(raw: u32) -> Self {
         match raw {
             0 => FswStatus::Running,
-            1 => FswStatus::StoppedLapped,
-            2 => FswStatus::Panicked,
-            3 => FswStatus::Done,
+            1 => FswStatus::Panicked,
+            2 => FswStatus::Done,
             _ => FswStatus::Panicked,
         }
     }
@@ -148,9 +148,6 @@ impl FswStatus {
     /// Map a runner's [`SlotState`] (after a `step`) to the FFI status.
     fn from_slot(state: SlotState) -> Self {
         match state {
-            SlotState::Stopped {
-                reason: StopReason::LappedInput,
-            } => FswStatus::StoppedLapped,
             // A `.so`-side `CyclicRunner` never sets `Panicked` through its `SlotState`
             // (a panic is caught by `catch_unwind` and returned directly as
             // `FswStatus::Panicked`), but the match must stay total.
@@ -223,8 +220,8 @@ pub enum PortSchemaMsg {
 }
 
 /// The serializable mirror of [`PortDesc`]: the port name, worst-case size, the
-/// schema axis ([`PortSchemaMsg`]), the three behavior axes, and the telemetry flag
-/// — a `.so` declares message ports and axis overrides exactly like a static
+/// schema axis ([`PortSchemaMsg`]), the behavior axes, and the telemetry flag —
+/// a `.so` declares message ports and axis overrides exactly like a static
 /// system.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct PortDescMsg {
@@ -238,8 +235,6 @@ pub struct PortDescMsg {
     pub delivery: Delivery,
     /// Axis 3 — producer cardinality for an input.
     pub fan_in: FanIn,
-    /// Axis 4 — the reader's lap policy.
-    pub on_lap: OnLap,
     /// Whether the downlink / `AllOutputs` taps this port (A6).
     pub telemetered: bool,
 }
@@ -293,7 +288,6 @@ impl PortDescMsg {
             schema,
             delivery: desc.delivery,
             fan_in: desc.fan_in,
-            on_lap: desc.on_lap,
             telemetered: desc.telemetered,
         }
     }
@@ -345,7 +339,6 @@ impl PortDescMsg {
             schema,
             delivery: self.delivery,
             fan_in: self.fan_in,
-            on_lap: self.on_lap,
             telemetered: self.telemetered,
             // Not carried across the ABI: a dlopen'd system's ports are always
             // edge-connected (Host/SelfTap are host-runner constructs; the slot
@@ -656,8 +649,8 @@ pub unsafe fn run_bind_init<S, O>(
     }));
 }
 
-/// `fsw_execute`: run one cyclic `step` (the verbatim lapped→hard-stop / timing /
-/// health logic) and return the mapped [`FswStatus`]. The `now`
+/// `fsw_execute`: run one cyclic `step` (the verbatim timing / health logic) and
+/// return the mapped [`FswStatus`]. The `now`
 /// word carries the coordinator's raw [`Timestamp`] tick (see the module note on the
 /// ABI timestamp). A caught `execute` panic latches `poisoned` and returns
 /// [`FswStatus::Panicked`]; an unbound/poisoned state returns it too.

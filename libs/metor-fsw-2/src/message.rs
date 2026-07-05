@@ -117,10 +117,10 @@ impl<M: Msg, B: Backing, WD: WakeSource, WS: WakeSink> MsgOut<M, B, WD, WS> {
         }
     }
 
-    /// Emit one message, **infallibly** (review E6): the only failure on the
-    /// framework's Overwrite rings is `InsufficientCapacity` (a sizing bug), so the
-    /// drop is counted for the runner to fold into health rather than returned.
-    /// Sizing-aware callers keep [`emit`](Self::emit).
+    /// Emit one message, **infallibly** (review E6): a failed write —
+    /// `InsufficientCapacity` (a sizing bug) or `WouldBlock` (a slow reader
+    /// backpressuring the ring) — is counted for the runner to fold into health
+    /// rather than returned. Sizing-aware callers keep [`emit`](Self::emit).
     pub fn publish(&mut self, msg: &M) {
         if self.emit(msg).is_err() {
             self.dropped += 1;
@@ -223,16 +223,6 @@ where
     RS: WakeSource,
 {
     views: Vec<View<B, RD, RS>>,
-    /// A reused record buffer, so a per-cycle drain grows in place rather than allocating —
-    /// the [`MsgOut`] `scratch` mirror.
-    scratch: Vec<u8>,
-    /// A lap [`drain`](Self::drain) observed, latched — policy-free (see
-    /// [`lap_fault`](Self::lap_fault)).
-    lapped: bool,
-    /// The lap policy (axis 4), default [`OnLap`](crate::OnLap)`::Resync` (a message
-    /// input is a best-effort log); a guaranteed-delivery command input overrides to
-    /// `Stop` via [`with_on_lap`](Self::with_on_lap) / `#[fsw(on_lap = "stop")]`.
-    on_lap: crate::OnLap,
     _marker: PhantomData<fn() -> M>,
 }
 
@@ -253,49 +243,21 @@ where
     pub fn from_views(views: Vec<View<B, RD, RS>>) -> Self {
         Self {
             views,
-            scratch: Vec::new(),
-            lapped: false,
-            on_lap: crate::OnLap::Resync,
             _marker: PhantomData,
         }
-    }
-
-    /// Override the runtime lap policy — chainable, mirroring the descriptor-level
-    /// [`PortDesc::with_on_lap`](crate::PortDesc::with_on_lap). The
-    /// `#[fsw(on_lap = "…")]` derive attribute lowers onto both so descriptor and
-    /// runtime can never disagree.
-    pub fn with_on_lap(mut self, p: crate::OnLap) -> Self {
-        self.on_lap = p;
-        self
-    }
-
-    /// Whether this port is in **lap fault**: a lap was observed — latched by a past
-    /// [`drain`](Self::drain), or live on any producer view (a writer overran unread
-    /// records between cycles, the [`Input::lap_fault`](crate::Input) mirror) — *and*
-    /// the port's policy says laps are fatal ([`OnLap::Stop`](crate::OnLap)). The
-    /// default Resync policy reports `false` *because laps are not faults there* —
-    /// derived from the policy, no longer the hard-coded `false` the old
-    /// `is_lapped()` lied (A5). The runner gates a cyclic consumer on this before
-    /// and after `execute`.
-    pub fn lap_fault(&self) -> bool {
-        self.on_lap == crate::OnLap::Stop
-            && (self.lapped || self.views.iter().any(|v| v.is_lapped()))
     }
 
     /// Drain every record committed since the last call across **all** producer views,
     /// decoding each `M::ID` record and handing the decoded payload to `f`. Per-producer
     /// order is preserved; the cross-producer interleave is arbitrary (and irrelevant — each
     /// record self-addresses). Records of a different id (a heterogeneous channel) and records
-    /// that fail to postcard-decode are skipped.
-    ///
-    /// A lap follows the port's policy: under the default `Resync` a lapped view
-    /// skips to the live edge and keeps draining (best-effort, like the message-log
-    /// downlink — `docs/messages.md` §3); under `Stop` the view's drain stops and
-    /// [`lap_fault`](Self::lap_fault) reports, so the runner hard-stops a cyclic
-    /// consumer that must never lose a record.
+    /// that fail to postcard-decode are skipped. Records are never lost: a full ring
+    /// backpressures the emitter, and each record is borrowed in place (zero-copy)
+    /// and freed for the writer as soon as `f` returns. A corrupt view (unreachable
+    /// from in-crate behavior) stops draining that view.
     pub fn drain(&mut self, mut f: impl FnMut(M)) {
         for view in &mut self.views {
-            self.lapped |= crate::port::drain_view(view, &mut self.scratch, self.on_lap, |rec| {
+            let _ = crate::port::drain_view(view, |rec| {
                 if let Some((id, payload)) = split_record(rec)
                     && id == M::ID
                     && let Ok(msg) = postcard::from_bytes::<M>(payload)
@@ -377,7 +339,7 @@ impl postcard::ser_flavors::Flavor for ScratchFlavor<'_> {
 
 #[cfg(test)]
 mod tests {
-    use metor_fsw_ring::{Config, NoWake, Overrun, RingBuffer};
+    use metor_fsw_ring::{Config, NoWake, RingBuffer};
     use metor_proto::types::Msg;
     use metor_proto_wkt::{
         SequenceChannelSpec, SequenceCommand, SequenceCommandKind, SequenceRegistry,
@@ -397,7 +359,6 @@ mod tests {
         let ring = RingBuffer::create_in_memory(Config {
             capacity: capacity_for(MAX_MSG_BYTES, LOG_DEPTH),
             max_readers: 4,
-            overrun: Overrun::Overwrite,
         });
         let entry = RegistryEntry {
             key: metor_proto::types::ComponentId::new("coordinator.sequences"),
@@ -415,8 +376,8 @@ mod tests {
             PortId::Packet(SequenceCommand::ID)
         );
 
-        // Claim the tap before any write — a view on an overwrite ring starts at the
-        // live edge, so the tap must exist before data flows (the telemetry-tap order).
+        // Claim the tap before any write — a view starts at the live edge, so the
+        // tap must exist before data flows (the telemetry-tap order).
         let mut view = entry.view().expect("reader slot");
 
         // A typed port per Msg type (each keyed on its own `M::ID`). The ring enforces a
@@ -478,9 +439,8 @@ mod tests {
         let ring = RingBuffer::create_in_memory(Config {
             capacity: capacity_for(MAX_MSG_BYTES, LOG_DEPTH),
             max_readers: 4,
-            overrun: Overrun::Overwrite,
         });
-        // Claim the read view before any write (overwrite ring starts at the live edge).
+        // Claim the read view before any write (a view starts at the live edge).
         let mut inbox: MsgIn<SequenceCommand> = MsgIn::new(ring.view(NoWake, NoWake).expect("slot"));
 
         // Two typed ports take the ring's single writer in turn (drop frees the claim),
@@ -536,7 +496,6 @@ mod tests {
             RingBuffer::create_in_memory(Config {
                 capacity: capacity_for(MAX_MSG_BYTES, LOG_DEPTH),
                 max_readers: 4,
-                overrun: Overrun::Overwrite,
             })
         };
         let ring_a = mk();
