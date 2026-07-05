@@ -69,7 +69,7 @@ The payoff:
 
 The key symmetry to preserve: *a frame's ring bytes are its wire bytes* (`design.md`) — and
 *a message's ring bytes are its wire bytes* — is untouched. Only the **wiring** layer
-changes; the data path, the `Overwrite` "loss, never delay" rings, the every-record drain,
+changes; the data path, the lossless rings, the every-record drain,
 and the non-coalescing downlink FIFO (`docs/messages.md` §3.1) are all unchanged.
 
 ---
@@ -274,9 +274,9 @@ message outputs through the same map.
 
 **Consumer side — the fan-in reconciliation.** A frame cyclic input views its single
 producer's output ring directly (`src/coordinator/mod.rs:1228`). A message input may have K
-producers, so it holds **K views**. Two mechanisms, split by driver kind — mirroring how the
-framework already splits frame inputs (cyclic = direct view, async = private copy-in buffer,
-`design.md` "Overrun semantics"):
+producers, so it holds **K views**. The framework splits async decoupling by the **delivery
+axis**, not by payload kind (only async *Snapshot* inputs are decoupled through a private
+latest-wins copy-in ring, `plan_copy_ins`):
 
 - **Cyclic message consumer → direct multi-view.** `MsgIn<M>` internally holds
   `views: Vec<View>` — one per producer edge — and `drain(f)` drains all of them each cycle
@@ -285,15 +285,12 @@ framework already splits frame inputs (cyclic = direct view, async = private cop
   (`src/coordinator/mod.rs:1258,1693-1703`) generalized to one port. Same-cycle, no ordering
   constraint, no extra ring. The `SlotRunner` holds precisely this (§6).
 
-- **Async message consumer → private merge ring.** An async system cannot safely track K
-  coordinator-driven producer rings across the async boundary, so — as with frame async
-  inputs — a private `Overwrite` merge ring is fed by **one** `MsgCopyIn { upstreams:
-  Vec<View>, writer }` that drains all K producers into it each cycle; the async `MsgIn<M>`
-  holds one view over the merge ring. `MsgCopyIn` is the message twin of `CopyIn`
-  (`src/coordinator/mod.rs:343`), and — crucially — a *single* writer, so the single-writer
-  ring discipline holds even under fan-in. Frame async copy-in already runs at cycle tail
-  (`:1618`); message merge copy-in for an async consumer runs there too (async consumers are
-  decoupled, so tail-timing is fine).
+- **Async message consumer → the same direct multi-view.** A message input is a Log
+  (every-record) input, and Log inputs are **not** copy-in decoupled: the rings are lossless,
+  so the async consumer can safely poll-drain the K producer views directly — a slow consumer
+  backpressures its producers rather than losing records. There is no private merge ring and
+  no `MsgCopyIn`; the private copy-in ring exists only for async **Snapshot** (frame) inputs,
+  where latest-wins mirroring decouples the cycle from the consumer.
 
 To bind K rings positionally, the binder cursor gains a per-input **fan-in list**. `BoundPort`
 for an input becomes:
@@ -322,12 +319,13 @@ trait RingSource {
 alignment holds because the coordinator lays out one `BoundInput` per input **port** (in
 `descriptors()` order) — `One` for frame ports, `Many` (possibly empty) for message ports.
 
-*Trade-off (cyclic direct-view vs a uniform merge ring for all consumers):* a uniform merge
+*Trade-off (direct multi-view vs a uniform merge ring for all consumers):* a uniform merge
 ring would make every message input a single-view port (simplest bundle story) but forces a
-copy + a head-of-cycle ordering constraint (the merge must run *before* the consumer steps,
-unlike today's tail copy-in) and an extra ring per input. Direct multi-view for cyclic
-consumers avoids both and matches the cyclic frame path. **Recommendation: cyclic =
-direct multi-view, async = merge ring.** **[OPEN Q2]**
+copy + a head-of-cycle ordering constraint (the merge must run *before* the consumer steps)
+and an extra ring per input. Direct multi-view avoids both and matches the cyclic frame path.
+**Shipped shape: direct multi-view for every message consumer, cyclic and async alike** — the
+lossless rings make the async case safe without a merge ring (Q2's original "async = merge
+ring" recommendation did not survive).
 
 ### 3.4 KDL + `WiringBuilder` surface
 
@@ -389,8 +387,8 @@ cannot parse. Noted as a deliberate asymmetry (§9, decision 1).
 
 **[OPEN Q4 → recommend]** Frame feedback cycles are rejected unless one edge is
 `connect_delayed` (`src/coordinator/mod.rs:836,842`), because a frame edge is a synchronous
-same-cycle data dependency. A message edge is **not**: it is a decoupled event/command bus on
-an `Overwrite` ring, read latest/every-record with no same-cycle production guarantee — a
+same-cycle data dependency. A message edge is **not**: it is a decoupled event/command bus,
+read every-record with no same-cycle production guarantee — a
 command loop (slot → autonomy system → command → slot) is legitimate and common. **Recommend:
 message edges are excluded from cycle detection entirely** (they simply do not populate
 `forward_adj`, `:836-838`), exactly as `delayed` frame edges are. This means a message edge
@@ -732,7 +730,8 @@ host-owned in `SlotRunner`.
   `MsgIn` (`src/message.rs`).
 - `AllOutputs` port (`src/registry.rs` or new `src/tap.rs`).
 - `RingSource::next_input_fanin` + `out_msg_ids`; `BoundInput` fan-in (`src/binder.rs`).
-- `MsgCopyIn` for async message inputs (`src/coordinator/mod.rs`).
+- ~~`MsgCopyIn` for async message inputs~~ — not needed: async message consumers hold the
+  direct fan-in views (§3.3); only async Snapshot (frame) inputs are copy-in decoupled.
 - `CoordinatorBuilder::connect_msg`/`connect_msg_delayed`; `WiringBuilder::connect_msg`;
   `EdgeSpec` kind + KDL `msg=` (`src/wiring/*`).
 - `compatible` message arm; `build()` kind-split edge pass (§3.2); reserved coordinator

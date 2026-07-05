@@ -79,7 +79,7 @@ Three properties of the existing machinery carry the whole design:
 1. **A ring is position-independent shared state.** Every cursor, the committed handshake,
    the reader table, and the data region live at fixed region-relative offsets inside one
    contiguous block; nothing inside it is a process-local pointer. `read_header(base)`
-   recovers `capacity`, `data_offset`, `reader_table_offset`, `max_readers`, and `overrun`
+   recovers `capacity`, `data_offset`, `reader_table_offset`, and `max_readers`
    from a bare base pointer, and the ring already rebuilds a working `RingBuffer` over a
    region it never allocated. **In the same address space, a `.so` reconstructing a ring over
    the host's `base` pointer sees the identical atomics the host's other systems do** — no
@@ -133,7 +133,7 @@ over the backing `B`:
   dlopen'd system is never the downlink, so its `RawBinder` uses the default).
 - **`CyclicRunner<S, O, B>`** threads the backing. The host instantiates
   `CyclicRunner<_, _, BoxBacking>`, the `.so` `CyclicRunner<_, _, RawBacking>` — the
-  lapped→hard-stop / health / timing logic is reused verbatim. `dyn CyclicSlot` stays
+  health / timing logic is reused verbatim. `dyn CyclicSlot` stays
   backing-free: a host slot is a `CyclicRunner<…, BoxBacking>`, a dlopen'd slot is a `DlSlot`
   that forwards across the ABI, so no `B` leaks into the trait object.
 
@@ -166,7 +166,7 @@ telemetry schema from the metadata the descriptor carries (see
 
 ### Version word
 
-`FSW_ABI_VERSION` is a single monotonic `u32` (currently `3` — the version-history comment on
+`FSW_ABI_VERSION` is a single monotonic `u32` (currently `4` — the version-history comment on
 the constant in `src/abi/mod.rs` is the changelog), exported as `fsw_abi_version`. The host
 checks it for equality before any other call. It is bumped on any change to the C surface or
 the `*Msg` wire structs — exactly once per released ABI shape. A mismatch fails the load
@@ -194,7 +194,7 @@ pub const ROLE_OUTPUT: u8 = 1; // the system is the buffer's sole Writer
 ```
 
 Everything else the system needs — capacity, data offset, reader-table offset,
-`max_readers`, overrun — is **self-describing in the region header**, recovered by
+`max_readers` — is **self-describing in the region header**, recovered by
 `attach_raw`. So the handle is just `(base, len, role)`. Single-writer discipline is preserved
 by `role`: for a `ROLE_OUTPUT` region the host hands the region but creates **no** writer
 itself, so the `.so` is the sole writer; for a `ROLE_INPUT` region the `.so` calls `view()`,
@@ -206,15 +206,16 @@ claiming a reader slot by CAS in the shared reader table — which is why the ho
 ```rust
 #[repr(u32)]
 pub enum FswStatus {
-    Running       = 0, // ran (or runnable); keep cycling it
-    StoppedLapped = 1, // an input lapped; the system permanently stopped itself
-    Panicked      = 2, // a panic was caught at the boundary, or the state was never bound
+    Running  = 0, // ran (or runnable); keep cycling it
+    Panicked = 1, // a panic was caught at the boundary, or the state was never bound
+    Done     = 2, // a sequence occupant ran to completion (sequences-slots.md)
 }
 ```
 
-The host maps `StoppedLapped`/`Panicked` to a `SlotState::Stopped { reason }` (`LappedInput` /
-`Panicked`) and folds it into the coordinator status frame; both are permanent hard-stops, and
-a stopped slot is never ticked again.
+The host maps `Panicked` to a `SlotState::Stopped { reason: Panicked }` and folds it into the
+coordinator status frame; it is a permanent hard-stop, and a stopped slot is never ticked
+again (and is destroyed immediately — see `DlSlot` below). There is no input-driven stop:
+the rings are lossless, so a slow reader backpressures its producer instead of being lapped.
 
 `ByteSink` is the host-owned callback a describe-style export hands its serialized bytes to:
 
@@ -263,7 +264,6 @@ pub struct PortDescMsg {
     pub schema:      PortSchemaMsg,       // axis 1
     pub delivery:    Delivery,            // axis 2 — Snapshot | Log
     pub fan_in:      FanIn,               // axis 3 — One | Many
-    pub on_lap:      OnLap,               // axis 4 — Stop | Resync
     pub telemetered: bool,                // the downlink/AllOutputs opt-out (A6)
 }
 
@@ -337,7 +337,7 @@ struct AbiState<S> {
   exactly once. A caught panic leaves the runner unbound, so the next `execute` reports
   `Panicked`.
 - **`run_execute<S>(state, now) -> FswStatus`** reconstructs `Timestamp(now as i64)`, runs the
-  verbatim `CyclicRunner::step` logic (lapped-input check → hard-stop, time `execute`, publish
+  verbatim `CyclicRunner::step` logic (time `execute`, publish
   health), and maps the runner's `SlotState` to an `FswStatus`. A caught `execute` panic
   latches `poisoned` and returns `Panicked`; an unbound or poisoned state returns `Panicked`
   too.
@@ -439,10 +439,13 @@ params and captures the handle arrays. Then:
 - **`init`** calls `fsw_bind_init`, handing the `.so` the per-port ring regions so it
   reconstructs its typed bundles and runs `System::init`.
 - **`step(now)`** calls `fsw_execute(state, now.0 as u64)` and maps the returned `FswStatus`
-  into the tracked `SlotState`. The lapped/panic check lives **inside the `.so`** (it owns the
-  input `View`) and is reported back via the status word; the host's status-frame machinery
+  into the tracked `SlotState`. The panic check lives **inside the `.so`** (the boundary
+  catches it) and is reported back via the status word; the host's status-frame machinery
   consumes it the same way it consumes a static runner's `SlotState`. A `Panicked` slot is
-  telemetered through the coordinator status frame.
+  telemetered through the coordinator status frame. A permanent stop runs `fsw_destroy`
+  **immediately** (not at teardown): dropping the `.so`'s `RawBacking` ports releases its
+  reader slots, so on lossless rings a dead consumer cannot backpressure upstream producers.
+  `state` is nulled, so the eventual `Drop` is a no-op.
 - **`shutdown`** calls `fsw_shutdown`.
 - **`Drop`** calls `fsw_destroy`.
 

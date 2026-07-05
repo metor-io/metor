@@ -4,6 +4,11 @@
 > commits: unified port descriptor axes, single-pathed `build()`, ONE registry, one telemetry
 > Tap/HandOff/drain loop, lap policy + `CommandOut` sugar, `ReceiveAll` as a capability, the
 > schema-tagged dl ABI). `docs/system.md` §5 and `docs/telemetry.md` reflect the shipped shape.
+>
+> **Since superseded in part**: the **on-lap axis (axis 4) was later removed** along with
+> the ring's overwrite mode — the ring is lossless-only and slow readers backpressure
+> writers instead of being lapped (see `docs/delete-overrun-plan.md`). A port now has
+> three behavior axes (schema × delivery × fan-in) plus `conn` and `telemetered`.
 
 **Status:** design, not yet implemented.
 **Covers review findings:** A1 (primary), A5, A6, A7, A10, A4, plus the parts of C4

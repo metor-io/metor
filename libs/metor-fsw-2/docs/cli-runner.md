@@ -290,14 +290,14 @@ Metadata that is *about* the bundle rather than the wiring:
 
 ```kdl
 meta {
-    abi_version 3                 // FSW_ABI_VERSION the cdylibs were built against
+    abi_version 4                 // FSW_ABI_VERSION the cdylibs were built against
     profile "release"            // build profile
     built_at_unix 1782000000     // epoch seconds — no date-formatting dep
 }
 ```
 
 `abi_version` is the **load-time guard**: `run` refuses a bundle whose `abi_version` differs
-from the host `FSW_ABI_VERSION` (3 today — it has bumped twice since v1, see `src/abi/mod.rs`'s
+from the host `FSW_ABI_VERSION` (4 today — see `src/abi/mod.rs`'s
 version-history comment) with a clear error, before opening any `.so`. **As shipped, `meta.kdl`
 carries only these three fields** (`abi_version`/`profile`/`built_at_unix`,
 `src/wiring/bundle.rs`'s `write_bundle`) — the per-system params-schema dump sketched in an

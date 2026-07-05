@@ -45,6 +45,16 @@
 >   `PacketId` matches (`RouteMsg::route`, multi-output dispatch), rather than forwarding a single
 >   command type pass-through; its ground subscription is still derived from its declared outputs.
 >
+> **Third supersession (the backpressure refactor, landed): the lap doctrine is gone.** The ring
+> is now **lossless-only** — the `Overrun` enum (Overwrite/Lossless) is deleted, a writer can never
+> overwrite unread data (`try_write` returns `WouldBlock` when a slow reader is in the way; async
+> `write` suspends), and a lap is impossible. Treat every mention below of a lap, a resyncing view,
+> `Overrun::Overwrite`, or a best-effort message log as historical: a full message ring
+> **backpressures the emitter** — `MsgOut::publish` counts a failed write into the
+> `publish_dropped` health error — and a committed record is never lost to a reader. Reads are
+> zero-copy in-place borrows (no scratch decode buffer), and `FswStatus` no longer has a
+> `StoppedLapped` code (`Running`/`Panicked`/`Done`).
+>
 > Everything below (§1–§8) is retained as the historical WP11 + redesign narrative; **read
 > `docs/message-wiring.md` and this banner for the wiring-parity shape, and treat every mention of
 > `channel_id`, a coordinator-drained command bus, or an implicit fan-out below as historical, not
@@ -234,7 +244,7 @@ per command channel (§4.3).
 
 ### 2.1 Allocation & sizing
 
-A message ring is an ordinary `RingBuffer<BoxBacking>` with `Overrun::Overwrite`, allocated by
+A message ring is an ordinary (lossless) `RingBuffer<BoxBacking>`, allocated by
 the coordinator at `build()` alongside the output rings (`src/coordinator/mod.rs:842-867`). The
 only new wrinkle is **sizing**: records are variable, so there is no `capacity_for(F::MAX_SIZE,
 depth)`. The heuristic:
@@ -245,14 +255,14 @@ depth)`. The heuristic:
 //                   with a realistic channel count; truncation is a config error)
 //   depth         : default 64 — generous, because a message ring is an EVENT/COMMAND
 //                   LOG, not a latest-wins snapshot; bursts of events between two
-//                   telemetry drains must not lap.
+//                   telemetry drains must not fill the ring.
 ```
 
-Because the ring is `Overwrite` and bounded, a sufficiently large burst *can* still lap an
-un-drained reader; telemetry drains **every cycle** and surfaces any lap as a `dropped` counter
-(§3, Q6). Generous depth + per-cycle drain is the mitigation; a guaranteed-lossless message ring
-is out of scope (it would need backpressure into the producer, which the cyclic loop cannot
-afford).
+Because the ring is lossless and bounded, a sufficiently large burst does not lap an un-drained
+reader — it **backpressures the emitter** instead: `try_write` returns `WouldBlock`, which
+`MsgOut::publish` counts into the `publish_dropped` health error. A committed record is never
+lost; readers drain **every cycle** (§3), and generous depth keeps the backpressure path off the
+steady state.
 
 ### 2.2 The `MessageRegistry`
 
@@ -314,11 +324,12 @@ struct MsgHandOff {
 }
 ```
 
-In-cycle `execute` (`:437`) drains **every** record from each message view (loop `try_read_into`
-until `Ok(false)`, like `Input::drain`, `src/port.rs:229` — not the latest-wins `loop` the output
-taps use at `:446`), splits the 2-byte id, builds `LenPacket::msg(id, payload.len())`
+In-cycle `execute` drains **every** record from each message view (per-record in-place read
+grants, like `Input::drain` — not the latest-wins borrow the output
+taps use), splits the 2-byte id, builds `LenPacket::msg(id, payload.len())`
 (`../metor-proto/src/types.rs:652`), extends it with the payload, and pushes each to the FIFO in
-ring order. A lapped view bumps `telemetry.dropped` and resyncs.
+ring order. The ring is lossless, so the view never misses a record; the only loss point is the
+bounded FIFO hand-off itself (dropped-oldest, surfaced as `telemetry.msg_dropped`).
 
 ### 3.2 The send path — no announce
 
@@ -563,7 +574,8 @@ it emits each `SequenceChannelEvent`
 **at the transition point**, as an every-record message. This is the critical reason not to diff
 the latest-wins `SlotStatus` frame: two commands can apply in one cycle's drain (e.g. `Load` then
 `Start`), so a `SlotStatus` snapshot would show only `Running` and **lose** the `Loaded` event.
-Emitting at the transition is lossless by construction.
+Emitting at the transition captures every transition by construction. (The emit itself is
+best-effort: a full events ring drops the event rather than blocking the cycle.)
 
 `Progress` and the terminal **outcome** originate inside the occupant, in its `SequenceStatus`
 frame (`run_state` + drained `progress` lines, `src/sequence/mod.rs:261`, `Outcome::run_state` at
@@ -592,12 +604,12 @@ So the `SlotRunner` holds two new things: a `MsgOut` (the sequence message chann
 | `Done`, `run_state=1` | `Completed` | `SequenceStatus.run_state` (`:110`) |
 | `Done`, `run_state=2` | `Aborted` | `SequenceStatus.run_state` |
 | `Done`, `run_state=3` | `Failed { reason }` | `SequenceStatus.run_state` |
-| `Stopped{Lapped/Panicked}` | `Failed { reason }` (`"lapped"`/`"panicked"`) | `FswStatus` (`slot.rs:500-505`) |
+| `Stopped{Panicked}` | `Failed { reason }` (`"panicked"`) | `FswStatus` (`slot.rs`) |
 
 `SequenceRunState` (`../metor-proto/wkt/src/msgs.rs:692`) maps for the registry/channel snapshot:
 `Loaded`→`Idle`, `Running`→`Running`, terminal as above. One gap to call out: wkt `Failed {
 reason: String }` wants a reason string, but `SequenceStatus` carries only `run_state` (no reason
-field). v1 emits a generic reason (`"failed"` / `"lapped"` / `"panicked"`); a real reason string
+field). v1 emits a generic reason (`"failed"` / `"panicked"`); a real reason string
 needs a field added to `SequenceStatus` (future work).
 
 ---
@@ -701,7 +713,9 @@ command-plane redesign (§4).
    generic command bus, and the coordinator is sequence-agnostic. The same-cycle property is kept
    (the bus drains at head-of-cycle). (See §4.4.)
 
-6. **Message-ring loss policy — DECIDED: generous depth (~64) + every-cycle drain + a surfaced
+6. **Message-ring loss policy — DECIDED (SUPERSEDED by the backpressure refactor, see banner: the
+   ring is now lossless-only; a full ring backpressures the emitter and a committed record is never
+   lost): generous depth (~64) + every-cycle drain + a surfaced
    `dropped` counter, over a non-coalescing FIFO hand-off.** A large enough burst can still lap;
    loss is surfaced, never silent, and never reordered/latest-wins-dropped like a component
    snapshot. *Trade-off:* truly lossless would need producer backpressure (unacceptable in the

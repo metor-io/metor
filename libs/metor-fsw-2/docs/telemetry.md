@@ -190,11 +190,11 @@ queued. For each registry entry that `mode.matches`, `init`:
 - picks a **lane** off the entry's `Delivery` axis (Snapshot → a coalescing slot, Log → the shared
   FIFO, §4) and a **wire** framing off its `EntrySchema` (Table → announce + a sequential `PacketId`,
   Postcard → forwarded as-is, no announce);
-- records a `Tap { view, scratch, lane, wire }` and, for a Table entry, an
+- records a `Tap { view, lane, wire, last_committed }` and, for a Table entry, an
   `Announce { packet_id, vtable, metadata }` carrying the entry's prefixed schema.
 
 **Known gap (B9): the init-time emit window.** `RingBuffer::view()` starts a reader **at the
-buffer's current commit point** — "it never sees older, possibly-lapped data" (`ring/src/lib.rs`).
+buffer's current commit point** — "it never sees older data" (`ring/src/lib.rs`).
 Every other system's `init` (both async systems, behind the coordinator's startup barrier, and every
 cyclic system, in registration order) completes **before** telemetry's own `init` runs (telemetry is
 registered last, coordinator.md §3.4/§3.7), so any frame or message a system emits *only* during its
@@ -237,23 +237,26 @@ Table×Log (an every-record frame log) falls out for free with zero extra code.
 
 ### Drain stage (in-cycle, `execute`)
 
-For each tap, `execute` drains the read `View` per its lane (`drain_view`, `OnLap::Resync` — a lap
-resyncs to the live edge and keeps going, never propagated as an error into the cycle):
+For each tap, `execute` reads the `View` per its lane, borrowing each record **in place** off the
+ring — there is no per-tap scratch copy:
 
 ```text
 Lane::Coalesce { slot }:      // Snapshot entries (frames, by default)
-  drain to the newest record only (like Input::latest); if any record arrived this
-  cycle, build one LenPacket (Table or Msg framing, per the tap's `wire`) and
+  compare the ring's `committed` word against the tap's `last_committed`; if
+  unchanged, nothing new this cycle — skip (the pinned newest record is not
+  re-sent). Otherwise borrow the newest record via View::try_latest, build one
+  LenPacket (Table or Msg framing, per the tap's `wire`) and
   handoff.push_snapshot(slot, pkt)     // never blocks
 
 Lane::Fifo:                   // Log entries (messages, by default)
-  drain every record in order; build one LenPacket per record and
+  drain every record in order (per-record read grants); build one LenPacket per
+  record and
   handoff.push_log(pkt)                // never blocks, for each record
 ```
 
-A buffer with no new record this cycle is simply skipped. Each record is two copies: the ring bytes
-land in the tap's reused `scratch: Vec<u8>` (via the view's read), and then in the freshly built
-`LenPacket`. Both are `memcpy`s; there are no syscalls and no `.await` in the cycle.
+A buffer with no new record this cycle is simply skipped. Each record is one copy: from the borrowed
+ring bytes into the freshly built `LenPacket`. It is a `memcpy`; there are no syscalls and no
+`.await` in the cycle.
 
 ### Hand-off (`HandOff`) — one struct, two lanes
 
@@ -269,8 +272,8 @@ HandOff
 
 - **Snapshot lane** — `push_snapshot(slot, pkt)` (cycle side, never blocks): if the slot is already
   occupied, the previous un-sent packet is overwritten and `dropped_snapshots` is incremented; the
-  new packet takes the slot. A newer snapshot overwriting an older un-sent one is exactly the
-  Overwrite ring semantics, one level up — at most one pending packet per tap.
+  new packet takes the slot. A snapshot is latest-wins state, so a newer one supersedes an older
+  un-sent one — at most one pending packet per tap.
 - **Log lane** — `push_log(pkt)` (cycle side, never blocks): appended to a shared, bounded FIFO
   (`LOG_HANDOFF_CAP = 1024`); an event/command record must never be coalesced, so every drained
   record is queued in order and forwarded verbatim (cross-*channel* order is irrelevant — each
@@ -290,8 +293,8 @@ the cycle is unaffected.
 
 ### Drop policy
 
-Consistent with the framework's overrun philosophy (drop, don't block — the rings are
-`Overrun::Overwrite`):
+The rings themselves are lossless — a writer backpressures rather than overwrite unread data — so
+the hand-off is where the "never let a slow link touch the cycle" trade is made explicitly:
 
 - The Snapshot lane coalesces per tap; the cycle never blocks on a backed-up link.
 - When a stalled link leaves a Snapshot slot occupied, the next snapshot overwrites it and counts a
@@ -426,7 +429,7 @@ telemetry {
 
 - The coordinator's `RingTable`/`RingEntry`/`BufferRole` and `output_instances` — the registry indexes
   this, it does not replace it.
-- `RingBuffer::view`, `View::try_read_into`/`resync` (`metor-fsw-ring`).
+- `RingBuffer::view`, `View::try_latest`/`try_read` (`metor-fsw-ring`).
 - `PortDesc.vtable` — the authoritative layout, captured into the registry entry.
 - `VTableMsg`, `SetComponentMetadata`, `LenPacket::table`/`extend_from_slice`, `PacketSink::send`,
   `SinkExt::{send_vtable, send_metadata, init_world}` — the whole wire path; cube-sat is the precedent.
