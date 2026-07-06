@@ -26,7 +26,7 @@ The coordinator runs in two phases.
    `add_telemetry`) and edges (`connect`/`connect_delayed`). Registration only records each
    system's `SystemDescriptor` (the derives already produce it) plus a boxed, type-erased
    registration. `build()` runs the validation pass (`compatible()` on every edge; single-connect,
-   unconnected-input, and unbroken-feedback-cycle checks), allocates one `RingBuffer<BoxBacking>`
+   unconnected-input, and unbroken-feedback-cycle checks), allocates one heap-backed `RingBuffer`
    per output port sized from the descriptors and the fan-out of the edge set, allocates a private
    copy-in buffer per async input, auto-provisions the coordinator's own health/log/status buffers,
    binds every system's typed `Output`/`Input` ports over those rings, and returns a ready
@@ -87,12 +87,12 @@ pub struct Coordinator {
     stopped:       Vec<StoppedSystem>,          // currently hard-stopped systems
     cycle:         u64,
     registry:      Arc<OutputRegistry>,         // broad by-id index over every tappable buffer
-    rings:         RingTable,                   // owns every RingBuffer<BoxBacking> — drops last
+    rings:         RingTable,                   // owns every RingBuffer — drops last
 }
 ```
 
 This realizes the ownership rule "systems own their outputs and borrow their inputs" concretely. A
-`RingBuffer<BoxBacking>` is `Arc`-backed and cheaply clonable, so the coordinator holds the
+`RingBuffer` is `Arc`-backed and cheaply clonable, so the coordinator holds the
 canonical handle in `RingTable` while each system's ports hold `Writer`/`View` clones derived from
 it. Keeping the canonical handle alive in `RingTable` — declared **last** in the struct so it drops
 after every other field — guarantees a buffer outlives every port over it and every dlopen'd slot
@@ -104,7 +104,7 @@ that attached to its region, regardless of teardown order.
 struct RingTable { rings: Vec<RingEntry> }
 
 struct RingEntry {
-    ring:     RingBuffer<BoxBacking>,
+    ring:     RingBuffer,
     frame_id: ComponentId,            // the frame the buffer carries (for diagnostics)
     role:     BufferRole,             // Output { system, port } | Private { system, input } | Coordinator
     instance: Option<String>,         // owning system's instance name; None for coordinator buffers
@@ -136,24 +136,24 @@ construction). The key invariant is that **`bind()` walks the port fields in the
 pre-allocated for it.
 
 ```rust
-pub trait BindPorts<B: Backing>: Sized {
+pub trait BindPorts: Sized {
     /// Construct every port from the ring source, in descriptors() order.
-    fn bind<S: RingSource<B = B>>(src: &mut S) -> Self;
+    fn bind<S: RingSource>(src: &mut S) -> Self;
 }
 ```
 
-A `RingSource` hands out one pre-allocated ring per port, abstracted over the ring `Backing` so a
+A `RingSource` hands out one pre-allocated ring per port. Rings are backing-erased, so a
 single generated bundle `bind` serves both providers:
 
-- The host's **`Binder`** (`RingSource<B = BoxBacking>`) walks the coordinator's pre-allocated
+- The host's **`Binder`** walks the coordinator's pre-allocated
   `BoundPort`s, popping one ring per port via `next_output`/`next_input` in `descriptors()` order.
-- A dlopen'd system's **`RawBinder`** (`RingSource<B = RawBacking>`, on the `.so` side of the ABI)
+- A dlopen'd system's **`RawBinder`** (on the `.so` side of the ABI)
   walks the host's raw ring regions. The static-system path never sees this — a `.so`
-  monomorphizes its own `CyclicRunner<_, _, RawBacking>` (§3.6).
+  compiles in its own `CyclicRunner` over the same port types (§3.6).
 
 ```rust
 pub struct BoundPort {
-    ring:  RingBuffer<BoxBacking>,
+    ring:  RingBuffer,
     data:  Option<Box<dyn Any>>,   // matched wake endpoints, copy-in path only
     space: Option<Box<dyn Any>>,
 }
@@ -452,20 +452,20 @@ gathers the raw ring regions the dlopen path needs — each port's `(base, len)`
 `FswRing` handles in `descriptors()` order. Outputs are this system's own buffers; inputs are
 `region()`s of the upstream producers' output buffers (the cyclic-consumer path, read directly). It
 passes them, plus the postcard `params` blob, to `DlSystem::into_slot`, which `fsw_create`s the
-state and returns a `DlSlot`. The `.so` reconstructs each ring over the host's `BoxBacking` region
+state and returns a `DlSlot`. The `.so` reconstructs each ring over the host's heap region
 via `attach_raw` (same process, no copy, no IPC — it sees the identical atomics the host's other
 systems do), and its `CyclicSlot::step` forwards over the ABI, mapping `FswStatus::Panicked` to
 `SlotState::Stopped { reason: Panicked }`.
 
 A permanent stop destroys the foreign state **immediately**, not at teardown: on the stop
-transition the slot calls `fsw_destroy` at once, dropping the `.so`'s `RawBacking` ports and
+transition the slot calls `fsw_destroy` at once, dropping the `.so`'s raw-attached ports and
 freeing its reader slots — on a lossless ring a dead consumer's pinned views would otherwise
 backpressure every upstream producer forever.
 
 Teardown ordering is load-bearing: a `DlSlot`'s `Drop` calls `fsw_destroy` (idempotent — a
 no-op if the stop already destroyed the state) before its `Arc<Library>` field unloads and
 before the host `RingTable` frees the regions. The coordinator drops its `cyclic` slot vec
-before its `rings` field (struct field order), so no `RawBacking` outlives its region and no
+before its `rings` field (struct field order), so no raw attach outlives its region and no
 `.so` code runs after its `Library` is gone. See `dl-open.md` for the full ABI.
 
 ### 3.7 Single-threaded execution
@@ -509,7 +509,7 @@ init barrier (§6) ensures every system's `init` has completed before any first 
 
 An async **Snapshot** input does **not** view the upstream output directly; it views a **private
 buffer the coordinator owns**. For each such input port the builder allocates a private
-`RingBuffer<BoxBacking>` (lossless, like every ring), sized like any buffer with `max_readers =
+heap-backed `RingBuffer` (lossless, like every ring), sized like any buffer with `max_readers =
 1 + reader_slack` (the async system's view plus slack). Two ports straddle it:
 
 - **Writer side — the copy-in job** (`CopyIn`), owned by the coordinator (the buffer's single

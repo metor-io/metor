@@ -153,7 +153,7 @@ of the future (`sequencer.rs:293-302`); its cooperative path is `Abort`. We keep
 muscle-memory: `Stop` drops the future immediately (no async cleanup), so re-running a stopped
 slot is an explicit `Reset` (rebuild). This composes cleanly with the ring-reclaim decision
 (§2.3, Q2): the dropped future owns its ports (§4.2, Q5), so dropping it drops those
-`RawBacking` `Writer`/`View`s, which **releases the slot's ring roles** — `Stop` naturally
+non-owning `Writer`/`View`s, which **releases the slot's ring roles** — `Stop` naturally
 frees ring capacity with no special handling. A future explicit **`Pause`** (stop polling but
 keep the future resumable) is possible later work; v1 is hard-drop only.
 
@@ -193,7 +193,7 @@ the whole mission and hands occupants `Writer`/`View` handles over them (coordin
 - On **Load**, `fsw_bind_init` hands the occupant the slot's `FswRing` arrays; the `.so`
   `attach_raw`s each region and claims its `Writer` (outputs) / `View` (inputs) — exactly
   `DlSlot::init` (`src/dl.rs:299-314`).
-- On **Stop/Unload/Reset**, `fsw_destroy` drops the occupant's `RawBacking` ports, **releasing**
+- On **Stop/Unload/Reset**, `fsw_destroy` drops the occupant's non-owning ports, **releasing**
   the writer role and reader slots back to the host-owned ring. A later Load re-claims them.
 
 The single subtlety this introduces over the build-time dl path is **re-acquisition**: a slot
@@ -206,13 +206,13 @@ frees its reader-table slot on drop (`ring/src/lib.rs:1102-1107`,
 `ring/src/tests.rs:90`), and a `Writer` holds **no** runtime claim at all — `writer()` is just
 an `inner.clone()` with no header flag and no `Drop` (`ring/src/lib.rs:692-703`); "at most one
 live writer" is a documented *discipline* (`:844`), not an enforced lock. Because slot swaps
-are **strictly ordered** — `fsw_destroy` drops the occupant's `RawBacking` ports before any
+are **strictly ordered** — `fsw_destroy` drops the occupant's non-owning ports before any
 re-`Load` constructs new ones (§6 teardown) — a fresh `view()` re-CASes the freed slot
 (`:710-737`) and a fresh `Output` re-acquires the writer for free. The only genuinely-missing
 capability would be reclaiming a slot whose owner died *without* running `Drop` (crash
 reclamation, for which the slot-epoch at `:727` is already reserved); that is a cross-process
 concern, **out of scope** here. So this is a real reuse with **zero ring surgery** — Wave 1
-adds swap re-acquire tests (incl. a `RawBacking` attach/detach round-trip under Miri) to prove
+adds swap re-acquire tests (incl. a raw attach/detach round-trip under Miri) to prove
 the Load→Stop→Load cycle, and nothing more. `Stop`'s ring-freeing (§2.1) then falls out of the
 existing `View`/`Writer` drops.
 
@@ -291,7 +291,7 @@ a future-driven state machine **plus** the C-ABI exports — driven by the host 
 any cyclic `.so`.
 
 **Decided (§9 Q5): the author writes the ports as direct parameters; the future owns them.**
-There is no `ctx` bundle and no per-cycle re-borrow. Every `Input<T,B>`/`Output<T,B>`
+There is no `ctx` bundle and no per-cycle re-borrow. Every `Input<T>`/`Output<T>`
 parameter is a port the macro binds once (at `fsw_bind_init`) and **moves into the future**,
 which owns it for its whole life. Because the ports are owned by the `'static` future, there
 is no per-cycle port threading at all — the old "stored future touching per-cycle `&mut`
@@ -299,11 +299,13 @@ borrows" problem (and its refresh-cell machinery) evaporates.
 
 ### 4.1 Author shape
 
-> **Updated (E7, `docs/design-system-macro.md` §3.5/§7.4, landed):** the ring-`Backing` generic is
-> now **injected** by the macro rather than hand-written — a plain `async fn seq(mut x: Input<T>,
-> …)` gains a hidden `__B: Backing` and each port parameter type is rewritten to `Input<T, __B>`;
-> a hand-written `<B: Backing>` is still accepted (the macro uses it instead — no forced
-> migration). A free `now()` (and `Seq::now()` on an explicit handle) reads the ambient
+> **Updated (E7, then the backing erasure — both landed):** the ring-`Backing` generic is gone
+> entirely. Rings are backing-erased, so a sequence fn is written — and emitted — over plain
+> `Input<T>`/`Output<T>` with **no** generic parameters. (E7 briefly had the macro inject a
+> hidden `__B: Backing` and rewrite each port type to `Input<T, __B>`; the erasure removed that
+> injection, and `#[sequence]` now *rejects* any generic parameters on the fn: "#[sequence] fns
+> take no generic parameters (rings are backing-erased)".) A free `now()` (and `Seq::now()` on
+> an explicit handle) reads the ambient
 > `SeqClock`, so a sequence can stamp the frames it emits without threading `Timestamp` through by
 > hand, and output ports gained the infallible `publish()`/`publish_with()` (E6, system.md §2.1) —
 > `#[sequence]` adopts it the same way `#[system]` does. The example below is the current shape;
@@ -338,8 +340,8 @@ async fn commissioning(mut att: Input<AttitudeEstimate>, mut mode: Output<ModeCm
 ```
 
 This is cube-sat's `commissioning` body (`sequencer.rs:149-162`) almost verbatim, with the
-shared `FSW` handle replaced by typed owned ports (`Input<AttitudeEstimate>`/`Output<ModeCmd>`, no
-`<B: Backing>` written by hand — injected) and the timer replaced by the free `wait`/`progress`
+shared `FSW` handle replaced by typed owned ports (`Input<AttitudeEstimate>`/`Output<ModeCmd>` —
+plain types; rings are backing-erased) and the timer replaced by the free `wait`/`progress`
 API. `#[sequence(name = "safe_mode")]` overrides the name (`examples/adcs-fsw2/systems/safe-mode`).
 
 The **port set is read straight off the signature** — no separate `SystemInput`/
@@ -359,35 +361,44 @@ emits its own thin lifecycle delegating to new `abi::run_seq_*` helpers (the seq
 the `run_*` helpers `export_system!` uses, `src/abi/mod.rs`).
 
 ```rust
-// 1. The opaque state the ABI threads (the sequence twin of AbiState).
-struct SeqState<B: Backing> {
-    params: Option<CommissioningParams>,                 // decoded in fsw_create; () if none
-    future: Option<Pin<Box<dyn Future<Output = Outcome>>>>, // built in fsw_bind_init; 'static
-    clock:  Rc<SeqClock>,                                 // the per-cycle ambient (§4.3)
-    status: Option<Out<SeqStatusOut<B>, RawBacking>>,     // wrapper-owned: SequenceStatus + health/log
+// 1. The opaque state the ABI threads (the sequence twin of AbiState); the port types
+//    are plain — rings are backing-erased, so the sequence stack has no type parameter.
+struct SeqState<S: SeqSystem> {
+    params: Option<S::Params>,            // decoded in fsw_create; () if none
+    bound:  Option<SeqBound>,             // built in fsw_bind_init (below)
+    clock:  Rc<SeqClock>,                 // the per-cycle ambient (§4.3)
     poisoned: bool,
+}
+// SeqBound (src/sequence/mod.rs) is the bound occupant: the 'static future (the user
+// ports moved inside it), the wrapper-owned status/health/log tail, the cancel input:
+pub struct SeqBound {
+    pub future:  Pin<Box<dyn Future<Output = Outcome>>>,
+    pub status:  Out<SeqStatusOut>,       // wrapper-owned: SequenceStatus + health/log
+    pub control: Input<SlotControlIn>,    // the cancel input (§4.4)
 }
 
 // 2. The descriptor: enumerated from the SIGNATURE, in a fixed order the bind walk mirrors.
-//    inputs  = [att, gyro]            (the Input<T> params, in signature order)
+//    inputs  = [att, gyro, SlotControlIn]  (the Input<T> params, in signature order, + control)
 //    outputs = [cmd, SequenceStatus, health, log]   (Output<T> params, then the implicit tail)
 fn descriptor() -> SystemDescriptor { /* PortDesc::of::<AttitudeEstimate>(), ::<GyroBias>(), … */ }
 
 // 3. fsw_bind_init (via abi::run_seq_bind_init): build a RawBinder over the host's FswRing
-//    arrays and bind the ports in descriptor() order — the user ports MOVE INTO the future,
-//    the implicit SequenceStatus/health/log stay in the wrapper state for per-cycle telemetry.
-fn bind_init(state, inputs: &[FswRing], outputs: &[FswRing]) {
-    let mut binder = RawBinder::new(inputs, outputs);
-    let att  = Input::<AttitudeEstimate, RawBacking>::bind(&mut binder);   // user inputs →
-    let gyro = Input::<GyroBias, RawBacking>::bind(&mut binder);           //   future
-    let cmd  = Output::<AttitudeCmd, RawBacking>::bind(&mut binder);       // user outputs →
-    let status = Out::<SeqStatusOut, RawBacking>::bind(&mut binder);       //   wrapper (tail)
-    let clock = Rc::new(SeqClock::default());
-    SEQ_CLOCK.set(&clock, || {                                            // task-local (§4.3)
-        state.future = Some(Box::pin(commissioning::<RawBacking>(att, gyro, cmd)));
+//    arrays and bind the ports in descriptor() order — the SAME plain port types and the
+//    same monomorphic bind path the host uses, just over non-owning attaches. The user
+//    ports MOVE INTO the future; the implicit control/SequenceStatus/health/log stay in
+//    SeqBound for per-cycle telemetry. (This is SeqSystem::build — descriptor() and
+//    build() walk one order over one set of types; there is no separate descriptor-side
+//    vs bind-side backing.)
+fn build(params, binder: &mut RawBinder, clock: &Rc<SeqClock>) -> SeqBound {
+    let att  = Input::<AttitudeEstimate>::bind(binder);    // user inputs →
+    let gyro = Input::<GyroBias>::bind(binder);            //   future
+    let cmd  = Output::<AttitudeCmd>::bind(binder);        // user outputs →
+    let status = Out::<SeqStatusOut>::bind(binder);        //   wrapper (tail)
+    let control = Input::<SlotControlIn>::bind(binder);
+    let future = SEQ_CLOCK.set(clock, || {                 // task-local (§4.3)
+        Box::pin(commissioning(att, gyro, cmd))
     });
-    state.clock = clock;
-    state.status = Some(status);
+    SeqBound { future, status, control }
 }
 
 // 4. fsw_execute (via abi::run_seq_execute): refresh the clock, fold cancel, poll ONCE.
@@ -395,12 +406,12 @@ fn execute(state, now: Timestamp) -> FswStatus {
     state.clock.now.set(now);
     state.clock.cancel.set(read_cancel_input(state));        // Abort folds in here (§4.4)
     let mut cx = Context::from_waker(Waker::noop());
-    let poll = SEQ_CLOCK.set(&state.clock, || state.future.as_mut().unwrap().as_mut().poll(&mut cx));
-    let st = state.status.as_mut().unwrap();
+    let bound = state.bound.as_mut().unwrap();
+    let poll = SEQ_CLOCK.set(&state.clock, || bound.future.as_mut().poll(&mut cx));
     match poll {
-        Poll::Ready(outcome) => { st.seq_status().complete(now, outcome); FswStatus::Done }   // §4.5
-        Poll::Pending        => { st.seq_status().running(now, state.clock.drain_progress());
-                                  st.health().end_cycle(now, micros); FswStatus::Running }
+        Poll::Ready(outcome) => { bound.status.seq_status().complete(now, outcome); FswStatus::Done }   // §4.5
+        Poll::Pending        => { bound.status.seq_status().running(now, state.clock.drain_progress());
+                                  bound.status.health().end_cycle(now, micros); FswStatus::Running }
     }
 }
 ```
@@ -688,7 +699,7 @@ the rationale survives.
    today. *Trade-off:* the cheaper-but-leaky alternatives once considered (sizing `max_readers`
    for a bounded reload count; a host-side persistent View + copy-in) are moot — there is no
    ring change to make. The release-on-drop the swap needs is the existing `View`/`Writer` drop
-   behavior; Wave 1 just proves it with swap re-acquire tests (incl. a `RawBacking` round-trip
+   behavior; Wave 1 just proves it with swap re-acquire tests (incl. a raw attach round-trip
    under Miri). Crash-slot reclamation (owner dies without `Drop`) remains future cross-process
    work (the slot-epoch at `ring/src/lib.rs:727` is reserved for it). (See §2.3.)
 
@@ -706,7 +717,7 @@ the rationale survives.
    to share one descriptor and couple wiring to the `.so`s being present at parse. (See §5.)
 
 5. **Decorator author API — DECIDED: direct port params, owned by the future; ambient free
-   functions.** Ports are written as `Input<T,B>`/`Output<T,B>` parameters the macro binds
+   functions.** Ports are written as plain `Input<T>`/`Output<T>` parameters the macro binds
    once and moves into the `'static` future; `wait`/`progress`/`aborted()` are free functions
    backed by a task-local `SeqClock` (with an opt-in explicit `seq: Seq` handle).
    `#[sequence]` defaults `NAME` to the fn name; `#[sequence(name="…")]` overrides. *Trade-off:*

@@ -36,11 +36,11 @@ system. A user implements the base plus exactly one leaf trait. The lifecycle is
 duplicated.
 
 ```rust
-pub trait System<B: Backing = BoxBacking> {
+pub trait System {
     /// The read-only inputs this system consumes.
-    type Input: SystemInput + BindPorts<B>;
+    type Input: SystemInput + BindPorts;
     /// The owned outputs this system produces (wrapped in `Out` for health).
-    type Output: SystemOutput + BindPorts<B>;
+    type Output: SystemOutput + BindPorts;
 
     /// Wiring name; the prefix the system's health frame hangs off (§4).
     const NAME: &'static str;
@@ -58,20 +58,22 @@ them. Both receive `&mut Self::Output` — a driver publishes its first frame in
 a default mode) and may flush a final health record in `shutdown`. They take no input:
 there is nothing meaningful to read before or after the run.
 
-### 1.1 `B: Backing` — one system, two deployment shapes
+### 1.1 Backing-erased rings — one system, two deployment shapes
 
-The `B` type parameter is the ring [`Backing`] the bundles are bound over. It defaults to
-`BoxBacking` — the in-process host case — so an ordinary system writes a plain
-`impl System for Foo` with no mention of `B`. A system that may run as a dlopen'd `cdylib`
-instead writes its impls `Backing`-generic (`impl<B: Backing> System<B> for Foo`), so a
-loaded instance can hold `RawBacking` views into the host's shared-memory regions. Because
-the bytes on the wire are described by the VTable rather than by a shared Rust type, the
-same system source serves both shapes; only the backing differs (§6).
+Rings are backing-erased: `RingBuffer` is one concrete type whatever holds its region —
+heap, mmap, or a non-owning attach (the ring's erased `Backing` struct, ring-buffer.md §10)
+— so no backing type parameter threads through the traits. `impl System for Foo` is the
+only spelling, and the **same impl** serves both deployment shapes: an in-process host
+instance over the coordinator's heap rings, and a dlopen'd `cdylib` instance whose ports
+hold non-owning attaches into the host's shared-memory regions. Because the bytes on the
+wire are described by the VTable rather than by a shared Rust type, the same system source
+(indeed the same monomorphization) serves both shapes; only who owns the region differs
+(§6).
 
 ### 1.2 Cyclic systems
 
 ```rust
-pub trait CyclicSystem<B: Backing = BoxBacking>: System<B> {
+pub trait CyclicSystem: System {
     /// One unit of work: read the latest inputs, write outputs. Reports trouble
     /// through `output.health()`, never a return value.
     fn execute(&mut self, now: Timestamp, input: &mut Self::Input, output: &mut Self::Output);
@@ -100,7 +102,7 @@ descriptors, and `SystemKind::Cyclic`.
 ### 1.3 Async systems
 
 ```rust
-pub trait AsyncSystem<B: Backing = BoxBacking>: System<B> {
+pub trait AsyncSystem: System {
     /// The system's own loop. Returns when shutting down.
     async fn run(&mut self, input: &mut Self::Input, output: &mut Self::Output);
 
@@ -166,16 +168,16 @@ A system's `Output` associated type is a struct of one or more **output ports**,
 output frame type. Each port wraps the single ring `Writer` the system owns for that frame:
 
 ```rust
-pub struct Output<F, B = BoxBacking, WD = NoWake, WS = NoWake>
-where B: Backing, WD: WakeSource, WS: WakeSink
+pub struct Output<F, WD = NoWake, WS = NoWake>
+where WD: WakeSource, WS: WakeSink
 {
-    writer: Writer<B, WD, WS>,
+    writer: Writer<WD, WS>,
     scratch: Option<LenPacket>,   // reused table-bytes buffer for write_with (no per-call malloc)
     _f: PhantomData<F>,
 }
 ```
 
-Cyclic outputs default to `BoxBacking` + `NoWake`; async outputs select a `Notifier` wake
+Cyclic outputs default to `NoWake`; async outputs select a `Notifier` wake
 so a write can suspend for space. The write methods (available when
 `F: Frame + IntoBytes + Immutable`):
 
@@ -258,11 +260,11 @@ The framework wraps a user's output bundle `O` in `Out<O>`, which adds the impli
 per-system health/log port pair so `output.health()` is always available:
 
 ```rust
-pub struct Out<O, B = BoxBacking, WD = NoWake, WS = NoWake>
-where B: Backing, WD: WakeSource, WS: WakeSink
+pub struct Out<O, WD = NoWake, WS = NoWake>
+where WD: WakeSource, WS: WakeSink
 {
     ports: O,
-    health: HealthPort<B, WD, WS>,
+    health: HealthPort<WD, WS>,
 }
 ```
 
@@ -279,10 +281,10 @@ A system's `Input` associated type is a struct of one or more **input ports**, o
 input frame type, each wrapping a read-only ring `View`:
 
 ```rust
-pub struct Input<F, B = BoxBacking, RD = NoWake, RS = NoWake>
-where B: Backing, RD: WakeSink, RS: WakeSource
+pub struct Input<F, RD = NoWake, RS = NoWake>
+where RD: WakeSink, RS: WakeSource
 {
-    view: View<B, RD, RS>,
+    view: View<RD, RS>,
     _f: PhantomData<F>,
 }
 ```
@@ -536,20 +538,20 @@ impl HealthPort {
 
 ### 4.3 The cyclic driver — `CyclicRunner`
 
-`CyclicRunner<S, O, B>` is the framework wrapper that owns a cyclic system's bundles between
+`CyclicRunner<S, O>` is the framework wrapper that owns a cyclic system's bundles between
 cycles and maintains the standard counters. It owns the system, its input bundle, its
-`Out<O, B>` output, and a lifecycle `state`:
+`Out<O>` output, and a lifecycle `state`:
 
 ```rust
-impl<S, O, B> CyclicRunner<S, O, B>
-where B: Backing, S: CyclicSystem<B, Output = Out<O, B>>, O: SystemOutput
+impl<S, O> CyclicRunner<S, O>
+where S: CyclicSystem<Output = Out<O>>, O: SystemOutput
 {
-    pub fn new(system: S, input: S::Input, output: Out<O, B>) -> Self;
+    pub fn new(system: S, input: S::Input, output: Out<O>) -> Self;
     pub fn init(&mut self);              // system.init once
     pub fn step(&mut self, now: Timestamp);
     pub fn shutdown(&mut self);          // system.shutdown once
     pub fn state(&self) -> &SlotState;
-    pub fn output(&mut self) -> &mut Out<O, B>;
+    pub fn output(&mut self) -> &mut Out<O>;
 }
 ```
 
@@ -686,35 +688,34 @@ it. The two are symmetric and positional: binding visits port fields in the *sam
 
 ```rust
 pub trait RingSource {
-    type B: Backing;
-    fn next_output<WD, WS>(&mut self) -> (RingBuffer<Self::B>, WD, WS) where /* wake bounds */;
-    fn next_input<RD, RS>(&mut self) -> (RingBuffer<Self::B>, RD, RS) where /* wake bounds */;
+    fn next_output<WD, WS>(&mut self) -> (RingBuffer, WD, WS) where /* wake bounds */;
+    fn next_input<RD, RS>(&mut self) -> (RingBuffer, RD, RS) where /* wake bounds */;
     fn output_registry(&self) -> Arc<OutputRegistry> { /* host-only; default panics */ }
 }
 
-pub trait BindPorts<B: Backing>: Sized {
+pub trait BindPorts: Sized {
     /// Construct every port from the ring source, in `descriptors()` order.
-    fn bind<S: RingSource<B = B>>(src: &mut S) -> Self;
+    fn bind<S: RingSource>(src: &mut S) -> Self;
 }
 ```
 
-A `RingSource` is where a bound port's ring comes from, abstracted over the backing `B` so one
-generated bundle `bind` serves both providers:
+A `RingSource` is where a bound port's ring comes from. Rings are backing-erased, so one
+generated bundle `bind` — a single monomorphic code path — serves both providers:
 
-- The host **`Binder`** (`B = BoxBacking`) pops the coordinator's pre-allocated `BoundPort`s
+- The host **`Binder`** pops the coordinator's pre-allocated `BoundPort`s
   in `descriptors()` order, each carrying its optional matched wake endpoints. (The matched
   endpoints matter only for the private copy-in buffer feeding an async input, where the view
   must share the writer's `Notifier`; every other port leaves them empty and the binder
   default-constructs the wake.)
-- A dlopen'd system's **`RawBinder`** (`B = RawBacking`) attaches the host's raw regions by
+- A dlopen'd system's **`RawBinder`** attaches the host's raw regions by
   offset (`RingBuffer::attach_raw`) over the same positional contract.
 
 `Output<F>::bind` / `Input<F>::bind` each pop one ring with its matched wake endpoints and
 wrap the resulting writer/view; the `#[derive(SystemInput)]` / `#[derive(SystemOutput)]`
 macros generate the bundle `BindPorts::bind` that calls them in field order. The `Out<O>`
 wrapper binds the user ports first, then the two implicit health/log ports — symmetric to its
-`descriptors()` pushing the health/log descriptors after the user ports — threading the ring
-source's backing `B` so a dlopen'd system's `Out<O, RawBacking>` binds over the host regions.
+`descriptors()` pushing the health/log descriptors after the user ports; the very same impl
+binds a dlopen'd system's `Out<O>` over the host's raw-attached regions.
 `output_registry` is a host-only capability (the broad-access output registry used by a
 telemetry downlink/logger/recorder); a non-host source's default panics rather than fabricate
 an empty registry.
@@ -729,12 +730,12 @@ same system source covers the first two with no rewrite, because **the bytes are
 the VTable, not by a shared Rust type**.
 
 - **In-process.** A `System` is a Rust value behind the trait. `execute` is a direct method
-  call. Ports wrap `Writer`/`View` over `BoxBacking`. Cyclic ports use `NoWake`; async ports
-  use `Notifier`. No Rust type crosses any boundary.
+  call. Ports wrap `Writer`/`View` over the coordinator's heap-backed rings. Cyclic ports use
+  `NoWake`; async ports use `Notifier`. No Rust type crosses any boundary.
 - **dlopen.** A `cdylib` is exported with the `export_system!` macro, which emits the stable C
-  entry points. The system writes its impls `Backing`-generic, so a loaded instance holds
-  `RawBacking` ports attached to the host's shared-memory regions via `RawBinder` and
-  `RingBuffer::attach_raw`. The only things crossing the `.so` boundary are (a) the ring
+  entry points. Rings are backing-erased, so the same `impl System` serves the loaded
+  instance: its ports hold non-owning attaches to the host's shared-memory regions via
+  `RawBinder` and `RingBuffer::attach_raw`. The only things crossing the `.so` boundary are (a) the ring
   regions, attached by offset, and (b) the system's params (postcard bytes decoded by
   `fsw_create` into `BuildSystem::Params`) and `SystemDescriptor`. The Rust `System` trait is
   the in-process realization of that same byte-described contract.
@@ -775,7 +776,7 @@ impl NavSystem {
 }
 ```
 
-This is `examples/adcs-fsw2/systems/nav/src/lib.rs` as actually shipped — no `B: Backing`, no
+This is `examples/adcs-fsw2/systems/nav/src/lib.rs` as actually shipped — no
 `NavIn`/`NavOut` bundle structs, no `Out<>` wrapper, no `BuildSystem` impl, no `#[cfg]`'d
 `export_system!` call; `fn new` (optional; absent ⇒ `Self: Default`) drives `BuildSystem::Params`,
 and `#[system(export = "export")]` gates the `fsw_*` dl exports on the crate's own `export` feature
@@ -783,10 +784,11 @@ and `#[system(export = "export")]` gates the `fsw_*` dl exports on the crate's o
 forms, by the last path segment of the type: `now: Timestamp` (the cycle timestamp, required on
 `execute`, rejected on `run`), `&mut Input<T>`/`&mut Output<T>` (frame ports), `&mut
 MsgIn<M>`/`&mut MsgOut<M>`/`&mut CommandOut<M>` (message ports), `&mut HealthPort` (optional, at
-most one). Ports must be `&mut` borrows — the macro owns the ring `Backing` and rewrites each port
-parameter's type to `PortType<T, __B>`; a genuinely backing-specific system still writes the traits
-by hand (§1-§6 stay the documented escape hatch, and the macro emits exactly what this document
-describes — nothing here changes because a system happens to be authored with it).
+most one). Ports must be `&mut` borrows — the generated bundles own the ports (the runner holds
+them between cycles) and lend them to each call; a system that needs something the classifier
+doesn't recognize still writes the traits by hand (§1-§6 stay the documented escape hatch, and the
+macro emits exactly what this document describes — nothing here changes because a system happens
+to be authored with it).
 
 `#[metor_fsw_2::sequence]` (`docs/sequences-slots.md` §4) shares the same signature classifier for
 stateless async sequence bodies, plus a `now()`/`Seq::now()` ambient clock so a sequence can stamp
@@ -805,5 +807,5 @@ the frames it emits without threading `Timestamp` through by hand.
 | Sizing | `round_up8`, `frame_len`, `MAX_SIZE`, `Config.capacity` pow2 | `buffer_capacity`/`capacity_for`, `DEFAULT_DEPTH` |
 | Wiring validation | `VTable::realize_fields(None)` registration mode, `RealizedField` | `compatible` subset / ty / shape check |
 | Health | `Frame`/`FrameMap`/`FrameList`, dynamic-name path, db ingest | `SystemHealth`/`SystemLog` frames, `HealthPort`, `output.health()` |
-| Backing | `BoxBacking`/`MmapBacking`/`RawBacking`, `attach_raw` | `RingSource`/`BindPorts`, host `Binder`, `RawBinder`, `B`-generic threading |
+| Backing | the erased `Backing` struct (heap/mmap/raw), `attach_raw` | `RingSource`/`BindPorts`, host `Binder`, `RawBinder` — one monomorphic bind path |
 | The system itself | `Componentize`/`Decomponentize` | `System`/`CyclicSystem`/`AsyncSystem`/`BuildSystem`, `SystemInput`/`SystemOutput`, `Out`, `CyclicRunner`, `SystemKind` |
