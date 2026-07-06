@@ -69,8 +69,8 @@ pub use coordinator::{
 // command-plane ingest system (its read twin).
 pub use registry::{AllOutputs, EntrySchema, Registry, RegistryEntry};
 pub use telemetry::{
-    RecvTransport, TcpRecvTransport, TcpTransport, TelemetryConfig, TelemetryMode,
-    TelemetrySystem, Transport, TransportError, UplinkSystem,
+    DownlinkParams, RecvTransport, TcpRecvTransport, TcpTransport, TelemetryConfig,
+    TelemetryMode, TelemetrySystem, Transport, TransportError, UplinkParams, UplinkSystem,
 };
 
 // The system trait family, the typed port wrappers, self-description, and the

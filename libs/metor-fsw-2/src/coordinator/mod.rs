@@ -46,7 +46,6 @@ use crate::port::{Input, Output, capacity_for};
 use crate::registry::{EntrySchema, Registry, RegistryEntry};
 use crate::sequence::{SequenceStatus, SlotControlIn};
 use crate::system::{AsyncSystem, CyclicRunner, CyclicSystem, Out, System, SystemOutput};
-use crate::telemetry::{RecvTransport, TelemetryConfig, TelemetrySystem, Transport, UplinkSystem};
 use crate::{DEFAULT_DEPTH, Frame};
 
 mod slot;
@@ -859,44 +858,6 @@ impl CoordinatorBuilder {
         )
     }
 
-    /// Register the telemetry downlink (telemetry.md §8). This is an ordinary
-    /// [`add_cyclic_named`](Self::add_cyclic_named) of a [`TelemetrySystem`] under the
-    /// instance name `"telemetry"`, registered **last** so its end-of-cycle snapshot
-    /// observes every other system's fresh output. The downlink's `AllOutputs` receive-all
-    /// port is what reserves it a reader slot on every buffer — `build()` derives that budget
-    /// by counting `ReceiveAll` capabilities, so no manual bookkeeping is needed here.
-    ///
-    /// **Init-time emit gap (B9)**: the downlink claims its read views in its own
-    /// `init`, which runs *after* earlier-registered systems' `init`s — a frame or
-    /// message a system emits during `init` is therefore **not** downlinked (the
-    /// view starts at the live edge past it). Values that must reach the ground
-    /// should be (re-)published from the first `execute`; the coordinator's own boot
-    /// `SequenceRegistry` deliberately emits at the head of `run_for`, after every
-    /// `init`, for exactly this reason.
-    pub fn add_telemetry<T>(&mut self, config: TelemetryConfig<T>) -> SystemHandle
-    where
-        T: Transport + 'static,
-    {
-        self.add_cyclic_named("telemetry", TelemetrySystem::new(config))
-    }
-
-    /// Register the **uplink** (`docs/messages.md` §4.4): an ordinary [`AsyncSystem`] — the read
-    /// twin of the telemetry downlink — that ingests panel `SequenceCommand` Msgs off `recv` and
-    /// re-emits each onto its command channel (the §4.3 emit capability), which the head of
-    /// [`run_for`](Coordinator::run_for) drains into the slots the **same cycle** it arrives.
-    /// This is a thin convenience over [`add_async`](Self::add_async); the uplink is wired,
-    /// sized, and spawned like any async system. A downlink-only mission omits it.
-    ///
-    /// The uplink owns its **own** connection (`recv`), distinct from the downlink's — a shared
-    /// bidirectional link is deferred (`docs/messages.md` §4.5). The Mock test path supplies a
-    /// [`RecvTransport`] directly.
-    pub fn add_uplink<R>(&mut self, recv: R) -> SystemHandle
-    where
-        R: RecvTransport + 'static,
-    {
-        self.add_async(UplinkSystem::new(recv))
-    }
-
     /// Register a dlopen'd cyclic system under an explicit instance name. `loaded` is
     /// an opened [`DlSystem`](crate::dl); `params` is the canonical postcard `Params`
     /// blob the `.so` decodes in `fsw_create` (identical on the wire from either
@@ -1450,7 +1411,7 @@ impl CoordinatorBuilder {
     /// (telemetry.md §2). Each `AllOutputs` receive-all capability
     /// (`docs/message-wiring.md` §4) is an extra fan-out reader on *every* buffer, so
     /// every ring's `max_readers` includes it — self-derived from the declared
-    /// `ReceiveAll` capabilities, no manual `add_telemetry` bookkeeping.
+    /// `ReceiveAll` capabilities, no per-consumer bookkeeping.
     fn alloc_rings(&self, fan_out: &HashMap<(usize, usize), usize>) -> RingAlloc {
         let depth = self.config.default_depth;
         let slack = self.config.reader_slack;

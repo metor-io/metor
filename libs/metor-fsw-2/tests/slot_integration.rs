@@ -25,7 +25,8 @@ use metor_fsw_2::metor_proto_wkt::{
 };
 use metor_fsw_2::{
     AllowedOccupant, ClockMode, Coordinator, CoordinatorConfig, DlSystem, Input, PortRef,
-    RecvTransport, SequenceStatus, SlotStatus, SystemKind, TransportError, split_record,
+    RecvTransport, SequenceStatus, SlotStatus, SystemKind, TransportError, UplinkSystem,
+    split_record,
 };
 
 /// One paramless allowed occupant (the E8e `AllowedOccupant` shape).
@@ -584,7 +585,7 @@ fn uplink_command_loads_and_starts_same_cycle() {
     let slot = b.add_slot("adcs", vec![occ("waiter", loaded)], None);
     // The uplink: a panel `Load { waiter }` then `Start`, both addressed to the slot by
     // its instance name — and reaching it over an explicit command edge (A2).
-    let uplink = b.add_uplink(MockRecv::new(vec![
+    let uplink = b.add_async(UplinkSystem::new(MockRecv::new(vec![
         SequenceCommand {
             channel: "adcs".to_string(),
             command: SequenceCommandKind::Load {
@@ -595,7 +596,7 @@ fn uplink_command_loads_and_starts_same_cycle() {
             channel: "adcs".to_string(),
             command: SequenceCommandKind::Start,
         },
-    ]));
+    ])));
     b.connect(
         PortRef::msg::<SequenceCommand>(uplink),
         PortRef::msg::<SequenceCommand>(slot),
@@ -1101,9 +1102,9 @@ fn uplink_routes_by_declared_output_and_survives_garbage() {
 
     let mut b = Coordinator::builder(sim_config());
     let tap = b.add_cyclic(CmdTap);
-    let uplink = b.add_uplink(MockRecv::from_packets(vec![
+    let uplink = b.add_async(UplinkSystem::new(MockRecv::from_packets(vec![
         reload, unroutable, malformed, valid,
-    ]));
+    ])));
     b.connect(
         PortRef::msg::<ReloadSequences>(uplink),
         PortRef::msg::<ReloadSequences>(tap),
