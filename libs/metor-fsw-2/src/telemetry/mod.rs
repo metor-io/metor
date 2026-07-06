@@ -41,8 +41,8 @@ use metor_proto::types::{LenPacket, Msg, OwnedPacket, PacketId, Timestamp};
 use metor_proto::vtable::VTable;
 use metor_proto_stellar::{PacketSink, PacketStream};
 use metor_proto_wkt::{
-    ComponentMetadata, MsgStream, ReloadSequences, SequenceCommand, SetComponentMetadata,
-    VTableMsg,
+    AlarmAck, ComponentMetadata, MsgStream, ReloadSequences, SequenceCommand,
+    SetComponentMetadata, VTableMsg,
 };
 use stellarator::JoinHandleDropGuard;
 use stellarator::buf::Slice;
@@ -431,6 +431,9 @@ const UPLINK_IDLE: Duration = Duration::from_millis(50);
 pub struct UplinkPorts {
     commands: CommandOut<SequenceCommand>,
     reloads: CommandOut<ReloadSequences>,
+    /// Panel-published alarm acks, forwarded to the alarm system
+    /// (`connect "uplink" -> "alarms" msg="AlarmAck"`, `docs/alarms.md` §6).
+    acks: CommandOut<AlarmAck>,
 }
 
 /// Route one received wire Msg to the declared output whose [`PacketId`] matches
@@ -465,6 +468,7 @@ impl RouteMsg for UplinkPorts {
         match id {
             SequenceCommand::ID => decode_emit(&mut self.commands, bytes),
             ReloadSequences::ID => decode_emit(&mut self.reloads, bytes),
+            AlarmAck::ID => decode_emit(&mut self.acks, bytes),
             _ => false,
         }
     }

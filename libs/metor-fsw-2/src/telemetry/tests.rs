@@ -753,8 +753,110 @@ fn uplink_subscribes_to_its_declared_command_ids() {
     use metor_proto_wkt::{ReloadSequences, SequenceCommand};
     assert_eq!(
         super::uplink_subscribe_ids(),
-        vec![SequenceCommand::ID, ReloadSequences::ID]
+        vec![
+            SequenceCommand::ID,
+            ReloadSequences::ID,
+            metor_proto_wkt::AlarmAck::ID
+        ]
     );
+}
+
+/// A wire `AlarmAck` fed through the uplink routes onto its `acks` port and reaches a
+/// consumer over an ordinary message edge (`docs/alarms.md` §6) — while a malformed
+/// postcard payload under the same id is dropped without killing the link (the next
+/// packet still arrives).
+#[cfg(not(miri))]
+#[stellarator::test]
+async fn uplink_routes_alarm_acks() {
+    use std::cell::RefCell;
+    use std::rc::Rc;
+
+    use metor_proto::types::{IntoLenPacket, Msg};
+    use metor_proto_wkt::AlarmAck;
+    use stellarator::buf::Slice;
+
+    use crate::{MsgIn, RecvTransport};
+
+    /// A fixed script of pre-framed wire packets, then `Disconnected`.
+    struct MockRecv {
+        queue: std::collections::VecDeque<Vec<u8>>,
+    }
+
+    impl RecvTransport for MockRecv {
+        async fn recv(
+            &mut self,
+        ) -> Result<metor_proto::types::OwnedPacket<Slice<Vec<u8>>>, TransportError> {
+            use stellarator::buf::IoBuf;
+            match self.queue.pop_front() {
+                Some(bytes) => {
+                    let slice = bytes.try_slice(..).expect("non-empty packet");
+                    metor_proto::types::OwnedPacket::parse(slice)
+                        .map_err(|e| TransportError::Io(Box::new(e)))
+                }
+                None => Err(TransportError::Disconnected),
+            }
+        }
+    }
+
+    /// Captures every ack that reaches it over the wired edge.
+    struct AckSink {
+        seen: Rc<RefCell<Vec<AlarmAck>>>,
+    }
+
+    #[derive(SystemInput)]
+    struct AckSinkIn {
+        acks: MsgIn<AlarmAck>,
+    }
+
+    #[derive(SystemOutput)]
+    struct AckSinkOut {}
+
+    impl System for AckSink {
+        type Input = AckSinkIn;
+        type Output = Out<AckSinkOut>;
+        const NAME: &'static str = "ack_sink";
+    }
+
+    impl CyclicSystem for AckSink {
+        fn execute(&mut self, _now: Timestamp, input: &mut AckSinkIn, _o: &mut Self::Output) {
+            let seen = &self.seen;
+            input.acks.drain(|a| seen.borrow_mut().push(a));
+        }
+    }
+
+    let ack = AlarmAck {
+        def_id: "RATE_HIGH".to_string(),
+        occurrence: 42,
+        operator: "op".to_string(),
+        note: None,
+    };
+    // Frame one good ack around a malformed payload under the same id: strip the
+    // LenPacket 4-byte length prefix, as the panel's sink does on the wire.
+    let good = ack.into_len_packet().inner[4..].to_vec();
+    let mut garbage = LenPacket::msg(AlarmAck::ID, 3);
+    garbage.extend_from_slice(&[0xff, 0xff, 0xff]);
+    let garbage = garbage.inner[4..].to_vec();
+
+    let seen = Rc::new(RefCell::new(Vec::new()));
+    let mut b = Coordinator::builder(sim_config());
+    let sink = b.add_cyclic(AckSink { seen: seen.clone() });
+    let uplink = b.add_uplink(MockRecv {
+        queue: vec![garbage, good].into(),
+    });
+    b.connect(
+        PortRef::msg::<AlarmAck>(uplink),
+        PortRef::msg::<AlarmAck>(sink),
+    )
+    .unwrap();
+    let mut coord = b.build().unwrap();
+
+    coord.run_for(20).await;
+
+    let got = seen.borrow();
+    assert_eq!(got.len(), 1, "the malformed payload is dropped, the ack lands");
+    assert_eq!(got[0].def_id, "RATE_HIGH");
+    assert_eq!(got[0].occurrence, 42);
+    assert_eq!(got[0].operator, "op");
 }
 
 /// A11(b): "the telemetry downlink registers last" is enforced, not silently reordered —
@@ -791,7 +893,7 @@ fn cyclic_after_receive_all_is_a_build_error() {
 fn uplink_command_ports_are_untelemetered() {
     use metor_proto::types::Msg;
     let descs = <super::UplinkPorts as crate::SystemOutput>::port_descs();
-    assert_eq!(descs.len(), 2);
+    assert_eq!(descs.len(), 3);
     for d in &descs {
         assert!(!d.telemetered, "inbound commands are never downlinked");
         assert_eq!(d.delivery, crate::Delivery::Log);
@@ -803,5 +905,9 @@ fn uplink_command_ports_are_untelemetered() {
     assert_eq!(
         descs[1].id,
         crate::PortId::Packet(metor_proto_wkt::ReloadSequences::ID)
+    );
+    assert_eq!(
+        descs[2].id,
+        crate::PortId::Packet(metor_proto_wkt::AlarmAck::ID)
     );
 }
