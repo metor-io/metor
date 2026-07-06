@@ -20,7 +20,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use metor_fsw_ring::{BoxBacking, FullReaderTable, NoWake, RingBuffer, View};
+use metor_fsw_ring::{FullReaderTable, NoWake, RingBuffer, View};
 use metor_proto::types::ComponentId;
 use metor_proto::vtable::VTable;
 use metor_proto_wkt::ComponentMetadata;
@@ -70,14 +70,14 @@ pub struct RegistryEntry {
     /// The read source. Crate-private so external callers must go through
     /// [`view()`](Self::view), which claims a slot-accounted reader (never the raw
     /// buffer); the coordinator sets it at `build()`.
-    pub(crate) ring: RingBuffer<BoxBacking>,
+    pub(crate) ring: RingBuffer,
 }
 
 impl RegistryEntry {
     /// Claim a read [`View`] into this buffer, consuming one reader slot from the
     /// buffer's fixed `max_readers` table. Fails with [`FullReaderTable`] if the
     /// build-time slot budget is exhausted (telemetry.md §2.5).
-    pub fn view(&self) -> Result<View<BoxBacking, NoWake, NoWake>, FullReaderTable> {
+    pub fn view(&self) -> Result<View<NoWake, NoWake>, FullReaderTable> {
         self.ring.view(NoWake, NoWake)
     }
 }
@@ -119,7 +119,7 @@ impl Registry {
     pub fn view(
         &self,
         key: ComponentId,
-    ) -> Option<Result<View<BoxBacking, NoWake, NoWake>, FullReaderTable>> {
+    ) -> Option<Result<View<NoWake, NoWake>, FullReaderTable>> {
         self.get(key).map(RegistryEntry::view)
     }
 

@@ -8,7 +8,6 @@ use core::task::{Context, Poll, Waker};
 use std::rc::Rc;
 use std::time::Duration;
 
-use metor_fsw_ring::Backing;
 use metor_proto::types::Timestamp;
 
 use crate::sequence::{
@@ -105,7 +104,7 @@ fn clock_is_cleared_after_with_clock() {
 // ---------------------------------------------------------------------------
 
 #[crate::sequence]
-async fn demo<B: Backing>(att: Input<SystemHealth, B>, mut out: Output<SystemHealth, B>) -> Outcome {
+async fn demo(att: Input<SystemHealth>, mut out: Output<SystemHealth>) -> Outcome {
     // The owned ports are really moved into the future (plain method calls on owned
     // values — no per-cycle re-borrow).
     let _ = att;

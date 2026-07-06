@@ -11,10 +11,9 @@
 //! ports in lockstep. The user ports **move into the future**; the tail stays in the
 //! wrapper state for per-cycle telemetry (§4.2).
 //!
-//! The ring-backing generic is **injected** (review E7, `docs/design-system-macro.md`
-//! §3.5): a plain `async fn seq(mut x: Input<T>, …)` gains a hidden `__B: Backing`
-//! parameter and each port parameter type is rewritten to `Input<T, __B>`; a
-//! hand-written `<B: Backing>` is still accepted (the macro uses it instead).
+//! Rings are backing-erased, so the fn is emitted verbatim — no injected generics,
+//! no port-type rewriting; `descriptor()` and `build()` name the same plain port
+//! types.
 
 use proc_macro::TokenStream;
 use quote::{format_ident, quote};
@@ -89,24 +88,19 @@ pub fn sequence(attr: TokenStream, item: TokenStream) -> TokenStream {
 
     let fsw2 = crate::metor_fsw_2_crate_name();
 
-    // The ring-backing generic: a hand-written `<B: Backing>` is used as-is;
-    // otherwise `__B: Backing` is injected and every port parameter type below is
-    // rewritten to carry it (design-system-macro.md §3.5).
-    let (backing, injected) = match sig::backing_param(&func.sig.generics) {
-        Some(b) => (b, false),
-        None => (sig::injected_backing_ident(), true),
-    };
-    if injected {
-        let b = &backing;
-        func.sig
-            .generics
-            .params
-            .push(syn::parse_quote!(#b: #fsw2::ring::Backing));
+    // Rings are backing-erased: a sequence fn carries no generic parameters (a
+    // leftover `<B: Backing>` from the pre-erasure API gets a clear error here,
+    // not a confusing unresolved-trait cascade).
+    if !func.sig.generics.params.is_empty() {
+        return syn::Error::new_spanned(
+            &func.sig.generics,
+            "#[sequence] fns take no generic parameters (rings are backing-erased)",
+        )
+        .to_compile_error()
+        .into();
     }
-    let backing_ty = sig::ident_type(&backing);
 
-    // Classify every parameter by the last segment of its type, rewriting port
-    // parameter types in place when the backing is injected.
+    // Classify every parameter by the last segment of its type.
     let mut params: Vec<Param> = Vec::new();
     let mut params_seen = false;
     for arg in &mut func.sig.inputs {
@@ -127,18 +121,15 @@ pub fn sequence(attr: TokenStream, item: TokenStream) -> TokenStream {
                     let msg = format!("`{h}` needs an element type: `{h}<MyFrame>`");
                     return syn::Error::new_spanned(&pt.ty, msg).to_compile_error().into();
                 };
-                if injected {
-                    let args = sig::type_args(&pt.ty);
-                    if args.len() > 1 {
-                        return syn::Error::new_spanned(
-                            args[1],
-                            "#[sequence] supplies the ring backing itself; \
-                             drop the second type parameter (or declare a `<B: Backing>` generic)",
-                        )
-                        .to_compile_error()
-                        .into();
-                    }
-                    sig::append_type_args(&mut pt.ty, std::slice::from_ref(&backing_ty));
+                let args = sig::type_args(&pt.ty);
+                if args.len() > 1 {
+                    return syn::Error::new_spanned(
+                        args[1],
+                        "#[sequence] ports take a single element type (the wake \
+                         endpoints are macro-supplied); drop the second type parameter",
+                    )
+                    .to_compile_error()
+                    .into();
                 }
                 let port = Port { ident, elem };
                 if h == "Input" {
@@ -193,23 +184,23 @@ pub fn sequence(attr: TokenStream, item: TokenStream) -> TokenStream {
     //                    outputs = [user outputs…, then the Out<SeqStatusOut> tail].
     let input_descs = inputs.iter().map(|p| {
         let elem = &p.elem;
-        quote! { <#fsw2::Input<#elem, #fsw2::ring::BoxBacking>>::descriptor() }
+        quote! { <#fsw2::Input<#elem>>::descriptor() }
     });
     let output_descs = outputs.iter().map(|p| {
         let elem = &p.elem;
-        quote! { <#fsw2::Output<#elem, #fsw2::ring::BoxBacking>>::descriptor() }
+        quote! { <#fsw2::Output<#elem>>::descriptor() }
     });
 
     // ---- build(): bind in the same order; user ports MOVE INTO the future.
     let bind_inputs = inputs.iter().map(|p| {
         let id = &p.ident;
         let elem = &p.elem;
-        quote! { let #id = <#fsw2::Input<#elem, #fsw2::ring::RawBacking>>::bind(binder); }
+        quote! { let #id = <#fsw2::Input<#elem>>::bind(binder); }
     });
     let bind_outputs = outputs.iter().map(|p| {
         let id = &p.ident;
         let elem = &p.elem;
-        quote! { let #id = <#fsw2::Output<#elem, #fsw2::ring::RawBacking>>::bind(binder); }
+        quote! { let #id = <#fsw2::Output<#elem>>::bind(binder); }
     });
     let bind_seq = seq_ident.map(|id| {
         quote! { let #id = #fsw2::sequence::Seq::new(clock.clone()); }
@@ -251,10 +242,10 @@ pub fn sequence(attr: TokenStream, item: TokenStream) -> TokenStream {
 
             fn descriptor() -> #fsw2::SystemDescriptor {
                 let mut inputs = ::std::vec![ #(#input_descs,)* ];
-                inputs.push(<#fsw2::Input<#fsw2::sequence::SlotControlIn, #fsw2::ring::BoxBacking>>::descriptor());
+                inputs.push(<#fsw2::Input<#fsw2::sequence::SlotControlIn>>::descriptor());
                 let mut outputs = ::std::vec![ #(#output_descs,)* ];
                 outputs.extend(
-                    <#fsw2::Out<#fsw2::sequence::SeqStatusOut<#fsw2::ring::BoxBacking>, #fsw2::ring::BoxBacking> as #fsw2::SystemOutput>::port_descs(),
+                    <#fsw2::Out<#fsw2::sequence::SeqStatusOut> as #fsw2::SystemOutput>::port_descs(),
                 );
                 #fsw2::SystemDescriptor {
                     name: #name,
@@ -272,12 +263,12 @@ pub fn sequence(attr: TokenStream, item: TokenStream) -> TokenStream {
                 clock: &::std::rc::Rc<#fsw2::sequence::SeqClock>,
             ) -> #fsw2::sequence::SeqBound {
                 #(#bind_inputs)*
-                let __control = <#fsw2::Input<#fsw2::sequence::SlotControlIn, #fsw2::ring::RawBacking>>::bind(binder);
+                let __control = <#fsw2::Input<#fsw2::sequence::SlotControlIn>>::bind(binder);
                 #(#bind_outputs)*
-                let __status = <#fsw2::Out<#fsw2::sequence::SeqStatusOut<#fsw2::ring::RawBacking>, #fsw2::ring::RawBacking> as #fsw2::BindPorts<#fsw2::ring::RawBacking>>::bind(binder);
+                let __status = <#fsw2::Out<#fsw2::sequence::SeqStatusOut> as #fsw2::BindPorts>::bind(binder);
                 #bind_seq
                 let __fut: ::core::pin::Pin<::std::boxed::Box<dyn ::core::future::Future<Output = #fsw2::sequence::Outcome>>> =
-                    ::std::boxed::Box::pin(#fn_ident::<#fsw2::ring::RawBacking>( #(#call_args),* ));
+                    ::std::boxed::Box::pin(#fn_ident( #(#call_args),* ));
                 #fsw2::sequence::SeqBound {
                     future: __fut,
                     status: __status,

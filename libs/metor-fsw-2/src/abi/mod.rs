@@ -31,7 +31,7 @@ use std::slice;
 
 use std::sync::Arc;
 
-use metor_fsw_ring::{RawBacking, RingBuffer, WakeSink, WakeSource};
+use metor_fsw_ring::{RingBuffer, WakeSink, WakeSource};
 use metor_proto::types::{ComponentId, PacketId, Timestamp};
 use metor_proto::vtable::{Op, VTable};
 use metor_proto_wkt::ComponentMetadata;
@@ -82,9 +82,9 @@ pub const FSW_ABI_VERSION: u32 = 4;
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct FswRing {
-    /// Region base — same-process: the host ring's `Backing::base()`.
+    /// Region base — same-process: the host ring's `RingBuffer::region().0`.
     pub base: *mut u8,
-    /// Region length — the host ring's `Backing::len()`.
+    /// Region length — the host ring's `RingBuffer::region().1`.
     pub len: usize,
     /// `0` = input (the system registers a `View`), `1` = output (the system is
     /// the sole `Writer`). The host hands an output region but creates **no**
@@ -470,18 +470,16 @@ impl<'a> RawBinder<'a> {
         }
     }
 
-    fn attach(handle: &FswRing) -> RingBuffer<RawBacking> {
+    fn attach(handle: &FswRing) -> RingBuffer {
         // SAFETY: `RawBinder::new`'s caller asserts each region is a live, header-valid
         // ring that outlives the produced handles; `attach_raw` validates the header.
-        unsafe { RingBuffer::<RawBacking>::attach_raw(handle.base, handle.len) }
+        unsafe { RingBuffer::attach_raw(handle.base, handle.len) }
             .expect("host handed a valid ring region (header validated)")
     }
 }
 
 impl<'a> RingSource for RawBinder<'a> {
-    type B = RawBacking;
-
-    fn next_output<WD, WS>(&mut self) -> (RingBuffer<RawBacking>, WD, WS)
+    fn next_output<WD, WS>(&mut self) -> (RingBuffer, WD, WS)
     where
         WD: WakeSource + Default + Clone + 'static,
         WS: WakeSink + Default + Clone + 'static,
@@ -493,7 +491,7 @@ impl<'a> RingSource for RawBinder<'a> {
         (Self::attach(h), WD::default(), WS::default())
     }
 
-    fn next_input<RD, RS>(&mut self) -> (RingBuffer<RawBacking>, RD, RS)
+    fn next_input<RD, RS>(&mut self) -> (RingBuffer, RD, RS)
     where
         RD: WakeSink + Default + Clone + 'static,
         RS: WakeSource + Default + Clone + 'static,
@@ -621,10 +619,11 @@ pub unsafe fn run_bind_init<S, O>(
     outputs: *const FswRing,
     n_out: usize,
 ) where
-    S: CyclicSystem<RawBacking, Output = Out<O, RawBacking>> + BuildSystem + 'static,
-    O: SystemOutput + 'static,
-    S::Input: BindPorts<RawBacking>,
-    S::Output: BindPorts<RawBacking>,
+    S: CyclicSystem<Output = Out<O>> + BuildSystem + 'static,
+    // `Out<O>: BindPorts` needs `O: BindPorts` spelled out: the `Output = Out<O>`
+    // equality makes the compiler prove the blanket impl rather than elaborate
+    // the `System::Output: BindPorts` associated-type bound.
+    O: SystemOutput + BindPorts + 'static,
 {
     if state.is_null() {
         return;
@@ -637,13 +636,13 @@ pub unsafe fn run_bind_init<S, O>(
     let _ = catch_unwind(AssertUnwindSafe(|| {
         // SAFETY: caller asserts each region outlives the runner (until run_destroy).
         let mut binder = unsafe { RawBinder::new(in_slice, out_slice) };
-        let input = <S::Input as BindPorts<RawBacking>>::bind(&mut binder);
-        let output = <S::Output as BindPorts<RawBacking>>::bind(&mut binder);
+        let input = <S::Input as BindPorts>::bind(&mut binder);
+        let output = <S::Output as BindPorts>::bind(&mut binder);
         let system = st
             .pending
             .take()
             .expect("fsw_create populated the system before fsw_bind_init");
-        let mut runner = CyclicRunner::<S, O, RawBacking>::new(system, input, output);
+        let mut runner = CyclicRunner::new(system, input, output);
         runner.init();
         st.runner = Some(Box::new(runner));
     }));
@@ -709,7 +708,7 @@ where
 }
 
 /// `fsw_destroy`: drop the boxed state inside the `.so` (running `S::drop` and every
-/// `RawBacking` port's `Drop`). Idempotent on null.
+/// non-owning port's `Drop`). Idempotent on null.
 ///
 /// # Safety
 /// `state` is a live pointer from [`run_create`] for this `S`, not used afterward.
@@ -738,12 +737,12 @@ where
 /// `.so` owns for the duration of the call).
 pub unsafe fn run_describe<S>(sink: ByteSink, ctx: *mut c_void) -> i32
 where
-    S: CyclicSystem<RawBacking> + BuildSystem,
+    S: CyclicSystem + BuildSystem,
     S::Params: postcard_schema::Schema,
 {
     let params_schema = OwnedNamedType::from(<S::Params as postcard_schema::Schema>::SCHEMA);
     describe_common(
-        <S as CyclicSystem<RawBacking>>::descriptor,
+        <S as CyclicSystem>::descriptor,
         params_schema,
         sink,
         ctx,
@@ -913,7 +912,7 @@ where
 }
 
 /// `fsw_destroy` (sequence): drop the boxed [`SeqState`] inside the `.so` — dropping
-/// the future drops its owned [`RawBacking`] ports (releasing their ring roles), and
+/// the future drops its owned non-owning ports (releasing their ring roles), and
 /// the wrapper tail/control drop too. Idempotent on null.
 ///
 /// # Safety

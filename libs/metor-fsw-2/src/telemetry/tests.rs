@@ -178,7 +178,7 @@ fn packet_payload(pkt: &LenPacket) -> &[u8] {
 }
 
 /// Drain a view to its newest record and return a copy of the bytes, if any.
-fn drain_latest(view: &mut metor_fsw_ring::View<metor_fsw_ring::BoxBacking, metor_fsw_ring::NoWake, metor_fsw_ring::NoWake>) -> Option<Vec<u8>> {
+fn drain_latest(view: &mut metor_fsw_ring::View<metor_fsw_ring::NoWake, metor_fsw_ring::NoWake>) -> Option<Vec<u8>> {
     let mut buf = Vec::new();
     let mut last = None;
     while let Ok(true) = view.try_read_into(&mut buf) {
@@ -625,8 +625,8 @@ impl SystemOutput for BurstLogOut {
     }
 }
 
-impl crate::BindPorts<crate::ring::BoxBacking> for BurstLogOut {
-    fn bind<S: crate::RingSource<B = crate::ring::BoxBacking>>(src: &mut S) -> Self {
+impl crate::BindPorts for BurstLogOut {
+    fn bind<S: crate::RingSource>(src: &mut S) -> Self {
         Self {
             imu: Output::bind(src),
         }

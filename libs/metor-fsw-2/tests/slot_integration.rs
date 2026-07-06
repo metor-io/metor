@@ -428,7 +428,6 @@ fn slot_reset_reruns_from_start() {
 /// postcard-round-tripping each record (the downlink tap's decode, `docs/messages.md` §3).
 fn drain_msgs<M: Msg + serde::de::DeserializeOwned>(
     view: &mut metor_fsw_2::ring::View<
-        metor_fsw_2::ring::BoxBacking,
         metor_fsw_2::ring::NoWake,
         metor_fsw_2::ring::NoWake,
     >,

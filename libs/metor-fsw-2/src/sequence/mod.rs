@@ -21,7 +21,6 @@ use core::task::{Context, Poll};
 use std::rc::Rc;
 use std::time::Duration;
 
-use metor_fsw_ring::{Backing, BoxBacking, RawBacking};
 use metor_proto::types::Timestamp;
 use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
 
@@ -301,8 +300,8 @@ pub struct SlotControlIn {
 /// (`src/system/mod.rs`). `#[derive(SystemOutput)]` gives it both `descriptors()` and
 /// `BindPorts`.
 #[derive(SystemOutput)]
-pub struct SeqStatusOut<B: Backing = BoxBacking> {
-    pub status: Output<SequenceStatus, B>,
+pub struct SeqStatusOut {
+    pub status: Output<SequenceStatus>,
 }
 
 // ---------------------------------------------------------------------------
@@ -311,8 +310,8 @@ pub struct SeqStatusOut<B: Backing = BoxBacking> {
 
 /// The bound occupant `abi::run_seq_*` threads: the owned future (the user ports moved
 /// inside it), the wrapper-owned [`SequenceStatus`] / health / log tail (an [`Out`]),
-/// and the cancel input the cycle reads. All over [`RawBacking`] — a dlopen'd
-/// occupant's views into the host's regions.
+/// and the cancel input the cycle reads. All bound over non-owning attaches to the
+/// host's regions (rings are backing-erased).
 ///
 /// TODO(E6, seq path): a sequence's *user* output ports move into the future, so
 /// their [`publish`](crate::Output::publish) drop counters are unreachable from this
@@ -331,8 +330,8 @@ pub struct SeqStatusOut<B: Backing = BoxBacking> {
 /// revisit if `Output` grows a cheap counter-sink seam.
 pub struct SeqBound {
     pub future: Pin<Box<dyn Future<Output = Outcome>>>,
-    pub status: Out<SeqStatusOut<RawBacking>, RawBacking>,
-    pub control: Input<SlotControlIn, RawBacking>,
+    pub status: Out<SeqStatusOut>,
+    pub control: Input<SlotControlIn>,
 }
 
 /// The seam the `#[sequence]` macro implements and `abi::run_seq_*` is generic over —
@@ -342,10 +341,9 @@ pub struct SeqBound {
 /// [`descriptor`](SeqSystem::descriptor) is the single source of truth for ring
 /// sizing / `compatible()` validation / the prefixed `announce`: it lists inputs
 /// `[user inputs…, SlotControlIn]` and outputs `[user outputs…, then the
-/// `Out<SeqStatusOut>` tail = SequenceStatus, health, log]`, `kind = Cyclic`. It may
-/// name ports at [`BoxBacking`] (a `PortDesc` is backing-independent). [`build`](SeqSystem::build)
-/// binds those same ports — in the same order — at [`RawBacking`], moving the user
-/// ports into the future.
+/// `Out<SeqStatusOut>` tail = SequenceStatus, health, log]`, `kind = Cyclic`.
+/// [`build`](SeqSystem::build) binds those same ports — in the same order — over
+/// the host's regions, moving the user ports into the future.
 pub trait SeqSystem {
     /// The params value `run_seq_create` postcard-decodes (`()` for a paramless sequence).
     type Params;
@@ -366,8 +364,8 @@ pub trait SeqSystem {
 /// Publish one [`SequenceStatus`] record from the wrapper-owned `Out` tail: stamp
 /// `run_state`/`timestamp` and fill the `progress` [`FrameList`] from `lines` (each a
 /// [`ProgressLine::new`]). The caller separately drives `out.health().end_cycle`.
-pub fn publish_status<B: Backing>(
-    out: &mut Out<SeqStatusOut<B>, B>,
+pub fn publish_status(
+    out: &mut Out<SeqStatusOut>,
     now: Timestamp,
     run_state: u8,
     lines: &[String],

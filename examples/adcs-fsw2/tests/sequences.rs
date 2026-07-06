@@ -227,7 +227,6 @@ fn interactive_load_then_abort_safes() {
 /// reused verbatim from the framework's `slot_integration` test.
 fn drain_msgs<M: Msg + serde::de::DeserializeOwned>(
     view: &mut metor_fsw_2::ring::View<
-        metor_fsw_2::ring::BoxBacking,
         metor_fsw_2::ring::NoWake,
         metor_fsw_2::ring::NoWake,
     >,

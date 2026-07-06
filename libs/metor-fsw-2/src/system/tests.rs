@@ -6,7 +6,7 @@ use core::mem::offset_of;
 use std::collections::HashMap;
 
 use metor_fsw::Decomponentize;
-use metor_fsw_ring::{BoxBacking, Config, NoWake, Notifier, RingBuffer, WriteError};
+use metor_fsw_ring::{Config, NoWake, Notifier, RingBuffer, WriteError};
 use metor_proto::types::{ComponentId, ComponentView, Timestamp};
 use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
 
@@ -68,7 +68,7 @@ impl Decomponentize for RecSink {
     }
 }
 
-fn ring_for<F: crate::Frame>(depth: usize, readers: usize) -> RingBuffer<BoxBacking> {
+fn ring_for<F: crate::Frame>(depth: usize, readers: usize) -> RingBuffer {
     RingBuffer::create_in_memory(Config {
         capacity: buffer_capacity::<F>(depth),
         max_readers: readers,
@@ -354,17 +354,17 @@ struct AsyncFilter;
 
 #[derive(SystemInput)]
 struct AsyncIn {
-    imu: Input<Imu, BoxBacking, Notifier, Notifier>,
+    imu: Input<Imu, Notifier, Notifier>,
 }
 
 #[derive(SystemOutput)]
 struct AsyncOut {
-    nav: Output<NavEstimate, BoxBacking, Notifier, Notifier>,
+    nav: Output<NavEstimate, Notifier, Notifier>,
 }
 
 impl System for AsyncFilter {
     type Input = AsyncIn;
-    type Output = Out<AsyncOut, BoxBacking, Notifier, Notifier>;
+    type Output = Out<AsyncOut, Notifier, Notifier>;
     const NAME: &'static str = "async_filter";
 }
 
@@ -534,8 +534,8 @@ impl MacroDoubler {
 fn run_doubler<S, O>(system: S, samples: &[Option<f64>]) -> (Vec<f64>, HashMap<ComponentId, f64>)
 where
     S: CyclicSystem<Output = Out<O>>,
-    S::Input: crate::BindPorts<BoxBacking>,
-    O: SystemOutput + crate::BindPorts<BoxBacking>,
+    S::Input: crate::BindPorts,
+    O: SystemOutput + crate::BindPorts,
 {
     let imu_ring = ring_for::<Imu>(8, 2);
     let nav_ring = ring_for::<NavEstimate>(8, 2);
@@ -581,12 +581,12 @@ where
 
 /// A positional `RingSource` over pre-created rings (the coordinator's job, by hand).
 struct TestSource {
-    rings: Vec<RingBuffer<BoxBacking>>,
+    rings: Vec<RingBuffer>,
     next: usize,
 }
 
 impl TestSource {
-    fn pop(&mut self) -> RingBuffer<BoxBacking> {
+    fn pop(&mut self) -> RingBuffer {
         let ring = self.rings[self.next].clone();
         self.next += 1;
         ring
@@ -594,9 +594,8 @@ impl TestSource {
 }
 
 impl crate::RingSource for TestSource {
-    type B = BoxBacking;
 
-    fn next_output<WD, WS>(&mut self) -> (RingBuffer<BoxBacking>, WD, WS)
+    fn next_output<WD, WS>(&mut self) -> (RingBuffer, WD, WS)
     where
         WD: metor_fsw_ring::WakeSource + Default + Clone + 'static,
         WS: metor_fsw_ring::WakeSink + Default + Clone + 'static,
@@ -604,7 +603,7 @@ impl crate::RingSource for TestSource {
         (self.pop(), WD::default(), WS::default())
     }
 
-    fn next_input<RD, RS>(&mut self) -> (RingBuffer<BoxBacking>, RD, RS)
+    fn next_input<RD, RS>(&mut self) -> (RingBuffer, RD, RS)
     where
         RD: metor_fsw_ring::WakeSink + Default + Clone + 'static,
         RS: metor_fsw_ring::WakeSource + Default + Clone + 'static,
@@ -612,7 +611,7 @@ impl crate::RingSource for TestSource {
         (self.pop(), RD::default(), RS::default())
     }
 
-    fn next_input_fanin<RD, RS>(&mut self) -> Vec<(RingBuffer<BoxBacking>, RD, RS)>
+    fn next_input_fanin<RD, RS>(&mut self) -> Vec<(RingBuffer, RD, RS)>
     where
         RD: metor_fsw_ring::WakeSink + Default + Clone + 'static,
         RS: metor_fsw_ring::WakeSource + Default + Clone + 'static,
@@ -726,7 +725,7 @@ struct QuietOut {
 }
 
 /// A tiny Log-sized message ring (small enough to fill with a handful of records).
-fn msg_ring(readers: usize) -> RingBuffer<BoxBacking> {
+fn msg_ring(readers: usize) -> RingBuffer {
     RingBuffer::create_in_memory(Config {
         capacity: crate::capacity_for(64, 2),
         max_readers: readers,

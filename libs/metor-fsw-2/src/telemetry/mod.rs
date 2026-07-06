@@ -36,7 +36,7 @@ use std::sync::atomic::{
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use metor_fsw_ring::{BoxBacking, NoWake, View};
+use metor_fsw_ring::{NoWake, View};
 use metor_proto::types::{LenPacket, Msg, OwnedPacket, PacketId, Timestamp};
 use metor_proto::vtable::VTable;
 use metor_proto_stellar::{PacketSink, PacketStream};
@@ -479,8 +479,8 @@ impl SystemInput for UplinkIn {
     }
 }
 
-impl BindPorts<BoxBacking> for UplinkIn {
-    fn bind<S: RingSource<B = BoxBacking>>(_src: &mut S) -> Self {
+impl BindPorts for UplinkIn {
+    fn bind<S: RingSource>(_src: &mut S) -> Self {
         UplinkIn
     }
 }
@@ -641,8 +641,8 @@ impl SystemInput for TelemetryIn {
     }
 }
 
-impl BindPorts<BoxBacking> for TelemetryIn {
-    fn bind<S: RingSource<B = BoxBacking>>(_src: &mut S) -> Self {
+impl BindPorts for TelemetryIn {
+    fn bind<S: RingSource>(_src: &mut S) -> Self {
         TelemetryIn
     }
 }
@@ -656,7 +656,7 @@ impl BindPorts<BoxBacking> for TelemetryIn {
 /// framing (from the entry's `schema`). The generic `Table × Log` combination falls
 /// out for free: FIFO lane + announced Table packets.
 struct Tap {
-    view: View<BoxBacking, NoWake, NoWake>,
+    view: View<NoWake, NoWake>,
     lane: Lane,
     wire: Wire,
     /// Coalesce lane only: the ring's `committed` at the last push, so a cycle with
