@@ -9244,6 +9244,7 @@ dependencies = [
  "memmap2",
  "stellarator",
  "tempfile",
+ "zerocopy",
 ]
 
 [[package]]

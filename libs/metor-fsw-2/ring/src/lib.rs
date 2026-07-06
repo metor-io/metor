@@ -3,9 +3,10 @@
 //! This is the transport over which fsw-2 systems exchange data. It generalizes
 //! the `metor-db` disruptor (`libs/db/src/disruptor.rs`) along one axis:
 //! **shared memory.** The entire stateful buffer lives in one contiguous region
-//! addressed by fixed byte offsets — no `Box`/`Arc`/process-local pointers
-//! inside it — so the same mechanism works in-process and (with the `mmap`
-//! feature) across processes.
+//! addressed through fixed `#[repr(C)]` layouts ([`RegionHeader`]/[`Control`]/
+//! [`ReaderSlot`], pinned by const asserts) — no `Box`/`Arc`/process-local
+//! pointers inside it — so the same mechanism works in-process and (with the
+//! `mmap` feature) across processes.
 //!
 //! The buffer is **lossless**: the writer honors the disruptor's in-use check —
 //! [`Writer::try_write`] returns [`WriteError::WouldBlock`] rather than
@@ -29,11 +30,14 @@ use std::sync::atomic::{
     AtomicU64, fence,
     Ordering::{AcqRel, Acquire, Relaxed, Release, SeqCst},
 };
+use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
 
 // ---------------------------------------------------------------------------
-// Layout constants
+// Region layout
 //
-// All offsets are region-relative bytes. Multi-byte fields are stored in native
+// Realized as `#[repr(C)]` structs; the const asserts below pin the VERSION-2
+// byte layout, so a field reorder or resize fails the build rather than
+// silently changing the wire format. Multi-byte fields are stored in native
 // byte order; `attach` rejects regions written by a different architecture (see
 // `arch_tag`), so cross-endian reinterpretation never happens.
 // ---------------------------------------------------------------------------
@@ -48,32 +52,93 @@ const MAGIC: u32 = u32::from_ne_bytes(*b"MFR1");
 /// archives; stale dev regions are simply recreated.
 const VERSION: u16 = 2;
 
-// Header (cache line 0).
-const OFF_MAGIC: usize = 0x00; // u32
-const OFF_VERSION: usize = 0x04; // u16
-const OFF_FLAGS: usize = 0x06; // u16
-const OFF_CAPACITY: usize = 0x08; // u64
-const OFF_DATA_OFFSET: usize = 0x10; // u64
-const OFF_MAX_READERS: usize = 0x18; // u32
-const OFF_READER_TABLE_OFFSET: usize = 0x1C; // u32
-const OFF_TOTAL_SIZE: usize = 0x20; // u64
-const OFF_ARCH_TAG: usize = 0x28; // u64
+/// The immutable region header (cache line 0, bytes `0x00..0x30`). Written once
+/// by `init_region` before the region is published and never mutated again —
+/// which is what makes the transient shared byte view in `read_header` sound.
+///
+/// The `IntoBytes` derive doubles as a compile-time no-padding proof.
+/// `align(8)`: `u64` is only 4-aligned on i686 (the same catch as [`Word`]).
+#[derive(FromBytes, IntoBytes, Immutable, KnownLayout)]
+#[repr(C, align(8))]
+struct RegionHeader {
+    magic: u32,
+    version: u16,
+    flags: u16,
+    capacity: u64,
+    data_offset: u64,
+    max_readers: u32,
+    reader_table_offset: u32,
+    total_size: u64,
+    arch_tag: u64,
+}
 
-// Control block (cache line 1).
-const OFF_COMMITTED: usize = 0x40; // AtomicU64
-const OFF_HWM: usize = 0x48; // AtomicU64
-const OFF_WAKE_WORD: usize = 0x50; // AtomicU64 (reserved; future cross-proc wake)
-const OFF_WRITER: usize = 0x58; // AtomicU64: writer claim, 0 = free (see `RingBuffer::writer`)
+/// The control block (cache line 1, at [`OFF_CONTROL`]). Every field is an
+/// atomic (interior-mutable), so a shared `&Control` over the live region is
+/// sound. Not a zerocopy type: it is never parsed from bytes, only
+/// pointer-cast; its VERSION-2 offsets are pinned by the const asserts below.
+#[repr(C)]
+struct Control {
+    committed: AtomicU64,
+    hwm: AtomicU64,
+    /// Reserved: future cross-process wake (see [`FLAG_WAKE_SHARED`]).
+    #[allow(dead_code)]
+    wake_word: AtomicU64,
+    /// The writer claim, `0` = free (see [`RingBuffer::writer`]).
+    writer: AtomicU64,
+}
 
+/// One reader-table slot, padded to a cache line to avoid false sharing.
+/// `_pad` is written once (zeroed) at init and never touched again — required:
+/// a shared `&ReaderSlot` freezes the pad bytes (they are not interior-mutable).
+#[repr(C)]
+struct ReaderSlot {
+    cursor: AtomicU64,
+    epoch: AtomicU64,
+    _pad: [u8; 48],
+}
+
+/// Byte offset of the control block (cache line 1).
+const OFF_CONTROL: usize = 0x40;
 /// Header + control block size; the reader table starts here.
 const HEADER_SIZE: usize = 0x80;
-/// One reader-table slot, padded to a cache line to avoid false sharing.
-const READER_SLOT_SIZE: usize = 64;
-const SLOT_OFF_CURSOR: usize = 0x00; // AtomicU64
-const SLOT_OFF_EPOCH: usize = 0x08; // AtomicU64
+/// One reader-table slot's stride.
+const READER_SLOT_SIZE: usize = size_of::<ReaderSlot>();
+
+// Pin the VERSION-2 wire layout, byte for byte. `init_region`/`read_header`
+// and the `Inner` accessors go through these types, so any drift fails the
+// build, not the format.
+const _: () = {
+    use core::mem::offset_of;
+    assert!(size_of::<RegionHeader>() == 0x30);
+    assert!(align_of::<RegionHeader>() == 8);
+    assert!(offset_of!(RegionHeader, magic) == 0x00);
+    assert!(offset_of!(RegionHeader, version) == 0x04);
+    assert!(offset_of!(RegionHeader, flags) == 0x06);
+    assert!(offset_of!(RegionHeader, capacity) == 0x08);
+    assert!(offset_of!(RegionHeader, data_offset) == 0x10);
+    assert!(offset_of!(RegionHeader, max_readers) == 0x18);
+    assert!(offset_of!(RegionHeader, reader_table_offset) == 0x1C);
+    assert!(offset_of!(RegionHeader, total_size) == 0x20);
+    assert!(offset_of!(RegionHeader, arch_tag) == 0x28);
+    assert!(size_of::<RegionHeader>() <= OFF_CONTROL);
+
+    assert!(size_of::<Control>() == 0x20);
+    assert!(align_of::<Control>() == 8);
+    assert!(offset_of!(Control, committed) == 0x00); // region 0x40
+    assert!(offset_of!(Control, hwm) == 0x08); // region 0x48
+    assert!(offset_of!(Control, wake_word) == 0x10); // region 0x50
+    assert!(offset_of!(Control, writer) == 0x18); // region 0x58
+    assert!(OFF_CONTROL + size_of::<Control>() <= HEADER_SIZE);
+
+    assert!(size_of::<ReaderSlot>() == 64);
+    assert!(align_of::<ReaderSlot>() == 8);
+    assert!(offset_of!(ReaderSlot, cursor) == 0x00);
+    assert!(offset_of!(ReaderSlot, epoch) == 0x08);
+};
 
 /// `flags` bit 0: a shared-memory wake word is present (reserved; never set in
-/// v2, but the bit and [`OFF_WAKE_WORD`] reserve room for cross-process wake).
+/// v2, but the bit and [`Control::wake_word`] reserve room for cross-process
+/// wake).
 #[allow(dead_code)]
 const FLAG_WAKE_SHARED: u16 = 1 << 0;
 
@@ -132,8 +197,9 @@ pub enum WriteError {
     WouldBlock,
 }
 
-// This crate is dependency-free by design, so the error types carry manual
-// `Display`/`Error` impls rather than a `thiserror` derive (S1).
+// This crate keeps its required dependencies to `zerocopy` (layout proofs
+// only), so the error types carry manual `Display`/`Error` impls rather than a
+// `thiserror` derive (S1).
 impl core::fmt::Display for WriteError {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
@@ -506,50 +572,54 @@ impl Inner {
         self.backing.base()
     }
 
-    /// `&AtomicU64` at region offset `off`.
-    ///
-    /// # Safety
-    /// `off + 8 <= region len`, and `off` is 8-byte aligned.
+    /// The control block.
     #[inline]
-    unsafe fn atomic_u64(&self, off: usize) -> &AtomicU64 {
-        // SAFETY: caller guarantees bounds + alignment; the backing is
-        // interior-mutable so an `&AtomicU64` over it is sound, and provenance is
-        // re-derived from `base()`.
-        unsafe { &*(self.base().add(off) as *const AtomicU64) }
+    fn control(&self) -> &Control {
+        // SAFETY: `OFF_CONTROL + size_of::<Control>() <= HEADER_SIZE <= region
+        // len` (established by `layout()` at create and `read_header` at
+        // attach), and `base + OFF_CONTROL` is 8-aligned. `Control` is
+        // all-atomic (interior-mutable), so a shared reference over the shared
+        // backing is sound; provenance is re-derived from `base()`.
+        unsafe { &*(self.base().add(OFF_CONTROL) as *const Control) }
     }
 
     #[inline]
     fn committed(&self) -> &AtomicU64 {
-        // SAFETY: OFF_COMMITTED is a fixed, 8-aligned, in-bounds control word.
-        unsafe { self.atomic_u64(OFF_COMMITTED) }
+        &self.control().committed
     }
 
     #[inline]
     fn hwm(&self) -> &AtomicU64 {
-        // SAFETY: OFF_HWM is a fixed, 8-aligned, in-bounds control word.
-        unsafe { self.atomic_u64(OFF_HWM) }
+        &self.control().hwm
     }
 
     /// The writer-claim word: `0` = free, `1` = a live [`Writer`] exists (or a
     /// crashed one leaked the claim). See [`RingBuffer::writer`].
     #[inline]
     fn writer_claim(&self) -> &AtomicU64 {
-        // SAFETY: OFF_WRITER is a fixed, 8-aligned, in-bounds control word.
-        unsafe { self.atomic_u64(OFF_WRITER) }
+        &self.control().writer
+    }
+
+    /// Reader-table slot `slot`.
+    #[inline]
+    fn slot(&self, slot: u32) -> &ReaderSlot {
+        let off = self.reader_table_offset + slot as usize * READER_SLOT_SIZE;
+        // SAFETY: slot < max_readers ⇒ the slot lies within the reader table
+        // (attach/layout geometry), 8-aligned. The atomic fields are
+        // interior-mutable; `_pad` is frozen by this shared borrow, which is
+        // sound only because pad bytes are written exactly once, in
+        // `init_region`, before publication — never stash state there.
+        unsafe { &*(self.base().add(off) as *const ReaderSlot) }
     }
 
     #[inline]
     fn slot_cursor(&self, slot: u32) -> &AtomicU64 {
-        let off = self.reader_table_offset + slot as usize * READER_SLOT_SIZE + SLOT_OFF_CURSOR;
-        // SAFETY: slot < max_readers ⇒ off is within the reader table, 8-aligned.
-        unsafe { self.atomic_u64(off) }
+        &self.slot(slot).cursor
     }
 
     #[inline]
     fn slot_epoch(&self, slot: u32) -> &AtomicU64 {
-        let off = self.reader_table_offset + slot as usize * READER_SLOT_SIZE + SLOT_OFF_EPOCH;
-        // SAFETY: slot < max_readers ⇒ off is within the reader table, 8-aligned.
-        unsafe { self.atomic_u64(off) }
+        &self.slot(slot).epoch
     }
 
     /// Pointer to byte `phys` of the data region.
@@ -964,26 +1034,35 @@ unsafe fn init_region(
 ) {
     let base = backing.base();
     debug_assert!(backing.len() >= total);
-    // SAFETY: all offsets are within `total` bytes and correctly aligned; no
+    // SAFETY: all offsets are within `total` bytes and 8-aligned (`base` is
+    // 8-aligned, `OFF_CONTROL` and the table offsets are multiples of 8); no
     // other thread can observe these writes yet.
     unsafe {
-        (base.add(OFF_MAGIC) as *mut u32).write(MAGIC);
-        (base.add(OFF_VERSION) as *mut u16).write(VERSION);
-        (base.add(OFF_FLAGS) as *mut u16).write(0);
-        (base.add(OFF_CAPACITY) as *mut u64).write(cfg.capacity as u64);
-        (base.add(OFF_DATA_OFFSET) as *mut u64).write(data_offset as u64);
-        (base.add(OFF_MAX_READERS) as *mut u32).write(cfg.max_readers as u32);
-        (base.add(OFF_READER_TABLE_OFFSET) as *mut u32).write(reader_table_offset as u32);
-        (base.add(OFF_TOTAL_SIZE) as *mut u64).write(total as u64);
-        (base.add(OFF_ARCH_TAG) as *mut u64).write(arch_tag());
-        (base.add(OFF_COMMITTED) as *mut u64).write(0);
-        (base.add(OFF_HWM) as *mut u64).write(HWM_NONE);
-        (base.add(OFF_WAKE_WORD) as *mut u64).write(0);
-        (base.add(OFF_WRITER) as *mut u64).write(0);
+        base.cast::<RegionHeader>().write(RegionHeader {
+            magic: MAGIC,
+            version: VERSION,
+            flags: 0,
+            capacity: cfg.capacity as u64,
+            data_offset: data_offset as u64,
+            max_readers: cfg.max_readers as u32,
+            reader_table_offset: reader_table_offset as u32,
+            total_size: total as u64,
+            arch_tag: arch_tag(),
+        });
+        base.add(OFF_CONTROL).cast::<Control>().write(Control {
+            committed: AtomicU64::new(0),
+            hwm: AtomicU64::new(HWM_NONE),
+            wake_word: AtomicU64::new(0),
+            writer: AtomicU64::new(0),
+        });
         for slot in 0..cfg.max_readers {
-            let so = reader_table_offset + slot * READER_SLOT_SIZE;
-            (base.add(so + SLOT_OFF_CURSOR) as *mut u64).write(FREE_SLOT);
-            (base.add(so + SLOT_OFF_EPOCH) as *mut u64).write(0);
+            base.add(reader_table_offset + slot * READER_SLOT_SIZE)
+                .cast::<ReaderSlot>()
+                .write(ReaderSlot {
+                    cursor: AtomicU64::new(FREE_SLOT),
+                    epoch: AtomicU64::new(0),
+                    _pad: [0; 48],
+                });
         }
     }
 }
@@ -998,12 +1077,12 @@ struct Geometry {
 
 /// Validate and read the immutable header fields from an existing region.
 ///
-/// After `Ok`, every offset the ring ever dereferences — control words, all
+/// After `Ok`, every offset the ring ever dereferences — the control block, all
 /// `max_readers` reader slots, and `data_offset + phys` for `phys < capacity` —
 /// is inside `[0, region_len)` and 8-aligned: attach restores the same geometry
 /// invariant `layout()` + `init_region` establish at creation, which is what
-/// the `SAFETY` comments on `atomic_u64`/`data_ptr` assume. All arithmetic is
-/// checked `u64`, so a hostile header cannot overflow its way past a bound.
+/// the `SAFETY` comments on `control`/`slot`/`data_ptr` assume. All arithmetic
+/// is checked `u64`, so a hostile header cannot overflow its way past a bound.
 ///
 /// # Safety
 /// `base` points at a readable region of at least `region_len` bytes.
@@ -1014,69 +1093,77 @@ unsafe fn read_header(base: *mut u8, region_len: usize) -> Result<Geometry, Atta
     if region_len < HEADER_SIZE {
         return Err(AttachError::TooSmall);
     }
-    // SAFETY: header fields are within HEADER_SIZE <= region_len and written
-    // once at creation; reading them by value is sound.
-    unsafe {
-        if (base.add(OFF_MAGIC) as *const u32).read() != MAGIC {
-            return Err(AttachError::BadMagic);
-        }
-        if (base.add(OFF_VERSION) as *const u16).read() != VERSION {
-            return Err(AttachError::BadVersion);
-        }
-        if (base.add(OFF_ARCH_TAG) as *const u64).read() != arch_tag() {
-            return Err(AttachError::ArchMismatch);
-        }
-        let capacity = (base.add(OFF_CAPACITY) as *const u64).read();
-        let data_offset = (base.add(OFF_DATA_OFFSET) as *const u64).read();
-        let max_readers = (base.add(OFF_MAX_READERS) as *const u32).read();
-        let reader_table_offset = (base.add(OFF_READER_TABLE_OFFSET) as *const u32).read() as u64;
-        let total_size = (base.add(OFF_TOTAL_SIZE) as *const u64).read();
+    // SAFETY: bytes `0..size_of::<RegionHeader>()` are in-bounds (checked
+    // above; the header ends before `OFF_CONTROL`) and were written once by
+    // `init_region` before the region was published, never again — all mutable
+    // state (control block, reader slots, data) starts at `OFF_CONTROL` — so
+    // this transient shared view cannot race a live writer (the argument
+    // `ReadGrant` reads rely on), and it dies before this function returns.
+    // Never widen it to `HEADER_SIZE`: attach can run against a live region
+    // whose control words are being concurrently mutated.
+    let hdr_bytes =
+        unsafe { core::slice::from_raw_parts(base as *const u8, size_of::<RegionHeader>()) };
+    let hdr = RegionHeader::read_from_bytes(hdr_bytes).expect("exact-size slice");
 
-        // Capacity: a power of two (so `mask = capacity - 1` is well-defined),
-        // at least one record header (8 bytes — `read_len`'s `phys + 8 <=
-        // capacity` contract needs it, and it keeps every 8-aligned record
-        // start dereferenceable), and fitting this target's `usize` (a 32-bit
-        // target can attach a region sized by a 64-bit creator).
-        if !capacity.is_power_of_two() || capacity < 8 || capacity > usize::MAX as u64 {
-            return Err(AttachError::BadGeometry);
-        }
-        if max_readers == 0 {
-            return Err(AttachError::BadGeometry);
-        }
-        // Reader table in bounds: behind the header, 8-aligned, and ending at
-        // or before the data region.
-        let table_end = (max_readers as u64)
-            .checked_mul(READER_SLOT_SIZE as u64)
-            .and_then(|sz| reader_table_offset.checked_add(sz))
-            .ok_or(AttachError::BadGeometry)?;
-        if reader_table_offset < HEADER_SIZE as u64
-            || !reader_table_offset.is_multiple_of(8)
-            || table_end > data_offset
-        {
-            return Err(AttachError::BadGeometry);
-        }
-        // Data region in bounds: 8-aligned and ending at or before total_size.
-        let data_end = data_offset
-            .checked_add(capacity)
-            .ok_or(AttachError::BadGeometry)?;
-        if !data_offset.is_multiple_of(8) || data_end > total_size {
-            return Err(AttachError::BadGeometry);
-        }
-        // The self-declared total must fit the actual backing region — the
-        // truncated-on-disk file case gets its own variant because it is the
-        // diagnosable real-world failure.
-        if total_size > region_len as u64 {
-            return Err(AttachError::RegionTruncated);
-        }
-
-        Ok(Geometry {
-            capacity,
-            // Both fit usize: they are <= total_size <= region_len: usize.
-            data_offset: data_offset as usize,
-            reader_table_offset: reader_table_offset as usize,
-            max_readers,
-        })
+    if hdr.magic != MAGIC {
+        return Err(AttachError::BadMagic);
     }
+    if hdr.version != VERSION {
+        return Err(AttachError::BadVersion);
+    }
+    if hdr.arch_tag != arch_tag() {
+        return Err(AttachError::ArchMismatch);
+    }
+    let capacity = hdr.capacity;
+    let data_offset = hdr.data_offset;
+    let max_readers = hdr.max_readers;
+    let reader_table_offset = hdr.reader_table_offset as u64;
+    let total_size = hdr.total_size;
+
+    // Capacity: a power of two (so `mask = capacity - 1` is well-defined),
+    // at least one record header (8 bytes — `read_len`'s `phys + 8 <=
+    // capacity` contract needs it, and it keeps every 8-aligned record
+    // start dereferenceable), and fitting this target's `usize` (a 32-bit
+    // target can attach a region sized by a 64-bit creator).
+    if !capacity.is_power_of_two() || capacity < 8 || capacity > usize::MAX as u64 {
+        return Err(AttachError::BadGeometry);
+    }
+    if max_readers == 0 {
+        return Err(AttachError::BadGeometry);
+    }
+    // Reader table in bounds: behind the header, 8-aligned, and ending at
+    // or before the data region.
+    let table_end = (max_readers as u64)
+        .checked_mul(READER_SLOT_SIZE as u64)
+        .and_then(|sz| reader_table_offset.checked_add(sz))
+        .ok_or(AttachError::BadGeometry)?;
+    if reader_table_offset < HEADER_SIZE as u64
+        || !reader_table_offset.is_multiple_of(8)
+        || table_end > data_offset
+    {
+        return Err(AttachError::BadGeometry);
+    }
+    // Data region in bounds: 8-aligned and ending at or before total_size.
+    let data_end = data_offset
+        .checked_add(capacity)
+        .ok_or(AttachError::BadGeometry)?;
+    if !data_offset.is_multiple_of(8) || data_end > total_size {
+        return Err(AttachError::BadGeometry);
+    }
+    // The self-declared total must fit the actual backing region — the
+    // truncated-on-disk file case gets its own variant because it is the
+    // diagnosable real-world failure.
+    if total_size > region_len as u64 {
+        return Err(AttachError::RegionTruncated);
+    }
+
+    Ok(Geometry {
+        capacity,
+        // Both fit usize: they are <= total_size <= region_len: usize.
+        data_offset: data_offset as usize,
+        reader_table_offset: reader_table_offset as usize,
+        max_readers,
+    })
 }
 
 // ---------------------------------------------------------------------------

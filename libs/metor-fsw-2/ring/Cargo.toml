@@ -5,7 +5,7 @@ version.workspace = true
 repository.workspace = true
 edition = "2024"
 publish = false
-description = "Overwrite-on-lap, shared-memory ring buffer for metor-fsw-2"
+description = "Lossless, shared-memory ring buffer for metor-fsw-2"
 authors = ["sascha@metor.io"]
 
 [lints]
@@ -22,6 +22,7 @@ mmap = ["dep:memmap2"]
 [dependencies]
 memmap2 = { version = "0.9", optional = true }
 stellarator = { path = "../../stellarator", optional = true }
+zerocopy = { version = "0.8.2", features = ["derive"] }
 
 [dev-dependencies]
 tempfile = "3.13"
