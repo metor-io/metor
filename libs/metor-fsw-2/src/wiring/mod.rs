@@ -48,7 +48,9 @@ use crate::coordinator::{
 use crate::descriptor::{PortId, SystemDescriptor, compatible};
 use crate::dl::DlSystem;
 use crate::system::{AsyncSystem, BuildSystem, CyclicSystem, Out, SystemOutput};
-use crate::telemetry::{TcpRecvTransport, TcpTransport, TelemetryConfig, TelemetryMode};
+use crate::telemetry::{
+    TcpRecvTransport, TcpTransport, TelemetryConfig, TelemetryMode, TelemetrySystem, UplinkSystem,
+};
 
 // The `Wiring` data model, the Rust builder, and the cargo build driver. KDL is *one*
 // deserializer onto `Wiring` (see `parse`/`resolve` below); the builder is the other;
@@ -356,7 +358,7 @@ pub fn resolve(wiring: &Wiring, registry: &Registry) -> Result<Coordinator, Load
     // Registered BEFORE the edges pass so command edges can name it — its commands
     // reach a slot only over an explicit `connect "uplink" -> … msg="…"` edge (A2).
     if let Some(spec) = &wiring.uplink {
-        let handle = builder.add_uplink(TcpRecvTransport::new(spec.addr));
+        let handle = builder.add_async(UplinkSystem::new(TcpRecvTransport::new(spec.addr)));
         let desc = builder.descriptor_of(handle).clone();
         if instances
             .insert("uplink".to_string(), Instance { handle, desc })
@@ -417,10 +419,13 @@ pub fn resolve(wiring: &Wiring, registry: &Registry) -> Result<Coordinator, Load
 
     // --- Telemetry: registered last (observes every system's fresh output) ---
     if let Some(t) = &wiring.telemetry {
-        builder.add_telemetry(TelemetryConfig {
-            transport: TcpTransport::new(t.addr),
-            mode: mode_from_spec(&t.mode),
-        });
+        builder.add_cyclic_named(
+            "telemetry",
+            TelemetrySystem::new(TelemetryConfig {
+                transport: TcpTransport::new(t.addr),
+                mode: mode_from_spec(&t.mode),
+            }),
+        );
     }
 
     builder.build().map_err(wire_at_build)

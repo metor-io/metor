@@ -54,7 +54,7 @@ use crate::binder::{BindPorts, RingSource};
 use crate::descriptor::{Delivery, PortDecl, PortId};
 use crate::message::{CommandOut, split_record};
 use crate::registry::{AllOutputs, EntrySchema, RegistryEntry};
-use crate::system::{AsyncSystem, CyclicSystem, Out, System, SystemInput, SystemOutput};
+use crate::system::{AsyncSystem, BuildSystem, CyclicSystem, Out, System, SystemInput, SystemOutput};
 
 // ---------------------------------------------------------------------------
 // Transport (telemetry.md §7)
@@ -303,13 +303,89 @@ impl TelemetryMode {
     }
 }
 
-/// The telemetry downlink configuration handed to
-/// [`add_telemetry`](crate::CoordinatorBuilder::add_telemetry).
+/// The telemetry downlink configuration [`TelemetrySystem::new`] is constructed
+/// from. Programmatic users (and every mock-transport test) build one directly and
+/// register the system like any other:
+/// `builder.add_cyclic(TelemetrySystem::new(config))`.
 pub struct TelemetryConfig<T: Transport> {
     /// Where the snapshots go (TCP in v1, a mock in tests).
     pub transport: T,
     /// Which outputs to tap.
     pub mode: TelemetryMode,
+}
+
+/// The wiring params of the built-in TCP downlink (`type="TcpDownlink"`): the ground
+/// address plus an optional tap subset. Both lists absent ⇒ [`TelemetryMode::All`];
+/// either present ⇒ [`TelemetryMode::Subset`] (an entry matches if its instance *or*
+/// its frame/channel name is listed). Sequence params are child nodes
+/// (`docs/design-kdl-serde.md`):
+///
+/// ```kdl
+/// system "telemetry" type="TcpDownlink" addr="127.0.0.1:2240" {
+///     instances "nav" "imu"      // optional; omit both children to tap everything
+///     frames "gyro_b"
+/// }
+/// ```
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone)]
+pub struct DownlinkParams {
+    /// The TCP address of the ground/db endpoint the downlink streams to.
+    pub addr: std::net::SocketAddr,
+    /// Instance names to tap; `None` (with `frames` also `None`) taps everything.
+    #[serde(default)]
+    pub instances: Option<Vec<String>>,
+    /// Frame/channel names to tap.
+    #[serde(default)]
+    pub frames: Option<Vec<String>>,
+}
+
+impl DownlinkParams {
+    /// Project the two optional subset lists onto the runtime [`TelemetryMode`].
+    fn mode(&self) -> TelemetryMode {
+        match (&self.instances, &self.frames) {
+            (None, None) => TelemetryMode::All,
+            (instances, frames) => TelemetryMode::Subset {
+                instances: instances.clone().unwrap_or_default(),
+                frames: frames.clone().unwrap_or_default(),
+            },
+        }
+    }
+}
+
+/// The registry entry point of the built-in TCP downlink: data params in, lazy
+/// transport out ([`TcpTransport::new`] connects on first announce inside the async
+/// sender task, so nothing blocks here).
+impl BuildSystem for TelemetrySystem<TcpTransport> {
+    type Params = DownlinkParams;
+
+    fn new(params: DownlinkParams) -> Self {
+        let mode = params.mode();
+        Self::new(TelemetryConfig {
+            transport: TcpTransport::new(params.addr),
+            mode,
+        })
+    }
+}
+
+/// The wiring params of the built-in TCP uplink (`type="TcpUplink"`): the address of
+/// the metor-db broker whose command Msgs it subscribes to.
+///
+/// ```kdl
+/// system "uplink" type="TcpUplink" addr="127.0.0.1:2241"
+/// ```
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone, Copy)]
+pub struct UplinkParams {
+    /// The TCP address of the metor-db broker the uplink subscribes to.
+    pub addr: std::net::SocketAddr,
+}
+
+/// The registry entry point of the built-in TCP uplink ([`TcpRecvTransport::new`] is
+/// as lazy as the downlink's transport — it connects and subscribes on first `recv`).
+impl BuildSystem for UplinkSystem<TcpRecvTransport> {
+    type Params = UplinkParams;
+
+    fn new(params: UplinkParams) -> Self {
+        Self::new(TcpRecvTransport::new(params.addr))
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -697,7 +773,18 @@ struct Started {
 }
 
 /// The telemetry downlink system (telemetry.md §3). Generic over the [`Transport`]; the
-/// concrete `T` is chosen by the builder/loader (TCP) or a test (mock).
+/// concrete `T` is chosen by the wiring (TCP, `type="TcpDownlink"`) or a test (mock).
+/// An ordinary registry system: register it **after** every other cyclic system (its
+/// `ReceiveAll` capability is what `build()`'s ordering check keys on), or let the
+/// wiring resolver defer it there automatically.
+///
+/// **Init-time emit gap (B9)**: the downlink claims its read views in its own
+/// `init`, which runs *after* earlier-registered systems' `init`s — a frame or
+/// message a system emits during `init` is therefore **not** downlinked (the
+/// view starts at the live edge past it). Values that must reach the ground
+/// should be (re-)published from the first `execute`; the coordinator's own boot
+/// `SequenceRegistry` deliberately emits at the head of `run_for`, after every
+/// `init`, for exactly this reason.
 pub struct TelemetrySystem<T: Transport> {
     transport: Option<T>,
     mode: TelemetryMode,

@@ -13,8 +13,8 @@ use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
 
 use crate::{
     ClockMode, Coordinator, CoordinatorConfig, CyclicSystem, Input, Out, Output, PortRef, System,
-    SystemHealth, SystemInput, SystemOutput, TelemetryConfig, TelemetryMode, Transport,
-    TransportError,
+    SystemHealth, SystemInput, SystemOutput, TelemetryConfig, TelemetryMode, TelemetrySystem,
+    Transport, TransportError, UplinkSystem,
 };
 
 // ---------------------------------------------------------------------------
@@ -238,10 +238,10 @@ async fn telemetry_end_to_end_all() {
     let c = b.add_cyclic_named("consumer", Consumer);
     b.connect(PortRef::new::<Imu>(p), PortRef::new::<Imu>(c))
         .unwrap();
-    b.add_telemetry(TelemetryConfig {
+    b.add_cyclic(TelemetrySystem::new(TelemetryConfig {
         transport: mock,
         mode: TelemetryMode::All,
-    });
+    }));
     let mut coord = b.build().unwrap();
     // Only Table entries are announced (Postcard entries — the coordinator's
     // `sequences`/`commands` channels — are self-describing, no announce).
@@ -359,13 +359,13 @@ async fn subset_mode_filters() {
     let c = b.add_cyclic_named("consumer", Consumer);
     b.connect(PortRef::new::<Imu>(p), PortRef::new::<Imu>(c))
         .unwrap();
-    b.add_telemetry(TelemetryConfig {
+    b.add_cyclic(TelemetrySystem::new(TelemetryConfig {
         transport: mock,
         mode: TelemetryMode::Subset {
             instances: vec!["producer".to_string()],
             frames: Vec::new(),
         },
-    });
+    }));
     let mut coord = b.build().unwrap();
     coord.run_for(20).await;
 
@@ -402,10 +402,10 @@ async fn drop_policy_never_blocks_and_counts() {
 
     let mut b = Coordinator::builder(sim_config());
     b.add_cyclic_named("producer", Producer { n: 0.0 });
-    b.add_telemetry(TelemetryConfig {
+    b.add_cyclic(TelemetrySystem::new(TelemetryConfig {
         transport: mock,
         mode: TelemetryMode::All,
-    });
+    }));
     let mut coord = b.build().unwrap();
 
     // Tap the telemetry system's own health frame to observe its error counter.
@@ -659,13 +659,13 @@ async fn table_log_entry_downlinks_every_record() {
 
     let mut b = Coordinator::builder(sim_config());
     b.add_cyclic(BurstLogProducer { n: 0.0 });
-    b.add_telemetry(TelemetryConfig {
+    b.add_cyclic(TelemetrySystem::new(TelemetryConfig {
         transport: mock,
         mode: TelemetryMode::Subset {
             instances: Vec::new(),
             frames: vec!["imu".to_string()],
         },
-    });
+    }));
     let mut coord = b.build().unwrap();
     let cycles = 4;
     coord.run_for(cycles).await;
@@ -840,9 +840,9 @@ async fn uplink_routes_alarm_acks() {
     let seen = Rc::new(RefCell::new(Vec::new()));
     let mut b = Coordinator::builder(sim_config());
     let sink = b.add_cyclic(AckSink { seen: seen.clone() });
-    let uplink = b.add_uplink(MockRecv {
+    let uplink = b.add_async(UplinkSystem::new(MockRecv {
         queue: vec![garbage, good].into(),
-    });
+    }));
     b.connect(
         PortRef::msg::<AlarmAck>(uplink),
         PortRef::msg::<AlarmAck>(sink),
@@ -866,10 +866,10 @@ async fn uplink_routes_alarm_acks() {
 fn cyclic_after_receive_all_is_a_build_error() {
     let mut b = Coordinator::builder(sim_config());
     b.add_cyclic_named("producer", Producer { n: 0.0 });
-    b.add_telemetry(TelemetryConfig {
+    b.add_cyclic(TelemetrySystem::new(TelemetryConfig {
         transport: MockTransport::new(false),
         mode: TelemetryMode::All,
-    });
+    }));
     // A second producer (no inputs, so nothing else can fail first) after the downlink.
     b.add_cyclic_named("late", Producer { n: 0.0 });
     let err = b.build().err().expect("a late cyclic system fails the build");
@@ -910,4 +910,30 @@ fn uplink_command_ports_are_untelemetered() {
         descs[2].id,
         crate::PortId::Packet(metor_proto_wkt::AlarmAck::ID)
     );
+}
+
+/// `DownlinkParams`' two optional subset lists project onto `TelemetryMode` as
+/// documented: both absent taps everything; either present selects a subset with
+/// the missing list empty.
+#[test]
+fn downlink_params_mode_projection() {
+    let all = super::DownlinkParams {
+        addr: "127.0.0.1:2240".parse().unwrap(),
+        instances: None,
+        frames: None,
+    };
+    assert!(matches!(all.mode(), TelemetryMode::All));
+
+    let subset = super::DownlinkParams {
+        addr: "127.0.0.1:2240".parse().unwrap(),
+        instances: Some(vec!["nav".to_string()]),
+        frames: None,
+    };
+    match subset.mode() {
+        TelemetryMode::Subset { instances, frames } => {
+            assert_eq!(instances, vec!["nav".to_string()]);
+            assert!(frames.is_empty());
+        }
+        other => panic!("expected Subset, got {other:?}"),
+    }
 }
