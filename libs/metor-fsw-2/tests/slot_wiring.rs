@@ -107,6 +107,60 @@ fn slot_via_wiring_resolves_and_runs_to_done() {
     drop((coord, slot_view));
 }
 
+/// A `system "alarms"` node coexists with a slot — declared FIRST, deliberately:
+/// without the resolver's deferred-ReceiveAll pass, the slot (a cyclic,
+/// non-ReceiveAll registration after the alarm engine) fails `build()` with
+/// `ReceiveAllNotLast` (`docs/alarms.md` §7 F1). The alarm targets the slot's own
+/// host `SlotStatus.phase` frame and raises when the occupant completes
+/// (Done = 3 > 2.5) — slots are just telemetered components to the alarm engine.
+#[test]
+fn alarms_node_before_a_slot_still_builds_and_raises() {
+    let kdl = format!(
+        r#"
+coordinator cycle_rate=1000.0 sim_dt=0.000002
+artifact "waiter" crate="{FIXTURE_CRATE}" lib="{FIXTURE_STEM}" type="waiter"
+system "alarms" type="Alarms" {{
+    alarm id="SLOT_DONE" name="Slot Done" {{
+        target component="adcs.slot_status.phase"
+        warning above=2.5
+    }}
+}}
+slot "adcs" {{
+    allow occupant="waiter"
+    initial occupant="waiter" state="running"
+}}
+"#
+    );
+    let mut wiring = parse(&kdl).expect("parse the alarmed slot mission");
+    if let Err(e) = build_artifacts(&mut wiring, &BuildOptions::default()) {
+        eprintln!("skipping: build_artifacts failed: {e}");
+        return;
+    }
+
+    let coord = resolve(&wiring, &Registry::with_builtins())
+        .expect("the alarms node defers behind the slot (F1)");
+    let mut raised: metor_fsw_2::MsgIn<metor_fsw_2::metor_proto_wkt::AlarmRaised> =
+        metor_fsw_2::MsgIn::new(
+            coord
+                .registry()
+                .get(ComponentId::new("alarms.AlarmRaised"))
+                .expect("alarm raise channel registered")
+                .view()
+                .expect("a reader slot is available"),
+        );
+
+    let coord = stellarator::run(|| async move {
+        let mut coord = coord;
+        coord.run_for(6).await;
+        coord
+    });
+
+    let mut got = Vec::new();
+    raised.drain(|r| got.push(r.def_id));
+    assert_eq!(got, vec!["SLOT_DONE"], "the slot-phase alarm raised once");
+    drop(coord);
+}
+
 #[test]
 fn slot_declared_contract_mismatch_is_a_clean_error() {
     // `waiter` has no user inputs, so declaring `input frame="nonsense"` cannot match the

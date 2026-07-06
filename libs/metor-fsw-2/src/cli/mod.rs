@@ -12,9 +12,11 @@
 //! `adcs-fsw2` example) delegates to the same [`main`]. Only [`run`](cmd_run) enters the
 //! `stellarator` runtime, at the leaf — `build`/`package` are fully synchronous.
 //!
-//! The generic runner resolves against an **empty** [`Registry`](crate::wiring::Registry):
-//! it loads `dlopen`'d (`cdylib`) systems only, since a single prebuilt binary cannot link an
-//! arbitrary mission's statically-linked systems (a static mission keeps its own host).
+//! The generic runner resolves against the **built-ins**
+//! [`Registry`](crate::wiring::Registry) (`Registry::with_builtins()` — the framework's own
+//! static systems, e.g. `type="Alarms"`): beyond those it loads `dlopen`'d (`cdylib`) systems
+//! only, since a single prebuilt binary cannot link an arbitrary mission's statically-linked
+//! systems (a static mission keeps its own host, seeded from the same built-ins).
 
 use std::ffi::OsString;
 use std::net::{SocketAddr, TcpStream};
@@ -203,7 +205,7 @@ fn cmd_run(args: RunArgs) -> miette::Result<()> {
 
     let cycles = args.cycles.unwrap_or(usize::MAX);
     let total = args.cycles; // `Some(n)` ⇒ show `cycle n/total`; `None` ⇒ open-ended.
-    let mut coord = resolve(&wiring, &Registry::new())?;
+    let mut coord = resolve(&wiring, &Registry::with_builtins())?;
     let progress = coord.progress();
 
     // Enter the async runtime at the leaf; `run_for` does init → cycle loop → shutdown. A
