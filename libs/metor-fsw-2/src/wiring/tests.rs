@@ -450,6 +450,73 @@ system "alarms" type="Alarms" {
 }
 
 // ---------------------------------------------------------------------------
+// The TCP downlink/uplink built-ins: ordinary `system` nodes, not reserved words.
+// ---------------------------------------------------------------------------
+
+/// The built-in `type="TcpDownlink"` node is an ordinary system: declared FIRST, the
+/// resolver defers it behind every other cyclic registration (the same
+/// deferred-ReceiveAll pass the alarm engine rides, `docs/alarms.md` §7 F1) instead
+/// of failing `build()` with `ReceiveAllNotLast`.
+#[test]
+fn tcp_downlink_node_defers_and_loads() {
+    let kdl = r#"
+coordinator cycle_rate=100.0
+
+system "telemetry" type="TcpDownlink" addr="127.0.0.1:2298"
+system "imu" type="ImuDriver" i2c_bus=1 sample_hz=200.0
+"#;
+    let coord = load(kdl, &registry()).expect("load succeeds (downlink deferred)");
+    assert!(
+        coord
+            .registry()
+            .get(ComponentId::new("telemetry.health"))
+            .is_some(),
+        "the downlink registered under its instance name"
+    );
+}
+
+/// Two downlink instances are legal — reader-slot sizing counts one `ReceiveAll`
+/// per holder — and the optional subset lists deserialize through the ordinary
+/// params path (`instances` as a child sequence node).
+#[test]
+fn two_downlink_instances_with_subset_build() {
+    let kdl = r#"
+coordinator cycle_rate=100.0
+
+system "imu" type="ImuDriver" i2c_bus=1 sample_hz=200.0
+system "tlm_all" type="TcpDownlink" addr="127.0.0.1:2296"
+system "tlm_imu" type="TcpDownlink" addr="127.0.0.1:2297" {
+    instances "imu"
+}
+"#;
+    let coord = load(kdl, &registry()).expect("two downlinks build");
+    let registry = coord.registry();
+    assert!(registry.get(ComponentId::new("tlm_all.health")).is_some());
+    assert!(registry.get(ComponentId::new("tlm_imu.health")).is_some());
+}
+
+/// The built-in `type="TcpUplink"` node loads like any async system, under any
+/// instance name, and its command edges resolve by message name.
+#[test]
+fn tcp_uplink_node_loads_and_edges_resolve() {
+    let kdl = r#"
+coordinator cycle_rate=100.0
+
+system "ground" type="TcpUplink" addr="127.0.0.1:2295"
+system "alarms" type="Alarms" {
+    alarm id="OMEGA_HIGH" name="Omega High" {
+        target component="imu.imu.omega"
+        warning above=2.5
+    }
+}
+system "imu" type="ImuDriver" i2c_bus=1 sample_hz=200.0
+
+connect "ground" -> "alarms" msg="AlarmAck"
+"#;
+    load(kdl, &registry()).expect("uplink node loads and the ack edge resolves");
+}
+
+// ---------------------------------------------------------------------------
 // Instance-naming: two instances of one type → distinct handles + recorded names.
 // ---------------------------------------------------------------------------
 

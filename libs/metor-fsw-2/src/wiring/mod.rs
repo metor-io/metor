@@ -200,12 +200,16 @@ impl Registry {
     }
 
     /// The framework's built-in static systems, registered under their KDL `type=`
-    /// names — currently the alarm engine (`type="Alarms"`, `docs/alarms.md` §2).
+    /// names: the alarm engine (`type="Alarms"`, `docs/alarms.md` §2), the TCP
+    /// telemetry downlink (`type="TcpDownlink"`, telemetry.md §8), and the TCP
+    /// command uplink (`type="TcpUplink"`, `docs/messages.md` §4.4).
     /// The CLI runner resolves against this, so every `cli::main()` mission gets the
     /// built-ins with zero Rust; an app-built registry starts here and adds its own.
     pub fn with_builtins() -> Self {
         let mut r = Self::new();
         r.register::<crate::AlarmSystem, _>("Alarms");
+        r.register::<TelemetrySystem<TcpTransport>, _>("TcpDownlink");
+        r.register::<UplinkSystem<TcpRecvTransport>, _>("TcpUplink");
         r
     }
 
