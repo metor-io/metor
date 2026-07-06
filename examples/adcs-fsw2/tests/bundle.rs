@@ -48,7 +48,8 @@ fn bundle_round_trips_and_runs() {
         );
     }
 
-    // 3. Load the bundle back — cargo-free — and resolve it (dl-only, empty registry).
+    // 3. Load the bundle back — cargo-free — and resolve it (dl systems + the
+    //    built-in registry: the mission's `alarms` node is a framework static system).
     let loaded = load_bundle(&dir).expect("load the bundle");
     assert_eq!(loaded.artifacts.len(), wiring.artifacts.len());
     for artifact in &loaded.artifacts {
@@ -57,7 +58,7 @@ fn bundle_round_trips_and_runs() {
             "bundle artifact path points inside the bundle dir"
         );
     }
-    let mut coord = resolve(&loaded, &Registry::new()).expect("resolve the bundle");
+    let mut coord = resolve(&loaded, &Registry::with_builtins()).expect("resolve the bundle");
 
     // 4. The loaded mission has its three systems' outputs registered, and it steps.
     assert!(

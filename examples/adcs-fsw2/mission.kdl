@@ -51,6 +51,24 @@ system "plant" type="Plant" artifact="plant" init_angle=0.5 init_rate=0.15 meas_
 system "nav"   type="Nav"   artifact="nav"   meas_sigma=0.02
 system "ctrl"  type="Ctrl"  artifact="ctrl"  q_weight=5.0 r_weight=8.0
 
+// The alarm engine — a framework built-in (`type="Alarms"`, docs/alarms.md), an ordinary
+// system: it watches the measured body rate through the receive-all registry tap and
+// broadcasts the wkt alarm Msgs the panel's alarm view consumes (AlarmDef at boot,
+// AlarmRaised/AlarmCleared on debounced transitions). `gyro_b` is a nox tensor — ONE
+// shaped component — so `element=1` addresses body-Y. The boot tumble (init_rate=0.15
+// about [1,1,1] ⇒ ~0.087 rad/s per axis) raises the warning immediately; the controller's
+// detumble clears it. The thresholds double as the panel's plot limit lines.
+system "alarms" type="Alarms" {
+    alarm id="ADCS_RATE_HIGH" name="Body Rate High" {
+        description "Measured body-Y rate exceeds the detumbled envelope"
+        target component="plant.sensors.gyro_b" element=1
+        warning above=0.05 below=-0.05
+        critical above=0.15 below=-0.15
+        debounce 2
+        hysteresis 0.005
+    }
+}
+
 // The runtime sequence slot. Its `input`/`output` lines declare the port contract every
 // allowed occupant is validated against; `initial ... state="running"` auto-loads + starts
 // `commissioning` at the first cycle (so `metor-fsw run` shows it execute). The `mode_cmd`
@@ -82,3 +100,4 @@ connect "ctrl"  -> "plant" frame="torque_cmd" delayed=#true
 uplink { transport "tcp" addr="127.0.0.1:2241" }
 connect "uplink"      -> "mode" msg="SequenceCommand"   // ground commands
 connect "coordinator" -> "mode" msg="SequenceCommand"   // in-proc control_handle
+connect "uplink"      -> "alarms" msg="AlarmAck"        // operator acks (gate latching alarms)

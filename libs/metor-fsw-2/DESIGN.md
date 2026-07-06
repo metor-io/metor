@@ -484,5 +484,6 @@ of each subsystem:
 - `docs/sequences-slots.md` — runtime-loadable slots and the `#[sequence]` author surface.
 - `docs/messages.md` — the message channel (a second payload kind), the telemetry uplink/downlink of messages, and the `SequenceCommand` command plane.
 - `docs/message-wiring.md` — messages as first-class wired ports/edges (`MsgOut<M>`/`MsgIn<M>`, `msg=`/`connect_msg`), the `AllOutputs` receive-all capability, and the port-unification axes (schema × delivery × fan-in, plus the `PortConn` axis). The command-plane shape it originally designed is further reframed — see `docs/messages.md`'s status banner and `docs/design-command-slots.md` for what actually shipped (name-addressed commands, explicit per-slot edges, the uplink's multi-output `CommandOut` dispatch).
+- `docs/alarms.md` — the alarm engine: a shipped, ordinary system (`type="Alarms"`) evaluating KDL-declared limit alarms against any telemetered component and broadcasting the wkt alarm Msgs the panel consumes.
 </content>
 </invoke>

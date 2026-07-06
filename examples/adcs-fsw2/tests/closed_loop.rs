@@ -70,7 +70,7 @@ fn build_static() -> Coordinator {
         // plant/nav/ctrl: link statically via the Registry rather than dlopen.
         spec.artifact = None;
     }
-    let mut registry = Registry::new();
+    let mut registry = Registry::with_builtins();
     register_system!(&mut registry, PlantSystem => "Plant");
     register_system!(&mut registry, NavSystem => "Nav");
     register_system!(&mut registry, CtrlSystem => "Ctrl");

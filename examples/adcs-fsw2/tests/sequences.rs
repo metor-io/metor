@@ -56,7 +56,7 @@ fn build_mission(auto_run: bool) -> Option<Coordinator> {
             slot.initial = None;
         }
     }
-    Some(resolve(&wiring, &Registry::new()).expect("resolve the mission"))
+    Some(resolve(&wiring, &Registry::with_builtins()).expect("resolve the mission"))
 }
 
 /// Tap the slot's occupant `SequenceStatus` (`mode.sequence`) and its `ModeCmd` output
