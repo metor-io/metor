@@ -33,14 +33,14 @@ feature). The sync tests use only the `try_*` APIs + `std::thread`:
 - Attach geometry (R4): `attach_rejects_truncated`, `attach_rejects_bad_capacity`,
   `attach_rejects_oob_offsets`, `attach_rejects_misaligned`,
   `raw_attach_bad_region_rejected` (`TooSmall`).
-- The race coverage: `concurrent_full_stream` (backpressured plain read/write,
-  zero loss — the writer spins on `WouldBlock`, the reader drains; delivery is
-  exact and ordered), `concurrent_reader_churn` (the writer tolerates
-  `WouldBlock` from churning views — the mode's contract, not a failure).
+- The race coverage: `concurrent_full_stream` (the writer spins on
+  `WouldBlock` while the reader drains; delivery is exact and ordered),
+  `concurrent_reader_churn` (the writer tolerates `WouldBlock` from churning
+  views).
 - The slot-swap reclaim path: `swap_writer_and_reader_reacquire`,
-  `raw_attach_swap_reacquire` (drop a writer+view over a region, then re-acquire a
-  fresh pair — the Load→Stop→Load cycle a coordinator slot runs; checks reader-slot
-  free/reuse, writer-claim free/reuse, and the raw re-attach for provenance/leaks).
+  `raw_attach_swap_reacquire` (drop a writer and view over a region, then
+  re-acquire a fresh pair; checks reader-slot and writer-claim free/reuse, and
+  the raw re-attach for provenance and leaks).
 
 Loop bounds shrink under `cfg!(miri)`. Leak checking is on by default.
 
@@ -48,10 +48,10 @@ Loop bounds shrink under `cfg!(miri)`. Leak checking is on by default.
 > writer through relaxed per-byte atomics guarded by a seqlock reservation
 > (`reserved_end` + fence pair); its tests (`concurrent_overwrite_no_ub`,
 > `torn_read_rejected_by_reservation`, the mixed-size gap-lap tests Miri's store
-> buffer ICE'd on) went with the mode. The lossless-only ring has no
-> reader/writer byte race left for Miri's weak-memory emulation to explore —
-> the checked properties are provenance, the claim/slot handoffs, and the
-> publication handshake.
+> buffer ICE'd on) went with the mode. The current ring has no reader/writer
+> byte race left for Miri's weak-memory emulation to explore; the checked
+> properties are provenance, the claim/slot handoffs, and the publication
+> handshake.
 
 ## Running
 
