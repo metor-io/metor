@@ -1,9 +1,9 @@
 # Running Miri on the ring buffer
 
 `src/lib.rs` contains hand-written `unsafe`: atomics formed at fixed offsets over
-the shared region (`&AtomicU64` from a re-derived base pointer) and raw-pointer
-record writes/reads whose race-freedom rests on the in-use backpressure check
-plus the `committed` Release/Acquire publication handshake.
+the shared region (`&AtomicU64` from the backing's owning base pointer) and
+raw-pointer record writes/reads whose race-freedom rests on the in-use
+backpressure check plus the `committed` Release/Acquire publication handshake.
 [Miri](https://github.com/rust-lang/miri) checks this for data races,
 use-after-free, leaks, and provenance violations that `cargo test` cannot see.
 
@@ -87,15 +87,19 @@ cargo +nightly miri test -p metor-fsw-ring --lib --no-default-features \
 
 All four pass clean as of this writing. The i686 run also caught a real
 portability bug: `Box<[UnsafeCell<u64>]>` is only 4-byte aligned on i686, so
-`BoxBacking` now allocates `repr(align(8))` words.
+`Backing::heap` now allocates `repr(align(8))` words. With leak checking on
+(the default), that run also proves the backing `drop_fn`s reconstruct and
+free their allocations correctly.
 
 ## Why it is Miri-clean
 
-- **Interior mutability.** `BoxBacking` is `Box<[Word]>` where `Word` is a
-  `repr(C, align(8))` `UnsafeCell<u64>` (interior mutable + 8-byte aligned on
-  every target for the control/cursor atomics). Atomics and byte slices are
-  formed from a base pointer re-derived on every access, keeping provenance
-  whole-allocation wide.
+- **Interior mutability.** `Backing::heap` leaks a `Box<[Word]>` where `Word`
+  is a `repr(C, align(8))` `UnsafeCell<u64>` (interior mutable + 8-byte aligned
+  on every target for the control/cursor atomics). `Box::into_raw` hands over
+  the whole-allocation pointer — no live `Box` is retained — so every atomic
+  and byte slice derives from that one owning base pointer, and provenance
+  stays whole-allocation wide; the `drop_fn` reconstructs the box from the same
+  `(base, len)` to free it exactly once.
 - **No data races.** The writer never overwrites in-flight bytes (the in-use
   backpressure check **plus** the SeqCst registration handshake that makes a
   fresh claim visible to the writer's scan), so plain reads/writes are ordered by

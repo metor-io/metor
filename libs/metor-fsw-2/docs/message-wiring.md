@@ -84,13 +84,13 @@ makes **both** typed on one `M`:
 
 ```rust
 // src/message.rs — sketch
-pub struct MsgOut<M, B = BoxBacking, WD = NoWake, WS = NoWake> {
-    writer: Writer<B, WD, WS>,
+pub struct MsgOut<M, WD = NoWake, WS = NoWake> {
+    writer: Writer<WD, WS>,
     scratch: Vec<u8>,
     _m: PhantomData<fn() -> M>,
 }
 
-impl<M: Msg, B: Backing, WD: WakeSource, WS: WakeSink> MsgOut<M, B, WD, WS> {
+impl<M: Msg, WD: WakeSource, WS: WakeSink> MsgOut<M, WD, WS> {
     /// Emit one `M`: write `M::ID` then postcard(M) as one record. No per-call generic —
     /// the port carries exactly one Msg type, so the edge can be keyed on `M::ID`.
     pub fn emit(&mut self, msg: &M) -> Result<(), WriteError> { /* as today, M fixed */ }
@@ -211,7 +211,7 @@ struct NavOut {
 
 `descriptors()` yields `[Frame(nav_solution…), Message(nav_event…)]`; `bind()` pops one ring
 each in field order. The positional binder (`src/binder.rs:78-225`) is unchanged: a message
-ring is an ordinary `RingBuffer<BoxBacking>`, so `next_output`/`next_input` hand it over and
+ring is an ordinary `RingBuffer`, so `next_output`/`next_input` hand it over and
 `MsgOut::bind`/`MsgIn::bind` wrap it. This is the crux of the design — **messages ride the
 existing bundle/descriptor/binder machinery verbatim once the port types satisfy the port
 contract.**
@@ -310,7 +310,7 @@ trait RingSource {
     // … next_output / next_input unchanged (frame ports) …
     /// Pop every producer ring wired to the next (message) input port. `Vec::new()` is a
     /// legal, unconnected message input (reads nothing). Frame ports never call this.
-    fn next_input_fanin<RD, RS>(&mut self) -> Vec<(RingBuffer<Self::B>, RD, RS)> { … }
+    fn next_input_fanin<RD, RS>(&mut self) -> Vec<(RingBuffer, RD, RS)> { … }
 }
 ```
 
@@ -502,8 +502,8 @@ registries):
 
 ```rust
 struct UplinkPorts { commands: MsgOut<SequenceCommand>, subscribe: Vec<PacketId> }
-impl BindPorts<BoxBacking> for UplinkPorts {
-    fn bind<S: RingSource<B = BoxBacking>>(src: &mut S) -> Self {
+impl BindPorts for UplinkPorts {
+    fn bind<S: RingSource>(src: &mut S) -> Self {
         Self { commands: MsgOut::bind(src), subscribe: src.out_msg_ids() }
     }
 }

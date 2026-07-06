@@ -4,6 +4,13 @@
 > attribute macro + cyclic API ergonomics"), `macros/` (crate `metor-fsw-2-macros`). Landed
 > BEFORE port unification, per this doc's own recommended order (§9). `docs/system.md` §7 and
 > `docs/sequences-slots.md` §4.1 reflect the shipped authoring surface.
+>
+> **Since superseded in part** — the §3.5/§7.4 backing-generic injection (the hidden
+> `__B: Backing` and the port-type rewrite, including §6's generic expansion) was later
+> removed with the backing erasure (commit `eb7f4019`): rings are backing-erased, bundles
+> and impls are non-generic, and `#[sequence]` now rejects generic parameters on the fn
+> outright. See `docs/erase-backing-plan.md` and `docs/dl-open.md` §"The backing-erased system stack" for the current shape;
+> the body below is kept as history.
 
 Status: **design** (2026-07-02). Companion to `docs/review-findings.md` §4 and the
 in-flight `docs/design-port-unification.md` (§9 states exactly which emitted pieces

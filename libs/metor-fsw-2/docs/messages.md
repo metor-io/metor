@@ -163,14 +163,14 @@ both `SequenceRegistry` and `SequenceChannelEvent` on one channel). It writes an
 ```rust
 /// One owned message output: the single `Writer` into a byte ring carrying
 /// `(PacketId, postcard)` records. Type-erased — accepts any `Msg` — unlike the
-/// per-frame `Output<F>` (src/port.rs). Backing-generic so a (future) dl occupant binds
-/// the same port over `RawBacking` (§6).
-pub struct MsgOut<B = BoxBacking, WD = NoWake, WS = NoWake> {
-    writer: Writer<B, WD, WS>,
+/// per-frame `Output<F>` (src/port.rs). Rings are backing-erased, so the same
+/// port type serves a (future) dl occupant binding over a raw attach (§6).
+pub struct MsgOut<WD = NoWake, WS = NoWake> {
+    writer: Writer<WD, WS>,
     scratch: Vec<u8>,             // reused encode buffer (no per-emit malloc)
 }
 
-impl<B: Backing, WD: WakeSource, WS: WakeSink> MsgOut<B, WD, WS> {
+impl<WD: WakeSource, WS: WakeSink> MsgOut<WD, WS> {
     /// Serialize `msg` (id prefix + postcard) into the reused scratch and write it as
     /// one ring record. Variable length — sizing is a heuristic, not `F::MAX_SIZE` (§2).
     pub fn emit<M: Msg>(&mut self, msg: &M) -> Result<(), WriteError> {
@@ -218,13 +218,13 @@ one message type it consumes:
 /// records, decoding each to `M`. The decode twin of `MsgOut` (`src/message.rs`) and the
 /// message analogue of `Input<F>` — but typed over one `M` (a reader knows what it consumes),
 /// where the emit port is erased (one channel carries many Msg types).
-pub struct MsgIn<M, B = BoxBacking> {
-    view: View<B, NoWake, NoWake>,
+pub struct MsgIn<M> {
+    view: View<NoWake, NoWake>,
     scratch: Vec<u8>,                 // reused decode buffer
     _marker: PhantomData<M>,
 }
 
-impl<M: Msg + DeserializeOwned, B: Backing> MsgIn<M, B> {
+impl<M: Msg + DeserializeOwned> MsgIn<M> {
     /// Drain every record since the last call, decoding each to `M` (records whose id is
     /// not `M::ID` are skipped — a command channel carries only `M`, but the filter keeps
     /// it total). Every-record, never coalesced — a command stream cannot drop. A lapped
@@ -244,7 +244,7 @@ per command channel (§4.3).
 
 ### 2.1 Allocation & sizing
 
-A message ring is an ordinary (lossless) `RingBuffer<BoxBacking>`, allocated by
+A message ring is an ordinary (lossless) heap-backed `RingBuffer`, allocated by
 the coordinator at `build()` alongside the output rings (`src/coordinator/mod.rs:842-867`). The
 only new wrinkle is **sizing**: records are variable, so there is no `capacity_for(F::MAX_SIZE,
 depth)`. The heuristic:
@@ -274,7 +274,7 @@ ring (Q3):
 pub struct MessageEntry {
     pub instance: Arc<str>,                       // owning system instance (subset filtering)
     pub channel: Arc<str>,                        // the message-channel name (telemetry id)
-    pub(crate) ring: RingBuffer<BoxBacking>,      // view()-only, slot-accounted (registry.rs:47)
+    pub(crate) ring: RingBuffer,                  // view()-only, slot-accounted (registry.rs:47)
 }
 pub struct MessageRegistry { entries: Vec<MessageEntry>, /* by_key */ }
 ```
@@ -617,7 +617,7 @@ needs a field added to `SequenceStatus` (future work).
 ## 6. ABI impact
 
 **None.** The sequence messages are produced entirely host-side by the `SlotRunner`/coordinator
-over `BoxBacking` rings (§5); the command plane is host-side too — the uplink is an ordinary
+over host-owned heap rings (§5); the command plane is host-side too — the uplink is an ordinary
 host-side `AsyncSystem` (§4.4) and the command bus is a host-side message-channel drain (§4.3);
 the occupant, `fsw_*`, and `FSW_ABI_VERSION` are untouched. The redesign is wholly FSW-side: it
 deletes the `SlotCommand` Frame, the `channel_map` translation, and the `UplinkLauncher`/`MsgInbox`
@@ -625,8 +625,9 @@ plumbing, and adds `MsgIn` + a `"commands"` channel — no ABI, no wire, no occu
 
 *If occupant-side emit were ever chosen (deferred):* a message ring is just bytes, so it needs
 **no new ABI symbol** — it appears as one more `FswRing` (a byte ring, role OUTPUT) in the
-occupant's output array, bound by the existing `RawBinder` (`src/abi/mod.rs:359`) as a
-`MsgOut<RawBacking>`. The `#[sequence]` descriptor would gain one output port. §5.1 makes this
+occupant's output array, bound by the existing `RawBinder` (`src/abi/mod.rs:359`) as an
+ordinary `MsgOut` (rings are backing-erased — the occupant's port type is the host's). The
+`#[sequence]` descriptor would gain one output port. §5.1 makes this
 unnecessary for the stated feature.
 
 ---

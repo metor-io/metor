@@ -20,8 +20,9 @@ ports are reconstructed*.
 
 The implementation is split across:
 
-- `metor-fsw-ring` — `RawBacking` and `RingBuffer::attach_raw`, the non-owning ring
-  attachment the system side reconstructs over a host region.
+- `metor-fsw-ring` — the erased `Backing` (`Backing::raw` is its non-owning constructor)
+  and `RingBuffer::attach_raw`, the non-owning ring attachment the system side
+  reconstructs over a host region.
 - `src/abi/mod.rs` — the C-ABI **contract both halves compile against**: the `repr(C)`
   handles (`FswRing`, `FswStatus`), the serialized descriptor mirrors (`PortDescMsg`,
   `SystemDescriptorMsg`), the `SYM_*` symbol-name constants, the `RawBinder`, and the
@@ -64,10 +65,10 @@ boundary is drawn precisely where the type disappears already.
   that forwards `init`/`step`/`shutdown` across the C ABI by passing **raw ring handles**
   (base pointer + length + role). It never reconstructs `Output<F>`/`Input<F>`.
 - **System side (the `cdylib`):** a one-line `export_system!` macro generates the C-ABI
-  entry points. Inside them the `.so` reconstructs a `RingBuffer<RawBacking>` over each host
-  region, walks its port bundle positionally (the standard bind contract, over raw regions),
-  and runs an ordinary `CyclicRunner<S, O, RawBacking>` — the **same host driver type**, just
-  monomorphized over a non-owning backing.
+  entry points. Inside them the `.so` reconstructs a `RingBuffer` over each host region
+  (a non-owning attach), walks its port bundle positionally (the standard bind contract,
+  over raw regions), and runs an ordinary `CyclicRunner<S, O>` — the **same host driver
+  type**, the identical monomorphic code.
 
 The only Rust values that cross the ABI are **serialized bytes** (the descriptor, the
 postcard params blob) and **`repr(C)` handles** (`FswRing`, the timestamp word, function
@@ -85,10 +86,12 @@ Three properties of the existing machinery carry the whole design:
    the host's `base` pointer sees the identical atomics the host's other systems do** — no
    copy, no IPC.
 
-2. **The typed ports are already `Backing`-generic.** `Output<F, B, …>` / `Input<F, B, …>`
-   take the ring backing as a type parameter and their read/write methods work for any `B`.
-   What the dlopen path adds is making the *bundles* and the *bind path* generic over `B` too
-   (below), so a system can hold `Output<F, RawBacking>` views into the host's regions.
+2. **Rings are backing-erased.** A `RingBuffer` carries one concrete
+   `Backing { base, len, ctx, drop_fn }` value; how a region is owned (heap, mmap, or a
+   non-owning attach) is a runtime constructor choice, not a type. `Output<F, …>` /
+   `Input<F, …>` therefore never know or care where their ring's bytes live — the same
+   port types, bundles, and bind path serve a host-allocated ring and a `.so`'s
+   non-owning view into the host's regions (below).
 
 3. **The host already deals in erased descriptors.** `PortDesc`/`SystemDescriptor` are how
    the coordinator sizes, allocates, and validates a system *without constructing it*. The
@@ -96,46 +99,46 @@ Three properties of the existing machinery carry the whole design:
    leaning on the fact that the payload a `PortDesc` carries — a `metor_proto::vtable::VTable`
    — already derives `Serialize`/`Deserialize`/`postcard_schema::Schema`.
 
-### `RawBacking` and `attach_raw`
+### `Backing::raw` and `attach_raw`
 
-`RawBacking` (in `metor-fsw-ring`) is a `Backing` impl holding a host-provided region it does
-**not** own: a `(base, len)` pair the caller asserts valid and stable, whose `Drop` frees
-nothing. `RingBuffer::<RawBacking>::attach_raw(base, len)` validates the region header (via
-`read_header`, including the arch tag) and builds a working ring over it — the same path the
-mmap attachment uses, with the mapping step removed. Same-process, this is called directly
-over the host ring's `RingBuffer::region()` `(base, len)`. Its safety contract: the named
-region is a live, header-valid ring that outlives every `Writer`/`View` produced from it and
-is not concurrently torn down.
+`Backing` (in `metor-fsw-ring`) is one concrete struct — `{ base, len, ctx, drop_fn }` —
+whose constructors pick the ownership at runtime: `Backing::heap` (a leaked `Box<[Word]>`
+the `drop_fn` reconstructs and frees), the feature-gated `Backing::mmap` (a boxed `MmapMut`
+behind `ctx`), and `unsafe Backing::raw(base, len)` — a host-provided region the ring does
+**not** own, `drop_fn: None`, so `Drop` frees nothing. `Backing::raw` is the dlopen attach:
+`RingBuffer::attach_raw(base, len)` wraps it, validating the region header (via
+`read_header`, including the arch tag) and building a working ring over it — the same path
+the mmap attachment uses (`unsafe RingBuffer::attach(backing)`, also the public door for
+custom `Backing::from_raw_parts` regions), with the mapping step removed. Same-process,
+this is called directly over the host ring's `RingBuffer::region()` `(base, len)`. Its
+safety contract: the named region is a live, header-valid ring that outlives every
+`Writer`/`View` produced from it and is not concurrently torn down.
 
-### The `Backing`-generic system stack
+### The backing-erased system stack
 
-Because a dlopen'd cyclic system holds `Input<F, RawBacking>` / `Output<F, RawBacking>` views
-into the host's regions, the system traits, the bundles, and the bind path all parameterize
-over the backing `B`:
+Because the backing is an erased runtime value, nothing above the ring is generic in it:
+**one monomorphic bind path serves the host (heap rings) and the `.so` (non-owning attaches
+via `RingBuffer::attach_raw`)**.
 
-- **Traits carry a defaulted backing param.** `trait System<B: Backing = BoxBacking>` and
-  `trait CyclicSystem<B: Backing = BoxBacking>: System<B>`, with
-  `type Input: BindPorts<B>` / `type Output: BindPorts<B>`. A system author writes
-  `impl<B: Backing> System<B> for Foo` and `impl<B: Backing> CyclicSystem<B> for Foo`. Static
-  call sites resolve `B = BoxBacking` through the default, so the host path stays
-  source-compatible.
-- **Bundles are generic.** The author writes
-  `#[derive(SystemInput)] struct FooIn<B: Backing = BoxBacking> { tick: Input<TickIn, B> }`
-  and the matching `SystemOutput` struct. The host instantiates them at `BoxBacking`; the
-  `.so` instantiates them at `RawBacking`.
-- **Bind is abstracted over a `RingSource`.** `trait BindPorts<B: Backing>` has
-  `fn bind<S: RingSource<B = B>>(src: &mut S) -> Self`, and a `RingSource` yields the next
-  ring (plus its wake endpoints) for an output or an input in `descriptors()` order. The
-  host's `Binder` impls `RingSource<B = BoxBacking>` over its pre-allocated `BoundPort`s; the
-  `.so`'s `RawBinder` impls `RingSource<B = RawBacking>` by popping the next `FswRing` and
-  `attach_raw`-ing it. `RingSource` also carries a provided `output_registry` that panics by
-  default and is overridden only by the host `Binder` (the telemetry downlink needs it; a
-  dlopen'd system is never the downlink, so its `RawBinder` uses the default).
-- **`CyclicRunner<S, O, B>`** threads the backing. The host instantiates
-  `CyclicRunner<_, _, BoxBacking>`, the `.so` `CyclicRunner<_, _, RawBacking>` — the
-  health / timing logic is reused verbatim. `dyn CyclicSlot` stays
-  backing-free: a host slot is a `CyclicRunner<…, BoxBacking>`, a dlopen'd slot is a `DlSlot`
-  that forwards across the ABI, so no `B` leaks into the trait object.
+- **Traits are plain.** `trait System` and `trait CyclicSystem: System`, with
+  `type Input: BindPorts` / `type Output: BindPorts`. A system author writes
+  `impl System for Foo` and `impl CyclicSystem for Foo` — the only spelling; the same
+  impl serves the static build and the `cdylib`.
+- **Bundles are plain structs.** The author writes
+  `#[derive(SystemInput)] struct FooIn { tick: Input<TickIn> }` and the matching
+  `SystemOutput` struct. The host and the `.so` bind the identical types.
+- **Bind is abstracted over a `RingSource`.** `trait BindPorts: Sized` has
+  `fn bind<S: RingSource>(src: &mut S) -> Self`, and a `RingSource` yields the next plain
+  `RingBuffer` (plus its wake endpoints) for an output or an input in `descriptors()`
+  order. The host's `Binder` is a `RingSource` over its pre-allocated `BoundPort`s; the
+  `.so`'s `RawBinder` is a `RingSource` that pops the next `FswRing` and `attach_raw`s it.
+  `RingSource` also carries a provided `output_registry` that panics by default and is
+  overridden only by the host `Binder` (the telemetry downlink needs it; a dlopen'd system
+  is never the downlink, so its `RawBinder` uses the default).
+- **`CyclicRunner<S, O>`** is the one driver type on both sides — the health / timing logic
+  is reused verbatim, and each dl bundle compiles **once**, not once per backing.
+  `dyn CyclicSlot` is unchanged: a host slot is a `CyclicRunner`, a dlopen'd slot is a
+  `DlSlot` that forwards across the ABI.
 
 ---
 
@@ -185,8 +188,8 @@ back into a ring:
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct FswRing {
-    pub base: *mut u8, // region base — the host ring's Backing::base()
-    pub len:  usize,   // region length — the host ring's Backing::len()
+    pub base: *mut u8, // region base — the host ring's RingBuffer::region().0
+    pub len:  usize,   // region length — the host ring's RingBuffer::region().1
     pub role: u8,      // ROLE_INPUT (0) or ROLE_OUTPUT (1)
 }
 pub const ROLE_INPUT:  u8 = 0; // the system registers a read-only View
@@ -332,7 +335,7 @@ struct AbiState<S> {
   construction panics.
 - **`run_bind_init<S, O>(state, inputs, n_in, outputs, n_out)`** builds a `RawBinder` over the
   handle arrays, binds `S::Input` and `S::Output` through it (the positional `descriptors()`
-  walk over `attach_raw`), assembles a `CyclicRunner<S, O, RawBacking>`, and runs its `init`.
+  walk over `attach_raw`), assembles a `CyclicRunner<S, O>`, and runs its `init`.
   Bind and init are fused into one call because both need the bound bundles and both run
   exactly once. A caught panic leaves the runner unbound, so the next `execute` reports
   `Panicked`.
@@ -344,7 +347,8 @@ struct AbiState<S> {
 - **`run_shutdown<S>(state)`** runs `System::shutdown` once; a poisoned/unbound state is a
   no-op.
 - **`run_destroy<S>(state)`** drops the boxed state inside the `.so`, running the user system's
-  `Drop` and every `RawBacking` port's `Drop`. Idempotent on null.
+  `Drop` and every port's `Drop` (the non-owning backings free nothing — the host still owns
+  the regions). Idempotent on null.
 - **`run_describe<S>(sink, ctx) -> i32`** lowers and postcard-encodes the descriptor as above,
   returning `0` on success and `-1` if anything panics.
 
@@ -354,8 +358,8 @@ crosses the `extern "C"` boundary**.
 
 ### `export_system!`
 
-A system author writes an ordinary `impl CyclicSystem` (over a generic backing) and adds one
-line to their `cdylib` crate:
+A system author writes an ordinary `impl CyclicSystem` and adds one line to their `cdylib`
+crate:
 
 ```rust
 // crate-type = ["cdylib"] in Cargo.toml
@@ -443,8 +447,9 @@ params and captures the handle arrays. Then:
   catches it) and is reported back via the status word; the host's status-frame machinery
   consumes it the same way it consumes a static runner's `SlotState`. A `Panicked` slot is
   telemetered through the coordinator status frame. A permanent stop runs `fsw_destroy`
-  **immediately** (not at teardown): dropping the `.so`'s `RawBacking` ports releases its
-  reader slots, so on lossless rings a dead consumer cannot backpressure upstream producers.
+  **immediately** (not at teardown): dropping the `.so`'s ports releases its reader slots
+  (their attaches are non-owning, so nothing else is freed), so on lossless rings a dead
+  consumer cannot backpressure upstream producers.
   `state` is nulled, so the eventual `Drop` is a no-op.
 - **`shutdown`** calls `fsw_shutdown`.
 - **`Drop`** calls `fsw_destroy`.
@@ -453,10 +458,10 @@ The host's per-cycle loop is **unchanged**.
 
 ### Teardown ordering
 
-`DlSlot::Drop` calls `fsw_destroy` (dropping the `.so`'s `RawBacking` ports and the user
+`DlSlot::Drop` calls `fsw_destroy` (dropping the `.so`'s non-owning ports and the user
 system) **before** the `Arc<Library>` field drops (so no `.so` code runs after the library
 unloads) and **before** the host ring table frees the regions (the coordinator drops its
-`cyclic` slot vec before its `rings` field). So no `RawBacking` ever outlives its region, and
+`cyclic` slot vec before its `rings` field). So no non-owning attach ever outlives its region, and
 all destructors run in the code that defined them. `state` is nulled after destroy, so a
 double-drop is a no-op.
 
@@ -670,7 +675,7 @@ dlopen across a stable Rust ABI is the genuinely hard part; the containment rule
   the host `ByteSink` and frees its own buffer. No `Vec`/`Box` is ever freed across the
   boundary.
 - **`Drop` correctness.** Because the runner (and therefore the user system and every
-  `RawBacking` port) is dropped by `fsw_destroy` inside the `.so`, all destructors run in the
+  non-owning port) is dropped by `fsw_destroy` inside the `.so`, all destructors run in the
   code that defined them. The teardown ordering (above) guarantees `fsw_destroy` runs before
   the library unloads and before the host frees the ring regions.
 - **No Rust types by value.** Only serialized bytes and `repr(C)` structs cross — which removes
@@ -712,11 +717,12 @@ and the ring leave the seams open for them.
   task woken by a shared-memory wake word (the ring reserves `OFF_WAKE_WORD` / `FLAG_WAKE_SHARED`
   for this) in place of `fsw_execute`.
 - **Separate-process systems.** The model is in-process: the `.so` reconstructs rings directly
-  over the host's `BoxBacking` regions via `attach_raw`, so the `FswRing` handle is a bare
+  over the host's heap regions via `attach_raw`, so the `FswRing` handle is a bare
   `(base, len, role)`. A cross-process variant would keep the same ports and the same
-  reconstruction logic but back each ring with an `MmapBacking` the peer attaches, replacing the
-  raw pointer in `FswRing` with a region identifier (a path or fd) — a backing swap, not a
-  redesign. It would also need process supervision (spawn, health-driven restart, crash-slot
+  reconstruction logic but back each ring with an mmap region (`Backing::mmap`, via
+  `RingBuffer::create_mmap`/`attach_mmap`) the peer attaches, replacing the raw pointer in
+  `FswRing` with a region identifier (a path or fd) — a constructor swap on the erased
+  backing, not a redesign. It would also need process supervision (spawn, health-driven restart, crash-slot
   reclamation), which is its own work.
 - **Cross-process wake.** The shared-memory wake handshake (`OFF_WAKE_WORD` / `FLAG_WAKE_SHARED`)
   the ring reserves is unimplemented; it is the prerequisite for async cross-process systems.

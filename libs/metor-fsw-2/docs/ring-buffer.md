@@ -47,8 +47,8 @@ analysis predates this removal and describes the two-mode design.
 
 ## 2. Memory layout
 
-One contiguous region (`BoxBacking`, `MmapBacking`, or a borrowed `RawBacking`),
-four logical zones: a **header** (immutable after creation), a **control block**
+One contiguous region (heap-allocated, mmap'd, or borrowed — all carried by the
+one erased `Backing` struct, §10), four logical zones: a **header** (immutable after creation), a **control block**
 (the live writer atomics), a **reader-cursor table** (a fixed array of slots),
 and the **data region**. Multi-byte fields are stored in **native byte order**;
 the `arch_tag` handshake (below) rejects regions written by a different pointer
@@ -60,10 +60,10 @@ sharing.
 
 - **In the region (shared):** the header, the control-block atomics, the
   reader-cursor table, and the data bytes. Addressed only by fixed offset.
-- **In the process-local handle (never shared):** the mapping base pointer
-  (`Backing`), the cached `capacity`/`mask`/`max_readers`/offsets, the
+- **In the process-local handle (never shared):** the region's base pointer and
+  drop fn (`Backing`), the cached `capacity`/`mask`/`max_readers`/offsets, the
   reader-slot *index* a `View` holds, and the async `WakeSource`/`WakeSink`.
-  These are reconstructed on attach (`from_validated` reads the geometry back out
+  These are reconstructed on attach (`attach` reads the geometry back out
   of the header), never stored in the region.
 
 ### Header (cache line 0, bytes `0x00..0x40`)
@@ -440,57 +440,64 @@ pub struct Config {
     pub max_readers: usize, // reader-table slots (over-provision; see §11)
 }
 
-pub unsafe trait Backing: Send + Sync {
-    fn base(&self) -> *mut u8;     // re-derived on every access
-    fn len(&self) -> usize;
-    fn is_empty(&self) -> bool { self.len() == 0 }
+pub struct Backing { /* base, len, ctx, drop_fn — owned, type-erased region storage */ }
+
+impl Backing {
+    pub fn heap(size: usize) -> Self;   // zeroed leaked Box<[Word]>; Drop frees it
+    /// # Safety: `base..base+len` satisfies the region contract (§10), outlives
+    /// every Writer/View produced over it, and is not concurrently torn down.
+    pub unsafe fn raw(base: *mut u8, len: usize) -> Self;   // non-owning: drop_fn None
+    /// # Safety: if Some, `drop_fn` must be sound to call exactly once, from any
+    /// thread, with exactly `(ctx, base, len)` — the only release of those resources.
+    pub unsafe fn from_raw_parts(base: *mut u8, len: usize, ctx: *mut (),
+        drop_fn: Option<unsafe fn(*mut (), *mut u8, usize)>) -> Self;
+    pub fn base(&self) -> *mut u8;
+    pub fn len(&self) -> usize;
+    pub fn is_empty(&self) -> bool;
 }
 
-pub struct RingBuffer<B: Backing> { /* Arc<Inner<B>>: backing + cached geometry */ }
+pub struct RingBuffer { /* Arc<Inner>: backing + cached geometry; Clone */ }
 
-impl RingBuffer<BoxBacking> {
+impl RingBuffer {
     pub fn create_in_memory(cfg: Config) -> Self;            // zeroes + writes header
-}
-#[cfg(feature = "mmap")]
-impl RingBuffer<MmapBacking> {
+    #[cfg(feature = "mmap")]
     pub fn create_mmap(path: &Path, cfg: Config) -> std::io::Result<Self>;
     /// # Safety: caller asserts `path` is a compatible region, not being torn down.
+    #[cfg(feature = "mmap")]
     pub unsafe fn attach_mmap(path: &Path) -> std::io::Result<Self>;
-}
-impl RingBuffer<RawBacking> {
     /// # Safety: `base..base+len` is a live, header-valid region outliving all
     /// writers/views produced from it and not torn down concurrently.
     pub unsafe fn attach_raw(base: *mut u8, len: usize) -> Result<Self, AttachError>;
-}
-
-impl<B: Backing> RingBuffer<B> {
+    /// # Safety: `backing`'s region is live and not concurrently torn down; the
+    /// door for custom `Backing::from_raw_parts` regions (shared attach tail).
+    pub unsafe fn attach(backing: Backing) -> Result<Self, AttachError>;
     pub fn region(&self) -> (*mut u8, usize);   // hand the bytes to a second handle
     pub fn committed(&self) -> u64;
     pub fn reader_count(&self) -> usize;
     pub fn writer<WD: WakeSource, WS: WakeSink>(&self, data: WD, space: WS)
-        -> Result<Writer<B, WD, WS>, WriterClaimed>;   // claims the in-region writer word
+        -> Result<Writer<WD, WS>, WriterClaimed>;   // claims the in-region writer word
     /// # Safety: the claiming writer no longer exists (crashed/leaked).
     pub unsafe fn force_release_writer(&self);
     pub fn view<RD: WakeSink, RS: WakeSource>(&self, data: RD, space: RS)
-        -> Result<View<B, RD, RS>, FullReaderTable>;
+        -> Result<View<RD, RS>, FullReaderTable>;
 }
 
-impl<B, WD: WakeSource, WS: WakeSink> Writer<B, WD, WS> {
+impl<WD: WakeSource, WS: WakeSink> Writer<WD, WS> {
     pub fn try_write(&mut self, bytes: &[u8]) -> Result<(), WriteError>;
     pub async fn write(&mut self, bytes: &[u8]) -> Result<(), WriteError>;
 }
 
-impl<B, RD: WakeSink, RS: WakeSource> View<B, RD, RS> {
+impl<RD: WakeSink, RS: WakeSource> View<RD, RS> {
     pub fn cursor(&self) -> u64;
     pub fn committed(&self) -> u64;
-    pub fn try_read(&mut self) -> Result<Option<ReadGrant<'_, B, RS>>, ReadError>;
-    pub async fn read(&mut self) -> Result<ReadGrant<'_, B, RS>, ReadError>;
-    pub fn try_latest(&mut self) -> Result<Option<ReadGrant<'_, B, RS>>, ReadError>;
+    pub fn try_read(&mut self) -> Result<Option<ReadGrant<'_, RS>>, ReadError>;
+    pub async fn read(&mut self) -> Result<ReadGrant<'_, RS>, ReadError>;
+    pub fn try_latest(&mut self) -> Result<Option<ReadGrant<'_, RS>>, ReadError>;
     pub fn try_read_into(&mut self, buf: &mut Vec<u8>) -> Result<bool, ReadError>;
     pub async fn read_into(&mut self, buf: &mut Vec<u8>) -> Result<(), ReadError>;
 }
 
-pub struct ReadGrant<'a, B: Backing, RS: WakeSource> { /* Deref<Target = [u8]> */ }
+pub struct ReadGrant<'a, RS: WakeSource> { /* Deref<Target = [u8]> */ }
 
 pub enum WriteError  { InsufficientCapacity, WouldBlock }
 pub enum ReadError   { Corrupt }
@@ -517,37 +524,70 @@ at least 8 bytes (one record header) or `max_readers` is zero.
 
 ## 10. Backing storage
 
-`Backing` is an `unsafe trait`: an implementor guarantees `base()` returns a
-pointer to a single allocation of at least `len()` bytes that is interior-mutable,
-8-byte aligned, and stable for the lifetime of `self`. The ring forms
-`&AtomicU64` references and plain byte slices over this region, re-deriving
-the pointer from `base()` on every access to keep provenance whole-allocation
-wide.
+`Backing` is one concrete struct — an owned, type-erased `(base, len)` byte
+range plus the destructor that releases it (`ctx: *mut ()` and `drop_fn:
+Option<unsafe fn(*mut (), *mut u8, usize)>`). The backing kinds differ **only**
+in how they drop, so a drop fn pointer replaces what used to be a `Backing`
+trait with per-kind impls (`BoxBacking`/`MmapBacking`/`RawBacking`) — and with
+it, the `B: Backing` generic that threaded through `RingBuffer`, `Writer`,
+`View`, `ReadGrant`, and every fsw-2 port type above them.
 
-- **`BoxBacking`** — in-process, heap-backed `Box<[Word]>` where `Word` is a
-  `repr(C, align(8))` `UnsafeCell<u64>`: interior-mutable (sound to write
-  through, Miri-clean) and 8-byte aligned on every target for the
-  control/cursor atomics (`u64` alone is only 4-aligned on i686). Default for
-  in-process use and tests.
-- **`MmapBacking`** (behind the `mmap` feature) — a `memmap2::MmapMut`,
-  page-aligned and cross-process capable.
-- **`RawBacking`** — a non-owning `(base, len)` over a region someone else owns
-  (the host's backing, or another process's mmap). Its `Drop` frees nothing; the
-  region's own atomics carry all synchronization. This is the same-process
-  dlopen path: the host calls `region()` to read out `(base, len)` and a dlopen'd
-  system reconstructs a ring over the very same bytes via `attach_raw`.
+**The region contract.** Every constructor asserts (and all the ring's `unsafe`
+relies on) that `base..base+len` is a single allocation that is
+interior-mutable (writes through `*mut` derived from `base` are sound), 8-byte
+aligned, and stable for the backing's lifetime. The ring forms `&AtomicU64`
+references and plain byte slices over this region, deriving every access
+pointer from `base` — captured **once** at construction — so provenance stays
+whole-allocation wide.
+
+The constructors:
+
+- **`Backing::heap(size)`** — in-process: a zeroed, leaked `Box<[Word]>` where
+  `Word` is a `repr(C, align(8))` `UnsafeCell<u64>`: interior-mutable (sound to
+  write through, Miri-clean) and 8-byte aligned on every target for the
+  control/cursor atomics (`u64` alone is only 4-aligned on i686).
+  `Box::into_raw` hands over the whole-allocation pointer and its provenance —
+  no live `Box` is retained, so there is no per-access re-derivation from an
+  owning `Box` (the old design's provenance dance). The `drop_fn` reconstructs
+  the box via `Box::from_raw(slice_from_raw_parts_mut(base as *mut Word,
+  len/8))` and frees it. Default for in-process use and tests.
+- **`unsafe Backing::raw(base, len)`** — non-owning, over a region someone else
+  owns (the host's backing, or another process's mmap): `drop_fn` is `None`, so
+  dropping it frees nothing; the region's own atomics carry all
+  synchronization. This is the same-process dlopen path: the host calls
+  `region()` to read out `(base, len)` and a dlopen'd system reconstructs a
+  ring over the very same bytes via `attach_raw`.
+- **`Backing::mmap(map)`** (crate-internal, behind the `mmap` feature) — a
+  `memmap2::MmapMut`, page-aligned and cross-process capable. The map is boxed
+  behind `ctx`; the `drop_fn` drops that box, unmapping via `MmapMut`'s own
+  `Drop`.
+- **`unsafe Backing::from_raw_parts(base, len, ctx, drop_fn)`** — the open
+  extension point for custom regions (a static arena, a foreign allocator, …),
+  paired with `unsafe RingBuffer::attach(backing)`. Its safety contract: the
+  region contract holds for the backing's whole lifetime, and if `drop_fn` is
+  `Some` it must be sound to call **exactly once, from any thread**, with
+  exactly `(ctx, base, len)` — that call being the only release of the
+  resources they name.
+
+**Send/Sync.** A `Backing` is `!Send + !Sync` by construction (raw pointers);
+one consolidated `unsafe impl Send/Sync for Backing` carries the promise the
+ring upholds through its own synchronization: region bytes are only ever
+touched through atomics or the `committed` Release/Acquire handshake, and the
+constructor contracts make `drop_fn` callable from whichever thread drops the
+last handle. `Inner` (and with it `RingBuffer`) is then auto-`Send + Sync` —
+its other fields are plain integers.
 
 `create_*` lays out the region (`init_region`) and writes the header
 single-threaded before any handle is published. `attach_mmap` / `attach_raw`
-validate the header (`read_header`) and read the geometry back out of the region
-rather than from arguments (`from_validated`), returning `AttachError` on
-mismatch. Validation is exhaustive, in checked `u64` arithmetic so a hostile
-header cannot overflow its way past a bound:
+funnel into `attach`, which validates the header (`read_header`) and reads the
+geometry back out of the region rather than from arguments, returning
+`AttachError` on mismatch. Validation is exhaustive, in checked `u64`
+arithmetic so a hostile header cannot overflow its way past a bound:
 
 1. `region_len >= HEADER_SIZE` → `TooSmall` (shared path, so a sub-header mmap
    of a truncated file is rejected before any header read).
-2. `attach_raw` base pointer 8-byte aligned → `Misaligned` (mmap/Box backings
-   are aligned by construction).
+2. `attach_raw` base pointer 8-byte aligned → `Misaligned` (the heap/mmap
+   backings are aligned by construction).
 3. Magic / version / `arch_tag` → `BadMagic` / `BadVersion` / `ArchMismatch`.
 4. `capacity` a power of two, `>= 8` (one record header — `read_len`'s bounds
    contract), and `<= usize::MAX` (a 32-bit target attaching a 64-bit-sized
@@ -603,7 +643,7 @@ read; it is reserved for crash-slot reclamation (§14).
 
 The unsafe core follows the `libs/db` Miri strategy (`libs/db/MIRI.md`;
 mirrored in this crate's `MIRI.md`): the synchronous tests use only the `try_*`
-APIs over a `BoxBacking` (`UnsafeCell`) with `std::thread`, and pass under Miri
+APIs over a heap backing (`UnsafeCell` words) with `std::thread`, and pass under Miri
 including Tree Borrows, many-seeds interleavings, and a 32-bit
 (`i686-unknown-linux-gnu`) target run that executes the length-overflow
 path. `concurrent_full_stream` exercises the backpressured zero-loss path
@@ -627,7 +667,7 @@ live in `ring/src/tests.rs`; see `MIRI.md` for how to run.
 | Read model | Borrowed `&[u8]` | Borrowed `ReadGrant` (derefs to `[u8]`), plus copy conveniences and the `try_latest` pin |
 | Reader registry | Heap Treiber list of `Arc<ReadNode>` | Fixed slot array, claimed by CAS, addressed by index |
 | Internal references | `Arc`/`Box`/`AtomicPtr` (process-local) | Relative offsets only; no pointers in the region |
-| Backing | `Box<[UnsafeCell<u8>]>` only | `Backing` trait: `Box`, `mmap`, or borrowed `Raw` |
+| Backing | `Box<[UnsafeCell<u8>]>` only | one erased `Backing` struct: heap, mmap, or borrowed raw (drop-fn is the only difference) |
 | Cross-process | No | Yes (single mapped region, same layout both sides) |
 | Record framing | caller's responsibility | `[len u32][pad u32][payload][tail pad]`, 8-byte aligned |
 | Writer serialization | In-region `Mutex` (`write_lock`) | Single writer, enforced by the in-region `writer_claim` CAS (no lock) |
@@ -640,9 +680,9 @@ live in `ring/src/tests.rs`; see `MIRI.md` for how to run.
   (consistent with the `metor-fsw-*` family; the `-2` is a workspace-path
   detail). `edition = "2024"`, `version.workspace`/`repository.workspace`,
   matching `libs/db`.
-- **Features:** `mmap` (memmap2, already in tree via `libs/db`) gates
-  `MmapBacking`; `async` gates the `stellarator`-backed `Notifier`. The in-memory
-  `BoxBacking` path and the `try_*` APIs need neither.
+- **Features:** `mmap` (memmap2, already in tree via `libs/db`) gates the mmap
+  backing (`create_mmap`/`attach_mmap`); `async` gates the `stellarator`-backed
+  `Notifier`. The in-memory heap path and the `try_*` APIs need neither.
 - The ring is byte-oriented: framing of `metor-proto` tables is a layer above it,
   so the crate has no `metor-proto` dependency. Keeping it standalone keeps the
   unsafe shared-memory core small and independently Miri-testable, and reusable

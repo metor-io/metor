@@ -61,7 +61,7 @@ RegistryEntry
   schema:      EntrySchema    // Table { frame_id, vtable, metadata } | Postcard   (§6)
   delivery:    Delivery       // Snapshot | Log — how a broad reader should drain this entry
   telemetered: bool           // does the downlink / AllOutputs tap this entry (§3)
-  ring:        RingBuffer<BoxBacking>  // crate-private read source; reached only via view()
+  ring:        RingBuffer     // crate-private read source; reached only via view()
 ```
 
 **One registry, both payload kinds.** The registry indexes every tappable buffer — component
@@ -123,7 +123,7 @@ broad or dynamic access** where the consumer does not know the producer at compi
 the same underlying rings; the registry never bypasses or duplicates a typed edge, it offers a by-id
 read path over the same ring table.
 
-Registry access is host-only: `AllOutputs::bind` is implemented for `B = BoxBacking` only — a
+Registry access is host-only: only the host `Binder` carries a registry — a
 non-host `RingSource`'s default `registry()` panics rather than fabricate an empty one (system.md
 §5.4). The telemetry downlink is never dlopen'd.
 

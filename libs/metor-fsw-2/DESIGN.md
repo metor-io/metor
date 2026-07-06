@@ -123,9 +123,9 @@ A system encapsulates one piece of functionality. Every system implements the sh
 a wiring `NAME`, and the once-each `init`/`shutdown` lifecycle hooks:
 
 ```rust
-pub trait System<B: Backing = BoxBacking> {
-    type Input: SystemInput + BindPorts<B>;
-    type Output: SystemOutput + BindPorts<B>;
+pub trait System {
+    type Input: SystemInput + BindPorts;
+    type Output: SystemOutput + BindPorts;
     const NAME: &'static str;
     fn init(&mut self, output: &mut Self::Output) {}
     fn shutdown(&mut self, output: &mut Self::Output) {}
@@ -147,7 +147,7 @@ exactly one of two leaf traits expressing how the system is driven:
   read from private buffers the coordinator mirrors upstream records into (see below).
 
 ```rust
-pub trait CyclicSystem<B: Backing = BoxBacking>: System<B> {
+pub trait CyclicSystem: System {
     fn execute(&mut self, now: Timestamp, input: &mut Self::Input, output: &mut Self::Output);
 }
 ```
