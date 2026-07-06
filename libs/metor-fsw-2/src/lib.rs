@@ -90,7 +90,7 @@ pub use port::{DEFAULT_DEPTH, FrameRef, Input, Output, buffer_capacity, capacity
 
 // The alarm engine: config surface + the limit-alarm evaluation system
 // (`docs/alarms.md`).
-pub use alarm::{AlarmSpec, AlarmsParams, BandSpec, TargetSpec};
+pub use alarm::{AlarmIn, AlarmOut, AlarmSpec, AlarmSystem, AlarmsParams, BandSpec, TargetSpec};
 
 // The general message channel — the `(PacketId, postcard)` record format, the
 // type-erased emit port, and its sizing/record helpers (`docs/messages.md` §1, §2).
