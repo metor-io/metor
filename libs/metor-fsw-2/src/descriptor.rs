@@ -427,7 +427,10 @@ pub fn compatible(producer: &PortDesc, consumer: &PortDesc) -> bool {
 #[cfg(test)]
 mod tests {
     use metor_proto::types::{Msg, Timestamp};
-    use metor_proto_wkt::{SequenceChannelEvent, SequenceCommand, SequenceRegistry};
+    use metor_proto_wkt::{
+        AlarmAck, AlarmCleared, AlarmDef, AlarmRaised, SequenceChannelEvent, SequenceCommand,
+        SequenceRegistry,
+    };
     use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
 
     use super::*;
@@ -529,5 +532,9 @@ mod tests {
             <SequenceChannelEvent as NamedMsg>::NAME,
             "SequenceChannelEvent"
         );
+        assert_eq!(<AlarmDef as NamedMsg>::NAME, "AlarmDef");
+        assert_eq!(<AlarmRaised as NamedMsg>::NAME, "AlarmRaised");
+        assert_eq!(<AlarmCleared as NamedMsg>::NAME, "AlarmCleared");
+        assert_eq!(<AlarmAck as NamedMsg>::NAME, "AlarmAck");
     }
 }
