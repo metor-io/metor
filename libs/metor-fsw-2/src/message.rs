@@ -18,7 +18,10 @@ use core::marker::PhantomData;
 
 use metor_fsw_ring::{NoWake, View, WakeSink, WakeSource, WriteError, Writer};
 use metor_proto::types::{Msg, PacketId};
-use metor_proto_wkt::{ReloadSequences, SequenceChannelEvent, SequenceCommand, SequenceRegistry};
+use metor_proto_wkt::{
+    AlarmAck, AlarmCleared, AlarmDef, AlarmRaised, ReloadSequences, SequenceChannelEvent,
+    SequenceCommand, SequenceRegistry,
+};
 use serde::de::DeserializeOwned;
 
 use crate::binder::RingSource;
@@ -51,6 +54,18 @@ impl NamedMsg for SequenceChannelEvent {
 }
 impl NamedMsg for ReloadSequences {
     const NAME: &'static str = "ReloadSequences";
+}
+impl NamedMsg for AlarmDef {
+    const NAME: &'static str = "AlarmDef";
+}
+impl NamedMsg for AlarmRaised {
+    const NAME: &'static str = "AlarmRaised";
+}
+impl NamedMsg for AlarmCleared {
+    const NAME: &'static str = "AlarmCleared";
+}
+impl NamedMsg for AlarmAck {
+    const NAME: &'static str = "AlarmAck";
 }
 
 /// Default worst-case message payload size, the [`Frame::MAX_SIZE`](crate::Frame)
