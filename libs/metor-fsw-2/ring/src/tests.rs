@@ -8,6 +8,12 @@
 
 use super::*;
 
+// Region offsets of the header fields the corruption tests scribble on
+// (`RegionHeader` sits at region offset 0).
+const OFF_CAPACITY: usize = core::mem::offset_of!(RegionHeader, capacity);
+const OFF_DATA_OFFSET: usize = core::mem::offset_of!(RegionHeader, data_offset);
+const OFF_READER_TABLE_OFFSET: usize = core::mem::offset_of!(RegionHeader, reader_table_offset);
+
 fn ring(capacity: usize, max_readers: usize) -> RingBuffer {
     RingBuffer::create_in_memory(Config {
         capacity,

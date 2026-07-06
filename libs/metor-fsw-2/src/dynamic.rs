@@ -26,6 +26,22 @@ pub struct Slot {
     pub byte_len: u32,
 }
 
+/// The 8-byte `{ key_off, key_len }` prefix of a map entry (frames.md §3.3):
+/// a table-absolute offset into the key pool and the key's byte length.
+/// Stored native-endian like every other frame field — the format is de facto
+/// little-endian (`Slot` is written by `patch_slot` and read back native by
+/// `Slot::read_from_prefix`, identical on every supported target; the ring's
+/// `arch_tag` rejects cross-endian producers, and metor-proto's vtable
+/// interpreter reads these fields as LE).
+#[repr(C)]
+#[derive(Clone, Copy, Debug, IntoBytes, Immutable, KnownLayout, FromBytes)]
+pub(crate) struct MapEntryHeader {
+    pub key_off: u32,
+    pub key_len: u32,
+}
+
+const _: () = assert!(size_of::<MapEntryHeader>() == 8);
+
 /// Round `n` up to a multiple of `a` (a power of two).
 pub(crate) const fn align_up(n: usize, a: usize) -> usize {
     (n + a - 1) & !(a - 1)
@@ -51,7 +67,7 @@ pub(crate) const fn entry_align<V>() -> usize {
 
 /// Byte offset of the value sub-frame within a map entry `{ key_off, key_len, value }`.
 pub(crate) const fn map_value_offset<V>() -> u32 {
-    align_up(8, entry_align::<V>()) as u32
+    align_up(size_of::<MapEntryHeader>(), entry_align::<V>()) as u32
 }
 
 /// Byte stride of one map entry (entry array element).

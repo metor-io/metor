@@ -14,7 +14,7 @@ use core::mem::size_of;
 use metor_proto::types::LenPacket;
 use zerocopy::{Immutable, IntoBytes};
 
-use crate::dynamic::{map_stride, map_value_offset};
+use crate::dynamic::{MapEntryHeader, Slot, map_stride, map_value_offset};
 use crate::frame::Frame;
 
 /// Bytes start of the table within a `LenPacket::table` (4-byte length + 1 ty +
@@ -119,8 +119,12 @@ impl<F: Frame + IntoBytes + Immutable> FrameWriter<F> {
             let kb = key.as_bytes();
             let vb = val.as_bytes();
             entry.fill(0);
-            entry[0..4].copy_from_slice(&(key_cursor as u32).to_le_bytes());
-            entry[4..8].copy_from_slice(&(kb.len() as u32).to_le_bytes());
+            MapEntryHeader {
+                key_off: key_cursor as u32,
+                key_len: kb.len() as u32,
+            }
+            .write_to_prefix(&mut entry)
+            .expect("stride >= size_of::<MapEntryHeader>()");
             entry[value_offset..value_offset + vb.len()].copy_from_slice(vb);
             self.packet.extend_from_slice(&entry);
             pool.extend_from_slice(kb);
@@ -155,8 +159,12 @@ impl<F: Frame + IntoBytes + Immutable> FrameWriter<F> {
 
     fn patch_slot(&mut self, slot_off: usize, trailer_off: u32, byte_len: u32) {
         let at = self.base + slot_off;
-        self.packet.inner[at..at + 4].copy_from_slice(&trailer_off.to_le_bytes());
-        self.packet.inner[at + 4..at + 8].copy_from_slice(&byte_len.to_le_bytes());
+        Slot {
+            trailer_off,
+            byte_len,
+        }
+        .write_to(&mut self.packet.inner[at..at + size_of::<Slot>()])
+        .expect("slot lies inside the fixed region");
     }
 }
 

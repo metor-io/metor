@@ -11,7 +11,7 @@ use core::mem::size_of;
 
 use zerocopy::FromBytes;
 
-use crate::dynamic::{Slot, map_stride, map_value_offset};
+use crate::dynamic::{MapEntryHeader, Slot, map_stride, map_value_offset};
 
 /// Reads list elements of type `T` out of a table trailer.
 pub struct ListReader<'a, T> {
@@ -88,11 +88,9 @@ impl<'a, V: FromBytes> MapReader<'a, V> {
         }
         let stride = map_stride::<V>() as usize;
         let entry_base = self.slot.trailer_off as usize + i * stride;
-        let key_off = u32::from_le_bytes(self.table.get(entry_base..entry_base + 4)?.try_into().ok()?)
-            as usize;
-        let key_len =
-            u32::from_le_bytes(self.table.get(entry_base + 4..entry_base + 8)?.try_into().ok()?)
-                as usize;
+        let (hdr, _) = MapEntryHeader::read_from_prefix(self.table.get(entry_base..)?).ok()?;
+        let key_off = hdr.key_off as usize;
+        let key_len = hdr.key_len as usize;
         let key = core::str::from_utf8(self.table.get(key_off..key_off + key_len)?).ok()?;
         let value_off = entry_base + map_value_offset::<V>() as usize;
         let value = V::read_from_bytes(self.table.get(value_off..value_off + size_of::<V>())?).ok()?;
