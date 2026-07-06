@@ -15,6 +15,14 @@ item below is a refinement, not a redesign. They are ordered roughly by impact.
 
 ## 1. There is no home for app-specific *host* logic — alarms forced this
 
+> **RESOLVED (2026-07-05, `libs/metor-fsw-2/docs/alarms.md`):** the recommended generic
+> `AlarmSystem` shipped as a framework built-in (`system "alarms" type="Alarms"`), and this
+> mission now declares an `ADCS_RATE_HIGH` alarm in `mission.kdl`. The design differs from
+> the sketch below where the framework moved underneath it: the bespoke `alarm_out()` /
+> `message_out(channel)` capabilities (§2) were obsoleted by the wiring-parity work — a
+> telemetered `MsgOut<AlarmRaised>` is now just an ordinary output-bundle port — and the
+> config is ordinary serde-KDL system params, not a `Wiring.alarms` top-level node.
+
 The most consequential finding, and the reason **alarms were descoped** from this pass.
 
 cube-sat declares an `AlarmDef` and raises/clears `AlarmRaised`/`AlarmCleared` with a

@@ -563,7 +563,10 @@ a slow reader is a backpressure/drop condition, never a stop. `CyclicRunner` als
 implements `CyclicSlot`, the object-safe trait the coordinator uses to hold a heterogeneous
 `Vec<Box<dyn CyclicSlot>>` and drive every system with one shared per-cycle timestamp.
 
-Fault management beyond this telemetry is out of scope.
+Fault management beyond this telemetry is not the system layer's concern — but the health
+frames are ordinary telemetered components, so the shipped alarm engine can watch them like
+anything else (`alarm … target component="nav.health.errors" critical above=0.5`); see
+`docs/alarms.md`.
 
 ---
 

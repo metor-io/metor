@@ -1,5 +1,13 @@
 # Implementation plan — alarms
 
+> **Status: COMPLETE (2026-07-05).** All six waves landed in order, one commit each.
+> Deviations from the plan as written: target resolution moved from the first execute to
+> `init` (with `AllOutputs` in the **output** bundle, the downlink's Q9 shape) so cycle-1
+> records already evaluate — only the def broadcast waits for the first execute (B9); and
+> the W3 tests surfaced the two target-addressing realizations (shaped nox tensors take
+> `element=`; primitive arrays flatten to dotted per-element components), recorded in
+> `docs/alarms.md` §3.
+
 Design: `docs/alarms.md` (approved 2026-07-05; decisions locked — AllOutputs targeting, ack +
 latching in v1, domain alarms descoped). Summary of what we build: a shipped **`AlarmSystem`**
 (an ordinary `CyclicSystem`, `src/alarm/`) that evaluates KDL-declared limit alarms against any

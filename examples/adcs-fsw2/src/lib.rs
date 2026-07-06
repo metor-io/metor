@@ -41,5 +41,5 @@ const MISSION_KDL: &str = include_str!("../mission.kdl");
 pub fn build_sim_coordinator() -> anyhow::Result<Coordinator> {
     let mut wiring = parse(MISSION_KDL)?;
     build_artifacts(&mut wiring, &BuildOptions::default())?;
-    Ok(resolve(&wiring, &Registry::new())?)
+    Ok(resolve(&wiring, &Registry::with_builtins())?)
 }

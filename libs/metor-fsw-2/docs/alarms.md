@@ -1,7 +1,8 @@
 # Alarms (`alarms`)
 
-> **Status: DESIGN — pending review.** Companion plan: `docs/alarms-plan.md` (to be written
-> after this document is reviewed). Nothing here is implemented yet.
+> **Status: IMPLEMENTED (2026-07-05).** Landed as `docs/alarms-plan.md` waves W1–W6:
+> `src/alarm/` (params + eval + system), the uplink `AlarmAck` route, the built-in registry
+> + deferred-ReceiveAll resolve pass (§7 F1), and the adcs-fsw2 `ADCS_RATE_HIGH` example.
 
 The framework has no alarm/FDIR story (`system.md` §4 closes with "fault management beyond
 this telemetry is out of scope"). The panel already has a complete one: an `AlarmStore` state
