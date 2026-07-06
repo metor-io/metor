@@ -279,6 +279,374 @@ fn spec_defaults() {
     assert_eq!(s.severity, Severity::Critical);
 }
 
+// ---------------------------------------------------------------------------
+// The system, end to end (coordinator-built, registry-observed)
+// ---------------------------------------------------------------------------
+
+#[cfg(not(miri))]
+mod system {
+    use metor_proto::types::{ComponentId, Timestamp};
+    use metor_proto_wkt::{AlarmAck, AlarmCleared, AlarmDef, AlarmRaised, LimitKind, Severity};
+    use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
+
+    use crate::{
+        AlarmSystem, AlarmsParams, BuildSystem, ClockMode, CommandOut, Coordinator,
+        CoordinatorConfig, CyclicSystem, MsgIn, Out, Output, PortRef, System, SystemHealth,
+        SystemInput, SystemOutput,
+    };
+
+    use super::super::{AlarmSpec, BandSpec, RawAlarmSpec, TargetSpec};
+
+    #[derive(crate::Frame, IntoBytes, Immutable, KnownLayout, FromBytes)]
+    #[repr(C)]
+    #[metor_fsw(name = "gyro")]
+    struct Gyro {
+        #[metor_fsw(timestamp)]
+        timestamp: Timestamp,
+        rates: [f64; 3],
+    }
+
+    #[derive(crate::Frame, IntoBytes, Immutable, KnownLayout, FromBytes)]
+    #[repr(C)]
+    #[metor_fsw(name = "status")]
+    struct Status {
+        #[metor_fsw(timestamp)]
+        timestamp: Timestamp,
+        // Flags ride as u8 — `bool` has invalid bit patterns, so it can't be a
+        // zerocopy frame field. `as_f64` makes it alarmable all the same.
+        degraded: u8,
+        _pad: [u8; 7],
+    }
+
+    #[derive(SystemInput)]
+    struct NoIn {}
+
+    /// Emits one scripted `rates[1]` sample per cycle (the last value repeats), and
+    /// mirrors `degraded = rate > 10.0` on a second frame for the bool-target test.
+    struct Plant {
+        script: Vec<f64>,
+        cycle: usize,
+    }
+
+    #[derive(SystemOutput)]
+    struct PlantOut {
+        gyro: Output<Gyro>,
+        status: Output<Status>,
+    }
+
+    impl System for Plant {
+        type Input = NoIn;
+        type Output = Out<PlantOut>;
+        const NAME: &'static str = "plant";
+    }
+
+    impl CyclicSystem for Plant {
+        fn execute(&mut self, now: Timestamp, _in: &mut NoIn, o: &mut Self::Output) {
+            let v = self.script[self.cycle.min(self.script.len() - 1)];
+            self.cycle += 1;
+            o.gyro.publish(&Gyro {
+                timestamp: now,
+                rates: [0.0, v, 0.0],
+            });
+            o.status.publish(&Status {
+                timestamp: now,
+                degraded: (v > 10.0) as u8,
+                _pad: [0; 7],
+            });
+        }
+    }
+
+    /// Acks every raise it sees, `delay` cycles after first sighting — the panel's
+    /// side of the latch loop, wired as ordinary message edges both ways.
+    struct Acker {
+        delay: usize,
+        pending: Vec<(AlarmRaised, usize)>,
+    }
+
+    #[derive(SystemInput)]
+    struct AckerIn {
+        raised: MsgIn<AlarmRaised>,
+    }
+
+    #[derive(SystemOutput)]
+    struct AckerOut {
+        acks: CommandOut<AlarmAck>,
+    }
+
+    impl System for Acker {
+        type Input = AckerIn;
+        type Output = Out<AckerOut>;
+        const NAME: &'static str = "acker";
+    }
+
+    impl CyclicSystem for Acker {
+        fn execute(&mut self, _now: Timestamp, input: &mut AckerIn, o: &mut Self::Output) {
+            let pending = &mut self.pending;
+            input.raised.drain(|r| pending.push((r, 0)));
+            for (raised, age) in &mut self.pending {
+                *age += 1;
+                if *age == self.delay {
+                    o.acks.publish(&AlarmAck {
+                        def_id: raised.def_id.clone(),
+                        occurrence: raised.occurrence,
+                        operator: "test".into(),
+                        note: None,
+                    });
+                }
+            }
+        }
+    }
+
+    fn config() -> CoordinatorConfig {
+        CoordinatorConfig {
+            cycle_rate: 1000.0,
+            clock: ClockMode::Wall,
+            // Zero slack makes the reader budget a structural assertion: the alarm
+            // system must claim exactly ONE view per watched entry (its ReceiveAll
+            // budgets one slot per ring), or `build`-time sizing is exceeded and
+            // the alarm reports `alarms.reader_slot` instead of raising.
+            reader_slack: 0,
+            ..CoordinatorConfig::default()
+        }
+    }
+
+    fn alarm(id: &str, component: &str, element: Option<usize>) -> RawAlarmSpec {
+        RawAlarmSpec {
+            id: id.into(),
+            name: id.into(),
+            description: String::new(),
+            target: TargetSpec {
+                component: component.into(),
+                element,
+            },
+            warning: Some(BandSpec {
+                above: Some(0.5),
+                below: None,
+            }),
+            critical: Some(BandSpec {
+                above: Some(1.0),
+                below: None,
+            }),
+            debounce: Some(2),
+            hysteresis: Some(0.1),
+            latching: None,
+            severity: None,
+        }
+    }
+
+    fn params(specs: Vec<RawAlarmSpec>) -> AlarmsParams {
+        AlarmsParams {
+            alarm: specs
+                .into_iter()
+                .map(|r| AlarmSpec::try_from(r).expect("valid spec"))
+                .collect(),
+        }
+    }
+
+    /// Claim a decoding view on one of the alarm system's message outputs, BEFORE
+    /// `run_for` (a view starts at the live edge).
+    fn tap<M: metor_proto::types::Msg + serde::de::DeserializeOwned>(
+        coord: &Coordinator,
+        key: &str,
+    ) -> MsgIn<M> {
+        let registry = coord.registry();
+        let entry = registry
+            .get(ComponentId::new(key))
+            .unwrap_or_else(|| panic!("registry entry `{key}`"));
+        MsgIn::new(entry.view().expect("reader slot"))
+    }
+
+    /// The headline path: def at the first cycle, a debounced warning raise, an
+    /// escalation to critical on the SAME occurrence, a hysteresis dead-zone hold,
+    /// and a debounced clear — while a second alarm on the same frame (sharing the
+    /// one watch view — reader_slack is 0) stays silent.
+    #[stellarator::test]
+    async fn end_to_end_raise_escalate_clear() {
+        let mut b = Coordinator::builder(config());
+        let script = vec![0.7, 0.7, 1.5, 0.45, 0.3, 0.3];
+        let cycles = script.len();
+        b.add_cyclic(Plant { script, cycle: 0 });
+        // `[f64; 3]` flattens to per-element components (`rates.0/.1/.2`) — the
+        // dotted path IS the element address (a shaped nox tensor would instead
+        // take `element=`; `docs/alarms.md` §3).
+        b.add_cyclic(AlarmSystem::new(params(vec![
+            alarm("RATE_HIGH", "plant.gyro.rates.1", None),
+            alarm("RATE_X", "plant.gyro.rates.0", None), // same frame, never breaches
+        ])));
+        let coord = b.build().unwrap();
+
+        let mut defs = tap::<AlarmDef>(&coord, "alarms.AlarmDef");
+        let mut raised = tap::<AlarmRaised>(&coord, "alarms.AlarmRaised");
+        let mut cleared = tap::<AlarmCleared>(&coord, "alarms.AlarmCleared");
+
+        let mut coord = coord;
+        coord.run_for(cycles).await;
+
+        // Both defs broadcast; thresholds are the display limits.
+        let mut got_defs = Vec::new();
+        defs.drain(|d| got_defs.push(d));
+        assert_eq!(got_defs.len(), 2);
+        let def = got_defs.iter().find(|d| d.id == "RATE_HIGH").unwrap();
+        assert_eq!(def.default_severity, Severity::Warning);
+        let target = def.target.as_ref().unwrap();
+        assert_eq!(target.component_id, ComponentId::new("plant.gyro.rates.1"));
+        assert_eq!(target.element_index, None);
+        assert_eq!(def.limits.len(), 2);
+        assert!(def.limits.iter().all(|l| l.kind == LimitKind::Upper));
+        assert!(
+            def.limits
+                .iter()
+                .any(|l| l.value == 0.5 && l.severity == Severity::Warning)
+        );
+        assert!(
+            def.limits
+                .iter()
+                .any(|l| l.value == 1.0 && l.severity == Severity::Critical)
+        );
+
+        // Cycle 2 raises at warning (debounce 2), cycle 3 escalates in place.
+        let mut got_raised = Vec::new();
+        raised.drain(|r| got_raised.push(r));
+        assert_eq!(got_raised.len(), 2, "{got_raised:?}");
+        assert!(got_raised.iter().all(|r| r.def_id == "RATE_HIGH"));
+        assert_eq!(got_raised[0].severity, Severity::Warning);
+        assert_eq!(got_raised[0].value, Some(0.7));
+        assert_eq!(got_raised[0].message, "plant.gyro.rates.1 = 0.7000");
+        assert_eq!(got_raised[1].severity, Severity::Critical);
+        assert_eq!(got_raised[1].value, Some(1.5));
+        assert_eq!(
+            got_raised[1].occurrence, got_raised[0].occurrence,
+            "escalation re-raises the same occurrence"
+        );
+
+        // Cycle 4 is the dead zone (needs <= 0.4 to count); 5-6 clear (debounce 2).
+        let mut got_cleared = Vec::new();
+        cleared.drain(|c| got_cleared.push(c));
+        assert_eq!(got_cleared.len(), 1);
+        assert_eq!(got_cleared[0].occurrence, got_raised[0].occurrence);
+    }
+
+    /// A latching alarm holds after recovery until the ack lands (wired through a
+    /// full message-edge loop: alarms → acker raise, acker → alarms ack).
+    #[stellarator::test]
+    async fn latching_clears_only_on_ack() {
+        let run = |delay: usize, cycles: usize| async move {
+            let mut b = Coordinator::builder(config());
+            b.add_cyclic(Plant {
+                script: vec![2.0, 0.0],
+                cycle: 0,
+            });
+            let acker = b.add_cyclic(Acker {
+                delay,
+                pending: Vec::new(),
+            });
+            let mut spec = alarm("LATCHED", "plant.gyro.rates.1", None);
+            spec.debounce = Some(1);
+            spec.latching = Some(true);
+            let alarms = b.add_cyclic(AlarmSystem::new(params(vec![spec])));
+            b.connect(
+                PortRef::msg::<AlarmRaised>(alarms),
+                PortRef::msg::<AlarmRaised>(acker),
+            )
+            .unwrap();
+            b.connect(
+                PortRef::msg::<AlarmAck>(acker),
+                PortRef::msg::<AlarmAck>(alarms),
+            )
+            .unwrap();
+            let coord = b.build().unwrap();
+            let mut cleared = tap::<AlarmCleared>(&coord, "alarms.AlarmCleared");
+            let mut coord = coord;
+            coord.run_for(cycles).await;
+            let mut got = Vec::new();
+            cleared.drain(|c| got.push(c));
+            got.len()
+        };
+
+        // Never acked (delay beyond the run): recovered by cycle 2, still no clear.
+        assert_eq!(run(100, 8).await, 0, "latched alarm must hold without ack");
+        // Acked (2 cycles after sighting): the clear lands.
+        assert_eq!(run(2, 8).await, 1, "latched alarm clears once acked");
+    }
+
+    /// A u8 flag component alarms through the same numeric path (`1 → 1.0`,
+    /// `above=0.5`).
+    #[stellarator::test]
+    async fn flag_component_alarms() {
+        let mut b = Coordinator::builder(config());
+        b.add_cyclic(Plant {
+            script: vec![0.0, 20.0, 20.0], // degraded = rate > 10
+            cycle: 0,
+        });
+        let mut spec = alarm("DEGRADED", "plant.status.degraded", None);
+        spec.warning = None;
+        spec.critical = Some(BandSpec {
+            above: Some(0.5),
+            below: None,
+        });
+        spec.debounce = Some(1);
+        spec.hysteresis = None;
+        b.add_cyclic(AlarmSystem::new(params(vec![spec])));
+        let coord = b.build().unwrap();
+        let mut raised = tap::<AlarmRaised>(&coord, "alarms.AlarmRaised");
+        let mut coord = coord;
+        coord.run_for(3).await;
+
+        let mut got = Vec::new();
+        raised.drain(|r| got.push(r));
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].def_id, "DEGRADED");
+        assert_eq!(got[0].severity, Severity::Critical);
+        assert_eq!(got[0].value, Some(1.0));
+        assert_eq!(got[0].message, "plant.status.degraded = 1.0000");
+    }
+
+    /// Misconfigured targets disable their alarms and surface through health; the
+    /// def still broadcasts and nothing ever raises.
+    #[stellarator::test]
+    async fn bad_targets_disable_and_report_health() {
+        let mut b = Coordinator::builder(config());
+        b.add_cyclic(Plant {
+            script: vec![5.0], // would breach everything, were anything enabled
+            cycle: 0,
+        });
+        b.add_cyclic(AlarmSystem::new(params(vec![
+            alarm("GHOST", "nowhere.gyro.rates.1", None), // no such component
+            alarm("OOB", "plant.gyro.rates.1", Some(9)),  // element out of bounds (scalar)
+            alarm("DUP", "plant.gyro.rates.1", None),
+            alarm("DUP", "plant.gyro.rates.1", None), // duplicate id
+        ])));
+        let coord = b.build().unwrap();
+        let mut defs = tap::<AlarmDef>(&coord, "alarms.AlarmDef");
+        let mut raised = tap::<AlarmRaised>(&coord, "alarms.AlarmRaised");
+        let registry = coord.registry();
+        let health_entry = registry
+            .get(ComponentId::new("alarms.health"))
+            .expect("health entry");
+        let mut health_view = health_entry.view().expect("reader slot");
+        let mut coord = coord;
+        coord.run_for(4).await;
+
+        let mut n_defs = 0;
+        defs.drain(|_| n_defs += 1);
+        assert_eq!(n_defs, 4, "defs broadcast even for disabled alarms");
+
+        // Only the first DUP survives resolution — and it raises; the rest stay dark.
+        let mut got = Vec::new();
+        raised.drain(|r| got.push(r));
+        assert_eq!(got.len(), 1, "{got:?}");
+        assert_eq!(got[0].def_id, "DUP");
+
+        // Three boot failures land in the standard health frame's error total.
+        let grant = health_view
+            .try_latest()
+            .expect("read health")
+            .expect("health record");
+        let (health, _) = SystemHealth::ref_from_prefix(&grant).expect("health layout");
+        assert_eq!(health.errors, 3, "ghost + oob + duplicate each count once");
+    }
+}
+
 /// `to_def` maps each configured threshold to one display limit at the firing value.
 #[test]
 fn to_def_mirrors_the_firing_thresholds() {

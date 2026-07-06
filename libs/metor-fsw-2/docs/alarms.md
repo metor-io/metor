@@ -79,9 +79,6 @@ pub struct AlarmIn {
     /// (`connect "uplink" -> "alarms" msg="AlarmAck"`). Zero producers is legal —
     /// a mission without an uplink simply never latches-clear via ack.
     acks: MsgIn<AlarmAck>,
-    /// The receive-all tap (Capability::ReceiveAll): every telemetered entry in the
-    /// graph, read through slot-accounted registry views. Host-only, like telemetry.
-    all: AllOutputs,
 }
 
 #[derive(SystemOutput)]
@@ -89,6 +86,10 @@ pub struct AlarmOut {
     defs:    MsgOut<AlarmDef>,      // telemetered (default) → downlinked → db msg log → panel
     raised:  MsgOut<AlarmRaised>,
     cleared: MsgOut<AlarmCleared>,
+    /// The receive-all tap (Capability::ReceiveAll): every telemetered entry in the
+    /// graph, read through slot-accounted registry views. Host-only, and output-side
+    /// exactly like the downlink's (§5.1 — `init` reaches it through the outputs).
+    all: AllOutputs,
 }
 
 pub struct AlarmSystem { /* specs, watches, eval state, occurrence counter */ }
@@ -179,6 +180,17 @@ warning band, `debounce == 0`, `hysteresis < 0`. Config errors are **load errors
 errors (a target that resolves to nothing) are **health errors** (§5.1) — matching the
 framework split between "the mission file is wrong" and "the running graph disagrees".
 
+**Addressing an element** depends on how the field realizes (a property of its `AsVTable`
+impl, not of the alarm system):
+
+- a **shaped** component — a nox tensor/quaternion field (`gyro_b: V3` → one component,
+  shape `[3]`) — is targeted by its path plus `element=` (`target
+  component="plant.sensors.gyro_b" element=1`);
+- a **primitive array** (`rates: [f64; 3]`) flattens into per-element scalar components —
+  the dotted path *is* the element address (`target component="plant.gyro.rates.1"`, no
+  `element=`);
+- `bool` cannot be a zerocopy frame field; flags ride as `u8` and alarm with `above=0.5`.
+
 ### 3.1 One source of truth for thresholds
 
 `AlarmSpec::to_def()` derives the wkt `AlarmDef` mechanically: each configured `above`/`below`
@@ -222,15 +234,21 @@ consumer forces the design (§9).
 
 ## 5. Behavior
 
-### 5.1 First execute: resolve targets, emit defs
+### 5.1 Boot: resolve targets at `init`, emit defs at the first execute
 
-Resolution and the boot `AlarmDef` burst happen at the **first `execute`, not `init`** — the
-documented `AllOutputs` init-gap (B9, `src/registry.rs`): the downlink claims its tap views in
-its *own* `init`, which runs after this system's, so records emitted from `init` would never be
+Target **resolution** (and watch-view claiming) happens at `init` — the registry is frozen by
+build, so `init` sees the whole graph, and claiming there rather than at the first execute
+means cycle-1 records already evaluate. This puts `AllOutputs` in the **output bundle**, as
+the downlink's is (`init` receives only the outputs; `message-wiring.md` Q9 allows either
+side).
+
+The boot `AlarmDef` burst happens at the **first `execute`, not `init`** — the documented
+`AllOutputs` init-gap (B9, `src/registry.rs`): the downlink claims its tap views in its *own*
+`init`, which runs after this system's, so records emitted from `init` would never be
 downlinked. (Precedent: the coordinator's boot `SequenceRegistry` emits at the head of
 `run_for` for the same reason.)
 
-Per configured alarm:
+Per configured alarm, at `init`:
 
 1. Scan `input.all.entries()` for `EntrySchema::Table` entries; run
    `vtable.for_each_field(None, …)` (registration mode) and match the realized
@@ -240,12 +258,15 @@ Per configured alarm:
    target components in it. `ReceiveAll` budgets exactly **+1 reader slot on every ring**, so
    the system must never claim two views on one ring; the watch table enforces that
    structurally.
-3. No match / bad element / exhausted reader table → `health().error("unresolved_target")` +
-   a `Warn` log naming the alarm id and component; the alarm is disabled for the run. The
-   system never panics on config-vs-graph disagreement.
+3. No match / bad element / exhausted reader table → `health().error("alarms.unresolved_target")`
+   (/ `alarms.bad_element` / `alarms.reader_slot`) + a `Warn` log naming the alarm id and
+   component; the alarm is disabled for the run. A duplicate alarm id likewise disables the
+   later spec (`alarms.duplicate_id`) — the panel's def store and the ack path are keyed by
+   id. The system never panics on config-vs-graph disagreement.
 
-Then every `AlarmDef` is emitted once, disabled ones included (the panel may still show the
-def; it just never fires). Defs are latest-wins on the wire, so re-emission is always safe.
+At the first execute, every `AlarmDef` is emitted once, disabled ones included (the panel may
+still show the def; it just never fires). Defs are latest-wins on the wire, so re-emission is
+always safe.
 
 ### 5.2 Each cycle: extract and evaluate
 
@@ -369,8 +390,10 @@ normal; nothing is a singleton).
    is custom messages from producing systems (§9), designed when a concrete consumer exists.
    *Trade-off:* a condition a system detects internally has no v1 alarm expression beyond
    what its telemetered components already expose.
-4. **Defs/resolution at first execute, not `init`** — the B9 init-gap; boot records emitted
-   from `init` would miss the downlink's later-claimed taps.
+4. **Resolution at `init` (AllOutputs output-side, the downlink's Q9 shape); the def
+   broadcast at the first execute** — claiming watch views at `init` lets cycle-1 records
+   evaluate, while boot records emitted from `init` would miss the downlink's later-claimed
+   taps (B9).
 5. **Firing thresholds are the display limits** — `AlarmDef.limits` derived from the same
    `BandSpec`s that drive evaluation; the panel draws what the FSW enforces.
 6. **Occurrence ids: global counter seeded from wall-clock micros at construction** — unique
