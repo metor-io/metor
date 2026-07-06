@@ -47,7 +47,10 @@ use crate::coordinator::{
 };
 use crate::descriptor::{PortId, SystemDescriptor, compatible};
 use crate::dl::DlSystem;
-use crate::system::{AsyncSystem, BuildSystem, CyclicSystem, Out, SystemOutput};
+use crate::message::MsgTable;
+use crate::system::{
+    AsyncSystem, BuildCtx, BuildSystem, ConfigureError, CyclicSystem, Out, SystemOutput,
+};
 use crate::telemetry::{TcpRecvTransport, TcpTransport, TelemetrySystem, UplinkSystem};
 
 // The `Wiring` data model, the Rust builder, and the cargo build driver. KDL is *one*
@@ -109,6 +112,9 @@ pub struct LoadCtx<'a> {
     pub name: &'a str,
     /// The builder under construction.
     pub builder: &'a mut CoordinatorBuilder,
+    /// The registry's msg table ([`Registry::register_msg`]) — the host context
+    /// [`BuildSystem::configure`] resolves config name tokens against.
+    pub msgs: &'a MsgTable,
 }
 
 /// A registered factory: parse params from `ctx.node`, construct the system, add it
@@ -170,9 +176,24 @@ where
 {
     let params =
         de::from_kdl_node::<S::Params>(ctx.node, ctx.src, ctx.name, SYSTEM_RESERVED, 1)?;
-    let system = S::new(params);
+    let mut system = S::new(params);
+    // The host-side construction phase: resolve config references (msg name
+    // tokens) against the registry tables the params value cannot carry.
+    system
+        .configure(&BuildCtx { msgs: ctx.msgs })
+        .map_err(|e| match e {
+            ConfigureError::UnknownMsg { name, available } => LoadError::UnknownMsgName {
+                system: ctx.name.to_string(),
+                msg: name,
+                available: available.join(", "),
+                src: ctx.src.to_string(),
+                span: (0, ctx.src.len()).into(),
+            },
+        })?;
     let handle = system.add_to(ctx.name, ctx.builder);
-    Ok((handle, <S as AddToBuilder<K>>::descriptor()))
+    // The registered (instance) descriptor, not the static one — a config-ported
+    // system's edges resolve against what this instance actually carries.
+    Ok((handle, ctx.builder.descriptor_of(handle).clone()))
 }
 
 /// One registered type: its instantiation factory plus the static descriptor —
@@ -189,6 +210,10 @@ struct RegistryEntry {
 #[derive(Default)]
 pub struct Registry {
     factories: HashMap<&'static str, RegistryEntry>,
+    /// The registered message types ([`register_msg`](Self::register_msg)) — the
+    /// [`NamedMsg::NAME`](crate::NamedMsg) → id table config name tokens (the
+    /// uplink's `msgs`) resolve against in [`BuildSystem::configure`].
+    msgs: MsgTable,
 }
 
 impl Registry {
@@ -200,15 +225,38 @@ impl Registry {
     /// The framework's built-in static systems, registered under their KDL `type=`
     /// names: the alarm engine (`type="Alarms"`, `docs/alarms.md` §2), the TCP
     /// telemetry downlink (`type="TcpDownlink"`, telemetry.md §8), and the TCP
-    /// command uplink (`type="TcpUplink"`, `docs/messages.md` §4.4).
+    /// command uplink (`type="TcpUplink"`, `docs/messages.md` §4.4) — plus the wkt
+    /// message set in the msg table, so a mission's `msgs` list can name any of
+    /// them out of the box.
     /// The CLI runner resolves against this, so every `cli::main()` mission gets the
     /// built-ins with zero Rust; an app-built registry starts here and adds its own.
     pub fn with_builtins() -> Self {
+        use metor_proto_wkt::{
+            AlarmAck, AlarmCleared, AlarmDef, AlarmRaised, ReloadSequences,
+            SequenceChannelEvent, SequenceCommand, SequenceRegistry,
+        };
         let mut r = Self::new();
         r.register::<crate::AlarmSystem, _>("Alarms");
         r.register::<TelemetrySystem<TcpTransport>, _>("TcpDownlink");
         r.register::<UplinkSystem<TcpRecvTransport>, _>("TcpUplink");
+        r.register_msg::<SequenceCommand>()
+            .register_msg::<SequenceRegistry>()
+            .register_msg::<SequenceChannelEvent>()
+            .register_msg::<ReloadSequences>()
+            .register_msg::<AlarmDef>()
+            .register_msg::<AlarmRaised>()
+            .register_msg::<AlarmCleared>()
+            .register_msg::<AlarmAck>();
         r
+    }
+
+    /// Register message type `M` under its stable [`NamedMsg::NAME`](crate::NamedMsg)
+    /// token, so config lists (the uplink's `msgs`) can name it. The wkt set comes
+    /// pre-seeded by [`with_builtins`](Self::with_builtins); a mission relaying its
+    /// own command types registers them here. Idempotent.
+    pub fn register_msg<M: crate::NamedMsg>(&mut self) -> &mut Self {
+        self.msgs.insert::<M>();
+        self
     }
 
     /// Register concrete system `S` under `type_name`. `S` supplies its params type
@@ -463,6 +511,7 @@ fn resolve_static(
         src: &node_src,
         name: &spec.name,
         builder,
+        msgs: &registry.msgs,
     })
 }
 

@@ -744,20 +744,69 @@ fn message_handoff_drops_oldest_on_overflow() {
     );
 }
 
-/// The uplink derives its ground subscription from its declared message-output ports — the
-/// one table dispatch also derives from (A8), not a hardcoded id: declaring a second command
-/// output (ReloadSequences) put its id in the subscription with no other change.
-#[test]
-fn uplink_subscribes_to_its_declared_command_ids() {
+/// The uplink subscribes to **exactly** its configured msg set — subscription,
+/// dispatch, and the minted ports all derive from the one `msgs` list, and there is
+/// no hardcoded fallback id: an empty config subscribes to nothing.
+#[cfg(not(miri))]
+#[stellarator::test]
+async fn uplink_subscribes_to_its_configured_ids() {
+    use std::cell::RefCell;
+    use std::rc::Rc;
+
     use metor_proto::types::Msg;
-    use metor_proto_wkt::{ReloadSequences, SequenceCommand};
+    use metor_proto_wkt::{AlarmAck, ReloadSequences};
+    use stellarator::buf::Slice;
+
+    use crate::RecvTransport;
+
+    /// Records the subscription and yields nothing (the reader stops immediately).
+    struct SubRecv {
+        subscribed: Rc<RefCell<Option<Vec<PacketId>>>>,
+    }
+
+    impl RecvTransport for SubRecv {
+        async fn recv(
+            &mut self,
+        ) -> Result<metor_proto::types::OwnedPacket<Slice<Vec<u8>>>, TransportError> {
+            Err(TransportError::Disconnected)
+        }
+
+        fn subscribe(&mut self, ids: &[PacketId]) {
+            *self.subscribed.borrow_mut() = Some(ids.to_vec());
+        }
+    }
+
+    // Configured: exactly the two ids, in config order.
+    let subscribed = Rc::new(RefCell::new(None));
+    let mut b = Coordinator::builder(sim_config());
+    b.add_async(
+        UplinkSystem::new(SubRecv {
+            subscribed: subscribed.clone(),
+        })
+        .with_msg::<ReloadSequences>()
+        .with_msg::<AlarmAck>(),
+    );
+    let mut coord = b.build().unwrap();
+    coord.run_for(20).await;
     assert_eq!(
-        super::uplink_subscribe_ids(),
-        vec![
-            SequenceCommand::ID,
-            ReloadSequences::ID,
-            metor_proto_wkt::AlarmAck::ID
-        ]
+        subscribed.borrow().clone(),
+        Some(vec![ReloadSequences::ID, AlarmAck::ID]),
+        "the subscription is the configured set, nothing more"
+    );
+
+    // Unconfigured: an empty subscription (the historical SequenceCommand fallback
+    // is gone; the uplink warns instead).
+    let subscribed = Rc::new(RefCell::new(None));
+    let mut b = Coordinator::builder(sim_config());
+    b.add_async(UplinkSystem::new(SubRecv {
+        subscribed: subscribed.clone(),
+    }));
+    let mut coord = b.build().unwrap();
+    coord.run_for(20).await;
+    assert_eq!(
+        subscribed.borrow().clone(),
+        Some(Vec::new()),
+        "no msgs configured subscribes to nothing"
     );
 }
 
@@ -840,9 +889,12 @@ async fn uplink_routes_alarm_acks() {
     let seen = Rc::new(RefCell::new(Vec::new()));
     let mut b = Coordinator::builder(sim_config());
     let sink = b.add_cyclic(AckSink { seen: seen.clone() });
-    let uplink = b.add_async(UplinkSystem::new(MockRecv {
-        queue: vec![garbage, good].into(),
-    }));
+    let uplink = b.add_async(
+        UplinkSystem::new(MockRecv {
+            queue: vec![garbage, good].into(),
+        })
+        .with_msg::<AlarmAck>(),
+    );
     b.connect(
         PortRef::msg::<AlarmAck>(uplink),
         PortRef::msg::<AlarmAck>(sink),
@@ -857,6 +909,99 @@ async fn uplink_routes_alarm_acks() {
     assert_eq!(got[0].def_id, "RATE_HIGH");
     assert_eq!(got[0].occurrence, 42);
     assert_eq!(got[0].operator, "op");
+}
+
+/// THE id-agnostic acceptance test: a user-defined Msg type the framework has never
+/// seen — blanket-hashed id, no wkt entry, no framework change — flows wire → uplink →
+/// typed consumer with nothing but a `with_msg` entry and an ordinary message edge.
+#[cfg(not(miri))]
+#[stellarator::test]
+async fn uplink_relays_arbitrary_user_msgs() {
+    use std::cell::RefCell;
+    use std::rc::Rc;
+
+    use metor_proto::types::IntoLenPacket;
+    use stellarator::buf::Slice;
+
+    use crate::{MsgIn, RecvTransport};
+
+    /// A mission-local command type, unknown to the framework.
+    #[derive(serde::Serialize, serde::Deserialize, postcard_schema::Schema, Debug)]
+    struct SetGain {
+        gain: u32,
+    }
+    impl crate::NamedMsg for SetGain {
+        const NAME: &'static str = "SetGain";
+    }
+
+    /// A fixed script of pre-framed wire packets, then `Disconnected`.
+    struct MockRecv {
+        queue: std::collections::VecDeque<Vec<u8>>,
+    }
+
+    impl RecvTransport for MockRecv {
+        async fn recv(
+            &mut self,
+        ) -> Result<metor_proto::types::OwnedPacket<Slice<Vec<u8>>>, TransportError> {
+            use stellarator::buf::IoBuf;
+            match self.queue.pop_front() {
+                Some(bytes) => {
+                    let slice = bytes.try_slice(..).expect("non-empty packet");
+                    metor_proto::types::OwnedPacket::parse(slice)
+                        .map_err(|e| TransportError::Io(Box::new(e)))
+                }
+                None => Err(TransportError::Disconnected),
+            }
+        }
+    }
+
+    struct GainSink {
+        seen: Rc<RefCell<Vec<u32>>>,
+    }
+
+    #[derive(SystemInput)]
+    struct GainSinkIn {
+        cmds: MsgIn<SetGain>,
+    }
+
+    #[derive(SystemOutput)]
+    struct GainSinkOut {}
+
+    impl System for GainSink {
+        type Input = GainSinkIn;
+        type Output = Out<GainSinkOut>;
+        const NAME: &'static str = "gain_sink";
+    }
+
+    impl CyclicSystem for GainSink {
+        fn execute(&mut self, _now: Timestamp, input: &mut GainSinkIn, _o: &mut Self::Output) {
+            let seen = &self.seen;
+            input.cmds.drain(|c| seen.borrow_mut().push(c.gain));
+        }
+    }
+
+    // Strip the LenPacket 4-byte length prefix, as the panel's sink does on the wire.
+    let wire = SetGain { gain: 7 }.into_len_packet().inner[4..].to_vec();
+
+    let seen = Rc::new(RefCell::new(Vec::new()));
+    let mut b = Coordinator::builder(sim_config());
+    let sink = b.add_cyclic(GainSink { seen: seen.clone() });
+    let uplink = b.add_async(
+        UplinkSystem::new(MockRecv {
+            queue: vec![wire].into(),
+        })
+        .with_msg::<SetGain>(),
+    );
+    b.connect(
+        PortRef::msg::<SetGain>(uplink),
+        PortRef::msg::<SetGain>(sink),
+    )
+    .unwrap();
+    let mut coord = b.build().unwrap();
+
+    coord.run_for(20).await;
+
+    assert_eq!(*seen.borrow(), vec![7], "the user msg landed at its consumer");
 }
 
 /// A11(b): "the telemetry downlink registers last" is enforced, not silently reordered —
@@ -885,31 +1030,46 @@ fn cyclic_after_receive_all_is_a_build_error() {
     }
 }
 
-/// The uplink's command port is UNTELEMETERED through its real spelling — the
-/// `CommandOut` token in the derived `UplinkPorts` bundle (a pure `MsgOut` alias;
-/// the flag lives on the descriptor via the derive's token lowering). Guards the
-/// A6 regression where the downlink would echo inbound commands back to the panel.
+/// Every config-minted uplink port is UNTELEMETERED (guards the A6 regression where
+/// the downlink would echo inbound commands back to the panel), Log-delivery, and
+/// keyed/named by its configured msg — appended after the static health/log pair in
+/// config order, the same order [`MsgFanOut::bind`] pops rings.
 #[test]
-fn uplink_command_ports_are_untelemetered() {
+fn uplink_minted_ports_are_untelemetered() {
     use metor_proto::types::Msg;
-    let descs = <super::UplinkPorts as crate::SystemOutput>::port_descs();
-    assert_eq!(descs.len(), 3);
-    for d in &descs {
+    use metor_proto_wkt::{AlarmAck, ReloadSequences, SequenceCommand};
+    use stellarator::buf::Slice;
+
+    use crate::RecvTransport;
+
+    struct NoRecv;
+    impl RecvTransport for NoRecv {
+        async fn recv(
+            &mut self,
+        ) -> Result<metor_proto::types::OwnedPacket<Slice<Vec<u8>>>, TransportError> {
+            Err(TransportError::Disconnected)
+        }
+    }
+
+    let uplink = UplinkSystem::new(NoRecv)
+        .with_msg::<SequenceCommand>()
+        .with_msg::<ReloadSequences>()
+        .with_msg::<AlarmAck>()
+        // Idempotent: a repeat is one port, not a duplicate registry key.
+        .with_msg::<AlarmAck>();
+    let desc = crate::AsyncSystem::instance_descriptor(&uplink);
+
+    // The static shape (health, log) first, then one port per configured msg.
+    assert_eq!(desc.outputs.len(), 5);
+    let minted = &desc.outputs[2..];
+    for d in minted {
         assert!(!d.telemetered, "inbound commands are never downlinked");
         assert_eq!(d.delivery, crate::Delivery::Log);
     }
-    assert_eq!(
-        descs[0].id,
-        crate::PortId::Packet(metor_proto_wkt::SequenceCommand::ID)
-    );
-    assert_eq!(
-        descs[1].id,
-        crate::PortId::Packet(metor_proto_wkt::ReloadSequences::ID)
-    );
-    assert_eq!(
-        descs[2].id,
-        crate::PortId::Packet(metor_proto_wkt::AlarmAck::ID)
-    );
+    assert_eq!(minted[0].id, crate::PortId::Packet(SequenceCommand::ID));
+    assert_eq!(minted[0].name, "SequenceCommand");
+    assert_eq!(minted[1].id, crate::PortId::Packet(ReloadSequences::ID));
+    assert_eq!(minted[2].id, crate::PortId::Packet(AlarmAck::ID));
 }
 
 /// `DownlinkParams`' two optional subset lists project onto `TelemetryMode` as

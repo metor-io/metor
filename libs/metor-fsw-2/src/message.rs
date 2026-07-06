@@ -68,6 +68,38 @@ impl NamedMsg for AlarmAck {
     const NAME: &'static str = "AlarmAck";
 }
 
+/// The host's registered message types — [`NamedMsg::NAME`] → [`Msg::ID`] — the
+/// table a config token resolves against ([`BuildSystem::configure`]). The wiring
+/// registry owns one (seeded with the wkt set, extended via `register_msg`); the
+/// stored `&'static` NAME doubles as a minted port's [`PortDesc`] name, so
+/// resolution never leaks a string.
+///
+/// [`BuildSystem::configure`]: crate::BuildSystem::configure
+#[derive(Default, Clone)]
+pub struct MsgTable {
+    map: std::collections::HashMap<&'static str, PacketId>,
+}
+
+impl MsgTable {
+    /// Register `M` under its stable [`NamedMsg::NAME`] token. Idempotent.
+    pub fn insert<M: NamedMsg>(&mut self) {
+        self.map.insert(M::NAME, M::ID);
+    }
+
+    /// Resolve a config token to its `(name, id)` pair. The returned name is the
+    /// stored `&'static` token (not the argument), usable as a port name.
+    pub fn get(&self, name: &str) -> Option<(&'static str, PacketId)> {
+        self.map.get_key_value(name).map(|(n, id)| (*n, *id))
+    }
+
+    /// Every registered name, sorted — for error listings.
+    pub fn names(&self) -> Vec<&'static str> {
+        let mut names: Vec<_> = self.map.keys().copied().collect();
+        names.sort_unstable();
+        names
+    }
+}
+
 /// Default worst-case message payload size, the [`Frame::MAX_SIZE`](crate::Frame)
 /// analogue for the variable-record ring sizing (`docs/messages.md` §2.1). Generous —
 /// a message is a log entry (a `SequenceChannelEvent`, a `SequenceRegistry`), not a
@@ -207,6 +239,78 @@ where
 /// (`PortDesc::msg::<M>().untelemetered()`) — calling `CommandOut::descriptor()`
 /// resolves through the alias to the *telemetered* `MsgOut` descriptor.
 pub type CommandOut<M, WD = NoWake, WS = NoWake> = MsgOut<M, WD, WS>;
+
+// ---------------------------------------------------------------------------
+// MsgFanOut
+// ---------------------------------------------------------------------------
+
+/// N raw message writers, one per **config-minted** Postcard output — the
+/// dynamic-count sibling of [`MsgOut`] for a system whose message outputs are
+/// determined by its instance config rather than its bundle type (the uplink's
+/// one-port-per-configured-msg, `docs/messages.md` §4.4).
+///
+/// The ports must be the *trailing* outputs of the instance descriptor:
+/// [`bind`](Self::bind) drains every ring the [`RingSource`] still holds, so the
+/// bundle binds its static ports first and the fan-out last. The writer at index
+/// k is the descriptor's k-th minted port — the owner keys both off the same
+/// config list, so no per-writer id is stored here.
+///
+/// [`write_raw`](Self::write_raw) is the id-erased [`emit`](MsgOut::emit): it
+/// writes an **already-encoded** `id ++ payload` record verbatim, no typed `M`
+/// and no postcard step (the uplink relays wire records whose payload it never
+/// decodes — validation happens at each consumer's [`drain`](MsgIn::drain)).
+pub struct MsgFanOut {
+    writers: Vec<Writer<NoWake, NoWake>>,
+    /// The reused record buffer (2-byte id + payload) — the [`MsgOut`] scratch
+    /// discipline.
+    scratch: Vec<u8>,
+}
+
+impl MsgFanOut {
+    /// Bind one writer per output ring the source still holds. Walked *after*
+    /// the bundle's static ports, in `descriptors()` order.
+    pub fn bind<S: RingSource>(src: &mut S) -> Self {
+        let mut writers = Vec::new();
+        while let Some((ring, data, space)) = src.try_next_output::<NoWake, NoWake>() {
+            // Invariant: the coordinator allocates one ring per message output and
+            // binds it exactly once, so the region's writer claim is always free here.
+            let writer = ring
+                .writer(data, space)
+                .expect("message ring is bound to exactly one writer at build");
+            writers.push(writer);
+        }
+        Self {
+            writers,
+            scratch: Vec::new(),
+        }
+    }
+
+    /// The bound writer count — must equal the owner's configured msg count (its
+    /// descriptor minted one port per msg).
+    pub fn len(&self) -> usize {
+        self.writers.len()
+    }
+
+    /// Whether no ports were minted (an empty config list).
+    pub fn is_empty(&self) -> bool {
+        self.writers.is_empty()
+    }
+
+    /// Write one already-encoded record — `id` then `payload`, verbatim — onto
+    /// writer `idx`. Only the ring `try_write` can fail (`WouldBlock`
+    /// backpressure or an oversized record).
+    pub fn write_raw(
+        &mut self,
+        idx: usize,
+        id: PacketId,
+        payload: &[u8],
+    ) -> Result<(), WriteError> {
+        self.scratch.clear();
+        self.scratch.extend_from_slice(&id);
+        self.scratch.extend_from_slice(payload);
+        self.writers[idx].try_write(&self.scratch)
+    }
+}
 
 // ---------------------------------------------------------------------------
 // MsgIn
@@ -352,7 +456,7 @@ mod tests {
         SequenceChannelSpec, SequenceCommand, SequenceCommandKind, SequenceRegistry,
     };
 
-    use super::{LOG_DEPTH, MAX_MSG_BYTES, MsgIn, MsgOut, split_record};
+    use super::{LOG_DEPTH, MAX_MSG_BYTES, MsgFanOut, MsgIn, MsgOut, split_record};
     use crate::port::capacity_for;
     use crate::PortId;
     use crate::registry::{EntrySchema, RegistryEntry};
@@ -492,6 +596,38 @@ mod tests {
         let mut again = 0;
         inbox.drain(|_| again += 1);
         assert_eq!(again, 0);
+    }
+
+    /// `MsgFanOut::write_raw` relays an already-encoded `(id ++ payload)` record
+    /// verbatim — the id-erased emit: a typed `MsgIn` over the same ring decodes it
+    /// exactly as if a `MsgOut<M>` had emitted it, and a record of another id on a
+    /// sibling writer stays isolated (one ring per minted port).
+    #[test]
+    fn msg_fan_out_write_raw_round_trips() {
+        let ring = RingBuffer::create_in_memory(Config {
+            capacity: capacity_for(MAX_MSG_BYTES, LOG_DEPTH),
+            max_readers: 4,
+        });
+        let mut inbox: MsgIn<SequenceCommand> =
+            MsgIn::new(ring.view(NoWake, NoWake).expect("slot"));
+        let mut fan = MsgFanOut {
+            writers: vec![ring.writer(NoWake, NoWake).expect("one writer")],
+            scratch: Vec::new(),
+        };
+        assert_eq!(fan.len(), 1);
+
+        let payload = postcard::to_allocvec(&SequenceCommand {
+            channel: "adcs".to_string(),
+            command: SequenceCommandKind::Start,
+        })
+        .expect("encode");
+        fan.write_raw(0, SequenceCommand::ID, &payload).expect("relay");
+
+        let mut got: Vec<SequenceCommand> = Vec::new();
+        inbox.drain(|c| got.push(c));
+        assert_eq!(got.len(), 1, "the relayed record decodes at the typed consumer");
+        assert_eq!(got[0].channel, "adcs");
+        assert!(matches!(got[0].command, SequenceCommandKind::Start));
     }
 
     /// A fan-in `MsgIn` (`from_views`) drains **every** producer view: two emitters on two

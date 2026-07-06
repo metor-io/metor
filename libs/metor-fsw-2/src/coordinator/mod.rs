@@ -827,11 +827,11 @@ impl CoordinatorBuilder {
         O: SystemOutput + BindPorts + 'static,
         S::Input: BindPorts + 'static,
     {
-        self.push_system(
-            <S as CyclicSystem>::descriptor(),
-            name.into(),
-            Reg::Cyclic(Box::new(CyclicReg { system })),
-        )
+        // The instance descriptor, not the static one: a system whose port set
+        // depends on its config (the uplink's per-msg outputs) registers what this
+        // instance actually carries.
+        let desc = system.instance_descriptor();
+        self.push_system(desc, name.into(), Reg::Cyclic(Box::new(CyclicReg { system })))
     }
 
     /// Register an async system under its type's `System::NAME` instance name.
@@ -851,11 +851,9 @@ impl CoordinatorBuilder {
         S::Input: BindPorts + 'static,
         S::Output: BindPorts + 'static,
     {
-        self.push_system(
-            <S as AsyncSystem>::descriptor(),
-            name.into(),
-            Reg::Async(Box::new(AsyncReg { system })),
-        )
+        // The instance descriptor, not the static one (see `add_cyclic_named`).
+        let desc = system.instance_descriptor();
+        self.push_system(desc, name.into(), Reg::Async(Box::new(AsyncReg { system })))
     }
 
     /// Register a dlopen'd cyclic system under an explicit instance name. `loaded` is

@@ -37,13 +37,10 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use metor_fsw_ring::{NoWake, View};
-use metor_proto::types::{LenPacket, Msg, OwnedPacket, PacketId, Timestamp};
+use metor_proto::types::{LenPacket, OwnedPacket, PacketId, Timestamp};
 use metor_proto::vtable::VTable;
 use metor_proto_stellar::{PacketSink, PacketStream};
-use metor_proto_wkt::{
-    AlarmAck, ComponentMetadata, MsgStream, ReloadSequences, SequenceCommand,
-    SetComponentMetadata, VTableMsg,
-};
+use metor_proto_wkt::{ComponentMetadata, MsgStream, SetComponentMetadata, VTableMsg};
 use stellarator::JoinHandleDropGuard;
 use stellarator::buf::Slice;
 use stellarator::io::{OwnedReader, OwnedWriter, SplitExt};
@@ -51,10 +48,14 @@ use stellarator::net::TcpStream;
 use stellarator::sync::WaitQueue;
 
 use crate::binder::{BindPorts, RingSource};
-use crate::descriptor::{Delivery, PortDecl, PortId};
-use crate::message::{CommandOut, split_record};
+use crate::descriptor::{Delivery, PortDecl, PortDesc, SystemDescriptor};
+use crate::health::HealthPort;
+use crate::message::{MsgFanOut, NamedMsg, split_record};
 use crate::registry::{AllOutputs, EntrySchema, RegistryEntry};
-use crate::system::{AsyncSystem, BuildSystem, CyclicSystem, Out, System, SystemInput, SystemOutput};
+use crate::system::{
+    AsyncSystem, BuildCtx, BuildSystem, ConfigureError, CyclicSystem, Out, System, SystemInput,
+    SystemOutput,
+};
 
 // ---------------------------------------------------------------------------
 // Transport (telemetry.md §7)
@@ -194,9 +195,9 @@ impl Transport for TcpTransport {
 /// command stream: the db relays a message id only to clients that send a [`MsgStream`] for it
 /// (`metor-db` `MsgStream` handler), so without this the uplink would read nothing. The write half
 /// (the [`PacketSink`] the subscription is sent over) is held for the connection's lifetime; the
-/// read half is a [`PacketStream`] yielding the streamed `SequenceCommand` Msgs. A dropped socket
-/// fails `recv` and stops the reader (no reconnect); uplink and downlink no longer share a socket
-/// (shared link is deferred, §4.5).
+/// read half is a [`PacketStream`] yielding the streamed Msgs. A dropped socket fails `recv` and
+/// stops the reader (no reconnect); uplink and downlink no longer share a socket (shared link is
+/// deferred, §4.5).
 pub struct TcpRecvTransport {
     addr: std::net::SocketAddr,
     stream: Option<PacketStream<OwnedReader<TcpStream>>>,
@@ -205,8 +206,8 @@ pub struct TcpRecvTransport {
     #[allow(dead_code)]
     sink: Option<PacketSink<OwnedWriter<TcpStream>>>,
     /// The message ids to subscribe to on connect (`docs/message-wiring.md` §5.2), set by
-    /// [`subscribe`](RecvTransport::subscribe) before the first `recv`. Falls back to
-    /// `SequenceCommand::ID` if the uplink never set it.
+    /// [`subscribe`](RecvTransport::subscribe) before the first `recv`. Empty subscribes
+    /// to nothing (the uplink warns about an empty config; there is no fallback id).
     subscribe_ids: Vec<PacketId>,
 }
 
@@ -223,8 +224,8 @@ impl TcpRecvTransport {
         }
     }
 
-    /// Connect lazily on first use, send the `SequenceCommand` [`MsgStream`] subscription, then
-    /// reuse the open read half. Subsequent calls reuse the established stream.
+    /// Connect lazily on first use, send one [`MsgStream`] subscription per configured id,
+    /// then reuse the open read half. Subsequent calls reuse the established stream.
     async fn ensure(&mut self) -> Result<&mut PacketStream<OwnedReader<TcpStream>>, TransportError> {
         if self.stream.is_none() {
             let stream = TcpStream::connect(self.addr)
@@ -233,16 +234,9 @@ impl TcpRecvTransport {
             let (rx, tx) = stream.split();
             // Subscribe to the panel's command stream before reading (`docs/messages.md` §4.4):
             // the db only forwards a message id to clients that asked for it. Mirrors cube-sat
-            // (`examples/cube-sat/src/main.rs:555`). v1 subscribes to `SequenceCommand` only.
+            // (`examples/cube-sat/src/main.rs:555`).
             let sink = PacketSink::new(tx);
-            // Subscribe to every id the uplink declared (its message-output ports, §5.2), or
-            // `SequenceCommand` if it never set them (the historical default).
-            let ids: Vec<PacketId> = if self.subscribe_ids.is_empty() {
-                vec![SequenceCommand::ID]
-            } else {
-                self.subscribe_ids.clone()
-            };
-            for msg_id in ids {
+            for msg_id in self.subscribe_ids.clone() {
                 sink.send(&MsgStream { msg_id })
                     .await
                     .0
@@ -367,24 +361,54 @@ impl BuildSystem for TelemetrySystem<TcpTransport> {
 }
 
 /// The wiring params of the built-in TCP uplink (`type="TcpUplink"`): the address of
-/// the metor-db broker whose command Msgs it subscribes to.
+/// the metor-db broker plus the message types to relay. Each `msgs` token is a
+/// [`NamedMsg::NAME`] resolved against the registry's [`MsgTable`](crate::MsgTable)
+/// (`Registry::register_msg` — the wkt set is pre-seeded); the uplink subscribes
+/// to exactly those ids and mints one ordinary message output port per msg, so
+/// `connect "uplink" -> … msg="…"` edges resolve like any other. No `msgs` child
+/// means the uplink relays nothing (and warns) — there is no built-in default set.
 ///
 /// ```kdl
-/// system "uplink" type="TcpUplink" addr="127.0.0.1:2241"
+/// system "uplink" type="TcpUplink" addr="127.0.0.1:2241" {
+///     msgs "SequenceCommand" "AlarmAck"
+/// }
 /// ```
-#[derive(serde::Serialize, serde::Deserialize, Debug, Clone, Copy)]
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone)]
 pub struct UplinkParams {
     /// The TCP address of the metor-db broker the uplink subscribes to.
     pub addr: std::net::SocketAddr,
+    /// The [`NamedMsg::NAME`] tokens of the messages to relay.
+    #[serde(default)]
+    pub msgs: Option<Vec<String>>,
 }
 
 /// The registry entry point of the built-in TCP uplink ([`TcpRecvTransport::new`] is
 /// as lazy as the downlink's transport — it connects and subscribes on first `recv`).
+/// The `msgs` name tokens resolve in [`configure`](BuildSystem::configure), where the
+/// host's msg table is in scope.
 impl BuildSystem for UplinkSystem<TcpRecvTransport> {
     type Params = UplinkParams;
 
     fn new(params: UplinkParams) -> Self {
-        Self::new(TcpRecvTransport::new(params.addr))
+        let mut system = Self::new(TcpRecvTransport::new(params.addr));
+        system.unresolved = params.msgs.unwrap_or_default();
+        system
+    }
+
+    fn configure(&mut self, ctx: &BuildCtx) -> Result<(), ConfigureError> {
+        for token in std::mem::take(&mut self.unresolved) {
+            let Some((name, id)) = ctx.msgs.get(&token) else {
+                return Err(ConfigureError::UnknownMsg {
+                    name: token,
+                    available: ctx.msgs.names(),
+                });
+            };
+            // Idempotent: a duplicate token is one port, not a DuplicateRegistryKey.
+            if !self.msgs.iter().any(|&(_, existing)| existing == id) {
+                self.msgs.push((name, id));
+            }
+        }
+        Ok(())
     }
 }
 
@@ -491,61 +515,49 @@ impl HandOff {
 /// via its drop guard regardless).
 const UPLINK_IDLE: Duration = Duration::from_millis(50);
 
-/// The uplink's output bundle (`docs/message-wiring.md` §6): one ordinary
-/// [`CommandOut`](CommandOut) message output **per forwarded command type** — fully
-/// normal message producers, no bespoke command-bus capability. A consumer receives a
-/// command type only over an explicit edge (`connect "uplink" -> … msg="…"`, A2).
-/// Untelemetered (inbound control), so nothing here is echoed on the downlink — the
-/// `CommandOut` token *is* the opt-out spelling the derive lowers to `.untelemetered()`
-/// (`CommandOut` itself is a pure `MsgOut` alias; the flag lives on the descriptor).
+/// The uplink's output bundle: the two implicit health/log ports **first**, then a
+/// [`MsgFanOut`] holding one ordinary message output **per configured msg** — fully
+/// normal message producers, no bespoke command-bus capability. A consumer receives
+/// a msg only over an explicit edge (`connect "uplink" -> … msg="…"`, A2), and every
+/// minted port is untelemetered (inbound control is never echoed on the downlink).
 ///
-/// This bundle is the **one table** subscription and dispatch derive from (A8): the
-/// ground subscription is the declared ports' `PacketId`s ([`uplink_subscribe_ids`]),
-/// and [`RouteMsg::route`] emits on the port whose id matches — adding a command type
-/// is one field + one route arm, and the subscription follows automatically.
-#[derive(crate::SystemOutput)]
-pub struct UplinkPorts {
-    commands: CommandOut<SequenceCommand>,
-    reloads: CommandOut<ReloadSequences>,
-    /// Panel-published alarm acks, forwarded to the alarm system
-    /// (`connect "uplink" -> "alarms" msg="AlarmAck"`, `docs/alarms.md` §6).
-    acks: CommandOut<AlarmAck>,
+/// Hand-written (not `Out<...>` + derive) because the fan-out's port count is
+/// config-determined: [`MsgFanOut::bind`] drains every ring the source still holds,
+/// so the minted ports must be the descriptor's *trailing* outputs — the reverse of
+/// the [`Out`] convention (user ports first). The static [`decls`](SystemOutput::decls)
+/// carry only health/log (the empty-config shape); the per-instance msg ports come
+/// from [`UplinkSystem::instance_descriptor`], which appends them in the same
+/// config order the bind walk pops rings, keeping the positional contract.
+pub struct UplinkOut {
+    fan: MsgFanOut,
+    health: HealthPort,
 }
 
-/// Route one received wire Msg to the declared output whose [`PacketId`] matches
-/// (A8, `docs/design-command-slots.md` §2.7). Returns `false` when no declared port
-/// matches — the uplink bumps its `uplink.unroutable` health counter. Ground bytes
-/// are never forwarded unparsed: each arm postcard-decodes before emitting, so a
-/// malformed payload for a known id is dropped (the link stays up).
-///
-/// Hand-written per bundle today, one arm per declared message output; the
-/// `#[system]` derive can generate it from the bundle later (E2).
-pub trait RouteMsg {
-    /// Decode-and-emit `bytes` on the declared output keyed `id`; `false` if no
-    /// declared output carries `id`.
-    fn route(&mut self, id: PacketId, bytes: &[u8]) -> bool;
-}
-
-/// Decode `bytes` as `M` and emit it on `port` — one [`RouteMsg`] arm's body. A
-/// decode failure is a dropped record, not an unroutable id (the id *did* match a
-/// declared port), so this returns `true` either way.
-fn decode_emit<M: Msg + serde::de::DeserializeOwned>(
-    port: &mut crate::MsgOut<M>,
-    bytes: &[u8],
-) -> bool {
-    if let Ok(msg) = postcard::from_bytes::<M>(bytes) {
-        let _ = port.emit(&msg);
+impl UplinkOut {
+    /// Disjoint borrows of the minted ports and the health handle — the
+    /// [`Out::split`] mirror.
+    fn split(&mut self) -> (&mut MsgFanOut, &mut HealthPort) {
+        (&mut self.fan, &mut self.health)
     }
-    true
 }
 
-impl RouteMsg for UplinkPorts {
-    fn route(&mut self, id: PacketId, bytes: &[u8]) -> bool {
-        match id {
-            SequenceCommand::ID => decode_emit(&mut self.commands, bytes),
-            ReloadSequences::ID => decode_emit(&mut self.reloads, bytes),
-            AlarmAck::ID => decode_emit(&mut self.acks, bytes),
-            _ => false,
+impl SystemOutput for UplinkOut {
+    fn decls() -> Vec<PortDecl> {
+        vec![
+            PortDecl::Port(PortDesc::of::<crate::SystemHealth>()),
+            PortDecl::Port(PortDesc::of::<crate::SystemLog>()),
+        ]
+    }
+}
+
+impl BindPorts for UplinkOut {
+    fn bind<S: RingSource>(src: &mut S) -> Self {
+        let health = crate::Output::bind(src);
+        let log = crate::Output::bind(src);
+        let fan = MsgFanOut::bind(src);
+        Self {
+            fan,
+            health: HealthPort::new(health, log),
         }
     }
 }
@@ -567,59 +579,96 @@ impl BindPorts for UplinkIn {
 
 /// The command-plane ingest system (`docs/messages.md` §4.4): the read twin of
 /// [`TelemetrySystem`], an ordinary [`AsyncSystem`] that owns its **own** [`RecvTransport`]
-/// connection (§4.5) and re-emits each panel `SequenceCommand` onto the command bus the
-/// coordinator drains at head-of-cycle. A near pass-through — wire and internal command type
-/// are now identical (`SequenceCommand`), so there is no mapping, no inbox, no translation.
+/// connection (§4.5) and relays each subscribed wire Msg onto its matching minted output.
+/// A pure pass-through for **any** message id: the forward set is the instance's config
+/// (`msgs`, or [`with_msg`](Self::with_msg) programmatically), never a compiled-in list,
+/// and payloads are forwarded verbatim — each consumer's [`MsgIn`](crate::MsgIn) drain
+/// decodes (and discards garbage) exactly as on any other message edge.
 pub struct UplinkSystem<R: RecvTransport> {
     /// The read transport, taken `None` on drop-on-disconnect (no reconnect, telemetry.md §7).
     recv: Option<R>,
     /// Whether the ground subscription has been sent (once, before the first `recv`).
     subscribed: bool,
+    /// The forward set, in config order: one `(NAME, ID)` per msg. Index k is minted
+    /// output port k ([`instance_descriptor`](AsyncSystem::instance_descriptor)) and
+    /// bound writer k ([`MsgFanOut`]) — one list keys all three.
+    msgs: Vec<(&'static str, PacketId)>,
+    /// Config name tokens awaiting [`configure`](BuildSystem::configure) resolution
+    /// (the registry path; [`with_msg`](Self::with_msg) resolves statically instead).
+    unresolved: Vec<String>,
 }
 
 impl<R: RecvTransport> UplinkSystem<R> {
-    /// Construct the (pre-init) uplink from its read transport (its own connection).
+    /// Construct the (pre-init) uplink from its read transport (its own connection),
+    /// with an empty forward set — add msgs via [`with_msg`](Self::with_msg) or the
+    /// registry's `msgs` params.
     pub fn new(recv: R) -> Self {
         Self {
             recv: Some(recv),
             subscribed: false,
+            msgs: Vec::new(),
+            unresolved: Vec::new(),
         }
     }
-}
 
-/// The message ids the uplink subscribes to on the ground: the `PacketId`s of its declared
-/// message-output ports (`docs/message-wiring.md` §5.2). Derived from the bundle descriptor, so a
-/// future uplink that forwards a second command type just declares a second output — the
-/// subscription follows automatically.
-fn uplink_subscribe_ids() -> Vec<PacketId> {
-    <UplinkPorts as SystemOutput>::port_descs()
-        .iter()
-        .filter_map(|p| match p.id {
-            PortId::Packet(id) => Some(id),
-            _ => None,
-        })
-        .collect()
+    /// Add `M` to the forward set — the typed twin of the `msgs` config list:
+    /// subscribes to `M::ID` on the ground and mints an `M`-keyed output port.
+    /// Idempotent.
+    pub fn with_msg<M: NamedMsg>(mut self) -> Self {
+        if !self.msgs.iter().any(|&(_, id)| id == M::ID) {
+            self.msgs.push((M::NAME, M::ID));
+        }
+        self
+    }
 }
 
 impl<R: RecvTransport + 'static> System for UplinkSystem<R> {
     type Input = UplinkIn;
-    type Output = Out<UplinkPorts>;
+    type Output = UplinkOut;
     const NAME: &'static str = "uplink";
 }
 
 impl<R: RecvTransport + 'static> AsyncSystem for UplinkSystem<R> {
-    /// One ingest pass (the coordinator's async-run loop calls it repeatedly): `recv` the next
-    /// packet and [`route`](RouteMsg::route) it to the declared output whose id matches (A8) —
-    /// subscription and dispatch derive from the one declared bundle, so they cannot diverge.
-    /// A Msg no declared port carries bumps `uplink.unroutable` (the db should only relay
-    /// subscribed ids, so this signals a broker/config mismatch); Tables are silently ignored
-    /// (the downlink's traffic class, never expected here). On the first error the link is
-    /// dropped (no reconnect) and subsequent passes idle so the loop does not spin a dead
-    /// reader.
+    /// The static health/log shape plus one untelemetered message port per configured
+    /// msg, in config order — the subscription, the dispatch, and the wired ports all
+    /// derive from the one `msgs` list, so they cannot diverge.
+    fn instance_descriptor(&self) -> SystemDescriptor {
+        let mut desc = Self::descriptor();
+        desc.outputs.extend(
+            self.msgs
+                .iter()
+                .map(|&(name, id)| PortDesc::msg_dynamic(name, id).untelemetered()),
+        );
+        desc
+    }
+
+    /// One ingest pass (the coordinator's async-run loop calls it repeatedly): `recv` the
+    /// next packet and forward it verbatim on the minted output whose id matches. A Msg
+    /// outside the configured set bumps `uplink.unroutable` (the db should only relay
+    /// subscribed ids, so this signals a broker/config mismatch); a full ring bumps
+    /// `uplink.dropped`; Tables are silently ignored (the downlink's traffic class, never
+    /// expected here). On the first error the link is dropped (no reconnect) and subsequent
+    /// passes idle so the loop does not spin a dead reader.
     async fn run(&mut self, _input: &mut Self::Input, output: &mut Self::Output) {
-        // Subscribe once, before the first read, to the ids of the uplink's declared outputs.
+        // Subscribe once, before the first read, to exactly the configured ids.
         if !self.subscribed {
-            let ids = uplink_subscribe_ids();
+            let (fan, health) = output.split();
+            // An async system has no per-cycle driver flushing its health, and an
+            // init-time log never reaches the ground (the downlink's taps resolve
+            // during init) — so warn on the first run pass and publish immediately.
+            if self.msgs.is_empty() {
+                health.log(
+                    crate::health::Level::Warn,
+                    "uplink has no msgs configured; it will receive nothing",
+                );
+                health.end_cycle(Timestamp::now(), 0);
+            } else if fan.len() != self.msgs.len() {
+                // One writer per configured msg is the bind contract; a mismatch
+                // means the registered descriptor and this instance diverged.
+                health.error("uplink.bind_mismatch");
+                health.end_cycle(Timestamp::now(), 0);
+            }
+            let ids: Vec<PacketId> = self.msgs.iter().map(|&(_, id)| id).collect();
             if let Some(recv) = self.recv.as_mut() {
                 recv.subscribe(&ids);
             }
@@ -631,15 +680,19 @@ impl<R: RecvTransport + 'static> AsyncSystem for UplinkSystem<R> {
         };
         match recv.recv().await {
             Ok(OwnedPacket::Msg(m)) => {
-                // Disjoint borrows: `route` takes the ports, the miss takes health.
-                let (ports, health) = output.split();
-                if !ports.route(m.id, &m.buf) {
-                    health.error("uplink.unroutable");
-                    // An async system has no per-cycle driver flushing its health
-                    // (`CyclicRunner::step` does that for cyclic systems), so
-                    // publish the miss immediately — otherwise the counter would
-                    // never reach the wire.
-                    health.end_cycle(Timestamp::now(), 0);
+                // Disjoint borrows: the forward takes the ports, the miss takes health.
+                let (fan, health) = output.split();
+                match self.msgs.iter().position(|&(_, id)| id == m.id) {
+                    Some(idx) => {
+                        if fan.write_raw(idx, m.id, &m.buf).is_err() {
+                            health.error("uplink.dropped");
+                            health.end_cycle(Timestamp::now(), 0);
+                        }
+                    }
+                    None => {
+                        health.error("uplink.unroutable");
+                        health.end_cycle(Timestamp::now(), 0);
+                    }
                 }
             }
             // Tables are ignored — the uplink is commands only.

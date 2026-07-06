@@ -162,6 +162,21 @@ pub enum LoadError {
         span: SourceSpan,
     },
 
+    #[error("system `{system}` names unknown msg `{msg}` (registered: {available})")]
+    #[diagnostic(
+        code(fsw_wiring::unknown_msg_name),
+        help("register the message type via `Registry::register_msg::<M>()`")
+    )]
+    UnknownMsgName {
+        system: String,
+        msg: String,
+        available: String,
+        #[source_code]
+        src: String,
+        #[label("not a registered NamedMsg token")]
+        span: SourceSpan,
+    },
+
     #[error("wiring error: {source}")]
     #[diagnostic(code(fsw_wiring::wire))]
     Wire {

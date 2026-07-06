@@ -402,7 +402,9 @@ system "alarms" type="Alarms" {
 }
 system "imu" type="ImuDriver" i2c_bus=1 sample_hz=200.0
 
-system "uplink" type="TcpUplink" addr="127.0.0.1:2299"
+system "uplink" type="TcpUplink" addr="127.0.0.1:2299" {
+    msgs "AlarmAck"
+}
 connect "uplink" -> "alarms" msg="AlarmAck"
 "#;
 
@@ -496,13 +498,16 @@ system "tlm_imu" type="TcpDownlink" addr="127.0.0.1:2297" {
 }
 
 /// The built-in `type="TcpUplink"` node loads like any async system, under any
-/// instance name, and its command edges resolve by message name.
+/// instance name, and its command edges resolve by message name — against the
+/// ports its `msgs` config minted.
 #[test]
 fn tcp_uplink_node_loads_and_edges_resolve() {
     let kdl = r#"
 coordinator cycle_rate=100.0
 
-system "ground" type="TcpUplink" addr="127.0.0.1:2295"
+system "ground" type="TcpUplink" addr="127.0.0.1:2295" {
+    msgs "AlarmAck"
+}
 system "alarms" type="Alarms" {
     alarm id="OMEGA_HIGH" name="Omega High" {
         target component="imu.imu.omega"
@@ -514,6 +519,84 @@ system "imu" type="ImuDriver" i2c_bus=1 sample_hz=200.0
 connect "ground" -> "alarms" msg="AlarmAck"
 "#;
     load(kdl, &registry()).expect("uplink node loads and the ack edge resolves");
+}
+
+/// The uplink relays a USER-registered msg type: `register_msg::<WireEvent>()`
+/// puts the name in the msg table, the `msgs` config mints its port, and the edge
+/// resolves — the forward set is config, not a compiled-in id list.
+#[test]
+fn tcp_uplink_relays_user_registered_msg() {
+    let mut reg = registry();
+    reg.register_msg::<WireEvent>();
+    let kdl = r#"
+coordinator cycle_rate=100.0
+
+system "uplink" type="TcpUplink" addr="127.0.0.1:2294" {
+    msgs "WireEvent"
+}
+system "sink" type="MsgSink"
+connect "uplink" -> "sink" msg="WireEvent"
+"#;
+    load(kdl, &reg).expect("a user msg resolves in `msgs` and its edge connects");
+}
+
+/// A `msgs` token that is not a registered `NamedMsg` is a spanned load error
+/// listing the registered names.
+#[test]
+fn err_uplink_unknown_msg_name() {
+    let kdl = r#"
+coordinator cycle_rate=100.0
+system "uplink" type="TcpUplink" addr="127.0.0.1:2293" {
+    msgs "SequnceCommand"
+}
+"#;
+    let err = load_err(kdl);
+    match err {
+        LoadError::UnknownMsgName {
+            system,
+            msg,
+            available,
+            ..
+        } => {
+            assert_eq!(system, "uplink");
+            assert_eq!(msg, "SequnceCommand");
+            assert!(
+                available.contains("SequenceCommand"),
+                "the error lists the registered names: {available}"
+            );
+        }
+        other => panic!("expected UnknownMsgName, got {other:?}"),
+    }
+}
+
+/// An edge naming a msg the uplink's config does NOT list fails like any missing
+/// port (`UnknownMsg`) — the minted set is exactly the config, nothing implicit.
+#[test]
+fn err_uplink_edge_to_unconfigured_msg() {
+    let kdl = r#"
+coordinator cycle_rate=100.0
+
+system "uplink" type="TcpUplink" addr="127.0.0.1:2292" {
+    msgs "SequenceCommand"
+}
+system "alarms" type="Alarms" {
+    alarm id="OMEGA_HIGH" name="Omega High" {
+        target component="imu.imu.omega"
+        warning above=2.5
+    }
+}
+system "imu" type="ImuDriver" i2c_bus=1 sample_hz=200.0
+connect "uplink" -> "alarms" msg="AlarmAck"
+"#;
+    let err = load_err(kdl);
+    assert!(
+        matches!(
+            err,
+            LoadError::UnknownMsg { ref instance, ref msg, .. }
+                if instance == "uplink" && msg == "AlarmAck"
+        ),
+        "{err:?}"
+    );
 }
 
 // ---------------------------------------------------------------------------

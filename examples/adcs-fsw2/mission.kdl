@@ -97,8 +97,11 @@ connect "ctrl"  -> "plant" frame="torque_cmd" delayed=#true
 // uplink is a framework built-in (`type="TcpUplink"`), an ordinary system ingesting
 // panel commands off its own connection (it connects lazily; a headless run without
 // a broker just idles); the in-proc `control_handle` is the "coordinator" producer.
-// A producer with no edge here commands nothing.
-system "uplink" type="TcpUplink" addr="127.0.0.1:2241"
+// A producer with no edge here commands nothing. `msgs` is the forward set: the
+// uplink subscribes to exactly these types and mints one output port per entry.
+system "uplink" type="TcpUplink" addr="127.0.0.1:2241" {
+    msgs "SequenceCommand" "AlarmAck"
+}
 connect "uplink"      -> "mode" msg="SequenceCommand"   // ground commands
 connect "coordinator" -> "mode" msg="SequenceCommand"   // in-proc control_handle
 connect "uplink"      -> "alarms" msg="AlarmAck"        // operator acks (gate latching alarms)

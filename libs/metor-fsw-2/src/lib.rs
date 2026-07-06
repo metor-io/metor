@@ -94,9 +94,12 @@ pub use alarm::{AlarmIn, AlarmOut, AlarmSpec, AlarmSystem, AlarmsParams, BandSpe
 
 // The general message channel — the `(PacketId, postcard)` record format, the
 // type-erased emit port, and its sizing/record helpers (`docs/messages.md` §1, §2).
-pub use message::{CommandOut, MAX_MSG_BYTES, MsgIn, MsgOut, NamedMsg, split_record};
+pub use message::{
+    CommandOut, MAX_MSG_BYTES, MsgFanOut, MsgIn, MsgOut, MsgTable, NamedMsg, split_record,
+};
 pub use system::{
-    AsyncSystem, BuildSystem, CyclicRunner, CyclicSystem, Out, System, SystemInput, SystemOutput,
+    AsyncSystem, BuildCtx, BuildSystem, ConfigureError, CyclicRunner, CyclicSystem, Out, System,
+    SystemInput, SystemOutput,
 };
 
 // Re-export the ring transport so a system author only needs `metor_fsw_2::*`.

@@ -417,8 +417,58 @@ fn apply_overrides(wiring: &mut Wiring, args: &RunArgs) -> miette::Result<()> {
         wiring.systems.push(SystemSpec::tcp_downlink("telemetry", addr));
     }
     if let Some(addr) = args.uplink {
-        wiring.systems.retain(|s| s.ty.as_deref() != Some(TCP_UPLINK_TYPE));
-        wiring.systems.push(SystemSpec::tcp_uplink("uplink", addr));
+        // Patch `addr=` on the declared uplink(s) IN PLACE — never replace the node,
+        // which would silently drop its `msgs` config (an uplink relaying nothing).
+        // Only a mission with no uplink at all gets a fresh (msgs-less) instance.
+        let mut found = false;
+        for spec in wiring
+            .systems
+            .iter_mut()
+            .filter(|s| s.ty.as_deref() == Some(TCP_UPLINK_TYPE))
+        {
+            patch_spec_addr(spec, addr)?;
+            found = true;
+        }
+        if !found {
+            wiring.systems.push(SystemSpec::tcp_uplink("uplink", addr));
+        }
+    }
+    Ok(())
+}
+
+/// Upsert the `addr=` property on a built-in link spec's params node, preserving
+/// every other param (the uplink's `msgs` children) — the write twin of
+/// [`spec_addr`]. A param-less spec synthesizes the minimal node
+/// [`SystemSpec::tcp_uplink`] would have produced.
+fn patch_spec_addr(spec: &mut SystemSpec, addr: SocketAddr) -> miette::Result<()> {
+    use crate::wiring::ParamSource;
+    match &mut spec.params {
+        ParamSource::Kdl(text) => {
+            let mut doc: kdl::KdlDocument = text
+                .parse()
+                .map_err(|e| miette::miette!("invalid params node on `{}`: {e}", spec.name))?;
+            let node = doc
+                .nodes_mut()
+                .first_mut()
+                .ok_or_else(|| miette::miette!("empty params node on `{}`", spec.name))?;
+            node.insert("addr", addr.to_string());
+            *text = doc.to_string();
+        }
+        ParamSource::None => {
+            let ty = spec.ty.as_deref().unwrap_or(TCP_UPLINK_TYPE);
+            spec.params = ParamSource::Kdl(format!(
+                "system \"{}\" type=\"{ty}\" addr=\"{addr}\"",
+                spec.name
+            ));
+        }
+        // Typed builder params are postcard bytes with no KDL to patch; the static
+        // resolve path rejects them anyway (`StaticPostcardParams`).
+        ParamSource::Postcard(_) => {
+            return Err(miette::miette!(
+                "cannot override `addr` on `{}`: it carries typed (postcard) params",
+                spec.name
+            ));
+        }
     }
     Ok(())
 }
