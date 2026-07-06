@@ -229,7 +229,12 @@ let mut b = Coordinator::builder(CoordinatorConfig::default());
 let imu = b.add_cyclic(ImuDriver::new());
 let nav = b.add_cyclic(MekfFilter::new());
 b.connect(PortRef::new::<Imu>(imu), PortRef::new::<Imu>(nav))?;
-b.add_telemetry(TelemetryConfig { transport: TcpTransport::new(addr), mode: TelemetryMode::All });
+// The telemetry downlink is an ordinary system; register it after the other cyclic
+// systems (its ReceiveAll capability makes build() enforce that ordering).
+b.add_cyclic(TelemetrySystem::new(TelemetryConfig {
+    transport: TcpTransport::new(addr),
+    mode: TelemetryMode::All,
+}));
 let mut coordinator = b.build()?;
 ```
 
@@ -280,9 +285,10 @@ accident of registration order. An unbroken cycle is rejected at `build()` as a
 
 A mission's graph is described by the `Wiring` data model (`src/wiring/model.rs`): a plain,
 serde-serializable Rust description of the coordinator config, the loadable artifacts, the
-system instances, the edges (frame and message), the optional telemetry downlink, the
-runtime-loadable slots (`docs/sequences-slots.md`), and the optional command uplink
-(`docs/messages.md` §4.4). `Wiring` is the single source of truth, and it has two equivalent
+system instances, the runtime-loadable slots (`docs/sequences-slots.md`), and the edges
+(frame and message). The telemetry downlink and the command uplink are ordinary systems —
+built-in registry types (`type="TcpDownlink"`, telemetry.md §8; `type="TcpUplink"`,
+`docs/messages.md` §4.4). `Wiring` is the single source of truth, and it has two equivalent
 front-ends:
 
 - A **KDL document**, deserialized by `parse` — a text format for declaring systems, their
@@ -294,10 +300,7 @@ coordinator cycle_rate=200.0 default_depth=8
 system "imu" type="ImuDriver" i2c_bus=1 sample_hz=200.0
 system "nav" type="MekfFilter" gain=0.8
 connect "imu" -> "nav" frame="imu"
-telemetry {
-    transport "tcp" addr="127.0.0.1:2240"
-    mode "all"
-}
+system "telemetry" type="TcpDownlink" addr="127.0.0.1:2240"
 ```
 
 Both front-ends feed one shared `resolve`, which instantiates each system, connects the
@@ -425,12 +428,12 @@ recognizes and lowers to an `.untelemetered()` `PortDesc` (`src/message.rs`), so
 never echoed back out the downlink. Commands reach the runtime slots with **no coordinator-side
 command stage**: each slot declares a `commands: MsgIn<SequenceCommand>` fan-in port wired by
 **explicit edges** — every command producer that should reach a given slot is connected to it by
-name in KDL, and a KDL `uplink { transport "tcp" addr="…" }` node declares the uplink itself
-(closing the earlier Rust-builder-only gap — the uplink has full KDL parity with every other
-system):
+name in KDL, and the uplink itself is an ordinary `system` node of the built-in
+`type="TcpUplink"` (full parity with every other system — `"uplink"` is just a
+conventional instance name):
 
 ```kdl
-uplink { transport "tcp" addr="127.0.0.1:2241" }
+system "uplink" type="TcpUplink" addr="127.0.0.1:2241"
 connect "uplink"      -> "mode" msg="SequenceCommand"   // ground commands
 connect "coordinator" -> "mode" msg="SequenceCommand"   // in-proc control_handle()
 ```
@@ -485,5 +488,6 @@ of each subsystem:
 - `docs/messages.md` — the message channel (a second payload kind), the telemetry uplink/downlink of messages, and the `SequenceCommand` command plane.
 - `docs/message-wiring.md` — messages as first-class wired ports/edges (`MsgOut<M>`/`MsgIn<M>`, `msg=`/`connect_msg`), the `AllOutputs` receive-all capability, and the port-unification axes (schema × delivery × fan-in, plus the `PortConn` axis). The command-plane shape it originally designed is further reframed — see `docs/messages.md`'s status banner and `docs/design-command-slots.md` for what actually shipped (name-addressed commands, explicit per-slot edges, the uplink's multi-output `CommandOut` dispatch).
 - `docs/alarms.md` — the alarm engine: a shipped, ordinary system (`type="Alarms"`) evaluating KDL-declared limit alarms against any telemetered component and broadcasting the wkt alarm Msgs the panel consumes.
+- `docs/normalize-telemetry-uplink-plan.md` — how the telemetry downlink and command uplink became ordinary registry systems (`type="TcpDownlink"`/`type="TcpUplink"`), replacing the dedicated `telemetry`/`uplink` wiring surface.
 </content>
 </invoke>

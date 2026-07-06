@@ -45,7 +45,7 @@ front-ends that produce a [`Wiring`] and exactly one resolver that consumes it:
   the Rust builder can express, because both target this type.
 - [`resolve`]`(wiring: &Wiring, registry: &Registry) -> Result<Coordinator, LoadError>` — walks a
   [`Wiring`], instantiates every system (static through the [`Registry`], dl by `dlopen`), connects
-  the edges, adds telemetry, and `build()`s. The validation/sizing/telemetry passes are identical
+  the edges, and `build()`s. The validation/sizing/telemetry passes are identical
   for static and dl systems and for both front-ends.
 
 [`load`]`(kdl, registry)` is the convenience composition `resolve(&parse(kdl)?, registry)`.
@@ -69,10 +69,15 @@ pub struct Wiring {
     pub coordinator: CoordinatorSpec,   // cycle rate, default depth, clock
     pub artifacts:   Vec<Artifact>,     // the cdylibs this mission loads
     pub systems:     Vec<SystemSpec>,   // the system instances
+    pub slots:       Vec<SlotSpec>,     // runtime-loadable sequence slots
     pub edges:       Vec<EdgeSpec>,     // producer → consumer edges
-    pub telemetry:   Option<TelemetrySpec>,
 }
 ```
+
+The telemetry downlink and the command uplink are **ordinary systems** here — instances of
+the built-in registry types (`TCP_DOWNLINK_TYPE` = `"TcpDownlink"`, `TCP_UPLINK_TYPE` =
+`"TcpUplink"`), not dedicated fields. `SystemSpec::tcp_downlink`/`tcp_uplink` construct the
+specs the builder sugar and the CLI flags push.
 
 ### 1.1 `CoordinatorSpec` / `ClockSpec`
 
@@ -148,26 +153,14 @@ pub struct EdgeSpec {
 `delayed` selects [`CoordinatorBuilder::connect_delayed`] over `connect`: the back-edge of a control
 loop, excluded from cycle detection (§4.3).
 
-### 1.5 `TelemetrySpec`
-
-```rust
-pub struct TelemetrySpec {
-    pub addr: SocketAddr,           // TCP downlink address
-    pub mode: TelemetryModeSpec,
-}
-
-pub enum TelemetryModeSpec {
-    All,                                          // tap every output buffer
-    Subset { instances: Vec<String>, frames: Vec<String> }, // tap matching instances/frames
-}
-```
-
 ---
 
 ## 2. The KDL schema
 
-A KDL wiring document has up to five node kinds at the top level: exactly one `coordinator`, N
-`artifact` nodes, N `system` nodes, M `connect` edges, and an optional `telemetry` block.
+A KDL wiring document has up to five node kinds at the top level: exactly one `coordinator`,
+N `artifact` nodes, N `system` nodes, N `slot` nodes, and M `connect` edges. (The
+pre-normalization `telemetry`/`uplink` blocks surface a guidance error carrying the
+`system` spelling that replaced them.)
 Conventions follow `metor-proto-kdl` (lowercase node names, `key=value` properties, KDL v2 `#true`
 booleans). Params and config are **properties on the node line**, not a `{ key=value }` children
 block (the latter is not valid KDL v2).
@@ -257,21 +250,20 @@ connect "uplink" -> "mode" msg="SequenceCommand"    // message edge (many-to-man
   `CoordinatorBuilder`/`PortRef` API needs only one `connect`, inferring the kind from the
   `PortRef`'s `PortId` (`Component` vs `Packet`).
 
-### 2.5 `telemetry`
+### 2.5 The downlink/uplink built-ins
 
 ```kdl
-telemetry {
-    transport "tcp" addr="127.0.0.1:2240"
-    mode "all"                       // or: mode "subset"
-    // subset only:
-    // tap instance="imu_left"
-    // tap frame="control"
+system "telemetry" type="TcpDownlink" addr="127.0.0.1:2240" {
+    instances "nav" "imu"      // optional subset children; omit both to tap everything
+    frames "gyro_b"
 }
+system "uplink" type="TcpUplink" addr="127.0.0.1:2241"
 ```
 
-`transport "tcp"` is the only v1 transport. `mode "all"` taps every output buffer; `mode "subset"`
-taps the `tap instance=…` / `tap frame=…` children. Absent `mode` ⇒ `all`. Maps onto
-[`TelemetrySpec`].
+Ordinary `system` nodes of the built-in registry types (telemetry.md §8, messages.md §4.4)
+— `"telemetry"`/`"uplink"` are conventional instance names, not reserved words, and several
+instances are legal. The resolver defers static `ReceiveAll` systems (the downlink, the
+alarm engine) behind every other cyclic registration, so document position is free.
 
 ### 2.6 Worked example
 
@@ -557,7 +549,7 @@ are wrapped with the error's own rendered message as the snippet.
 - `src/wiring/tests.rs` — the in-crate acceptance suite: an end-to-end KDL load + run of a
   params-bearing cyclic chain into an async logger; instance-name disambiguation of two instances of
   one type; the span-carrying error cases; feedback-cycle detection and the `delayed=#true` break; a
-  `telemetry` node loading; the KDL `serde::Deserializer` round-trip (`src/wiring/de.rs`); and the **front-end equivalence**
+  `TcpDownlink` system-node loading; the KDL `serde::Deserializer` round-trip (`src/wiring/de.rs`); and the **front-end equivalence**
   tests (`parse` and `WiringBuilder` produce byte-equal [`Wiring`], and a builder-origin [`Wiring`]
   resolves and runs).
 - `tests/wiring_resolve.rs` — the dl acceptance gate driven **through** the [`Wiring`] data model: a

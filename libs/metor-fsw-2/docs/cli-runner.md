@@ -139,10 +139,10 @@ which (a directory, or a `*.bundle`, is a bundle). Loading differs:
 | `--wall` | `coordinator.clock = ClockSpec::Wall` |
 | `--sim-dt <SECS>` | `coordinator.clock = ClockSpec::Simulated { dt_secs }` |
 | `--cycle-rate <HZ>` | `coordinator.cycle_rate = HZ` |
-| `--telemetry <ADDR>` | `telemetry = Some(TelemetrySpec { addr, mode })` (enables it) |
+| `--telemetry <ADDR>` | replaces any `TcpDownlink` spec with `SystemSpec::tcp_downlink("telemetry", addr)` (enables it) |
 | `--telemetry-mode all` | sets the mode of `--telemetry` (v1: `all`; `subset` stays KDL-only) |
-| `--no-telemetry` | `telemetry = None` (disable even if the KDL declares it) |
-| `--uplink <ADDR>` | `wiring.uplink = Some(UplinkSpec { addr })` — enables the command uplink (its own connection, reading panel `SequenceCommand`s, `docs/messages.md` §4.4) even if the KDL doesn't declare an `uplink { … }` node |
+| `--no-telemetry` | removes every `TcpDownlink` spec (disable even if the KDL declares one) |
+| `--uplink <ADDR>` | replaces any `TcpUplink` spec with `SystemSpec::tcp_uplink("uplink", addr)` — enables the command uplink (its own connection, reading panel `SequenceCommand`s, `docs/messages.md` §4.4) even if the KDL doesn't declare one |
 | `--cycles <N>` | `run_for(N)`; default `usize::MAX` (run until interrupted) |
 
 `--wall`/`--sim-dt` are mutually exclusive (clap group). `--telemetry`/`--no-telemetry` are
@@ -162,8 +162,11 @@ the active config is never a guess.
   ahead of real time; the banner suggests `--wall` whenever telemetry is on with a sim clock.
   For live panel viewing use `--wall --telemetry <addr>`.
 - The uplink gets the same one-shot reachability probe as telemetry, reported on its own banner
-  line; with no `--uplink`/KDL `uplink { … }` node the banner says `uplink: off — pass
-  \`--uplink <addr>\` to receive panel commands` (`src/cli/mod.rs`).
+  line; with no `--uplink`/KDL `TcpUplink` system the banner says `uplink: off — pass
+  \`--uplink <addr>\` to receive panel commands` (`src/cli/mod.rs`). The link flags/banner key
+  on the built-in **types** (`TCP_DOWNLINK_TYPE`/`TCP_UPLINK_TYPE`), never on instance names,
+  so a user-written downlink/uplink system is untouched by them; several instances get one
+  banner line each.
 
 ### 2.4 The build→run shortcut
 
@@ -469,8 +472,8 @@ the `build_live_coordinator` pattern, generalized: load → mutate `Wiring` → 
 | --- | --- | --- | --- |
 | clock | `coordinator sim_dt=…` / absent⇒Wall | `--sim-dt` / `--wall` | flag > KDL > `Wall` |
 | cycle rate | `coordinator cycle_rate=…` | `--cycle-rate` | flag > KDL |
-| telemetry | `telemetry { … }` / absent⇒none | `--telemetry <addr>` / `--no-telemetry` | flag > KDL |
-| telemetry mode | `mode "all"|"subset"` | `--telemetry-mode all` | flag > KDL (subset KDL-only) |
+| telemetry | `system "…" type="TcpDownlink"` / absent⇒none | `--telemetry <addr>` / `--no-telemetry` | flag > KDL |
+| telemetry mode | `instances`/`frames` subset children | `--telemetry-mode all` | flag > KDL (subset KDL-only) |
 
 The example relies on this directly: `mission.kdl` declares the **sim** base (free-running
 `Simulated` clock, no telemetry) — the headless/test config — and a live run is purely
