@@ -150,6 +150,47 @@ fn uplink_override_pushes_tcp_uplink_spec() {
     );
 }
 
+/// `--uplink` on a mission that already declares one patches `addr=` IN PLACE —
+/// the spec's other params (its `msgs` config) must survive the override.
+#[test]
+fn uplink_override_preserves_msgs_config() {
+    use crate::wiring::{ParamSource, SystemSpec, TCP_UPLINK_TYPE};
+
+    let mut wiring = WiringBuilder::new()
+        .coordinator(120.0, ClockSpec::Wall)
+        .build();
+    wiring.systems.push(SystemSpec {
+        name: "ground".to_string(),
+        ty: Some(TCP_UPLINK_TYPE.to_string()),
+        artifact: None,
+        params: ParamSource::Kdl(
+            "system \"ground\" type=\"TcpUplink\" addr=\"10.0.0.1:9999\" {\n    \
+             msgs \"SequenceCommand\" \"AlarmAck\"\n}"
+                .to_string(),
+        ),
+    });
+    let args = run_args(&[
+        "metor-fsw", "run", "m.kdl", "--build", "--uplink", "127.0.0.1:2241",
+    ]);
+    apply_overrides(&mut wiring, &args).unwrap();
+
+    assert_eq!(wiring.systems.len(), 1, "patched in place, not replaced");
+    let spec = &wiring.systems[0];
+    assert_eq!(spec.name, "ground", "the declared instance name survives");
+    let ParamSource::Kdl(text) = &spec.params else {
+        panic!("params stay KDL");
+    };
+    assert_eq!(
+        spec_addr(spec),
+        Some("127.0.0.1:2241".parse().unwrap()),
+        "the flag's addr won: {text}"
+    );
+    assert!(
+        text.contains("msgs") && text.contains("SequenceCommand") && text.contains("AlarmAck"),
+        "the msgs child survives the override: {text}"
+    );
+}
+
 #[test]
 fn sim_dt_override_sets_simulated_clock() {
     let mut wiring = WiringBuilder::new().coordinator(120.0, ClockSpec::Wall).build();

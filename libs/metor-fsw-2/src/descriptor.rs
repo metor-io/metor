@@ -310,6 +310,25 @@ impl PortDesc {
         }
     }
 
+    /// [`msg`](Self::msg) at the value level: mint a Postcard port from a runtime
+    /// `(name, id)` pair, for an instance descriptor whose message ports are
+    /// determined by config and so have no static `M` (the uplink's
+    /// one-port-per-configured-msg). Same axes as [`msg`](Self::msg); `name` is
+    /// the stable [`NamedMsg::NAME`] token the config resolved (a `MsgTable`
+    /// holds it `&'static`), so `msg="<name>"` edges resolve identically.
+    pub fn msg_dynamic(name: &'static str, id: PacketId) -> Self {
+        Self {
+            id: PortId::Packet(id),
+            name,
+            max_size: MAX_MSG_BYTES,
+            schema: PortSchema::Postcard,
+            delivery: Delivery::Log,
+            fan_in: FanIn::Many,
+            telemetered: true,
+            conn: PortConn::Edge,
+        }
+    }
+
     /// Opt this output out of the downlink / `AllOutputs` tap (A6): the port stays a
     /// first-class registered buffer (debugger/test visible by key) but is never
     /// downlinked. Command channels use this; frame outputs may too.

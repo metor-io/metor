@@ -120,6 +120,19 @@ pub trait RingSource {
         RD: WakeSink + Default + Clone + 'static,
         RS: WakeSource + Default + Clone + 'static;
 
+    /// Pop the next output ring **if one remains** — the dynamic-count twin of
+    /// [`next_output`](Self::next_output), for a bundle whose trailing output count
+    /// is config-determined ([`MsgFanOut`](crate::MsgFanOut) drains the remainder).
+    /// The default (non-host sources, which never carry config-minted ports)
+    /// yields none.
+    fn try_next_output<WD, WS>(&mut self) -> Option<(RingBuffer, WD, WS)>
+    where
+        WD: WakeSource + Default + Clone + 'static,
+        WS: WakeSink + Default + Clone + 'static,
+    {
+        None
+    }
+
     /// Pop **every** producer ring wired to the next (message) input port — the fan-in list
     /// (`docs/message-wiring.md` §3.3). `Vec::new()` is a legal, unconnected message input
     /// (reads nothing). Frame ports call [`next_input`](Self::next_input) instead; only
@@ -157,6 +170,15 @@ impl<'a> RingSource for Binder<'a> {
             .next()
             .expect("bind() walks output ports in descriptors() order");
         (p.ring.clone(), BoundPort::wake(&p.data), WS::default())
+    }
+
+    fn try_next_output<WD, WS>(&mut self) -> Option<(RingBuffer, WD, WS)>
+    where
+        WD: WakeSource + Default + Clone + 'static,
+        WS: WakeSink + Default + Clone + 'static,
+    {
+        let p = self.outputs.next()?;
+        Some((p.ring.clone(), BoundPort::wake(&p.data), WS::default()))
     }
 
     fn next_input<RD, RS>(&mut self) -> (RingBuffer, RD, RS)

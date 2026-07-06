@@ -16,6 +16,7 @@ use crate::binder::{BindPorts, RingSource};
 use crate::coordinator::{CyclicSlot, SlotState};
 use crate::descriptor::{PortDecl, PortDesc, SystemDescriptor, SystemKind, split_decls};
 use crate::health::{HealthPort, SystemHealth, SystemLog};
+use crate::message::MsgTable;
 use crate::port::Output;
 
 // ---------------------------------------------------------------------------
@@ -182,6 +183,40 @@ pub trait BuildSystem: Sized {
     type Params;
     /// Construct the (pre-init) system from its decoded params.
     fn new(params: Self::Params) -> Self;
+
+    /// Host-side second construction phase: resolve config references against host
+    /// context — e.g. message name tokens against the registry's [`MsgTable`]
+    /// (`docs/messages.md` §4.4). The static-registry factory calls it between
+    /// [`new`](Self::new) and registration; the dl `fsw_create` path never does (a
+    /// `.so` decodes params in isolation and cannot see host tables). Defaults to a
+    /// no-op, so a system whose params are self-contained ignores it.
+    fn configure(&mut self, _ctx: &BuildCtx) -> Result<(), ConfigureError> {
+        Ok(())
+    }
+}
+
+/// The host context [`BuildSystem::configure`] resolves config references against —
+/// the tables a `Params` value cannot carry (params cross the dl wire as postcard;
+/// the tables are host state).
+pub struct BuildCtx<'a> {
+    /// The registered message types (`Registry::register_msg` on the wiring
+    /// registry), keyed by [`NamedMsg::NAME`](crate::NamedMsg).
+    pub msgs: &'a MsgTable,
+}
+
+/// A [`configure`](BuildSystem::configure) failure. Deliberately span-free — the
+/// trait is format-independent, so the wiring loader wraps a variant with the KDL
+/// node's source span before surfacing it.
+#[derive(Debug, thiserror::Error)]
+pub enum ConfigureError {
+    /// A configured message name token is not in the host's [`MsgTable`].
+    #[error("unknown msg `{name}` (registered: {})", available.join(", "))]
+    UnknownMsg {
+        /// The unresolvable config token.
+        name: String,
+        /// Every registered name, for the error listing.
+        available: Vec<&'static str>,
+    },
 }
 
 // ---------------------------------------------------------------------------
@@ -243,6 +278,14 @@ pub trait CyclicSystem: System {
             capabilities,
         }
     }
+
+    /// This *instance*'s descriptor — [`descriptor`](Self::descriptor) unless the
+    /// port set depends on the instance's config (the uplink minting one message
+    /// output per configured msg). The builder registers this value, so a
+    /// config-derived port is sized, wired, and telemetered like any static one.
+    fn instance_descriptor(&self) -> SystemDescriptor {
+        Self::descriptor()
+    }
 }
 
 /// A self-driven system: it owns its own loop, paced by a timer or by awaiting its
@@ -269,6 +312,14 @@ pub trait AsyncSystem: System {
             outputs,
             capabilities,
         }
+    }
+
+    /// This *instance*'s descriptor — [`descriptor`](Self::descriptor) unless the
+    /// port set depends on the instance's config (the uplink minting one message
+    /// output per configured msg). The builder registers this value, so a
+    /// config-derived port is sized, wired, and telemetered like any static one.
+    fn instance_descriptor(&self) -> SystemDescriptor {
+        Self::descriptor()
     }
 }
 

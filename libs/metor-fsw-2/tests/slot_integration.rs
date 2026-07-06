@@ -585,18 +585,21 @@ fn uplink_command_loads_and_starts_same_cycle() {
     let slot = b.add_slot("adcs", vec![occ("waiter", loaded)], None);
     // The uplink: a panel `Load { waiter }` then `Start`, both addressed to the slot by
     // its instance name — and reaching it over an explicit command edge (A2).
-    let uplink = b.add_async(UplinkSystem::new(MockRecv::new(vec![
-        SequenceCommand {
-            channel: "adcs".to_string(),
-            command: SequenceCommandKind::Load {
-                name: "waiter".to_string(),
+    let uplink = b.add_async(
+        UplinkSystem::new(MockRecv::new(vec![
+            SequenceCommand {
+                channel: "adcs".to_string(),
+                command: SequenceCommandKind::Load {
+                    name: "waiter".to_string(),
+                },
             },
-        },
-        SequenceCommand {
-            channel: "adcs".to_string(),
-            command: SequenceCommandKind::Start,
-        },
-    ])));
+            SequenceCommand {
+                channel: "adcs".to_string(),
+                command: SequenceCommandKind::Start,
+            },
+        ]))
+        .with_msg::<SequenceCommand>(),
+    );
     b.connect(
         PortRef::msg::<SequenceCommand>(uplink),
         PortRef::msg::<SequenceCommand>(slot),
@@ -1102,9 +1105,13 @@ fn uplink_routes_by_declared_output_and_survives_garbage() {
 
     let mut b = Coordinator::builder(sim_config());
     let tap = b.add_cyclic(CmdTap);
-    let uplink = b.add_async(UplinkSystem::new(MockRecv::from_packets(vec![
-        reload, unroutable, malformed, valid,
-    ])));
+    let uplink = b.add_async(
+        UplinkSystem::new(MockRecv::from_packets(vec![
+            reload, unroutable, malformed, valid,
+        ]))
+        .with_msg::<ReloadSequences>()
+        .with_msg::<SequenceCommand>(),
+    );
     b.connect(
         PortRef::msg::<ReloadSequences>(uplink),
         PortRef::msg::<ReloadSequences>(tap),
