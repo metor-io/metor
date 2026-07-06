@@ -175,18 +175,36 @@ where
     Ok((handle, <S as AddToBuilder<K>>::descriptor()))
 }
 
+/// One registered type: its instantiation factory plus the static descriptor —
+/// available without constructing the system, so `resolve` can order registrations
+/// by capability (a `ReceiveAll` system defers behind slots, `docs/alarms.md` §7 F1).
+struct RegistryEntry {
+    factory: SystemFactory,
+    descriptor: fn() -> SystemDescriptor,
+}
+
 /// The app-built map from a KDL `type="..."` string to a system factory
 /// (wiring.md §2.4 — an explicit table, not `inventory`). Each system crate can
 /// expose `pub fn register(&mut Registry)` registering its own systems.
 #[derive(Default)]
 pub struct Registry {
-    factories: HashMap<&'static str, SystemFactory>,
+    factories: HashMap<&'static str, RegistryEntry>,
 }
 
 impl Registry {
     /// An empty registry.
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// The framework's built-in static systems, registered under their KDL `type=`
+    /// names — currently the alarm engine (`type="Alarms"`, `docs/alarms.md` §2).
+    /// The CLI runner resolves against this, so every `cli::main()` mission gets the
+    /// built-ins with zero Rust; an app-built registry starts here and adds its own.
+    pub fn with_builtins() -> Self {
+        let mut r = Self::new();
+        r.register::<crate::AlarmSystem, _>("Alarms");
+        r
     }
 
     /// Register concrete system `S` under `type_name`. `S` supplies its params type
@@ -201,8 +219,25 @@ impl Registry {
         S: BuildSystem + AddToBuilder<K>,
         S::Params: serde::de::DeserializeOwned,
     {
-        self.factories.insert(type_name, factory::<S, K>);
+        self.factories.insert(
+            type_name,
+            RegistryEntry {
+                factory: factory::<S, K>,
+                descriptor: <S as AddToBuilder<K>>::descriptor,
+            },
+        );
         self
+    }
+
+    /// Whether a `type=` names a registered system whose descriptor carries
+    /// [`Capability::ReceiveAll`](crate::Capability). Unknown types answer `false` —
+    /// the systems pass reports them as [`LoadError::UnknownType`] in document order.
+    fn is_receive_all(&self, ty: Option<&str>) -> bool {
+        ty.and_then(|ty| self.factories.get(ty)).is_some_and(|e| {
+            (e.descriptor)()
+                .capabilities
+                .contains(&crate::Capability::ReceiveAll)
+        })
     }
 }
 
@@ -272,10 +307,22 @@ pub fn resolve(wiring: &Wiring, registry: &Registry) -> Result<Coordinator, Load
             desc: builder.descriptor_of(coord_handle).clone(),
         },
     );
+    // A static `ReceiveAll` system (the alarm engine) is DEFERRED behind every other
+    // cyclic registration — systems here, slots below — or `build()`'s
+    // `ReceiveAllNotLast` rejects the graph (`docs/alarms.md` §7 F1). Deferral also
+    // gives it the right step position: after every producer, before telemetry.
+    // (dl systems can never carry capabilities — the loader rejects them.)
+    let mut deferred: Vec<&SystemSpec> = Vec::new();
     for spec in &wiring.systems {
         let (handle, desc) = match &spec.artifact {
             Some(artifact_id) => resolve_dl(spec, artifact_id, wiring, &mut builder)?,
-            None => resolve_static(spec, registry, &mut builder)?,
+            None => {
+                if registry.is_receive_all(spec.ty.as_deref()) {
+                    deferred.push(spec);
+                    continue;
+                }
+                resolve_static(spec, registry, &mut builder)?
+            }
         };
         if instances
             .insert(spec.name.clone(), Instance { handle, desc })
@@ -320,6 +367,23 @@ pub fn resolve(wiring: &Wiring, registry: &Registry) -> Result<Coordinator, Load
                 name: "uplink".to_string(),
                 span: (0, src.len()).into(),
                 src,
+            });
+        }
+    }
+
+    // --- Deferred receive-all systems: the last cyclic registrations before
+    //     telemetry, and still ahead of the edges pass (edge resolution only needs
+    //     the finished instance map).
+    for spec in deferred {
+        let (handle, desc) = resolve_static(spec, registry, &mut builder)?;
+        if instances
+            .insert(spec.name.clone(), Instance { handle, desc })
+            .is_some()
+        {
+            return Err(LoadError::DuplicateInstance {
+                name: spec.name.clone(),
+                src: system_src(spec),
+                span: (0, system_src(spec).len()).into(),
             });
         }
     }
@@ -418,7 +482,7 @@ fn resolve_static(
         src: node_src.clone(),
         span: (0, node_src.len()).into(),
     })?;
-    factory(&mut LoadCtx {
+    (factory.factory)(&mut LoadCtx {
         node,
         src: &node_src,
         name: &spec.name,

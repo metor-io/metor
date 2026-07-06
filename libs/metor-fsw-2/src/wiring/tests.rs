@@ -330,7 +330,8 @@ impl BuildSystem for Sink {
 
 /// The app's registry: the visible, auditable list of loadable systems.
 fn registry() -> Registry {
-    let mut r = Registry::new();
+    // Seeded from the built-ins (the alarm engine), as an app registry would be.
+    let mut r = Registry::with_builtins();
     crate::register_system!(&mut r, ImuDriver => "ImuDriver");
     r.register::<NavFilter, _>("NavFilter");
     r.register::<NavLogger, _>("NavLogger");
@@ -374,6 +375,78 @@ connect "nav" -> "log" frame="nav"
     let last = f64::from_bits(LOG_LAST_ANGLE_BITS.load(Relaxed));
     assert!(last > 0.0, "received a real angle: {last}");
     assert_eq!(last % 2.0, 0.0, "angle = omega * gain(2.0): {last}");
+}
+
+// ---------------------------------------------------------------------------
+// Alarms from KDL: the built-in `type="Alarms"` node loads, defers behind the
+// other systems (F1), wires an uplink AlarmAck edge, and raises on the wire.
+// ---------------------------------------------------------------------------
+
+/// The full `docs/alarms.md` §3 surface through `load`: the alarms node is
+/// deliberately declared FIRST — without the resolver's deferred-ReceiveAll pass
+/// this graph fails `build()` with `ReceiveAllNotLast` (`docs/alarms.md` §7 F1) —
+/// and the `AlarmAck` edge from a (never-connecting) uplink resolves like any
+/// message edge. The raise lands on the `alarms.AlarmRaised` registry ring.
+#[cfg(not(miri))]
+#[stellarator::test]
+async fn alarms_node_loads_defers_and_raises() {
+    let kdl = r#"
+coordinator cycle_rate=1000.0
+
+system "alarms" type="Alarms" {
+    alarm id="OMEGA_HIGH" name="Omega High" {
+        target component="imu.imu.omega"
+        warning above=2.5
+        critical above=4.5
+    }
+}
+system "imu" type="ImuDriver" i2c_bus=1 sample_hz=200.0
+
+uplink { transport "tcp" addr="127.0.0.1:2299" }
+connect "uplink" -> "alarms" msg="AlarmAck"
+"#;
+
+    let coord = load(kdl, &registry()).expect("load succeeds (alarms deferred)");
+    let registry = coord.registry();
+    let mut raised: crate::MsgIn<metor_proto_wkt::AlarmRaised> = crate::MsgIn::new(
+        registry
+            .get(ComponentId::new("alarms.AlarmRaised"))
+            .expect("alarm raise channel registered")
+            .view()
+            .expect("reader slot"),
+    );
+
+    let mut coord = coord;
+    // omega increments 1.0/cycle: warning at 3.0 (cycle 3), critical at 5.0 (cycle 5).
+    coord.run_for(5).await;
+
+    let mut got = Vec::new();
+    raised.drain(|r| got.push(r));
+    assert_eq!(got.len(), 2, "warning then escalation: {got:?}");
+    assert_eq!(got[0].def_id, "OMEGA_HIGH");
+    assert_eq!(got[0].severity, metor_proto_wkt::Severity::Warning);
+    assert_eq!(got[1].severity, metor_proto_wkt::Severity::Critical);
+    assert_eq!(got[1].occurrence, got[0].occurrence);
+}
+
+/// A semantically-bad alarm spec surfaces as a spanned `InvalidParam` through the
+/// full `load` path (the `try_from` refinement inside the factory's deserialize).
+#[test]
+fn err_alarm_misconfig_is_invalid_param() {
+    let err = load_err(
+        r#"
+coordinator cycle_rate=100.0
+system "alarms" type="Alarms" {
+    alarm id="X" name="X" {
+        target component="a.b.c"
+    }
+}
+"#,
+    );
+    assert!(
+        matches!(err, LoadError::InvalidParam { ref property, .. } if property == "alarm"),
+        "{err:?}"
+    );
 }
 
 // ---------------------------------------------------------------------------
