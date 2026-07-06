@@ -72,7 +72,7 @@ struct TickEvent {
 // ---------------------------------------------------------------------------
 
 /// Emits `tick_in.value = 1, 2, 3, …` (incremented before each write), so after `n`
-/// cycles the freshest value is `n`. A statically-linked (host `BoxBacking`) system.
+/// cycles the freshest value is `n`. A statically-linked (host-side) system.
 struct Ticker {
     n: u64,
 }

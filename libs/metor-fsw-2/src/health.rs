@@ -10,7 +10,7 @@
 
 use core::mem::offset_of;
 
-use metor_fsw_ring::{Backing, BoxBacking, NoWake, WakeSink, WakeSource};
+use metor_fsw_ring::{NoWake, WakeSink, WakeSource};
 use metor_proto::types::Timestamp;
 use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
 // `FromBytes` lets the health/log frames be read back through a typed `Input` port.
@@ -86,14 +86,13 @@ pub enum Level {
 /// The health/log port pair plus the framework-maintained counter state. Surfaced
 /// to a system as `output.health()`; the framework drives [`HealthPort::end_cycle`]
 /// around each `execute` to publish a record (system.md §4.2).
-pub struct HealthPort<B = BoxBacking, WD = NoWake, WS = NoWake>
+pub struct HealthPort<WD = NoWake, WS = NoWake>
 where
-    B: Backing,
     WD: WakeSource,
     WS: WakeSink,
 {
-    health: Output<SystemHealth, B, WD, WS>,
-    log: Output<SystemLog, B, WD, WS>,
+    health: Output<SystemHealth, WD, WS>,
+    log: Output<SystemLog, WD, WS>,
     cycles: u64,
     errors: u64,
     last_execute_micros: u64,
@@ -101,14 +100,13 @@ where
     pending: Vec<LogLine>,
 }
 
-impl<B, WD, WS> HealthPort<B, WD, WS>
+impl<WD, WS> HealthPort<WD, WS>
 where
-    B: Backing,
     WD: WakeSource,
     WS: WakeSink,
 {
     /// Build the handle from the two framework-allocated output ports.
-    pub fn new(health: Output<SystemHealth, B, WD, WS>, log: Output<SystemLog, B, WD, WS>) -> Self {
+    pub fn new(health: Output<SystemHealth, WD, WS>, log: Output<SystemLog, WD, WS>) -> Self {
         Self {
             health,
             log,

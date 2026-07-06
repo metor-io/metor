@@ -12,14 +12,12 @@
 use core::time::Duration;
 
 use metor_fsw_2::Outcome;
-use metor_fsw_2::ring::Backing;
 use metor_fsw_2::sequence::{progress, wait};
 
 /// Wait ~2 sim-µs, then complete — unless aborted first, in which case bail out with
-/// `Aborted` (the cooperative cancel the slot's `Abort` command raises). `B: Backing` is
-/// the macro's port backing (unused here — `waiter` has no user ports).
+/// `Aborted` (the cooperative cancel the slot's `Abort` command raises).
 #[metor_fsw_2::sequence]
-async fn waiter<B: Backing>() -> Outcome {
+async fn waiter() -> Outcome {
     progress("waiting");
     if wait(Duration::from_micros(2)).await.aborted() {
         progress("aborted");

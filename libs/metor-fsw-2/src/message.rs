@@ -16,9 +16,7 @@
 
 use core::marker::PhantomData;
 
-use metor_fsw_ring::{
-    Backing, BoxBacking, NoWake, View, WakeSink, WakeSource, WriteError, Writer,
-};
+use metor_fsw_ring::{NoWake, View, WakeSink, WakeSource, WriteError, Writer};
 use metor_proto::types::{Msg, PacketId};
 use metor_proto_wkt::{ReloadSequences, SequenceChannelEvent, SequenceCommand, SequenceRegistry};
 use serde::de::DeserializeOwned;
@@ -85,16 +83,15 @@ pub fn split_record(rec: &[u8]) -> Option<(PacketId, &[u8])> {
 /// One owned **message** output: the single [`Writer`] into a byte ring carrying
 /// `(id, postcard)` records, **typed on one [`Msg`] type `M`** (`docs/message-wiring.md`
 /// §2.1). The message twin of [`Output<F>`](crate::Output) — same single-writer discipline,
-/// same `BoxBacking`/`NoWake` cyclic default, and the same `descriptor()`/`bind()` port
+/// same `NoWake` cyclic default, and the same `descriptor()`/`bind()` port
 /// contract, so it drops into a `SystemOutput` bundle beside frame ports with no macro
 /// change. The edge key is `M::ID`.
-pub struct MsgOut<M, B = BoxBacking, WD = NoWake, WS = NoWake>
+pub struct MsgOut<M, WD = NoWake, WS = NoWake>
 where
-    B: Backing,
     WD: WakeSource,
     WS: WakeSink,
 {
-    writer: Writer<B, WD, WS>,
+    writer: Writer<WD, WS>,
     /// A reused record buffer (the 2-byte id prefix + the serialized payload), so a
     /// per-cycle emit grows in place rather than allocating a fresh `Vec` every call —
     /// exactly the [`Output::write_with`](crate::Output) scratch discipline.
@@ -106,9 +103,9 @@ where
     _m: PhantomData<fn() -> M>,
 }
 
-impl<M: Msg, B: Backing, WD: WakeSource, WS: WakeSink> MsgOut<M, B, WD, WS> {
+impl<M: Msg, WD: WakeSource, WS: WakeSink> MsgOut<M, WD, WS> {
     /// Wrap a writer the coordinator created over a Log-sized byte ring.
-    pub fn new(writer: Writer<B, WD, WS>) -> Self {
+    pub fn new(writer: Writer<WD, WS>) -> Self {
         Self {
             writer,
             scratch: Vec::new(),
@@ -148,7 +145,7 @@ impl<M: Msg, B: Backing, WD: WakeSource, WS: WakeSink> MsgOut<M, B, WD, WS> {
 
 }
 
-impl<M: NamedMsg, B: Backing, WD: WakeSource, WS: WakeSink> MsgOut<M, B, WD, WS> {
+impl<M: NamedMsg, WD: WakeSource, WS: WakeSink> MsgOut<M, WD, WS> {
     /// This port's static descriptor — the message twin of
     /// [`Output::<F>::descriptor`](crate::Output) (`docs/message-wiring.md` §2.1).
     /// Requires [`NamedMsg`]: a wired port needs the stable name token.
@@ -163,17 +160,16 @@ impl<M: NamedMsg, B: Backing, WD: WakeSource, WS: WakeSink> MsgOut<M, B, WD, WS>
     }
 }
 
-impl<M, B, WD, WS> MsgOut<M, B, WD, WS>
+impl<M, WD, WS> MsgOut<M, WD, WS>
 where
     M: Msg,
-    B: Backing,
     WD: WakeSource + Default + Clone + 'static,
     WS: WakeSink + Default + Clone + 'static,
 {
     /// Bind this port over the next ring the [`RingSource`] hands out, taking the matched
     /// writer-side wake endpoints — the [`Output::bind`](crate::Output) mirror. Walked by
     /// the derive when a `MsgOut<M>` is declared in a `SystemOutput` bundle.
-    pub fn bind<S: RingSource<B = B>>(src: &mut S) -> Self {
+    pub fn bind<S: RingSource>(src: &mut S) -> Self {
         let (ring, data, space) = src.next_output::<WD, WS>();
         // Invariant: the coordinator allocates one ring per message output and
         // binds it exactly once, so the region's writer claim is always free here.
@@ -195,7 +191,7 @@ where
 /// `SystemOutput` impl must spell the descriptor itself
 /// (`PortDesc::msg::<M>().untelemetered()`) — calling `CommandOut::descriptor()`
 /// resolves through the alias to the *telemetered* `MsgOut` descriptor.
-pub type CommandOut<M, B = BoxBacking, WD = NoWake, WS = NoWake> = MsgOut<M, B, WD, WS>;
+pub type CommandOut<M, WD = NoWake, WS = NoWake> = MsgOut<M, WD, WS>;
 
 // ---------------------------------------------------------------------------
 // MsgIn
@@ -216,31 +212,29 @@ pub type CommandOut<M, B = BoxBacking, WD = NoWake, WS = NoWake> = MsgOut<M, B, 
 /// consumer holds the producer views directly (generalizing the coordinator's
 /// `command_sources: Vec<MsgIn>`); an async consumer holds one view over a private merge
 /// ring (WP4). K = 1 is the common single-producer case; K = 0 is a legal unconnected input.
-pub struct MsgIn<M, B = BoxBacking, RD = NoWake, RS = NoWake>
+pub struct MsgIn<M, RD = NoWake, RS = NoWake>
 where
-    B: Backing,
     RD: WakeSink,
     RS: WakeSource,
 {
-    views: Vec<View<B, RD, RS>>,
+    views: Vec<View<RD, RS>>,
     _marker: PhantomData<fn() -> M>,
 }
 
-impl<M, B, RD, RS> MsgIn<M, B, RD, RS>
+impl<M, RD, RS> MsgIn<M, RD, RS>
 where
     M: Msg + DeserializeOwned,
-    B: Backing,
     RD: WakeSink,
     RS: WakeSource,
 {
     /// Wrap a single [`View`] the coordinator/registry claimed over a Log-sized byte
     /// ring (the message twin of [`Input::new`](crate::Input), the K = 1 case).
-    pub fn new(view: View<B, RD, RS>) -> Self {
+    pub fn new(view: View<RD, RS>) -> Self {
         Self::from_views(vec![view])
     }
 
     /// Wrap K producer [`View`]s (the fan-in case — many emitters into one input).
-    pub fn from_views(views: Vec<View<B, RD, RS>>) -> Self {
+    pub fn from_views(views: Vec<View<RD, RS>>) -> Self {
         Self {
             views,
             _marker: PhantomData,
@@ -269,10 +263,9 @@ where
     }
 }
 
-impl<M, B, RD, RS> MsgIn<M, B, RD, RS>
+impl<M, RD, RS> MsgIn<M, RD, RS>
 where
     M: NamedMsg + DeserializeOwned,
-    B: Backing,
     RD: WakeSink,
     RS: WakeSource,
 {
@@ -289,10 +282,9 @@ where
     }
 }
 
-impl<M, B, RD, RS> MsgIn<M, B, RD, RS>
+impl<M, RD, RS> MsgIn<M, RD, RS>
 where
     M: Msg + DeserializeOwned,
-    B: Backing,
     RD: WakeSink + Default + Clone + 'static,
     RS: WakeSource + Default + Clone + 'static,
 {
@@ -301,7 +293,7 @@ where
     /// ([`next_input_fanin`](RingSource::next_input_fanin)). An empty list is a legal,
     /// unconnected message input (drains nothing). Walked by the derive when a `MsgIn<M>` is
     /// declared in a `SystemInput` bundle.
-    pub fn bind<S: RingSource<B = B>>(src: &mut S) -> Self {
+    pub fn bind<S: RingSource>(src: &mut S) -> Self {
         let rings = src.next_input_fanin::<RD, RS>();
         let views = rings
             .into_iter()

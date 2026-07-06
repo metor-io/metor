@@ -3,7 +3,7 @@
 //! the ports off the `execute` (cyclic) / `run` (async) method signature, and emits
 //! everything a hand-written system spells out today:
 //!
-//! 1. the inherent impl re-emitted (recognized methods hidden + made `Backing`-generic,
+//! 1. the inherent impl re-emitted (recognized methods hidden,
 //!    `new` and unrecognized methods verbatim),
 //! 2. hidden `__<Ty>In`/`__<Ty>Out` port bundles carrying the *existing*
 //!    `#[derive(SystemInput)]`/`#[derive(SystemOutput)]` (the port-unification
@@ -184,13 +184,11 @@ fn unrecognized(ty: &Type) -> syn::Error {
     )
 }
 
-/// Classify (and rewrite, in place) the parameters of `f`: every port parameter type
-/// gains the injected `__B` backing argument. Pushes every independent error; returns
+/// Classify the parameters of `f`. Pushes every independent error; returns
 /// the classification in signature order.
 fn classify_params(
     f: &mut ImplItemFn,
     method: &str,
-    backing_ty: &Type,
     errors: &mut Vec<syn::Error>,
 ) -> Vec<ExecParam> {
     let mut out = Vec::new();
@@ -257,11 +255,10 @@ fn classify_params(
                     if let Some(extra) = sig::type_args(&r.elem).first() {
                         errors.push(syn::Error::new_spanned(
                             extra,
-                            "#[system] supplies the ring backing itself; write a bare `&mut HealthPort`",
+                            "#[system] supplies the wake endpoints itself; write a bare `&mut HealthPort`",
                         ));
                         continue;
                     }
-                    sig::append_type_args(&mut r.elem, std::slice::from_ref(backing_ty));
                     out.push(ExecParam { ident, kind: ParamKind::Health });
                 } else if let Some(kind) = PortKind::from_head(&head) {
                     if r.mutability.is_none() {
@@ -288,11 +285,11 @@ fn classify_params(
                     if let Some(span) = extra_span {
                         errors.push(syn::Error::new(
                             span,
-                            "#[system] supplies the ring backing itself; drop the second type parameter",
+                            "#[system] ports take a single element type (the wake endpoints \
+                             are macro-supplied); drop the second type parameter",
                         ));
                         continue;
                     }
-                    sig::append_type_args(&mut r.elem, std::slice::from_ref(backing_ty));
                     out.push(ExecParam { ident, kind: ParamKind::Port { kind, elem } });
                 } else {
                     errors.push(unrecognized(&pt.ty));
@@ -409,11 +406,7 @@ fn expand(attr: TokenStream, item: TokenStream) -> Result<TokenStream, syn::Erro
         }
     };
 
-    let backing = sig::injected_backing_ident();
-    let backing_ty = sig::ident_type(&backing);
-    let backing_param: syn::GenericParam = syn::parse_quote!(#backing: #fsw2::ring::Backing);
-
-    // ---- the main method: classify + hide (rename, inject __B, rewrite port types).
+    // ---- the main method: classify + hide (rename).
     let main_params;
     let main_hidden;
     {
@@ -433,7 +426,7 @@ fn expand(attr: TokenStream, item: TokenStream) -> Result<TokenStream, syn::Erro
             ));
         }
         let method = if is_cyclic { "execute" } else { "run" };
-        let params = classify_params(f, method, &backing_ty, &mut errors);
+        let params = classify_params(f, method, &mut errors);
 
         // `now: Timestamp` — required (exactly once) on execute, rejected on run.
         let mut now_seen = false;
@@ -462,7 +455,7 @@ fn expand(attr: TokenStream, item: TokenStream) -> Result<TokenStream, syn::Erro
         }
 
         main_hidden = format_ident!("__fsw_{}", method);
-        hide(f, &main_hidden, &backing_param);
+        hide(f, &main_hidden);
         main_params = params;
     }
 
@@ -477,10 +470,10 @@ fn expand(attr: TokenStream, item: TokenStream) -> Result<TokenStream, syn::Erro
                 format!("`{method}` is a synchronous lifecycle hook"),
             ));
         }
-        let params = classify_params(f, method, &backing_ty, &mut errors);
+        let params = classify_params(f, method, &mut errors);
         validate_lifecycle(&params, method, &main_params, &mut errors);
         let hidden = format_ident!("__fsw_{}", *method);
-        hide(f, &hidden, &backing_param);
+        hide(f, &hidden);
         *params_slot = Some(params);
     }
     let init_params = lifecycle[0].2.take();
@@ -520,8 +513,8 @@ fn expand(attr: TokenStream, item: TokenStream) -> Result<TokenStream, syn::Erro
     let out_ident = format_ident!("__{}Out", ty_ident);
 
     // Hidden bundles: field name = param ident, field order = signature order within
-    // each direction; a `PhantomData` anchors `__B` when a direction has no ports
-    // (the derives skip it and `bind` default-constructs it).
+    // each direction. A port-less direction is a genuinely empty struct (the
+    // derives handle zero ports: empty `decls()`, `Self {}` bind).
     let bundle = |want_input: bool| -> TokenStream {
         let fields: Vec<TokenStream> = main_params
             .iter()
@@ -529,16 +522,12 @@ fn expand(attr: TokenStream, item: TokenStream) -> Result<TokenStream, syn::Erro
                 ParamKind::Port { kind, elem } if kind.is_input() == want_input => {
                     let id = &p.ident;
                     let port = kind.ident();
-                    Some(quote! { pub #id: #fsw2::#port<#elem, #backing>, })
+                    Some(quote! { pub #id: #fsw2::#port<#elem>, })
                 }
                 _ => None,
             })
             .collect();
-        if fields.is_empty() {
-            quote! { pub __b: ::core::marker::PhantomData<fn() -> #backing>, }
-        } else {
-            quote! { #(#fields)* }
-        }
+        quote! { #(#fields)* }
     };
     let in_fields = bundle(true);
     let out_fields = bundle(false);
@@ -546,13 +535,13 @@ fn expand(attr: TokenStream, item: TokenStream) -> Result<TokenStream, syn::Erro
     let bundles = quote! {
         #[derive(#fsw2::SystemInput)]
         #[doc(hidden)]
-        pub struct #in_ident<#backing: #fsw2::ring::Backing = #fsw2::ring::BoxBacking> {
+        pub struct #in_ident {
             #in_fields
         }
 
         #[derive(#fsw2::SystemOutput)]
         #[doc(hidden)]
-        pub struct #out_ident<#backing: #fsw2::ring::Backing = #fsw2::ring::BoxBacking> {
+        pub struct #out_ident {
             #out_fields
         }
     };
@@ -586,7 +575,7 @@ fn expand(attr: TokenStream, item: TokenStream) -> Result<TokenStream, syn::Erro
             fn #trait_ident(&mut self, __output: &mut Self::Output) {
                 let (__ports, __health) = #fsw2::Out::split(__output);
                 let _ = (&__ports, &__health);
-                self.#hidden::<#backing>(#(#args),*)
+                self.#hidden(#(#args),*)
             }
         }
     };
@@ -594,9 +583,9 @@ fn expand(attr: TokenStream, item: TokenStream) -> Result<TokenStream, syn::Erro
     let shutdown_fn = lifecycle_fn("shutdown", &shutdown_params);
 
     let system_impl = quote! {
-        impl<#backing: #fsw2::ring::Backing> #fsw2::System<#backing> for #self_ty {
-            type Input = #in_ident<#backing>;
-            type Output = #fsw2::Out<#out_ident<#backing>, #backing>;
+        impl #fsw2::System for #self_ty {
+            type Input = #in_ident;
+            type Output = #fsw2::Out<#out_ident>;
             const NAME: &'static str = #name;
             #init_fn
             #shutdown_fn
@@ -606,7 +595,7 @@ fn expand(attr: TokenStream, item: TokenStream) -> Result<TokenStream, syn::Erro
     let main_args = delegate_args(&main_params);
     let leaf_impl = if is_cyclic {
         quote! {
-            impl<#backing: #fsw2::ring::Backing> #fsw2::CyclicSystem<#backing> for #self_ty {
+            impl #fsw2::CyclicSystem for #self_ty {
                 fn execute(
                     &mut self,
                     __now: #fsw2::Timestamp,
@@ -617,17 +606,17 @@ fn expand(attr: TokenStream, item: TokenStream) -> Result<TokenStream, syn::Erro
                     // health pair, so both can be lent to the user fn at once.
                     let (__ports, __health) = #fsw2::Out::split(__output);
                     let _ = (&__input, &__ports, &__health);
-                    self.#main_hidden::<#backing>(#(#main_args),*)
+                    self.#main_hidden(#(#main_args),*)
                 }
             }
         }
     } else {
         quote! {
-            impl<#backing: #fsw2::ring::Backing> #fsw2::AsyncSystem<#backing> for #self_ty {
+            impl #fsw2::AsyncSystem for #self_ty {
                 async fn run(&mut self, __input: &mut Self::Input, __output: &mut Self::Output) {
                     let (__ports, __health) = #fsw2::Out::split(__output);
                     let _ = (&__input, &__ports, &__health);
-                    self.#main_hidden::<#backing>(#(#main_args),*).await
+                    self.#main_hidden(#(#main_args),*).await
                 }
             }
         }
@@ -697,12 +686,10 @@ fn non_receiver_args(sig: &syn::Signature) -> impl Iterator<Item = &FnArg> {
         .filter(|a| matches!(a, FnArg::Typed(_)))
 }
 
-/// Turn a recognized method into its hidden generic twin: rename, `#[doc(hidden)]`,
-/// and the injected `__B: Backing` generic (port parameter types were already
-/// rewritten by `classify_params`). The body tokens are untouched (spans preserved).
-fn hide(f: &mut ImplItemFn, hidden: &Ident, backing_param: &syn::GenericParam) {
+/// Turn a recognized method into its hidden twin: rename + `#[doc(hidden)]`.
+/// The body tokens are untouched (spans preserved).
+fn hide(f: &mut ImplItemFn, hidden: &Ident) {
     f.sig.ident = hidden.clone();
-    f.sig.generics.params.push(backing_param.clone());
     f.attrs.push(syn::parse_quote!(#[doc(hidden)]));
     f.attrs.push(syn::parse_quote!(#[allow(clippy::too_many_arguments)]));
 }
@@ -845,10 +832,10 @@ mod tests {
         // Hidden bundles carry the real derives (the insulation point).
         assert!(out.contains("struct __EchoSystemIn"), "{out}");
         assert!(out.contains("struct __EchoSystemOut"), "{out}");
-        assert!(out.contains("pub ping: metor_fsw_2::Input<Ping, __B>"), "{out}");
-        assert!(out.contains("pub pong: metor_fsw_2::Output<Pong, __B>"), "{out}");
+        assert!(out.contains("pub ping: metor_fsw_2::Input<Ping>"), "{out}");
+        assert!(out.contains("pub pong: metor_fsw_2::Output<Pong>"), "{out}");
         // Out<> only in generated code; split-based delegation; Default-built params.
-        assert!(out.contains("type Output = metor_fsw_2::Out<__EchoSystemOut<__B>, __B>"), "{out}");
+        assert!(out.contains("type Output = metor_fsw_2::Out<__EchoSystemOut>"), "{out}");
         assert!(out.contains("Out::split"), "{out}");
         assert!(out.contains("__fsw_execute"), "{out}");
         assert!(out.contains("as ::core::default::Default>::default()"), "{out}");
@@ -871,8 +858,9 @@ mod tests {
         assert!(out.contains(r#"#[cfg(all(feature = "export", not(test)))]"#), "{out}");
         assert!(out.contains("fsw_abi_version"), "{out}");
         assert!(out.contains("type Params = NavParams;"), "{out}");
-        // Empty output direction is anchored by a skipped PhantomData field.
-        assert!(out.contains("PhantomData<fn() -> __B>"), "{out}");
+        // Empty output direction is a genuinely empty bundle (the derives handle
+        // zero ports: empty decls, `Self {}` bind).
+        assert!(out.contains("pub struct __NavSystemOut {}"), "{out}");
     }
 
     #[test]
@@ -885,10 +873,10 @@ mod tests {
                 }
             },
         );
-        assert!(out.contains("AsyncSystem<__B> for Radio"), "{out}");
+        assert!(out.contains("AsyncSystem for Radio"), "{out}");
         assert!(out.contains("__fsw_run"), "{out}");
         assert!(out.contains(r#"const NAME: &'static str = "radio";"#), "{out}");
-        assert!(out.contains("pub cmds: metor_fsw_2::MsgIn<GroundCmd, __B>"), "{out}");
+        assert!(out.contains("pub cmds: metor_fsw_2::MsgIn<GroundCmd>"), "{out}");
     }
 
     #[test]
@@ -973,10 +961,10 @@ mod tests {
         );
         assert!(msgs.iter().any(|m| m.contains("takes `&mut self`")), "{msgs:?}");
 
-        // explicit backing
+        // extra type parameter (the wake endpoints are macro-supplied)
         let msgs = expand_err(
             quote!(),
-            quote! { impl A { fn execute(&mut self, now: Timestamp, x: &mut Input<T, RawBacking>) {} } },
+            quote! { impl A { fn execute(&mut self, now: Timestamp, x: &mut Input<T, NoWake>) {} } },
         );
         assert!(msgs.iter().any(|m| m.contains("drop the second type parameter")), "{msgs:?}");
 

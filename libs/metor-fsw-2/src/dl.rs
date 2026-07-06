@@ -12,17 +12,17 @@
 //! [`FswRing`] handles.
 //!
 //! Same-process and cyclic-only: the `.so` reconstructs each ring over the host's
-//! `BoxBacking` region via `attach_raw`, so there is no copy and no IPC — the system
+//! host-owned region via `attach_raw`, so there is no copy and no IPC — the system
 //! sees the identical atomics the host's other systems do.
 //!
 //! ## Teardown ordering — load-bearing
 //!
 //! A [`DlSlot`] owns an `Arc<Library>` and the opaque `*mut state`. Its [`Drop`]
-//! calls `fsw_destroy` (dropping the `.so`'s `RawBacking` ports and the user system)
+//! calls `fsw_destroy` (dropping the `.so`'s non-owning ports and the user system)
 //! **before** the `Library` unloads (the `Arc` field drops after the `Drop` body) and
 //! **before** the host [`RingTable`](crate::coordinator) frees the regions (the
 //! coordinator drops its `cyclic` slot vec before its `rings` field). So no
-//! `RawBacking` ever outlives its region, and no `.so` code runs after its `Library`
+//! non-owning attach ever outlives its region, and no `.so` code runs after its `Library`
 //! is gone.
 
 use core::ffi::c_void;
@@ -405,7 +405,7 @@ impl CyclicSlot for DlSlot {
             FswStatus::Done => SlotState::Running,
         };
         if self.slot_state.is_stopped() {
-            // `fsw_destroy` drops the `.so`'s `RawBacking` ports, freeing its reader
+            // `fsw_destroy` drops the `.so`'s non-owning ports, freeing its reader
             // slots so producers are not backpressured by a dead consumer. Nulled so
             // `shutdown`/`Drop` stay no-ops (a panicked system gets no `shutdown`).
             // SAFETY: `state` is the live pointer, transferred to destroy exactly once.

@@ -129,10 +129,8 @@ pub fn export_system(input: TokenStream) -> TokenStream {
 /// `SlotControlIn` input and the `SequenceStatus` + health/log output tail. `name`
 /// defaults to the fn name.
 ///
-/// The ring-backing generic is **injected** (review E7): a plain
-/// `async fn seq(mut x: Input<T>, …)` gets a hidden `__B: Backing` parameter and each
-/// port type is rewritten to `Input<T, __B>`; a hand-written `<B: Backing>` is still
-/// accepted. A sequence may be paramless (`Params = ()`) or take one params parameter
+/// Rings are backing-erased, so the fn is emitted verbatim — no injected generics.
+/// A sequence may be paramless (`Params = ()`) or take one params parameter
 /// (`Serialize + Deserialize + Schema`, the postcard contract).
 #[proc_macro_attribute]
 pub fn sequence(attr: TokenStream, item: TokenStream) -> TokenStream {

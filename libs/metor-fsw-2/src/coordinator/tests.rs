@@ -9,7 +9,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering::Relaxed};
 use std::time::Duration;
 
-use metor_fsw_ring::{BoxBacking, Notifier};
+use metor_fsw_ring::Notifier;
 use metor_proto::types::Timestamp;
 use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
 
@@ -218,7 +218,7 @@ struct AsyncConsumer {
 
 #[derive(SystemInput)]
 struct AsyncIn {
-    imu: Input<Imu, BoxBacking, Notifier, Notifier>,
+    imu: Input<Imu, Notifier, Notifier>,
 }
 
 #[derive(SystemOutput)]
@@ -226,7 +226,7 @@ struct AsyncNoOut {}
 
 impl System for AsyncConsumer {
     type Input = AsyncIn;
-    type Output = Out<AsyncNoOut, BoxBacking, Notifier, Notifier>;
+    type Output = Out<AsyncNoOut, Notifier, Notifier>;
     const NAME: &'static str = "async_consumer";
 }
 
@@ -1011,8 +1011,8 @@ impl SystemInput for SnapshotFanInIn {
     }
 }
 
-impl crate::BindPorts<BoxBacking> for SnapshotFanInIn {
-    fn bind<S: crate::RingSource<B = BoxBacking>>(src: &mut S) -> Self {
+impl crate::BindPorts for SnapshotFanInIn {
+    fn bind<S: crate::RingSource>(src: &mut S) -> Self {
         Self {
             imu: Input::bind(src),
         }
@@ -1253,8 +1253,8 @@ impl SystemOutput for QuietOut {
     }
 }
 
-impl crate::BindPorts<BoxBacking> for QuietOut {
-    fn bind<S: crate::RingSource<B = BoxBacking>>(src: &mut S) -> Self {
+impl crate::BindPorts for QuietOut {
+    fn bind<S: crate::RingSource>(src: &mut S) -> Self {
         Self {
             imu: Output::bind(src),
         }

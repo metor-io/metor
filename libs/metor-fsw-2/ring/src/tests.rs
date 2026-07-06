@@ -8,7 +8,7 @@
 
 use super::*;
 
-fn ring(capacity: usize, max_readers: usize) -> RingBuffer<BoxBacking> {
+fn ring(capacity: usize, max_readers: usize) -> RingBuffer {
     RingBuffer::create_in_memory(Config {
         capacity,
         max_readers,
@@ -378,11 +378,11 @@ async fn wait_reader_borrows() {
     assert_eq!(got, expected);
 }
 
-// ----- RawBacking / attach_raw (non-owning, same-process) -----
+// ----- attach_raw (non-owning, same-process) -----
 
-/// Same-process attach round-trip (the dlopen scenario): a second
-/// `RingBuffer<RawBacking>` reconstructed over the SAME region a
-/// `RingBuffer<BoxBacking>` allocated sees the identical atomics — a record
+/// Same-process attach round-trip (the dlopen scenario): a second, non-owning
+/// `RingBuffer` reconstructed over the SAME region a heap-backed one allocated
+/// sees the identical atomics — a record
 /// written through one is read through the other, in both directions. Sync-only,
 /// so it runs under Miri (provenance/leak/race check of the raw attach path).
 #[test]
@@ -390,7 +390,7 @@ fn raw_attach_same_process_roundtrip() {
     let rb = ring(1024, 4);
     let (base, len) = rb.region();
     // Attach a non-owning handle over the SAME bytes `rb` owns.
-    let raw = unsafe { RingBuffer::<RawBacking>::attach_raw(base, len) }.unwrap();
+    let raw = unsafe { RingBuffer::attach_raw(base, len) }.unwrap();
 
     let mut buf = Vec::new();
 
@@ -421,7 +421,7 @@ fn raw_attach_recovers_geometry() {
     rb.writer(NoWake, NoWake).unwrap().try_write(b"x").unwrap();
 
     let (base, len) = rb.region();
-    let raw = unsafe { RingBuffer::<RawBacking>::attach_raw(base, len) }.unwrap();
+    let raw = unsafe { RingBuffer::attach_raw(base, len) }.unwrap();
 
     // Committed came from the header region, not from arguments.
     assert_eq!(raw.committed(), rb.committed());
@@ -447,16 +447,16 @@ fn raw_attach_recovers_geometry() {
 #[test]
 fn raw_attach_bad_region_rejected() {
     // Zeroed but header-sized region: magic word is 0 -> BadMagic.
-    let zeros = BoxBacking::new(HEADER_SIZE);
+    let zeros = Backing::heap(HEADER_SIZE);
     assert_eq!(
-        unsafe { RingBuffer::<RawBacking>::attach_raw(zeros.base(), zeros.len()) }.err(),
+        unsafe { RingBuffer::attach_raw(zeros.base(), zeros.len()) }.err(),
         Some(AttachError::BadMagic),
     );
 
     // Too-short region: guarded before any header read, so no out-of-bounds load.
-    let tiny = BoxBacking::new(8);
+    let tiny = Backing::heap(8);
     assert_eq!(
-        unsafe { RingBuffer::<RawBacking>::attach_raw(tiny.base(), tiny.len()) }.err(),
+        unsafe { RingBuffer::attach_raw(tiny.base(), tiny.len()) }.err(),
         Some(AttachError::TooSmall),
     );
 }
@@ -508,7 +508,7 @@ fn swap_writer_and_reader_reacquire() {
 }
 
 /// The occupant-side swap a dlopen'd `.so` performs: each Load `attach_raw`s a
-/// fresh `RingBuffer<RawBacking>` over the host region, claims writer+view, and on
+/// fresh non-owning `RingBuffer` over the host region, claims writer+view, and on
 /// `fsw_destroy` drops them (and the handle); a later Load re-attaches and
 /// re-acquires the freed reader slot over the SAME host-owned region. Sync-only,
 /// so Miri checks the reclaim path's provenance/leaks under reuse.
@@ -520,7 +520,7 @@ fn raw_attach_swap_reacquire() {
 
     // Occupant 1: attach, claim, use, then drop everything (fsw_destroy).
     {
-        let raw = unsafe { RingBuffer::<RawBacking>::attach_raw(base, len) }.unwrap();
+        let raw = unsafe { RingBuffer::attach_raw(base, len) }.unwrap();
         let mut w = raw.writer(NoWake, NoWake).unwrap();
         let mut v = raw.view(NoWake, NoWake).unwrap();
         assert_eq!(host.reader_count(), 1);
@@ -535,7 +535,7 @@ fn raw_attach_swap_reacquire() {
     );
 
     // Occupant 2: a fresh attach re-acquires the reclaimed slot over the same region.
-    let raw2 = unsafe { RingBuffer::<RawBacking>::attach_raw(base, len) }.unwrap();
+    let raw2 = unsafe { RingBuffer::attach_raw(base, len) }.unwrap();
     let mut w2 = raw2.writer(NoWake, NoWake).unwrap();
     let mut v2 = raw2.view(NoWake, NoWake).unwrap();
     assert_eq!(
@@ -679,7 +679,7 @@ fn writer_claim_freed_on_drop() {
 fn writer_claim_shared_across_attach() {
     let rb = ring(256, 1);
     let (base, len) = rb.region();
-    let raw = unsafe { RingBuffer::<RawBacking>::attach_raw(base, len) }.unwrap();
+    let raw = unsafe { RingBuffer::attach_raw(base, len) }.unwrap();
 
     let w1 = rb.writer(NoWake, NoWake).unwrap();
     assert!(raw.writer(NoWake, NoWake).is_err(), "claim visible cross-handle");
@@ -769,7 +769,7 @@ fn reader_on_gap_start_reads_through() {
 // ----- R4: attach geometry validation -----
 
 /// A handle to a valid region plus a byte-poke helper for corrupting its header.
-fn valid_region() -> (RingBuffer<BoxBacking>, *mut u8, usize) {
+fn valid_region() -> (RingBuffer, *mut u8, usize) {
     let rb = ring(64, 2);
     let (base, len) = rb.region();
     (rb, base, len)
@@ -781,7 +781,7 @@ fn valid_region() -> (RingBuffer<BoxBacking>, *mut u8, usize) {
 fn attach_rejects_truncated() {
     let (_rb, base, len) = valid_region();
     assert_eq!(
-        unsafe { RingBuffer::<RawBacking>::attach_raw(base, len - 8) }.err(),
+        unsafe { RingBuffer::attach_raw(base, len - 8) }.err(),
         Some(AttachError::RegionTruncated),
     );
 }
@@ -795,7 +795,7 @@ fn attach_rejects_bad_capacity() {
         // SAFETY: OFF_CAPACITY is inside the live header region.
         unsafe { (base.add(OFF_CAPACITY) as *mut u64).write(bad) };
         assert_eq!(
-            unsafe { RingBuffer::<RawBacking>::attach_raw(base, len) }.err(),
+            unsafe { RingBuffer::attach_raw(base, len) }.err(),
             Some(AttachError::BadGeometry),
             "capacity {bad} must be rejected"
         );
@@ -803,7 +803,7 @@ fn attach_rejects_bad_capacity() {
     // Restore: the same region attaches cleanly again.
     // SAFETY: as above.
     unsafe { (base.add(OFF_CAPACITY) as *mut u64).write(64) };
-    assert!(unsafe { RingBuffer::<RawBacking>::attach_raw(base, len) }.is_ok());
+    assert!(unsafe { RingBuffer::attach_raw(base, len) }.is_ok());
 }
 
 /// Out-of-bounds / overlapping offsets are `BadGeometry`: a reader table running
@@ -812,7 +812,7 @@ fn attach_rejects_bad_capacity() {
 #[test]
 fn attach_rejects_oob_offsets() {
     let (_rb, base, len) = valid_region();
-    let attach = |base, len| unsafe { RingBuffer::<RawBacking>::attach_raw(base, len) };
+    let attach = |base, len| unsafe { RingBuffer::attach_raw(base, len) };
     let data_offset = HEADER_SIZE as u64 + 2 * READER_SLOT_SIZE as u64; // 0xC0
 
     // Reader table ends past the data region.
@@ -846,7 +846,7 @@ fn attach_rejects_misaligned() {
     let (_rb, base, len) = valid_region();
     assert_eq!(
         // SAFETY: base+1 .. base+len is still inside the live region.
-        unsafe { RingBuffer::<RawBacking>::attach_raw(base.add(1), len - 1) }.err(),
+        unsafe { RingBuffer::attach_raw(base.add(1), len - 1) }.err(),
         Some(AttachError::Misaligned),
     );
 }
@@ -876,7 +876,7 @@ fn attach_mmap_rejects_truncated_file() {
 
     // Below total_size but above the header: RegionTruncated.
     truncate(512);
-    let err = unsafe { RingBuffer::<MmapBacking>::attach_mmap(&path) }
+    let err = unsafe { RingBuffer::attach_mmap(&path) }
         .err()
         .expect("truncated file must be rejected");
     // The io::Error wraps the AttachError (its Display, no longer a Debug dump).
@@ -884,7 +884,7 @@ fn attach_mmap_rejects_truncated_file() {
 
     // Below even the header: TooSmall (previously an out-of-bounds header read).
     truncate(64);
-    let err = unsafe { RingBuffer::<MmapBacking>::attach_mmap(&path) }
+    let err = unsafe { RingBuffer::attach_mmap(&path) }
         .err()
         .expect("truncated file must be rejected");
     assert!(format!("{err}").contains("shorter than the fixed header"), "{err}");

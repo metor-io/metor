@@ -11,7 +11,7 @@
 //! The load-bearing reuse is the ring topology. The coordinator owns every ring in its
 //! `RingTable` for the whole mission; an occupant only **borrows** transient
 //! `Writer`/`View` handles over them (sequences-slots.md §2.3). On `Stop`/`Unload`/`Reset`
-//! the occupant's `fsw_destroy` drops those `RawBacking` ports, releasing the ring roles
+//! the occupant's `fsw_destroy` drops those non-owning ports, releasing the ring roles
 //! back to the host-owned ring, and a later `Load` re-acquires over the same regions
 //! (Wave 1). So `make_slot` runs N times against one [`DlSystem`](crate::dl), each a
 //! fresh `fsw_create` state over the slot's pre-allocated rings.
@@ -246,7 +246,7 @@ impl SlotRunner {
         // SAFETY: every region in the templates is a `RingTable`-owned ring that
         // outlives this slot — the coordinator drops `cyclic` (this runner, whose Drop
         // chain destroys the live occupant) before `rings`; and the occupant's own
-        // `fsw_destroy` releases its `RawBacking` ports before any re-`Load` re-attaches.
+        // `fsw_destroy` releases its non-owning ports before any re-`Load` re-attaches.
         let mut slot = unsafe {
             occ.system.make_slot(
                 &occ.params,
@@ -510,7 +510,7 @@ impl CyclicSlot for SlotRunner {
 /// A fresh host writer over a control/command/status ring (mirrors how the coordinator
 /// wraps its own ports). Cyclic ⇒ [`NoWake`].
 pub(crate) fn slot_writer<F: crate::Frame + IntoBytes + Immutable>(
-    ring: &metor_fsw_ring::RingBuffer<metor_fsw_ring::BoxBacking>,
+    ring: &metor_fsw_ring::RingBuffer,
 ) -> Output<F> {
     // Invariant: each control/command/status ring gets its single host writer
     // minted exactly once at build, so the claim is always free here.

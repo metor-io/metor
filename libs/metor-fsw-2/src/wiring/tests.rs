@@ -6,7 +6,7 @@
 
 use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 
-use metor_fsw_ring::{BoxBacking, Notifier};
+use metor_fsw_ring::Notifier;
 use metor_proto::types::{ComponentId, Timestamp};
 use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
 
@@ -165,7 +165,7 @@ struct NavLogger;
 
 #[derive(SystemInput)]
 struct LogIn {
-    nav: Input<Nav, BoxBacking, Notifier, Notifier>,
+    nav: Input<Nav, Notifier, Notifier>,
 }
 
 #[derive(SystemOutput)]
@@ -173,7 +173,7 @@ struct LogNoOut {}
 
 impl System for NavLogger {
     type Input = LogIn;
-    type Output = Out<LogNoOut, BoxBacking, Notifier, Notifier>;
+    type Output = Out<LogNoOut, Notifier, Notifier>;
     const NAME: &'static str = "nav_logger";
 }
 

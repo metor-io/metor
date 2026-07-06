@@ -1,19 +1,19 @@
 //! ABI acceptance tests: the generated `export_system!` C-ABI exercised
 //! **in-process, without dlopen/libloading**. A direct in-crate call of the generated
 //! `#[unsafe(no_mangle)]` `fsw_*` functions proves the macro + `RawBinder` +
-//! `attach_raw` + the verbatim `CyclicRunner<…, RawBacking>` + the descriptor
+//! `attach_raw` + the verbatim `CyclicRunner` + the descriptor
 //! serialization all compose.
 //!
-//! The host side is emulated by hand: it allocates `RingBuffer<BoxBacking>`s, hands
+//! The host side is emulated by hand: it allocates heap-backed `RingBuffer`s, hands
 //! the system their `(base, len, role)` as `FswRing`s, and reads results back through
-//! its own `BoxBacking` writer/view over the *same* regions the system reconstructs
-//! over `RawBacking`.
+//! its own writer/view over the *same* regions the system reconstructs via
+//! non-owning attaches.
 
 use core::ffi::c_void;
 use core::ptr;
 use std::slice;
 
-use metor_fsw_ring::{Backing, BoxBacking, Config, NoWake, RingBuffer};
+use metor_fsw_ring::{Config, NoWake, RingBuffer};
 use metor_proto::types::{ComponentId, Timestamp};
 use metor_proto::vtable::VTable;
 use postcard_schema::Schema;
@@ -74,23 +74,23 @@ struct Counter {
 }
 
 #[derive(SystemInput)]
-struct CounterIn<B: Backing = BoxBacking> {
-    tick: Input<TickIn, B>,
+struct CounterIn {
+    tick: Input<TickIn>,
 }
 
 #[derive(SystemOutput)]
-struct CounterOut<B: Backing = BoxBacking> {
-    out: Output<TickOut, B>,
+struct CounterOut {
+    out: Output<TickOut>,
 }
 
-impl<B: Backing> System<B> for Counter {
-    type Input = CounterIn<B>;
-    type Output = Out<CounterOut<B>, B>;
+impl System for Counter {
+    type Input = CounterIn;
+    type Output = Out<CounterOut>;
     const NAME: &'static str = "counter";
 }
 
-impl<B: Backing> CyclicSystem<B> for Counter {
-    fn execute(&mut self, now: Timestamp, input: &mut CounterIn<B>, output: &mut Out<CounterOut<B>, B>) {
+impl CyclicSystem for Counter {
+    fn execute(&mut self, now: Timestamp, input: &mut CounterIn, output: &mut Out<CounterOut>) {
         let value = match input.tick.latest() {
             Some(t) => t.get().value,
             _ => {
@@ -121,7 +121,7 @@ crate::export_system!(Counter);
 // Host-emulation helpers.
 // ---------------------------------------------------------------------------
 
-fn ring_for<F: Frame>(depth: usize, readers: usize) -> RingBuffer<BoxBacking> {
+fn ring_for<F: Frame>(depth: usize, readers: usize) -> RingBuffer {
     RingBuffer::create_in_memory(Config {
         capacity: buffer_capacity::<F>(depth),
         max_readers: readers,
@@ -129,7 +129,7 @@ fn ring_for<F: Frame>(depth: usize, readers: usize) -> RingBuffer<BoxBacking> {
 }
 
 /// An `FswRing` over a host ring's region (the same-process handle the host fills).
-fn handle(ring: &RingBuffer<BoxBacking>, role: u8) -> FswRing {
+fn handle(ring: &RingBuffer, role: u8) -> FswRing {
     let (base, len) = ring.region();
     FswRing { base, len, role }
 }
@@ -166,8 +166,8 @@ fn abi_lifecycle_end_to_end() {
     assert!(!state.is_null(), "fsw_create returned state");
     fsw_bind_init(state, inputs.as_ptr(), inputs.len(), outputs.as_ptr(), outputs.len());
 
-    // The host writes one input record through a BoxBacking writer over `in_ring`,
-    // which the system reads through its RawBacking view over the same region.
+    // The host writes one input record through its own writer over `in_ring`,
+    // which the system reads through its non-owning view over the same region.
     let mut in_writer = Output::<TickIn>::new(in_ring.writer(NoWake, NoWake).unwrap());
     in_writer
         .write(&TickIn {
@@ -324,28 +324,28 @@ fn dl_announce_prefixes_vtable_ids() {
 struct Boom;
 
 #[derive(SystemInput)]
-struct BoomIn<B: Backing = BoxBacking> {
+struct BoomIn {
     // Bound by the ABI but never drained (Boom panics first).
     #[allow(dead_code)]
-    tick: Input<TickIn, B>,
+    tick: Input<TickIn>,
 }
 
 #[derive(SystemOutput)]
-struct BoomOut<B: Backing = BoxBacking> {
+struct BoomOut {
     // Bound by the ABI but never written (Boom panics first); kept so the bundle has
     // a real output port for the descriptor/bind walk.
     #[allow(dead_code)]
-    out: Output<TickOut, B>,
+    out: Output<TickOut>,
 }
 
-impl<B: Backing> System<B> for Boom {
-    type Input = BoomIn<B>;
-    type Output = Out<BoomOut<B>, B>;
+impl System for Boom {
+    type Input = BoomIn;
+    type Output = Out<BoomOut>;
     const NAME: &'static str = "boom";
 }
 
-impl<B: Backing> CyclicSystem<B> for Boom {
-    fn execute(&mut self, _now: Timestamp, _input: &mut BoomIn<B>, _output: &mut Out<BoomOut<B>, B>) {
+impl CyclicSystem for Boom {
+    fn execute(&mut self, _now: Timestamp, _input: &mut BoomIn, _output: &mut Out<BoomOut>) {
         panic!("boom: execute panicked across the ABI");
     }
 }
@@ -623,8 +623,6 @@ fn kdl_schema_encode_nested_struct_and_vec_byte_equal() {
 use std::rc::Rc;
 use std::time::Duration;
 
-use metor_fsw_ring::RawBacking;
-
 use crate::SystemDescriptor;
 
 struct WaitSeq;
@@ -635,9 +633,9 @@ impl SeqSystem for WaitSeq {
     fn descriptor() -> SystemDescriptor {
         // inputs = [SlotControlIn]; outputs = the Out<SeqStatusOut> tail
         // (SequenceStatus, health, log).
-        let inputs = vec![<Input<SlotControlIn, BoxBacking>>::descriptor()];
+        let inputs = vec![<Input<SlotControlIn>>::descriptor()];
         let outputs =
-            <Out<SeqStatusOut<BoxBacking>, BoxBacking> as SystemOutput>::port_descs();
+            <Out<SeqStatusOut> as SystemOutput>::port_descs();
         SystemDescriptor {
             name: "wait_seq",
             kind: SystemKind::Cyclic,
@@ -648,9 +646,9 @@ impl SeqSystem for WaitSeq {
     }
 
     fn build(_params: (), binder: &mut RawBinder, clock: &Rc<SeqClock>) -> SeqBound {
-        let control = <Input<SlotControlIn, RawBacking>>::bind(binder);
+        let control = <Input<SlotControlIn>>::bind(binder);
         let status =
-            <Out<SeqStatusOut<RawBacking>, RawBacking> as BindPorts<RawBacking>>::bind(binder);
+            <Out<SeqStatusOut> as BindPorts>::bind(binder);
         let _ = clock;
         let future: std::pin::Pin<Box<dyn std::future::Future<Output = Outcome>>> =
             Box::pin(async {

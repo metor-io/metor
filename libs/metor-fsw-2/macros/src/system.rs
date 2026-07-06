@@ -14,9 +14,8 @@
 //!   (A6); lowers to `.untelemetered()` on the descriptor. The `CommandOut<M>` type
 //!   token is recognized as sugar for exactly this on a `MsgOut<M>`.
 //!
-//! A `PhantomData` field is skipped everywhere (and default-constructed by `bind`):
-//! `#[system]`'s generated bundles carry one to anchor the `__B: Backing` param when
-//! a direction has no ports.
+//! A `PhantomData` field is skipped everywhere (and default-constructed by `bind`),
+//! so a hand-written bundle may carry one for its own generics.
 
 use darling::FromDeriveInput;
 use darling::ast;
@@ -147,37 +146,14 @@ fn bind_body(bundle: &Bundle, _fsw2: &TokenStream2) -> TokenStream2 {
     }
 }
 
-/// A copy of `generics` with every default value stripped from its type/const params.
-/// Rust forbids defaults in an `impl<…>` header, so a bundle author's
-/// `struct PlantOut<B: Backing = BoxBacking>` must shed the `= BoxBacking` before the
-/// generated impls reuse its generics (dl-open.md §1.2).
-fn strip_defaults(generics: &Generics) -> Generics {
-    let mut g = generics.clone();
-    for p in g.params.iter_mut() {
-        match p {
-            syn::GenericParam::Type(t) => t.default = None,
-            syn::GenericParam::Const(c) => c.default = None,
-            syn::GenericParam::Lifetime(_) => {}
-        }
-    }
-    g
-}
-
-/// Emit the `BindPorts<B>` impl for a bundle: over the bundle's own `Backing` param if
-/// it has one (detected by bound, `sig::backing_param`), else over `BoxBacking` (the
-/// bundle's ports pin `BoxBacking`). Generics are default-stripped for the `impl<…>`
-/// header (dl-open.md §1.2).
+/// Emit the `BindPorts` impl for a bundle. Rings are backing-erased, so the one
+/// impl serves the host binder and a dlopen'd system's raw binder alike.
 fn bind_ports_impl(bundle: &Bundle, fsw2: &TokenStream2, bind: &TokenStream2) -> TokenStream2 {
     let ident = &bundle.ident;
-    let stripped = strip_defaults(&bundle.generics);
-    let (impl_generics, ty_generics, where_clause) = stripped.split_for_impl();
-    let backing = match crate::sig::backing_param(&bundle.generics) {
-        Some(b) => quote! { #b },
-        None => quote! { #fsw2::ring::BoxBacking },
-    };
+    let (impl_generics, ty_generics, where_clause) = bundle.generics.split_for_impl();
     quote! {
-        impl #impl_generics #fsw2::BindPorts<#backing> for #ident #ty_generics #where_clause {
-            fn bind<__S: #fsw2::RingSource<B = #backing>>(src: &mut __S) -> Self {
+        impl #impl_generics #fsw2::BindPorts for #ident #ty_generics #where_clause {
+            fn bind<__S: #fsw2::RingSource>(src: &mut __S) -> Self {
                 #bind
             }
         }
@@ -202,10 +178,7 @@ fn expand_input(parsed: DeriveInput) -> TokenStream2 {
     }
     let fsw2 = crate::metor_fsw_2_crate_name();
     let ident = &bundle.ident;
-    // `SystemInput` is non-generic in `B`, but the bundle may carry a defaulted
-    // `Backing` param: strip defaults for the impl header (dl-open.md §1.2).
-    let stripped = strip_defaults(&bundle.generics);
-    let (impl_generics, ty_generics, where_clause) = stripped.split_for_impl();
+    let (impl_generics, ty_generics, where_clause) = bundle.generics.split_for_impl();
     let decls = decls_body(&bundle, &fsw2);
     let bind = bind_body(&bundle, &fsw2);
     let bind_ports = bind_ports_impl(&bundle, &fsw2, &bind);
@@ -237,8 +210,7 @@ fn expand_output(parsed: DeriveInput) -> TokenStream2 {
     }
     let fsw2 = crate::metor_fsw_2_crate_name();
     let ident = &bundle.ident;
-    let stripped = strip_defaults(&bundle.generics);
-    let (impl_generics, ty_generics, where_clause) = stripped.split_for_impl();
+    let (impl_generics, ty_generics, where_clause) = bundle.generics.split_for_impl();
     let decls = decls_body(&bundle, &fsw2);
     let bind = bind_body(&bundle, &fsw2);
     let bind_ports = bind_ports_impl(&bundle, &fsw2, &bind);

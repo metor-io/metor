@@ -17,14 +17,14 @@
 //! load-bearing is the private copy-in buffer feeding an async input: there the
 //! coordinator pre-creates the data `Notifier`, stores it type-erased on the
 //! port's [`BoundPort`], and hands the matched clone to the async view. Every
-//! other endpoint is default-constructed by the binder (the framework's rings are
-//! all Overwrite, so no writer ever awaits a space wake).
+//! other endpoint is default-constructed by the binder (cyclic writers use the
+//! non-blocking `try_write`, so no framework writer ever awaits a space wake).
 
 use std::any::Any;
 use std::slice;
 use std::sync::Arc;
 
-use metor_fsw_ring::{Backing, BoxBacking, RingBuffer, WakeSink, WakeSource};
+use metor_fsw_ring::{RingBuffer, WakeSink, WakeSource};
 
 use crate::registry::Registry;
 
@@ -32,21 +32,22 @@ use crate::registry::Registry;
 /// `descriptors()` order. `data` is `Some` only for the copy-in private buffer that
 /// feeds an async input (where the view must share the writer's `Notifier` to be
 /// woken); otherwise the binder default-constructs the wake. There is no matched
-/// *space* endpoint: every framework ring is Overwrite, so a write never suspends
-/// for space and the reader-side space notification has no listener.
+/// *space* endpoint: framework writers use the non-blocking `try_write`, so no
+/// write ever suspends for space and the reader-side space notification has no
+/// listener.
 pub struct BoundPort {
-    ring: RingBuffer<BoxBacking>,
+    ring: RingBuffer,
     data: Option<Box<dyn Any>>,
 }
 
 impl BoundPort {
     /// A port whose wake endpoints are default-constructed at bind time.
-    pub(crate) fn new(ring: RingBuffer<BoxBacking>) -> Self {
+    pub(crate) fn new(ring: RingBuffer) -> Self {
         Self { ring, data: None }
     }
 
     /// A port carrying the pre-created, matched data-wake endpoint (the copy-in path).
-    pub(crate) fn matched(ring: RingBuffer<BoxBacking>, data: Box<dyn Any>) -> Self {
+    pub(crate) fn matched(ring: RingBuffer, data: Box<dyn Any>) -> Self {
         Self {
             ring,
             data: Some(data),
@@ -96,27 +97,25 @@ impl<'a> Binder<'a> {
     }
 }
 
-/// Where a bound port's pre-allocated ring comes from, abstracted over the ring
-/// [`Backing`] so one generated bundle `bind` serves both providers: the host's
-/// [`Binder`] (`B = BoxBacking`, over the coordinator's pre-allocated [`BoundPort`]s)
-/// and a dlopen'd system's [`RawBinder`](crate::abi::RawBinder) (`B = RawBacking`, over
-/// the host's raw regions). The positional contract is the same for both: `bind` pops
-/// one ring per port via [`next_output`](Self::next_output)/[`next_input`](Self::next_input)
-/// in `descriptors()` order.
+/// Where a bound port's pre-allocated ring comes from. Rings are backing-erased,
+/// so one generated bundle `bind` serves both providers with one monomorphic
+/// code path: the host's [`Binder`] (over the coordinator's pre-allocated
+/// [`BoundPort`]s) and a dlopen'd system's [`RawBinder`](crate::abi::RawBinder)
+/// (over non-owning attaches to the host's regions). The positional contract is
+/// the same for both: `bind` pops one ring per port via
+/// [`next_output`](Self::next_output)/[`next_input`](Self::next_input) in
+/// `descriptors()` order.
 pub trait RingSource {
-    /// The ring backing this source hands out.
-    type B: Backing;
-
     /// Pop the next output ring and its writer-side wake endpoints, of the concrete
     /// `WD`/`WS` the port type supplies.
-    fn next_output<WD, WS>(&mut self) -> (RingBuffer<Self::B>, WD, WS)
+    fn next_output<WD, WS>(&mut self) -> (RingBuffer, WD, WS)
     where
         WD: WakeSource + Default + Clone + 'static,
         WS: WakeSink + Default + Clone + 'static;
 
     /// Pop the next input ring and its reader-side wake endpoints (a frame port, or a
     /// single-producer message port).
-    fn next_input<RD, RS>(&mut self) -> (RingBuffer<Self::B>, RD, RS)
+    fn next_input<RD, RS>(&mut self) -> (RingBuffer, RD, RS)
     where
         RD: WakeSink + Default + Clone + 'static,
         RS: WakeSource + Default + Clone + 'static;
@@ -126,7 +125,7 @@ pub trait RingSource {
     /// (reads nothing). Frame ports call [`next_input`](Self::next_input) instead; only
     /// [`MsgIn::bind`](crate::MsgIn) calls this. The default (non-host sources, which never
     /// carry message ports) yields no producers.
-    fn next_input_fanin<RD, RS>(&mut self) -> Vec<(RingBuffer<Self::B>, RD, RS)>
+    fn next_input_fanin<RD, RS>(&mut self) -> Vec<(RingBuffer, RD, RS)>
     where
         RD: WakeSink + Default + Clone + 'static,
         RS: WakeSource + Default + Clone + 'static,
@@ -138,8 +137,8 @@ pub trait RingSource {
     /// A bundle that wants by-id access to *every* output (the telemetry downlink, a
     /// logger, a recorder) pulls this in its `BindPorts::bind`, exactly where it
     /// pulls its typed ports. Only the host [`Binder`] carries one; a system that
-    /// needs it is therefore host-only (`B = BoxBacking`), so the default — used by
-    /// any non-host source — panics rather than fabricate an empty registry.
+    /// needs it is therefore host-only, so the default — used by any non-host
+    /// source — panics rather than fabricate an empty registry.
     fn registry(&self) -> Arc<Registry> {
         panic!("this ring source carries no registry (host-only capability)")
     }
@@ -148,9 +147,7 @@ pub trait RingSource {
 /// The host's ring source: pops the coordinator's pre-allocated [`BoundPort`]s, in
 /// `descriptors()` order, with their optional matched wake endpoints (the copy-in path).
 impl<'a> RingSource for Binder<'a> {
-    type B = BoxBacking;
-
-    fn next_output<WD, WS>(&mut self) -> (RingBuffer<BoxBacking>, WD, WS)
+    fn next_output<WD, WS>(&mut self) -> (RingBuffer, WD, WS)
     where
         WD: WakeSource + Default + Clone + 'static,
         WS: WakeSink + Default + Clone + 'static,
@@ -162,7 +159,7 @@ impl<'a> RingSource for Binder<'a> {
         (p.ring.clone(), BoundPort::wake(&p.data), WS::default())
     }
 
-    fn next_input<RD, RS>(&mut self) -> (RingBuffer<BoxBacking>, RD, RS)
+    fn next_input<RD, RS>(&mut self) -> (RingBuffer, RD, RS)
     where
         RD: WakeSink + Default + Clone + 'static,
         RS: WakeSource + Default + Clone + 'static,
@@ -180,7 +177,7 @@ impl<'a> RingSource for Binder<'a> {
         (p.ring.clone(), BoundPort::wake(&p.data), RS::default())
     }
 
-    fn next_input_fanin<RD, RS>(&mut self) -> Vec<(RingBuffer<BoxBacking>, RD, RS)>
+    fn next_input_fanin<RD, RS>(&mut self) -> Vec<(RingBuffer, RD, RS)>
     where
         RD: WakeSink + Default + Clone + 'static,
         RS: WakeSource + Default + Clone + 'static,
@@ -207,11 +204,11 @@ impl<'a> RingSource for Binder<'a> {
 }
 
 /// A port bundle (a `#[derive(SystemInput)]`/`#[derive(SystemOutput)]` struct, or
-/// the framework [`Out`](crate::Out) wrapper) constructible from a [`RingSource`] over
-/// the ring backing `B`. The derives generate this symmetrically to `descriptors()`;
-/// a host bundle is `BindPorts<BoxBacking>`, a `Backing`-generic bundle is
-/// `BindPorts<B>` for all `B`.
-pub trait BindPorts<B: Backing>: Sized {
+/// the framework [`Out`](crate::Out) wrapper) constructible from a [`RingSource`].
+/// The derives generate this symmetrically to `descriptors()`; rings are
+/// backing-erased, so the same impl binds over the host's heap rings and a
+/// dlopen'd system's raw attaches.
+pub trait BindPorts: Sized {
     /// Construct every port from the ring source, in `descriptors()` order.
-    fn bind<S: RingSource<B = B>>(src: &mut S) -> Self;
+    fn bind<S: RingSource>(src: &mut S) -> Self;
 }

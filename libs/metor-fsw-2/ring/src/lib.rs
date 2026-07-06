@@ -252,120 +252,175 @@ impl std::error::Error for AttachError {}
 // Backing storage
 // ---------------------------------------------------------------------------
 
-/// Pluggable backing storage for the region.
-///
-/// # Safety
-///
-/// Implementors must guarantee that [`Backing::base`] returns a pointer to a
-/// single allocation of at least [`Backing::len`] bytes that is **interior
-/// mutable** (writes through `*mut` derived from it are sound), **8-byte
-/// aligned**, and **stable** for the lifetime of `self`. The ring forms
-/// `&AtomicU64` references and plain byte slices over this region.
-pub unsafe trait Backing: Send + Sync {
-    /// Base of the region. Re-derived on every access to keep provenance fresh.
-    fn base(&self) -> *mut u8;
-    /// Length of the region in bytes.
-    fn len(&self) -> usize;
-    /// Whether the region is empty (clippy-friendly companion to `len`).
-    fn is_empty(&self) -> bool {
-        self.len() == 0
-    }
-}
-
 /// One 8-byte, explicitly 8-aligned, interior-mutable word. `u64` alone is only
 /// 4-byte aligned on some 32-bit targets (i686), which would leave the region's
 /// `AtomicU64` control/cursor words unaligned — the `repr(align(8))` makes the
-/// backing allocation 8-aligned on every target.
+/// heap allocation 8-aligned on every target.
 #[repr(C, align(8))]
 struct Word(UnsafeCell<u64>);
 
-/// In-process, heap-backed storage. Backed by `Box<[Word]>` so the allocation is
-/// interior-mutable (sound to write through, Miri-clean) and 8-byte aligned on
-/// all targets for the control/cursor atomics.
-pub struct BoxBacking {
-    buf: Box<[Word]>,
-}
-
-impl BoxBacking {
-    /// Allocate a zeroed region of at least `size` bytes.
-    pub fn new(size: usize) -> Self {
-        let words = size.div_ceil(8);
-        let buf = (0..words).map(|_| Word(UnsafeCell::new(0u64))).collect();
-        Self { buf }
-    }
-}
-
-// SAFETY: `UnsafeCell<u64>` is `!Sync`, but the ring upholds `Send + Sync`
-// through its own synchronization (atomics + the `committed` handshake): the
-// bytes are only ever touched through that documented discipline.
-unsafe impl Send for BoxBacking {}
-unsafe impl Sync for BoxBacking {}
-
-// SAFETY: `buf` is a single boxed slice of 8-aligned interior-mutable words,
-// stable (heap allocation owned by `self`). `as_ptr()` carries whole-allocation
-// provenance, matching the contract.
-unsafe impl Backing for BoxBacking {
-    fn base(&self) -> *mut u8 {
-        self.buf.as_ptr() as *mut u8
-    }
-    fn len(&self) -> usize {
-        self.buf.len() * 8
-    }
-}
-
-/// mmap-backed storage (cross-process capable). Behind the `mmap` feature.
-#[cfg(feature = "mmap")]
-pub struct MmapBacking {
-    map: memmap2::MmapMut,
-}
-
-#[cfg(feature = "mmap")]
-// SAFETY: an `mmap`ed region is a stable, interior-mutable, page-aligned (hence
-// 8-byte aligned) allocation, satisfying the `Backing` contract.
-unsafe impl Backing for MmapBacking {
-    fn base(&self) -> *mut u8 {
-        self.map.as_ptr() as *mut u8
-    }
-    fn len(&self) -> usize {
-        self.map.len()
-    }
-}
-
-/// Non-owning storage over a region someone else owns (the host, or another
-/// process's mmap). Its `Drop` frees nothing; the region's own atomics carry all
-/// synchronization. Used by [`RingBuffer::attach_raw`] for same-process dlopen'd
-/// systems that reconstruct a ring over the host's backing.
+/// Owned, type-erased backing storage for a ring region: a `(base, len)` byte
+/// range plus the destructor that releases it. The backing kinds (heap, raw
+/// attach, mmap) differ **only** in how they drop, so one concrete struct with
+/// a drop fn pointer replaces the old `Backing` trait and its per-kind impls —
+/// and with it, the `B: Backing` generic on every ring and port type.
 ///
-/// # Safety
-///
-/// The `(base, len)` pair handed to [`RingBuffer::attach_raw`] must name a live,
-/// header-valid ring region — `base..base+len` interior-mutable and 8-byte
-/// aligned (e.g. another [`Backing`]'s region) — that **outlives every
-/// [`Writer`]/[`View`] produced from it** and is **not concurrently torn down**.
-pub struct RawBacking {
+/// Region contract (what every constructor asserts, and what all the ring's
+/// `unsafe` relies on): `base..base+len` is a single allocation that is
+/// **interior mutable** (writes through `*mut` derived from `base` are sound),
+/// **8-byte aligned**, and **stable** for the backing's lifetime. The ring
+/// forms `&AtomicU64` references and plain byte slices over this region.
+pub struct Backing {
     base: *mut u8,
     len: usize,
+    /// Drop context (null for [`heap`](Backing::heap)/[`raw`](Backing::raw)),
+    /// passed through to `drop_fn`.
+    ctx: *mut (),
+    /// Destructor; `None` = non-owning (the [`RingBuffer::attach_raw`] path).
+    drop_fn: Option<unsafe fn(*mut (), *mut u8, usize)>,
 }
 
-// SAFETY: like `BoxBacking`, a `RawBacking` is `!Sync` by construction (a bare
-// pointer), but the ring upholds `Send + Sync` through its own synchronization
-// (the region's atomics + the `committed` handshake): the bytes are only ever
-// touched through that documented discipline.
-unsafe impl Send for RawBacking {}
-unsafe impl Sync for RawBacking {}
+/// Rebuild and free the `Box<[Word]>` a [`Backing::heap`] leaked into `base`.
+///
+/// # Safety
+/// `(base, len)` came from `Backing::heap` — a leaked `Box<[Word]>` of `len/8`
+/// words — and this runs exactly once (the `Drop` contract).
+unsafe fn heap_drop(_ctx: *mut (), base: *mut u8, len: usize) {
+    // SAFETY: reconstructs exactly the allocation `heap` leaked — same pointer,
+    // same word count — transferring ownership back for the free.
+    unsafe {
+        drop(Box::from_raw(std::ptr::slice_from_raw_parts_mut(
+            base as *mut Word,
+            len / 8,
+        )))
+    };
+}
 
-// SAFETY: `attach_raw`'s caller asserts `base..base+len` is a stable,
-// interior-mutable, 8-byte-aligned ring region (laid out by `init_region`
-// through an interior-mutable backing). `RawBacking` only borrows it — `Drop`
-// frees nothing — and re-derives the pointer on every access.
-unsafe impl Backing for RawBacking {
-    fn base(&self) -> *mut u8 {
+impl Backing {
+    /// Allocate a zeroed heap region of at least `size` bytes. Backed by a
+    /// leaked `Box<[Word]>` so the region is interior-mutable (sound to write
+    /// through, Miri-clean) and 8-byte aligned on all targets; `Drop`
+    /// reconstructs and frees it.
+    pub fn heap(size: usize) -> Self {
+        let words = size.div_ceil(8);
+        let buf: Box<[Word]> = (0..words).map(|_| Word(UnsafeCell::new(0u64))).collect();
+        let len = buf.len() * 8;
+        // `into_raw` hands over the whole-allocation pointer (and its
+        // provenance); no live `Box` remains, so every later access derives
+        // from this one owning pointer.
+        let base = Box::into_raw(buf) as *mut u8;
+        Self {
+            base,
+            len,
+            ctx: std::ptr::null_mut(),
+            drop_fn: Some(heap_drop),
+        }
+    }
+
+    /// A non-owning backing over a region someone else owns (the host, or
+    /// another process's mmap). Dropping it frees nothing; the region's own
+    /// atomics carry all synchronization.
+    ///
+    /// # Safety
+    /// `base..base+len` satisfies the region contract (see [`Backing`]) — e.g.
+    /// it is another backing's live region — **outlives every [`Writer`]/
+    /// [`View`] produced over it**, and is not concurrently torn down.
+    pub unsafe fn raw(base: *mut u8, len: usize) -> Self {
+        Self {
+            base,
+            len,
+            ctx: std::ptr::null_mut(),
+            drop_fn: None,
+        }
+    }
+
+    /// An mmap-backed region (cross-process capable). The map is boxed behind
+    /// the drop context and unmapped (via `MmapMut`'s own `Drop`) when the
+    /// backing drops.
+    #[cfg(feature = "mmap")]
+    fn mmap(map: memmap2::MmapMut) -> Self {
+        // # Safety: `ctx` is the `Box<MmapMut>` leaked below; runs exactly once.
+        unsafe fn mmap_drop(ctx: *mut (), _base: *mut u8, _len: usize) {
+            // SAFETY: reconstructs the box `mmap` leaked, transferring
+            // ownership back; `MmapMut::drop` unmaps.
+            unsafe { drop(Box::from_raw(ctx as *mut memmap2::MmapMut)) };
+        }
+        // Box first, then read base/len: the mapping itself never moves, and
+        // boxing keeps the `MmapMut` value at a stable heap address for `ctx`.
+        let map = Box::new(map);
+        let (base, len) = (map.as_ptr() as *mut u8, map.len());
+        Self {
+            base,
+            len,
+            ctx: Box::into_raw(map) as *mut (),
+            drop_fn: Some(mmap_drop),
+        }
+    }
+
+    /// Assemble a backing from raw parts — the open extension point for custom
+    /// regions (a static arena, a foreign allocator, …). Pair with
+    /// [`RingBuffer::attach`].
+    ///
+    /// # Safety
+    /// - `base..base+len` satisfies the region contract (see [`Backing`]) for
+    ///   the backing's whole lifetime.
+    /// - If `drop_fn` is `Some`, it must be sound to call **exactly once, from
+    ///   any thread**, with exactly `(ctx, base, len)`, and that call must be
+    ///   the only release of the resources they name.
+    /// - Whatever `ctx` points at must be safe to drop from another thread,
+    ///   since the last ring handle may drop anywhere.
+    pub unsafe fn from_raw_parts(
+        base: *mut u8,
+        len: usize,
+        ctx: *mut (),
+        drop_fn: Option<unsafe fn(*mut (), *mut u8, usize)>,
+    ) -> Self {
+        Self {
+            base,
+            len,
+            ctx,
+            drop_fn,
+        }
+    }
+
+    /// Base of the region.
+    #[inline]
+    pub fn base(&self) -> *mut u8 {
         self.base
     }
-    fn len(&self) -> usize {
+
+    /// Length of the region in bytes.
+    #[inline]
+    pub fn len(&self) -> usize {
         self.len
     }
+
+    /// Whether the region is empty (clippy-friendly companion to `len`).
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
 }
+
+impl Drop for Backing {
+    fn drop(&mut self) {
+        if let Some(f) = self.drop_fn {
+            // SAFETY: the constructor contracts guarantee `f(ctx, base, len)`
+            // is sound to call exactly once with these exact values; `Drop`
+            // runs at most once.
+            unsafe { f(self.ctx, self.base, self.len) };
+        }
+    }
+}
+
+// SAFETY: a `Backing` is `!Send + !Sync` by construction (raw pointers), but
+// the ring upholds both through its own synchronization: the region bytes are
+// only ever touched through atomics or the `committed` Release/Acquire
+// handshake (the documented discipline every access follows). The drop side is
+// covered by the constructor contracts — `drop_fn` may run on whichever thread
+// drops the last `Arc<Inner>`, and whatever `ctx` owns (e.g. the boxed
+// `MmapMut`, itself `Send + Sync`) is safe to drop there.
+unsafe impl Send for Backing {}
+unsafe impl Sync for Backing {}
 
 // ---------------------------------------------------------------------------
 // Async wake abstraction (kept out of the shared layout)
@@ -433,8 +488,8 @@ impl WakeSink for Notifier {
 // Inner: the shared region + cached, process-local geometry
 // ---------------------------------------------------------------------------
 
-struct Inner<B: Backing> {
-    backing: B,
+struct Inner {
+    backing: Backing,
     capacity: u64,
     mask: u64,
     data_offset: usize,
@@ -442,14 +497,10 @@ struct Inner<B: Backing> {
     max_readers: u32,
 }
 
-// SAFETY: every access to the shared region goes through atomics or the
-// `committed` Release/Acquire handshake. The in-use check gives the
-// writer-then-reader happens-before that makes the plain data accesses
-// race-free, exactly as in the db disruptor. `B: Send + Sync`.
-unsafe impl<B: Backing> Send for Inner<B> {}
-unsafe impl<B: Backing> Sync for Inner<B> {}
+// `Inner` is auto-`Send + Sync`: `Backing` carries the manual promise (see its
+// SAFETY comment) and the remaining fields are plain integers.
 
-impl<B: Backing> Inner<B> {
+impl Inner {
     #[inline]
     fn base(&self) -> *mut u8 {
         self.backing.base()
@@ -606,26 +657,19 @@ impl<B: Backing> Inner<B> {
 
 /// A handle to a ring buffer region. Cheaply clonable (`Arc`-backed); the writer
 /// and views are produced from it and may outlive the original handle.
-pub struct RingBuffer<B: Backing> {
-    inner: Arc<Inner<B>>,
+#[derive(Clone)]
+pub struct RingBuffer {
+    inner: Arc<Inner>,
 }
 
-impl<B: Backing> Clone for RingBuffer<B> {
-    fn clone(&self) -> Self {
-        Self {
-            inner: self.inner.clone(),
-        }
-    }
-}
-
-impl RingBuffer<BoxBacking> {
+impl RingBuffer {
     /// Create an in-process, heap-backed ring buffer.
     ///
     /// Panics if `capacity` is not a non-zero power of two, or `max_readers` is
     /// zero.
     pub fn create_in_memory(cfg: Config) -> Self {
         let (reader_table_offset, data_offset, total) = layout(&cfg);
-        let backing = BoxBacking::new(total);
+        let backing = Backing::heap(total);
         // SAFETY: `backing` is a fresh region of `total` bytes, exclusively owned
         // here (no other handle exists yet), so single-threaded init is sound.
         unsafe { init_region(&backing, &cfg, reader_table_offset, data_offset, total) };
@@ -640,11 +684,9 @@ impl RingBuffer<BoxBacking> {
             }),
         }
     }
-}
 
-#[cfg(feature = "mmap")]
-impl RingBuffer<MmapBacking> {
     /// Create a new mmap-backed region at `path` (truncating any existing file).
+    #[cfg(feature = "mmap")]
     pub fn create_mmap(path: &std::path::Path, cfg: Config) -> std::io::Result<Self> {
         let (reader_table_offset, data_offset, total) = layout(&cfg);
         let file = std::fs::OpenOptions::new()
@@ -656,7 +698,7 @@ impl RingBuffer<MmapBacking> {
         file.set_len(total as u64)?;
         // SAFETY: mapping a file we just sized to `total`; we hold it exclusively.
         let map = unsafe { memmap2::MmapMut::map_mut(&file)? };
-        let backing = MmapBacking { map };
+        let backing = Backing::mmap(map);
         // SAFETY: freshly sized, exclusively-held region; single-threaded init.
         unsafe { init_region(&backing, &cfg, reader_table_offset, data_offset, total) };
         Ok(RingBuffer {
@@ -677,6 +719,7 @@ impl RingBuffer<MmapBacking> {
     /// The caller asserts `path` is a ring-buffer region created by a compatible
     /// build and is not being concurrently torn down. The magic/version/arch
     /// handshake guards against accidental misuse but not deliberate corruption.
+    #[cfg(feature = "mmap")]
     pub unsafe fn attach_mmap(path: &std::path::Path) -> std::io::Result<Self> {
         let file = std::fs::OpenOptions::new()
             .read(true)
@@ -684,52 +727,50 @@ impl RingBuffer<MmapBacking> {
             .open(path)?;
         // SAFETY: caller asserts a valid region; mapping read+write shared.
         let map = unsafe { memmap2::MmapMut::map_mut(&file)? };
-        // SAFETY: caller asserts a live, valid region; `from_validated` reads and
+        // SAFETY: caller asserts a live, valid region; `attach` reads and
         // checks the header before forming any reference into it.
-        unsafe { Self::from_validated(MmapBacking { map }) }
+        unsafe { Self::attach(Backing::mmap(map)) }
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
     }
-}
 
-impl RingBuffer<RawBacking> {
     /// Attach a non-owning handle to a host-provided ring region, validating its
-    /// header and reading geometry back out of it (the same-process dlopen path). The
-    /// caller keeps owning the region; this handle's [`RawBacking`] frees nothing.
+    /// header and reading geometry back out of it (the same-process dlopen path).
+    /// The caller keeps owning the region; the non-owning backing frees nothing.
     ///
     /// This is [`RingBuffer::attach_mmap`] with the mapping step removed: the
-    /// caller supplies the `(base, len)` directly (e.g. another backing's
-    /// [`Backing::base`]/[`Backing::len`]).
+    /// caller supplies the `(base, len)` directly (e.g. another ring's
+    /// [`RingBuffer::region`]).
     ///
     /// # Safety
     /// `base..base+len` is a live ring region (header already laid out and
     /// validated) that outlives every [`Writer`]/[`View`] produced here and is
     /// not torn down concurrently.
     pub unsafe fn attach_raw(base: *mut u8, len: usize) -> Result<Self, AttachError> {
-        // The raw path takes an arbitrary pointer (mmap and `BoxBacking` are
-        // aligned by construction), so alignment is checked here; everything
+        // The raw path takes an arbitrary pointer (the heap and mmap backings
+        // are aligned by construction), so alignment is checked here; everything
         // else — including the region-shorter-than-header case — is validated
         // by the shared `read_header` path before any out-of-bounds read.
         if !(base as usize).is_multiple_of(8) {
             return Err(AttachError::Misaligned);
         }
-        // SAFETY: caller asserts a live region of `len` readable bytes;
-        // `from_validated` bounds every header read against that length.
-        unsafe { Self::from_validated(RawBacking { base, len }) }
+        // SAFETY: caller asserts a live region of `len` readable bytes (the
+        // `Backing::raw` contract); `attach` bounds every header read against
+        // that length.
+        unsafe { Self::attach(Backing::raw(base, len)) }
     }
-}
 
-impl<B: Backing> RingBuffer<B> {
-    /// Rebuild a handle over an already-laid-out region: validate its header and
-    /// read the geometry (capacity/offsets/`max_readers`) back out of it rather
-    /// than from arguments. Shared by [`RingBuffer::attach_mmap`] and
-    /// [`RingBuffer::attach_raw`].
+    /// Attach over an already-laid-out region held by `backing`: validate its
+    /// header and read the geometry (capacity/offsets/`max_readers`) back out
+    /// of it rather than from arguments. The shared tail of
+    /// [`RingBuffer::attach_mmap`]/[`RingBuffer::attach_raw`], and the public
+    /// door for custom [`Backing::from_raw_parts`] regions.
     ///
     /// # Safety
     /// `backing`'s region is live (all [`Backing::len`] bytes readable) and is
     /// not being concurrently torn down. `read_header` validates everything
     /// else — size, magic/version/arch, and geometry — before any reference is
     /// formed into the region.
-    unsafe fn from_validated(backing: B) -> Result<Self, AttachError> {
+    pub unsafe fn attach(backing: Backing) -> Result<Self, AttachError> {
         let base = backing.base();
         // SAFETY: `backing.len()` bytes are readable (caller contract);
         // `read_header` bounds every read against that length.
@@ -774,7 +815,7 @@ impl<B: Backing> RingBuffer<B> {
         &self,
         data: WD,
         space: WS,
-    ) -> Result<Writer<B, WD, WS>, WriterClaimed> {
+    ) -> Result<Writer<WD, WS>, WriterClaimed> {
         // Acquire on success: pairs with the Release store in `Writer::drop` /
         // `force_release_writer`, so drop→claim forms a synchronizes-with edge
         // handing the whole region state (committed/hwm and data bytes) from
@@ -813,7 +854,7 @@ impl<B: Backing> RingBuffer<B> {
         &self,
         data: RD,
         space: RS,
-    ) -> Result<View<B, RD, RS>, FullReaderTable> {
+    ) -> Result<View<RD, RS>, FullReaderTable> {
         // A new reader starts at the current commit point (mirrors
         // `Disruptor::reader`): it never sees older data.
         let mut start = self.inner.committed().load(Acquire);
@@ -914,8 +955,8 @@ fn layout(cfg: &Config) -> (usize, usize, usize) {
 /// # Safety
 /// `backing` is a freshly allocated, exclusively-owned region of `total` bytes;
 /// this runs single-threaded before any handle is published.
-unsafe fn init_region<B: Backing>(
-    backing: &B,
+unsafe fn init_region(
+    backing: &Backing,
     cfg: &Config,
     reader_table_offset: usize,
     data_offset: usize,
@@ -1044,13 +1085,13 @@ unsafe fn read_header(base: *mut u8, region_len: usize) -> Result<Geometry, Atta
 
 /// The single producer for a buffer. There must be at most one live writer per
 /// buffer; the writer is the sole mutator of `committed`/`high_water_mark`.
-pub struct Writer<B: Backing, WD: WakeSource, WS: WakeSink> {
-    inner: Arc<Inner<B>>,
+pub struct Writer<WD: WakeSource, WS: WakeSink> {
+    inner: Arc<Inner>,
     data: WD,
     space: WS,
 }
 
-impl<B: Backing, WD: WakeSource, WS: WakeSink> Writer<B, WD, WS> {
+impl<WD: WakeSource, WS: WakeSink> Writer<WD, WS> {
     /// Write one message without blocking. Returns [`WriteError::WouldBlock`]
     /// if writing now would overwrite the slowest active reader.
     pub fn try_write(&mut self, bytes: &[u8]) -> Result<(), WriteError> {
@@ -1127,7 +1168,7 @@ impl<B: Backing, WD: WakeSource, WS: WakeSink> Writer<B, WD, WS> {
     }
 }
 
-impl<B: Backing, WD: WakeSource, WS: WakeSink> Drop for Writer<B, WD, WS> {
+impl<WD: WakeSource, WS: WakeSink> Drop for Writer<WD, WS> {
     fn drop(&mut self) {
         // Free the region's writer claim. Release: pairs with the Acquire CAS in
         // `RingBuffer::writer`, handing the whole region state (committed / hwm
@@ -1154,14 +1195,14 @@ struct Located {
 
 /// A reader into a buffer, with its own absolute cursor stored in the shared
 /// reader table. Drops free its slot.
-pub struct View<B: Backing, RD: WakeSink, RS: WakeSource> {
-    inner: Arc<Inner<B>>,
+pub struct View<RD: WakeSink, RS: WakeSource> {
+    inner: Arc<Inner>,
     slot: u32,
     data: RD,
     space: RS,
 }
 
-impl<B: Backing, RD: WakeSink, RS: WakeSource> View<B, RD, RS> {
+impl<RD: WakeSink, RS: WakeSource> View<RD, RS> {
     /// This view's current absolute read cursor.
     pub fn cursor(&self) -> u64 {
         self.inner.slot_cursor(self.slot).load(Acquire)
@@ -1208,7 +1249,7 @@ impl<B: Backing, RD: WakeSink, RS: WakeSource> View<B, RD, RS> {
     /// borrow is stable for its whole lifetime. The returned grant holds this
     /// view's cursor until dropped, at which point the cursor advances past the
     /// record and a waiting writer is woken.
-    pub fn try_read(&mut self) -> Result<Option<ReadGrant<'_, B, RS>>, ReadError> {
+    pub fn try_read(&mut self) -> Result<Option<ReadGrant<'_, RS>>, ReadError> {
         let Some(loc) = self.locate()? else {
             return Ok(None);
         };
@@ -1230,7 +1271,7 @@ impl<B: Backing, RD: WakeSink, RS: WakeSource> View<B, RD, RS> {
 
     /// Await the next record and borrow it (event-driven async consumers) — the
     /// grant twin of [`View::read_into`].
-    pub async fn read(&mut self) -> Result<ReadGrant<'_, B, RS>, ReadError> {
+    pub async fn read(&mut self) -> Result<ReadGrant<'_, RS>, ReadError> {
         // Await-then-borrow is split from `try_read` for borrowck: a grant
         // taken inside the wait loop would pin the `self` borrow across every
         // iteration. Nothing else can consume between the successful `locate`
@@ -1254,7 +1295,7 @@ impl<B: Backing, RD: WakeSink, RS: WakeSource> View<B, RD, RS> {
     /// with no new data returns the same record again. `Ok(None)` only before
     /// the first record is committed (or after the stream was fully consumed
     /// through [`View::try_read`]/[`View::try_read_into`]).
-    pub fn try_latest(&mut self) -> Result<Option<ReadGrant<'_, B, RS>>, ReadError> {
+    pub fn try_latest(&mut self) -> Result<Option<ReadGrant<'_, RS>>, ReadError> {
         loop {
             let Some(loc) = self.locate()? else {
                 return Ok(None);
@@ -1352,7 +1393,7 @@ impl<B: Backing, RD: WakeSink, RS: WakeSource> View<B, RD, RS> {
     }
 }
 
-impl<B: Backing, RD: WakeSink, RS: WakeSource> Drop for View<B, RD, RS> {
+impl<RD: WakeSink, RS: WakeSource> Drop for View<RD, RS> {
     fn drop(&mut self) {
         // Free this view's slot for reuse (a single wait-free store).
         self.inner.slot_cursor(self.slot).store(FREE_SLOT, Release);
@@ -1363,22 +1404,22 @@ impl<B: Backing, RD: WakeSink, RS: WakeSource> Drop for View<B, RD, RS> {
 /// drop, moves the view's cursor to `end_abs` — past the record for a
 /// [`View::try_read`]/[`View::read`] grant (consume), back to its start for a
 /// [`View::try_latest`] grant (pin) — and wakes a waiting writer.
-pub struct ReadGrant<'a, B: Backing, RS: WakeSource> {
-    inner: &'a Inner<B>,
+pub struct ReadGrant<'a, RS: WakeSource> {
+    inner: &'a Inner,
     space: &'a RS,
     slot: u32,
     end_abs: u64,
     slice: &'a [u8],
 }
 
-impl<B: Backing, RS: WakeSource> std::ops::Deref for ReadGrant<'_, B, RS> {
+impl<RS: WakeSource> std::ops::Deref for ReadGrant<'_, RS> {
     type Target = [u8];
     fn deref(&self) -> &[u8] {
         self.slice
     }
 }
 
-impl<B: Backing, RS: WakeSource> Drop for ReadGrant<'_, B, RS> {
+impl<RS: WakeSource> Drop for ReadGrant<'_, RS> {
     fn drop(&mut self) {
         self.inner.slot_cursor(self.slot).store(self.end_abs, Release);
         self.space.notify();

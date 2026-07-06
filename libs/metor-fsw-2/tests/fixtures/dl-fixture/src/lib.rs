@@ -19,7 +19,6 @@ use metor_fsw_2::{
     SystemOutput,
 };
 use metor_fsw_2::metor_proto::types::Timestamp;
-use metor_fsw_2::ring::{Backing, BoxBacking};
 use postcard_schema::Schema;
 use serde::{Deserialize, Serialize};
 use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
@@ -78,29 +77,29 @@ pub struct DlCounter {
 }
 
 #[derive(SystemInput)]
-pub struct DlCounterIn<B: Backing = BoxBacking> {
-    tick: Input<TickIn, B>,
+pub struct DlCounterIn {
+    tick: Input<TickIn>,
 }
 
 #[derive(SystemOutput)]
-pub struct DlCounterOut<B: Backing = BoxBacking> {
-    out: Output<TickOut, B>,
+pub struct DlCounterOut {
+    out: Output<TickOut>,
     /// The Postcard port beside the Table port — one bundle, both schemas.
-    events: MsgOut<TickEvent, B>,
+    events: MsgOut<TickEvent>,
 }
 
-impl<B: Backing> System<B> for DlCounter {
-    type Input = DlCounterIn<B>;
-    type Output = Out<DlCounterOut<B>, B>;
+impl System for DlCounter {
+    type Input = DlCounterIn;
+    type Output = Out<DlCounterOut>;
     const NAME: &'static str = "dl_counter";
 }
 
-impl<B: Backing> CyclicSystem<B> for DlCounter {
+impl CyclicSystem for DlCounter {
     fn execute(
         &mut self,
         now: Timestamp,
-        input: &mut DlCounterIn<B>,
-        output: &mut Out<DlCounterOut<B>, B>,
+        input: &mut DlCounterIn,
+        output: &mut Out<DlCounterOut>,
     ) {
         let value = match input.tick.latest() {
             Some(t) => t.get().value,

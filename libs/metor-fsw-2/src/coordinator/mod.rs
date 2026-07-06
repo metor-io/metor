@@ -23,7 +23,7 @@ use std::sync::atomic::{
 use std::time::{Duration, Instant};
 
 use metor_fsw_ring::{
-    BoxBacking, Config, NoWake, Notifier, RingBuffer, View, WakeSource, Writer,
+    Config, NoWake, Notifier, RingBuffer, View, WakeSource, Writer,
 };
 use metor_proto::types::{ComponentId, Msg, Timestamp};
 use metor_proto_wkt::{
@@ -529,7 +529,7 @@ enum BufferRole {
 struct RingEntry {
     /// Held for ownership only (the ports clone their own `Arc`s) — never read.
     #[allow(dead_code)]
-    ring: RingBuffer<BoxBacking>,
+    ring: RingBuffer,
     frame_id: ComponentId,
     role: BufferRole,
     /// The KDL/builder instance name of the system owning this buffer (the
@@ -537,7 +537,7 @@ struct RingEntry {
     instance: Option<String>,
 }
 
-/// Owns every `RingBuffer<BoxBacking>`. Holding the canonical handle here keeps a
+/// Owns every `RingBuffer`. Holding the canonical handle here keeps a
 /// buffer alive longer than any port over it, regardless of teardown order.
 struct RingTable {
     rings: Vec<RingEntry>,
@@ -553,11 +553,11 @@ struct RingTable {
 /// commit. The record is borrowed in place off the upstream ring and written
 /// through; no intermediate buffer.
 struct CopyIn {
-    upstream: View<BoxBacking, NoWake, NoWake>,
+    upstream: View<NoWake, NoWake>,
     /// The private ring's sole writer: the matched data `Notifier` wakes the parked
     /// async `recv`; the space side is `NoWake` — a full private ring (the consumer
     /// is behind) drops this cycle's mirror rather than suspending the cycle loop.
-    writer: Writer<BoxBacking, Notifier, NoWake>,
+    writer: Writer<Notifier, NoWake>,
     /// The upstream ring's `committed` at the last mirror, so an unchanged upstream
     /// (no new record) is skipped instead of re-waking the consumer with the same
     /// pinned record every cycle. `u64::MAX` = nothing mirrored yet.
@@ -648,15 +648,15 @@ struct CyclicReg<S> {
 impl<S, O> CyclicRegistration for CyclicReg<S>
 where
     S: CyclicSystem<Output = Out<O>> + 'static,
-    O: SystemOutput + BindPorts<BoxBacking> + 'static,
-    S::Input: BindPorts<BoxBacking> + 'static,
+    O: SystemOutput + BindPorts + 'static,
+    S::Input: BindPorts + 'static,
 {
     fn bind(self: Box<Self>, binder: &mut Binder) -> Box<dyn CyclicSlot> {
-        // The host always binds over `BoxBacking`; the `Binder` is the host's
-        // `RingSource<B = BoxBacking>`. A dlopen'd system instead monomorphizes
-        // `CyclicRunner<_, _, RawBacking>` on its own side of the ABI.
-        let input = <S::Input as BindPorts<BoxBacking>>::bind(binder);
-        let output = <Out<O> as BindPorts<BoxBacking>>::bind(binder);
+        // The host binds over its own pre-allocated heap rings via the `Binder`
+        // ring source; a dlopen'd system runs the identical (backing-erased)
+        // bind on its own side of the ABI over non-owning attaches.
+        let input = <S::Input as BindPorts>::bind(binder);
+        let output = <Out<O> as BindPorts>::bind(binder);
         Box::new(CyclicRunner::new(self.system, input, output))
     }
 }
@@ -672,12 +672,12 @@ struct AsyncReg<S> {
 impl<S> AsyncRegistration for AsyncReg<S>
 where
     S: AsyncSystem + 'static,
-    S::Input: BindPorts<BoxBacking> + 'static,
-    S::Output: BindPorts<BoxBacking> + 'static,
+    S::Input: BindPorts + 'static,
+    S::Output: BindPorts + 'static,
 {
     fn bind(self: Box<Self>, binder: &mut Binder) -> Box<dyn AsyncLauncher> {
-        let input = <S::Input as BindPorts<BoxBacking>>::bind(binder);
-        let output = <S::Output as BindPorts<BoxBacking>>::bind(binder);
+        let input = <S::Input as BindPorts>::bind(binder);
+        let output = <S::Output as BindPorts>::bind(binder);
         Box::new(AsyncSlot {
             system: self.system,
             input,
@@ -813,8 +813,8 @@ impl CoordinatorBuilder {
     pub fn add_cyclic<S, O>(&mut self, system: S) -> SystemHandle
     where
         S: CyclicSystem<Output = Out<O>> + 'static,
-        O: SystemOutput + BindPorts<BoxBacking> + 'static,
-        S::Input: BindPorts<BoxBacking> + 'static,
+        O: SystemOutput + BindPorts + 'static,
+        S::Input: BindPorts + 'static,
     {
         self.add_cyclic_named(<S as System>::NAME, system)
     }
@@ -825,8 +825,8 @@ impl CoordinatorBuilder {
     pub fn add_cyclic_named<S, O>(&mut self, name: impl Into<String>, system: S) -> SystemHandle
     where
         S: CyclicSystem<Output = Out<O>> + 'static,
-        O: SystemOutput + BindPorts<BoxBacking> + 'static,
-        S::Input: BindPorts<BoxBacking> + 'static,
+        O: SystemOutput + BindPorts + 'static,
+        S::Input: BindPorts + 'static,
     {
         self.push_system(
             <S as CyclicSystem>::descriptor(),
@@ -839,8 +839,8 @@ impl CoordinatorBuilder {
     pub fn add_async<S>(&mut self, system: S) -> SystemHandle
     where
         S: AsyncSystem + 'static,
-        S::Input: BindPorts<BoxBacking> + 'static,
-        S::Output: BindPorts<BoxBacking> + 'static,
+        S::Input: BindPorts + 'static,
+        S::Output: BindPorts + 'static,
     {
         self.add_async_named(<S as System>::NAME, system)
     }
@@ -849,8 +849,8 @@ impl CoordinatorBuilder {
     pub fn add_async_named<S>(&mut self, name: impl Into<String>, system: S) -> SystemHandle
     where
         S: AsyncSystem + 'static,
-        S::Input: BindPorts<BoxBacking> + 'static,
-        S::Output: BindPorts<BoxBacking> + 'static,
+        S::Input: BindPorts + 'static,
+        S::Output: BindPorts + 'static,
     {
         self.push_system(
             <S as AsyncSystem>::descriptor(),
@@ -1643,15 +1643,15 @@ type ConsEdges = HashMap<(usize, usize), Vec<(usize, usize)>>;
 /// registry entries (drained by [`freeze_registry`]).
 struct RingAlloc {
     table: RingTable,
-    output_rings: Vec<Vec<RingBuffer<BoxBacking>>>,
-    host_input_rings: HashMap<(usize, usize), RingBuffer<BoxBacking>>,
+    output_rings: Vec<Vec<RingBuffer>>,
+    host_input_rings: HashMap<(usize, usize), RingBuffer>,
     reg_entries: Vec<RegistryEntry>,
 }
 
 /// The copy-in planning product: each async Snapshot input's private ring + matched
 /// data notifier, the per-system wake lists (for teardown), and the copy-in jobs.
 struct AsyncPlumbing {
-    private_inputs: HashMap<(usize, usize), (RingBuffer<BoxBacking>, Notifier)>,
+    private_inputs: HashMap<(usize, usize), (RingBuffer, Notifier)>,
     async_wakes: Vec<Vec<Notifier>>,
     copy_ins: Vec<CopyIn>,
 }
@@ -1690,7 +1690,7 @@ fn freeze_registry(reg_entries: Vec<RegistryEntry>) -> Result<Arc<Registry>, Wir
 
 /// Bind every system's ports over the allocated rings — the pass that consumes the
 /// registrations. Each arm mirrors one registration kind; the static (host-side
-/// `BoxBacking`) arm builds typed `BoundPort`s and walks them with a [`Binder`].
+/// host) arm builds typed `BoundPort`s and walks them with a [`Binder`].
 fn bind_systems(
     systems: Vec<Registration>,
     cons_edges: &ConsEdges,
@@ -1717,7 +1717,7 @@ fn bind_systems(
             Reg::Slot(slot_reg) => cyclic.push(Box::new(bind_slot(
                 id, slot_reg, &desc, cons_edges, alloc,
             ))),
-            // The static (host-side `BoxBacking`) path: build typed `BoundPort`s and
+            // The static (host-side) path: build typed `BoundPort`s and
             // walk them with a `Binder`.
             reg => {
                 // Outputs: default wakes, the system's own buffers. Capabilities
@@ -1805,7 +1805,7 @@ fn bind_systems(
 fn bind_coordinator(
     id: usize,
     desc: &SystemDescriptor,
-    output_rings: &[Vec<RingBuffer<BoxBacking>>],
+    output_rings: &[Vec<RingBuffer>],
 ) -> CoordinatorPorts {
     let out_idx = |pid: PortId| {
         desc.outputs
@@ -1854,7 +1854,7 @@ fn bind_dl(
     dl: DlReg,
     desc: &SystemDescriptor,
     cons_edges: &ConsEdges,
-    output_rings: &[Vec<RingBuffer<BoxBacking>>],
+    output_rings: &[Vec<RingBuffer>],
 ) -> crate::dl::DlSlot {
     use crate::abi::{FswRing, ROLE_INPUT, ROLE_OUTPUT};
     let outputs: Vec<FswRing> = (0..desc.outputs.len())
@@ -2104,7 +2104,7 @@ fn alloc_ring(
     max_size: usize,
     default_depth: usize,
     max_readers: usize,
-) -> RingBuffer<BoxBacking> {
+) -> RingBuffer {
     let depth = match delivery {
         Delivery::Snapshot => default_depth,
         Delivery::Log => LOG_DEPTH,
@@ -2119,7 +2119,7 @@ fn alloc_ring(
 /// [`slot_writer`] analogue for the message channel, exactly how the coordinator
 /// mints its own `status_out`/`control` writers. Called exactly once per ring at
 /// build (the region's writer claim enforces it).
-fn owned_writer<M: Msg>(ring: &RingBuffer<BoxBacking>) -> MsgOut<M> {
+fn owned_writer<M: Msg>(ring: &RingBuffer) -> MsgOut<M> {
     // Invariant: each coordinator-owned message ring gets its single writer
     // minted exactly once at build, so the claim is always free here.
     let writer = ring
@@ -2135,7 +2135,7 @@ fn owned_writer<M: Msg>(ring: &RingBuffer<BoxBacking>) -> MsgOut<M> {
 fn postcard_entry(
     instance: &str,
     name: &str,
-    ring: RingBuffer<BoxBacking>,
+    ring: RingBuffer,
     telemetered: bool,
 ) -> RegistryEntry {
     RegistryEntry {
@@ -2157,7 +2157,7 @@ const COORDINATOR_INSTANCE: &str = "coordinator";
 /// Build a [`RegistryEntry`] for one buffer: compute the instance-qualified key and
 /// the prefixed announce vtable+metadata once (telemetry.md §2.1/§6), capturing a
 /// clone of the ring as the read source.
-fn registry_entry(instance: &str, port: &PortDesc, ring: RingBuffer<BoxBacking>) -> RegistryEntry {
+fn registry_entry(instance: &str, port: &PortDesc, ring: RingBuffer) -> RegistryEntry {
     let key = ComponentId::new(&format!("{instance}.{}", port.name));
     // Invariant: only Table ports come through here (the caller branches on the
     // schema), so the checked accessors are always `Some`.
