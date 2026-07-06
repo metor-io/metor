@@ -1,9 +1,11 @@
 # Running Miri on the ring buffer
 
-`src/lib.rs` contains hand-written `unsafe`: atomics formed at fixed offsets over
-the shared region (`&AtomicU64` from the backing's owning base pointer) and
-raw-pointer record writes/reads whose race-freedom rests on the in-use
-backpressure check plus the `committed` Release/Acquire publication handshake.
+`src/lib.rs` contains hand-written `unsafe`: `#[repr(C)]` control structures
+(`Control`, `ReaderSlot`) pointer-cast over the shared region from the backing's
+owning base pointer (their `AtomicU64` fields carry the synchronization), a
+transient shared byte view of the write-once `RegionHeader`, and raw-pointer
+record writes/reads whose race-freedom rests on the in-use backpressure check
+plus the `committed` Release/Acquire publication handshake.
 [Miri](https://github.com/rust-lang/miri) checks this for data races,
 use-after-free, leaks, and provenance violations that `cargo test` cannot see.
 
@@ -107,3 +109,11 @@ free their allocations correctly.
   `ReadGrant` (including the `try_latest` pin) holds the view's cursor at or
   before the record start, so the same check keeps the borrowed bytes stable for
   the borrow's whole lifetime.
+- **Struct views over the region.** The control block and reader slots are
+  reached as `&Control` / `&ReaderSlot` (`#[repr(C)]`, offsets pinned by const
+  asserts) — sound because every non-pad field is an atomic, and `ReaderSlot`'s
+  pad bytes are written exactly once in `init_region` before publication (a
+  shared borrow freezes them). `read_header` forms a transient `&[u8]` over
+  exactly the 48 `RegionHeader` bytes — never wider: those bytes are write-once
+  pre-publication, while the control words past them may be concurrently
+  mutated by a live writer during attach.
