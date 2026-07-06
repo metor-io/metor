@@ -1187,6 +1187,90 @@ mod tests {
         assert_eq!(got.gain, 0.5);
     }
 
+    /// The alarm-config grammar (`docs/alarms.md` §3) deserializes end-to-end:
+    /// repeated `alarm` children, property + scalar-child fields, `Option` bands
+    /// with per-side `Option` thresholds, the wkt `Severity` enum from a string,
+    /// integer→float coercion, and the `try_from` semantic validation.
+    #[test]
+    fn alarm_params_grammar_round_trips() {
+        use metor_proto_wkt::Severity;
+
+        use crate::alarm::AlarmsParams;
+
+        let got: AlarmsParams = de_system(
+            r#"system "alarms" type="Alarms" {
+    alarm id="ADCS_RATE_HIGH" name="Body Rate High" severity="warning" {
+        description "Body rate exceeds the safe envelope"
+        target component="plant.sensors.gyro_b" element=1
+        warning above=0.5 below=-0.5
+        critical above=1 below=-1
+        debounce 2
+        hysteresis 0.05
+        latching #true
+    }
+    alarm id="BATT_LOW" name="Battery Low" {
+        target component="power.battery.soc"
+        critical below=0.2
+    }
+}"#,
+        )
+        .unwrap();
+
+        assert_eq!(got.alarm.len(), 2);
+        let a = &got.alarm[0];
+        assert_eq!(a.id, "ADCS_RATE_HIGH");
+        assert_eq!(a.target.component, "plant.sensors.gyro_b");
+        assert_eq!(a.target.element, Some(1));
+        assert_eq!(a.warning.unwrap().above, Some(0.5));
+        assert_eq!(a.critical.unwrap().above, Some(1.0)); // int literal coerces
+        assert_eq!(a.debounce, 2);
+        assert_eq!(a.hysteresis, 0.05);
+        assert!(a.latching);
+        assert_eq!(a.severity, Severity::Warning);
+
+        let b = &got.alarm[1];
+        assert_eq!(b.target.element, None);
+        assert!(b.warning.is_none());
+        assert_eq!(b.debounce, 1); // defaults
+        assert!(!b.latching);
+        assert_eq!(b.severity, Severity::Critical); // lowest configured band
+
+        // An alarm-less node is legal.
+        let empty: AlarmsParams = de_system(r#"system "alarms" type="Alarms""#).unwrap();
+        assert!(empty.alarm.is_empty());
+    }
+
+    /// A semantically-bad alarm spec is a spanned `InvalidParam` naming the `alarm`
+    /// key (the `try_from` refinement), and the positional-id spelling is rejected
+    /// (nested nodes take no positional args — `docs/alarms.md` §7 F2).
+    #[test]
+    fn alarm_params_misconfig_is_spanned() {
+        use crate::alarm::AlarmsParams;
+
+        // No band configured.
+        let src = r#"system "alarms" type="Alarms" {
+    alarm id="X" name="X" { target component="a.b.c" }
+}"#;
+        let err = de_system::<AlarmsParams>(src).unwrap_err();
+        match err {
+            LoadError::InvalidParam { ref property, span, .. } => {
+                assert_eq!(property, "alarm");
+                let at = src.find("alarm id=").unwrap();
+                assert!(span.offset() >= at, "span {span:?} at the alarm child (at {at})");
+            }
+            other => panic!("expected InvalidParam, got {other:?}"),
+        }
+
+        // Positional id (the `alarm "X"` spelling) is not the grammar.
+        let err = de_system::<AlarmsParams>(
+            r#"system "alarms" type="Alarms" {
+    alarm "X" name="X" { target component="a.b.c"; warning above=1.0 }
+}"#,
+        )
+        .unwrap_err();
+        assert!(matches!(err, LoadError::InvalidParam { .. }), "{err:?}");
+    }
+
     #[test]
     fn value_target_maps_the_full_surface() {
         let (doc, text) = parse_node(
