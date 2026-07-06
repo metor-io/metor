@@ -48,9 +48,7 @@ use crate::coordinator::{
 use crate::descriptor::{PortId, SystemDescriptor, compatible};
 use crate::dl::DlSystem;
 use crate::system::{AsyncSystem, BuildSystem, CyclicSystem, Out, SystemOutput};
-use crate::telemetry::{
-    TcpRecvTransport, TcpTransport, TelemetryConfig, TelemetryMode, TelemetrySystem, UplinkSystem,
-};
+use crate::telemetry::{TcpRecvTransport, TcpTransport, TelemetrySystem, UplinkSystem};
 
 // The `Wiring` data model, the Rust builder, and the cargo build driver. KDL is *one*
 // deserializer onto `Wiring` (see `parse`/`resolve` below); the builder is the other;
@@ -72,8 +70,8 @@ pub use bundle::{BundleError, PackageOptions, load_bundle, write_bundle};
 pub use builder::{SlotSpecBuilder, SystemSpecBuilder, WiringBuilder};
 pub use model::{
     AllowedOccupantSpec, Artifact, ClockSpec, CoordinatorSpec, EdgeKind, EdgeSpec,
-    InitialOccupantSpec, ParamSource, SlotInitState, SlotSpec, SystemSpec, TelemetryModeSpec,
-    TelemetrySpec, UplinkSpec, Wiring,
+    InitialOccupantSpec, ParamSource, SlotInitState, SlotSpec, SystemSpec, TCP_DOWNLINK_TYPE,
+    TCP_UPLINK_TYPE, Wiring,
 };
 
 // Re-export the registration macro so a system author only needs
@@ -358,28 +356,8 @@ pub fn resolve(wiring: &Wiring, registry: &Registry) -> Result<Coordinator, Load
         }
     }
 
-    // --- Uplink: an async system on its own connection (`docs/messages.md` §4.4/§4.5).
-    // Registered BEFORE the edges pass so command edges can name it — its commands
-    // reach a slot only over an explicit `connect "uplink" -> … msg="…"` edge (A2).
-    if let Some(spec) = &wiring.uplink {
-        let handle = builder.add_async(UplinkSystem::new(TcpRecvTransport::new(spec.addr)));
-        let desc = builder.descriptor_of(handle).clone();
-        if instances
-            .insert("uplink".to_string(), Instance { handle, desc })
-            .is_some()
-        {
-            let src = "uplink { … }".to_string();
-            return Err(LoadError::DuplicateInstance {
-                name: "uplink".to_string(),
-                span: (0, src.len()).into(),
-                src,
-            });
-        }
-    }
-
-    // --- Deferred receive-all systems: the last cyclic registrations before
-    //     telemetry, and still ahead of the edges pass (edge resolution only needs
-    //     the finished instance map).
+    // --- Deferred receive-all systems: the last cyclic registrations, still ahead
+    //     of the edges pass (edge resolution only needs the finished instance map).
     for spec in deferred {
         let (handle, desc) = resolve_static(spec, registry, &mut builder)?;
         if instances
@@ -419,17 +397,6 @@ pub fn resolve(wiring: &Wiring, registry: &Registry) -> Result<Coordinator, Load
             builder.connect(producer, consumer)
         };
         result.map_err(|source| LoadError::Wire { source, src, span })?;
-    }
-
-    // --- Telemetry: registered last (observes every system's fresh output) ---
-    if let Some(t) = &wiring.telemetry {
-        builder.add_cyclic_named(
-            "telemetry",
-            TelemetrySystem::new(TelemetryConfig {
-                transport: TcpTransport::new(t.addr),
-                mode: mode_from_spec(&t.mode),
-            }),
-        );
     }
 
     builder.build().map_err(wire_at_build)
@@ -785,17 +752,6 @@ fn coordinator_config(spec: &CoordinatorSpec) -> CoordinatorConfig {
         },
     };
     config
-}
-
-/// Convert the serializable [`TelemetryModeSpec`] into the runtime [`TelemetryMode`].
-fn mode_from_spec(mode: &TelemetryModeSpec) -> TelemetryMode {
-    match mode {
-        TelemetryModeSpec::All => TelemetryMode::All,
-        TelemetryModeSpec::Subset { instances, frames } => TelemetryMode::Subset {
-            instances: instances.clone(),
-            frames: frames.clone(),
-        },
-    }
 }
 
 /// Resolve a `msg=` edge's two endpoints **jointly** (`docs/design-command-slots.md`

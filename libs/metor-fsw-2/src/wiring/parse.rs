@@ -8,8 +8,8 @@ use kdl::{KdlDocument, KdlNode};
 
 use super::model::{
     AllowedOccupantSpec, Artifact, ClockSpec, CoordinatorSpec, EdgeKind, EdgeSpec,
-    InitialOccupantSpec, SlotInitState, SlotSpec, SystemSpec, TelemetryModeSpec, TelemetrySpec,
-    UplinkSpec, Wiring,
+    InitialOccupantSpec, SlotInitState, SlotSpec, SystemSpec, TCP_DOWNLINK_TYPE, TCP_UPLINK_TYPE,
+    Wiring,
 };
 use super::{ALLOW_RESERVED, LoadError, ParamSource, SYSTEM_RESERVED, de};
 
@@ -18,8 +18,11 @@ use super::{ALLOW_RESERVED, LoadError, ParamSource, SYSTEM_RESERVED, de};
 ///
 /// This is **parse only**: it touches no [`Registry`], `dlopen`s nothing, and does not
 /// validate the graph — those are [`resolve`]'s job. It carries the
-/// `coordinator`/`system`/`connect`/`telemetry` surface plus the `artifact` node +
-/// per-`system` `artifact=` reference for dl systems.
+/// `coordinator`/`system`/`slot`/`connect` surface plus the `artifact` node +
+/// per-`system` `artifact=` reference for dl systems. The telemetry downlink and the
+/// command uplink are ordinary `system` nodes (the built-in
+/// [`TCP_DOWNLINK_TYPE`]/[`TCP_UPLINK_TYPE`] registry types); their pre-normalization
+/// dedicated nodes surface a guidance [`LoadError::LegacyLinkNode`].
 ///
 /// **Params** (for either kind) are carried as the KDL `system` node's source text in
 /// [`ParamSource::Kdl`] when the node has config properties/children; a config-less
@@ -41,8 +44,6 @@ pub fn parse(kdl: &str) -> Result<Wiring, LoadError> {
     let mut systems: Vec<SystemSpec> = Vec::new();
     let mut slots: Vec<SlotSpec> = Vec::new();
     let mut edges: Vec<EdgeSpec> = Vec::new();
-    let mut telemetry: Option<TelemetrySpec> = None;
-    let mut uplink: Option<UplinkSpec> = None;
     let mut seen: HashSet<String> = HashSet::new();
 
     for node in doc.nodes() {
@@ -61,15 +62,14 @@ pub fn parse(kdl: &str) -> Result<Wiring, LoadError> {
             // sequences-slots.md §5: a slot is an instance like a system.
             "slot" => slots.push(parse_slot(node, kdl, &mut seen)?),
             "connect" => edges.push(parse_edge(node, kdl)?),
+            // The pre-normalization dedicated nodes: a guidance error carrying the
+            // `system` spelling that replaced each (the only migration notice an old
+            // mission document or bundle gets).
             "telemetry" => {
-                let (addr, mode) = parse_telemetry(node, kdl)?;
-                telemetry = Some(TelemetrySpec { addr, mode });
+                return Err(legacy_link_node(node, kdl, "telemetry", TCP_DOWNLINK_TYPE, "2240"));
             }
-            // The command uplink (`docs/messages.md` §4.4): registers the instance
-            // name "uplink" so command edges can name it.
             "uplink" => {
-                let addr = parse_transport_addr(node, kdl, "uplink")?;
-                uplink = Some(UplinkSpec { addr });
+                return Err(legacy_link_node(node, kdl, "uplink", TCP_UPLINK_TYPE, "2241"));
             }
             other => {
                 return Err(LoadError::UnknownTopLevelNode {
@@ -89,9 +89,24 @@ pub fn parse(kdl: &str) -> Result<Wiring, LoadError> {
         systems,
         slots,
         edges,
-        telemetry,
-        uplink,
     })
+}
+
+/// Build the [`LoadError::LegacyLinkNode`] guidance error for one of the two removed
+/// dedicated nodes, spelling out the equivalent `system` declaration.
+fn legacy_link_node(
+    node: &KdlNode,
+    src: &str,
+    name: &str,
+    ty: &str,
+    example_port: &str,
+) -> LoadError {
+    LoadError::LegacyLinkNode {
+        node: name.to_string(),
+        example: format!("`system \"{name}\" type=\"{ty}\" addr=\"127.0.0.1:{example_port}\"`"),
+        src: src.to_string(),
+        span: node.span(),
+    }
 }
 
 /// Decorate a library **stem** into the platform's produced `cdylib` file name:
@@ -336,97 +351,6 @@ fn parse_slot(
         allow,
         initial,
     })
-}
-
-/// Parse a `telemetry` node into a `(addr, mode)` pair (telemetry.md §8):
-///
-/// ```kdl
-/// telemetry {
-///     transport "tcp" addr="127.0.0.1:2240"
-///     mode "all"                       // or: mode "subset"
-///     // subset only:
-///     // tap instance="imu_left"
-///     // tap frame="control"
-/// }
-/// ```
-/// Parse the shared `transport "tcp" addr="…"` child of a `telemetry`/`uplink` node
-/// into its socket address (v1 supports only `"tcp"`); `label` names the node in
-/// diagnostics.
-fn parse_transport_addr(
-    node: &KdlNode,
-    src: &str,
-    label: &str,
-) -> Result<std::net::SocketAddr, LoadError> {
-    let invalid = |property: &str, expected: &str| LoadError::InvalidParam {
-        property: property.to_string(),
-        system: label.to_string(),
-        expected: expected.to_string(),
-        src: src.to_string(),
-        span: node.span(),
-    };
-    let missing = |property: &str| LoadError::MissingParam {
-        property: property.to_string(),
-        system: label.to_string(),
-        src: src.to_string(),
-        span: node.span(),
-    };
-
-    let children = node.children().ok_or_else(|| missing("transport"))?;
-    let transport_node = children
-        .nodes()
-        .iter()
-        .find(|n| n.name().value() == "transport")
-        .ok_or_else(|| missing("transport"))?;
-    match first_arg_string(transport_node) {
-        Some("tcp") => {}
-        _ => return Err(invalid("transport", "\"tcp\" (the only v1 transport)")),
-    }
-    let addr_str = prop_string(transport_node, "addr").ok_or_else(|| missing("addr"))?;
-    addr_str
-        .parse::<std::net::SocketAddr>()
-        .map_err(|_| invalid("addr", "a socket address like 127.0.0.1:2240"))
-}
-
-fn parse_telemetry(
-    node: &KdlNode,
-    src: &str,
-) -> Result<(std::net::SocketAddr, TelemetryModeSpec), LoadError> {
-    let invalid = |property: &str, expected: &str| LoadError::InvalidParam {
-        property: property.to_string(),
-        system: "telemetry".to_string(),
-        expected: expected.to_string(),
-        src: src.to_string(),
-        span: node.span(),
-    };
-
-    let addr = parse_transport_addr(node, src, "telemetry")?;
-    let children = node.children().expect("parse_transport_addr requires children");
-
-    // mode "all" | "subset"  — subset taps the `tap instance=.. / frame=..` children.
-    let mode_str = children
-        .nodes()
-        .iter()
-        .find(|n| n.name().value() == "mode")
-        .and_then(first_arg_string)
-        .unwrap_or("all");
-    let mode = match mode_str {
-        "all" => TelemetryModeSpec::All,
-        "subset" => {
-            let mut instances = Vec::new();
-            let mut frames = Vec::new();
-            for tap in children.nodes().iter().filter(|n| n.name().value() == "tap") {
-                if let Some(i) = prop_string(tap, "instance") {
-                    instances.push(i.to_string());
-                }
-                if let Some(f) = prop_string(tap, "frame") {
-                    frames.push(f.to_string());
-                }
-            }
-            TelemetryModeSpec::Subset { instances, frames }
-        }
-        _ => return Err(invalid("mode", "\"all\" or \"subset\"")),
-    };
-    Ok((addr, mode))
 }
 
 /// Read one `coordinator` node into a [`CoordinatorSpec`] (wiring.md §1.1).

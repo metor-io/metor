@@ -3,7 +3,7 @@
 //! Everything KDL expresses, Rust expresses, because both produce the same [`Wiring`]:
 //!
 //! ```no_run
-//! # use metor_fsw_2::{WiringBuilder, ClockSpec, TelemetryModeSpec};
+//! # use metor_fsw_2::{WiringBuilder, ClockSpec};
 //! # #[derive(serde::Serialize)] struct PlantParams { init_angle: f64 }
 //! let wiring = WiringBuilder::new()
 //!     .coordinator(120.0, ClockSpec::Simulated { dt_secs: 1.0 / 120.0 })
@@ -12,7 +12,7 @@
 //!         .params(PlantParams { init_angle: 0.5 }).end()
 //!     .system("nav").ty("Nav").from_static().end()
 //!     .connect("plant", "sensors", "nav", "sensors")
-//!     .telemetry("127.0.0.1:2240".parse().unwrap(), TelemetryModeSpec::All)
+//!     .telemetry("127.0.0.1:2240".parse().unwrap())
 //!     .build();
 //! ```
 //!
@@ -27,21 +27,18 @@ use serde::Serialize;
 
 use super::model::{
     AllowedOccupantSpec, Artifact, ClockSpec, CoordinatorSpec, EdgeKind, EdgeSpec,
-    InitialOccupantSpec, ParamSource, SlotInitState, SlotSpec, SystemSpec, TelemetryModeSpec,
-    TelemetrySpec, UplinkSpec, Wiring,
+    InitialOccupantSpec, ParamSource, SlotInitState, SlotSpec, SystemSpec, Wiring,
 };
 
 /// Fluent constructor for a [`Wiring`]. Start with [`new`](Self::new), set the
 /// coordinator, declare artifacts, add systems (via the per-system
-/// [`SystemSpecBuilder`]), wire edges, optionally add telemetry, and [`build`](Self::build).
+/// [`SystemSpecBuilder`]), wire edges, and [`build`](Self::build).
 pub struct WiringBuilder {
     coordinator: CoordinatorSpec,
     artifacts: Vec<Artifact>,
     systems: Vec<SystemSpec>,
     slots: Vec<SlotSpec>,
     edges: Vec<EdgeSpec>,
-    telemetry: Option<TelemetrySpec>,
-    uplink: Option<UplinkSpec>,
 }
 
 impl Default for WiringBuilder {
@@ -64,8 +61,6 @@ impl WiringBuilder {
             systems: Vec::new(),
             slots: Vec::new(),
             edges: Vec::new(),
-            telemetry: None,
-            uplink: None,
         }
     }
 
@@ -185,19 +180,23 @@ impl WiringBuilder {
         self
     }
 
-    /// Add the telemetry downlink (TCP `addr`, tapping `mode`).
-    pub fn telemetry(mut self, addr: SocketAddr, mode: TelemetryModeSpec) -> Self {
-        self.telemetry = Some(TelemetrySpec { addr, mode });
+    /// Add the built-in TCP telemetry downlink under the instance name `"telemetry"`,
+    /// tapping every output — sugar for pushing the [`SystemSpec::tcp_downlink`] spec.
+    /// A subset tap (or a second downlink) declares an ordinary `system` spec/node
+    /// with the `TcpDownlink` type instead. Resolve against a registry seeded from
+    /// [`Registry::with_builtins`](super::Registry::with_builtins).
+    pub fn telemetry(mut self, addr: SocketAddr) -> Self {
+        self.systems.push(SystemSpec::tcp_downlink("telemetry", addr));
         self
     }
 
-    /// Add the command uplink (`docs/messages.md` §4.4): an [`UplinkSystem`](crate::UplinkSystem)
-    /// reading panel command Msgs off its **own** TCP connection to `addr`, separate from
-    /// the telemetry downlink's connection (shared connection is deferred, §4.5). It
-    /// registers under the instance name `"uplink"`; route its commands with explicit
-    /// edges (`connect("uplink", …, msg)` / KDL `connect "uplink" -> … msg="…"`).
+    /// Add the built-in TCP command uplink (`docs/messages.md` §4.4) under the
+    /// instance name `"uplink"` — sugar for pushing the [`SystemSpec::tcp_uplink`]
+    /// spec. It reads panel command Msgs off its **own** TCP connection to `addr`,
+    /// separate from the downlink's (a shared connection is deferred, §4.5); route
+    /// its commands with explicit edges (`connect("uplink", …, msg)`).
     pub fn uplink(mut self, addr: SocketAddr) -> Self {
-        self.uplink = Some(UplinkSpec { addr });
+        self.systems.push(SystemSpec::tcp_uplink("uplink", addr));
         self
     }
 
@@ -235,8 +234,6 @@ impl WiringBuilder {
             systems: self.systems,
             slots: self.slots,
             edges: self.edges,
-            telemetry: self.telemetry,
-            uplink: self.uplink,
         }
     }
 }

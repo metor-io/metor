@@ -29,8 +29,8 @@ use clap::{Args, Parser, Subcommand};
 use miette::IntoDiagnostic;
 
 use crate::wiring::{
-    BuildOptions, ClockSpec, PackageOptions, Registry, TelemetryModeSpec, TelemetrySpec,
-    UplinkSpec, Wiring, build_artifacts, load_bundle, parse, resolve, write_bundle,
+    BuildOptions, ClockSpec, PackageOptions, Registry, SystemSpec, TCP_DOWNLINK_TYPE,
+    TCP_UPLINK_TYPE, Wiring, build_artifacts, load_bundle, parse, resolve, write_bundle,
 };
 
 // ---------------------------------------------------------------------------
@@ -265,35 +265,33 @@ fn print_run_banner(target: &Path, wiring: &Wiring) {
         }
     }
 
-    match &wiring.telemetry {
-        None => println!(
-            "  telemetry: off — pass `--telemetry <addr>` to stream to metor-panel"
-        ),
-        Some(t) => {
-            let reach = if probe_telemetry(t.addr) {
-                "✓ reachable".to_string()
-            } else {
-                "⚠ not reachable — start metor-panel BEFORE the mission (no auto-reconnect in v1)"
-                    .to_string()
-            };
-            println!("  telemetry: {} ({}) {reach}", t.addr, mode_label(&t.mode));
-            // The sim clock free-runs, so a live downlink would race far ahead of real time.
-            if matches!(wiring.coordinator.clock, ClockSpec::Simulated { .. }) {
-                println!("  note:      simulated clock free-runs; pass `--wall` for real-time panel viewing");
+    // The downlink/uplink are ordinary systems now — the banner scans for the
+    // built-in TCP types, one line per instance (several downlinks are legal).
+    let downlinks: Vec<&SystemSpec> = specs_of_type(wiring, TCP_DOWNLINK_TYPE);
+    if downlinks.is_empty() {
+        println!("  telemetry: off — pass `--telemetry <addr>` to stream to metor-panel");
+    }
+    for spec in &downlinks {
+        match spec_addr(spec) {
+            Some(addr) => {
+                println!("  telemetry: {addr} ({}) {}", spec.name, reach_label(addr));
             }
+            None => println!("  telemetry: {} (unparsable addr)", spec.name),
         }
     }
+    if !downlinks.is_empty() && matches!(wiring.coordinator.clock, ClockSpec::Simulated { .. }) {
+        // The sim clock free-runs, so a live downlink would race far ahead of real time.
+        println!("  note:      simulated clock free-runs; pass `--wall` for real-time panel viewing");
+    }
 
-    match wiring.uplink {
-        None => println!("  uplink:    off — pass `--uplink <addr>` to receive panel commands"),
-        Some(UplinkSpec { addr }) => {
-            let reach = if probe_telemetry(addr) {
-                "✓ reachable".to_string()
-            } else {
-                "⚠ not reachable — start metor-panel BEFORE the mission (no auto-reconnect in v1)"
-                    .to_string()
-            };
-            println!("  uplink:    {addr} {reach}");
+    let uplinks = specs_of_type(wiring, TCP_UPLINK_TYPE);
+    if uplinks.is_empty() {
+        println!("  uplink:    off — pass `--uplink <addr>` to receive panel commands");
+    }
+    for spec in &uplinks {
+        match spec_addr(spec) {
+            Some(addr) => println!("  uplink:    {addr} ({}) {}", spec.name, reach_label(addr)),
+            None => println!("  uplink:    {} (unparsable addr)", spec.name),
         }
     }
     println!();
@@ -306,12 +304,38 @@ fn probe_telemetry(addr: SocketAddr) -> bool {
     TcpStream::connect_timeout(&addr, Duration::from_millis(300)).is_ok()
 }
 
-/// A short human label for the telemetry tap mode.
-fn mode_label(mode: &TelemetryModeSpec) -> &'static str {
-    match mode {
-        TelemetryModeSpec::All => "all",
-        TelemetryModeSpec::Subset { .. } => "subset",
+/// The banner's reachability suffix for one probed endpoint.
+fn reach_label(addr: SocketAddr) -> &'static str {
+    if probe_telemetry(addr) {
+        "✓ reachable"
+    } else {
+        "⚠ not reachable — start metor-panel BEFORE the mission (no auto-reconnect in v1)"
     }
+}
+
+/// The specs of one built-in TCP link type, in document order.
+fn specs_of_type<'w>(wiring: &'w Wiring, ty: &str) -> Vec<&'w SystemSpec> {
+    wiring
+        .systems
+        .iter()
+        .filter(|s| s.ty.as_deref() == Some(ty))
+        .collect()
+}
+
+/// Pull the `addr=` property back out of a built-in link spec's params node (the
+/// same node text `resolve` re-decodes) — banner display only, never load-bearing.
+fn spec_addr(spec: &SystemSpec) -> Option<SocketAddr> {
+    let crate::wiring::ParamSource::Kdl(text) = &spec.params else {
+        return None;
+    };
+    let doc: kdl::KdlDocument = text.parse().ok()?;
+    doc.nodes()
+        .first()?
+        .entries()
+        .iter()
+        .find(|e| e.name().map(|n| n.value()) == Some("addr"))
+        .and_then(|e| e.value().as_string())
+        .and_then(|s| s.parse().ok())
 }
 
 /// The progress heartbeat: every couple of seconds, print the live cycle counter (read from
@@ -377,22 +401,24 @@ fn apply_overrides(wiring: &mut Wiring, args: &RunArgs) -> miette::Result<()> {
     if let Some(rate) = args.cycle_rate {
         wiring.coordinator.cycle_rate = rate;
     }
+    // The link flags add/remove instances of the built-in TCP types — keyed on the
+    // TYPE, never the instance name, so a user's custom downlink system is untouched.
     if args.no_telemetry {
-        wiring.telemetry = None;
+        wiring.systems.retain(|s| s.ty.as_deref() != Some(TCP_DOWNLINK_TYPE));
     } else if let Some(addr) = args.telemetry {
-        let mode = match args.telemetry_mode.as_str() {
-            "all" => TelemetryModeSpec::All,
-            other => {
-                return Err(miette::miette!(
-                    "unknown --telemetry-mode `{other}` (v1 supports `all`; declare a `subset` \
-                     tap list in the KDL)"
-                ));
-            }
-        };
-        wiring.telemetry = Some(TelemetrySpec { addr, mode });
+        if args.telemetry_mode != "all" {
+            return Err(miette::miette!(
+                "unknown --telemetry-mode `{}` (v1 supports `all`; declare `instances`/`frames` \
+                 subset children on a `system` node in the KDL)",
+                args.telemetry_mode
+            ));
+        }
+        wiring.systems.retain(|s| s.ty.as_deref() != Some(TCP_DOWNLINK_TYPE));
+        wiring.systems.push(SystemSpec::tcp_downlink("telemetry", addr));
     }
     if let Some(addr) = args.uplink {
-        wiring.uplink = Some(UplinkSpec { addr });
+        wiring.systems.retain(|s| s.ty.as_deref() != Some(TCP_UPLINK_TYPE));
+        wiring.systems.push(SystemSpec::tcp_uplink("uplink", addr));
     }
     Ok(())
 }

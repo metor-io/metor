@@ -262,7 +262,23 @@ pub enum LoadError {
         node: String,
         #[source_code]
         src: String,
-        #[label("expected `coordinator`/`artifact`/`system`/`slot`/`connect`/`telemetry`/`uplink`")]
+        #[label("expected `coordinator`/`artifact`/`system`/`slot`/`connect`")]
+        span: SourceSpan,
+    },
+
+    /// The pre-normalization `telemetry { … }` / `uplink { … }` nodes — a guidance
+    /// error carrying the ordinary `system` spelling that replaced them.
+    #[error("the `{node}` node was replaced by an ordinary `system` declaration")]
+    #[diagnostic(
+        code(fsw_wiring::legacy_link_node),
+        help("declare it as a system, e.g. {example}")
+    )]
+    LegacyLinkNode {
+        node: String,
+        example: String,
+        #[source_code]
+        src: String,
+        #[label("no longer a dedicated node")]
         span: SourceSpan,
     },
 

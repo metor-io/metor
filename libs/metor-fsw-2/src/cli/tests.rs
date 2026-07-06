@@ -106,35 +106,47 @@ fn overrides_applied_to_wiring() {
     apply_overrides(&mut wiring, &args).unwrap();
     assert!(matches!(wiring.coordinator.clock, ClockSpec::Wall));
     assert_eq!(wiring.coordinator.cycle_rate, 200.0);
-    assert!(wiring.telemetry.is_some());
+    let downlink = wiring
+        .systems
+        .iter()
+        .find(|s| s.ty.as_deref() == Some(crate::wiring::TCP_DOWNLINK_TYPE))
+        .expect("--telemetry pushed a TcpDownlink spec");
+    assert_eq!(downlink.name, "telemetry");
 }
 
 #[test]
 fn no_telemetry_override_disables_kdl_telemetry() {
     let mut wiring = WiringBuilder::new()
         .coordinator(120.0, ClockSpec::Wall)
-        .telemetry("127.0.0.1:2240".parse().unwrap(), TelemetryModeSpec::All)
+        .telemetry("127.0.0.1:2240".parse().unwrap())
         .build();
     let args = run_args(&["metor-fsw", "run", "m.kdl", "--build", "--no-telemetry"]);
     apply_overrides(&mut wiring, &args).unwrap();
-    assert!(wiring.telemetry.is_none());
+    assert!(
+        !wiring
+            .systems
+            .iter()
+            .any(|s| s.ty.as_deref() == Some(crate::wiring::TCP_DOWNLINK_TYPE)),
+        "--no-telemetry removed the KDL-declared TcpDownlink spec"
+    );
 }
 
 #[test]
-fn uplink_override_sets_wiring_uplink() {
+fn uplink_override_pushes_tcp_uplink_spec() {
     let mut wiring = WiringBuilder::new()
         .coordinator(120.0, ClockSpec::Wall)
         .build();
-    assert!(wiring.uplink.is_none(), "no uplink by default");
+    assert!(wiring.systems.is_empty(), "no uplink by default");
     let args = run_args(&[
         "metor-fsw", "run", "m.kdl", "--build", "--uplink", "127.0.0.1:2241",
     ]);
     apply_overrides(&mut wiring, &args).unwrap();
     assert_eq!(
-        wiring.uplink,
-        Some(crate::wiring::UplinkSpec {
-            addr: "127.0.0.1:2241".parse().unwrap()
-        })
+        wiring.systems,
+        vec![crate::wiring::SystemSpec::tcp_uplink(
+            "uplink",
+            "127.0.0.1:2241".parse().unwrap()
+        )]
     );
 }
 

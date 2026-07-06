@@ -13,7 +13,7 @@
 use metor_fsw_2::metor_proto::types::{ComponentId, Timestamp};
 use metor_fsw_2::{
     BuildSystem, ClockSpec, CyclicSystem, DlSystem, Frame, Input, Out, Output, ParamSource, System,
-    SystemInput, SystemKind, SystemOutput, TelemetryModeSpec, Wiring, WiringBuilder,
+    SystemInput, SystemKind, SystemOutput, Wiring, WiringBuilder,
     wiring::{BuildOptions, Registry, build_artifacts, encode_kdl_params, parse, resolve},
 };
 use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
@@ -114,7 +114,7 @@ fn dl_graph_via_wiring_resolve_end_to_end() {
         .params(CounterParams { start: 1000, scale: 1.0 })
         .end()
         .connect("ticker", "tick_in", "counter", "tick_in")
-        .telemetry("127.0.0.1:2240".parse().unwrap(), TelemetryModeSpec::All)
+        .telemetry("127.0.0.1:2240".parse().unwrap())
         .build();
 
     // 2. Build driver: cargo build -p the fixture crate, locate + record its `.so`.
@@ -130,7 +130,7 @@ fn dl_graph_via_wiring_resolve_end_to_end() {
 
     // 3. Resolve the `Wiring` through the one shared resolver (static via the Registry,
     //    dl via DlSystem::open) into a running coordinator.
-    let mut registry = Registry::new();
+    let mut registry = Registry::with_builtins();
     registry.register::<Ticker, _>("Ticker");
     let mut coord = resolve(&wiring, &registry).expect("resolve the dl Wiring");
 

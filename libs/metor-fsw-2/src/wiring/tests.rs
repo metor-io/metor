@@ -402,7 +402,7 @@ system "alarms" type="Alarms" {
 }
 system "imu" type="ImuDriver" i2c_bus=1 sample_hz=200.0
 
-uplink { transport "tcp" addr="127.0.0.1:2299" }
+system "uplink" type="TcpUplink" addr="127.0.0.1:2299"
 connect "uplink" -> "alarms" msg="AlarmAck"
 "#;
 
@@ -693,9 +693,9 @@ connect "nav"    -> "closer" frame="nav"
 }
 
 // ---------------------------------------------------------------------------
-// Telemetry: a `telemetry` node loads (registered last) and runs. The TCP endpoint
-// is closed, so the sender just fails to connect and stops downlinking — the control
-// cycle is unaffected and the run completes (telemetry.md §7/§8).
+// Telemetry: a `TcpDownlink` system node loads (deferred last) and runs. The TCP
+// endpoint is closed, so the sender just fails to connect and stops downlinking —
+// the control cycle is unaffected and the run completes (telemetry.md §7/§8).
 // ---------------------------------------------------------------------------
 
 #[cfg(not(miri))]
@@ -706,13 +706,9 @@ coordinator cycle_rate=1000.0 sim_dt=0.001
 
 system "imu" type="ImuDriver" i2c_bus=1 sample_hz=200.0
 system "nav" type="NavFilter" gain=2.0
+system "telemetry" type="TcpDownlink" addr="127.0.0.1:59421"
 
 connect "imu" -> "nav" frame="imu"
-
-telemetry {
-    transport "tcp" addr="127.0.0.1:59421"
-    mode "all"
-}
 "#;
     let mut coord = load(kdl, &registry()).expect("telemetry node loads");
     coord.run_for(10).await;
@@ -1457,21 +1453,34 @@ fn cmd_registry() -> Registry {
     r
 }
 
-/// `uplink { transport "tcp" addr=… }` parses onto `Wiring.uplink` (the design's
-/// KDL surface for the instance name "uplink").
+/// The pre-normalization `telemetry { … }` / `uplink { … }` nodes surface the
+/// guidance `LegacyLinkNode` error carrying the `system` spelling that replaced
+/// them — the only migration notice an old mission document or bundle gets.
 #[test]
-fn uplink_node_parses() {
-    let kdl = r#"
-coordinator cycle_rate=100.0
-uplink { transport "tcp" addr="127.0.0.1:2241" }
-"#;
-    let wiring = parse(kdl).expect("parse succeeds");
-    assert_eq!(
-        wiring.uplink,
-        Some(crate::wiring::UplinkSpec {
-            addr: "127.0.0.1:2241".parse().unwrap()
-        })
-    );
+fn legacy_telemetry_and_uplink_nodes_are_guidance_errors() {
+    for (kdl, node, ty) in [
+        (
+            "coordinator cycle_rate=100.0\ntelemetry { transport \"tcp\" addr=\"127.0.0.1:2240\" }",
+            "telemetry",
+            "TcpDownlink",
+        ),
+        (
+            "coordinator cycle_rate=100.0\nuplink { transport \"tcp\" addr=\"127.0.0.1:2241\" }",
+            "uplink",
+            "TcpUplink",
+        ),
+    ] {
+        let err = parse(kdl).expect_err("the legacy node is rejected");
+        match err {
+            LoadError::LegacyLinkNode {
+                node: got, example, ..
+            } => {
+                assert_eq!(got, node);
+                assert!(example.contains(ty), "help names the built-in type: {example}");
+            }
+            other => panic!("expected LegacyLinkNode, got {other:?}"),
+        }
+    }
 }
 
 /// `"coordinator"` is a reserved instance name: a user system claiming it is a
