@@ -286,12 +286,13 @@ name pool: key bytes back-to-back; entry[i].key_off points table-absolute into h
 
 The slot delimits the **entry array only** (`{ entry_array_off, count * stride }`), so
 `count = byte_len / stride` stays exact even with the pool after it. Each `key_off` is
-table-absolute into the pool; `key_len` is the byte length. The entry geometry
-(`src/dynamic.rs`):
+table-absolute into the pool; `key_len` is the byte length. In code the
+`{ key_off, key_len }` pair is the zerocopy struct `MapEntryHeader`
+(`src/dynamic.rs`, next to `Slot`); the entry geometry:
 
 - `entry_align::<V>() = max(align_of::<V>(), 8)` — entries stay at least 8-aligned.
-- `map_value_offset::<V>() = align_up(8, entry_align::<V>())` — the value sits after the
-  `{ key_off, key_len }` pair (8 bytes for any value of alignment ≤ 8).
+- `map_value_offset::<V>() = align_up(size_of::<MapEntryHeader>(), entry_align::<V>())` —
+  the value sits after the header pair (8 bytes for any value of alignment ≤ 8).
 - `map_stride::<V>() = align_up(map_value_offset + size_of::<V>, entry_align::<V>())`.
 
 For a 16-byte, 8-aligned `Process`, that is `value_offset = 8`, `stride = 24`. For a nested

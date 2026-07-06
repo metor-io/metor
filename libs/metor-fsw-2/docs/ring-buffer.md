@@ -7,8 +7,8 @@ buffers (cyclic systems view upstream outputs directly; async systems read
 private input buffers the coordinator fills for them — see `DESIGN.md`). A system
 may run as a dlopen'd library inside the coordinator's process *or* as a separate
 process, so the buffer works identically in-process and across a process
-boundary: it lives in one contiguous region addressed by fixed byte offsets and
-contains no process-local pointers.
+boundary: it lives in one contiguous region addressed through a fixed
+`#[repr(C)]` layout and contains no process-local pointers.
 
 The crate generalizes the `metor-db` disruptor (`libs/db/src/disruptor.rs`)
 along one axis — **shared-memory residence** (the disruptor uses heap
@@ -55,6 +55,13 @@ the `arch_tag` handshake (below) rejects regions written by a different pointer
 width or endianness on attach, so cross-endian reinterpretation never happens.
 Control words and reader slots are padded to 64-byte cache lines to avoid false
 sharing.
+
+In code, the layout is realized as three `#[repr(C)]` structs — `RegionHeader`
+(a zerocopy type; its `IntoBytes` derive is a compile-time no-padding proof),
+`Control`, and `ReaderSlot` (all-`AtomicU64` + pad, pointer-cast rather than
+parsed) — with a `const` block of `offset_of!`/`size_of` assertions pinning
+every offset in the tables below, so layout drift fails the build rather than
+changing the wire format.
 
 ### What is shared-memory-resident vs process-local
 
@@ -604,7 +611,7 @@ After a successful attach, every offset the ring ever dereferences — control
 words, all reader slots, `data_offset + phys` for `phys < capacity` — is inside
 `[0, region_len)` and 8-aligned: attach restores the same geometry invariant
 `layout()` + `init_region` establish at creation, which is what the `SAFETY`
-comments on `atomic_u64`/`data_ptr` assume.
+comments on `control`/`slot`/`data_ptr` assume.
 
 ## 11. Memory ordering & Miri
 
