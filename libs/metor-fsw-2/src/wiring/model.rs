@@ -20,10 +20,12 @@ use std::path::PathBuf;
 use serde::{Deserialize, Serialize};
 
 /// The authoritative description of a wired mission: the coordinator config, the
-/// `cdylib` artifacts it loads, the system instances, the edges, and the
-/// optional telemetry downlink. Produced by [`parse`](super::parse) (from KDL) or
+/// `cdylib` artifacts it loads, the system instances, the slots, and the edges.
+/// Produced by [`parse`](super::parse) (from KDL) or
 /// [`WiringBuilder`](super::WiringBuilder) (from Rust); consumed by
-/// [`resolve`](super::resolve).
+/// [`resolve`](super::resolve). The telemetry downlink and the command uplink are
+/// ordinary systems here — built-in registry types
+/// ([`TCP_DOWNLINK_TYPE`]/[`TCP_UPLINK_TYPE`]), not dedicated fields.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Wiring {
     /// Coordinator-wide config (cycle rate, default ring depth, clock).
@@ -39,28 +41,17 @@ pub struct Wiring {
     pub slots: Vec<SlotSpec>,
     /// The producer → consumer edges.
     pub edges: Vec<EdgeSpec>,
-    /// The telemetry downlink, if any.
-    pub telemetry: Option<TelemetrySpec>,
-    /// The command uplink, if any (`docs/messages.md` §4.4/§4.5). When set,
-    /// [`resolve`](super::resolve) registers an [`UplinkSystem`](crate::UplinkSystem) reading
-    /// panel command Msgs off **its own** TCP connection (separate from the telemetry
-    /// downlink's) under the instance name `"uplink"`, **before** the edges pass — so
-    /// command edges name it (`connect "uplink" -> "<slot>" msg="SequenceCommand"`).
-    /// Declared with the KDL `uplink { … }` node, the CLI `--uplink` flag, or
-    /// [`WiringBuilder::uplink`](super::WiringBuilder::uplink).
-    pub uplink: Option<UplinkSpec>,
 }
 
-/// The command uplink, the read twin of [`TelemetrySpec`] (`docs/messages.md` §4.4):
-///
-/// ```kdl
-/// uplink { transport "tcp" addr="127.0.0.1:2241" }   // instance name "uplink"
-/// ```
-#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
-pub struct UplinkSpec {
-    /// The TCP address of the metor-db broker the uplink subscribes to.
-    pub addr: SocketAddr,
-}
+/// The registry `type=` of the built-in TCP telemetry downlink
+/// ([`TelemetrySystem`](crate::TelemetrySystem) over a
+/// [`TcpTransport`](crate::TcpTransport); params: [`DownlinkParams`](crate::DownlinkParams)).
+pub const TCP_DOWNLINK_TYPE: &str = "TcpDownlink";
+
+/// The registry `type=` of the built-in TCP command uplink
+/// ([`UplinkSystem`](crate::UplinkSystem) over a
+/// [`TcpRecvTransport`](crate::TcpRecvTransport); params: [`UplinkParams`](crate::UplinkParams)).
+pub const TCP_UPLINK_TYPE: &str = "TcpUplink";
 
 /// Coordinator-wide configuration, the serializable mirror of
 /// [`CoordinatorConfig`](crate::CoordinatorConfig).
@@ -124,6 +115,35 @@ pub struct SystemSpec {
     pub artifact: Option<String>,
     /// Where this system's params come from — see [`ParamSource`].
     pub params: ParamSource,
+}
+
+impl SystemSpec {
+    /// A built-in TCP telemetry downlink instance tapping **every** output — the spec
+    /// the [`WiringBuilder::telemetry`](super::WiringBuilder::telemetry) sugar and the
+    /// CLI `--telemetry` flag push. A subset tap declares the `instances`/`frames`
+    /// children on an ordinary `system` node instead.
+    pub fn tcp_downlink(name: &str, addr: SocketAddr) -> Self {
+        Self::tcp_builtin(name, TCP_DOWNLINK_TYPE, addr)
+    }
+
+    /// A built-in TCP command uplink instance — the spec the
+    /// [`WiringBuilder::uplink`](super::WiringBuilder::uplink) sugar and the CLI
+    /// `--uplink` flag push. Route its commands with explicit edges
+    /// (`connect "<name>" -> … msg="…"`).
+    pub fn tcp_uplink(name: &str, addr: SocketAddr) -> Self {
+        Self::tcp_builtin(name, TCP_UPLINK_TYPE, addr)
+    }
+
+    /// Both built-ins carry one `addr=` param; render it as the KDL node text the
+    /// static resolve path re-decodes (the typed-postcard builder path is dl-only).
+    fn tcp_builtin(name: &str, ty: &str, addr: SocketAddr) -> Self {
+        Self {
+            name: name.to_string(),
+            ty: Some(ty.to_string()),
+            artifact: None,
+            params: ParamSource::Kdl(format!("system \"{name}\" type=\"{ty}\" addr=\"{addr}\"")),
+        }
+    }
 }
 
 /// Where a [`SystemSpec`]'s params come from — an explicit enum so the three cases
@@ -247,28 +267,3 @@ pub struct EdgeSpec {
     pub kind: EdgeKind,
 }
 
-/// The telemetry downlink, the serializable mirror of
-/// [`TelemetryConfig`](crate::TelemetryConfig) (TCP only) plus its
-/// [`TelemetryMode`](crate::TelemetryMode).
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-pub struct TelemetrySpec {
-    /// The TCP downlink address.
-    pub addr: SocketAddr,
-    /// Which outputs to tap.
-    pub mode: TelemetryModeSpec,
-}
-
-/// Which outputs the telemetry sink taps — the serializable mirror of
-/// [`TelemetryMode`](crate::TelemetryMode).
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-pub enum TelemetryModeSpec {
-    /// Tap every registry entry.
-    All,
-    /// Tap only entries matching one of the instance/frame lists.
-    Subset {
-        /// Instance names to tap.
-        instances: Vec<String>,
-        /// Frame names to tap.
-        frames: Vec<String>,
-    },
-}

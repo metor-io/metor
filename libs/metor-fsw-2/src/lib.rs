@@ -157,7 +157,7 @@ pub use dl::{DlError, DlSystem};
 pub use wiring::{
     AllowedOccupantSpec, Artifact, BuildError, BuildOptions, BundleError, ClockSpec,
     CoordinatorSpec, EdgeSpec, InitialOccupantSpec, PackageOptions, ParamSource, SlotInitState,
-    SlotSpec, SystemSpec, TelemetryModeSpec, TelemetrySpec, Wiring, WiringBuilder,
+    SlotSpec, SystemSpec, TCP_DOWNLINK_TYPE, TCP_UPLINK_TYPE, Wiring, WiringBuilder,
 };
 
 // The clap-based CLI runner (`metor-fsw {build,package,run}`) and the reusable
