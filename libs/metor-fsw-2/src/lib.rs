@@ -10,6 +10,7 @@
 //! alignment); its own surface is the [`Frame`] trait, the dynamic types,
 //! and the [`FrameWriter`] producer API.
 
+mod alarm;
 mod binder;
 mod coordinator;
 mod descriptor;
@@ -86,6 +87,10 @@ pub use health::{
     HealthPort, LOG_MSG_CAP, LogLine, MAX_ERR_KINDS, MAX_LINES, SystemHealth, SystemLog,
 };
 pub use port::{DEFAULT_DEPTH, FrameRef, Input, Output, buffer_capacity, capacity_for};
+
+// The alarm engine: config surface + the limit-alarm evaluation system
+// (`docs/alarms.md`).
+pub use alarm::{AlarmSpec, AlarmsParams, BandSpec, TargetSpec};
 
 // The general message channel — the `(PacketId, postcard)` record format, the
 // type-erased emit port, and its sizing/record helpers (`docs/messages.md` §1, §2).
