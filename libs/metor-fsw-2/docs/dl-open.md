@@ -507,11 +507,11 @@ pub struct Wiring {
     pub coordinator: CoordinatorSpec,   // cycle_rate, default_depth, clock
     pub artifacts:   Vec<Artifact>,     // the cdylibs this mission loads
     pub systems:     Vec<SystemSpec>,
-    pub edges:       Vec<EdgeSpec>,     // from/out/to/in/delayed/kind (Frame|Msg)
-    pub telemetry:   Option<TelemetrySpec>,
     pub slots:       Vec<SlotSpec>,     // runtime-loadable slots (sequences-slots.md)
-    pub uplink:      Option<UplinkSpec>, // the command uplink (messages.md §4.4)
+    pub edges:       Vec<EdgeSpec>,     // from/out/to/in/delayed/kind (Frame|Msg)
 }
+// The telemetry downlink and the command uplink are ordinary systems — built-in
+// registry types ("TcpDownlink"/"TcpUplink"), not dedicated fields.
 
 pub struct Artifact {
     pub id:          String,            // referenced by SystemSpec::artifact
@@ -535,10 +535,10 @@ pub enum ParamSource {
 }
 ```
 
-`CoordinatorSpec`, `ClockSpec`, `EdgeSpec`, `TelemetrySpec`, and `TelemetryModeSpec` are
-serializable mirrors of the runtime types (`CoordinatorConfig`, `ClockMode`, the connect edge,
-`TelemetryConfig`, `TelemetryMode`), deliberately decoupled from runtime values so the model is
-a pure serde data format. The conversion to runtime types lives in `resolve`.
+`CoordinatorSpec`, `ClockSpec`, and `EdgeSpec` are serializable mirrors of the runtime
+types (`CoordinatorConfig`, `ClockMode`, the connect edge), deliberately decoupled from
+runtime values so the model is a pure serde data format. The conversion to runtime types
+lives in `resolve`.
 
 One `Artifact` exports a single system type (the fixed `fsw_*` symbols), but multiple
 `SystemSpec`s may reference one `Artifact` to instance that type more than once — the loader
@@ -558,7 +558,7 @@ let wiring = WiringBuilder::new()
     .system("nav").ty("Nav").from_static().params(NavParams { .. }).end()
     .connect("plant", "sensors", "nav", "sensors")
     .connect_delayed("ctrl", "torque_cmd", "plant", "torque_cmd")
-    .telemetry("127.0.0.1:2240".parse().unwrap(), TelemetryModeSpec::All)
+    .telemetry("127.0.0.1:2240".parse().unwrap())   // sugar for a TcpDownlink system spec
     .build();
 ```
 
@@ -579,7 +579,7 @@ system "nav"   type="Nav"   meas_sigma=0.02            // no artifact= => static
 
 connect "plant" -> "nav"  frame="sensors"
 connect "ctrl"  -> "plant" frame="torque_cmd" delayed=#true
-telemetry { transport "tcp" addr="127.0.0.1:2240"; mode "all" }
+system "telemetry" type="TcpDownlink" addr="127.0.0.1:2240"
 ```
 
 Note the two properties are spelled differently on purpose: the `artifact` node's own `lib=` is

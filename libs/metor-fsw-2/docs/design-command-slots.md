@@ -3,7 +3,10 @@
 > **Status: LANDED** — implemented across commits `90715ed9` (A2), `739b0d52` (A3), `c5090d17`
 > (A9), `d9e3b4fd` (A8), on top of `94b91143` (wave-4a: name-addressed
 > `SequenceCommand`/`SequenceChannelEvent`, `ChannelId` deleted). `docs/messages.md`'s status
-> banner and `docs/sequences-slots.md` §3 reflect the shipped shape.
+> banner and `docs/sequences-slots.md` §3 reflect the shipped shape. **Normalization update
+> (2026-07-05):** the §2.7 `uplink { … }` node and `add_uplink` were since deleted — the uplink
+> is the `type="TcpUplink"` registry built-in, an ordinary `system` node
+> (`docs/normalize-telemetry-uplink-plan.md`); command edges are unchanged.
 >
 > **Status (original): DESIGN (D4 of `review-fixes-plan.md`, wave 0).** Covers findings **A2**
 > (command edges become explicit dataflow), **A3** (slots stop being a third system

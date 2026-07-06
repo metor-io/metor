@@ -241,7 +241,7 @@ being the downlink: slot control is the **uplink**.
 >   given slot is connected to it by an **explicit** KDL/builder edge; there is no implicit
 >   broadcast-to-every-slot sugar. A mission wires each producer × slot pair it wants:
 >   ```kdl
->   uplink { transport "tcp" addr="127.0.0.1:2241" }
+>   system "uplink" type="TcpUplink" addr="127.0.0.1:2241"
 >   connect "uplink"      -> "mode" msg="SequenceCommand"   // ground commands
 >   connect "coordinator" -> "mode" msg="SequenceCommand"   // in-proc control_handle()
 >   ```

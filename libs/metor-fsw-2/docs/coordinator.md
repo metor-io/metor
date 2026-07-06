@@ -22,8 +22,8 @@ lifecycle driver.
 The coordinator runs in two phases.
 
 1. **Build phase (no cycles running).** `Coordinator::builder(config)` returns a
-   `CoordinatorBuilder` that registers systems (`add_cyclic`/`add_async`/`add_dl_cyclic`/
-   `add_telemetry`) and edges (`connect`/`connect_delayed`). Registration only records each
+   `CoordinatorBuilder` that registers systems (`add_cyclic`/`add_async`/`add_dl_cyclic`)
+   and edges (`connect`/`connect_delayed`). Registration only records each
    system's `SystemDescriptor` (the derives already produce it) plus a boxed, type-erased
    registration. `build()` runs the validation pass (`compatible()` on every edge; single-connect,
    unconnected-input, and unbroken-feedback-cycle checks), allocates one heap-backed `RingBuffer`
@@ -192,7 +192,6 @@ impl CoordinatorBuilder {
     pub fn add_cyclic_named<S, O>(&mut self, name: impl Into<String>, system: S) -> SystemHandle;
     pub fn add_async<S>(&mut self, system: S) -> SystemHandle;
     pub fn add_async_named<S>(&mut self, name: impl Into<String>, system: S) -> SystemHandle;
-    pub fn add_telemetry<T: Transport>(&mut self, config: TelemetryConfig<T>) -> SystemHandle;
     pub fn add_dl_cyclic(&mut self, name: impl Into<String>,
                          loaded: dl::DlSystem, params: Vec<u8>) -> SystemHandle;
 
@@ -647,7 +646,7 @@ The hard timeout is the only non-cooperative path.
 | Wake | `NoWake` (cyclic), `Notifier` (async), `WaitQueue` | matched wake endpoints on the copy-in private buffer |
 | Health | `SystemHealth`/`SystemLog`, `HealthPort` | auto-provisioned buffers; instance prefix at the sink; coordinator health + `CoordinatorStatus` |
 | Async | `AsyncSystem::run`, `Input::recv`, `Output::write_async` | spawn-once task + in-task `init`/`shutdown`; private copy-in buffers + newest-record mirror |
-| Telemetry | — | the `OutputRegistry`, `add_telemetry`, registry-consumer sizing |
+| Telemetry | — | the `OutputRegistry`, registry-consumer sizing (the downlink is an ordinary `add_cyclic` system) |
 | dlopen | `DlSystem`/`DlSlot`/`FswRing` ABI (`dl.rs`/`abi.rs`) | `add_dl_cyclic`, raw-region bind, teardown ordering |
 | Runtime | `stellarator::{run,spawn,sleep,yield_now,JoinHandle::drop_guard}` | the run-fast-then-wait `run_for` loop; cooperative teardown |
 

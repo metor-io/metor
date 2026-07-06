@@ -1,5 +1,13 @@
 # Implementation plan — telemetry + uplink as ordinary systems
 
+> **Status: LANDED (2026-07-05)** — W1/W2 as planned; W3+W4 landed as one commit (the CLI
+> reads the model, so they were inseparable); the alarms feature had already shipped
+> `Registry::with_builtins()`, the deferred-ReceiveAll pass, and the CLI's built-ins
+> registry, so W2/W4 shrank to registering the two types and the flag/banner rewrite.
+> `CoordinatorBuilder::add_telemetry`/`add_uplink` were deleted outright (not kept as
+> sugar); `WiringBuilder::telemetry(addr)` dropped its mode param (subset taps are
+> KDL/params-only).
+
 Goal: delete the special-cased wiring surface for the telemetry downlink and the command
 uplink so both are **normal registry systems** — declared as `system` nodes, instantiable
 more than once, and replaceable by a user-written system (any static system may hold

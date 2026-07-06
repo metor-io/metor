@@ -135,7 +135,7 @@ rings have no crash-slot reclamation, so `max_readers` is set once at `build()`.
 
 The coordinator sizes for the known registry consumers **self-derived, not manually bumped**:
 `build()` counts how many descriptors declare the `ReceiveAll` capability (`n_reg`) by scanning
-every registered system's `capabilities` — `add_telemetry` needs no counter-bump call, and any
+every registered system's `capabilities` — no counter-bump call anywhere, and any
 future `AllOutputs`-declaring system (a recorder, a second downlink) is picked up automatically just
 by declaring the field. Every output ring is sized
 
@@ -400,26 +400,31 @@ snapshot stage keeps running and drops (its hand-off fills) so control is unaffe
 
 ## 8. KDL / builder surface
 
-The downlink is declared like any other node in a wiring document, plus a builder convenience.
+The downlink is an **ordinary registry system** — a `system` node of the built-in
+`type="TcpDownlink"`, not a dedicated grammar. `"telemetry"` is a conventional instance name,
+not a reserved word; several downlink instances are legal.
 
 ```kdl
-telemetry {
-    transport "tcp" addr="127.0.0.1:2240"
-    mode "all"                              // or: mode "subset"
-    // subset only — taps these instances/frames:
-    // tap instance="imu_left"
-    // tap frame="control"
+system "telemetry" type="TcpDownlink" addr="127.0.0.1:2240" {
+    instances "nav" "imu"      // optional subset children; omit both to tap everything
+    frames "gyro_b"
 }
 ```
 
-- The loader (`src/wiring/mod.rs`) parses the `telemetry` node into a `(addr, mode)` pair, validates
-  that `transport` is `"tcp"` and `mode` is `"all"` or `"subset"`, and adds the downlink after every
-  `system` node so it is registered last (§3).
-- **Builder surface:** `CoordinatorBuilder::add_telemetry(TelemetryConfig { transport, mode })`. It is
-  an ordinary `add_cyclic_named("telemetry", TelemetrySystem::new(config))` — no manual reader-slot
-  bookkeeping: `TelemetryPorts`'s `AllOutputs` field is what earns the downlink its reader slot on
+- The params are `DownlinkParams { addr, instances, frames }` (`src/telemetry/mod.rs`): both
+  lists absent ⇒ `TelemetryMode::All`; either present ⇒ `Subset` (an entry matches if its
+  instance *or* frame/channel name is listed).
+- The resolver **defers** every static `ReceiveAll` system behind the other cyclic
+  registrations (`docs/alarms.md` §7 F1), so the node's document position is free — it is
+  still registered last (§3).
+- **Builder surfaces:** `WiringBuilder::telemetry(addr)` pushes the equivalent
+  `SystemSpec::tcp_downlink("telemetry", addr)`; a direct `CoordinatorBuilder` user registers
+  `add_cyclic(TelemetrySystem::new(TelemetryConfig { transport, mode }))` **after** its other
+  cyclic systems (`build()` enforces the ordering). No manual reader-slot bookkeeping either
+  way: `TelemetryPorts`'s `AllOutputs` field is what earns the downlink its reader slot on
   every buffer, self-derived at `build()` by counting `ReceiveAll` capabilities (§2.5).
-- `TelemetryConfig<T: Transport>` carries the concrete `transport` value and the `mode`.
+- `TelemetryConfig<T: Transport>` carries the concrete `transport` value and the `mode` —
+  the mock-transport test path; `TcpDownlink` is `TelemetrySystem<TcpTransport>`.
 
 ---
 

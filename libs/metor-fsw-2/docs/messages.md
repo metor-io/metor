@@ -6,6 +6,12 @@
 > §3, §5, §6 (the record format, the downlink, the sequence coupling, and the ABI note) remain
 > accurate in substance. **§1.2/§1.4, §2.2, and all of §4 are SUPERSEDED — twice over**, as follows.
 >
+> **Normalization update (2026-07-05, `docs/normalize-telemetry-uplink-plan.md`, landed):** the
+> uplink and the telemetry downlink are now **registry built-ins** (`type="TcpUplink"` /
+> `type="TcpDownlink"`) declared as ordinary `system` nodes; the dedicated `uplink { … }` KDL
+> node and `CoordinatorBuilder::add_uplink`/`add_telemetry` were deleted (register with
+> `add_async`/`add_cyclic` directly). §4's system design is otherwise as landed.
+>
 > **First supersession (`docs/message-wiring.md`, landed):**
 > - `MsgOut` is now **typed** (`MsgOut<M>`) and, with `MsgIn<M>`, is a first-class port that drops
 >   into a `SystemInput`/`SystemOutput` bundle and is wired by an ordinary edge — one `connect` KDL
