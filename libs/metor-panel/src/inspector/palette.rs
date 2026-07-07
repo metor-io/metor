@@ -338,7 +338,7 @@ fn register_command_provider(
 fn read_and_load(path: &Path, tiles: &Entity<TileGroup>, cx: &mut App) {
     match presets::load_preset(path) {
         Ok(json) => presets::load_into_tiles(&json, tiles, cx),
-        Err(e) => eprintln!("read preset {}: {e}", path.display()),
+        Err(e) => tracing::error!(path = %path.display(), %e, "read preset failed"),
     }
 }
 
@@ -418,7 +418,7 @@ pub(crate) fn preset_save_rows(tiles: Entity<TileGroup>) -> Vec<Box<dyn Inspecto
         callback: Arc::new(move |name, _window, cx| {
             let json = tiles_for_name.read(cx).to_json(cx);
             if let Err(e) = presets::save_preset(&name, &json) {
-                eprintln!("save preset {name}: {e}");
+                tracing::error!(%name, %e, "save preset failed");
             }
         }),
     }));
@@ -439,7 +439,7 @@ pub(crate) fn preset_save_rows(tiles: Entity<TileGroup>) -> Vec<Box<dyn Inspecto
                     Err(_) => return,
                 };
                 if let Err(e) = std::fs::write(&path, json) {
-                    eprintln!("save preset to {}: {e}", path.display());
+                    tracing::error!(path = %path.display(), %e, "save preset failed");
                 }
             })
             .detach();

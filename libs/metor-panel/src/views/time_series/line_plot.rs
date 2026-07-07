@@ -550,9 +550,9 @@ impl LinePlot {
     }
 
     /// Value plotted by `trace` at the sample whose timestamp is closest to
-    /// `ts`. Returns `None` when the trace's component hasn't resolved yet,
-    /// when its element index falls outside the schema, or when the
-    /// component has no samples bracketing `ts`.
+    /// `ts` across every live node. Returns `None` when the trace's
+    /// component hasn't resolved yet, when its element index falls outside
+    /// the schema, or when the component has no samples at all.
     ///
     /// Used by measurement-cursor rendering (dot marker per trace) and by
     /// the Δy / Mean readouts that need a value at the cursor endpoints.
@@ -568,40 +568,26 @@ impl LinePlot {
         if cfg.element_index >= total_elements {
             return None;
         }
+        // Nodes iterate newest-first, but a historical cursor endpoint can
+        // land in any of them — keep the global best, not the first hit.
+        let mut best: Option<(i64, _, usize)> = None;
         for node in component.time_series.list.iter() {
-            let timestamps = node.timestamps();
-            if timestamps.is_empty() {
+            let Some((idx, dist)) = super::cursor::nearest_in_node(node.timestamps(), ts) else {
                 continue;
+            };
+            if best.as_ref().map(|(d, _, _)| dist < *d).unwrap_or(true) {
+                best = Some((dist, node, idx));
             }
-            let idx = match timestamps.binary_search_by_key(&ts.0, |t| t.0) {
-                Ok(i) => i,
-                Err(i) => i,
-            };
-            let mut best: Option<(i64, usize)> = None;
-            for cand_idx in [idx.saturating_sub(1), idx, idx + 1] {
-                let Some(cand) = timestamps.get(cand_idx) else {
-                    continue;
-                };
-                let d = (cand.0 - ts.0).abs();
-                if best.map(|(bd, _)| d < bd).unwrap_or(true) {
-                    best = Some((d, cand_idx));
-                }
-            }
-            let Some((_, sample_idx)) = best else {
-                continue;
-            };
-            let data = node.data.data();
-            let base = sample_idx * elem_size;
-            let Some(buf) = data.get(base..base + elem_size) else {
-                continue;
-            };
-            return Some(crate::dynamic::tensor::read_f64_at(
-                buf,
-                component.schema.prim_type,
-                cfg.element_index,
-            ));
         }
-        None
+        let (_, node, sample_idx) = best?;
+        let data = node.data.data();
+        let base = sample_idx * elem_size;
+        let buf = data.get(base..base + elem_size)?;
+        Some(crate::dynamic::tensor::read_f64_at(
+            buf,
+            component.schema.prim_type,
+            cfg.element_index,
+        ))
     }
 
     pub fn trace(&self, idx: usize) -> Option<&Entity<Trace>> {

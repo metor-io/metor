@@ -1,10 +1,11 @@
-use metor_proto::types::Timestamp;
+use metor_proto::types::{Msg, Timestamp};
 use metor_proto_wkt::{
     SequenceChannelEvent, SequenceChannelSpec, SequenceEventKind, SequenceRegistry,
     SequenceRunState,
 };
 
 use super::SequenceState;
+use crate::msg_ingest::{IngestSource, apply_backfill};
 
 fn ts(n: i64) -> Timestamp {
     Timestamp(n)
@@ -199,4 +200,50 @@ fn count_in_state_tracks_run_states() {
     assert_eq!(state.count_in_state(SequenceRunState::Running), 2);
     assert_eq!(state.count_in_state(SequenceRunState::Failed), 1);
     assert_eq!(state.count_in_state(SequenceRunState::Idle), 0);
+}
+
+/// The store's ingest sources in declaration order, folding directly into a bare
+/// [`SequenceState`]. `apply_backfill` is generic over its store type, so the same
+/// (timestamp, source-index) merge the live store uses can be exercised without a
+/// gpui `App` — the closures here mirror `SequenceStore::new`'s sources exactly.
+fn sequence_sources() -> Vec<IngestSource<SequenceState>> {
+    vec![
+        IngestSource::new(SequenceRegistry::ID, |s: &mut SequenceState, ts, reg| {
+            s.apply_registry(ts, reg)
+        }),
+        IngestSource::new(SequenceChannelEvent::ID, |s: &mut SequenceState, ts, ev| {
+            s.apply_event(ts, ev)
+        }),
+    ]
+}
+
+fn bytes<T: serde::Serialize>(value: &T) -> Vec<u8> {
+    postcard::to_allocvec(value).unwrap()
+}
+
+/// An event whose channel is only declared by an equal-timestamp registry must still
+/// apply. The event (source index 1) is listed ahead of the registry (index 0), as a
+/// naive per-log replay draining the event log first would order it; folded that way the
+/// event hits an undeclared channel and is dropped, leaving the channel `Idle`.
+/// `apply_backfill` sorts by (timestamp, source index), so the registry declares the
+/// channel before the event folds and the run state reflects the event.
+#[test]
+fn backfill_folds_registry_before_equal_timestamp_event() {
+    let mut state = SequenceState::default();
+    let mut sources = sequence_sources();
+
+    let entries = vec![
+        (
+            ts(1),
+            1,
+            bytes(&event("deploy", SequenceEventKind::Started)),
+        ),
+        (ts(1), 0, bytes(&registry(&[("deploy", &["solar"])]))),
+    ];
+    apply_backfill(&mut state, &mut sources, entries);
+
+    assert_eq!(
+        state.channel("deploy").unwrap().run_state,
+        SequenceRunState::Running
+    );
 }

@@ -987,6 +987,117 @@ async fn delta_t_accepts_value_input() {
 }
 
 #[stellarator::test]
+async fn compose_realigns_after_one_sample_skew() {
+    use crate::dynamic::node::{NodeReader, write_sample};
+    use crate::dynamic::ops::compose::run_aligned_emit;
+    use metor_db::disruptor::Disruptor;
+    use metor_proto::types::Timestamp;
+
+    // Two f64 input rings and one f64 output ring (8-byte values).
+    let a_ring = Disruptor::new(8 * 1024);
+    let b_ring = Disruptor::new(8 * 1024);
+    let out_ring = Disruptor::new(8 * 1024);
+
+    // Readers must be created before the writes so they start at the head
+    // that precedes them and see every sample.
+    let a_reader = NodeReader::from_disruptor(&a_ring, 8);
+    let b_reader = NodeReader::from_disruptor(&b_ring, 8);
+    let mut out_reader = NodeReader::from_disruptor(&out_ring, 8);
+
+    // Input b leads a by one sample: a = t1..=t4, b = t2..=t5. A positional
+    // pairing would mismatch every tuple (t1 vs t2, t2 vs t3, ...) and emit
+    // nothing forever; the aligner must drop the stale heads and converge on
+    // the shared timestamps t2, t3, t4.
+    for t in 1..=4i64 {
+        write_sample(&a_ring, Timestamp(t), &10.0_f64.to_le_bytes());
+    }
+    for t in 2..=5i64 {
+        write_sample(&b_ring, Timestamp(t), &1.0_f64.to_le_bytes());
+    }
+
+    let _task = stellarator::spawn(run_aligned_emit(
+        vec![a_reader, b_reader],
+        out_ring.clone(),
+        8,
+        |inputs, out| {
+            let a = f64::from_le_bytes(inputs[0].try_into().unwrap());
+            let b = f64::from_le_bytes(inputs[1].try_into().unwrap());
+            out.copy_from_slice(&(a + b).to_le_bytes());
+        },
+    ));
+
+    let mut got: Vec<(i64, f64)> = Vec::new();
+    while got.len() < 3 {
+        let grant = out_reader.next().await;
+        for (ts, v) in grant.samples() {
+            got.push((ts.0, f64::from_le_bytes(v.try_into().unwrap())));
+        }
+    }
+    assert_eq!(got, vec![(2, 11.0), (3, 11.0), (4, 11.0)]);
+}
+
+#[stellarator::test]
+async fn resample_linear_interp_covers_all_branches() {
+    use crate::dynamic::ops::resample::interp;
+    use metor_proto::types::Timestamp;
+
+    let read = |bytes: &[u8]| f64::from_le_bytes(bytes.try_into().unwrap());
+    let mut out = [0u8; 8];
+
+    // Before the first sample: only `next` present → hold it.
+    interp(
+        Timestamp(5),
+        None,
+        Some(&(Timestamp(10), vec![100.0])),
+        &mut out,
+        PrimType::F64,
+    );
+    assert_eq!(read(&out), 100.0);
+
+    // After the last sample: only `prev` present → hold it.
+    interp(
+        Timestamp(25),
+        Some(&(Timestamp(20), vec![200.0])),
+        None,
+        &mut out,
+        PrimType::F64,
+    );
+    assert_eq!(read(&out), 200.0);
+
+    // Exact lower endpoint (tick == t0) → prev value, no interpolation.
+    interp(
+        Timestamp(10),
+        Some(&(Timestamp(10), vec![100.0])),
+        Some(&(Timestamp(20), vec![200.0])),
+        &mut out,
+        PrimType::F64,
+    );
+    assert_eq!(read(&out), 100.0);
+
+    // Interior: halfway between (10, 100) and (20, 200) → 150.
+    interp(
+        Timestamp(15),
+        Some(&(Timestamp(10), vec![100.0])),
+        Some(&(Timestamp(20), vec![200.0])),
+        &mut out,
+        PrimType::F64,
+    );
+    assert_eq!(read(&out), 150.0);
+
+    // Degenerate t1 == t0: a zero span must not divide by zero; take v1.
+    interp(
+        Timestamp(15),
+        Some(&(Timestamp(10), vec![100.0])),
+        Some(&(Timestamp(10), vec![300.0])),
+        &mut out,
+        PrimType::F64,
+    );
+    let v = read(&out);
+    assert!(v.is_finite(), "t1 == t0 must not produce NaN/inf, got {v}");
+    assert_eq!(v, 300.0);
+}
+
+#[stellarator::test]
 async fn zoh_passes_through_typed_vector_bytes() {
     let slow = ops::clock::fixed_rate(50.0).unwrap();
     let fast = ops::clock::fixed_rate(400.0).unwrap();

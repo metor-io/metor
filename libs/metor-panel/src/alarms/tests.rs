@@ -1,9 +1,10 @@
-use metor_proto::types::{ComponentId, Timestamp};
+use metor_proto::types::{ComponentId, Msg, Timestamp};
 use metor_proto_wkt::{
     AlarmAck, AlarmCleared, AlarmDef, AlarmLimit, AlarmRaised, AlarmTarget, LimitKind, Severity,
 };
 
 use super::{AlarmEventKind, AlarmState};
+use crate::msg_ingest::{IngestSource, apply_backfill};
 
 fn ts(n: i64) -> Timestamp {
     Timestamp(n)
@@ -201,4 +202,76 @@ fn history_records_event_kinds() {
             AlarmEventKind::Cleared,
         ]
     );
+}
+
+/// The store's ingest sources in declaration order, folding directly into a bare
+/// [`AlarmState`]. `apply_backfill` is generic over its store type, so the same
+/// (timestamp, source-index) merge the live store uses can be exercised without a
+/// gpui `App` — the closures here mirror `AlarmStore::new`'s sources exactly.
+fn alarm_sources() -> Vec<IngestSource<AlarmState>> {
+    vec![
+        IngestSource::new(AlarmDef::ID, |s: &mut AlarmState, _ts, def| s.apply_def(def)),
+        IngestSource::new(AlarmRaised::ID, |s: &mut AlarmState, ts, r| {
+            s.apply_raised(ts, r)
+        }),
+        IngestSource::new(AlarmCleared::ID, |s: &mut AlarmState, ts, c| {
+            s.apply_cleared(ts, c)
+        }),
+        IngestSource::new(AlarmAck::ID, |s: &mut AlarmState, ts, a| s.apply_ack(ts, a)),
+    ]
+}
+
+fn bytes<T: serde::Serialize>(value: &T) -> Vec<u8> {
+    postcard::to_allocvec(value).unwrap()
+}
+
+/// A clear whose raise lives in a different log must still cancel it. The raise (ts 1)
+/// and clear (ts 2) interleave across the raised/cleared logs; here the clear is listed
+/// first, as a naive per-log replay (cleared log drained before the raised log) would
+/// order it. `apply_backfill` sorts by (timestamp, source index), so the raise folds
+/// before the clear and the occurrence ends cleared — not active forever.
+#[test]
+fn backfill_folds_cross_log_clear_after_its_raise() {
+    let mut state = AlarmState::default();
+    let mut sources = alarm_sources();
+
+    let entries = vec![
+        (
+            ts(2),
+            2,
+            bytes(&AlarmCleared {
+                def_id: "A".into(),
+                occurrence: 1,
+            }),
+        ),
+        (ts(1), 1, bytes(&raised(1, Severity::Warning))),
+    ];
+    apply_backfill(&mut state, &mut sources, entries);
+
+    assert_eq!(state.active_count(), 0);
+    assert_eq!(state.unacked_count(), 0);
+}
+
+/// When a raise and its clear share one timestamp, the source declaration index breaks
+/// the tie: raised (index 1) folds before cleared (index 2), so the occurrence still
+/// clears. The clear is again listed first to prove the sort, not input order, decides.
+#[test]
+fn backfill_breaks_equal_timestamp_ties_by_source_index() {
+    let mut state = AlarmState::default();
+    let mut sources = alarm_sources();
+
+    let entries = vec![
+        (
+            ts(5),
+            2,
+            bytes(&AlarmCleared {
+                def_id: "A".into(),
+                occurrence: 1,
+            }),
+        ),
+        (ts(5), 1, bytes(&raised(1, Severity::Warning))),
+    ];
+    apply_backfill(&mut state, &mut sources, entries);
+
+    assert_eq!(state.active_count(), 0);
 }

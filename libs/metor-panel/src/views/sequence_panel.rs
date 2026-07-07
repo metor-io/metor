@@ -57,6 +57,20 @@ impl SequenceView {
             arming_stop: None,
         }
     }
+
+    /// Restore a persisted panel to the history or channels tab.
+    pub fn set_history(&mut self, history: bool) {
+        self.mode = if history {
+            SequenceListMode::History
+        } else {
+            SequenceListMode::Channels
+        };
+    }
+
+    /// Whether the history tab is showing, for persistence.
+    pub fn is_history(&self) -> bool {
+        self.mode == SequenceListMode::History
+    }
 }
 
 /// Snapshot of one channel for rendering, owned so the store borrow is released before we

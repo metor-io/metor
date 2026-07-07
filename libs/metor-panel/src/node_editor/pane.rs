@@ -16,6 +16,7 @@ use gpui::{
 use metor_db::DB;
 
 use crate::node_editor::config::{NodeEditorConfig, Viewport as ConfigViewport};
+use crate::node_editor::coordinator::GraphCoordinator;
 use crate::node_editor::graph::{BuildState, EdgeEntry, FlowId, NodeEntry, NodeGraph, Position};
 use crate::node_editor::registry::{Arity, OpDescriptor, SocketKind, descriptor_for};
 use crate::node_editor::spec::NodeSpec;
@@ -111,6 +112,8 @@ struct NodeRenderSnapshot {
 impl NodeEditor {
     pub fn new(db: Arc<DB>, cx: &mut Context<Self>) -> Self {
         let owner = cx.entity_id().as_u64();
+        cx.on_release(move |_, cx| GraphCoordinator::drop_owner(owner, cx))
+            .detach();
         let graph = cx.new(|_| NodeGraph::new(owner));
         let focus_handle = cx.focus_handle();
         Self {
@@ -135,11 +138,9 @@ impl NodeEditor {
         let viewport = cfg.viewport.clone();
         let next_node_seq = cfg.nodes.len() as u64;
         let owner = cx.entity_id().as_u64();
-        // The hydrated graph carries its serialized owner_id, but every
-        // process gets a fresh EntityId, so override with our actual id.
-        let mut graph = cfg.into_graph();
-        graph.owner_id = owner;
-        let graph = cx.new(|_| graph);
+        cx.on_release(move |_, cx| GraphCoordinator::drop_owner(owner, cx))
+            .detach();
+        let graph = cx.new(|_| cfg.into_graph(owner));
         let focus_handle = cx.focus_handle();
         let mut this = Self {
             graph,
@@ -167,9 +168,6 @@ impl NodeEditor {
         SharedString::from(format!("{kind}-{n}"))
     }
 
-    /// Spawn a new node at canvas-local pixel position `screen_pos` (graph
-    /// origin assumed at (0, 0); pan/zoom not yet wired). Used by the palette
-    /// provider — the descriptor decides label and default args.
     /// Read-only accessor for the underlying graph entity. Used by
     /// inspector_rows to walk the spec without going through `to_config`.
     pub fn graph_entity(&self) -> &Entity<NodeGraph> {
@@ -619,16 +617,8 @@ impl Render for NodeEditor {
             .on_mouse_up(
                 MouseButton::Left,
                 cx.listener(|this, _ev: &gpui::MouseUpEvent, _w, cx| {
-                    let was_dragging_node = this.node_drag.take().is_some();
-                    let cancelled_draft = this.edge_draft.take().is_some();
-                    if was_dragging_node {
-                        // Position-only changes don't require a rebuild — but
-                        // re-running rebuild is cheap thanks to idempotency,
-                        // and Mean's parent order is position-derived so vertical
-                        // drags can change its hash.
-                        this.schedule_rebuild(cx);
-                    }
-                    if cancelled_draft {
+                    this.node_drag.take();
+                    if this.edge_draft.take().is_some() {
                         cx.notify();
                     }
                 }),

@@ -309,21 +309,55 @@ impl ScreenTransform {
     }
 }
 
-/// Round `num` to the nearest `0.5 * 10^k` so axis steps land on
-/// human-friendly values (1, 1.5, 2, 5, 10, 20, 50, …).
+/// Snap `num` to the nearest "nice" value — 1, 2, 2.5, or 5 times a power
+/// of ten — so axis tick steps land on human-friendly intervals at any
+/// scale (…, 0.25, 0.5, 1, 2, 2.5, 5, 10, 20, 25, 50, …).
 pub fn pretty_round(num: f64) -> f64 {
     if num == 0.0 || !num.is_finite() {
         return num;
     }
-    let mut multiplier = 1.0;
-    let mut n = num.abs();
+    let abs = num.abs();
+    let magnitude = 10f64.powi(abs.log10().floor() as i32);
+    let mantissa = abs / magnitude;
+    let nice = if mantissa < 1.5 {
+        1.0
+    } else if mantissa < 2.25 {
+        2.0
+    } else if mantissa < 3.75 {
+        2.5
+    } else if mantissa < 7.5 {
+        5.0
+    } else {
+        10.0
+    };
+    let result = nice * magnitude;
+    if num < 0.0 { -result } else { result }
+}
 
-    while n < 1.0 {
-        n *= 10.0;
-        multiplier *= 10.0;
+#[cfg(test)]
+mod tests {
+    use super::pretty_round;
+
+    #[test]
+    fn snaps_to_nice_mantissas() {
+        assert_eq!(pretty_round(246.8), 250.0);
+        assert_eq!(pretty_round(1.4), 1.0);
+        assert_eq!(pretty_round(1.6), 2.0);
+        assert_eq!(pretty_round(4.0), 5.0);
+        assert_eq!(pretty_round(9.0), 10.0);
     }
 
-    let rounded = (n * 2.0).round() / 2.0;
-    let result = rounded / multiplier;
-    if num < 0.0 { -result } else { result }
+    #[test]
+    fn preserves_sign_and_scale() {
+        assert_eq!(pretty_round(-246.8), -250.0);
+        assert!((pretty_round(0.2) - 0.2).abs() < 1e-12);
+        assert!((pretty_round(0.000_23) - 0.000_25).abs() < 1e-15);
+    }
+
+    #[test]
+    fn passes_through_degenerate_inputs() {
+        assert_eq!(pretty_round(0.0), 0.0);
+        assert!(pretty_round(f64::INFINITY).is_infinite());
+        assert!(pretty_round(f64::NAN).is_nan());
+    }
 }

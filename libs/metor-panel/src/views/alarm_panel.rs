@@ -34,6 +34,20 @@ impl AlarmView {
             mode: AlarmListMode::default(),
         }
     }
+
+    /// Restore a persisted panel to the history or active tab.
+    pub fn set_history(&mut self, history: bool) {
+        self.mode = if history {
+            AlarmListMode::History
+        } else {
+            AlarmListMode::Active
+        };
+    }
+
+    /// Whether the history tab is showing, for persistence.
+    pub fn is_history(&self) -> bool {
+        self.mode == AlarmListMode::History
+    }
 }
 
 fn format_age(raised_at: Timestamp) -> String {

@@ -24,7 +24,7 @@ impl GpuContext {
         CTX.get_or_init(|| match pollster::block_on(Self::create()) {
             Ok(ctx) => Some(Arc::new(ctx)),
             Err(e) => {
-                eprintln!("metor-panel: GpuContext init failed: {e}");
+                tracing::error!(%e, "GpuContext init failed");
                 None
             }
         })

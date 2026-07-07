@@ -4,12 +4,12 @@
 //! it back). Per-preset: each `NodeEditorConfig` is embedded inside a
 //! `SerializedItem`'s `state` blob, so swapping presets swaps the graph.
 
+use crate::node_editor::coordinator::OwnerId;
 use crate::node_editor::graph::{EdgeEntry, NodeGraph, Position};
 use crate::node_editor::spec::NodeSpec;
 
 #[derive(Clone, Debug, Default, facet::Facet)]
 pub struct NodeEditorConfig {
-    pub owner_uuid: u64,
     pub viewport: Viewport,
     pub nodes: Vec<SerializedNode>,
     pub edges: Vec<SerializedEdge>,
@@ -19,7 +19,6 @@ pub struct NodeEditorConfig {
 pub struct Viewport {
     pub x: f32,
     pub y: f32,
-    pub zoom: f32,
 }
 
 #[derive(Clone, Debug, facet::Facet)]
@@ -64,17 +63,17 @@ impl NodeEditorConfig {
             .collect();
 
         Self {
-            owner_uuid: graph.owner_id,
             viewport,
             nodes,
             edges,
         }
     }
 
-    /// Hydrate into a fresh graph. Call `rebuild_into` afterwards to populate
-    /// build state.
-    pub fn into_graph(self) -> NodeGraph {
-        let mut graph = NodeGraph::new(self.owner_uuid);
+    /// Hydrate into a fresh graph owned by `owner` — ownership is a live
+    /// per-process concern (the pane's `EntityId`), so it isn't persisted.
+    /// Call `rebuild_into` afterwards to populate build state.
+    pub fn into_graph(self, owner: OwnerId) -> NodeGraph {
+        let mut graph = NodeGraph::new(owner);
         for n in self.nodes {
             graph.insert_node(n.flow_id.into(), n.spec, Position { x: n.x, y: n.y });
         }

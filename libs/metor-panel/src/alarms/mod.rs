@@ -20,7 +20,7 @@ use metor_proto_wkt::{
     AlarmAck, AlarmCleared, AlarmDef, AlarmId, AlarmLimit, AlarmRaised, OccurrenceId, Severity,
 };
 
-use crate::msg_ingest::ingest_loop;
+use crate::msg_ingest::{IngestSource, ingest_all};
 
 #[cfg(test)]
 mod tests;
@@ -230,7 +230,7 @@ pub struct AlarmStore {
     state: AlarmState,
     db: Arc<DB>,
     operator: String,
-    _tasks: Vec<Task<()>>,
+    _task: Task<()>,
 }
 
 /// Hands the shared [`AlarmStore`] entity to any part of the app.
@@ -254,50 +254,34 @@ impl AlarmStore {
             .or_else(|_| std::env::var("USERNAME"))
             .unwrap_or_else(|_| "operator".to_string());
 
-        let tasks = vec![
-            cx.spawn({
-                let db = db.clone();
-                async move |this, cx| {
-                    ingest_loop(db, AlarmDef::ID, this, cx, |store, _ts, def| {
+        // Sources list cause before effect: defs and raises must fold before the clears
+        // and acks that reference them, so equal-timestamp records merge in this order.
+        let task = cx.spawn({
+            let db = db.clone();
+            async move |this, cx| {
+                let sources = vec![
+                    IngestSource::new(AlarmDef::ID, |store: &mut Self, _ts, def| {
                         store.state.apply_def(def)
-                    })
-                    .await
-                }
-            }),
-            cx.spawn({
-                let db = db.clone();
-                async move |this, cx| {
-                    ingest_loop(db, AlarmRaised::ID, this, cx, |store, ts, raised| {
+                    }),
+                    IngestSource::new(AlarmRaised::ID, |store: &mut Self, ts, raised| {
                         store.state.apply_raised(ts, raised)
-                    })
-                    .await
-                }
-            }),
-            cx.spawn({
-                let db = db.clone();
-                async move |this, cx| {
-                    ingest_loop(db, AlarmCleared::ID, this, cx, |store, ts, cleared| {
+                    }),
+                    IngestSource::new(AlarmCleared::ID, |store: &mut Self, ts, cleared| {
                         store.state.apply_cleared(ts, cleared)
-                    })
-                    .await
-                }
-            }),
-            cx.spawn({
-                let db = db.clone();
-                async move |this, cx| {
-                    ingest_loop(db, AlarmAck::ID, this, cx, |store, ts, ack| {
+                    }),
+                    IngestSource::new(AlarmAck::ID, |store: &mut Self, ts, ack| {
                         store.state.apply_ack(ts, ack)
-                    })
-                    .await
-                }
-            }),
-        ];
+                    }),
+                ];
+                ingest_all(db, sources, this, cx).await
+            }
+        });
 
         Self {
             state: AlarmState::default(),
             db,
             operator,
-            _tasks: tasks,
+            _task: task,
         }
     }
 

@@ -8,9 +8,8 @@
 //! - [`coordinator::GraphCoordinator`] — multi-editor alive-set aggregator.
 //! - [`registry::OpDescriptor`] — palette/canvas/validator metadata.
 //! - [`validate`] — connection validation + edge coloring.
-//!
-//! The visual canvas (gpui view) and pane integration are intentionally not
-//! in this commit — the foundation is testable without UI.
+//! - [`pane::NodeEditor`] — the visual canvas pane that renders the graph
+//!   and routes edits back into it.
 
 pub mod config;
 pub mod coordinator;

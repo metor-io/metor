@@ -15,7 +15,9 @@ use crate::{AsComponentView, ComponentStream, ComponentStreamBuilder};
 /// Mirrors [`Monitor`](super::Monitor)'s streaming pattern: the constructor
 /// spawns one task that consumes the WAL stream and stores the latest sample;
 /// rendering is a single coloured swatch. See [`any_on`] for how non-bool
-/// components are interpreted as on/off.
+/// components are interpreted as on/off. Metadata is bound lazily: producers
+/// may register the component after the light is placed, so a resolver task
+/// refreshes name/`is_bool`/element names once the schema shows up in the DB.
 #[derive(facet::Facet)]
 pub struct TrafficLight {
     #[facet(skip)]
@@ -35,6 +37,8 @@ pub struct TrafficLight {
     focus: FocusHandle,
     #[facet(opaque)]
     _task: gpui::Task<()>,
+    #[facet(opaque)]
+    _resolver_task: gpui::Task<()>,
 }
 
 impl TrafficLight {
@@ -52,6 +56,29 @@ impl TrafficLight {
             cx.notify();
         });
 
+        // Await component registration, then re-read metadata: a light
+        // placed (or restored) before the producer registers would
+        // otherwise show the debug id forever and never enable
+        // click-to-toggle.
+        let resolver_task = cx.spawn({
+            let db = db.clone();
+            async move |this, cx| {
+                loop {
+                    if db.with_state(|state| state.get_component(component_id).is_some()) {
+                        let meta = component_meta(&db, component_id);
+                        let _ = this.update(cx, |light, cx| {
+                            light.name = meta.name;
+                            light.is_bool = meta.is_bool;
+                            light.element_names = meta.element_names;
+                            cx.notify();
+                        });
+                        break;
+                    }
+                    db.vtable_gen.wait().await;
+                }
+            }
+        });
+
         Self {
             name: meta.name,
             color: default_color,
@@ -62,6 +89,7 @@ impl TrafficLight {
             latest_on: None,
             focus: cx.focus_handle(),
             _task: task,
+            _resolver_task: resolver_task,
         }
     }
 
@@ -184,7 +212,7 @@ pub(crate) fn any_on(values: impl Iterator<Item = ElementValue>) -> bool {
 }
 
 /// Bundle of per-component metadata that traffic-light views read out of the
-/// DB once at construction.
+/// DB at construction and again once the component registers.
 pub(crate) struct ComponentMeta {
     pub name: SharedString,
     pub is_bool: bool,

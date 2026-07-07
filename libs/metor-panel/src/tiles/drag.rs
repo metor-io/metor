@@ -95,3 +95,57 @@ pub fn detect_split_zone(cursor: Point<Pixels>, bounds: Bounds<Pixels>) -> Optio
         None
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use gpui::{point, size};
+
+    /// A 100x100 pane at the origin, so relative fractions read straight off
+    /// the pixel coordinates.
+    fn unit_bounds() -> Bounds<Pixels> {
+        Bounds {
+            origin: point(px(0.0), px(0.0)),
+            size: size(px(100.0), px(100.0)),
+        }
+    }
+
+    fn zone_at(x: f32, y: f32) -> Option<SplitDirection> {
+        detect_split_zone(point(px(x), px(y)), unit_bounds())
+    }
+
+    #[test]
+    fn center_yields_no_split() {
+        assert_eq!(zone_at(50.0, 50.0), None);
+    }
+
+    #[test]
+    fn edges_map_to_their_direction() {
+        assert_eq!(zone_at(10.0, 50.0), Some(SplitDirection::Left));
+        assert_eq!(zone_at(90.0, 50.0), Some(SplitDirection::Right));
+        assert_eq!(zone_at(50.0, 10.0), Some(SplitDirection::Up));
+        assert_eq!(zone_at(50.0, 90.0), Some(SplitDirection::Down));
+    }
+
+    #[test]
+    fn horizontal_edges_win_over_vertical_in_corners() {
+        // A corner sits in both an x- and a y-strip; the x-check runs first, so
+        // Left/Right take precedence.
+        assert_eq!(zone_at(10.0, 10.0), Some(SplitDirection::Left));
+        assert_eq!(zone_at(90.0, 90.0), Some(SplitDirection::Right));
+    }
+
+    #[test]
+    fn bounds_origin_is_honored() {
+        let bounds = Bounds {
+            origin: point(px(200.0), px(200.0)),
+            size: size(px(100.0), px(100.0)),
+        };
+        // Absolute (250,250) is the center of an origin-shifted pane.
+        assert_eq!(detect_split_zone(point(px(250.0), px(250.0)), bounds), None);
+        assert_eq!(
+            detect_split_zone(point(px(210.0), px(250.0)), bounds),
+            Some(SplitDirection::Left)
+        );
+    }
+}

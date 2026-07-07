@@ -178,29 +178,52 @@ async fn run_resample_linear(
                 continue;
             };
             wg[..size_of::<Timestamp>()].copy_from_slice(&tick.to_le_bytes());
-            let out_bytes = &mut wg[size_of::<Timestamp>()..];
-            match (&prev, next) {
-                (None, None) => unreachable!(),
-                (None, Some((_, v))) | (Some((_, v)), None) => {
-                    for (i, &x) in v.iter().enumerate() {
-                        write_f64_at(out_bytes, out_dtype, i, x);
-                    }
+            interp(
+                tick,
+                prev.as_ref(),
+                next,
+                &mut wg[size_of::<Timestamp>()..],
+                out_dtype,
+            );
+        }
+    }
+}
+
+/// Interpolate `tick`'s output from the bracketing decoded samples, writing
+/// `out_dtype` bytes into `out`. `prev` is the newest sample at or before
+/// `tick`; `next` is the oldest strictly after it. With only one side present
+/// we hold that sample (zero-order hold at the ends). With both, we lerp per
+/// element — guarding the `t1 == t0` degenerate so a zero span can't divide
+/// by zero. The drain invariant keeps `prev` at or before and `next` strictly
+/// after `tick`, so `(None, None)` never reaches here; it is a no-op for
+/// safety.
+pub(crate) fn interp(
+    tick: Timestamp,
+    prev: Option<&(Timestamp, Vec<f64>)>,
+    next: Option<&(Timestamp, Vec<f64>)>,
+    out: &mut [u8],
+    out_dtype: PrimType,
+) {
+    match (prev, next) {
+        (None, None) => {}
+        (None, Some((_, v))) | (Some((_, v)), None) => {
+            for (i, &x) in v.iter().enumerate() {
+                write_f64_at(out, out_dtype, i, x);
+            }
+        }
+        (Some((t0, v0)), Some((t1, v1))) => {
+            if tick.0 <= t0.0 {
+                for (i, &x) in v0.iter().enumerate() {
+                    write_f64_at(out, out_dtype, i, x);
                 }
-                (Some((t0, v0)), Some((t1, v1))) => {
-                    if tick.0 <= t0.0 {
-                        for (i, &x) in v0.iter().enumerate() {
-                            write_f64_at(out_bytes, out_dtype, i, x);
-                        }
-                    } else if tick.0 >= t1.0 || t1.0 == t0.0 {
-                        for (i, &x) in v1.iter().enumerate() {
-                            write_f64_at(out_bytes, out_dtype, i, x);
-                        }
-                    } else {
-                        let frac = (tick.0 - t0.0) as f64 / (t1.0 - t0.0) as f64;
-                        for (i, (a, b)) in v0.iter().zip(v1.iter()).enumerate() {
-                            write_f64_at(out_bytes, out_dtype, i, a + frac * (b - a));
-                        }
-                    }
+            } else if tick.0 >= t1.0 || t1.0 == t0.0 {
+                for (i, &x) in v1.iter().enumerate() {
+                    write_f64_at(out, out_dtype, i, x);
+                }
+            } else {
+                let frac = (tick.0 - t0.0) as f64 / (t1.0 - t0.0) as f64;
+                for (i, (a, b)) in v0.iter().zip(v1.iter()).enumerate() {
+                    write_f64_at(out, out_dtype, i, a + frac * (b - a));
                 }
             }
         }
