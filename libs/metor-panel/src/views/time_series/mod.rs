@@ -257,6 +257,18 @@ pub(crate) const X_LABEL_HEIGHT: f32 = 10.0;
 pub(crate) const PADDING: f32 = 8.0;
 pub(crate) const LABEL_FONT_SIZE: f32 = 11.0;
 
+/// Gap between the pointer and the hover readout box so the box never sits
+/// under the cursor.
+const HOVER_READOUT_OFFSET: f32 = 14.0;
+/// Inner padding on the hover readout box; mirrors the estimate in
+/// [`cursor::estimate_readout_size`] so placement matches the painted box.
+const READOUT_PAD_X: f32 = 6.0;
+const READOUT_PAD_Y: f32 = 4.0;
+
+/// One readout line: the trace's color, its label, and the formatted value
+/// at the crosshair timestamp.
+type HoverRows = smallvec::SmallVec<[(Hsla, SharedString, SharedString); 4]>;
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) enum AxisZone {
     Plot,
@@ -895,6 +907,34 @@ fn paint_cursors(
     }
 }
 
+/// Paint the plain-hover crosshair: one thin vertical rule at the pointer's
+/// X, clipped to the plot area.
+///
+/// Deliberately thinner and more muted than the measurement cursors — it is
+/// transient chrome, never a persisted selection line.
+fn paint_hover_crosshair(
+    outer_bounds: Bounds<Pixels>,
+    view: &PlotView,
+    pointer_x: Pixels,
+    window: &mut Window,
+    cx: &mut gpui::App,
+) {
+    let pb = plot_area(outer_bounds, view.axis_count());
+    if pointer_x < pb.origin.x || pointer_x > pb.origin.x + pb.size.width {
+        return;
+    }
+    let color = Hsla {
+        a: 0.6,
+        ..crate::theme::theme(cx).text_secondary
+    };
+    let mut line = PathBuilder::stroke(px(0.5));
+    line.move_to(point(pointer_x, pb.origin.y));
+    line.line_to(point(pointer_x, pb.origin.y + pb.size.height));
+    if let Ok(path) = line.build() {
+        window.paint_path(path, color);
+    }
+}
+
 /// Rendering mode for a single [`Trace`].
 #[derive(Clone, Copy, Default, PartialEq, facet::Facet)]
 #[repr(u8)]
@@ -1011,6 +1051,10 @@ pub struct TimeSeriesPlot {
     /// Pointer-to-panel-origin offset captured at drag start, in window
     /// coordinates. `Some` while a panel drag is in flight.
     panel_drag: Option<Point<Pixels>>,
+    /// Window-local pointer position while plain-hovering over the plot,
+    /// driving the crosshair and value readout. `None` unless a bare hover
+    /// (no modifier, no drag) is over the plot area.
+    hover: Option<Point<Pixels>>,
 }
 
 /// Build traces for `component_id` × `indices`, cycling theme colors and
@@ -1078,6 +1122,7 @@ impl TimeSeriesPlot {
             cursor_drag: None,
             panel_position: PanelPosition::default(),
             panel_drag: None,
+            hover: None,
         }
     }
 
@@ -1430,6 +1475,141 @@ impl TimeSeriesPlot {
             cx.notify();
         });
     }
+
+    /// Drop the hover crosshair/readout, repainting if it was showing.
+    /// Called whenever a gesture that owns the pointer (pan, zoom, cursor
+    /// drag, inspector) begins, and on mouse-leave.
+    fn clear_hover(&mut self, cx: &mut Context<Self>) {
+        if self.hover.take().is_some() {
+            cx.notify();
+        }
+    }
+
+    /// Track the bare-hover pointer for the crosshair and value readout.
+    ///
+    /// Mutually exclusive with every other pointer gesture: a held modifier
+    /// (measurement), an in-flight drag, or a pointer over the axis chrome
+    /// all suppress it, so hover never fights pan/zoom/measure.
+    fn update_hover(&mut self, event: &gpui::MouseMoveEvent, cx: &mut Context<Self>) {
+        if event.modifiers.alt
+            || self.cursor_drag.is_some()
+            || self.drag_start.is_some()
+            || self.panel_drag.is_some()
+        {
+            self.clear_hover(cx);
+            return;
+        }
+        let Some(pa) = self.last_plot_area else {
+            self.clear_hover(cx);
+            return;
+        };
+        let axis_count = self.line_plot.read(cx).axes.len();
+        if axis_zone(event.position, pa, axis_count) != AxisZone::Plot {
+            self.clear_hover(cx);
+            return;
+        }
+        self.hover = Some(event.position);
+        cx.notify();
+    }
+
+    /// Build the hover readout: a native div listing each visible trace's
+    /// value at the crosshair timestamp (nearest sample, via the shared
+    /// [`LinePlot::trace_value_at`]) under a formatted time header, offset
+    /// and clamped clear of the pointer and pane edges.
+    fn hover_readout(&self, cx: &Context<Self>) -> Option<gpui::AnyElement> {
+        let pointer = self.hover?;
+        let pa = self.last_plot_area?;
+        let lp = self.line_plot.read(cx);
+        let view = lp.effective_view(cx)?;
+        let theme = crate::theme::theme(cx);
+
+        let x_data = cursor::pixel_to_data_x(pointer.x, pa, view.x_bounds());
+        let ts = Timestamp(x_data as i64);
+        let header = format_time_label(
+            x_data as i64,
+            lp.data_start().unwrap_or(0.0) as i64,
+            lp.x_time_format,
+            view.x_bounds().width(),
+        );
+
+        let mut rows: HoverRows = smallvec::SmallVec::new();
+        for trace in lp.traces() {
+            let cfg = trace.read(cx);
+            if !cfg.visible {
+                continue;
+            }
+            let Some(value) = lp.trace_value_at(trace.entity_id(), ts, cx) else {
+                continue;
+            };
+            rows.push((
+                cfg.color,
+                cfg.label.clone(),
+                SharedString::from(format_value_label(value)),
+            ));
+        }
+
+        let lens: smallvec::SmallVec<[(usize, usize); 4]> = rows
+            .iter()
+            .map(|(_, label, value)| (label.chars().count(), value.chars().count()))
+            .collect();
+        let size = cursor::estimate_readout_size(header.chars().count(), &lens);
+        let origin = cursor::readout_origin(pointer, size, pa, px(HOVER_READOUT_OFFSET));
+        // Position within the wrapper div, whose origin is inset from the
+        // plot area by the left chrome and top padding.
+        let inner_origin = point(
+            pa.origin.x - px(left_margin(view.axis_count())),
+            pa.origin.y - px(PADDING),
+        );
+
+        let mut boxed = div()
+            .flex()
+            .flex_col()
+            .gap_y_0()
+            .px(px(READOUT_PAD_X))
+            .py(px(READOUT_PAD_Y))
+            .bg(theme.bg_elevated)
+            .border_1()
+            .border_color(theme.border_primary)
+            .rounded(px(3.0))
+            .child(
+                div()
+                    .text_size(px(LABEL_FONT_SIZE))
+                    .text_color(theme.text_secondary)
+                    .child(SharedString::from(header)),
+            );
+        for (color, label, value) in rows {
+            boxed = boxed.child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap_1()
+                    .child(div().w(px(8.0)).h(px(8.0)).rounded(px(2.0)).bg(color))
+                    .child(
+                        div()
+                            .flex_1()
+                            .text_size(px(LABEL_FONT_SIZE))
+                            .text_color(theme.text_secondary)
+                            .child(label),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(LABEL_FONT_SIZE))
+                            .text_color(color)
+                            .child(value),
+                    ),
+            );
+        }
+
+        Some(
+            div()
+                .absolute()
+                .left(origin.x - inner_origin.x)
+                .top(origin.y - inner_origin.y)
+                .child(boxed)
+                .into_any_element(),
+        )
+    }
 }
 
 impl Render for TimeSeriesPlot {
@@ -1445,16 +1625,24 @@ impl Render for TimeSeriesPlot {
         let overlay_lp = self.line_plot.clone();
         let cursors_lp = self.line_plot.clone();
         let cursors_weak = cx.entity().downgrade();
+        let hover_weak = cx.entity().downgrade();
 
         let mut root = div().flex().flex_col().size_full().bg(theme.bg_secondary);
 
         let mut inner = div()
+            .id(("time-series-plot", cx.entity().entity_id().as_u64() as usize))
             .flex_1()
             .min_h_0()
             .relative()
+            .on_hover(cx.listener(|this, hovered: &bool, _window, cx| {
+                if !*hovered {
+                    this.clear_hover(cx);
+                }
+            }))
             .on_mouse_down(
                 MouseButton::Left,
                 cx.listener(|this, event: &gpui::MouseDownEvent, window, cx| {
+                    this.clear_hover(cx);
                     if event.click_count == 2 {
                         this.reset_view(cx);
                         return;
@@ -1494,12 +1682,14 @@ impl Render for TimeSeriesPlot {
             .on_mouse_down(
                 MouseButton::Right,
                 cx.listener(|this, event: &gpui::MouseDownEvent, window, cx| {
+                    this.clear_hover(cx);
                     this.open_cursor_inspector_at(event.position, window, cx);
                 }),
             )
             .on_mouse_move(
                 cx.listener(|this, event: &gpui::MouseMoveEvent, _window, cx| {
                     if !event.dragging() {
+                        this.update_hover(event, cx);
                         return;
                     }
                     if this.advance_panel_drag(event.position, cx) {
@@ -1531,6 +1721,7 @@ impl Render for TimeSeriesPlot {
             )
             .on_scroll_wheel(
                 cx.listener(|this, event: &gpui::ScrollWheelEvent, _window, cx| {
+                    this.clear_hover(cx);
                     let Some(view) = this.line_plot.read(cx).effective_view(cx) else {
                         return;
                     };
@@ -1691,6 +1882,28 @@ impl Render for TimeSeriesPlot {
                 )
                 .absolute()
                 .inset_0(),
+            )
+            .child(
+                canvas(
+                    move |bounds, _window, cx| {
+                        let mut out = None;
+                        let _ = hover_weak.update(cx, |this, cx| {
+                            if let Some(pointer) = this.hover
+                                && let Some(view) = this.line_plot.read(cx).effective_view(cx)
+                            {
+                                out = Some((view, pointer.x));
+                            }
+                        });
+                        (bounds, out)
+                    },
+                    move |_, (bounds, data), window, cx| {
+                        if let Some((view, x)) = data {
+                            paint_hover_crosshair(bounds, &view, x, window, cx);
+                        }
+                    },
+                )
+                .absolute()
+                .inset_0(),
             );
 
         // Measurement panels: a native div tree positioned on top of
@@ -1703,6 +1916,10 @@ impl Render for TimeSeriesPlot {
             let left = panel.origin.x + chrome_left;
             let top = panel.origin.y + px(PADDING);
             inner = inner.child(div().absolute().left(left).top(top).child(panel.element));
+        }
+
+        if let Some(readout) = self.hover_readout(cx) {
+            inner = inner.child(readout);
         }
 
         root = root.child(inner);
