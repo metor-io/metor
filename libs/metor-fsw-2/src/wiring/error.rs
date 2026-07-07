@@ -1,5 +1,4 @@
-//! The wiring [`LoadError`] — every load/resolve failure with source context
-//! (wiring.md §5.2), split out of `wiring/mod.rs` (C6).
+//! Errors raised while loading and resolving a wiring document.
 
 use miette::{Diagnostic, SourceSpan};
 use thiserror::Error;
@@ -7,13 +6,11 @@ use thiserror::Error;
 use crate::coordinator::WireError;
 use crate::dl::DlError;
 
-// ---------------------------------------------------------------------------
-// Errors — every failure with source context (wiring.md §5.2)
-// ---------------------------------------------------------------------------
-
-/// A wiring-document load failure, each carrying the offending KDL source span.
-/// Mirrors `metor-proto-kdl`'s `KdlSchematicError`: same `thiserror`+`miette`
-/// derive, same `#[source_code]`/`#[label]` shape.
+/// An error from loading or resolving a wiring document.
+///
+/// Each variant carries the full KDL source and the span of the offending
+/// node, so rendering the error as a [`miette`] report points at the exact
+/// line of the document.
 #[derive(Error, Debug, Diagnostic)]
 pub enum LoadError {
     #[error("KDL parse error")]
@@ -79,8 +76,7 @@ pub enum LoadError {
         span: SourceSpan,
     },
 
-    /// A required params field (per the typed `Params` struct or the dl `Params`
-    /// schema) has no matching property/child on the node.
+    /// A required params field has no matching property or child on the node.
     #[error("missing required param `{property}` for system `{system}`")]
     #[diagnostic(code(fsw_wiring::missing_param))]
     MissingParam {
@@ -92,8 +88,9 @@ pub enum LoadError {
         span: SourceSpan,
     },
 
-    /// A params value that does not decode as the field's type (or a params
-    /// surface shape error: a stray positional argument, a repeated property, …).
+    /// A params value that does not decode as the field's type, or a malformed
+    /// params surface such as a stray positional argument or a repeated
+    /// property.
     #[error("invalid value for `{property}` on system `{system}`: expected {expected}")]
     #[diagnostic(code(fsw_wiring::invalid_param))]
     InvalidParam {
@@ -106,9 +103,9 @@ pub enum LoadError {
         span: SourceSpan,
     },
 
-    /// A property/child with no matching params field — a typo or a stale config.
-    /// Raised uniformly by the static path (the serde deserializer) and the dl
-    /// path (the `Params`-schema validation).
+    /// A property or child with no matching params field, usually a typo or a
+    /// stale config. Both the typed deserializer and the dynamic schema
+    /// validation raise this same variant.
     #[error("unknown param `{property}` for system `{system}`")]
     #[diagnostic(code(fsw_wiring::unknown_param))]
     UnknownParam {
@@ -215,8 +212,8 @@ pub enum LoadError {
     DlOpen {
         system: String,
         artifact: String,
-        // Boxed: a `DlError` carries a `libloading::Error`, which would otherwise bloat
-        // every `LoadError` (the `result_large_err` lint).
+        // Boxed because `DlError` carries a `libloading::Error`, which would
+        // otherwise bloat every `LoadError` (the `result_large_err` lint).
         #[source]
         source: Box<DlError>,
         #[source_code]
@@ -225,8 +222,9 @@ pub enum LoadError {
         span: SourceSpan,
     },
 
-    /// The dl system's `Params` schema could not be encoded from its KDL config (an
-    /// unsupported schema shape, or the dynamic encoder rejected the value).
+    /// The dl system's params could not be encoded against its `Params`
+    /// schema, either because the schema has an unsupported shape or because
+    /// the dynamic encoder rejected a value.
     #[error("dl system `{system}` params could not be schema-encoded: {reason}")]
     #[diagnostic(code(fsw_wiring::dl_param_encode))]
     DlParamEncode {
@@ -238,11 +236,11 @@ pub enum LoadError {
         span: SourceSpan,
     },
 
-    /// A **static** (`from_static`) system carries typed builder params
-    /// ([`ParamSource::Postcard`]). The static path has no postcard decoder: the
-    /// [`Registry`] factory constructs the system by deserializing its params off the
-    /// KDL `system` node ([`Registry::register`]), so the postcard bytes would be
-    /// silently dropped and the system would run on defaults.
+    /// A static system was given typed builder params. The static path has no
+    /// postcard decoder; its registered factory deserializes params off the
+    /// KDL `system` node, so the postcard bytes would be silently dropped and
+    /// the system would run on defaults. Only the dl path decodes postcard
+    /// params.
     #[error(
         "static system `{system}` (type `{ty}`) has typed builder params, but a static \
          system takes params through its registered KDL-deserializing factory — express \
@@ -269,8 +267,8 @@ pub enum LoadError {
         span: SourceSpan,
     },
 
-    /// A top-level node name the wiring schema does not know — a typo would
-    /// otherwise be silently skipped.
+    /// A top-level node name the wiring schema does not know. Without this
+    /// error a typo would be silently skipped.
     #[error("unknown top-level node `{node}`")]
     #[diagnostic(code(fsw_wiring::unknown_top_level_node))]
     UnknownTopLevelNode {
@@ -281,8 +279,8 @@ pub enum LoadError {
         span: SourceSpan,
     },
 
-    /// The pre-normalization `telemetry { … }` / `uplink { … }` nodes — a guidance
-    /// error carrying the ordinary `system` spelling that replaced them.
+    /// A retired `telemetry { … }` or `uplink { … }` node. This guidance error
+    /// carries the ordinary `system` spelling to write instead.
     #[error("the `{node}` node was replaced by an ordinary `system` declaration")]
     #[diagnostic(
         code(fsw_wiring::legacy_link_node),
@@ -297,8 +295,8 @@ pub enum LoadError {
         span: SourceSpan,
     },
 
-    /// `lib=` on a `system` node — renamed to `artifact=` (a guidance error for the
-    /// pre-rename spelling; `lib=` on `artifact` nodes still means the library stem).
+    /// The retired `lib=` spelling on a `system` node, which is now
+    /// `artifact=`. On `artifact` nodes `lib=` still means the library stem.
     #[error(
         "`lib=` on `system` nodes was renamed to `artifact=` (it references an artifact \
          id; `lib=` on `artifact` nodes still means the library stem)"
@@ -311,11 +309,10 @@ pub enum LoadError {
         span: SourceSpan,
     },
 
-    /// A dl system's explicit `type=` contradicts the `.so` type its artifact
-    /// exports (`type=` is optional on dl systems; when given it must match).
-    #[error(
-        "system `{system}` declares type `{ty}` but its artifact exports `{artifact_type}`"
-    )]
+    /// A dl system's explicit `type=` contradicts the type its artifact's
+    /// `.so` exports. `type=` is optional on dl systems, but when given it
+    /// must match.
+    #[error("system `{system}` declares type `{ty}` but its artifact exports `{artifact_type}`")]
     #[diagnostic(code(fsw_wiring::type_mismatches_artifact))]
     TypeMismatchesArtifact {
         system: String,
@@ -327,8 +324,10 @@ pub enum LoadError {
         span: SourceSpan,
     },
 
-    // --- slots (sequences-slots.md §5) --------------------------------------
-    #[error("`slot` node has an unknown child `{child}` (expected `input`/`output`/`allow`/`initial`)")]
+    // --- slots ---------------------------------------------------------------
+    #[error(
+        "`slot` node has an unknown child `{child}` (expected `input`/`output`/`allow`/`initial`)"
+    )]
     #[diagnostic(code(fsw_wiring::unknown_slot_child))]
     UnknownSlotChild {
         child: String,
@@ -348,7 +347,9 @@ pub enum LoadError {
         span: SourceSpan,
     },
 
-    #[error("`slot \"{slot}\"` has an invalid initial `state=\"{state}\"` (expected `empty`/`loaded`/`running`)")]
+    #[error(
+        "`slot \"{slot}\"` has an invalid initial `state=\"{state}\"` (expected `empty`/`loaded`/`running`)"
+    )]
     #[diagnostic(code(fsw_wiring::bad_slot_state))]
     BadSlotState {
         slot: String,
@@ -359,10 +360,12 @@ pub enum LoadError {
         span: SourceSpan,
     },
 
-    /// A `slot`'s declared `input`/`output frame="…"` contract names a frame that the
-    /// slot's resolved (registered) descriptor has no matching user port for — a typo or
-    /// a stale contract (the explicit-contract validation, Resolved Q4).
-    #[error("`slot \"{slot}\"` declares {dir} frame `{frame}` but its occupants have no such user port")]
+    /// A slot's declared `input`/`output frame="…"` contract names a frame
+    /// that none of its resolved occupants expose as a user port, usually a
+    /// typo or a stale contract.
+    #[error(
+        "`slot \"{slot}\"` declares {dir} frame `{frame}` but its occupants have no such user port"
+    )]
     #[diagnostic(code(fsw_wiring::slot_contract_mismatch))]
     SlotContractMismatch {
         slot: String,
@@ -374,9 +377,10 @@ pub enum LoadError {
         span: SourceSpan,
     },
 
-    /// A `slot`'s `initial occupant="…"` names an occupant that is not in the slot's
-    /// `allow` set — a typo the slot would otherwise boot `Empty` on with no diagnostic
-    /// (the runtime `Load` path validates the same set).
+    /// A slot's `initial occupant="…"` names an occupant outside the slot's
+    /// `allow` set. Without this error such a typo would boot the slot empty
+    /// with no diagnostic. The runtime load path validates against the same
+    /// set.
     #[error(
         "`slot \"{slot}\"` initial occupant `{occupant}` is not in the allowed set \
          (allowed: {allowed})"
@@ -385,7 +389,7 @@ pub enum LoadError {
     UnknownInitialOccupant {
         slot: String,
         occupant: String,
-        /// The comma-joined allowed occupant names, for the message/label.
+        /// The comma-joined allowed occupant names, for the message and label.
         allowed: String,
         #[source_code]
         src: String,
@@ -393,9 +397,9 @@ pub enum LoadError {
         span: SourceSpan,
     },
 
-    /// Two allowed occupants of one `slot` have incompatible descriptors — the slot derives
-    /// its single contract from the allowed set's shared shape (v1 holds sequence occupants
-    /// only, so they must agree). A clean error in place of `add_slot`'s build-time panic.
+    /// Two allowed occupants of one slot have incompatible descriptors. A
+    /// slot derives its single contract from the shared shape of its allowed
+    /// set, so every occupant's ports must agree with the first one's.
     #[error("`slot \"{slot}\"` occupant `{occupant}` is incompatible with the slot contract")]
     #[diagnostic(code(fsw_wiring::slot_occupant_mismatch))]
     SlotOccupantMismatch {
@@ -407,4 +411,3 @@ pub enum LoadError {
         span: SourceSpan,
     },
 }
-

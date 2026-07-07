@@ -1,13 +1,15 @@
-//! ABI acceptance tests: the generated `export_system!` C-ABI exercised
-//! **in-process, without dlopen/libloading**. A direct in-crate call of the generated
-//! `#[unsafe(no_mangle)]` `fsw_*` functions proves the macro + `RawBinder` +
-//! `attach_raw` + the verbatim `CyclicRunner` + the descriptor
-//! serialization all compose.
+//! In-process tests for the exported C ABI.
 //!
-//! The host side is emulated by hand: it allocates heap-backed `RingBuffer`s, hands
-//! the system their `(base, len, role)` as `FswRing`s, and reads results back through
-//! its own writer/view over the *same* regions the system reconstructs via
-//! non-owning attaches.
+//! The `fsw_*` symbols that `export_system!` generates live in this crate, so
+//! the tests call them directly instead of loading a shared library. A plain
+//! function call still exercises everything a loaded artifact would use, from
+//! the macro expansion through `RawBinder`, `attach_raw`, the `CyclicRunner`,
+//! and descriptor serialization.
+//!
+//! The tests also play the host's role. They allocate heap-backed
+//! `RingBuffer`s, hand the system `(base, len, role)` handles, and read
+//! results back through their own writers and views over the same regions the
+//! system attaches to without owning.
 
 use core::ffi::c_void;
 use core::ptr;
@@ -22,10 +24,9 @@ use serde::{Deserialize, Serialize};
 use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
 
 use crate::abi::{
-    FswRing, FswStatus, PortDescMsg, PortSchemaMsg, RawBinder, ROLE_INPUT, ROLE_OUTPUT,
-    SystemDescriptorMsg, run_bind_init,
-    run_create, run_destroy, run_execute, run_seq_bind_init, run_seq_create, run_seq_destroy,
-    run_seq_execute, run_seq_shutdown, run_shutdown,
+    FswRing, FswStatus, PortDescMsg, PortSchemaMsg, ROLE_INPUT, ROLE_OUTPUT, RawBinder,
+    SystemDescriptorMsg, run_bind_init, run_create, run_destroy, run_execute, run_seq_bind_init,
+    run_seq_create, run_seq_destroy, run_seq_execute, run_seq_shutdown, run_shutdown,
 };
 use crate::binder::BindPorts;
 use crate::sequence::{
@@ -38,7 +39,7 @@ use crate::{
 };
 
 // ---------------------------------------------------------------------------
-// Fixture frames + a tiny cyclic system, exported through the ABI.
+// Fixture frames and a small cyclic system exported through the ABI.
 // ---------------------------------------------------------------------------
 
 #[derive(crate::Frame, IntoBytes, Immutable, KnownLayout, FromBytes, Default)]
@@ -59,16 +60,15 @@ struct TickOut {
     count: u64,
 }
 
-/// A real `Params` struct: `Serialize + Deserialize + Schema` (the postcard params
-/// contract) — `Deserialize` is also all the static KDL registry path needs.
+/// Params carrying the full postcard contract (`Serialize + Deserialize +
+/// Schema`).
 #[derive(Serialize, Deserialize, Schema, Clone, Default, Debug, PartialEq)]
 struct CounterParams {
     #[serde(default)]
     start: u64,
 }
 
-/// Adds `start` to each input tick and republishes the sum — enough to prove the
-/// input view, the output writer, and the counters all ride the boundary.
+/// Adds `start` to each input tick and republishes the sum.
 struct Counter {
     start: u64,
 }
@@ -108,13 +108,15 @@ impl CyclicSystem for Counter {
 impl BuildSystem for Counter {
     type Params = CounterParams;
     fn new(params: Self::Params) -> Self {
-        Counter { start: params.start }
+        Counter {
+            start: params.start,
+        }
     }
 }
 
-// The one `#[unsafe(no_mangle)] fsw_*` surface this test crate may carry (no_mangle
-// symbols are crate-unique): the `Counter`. `Boom` (below) drives the `run_*` helpers
-// directly to avoid a second, clashing export.
+// The `no_mangle` symbols are crate-unique, so this crate can export exactly
+// one system. `Counter` takes the slot; `Boom` (below) drives the `run_*`
+// helpers directly to avoid a second, clashing export.
 crate::export_system!(Counter);
 
 // ---------------------------------------------------------------------------
@@ -128,27 +130,27 @@ fn ring_for<F: Frame>(depth: usize, readers: usize) -> RingBuffer {
     })
 }
 
-/// An `FswRing` over a host ring's region (the same-process handle the host fills).
+/// Builds the boundary handle for a host-owned ring's region.
 fn handle(ring: &RingBuffer, role: u8) -> FswRing {
     let (base, len) = ring.region();
     FswRing { base, len, role }
 }
 
 // ---------------------------------------------------------------------------
-// 1+2. Lifecycle end-to-end: create → bind_init → write → execute → read back.
+// Lifecycle end-to-end: create, bind, write, execute, read back.
 // ---------------------------------------------------------------------------
 
 #[test]
 fn abi_lifecycle_end_to_end() {
-    // Host-side rings (the coordinator owns these). Descriptor order on the output
-    // side is [user `out`, implicit health, implicit log].
+    // The host owns the rings. Output descriptor order is the user `out`
+    // followed by the implicit health and log ports.
     let in_ring = ring_for::<TickIn>(8, 1);
     let out_ring = ring_for::<TickOut>(8, 1);
     let health_ring = ring_for::<SystemHealth>(8, 1);
     let log_ring = ring_for::<SystemLog>(8, 1);
 
-    // The host reads results through its own view; register it before the system
-    // writes (a fresh view only sees data committed from now on).
+    // Register the host's view before the system writes; a fresh view only
+    // sees data committed after it exists.
     let mut out_view = Input::<TickOut>::new(out_ring.view(NoWake, NoWake).unwrap());
 
     let inputs = [handle(&in_ring, ROLE_INPUT)];
@@ -158,16 +160,22 @@ fn abi_lifecycle_end_to_end() {
         handle(&log_ring, ROLE_OUTPUT),
     ];
 
-    // params blob — canonical postcard, exactly what a KDL/builder front-end would emit.
+    // The params blob is canonical postcard, the same bytes any front-end
+    // emits.
     let params = postcard::to_allocvec(&CounterParams { start: 100 }).unwrap();
 
-    // fsw_create → fsw_bind_init.
     let state = fsw_create(params.as_ptr(), params.len());
     assert!(!state.is_null(), "fsw_create returned state");
-    fsw_bind_init(state, inputs.as_ptr(), inputs.len(), outputs.as_ptr(), outputs.len());
+    fsw_bind_init(
+        state,
+        inputs.as_ptr(),
+        inputs.len(),
+        outputs.as_ptr(),
+        outputs.len(),
+    );
 
-    // The host writes one input record through its own writer over `in_ring`,
-    // which the system reads through its non-owning view over the same region.
+    // The host writes one record through its own writer over `in_ring`; the
+    // system reads it through its non-owning view over the same region.
     let mut in_writer = Output::<TickIn>::new(in_ring.writer(NoWake, NoWake).unwrap());
     in_writer
         .write(&TickIn {
@@ -176,19 +184,19 @@ fn abi_lifecycle_end_to_end() {
         })
         .unwrap();
 
-    // One cycle. `now` is the coordinator's raw timestamp tick.
+    // One cycle, with `now` as the host's raw timestamp tick.
     let status = fsw_execute(state, 1000);
     assert_eq!(status, FswStatus::Running);
 
-    // Read the produced frame back through the host's view (scoped: the grant
-    // borrows the view, which is dropped below).
+    // The grant borrows the view, so read inside a scope that ends before the
+    // final drop.
     {
         let out = out_view.latest().expect("system produced an output");
         assert_eq!(out.get().count, 105, "start(100) + value(5)");
         assert_eq!(out.get().timestamp, Timestamp(1000), "stamped with `now`");
     }
 
-    // Teardown: shutdown + destroy inside the `.so` *before* the host rings drop.
+    // Tear the system down before the host rings drop.
     fsw_shutdown(state);
     fsw_destroy(state);
 
@@ -196,12 +204,12 @@ fn abi_lifecycle_end_to_end() {
 }
 
 // ---------------------------------------------------------------------------
-// 3. Descriptor round-trip: fsw_describe → postcard → SystemDescriptorMsg.
+// Descriptor round-trip through fsw_describe and postcard.
 // ---------------------------------------------------------------------------
 
 extern "C" fn collect_bytes(ctx: *mut c_void, buf: *const u8, len: usize) {
-    // SAFETY: the test passes a `&mut Vec<u8>` as `ctx`, and `buf`/`len` is the
-    // descriptor buffer the export owns for the call.
+    // SAFETY: the test passes a `&mut Vec<u8>` as `ctx`, and `buf`/`len` is
+    // the descriptor buffer the export owns for the duration of the call.
     let sink = unsafe { &mut *(ctx as *mut Vec<u8>) };
     let bytes = unsafe { slice::from_raw_parts(buf, len) };
     sink.extend_from_slice(bytes);
@@ -219,7 +227,7 @@ fn abi_describe_round_trips() {
     assert_eq!(msg.name, "counter");
     assert_eq!(msg.kind, SystemKind::Cyclic);
 
-    // Ports / frame ids match the static descriptor.
+    // Ports and frame ids match the static descriptor.
     assert_eq!(msg.inputs.len(), desc.inputs.len());
     assert_eq!(msg.inputs.len(), 1);
     let table_frame_id = |m: &PortDescMsg| match &m.schema {
@@ -232,42 +240,43 @@ fn abi_describe_round_trips() {
         desc.inputs[0].id.component().expect("table port")
     );
 
-    // user `out` + implicit health + implicit log.
+    // The user `out` plus the implicit health and log ports.
     assert_eq!(msg.outputs.len(), desc.outputs.len());
     assert_eq!(msg.outputs.len(), 3);
     assert_eq!(table_frame_id(&msg.outputs[0]), TickOut::FRAME_ID);
     for (m, d) in msg.outputs.iter().zip(&desc.outputs) {
         assert_eq!(table_frame_id(m), d.id.component().expect("table port"));
         assert_eq!(m.name, d.name);
-        // The axes + telemetry flag ride the wire verbatim.
+        // The axes and the telemetry flag ride the wire verbatim.
         assert_eq!(m.delivery, d.delivery);
         assert_eq!(m.fan_in, d.fan_in);
         assert_eq!(m.telemetered, d.telemetered);
     }
 
-    // Every static system declares no host capabilities.
+    // A static system declares no host capabilities.
     assert!(msg.capabilities.is_empty());
 
-    // params_schema present and correct.
     assert_eq!(
         msg.params_schema,
         OwnedNamedType::from(<CounterParams as Schema>::SCHEMA),
         "Params schema round-trips"
     );
 
-    // The descriptor mirror reconstructs a usable SystemDescriptor (host side).
+    // The message reconstructs a usable descriptor on the host side.
     let rebuilt = msg.into_descriptor();
     assert_eq!(rebuilt.name, "counter");
-    assert_eq!(rebuilt.inputs[0].id.component().expect("table port"), TickIn::FRAME_ID);
+    assert_eq!(
+        rebuilt.inputs[0].id.component().expect("table port"),
+        TickIn::FRAME_ID
+    );
 }
 
 // ---------------------------------------------------------------------------
-// 3b. Telemetry-prefix rewrite: a dl output's `announce(prefix)` yields
-//     instance-prefixed *vtable* ids, matching a static system's announce.
+// Telemetry-prefix rewrite on a reconstructed descriptor's outputs.
 // ---------------------------------------------------------------------------
 
-/// Every component id a vtable realizes (registration mode), for asserting which ids
-/// are baked into the schema the telemetry tap downlinks.
+/// Every component id a vtable realizes in registration mode, so a test can
+/// assert exactly which ids the schema bakes in.
 fn realized_ids(vt: &VTable) -> Vec<ComponentId> {
     vt.realize_fields(None)
         .flatten()
@@ -277,7 +286,8 @@ fn realized_ids(vt: &VTable) -> Vec<ComponentId> {
 
 #[test]
 fn dl_announce_prefixes_vtable_ids() {
-    // Lower → wire → reconstruct the descriptor exactly as the host loader does.
+    // Lower to the wire and reconstruct, exactly as a host loading the
+    // descriptor would.
     let desc = <Counter as CyclicSystem>::descriptor();
     let schema = OwnedNamedType::from(<CounterParams as Schema>::SCHEMA);
     let msg = SystemDescriptorMsg::lower(&desc, schema);
@@ -287,7 +297,6 @@ fn dl_announce_prefixes_vtable_ids() {
     let port = &rebuilt.outputs[0];
     let (vtable, metadata) = (port.announce().expect("table port"))("inst");
 
-    // The metadata ids are prefixed.
     assert!(
         metadata
             .iter()
@@ -295,9 +304,9 @@ fn dl_announce_prefixes_vtable_ids() {
         "metadata id is instance-prefixed"
     );
 
-    // The vtable's *baked* leaf id is prefixed too (the metadata-driven id rewrite): it
-    // matches what a static system bakes via `announce_of::<F>("inst")`, and the
-    // unprefixed id is absent.
+    // The vtable's baked leaf id is prefixed too, matching what a static
+    // system bakes via `announce_of::<F>("inst")`, and the unprefixed id is
+    // gone.
     let ids = realized_ids(&vtable);
     assert!(
         ids.contains(&ComponentId::new("inst.tick_out.count")),
@@ -308,8 +317,8 @@ fn dl_announce_prefixes_vtable_ids() {
         "no unprefixed leaf id remains: {ids:?}"
     );
 
-    // The *unprefixed* vtable on the PortDesc (what `compatible()` validates) is left
-    // alone, so wiring validation still sees the frame-relative ids.
+    // The vtable carried on the port itself stays unprefixed; `compatible()`
+    // validates wiring against the frame-relative ids.
     let unprefixed = realized_ids(port.vtable().expect("table port"));
     assert!(
         unprefixed.contains(&ComponentId::new("tick_out.count")),
@@ -318,22 +327,22 @@ fn dl_announce_prefixes_vtable_ids() {
 }
 
 // ---------------------------------------------------------------------------
-// 4. Panic containment: a panicking `execute` returns Panicked, never unwinds.
+// Panic containment: a panicking execute returns Panicked, never unwinds.
 // ---------------------------------------------------------------------------
 
 struct Boom;
 
 #[derive(SystemInput)]
 struct BoomIn {
-    // Bound by the ABI but never drained (Boom panics first).
+    // Bound by the ABI but never drained; Boom panics first.
     #[allow(dead_code)]
     tick: Input<TickIn>,
 }
 
 #[derive(SystemOutput)]
 struct BoomOut {
-    // Bound by the ABI but never written (Boom panics first); kept so the bundle has
-    // a real output port for the descriptor/bind walk.
+    // Bound by the ABI but never written; kept so the bundle has a real
+    // output port for the descriptor and bind walk.
     #[allow(dead_code)]
     out: Output<TickOut>,
 }
@@ -357,8 +366,8 @@ impl BuildSystem for Boom {
     }
 }
 
-/// An `extern "C"` frame over `run_execute` — the exact shape `export_system!`
-/// generates — so the test exercises the panic crossing a real C ABI frame.
+/// An `extern "C"` frame over `run_execute`, the exact shape `export_system!`
+/// generates, so the panic crosses a real C ABI frame.
 extern "C" fn boom_execute(state: *mut c_void, now: u64) -> FswStatus {
     // SAFETY: `state` is a live `AbiState<Boom>` from `run_create`.
     unsafe { run_execute::<Boom>(state, now) }
@@ -378,20 +387,26 @@ fn abi_panic_is_contained() {
         handle(&log_ring, ROLE_OUTPUT),
     ];
 
-    // `()` params encode to zero bytes; pass a null/empty blob.
+    // `()` params encode to zero bytes.
     // SAFETY: null params with len 0 is the documented empty-params case.
     let state = unsafe { run_create::<Boom>(ptr::null(), 0) };
     assert!(!state.is_null());
-    // SAFETY: live state + valid handle regions that outlive the runner.
+    // SAFETY: live state, and the handle regions outlive the runner.
     unsafe {
-        run_bind_init::<Boom, _>(state, inputs.as_ptr(), inputs.len(), outputs.as_ptr(), outputs.len())
+        run_bind_init::<Boom, _>(
+            state,
+            inputs.as_ptr(),
+            inputs.len(),
+            outputs.as_ptr(),
+            outputs.len(),
+        )
     };
 
-    // execute panics inside the `.so`; the boundary converts it to `Panicked`.
+    // The panic is caught at the boundary and reported as a status.
     let status = boom_execute(state, 1);
     assert_eq!(status, FswStatus::Panicked, "panic converted, not unwound");
 
-    // A subsequent cycle is short-circuited (the slot is poisoned).
+    // A later cycle is short-circuited because the slot is poisoned.
     assert_eq!(boom_execute(state, 2), FswStatus::Panicked);
 
     // SAFETY: live state, used once more then destroyed.
@@ -403,35 +418,33 @@ fn abi_panic_is_contained() {
     drop((in_ring, out_ring, health_ring, log_ring));
 }
 
-/// `FswStatus::from_raw` is the dlopen consuming side's trust-boundary conversion
-/// (review R2): the three declared discriminants round-trip, and anything outside
-/// `0..=2` — the range a well-behaved `.so`'s `fsw_execute` sends — folds to
-/// `Panicked` rather than being trusted as a valid `repr(u32)` value.
+/// `FswStatus::from_raw` sits on the trust boundary. The three declared
+/// discriminants round-trip; any other word folds to `Panicked` rather than
+/// being treated as a valid `repr(u32)` value.
 #[test]
 fn from_raw_folds_out_of_range_to_panicked() {
     assert_eq!(FswStatus::from_raw(0), FswStatus::Running);
     assert_eq!(FswStatus::from_raw(1), FswStatus::Panicked);
     assert_eq!(FswStatus::from_raw(2), FswStatus::Done);
-    // Never sent by the host's own `run_execute`/`run_seq_execute` exports, but a
-    // stale/mismatched build, a hand-rolled non-Rust exporter, or memory corruption
-    // could hand back any word — none of these must be trusted verbatim.
+    // A well-behaved export never sends these, but a stale build, a
+    // hand-rolled exporter, or memory corruption could hand back any word.
     assert_eq!(FswStatus::from_raw(3), FswStatus::Panicked);
     assert_eq!(FswStatus::from_raw(255), FswStatus::Panicked);
     assert_eq!(FswStatus::from_raw(u32::MAX), FswStatus::Panicked);
 }
 
 // ---------------------------------------------------------------------------
-// The schema-guided KDL → postcard params path.
-// These prove the **core byte-equality invariant** (the dynamic encoder produces
-// exactly the bytes the typed Rust builder produces) and the span-aware error
-// cases, all without dlopen — `encode_kdl_params` is driven by an owned schema, so
-// the host never needs to link the system's `Params` type to encode KDL config.
+// Schema-guided KDL params encoding.
+// The invariant under test is byte equality: `encode_kdl_params`, driven only
+// by an owned schema, must produce exactly the postcard bytes the typed Rust
+// value encodes to, so a host can encode config without linking the system's
+// `Params` type. The remaining tests cover the span-aware error cases.
 // ---------------------------------------------------------------------------
 
 use crate::wiring::encode_kdl_params;
 
-/// `encode_kdl_params` with the `system`-node surface (reserved `type=`/`artifact=`,
-/// one leading instance-name argument) — what `resolve_dl` passes.
+/// `encode_kdl_params` with the `system`-node surface: `type=` and
+/// `artifact=` reserved, one leading instance-name argument.
 fn encode_system_params(
     node_text: &str,
     schema: &OwnedNamedType,
@@ -440,8 +453,8 @@ fn encode_system_params(
     encode_kdl_params(node_text, schema, system, &["type", "artifact"], 1)
 }
 
-/// A multi-field, mixed-type `Params` (the byte-equality gate must hold across types,
-/// not just one field). Mirrors a dl system's `#[derive(Serialize, Deserialize, Schema)]`.
+/// Params spanning several field types, so byte equality is checked across
+/// more than one postcard encoding shape.
 #[derive(Serialize, Deserialize, Schema, Debug, PartialEq)]
 struct MultiParams {
     start: u64,
@@ -452,15 +465,15 @@ struct MultiParams {
     trim: Option<f64>,
 }
 
-/// THE HARD GATE: `encode_kdl_params` (schema-guided, the KDL front-end) produces
-/// byte-identical postcard bytes to `postcard::to_stdvec` of the
-/// typed value (the Rust builder front-end) — across every field type.
+/// The schema-guided encoder produces byte-identical postcard to the typed
+/// value's own encoding, across every field type.
 #[test]
 fn kdl_schema_encode_byte_equals_typed_builder() {
     let schema = OwnedNamedType::from(<MultiParams as Schema>::SCHEMA);
     let node_text = r#"system "x" type="T" artifact="a" start=7 scale=2.5 enabled=#true label="hi" bias=-9 trim=0.25"#;
 
-    let kdl_bytes = encode_system_params(node_text, &schema, "x").expect("schema-encode KDL params");
+    let kdl_bytes =
+        encode_system_params(node_text, &schema, "x").expect("schema-encode KDL params");
     let typed_bytes = postcard::to_allocvec(&MultiParams {
         start: 7,
         scale: 2.5,
@@ -471,23 +484,28 @@ fn kdl_schema_encode_byte_equals_typed_builder() {
     })
     .unwrap();
 
-    assert_eq!(kdl_bytes, typed_bytes, "KDL schema-encode == typed builder (the wire contract)");
+    assert_eq!(
+        kdl_bytes, typed_bytes,
+        "KDL schema-encode == typed builder (the wire contract)"
+    );
 
-    // And the .so's `fsw_create` would decode it back to the real Params.
+    // The blob decodes back to the typed value on the receiving side.
     let decoded: MultiParams = postcard::from_bytes(&kdl_bytes).unwrap();
     assert_eq!(decoded.start, 7);
     assert_eq!(decoded.trim, Some(0.25));
 }
 
-/// An `Option` field with no KDL property is `None` (omittable default), and an int
-/// literal where a float is wanted coerces (`scale=3` ⇒ 3.0) — both still byte-match.
+/// An `Option` field with no KDL property encodes as `None`, and an int
+/// literal where a float is wanted coerces (`scale=3` becomes 3.0). Both
+/// still byte-match.
 #[test]
 fn kdl_schema_encode_optional_absent_and_int_for_float() {
     let schema = OwnedNamedType::from(<MultiParams as Schema>::SCHEMA);
-    // `trim` omitted ⇒ None; `scale=3` (int literal) ⇒ 3.0.
-    let node_text = r#"system "x" type="T" artifact="a" start=0 scale=3 enabled=#false label="" bias=0"#;
+    let node_text =
+        r#"system "x" type="T" artifact="a" start=0 scale=3 enabled=#false label="" bias=0"#;
 
-    let kdl_bytes = encode_system_params(node_text, &schema, "x").expect("encode with absent Option");
+    let kdl_bytes =
+        encode_system_params(node_text, &schema, "x").expect("encode with absent Option");
     let typed_bytes = postcard::to_allocvec(&MultiParams {
         start: 0,
         scale: 3.0,
@@ -497,19 +515,28 @@ fn kdl_schema_encode_optional_absent_and_int_for_float() {
         trim: None,
     })
     .unwrap();
-    assert_eq!(kdl_bytes, typed_bytes, "absent Option + int-for-float still byte-match");
+    assert_eq!(
+        kdl_bytes, typed_bytes,
+        "absent Option + int-for-float still byte-match"
+    );
 }
 
-/// A KDL property whose value type does not match the schema field is a clean
-/// spanned `InvalidParam` (not a panic, not a silent divergence).
+/// A property whose value type does not match the schema field is a spanned
+/// `InvalidParam`, not a panic or a silent divergence.
 #[test]
 fn kdl_schema_encode_type_mismatch_is_clean_error() {
     let schema = OwnedNamedType::from(<MultiParams as Schema>::SCHEMA);
     // `start` wants a u64 but is given a string.
-    let node_text = r#"system "x" type="T" artifact="a" start="oops" scale=1.0 enabled=#true label="h" bias=0"#;
+    let node_text =
+        r#"system "x" type="T" artifact="a" start="oops" scale=1.0 enabled=#true label="h" bias=0"#;
     let err = encode_system_params(node_text, &schema, "x").expect_err("type mismatch is an error");
     match err {
-        LoadError::InvalidParam { system, property, span, .. } => {
+        LoadError::InvalidParam {
+            system,
+            property,
+            span,
+            ..
+        } => {
             assert_eq!(system, "x");
             assert_eq!(property, "start");
             // The span points at the offending `start="oops"` entry.
@@ -520,7 +547,7 @@ fn kdl_schema_encode_type_mismatch_is_clean_error() {
     }
 }
 
-/// A required (non-`Option`) schema field with no KDL property is a clean
+/// A required (non-`Option`) schema field with no property is a
 /// `MissingParam`.
 #[test]
 fn kdl_schema_encode_missing_field_is_clean_error() {
@@ -529,7 +556,9 @@ fn kdl_schema_encode_missing_field_is_clean_error() {
     let node_text = r#"system "x" type="T" artifact="a" start=1 scale=1.0 enabled=#true label="h""#;
     let err = encode_system_params(node_text, &schema, "x").expect_err("missing field is an error");
     match err {
-        LoadError::MissingParam { system, property, .. } => {
+        LoadError::MissingParam {
+            system, property, ..
+        } => {
             assert_eq!(system, "x");
             assert_eq!(property, "bias");
         }
@@ -537,16 +566,22 @@ fn kdl_schema_encode_missing_field_is_clean_error() {
     }
 }
 
-/// A KDL property not present in the schema is a clean spanned `UnknownParam` (a
-/// typo guard; `type=`/`artifact=` are reserved and never treated as params).
+/// A property not present in the schema is a spanned `UnknownParam`, guarding
+/// against typos. The reserved `type=`/`artifact=` are never treated as
+/// params.
 #[test]
 fn kdl_schema_encode_unknown_property_is_clean_error() {
     let schema = OwnedNamedType::from(<MultiParams as Schema>::SCHEMA);
-    let node_text =
-        r#"system "x" type="T" artifact="a" start=1 scale=1.0 enabled=#true label="h" bias=0 typo=5"#;
-    let err = encode_system_params(node_text, &schema, "x").expect_err("extra property is an error");
+    let node_text = r#"system "x" type="T" artifact="a" start=1 scale=1.0 enabled=#true label="h" bias=0 typo=5"#;
+    let err =
+        encode_system_params(node_text, &schema, "x").expect_err("extra property is an error");
     match err {
-        LoadError::UnknownParam { system, property, span, .. } => {
+        LoadError::UnknownParam {
+            system,
+            property,
+            span,
+            ..
+        } => {
             assert_eq!(system, "x");
             assert_eq!(property, "typo");
             let at = node_text.find("typo=5").unwrap();
@@ -556,9 +591,9 @@ fn kdl_schema_encode_unknown_property_is_clean_error() {
     }
 }
 
-/// Nested params through the dl path: a nested struct, a `Vec` (both the
-/// multi-arg and the repeated-children spellings), and an absent `Option`,
-/// expressed as children — byte-equal to the typed postcard encode.
+/// Nested params expressed as children: a nested struct, a `Vec` in both the
+/// multi-arg and repeated-children spellings, and an absent `Option`, all
+/// byte-equal to the typed encoding.
 #[derive(Serialize, Deserialize, Schema, Debug, PartialEq)]
 struct NestedParams {
     pid: PidParams,
@@ -577,7 +612,11 @@ struct PidParams {
 fn kdl_schema_encode_nested_struct_and_vec_byte_equal() {
     let schema = OwnedNamedType::from(<NestedParams as Schema>::SCHEMA);
     let typed_bytes = postcard::to_allocvec(&NestedParams {
-        pid: PidParams { p: 1.0, i: 0.5, d: 0.1 },
+        pid: PidParams {
+            p: 1.0,
+            i: 0.5,
+            d: 0.1,
+        },
         taps: vec![1, 2, 3],
         label: None,
     })
@@ -589,19 +628,23 @@ fn kdl_schema_encode_nested_struct_and_vec_byte_equal() {
     taps 1 2 3
 }"#;
     let kdl_bytes = encode_system_params(node_text, &schema, "x").expect("nested encode");
-    assert_eq!(kdl_bytes, typed_bytes, "nested struct + multi-arg Vec byte-match");
+    assert_eq!(
+        kdl_bytes, typed_bytes,
+        "nested struct + multi-arg Vec byte-match"
+    );
 
-    // Repeated-children form for the Vec is the same wire.
+    // The repeated-children form for the Vec produces the same wire.
     let node_text = r#"system "x" type="T" artifact="a" {
     pid p=1.0 i=0.5 d=0.1
     taps 1
     taps 2
     taps 3
 }"#;
-    let kdl_bytes = encode_system_params(node_text, &schema, "x").expect("repeated-children encode");
+    let kdl_bytes =
+        encode_system_params(node_text, &schema, "x").expect("repeated-children encode");
     assert_eq!(kdl_bytes, typed_bytes, "repeated-children Vec byte-match");
 
-    // A wrong-typed nested leaf is a named error carrying the nested field name.
+    // A wrong-typed nested leaf errors with the nested field's name.
     let node_text = r#"system "x" type="T" artifact="a" {
     pid p="oops" i=0.5 d=0.1
     taps 1 2 3
@@ -614,10 +657,9 @@ fn kdl_schema_encode_nested_struct_and_vec_byte_equal() {
 }
 
 // ---------------------------------------------------------------------------
-// Sequence occupant: a hand-written `SeqSystem` driven through the `run_seq_*`
-// helpers in-proc (no dlopen, the house pattern). It has no user ports — just the
-// implicit `SlotControlIn` input and the `SequenceStatus` + health/log output tail —
-// and a future that `wait`s ~2 sim-us then returns `Completed`.
+// A hand-written SeqSystem driven through the run_seq_* helpers. It has no
+// user ports, just the implicit SlotControlIn input and the SequenceStatus
+// plus health/log output tail.
 // ---------------------------------------------------------------------------
 
 use std::rc::Rc;
@@ -625,6 +667,8 @@ use std::time::Duration;
 
 use crate::SystemDescriptor;
 
+/// A sequence occupant whose future waits about two sim-microseconds and then
+/// returns `Completed`.
 struct WaitSeq;
 
 impl SeqSystem for WaitSeq {
@@ -634,8 +678,7 @@ impl SeqSystem for WaitSeq {
         // inputs = [SlotControlIn]; outputs = the Out<SeqStatusOut> tail
         // (SequenceStatus, health, log).
         let inputs = vec![<Input<SlotControlIn>>::descriptor()];
-        let outputs =
-            <Out<SeqStatusOut> as SystemOutput>::port_descs();
+        let outputs = <Out<SeqStatusOut> as SystemOutput>::port_descs();
         SystemDescriptor {
             name: "wait_seq",
             kind: SystemKind::Cyclic,
@@ -647,12 +690,12 @@ impl SeqSystem for WaitSeq {
 
     fn build(_params: (), binder: &mut RawBinder, clock: &Rc<SeqClock>) -> SeqBound {
         let control = <Input<SlotControlIn>>::bind(binder);
-        let status =
-            <Out<SeqStatusOut> as BindPorts>::bind(binder);
+        let status = <Out<SeqStatusOut> as BindPorts>::bind(binder);
         let _ = clock;
         let future: std::pin::Pin<Box<dyn std::future::Future<Output = Outcome>>> =
             Box::pin(async {
-                // Deadline = now-at-first-poll + 2us; resolves once `now` reaches it.
+                // The deadline is 2us past `now` at the first poll; `wait`
+                // resolves once `now` reaches it.
                 wait(Duration::from_micros(2)).await;
                 Outcome::Completed
             });
@@ -666,13 +709,14 @@ impl SeqSystem for WaitSeq {
 
 #[test]
 fn seq_abi_runs_to_done() {
-    // Descriptor-order rings: input [control]; outputs [status, health, log].
+    // Rings in descriptor order: input [control]; outputs [status, health,
+    // log].
     let control_ring = ring_for::<SlotControlIn>(8, 1);
     let status_ring = ring_for::<SequenceStatus>(8, 1);
     let health_ring = ring_for::<SystemHealth>(8, 1);
     let log_ring = ring_for::<SystemLog>(8, 1);
 
-    // Host view over the status ring, registered before the occupant writes.
+    // Register the host's view before the occupant writes.
     let mut status_view = Input::<SequenceStatus>::new(status_ring.view(NoWake, NoWake).unwrap());
 
     let inputs = [handle(&control_ring, ROLE_INPUT)];
@@ -682,11 +726,11 @@ fn seq_abi_runs_to_done() {
         handle(&log_ring, ROLE_OUTPUT),
     ];
 
-    // `()` params → empty blob.
-    // SAFETY: null/0 is the documented empty-params case.
+    // `()` params encode to zero bytes.
+    // SAFETY: null params with len 0 is the documented empty-params case.
     let state = unsafe { run_seq_create::<WaitSeq>(std::ptr::null(), 0) };
     assert!(!state.is_null(), "run_seq_create returned state");
-    // SAFETY: live state + valid handle regions that outlive the future.
+    // SAFETY: live state, and the handle regions outlive the future.
     unsafe {
         run_seq_bind_init::<WaitSeq>(
             state,
@@ -697,14 +741,20 @@ fn seq_abi_runs_to_done() {
         )
     };
 
-    // t=0: the future suspends on `wait` → Running.
+    // At t=0 the future suspends on `wait`, so the cycle reports Running.
     // SAFETY: live, bound state.
-    assert_eq!(unsafe { run_seq_execute::<WaitSeq>(state, 0) }, FswStatus::Running);
-    // t=2: deadline elapsed → the future completes → Done.
+    assert_eq!(
+        unsafe { run_seq_execute::<WaitSeq>(state, 0) },
+        FswStatus::Running
+    );
+    // At t=2 the deadline has elapsed and the future completes.
     // SAFETY: live, bound state.
-    assert_eq!(unsafe { run_seq_execute::<WaitSeq>(state, 2) }, FswStatus::Done);
+    assert_eq!(
+        unsafe { run_seq_execute::<WaitSeq>(state, 2) },
+        FswStatus::Done
+    );
 
-    // A terminal `SequenceStatus` (run_state == Completed) was published on the tail.
+    // A terminal SequenceStatus was published on the tail.
     {
         let rec = status_view
             .latest()
@@ -718,12 +768,17 @@ fn seq_abi_runs_to_done() {
         run_seq_shutdown::<WaitSeq>(state);
         run_seq_destroy::<WaitSeq>(state);
     }
-    drop((control_ring, status_ring, health_ring, log_ring, status_view));
+    drop((
+        control_ring,
+        status_ring,
+        health_ring,
+        log_ring,
+        status_view,
+    ));
 }
 
 // ---------------------------------------------------------------------------
-// 3c. The schema-tagged PortDescMsg (C7): both arms postcard round-trip with
-//     their axes; the Postcard arm reconstructs a wire-usable message port.
+// PortDescMsg: both schema arms round-trip through postcard with their axes.
 // ---------------------------------------------------------------------------
 
 #[test]
@@ -733,7 +788,7 @@ fn port_desc_msg_round_trips_both_arms() {
 
     use crate::{Delivery, FanIn, PortDesc, PortId, PortSchema};
 
-    // Postcard arm — with a non-default telemetry flag, so the override rides
+    // Postcard arm, with a non-default telemetry flag so the override rides
     // the wire too.
     let d = PortDesc::msg::<SequenceCommand>().untelemetered();
     let m = PortDescMsg::lower(&d);
@@ -744,14 +799,17 @@ fn port_desc_msg_round_trips_both_arms() {
     assert_eq!(rd.name, "SequenceCommand");
     assert_eq!(rd.max_size, d.max_size);
     assert!(matches!(rd.schema, PortSchema::Postcard));
-    assert!(rd.vtable().is_none(), "no vtable on a Postcard port (checked, S5)");
+    assert!(rd.vtable().is_none(), "no vtable on a Postcard port");
     assert_eq!(rd.delivery, Delivery::Log);
     assert_eq!(rd.fan_in, FanIn::Many);
     assert!(!rd.telemetered, "the opt-out survived the wire");
     // The reconstructed desc satisfies an edge against the static twin.
-    assert!(crate::descriptor::compatible(&rd, &PortDesc::msg::<SequenceCommand>()));
+    assert!(crate::descriptor::compatible(
+        &rd,
+        &PortDesc::msg::<SequenceCommand>()
+    ));
 
-    // Table arm — axes at their frame defaults.
+    // Table arm, axes at their frame defaults.
     let d = PortDesc::of::<TickOut>();
     let m = PortDescMsg::lower(&d);
     let bytes = postcard::to_allocvec(&m).expect("encodes");
@@ -762,7 +820,14 @@ fn port_desc_msg_round_trips_both_arms() {
     assert_eq!(rd.delivery, Delivery::Snapshot);
     assert_eq!(rd.fan_in, FanIn::One);
     assert!(rd.telemetered);
-    // Wiring compatibility runs over the carried unprefixed vtable, unchanged.
-    assert!(crate::descriptor::compatible(&PortDesc::of::<TickOut>(), &rd));
-    assert!(crate::descriptor::compatible(&rd, &PortDesc::of::<TickOut>()));
+    // Compatibility runs over the carried unprefixed vtable in both
+    // directions.
+    assert!(crate::descriptor::compatible(
+        &PortDesc::of::<TickOut>(),
+        &rd
+    ));
+    assert!(crate::descriptor::compatible(
+        &rd,
+        &PortDesc::of::<TickOut>()
+    ));
 }

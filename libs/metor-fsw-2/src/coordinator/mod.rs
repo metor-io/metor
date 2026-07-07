@@ -1,17 +1,60 @@
-//! Work-Package 5 — the coordinator (coordinator.md).
+//! Build-time wiring and the cyclic run loop.
 //!
-//! The coordinator owns the ring regions, wires the system graph at build time,
-//! drives cyclic systems once per cycle, spawns async systems, folds in the async
-//! copy-in step, and provisions per-system health. It is built in two phases: a
-//! [`CoordinatorBuilder`] registers systems and edges and `build()`s a ready
-//! [`Coordinator`] (validating, sizing, allocating rings, binding ports); then
-//! [`Coordinator::run_for`] drives the run phase on `stellarator`.
+//! A [`CoordinatorBuilder`] collects systems and the edges between their ports.
+//! Its `build()` validates the graph, sizes and allocates one ring per output
+//! port, and binds every port over those rings, producing a ready
+//! [`Coordinator`]. [`Coordinator::run_for`] then drives the lifecycle: spawn
+//! the async systems, init everything behind a barrier, step the cyclic
+//! systems once per cycle, and tear it all down.
 //!
-//! Almost everything below the builder is reuse (the ring, the typed ports, the
-//! descriptors, the health port, the grown [`CyclicRunner`](crate::CyclicRunner)).
-//! The genuinely new surface is the builder + validation/sizing pass, the
-//! `bind`/[`Binder`] contract (see `binder.rs`), the lapped → hard-stop slot, the
-//! copy-in jobs, and the lifecycle driver.
+//! # Execution order
+//!
+//! Cyclic systems step in registration order, once per cycle. A snapshot edge
+//! only observes the current cycle's value when it points forward in that
+//! order, so `build()` rejects a backward snapshot edge between cyclic systems
+//! ([`WireError::StaleFrameEdge`]) and any feedback loop not broken by an
+//! explicit [`connect_delayed`](CoordinatorBuilder::connect_delayed) edge
+//! ([`WireError::FeedbackCycle`]). One-cycle-late sampling is therefore always
+//! a declared decision, never an accident of registration order. Log edges
+//! carry decoupled event/command streams with no same-cycle dependency and are
+//! exempt from both rules, as are edges touching an async endpoint.
+//!
+//! # Port connections
+//!
+//! An input's [`PortConn`] says who feeds it. An `Edge` input is wired by
+//! [`connect`](CoordinatorBuilder::connect). A `Host` input's counterpart is
+//! held by the system's runner over a dedicated ring (a slot's cancel frame,
+//! for example). A `SelfTap` input is a read view over one of the system's own
+//! outputs. Edges into `Host` or `SelfTap` inputs are rejected; `Host`
+//! *outputs* still accept consumer edges (the coordinator's own command
+//! channel is one).
+//!
+//! # Async systems and copy-ins
+//!
+//! An async system runs on its own task, off the cycle clock, so it cannot be
+//! step-gated. Each of its edge-connected snapshot inputs is decoupled through
+//! a private ring: after the cyclic step loop, the coordinator mirrors the
+//! newest upstream record into the private ring, whose data notifier wakes the
+//! task's parked `recv`. Log inputs need no copy-in; they read the producers'
+//! rings directly and are poll-drained.
+//!
+//! # Reader budgets
+//!
+//! Every ring's `max_readers` is fixed at build time. The budget is the
+//! counted edge fan-out plus declared self-taps, one slot per receive-all
+//! capability in the graph, and [`CoordinatorConfig::reader_slack`] spare
+//! slots for taps claimed through the [`Registry`] after build. Exhausting the
+//! budget surfaces as an error at the claim site, not a panic.
+//!
+//! # The coordinator's own bundle
+//!
+//! The coordinator registers itself as system #0 under the reserved instance
+//! name `"coordinator"`, declaring its own channels (health, log, status, the
+//! boot sequence registry, the operator command channel) as an ordinary
+//! descriptor. They are validated, sized, allocated, and registered by the
+//! same passes as every other system's; the bind pass wraps the allocated
+//! rings into the coordinator's fields instead of a cyclic slot, because the
+//! coordinator is the loop rather than a member of it.
 
 use core::mem::offset_of;
 use std::collections::HashMap;
@@ -22,9 +65,7 @@ use std::sync::atomic::{
 };
 use std::time::{Duration, Instant};
 
-use metor_fsw_ring::{
-    Config, NoWake, Notifier, RingBuffer, View, WakeSource, Writer,
-};
+use metor_fsw_ring::{Config, NoWake, Notifier, RingBuffer, View, WakeSource, Writer};
 use metor_proto::types::{ComponentId, Msg, Timestamp};
 use metor_proto_wkt::{
     SequenceChannelEvent, SequenceChannelSpec, SequenceCommand, SequenceRegistry,
@@ -36,8 +77,7 @@ use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
 use crate::binder::{BindPorts, Binder, BoundInput, BoundPort};
 use crate::descriptor::compatible;
 use crate::descriptor::{
-    Delivery, FanIn, Hz, PortConn, PortDesc, PortId, PortSchema, SystemDescriptor,
-    SystemKind,
+    Delivery, FanIn, Hz, PortConn, PortDesc, PortId, PortSchema, SystemDescriptor, SystemKind,
 };
 use crate::dynamic::FrameList;
 use crate::health::{HealthPort, Level, SystemHealth, SystemLog};
@@ -52,11 +92,10 @@ mod slot;
 pub use slot::{AllowedOccupant, InitialOccupant, SLOT_NAME_CAP, SlotStatus};
 use slot::{SlotReg, SlotRunner, slot_writer};
 
-/// The default [`CoordinatorConfig::reader_slack`] (E8b: the knob is on the config;
-/// this is only its default value).
+/// The default [`CoordinatorConfig::reader_slack`].
 const READER_SLACK: usize = 4;
 
-/// Bounded window a teardown gives async tasks to exit cooperatively before their
+/// How long a teardown gives async tasks to exit cooperatively before their
 /// `drop_guard` cancels them.
 const JOIN_TIMEOUT: Duration = Duration::from_millis(20);
 
@@ -64,37 +103,37 @@ const JOIN_TIMEOUT: Duration = Duration::from_millis(20);
 // Public configuration / addressing / errors
 // ---------------------------------------------------------------------------
 
-/// Which clock drives the per-cycle timestamp (and whether the loop paces itself).
+/// Which clock drives the per-cycle timestamp, and whether the loop paces itself.
 #[derive(Clone, Copy, Debug, Default)]
 pub enum ClockMode {
-    /// Wall-clock time: each cycle's `now` is `Timestamp::now()`, and the loop
-    /// sleeps to hold `cycle_rate` (run-fast-then-wait). The default.
+    /// Wall-clock time. Each cycle's `now` is `Timestamp::now()`, and the loop
+    /// sleeps out the remainder of each cycle to hold `cycle_rate`. The default.
     #[default]
     Wall,
-    /// A simulated clock: each cycle's `now` advances by `dt` from a start epoch and
-    /// the loop does **not** sleep — it runs cycles as fast as possible. `dt` is the
-    /// logical step (e.g. a physics integrator's), so a mission converges in fixed
-    /// sim time regardless of how fast the host runs it (coordinator.md §6).
+    /// A simulated clock. Each cycle's `now` advances by `dt` from a start epoch
+    /// and the loop never sleeps, so cycles run as fast as the host allows. `dt`
+    /// is the logical step, which keeps a mission converging in fixed simulated
+    /// time no matter how fast it actually runs.
     Simulated { dt: Duration },
 }
 
-/// Coordinator-wide configuration (coordinator.md §1.1).
+/// Coordinator-wide configuration.
 #[derive(Clone, Copy, Debug)]
 pub struct CoordinatorConfig {
-    /// The single global cycle rate the loop holds (run-fast-then-wait) under a
-    /// [`Wall`](ClockMode::Wall) clock. Every cyclic system runs every cycle; there
-    /// is no per-system rate division (v1). Ignored under a `Simulated` clock.
+    /// The single global cycle rate the loop holds under a
+    /// [`Wall`](ClockMode::Wall) clock. Every cyclic system runs every cycle;
+    /// there is no per-system rate division. Ignored under a `Simulated` clock.
     pub cycle_rate: Hz,
     /// In-flight record depth for a buffer whose `PortDesc` carries no rate hint.
     pub default_depth: usize,
     /// The clock driving the per-cycle `now` and loop pacing (default `Wall`).
     pub clock: ClockMode,
-    /// Slack reader slots added on top of every buffer's computed fan-out (E8b),
-    /// covering late taps claimed through the [`Registry`](crate::Registry) after
-    /// `build()` — a db recorder, a debugger. v1 has no crash-slot reclamation, so
-    /// each buffer's `max_readers` is fixed at build time (coordinator.md §2.3, Q7);
-    /// exhausting the budget surfaces as a [`FullReaderTable`](metor_fsw_ring::FullReaderTable)
-    /// error at the claim site (`RegistryEntry::view`), naming no panic. Default `4`.
+    /// Spare reader slots added on top of every buffer's counted fan-out, for
+    /// taps claimed through the [`Registry`](crate::Registry) after `build()`
+    /// (a recorder, a debugger). Each buffer's `max_readers` is fixed at build
+    /// time; exhausting the budget is a
+    /// [`FullReaderTable`](metor_fsw_ring::FullReaderTable) error at the claim
+    /// site. Default `4`.
     pub reader_slack: usize,
 }
 
@@ -109,15 +148,15 @@ impl Default for CoordinatorConfig {
     }
 }
 
-/// A handle to a registered system, returned by `add_cyclic`/`add_async` and used
-/// to address its ports in [`PortRef`].
+/// A handle to a registered system, returned by `add_cyclic`/`add_async` and
+/// used to address its ports in [`PortRef`].
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct SystemHandle {
     id: usize,
 }
 
-/// Addresses one port as `(system, port)` — both come straight off the already-derived
-/// `SystemDescriptor`, so the wiring loader can resolve a KDL edge to a `connect`.
+/// Addresses one port as a `(system, port)` pair, both taken from the system's
+/// derived `SystemDescriptor`.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct PortRef {
     pub system: SystemHandle,
@@ -133,7 +172,7 @@ impl PortRef {
         }
     }
 
-    /// Address the port carrying message `M` on `system` (`docs/message-wiring.md` §3).
+    /// Address the port carrying message `M` on `system`.
     pub fn msg<M: Msg>(system: SystemHandle) -> Self {
         Self {
             system,
@@ -142,123 +181,107 @@ impl PortRef {
     }
 }
 
-/// A wiring error caught at build time, before any byte flows (coordinator.md §2.2).
+/// A wiring error caught at build time, before any byte flows.
 ///
-/// Not `Eq`: [`InvalidCycleRate`](WireError::InvalidCycleRate) carries the offending
-/// `f64` rate so the message can name it.
+/// Not `Eq`: [`InvalidCycleRate`](WireError::InvalidCycleRate) carries the
+/// offending `f64` rate so the message can name it.
 #[derive(Clone, Debug, PartialEq)]
 pub enum WireError {
     /// A `PortRef` named a system index that was never registered.
     UnknownSystem { id: usize },
     /// A system has no port carrying the named frame or message.
-    UnknownPort {
-        system: usize,
-        port: PortId,
-    },
+    UnknownPort { system: usize, port: PortId },
     /// `connect` named a producer and consumer port that do not share a port id.
-    PortIdMismatch {
-        producer: PortId,
-        consumer: PortId,
-    },
-    /// The producer's record shape does not satisfy the consumer's required shape
-    /// (the Table subset rule / Postcard id equality / delivery agreement).
+    PortIdMismatch { producer: PortId, consumer: PortId },
+    /// The producer's record shape does not satisfy the consumer's required
+    /// shape (the table subset rule, postcard id equality, delivery agreement).
     Incompatible {
         producer: &'static str,
         consumer: &'static str,
         port: PortId,
     },
-    /// A [`FanIn::One`](crate::FanIn) input port was never connected (nothing would
-    /// ever write it). [`FanIn::Many`](crate::FanIn) inputs may be unconnected (zero
-    /// producers is legal, `docs/message-wiring.md` §3.2).
-    UnconnectedInput {
-        system: &'static str,
-        port: PortId,
-    },
-    /// Two producers were connected into one [`FanIn::One`](crate::FanIn) input port.
-    /// [`FanIn::Many`](crate::FanIn) inputs allow fan-in, so this never fires for
-    /// them — but an *exact duplicate* of one edge is a
+    /// A [`FanIn::One`](crate::FanIn) input port was never connected, so nothing
+    /// would ever write it. [`FanIn::Many`](crate::FanIn) inputs may be left
+    /// unconnected; zero producers is legal there.
+    UnconnectedInput { system: &'static str, port: PortId },
+    /// Two producers were connected into one [`FanIn::One`](crate::FanIn) input
+    /// port. [`FanIn::Many`](crate::FanIn) inputs allow fan-in, so this never
+    /// fires for them, though an exact duplicate of one edge is still a
     /// [`DuplicateEdge`](Self::DuplicateEdge).
-    DoubleConnect {
-        system: &'static str,
-        port: PortId,
-    },
-    /// The exact same fan-in edge — one `(producer, consumer, port)` triple — was
-    /// connected twice. Fan-in of *distinct* producers is legal (`docs/message-wiring.md`
-    /// §3.2); a copy-pasted duplicate edge would deliver every record to the consumer
-    /// twice (a double-applied command), so it is rejected.
+    DoubleConnect { system: &'static str, port: PortId },
+    /// The exact same fan-in edge, one `(producer, consumer, port)` triple, was
+    /// connected twice. Fan-in of distinct producers is legal; a copy-pasted
+    /// duplicate edge would deliver every record to the consumer twice (a
+    /// double-applied command), so it is rejected.
     DuplicateEdge {
         producer: &'static str,
         consumer: &'static str,
         port: PortId,
     },
-    /// `connect_delayed` (or KDL `delayed=#true`) on an edge into a
-    /// [`Delivery::Log`](crate::Delivery) input (A7). `delayed` marks a one-cycle-late
-    /// *snapshot* sample; a log is a decoupled event/command stream with no same-cycle
-    /// dependency, so the delay is meaningless — rejected instead of silently ignored.
+    /// `connect_delayed` on an edge into a [`Delivery::Log`](crate::Delivery)
+    /// input. `delayed` marks a one-cycle-late snapshot sample; a log is a
+    /// decoupled event/command stream with no same-cycle dependency, so the
+    /// delay is meaningless and rejected instead of silently ignored.
     DelayedLogEdge {
         producer: &'static str,
         consumer: &'static str,
         port: PortId,
     },
     /// An input declared [`FanIn::Many`](crate::FanIn) with
-    /// [`Delivery::Snapshot`](crate::Delivery): latest-wins across several producers
-    /// is ill-defined without cross-ring ordering, so the combination is rejected.
-    SnapshotFanIn {
-        system: &'static str,
-        port: PortId,
-    },
-    /// An edge targets a **host-connected** input (`PortConn::Host`/`SelfTap`, A3):
-    /// its counterpart is held by the system's runner (the slot runner's cancel
-    /// writer, a self-tap view over the system's own output), never an edge — a slot
+    /// [`Delivery::Snapshot`](crate::Delivery). Latest-wins across several
+    /// producers is ill-defined without cross-ring ordering, so the combination
+    /// is rejected.
+    SnapshotFanIn { system: &'static str, port: PortId },
+    /// An edge targets a host-connected input (`PortConn::Host`/`SelfTap`).
+    /// Its counterpart is held by the system's runner, never an edge; a slot
     /// occupant's `slot_control` is written by `Abort`, not by another system.
-    HostPort {
-        system: &'static str,
-        port: PortId,
-    },
-    /// A non-delayed **Snapshot** edge points *backward* in registration order between
-    /// two cyclic systems: the cyclic step loop runs in registration order, so the
-    /// consumer would execute before its producer every cycle and permanently read the
-    /// previous cycle's value — the exact staleness
+    HostPort { system: &'static str, port: PortId },
+    /// A non-delayed snapshot edge points backward in registration order
+    /// between two cyclic systems. The step loop runs in registration order,
+    /// so the consumer would execute before its producer every cycle and
+    /// permanently read the previous cycle's value, exactly the staleness
     /// [`connect_delayed`](CoordinatorBuilder::connect_delayed) exists to make
-    /// explicit. Fix by registering the producer before the consumer, or declare the
-    /// one-cycle delay with `connect_delayed`. Log edges are exempt (a decoupled
-    /// stream, not a same-cycle dependency), as are edges touching an async endpoint
-    /// (async systems run off the copy-in step / their own task, not the
-    /// registration-ordered step loop).
+    /// explicit. Fix by registering the producer before the consumer, or
+    /// declare the one-cycle delay with `connect_delayed`. Log edges are
+    /// exempt, as are edges touching an async endpoint (async systems run off
+    /// the copy-in step or their own task, not the registration-ordered loop).
     StaleFrameEdge {
         producer: &'static str,
         consumer: &'static str,
         port: PortId,
     },
-    /// The configured `cycle_rate` cannot pace a [`Wall`](ClockMode::Wall) clock: it must
-    /// be finite and positive to become a per-cycle `Duration` budget (a 0/negative/NaN/
-    /// infinite rate would panic in `Duration::from_secs_f64` at run time). A
+    /// The configured `cycle_rate` cannot pace a [`Wall`](ClockMode::Wall)
+    /// clock. It must be finite and positive to become a per-cycle `Duration`
+    /// budget; a zero, negative, NaN, or infinite rate would panic in
+    /// `Duration::from_secs_f64` at run time. A
     /// [`Simulated`](ClockMode::Simulated) clock ignores the rate, so it is not
     /// validated there.
     InvalidCycleRate { rate: Hz },
-    /// A feedback loop was left unbroken: a cycle remains in the graph once the
-    /// intentional one-cycle-delayed edges (`connect_delayed`) are removed. Every
-    /// feedback loop must break exactly one of its edges with `connect_delayed`, so
+    /// A feedback loop was left unbroken. A cycle remains in the graph once
+    /// the intentional one-cycle-delayed edges (`connect_delayed`) are removed;
+    /// every feedback loop must break exactly one of its edges that way, so
     /// that the one-cycle-late sampling is explicit rather than an artifact of
     /// registration order. `systems` names the cycle members in loop order.
     FeedbackCycle { systems: Vec<&'static str> },
     /// Two registered buffers computed the same instance-qualified registry key
-    /// `"<instance>.<name>"` — one keyspace over frames and channels makes the
-    /// collision detectable instead of silently shadowing one entry (A1/C3).
+    /// `"<instance>.<name>"`. Frames and channels share one keyspace, so the
+    /// collision is detectable instead of silently shadowing one entry.
     DuplicateRegistryKey { key: String },
-    /// A slot instance name exceeds [`NAME_CAP`] bytes. Slot names are the sequence
-    /// channels' **wire address** (`SequenceCommand::channel`) *and* must round-trip
-    /// losslessly into the fixed-size frames that carry them (`SlotStatus::occupant`,
-    /// the coordinator status entries) — a longer name would telemeter truncated while
-    /// addressing untruncated, so it is rejected at build instead of silently truncated.
+    /// A slot instance name exceeds [`NAME_CAP`] bytes. Slot names are the
+    /// sequence channels' wire address (`SequenceCommand::channel`) and must
+    /// also round-trip losslessly into the fixed-size frames that carry them
+    /// (`SlotStatus::occupant`, the coordinator status entries). A longer name
+    /// would telemeter truncated while addressing untruncated, so it is
+    /// rejected at build instead of silently truncated.
     SlotNameTooLong { name: String, len: usize },
-    /// A cyclic system **without** a receive-all port was registered after one **with**
-    /// it (the telemetry downlink). The downlink's end-of-cycle snapshot only observes
-    /// systems that step *before* it, so a later registration would telemeter one cycle
-    /// stale — enforced, not silently reordered (reordering would change the step order
-    /// the stale-edge diagnostics validate). Fix: register `system` before the
-    /// receive-all system. Async systems are exempt (they are not in the step order).
-    /// Both fields are **instance** names.
+    /// A cyclic system without a receive-all port was registered after one
+    /// with it (the telemetry downlink). The downlink's end-of-cycle snapshot
+    /// only observes systems that step before it, so a later registration
+    /// would telemeter one cycle stale. Enforced rather than silently
+    /// reordered, because reordering would change the step order the
+    /// stale-edge diagnostics validate. Fix by registering `system` before the
+    /// receive-all system. Async systems are exempt (they are not in the step
+    /// order). Both fields are instance names.
     ReceiveAllNotLast { system: String, receive_all: String },
 }
 
@@ -364,55 +387,56 @@ impl std::fmt::Display for WireError {
 impl std::error::Error for WireError {}
 
 // ---------------------------------------------------------------------------
-// Slot state (the permanent hard-stop, coordinator.md §3.3/§3.4)
+// Slot state
 // ---------------------------------------------------------------------------
 
 /// Why a cyclic slot hard-stopped.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum StopReason {
-    /// A dlopen'd system panicked inside the `.so` (the boundary caught it and
-    /// returned [`FswStatus::Panicked`](crate::abi::FswStatus)).
-    /// Only reachable for a [`DlSlot`](crate::dl); a static `CyclicRunner` cannot
-    /// produce it (a panic there unwinds the host directly).
+    /// A dlopen'd system panicked inside the `.so`; the boundary caught it and
+    /// returned [`FswStatus::Panicked`](crate::abi::FswStatus). Only reachable
+    /// for a [`DlSlot`](crate::dl); a static `CyclicRunner` cannot produce it
+    /// (a panic there unwinds the host directly).
     Panicked,
 }
 
 impl StopReason {
     fn code(self) -> u8 {
         match self {
-            // `1` was `LappedInput`, retired with the ring's overwrite mode.
+            // Code `1` belonged to a retired reason; codes stay stable on the wire.
             StopReason::Panicked => 2,
         }
     }
 }
 
-/// A cyclic slot's lifecycle state — the **one** lifecycle enum every slot kind shares.
-/// A static [`CyclicRunner`](crate::CyclicRunner) and a build-time
-/// [`DlSlot`](crate::dl::DlSlot) only ever inhabit `Running`/`Stopped` (once `Stopped`
-/// they are never cleared in v1); the runtime [`SlotRunner`](slot) uses all five, and a
-/// runtime slot recovers from a terminal state via `Load`/`Reset`.
+/// A cyclic slot's lifecycle state, shared by every slot kind. A static
+/// [`CyclicRunner`](crate::CyclicRunner) and a build-time
+/// [`DlSlot`](crate::dl::DlSlot) only ever inhabit `Running`/`Stopped` (once
+/// `Stopped` they are never cleared); the runtime [`SlotRunner`](slot) uses all
+/// five and recovers from a terminal state via `Load`/`Reset`.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum SlotState {
     /// No occupant; `step` is a cheap no-op. (Runtime slots only.)
     Empty,
-    /// An occupant is created and bound (its future built) but not yet polling. After a
-    /// hard-drop `Stop` the state returns to `Loaded` with no live future. (Runtime
-    /// slots only.)
+    /// An occupant is created and bound (its future built) but not yet polling.
+    /// After a hard-drop `Stop` the state returns to `Loaded` with no live
+    /// future. (Runtime slots only.)
     Loaded,
     /// The slot is polled every cycle.
     Running,
-    /// The occupant's future returned `Ready` — terminal **success**, not an error-stop.
-    /// The `Completed`/`Aborted`/`Failed` detail rides the occupant's own
-    /// [`SequenceStatus`](crate::sequence::SequenceStatus) frame; `outcome` is its
-    /// latched `run_state` byte. (Runtime slots only.)
+    /// The occupant's future returned `Ready`. Terminal success, not an
+    /// error-stop; the `Completed`/`Aborted`/`Failed` detail rides the
+    /// occupant's own [`SequenceStatus`](crate::sequence::SequenceStatus)
+    /// frame, and `outcome` is its latched `run_state` byte. (Runtime slots
+    /// only.)
     Done { outcome: u8 },
-    /// Hard-stopped: an input was lapped or the `.so` panicked.
+    /// Hard-stopped; `reason` says why.
     Stopped { reason: StopReason },
 }
 
 impl SlotState {
     /// The projection the coordinator's stopped-systems status uses: only a
-    /// lapped/panicked stop is an error-stop (`Done`/`Empty`/`Loaded` are not).
+    /// hard stop is an error-stop (`Done`/`Empty`/`Loaded` are not).
     pub fn stop_reason(&self) -> Option<StopReason> {
         match self {
             SlotState::Stopped { reason } => Some(*reason),
@@ -445,8 +469,8 @@ pub struct StoppedSystem {
     pub reason: StopReason,
 }
 
-/// The grown per-system slot trait object the coordinator drives (coordinator.md
-/// §3.4); implemented for [`CyclicRunner`](crate::CyclicRunner) in `system.rs`.
+/// The per-system slot trait object the coordinator drives; implemented for
+/// [`CyclicRunner`](crate::CyclicRunner) in `system.rs`.
 pub(crate) trait CyclicSlot {
     fn init(&mut self);
     fn step(&mut self, now: Timestamp);
@@ -456,13 +480,13 @@ pub(crate) trait CyclicSlot {
 }
 
 // ---------------------------------------------------------------------------
-// Coordinator status frame (coordinator.md §3.3/§5.3)
+// Coordinator status frame
 // ---------------------------------------------------------------------------
 
-/// The one shared byte cap on every name packed into a fixed-size host frame (a stopped
-/// system in [`CoordinatorStatus`], the occupant in [`SlotStatus`]) — and the validated
-/// cap on slot instance names, which double as the sequence channels' **wire address**
-/// (`SequenceCommand::channel`). Matches
+/// The one shared byte cap on every name packed into a fixed-size host frame
+/// (a stopped system in [`CoordinatorStatus`], the occupant in [`SlotStatus`])
+/// and the validated cap on slot instance names, which double as the sequence
+/// channels' wire address (`SequenceCommand::channel`). Matches
 /// [`SEQUENCE_CHANNEL_NAME_CAP`](metor_proto_wkt::SEQUENCE_CHANNEL_NAME_CAP).
 pub const NAME_CAP: usize = 48;
 
@@ -472,16 +496,15 @@ const _: () = assert!(NAME_CAP == metor_proto_wkt::SEQUENCE_CHANNEL_NAME_CAP);
 /// Capacity of one stopped-system name in the status frame (longer truncated).
 pub const STATUS_NAME_CAP: usize = NAME_CAP;
 
-/// Pack a name into a fixed [`NAME_CAP`] buffer + used length (truncating) — the
-/// [`NAME_CAP`]-sized instantiation of the crate's one [`pack_str`] helper.
+/// Pack a name into a fixed [`NAME_CAP`] buffer plus used length, truncating.
 pub(crate) fn pack_name(name: &str) -> ([u8; NAME_CAP], u8) {
     crate::dynamic::pack_str::<NAME_CAP>(name)
 }
 /// Max stopped systems named in one status record.
 pub const MAX_STOPPED: usize = 32;
 
-/// One stopped-system entry in [`CoordinatorStatus`]: a reason code, a used name
-/// length, and a fixed-size name buffer.
+/// One stopped-system entry in [`CoordinatorStatus`]: a reason code, a used
+/// name length, and a fixed-size name buffer.
 #[derive(crate::AsVTable, IntoBytes, Immutable, KnownLayout, FromBytes, Clone, Copy)]
 #[repr(C)]
 struct StoppedEntry {
@@ -491,8 +514,8 @@ struct StoppedEntry {
     name: [u8; STATUS_NAME_CAP],
 }
 
-/// The coordinator's own status frame (NAME = `"coordinator"`): which cyclic
-/// systems have hard-stopped and why, in addition to each system's own health.
+/// The coordinator's own status frame: which cyclic systems have hard-stopped
+/// and why, in addition to each system's own health.
 #[derive(crate::Frame, IntoBytes, Immutable, KnownLayout, FromBytes)]
 #[repr(C)]
 #[metor_fsw(name = "coordinator_status")]
@@ -505,39 +528,39 @@ struct CoordinatorStatus {
 }
 
 // ---------------------------------------------------------------------------
-// Ring registry (coordinator.md §1.2)
+// Ring registry
 // ---------------------------------------------------------------------------
 
-/// What a buffer carries — for diagnostics and to make ownership explicit. The
-/// variant payloads are debug-only (rendered via `Debug`, read by nothing) — the
-/// `allow` covers exactly them; the variants themselves are matched
+/// What a buffer carries, for diagnostics and to make ownership explicit. The
+/// variant payloads are debug-only (rendered via `Debug`, read by nothing),
+/// which is what the `allow` covers; the variants themselves are matched
 /// (`output_instances`).
 #[allow(dead_code)]
 #[derive(Clone, Copy, Debug)]
 enum BufferRole {
-    /// A system's declared output buffer (the coordinator's own #0 outputs
-    /// included — A9 removed the special `Coordinator` role).
+    /// A system's declared output buffer, the coordinator's own #0 outputs
+    /// included.
     Output { system: usize, port: usize },
-    /// A dedicated input-side ring: an async copy-in buffer, or a Host-connected
-    /// input's ring (A3).
+    /// A dedicated input-side ring: an async copy-in buffer, or a
+    /// host-connected input's ring.
     Private { system: usize, input: usize },
 }
 
-/// One owned ring plus its identity. `ring` is the canonical handle whose sole job
-/// is to outlive every port over it (the ports hold their own `Arc` clones).
+/// One owned ring plus its identity. `ring` is the canonical handle whose sole
+/// job is to outlive every port over it (the ports hold their own `Arc` clones).
 struct RingEntry {
-    /// Held for ownership only (the ports clone their own `Arc`s) — never read.
+    /// Held for ownership only (the ports clone their own `Arc`s), never read.
     #[allow(dead_code)]
     ring: RingBuffer,
     frame_id: ComponentId,
     role: BufferRole,
-    /// The KDL/builder instance name of the system owning this buffer (the
-    /// telemetry-sink prefix, wiring.md §6). `None` for coordinator-owned buffers.
+    /// The instance name of the system owning this buffer, which prefixes its
+    /// telemetry key. `None` for coordinator-owned buffers.
     instance: Option<String>,
 }
 
-/// Owns every `RingBuffer`. Holding the canonical handle here keeps a
-/// buffer alive longer than any port over it, regardless of teardown order.
+/// Owns every `RingBuffer`. Holding the canonical handle here keeps a buffer
+/// alive longer than any port over it, regardless of teardown order.
 struct RingTable {
     rings: Vec<RingEntry>,
 }
@@ -546,26 +569,27 @@ struct RingTable {
 // Async plumbing
 // ---------------------------------------------------------------------------
 
-/// A private-buffer copy-in job (coordinator.md §4.2/§4.3): mirrors the **newest**
-/// upstream record (Snapshot semantics — the copy-in exists only for Snapshot
-/// inputs) into the async system's private buffer, at most once per new upstream
-/// commit. The record is borrowed in place off the upstream ring and written
-/// through; no intermediate buffer.
+/// A private-buffer copy-in job: mirrors the newest upstream record (snapshot
+/// semantics; the copy-in exists only for snapshot inputs) into the async
+/// system's private buffer, at most once per new upstream commit. The record
+/// is borrowed in place off the upstream ring and written through, with no
+/// intermediate buffer.
 struct CopyIn {
     upstream: View<NoWake, NoWake>,
-    /// The private ring's sole writer: the matched data `Notifier` wakes the parked
-    /// async `recv`; the space side is `NoWake` — a full private ring (the consumer
-    /// is behind) drops this cycle's mirror rather than suspending the cycle loop.
+    /// The private ring's sole writer. The matched data `Notifier` wakes the
+    /// parked async `recv`; the space side is `NoWake` because a full private
+    /// ring (the consumer is behind) drops this cycle's mirror rather than
+    /// suspending the cycle loop.
     writer: Writer<Notifier, NoWake>,
-    /// The upstream ring's `committed` at the last mirror, so an unchanged upstream
-    /// (no new record) is skipped instead of re-waking the consumer with the same
-    /// pinned record every cycle. `u64::MAX` = nothing mirrored yet.
+    /// The upstream ring's `committed` at the last mirror, so an unchanged
+    /// upstream is skipped instead of re-waking the consumer with the same
+    /// pinned record every cycle. `u64::MAX` means nothing mirrored yet.
     last_committed: u64,
 }
 
-/// Per-task signals the coordinator hands a spawned async system: a stop flag, an
-/// init-readiness barrier, and a go-gate that holds the first `run` pass until
-/// every system's `init` has completed (coordinator.md init-barrier decision).
+/// Per-task signals the coordinator hands a spawned async system: a stop flag,
+/// an init-readiness barrier, and a go-gate that holds the first `run` pass
+/// until every system's `init` has completed.
 struct LaunchCtx {
     stop: Arc<AtomicBool>,
     ready: Arc<WaitQueue>,
@@ -574,14 +598,14 @@ struct LaunchCtx {
     go_flag: Arc<AtomicBool>,
 }
 
-/// A bound async system ready to be spawned once. Erased so the coordinator can
-/// hold a heterogeneous set.
+/// A bound async system ready to be spawned once. Erased so the coordinator
+/// can hold a heterogeneous set.
 trait AsyncLauncher {
     fn launch(self: Box<Self>, ctx: LaunchCtx) -> JoinHandle<()>;
 }
 
-/// A bound async system: its `run` future borrows all three for the loop, so they
-/// move into the spawned task (coordinator.md §4.1).
+/// A bound async system. Its `run` future borrows all three for the loop, so
+/// they move into the spawned task together.
 struct AsyncSlot<S: AsyncSystem> {
     system: S,
     input: S::Input,
@@ -614,9 +638,9 @@ where
     }
 }
 
-/// A spawned async task plus the handles the coordinator drives its lifecycle with.
-/// The `drop_guard` cancels the task if it does not exit cooperatively (and when a
-/// `Coordinator` is dropped mid-run).
+/// A spawned async task plus the handles the coordinator drives its lifecycle
+/// with. The `drop_guard` cancels the task if it does not exit cooperatively
+/// (and when a `Coordinator` is dropped mid-run).
 struct AsyncTask {
     /// Held for its `Drop`: cancels the task on teardown (or coordinator drop).
     #[allow(dead_code)]
@@ -685,11 +709,11 @@ where
     }
 }
 
-/// A registered dlopen'd cyclic system: the loaded handle plus its postcard `Params`
-/// blob. At `build()` it is turned into a [`DlSlot`](crate::dl) instead of a typed
-/// [`CyclicRunner`]; everything before that (descriptor push, edge validation, ring
-/// sizing/allocation, registry entry) is the same as the static-system path.
-/// Available without `kdl`.
+/// A registered dlopen'd cyclic system: the loaded handle plus its postcard
+/// `Params` blob. At `build()` it becomes a [`DlSlot`](crate::dl) instead of a
+/// typed [`CyclicRunner`]; everything before that (descriptor push, edge
+/// validation, ring sizing/allocation, registry entry) is the same as the
+/// static-system path.
 struct DlReg {
     system: crate::dl::DlSystem,
     params: Vec<u8>,
@@ -702,12 +726,12 @@ enum Reg {
     Dl(DlReg),
     /// A runtime-swappable slot, bound to a [`SlotRunner`](slot::SlotRunner) at `build()`.
     Slot(SlotReg),
-    /// The coordinator itself, registered as system #0 under the reserved instance
-    /// name `"coordinator"` (`docs/design-command-slots.md` §2.6). A **marker**
-    /// registration: its declared outputs are allocated/registered by the uniform
-    /// passes like any system's, but it is never pushed into `cyclic` (the
-    /// coordinator *is* the loop) — the bind arm wraps the allocated rings into the
-    /// coordinator's own fields instead.
+    /// The coordinator itself, registered as system #0 under the reserved
+    /// instance name `"coordinator"`. A marker registration: its declared
+    /// outputs are allocated and registered by the uniform passes like any
+    /// system's, but it is never pushed into `cyclic` (the coordinator is the
+    /// loop); the bind arm wraps the allocated rings into the coordinator's own
+    /// fields instead.
     Coordinator,
 }
 
@@ -715,24 +739,23 @@ enum Reg {
 // Builder
 // ---------------------------------------------------------------------------
 
-/// One registered system: its type-erased registration, its **registered**
-/// descriptor (what `build()` validates, sizes, and wires), and its instance name
-/// (defaults to `System::NAME`; the wiring loader supplies a distinct KDL instance
-/// name — wiring.md §6). One `Vec<Registration>` replaces the former four parallel
-/// vectors (C5) — in particular the `kinds` vec, which always equaled `desc.kind`.
+/// One registered system: its type-erased registration, its registered
+/// descriptor (what `build()` validates, sizes, and wires), and its instance
+/// name (defaults to `System::NAME`; a wiring file supplies a distinct name
+/// per instance).
 struct Registration {
     reg: Reg,
     desc: SystemDescriptor,
     name: String,
 }
 
-/// Registers systems and edges, then `build`s a ready [`Coordinator`]. This is the
-/// surface the wiring loader targets (coordinator.md §2.1).
+/// Registers systems and edges, then `build`s a ready [`Coordinator`].
 pub struct CoordinatorBuilder {
     config: CoordinatorConfig,
     systems: Vec<Registration>,
-    /// Each registered edge `(producer, consumer, delayed)`. A `delayed` edge is an
-    /// intentional one-cycle-delayed feedback edge, excluded from cycle detection.
+    /// Each registered edge `(producer, consumer, delayed)`. A `delayed` edge
+    /// is an intentional one-cycle-delayed feedback edge, excluded from cycle
+    /// detection.
     edges: Vec<(PortRef, PortRef, bool)>,
 }
 
@@ -743,23 +766,22 @@ impl CoordinatorBuilder {
             systems: Vec::new(),
             edges: Vec::new(),
         };
-        // The coordinator registers itself as system #0 under the reserved instance
-        // name `"coordinator"` (`docs/design-command-slots.md` §2.6): an ordinary
-        // declared bundle, so its channels are wired/sized/registered by the same
-        // passes as every system's — no hand-rolled allocation blocks. Every output
-        // is Host-connected (the coordinator itself holds the writers; a Host OUTPUT
-        // still accepts consumer edges); the registry keys are byte-identical to the
-        // historical hand-rolled ones (`coordinator.health` / `.log` /
-        // `.coordinator_status` / `.sequences` / `.commands`).
+        // The coordinator registers itself as system #0 under the reserved
+        // instance name `"coordinator"`: an ordinary declared bundle, so its
+        // channels are wired, sized, and registered by the same passes as
+        // every system's. Every output is host-connected (the coordinator
+        // itself holds the writers; a Host OUTPUT still accepts consumer
+        // edges); the registry keys are `coordinator.health` / `.log` /
+        // `.coordinator_status` / `.sequences` / `.commands`.
         //
         // - `commands` is the operator channel behind the take-once
         //   [`Coordinator::control_handle`]; commands reach a slot only over an
-        //   explicit `"coordinator" -> <slot>` edge. Untelemetered (inbound control
-        //   is never echoed on the downlink).
-        // - `sequences` carries the boot `SequenceRegistry` (telemetered — the
-        //   panel's sequence view sources it).
-        // - the `status` SelfTap is `read_status`'s view over the coordinator's own
-        //   status output.
+        //   explicit `"coordinator" -> <slot>` edge. Untelemetered, since
+        //   inbound control is never echoed on the downlink.
+        // - `sequences` carries the boot `SequenceRegistry`, telemetered so
+        //   downstream consumers can list the channels.
+        // - the `status` SelfTap is `read_status`'s view over the
+        //   coordinator's own status output.
         let desc = SystemDescriptor {
             name: COORDINATOR_INSTANCE,
             kind: SystemKind::Cyclic,
@@ -772,8 +794,7 @@ impl CoordinatorBuilder {
                 PortDesc::of::<crate::SystemHealth>().with_conn(PortConn::Host),
                 PortDesc::of::<crate::SystemLog>().with_conn(PortConn::Host),
                 PortDesc::of::<CoordinatorStatus>().with_conn(PortConn::Host),
-                PortDesc::msg_named::<SequenceRegistry>("sequences")
-                    .with_conn(PortConn::Host),
+                PortDesc::msg_named::<SequenceRegistry>("sequences").with_conn(PortConn::Host),
                 PortDesc::msg_named::<SequenceCommand>("commands")
                     .untelemetered()
                     .with_conn(PortConn::Host),
@@ -791,24 +812,25 @@ impl CoordinatorBuilder {
         SystemHandle { id }
     }
 
-    /// The handle addressing the coordinator's own system-#0 bundle (§2.6), so a
-    /// front-end can wire the operator command edge:
-    /// `connect(PortRef::msg::<SequenceCommand>(b.coordinator_handle()), …)` — the
-    /// Rust twin of the KDL `connect "coordinator" -> "<slot>" msg="SequenceCommand"`.
+    /// The handle addressing the coordinator's own system-#0 bundle, so a
+    /// front-end can wire the operator command edge with
+    /// `connect(PortRef::msg::<SequenceCommand>(b.coordinator_handle()), …)`.
     pub fn coordinator_handle(&self) -> SystemHandle {
         SystemHandle { id: 0 }
     }
 
-    /// The **registered** descriptor of `handle` — what `build()` validates, sizes,
-    /// and wires. For a slot this is the derived contract (`add_slot` docs), which a
-    /// front-end reads back instead of re-deriving; for everything else it is the
-    /// system's own `descriptor()`.
+    /// The registered descriptor of `handle`, which is what `build()`
+    /// validates, sizes, and wires. For a slot this is the derived contract
+    /// (see [`add_slot`](Self::add_slot)), which a front-end reads back
+    /// instead of re-deriving; for everything else it is the system's own
+    /// `descriptor()`.
     pub fn descriptor_of(&self, handle: SystemHandle) -> &SystemDescriptor {
         &self.systems[handle.id].desc
     }
 
-    /// Register a cyclic system under its type's `System::NAME` instance name; see
-    /// [`add_cyclic_named`](Self::add_cyclic_named) to name the instance explicitly.
+    /// Register a cyclic system under its type's `System::NAME` instance name;
+    /// see [`add_cyclic_named`](Self::add_cyclic_named) to name the instance
+    /// explicitly.
     pub fn add_cyclic<S, O>(&mut self, system: S) -> SystemHandle
     where
         S: CyclicSystem<Output = Out<O>> + 'static,
@@ -818,9 +840,9 @@ impl CoordinatorBuilder {
         self.add_cyclic_named(<S as System>::NAME, system)
     }
 
-    /// Register a cyclic system under an explicit instance name; returns a handle
-    /// whose ports can be `connect`ed. The instance name disambiguates two instances
-    /// of one system type at the telemetry sink (wiring.md §6).
+    /// Register a cyclic system under an explicit instance name; returns a
+    /// handle whose ports can be `connect`ed. The instance name disambiguates
+    /// two instances of one system type in the telemetry keyspace.
     pub fn add_cyclic_named<S, O>(&mut self, name: impl Into<String>, system: S) -> SystemHandle
     where
         S: CyclicSystem<Output = Out<O>> + 'static,
@@ -828,10 +850,13 @@ impl CoordinatorBuilder {
         S::Input: BindPorts + 'static,
     {
         // The instance descriptor, not the static one: a system whose port set
-        // depends on its config (the uplink's per-msg outputs) registers what this
-        // instance actually carries.
+        // depends on its config registers what this instance actually carries.
         let desc = system.instance_descriptor();
-        self.push_system(desc, name.into(), Reg::Cyclic(Box::new(CyclicReg { system })))
+        self.push_system(
+            desc,
+            name.into(),
+            Reg::Cyclic(Box::new(CyclicReg { system })),
+        )
     }
 
     /// Register an async system under its type's `System::NAME` instance name.
@@ -844,7 +869,7 @@ impl CoordinatorBuilder {
         self.add_async_named(<S as System>::NAME, system)
     }
 
-    /// Register an async system under an explicit instance name (wiring.md §6).
+    /// Register an async system under an explicit instance name.
     pub fn add_async_named<S>(&mut self, name: impl Into<String>, system: S) -> SystemHandle
     where
         S: AsyncSystem + 'static,
@@ -856,23 +881,21 @@ impl CoordinatorBuilder {
         self.push_system(desc, name.into(), Reg::Async(Box::new(AsyncReg { system })))
     }
 
-    /// Register a dlopen'd cyclic system under an explicit instance name. `loaded` is
-    /// an opened [`DlSystem`](crate::dl); `params` is the canonical postcard `Params`
-    /// blob the `.so` decodes in `fsw_create` (identical on the wire from either
-    /// front-end).
+    /// Register a dlopen'd cyclic system under an explicit instance name.
+    /// `loaded` is an opened [`DlSystem`](crate::dl); `params` is the canonical
+    /// postcard `Params` blob the `.so` decodes in `fsw_create`.
     ///
-    /// This is the dl twin of [`add_cyclic_named`](Self::add_cyclic_named): it pushes
-    /// the `.so`'s reconstructed [`SystemDescriptor`] so the **existing**
-    /// `compatible()`/`WireError` validation and ring sizing/allocation run over it
-    /// unchanged, and records a [`Reg::Dl`] registration whose `bind` (at `build()`)
-    /// gathers the per-port ring regions, `fsw_create`s the state, and produces a
-    /// [`DlSlot`](crate::dl) instead of a typed `CyclicRunner`. Its output buffers land
-    /// in the [`Registry`] with the (prefixed) announce, so telemetry `All` taps
-    /// them like a static system's.
+    /// The dl twin of [`add_cyclic_named`](Self::add_cyclic_named): it pushes
+    /// the `.so`'s reconstructed [`SystemDescriptor`] so the ordinary
+    /// `compatible()`/`WireError` validation and ring sizing run over it
+    /// unchanged, and records a [`Reg::Dl`] registration whose bind (at
+    /// `build()`) gathers the per-port ring regions, `fsw_create`s the state,
+    /// and produces a [`DlSlot`](crate::dl) instead of a typed `CyclicRunner`.
+    /// Its output buffers land in the [`Registry`] like a static system's.
     ///
     /// Dl systems are cyclic-only. This is the low-level builder method; the
-    /// [`resolve`](crate::wiring::resolve) entry point drives it from a [`Wiring`](crate::Wiring)
-    /// (built in Rust or parsed from the KDL `artifact`/`lib=` surface).
+    /// [`resolve`](crate::wiring::resolve) entry point drives it from a
+    /// [`Wiring`](crate::Wiring).
     pub fn add_dl_cyclic(
         &mut self,
         name: impl Into<String>,
@@ -880,9 +903,8 @@ impl CoordinatorBuilder {
         params: Vec<u8>,
     ) -> SystemHandle {
         let mut desc = loaded.descriptor().clone();
-        // Dl systems are cyclic-only: the registered kind is pinned here (as the
-        // former parallel `kinds` vec hard-coded it), never trusted from the
-        // decoded wire mirror.
+        // Dl systems are cyclic-only: the registered kind is pinned here,
+        // never trusted from the decoded wire mirror.
         desc.kind = SystemKind::Cyclic;
         self.push_system(
             desc,
@@ -894,32 +916,33 @@ impl CoordinatorBuilder {
         )
     }
 
-    /// Register a runtime-swappable **slot** (sequences-slots.md §6): a fixed position in
-    /// the cyclic call chain whose occupant the host `Load`s/`Start`s/`Stop`s/`Abort`s/
-    /// `Reset`s/`Unload`s at runtime. `allowed` is the pre-opened candidate set — each
-    /// [`AllowedOccupant`] a sequence occupant (its `Load` name, opened `DlSystem`, and
-    /// postcard params — E8e: the public type, not a tuple). `initial` optionally
-    /// applies one at startup.
+    /// Register a runtime-swappable slot: a fixed position in the cyclic call
+    /// chain whose occupant the host `Load`s/`Start`s/`Stop`s/`Abort`s/
+    /// `Reset`s/`Unload`s at runtime. `allowed` is the pre-opened candidate
+    /// set, each [`AllowedOccupant`] a sequence occupant (its `Load` name,
+    /// opened `DlSystem`, and postcard params); `initial` optionally applies
+    /// one at startup.
     ///
-    /// The registered descriptor is derived from the occupant descriptor **by
-    /// extension, not surgery** (`docs/design-command-slots.md` §2.2): the occupant's
-    /// ports form the *prefix* of each list in the occupant's own order (its trailing
-    /// [`SlotControlIn`] input re-marked [`PortConn::Host`] in place — the runner
-    /// holds the cancel writer), and the runner's ports are the *tail*: a declared
-    /// `commands` `MsgIn<SequenceCommand>` fan-in (Edge — command wiring is ordinary
-    /// message wiring, §2.5) and a [`PortConn::SelfTap`] view over the occupant's own
-    /// [`SequenceStatus`] output on the input side; a [`SlotStatus`] output and the
-    /// `"sequences"` events channel (both `Host`, registry-tapped) on the output
-    /// side. [`SlotReg`] records the prefix split indices, so the bind arm maps the
-    /// occupant `FswRing` arrays as a straight prefix walk — the occupant-side
-    /// positional bind contract (and so the dl ABI) is untouched.
+    /// The registered descriptor is derived from the occupant descriptor by
+    /// extension, not surgery. The occupant's ports form the *prefix* of each
+    /// list in the occupant's own order (its trailing [`SlotControlIn`] input
+    /// re-marked [`PortConn::Host`] in place, since the runner holds the
+    /// cancel writer), and the runner's ports are the *tail*: a declared
+    /// `commands` `MsgIn<SequenceCommand>` fan-in (an ordinary edge input, so
+    /// command wiring is ordinary message wiring) plus a [`PortConn::SelfTap`]
+    /// view over the occupant's own [`SequenceStatus`] output on the input
+    /// side; a [`SlotStatus`] output and the `"sequences"` events channel
+    /// (both `Host`, registry-tapped) on the output side. [`SlotReg`] records
+    /// the prefix split indices, so the bind arm maps the occupant `FswRing`
+    /// arrays as a straight prefix walk and the occupant-side positional bind
+    /// contract (and so the dl ABI) is untouched.
     ///
-    /// Panics on a build-time contract violation: `allowed` is empty, an allowed
-    /// occupant is not `compatible()` with the first occupant's contract, the
-    /// occupant is not a v1 sequence shape (no trailing `SlotControlIn` input /
-    /// `SequenceStatus` output), or `initial` names an occupant outside the allowed
-    /// set (W1b — the KDL front-end surfaces the same checks as clean `LoadError`s
-    /// before calling this).
+    /// Panics on a build-time contract violation: `allowed` is empty, an
+    /// allowed occupant is not `compatible()` with the first occupant's
+    /// contract, the occupant is not a sequence shape (no trailing
+    /// `SlotControlIn` input / `SequenceStatus` output), or `initial` names an
+    /// occupant outside the allowed set. Front-ends surface the same checks as
+    /// clean errors before calling this.
     pub fn add_slot(
         &mut self,
         name: impl Into<String>,
@@ -931,8 +954,8 @@ impl CoordinatorBuilder {
             "a slot needs at least one allowed occupant"
         );
         let base = allowed[0].system.descriptor().clone();
-        // Every allowed occupant must share the contract (the slot sizes/validates to the
-        // first occupant's descriptor). v1 requires a shared shape (mutual subset).
+        // Every allowed occupant must share the contract; the slot sizes and
+        // validates to the first occupant's descriptor (mutual subset).
         for occ in &allowed[1..] {
             let d = occ.system.descriptor();
             let ports_match = |a: &[PortDesc], b: &[PortDesc]| {
@@ -949,9 +972,8 @@ impl CoordinatorBuilder {
                 allowed[0].name
             );
         }
-        // W1b: the builder path validates the initial occupant against the allowed
-        // set at build, like the resolve path's `UnknownInitialOccupant` — a typo
-        // would otherwise surface only as a runtime `Failed` event.
+        // Validate the initial occupant against the allowed set at build; a
+        // typo would otherwise surface only as a runtime `Failed` event.
         if let Some(init) = &initial {
             assert!(
                 allowed.iter().any(|a| a.name == init.occupant),
@@ -967,7 +989,7 @@ impl CoordinatorBuilder {
 
         let name: String = name.into();
         // The registered descriptor name is the slot's instance name (a leaked
-        // `&'static str` for the descriptor field + the `SlotRunner` identity).
+        // `&'static str` for the descriptor field and the `SlotRunner` identity).
         let leaked: &'static str = Box::leak(name.clone().into_boxed_str());
 
         // --- Inputs: occupant prefix (SlotControlIn re-marked Host), runner tail ---
@@ -976,19 +998,19 @@ impl CoordinatorBuilder {
             .iter_mut()
             .find(|p| p.id == PortId::Component(SlotControlIn::FRAME_ID))
             .expect("a v1 sequence occupant declares the implicit SlotControlIn input");
-        // Host-connected: the RUNNER holds the cancel writer over a dedicated ring;
-        // the occupant reads it. Exempt from UnconnectedInput; edges are rejected.
+        // Host-connected: the RUNNER holds the cancel writer over a dedicated
+        // ring; the occupant reads it. Exempt from UnconnectedInput; edges are
+        // rejected.
         control.conn = PortConn::Host;
         let n_occ_inputs = inputs.len();
-        // The slot's declared command input (§2.5): an ordinary fan-in message
-        // input, so command wiring is ordinary message wiring — a producer commands
-        // this slot only over an explicit edge (`connect … msg="SequenceCommand"`).
-        // Zero edges is legal (an autonomy-free, wiring-frozen slot). The runner
+        // The slot's declared command input: an ordinary fan-in message input,
+        // so a producer commands this slot only over an explicit edge. Zero
+        // edges is legal (an autonomy-free, wiring-frozen slot). The runner
         // drains it at the head of each step; it is never handed to the occupant.
         inputs.push(PortDesc::msg::<SequenceCommand>());
         // The runner's read view over the occupant's own SequenceStatus output
-        // (Progress lines + the terminal outcome): a declared self-tap — no ring,
-        // +1 fan-out on that output at sizing time.
+        // (Progress lines plus the terminal outcome): a declared self-tap, so
+        // no ring, just +1 fan-out on that output at sizing time.
         let seq_status_id = PortId::Component(SequenceStatus::FRAME_ID);
         assert!(
             base.outputs.iter().any(|p| p.id == seq_status_id),
@@ -999,11 +1021,11 @@ impl CoordinatorBuilder {
         // --- Outputs: occupant prefix, runner tail (both Host, registry-tapped) ---
         let mut outputs = base.outputs.clone();
         let n_occ_outputs = outputs.len();
-        // Host-side slot telemetry: the RUNNER writes the phase/occupant frame each
-        // step; tapped like any output ("<slot>.slot_status").
+        // Host-side slot telemetry: the RUNNER writes the phase/occupant frame
+        // each step; tapped like any output ("<slot>.slot_status").
         outputs.push(PortDesc::of::<SlotStatus>().with_conn(PortConn::Host));
-        // The slot's events channel: the RUNNER emits a SequenceChannelEvent per
-        // lifecycle transition; keyed "<slot>.sequences" (msg_named), telemetered.
+        // The slot's events channel: the RUNNER emits a SequenceChannelEvent
+        // per lifecycle transition; keyed "<slot>.sequences", telemetered.
         outputs.push(
             PortDesc::msg_named::<SequenceChannelEvent>("sequences").with_conn(PortConn::Host),
         );
@@ -1029,35 +1051,39 @@ impl CoordinatorBuilder {
         )
     }
 
-    /// Connect a producer output to a consumer input, addressed by port id. The full
-    /// compatibility/structural validation runs in [`build`](Self::build); this only
-    /// catches the cheap port-id and unknown-system/port mistakes early. **One entry
-    /// point for every edge** (A7): the edge's behavior — fan-in rule, cycle-detection
-    /// membership, lap policy — is inferred from the connected ports' descriptors, so
-    /// a Snapshot (frame) edge and a Log (message) edge spell identically.
+    /// Connect a producer output to a consumer input, addressed by port id.
+    /// The full compatibility and structural validation runs in
+    /// [`build`](Self::build); this only catches the cheap port-id and
+    /// unknown-system/port mistakes early. One entry point for every edge: the
+    /// edge's behavior (fan-in rule, cycle-detection membership) is inferred
+    /// from the connected ports' descriptors, so a snapshot (frame) edge and a
+    /// log (message) edge spell identically.
     ///
-    /// A forward (acyclic) edge. If a `connect` happens to close a feedback loop over
-    /// Snapshot edges — including a system connected to itself — `build` rejects it as
-    /// a [`FeedbackCycle`](WireError::FeedbackCycle): the back-edge of a loop must be
-    /// declared with [`connect_delayed`](Self::connect_delayed). Likewise a Snapshot
-    /// edge between two cyclic systems must point *forward* in registration order (the
-    /// step loop's execution order), or the consumer would permanently read last
-    /// cycle's value — `build` rejects the backward edge as a
-    /// [`StaleFrameEdge`](WireError::StaleFrameEdge) unless it is `connect_delayed`.
-    /// Log edges are exempt from both (a decoupled event/command stream).
+    /// This declares a forward (acyclic) edge. If a `connect` happens to close
+    /// a feedback loop over snapshot edges, including a system connected to
+    /// itself, `build` rejects it as a
+    /// [`FeedbackCycle`](WireError::FeedbackCycle); the back-edge of a loop
+    /// must be declared with [`connect_delayed`](Self::connect_delayed).
+    /// Likewise a snapshot edge between two cyclic systems must point forward
+    /// in registration order (the step loop's execution order), or the
+    /// consumer would permanently read last cycle's value; `build` rejects the
+    /// backward edge as a [`StaleFrameEdge`](WireError::StaleFrameEdge) unless
+    /// it is `connect_delayed`. Log edges are exempt from both (a decoupled
+    /// event/command stream).
     pub fn connect(&mut self, producer: PortRef, consumer: PortRef) -> Result<(), WireError> {
         self.push_edge(producer, consumer, false)
     }
 
-    /// Connect a producer to a consumer marking the edge as an intentional
-    /// one-cycle-**delayed** feedback edge (the back-edge of a control loop). The
-    /// runtime path is identical to [`connect`](Self::connect) — a `view()` read of
-    /// the latest committed value, which is last cycle's because the producer runs
-    /// after the consumer in registration order — but the edge is excluded from
-    /// cycle detection, so the loop builds. Every feedback loop must break exactly
-    /// one edge this way; an unbroken cycle is a [`FeedbackCycle`](WireError::FeedbackCycle).
-    /// Only meaningful on a Snapshot edge; `delayed` into a Log input is rejected at
-    /// build as a [`DelayedLogEdge`](WireError::DelayedLogEdge).
+    /// Connect a producer to a consumer, marking the edge as an intentional
+    /// one-cycle-delayed feedback edge (the back-edge of a control loop). The
+    /// runtime path is identical to [`connect`](Self::connect), a `view()`
+    /// read of the latest committed value, which is last cycle's because the
+    /// producer runs after the consumer in registration order; but the edge is
+    /// excluded from cycle detection, so the loop builds. Every feedback loop
+    /// must break exactly one edge this way; an unbroken cycle is a
+    /// [`FeedbackCycle`](WireError::FeedbackCycle). Only meaningful on a
+    /// snapshot edge; `delayed` into a log input is rejected at build as a
+    /// [`DelayedLogEdge`](WireError::DelayedLogEdge).
     pub fn connect_delayed(
         &mut self,
         producer: PortRef,
@@ -1092,12 +1118,12 @@ impl CoordinatorBuilder {
         Ok(())
     }
 
-    /// Validate the graph, size and allocate every ring, bind ports, auto-provision
-    /// health/log buffers, and return a ready coordinator (coordinator.md §2).
+    /// Validate the graph, size and allocate every ring, bind ports,
+    /// auto-provision health/log buffers, and return a ready coordinator.
     ///
-    /// One orchestrator over named passes (C2): each pass owns one former section of
-    /// the monolith and hands its product to the next — validation, edge resolution,
-    /// fan-out counting, ring allocation, registry freeze, copy-in planning, bind.
+    /// One orchestrator over named passes, each handing its product to the
+    /// next: validation, edge resolution, fan-out counting, ring allocation,
+    /// registry freeze, copy-in planning, bind.
     pub fn build(self) -> Result<Coordinator, WireError> {
         self.validate_cycle_rate()?;
         self.validate_receive_all_last()?;
@@ -1142,13 +1168,14 @@ impl CoordinatorBuilder {
     }
 
     // -----------------------------------------------------------------------
-    // build() passes (C2) — each one former section of the monolith, in order.
+    // build() passes, in order.
     // -----------------------------------------------------------------------
 
-    /// A Wall clock turns `cycle_rate` into the per-cycle pacing budget in `run_for`;
-    /// reject an unusable rate here so the failure is a build-time `WireError`, not a
-    /// `Duration::from_secs_f64` panic mid-run. A `Simulated` clock ignores the rate
-    /// (coordinator.md §6), so it is deliberately not validated there.
+    /// A Wall clock turns `cycle_rate` into the per-cycle pacing budget in
+    /// `run_for`; reject an unusable rate here so the failure is a build-time
+    /// `WireError`, not a `Duration::from_secs_f64` panic mid-run. A
+    /// `Simulated` clock ignores the rate, so it is deliberately not validated
+    /// there.
     fn validate_cycle_rate(&self) -> Result<(), WireError> {
         if matches!(self.config.clock, ClockMode::Wall)
             && !(self.config.cycle_rate.is_finite() && self.config.cycle_rate > 0.0)
@@ -1160,19 +1187,22 @@ impl CoordinatorBuilder {
         Ok(())
     }
 
-    /// Receive-all (telemetry) systems register last (A11(b): enforced). The
-    /// downlink's end-of-cycle snapshot only observes systems stepping *before* it,
-    /// so a cyclic system registered after it would telemeter one cycle stale.
-    /// Enforced, not silently reordered: reordering registrations would change the
-    /// step order the stale-edge diagnostics validate. Async systems are exempt
-    /// (they run off their own task, not the registration-ordered step loop).
+    /// Receive-all (telemetry) systems must register last. The downlink's
+    /// end-of-cycle snapshot only observes systems stepping before it, so a
+    /// cyclic system registered after it would telemeter one cycle stale.
+    /// Enforced, not silently reordered: reordering registrations would change
+    /// the step order the stale-edge diagnostics validate. Async systems are
+    /// exempt (they run off their own task, not the registration-ordered loop).
     fn validate_receive_all_last(&self) -> Result<(), WireError> {
         let mut first_receive_all: Option<usize> = None;
         for (s, sys) in self.systems.iter().enumerate() {
             if sys.desc.kind != SystemKind::Cyclic {
                 continue;
             }
-            let has_receive_all = sys.desc.capabilities.contains(&crate::Capability::ReceiveAll);
+            let has_receive_all = sys
+                .desc
+                .capabilities
+                .contains(&crate::Capability::ReceiveAll);
             if has_receive_all {
                 first_receive_all.get_or_insert(s);
             } else if let Some(t) = first_receive_all {
@@ -1186,9 +1216,10 @@ impl CoordinatorBuilder {
     }
 
     /// Slot instance names are wire addresses: enforce the [`NAME_CAP`]. A
-    /// `SequenceCommand` addresses a slot by its instance name, and the same name
-    /// packs into fixed-size status frames; > NAME_CAP would telemeter truncated
-    /// while addressing untruncated, so it is a build error, never a truncation.
+    /// `SequenceCommand` addresses a slot by its instance name, and the same
+    /// name packs into fixed-size status frames; a longer name would telemeter
+    /// truncated while addressing untruncated, so it is a build error, never a
+    /// truncation.
     fn validate_slot_name_caps(&self) -> Result<(), WireError> {
         for sys in &self.systems {
             if matches!(sys.reg, Reg::Slot(_)) && sys.desc.name.len() > NAME_CAP {
@@ -1201,9 +1232,9 @@ impl CoordinatorBuilder {
         Ok(())
     }
 
-    /// Per-descriptor axis validation (no edges needed).
-    /// FanIn::Many × Delivery::Snapshot: latest-wins across producers is
-    /// ill-defined.
+    /// Per-descriptor axis validation, needing no edges: FanIn::Many with
+    /// Delivery::Snapshot is rejected (latest-wins across producers is
+    /// ill-defined).
     fn validate_port_axes(&self) -> Result<(), WireError> {
         for sys in &self.systems {
             for port in &sys.desc.inputs {
@@ -1218,40 +1249,41 @@ impl CoordinatorBuilder {
         Ok(())
     }
 
-    /// Validate every edge and build the ONE connection map:
-    /// `(cons_id, in_idx) -> [(prod_id, out_idx)]` for EVERY input — a FanIn::One
-    /// input holds exactly one entry (enforced here), a FanIn::Many input zero or
-    /// more. Every rule branches on a descriptor axis, never on frame-vs-message.
-    /// Also runs the graph-shape checks over the map: every feedback loop must be
-    /// broken by a `connect_delayed`, registration order must agree with the
-    /// dataflow, and every FanIn::One input must be connected.
+    /// Validate every edge and build the one connection map,
+    /// `(cons_id, in_idx) -> [(prod_id, out_idx)]`, covering every input: a
+    /// FanIn::One input holds exactly one entry (enforced here), a FanIn::Many
+    /// input zero or more. Every rule branches on a descriptor axis, never on
+    /// frame-vs-message. Also runs the graph-shape checks over the map: every
+    /// feedback loop must be broken by a `connect_delayed`, registration order
+    /// must agree with the dataflow, and every FanIn::One input must be
+    /// connected.
     fn resolve_edges(&self) -> Result<ConsEdges, WireError> {
         let n = self.systems.len();
         let mut cons_edges: ConsEdges = HashMap::new();
-        // System-level adjacency over the NON-delayed SNAPSHOT edges only, for cycle
-        // detection: a remaining cycle is an unbroken feedback loop. Log edges are
-        // excluded — a log is a decoupled event/command stream, not a same-cycle
-        // dependency (§3.6).
+        // System-level adjacency over the non-delayed SNAPSHOT edges only, for
+        // cycle detection: a remaining cycle is an unbroken feedback loop. Log
+        // edges are excluded; a log is a decoupled event/command stream, not a
+        // same-cycle dependency.
         let mut forward_adj: Vec<Vec<usize>> = vec![Vec::new(); n];
         for (p, c, delayed) in &self.edges {
             let prod = &self.systems[p.system.id].desc;
             let cons = &self.systems[c.system.id].desc;
-            let out_idx = prod
-                .outputs
-                .iter()
-                .position(|d| d.id == p.port)
-                .ok_or(WireError::UnknownPort {
-                    system: p.system.id,
-                    port: p.port,
-                })?;
-            let in_idx = cons
-                .inputs
-                .iter()
-                .position(|d| d.id == c.port)
-                .ok_or(WireError::UnknownPort {
-                    system: c.system.id,
-                    port: c.port,
-                })?;
+            let out_idx =
+                prod.outputs
+                    .iter()
+                    .position(|d| d.id == p.port)
+                    .ok_or(WireError::UnknownPort {
+                        system: p.system.id,
+                        port: p.port,
+                    })?;
+            let in_idx =
+                cons.inputs
+                    .iter()
+                    .position(|d| d.id == c.port)
+                    .ok_or(WireError::UnknownPort {
+                        system: c.system.id,
+                        port: c.port,
+                    })?;
             if !compatible(&prod.outputs[out_idx], &cons.inputs[in_idx]) {
                 return Err(WireError::Incompatible {
                     producer: prod.name,
@@ -1260,19 +1292,19 @@ impl CoordinatorBuilder {
                 });
             }
             let in_desc = &cons.inputs[in_idx];
-            // A host-connected input's counterpart is held by the system's runner
-            // (the slot's cancel writer, a self-tap over its own output) — an edge
-            // into it is rejected (A3). Host *outputs* keep accepting consumer edges:
-            // the coordinator's `commands` channel is exactly a Host output slots
-            // read over explicit edges.
+            // A host-connected input's counterpart is held by the system's
+            // runner (the slot's cancel writer, a self-tap over its own
+            // output), so an edge into it is rejected. Host *outputs* keep
+            // accepting consumer edges: the coordinator's `commands` channel is
+            // exactly a Host output slots read over explicit edges.
             if in_desc.conn != PortConn::Edge {
                 return Err(WireError::HostPort {
                     system: cons.name,
                     port: c.port,
                 });
             }
-            // `delayed` marks a one-cycle-late snapshot sample; on a Log input it is
-            // meaningless and rejected instead of silently ignored (A7).
+            // `delayed` marks a one-cycle-late snapshot sample; on a log input
+            // it is meaningless and rejected instead of silently ignored.
             if *delayed && in_desc.delivery == Delivery::Log {
                 return Err(WireError::DelayedLogEdge {
                     producer: prod.name,
@@ -1282,7 +1314,7 @@ impl CoordinatorBuilder {
             }
             let producers = cons_edges.entry((c.system.id, in_idx)).or_default();
             match in_desc.fan_in {
-                // Exactly one edge per input (the frame doctrine).
+                // Exactly one edge per input.
                 FanIn::One => {
                     if !producers.is_empty() {
                         return Err(WireError::DoubleConnect {
@@ -1292,8 +1324,8 @@ impl CoordinatorBuilder {
                     }
                     producers.push((p.system.id, out_idx));
                 }
-                // Fan-in (append). Distinct producers may fan in freely (§3.2), but an
-                // exact duplicate of one edge would deliver every record twice (B7).
+                // Fan-in (append). Distinct producers may fan in freely, but an
+                // exact duplicate of one edge would deliver every record twice.
                 FanIn::Many => {
                     if producers.contains(&(p.system.id, out_idx)) {
                         return Err(WireError::DuplicateEdge {
@@ -1308,7 +1340,7 @@ impl CoordinatorBuilder {
             // Self-edges included: a system plainly connected to itself is the
             // tightest feedback loop (it can only ever read its own previous
             // cycle's value), so it must be declared with `connect_delayed` like
-            // any other loop — the DFS reports it as a one-member `FeedbackCycle`.
+            // any other loop; the DFS reports it as a one-member `FeedbackCycle`.
             if in_desc.delivery == Delivery::Snapshot && !delayed {
                 forward_adj[p.system.id].push(c.system.id);
             }
@@ -1325,27 +1357,31 @@ impl CoordinatorBuilder {
         }
 
         // --- Registration order must agree with the dataflow ------------------
-        // The cyclic step loop runs in registration order, so a non-delayed Snapshot
-        // edge between two cyclic systems whose consumer registered *before* its
-        // producer would read last cycle's value forever — silent staleness that must
-        // instead be declared with `connect_delayed`. Checked after cycle detection so
-        // a genuine unbroken loop (which always contains a backward edge) reports the
-        // clearer `FeedbackCycle`. Log edges are exempt (a decoupled stream, §3.6); so
-        // are edges with an async endpoint (async systems run off the post-step
-        // copy-in / their own task, so their registration index carries no ordering
-        // semantics). Self-edges never reach here (rejected above as a one-member cycle).
+        // The cyclic step loop runs in registration order, so a non-delayed
+        // snapshot edge between two cyclic systems whose consumer registered
+        // before its producer would read last cycle's value forever: silent
+        // staleness that must instead be declared with `connect_delayed`.
+        // Checked after cycle detection so a genuine unbroken loop (which
+        // always contains a backward edge) reports the clearer `FeedbackCycle`.
+        // Log edges are exempt (a decoupled stream); so are edges with an async
+        // endpoint (async systems run off the post-step copy-in or their own
+        // task, so their registration index carries no ordering semantics).
+        // Self-edges never reach here (rejected above as a one-member cycle).
         for (p, c, delayed) in &self.edges {
             if *delayed {
                 continue;
             }
             let prod = &self.systems[p.system.id].desc;
             let cons = &self.systems[c.system.id].desc;
-            let in_delivery = cons.inputs.iter().find(|d| d.id == c.port).map(|d| d.delivery);
+            let in_delivery = cons
+                .inputs
+                .iter()
+                .find(|d| d.id == c.port)
+                .map(|d| d.delivery);
             if in_delivery != Some(Delivery::Snapshot) {
                 continue;
             }
-            let both_cyclic =
-                prod.kind == SystemKind::Cyclic && cons.kind == SystemKind::Cyclic;
+            let both_cyclic = prod.kind == SystemKind::Cyclic && cons.kind == SystemKind::Cyclic;
             if both_cyclic && c.system.id < p.system.id {
                 return Err(WireError::StaleFrameEdge {
                     producer: prod.name,
@@ -1356,9 +1392,9 @@ impl CoordinatorBuilder {
         }
 
         // --- Input coverage: a FanIn::One input must be connected exactly once ---
-        // (exactly-once is the edge pass above; existence is here). A FanIn::Many
-        // input may have zero producers (fan-in is optional, §3.2); a non-Edge input
-        // is fed by its runner, never an edge (A3).
+        // Exactly-once is the edge pass above; existence is here. A FanIn::Many
+        // input may have zero producers; a non-Edge input is fed by its runner,
+        // never an edge.
         for (sid, sys) in self.systems.iter().enumerate() {
             for (in_idx, port) in sys.desc.inputs.iter().enumerate() {
                 if port.conn == PortConn::Edge
@@ -1376,9 +1412,9 @@ impl CoordinatorBuilder {
         Ok(cons_edges)
     }
 
-    /// Fan-out per output port: one uniform count over the one connection map. A
-    /// declared self-tap (A3) is one more reader on the system's *own* output —
-    /// counted here so the budget is explicit, not slack-covered.
+    /// Fan-out per output port: one uniform count over the one connection map.
+    /// A declared self-tap is one more reader on the system's *own* output,
+    /// counted here so the budget is explicit rather than slack-covered.
     fn count_fan_out(&self, cons_edges: &ConsEdges) -> HashMap<(usize, usize), usize> {
         let mut fan_out: HashMap<(usize, usize), usize> = HashMap::new();
         for producers in cons_edges.values() {
@@ -1403,13 +1439,13 @@ impl CoordinatorBuilder {
         fan_out
     }
 
-    /// Allocate one buffer per output port (incl. health/log) plus a dedicated ring
-    /// per Host-connected input (A3), collecting the build-order registry entries —
-    /// ONE list over every registered buffer, frames and message channels alike
-    /// (telemetry.md §2). Each `AllOutputs` receive-all capability
-    /// (`docs/message-wiring.md` §4) is an extra fan-out reader on *every* buffer, so
-    /// every ring's `max_readers` includes it — self-derived from the declared
-    /// `ReceiveAll` capabilities, no per-consumer bookkeeping.
+    /// Allocate one buffer per output port (health/log included) plus a
+    /// dedicated ring per host-connected input, collecting the build-order
+    /// registry entries: one list over every registered buffer, frames and
+    /// message channels alike. Each receive-all capability in the graph is an
+    /// extra fan-out reader on *every* buffer, so every ring's `max_readers`
+    /// includes it, derived from the declared `ReceiveAll` capabilities with
+    /// no per-consumer bookkeeping.
     fn alloc_rings(&self, fan_out: &HashMap<(usize, usize), usize>) -> RingAlloc {
         let depth = self.config.default_depth;
         let slack = self.config.reader_slack;
@@ -1437,10 +1473,11 @@ impl CoordinatorBuilder {
                     system: sid,
                     port: out_idx,
                 };
-                // ONE sizing path (depth by delivery — `alloc_ring`); only the
-                // registry-entry shape still splits on the schema. Command channels
-                // are ordinary outputs here: a slot reads a producer only over an
-                // explicit edge, so the edge fan-out counts its readers exactly (A2).
+                // One sizing path (depth by delivery, `alloc_ring`); only the
+                // registry-entry shape still splits on the schema. Command
+                // channels are ordinary outputs here: a slot reads a producer
+                // only over an explicit edge, so the edge fan-out counts its
+                // readers exactly.
                 let ring = alloc_ring(port.delivery, port.max_size, depth, readers);
                 match &port.schema {
                     PortSchema::Table { .. } => {
@@ -1458,9 +1495,9 @@ impl CoordinatorBuilder {
                         });
                     }
                     PortSchema::Postcard => {
-                        // Registered like any buffer; the downlink / `AllOutputs`
-                        // taps it unless the port opted out via
-                        // `telemetered = false` (e.g. a command channel, §6.4).
+                        // Registered like any buffer; the downlink taps it
+                        // unless the port opted out via `telemetered = false`
+                        // (a command channel, for example).
                         let entry =
                             postcard_entry(&instance, port.name, ring.clone(), port.telemetered);
                         alloc.table.rings.push(RingEntry {
@@ -1477,13 +1514,14 @@ impl CoordinatorBuilder {
             alloc.output_rings.push(row);
         }
 
-        // --- Dedicated rings for Host-connected inputs (A3) ----------------
+        // --- Dedicated rings for host-connected inputs ---------------------
         // A Host input's counterpart is its runner's writer (the slot's cancel
-        // frame), so it gets its own ring instead of a producer edge: the occupant
-        // attaches one read `View` per Load (released on each Stop/Reset/Unload), so
-        // 1 reader slot + slack covers the reload cycle. No registry entry — it is
-        // inbound control, not an output. SelfTap inputs allocate nothing (they view
-        // the system's own output, already counted in `fan_out`).
+        // frame), so it gets its own ring instead of a producer edge. The
+        // occupant attaches one read `View` per Load (released on each
+        // Stop/Reset/Unload), so 1 reader slot plus slack covers the reload
+        // cycle. No registry entry: it is inbound control, not an output.
+        // SelfTap inputs allocate nothing (they view the system's own output,
+        // already counted in `fan_out`).
         for (sid, sys) in self.systems.iter().enumerate() {
             for (in_idx, port) in sys.desc.inputs.iter().enumerate() {
                 if port.conn != PortConn::Host {
@@ -1509,9 +1547,9 @@ impl CoordinatorBuilder {
         alloc
     }
 
-    /// The boot `SequenceRegistry` payload: one spec per slot, keyed by the slot's
-    /// **instance name** — the channel's wire address (`docs/messages.md` §5); there
-    /// is no build-order channel id.
+    /// The boot `SequenceRegistry` payload: one spec per slot, keyed by the
+    /// slot's instance name, the channel's wire address. There is no
+    /// build-order channel id.
     fn seq_registry_payload(&self) -> SequenceRegistry {
         let channels = self
             .systems
@@ -1527,11 +1565,12 @@ impl CoordinatorBuilder {
         SequenceRegistry { channels }
     }
 
-    /// Private copy-in buffers for async inputs, keyed on the delivery axis (§2.3):
-    /// an async system cannot be step-gated, so an async SNAPSHOT input is decoupled
-    /// through a private latest-wins copy-in ring (which also supplies the matched
-    /// data `Notifier` the async `recv` parks on). Log inputs use a direct fan-in
-    /// multi-view (§3.3) — an every-record log the consumer poll-drains, no copy-in.
+    /// Private copy-in buffers for async inputs, keyed on the delivery axis.
+    /// An async system cannot be step-gated, so an async snapshot input is
+    /// decoupled through a private latest-wins copy-in ring, which also
+    /// supplies the matched data `Notifier` the async `recv` parks on. Log
+    /// inputs use a direct fan-in multi-view, an every-record log the consumer
+    /// poll-drains, with no copy-in.
     fn plan_copy_ins(&self, cons_edges: &ConsEdges, alloc: &mut RingAlloc) -> AsyncPlumbing {
         let depth = self.config.default_depth;
         let slack = self.config.reader_slack;
@@ -1545,8 +1584,8 @@ impl CoordinatorBuilder {
                 continue;
             }
             for (in_idx, port) in sys.desc.inputs.iter().enumerate() {
-                // Only edge-connected Snapshot inputs are copy-in decoupled; a
-                // Host/SelfTap input is fed by its runner, not a producer edge (A3).
+                // Only edge-connected snapshot inputs are copy-in decoupled; a
+                // Host/SelfTap input is fed by its runner, not a producer edge.
                 if port.delivery == Delivery::Log || port.conn != PortConn::Edge {
                     continue;
                 }
@@ -1554,10 +1593,10 @@ impl CoordinatorBuilder {
                 let private = alloc_ring(port.delivery, port.max_size, depth, 1 + slack);
                 let data = Notifier::default();
                 // Only the matched DATA notifier is load-bearing (it wakes the
-                // parked async `recv`); the writer's space side is `NoWake` — the
-                // copy-in uses `try_write` and skips a full private ring.
-                // Invariant: each private copy-in ring is created here and gets
-                // this one writer, so the claim is always free.
+                // parked async `recv`); the writer's space side is `NoWake`
+                // because the copy-in uses `try_write` and skips a full
+                // private ring. Each private copy-in ring is created here and
+                // gets this one writer, so the claim is always free.
                 let writer = private
                     .writer(data.clone(), NoWake)
                     .expect("private copy-in ring has exactly one writer");
@@ -1589,17 +1628,17 @@ impl CoordinatorBuilder {
 }
 
 // ---------------------------------------------------------------------------
-// build() products + the bind pass (C2)
+// build() products + the bind pass
 // ---------------------------------------------------------------------------
 
-/// The ONE connection map: `(consumer, input-index)` → the producer endpoints
+/// The one connection map, `(consumer, input-index)` to the producer endpoints
 /// explicitly wired into it. Product of [`CoordinatorBuilder::resolve_edges`];
 /// consumed by fan-out counting, copy-in planning, and the bind pass.
 type ConsEdges = HashMap<(usize, usize), Vec<(usize, usize)>>;
 
-/// The ring-allocation pass product: the canonical owning [`RingTable`], one buffer
-/// row per system's outputs, the dedicated Host-input rings, and the build-order
-/// registry entries (drained by [`freeze_registry`]).
+/// The ring-allocation pass product: the canonical owning [`RingTable`], one
+/// buffer row per system's outputs, the dedicated host-input rings, and the
+/// build-order registry entries (drained by [`freeze_registry`]).
 struct RingAlloc {
     table: RingTable,
     output_rings: Vec<Vec<RingBuffer>>,
@@ -1607,8 +1646,9 @@ struct RingAlloc {
     reg_entries: Vec<RegistryEntry>,
 }
 
-/// The copy-in planning product: each async Snapshot input's private ring + matched
-/// data notifier, the per-system wake lists (for teardown), and the copy-in jobs.
+/// The copy-in planning product: each async snapshot input's private ring plus
+/// matched data notifier, the per-system wake lists (for teardown), and the
+/// copy-in jobs.
 struct AsyncPlumbing {
     private_inputs: HashMap<(usize, usize), (RingBuffer, Notifier)>,
     async_wakes: Vec<Vec<Notifier>>,
@@ -1624,17 +1664,17 @@ struct CoordinatorPorts {
     control_out: MsgOut<SequenceCommand>,
 }
 
-/// The bind pass product: every cyclic slot, every pending async system, and the
-/// coordinator's own ports.
+/// The bind pass product: every cyclic slot, every pending async system, and
+/// the coordinator's own ports.
 struct BoundSystems {
     cyclic: Vec<Box<dyn CyclicSlot>>,
     pending_async: Vec<PendingAsync>,
     coord: CoordinatorPorts,
 }
 
-/// One keyspace over frames and channels: a same-instance name collision between a
-/// frame and a channel (both `"<instance>.<name>"`) is detectable instead of
-/// shadowing. Freezes the ONE registry; every consumer's bind pulls this handle.
+/// Freeze the one registry every consumer's bind pulls. Frames and channels
+/// share one keyspace, so a same-instance name collision between a frame and a
+/// channel (both `"<instance>.<name>"`) is detectable instead of shadowing.
 fn freeze_registry(reg_entries: Vec<RegistryEntry>) -> Result<Arc<Registry>, WireError> {
     let mut seen_keys: HashMap<ComponentId, usize> = HashMap::new();
     for (i, e) in reg_entries.iter().enumerate() {
@@ -1647,9 +1687,9 @@ fn freeze_registry(reg_entries: Vec<RegistryEntry>) -> Result<Arc<Registry>, Wir
     Ok(Arc::new(Registry::new(reg_entries)))
 }
 
-/// Bind every system's ports over the allocated rings — the pass that consumes the
-/// registrations. Each arm mirrors one registration kind; the static (host-side
-/// host) arm builds typed `BoundPort`s and walks them with a [`Binder`].
+/// Bind every system's ports over the allocated rings, consuming the
+/// registrations. Each arm mirrors one registration kind; the static
+/// (host-side) arm builds typed `BoundPort`s and walks them with a [`Binder`].
 fn bind_systems(
     systems: Vec<Registration>,
     cons_edges: &ConsEdges,
@@ -1673,34 +1713,36 @@ fn bind_systems(
                 cons_edges,
                 &alloc.output_rings,
             ))),
-            Reg::Slot(slot_reg) => cyclic.push(Box::new(bind_slot(
-                id, slot_reg, &desc, cons_edges, alloc,
-            ))),
+            Reg::Slot(slot_reg) => {
+                cyclic.push(Box::new(bind_slot(id, slot_reg, &desc, cons_edges, alloc)))
+            }
             // The static (host-side) path: build typed `BoundPort`s and
             // walk them with a `Binder`.
             reg => {
-                // Outputs: default wakes, the system's own buffers. Capabilities
-                // never appear here — they live on `desc.capabilities`, not in the
-                // port lists, so the positional cursor covers exactly the wired
-                // ports (`AllOutputs::bind` pulls the registry instead of consuming
+                // Outputs: default wakes, the system's own buffers.
+                // Capabilities never appear here: they live on
+                // `desc.capabilities`, not in the port lists, so the
+                // positional cursor covers exactly the wired ports
+                // (`AllOutputs::bind` pulls the registry instead of consuming
                 // a cursor position).
                 let outs: Vec<BoundPort> = (0..desc.outputs.len())
                     .map(|out_idx| BoundPort::new(alloc.output_rings[id][out_idx].clone()))
                     .collect();
-                // Inputs, in `descriptors()` order, chosen by the FAN-IN axis. A
-                // `One` input: cyclic consumers view the producer's output
-                // directly, async consumers view their private copy-in buffer with
-                // the matched data wake. A `Many` input: a direct multi-view over
-                // every producer ring wired to it (fan-in, §3.3), NoWake — a
-                // best-effort log the consumer poll-drains (no copy-in, cyclic or
-                // async).
+                // Inputs, in `descriptors()` order, chosen by the fan-in axis.
+                // A `One` input: cyclic consumers view the producer's output
+                // directly, async consumers view their private copy-in buffer
+                // with the matched data wake. A `Many` input: a direct
+                // multi-view over every producer ring wired to it, NoWake, a
+                // best-effort log the consumer poll-drains (no copy-in, cyclic
+                // or async).
                 let ins: Vec<BoundInput> = (0..desc.inputs.len())
                     .map(|in_idx| match desc.inputs[in_idx].fan_in {
                         FanIn::One => {
                             let (prod_id, out_idx) = cons_edges[&(id, in_idx)][0];
-                            // The copy-in pass keyed on (Async, Snapshot); anything
-                            // it decoupled binds the private ring + matched wake,
-                            // everything else views the producer directly.
+                            // The copy-in pass keyed on (Async, Snapshot);
+                            // anything it decoupled binds the private ring plus
+                            // matched wake, everything else views the producer
+                            // directly.
                             let port = match plumbing.private_inputs.get(&(id, in_idx)) {
                                 Some((ring, data)) => {
                                     BoundPort::matched(ring.clone(), Box::new(data.clone()))
@@ -1756,11 +1798,11 @@ fn bind_systems(
     }
 }
 
-/// The coordinator's own bundle (§2.6): a marker registration — not a cyclic slot
-/// (the coordinator IS the loop). Its declared Host outputs were allocated and
-/// registered by the uniform passes; wrap the writers into the coordinator's ports
-/// here, single-writer by construction, and claim the status SelfTap view
-/// (`read_status`).
+/// The coordinator's own bundle: a marker registration, not a cyclic slot (the
+/// coordinator IS the loop). Its declared Host outputs were allocated and
+/// registered by the uniform passes; wrap the writers into the coordinator's
+/// ports here, single-writer by construction, and claim the status SelfTap
+/// view (`read_status`).
 fn bind_coordinator(
     id: usize,
     desc: &SystemDescriptor,
@@ -1780,8 +1822,8 @@ fn bind_coordinator(
     );
     let status_idx = out_idx(PortId::Component(CoordinatorStatus::FRAME_ID));
     let status_out = slot_writer::<CoordinatorStatus>(&output_rings[id][status_idx]);
-    // The declared SelfTap over the coordinator's own status output (+1 fan-out
-    // counted at sizing).
+    // The declared SelfTap over the coordinator's own status output (+1
+    // fan-out counted at sizing).
     let status_view = Input::new(
         output_rings[id][status_idx]
             .view(NoWake, NoWake)
@@ -1802,12 +1844,12 @@ fn bind_coordinator(
     }
 }
 
-/// A dlopen'd system binds over **raw** `FswRing` regions, not typed `BoundPort`s:
-/// gather the same per-port rings the coordinator allocated (outputs = this system's
-/// own buffers; inputs = views into the upstream producers' outputs — the
-/// cyclic-consumer path), as `(base, len, role)` handles in `descriptors()` order,
-/// and hand them to a `DlSlot`. Sizing, allocation, validation, and the registry
-/// entry are identical to a static system's.
+/// A dlopen'd system binds over raw `FswRing` regions, not typed `BoundPort`s:
+/// gather the same per-port rings the coordinator allocated (outputs are this
+/// system's own buffers; inputs are views into the upstream producers'
+/// outputs, the cyclic-consumer path), as `(base, len, role)` handles in
+/// `descriptors()` order, and hand them to a `DlSlot`. Sizing, allocation,
+/// validation, and the registry entry are identical to a static system's.
 fn bind_dl(
     id: usize,
     dl: DlReg,
@@ -1837,16 +1879,16 @@ fn bind_dl(
             }
         })
         .collect();
-    // SAFETY: every region named here is a `RingTable`-owned ring that outlives the
-    // slot — the coordinator drops `cyclic` (this slot, whose `Drop` calls
-    // `fsw_destroy`) before `rings`. The `DlSystem` handle drops right after; the
-    // slot keeps its own `Arc<Library>`.
+    // SAFETY: every region named here is a `RingTable`-owned ring that outlives
+    // the slot; the coordinator drops `cyclic` (this slot, whose `Drop` calls
+    // `fsw_destroy`) before `rings`. The `DlSystem` handle drops right after;
+    // the slot keeps its own `Arc<Library>`.
     unsafe { dl.system.make_slot(&dl.params, inputs, outputs, desc.name) }
 }
 
-/// A runtime slot: gather the same per-port regions as the dl arm, but locate the
-/// runner's tail ports by their declared shape and hand the runner the
-/// control/status writers. No occupant is created here — only `init`/`Load`
+/// A runtime slot: gather the same per-port regions as the dl arm, but locate
+/// the runner's tail ports by their declared shape and hand the runner the
+/// control/status writers. No occupant is created here; only `init`/`Load`
 /// (runtime) does.
 fn bind_slot(
     id: usize,
@@ -1863,11 +1905,11 @@ fn bind_slot(
         n_occ_outputs,
     } = slot_reg;
     let output_rings = &alloc.output_rings;
-    // The prefix/tail invariant (§2.2): the occupant's ports are the prefix of each
-    // registered list, in the occupant descriptor's own order — so the occupant
-    // `FswRing` arrays are a straight prefix map (Edge inputs view their producers;
-    // the Host `SlotControlIn` input its dedicated ring) and the occupant-side
-    // positional bind contract (the dl ABI) is untouched.
+    // The prefix/tail invariant: the occupant's ports are the prefix of each
+    // registered list, in the occupant descriptor's own order, so the occupant
+    // `FswRing` arrays are a straight prefix map (Edge inputs view their
+    // producers; the Host `SlotControlIn` input its dedicated ring) and the
+    // occupant-side positional bind contract (the dl ABI) is untouched.
     let inputs: Vec<FswRing> = (0..n_occ_inputs)
         .map(|in_idx| {
             let (base, len) = match desc.inputs[in_idx].conn {
@@ -1887,8 +1929,8 @@ fn bind_slot(
             }
         })
         .collect();
-    // Occupant outputs = the prefix of the slot's own buffers (user outputs +
-    // SequenceStatus + health + log, in descriptor order).
+    // Occupant outputs are the prefix of the slot's own buffers (user outputs,
+    // SequenceStatus, health, log, in descriptor order).
     let outputs: Vec<FswRing> = (0..n_occ_outputs)
         .map(|out_idx| {
             let (base, len) = output_rings[id][out_idx].region();
@@ -1907,10 +1949,10 @@ fn bind_slot(
         .position(|p| p.conn == PortConn::Host)
         .expect("a slot declares its Host SlotControlIn input");
     let control = slot_writer::<SlotControlIn>(&alloc.host_input_rings[&(id, control_in_idx)]);
-    // The slot's command fan-in: one view per producer explicitly edged into the
-    // declared `commands` input (A2 — no type-keyed broadcast; zero edges is a
-    // legal, command-less slot). The `SlotRunner` drains + filters by its instance
-    // name each step.
+    // The slot's command fan-in: one view per producer explicitly edged into
+    // the declared `commands` input (no type-keyed broadcast; zero edges is a
+    // legal, command-less slot). The `SlotRunner` drains and filters by its
+    // instance name each step.
     let cmd_in_idx = desc
         .inputs
         .iter()
@@ -1932,7 +1974,7 @@ fn bind_slot(
             .unwrap_or_default(),
     );
     // The declared self-tap over the occupant's own SequenceStatus output (+1
-    // fan-out counted at sizing) — Progress + outcome.
+    // fan-out counted at sizing): Progress plus outcome.
     let seq_tap = desc
         .inputs
         .iter()
@@ -1951,9 +1993,8 @@ fn bind_slot(
             .view(NoWake, NoWake)
             .expect("SequenceStatus self-tap reader (fan-out sized)"),
     );
-    // Host writers over the runner's declared output tail: SlotStatus + the
-    // "sequences" events channel (real output indices — no off-by-the-end
-    // BufferRole, no side allocation).
+    // Host writers over the runner's declared output tail: SlotStatus plus the
+    // "sequences" events channel (real output indices, no side allocation).
     let status_out_idx = desc
         .outputs
         .iter()
@@ -1968,15 +2009,7 @@ fn bind_slot(
     let events = owned_writer::<SequenceChannelEvent>(&output_rings[id][events_out_idx]);
 
     SlotRunner::new(
-        desc.name,
-        allowed,
-        initial,
-        inputs,
-        outputs,
-        control,
-        status_out,
-        events,
-        seq_status,
+        desc.name, allowed, initial, inputs, outputs, control, status_out, events, seq_status,
         commands,
     )
 }
@@ -2031,21 +2064,23 @@ fn find_cycle(adj: &[Vec<usize>]) -> Option<Vec<usize>> {
     None
 }
 
-/// The `Simulated` per-cycle timestamp: `epoch + k*dt`, computed in wide integer
-/// nanoseconds so the cycle index is never truncated (the previous `dt * k as u32`
-/// wrapped the timeline back to `epoch` every 2³² cycles, breaking monotonicity and
-/// stalling in-flight `Wait`s). The u128 product cannot overflow for any realistic
-/// run; the final i64-microsecond cast holds ~292k years of simulated time.
+/// The `Simulated` per-cycle timestamp, `epoch + k*dt`, computed in wide
+/// integer nanoseconds so the cycle index is never truncated (a narrower
+/// `dt * k as u32` would wrap the timeline back to `epoch` every 2³² cycles,
+/// breaking monotonicity and stalling in-flight `Wait`s). The u128 product
+/// cannot overflow for any realistic run; the final i64-microsecond cast holds
+/// roughly 292k years of simulated time.
 fn simulated_now(epoch: Timestamp, dt: Duration, k: u64) -> Timestamp {
     Timestamp(epoch.0 + (dt.as_nanos() * k as u128 / 1_000) as i64)
 }
 
-/// Whether the freshly scanned stopped set differs from the previously published one.
-/// Both slices come from the same in-order scan of the cyclic slots, so an element-wise
-/// `(name, reason)` compare is an exact membership compare — no set structure, no
-/// allocation. A length-only check is not enough: stops are no longer monotonic (a slot
-/// recovers via `Load`/`Reset`), so slot A can recover the same cycle slot B stops,
-/// changing the membership while the count stays put.
+/// Whether the freshly scanned stopped set differs from the previously
+/// published one. Both slices come from the same in-order scan of the cyclic
+/// slots, so an element-wise `(name, reason)` compare is an exact membership
+/// compare, with no set structure and no allocation. A length-only check is
+/// not enough: stops are not monotonic (a slot recovers via `Load`/`Reset`),
+/// so slot A can recover the same cycle slot B stops, changing the membership
+/// while the count stays put.
 fn stopped_set_changed(cur: &[StoppedSystem], prev: &[StoppedSystem]) -> bool {
     cur.len() != prev.len()
         || cur
@@ -2054,10 +2089,9 @@ fn stopped_set_changed(cur: &[StoppedSystem], prev: &[StoppedSystem]) -> bool {
             .any(|(a, b)| a.name != b.name || a.reason != b.reason)
 }
 
-/// The ONE ring-sizing helper (`docs/design-port-unification.md` §4 PASS 5): a
-/// Snapshot port is sized at the configured default depth (a latest-wins sample needs
-/// little history), a Log port at [`LOG_DEPTH`] (an every-record stream must absorb a
-/// slow tap).
+/// The one ring-sizing helper. A snapshot port is sized at the configured
+/// default depth (a latest-wins sample needs little history), a log port at
+/// [`LOG_DEPTH`] (an every-record stream must absorb a slow tap).
 fn alloc_ring(
     delivery: Delivery,
     max_size: usize,
@@ -2074,23 +2108,23 @@ fn alloc_ring(
     })
 }
 
-/// Mint the single [`MsgOut`] writer over a coordinator-owned ring — the
-/// [`slot_writer`] analogue for the message channel, exactly how the coordinator
-/// mints its own `status_out`/`control` writers. Called exactly once per ring at
-/// build (the region's writer claim enforces it).
+/// Mint the single [`MsgOut`] writer over a coordinator-owned ring, the
+/// [`slot_writer`] analogue for a message channel. Called exactly once per
+/// ring at build; the region's writer claim enforces it.
 fn owned_writer<M: Msg>(ring: &RingBuffer) -> MsgOut<M> {
-    // Invariant: each coordinator-owned message ring gets its single writer
-    // minted exactly once at build, so the claim is always free here.
+    // Each coordinator-owned message ring gets its single writer minted
+    // exactly once at build, so the claim is always free here.
     let writer = ring
         .writer(NoWake, NoWake)
         .expect("coordinator message ring has exactly one writer");
     MsgOut::new(writer)
 }
 
-/// Build a Postcard [`RegistryEntry`] for one message channel: the instance-qualified
-/// key `ComponentId::new("<instance>.<name>")` (the on-wire identity) over a clone of
-/// the ring — the [`registry_entry`] sibling for the self-describing record
-/// (`docs/messages.md` §2). No vtable/announce; the record's 2-byte id is the schema.
+/// Build a postcard [`RegistryEntry`] for one message channel: the
+/// instance-qualified key `ComponentId::new("<instance>.<name>")` (the on-wire
+/// identity) over a clone of the ring, the [`registry_entry`] sibling for the
+/// self-describing record. No vtable or announce; the record's 2-byte id is
+/// the schema.
 fn postcard_entry(
     instance: &str,
     name: &str,
@@ -2108,27 +2142,32 @@ fn postcard_entry(
     }
 }
 
-/// The synthetic instance prefix coordinator-owned buffers downlink under
-/// (telemetry.md §6): they have no system instance, so their qualified key is
+/// The synthetic instance prefix coordinator-owned buffers register under:
+/// they have no system instance, so their qualified key is
 /// `coordinator.health` / `coordinator.log` / `coordinator.coordinator_status`.
 const COORDINATOR_INSTANCE: &str = "coordinator";
 
-/// Build a [`RegistryEntry`] for one buffer: compute the instance-qualified key and
-/// the prefixed announce vtable+metadata once (telemetry.md §2.1/§6), capturing a
-/// clone of the ring as the read source.
+/// Build a [`RegistryEntry`] for one buffer: compute the instance-qualified
+/// key and the prefixed announce vtable and metadata once, capturing a clone
+/// of the ring as the read source.
 fn registry_entry(instance: &str, port: &PortDesc, ring: RingBuffer) -> RegistryEntry {
     let key = ComponentId::new(&format!("{instance}.{}", port.name));
-    // Invariant: only Table ports come through here (the caller branches on the
-    // schema), so the checked accessors are always `Some`.
-    // `announce` is an `Arc<dyn Fn>` (not directly callable); deref to a `&dyn Fn`.
-    let announce = port.announce().expect("table port carries an announce factory");
+    // Only table ports come through here (the caller branches on the schema),
+    // so the checked accessors are always `Some`. `announce` is an
+    // `Arc<dyn Fn>` (not directly callable); deref to a `&dyn Fn`.
+    let announce = port
+        .announce()
+        .expect("table port carries an announce factory");
     let (vtable, metadata) = (**announce)(instance);
     RegistryEntry {
         key,
         instance: Arc::from(instance),
         name: Arc::from(port.name),
         schema: EntrySchema::Table {
-            frame_id: port.id.component().expect("table port keys on a ComponentId"),
+            frame_id: port
+                .id
+                .component()
+                .expect("table port keys on a ComponentId"),
             vtable,
             metadata,
         },
@@ -2142,9 +2181,9 @@ fn registry_entry(instance: &str, port: &PortDesc, ring: RingBuffer) -> Registry
 // Coordinator
 // ---------------------------------------------------------------------------
 
-/// The wired, ready flight-software graph. Drives cyclic systems once per cycle,
-/// runs the async copy-in step, spawns and tears down async systems, and emits
-/// coordinator-level health + a status frame.
+/// The wired, ready flight-software graph. Drives cyclic systems once per
+/// cycle, runs the async copy-in step, spawns and tears down async systems,
+/// and emits coordinator-level health plus a status frame.
 pub struct Coordinator {
     config: CoordinatorConfig,
     cyclic: Vec<Box<dyn CyclicSlot>>,
@@ -2154,37 +2193,39 @@ pub struct Coordinator {
     status_out: Output<CoordinatorStatus>,
     status_view: Input<CoordinatorStatus>,
     stopped: Vec<StoppedSystem>,
-    /// Scratch for `update_status`'s per-cycle scan, swapped with `stopped` on a
-    /// change — no per-cycle allocation in the hot loop (S5).
+    /// Scratch for `update_status`'s per-cycle scan, swapped with `stopped` on
+    /// a change, so the hot loop never allocates.
     stopped_scratch: Vec<StoppedSystem>,
     cycle: u64,
-    /// A shared, lock-free mirror of `cycle` that an out-of-loop observer (e.g. the CLI
-    /// runner's heartbeat) can read while `run_for` holds `&mut self` — published each
-    /// cycle. Purely observational; nothing in the loop reads it back.
+    /// A shared, lock-free mirror of `cycle` that an observer outside the loop
+    /// can read while `run_for` holds `&mut self`, published each cycle.
+    /// Purely observational; nothing in the loop reads it back.
     progress: Arc<AtomicU64>,
-    /// The ONE broad registry over every registered buffer — frames and message
-    /// channels alike, untelemetered entries included (telemetry.md §2).
+    /// The one broad registry over every registered buffer, frames and message
+    /// channels alike, untelemetered entries included.
     registry: Arc<Registry>,
-    /// The single writer over the coordinator's declared `commands` output (its #0
-    /// bundle, §2.6): the in-proc `SequenceCommand` producer. A slot reads it only
-    /// over an explicit `"coordinator" -> <slot>` edge — the same wiring surface the
-    /// uplink uses; with no edge the handle is inert (visible in the graph, A2).
-    /// Minted once at `build()` (the ring's writer claim enforces one live writer)
-    /// and handed out by [`control_handle`](Coordinator::control_handle), which
-    /// takes it — `None` afterwards.
+    /// The single writer over the coordinator's declared `commands` output
+    /// (its #0 bundle): the in-proc `SequenceCommand` producer. A slot reads
+    /// it only over an explicit `"coordinator" -> <slot>` edge, the same
+    /// wiring surface an uplink uses; with no edge the handle is inert but
+    /// visible in the graph. Minted once at `build()` (the ring's writer claim
+    /// enforces one live writer) and handed out by
+    /// [`control_handle`](Coordinator::control_handle), which takes it, `None`
+    /// afterwards.
     control_out: Option<MsgOut<SequenceCommand>>,
-    /// The sole writer of the coordinator's boot-`SequenceRegistry` message channel (§5).
+    /// The sole writer of the coordinator's boot-`SequenceRegistry` message channel.
     seq_registry_out: MsgOut<SequenceRegistry>,
-    /// The prebuilt boot [`SequenceRegistry`] payload (the slots + their allowed
-    /// occupants), emitted once at the head of [`run_for`](Coordinator::run_for).
+    /// The prebuilt boot [`SequenceRegistry`] payload (the slots plus their
+    /// allowed occupants), emitted once at the head of
+    /// [`run_for`](Coordinator::run_for).
     seq_registry: SequenceRegistry,
-    /// Whether the boot `SequenceRegistry` has been emitted (emit-once; the re-emit hook
-    /// for a future `ReloadSequences` is [`emit_sequence_registry`](Coordinator::emit_sequence_registry)).
+    /// Whether the boot `SequenceRegistry` has been emitted (emit-once; the
+    /// re-emit hook is [`emit_sequence_registry`](Coordinator::emit_sequence_registry)).
     seq_registry_emitted: bool,
-    /// Latched by the first [`run_for`](Coordinator::run_for): a run consumes the
-    /// coordinator (spawned async systems and their transports are gone after
-    /// shutdown), so a second run would silently re-init everything over dead
-    /// plumbing — it panics instead.
+    /// Latched by the first [`run_for`](Coordinator::run_for): a run consumes
+    /// the coordinator (spawned async systems and their transports are gone
+    /// after shutdown), so a second run would silently re-init everything over
+    /// dead plumbing. It panics instead.
     started: bool,
     /// Canonical ring handles; declared last so they drop after every port.
     #[allow(dead_code)]
@@ -2197,60 +2238,61 @@ impl Coordinator {
         CoordinatorBuilder::new(config)
     }
 
-    /// The cyclic systems that have hard-stopped (lapped input), as also published
-    /// in the coordinator status frame.
+    /// The cyclic systems that have hard-stopped, as also published in the
+    /// coordinator status frame.
     pub fn stopped(&self) -> &[StoppedSystem] {
         &self.stopped
     }
 
-    /// A shared handle to the live cycle counter (0 before the first cycle), readable
-    /// while [`run_for`](Self::run_for) is running — e.g. for a progress heartbeat on
-    /// another task. Lock-free, observational only.
+    /// A shared handle to the live cycle counter (0 before the first cycle),
+    /// readable while [`run_for`](Self::run_for) is running, for a progress
+    /// heartbeat on another task. Lock-free, observational only.
     pub fn progress(&self) -> Arc<AtomicU64> {
         self.progress.clone()
     }
 
-    /// The ONE broad registry over every registered buffer (telemetry.md §2): an
-    /// index a logger, recorder, debugger, or test can use to read any buffer —
-    /// frame output or message channel — by its instance-qualified id
-    /// `ComponentId::new("<instance>.<name>")`. Unfiltered: untelemetered entries
-    /// (e.g. `coordinator.commands`) are visible here, unlike through
-    /// [`AllOutputs`](crate::AllOutputs).
+    /// The one broad registry over every registered buffer: an index a logger,
+    /// recorder, debugger, or test can use to read any buffer, frame output or
+    /// message channel, by its instance-qualified id
+    /// `ComponentId::new("<instance>.<name>")`. Unfiltered: untelemetered
+    /// entries (`coordinator.commands`, for example) are visible here, unlike
+    /// through [`AllOutputs`](crate::AllOutputs).
     pub fn registry(&self) -> Arc<Registry> {
         self.registry.clone()
     }
 
-    /// Emit the boot [`SequenceRegistry`] on the coordinator's message channel (§5): the
-    /// slots and their allowed occupants the panel's sequence view sources from. Called
-    /// once at the head of [`run_for`](Self::run_for); exposed as the re-emit hook a
-    /// future `ReloadSequences` would drive after rebuilding the payload.
+    /// Emit the boot [`SequenceRegistry`] on the coordinator's message
+    /// channel: the slots and their allowed occupants. Called once at the head
+    /// of [`run_for`](Self::run_for); exposed as the re-emit hook for a
+    /// rebuilt payload.
     pub fn emit_sequence_registry(&mut self) {
         let _ = self.seq_registry_out.emit(&self.seq_registry);
     }
 
-    /// The writer over the coordinator's command channel (`docs/messages.md` §4.3): the in-proc
-    /// convenience for driving slots `Load`/`Start`/`Stop`/`Abort`/`Reset` — the host / CLI / a
-    /// test [`emit`](MsgOut::emit)s [`SequenceCommand`]s the slots drain once per cycle (the same
-    /// mechanism the uplink system uses, just an in-proc channel instead of a wire one). Address
-    /// a slot by its **instance name** (`SequenceCommand::channel`) — the same key the wiring,
-    /// the telemetry prefix, and the boot [`SequenceRegistry`] use.
+    /// The writer over the coordinator's command channel: the in-proc
+    /// convenience for driving slots `Load`/`Start`/`Stop`/`Abort`/`Reset`.
+    /// The host or a test [`emit`](MsgOut::emit)s [`SequenceCommand`]s the
+    /// slots drain once per cycle, the same mechanism an uplink system uses,
+    /// just over an in-proc channel instead of a wire one. Address a slot by
+    /// its instance name (`SequenceCommand::channel`), the same key the
+    /// wiring, the telemetry prefix, and the boot [`SequenceRegistry`] use.
     ///
-    /// The channel has exactly **one** writer (the ring's writer claim enforces it), minted at
-    /// `build()` and handed out here **once**: the first call returns it, every later call
-    /// returns `None`. Take it once and hold it for the run — driving commands from one place is
-    /// now structural, not a discipline note.
+    /// The channel has exactly one writer (the ring's writer claim enforces
+    /// it), minted at `build()` and handed out here once: the first call
+    /// returns it, every later call returns `None`. Take it once and hold it
+    /// for the run, so driving commands from one place is structural.
     ///
-    /// Commands reach a slot only over an explicit `"coordinator" -> <slot>` edge
-    /// (`connect … msg="SequenceCommand"`, A2): with no edge the handle is inert —
-    /// visible in the wiring, diagnosable from the graph.
+    /// Commands reach a slot only over an explicit `"coordinator" -> <slot>`
+    /// edge; with no edge the handle is inert but the wiring shows it, so the
+    /// gap is diagnosable from the graph.
     pub fn control_handle(&mut self) -> Option<MsgOut<SequenceCommand>> {
         self.control_out.take()
     }
 
-    /// Every owned **output** buffer as `(instance-name, frame-id)`. The instance
-    /// name is the unique per-system handle a telemetry sink prefixes records with
-    /// (`<instance>.<frame>.<component>`), so two instances of one system type emit
-    /// distinct fully-qualified paths despite sharing a `frame_id` (wiring.md §6).
+    /// Every owned output buffer as `(instance-name, frame-id)`. The instance
+    /// name is the unique per-system handle a telemetry sink prefixes records
+    /// with (`<instance>.<frame>.<component>`), so two instances of one system
+    /// type emit distinct fully-qualified paths despite sharing a `frame_id`.
     pub fn output_instances(&self) -> Vec<(&str, ComponentId)> {
         self.rings
             .rings
@@ -2274,15 +2316,17 @@ impl Coordinator {
         Some(out)
     }
 
-    /// Run the lifecycle for a bounded number of cycles: init all (barrier) → run
-    /// → shutdown all. Convenient for tests and bounded missions.
+    /// Run the lifecycle for a bounded number of cycles: init all (behind the
+    /// barrier), run, then shut all down. Convenient for tests and bounded
+    /// missions.
     ///
     /// # Panics
     ///
-    /// Panics if called a second time on the same coordinator: a run *consumes* it —
-    /// the async systems were moved into their (now torn-down) tasks and a transport's
-    /// connection is gone — so a rerun would re-init every cyclic system over dead
-    /// plumbing. Build a fresh `Coordinator` to run again.
+    /// Panics if called a second time on the same coordinator: a run
+    /// *consumes* it. The async systems were moved into their (now torn-down)
+    /// tasks and a transport's connection is gone, so a rerun would re-init
+    /// every cyclic system over dead plumbing. Build a fresh `Coordinator` to
+    /// run again.
     pub async fn run_for(&mut self, cycles: usize) {
         assert!(
             !self.started,
@@ -2292,16 +2336,17 @@ impl Coordinator {
         );
         self.started = true;
         let tasks = self.start().await;
-        // Emit the boot `SequenceRegistry` once, before the first cycle's events flow, so
-        // a tap claimed after `build()` observes it ahead of any `SequenceChannelEvent`.
+        // Emit the boot `SequenceRegistry` once, before the first cycle's
+        // events flow, so a tap claimed after `build()` observes it ahead of
+        // any `SequenceChannelEvent`.
         if !self.seq_registry_emitted {
             self.emit_sequence_registry();
             self.seq_registry_emitted = true;
         }
-        // The Wall pacing budget. Only computed under a `Wall` clock — `cycle_rate` is
-        // documented ignored under `Simulated`, so an unusable rate must not panic
-        // there; under `Wall` the rate was validated at `build()` (`InvalidCycleRate`),
-        // so the conversion cannot panic.
+        // The Wall pacing budget. Only computed under a `Wall` clock, since
+        // `cycle_rate` is documented ignored under `Simulated` and an unusable
+        // rate must not panic there; under `Wall` the rate was validated at
+        // `build()` (`InvalidCycleRate`), so the conversion cannot panic.
         let budget = match self.config.clock {
             ClockMode::Wall => Duration::from_secs_f64(1.0 / self.config.cycle_rate),
             ClockMode::Simulated { .. } => Duration::ZERO,
@@ -2311,25 +2356,26 @@ impl Coordinator {
         for k in 0..cycles {
             let start = Instant::now();
             self.cycle += 1;
-            // Publish progress for any out-of-loop observer (the CLI heartbeat).
+            // Publish progress for any observer outside the loop.
             self.progress.store(self.cycle, Relaxed);
             // The per-cycle timestamp every system shares: wall time, or the
-            // simulated clock at `epoch + k*dt` (coordinator.md §6, fix #5/#6).
+            // simulated clock at `epoch + k*dt`.
             let now = match self.config.clock {
                 ClockMode::Wall => Timestamp::now(),
                 ClockMode::Simulated { dt } => simulated_now(epoch, dt, k as u64),
             };
-            // Commands are drained per-slot at the head of each `step`: a slot's
-            // declared `commands` fan-in reads exactly the producers explicitly edged
-            // into it (A2) and filters by its instance name, so a command dispatches
-            // the *same* cycle it lands — no coordinator-side command stage.
+            // Commands are drained per-slot at the head of each `step`: a
+            // slot's declared `commands` fan-in reads exactly the producers
+            // explicitly edged into it and filters by its instance name, so a
+            // command dispatches the *same* cycle it lands, with no
+            // coordinator-side command stage.
             for slot in &mut self.cyclic {
                 slot.step(now);
             }
             self.run_copy_ins();
             self.update_status(now);
             match self.config.clock {
-                // Wall: hold the cycle rate (run-fast-then-wait).
+                // Wall: sleep out the remainder of the cycle budget.
                 ClockMode::Wall => {
                     let elapsed = start.elapsed();
                     if elapsed < budget {
@@ -2338,18 +2384,19 @@ impl Coordinator {
                         self.telemeter_overrun(now, elapsed, budget);
                     }
                 }
-                // Simulated: no pacing — run as fast as possible. Still yield once so
-                // any spawned async consumer (driven by the copy-in above) gets to run
-                // on this cooperative runtime.
+                // Simulated: no pacing, run as fast as possible. Still yield
+                // once so any spawned async consumer (driven by the copy-in
+                // above) gets to run on this cooperative runtime.
                 ClockMode::Simulated { .. } => stellarator::yield_now().await,
             }
         }
         self.shutdown(tasks).await;
     }
 
-    /// Phase 1: spawn async systems (each inits + signals readiness), wait for the
-    /// init barrier, run cyclic inits, then release the async tasks. Holds the
-    /// barrier so every `init` completes before the first cycle or any `run` pass.
+    /// Phase 1: spawn async systems (each inits and signals readiness), wait
+    /// for the init barrier, run cyclic inits, then release the async tasks.
+    /// Holds the barrier so every `init` completes before the first cycle or
+    /// any `run` pass.
     async fn start(&mut self) -> Vec<AsyncTask> {
         let n_async = self.pending_async.len();
         let ready = Arc::new(WaitQueue::new());
@@ -2385,8 +2432,6 @@ impl Coordinator {
         for slot in &mut self.cyclic {
             slot.init();
         }
-        // The uplink is now an ordinary async system (`docs/messages.md` §4.4) — spawned with
-        // the rest above, no special reader task here.
 
         // Release the async tasks into their run loops.
         go_flag.store(true, Release);
@@ -2394,17 +2439,17 @@ impl Coordinator {
         tasks
     }
 
-    /// Mirror the newest upstream record into each async system's private buffer,
-    /// waking the async `recv` (coordinator.md §4.3). Snapshot semantics: older
-    /// unread upstream records are consumed on the way (freed for the producer) and
-    /// only the newest is mirrored, at most once per new upstream commit. A full
-    /// private ring (the consumer is behind) skips this cycle's mirror — the next
-    /// cycle retries with whatever is newest then.
+    /// Mirror the newest upstream record into each async system's private
+    /// buffer, waking the async `recv`. Snapshot semantics: older unread
+    /// upstream records are consumed on the way (freed for the producer) and
+    /// only the newest is mirrored, at most once per new upstream commit. A
+    /// full private ring (the consumer is behind) skips this cycle's mirror;
+    /// the next cycle retries with whatever is newest then.
     fn run_copy_ins(&mut self) {
         for c in &mut self.copy_ins {
-            // Skip untouched upstreams: `committed` moves iff a record landed on
-            // this ring, so this also keeps the pinned newest record from being
-            // re-mirrored (and the consumer re-woken) every cycle.
+            // Skip untouched upstreams: `committed` moves iff a record landed
+            // on this ring, so this also keeps the pinned newest record from
+            // being re-mirrored (and the consumer re-woken) every cycle.
             let committed = c.upstream.committed();
             if committed == c.last_committed {
                 continue;
@@ -2417,13 +2462,14 @@ impl Coordinator {
         }
     }
 
-    /// Scan the slots; when the stopped set changes, refresh the status frame and
-    /// log the change to coordinator health. The scan fills a retained scratch and
-    /// swaps it with `stopped` on a change — no per-cycle allocation (S5).
+    /// Scan the slots; when the stopped set changes, refresh the status frame
+    /// and log the change to coordinator health. The scan fills a retained
+    /// scratch and swaps it with `stopped` on a change, so nothing allocates
+    /// per cycle.
     fn update_status(&mut self, now: Timestamp) {
         self.stopped_scratch.clear();
         for slot in &self.cyclic {
-            // Only a panicked stop is an error-stop; a runtime slot's
+            // Only a hard stop is an error-stop; a runtime slot's
             // Empty/Loaded/Done states are not (the `stop_reason` projection).
             if let Some(reason) = slot.state().stop_reason() {
                 self.stopped_scratch.push(StoppedSystem {
@@ -2452,8 +2498,8 @@ impl Coordinator {
             stopped_count: self.stopped.len() as u64,
             stopped: FrameList::EMPTY,
         };
-        // Split borrows: the writer takes `status_out`, the closure reads `stopped`
-        // — no intermediate entries Vec (S5).
+        // Split borrows: the writer takes `status_out`, the closure reads
+        // `stopped`, so no intermediate entries Vec is needed.
         let stopped = &self.stopped;
         let _ = self.status_out.write_with(&frame, |fw| {
             fw.list(offset_of!(CoordinatorStatus, stopped), |l| {
@@ -2483,25 +2529,23 @@ impl Coordinator {
         self.coord_health.end_cycle(now, elapsed.as_micros() as u64);
     }
 
-    /// Cooperative teardown (coordinator.md §6): signal every async task, wake any
-    /// parked `recv`, give the tasks a brief window to finish their current pass
-    /// and run their own `shutdown`, then drop the tasks — whose `drop_guard`
-    /// cancels any still parked (the non-cooperative timeout path). Finally
-    /// `shutdown` the cyclic systems in reverse registration order. The
-    /// `RingTable` drops last (struct field order).
+    /// Cooperative teardown: signal every async task, wake any parked `recv`,
+    /// give the tasks a brief window to finish their current pass and run
+    /// their own `shutdown`, then drop the tasks, whose `drop_guard` cancels
+    /// any still parked. Finally `shutdown` the cyclic systems in reverse
+    /// registration order. The `RingTable` drops last (struct field order).
     async fn shutdown(&mut self, tasks: Vec<AsyncTask>) {
-        // The uplink is an async system now; it tears down with the rest (its `AsyncTask`
-        // drop guard cancels it if it is parked in `recv`).
         for t in &tasks {
             t.stop.store(true, Release);
             for n in &t.wake_on_stop {
                 n.notify();
             }
         }
-        // A task parked in `Input::recv` cannot be woken without data (the wait
-        // re-checks for a committed record), so a recv-driven loop only exits on
-        // the next datum; the bounded window lets timer- and data-paced tasks
-        // observe `stop` and flush in `System::shutdown` before we cancel.
+        // A task parked in `Input::recv` cannot be woken without data (the
+        // wait re-checks for a committed record), so a recv-driven loop only
+        // exits on the next datum; the bounded window lets timer- and
+        // data-paced tasks observe `stop` and flush in `System::shutdown`
+        // before we cancel.
         stellarator::sleep(JOIN_TIMEOUT).await;
         drop(tasks);
         for slot in self.cyclic.iter_mut().rev() {

@@ -1,14 +1,103 @@
-//! Frames & component derives for the `metor-fsw-2` flight-software framework.
+//! A framework for building modular flight software.
 //!
-//! A [`Frame`] is a `#[repr(C)]` struct that, with one `#[derive(Frame)]`, becomes a
-//! timestamped, [`ComponentId`](metor_proto::types::ComponentId)-named group of
-//! components serializing straight to a metor-proto table — and that can carry
-//! runtime-dynamic [`FrameList`]/[`FrameMap`] members. See `docs/frames.md`.
+//! A mission is a graph of **systems** (an IMU driver, a navigation filter, an
+//! attitude controller) that a single **coordinator** wires together, schedules,
+//! and observes. Systems exchange **frames** of typed components over
+//! shared-memory ring buffers, and the graph streams its state off-board through
+//! a downlink that is itself an ordinary system.
 //!
-//! This crate builds on the metor-proto primitives (the vtable
-//! `List`/`Map`/`PathComponent`/`Frame` ops, `PathHasher`, the ring's record
-//! alignment); its own surface is the [`Frame`] trait, the dynamic types,
-//! and the [`FrameWriter`] producer API.
+//! ```text
+//!            coordinator (sizes rings, binds ports, drives the cycle)
+//!                |
+//!   [imu] -Imu-> [nav] -NavState-> [ctrl] -TorqueCmd-> [actuators]
+//!     \_______________ ring buffers _______________/
+//!                |
+//!           [downlink] --> TCP --> ground
+//! ```
+//!
+//! # Frames
+//!
+//! A [`Frame`] is a `#[repr(C)]` struct whose fields are components sharing one
+//! logical timestamp, the whole group named by a `ComponentId`. One
+//! `#[derive(Frame)]` propagates the marked timestamp field to every component
+//! and describes the struct with a vtable, so a frame's in-memory bytes are also
+//! its wire bytes. Nothing in the data path serializes; a peer system, the
+//! downlink, and a ground database all read the same representation.
+//!
+//! ```edition2021
+//! use metor_fsw_2::*;
+//! use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
+//!
+//! #[derive(Frame, IntoBytes, Immutable, KnownLayout, FromBytes)]
+//! #[repr(C)]
+//! #[metor_fsw(name = "imu")]
+//! struct Imu {
+//!     #[metor_fsw(timestamp)]
+//!     timestamp: Timestamp,
+//!     omega: f64,
+//!     accel: f64,
+//! }
+//!
+//! fn main() {
+//!     let imu = Imu { timestamp: Timestamp(42), omega: 0.1, accel: 9.8 };
+//!     assert_eq!(Imu::NAME, "imu");
+//!     assert_eq!(imu.timestamp(), Timestamp(42));
+//! }
+//! ```
+//!
+//! [`FrameList`] and [`FrameMap`] members add bounded runtime dynamism (a
+//! variable number of elements stored past the fixed region) while keeping the
+//! worst-case frame size a compile-time constant, so rings can still be sized up
+//! front. [`FrameWriter`] builds such a frame's bytes; [`ListReader`] and
+//! [`MapReader`] read them back.
+//!
+//! # Systems and ports
+//!
+//! A system implements [`System`] plus one of two driving traits. A
+//! [`CyclicSystem`] is ticked by the coordinator, which calls `execute` once per
+//! cycle with the shared cycle [`Timestamp`]. An [`AsyncSystem`] owns its own
+//! loop; the coordinator spawns `run` once and the system paces itself. The
+//! `#[system]` attribute macro derives the port bundles and trait impls from an
+//! inherent impl block, so most systems write only their `execute` or `run`.
+//!
+//! Ports are typed handles over ring buffers. An [`Output`] owns the ring a
+//! frame is published to; an [`Input`] borrows a read-only view of an upstream
+//! ring. Publishing a fixed-size frame is a single ring write, and reading hands
+//! back a zero-copy grant borrowed in place. A writer never overwrites a record
+//! a reader has not consumed; a full ring surfaces as a [`WriteError`] instead
+//! of silent loss. Beside frames there is a second payload kind, postcard
+//! **messages** ([`MsgOut`], [`MsgIn`]), for commands and events that fan in
+//! from many producers.
+//!
+//! Systems never return errors. Every output bundle carries an implicit
+//! health/log port pair (the [`health`] module), and the framework publishes
+//! per-system [`SystemHealth`] and [`SystemLog`] frames each cycle, so a
+//! system's troubles flow off-board like any other telemetry.
+//!
+//! # The coordinator and wiring
+//!
+//! The [`Coordinator`] reads each system's static [`SystemDescriptor`] before
+//! constructing anything, validates the connection graph, allocates and sizes
+//! every ring, binds the ports, and then drives the cycle on a wall or simulated
+//! clock. Graphs are wired in Rust through [`CoordinatorBuilder`], or
+//! declaratively in KDL through the [`wiring`] module (the `kdl` feature).
+//!
+//! A system can also be compiled as a `cdylib` exporting the C ABI in [`abi`]
+//! (via [`export_system!`] or `#[system(export)]`) and loaded at runtime through
+//! [`dl`]. A loaded system describes itself over the ABI and is validated and
+//! wired exactly like a statically linked one. Both modules build without the
+//! `kdl` feature.
+//!
+//! # Built-in systems
+//!
+//! The crate ships the common infrastructure as ordinary systems: the TCP
+//! telemetry downlink and command uplink ([`TelemetrySystem`],
+//! [`UplinkSystem`]), the limit-alarm engine ([`AlarmSystem`]), and the
+//! [`sequence`] runtime that turns a `#[sequence]` async fn into a loadable
+//! occupant of a coordinator slot.
+//!
+//! The `docs/` directory of this crate holds the detailed design documents;
+//! `DESIGN.md` is the overview.
 
 mod alarm;
 mod binder;
@@ -24,26 +113,18 @@ mod system;
 mod telemetry;
 mod writer;
 
-// Public: `health::Level` is deliberately namespaced (a bare `Level` at the root
-// is collision-prone — S3); the frame types themselves stay root re-exports.
 pub mod health;
 
-// The sequence-occupant runtime (the future-driven state machine a `#[sequence]`
-// async fn becomes). Ungated alongside `abi`/`dl` — sequences are an ABI/runtime
-// feature, not KDL.
+// Not gated on `kdl`; sequences are an ABI/runtime feature.
 pub mod sequence;
 
-// The KDL wiring front-end (registry, the KDL params deserializer, `load()`).
 #[cfg(feature = "kdl")]
 pub mod wiring;
 
-// The `dlopen` C-ABI a system `cdylib` exports. Construction is decoupled from KDL (the
-// `BuildSystem` contract in `src/system.rs`), so the ABI is available with or without
-// the `kdl` feature: `fsw_create` leans only on that kdl-independent contract.
+// The C ABI a system `cdylib` exports, and the host loader that drives one.
+// Both build without the `kdl` feature; constructing a system does not depend
+// on the KDL front-end.
 pub mod abi;
-
-// The host-side `dlopen` loader (`DlSystem`) + the cyclic slot (`DlSlot`) that drives a
-// system `.so` across the ABI. Ungated alongside `abi`.
 pub mod dl;
 
 pub use dynamic::{FrameList, FrameMap, Slot};
@@ -51,49 +132,36 @@ pub use frame::Frame;
 pub use reader::{ListReader, MapReader};
 pub use writer::{FrameWriter, KeyError, ListWriter, MapWriter};
 
-// The transport-level errors the port APIs actually return (`Output::write` /
-// `MsgOut::emit` → `WriteError`; `Input::drain`/`recv` → `ReadError`) — re-exported
-// at the root so `?`-ing them needs no `metor_fsw_ring` path (S2).
+// The errors the port APIs return, at the root so `?`-ing them needs no direct
+// path into the ring crate.
 pub use metor_fsw_ring::{ReadError, WriteError};
 
-// The coordinator: builder, graph wiring, the run-phase lifecycle, and the
-// `bind`/`Binder` port-construction contract.
 pub use binder::{BindPorts, Binder, BoundInput, BoundPort, RingSource};
 pub use coordinator::{
     AllowedOccupant, ClockMode, Coordinator, CoordinatorBuilder, CoordinatorConfig,
-    InitialOccupant, NAME_CAP, PortRef, SLOT_NAME_CAP, SlotState, SlotStatus,
-    StopReason, StoppedSystem, SystemHandle, WireError,
+    InitialOccupant, NAME_CAP, PortRef, SLOT_NAME_CAP, SlotState, SlotStatus, StopReason,
+    StoppedSystem, SystemHandle, WireError,
 };
 
-// The general output registry and the telemetry downlink (its first consumer) + the uplink
-// command-plane ingest system (its read twin).
 pub use registry::{AllOutputs, EntrySchema, Registry, RegistryEntry};
 pub use telemetry::{
-    DownlinkParams, RecvTransport, TcpRecvTransport, TcpTransport, TelemetryConfig,
-    TelemetryMode, TelemetrySystem, Transport, TransportError, UplinkParams, UplinkSystem,
+    DownlinkParams, RecvTransport, TcpRecvTransport, TcpTransport, TelemetryConfig, TelemetryMode,
+    TelemetrySystem, Transport, TransportError, UplinkParams, UplinkSystem,
 };
 
-// The system trait family, the typed port wrappers, self-description, and the
-// standard health/log telemetry.
-// `compatible`/`split_decls` stay off the root: generic free-function names are
-// collision-prone under a glob import (S3). Wiring resolves compatibility itself;
-// the derives call `split_decls` through `crate::` paths.
 pub use descriptor::{
-    AnnounceFn, Capability, Delivery, FanIn, Hz, PortConn, PortDecl, PortDesc, PortId,
-    PortSchema, SystemDescriptor, SystemKind, split_decls,
+    AnnounceFn, Capability, Delivery, FanIn, Hz, PortConn, PortDecl, PortDesc, PortId, PortSchema,
+    SystemDescriptor, SystemKind, split_decls,
 };
-// `health::Level` stays namespaced (S3) — write `health::Level::Warn`.
+// `Level` stays under [`health`]; a bare `Level` at the root would be
+// collision-prone under glob imports.
 pub use health::{
     HealthPort, LOG_MSG_CAP, LogLine, MAX_ERR_KINDS, MAX_LINES, SystemHealth, SystemLog,
 };
 pub use port::{DEFAULT_DEPTH, FrameRef, Input, Output, buffer_capacity, capacity_for};
 
-// The alarm engine: config surface + the limit-alarm evaluation system
-// (`docs/alarms.md`).
 pub use alarm::{AlarmIn, AlarmOut, AlarmSpec, AlarmSystem, AlarmsParams, BandSpec, TargetSpec};
 
-// The general message channel — the `(PacketId, postcard)` record format, the
-// type-erased emit port, and its sizing/record helpers (`docs/messages.md` §1, §2).
 pub use message::{
     CommandOut, MAX_MSG_BYTES, MsgFanOut, MsgIn, MsgOut, MsgTable, NamedMsg, split_record,
 };
@@ -102,60 +170,52 @@ pub use system::{
     SystemInput, SystemOutput,
 };
 
-// Re-export the ring transport so a system author only needs `metor_fsw_2::*`.
+// The ring transport, so a system author needs only this crate.
 pub use metor_fsw_ring as ring;
 
-// The four component traits (defined by metor-fsw) and the fsw-2 derives (owned by
-// the metor-fsw-2-macros crate), so a user only needs `metor_fsw_2::*`.
+// The four component traits and the derives, so a system crate needs no direct
+// dependency on the crates that define them.
 pub use metor_fsw::{AsVTable, Componentize, Decomponentize, Metadatatize};
 pub use metor_fsw_2_macros::{Frame, SystemInput, SystemOutput};
 
-// The `export_system!` macro that emits a system `cdylib`'s C-ABI surface (the
-// hand-written escape hatch; `#[system(export)]` emits the same surface).
+// The hand-written escape hatch that emits a system `cdylib`'s C-ABI surface;
+// `#[system(export)]` emits the same surface.
 pub use metor_fsw_2_macros::export_system;
 
-// The `#[sequence]` attribute macro that turns an `async fn` into a dl-loadable
-// occupant (the sequence twin of `export_system!`). Coexists with the `sequence`
-// module above (module in the type namespace, macro in the macro namespace).
+// Turns an `async fn` into a loadable sequence occupant. Coexists with the
+// `sequence` module above (module in the type namespace, macro in the macro
+// namespace).
 pub use metor_fsw_2_macros::sequence;
 
-// The `#[system]` attribute macro: annotates a system's inherent impl block and
-// derives the port bundles, `System` + `CyclicSystem`/`AsyncSystem`, `BuildSystem`,
-// and (opt-in) the `fsw_*` exports from the `execute`/`run` signature
-// (`docs/design-system-macro.md`).
+// Annotates a system's inherent impl block and derives the port bundles, the
+// trait impls, and (opt-in) the `fsw_*` exports from the `execute`/`run`
+// signature.
 pub use metor_fsw_2_macros::system;
 
-// The coordinator cycle timestamp every `execute` receives — re-exported at the root
-// so `#[system]`-authored code writes `now: Timestamp` without reaching into
-// `metor_proto::types` (`docs/design-system-macro.md` §3.1).
+// The cycle timestamp every `execute` receives, at the root so systems write
+// `now: Timestamp` without importing the protocol crate.
 pub use metor_proto::types::Timestamp;
 
-// The sequence-occupant runtime surface: the **types** the macro/seam name. The free
-// author API (`wait`/`progress`/`aborted`/`now`) and the generic-named `Step`/`Wait`
-// stay namespaced under [`sequence`] (S3) — `metor_fsw_2::wait()` or a bare `Wait`
-// at the root would be collision-prone, and `metor_fsw_2::now()` would read as wall
-// time (review E7).
+// The sequence types only. The author-facing free functions (`wait`,
+// `progress`, `aborted`, `now`) stay under [`sequence`], where the generic
+// names cannot collide under glob imports and `now` reads as sequence time
+// rather than wall time.
 pub use sequence::{
     Outcome, Seq, SeqBound, SeqClock, SeqStatusOut, SeqSystem, SequenceStatus, SlotControlIn,
 };
 
-// Re-exports the `#[derive(Frame)]` generated code names
-// (`::metor_fsw_2::metor_proto::…`, `::metor_fsw_2::path::…`, `::metor_fsw_2::kdl::…`)
-// so a crate depending only on metor-fsw-2 can use those derives without a direct
-// `metor-fsw` / `metor-proto` / `kdl` dependency.
+// The paths the derive-generated code names (`::metor_fsw_2::metor_proto::…`,
+// `::metor_fsw_2::path::…`), so a crate depending only on this one can use the
+// derives.
 pub use metor_fsw::path;
 pub use {metor_proto, metor_proto_wkt};
 
-// The host dlopen loader surface (available without `kdl`).
 pub use dl::{DlError, DlSystem};
 
-// The `Wiring` data model, the Rust builder, the shared resolver, and the cargo build
-// driver (the data/serialization split). These ride the `kdl` feature with the wiring
-// front-end they share a resolver with.
-// Types only (S3): the wiring free functions (`wiring::parse`, `wiring::resolve`,
-// `wiring::load`, `wiring::build_artifacts`, `wiring::load_bundle`, …) stay
-// namespaced — `metor_fsw_2::parse`/`resolve` at the root are collision-prone
-// under the glob imports the docs recommend.
+// The `Wiring` data model, the Rust builder, and the build driver. Types only;
+// the wiring free functions (`wiring::parse`, `wiring::resolve`,
+// `wiring::load`, …) stay namespaced, since bare `parse`/`resolve` at the root
+// would be collision-prone under glob imports.
 #[cfg(feature = "kdl")]
 pub use wiring::{
     AllowedOccupantSpec, Artifact, BuildError, BuildOptions, BundleError, ClockSpec,
@@ -163,16 +223,15 @@ pub use wiring::{
     SlotSpec, SystemSpec, TCP_DOWNLINK_TYPE, TCP_UPLINK_TYPE, Wiring, WiringBuilder,
 };
 
-// The clap-based CLI runner (`metor-fsw {build,package,run}`) and the reusable
-// `cli::main()`/`cli::run()` entry points. Rides the `kdl` feature (it uses
-// `parse`/`build_artifacts`/`resolve`); the `metor-fsw` bin delegates to `cli::main()`.
+// The clap-based `metor-fsw {build,package,run}` runner; the bin delegates to
+// `cli::main()`.
 #[cfg(feature = "kdl")]
 pub mod cli;
 
 #[cfg(feature = "kdl")]
 pub use kdl;
 
-// Frame acceptance tests span frame/dynamic/writer/reader, so they stay a
-// crate-root tests module rather than living under any single module.
+// Frame acceptance tests span frame/dynamic/writer/reader, so they live at the
+// crate root rather than under any single module.
 #[cfg(test)]
 mod tests;

@@ -1,22 +1,28 @@
-//! `#[system]` — the one-annotation system author surface
-//! (`docs/design-system-macro.md`). Annotates a type's **inherent impl block**, reads
-//! the ports off the `execute` (cyclic) / `run` (async) method signature, and emits
-//! everything a hand-written system spells out today:
+//! Implementation of the `#[system]` attribute.
 //!
-//! 1. the inherent impl re-emitted (recognized methods hidden,
-//!    `new` and unrecognized methods verbatim),
-//! 2. hidden `__<Ty>In`/`__<Ty>Out` port bundles carrying the *existing*
-//!    `#[derive(SystemInput)]`/`#[derive(SystemOutput)]` (the port-unification
-//!    insulation point, §9 — this macro owns no descriptor/bind knowledge),
-//! 3. `impl System` + `impl CyclicSystem`/`impl AsyncSystem` (delegating through
-//!    `Out::split`, so `Out<>` never appears in user code — E8a),
-//! 4. `impl BuildSystem` from `fn new` (or `Default` when absent),
-//! 5. optionally the `fsw_*` dl C-ABI exports (`export`/`export = "feature"`),
-//!    byte-identical to `export_system!`'s but `cfg`-gated.
+//! The attribute annotates a type's inherent impl block and derives the whole
+//! system surface from the method signatures found there. A system's ports
+//! are declared once, as parameters of its `execute` (cyclic) or `run`
+//! (async) method, and the macro reads them off that signature to emit:
 //!
-//! All errors are `syn::Error`s on the narrowest offending token, combined so a wrong
-//! signature reports everything at once (§10). On error the original impl is re-emitted
-//! untouched so downstream name resolution stays alive.
+//! 1. the inherent impl itself, with the recognized methods renamed to hidden
+//!    delegation targets and everything else passed through verbatim,
+//! 2. two hidden port-bundle structs, one per direction, carrying
+//!    `#[derive(SystemInput)]` and `#[derive(SystemOutput)]` so that all
+//!    descriptor and binding knowledge stays in those derives,
+//! 3. `impl System` plus `impl CyclicSystem` or `impl AsyncSystem`, which
+//!    split the output bundle and lend each port back to the user's method in
+//!    its original parameter order,
+//! 4. `impl BuildSystem`, delegating to `fn new` when the impl has one and to
+//!    `Default` otherwise,
+//! 5. with the `export` argument, the `fsw_*` C-ABI entry points for
+//!    dynamically loaded systems, behind a `cfg` gate.
+//!
+//! Every validation failure is a `syn::Error` on the narrowest offending
+//! token, and independent failures are combined so a broken signature reports
+//! all of its problems in one compile. On error the original impl block is
+//! re-emitted untouched, which keeps the type and its methods resolving and
+//! avoids cascading diagnostics.
 
 use convert_case::{Case, Casing};
 use proc_macro2::{Span, TokenStream};
@@ -25,18 +31,18 @@ use syn::parse::Parser;
 use syn::punctuated::Punctuated;
 use syn::spanned::Spanned;
 use syn::{
-    Expr, ExprLit, FnArg, Ident, ImplItem, ImplItemFn, ItemImpl, Lit, Meta, Pat, ReturnType,
-    Token, Type,
+    Expr, ExprLit, FnArg, Ident, ImplItem, ImplItemFn, ItemImpl, Lit, Meta, Pat, ReturnType, Token,
+    Type,
 };
 
 use crate::sig;
 
 // ---------------------------------------------------------------------------
-// Attribute arguments (§4)
+// Attribute arguments
 // ---------------------------------------------------------------------------
 
-/// How the `fsw_*` dl ABI is gated: `export` ⇒ `not(test)` only; `export = "feat"` ⇒
-/// additionally on that cargo feature. Absent ⇒ no exports (static-link-only crate).
+/// Gating for the generated C-ABI exports. Bare `export` gates them on
+/// `not(test)`; `export = "feat"` additionally requires that cargo feature.
 enum Export {
     Bare(Span),
     Feature(String, Span),
@@ -65,7 +71,10 @@ fn parse_args(attr: TokenStream) -> Result<Args, syn::Error> {
     for meta in metas {
         match &meta {
             Meta::NameValue(nv) if nv.path.is_ident("name") => {
-                if let Expr::Lit(ExprLit { lit: Lit::Str(s), .. }) = &nv.value {
+                if let Expr::Lit(ExprLit {
+                    lit: Lit::Str(s), ..
+                }) = &nv.value
+                {
                     args.name = Some(s.value());
                 } else {
                     return Err(syn::Error::new_spanned(
@@ -78,7 +87,10 @@ fn parse_args(attr: TokenStream) -> Result<Args, syn::Error> {
                 args.export = Some(Export::Bare(p.span()));
             }
             Meta::NameValue(nv) if nv.path.is_ident("export") => {
-                if let Expr::Lit(ExprLit { lit: Lit::Str(s), .. }) = &nv.value {
+                if let Expr::Lit(ExprLit {
+                    lit: Lit::Str(s), ..
+                }) = &nv.value
+                {
                     args.export = Some(Export::Feature(s.value(), nv.span()));
                 } else {
                     return Err(syn::Error::new_spanned(
@@ -102,8 +114,9 @@ fn parse_args(attr: TokenStream) -> Result<Args, syn::Error> {
     Ok(args)
 }
 
-/// The default wiring name: the self-type ident with a trailing `System` stripped,
-/// snake_cased (`NavSystem` → `"nav"`, `GpsDriver` → `"gps_driver"`).
+/// Derive the default system name from the type ident by stripping a trailing
+/// `System` and snake_casing the rest, so `NavSystem` becomes `"nav"` and
+/// `GpsDriver` becomes `"gps_driver"`.
 fn default_name(ty_ident: &Ident) -> String {
     let s = ty_ident.to_string();
     let base = match s.strip_suffix("System") {
@@ -114,10 +127,10 @@ fn default_name(ty_ident: &Ident) -> String {
 }
 
 // ---------------------------------------------------------------------------
-// Signature classification (§5)
+// Signature classification
 // ---------------------------------------------------------------------------
 
-/// The accepted port type heads and which bundle they land in.
+/// The recognized port type heads and the direction bundle each lands in.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum PortKind {
     Input,
@@ -155,14 +168,14 @@ impl PortKind {
     }
 }
 
-/// One classified `execute`/`run`/`init`/`shutdown` parameter, in signature order.
-/// The element type is boxed: a `syn::Type` dwarfs the dataless variants.
+/// What one parameter of a recognized method turned out to be. The element
+/// type is boxed because a `syn::Type` dwarfs the dataless variants.
 enum ParamKind {
-    /// `now: Timestamp` — the cycle timestamp.
+    /// `now: Timestamp`, the cycle timestamp.
     Now,
-    /// `x: &mut <Port><T>` — a wired port.
+    /// `x: &mut <Port><T>`, a wired port.
     Port { kind: PortKind, elem: Box<Type> },
-    /// `health: &mut HealthPort` — the opt-in health handle.
+    /// `health: &mut HealthPort`, the opt-in health handle.
     Health,
 }
 
@@ -171,7 +184,8 @@ struct ExecParam {
     kind: ParamKind,
 }
 
-/// The §10 catch-all for a parameter that is neither a port nor `now`/health.
+/// The catch-all error for a parameter that is neither a port, `now`, nor the
+/// health handle.
 fn unrecognized(ty: &Type) -> syn::Error {
     let found = ty.to_token_stream().to_string().replace(' ', "");
     syn::Error::new_spanned(
@@ -184,8 +198,8 @@ fn unrecognized(ty: &Type) -> syn::Error {
     )
 }
 
-/// Classify the parameters of `f`. Pushes every independent error; returns
-/// the classification in signature order.
+/// Classify every parameter of `f`, pushing an error for each independent
+/// problem and returning the accepted parameters in signature order.
 fn classify_params(
     f: &mut ImplItemFn,
     method: &str,
@@ -194,7 +208,6 @@ fn classify_params(
     let mut out = Vec::new();
     let mut saw_health = false;
 
-    // `&mut self` receiver (the system state lives in the struct).
     let recv_msg = format!("`{method}` takes `&mut self` (the system state lives in the struct)");
     match f.sig.inputs.first() {
         Some(FnArg::Receiver(r)) if r.reference.is_some() && r.mutability.is_some() => {}
@@ -207,19 +220,25 @@ fn classify_params(
         let ident = match &*pt.pat {
             Pat::Ident(p) => p.ident.clone(),
             other => {
-                errors.push(syn::Error::new_spanned(other, "parameters need a plain name"));
+                errors.push(syn::Error::new_spanned(
+                    other,
+                    "parameters need a plain name",
+                ));
                 continue;
             }
         };
         match &mut *pt.ty {
-            // By-value parameter: only `Timestamp` is accepted; a by-value port gets
-            // the dedicated "&mut" error (ports are runner-owned, lent per cycle).
+            // By value only `Timestamp` is accepted. A by-value port gets a
+            // dedicated error since ports are runner-owned and lent per cycle.
             Type::Path(_) => {
                 let head = sig::type_head(&pt.ty)
                     .map(|i| i.to_string())
                     .unwrap_or_default();
                 if head == "Timestamp" {
-                    out.push(ExecParam { ident, kind: ParamKind::Now });
+                    out.push(ExecParam {
+                        ident,
+                        kind: ParamKind::Now,
+                    });
                 } else if PortKind::from_head(&head).is_some() || head == "HealthPort" {
                     errors.push(syn::Error::new_spanned(
                         &pt.ty,
@@ -259,7 +278,10 @@ fn classify_params(
                         ));
                         continue;
                     }
-                    out.push(ExecParam { ident, kind: ParamKind::Health });
+                    out.push(ExecParam {
+                        ident,
+                        kind: ParamKind::Health,
+                    });
                 } else if let Some(kind) = PortKind::from_head(&head) {
                     if r.mutability.is_none() {
                         errors.push(syn::Error::new_spanned(
@@ -290,7 +312,10 @@ fn classify_params(
                         ));
                         continue;
                     }
-                    out.push(ExecParam { ident, kind: ParamKind::Port { kind, elem } });
+                    out.push(ExecParam {
+                        ident,
+                        kind: ParamKind::Port { kind, elem },
+                    });
                 } else {
                     errors.push(unrecognized(&pt.ty));
                 }
@@ -305,14 +330,14 @@ fn classify_params(
 // Expansion
 // ---------------------------------------------------------------------------
 
-/// The proc-macro2 body of `#[system]` (`TokenStream2`-shaped so the in-crate unit
-/// tests can drive it directly).
+/// The body of `#[system]`, over `proc_macro2` streams so the unit tests
+/// below can drive it directly.
 pub fn system_impl(attr: TokenStream, item: TokenStream) -> TokenStream {
     match expand(attr, item.clone()) {
         Ok(ts) => ts,
         Err(e) => {
-            // Re-emit the original impl so the type and its inherent methods keep
-            // resolving (no cascading unknown-type errors), then the diagnostics.
+            // Re-emit the original impl so the type and its inherent methods
+            // keep resolving, then append the diagnostics.
             let err = e.to_compile_error();
             quote! {
                 #item
@@ -358,7 +383,7 @@ fn expand(attr: TokenStream, item: TokenStream) -> Result<TokenStream, syn::Erro
         ));
     };
 
-    // ---- locate the recognized methods (everything else passes through verbatim).
+    // Locate the recognized methods; everything else passes through verbatim.
     let mut execute_idx = None;
     let mut run_idx = None;
     let mut new_idx = None;
@@ -406,11 +431,13 @@ fn expand(attr: TokenStream, item: TokenStream) -> Result<TokenStream, syn::Erro
         }
     };
 
-    // ---- the main method: classify + hide (rename).
+    // Classify the main method's parameters, then hide it behind a rename.
     let main_params;
     let main_hidden;
     {
-        let ImplItem::Fn(f) = &mut imp.items[main_idx] else { unreachable!() };
+        let ImplItem::Fn(f) = &mut imp.items[main_idx] else {
+            unreachable!()
+        };
         if is_cyclic {
             if let Some(asyncness) = &f.sig.asyncness {
                 errors.push(syn::Error::new_spanned(
@@ -428,7 +455,8 @@ fn expand(attr: TokenStream, item: TokenStream) -> Result<TokenStream, syn::Erro
         let method = if is_cyclic { "execute" } else { "run" };
         let params = classify_params(f, method, &mut errors);
 
-        // `now: Timestamp` — required (exactly once) on execute, rejected on run.
+        // `now: Timestamp` is required exactly once on execute and rejected
+        // on run.
         let mut now_seen = false;
         for (p, arg) in params.iter().zip(non_receiver_args(&f.sig)) {
             if matches!(p.kind, ParamKind::Now) {
@@ -459,11 +487,14 @@ fn expand(attr: TokenStream, item: TokenStream) -> Result<TokenStream, syn::Erro
         main_params = params;
     }
 
-    // ---- optional init/shutdown: classify + validate against execute's outputs.
+    // Classify optional init/shutdown and validate them against the main
+    // method's outputs.
     let mut lifecycle = [(init_idx, "init", None), (shutdown_idx, "shutdown", None)];
     for (idx, method, params_slot) in lifecycle.iter_mut() {
         let Some(i) = *idx else { continue };
-        let ImplItem::Fn(f) = &mut imp.items[i] else { unreachable!() };
+        let ImplItem::Fn(f) = &mut imp.items[i] else {
+            unreachable!()
+        };
         if let Some(asyncness) = &f.sig.asyncness {
             errors.push(syn::Error::new_spanned(
                 asyncness,
@@ -479,18 +510,20 @@ fn expand(attr: TokenStream, item: TokenStream) -> Result<TokenStream, syn::Erro
     let init_params = lifecycle[0].2.take();
     let shutdown_params = lifecycle[1].2.take();
 
-    // ---- optional `fn new` (kept verbatim; BuildSystem delegates to it).
-    // `None` ⇒ no `new` at all; `Some(None)` ⇒ `fn new()`; `Some(Some(P))` ⇒ params P.
+    // Optional `fn new`, kept verbatim; `BuildSystem` delegates to it.
+    // `None` means no `new` at all, `Some(None)` a paramless `fn new()`, and
+    // `Some(Some(p))` one taking `p`.
     let mut new_params: Option<Option<Type>> = None;
     if let Some(i) = new_idx {
-        let ImplItem::Fn(f) = &imp.items[i] else { unreachable!() };
+        let ImplItem::Fn(f) = &imp.items[i] else {
+            unreachable!()
+        };
         match validate_new(f, &ty_ident) {
             Ok(p) => new_params = Some(p),
             Err(e) => errors.push(e),
         }
     }
 
-    // ---- `export` is a dl (cyclic) surface; the ABI cannot drive `async fn run`.
     if let Some(export) = &args.export
         && !is_cyclic
     {
@@ -512,9 +545,9 @@ fn expand(attr: TokenStream, item: TokenStream) -> Result<TokenStream, syn::Erro
     let in_ident = format_ident!("__{}In", ty_ident);
     let out_ident = format_ident!("__{}Out", ty_ident);
 
-    // Hidden bundles: field name = param ident, field order = signature order within
-    // each direction. A port-less direction is a genuinely empty struct (the
-    // derives handle zero ports: empty `decls()`, `Self {}` bind).
+    // Hidden bundles. Field name is the parameter ident and field order the
+    // signature order within each direction. A direction with no ports is a
+    // genuinely empty struct, which the derives accept.
     let bundle = |want_input: bool| -> TokenStream {
         let fields: Vec<TokenStream> = main_params
             .iter()
@@ -602,8 +635,9 @@ fn expand(attr: TokenStream, item: TokenStream) -> Result<TokenStream, syn::Erro
                     __input: &mut Self::Input,
                     __output: &mut Self::Output,
                 ) {
-                    // `Out::split` (E8a): disjoint borrows of the user ports and the
-                    // health pair, so both can be lent to the user fn at once.
+                    // Splitting the output yields disjoint borrows of the user
+                    // ports and the health pair, so both can be lent to the
+                    // user's method at once.
                     let (__ports, __health) = #fsw2::Out::split(__output);
                     let _ = (&__input, &__ports, &__health);
                     self.#main_hidden(#(#main_args),*)
@@ -640,8 +674,9 @@ fn expand(attr: TokenStream, item: TokenStream) -> Result<TokenStream, syn::Erro
             }
         },
         None => {
-            // No `fn new`: construction requires `Default`. The spanned call surfaces
-            // a missing impl as an error on the annotated type name.
+            // Without `fn new`, construction goes through `Default`. The
+            // spanned call surfaces a missing impl as an error on the
+            // annotated type name.
             let default_call = quote_spanned! {ty_ident.span()=>
                 <#self_ty as ::core::default::Default>::default()
             };
@@ -679,23 +714,23 @@ fn expand(attr: TokenStream, item: TokenStream) -> Result<TokenStream, syn::Erro
     })
 }
 
-/// The non-receiver arguments of `sig`, aligned with `classify_params`'s output order.
+/// The non-receiver arguments of `sig`, aligned with `classify_params`'s
+/// output order.
 fn non_receiver_args(sig: &syn::Signature) -> impl Iterator<Item = &FnArg> {
-    sig.inputs
-        .iter()
-        .filter(|a| matches!(a, FnArg::Typed(_)))
+    sig.inputs.iter().filter(|a| matches!(a, FnArg::Typed(_)))
 }
 
-/// Turn a recognized method into its hidden twin: rename + `#[doc(hidden)]`.
-/// The body tokens are untouched (spans preserved).
+/// Turn a recognized method into its hidden twin by renaming it and marking
+/// it `#[doc(hidden)]`. The body tokens are untouched, so spans survive.
 fn hide(f: &mut ImplItemFn, hidden: &Ident) {
     f.sig.ident = hidden.clone();
     f.attrs.push(syn::parse_quote!(#[doc(hidden)]));
-    f.attrs.push(syn::parse_quote!(#[allow(clippy::too_many_arguments)]));
+    f.attrs
+        .push(syn::parse_quote!(#[allow(clippy::too_many_arguments)]));
 }
 
-/// `init`/`shutdown` may only take execute's *output* ports (matched by ident, same
-/// port type) and `&mut HealthPort` (§5, §10).
+/// Check that `init`/`shutdown` only take output ports the main method also
+/// takes (matched by ident, with the same port type) plus `&mut HealthPort`.
 fn validate_lifecycle(
     params: &[ExecParam],
     method: &str,
@@ -767,8 +802,9 @@ fn validate_lifecycle(
     }
 }
 
-/// `fn new` drives `BuildSystem`: `fn new(params: P) -> Self` or `fn new() -> Self`,
-/// no receiver. Returns the params type (`None` for paramless).
+/// Check the shape of `fn new`, which must be `fn new(params: P) -> Self` or
+/// `fn new() -> Self` with no receiver. Returns the params type, `None` when
+/// paramless.
 fn validate_new(f: &ImplItemFn, ty_ident: &Ident) -> Result<Option<Type>, syn::Error> {
     const MSG: &str = "`new` must be `fn new(params: P) -> Self` or `fn new() -> Self`";
     let mut params = Vec::new();
@@ -782,9 +818,7 @@ fn validate_new(f: &ImplItemFn, ty_ident: &Ident) -> Result<Option<Type>, syn::E
         return Err(syn::Error::new_spanned(&f.sig.inputs, MSG));
     }
     let ret_ok = match &f.sig.output {
-        ReturnType::Type(_, ty) => {
-            sig::type_head(ty).is_some_and(|i| i == "Self" || i == ty_ident)
-        }
+        ReturnType::Type(_, ty) => sig::type_head(ty).is_some_and(|i| i == "Self" || i == ty_ident),
         ReturnType::Default => false,
     };
     if !ret_ok {
@@ -794,7 +828,7 @@ fn validate_new(f: &ImplItemFn, ty_ident: &Ident) -> Result<Option<Type>, syn::E
 }
 
 // ---------------------------------------------------------------------------
-// Unit tests: expansion shape + the §10 error table (in-crate, over TokenStream2)
+// Tests
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
@@ -827,19 +861,29 @@ mod tests {
     #[test]
     fn minimal_cyclic_expansion() {
         let out = expand_ok(quote!(), minimal());
-        // Default name: `System` suffix stripped + snake_case.
-        assert!(out.contains(r#"const NAME: &'static str = "echo";"#), "{out}");
-        // Hidden bundles carry the real derives (the insulation point).
+        // Default name: `System` suffix stripped, then snake_case.
+        assert!(
+            out.contains(r#"const NAME: &'static str = "echo";"#),
+            "{out}"
+        );
+        // The hidden bundles carry the real derives.
         assert!(out.contains("struct __EchoSystemIn"), "{out}");
         assert!(out.contains("struct __EchoSystemOut"), "{out}");
         assert!(out.contains("pub ping: metor_fsw_2::Input<Ping>"), "{out}");
         assert!(out.contains("pub pong: metor_fsw_2::Output<Pong>"), "{out}");
-        // Out<> only in generated code; split-based delegation; Default-built params.
-        assert!(out.contains("type Output = metor_fsw_2::Out<__EchoSystemOut>"), "{out}");
+        // `Out<>` appears only in generated code, delegation goes through
+        // `Out::split`, and construction falls back to `Default`.
+        assert!(
+            out.contains("type Output = metor_fsw_2::Out<__EchoSystemOut>"),
+            "{out}"
+        );
         assert!(out.contains("Out::split"), "{out}");
         assert!(out.contains("__fsw_execute"), "{out}");
-        assert!(out.contains("as ::core::default::Default>::default()"), "{out}");
-        // No export arg: no ABI surface.
+        assert!(
+            out.contains("as ::core::default::Default>::default()"),
+            "{out}"
+        );
+        // No export arg, no ABI surface.
         assert!(!out.contains("fsw_abi_version"), "{out}");
     }
 
@@ -854,12 +898,17 @@ mod tests {
                 }
             },
         );
-        assert!(out.contains(r#"const NAME: &'static str = "navigator";"#), "{out}");
-        assert!(out.contains(r#"#[cfg(all(feature = "export", not(test)))]"#), "{out}");
+        assert!(
+            out.contains(r#"const NAME: &'static str = "navigator";"#),
+            "{out}"
+        );
+        assert!(
+            out.contains(r#"#[cfg(all(feature = "export", not(test)))]"#),
+            "{out}"
+        );
         assert!(out.contains("fsw_abi_version"), "{out}");
         assert!(out.contains("type Params = NavParams;"), "{out}");
-        // Empty output direction is a genuinely empty bundle (the derives handle
-        // zero ports: empty decls, `Self {}` bind).
+        // A port-less direction is a genuinely empty bundle.
         assert!(out.contains("pub struct __NavSystemOut {}"), "{out}");
     }
 
@@ -875,8 +924,14 @@ mod tests {
         );
         assert!(out.contains("AsyncSystem for Radio"), "{out}");
         assert!(out.contains("__fsw_run"), "{out}");
-        assert!(out.contains(r#"const NAME: &'static str = "radio";"#), "{out}");
-        assert!(out.contains("pub cmds: metor_fsw_2::MsgIn<GroundCmd>"), "{out}");
+        assert!(
+            out.contains(r#"const NAME: &'static str = "radio";"#),
+            "{out}"
+        );
+        assert!(
+            out.contains("pub cmds: metor_fsw_2::MsgIn<GroundCmd>"),
+            "{out}"
+        );
     }
 
     #[test]
@@ -890,7 +945,10 @@ mod tests {
                 }
             },
         );
-        assert!(out.contains("fn init(&mut self, __output: &mut Self::Output)"), "{out}");
+        assert!(
+            out.contains("fn init(&mut self, __output: &mut Self::Output)"),
+            "{out}"
+        );
         assert!(out.contains("__fsw_init"), "{out}");
         assert!(out.contains("&mut __ports.beat, __health"), "{out}");
     }
@@ -907,11 +965,13 @@ mod tests {
             },
         );
         assert!(
-            msgs.iter().any(|m| m.contains("only #[sequence] ports are moved by value")),
+            msgs.iter()
+                .any(|m| m.contains("only #[sequence] ports are moved by value")),
             "{msgs:?}"
         );
         assert!(
-            msgs.iter().any(|m| m.contains("non-port state belongs in fields")),
+            msgs.iter()
+                .any(|m| m.contains("non-port state belongs in fields")),
             "{msgs:?}"
         );
         assert!(
@@ -924,7 +984,10 @@ mod tests {
     fn error_table_rows() {
         // no execute/run
         let msgs = expand_err(quote!(), quote! { impl Empty { fn helper(&self) {} } });
-        assert!(msgs[0].contains("#[system] needs a `fn execute"), "{msgs:?}");
+        assert!(
+            msgs[0].contains("#[system] needs a `fn execute"),
+            "{msgs:?}"
+        );
 
         // both
         let msgs = expand_err(
@@ -934,53 +997,79 @@ mod tests {
                 async fn run(&mut self) {}
             } },
         );
-        assert!(msgs.iter().any(|m| m.contains("cyclic or async, not both")), "{msgs:?}");
+        assert!(
+            msgs.iter().any(|m| m.contains("cyclic or async, not both")),
+            "{msgs:?}"
+        );
 
         // async execute
         let msgs = expand_err(
             quote!(),
             quote! { impl A { async fn execute(&mut self, now: Timestamp) {} } },
         );
-        assert!(msgs.iter().any(|m| m.contains("write `async fn run`")), "{msgs:?}");
+        assert!(
+            msgs.iter().any(|m| m.contains("write `async fn run`")),
+            "{msgs:?}"
+        );
 
         // sync run
         let msgs = expand_err(quote!(), quote! { impl A { fn run(&mut self) {} } });
-        assert!(msgs.iter().any(|m| m.contains("`run` must be `async`")), "{msgs:?}");
+        assert!(
+            msgs.iter().any(|m| m.contains("`run` must be `async`")),
+            "{msgs:?}"
+        );
 
         // now on run
         let msgs = expand_err(
             quote!(),
             quote! { impl A { async fn run(&mut self, now: Timestamp) {} } },
         );
-        assert!(msgs.iter().any(|m| m.contains("no coordinator `now`")), "{msgs:?}");
+        assert!(
+            msgs.iter().any(|m| m.contains("no coordinator `now`")),
+            "{msgs:?}"
+        );
 
         // missing &mut self
         let msgs = expand_err(
             quote!(),
             quote! { impl A { fn execute(&self, now: Timestamp) {} } },
         );
-        assert!(msgs.iter().any(|m| m.contains("takes `&mut self`")), "{msgs:?}");
+        assert!(
+            msgs.iter().any(|m| m.contains("takes `&mut self`")),
+            "{msgs:?}"
+        );
 
         // extra type parameter (the wake endpoints are macro-supplied)
         let msgs = expand_err(
             quote!(),
             quote! { impl A { fn execute(&mut self, now: Timestamp, x: &mut Input<T, NoWake>) {} } },
         );
-        assert!(msgs.iter().any(|m| m.contains("drop the second type parameter")), "{msgs:?}");
+        assert!(
+            msgs.iter()
+                .any(|m| m.contains("drop the second type parameter")),
+            "{msgs:?}"
+        );
 
         // missing element type
         let msgs = expand_err(
             quote!(),
             quote! { impl A { fn execute(&mut self, now: Timestamp, x: &mut Input) {} } },
         );
-        assert!(msgs.iter().any(|m| m.contains("needs an element type")), "{msgs:?}");
+        assert!(
+            msgs.iter().any(|m| m.contains("needs an element type")),
+            "{msgs:?}"
+        );
 
         // two HealthPorts
         let msgs = expand_err(
             quote!(),
             quote! { impl A { fn execute(&mut self, now: Timestamp, h1: &mut HealthPort, h2: &mut HealthPort) {} } },
         );
-        assert!(msgs.iter().any(|m| m.contains("at most one `&mut HealthPort`")), "{msgs:?}");
+        assert!(
+            msgs.iter()
+                .any(|m| m.contains("at most one `&mut HealthPort`")),
+            "{msgs:?}"
+        );
 
         // bad new
         let msgs = expand_err(
@@ -1000,7 +1089,10 @@ mod tests {
                 fn execute(&mut self, now: Timestamp, imu: &mut Input<Imu>) {}
             } },
         );
-        assert!(msgs.iter().any(|m| m.contains("`imu` is an input")), "{msgs:?}");
+        assert!(
+            msgs.iter().any(|m| m.contains("`imu` is an input")),
+            "{msgs:?}"
+        );
 
         // init type mismatch
         let msgs = expand_err(
@@ -1011,7 +1103,8 @@ mod tests {
             } },
         );
         assert!(
-            msgs.iter().any(|m| m.contains("has type `Output<A>` in `execute` but `Output<B>` here")),
+            msgs.iter()
+                .any(|m| m.contains("has type `Output<A>` in `execute` but `Output<B>` here")),
             "{msgs:?}"
         );
 
@@ -1020,17 +1113,28 @@ mod tests {
             quote!(),
             quote! { impl<T> A<T> { fn execute(&mut self, now: Timestamp) {} } },
         );
-        assert!(msgs.iter().any(|m| m.contains("does not support generic impls")), "{msgs:?}");
+        assert!(
+            msgs.iter()
+                .any(|m| m.contains("does not support generic impls")),
+            "{msgs:?}"
+        );
 
         // export on an async system
         let msgs = expand_err(
             quote!(export),
             quote! { impl A { async fn run(&mut self) {} } },
         );
-        assert!(msgs.iter().any(|m| m.contains("`export` needs a cyclic system")), "{msgs:?}");
+        assert!(
+            msgs.iter()
+                .any(|m| m.contains("`export` needs a cyclic system")),
+            "{msgs:?}"
+        );
 
         // unknown arg
         let msgs = expand_err(quote!(frobnicate), minimal());
-        assert!(msgs[0].contains("unknown #[system] argument `frobnicate`"), "{msgs:?}");
+        assert!(
+            msgs[0].contains("unknown #[system] argument `frobnicate`"),
+            "{msgs:?}"
+        );
     }
 }

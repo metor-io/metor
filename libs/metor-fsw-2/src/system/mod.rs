@@ -1,11 +1,27 @@
-//! The `System` family of traits and the framework wrapper around a system's
-//! outputs (system.md §1, §3, §4).
+//! System traits, and the framework wrapper around a system's outputs.
 //!
-//! A shared [`System`] base carries the common surface (input/output bundle types,
-//! name, lifecycle). Two leaf traits a user implements express the one structural
-//! difference (system.md §3): [`CyclicSystem`] is coordinator-driven (`execute`
-//! once per cycle), [`AsyncSystem`] owns its own `run` loop. The lifecycle is not
-//! duplicated.
+//! A system is a struct with a typed input bundle and a typed output bundle.
+//! [`System`] carries the surface every system shares (the bundle types, the
+//! wiring name, and the init/shutdown hooks), and a user implements exactly
+//! one of two leaf traits on top of it. A [`CyclicSystem`] is driven by the
+//! coordinator, which calls `execute` once per cycle. An [`AsyncSystem`] owns
+//! its own `run` loop and paces itself by awaiting its inputs or a timer.
+//!
+//! Outputs are never handed to a system bare. The framework wraps the user's
+//! bundle in [`Out`], which appends an implicit health/log port pair so that
+//! `output.health()` is always available. Reporting through that handle is a
+//! system's only failure channel; `execute` and `run` return nothing.
+//!
+//! Construction is split from wiring. [`BuildSystem`] says how a system is
+//! made from a decoded params value and knows nothing about config formats,
+//! so the same impl serves a statically registered system and one exported
+//! from a shared library. Rings are likewise backing-erased: one
+//! `impl System` binds over heap rings or over memory regions a host maps in,
+//! with no backing generic anywhere.
+//!
+//! [`CyclicRunner`] is the framework shim between the coordinator and a
+//! cyclic system. It owns the bundles between cycles, times each `execute`,
+//! and publishes the standard health record per cycle.
 
 use core::ops::{Deref, DerefMut};
 
@@ -23,48 +39,53 @@ use crate::port::Output;
 // Port bundles
 // ---------------------------------------------------------------------------
 
-/// A system's input bundle: a struct of [`Input<F>`](crate::Input) ports. Derive
-/// with `#[derive(SystemInput)]` to generate `decls` from the port fields.
+/// A system's input bundle: a struct of [`Input<F>`](crate::Input) ports.
+/// Derive with `#[derive(SystemInput)]` to generate `decls` from the fields.
 pub trait SystemInput {
-    /// What every field contributes (system.md §5), in field order: the required
-    /// producer shape of each wired port, or a bind-time [`Capability`]. Read
-    /// before any port exists.
+    /// What every field contributes, in field order: the producer shape a
+    /// wired port requires, or a bind-time [`Capability`]. Read before any
+    /// port exists.
     fn decls() -> Vec<PortDecl>;
 
-    /// The wired-port projection of [`decls`](Self::decls) (capabilities filtered
-    /// out) — what edge validation and ring sizing consume.
+    /// [`decls`](Self::decls) with the capabilities filtered out, leaving the
+    /// wired ports that edge validation and ring sizing consume.
     fn port_descs() -> Vec<PortDesc> {
-        Self::decls().into_iter().filter_map(PortDecl::into_port).collect()
+        Self::decls()
+            .into_iter()
+            .filter_map(PortDecl::into_port)
+            .collect()
     }
 }
 
-/// A system's output bundle: a struct of [`Output<F>`](crate::Output) ports. Derive
-/// with `#[derive(SystemOutput)]`. The framework wraps it in [`Out`] to add the
-/// implicit health/log ports.
+/// A system's output bundle: a struct of [`Output<F>`](crate::Output) ports.
+/// Derive with `#[derive(SystemOutput)]`. The framework wraps it in [`Out`]
+/// to add the implicit health/log ports.
 pub trait SystemOutput {
-    /// What every field contributes (system.md §5), in field order: the produced
-    /// shape of each wired port, or a bind-time [`Capability`] (e.g. the
-    /// downlink's [`AllOutputs`](crate::AllOutputs) → `ReceiveAll`).
+    /// What every field contributes, in field order: the produced shape of
+    /// each wired port, or a bind-time [`Capability`] such as the `ReceiveAll`
+    /// an [`AllOutputs`](crate::AllOutputs) field requests.
     fn decls() -> Vec<PortDecl>;
 
-    /// The wired-port projection of [`decls`](Self::decls) (capabilities filtered
-    /// out).
+    /// [`decls`](Self::decls) with the capabilities filtered out.
     fn port_descs() -> Vec<PortDesc> {
-        Self::decls().into_iter().filter_map(PortDecl::into_port).collect()
+        Self::decls()
+            .into_iter()
+            .filter_map(PortDecl::into_port)
+            .collect()
     }
 
-    /// Sum-and-clear the ports' [`publish`](crate::Output::publish) drop counters
-    /// (review E6). Derive-generated; the runner folds a nonzero sum into a
-    /// `publish_dropped` health error each cycle. The default keeps hand-written
-    /// bundles (which may not track drops) compiling.
+    /// Sum and clear the ports' [`publish`](crate::Output::publish) drop
+    /// counters. Derive-generated; the runner folds a nonzero sum into a
+    /// `publish_dropped` health error each cycle. The default returns zero so
+    /// a hand-written bundle that does not track drops still compiles.
     fn take_dropped(&mut self) -> u64 {
         0
     }
 }
 
-/// The framework wrapper around a system's user output bundle `O`: it adds the
-/// implicit per-system health/log port pair (system.md §4) so `output.health()`
-/// is always available, while `Deref`/`DerefMut` expose the user's own ports
+/// The framework wrapper around a system's output bundle `O`. It carries the
+/// implicit per-system health/log port pair so `output.health()` is always
+/// available, while `Deref`/`DerefMut` expose the user's own ports
 /// (`output.<port>.write(...)`).
 pub struct Out<O, WD = NoWake, WS = NoWake>
 where
@@ -80,21 +101,21 @@ where
     WD: WakeSource,
     WS: WakeSink,
 {
-    /// Bundle a user output struct with its framework-allocated health/log port.
+    /// Bundle a user output struct with its framework-allocated health port.
     pub fn new(ports: O, health: HealthPort<WD, WS>) -> Self {
         Self { ports, health }
     }
 
-    /// The system-facing health handle: `output.health().error("kind")` /
-    /// `.log(level, msg)` (system.md §4.2). The only error-reporting mechanism.
+    /// The handle a system reports through: `output.health().error("kind")`
+    /// and `.log(level, msg)`.
     pub fn health(&mut self) -> &mut HealthPort<WD, WS> {
         &mut self.health
     }
 
-    /// Disjoint borrows of the user ports and the health handle (review E8a), so
-    /// generated delegation (`#[system]`) can lend a `&mut` port *and* the health
-    /// handle to the user `execute` at once — `health()` borrows the whole `Out`,
-    /// which would conflict with `&mut out.<port>`.
+    /// Disjoint borrows of the user ports and the health handle. `health()`
+    /// borrows the whole `Out` and so conflicts with a live `&mut` to one of
+    /// the user ports; generated delegation needs to lend both to the user's
+    /// `execute` at once.
     pub fn split(&mut self) -> (&mut O, &mut HealthPort<WD, WS>) {
         (&mut self.ports, &mut self.health)
     }
@@ -128,15 +149,15 @@ where
     WS: WakeSink,
 {
     fn decls() -> Vec<PortDecl> {
-        // The user's decls, then the two implicit health/log ports every system gets.
+        // The user's decls, then the implicit health/log ports every system gets.
         let mut decls = O::decls();
         decls.push(PortDecl::Port(PortDesc::of::<SystemHealth>()));
         decls.push(PortDecl::Port(PortDesc::of::<SystemLog>()));
         decls
     }
 
-    /// Forward to the user bundle's counters (the framework's own health/log ports
-    /// publish through the sizing-aware `write_with`, so they never count drops).
+    /// Only the user bundle counts drops; the framework's own health/log
+    /// ports publish through the sizing-aware path and never drop.
     fn take_dropped(&mut self) -> u64 {
         self.ports.take_dropped()
     }
@@ -148,10 +169,8 @@ where
     WD: WakeSource + Default + Clone + 'static,
     WS: WakeSink + Default + Clone + 'static,
 {
-    /// Bind the user ports, then the two implicit health/log ports — symmetric to
-    /// [`Out::descriptors`] pushing the health/log descriptors after the user
-    /// ports (coordinator.md §1.4). Rings are backing-erased, so a dlopen'd
-    /// system's `Out<O>` binds over the host's raw regions with this same impl.
+    /// Bind the user ports, then the two implicit health/log ports, in the
+    /// same order [`decls`](SystemOutput::decls) declares them.
     fn bind<S: RingSource>(src: &mut S) -> Self {
         let ports = O::bind(src);
         let health: Output<SystemHealth, WD, WS> = Output::bind(src);
@@ -164,55 +183,51 @@ where
 // System construction (kdl-independent)
 // ---------------------------------------------------------------------------
 
-/// How a concrete system is constructed from its typed params — the
-/// **format-independent** half of system construction.
+/// How a concrete system is constructed from its typed params.
 ///
-/// This trait carries *no* KDL coupling: a `cdylib` exported via
-/// [`export_system!`](crate::export_system) only needs `BuildSystem` (its `fsw_create`
-/// postcard-decodes `Params` and calls `new`), so the dlopen ABI does not ride the
-/// `kdl` feature. The KDL static-registry path (`wiring::Registry::register`) adds
-/// only a `Params: serde::de::DeserializeOwned` bound — the same derive the postcard
-/// contract already needs — so a statically-linked system registers by impl'ing
-/// `BuildSystem` alone.
-///
-/// `Params` is the value `fsw_create`/the registry factory decodes and hands to
-/// [`new`](BuildSystem::new); a paramless system uses `type Params = ()`.
+/// The trait carries no config-format coupling. A shared library exported
+/// with [`export_system!`](crate::export_system) needs only `BuildSystem`;
+/// its entry point decodes `Params` from postcard bytes and calls
+/// [`new`](Self::new). The static registry adds only a
+/// `Params: serde::de::DeserializeOwned` bound, satisfied by the same derive
+/// the postcard contract already needs, so implementing `BuildSystem` alone
+/// is enough to register a system either way.
 pub trait BuildSystem: Sized {
-    /// The params value the system is constructed from (postcard bytes on the dl wire;
-    /// serde-deserialized off the KDL node on the static-registry path).
+    /// The value the system is constructed from. A paramless system uses
+    /// `type Params = ()`.
     type Params;
     /// Construct the (pre-init) system from its decoded params.
     fn new(params: Self::Params) -> Self;
 
-    /// Host-side second construction phase: resolve config references against host
-    /// context — e.g. message name tokens against the registry's [`MsgTable`]
-    /// (`docs/messages.md` §4.4). The static-registry factory calls it between
-    /// [`new`](Self::new) and registration; the dl `fsw_create` path never does (a
-    /// `.so` decodes params in isolation and cannot see host tables). Defaults to a
-    /// no-op, so a system whose params are self-contained ignores it.
+    /// Second construction phase, run where host context exists: resolve
+    /// config references, for example message name tokens against the
+    /// registry's [`MsgTable`]. The registry factory calls it between
+    /// [`new`](Self::new) and registration. A system constructed inside a
+    /// shared library never sees it, since its params are decoded in
+    /// isolation and host tables are out of reach; a system that must load
+    /// that way keeps its `Params` self-contained. Defaults to a no-op.
     fn configure(&mut self, _ctx: &BuildCtx) -> Result<(), ConfigureError> {
         Ok(())
     }
 }
 
-/// The host context [`BuildSystem::configure`] resolves config references against —
-/// the tables a `Params` value cannot carry (params cross the dl wire as postcard;
-/// the tables are host state).
+/// The host state [`BuildSystem::configure`] resolves config references
+/// against, holding the tables a `Params` value cannot carry.
 pub struct BuildCtx<'a> {
-    /// The registered message types (`Registry::register_msg` on the wiring
-    /// registry), keyed by [`NamedMsg::NAME`](crate::NamedMsg).
+    /// The registered message types, keyed by
+    /// [`NamedMsg::NAME`](crate::NamedMsg).
     pub msgs: &'a MsgTable,
 }
 
-/// A [`configure`](BuildSystem::configure) failure. Deliberately span-free — the
-/// trait is format-independent, so the wiring loader wraps a variant with the KDL
-/// node's source span before surfacing it.
+/// A [`configure`](BuildSystem::configure) failure. It carries no source
+/// span; the trait knows nothing about config formats, so the loader that
+/// does attaches the span before surfacing the error.
 #[derive(Debug, thiserror::Error)]
 pub enum ConfigureError {
-    /// A configured message name token is not in the host's [`MsgTable`].
+    /// A configured message name is not in the host's [`MsgTable`].
     #[error("unknown msg `{name}` (registered: {})", available.join(", "))]
     UnknownMsg {
-        /// The unresolvable config token.
+        /// The unresolved name.
         name: String,
         /// Every registered name, for the error listing.
         available: Vec<&'static str>,
@@ -223,49 +238,47 @@ pub enum ConfigureError {
 // System traits
 // ---------------------------------------------------------------------------
 
-/// The shared system surface (system.md §1): the typed input/output bundles, the
-/// wiring name, and the once-each lifecycle hooks. A user implements one of
-/// [`CyclicSystem`]/[`AsyncSystem`], which both require this.
-///
-/// Rings are backing-erased, so the one `impl System for Foo` serves both the
-/// host (heap rings) and a dlopen'd instance (non-owning views into the host's
-/// regions) — no backing generic anywhere.
+/// The surface every system shares: the typed input/output bundle types, the
+/// wiring name, and the once-each lifecycle hooks. Implement one of
+/// [`CyclicSystem`] or [`AsyncSystem`], both of which require this.
 pub trait System {
     /// The read-only inputs this system consumes.
     type Input: SystemInput + BindPorts;
     /// The owned outputs this system produces (wrapped in [`Out`] for health).
     type Output: SystemOutput + BindPorts;
 
-    /// Wiring name; the prefix the system's health frame hangs off (system.md §4).
+    /// The name this system wires under, and the prefix its health frames
+    /// hang off.
     const NAME: &'static str;
 
-    /// Runs once before the first `execute`/`run`. May emit initial frames / health.
-    /// Defaults to a no-op, so a system that needs no setup can omit it.
+    /// Runs once before the first `execute`/`run`. May emit initial frames or
+    /// health. Defaults to a no-op.
     fn init(&mut self, _output: &mut Self::Output) {}
 
-    /// Runs once at teardown. May flush final frames / health. Defaults to a no-op.
+    /// Runs once at teardown. May flush final frames or health. Defaults to a
+    /// no-op.
     fn shutdown(&mut self, _output: &mut Self::Output) {}
 }
 
-/// A coordinator-driven system: the coordinator calls [`execute`](Self::execute)
-/// once per cycle. Inputs are views straight into upstream output buffers; a slow
-/// consumer backpressures its producers rather than losing data (system.md §3.1).
+/// A coordinator-driven system. The coordinator calls
+/// [`execute`](Self::execute) once per cycle; inputs are views straight into
+/// upstream output buffers, and a slow consumer backpressures its producers
+/// rather than losing data.
 pub trait CyclicSystem: System {
-    /// One unit of work: read the latest inputs, write outputs. Reports trouble
-    /// through `output.health()`, never a return value.
+    /// One unit of work: read the latest inputs, write outputs. Trouble is
+    /// reported through `output.health()`, never a return value.
     ///
-    /// `now` is the coordinator's per-cycle timestamp (the same value for every
-    /// system in one cycle, and the value driving a [`Simulated`](crate::ClockMode)
-    /// clock); a system stamps its output frames with it rather than calling
-    /// `Timestamp::now()` independently.
+    /// `now` is the coordinator's timestamp for the cycle. Every system in a
+    /// cycle sees the same value, and a [`Simulated`](crate::ClockMode) clock
+    /// advances it, so stamp output frames with `now` rather than reading the
+    /// wall clock.
     ///
-    /// `input` is `&mut` (not `&`, deviating from system.md §1.1): draining a ring
-    /// `View` advances its cursor, exactly the `&mut self` reason the doc's own
-    /// §2.3 `Input::latest` takes.
+    /// `input` is `&mut` because draining a ring view advances its read
+    /// cursor.
     fn execute(&mut self, now: Timestamp, input: &mut Self::Input, output: &mut Self::Output);
 
-    /// This system's self-description for wiring (system.md §5): the wired ports
-    /// per direction, plus the merged capability set of both bundles.
+    /// This system's self-description for wiring: the wired ports per
+    /// direction, plus the merged capability set of both bundles.
     fn descriptor() -> SystemDescriptor {
         let (inputs, mut capabilities) = split_decls(<Self::Input as SystemInput>::decls());
         let (outputs, out_caps) = split_decls(<Self::Output as SystemOutput>::decls());
@@ -279,28 +292,28 @@ pub trait CyclicSystem: System {
         }
     }
 
-    /// This *instance*'s descriptor — [`descriptor`](Self::descriptor) unless the
-    /// port set depends on the instance's config (the uplink minting one message
-    /// output per configured msg). The builder registers this value, so a
-    /// config-derived port is sized, wired, and telemetered like any static one.
+    /// This instance's descriptor. Override it when the port set depends on
+    /// the instance's config, such as minting one output per configured
+    /// message. The builder registers this value, so a config-derived port is
+    /// sized, wired, and telemetered like any static one.
     fn instance_descriptor(&self) -> SystemDescriptor {
         Self::descriptor()
     }
 }
 
-/// A self-driven system: it owns its own loop, paced by a timer or by awaiting its
-/// inputs with the ring `Notifier`. The coordinator spawns [`run`](Self::run)
-/// once and does not tick it (system.md §3.2).
+/// A self-driven system. The coordinator spawns [`run`](Self::run) once and
+/// never ticks it; the system paces itself with a timer or by awaiting its
+/// inputs through the ring `Notifier`.
 #[allow(async_fn_in_trait)]
 pub trait AsyncSystem: System {
-    /// The system's own loop. Returns when shutting down. Awaits inputs
-    /// (`Input::recv`) or sleeps on a timer, calling its work on each wake, and uses
-    /// the async output path so a lossless output can suspend for space. `input` is
-    /// `&mut` for the same reason as [`CyclicSystem::execute`].
+    /// The system's own loop; returns when shutting down. It awaits inputs
+    /// (`Input::recv`) or sleeps on a timer, doing its work on each wake, and
+    /// uses the async output path so a full output can suspend for space.
+    /// `input` is `&mut` for the same reason as [`CyclicSystem::execute`].
     async fn run(&mut self, input: &mut Self::Input, output: &mut Self::Output);
 
-    /// This system's self-description for wiring (system.md §5): the wired ports
-    /// per direction, plus the merged capability set of both bundles.
+    /// This system's self-description for wiring: the wired ports per
+    /// direction, plus the merged capability set of both bundles.
     fn descriptor() -> SystemDescriptor {
         let (inputs, mut capabilities) = split_decls(<Self::Input as SystemInput>::decls());
         let (outputs, out_caps) = split_decls(<Self::Output as SystemOutput>::decls());
@@ -314,24 +327,22 @@ pub trait AsyncSystem: System {
         }
     }
 
-    /// This *instance*'s descriptor — [`descriptor`](Self::descriptor) unless the
-    /// port set depends on the instance's config (the uplink minting one message
-    /// output per configured msg). The builder registers this value, so a
-    /// config-derived port is sized, wired, and telemetered like any static one.
+    /// This instance's descriptor. Override it when the port set depends on
+    /// the instance's config, such as minting one output per configured
+    /// message. The builder registers this value, so a config-derived port is
+    /// sized, wired, and telemetered like any static one.
     fn instance_descriptor(&self) -> SystemDescriptor {
         Self::descriptor()
     }
 }
 
 // ---------------------------------------------------------------------------
-// Cyclic driver (the framework wrapper that maintains the standard counters)
+// Cyclic driver
 // ---------------------------------------------------------------------------
 
-/// Drives a [`CyclicSystem`] and maintains the standard health counters around
-/// each `execute` (system.md §4): the execute duration is timed and a health
-/// record is published per cycle.
-///
-/// It owns the bundles between cycles, on behalf of the coordinator that drives it.
+/// Drives a [`CyclicSystem`] on behalf of the coordinator. It owns the port
+/// bundles between cycles, times each `execute`, and publishes a health
+/// record per cycle.
 pub struct CyclicRunner<S, O>
 where
     S: CyclicSystem<Output = Out<O>>,
@@ -348,8 +359,8 @@ where
     S: CyclicSystem<Output = Out<O>>,
     O: SystemOutput,
 {
-    /// Assemble a runner from a constructed system and its (hand- or coordinator-
-    /// built) port bundles.
+    /// Assemble a runner from a constructed system and its bound port
+    /// bundles.
     pub fn new(system: S, input: S::Input, output: Out<O>) -> Self {
         Self {
             system,
@@ -364,9 +375,9 @@ where
         self.system.init(&mut self.output);
     }
 
-    /// Run one cycle (coordinator.md §3.3/§3.4). If already stopped, do nothing.
-    /// Otherwise time `execute` and publish health. `now` is threaded from the
-    /// cycle loop so every system in a cycle shares one timestamp.
+    /// Run one cycle: time `execute`, then publish health. Does nothing once
+    /// stopped. `now` is threaded from the cycle loop so every system in a
+    /// cycle shares one timestamp.
     pub fn step(&mut self, now: Timestamp) {
         if self.state.is_stopped() {
             return;
@@ -374,9 +385,8 @@ where
         let start = std::time::Instant::now();
         self.system.execute(now, &mut self.input, &mut self.output);
         let micros = start.elapsed().as_micros() as u64;
-        // E6: fold the ports' publish-drop counters into health — a nonzero sum is a
-        // ring-sizing bug or a backpressuring reader the system itself could not
-        // report (publish is infallible).
+        // Publish is infallible, so a dropped write can only surface here: a
+        // nonzero sum means an undersized ring or a backpressuring reader.
         if self.output.take_dropped() > 0 {
             self.output.health().error("publish_dropped");
         }
@@ -393,15 +403,14 @@ where
         self.system.shutdown(&mut self.output);
     }
 
-    /// Borrow the output bundle (e.g. for a test to read a produced port back).
+    /// Borrow the output bundle, e.g. for a test to read a produced port back.
     pub fn output(&mut self) -> &mut Out<O> {
         &mut self.output
     }
 }
 
-/// The grown [`CyclicRunner`] erased so the coordinator can hold a heterogeneous
-/// `Vec<Box<dyn CyclicSlot>>` (coordinator.md §3.4). Delegates to the inherent
-/// methods above; `step` threads the cycle's shared timestamp.
+/// Type-erased entry points, so the coordinator can hold a heterogeneous
+/// `Vec<Box<dyn CyclicSlot>>`. Everything delegates to the inherent methods.
 impl<S, O> CyclicSlot for CyclicRunner<S, O>
 where
     S: CyclicSystem<Output = Out<O>>,

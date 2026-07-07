@@ -1,16 +1,17 @@
-//! The build driver — turn a [`Wiring`]'s [`Artifact`](super::Artifact)s into located
-//! `.so`s.
+//! Builds a [`Wiring`]'s [`Artifact`](super::Artifact)s and records where the
+//! resulting `.so`s live.
 //!
-//! For each artifact it runs `cargo build -p <crate_name>` and locates the produced
-//! `cdylib`, writing its path back into [`Artifact::path`](super::Artifact::path) so the
-//! resolver ([`resolve`](super::resolve)) can `dlopen` it. Because each system cdylib is
-//! its own cargo package, **cargo already does the incremental work** — only changed
-//! crates recompile; the driver's value is knowing *which* crates a mission needs and
-//! *where* their `.so`s land. It is std-only (`std::process::Command`), no new deps.
+//! Each artifact names a cargo package that produces a `cdylib`. The driver runs
+//! `cargo build -p <crate_name>` for each one, finds the produced library in
+//! cargo's `--message-format=json` output, and writes its path into
+//! [`Artifact::path`](super::Artifact::path) so the resolver
+//! ([`resolve`](super::resolve)) can `dlopen` it. Since every system cdylib is its
+//! own package, cargo decides what is stale and what can be skipped; the driver
+//! only supplies the list of crates and reads back where their outputs landed.
 //!
-//! The `.so` is located the same way `tests/dl_integration.rs` does it: parse cargo's
-//! `--message-format=json` `compiler-artifact` lines for the file matching the
-//! artifact's `cdylib` name (robust to a custom target dir / profile).
+//! The library is located by scanning `compiler-artifact` JSON lines for a
+//! `filenames` entry ending in the artifact's `cdylib` name, which stays correct
+//! under a custom target directory or profile.
 
 use std::path::PathBuf;
 use std::process::Command;
@@ -20,14 +21,13 @@ use super::model::Wiring;
 /// Options for the build driver.
 #[derive(Clone, Debug, Default)]
 pub struct BuildOptions {
-    /// Build the `--release` profile (default: debug, matching `cargo build`).
+    /// Build the `--release` profile instead of the default debug profile.
     pub release: bool,
     /// Extra args appended to every `cargo build` invocation (e.g. `--target ...`).
     pub extra_args: Vec<String>,
 }
 
-/// A build-driver failure. Each is a clean error — a build problem never panics the
-/// caller.
+/// A build-driver failure.
 #[derive(Debug, thiserror::Error)]
 pub enum BuildError {
     /// `cargo` could not be spawned.
@@ -57,9 +57,9 @@ pub enum BuildError {
     },
 }
 
-/// Build every [`Artifact`](super::Artifact) in `wiring` and fill in its
-/// [`path`](super::Artifact::path). Idempotent and incremental — re-running only
-/// rebuilds crates cargo considers stale.
+/// Builds every [`Artifact`](super::Artifact) in `wiring` and fills in its
+/// [`path`](super::Artifact::path). Safe to re-run; cargo rebuilds only what it
+/// considers stale.
 pub fn build_artifacts(wiring: &mut Wiring, opts: &BuildOptions) -> Result<(), BuildError> {
     for artifact in &mut wiring.artifacts {
         let path = build_one(&artifact.crate_name, &artifact.cdylib, opts)?;
@@ -68,9 +68,9 @@ pub fn build_artifacts(wiring: &mut Wiring, opts: &BuildOptions) -> Result<(), B
     Ok(())
 }
 
-/// `cargo build -p <crate_name>` and return the located cdylib path.
+/// Runs `cargo build -p <crate_name>` and returns the located cdylib path.
 fn build_one(crate_name: &str, cdylib: &str, opts: &BuildOptions) -> Result<PathBuf, BuildError> {
-    // `env!("CARGO")` is the cargo that built this crate; fall back to PATH otherwise.
+    // Prefer the cargo that invoked this process, falling back to PATH.
     let cargo = std::env::var("CARGO").unwrap_or_else(|_| "cargo".to_string());
     let mut cmd = Command::new(cargo);
     cmd.args(["build", "-p", crate_name, "--message-format=json"]);
@@ -91,9 +91,9 @@ fn build_one(crate_name: &str, cdylib: &str, opts: &BuildOptions) -> Result<Path
         });
     }
 
-    // Each `compiler-artifact` JSON line carries a `"filenames":[ ... ]` array; the
-    // cdylib is the entry ending in the requested file name. Scan without a JSON dep,
-    // mirroring `tests/dl_integration.rs::locate_fixture`.
+    // Each `compiler-artifact` line carries a `"filenames":[...]` array whose
+    // entries are quoted paths, so splitting on `"` yields each path as one token.
+    // That is enough to find the cdylib without pulling in a JSON parser.
     let stdout = String::from_utf8_lossy(&output.stdout);
     for line in stdout.lines() {
         if !line.contains("compiler-artifact") || !line.contains(cdylib) {

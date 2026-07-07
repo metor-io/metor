@@ -1,4 +1,4 @@
-//! Frame acceptance tests (frames.md "Tests").
+//! Frame acceptance tests: derive output, dynamic members, and size accounting.
 
 use core::mem::offset_of;
 use std::collections::HashMap;
@@ -9,9 +9,7 @@ use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
 
 use crate::{Frame, FrameList, FrameMap, FrameWriter, KeyError};
 
-// ---------------------------------------------------------------------------
-// Shared recording sink
-// ---------------------------------------------------------------------------
+// --- Shared recording sink ---
 
 #[derive(Default)]
 struct RecSink {
@@ -33,9 +31,7 @@ impl metor_fsw::Decomponentize for RecSink {
     }
 }
 
-// ---------------------------------------------------------------------------
-// 1. IMU frame: frame tag + shared timestamp + timestamp suppression
-// ---------------------------------------------------------------------------
+// --- Frame tag, shared timestamp, and timestamp suppression ---
 
 #[derive(Frame, IntoBytes, Immutable, KnownLayout, FromBytes)]
 #[repr(C)]
@@ -55,8 +51,8 @@ fn imu_frame_tag_and_timestamp_suppression() {
         accel: 2.0,
     };
     let vtable = Imu::as_vtable();
-    // `frame` is carried on `RealizedField`, not handed to `apply_value`, so realize
-    // explicitly to inspect it.
+    // The frame tag rides on `RealizedField` and is never handed to `apply_value`,
+    // so realize the fields explicitly to see it.
     let fields: Vec<_> = vtable
         .realize_fields(Some(imu.as_bytes()))
         .map(|f| f.unwrap())
@@ -78,7 +74,8 @@ fn imu_frame_tag_and_timestamp_suppression() {
             "{member} should carry the shared timestamp"
         );
     }
-    // The timestamp field is the source only — never a standalone component.
+    // The timestamp field only sources the shared timestamp; it must not appear
+    // as a component of its own.
     assert!(
         !by_id.contains_key(&ComponentId::new("imu.timestamp")),
         "imu.timestamp must be suppressed"
@@ -87,9 +84,7 @@ fn imu_frame_tag_and_timestamp_suppression() {
     assert_eq!(imu.timestamp(), Timestamp(4242));
 }
 
-// ---------------------------------------------------------------------------
-// 2. Static-frame Componentize / Decomponentize round-trip
-// ---------------------------------------------------------------------------
+// --- Static-frame Componentize / Decomponentize round-trip ---
 
 #[derive(Frame, IntoBytes, Immutable, KnownLayout, FromBytes, Default, Debug, PartialEq)]
 #[repr(C)]
@@ -112,18 +107,14 @@ fn static_frame_componentize_round_trip() {
     };
     let mut dst = ImuRt::default();
     src.sink_columns(&mut dst);
-    // The timestamp is suppressed (source only), so it does not round-trip; every
-    // other component does.
+    // Every component round-trips except the suppressed timestamp field.
     assert_eq!(dst.gyro_x, src.gyro_x);
     assert_eq!(dst.gyro_y, src.gyro_y);
     assert_eq!(dst.count, src.count);
     assert_eq!(dst.timestamp, Timestamp(0));
 }
 
-// ---------------------------------------------------------------------------
-// 2b. Array (`[T; N]`) frame field: one multi-element component, round-tripped
-// through `apply` into a recording sink.
-// ---------------------------------------------------------------------------
+// --- Array (`[T; N]`) frame field ---
 
 #[derive(Default)]
 struct VecSink {
@@ -151,8 +142,8 @@ struct ArrFrame {
     #[metor_fsw(timestamp)]
     timestamp: Timestamp,
     v: [f64; 3],
-    // `u64` (not `u32`) keeps the `#[repr(C)]` frame padding-free, a prerequisite
-    // for `IntoBytes`.
+    // `u64` rather than `u32` so the `#[repr(C)]` layout has no padding, which
+    // `IntoBytes` requires.
     n: u64,
 }
 
@@ -164,17 +155,17 @@ fn array_field_frame_round_trip() {
         n: 42,
     };
 
-    // (a) Componentize → Decomponentize in-process round-trip.
+    // (a) In-process Componentize into Decomponentize round-trip.
     let mut dst = ArrFrame::default();
     frame.sink_columns(&mut dst);
     assert_eq!(dst.v, frame.v);
     assert_eq!(dst.n, frame.n);
 
-    // (b) bytes → vtable `apply` into a recording sink. NOTE: the blanket
-    // `AsVTable for [T; N]` (metor-fsw/src/vtable.rs) expands an array into N indexed
-    // scalar components, so the vtable path yields `arr.v.0/1/2` rather than the
-    // single shape-[3] `arr.v` that `as_component_view` (part a) produces. This
-    // representation split is inherent framework behavior.
+    // (b) Bytes through the vtable into a recording sink. The two paths represent
+    // arrays differently on purpose: `as_component_view` (part a) emits `arr.v` as
+    // a single shape-[3] component, while the blanket `AsVTable` impl for `[T; N]`
+    // expands the array into N indexed scalars, so the vtable path yields
+    // `arr.v.0/1/2`.
     let mut sink = VecSink::default();
     ArrFrame::as_vtable()
         .apply(frame.as_bytes(), &mut sink)
@@ -186,9 +177,7 @@ fn array_field_frame_round_trip() {
     assert_eq!(sink.values[&ComponentId::new("arr.n")], vec![42.0]);
 }
 
-// ---------------------------------------------------------------------------
-// 3. FrameList / FrameMap: build → serialize → apply
-// ---------------------------------------------------------------------------
+// --- FrameList / FrameMap: build, serialize, apply ---
 
 #[derive(AsVTable, IntoBytes, Immutable, KnownLayout, Clone, Copy)]
 #[repr(C)]
@@ -232,7 +221,10 @@ fn frame_list_build_and_apply() {
     assert_eq!(sink.values[&ComponentId::new("processes.0.pid")], 1001.0);
     assert_eq!(sink.values[&ComponentId::new("processes.0.cpu_usage")], 0.5);
     assert_eq!(sink.values[&ComponentId::new("processes.1.pid")], 1002.0);
-    assert_eq!(sink.values[&ComponentId::new("processes.1.cpu_usage")], 0.25);
+    assert_eq!(
+        sink.values[&ComponentId::new("processes.1.cpu_usage")],
+        0.25
+    );
     // Elements inherit the shared frame timestamp.
     assert_eq!(
         sink.timestamps[&ComponentId::new("processes.0.pid")],
@@ -310,9 +302,7 @@ fn frame_map_rejects_dot_key_at_write_time() {
     assert_eq!(res, Err(KeyError::DotInKey));
 }
 
-// ---------------------------------------------------------------------------
-// 4. Nested dynamics: processes.htop.threads.0.state (the §4 prefix rule)
-// ---------------------------------------------------------------------------
+// --- Nested dynamics: processes.htop.threads.0.state ---
 
 #[derive(AsVTable, IntoBytes, Immutable, KnownLayout, Clone, Copy)]
 #[repr(C)]
@@ -343,10 +333,11 @@ fn put_i64(buf: &mut Vec<u8>, v: i64) {
 
 #[test]
 fn nested_dynamic_prefix_rule() {
-    // The derived vtable is the contract under test (frames.md §4): the outer map is
-    // reached statically → full prefix `processes`; the inner `threads` list is a
-    // member template → own name only. The trailer bytes mirror the
-    // `test_dynamic_nested` layout.
+    // Naming contract for the derived vtable. The outer map is reached statically,
+    // so its ops carry the full dotted prefix `processes`; the inner `threads` list
+    // lives in a member template and is named by its own field alone. The names
+    // only join up when the trailer is walked. The trailer below is one map entry
+    // keyed "htop" whose Host value holds a one-element thread list.
     let vtable = SysNested::as_vtable();
 
     let mut t = Vec::new();
@@ -379,9 +370,7 @@ fn nested_dynamic_prefix_rule() {
     );
 }
 
-// ---------------------------------------------------------------------------
-// 5. MAX_SIZE formula (frames.md §3.4)
-// ---------------------------------------------------------------------------
+// --- MAX_SIZE formula ---
 
 #[derive(Frame, IntoBytes, Immutable, KnownLayout, FromBytes)]
 #[repr(C)]
@@ -398,8 +387,7 @@ fn max_size_formula() {
     let _ = map_value_offset::<Process>();
 
     let list_budget = metor_fsw_ring::round_up8(8 * core::mem::size_of::<Process>());
-    let map_budget =
-        metor_fsw_ring::round_up8(4 * map_stride::<Process>() as usize + 4 * 16);
+    let map_budget = metor_fsw_ring::round_up8(4 * map_stride::<Process>() as usize + 4 * 16);
     let expected = core::mem::size_of::<SysBoth>() + list_budget + map_budget + 8;
 
     assert_eq!(<SysBoth as Componentize>::MAX_SIZE, expected);

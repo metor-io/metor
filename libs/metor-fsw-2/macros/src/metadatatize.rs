@@ -13,17 +13,21 @@ pub struct Metadatatize {
     data: ast::Data<Ident, crate::Field>,
     parent: Option<String>,
     name: Option<String>,
-    /// Tolerated here; consumed by the bundling `Frame` derive (E4 opt-out).
+    /// Accepted so the attribute parses when the derives are bundled; only the
+    /// `Frame` derive acts on it.
     #[darling(default, rename = "no_timestamp")]
     _no_timestamp: darling::util::Ignored,
-    /// `#[metor_fsw(group)]` emits a metadata-only parent entry with
-    /// `group_name = <Ident>`. `#[metor_fsw(group = "Custom")]` overrides.
+    /// Bare `#[fsw(group)]` emits a metadata-only parent entry whose
+    /// `group_name` is the struct's identifier; `#[fsw(group = "Custom")]`
+    /// supplies the name instead.
     #[darling(default)]
     group: Option<Override<String>>,
 }
 
-/// See [`componentize_impl`](crate::componentize::componentize_impl) for the
-/// `crate_name` root-path contract.
+/// Generates the `Metadatatize` impl for a struct or unit enum.
+///
+/// `crate_name` follows the same root-path contract as
+/// [`componentize_impl`](crate::componentize::componentize_impl).
 pub fn metadatatize_impl(input: &DeriveInput, crate_name: &TokenStream2) -> TokenStream2 {
     let Metadatatize {
         ident,
@@ -65,8 +69,8 @@ pub fn metadatatize_impl(input: &DeriveInput, crate_name: &TokenStream2) -> Toke
                     .chain(<#ty>::metadata(prefix.clone().chain(#name)))
                 }
             });
-            // Skipped at empty root prefix — an empty name would collide
-            // across roots.
+            // No group entry at an empty root prefix, since the empty name
+            // would collide across roots.
             let group_emit = match group {
                 None => quote! {
                     let group_parent: Option<#impeller_wkt::ComponentMetadata> = None;

@@ -1,27 +1,38 @@
-//! A `serde::Deserializer` over one KDL node's **params surface** — the single
-//! decoder both params paths share (docs/design-kdl-serde.md).
+//! A `serde::Deserializer` that reads one KDL node's parameters.
 //!
-//! The surface of a node is its non-reserved line properties (`k=v`), its
-//! non-reserved positional arguments (there must be none beyond `skip_args` —
-//! extras are a spanned error), and its child nodes. The mapping (design §1.2):
+//! The parameters of a node are its named properties (`k=v`) and its child
+//! nodes. Keys listed in `reserved` and the first `skip_args` positional
+//! arguments belong to the caller and are skipped; any further positional
+//! argument is an error. Values map onto Rust types by shape. A property or
+//! a single-argument child fills a scalar field. A child with several
+//! positional arguments, or several children sharing one name, fills a
+//! sequence. A child carrying properties or children of its own fills a
+//! nested struct or map, recursively. An integer literal is accepted where a
+//! float is wanted (`rate=200` reads as `200.0`), and integers are
+//! range-checked against the requested width. `#null` or an absent key reads
+//! as `Option::None`, while a missing non-`Option` field is reported as a
+//! missing parameter.
 //!
-//! - property `k=v` / child `k v` (one positional arg) → struct field `k` (scalar)
-//! - child `k a b c` (≥2 args) / repeated `k …` children → `Vec<T>`/tuple
-//! - child `k p=1 q=2` and/or `k { … }` → nested struct / map (recursive)
-//! - integer literals coerce to float fields (`rate=200` ⇒ `200.0`); integers are
-//!   range-checked per the asked width
-//! - `#null` / an absent key → `Option::None`; a missing non-`Option` field is a
-//!   spanned missing-param error
-//! - an unmatched key is a spanned unknown-param error for **every** struct
-//!   (deny-unknown-fields without the attribute: `deserialize_ignored_any` errors)
-//! - a repeated property, or one key as both a property and a child, is a spanned
-//!   error (explicit beats KDL's last-wins)
+//! Every struct rejects unknown keys. serde-derive drains an unmatched key
+//! through `deserialize_ignored_any`, and this deserializer turns that into
+//! an error carrying the key's exact span, so typos are caught without
+//! `deny_unknown_fields` on each params type. A repeated property, or one
+//! key spelled both as a property and as a child, is likewise an error
+//! rather than a silent last-one-wins.
 //!
-//! The **static** path deserializes a typed `Params` ([`from_kdl_node`]); the
-//! **dl** path deserializes a `serde_json::Value` plus a key → span side table
-//! ([`params_value`]) that the schema-validation pass feeds to postcard-dyn.
-//! Spans are captured *inside* the deserializer ([`DeError`]) and converted to
-//! [`LoadError`] only at the boundary.
+//! There are two entry points. [`from_kdl_node`] produces a typed value.
+//! [`params_value`] produces a self-describing `serde_json::Value` along
+//! with a table mapping each top-level key to its span, for callers that
+//! validate the value against a schema later and still want named, spanned
+//! diagnostics.
+//!
+//! Errors are [`DeError`] internally and become [`LoadError`] only at the
+//! entry points. A `DeError` raised by this module is born knowing the exact
+//! span of the offending value; one raised inside a visitor (serde's
+//! `custom`, `missing_field`, and friends) starts without one and picks up
+//! the nearest enclosing property name and span on the way out. Both
+//! attachments fill only empty fields, so the innermost, most precise
+//! information always wins.
 
 use std::collections::HashMap;
 use std::fmt;
@@ -34,16 +45,16 @@ use serde_json::Value;
 use super::LoadError;
 
 // ---------------------------------------------------------------------------
-// Entry points (the only surface `wiring` uses)
+// Entry points
 // ---------------------------------------------------------------------------
 
-/// Static path: deserialize a typed `Params` from `node`'s params surface.
+/// Deserialize a typed value from `node`'s parameters.
 ///
-/// `src` is the document text (miette source context), `system` the instance
-/// name for diagnostics, `reserved` the line-property keys that belong to the
-/// wiring surface (`&["type", "artifact"]` on a `system` node, `&["occupant"]`
-/// on an `allow` node), and `skip_args` the leading positional args the wiring
-/// surface owns (the instance name on `system` ⇒ 1; none on `allow` ⇒ 0).
+/// `src` is the document text errors quote from and `system` names the
+/// instance in diagnostics. `reserved` lists the property keys the caller
+/// consumes itself, and `skip_args` how many leading positional arguments it
+/// owns; a `system "name" type="T"` node passes `&["type", "artifact"]` and
+/// 1, an `allow` node passes `&["occupant"]` and 0.
 pub(crate) fn from_kdl_node<T: de::DeserializeOwned>(
     node: &KdlNode,
     src: &str,
@@ -59,9 +70,8 @@ pub(crate) fn from_kdl_node<T: de::DeserializeOwned>(
     .map_err(|e| e.into_load_error(node, src, system))
 }
 
-/// Dl path: the same deserializer targeting `serde_json::Value`, plus the
-/// top-level key → span side table the schema-validation pass uses for
-/// named, spanned diagnostics.
+/// Deserialize `node`'s parameters into a `serde_json::Value`, plus a table
+/// mapping each top-level key to its span for later diagnostics.
 pub(crate) fn params_value(
     node: &KdlNode,
     src: &str,
@@ -90,38 +100,39 @@ pub(crate) fn params_value(
 }
 
 // ---------------------------------------------------------------------------
-// The error (design §2): spans captured inside, `LoadError` at the boundary
+// The error
 // ---------------------------------------------------------------------------
 
-/// The de-internal error. Implements [`serde::de::Error`]; converted to
-/// [`LoadError`] only at the [`from_kdl_node`]/[`params_value`] boundary.
+/// The deserializer-internal error, converted to [`LoadError`] at the entry
+/// points.
 #[derive(Debug)]
 pub(crate) struct DeError {
     kind: DeErrorKind,
     /// The most specific span known. `None` only for visitor-originated
-    /// `custom` errors until the enclosing map access attaches one.
+    /// errors until an enclosing map access attaches one.
     span: Option<SourceSpan>,
-    /// The property/child name in scope, attached by the innermost map access.
+    /// The property or child name in scope, attached by the innermost map
+    /// access.
     property: Option<String>,
 }
 
 #[derive(Debug)]
 enum DeErrorKind {
-    /// serde `custom`/`invalid_value` from a visitor (e.g. a hand-written
-    /// `Deserialize`) — message only, span attached by context.
+    /// A message-only error from a visitor (`custom`, `invalid_value`); the
+    /// span is attached by the enclosing context.
     Custom(String),
-    /// serde-derive's end-of-map missing required field.
+    /// serde-derive's end-of-map report of a missing required field.
     MissingField { field: &'static str },
-    /// An unmatched key: our `deserialize_ignored_any`, or a
+    /// An unmatched key, from our `deserialize_ignored_any` or a
     /// `deny_unknown_fields` struct.
     UnknownField { field: String },
-    /// Raised by our code with the exact value span (we see the `KdlValue` and
-    /// the wanted type before any visitor runs).
+    /// A wrong-shaped value, raised here with the value's exact span before
+    /// any visitor runs.
     InvalidType { expected: String, found: String },
-    /// Integer out of range for the asked width (`u8 = 300`, …).
+    /// An integer that does not fit the requested width (`u8 = 300`).
     OutOfRange { expected: String },
-    /// Extra positional argument / repeated property / property-vs-child
-    /// ambiguity. The message is phrased to read as "expected {msg}".
+    /// An extra positional argument, a repeated property, or a key spelled
+    /// as both property and child. The message reads as "expected {msg}".
     Shape(String),
 }
 
@@ -134,7 +145,11 @@ impl DeError {
         }
     }
 
-    fn invalid_type_at(expected: impl Into<String>, found: impl Into<String>, span: SourceSpan) -> Self {
+    fn invalid_type_at(
+        expected: impl Into<String>,
+        found: impl Into<String>,
+        span: SourceSpan,
+    ) -> Self {
         DeError {
             kind: DeErrorKind::InvalidType {
                 expected: expected.into(),
@@ -157,15 +172,16 @@ impl DeError {
 
     fn unknown_field_at(field: impl Into<String>, span: SourceSpan) -> Self {
         DeError {
-            kind: DeErrorKind::UnknownField { field: field.into() },
+            kind: DeErrorKind::UnknownField {
+                field: field.into(),
+            },
             span: Some(span),
             property: None,
         }
     }
 
-    /// Attach the surrounding property + span to a context-less error (a
-    /// visitor-originated `custom`); an error that already knows its exact span
-    /// keeps it (fill-if-`None`, so the innermost context wins).
+    /// Attach the surrounding property name and span, filling only empty
+    /// fields so an error that already knows its exact position keeps it.
     fn with_context(mut self, key: &str, span: SourceSpan) -> Self {
         if self.property.is_none() {
             self.property = Some(key.to_string());
@@ -183,13 +199,14 @@ impl DeError {
         self
     }
 
-    /// Boundary conversion (design §2.1): no serde types leak into [`LoadError`].
+    /// Convert to [`LoadError`], falling back to the node's own span and
+    /// name when nothing more precise was recorded.
     pub(crate) fn into_load_error(self, node: &KdlNode, src: &str, system: &str) -> LoadError {
         let span = self.span.unwrap_or_else(|| node.span());
         let src = src.to_string();
         let system = system.to_string();
-        // The property in scope; shape errors at the node level fall back to the
-        // node name so the message never reads "for ``".
+        // Shape errors at the node level carry no property; fall back to the
+        // node name so the message never quotes an empty key.
         let property = self
             .property
             .unwrap_or_else(|| node.name().value().to_string());
@@ -289,32 +306,30 @@ impl de::Error for DeError {
 }
 
 // ---------------------------------------------------------------------------
-// The node deserializer (the map over the params surface)
+// The node deserializer
 // ---------------------------------------------------------------------------
 
-/// Deserializes any `T: Deserialize` from one KDL node's params surface.
+/// Deserializes any `T: Deserialize` from one KDL node's parameters.
 pub(crate) struct KdlNodeDe<'de> {
     node: &'de KdlNode,
-    /// Line-property keys owned by the wiring surface, never yielded as params.
+    /// Property keys the caller consumes itself, never yielded as params.
     reserved: &'static [&'static str],
-    /// Leading positional args owned by the wiring surface (the instance name).
+    /// Leading positional arguments the caller owns.
     skip_args: usize,
 }
 
-/// One field's value source, produced by the surface walk.
+/// Where one field's value comes from.
 enum FieldSource<'de> {
     /// A line property `k=v`.
     Entry(&'de KdlEntry),
-    /// A child node: `k v`, `k a b c`, `k p=1 { … }`, `k { … }`.
+    /// A child node, in any of its shapes (`k v`, `k a b c`, `k p=1 { … }`).
     Node(&'de KdlNode),
-    /// Repeated same-name children: `k 1` `k 2` → a sequence.
+    /// Several children sharing one name, read as a sequence.
     Nodes(Vec<&'de KdlNode>),
 }
 
-/// Collect the params surface of `node` in document order (properties, then
-/// children grouped by name), enforcing the shape rules: no positional args
-/// beyond `skip_args`, no repeated property, no key as both property and child,
-/// no child named like a reserved property.
+/// Collect `node`'s parameters in document order, properties first and then
+/// children grouped by name, enforcing the shape rules from the module doc.
 fn surface<'de>(
     node: &'de KdlNode,
     reserved: &'static [&'static str],
@@ -381,7 +396,7 @@ fn surface<'de>(
 impl<'de> Deserializer<'de> for KdlNodeDe<'de> {
     type Error = DeError;
 
-    // The `serde_json::Value` target: the params surface is a JSON object.
+    // `serde_json::Value` lands here; the parameters read as a JSON object.
     fn deserialize_any<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value, DeError> {
         self.deserialize_map(visitor)
     }
@@ -403,7 +418,7 @@ impl<'de> Deserializer<'de> for KdlNodeDe<'de> {
         self.deserialize_map(visitor)
     }
 
-    // `type Params = ()`: succeeds on a param-less node, rejects stray params.
+    // A unit target accepts a parameter-less node and rejects stray keys.
     fn deserialize_unit<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value, DeError> {
         let fields = surface(self.node, self.reserved, self.skip_args)?;
         if let Some((key, span, _)) = fields.first() {
@@ -436,15 +451,15 @@ impl<'de> Deserializer<'de> for KdlNodeDe<'de> {
         visitor.visit_unit()
     }
 
-    // A scalar/seq/enum asked of a whole node's surface: drive the map and let
-    // the visitor's own `invalid_type` report it (span attached at the boundary).
+    // Asking a whole node for a scalar, sequence, or enum cannot succeed;
+    // drive the map and let the visitor's own `invalid_type` report it.
     serde::forward_to_deserialize_any! {
         bool i8 i16 i32 i64 i128 u8 u16 u32 u64 u128 f32 f64 char str string
         bytes byte_buf seq tuple tuple_struct enum identifier
     }
 }
 
-/// The map access over a node's params surface.
+/// Map access over a node's parameters.
 struct NodeMapAccess<'de> {
     iter: std::vec::IntoIter<(&'de str, SourceSpan, FieldSource<'de>)>,
     pending: Option<(&'de str, SourceSpan, FieldSource<'de>)>,
@@ -473,8 +488,8 @@ impl<'de> MapAccess<'de> for NodeMapAccess<'de> {
     fn next_value_seed<V: DeserializeSeed<'de>>(&mut self, seed: V) -> Result<V::Value, DeError> {
         let (key, span, source) = self.pending.take().expect("next_value_seed before a key");
         seed.deserialize(FieldDe { source, key, span })
-            // Attach the property + span to visitor-originated (context-less)
-            // errors; born-with-span errors keep their more precise span.
+            // Attach the property name and span to context-less visitor
+            // errors; errors born with a span keep their more precise one.
             .map_err(|e| e.with_context(key, span))
     }
 }
@@ -483,15 +498,15 @@ impl<'de> MapAccess<'de> for NodeMapAccess<'de> {
 // The value-position deserializer (one field)
 // ---------------------------------------------------------------------------
 
-/// The value-position deserializer the map access hands to `next_value_seed`.
+/// Deserializes one field's value.
 struct FieldDe<'de> {
     source: FieldSource<'de>,
     key: &'de str,
-    /// The entry's / child node's span.
+    /// The span of the entry or child node the value came from.
     span: SourceSpan,
 }
 
-/// A human name of a KDL value's own type, for `InvalidType.found`.
+/// A human name for a KDL value's type, used in invalid-type messages.
 fn value_desc(value: &KdlValue) -> &'static str {
     match value {
         KdlValue::String(_) => "a string",
@@ -502,7 +517,7 @@ fn value_desc(value: &KdlValue) -> &'static str {
     }
 }
 
-/// Drive `visitor` with one scalar KDL value (the `deserialize_any` leaf).
+/// Drive `visitor` with one scalar KDL value.
 fn visit_scalar<'de, V: Visitor<'de>>(
     visitor: V,
     value: &'de KdlValue,
@@ -526,11 +541,12 @@ fn visit_scalar<'de, V: Visitor<'de>>(
     result.map_err(|e: DeError| e.with_span(span))
 }
 
-/// How a child node's own surface is shaped (drives `deserialize_any`/seq).
+/// The shape of a child node's own contents.
 enum NodeShape {
-    /// Properties and/or children ⇒ a nested map.
+    /// Properties and/or children, read as a nested map.
     Nested,
-    /// Positional args only (0, 1, or many) ⇒ unit / scalar / seq.
+    /// Only positional arguments (possibly none), read as unit, scalar, or
+    /// sequence.
     Args(usize),
 }
 
@@ -544,14 +560,14 @@ fn node_shape(node: &KdlNode) -> NodeShape {
     }
 }
 
-/// A node's positional (nameless) argument entries.
+/// A node's positional (unnamed) argument entries.
 fn node_args(node: &KdlNode) -> impl Iterator<Item = &KdlEntry> {
     node.entries().iter().filter(|e| e.name().is_none())
 }
 
 impl<'de> FieldDe<'de> {
-    /// The scalar value + its exact span, if this source is scalar-shaped
-    /// (a property, or a childless prop-less node with exactly one arg).
+    /// The scalar value and its exact span, when this source is a property
+    /// or a bare child with exactly one argument.
     fn scalar_value(&self) -> Option<(&'de KdlValue, SourceSpan)> {
         match &self.source {
             FieldSource::Entry(e) => Some((e.value(), e.span())),
@@ -566,7 +582,8 @@ impl<'de> FieldDe<'de> {
         }
     }
 
-    /// A human name of what this source holds, for `InvalidType.found`.
+    /// A human name for what this source holds, used in invalid-type
+    /// messages.
     fn found_desc(&self) -> String {
         match &self.source {
             FieldSource::Entry(e) => value_desc(e.value()).to_string(),
@@ -582,21 +599,23 @@ impl<'de> FieldDe<'de> {
         }
     }
 
-    /// The scalar value, or a born-with-span invalid-type error naming `expected`.
+    /// The scalar value, or an invalid-type error naming `expected` at this
+    /// field's span.
     fn scalar(&self, expected: &str) -> Result<(&'de KdlValue, SourceSpan), DeError> {
         self.scalar_value()
             .ok_or_else(|| DeError::invalid_type_at(expected, self.found_desc(), self.span))
     }
 }
 
-/// Integer widths: range-checked at the value's exact span.
+/// Integer widths, range-checked at the value's exact span.
 macro_rules! de_int {
     ($method:ident, $visit:ident, $ty:ty, $expected:expr) => {
         fn $method<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value, DeError> {
             let (value, span) = self.scalar($expected)?;
             match value {
                 KdlValue::Integer(i) => {
-                    let x = <$ty>::try_from(*i).map_err(|_| DeError::out_of_range($expected, span))?;
+                    let x =
+                        <$ty>::try_from(*i).map_err(|_| DeError::out_of_range($expected, span))?;
                     visitor.$visit(x).map_err(|e: DeError| e.with_span(span))
                 }
                 other => Err(DeError::invalid_type_at($expected, value_desc(other), span)),
@@ -605,16 +624,18 @@ macro_rules! de_int {
     };
 }
 
-/// Floats: accept an integer literal where a float is wanted (`rate=200`).
+/// Floats also accept an integer literal (`rate=200` reads as `200.0`).
 macro_rules! de_float {
     ($method:ident, $expected:expr) => {
         fn $method<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value, DeError> {
             let (value, span) = self.scalar($expected)?;
             match value {
-                KdlValue::Float(f) => visitor.visit_f64(*f).map_err(|e: DeError| e.with_span(span)),
-                KdlValue::Integer(i) => {
-                    visitor.visit_f64(*i as f64).map_err(|e: DeError| e.with_span(span))
-                }
+                KdlValue::Float(f) => visitor
+                    .visit_f64(*f)
+                    .map_err(|e: DeError| e.with_span(span)),
+                KdlValue::Integer(i) => visitor
+                    .visit_f64(*i as f64)
+                    .map_err(|e: DeError| e.with_span(span)),
                 other => Err(DeError::invalid_type_at($expected, value_desc(other), span)),
             }
         }
@@ -628,12 +649,42 @@ impl<'de> Deserializer<'de> for FieldDe<'de> {
     de_int!(deserialize_i16, visit_i16, i16, "a 16-bit signed integer");
     de_int!(deserialize_i32, visit_i32, i32, "a 32-bit signed integer");
     de_int!(deserialize_i64, visit_i64, i64, "a 64-bit signed integer");
-    de_int!(deserialize_i128, visit_i128, i128, "a 128-bit signed integer");
-    de_int!(deserialize_u8, visit_u8, u8, "an 8-bit non-negative integer");
-    de_int!(deserialize_u16, visit_u16, u16, "a 16-bit non-negative integer");
-    de_int!(deserialize_u32, visit_u32, u32, "a 32-bit non-negative integer");
-    de_int!(deserialize_u64, visit_u64, u64, "a 64-bit non-negative integer");
-    de_int!(deserialize_u128, visit_u128, u128, "a 128-bit non-negative integer");
+    de_int!(
+        deserialize_i128,
+        visit_i128,
+        i128,
+        "a 128-bit signed integer"
+    );
+    de_int!(
+        deserialize_u8,
+        visit_u8,
+        u8,
+        "an 8-bit non-negative integer"
+    );
+    de_int!(
+        deserialize_u16,
+        visit_u16,
+        u16,
+        "a 16-bit non-negative integer"
+    );
+    de_int!(
+        deserialize_u32,
+        visit_u32,
+        u32,
+        "a 32-bit non-negative integer"
+    );
+    de_int!(
+        deserialize_u64,
+        visit_u64,
+        u64,
+        "a 64-bit non-negative integer"
+    );
+    de_int!(
+        deserialize_u128,
+        visit_u128,
+        u128,
+        "a 128-bit non-negative integer"
+    );
 
     de_float!(deserialize_f32, "a number");
     de_float!(deserialize_f64, "a number");
@@ -641,7 +692,9 @@ impl<'de> Deserializer<'de> for FieldDe<'de> {
     fn deserialize_bool<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value, DeError> {
         let (value, span) = self.scalar("a boolean (#true/#false)")?;
         match value {
-            KdlValue::Bool(b) => visitor.visit_bool(*b).map_err(|e: DeError| e.with_span(span)),
+            KdlValue::Bool(b) => visitor
+                .visit_bool(*b)
+                .map_err(|e: DeError| e.with_span(span)),
             other => Err(DeError::invalid_type_at(
                 "a boolean (#true/#false)",
                 value_desc(other),
@@ -653,10 +706,14 @@ impl<'de> Deserializer<'de> for FieldDe<'de> {
     fn deserialize_str<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value, DeError> {
         let (value, span) = self.scalar("a string")?;
         match value {
-            KdlValue::String(s) => {
-                visitor.visit_borrowed_str(s).map_err(|e: DeError| e.with_span(span))
-            }
-            other => Err(DeError::invalid_type_at("a string", value_desc(other), span)),
+            KdlValue::String(s) => visitor
+                .visit_borrowed_str(s)
+                .map_err(|e: DeError| e.with_span(span)),
+            other => Err(DeError::invalid_type_at(
+                "a string",
+                value_desc(other),
+                span,
+            )),
         }
     }
 
@@ -717,7 +774,8 @@ impl<'de> Deserializer<'de> for FieldDe<'de> {
     }
 
     fn deserialize_option<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value, DeError> {
-        // Present-with-`#null` is an explicit `None`; anything else is `Some`.
+        // A key present with `#null` is an explicit `None`; anything else is
+        // `Some`.
         if let Some((KdlValue::Null, _)) = self.scalar_value() {
             return visitor.visit_none();
         }
@@ -735,18 +793,18 @@ impl<'de> Deserializer<'de> for FieldDe<'de> {
     fn deserialize_seq<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value, DeError> {
         let key = self.key;
         match self.source {
-            // Repeated same-name children: one element per node.
+            // Repeated same-name children yield one element per node.
             FieldSource::Nodes(nodes) => visitor.visit_seq(NodesSeq {
                 iter: nodes.into_iter(),
                 key,
             }),
             FieldSource::Node(n) => match node_shape(n) {
-                // `k a b c` (positional args only): one element per arg.
+                // `k a b c` yields one element per positional argument.
                 NodeShape::Args(_) => visitor.visit_seq(ArgsSeq {
                     iter: node_args(n).collect::<Vec<_>>().into_iter(),
                     key,
                 }),
-                // A single nested child for a one-element sequence.
+                // A single nested child reads as a one-element sequence.
                 NodeShape::Nested => visitor.visit_seq(NodesSeq {
                     iter: vec![n].into_iter(),
                     key,
@@ -808,7 +866,7 @@ impl<'de> Deserializer<'de> for FieldDe<'de> {
         _variants: &'static [&'static str],
         visitor: V,
     ) -> Result<V::Value, DeError> {
-        // A fieldless enum from a string (`state="running"`).
+        // A fieldless enum spelled as a string (`state="running"`).
         let (value, span) = self.scalar("a string variant name")?;
         match value {
             KdlValue::String(s) => visitor
@@ -826,13 +884,14 @@ impl<'de> Deserializer<'de> for FieldDe<'de> {
         self.deserialize_str(visitor)
     }
 
-    // The typo guard: serde-derive drains an unmatched key through here, so every
-    // params struct is deny-unknown-fields with the key's exact span (design §1.3).
+    // serde-derive drains an unmatched key through here; erroring makes
+    // every struct reject unknown keys, with the key's exact span.
     fn deserialize_ignored_any<V: Visitor<'de>>(self, _visitor: V) -> Result<V::Value, DeError> {
         Err(DeError::unknown_field_at(self.key, self.span))
     }
 
-    // The self-describing path (`serde_json::Value`): shape decides.
+    // The self-describing path; the source's shape decides what the visitor
+    // sees.
     fn deserialize_any<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value, DeError> {
         match &self.source {
             FieldSource::Entry(e) => visit_scalar(visitor, e.value(), e.span()),
@@ -857,7 +916,7 @@ impl<'de> Deserializer<'de> for FieldDe<'de> {
     }
 }
 
-/// Sequence elements from child nodes (repeated children, or one nested child).
+/// Sequence elements drawn from child nodes.
 struct NodesSeq<'de> {
     iter: std::vec::IntoIter<&'de KdlNode>,
     key: &'de str,
@@ -890,7 +949,7 @@ impl<'de> SeqAccess<'de> for NodesSeq<'de> {
     }
 }
 
-/// Sequence elements from one child's positional args (`k a b c`).
+/// Sequence elements drawn from one child's positional arguments.
 struct ArgsSeq<'de> {
     iter: std::vec::IntoIter<&'de KdlEntry>,
     key: &'de str,
@@ -929,11 +988,14 @@ mod tests {
     use kdl::KdlDocument;
 
     fn parse_node(src: &str) -> (KdlDocument, String) {
-        (src.parse::<KdlDocument>().expect("fixture KDL parses"), src.to_string())
+        (
+            src.parse::<KdlDocument>().expect("fixture KDL parses"),
+            src.to_string(),
+        )
     }
 
-    /// Deserialize `T` from the first node of `src`, with a `system`-node surface
-    /// (reserved `type`/`artifact`, one leading positional name arg).
+    /// Deserialize `T` from the first node of `src` with a `system` node's
+    /// surface, reserving `type`/`artifact` and one leading name argument.
     fn de_system<T: de::DeserializeOwned>(src: &str) -> Result<T, LoadError> {
         let (doc, text) = parse_node(src);
         from_kdl_node(&doc.nodes()[0], &text, "test", &["type", "artifact"], 1)
@@ -950,10 +1012,8 @@ mod tests {
 
     #[test]
     fn flat_properties_deserialize() {
-        let got: Flat = de_system(
-            r#"system "x" type="T" count=3 rate=2 label="hi" enabled=#true"#,
-        )
-        .unwrap();
+        let got: Flat =
+            de_system(r#"system "x" type="T" count=3 rate=2 label="hi" enabled=#true"#).unwrap();
         assert_eq!(
             got,
             Flat {
@@ -968,20 +1028,20 @@ mod tests {
 
     #[test]
     fn scalar_child_nodes_are_fields_too() {
-        // `k v` child form (the slot `allow { gain 0.8 }` shape).
-        let got: Flat = de_system(
-            r#"system "x" type="T" { count 3; rate 0.5; label "hi"; enabled #false }"#,
-        )
-        .unwrap();
+        // Scalar fields may also be spelled as `k v` children.
+        let got: Flat =
+            de_system(r#"system "x" type="T" { count 3; rate 0.5; label "hi"; enabled #false }"#)
+                .unwrap();
         assert_eq!(got.rate, 0.5);
         assert!(!got.enabled);
     }
 
     #[test]
     fn null_property_is_explicit_none() {
-        let got: Flat =
-            de_system(r#"system "x" type="T" count=1 rate=1.0 label="l" enabled=#true offset=#null"#)
-                .unwrap();
+        let got: Flat = de_system(
+            r#"system "x" type="T" count=1 rate=1.0 label="l" enabled=#true offset=#null"#,
+        )
+        .unwrap();
         assert_eq!(got.offset, None);
     }
 
@@ -990,7 +1050,9 @@ mod tests {
         let err = de_system::<Flat>(r#"system "x" type="T" rate=1.0 label="l" enabled=#true"#)
             .unwrap_err();
         match err {
-            LoadError::MissingParam { property, system, .. } => {
+            LoadError::MissingParam {
+                property, system, ..
+            } => {
                 assert_eq!(property, "count");
                 assert_eq!(system, "test");
             }
@@ -1007,7 +1069,10 @@ mod tests {
                 assert_eq!(property, "typo");
                 // The span points at the `typo=5` entry, not the whole node.
                 let at = src.find("typo=5").unwrap();
-                assert!(span.offset() >= at, "span {span:?} inside the entry (at {at})");
+                assert!(
+                    span.offset() >= at,
+                    "span {span:?} inside the entry (at {at})"
+                );
             }
             other => panic!("expected UnknownParam, got {other:?}"),
         }
@@ -1035,7 +1100,10 @@ mod tests {
             n: u8,
         }
         let err = de_system::<Small>(r#"system "x" type="T" n=300"#).unwrap_err();
-        assert!(matches!(err, LoadError::InvalidParam { ref property, .. } if property == "n"), "{err:?}");
+        assert!(
+            matches!(err, LoadError::InvalidParam { ref property, .. } if property == "n"),
+            "{err:?}"
+        );
     }
 
     #[derive(serde::Deserialize, Debug, PartialEq)]
@@ -1064,7 +1132,11 @@ mod tests {
         assert_eq!(
             got,
             Nested {
-                pid: Pid { p: 1.0, i: 0.5, d: 0.1 },
+                pid: Pid {
+                    p: 1.0,
+                    i: 0.5,
+                    d: 0.1
+                },
                 taps: vec![1, 2, 3],
                 label: None,
             }
@@ -1087,20 +1159,18 @@ mod tests {
         struct Gains {
             gain: Vec<Pid>,
         }
-        let got: Gains = de_system(
-            r#"system "x" type="T" { gain p=1.0 i=0.0 d=0.0; gain p=2.0 i=0.1 d=0.2 }"#,
-        )
-        .unwrap();
+        let got: Gains =
+            de_system(r#"system "x" type="T" { gain p=1.0 i=0.0 d=0.0; gain p=2.0 i=0.1 d=0.2 }"#)
+                .unwrap();
         assert_eq!(got.gain.len(), 2);
         assert_eq!(got.gain[1].p, 2.0);
     }
 
     #[test]
     fn nested_unknown_field_names_the_inner_key() {
-        let err = de_system::<Nested>(
-            r#"system "x" type="T" { pid p=1.0 i=0.5 d=0.1 q=9; taps 1 }"#,
-        )
-        .unwrap_err();
+        let err =
+            de_system::<Nested>(r#"system "x" type="T" { pid p=1.0 i=0.5 d=0.1 q=9; taps 1 }"#)
+                .unwrap_err();
         assert!(
             matches!(err, LoadError::UnknownParam { ref property, .. } if property == "q"),
             "{err:?}"
@@ -1122,7 +1192,10 @@ mod tests {
         let got: WithMode = de_system(r#"system "x" type="T" mode="fast""#).unwrap();
         assert_eq!(got.mode, Mode::Fast);
         let err = de_system::<WithMode>(r#"system "x" type="T" mode="warp""#).unwrap_err();
-        assert!(matches!(err, LoadError::InvalidParam { ref property, .. } if property == "mode"), "{err:?}");
+        assert!(
+            matches!(err, LoadError::InvalidParam { ref property, .. } if property == "mode"),
+            "{err:?}"
+        );
     }
 
     #[test]
@@ -1187,10 +1260,10 @@ mod tests {
         assert_eq!(got.gain, 0.5);
     }
 
-    /// The alarm-config grammar (`docs/alarms.md` §3) deserializes end-to-end:
-    /// repeated `alarm` children, property + scalar-child fields, `Option` bands
-    /// with per-side `Option` thresholds, the wkt `Severity` enum from a string,
-    /// integer→float coercion, and the `try_from` semantic validation.
+    /// The alarm grammar deserializes end to end: repeated `alarm` children,
+    /// property and scalar-child fields, `Option` bands with per-side
+    /// `Option` thresholds, the `Severity` enum from a string,
+    /// integer-to-float coercion, and the `try_from` semantic validation.
     #[test]
     fn alarm_params_grammar_round_trips() {
         use metor_proto_wkt::Severity;
@@ -1240,9 +1313,9 @@ mod tests {
         assert!(empty.alarm.is_empty());
     }
 
-    /// A semantically-bad alarm spec is a spanned `InvalidParam` naming the `alarm`
-    /// key (the `try_from` refinement), and the positional-id spelling is rejected
-    /// (nested nodes take no positional args — `docs/alarms.md` §7 F2).
+    /// A semantically invalid alarm is a spanned invalid-param naming the
+    /// `alarm` key (the `try_from` refinement), and a positional id is
+    /// rejected because nested nodes take no positional arguments.
     #[test]
     fn alarm_params_misconfig_is_spanned() {
         use crate::alarm::AlarmsParams;
@@ -1253,15 +1326,20 @@ mod tests {
 }"#;
         let err = de_system::<AlarmsParams>(src).unwrap_err();
         match err {
-            LoadError::InvalidParam { ref property, span, .. } => {
+            LoadError::InvalidParam {
+                ref property, span, ..
+            } => {
                 assert_eq!(property, "alarm");
                 let at = src.find("alarm id=").unwrap();
-                assert!(span.offset() >= at, "span {span:?} at the alarm child (at {at})");
+                assert!(
+                    span.offset() >= at,
+                    "span {span:?} at the alarm child (at {at})"
+                );
             }
             other => panic!("expected InvalidParam, got {other:?}"),
         }
 
-        // Positional id (the `alarm "X"` spelling) is not the grammar.
+        // The `alarm "X"` positional-id spelling is not the grammar.
         let err = de_system::<AlarmsParams>(
             r#"system "alarms" type="Alarms" {
     alarm "X" name="X" { target component="a.b.c"; warning above=1.0 }
@@ -1287,7 +1365,10 @@ mod tests {
         assert_eq!(obj["gain"], serde_json::json!(0.5));
         assert_eq!(obj["name"], serde_json::json!("n"));
         assert_eq!(obj["on"], serde_json::json!(true));
-        assert_eq!(obj["pid"], serde_json::json!({ "p": 1, "i": 2.5, "d": null }));
+        assert_eq!(
+            obj["pid"],
+            serde_json::json!({ "p": 1, "i": 2.5, "d": null })
+        );
         assert_eq!(obj["taps"], serde_json::json!([1, 2]));
         assert_eq!(obj["tag"], serde_json::json!(["a", "b"]));
         // The side table names every top-level key.

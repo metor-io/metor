@@ -1,8 +1,9 @@
-//! Telemetry acceptance tests (telemetry.md "Tests"): the general output registry queried
-//! by instance-qualified id, the telemetry downlink end-to-end against a deterministic
-//! in-memory mock transport (announced prefixed vtables/metadata + `Table` packets),
-//! two-instance prefix disambiguation, subset filtering, and the non-blocking
-//! drop-on-full policy with its `telemetry.dropped` health counter.
+//! Acceptance tests for the downlink and uplink. They cover the output registry
+//! queried by instance-qualified id, the end-to-end downlink against a deterministic
+//! in-memory transport (one announce per tapped entry, then `Table` packets),
+//! prefix disambiguation between two instances of one system type, subset
+//! filtering, the non-blocking drop-on-full policy and its health counter, the
+//! non-coalescing message FIFO, and uplink subscription and routing.
 
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -18,7 +19,7 @@ use crate::{
 };
 
 // ---------------------------------------------------------------------------
-// Frames + systems under test (a producer -> consumer chain).
+// Frames and systems under test (a producer -> consumer chain).
 // ---------------------------------------------------------------------------
 
 #[derive(crate::Frame, IntoBytes, Immutable, KnownLayout, FromBytes, Default)]
@@ -42,7 +43,7 @@ struct Nav {
 #[derive(SystemInput)]
 struct NoIn {}
 
-/// A cyclic producer writing an incrementing `Imu` (omega = cycle index).
+/// A cyclic producer writing an incrementing `Imu` (omega equals the cycle index).
 struct Producer {
     n: f64,
 }
@@ -68,7 +69,7 @@ impl CyclicSystem for Producer {
     }
 }
 
-/// A cyclic consumer: `nav.angle = imu.omega`.
+/// A cyclic consumer that copies `imu.omega` into `nav.angle`.
 struct Consumer;
 
 #[derive(SystemInput)]
@@ -99,13 +100,13 @@ impl CyclicSystem for Consumer {
 }
 
 // ---------------------------------------------------------------------------
-// A deterministic in-memory mock transport (telemetry.md §7) for the e2e tests.
+// A deterministic in-memory mock transport for the end-to-end tests.
 // ---------------------------------------------------------------------------
 
 struct MockInner {
     announces: Mutex<Vec<(PacketId, Vec<ComponentMetadata>)>>,
     packets: Mutex<Vec<LenPacket>>,
-    /// When set, `send` never completes — saturates the queue for the drop test.
+    /// When set, `send` never completes, so the drop test can saturate the queue.
     block: bool,
 }
 
@@ -142,7 +143,7 @@ impl Transport for MockTransport {
 
     async fn send(&mut self, pkt: LenPacket) -> Result<(), TransportError> {
         if self.inner.block {
-            // Never resolves: the sender parks here, the cycle keeps running, slots fill.
+            // Park forever; the cycle keeps running and the hand-off slots fill.
             std::future::pending::<()>().await;
         }
         self.inner.packets.lock().unwrap().push(pkt);
@@ -154,8 +155,8 @@ impl Transport for MockTransport {
 // Helpers.
 // ---------------------------------------------------------------------------
 
-/// A free-running simulated clock: `run_for` yields each cycle, so the spawned sender
-/// task is scheduled deterministically.
+/// A free-running simulated clock. `run_for` yields each cycle, so the spawned
+/// sender task is scheduled deterministically.
 fn sim_config() -> CoordinatorConfig {
     CoordinatorConfig {
         cycle_rate: 1000.0,
@@ -167,7 +168,7 @@ fn sim_config() -> CoordinatorConfig {
     }
 }
 
-/// A `Table` packet's announced id is the 2 bytes after the 4-byte length + 1 ty byte.
+/// A `Table` packet's id is the 2 bytes after the 4-byte length and 1 ty byte.
 fn packet_id_of(pkt: &LenPacket) -> PacketId {
     [pkt.inner[5], pkt.inner[6]]
 }
@@ -178,7 +179,9 @@ fn packet_payload(pkt: &LenPacket) -> &[u8] {
 }
 
 /// Drain a view to its newest record and return a copy of the bytes, if any.
-fn drain_latest(view: &mut metor_fsw_ring::View<metor_fsw_ring::NoWake, metor_fsw_ring::NoWake>) -> Option<Vec<u8>> {
+fn drain_latest(
+    view: &mut metor_fsw_ring::View<metor_fsw_ring::NoWake, metor_fsw_ring::NoWake>,
+) -> Option<Vec<u8>> {
     let mut buf = Vec::new();
     let mut last = None;
     while let Ok(true) = view.try_read_into(&mut buf) {
@@ -188,7 +191,7 @@ fn drain_latest(view: &mut metor_fsw_ring::View<metor_fsw_ring::NoWake, metor_fs
 }
 
 // ---------------------------------------------------------------------------
-// 1. Registry: query by instance-qualified id, claim a view, read the bytes.
+// 1. Query the registry by instance-qualified id, claim a view, read the bytes.
 // ---------------------------------------------------------------------------
 
 #[cfg(not(miri))]
@@ -213,9 +216,13 @@ async fn registry_query_view_and_read() {
     assert_eq!(&*entry.instance, "producer");
     // The consumer's frame and the coordinator's own buffers are indexed too.
     assert!(registry.get(ComponentId::new("consumer.nav")).is_some());
-    assert!(registry.get(ComponentId::new("coordinator.health")).is_some());
+    assert!(
+        registry
+            .get(ComponentId::new("coordinator.health"))
+            .is_some()
+    );
 
-    // Claim a view *before* running (a fresh view only sees later commits), run, read.
+    // Claim a view before running (a fresh view only sees later commits), run, read.
     let mut view = entry.view().expect("reader slot");
     coord.run_for(5).await;
     let bytes = drain_latest(&mut view).expect("producer wrote at least one imu");
@@ -224,7 +231,7 @@ async fn registry_query_view_and_read() {
 }
 
 // ---------------------------------------------------------------------------
-// 2. End-to-end (all mode): announced prefixed schema + per-cycle Table packets.
+// 2. End-to-end in All mode. Announced prefixed schema, then per-cycle Table packets.
 // ---------------------------------------------------------------------------
 
 #[cfg(not(miri))]
@@ -243,8 +250,8 @@ async fn telemetry_end_to_end_all() {
         mode: TelemetryMode::All,
     }));
     let mut coord = b.build().unwrap();
-    // Only Table entries are announced (Postcard entries — the coordinator's
-    // `sequences`/`commands` channels — are self-describing, no announce).
+    // Only Table entries are announced; Postcard entries (the coordinator's
+    // `sequences` and `commands` channels) are self-describing and carry no announce.
     let n_taps = coord
         .registry()
         .entries()
@@ -255,11 +262,11 @@ async fn telemetry_end_to_end_all() {
 
     let announces = rec.announces.lock().unwrap();
 
-    // Every output is announced exactly once — the user frames, every system's implicit
-    // health/log, and the coordinator-owned buffers (telemetry.md §3/§5). The `log`
-    // frames carry only a dynamic `FrameList`, so their announce has an empty metadata
-    // set (the count proves they were announced); the scalar-bearing frames carry their
-    // prefixed component names.
+    // Every output is announced exactly once. That includes the user frames, every
+    // system's implicit health/log, and the coordinator-owned buffers. The `log`
+    // frames carry only a dynamic `FrameList`, so their announce has an empty
+    // metadata set (the count proves they were announced); the scalar-bearing
+    // frames carry their prefixed component names.
     assert_eq!(announces.len(), n_taps, "one announce per registry entry");
     let has_name = |name: &str| {
         announces
@@ -275,7 +282,10 @@ async fn telemetry_end_to_end_all() {
     assert!(has_name("consumer.nav.angle"), "consumer.nav announced");
     assert!(has_prefix("producer.health"), "producer.health announced");
     assert!(has_prefix("consumer.health"), "consumer.health announced");
-    assert!(has_prefix("coordinator.health"), "coordinator buffers announced");
+    assert!(
+        has_prefix("coordinator.health"),
+        "coordinator buffers announced"
+    );
 
     // The producer.imu tap's `Table` packets carry the committed frame bytes verbatim.
     let imu_pid = announces
@@ -290,7 +300,10 @@ async fn telemetry_end_to_end_all() {
         .iter()
         .filter(|pkt| packet_id_of(pkt) == imu_pid)
         .collect();
-    assert!(!imu_pkts.is_empty(), "received Table packets for producer.imu");
+    assert!(
+        !imu_pkts.is_empty(),
+        "received Table packets for producer.imu"
+    );
     let last = imu_pkts.last().unwrap();
     let imu = Imu::read_from_prefix(packet_payload(last))
         .expect("packet payload is the imu table")
@@ -299,7 +312,7 @@ async fn telemetry_end_to_end_all() {
 }
 
 // ---------------------------------------------------------------------------
-// 3. Two instances of one type → distinct qualified ids + distinct prefixed names.
+// 3. Two instances of one type get distinct qualified ids and prefixed names.
 // ---------------------------------------------------------------------------
 
 #[test]
@@ -318,8 +331,8 @@ fn two_instances_distinct_prefixes() {
         .get(ComponentId::new("imu_right.imu"))
         .expect("imu_right.imu");
 
-    // Same unprefixed frame id, distinct qualified keys — the headline collision, now
-    // disambiguated; their announced names carry distinct instance prefixes.
+    // Both entries share the unprefixed frame id, but their qualified keys differ
+    // and their announced names carry distinct instance prefixes.
     let crate::EntrySchema::Table {
         frame_id: left_id,
         metadata: left_meta,
@@ -345,7 +358,7 @@ fn two_instances_distinct_prefixes() {
 }
 
 // ---------------------------------------------------------------------------
-// 4. Subset mode taps only the configured instances/frames.
+// 4. Subset mode taps only the configured instances and frames.
 // ---------------------------------------------------------------------------
 
 #[cfg(not(miri))]
@@ -371,7 +384,7 @@ async fn subset_mode_filters() {
 
     let announces = rec.announces.lock().unwrap();
     assert!(!announces.is_empty(), "producer was tapped");
-    // Only producer.* was tapped — no consumer, coordinator, or telemetry frames leaked.
+    // Only producer.* was tapped; no consumer, coordinator, or telemetry frames leaked.
     for (_, meta) in announces.iter() {
         for m in meta {
             assert!(
@@ -390,14 +403,14 @@ async fn subset_mode_filters() {
 }
 
 // ---------------------------------------------------------------------------
-// 5. Drop policy: a saturated transport never blocks the cycle; drops are surfaced.
+// 5. Drop policy. A saturated transport never blocks the cycle; drops are surfaced.
 // ---------------------------------------------------------------------------
 
 #[cfg(not(miri))]
 #[stellarator::test]
 async fn drop_policy_never_blocks_and_counts() {
-    // A transport whose `send` never completes: after the first take, slots stay full
-    // and every later snapshot overwrites an un-sent one (a drop).
+    // A transport whose `send` never completes. After the first take, slots stay
+    // full and every later snapshot overwrites an un-sent one, which counts as a drop.
     let mock = MockTransport::new(true);
 
     let mut b = Coordinator::builder(sim_config());
@@ -416,7 +429,7 @@ async fn drop_policy_never_blocks_and_counts() {
         .view()
         .expect("reader slot");
 
-    // The cycle never blocks on the stalled link: `run_for` completes all cycles.
+    // The cycle never blocks on the stalled link, so `run_for` completes all cycles.
     coord.run_for(50).await;
 
     let bytes = drain_latest(&mut health).expect("telemetry published a health frame");
@@ -431,9 +444,9 @@ async fn drop_policy_never_blocks_and_counts() {
 }
 
 // ---------------------------------------------------------------------------
-// 6. Message downlink: every record forwarded as a self-describing `Msg` packet, in
-//    FIFO order, never coalesced, no announce — and the message FIFO and the component
-//    hand-off share the one sender independently (`docs/messages.md` §3).
+// 6. Message downlink. Every record is forwarded as a self-describing `Msg`
+//    packet in FIFO order, never coalesced and never announced, and the message
+//    FIFO and the component hand-off share the one sender independently.
 // ---------------------------------------------------------------------------
 
 #[cfg(not(miri))]
@@ -454,8 +467,8 @@ async fn message_downlink_fifo_no_coalesce() {
 
     use super::{HandOff, run_sender};
 
-    // A by-hand message channel — the exact shape the coordinator registers (W4) and the
-    // telemetry `execute` message-tap drains.
+    // A by-hand message channel with the same shape the coordinator registers and
+    // the telemetry message tap drains.
     let ring = RingBuffer::create_in_memory(Config {
         capacity: capacity_for(MAX_MSG_BYTES, LOG_DEPTH),
         max_readers: 4,
@@ -471,10 +484,9 @@ async fn message_downlink_fifo_no_coalesce() {
     };
     // Claim the tap before any write (an overwrite-ring view starts at the live edge).
     let mut view = entry.view().expect("reader slot");
-    // Typed ports — a heterogeneous channel is N ports now (`docs/message-wiring.md` §2.1);
-    // the ring enforces a single live writer, so the ports take it in turn (each drop
-    // frees the claim) and the tap drains one interleaved stream.
-    // An event/command *log* of three records — two of one Msg type, one of another,
+    // The ring enforces a single live writer, so the typed ports take it in turn
+    // (each drop frees the claim) and the tap drains one interleaved stream.
+    // The log holds three records, two of one Msg type and one of another,
     // interleaved. A snapshot would coalesce the two `SequenceCommand`s; a log must not.
     {
         let mut cmd_out: MsgOut<SequenceCommand> =
@@ -511,13 +523,13 @@ async fn message_downlink_fifo_no_coalesce() {
     let wq = Arc::new(WaitQueue::new());
     let handoff = Arc::new(HandOff::new(1, wq.clone()));
 
-    // A component snapshot through the latest-wins hand-off, to prove the two queues are
-    // independent and the one sender forwards both.
+    // A component snapshot through the latest-wins hand-off, to prove the two
+    // queues are independent and the one sender forwards both.
     let mut table = LenPacket::table([9, 9], 4);
     table.extend_from_slice(&[1, 2, 3, 4]);
     handoff.push_snapshot(0, table);
 
-    // Drain *every* message record (the `execute` message-tap logic) into the FIFO.
+    // Drain every message record into the FIFO, exactly as the in-cycle tap does.
     let mut scratch = Vec::new();
     while let Ok(true) = view.try_read_into(&mut scratch) {
         let (id, payload) = split_record(&scratch).expect("split record");
@@ -526,7 +538,8 @@ async fn message_downlink_fifo_no_coalesce() {
         handoff.push_log(pkt);
     }
 
-    // Drive the async sender: no announces (no component taps), forward each queued packet.
+    // Drive the async sender. With no component taps there are no announces; it
+    // just forwards each queued packet.
     let mock = MockTransport::new(false);
     let rec = mock.inner.clone();
     let stop = Arc::new(AtomicBool::new(false));
@@ -538,7 +551,7 @@ async fn message_downlink_fifo_no_coalesce() {
         stop.clone(),
     ));
 
-    // Let the sender drain (it sends synchronously, then parks), then stop + join.
+    // Let the sender drain (it sends synchronously, then parks), then stop and join.
     for _ in 0..32 {
         if rec.packets.lock().unwrap().len() >= 4 {
             break;
@@ -549,23 +562,23 @@ async fn message_downlink_fifo_no_coalesce() {
     wq.wake_all();
     let _ = handle.await;
 
-    // No message is announced (self-describing); only the component tap would announce,
-    // and we passed none.
+    // No message is announced (self-describing); only the component tap would
+    // announce, and we passed none.
     assert!(
         rec.announces.lock().unwrap().is_empty(),
         "messages carry no announce"
     );
 
     let packets = rec.packets.lock().unwrap();
-    // A `LenPacket`'s bytes carry a 4-byte length prefix the wire reader strips before
-    // `OwnedPacket::parse` sees the packet header; skip it here too.
+    // A `LenPacket`'s bytes carry a 4-byte length prefix the wire reader strips
+    // before `OwnedPacket::parse` sees the packet header; skip it here too.
     let parsed: Vec<OwnedPacket<Vec<u8>>> = packets
         .iter()
         .map(|p| OwnedPacket::parse(p.inner[4..].to_vec()).expect("parse packet"))
         .collect();
 
-    // The component snapshot came through as a `Table`, proving the shared sender drains
-    // both hand-offs.
+    // The component snapshot came through as a `Table`, proving the shared sender
+    // drains both hand-offs.
     assert_eq!(
         parsed
             .iter()
@@ -575,8 +588,9 @@ async fn message_downlink_fifo_no_coalesce() {
         "the component snapshot was forwarded too"
     );
 
-    // The three message records arrived as `Msg` packets, in FIFO order, none coalesced —
-    // both `SequenceCommand`s are present despite sharing an id (a snapshot would lose one).
+    // The three message records arrived as `Msg` packets in FIFO order, none
+    // coalesced. Both `SequenceCommand`s are present despite sharing an id
+    // (a snapshot would lose one).
     let msgs: Vec<_> = parsed
         .iter()
         .filter_map(|p| match p {
@@ -584,7 +598,11 @@ async fn message_downlink_fifo_no_coalesce() {
             _ => None,
         })
         .collect();
-    assert_eq!(msgs.len(), 3, "every message record forwarded, none coalesced");
+    assert_eq!(
+        msgs.len(),
+        3,
+        "every message record forwarded, none coalesced"
+    );
     assert_eq!(
         msgs.iter().map(|m| m.id).collect::<Vec<_>>(),
         vec![
@@ -602,13 +620,12 @@ async fn message_downlink_fifo_no_coalesce() {
 }
 
 // ---------------------------------------------------------------------------
-// 6b. The generic Table × Log combination (the axis product's fourth cell): an
-//     every-record FRAME log downlinks each record via the FIFO lane, framed as an
-//     announced Table packet — no coalescing, one announce.
+// 6b. A frame output with Log delivery downlinks every record through the FIFO
+//     lane, each framed as a Table packet under one announce, none coalesced.
 // ---------------------------------------------------------------------------
 
-/// A producer whose `Imu` output declares `Delivery::Log` — an every-record frame
-/// log. Writes THREE records per cycle; a Snapshot tap would coalesce them.
+/// A producer whose `Imu` output declares `Delivery::Log`, an every-record frame
+/// log. Writes three records per cycle; a snapshot tap would coalesce them.
 struct BurstLogProducer {
     n: f64,
 }
@@ -672,17 +689,20 @@ async fn table_log_entry_downlinks_every_record() {
     // Let the parked sender drain the FIFO tail.
     stellarator::sleep(Duration::from_millis(20)).await;
 
-    // The Log frame entry is announced exactly once (a valid Table announce)...
+    // The Log frame entry is announced exactly once, as a valid Table announce...
     let announces = rec.announces.lock().unwrap();
     assert_eq!(announces.len(), 1, "one announce for the one tapped entry");
     assert!(
-        announces[0].1.iter().any(|m| m.name == "burst_log.imu.omega"),
+        announces[0]
+            .1
+            .iter()
+            .any(|m| m.name == "burst_log.imu.omega"),
         "prefixed announce metadata"
     );
     let packet_id = announces[0].0;
 
-    // ...and EVERY record arrives as its own Table packet under that id — the
-    // FIFO lane never coalesces (3 records x N cycles), and each omega is distinct.
+    // ...and every record arrives as its own Table packet under that id. The FIFO
+    // lane never coalesces (3 records x N cycles), and each omega is distinct.
     let packets = rec.packets.lock().unwrap();
     let omegas: Vec<f64> = packets
         .iter()
@@ -704,8 +724,8 @@ async fn table_log_entry_downlinks_every_record() {
 }
 
 // ---------------------------------------------------------------------------
-// 7. The message FIFO is bounded: past capacity it drops the *oldest* record (never the
-//    newest) and counts each drop — the non-coalescing event-log overflow policy.
+// 7. The message FIFO is bounded. Past capacity it drops the oldest record
+//    (never the newest) and counts each drop.
 // ---------------------------------------------------------------------------
 
 #[test]
@@ -733,9 +753,13 @@ fn message_handoff_drops_oldest_on_overflow() {
 
     let (snapshots, drained) = handoff.drain();
     assert!(snapshots.is_empty(), "nothing on the snapshot lane");
-    assert_eq!(drained.len(), LOG_HANDOFF_CAP, "the FIFO is bounded to its cap");
-    // The *oldest* (records 0,1) were dropped; the queue holds records `overflow..`, in
-    // order — the newest survive, the front is shed.
+    assert_eq!(
+        drained.len(),
+        LOG_HANDOFF_CAP,
+        "the FIFO is bounded to its cap"
+    );
+    // Records 0 and 1 were shed from the front; the queue holds records
+    // `overflow..` in order, so the newest survive.
     let first_id = [drained[0].inner[5], drained[0].inner[6]];
     assert_eq!(
         first_id,
@@ -744,9 +768,9 @@ fn message_handoff_drops_oldest_on_overflow() {
     );
 }
 
-/// The uplink subscribes to **exactly** its configured msg set — subscription,
-/// dispatch, and the minted ports all derive from the one `msgs` list, and there is
-/// no hardcoded fallback id: an empty config subscribes to nothing.
+/// The uplink subscribes to exactly its configured msg set. Subscription,
+/// dispatch, and the minted ports all derive from the one `msgs` list, and there
+/// is no fallback id, so an empty config subscribes to nothing.
 #[cfg(not(miri))]
 #[stellarator::test]
 async fn uplink_subscribes_to_its_configured_ids() {
@@ -759,7 +783,7 @@ async fn uplink_subscribes_to_its_configured_ids() {
 
     use crate::RecvTransport;
 
-    /// Records the subscription and yields nothing (the reader stops immediately).
+    /// Records the subscription and yields nothing, so the reader stops immediately.
     struct SubRecv {
         subscribed: Rc<RefCell<Option<Vec<PacketId>>>>,
     }
@@ -776,7 +800,7 @@ async fn uplink_subscribes_to_its_configured_ids() {
         }
     }
 
-    // Configured: exactly the two ids, in config order.
+    // Configured, so the subscription is exactly the two ids, in config order.
     let subscribed = Rc::new(RefCell::new(None));
     let mut b = Coordinator::builder(sim_config());
     b.add_async(
@@ -794,8 +818,8 @@ async fn uplink_subscribes_to_its_configured_ids() {
         "the subscription is the configured set, nothing more"
     );
 
-    // Unconfigured: an empty subscription (the historical SequenceCommand fallback
-    // is gone; the uplink warns instead).
+    // Unconfigured means an empty subscription; the uplink warns rather than
+    // guessing an id.
     let subscribed = Rc::new(RefCell::new(None));
     let mut b = Coordinator::builder(sim_config());
     b.add_async(UplinkSystem::new(SubRecv {
@@ -810,9 +834,9 @@ async fn uplink_subscribes_to_its_configured_ids() {
     );
 }
 
-/// A wire `AlarmAck` fed through the uplink routes onto its `acks` port and reaches a
-/// consumer over an ordinary message edge (`docs/alarms.md` §6) — while a malformed
-/// postcard payload under the same id is dropped without killing the link (the next
+/// A wire `AlarmAck` fed through the uplink routes onto its `acks` port and
+/// reaches a consumer over an ordinary message edge, while a malformed postcard
+/// payload under the same id is dropped without killing the link (the next
 /// packet still arrives).
 #[cfg(not(miri))]
 #[stellarator::test]
@@ -879,8 +903,8 @@ async fn uplink_routes_alarm_acks() {
         operator: "op".to_string(),
         note: None,
     };
-    // Frame one good ack around a malformed payload under the same id: strip the
-    // LenPacket 4-byte length prefix, as the panel's sink does on the wire.
+    // Frame one good ack around a malformed payload under the same id, stripping
+    // the LenPacket 4-byte length prefix so the bytes match what arrives on the wire.
     let good = ack.into_len_packet().inner[4..].to_vec();
     let mut garbage = LenPacket::msg(AlarmAck::ID, 3);
     garbage.extend_from_slice(&[0xff, 0xff, 0xff]);
@@ -905,15 +929,20 @@ async fn uplink_routes_alarm_acks() {
     coord.run_for(20).await;
 
     let got = seen.borrow();
-    assert_eq!(got.len(), 1, "the malformed payload is dropped, the ack lands");
+    assert_eq!(
+        got.len(),
+        1,
+        "the malformed payload is dropped, the ack lands"
+    );
     assert_eq!(got[0].def_id, "RATE_HIGH");
     assert_eq!(got[0].occurrence, 42);
     assert_eq!(got[0].operator, "op");
 }
 
-/// THE id-agnostic acceptance test: a user-defined Msg type the framework has never
-/// seen — blanket-hashed id, no wkt entry, no framework change — flows wire → uplink →
-/// typed consumer with nothing but a `with_msg` entry and an ordinary message edge.
+/// A user-defined Msg type the framework has never seen (its id comes from the
+/// blanket hash, with no registered entry anywhere) flows from the wire through
+/// the uplink to a typed consumer with nothing but a `with_msg` entry and an
+/// ordinary message edge.
 #[cfg(not(miri))]
 #[stellarator::test]
 async fn uplink_relays_arbitrary_user_msgs() {
@@ -980,7 +1009,8 @@ async fn uplink_relays_arbitrary_user_msgs() {
         }
     }
 
-    // Strip the LenPacket 4-byte length prefix, as the panel's sink does on the wire.
+    // Strip the LenPacket 4-byte length prefix so the bytes match what arrives
+    // on the wire.
     let wire = SetGain { gain: 7 }.into_len_packet().inner[4..].to_vec();
 
     let seen = Rc::new(RefCell::new(Vec::new()));
@@ -1001,12 +1031,16 @@ async fn uplink_relays_arbitrary_user_msgs() {
 
     coord.run_for(20).await;
 
-    assert_eq!(*seen.borrow(), vec![7], "the user msg landed at its consumer");
+    assert_eq!(
+        *seen.borrow(),
+        vec![7],
+        "the user msg landed at its consumer"
+    );
 }
 
-/// A11(b): "the telemetry downlink registers last" is enforced, not silently reordered —
-/// a cyclic system registered *after* the receive-all downlink would telemeter one cycle
-/// stale, so `build()` rejects it by name.
+/// The rule that the downlink registers last is enforced, not silently
+/// reordered. A cyclic system registered after the receive-all downlink would
+/// telemeter one cycle stale, so `build()` rejects it by name.
 #[test]
 fn cyclic_after_receive_all_is_a_build_error() {
     let mut b = Coordinator::builder(sim_config());
@@ -1017,7 +1051,10 @@ fn cyclic_after_receive_all_is_a_build_error() {
     }));
     // A second producer (no inputs, so nothing else can fail first) after the downlink.
     b.add_cyclic_named("late", Producer { n: 0.0 });
-    let err = b.build().err().expect("a late cyclic system fails the build");
+    let err = b
+        .build()
+        .err()
+        .expect("a late cyclic system fails the build");
     match err {
         crate::WireError::ReceiveAllNotLast {
             system,
@@ -1030,10 +1067,10 @@ fn cyclic_after_receive_all_is_a_build_error() {
     }
 }
 
-/// Every config-minted uplink port is UNTELEMETERED (guards the A6 regression where
-/// the downlink would echo inbound commands back to the panel), Log-delivery, and
-/// keyed/named by its configured msg — appended after the static health/log pair in
-/// config order, the same order [`MsgFanOut::bind`] pops rings.
+/// Every config-minted uplink port is untelemetered (so the downlink never
+/// echoes inbound commands back over the link), Log-delivery, and keyed and
+/// named by its configured msg. The minted ports follow the static health/log
+/// pair in config order, the same order [`MsgFanOut::bind`] pops rings.
 #[test]
 fn uplink_minted_ports_are_untelemetered() {
     use metor_proto::types::Msg;
@@ -1055,7 +1092,7 @@ fn uplink_minted_ports_are_untelemetered() {
         .with_msg::<SequenceCommand>()
         .with_msg::<ReloadSequences>()
         .with_msg::<AlarmAck>()
-        // Idempotent: a repeat is one port, not a duplicate registry key.
+        // Idempotent, so a repeat is one port, not a duplicate registry key.
         .with_msg::<AlarmAck>();
     let desc = crate::AsyncSystem::instance_descriptor(&uplink);
 
@@ -1073,8 +1110,8 @@ fn uplink_minted_ports_are_untelemetered() {
 }
 
 /// `DownlinkParams`' two optional subset lists project onto `TelemetryMode` as
-/// documented: both absent taps everything; either present selects a subset with
-/// the missing list empty.
+/// documented. Both absent taps everything; either present selects a subset
+/// with the missing list empty.
 #[test]
 fn downlink_params_mode_projection() {
     let all = super::DownlinkParams {

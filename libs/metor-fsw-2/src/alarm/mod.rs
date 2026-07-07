@@ -1,25 +1,52 @@
-//! The alarm engine (`docs/alarms.md`).
+//! Limit alarms over telemetered components.
 //!
-//! An alarm is just a message, and the alarm engine is just a system: `AlarmSystem`
-//! is an ordinary [`CyclicSystem`](crate::CyclicSystem) that evaluates configured
-//! **limit alarms** against any telemetered component (read through the
-//! [`AllOutputs`](crate::AllOutputs) tap) and reports firing over ordinary telemetered
-//! message ports carrying the wkt alarm Msgs — [`AlarmDef`] at boot, [`AlarmRaised`] /
-//! [`AlarmCleared`] on debounced transitions. The downlink, the db msg-log catch-all,
-//! and the panel's alarm store consume them with no new plumbing.
+//! An alarm is just a message, and the alarm engine is just a system.
+//! [`AlarmSystem`] is an ordinary [`CyclicSystem`](crate::CyclicSystem) that
+//! watches telemetered components through an [`AllOutputs`](crate::AllOutputs)
+//! tap and publishes over ordinary message ports. It emits an [`AlarmDef`] per
+//! configured alarm at boot, then [`AlarmRaised`] and [`AlarmCleared`] as
+//! alarms transition. Anything that consumes telemetered messages sees them
+//! with no extra plumbing.
 //!
-//! This module has two halves:
+//! The module splits into three pieces:
 //!
-//! - the **config surface** ([`AlarmsParams`] / [`AlarmSpec`]): serde types a mission
-//!   file's `system "alarms" type="Alarms" { alarm … }` node deserializes into, with
-//!   semantic validation at load (`docs/alarms.md` §3), and the mechanical
-//!   [`AlarmSpec::to_def`] mapping — the firing thresholds *are* the display limits;
-//! - the **evaluation state machine** ([`AlarmEval`]): pure, port-free per-alarm state
-//!   (debounce both ways, a hysteresis dead zone, severity escalation on the same
-//!   occurrence, latching clear gated on recovered ∧ acked — `docs/alarms.md` §5.3);
-//! - the **system** ([`AlarmSystem`]): target resolution + def broadcast at the first
-//!   execute (`docs/alarms.md` §5.1 — not `init`, the downlink's taps don't exist
-//!   yet), per-cycle value extraction off shared registry views, and the ack drain.
+//! - the config surface ([`AlarmsParams`], [`AlarmSpec`]), the serde types a
+//!   mission file's `system "alarms" type="Alarms" { alarm … }` node
+//!   deserializes into, validated at load so a bad spec is a spanned config
+//!   error rather than a runtime surprise;
+//! - the evaluation state machine ([`AlarmEval`]), pure per-alarm state with
+//!   no ports of its own;
+//! - the system ([`AlarmSystem`]), which resolves targets, extracts values
+//!   each cycle, and turns evaluation events into wire messages.
+//!
+//! # Evaluation
+//!
+//! Each cycle the target's value classifies one of three ways. It is
+//! *breaching* when some configured band is violated, *in band* when every
+//! configured threshold is respected by at least the `hysteresis` margin, and
+//! otherwise in the *dead zone* between the two. Breaching cycles advance a
+//! raise counter and in-band cycles advance a clear counter; either counter
+//! must reach `debounce` before the alarm transitions, and a dead-zone cycle
+//! resets both, so chatter around a boundary neither raises nor clears. A NaN
+//! value lands in the dead zone and freezes the alarm where it is.
+//!
+//! Each raise mints an occurrence id. While an occurrence is active, a breach
+//! of a worse band re-raises the same occurrence at the higher severity. A
+//! latching alarm holds its occurrence after recovery until an operator ack
+//! arrives; a non-latching one clears as soon as the recovery debounce
+//! completes.
+//!
+//! # Boot order
+//!
+//! Targets resolve and watch views are claimed in `init`, when the registry
+//! is already frozen, so values from the very first cycle evaluate. The def
+//! broadcast waits for the first `execute` instead, because consumers claim
+//! their taps in their own `init`, which may run after this system's. Defs
+//! are latest-wins on the wire, so the delayed emit is always safe.
+//!
+//! A target that fails to resolve (unknown component, out-of-range element,
+//! duplicate alarm id, no reader slot left) disables that alarm and reports
+//! through health; it never panics the mission.
 
 use metor_fsw_ring::{NoWake, View};
 use metor_proto::types::{ComponentId, Timestamp};
@@ -34,39 +61,39 @@ use crate::message::{MsgIn, MsgOut};
 use crate::registry::{AllOutputs, EntrySchema};
 use crate::system::{BuildSystem, CyclicSystem, Out, System};
 
-/// The `AlarmSystem` params: the mission's alarm definitions, one [`AlarmSpec`] per
-/// repeated `alarm` child node. An alarm-less instance is legal (it evaluates nothing).
+/// Params for [`AlarmSystem`], one [`AlarmSpec`] per repeated `alarm` child
+/// node. An alarm-less instance is legal and evaluates nothing.
 #[derive(Deserialize, Debug, Clone, Default)]
 pub struct AlarmsParams {
     #[serde(default)]
     pub alarm: Vec<AlarmSpec>,
 }
 
-/// One configured limit alarm, semantically validated (via `RawAlarmSpec`) at
-/// deserialization — a bad spec is a spanned load error, not a runtime surprise.
+/// One configured limit alarm, validated during deserialization (via
+/// `RawAlarmSpec`).
 #[derive(Deserialize, Debug, Clone)]
 #[serde(try_from = "RawAlarmSpec")]
 pub struct AlarmSpec {
     /// The stable [`AlarmId`](metor_proto_wkt::AlarmId), e.g. `"ADCS_RATE_HIGH"`.
     pub id: String,
-    /// Human-readable title the panel shows.
+    /// Human-readable title.
     pub name: String,
     pub description: String,
     pub target: TargetSpec,
     pub warning: Option<BandSpec>,
     pub critical: Option<BandSpec>,
-    /// Consecutive cycles a breach must hold to raise — and a recovery to clear.
+    /// Consecutive cycles a breach must hold to raise, and a recovery to clear.
     pub debounce: u32,
-    /// Absolute margin a value must recover *past* a threshold before it counts as
-    /// in-band (the clear side of the dead zone).
+    /// Absolute margin a value must recover past a threshold before it counts
+    /// as in band.
     pub hysteresis: f64,
-    /// A latching alarm clears only once recovered **and** operator-acked.
+    /// A latching alarm clears only once recovered *and* operator-acked.
     pub latching: bool,
     /// `AlarmDef::default_severity`; defaults to the lowest configured band.
     pub severity: Severity,
 }
 
-/// The monitored component: an instance-prefixed component id text
+/// The monitored component, as an instance-prefixed component id text
 /// (`"plant.sensors.gyro_b"`) plus an optional element index into its shape.
 #[derive(Deserialize, Debug, Clone)]
 pub struct TargetSpec {
@@ -74,8 +101,8 @@ pub struct TargetSpec {
     pub element: Option<usize>,
 }
 
-/// One severity band: breach is `value > above` or `value < below`. At least one
-/// side must be configured (validated on the owning spec).
+/// One severity band. Breach is `value > above` or `value < below`; at least
+/// one side must be configured (validated on the owning spec).
 #[derive(Deserialize, Debug, Clone, Copy)]
 pub struct BandSpec {
     pub above: Option<f64>,
@@ -97,7 +124,7 @@ impl BandSpec {
     }
 }
 
-/// The unvalidated deserialization target [`AlarmSpec`] is `try_from`-refined out of.
+/// Unvalidated deserialization target that [`AlarmSpec`] is refined out of.
 #[derive(Deserialize, Debug)]
 struct RawAlarmSpec {
     id: String,
@@ -136,8 +163,9 @@ impl TryFrom<RawAlarmSpec> for AlarmSpec {
             }
         }
         if let (Some(w), Some(c)) = (&warning, &critical) {
-            // Critical is the outer band: a critical threshold tighter than the
-            // warning one would fire critical before (or instead of) warning.
+            // Critical is the outer band. A critical threshold tighter than
+            // the warning one would fire critical before (or instead of)
+            // warning.
             if let (Some(wa), Some(ca)) = (w.above, c.above)
                 && ca < wa
             {
@@ -178,18 +206,31 @@ impl TryFrom<RawAlarmSpec> for AlarmSpec {
 }
 
 impl AlarmSpec {
-    /// The wkt declaration this spec broadcasts: one display limit per configured
-    /// threshold, at the *firing* value — the panel draws exactly the boundary the
-    /// engine enforces (`docs/alarms.md` §3.1).
+    /// Build the declaration this spec broadcasts, one display limit per
+    /// configured threshold at the firing value, so consumers draw exactly
+    /// the boundary the engine enforces.
     pub fn to_def(&self) -> AlarmDef {
         let mut limits = Vec::new();
-        for (band, severity) in [(&self.warning, Severity::Warning), (&self.critical, Severity::Critical)] {
+        for (band, severity) in [
+            (&self.warning, Severity::Warning),
+            (&self.critical, Severity::Critical),
+        ] {
             let Some(band) = band else { continue };
             if let Some(value) = band.above {
-                limits.push(AlarmLimit { kind: LimitKind::Upper, value, severity, label: None });
+                limits.push(AlarmLimit {
+                    kind: LimitKind::Upper,
+                    value,
+                    severity,
+                    label: None,
+                });
             }
             if let Some(value) = band.below {
-                limits.push(AlarmLimit { kind: LimitKind::Lower, value, severity, label: None });
+                limits.push(AlarmLimit {
+                    kind: LimitKind::Lower,
+                    value,
+                    severity,
+                    label: None,
+                });
             }
         }
         AlarmDef {
@@ -210,18 +251,20 @@ impl AlarmSpec {
 // The evaluation state machine
 // ---------------------------------------------------------------------------
 
-/// What one evaluation step (or an ack) asks the caller to emit. The caller owns the
-/// wire types: it builds the `AlarmRaised` (it has the value and the target name for
-/// the message) and the `AlarmCleared`.
+/// What one evaluation step (or an ack) asks the caller to emit. The caller
+/// owns the wire types, since it has the value and target name the messages
+/// carry.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum EvalEvent {
-    /// A new occurrence — or, if `occurrence` matches the already-active one, a
-    /// severity escalation re-raise the panel applies in place.
+    /// A new occurrence, or, when `occurrence` matches the already-active
+    /// one, a severity escalation that consumers apply in place.
     Raise {
         occurrence: OccurrenceId,
         severity: Severity,
     },
-    Clear { occurrence: OccurrenceId },
+    Clear {
+        occurrence: OccurrenceId,
+    },
 }
 
 /// One active occurrence's lifecycle state.
@@ -230,19 +273,14 @@ struct Active {
     occurrence: OccurrenceId,
     severity: Severity,
     acked: bool,
-    /// The recovery debounce completed; a latching alarm may still be waiting on ack.
-    /// Un-set by any new breach.
+    /// The recovery debounce completed; a latching alarm may still be waiting
+    /// on ack. Un-set by any new breach.
     recovered: bool,
 }
 
-/// Per-alarm evaluation state (`docs/alarms.md` §5.3): pure and port-free — the
-/// `AlarmSystem` turns its events into wire Msgs.
-///
-/// A value classifies three ways each step: **breaching** (some band violated — the
-/// raise counter runs), **in band** (every threshold respected by ≥ `hysteresis` —
-/// the clear counter runs), or the **dead zone** between them (both counters reset;
-/// chatter around a boundary neither raises nor clears). A NaN value lands in the
-/// dead zone, freezing the alarm where it is.
+/// Per-alarm evaluation state, pure and port-free. See the module docs for
+/// the breach/in-band/dead-zone classification and the debounce rules;
+/// [`AlarmSystem`] turns the resulting events into wire messages.
 #[derive(Debug)]
 pub(crate) struct AlarmEval {
     warning: Option<BandSpec>,
@@ -280,14 +318,15 @@ impl AlarmEval {
         None
     }
 
-    /// Every configured threshold (both bands) respected by ≥ the hysteresis margin.
+    /// Every configured threshold (both bands) respected by at least the
+    /// hysteresis margin.
     fn in_band(&self, v: f64) -> bool {
         self.warning.is_none_or(|b| b.in_band(v, self.hysteresis))
             && self.critical.is_none_or(|b| b.in_band(v, self.hysteresis))
     }
 
-    /// Step the machine with this cycle's value. `alloc` mints a fresh occurrence id
-    /// (called at most once, on a raise).
+    /// Step the machine with this cycle's value. `alloc` mints a fresh
+    /// occurrence id and is called at most once, on a raise.
     pub fn step(&mut self, v: f64, alloc: &mut impl FnMut() -> OccurrenceId) -> Option<EvalEvent> {
         if let Some(severity) = self.breach(v) {
             self.clear_count = 0;
@@ -313,7 +352,10 @@ impl AlarmEval {
                             acked: false,
                             recovered: false,
                         });
-                        return Some(EvalEvent::Raise { occurrence, severity });
+                        return Some(EvalEvent::Raise {
+                            occurrence,
+                            severity,
+                        });
                     }
                 }
             }
@@ -341,8 +383,8 @@ impl AlarmEval {
         None
     }
 
-    /// Apply an operator ack. Only the active occurrence matches (stale acks are
-    /// dropped, mirroring the panel); an already-recovered latching alarm clears
+    /// Apply an operator ack. Only the active occurrence matches, so stale
+    /// acks are dropped; an already-recovered latching alarm clears
     /// immediately.
     pub fn ack(&mut self, occurrence: OccurrenceId) -> Option<EvalEvent> {
         let active = self.active.as_mut()?;
@@ -362,20 +404,18 @@ impl AlarmEval {
 // The system
 // ---------------------------------------------------------------------------
 
-/// The alarm system's inputs: panel acks over ordinary message edges
-/// (`connect "uplink" -> "alarms" msg="AlarmAck"`; zero producers is a legal,
-/// ack-less mission).
+/// Inputs: operator acks over an ordinary message edge
+/// (`connect "uplink" -> "alarms" msg="AlarmAck"`). Zero producers is a
+/// legal, ack-less mission.
 #[derive(crate::SystemInput)]
 pub struct AlarmIn {
     acks: MsgIn<AlarmAck>,
 }
 
-/// The alarm system's outputs: ordinary **telemetered** message ports — the downlink
-/// taps them, the db msg-log catch-all records them, the panel's alarm store consumes
-/// them (`docs/alarms.md` §2.1) — plus the receive-all registry tap the targets
-/// resolve against. `AllOutputs` rides the output bundle (not the input) exactly as
-/// the downlink's does: `init` receives only the outputs, and resolving/claiming
-/// there rather than at the first execute means cycle-1 values already evaluate.
+/// Outputs: ordinary telemetered message ports, plus the receive-all registry
+/// tap the targets resolve against. `AllOutputs` rides the output bundle
+/// rather than the input because `init` receives only the outputs, and
+/// resolving and claiming there means cycle-1 values already evaluate.
 #[derive(crate::SystemOutput)]
 pub struct AlarmOut {
     defs: MsgOut<AlarmDef>,
@@ -384,9 +424,9 @@ pub struct AlarmOut {
     all: AllOutputs,
 }
 
-/// One configured alarm at runtime: its broadcast def, resolved target identity, and
-/// evaluation state. `enabled` drops on a boot-resolution failure (unresolvable
-/// target, bad element, duplicate id) — surfaced through health, never a panic.
+/// One configured alarm at runtime: its broadcast def, resolved target
+/// identity, and evaluation state. `enabled` drops on a boot-resolution
+/// failure, surfaced through health rather than a panic.
 struct AlarmRuntime {
     spec: AlarmSpec,
     component_id: ComponentId,
@@ -395,34 +435,32 @@ struct AlarmRuntime {
     enabled: bool,
 }
 
-/// One watched registry entry: the claimed read view, the entry's instance-prefixed
-/// vtable (what the per-cycle extraction walks), and the alarms it feeds. One view
-/// per **distinct** entry, however many alarms target its components — `ReceiveAll`
-/// budgets exactly one reader slot per ring (`docs/alarms.md` §5.1).
+/// One watched registry entry: the claimed read view, the entry's
+/// instance-prefixed vtable the per-cycle extraction walks, and the alarms it
+/// feeds. There is one view per distinct entry, however many alarms target
+/// its components, because each claimed view costs a reader slot on the ring.
 struct Watch {
     vtable: VTable,
     view: View<NoWake, NoWake>,
     members: Vec<usize>,
 }
 
-/// The alarm engine (`docs/alarms.md`): an ordinary cyclic system evaluating the
-/// configured limit alarms each cycle and reporting transitions as wkt alarm Msgs.
-/// Registered like any system — `system "alarms" type="Alarms" { … }` in KDL (a
-/// framework built-in), or `add_cyclic_named` after the mission's other cyclic
-/// systems (a receive-all system registers late, `docs/alarms.md` §7 F1).
+/// The alarm engine, a cyclic system that evaluates the configured limit
+/// alarms each cycle and reports transitions as alarm messages. Registered
+/// like any system, either as `system "alarms" type="Alarms" { … }` in KDL or
+/// with `add_cyclic_named`; it reads through a receive-all tap, so it must
+/// register after the systems it watches.
 pub struct AlarmSystem {
     alarms: Vec<AlarmRuntime>,
     watches: Vec<Watch>,
-    /// First-`execute` latch for the def broadcast — records emitted from `init`
-    /// would miss the downlink's taps, which are claimed in the (later-registered)
-    /// telemetry system's own `init` (B9, `docs/alarms.md` §5.1).
+    /// First-`execute` latch for the def broadcast; see the module docs on
+    /// boot order.
     booted: bool,
-    /// The occurrence allocator: wall-clock-micros seeded at construction so ids are
-    /// unique across runs in the panel's persisted, occurrence-keyed backfill — the
-    /// documented one-time exception to the no-`Timestamp::now()` rule
-    /// (`docs/alarms.md` §5.4).
+    /// The occurrence allocator, seeded from wall-clock micros at
+    /// construction so ids stay unique across restarts for consumers that
+    /// persist occurrence-keyed state.
     next_occurrence: u64,
-    /// Reused per-watch extraction buffer: `(alarm index, value)` per cycle.
+    /// Reused per-watch extraction buffer of `(alarm index, value)`.
     scratch: Vec<(usize, f64)>,
 }
 
@@ -456,9 +494,8 @@ impl System for AlarmSystem {
     type Output = Out<AlarmOut>;
     const NAME: &'static str = "alarms";
 
-    /// Resolve every target and claim the watch views (`docs/alarms.md` §5.1). The
-    /// registry is frozen by build, so `init` sees the whole graph; claiming here
-    /// (not at the first execute) means cycle-1 records already evaluate.
+    /// Resolve every target and claim the watch views. The registry is frozen
+    /// by build, so `init` sees the whole graph.
     fn init(&mut self, output: &mut Self::Output) {
         self.resolve_targets(output);
     }
@@ -468,16 +505,15 @@ impl CyclicSystem for AlarmSystem {
     fn execute(&mut self, _now: Timestamp, input: &mut AlarmIn, output: &mut Out<AlarmOut>) {
         if !self.booted {
             self.booted = true;
-            // Defs broadcast at the first execute, not `init` — the downlink's taps
-            // are claimed in the telemetry system's later `init` (B9). Latest-wins
-            // on the wire, so the (re-)emit is always safe.
+            // Defs broadcast at the first execute, not `init`; see the module
+            // docs on boot order.
             for rt in &self.alarms {
                 output.defs.publish(&rt.spec.to_def());
             }
         }
 
-        // Operator acks first: a latched, already-recovered occurrence clears the
-        // same cycle its ack lands.
+        // Operator acks first, so a latched, already-recovered occurrence
+        // clears the same cycle its ack lands.
         let alarms = &mut self.alarms;
         input.acks.drain(|ack| {
             for rt in alarms.iter_mut().filter(|rt| rt.spec.id == ack.def_id) {
@@ -490,9 +526,9 @@ impl CyclicSystem for AlarmSystem {
             }
         });
 
-        // Evaluate each watch off its newest record. `try_latest` re-serves the
-        // pinned record, so a silent producer keeps being evaluated at its last
-        // value (`docs/alarms.md` §5.2); before a first record, nothing evaluates.
+        // Evaluate each watch off its newest record. `try_latest` re-serves
+        // the pinned record, so a silent producer keeps being evaluated at
+        // its last value; before a first record, nothing evaluates.
         let Self {
             alarms,
             watches,
@@ -550,15 +586,15 @@ impl CyclicSystem for AlarmSystem {
 }
 
 impl AlarmSystem {
-    /// Init-time resolution (`docs/alarms.md` §5.1): resolve every target against the
-    /// telemetered registry entries and claim one shared view per distinct entry.
+    /// Resolve every target against the telemetered registry entries and
+    /// claim one shared view per distinct entry.
     fn resolve_targets(&mut self, output: &mut Out<AlarmOut>) {
-        // Health reports deferred: iterating `output.all` borrows the bundle, and
-        // `output.health()` is a `&mut` borrow.
+        // Health reports are deferred because iterating `output.all` borrows
+        // the bundle, and `output.health()` needs a `&mut` borrow.
         let mut failures: Vec<(&'static str, String)> = Vec::new();
 
-        // Duplicate ids would collide on the ack path (and the panel's def store is
-        // latest-wins by id): keep the first, disable the rest.
+        // Duplicate ids would collide on the ack path, so keep the first and
+        // disable the rest.
         for i in 0..self.alarms.len() {
             let (head, tail) = self.alarms.split_at_mut(i);
             let rt = &mut tail[0];
@@ -576,9 +612,10 @@ impl AlarmSystem {
             let EntrySchema::Table { vtable, .. } = &entry.schema else {
                 continue;
             };
-            // Registration mode surfaces each static field's id + shape; dynamic
-            // member templates never receive samples directly and are skipped — a
-            // target must be a static component (`docs/alarms.md` §9).
+            // Walking the vtable without a record surfaces each static
+            // field's id and shape. Dynamic member templates never receive
+            // samples directly and are skipped; a target must be a static
+            // component.
             let mut members: Vec<usize> = Vec::new();
             let alarms = &mut self.alarms;
             let failures = &mut failures;
@@ -587,10 +624,7 @@ impl AlarmSystem {
                     return Ok(());
                 }
                 for (m, rt) in alarms.iter_mut().enumerate() {
-                    if !rt.enabled
-                        || rf.component_id != rt.component_id
-                        || members.contains(&m)
-                    {
+                    if !rt.enabled || rf.component_id != rt.component_id || members.contains(&m) {
                         continue;
                     }
                     let elements = rf.shape.iter().product::<usize>().max(1);
@@ -618,9 +652,9 @@ impl AlarmSystem {
                     view,
                     members,
                 }),
-                // Reader-slot budget exhausted (a hand-built over-subscription —
-                // build-time sizing covers the known consumers): diagnosable, not
-                // a panic, mirroring the downlink (`src/telemetry/mod.rs`).
+                // The ring's reader-slot budget is exhausted, which takes a
+                // hand-built over-subscription since build-time sizing covers
+                // the known consumers. Diagnosable, not a panic.
                 Err(_) => {
                     for m in members {
                         self.alarms[m].enabled = false;
@@ -637,7 +671,11 @@ impl AlarmSystem {
         }
         self.watches = watches;
 
-        let watched: Vec<usize> = self.watches.iter().flat_map(|w| w.members.clone()).collect();
+        let watched: Vec<usize> = self
+            .watches
+            .iter()
+            .flat_map(|w| w.members.clone())
+            .collect();
         for (m, rt) in self.alarms.iter_mut().enumerate() {
             if rt.enabled && !watched.contains(&m) {
                 rt.enabled = false;
@@ -659,8 +697,8 @@ impl AlarmSystem {
     }
 }
 
-/// The auto-generated raise message: `"<component>[i] = <value>"` (the element index
-/// only when configured).
+/// The auto-generated raise message, `"<component>[i] = <value>"` with the
+/// element index only when configured.
 fn raise_message(target: &TargetSpec, value: f64) -> String {
     match target.element {
         Some(i) => format!("{}[{i}] = {value:.4}", target.component),

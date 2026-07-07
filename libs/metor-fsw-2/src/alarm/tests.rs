@@ -28,7 +28,7 @@ fn spec(raw: RawAlarmSpec) -> AlarmSpec {
     AlarmSpec::try_from(raw).expect("valid spec")
 }
 
-/// A simple upper warning at 1.0, critical at 2.0, with the given knobs.
+/// An upper warning at 1.0 and critical at 2.0, with the given knobs.
 fn eval_with(debounce: u32, hysteresis: f64, latching: bool) -> AlarmEval {
     let mut r = raw(band(Some(1.0), None), band(Some(2.0), None));
     r.debounce = Some(debounce);
@@ -37,7 +37,7 @@ fn eval_with(debounce: u32, hysteresis: f64, latching: bool) -> AlarmEval {
     AlarmEval::new(&spec(r))
 }
 
-/// Step with a monotonically-minting allocator starting at 100.
+/// Step the evaluator, minting occurrence ids by incrementing `next`.
 fn step(eval: &mut AlarmEval, v: f64, next: &mut u64) -> Option<EvalEvent> {
     eval.step(v, &mut || {
         *next += 1;
@@ -49,14 +49,14 @@ fn step(eval: &mut AlarmEval, v: f64, next: &mut u64) -> Option<EvalEvent> {
 // AlarmEval
 // ---------------------------------------------------------------------------
 
-/// A breach must hold `debounce` consecutive cycles to raise; a recovery likewise
-/// to clear. A blip shorter than the debounce does neither.
+/// A breach must hold for `debounce` consecutive cycles to raise, and a
+/// recovery likewise to clear. A shorter blip does neither.
 #[test]
 fn debounce_gates_raise_and_clear() {
     let mut eval = eval_with(3, 0.0, false);
     let mut occ = 100;
 
-    // Two breaching cycles, then a recovery: no raise.
+    // Two breaching cycles, then a recovery. No raise.
     assert_eq!(step(&mut eval, 1.5, &mut occ), None);
     assert_eq!(step(&mut eval, 1.5, &mut occ), None);
     assert_eq!(step(&mut eval, 0.0, &mut occ), None);
@@ -72,7 +72,7 @@ fn debounce_gates_raise_and_clear() {
         })
     );
 
-    // Two in-band cycles, then a breach: the clear counter restarts too.
+    // Two in-band cycles interrupted by a breach restart the clear counter too.
     assert_eq!(step(&mut eval, 0.0, &mut occ), None);
     assert_eq!(step(&mut eval, 0.0, &mut occ), None);
     assert_eq!(step(&mut eval, 1.5, &mut occ), None);
@@ -97,40 +97,47 @@ fn debounce_gates_raise_and_clear() {
     );
 }
 
-/// Values between a threshold and its hysteresis margin advance neither counter —
-/// boundary chatter neither raises nor clears.
+/// Values between a threshold and its hysteresis margin advance neither
+/// counter, so boundary chatter neither raises nor clears.
 #[test]
 fn hysteresis_dead_zone_resets_both_counters() {
     let mut eval = eval_with(2, 0.2, false);
     let mut occ = 0;
 
-    // One breach, then a dead-zone value (1.0 - 0.2 < 0.9 <= 1.0): raise counter resets.
+    // One breach, then a dead-zone value (0.9 is above 1.0 - 0.2 but not past
+    // the threshold), which resets the raise counter.
     assert_eq!(step(&mut eval, 1.5, &mut occ), None);
     assert_eq!(step(&mut eval, 0.9, &mut occ), None);
     assert_eq!(step(&mut eval, 1.5, &mut occ), None); // count restarted at 1
     assert!(step(&mut eval, 1.5, &mut occ).is_some()); // now raises
 
-    // Active: one recovery, then dead-zone chatter — the clear counter resets, and
-    // it takes a fresh full debounce of comfortable recovery to clear.
+    // While active, one recovery followed by dead-zone chatter resets the
+    // clear counter; a fresh full debounce of comfortable recovery clears.
     assert_eq!(step(&mut eval, 0.5, &mut occ), None);
     assert_eq!(step(&mut eval, 0.9, &mut occ), None);
     assert_eq!(step(&mut eval, 0.5, &mut occ), None);
-    assert_eq!(step(&mut eval, 0.5, &mut occ), Some(EvalEvent::Clear { occurrence: 1 }));
+    assert_eq!(
+        step(&mut eval, 0.5, &mut occ),
+        Some(EvalEvent::Clear { occurrence: 1 })
+    );
 }
 
-/// A NaN value is dead-zone: the alarm freezes where it is.
+/// A NaN value counts as dead zone, freezing the alarm where it is.
 #[test]
 fn nan_freezes_the_alarm() {
     let mut eval = eval_with(1, 0.0, false);
     let mut occ = 0;
     assert!(step(&mut eval, 1.5, &mut occ).is_some());
     assert_eq!(step(&mut eval, f64::NAN, &mut occ), None);
-    // Still active: an in-band value clears it.
-    assert_eq!(step(&mut eval, 0.0, &mut occ), Some(EvalEvent::Clear { occurrence: 1 }));
+    // Still active, so an in-band value clears it.
+    assert_eq!(
+        step(&mut eval, 0.0, &mut occ),
+        Some(EvalEvent::Clear { occurrence: 1 })
+    );
 }
 
-/// Escalation re-raises the SAME occurrence at the higher severity; severity only
-/// ratchets up (a drop back to the warning band re-emits nothing).
+/// Escalation re-raises the same occurrence at the higher severity, and
+/// severity only ratchets up. Dropping back to the warning band emits nothing.
 #[test]
 fn escalation_reuses_the_occurrence_and_ratchets() {
     let mut eval = eval_with(1, 0.0, false);
@@ -143,7 +150,7 @@ fn escalation_reuses_the_occurrence_and_ratchets() {
             severity: Severity::Warning
         })
     );
-    // Into the critical band: same occurrence, escalated.
+    // Into the critical band. Same occurrence, escalated.
     assert_eq!(
         step(&mut eval, 2.5, &mut occ),
         Some(EvalEvent::Raise {
@@ -151,13 +158,16 @@ fn escalation_reuses_the_occurrence_and_ratchets() {
             severity: Severity::Critical
         })
     );
-    // Steady critical, then back down to warning-band breach: nothing re-emitted.
+    // Steady critical, then back down to a warning-band breach. Nothing new.
     assert_eq!(step(&mut eval, 2.5, &mut occ), None);
     assert_eq!(step(&mut eval, 1.5, &mut occ), None);
-    assert_eq!(step(&mut eval, 0.0, &mut occ), Some(EvalEvent::Clear { occurrence: 1 }));
+    assert_eq!(
+        step(&mut eval, 0.0, &mut occ),
+        Some(EvalEvent::Clear { occurrence: 1 })
+    );
 }
 
-/// A breach past both bands at once raises straight at critical.
+/// A value past both bands at once raises straight at critical.
 #[test]
 fn worst_band_wins_at_raise() {
     let mut eval = eval_with(1, 0.0, false);
@@ -171,21 +181,23 @@ fn worst_band_wins_at_raise() {
     );
 }
 
-/// Latching: recovered-then-acked clears on the ack; the recovery alone holds.
+/// A latched alarm that has recovered clears on the ack; the recovery alone
+/// holds it active.
 #[test]
 fn latching_recover_then_ack() {
     let mut eval = eval_with(1, 0.0, true);
     let mut occ = 0;
     assert!(step(&mut eval, 1.5, &mut occ).is_some());
 
-    // Recovered, but latched: no clear, cycle after cycle.
+    // Recovered but latched, so no clear, cycle after cycle.
     assert_eq!(step(&mut eval, 0.0, &mut occ), None);
     assert_eq!(step(&mut eval, 0.0, &mut occ), None);
 
     assert_eq!(eval.ack(1), Some(EvalEvent::Clear { occurrence: 1 }));
 }
 
-/// Latching: acked-then-recovered clears when the recovery debounce completes.
+/// A latched alarm acked while still breaching clears when the recovery
+/// debounce later completes.
 #[test]
 fn latching_ack_then_recover() {
     let mut eval = eval_with(2, 0.0, true);
@@ -193,26 +205,32 @@ fn latching_ack_then_recover() {
     step(&mut eval, 1.5, &mut occ);
     assert!(step(&mut eval, 1.5, &mut occ).is_some());
 
-    assert_eq!(eval.ack(1), None); // still breaching — ack recorded, no clear
+    assert_eq!(eval.ack(1), None); // still breaching, so the ack is only recorded
     assert_eq!(step(&mut eval, 0.0, &mut occ), None);
-    assert_eq!(step(&mut eval, 0.0, &mut occ), Some(EvalEvent::Clear { occurrence: 1 }));
+    assert_eq!(
+        step(&mut eval, 0.0, &mut occ),
+        Some(EvalEvent::Clear { occurrence: 1 })
+    );
 }
 
-/// A re-breach after recovery un-recovers a latched alarm: the earlier recovery no
-/// longer satisfies the clear.
+/// A re-breach after recovery un-recovers a latched alarm, so the earlier
+/// recovery no longer satisfies the clear.
 #[test]
 fn latching_rebreach_unrecovers() {
     let mut eval = eval_with(1, 0.0, true);
     let mut occ = 0;
     assert!(step(&mut eval, 1.5, &mut occ).is_some());
     assert_eq!(step(&mut eval, 0.0, &mut occ), None); // recovered (unacked)
-    assert_eq!(step(&mut eval, 1.5, &mut occ), None); // re-breach: recovery voided
+    assert_eq!(step(&mut eval, 1.5, &mut occ), None); // re-breach voids the recovery
     assert_eq!(eval.ack(1), None); // acked, but no longer recovered
-    assert_eq!(step(&mut eval, 0.0, &mut occ), Some(EvalEvent::Clear { occurrence: 1 }));
+    assert_eq!(
+        step(&mut eval, 0.0, &mut occ),
+        Some(EvalEvent::Clear { occurrence: 1 })
+    );
 }
 
-/// Acks for a stale or unknown occurrence are dropped; on a non-latching alarm an
-/// ack never clears.
+/// Acks for a stale or unknown occurrence are dropped, and on a non-latching
+/// alarm an ack never clears.
 #[test]
 fn stale_and_nonlatching_acks_are_inert() {
     let mut eval = eval_with(1, 0.0, false);
@@ -220,11 +238,15 @@ fn stale_and_nonlatching_acks_are_inert() {
     assert_eq!(eval.ack(7), None); // nothing active
     assert!(step(&mut eval, 1.5, &mut occ).is_some());
     assert_eq!(eval.ack(999), None); // wrong occurrence
-    assert_eq!(eval.ack(1), None); // non-latching: recorded, no clear
-    assert_eq!(step(&mut eval, 0.0, &mut occ), Some(EvalEvent::Clear { occurrence: 1 }));
+    assert_eq!(eval.ack(1), None); // non-latching, so recorded without a clear
+    assert_eq!(
+        step(&mut eval, 0.0, &mut occ),
+        Some(EvalEvent::Clear { occurrence: 1 })
+    );
 }
 
-/// A lower (`below=`) threshold breaches downward and needs the margin upward.
+/// A `below` threshold breaches downward and needs the hysteresis margin
+/// upward to count as in band.
 #[test]
 fn below_thresholds_breach_downward() {
     let mut r = raw(band(None, Some(-1.0)), None);
@@ -233,8 +255,11 @@ fn below_thresholds_breach_downward() {
     let mut occ = 0;
 
     assert!(step(&mut eval, -1.5, &mut occ).is_some());
-    assert_eq!(step(&mut eval, -0.95, &mut occ), None); // dead zone (needs >= -0.9)
-    assert_eq!(step(&mut eval, -0.5, &mut occ), Some(EvalEvent::Clear { occurrence: 1 }));
+    assert_eq!(step(&mut eval, -0.95, &mut occ), None); // dead zone, needs >= -0.9
+    assert_eq!(
+        step(&mut eval, -0.5, &mut occ),
+        Some(EvalEvent::Clear { occurrence: 1 })
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -266,7 +291,8 @@ fn try_from_rejects_bad_specs() {
     assert!(AlarmSpec::try_from(r).is_err());
 }
 
-/// Defaults: debounce 1, hysteresis 0, non-latching, severity = lowest configured band.
+/// Defaults are debounce 1, hysteresis 0, non-latching, and a severity equal
+/// to the lowest configured band.
 #[test]
 fn spec_defaults() {
     let s = spec(raw(band(Some(1.0), None), None));
@@ -312,8 +338,8 @@ mod system {
     struct Status {
         #[metor_fsw(timestamp)]
         timestamp: Timestamp,
-        // Flags ride as u8 — `bool` has invalid bit patterns, so it can't be a
-        // zerocopy frame field. `as_f64` makes it alarmable all the same.
+        // The flag rides as a u8 because `bool` has invalid bit patterns and
+        // can't be a zerocopy frame field. `as_f64` makes it alarmable anyway.
         degraded: u8,
         _pad: [u8; 7],
     }
@@ -321,8 +347,8 @@ mod system {
     #[derive(SystemInput)]
     struct NoIn {}
 
-    /// Emits one scripted `rates[1]` sample per cycle (the last value repeats), and
-    /// mirrors `degraded = rate > 10.0` on a second frame for the bool-target test.
+    /// Emits one scripted `rates[1]` sample per cycle (the last value repeats)
+    /// and mirrors `degraded = rate > 10.0` on a second frame.
     struct Plant {
         script: Vec<f64>,
         cycle: usize,
@@ -356,8 +382,8 @@ mod system {
         }
     }
 
-    /// Acks every raise it sees, `delay` cycles after first sighting — the panel's
-    /// side of the latch loop, wired as ordinary message edges both ways.
+    /// Acks every raise it sees, `delay` cycles after first sighting. Plays
+    /// the operator side of the latch loop over ordinary message edges.
     struct Acker {
         delay: usize,
         pending: Vec<(AlarmRaised, usize)>,
@@ -401,10 +427,11 @@ mod system {
         CoordinatorConfig {
             cycle_rate: 1000.0,
             clock: ClockMode::Wall,
-            // Zero slack makes the reader budget a structural assertion: the alarm
-            // system must claim exactly ONE view per watched entry (its ReceiveAll
-            // budgets one slot per ring), or `build`-time sizing is exceeded and
-            // the alarm reports `alarms.reader_slot` instead of raising.
+            // Zero slack turns the reader budget into a structural assertion.
+            // The alarm system must claim exactly one view per watched entry
+            // (its ReceiveAll budgets one slot per ring); if it claims more,
+            // the build-time sizing is exceeded and the alarm reports
+            // `alarms.reader_slot` instead of raising.
             reader_slack: 0,
             ..CoordinatorConfig::default()
         }
@@ -443,8 +470,8 @@ mod system {
         }
     }
 
-    /// Claim a decoding view on one of the alarm system's message outputs, BEFORE
-    /// `run_for` (a view starts at the live edge).
+    /// Claim a decoding view on one of the alarm system's message outputs.
+    /// Must happen before `run_for`, since a view starts at the live edge.
     fn tap<M: metor_proto::types::Msg + serde::de::DeserializeOwned>(
         coord: &Coordinator,
         key: &str,
@@ -456,19 +483,20 @@ mod system {
         MsgIn::new(entry.view().expect("reader slot"))
     }
 
-    /// The headline path: def at the first cycle, a debounced warning raise, an
-    /// escalation to critical on the SAME occurrence, a hysteresis dead-zone hold,
-    /// and a debounced clear — while a second alarm on the same frame (sharing the
-    /// one watch view — reader_slack is 0) stays silent.
+    /// The headline path. A def at the first cycle, a debounced warning raise,
+    /// an escalation to critical on the same occurrence, a hysteresis
+    /// dead-zone hold, and a debounced clear, while a second alarm on the same
+    /// frame shares the single watch view (reader_slack is 0) and stays
+    /// silent.
     #[stellarator::test]
     async fn end_to_end_raise_escalate_clear() {
         let mut b = Coordinator::builder(config());
         let script = vec![0.7, 0.7, 1.5, 0.45, 0.3, 0.3];
         let cycles = script.len();
         b.add_cyclic(Plant { script, cycle: 0 });
-        // `[f64; 3]` flattens to per-element components (`rates.0/.1/.2`) — the
-        // dotted path IS the element address (a shaped nox tensor would instead
-        // take `element=`; `docs/alarms.md` §3).
+        // `[f64; 3]` flattens to per-element components (`rates.0/.1/.2`), so
+        // the dotted path itself is the element address; a shaped tensor
+        // component would take `element=` instead.
         b.add_cyclic(AlarmSystem::new(params(vec![
             alarm("RATE_HIGH", "plant.gyro.rates.1", None),
             alarm("RATE_X", "plant.gyro.rates.0", None), // same frame, never breaches
@@ -526,8 +554,8 @@ mod system {
         assert_eq!(got_cleared[0].occurrence, got_raised[0].occurrence);
     }
 
-    /// A latching alarm holds after recovery until the ack lands (wired through a
-    /// full message-edge loop: alarms → acker raise, acker → alarms ack).
+    /// A latching alarm holds after recovery until the ack lands, wired
+    /// through a full message-edge loop (raises out to the acker, acks back).
     #[stellarator::test]
     async fn latching_clears_only_on_ack() {
         let run = |delay: usize, cycles: usize| async move {
@@ -565,12 +593,12 @@ mod system {
 
         // Never acked (delay beyond the run): recovered by cycle 2, still no clear.
         assert_eq!(run(100, 8).await, 0, "latched alarm must hold without ack");
-        // Acked (2 cycles after sighting): the clear lands.
+        // Acked 2 cycles after sighting: the clear lands.
         assert_eq!(run(2, 8).await, 1, "latched alarm clears once acked");
     }
 
-    /// A u8 flag component alarms through the same numeric path (`1 → 1.0`,
-    /// `above=0.5`).
+    /// A u8 flag component alarms through the same numeric path (a raw 1 reads
+    /// as 1.0, breaching `above = 0.5`).
     #[stellarator::test]
     async fn flag_component_alarms() {
         let mut b = Coordinator::builder(config());
@@ -601,8 +629,8 @@ mod system {
         assert_eq!(got[0].message, "plant.status.degraded = 1.0000");
     }
 
-    /// Misconfigured targets disable their alarms and surface through health; the
-    /// def still broadcasts and nothing ever raises.
+    /// Misconfigured targets disable their alarms and surface through health.
+    /// The def still broadcasts and nothing ever raises.
     #[stellarator::test]
     async fn bad_targets_disable_and_report_health() {
         let mut b = Coordinator::builder(config());
@@ -631,13 +659,13 @@ mod system {
         defs.drain(|_| n_defs += 1);
         assert_eq!(n_defs, 4, "defs broadcast even for disabled alarms");
 
-        // Only the first DUP survives resolution — and it raises; the rest stay dark.
+        // Only the first DUP survives resolution, and it raises; the rest stay dark.
         let mut got = Vec::new();
         raised.drain(|r| got.push(r));
         assert_eq!(got.len(), 1, "{got:?}");
         assert_eq!(got[0].def_id, "DUP");
 
-        // Three boot failures land in the standard health frame's error total.
+        // The three boot failures land in the standard health frame's error total.
         let grant = health_view
             .try_latest()
             .expect("read health")
@@ -647,7 +675,8 @@ mod system {
     }
 }
 
-/// `to_def` maps each configured threshold to one display limit at the firing value.
+/// `to_def` maps each configured threshold to one display limit at the firing
+/// value.
 #[test]
 fn to_def_mirrors_the_firing_thresholds() {
     let mut r = raw(band(Some(0.5), Some(-0.5)), band(Some(1.0), Some(-1.0)));
@@ -662,8 +691,11 @@ fn to_def_mirrors_the_firing_thresholds() {
     );
     assert_eq!(target.element_index, Some(1));
 
-    let mut got: Vec<(LimitKind, f64, Severity)> =
-        def.limits.iter().map(|l| (l.kind, l.value, l.severity)).collect();
+    let mut got: Vec<(LimitKind, f64, Severity)> = def
+        .limits
+        .iter()
+        .map(|l| (l.kind, l.value, l.severity))
+        .collect();
     got.sort_by(|a, b| a.1.total_cmp(&b.1));
     assert_eq!(
         got,

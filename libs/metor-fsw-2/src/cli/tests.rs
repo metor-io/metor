@@ -1,16 +1,18 @@
-//! CLI arg-parsing + override-mapping tests. These drive the clap structs and the pure
-//! helpers (`apply_overrides`, `load_run_wiring`) directly — no process, no cargo, no
-//! runtime — so the command surface is pinned without running a mission.
+//! Tests for the command-line surface.
+//!
+//! These drive the clap structs and the pure helpers ([`apply_overrides`] and
+//! [`load_run_wiring`]) directly, so flag parsing and override mapping are
+//! pinned down without building or running a mission.
 
 use super::*;
 use crate::wiring::WiringBuilder;
 
-/// Parse an argv into the [`Cli`], panicking on a parse error (the happy path).
+/// Parse an argv into the [`Cli`], panicking if clap rejects it.
 fn parse_args(argv: &[&str]) -> Cli {
     Cli::try_parse_from(argv).expect("parse argv")
 }
 
-/// Extract a [`RunArgs`] from a parsed `run` invocation.
+/// Parse an argv and unwrap the `run` subcommand's arguments.
 fn run_args(argv: &[&str]) -> RunArgs {
     match parse_args(argv).command {
         Command::Run(a) => a,
@@ -91,16 +93,31 @@ fn telemetry_flags_mutually_exclusive() {
         "127.0.0.1:2240",
         "--no-telemetry",
     ]);
-    assert!(r.is_err(), "--telemetry and --no-telemetry must not coexist");
+    assert!(
+        r.is_err(),
+        "--telemetry and --no-telemetry must not coexist"
+    );
 }
 
 #[test]
 fn overrides_applied_to_wiring() {
     let mut wiring = WiringBuilder::new()
-        .coordinator(120.0, ClockSpec::Simulated { dt_secs: 1.0 / 120.0 })
+        .coordinator(
+            120.0,
+            ClockSpec::Simulated {
+                dt_secs: 1.0 / 120.0,
+            },
+        )
         .build();
     let args = run_args(&[
-        "metor-fsw", "run", "m.kdl", "--build", "--wall", "--cycle-rate", "200", "--telemetry",
+        "metor-fsw",
+        "run",
+        "m.kdl",
+        "--build",
+        "--wall",
+        "--cycle-rate",
+        "200",
+        "--telemetry",
         "127.0.0.1:2240",
     ]);
     apply_overrides(&mut wiring, &args).unwrap();
@@ -138,7 +155,12 @@ fn uplink_override_pushes_tcp_uplink_spec() {
         .build();
     assert!(wiring.systems.is_empty(), "no uplink by default");
     let args = run_args(&[
-        "metor-fsw", "run", "m.kdl", "--build", "--uplink", "127.0.0.1:2241",
+        "metor-fsw",
+        "run",
+        "m.kdl",
+        "--build",
+        "--uplink",
+        "127.0.0.1:2241",
     ]);
     apply_overrides(&mut wiring, &args).unwrap();
     assert_eq!(
@@ -150,8 +172,9 @@ fn uplink_override_pushes_tcp_uplink_spec() {
     );
 }
 
-/// `--uplink` on a mission that already declares one patches `addr=` IN PLACE —
-/// the spec's other params (its `msgs` config) must survive the override.
+/// When the mission already declares an uplink, `--uplink` patches the address
+/// on the existing spec rather than replacing it, so the rest of the spec's
+/// configuration (here the `msgs` list) must survive.
 #[test]
 fn uplink_override_preserves_msgs_config() {
     use crate::wiring::{ParamSource, SystemSpec, TCP_UPLINK_TYPE};
@@ -170,7 +193,12 @@ fn uplink_override_preserves_msgs_config() {
         ),
     });
     let args = run_args(&[
-        "metor-fsw", "run", "m.kdl", "--build", "--uplink", "127.0.0.1:2241",
+        "metor-fsw",
+        "run",
+        "m.kdl",
+        "--build",
+        "--uplink",
+        "127.0.0.1:2241",
     ]);
     apply_overrides(&mut wiring, &args).unwrap();
 
@@ -193,7 +221,9 @@ fn uplink_override_preserves_msgs_config() {
 
 #[test]
 fn sim_dt_override_sets_simulated_clock() {
-    let mut wiring = WiringBuilder::new().coordinator(120.0, ClockSpec::Wall).build();
+    let mut wiring = WiringBuilder::new()
+        .coordinator(120.0, ClockSpec::Wall)
+        .build();
     let args = run_args(&["metor-fsw", "run", "m.kdl", "--build", "--sim-dt", "0.005"]);
     apply_overrides(&mut wiring, &args).unwrap();
     assert!(matches!(
@@ -204,7 +234,7 @@ fn sim_dt_override_sets_simulated_clock() {
 
 #[test]
 fn source_kdl_run_without_build_is_rejected() {
-    // Not a bundle (a `.kdl` path), and no `--build`: errors before touching the fs.
+    // A `.kdl` source path without `--build` fails before any filesystem access.
     let args = run_args(&["metor-fsw", "run", "nonexistent_mission.kdl"]);
     let err = load_run_wiring(&args).expect_err("must require --build");
     assert!(format!("{err:?}").contains("--build"), "{err:?}");
@@ -212,10 +242,18 @@ fn source_kdl_run_without_build_is_rejected() {
 
 #[test]
 fn unknown_telemetry_mode_is_rejected() {
-    let mut wiring = WiringBuilder::new().coordinator(1.0, ClockSpec::Wall).build();
+    let mut wiring = WiringBuilder::new()
+        .coordinator(1.0, ClockSpec::Wall)
+        .build();
     let args = run_args(&[
-        "metor-fsw", "run", "m.kdl", "--build", "--telemetry", "127.0.0.1:2240",
-        "--telemetry-mode", "subset",
+        "metor-fsw",
+        "run",
+        "m.kdl",
+        "--build",
+        "--telemetry",
+        "127.0.0.1:2240",
+        "--telemetry-mode",
+        "subset",
     ]);
     let err = apply_overrides(&mut wiring, &args).expect_err("subset not a CLI mode");
     assert!(format!("{err:?}").contains("telemetry-mode"), "{err:?}");

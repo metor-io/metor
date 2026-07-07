@@ -1,6 +1,6 @@
-//! The synchronous tests use only the `try_*` APIs plus `std::thread`, so
-//! they run under Miri (which cannot drive the async runtime) and exercise
-//! the unsafe pointer and atomic paths for provenance, leaks, and data races.
+//! The synchronous tests stick to the `try_*` APIs plus `std::thread` so they
+//! run under Miri, which cannot drive the async runtime, and exercise the
+//! unsafe pointer and atomic paths for provenance, leaks, and data races.
 //! `MIRI.md` in the crate root describes the coverage. Loop bounds shrink
 //! under `cfg!(miri)`.
 
@@ -100,8 +100,8 @@ fn reader_table_claim_free() {
 
 // ----- Backpressure / borrow semantics -----
 
-/// The writer backpressures with `WouldBlock` rather than overwrite a reader,
-/// and freeing space lets the next write through.
+/// The writer returns `WouldBlock` rather than overwrite a reader, and
+/// freeing space lets the next write through.
 #[test]
 fn backpressure() {
     let rb = ring(64, 1);

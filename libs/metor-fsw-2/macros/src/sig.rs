@@ -1,10 +1,12 @@
-//! Shared signature → port classification for `#[system]` and `#[sequence]`
-//! (`docs/design-system-macro.md` §5): both macros read their port set off an fn
-//! signature by the **last path segment** of each parameter type.
+//! Type-shape helpers shared by `#[system]` and `#[sequence]`.
+//!
+//! Both macros classify each fn parameter as a port by the last path segment
+//! of its type, so `fsw::Input<T>`, `crate::Input<T>`, and `Input<T>` all read
+//! the same. These helpers pull that segment and its generic arguments apart.
 
 use syn::{GenericArgument, Ident, PathArguments, Type};
 
-/// The last path segment ident of a type (`Input<…>` → `Input`).
+/// The last path segment ident of a type, so `fsw::Input<T>` yields `Input`.
 pub fn type_head(ty: &Type) -> Option<&Ident> {
     if let Type::Path(p) = ty {
         p.path.segments.last().map(|s| &s.ident)
@@ -13,7 +15,8 @@ pub fn type_head(ty: &Type) -> Option<&Ident> {
     }
 }
 
-/// The first generic *type* argument of a `Foo<T, …>` type (the element `T`).
+/// The first generic type argument of the last path segment, skipping
+/// lifetimes, so `Input<'a, T>` yields `T`.
 pub fn first_type_arg(ty: &Type) -> Option<Type> {
     if let Type::Path(p) = ty
         && let Some(seg) = p.path.segments.last()
@@ -28,8 +31,8 @@ pub fn first_type_arg(ty: &Type) -> Option<Type> {
     None
 }
 
-/// The generic *type* arguments of a `Foo<…>` type, for arity checks (`Input<T>` has
-/// exactly one; an extra type argument is rejected by `#[system]`/`#[sequence]`).
+/// All generic type arguments of the last path segment. Callers use the
+/// count to reject ports with the wrong arity.
 pub fn type_args(ty: &Type) -> Vec<&Type> {
     let mut out = Vec::new();
     if let Type::Path(p) = ty
@@ -44,4 +47,3 @@ pub fn type_args(ty: &Type) -> Vec<&Type> {
     }
     out
 }
-

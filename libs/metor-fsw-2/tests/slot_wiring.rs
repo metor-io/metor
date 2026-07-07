@@ -1,13 +1,15 @@
-//! Acceptance gate for a runtime **slot** driven **through the `Wiring`/KDL front-end**
-//! (WP10 Wave 5), not a hand-built `CoordinatorBuilder`.
+//! Runtime slots driven through the KDL wiring front end.
 //!
-//! Mirrors `tests/slot_integration.rs` (a real `dlopen` of the `#[sequence]` occupant),
-//! but expresses the mission as a KDL `slot` document: it `parse`s the slot, runs the
-//! build driver ([`build_artifacts`]) to locate the occupant `.so` (the same infra the
-//! dl-fixture wiring test uses), [`resolve`]s it into a [`Coordinator`] with the slot
-//! registered, and drives an `initial state="running"` slot to a terminal phase — proving
-//! the `parse` → `build_artifacts` → `resolve_slot` path lands a live slot. A declared
-//! contract mismatch surfaces as the clean [`LoadError::SlotContractMismatch`].
+//! Each test starts from a KDL `slot` document rather than a hand-built
+//! coordinator. The document is [`parse`]d, the build driver
+//! ([`build_artifacts`]) compiles and locates the occupant shared library, and
+//! [`resolve`] turns the whole thing into a live [`Coordinator`]. The tests
+//! then observe the slot from the outside, through its host `SlotStatus`
+//! frames, its events channel, and its user outputs.
+//!
+//! Every test skips (with a note on stderr) if the build driver cannot compile
+//! the fixture crate, so the suite stays runnable in environments without the
+//! fixture toolchain.
 
 #![cfg(all(feature = "kdl", not(miri)))]
 
@@ -20,7 +22,7 @@ use metor_fsw_2::{
     wiring::{BuildOptions, LoadError, Registry, build_artifacts, parse, resolve},
 };
 
-/// The seq-fixture's cargo crate name + cdylib library stem.
+/// The seq fixture's cargo crate name and cdylib library stem.
 const FIXTURE_CRATE: &str = "metor-fsw-2-seq-fixture";
 const FIXTURE_STEM: &str = "metor_fsw_2_seq_fixture";
 
@@ -28,8 +30,9 @@ const FIXTURE_STEM: &str = "metor_fsw_2_seq_fixture";
 const RUNNING: u8 = 2;
 const DONE: u8 = 3;
 
-/// A slot mission whose single allowed occupant is the `waiter` seq-fixture, started at
-/// init. `waiter` has **no user ports**, so the slot declares no `input`/`output`.
+/// A slot mission whose single allowed occupant is the `waiter` fixture,
+/// started at init. `waiter` has no user ports, so the slot declares no
+/// `input` or `output`.
 fn slot_kdl() -> String {
     format!(
         r#"
@@ -43,7 +46,7 @@ slot "adcs" {{
     )
 }
 
-/// Drain every `SlotStatus.phase` published over a run (mirrors `slot_integration`).
+/// Drain every `SlotStatus.phase` published over a run.
 fn slot_phases(view: &mut Input<SlotStatus>) -> Vec<u8> {
     let mut phases = Vec::new();
     view.drain(|f| phases.push(f.get().phase)).expect("no lap");
@@ -55,9 +58,7 @@ fn slot_via_wiring_resolves_and_runs_to_done() {
     let mut wiring = parse(&slot_kdl()).expect("parse the slot mission onto Wiring");
     assert_eq!(wiring.slots.len(), 1, "the slot parsed");
 
-    // Build driver: cargo build -p the seq-fixture crate, locate + record its `.so`.
     if let Err(e) = build_artifacts(&mut wiring, &BuildOptions::default()) {
-        // Build plumbing unavailable: skip (slot_integration covers the slot directly).
         eprintln!("skipping: build_artifacts failed: {e}");
         return;
     }
@@ -66,8 +67,6 @@ fn slot_via_wiring_resolves_and_runs_to_done() {
         "build driver resolved the occupant artifact path"
     );
 
-    // Resolve the slot through the one shared resolver (the slot opens its allowed
-    // occupant `.so` and registers under its instance name).
     let mut coord = resolve(&wiring, &Registry::new()).expect("resolve the slot Wiring");
 
     // The slot's host SlotStatus output is registered under its instance name.
@@ -79,7 +78,6 @@ fn slot_via_wiring_resolves_and_runs_to_done() {
         "the slot's SlotStatus output is registered under its instance name"
     );
 
-    // Tap the host SlotStatus before running.
     let mut slot_view: Input<SlotStatus> = Input::new(
         coord
             .registry()
@@ -88,8 +86,9 @@ fn slot_via_wiring_resolves_and_runs_to_done() {
             .expect("a reader slot is available"),
     );
 
-    // The slot was started at init (state="running"); a short run reaches the terminal
-    // Done phase (the `waiter` waits ~2 sim-µs then completes).
+    // The slot was started at init (state="running"); a short run reaches the
+    // terminal Done phase, since the waiter waits about 2 sim-microseconds and
+    // then completes.
     let coord = stellarator::run(|| async move {
         coord.run_for(6).await;
         coord
@@ -107,12 +106,13 @@ fn slot_via_wiring_resolves_and_runs_to_done() {
     drop((coord, slot_view));
 }
 
-/// A `system "alarms"` node coexists with a slot — declared FIRST, deliberately:
-/// without the resolver's deferred-ReceiveAll pass, the slot (a cyclic,
-/// non-ReceiveAll registration after the alarm engine) fails `build()` with
-/// `ReceiveAllNotLast` (`docs/alarms.md` §7 F1). The alarm targets the slot's own
+/// A `system "alarms"` node coexists with a slot, and is declared first on
+/// purpose. The alarm engine registers a receive-all input, which must come
+/// last in build order; the resolver defers it behind the slot's cyclic
+/// registration so the document still builds. The alarm targets the slot's own
 /// host `SlotStatus.phase` frame and raises when the occupant completes
-/// (Done = 3 > 2.5) — slots are just telemetered components to the alarm engine.
+/// (Done = 3 > 2.5): to the alarm engine a slot is just another telemetered
+/// component.
 #[test]
 fn alarms_node_before_a_slot_still_builds_and_raises() {
     let kdl = format!(
@@ -138,7 +138,7 @@ slot "adcs" {{
     }
 
     let coord = resolve(&wiring, &Registry::with_builtins())
-        .expect("the alarms node defers behind the slot (F1)");
+        .expect("the alarm engine's receive-all input defers behind the slot");
     let mut raised: metor_fsw_2::MsgIn<metor_fsw_2::metor_proto_wkt::AlarmRaised> =
         metor_fsw_2::MsgIn::new(
             coord
@@ -163,8 +163,8 @@ slot "adcs" {{
 
 #[test]
 fn slot_declared_contract_mismatch_is_a_clean_error() {
-    // `waiter` has no user inputs, so declaring `input frame="nonsense"` cannot match the
-    // resolved descriptor → the clean `SlotContractMismatch`.
+    // `waiter` has no user inputs, so declaring `input frame="nonsense"` cannot
+    // match the resolved descriptor and resolve reports SlotContractMismatch.
     let kdl = format!(
         r#"
 coordinator cycle_rate=1000.0 sim_dt=0.000002
@@ -190,17 +190,16 @@ slot "adcs" {{
     );
 }
 
-/// Drain a message ring into the decoded `Msg`s of one type (the downlink tap's decode,
-/// mirrors `slot_integration`).
+/// Drain a message ring, decoding every record as one `Msg` type.
 fn drain_msgs<M: Msg + serde::de::DeserializeOwned>(
-    view: &mut metor_fsw_2::ring::View<
-        metor_fsw_2::ring::NoWake,
-        metor_fsw_2::ring::NoWake,
-    >,
+    view: &mut metor_fsw_2::ring::View<metor_fsw_2::ring::NoWake, metor_fsw_2::ring::NoWake>,
 ) -> Vec<M> {
     let mut out = Vec::new();
     let mut buf = Vec::new();
-    while view.try_read_into(&mut buf).expect("no lap on the message tap") {
+    while view
+        .try_read_into(&mut buf)
+        .expect("no lap on the message tap")
+    {
         let (id, payload) = split_record(&buf).expect("a 2-byte-id record");
         assert_eq!(id, M::ID, "every record on this channel carries M::ID");
         out.push(postcard::from_bytes::<M>(payload).expect("postcard round-trip"));
@@ -210,9 +209,10 @@ fn drain_msgs<M: Msg + serde::de::DeserializeOwned>(
 
 #[test]
 fn unknown_runtime_load_is_rejected_with_a_failed_event() {
-    // A runtime `Load` naming an occupant outside the allowed set is rejected loudly —
-    // a `Failed` event naming the bad occupant + the allowed set on the slot's events
-    // channel — not silently swallowed leaving the slot stuck `Empty` with no diagnostic.
+    // A runtime `Load` naming an occupant outside the allowed set is rejected
+    // loudly, with a `Failed` event on the slot's events channel naming the bad
+    // occupant and the allowed set, rather than silently leaving the slot Empty
+    // with no diagnostic.
     let kdl = format!(
         r#"
 coordinator cycle_rate=1000.0 sim_dt=0.000002
@@ -220,8 +220,8 @@ artifact "waiter" crate="{FIXTURE_CRATE}" lib="{FIXTURE_STEM}" type="waiter"
 slot "adcs" {{
     allow occupant="waiter"
 }}
-// A2: the in-proc control handle reaches the slot only over this explicit edge —
-// "coordinator" is the reserved instance name of the coordinator's own #0 bundle.
+// The in-proc control handle reaches the slot only over this explicit edge;
+// "coordinator" is the reserved instance name of the coordinator's own bundle.
 connect "coordinator" -> "adcs" msg="SequenceCommand"
 "#
     );
@@ -232,16 +232,16 @@ connect "coordinator" -> "adcs" msg="SequenceCommand"
     }
     let mut coord = resolve(&wiring, &Registry::new()).expect("resolve the slot Wiring");
 
-    // Tap the slot's events channel BEFORE the run (an overwrite ring starts at the
-    // live edge, so the tap must precede the emit).
+    // Tap the events channel before the run; an overwrite ring starts a reader
+    // at the live edge, so a tap taken after the emit would miss it.
     let messages = coord.registry();
     let mut events_view = messages
         .view(ComponentId::new("adcs.sequences"))
         .expect("the slot events channel is registered")
         .expect("reader slot available");
 
-    // A typo'd panel/uplink Load, injected through the in-proc control handle and
-    // addressed to the slot by its instance name.
+    // A typo'd Load, injected through the in-proc control handle and addressed
+    // to the slot by its instance name.
     let mut control = coord.control_handle().expect("taken once per coordinator");
     control
         .emit(&SequenceCommand {
@@ -265,20 +265,18 @@ connect "coordinator" -> "adcs" msg="SequenceCommand"
             _ => None,
         })
         .expect("the unknown-occupant Load emitted a Failed event");
-    assert!(failed.contains("nonesuch"), "names the bad occupant: {failed}");
+    assert!(
+        failed.contains("nonesuch"),
+        "names the bad occupant: {failed}"
+    );
     assert!(failed.contains("waiter"), "lists the allowed set: {failed}");
 
     drop((coord, events_view, control));
 }
 
-// ---------------------------------------------------------------------------
-// B1 regression: slot `allow` occupant params resolve and run — in BOTH forms
-// (line properties and a child block), byte-identical to the typed
-// `WiringBuilder::allow_with_params` postcard bytes, and observably applied by
-// the running occupant (the seq-param-fixture republishes its configured gain).
-// ---------------------------------------------------------------------------
+// --- Occupant params on `allow` ---
 
-/// The parametered seq fixture's cargo crate name + cdylib library stem.
+/// The parametered seq fixture's cargo crate name and cdylib library stem.
 const PARAM_FIXTURE_CRATE: &str = "metor-fsw-2-seq-param-fixture";
 const PARAM_FIXTURE_STEM: &str = "metor_fsw_2_seq_param_fixture";
 
@@ -288,8 +286,15 @@ struct GainerParams {
     gain: f64,
 }
 
-/// Host-side mirror of the fixture's `gain_out` frame (byte-for-byte).
-#[derive(Frame, zerocopy::IntoBytes, zerocopy::Immutable, zerocopy::KnownLayout, zerocopy::FromBytes, Default)]
+/// Host-side mirror of the fixture's `gain_out` frame, byte for byte.
+#[derive(
+    Frame,
+    zerocopy::IntoBytes,
+    zerocopy::Immutable,
+    zerocopy::KnownLayout,
+    zerocopy::FromBytes,
+    Default,
+)]
 #[repr(C)]
 #[metor_fsw(name = "gain_out")]
 struct GainOut {
@@ -298,8 +303,8 @@ struct GainOut {
     gain: f64,
 }
 
-/// A slot mission whose single allowed occupant carries params, spelled `allow_line`
-/// (properties) or as a child block.
+/// A slot mission whose single allowed occupant carries params, spelled by
+/// `allow_line` either as line properties or as a child block.
 fn param_slot_kdl(allow_line: &str) -> String {
     format!(
         r#"
@@ -314,20 +319,23 @@ slot "gslot" {{
     )
 }
 
+/// Occupant params on `allow` resolve and run in both KDL spellings, line
+/// properties and a child block. Both must schema-encode to exactly the
+/// postcard bytes the typed `allow_with_params` builder produces, and the
+/// running occupant must observably apply them (the fixture republishes its
+/// configured gain).
 #[test]
 fn slot_allow_params_resolve_and_run_b1() {
     use metor_fsw_2::wiring::encode_kdl_params;
     use metor_fsw_2::{DlSystem, ParamSource, SlotInitState, WiringBuilder};
 
-    // Both canonical forms of occupant params.
     let line_form = param_slot_kdl(r#"allow occupant="gainer" gain=0.8"#);
     let child_form = param_slot_kdl(r#"allow occupant="gainer" { gain 0.8 }"#);
 
     let mut wiring = parse(&line_form).expect("parse the line-property allow params");
     let child_wiring = parse(&child_form).expect("parse the child-block allow params");
 
-    // Both parse to carried KDL params (line properties were previously dropped —
-    // half of B1).
+    // Both spellings must parse to carried KDL params.
     let carried = |w: &metor_fsw_2::Wiring| match &w.slots[0].allow[0].params {
         ParamSource::Kdl(text) => text.clone(),
         other => panic!("expected ParamSource::Kdl, got {other:?}"),
@@ -339,12 +347,17 @@ fn slot_allow_params_resolve_and_run_b1() {
         eprintln!("skipping: build_artifacts failed: {e}");
         return;
     }
-    let so_path = wiring.artifacts[0].path.clone().expect("located fixture .so");
+    let so_path = wiring.artifacts[0]
+        .path
+        .clone()
+        .expect("located fixture .so");
 
-    // (a) Byte equality: both KDL forms schema-encode to exactly the bytes the
-    // typed Rust `allow_with_params` carries (the one-postcard-encoding invariant).
+    // (a) Byte equality with the typed builder path.
     let builder_wiring = WiringBuilder::new()
-        .coordinator(1000.0, metor_fsw_2::ClockSpec::Simulated { dt_secs: 0.000002 })
+        .coordinator(
+            1000.0,
+            metor_fsw_2::ClockSpec::Simulated { dt_secs: 0.000002 },
+        )
         .artifact("gainer", PARAM_FIXTURE_CRATE, PARAM_FIXTURE_STEM, "gainer")
         .slot("gslot")
         .output("gain_out")
@@ -361,8 +374,16 @@ fn slot_allow_params_resolve_and_run_b1() {
         encode_kdl_params(text, dl.params_schema(), "gslot", &["occupant"], 0)
             .expect("schema-encode the allow params")
     };
-    assert_eq!(encode(&line_text), builder_bytes, "line-property form byte-matches");
-    assert_eq!(encode(&child_text), builder_bytes, "child-block form byte-matches");
+    assert_eq!(
+        encode(&line_text),
+        builder_bytes,
+        "line-property form byte-matches"
+    );
+    assert_eq!(
+        encode(&child_text),
+        builder_bytes,
+        "child-block form byte-matches"
+    );
     drop(dl);
 
     // (b) End to end: the resolved slot runs and the occupant publishes the
@@ -383,7 +404,11 @@ fn slot_allow_params_resolve_and_run_b1() {
         let out = gain_view
             .latest()
             .expect("the occupant published its configured gain");
-        assert_eq!(out.get().gain, 0.8, "allow params reached the running occupant");
+        assert_eq!(
+            out.get().gain,
+            0.8,
+            "allow params reached the running occupant"
+        );
     }
     assert!(coord.stopped().is_empty(), "Done is not a hard-stop");
 
@@ -392,8 +417,8 @@ fn slot_allow_params_resolve_and_run_b1() {
 
 #[test]
 fn slot_allow_unknown_param_is_a_clean_error() {
-    // A typo'd allow param is a spanned UnknownParam at resolve (the schema pass),
-    // naming the property — not a silent drop.
+    // A typo'd allow param is a spanned UnknownParam at resolve, naming the
+    // property, not a silent drop.
     let kdl = param_slot_kdl(r#"allow occupant="gainer" gian=0.8"#);
     let mut wiring = parse(&kdl).expect("parse the typo'd allow params");
     if let Err(e) = build_artifacts(&mut wiring, &BuildOptions::default()) {

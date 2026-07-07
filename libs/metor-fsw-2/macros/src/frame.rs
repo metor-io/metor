@@ -5,9 +5,11 @@ use proc_macro::TokenStream;
 use quote::quote;
 use syn::{DeriveInput, Generics, Ident, parse_macro_input};
 
-/// Frame-level attributes. The frame name (`name`/`parent`) doubles as both the
-/// component-id prefix and the `FRAME_ID` tag (frames.md §1.3). When absent, no
-/// prefix is applied and `FRAME_ID` defaults to `snake_case(ident)`.
+/// Struct-level attributes for `#[derive(Frame)]`.
+///
+/// The frame name (`name`, or its `parent` alias) becomes both the dotted
+/// component-id prefix and the `FRAME_ID` tag. When absent, no prefix is
+/// applied and `FRAME_ID` defaults to the snake_case struct ident.
 #[derive(Debug, FromDeriveInput)]
 #[darling(attributes(fsw, metor_fsw), supports(struct_named))]
 struct Frame {
@@ -16,19 +18,19 @@ struct Frame {
     data: ast::Data<(), crate::Field>,
     parent: Option<String>,
     name: Option<String>,
-    /// Explicit opt-out of the shared-timestamp requirement (E4): a frame without a
-    /// `#[metor_fsw(timestamp)]` field must say `#[metor_fsw(no_timestamp)]`, so a
-    /// forgotten timestamp is a derive error instead of every record silently
-    /// stamping `Timestamp(0)`.
+    /// Explicit opt-out of the shared timestamp. A frame with no
+    /// `#[metor_fsw(timestamp)]` field must say `#[metor_fsw(no_timestamp)]`,
+    /// so a forgotten timestamp is a derive error rather than every record
+    /// silently stamping `Timestamp(0)`.
     #[darling(default)]
     no_timestamp: bool,
 }
 
-/// `#[derive(Frame)]` — the one-annotation entry point (frames.md §2.4).
+/// Expands `#[derive(Frame)]`.
 ///
-/// Bundles the four sub-derives (`AsVTable` + `Metadatatize` + `Componentize` +
-/// `Decomponentize`) and adds `impl Frame`. The `AsVTable` half is generated with a
-/// frame wrap so every member inherits the `FRAME_ID`.
+/// Bundles the four sub-derives (`AsVTable`, `Metadatatize`, `Componentize`,
+/// `Decomponentize`) and adds an `impl Frame`. The `AsVTable` half is generated
+/// with a frame wrap so every member inherits the `FRAME_ID`.
 pub fn frame(input: TokenStream) -> TokenStream {
     let parsed = parse_macro_input!(input as DeriveInput);
     let Frame {
@@ -40,31 +42,29 @@ pub fn frame(input: TokenStream) -> TokenStream {
         no_timestamp,
     } = Frame::from_derive_input(&parsed).unwrap();
 
-    // `#[derive(Frame)]` is a metor-fsw-2 concept, so the bundled sub-derives emit
-    // `::metor_fsw_2::…` re-export paths — a crate depending only on metor-fsw-2 can
-    // then use the derive without a direct metor-fsw / metor-proto dependency.
+    // The sub-derives emit `::metor_fsw_2::…` re-export paths, so a crate that
+    // depends only on metor_fsw_2 can use the derive without depending on the
+    // protocol crate directly.
     let fsw2 = crate::metor_fsw_2_crate_name();
     let impeller = quote! { #fsw2::metor_proto };
 
-    // The frame name: explicit `name`/`parent`, else snake_case of the ident. This
-    // is both the dotted component prefix and the `FRAME_ID`.
+    // Explicit `name`/`parent` wins, else snake_case of the ident. This is both
+    // the dotted component prefix and the `FRAME_ID`.
     let frame_name = name
         .or(parent)
         .unwrap_or_else(|| ident.to_string().to_case(Case::Snake));
     let frame_id = quote! { #impeller::types::ComponentId::new(#frame_name) };
 
     // The shared timestamp accessor reads the `#[metor_fsw(timestamp)]` field.
-    // E4 strictness: a missing marker is a **derive error** (previously every record
-    // silently stamped `Timestamp(0)`); a genuinely timestamp-free frame opts out
-    // explicitly with `#[metor_fsw(no_timestamp)]` (its accessor then returns the
-    // default stamp, documented rather than accidental).
+    // A frame with neither the marker nor the `no_timestamp` opt-out is a
+    // derive error; with the opt-out, the accessor returns the default stamp.
     let fields = data.take_struct().expect("Frame requires a named struct");
     let ts_field = fields.fields.iter().find(|f| f.timestamp);
     let timestamp_body = match (ts_field, no_timestamp) {
         (Some(_), true) => {
             return syn::Error::new_spanned(
                 &parsed.ident,
-                "#[metor_fsw(no_timestamp)] contradicts the #[metor_fsw(timestamp)] field — \
+                "#[metor_fsw(no_timestamp)] contradicts the #[metor_fsw(timestamp)] field; \
                  remove one",
             )
             .to_compile_error()
@@ -87,8 +87,8 @@ pub fn frame(input: TokenStream) -> TokenStream {
         }
     };
 
-    // The four sub-derives share the same `Field`/attribute surface; each reads the
-    // frame `name` as its component prefix.
+    // Each sub-derive reads the same `Field` attribute surface and takes the
+    // frame name as its component prefix.
     let as_vtable = crate::as_vtable::as_vtable_impl(&parsed, Some(frame_id.clone()), &fsw2);
     let metadatatize = crate::metadatatize::metadatatize_impl(&parsed, &fsw2);
     let componentize = crate::componentize::componentize_impl(&parsed, &fsw2);

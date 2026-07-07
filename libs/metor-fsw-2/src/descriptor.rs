@@ -1,8 +1,11 @@
-//! Static self-description a coordinator reads before any port exists (system.md
-//! §5): the per-port [`PortDesc`], the [`SystemDescriptor`] bundle, and the
-//! producer/consumer [`compatible`] check.
+//! Static self-description of a system's ports, read before any port exists.
 //!
-//! One port concept, three orthogonal axes (`docs/design-port-unification.md`):
+//! A coordinator sizes rings, validates wiring, and allocates buffers from a
+//! [`SystemDescriptor`] alone, so everything here is derived from static
+//! metadata (`F::FRAME_ID`, `F::as_vtable()`, `M::ID`) and never needs a
+//! constructed system.
+//!
+//! There is one port concept with three orthogonal axes:
 //!
 //! ```text
 //! schema     Table(VTable) | Postcard(PacketId)      what a record is
@@ -10,11 +13,14 @@
 //! fan-in     One | Many                              how many producers an input takes
 //! ```
 //!
-//! "Frame port" and "message port" are two *configurations* of this one concept:
-//! [`PortDesc::of`] mints `Table × Snapshot × One`, [`PortDesc::msg`] mints
-//! `Postcard × Log × Many`. Everything here is derived from static metadata
-//! (`F::FRAME_ID`, `F::as_vtable()`, `M::ID`), so a system can be sized, allocated,
-//! and wiring-validated without constructing it.
+//! A "frame port" and a "message port" are two configurations of that one
+//! concept. [`PortDesc::of`] mints `Table × Snapshot × One` and
+//! [`PortDesc::msg`] mints `Postcard × Log × Many`. Beside the axes sit two
+//! more pieces of shape: [`PortConn`] names who provides the other end of a
+//! port, and a [`Capability`] is a bind-time grant that is not a port at all.
+//!
+//! [`compatible`] is the one check that decides whether a producer output may
+//! feed a consumer input.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -28,30 +34,32 @@ use metor_proto_wkt::ComponentMetadata;
 use crate::frame::Frame;
 use crate::message::{MAX_MSG_BYTES, NamedMsg};
 
-/// A unit measured in Hertz.
+/// A rate in Hertz.
 pub type Hz = f64;
 
-/// The type-erased prefix factory stored on a Table port's schema: given an instance
-/// name it returns the prefixed announce vtable + component metadata. An [`Arc`] boxed
-/// closure (not a bare `fn`) so a dlopen'd port — which has no static `F` — can
-/// carry a closure capturing its metadata-derived prefix rewrite.
+/// Factory a Table port carries to produce its announce vtable and component
+/// metadata under an instance-name prefix.
+///
+/// An [`Arc`]'d closure rather than a bare `fn` so that a port built from
+/// runtime metadata, with no static frame type behind it, can capture the
+/// prefix rewrite it needs.
 pub type AnnounceFn = Arc<dyn Fn(&str) -> (VTable, Vec<ComponentMetadata>) + Send + Sync>;
 
-/// The edge key of a port. Two disjoint value spaces (a Table port keys on the
-/// 8-byte frame [`ComponentId`], a Postcard port on the 2-byte [`PacketId`]), so a
-/// mismatched pair can never accidentally satisfy an edge.
+/// The edge key of a port.
+///
+/// The two variants draw from disjoint value spaces (an 8-byte frame
+/// [`ComponentId`] versus a 2-byte [`PacketId`]), so ports of different
+/// schemas can never accidentally satisfy the same edge.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub enum PortId {
-    /// `F::FRAME_ID` — a Table port's key.
+    /// The key of a Table port, `F::FRAME_ID`.
     Component(ComponentId),
-    /// `M::ID` — a Postcard port's key.
+    /// The key of a Postcard port, `M::ID`.
     Packet(PacketId),
 }
 
 impl PortId {
-    /// The frame [`ComponentId`] of a Table port, or `None` on a Postcard port.
-    /// Checked (S5): internal Table-only call sites `.expect("table port")` with the
-    /// invariant stated; user-reachable paths surface an error instead of panicking.
+    /// The frame [`ComponentId`] of a Table port, or `None` for a Postcard port.
     pub fn component(self) -> Option<ComponentId> {
         match self {
             PortId::Component(c) => Some(c),
@@ -59,7 +67,7 @@ impl PortId {
         }
     }
 
-    /// The [`PacketId`] of a Postcard port, or `None` on a Table port.
+    /// The [`PacketId`] of a Postcard port, or `None` for a Table port.
     pub fn packet(self) -> Option<PacketId> {
         match self {
             PortId::Component(_) => None,
@@ -68,90 +76,85 @@ impl PortId {
     }
 }
 
-/// Axis 1 — what one record is and how it is described.
+/// What one record is and how it is described (the schema axis).
 #[derive(Clone)]
 pub enum PortSchema {
-    /// A component-frame table: `#[repr(C)]` bytes described by a vtable. Carries the
-    /// wiring-compatibility vtable and the telemetry announce factory.
+    /// A component-frame table of `#[repr(C)]` bytes described by a vtable.
     Table {
-        /// `F::as_vtable()` — the **frame-relative** (unprefixed) vtable the wiring
-        /// compatibility check uses; the prefixed vtable is produced on demand by the
-        /// announce factory.
+        /// The frame-relative (unprefixed) vtable that wiring compatibility
+        /// compares. The prefixed form is produced on demand by `announce`.
         vtable: VTable,
-        /// Prefix factory (telemetry.md §6): given an instance name, it re-derives the
-        /// **prefixed** announce vtable + component metadata. Type-erased ([`Arc`]
-        /// boxed closure) so a dlopen'd port, which has no static `F`, can carry a
-        /// closure capturing its metadata-derived prefix rewrite instead.
+        /// Re-derives the prefixed announce vtable and component metadata for
+        /// a given instance name. See [`AnnounceFn`] for why it is a closure.
         announce: AnnounceFn,
     },
-    /// A self-describing `(PacketId, postcard)` record. The 2-byte id *is* the
-    /// schema; no vtable, no announce.
+    /// A self-describing postcard record. The 2-byte [`PacketId`] is the whole
+    /// schema, so there is no vtable and nothing to announce.
     Postcard,
 }
 
-/// Axis 2 — what a consumer is expected to read off the channel. Drives ring depth,
-/// telemetry coalescing, cycle-detection membership, and whether `delayed` is
-/// meaningful.
+/// What a consumer is expected to read off the channel (the delivery axis).
+///
+/// Delivery drives ring depth, telemetry coalescing, and cycle-detection
+/// membership.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, serde::Serialize, serde::Deserialize)]
 pub enum Delivery {
-    /// A state sample: readers coalesce to the newest record (latest-wins).
+    /// A state sample. Readers coalesce to the newest record.
     Snapshot,
-    /// An event/command log: every record matters, in order, never coalesced.
+    /// An event or command log. Every record is read, in order, never
+    /// coalesced.
     Log,
 }
 
-/// Axis 3 — how many producers may wire into this *input*. (Ignored on outputs;
-/// fan-out is always unbounded.)
+/// How many producers may wire into an input (the fan-in axis). Outputs
+/// ignore it; fan-out is always unbounded.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, serde::Serialize, serde::Deserialize)]
 pub enum FanIn {
-    /// Exactly one edge, required (the frame-input rule).
+    /// Exactly one edge, and it must be present.
     One,
-    /// Zero, one, or many edges (the message-input rule). Requires
-    /// [`Delivery::Log`] — latest-wins across producers is ill-defined
-    /// (`WireError::SnapshotFanIn`).
+    /// Zero, one, or many edges. Requires [`Delivery::Log`], since latest-wins
+    /// across several producers is ill-defined; a Snapshot input declaring
+    /// `Many` fails wiring with `WireError::SnapshotFanIn`.
     Many,
 }
 
-/// Who provides the other end of this port (`docs/design-command-slots.md` §2.1) —
-/// a fourth axis beside schema × delivery × fan-in.
+/// Who provides the other end of a port.
 ///
-/// Not carried across the dl ABI: a dlopen'd system's ports are always
-/// edge-connected (`Host`/`SelfTap` are host-runner constructs — the slot runner's
-/// control/status/events ports, the coordinator's own bundle).
+/// Only the coordinator's and the slot runner's own bundles use anything
+/// other than [`Edge`](PortConn::Edge). A dynamically loaded system's ports
+/// are always edge-connected, so this axis never crosses the load boundary.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum PortConn {
-    /// Edge-connected (the default): wired by `connect` / KDL edges under the
-    /// fan-in axis rules.
+    /// Wired by ordinary edges under the fan-in rules. The default.
     Edge,
-    /// Host-connected: the system's *runner* (the slot runner, or the coordinator
-    /// itself) holds the port's counterpart — the writer of an input's dedicated
-    /// ring, or the writer of an output ring the bind walk would otherwise hand to
-    /// the system. A Host **output** is still ring-allocated and registry-tapped
-    /// like any output (and may be consumed over ordinary edges); a Host **input**
-    /// gets a dedicated ring, is exempt from `UnconnectedInput`, and rejects edges
-    /// (`WireError::HostPort`).
+    /// The system's runner holds the port's counterpart, writing a Host
+    /// input's dedicated ring or the output ring that would otherwise be
+    /// handed to the system. A Host output is still ring-allocated and
+    /// registry-tapped like any output and may be consumed over ordinary
+    /// edges. A Host input is exempt from the unconnected-input check and
+    /// rejects edges with `WireError::HostPort`.
     Host,
-    /// A declared reader over one of this system's *own* outputs, named by
-    /// [`PortId`]. Allocates no ring; adds +1 to that output's fan-out; the view
-    /// goes to the runner. Inputs only; rejects edges (`WireError::HostPort`).
+    /// A declared reader over one of this system's own outputs, named by
+    /// [`PortId`]. Allocates no ring, counts one extra reader on that output,
+    /// and hands the read view to the runner. Inputs only; edges are rejected
+    /// with `WireError::HostPort`.
     SelfTap(PortId),
 }
 
-/// A non-port resource a system needs from the host at bind time
-/// (`docs/design-port-unification.md` §2.5). Unlike a port it reserves no ring and
-/// connects no edge — it is granted, not wired.
+/// A non-port resource granted to a system at bind time. Unlike a port it
+/// reserves no ring and connects no edge.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, serde::Serialize, serde::Deserialize)]
 pub enum Capability {
     /// A read view over every telemetered output in the graph
-    /// ([`AllOutputs`](crate::AllOutputs)). Counts one reader slot on every buffer
-    /// at sizing time. Host-only (a dlopen'd system cannot hold it).
+    /// ([`AllOutputs`](crate::AllOutputs)). Counts one reader slot on every
+    /// buffer at sizing time. Only a host-built system can hold it.
     ReceiveAll,
 }
 
-/// What one bundle field contributes to the descriptor: an ordinary wired port, or
-/// a bind-time [`Capability`]. The `SystemInput`/`SystemOutput` derives collect one
-/// per field (`<Field>::decl()`), so a single type-blind walk covers both — the
-/// bind cursor skips capability decls (they consume no ring).
+/// What one bundle field contributes to a descriptor, either a wired port or
+/// a bind-time [`Capability`]. Collecting one decl per field lets a single
+/// walk cover both; the bind cursor skips capability decls since they consume
+/// no ring.
 #[derive(Clone, Debug)]
 pub enum PortDecl {
     Port(PortDesc),
@@ -159,9 +162,8 @@ pub enum PortDecl {
 }
 
 impl PortDecl {
-    /// The derive-facing twin of [`PortDesc::untelemetered`]: applies to a
-    /// [`Port`](PortDecl::Port) decl; a capability has no axes, so it passes
-    /// through untouched.
+    /// Applies [`PortDesc::untelemetered`] to a port decl; a capability has
+    /// no axes and passes through unchanged.
     pub fn untelemetered(self) -> Self {
         match self {
             PortDecl::Port(p) => PortDecl::Port(p.untelemetered()),
@@ -169,7 +171,7 @@ impl PortDecl {
         }
     }
 
-    /// The port shape of a [`Port`](PortDecl::Port) decl, `None` for a capability.
+    /// The port of a [`Port`](PortDecl::Port) decl, or `None` for a capability.
     pub fn into_port(self) -> Option<PortDesc> {
         match self {
             PortDecl::Port(p) => Some(p),
@@ -178,8 +180,8 @@ impl PortDecl {
     }
 }
 
-/// Split one direction's decls into its wired ports (order preserved — the bind
-/// cursor contract) and its capabilities.
+/// Splits one direction's decls into its wired ports and its capabilities,
+/// preserving port order for the bind cursor.
 pub fn split_decls(decls: Vec<PortDecl>) -> (Vec<PortDesc>, Vec<Capability>) {
     let mut ports = Vec::with_capacity(decls.len());
     let mut caps = Vec::new();
@@ -192,51 +194,48 @@ pub fn split_decls(decls: Vec<PortDecl>) -> (Vec<PortDesc>, Vec<Capability>) {
     (ports, caps)
 }
 
-/// One port's static shape: its edge key, display name, worst-case size, and the
-/// behavior axes.
+/// One port's static shape: its edge key, display name, worst-case record
+/// size, and the behavior axes.
 ///
-/// Used both for an output (a produced record stream) and an input (a required
-/// shape) — the two are structurally identical; the direction is which list of a
-/// [`SystemDescriptor`] it sits in. `fan_in` is a documented no-op on outputs;
-/// `telemetered` is a no-op on inputs.
+/// The same struct describes an output (a produced record stream) and an
+/// input (a required shape); the direction is which list of a
+/// [`SystemDescriptor`] it sits in. `fan_in` has no effect on outputs, and
+/// `telemetered` has no effect on inputs.
 #[derive(Clone)]
 pub struct PortDesc {
-    /// Edge key, derived from schema by the constructors:
-    /// `Component(F::FRAME_ID)` for Table, `Packet(M::ID)` for Postcard.
+    /// Edge key, derived from the schema by the constructors.
     pub id: PortId,
-    /// Display / KDL-token / registry-key name: `F::NAME` or `M::NAME` — kept so the
-    /// coordinator can compute the instance-qualified registry key
-    /// `ComponentId::new("<instance>.<name>")` without a static type.
+    /// Display, KDL-token, and registry-key name (`F::NAME` or `M::NAME`).
+    /// The coordinator joins it with an instance name to form the qualified
+    /// registry key `ComponentId::new("<instance>.<name>")` without needing a
+    /// static type.
     pub name: &'static str,
-    /// Worst-case record bytes: `F::MAX_SIZE` or [`MAX_MSG_BYTES`]; size a ring via
-    /// [`crate::capacity_for`].
+    /// Worst-case record bytes (`F::MAX_SIZE` or [`MAX_MSG_BYTES`]), the
+    /// input to [`crate::capacity_for`] when sizing a ring.
     pub max_size: usize,
-    /// Axis 1 — what a record is (Table bytes + vtable, or self-describing postcard).
+    /// What a record is and how it is described.
     pub schema: PortSchema,
-    /// Axis 2 — latest-wins snapshot vs every-record log.
+    /// Latest-wins snapshot or every-record log.
     pub delivery: Delivery,
-    /// Axis 3 — producer cardinality for an input (no-op on outputs).
+    /// Producer cardinality for an input.
     pub fan_in: FanIn,
-    /// Output-side: whether the downlink / `AllOutputs` taps this port (A6). A plain
-    /// field on *every* port — frames get the opt-out too.
+    /// Whether the downlink taps this output. Every port carries the flag, so
+    /// frame outputs can opt out too.
     pub telemetered: bool,
-    /// Axis 5 — who provides the other end ([`PortConn::Edge`] everywhere except the
-    /// slot runner's and coordinator's own bundles).
+    /// Who provides the other end.
     pub conn: PortConn,
 }
 
 impl std::fmt::Debug for PortDesc {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        // `announce` (inside `PortSchema::Table`) is a boxed closure (no `Debug`); the
-        // manual impl renders the schema without it.
+        // The announce closure has no `Debug` impl, so render the schema
+        // without it.
         let mut s = f.debug_struct("PortDesc");
         s.field("id", &self.id)
             .field("name", &self.name)
             .field("max_size", &self.max_size);
         match &self.schema {
-            PortSchema::Table { vtable, .. } => {
-                s.field("schema", &"Table").field("vtable", vtable)
-            }
+            PortSchema::Table { vtable, .. } => s.field("schema", &"Table").field("vtable", vtable),
             PortSchema::Postcard => s.field("schema", &"Postcard"),
         };
         s.field("delivery", &self.delivery)
@@ -247,10 +246,9 @@ impl std::fmt::Debug for PortDesc {
     }
 }
 
-/// The prefix factory stored on a Table port's schema: re-derive `F`'s vtable +
-/// metadata under the dotted `prefix` (the instance name). A `&str` is a
-/// [`ComponentPath`](metor_fsw::path::ComponentPath), so the leaves roll the same
-/// ids as `ComponentId::new("<prefix>.<frame>.<field>")`.
+/// Re-derives `F`'s vtable and metadata under the dotted `prefix` (the
+/// instance name), so the leaves roll the same ids as
+/// `ComponentId::new("<prefix>.<frame>.<field>")`.
 fn announce_of<F: Frame>(prefix: &str) -> (VTable, Vec<ComponentMetadata>) {
     let vt = vtable(<F as AsVTable>::vtable_fields(prefix));
     let metadata = <F as Metadatatize>::metadata(prefix).collect();
@@ -258,8 +256,8 @@ fn announce_of<F: Frame>(prefix: &str) -> (VTable, Vec<ComponentMetadata>) {
 }
 
 impl PortDesc {
-    /// Derives the descriptor for a frame type: `Table × Snapshot × One`,
-    /// telemetered. Pure metadata — no instance needed.
+    /// Derives the descriptor for a frame type, `Table × Snapshot × One`,
+    /// telemetered.
     pub fn of<F: Frame>() -> Self {
         Self {
             id: PortId::Component(F::FRAME_ID),
@@ -267,8 +265,8 @@ impl PortDesc {
             max_size: F::MAX_SIZE,
             schema: PortSchema::Table {
                 vtable: F::as_vtable(),
-                // Coerce the `F`-closing fn item to a plain fn pointer first (erasing
-                // `F`, so no `F: 'static` bound is needed), then box it as the
+                // Coerce the fn item to a plain fn pointer first, erasing `F`
+                // so no `F: 'static` bound is needed, then box it as the
                 // type-erased `Arc<dyn Fn>`.
                 announce: Arc::new(
                     announce_of::<F> as fn(&str) -> (VTable, Vec<ComponentMetadata>),
@@ -281,9 +279,9 @@ impl PortDesc {
         }
     }
 
-    /// Derives the descriptor for a message type: `Postcard × Log × Many`,
-    /// telemetered. The edge key is `M::ID`; the name is the explicit, stable
-    /// [`NamedMsg::NAME`] token (A10 — never the Rust type path).
+    /// Derives the descriptor for a message type, `Postcard × Log × Many`,
+    /// telemetered. The name is the stable [`NamedMsg::NAME`] token, never
+    /// the Rust type path.
     pub fn msg<M: NamedMsg>() -> Self {
         Self {
             id: PortId::Packet(M::ID),
@@ -297,12 +295,10 @@ impl PortDesc {
         }
     }
 
-    /// [`msg`](Self::msg) with an explicit channel-name override: `name` (not
-    /// `M::NAME`) becomes the display/KDL/registry token, so a coordinator-minted
-    /// channel keyed `"<instance>.sequences"` or `"<instance>.commands"` survives the
-    /// move from hand-built registry entries to descriptor-driven allocation. The
-    /// edge key stays `M::ID`, so `connect`/`msg="<M::NAME>"` edges still resolve to
-    /// it by packet id.
+    /// [`msg`](Self::msg) with an explicit name override. `name` becomes the
+    /// display, KDL, and registry token while the edge key stays `M::ID`, so
+    /// a channel keyed `"<instance>.commands"` keeps its key and
+    /// `msg="<M::NAME>"` edges still resolve by packet id.
     pub fn msg_named<M: NamedMsg>(name: &'static str) -> Self {
         Self {
             name,
@@ -310,12 +306,11 @@ impl PortDesc {
         }
     }
 
-    /// [`msg`](Self::msg) at the value level: mint a Postcard port from a runtime
-    /// `(name, id)` pair, for an instance descriptor whose message ports are
-    /// determined by config and so have no static `M` (the uplink's
-    /// one-port-per-configured-msg). Same axes as [`msg`](Self::msg); `name` is
-    /// the stable [`NamedMsg::NAME`] token the config resolved (a `MsgTable`
-    /// holds it `&'static`), so `msg="<name>"` edges resolve identically.
+    /// [`msg`](Self::msg) at the value level, minting a Postcard port from a
+    /// runtime `(name, id)` pair for a system whose message ports are chosen
+    /// by configuration and so have no static `M`. `name` must be the stable
+    /// [`NamedMsg::NAME`] token the configuration resolved, so `msg="<name>"`
+    /// edges resolve identically.
     pub fn msg_dynamic(name: &'static str, id: PacketId) -> Self {
         Self {
             id: PortId::Packet(id),
@@ -329,36 +324,36 @@ impl PortDesc {
         }
     }
 
-    /// Opt this output out of the downlink / `AllOutputs` tap (A6): the port stays a
-    /// first-class registered buffer (debugger/test visible by key) but is never
-    /// downlinked. Command channels use this; frame outputs may too.
+    /// Opts this output out of the downlink tap. The port stays a first-class
+    /// registered buffer, visible by key, but is never downlinked.
     pub fn untelemetered(mut self) -> Self {
         self.telemetered = false;
         self
     }
 
-    /// Override the port-connection axis (axis 4) — used only by the slot runner's
-    /// and coordinator's own bundle derivations; user ports stay [`PortConn::Edge`].
+    /// Overrides the connection axis. Only the slot runner's and the
+    /// coordinator's own bundle derivations use this; user ports stay
+    /// [`PortConn::Edge`].
     pub fn with_conn(mut self, c: PortConn) -> Self {
         self.conn = c;
         self
     }
 
-    /// Override the input fan-in rule (axis 3).
+    /// Overrides the input fan-in rule.
     pub fn with_fan_in(mut self, f: FanIn) -> Self {
         self.fan_in = f;
         self
     }
 
-    /// Override the delivery semantics (axis 2) — e.g. a future `Table × Log`
-    /// every-record frame log.
+    /// Overrides the delivery semantics, for example an every-record
+    /// `Table × Log` frame log.
     pub fn with_delivery(mut self, d: Delivery) -> Self {
         self.delivery = d;
         self
     }
 
-    /// The frame-relative vtable of a Table port (wiring compatibility / telemetry
-    /// announce), or `None` on a Postcard port (checked — S5).
+    /// The frame-relative vtable of a Table port, or `None` for a Postcard
+    /// port.
     pub fn vtable(&self) -> Option<&VTable> {
         match &self.schema {
             PortSchema::Table { vtable, .. } => Some(vtable),
@@ -366,8 +361,7 @@ impl PortDesc {
         }
     }
 
-    /// The prefix-announce factory of a Table port, or `None` on a Postcard port
-    /// (checked — S5).
+    /// The announce factory of a Table port, or `None` for a Postcard port.
     pub fn announce(&self) -> Option<&AnnounceFn> {
         match &self.schema {
             PortSchema::Table { announce, .. } => Some(announce),
@@ -376,20 +370,21 @@ impl PortDesc {
     }
 }
 
-/// How the coordinator drives a system. Carried on the descriptor as metadata; the
-/// trait a user implements ([`CyclicSystem`](crate::CyclicSystem) vs
+/// How the coordinator drives a system. Carried on the descriptor as
+/// metadata; the trait a system implements
+/// ([`CyclicSystem`](crate::CyclicSystem) or
 /// [`AsyncSystem`](crate::AsyncSystem)) is the real distinction.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, serde::Serialize, serde::Deserialize)]
 pub enum SystemKind {
-    /// Coordinator-driven: `execute` once per cycle.
+    /// Driven by the coordinator, `execute` once per cycle.
     Cyclic,
-    /// Self-driven: the system owns its own `run` loop.
+    /// Self-driven; the system owns its own `run` loop.
     Async,
 }
 
-/// A system's full self-description: its name, driving kind, the static shapes of
-/// every input and output port, and the non-port [`Capability`] set it needs from
-/// the host at bind time (§2.5 — e.g. the downlink's `ReceiveAll`).
+/// A system's full self-description: its name, driving kind, the static shape
+/// of every input and output port, and the [`Capability`] set it needs from
+/// the host at bind time.
 #[derive(Clone, Debug)]
 pub struct SystemDescriptor {
     pub name: &'static str,
@@ -399,32 +394,30 @@ pub struct SystemDescriptor {
     pub capabilities: Vec<Capability>,
 }
 
-/// A `(component_id, ty, shape)` triple — the unit a compatibility check compares.
+/// Collects a vtable's components into the `(ty, shape)` map a compatibility
+/// check compares.
 fn realize_set(vtable: &VTable) -> HashMap<ComponentId, (PrimType, Vec<usize>)> {
     let mut set = HashMap::new();
-    // Registration mode (`table = None`): every component, including dynamic member
-    // templates, is surfaced with its ty/shape (the dynamic-registration-mode
-    // contract). Malformed fields are skipped — a real frame's vtable never errors here.
+    // Realizing with no table surfaces every component, including dynamic
+    // member templates, with its ty and shape. Malformed fields are skipped;
+    // a real frame's vtable never produces them.
     for field in vtable.realize_fields(None).flatten() {
         set.insert(field.component_id, (field.ty, field.shape.to_vec()));
     }
     set
 }
 
-/// Whether a `producer` output satisfies a `consumer` input — the one compatibility
-/// path for every port:
+/// Whether a `producer` output satisfies a `consumer` input.
 ///
-/// - The edge keys must match (`PortId` equality — Table ids and Postcard ids live in
-///   disjoint spaces, so a cross-schema pair can never match).
-/// - **Delivery must match across an edge**: a Log consumer of a Snapshot ring would
-///   silently see coalesced gaps; a Snapshot consumer of a Log ring would silently
-///   discard records. The facades make agreement automatic; a hand-modified desc
-///   that disagrees is a build error.
-/// - **Table/Table** (system.md §5.2): the consumer's component set is a **subset**
-///   of the producer's with matching `ty`/`shape`. Subset (not equality) lets a
-///   producer emit extra fields a consumer ignores (forward-compatible wiring).
-/// - **Postcard/Postcard**: pure [`PacketId`] equality (already checked) — records
-///   are opaque postcard blobs with no component structure.
+/// The edge keys must match, and since Table and Postcard ids live in
+/// disjoint spaces a cross-schema pair never can. Delivery must also match
+/// across an edge; a Log consumer of a Snapshot ring would silently see
+/// coalesced gaps, and a Snapshot consumer of a Log ring would silently
+/// discard records. For a Table pair the consumer's component set must be a
+/// subset of the producer's with matching type and shape, so a producer may
+/// emit extra fields a consumer ignores. A Postcard pair needs nothing beyond
+/// the id equality already checked, since its records are opaque postcard
+/// blobs with no component structure.
 pub fn compatible(producer: &PortDesc, consumer: &PortDesc) -> bool {
     if producer.id != consumer.id || producer.delivery != consumer.delivery {
         return false;
@@ -464,9 +457,8 @@ mod tests {
         value: f64,
     }
 
-    /// Constructor axis defaults match the facade table (§2.2): `of` mints
-    /// `Table × Snapshot × One`, telemetered; `msg` mints `Postcard × Log × Many`,
-    /// telemetered — and each `id` is consistent with its schema's value space.
+    /// The constructors set the documented axis defaults, and each `id` sits
+    /// in its schema's value space.
     #[test]
     fn constructor_axis_defaults() {
         let f = PortDesc::of::<AxisProbe>();
@@ -497,14 +489,13 @@ mod tests {
         assert_eq!(d.fan_in, FanIn::Many);
         assert_eq!(d.delivery, Delivery::Snapshot);
 
-        // The generic fourth combination: an every-record frame log.
+        // The fourth axis combination, an every-record frame log.
         let d = PortDesc::of::<AxisProbe>().with_delivery(Delivery::Log);
         assert_eq!(d.delivery, Delivery::Log);
         assert!(matches!(d.schema, PortSchema::Table { .. }));
     }
 
-    /// Checked accessors return `None` off-schema — no panic reachable from the
-    /// public API (S5).
+    /// The checked accessors return `None` off-schema rather than panicking.
     #[test]
     fn checked_accessors_none_off_schema() {
         let m = PortDesc::msg::<SequenceCommand>();
@@ -520,8 +511,8 @@ mod tests {
         assert!(f.id.packet().is_none());
     }
 
-    /// The `compatible` matrix: Table/Table subset rule, Postcard/Postcard id
-    /// equality, cross-schema never, and **delivery mismatch never** (§2.6).
+    /// Table pairs follow the subset rule, Postcard pairs match by id, and
+    /// neither a cross-schema pair nor a delivery mismatch ever matches.
     #[test]
     fn compatible_matrix() {
         let f = PortDesc::of::<AxisProbe>();
@@ -531,18 +522,20 @@ mod tests {
         assert!(compatible(&m, &PortDesc::msg::<SequenceCommand>()));
         // Distinct Postcard ids never match.
         assert!(!compatible(&m, &PortDesc::msg::<SequenceRegistry>()));
-        // Cross-schema never matches (disjoint id spaces already guarantee it).
+        // Cross-schema never matches; the disjoint id spaces already
+        // guarantee it.
         assert!(!compatible(&f, &m));
         assert!(!compatible(&m, &f));
-        // NEW: delivery must match across an edge — a hand-modified desc that
-        // disagrees is incompatible even with identical id + schema.
+        // A delivery mismatch is incompatible even with identical id and
+        // schema.
         let log_f = PortDesc::of::<AxisProbe>().with_delivery(Delivery::Log);
         assert!(!compatible(&f, &log_f));
         assert!(!compatible(&log_f, &f));
         assert!(compatible(&log_f, &log_f.clone()));
     }
 
-    /// The wkt `NamedMsg` tokens are frozen to today's names (KDL/registry compat).
+    /// The well-known message name tokens are frozen; KDL files and registry
+    /// keys depend on them.
     #[test]
     fn wkt_named_msg_tokens_frozen() {
         assert_eq!(<SequenceCommand as NamedMsg>::NAME, "SequenceCommand");
