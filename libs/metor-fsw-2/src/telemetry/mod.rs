@@ -3,44 +3,45 @@
 //!
 //! Two systems live here. [`TelemetrySystem`] is the downlink, an ordinary
 //! [`CyclicSystem`] registered after every other cyclic system. Its
-//! end-of-cycle `execute` copies the pending records of every tapped output
-//! buffer into a bounded hand-off, and a spawned sender task drains the
-//! hand-off onto the wire. [`UplinkSystem`] is the read twin, an
-//! [`AsyncSystem`] that owns its own connection, subscribes to a configured
-//! set of message ids, and republishes each inbound `Msg` packet on an
-//! ordinary message output port, so consumers receive commands over explicit
-//! edges like any other message.
+//! end-of-cycle `execute` frames the pending records of every tapped output
+//! buffer into one batch buffer and queues the batch for a spawned sender
+//! task, which writes it to the wire in a single send. [`UplinkSystem`] is
+//! the read twin, an [`AsyncSystem`] that owns its own connection, subscribes
+//! to a configured set of message ids, and republishes each inbound `Msg`
+//! packet on an ordinary message output port, so consumers receive commands
+//! over explicit edges like any other message.
 //!
 //! # Cycle / sender split
 //!
 //! The control cycle is single-threaded and synchronous while the socket is
-//! async, so the downlink is split in two. The in-cycle stage only copies
-//! records into the hand-off and never blocks on the link; the sender task
-//! does all the awaiting I/O. When the transport backs up, data is dropped
-//! rather than delayed, and every drop is counted on the system's health
-//! output.
+//! async, so the downlink is split in two. The in-cycle stage only frames
+//! records into the cycle's batch and hands it over a fixed-depth queue,
+//! never blocking on the link; the sender task does all the awaiting I/O.
+//! The queue recycles its buffers — a sent batch's allocation comes back for
+//! a later cycle — so the steady state allocates nothing. When the transport
+//! backs up the queue fills, whole batches are dropped rather than delayed,
+//! and every drop is counted on the system's health output as
+//! `telemetry.dropped`.
 //!
-//! # Taps, lanes, and wire framing
+//! # Taps and wire framing
 //!
 //! Each tapped registry entry becomes one tap, and the entry's two axes drive
-//! it independently. Its [`Delivery`](crate::Delivery) picks the hand-off
-//! lane:
+//! it independently. Its [`Delivery`](crate::Delivery) picks how much of the
+//! buffer each cycle contributes to the batch:
 //!
-//! * `Snapshot` entries get a dedicated coalescing slot. Only the newest
-//!   record of a cycle is pushed, a newer snapshot overwrites an older un-sent
-//!   one, and each overwrite of an occupied slot bumps the `telemetry.dropped`
-//!   counter.
-//! * `Log` entries share one bounded FIFO. Event and command records must
-//!   never be coalesced, so every drained record is queued in order and sent
-//!   verbatim. Overflow drops the oldest queued record and bumps
-//!   `telemetry.msg_dropped`.
+//! * `Snapshot` entries contribute only the cycle's newest record; a cycle
+//!   with nothing new contributes nothing.
+//! * `Log` entries contribute every pending record, in commit order. Event
+//!   and command records must never be coalesced.
 //!
-//! The entry's schema picks the wire framing. A table entry is sent as a
+//! The entry's schema picks the wire framing. A table entry is framed as a
 //! `Table` packet whose payload is the ring record itself (the bytes a system
 //! committed are the bytes on the wire), referencing a `VTable` announced once
-//! on connect. A postcard entry is sent as a self-describing `Msg` packet
+//! on connect. A postcard entry is framed as a self-describing `Msg` packet
 //! whose id is the record's leading two bytes, with no announce step. The two
-//! axes combine freely; an every-record table log needs no extra code.
+//! axes combine freely; an every-record table log needs no extra code. The
+//! wire is a plain stream of length-prefixed packets, so a batch is just the
+//! cycle's packets concatenated and the receiver never notices the batching.
 //!
 //! # Connection lifecycle
 //!
@@ -48,24 +49,20 @@
 //! drives them, and neither reconnects. The first transport error ends the
 //! sender (or reader) while the in-cycle stage keeps running and drops.
 
-use std::collections::VecDeque;
-use std::sync::atomic::{
-    AtomicBool, AtomicU64,
-    Ordering::{AcqRel, Acquire, Relaxed, Release},
-};
-use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use metor_fsw_ring::{NoWake, View};
-use metor_proto::types::{LenPacket, OwnedPacket, PacketId, Timestamp};
+use metor_proto::types::{
+    IntoLenPacket, OwnedPacket, PACKET_HEADER_LEN, PacketId, PacketTy, Timestamp,
+};
 use metor_proto::vtable::VTable;
 use metor_proto_stellar::{PacketSink, PacketStream};
 use metor_proto_wkt::{ComponentMetadata, MsgStream, SetComponentMetadata, VTableMsg};
 use stellarator::JoinHandleDropGuard;
 use stellarator::buf::Slice;
-use stellarator::io::{OwnedReader, OwnedWriter, SplitExt};
+use stellarator::io::{AsyncWrite, OwnedReader, OwnedWriter, SplitExt};
 use stellarator::net::TcpStream;
-use stellarator::sync::WaitQueue;
+use thingbuf::mpsc;
 
 use crate::binder::{BindPorts, RingSource};
 use crate::descriptor::{Delivery, PortDecl, PortDesc, SystemDescriptor};
@@ -114,8 +111,9 @@ pub trait Transport {
         meta: &[ComponentMetadata],
     ) -> Result<(), TransportError>;
 
-    /// Send one `Table` packet referencing an already-announced vtable.
-    async fn send(&mut self, pkt: LenPacket) -> Result<(), TransportError>;
+    /// Send one batch of concatenated length-prefixed packets, returning the
+    /// buffer so its allocation can be reused for a later batch.
+    async fn send(&mut self, buf: Vec<u8>) -> Result<Vec<u8>, TransportError>;
 }
 
 /// The read twin of [`Transport`]: yields the next inbound packet off the
@@ -134,7 +132,7 @@ pub trait RecvTransport {
 /// A live connection's write half plus the parked read half, which is held
 /// only to keep the full socket open; the downlink never reads replies.
 struct TcpConn {
-    sink: PacketSink<OwnedWriter<TcpStream>>,
+    tx: OwnedWriter<TcpStream>,
     #[allow(dead_code)]
     rx: OwnedReader<TcpStream>,
 }
@@ -154,18 +152,15 @@ impl TcpTransport {
     }
 
     /// Connect on first use; later calls reuse the open socket.
-    async fn ensure(&mut self) -> Result<&PacketSink<OwnedWriter<TcpStream>>, TransportError> {
+    async fn ensure(&mut self) -> Result<&OwnedWriter<TcpStream>, TransportError> {
         if self.conn.is_none() {
             let stream = TcpStream::connect(self.addr)
                 .await
                 .map_err(TransportError::io)?;
             let (rx, tx) = stream.split();
-            self.conn = Some(TcpConn {
-                sink: PacketSink::new(tx),
-                rx,
-            });
+            self.conn = Some(TcpConn { tx, rx });
         }
-        Ok(&self.conn.as_ref().expect("just connected").sink)
+        Ok(&self.conn.as_ref().expect("just connected").tx)
     }
 }
 
@@ -175,21 +170,21 @@ impl Transport for TcpTransport {
         msg: &VTableMsg,
         meta: &[ComponentMetadata],
     ) -> Result<(), TransportError> {
-        let sink = self.ensure().await?;
-        sink.send(msg).await.0.map_err(TransportError::io)?;
+        let tx = self.ensure().await?;
+        let pkt = msg.into_len_packet();
+        tx.write_all(pkt.inner).await.0.map_err(TransportError::io)?;
         for m in meta {
-            sink.send(&SetComponentMetadata(m.clone()))
-                .await
-                .0
-                .map_err(TransportError::io)?;
+            let pkt = (&SetComponentMetadata(m.clone())).into_len_packet();
+            tx.write_all(pkt.inner).await.0.map_err(TransportError::io)?;
         }
         Ok(())
     }
 
-    async fn send(&mut self, pkt: LenPacket) -> Result<(), TransportError> {
-        let sink = self.ensure().await?;
-        sink.send(pkt).await.0.map_err(TransportError::io)?;
-        Ok(())
+    async fn send(&mut self, buf: Vec<u8>) -> Result<Vec<u8>, TransportError> {
+        let tx = self.ensure().await?;
+        let (res, buf) = tx.write_all(buf).await;
+        res.map_err(TransportError::io)?;
+        Ok(buf)
     }
 }
 
@@ -411,88 +406,10 @@ impl BuildSystem for UplinkSystem<TcpRecvTransport> {
 // Hand-off
 // ---------------------------------------------------------------------------
 
-/// The bound on the shared log-lane FIFO. Past this depth the oldest queued
-/// record is dropped (and counted), bounding memory while keeping the most
-/// recent events and commands.
-const LOG_HANDOFF_CAP: usize = 1024;
-
-/// Where the cycle parks framed packets for the sender, one coalescing slot
-/// per snapshot tap and one FIFO shared by every log tap. The module docs tell
-/// the lane story; the methods here implement it without ever blocking the
-/// cycle side.
-struct HandOff {
-    /// Snapshot lane: one coalescing slot per snapshot tap.
-    slots: Mutex<Vec<Option<LenPacket>>>,
-    /// Log lane: one bounded FIFO shared by every log tap.
-    fifo: Mutex<VecDeque<LenPacket>>,
-    /// Set when either lane is filled, cleared by the sender before it parks.
-    /// This only avoids busy spinning; a missed wake is harmless because the
-    /// sender always drains both lanes fully.
-    pending: AtomicBool,
-    /// Snapshots dropped by coalescing overwrite (surfaced as `telemetry.dropped`).
-    dropped_snapshots: AtomicU64,
-    /// Log records dropped-oldest on overflow (surfaced as `telemetry.msg_dropped`).
-    dropped_logs: AtomicU64,
-    /// Wakes the parked sender when either lane fills (or on shutdown).
-    wq: Arc<WaitQueue>,
-}
-
-impl HandOff {
-    fn new(n_slots: usize, wq: Arc<WaitQueue>) -> Self {
-        Self {
-            slots: Mutex::new((0..n_slots).map(|_| None).collect()),
-            fifo: Mutex::new(VecDeque::new()),
-            pending: AtomicBool::new(false),
-            dropped_snapshots: AtomicU64::new(0),
-            dropped_logs: AtomicU64::new(0),
-            wq,
-        }
-    }
-
-    /// Cycle side, never blocks: coalesce `pkt` into `slot`, counting a drop
-    /// if it overwrote an un-sent packet, then wake the sender.
-    fn push_snapshot(&self, slot: usize, pkt: LenPacket) {
-        {
-            let mut slots = self.slots.lock().expect("handoff poisoned");
-            if slots[slot].is_some() {
-                self.dropped_snapshots.fetch_add(1, Relaxed);
-            }
-            slots[slot] = Some(pkt);
-        }
-        self.pending.store(true, Release);
-        self.wq.wake_all();
-    }
-
-    /// Cycle side, never blocks: append `pkt` to the log lane, dropping the
-    /// oldest queued record (and counting it) past [`LOG_HANDOFF_CAP`], then
-    /// wake the sender.
-    fn push_log(&self, pkt: LenPacket) {
-        {
-            let mut fifo = self.fifo.lock().expect("handoff poisoned");
-            if fifo.len() >= LOG_HANDOFF_CAP {
-                fifo.pop_front();
-                self.dropped_logs.fetch_add(1, Relaxed);
-            }
-            fifo.push_back(pkt);
-        }
-        self.pending.store(true, Release);
-        self.wq.wake_all();
-    }
-
-    /// Sender side: take every pending packet from both lanes as
-    /// `(snapshots, log records)`, dropping the locks before any `.await`.
-    fn drain(&self) -> (Vec<LenPacket>, Vec<LenPacket>) {
-        let snapshots = {
-            let mut slots = self.slots.lock().expect("handoff poisoned");
-            slots.iter_mut().filter_map(Option::take).collect()
-        };
-        let logs = {
-            let mut fifo = self.fifo.lock().expect("handoff poisoned");
-            fifo.drain(..).collect()
-        };
-        (snapshots, logs)
-    }
-}
+/// How many cycle batches may wait for the sender before the cycle side drops
+/// new ones. The channel recycles its slots' buffers, so this also bounds the
+/// downlink's steady-state allocation.
+const BATCH_QUEUE_CAP: usize = 8;
 
 // ---------------------------------------------------------------------------
 // Uplink
@@ -703,15 +620,14 @@ struct Announce {
     metadata: Vec<ComponentMetadata>,
 }
 
-/// The async sender task: announce every table tap once, then drain the
-/// hand-off and send until a transport error or `stop` ends it. The cycle side
-/// is unaffected either way.
+/// The async sender task: announce every table tap once, then send each
+/// queued batch until a transport error or a closed channel ends it. The
+/// cycle side is unaffected either way. A sent batch's buffer goes back into
+/// its channel slot, so the allocation is recycled instead of freed.
 async fn run_sender<T: Transport>(
     mut transport: T,
     announces: Vec<Announce>,
-    handoff: Arc<HandOff>,
-    wq: Arc<WaitQueue>,
-    stop: Arc<AtomicBool>,
+    rx: mpsc::Receiver<Vec<u8>>,
 ) {
     for a in &announces {
         let msg = VTableMsg {
@@ -722,22 +638,13 @@ async fn run_sender<T: Transport>(
             return;
         }
     }
-    loop {
-        if stop.load(Acquire) {
-            return;
-        }
-        // Drain both lanes; park on the wait queue only when both are empty.
-        let (pkts, logs) = handoff.drain();
-        if pkts.is_empty() && logs.is_empty() {
-            let _ = wq
-                .wait_for(|| handoff.pending.swap(false, AcqRel) || stop.load(Acquire))
-                .await;
-            continue;
-        }
-        for pkt in pkts.into_iter().chain(logs) {
-            if transport.send(pkt).await.is_err() {
-                return;
-            }
+    // `recv_ref` parks until a batch is queued and returns `None` once the
+    // cycle side has dropped its sender and the queue is drained (shutdown).
+    while let Some(mut slot) = rx.recv_ref().await {
+        let batch = std::mem::take(&mut *slot);
+        match transport.send(batch).await {
+            Ok(buf) => *slot = buf,
+            Err(_) => return,
         }
     }
 }
@@ -776,25 +683,16 @@ impl BindPorts for TelemetryIn {
 // The downlink system
 // ---------------------------------------------------------------------------
 
-/// A read view into one tapped buffer plus the [`Lane`] and [`Wire`] framing
-/// projected from the entry's delivery and schema axes.
+/// A read view into one tapped buffer plus the delivery axis and the [`Wire`]
+/// framing projected from the entry.
 struct Tap {
     view: View<NoWake, NoWake>,
-    lane: Lane,
+    delivery: Delivery,
     wire: Wire,
-    /// Coalesce lane only: the ring's `committed` at the last push, so a cycle
-    /// with no new record pushes nothing (the pinned newest record is not
-    /// re-sent). `u64::MAX` means nothing pushed yet.
+    /// Snapshot taps only: the ring's `committed` at the last contribution, so
+    /// a cycle with no new record contributes nothing (the pinned newest
+    /// record is not re-sent). `u64::MAX` means nothing contributed yet.
     last_committed: u64,
-}
-
-/// Which hand-off lane a tap pushes to, projected from the entry's
-/// [`Delivery`](crate::Delivery).
-enum Lane {
-    /// Latest wins: coalesce into this tap's dedicated slot.
-    Coalesce { slot: usize },
-    /// Every record, in order, into the shared FIFO.
-    Fifo,
 }
 
 /// How a tap frames a drained record, projected from the entry's schema.
@@ -807,8 +705,9 @@ enum Wire {
 
 /// Everything `init` starts, bundled so it is present or absent as one.
 struct Started {
-    handoff: Arc<HandOff>,
-    stop: Arc<AtomicBool>,
+    /// The cycle side of the batch queue; taken by `shutdown` so the channel
+    /// closes and the sender drains what is queued, then exits.
+    tx: Option<mpsc::Sender<Vec<u8>>>,
     /// Holds the sender task; dropping the guard cancels the task on teardown.
     /// `None` when the transport was already taken by an earlier `init`; the
     /// taps still drain.
@@ -830,14 +729,13 @@ struct Started {
 pub struct TelemetrySystem<T: Transport> {
     transport: Option<T>,
     mode: TelemetryMode,
-    /// The resolved taps; each carries its own lane and wire framing.
+    /// The resolved taps; each carries its own delivery axis and wire framing.
     taps: Vec<Tap>,
     /// The running state `init` assembles. `None` before `init`.
     started: Option<Started>,
-    /// Snapshot drops already surfaced to health (each new one reported once).
-    last_dropped: u64,
-    /// The log-lane twin of `last_dropped` (surfaced as `telemetry.msg_dropped`).
-    last_msg_dropped: u64,
+    /// The batch under construction this cycle. On hand-off it is swapped for
+    /// a recycled channel buffer, so the steady state allocates nothing.
+    scratch: Vec<u8>,
 }
 
 impl<T: Transport> TelemetrySystem<T> {
@@ -849,8 +747,7 @@ impl<T: Transport> TelemetrySystem<T> {
             mode: config.mode,
             taps: Vec::new(),
             started: None,
-            last_dropped: 0,
-            last_msg_dropped: 0,
+            scratch: Vec::new(),
         }
     }
 }
@@ -869,7 +766,6 @@ impl<T: Transport + 'static> System for TelemetrySystem<T> {
         // so a command channel or an opted-out frame never reaches the matcher.
         let mut taps = Vec::new();
         let mut announces = Vec::new();
-        let mut n_slots = 0usize;
         // Deferred health reports: iterating `output.all` borrows the output
         // bundle, so `output.health()` (a `&mut` borrow) runs after the loop.
         let mut exhausted: Vec<String> = Vec::new();
@@ -889,16 +785,9 @@ impl<T: Transport + 'static> System for TelemetrySystem<T> {
                     continue;
                 }
             };
-            // Lane and wire are independent projections of the entry: delivery
-            // picks the hand-off lane, schema picks the framing.
-            let lane = match entry.delivery {
-                Delivery::Snapshot => {
-                    let slot = n_slots;
-                    n_slots += 1;
-                    Lane::Coalesce { slot }
-                }
-                Delivery::Log => Lane::Fifo,
-            };
+            // Delivery and wire are independent projections of the entry:
+            // delivery picks how much each cycle contributes, schema picks
+            // the framing.
             let wire = match &entry.schema {
                 EntrySchema::Table {
                     vtable, metadata, ..
@@ -915,7 +804,7 @@ impl<T: Transport + 'static> System for TelemetrySystem<T> {
             };
             taps.push(Tap {
                 view,
-                lane,
+                delivery: entry.delivery,
                 wire,
                 last_committed: u64::MAX,
             });
@@ -930,75 +819,71 @@ impl<T: Transport + 'static> System for TelemetrySystem<T> {
             );
         }
 
-        // One wait queue on the one two-lane hand-off wakes the single sender.
-        let wq = Arc::new(WaitQueue::new());
-        let handoff = Arc::new(HandOff::new(n_slots, wq.clone()));
-        let stop = Arc::new(AtomicBool::new(false));
-        let sender = self.transport.take().map(|transport| {
-            stellarator::spawn(run_sender(
-                transport,
-                announces,
-                handoff.clone(),
-                wq,
-                stop.clone(),
-            ))
-            .drop_guard()
-        });
+        // One bounded channel of recycled batch buffers feeds the one sender.
+        // With no transport (an earlier `init` took it) the receiver drops
+        // here and the channel reports closed, so pushes count as drops.
+        let (tx, rx) = mpsc::channel::<Vec<u8>>(BATCH_QUEUE_CAP);
+        let sender = self
+            .transport
+            .take()
+            .map(|transport| stellarator::spawn(run_sender(transport, announces, rx)).drop_guard());
         self.taps = taps;
         self.started = Some(Started {
-            handoff,
-            stop,
+            tx: Some(tx),
             sender,
         });
     }
 
-    /// Signal the sender to stop and wake it so it exits cooperatively (the
-    /// drop guard cancels it regardless when the system is dropped at
-    /// teardown).
+    /// Close the batch queue so the sender drains what is queued and exits
+    /// cooperatively (the drop guard cancels it regardless when the system is
+    /// dropped at teardown).
     fn shutdown(&mut self, _output: &mut Self::Output) {
-        if let Some(started) = &self.started {
-            started.stop.store(true, Release);
-            started.handoff.wq.wake_all();
+        if let Some(started) = &mut self.started {
+            started.tx = None;
         }
     }
 }
 
-/// Frame one drained record per the tap's [`Wire`]: a `Table` packet under the
-/// announce-assigned id, or a self-describing `Msg` packet keyed by the
-/// record's own leading id (`None` if the record is too short to carry one).
-fn frame_packet(wire: &Wire, rec: &[u8]) -> Option<LenPacket> {
+/// Append one length-prefixed packet to `batch`: the framing [`LenPacket`]
+/// builds (`metor_proto::types::LenPacket`), minus the intermediate
+/// allocation.
+fn append_packet(batch: &mut Vec<u8>, ty: PacketTy, id: PacketId, payload: &[u8]) {
+    batch.extend_from_slice(&((PACKET_HEADER_LEN + payload.len()) as u32).to_le_bytes());
+    batch.push(ty as u8);
+    batch.extend_from_slice(&id);
+    batch.push(0); // req_id
+    batch.extend_from_slice(payload);
+}
+
+/// Frame one drained record onto `batch` per the tap's [`Wire`]: a `Table`
+/// packet under the announce-assigned id, or a self-describing `Msg` packet
+/// keyed by the record's own leading id (skipped if the record is too short
+/// to carry one).
+fn append_record(batch: &mut Vec<u8>, wire: &Wire, rec: &[u8]) {
     match wire {
-        Wire::Table { packet_id } => {
-            let mut pkt = LenPacket::table(*packet_id, rec.len());
-            pkt.extend_from_slice(rec);
-            Some(pkt)
+        Wire::Table { packet_id } => append_packet(batch, PacketTy::Table, *packet_id, rec),
+        Wire::Msg => {
+            if let Some((id, payload)) = split_record(rec) {
+                append_packet(batch, PacketTy::Msg, id, payload);
+            }
         }
-        Wire::Msg => split_record(rec).map(|(id, payload)| {
-            let mut pkt = LenPacket::msg(id, payload.len());
-            pkt.extend_from_slice(payload);
-            pkt
-        }),
     }
 }
 
 impl<T: Transport + 'static> CyclicSystem for TelemetrySystem<T> {
-    /// The end-of-cycle drain; never awaits. A coalesce tap borrows only the
-    /// newest record and pushes one latest-wins snapshot (nothing when no new
-    /// record landed); a FIFO tap pushes every record in order. Either way the
-    /// record is borrowed in place off the ring and framed per the tap's wire
-    /// form. Drops detected since the last cycle surface as
-    /// `telemetry.dropped` (snapshot lane) and `telemetry.msg_dropped` (log
-    /// lane).
     fn execute(&mut self, _now: Timestamp, _input: &mut Self::Input, output: &mut Self::Output) {
         let Some(started) = &self.started else {
             return;
         };
-        let handoff = started.handoff.clone();
+        let Some(tx) = &started.tx else {
+            return;
+        };
+        let batch = &mut self.scratch;
         for tap in &mut self.taps {
-            match tap.lane {
+            match tap.delivery {
                 // An unchanged `committed` means no new record this cycle;
-                // push nothing rather than re-sending the pinned record.
-                Lane::Coalesce { slot } => {
+                // contribute nothing rather than re-sending the pinned record.
+                Delivery::Snapshot => {
                     let committed = tap.view.committed();
                     if committed == tap.last_committed {
                         continue;
@@ -1006,34 +891,32 @@ impl<T: Transport + 'static> CyclicSystem for TelemetrySystem<T> {
                     tap.last_committed = committed;
                     // A corrupt read (unreachable in practice) counts as
                     // nothing new.
-                    if let Ok(Some(grant)) = tap.view.try_latest()
-                        && let Some(pkt) = frame_packet(&tap.wire, &grant)
-                    {
-                        handoff.push_snapshot(slot, pkt);
+                    if let Ok(Some(grant)) = tap.view.try_latest() {
+                        append_record(batch, &tap.wire, &grant);
                     }
                 }
-                // Every record, in order, onto the shared FIFO.
-                Lane::Fifo => {
+                // Every record, in order.
+                Delivery::Log => {
                     let wire = &tap.wire;
-                    let handoff = &handoff;
                     let _ = crate::port::drain_view(&mut tap.view, |rec| {
-                        if let Some(pkt) = frame_packet(wire, rec) {
-                            handoff.push_log(pkt);
-                        }
+                        append_record(batch, wire, rec);
                     });
                 }
             }
         }
-        // Surface any packets the sender's backlog forced us to drop.
-        let dropped = handoff.dropped_snapshots.load(Relaxed);
-        while self.last_dropped < dropped {
-            output.health().error("telemetry.dropped");
-            self.last_dropped += 1;
+        if batch.is_empty() {
+            return;
         }
-        let msg_dropped = handoff.dropped_logs.load(Relaxed);
-        while self.last_msg_dropped < msg_dropped {
-            output.health().error("telemetry.msg_dropped");
-            self.last_msg_dropped += 1;
+        // Swap the batch into a channel slot; the recycled buffer that comes
+        // back keeps its capacity, so the next cycle frames without
+        // allocating. A full (or closed) queue drops the whole batch instead
+        // of delaying the cycle, counted once per batch.
+        match tx.try_send_ref() {
+            Ok(mut slot) => std::mem::swap(&mut *slot, batch),
+            Err(_) => {
+                batch.clear();
+                output.health().error("telemetry.dropped");
+            }
         }
     }
 }

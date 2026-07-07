@@ -9170,6 +9170,7 @@ dependencies = [
  "serde",
  "serde_json",
  "stellarator",
+ "thingbuf",
  "thiserror 2.0.18",
  "zerocopy",
 ]

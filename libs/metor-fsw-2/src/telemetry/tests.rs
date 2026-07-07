@@ -1,9 +1,10 @@
 //! Acceptance tests for the downlink and uplink. They cover the output registry
 //! queried by instance-qualified id, the end-to-end downlink against a deterministic
-//! in-memory transport (one announce per tapped entry, then `Table` packets),
-//! prefix disambiguation between two instances of one system type, subset
-//! filtering, the non-blocking drop-on-full policy and its health counter, the
-//! non-coalescing message FIFO, and uplink subscription and routing.
+//! in-memory transport (one announce per tapped entry, then batched `Table`
+//! packets), prefix disambiguation between two instances of one system type,
+//! subset filtering, the non-blocking drop-on-full policy and its health
+//! counter, non-coalescing message batching, and uplink subscription and
+//! routing.
 
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -105,6 +106,8 @@ impl CyclicSystem for Consumer {
 
 struct MockInner {
     announces: Mutex<Vec<(PacketId, Vec<ComponentMetadata>)>>,
+    /// Each sent batch, split back into its individual length-prefixed packets
+    /// so assertions can address one packet at a time.
     packets: Mutex<Vec<LenPacket>>,
     /// When set, `send` never completes, so the drop test can saturate the queue.
     block: bool,
@@ -141,13 +144,21 @@ impl Transport for MockTransport {
         Ok(())
     }
 
-    async fn send(&mut self, pkt: LenPacket) -> Result<(), TransportError> {
+    async fn send(&mut self, buf: Vec<u8>) -> Result<Vec<u8>, TransportError> {
         if self.inner.block {
-            // Park forever; the cycle keeps running and the hand-off slots fill.
+            // Park forever; the cycle keeps running and the batch queue fills.
             std::future::pending::<()>().await;
         }
-        self.inner.packets.lock().unwrap().push(pkt);
-        Ok(())
+        let mut packets = self.inner.packets.lock().unwrap();
+        let mut rest = &buf[..];
+        while !rest.is_empty() {
+            let len = u32::from_le_bytes(rest[..4].try_into().unwrap()) as usize;
+            let (pkt, tail) = rest.split_at(4 + len);
+            packets.push(LenPacket { inner: pkt.to_vec() });
+            rest = tail;
+        }
+        drop(packets);
+        Ok(buf)
     }
 }
 
@@ -409,8 +420,8 @@ async fn subset_mode_filters() {
 #[cfg(not(miri))]
 #[stellarator::test]
 async fn drop_policy_never_blocks_and_counts() {
-    // A transport whose `send` never completes. After the first take, slots stay
-    // full and every later snapshot overwrites an un-sent one, which counts as a drop.
+    // A transport whose `send` never completes. After the first take the batch
+    // queue stays full, and every later cycle's batch is dropped and counted.
     let mock = MockTransport::new(true);
 
     let mut b = Coordinator::builder(sim_config());
@@ -444,28 +455,25 @@ async fn drop_policy_never_blocks_and_counts() {
 }
 
 // ---------------------------------------------------------------------------
-// 6. Message downlink. Every record is forwarded as a self-describing `Msg`
-//    packet in FIFO order, never coalesced and never announced, and the message
-//    FIFO and the component hand-off share the one sender independently.
+// 6. Message downlink. Every record is framed as a self-describing `Msg`
+//    packet in FIFO order, never coalesced and never announced, and tables and
+//    messages ride the one batch through the one sender.
 // ---------------------------------------------------------------------------
 
 #[cfg(not(miri))]
 #[stellarator::test]
 async fn message_downlink_fifo_no_coalesce() {
-    use std::sync::atomic::{AtomicBool, Ordering::Release};
-
     use metor_fsw_ring::{Config, NoWake, RingBuffer};
     use metor_proto::types::{Msg, OwnedPacket};
     use metor_proto_wkt::{
         SequenceChannelSpec, SequenceCommand, SequenceCommandKind, SequenceRegistry,
     };
-    use stellarator::sync::WaitQueue;
 
-    use crate::message::{LOG_DEPTH, MAX_MSG_BYTES, MsgOut, split_record};
+    use crate::message::{LOG_DEPTH, MAX_MSG_BYTES, MsgOut};
     use crate::port::capacity_for;
     use crate::registry::{EntrySchema, RegistryEntry};
 
-    use super::{HandOff, run_sender};
+    use super::{BATCH_QUEUE_CAP, Wire, append_record, run_sender};
 
     // A by-hand message channel with the same shape the coordinator registers and
     // the telemetry message tap drains.
@@ -519,48 +527,24 @@ async fn message_downlink_fifo_no_coalesce() {
         })
         .expect("emit abort");
 
-    // The one two-lane hand-off (one sender drains both lanes).
-    let wq = Arc::new(WaitQueue::new());
-    let handoff = Arc::new(HandOff::new(1, wq.clone()));
-
-    // A component snapshot through the latest-wins hand-off, to prove the two
-    // queues are independent and the one sender forwards both.
-    let mut table = LenPacket::table([9, 9], 4);
-    table.extend_from_slice(&[1, 2, 3, 4]);
-    handoff.push_snapshot(0, table);
-
-    // Drain every message record into the FIFO, exactly as the in-cycle tap does.
+    // Frame one cycle's batch exactly as the in-cycle stage does: a component
+    // snapshot as a `Table`, then every drained message record in order.
+    let mut batch = Vec::new();
+    append_record(&mut batch, &Wire::Table { packet_id: [9, 9] }, &[1, 2, 3, 4]);
     let mut scratch = Vec::new();
     while let Ok(true) = view.try_read_into(&mut scratch) {
-        let (id, payload) = split_record(&scratch).expect("split record");
-        let mut pkt = LenPacket::msg(id, payload.len());
-        pkt.extend_from_slice(payload);
-        handoff.push_log(pkt);
+        append_record(&mut batch, &Wire::Msg, &scratch);
     }
 
-    // Drive the async sender. With no component taps there are no announces; it
-    // just forwards each queued packet.
+    // Queue the batch and close the channel; the sender drains what is queued,
+    // then exits, so the join below is deterministic. With no component taps
+    // there are no announces.
+    let (tx, rx) = thingbuf::mpsc::channel::<Vec<u8>>(BATCH_QUEUE_CAP);
+    tx.try_send(batch).expect("queue has room");
+    drop(tx);
     let mock = MockTransport::new(false);
     let rec = mock.inner.clone();
-    let stop = Arc::new(AtomicBool::new(false));
-    let handle = stellarator::spawn(run_sender(
-        mock,
-        Vec::new(),
-        handoff,
-        wq.clone(),
-        stop.clone(),
-    ));
-
-    // Let the sender drain (it sends synchronously, then parks), then stop and join.
-    for _ in 0..32 {
-        if rec.packets.lock().unwrap().len() >= 4 {
-            break;
-        }
-        stellarator::yield_now().await;
-    }
-    stop.store(true, Release);
-    wq.wake_all();
-    let _ = handle.await;
+    let _ = stellarator::spawn(run_sender(mock, Vec::new(), rx)).await;
 
     // No message is announced (self-describing); only the component tap would
     // announce, and we passed none.
@@ -577,8 +561,8 @@ async fn message_downlink_fifo_no_coalesce() {
         .map(|p| OwnedPacket::parse(p.inner[4..].to_vec()).expect("parse packet"))
         .collect();
 
-    // The component snapshot came through as a `Table`, proving the shared sender
-    // drains both hand-offs.
+    // The component snapshot came through as a `Table`, proving tables and
+    // messages ride the one batch.
     assert_eq!(
         parsed
             .iter()
@@ -721,51 +705,6 @@ async fn table_log_entry_downlinks_every_record() {
     );
     let want: Vec<f64> = (1..=(3 * cycles)).map(|i| i as f64).collect();
     assert_eq!(omegas, want, "in order");
-}
-
-// ---------------------------------------------------------------------------
-// 7. The message FIFO is bounded. Past capacity it drops the oldest record
-//    (never the newest) and counts each drop.
-// ---------------------------------------------------------------------------
-
-#[test]
-fn message_handoff_drops_oldest_on_overflow() {
-    use std::sync::atomic::Ordering::Relaxed;
-
-    use stellarator::sync::WaitQueue;
-
-    use super::{HandOff, LOG_HANDOFF_CAP};
-
-    let wq = Arc::new(WaitQueue::new());
-    let handoff = HandOff::new(0, wq);
-
-    // Push two past capacity; each packet carries a unique id byte so we can identify it.
-    let overflow = 2usize;
-    for i in 0..(LOG_HANDOFF_CAP + overflow) {
-        handoff.push_log(LenPacket::msg([(i & 0xff) as u8, (i >> 8) as u8], 0));
-    }
-
-    assert_eq!(
-        handoff.dropped_logs.load(Relaxed) as usize,
-        overflow,
-        "two records past cap were dropped"
-    );
-
-    let (snapshots, drained) = handoff.drain();
-    assert!(snapshots.is_empty(), "nothing on the snapshot lane");
-    assert_eq!(
-        drained.len(),
-        LOG_HANDOFF_CAP,
-        "the FIFO is bounded to its cap"
-    );
-    // Records 0 and 1 were shed from the front; the queue holds records
-    // `overflow..` in order, so the newest survive.
-    let first_id = [drained[0].inner[5], drained[0].inner[6]];
-    assert_eq!(
-        first_id,
-        [(overflow & 0xff) as u8, (overflow >> 8) as u8],
-        "the oldest records were dropped, not the newest"
-    );
 }
 
 /// The uplink subscribes to exactly its configured msg set. Subscription,
