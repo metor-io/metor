@@ -5,6 +5,8 @@ use quote::quote;
 use syn::{Attribute, Meta};
 use syn::{DeriveInput, Generics, Ident};
 
+/// Derive input for [`as_vtable_impl`], parsed from the shared
+/// `#[fsw(...)]`/`#[metor_fsw(...)]` attribute surface.
 #[derive(Debug, FromDeriveInput)]
 #[darling(
     attributes(fsw, metor_fsw),
@@ -16,40 +18,43 @@ pub struct AsVTable {
     generics: Generics,
     data: ast::Data<(), crate::Field>,
     parent: Option<String>,
-    /// Frame name (frames.md §1.3); folds into `parent` as the component prefix.
+    /// Alternative spelling of `parent`; a frame's name doubles as the
+    /// component prefix of its fields.
     name: Option<String>,
     #[darling(default, rename = "group")]
     _group: darling::util::Ignored,
-    /// Tolerated here; consumed by the bundling `Frame` derive (E4 opt-out).
+    /// Accepted so the shared attribute parses; only the `Frame` derive
+    /// acts on it.
     #[darling(default, rename = "no_timestamp")]
     _no_timestamp: darling::util::Ignored,
 }
 
+/// Returns the first identifier inside a `#[repr(...)]` attribute, if any.
 fn extract_repr_type(attrs: &[Attribute]) -> Option<Ident> {
     for attr in attrs {
         if attr.path().is_ident("repr")
-            && let Meta::List(meta_list) = attr.meta.clone() {
-                for token in meta_list.tokens {
-                    if let Ok(ident) = syn::parse2::<Ident>(token.into()) {
-                        return Some(ident);
-                    }
+            && let Meta::List(meta_list) = attr.meta.clone()
+        {
+            for token in meta_list.tokens {
+                if let Ok(ident) = syn::parse2::<Ident>(token.into()) {
+                    return Some(ident);
                 }
             }
+        }
     }
     None
 }
 
-/// Shared `AsVTable` code generator.
+/// Generates an `AsVTable` impl for the derive input.
 ///
-/// `frame_id` is `None` for the standalone `#[derive(AsVTable)]` and
-/// `Some(<ComponentId expr>)` for `#[derive(Frame)]`, which wraps every member's
-/// op chain in a `frame(...)` op so each realized component inherits the frame id.
+/// When `frame_id` is given, every emitted field builder is wrapped in a
+/// `with_frame` op so the realized components inherit that frame id; when it
+/// is `None` the fields stand on their own. `crate_name` is the path prefix
+/// the generated code uses to reach the framework's re-exports.
 ///
-/// The `#[metor_fsw(timestamp)]` field is suppressed as a standalone component on
-/// both paths (frames.md Q1) — it contributes only the shared timestamp source.
-///
-/// `crate_name` is the root path to the crate re-exporting the named trait surface
-/// (`metor-fsw` standalone, `metor-fsw-2` when bundled by `#[derive(Frame)]`).
+/// A struct field marked `#[fsw(timestamp)]` never becomes a component of its
+/// own. It is captured as a raw table and attached to every other field as
+/// the shared timestamp source.
 pub fn as_vtable_impl(
     input: &DeriveInput,
     frame_id: Option<TokenStream2>,
@@ -73,6 +78,7 @@ pub fn as_vtable_impl(
     });
 
     match data {
+        // A unit enum is a single raw field typed after its `#[repr(...)]`.
         ast::Data::Enum(_) => {
             let name = parent.unwrap_or_else(|| ident.to_string());
             let Some(repr_type) = extract_repr_type(&input.attrs) else {
@@ -119,7 +125,8 @@ pub fn as_vtable_impl(
                     .map(move |field| field.with_timestamp(timestamp_source.clone()))
                 }
             });
-            // The timestamp field is the source only; never emitted as a component.
+            // The timestamp field feeds the source above and is filtered out
+            // of the component fields.
             let vtable_items = fields.fields.iter().filter(|f| !f.timestamp).map(|field| {
                 let ty = &field.ty;
                 let name = field.component_name();
@@ -135,8 +142,9 @@ pub fn as_vtable_impl(
                     )
                 }
             });
-            // Dynamic member-template form (frames.md §4): leaves are
-            // `path_component`, names are relative to the element base.
+            // `element_fields` names members relative to a plain string prefix
+            // instead of a component path, so a dynamic container can stamp
+            // out copies under names chosen at runtime.
             let element_items = fields.fields.iter().filter(|f| !f.timestamp).map(|field| {
                 let ty = &field.ty;
                 let name = field.component_name();

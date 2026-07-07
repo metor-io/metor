@@ -1,32 +1,52 @@
-//! Work-Package 7 — the telemetry downlink (telemetry.md §3–§7).
+//! Streams output buffers to a ground endpoint and relays ground commands
+//! back in.
 //!
-//! [`TelemetrySystem`] is the output registry's first consumer: an ordinary
-//! [`CyclicSystem`] registered **last**, so its end-of-cycle `execute` snapshots the
-//! freshest record of every tapped output buffer and re-emits each as a metor-proto
-//! `Table` packet referencing a once-announced (instance-prefixed) `VTable` — the same
-//! wire format `metor-db` ingests. Because a frame's ring payload *is* its table bytes,
-//! there is no serialization step; the bytes a system committed are the bytes on the wire.
+//! Two systems live here. [`TelemetrySystem`] is the downlink, an ordinary
+//! [`CyclicSystem`] registered after every other cyclic system. Its
+//! end-of-cycle `execute` copies the pending records of every tapped output
+//! buffer into a bounded hand-off, and a spawned sender task drains the
+//! hand-off onto the wire. [`UplinkSystem`] is the read twin, an
+//! [`AsyncSystem`] that owns its own connection, subscribes to a configured
+//! set of message ids, and republishes each inbound `Msg` packet on an
+//! ordinary message output port, so consumers receive commands over explicit
+//! edges like any other message.
 //!
-//! ## Cycle / sender split (telemetry.md §4)
+//! # Cycle / sender split
 //!
-//! The control cycle is single-threaded and synchronous; the socket is async. So the
-//! in-cycle stage only *snapshots* (a `memcpy` per tapped buffer with a fresh record)
-//! into a bounded, per-tap-coalescing hand-off, and a `stellarator::spawn`ed sender task
-//! drains it and does the awaiting I/O. The cycle never blocks on the link: a backed-up
-//! transport just causes snapshots to overwrite un-sent ones (latest-wins), bumping a
-//! `telemetry.dropped` health counter. Loss, never delay — the same overrun philosophy
-//! as the `Overwrite` rings one level down.
+//! The control cycle is single-threaded and synchronous while the socket is
+//! async, so the downlink is split in two. The in-cycle stage only copies
+//! records into the hand-off and never blocks on the link; the sender task
+//! does all the awaiting I/O. When the transport backs up, data is dropped
+//! rather than delayed, and every drop is counted on the system's health
+//! output.
 //!
-//! ## Message downlink (`docs/messages.md` §3)
+//! # Taps, lanes, and wire framing
 //!
-//! Beside the component-frame snapshots, telemetry also taps every Postcard registry
-//! entry and downlinks each `(id, postcard)` record as an `OwnedPacket::Msg` — **no
-//! announce** (a message is self-describing; its 2-byte id *is* its schema). Messages are
-//! an event/command **log**, so they must never be coalesced like the latest-wins
-//! component hand-off: the in-cycle stage drains **every** record of each message ring
-//! into a separate non-coalescing FIFO ([`MsgHandOff`] — one bounded `VecDeque` shared
-//! across all message taps, drop-**oldest** on overflow + a `telemetry.msg_dropped`
-//! counter), and the same async sender drains that FIFO and sends each as a `Msg` packet.
+//! Each tapped registry entry becomes one tap, and the entry's two axes drive
+//! it independently. Its [`Delivery`](crate::Delivery) picks the hand-off
+//! lane:
+//!
+//! * `Snapshot` entries get a dedicated coalescing slot. Only the newest
+//!   record of a cycle is pushed, a newer snapshot overwrites an older un-sent
+//!   one, and each overwrite of an occupied slot bumps the `telemetry.dropped`
+//!   counter.
+//! * `Log` entries share one bounded FIFO. Event and command records must
+//!   never be coalesced, so every drained record is queued in order and sent
+//!   verbatim. Overflow drops the oldest queued record and bumps
+//!   `telemetry.msg_dropped`.
+//!
+//! The entry's schema picks the wire framing. A table entry is sent as a
+//! `Table` packet whose payload is the ring record itself (the bytes a system
+//! committed are the bytes on the wire), referencing a `VTable` announced once
+//! on connect. A postcard entry is sent as a self-describing `Msg` packet
+//! whose id is the record's leading two bytes, with no announce step. The two
+//! axes combine freely; an every-record table log needs no extra code.
+//!
+//! # Connection lifecycle
+//!
+//! Both TCP transports connect lazily on first use, inside the async task that
+//! drives them, and neither reconnects. The first transport error ends the
+//! sender (or reader) while the in-cycle stage keeps running and drops.
 
 use std::collections::VecDeque;
 use std::sync::atomic::{
@@ -58,39 +78,36 @@ use crate::system::{
 };
 
 // ---------------------------------------------------------------------------
-// Transport (telemetry.md §7)
+// Transport
 // ---------------------------------------------------------------------------
 
-/// An async error a [`Transport`] surfaces; v1 stops downlinking on any error (the
-/// in-cycle snapshot stage keeps running and simply drops).
+/// An error surfaced by a transport. The first error stops the task driving
+/// the transport, while the in-cycle stage keeps running and drops.
 #[derive(Debug, thiserror::Error)]
 pub enum TransportError {
     /// The link is not connected (never established, or dropped).
     #[error("transport is not connected")]
     Disconnected,
-    /// An underlying I/O error, carried as its boxed source (transport-agnostic —
-    /// the TCP paths raise `stellarator`/`metor-proto-stellar` errors) so the
-    /// chain survives a `?` into anyhow/miette instead of flattening to a string.
+    /// An underlying I/O error, boxed so the source chain survives a `?` into
+    /// a caller's error type instead of flattening to a string.
     #[error("transport I/O error: {0}")]
     Io(#[source] Box<dyn std::error::Error + Send + Sync + 'static>),
 }
 
 impl TransportError {
-    /// Wrap any transport-level error as the boxed [`Io`](TransportError::Io) source
-    /// — the one conversion every TCP call site funnels through.
+    /// Box any transport-level error into [`Io`](TransportError::Io).
     fn io(e: impl std::error::Error + Send + Sync + 'static) -> Self {
         TransportError::Io(Box::new(e))
     }
 }
 
-/// Isolates the wire from the streamer (telemetry.md §7). v1 ships [`TcpTransport`];
-/// `bbq`/SHM is a documented future impl. Tests drive an in-memory mock against the
-/// same trait.
+/// The downlink's write side, isolating the wire from the streaming logic.
+/// [`TcpTransport`] is the shipped implementation; tests drive an in-memory
+/// mock against the same trait.
 #[allow(async_fn_in_trait)]
 pub trait Transport {
-    /// Announce one tap's prefixed vtable + component metadata (sent once on connect):
-    /// a `VTableMsg` followed by a `SetComponentMetadata` per component — exactly the
-    /// two steps `SinkExt::init_world` does, but with a per-instance prefix.
+    /// Announce one tap's schema, a `VTableMsg` followed by one
+    /// `SetComponentMetadata` per component. Sent once per tap on connect.
     async fn announce(
         &mut self,
         msg: &VTableMsg,
@@ -101,48 +118,42 @@ pub trait Transport {
     async fn send(&mut self, pkt: LenPacket) -> Result<(), TransportError>;
 }
 
-/// The read twin of [`Transport`] (`docs/messages.md` §4): yields the next inbound
-/// `OwnedPacket` off the connection's read half — the uplink's source of panel
-/// `SequenceCommand`s. v1 ships [`TcpRecvTransport`] (a [`PacketStream`] over the read
-/// half, the inverse of [`Transport`]'s [`PacketSink`]); tests drive an in-memory mock
-/// against the same trait. Like the sender, the reader stops on the first error
-/// (drop-on-disconnect, telemetry.md §7) — no reconnect.
+/// The read twin of [`Transport`]: yields the next inbound packet off the
+/// connection. Like the sender, a reader stops on its first error; there is no
+/// reconnect.
 #[allow(async_fn_in_trait)]
 pub trait RecvTransport {
     /// Receive the next packet, or an error if the link dropped.
     async fn recv(&mut self) -> Result<OwnedPacket<Slice<Vec<u8>>>, TransportError>;
 
-    /// Declare the message ids this transport should subscribe to on connect
-    /// (`docs/message-wiring.md` §5.2). Called once by the uplink before its first `recv`, with
-    /// the ids of its declared message-output ports. The default is a no-op (a mock ignores it).
+    /// Declare the message ids to subscribe to on connect. Called once before
+    /// the first `recv`; the default is a no-op.
     fn subscribe(&mut self, _ids: &[PacketId]) {}
 }
 
-/// A live TCP connection's write half plus the parked read half. The downlink only writes;
-/// the read half is held to keep the full socket open (the downlink does not read replies —
-/// the uplink owns its own separate connection, `docs/messages.md` §4.5).
+/// A live connection's write half plus the parked read half, which is held
+/// only to keep the full socket open; the downlink never reads replies.
 struct TcpConn {
     sink: PacketSink<OwnedWriter<TcpStream>>,
     #[allow(dead_code)]
     rx: OwnedReader<TcpStream>,
 }
 
-/// The v1 transport: connect-once to a ground/db endpoint and stream `LenPacket`s,
-/// the same path cube-sat's hand-written loop uses (telemetry.md §7). On disconnect it
-/// stops downlinking (drop-on-disconnect); automatic reconnect/backoff is future work.
+/// The TCP downlink transport: connect once to a ground endpoint and stream
+/// packets. On the first error the sender stops; there is no reconnect.
 pub struct TcpTransport {
     addr: std::net::SocketAddr,
     conn: Option<TcpConn>,
 }
 
 impl TcpTransport {
-    /// A transport that will connect to `addr` on its first announce, inside the async
-    /// sender task (connecting is async, so it cannot happen at build).
+    /// A transport that connects to `addr` on its first announce, inside the
+    /// async sender task (connecting is async, so it cannot happen at build).
     pub fn new(addr: std::net::SocketAddr) -> Self {
         Self { addr, conn: None }
     }
 
-    /// Connect lazily on first use; subsequent calls reuse the open socket.
+    /// Connect on first use; later calls reuse the open socket.
     async fn ensure(&mut self) -> Result<&PacketSink<OwnedWriter<TcpStream>>, TransportError> {
         if self.conn.is_none() {
             let stream = TcpStream::connect(self.addr)
@@ -165,10 +176,7 @@ impl Transport for TcpTransport {
         meta: &[ComponentMetadata],
     ) -> Result<(), TransportError> {
         let sink = self.ensure().await?;
-        sink.send(msg)
-            .await
-            .0
-            .map_err(TransportError::io)?;
+        sink.send(msg).await.0.map_err(TransportError::io)?;
         for m in meta {
             sink.send(&SetComponentMetadata(m.clone()))
                 .await
@@ -180,41 +188,34 @@ impl Transport for TcpTransport {
 
     async fn send(&mut self, pkt: LenPacket) -> Result<(), TransportError> {
         let sink = self.ensure().await?;
-        sink.send(pkt)
-            .await
-            .0
-            .map_err(TransportError::io)?;
+        sink.send(pkt).await.0.map_err(TransportError::io)?;
         Ok(())
     }
 }
 
-/// The v1 uplink read path (`docs/messages.md` §4.2/§4.5): the uplink's **own** connection to
-/// the metor-db broker, mirroring cube-sat (`examples/cube-sat/src/main.rs:541-559`). It connects
-/// lazily on first `recv` (inside the uplink system's async task, as the downlink's
-/// [`TcpTransport`] connects on first announce), then — crucially — **subscribes** to the panel's
-/// command stream: the db relays a message id only to clients that send a [`MsgStream`] for it
-/// (`metor-db` `MsgStream` handler), so without this the uplink would read nothing. The write half
-/// (the [`PacketSink`] the subscription is sent over) is held for the connection's lifetime; the
-/// read half is a [`PacketStream`] yielding the streamed Msgs. A dropped socket fails `recv` and
-/// stops the reader (no reconnect); uplink and downlink no longer share a socket (shared link is
-/// deferred, §4.5).
+/// The TCP read transport: the uplink's own connection, distinct from the
+/// downlink's. It connects lazily on the first `recv`, then subscribes to the
+/// configured message ids; the broker relays a message id only to clients that
+/// sent a [`MsgStream`] for it, so without the subscription the uplink would
+/// read nothing. The write half carries the subscription and is held for the
+/// connection's lifetime; the read half yields the streamed msgs. A dropped
+/// socket fails `recv` and ends the reader; there is no reconnect.
 pub struct TcpRecvTransport {
     addr: std::net::SocketAddr,
     stream: Option<PacketStream<OwnedReader<TcpStream>>>,
-    /// The write half, held open so the db keeps streaming (it is the channel the [`MsgStream`]
-    /// subscription was sent on; dropping it could half-close the socket and end the stream).
+    /// The write half, held open because it carried the subscription; dropping
+    /// it could half-close the socket and end the stream.
     #[allow(dead_code)]
     sink: Option<PacketSink<OwnedWriter<TcpStream>>>,
-    /// The message ids to subscribe to on connect (`docs/message-wiring.md` §5.2), set by
-    /// [`subscribe`](RecvTransport::subscribe) before the first `recv`. Empty subscribes
-    /// to nothing (the uplink warns about an empty config; there is no fallback id).
+    /// The message ids to subscribe to on connect, set by
+    /// [`subscribe`](RecvTransport::subscribe) before the first `recv`. Empty
+    /// subscribes to nothing.
     subscribe_ids: Vec<PacketId>,
 }
 
 impl TcpRecvTransport {
-    /// A reader that will connect to `addr` (the metor-db broker) and subscribe on its first
-    /// `recv` (connecting is async, so it cannot happen at build). The uplink's own connection,
-    /// distinct from the downlink's.
+    /// A reader that connects to `addr` and subscribes on its first `recv`
+    /// (connecting is async, so it cannot happen at build).
     pub fn new(addr: std::net::SocketAddr) -> Self {
         Self {
             addr,
@@ -224,17 +225,18 @@ impl TcpRecvTransport {
         }
     }
 
-    /// Connect lazily on first use, send one [`MsgStream`] subscription per configured id,
-    /// then reuse the open read half. Subsequent calls reuse the established stream.
-    async fn ensure(&mut self) -> Result<&mut PacketStream<OwnedReader<TcpStream>>, TransportError> {
+    /// Connect on first use and send one [`MsgStream`] subscription per
+    /// configured id; later calls reuse the open stream.
+    async fn ensure(
+        &mut self,
+    ) -> Result<&mut PacketStream<OwnedReader<TcpStream>>, TransportError> {
         if self.stream.is_none() {
             let stream = TcpStream::connect(self.addr)
                 .await
                 .map_err(TransportError::io)?;
             let (rx, tx) = stream.split();
-            // Subscribe to the panel's command stream before reading (`docs/messages.md` §4.4):
-            // the db only forwards a message id to clients that asked for it. Mirrors cube-sat
-            // (`examples/cube-sat/src/main.rs:555`).
+            // Subscribe before reading anything; the broker only forwards a
+            // message id to clients that asked for it.
             let sink = PacketSink::new(tx);
             for msg_id in self.subscribe_ids.clone() {
                 sink.send(&MsgStream { msg_id })
@@ -267,14 +269,14 @@ impl RecvTransport for TcpRecvTransport {
 // Configuration
 // ---------------------------------------------------------------------------
 
-/// Which outputs to tap (telemetry.md §3).
+/// Which registry entries the downlink taps.
 #[derive(Clone, Debug)]
 pub enum TelemetryMode {
-    /// Tap every registry entry: every system's user frames *and* their implicit
+    /// Tap every entry: every system's user frames and their implicit
     /// `health`/`log`, plus the coordinator-owned `health`/`log`/`status`.
     All,
-    /// Tap only the entries whose instance name or frame name matches the configured
-    /// lists (matching either is enough).
+    /// Tap only the entries whose instance name or frame name appears in the
+    /// configured lists; matching either is enough.
     Subset {
         instances: Vec<String>,
         frames: Vec<String>,
@@ -282,10 +284,9 @@ pub enum TelemetryMode {
 }
 
 impl TelemetryMode {
-    /// ONE matcher for every entry kind: the `frames` subset list matches
-    /// [`RegistryEntry::name`], which covers both frame names (`F::NAME` — the same
-    /// string a frame id hashes) and channel names; instance matching is identical
-    /// for both.
+    /// Whether `entry` is tapped. The `frames` list matches
+    /// [`RegistryEntry::name`], which covers frame names and channel names
+    /// alike.
     fn matches(&self, entry: &RegistryEntry) -> bool {
         match self {
             TelemetryMode::All => true,
@@ -297,22 +298,20 @@ impl TelemetryMode {
     }
 }
 
-/// The telemetry downlink configuration [`TelemetrySystem::new`] is constructed
-/// from. Programmatic users (and every mock-transport test) build one directly and
-/// register the system like any other:
-/// `builder.add_cyclic(TelemetrySystem::new(config))`.
+/// The configuration [`TelemetrySystem::new`] is constructed from.
+/// Programmatic users build one directly and register the system like any
+/// other: `builder.add_cyclic(TelemetrySystem::new(config))`.
 pub struct TelemetryConfig<T: Transport> {
-    /// Where the snapshots go (TCP in v1, a mock in tests).
+    /// Where the snapshots go.
     pub transport: T,
     /// Which outputs to tap.
     pub mode: TelemetryMode,
 }
 
-/// The wiring params of the built-in TCP downlink (`type="TcpDownlink"`): the ground
-/// address plus an optional tap subset. Both lists absent ⇒ [`TelemetryMode::All`];
-/// either present ⇒ [`TelemetryMode::Subset`] (an entry matches if its instance *or*
-/// its frame/channel name is listed). Sequence params are child nodes
-/// (`docs/design-kdl-serde.md`):
+/// Wiring parameters for the built-in TCP downlink (`type="TcpDownlink"`): the
+/// ground address plus an optional tap subset. With both lists absent every
+/// entry is tapped; with either present an entry is tapped when its instance
+/// or its frame/channel name is listed.
 ///
 /// ```kdl
 /// system "telemetry" type="TcpDownlink" addr="127.0.0.1:2240" {
@@ -322,7 +321,7 @@ pub struct TelemetryConfig<T: Transport> {
 /// ```
 #[derive(serde::Serialize, serde::Deserialize, Debug, Clone)]
 pub struct DownlinkParams {
-    /// The TCP address of the ground/db endpoint the downlink streams to.
+    /// The TCP address of the ground endpoint the downlink streams to.
     pub addr: std::net::SocketAddr,
     /// Instance names to tap; `None` (with `frames` also `None`) taps everything.
     #[serde(default)]
@@ -333,7 +332,7 @@ pub struct DownlinkParams {
 }
 
 impl DownlinkParams {
-    /// Project the two optional subset lists onto the runtime [`TelemetryMode`].
+    /// Project the two optional subset lists onto a [`TelemetryMode`].
     fn mode(&self) -> TelemetryMode {
         match (&self.instances, &self.frames) {
             (None, None) => TelemetryMode::All,
@@ -345,9 +344,9 @@ impl DownlinkParams {
     }
 }
 
-/// The registry entry point of the built-in TCP downlink: data params in, lazy
-/// transport out ([`TcpTransport::new`] connects on first announce inside the async
-/// sender task, so nothing blocks here).
+/// The registry entry point of the built-in TCP downlink. The transport is
+/// lazy ([`TcpTransport::new`] connects on first announce inside the sender
+/// task), so nothing blocks here.
 impl BuildSystem for TelemetrySystem<TcpTransport> {
     type Params = DownlinkParams;
 
@@ -360,13 +359,14 @@ impl BuildSystem for TelemetrySystem<TcpTransport> {
     }
 }
 
-/// The wiring params of the built-in TCP uplink (`type="TcpUplink"`): the address of
-/// the metor-db broker plus the message types to relay. Each `msgs` token is a
-/// [`NamedMsg::NAME`] resolved against the registry's [`MsgTable`](crate::MsgTable)
-/// (`Registry::register_msg` — the wkt set is pre-seeded); the uplink subscribes
-/// to exactly those ids and mints one ordinary message output port per msg, so
-/// `connect "uplink" -> … msg="…"` edges resolve like any other. No `msgs` child
-/// means the uplink relays nothing (and warns) — there is no built-in default set.
+/// Wiring parameters for the built-in TCP uplink (`type="TcpUplink"`): the
+/// broker address plus the message types to relay. Each `msgs` token is a
+/// [`NamedMsg::NAME`] resolved against the registry's
+/// [`MsgTable`](crate::MsgTable); the uplink subscribes to exactly those ids
+/// and mints one ordinary message output port per msg, so
+/// `connect "uplink" -> … msg="…"` edges resolve like any other. No `msgs`
+/// child means the uplink relays nothing (and warns); there is no built-in
+/// default set.
 ///
 /// ```kdl
 /// system "uplink" type="TcpUplink" addr="127.0.0.1:2241" {
@@ -375,17 +375,17 @@ impl BuildSystem for TelemetrySystem<TcpTransport> {
 /// ```
 #[derive(serde::Serialize, serde::Deserialize, Debug, Clone)]
 pub struct UplinkParams {
-    /// The TCP address of the metor-db broker the uplink subscribes to.
+    /// The TCP address of the broker the uplink subscribes to.
     pub addr: std::net::SocketAddr,
     /// The [`NamedMsg::NAME`] tokens of the messages to relay.
     #[serde(default)]
     pub msgs: Option<Vec<String>>,
 }
 
-/// The registry entry point of the built-in TCP uplink ([`TcpRecvTransport::new`] is
-/// as lazy as the downlink's transport — it connects and subscribes on first `recv`).
-/// The `msgs` name tokens resolve in [`configure`](BuildSystem::configure), where the
-/// host's msg table is in scope.
+/// The registry entry point of the built-in TCP uplink. The transport is as
+/// lazy as the downlink's, connecting and subscribing on the first `recv`. The
+/// `msgs` name tokens resolve in [`configure`](BuildSystem::configure), where
+/// the host's msg table is in scope.
 impl BuildSystem for UplinkSystem<TcpRecvTransport> {
     type Params = UplinkParams;
 
@@ -403,7 +403,8 @@ impl BuildSystem for UplinkSystem<TcpRecvTransport> {
                     available: ctx.msgs.names(),
                 });
             };
-            // Idempotent: a duplicate token is one port, not a DuplicateRegistryKey.
+            // A duplicate token folds into one port instead of a duplicate-key
+            // error.
             if !self.msgs.iter().any(|&(_, existing)| existing == id) {
                 self.msgs.push((name, id));
             }
@@ -413,34 +414,26 @@ impl BuildSystem for UplinkSystem<TcpRecvTransport> {
 }
 
 // ---------------------------------------------------------------------------
-// Hand-off (the bounded, per-tap-coalescing queue, telemetry.md §4)
+// Hand-off
 // ---------------------------------------------------------------------------
 
-/// The bound on the shared Log-lane FIFO. A backed-up link drops the **oldest**
-/// queued record past this depth (and counts it), bounding memory while keeping the
-/// link's most recent log of events/commands.
+/// The bound on the shared log-lane FIFO. Past this depth the oldest queued
+/// record is dropped (and counted), bounding memory while keeping the most
+/// recent events and commands.
 const LOG_HANDOFF_CAP: usize = 1024;
 
-/// THE hand-off (C4): one struct, one wait queue, one sender — two lanes keyed on
-/// the entry's [`Delivery`](crate::Delivery) axis.
-///
-/// **Snapshot lane** — one coalescing slot per Snapshot tap: a newer snapshot
-/// overwrites an older un-sent one (latest-wins — the Overwrite ring semantics, one
-/// level up); overwriting an *occupied* slot counts a drop (`telemetry.dropped`).
-///
-/// **Log lane** — one bounded FIFO shared by every Log tap: an event/command record
-/// must never be coalesced, so every drained record is appended in order and
-/// forwarded verbatim (cross-channel order is irrelevant — each record
-/// self-addresses). Overflow drops the **oldest** and counts it
-/// (`telemetry.msg_dropped` — the health key is kept).
+/// The bounded hand-off between the cycle and the sender: one coalescing slot
+/// per snapshot tap and one FIFO shared by every log tap. The module docs tell
+/// the lane story; the methods here implement it without ever blocking the
+/// cycle side.
 struct HandOff {
-    /// Snapshot lane: one coalescing slot per Snapshot tap.
+    /// Snapshot lane: one coalescing slot per snapshot tap.
     slots: Mutex<Vec<Option<LenPacket>>>,
-    /// Log lane: one bounded FIFO shared by every Log tap.
+    /// Log lane: one bounded FIFO shared by every log tap.
     fifo: Mutex<VecDeque<LenPacket>>,
-    /// Set when either lane is filled; cleared by the sender when it parks. Just
-    /// avoids busy spinning — a missed wake is harmless because the sender always
-    /// drains both lanes fully.
+    /// Set when either lane is filled, cleared by the sender before it parks.
+    /// This only avoids busy spinning; a missed wake is harmless because the
+    /// sender always drains both lanes fully.
     pending: AtomicBool,
     /// Snapshots dropped by coalescing overwrite (surfaced as `telemetry.dropped`).
     dropped_snapshots: AtomicU64,
@@ -462,8 +455,8 @@ impl HandOff {
         }
     }
 
-    /// Cycle side (never blocks): coalesce `pkt` into `slot`, counting a drop if it
-    /// overwrote an un-sent packet, then wake the sender.
+    /// Cycle side, never blocks: coalesce `pkt` into `slot`, counting a drop
+    /// if it overwrote an un-sent packet, then wake the sender.
     fn push_snapshot(&self, slot: usize, pkt: LenPacket) {
         {
             let mut slots = self.slots.lock().expect("handoff poisoned");
@@ -476,8 +469,9 @@ impl HandOff {
         self.wq.wake_all();
     }
 
-    /// Cycle side (never blocks): append `pkt` to the Log lane, dropping the oldest
-    /// queued record (and counting it) past [`LOG_HANDOFF_CAP`], then wake the sender.
+    /// Cycle side, never blocks: append `pkt` to the log lane, dropping the
+    /// oldest queued record (and counting it) past [`LOG_HANDOFF_CAP`], then
+    /// wake the sender.
     fn push_log(&self, pkt: LenPacket) {
         {
             let mut fifo = self.fifo.lock().expect("handoff poisoned");
@@ -491,8 +485,8 @@ impl HandOff {
         self.wq.wake_all();
     }
 
-    /// Sender side: take every pending packet from both lanes
-    /// `(snapshots, log records)` — drops the locks before any `.await`.
+    /// Sender side: take every pending packet from both lanes as
+    /// `(snapshots, log records)`, dropping the locks before any `.await`.
     fn drain(&self) -> (Vec<LenPacket>, Vec<LenPacket>) {
         let snapshots = {
             let mut slots = self.slots.lock().expect("handoff poisoned");
@@ -507,35 +501,34 @@ impl HandOff {
 }
 
 // ---------------------------------------------------------------------------
-// Uplink — the command-plane ingest system (`docs/messages.md` §4.4)
+// Uplink
 // ---------------------------------------------------------------------------
 
-/// Idle pause one [`UplinkSystem::run`] pass takes once its link has dropped, so the
-/// coordinator's async-run loop does not busy-spin a dead reader (teardown cancels the task
-/// via its drop guard regardless).
+/// How long one [`UplinkSystem::run`] pass sleeps once its link has dropped,
+/// so the async-run loop does not busy-spin a dead reader (teardown cancels
+/// the task regardless).
 const UPLINK_IDLE: Duration = Duration::from_millis(50);
 
-/// The uplink's output bundle: the two implicit health/log ports **first**, then a
-/// [`MsgFanOut`] holding one ordinary message output **per configured msg** — fully
-/// normal message producers, no bespoke command-bus capability. A consumer receives
-/// a msg only over an explicit edge (`connect "uplink" -> … msg="…"`, A2), and every
-/// minted port is untelemetered (inbound control is never echoed on the downlink).
+/// The uplink's output bundle: the two implicit health/log ports first, then a
+/// [`MsgFanOut`] holding one ordinary message output per configured msg. A
+/// consumer receives a msg only over an explicit edge, and every minted port
+/// is untelemetered, so inbound control is never echoed back on the downlink.
 ///
-/// Hand-written (not `Out<...>` + derive) because the fan-out's port count is
-/// config-determined: [`MsgFanOut::bind`] drains every ring the source still holds,
-/// so the minted ports must be the descriptor's *trailing* outputs — the reverse of
-/// the [`Out`] convention (user ports first). The static [`decls`](SystemOutput::decls)
-/// carry only health/log (the empty-config shape); the per-instance msg ports come
-/// from [`UplinkSystem::instance_descriptor`], which appends them in the same
-/// config order the bind walk pops rings, keeping the positional contract.
+/// Hand-written rather than derived because the fan-out's port count is
+/// decided by configuration. [`MsgFanOut::bind`] drains every ring the source
+/// still holds, so the minted ports must be the descriptor's trailing outputs,
+/// the reverse of the [`Out`] convention of user ports first. The static
+/// [`decls`](SystemOutput::decls) carry only health and log (the empty-config
+/// shape); [`UplinkSystem::instance_descriptor`] appends the msg ports in the
+/// same config order the bind walk pops rings, keeping the positional
+/// contract.
 pub struct UplinkOut {
     fan: MsgFanOut,
     health: HealthPort,
 }
 
 impl UplinkOut {
-    /// Disjoint borrows of the minted ports and the health handle — the
-    /// [`Out::split`] mirror.
+    /// Disjoint borrows of the minted ports and the health handle.
     fn split(&mut self) -> (&mut MsgFanOut, &mut HealthPort) {
         (&mut self.fan, &mut self.health)
     }
@@ -562,7 +555,8 @@ impl BindPorts for UplinkOut {
     }
 }
 
-/// The uplink's (empty) input bundle — it sources commands from its own connection, not edges.
+/// The uplink's empty input bundle; commands come from its own connection, not
+/// edges.
 pub struct UplinkIn;
 
 impl SystemInput for UplinkIn {
@@ -577,31 +571,33 @@ impl BindPorts for UplinkIn {
     }
 }
 
-/// The command-plane ingest system (`docs/messages.md` §4.4): the read twin of
-/// [`TelemetrySystem`], an ordinary [`AsyncSystem`] that owns its **own** [`RecvTransport`]
-/// connection (§4.5) and relays each subscribed wire Msg onto its matching minted output.
-/// A pure pass-through for **any** message id: the forward set is the instance's config
-/// (`msgs`, or [`with_msg`](Self::with_msg) programmatically), never a compiled-in list,
-/// and payloads are forwarded verbatim — each consumer's [`MsgIn`](crate::MsgIn) drain
-/// decodes (and discards garbage) exactly as on any other message edge.
+/// The command ingest system, the read twin of [`TelemetrySystem`]: an
+/// ordinary [`AsyncSystem`] that owns its own [`RecvTransport`] connection and
+/// relays each subscribed inbound msg onto its matching minted output. It is a
+/// pure pass-through for any message id: the forward set is per-instance
+/// configuration (`msgs`, or [`with_msg`](Self::with_msg) programmatically),
+/// never a compiled-in list, and payloads are forwarded verbatim, leaving each
+/// consumer's own drain to decode (and discard garbage) exactly as on any
+/// other message edge.
 pub struct UplinkSystem<R: RecvTransport> {
-    /// The read transport, taken `None` on drop-on-disconnect (no reconnect, telemetry.md §7).
+    /// The read transport, taken to `None` on the first error; no reconnect.
     recv: Option<R>,
-    /// Whether the ground subscription has been sent (once, before the first `recv`).
+    /// Whether the subscription has been sent (once, before the first `recv`).
     subscribed: bool,
-    /// The forward set, in config order: one `(NAME, ID)` per msg. Index k is minted
-    /// output port k ([`instance_descriptor`](AsyncSystem::instance_descriptor)) and
-    /// bound writer k ([`MsgFanOut`]) — one list keys all three.
+    /// The forward set, in config order: one `(NAME, ID)` per msg. Index k is
+    /// minted output port k and bound writer k, so this one list keys the
+    /// subscription, the dispatch, and the ports.
     msgs: Vec<(&'static str, PacketId)>,
-    /// Config name tokens awaiting [`configure`](BuildSystem::configure) resolution
-    /// (the registry path; [`with_msg`](Self::with_msg) resolves statically instead).
+    /// Config name tokens awaiting resolution in
+    /// [`configure`](BuildSystem::configure); [`with_msg`](Self::with_msg)
+    /// resolves statically instead.
     unresolved: Vec<String>,
 }
 
 impl<R: RecvTransport> UplinkSystem<R> {
-    /// Construct the (pre-init) uplink from its read transport (its own connection),
-    /// with an empty forward set — add msgs via [`with_msg`](Self::with_msg) or the
-    /// registry's `msgs` params.
+    /// A pre-init uplink over its read transport, with an empty forward set;
+    /// add msgs via [`with_msg`](Self::with_msg) or the registry's `msgs`
+    /// params.
     pub fn new(recv: R) -> Self {
         Self {
             recv: Some(recv),
@@ -611,9 +607,8 @@ impl<R: RecvTransport> UplinkSystem<R> {
         }
     }
 
-    /// Add `M` to the forward set — the typed twin of the `msgs` config list:
-    /// subscribes to `M::ID` on the ground and mints an `M`-keyed output port.
-    /// Idempotent.
+    /// Add `M` to the forward set, the typed twin of the `msgs` config list:
+    /// subscribes to `M::ID` and mints an `M`-keyed output port. Idempotent.
     pub fn with_msg<M: NamedMsg>(mut self) -> Self {
         if !self.msgs.iter().any(|&(_, id)| id == M::ID) {
             self.msgs.push((M::NAME, M::ID));
@@ -629,9 +624,10 @@ impl<R: RecvTransport + 'static> System for UplinkSystem<R> {
 }
 
 impl<R: RecvTransport + 'static> AsyncSystem for UplinkSystem<R> {
-    /// The static health/log shape plus one untelemetered message port per configured
-    /// msg, in config order — the subscription, the dispatch, and the wired ports all
-    /// derive from the one `msgs` list, so they cannot diverge.
+    /// The static health/log shape plus one untelemetered message port per
+    /// configured msg, in config order. The subscription, the dispatch, and
+    /// the wired ports all derive from the one `msgs` list, so they cannot
+    /// diverge.
     fn instance_descriptor(&self) -> SystemDescriptor {
         let mut desc = Self::descriptor();
         desc.outputs.extend(
@@ -642,20 +638,21 @@ impl<R: RecvTransport + 'static> AsyncSystem for UplinkSystem<R> {
         desc
     }
 
-    /// One ingest pass (the coordinator's async-run loop calls it repeatedly): `recv` the
-    /// next packet and forward it verbatim on the minted output whose id matches. A Msg
-    /// outside the configured set bumps `uplink.unroutable` (the db should only relay
-    /// subscribed ids, so this signals a broker/config mismatch); a full ring bumps
-    /// `uplink.dropped`; Tables are silently ignored (the downlink's traffic class, never
-    /// expected here). On the first error the link is dropped (no reconnect) and subsequent
-    /// passes idle so the loop does not spin a dead reader.
+    /// One ingest pass, called repeatedly by the coordinator's async-run loop:
+    /// receive the next packet and forward it verbatim on the minted output
+    /// whose id matches. A msg outside the configured set bumps
+    /// `uplink.unroutable` (the broker should only relay subscribed ids, so
+    /// this signals a broker or config mismatch), a full ring bumps
+    /// `uplink.dropped`, and `Table` packets are silently ignored. The first
+    /// error drops the link for good, and later passes idle instead of
+    /// spinning.
     async fn run(&mut self, _input: &mut Self::Input, output: &mut Self::Output) {
         // Subscribe once, before the first read, to exactly the configured ids.
         if !self.subscribed {
             let (fan, health) = output.split();
-            // An async system has no per-cycle driver flushing its health, and an
-            // init-time log never reaches the ground (the downlink's taps resolve
-            // during init) — so warn on the first run pass and publish immediately.
+            // An async system has no per-cycle driver flushing its health, and
+            // an init-time log would be emitted before the downlink's taps
+            // resolve, so warn on the first run pass and publish immediately.
             if self.msgs.is_empty() {
                 health.log(
                     crate::health::Level::Warn,
@@ -663,8 +660,9 @@ impl<R: RecvTransport + 'static> AsyncSystem for UplinkSystem<R> {
                 );
                 health.end_cycle(Timestamp::now(), 0);
             } else if fan.len() != self.msgs.len() {
-                // One writer per configured msg is the bind contract; a mismatch
-                // means the registered descriptor and this instance diverged.
+                // One writer per configured msg is the bind contract; a
+                // mismatch means the registered descriptor and this instance
+                // diverged.
                 health.error("uplink.bind_mismatch");
                 health.end_cycle(Timestamp::now(), 0);
             }
@@ -680,7 +678,6 @@ impl<R: RecvTransport + 'static> AsyncSystem for UplinkSystem<R> {
         };
         match recv.recv().await {
             Ok(OwnedPacket::Msg(m)) => {
-                // Disjoint borrows: the forward takes the ports, the miss takes health.
                 let (fan, health) = output.split();
                 match self.msgs.iter().position(|&(_, id)| id == m.id) {
                     Some(idx) => {
@@ -695,24 +692,26 @@ impl<R: RecvTransport + 'static> AsyncSystem for UplinkSystem<R> {
                     }
                 }
             }
-            // Tables are ignored — the uplink is commands only.
+            // Tables are ignored; the uplink is commands only.
             Ok(_) => {}
-            // A dropped link (or an exhausted mock) ends the reader, like the sender.
+            // A dropped link (or an exhausted mock) ends the reader, like the
+            // sender.
             Err(_) => self.recv = None,
         }
     }
 }
 
-/// One announced tap's wire schema, moved into the sender task to replay on connect.
+/// One announced tap's wire schema, moved into the sender task to replay on
+/// connect.
 struct Announce {
     packet_id: PacketId,
     vtable: VTable,
     metadata: Vec<ComponentMetadata>,
 }
 
-/// The async sender task (telemetry.md §4): announce every Table tap once on
-/// connect, then drain the one two-lane hand-off and send. Stops downlinking on any
-/// transport error or when `stop` is set (the cycle is unaffected either way).
+/// The async sender task: announce every table tap once, then drain the
+/// hand-off and send until a transport error or `stop` ends it. The cycle side
+/// is unaffected either way.
 async fn run_sender<T: Transport>(
     mut transport: T,
     announces: Vec<Announce>,
@@ -733,8 +732,7 @@ async fn run_sender<T: Transport>(
         if stop.load(Acquire) {
             return;
         }
-        // Snapshots (latest-wins) and log records (FIFO) share the one sender; drain
-        // both lanes, park on the wait queue only when both are empty.
+        // Drain both lanes; park on the wait queue only when both are empty.
         let (pkts, logs) = handoff.drain();
         if pkts.is_empty() && logs.is_empty() {
             let _ = wq
@@ -751,21 +749,21 @@ async fn run_sender<T: Transport>(
 }
 
 // ---------------------------------------------------------------------------
-// Ports (no typed inputs; the output bundle carries the registry handle)
+// Ports
 // ---------------------------------------------------------------------------
 
-/// The telemetry system has no typed inputs (telemetry.md §3); its output bundle is a single
-/// [`AllOutputs`] receive-all field (`docs/message-wiring.md` §4) — no longer a port but the
-/// [`Capability::ReceiveAll`](crate::Capability) grant its `decl()` contributes to the
-/// descriptor. `init` reaches the registry through it, the capability earns the downlink a
-/// reader slot on every buffer at sizing time, and the derived `bind` walk skips it on the
-/// ring cursor (`AllOutputs::bind` pulls the host registry — the downlink is never dlopen'd).
+/// The downlink's output bundle: no typed ports, just the [`AllOutputs`]
+/// receive-all field. `init` reaches the output registry through it, the
+/// receive-all capability its decl contributes earns the downlink a reader
+/// slot on every buffer at sizing time, and its `bind` pulls the host registry
+/// rather than consuming a ring.
 #[derive(crate::SystemOutput)]
 pub struct TelemetryPorts {
     all: AllOutputs,
 }
 
-/// The empty input bundle (the streamer pulls outputs via the registry, not typed edges).
+/// The downlink's empty input bundle; it pulls outputs through the registry,
+/// not typed edges.
 pub struct TelemetryIn;
 
 impl SystemInput for TelemetryIn {
@@ -781,32 +779,31 @@ impl BindPorts for TelemetryIn {
 }
 
 // ---------------------------------------------------------------------------
-// The system
+// The downlink system
 // ---------------------------------------------------------------------------
 
-/// ONE resolved tap (C4): a read view into a registered buffer plus the two axes
-/// that drive it — the hand-off lane (from the entry's `delivery`) and the wire
-/// framing (from the entry's `schema`). The generic `Table × Log` combination falls
-/// out for free: FIFO lane + announced Table packets.
+/// One resolved tap: a read view into a registered buffer plus the lane and
+/// wire framing projected from the entry's delivery and schema axes.
 struct Tap {
     view: View<NoWake, NoWake>,
     lane: Lane,
     wire: Wire,
-    /// Coalesce lane only: the ring's `committed` at the last push, so a cycle with
-    /// no new record pushes nothing (the pinned newest record is not re-sent).
-    /// `u64::MAX` = nothing pushed yet.
+    /// Coalesce lane only: the ring's `committed` at the last push, so a cycle
+    /// with no new record pushes nothing (the pinned newest record is not
+    /// re-sent). `u64::MAX` means nothing pushed yet.
     last_committed: u64,
 }
 
-/// Which hand-off lane a tap pushes to — the entry's `Delivery` projection.
+/// Which hand-off lane a tap pushes to, projected from the entry's
+/// [`Delivery`](crate::Delivery).
 enum Lane {
-    /// Latest-wins: coalesce into this tap's dedicated slot.
+    /// Latest wins: coalesce into this tap's dedicated slot.
     Coalesce { slot: usize },
     /// Every record, in order, into the shared FIFO.
     Fifo,
 }
 
-/// How a tap frames a drained record — the entry's schema projection.
+/// How a tap frames a drained record, projected from the entry's schema.
 enum Wire {
     /// A `Table` packet under the announce-assigned packet id.
     Table { packet_id: PacketId },
@@ -814,47 +811,43 @@ enum Wire {
     Msg,
 }
 
-/// Everything `init` starts, bundled (C6 — one `Option<Started>` instead of three
-/// parallel `Option`s that were only ever set together).
+/// Everything `init` starts, bundled so it is present or absent as one.
 struct Started {
     handoff: Arc<HandOff>,
     stop: Arc<AtomicBool>,
-    /// Holds the sender task; its `Drop` cancels the task on teardown. `None` when
-    /// the transport was already taken (a re-init) — the taps still drain.
+    /// Holds the sender task; dropping the guard cancels the task on teardown.
+    /// `None` when the transport was already taken by an earlier `init`; the
+    /// taps still drain.
     #[allow(dead_code)]
     sender: Option<JoinHandleDropGuard<()>>,
 }
 
-/// The telemetry downlink system (telemetry.md §3). Generic over the [`Transport`]; the
-/// concrete `T` is chosen by the wiring (TCP, `type="TcpDownlink"`) or a test (mock).
-/// An ordinary registry system: register it **after** every other cyclic system (its
-/// `ReceiveAll` capability is what `build()`'s ordering check keys on), or let the
-/// wiring resolver defer it there automatically.
+/// The telemetry downlink system, generic over the [`Transport`] chosen by the
+/// wiring (`type="TcpDownlink"` for TCP) or by a test (a mock). Register it
+/// after every other cyclic system, or let the wiring resolver defer it there;
+/// its `ReceiveAll` capability is what the build-time ordering check keys on.
 ///
-/// **Init-time emit gap (B9)**: the downlink claims its read views in its own
-/// `init`, which runs *after* earlier-registered systems' `init`s — a frame or
-/// message a system emits during `init` is therefore **not** downlinked (the
-/// view starts at the live edge past it). Values that must reach the ground
-/// should be (re-)published from the first `execute`; the coordinator's own boot
-/// `SequenceRegistry` deliberately emits at the head of `run_for`, after every
-/// `init`, for exactly this reason.
+/// Read views are claimed in `init`, which runs after earlier-registered
+/// systems' `init`s, so a frame or message emitted during another system's
+/// `init` is not downlinked (the view starts at the live edge past it). Values
+/// that must reach the ground should be published from the first `execute`
+/// onward.
 pub struct TelemetrySystem<T: Transport> {
     transport: Option<T>,
     mode: TelemetryMode,
-    /// ONE tap list (C4): each tap carries its own lane + wire framing.
+    /// The resolved taps; each carries its own lane and wire framing.
     taps: Vec<Tap>,
-    /// The running state `init` assembles: the hand-off, the sender's stop flag, and
-    /// the sender task guard. `None` before `init`.
+    /// The running state `init` assembles. `None` before `init`.
     started: Option<Started>,
     /// Snapshot drops already surfaced to health (each new one reported once).
     last_dropped: u64,
-    /// The Log-lane twin of `last_dropped` (surfaced as `telemetry.msg_dropped`).
+    /// The log-lane twin of `last_dropped` (surfaced as `telemetry.msg_dropped`).
     last_msg_dropped: u64,
 }
 
 impl<T: Transport> TelemetrySystem<T> {
-    /// Construct the (pre-init) downlink from its config. Taps are resolved and the
-    /// sender spawned at `init`, where the registry handle is reachable.
+    /// A pre-init downlink from its config. Taps are resolved and the sender
+    /// spawned at `init`, where the registry handle is reachable.
     pub fn new(config: TelemetryConfig<T>) -> Self {
         Self {
             transport: Some(config.transport),
@@ -872,19 +865,18 @@ impl<T: Transport + 'static> System for TelemetrySystem<T> {
     type Output = Out<TelemetryPorts>;
     const NAME: &'static str = "telemetry";
 
-    /// Resolve the tap set, claim one read `View` per tapped buffer, and spawn the async
-    /// sender (telemetry.md §3/§4). `init` runs on the coordinator's loop task within
-    /// `start()`, so `stellarator::spawn` has a runtime; the sender announces before any
+    /// Resolve the tap set, claim one read `View` per tapped buffer, and spawn
+    /// the async sender. `init` runs on the coordinator's loop task, so
+    /// `stellarator::spawn` has a runtime, and the sender announces before any
     /// data is queued (nothing is pushed until the first `execute`).
     fn init(&mut self, output: &mut Self::Output) {
-        // ONE loop over the unified registry surface — `AllOutputs::entries()` is
-        // already telemetered-only (the A6 source-side filter), so a command channel
-        // or an opted-out frame never even reaches the matcher here.
+        // `AllOutputs::entries()` is already filtered to telemetered entries,
+        // so a command channel or an opted-out frame never reaches the matcher.
         let mut taps = Vec::new();
         let mut announces = Vec::new();
         let mut n_slots = 0usize;
-        // Deferred health reports: iterating `output.all` borrows the output bundle,
-        // so `output.health()` (a `&mut` borrow) is driven after the loop.
+        // Deferred health reports: iterating `output.all` borrows the output
+        // bundle, so `output.health()` (a `&mut` borrow) runs after the loop.
         let mut exhausted: Vec<String> = Vec::new();
         for entry in output.all.entries() {
             if !self.mode.matches(entry) {
@@ -892,22 +884,18 @@ impl<T: Transport + 'static> System for TelemetrySystem<T> {
             }
             let view = match entry.view() {
                 Ok(v) => v,
-                // Reader-slot budget exhausted: surface it — a health error plus a log
-                // line NAMING the buffer (E8b) — and skip this tap rather than
-                // panicking (telemetry.md §2.5). Build-time sizing makes this
-                // unreachable for the known consumers, but a hand-built
-                // over-subscription (or a too-small `CoordinatorConfig::reader_slack`)
-                // is diagnosable.
+                // The buffer has no reader slot left. Build-time sizing makes
+                // this unreachable for the known consumers, but a hand-built
+                // over-subscription (or too little configured reader slack) is
+                // worth diagnosing, so log the buffer by name and skip the tap
+                // instead of panicking.
                 Err(_) => {
                     exhausted.push(format!("{}.{}", entry.instance, entry.name));
                     continue;
                 }
             };
-            // The two tap axes are independent projections of the entry: the LANE
-            // comes off `delivery` (coalesce vs FIFO), the WIRE off `schema`
-            // (announced Table id vs self-describing record). The generic
-            // `Table × Log` combination — an every-record frame log — falls out with
-            // zero extra code.
+            // Lane and wire are independent projections of the entry: delivery
+            // picks the hand-off lane, schema picks the framing.
             let lane = match entry.delivery {
                 Delivery::Snapshot => {
                     let slot = n_slots;
@@ -947,7 +935,7 @@ impl<T: Transport + 'static> System for TelemetrySystem<T> {
             );
         }
 
-        // One wait queue on the one two-lane hand-off wakes the single sender task.
+        // One wait queue on the one two-lane hand-off wakes the single sender.
         let wq = Arc::new(WaitQueue::new());
         let handoff = Arc::new(HandOff::new(n_slots, wq.clone()));
         let stop = Arc::new(AtomicBool::new(false));
@@ -969,8 +957,9 @@ impl<T: Transport + 'static> System for TelemetrySystem<T> {
         });
     }
 
-    /// Signal the sender to stop and wake it so it exits cooperatively (the drop guard
-    /// cancels it regardless when the system is dropped at coordinator teardown).
+    /// Signal the sender to stop and wake it so it exits cooperatively (the
+    /// drop guard cancels it regardless when the system is dropped at
+    /// teardown).
     fn shutdown(&mut self, _output: &mut Self::Output) {
         if let Some(started) = &self.started {
             started.stop.store(true, Release);
@@ -979,9 +968,9 @@ impl<T: Transport + 'static> System for TelemetrySystem<T> {
     }
 }
 
-/// Frame one drained record for the wire per the tap's [`Wire`]: a `Table` packet
-/// under the announce-assigned id, or a self-describing `Msg` packet (the record's
-/// own 2-byte id — `None` if the record is too short to carry one).
+/// Frame one drained record per the tap's [`Wire`]: a `Table` packet under the
+/// announce-assigned id, or a self-describing `Msg` packet keyed by the
+/// record's own leading id (`None` if the record is too short to carry one).
 fn frame_packet(wire: &Wire, rec: &[u8]) -> Option<LenPacket> {
     match wire {
         Wire::Table { packet_id } => {
@@ -998,13 +987,13 @@ fn frame_packet(wire: &Wire, rec: &[u8]) -> Option<LenPacket> {
 }
 
 impl<T: Transport + 'static> CyclicSystem for TelemetrySystem<T> {
-    /// End-of-cycle drain (telemetry.md §3/§4) — ONE loop over the one tap list;
-    /// never awaits. A Coalesce tap borrows only the newest record and pushes one
-    /// latest-wins snapshot (nothing when no new record landed); a Fifo tap pushes
-    /// **every** record in order. Either way the record is borrowed in place off
-    /// the ring and framed per the tap's wire form. Drops detected since last cycle
-    /// surface as `telemetry.dropped` (snapshot lane) / `telemetry.msg_dropped`
-    /// (log lane).
+    /// The end-of-cycle drain; never awaits. A coalesce tap borrows only the
+    /// newest record and pushes one latest-wins snapshot (nothing when no new
+    /// record landed); a FIFO tap pushes every record in order. Either way the
+    /// record is borrowed in place off the ring and framed per the tap's wire
+    /// form. Drops detected since the last cycle surface as
+    /// `telemetry.dropped` (snapshot lane) and `telemetry.msg_dropped` (log
+    /// lane).
     fn execute(&mut self, _now: Timestamp, _input: &mut Self::Input, output: &mut Self::Output) {
         let Some(started) = &self.started else {
             return;
@@ -1012,16 +1001,16 @@ impl<T: Transport + 'static> CyclicSystem for TelemetrySystem<T> {
         let handoff = started.handoff.clone();
         for tap in &mut self.taps {
             match tap.lane {
-                // Latest-wins: borrow the newest committed record; an unchanged
-                // `committed` means no new record this cycle — nothing to send
-                // (and the pinned record is not re-pushed).
+                // An unchanged `committed` means no new record this cycle;
+                // push nothing rather than re-sending the pinned record.
                 Lane::Coalesce { slot } => {
                     let committed = tap.view.committed();
                     if committed == tap.last_committed {
                         continue;
                     }
                     tap.last_committed = committed;
-                    // Corrupt (unreachable in practice) reads as "nothing new".
+                    // A corrupt read (unreachable in practice) counts as
+                    // nothing new.
                     if let Ok(Some(grant)) = tap.view.try_latest()
                         && let Some(pkt) = frame_packet(&tap.wire, &grant)
                     {
@@ -1040,7 +1029,7 @@ impl<T: Transport + 'static> CyclicSystem for TelemetrySystem<T> {
                 }
             }
         }
-        // Surface any packets the sender's backlog forced us to drop (telemetry.md §4).
+        // Surface any packets the sender's backlog forced us to drop.
         let dropped = handoff.dropped_snapshots.load(Relaxed);
         while self.last_dropped < dropped {
             output.health().error("telemetry.dropped");

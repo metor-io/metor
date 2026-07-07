@@ -1,18 +1,23 @@
-//! The general **message channel** — the second payload kind beside frames
-//! (`docs/messages.md` §1, §2).
+//! Self-describing message records and the ports that carry them.
 //!
-//! Where a [`Frame`](crate::Frame) is a fixed, vtable-announced component group, a
-//! **message** is a self-describing `(PacketId, postcard-bytes)` record: the 2-byte
-//! [`Msg::ID`] followed by the postcard-serialized payload, written verbatim onto a
-//! byte ring. There is no announce and no vtable — the id *is* the schema identity, so
-//! any consumer (the telemetry downlink, a recorder, the panel's sequence view)
-//! decodes a record with nothing but the id. Messages are an event/command **log**:
-//! every record is preserved in order, never coalesced like a latest-wins snapshot.
+//! A message is the second payload kind beside frames. Where a
+//! [`Frame`](crate::Frame) is a fixed component group announced through a
+//! vtable, a message record describes itself: the 2-byte [`Msg::ID`] followed
+//! by the postcard-serialized payload, written verbatim onto a byte ring. The
+//! id alone names the schema, so any consumer decodes a record with nothing
+//! but the bytes in front of it. Message rings use log delivery, which means
+//! every record is preserved in order rather than coalesced into a
+//! latest-wins snapshot, and a full ring backpressures the emitter instead of
+//! dropping.
 //!
-//! [`MsgOut<M>`](MsgOut) is the emit port — the message twin of [`Output<F>`](crate::Output),
-//! **typed on one [`Msg`] type `M`** so it can be a first-class wired port
-//! (`docs/message-wiring.md` §2.1): the edge key is `M::ID`, exactly parallel to a frame
-//! port's `F::FRAME_ID`. A channel that carries several `Msg` types becomes several ports.
+//! [`MsgOut<M>`](MsgOut) and [`MsgIn<M>`](MsgIn) are the message twins of
+//! [`Output<F>`](crate::Output) and [`Input<F>`](crate::Input). Each is typed
+//! on a single [`Msg`] type `M`, and the wiring edge key is `M::ID`, exactly
+//! parallel to a frame port keyed on its frame id. A channel that carries
+//! several message types is simply several typed ports, possibly sharing a
+//! ring; a consumer's [`drain`](MsgIn::drain) skips records whose id is not
+//! `M::ID`. Message inputs also allow fan-in, so a [`MsgIn`] holds one
+//! [`View`] per wired producer and drains them all.
 
 use core::marker::PhantomData;
 
@@ -27,22 +32,18 @@ use serde::de::DeserializeOwned;
 use crate::binder::RingSource;
 use crate::descriptor::PortDesc;
 
-/// A [`Msg`] usable as a wired port: carries an explicit, stable wire/KDL/registry
-/// name beside its [`Msg::ID`] edge key (review A10).
+/// A [`Msg`] with a stable name token, usable as a wired port.
 ///
-/// The derived `type_name` token is gone — renaming a Rust type silently changed the
-/// KDL token and registry key, generics produced garbage, and the format is
-/// unspecified. `NAME` is the token a mission file writes (`msg="SequenceCommand"`)
-/// and the channel part of the registry key `<instance>.<NAME>`; renaming the Rust
-/// type must not change it. (Coordinator-minted channels that pass an explicit
-/// channel string — `"sequences"` — keep doing so; `NAME` is the default, not a cage.)
+/// `NAME` is the token a config file writes to select this message type and
+/// the channel half of the registry key `<instance>.<NAME>`. It is declared
+/// explicitly rather than derived from the Rust type name so that renaming
+/// the type cannot silently change the wire token.
 pub trait NamedMsg: Msg {
-    /// The stable wire/KDL/registry token for this message type.
+    /// The stable wire, config, and registry token for this message type.
     const NAME: &'static str;
 }
 
-// The wkt migration set: names frozen to today's tokens so every existing
-// mission.kdl and registry key is unchanged.
+// The well-known message set every registry's MsgTable starts with.
 impl NamedMsg for SequenceCommand {
     const NAME: &'static str = "SequenceCommand";
 }
@@ -68,31 +69,29 @@ impl NamedMsg for AlarmAck {
     const NAME: &'static str = "AlarmAck";
 }
 
-/// The host's registered message types — [`NamedMsg::NAME`] → [`Msg::ID`] — the
-/// table a config token resolves against ([`BuildSystem::configure`]). The wiring
-/// registry owns one (seeded with the wkt set, extended via `register_msg`); the
-/// stored `&'static` NAME doubles as a minted port's [`PortDesc`] name, so
-/// resolution never leaks a string.
+/// The registered message types, keyed by [`NamedMsg::NAME`].
 ///
-/// [`BuildSystem::configure`]: crate::BuildSystem::configure
+/// Config tokens resolve against this table. The stored name is `&'static`,
+/// so a resolved entry doubles as a minted port's [`PortDesc`] name without
+/// leaking a string.
 #[derive(Default, Clone)]
 pub struct MsgTable {
     map: std::collections::HashMap<&'static str, PacketId>,
 }
 
 impl MsgTable {
-    /// Register `M` under its stable [`NamedMsg::NAME`] token. Idempotent.
+    /// Register `M` under [`NamedMsg::NAME`]. Idempotent.
     pub fn insert<M: NamedMsg>(&mut self) {
         self.map.insert(M::NAME, M::ID);
     }
 
-    /// Resolve a config token to its `(name, id)` pair. The returned name is the
-    /// stored `&'static` token (not the argument), usable as a port name.
+    /// Resolve a token to its `(name, id)` pair. The returned name is the
+    /// stored `&'static` token, not the argument, so it can name a port.
     pub fn get(&self, name: &str) -> Option<(&'static str, PacketId)> {
         self.map.get_key_value(name).map(|(n, id)| (*n, *id))
     }
 
-    /// Every registered name, sorted — for error listings.
+    /// Every registered name, sorted, for error listings.
     pub fn names(&self) -> Vec<&'static str> {
         let mut names: Vec<_> = self.map.keys().copied().collect();
         names.sort_unstable();
@@ -100,24 +99,19 @@ impl MsgTable {
     }
 }
 
-/// Default worst-case message payload size, the [`Frame::MAX_SIZE`](crate::Frame)
-/// analogue for the variable-record ring sizing (`docs/messages.md` §2.1). Generous —
-/// a message is a log entry (a `SequenceChannelEvent`, a `SequenceRegistry`), not a
-/// telemetry snapshot.
+/// Default worst-case message payload size, used to size a message ring the
+/// way [`Frame::MAX_SIZE`](crate::Frame) sizes a frame ring.
 pub const MAX_MSG_BYTES: usize = 4096;
 
-/// Default in-flight record depth for a [`Delivery::Log`](crate::Delivery) ring
-/// (`docs/messages.md` §2.1). Deep because a log is an every-record event/command
-/// stream — a slow tap must not drop a transition — not a one-deep snapshot like a
-/// component output. An internal sizing constant (the coordinator's `alloc_ring`
-/// keys on the delivery axis); size a ring by hand via
+/// Default in-flight record depth for a [`Delivery::Log`](crate::Delivery)
+/// ring. Deep, because a log ring must hold every record its slowest reader
+/// has not yet seen, unlike a one-deep snapshot. Size a ring by hand via
 /// [`capacity_for`](crate::capacity_for).
 pub(crate) const LOG_DEPTH: usize = 64;
 
-/// Split a raw message record back into its `(id, payload)` halves — the inverse of an
-/// [`emit`](MsgOut::emit) (the downlink tap's decode, W2). The first 2 bytes are the
-/// [`Msg::ID`]; the rest is the postcard payload. `None` if the record is too short to
-/// carry an id.
+/// Split a raw message record into its `(id, payload)` halves, the inverse
+/// of an [`emit`](MsgOut::emit). Returns `None` if the record is too short
+/// to carry the 2-byte id.
 pub fn split_record(rec: &[u8]) -> Option<(PacketId, &[u8])> {
     let (id, payload) = rec.split_first_chunk::<2>()?;
     Some((*id, payload))
@@ -127,31 +121,30 @@ pub fn split_record(rec: &[u8]) -> Option<(PacketId, &[u8])> {
 // MsgOut
 // ---------------------------------------------------------------------------
 
-/// One owned **message** output: the single [`Writer`] into a byte ring carrying
-/// `(id, postcard)` records, **typed on one [`Msg`] type `M`** (`docs/message-wiring.md`
-/// §2.1). The message twin of [`Output<F>`](crate::Output) — same single-writer discipline,
-/// same `NoWake` cyclic default, and the same `descriptor()`/`bind()` port
-/// contract, so it drops into a `SystemOutput` bundle beside frame ports with no macro
-/// change. The edge key is `M::ID`.
+/// One owned message output, a single [`Writer`] into a byte ring, typed on
+/// the [`Msg`] type `M` it emits.
+///
+/// The message twin of [`Output<F>`](crate::Output), with the same
+/// single-writer discipline and the same `descriptor()`/`bind()` port
+/// contract, so it sits in a `SystemOutput` bundle beside frame ports. The
+/// wiring edge key is `M::ID`.
 pub struct MsgOut<M, WD = NoWake, WS = NoWake>
 where
     WD: WakeSource,
     WS: WakeSink,
 {
     writer: Writer<WD, WS>,
-    /// A reused record buffer (the 2-byte id prefix + the serialized payload), so a
-    /// per-cycle emit grows in place rather than allocating a fresh `Vec` every call —
-    /// exactly the [`Output::write_with`](crate::Output) scratch discipline.
+    /// Reused record buffer (the 2-byte id prefix plus the serialized
+    /// payload), so a per-cycle emit grows in place instead of allocating.
     scratch: Vec<u8>,
-    /// Records dropped by the infallible [`publish`](Self::publish) path (review E6) —
-    /// the [`Output`](crate::Output) drop-counter mirror, folded into health by the
-    /// runner via `SystemOutput::take_dropped`.
+    /// Records dropped by the infallible [`publish`](Self::publish) path,
+    /// folded into health by the runner via `SystemOutput::take_dropped`.
     dropped: u64,
     _m: PhantomData<fn() -> M>,
 }
 
 impl<M: Msg, WD: WakeSource, WS: WakeSink> MsgOut<M, WD, WS> {
-    /// Wrap a writer the coordinator created over a Log-sized byte ring.
+    /// Wrap a writer over a log-sized byte ring.
     pub fn new(writer: Writer<WD, WS>) -> Self {
         Self {
             writer,
@@ -161,27 +154,27 @@ impl<M: Msg, WD: WakeSource, WS: WakeSink> MsgOut<M, WD, WS> {
         }
     }
 
-    /// Emit one message, **infallibly** (review E6): a failed write —
-    /// `InsufficientCapacity` (a sizing bug) or `WouldBlock` (a slow reader
-    /// backpressuring the ring) — is counted for the runner to fold into health
-    /// rather than returned. Sizing-aware callers keep [`emit`](Self::emit).
+    /// Emit one message, counting a failed write instead of returning it.
+    ///
+    /// A write fails on `InsufficientCapacity` (a sizing bug) or `WouldBlock`
+    /// (a slow reader backpressuring the ring); either way the record is
+    /// dropped and counted for the runner to fold into health. Callers that
+    /// want to see the error use [`emit`](Self::emit).
     pub fn publish(&mut self, msg: &M) {
         if self.emit(msg).is_err() {
             self.dropped += 1;
         }
     }
 
-    /// Take (sum-and-clear) the [`publish`](Self::publish) drop counter — the
-    /// [`Output::take_dropped`](crate::Output) mirror.
+    /// Take and clear the [`publish`](Self::publish) drop counter.
     pub fn take_dropped(&mut self) -> u64 {
         core::mem::take(&mut self.dropped)
     }
 
-    /// Emit one message: write the 2-byte [`Msg::ID`] then the postcard-serialized
-    /// payload as a single ring record (`docs/messages.md` §1.2). Serialization runs
-    /// into the reused `scratch` via the same `serialize_with_flavor` path the
-    /// `IntoLenPacket` impl uses (`../metor-proto/src/types.rs:620`); only the ring
-    /// `try_write` can fail, so this surfaces a [`WriteError`] and nothing else.
+    /// Emit one message as a single ring record, the 2-byte [`Msg::ID`]
+    /// followed by the postcard payload. Serialization into the reused
+    /// scratch buffer cannot fail, so the only error is the ring write's
+    /// [`WriteError`].
     pub fn emit(&mut self, msg: &M) -> Result<(), WriteError> {
         self.scratch.clear();
         self.scratch.extend_from_slice(&M::ID);
@@ -189,19 +182,17 @@ impl<M: Msg, WD: WakeSource, WS: WakeSink> MsgOut<M, WD, WS> {
             .expect("postcard serialization into an in-memory buffer is infallible");
         self.writer.try_write(&self.scratch)
     }
-
 }
 
 impl<M: NamedMsg, WD: WakeSource, WS: WakeSink> MsgOut<M, WD, WS> {
-    /// This port's static descriptor — the message twin of
-    /// [`Output::<F>::descriptor`](crate::Output) (`docs/message-wiring.md` §2.1).
-    /// Requires [`NamedMsg`]: a wired port needs the stable name token.
+    /// This port's static descriptor, keyed on `M::ID` and named by
+    /// [`NamedMsg::NAME`].
     pub fn descriptor() -> PortDesc {
         PortDesc::msg::<M>()
     }
 
-    /// What this field contributes to the bundle's `decls` walk: an ordinary
-    /// wired port.
+    /// The port declaration this field contributes to a bundle's `decls`
+    /// walk, an ordinary wired port.
     pub fn decl() -> crate::PortDecl {
         crate::PortDecl::Port(Self::descriptor())
     }
@@ -213,13 +204,13 @@ where
     WD: WakeSource + Default + Clone + 'static,
     WS: WakeSink + Default + Clone + 'static,
 {
-    /// Bind this port over the next ring the [`RingSource`] hands out, taking the matched
-    /// writer-side wake endpoints — the [`Output::bind`](crate::Output) mirror. Walked by
-    /// the derive when a `MsgOut<M>` is declared in a `SystemOutput` bundle.
+    /// Bind this port over the next ring the [`RingSource`] hands out, taking
+    /// the matched writer-side wake endpoints. Called by the derive for a
+    /// `MsgOut<M>` field in a `SystemOutput` bundle.
     pub fn bind<S: RingSource>(src: &mut S) -> Self {
         let (ring, data, space) = src.next_output::<WD, WS>();
-        // Invariant: the coordinator allocates one ring per message output and
-        // binds it exactly once, so the region's writer claim is always free here.
+        // The coordinator allocates one ring per message output and binds it
+        // exactly once, so the region's writer claim is always free here.
         let writer = ring
             .writer(data, space)
             .expect("message ring is bound to exactly one writer at build");
@@ -227,53 +218,51 @@ where
     }
 }
 
-/// A **command-channel** message output: pure sugar for a [`MsgOut<M>`] whose port
-/// is marked **untelemetered** (`docs/message-wiring.md` §6.4), so the downlink /
-/// `AllOutputs` never echo inbound commands back to the panel.
+/// A message output whose port is marked untelemetered, so telemetry taps
+/// never echo inbound commands back out.
 ///
-/// The flag lives on the *descriptor*, not the type: the `SystemInput`/
-/// `SystemOutput` derives and `#[system]` recognize the `CommandOut` **token** and
-/// lower it to `MsgOut` + `PortDesc::untelemetered()` (identical to spelling
-/// `#[fsw(telemetered = false)]` on a `MsgOut` field). A hand-written
-/// `SystemOutput` impl must spell the descriptor itself
-/// (`PortDesc::msg::<M>().untelemetered()`) — calling `CommandOut::descriptor()`
-/// resolves through the alias to the *telemetered* `MsgOut` descriptor.
+/// This is an alias, not a distinct type; the flag lives on the descriptor.
+/// The `SystemInput`/`SystemOutput` derives and `#[system]` recognize the
+/// `CommandOut` token and lower it to a `MsgOut` whose [`PortDesc`] is
+/// [`untelemetered`](PortDesc::untelemetered), identical to spelling
+/// `#[fsw(telemetered = false)]` on a `MsgOut` field. A hand-written
+/// `SystemOutput` impl must build that descriptor itself
+/// (`PortDesc::msg::<M>().untelemetered()`), because `CommandOut::descriptor()`
+/// resolves through the alias to the plain, telemetered `MsgOut` descriptor.
 pub type CommandOut<M, WD = NoWake, WS = NoWake> = MsgOut<M, WD, WS>;
 
 // ---------------------------------------------------------------------------
 // MsgFanOut
 // ---------------------------------------------------------------------------
 
-/// N raw message writers, one per **config-minted** Postcard output — the
-/// dynamic-count sibling of [`MsgOut`] for a system whose message outputs are
-/// determined by its instance config rather than its bundle type (the uplink's
-/// one-port-per-configured-msg, `docs/messages.md` §4.4).
+/// N raw message writers, one per config-minted output.
 ///
-/// The ports must be the *trailing* outputs of the instance descriptor:
-/// [`bind`](Self::bind) drains every ring the [`RingSource`] still holds, so the
-/// bundle binds its static ports first and the fan-out last. The writer at index
-/// k is the descriptor's k-th minted port — the owner keys both off the same
-/// config list, so no per-writer id is stored here.
+/// The dynamic-count sibling of [`MsgOut`] for a system whose message outputs
+/// come from its instance config rather than its bundle type. The minted
+/// ports must be the trailing outputs of the instance descriptor, because
+/// [`bind`](Self::bind) drains every ring the [`RingSource`] still holds; a
+/// bundle binds its static ports first and the fan-out last. The writer at
+/// index k is the descriptor's k-th minted port. The owner keys both off the
+/// same config list, so no per-writer id is stored here.
 ///
-/// [`write_raw`](Self::write_raw) is the id-erased [`emit`](MsgOut::emit): it
-/// writes an **already-encoded** `id ++ payload` record verbatim, no typed `M`
-/// and no postcard step (the uplink relays wire records whose payload it never
-/// decodes — validation happens at each consumer's [`drain`](MsgIn::drain)).
+/// [`write_raw`](Self::write_raw) is the id-erased [`emit`](MsgOut::emit).
+/// It writes an already-encoded `id ++ payload` record verbatim, with no
+/// typed `M` and no postcard step; validation happens where a typed consumer
+/// [`drain`](MsgIn::drain)s the record.
 pub struct MsgFanOut {
     writers: Vec<Writer<NoWake, NoWake>>,
-    /// The reused record buffer (2-byte id + payload) — the [`MsgOut`] scratch
-    /// discipline.
+    /// Reused record buffer, as in [`MsgOut`].
     scratch: Vec<u8>,
 }
 
 impl MsgFanOut {
-    /// Bind one writer per output ring the source still holds. Walked *after*
-    /// the bundle's static ports, in `descriptors()` order.
+    /// Bind one writer per output ring the source still holds. Must run after
+    /// the bundle's static ports have bound, in `descriptors()` order.
     pub fn bind<S: RingSource>(src: &mut S) -> Self {
         let mut writers = Vec::new();
         while let Some((ring, data, space)) = src.try_next_output::<NoWake, NoWake>() {
-            // Invariant: the coordinator allocates one ring per message output and
-            // binds it exactly once, so the region's writer claim is always free here.
+            // The coordinator allocates one ring per message output and binds
+            // it exactly once, so the region's writer claim is always free here.
             let writer = ring
                 .writer(data, space)
                 .expect("message ring is bound to exactly one writer at build");
@@ -285,20 +274,19 @@ impl MsgFanOut {
         }
     }
 
-    /// The bound writer count — must equal the owner's configured msg count (its
-    /// descriptor minted one port per msg).
+    /// The bound writer count, one per port the owner's config minted.
     pub fn len(&self) -> usize {
         self.writers.len()
     }
 
-    /// Whether no ports were minted (an empty config list).
+    /// Whether the config minted no ports.
     pub fn is_empty(&self) -> bool {
         self.writers.is_empty()
     }
 
-    /// Write one already-encoded record — `id` then `payload`, verbatim — onto
-    /// writer `idx`. Only the ring `try_write` can fail (`WouldBlock`
-    /// backpressure or an oversized record).
+    /// Write one already-encoded record, `id` then `payload` verbatim, onto
+    /// writer `idx`. Only the ring write can fail, on backpressure or an
+    /// oversized record.
     pub fn write_raw(
         &mut self,
         idx: usize,
@@ -316,21 +304,18 @@ impl MsgFanOut {
 // MsgIn
 // ---------------------------------------------------------------------------
 
-/// One owned **message** input: a [`View`] over a byte ring carrying `(id, postcard)`
-/// records, decoding each into the [`Msg`] type `M` — the in-FSW subscribe twin of
-/// [`MsgOut`] (`docs/messages.md` §4). Where [`emit`](MsgOut::emit) writes the 2-byte
-/// [`Msg::ID`] then the postcard payload, [`drain`](Self::drain) reads each committed
-/// record, keeps only those whose id is `M::ID`, and postcard-decodes the payload —
-/// reusing [`split_record`] (the downlink tap's decode). A record of another `Msg` type
-/// on a heterogeneous channel is skipped, and a lapped view resyncs to the live edge (the
-/// in-FSW analogue of the downlink message tap's `resync`, `src/telemetry/mod.rs`).
+/// One owned message input that decodes `(id, postcard)` records into the
+/// [`Msg`] type `M`.
 ///
-/// A message input may have **several producers** (`docs/message-wiring.md` §3.2/§3.3):
-/// fan-in is legal (many emitters → one command consumer), so the port holds **K views**,
-/// one per wired producer edge, and [`drain`](Self::drain) drains them all. A cyclic
-/// consumer holds the producer views directly (generalizing the coordinator's
-/// `command_sources: Vec<MsgIn>`); an async consumer holds one view over a private merge
-/// ring (WP4). K = 1 is the common single-producer case; K = 0 is a legal unconnected input.
+/// [`drain`](Self::drain) reads each committed record, keeps those whose id
+/// is `M::ID`, and postcard-decodes the payload, so records of other message
+/// types on a shared channel are skipped. A lapped view resyncs to the live
+/// edge.
+///
+/// Message inputs allow fan-in, so the port holds one [`View`] per wired
+/// producer and [`drain`](Self::drain) drains them all. One view is the
+/// common single-producer case, and an empty list is a legal unconnected
+/// input.
 pub struct MsgIn<M, RD = NoWake, RS = NoWake>
 where
     RD: WakeSink,
@@ -346,13 +331,12 @@ where
     RD: WakeSink,
     RS: WakeSource,
 {
-    /// Wrap a single [`View`] the coordinator/registry claimed over a Log-sized byte
-    /// ring (the message twin of [`Input::new`](crate::Input), the K = 1 case).
+    /// Wrap a single producer [`View`].
     pub fn new(view: View<RD, RS>) -> Self {
         Self::from_views(vec![view])
     }
 
-    /// Wrap K producer [`View`]s (the fan-in case — many emitters into one input).
+    /// Wrap one [`View`] per wired producer, the fan-in case.
     pub fn from_views(views: Vec<View<RD, RS>>) -> Self {
         Self {
             views,
@@ -360,14 +344,16 @@ where
         }
     }
 
-    /// Drain every record committed since the last call across **all** producer views,
-    /// decoding each `M::ID` record and handing the decoded payload to `f`. Per-producer
-    /// order is preserved; the cross-producer interleave is arbitrary (and irrelevant — each
-    /// record self-addresses). Records of a different id (a heterogeneous channel) and records
-    /// that fail to postcard-decode are skipped. Records are never lost: a full ring
-    /// backpressures the emitter, and each record is borrowed in place (zero-copy)
-    /// and freed for the writer as soon as `f` returns. A corrupt view (unreachable
-    /// from in-crate behavior) stops draining that view.
+    /// Drain every record committed since the last call across all producer
+    /// views, handing each decoded `M` to `f`.
+    ///
+    /// Per-producer order is preserved; the interleave across producers is
+    /// arbitrary, and irrelevant since each record describes itself. Records
+    /// with a different id and records that fail to decode are skipped. Each
+    /// record is borrowed in place and freed for the writer as soon as `f`
+    /// returns, and a full ring backpressures the emitter rather than
+    /// dropping. A corrupt view, unreachable from in-crate behavior, stops
+    /// draining that view.
     pub fn drain(&mut self, mut f: impl FnMut(M)) {
         for view in &mut self.views {
             let _ = crate::port::drain_view(view, |rec| {
@@ -388,14 +374,14 @@ where
     RD: WakeSink,
     RS: WakeSource,
 {
-    /// This port's static descriptor — same edge key as the [`MsgOut<M>`](MsgOut) it
-    /// consumes. Requires [`NamedMsg`]: a wired port needs the stable name token.
+    /// This port's static descriptor, sharing its edge key with the
+    /// [`MsgOut<M>`](MsgOut) it consumes.
     pub fn descriptor() -> PortDesc {
         PortDesc::msg::<M>()
     }
 
-    /// What this field contributes to the bundle's `decls` walk: an ordinary
-    /// wired port.
+    /// The port declaration this field contributes to a bundle's `decls`
+    /// walk, an ordinary wired port.
     pub fn decl() -> crate::PortDecl {
         crate::PortDecl::Port(Self::descriptor())
     }
@@ -407,11 +393,11 @@ where
     RD: WakeSink + Default + Clone + 'static,
     RS: WakeSource + Default + Clone + 'static,
 {
-    /// Bind this port over **every** producer ring wired to the next message input — the
-    /// [`Input::bind`](crate::Input) mirror, but claiming the fan-in list
-    /// ([`next_input_fanin`](RingSource::next_input_fanin)). An empty list is a legal,
-    /// unconnected message input (drains nothing). Walked by the derive when a `MsgIn<M>` is
-    /// declared in a `SystemInput` bundle.
+    /// Bind this port over every producer ring wired to the next message
+    /// input, claiming the whole fan-in list
+    /// ([`next_input_fanin`](RingSource::next_input_fanin)). An empty list is
+    /// a legal, unconnected input that drains nothing. Called by the derive
+    /// for a `MsgIn<M>` field in a `SystemInput` bundle.
     pub fn bind<S: RingSource>(src: &mut S) -> Self {
         let rings = src.next_input_fanin::<RD, RS>();
         let views = rings
@@ -425,9 +411,9 @@ where
     }
 }
 
-/// A postcard serialization sink that appends into a borrowed, reused byte buffer — the
-/// `&mut LenPacket` flavor's twin (`../metor-proto/src/types.rs:747`), so each
-/// [`emit`](MsgOut::emit) grows `scratch` in place rather than allocating.
+/// A postcard serialization flavor that appends into a borrowed, reused
+/// buffer, so an [`emit`](MsgOut::emit) grows its scratch in place instead
+/// of allocating.
 struct ScratchFlavor<'a>(&'a mut Vec<u8>);
 
 impl postcard::ser_flavors::Flavor for ScratchFlavor<'_> {
@@ -457,14 +443,13 @@ mod tests {
     };
 
     use super::{LOG_DEPTH, MAX_MSG_BYTES, MsgFanOut, MsgIn, MsgOut, split_record};
-    use crate::port::capacity_for;
     use crate::PortId;
+    use crate::port::capacity_for;
     use crate::registry::{EntrySchema, RegistryEntry};
 
-    /// A heterogeneous channel is now N typed ports (`docs/message-wiring.md` §2.1): mint a
-    /// `MsgOut<SequenceRegistry>` and a `MsgOut<SequenceCommand>` over one ring, emit one of
-    /// each, read them back via a `RegistryEntry` `View`, and assert `split_record` recovers
-    /// each id and the payloads postcard-round-trip. Also checks `MsgOut::descriptor`.
+    /// Two typed ports emit distinct message types onto one ring; a raw view
+    /// reads the records back, `split_record` recovers each id, and the
+    /// payloads postcard-round-trip. Also checks `MsgOut::descriptor`.
     #[test]
     fn msg_out_emits_and_round_trips() {
         let ring = RingBuffer::create_in_memory(Config {
@@ -487,13 +472,13 @@ mod tests {
             PortId::Packet(SequenceCommand::ID)
         );
 
-        // Claim the tap before any write — a view starts at the live edge, so the
-        // tap must exist before data flows (the telemetry-tap order).
+        // Claim the view before any write; a view starts at the live edge,
+        // so it must exist before data flows.
         let mut view = entry.view().expect("reader slot");
 
-        // A typed port per Msg type (each keyed on its own `M::ID`). The ring enforces a
-        // single live writer, so the ports take it in turn (drop frees the claim).
-        // First record: a whole-registry declaration.
+        // One typed port per Msg type, each keyed on its own `M::ID`. The
+        // ring enforces a single live writer, so the ports take it in turn
+        // (drop frees the claim). First record: a whole-registry declaration.
         let registry = SequenceRegistry {
             channels: vec![SequenceChannelSpec {
                 name: "mode".to_string(),
@@ -506,7 +491,8 @@ mod tests {
             reg_out.emit(&registry).expect("emit registry");
         }
 
-        // Second record: a *different* Msg type, its own typed port on the same ring.
+        // Second record: a different Msg type, its own typed port on the
+        // same ring.
         let mut cmd_out: MsgOut<SequenceCommand> =
             MsgOut::new(ring.writer(NoWake, NoWake).expect("claim freed on drop"));
         let command = SequenceCommand {
@@ -517,23 +503,24 @@ mod tests {
 
         let mut buf = Vec::new();
 
-        // Record 1 — SequenceRegistry.
+        // Record 1, the SequenceRegistry.
         assert!(view.try_read_into(&mut buf).expect("read record 1"));
         let (id, payload) = split_record(&buf).expect("split record 1");
         assert_eq!(id, SequenceRegistry::ID);
-        let decoded: SequenceRegistry =
-            postcard::from_bytes(payload).expect("round-trip registry");
+        let decoded: SequenceRegistry = postcard::from_bytes(payload).expect("round-trip registry");
         assert_eq!(decoded.channels.len(), 1);
         assert_eq!(decoded.channels[0].name, "mode");
-        assert_eq!(decoded.channels[0].available, vec!["commissioning", "safe_mode"]);
+        assert_eq!(
+            decoded.channels[0].available,
+            vec!["commissioning", "safe_mode"]
+        );
 
-        // Record 2 — SequenceCommand, a distinct id from the same writer.
+        // Record 2, the SequenceCommand, a distinct id from the same writer.
         assert!(view.try_read_into(&mut buf).expect("read record 2"));
         let (id, payload) = split_record(&buf).expect("split record 2");
         assert_eq!(id, SequenceCommand::ID);
         assert_ne!(SequenceCommand::ID, SequenceRegistry::ID);
-        let decoded: SequenceCommand =
-            postcard::from_bytes(payload).expect("round-trip command");
+        let decoded: SequenceCommand = postcard::from_bytes(payload).expect("round-trip command");
         assert_eq!(decoded.channel, "mode");
         assert!(matches!(decoded.command, SequenceCommandKind::Start));
 
@@ -541,10 +528,9 @@ mod tests {
         assert!(!view.try_read_into(&mut buf).expect("no more records"));
     }
 
-    /// `MsgIn` drains a heterogeneous channel, decoding only the records whose id matches
-    /// its `Msg` type and skipping the rest — the command-bus drain shape. Emit a
-    /// `SequenceRegistry` then two `SequenceCommand`s through one `MsgOut`; a
-    /// `MsgIn<SequenceCommand>` yields exactly the two commands, in order.
+    /// A `MsgIn` drains a shared channel, decoding only the records whose id
+    /// matches its type. Emit a `SequenceRegistry` then two `SequenceCommand`s;
+    /// a `MsgIn<SequenceCommand>` yields exactly the two commands, in order.
     #[test]
     fn msg_in_drains_and_id_filters() {
         let ring = RingBuffer::create_in_memory(Config {
@@ -552,11 +538,12 @@ mod tests {
             max_readers: 4,
         });
         // Claim the read view before any write (a view starts at the live edge).
-        let mut inbox: MsgIn<SequenceCommand> = MsgIn::new(ring.view(NoWake, NoWake).expect("slot"));
+        let mut inbox: MsgIn<SequenceCommand> =
+            MsgIn::new(ring.view(NoWake, NoWake).expect("slot"));
 
-        // Two typed ports take the ring's single writer in turn (drop frees the claim),
-        // so the drained view sees a heterogeneous stream.
-        // A different Msg type ahead of the commands — it must be skipped.
+        // Two typed ports take the ring's single writer in turn (drop frees
+        // the claim), so the drained view sees a mixed stream. A different
+        // Msg type ahead of the commands must be skipped.
         {
             let mut reg_out: MsgOut<SequenceRegistry> =
                 MsgOut::new(ring.writer(NoWake, NoWake).expect("first writer"));
@@ -592,16 +579,15 @@ mod tests {
         assert_eq!(got[1].channel, "recovery");
         assert!(matches!(got[1].command, SequenceCommandKind::Stop));
 
-        // Drained dry — a second drain yields nothing.
+        // Drained dry, so a second drain yields nothing.
         let mut again = 0;
         inbox.drain(|_| again += 1);
         assert_eq!(again, 0);
     }
 
-    /// `MsgFanOut::write_raw` relays an already-encoded `(id ++ payload)` record
-    /// verbatim — the id-erased emit: a typed `MsgIn` over the same ring decodes it
-    /// exactly as if a `MsgOut<M>` had emitted it, and a record of another id on a
-    /// sibling writer stays isolated (one ring per minted port).
+    /// `MsgFanOut::write_raw` relays an already-encoded `(id ++ payload)`
+    /// record verbatim; a typed `MsgIn` over the same ring decodes it exactly
+    /// as if a `MsgOut<M>` had emitted it.
     #[test]
     fn msg_fan_out_write_raw_round_trips() {
         let ring = RingBuffer::create_in_memory(Config {
@@ -621,18 +607,23 @@ mod tests {
             command: SequenceCommandKind::Start,
         })
         .expect("encode");
-        fan.write_raw(0, SequenceCommand::ID, &payload).expect("relay");
+        fan.write_raw(0, SequenceCommand::ID, &payload)
+            .expect("relay");
 
         let mut got: Vec<SequenceCommand> = Vec::new();
         inbox.drain(|c| got.push(c));
-        assert_eq!(got.len(), 1, "the relayed record decodes at the typed consumer");
+        assert_eq!(
+            got.len(),
+            1,
+            "the relayed record decodes at the typed consumer"
+        );
         assert_eq!(got[0].channel, "adcs");
         assert!(matches!(got[0].command, SequenceCommandKind::Start));
     }
 
-    /// A fan-in `MsgIn` (`from_views`) drains **every** producer view: two emitters on two
-    /// rings, one `MsgIn<SequenceCommand>` over both views, yields all records
-    /// (`docs/message-wiring.md` §3.3). This is the multi-view path WP4 wires as message edges.
+    /// A fan-in `MsgIn` (`from_views`) drains every producer view: two
+    /// emitters on two rings, one input over both views, yields all records.
+    /// An empty fan-in drains nothing.
     #[test]
     fn msg_in_fans_in_multiple_views() {
         let mk = || {
@@ -669,7 +660,11 @@ mod tests {
         let mut got: Vec<String> = Vec::new();
         inbox.drain(|c| got.push(c.channel));
         got.sort_unstable();
-        assert_eq!(got, vec!["adcs", "recovery"], "both producers' records are drained");
+        assert_eq!(
+            got,
+            vec!["adcs", "recovery"],
+            "both producers' records are drained"
+        );
 
         // An empty fan-in (unconnected input) drains nothing.
         let mut empty: MsgIn<SequenceCommand> = MsgIn::from_views(vec![]);

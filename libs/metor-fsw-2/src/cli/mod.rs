@@ -1,22 +1,28 @@
-//! The `metor-fsw` CLI runner (cli-runner.md) — a thin clap front-end over the wiring
-//! surface: `parse` → (`build_artifacts`) → override → `resolve` → `Coordinator::run_for`.
+//! The `metor-fsw` command line: a thin clap front end over the wiring surface.
+//! Every command runs the same pipeline. It parses the wiring KDL, optionally
+//! compiles the `cdylib` artifacts, applies any flag overrides, and either stops
+//! there or resolves the wiring into a coordinator and runs it.
 //!
-//! Three separable operations, plus a build→run shortcut:
+//! Three subcommands, plus a build-then-run shortcut:
 //!
-//! - **`build <KDL>`** — compile the `cdylib`s a wiring references (`build_artifacts`).
-//! - **`package <KDL> -o <DIR>`** — produce a relocatable bundle directory ([`write_bundle`]).
-//! - **`run <TARGET>`** — load a wiring (a source `.kdl` with `--build`, or a bundle dir) and
-//!   drive the coordinator. Clock/telemetry knobs are flags that override the KDL.
+//! - **`build <KDL>`** compiles the `cdylib`s the wiring references and prints
+//!   where they landed.
+//! - **`package <KDL> -o <DIR>`** produces a relocatable bundle directory
+//!   ([`write_bundle`]).
+//! - **`run <TARGET>`** loads a wiring (a source `.kdl` with `--build`, or a
+//!   bundle directory) and drives the coordinator. Clock and link flags
+//!   override whatever the KDL declares.
 //!
-//! The `metor-fsw` binary is `fn main() { metor_fsw_2::cli::main() }`; a mission host (the
-//! `adcs-fsw2` example) delegates to the same [`main`]. Only [`run`](cmd_run) enters the
-//! `stellarator` runtime, at the leaf — `build`/`package` are fully synchronous.
+//! A binary embeds the whole CLI by calling [`main`] from its own `fn main`.
+//! Only `run` enters the `stellarator` runtime, at the leaf; `build` and
+//! `package` are fully synchronous.
 //!
-//! The generic runner resolves against the **built-ins**
-//! [`Registry`](crate::wiring::Registry) (`Registry::with_builtins()` — the framework's own
-//! static systems, e.g. `type="Alarms"`): beyond those it loads `dlopen`'d (`cdylib`) systems
-//! only, since a single prebuilt binary cannot link an arbitrary mission's statically-linked
-//! systems (a static mission keeps its own host, seeded from the same built-ins).
+//! The runner resolves against [`Registry::with_builtins`], so a wiring may use
+//! the framework's static built-in systems (for example `type="Alarms"`) plus
+//! any number of `dlopen`'d `cdylib` systems. It cannot host a mission's own
+//! statically linked systems, because a prebuilt binary has nothing to link
+//! them into; such a mission keeps its own host binary, seeded from the same
+//! built-ins.
 
 use std::ffi::OsString;
 use std::net::{SocketAddr, TcpStream};
@@ -37,7 +43,7 @@ use crate::wiring::{
 // clap command tree
 // ---------------------------------------------------------------------------
 
-/// `metor-fsw` — build, package, and run metor-fsw missions.
+/// `metor-fsw`: build, package, and run metor-fsw missions.
 #[derive(Parser, Debug)]
 #[command(
     name = "metor-fsw",
@@ -54,7 +60,7 @@ struct Cli {
 enum Command {
     /// Compile the cdylibs the wiring references; print where they landed.
     Build(BuildArgs),
-    /// Produce a relocatable bundle directory (the cdylibs + a manifest).
+    /// Produce a relocatable bundle directory (the cdylibs plus a manifest).
     Package(PackageArgs),
     /// Load a wiring (a source `.kdl` with `--build`, or a bundle dir) and run it.
     Run(RunArgs),
@@ -92,7 +98,7 @@ struct PackageArgs {
 struct RunArgs {
     /// A source `.kdl` file (requires `--build`) or a bundle directory (cargo-free).
     target: PathBuf,
-    /// Build the cdylibs first — the build→run shortcut; required for a source `.kdl`.
+    /// Build the cdylibs first; required when the target is a source `.kdl`.
     #[arg(long)]
     build: bool,
     /// Build the `--release` profile when `--build` is set.
@@ -101,26 +107,26 @@ struct RunArgs {
     /// An extra arg appended to every `cargo build` (repeatable), with `--build`.
     #[arg(long = "cargo-arg", value_name = "ARG", allow_hyphen_values = true)]
     cargo_arg: Vec<String>,
-    /// Use a paced wall clock (override the KDL's clock).
+    /// Use a paced wall clock, overriding the KDL's clock.
     #[arg(long, group = "clock")]
     wall: bool,
-    /// Use a free-running simulated clock with this per-cycle step, in seconds
-    /// (override the KDL's clock).
+    /// Use a free-running simulated clock with this per-cycle step in seconds,
+    /// overriding the KDL's clock.
     #[arg(long, value_name = "SECS", group = "clock")]
     sim_dt: Option<f64>,
     /// Override the coordinator cycle rate (Hz).
     #[arg(long, value_name = "HZ")]
     cycle_rate: Option<f64>,
-    /// Enable the telemetry downlink to this TCP address (override the KDL).
+    /// Enable the telemetry downlink to this TCP address, overriding the KDL.
     #[arg(long, value_name = "ADDR", group = "telem")]
     telemetry: Option<SocketAddr>,
     /// Disable telemetry even if the KDL declares it.
     #[arg(long, group = "telem")]
     no_telemetry: bool,
-    /// Tap mode for `--telemetry` (v1: `all`).
+    /// Tap mode for `--telemetry`; only `all` is supported.
     #[arg(long, value_name = "MODE", default_value = "all")]
     telemetry_mode: String,
-    /// Enable the command uplink, reading panel `SequenceCommand`s off its own TCP
+    /// Enable the command uplink, reading `SequenceCommand`s from its own TCP
     /// connection to this address (separate from `--telemetry`'s connection).
     #[arg(long, value_name = "ADDR")]
     uplink: Option<SocketAddr>,
@@ -133,8 +139,8 @@ struct RunArgs {
 // Entry points
 // ---------------------------------------------------------------------------
 
-/// Binary entry: parse argv, dispatch, render any error to stderr, set the exit code.
-/// `metor-fsw`'s `main` and a mission host's `main` are both one line: `cli::main()`.
+/// Binary entry point. Parses argv, dispatches, renders any error to stderr,
+/// and sets the exit code. A host binary's `main` is one line, `cli::main()`.
 pub fn main() {
     if let Err(report) = run(std::env::args_os()) {
         // miette's Debug rendering draws the span-carrying diagnostic (the "fancy" feature).
@@ -143,10 +149,11 @@ pub fn main() {
     }
 }
 
-/// Testable entry: parse `args`, dispatch a command. Returns a [`miette::Result`] so the
-/// command logic is drivable without spawning a process. A clap parse failure (or
-/// `--help`/`--version`) is rendered and the process exits with clap's own code — the
-/// command handlers below are what this `Result` reports.
+/// Testable entry point. Parses `args` and dispatches, returning a
+/// [`miette::Result`] so command logic is drivable without spawning a process.
+/// A clap parse failure (or `--help`/`--version`) is rendered by clap and exits
+/// the process with clap's own code; this `Result` reports only what the
+/// command handlers below return.
 pub fn run<I, T>(args: I) -> miette::Result<()>
 where
     I: IntoIterator<Item = T>,
@@ -164,27 +171,38 @@ where
 // Command handlers
 // ---------------------------------------------------------------------------
 
-/// `build` — parse the wiring, compile + locate every artifact's `.so`, print them.
+/// `build`: parse the wiring, compile and locate every artifact's `.so`, print them.
 fn cmd_build(args: BuildArgs) -> miette::Result<()> {
     let text = read_file(&args.kdl)?;
     let mut wiring = parse(&text)?;
     build_artifacts(&mut wiring, &build_opts(args.release, &args.cargo_arg)).into_diagnostic()?;
     for a in &wiring.artifacts {
-        let path = a.path.as_deref().map(|p| p.display().to_string()).unwrap_or_default();
+        let path = a
+            .path
+            .as_deref()
+            .map(|p| p.display().to_string())
+            .unwrap_or_default();
         println!("  {:<28} →  {path}", a.crate_name);
     }
     Ok(())
 }
 
-/// `package` — compile + locate the artifacts (incremental), then write the relocatable
-/// bundle. The build driver is also the locator, so this is always self-sufficient: an
-/// up-to-date tree only relocates the `.so`s, it does not recompile.
+/// `package`: compile and locate the artifacts, then write the relocatable
+/// bundle. The build driver doubles as the locator, so an already up-to-date
+/// tree only relocates the `.so`s without recompiling.
 fn cmd_package(args: PackageArgs) -> miette::Result<()> {
     let text = read_file(&args.kdl)?;
     let mut wiring = parse(&text)?;
     build_artifacts(&mut wiring, &build_opts(args.release, &args.cargo_arg)).into_diagnostic()?;
-    write_bundle(&wiring, &text, &PackageOptions { release: args.release }, &args.out)
-        .into_diagnostic()?;
+    write_bundle(
+        &wiring,
+        &text,
+        &PackageOptions {
+            release: args.release,
+        },
+        &args.out,
+    )
+    .into_diagnostic()?;
     println!(
         "packaged {} artifacts, {} systems → {}",
         wiring.artifacts.len(),
@@ -194,22 +212,22 @@ fn cmd_package(args: PackageArgs) -> miette::Result<()> {
     Ok(())
 }
 
-/// `run` — load the wiring (bundle or source-KDL+`--build`), apply CLI overrides, resolve
-/// against the empty (dl-only) registry, and drive the coordinator on the runtime. Prints a
-/// config banner (so it is obvious what clock/telemetry are active) and a live progress
-/// heartbeat (so a long run visibly advances).
+/// `run`: load the wiring, apply flag overrides, resolve against the built-ins
+/// registry, and drive the coordinator on the runtime. Prints a config banner
+/// up front and a live progress heartbeat while the mission runs.
 fn cmd_run(args: RunArgs) -> miette::Result<()> {
     let mut wiring = load_run_wiring(&args)?;
     apply_overrides(&mut wiring, &args)?;
     print_run_banner(&args.target, &wiring);
 
     let cycles = args.cycles.unwrap_or(usize::MAX);
-    let total = args.cycles; // `Some(n)` ⇒ show `cycle n/total`; `None` ⇒ open-ended.
+    let total = args.cycles;
     let mut coord = resolve(&wiring, &Registry::with_builtins())?;
     let progress = coord.progress();
 
-    // Enter the async runtime at the leaf; `run_for` does init → cycle loop → shutdown. A
-    // side heartbeat task reads the shared progress counter while the loop holds `&mut coord`.
+    // Enter the async runtime at the leaf; `run_for` does init, the cycle loop,
+    // and shutdown. The heartbeat is a side task reading the shared progress
+    // counter, since the loop holds `&mut coord` for its whole life.
     stellarator::run(move || async move {
         let _beat = stellarator::spawn(heartbeat(progress, total)).drop_guard();
         coord.run_for(cycles).await;
@@ -229,17 +247,21 @@ fn cmd_run(args: RunArgs) -> miette::Result<()> {
     Ok(())
 }
 
-/// Print what `run` is about to do — the source, the systems, the active clock, the
-/// telemetry target (with a reachability probe), and the duration — so the run is never a
-/// silent black box. Synchronous; called before the runtime starts.
+/// Print what `run` is about to do: the source, the systems, the active clock,
+/// the link endpoints (with a reachability probe), and the duration. Runs
+/// synchronously before the runtime starts.
 fn print_run_banner(target: &Path, wiring: &Wiring) {
     let names: Vec<&str> = wiring.systems.iter().map(|s| s.name.as_str()).collect();
     let kind = if target.is_dir() { "bundle" } else { "mission" };
     println!("metor-fsw — running {kind} {}", target.display());
-    println!("  systems:   {} ({})", wiring.systems.len(), names.join(", "));
+    println!(
+        "  systems:   {} ({})",
+        wiring.systems.len(),
+        names.join(", ")
+    );
     if !wiring.slots.is_empty() {
-        // Each slot is a runtime-loadable position; show its initial occupant (or
-        // "empty") so the run output reflects the sequences in the mission.
+        // Each slot is a runtime-loadable position; show its initial occupant
+        // (or "empty").
         let slots: Vec<String> = wiring
             .slots
             .iter()
@@ -265,8 +287,8 @@ fn print_run_banner(target: &Path, wiring: &Wiring) {
         }
     }
 
-    // The downlink/uplink are ordinary systems now — the banner scans for the
-    // built-in TCP types, one line per instance (several downlinks are legal).
+    // The links are ordinary systems, so the banner scans for the built-in TCP
+    // types and prints one line per instance (several downlinks are legal).
     let downlinks: Vec<&SystemSpec> = specs_of_type(wiring, TCP_DOWNLINK_TYPE);
     if downlinks.is_empty() {
         println!("  telemetry: off — pass `--telemetry <addr>` to stream to metor-panel");
@@ -281,7 +303,9 @@ fn print_run_banner(target: &Path, wiring: &Wiring) {
     }
     if !downlinks.is_empty() && matches!(wiring.coordinator.clock, ClockSpec::Simulated { .. }) {
         // The sim clock free-runs, so a live downlink would race far ahead of real time.
-        println!("  note:      simulated clock free-runs; pass `--wall` for real-time panel viewing");
+        println!(
+            "  note:      simulated clock free-runs; pass `--wall` for real-time panel viewing"
+        );
     }
 
     let uplinks = specs_of_type(wiring, TCP_UPLINK_TYPE);
@@ -297,9 +321,9 @@ fn print_run_banner(target: &Path, wiring: &Wiring) {
     println!();
 }
 
-/// A one-shot, best-effort TCP reachability check for the telemetry endpoint, so the banner
-/// can warn when metor-panel is not listening yet (the downlink connects once and does not
-/// retry). A transient probe connection is harmless; never fails the run.
+/// A one-shot, best-effort TCP reachability check, so the banner can warn when
+/// nothing is listening at a link endpoint yet (the downlink connects once and
+/// does not retry). The probe connection is transient and never fails the run.
 fn probe_telemetry(addr: SocketAddr) -> bool {
     TcpStream::connect_timeout(&addr, Duration::from_millis(300)).is_ok()
 }
@@ -322,8 +346,9 @@ fn specs_of_type<'w>(wiring: &'w Wiring, ty: &str) -> Vec<&'w SystemSpec> {
         .collect()
 }
 
-/// Pull the `addr=` property back out of a built-in link spec's params node (the
-/// same node text `resolve` re-decodes) — banner display only, never load-bearing.
+/// Pull the `addr=` property back out of a built-in link spec's params node,
+/// the same node text `resolve` re-decodes. Banner display only, never
+/// load-bearing.
 fn spec_addr(spec: &SystemSpec) -> Option<SocketAddr> {
     let crate::wiring::ParamSource::Kdl(text) = &spec.params else {
         return None;
@@ -338,9 +363,8 @@ fn spec_addr(spec: &SystemSpec) -> Option<SocketAddr> {
         .and_then(|s| s.parse().ok())
 }
 
-/// The progress heartbeat: every couple of seconds, print the live cycle counter (read from
-/// the coordinator's shared progress handle) so a long run visibly advances. Cancelled when
-/// its `drop_guard` drops at the end of `run`.
+/// Print the live cycle counter every couple of seconds so a long run visibly
+/// advances. Cancelled when its `drop_guard` drops at the end of `run`.
 async fn heartbeat(progress: Arc<AtomicU64>, total: Option<usize>) {
     let start = Instant::now();
     loop {
@@ -358,10 +382,10 @@ async fn heartbeat(progress: Arc<AtomicU64>, total: Option<usize>) {
 // Helpers
 // ---------------------------------------------------------------------------
 
-/// Resolve `run`'s `<TARGET>` into a located [`Wiring`]: a bundle directory loads
-/// cargo-free ([`load_bundle`]); a source `.kdl` requires `--build` (the only artifact
-/// locator is the cargo build driver, since `.so` paths are not persisted between a
-/// `build` and a later `run`).
+/// Resolve `run`'s `<TARGET>` into a located [`Wiring`]. A bundle directory
+/// loads cargo-free via [`load_bundle`]. A source `.kdl` requires `--build`,
+/// because the cargo build driver is the only artifact locator and `.so` paths
+/// are not persisted between a `build` and a later `run`.
 fn load_run_wiring(args: &RunArgs) -> miette::Result<Wiring> {
     if is_bundle(&args.target) {
         if args.build {
@@ -390,8 +414,8 @@ fn is_bundle(path: &Path) -> bool {
     path.is_dir() || path.extension().is_some_and(|e| e == "bundle")
 }
 
-/// Apply `run`'s override flags onto the loaded [`Wiring`], before `resolve` — the
-/// generalized `build_live_coordinator` mutation (cli-runner.md §7). Flag beats KDL.
+/// Apply `run`'s override flags onto the loaded [`Wiring`] before `resolve`.
+/// A flag always beats the KDL.
 fn apply_overrides(wiring: &mut Wiring, args: &RunArgs) -> miette::Result<()> {
     if args.wall {
         wiring.coordinator.clock = ClockSpec::Wall;
@@ -401,10 +425,13 @@ fn apply_overrides(wiring: &mut Wiring, args: &RunArgs) -> miette::Result<()> {
     if let Some(rate) = args.cycle_rate {
         wiring.coordinator.cycle_rate = rate;
     }
-    // The link flags add/remove instances of the built-in TCP types — keyed on the
-    // TYPE, never the instance name, so a user's custom downlink system is untouched.
+    // The link flags add and remove instances of the built-in TCP types, keyed
+    // on the type rather than the instance name, so a user's custom downlink
+    // system is untouched.
     if args.no_telemetry {
-        wiring.systems.retain(|s| s.ty.as_deref() != Some(TCP_DOWNLINK_TYPE));
+        wiring
+            .systems
+            .retain(|s| s.ty.as_deref() != Some(TCP_DOWNLINK_TYPE));
     } else if let Some(addr) = args.telemetry {
         if args.telemetry_mode != "all" {
             return Err(miette::miette!(
@@ -413,13 +440,17 @@ fn apply_overrides(wiring: &mut Wiring, args: &RunArgs) -> miette::Result<()> {
                 args.telemetry_mode
             ));
         }
-        wiring.systems.retain(|s| s.ty.as_deref() != Some(TCP_DOWNLINK_TYPE));
-        wiring.systems.push(SystemSpec::tcp_downlink("telemetry", addr));
+        wiring
+            .systems
+            .retain(|s| s.ty.as_deref() != Some(TCP_DOWNLINK_TYPE));
+        wiring
+            .systems
+            .push(SystemSpec::tcp_downlink("telemetry", addr));
     }
     if let Some(addr) = args.uplink {
-        // Patch `addr=` on the declared uplink(s) IN PLACE — never replace the node,
-        // which would silently drop its `msgs` config (an uplink relaying nothing).
-        // Only a mission with no uplink at all gets a fresh (msgs-less) instance.
+        // Patch `addr=` on the declared uplink(s) in place. Replacing the node
+        // would silently drop its `msgs` config, leaving an uplink that relays
+        // nothing. Only a mission with no uplink at all gets a fresh instance.
         let mut found = false;
         for spec in wiring
             .systems
@@ -436,9 +467,9 @@ fn apply_overrides(wiring: &mut Wiring, args: &RunArgs) -> miette::Result<()> {
     Ok(())
 }
 
-/// Upsert the `addr=` property on a built-in link spec's params node, preserving
-/// every other param (the uplink's `msgs` children) — the write twin of
-/// [`spec_addr`]. A param-less spec synthesizes the minimal node
+/// Upsert the `addr=` property on a built-in link spec's params node,
+/// preserving every other param (notably the uplink's `msgs` children); the
+/// write twin of [`spec_addr`]. A param-less spec synthesizes the minimal node
 /// [`SystemSpec::tcp_uplink`] would have produced.
 fn patch_spec_addr(spec: &mut SystemSpec, addr: SocketAddr) -> miette::Result<()> {
     use crate::wiring::ParamSource;
@@ -461,8 +492,7 @@ fn patch_spec_addr(spec: &mut SystemSpec, addr: SocketAddr) -> miette::Result<()
                 spec.name
             ));
         }
-        // Typed builder params are postcard bytes with no KDL to patch; the static
-        // resolve path rejects them anyway (`StaticPostcardParams`).
+        // Typed builder params are postcard bytes with no KDL to patch.
         ParamSource::Postcard(_) => {
             return Err(miette::miette!(
                 "cannot override `addr` on `{}`: it carries typed (postcard) params",

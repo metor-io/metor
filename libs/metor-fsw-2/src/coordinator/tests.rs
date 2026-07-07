@@ -1,7 +1,7 @@
-//! Coordinator acceptance tests (coordinator.md "Tests"): the two-cyclic-system graph end
-//! to end, the lapped hard-stop, an async system wired through a private copy-in
-//! buffer, build-time wiring validation, and the init barrier. Systems are
-//! registered and wired through the `Coordinator` builder — no hand-built ports.
+//! Coordinator acceptance tests: a two-cyclic-system pipeline end to end,
+//! backpressure from an idle consumer, an async system fed through its private
+//! copy-in buffer, build-time wiring validation, and the init barrier. Every
+//! graph here is registered and wired through the `Coordinator` builder.
 
 use std::cell::RefCell;
 use std::rc::Rc;
@@ -40,7 +40,7 @@ struct Nav {
     angle: f64,
 }
 
-// Empty bundles for systems with no user inputs / outputs.
+// Empty bundles for systems with no user inputs or outputs.
 #[derive(SystemInput)]
 struct NoIn {}
 
@@ -53,7 +53,7 @@ struct NoOut {}
 
 struct Producer {
     n: f64,
-    /// Optional burst count (writes N records per execute) for the drop-on-full test.
+    /// Records written per execute; more than one bursts past a per-cycle mirror.
     burst: u64,
     init_counter: Option<Arc<AtomicUsize>>,
 }
@@ -102,7 +102,7 @@ impl CyclicSystem for Producer {
 
 struct Consumer {
     seen: Rc<RefCell<Vec<f64>>>,
-    /// When false the consumer never drains its input (forces a lap).
+    /// When false the consumer never reads, so its view eventually fills the ring.
     drain: bool,
     init_counter: Option<Arc<AtomicUsize>>,
     first_exec_init: Option<Arc<AtomicUsize>>,
@@ -127,13 +127,13 @@ impl System for Consumer {
 impl CyclicSystem for Consumer {
     fn execute(&mut self, _now: Timestamp, input: &mut ConsIn, _o: &mut Self::Output) {
         if let Some(c) = &self.first_exec_init {
-            // Record (once) how many inits had run before the first execute.
+            // Record, once, how many inits had run before the first execute.
             if let Some(ic) = &self.init_counter {
                 let _ = c.compare_exchange(0, ic.load(Relaxed), Relaxed, Relaxed);
             }
         }
         if !self.drain {
-            return; // ignore the input so it eventually laps
+            return; // ignore the input so the ring fills up
         }
         if let Some(imu) = input.imu.latest() {
             self.seen.borrow_mut().push(imu.get().omega);
@@ -179,8 +179,8 @@ async fn two_system_end_to_end() {
 
 // ---------------------------------------------------------------------------
 // A consumer that never drains backpressures its producer: nothing is
-// overwritten, nothing hard-stops, and the cycle loop never blocks (the
-// producer's failed publishes are counted, not returned).
+// overwritten, nothing stops, and the cycle loop never blocks because the
+// producer's failed writes are counted rather than returned.
 // ---------------------------------------------------------------------------
 
 #[cfg(not(miri))]
@@ -191,7 +191,7 @@ async fn idle_consumer_backpressures_producer() {
     let prod = b.add_cyclic(Producer::new());
     let cons = b.add_cyclic(Consumer {
         seen: seen.clone(),
-        drain: false, // never reads → its view eventually fills the ring
+        drain: false, // never reads, so its view eventually fills the ring
         init_counter: None,
         first_exec_init: None,
     });
@@ -201,9 +201,12 @@ async fn idle_consumer_backpressures_producer() {
 
     coord.run_for(60).await;
 
-    // No hard-stop doctrine anymore: both systems keep running; the writer's
-    // rejected writes were dropped (and counted on the producer's health).
-    assert!(coord.stopped().is_empty(), "backpressure never stops a system");
+    // Both systems keep running; the writer's rejected writes were dropped and
+    // counted on the producer's health.
+    assert!(
+        coord.stopped().is_empty(),
+        "backpressure never stops a system"
+    );
     assert!(seen.borrow().is_empty(), "the consumer never drained");
 }
 
@@ -232,7 +235,7 @@ impl System for AsyncConsumer {
 
 impl AsyncSystem for AsyncConsumer {
     async fn run(&mut self, input: &mut Self::Input, _o: &mut Self::Output) {
-        // Corrupt (the only recv error) is unreachable in practice; skip the wake.
+        // recv only fails on a corrupt record, which cannot happen here.
         if let Ok(imu) = input.imu.recv().await {
             self.count.fetch_add(1, Relaxed);
             self.last.store(imu.get().omega as u64, Relaxed);
@@ -258,8 +261,8 @@ async fn async_through_copy_in() {
         .unwrap();
     let mut coord = b.build().unwrap();
 
-    // Completes without blocking despite the burst (the copy-in mirrors only the
-    // newest record per cycle; a full private ring skips, never suspends).
+    // Completes without blocking despite the burst; the copy-in mirrors only the
+    // newest record per cycle, and a full private ring skips rather than suspends.
     coord.run_for(30).await;
 
     assert!(
@@ -275,7 +278,7 @@ async fn async_through_copy_in() {
 
 #[test]
 fn validation_incompatible_frame_id_mismatch() {
-    // connect rejects a producer/consumer that do not even share a frame id.
+    // connect rejects a producer/consumer pair that do not even share a frame id.
     let mut b = Coordinator::builder(config());
     let prod = b.add_cyclic(Producer::new());
     let cons = b.add_cyclic(Consumer {
@@ -292,7 +295,6 @@ fn validation_incompatible_frame_id_mismatch() {
 
 #[test]
 fn validation_unknown_port() {
-    // The producer has no `Nav` output, so the edge fails at build.
     let mut b = Coordinator::builder(config());
     let prod = b.add_cyclic(Producer::new());
     let cons = b.add_cyclic(Consumer {
@@ -301,8 +303,8 @@ fn validation_unknown_port() {
         init_counter: None,
         first_exec_init: None,
     });
-    // Same frame id on both sides (passes connect), but the producer lacks a Nav
-    // output port → UnknownPort at build.
+    // Both sides name the same frame id, so connect accepts the edge, but the
+    // producer has no `Nav` output port and build reports UnknownPort.
     b.connect(PortRef::new::<Nav>(prod), PortRef::new::<Nav>(cons))
         .unwrap();
     assert!(matches!(b.build(), Err(WireError::UnknownPort { .. })));
@@ -318,14 +320,15 @@ fn validation_unconnected_input() {
         init_counter: None,
         first_exec_init: None,
     });
-    // No connect at all → the consumer's `imu` input is unconnected.
+    // With no connect call at all, the consumer's `imu` input is unconnected.
     assert!(matches!(b.build(), Err(WireError::UnconnectedInput { .. })));
 }
 
 #[test]
 fn validation_invalid_cycle_rate_wall_clock() {
-    // A 0/negative/NaN/infinite cycle_rate would panic in `Duration::from_secs_f64`
-    // at run time under a Wall clock; build() rejects it up front instead.
+    // A zero, negative, NaN, or infinite cycle_rate would panic inside
+    // `Duration::from_secs_f64` at run time under a Wall clock, so build()
+    // rejects it up front.
     for rate in [0.0, -5.0, f64::NAN, f64::INFINITY] {
         let mut b = Coordinator::builder(CoordinatorConfig {
             cycle_rate: rate,
@@ -344,8 +347,8 @@ fn validation_invalid_cycle_rate_wall_clock() {
 #[cfg(not(miri))]
 #[stellarator::test]
 async fn simulated_clock_ignores_cycle_rate() {
-    // `cycle_rate` is documented ignored under `Simulated`, so an unusable rate must
-    // neither fail build nor panic mid-run (the budget is only computed under Wall).
+    // `cycle_rate` is ignored under `Simulated`, so an unusable rate must neither
+    // fail build nor panic mid-run; the cycle budget is only computed under Wall.
     let mut b = Coordinator::builder(CoordinatorConfig {
         cycle_rate: 0.0,
         default_depth: crate::DEFAULT_DEPTH,
@@ -355,8 +358,10 @@ async fn simulated_clock_ignores_cycle_rate() {
         ..CoordinatorConfig::default()
     });
     b.add_cyclic(Producer::new());
-    let mut coord = b.build().expect("cycle_rate is not validated under Simulated");
-    coord.run_for(3).await; // panicked in Duration::from_secs_f64 before the fix
+    let mut coord = b
+        .build()
+        .expect("cycle_rate is not validated under Simulated");
+    coord.run_for(3).await; // must complete without touching Duration::from_secs_f64
 }
 
 #[test]
@@ -418,8 +423,8 @@ async fn init_barrier_holds() {
 // Feedback loops: an unbroken cycle is rejected; `connect_delayed` breaks it.
 // ---------------------------------------------------------------------------
 
-// `Looper` produces `Imu`, consumes `Nav`; `Backer` produces `Nav`, consumes
-// `Imu`. Plain-connecting both directions closes a 2-system cycle.
+// `Looper` produces `Imu` and consumes `Nav`; `Backer` produces `Nav` and
+// consumes `Imu`. Plain-connecting both directions closes a two-system cycle.
 struct Looper {
     n: f64,
 }
@@ -442,7 +447,7 @@ impl System for Looper {
 
 impl CyclicSystem for Looper {
     fn execute(&mut self, now: Timestamp, input: &mut LooperIn, o: &mut Self::Output) {
-        let _ = input.nav.latest(); // sample the (one-cycle-late) feedback
+        let _ = input.nav.latest(); // sample the one-cycle-late feedback
         self.n += 1.0;
         let _ = o.imu.write(&Imu {
             timestamp: now,
@@ -487,7 +492,7 @@ fn feedback_cycle_unbroken_is_rejected() {
     let mut b = Coordinator::builder(config());
     let looper = b.add_cyclic(Looper { n: 0.0 });
     let backer = b.add_cyclic(Backer);
-    // Both directions are plain forward edges → an unbroken cycle.
+    // Both directions are plain forward edges, which closes an unbroken cycle.
     b.connect(PortRef::new::<Imu>(looper), PortRef::new::<Imu>(backer))
         .unwrap();
     b.connect(PortRef::new::<Nav>(backer), PortRef::new::<Nav>(looper))
@@ -510,11 +515,12 @@ async fn delayed_edge_allows_feedback_loop() {
         .unwrap();
     b.connect_delayed(PortRef::new::<Nav>(backer), PortRef::new::<Nav>(looper))
         .unwrap();
-    let mut coord = b.build().expect("connect_delayed breaks the cycle so it builds");
+    let mut coord = b
+        .build()
+        .expect("connect_delayed breaks the cycle so it builds");
 
     coord.run_for(5).await;
 
-    // Both systems ran the whole way without lapping/hard-stopping.
     assert!(coord.stopped().is_empty(), "no system hard-stopped");
 }
 
@@ -523,8 +529,8 @@ async fn delayed_edge_allows_feedback_loop() {
 // feedback loop, so it needs `connect_delayed` like any other loop.
 // ---------------------------------------------------------------------------
 
-// `SelfLoop` consumes and produces `Imu` — its input can only ever be its own
-// previous-cycle output.
+// `SelfLoop` consumes and produces `Imu`, so its input can only ever be its
+// own previous-cycle output.
 struct SelfLoop {
     n: f64,
 }
@@ -560,11 +566,13 @@ impl CyclicSystem for SelfLoop {
 fn self_loop_plain_connect_is_rejected() {
     let mut b = Coordinator::builder(config());
     let s = b.add_cyclic(SelfLoop { n: 0.0 });
-    // A plain frame edge from a system to itself: previously exempt from cycle
-    // detection, now a one-member `FeedbackCycle`.
+    // A plain frame edge from a system to itself is a one-member feedback cycle.
     b.connect(PortRef::new::<Imu>(s), PortRef::new::<Imu>(s))
         .unwrap();
-    let err = b.build().err().expect("a plain self-edge is rejected at build");
+    let err = b
+        .build()
+        .err()
+        .expect("a plain self-edge is rejected at build");
     assert!(
         matches!(&err, WireError::FeedbackCycle { systems } if systems == &vec!["self_loop"]),
         "{err:?}"
@@ -578,7 +586,9 @@ async fn self_loop_delayed_connect_builds_and_runs() {
     let s = b.add_cyclic(SelfLoop { n: 0.0 });
     b.connect_delayed(PortRef::new::<Imu>(s), PortRef::new::<Imu>(s))
         .unwrap();
-    let mut coord = b.build().expect("connect_delayed declares the self-feedback");
+    let mut coord = b
+        .build()
+        .expect("connect_delayed declares the self-feedback");
 
     coord.run_for(5).await;
 
@@ -594,7 +604,7 @@ async fn self_loop_delayed_connect_builds_and_runs() {
 #[test]
 fn backward_frame_edge_is_rejected() {
     let mut b = Coordinator::builder(config());
-    // The consumer registers (and therefore steps) BEFORE its producer.
+    // The consumer registers, and therefore steps, before its producer.
     let cons = b.add_cyclic(Consumer {
         seen: Rc::new(RefCell::new(Vec::new())),
         drain: true,
@@ -621,7 +631,7 @@ fn backward_frame_edge_is_rejected() {
 #[cfg(not(miri))]
 #[stellarator::test]
 async fn backward_frame_edge_allowed_when_delayed() {
-    // The same backward edge declared with `connect_delayed` builds: the one-cycle
+    // The same backward edge declared with `connect_delayed` builds; the one-cycle
     // staleness is now explicit, and the consumer samples last cycle's value.
     let seen = Rc::new(RefCell::new(Vec::new()));
     let mut b = Coordinator::builder(config());
@@ -645,9 +655,9 @@ async fn backward_frame_edge_allowed_when_delayed() {
 #[cfg(not(miri))]
 #[stellarator::test]
 async fn backward_edge_to_async_consumer_is_allowed() {
-    // Registration order carries no execution-order semantics for an async consumer
-    // (it reads through the post-step copy-in), so registering it before its producer
-    // is fine — the StaleFrameEdge check only covers cyclic-to-cyclic edges.
+    // Registration order carries no execution-order meaning for an async consumer,
+    // which reads through the post-step copy-in, so registering it before its
+    // producer is fine; the StaleFrameEdge check only covers cyclic-to-cyclic edges.
     let count = Arc::new(AtomicU64::new(0));
     let last = Arc::new(AtomicU64::new(0));
     let mut b = Coordinator::builder(config());
@@ -700,8 +710,8 @@ fn stopped_set_change_detection_compares_membership() {
         name: "b",
         reason: StopReason::Panicked,
     };
-    // Equal length, different member (a slot recovered the same cycle another
-    // stopped) — the length-only check missed exactly this.
+    // Equal length but a different member, as when one slot recovers the same
+    // cycle another stops. Length alone cannot distinguish these sets.
     assert!(stopped_set_changed(&[a], &[b]));
     // Identical sets are unchanged; length changes still register.
     assert!(!stopped_set_changed(&[a, b], &[a, b]));
@@ -753,16 +763,20 @@ async fn simulated_clock_is_deterministic_and_monotonic() {
     let step = dt.as_micros() as i64;
     for k in 1..s.len() {
         // Cycle k sits exactly k*dt past cycle 0, and the clock is strictly rising.
-        assert_eq!(s[k].0 - s[0].0, k as i64 * step, "cycle {k} at start + k*dt");
+        assert_eq!(
+            s[k].0 - s[0].0,
+            k as i64 * step,
+            "cycle {k} at start + k*dt"
+        );
         assert!(s[k].0 > s[k - 1].0, "monotonically increasing");
     }
 }
 
 #[test]
 fn simulated_clock_does_not_wrap_past_u32_cycles() {
-    // The old arithmetic (`epoch + dt * k as u32`) truncated the cycle index, jumping
-    // the timeline back to `epoch` every 2^32 cycles. The wide-integer helper stays
-    // exact and strictly monotonic across that boundary.
+    // Computing `epoch + dt * k as u32` truncates the cycle index and jumps the
+    // timeline back to the epoch every 2^32 cycles. `simulated_now` uses wide
+    // integers, so it stays exact and strictly monotonic across that boundary.
     use super::simulated_now;
     let epoch = Timestamp(1_000);
     let dt = Duration::from_micros(8_333);
@@ -775,12 +789,16 @@ fn simulated_clock_does_not_wrap_past_u32_cycles() {
         before.0,
         at.0
     );
-    assert_eq!(at.0 - epoch.0, 8_333 * (1i64 << 32), "exactly k*dt past epoch");
+    assert_eq!(
+        at.0 - epoch.0,
+        8_333 * (1i64 << 32),
+        "exactly k*dt past epoch"
+    );
 }
 
 // ---------------------------------------------------------------------------
-// Message edges (docs/message-wiring.md §3): typed `MsgOut<M>` -> `MsgIn<M>`,
-// fan-in, and the wiring-validation behaviour (id-mismatch, optional inputs).
+// Message edges: typed `MsgOut<M>` to `MsgIn<M>`, fan-in, and their wiring
+// validation (id mismatch, duplicate edges, optional inputs).
 // ---------------------------------------------------------------------------
 
 #[derive(serde::Serialize, serde::Deserialize, postcard_schema::Schema)]
@@ -793,7 +811,7 @@ struct OtherEvent {
     x: u32,
 }
 
-// A wired message port needs the explicit, stable name token (A10).
+// A wired message port needs an explicit, stable name.
 impl crate::NamedMsg for TestEvent {
     const NAME: &'static str = "TestEvent";
 }
@@ -846,7 +864,7 @@ impl CyclicSystem for MsgConsumer {
     }
 }
 
-// A consumer of a *different* Msg type, for the id-mismatch check.
+// A consumer of a different message type, for the id-mismatch check.
 struct OtherConsumer;
 
 #[derive(SystemInput)]
@@ -882,7 +900,7 @@ async fn msg_edge_two_cyclic_systems() {
 
     coord.run_for(4).await;
 
-    // Producer emits 1..=4; the consumer drains each the same cycle (producer runs first).
+    // The producer emits 1..=4; the consumer drains each the same cycle (producer runs first).
     assert_eq!(*seen.borrow(), vec![1, 2, 3, 4]);
 }
 
@@ -894,7 +912,7 @@ async fn msg_fanin_two_emitters_one_consumer() {
     let prod_a = b.add_cyclic_named("emitter_a", MsgProducer { n: 0 });
     let prod_b = b.add_cyclic_named("emitter_b", MsgProducer { n: 100 });
     let cons = b.add_cyclic(MsgConsumer { seen: seen.clone() });
-    // Two producers fan in to one message input — no `DoubleConnect`.
+    // Two producers fan in to one message input without a `DoubleConnect`.
     b.connect(
         PortRef::msg::<TestEvent>(prod_a),
         PortRef::msg::<TestEvent>(cons),
@@ -917,7 +935,7 @@ async fn msg_fanin_two_emitters_one_consumer() {
 
 #[test]
 fn msg_exact_duplicate_edge_is_rejected() {
-    // Fan-in of DISTINCT producers is legal (covered above); the exact same edge
+    // Fan-in of distinct producers is legal (covered above); the exact same edge
     // twice would deliver every record twice, so build() rejects the duplicate.
     let mut b = Coordinator::builder(config());
     let prod = b.add_cyclic(MsgProducer { n: 0 });
@@ -935,7 +953,10 @@ fn msg_exact_duplicate_edge_is_rejected() {
         PortRef::msg::<TestEvent>(cons),
     )
     .unwrap();
-    let err = b.build().err().expect("the duplicate message edge is rejected");
+    let err = b
+        .build()
+        .err()
+        .expect("the duplicate message edge is rejected");
     assert!(
         matches!(
             err,
@@ -954,8 +975,8 @@ fn msg_edge_mismatched_type_is_rejected() {
     let mut b = Coordinator::builder(config());
     let prod = b.add_cyclic(MsgProducer { n: 0 });
     let cons = b.add_cyclic(OtherConsumer);
-    // `MsgOut<TestEvent>` -> `MsgIn<OtherEvent>`: distinct `M::ID`, so the two PortRefs name
-    // different ports — rejected at `connect` (the same cheap port-id guard).
+    // `MsgOut<TestEvent>` into `MsgIn<OtherEvent>` names two different ports
+    // (distinct `M::ID`), so `connect` rejects it with the same cheap id guard.
     let err = b
         .connect(
             PortRef::msg::<TestEvent>(prod),
@@ -967,8 +988,8 @@ fn msg_edge_mismatched_type_is_rejected() {
 
 #[test]
 fn delayed_edge_into_log_input_is_rejected() {
-    // `delayed` marks a one-cycle-late snapshot sample; on a Log input it is
-    // meaningless — previously accepted-and-ignored, now a build error (A7).
+    // `delayed` marks a one-cycle-late snapshot sample; on a Log input it means
+    // nothing, so build rejects the edge instead of silently ignoring the flag.
     let mut b = Coordinator::builder(config());
     let prod = b.add_cyclic(MsgProducer { n: 0 });
     let cons = b.add_cyclic(MsgConsumer {
@@ -994,7 +1015,7 @@ fn delayed_edge_into_log_input_is_rejected() {
 }
 
 // A consumer whose hand-written input descriptor declares the ill-defined
-// FanIn::Many × Delivery::Snapshot combination.
+// FanIn::Many with Delivery::Snapshot combination.
 struct SnapshotFanInConsumer;
 
 struct SnapshotFanInIn {
@@ -1031,8 +1052,8 @@ impl CyclicSystem for SnapshotFanInConsumer {
 
 #[test]
 fn snapshot_fan_in_is_rejected() {
-    // Latest-wins across several producers is ill-defined, so Many × Snapshot is a
-    // build error even before any edge is connected.
+    // Latest-wins across several producers is ill-defined, so many-producer
+    // snapshot inputs are a build error even before any edge is connected.
     let mut b = Coordinator::builder(config());
     b.add_cyclic(Producer::new());
     b.add_cyclic(SnapshotFanInConsumer);
@@ -1052,8 +1073,8 @@ fn snapshot_fan_in_is_rejected() {
 #[cfg(not(miri))]
 #[stellarator::test]
 async fn msg_input_may_be_unconnected() {
-    // A message input with zero producers builds fine and drains nothing (§3.2) — unlike a
-    // frame input, which would be an `UnconnectedInput` build error.
+    // A message input with zero producers builds fine and drains nothing, unlike
+    // a frame input, which would be an `UnconnectedInput` build error.
     let seen = Rc::new(RefCell::new(Vec::new()));
     let mut b = Coordinator::builder(config());
     let _cons = b.add_cyclic(MsgConsumer { seen: seen.clone() });
@@ -1063,9 +1084,9 @@ async fn msg_input_may_be_unconnected() {
 }
 
 // ---------------------------------------------------------------------------
-// AllOutputs receive-all tap (docs/message-wiring.md §4): a non-telemetry system
-// declaring `AllOutputs` sees every frame output and telemetered message channel,
-// and self-derives its reader-slot budget on every buffer.
+// AllOutputs receive-all tap: a system declaring `AllOutputs` sees every frame
+// output and telemetered message channel, and reserves itself a reader slot on
+// every one of those buffers.
 // ---------------------------------------------------------------------------
 
 struct AllTap {
@@ -1103,7 +1124,7 @@ async fn all_outputs_taps_the_whole_graph() {
     let frame_outs = Rc::new(std::cell::Cell::new(0));
     let msg_chans = Rc::new(std::cell::Cell::new(0));
     let mut b = Coordinator::builder(config());
-    // A producer of a (telemetered) message channel + its implicit health/log frame outputs.
+    // A producer of a telemetered message channel plus its implicit health/log frame outputs.
     let _prod = b.add_cyclic(MsgProducer { n: 0 });
     let _tap = b.add_cyclic(AllTap {
         frame_outs: frame_outs.clone(),
@@ -1112,22 +1133,31 @@ async fn all_outputs_taps_the_whole_graph() {
     let mut coord = b.build().unwrap();
     coord.run_for(1).await;
 
-    // The tap — with no wired edges — sees the producer's message channel and the frame
-    // outputs (health/log of both systems + the coordinator's own), proving the broad tap
-    // and that the `ReceiveAll` port reserved itself a reader slot everywhere (build succeeded).
-    assert!(msg_chans.get() >= 1, "sees the message channel: {}", msg_chans.get());
-    assert!(frame_outs.get() >= 2, "sees frame outputs: {}", frame_outs.get());
+    // The tap has no wired edges, yet it sees the producer's message channel and
+    // the frame outputs (health/log of both systems plus the coordinator's own).
+    // Build succeeding also proves the receive-all port reserved itself a reader
+    // slot on every buffer.
+    assert!(
+        msg_chans.get() >= 1,
+        "sees the message channel: {}",
+        msg_chans.get()
+    );
+    assert!(
+        frame_outs.get() >= 2,
+        "sees frame outputs: {}",
+        frame_outs.get()
+    );
 }
 
 // ---------------------------------------------------------------------------
-// Capabilities (A4/C6): AllOutputs is a SystemDescriptor capability, not a port —
-// no sentinel desc, no placeholder ring, no bind-cursor position.
+// Capabilities: AllOutputs is a SystemDescriptor capability, not a port. It
+// gets no sentinel desc, no placeholder ring, and no bind-cursor position.
 // ---------------------------------------------------------------------------
 
 struct MixedTap;
 
-/// A capability field FIRST, a real port after it: if the capability consumed a
-/// bind-cursor position, `imu` would bind over the wrong ring.
+/// A capability field first and a real port after it. If the capability
+/// consumed a bind-cursor position, `imu` would bind over the wrong ring.
 #[derive(SystemOutput)]
 struct MixedTapOut {
     all: AllOutputs,
@@ -1149,18 +1179,23 @@ impl CyclicSystem for MixedTap {
     }
 }
 
-/// The descriptor splits ports from capabilities: the port lists carry ONLY wired
-/// ports (no receive-all sentinel), and the capability set carries `ReceiveAll`.
+/// The descriptor splits ports from capabilities: the port lists carry only
+/// wired ports, and the capability set carries `ReceiveAll`.
 #[test]
 fn capability_lifts_out_of_the_port_lists() {
     let d = <MixedTap as CyclicSystem>::descriptor();
     assert_eq!(d.capabilities, vec![crate::Capability::ReceiveAll]);
     let names: Vec<&str> = d.outputs.iter().map(|p| p.name).collect();
-    assert_eq!(names, vec!["imu", "health", "log"], "wired ports only, in field order");
+    assert_eq!(
+        names,
+        vec!["imu", "health", "log"],
+        "wired ports only, in field order"
+    );
 }
 
-/// End-to-end bind alignment: with the capability declared BEFORE a real port, the
-/// port still binds its own ring — its records are readable under its registry key.
+/// End-to-end bind alignment: with the capability declared before a real port,
+/// the port still binds its own ring and its records are readable under its
+/// registry key.
 #[cfg(not(miri))]
 #[stellarator::test]
 async fn capability_field_consumes_no_bind_cursor() {
@@ -1169,11 +1204,13 @@ async fn capability_field_consumes_no_bind_cursor() {
     // Registered last: a cyclic ReceiveAll holder must step after everything else.
     b.add_cyclic(MixedTap);
     let mut coord = b.build().unwrap();
-    // Claim the tap before any cycle runs — a view on an overwrite ring starts at
-    // the live edge, so it must exist before data flows.
+    // Claim the view before any cycle runs; a view starts at the live edge of its
+    // ring, so it must exist before data flows.
     let registry = coord.registry();
     let key = metor_proto::types::ComponentId::new("mixed_tap.imu");
-    let entry = registry.get(key).expect("the port after the capability is registered");
+    let entry = registry
+        .get(key)
+        .expect("the port after the capability is registered");
     let mut view = entry.view().expect("reader slot");
     coord.run_for(2).await;
 
@@ -1186,10 +1223,9 @@ async fn capability_field_consumes_no_bind_cursor() {
 
 #[test]
 fn command_ring_registered_but_untelemetered() {
-    // The coordinator's command channel is an ordinary registered entry now (A6):
-    // findable by key through the full registry (debugger/test surface), flagged
-    // untelemetered — the AllOutputs/downlink surface must never see it. No more
-    // opt-out-by-omission.
+    // The coordinator's command channel is an ordinary registered entry, findable
+    // by key through the full registry, but flagged untelemetered so the
+    // AllOutputs and downlink surfaces never see inbound control.
     let mut b = Coordinator::builder(config());
     b.add_cyclic(Producer::new());
     let coord = b.build().unwrap();
@@ -1203,9 +1239,9 @@ fn command_ring_registered_but_untelemetered() {
 
 #[test]
 fn coordinator_bundle_registry_keys_are_golden() {
-    // A9: the coordinator's channels come off its declared #0 bundle now — the
-    // registry keys must stay byte-identical to the historical hand-rolled ones so
-    // nothing downstream (Subset filters, db paths, panel taps) moves.
+    // The coordinator's channels come off its declared bundle, but external
+    // consumers address these buffers by their key strings, so the exact keys
+    // are pinned here.
     let mut b = Coordinator::builder(config());
     b.add_cyclic(Producer::new());
     let coord = b.build().unwrap();
@@ -1228,19 +1264,22 @@ fn coordinator_bundle_registry_keys_are_golden() {
 #[test]
 fn duplicate_registry_key_is_rejected() {
     // Two systems registered under the same instance name compute colliding
-    // `<instance>.<name>` keys for every port (user frame + health + log). One
-    // keyspace makes the collision a build error instead of a silent shadowing.
+    // `<instance>.<name>` keys for every port. Build reports the collision
+    // instead of letting one entry silently shadow the other.
     let mut b = Coordinator::builder(config());
     b.add_cyclic_named("dup", Producer::new());
     b.add_cyclic_named("dup", Producer::new());
-    let err = b.build().err().expect("colliding registry keys are rejected");
+    let err = b
+        .build()
+        .err()
+        .expect("colliding registry keys are rejected");
     assert!(
         matches!(&err, WireError::DuplicateRegistryKey { key } if key == "dup.imu"),
         "{err:?}"
     );
 }
 
-// A producer whose frame output opts out of telemetry (the A6 frame-side opt-out).
+// A producer whose frame output opts out of telemetry.
 struct QuietProducer;
 
 struct QuietOut {
@@ -1249,7 +1288,9 @@ struct QuietOut {
 
 impl SystemOutput for QuietOut {
     fn decls() -> Vec<crate::PortDecl> {
-        vec![crate::PortDecl::Port(crate::PortDesc::of::<Imu>().untelemetered())]
+        vec![crate::PortDecl::Port(
+            crate::PortDesc::of::<Imu>().untelemetered(),
+        )]
     }
 }
 
@@ -1279,9 +1320,9 @@ impl CyclicSystem for QuietProducer {
 #[cfg(not(miri))]
 #[stellarator::test]
 async fn untelemetered_frame_output_hidden_from_all_outputs() {
-    // A frame output with `telemetered = false` stays a fully registered, readable
-    // buffer (full-registry surface) but is invisible through `AllOutputs` — the
-    // frame-side twin of the command-channel opt-out (A6).
+    // A frame output declared untelemetered stays a fully registered, readable
+    // buffer but is invisible through `AllOutputs`, the frame-side twin of the
+    // command-channel opt-out.
     let frame_outs = Rc::new(std::cell::Cell::new(0));
     let msg_chans = Rc::new(std::cell::Cell::new(0));
     let mut b = Coordinator::builder(config());
@@ -1294,11 +1335,14 @@ async fn untelemetered_frame_output_hidden_from_all_outputs() {
 
     let registry = coord.registry();
     let key = metor_proto::types::ComponentId::new("quiet.imu");
-    let entry = registry.get(key).expect("untelemetered frame is registered");
+    let entry = registry
+        .get(key)
+        .expect("untelemetered frame is registered");
     assert!(!entry.telemetered);
 
     coord.run_for(1).await;
-    // The tap sees the two systems' health/log frames (4) + coordinator health/log/
-    // status (3), but NOT quiet.imu. Exact count so a filter regression is loud.
+    // The tap sees the two systems' health/log frames (4) plus the coordinator's
+    // health, log, and status (3), but not quiet.imu. The exact count keeps a
+    // filter regression loud.
     assert_eq!(frame_outs.get(), 7, "quiet.imu is filtered at the source");
 }

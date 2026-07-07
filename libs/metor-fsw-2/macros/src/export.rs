@@ -1,21 +1,25 @@
-//! `export_system!(MySystem);` — the system-author surface that turns an ordinary
-//! `impl CyclicSystem` into a `dlopen`-loadable `cdylib`'s C-ABI (dl-open.md §3).
+//! Generates the C ABI a cyclic system exports when it is compiled as a
+//! dynamically loaded `cdylib`.
 //!
-//! Each generated `#[unsafe(no_mangle)] pub extern "C" fn fsw_*` is a one-liner that
-//! delegates to the matching `metor_fsw_2::abi::run_*` helper, so the real logic
-//! lives in `abi.rs` (testable without the macro) and the macro stays thin. The
-//! function names are the string forms of the `abi::SYM_*` constants — one source of
-//! truth the host resolves by.
+//! Each generated `#[unsafe(no_mangle)] pub extern "C" fn fsw_*` is a one-line
+//! shim that delegates to the matching `metor_fsw_2::abi::run_*` helper, so
+//! the real logic lives in code that can be tested without expanding the
+//! macro. The function names are the string forms of the `abi::SYM_*`
+//! constants the host resolves against, which keeps the two sides from
+//! drifting apart.
 //!
-//! `MySystem::Params` must be `Serialize + Deserialize + Schema` (postcard): the
-//! params blob crosses `fsw_create` as canonical postcard bytes, and `fsw_describe`
-//! exports `<Params as postcard_schema::Schema>::SCHEMA` so the host can encode params
-//! from KDL without linking the `Params` type (dl-open.md §6.3).
+//! The system's `Params` type must implement `Serialize`, `Deserialize`, and
+//! `postcard_schema::Schema`. The params blob crosses `fsw_create` as
+//! canonical postcard bytes, and `fsw_describe` writes the schema into the
+//! descriptor so a host can encode params without ever linking the `Params`
+//! type.
 //!
-//! [`export_items`] is the shared generator: `export_system!` emits it ungated;
-//! `#[system(export)]`/`#[system(export = "feature")]` emit it behind a `cfg` gate.
-//! Every item carries `#[allow(clippy::not_unsafe_ptr_arg_deref)]` (the raw-pointer
-//! params are the ABI contract), so consuming crates need no crate-level allow.
+//! [`export_items`] is the shared generator. `export_system!` emits the items
+//! ungated, while `#[system(export)]` and `#[system(export = "feature")]`
+//! wrap each one in a `cfg` gate. Every item carries
+//! `#[allow(clippy::not_unsafe_ptr_arg_deref)]` because raw-pointer
+//! parameters are the ABI contract, sparing consuming crates a crate-level
+//! allow.
 
 use proc_macro::TokenStream;
 use proc_macro2::TokenStream as TokenStream2;
@@ -28,9 +32,9 @@ pub fn export_system(input: TokenStream) -> TokenStream {
     export_items(&quote! { #ty }, &fsw2, None).into()
 }
 
-/// The `fsw_*` C-ABI items for cyclic system `ty`, each optionally wrapped in the
-/// `cfg` `gate` (`#[system]`'s `not(test)` / feature gating; `export_system!` passes
-/// `None` — a pure-cdylib crate exports unconditionally).
+/// Generates the `fsw_*` C-ABI items for the cyclic system `ty`, wrapping
+/// each one in `gate` when a `cfg` gate is supplied and exporting
+/// unconditionally when `gate` is `None`.
 pub fn export_items(
     ty: &TokenStream2,
     fsw2: &TokenStream2,
@@ -38,7 +42,7 @@ pub fn export_items(
 ) -> TokenStream2 {
     let gate = &gate;
     quote! {
-        /// The ABI word the host checks for equality before any other call.
+        /// The ABI version word the host checks before making any other call.
         #gate
         #[unsafe(no_mangle)]
         #[allow(clippy::not_unsafe_ptr_arg_deref)]
@@ -46,7 +50,7 @@ pub fn export_items(
             #fsw2::abi::FSW_ABI_VERSION
         }
 
-        /// Serialize this system's descriptor (postcard) to the host sink.
+        /// Serialize this system's descriptor to the host-provided sink.
         #gate
         #[unsafe(no_mangle)]
         #[allow(clippy::not_unsafe_ptr_arg_deref)]
@@ -54,11 +58,11 @@ pub fn export_items(
             sink: #fsw2::abi::ByteSink,
             ctx: *mut ::core::ffi::c_void,
         ) -> i32 {
-            // SAFETY: the host supplies a valid sink/ctx pair (dl-open.md §2.1).
+            // SAFETY: the host supplies a sink and the context pointer it expects.
             unsafe { #fsw2::abi::run_describe::<#ty>(sink, ctx) }
         }
 
-        /// Decode the postcard `Params` blob, construct the system, box the state.
+        /// Decode the postcard `Params` blob, construct the system, and box its state.
         #gate
         #[unsafe(no_mangle)]
         #[allow(clippy::not_unsafe_ptr_arg_deref)]
@@ -70,7 +74,7 @@ pub fn export_items(
             unsafe { #fsw2::abi::run_create::<#ty>(params, params_len) }
         }
 
-        /// Reconstruct the typed bundles from the host's ring handles, run `init`.
+        /// Rebuild the typed port bundles from the host's ring handles and run `init`.
         #gate
         #[unsafe(no_mangle)]
         #[allow(clippy::not_unsafe_ptr_arg_deref)]
@@ -81,7 +85,7 @@ pub fn export_items(
             outputs: *const #fsw2::abi::FswRing,
             n_out: usize,
         ) {
-            // SAFETY: `state` is from `fsw_create`; the handles name live regions.
+            // SAFETY: `state` came from `fsw_create`; the handles name live ring regions.
             unsafe { #fsw2::abi::run_bind_init::<#ty, _>(state, inputs, n_in, outputs, n_out) }
         }
 
@@ -97,7 +101,7 @@ pub fn export_items(
             unsafe { #fsw2::abi::run_execute::<#ty>(state, now) }
         }
 
-        /// Run `System::shutdown` once.
+        /// Run the system's `shutdown` hook once.
         #gate
         #[unsafe(no_mangle)]
         #[allow(clippy::not_unsafe_ptr_arg_deref)]
@@ -106,12 +110,12 @@ pub fn export_items(
             unsafe { #fsw2::abi::run_shutdown::<#ty>(state) }
         }
 
-        /// Drop the boxed state inside this `.so`.
+        /// Drop the boxed state inside the library that allocated it.
         #gate
         #[unsafe(no_mangle)]
         #[allow(clippy::not_unsafe_ptr_arg_deref)]
         pub extern "C" fn fsw_destroy(state: *mut ::core::ffi::c_void) {
-            // SAFETY: `state` is from `fsw_create`, transferred here exactly once.
+            // SAFETY: `state` came from `fsw_create` and ownership transfers here exactly once.
             unsafe { #fsw2::abi::run_destroy::<#ty>(state) }
         }
     }

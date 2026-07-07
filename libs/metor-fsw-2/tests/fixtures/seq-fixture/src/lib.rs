@@ -1,21 +1,20 @@
-//! A slots/sequences integration-test fixture: one `#[sequence]` occupant made
-//! `dlopen`-loadable. The `slot_integration` host test builds this crate as a `cdylib`,
-//! `dlopen`s the produced shared object through [`DlSystem`], and drives it through a
-//! runtime **slot** (Load/Start/Stop/Reset/Abort).
+//! A fixture crate holding one `#[sequence]`, built as a `cdylib` so a host
+//! test can `dlopen` the shared object and drive the sequence through a slot's
+//! lifecycle commands (load, start, stop, reset, abort).
 //!
-//! `waiter` has **no user ports** — just the implicit `SlotControlIn` input (the slot's
-//! cancel) and the `SequenceStatus` + health/log output tail. It `wait`s ~2 sim-µs then
-//! returns `Completed`; if it is aborted before the deadline the `wait` short-circuits
-//! and it returns `Aborted`. One sequence thus exercises both the run-to-completion and
-//! the cooperative-cancel paths the slot test drives.
+//! `waiter` declares no ports of its own; it carries only the implicit
+//! slot-control input and the status, health, and log outputs every sequence
+//! has. It waits two simulated microseconds and then completes. If the slot
+//! aborts it before the deadline, the wait returns early and the sequence
+//! reports `Aborted`. One sequence therefore covers both the run-to-completion
+//! and the cooperative-cancel paths.
 
 use core::time::Duration;
 
 use metor_fsw_2::Outcome;
 use metor_fsw_2::sequence::{progress, wait};
 
-/// Wait ~2 sim-µs, then complete — unless aborted first, in which case bail out with
-/// `Aborted` (the cooperative cancel the slot's `Abort` command raises).
+/// Waits two simulated microseconds, completing unless aborted first.
 #[metor_fsw_2::sequence]
 async fn waiter() -> Outcome {
     progress("waiting");

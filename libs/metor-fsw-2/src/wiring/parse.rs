@@ -1,6 +1,18 @@
-//! The KDL → [`Wiring`] parse stage: the top-level node walk and the per-node
-//! parsers, split out of `wiring/mod.rs` (C6). Parse only — no [`Registry`]
-//! lookups, no `dlopen`, no graph validation (those are `resolve`'s job).
+//! The KDL parse stage, turning a wiring document into the [`Wiring`] data
+//! model.
+//!
+//! Parsing is purely syntactic. It walks the top-level nodes of a document and
+//! builds specs; registry lookups, library loading, and graph validation all
+//! happen later, in `resolve`. Every error carries the document source and a
+//! span, so it renders as a pointed diagnostic.
+//!
+//! Params are not decoded here. When a `system` node (or a slot's `allow`
+//! child) carries any non-reserved property or any child node, its KDL source
+//! text is captured as [`ParamSource::Kdl`] and decoded at resolve time, where
+//! the target type is known. A static system deserializes the text into its
+//! typed `Params`; a dynamically loaded system encodes it against the schema
+//! exported by its artifact. A node with no config carries
+//! [`ParamSource::None`].
 
 use std::collections::HashSet;
 
@@ -13,32 +25,21 @@ use super::model::{
 };
 use super::{ALLOW_RESERVED, LoadError, ParamSource, SYSTEM_RESERVED, de};
 
-/// Deserialize a KDL wiring document into the [`Wiring`] data model — one of the two
-/// front-ends onto `Wiring` (the other is [`WiringBuilder`]).
+/// Parse a KDL wiring document into a [`Wiring`].
 ///
-/// This is **parse only**: it touches no [`Registry`], `dlopen`s nothing, and does not
-/// validate the graph — those are [`resolve`]'s job. It carries the
-/// `coordinator`/`system`/`slot`/`connect` surface plus the `artifact` node +
-/// per-`system` `artifact=` reference for dl systems. The telemetry downlink and the
-/// command uplink are ordinary `system` nodes (the built-in
-/// [`TCP_DOWNLINK_TYPE`]/[`TCP_UPLINK_TYPE`] registry types); their pre-normalization
-/// dedicated nodes surface a guidance [`LoadError::LegacyLinkNode`].
-///
-/// **Params** (for either kind) are carried as the KDL `system` node's source text in
-/// [`ParamSource::Kdl`] when the node has config properties/children; a config-less
-/// system carries [`ParamSource::None`]. The decoder is chosen at [`resolve`] time by
-/// [`SystemSpec::artifact`]: a **static** system re-deserializes the text into its
-/// typed `Params` (`serde`); a **dl** system schema-encodes it against the `.so`'s
-/// exported `Params` schema, so KDL ≡ the Rust builder on the wire.
+/// The document is a flat list of `coordinator`, `artifact`, `system`, `slot`,
+/// and `connect` nodes. Exactly one `coordinator` is required, and an unknown
+/// node name is a spanned error rather than a silent skip.
 pub fn parse(kdl: &str) -> Result<Wiring, LoadError> {
-    let doc = kdl.parse::<KdlDocument>().map_err(|source| LoadError::Parse {
-        source,
-        src: kdl.to_string(),
-        span: (0, kdl.len()).into(),
-    })?;
+    let doc = kdl
+        .parse::<KdlDocument>()
+        .map_err(|source| LoadError::Parse {
+            source,
+            src: kdl.to_string(),
+            span: (0, kdl.len()).into(),
+        })?;
 
-    // One pass over the top-level nodes; each list keeps document order, and an
-    // unknown node name is a spanned error rather than a silent skip.
+    // Each list keeps document order.
     let mut coordinator: Option<CoordinatorSpec> = None;
     let mut artifacts: Vec<Artifact> = Vec::new();
     let mut systems: Vec<SystemSpec> = Vec::new();
@@ -59,17 +60,29 @@ pub fn parse(kdl: &str) -> Result<Wiring, LoadError> {
             }
             "artifact" => artifacts.push(parse_artifact(node, kdl)?),
             "system" => systems.push(parse_system(node, kdl, &mut seen)?),
-            // sequences-slots.md §5: a slot is an instance like a system.
             "slot" => slots.push(parse_slot(node, kdl, &mut seen)?),
             "connect" => edges.push(parse_edge(node, kdl)?),
-            // The pre-normalization dedicated nodes: a guidance error carrying the
-            // `system` spelling that replaced each (the only migration notice an old
-            // mission document or bundle gets).
+            // `telemetry` and `uplink` were dedicated nodes before the links
+            // became ordinary registry systems. A document that still uses
+            // them gets a guidance error naming the `system` spelling that
+            // replaced each.
             "telemetry" => {
-                return Err(legacy_link_node(node, kdl, "telemetry", TCP_DOWNLINK_TYPE, "2240"));
+                return Err(legacy_link_node(
+                    node,
+                    kdl,
+                    "telemetry",
+                    TCP_DOWNLINK_TYPE,
+                    "2240",
+                ));
             }
             "uplink" => {
-                return Err(legacy_link_node(node, kdl, "uplink", TCP_UPLINK_TYPE, "2241"));
+                return Err(legacy_link_node(
+                    node,
+                    kdl,
+                    "uplink",
+                    TCP_UPLINK_TYPE,
+                    "2241",
+                ));
             }
             other => {
                 return Err(LoadError::UnknownTopLevelNode {
@@ -92,8 +105,8 @@ pub fn parse(kdl: &str) -> Result<Wiring, LoadError> {
     })
 }
 
-/// Build the [`LoadError::LegacyLinkNode`] guidance error for one of the two removed
-/// dedicated nodes, spelling out the equivalent `system` declaration.
+/// Build the guidance error for a removed dedicated link node, spelling out
+/// the equivalent `system` declaration.
 fn legacy_link_node(
     node: &KdlNode,
     src: &str,
@@ -109,14 +122,13 @@ fn legacy_link_node(
     }
 }
 
-/// Decorate a library **stem** into the platform's produced `cdylib` file name:
-/// `lib{stem}.dylib` (macOS), `lib{stem}.so` (Linux/other), `{stem}.dll` (Windows).
+/// Decorate a library stem into the platform's cdylib file name, so `adcs`
+/// becomes `libadcs.dylib` on macOS, `libadcs.so` on Linux, or `adcs.dll` on
+/// Windows.
 ///
-/// The wiring's `artifact` `lib=` and the Rust builder both carry the bare stem
-/// (`adcs_plant`), so a single mission document is portable across a dev mac and a
-/// Linux flight target; the framework computes the concrete file name here at parse
-/// time. [`Artifact::cdylib`](crate::Artifact) then holds that produced name — the
-/// build driver, the bundle, and `resolve` all consume it unchanged.
+/// Wiring documents and the builder both carry the bare stem, which keeps a
+/// single document portable across host platforms; the concrete file name is
+/// computed here at parse time and consumed unchanged from then on.
 pub fn cdylib_file_name(stem: &str) -> String {
     if cfg!(target_os = "macos") {
         format!("lib{stem}.dylib")
@@ -127,10 +139,9 @@ pub fn cdylib_file_name(stem: &str) -> String {
     }
 }
 
-/// Parse one `artifact "id" crate="..." lib="foo" type="Foo"` node into an
-/// [`Artifact`]. `lib=` is the library **stem** (`foo`); the produced file name is
-/// computed per-platform via [`cdylib_file_name`] so a static mission document stays
-/// portable across host OSes.
+/// Parse an `artifact "id" crate="..." lib="..." type="..."` node into an
+/// [`Artifact`]. `lib=` is the bare library stem; the platform file name comes
+/// from [`cdylib_file_name`].
 fn parse_artifact(node: &KdlNode, src: &str) -> Result<Artifact, LoadError> {
     let missing = |property: &'static str| LoadError::MissingArtifactField {
         property,
@@ -150,11 +161,12 @@ fn parse_artifact(node: &KdlNode, src: &str) -> Result<Artifact, LoadError> {
     })
 }
 
-/// Parse one `system` node into a [`SystemSpec`]. An `artifact=` ⇒ a dl system
-/// referencing that [`Artifact`] (its `type=` is then optional — the artifact's
-/// `system_type` is authoritative, and a given `type=` is validated at resolve);
-/// otherwise a static system, whose `type=` is required. See [`parse`] for the
-/// static-params / dl-params-deferred handling.
+/// Parse a `system` node into a [`SystemSpec`].
+///
+/// A node with `artifact=` declares a dynamically loaded system and may omit
+/// `type=`, since the artifact's type is authoritative (a `type=` given anyway
+/// is checked against it at resolve). Without `artifact=`, the system is
+/// static and `type=` is required.
 fn parse_system(
     node: &KdlNode,
     src: &str,
@@ -164,7 +176,7 @@ fn parse_system(
         src: src.to_string(),
         span: node.span(),
     })?;
-    // The pre-rename `lib=` spelling gets a guidance error pointing at the entry.
+    // `lib=` was renamed to `artifact=`; the error points at the entry.
     if let Some(entry) = node
         .entries()
         .iter()
@@ -191,16 +203,12 @@ fn parse_system(
             span: node.span(),
         });
     }
-    // Any property other than the reserved `type=`/`artifact=`, or any child node,
-    // is params config.
-    let has_config = node
-        .entries()
-        .iter()
-        .any(|e| matches!(e.name().map(|n| n.value()), Some(k) if !SYSTEM_RESERVED.contains(&k)))
-        || node.children().is_some_and(|c| !c.nodes().is_empty());
-    // Both static and dl systems carry the node's source text when configured; the
-    // decoder is chosen at `resolve` by `artifact` (static ⇒ the typed serde
-    // deserialize, dl ⇒ schema-guided postcard encode).
+    // Any property beyond the reserved set, or any child node, is params
+    // config; see the module docs for how the captured text is decoded.
+    let has_config =
+        node.entries().iter().any(
+            |e| matches!(e.name().map(|n| n.value()), Some(k) if !SYSTEM_RESERVED.contains(&k)),
+        ) || node.children().is_some_and(|c| !c.nodes().is_empty());
     let params = if has_config {
         ParamSource::Kdl(node.to_string())
     } else {
@@ -214,24 +222,17 @@ fn parse_system(
     })
 }
 
-/// Parse one `slot "name" { input/output/allow/initial }` node into a [`SlotSpec`]
-/// (sequences-slots.md §5). The slot name is the node's first string arg (like a
-/// `system`/`artifact` name) and shares the instance namespace (`seen`), so a name
-/// colliding with a system is a [`DuplicateInstance`](LoadError::DuplicateInstance).
+/// Parse a `slot "name" { input/output/allow/initial }` node into a
+/// [`SlotSpec`].
 ///
-/// Command wiring is ordinary message wiring (A2): a slot receives commands only from
-/// producers explicitly edged into it (`connect "<producer>" -> "<slot>"
-/// msg="SequenceCommand"`). A slot with **zero** command edges is legal and silently
-/// command-less (an autonomy-free, wiring-frozen slot) — deliberate: `resolve` has no
-/// non-fatal diagnostics surface, and warning on every such mission would be noise;
-/// the absence is visible in the wiring document itself.
-///
-/// Children: `input frame="…"`/`output frame="…"` declare the user-port contract;
-/// `allow occupant="…" …` is one allowed occupant — everything on it other than the
-/// reserved `occupant=` is its default params, as line properties
-/// (`allow occupant="x" gain=0.8`) and/or children (`allow occupant="x" { gain 0.8 }`),
-/// carried as [`ParamSource::Kdl`] (else [`ParamSource::None`] — mirroring
-/// [`parse_system`]); `initial occupant="…" state="…"` is the startup occupant.
+/// Slots share the instance namespace with systems, so a slot named like an
+/// existing system is a [`DuplicateInstance`](LoadError::DuplicateInstance)
+/// error. The children declare the slot's contract. `input frame="..."` and
+/// `output frame="..."` name the user-port frames. Each `allow occupant="..."`
+/// names one permitted occupant, and anything on it beyond the reserved
+/// `occupant=` property, whether line properties or children, is that
+/// occupant's default params, captured as with a `system` node. An
+/// `initial occupant="..." state="..."` child picks the startup occupant.
 fn parse_slot(
     node: &KdlNode,
     src: &str,
@@ -258,39 +259,33 @@ fn parse_slot(
         for child in children.nodes() {
             match child.name().value() {
                 "input" => {
-                    let frame = prop_string(child, "frame").ok_or_else(|| {
-                        LoadError::MissingParam {
+                    let frame =
+                        prop_string(child, "frame").ok_or_else(|| LoadError::MissingParam {
                             property: "frame".to_string(),
                             system: "slot".to_string(),
                             src: src.to_string(),
                             span: child.span(),
-                        }
-                    })?;
+                        })?;
                     inputs.push(frame.to_string());
                 }
                 "output" => {
-                    let frame = prop_string(child, "frame").ok_or_else(|| {
-                        LoadError::MissingParam {
+                    let frame =
+                        prop_string(child, "frame").ok_or_else(|| LoadError::MissingParam {
                             property: "frame".to_string(),
                             system: "slot".to_string(),
                             src: src.to_string(),
                             span: child.span(),
-                        }
-                    })?;
+                        })?;
                     outputs.push(frame.to_string());
                 }
                 "allow" => {
-                    let occupant = prop_string(child, "occupant").ok_or_else(|| {
-                        LoadError::MissingParam {
+                    let occupant =
+                        prop_string(child, "occupant").ok_or_else(|| LoadError::MissingParam {
                             property: "occupant".to_string(),
                             system: "slot".to_string(),
                             src: src.to_string(),
                             span: child.span(),
-                        }
-                    })?;
-                    // Any non-reserved line property OR any child ⇒ params: carry the
-                    // `allow` node's source text for the resolve-time schema-guided
-                    // encoder (mirrors `parse_system`'s `Kdl` decision); else paramless.
+                        })?;
                     let has_config = child.entries().iter().any(|e| {
                         matches!(e.name().map(|n| n.value()), Some(k) if !ALLOW_RESERVED.contains(&k))
                     }) || child.children().is_some_and(|c| !c.nodes().is_empty());
@@ -305,16 +300,15 @@ fn parse_slot(
                     });
                 }
                 "initial" => {
-                    let occupant = prop_string(child, "occupant").ok_or_else(|| {
-                        LoadError::MissingParam {
+                    let occupant =
+                        prop_string(child, "occupant").ok_or_else(|| LoadError::MissingParam {
                             property: "occupant".to_string(),
                             system: "slot".to_string(),
                             src: src.to_string(),
                             span: child.span(),
-                        }
-                    })?;
-                    // `state` is optional; an `initial` with no `state` defaults to
-                    // `loaded` (built but not auto-started — the conservative default).
+                        })?;
+                    // With no `state`, the occupant defaults to `loaded`,
+                    // built but not auto-started.
                     let state = match prop_string(child, "state") {
                         None | Some("loaded") => SlotInitState::Loaded,
                         Some("running") => SlotInitState::Running,
@@ -353,11 +347,12 @@ fn parse_slot(
     })
 }
 
-/// Read one `coordinator` node into a [`CoordinatorSpec`] (wiring.md §1.1).
-/// `sim_dt` (seconds) present ⇒ a free-running [`Simulated`](ClockSpec::Simulated)
-/// clock; absent ⇒ [`Wall`](ClockSpec::Wall). Deserialized through the shared KDL
-/// params deserializer, so an unknown/misspelled coordinator property is a spanned
-/// [`UnknownParam`](LoadError::UnknownParam) and a bad value is entry-precise.
+/// Parse the `coordinator` node into a [`CoordinatorSpec`].
+///
+/// A `sim_dt` property (seconds) selects a free-running simulated clock;
+/// without it the coordinator runs on the wall clock. Properties go through
+/// the shared KDL params deserializer, so an unknown property or a bad value
+/// is an entry-precise spanned error.
 fn parse_coordinator(node: &KdlNode, src: &str) -> Result<CoordinatorSpec, LoadError> {
     #[derive(serde::Deserialize)]
     struct CoordinatorProps {
@@ -377,9 +372,12 @@ fn parse_coordinator(node: &KdlNode, src: &str) -> Result<CoordinatorSpec, LoadE
     })
 }
 
-/// Parse a `connect` edge in either the shorthand (`"a" -> "b" frame="f"`) or the
-/// explicit (`from=.. out=.. to=.. in=..`) form (wiring.md §1.3), directly into the
-/// data model's [`EdgeSpec`] (the former parse-local `Edge` twin is gone — C5).
+/// Parse a `connect` node into an [`EdgeSpec`].
+///
+/// Two forms are accepted. The shorthand `"a" -> "b"` names the port with
+/// exactly one of `frame=` (a component frame, same name on both ends) or
+/// `msg=` (a message type). The explicit `from=.. out=.. to=.. in=..` form is
+/// for frame edges whose port names differ.
 fn parse_edge(node: &KdlNode, src: &str) -> Result<EdgeSpec, LoadError> {
     let span = node.span();
     let missing = |property: &str| LoadError::MissingEdgeField {
@@ -387,11 +385,13 @@ fn parse_edge(node: &KdlNode, src: &str) -> Result<EdgeSpec, LoadError> {
         src: src.to_string(),
         span,
     };
-    // `delayed=#true` marks a one-cycle-delayed feedback back-edge (default false).
-    let delayed = node.get("delayed").and_then(|v| v.as_bool()).unwrap_or(false);
+    // `delayed=#true` marks a feedback back-edge read one cycle late.
+    let delayed = node
+        .get("delayed")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
 
     if let Some(from) = prop_string(node, "from") {
-        // Explicit long form — frame edges only (a message edge uses the `msg=` shorthand).
         let to = prop_string(node, "to").ok_or_else(|| missing("to"))?;
         let out = prop_string(node, "out").ok_or_else(|| missing("out"))?;
         let in_ = prop_string(node, "in").ok_or_else(|| missing("in"))?;
@@ -405,8 +405,8 @@ fn parse_edge(node: &KdlNode, src: &str) -> Result<EdgeSpec, LoadError> {
         });
     }
 
-    // Shorthand: the nameless arguments are `"from"`, (optional `->`), `"to"`; the port is
-    // named by exactly one of `frame=` (a component frame) or `msg=` (a message type).
+    // Shorthand: the nameless arguments are `"from"`, an optional `->`, and
+    // `"to"`.
     let args: Vec<&str> = node
         .entries()
         .iter()
@@ -434,7 +434,7 @@ fn parse_edge(node: &KdlNode, src: &str) -> Result<EdgeSpec, LoadError> {
     })
 }
 
-/// The first nameless string argument of a node (e.g. a `system` instance name).
+/// The first nameless string argument of a node, such as an instance name.
 fn first_arg_string(node: &KdlNode) -> Option<&str> {
     node.entries()
         .iter()
@@ -446,4 +446,3 @@ fn first_arg_string(node: &KdlNode) -> Option<&str> {
 fn prop_string<'a>(node: &'a KdlNode, key: &str) -> Option<&'a str> {
     node.get(key).and_then(|v| v.as_string())
 }
-

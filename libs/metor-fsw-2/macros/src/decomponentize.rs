@@ -13,13 +13,16 @@ pub struct Decomponentize {
     data: ast::Data<(), crate::Field>,
     parent: Option<String>,
     name: Option<String>,
-    /// Tolerated here; consumed by the bundling `Frame` derive (E4 opt-out).
+    /// Accepted so the attribute parses; only the `Frame` derive acts on it.
     #[darling(default, rename = "no_timestamp")]
     _no_timestamp: darling::util::Ignored,
 }
 
-/// See [`componentize_impl`](crate::componentize::componentize_impl) for the
-/// `crate_name` root-path contract.
+/// Generates the `Decomponentize` impl, which routes an incoming component
+/// value to the matching field by comparing against per-field `ComponentId`
+/// constants. Unmatched ids and values that fail conversion are silently
+/// skipped. See [`componentize_impl`](crate::componentize::componentize_impl)
+/// for the `crate_name` root-path contract.
 pub fn decomponentize_impl(input: &DeriveInput, crate_name: &TokenStream2) -> TokenStream2 {
     let Decomponentize {
         ident,
@@ -36,9 +39,8 @@ pub fn decomponentize_impl(input: &DeriveInput, crate_name: &TokenStream2) -> To
     let if_arms = fields.fields.iter().filter(|f| !f.timestamp).map(|field| {
         let ty = &field.ty;
         let ident = &field.ident;
-        // Nested/dynamic fields forward every value (a `FrameList`/`FrameMap` slot
-        // can't be reconstructed from individual scalar components, so its
-        // `apply_value` is a no-op).
+        // Nested and dynamic fields have no single id to match, so every value
+        // is forwarded and the field's own `apply_value` decides what applies.
         if field.is_nested() {
             return quote! {
                 self.#ident.apply_value(component_id, view.clone(), timestamp)?;

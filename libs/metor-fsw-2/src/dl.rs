@@ -1,29 +1,37 @@
-//! The host side of the dlopen path — the loader (`DlSystem`) and the cyclic slot
-//! (`DlSlot`) that drives a system `.so` across the C ABI.
+//! Loading and driving a system compiled as a shared object.
 //!
-//! A [`DlSystem`] opens a system `cdylib`, resolves its `fsw_*` symbols by the
-//! [`abi::SYM_*`](crate::abi) constants, checks the ABI word, and `fsw_describe`s
-//! it into a [`SystemDescriptor`] the wiring/validation/sizing passes consume
-//! unchanged — a dlopen'd system is wiring-validated exactly like a statically-linked
-//! one. [`CoordinatorBuilder::add_dl_cyclic`] registers it; at `build()` the
-//! coordinator allocates and sizes its rings like any cyclic system and, instead of a
-//! typed [`CyclicRunner`](crate::CyclicRunner), binds a [`DlSlot`] that forwards
-//! `init`/`step`/`shutdown` over the ABI by passing the per-port ring regions as raw
-//! [`FswRing`] handles.
+//! [`DlSystem::open`] loads a system `cdylib`, checks its ABI version word,
+//! resolves the `fsw_*` exports named by the [`abi`](crate::abi) constants, and
+//! asks `fsw_describe` for a [`SystemDescriptor`]. From there the builder
+//! treats the system like any statically linked one; wiring, validation, and
+//! ring sizing all run against the descriptor. At `build()` the coordinator
+//! binds a [`DlSlot`] in place of a typed [`CyclicRunner`](crate::CyclicRunner).
+//! The slot forwards `init`, `step`, and `shutdown` across the C ABI, handing
+//! the shared object its per-port ring regions as raw [`FswRing`] handles.
 //!
-//! Same-process and cyclic-only: the `.so` reconstructs each ring over the host's
-//! host-owned region via `attach_raw`, so there is no copy and no IPC — the system
-//! sees the identical atomics the host's other systems do.
+//! Everything stays in one process. The shared object attaches to the host's
+//! ring regions in place, so it reads and writes the same atomics the host's
+//! statically linked systems do; there is no copy and no IPC.
 //!
-//! ## Teardown ordering — load-bearing
+//! ## The trust boundary
 //!
-//! A [`DlSlot`] owns an `Arc<Library>` and the opaque `*mut state`. Its [`Drop`]
-//! calls `fsw_destroy` (dropping the `.so`'s non-owning ports and the user system)
-//! **before** the `Library` unloads (the `Arc` field drops after the `Drop` body) and
-//! **before** the host [`RingTable`](crate::coordinator) frees the regions (the
-//! coordinator drops its `cyclic` slot vec before its `rings` field). So no
-//! non-owning attach ever outlives its region, and no `.so` code runs after its `Library`
-//! is gone.
+//! The shared object is foreign code the host does not control, so nothing it
+//! returns is trusted as a Rust value. `fsw_execute` returns a raw `u32`
+//! rather than an [`FswStatus`], because materializing a `repr(u32)` enum from
+//! an out-of-range discriminant is immediate undefined behavior. Every call
+//! site converts through [`FswStatus::from_raw`], which folds unknown words to
+//! `Panicked`. Likewise a descriptor that fails to decode, or that declares
+//! capabilities the host cannot grant across the ABI, is a clean [`DlError`]
+//! at load time rather than a panic later.
+//!
+//! ## Teardown ordering
+//!
+//! A [`DlSlot`] owns an `Arc<Library>` and the opaque `*mut state` returned by
+//! `fsw_create`. Its [`Drop`] calls `fsw_destroy` before the `Library` can
+//! unload, because the `Arc` field drops after the `Drop` body runs, and
+//! before the host frees the ring regions, because the coordinator drops its
+//! slots before its ring table. So no non-owning ring attach outlives its
+//! region, and no shared object code runs after the object is unloaded.
 
 use core::ffi::c_void;
 use std::ffi::OsStr;
@@ -34,9 +42,7 @@ use libloading::{Library, Symbol};
 use metor_proto::types::Timestamp;
 use postcard_schema::schema::owned::OwnedNamedType;
 
-use crate::abi::{
-    self, ByteSink, FSW_ABI_VERSION, FswRing, FswStatus, SystemDescriptorMsg,
-};
+use crate::abi::{self, ByteSink, FSW_ABI_VERSION, FswRing, FswStatus, SystemDescriptorMsg};
 use crate::coordinator::{CyclicSlot, SlotState, StopReason};
 use crate::descriptor::SystemDescriptor;
 
@@ -48,12 +54,8 @@ type AbiVersionFn = unsafe extern "C" fn() -> u32;
 type DescribeFn = unsafe extern "C" fn(ByteSink, *mut c_void) -> i32;
 type CreateFn = unsafe extern "C" fn(*const u8, usize) -> *mut c_void;
 type BindInitFn = unsafe extern "C" fn(*mut c_void, *const FswRing, usize, *const FswRing, usize);
-// `ExecuteFn` returns the **raw** `u32` word, not `FswStatus` directly: the callee is a
-// foreign `.so` the host does not control, and constructing an `FswStatus` (`repr(u32)`)
-// straight from an out-of-range discriminant is instant UB — the one place a Rust
-// validity invariant crosses the dlopen boundary (review R2). Every call site converts
-// through [`FswStatus::from_raw`], which folds anything outside the declared range to
-// `Panicked` instead of trusting it.
+// Returns the raw status word, not `FswStatus`; see the trust boundary note in
+// the module docs.
 type ExecuteFn = unsafe extern "C" fn(*mut c_void, u64) -> u32;
 type ShutdownFn = unsafe extern "C" fn(*mut c_void);
 type DestroyFn = unsafe extern "C" fn(*mut c_void);
@@ -62,22 +64,22 @@ type DestroyFn = unsafe extern "C" fn(*mut c_void);
 // Errors
 // ---------------------------------------------------------------------------
 
-/// A failure loading or describing a system `.so`. Every variant is a clean error —
-/// a bad artifact never crashes the host.
+/// A failure loading or describing a system shared object. A bad artifact is
+/// always a clean error, never a crash of the host.
 #[derive(Debug, thiserror::Error)]
 pub enum DlError {
     /// `dlopen` failed (missing file, bad object, unresolved symbol at load).
     #[error("failed to open shared object: {0}")]
     Open(#[source] libloading::Error),
-    /// A required `fsw_*` symbol was not present in the `.so`.
+    /// A required `fsw_*` symbol was not present in the shared object.
     #[error("shared object is missing the `{symbol}` symbol: {source}")]
     MissingSymbol {
         symbol: &'static str,
         #[source]
         source: libloading::Error,
     },
-    /// `fsw_abi_version()` did not equal the host's [`FSW_ABI_VERSION`]: the `.so`
-    /// was built against a different ABI and must be rebuilt.
+    /// `fsw_abi_version()` did not equal the host's [`FSW_ABI_VERSION`]; the
+    /// shared object was built against a different ABI and must be rebuilt.
     #[error("ABI version mismatch: .so reports {found}, host expects {expected}")]
     VersionMismatch { found: u32, expected: u32 },
     /// `fsw_describe` returned a non-zero (failure) code.
@@ -86,10 +88,12 @@ pub enum DlError {
     /// The postcard-encoded [`SystemDescriptorMsg`] could not be decoded.
     #[error("failed to decode the system descriptor: {0}")]
     Decode(#[source] postcard::Error),
-    /// The `.so` declares host [`Capability`](crate::Capability)s. Every v1
-    /// capability is host-only (`ReceiveAll` needs the host registry, which cannot
-    /// cross the ABI), so a non-empty list is rejected at load.
-    #[error("shared object declares host-only capabilities {0:?}; a dlopen'd system cannot hold them")]
+    /// The descriptor declares [`Capability`](crate::Capability)s. Capabilities
+    /// are granted by the host registry, which cannot cross the ABI, so a
+    /// shared object declaring any is rejected at load.
+    #[error(
+        "shared object declares host-only capabilities {0:?}; a dlopen'd system cannot hold them"
+    )]
     UnsupportedCapabilities(Vec<crate::Capability>),
 }
 
@@ -97,19 +101,18 @@ pub enum DlError {
 // DlSystem — the loaded handle
 // ---------------------------------------------------------------------------
 
-/// A loaded system `cdylib`: the kept-alive [`Library`], the resolved lifecycle
-/// function pointers, and the reconstructed [`SystemDescriptor`] for wiring. The
-/// handle **owns** the `Library` (an `Arc` it shares with the [`DlSlot`] it builds)
-/// so the `.so` outlives every slot and `*mut state`.
+/// A loaded system `cdylib`, holding the [`Library`], the resolved lifecycle
+/// function pointers, and the [`SystemDescriptor`] the builder wires against.
 ///
-/// Construct with [`DlSystem::open`], hand to
+/// The `Library` lives in an `Arc` shared with every [`DlSlot`] built from
+/// this handle, so the shared object stays loaded as long as any slot exists.
+/// Construct with [`DlSystem::open`], register with
 /// [`CoordinatorBuilder::add_dl_cyclic`](crate::CoordinatorBuilder::add_dl_cyclic).
 pub struct DlSystem {
     lib: Arc<Library>,
     descriptor: SystemDescriptor,
-    /// The `.so`'s exported `Params` schema, kept so the host can schema-encode KDL
-    /// params **without linking the `Params` type**. Carried on the descriptor mirror;
-    /// surfaced via [`DlSystem::params_schema`].
+    /// The exported `Params` schema, kept so the host can schema-encode KDL
+    /// params without ever linking the `Params` type.
     params_schema: OwnedNamedType,
     create: CreateFn,
     bind_init: BindInitFn,
@@ -118,9 +121,9 @@ pub struct DlSystem {
     destroy: DestroyFn,
 }
 
-/// v1 gate: every [`Capability`](crate::Capability) is host-only (`ReceiveAll`
-/// needs the host registry, which cannot cross the ABI), so a decoded descriptor
-/// declaring any is a clean load rejection — never a bind-time panic.
+/// Rejects a descriptor that declares any [`Capability`](crate::Capability).
+/// Capabilities are resolved against the host registry, which cannot cross the
+/// ABI, so the load fails cleanly instead of panicking at bind time.
 fn reject_capabilities(msg: SystemDescriptorMsg) -> Result<SystemDescriptorMsg, DlError> {
     if msg.capabilities.is_empty() {
         Ok(msg)
@@ -129,46 +132,51 @@ fn reject_capabilities(msg: SystemDescriptorMsg) -> Result<SystemDescriptorMsg, 
     }
 }
 
-/// The host [`ByteSink`] `fsw_describe` writes its postcard bytes to: append them to
-/// the `Vec<u8>` passed as `ctx`. The `.so` owns the buffer for the call's duration
-/// and frees it itself — the host only copies (no cross-allocator free).
+/// The [`ByteSink`] handed to `fsw_describe`; appends the callee's bytes to
+/// the `Vec<u8>` passed as `ctx`. The shared object keeps ownership of its
+/// buffer and the host only copies, so no allocation crosses the boundary.
 extern "C" fn collect_sink(ctx: *mut c_void, buf: *const u8, len: usize) {
-    // SAFETY: `open` passes `&mut Vec<u8>` as `ctx`; `buf`/`len` is the descriptor
-    // buffer the `.so` owns for this call.
+    // SAFETY: `open` passes `&mut Vec<u8>` as `ctx`; `buf`/`len` is the
+    // descriptor buffer the shared object owns for the duration of this call.
     let out = unsafe { &mut *(ctx as *mut Vec<u8>) };
     let bytes = unsafe { slice::from_raw_parts(buf, len) };
     out.extend_from_slice(bytes);
 }
 
-/// Resolve a required symbol by its NUL-terminated [`abi::SYM_*`](crate::abi) name,
-/// mapping a miss to a clean [`DlError::MissingSymbol`].
+/// Resolves a required symbol by its NUL-terminated name, mapping a miss to
+/// [`DlError::MissingSymbol`].
 ///
 /// # Safety
-/// The resolved `T` must match the `.so`'s actual signature for `name`.
+/// The resolved `T` must match the shared object's actual signature for
+/// `name`.
 unsafe fn resolve<'lib, T>(
     lib: &'lib Library,
     name: &[u8],
     sym: &'static str,
 ) -> Result<Symbol<'lib, T>, DlError> {
-    // SAFETY: the caller asserts `T` matches the export's signature; the bytes are a
-    // NUL-terminated symbol name.
-    unsafe { lib.get::<T>(name) }.map_err(|source| DlError::MissingSymbol { symbol: sym, source })
+    // SAFETY: the caller asserts `T` matches the export's signature; the bytes
+    // are a NUL-terminated symbol name.
+    unsafe { lib.get::<T>(name) }.map_err(|source| DlError::MissingSymbol {
+        symbol: sym,
+        source,
+    })
 }
 
 impl DlSystem {
-    /// `dlopen` the artifact at `path`, resolve every `fsw_*` symbol, check the ABI
-    /// word, and `fsw_describe` it into a [`SystemDescriptor`].
+    /// Opens the artifact at `path`, resolves every `fsw_*` symbol, checks the
+    /// ABI version word, and describes it into a [`SystemDescriptor`].
     ///
-    /// On any failure returns a [`DlError`] (never a crash): a missing/incompatible
-    /// artifact is a clean load error.
+    /// Any failure is a [`DlError`]; a missing or incompatible artifact never
+    /// crashes the host.
     pub fn open(path: impl AsRef<OsStr>) -> Result<Self, DlError> {
-        // SAFETY: `dlopen` runs the `.so`'s initializers; a system `cdylib` has none
-        // beyond Rust's, and the path is caller-chosen. There is no safer form.
+        // SAFETY: `dlopen` runs the object's initializers; a system `cdylib`
+        // has none beyond Rust's, and the path is caller-chosen. There is no
+        // safer form.
         let lib = unsafe { Library::new(path) }.map_err(DlError::Open)?;
 
-        // --- ABI word: equality before any other call ----------------------------
+        // --- Check the ABI word before any other call -----------------------
         let found = {
-            // SAFETY: the export is a `fn() -> u32` (the macro's `fsw_abi_version`).
+            // SAFETY: the export is a `fn() -> u32`.
             let f: Symbol<AbiVersionFn> =
                 unsafe { resolve(&lib, abi::SYM_ABI_VERSION, "fsw_abi_version")? };
             // SAFETY: a plain version read, no arguments.
@@ -181,31 +189,31 @@ impl DlSystem {
             });
         }
 
-        // --- Describe → postcard → SystemDescriptor ------------------------------
-        // Keep the `Params` schema off the mirror before `into_descriptor` consumes it,
-        // so the host can schema-encode KDL params later.
+        // --- Describe, decode, and reconstruct the descriptor ---------------
+        // The `Params` schema is cloned off the message before `into_descriptor`
+        // consumes it, so the host can schema-encode KDL params later.
         let (descriptor, params_schema) = {
-            // SAFETY: the export is the macro's `fsw_describe(sink, ctx) -> i32`.
+            // SAFETY: the export is `fsw_describe(sink, ctx) -> i32`.
             let describe: Symbol<DescribeFn> =
                 unsafe { resolve(&lib, abi::SYM_DESCRIBE, "fsw_describe")? };
             let mut buf: Vec<u8> = Vec::new();
-            // SAFETY: `collect_sink`/`&mut buf` form a valid host callback pair; the
-            // `.so` calls the sink with a buffer it owns for the call.
+            // SAFETY: `collect_sink` and `&mut buf` form a matching callback
+            // pair; the shared object calls the sink with a buffer it owns for
+            // the duration of the call.
             let rc = unsafe { describe(collect_sink, &mut buf as *mut Vec<u8> as *mut c_void) };
             if rc != 0 {
                 return Err(DlError::Describe(rc));
             }
-            let msg: SystemDescriptorMsg =
-                postcard::from_bytes(&buf).map_err(DlError::Decode)?;
+            let msg: SystemDescriptorMsg = postcard::from_bytes(&buf).map_err(DlError::Decode)?;
             let msg = reject_capabilities(msg)?;
             let params_schema = msg.params_schema.clone();
             (msg.into_descriptor(), params_schema)
         };
 
-        // --- Resolve the lifecycle surface, dereferencing each `Symbol` to a bare
-        // fn pointer kept alive by the `Arc<Library>` below (the standard libloading
-        // pattern: the pointer is valid as long as the `Library` stays loaded). ----
-        // SAFETY: each export matches the macro's generated signature.
+        // --- Resolve the lifecycle surface. Each `Symbol` is dereferenced to
+        // a bare fn pointer, valid as long as the `Arc<Library>` below stays
+        // loaded. ------------------------------------------------------------
+        // SAFETY: each export matches its generated signature.
         let create = *unsafe { resolve::<CreateFn>(&lib, abi::SYM_CREATE, "fsw_create")? };
         let bind_init =
             *unsafe { resolve::<BindInitFn>(&lib, abi::SYM_BIND_INIT, "fsw_bind_init")? };
@@ -225,34 +233,31 @@ impl DlSystem {
         })
     }
 
-    /// The reconstructed self-description the builder validates wiring against. Its
-    /// ports' `announce` closures already prefix the carried vtable ids (the dl
-    /// telemetry rewrite, [`abi`](crate::abi)).
+    /// The self-description the builder validates wiring against. Its ports'
+    /// `announce` closures already prefix the vtable ids carried across the
+    /// ABI.
     pub fn descriptor(&self) -> &SystemDescriptor {
         &self.descriptor
     }
 
-    /// The `.so`'s exported `Params` schema. The resolver feeds this to
-    /// [`encode_kdl_params`](crate::wiring::encode_kdl_params) to schema-encode a
-    /// dl system's KDL config into the canonical postcard bytes **without linking the
-    /// `Params` type** — the host stays schema-agnostic.
+    /// The exported `Params` schema, which lets the wiring resolver encode a
+    /// KDL config into the canonical postcard bytes without linking the
+    /// `Params` type.
     pub fn params_schema(&self) -> &OwnedNamedType {
         &self.params_schema
     }
 
-    /// Build a fresh [`DlSlot`] over this handle **without** consuming it: `fsw_create`
-    /// a new opaque state and **clone** the `Arc<Library>` so the [`DlSystem`] survives
-    /// for another build. The coordinator's build-time dl bind calls this once (and
-    /// drops the handle after); a [`SlotRunner`](crate::coordinator) calls it on every
-    /// `Load`/`Reset`, so the same loaded handle reloads N times, each `make_slot` → a
-    /// fresh `fsw_create` state over the slot's owned rings.
+    /// Builds a fresh [`DlSlot`] without consuming the handle. Each call runs
+    /// `fsw_create` for a new opaque state and clones the `Arc<Library>`, so
+    /// one loaded object can produce any number of slots, one per load or
+    /// reset.
     ///
     /// # Safety
     /// Every region named by an `FswRing` in `inputs`/`outputs` must satisfy
-    /// [`RingBuffer::attach_raw`](metor_fsw_ring::RingBuffer::attach_raw)'s contract —
-    /// a live, header-valid ring region that outlives the slot (until its `Drop` calls
-    /// `fsw_destroy`). The coordinator guarantees this by keeping the owning
-    /// `RingTable` alive past the slot.
+    /// [`RingBuffer::attach_raw`](metor_fsw_ring::RingBuffer::attach_raw)'s
+    /// contract, and must stay live until the slot's `Drop` has called
+    /// `fsw_destroy`. The coordinator guarantees this by keeping the owning
+    /// ring table alive past the slot.
     pub(crate) unsafe fn make_slot(
         &self,
         params: &[u8],
@@ -265,18 +270,14 @@ impl DlSystem {
         } else {
             (params.as_ptr(), params.len())
         };
-        // SAFETY: `params`/`len` name a readable byte range (or null/0); the export
-        // decodes them immediately, so they need not outlive the call.
+        // SAFETY: `ptr`/`len` name a readable byte range (or null/0); the
+        // export decodes them immediately, so they need not outlive the call.
         let state = unsafe { (self.create)(ptr, len) };
-        // R5: a null `state` (params decode/construction panicked inside the `.so`,
-        // caught by `run_create`'s `catch_unwind`) must not leave the slot looking
-        // `Running` forever. `DlSlot::step` early-returns on a null state *without*
-        // touching `slot_state` (it never calls `fsw_execute` on a state that was never
-        // created), so an initial `Running` would zombie the slot: `update_status`
-        // (coordinator/mod.rs) reads `state()` and would never see a stop, and the
-        // build-time direct-bind path (`into_slot`) is driven straight as `CyclicSlot`
-        // with no other place to notice. Latch the failure here instead, so the very
-        // first `state()` read after `init`/`step` reports it.
+        // A null state means creation panicked inside the shared object (the
+        // ABI shim catches the unwind and returns null). Latch the failure
+        // now: `step` early-returns on a null state without touching
+        // `slot_state`, so a slot that started `Running` would never report a
+        // stop and the coordinator would poll a zombie forever.
         let slot_state = if state.is_null() {
             SlotState::Stopped {
                 reason: StopReason::Panicked,
@@ -300,69 +301,67 @@ impl DlSystem {
 }
 
 // ---------------------------------------------------------------------------
-// DlSlot — the dlopen twin of CyclicRunner's CyclicSlot impl
+// DlSlot — a dlopen'd system behind the CyclicSlot interface
 // ---------------------------------------------------------------------------
 
-/// A bound dlopen'd cyclic system the coordinator drives as a `Box<dyn CyclicSlot>`,
-/// indistinguishable from a static [`CyclicRunner`](crate::CyclicRunner) in the
-/// per-cycle loop. It forwards `init`/`step`/`shutdown` across the C ABI: `init` hands
-/// the `.so` the per-port [`FswRing`] arrays for `fsw_bind_init`,
-/// `step` calls `fsw_execute` and maps the returned [`FswStatus`] into a tracked
-/// [`SlotState`] (the lapped/panic check lives inside the `.so`, which owns the input
-/// `View`), and `Drop` calls `fsw_destroy` (see the module teardown note).
+/// A bound dlopen'd cyclic system, driven by the coordinator as a
+/// `Box<dyn CyclicSlot>` exactly like a static
+/// [`CyclicRunner`](crate::CyclicRunner). `init` hands the shared object its
+/// per-port [`FswRing`] arrays, `step` calls `fsw_execute` and folds the
+/// returned [`FswStatus`] into the tracked [`SlotState`], and `Drop` calls
+/// `fsw_destroy` (see the module teardown note).
 pub(crate) struct DlSlot {
-    /// Kept alive for the slot's whole life; dropped **after** `fsw_destroy` (Drop
-    /// body runs before this field drops), so no `.so` code runs after unload.
+    /// Keeps the shared object loaded for the slot's whole life; drops after
+    /// the `Drop` body has run `fsw_destroy`.
     #[allow(dead_code)]
     lib: Arc<Library>,
     bind_init: BindInitFn,
     execute: ExecuteFn,
     shutdown: ShutdownFn,
     destroy: DestroyFn,
-    /// The opaque runner state from `fsw_create`; owned by the `.so`, dropped by
-    /// `fsw_destroy`. Nulled after destroy so `Drop` is idempotent.
+    /// The opaque state from `fsw_create`, owned by the shared object and
+    /// dropped by `fsw_destroy`. Nulled after destroy so `Drop` is idempotent.
     state: *mut c_void,
-    /// Per-port input handles (role=INPUT), in `descriptors()` order — views into the
-    /// upstream producers' output rings.
+    /// Input ring handles in descriptor order, viewing the upstream producers'
+    /// output rings.
     inputs: Vec<FswRing>,
-    /// Per-port output handles (role=OUTPUT), in `descriptors()` order — this system's
-    /// own writer rings (incl. the implicit health/log).
+    /// Output ring handles in descriptor order, this system's own writer rings
+    /// (including the implicit health and log).
     outputs: Vec<FswRing>,
-    /// The system's descriptor name (the `dyn CyclicSlot` identity in status/health).
+    /// The descriptor name, used as the slot's identity in status and health.
     name: &'static str,
     slot_state: SlotState,
 }
 
 impl DlSlot {
-    /// `fsw_execute` returning the **raw** [`FswStatus`] (incl. the terminal
-    /// [`Done`](FswStatus::Done)), guarded on a null/unbound state. Unlike
-    /// [`CyclicSlot::step`] — which folds the status straight into the
-    /// [`SlotState`] and treats `Done` as keep-running (a build-time slot has no
-    /// occupant outcome to refine it with) — this hands the raw word back to the
-    /// caller. The runtime [`SlotRunner`](crate::coordinator) drives an occupant
-    /// through this and maps the status into the full lifecycle, so a completed
-    /// sequence becomes a terminal `Done` rather than a benign keep-running.
+    /// Runs one cycle and returns the raw [`FswStatus`], including the
+    /// terminal [`Done`](FswStatus::Done).
+    ///
+    /// [`CyclicSlot::step`] folds the status straight into the slot state and
+    /// treats `Done` as keep-running, because a build-time slot has no
+    /// occupant outcome to refine it with. A runtime slot runner does, so it
+    /// drives its occupant through this method instead and maps `Done` into a
+    /// terminal lifecycle state.
     pub(crate) fn execute_raw(&mut self, now: Timestamp) -> FswStatus {
         if self.state.is_null() {
             return FswStatus::Panicked;
         }
         // SAFETY: `state` is the live, bound `fsw_create` pointer.
         let raw = unsafe { (self.execute)(self.state, now.0 as u64) };
-        // R2: `raw` is an untrusted word from a foreign `.so` — route it through the
-        // trust-boundary conversion rather than trusting it as a valid discriminant.
+        // Untrusted word from foreign code; see the module trust boundary note.
         FswStatus::from_raw(raw)
     }
 }
 
 impl CyclicSlot for DlSlot {
-    /// `fsw_bind_init`: hand the `.so` the per-port ring regions so it reconstructs
-    /// its typed `Input`/`Output` bundles and runs `System::init`.
+    /// Hands the shared object its per-port ring regions so it can reconstruct
+    /// its typed `Input`/`Output` bundles and run `System::init`.
     fn init(&mut self) {
         if self.state.is_null() {
             return;
         }
-        // SAFETY: `state` is the live `fsw_create` pointer; the handle arrays name
-        // live regions the coordinator keeps alive past this slot.
+        // SAFETY: `state` is the live `fsw_create` pointer; the handle arrays
+        // name live regions the coordinator keeps alive past this slot.
         unsafe {
             (self.bind_init)(
                 self.state,
@@ -374,47 +373,45 @@ impl CyclicSlot for DlSlot {
         }
     }
 
-    /// `fsw_execute`: run one cycle and fold the returned status into the slot state.
-    /// `now` carries the coordinator's **raw `Timestamp` tick** (`now.0 as u64`), the
-    /// unit-agnostic reversible contract — NOT nanoseconds.
-    /// `Panicked` is a permanent hard-stop surfaced through the coordinator status
-    /// frame; once stopped the slot is never ticked again, and its foreign state is
-    /// destroyed **immediately** (not at teardown): on a lossless ring a stopped
-    /// system's live input `View`s would backpressure every upstream producer
-    /// forever, so the stop must release its reader slots.
+    /// Runs one cycle and folds the returned status into the slot state.
+    ///
+    /// `now` crosses the ABI as the raw `Timestamp` tick (`now.0 as u64`), not
+    /// nanoseconds; the unit is whatever the coordinator's clock produced. A
+    /// `Panicked` status stops the slot permanently, and its foreign state is
+    /// destroyed immediately rather than at teardown, because a stopped
+    /// system's live input views would hold their reader slots and
+    /// backpressure every upstream producer forever.
     fn step(&mut self, now: Timestamp) {
         if self.slot_state.is_stopped() || self.state.is_null() {
             return;
         }
         // SAFETY: `state` is the live, bound `fsw_create` pointer.
         let raw = unsafe { (self.execute)(self.state, now.0 as u64) };
-        // R2: `raw` is an untrusted word from a foreign `.so` — route it through the
-        // trust-boundary conversion rather than trusting it as a valid discriminant.
+        // Untrusted word from foreign code; see the module trust boundary note.
         let status = FswStatus::from_raw(raw);
         self.slot_state = match status {
             FswStatus::Running => SlotState::Running,
             FswStatus::Panicked => SlotState::Stopped {
                 reason: StopReason::Panicked,
             },
-            // `Done` (terminal sequence outcome) is unreachable for a build-time
-            // `DlSlot`: an `export_system!` system is `CyclicRunner`-driven and never
-            // returns it (only a `#[sequence]` occupant does, via `run_seq_execute`).
-            // The slot-layer `SlotRunner` (W4) is where `Done` is meaningful; here it
-            // can only arrive from a misbehaving `.so`, so treat it as a benign
-            // keep-running (a build-time slot has no occupant outcome to refine it).
+            // A well-behaved cyclic export never returns `Done` (only a
+            // sequence occupant does, and those run under the runtime slot
+            // runner via `execute_raw`). With no occupant outcome to refine it
+            // with, a stray `Done` here is treated as keep-running.
             FswStatus::Done => SlotState::Running,
         };
         if self.slot_state.is_stopped() {
-            // `fsw_destroy` drops the `.so`'s non-owning ports, freeing its reader
-            // slots so producers are not backpressured by a dead consumer. Nulled so
-            // `shutdown`/`Drop` stay no-ops (a panicked system gets no `shutdown`).
-            // SAFETY: `state` is the live pointer, transferred to destroy exactly once.
+            // Destroy the foreign state now so its non-owning ports release
+            // their reader slots (a panicked system gets no `shutdown`).
+            // Nulling keeps `shutdown` and `Drop` as no-ops afterwards.
+            // SAFETY: `state` is the live pointer, handed to destroy exactly
+            // once.
             unsafe { (self.destroy)(self.state) };
             self.state = core::ptr::null_mut();
         }
     }
 
-    /// `fsw_shutdown`: run `System::shutdown` once inside the `.so`.
+    /// Runs `System::shutdown` once inside the shared object.
     fn shutdown(&mut self) {
         if self.state.is_null() {
             return;
@@ -433,12 +430,11 @@ impl CyclicSlot for DlSlot {
 }
 
 impl Drop for DlSlot {
-    /// `fsw_destroy` the state **before** the `Library` unloads (the `Arc<Library>`
-    /// field drops after this body) and before the host `RingTable` frees the regions
-    /// (the coordinator drops `cyclic` before `rings`).
+    /// Destroys the foreign state before the `Library` field drops and before
+    /// the host frees the ring regions; see the module teardown note.
     fn drop(&mut self) {
         if !self.state.is_null() {
-            // SAFETY: `state` is the live `fsw_create` pointer, transferred to
+            // SAFETY: `state` is the live `fsw_create` pointer, handed to
             // `fsw_destroy` exactly once; nulled so a double-drop is a no-op.
             unsafe { (self.destroy)(self.state) };
             self.state = core::ptr::null_mut();
@@ -450,9 +446,8 @@ impl Drop for DlSlot {
 mod tests {
     use super::*;
 
-    /// A `.so` descriptor declaring a host capability is rejected at load (C7): every
-    /// v1 capability is host-only, and the failure is a clean `DlError`, not a
-    /// bind-time panic. An empty list (every real export) passes through.
+    /// A descriptor declaring a host capability is a clean load rejection,
+    /// never a bind-time panic; an empty list (every real export) passes.
     #[test]
     fn load_rejects_declared_capabilities() {
         let mk = |capabilities| SystemDescriptorMsg {

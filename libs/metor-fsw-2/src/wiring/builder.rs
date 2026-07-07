@@ -1,6 +1,8 @@
-//! The [`WiringBuilder`] — a fluent Rust front-end onto the [`Wiring`] data model.
+//! Fluent construction of a [`Wiring`] from Rust.
 //!
-//! Everything KDL expresses, Rust expresses, because both produce the same [`Wiring`]:
+//! [`WiringBuilder`] is the programmatic counterpart to the KDL front-end.
+//! Both produce the same [`Wiring`] value, so anything a KDL document can
+//! declare can be declared here instead.
 //!
 //! ```no_run
 //! # use metor_fsw_2::{WiringBuilder, ClockSpec};
@@ -16,10 +18,11 @@
 //!     .build();
 //! ```
 //!
-//! [`SystemSpecBuilder::params`] postcard-encodes a typed `Params` into the canonical
-//! [`ParamSource::Postcard`] bytes — byte-identical to what the KDL front-end's
-//! schema-guided encoder produces for a dl system, and what the `.so`'s `fsw_create`
-//! decodes. A paramless system gets [`ParamSource::None`].
+//! Typed params are postcard-encoded into [`ParamSource::Postcard`] bytes.
+//! The encoding is byte-identical to what the KDL front-end's schema-guided
+//! encoder produces for the same logical value, and it is exactly what a
+//! loaded library's `fsw_create` decodes. A system without params carries
+//! [`ParamSource::None`].
 
 use std::net::SocketAddr;
 
@@ -30,9 +33,9 @@ use super::model::{
     InitialOccupantSpec, ParamSource, SlotInitState, SlotSpec, SystemSpec, Wiring,
 };
 
-/// Fluent constructor for a [`Wiring`]. Start with [`new`](Self::new), set the
-/// coordinator, declare artifacts, add systems (via the per-system
-/// [`SystemSpecBuilder`]), wire edges, and [`build`](Self::build).
+/// Fluent builder for a [`Wiring`]. Set the coordinator, declare artifacts,
+/// add systems and slots through their sub-builders, wire edges, and finish
+/// with [`build`](Self::build).
 pub struct WiringBuilder {
     coordinator: CoordinatorSpec,
     artifacts: Vec<Artifact>,
@@ -48,8 +51,7 @@ impl Default for WiringBuilder {
 }
 
 impl WiringBuilder {
-    /// An empty builder with a default coordinator (100 Hz, framework default depth,
-    /// [`Wall`](ClockSpec::Wall) clock) — override with [`coordinator`](Self::coordinator).
+    /// Creates an empty builder with a 100 Hz, wall-clock coordinator.
     pub fn new() -> Self {
         Self {
             coordinator: CoordinatorSpec {
@@ -64,8 +66,8 @@ impl WiringBuilder {
         }
     }
 
-    /// Set the cycle rate and clock (the common case). Use
-    /// [`coordinator_spec`](Self::coordinator_spec) to also set `default_depth`.
+    /// Sets the cycle rate and clock, leaving `default_depth` untouched. Use
+    /// [`coordinator_spec`](Self::coordinator_spec) to set everything at once.
     pub fn coordinator(mut self, cycle_rate: f64, clock: ClockSpec) -> Self {
         self.coordinator = CoordinatorSpec {
             cycle_rate,
@@ -75,18 +77,20 @@ impl WiringBuilder {
         self
     }
 
-    /// Set the full [`CoordinatorSpec`] (including `default_depth`).
+    /// Sets the full [`CoordinatorSpec`], including `default_depth`.
     pub fn coordinator_spec(mut self, spec: CoordinatorSpec) -> Self {
         self.coordinator = spec;
         self
     }
 
-    /// Declare a loadable [`Artifact`] (one system type per cdylib). `lib_stem` is the
-    /// library **stem** (`adcs_plant`); the framework decorates it to the platform's
-    /// produced file name (`libadcs_plant.dylib`/`.so` / `adcs_plant.dll`) via
-    /// [`cdylib_file_name`](super::cdylib_file_name), matching the KDL `lib=` surface.
-    /// `system_type` is the `type=` this `.so` exports. Its `path` is filled by the
-    /// build driver ([`build_artifacts`](super::build_artifacts)).
+    /// Declares a loadable [`Artifact`], one system type per cdylib.
+    ///
+    /// `lib_stem` is the bare library stem (`adcs_plant`), decorated into the
+    /// platform's file name (`libadcs_plant.dylib`, `libadcs_plant.so`, or
+    /// `adcs_plant.dll`) via [`cdylib_file_name`](super::cdylib_file_name).
+    /// `system_type` names the system type the library exports. The
+    /// artifact's `path` starts out unset; the build driver
+    /// ([`build_artifacts`](super::build_artifacts)) fills it in.
     pub fn artifact(
         mut self,
         id: impl Into<String>,
@@ -104,11 +108,8 @@ impl WiringBuilder {
         self
     }
 
-    /// Begin a system instance named `name`; finish it with
-    /// [`SystemSpecBuilder::end`]. Set its type, where it resolves
-    /// ([`from_static`](SystemSpecBuilder::from_static) /
-    /// [`from_artifact`](SystemSpecBuilder::from_artifact)), and its
-    /// [`params`](SystemSpecBuilder::params) before `end`.
+    /// Begins a system instance named `name`, returning a [`SystemSpecBuilder`]
+    /// that flows back into this builder through [`SystemSpecBuilder::end`].
     pub fn system(self, name: impl Into<String>) -> SystemSpecBuilder {
         SystemSpecBuilder {
             parent: self,
@@ -119,8 +120,8 @@ impl WiringBuilder {
         }
     }
 
-    /// Add a forward (acyclic) edge: producer `from`'s `out` port → consumer `to`'s
-    /// `in_` port (by frame name).
+    /// Adds a forward frame edge from `from`'s `out` port to `to`'s `in_`
+    /// port. Forward edges must form an acyclic graph.
     pub fn connect(
         mut self,
         from: impl Into<String>,
@@ -139,8 +140,8 @@ impl WiringBuilder {
         self
     }
 
-    /// Add a one-cycle-**delayed** feedback back-edge (`connect_delayed`): the back-edge
-    /// of a control loop, excluded from cycle detection.
+    /// Adds a frame edge whose value arrives one cycle late. Delayed edges
+    /// close feedback loops and are excluded from cycle detection.
     pub fn connect_delayed(
         mut self,
         from: impl Into<String>,
@@ -159,9 +160,9 @@ impl WiringBuilder {
         self
     }
 
-    /// Add a **message** edge (`connect_msg`, `docs/message-wiring.md` §3): route the message
-    /// type `msg` from producer `from` to consumer `to`. Both endpoints carry the same message
-    /// type (id-equality); message edges are many-to-many and excluded from cycle detection.
+    /// Routes the message type `msg` from producer `from` to consumer `to`.
+    /// Both endpoints carry the same message name, message edges may fan in
+    /// and out freely, and they are excluded from cycle detection.
     pub fn connect_msg(
         mut self,
         from: impl Into<String>,
@@ -180,32 +181,29 @@ impl WiringBuilder {
         self
     }
 
-    /// Add the built-in TCP telemetry downlink under the instance name `"telemetry"`,
-    /// tapping every output — sugar for pushing the [`SystemSpec::tcp_downlink`] spec.
-    /// A subset tap (or a second downlink) declares an ordinary `system` spec/node
-    /// with the `TcpDownlink` type instead. Resolve against a registry seeded from
+    /// Adds the built-in TCP telemetry downlink under the instance name
+    /// `"telemetry"`, tapping every output. For a subset tap or a second
+    /// downlink, declare an ordinary system with the `TcpDownlink` type
+    /// instead. Resolving either requires a registry seeded from
     /// [`Registry::with_builtins`](super::Registry::with_builtins).
     pub fn telemetry(mut self, addr: SocketAddr) -> Self {
-        self.systems.push(SystemSpec::tcp_downlink("telemetry", addr));
+        self.systems
+            .push(SystemSpec::tcp_downlink("telemetry", addr));
         self
     }
 
-    /// Add the built-in TCP command uplink (`docs/messages.md` §4.4) under the
-    /// instance name `"uplink"` — sugar for pushing the [`SystemSpec::tcp_uplink`]
-    /// spec. It reads panel command Msgs off its **own** TCP connection to `addr`,
-    /// separate from the downlink's (a shared connection is deferred, §4.5); route
-    /// its commands with explicit edges (`connect("uplink", …, msg)`).
+    /// Adds the built-in TCP command uplink under the instance name
+    /// `"uplink"`. It reads command messages off its own connection to
+    /// `addr`, separate from the downlink's; route its commands onward with
+    /// explicit message edges.
     pub fn uplink(mut self, addr: SocketAddr) -> Self {
         self.systems.push(SystemSpec::tcp_uplink("uplink", addr));
         self
     }
 
-    /// Begin a runtime-loadable **slot** named `name`; finish it with
-    /// [`SlotSpecBuilder::end`]. Declare its allowed occupants
-    /// ([`allow`](SlotSpecBuilder::allow)), its `input`/`output` contract
-    /// ([`input`](SlotSpecBuilder::input)/[`output`](SlotSpecBuilder::output)), and an
-    /// optional [`initial`](SlotSpecBuilder::initial) occupant before `end` — the Rust
-    /// mirror of the KDL `slot` node (sequences-slots.md §5).
+    /// Begins a runtime-loadable slot named `name`, returning a
+    /// [`SlotSpecBuilder`] that flows back into this builder through
+    /// [`SlotSpecBuilder::end`].
     pub fn slot(self, name: impl Into<String>) -> SlotSpecBuilder {
         SlotSpecBuilder {
             parent: self,
@@ -219,14 +217,14 @@ impl WiringBuilder {
         }
     }
 
-    /// Push a fully-built [`SlotSpec`] (the escape hatch for a programmatically-assembled
-    /// slot; [`slot`](Self::slot) is the fluent path).
+    /// Pushes a fully built [`SlotSpec`], for slots assembled outside the
+    /// fluent chain.
     pub fn add_slot_spec(mut self, spec: SlotSpec) -> Self {
         self.slots.push(spec);
         self
     }
 
-    /// Finish the [`Wiring`].
+    /// Finishes the [`Wiring`].
     pub fn build(self) -> Wiring {
         Wiring {
             coordinator: self.coordinator,
@@ -238,18 +236,17 @@ impl WiringBuilder {
     }
 }
 
-/// The per-slot fluent sub-builder returned by [`WiringBuilder::slot`]; owns the parent
-/// builder so the chain flows back through [`end`](Self::end). The Rust mirror of the KDL
-/// `slot` node.
+/// Sub-builder for one slot, returned by [`WiringBuilder::slot`]. It owns the
+/// parent builder, so the chain flows back through [`end`](Self::end).
 pub struct SlotSpecBuilder {
     parent: WiringBuilder,
     spec: SlotSpec,
 }
 
 impl SlotSpecBuilder {
-    /// Declare an **allowed** occupant by artifact id (the `Load` name, 1:1 for v1), with
-    /// no default params ([`ParamSource::None`]). Use
-    /// [`allow_with_params`](Self::allow_with_params) for typed default params.
+    /// Allows the named occupant to load into this slot, with no default
+    /// params. Use [`allow_with_params`](Self::allow_with_params) to attach
+    /// typed defaults.
     pub fn allow(mut self, occupant: impl Into<String>) -> Self {
         self.spec.allow.push(AllowedOccupantSpec {
             occupant: occupant.into(),
@@ -258,9 +255,8 @@ impl SlotSpecBuilder {
         self
     }
 
-    /// Declare an allowed occupant carrying typed default params, postcard-encoded into the
-    /// canonical [`ParamSource::Postcard`] bytes (byte-identical to the KDL schema-guided
-    /// encode — the same equivalence as [`SystemSpecBuilder::params`]).
+    /// Allows the named occupant with typed default params, postcard-encoded
+    /// the same way as [`SystemSpecBuilder::params`].
     pub fn allow_with_params<P: Serialize>(
         mut self,
         occupant: impl Into<String>,
@@ -275,19 +271,20 @@ impl SlotSpecBuilder {
         self
     }
 
-    /// Declare an `input` user-port frame name (the validated contract).
+    /// Declares an input frame in the slot's port contract. Every occupant is
+    /// validated against the contract when it loads.
     pub fn input(mut self, frame: impl Into<String>) -> Self {
         self.spec.inputs.push(frame.into());
         self
     }
 
-    /// Declare an `output` user-port frame name (the validated contract).
+    /// Declares an output frame in the slot's port contract.
     pub fn output(mut self, frame: impl Into<String>) -> Self {
         self.spec.outputs.push(frame.into());
         self
     }
 
-    /// Set the startup occupant and its [`SlotInitState`].
+    /// Sets the occupant loaded at startup and its [`SlotInitState`].
     pub fn initial(mut self, occupant: impl Into<String>, state: SlotInitState) -> Self {
         self.spec.initial = Some(InitialOccupantSpec {
             occupant: occupant.into(),
@@ -296,15 +293,16 @@ impl SlotSpecBuilder {
         self
     }
 
-    /// Finish this slot, push it onto the [`Wiring`], and return the parent builder.
+    /// Pushes this slot onto the [`Wiring`] and returns the parent builder.
     pub fn end(mut self) -> WiringBuilder {
         self.parent.slots.push(self.spec);
         self.parent
     }
 }
 
-/// The per-system fluent sub-builder returned by [`WiringBuilder::system`]; owns the
-/// parent builder so the chain flows back through [`end`](Self::end).
+/// Sub-builder for one system instance, returned by [`WiringBuilder::system`].
+/// It owns the parent builder, so the chain flows back through
+/// [`end`](Self::end).
 pub struct SystemSpecBuilder {
     parent: WiringBuilder,
     name: String,
@@ -314,47 +312,48 @@ pub struct SystemSpecBuilder {
 }
 
 impl SystemSpecBuilder {
-    /// Set the system `type=` key. Required for a [`from_static`](Self::from_static)
-    /// system (the registry key); optional for a [`from_artifact`](Self::from_artifact)
-    /// one, whose artifact's `system_type` is authoritative (a given `ty` is validated
-    /// against it at resolve).
+    /// Sets the system type. A [`from_static`](Self::from_static) system
+    /// requires it as the registry key. For a
+    /// [`from_artifact`](Self::from_artifact) system it is optional, since
+    /// the artifact's `system_type` is authoritative; when given, resolve
+    /// checks the two agree.
     pub fn ty(mut self, ty: impl Into<String>) -> Self {
         self.ty = Some(ty.into());
         self
     }
 
-    /// Resolve this system by `dlopen`'ing the named [`Artifact`].
+    /// Resolves this system by loading the named [`Artifact`] at run time.
     pub fn from_artifact(mut self, artifact_id: impl Into<String>) -> Self {
         self.artifact = Some(artifact_id.into());
         self
     }
 
-    /// Resolve this system statically through the [`Registry`](super::Registry).
-    /// The default if neither `from_*` is called.
+    /// Resolves this system statically through the
+    /// [`Registry`](super::Registry). This is the default when neither
+    /// `from_*` is called.
     pub fn from_static(mut self) -> Self {
         self.artifact = None;
         self
     }
 
-    /// Set the typed params, postcard-encoded into the canonical
-    /// [`ParamSource::Postcard`] bytes. For a dl system these are exactly the bytes
-    /// `fsw_create` decodes — **byte-identical** to what the KDL front-end's
-    /// schema-guided encoder produces for the same logical value. A paramless
-    /// system can omit this ([`ParamSource::None`]).
+    /// Sets the typed params, postcard-encoded into [`ParamSource::Postcard`]
+    /// bytes. These are exactly the bytes the loaded library's `fsw_create`
+    /// decodes, and match what the KDL front-end encodes for the same value.
     ///
-    /// **[`from_artifact`](Self::from_artifact) systems only.** A static system takes
-    /// its params through its registered KDL-deserializing factory — there is no
-    /// postcard decode path, so `resolve` rejects the combination with
+    /// Only a [`from_artifact`](Self::from_artifact) system accepts them. A
+    /// static system takes its params through its registered
+    /// KDL-deserializing factory and has no postcard decode path, so resolve
+    /// rejects the combination with
     /// [`LoadError::StaticPostcardParams`](super::LoadError::StaticPostcardParams)
     /// rather than silently running the system on defaults.
     pub fn params<P: Serialize>(mut self, params: P) -> Self {
-        let bytes =
-            postcard::to_allocvec(&params).expect("params postcard-encode (Serialize is infallible)");
+        let bytes = postcard::to_allocvec(&params)
+            .expect("params postcard-encode (Serialize is infallible)");
         self.params = ParamSource::Postcard(bytes);
         self
     }
 
-    /// Finish this system, push it onto the [`Wiring`], and return the parent builder.
+    /// Pushes this system onto the [`Wiring`] and returns the parent builder.
     pub fn end(mut self) -> WiringBuilder {
         self.parent.systems.push(SystemSpec {
             name: self.name,

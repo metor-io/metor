@@ -1,21 +1,27 @@
-//! `#[derive(SystemInput)]` / `#[derive(SystemOutput)]` (system.md §2, Q5).
+//! Derives for system port bundles: `#[derive(SystemInput)]` and
+//! `#[derive(SystemOutput)]`.
 //!
-//! A system's input/output bundle is a named struct of `Input<F>` / `Output<F>` /
-//! `MsgIn<M>` / `MsgOut<M>` ports (plus capability fields like `AllOutputs`).
-//! These derives generate the static `decls()` (and, for outputs,
-//! `take_dropped()`) by delegating to each field type's own
-//! `decl()`/`take_dropped()` — so the macro never has to parse `F` out of the
-//! field type, and a capability field rides the same walk (its `decl()` is a
-//! `PortDecl::Capability`; its `bind` consumes no ring).
+//! A bundle is a named struct whose fields are port types (`Input<F>`,
+//! `Output<F>`, `MsgIn<M>`, `MsgOut<M>`) or capability fields such as
+//! `AllOutputs`. The derives never parse a payload type out of a field.
+//! Instead they delegate to the field type itself: the generated `decls()`
+//! pushes each field's `decl()` and the generated `bind` calls each field's
+//! `bind(src)`, both in declaration order. That symmetry is what makes
+//! positional binding work, since the ring source hands out rings by cursor
+//! and each `bind(src)` call lands on the ring reserved for the matching
+//! declaration. Capability fields ride the same walk without disturbing it;
+//! their `decl()` is a `PortDecl::Capability` and their `bind` consumes no
+//! ring.
 //!
-//! ## `#[fsw(...)]` field attributes
+//! A `PhantomData` field is skipped by both walks and default-constructed by
+//! `bind`, so a hand-written bundle can carry one for its own generics.
 //!
-//! - `#[fsw(telemetered = false)]` (outputs) — the downlink / `AllOutputs` opt-out
-//!   (A6); lowers to `.untelemetered()` on the descriptor. The `CommandOut<M>` type
-//!   token is recognized as sugar for exactly this on a `MsgOut<M>`.
-//!
-//! A `PhantomData` field is skipped everywhere (and default-constructed by `bind`),
-//! so a hand-written bundle may carry one for its own generics.
+//! One field attribute is recognized. `#[fsw(telemetered = false)]` excludes
+//! an output port from telemetry, lowering to `.untelemetered()` on the port's
+//! descriptor. The `CommandOut<M>` type alias is sugar for exactly this on a
+//! `MsgOut<M>`; the alias carries no flag of its own, so the derive spots the
+//! type token and applies the override. The attribute is rejected on inputs,
+//! which are never telemetered.
 
 use darling::FromDeriveInput;
 use darling::ast;
@@ -25,8 +31,8 @@ use proc_macro2::TokenStream as TokenStream2;
 use quote::quote;
 use syn::{DeriveInput, Generics, Ident};
 
-/// Which derive is running — the two directions accept different `#[fsw(...)]`
-/// keys (`telemetered` is output-only).
+/// Which derive is running. The two directions accept different `#[fsw(...)]`
+/// keys; `telemetered` is output-only.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Dir {
     Input,
@@ -38,7 +44,7 @@ enum Dir {
 struct BundleField {
     ident: Option<Ident>,
     ty: syn::Type,
-    /// `#[fsw(telemetered = false)]` — output-only downlink opt-out (A6).
+    /// `#[fsw(telemetered = false)]`, the output-only telemetry opt-out.
     #[darling(default)]
     telemetered: Option<bool>,
 }
@@ -49,8 +55,8 @@ impl BundleField {
         crate::sig::type_head(&self.ty).is_some_and(|h| h == "PhantomData")
     }
 
-    /// Whether the field's type token is the `CommandOut` sugar (an untelemetered
-    /// `MsgOut` — the alias carries no flag of its own, the macros apply it).
+    /// Whether the field's type token is the `CommandOut` sugar for an
+    /// untelemetered `MsgOut`.
     fn is_command_out(&self) -> bool {
         crate::sig::type_head(&self.ty).is_some_and(|h| h == "CommandOut")
     }
@@ -77,7 +83,8 @@ struct Bundle {
 }
 
 impl Bundle {
-    /// The port fields, in declaration order (`PhantomData` anchors skipped).
+    /// The port fields in declaration order, with `PhantomData` anchors
+    /// skipped.
     fn ports(&self) -> Vec<&BundleField> {
         self.data
             .as_ref()
@@ -88,7 +95,8 @@ impl Bundle {
             .collect()
     }
 
-    /// Validate every field's attributes for this direction, folding all errors.
+    /// Validate every field's attributes for this direction, folding all
+    /// errors into one so the caller reports them together.
     fn validate(&self, dir: Dir) -> Result<(), syn::Error> {
         let mut err: Option<syn::Error> = None;
         for f in self.ports() {
@@ -106,10 +114,10 @@ impl Bundle {
     }
 }
 
-/// Emits the `decls()` body: each field type's `decl()` (a wired port, or a
-/// capability like `AllOutputs`), in field order, with the `#[fsw(...)]` axis
-/// overrides (and the `CommandOut` sugar) chained on. The overrides are
-/// `PortDecl`-level so the walk stays type-blind; they only touch `Port` decls.
+/// Emits the `decls()` body: each field type's `decl()` in field order, with
+/// the telemetry override chained on where the attribute or the `CommandOut`
+/// sugar asks for it. The override is applied at the `PortDecl` level so the
+/// walk stays type-blind.
 fn decls_body(bundle: &Bundle, _fsw2: &TokenStream2) -> TokenStream2 {
     let calls = bundle.ports().into_iter().map(|f| {
         let ty = &f.ty;
@@ -126,10 +134,9 @@ fn decls_body(bundle: &Bundle, _fsw2: &TokenStream2) -> TokenStream2 {
     }
 }
 
-/// Emits the `BindPorts::bind` body: each port type's `bind(src)`, in field order —
-/// symmetric to `decls()`, so the ring source's positional cursor lines each
-/// port up with the ring the coordinator reserved for it. `PhantomData` anchors
-/// are default-constructed (they consume no ring).
+/// Emits the `BindPorts::bind` body: each port type's `bind(src)` in field
+/// order, mirroring `decls()` so positional binding lines up (see the module
+/// doc). `PhantomData` anchors are default-constructed and consume no ring.
 fn bind_body(bundle: &Bundle, _fsw2: &TokenStream2) -> TokenStream2 {
     let fields = bundle.data.as_ref().take_struct().expect("named struct");
     let binds = fields.iter().map(|f| {
@@ -146,8 +153,8 @@ fn bind_body(bundle: &Bundle, _fsw2: &TokenStream2) -> TokenStream2 {
     }
 }
 
-/// Emit the `BindPorts` impl for a bundle. Rings are backing-erased, so the one
-/// impl serves the host binder and a dlopen'd system's raw binder alike.
+/// Emit the `BindPorts` impl for a bundle. The impl is generic over the ring
+/// source, so it serves any binder that can hand out rings.
 fn bind_ports_impl(bundle: &Bundle, fsw2: &TokenStream2, bind: &TokenStream2) -> TokenStream2 {
     let ident = &bundle.ident;
     let (impl_generics, ty_generics, where_clause) = bundle.generics.split_for_impl();
@@ -165,10 +172,11 @@ pub fn system_input(input: TokenStream) -> TokenStream {
     expand_input(parsed).into()
 }
 
-/// The `TokenStream2` body of `#[derive(SystemInput)]` (unit-testable in-crate).
+/// The `TokenStream2` body of `#[derive(SystemInput)]`, split out so the unit
+/// tests can call it directly.
 fn expand_input(parsed: DeriveInput) -> TokenStream2 {
-    // A darling parse failure (e.g. an unknown `#[fsw(...)]` key) is a compile
-    // error on the offending tokens, not a proc-macro panic.
+    // A darling parse failure (say, an unknown `#[fsw(...)]` key) becomes a
+    // compile error on the offending tokens rather than a proc-macro panic.
     let bundle = match Bundle::from_derive_input(&parsed) {
         Ok(b) => b,
         Err(e) => return e.write_errors(),
@@ -199,7 +207,8 @@ pub fn system_output(input: TokenStream) -> TokenStream {
     expand_output(parsed).into()
 }
 
-/// The `TokenStream2` body of `#[derive(SystemOutput)]` (unit-testable in-crate).
+/// The `TokenStream2` body of `#[derive(SystemOutput)]`, split out so the unit
+/// tests can call it directly.
 fn expand_output(parsed: DeriveInput) -> TokenStream2 {
     let bundle = match Bundle::from_derive_input(&parsed) {
         Ok(b) => b,
@@ -215,7 +224,7 @@ fn expand_output(parsed: DeriveInput) -> TokenStream2 {
     let bind = bind_body(&bundle, &fsw2);
     let bind_ports = bind_ports_impl(&bundle, &fsw2, &bind);
 
-    // take_dropped: sum-and-clear every output port's publish-drop counter (E6).
+    // take_dropped sums and clears every output port's publish-drop counter.
     let dropped = bundle.ports().into_iter().map(|f| {
         let id = f.ident.as_ref().expect("named field");
         quote! { + self.#id.take_dropped() }
@@ -235,11 +244,8 @@ fn expand_output(parsed: DeriveInput) -> TokenStream2 {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Unit tests: `#[fsw(...)]` attribute lowering + the direction/value errors
-// (in-crate, over `TokenStream2` — the compile-and-run half lives in
-// metor-fsw-2's own test suites, which exercise the generated impls).
-// ---------------------------------------------------------------------------
+// --- Unit tests: attribute lowering and the direction errors, checked over
+// `TokenStream2` without compiling the expansion ---
 
 #[cfg(test)]
 mod tests {
@@ -261,8 +267,8 @@ mod tests {
         prettyplease::unparse(&file)
     }
 
-    /// The input derive delegates every field to its type's `decl()`/`bind(src)`,
-    /// in field order.
+    /// The input derive delegates every field to its type's `decl()` and
+    /// `bind(src)`, in field order.
     #[test]
     fn input_delegates_decl_and_bind() {
         let out = input_ok(quote! {
@@ -271,15 +277,18 @@ mod tests {
                 imu: Input<Imu>,
             }
         });
-        assert!(out.contains("decls.push(<MsgIn<GuardCmd>>::decl());"), "{out}");
+        assert!(
+            out.contains("decls.push(<MsgIn<GuardCmd>>::decl());"),
+            "{out}"
+        );
         assert!(out.contains("decls.push(<Input<Imu>>::decl());"), "{out}");
         assert!(out.contains("cmds: <MsgIn<GuardCmd>>::bind(src)"), "{out}");
         assert!(out.contains("imu: <Input<Imu>>::bind(src)"), "{out}");
     }
 
-    /// `#[fsw(telemetered = false)]` and the `CommandOut` type token both lower to
-    /// `.untelemetered()` on the descriptor (bind is untouched — the flag is
-    /// descriptor-only).
+    /// `#[fsw(telemetered = false)]` and the `CommandOut` type token both
+    /// lower to `.untelemetered()` on the descriptor, and only there; bind is
+    /// untouched.
     #[test]
     fn telemetered_and_command_out_lower_to_untelemetered() {
         let out = output_ok(quote! {
@@ -290,19 +299,25 @@ mod tests {
                 beat: Output<Heartbeat>,
             }
         });
-        assert!(out.contains("<Output<Nav>>::decl().untelemetered()"), "{out}");
+        assert!(
+            out.contains("<Output<Nav>>::decl().untelemetered()"),
+            "{out}"
+        );
         assert!(
             out.contains("<CommandOut<SequenceCommand>>::decl().untelemetered()"),
             "{out}"
         );
-        assert!(out.contains("decls.push(<Output<Heartbeat>>::decl());"), "{out}");
+        assert!(
+            out.contains("decls.push(<Output<Heartbeat>>::decl());"),
+            "{out}"
+        );
         // Bind never chains a telemetry override.
         assert!(out.contains("nav: <Output<Nav>>::bind(src)"), "{out}");
         assert!(!out.contains("bind(src).untelemetered"), "{out}");
     }
 
-    /// Direction misuse is a compile error, not a silent no-op; an unknown
-    /// `#[fsw(...)]` key errs via darling.
+    /// Direction misuse is a compile error, not a silent no-op, and an
+    /// unknown `#[fsw(...)]` key errs via darling.
     #[test]
     fn attribute_errors() {
         let err = |dir_input: bool, item: TokenStream2| -> String {
@@ -316,15 +331,21 @@ mod tests {
         };
 
         // telemetered on an input.
-        let out = err(true, quote! {
-            struct A { #[fsw(telemetered = false)] x: MsgIn<M> }
-        });
+        let out = err(
+            true,
+            quote! {
+                struct A { #[fsw(telemetered = false)] x: MsgIn<M> }
+            },
+        );
         assert!(out.contains("applies to output ports only"), "{out}");
 
-        // Unknown key (darling), surfaced as a compile error — never a macro panic.
-        let out = err(false, quote! {
-            struct A { #[fsw(telemetred = false)] x: MsgOut<M> }
-        });
+        // An unknown key surfaces as a compile error, never a macro panic.
+        let out = err(
+            false,
+            quote! {
+                struct A { #[fsw(telemetred = false)] x: MsgOut<M> }
+            },
+        );
         assert!(out.contains("compile_error"), "{out}");
     }
 }

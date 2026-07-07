@@ -1,15 +1,23 @@
-//! The relocatable **bundle** — `package`'s output and one of `run`'s inputs
-//! (cli-runner.md §4).
+//! Relocatable bundles, directories that carry everything a mission needs to
+//! run without a source tree or a cargo install.
 //!
-//! A bundle is a plain directory carrying everything a mission needs to run with **no
-//! source tree and no cargo**: the wiring manifest (`mission.kdl`), a metadata sidecar
-//! (`meta.kdl`), and the built `cdylib`s copied in next to them. It is
-//! **platform-specific** (it holds compiled `.so`s), so it is built for, and run on, one
-//! target arch.
+//! A bundle holds three things side by side: the wiring manifest
+//! (`mission.kdl`, the source KDL text carried over verbatim), a metadata
+//! sidecar (`meta.kdl`), and a copy of every artifact's built `cdylib`. The
+//! manifest stays relocatable because its `artifact` entries name library
+//! stems rather than absolute paths; loading re-decorates each stem into this
+//! platform's file name and expects the matching `.so` next to the manifest.
+//! Since the shared objects are compiled code, a bundle is tied to the target
+//! architecture it was built for.
 //!
-//! [`write_bundle`] produces it from a built [`Wiring`] + the source KDL text;
-//! [`load_bundle`] reads one back into a [`Wiring`] whose artifacts point at the copied
-//! `.so`s — the cargo-free counterpart to [`build_artifacts`](super::build_artifacts).
+//! The sidecar records the ABI version the bundle was built against, and
+//! [`load_bundle`] refuses any bundle whose version differs from this host's
+//! [`FSW_ABI_VERSION`]. It also records the build profile and a timestamp for
+//! provenance; those are informational only.
+//!
+//! [`write_bundle`] produces a bundle from a built [`Wiring`] plus the source
+//! KDL text. [`load_bundle`] reads one back into a [`Wiring`] whose artifact
+//! paths point at the copied `.so`s, ready to run without invoking cargo.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -23,21 +31,20 @@ use crate::abi::FSW_ABI_VERSION;
 use super::model::Wiring;
 use super::parse;
 
-/// The metadata sidecar's file name within a bundle.
+/// File name of the metadata sidecar within a bundle.
 const META_FILE: &str = "meta.kdl";
-/// The wiring manifest's file name within a bundle.
+/// File name of the wiring manifest within a bundle.
 const MISSION_FILE: &str = "mission.kdl";
 
 /// Options for [`write_bundle`].
 #[derive(Clone, Debug, Default)]
 pub struct PackageOptions {
-    /// Record `profile "release"` in `meta.kdl` (otherwise `"debug"`). Purely
-    /// informational — it documents how the bundled `.so`s were built.
+    /// Record `profile "release"` in `meta.kdl` instead of `"debug"`. Purely
+    /// informational; it documents how the bundled `.so`s were built.
     pub release: bool,
 }
 
-/// A bundle read/write failure. Each is a clean error — packaging or loading never
-/// panics the caller.
+/// An error writing or loading a bundle.
 #[derive(Debug, Error)]
 pub enum BundleError {
     /// A filesystem operation failed.
@@ -49,19 +56,21 @@ pub enum BundleError {
         /// The underlying I/O error.
         source: std::io::Error,
     },
-    /// An artifact had no resolved `path` at package time (run the build driver first).
+    /// An artifact had no built `.so` at package time.
     #[error("cannot package artifact `{artifact}`: it has no built `.so` (build it first)")]
     NotBuilt {
         /// The artifact id.
         artifact: String,
     },
-    /// A bundle's `meta.kdl` could not be parsed, or was missing a required field.
+    /// The bundle's `meta.kdl` could not be parsed, or was missing a required
+    /// field.
     #[error("invalid bundle metadata ({META_FILE}): {reason}")]
     BadMeta {
         /// What was wrong.
         reason: String,
     },
-    /// The bundle's ABI version does not match this host's [`FSW_ABI_VERSION`].
+    /// The bundle's ABI version does not match this host's
+    /// [`FSW_ABI_VERSION`].
     #[error(
         "bundle was built against FSW ABI v{found}, but this host speaks v{expected} \
          (rebuild the bundle)"
@@ -85,21 +94,18 @@ pub enum BundleError {
     },
 }
 
-/// Helper: tag an [`std::io::Error`] with the path it happened on.
+/// Tag an [`std::io::Error`] with the path it happened on.
 fn io_at(path: impl Into<PathBuf>) -> impl FnOnce(std::io::Error) -> BundleError {
     let path = path.into();
     move |source| BundleError::Io { path, source }
 }
 
-/// Write a relocatable bundle to `dir` (created if absent): copy each artifact's built
-/// `.so` in, place the `mission.kdl` manifest (the source KDL, verbatim), and emit the
-/// `meta.kdl` sidecar (cli-runner.md §4).
+/// Write a bundle to `dir`, creating the directory if needed.
 ///
-/// `wiring` must be **built** — every [`Artifact::path`](crate::Artifact) is `Some` (run
-/// [`build_artifacts`](super::build_artifacts) first), else [`BundleError::NotBuilt`].
-/// `mission_kdl` is the source wiring text carried into the bundle unchanged; its
-/// `artifact` `lib=` stems re-decorate to this platform's file names on
-/// [`load_bundle`], matching the copied `.so`s.
+/// Copies each artifact's built `.so` in under its produced file name, writes
+/// `mission_kdl` verbatim as the manifest, and emits the `meta.kdl` sidecar.
+/// Every artifact in `wiring` must already have a built path, otherwise this
+/// returns [`BundleError::NotBuilt`].
 pub fn write_bundle(
     wiring: &Wiring,
     mission_kdl: &str,
@@ -108,21 +114,20 @@ pub fn write_bundle(
 ) -> Result<(), BundleError> {
     fs::create_dir_all(dir).map_err(io_at(dir))?;
 
-    // Copy each built `.so` in under its produced file name (`Artifact::cdylib`).
     for artifact in &wiring.artifacts {
-        let src = artifact.path.as_ref().ok_or_else(|| BundleError::NotBuilt {
-            artifact: artifact.id.clone(),
-        })?;
+        let src = artifact
+            .path
+            .as_ref()
+            .ok_or_else(|| BundleError::NotBuilt {
+                artifact: artifact.id.clone(),
+            })?;
         let dst = dir.join(&artifact.cdylib);
         fs::copy(src, &dst).map_err(io_at(&dst))?;
     }
 
-    // The manifest is the source KDL, verbatim — re-parseable, human-readable, and
-    // already relocatable (artifact `lib=` are stems, not absolute paths).
     let mission_path = dir.join(MISSION_FILE);
     fs::write(&mission_path, mission_kdl).map_err(io_at(&mission_path))?;
 
-    // The sidecar: the ABI load-guard plus provenance. Schemas are deferred (§4.3).
     let built_at_unix = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs())
@@ -140,12 +145,13 @@ pub fn write_bundle(
     Ok(())
 }
 
-/// Read a bundle directory back into a runnable [`Wiring`]: parse `meta.kdl` (guarding
-/// the ABI version), parse `mission.kdl`, and fill each [`Artifact::path`](crate::Artifact)
-/// from the `.so` copied alongside. **Never invokes cargo** — the cargo-free counterpart
-/// to [`build_artifacts`](super::build_artifacts) (cli-runner.md §4.4).
+/// Read a bundle directory back into a runnable [`Wiring`].
+///
+/// Checks the sidecar's ABI version against [`FSW_ABI_VERSION`], parses the
+/// manifest, and fills each artifact's path from the `.so` copied alongside.
+/// Fails with [`BundleError::MissingSo`] if a `.so` the manifest names is not
+/// in the directory.
 pub fn load_bundle(dir: &Path) -> Result<Wiring, BundleError> {
-    // --- meta.kdl: the ABI load-guard -----------------------------------
     let meta_path = dir.join(META_FILE);
     let meta_text = fs::read_to_string(&meta_path).map_err(io_at(&meta_path))?;
     let abi = meta_abi_version(&meta_text)?;
@@ -156,7 +162,6 @@ pub fn load_bundle(dir: &Path) -> Result<Wiring, BundleError> {
         });
     }
 
-    // --- mission.kdl → Wiring, then fill each artifact path from the dir --
     let mission_path = dir.join(MISSION_FILE);
     let mission_text = fs::read_to_string(&mission_path).map_err(io_at(&mission_path))?;
     let mut wiring = parse(&mission_text).map_err(|e| BundleError::Parse(Box::new(e)))?;
@@ -177,7 +182,9 @@ pub fn load_bundle(dir: &Path) -> Result<Wiring, BundleError> {
 fn meta_abi_version(text: &str) -> Result<u32, BundleError> {
     let doc = text
         .parse::<KdlDocument>()
-        .map_err(|e| BundleError::BadMeta { reason: e.to_string() })?;
+        .map_err(|e| BundleError::BadMeta {
+            reason: e.to_string(),
+        })?;
     let meta = doc
         .nodes()
         .iter()

@@ -1,5 +1,26 @@
-//! The schema-guided KDL→postcard params encoder for dl systems (the
-//! one-postcard-encoding path), split out of `wiring/mod.rs` (C6).
+//! Schema-guided encoding of a KDL params node into postcard bytes.
+//!
+//! A dynamically loaded system's `Params` type is never linked into the host.
+//! What the host has instead is the postcard schema the shared library exports
+//! ([`DlSystem::params_schema`](crate::dl::DlSystem::params_schema)). This
+//! module walks that schema to turn a system node's KDL params into the exact
+//! bytes the `Params` struct itself would postcard-encode to, so the loaded
+//! side can decode them as its own type.
+//!
+//! The pipeline has three steps. The shared node deserializer ([`de`]) reads
+//! the node's params surface into a dynamic [`serde_json::Value`] plus a table
+//! mapping each top-level key to its source span. [`conform_to_schema`] then
+//! checks that value against the schema, turning unknown keys, missing fields,
+//! and type mismatches into spanned [`LoadError`]s and inserting an explicit
+//! `Null` for every absent `Option` field, since postcard-dyn requires the key
+//! to be present. Finally [`postcard_dyn::to_stdvec_dyn`] emits the bytes.
+//!
+//! Two properties of the conformance walk are worth knowing. The span table
+//! covers top-level keys only, so an error inside a nested struct or sequence
+//! carries the span of the top-level property containing it. And any schema
+//! shape the walk does not model (tuples, maps, enums) passes through
+//! unchecked; if postcard-dyn cannot encode it, the failure surfaces as
+//! [`LoadError::DlParamEncode`] rather than as silently wrong bytes.
 
 use std::collections::HashMap;
 
@@ -10,24 +31,14 @@ use serde_json::{Map, Value};
 
 use super::{LoadError, de};
 
-/// Encode a dl system's KDL node config into the canonical postcard `Params` bytes,
-/// **guided by the `.so`'s exported `Params` schema** (the one-postcard-encoding
-/// decision). The host never links the system's `Params` type: the shared KDL
-/// deserializer ([`de`]) reads the node's params surface into a dynamic
-/// [`serde_json::Value`] (plus a key → span table), the value is conformed to the
-/// schema ([`conform_to_schema`]: unknown/missing/type-mismatched fields become
-/// named, spanned errors; absent `Option` fields become explicit nulls), and
-/// [`postcard_dyn::to_stdvec_dyn`] emits the **same bytes** the typed Rust builder's
-/// [`WiringBuilder::params`](crate::WiringBuilder) postcard-encodes (the byte
-/// equality is the headline equivalence gate, asserted in `tests_abi`).
+/// Encodes a system node's KDL params into the postcard bytes described by
+/// `schema`.
 ///
-/// `node_text` is the carried node source ([`ParamSource::Kdl`]); `schema` is
-/// [`DlSystem::params_schema`]; `system` names the instance for diagnostics;
-/// `reserved`/`skip_args` name the node's wiring surface (`type=`/`artifact=` + the
-/// instance name on `system` nodes, `occupant=` on `allow` nodes). Errors are
-/// span-aware [`LoadError`]s: [`UnknownParam`](LoadError::UnknownParam),
-/// [`MissingParam`](LoadError::MissingParam), [`InvalidParam`](LoadError::InvalidParam),
-/// or [`DlParamEncode`](LoadError::DlParamEncode) for an un-encodable schema shape.
+/// `node_text` must parse to a document containing the one system node.
+/// `reserved` and `skip_args` name the parts of the node that belong to the
+/// wiring surface rather than the params (reserved property names and leading
+/// positional arguments), which the deserializer skips. `system` names the
+/// instance in diagnostics.
 pub fn encode_kdl_params(
     node_text: &str,
     schema: &OwnedNamedType,
@@ -43,7 +54,9 @@ pub fn encode_kdl_params(
         span,
     };
 
-    let doc = node_text.parse::<KdlDocument>().map_err(|e| encode_err(e.to_string()))?;
+    let doc = node_text
+        .parse::<KdlDocument>()
+        .map_err(|e| encode_err(e.to_string()))?;
     let node = doc
         .nodes()
         .first()
@@ -60,8 +73,8 @@ pub fn encode_kdl_params(
         .map_err(|e| encode_err(format!("dynamic postcard encode failed: {e:?}")))
 }
 
-/// A [`conform_to_schema`] failure: a named, spanned params diagnostic, or a schema
-/// shape the walk cannot model (surfaced as [`DlParamEncode`](LoadError::DlParamEncode)).
+/// A conformance failure, either a spanned params diagnostic or a schema shape
+/// the walk cannot express (reported as [`LoadError::DlParamEncode`]).
 enum Conform {
     Load(Box<LoadError>),
     Shape(String),
@@ -73,12 +86,11 @@ impl From<LoadError> for Conform {
     }
 }
 
-/// Conform a deserialized params [`Value`] to a `Params` schema **struct** (or unit):
-/// every JSON key must be a schema field ([`UnknownParam`](LoadError::UnknownParam)),
-/// every non-`Option` schema field must be present ([`MissingParam`](LoadError::MissingParam),
-/// absent `Option`s get an explicit `Null` — postcard-dyn requires it), and each field
-/// value is checked/recursed by [`conform_value`]. The output object holds schema
-/// field order (order is irrelevant to postcard-dyn, which iterates the schema).
+/// Conforms a params object to a struct (or unit) schema.
+///
+/// Every key must name a schema field and every non-`Option` field must be
+/// present; there are no defaults. Absent `Option` fields become explicit
+/// `Null`s. Field values are checked and recursed by [`conform_value`].
 fn conform_to_schema(
     ty: &OwnedDataModelType,
     value: Value,
@@ -106,7 +118,7 @@ fn conform_to_schema(
         }
     };
 
-    // Every key must name a schema field (the typo guard, with the entry's span).
+    // The typo guard, with the offending entry's own span when we have one.
     for key in obj.keys() {
         if !fields.iter().any(|f| f.name == *key) {
             return Err(LoadError::UnknownParam {
@@ -127,8 +139,7 @@ fn conform_to_schema(
                 let v = conform_value(&field.ty.ty, v, &field.name, span, system, src)?;
                 out.insert(field.name.clone(), v);
             }
-            // An `Option` field with no property is `None` (postcard-dyn needs the
-            // explicit null); any other absent field is a hard miss (no defaults).
+            // postcard-dyn requires the key even for `None`, hence the explicit null.
             None if matches!(field.ty.ty, OwnedDataModelType::Option(_)) => {
                 out.insert(field.name.clone(), Value::Null);
             }
@@ -146,12 +157,11 @@ fn conform_to_schema(
     Ok(Value::Object(out))
 }
 
-/// Check/recurse one field value against its schema type. Leaves are type- and
-/// range-checked with [`leaf_expected`] wording; nested structs/sequences/options
-/// recurse (nested errors carry the **top-level** property's span — the side table
-/// is top-level only, v1). Any schema shape the walk does not model passes through
-/// to postcard-dyn, whose failure surfaces as
-/// [`DlParamEncode`](LoadError::DlParamEncode) — never silently wrong bytes.
+/// Checks one field value against its schema type, recursing into options,
+/// sequences, newtypes, and nested structs.
+///
+/// Unmodeled schema shapes pass through to postcard-dyn, and errors inside
+/// nested values reuse the top-level property's span; see the module docs.
 fn conform_value(
     ty: &OwnedDataModelType,
     value: Value,
@@ -171,7 +181,7 @@ fn conform_value(
         }
         .into()
     };
-    // The signed/unsigned width an integer leaf must fit.
+    // Whether the value is an integer within the leaf's width.
     let int_ok = |min: i128, max: i128| -> bool {
         match &value {
             Value::Number(n) => n
@@ -184,34 +194,48 @@ fn conform_value(
     };
     match ty {
         T::Bool => value.is_boolean().then_some(value).ok_or_else(mismatch),
-        T::I8 => int_ok(i8::MIN as i128, i8::MAX as i128).then_some(value).ok_or_else(mismatch),
-        T::I16 => int_ok(i16::MIN as i128, i16::MAX as i128).then_some(value).ok_or_else(mismatch),
-        T::I32 => int_ok(i32::MIN as i128, i32::MAX as i128).then_some(value).ok_or_else(mismatch),
-        // postcard-dyn reads i64/isize/i128 via `as_i64` — i64 range on the wire.
-        T::I64 | T::Isize | T::I128 => {
-            int_ok(i64::MIN as i128, i64::MAX as i128).then_some(value).ok_or_else(mismatch)
-        }
-        T::U8 => int_ok(0, u8::MAX as i128).then_some(value).ok_or_else(mismatch),
-        T::U16 => int_ok(0, u16::MAX as i128).then_some(value).ok_or_else(mismatch),
-        T::U32 => int_ok(0, u32::MAX as i128).then_some(value).ok_or_else(mismatch),
-        // postcard-dyn reads u64/usize/u128 via `as_u64` — u64 range on the wire.
-        T::U64 | T::Usize | T::U128 => {
-            int_ok(0, u64::MAX as i128).then_some(value).ok_or_else(mismatch)
-        }
-        // postcard-dyn's `as_f64` accepts integer literals (`rate=200` ⇒ 200.0).
+        T::I8 => int_ok(i8::MIN as i128, i8::MAX as i128)
+            .then_some(value)
+            .ok_or_else(mismatch),
+        T::I16 => int_ok(i16::MIN as i128, i16::MAX as i128)
+            .then_some(value)
+            .ok_or_else(mismatch),
+        T::I32 => int_ok(i32::MIN as i128, i32::MAX as i128)
+            .then_some(value)
+            .ok_or_else(mismatch),
+        // postcard-dyn reads i64, isize, and i128 through `as_i64`, so the
+        // whole family is i64-ranged on the wire.
+        T::I64 | T::Isize | T::I128 => int_ok(i64::MIN as i128, i64::MAX as i128)
+            .then_some(value)
+            .ok_or_else(mismatch),
+        T::U8 => int_ok(0, u8::MAX as i128)
+            .then_some(value)
+            .ok_or_else(mismatch),
+        T::U16 => int_ok(0, u16::MAX as i128)
+            .then_some(value)
+            .ok_or_else(mismatch),
+        T::U32 => int_ok(0, u32::MAX as i128)
+            .then_some(value)
+            .ok_or_else(mismatch),
+        // Likewise u64, usize, and u128 all go through `as_u64`.
+        T::U64 | T::Usize | T::U128 => int_ok(0, u64::MAX as i128)
+            .then_some(value)
+            .ok_or_else(mismatch),
+        // Any number is fine here; postcard-dyn's `as_f64` accepts integer
+        // literals, so `rate=200` encodes as `200.0`.
         T::F32 | T::F64 => value.is_number().then_some(value).ok_or_else(mismatch),
         T::String => value.is_string().then_some(value).ok_or_else(mismatch),
         T::Char => match &value {
             Value::String(s) if s.chars().count() == 1 => Ok(value),
             _ => Err(mismatch()),
         },
-        // A present `Option<T>` is the `Some(T)` inner value; `#null` is `None`.
+        // A present value is the `Some` payload; `#null` stays `None`.
         T::Option(inner) => match value {
             Value::Null => Ok(Value::Null),
             v => conform_value(&inner.ty, v, property, span, system, src),
         },
-        // Nested structs recurse with the same rules; the top-level property's span
-        // is the fallback for everything inside.
+        // Nested structs get an empty span table, so everything inside falls
+        // back to the enclosing property's span.
         T::Struct(_) | T::Unit | T::UnitStruct => {
             conform_to_schema(ty, value, &HashMap::new(), system, src, span)
         }
@@ -226,14 +250,13 @@ fn conform_value(
             _ => Err(mismatch()),
         },
         T::NewtypeStruct(inner) => conform_value(&inner.ty, value, property, span, system, src),
-        // Tuples/maps/enums/etc.: pass through — postcard-dyn models them, and its
-        // failure surfaces as `DlParamEncode` (never silently wrong bytes).
+        // Unmodeled shapes pass through to postcard-dyn; see the module docs.
         _ => Ok(value),
     }
 }
 
-/// A human name of a schema leaf type, for [`InvalidParam`](LoadError::InvalidParam)
-/// on the dl (schema-guided) path.
+/// The wording for the `expected` field of an
+/// [`InvalidParam`](LoadError::InvalidParam) diagnostic.
 fn leaf_expected(ty: &OwnedDataModelType) -> String {
     use OwnedDataModelType as T;
     match ty {
@@ -248,4 +271,3 @@ fn leaf_expected(ty: &OwnedDataModelType) -> String {
         other => format!("an unsupported type ({other:?})"),
     }
 }
-

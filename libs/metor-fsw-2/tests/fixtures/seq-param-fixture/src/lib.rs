@@ -1,12 +1,11 @@
-//! A slots/sequences integration-test fixture with **params**: one `#[sequence]`
-//! occupant made `dlopen`-loadable, taking a typed `Params` and publishing its
-//! value on a user output frame. The `slot_wiring` host test resolves it through
-//! a KDL `slot`'s `allow occupant="gainer" gain=…` (the B1 regression: slot
-//! occupant params must reach the occupant) and asserts the frame carries the
-//! configured gain.
+//! A test fixture exercising sequence params. The crate builds as a loadable
+//! shared library containing one `#[sequence]`, `gainer`, which takes a typed
+//! [`GainerParams`] and republishes the configured gain on its output frame.
+//! A host that loads the library and passes params can read the frame back to
+//! confirm the values reached the running sequence.
 
-// The `#[sequence]` macro emits the `fsw_*` C-ABI exports (raw-pointer entry
-// points); the raw-pointer deref lint is inherent to that surface for any cdylib.
+// The `#[sequence]` macro generates raw-pointer C entry points, and this lint
+// fires on that generated code rather than anything written here.
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
 
 use core::time::Duration;
@@ -18,8 +17,7 @@ use postcard_schema::Schema;
 use serde::{Deserialize, Serialize};
 use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
 
-/// The user output frame: the configured gain, republished so the host can see
-/// the params were applied.
+/// The output frame carrying the gain the sequence was configured with.
 #[derive(metor_fsw_2::Frame, IntoBytes, Immutable, KnownLayout, FromBytes, Default)]
 #[repr(C)]
 #[metor_fsw(name = "gain_out")]
@@ -29,15 +27,15 @@ pub struct GainOut {
     pub gain: f64,
 }
 
-/// The typed params crossing `fsw_create` as postcard bytes (the same contract
-/// as any dl system's `Params`).
+/// Typed params handed to the sequence at creation, encoded as postcard bytes.
 #[derive(Serialize, Deserialize, Schema, Clone, Default, Debug, PartialEq)]
 pub struct GainerParams {
     pub gain: f64,
 }
 
-/// Publish the configured gain, wait ~2 sim-µs, then complete. The write happens
-/// on the first poll, so even a short run observes the params-derived value.
+/// Publishes the configured gain, waits two simulated microseconds, and
+/// completes. The write lands on the first poll, so even a very short run
+/// observes the params-derived value.
 #[metor_fsw_2::sequence]
 async fn gainer(params: GainerParams, mut out: Output<GainOut>) -> Outcome {
     progress("publishing gain");

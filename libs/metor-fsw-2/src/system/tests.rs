@@ -1,6 +1,8 @@
-//! System acceptance tests (system.md "Tests"): the cyclic & async system paths, the
-//! self-descriptor + compatibility check, the standard health counters, and the
-//! lossless backpressure semantics. Ports are built by hand, without a coordinator.
+//! Tests for the system layer. They cover the cyclic and async execution
+//! paths, the self-describing descriptor and its compatibility check, the
+//! standard health counters, and the backpressure a slow reader applies to a
+//! writer. Every port is built by hand on in-memory rings, with no
+//! coordinator involved.
 
 use core::mem::offset_of;
 use std::collections::HashMap;
@@ -10,13 +12,11 @@ use metor_fsw_ring::{Config, NoWake, Notifier, RingBuffer, WriteError};
 use metor_proto::types::{ComponentId, ComponentView, Timestamp};
 use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
 
+use crate::descriptor::compatible;
 use crate::{
     AsyncSystem, CyclicRunner, CyclicSystem, Frame, FrameList, HealthPort, Input, Out, Output,
-    PortDesc, SystemHealth, SystemInput, SystemKind, SystemLog, SystemOutput, System,
+    PortDesc, System, SystemHealth, SystemInput, SystemKind, SystemLog, SystemOutput,
     buffer_capacity,
-};
-use crate::descriptor::{
-    compatible,
 };
 
 // ---------------------------------------------------------------------------
@@ -49,7 +49,7 @@ struct NavEstimate {
     residuals: FrameList<Residual, 4>,
 }
 
-/// Records every scalar component it sees as `f64` — for reading a port via its vtable.
+/// Collects every scalar component a record's vtable reports, as `f64`.
 #[derive(Default)]
 struct RecSink {
     values: HashMap<ComponentId, f64>,
@@ -99,7 +99,7 @@ impl System for Filter {
     const NAME: &'static str = "filter";
 
     fn init(&mut self, output: &mut Out<FilterOut>) {
-        // Publish an initial (default) estimate before the first execute.
+        // Publish an initial default estimate before the first execute.
         let _ = output.nav.write(&NavEstimate {
             timestamp: Timestamp(0),
             angle: 0.0,
@@ -109,8 +109,8 @@ impl System for Filter {
 }
 
 impl CyclicSystem for Filter {
-    // Carries the input's timestamp through (not `now`), so the test can assert the
-    // sample stamp survives the cycle.
+    // Carries the input's timestamp through rather than `now`, so the test can
+    // assert the sample stamp survives the cycle.
     fn execute(&mut self, _now: Timestamp, input: &mut FilterIn, output: &mut Out<FilterOut>) {
         // Read the freshest IMU sample; report a health error when starved.
         let (timestamp, angle, accel) = match input.imu.latest() {
@@ -147,7 +147,7 @@ fn cyclic_filter_end_to_end() {
     let health_ring = ring_for::<SystemHealth>(8, 1);
     let log_ring = ring_for::<SystemLog>(8, 1);
 
-    // Upstream producer + downstream consumer, both built by hand.
+    // Upstream producer and downstream consumer, both built by hand.
     let mut imu_w = Output::<Imu>::new(imu_ring.writer(NoWake, NoWake).unwrap());
     let mut nav_in = Input::<NavEstimate>::new(nav_ring.view(NoWake, NoWake).unwrap());
 
@@ -177,7 +177,8 @@ fn cyclic_filter_end_to_end() {
         .unwrap();
     runner.step(Timestamp::now());
 
-    // The consumer reads the produced frame: fixed region zero-copy + dynamic member.
+    // The consumer reads the produced frame, both the fixed region and the
+    // dynamic member.
     let nav = nav_in.latest().expect("nav produced");
     let est = nav.get();
     assert_eq!(est.angle, 3.0, "omega * gain");
@@ -189,8 +190,8 @@ fn cyclic_filter_end_to_end() {
 }
 
 // ---------------------------------------------------------------------------
-// Backpressure: an idle reader is never overwritten — the writer blocks instead —
-// and `latest()` frees older records while pinning (protecting) the newest.
+// Backpressure: an idle reader stalls the writer instead of being overwritten,
+// and `latest()` frees older records while pinning the newest.
 // ---------------------------------------------------------------------------
 
 #[test]
@@ -206,7 +207,7 @@ fn idle_input_backpressures_writer_and_latest_frees() {
         accel: 0.0,
     };
 
-    // Fill until the idle view backpressures the writer (never overwritten).
+    // Fill until the idle view stalls the writer.
     let mut wrote = 0u32;
     loop {
         match w.write(&imu(wrote as f64)) {
@@ -222,9 +223,8 @@ fn idle_input_backpressures_writer_and_latest_frees() {
         input.imu.latest().expect("newest").get().omega,
         (wrote - 1) as f64
     );
-    // ...which frees room for the writer — but only up to the pinned newest
-    // record, which is never overwritten (the exact pin geometry is covered by
-    // the ring's own `latest_pin_backpressures_writer` test).
+    // ...which frees room for the writer, but only up to the pinned newest
+    // record, which keeps its slot until the next read.
     let mut wrote2 = 0u32;
     loop {
         match w.write(&imu(100.0 + wrote2 as f64)) {
@@ -281,10 +281,16 @@ fn descriptor_and_compatibility() {
     assert_eq!(desc.name, "filter");
     assert_eq!(desc.kind, SystemKind::Cyclic);
     assert_eq!(desc.inputs.len(), 1);
-    assert_eq!(desc.inputs[0].id.component().expect("table port"), Imu::FRAME_ID);
-    // user nav port + the two implicit health/log ports.
+    assert_eq!(
+        desc.inputs[0].id.component().expect("table port"),
+        Imu::FRAME_ID
+    );
+    // The user's nav port plus the two implicit health and log ports.
     assert_eq!(desc.outputs.len(), 3);
-    assert_eq!(desc.outputs[0].id.component().expect("table port"), NavEstimate::FRAME_ID);
+    assert_eq!(
+        desc.outputs[0].id.component().expect("table port"),
+        NavEstimate::FRAME_ID
+    );
 
     let producer = PortDesc::of::<Imu>();
     // A matching subset consumer is compatible.
@@ -400,20 +406,28 @@ async fn async_filter_one_cycle() {
     let nav_space = Notifier::default();
 
     let mut input = AsyncIn {
-        imu: Input::new(
-            imu_ring
-                .view(imu_data.clone(), imu_space.clone())
-                .unwrap(),
-        ),
+        imu: Input::new(imu_ring.view(imu_data.clone(), imu_space.clone()).unwrap()),
     };
     let mut nav_in = Input::<NavEstimate>::new(nav_ring.view(NoWake, NoWake).unwrap());
     let health = HealthPort::new(
-        Output::new(health_ring.writer(Notifier::default(), Notifier::default()).unwrap()),
-        Output::new(log_ring.writer(Notifier::default(), Notifier::default()).unwrap()),
+        Output::new(
+            health_ring
+                .writer(Notifier::default(), Notifier::default())
+                .unwrap(),
+        ),
+        Output::new(
+            log_ring
+                .writer(Notifier::default(), Notifier::default())
+                .unwrap(),
+        ),
     );
     let mut output = Out::new(
         AsyncOut {
-            nav: Output::new(nav_ring.writer(nav_data.clone(), nav_space.clone()).unwrap()),
+            nav: Output::new(
+                nav_ring
+                    .writer(nav_data.clone(), nav_space.clone())
+                    .unwrap(),
+            ),
         },
         health,
     );
@@ -448,11 +462,11 @@ async fn async_filter_one_cycle() {
 }
 
 // ---------------------------------------------------------------------------
-// #[system] parity: the hand-written trait impls and the attribute macro produce
-// an identical descriptor and identical run behavior (design-system-macro.md §11.2).
+// #[system] parity: the hand-written trait impls and the attribute macro
+// produce an identical descriptor and identical run behavior.
 // ---------------------------------------------------------------------------
 
-/// The hand-written form: bundles + System + CyclicSystem + BuildSystem spelled out.
+/// The hand-written form, with the port bundles and every trait impl spelled out.
 struct HandDoubler {
     gain: f64,
 }
@@ -496,8 +510,8 @@ impl crate::BuildSystem for HandDoubler {
     }
 }
 
-/// The macro form: same name, same ports in the same order, same body — everything
-/// else generated.
+/// The macro form. Same name, same ports in the same order, same body;
+/// everything else is generated.
 struct MacroDoubler {
     gain: f64,
 }
@@ -529,8 +543,9 @@ impl MacroDoubler {
     }
 }
 
-/// A tiny 3-cycle harness: feed `samples` (None ⇒ starve the cycle), return every
-/// produced angle and the final health record's scalar components.
+/// Runs `system` for one cycle per sample (`None` starves the cycle) and
+/// returns every produced angle plus the final health record's scalar
+/// components.
 fn run_doubler<S, O>(system: S, samples: &[Option<f64>]) -> (Vec<f64>, HashMap<ComponentId, f64>)
 where
     S: CyclicSystem<Output = Out<O>>,
@@ -579,7 +594,7 @@ where
     (angles, sink.values)
 }
 
-/// A positional `RingSource` over pre-created rings (the coordinator's job, by hand).
+/// Hands out pre-created rings in order, standing in for a coordinator.
 struct TestSource {
     rings: Vec<RingBuffer>,
     next: usize,
@@ -594,7 +609,6 @@ impl TestSource {
 }
 
 impl crate::RingSource for TestSource {
-
     fn next_output<WD, WS>(&mut self) -> (RingBuffer, WD, WS)
     where
         WD: metor_fsw_ring::WakeSource + Default + Clone + 'static,
@@ -616,15 +630,16 @@ impl crate::RingSource for TestSource {
         RD: metor_fsw_ring::WakeSink + Default + Clone + 'static,
         RS: metor_fsw_ring::WakeSource + Default + Clone + 'static,
     {
-        // Single-producer fan-in: pop one ring per message input.
+        // A single producer, so one ring per message input.
         vec![(self.pop(), RD::default(), RS::default())]
     }
 }
 
 #[test]
 fn system_macro_matches_hand_written() {
-    // 1. Identical descriptors (name, kind, port order/ids/sizes — via the stable
-    //    Debug rendering, PortDesc carries a non-Eq announce closure).
+    // 1. Identical descriptors: name, kind, port order, ids, and sizes. They
+    //    are compared through the Debug rendering because PortDesc carries a
+    //    non-Eq announce closure.
     let hand = <HandDoubler as CyclicSystem>::descriptor();
     let mac = <MacroDoubler as CyclicSystem>::descriptor();
     assert_eq!(format!("{hand:?}"), format!("{mac:?}"));
@@ -641,16 +656,19 @@ fn system_macro_matches_hand_written() {
     let (ma, mut mh) = run_doubler(m, &samples);
     assert_eq!(ha, ma, "same outputs");
     assert_eq!(ha, vec![3.0, -4.0], "gain applied once samples flow");
-    // The execute duration is wall time — the one legitimately different component.
+    // The execute duration is wall time, the one legitimately different component.
     hh.remove(&ComponentId::new("health.last_execute_micros"));
     mh.remove(&ComponentId::new("health.last_execute_micros"));
     assert_eq!(hh, mh, "same health counters");
     assert_eq!(hh[&ComponentId::new("health.cycles")], 3.0);
-    assert_eq!(hh[&ComponentId::new("health.error_counts.imu_missing")], 1.0);
+    assert_eq!(
+        hh[&ComponentId::new("health.error_counts.imu_missing")],
+        1.0
+    );
 }
 
 // ---------------------------------------------------------------------------
-// E6: an infallible publish onto an undersized ring counts the drop, and the
+// An infallible publish onto an undersized ring counts the drop, and the
 // runner folds it into a `publish_dropped` health error.
 // ---------------------------------------------------------------------------
 
@@ -660,8 +678,9 @@ struct Chatter;
 #[crate::system(name = "chatter")]
 impl Chatter {
     fn execute(&mut self, now: Timestamp, imu: &mut Output<Imu>) {
-        // An `Imu` record can never fit the 16-byte ring below: the publish fails
-        // with `InsufficientCapacity` (a sizing bug) and is counted, not returned.
+        // An `Imu` record can never fit the 16-byte ring below, so every
+        // publish fails with `InsufficientCapacity` (a sizing bug) and is
+        // counted rather than returned.
         imu.publish(&Imu {
             timestamp: now,
             omega: 1.0,
@@ -681,7 +700,10 @@ fn publish_drop_folds_to_health() {
     let log_ring = ring_for::<SystemLog>(8, 1);
     let mut health_in = Input::<SystemHealth>::new(health_ring.view(NoWake, NoWake).unwrap());
 
-    let input = crate::BindPorts::bind(&mut TestSource { rings: vec![], next: 0 });
+    let input = crate::BindPorts::bind(&mut TestSource {
+        rings: vec![],
+        next: 0,
+    });
     let output = crate::BindPorts::bind(&mut TestSource {
         rings: vec![tiny, health_ring.clone(), log_ring.clone()],
         next: 0,
@@ -696,19 +718,22 @@ fn publish_drop_folds_to_health() {
     assert_eq!(
         sink.values[&ComponentId::new("health.error_counts.publish_dropped")],
         1.0,
-        "the port's counted drop is telemetered by the runner (E6)"
+        "the port's counted drop lands as a runner health error"
     );
-    assert!(matches!(runner.state(), crate::SlotState::Running), "a drop is an error, not a stop");
+    assert!(
+        matches!(runner.state(), crate::SlotState::Running),
+        "a drop is an error, not a stop"
+    );
 }
 
 // ---------------------------------------------------------------------------
-// #[fsw(...)] attribute lowering + message-log delivery guarantees (A5/A6, C5).
+// #[fsw(...)] attribute lowering + message-log delivery guarantees.
 // ---------------------------------------------------------------------------
 
 use metor_proto_wkt::{SequenceCommand, SequenceCommandKind};
 
-/// A command log input — never loses a record (the lossless ring backpressures
-/// the emitter instead).
+/// A command log input. A full ring holds the emitter back instead of
+/// dropping records.
 #[derive(crate::SystemInput)]
 struct GuardIn {
     cmds: crate::MsgIn<SequenceCommand>,
@@ -716,15 +741,15 @@ struct GuardIn {
 
 #[derive(crate::SystemOutput)]
 struct QuietOut {
-    /// A frame output opted out of the downlink (A6 — frames get the opt-out too).
+    /// A frame output opted out of the downlink.
     #[fsw(telemetered = false)]
     nav: Output<NavEstimate>,
-    /// The `CommandOut` token: pure `MsgOut` sugar the derive lowers to
-    /// `.untelemetered()` (the alias itself carries no flag).
+    /// `CommandOut` is `MsgOut` sugar that the derive lowers to the same
+    /// telemetry opt-out; the alias itself carries no flag.
     cmds: crate::CommandOut<SequenceCommand>,
 }
 
-/// A tiny Log-sized message ring (small enough to fill with a handful of records).
+/// A message ring small enough to fill with a handful of records.
 fn msg_ring(readers: usize) -> RingBuffer {
     RingBuffer::create_in_memory(Config {
         capacity: crate::capacity_for(64, 2),
@@ -739,30 +764,39 @@ fn cmd(channel: &str) -> SequenceCommand {
     }
 }
 
-/// `#[fsw(...)]` overrides land on the generated descriptors: `telemetered =
-/// false` and the `CommandOut` token flip exactly the telemetry flag; other
-/// axes keep their facade defaults.
+/// `#[fsw(telemetered = false)]` and the `CommandOut` token flip exactly the
+/// telemetry flag on the generated descriptors; the other axes keep their
+/// defaults.
 #[test]
 fn fsw_attrs_lower_onto_descriptors() {
     let ins = <GuardIn as SystemInput>::port_descs();
     assert_eq!(ins.len(), 1);
-    assert_eq!(ins[0].delivery, crate::Delivery::Log, "axes keep the MsgIn defaults");
+    assert_eq!(
+        ins[0].delivery,
+        crate::Delivery::Log,
+        "axes keep the MsgIn defaults"
+    );
     assert_eq!(ins[0].fan_in, crate::FanIn::Many);
 
     let outs = <QuietOut as SystemOutput>::port_descs();
     assert_eq!(outs.len(), 2);
-    assert!(!outs[0].telemetered, "#[fsw(telemetered = false)] on a FRAME output");
+    assert!(
+        !outs[0].telemetered,
+        "#[fsw(telemetered = false)] on a FRAME output"
+    );
     assert_eq!(outs[0].id, crate::PortId::Component(NavEstimate::FRAME_ID));
-    assert!(!outs[1].telemetered, "the CommandOut token is the same opt-out");
+    assert!(
+        !outs[1].telemetered,
+        "the CommandOut token is the same opt-out"
+    );
     assert_eq!(
         outs[1].id,
         crate::PortId::Packet(<SequenceCommand as metor_proto::types::Msg>::ID)
     );
 }
 
-/// A message log never loses a record: a full ring backpressures the emitter
-/// (`WouldBlock`), every accepted record arrives in order, and draining frees
-/// space for the next emit.
+/// A full message ring makes the emitter see `WouldBlock`, every accepted
+/// record arrives in order, and draining frees space for the next emit.
 #[test]
 fn msg_log_never_loses_records() {
     let ring = msg_ring(1);
@@ -771,7 +805,7 @@ fn msg_log_never_loses_records() {
     let mut w: crate::MsgOut<SequenceCommand> =
         crate::MsgOut::new(ring.writer(NoWake, NoWake).unwrap());
 
-    // Fill until the idle inbox backpressures the emitter.
+    // Fill until the idle inbox stalls the emitter.
     let mut sent = 0u32;
     loop {
         match w.emit(&cmd(&format!("c{sent}"))) {
@@ -782,22 +816,22 @@ fn msg_log_never_loses_records() {
     }
     assert!(sent >= 1);
 
-    // Every accepted record arrives, in order — nothing was overwritten.
+    // Every accepted record arrives in order; nothing was overwritten.
     let mut got = Vec::new();
     inbox.drain(|c| got.push(c.channel));
     let expected: Vec<String> = (0..sent).map(|i| format!("c{i}")).collect();
     assert_eq!(got, expected, "the log lost or reordered records");
 
-    // The drain freed space: the emitter proceeds.
+    // The drain freed space, so the emitter proceeds.
     w.emit(&cmd("after")).unwrap();
     let mut got = 0;
     inbox.drain(|_| got += 1);
     assert_eq!(got, 1);
 }
 
-/// Guaranteed delivery through the runner: a cyclic consumer of a command log
-/// sees **every** emitted record across cycles — a full ring holds the emitter
-/// back rather than dropping, and the consumer stays `Running`.
+/// A cyclic consumer of a command log sees every emitted record across
+/// cycles. A full ring holds the emitter back rather than dropping, and the
+/// consumer stays `Running`.
 #[test]
 fn log_input_guaranteed_delivery_through_runner() {
     #[derive(crate::SystemOutput)]
@@ -839,8 +873,8 @@ fn log_input_guaranteed_delivery_through_runner() {
     let seen = std::rc::Rc::new(core::cell::Cell::new(0));
     let mut runner = CyclicRunner::new(Guard { seen: seen.clone() }, input, output);
 
-    // Emit across cycles, pausing whenever the ring backpressures; every record
-    // is eventually delivered and the consumer never stops.
+    // Emit across cycles, pausing whenever the ring is full; every record is
+    // eventually delivered and the consumer never stops.
     let mut sent = 0;
     while sent < 32 {
         while sent < 32 && w.emit(&cmd(&format!("c{sent}"))).is_ok() {

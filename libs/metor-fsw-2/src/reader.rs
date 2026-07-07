@@ -1,10 +1,16 @@
-//! Consumer side, typed-by-index/key access (frames.md §3.5).
+//! Typed read access to a frame's dynamic fields.
 //!
-//! A thin presentation convenience over the same table bytes the
-//! `RealizedField`/`expand_dynamic` path realizes: it reads a [`Slot`] from the
-//! fixed region and indexes the trailer as `T` (list) or scans entries by key
-//! (map). The authoritative dotted-id/frame/timestamp semantics remain the vtable
-//! `apply` path; this reader does not re-derive them.
+//! A list or map field occupies an 8-byte [`Slot`] in the frame's fixed
+//! region, and its element bytes live in the trailer that follows. The
+//! readers here wrap the full table bytes plus one such slot and decode
+//! elements on demand, by index for lists and by key for maps. Every access
+//! is bounds checked against the table, so a truncated or corrupt trailer
+//! yields `None` rather than a panic, and iterators simply skip entries
+//! whose bytes are out of range.
+//!
+//! These readers are a presentation convenience. The frame's vtable remains
+//! the authoritative interpretation of the table; nothing here re-derives
+//! field identity or timestamp semantics.
 
 use core::marker::PhantomData;
 use core::mem::size_of;
@@ -21,8 +27,8 @@ pub struct ListReader<'a, T> {
 }
 
 impl<'a, T: FromBytes> ListReader<'a, T> {
-    /// Wraps the `table` bytes and the list field's `slot` (read from the fixed
-    /// region).
+    /// Wraps the `table` bytes and a list field's `slot` from the fixed
+    /// region.
     pub fn new(table: &'a [u8], slot: Slot) -> Self {
         Self {
             table,
@@ -40,7 +46,8 @@ impl<'a, T: FromBytes> ListReader<'a, T> {
         self.len() == 0
     }
 
-    /// Element `i`, or `None` if out of range / malformed.
+    /// Element `i`, or `None` if it is out of range or its bytes fall
+    /// outside the table.
     pub fn get(&self, i: usize) -> Option<T> {
         if i >= self.len() {
             return None;
@@ -56,7 +63,7 @@ impl<'a, T: FromBytes> ListReader<'a, T> {
     }
 }
 
-/// Reads map entries (value type `V`) out of a table trailer, keyed by name.
+/// Reads map entries with values of type `V` out of a table trailer.
 pub struct MapReader<'a, V> {
     table: &'a [u8],
     slot: Slot,
@@ -64,6 +71,8 @@ pub struct MapReader<'a, V> {
 }
 
 impl<'a, V: FromBytes> MapReader<'a, V> {
+    /// Wraps the `table` bytes and a map field's `slot` from the fixed
+    /// region.
     pub fn new(table: &'a [u8], slot: Slot) -> Self {
         Self {
             table,
@@ -81,7 +90,8 @@ impl<'a, V: FromBytes> MapReader<'a, V> {
         self.len() == 0
     }
 
-    /// The key and value at entry `i`.
+    /// The key and value at entry `i`, or `None` if it is out of range or
+    /// malformed.
     pub fn entry(&self, i: usize) -> Option<(&'a str, V)> {
         if i >= self.len() {
             return None;
@@ -93,11 +103,12 @@ impl<'a, V: FromBytes> MapReader<'a, V> {
         let key_len = hdr.key_len as usize;
         let key = core::str::from_utf8(self.table.get(key_off..key_off + key_len)?).ok()?;
         let value_off = entry_base + map_value_offset::<V>() as usize;
-        let value = V::read_from_bytes(self.table.get(value_off..value_off + size_of::<V>())?).ok()?;
+        let value =
+            V::read_from_bytes(self.table.get(value_off..value_off + size_of::<V>())?).ok()?;
         Some((key, value))
     }
 
-    /// The value for `key`, if present.
+    /// The value for `key`, found by a linear scan of the entries.
     pub fn get(&self, key: &str) -> Option<V> {
         (0..self.len())
             .filter_map(|i| self.entry(i))
@@ -105,7 +116,7 @@ impl<'a, V: FromBytes> MapReader<'a, V> {
             .map(|(_, v)| v)
     }
 
-    /// Iterates `(key, value)` entries.
+    /// Iterates the `(key, value)` entries.
     pub fn iter(&self) -> impl Iterator<Item = (&'a str, V)> + '_ {
         (0..self.len()).filter_map(|i| self.entry(i))
     }

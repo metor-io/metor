@@ -1,19 +1,20 @@
-//! `#[sequence]` — the ergonomic author surface (sequences-slots.md §4) that turns an
-//! `async fn` into a complete, dl-loadable occupant: a future-driven state machine
-//! **plus** the `fsw_*` C-ABI exports, driven by the host exactly like any cyclic
-//! `.so` (it delegates to the `abi::run_seq_*` helpers, the sequence twins of the
-//! `run_*` helpers `export_system!` uses).
+//! Implementation of `#[sequence]`, which expands an `async fn` into a
+//! complete sequence system. The expansion has three parts: the fn itself,
+//! emitted verbatim; a hidden wrapper type implementing `SeqSystem`; and the
+//! `fsw_*` C-ABI exports, which delegate to the `abi::run_seq_*` helpers so
+//! the host can drive the sequence like any other cyclic system.
 //!
-//! The port set is read straight off the signature: every `Input<T>` parameter is
-//! an input port and every `Output<T>` an output port (in signature order), the
-//! macro appends the implicit `SlotControlIn` input and the `SequenceStatus` +
-//! health/log output tail, and emits a `descriptor()` + a `build()` that binds those
-//! ports in lockstep. The user ports **move into the future**; the tail stays in the
-//! wrapper state for per-cycle telemetry (§4.2).
+//! The port set is read off the signature. Every `Input<T>` parameter becomes
+//! an input port and every `Output<T>` an output port, in signature order.
+//! The macro appends an implicit `SlotControlIn` input and the status output
+//! tail, then emits a `descriptor()` and a `build()` that agree on that
+//! order. The user ports move into the future when it is built; the control
+//! and status ports stay in the wrapper state so the host can command the
+//! sequence and read its status on every poll.
 //!
-//! Rings are backing-erased, so the fn is emitted verbatim — no injected generics,
-//! no port-type rewriting; `descriptor()` and `build()` name the same plain port
-//! types.
+//! Rings are backing-erased, so the fn needs no injected generics and no
+//! port-type rewriting. The port types named in the signature are exactly the
+//! ones `descriptor()` and `build()` use.
 
 use proc_macro::TokenStream;
 use quote::{format_ident, quote};
@@ -23,8 +24,8 @@ use syn::{FnArg, ItemFn, Lit, Meta, Pat, Token, Type, parse_macro_input};
 
 use crate::sig;
 
-/// One user port the signature declares: its binding ident and its element frame type
-/// `T` (extracted from `Input<T>` / `Output<T>`).
+/// A user port declared in the signature, as its binding ident and the
+/// element type `T` from `Input<T>` / `Output<T>`.
 struct Port {
     ident: syn::Ident,
     elem: Type,
@@ -32,14 +33,14 @@ struct Port {
 
 /// How a fn parameter is classified by the last path segment of its type.
 enum Param {
-    /// `Input<T>` — a user input port.
+    /// A user input port, `Input<T>`.
     Input(Port),
-    /// `Output<T>` — a user output port.
+    /// A user output port, `Output<T>`.
     Output(Port),
-    /// A `Seq` — the opt-in explicit handle.
+    /// The opt-in `Seq` handle.
     Seq(syn::Ident),
-    /// Anything else — the (at most one) `Params` parameter (only its type is used;
-    /// the build arg is always named `params`).
+    /// The at-most-one params parameter. Only its type is used; the build
+    /// argument is always named `params`.
     Params { ty: Type },
 }
 
@@ -51,8 +52,8 @@ fn pat_ident(pat: &Pat) -> Option<syn::Ident> {
     }
 }
 
-/// Parse the optional `name = "…"` from the attribute meta list, defaulting to the
-/// fn ident's string.
+/// Parse the optional `name = "…"` attribute argument, defaulting to the fn
+/// ident's string.
 fn parse_name(attr: TokenStream, default: &syn::Ident) -> Result<String, syn::Error> {
     if attr.is_empty() {
         return Ok(default.to_string());
@@ -62,10 +63,16 @@ fn parse_name(attr: TokenStream, default: &syn::Ident) -> Result<String, syn::Er
         if let Meta::NameValue(nv) = meta
             && nv.path.is_ident("name")
         {
-            if let syn::Expr::Lit(syn::ExprLit { lit: Lit::Str(s), .. }) = nv.value {
+            if let syn::Expr::Lit(syn::ExprLit {
+                lit: Lit::Str(s), ..
+            }) = nv.value
+            {
                 return Ok(s.value());
             }
-            return Err(syn::Error::new_spanned(nv.value, "`name` must be a string literal"));
+            return Err(syn::Error::new_spanned(
+                nv.value,
+                "`name` must be a string literal",
+            ));
         }
     }
     Ok(default.to_string())
@@ -88,9 +95,8 @@ pub fn sequence(attr: TokenStream, item: TokenStream) -> TokenStream {
 
     let fsw2 = crate::metor_fsw_2_crate_name();
 
-    // Rings are backing-erased: a sequence fn carries no generic parameters (a
-    // leftover `<B: Backing>` from the pre-erasure API gets a clear error here,
-    // not a confusing unresolved-trait cascade).
+    // Rejecting generics here gives a clear error instead of an
+    // unresolved-trait cascade from the generated impl.
     if !func.sig.generics.params.is_empty() {
         return syn::Error::new_spanned(
             &func.sig.generics,
@@ -119,7 +125,9 @@ pub fn sequence(attr: TokenStream, item: TokenStream) -> TokenStream {
             Some(h @ ("Input" | "Output")) => {
                 let Some(elem) = sig::first_type_arg(&pt.ty) else {
                     let msg = format!("`{h}` needs an element type: `{h}<MyFrame>`");
-                    return syn::Error::new_spanned(&pt.ty, msg).to_compile_error().into();
+                    return syn::Error::new_spanned(&pt.ty, msg)
+                        .to_compile_error()
+                        .into();
                 };
                 let args = sig::type_args(&pt.ty);
                 if args.len() > 1 {
@@ -150,20 +158,34 @@ pub fn sequence(attr: TokenStream, item: TokenStream) -> TokenStream {
                 }
                 params_seen = true;
                 let _ = ident;
-                params.push(Param::Params { ty: (*pt.ty).clone() });
+                params.push(Param::Params {
+                    ty: (*pt.ty).clone(),
+                });
             }
         }
     }
 
-    // Collect, in signature order within each kind, the user ports + the optional
-    // params type + whether a Seq handle is wanted.
+    // Split the classified parameters into user ports (in signature order
+    // within each kind), the optional params type, and the optional Seq handle.
     let inputs: Vec<&Port> = params
         .iter()
-        .filter_map(|p| if let Param::Input(p) = p { Some(p) } else { None })
+        .filter_map(|p| {
+            if let Param::Input(p) = p {
+                Some(p)
+            } else {
+                None
+            }
+        })
         .collect();
     let outputs: Vec<&Port> = params
         .iter()
-        .filter_map(|p| if let Param::Output(p) = p { Some(p) } else { None })
+        .filter_map(|p| {
+            if let Param::Output(p) = p {
+                Some(p)
+            } else {
+                None
+            }
+        })
         .collect();
     let params_ty: Option<&Type> = params.iter().find_map(|p| {
         if let Param::Params { ty } = p {
@@ -180,8 +202,8 @@ pub fn sequence(attr: TokenStream, item: TokenStream) -> TokenStream {
         }
     });
 
-    // ---- descriptor(): inputs = [user inputs…, SlotControlIn];
-    //                    outputs = [user outputs…, then the Out<SeqStatusOut> tail].
+    // ---- descriptor(): user ports first, then the control input and the
+    // status output tail.
     let input_descs = inputs.iter().map(|p| {
         let elem = &p.elem;
         quote! { <#fsw2::Input<#elem>>::descriptor() }
@@ -191,7 +213,7 @@ pub fn sequence(attr: TokenStream, item: TokenStream) -> TokenStream {
         quote! { <#fsw2::Output<#elem>>::descriptor() }
     });
 
-    // ---- build(): bind in the same order; user ports MOVE INTO the future.
+    // ---- build(): bind in descriptor order; user ports move into the future.
     let bind_inputs = inputs.iter().map(|p| {
         let id = &p.ident;
         let elem = &p.elem;
@@ -206,7 +228,8 @@ pub fn sequence(attr: TokenStream, item: TokenStream) -> TokenStream {
         quote! { let #id = #fsw2::sequence::Seq::new(clock.clone()); }
     });
 
-    // The future args, in ORIGINAL signature order (params? mapped to the build arg).
+    // The future's arguments, in original signature order. A params parameter
+    // maps to the build argument, which is always named `params`.
     let call_args = params.iter().map(|p| match p {
         Param::Input(p) => {
             let id = &p.ident;
@@ -226,7 +249,7 @@ pub fn sequence(attr: TokenStream, item: TokenStream) -> TokenStream {
     };
     let build_params_arg = match params_ty {
         Some(ty) => quote! { params: #ty },
-        // No params parameter: name it `_params` so the unused trait arg is silent.
+        // No params parameter, so name the unused trait argument `_params`.
         None => quote! { _params: () },
     };
 
@@ -252,7 +275,7 @@ pub fn sequence(attr: TokenStream, item: TokenStream) -> TokenStream {
                     kind: #fsw2::SystemKind::Cyclic,
                     inputs,
                     outputs,
-                    // A sequence declares wired ports only (no host capabilities).
+                    // A sequence declares wired ports only, no host capabilities.
                     capabilities: ::std::vec::Vec::new(),
                 }
             }
@@ -278,11 +301,11 @@ pub fn sequence(attr: TokenStream, item: TokenStream) -> TokenStream {
         }
     };
 
-    // ---- The C-ABI exports: same `fsw_*` symbols as export.rs, delegating to the
-    // `run_seq_*` helpers. Gated on `not(test)` so an in-crate macro test can coexist
-    // with another crate-unique `fsw_*` export (a real `.so` builds without `--test`).
-    // Each item carries the clippy allow (raw-pointer params are the ABI contract), so
-    // consuming crates need no crate-level allow (design-system-macro.md §3.5).
+    // ---- The C-ABI exports. Gated on `not(test)` so an in-crate macro test
+    // can coexist with another crate-unique `fsw_*` export; a real shared
+    // object builds without `--test`. Each item carries its own clippy allow
+    // (raw-pointer parameters are the ABI contract), so consuming crates need
+    // no crate-level allow.
     let exports = quote! {
         /// The ABI word the host checks for equality before any other call.
         #[cfg(not(test))]
@@ -343,7 +366,7 @@ pub fn sequence(attr: TokenStream, item: TokenStream) -> TokenStream {
             unsafe { #fsw2::abi::run_seq_execute::<#wrapper>(state, now) }
         }
 
-        /// No-op for v1 sequences (kept for symbol uniformity).
+        /// No-op for sequences; the symbol exists so every export set is uniform.
         #[cfg(not(test))]
         #[unsafe(no_mangle)]
         #[allow(clippy::not_unsafe_ptr_arg_deref)]
@@ -352,7 +375,7 @@ pub fn sequence(attr: TokenStream, item: TokenStream) -> TokenStream {
             unsafe { #fsw2::abi::run_seq_shutdown::<#wrapper>(state) }
         }
 
-        /// Drop the boxed sequence state inside this `.so`.
+        /// Drop the boxed sequence state inside this shared object.
         #[cfg(not(test))]
         #[unsafe(no_mangle)]
         #[allow(clippy::not_unsafe_ptr_arg_deref)]

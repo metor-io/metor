@@ -1,29 +1,33 @@
-//! A dl-open integration-test fixture: one ordinary `impl CyclicSystem` made
-//! `dlopen`-loadable with a single `export_system!`. The `dl_integration` host test
-//! builds this crate as a `cdylib`, `dlopen`s the produced shared object, and drives
-//! it through the real C ABI.
+//! A minimal system compiled as a shared library and driven over the C ABI.
 //!
-//! `DlCounter` consumes a `tick_in` frame and republishes `start + value` as a
-//! `tick_out` frame — enough to prove the input view, the output writer, the params
-//! blob, and the descriptor all cross a real `.so` boundary. The frame definitions
-//! match the host test's byte-for-byte (same name + layout), the compile-time contract
-//! `compatible()` enforces.
+//! This crate builds as a `cdylib` whose only export surface is the
+//! [`export_system!`](metor_fsw_2::export_system) invocation at the bottom. A
+//! host process `dlopen`s the produced library, reads the descriptor from
+//! `fsw_describe`, constructs the system through `fsw_create` from
+//! postcard-encoded [`CounterParams`], and steps it cycle by cycle.
+//!
+//! [`DlCounter`] reads a `tick_in` frame each cycle and republishes
+//! `start + round(value * scale)` as a `tick_out` frame, plus a [`TickEvent`]
+//! message. That covers every kind of data crossing the library boundary: a
+//! frame input, a frame output, a message output, and the params blob. The
+//! host declares byte-identical twins of both frame types, and the layout
+//! check in the wiring step verifies that the two sides agree.
 
-// The `export_system!`-generated `extern "C" fn fsw_*` exports take raw pointers by
-// ABI contract (the host owns their validity); clippy's `not_unsafe_ptr_arg_deref` is
-// inherent to that macro surface for any cdylib.
+// The generated `extern "C" fn fsw_*` exports take raw pointers whose validity
+// the host guarantees, so clippy's `not_unsafe_ptr_arg_deref` fires on every
+// export. Silence it crate-wide.
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
 
+use metor_fsw_2::metor_proto::types::Timestamp;
 use metor_fsw_2::{
     BuildSystem, CyclicSystem, Input, MsgOut, NamedMsg, Out, Output, System, SystemInput,
     SystemOutput,
 };
-use metor_fsw_2::metor_proto::types::Timestamp;
 use postcard_schema::Schema;
 use serde::{Deserialize, Serialize};
 use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
 
-/// The input frame the host producer writes (`tick_in`).
+/// Input frame the host writes each cycle.
 #[derive(metor_fsw_2::Frame, IntoBytes, Immutable, KnownLayout, FromBytes, Default)]
 #[repr(C)]
 #[metor_fsw(name = "tick_in")]
@@ -33,7 +37,7 @@ pub struct TickIn {
     pub value: u64,
 }
 
-/// The output frame this system produces (`tick_out`).
+/// Output frame [`DlCounter`] publishes each cycle.
 #[derive(metor_fsw_2::Frame, IntoBytes, Immutable, KnownLayout, FromBytes, Default)]
 #[repr(C)]
 #[metor_fsw(name = "tick_out")]
@@ -43,11 +47,11 @@ pub struct TickOut {
     pub count: u64,
 }
 
-/// A self-describing `(PacketId, postcard)` **message** this system also emits — the
-/// Postcard-schema port crossing the dl ABI (`fsw_describe` carries it as
-/// `PortSchemaMsg::Postcard`; the host wires + taps it like any message channel).
-/// The `Msg` impl is the blanket `Serialize + Schema` one; the id hashes the schema
-/// name, so the host's byte-identical mirror decodes it with nothing but the id.
+/// Message emitted once per cycle with the published count.
+///
+/// Unlike the frames, this crosses the boundary as postcard bytes tagged with
+/// an id hashed from the schema name, so a peer holding the same definition
+/// can decode it from the id alone.
 #[derive(Serialize, Deserialize, Schema, Debug, PartialEq)]
 pub struct TickEvent {
     pub count: u64,
@@ -57,20 +61,20 @@ impl NamedMsg for TickEvent {
     const NAME: &'static str = "TickEvent";
 }
 
-/// Two params of **differing types** crossing `fsw_create` as postcard bytes (so the
-/// KDL≡builder byte-equality gate is a real multi-field, mixed-type check): a `start`
-/// offset (`u64`) and a `scale` factor (`f64`) applied to each input tick.
+/// Construction parameters, decoded from postcard bytes in `fsw_create`.
+///
+/// The mix of an integer and a float keeps parameter round-trip checks honest
+/// beyond a single-value encoding.
 #[derive(Serialize, Deserialize, Schema, Clone, Default, Debug, PartialEq)]
 pub struct CounterParams {
     pub start: u64,
     pub scale: f64,
 }
 
-// A dl system needs no KDL coupling at all — it is constructed only via
-// `BuildSystem` (below), decoding canonical postcard `Params` bytes in `fsw_create`.
-// This fixture proves the `BuildSystem`/`kdl` decoupling.
-
-/// Applies `start + value * scale` to each input tick and republishes the sum.
+/// Republishes each input tick as `start + round(value * scale)`.
+///
+/// Deliberately has no KDL support; the host constructs it only through
+/// [`BuildSystem`], proving the two construction paths are independent.
 pub struct DlCounter {
     start: u64,
     scale: f64,
@@ -84,7 +88,6 @@ pub struct DlCounterIn {
 #[derive(SystemOutput)]
 pub struct DlCounterOut {
     out: Output<TickOut>,
-    /// The Postcard port beside the Table port — one bundle, both schemas.
     events: MsgOut<TickEvent>,
 }
 
@@ -95,12 +98,7 @@ impl System for DlCounter {
 }
 
 impl CyclicSystem for DlCounter {
-    fn execute(
-        &mut self,
-        now: Timestamp,
-        input: &mut DlCounterIn,
-        output: &mut Out<DlCounterOut>,
-    ) {
+    fn execute(&mut self, now: Timestamp, input: &mut DlCounterIn, output: &mut Out<DlCounterOut>) {
         let value = match input.tick.latest() {
             Some(t) => t.get().value,
             None => {
@@ -113,7 +111,6 @@ impl CyclicSystem for DlCounter {
             timestamp: now,
             count,
         });
-        // The message twin: every cycle's count as a self-describing log record.
         let _ = output.events.emit(&TickEvent { count });
     }
 }
@@ -128,5 +125,5 @@ impl BuildSystem for DlCounter {
     }
 }
 
-// The one C-ABI surface this cdylib exports (the `fsw_*` symbols the host resolves).
+// Exports the `fsw_*` C symbols the host resolves after `dlopen`.
 metor_fsw_2::export_system!(DlCounter);
