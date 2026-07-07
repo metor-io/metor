@@ -239,7 +239,7 @@ impl AppRoot {
             self.inspector = Some(inspector);
             cx.notify();
         } else {
-            println!("no rows for entity");
+            tracing::debug!("no inspector rows for entity");
         }
     }
 

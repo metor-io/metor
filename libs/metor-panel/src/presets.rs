@@ -96,12 +96,12 @@ pub fn load_preset(path: &Path) -> io::Result<String> {
 /// Replace the current tile layout with the one encoded in `json`.
 ///
 /// Pulls the panel-item registry from globals so callers don't have to
-/// thread it. Failures are logged via `eprintln!`; a toast UX is out of
+/// thread it. Failures are logged via `tracing`; a toast UX is out of
 /// scope.
 pub fn load_into_tiles(json: &str, tiles: &Entity<TileGroup>, cx: &mut App) {
     tiles.update(cx, |tg, cx| {
         if let Err(e) = tg.replace_from_json(json, cx) {
-            eprintln!("failed to load preset: {e}");
+            tracing::error!(%e, "failed to load preset");
         }
     });
 }

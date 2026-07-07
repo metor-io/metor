@@ -336,7 +336,7 @@ pub mod op_tag {
     pub const FROM_DB: &[u8] = b"db_source";
 }
 
-/// Default ring capacity in samples. Sized per-node from the value byte size
+/// Default ring capacity in bytes. Sized per-node from the value byte size
 /// so generators with large schemas still get a reasonable buffer.
 pub fn default_ring_bytes(value_bytes: usize) -> usize {
     let msg = size_of::<Timestamp>() + value_bytes;

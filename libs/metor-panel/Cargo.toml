@@ -86,3 +86,4 @@ unexpected_cfgs = { level = "warn", check-cfg = ['cfg(feature, values("cargo-cli
 
 [dev-dependencies]
 tempfile = "3.13.0"
+gpui = { version = "*", features = ["test-support"] }

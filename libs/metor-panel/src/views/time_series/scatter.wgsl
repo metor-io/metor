@@ -15,7 +15,6 @@ struct LineUniform {
 
 @group(2) @binding(0) var<storage, read> x_values: array<f32>;
 @group(2) @binding(1) var<storage, read> y_values: array<f32>;
-@group(2) @binding(2) var<storage, read> index_buffer: array<u32>;
 
 struct VertexOutput {
     @builtin(position) clip_position: vec4<f32>,
@@ -40,8 +39,9 @@ fn vertex(
     );
     let corner = offsets[vertex_index];
 
-    let idx = index_buffer[instance_index];
-    let center = data_to_clip(vec2(x_values[idx], y_values[idx]));
+    // Uploads are sequential, so the instance index (offset by the draw's
+    // first_instance) addresses the storage buffers directly.
+    let center = data_to_clip(vec2(x_values[instance_index], y_values[instance_index]));
     let radius_ndc = line_uniform.line_width / view.viewport;
     let point = center + corner * radius_ndc;
 

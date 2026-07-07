@@ -64,8 +64,9 @@ pub struct NodeEntry {
 pub struct EdgeEntry {
     pub source: FlowId,
     pub target: FlowId,
-    /// Slot on the target node. For variadic ops (`Mean`) this is ignored
-    /// during build — sources are sorted by `(y, x)` of their position.
+    /// Slot on the target node. Determines build-time input order for both
+    /// exact and variadic ops — [`NodeGraph::parents_of`] sorts incoming
+    /// edges by this index.
     pub target_socket: usize,
 }
 

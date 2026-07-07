@@ -15,7 +15,6 @@ struct LineUniform {
 
 @group(2) @binding(0) var<storage, read> x_values: array<f32>;
 @group(2) @binding(1) var<storage, read> y_values: array<f32>;
-@group(2) @binding(2) var<storage, read> index_buffer: array<u32>;
 
 struct VertexOutput {
     @builtin(position) clip_position: vec4<f32>,
@@ -42,8 +41,11 @@ fn vertex(
     );
     let corner = positions[vertex_index];
 
-    let idx_a = index_buffer[instance_index];
-    let idx_b = index_buffer[instance_index + 1u];
+    // Uploads are sequential, so the instance index (offset by the draw's
+    // first_instance) addresses the storage buffers directly; each
+    // instance draws the segment between one sample and its successor.
+    let idx_a = instance_index;
+    let idx_b = instance_index + 1u;
 
     let p_a = data_to_pixel(vec2(x_values[idx_a], y_values[idx_a]));
     let p_b = data_to_pixel(vec2(x_values[idx_b], y_values[idx_b]));

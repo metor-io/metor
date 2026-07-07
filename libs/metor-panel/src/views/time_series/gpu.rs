@@ -22,10 +22,6 @@
 //!    `RenderImage`, and installs it back via a field accessor.
 //! 4. The paint closure blits `state.current_frame()`.
 
-// Uniform fields are only read via `bytemuck::bytes_of`, which the
-// dead-code lint can't see through the Pod/Zeroable derive expansions.
-#![allow(dead_code)]
-
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -42,18 +38,16 @@ use crate::gpu_context::GpuContext;
 
 const VALUE_CAPACITY: u32 = 1 << 22;
 const VALUE_BUF_BYTES: u64 = VALUE_CAPACITY as u64 * 4;
-const INDEX_CAPACITY: u32 = 1 << 18;
-const INDEX_BUF_BYTES: u64 = INDEX_CAPACITY as u64 * 4;
 const TARGET_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Bgra8Unorm;
 const SAMPLE_COUNT: u32 = 4;
-const NS_PER_SEC: f64 = 1.0e9;
+const MICROS_PER_SEC: f64 = 1.0e6;
 const UNIFORM_ALIGN: u64 = 256;
 const MAX_TRACES: usize = 64;
 
 /// Where one axis of a trace gets its values.
 ///
 /// `Timestamps` reads from a node's `Timestamp` index; the materializer
-/// scales nanoseconds to seconds so f32 storage retains precision over
+/// scales microseconds to seconds so f32 storage retains precision over
 /// long durations. `Element` reads one element of one component schema's
 /// raw byte buffer at its native scale.
 ///
@@ -65,6 +59,10 @@ const MAX_TRACES: usize = 64;
 pub(crate) enum AxisSource<'a> {
     Timestamps,
     Element {
+        // Source identity travels with every component-backed variant so
+        // call sites stay uniform, but the pipeline itself only reads the
+        // resolved `component`.
+        #[allow(dead_code)]
         component_id: ComponentId,
         component: &'a Component,
         element_index: usize,
@@ -73,6 +71,7 @@ pub(crate) enum AxisSource<'a> {
         len: usize,
     },
     LatestSampleElements {
+        #[allow(dead_code)]
         component_id: ComponentId,
         component: &'a Component,
         len: usize,
@@ -83,6 +82,7 @@ pub(crate) enum AxisSource<'a> {
     /// spans its bucket's extremes, the same geometry min-max decimation
     /// produces from raw samples.
     MinMax {
+        #[allow(dead_code)]
         component_id: ComponentId,
         component: &'a Component,
         element_index: usize,
@@ -92,23 +92,14 @@ pub(crate) enum AxisSource<'a> {
 impl<'a> AxisSource<'a> {
     /// Conversion factor applied during materialization so the GPU sees a
     /// numerically stable f32 even when the source range is huge (e.g.,
-    /// nanosecond timestamps).
+    /// microsecond timestamps).
     fn scale(&self) -> f64 {
         match self {
-            AxisSource::Timestamps => 1.0 / NS_PER_SEC,
+            AxisSource::Timestamps => 1.0 / MICROS_PER_SEC,
             AxisSource::Element { .. }
             | AxisSource::LatestSampleIndex { .. }
             | AxisSource::LatestSampleElements { .. }
             | AxisSource::MinMax { .. } => 1.0,
-        }
-    }
-
-    fn component(&self) -> Option<&'a Component> {
-        match self {
-            AxisSource::Timestamps | AxisSource::LatestSampleIndex { .. } => None,
-            AxisSource::Element { component, .. }
-            | AxisSource::LatestSampleElements { component, .. }
-            | AxisSource::MinMax { component, .. } => Some(component),
         }
     }
 }
@@ -161,7 +152,7 @@ struct ValueCache {
     /// Next free slot in samples (×4 bytes for the byte offset). Reset at
     /// the start of every `submit`.
     cursor: u32,
-    /// Per-frame epoch for the X axis in raw plot-space units (nanoseconds
+    /// Per-frame epoch for the X axis in raw plot-space units (microseconds
     /// for timestamps, native units for component elements).
     ///
     /// Anchored to the view's left edge each frame so `f32` precision is
@@ -183,8 +174,11 @@ impl ValueCache {
     }
 }
 
+// Uniform fields are only read via `bytemuck::bytes_of`, which the
+// dead-code lint can't see through the Pod/Zeroable derive expansions.
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
+#[allow(dead_code)]
 struct ViewUniform {
     scale: [f32; 2],
     offset: [f32; 2],
@@ -194,6 +188,7 @@ struct ViewUniform {
 
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
+#[allow(dead_code)]
 struct LineUniform {
     color: [f32; 4],
     line_width: f32,
@@ -343,13 +338,11 @@ pub(super) struct PlotGpu {
     line_bg: wgpu::BindGroup,
     x_buf: wgpu::Buffer,
     y_buf: wgpu::Buffer,
-    idx_buf: wgpu::Buffer,
     storage_bg: wgpu::BindGroup,
     cache: ValueCache,
     upload_x: Vec<f32>,
     upload_y: Vec<f32>,
     select_scratch: Vec<u32>,
-    idx_scratch: Vec<u32>,
 }
 
 impl Global for PlotGpu {}
@@ -410,7 +403,7 @@ impl PlotGpu {
         };
         let storage_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("line storage"),
-            entries: &[storage_entry(0), storage_entry(1), storage_entry(2)],
+            entries: &[storage_entry(0), storage_entry(1)],
         });
 
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
@@ -511,12 +504,6 @@ impl PlotGpu {
         };
         let x_buf = make_storage("line x");
         let y_buf = make_storage("line y");
-        let idx_buf = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("line indices"),
-            size: INDEX_BUF_BYTES,
-            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
         let storage_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("line storage bg"),
             layout: &storage_layout,
@@ -528,10 +515,6 @@ impl PlotGpu {
                 wgpu::BindGroupEntry {
                     binding: 1,
                     resource: y_buf.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 2,
-                    resource: idx_buf.as_entire_binding(),
                 },
             ],
         });
@@ -547,13 +530,11 @@ impl PlotGpu {
             line_bg,
             x_buf,
             y_buf,
-            idx_buf,
             storage_bg,
             cache: ValueCache::new(),
             upload_x: Vec::new(),
             upload_y: Vec::new(),
             select_scratch: Vec::new(),
-            idx_scratch: Vec::with_capacity(INDEX_CAPACITY as usize),
         })
     }
 
@@ -568,7 +549,6 @@ impl PlotGpu {
         scale: f32,
         traces: &[LineDraw<'_>],
     ) -> bool {
-        self.idx_scratch.clear();
         self.cache.cursor = 0;
         self.cache.epoch_x = view.min_x;
         self.cache.truncated = false;
@@ -585,7 +565,6 @@ impl PlotGpu {
                 &mut self.upload_x,
                 &mut self.upload_y,
                 &mut self.select_scratch,
-                &mut self.idx_scratch,
                 &self.x_buf,
                 &self.y_buf,
                 trace,
@@ -600,7 +579,6 @@ impl PlotGpu {
             tracing::debug!(
                 target: "plot::capacity",
                 uploaded = self.cache.cursor,
-                indices = self.idx_scratch.len(),
                 "plot uploads clamped to buffer capacity"
             );
         }
@@ -609,7 +587,7 @@ impl PlotGpu {
         }
 
         // X axis uniform space: shifted by epoch and scaled by the X
-        // source's scale factor (1.0 for element values, 1e-9 for ns
+        // source's scale factor (1.0 for element values, 1e-6 for µs
         // timestamps). The `x_scale_factor` of the FIRST trace whose
         // source is well-defined drives the view uniform; all real-world
         // call sites compose homogeneous traces (all time-series xor all
@@ -618,7 +596,7 @@ impl PlotGpu {
         let x_scale_factor = traces
             .first()
             .map(|t| t.x.scale())
-            .unwrap_or(1.0 / NS_PER_SEC);
+            .unwrap_or(1.0 / MICROS_PER_SEC);
         let view_min_x = ((view.min_x - epoch_x) * x_scale_factor) as f32;
         let view_max_x = ((view.max_x - epoch_x) * x_scale_factor) as f32;
         let dx = (view_max_x - view_min_x).max(1e-12);
@@ -636,9 +614,6 @@ impl PlotGpu {
         self.ctx
             .queue
             .write_buffer(&self.view_buf, 0, bytemuck::bytes_of(&view_uniform));
-        self.ctx
-            .queue
-            .write_buffer(&self.idx_buf, 0, bytemuck::cast_slice(&self.idx_scratch));
 
         // Pack every trace's uniform into one dynamic-offset buffer so
         // the whole frame goes in a single submit.
@@ -871,7 +846,11 @@ fn read_mapped_bytes(
     out
 }
 
-/// Contiguous run of instance indices that belong to one trace.
+/// Contiguous run of samples in the shared x/y storage buffers that one
+/// draw call renders. The range goes to `draw` as `first_instance..end`,
+/// and `instance_index` (which includes `first_instance`) addresses the
+/// storage buffers directly — uploads are always sequential, so no
+/// indirection buffer is needed.
 struct DrawSpan {
     instance_start: u32,
     instance_end: u32,
@@ -947,7 +926,7 @@ impl NodeView {
 }
 
 /// Walk one trace's visible nodes, decimate, upload to the value cache,
-/// and emit draw spans referenced by `idx_scratch`.
+/// and emit draw spans over the uploaded ranges.
 #[allow(clippy::too_many_arguments)]
 fn plan_trace(
     ctx: &GpuContext,
@@ -955,7 +934,6 @@ fn plan_trace(
     upload_x: &mut Vec<f32>,
     upload_y: &mut Vec<f32>,
     select_scratch: &mut Vec<u32>,
-    idx_scratch: &mut Vec<u32>,
     x_buf: &wgpu::Buffer,
     y_buf: &wgpu::Buffer,
     trace: &LineDraw<'_>,
@@ -988,7 +966,6 @@ fn plan_trace(
             cache,
             upload_x,
             upload_y,
-            idx_scratch,
             x_buf,
             y_buf,
             component,
@@ -1011,7 +988,6 @@ fn plan_trace(
             cache,
             upload_x,
             upload_y,
-            idx_scratch,
             x_buf,
             y_buf,
             component,
@@ -1138,34 +1114,19 @@ fn plan_trace(
         };
 
         let is_line = matches!(trace.style, PlotStyle::Line);
-        let span_first = idx_scratch.len() as u32;
-        // Clamp to the index buffer: overflowing it would fail wgpu
-        // validation and silently drop the whole frame.
-        let index_available = (INDEX_CAPACITY as usize).saturating_sub(idx_scratch.len()) as u32;
-        let count = if count > index_available {
-            cache.truncated = true;
-            index_available
-        } else {
-            count
-        };
-        let mut count_pushed: u32 = 0;
-        for j in 0..count {
-            idx_scratch.push(chunk_offset + j);
-            count_pushed += 1;
-        }
         let min_for_draw = if is_line { 2u32 } else { 1 };
-        if count_pushed >= min_for_draw {
+        if count >= min_for_draw {
+            // Line instances draw the segment (i, i+1), so the last
+            // sample anchors the previous instance rather than its own.
             let instance_end = if is_line {
-                span_first + count_pushed - 1
+                chunk_offset + count - 1
             } else {
-                span_first + count_pushed
+                chunk_offset + count
             };
             spans.push(DrawSpan {
-                instance_start: span_first,
+                instance_start: chunk_offset,
                 instance_end,
             });
-        } else {
-            idx_scratch.truncate(span_first as usize);
         }
     }
 
@@ -1191,7 +1152,6 @@ fn plan_min_max_trace(
     cache: &mut ValueCache,
     upload_x: &mut Vec<f32>,
     upload_y: &mut Vec<f32>,
-    idx_scratch: &mut Vec<u32>,
     x_buf: &wgpu::Buffer,
     y_buf: &wgpu::Buffer,
     component: &Component,
@@ -1227,7 +1187,7 @@ fn plan_min_max_trace(
     let stride = (total * 2).div_ceil(pixel_budget).max(1);
 
     let epoch_x = cache.epoch_x;
-    let scale_x = 1.0 / NS_PER_SEC;
+    let scale_x = 1.0 / MICROS_PER_SEC;
     upload_x.clear();
     upload_y.clear();
     // Point ranges of contiguous finite runs; each becomes one DrawSpan.
@@ -1341,23 +1301,12 @@ fn plan_min_max_trace(
             break;
         }
         let len = len.min(total - first);
-        let index_available = (INDEX_CAPACITY as usize).saturating_sub(idx_scratch.len()) as u32;
-        let len = if len > index_available {
-            cache.truncated = true;
-            index_available
-        } else {
-            len
-        };
         if len < 2 {
             continue;
         }
-        let span_first = idx_scratch.len() as u32;
-        for j in 0..len {
-            idx_scratch.push(chunk_offset + first + j);
-        }
         spans.push(DrawSpan {
-            instance_start: span_first,
-            instance_end: span_first + len - 1,
+            instance_start: chunk_offset + first,
+            instance_end: chunk_offset + first + len - 1,
         });
     }
 
@@ -1535,8 +1484,9 @@ fn select_minmax_indices(
 /// Materialize one axis's strided samples as `f32` in shifted plot space.
 ///
 /// The output value is `(raw - epoch) * source.scale()`, written into
-/// `out`. Raw timestamp axes pick up a 1e-9 scaling so f32 storage
-/// retains nanosecond precision over long durations.
+/// `out`. Raw timestamp axes pick up a 1e-6 scaling so microsecond
+/// timestamps land in seconds and f32 storage retains precision over
+/// long durations.
 #[allow(clippy::too_many_arguments)]
 fn materialize_axis(
     source: &AxisSource<'_>,
@@ -1639,10 +1589,59 @@ impl_plot_value! {
     u64 => |x: u64| x as f64,
 }
 
+/// Expand `$body` with `$t` bound to the [`PlotValue`] type matching
+/// `$prim`, so byte-buffer readers monomorphize per primitive without
+/// repeating the ten-arm match at every call site. `Bool` routes through
+/// `u8` — not every byte pattern is a valid `bool`, so `bool` can't
+/// implement `FromBytes`.
+macro_rules! dispatch_prim {
+    ($prim:expr, $t:ident => $body:expr) => {
+        match $prim {
+            PrimType::F64 => {
+                type $t = f64;
+                $body
+            }
+            PrimType::F32 => {
+                type $t = f32;
+                $body
+            }
+            PrimType::I64 => {
+                type $t = i64;
+                $body
+            }
+            PrimType::I32 => {
+                type $t = i32;
+                $body
+            }
+            PrimType::I16 => {
+                type $t = i16;
+                $body
+            }
+            PrimType::I8 => {
+                type $t = i8;
+                $body
+            }
+            PrimType::U64 => {
+                type $t = u64;
+                $body
+            }
+            PrimType::U32 => {
+                type $t = u32;
+                $body
+            }
+            PrimType::U16 => {
+                type $t = u16;
+                $body
+            }
+            PrimType::U8 | PrimType::Bool => {
+                type $t = u8;
+                $body
+            }
+        }
+    };
+}
+
 /// Decode one element at `sample_index` directly from a raw buffer.
-///
-/// `bool` doesn't implement `FromBytes` because not every byte pattern is
-/// valid; callers handle `PrimType::Bool` by routing through `u8`.
 #[inline(always)]
 fn read_value<T: PlotValue>(
     data: &[u8],
@@ -1666,20 +1665,9 @@ fn read_element_f64(
     if elem_size == 0 {
         return None;
     }
-    match schema.prim_type {
-        PrimType::F64 => read_value::<f64>(data, sample_index, elem_size, element_index),
-        PrimType::F32 => read_value::<f32>(data, sample_index, elem_size, element_index),
-        PrimType::I64 => read_value::<i64>(data, sample_index, elem_size, element_index),
-        PrimType::I32 => read_value::<i32>(data, sample_index, elem_size, element_index),
-        PrimType::I16 => read_value::<i16>(data, sample_index, elem_size, element_index),
-        PrimType::I8 => read_value::<i8>(data, sample_index, elem_size, element_index),
-        PrimType::U64 => read_value::<u64>(data, sample_index, elem_size, element_index),
-        PrimType::U32 => read_value::<u32>(data, sample_index, elem_size, element_index),
-        PrimType::U16 => read_value::<u16>(data, sample_index, elem_size, element_index),
-        PrimType::U8 | PrimType::Bool => {
-            read_value::<u8>(data, sample_index, elem_size, element_index)
-        }
-    }
+    dispatch_prim!(schema.prim_type, T => {
+        read_value::<T>(data, sample_index, elem_size, element_index)
+    })
 }
 
 /// Materialize every `lod_stride`-th sample of one element into `f32`,
@@ -1725,8 +1713,8 @@ fn convert_element_strided(
         }
     }
 
-    match schema.prim_type {
-        PrimType::F64 => fill::<f64>(
+    dispatch_prim!(schema.prim_type, T => {
+        fill::<T>(
             full_data,
             lod_stride,
             from,
@@ -1737,116 +1725,8 @@ fn convert_element_strided(
             epoch,
             scale,
             out,
-        ),
-        PrimType::F32 => fill::<f32>(
-            full_data,
-            lod_stride,
-            from,
-            to,
-            max_sample,
-            elem_size,
-            element_index,
-            epoch,
-            scale,
-            out,
-        ),
-        PrimType::I64 => fill::<i64>(
-            full_data,
-            lod_stride,
-            from,
-            to,
-            max_sample,
-            elem_size,
-            element_index,
-            epoch,
-            scale,
-            out,
-        ),
-        PrimType::I32 => fill::<i32>(
-            full_data,
-            lod_stride,
-            from,
-            to,
-            max_sample,
-            elem_size,
-            element_index,
-            epoch,
-            scale,
-            out,
-        ),
-        PrimType::I16 => fill::<i16>(
-            full_data,
-            lod_stride,
-            from,
-            to,
-            max_sample,
-            elem_size,
-            element_index,
-            epoch,
-            scale,
-            out,
-        ),
-        PrimType::I8 => fill::<i8>(
-            full_data,
-            lod_stride,
-            from,
-            to,
-            max_sample,
-            elem_size,
-            element_index,
-            epoch,
-            scale,
-            out,
-        ),
-        PrimType::U64 => fill::<u64>(
-            full_data,
-            lod_stride,
-            from,
-            to,
-            max_sample,
-            elem_size,
-            element_index,
-            epoch,
-            scale,
-            out,
-        ),
-        PrimType::U32 => fill::<u32>(
-            full_data,
-            lod_stride,
-            from,
-            to,
-            max_sample,
-            elem_size,
-            element_index,
-            epoch,
-            scale,
-            out,
-        ),
-        PrimType::U16 => fill::<u16>(
-            full_data,
-            lod_stride,
-            from,
-            to,
-            max_sample,
-            elem_size,
-            element_index,
-            epoch,
-            scale,
-            out,
-        ),
-        PrimType::U8 | PrimType::Bool => fill::<u8>(
-            full_data,
-            lod_stride,
-            from,
-            to,
-            max_sample,
-            elem_size,
-            element_index,
-            epoch,
-            scale,
-            out,
-        ),
-    }
+        )
+    })
 }
 
 /// Plan one list-plot trace from the component's latest sample.
@@ -1861,7 +1741,6 @@ fn plan_list_trace(
     cache: &mut ValueCache,
     upload_x: &mut Vec<f32>,
     upload_y: &mut Vec<f32>,
-    idx_scratch: &mut Vec<u32>,
     x_buf: &wgpu::Buffer,
     y_buf: &wgpu::Buffer,
     component: &Component,
@@ -1929,30 +1808,17 @@ fn plan_list_trace(
     cache.cursor += count_u32;
 
     let is_line = matches!(style, PlotStyle::Line);
-    let span_first = idx_scratch.len() as u32;
-    let index_available = (INDEX_CAPACITY as usize).saturating_sub(idx_scratch.len()) as u32;
-    let count_u32 = if count_u32 > index_available {
-        cache.truncated = true;
-        index_available
-    } else {
-        count_u32
-    };
-    for j in 0..count_u32 {
-        idx_scratch.push(chunk_offset + j);
-    }
     let min_for_draw = if is_line { 2u32 } else { 1 };
     if count_u32 >= min_for_draw {
         let instance_end = if is_line {
-            span_first + count_u32 - 1
+            chunk_offset + count_u32 - 1
         } else {
-            span_first + count_u32
+            chunk_offset + count_u32
         };
         spans.push(DrawSpan {
-            instance_start: span_first,
+            instance_start: chunk_offset,
             instance_end,
         });
-    } else {
-        idx_scratch.truncate(span_first as usize);
     }
 
     TracePlan { spans }
@@ -1996,20 +1862,9 @@ fn convert_latest_sample_strided(
             i += stride;
         }
     }
-    match prim {
-        PrimType::F64 => fill::<f64>(sample_bytes, len, lod_stride, prim_size, epoch, scale, out),
-        PrimType::F32 => fill::<f32>(sample_bytes, len, lod_stride, prim_size, epoch, scale, out),
-        PrimType::I64 => fill::<i64>(sample_bytes, len, lod_stride, prim_size, epoch, scale, out),
-        PrimType::I32 => fill::<i32>(sample_bytes, len, lod_stride, prim_size, epoch, scale, out),
-        PrimType::I16 => fill::<i16>(sample_bytes, len, lod_stride, prim_size, epoch, scale, out),
-        PrimType::I8 => fill::<i8>(sample_bytes, len, lod_stride, prim_size, epoch, scale, out),
-        PrimType::U64 => fill::<u64>(sample_bytes, len, lod_stride, prim_size, epoch, scale, out),
-        PrimType::U32 => fill::<u32>(sample_bytes, len, lod_stride, prim_size, epoch, scale, out),
-        PrimType::U16 => fill::<u16>(sample_bytes, len, lod_stride, prim_size, epoch, scale, out),
-        PrimType::U8 | PrimType::Bool => {
-            fill::<u8>(sample_bytes, len, lod_stride, prim_size, epoch, scale, out)
-        }
-    }
+    dispatch_prim!(prim, T => {
+        fill::<T>(sample_bytes, len, lod_stride, prim_size, epoch, scale, out)
+    })
 }
 
 #[cfg(test)]
@@ -2057,17 +1912,17 @@ mod tests {
         dir: &Path,
         nodes: usize,
         samples_per_node: usize,
-        start_ns: i64,
-        step_ns: i64,
+        start_us: i64,
+        step_us: i64,
     ) -> Component {
         for n in 0..nodes {
-            let node_start = start_ns + (n * samples_per_node) as i64 * step_ns;
+            let node_start = start_us + (n * samples_per_node) as i64 * step_us;
             let node =
                 TimeSeriesNode::create(dir.join(node_start.to_string()), Timestamp(node_start), 8)
                     .unwrap();
             for i in 0..samples_per_node {
-                let ts = node_start + i as i64 * step_ns;
-                let v = (ts as f64 * 1e-9).sin();
+                let ts = node_start + i as i64 * step_us;
+                let v = (ts as f64 * 1e-6).sin();
                 node.data.write(&v.to_le_bytes()).unwrap();
                 node.index.write(&Timestamp(ts).to_le_bytes()).unwrap();
             }
@@ -2081,7 +1936,7 @@ mod tests {
         }
     }
 
-    /// Long sessions at realistic nanosecond epochs must keep drawing at
+    /// Long sessions at realistic microsecond epochs must keep drawing at
     /// every zoom level: uploads stay inside the shared buffers and the
     /// epoch rebase keeps materialized x values small and ordered.
     #[test]
@@ -2091,19 +1946,19 @@ mod tests {
             return;
         };
         let dir = tempfile::tempdir().unwrap();
-        let start_ns: i64 = 1_700_000_000_000_000_000;
-        let step_ns: i64 = 1_000_000; // 1 kHz
+        let start_us: i64 = 1_700_000_000_000_000;
+        let step_us: i64 = 1_000; // 1 kHz
         let samples_per_node = 200_000;
         let nodes = 6;
-        let component = synth_component(dir.path(), nodes, samples_per_node, start_ns, step_ns);
-        let end_ns = start_ns + (nodes * samples_per_node) as i64 * step_ns;
+        let component = synth_component(dir.path(), nodes, samples_per_node, start_us, step_us);
+        let end_us = start_us + (nodes * samples_per_node) as i64 * step_us;
         let target = RenderTarget::new(&gpu.ctx.device, 1500, 600);
 
         let windows = [
-            (start_ns, end_ns),                           // full range (~20 min)
-            (end_ns - 30_000_000_000, end_ns),            // last 30 s
-            (end_ns - 1_000_000_000, end_ns),             // last 1 s (no decimation)
-            (start_ns, start_ns + 60_000_000_000),        // first minute
+            (start_us, end_us),                    // full range (~20 min)
+            (end_us - 30_000_000, end_us),         // last 30 s
+            (end_us - 1_000_000, end_us),          // last 1 s (no decimation)
+            (start_us, start_us + 60_000_000),     // first minute
         ];
         for (min_x, max_x) in windows {
             let draw = LineDraw {
@@ -2127,14 +1982,13 @@ mod tests {
             };
             let view = PlotBounds::new(min_x as f64, 0.0, max_x as f64, 1.0);
             let drew = gpu.submit(&target, view, 1.0, std::slice::from_ref(&draw));
-            let span_secs = (max_x - min_x) as f64 * 1e-9;
+            let span_secs = (max_x - min_x) as f64 * 1e-6;
             assert!(drew, "no spans drawn for window of {span_secs}s");
             assert!(
                 !gpu.cache.truncated,
                 "decimated upload should fit capacity for window of {span_secs}s"
             );
             assert!(gpu.cache.cursor <= VALUE_CAPACITY);
-            assert!(gpu.idx_scratch.len() <= INDEX_CAPACITY as usize);
             // Epoch rebase: the last uploaded chunk's x values are small
             // window-relative seconds, ordered, and finite.
             assert!(!gpu.upload_x.is_empty());

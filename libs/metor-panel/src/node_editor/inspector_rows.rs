@@ -38,8 +38,7 @@ use crate::dynamic::ops::resample::ResampleMode;
 use crate::dynamic::tensor::TypedScalar;
 use crate::inspector::registry::InspectorRegistry;
 use crate::inspector::rows::{
-    BoolRow, CommandRow, DefaultActionRow, EnumRow, InspectorRow, RowAction, ScalarRow,
-    TextRow,
+    BoolRow, CommandRow, DefaultActionRow, EnumRow, InspectorRow, RowAction, ScalarRow, TextRow,
 };
 use crate::node_editor::graph::{BuildState, FlowId, NodeGraph};
 use crate::node_editor::pane::NodeEditor;

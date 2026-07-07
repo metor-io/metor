@@ -813,7 +813,7 @@ pub fn resolve_font_family(cx: &App, cfg: &PanelConfig) -> SharedString {
             if has(name) {
                 SharedString::from(name.clone())
             } else {
-                eprintln!("font '{name}' not found; using bundled {BUNDLED_FAMILY}");
+                tracing::warn!("font '{name}' not found; using bundled {BUNDLED_FAMILY}");
                 SharedString::new_static(BUNDLED_FAMILY)
             }
         }
@@ -846,7 +846,7 @@ pub fn set_font(cx: &mut App, font: FontConfig) {
     config.font = font;
     let family = resolve_font_family(cx, &config);
     if let Err(e) = config::save(&config) {
-        eprintln!("save config: {e}");
+        tracing::error!(%e, "save config failed");
     }
     cx.set_global(FontSettings { family, config });
 }

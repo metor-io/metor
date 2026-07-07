@@ -230,6 +230,10 @@ impl DashboardPanel {
     fn remove_widget(&mut self, id: WidgetId, cx: &mut Context<Self>) {
         self.widgets.retain(|w| w.id != id);
         self.widget_views.remove(&id);
+        // Dropping the entity here is what cancels the widget's stream
+        // tasks; a leftover entry keeps them alive for the dashboard's
+        // whole lifetime.
+        self.widget_entities.remove(&id);
         if self.selected == Some(id) {
             self.selected = None;
         }
@@ -558,7 +562,10 @@ fn component_picker_rows(
                     // user's component selection.
                     let component = name_clone.clone();
                     let config = if kind == WidgetKind::monitor() {
-                        let cfg = widgets::MonitorWidgetConfig { component };
+                        let cfg = widgets::MonitorWidgetConfig {
+                            component,
+                            ..Default::default()
+                        };
                         facet_json::to_string(&cfg)
                     } else if kind == WidgetKind::traffic_light() {
                         let cfg = widgets::TrafficLightWidgetConfig {
@@ -760,17 +767,16 @@ impl PaneItem for DashboardPanel {
 
     fn to_config(&self, cx: &App) -> DashboardPanelConfig {
         // Refresh widget configs from live entities so inspector edits land
-        // on disk. Today only `plot` widgets diverge from their cached blob
-        // (the user can add/remove traces, edit overrides). The other kinds
-        // never mutate after construction so their cached config stays
-        // authoritative.
+        // on disk. Kinds without editable state return `None` and keep
+        // their cached blob.
         let widgets = self
             .widgets
             .iter()
             .map(|w| {
                 let mut w = w.clone();
                 if let Some(entity) = self.widget_entities.get(&w.id)
-                    && let Some(blob) = widgets::serialize_widget_state(&w.kind, entity, cx)
+                    && let Some(blob) =
+                        widgets::serialize_widget_state(&w.kind, entity, &w.config, cx)
                 {
                     w.config = blob;
                 }

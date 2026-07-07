@@ -44,32 +44,35 @@ pub use measurement_panel::PanelPosition;
 /// Iterator of tick values for any value axis on a `[min, max)` range.
 ///
 /// Ticks are anchored at zero whenever the range crosses it so the origin
-/// stays on a labeled line. Near-zero values are snapped to exact zero to
-/// avoid the `-5.6e-17` artifacts that show up with floating arithmetic.
-/// Used for both Y axes on time-series plots and both axes on XY plots.
+/// stays on a labeled line, and are generated as `start + i * step` rather
+/// than by accumulation so float drift can't drop the top tick. Near-zero
+/// values are snapped to exact zero to avoid the `-5.6e-17` artifacts that
+/// show up with floating arithmetic. Used for both Y axes on time-series
+/// plots and both axes on XY plots.
 pub(crate) fn value_ticks(min: f64, max: f64, target_count: usize) -> impl Iterator<Item = f64> {
     let step = pretty_round((max - min) / target_count as f64);
-    let (start, end) = if !step.is_normal() || step <= 0.0 {
-        (0.0, -1.0) // empty range — iterator yields nothing
-    } else if min <= 0.0 && max >= 0.0 {
-        // Anchor at 0: find the lowest tick by stepping down from 0
-        let neg_steps = (-min / step).floor() as i64;
-        let start = -step * neg_steps as f64;
-        (start, max)
+    let (start, count) = if !step.is_normal() || step <= 0.0 {
+        (0.0, 0)
     } else {
-        let start = (min / step).ceil() * step;
-        (start, max + step * 0.01)
-    };
-
-    let mut v = start;
-    std::iter::from_fn(move || {
-        if v <= end {
-            let tick = if v.abs() < step * 1e-10 { 0.0 } else { v };
-            v += step;
-            Some(tick)
+        let (start, end) = if min <= 0.0 && max >= 0.0 {
+            // Anchor at 0: find the lowest tick by stepping down from 0
+            let neg_steps = (-min / step).floor() as i64;
+            (-step * neg_steps as f64, max)
         } else {
-            None
+            ((min / step).ceil() * step, max + step * 0.01)
+        };
+        // The epsilon rescues a top tick whose quotient lands barely under
+        // an integer through division rounding alone.
+        let steps = ((end - start) / step + 1e-9).floor();
+        if steps < 0.0 {
+            (start, 0)
+        } else {
+            (start, steps as usize + 1)
         }
+    };
+    (0..count).map(move |i| {
+        let v = start + i as f64 * step;
+        if v.abs() < step * 1e-10 { 0.0 } else { v }
     })
 }
 
@@ -143,48 +146,46 @@ fn segment_round(dur: hifitime::Duration) -> hifitime::Duration {
 /// crawl during pan) and Unix epoch `0` for absolute labels (so ticks land
 /// on wall-clock boundaries like `:00`/`:30`).
 fn x_ticks(view: &PlotBounds, target_count: usize, anchor: f64) -> impl Iterator<Item = i64> {
+    // Backstop: `segment_round` keeps the count near `target_count`, but a
+    // paint pass must never be able to loop unbounded if it degenerates.
+    const MAX_TICKS: usize = 1024;
     let range = view.width();
     let target = (target_count as f64).max(1.0);
     let raw_step_us = range / target;
     let step_dur = segment_round(hifitime::Duration::from_microseconds(raw_step_us));
-    let step_i = (step_dur.total_nanoseconds() / 1_000) as i64;
+    // Sub-microsecond windows round to a zero-microsecond step; clamp to
+    // one so the iterator always advances.
+    let step_i = ((step_dur.total_nanoseconds() / 1_000) as i64).max(1);
 
     let t_min = view.min_x as i64;
     let t_max = view.max_x as i64;
     let ds = anchor as i64;
-    let valid = range > 0.0 && step_i > 0;
 
-    // Ticks are snapped to multiples of `step_i` measured from `data_start`
+    // Ticks are snapped to multiples of `step_i` measured from the anchor
     // so scrubbing doesn't make labels crawl across the axis.
-    let offset_from_start = t_min - ds;
-    let aligned = if valid {
-        ds + (offset_from_start / step_i) * step_i
-    } else {
-        t_min
-    };
-    let start = if aligned < t_min {
+    let aligned = ds + ((t_min - ds) / step_i) * step_i;
+    let first = if aligned < t_min {
         aligned + step_i
     } else {
         aligned
     };
-    let end = if valid { t_max } else { t_min };
+    // A degenerate window still labels its position: yield `t_min` once.
+    let (start, end) = if range > 0.0 {
+        (first, t_max)
+    } else {
+        (t_min, t_min)
+    };
 
     let mut t = start;
-    let mut done = false;
+    let mut yielded = 0;
     std::iter::from_fn(move || {
-        if done {
+        if t > end || yielded >= MAX_TICKS {
             return None;
         }
-        if t <= end {
-            let tick = t;
-            t += step_i;
-            Some(tick)
-        } else if !valid && !done {
-            done = true;
-            Some(t_min)
-        } else {
-            None
-        }
+        let tick = t;
+        t = t.saturating_add(step_i);
+        yielded += 1;
+        Some(tick)
     })
 }
 
@@ -1777,5 +1778,78 @@ impl Render for TimeSeriesPlot {
         }
 
         root
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn x_ticks_terminates_on_sub_microsecond_window() {
+        // Width under 5us used to truncate the step to zero and loop forever.
+        let view = PlotBounds::new(1_000.2, 0.0, 1_003.8, 1.0);
+        let ticks: Vec<i64> = x_ticks(&view, 5, 1_000.2).take(2_000).collect();
+        assert!(!ticks.is_empty());
+        assert!(ticks.len() < 2_000);
+        for pair in ticks.windows(2) {
+            assert!(pair[1] > pair[0]);
+        }
+    }
+
+    #[test]
+    fn x_ticks_zero_width_range_yields_position_once() {
+        let view = PlotBounds::new(5_000.0, 0.0, 5_000.0, 1.0);
+        let ticks: Vec<i64> = x_ticks(&view, 5, 5_000.0).take(10).collect();
+        assert_eq!(ticks, vec![5_000]);
+    }
+
+    #[test]
+    fn x_ticks_snap_to_anchor_multiples() {
+        let anchor = 1_000_003.0;
+        let view = PlotBounds::new(anchor, 0.0, 10_000_000.0, 1.0);
+        let ticks: Vec<i64> = x_ticks(&view, 5, anchor).collect();
+        assert!(ticks.len() >= 2);
+        let step = ticks[1] - ticks[0];
+        assert!(step > 0);
+        for &tick in &ticks {
+            assert_eq!((tick - anchor as i64) % step, 0);
+            assert!(tick >= view.min_x as i64 && tick <= view.max_x as i64);
+        }
+    }
+
+    #[test]
+    fn value_ticks_uses_nice_step() {
+        let ticks: Vec<f64> = value_ticks(0.0, 1234.0, 5).collect();
+        assert_eq!(ticks, vec![0.0, 250.0, 500.0, 750.0, 1000.0]);
+    }
+
+    #[test]
+    fn value_ticks_zero_crossing_anchors_at_zero() {
+        let ticks: Vec<f64> = value_ticks(-1.0, 1.0, 5).collect();
+        assert!(ticks.contains(&0.0));
+        assert_eq!(ticks.first(), Some(&-1.0));
+        assert_eq!(ticks.last(), Some(&1.0));
+    }
+
+    #[test]
+    fn value_ticks_tiny_fractional_range() {
+        let (min, max) = (0.001, 0.002);
+        let ticks: Vec<f64> = value_ticks(min, max, 5).collect();
+        assert!(ticks.len() >= 5);
+        let step = ticks[1] - ticks[0];
+        assert!((step - 0.000_2).abs() < 1e-12);
+        for pair in ticks.windows(2) {
+            assert!((pair[1] - pair[0] - step).abs() < 1e-12);
+        }
+        for &tick in &ticks {
+            assert!(tick >= min - 1e-12 && tick <= max + step * 0.02);
+        }
+    }
+
+    #[test]
+    fn value_ticks_empty_on_degenerate_range() {
+        assert_eq!(value_ticks(1.0, 1.0, 5).count(), 0);
+        assert_eq!(value_ticks(2.0, 1.0, 5).count(), 0);
     }
 }

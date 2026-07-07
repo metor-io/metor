@@ -25,7 +25,7 @@ use metor_proto_wkt::{
     SequenceEventKind, SequenceRegistry, SequenceRunState,
 };
 
-use crate::msg_ingest::ingest_loop;
+use crate::msg_ingest::{IngestSource, ingest_all};
 
 #[cfg(test)]
 mod tests;
@@ -235,7 +235,7 @@ pub fn run_state_label(run_state: SequenceRunState) -> &'static str {
 pub struct SequenceStore {
     state: SequenceState,
     db: Arc<DB>,
-    _tasks: Vec<Task<()>>,
+    _task: Task<()>,
 }
 
 /// Hands the shared [`SequenceStore`] entity to any part of the app.
@@ -255,31 +255,28 @@ impl SequenceStore {
     }
 
     fn new(db: Arc<DB>, cx: &mut Context<Self>) -> Self {
-        let tasks = vec![
-            cx.spawn({
-                let db = db.clone();
-                async move |this, cx| {
-                    ingest_loop(db, SequenceRegistry::ID, this, cx, |store, ts, reg| {
+        // Registry declares channels before their events can fold, so it leads the
+        // sources list and wins equal-timestamp ties in the merged backfill.
+        let task = cx.spawn({
+            let db = db.clone();
+            async move |this, cx| {
+                let sources = vec![
+                    IngestSource::new(SequenceRegistry::ID, |store: &mut Self, ts, reg| {
                         store.state.apply_registry(ts, reg)
-                    })
-                    .await
-                }
-            }),
-            cx.spawn({
-                let db = db.clone();
-                async move |this, cx| {
-                    ingest_loop(db, SequenceChannelEvent::ID, this, cx, |store, ts, ev| {
-                        store.state.apply_event(ts, ev)
-                    })
-                    .await
-                }
-            }),
-        ];
+                    }),
+                    IngestSource::new(
+                        SequenceChannelEvent::ID,
+                        |store: &mut Self, ts, ev| store.state.apply_event(ts, ev),
+                    ),
+                ];
+                ingest_all(db, sources, this, cx).await
+            }
+        });
 
         Self {
             state: SequenceState::default(),
             db,
-            _tasks: tasks,
+            _task: task,
         }
     }
 

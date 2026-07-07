@@ -31,13 +31,8 @@ pub enum CellKind {
     /// Component isn't registered yet or its metadata can't be resolved.
     Unknown,
     Bool,
-    Enum {
-        variants: Vec<SharedString>,
-    },
-    Numeric {
-        signed: bool,
-        float: bool,
-    },
+    Enum { variants: Vec<SharedString> },
+    Numeric,
     String,
 }
 
@@ -56,18 +51,16 @@ impl CellKind {
         }
         match prim_type {
             PrimType::Bool => CellKind::Bool,
-            PrimType::F32 | PrimType::F64 => CellKind::Numeric {
-                signed: true,
-                float: true,
-            },
-            PrimType::I8 | PrimType::I16 | PrimType::I32 | PrimType::I64 => CellKind::Numeric {
-                signed: true,
-                float: false,
-            },
-            PrimType::U8 | PrimType::U16 | PrimType::U32 | PrimType::U64 => CellKind::Numeric {
-                signed: false,
-                float: false,
-            },
+            PrimType::F32
+            | PrimType::F64
+            | PrimType::I8
+            | PrimType::I16
+            | PrimType::I32
+            | PrimType::I64
+            | PrimType::U8
+            | PrimType::U16
+            | PrimType::U32
+            | PrimType::U64 => CellKind::Numeric,
         }
     }
 }
@@ -379,7 +372,7 @@ impl ComponentValueStrip {
         }
         let seed = match self.kind {
             CellKind::String => string_seed(&self.raw_values),
-            CellKind::Numeric { .. } => self
+            CellKind::Numeric => self
                 .raw_values
                 .get(idx)
                 .map(|v| format_seed(*v))
@@ -404,28 +397,26 @@ impl ComponentValueStrip {
             return;
         };
         let text = edit.field.text.clone();
-        match self.kind.clone() {
-            CellKind::Numeric { signed, float } => {
-                match parse_numeric(&text, self.prim_type(), signed, float) {
-                    Some(value) => {
-                        crate::inspector::edits::upsert_element_value(
-                            &self.db,
-                            self.component_id,
-                            self.component_name.clone(),
-                            self.element_names.clone(),
-                            edit.index,
-                            value,
-                            cx,
-                        );
-                    }
-                    None => {
-                        edit.error = true;
-                        self.editing = Some(edit);
-                        cx.notify();
-                        return;
-                    }
+        match self.kind {
+            CellKind::Numeric => match parse_numeric(&text, self.prim_type()) {
+                Some(value) => {
+                    crate::inspector::edits::upsert_element_value(
+                        &self.db,
+                        self.component_id,
+                        self.component_name.clone(),
+                        self.element_names.clone(),
+                        edit.index,
+                        value,
+                        cx,
+                    );
                 }
-            }
+                None => {
+                    edit.error = true;
+                    self.editing = Some(edit);
+                    cx.notify();
+                    return;
+                }
+            },
             CellKind::String => {
                 crate::inspector::edits::upsert_string_value(
                     &self.db,
@@ -510,12 +501,7 @@ fn string_seed(raw: &[ElementValue]) -> String {
     String::from_utf8(bytes).unwrap_or_default()
 }
 
-fn parse_numeric(
-    text: &str,
-    prim_type: Option<PrimType>,
-    _signed: bool,
-    _float: bool,
-) -> Option<ElementValue> {
+fn parse_numeric(text: &str, prim_type: Option<PrimType>) -> Option<ElementValue> {
     let prim_type = prim_type?;
     Some(match prim_type {
         PrimType::U8 => ElementValue::U8(text.parse().ok()?),
@@ -538,9 +524,9 @@ impl Render for ComponentValueStrip {
 
         // Pending edits shadow WAL samples so typed changes stay visible
         // until the user applies or discards them.
-        let (cells, raw_values) = {
-            let pending = crate::inspector::edits::pending_edits(cx).get(self.component_id);
-            if let Some(edit) = pending {
+        let pending = crate::inspector::edits::pending_edits(cx)
+            .get(self.component_id)
+            .map(|edit| {
                 let view = edit.value.as_view();
                 let raw: Vec<ElementValue> = view.iter().collect();
                 let cells = format_cells(
@@ -550,9 +536,10 @@ impl Render for ComponentValueStrip {
                     self.is_string,
                 );
                 (cells, raw)
-            } else {
-                (self.cells.clone(), self.raw_values.clone())
-            }
+            });
+        let (cells, raw_values): (&[StripCell], &[ElementValue]) = match &pending {
+            Some((cells, raw)) => (cells, raw),
+            None => (&self.cells, &self.raw_values),
         };
 
         if cells.is_empty() {
@@ -622,7 +609,7 @@ impl Render for ComponentValueStrip {
             };
 
             let can_edit_inline =
-                !behavior.locked && matches!(kind, CellKind::Numeric { .. } | CellKind::String);
+                !behavior.locked && matches!(kind, CellKind::Numeric | CellKind::String);
 
             let atom = if behavior.locked || is_editing {
                 atom
@@ -1153,24 +1140,15 @@ mod tests {
         }
         assert_eq!(
             CellKind::from_schema(PrimType::F32, false, None),
-            CellKind::Numeric {
-                signed: true,
-                float: true
-            }
+            CellKind::Numeric
         );
         assert_eq!(
             CellKind::from_schema(PrimType::I32, false, None),
-            CellKind::Numeric {
-                signed: true,
-                float: false
-            }
+            CellKind::Numeric
         );
         assert_eq!(
             CellKind::from_schema(PrimType::U64, false, None),
-            CellKind::Numeric {
-                signed: false,
-                float: false
-            }
+            CellKind::Numeric
         );
     }
 
