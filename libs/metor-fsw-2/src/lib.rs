@@ -45,6 +45,10 @@
 //! }
 //! ```
 //!
+//! Everything derive-generated code names is re-exported from this crate's
+//! root, so a system crate depends only on this crate and not on the component
+//! and protocol crates underneath.
+//!
 //! [`FrameList`] and [`FrameMap`] members add bounded runtime dynamism (a
 //! variable number of elements stored past the fixed region) while keeping the
 //! worst-case frame size a compile-time constant, so rings can still be sized up
@@ -121,9 +125,6 @@ pub mod sequence;
 #[cfg(feature = "kdl")]
 pub mod wiring;
 
-// The C ABI a system `cdylib` exports, and the host loader that drives one.
-// Both build without the `kdl` feature; constructing a system does not depend
-// on the KDL front-end.
 pub mod abi;
 pub mod dl;
 
@@ -132,8 +133,6 @@ pub use frame::Frame;
 pub use reader::{ListReader, MapReader};
 pub use writer::{FrameWriter, KeyError, ListWriter, MapWriter};
 
-// The errors the port APIs return, at the root so `?`-ing them needs no direct
-// path into the ring crate.
 pub use metor_fsw_ring::{ReadError, WriteError};
 
 pub use binder::{BindPorts, Binder, BoundInput, BoundPort, RingSource};
@@ -153,8 +152,6 @@ pub use descriptor::{
     AnnounceFn, Capability, Delivery, FanIn, Hz, PortConn, PortDecl, PortDesc, PortId, PortSchema,
     SystemDescriptor, SystemKind, split_decls,
 };
-// `Level` stays under [`health`]; a bare `Level` at the root would be
-// collision-prone under glob imports.
 pub use health::{
     HealthPort, LOG_MSG_CAP, LogLine, MAX_ERR_KINDS, MAX_LINES, SystemHealth, SystemLog,
 };
@@ -170,52 +167,28 @@ pub use system::{
     SystemInput, SystemOutput,
 };
 
-// The ring transport, so a system author needs only this crate.
 pub use metor_fsw_ring as ring;
 
-// The four component traits and the derives, so a system crate needs no direct
-// dependency on the crates that define them.
 pub use metor_fsw::{AsVTable, Componentize, Decomponentize, Metadatatize};
 pub use metor_fsw_2_macros::{Frame, SystemInput, SystemOutput};
 
-// The hand-written escape hatch that emits a system `cdylib`'s C-ABI surface;
-// `#[system(export)]` emits the same surface.
 pub use metor_fsw_2_macros::export_system;
 
-// Turns an `async fn` into a loadable sequence occupant. Coexists with the
-// `sequence` module above (module in the type namespace, macro in the macro
-// namespace).
 pub use metor_fsw_2_macros::sequence;
 
-// Annotates a system's inherent impl block and derives the port bundles, the
-// trait impls, and (opt-in) the `fsw_*` exports from the `execute`/`run`
-// signature.
 pub use metor_fsw_2_macros::system;
 
-// The cycle timestamp every `execute` receives, at the root so systems write
-// `now: Timestamp` without importing the protocol crate.
 pub use metor_proto::types::Timestamp;
 
-// The sequence types only. The author-facing free functions (`wait`,
-// `progress`, `aborted`, `now`) stay under [`sequence`], where the generic
-// names cannot collide under glob imports and `now` reads as sequence time
-// rather than wall time.
 pub use sequence::{
     Outcome, Seq, SeqBound, SeqClock, SeqStatusOut, SeqSystem, SequenceStatus, SlotControlIn,
 };
 
-// The paths the derive-generated code names (`::metor_fsw_2::metor_proto::…`,
-// `::metor_fsw_2::path::…`), so a crate depending only on this one can use the
-// derives.
 pub use metor_fsw::path;
 pub use {metor_proto, metor_proto_wkt};
 
 pub use dl::{DlError, DlSystem};
 
-// The `Wiring` data model, the Rust builder, and the build driver. Types only;
-// the wiring free functions (`wiring::parse`, `wiring::resolve`,
-// `wiring::load`, …) stay namespaced, since bare `parse`/`resolve` at the root
-// would be collision-prone under glob imports.
 #[cfg(feature = "kdl")]
 pub use wiring::{
     AllowedOccupantSpec, Artifact, BuildError, BuildOptions, BundleError, ClockSpec,
@@ -223,8 +196,6 @@ pub use wiring::{
     SlotSpec, SystemSpec, TCP_DOWNLINK_TYPE, TCP_UPLINK_TYPE, Wiring, WiringBuilder,
 };
 
-// The clap-based `metor-fsw {build,package,run}` runner; the bin delegates to
-// `cli::main()`.
 #[cfg(feature = "kdl")]
 pub mod cli;
 

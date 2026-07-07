@@ -24,14 +24,16 @@ use syn::{FnArg, ItemFn, Lit, Meta, Pat, Token, Type, parse_macro_input};
 
 use crate::sig;
 
-/// A user port declared in the signature, as its binding ident and the
-/// element type `T` from `Input<T>` / `Output<T>`.
+/// One `Input<T>` or `Output<T>` parameter, reduced to its binding ident and
+/// the element type `T`. This is all the expansion needs to emit the port's
+/// descriptor and bind call; see [`Param`] for the other parameter kinds.
 struct Port {
     ident: syn::Ident,
     elem: Type,
 }
 
-/// How a fn parameter is classified by the last path segment of its type.
+/// The role one fn parameter plays in the expansion, decided by the last
+/// path segment of its type. Port parameters carry a [`Port`].
 enum Param {
     /// A user input port, `Input<T>`.
     Input(Port),

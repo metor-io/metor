@@ -5,7 +5,8 @@ use proc_macro::TokenStream;
 use quote::quote;
 use syn::{DeriveInput, Generics, Ident, parse_macro_input};
 
-/// Struct-level attributes for `#[derive(Frame)]`.
+/// Everything `#[derive(Frame)]` reads from the input struct, parsed by
+/// darling from the `fsw`/`metor_fsw` attributes.
 ///
 /// The frame name (`name`, or its `parent` alias) becomes both the dotted
 /// component-id prefix and the `FRAME_ID` tag. When absent, no prefix is

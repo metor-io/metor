@@ -49,7 +49,8 @@ struct NavEstimate {
     residuals: FrameList<Residual, 4>,
 }
 
-/// Collects every scalar component a record's vtable reports, as `f64`.
+/// A [`Decomponentize`] sink that collects every scalar component a record's
+/// vtable reports, as `f64`.
 #[derive(Default)]
 struct RecSink {
     values: HashMap<ComponentId, f64>,
@@ -466,7 +467,8 @@ async fn async_filter_one_cycle() {
 // produce an identical descriptor and identical run behavior.
 // ---------------------------------------------------------------------------
 
-/// The hand-written form, with the port bundles and every trait impl spelled out.
+/// A cyclic system that scales IMU omega into a nav angle, with the port
+/// bundles and every trait impl spelled out by hand.
 struct HandDoubler {
     gain: f64,
 }
@@ -510,8 +512,9 @@ impl crate::BuildSystem for HandDoubler {
     }
 }
 
-/// The macro form. Same name, same ports in the same order, same body;
-/// everything else is generated.
+/// The same system as [`HandDoubler`], declared through the `#[system]`
+/// attribute. Same name, same ports in the same order, same body; everything
+/// else is generated.
 struct MacroDoubler {
     gain: f64,
 }
@@ -594,7 +597,8 @@ where
     (angles, sink.values)
 }
 
-/// Hands out pre-created rings in order, standing in for a coordinator.
+/// A [`RingSource`](crate::RingSource) that hands out pre-created rings in
+/// order, standing in for a coordinator.
 struct TestSource {
     rings: Vec<RingBuffer>,
     next: usize,
@@ -732,8 +736,8 @@ fn publish_drop_folds_to_health() {
 
 use metor_proto_wkt::{SequenceCommand, SequenceCommandKind};
 
-/// A command log input. A full ring holds the emitter back instead of
-/// dropping records.
+/// An input bundle whose one port is a [`MsgIn`](crate::MsgIn) command log.
+/// A full ring holds the emitter back instead of dropping records.
 #[derive(crate::SystemInput)]
 struct GuardIn {
     cmds: crate::MsgIn<SequenceCommand>,
@@ -744,8 +748,9 @@ struct QuietOut {
     /// A frame output opted out of the downlink.
     #[fsw(telemetered = false)]
     nav: Output<NavEstimate>,
-    /// `CommandOut` is `MsgOut` sugar that the derive lowers to the same
-    /// telemetry opt-out; the alias itself carries no flag.
+    /// [`CommandOut`](crate::CommandOut) is [`MsgOut`](crate::MsgOut) sugar
+    /// that the derive lowers to the same telemetry opt-out; the alias itself
+    /// carries no flag.
     cmds: crate::CommandOut<SequenceCommand>,
 }
 

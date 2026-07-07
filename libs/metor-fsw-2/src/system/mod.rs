@@ -1,4 +1,5 @@
-//! System traits, and the framework wrapper around a system's outputs.
+//! The traits a user's system implements, and the shims the framework wraps
+//! around it.
 //!
 //! A system is a struct with a typed input bundle and a typed output bundle.
 //! [`System`] carries the surface every system shares (the bundle types, the
@@ -39,8 +40,9 @@ use crate::port::Output;
 // Port bundles
 // ---------------------------------------------------------------------------
 
-/// A system's input bundle: a struct of [`Input<F>`](crate::Input) ports.
-/// Derive with `#[derive(SystemInput)]` to generate `decls` from the fields.
+/// The read side of a system, a struct whose fields are
+/// [`Input<F>`](crate::Input) ports. Derive with `#[derive(SystemInput)]` to
+/// generate `decls` from the fields.
 pub trait SystemInput {
     /// What every field contributes, in field order: the producer shape a
     /// wired port requires, or a bind-time [`Capability`]. Read before any

@@ -5,8 +5,9 @@
 //! Runtime commands `Load`, `Start`, `Stop`, `Abort`, and `Reset` the
 //! occupant over the same create/execute/destroy ABI a statically wired
 //! dynamic system uses; there are no extra lifecycle symbols. Occupants are
-//! sequences, and the loadable set is fixed at build time. Each candidate
-//! library is opened and validated up front, and `Load` selects one by name.
+//! sequences, and the loadable set of [`AllowedOccupant`]s is fixed at build
+//! time. Each candidate library is opened and validated up front, and `Load`
+//! selects one by name.
 //!
 //! # Ring ownership
 //!
@@ -31,6 +32,11 @@
 //! frame plus the slot's events message channel on the output side.
 //!
 //! # Lifecycle and events
+//!
+//! Each [`step`](CyclicSlot::step) drains and applies addressed commands
+//! first, so a command lands the cycle it arrives, then publishes the
+//! [`SlotStatus`] frame and polls the occupant once while the phase is
+//! Running. Once the phase leaves Running the occupant is not polled again.
 //!
 //! [`SlotState`] tracks the phase, while the live occupant future is tracked
 //! separately in [`SlotRunner`]'s `slot` field. A `Stop` hard-drops the
@@ -59,7 +65,7 @@ use crate::message::{MsgIn, MsgOut};
 use crate::port::{Input, Output};
 use crate::sequence::{PROGRESS_MSG_CAP, ProgressLine, SequenceStatus, SlotControlIn};
 
-/// Capacity of one occupant name in the host frames below, the shared
+/// Capacity of the occupant name field in [`SlotStatus`], the shared
 /// [`NAME_CAP`](super::NAME_CAP).
 pub const SLOT_NAME_CAP: usize = NAME_CAP;
 
@@ -67,9 +73,9 @@ pub const SLOT_NAME_CAP: usize = NAME_CAP;
 // Host telemetry / control frames
 // ---------------------------------------------------------------------------
 
-/// Host-side slot telemetry, written every cycle. It carries the slot phase
-/// and the selected occupant's name; occupant-side detail such as progress
-/// lines and the terminal outcome rides the occupant's own
+/// A fixed frame the host publishes every cycle carrying the slot phase and
+/// the selected occupant's name. Occupant-side detail such as progress lines
+/// and the terminal outcome rides the occupant's own
 /// [`SequenceStatus`](crate::sequence::SequenceStatus) frame.
 #[derive(crate::Frame, IntoBytes, Immutable, KnownLayout, FromBytes)]
 #[repr(C)]
@@ -90,17 +96,19 @@ pub struct SlotStatus {
 // Allowed / initial occupants + the registration payload
 // ---------------------------------------------------------------------------
 
-/// One loadable occupant. `Load` selects it by `name`; `system` is the
-/// already opened library, whose backing stays loaded across swaps, and
-/// `params` is the postcard blob `fsw_create` decodes.
+/// A candidate library a slot is allowed to load, opened and validated at
+/// build time. `Load` selects it by `name`; `system` is the already opened
+/// library, whose backing stays loaded across swaps, and `params` is the
+/// postcard blob `fsw_create` decodes.
 pub struct AllowedOccupant {
     pub name: String,
     pub system: DlSystem,
     pub params: Vec<u8>,
 }
 
-/// An occupant applied once at startup. [`SlotRunner::init`] loads it, and
-/// starts it too when `start` is set.
+/// Names an [`AllowedOccupant`] to load at startup, so a slot comes up
+/// populated instead of empty. [`SlotRunner::init`] applies it once, starting
+/// the occupant too when `start` is set.
 #[derive(Clone, Debug)]
 pub struct InitialOccupant {
     /// The allowed-set occupant name to load at startup.
@@ -126,8 +134,8 @@ impl InitialOccupant {
     }
 }
 
-/// The slot registration the builder records and `build()` turns into a
-/// [`SlotRunner`].
+/// A slot's configuration as recorded at registration, held until `build()`
+/// assembles the [`SlotRunner`] from it.
 ///
 /// `n_occ_inputs` and `n_occ_outputs` split the registered port lists into
 /// the occupant prefix and the runner tail (see the module docs), so the
@@ -147,9 +155,10 @@ pub(crate) struct SlotReg {
 // SlotRunner
 // ---------------------------------------------------------------------------
 
-/// The runtime-swappable slot the coordinator drives as a `Box<dyn CyclicSlot>`.
-/// It holds the per-port [`FswRing`](crate::abi::FswRing) templates, the
-/// allowed-occupant set, the live occupant, the [`SlotState`], and the
+/// A slot runner drives one swappable position in the coordinator's schedule,
+/// creating, polling, and destroying occupants in response to runtime
+/// commands. It holds the per-port [`FswRing`](crate::abi::FswRing) templates,
+/// the [`AllowedOccupant`] set, the live occupant, the [`SlotState`], and the
 /// host-owned control and status writers. No occupant exists after `build()`;
 /// the first one is created at `init` or by a runtime `Load`.
 ///
@@ -428,8 +437,6 @@ impl SlotRunner {
 }
 
 impl CyclicSlot for SlotRunner {
-    /// Apply the initial occupant, loading it and optionally starting it.
-    /// Slots without one init to a no-op.
     fn init(&mut self) {
         if let Some(initial) = self.initial.take() {
             self.do_load(&initial.occupant);
@@ -439,9 +446,6 @@ impl CyclicSlot for SlotRunner {
         }
     }
 
-    /// Drain and apply addressed commands, publish status, then poll the
-    /// occupant once while running and fold its raw [`FswStatus`] into the
-    /// slot phase. Once the phase leaves running the occupant is not polled.
     fn step(&mut self, now: Timestamp) {
         self.last_now = now;
         // Apply commands before stepping the occupant so a command lands the
@@ -487,8 +491,6 @@ impl CyclicSlot for SlotRunner {
         }
     }
 
-    /// Drop the live occupant (its `Drop` runs `fsw_destroy`) at teardown.
-    /// The coordinator frees the ring regions afterward.
     fn shutdown(&mut self) {
         self.slot = None;
     }

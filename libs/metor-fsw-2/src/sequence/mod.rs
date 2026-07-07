@@ -271,7 +271,8 @@ pub const PROGRESS_MSG_CAP: usize = 64;
 /// Most progress lines one [`SequenceStatus`] record can carry.
 pub const MAX_PROGRESS: usize = 16;
 
-/// One progress line, a used-length plus a fixed-size message buffer.
+/// A fixed-size text cell carrying one status message, stored as a used
+/// length plus a [`PROGRESS_MSG_CAP`]-byte buffer.
 #[derive(metor_fsw::AsVTable, IntoBytes, Immutable, KnownLayout, FromBytes, Clone, Copy)]
 #[repr(C)]
 pub struct ProgressLine {
@@ -330,8 +331,9 @@ pub struct SeqStatusOut {
 // The SeqSystem seam the generated occupant implements
 // ---------------------------------------------------------------------------
 
-/// A bound sequence: the future with the user ports moved inside it, the
-/// wrapper-owned status/health/log tail, and the cancel input the driver
+/// Everything the driver needs to run one sequence, handed back by
+/// [`SeqSystem::build`]. The future owns the user ports; alongside it ride
+/// the wrapper-owned status/health/log tail and the cancel input the driver
 /// reads each cycle.
 ///
 /// TODO: because the user's output ports live inside the future, their
@@ -347,8 +349,9 @@ pub struct SeqBound {
     pub control: Input<SlotControlIn>,
 }
 
-/// The seam the `#[sequence]` macro implements and the ABI helpers are
-/// generic over.
+/// The interface a generated sequence occupant implements, letting the ABI
+/// helpers describe, create, and poll any sequence without knowing its
+/// concrete type.
 ///
 /// [`descriptor`](SeqSystem::descriptor) is the single source of truth for
 /// port order, ring sizing, and compatibility checks. Its inputs are the

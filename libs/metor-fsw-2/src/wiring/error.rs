@@ -6,7 +6,9 @@ use thiserror::Error;
 use crate::coordinator::WireError;
 use crate::dl::DlError;
 
-/// An error from loading or resolving a wiring document.
+/// A reason a KDL wiring document failed to parse, validate, or resolve
+/// into a runnable system graph, from syntax errors through graph-level
+/// [`WireError`]s and shared-library loading failures ([`DlError`]).
 ///
 /// Each variant carries the full KDL source and the span of the offending
 /// node, so rendering the error as a [`miette`] report points at the exact

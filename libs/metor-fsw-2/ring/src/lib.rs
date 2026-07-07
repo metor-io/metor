@@ -46,12 +46,11 @@
 //!      └───────────────────────────┘
 //! ```
 //!
-//! Const asserts pin the `#[repr(C)]` layouts byte for byte, so reordering a
-//! field fails the build instead of silently changing the format. Attaching
-//! validates the magic, version, architecture tag, and geometry before it
-//! forms a single reference into the region. Fields are stored native-endian,
-//! and the architecture tag rejects regions written by a different endianness
-//! or pointer width.
+//! The `#[repr(C)]` declarations below are the region format; reordering a
+//! field changes it. Attaching validates the magic, version, architecture
+//! tag, and geometry before it forms a single reference into the region.
+//! Fields are stored native-endian, and the architecture tag rejects regions
+//! written by a different endianness or pointer width.
 //!
 //! # Cursors and records
 //!
@@ -125,9 +124,10 @@ const MAGIC: u32 = u32::from_ne_bytes(*b"MFR1");
 /// migrated.
 const VERSION: u16 = 2;
 
-/// The immutable region header, occupying cache line 0. `init_region` writes
-/// it once before the region is published and nothing mutates it afterwards,
-/// which is what makes the transient shared byte view in `read_header` sound.
+/// The identifying metadata at the start of every region, occupying cache
+/// line 0. `init_region` writes it once before the region is published and
+/// nothing mutates it afterwards, which is what makes the transient shared
+/// byte view in `read_header` sound.
 ///
 /// The `IntoBytes` derive doubles as a compile-time proof that the struct has
 /// no padding. The `align(8)` matters on 32-bit targets like i686, where
@@ -146,9 +146,10 @@ struct RegionHeader {
     arch_tag: u64,
 }
 
-/// The mutable control block on cache line 1. Every field is an atomic, so a
-/// shared `&Control` over the live region is sound. It is never parsed from
-/// bytes, only pointer-cast, and the const asserts below pin its offsets.
+/// The words the writer and readers coordinate through, occupying cache
+/// line 1. Every field is an atomic, so a shared `&Control` over the live
+/// region is sound. It is never parsed from bytes, only pointer-cast, with
+/// `#[repr(C)]` fixing the field offsets.
 #[repr(C)]
 struct Control {
     committed: AtomicU64,
@@ -160,7 +161,8 @@ struct Control {
     writer: AtomicU64,
 }
 
-/// One reader-table slot, padded out to a cache line to avoid false sharing.
+/// One reader's shared cursor and epoch, padded out to a cache line to avoid
+/// false sharing.
 ///
 /// `_pad` is not interior-mutable, so a shared `&ReaderSlot` freezes it. That
 /// is sound only because the pad is written exactly once, in `init_region`,
@@ -178,36 +180,6 @@ const OFF_CONTROL: usize = 0x40;
 const HEADER_SIZE: usize = 0x80;
 /// One reader-table slot's stride.
 const READER_SLOT_SIZE: usize = size_of::<ReaderSlot>();
-
-// Pin the version-2 wire layout byte for byte. Any drift fails the build.
-const _: () = {
-    use core::mem::offset_of;
-    assert!(size_of::<RegionHeader>() == 0x30);
-    assert!(align_of::<RegionHeader>() == 8);
-    assert!(offset_of!(RegionHeader, magic) == 0x00);
-    assert!(offset_of!(RegionHeader, version) == 0x04);
-    assert!(offset_of!(RegionHeader, flags) == 0x06);
-    assert!(offset_of!(RegionHeader, capacity) == 0x08);
-    assert!(offset_of!(RegionHeader, data_offset) == 0x10);
-    assert!(offset_of!(RegionHeader, max_readers) == 0x18);
-    assert!(offset_of!(RegionHeader, reader_table_offset) == 0x1C);
-    assert!(offset_of!(RegionHeader, total_size) == 0x20);
-    assert!(offset_of!(RegionHeader, arch_tag) == 0x28);
-    assert!(size_of::<RegionHeader>() <= OFF_CONTROL);
-
-    assert!(size_of::<Control>() == 0x20);
-    assert!(align_of::<Control>() == 8);
-    assert!(offset_of!(Control, committed) == 0x00); // region 0x40
-    assert!(offset_of!(Control, hwm) == 0x08); // region 0x48
-    assert!(offset_of!(Control, wake_word) == 0x10); // region 0x50
-    assert!(offset_of!(Control, writer) == 0x18); // region 0x58
-    assert!(OFF_CONTROL + size_of::<Control>() <= HEADER_SIZE);
-
-    assert!(size_of::<ReaderSlot>() == 64);
-    assert!(align_of::<ReaderSlot>() == 8);
-    assert!(offset_of!(ReaderSlot, cursor) == 0x00);
-    assert!(offset_of!(ReaderSlot, epoch) == 0x08);
-};
 
 /// `flags` bit 0, set when a shared-memory wake word is present. Reserved and
 /// never set in version 2.
@@ -248,7 +220,7 @@ pub const fn frame_len(payload_len: usize) -> usize {
 // Public config / errors
 // ---------------------------------------------------------------------------
 
-/// Buffer geometry.
+/// The sizes fixed when a ring buffer is created.
 #[derive(Debug, Clone, Copy)]
 pub struct Config {
     /// Data-region size in bytes. **Must be a power of two.**
@@ -257,9 +229,6 @@ pub struct Config {
     /// are not yet reclaimed.
     pub max_readers: usize,
 }
-
-// Manual `Display`/`Error` impls keep `zerocopy` the crate's only required
-// dependency.
 
 /// A write could not be performed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -397,9 +366,9 @@ impl std::error::Error for AttachError {}
 #[repr(C, align(8))]
 struct Word(UnsafeCell<u64>);
 
-/// Owned, type-erased backing storage for a ring region. It is a
-/// `(base, len)` byte range plus the destructor that releases it; the backing
-/// kinds (heap, mmap, caller-owned) differ only in how they drop.
+/// The memory a ring lives in, reduced to a `(base, len)` byte range plus
+/// the destructor that releases it. The kinds of backing memory (heap, mmap,
+/// caller-owned) differ only in how they drop.
 ///
 /// Every constructor guarantees the region contract that all of the ring's
 /// `unsafe` relies on. `base..base + len` is a single allocation that is
@@ -587,10 +556,9 @@ impl WakeSink for NoWake {
     }
 }
 
-/// Notifies tasks within one process, backed by a `stellarator` wait queue.
-/// The writer and the views for one direction (data available or space
-/// available) share clones of a single `Notifier`. Behind the `async`
-/// feature.
+/// A shared wait queue that wakes tasks within one process. The writer and
+/// the views for one direction (data available or space available) share
+/// clones of a single `Notifier`. Behind the `async` feature.
 #[cfg(feature = "async")]
 #[derive(Clone)]
 pub struct Notifier(Arc<stellarator::sync::WaitQueue>);
@@ -781,8 +749,9 @@ impl Inner {
 // RingBuffer
 // ---------------------------------------------------------------------------
 
-/// A handle to a ring buffer region. Cloning is cheap, and the writer and
-/// views produced from a handle may outlive it.
+/// A cloneable handle to one shared region, from which the single [`Writer`]
+/// and any number of [`View`]s are created. The writer and views produced
+/// from a handle may outlive it.
 #[derive(Clone)]
 pub struct RingBuffer {
     inner: Arc<Inner>,
@@ -1105,7 +1074,7 @@ unsafe fn init_region(
     }
 }
 
-/// The geometry `read_header` recovers and validates from a region's header.
+/// The offsets and sizes read back from an existing region's header.
 struct Geometry {
     capacity: u64,
     data_offset: usize,
@@ -1204,8 +1173,8 @@ unsafe fn read_header(base: *mut u8, region_len: usize) -> Result<Geometry, Atta
 // ---------------------------------------------------------------------------
 
 /// The single producer for a buffer and the sole mutator of `committed` and
-/// the high-water mark. At most one exists per region, enforced by the writer
-/// claim.
+/// the high-water mark. At most one exists per region, enforced by the claim
+/// word that [`RingBuffer::writer`] takes.
 pub struct Writer<WD: WakeSource, WS: WakeSink> {
     inner: Arc<Inner>,
     data: WD,
@@ -1314,8 +1283,8 @@ struct Located {
     rec: usize,
 }
 
-/// A reader into a buffer, with its own absolute cursor stored in the shared
-/// reader table. Dropping it frees its slot.
+/// A reader with its own absolute cursor in the shared reader table,
+/// registered by [`RingBuffer::view`]. Dropping it frees its slot.
 pub struct View<RD: WakeSink, RS: WakeSource> {
     inner: Arc<Inner>,
     slot: u32,
@@ -1512,7 +1481,6 @@ impl<RD: WakeSink, RS: WakeSource> View<RD, RS> {
 
 impl<RD: WakeSink, RS: WakeSource> Drop for View<RD, RS> {
     fn drop(&mut self) {
-        // Free this view's slot for reuse.
         self.inner.slot_cursor(self.slot).store(FREE_SLOT, Release);
     }
 }

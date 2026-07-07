@@ -60,15 +60,16 @@ struct TickOut {
     count: u64,
 }
 
-/// Params carrying the full postcard contract (`Serialize + Deserialize +
-/// Schema`).
+/// Configuration for [`Counter`], carrying the full postcard contract
+/// (`Serialize + Deserialize + Schema`).
 #[derive(Serialize, Deserialize, Schema, Clone, Default, Debug, PartialEq)]
 struct CounterParams {
     #[serde(default)]
     start: u64,
 }
 
-/// Adds `start` to each input tick and republishes the sum.
+/// A minimal [`CyclicSystem`] that adds `start` to each input tick and
+/// republishes the sum.
 struct Counter {
     start: u64,
 }
@@ -418,7 +419,7 @@ fn abi_panic_is_contained() {
     drop((in_ring, out_ring, health_ring, log_ring));
 }
 
-/// `FswStatus::from_raw` sits on the trust boundary. The three declared
+/// [`FswStatus::from_raw`] sits on the trust boundary. The three declared
 /// discriminants round-trip; any other word folds to `Panicked` rather than
 /// being treated as a valid `repr(u32)` value.
 #[test]
@@ -443,7 +444,7 @@ fn from_raw_folds_out_of_range_to_panicked() {
 
 use crate::wiring::encode_kdl_params;
 
-/// `encode_kdl_params` with the `system`-node surface: `type=` and
+/// [`encode_kdl_params`] with the `system`-node surface: `type=` and
 /// `artifact=` reserved, one leading instance-name argument.
 fn encode_system_params(
     node_text: &str,
@@ -453,8 +454,8 @@ fn encode_system_params(
     encode_kdl_params(node_text, schema, system, &["type", "artifact"], 1)
 }
 
-/// Params spanning several field types, so byte equality is checked across
-/// more than one postcard encoding shape.
+/// A params struct whose fields span several postcard encoding shapes, so
+/// byte equality is checked across more than one of them.
 #[derive(Serialize, Deserialize, Schema, Debug, PartialEq)]
 struct MultiParams {
     start: u64,
@@ -591,9 +592,10 @@ fn kdl_schema_encode_unknown_property_is_clean_error() {
     }
 }
 
-/// Nested params expressed as children: a nested struct, a `Vec` in both the
-/// multi-arg and repeated-children spellings, and an absent `Option`, all
-/// byte-equal to the typed encoding.
+/// A params struct whose fields arrive as KDL children rather than
+/// properties, covering a nested struct, a `Vec` in both the multi-arg and
+/// repeated-children spellings, and an absent `Option`, all byte-equal to the
+/// typed encoding.
 #[derive(Serialize, Deserialize, Schema, Debug, PartialEq)]
 struct NestedParams {
     pid: PidParams,
@@ -667,8 +669,8 @@ use std::time::Duration;
 
 use crate::SystemDescriptor;
 
-/// A sequence occupant whose future waits about two sim-microseconds and then
-/// returns `Completed`.
+/// A [`SeqSystem`] whose future waits about two sim-microseconds and then
+/// returns [`Outcome::Completed`].
 struct WaitSeq;
 
 impl SeqSystem for WaitSeq {

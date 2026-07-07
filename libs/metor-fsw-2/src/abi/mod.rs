@@ -80,8 +80,8 @@ pub const FSW_ABI_VERSION: u32 = 4;
 // repr(C) handles
 // ---------------------------------------------------------------------------
 
-/// A ring region handle the host passes at bind time and the system turns back
-/// into a ring via [`RingBuffer::attach_raw`].
+/// A ring handle points a system at one host-mapped memory region, which the
+/// system attaches as a ring via [`RingBuffer::attach_raw`] at bind time.
 ///
 /// Capacity, data offset, reader-table offset, and reader limits are all
 /// self-describing in the region header, so the handle is just base, length,
@@ -98,13 +98,13 @@ pub struct FswRing {
     pub role: u8,
 }
 
-/// `FswRing::role` for an input port; the system registers a read-only `View`.
+/// [`FswRing::role`] for an input port; the system registers a read-only `View`.
 pub const ROLE_INPUT: u8 = 0;
-/// `FswRing::role` for an output port; the system is the buffer's sole `Writer`.
+/// [`FswRing::role`] for an output port; the system is the buffer's sole `Writer`.
 pub const ROLE_OUTPUT: u8 = 1;
 
-/// The lifecycle status an execute export returns. `repr(u32)` keeps it
-/// FFI-stable.
+/// A status word reports the outcome of one execute call back to the host.
+/// `repr(u32)` keeps it FFI-stable.
 #[repr(u32)]
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum FswStatus {
@@ -157,9 +157,9 @@ impl FswStatus {
     }
 }
 
-/// The host-owned sink a describe export hands its serialized bytes to. The
-/// system keeps ownership of its buffer and the host copies out of it, so no
-/// allocation crosses the boundary.
+/// A byte sink is the host callback a describe export feeds its serialized
+/// descriptor through. The system keeps ownership of its buffer and the host
+/// copies out of it, so no allocation crosses the boundary.
 pub type ByteSink = extern "C" fn(ctx: *mut c_void, buf: *const u8, len: usize);
 
 // ---------------------------------------------------------------------------
@@ -185,7 +185,8 @@ pub const SYM_DESTROY: &[u8] = b"fsw_destroy\0";
 // Serialized descriptor mirrors (postcard)
 // ---------------------------------------------------------------------------
 
-/// The serializable mirror of the [`PortSchema`] axis.
+/// A schema message describes a port's record type in a form that crosses the
+/// boundary as postcard bytes, the wire twin of [`PortSchema`].
 ///
 /// A Table port cannot cross by value because its `announce` is a closure over
 /// the static frame type, which does not exist on the host side. Its arm
@@ -213,8 +214,10 @@ pub enum PortSchemaMsg {
     },
 }
 
-/// The serializable mirror of [`PortDesc`]. A `.so` declares message ports and
-/// axis overrides exactly like a static system.
+/// A port message carries one port's declaration, its name, size, schema, and
+/// delivery axes, across the boundary as postcard bytes, the wire twin of
+/// [`PortDesc`]. A `.so` declares message ports and axis overrides exactly
+/// like a static system.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct PortDescMsg {
     /// The port name; the `&'static str` is recovered by leaking at load.
@@ -231,9 +234,11 @@ pub struct PortDescMsg {
     pub telemetered: bool,
 }
 
-/// The serializable mirror of [`SystemDescriptor`]. It carries the `Params`
-/// schema rather than the `Params` type, so the host can encode params from
-/// configuration without linking against the system.
+/// A descriptor message ships a system's whole self-description, name, kind,
+/// ports, and params schema, to the host as postcard bytes, the wire twin of
+/// [`SystemDescriptor`]. It carries the `Params` schema rather than the
+/// `Params` type, so the host can encode params from configuration without
+/// linking against the system.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct SystemDescriptorMsg {
     pub name: String,
@@ -439,12 +444,13 @@ impl SystemDescriptorMsg {
 // RawBinder
 // ---------------------------------------------------------------------------
 
-/// The `.so`-side [`RingSource`], a cursor over the host-provided [`FswRing`]
-/// arrays.
+/// A raw binder walks the host-provided [`FswRing`] arrays, attaching each
+/// region as a ring while the port bundles bind; it is the `.so`-side
+/// [`RingSource`].
 ///
-/// `next_output` and `next_input` pop the next handle and attach it, walking in
-/// the same positional order the descriptor lists the ports. Every wake
-/// endpoint is `NoWake`, so the generic wake parameters are default-constructed.
+/// `next_output` and `next_input` pop the next handle in the same positional
+/// order the descriptor lists the ports. Every wake endpoint is `NoWake`, so
+/// the generic wake parameters are default-constructed.
 pub struct RawBinder<'a> {
     inputs: slice::Iter<'a, FswRing>,
     outputs: slice::Iter<'a, FswRing>,
@@ -506,8 +512,9 @@ impl<'a> RingSource for RawBinder<'a> {
 // Opaque state + generic export helpers
 // ---------------------------------------------------------------------------
 
-/// The opaque state a cyclic system's lifecycle threads, boxed by [`run_create`]
-/// and dropped by [`run_destroy`].
+/// The heap allocation behind the opaque state pointer, holding a cyclic
+/// system between export calls. [`run_create`] boxes it and [`run_destroy`]
+/// drops it.
 ///
 /// `pending` holds the constructed system until [`run_bind_init`] binds its
 /// bundles and builds the runner, type-erased to [`CyclicSlot`] so `run_execute`
@@ -743,8 +750,8 @@ where
 // Sequence occupants
 // ---------------------------------------------------------------------------
 
-/// The opaque state a sequence occupant's lifecycle threads, the future-driven
-/// twin of [`AbiState`].
+/// The heap allocation behind a sequence occupant's opaque state pointer, the
+/// future-driven twin of [`AbiState`].
 ///
 /// `params` holds the decoded params until [`run_seq_bind_init`] consumes them.
 /// `bound` holds the owned future (with the user ports moved inside it) plus

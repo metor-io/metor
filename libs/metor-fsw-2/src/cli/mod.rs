@@ -43,7 +43,7 @@ use crate::wiring::{
 // clap command tree
 // ---------------------------------------------------------------------------
 
-/// `metor-fsw`: build, package, and run metor-fsw missions.
+/// The fully parsed command line, produced from argv by [`run`].
 #[derive(Parser, Debug)]
 #[command(
     name = "metor-fsw",
@@ -212,9 +212,10 @@ fn cmd_package(args: PackageArgs) -> miette::Result<()> {
     Ok(())
 }
 
-/// `run`: load the wiring, apply flag overrides, resolve against the built-ins
-/// registry, and drive the coordinator on the runtime. Prints a config banner
-/// up front and a live progress heartbeat while the mission runs.
+/// `run`: load the wiring, apply flag overrides, resolve against
+/// [`Registry::with_builtins`], and drive the coordinator on the runtime.
+/// Prints a config banner ([`print_run_banner`]) up front and a live progress
+/// [`heartbeat`] while the mission runs.
 fn cmd_run(args: RunArgs) -> miette::Result<()> {
     let mut wiring = load_run_wiring(&args)?;
     apply_overrides(&mut wiring, &args)?;
@@ -347,7 +348,7 @@ fn specs_of_type<'w>(wiring: &'w Wiring, ty: &str) -> Vec<&'w SystemSpec> {
 }
 
 /// Pull the `addr=` property back out of a built-in link spec's params node,
-/// the same node text `resolve` re-decodes. Banner display only, never
+/// the same node text [`resolve`] re-decodes. Banner display only, never
 /// load-bearing.
 fn spec_addr(spec: &SystemSpec) -> Option<SocketAddr> {
     let crate::wiring::ParamSource::Kdl(text) = &spec.params else {
@@ -364,7 +365,7 @@ fn spec_addr(spec: &SystemSpec) -> Option<SocketAddr> {
 }
 
 /// Print the live cycle counter every couple of seconds so a long run visibly
-/// advances. Cancelled when its `drop_guard` drops at the end of `run`.
+/// advances. Cancelled when its `drop_guard` drops at the end of [`cmd_run`].
 async fn heartbeat(progress: Arc<AtomicU64>, total: Option<usize>) {
     let start = Instant::now();
     loop {
@@ -414,7 +415,7 @@ fn is_bundle(path: &Path) -> bool {
     path.is_dir() || path.extension().is_some_and(|e| e == "bundle")
 }
 
-/// Apply `run`'s override flags onto the loaded [`Wiring`] before `resolve`.
+/// Apply `run`'s override flags onto the loaded [`Wiring`] before [`resolve`].
 /// A flag always beats the KDL.
 fn apply_overrides(wiring: &mut Wiring, args: &RunArgs) -> miette::Result<()> {
     if args.wall {

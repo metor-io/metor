@@ -18,7 +18,8 @@ use std::process::Command;
 
 use super::model::Wiring;
 
-/// Options for the build driver.
+/// Knobs applied to every `cargo build` invocation run by
+/// [`build_artifacts`].
 #[derive(Clone, Debug, Default)]
 pub struct BuildOptions {
     /// Build the `--release` profile instead of the default debug profile.
@@ -27,7 +28,7 @@ pub struct BuildOptions {
     pub extra_args: Vec<String>,
 }
 
-/// A build-driver failure.
+/// Why [`build_artifacts`] could not produce a library path for an artifact.
 #[derive(Debug, thiserror::Error)]
 pub enum BuildError {
     /// `cargo` could not be spawned.

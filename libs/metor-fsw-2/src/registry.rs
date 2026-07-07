@@ -10,7 +10,8 @@
 //!
 //! Frames and message channels share a single keyspace, so a name collision
 //! within an instance is detectable rather than silently shadowed. `build()`
-//! rejects a duplicate key with `WireError::DuplicateRegistryKey`.
+//! rejects a duplicate key with
+//! [`WireError::DuplicateRegistryKey`](crate::WireError::DuplicateRegistryKey).
 //!
 //! The registry never hands out a raw [`RingBuffer`]. Every reader goes
 //! through [`RegistryEntry::view`], which claims a slot from the buffer's
@@ -63,7 +64,8 @@ pub struct RegistryEntry {
     /// How a tap decodes this entry's records.
     pub schema: EntrySchema,
     /// How a broad reader drains this entry, coalescing to the newest record
-    /// (`Snapshot`) or taking every record in order (`Log`).
+    /// ([`Snapshot`](Delivery::Snapshot)) or taking every record in order
+    /// ([`Log`](Delivery::Log)).
     pub delivery: Delivery,
     /// Whether [`AllOutputs`] exposes this entry. Untelemetered entries stay
     /// registered and remain visible by key through the full [`Registry`],

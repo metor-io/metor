@@ -103,7 +103,8 @@ pub(crate) fn params_value(
 // The error
 // ---------------------------------------------------------------------------
 
-/// The deserializer-internal error, converted to [`LoadError`] at the entry
+/// A deserialization failure carrying the most precise source span and
+/// property name known so far, converted to [`LoadError`] at the entry
 /// points.
 #[derive(Debug)]
 pub(crate) struct DeError {
@@ -309,7 +310,8 @@ impl de::Error for DeError {
 // The node deserializer
 // ---------------------------------------------------------------------------
 
-/// Deserializes any `T: Deserialize` from one KDL node's parameters.
+/// A [`Deserializer`] over one KDL node's parameters, presenting the node's
+/// properties and children as the fields of a map or struct.
 pub(crate) struct KdlNodeDe<'de> {
     node: &'de KdlNode,
     /// Property keys the caller consumes itself, never yielded as params.
@@ -459,7 +461,9 @@ impl<'de> Deserializer<'de> for KdlNodeDe<'de> {
     }
 }
 
-/// Map access over a node's parameters.
+/// Feeds each parameter collected by [`surface`] to a map visitor, handing
+/// the value to a [`FieldDe`] and tagging its errors with the key's name and
+/// span.
 struct NodeMapAccess<'de> {
     iter: std::vec::IntoIter<(&'de str, SourceSpan, FieldSource<'de>)>,
     pending: Option<(&'de str, SourceSpan, FieldSource<'de>)>,
@@ -498,7 +502,8 @@ impl<'de> MapAccess<'de> for NodeMapAccess<'de> {
 // The value-position deserializer (one field)
 // ---------------------------------------------------------------------------
 
-/// Deserializes one field's value.
+/// A [`Deserializer`] over a single parameter's value, whichever
+/// [`FieldSource`] it came from.
 struct FieldDe<'de> {
     source: FieldSource<'de>,
     key: &'de str,
@@ -541,7 +546,8 @@ fn visit_scalar<'de, V: Visitor<'de>>(
     result.map_err(|e: DeError| e.with_span(span))
 }
 
-/// The shape of a child node's own contents.
+/// Whether a child node's own contents read as a nested map or as
+/// positional arguments.
 enum NodeShape {
     /// Properties and/or children, read as a nested map.
     Nested,
@@ -916,7 +922,7 @@ impl<'de> Deserializer<'de> for FieldDe<'de> {
     }
 }
 
-/// Sequence elements drawn from child nodes.
+/// A [`SeqAccess`] yielding one element per child node.
 struct NodesSeq<'de> {
     iter: std::vec::IntoIter<&'de KdlNode>,
     key: &'de str,
@@ -949,7 +955,8 @@ impl<'de> SeqAccess<'de> for NodesSeq<'de> {
     }
 }
 
-/// Sequence elements drawn from one child's positional arguments.
+/// A [`SeqAccess`] yielding one element per positional argument of a single
+/// child node.
 struct ArgsSeq<'de> {
     iter: std::vec::IntoIter<&'de KdlEntry>,
     key: &'de str,

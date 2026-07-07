@@ -33,9 +33,11 @@ use super::model::{
     InitialOccupantSpec, ParamSource, SlotInitState, SlotSpec, SystemSpec, Wiring,
 };
 
-/// Fluent builder for a [`Wiring`]. Set the coordinator, declare artifacts,
-/// add systems and slots through their sub-builders, wire edges, and finish
-/// with [`build`](Self::build).
+/// Accumulates coordinator settings, artifact declarations, systems, slots,
+/// and edges, then assembles them into a [`Wiring`] with
+/// [`build`](Self::build). Systems and slots are declared through the
+/// [`SystemSpecBuilder`] and [`SlotSpecBuilder`] sub-builders; everything
+/// else chains directly on this type.
 pub struct WiringBuilder {
     coordinator: CoordinatorSpec,
     artifacts: Vec<Artifact>,
@@ -236,8 +238,10 @@ impl WiringBuilder {
     }
 }
 
-/// Sub-builder for one slot, returned by [`WiringBuilder::slot`]. It owns the
-/// parent builder, so the chain flows back through [`end`](Self::end).
+/// Declares one runtime-loadable slot as a [`SlotSpec`], covering its port
+/// contract, allowed occupants, and startup occupant. Returned by
+/// [`WiringBuilder::slot`]; it owns the parent builder, so the chain flows
+/// back through [`end`](Self::end).
 pub struct SlotSpecBuilder {
     parent: WiringBuilder,
     spec: SlotSpec,
@@ -300,9 +304,10 @@ impl SlotSpecBuilder {
     }
 }
 
-/// Sub-builder for one system instance, returned by [`WiringBuilder::system`].
-/// It owns the parent builder, so the chain flows back through
-/// [`end`](Self::end).
+/// Declares one system instance as a [`SystemSpec`], covering its type, how
+/// it resolves (statically or from a loaded artifact), and its params.
+/// Returned by [`WiringBuilder::system`]; it owns the parent builder, so the
+/// chain flows back through [`end`](Self::end).
 pub struct SystemSpecBuilder {
     parent: WiringBuilder,
     name: String,

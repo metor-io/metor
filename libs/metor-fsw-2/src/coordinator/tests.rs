@@ -1,7 +1,7 @@
 //! Coordinator acceptance tests: a two-cyclic-system pipeline end to end,
 //! backpressure from an idle consumer, an async system fed through its private
 //! copy-in buffer, build-time wiring validation, and the init barrier. Every
-//! graph here is registered and wired through the `Coordinator` builder.
+//! graph here is registered and wired through the [`Coordinator`] builder.
 
 use std::cell::RefCell;
 use std::rc::Rc;
@@ -811,7 +811,6 @@ struct OtherEvent {
     x: u32,
 }
 
-// A wired message port needs an explicit, stable name.
 impl crate::NamedMsg for TestEvent {
     const NAME: &'static str = "TestEvent";
 }

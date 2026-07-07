@@ -61,16 +61,18 @@ use crate::message::{MsgIn, MsgOut};
 use crate::registry::{AllOutputs, EntrySchema};
 use crate::system::{BuildSystem, CyclicSystem, Out, System};
 
-/// Params for [`AlarmSystem`], one [`AlarmSpec`] per repeated `alarm` child
-/// node. An alarm-less instance is legal and evaluates nothing.
+/// The set of alarms one [`AlarmSystem`] instance evaluates, one
+/// [`AlarmSpec`] per repeated `alarm` child node. An alarm-less instance is
+/// legal and evaluates nothing.
 #[derive(Deserialize, Debug, Clone, Default)]
 pub struct AlarmsParams {
     #[serde(default)]
     pub alarm: Vec<AlarmSpec>,
 }
 
-/// One configured limit alarm, validated during deserialization (via
-/// `RawAlarmSpec`).
+/// A limit alarm over a single component value, carrying the bands it
+/// breaches and the debounce and latching behavior that govern its
+/// transitions. Validated during deserialization (via `RawAlarmSpec`).
 #[derive(Deserialize, Debug, Clone)]
 #[serde(try_from = "RawAlarmSpec")]
 pub struct AlarmSpec {
@@ -93,16 +95,18 @@ pub struct AlarmSpec {
     pub severity: Severity,
 }
 
-/// The monitored component, as an instance-prefixed component id text
-/// (`"plant.sensors.gyro_b"`) plus an optional element index into its shape.
+/// The component value an [`AlarmSpec`] monitors, as an instance-prefixed
+/// component id text (`"plant.sensors.gyro_b"`) plus an optional element
+/// index into its shape.
 #[derive(Deserialize, Debug, Clone)]
 pub struct TargetSpec {
     pub component: String,
     pub element: Option<usize>,
 }
 
-/// One severity band. Breach is `value > above` or `value < below`; at least
-/// one side must be configured (validated on the owning spec).
+/// A pair of optional thresholds bounding acceptable values at one severity.
+/// Breach is `value > above` or `value < below`; at least one side must be
+/// configured (validated on the owning [`AlarmSpec`]).
 #[derive(Deserialize, Debug, Clone, Copy)]
 pub struct BandSpec {
     pub above: Option<f64>,
@@ -251,9 +255,9 @@ impl AlarmSpec {
 // The evaluation state machine
 // ---------------------------------------------------------------------------
 
-/// What one evaluation step (or an ack) asks the caller to emit. The caller
-/// owns the wire types, since it has the value and target name the messages
-/// carry.
+/// What one [`AlarmEval`] step (or an ack) asks the caller to emit. The
+/// caller owns the wire types, since it has the value and target name the
+/// messages carry.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum EvalEvent {
     /// A new occurrence, or, when `occurrence` matches the already-active
@@ -267,7 +271,8 @@ pub(crate) enum EvalEvent {
     },
 }
 
-/// One active occurrence's lifecycle state.
+/// The occurrence currently raised for one alarm, and how far it has moved
+/// through recovery and acknowledgment.
 #[derive(Debug)]
 struct Active {
     occurrence: OccurrenceId,
@@ -278,9 +283,10 @@ struct Active {
     recovered: bool,
 }
 
-/// Per-alarm evaluation state, pure and port-free. See the module docs for
-/// the breach/in-band/dead-zone classification and the debounce rules;
-/// [`AlarmSystem`] turns the resulting events into wire messages.
+/// The debounced state machine deciding when one alarm raises and clears,
+/// pure and port-free. See the module docs for the breach/in-band/dead-zone
+/// classification and the debounce rules; [`AlarmSystem`] turns the
+/// resulting [`EvalEvent`]s into wire messages.
 #[derive(Debug)]
 pub(crate) struct AlarmEval {
     warning: Option<BandSpec>,
@@ -404,18 +410,19 @@ impl AlarmEval {
 // The system
 // ---------------------------------------------------------------------------
 
-/// Inputs: operator acks over an ordinary message edge
-/// (`connect "uplink" -> "alarms" msg="AlarmAck"`). Zero producers is a
-/// legal, ack-less mission.
+/// Operator acks flowing into [`AlarmSystem`] over an ordinary message edge
+/// (`connect "uplink" -> "alarms" msg="AlarmAck"`), its only input. Zero
+/// producers is a legal, ack-less mission.
 #[derive(crate::SystemInput)]
 pub struct AlarmIn {
     acks: MsgIn<AlarmAck>,
 }
 
-/// Outputs: ordinary telemetered message ports, plus the receive-all registry
-/// tap the targets resolve against. `AllOutputs` rides the output bundle
-/// rather than the input because `init` receives only the outputs, and
-/// resolving and claiming there means cycle-1 values already evaluate.
+/// The telemetered message ports [`AlarmSystem`] publishes on, plus the
+/// receive-all registry tap its targets resolve against. [`AllOutputs`]
+/// rides the output bundle rather than the input because `init` receives
+/// only the outputs, and resolving and claiming there means cycle-1 values
+/// already evaluate.
 #[derive(crate::SystemOutput)]
 pub struct AlarmOut {
     defs: MsgOut<AlarmDef>,
@@ -424,9 +431,9 @@ pub struct AlarmOut {
     all: AllOutputs,
 }
 
-/// One configured alarm at runtime: its broadcast def, resolved target
-/// identity, and evaluation state. `enabled` drops on a boot-resolution
-/// failure, surfaced through health rather than a panic.
+/// A configured alarm bound to its resolved target identity and live
+/// [`AlarmEval`] state. `enabled` drops on a boot-resolution failure,
+/// surfaced through health rather than a panic.
 struct AlarmRuntime {
     spec: AlarmSpec,
     component_id: ComponentId,
@@ -435,10 +442,11 @@ struct AlarmRuntime {
     enabled: bool,
 }
 
-/// One watched registry entry: the claimed read view, the entry's
-/// instance-prefixed vtable the per-cycle extraction walks, and the alarms it
-/// feeds. There is one view per distinct entry, however many alarms target
-/// its components, because each claimed view costs a reader slot on the ring.
+/// A claimed read view over one watched registry entry, together with the
+/// entry's instance-prefixed vtable the per-cycle extraction walks and the
+/// alarms it feeds. There is one view per distinct entry, however many
+/// alarms target its components, because each claimed view costs a reader
+/// slot on the ring.
 struct Watch {
     vtable: VTable,
     view: View<NoWake, NoWake>,
@@ -494,8 +502,6 @@ impl System for AlarmSystem {
     type Output = Out<AlarmOut>;
     const NAME: &'static str = "alarms";
 
-    /// Resolve every target and claim the watch views. The registry is frozen
-    /// by build, so `init` sees the whole graph.
     fn init(&mut self, output: &mut Self::Output) {
         self.resolve_targets(output);
     }

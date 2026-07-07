@@ -12,7 +12,7 @@ use std::time::Duration;
 use metor_proto::types::Timestamp;
 
 use crate::sequence::{
-    Outcome, SeqClock, SeqSystem, Step, Wait, aborted, current, progress, wait, with_clock,
+    aborted, current, progress, wait, with_clock, Outcome, SeqClock, SeqSystem, Step, Wait,
 };
 use crate::{
     Frame, Input, Output, SequenceStatus, SlotControlIn, SystemHealth, SystemKind, SystemLog,

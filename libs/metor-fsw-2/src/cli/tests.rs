@@ -12,7 +12,7 @@ fn parse_args(argv: &[&str]) -> Cli {
     Cli::try_parse_from(argv).expect("parse argv")
 }
 
-/// Parse an argv and unwrap the `run` subcommand's arguments.
+/// Parse an argv and unwrap the `run` subcommand's [`RunArgs`].
 fn run_args(argv: &[&str]) -> RunArgs {
     match parse_args(argv).command {
         Command::Run(a) => a,
