@@ -5,6 +5,8 @@ use proc_macro2::{Span, TokenStream as TokenStream2};
 use quote::quote;
 use syn::{DeriveInput, Generics, Ident};
 
+/// Input to the `Decomponentize` derive, parsed from the struct and its
+/// `#[fsw(...)]` attributes.
 #[derive(Debug, FromDeriveInput)]
 #[darling(attributes(fsw, metor_fsw), supports(struct_named))]
 pub struct Decomponentize {

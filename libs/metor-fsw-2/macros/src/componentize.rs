@@ -4,8 +4,9 @@ use proc_macro2::TokenStream as TokenStream2;
 use quote::quote;
 use syn::{DeriveInput, Generics, Ident};
 
-/// Input to the `Componentize` derive, parsed from the struct and its
-/// `#[fsw(...)]` attributes.
+/// The parsed view of a frame struct that drives its `Componentize` impl.
+/// Darling extracts it from the item and its `#[fsw(...)]` attributes, with
+/// per-field options landing in [`Field`](crate::Field).
 #[derive(Debug, FromDeriveInput)]
 #[darling(attributes(fsw, metor_fsw), supports(struct_named))]
 pub struct Componentize {

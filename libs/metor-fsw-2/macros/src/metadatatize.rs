@@ -5,6 +5,8 @@ use proc_macro2::TokenStream as TokenStream2;
 use quote::quote;
 use syn::{DeriveInput, Generics, Ident};
 
+/// The attribute arguments the derive understands, decoded by darling from
+/// the input item together with its identity and fields.
 #[derive(Debug, FromDeriveInput)]
 #[darling(attributes(fsw, metor_fsw), supports(struct_named, enum_unit))]
 pub struct Metadatatize {

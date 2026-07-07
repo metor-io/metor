@@ -16,8 +16,8 @@ use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
-/// The full description of a wired mission: coordinator config, the `cdylib`
-/// artifacts it loads, the system instances, the slots, and the edges.
+/// A plain-data description of a complete mission, naming the systems that
+/// run, where their code and params come from, and how their ports connect.
 ///
 /// Produced by [`parse`](super::parse) or [`WiringBuilder`](super::WiringBuilder),
 /// consumed by [`resolve`](super::resolve). The telemetry downlink and the

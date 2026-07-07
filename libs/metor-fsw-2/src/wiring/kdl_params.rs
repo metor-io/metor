@@ -29,7 +29,7 @@ use miette::SourceSpan;
 use postcard_schema::schema::owned::{OwnedDataModelType, OwnedNamedType};
 use serde_json::{Map, Value};
 
-use super::{LoadError, de};
+use super::{de, LoadError};
 
 /// Encodes a system node's KDL params into the postcard bytes described by
 /// `schema`.
@@ -73,7 +73,8 @@ pub fn encode_kdl_params(
         .map_err(|e| encode_err(format!("dynamic postcard encode failed: {e:?}")))
 }
 
-/// A conformance failure, either a spanned params diagnostic or a schema shape
+/// What the schema walk reports when a value does not fit, either a spanned
+/// params diagnostic ready to surface as-is or a description of a schema shape
 /// the walk cannot express (reported as [`LoadError::DlParamEncode`]).
 enum Conform {
     Load(Box<LoadError>),
@@ -86,7 +87,8 @@ impl From<LoadError> for Conform {
     }
 }
 
-/// Conforms a params object to a struct (or unit) schema.
+/// Checks a params object against a struct (or unit) schema, producing the
+/// object postcard-dyn expects for that schema.
 ///
 /// Every key must name a schema field and every non-`Option` field must be
 /// present; there are no defaults. Absent `Option` fields become explicit

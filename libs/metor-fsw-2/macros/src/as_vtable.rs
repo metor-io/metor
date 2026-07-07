@@ -5,8 +5,8 @@ use quote::quote;
 use syn::{Attribute, Meta};
 use syn::{DeriveInput, Generics, Ident};
 
-/// Derive input for [`as_vtable_impl`], parsed from the shared
-/// `#[fsw(...)]`/`#[metor_fsw(...)]` attribute surface.
+/// The parsed shape of a deriving type, carrying its fields and any
+/// `#[fsw(...)]`/`#[metor_fsw(...)]` arguments for [`as_vtable_impl`].
 #[derive(Debug, FromDeriveInput)]
 #[darling(
     attributes(fsw, metor_fsw),

@@ -117,7 +117,9 @@ pub enum ClockMode {
     Simulated { dt: Duration },
 }
 
-/// Coordinator-wide configuration.
+/// The settings a whole graph is built under. They fix the loop's pace, the
+/// depth of buffers without a rate hint, the [`ClockMode`] stamping each
+/// cycle, and the spare reader slots every ring keeps.
 #[derive(Clone, Copy, Debug)]
 pub struct CoordinatorConfig {
     /// The single global cycle rate the loop holds under a
@@ -148,15 +150,16 @@ impl Default for CoordinatorConfig {
     }
 }
 
-/// A handle to a registered system, returned by `add_cyclic`/`add_async` and
-/// used to address its ports in [`PortRef`].
+/// An opaque index naming one registered system. The builder's `add_*`
+/// methods return it, and a [`PortRef`] embeds it to address that system's
+/// ports.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct SystemHandle {
     id: usize,
 }
 
-/// Addresses one port as a `(system, port)` pair, both taken from the system's
-/// derived `SystemDescriptor`.
+/// A `(system, port)` pair addressing one port for wiring, both halves taken
+/// from the system's registered [`SystemDescriptor`].
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct PortRef {
     pub system: SystemHandle,
@@ -181,7 +184,9 @@ impl PortRef {
     }
 }
 
-/// A wiring error caught at build time, before any byte flows.
+/// A defect in the declared graph, reported by
+/// [`connect`](CoordinatorBuilder::connect) or
+/// [`build`](CoordinatorBuilder::build) before any byte flows.
 ///
 /// Not `Eq`: [`InvalidCycleRate`](WireError::InvalidCycleRate) carries the
 /// offending `f64` rate so the message can name it.
@@ -409,7 +414,8 @@ impl StopReason {
     }
 }
 
-/// A cyclic slot's lifecycle state, shared by every slot kind. A static
+/// Where a cyclic slot sits in its lifecycle, from empty through running to
+/// done or hard-stopped. A static
 /// [`CyclicRunner`](crate::CyclicRunner) and a build-time
 /// [`DlSlot`](crate::dl::DlSlot) only ever inhabit `Running`/`Stopped` (once
 /// `Stopped` they are never cleared); the runtime [`SlotRunner`](slot) uses all
@@ -461,16 +467,17 @@ impl SlotState {
     }
 }
 
-/// One stopped cyclic system, surfaced through [`Coordinator::stopped`] and the
-/// coordinator status frame.
+/// The name and stop reason of one hard-stopped cyclic system, surfaced
+/// through [`Coordinator::stopped`] and the coordinator status frame.
 #[derive(Clone, Copy, Debug)]
 pub struct StoppedSystem {
     pub name: &'static str,
     pub reason: StopReason,
 }
 
-/// The per-system slot trait object the coordinator drives; implemented for
-/// [`CyclicRunner`](crate::CyclicRunner) in `system.rs`.
+/// One position in the cyclic step loop. The coordinator inits, steps, and
+/// shuts it down without knowing the concrete system inside;
+/// [`CyclicRunner`](crate::CyclicRunner) is the typed implementation.
 pub(crate) trait CyclicSlot {
     fn init(&mut self);
     fn step(&mut self, now: Timestamp);
@@ -531,10 +538,10 @@ struct CoordinatorStatus {
 // Ring registry
 // ---------------------------------------------------------------------------
 
-/// What a buffer carries, for diagnostics and to make ownership explicit. The
-/// variant payloads are debug-only (rendered via `Debug`, read by nothing),
-/// which is what the `allow` covers; the variants themselves are matched
-/// (`output_instances`).
+/// The place a ring occupies in the graph, either a system's declared output
+/// buffer or a dedicated input-side ring. The variant payloads are debug-only
+/// (rendered via `Debug`, read by nothing), which is what the `allow` covers;
+/// the variants themselves are matched (`output_instances`).
 #[allow(dead_code)]
 #[derive(Clone, Copy, Debug)]
 enum BufferRole {
@@ -569,11 +576,10 @@ struct RingTable {
 // Async plumbing
 // ---------------------------------------------------------------------------
 
-/// A private-buffer copy-in job: mirrors the newest upstream record (snapshot
-/// semantics; the copy-in exists only for snapshot inputs) into the async
-/// system's private buffer, at most once per new upstream commit. The record
-/// is borrowed in place off the upstream ring and written through, with no
-/// intermediate buffer.
+/// One mirroring job that copies the newest upstream record into an async
+/// system's private buffer, at most once per new upstream commit. It exists
+/// only for snapshot inputs; the record is borrowed in place off the upstream
+/// ring and written through, with no intermediate buffer.
 struct CopyIn {
     upstream: View<NoWake, NoWake>,
     /// The private ring's sole writer. The matched data `Notifier` wakes the
@@ -598,14 +604,15 @@ struct LaunchCtx {
     go_flag: Arc<AtomicBool>,
 }
 
-/// A bound async system ready to be spawned once. Erased so the coordinator
-/// can hold a heterogeneous set.
+/// Spawns a bound async system onto its own task, exactly once. Erased so the
+/// coordinator can hold a heterogeneous set.
 trait AsyncLauncher {
     fn launch(self: Box<Self>, ctx: LaunchCtx) -> JoinHandle<()>;
 }
 
-/// A bound async system. Its `run` future borrows all three for the loop, so
-/// they move into the spawned task together.
+/// An async system packaged with its bound input and output ports. Its `run`
+/// future borrows all three for the loop, so they move into the spawned task
+/// together.
 struct AsyncSlot<S: AsyncSystem> {
     system: S,
     input: S::Input,

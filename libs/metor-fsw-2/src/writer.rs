@@ -27,7 +27,7 @@ use crate::frame::Frame;
 /// (4-byte length, 1 type byte, 2-byte id, 1 request-id byte).
 const TABLE_BASE: usize = 8;
 
-/// An invalid map key, reported by [`FrameWriter::map`].
+/// The reason [`FrameWriter::map`] rejected a key.
 ///
 /// Map keys become path segments of the dotted component path, so a key must
 /// be non-empty and must not itself contain a dot.
@@ -41,7 +41,9 @@ pub enum KeyError {
     EmptyKey,
 }
 
-/// Builds the table bytes for a frame `F` over a [`LenPacket`].
+/// A writer that serializes one frame `F` into a contiguous table inside a
+/// growable [`LenPacket`], fixed region first and dynamic members appended
+/// to the trailer.
 pub struct FrameWriter<F> {
     packet: LenPacket,
     /// Index in `packet.inner` where the fixed region begins.
@@ -175,7 +177,8 @@ impl<F: Frame + IntoBytes + Immutable> FrameWriter<F> {
     }
 }
 
-/// Collects list elements before they are copied back-to-back into the trailer.
+/// A staging buffer that accumulates a list's elements as raw bytes until
+/// [`FrameWriter::list`] copies them back-to-back into the trailer.
 pub struct ListWriter<T> {
     bytes: Vec<u8>,
     count: usize,
@@ -208,7 +211,8 @@ impl<T: IntoBytes + Immutable> ListWriter<T> {
     }
 }
 
-/// Collects map entries before they are serialized into the trailer.
+/// A staging buffer that accumulates a map's entries until
+/// [`FrameWriter::map`] serializes them into the trailer.
 ///
 /// Keys are validated on insert and the first rejection is surfaced by
 /// [`FrameWriter::map`].

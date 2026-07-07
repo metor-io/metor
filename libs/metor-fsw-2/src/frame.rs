@@ -4,12 +4,14 @@ use metor_fsw::{AsVTable, Componentize, Decomponentize, Metadatatize};
 use metor_proto::types::{ComponentId, Timestamp};
 use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
 
-/// A `#[repr(C)]` struct whose fields are components sharing one logical
-/// timestamp.
+/// A frame groups components into one `#[repr(C)]` struct whose fields share
+/// a single logical timestamp.
 ///
-/// `Frame` bundles the four component traits and adds the frame's name, its
-/// [`ComponentId`], and an accessor for the shared timestamp. Implement it
-/// with `#[derive(Frame)]`, which derives the component traits as well.
+/// `Frame` bundles the four component traits ([`AsVTable`], [`Metadatatize`],
+/// [`Componentize`], [`Decomponentize`]) and adds the frame's name, its
+/// [`ComponentId`], and the [`timestamp`](Frame::timestamp) accessor.
+/// Implement it with `#[derive(Frame)]`, which derives the component traits
+/// as well.
 ///
 /// The zerocopy traits are supertraits because a frame's `#[repr(C)]` bytes
 /// are its wire bytes. Requiring them here turns a forgotten zerocopy derive

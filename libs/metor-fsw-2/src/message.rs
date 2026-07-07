@@ -32,18 +32,18 @@ use serde::de::DeserializeOwned;
 use crate::binder::RingSource;
 use crate::descriptor::PortDesc;
 
-/// A [`Msg`] with a stable name token, usable as a wired port.
+/// A message type a config file can select by a stable string token.
 ///
-/// `NAME` is the token a config file writes to select this message type and
+/// `NAME` is the token a config file writes to pick this message type and
 /// the channel half of the registry key `<instance>.<NAME>`. It is declared
 /// explicitly rather than derived from the Rust type name so that renaming
-/// the type cannot silently change the wire token.
+/// the type cannot silently change the wire token. Resolution from token to
+/// type happens through a [`MsgTable`].
 pub trait NamedMsg: Msg {
     /// The stable wire, config, and registry token for this message type.
     const NAME: &'static str;
 }
 
-// The well-known message set every registry's MsgTable starts with.
 impl NamedMsg for SequenceCommand {
     const NAME: &'static str = "SequenceCommand";
 }
@@ -69,11 +69,13 @@ impl NamedMsg for AlarmAck {
     const NAME: &'static str = "AlarmAck";
 }
 
-/// The registered message types, keyed by [`NamedMsg::NAME`].
+/// A lookup from message name tokens to packet ids.
 ///
-/// Config tokens resolve against this table. The stored name is `&'static`,
-/// so a resolved entry doubles as a minted port's [`PortDesc`] name without
-/// leaking a string.
+/// Config tokens resolve against this table, and every registry's table
+/// starts with the well-known sequence and alarm messages whose [`NamedMsg`]
+/// impls live in this module. The stored name is `&'static`, so a resolved
+/// entry doubles as a minted port's [`PortDesc`] name without leaking a
+/// string.
 #[derive(Default, Clone)]
 pub struct MsgTable {
     map: std::collections::HashMap<&'static str, PacketId>,
@@ -121,8 +123,8 @@ pub fn split_record(rec: &[u8]) -> Option<(PacketId, &[u8])> {
 // MsgOut
 // ---------------------------------------------------------------------------
 
-/// One owned message output, a single [`Writer`] into a byte ring, typed on
-/// the [`Msg`] type `M` it emits.
+/// A [`Writer`] that serializes values of a single [`Msg`] type `M` onto a
+/// byte ring, one self-describing record per emit.
 ///
 /// The message twin of [`Output<F>`](crate::Output), with the same
 /// single-writer discipline and the same `descriptor()`/`bind()` port
@@ -218,8 +220,8 @@ where
     }
 }
 
-/// A message output whose port is marked untelemetered, so telemetry taps
-/// never echo inbound commands back out.
+/// A [`MsgOut`] whose port is marked untelemetered, so telemetry taps never
+/// echo inbound commands back out.
 ///
 /// This is an alias, not a distinct type; the flag lives on the descriptor.
 /// The `SystemInput`/`SystemOutput` derives and `#[system]` recognize the
@@ -235,10 +237,10 @@ pub type CommandOut<M, WD = NoWake, WS = NoWake> = MsgOut<M, WD, WS>;
 // MsgFanOut
 // ---------------------------------------------------------------------------
 
-/// N raw message writers, one per config-minted output.
+/// A bank of raw ring writers, one per message output minted from an
+/// instance's config rather than declared in its bundle type.
 ///
-/// The dynamic-count sibling of [`MsgOut`] for a system whose message outputs
-/// come from its instance config rather than its bundle type. The minted
+/// The dynamic-count sibling of [`MsgOut`]. The minted
 /// ports must be the trailing outputs of the instance descriptor, because
 /// [`bind`](Self::bind) drains every ring the [`RingSource`] still holds; a
 /// bundle binds its static ports first and the fan-out last. The writer at
@@ -304,8 +306,8 @@ impl MsgFanOut {
 // MsgIn
 // ---------------------------------------------------------------------------
 
-/// One owned message input that decodes `(id, postcard)` records into the
-/// [`Msg`] type `M`.
+/// The consuming half of a message channel, decoding committed ring records
+/// into values of the [`Msg`] type `M`.
 ///
 /// [`drain`](Self::drain) reads each committed record, keeps those whose id
 /// is `M::ID`, and postcard-decodes the payload, so records of other message

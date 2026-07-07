@@ -8,6 +8,8 @@
 //! binds a [`DlSlot`] in place of a typed [`CyclicRunner`](crate::CyclicRunner).
 //! The slot forwards `init`, `step`, and `shutdown` across the C ABI, handing
 //! the shared object its per-port ring regions as raw [`FswRing`] handles.
+//! Timestamps cross the ABI as the raw `Timestamp` tick, in whatever unit the
+//! coordinator's clock produces.
 //!
 //! Everything stays in one process. The shared object attaches to the host's
 //! ring regions in place, so it reads and writes the same atomics the host's
@@ -32,6 +34,10 @@
 //! before the host frees the ring regions, because the coordinator drops its
 //! slots before its ring table. So no non-owning ring attach outlives its
 //! region, and no shared object code runs after the object is unloaded.
+//!
+//! A slot whose system panics is destroyed immediately rather than at
+//! teardown. A stopped system's live input views would otherwise keep holding
+//! their reader slots and backpressure every upstream producer forever.
 
 use core::ffi::c_void;
 use std::ffi::OsStr;
@@ -98,11 +104,12 @@ pub enum DlError {
 }
 
 // ---------------------------------------------------------------------------
-// DlSystem — the loaded handle
+// DlSystem, the loaded handle
 // ---------------------------------------------------------------------------
 
-/// A loaded system `cdylib`, holding the [`Library`], the resolved lifecycle
-/// function pointers, and the [`SystemDescriptor`] the builder wires against.
+/// A handle to a system shared object loaded into the host process, holding
+/// the [`Library`], the resolved lifecycle function pointers, and the
+/// [`SystemDescriptor`] the builder wires against.
 ///
 /// The `Library` lives in an `Arc` shared with every [`DlSlot`] built from
 /// this handle, so the shared object stays loaded as long as any slot exists.
@@ -301,15 +308,16 @@ impl DlSystem {
 }
 
 // ---------------------------------------------------------------------------
-// DlSlot — a dlopen'd system behind the CyclicSlot interface
+// DlSlot, a dlopen'd system behind the CyclicSlot interface
 // ---------------------------------------------------------------------------
 
-/// A bound dlopen'd cyclic system, driven by the coordinator as a
-/// `Box<dyn CyclicSlot>` exactly like a static
+/// A running instance of a loaded shared object, driven by the coordinator
+/// through the same `Box<dyn CyclicSlot>` interface as a statically linked
 /// [`CyclicRunner`](crate::CyclicRunner). `init` hands the shared object its
 /// per-port [`FswRing`] arrays, `step` calls `fsw_execute` and folds the
 /// returned [`FswStatus`] into the tracked [`SlotState`], and `Drop` calls
-/// `fsw_destroy` (see the module teardown note).
+/// `fsw_destroy` (see the module teardown note). Built by
+/// [`DlSystem::make_slot`].
 pub(crate) struct DlSlot {
     /// Keeps the shared object loaded for the slot's whole life; drops after
     /// the `Drop` body has run `fsw_destroy`.
@@ -354,8 +362,6 @@ impl DlSlot {
 }
 
 impl CyclicSlot for DlSlot {
-    /// Hands the shared object its per-port ring regions so it can reconstruct
-    /// its typed `Input`/`Output` bundles and run `System::init`.
     fn init(&mut self) {
         if self.state.is_null() {
             return;
@@ -373,14 +379,6 @@ impl CyclicSlot for DlSlot {
         }
     }
 
-    /// Runs one cycle and folds the returned status into the slot state.
-    ///
-    /// `now` crosses the ABI as the raw `Timestamp` tick (`now.0 as u64`), not
-    /// nanoseconds; the unit is whatever the coordinator's clock produced. A
-    /// `Panicked` status stops the slot permanently, and its foreign state is
-    /// destroyed immediately rather than at teardown, because a stopped
-    /// system's live input views would hold their reader slots and
-    /// backpressure every upstream producer forever.
     fn step(&mut self, now: Timestamp) {
         if self.slot_state.is_stopped() || self.state.is_null() {
             return;
@@ -411,7 +409,6 @@ impl CyclicSlot for DlSlot {
         }
     }
 
-    /// Runs `System::shutdown` once inside the shared object.
     fn shutdown(&mut self) {
         if self.state.is_null() {
             return;
@@ -430,8 +427,6 @@ impl CyclicSlot for DlSlot {
 }
 
 impl Drop for DlSlot {
-    /// Destroys the foreign state before the `Library` field drops and before
-    /// the host frees the ring regions; see the module teardown note.
     fn drop(&mut self) {
         if !self.state.is_null() {
             // SAFETY: `state` is the live `fsw_create` pointer, handed to

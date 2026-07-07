@@ -34,18 +34,20 @@ use metor_proto_wkt::ComponentMetadata;
 use crate::frame::Frame;
 use crate::message::{MAX_MSG_BYTES, NamedMsg};
 
-/// A rate in Hertz.
+/// A frequency in cycles per second, the unit of the coordinator's cycle
+/// rate.
 pub type Hz = f64;
 
-/// Factory a Table port carries to produce its announce vtable and component
-/// metadata under an instance-name prefix.
+/// A closure that rebuilds a Table port's announce [`VTable`] and component
+/// metadata with every leaf id nested under an instance-name prefix.
 ///
 /// An [`Arc`]'d closure rather than a bare `fn` so that a port built from
 /// runtime metadata, with no static frame type behind it, can capture the
 /// prefix rewrite it needs.
 pub type AnnounceFn = Arc<dyn Fn(&str) -> (VTable, Vec<ComponentMetadata>) + Send + Sync>;
 
-/// The edge key of a port.
+/// The key that decides which producer output may feed which consumer input
+/// when an edge is wired.
 ///
 /// The two variants draw from disjoint value spaces (an 8-byte frame
 /// [`ComponentId`] versus a 2-byte [`PacketId`]), so ports of different
@@ -79,7 +81,7 @@ impl PortId {
 /// What one record is and how it is described (the schema axis).
 #[derive(Clone)]
 pub enum PortSchema {
-    /// A component-frame table of `#[repr(C)]` bytes described by a vtable.
+    /// A component-frame table of `#[repr(C)]` bytes described by a [`VTable`].
     Table {
         /// The frame-relative (unprefixed) vtable that wiring compatibility
         /// compares. The prefixed form is produced on demand by `announce`.
@@ -114,7 +116,8 @@ pub enum FanIn {
     One,
     /// Zero, one, or many edges. Requires [`Delivery::Log`], since latest-wins
     /// across several producers is ill-defined; a Snapshot input declaring
-    /// `Many` fails wiring with `WireError::SnapshotFanIn`.
+    /// `Many` fails wiring with
+    /// [`WireError::SnapshotFanIn`](crate::WireError::SnapshotFanIn).
     Many,
 }
 
@@ -132,12 +135,12 @@ pub enum PortConn {
     /// handed to the system. A Host output is still ring-allocated and
     /// registry-tapped like any output and may be consumed over ordinary
     /// edges. A Host input is exempt from the unconnected-input check and
-    /// rejects edges with `WireError::HostPort`.
+    /// rejects edges with [`WireError::HostPort`](crate::WireError::HostPort).
     Host,
     /// A declared reader over one of this system's own outputs, named by
     /// [`PortId`]. Allocates no ring, counts one extra reader on that output,
     /// and hands the read view to the runner. Inputs only; edges are rejected
-    /// with `WireError::HostPort`.
+    /// with [`WireError::HostPort`](crate::WireError::HostPort).
     SelfTap(PortId),
 }
 
@@ -194,8 +197,8 @@ pub fn split_decls(decls: Vec<PortDecl>) -> (Vec<PortDesc>, Vec<Capability>) {
     (ports, caps)
 }
 
-/// One port's static shape: its edge key, display name, worst-case record
-/// size, and the behavior axes.
+/// The static shape of one port, everything the coordinator needs to size a
+/// ring and check an edge before the owning system is constructed.
 ///
 /// The same struct describes an output (a produced record stream) and an
 /// input (a required shape); the direction is which list of a
@@ -256,7 +259,7 @@ fn announce_of<F: Frame>(prefix: &str) -> (VTable, Vec<ComponentMetadata>) {
 }
 
 impl PortDesc {
-    /// Derives the descriptor for a frame type, `Table × Snapshot × One`,
+    /// Derives the descriptor for a [`Frame`] type, `Table × Snapshot × One`,
     /// telemetered.
     pub fn of<F: Frame>() -> Self {
         Self {
@@ -279,7 +282,7 @@ impl PortDesc {
         }
     }
 
-    /// Derives the descriptor for a message type, `Postcard × Log × Many`,
+    /// Derives the descriptor for a [`NamedMsg`] type, `Postcard × Log × Many`,
     /// telemetered. The name is the stable [`NamedMsg::NAME`] token, never
     /// the Rust type path.
     pub fn msg<M: NamedMsg>() -> Self {
@@ -382,9 +385,13 @@ pub enum SystemKind {
     Async,
 }
 
-/// A system's full self-description: its name, driving kind, the static shape
-/// of every input and output port, and the [`Capability`] set it needs from
-/// the host at bind time.
+/// The complete static shape of one system, read by the coordinator to size
+/// rings, validate wiring, and allocate buffers before the system is
+/// constructed.
+///
+/// It carries the system's name, its driving [`SystemKind`], a [`PortDesc`]
+/// for every input and output, and the [`Capability`] set it needs from the
+/// host at bind time.
 #[derive(Clone, Debug)]
 pub struct SystemDescriptor {
     pub name: &'static str,

@@ -5,21 +5,25 @@
 //! The element data itself lives in the table trailer, past the fixed region,
 //! where [`FrameWriter`](crate::writer::FrameWriter) appends it and patches
 //! the slot. A list block is the element frames laid back to back. A map
-//! block is a fixed-stride entry array, each entry a [`MapEntryHeader`]
+//! block is a fixed-stride entry array, each entry a `MapEntryHeader`
 //! followed by the value, trailed by a name pool the key offsets point into.
 //!
 //! The const generics bound the trailer. `MAX` caps the element or entry
 //! count and `MAX_KEY` the per-key byte length, which keeps
-//! `Componentize::MAX_SIZE` a `const` expression so output rings can be sized
-//! at construction. See `docs/frames.md` §3 for the byte layout and §3.5 for
-//! the sizing formula.
+//! [`Componentize::MAX_SIZE`] a `const` expression so output rings can be
+//! sized at construction. A list budgets `MAX` elements at the element
+//! stride, and a map budgets `MAX` entries at the entry stride plus a
+//! `MAX * MAX_KEY` name pool, each rounded up to a multiple of 8.
 //!
 //! Both types name their elements by dotted path, and the vtable name they
 //! emit depends on how they are reached. A field reached statically uses the
 //! full dotted prefix from the frame root, while a field reached as the
 //! element type of an enclosing list or map uses only its own relative name;
-//! the enclosing op accumulates the runtime part of the path. `docs/frames.md`
-//! §4 pins this rule.
+//! the enclosing op accumulates the runtime part of the path.
+//!
+//! Element names cannot be enumerated at compile time, so neither type emits
+//! static metadata. The producer announces each list index or map key the
+//! first time it appears.
 
 use core::marker::PhantomData;
 use core::mem::{align_of, size_of};
@@ -31,8 +35,12 @@ use metor_proto::vtable::builder::{FieldBuilder, list, map, raw_field};
 use metor_proto_wkt::ComponentMetadata;
 use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
 
-/// The 8-byte dynamic-field slot in a frame's fixed region, a table-absolute
-/// offset to the element block in the trailer plus its byte length.
+/// An 8-byte reference from a frame's fixed region to a dynamic member's
+/// data in the trailer, as a table-absolute byte offset plus a byte length.
+///
+/// [`FrameList`] and [`FrameMap`] are each transparent wrappers over one of
+/// these; [`FrameWriter`](crate::writer::FrameWriter) fills the trailer and
+/// patches the slot to point at it.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, IntoBytes, Immutable, KnownLayout, FromBytes)]
 pub struct Slot {
@@ -40,12 +48,12 @@ pub struct Slot {
     pub byte_len: u32,
 }
 
-/// The `{ key_off, key_len }` prefix of a map entry, a table-absolute offset
-/// into the name pool and the key's byte length.
+/// Every map entry begins with this pair, which locates the entry's key in
+/// the name pool by table-absolute offset and byte length.
 ///
-/// Stored native-endian like every other frame field. The format is de facto
-/// little-endian: all supported targets are LE, and the ring's `arch_tag`
-/// rejects cross-endian producers.
+/// Stored native-endian like every other frame field. In practice the format
+/// is little-endian, since all supported targets are LE and the ring's
+/// `arch_tag` rejects cross-endian producers.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, IntoBytes, Immutable, KnownLayout, FromBytes)]
 pub(crate) struct MapEntryHeader {
@@ -90,11 +98,14 @@ pub(crate) const fn map_stride<V>() -> u32 {
     ) as u32
 }
 
-/// A runtime-sized, positionally indexed sequence of element frames
-/// (`processes.0.pid`). `MAX` bounds the element count for buffer sizing.
+/// A frame field holding a runtime-varying number of element frames,
+/// addressed by position (`processes.0.pid`). `MAX` bounds the element count
+/// for buffer sizing.
 ///
-/// `#[repr(transparent)]` over the [`Slot`] (the `PhantomData` is a ZST), so
-/// the field is exactly the 8-byte slot and stays trivially `IntoBytes`.
+/// `#[repr(transparent)]` over its [`Slot`] (the `PhantomData` is a ZST), so
+/// the field is exactly the 8-byte slot and stays trivially `IntoBytes`. The
+/// elements themselves live in the trailer; see the module doc for the
+/// layout.
 #[repr(transparent)]
 #[derive(Clone, Copy, Debug, IntoBytes, Immutable, KnownLayout, FromBytes)]
 pub struct FrameList<T, const MAX: usize> {
@@ -127,9 +138,9 @@ impl<T, const MAX: usize> FrameList<T, MAX> {
 
 impl<T: AsVTable, const MAX: usize> AsVTable for FrameList<T, MAX> {
     fn vtable_fields(path: impl ComponentPath) -> impl Iterator<Item = FieldBuilder> {
-        // Reached statically, so the list op is named by the full dotted
-        // prefix (see the prefix rule in the module doc). The slot sits at
-        // offset 0; the enclosing frame `offset_by`s it into place.
+        // Reached statically, so the list op takes the full dotted prefix
+        // (the naming rule in the module doc). The slot sits at offset 0;
+        // the enclosing frame `offset_by`s it into place.
         let prefix = path.to_name();
         core::iter::once(raw_field(
             0,
@@ -143,8 +154,7 @@ impl<T: AsVTable, const MAX: usize> AsVTable for FrameList<T, MAX> {
     }
 
     fn element_fields(prefix: String) -> impl Iterator<Item = FieldBuilder> {
-        // Reached as a member template, so the name is the relative field
-        // name only.
+        // Reached as a member template, so the relative field name only.
         core::iter::once(raw_field(
             0,
             size_of::<Slot>() as u32,
@@ -158,11 +168,11 @@ impl<T: AsVTable, const MAX: usize> AsVTable for FrameList<T, MAX> {
 }
 
 impl<T, const MAX: usize> Componentize for FrameList<T, MAX> {
-    // The slot carries no in-struct value, so there is nothing to sink
-    // directly; elements flow through the vtable/trailer path.
+    // The slot itself carries no value; elements flow through the vtable and
+    // trailer.
     fn sink_columns(&self, _output: &mut impl Decomponentize) {}
 
-    // Trailer budget of `MAX` elements at the element stride, padded to 8.
+    // MAX elements at the element stride, padded to 8.
     const MAX_SIZE: usize = metor_fsw_ring::round_up8(MAX * size_of::<T>());
 }
 
@@ -180,18 +190,16 @@ impl<T, const MAX: usize> Decomponentize for FrameList<T, MAX> {
 
 impl<T, const MAX: usize> Metadatatize for FrameList<T, MAX> {
     fn metadata(_prefix: impl ComponentPath) -> impl Iterator<Item = ComponentMetadata> {
-        // Dynamic member names cannot be enumerated at compile time; the
-        // producer announces them lazily, once per newly seen key.
         core::iter::empty()
     }
 }
 
-/// A runtime-sized, name-keyed sequence of element frames
-/// (`processes.htop.pid`). `MAX` bounds the entry count and `MAX_KEY` the
-/// per-key byte length for buffer sizing.
+/// A frame field holding a runtime-varying number of element frames,
+/// addressed by string key (`processes.htop.pid`). `MAX` bounds the entry
+/// count and `MAX_KEY` the per-key byte length for buffer sizing.
 ///
-/// Keys are plain `&str`s validated at write time by
-/// [`MapWriter::insert`](crate::MapWriter): non-empty, with no `.`.
+/// Keys are plain `&str`s; [`MapWriter::insert`](crate::MapWriter) rejects
+/// empty keys and keys containing `.` at write time.
 #[repr(transparent)]
 #[derive(Clone, Copy, Debug, IntoBytes, Immutable, KnownLayout, FromBytes)]
 pub struct FrameMap<V, const MAX: usize, const MAX_KEY: usize = 32> {
@@ -253,8 +261,7 @@ impl<V: AsVTable, const MAX: usize, const MAX_KEY: usize> AsVTable for FrameMap<
 impl<V, const MAX: usize, const MAX_KEY: usize> Componentize for FrameMap<V, MAX, MAX_KEY> {
     fn sink_columns(&self, _output: &mut impl Decomponentize) {}
 
-    // Trailer budget of `MAX` entries at the entry stride plus the name pool
-    // (`MAX * MAX_KEY`), padded to 8.
+    // MAX entries at the entry stride plus the name pool, padded to 8.
     const MAX_SIZE: usize =
         metor_fsw_ring::round_up8(MAX * map_stride::<V>() as usize + MAX * MAX_KEY);
 }

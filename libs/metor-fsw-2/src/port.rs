@@ -78,9 +78,10 @@ where
 // Output
 // ---------------------------------------------------------------------------
 
-/// The single [`Writer`] into a ring carrying frame `F`. Cyclic outputs
-/// default to [`NoWake`]; async outputs pick wake endpoints so a write can
-/// suspend for space.
+/// An output publishes a system's frames of type `F`, wrapping the single
+/// [`Writer`] into the ring that carries them to downstream [`Input`]s.
+/// Cyclic outputs default to [`NoWake`]; async outputs pick wake endpoints
+/// so a write can suspend for space.
 pub struct Output<F, WD = NoWake, WS = NoWake>
 where
     WD: WakeSource,
@@ -202,9 +203,10 @@ where
 // Input
 // ---------------------------------------------------------------------------
 
-/// A read-only [`View`] into the ring behind an upstream output. Records are
-/// read in place and handed out as a typed [`FrameGrant`] or [`FrameRef`];
-/// the writer never overwrites a record a reader has yet to release.
+/// An input consumes the frames an upstream [`Output`] publishes, through a
+/// read-only [`View`] of that output's ring. Records are read in place and
+/// handed out as a typed [`FrameGrant`] or [`FrameRef`]; the writer never
+/// overwrites a record a reader has yet to release.
 pub struct Input<F, RD = NoWake, RS = NoWake>
 where
     RD: WakeSink,
@@ -288,11 +290,11 @@ where
 // FrameRef / FrameGrant
 // ---------------------------------------------------------------------------
 
-/// A typed, zero-copy view of one record's table bytes. The fixed region is
-/// read directly as `F`, dynamic members are read with [`ListReader`] and
-/// [`MapReader`], and [`apply`](Self::apply) walks the whole record through
-/// the frame's vtable for consumers that want components rather than the
-/// concrete type.
+/// A frame ref reads one record's table bytes in place, giving typed access
+/// without copying. The fixed region is read directly as `F`, dynamic
+/// members are read with [`ListReader`] and [`MapReader`], and
+/// [`apply`](Self::apply) walks the whole record through the frame's vtable
+/// for consumers that want components rather than the concrete type.
 pub struct FrameRef<'a, F> {
     table: &'a [u8],
     _f: PhantomData<F>,
@@ -354,11 +356,12 @@ where
     }
 }
 
-/// An owning typed read guard, a ring [`ReadGrant`] holding the view's
-/// cursor plus the [`FrameRef`] accessor surface. Returned by the reads that
-/// hand back a record ([`Input::latest`], [`Input::recv`]); a callback drain
-/// passes a plain [`FrameRef`] instead. Dropping it releases the record per
-/// the grant's semantics, consumed for `recv` and kept pinned for `latest`.
+/// A frame grant holds one record on the ring while the caller reads it,
+/// pairing the ring [`ReadGrant`] that keeps the record alive with the
+/// typed accessors of [`FrameRef`]. Returned by the reads that hand back a
+/// record ([`Input::latest`], [`Input::recv`]); a callback drain passes a
+/// plain [`FrameRef`] instead. Dropping it releases the record per the
+/// grant's semantics, consumed for `recv` and kept pinned for `latest`.
 pub struct FrameGrant<'a, F, RS = NoWake>
 where
     RS: WakeSource,

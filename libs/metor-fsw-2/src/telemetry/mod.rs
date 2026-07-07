@@ -81,8 +81,8 @@ use crate::system::{
 // Transport
 // ---------------------------------------------------------------------------
 
-/// An error surfaced by a transport. The first error stops the task driving
-/// the transport, while the in-cycle stage keeps running and drops.
+/// A failed send or receive on the link. The first error stops the task
+/// driving the transport, while the in-cycle stage keeps running and drops.
 #[derive(Debug, thiserror::Error)]
 pub enum TransportError {
     /// The link is not connected (never established, or dropped).
@@ -139,8 +139,8 @@ struct TcpConn {
     rx: OwnedReader<TcpStream>,
 }
 
-/// The TCP downlink transport: connect once to a ground endpoint and stream
-/// packets. On the first error the sender stops; there is no reconnect.
+/// A [`Transport`] that streams packets over one TCP connection to a ground
+/// endpoint. On the first error the sender stops; there is no reconnect.
 pub struct TcpTransport {
     addr: std::net::SocketAddr,
     conn: Option<TcpConn>,
@@ -193,9 +193,10 @@ impl Transport for TcpTransport {
     }
 }
 
-/// The TCP read transport: the uplink's own connection, distinct from the
-/// downlink's. It connects lazily on the first `recv`, then subscribes to the
-/// configured message ids; the broker relays a message id only to clients that
+/// A [`RecvTransport`] that reads packets over the uplink's own TCP
+/// connection, distinct from the downlink's. It connects lazily on the first
+/// `recv`, then subscribes to the configured message ids; the broker relays a
+/// message id only to clients that
 /// sent a [`MsgStream`] for it, so without the subscription the uplink would
 /// read nothing. The write half carries the subscription and is held for the
 /// connection's lifetime; the read half yields the streamed msgs. A dropped
@@ -298,7 +299,7 @@ impl TelemetryMode {
     }
 }
 
-/// The configuration [`TelemetrySystem::new`] is constructed from.
+/// The transport and tap selection a [`TelemetrySystem`] is built from.
 /// Programmatic users build one directly and register the system like any
 /// other: `builder.add_cyclic(TelemetrySystem::new(config))`.
 pub struct TelemetryConfig<T: Transport> {
@@ -344,9 +345,6 @@ impl DownlinkParams {
     }
 }
 
-/// The registry entry point of the built-in TCP downlink. The transport is
-/// lazy ([`TcpTransport::new`] connects on first announce inside the sender
-/// task), so nothing blocks here.
 impl BuildSystem for TelemetrySystem<TcpTransport> {
     type Params = DownlinkParams;
 
@@ -382,10 +380,6 @@ pub struct UplinkParams {
     pub msgs: Option<Vec<String>>,
 }
 
-/// The registry entry point of the built-in TCP uplink. The transport is as
-/// lazy as the downlink's, connecting and subscribing on the first `recv`. The
-/// `msgs` name tokens resolve in [`configure`](BuildSystem::configure), where
-/// the host's msg table is in scope.
 impl BuildSystem for UplinkSystem<TcpRecvTransport> {
     type Params = UplinkParams;
 
@@ -422,7 +416,7 @@ impl BuildSystem for UplinkSystem<TcpRecvTransport> {
 /// recent events and commands.
 const LOG_HANDOFF_CAP: usize = 1024;
 
-/// The bounded hand-off between the cycle and the sender: one coalescing slot
+/// Where the cycle parks framed packets for the sender, one coalescing slot
 /// per snapshot tap and one FIFO shared by every log tap. The module docs tell
 /// the lane story; the methods here implement it without ever blocking the
 /// cycle side.
@@ -782,8 +776,8 @@ impl BindPorts for TelemetryIn {
 // The downlink system
 // ---------------------------------------------------------------------------
 
-/// One resolved tap: a read view into a registered buffer plus the lane and
-/// wire framing projected from the entry's delivery and schema axes.
+/// A read view into one tapped buffer plus the [`Lane`] and [`Wire`] framing
+/// projected from the entry's delivery and schema axes.
 struct Tap {
     view: View<NoWake, NoWake>,
     lane: Lane,
@@ -822,8 +816,9 @@ struct Started {
     sender: Option<JoinHandleDropGuard<()>>,
 }
 
-/// The telemetry downlink system, generic over the [`Transport`] chosen by the
-/// wiring (`type="TcpDownlink"` for TCP) or by a test (a mock). Register it
+/// A [`CyclicSystem`] that copies every tapped output buffer's pending records
+/// onto a ground link, generic over the [`Transport`] chosen by the wiring
+/// (`type="TcpDownlink"` for TCP) or by a test (a mock). Register it
 /// after every other cyclic system, or let the wiring resolver defer it there;
 /// its `ReceiveAll` capability is what the build-time ordering check keys on.
 ///

@@ -28,7 +28,8 @@ fn spec(raw: RawAlarmSpec) -> AlarmSpec {
     AlarmSpec::try_from(raw).expect("valid spec")
 }
 
-/// An upper warning at 1.0 and critical at 2.0, with the given knobs.
+/// An [`AlarmEval`] with an upper warning at 1.0 and critical at 2.0, plus
+/// the given knobs.
 fn eval_with(debounce: u32, hysteresis: f64, latching: bool) -> AlarmEval {
     let mut r = raw(band(Some(1.0), None), band(Some(2.0), None));
     r.debounce = Some(debounce);
@@ -347,8 +348,9 @@ mod system {
     #[derive(SystemInput)]
     struct NoIn {}
 
-    /// Emits one scripted `rates[1]` sample per cycle (the last value repeats)
-    /// and mirrors `degraded = rate > 10.0` on a second frame.
+    /// A scripted telemetry source that publishes one `rates[1]` sample per
+    /// cycle (the last value repeats) and mirrors `degraded = rate > 10.0` on
+    /// a second frame.
     struct Plant {
         script: Vec<f64>,
         cycle: usize,
@@ -382,8 +384,9 @@ mod system {
         }
     }
 
-    /// Acks every raise it sees, `delay` cycles after first sighting. Plays
-    /// the operator side of the latch loop over ordinary message edges.
+    /// A stand-in operator that acks every raise it sees, `delay` cycles
+    /// after first sighting, closing the latch loop over ordinary message
+    /// edges.
     struct Acker {
         delay: usize,
         pending: Vec<(AlarmRaised, usize)>,
@@ -470,7 +473,7 @@ mod system {
         }
     }
 
-    /// Claim a decoding view on one of the alarm system's message outputs.
+    /// Claim a decoding view on one of the [`AlarmSystem`]'s message outputs.
     /// Must happen before `run_for`, since a view starts at the live edge.
     fn tap<M: metor_proto::types::Msg + serde::de::DeserializeOwned>(
         coord: &Coordinator,

@@ -8,7 +8,8 @@
 //! 1. the inherent impl itself, with the recognized methods renamed to hidden
 //!    delegation targets and everything else passed through verbatim,
 //! 2. two hidden port-bundle structs, one per direction, carrying
-//!    `#[derive(SystemInput)]` and `#[derive(SystemOutput)]` so that all
+//!    [`#[derive(SystemInput)]`](derive@crate::SystemInput) and
+//!    [`#[derive(SystemOutput)]`](derive@crate::SystemOutput) so that all
 //!    descriptor and binding knowledge stays in those derives,
 //! 3. `impl System` plus `impl CyclicSystem` or `impl AsyncSystem`, which
 //!    split the output bundle and lend each port back to the user's method in
@@ -41,8 +42,9 @@ use crate::sig;
 // Attribute arguments
 // ---------------------------------------------------------------------------
 
-/// Gating for the generated C-ABI exports. Bare `export` gates them on
-/// `not(test)`; `export = "feat"` additionally requires that cargo feature.
+/// Controls when the generated C-ABI entry points are compiled. Bare
+/// `export` gates them on `not(test)`; `export = "feat"` additionally
+/// requires that cargo feature.
 enum Export {
     Bare(Span),
     Feature(String, Span),
@@ -130,7 +132,8 @@ fn default_name(ty_ident: &Ident) -> String {
 // Signature classification
 // ---------------------------------------------------------------------------
 
-/// The recognized port type heads and the direction bundle each lands in.
+/// Identifies which recognized port type a parameter named, and with it
+/// whether the field lands in the input or the output bundle.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum PortKind {
     Input,
@@ -179,6 +182,8 @@ enum ParamKind {
     Health,
 }
 
+/// One accepted parameter, pairing its name with its [`ParamKind`] so the
+/// generated impls can rebuild the user's argument list in order.
 struct ExecParam {
     ident: Ident,
     kind: ParamKind,

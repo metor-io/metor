@@ -39,6 +39,8 @@ enum Dir {
     Output,
 }
 
+/// One field of the struct being derived, carrying its type and any parsed
+/// `#[fsw(...)]` attribute values.
 #[derive(Debug, darling::FromField)]
 #[darling(attributes(fsw))]
 struct BundleField {
@@ -74,6 +76,9 @@ impl BundleField {
     }
 }
 
+/// The struct being derived, reduced to its name, generics, and
+/// [`BundleField`] list. Both derives share this one receiver; what differs
+/// per direction is checked by [`Bundle::validate`].
 #[derive(Debug, FromDeriveInput)]
 #[darling(supports(struct_named), attributes(fsw))]
 struct Bundle {
@@ -135,8 +140,9 @@ fn decls_body(bundle: &Bundle, _fsw2: &TokenStream2) -> TokenStream2 {
 }
 
 /// Emits the `BindPorts::bind` body: each port type's `bind(src)` in field
-/// order, mirroring `decls()` so positional binding lines up (see the module
-/// doc). `PhantomData` anchors are default-constructed and consume no ring.
+/// order, mirroring [`decls_body`] so positional binding lines up (see the
+/// module doc). `PhantomData` anchors are default-constructed and consume no
+/// ring.
 fn bind_body(bundle: &Bundle, _fsw2: &TokenStream2) -> TokenStream2 {
     let fields = bundle.data.as_ref().take_struct().expect("named struct");
     let binds = fields.iter().map(|f| {

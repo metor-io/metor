@@ -36,7 +36,8 @@ const META_FILE: &str = "meta.kdl";
 /// File name of the wiring manifest within a bundle.
 const MISSION_FILE: &str = "mission.kdl";
 
-/// Options for [`write_bundle`].
+/// Caller-supplied details that [`write_bundle`] records in the `meta.kdl`
+/// sidecar.
 #[derive(Clone, Debug, Default)]
 pub struct PackageOptions {
     /// Record `profile "release"` in `meta.kdl` instead of `"debug"`. Purely
@@ -44,7 +45,8 @@ pub struct PackageOptions {
     pub release: bool,
 }
 
-/// An error writing or loading a bundle.
+/// A failure from [`write_bundle`] or [`load_bundle`], ranging from plain
+/// filesystem trouble to a bundle built against an incompatible ABI.
 #[derive(Debug, Error)]
 pub enum BundleError {
     /// A filesystem operation failed.
@@ -103,7 +105,8 @@ fn io_at(path: impl Into<PathBuf>) -> impl FnOnce(std::io::Error) -> BundleError
 /// Write a bundle to `dir`, creating the directory if needed.
 ///
 /// Copies each artifact's built `.so` in under its produced file name, writes
-/// `mission_kdl` verbatim as the manifest, and emits the `meta.kdl` sidecar.
+/// `mission_kdl` verbatim as the manifest, and emits the `meta.kdl` sidecar
+/// described by [`PackageOptions`].
 /// Every artifact in `wiring` must already have a built path, otherwise this
 /// returns [`BundleError::NotBuilt`].
 pub fn write_bundle(

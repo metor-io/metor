@@ -1,12 +1,12 @@
 //! Typed read access to a frame's dynamic fields.
 //!
 //! A list or map field occupies an 8-byte [`Slot`] in the frame's fixed
-//! region, and its element bytes live in the trailer that follows. The
-//! readers here wrap the full table bytes plus one such slot and decode
-//! elements on demand, by index for lists and by key for maps. Every access
-//! is bounds checked against the table, so a truncated or corrupt trailer
-//! yields `None` rather than a panic, and iterators simply skip entries
-//! whose bytes are out of range.
+//! region, and its element bytes live in the trailer that follows.
+//! [`ListReader`] and [`MapReader`] wrap the full table bytes plus one such
+//! slot and decode elements on demand, by index for lists and by key for
+//! maps. Every access is bounds checked against the table, so a truncated
+//! or corrupt trailer yields `None` rather than a panic, and iterators
+//! simply skip entries whose bytes are out of range.
 //!
 //! These readers are a presentation convenience. The frame's vtable remains
 //! the authoritative interpretation of the table; nothing here re-derives
@@ -19,7 +19,8 @@ use zerocopy::FromBytes;
 
 use crate::dynamic::{MapEntryHeader, Slot, map_stride, map_value_offset};
 
-/// Reads list elements of type `T` out of a table trailer.
+/// A borrowed view of one list field that decodes its trailer bytes into
+/// `T` values on demand.
 pub struct ListReader<'a, T> {
     table: &'a [u8],
     slot: Slot,
@@ -63,7 +64,8 @@ impl<'a, T: FromBytes> ListReader<'a, T> {
     }
 }
 
-/// Reads map entries with values of type `V` out of a table trailer.
+/// A borrowed view of one map field that decodes its string-keyed entries
+/// into `V` values on demand, the map counterpart of [`ListReader`].
 pub struct MapReader<'a, V> {
     table: &'a [u8],
     slot: Slot,

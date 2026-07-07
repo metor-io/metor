@@ -8,12 +8,15 @@
 //!
 //! The surface is small:
 //!
-//! - `#[derive(Frame)]` turns a struct into a frame in one annotation.
-//! - `#[derive(SystemInput)]` / `#[derive(SystemOutput)]` describe port
-//!   bundles.
-//! - `#[system]` builds a whole system from an inherent impl block.
-//! - `#[sequence]` turns an `async fn` into a loadable sequence.
-//! - `export_system!` hand-writes the loadable-system C entry points.
+//! - [`#[derive(Frame)]`](derive@Frame) turns a struct into a frame in one
+//!   annotation.
+//! - [`#[derive(SystemInput)]`](derive@SystemInput) /
+//!   [`#[derive(SystemOutput)]`](derive@SystemOutput) describe port bundles.
+//! - [`#[system]`](macro@system) builds a whole system from an inherent impl
+//!   block.
+//! - [`#[sequence]`](macro@sequence) turns an `async fn` into a loadable
+//!   sequence.
+//! - [`export_system!`] hand-writes the loadable-system C entry points.
 //!
 //! Field and struct attributes live under `#[fsw(...)]`; the longer
 //! `#[metor_fsw(...)]` spelling is accepted as an alias.
@@ -36,7 +39,8 @@ mod sig;
 mod system;
 mod system_attr;
 
-/// The `#[fsw(...)]` field attributes shared by the frame derives.
+/// A single struct field as parsed by the frame derives, pairing its ident
+/// and type with the `#[fsw(...)]` attributes they all share.
 #[derive(Debug, FromField)]
 #[darling(attributes(fsw, metor_fsw))]
 struct Field {
@@ -124,8 +128,8 @@ pub fn system_output(input: TokenStream) -> TokenStream {
 /// must implement `Serialize`, `Deserialize`, and `Schema` so they can cross
 /// the boundary as postcard bytes.
 ///
-/// This is the hand-written form; `#[system(export)]` emits the same surface
-/// for macro-authored systems.
+/// This is the hand-written form; [`#[system(export)]`](macro@system) emits
+/// the same surface for macro-authored systems.
 #[proc_macro]
 pub fn export_system(input: TokenStream) -> TokenStream {
     export::export_system(input)
@@ -167,8 +171,8 @@ pub fn sequence(attr: TokenStream, item: TokenStream) -> TokenStream {
 /// `#[system(name = "…")]` overrides the wiring name, which defaults to the
 /// snake_cased type ident with any `System` suffix stripped.
 /// `#[system(export)]` and `#[system(export = "feature")]` additionally emit
-/// the `fsw_*` entry points, compiled out under `cfg(test)` and, in the
-/// second form, gated on the named cargo feature.
+/// the same `fsw_*` entry points as [`export_system!`], compiled out under
+/// `cfg(test)` and, in the second form, gated on the named cargo feature.
 #[proc_macro_attribute]
 pub fn system(attr: TokenStream, item: TokenStream) -> TokenStream {
     system_attr::system_impl(attr.into(), item.into()).into()

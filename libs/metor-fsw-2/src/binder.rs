@@ -29,7 +29,8 @@ use metor_fsw_ring::{RingBuffer, WakeSink, WakeSource};
 
 use crate::registry::Registry;
 
-/// A pre-allocated ring plus an optional matched data-wake endpoint.
+/// A pre-allocated [`RingBuffer`] plus an optional matched data-wake
+/// endpoint.
 ///
 /// `data` is `Some` only for the copy-in buffer feeding an async input, where
 /// the reader must hold the writer's endpoint to be woken (see the module
@@ -65,11 +66,13 @@ impl BoundPort {
     }
 }
 
-/// The ring(s) bound to one input port.
+/// The pre-allocated ring, or set of per-producer rings, feeding one input
+/// port.
 ///
 /// A frame input, or a single-producer message input, binds
 /// [`One`](BoundInput::One). A fanned-in message input binds
-/// [`Many`](BoundInput::Many), with one ring per producer and possibly none.
+/// [`Many`](BoundInput::Many), with one [`BoundPort`] per producer and
+/// possibly none.
 pub enum BoundInput {
     One(BoundPort),
     Many(Vec<BoundPort>),
@@ -153,9 +156,10 @@ pub trait RingSource {
     /// than typed ports.
     ///
     /// A bundle pulls this in its `bind`, exactly where it pulls its typed
-    /// ports. Only the host [`Binder`] carries one, so a bundle that needs it
-    /// can only be bound on the host; the default panics rather than
-    /// fabricate an empty registry.
+    /// ports; the registry is already complete by then, so the handle is
+    /// usable immediately. Only the host [`Binder`] carries one, so a bundle
+    /// that needs it can only be bound on the host; the default panics rather
+    /// than fabricate an empty registry.
     fn registry(&self) -> Arc<Registry> {
         panic!("this ring source carries no registry (host-only capability)")
     }
@@ -220,8 +224,6 @@ impl<'a> RingSource for Binder<'a> {
             .collect()
     }
 
-    /// The registry is complete before the bind loop runs, so handing it out
-    /// here needs no second phase.
     fn registry(&self) -> Arc<Registry> {
         self.registry.clone()
     }

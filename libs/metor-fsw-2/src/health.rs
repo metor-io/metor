@@ -37,11 +37,13 @@ pub const MAX_LINES: usize = 16;
 /// Byte capacity of one log line's message; longer lines are truncated.
 pub const LOG_MSG_CAP: usize = 64;
 
-/// The standard per-system health frame.
+/// A telemetry frame that snapshots one system's run counters at the end of
+/// each cycle.
 ///
 /// The scalar counters are maintained by the framework around `execute`;
-/// `error_counts` holds the system's named counters and lands as one
-/// `health.error_counts.<kind>` component per kind.
+/// `error_counts` holds the named counters bumped through
+/// [`HealthPort::error`] and lands as one `health.error_counts.<kind>`
+/// component per kind.
 #[derive(Frame, IntoBytes, Immutable, KnownLayout, FromBytes)]
 #[repr(C)]
 #[metor_fsw(name = "health")]
@@ -54,8 +56,8 @@ pub struct SystemHealth {
     pub error_counts: FrameMap<u64, MAX_ERR_KINDS>,
 }
 
-/// One log line, made of a severity level, the used length, and a fixed-size
-/// message buffer.
+/// A fixed-size log entry carried on the [`SystemLog`] frame, holding a
+/// severity level, the used byte length, and the message bytes.
 #[derive(metor_fsw::AsVTable, IntoBytes, Immutable, KnownLayout, FromBytes, Clone, Copy)]
 #[repr(C)]
 pub struct LogLine {
@@ -77,7 +79,8 @@ impl LogLine {
     }
 }
 
-/// The standard per-system log frame.
+/// A telemetry frame carrying the lines a system queued through
+/// [`HealthPort::log`] during one cycle.
 #[derive(Frame, IntoBytes, Immutable, KnownLayout, FromBytes)]
 #[repr(C)]
 #[metor_fsw(name = "log")]
@@ -96,10 +99,11 @@ pub enum Level {
     Error = 2,
 }
 
-/// A system's health and log output ports plus the counter state behind them.
+/// The handle a system uses to report errors and log lines as telemetry.
 ///
-/// Surfaced to a system as `output.health()`. See the [module docs](self) for
-/// who calls what.
+/// It bundles the [`SystemHealth`] and [`SystemLog`] output ports with the
+/// counter state behind them, and is surfaced to a system as
+/// `output.health()`. See the [module docs](self) for who calls what.
 pub struct HealthPort<WD = NoWake, WS = NoWake>
 where
     WD: WakeSource,
