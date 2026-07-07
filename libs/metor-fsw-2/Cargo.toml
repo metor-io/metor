@@ -22,6 +22,7 @@ metor-fsw = { path = "../metor-fsw", default-features = false, features = ["std"
 metor-fsw-ring = { path = "ring", default-features = false, features = ["async"] }
 metor-fsw-2-macros = { path = "macros" }
 stellarator = { path = "../stellarator" }
+thingbuf = "0.1.6"
 zerocopy = { version = "0.8.2", features = ["derive"] }
 
 # The dlopen ABI: the serialized descriptor mirrors + the `Params` schema cross the
