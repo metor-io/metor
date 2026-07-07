@@ -579,7 +579,7 @@ impl MockRecv {
 }
 
 impl RecvTransport for MockRecv {
-    async fn recv(&mut self) -> Result<OwnedPacket<Slice<Vec<u8>>>, TransportError> {
+    async fn recv(&mut self, _buf: Vec<u8>) -> Result<OwnedPacket<Slice<Vec<u8>>>, TransportError> {
         match self.queue.pop_front() {
             Some(bytes) => {
                 let slice = bytes.try_slice(..).expect("non-empty packet");

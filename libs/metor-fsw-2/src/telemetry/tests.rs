@@ -730,6 +730,7 @@ async fn uplink_subscribes_to_its_configured_ids() {
     impl RecvTransport for SubRecv {
         async fn recv(
             &mut self,
+            _buf: Vec<u8>,
         ) -> Result<metor_proto::types::OwnedPacket<Slice<Vec<u8>>>, TransportError> {
             Err(TransportError::Disconnected)
         }
@@ -797,6 +798,7 @@ async fn uplink_routes_alarm_acks() {
     impl RecvTransport for MockRecv {
         async fn recv(
             &mut self,
+            _buf: Vec<u8>,
         ) -> Result<metor_proto::types::OwnedPacket<Slice<Vec<u8>>>, TransportError> {
             use stellarator::buf::IoBuf;
             match self.queue.pop_front() {
@@ -910,6 +912,7 @@ async fn uplink_relays_arbitrary_user_msgs() {
     impl RecvTransport for MockRecv {
         async fn recv(
             &mut self,
+            _buf: Vec<u8>,
         ) -> Result<metor_proto::types::OwnedPacket<Slice<Vec<u8>>>, TransportError> {
             use stellarator::buf::IoBuf;
             match self.queue.pop_front() {
@@ -1022,6 +1025,7 @@ fn uplink_minted_ports_are_untelemetered() {
     impl RecvTransport for NoRecv {
         async fn recv(
             &mut self,
+            _buf: Vec<u8>,
         ) -> Result<metor_proto::types::OwnedPacket<Slice<Vec<u8>>>, TransportError> {
             Err(TransportError::Disconnected)
         }

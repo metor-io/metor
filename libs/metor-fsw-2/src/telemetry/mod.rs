@@ -121,8 +121,12 @@ pub trait Transport {
 /// reconnect.
 #[allow(async_fn_in_trait)]
 pub trait RecvTransport {
-    /// Receive the next packet, or an error if the link dropped.
-    async fn recv(&mut self) -> Result<OwnedPacket<Slice<Vec<u8>>>, TransportError>;
+    /// Receive the next packet, reading into `buf`, or an error if the link
+    /// dropped. The caller recovers the buffer from the returned packet via
+    /// [`OwnedPacket::into_buf`] once the payload is routed, so one buffer
+    /// serves the link's whole lifetime.
+    async fn recv(&mut self, buf: Vec<u8>)
+    -> Result<OwnedPacket<Slice<Vec<u8>>>, TransportError>;
 
     /// Declare the message ids to subscribe to on connect. Called once before
     /// the first `recv`; the default is a no-op.
@@ -248,12 +252,12 @@ impl TcpRecvTransport {
 }
 
 impl RecvTransport for TcpRecvTransport {
-    async fn recv(&mut self) -> Result<OwnedPacket<Slice<Vec<u8>>>, TransportError> {
+    async fn recv(
+        &mut self,
+        buf: Vec<u8>,
+    ) -> Result<OwnedPacket<Slice<Vec<u8>>>, TransportError> {
         let stream = self.ensure().await?;
-        stream
-            .next_grow(vec![0u8; 1024])
-            .await
-            .map_err(TransportError::io)
+        stream.next_grow(buf).await.map_err(TransportError::io)
     }
 
     fn subscribe(&mut self, ids: &[PacketId]) {
@@ -420,6 +424,11 @@ const BATCH_QUEUE_CAP: usize = 8;
 /// the task regardless).
 const UPLINK_IDLE: Duration = Duration::from_millis(50);
 
+/// The initial size of the uplink's recycled receive buffer. `recv` grows it
+/// past this when a packet demands, and the grown buffer is what recycles, so
+/// it converges to the largest packet seen and then never reallocates.
+const UPLINK_RECV_BUF: usize = 1024;
+
 /// The uplink's output bundle: the two implicit health/log ports first, then a
 /// [`MsgFanOut`] holding one ordinary message output per configured msg. A
 /// consumer receives a msg only over an explicit edge, and every minted port
@@ -493,6 +502,9 @@ impl BindPorts for UplinkIn {
 pub struct UplinkSystem<R: RecvTransport> {
     /// The read transport, taken to `None` on the first error; no reconnect.
     recv: Option<R>,
+    /// The receive buffer, lent to `recv` and recovered from each returned
+    /// packet, so the link's whole lifetime reuses one allocation.
+    recv_buf: Vec<u8>,
     /// Whether the subscription has been sent (once, before the first `recv`).
     subscribed: bool,
     /// The forward set, in config order: one `(NAME, ID)` per msg. Index k is
@@ -512,6 +524,7 @@ impl<R: RecvTransport> UplinkSystem<R> {
     pub fn new(recv: R) -> Self {
         Self {
             recv: Some(recv),
+            recv_buf: vec![0u8; UPLINK_RECV_BUF],
             subscribed: false,
             msgs: Vec::new(),
             unresolved: Vec::new(),
@@ -550,10 +563,11 @@ impl<R: RecvTransport + 'static> AsyncSystem for UplinkSystem<R> {
     }
 
     /// One ingest pass, called repeatedly by the coordinator's async-run loop:
-    /// receive the next packet and forward it verbatim on the minted output
-    /// whose id matches. A msg outside the configured set bumps
-    /// `uplink.unroutable` (the broker should only relay subscribed ids, so
-    /// this signals a broker or config mismatch), a full ring bumps
+    /// receive the next packet into the recycled buffer and forward it
+    /// verbatim on the minted output whose id matches, then recover the
+    /// buffer from the packet for the next pass. A msg outside the configured
+    /// set bumps `uplink.unroutable` (the broker should only relay subscribed
+    /// ids, so this signals a broker or config mismatch), a full ring bumps
     /// `uplink.dropped`, and `Table` packets are silently ignored. The first
     /// error drops the link for good, and later passes idle instead of
     /// spinning.
@@ -587,24 +601,28 @@ impl<R: RecvTransport + 'static> AsyncSystem for UplinkSystem<R> {
             stellarator::sleep(UPLINK_IDLE).await;
             return;
         };
-        match recv.recv().await {
-            Ok(OwnedPacket::Msg(m)) => {
-                let (fan, health) = output.split();
-                match self.msgs.iter().position(|&(_, id)| id == m.id) {
-                    Some(idx) => {
-                        if fan.write_raw(idx, m.id, &m.buf).is_err() {
-                            health.error("uplink.dropped");
+        match recv.recv(std::mem::take(&mut self.recv_buf)).await {
+            Ok(pkt) => {
+                // Msgs are routed; tables are ignored (the uplink is commands
+                // only). Either way the packet's backing buffer is recovered
+                // for the next receive.
+                if let OwnedPacket::Msg(m) = &pkt {
+                    let (fan, health) = output.split();
+                    match self.msgs.iter().position(|&(_, id)| id == m.id) {
+                        Some(idx) => {
+                            if fan.write_raw(idx, m.id, &m.buf).is_err() {
+                                health.error("uplink.dropped");
+                                health.end_cycle(Timestamp::now(), 0);
+                            }
+                        }
+                        None => {
+                            health.error("uplink.unroutable");
                             health.end_cycle(Timestamp::now(), 0);
                         }
                     }
-                    None => {
-                        health.error("uplink.unroutable");
-                        health.end_cycle(Timestamp::now(), 0);
-                    }
                 }
+                self.recv_buf = pkt.into_buf().into_inner();
             }
-            // Tables are ignored; the uplink is commands only.
-            Ok(_) => {}
             // A dropped link (or an exhausted mock) ends the reader, like the
             // sender.
             Err(_) => self.recv = None,
