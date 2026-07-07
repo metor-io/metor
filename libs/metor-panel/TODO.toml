@@ -1,0 +1,183 @@
+# Feature backlog for metor-panel, from the 2026-07-07 crate review.
+# Ordered by product value. `status` is one of: planned | in-progress | implemented.
+
+[[feature]]
+name = "session-restore"
+status = "planned"
+priority = 1
+summary = "Restore the last layout on launch; persist the theme choice."
+details = """
+The app boots with an empty TileGroup every launch (src/app.rs); presets are strictly
+manual. Autosave the layout to a session.json next to config.json (debounced or on quit)
+and restore it on start — to_json/replace_from_json already exist. Also add a theme
+field to PanelConfig (src/config.rs): set_theme currently swaps a global and forgets,
+while set_font persists.
+"""
+
+[[feature]]
+name = "hover-readout"
+status = "implemented"
+priority = 2
+summary = "Value-at-cursor readout and crosshair on plain hover over plots."
+details = """
+Currently the only way to read a value is the alt-drag measurement cursor. Show a
+crosshair plus per-trace value readout at the hovered timestamp on the time-series plot.
+The pieces (trace_value_at, cursor paint in src/views/time_series/) already exist.
+"""
+
+[[feature]]
+name = "node-graph-smoothing"
+status = "planned"
+priority = 3
+summary = "Axis-reduce ops (mean/min/max/sum) and EMA so a rolling average is expressible."
+details = """
+Window produces [N, ...] but Mean averages across inputs, not along an axis — smoothing
+a noisy channel has no path through the graph today. Add reduce-along-axis and an
+EMA/low-pass node (src/dynamic/ops/). The per-element f64 pipeline in dynamic/tensor.rs
+makes these nearly free. Relatedly the FFT op (src/dynamic/ops/derive.rs) needs a window
+function (Hann), normalization, and frequency-axis metadata to be usable; consider a
+decimation option since it recomputes per input tick.
+"""
+
+[[feature]]
+name = "alarm-panel-ops"
+status = "planned"
+priority = 4
+summary = "Alarm filtering/search, ack notes, drill-in, ack-all confirm, escalation."
+details = """
+src/views/alarm_panel.rs gaps for a mission-control workflow: no severity/text/acked
+filter over 1000 history rows; AlarmAck.note hardwired None though the protocol supports
+it; AlarmDef.description and limits stored but never shown (use the inspector-page
+pattern from sequence_panel channel_control_rows); "Ack all" fires with no confirmation
+while sequence Stop gets a two-step confirm; no attention escalation (flash/badge) for
+new unacked criticals despite unacked_count existing. Also virtualize the alarm and
+sequence lists with uniform_list, and fix the frozen relative ages ("5s ago" never
+updates without a repaint timer) — or show absolute timestamps, which don't exist at all.
+"""
+
+[[feature]]
+name = "alarm-aware-traffic-lights"
+status = "planned"
+priority = 5
+summary = "Tint traffic lights by active alarm severity; add expected-state semantics."
+details = """
+AlarmState::active_severity_for already drives plot tinting, but a traffic light over a
+critical-alarmed component renders like a healthy one (src/views/traffic_light.rs).
+Wire the swatch to alarm severity (manual color as fallback) to turn the grid into a
+health board. Expected-state (this light SHOULD be on; deviation = red) and per-value
+color mapping for enum/state components complete it. Grid multi-element cells collapse
+to one light and toggling always writes element 0 — revisit.
+"""
+
+[[feature]]
+name = "layout-undo"
+status = "planned"
+priority = 6
+summary = "Reopen closed tab / layout undo stack."
+details = """
+Closing a tab or pane irreversibly destroys the item's config — one mis-click loses a
+carefully configured plot. Snapshot item.serialize(cx) + kind into a ring buffer on
+close and offer "Reopen closed tab" in the palette/chord menu; optionally a full layout
+undo stack (snapshot SerializedTileGroup before structural ops).
+"""
+
+[[feature]]
+name = "pane-focus-visibility"
+status = "planned"
+priority = 7
+summary = "Visible focused-pane indication and keyboard focus movement."
+details = """
+TileGroup.focused_pane drives every keyboard command but is set only by mouse-down and
+has no visual indication (src/tiles/mod.rs). Add a subtle active-pane border and
+focus-direction chords (h/j/k/l or cmd-arrows) in the window chord menu.
+"""
+
+[[feature]]
+name = "y-autofit-visible-window"
+status = "planned"
+priority = 8
+summary = "Fit the Y axis to the visible X window instead of all-time bounds."
+details = """
+expand_value_bounds (src/views/time_series/mod.rs) aggregates min/max over every sample
+ever recorded, so one historical spike squashes the plot forever. NodeBounds is already
+cached per node keyed by first timestamp — range-limit the aggregation over visible
+nodes with partial scans only at the two boundary nodes.
+"""
+
+[[feature]]
+name = "log-scale"
+status = "planned"
+priority = 9
+summary = "Log-scale Y axis for plots."
+details = """
+PlotBounds / value_ticks / GPU normalization are all linear. Painful for spectra
+rendered via the FFT op into the list plot.
+"""
+
+[[feature]]
+name = "plot-export"
+status = "planned"
+priority = 10
+summary = "PNG snapshot and CSV export of the visible window / measurements."
+details = """
+The rendered frame is already a RenderImage, so PNG is nearly free. CSV of the visible
+window or of cursor measurement results serves reports and offline analysis.
+"""
+
+[[feature]]
+name = "linked-cursors"
+status = "planned"
+priority = 11
+summary = "Cursor placed on one plot appears on sibling plots."
+details = """
+GlobalTimeRange (src/views/time_series/time_range.rs) already syncs the window across
+plots; sharing cursors is the natural extension for multi-plot anomaly correlation.
+"""
+
+[[feature]]
+name = "component-table-numeric-sort"
+status = "planned"
+priority = 12
+summary = "Numeric value-column sort that survives vtable rebuilds."
+details = """
+src/views/component_table.rs sorts the Value column lexicographically ("9" > "10") via
+formatted strings — parse the raw latest sample numerically with a string fallback. And
+spawn_watcher rebuilds metas on every vtable_gen bump without re-applying the active
+sort while the header chevron still claims one; remember (col_ix, sort) and re-apply.
+"""
+
+[[feature]]
+name = "browser-type-ahead"
+status = "planned"
+priority = 13
+summary = "Type-to-jump in column browser; persist browser filters."
+details = """
+ColumnBrowser::handle_key supports only arrows/Enter — no type-ahead within a column,
+no incremental search across the namespace. Also glob filter sets built in the
+component browser vanish on restart: BrowserPanelConfig persists custom_title and
+root_override but not filters (src/tiles/panels.rs).
+"""
+
+[[feature]]
+name = "node-editor-polish"
+status = "planned"
+priority = 14
+summary = "Viewport-aware node placement, inline build-error text, clamped panning."
+details = """
+next_node_position ignores the viewport so Add Node while panned drops nodes off-screen;
+the header pill shows only "!" on error with the BuildError reachable only via
+right-click inspector — add a hover tooltip / inline message; middle-mouse pan skips
+clamp_viewport while scroll clamps (src/node_editor/pane.rs).
+"""
+
+[[feature]]
+name = "persistence-robustness"
+status = "planned"
+priority = 15
+summary = "Unknown-panel placeholder, save/load error toasts, preset overwrite confirm."
+details = """
+Unknown/corrupt panels are silently dropped on load and re-save finalizes the loss —
+keep a placeholder tile that round-trips the raw SerializedItem. All save/load errors go
+to stderr only; the title bar already hosts status pills, add a transient error/success
+pill. presets::save_preset silently overwrites an existing preset.
+"""
