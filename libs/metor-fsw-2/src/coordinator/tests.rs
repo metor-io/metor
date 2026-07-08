@@ -1345,3 +1345,90 @@ async fn untelemetered_frame_output_hidden_from_all_outputs() {
     // filter regression loud.
     assert_eq!(frame_outs.get(), 7, "quiet.imu is filtered at the source");
 }
+
+// ---------------------------------------------------------------------------
+// Process systems: which rings become session-dir files.
+// ---------------------------------------------------------------------------
+
+/// A process registration marks exactly the crossing buffers as file-backed —
+/// every output of the process system (implicit health/log included) plus the
+/// producer output it consumes — and `alloc_rings` creates precisely those as
+/// ring files in a session directory that is removed when the alloc drops.
+/// A bystander system's rings stay heap.
+#[test]
+fn proc_rings_are_file_backed() {
+    let mut b = Coordinator::builder(config());
+    let prod = b.add_cyclic(Producer::new());
+    let _bystander = b.add_cyclic_named("bystander", Producer::new());
+    // The process system's descriptor is a real consumer's, exactly what a
+    // describe worker would hand back; no worker is spawned in this test
+    // (spawn happens at build(), which is never called).
+    let desc = Consumer {
+        seen: Rc::new(RefCell::new(Vec::new())),
+        drain: true,
+        init_counter: None,
+        first_exec_init: None,
+    }
+    .instance_descriptor();
+    let n_proc_outputs = desc.outputs.len();
+    let cons = b.add_proc_cyclic("proc-cons", desc, "/nonexistent.so".into(), Vec::new());
+    b.connect(PortRef::new::<Imu>(prod), PortRef::new::<Imu>(cons))
+        .unwrap();
+
+    let cons_edges = b.resolve_edges().unwrap();
+    let shared = b.shared_outputs(&cons_edges);
+    // The producer's imu output crosses; its health/log do not.
+    let imu_out = b.systems[prod.id]
+        .desc
+        .outputs
+        .iter()
+        .position(|p| p.id == crate::PortId::Component(<Imu as crate::Frame>::FRAME_ID))
+        .unwrap();
+    assert!(shared.contains(&(prod.id, imu_out)));
+    // Every process-system output crosses.
+    for out_idx in 0..n_proc_outputs {
+        assert!(shared.contains(&(cons.id, out_idx)));
+    }
+    assert_eq!(
+        shared.len(),
+        n_proc_outputs + 1,
+        "nothing else crosses (bystander and coordinator rings stay heap)"
+    );
+
+    let fan_out = b.count_fan_out(&cons_edges);
+    let alloc = b.alloc_rings(&cons_edges, &fan_out).unwrap();
+    assert_eq!(
+        alloc.ring_paths.keys().copied().collect::<std::collections::HashSet<_>>(),
+        shared,
+        "one ring file per crossing buffer"
+    );
+    let session = alloc.session.as_ref().expect("proc graph has a session");
+    let session_path = session.path().to_path_buf();
+    for path in alloc.ring_paths.values() {
+        assert!(path.exists(), "ring file {} exists", path.display());
+        assert!(path.starts_with(&session_path));
+    }
+    drop(alloc);
+    assert!(!session_path.exists(), "session dir removed on drop");
+}
+
+/// A graph without process systems allocates no session and no ring files.
+#[test]
+fn heap_only_graph_has_no_session() {
+    let seen = Rc::new(RefCell::new(Vec::new()));
+    let mut b = Coordinator::builder(config());
+    let prod = b.add_cyclic(Producer::new());
+    let cons = b.add_cyclic(Consumer {
+        seen,
+        drain: true,
+        init_counter: None,
+        first_exec_init: None,
+    });
+    b.connect(PortRef::new::<Imu>(prod), PortRef::new::<Imu>(cons))
+        .unwrap();
+    let cons_edges = b.resolve_edges().unwrap();
+    let fan_out = b.count_fan_out(&cons_edges);
+    let alloc = b.alloc_rings(&cons_edges, &fan_out).unwrap();
+    assert!(alloc.session.is_none());
+    assert!(alloc.ring_paths.is_empty());
+}
