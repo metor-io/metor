@@ -60,12 +60,18 @@ fn resolve_worker_exe(overridden: Option<&Path>) -> Result<PathBuf, ProcError> {
 }
 
 /// Run a describe-mode worker over `artifact` and return the raw postcard
-/// `SystemDescriptorMsg` bytes it wrote — the host-side twin of
-/// `fsw_describe`, with the dlopen quarantined in a short-lived child. The
-/// child's stderr is captured into the failure diagnostic.
-// Only the `kdl` wiring resolver drives describe workers today.
-#[cfg_attr(not(feature = "kdl"), allow(dead_code))]
-pub(crate) fn describe_via_worker(
+/// [`SystemDescriptorMsg`](crate::abi::SystemDescriptorMsg) bytes it wrote —
+/// the host-side twin of `fsw_describe`, with the dlopen quarantined in a
+/// short-lived child. Decode the bytes with
+/// [`SystemDescriptorMsg::into_descriptor`](crate::abi::SystemDescriptorMsg::into_descriptor)
+/// and register via
+/// [`add_proc_cyclic`](crate::CoordinatorBuilder::add_proc_cyclic); the KDL
+/// [`resolve`](crate::wiring::resolve) front-end does exactly this. The
+/// child's stderr is captured into the failure diagnostic. `worker_exe`
+/// `None` re-executes this binary (whose `main` must call [`worker_entry`]).
+///
+/// [`worker_entry`]: super::worker_entry
+pub fn describe_via_worker(
     worker_exe: Option<&Path>,
     artifact: &Path,
 ) -> Result<Vec<u8>, ProcError> {
