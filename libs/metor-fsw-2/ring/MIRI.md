@@ -14,7 +14,10 @@ use-after-free, leaks, and provenance violations that `cargo test` cannot see.
 Miri runs the **synchronous** tests (everything except `wait_writer_backpressures`
 and `wait_reader_borrows`, which need the async runtime Miri can't drive — they
 are `#[cfg(not(miri))]` — and the `mmap` tests, which are behind a non-default
-feature). The sync tests use only the `try_*` APIs + `std::thread`:
+feature). The `wake` module (behind the non-default `futex` feature) is
+syscall-based and excluded outright: its tests are `#[cfg(not(miri))]` and its
+cross-process behavior is exercised by real-process integration tests in
+`metor-fsw-2` instead. The sync tests use only the `try_*` APIs + `std::thread`:
 
 - Basic paths: `roundtrip`, `wraparound_aligned`, `multi_reader`,
   `reader_table_claim_free`, `backpressure`, `borrow_read`,
