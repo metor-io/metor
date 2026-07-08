@@ -128,9 +128,9 @@ pub mod wiring;
 pub mod abi;
 pub mod dl;
 
-// Cross-process systems need a shared futex; see docs/process-systems.md §2
-// for the platform floor.
-#[cfg(any(target_os = "linux", target_os = "macos"))]
+// Cross-process systems need a shared futex (Linux, macOS 14.4+); on other
+// targets the module reduces to a no-op `worker_entry` and `build()` rejects
+// process registrations. See docs/process-systems.md §2 for the floor.
 pub mod proc;
 
 pub use dynamic::{FrameList, FrameMap, Slot};

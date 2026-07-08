@@ -57,7 +57,8 @@
 //! coordinator is the loop rather than a member of it.
 
 use core::mem::offset_of;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{
     AtomicBool, AtomicU64, AtomicUsize,
@@ -83,6 +84,7 @@ use crate::dynamic::FrameList;
 use crate::health::{HealthPort, Level, SystemHealth, SystemLog};
 use crate::message::{LOG_DEPTH, MsgIn, MsgOut};
 use crate::port::{Input, Output, capacity_for};
+use crate::proc::session::SessionDir;
 use crate::registry::{EntrySchema, Registry, RegistryEntry};
 use crate::sequence::{SequenceStatus, SlotControlIn};
 use crate::system::{AsyncSystem, CyclicRunner, CyclicSystem, Out, System, SystemOutput};
@@ -137,6 +139,13 @@ pub struct CoordinatorConfig {
     /// [`FullReaderTable`](metor_fsw_ring::FullReaderTable) error at the claim
     /// site. Default `4`.
     pub reader_slack: usize,
+    /// How long a process system's step waits for the worker's ack before the
+    /// cycle moves on. A lapse with the child alive is telemetered as a
+    /// `proc_step_timeout` coordinator-health error; with the child dead it
+    /// hard-stops the slot ([`StopReason::ProcessDied`]). A healthy worker
+    /// never approaches this — the wall cycle budget is usually far tighter.
+    /// Default 100 ms.
+    pub proc_step_timeout: Duration,
 }
 
 impl Default for CoordinatorConfig {
@@ -146,6 +155,7 @@ impl Default for CoordinatorConfig {
             default_depth: DEFAULT_DEPTH,
             clock: ClockMode::Wall,
             reader_slack: READER_SLACK,
+            proc_step_timeout: Duration::from_millis(100),
         }
     }
 }
@@ -288,6 +298,13 @@ pub enum WireError {
     /// receive-all system. Async systems are exempt (they are not in the step
     /// order). Both fields are instance names.
     ReceiveAllNotLast { system: String, receive_all: String },
+    /// The run's shared-memory session (the mmap ring files process systems
+    /// exchange data over) could not be set up.
+    Shm { detail: String },
+    /// A process system's worker could not be spawned or never attached.
+    /// `system` is the instance name; `detail` carries the cause, including
+    /// the worker's own failure code when it reported one.
+    ProcSpawn { system: String, detail: String },
 }
 
 impl std::fmt::Display for WireError {
@@ -385,6 +402,12 @@ impl std::fmt::Display for WireError {
                 "unbroken feedback cycle {} — break one edge with connect_delayed",
                 systems.join(" -> ")
             ),
+            WireError::Shm { detail } => {
+                write!(f, "cannot set up the shared-memory session: {detail}")
+            }
+            WireError::ProcSpawn { system, detail } => {
+                write!(f, "process system '{system}': {detail}")
+            }
         }
     }
 }
@@ -398,11 +421,16 @@ impl std::error::Error for WireError {}
 /// Why a cyclic slot hard-stopped.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum StopReason {
-    /// A dlopen'd system panicked inside the `.so`; the boundary caught it and
+    /// A loaded system panicked inside its `.so`; the boundary caught it and
     /// returned [`FswStatus::Panicked`](crate::abi::FswStatus). Only reachable
-    /// for a [`DlSlot`](crate::dl); a static `CyclicRunner` cannot produce it
-    /// (a panic there unwinds the host directly).
+    /// for a [`DlSlot`](crate::dl) or its process twin; a static
+    /// `CyclicRunner` cannot produce it (a panic there unwinds the host
+    /// directly).
     Panicked,
+    /// A process system's worker died (crashed, was killed, or exited on its
+    /// own). Its ring roles were reclaimed, so the rest of the graph keeps
+    /// flowing; the stop is permanent, like a panic.
+    ProcessDied,
 }
 
 impl StopReason {
@@ -410,6 +438,7 @@ impl StopReason {
         match self {
             // Code `1` belonged to a retired reason; codes stay stable on the wire.
             StopReason::Panicked => 2,
+            StopReason::ProcessDied => 3,
         }
     }
 }
@@ -484,6 +513,12 @@ pub(crate) trait CyclicSlot {
     fn shutdown(&mut self);
     fn name(&self) -> &'static str;
     fn state(&self) -> &SlotState;
+    /// Host-side step timeouts since last drained. The coordinator folds them
+    /// into its own health (the worker owns the system's health ring, so a
+    /// process slot cannot report through it). Only `ProcSlot` overrides.
+    fn drain_timeouts(&mut self) -> u64 {
+        0
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -726,11 +761,25 @@ struct DlReg {
     params: Vec<u8>,
 }
 
+/// A registered process system: the artifact path a worker process will
+/// dlopen plus its postcard `Params` blob. The descriptor (on the enclosing
+/// [`Registration`]) arrived as decoded describe-worker bytes — the host
+/// holds no `DlSystem` and never loads the artifact itself. At `build()` it
+/// becomes a [`ProcSlot`](crate::proc); everything before that is the same
+/// uniform pass as every other kind.
+struct ProcReg {
+    artifact: PathBuf,
+    params: Vec<u8>,
+}
+
 enum Reg {
     Cyclic(Box<dyn CyclicRegistration>),
     Async(Box<dyn AsyncRegistration>),
     /// A dlopen'd cyclic system, bound to a [`DlSlot`](crate::dl) at `build()`.
     Dl(DlReg),
+    /// A cross-process cyclic system, spawned as a worker and bound to a
+    /// [`ProcSlot`](crate::proc) at `build()`.
+    Proc(ProcReg),
     /// A runtime-swappable slot, bound to a [`SlotRunner`](slot::SlotRunner) at `build()`.
     Slot(SlotReg),
     /// The coordinator itself, registered as system #0 under the reserved
@@ -764,6 +813,12 @@ pub struct CoordinatorBuilder {
     /// is an intentional one-cycle-delayed feedback edge, excluded from cycle
     /// detection.
     edges: Vec<(PortRef, PortRef, bool)>,
+    /// Override of the worker executable process systems spawn; `None`
+    /// re-executes the host binary (see [`worker_exe`](Self::worker_exe)).
+    worker_exe: Option<PathBuf>,
+    /// Override of the shared-memory session root; `None` picks `/dev/shm`
+    /// when present, else the OS temp dir (see [`shm_dir`](Self::shm_dir)).
+    shm_dir: Option<PathBuf>,
 }
 
 impl CoordinatorBuilder {
@@ -772,6 +827,8 @@ impl CoordinatorBuilder {
             config,
             systems: Vec::new(),
             edges: Vec::new(),
+            worker_exe: None,
+            shm_dir: None,
         };
         // The coordinator registers itself as system #0 under the reserved
         // instance name `"coordinator"`: an ordinary declared bundle, so its
@@ -921,6 +978,54 @@ impl CoordinatorBuilder {
                 params,
             }),
         )
+    }
+
+    /// Register a cross-process cyclic system under an explicit instance
+    /// name: the artifact at `artifact` will be dlopen'd and driven **in a
+    /// worker process** the coordinator spawns at `build()`
+    /// (`docs/process-systems.md`).
+    ///
+    /// The process twin of [`add_dl_cyclic`](Self::add_dl_cyclic), with one
+    /// deliberate difference: the host never loads the artifact, so instead
+    /// of an opened [`DlSystem`](crate::dl::DlSystem) this takes the already
+    /// decoded `descriptor` — obtained from a describe-mode worker run (the
+    /// [`resolve`](crate::wiring::resolve) front-end does this) — and the
+    /// canonical postcard `params` blob. Validation, sizing, and registry
+    /// entries run over the descriptor unchanged; the rings this system
+    /// touches are allocated mmap-backed in the run's session directory.
+    ///
+    /// Process systems are cyclic-only and need a cross-process futex;
+    /// `build()` rejects the registration on unsupported targets.
+    pub fn add_proc_cyclic(
+        &mut self,
+        name: impl Into<String>,
+        mut descriptor: SystemDescriptor,
+        artifact: PathBuf,
+        params: Vec<u8>,
+    ) -> SystemHandle {
+        // Cyclic-only, pinned here like the dl path: the registered kind is
+        // never trusted from decoded wire bytes.
+        descriptor.kind = SystemKind::Cyclic;
+        self.push_system(
+            descriptor,
+            name.into(),
+            Reg::Proc(ProcReg { artifact, params }),
+        )
+    }
+
+    /// Use `exe` as the worker executable for process systems instead of
+    /// re-executing the host binary. For hosts whose own binary cannot serve
+    /// as a worker (or wants a leaner one).
+    pub fn worker_exe(&mut self, exe: impl Into<PathBuf>) -> &mut Self {
+        self.worker_exe = Some(exe.into());
+        self
+    }
+
+    /// Root the run's shared-memory session directory at `dir` instead of
+    /// the default (`/dev/shm` when present, else the OS temp dir).
+    pub fn shm_dir(&mut self, dir: impl Into<PathBuf>) -> &mut Self {
+        self.shm_dir = Some(dir.into());
+        self
     }
 
     /// Register a runtime-swappable slot: a fixed position in the cyclic call
@@ -1138,18 +1243,32 @@ impl CoordinatorBuilder {
         self.validate_port_axes()?;
         let cons_edges = self.resolve_edges()?;
         let fan_out = self.count_fan_out(&cons_edges);
-        let mut alloc = self.alloc_rings(&fan_out);
+        let mut alloc = self.alloc_rings(&cons_edges, &fan_out)?;
         let seq_registry = self.seq_registry_payload();
         let registry = freeze_registry(std::mem::take(&mut alloc.reg_entries))?;
         let mut plumbing = self.plan_copy_ins(&cons_edges, &mut alloc);
         let Self {
-            config, systems, ..
+            config,
+            systems,
+            worker_exe,
+            ..
         } = self;
+        let proc_ctx = ProcBindCtx {
+            step_timeout: config.proc_step_timeout,
+            worker_exe,
+        };
         let BoundSystems {
             cyclic,
             pending_async,
             coord,
-        } = bind_systems(systems, &cons_edges, &alloc, &mut plumbing, &registry);
+        } = bind_systems(
+            systems,
+            &cons_edges,
+            &alloc,
+            &mut plumbing,
+            &registry,
+            &proc_ctx,
+        )?;
 
         Ok(Coordinator {
             config,
@@ -1171,6 +1290,7 @@ impl CoordinatorBuilder {
             started: false,
             // Declared last so the canonical ring handles drop after every port.
             rings: alloc.table,
+            session: alloc.session,
         })
     }
 
@@ -1446,6 +1566,27 @@ impl CoordinatorBuilder {
         fan_out
     }
 
+    /// Which output buffers cross a process boundary and must therefore be
+    /// file-backed: every output of a process system, plus every output some
+    /// process system consumes over an edge. Everything else stays heap.
+    fn shared_outputs(&self, cons_edges: &ConsEdges) -> HashSet<(usize, usize)> {
+        let mut shared = HashSet::new();
+        for (sid, sys) in self.systems.iter().enumerate() {
+            if !matches!(sys.reg, Reg::Proc(_)) {
+                continue;
+            }
+            for out_idx in 0..sys.desc.outputs.len() {
+                shared.insert((sid, out_idx));
+            }
+            for in_idx in 0..sys.desc.inputs.len() {
+                if let Some(producers) = cons_edges.get(&(sid, in_idx)) {
+                    shared.extend(producers.iter().copied());
+                }
+            }
+        }
+        shared
+    }
+
     /// Allocate one buffer per output port (health/log included) plus a
     /// dedicated ring per host-connected input, collecting the build-order
     /// registry entries: one list over every registered buffer, frames and
@@ -1453,7 +1594,18 @@ impl CoordinatorBuilder {
     /// extra fan-out reader on *every* buffer, so every ring's `max_readers`
     /// includes it, derived from the declared `ReceiveAll` capabilities with
     /// no per-consumer bookkeeping.
-    fn alloc_rings(&self, fan_out: &HashMap<(usize, usize), usize>) -> RingAlloc {
+    ///
+    /// A buffer in the [`shared_outputs`](Self::shared_outputs) set is
+    /// allocated as an mmap ring file in the run's [`SessionDir`] (created
+    /// lazily on the first one) and its path recorded for the worker
+    /// manifests; the in-process handle over the same mapping is used
+    /// everywhere the heap ring would have been — a ring is backing-erased,
+    /// so nothing downstream can tell.
+    fn alloc_rings(
+        &self,
+        cons_edges: &ConsEdges,
+        fan_out: &HashMap<(usize, usize), usize>,
+    ) -> Result<RingAlloc, WireError> {
         let depth = self.config.default_depth;
         let slack = self.config.reader_slack;
         let n_reg = self
@@ -1462,12 +1614,27 @@ impl CoordinatorBuilder {
             .flat_map(|sys| sys.desc.capabilities.iter())
             .filter(|c| **c == crate::Capability::ReceiveAll)
             .count();
+        let shared = self.shared_outputs(cons_edges);
 
+        // A graph with any process system gets its session directory up
+        // front: even a (pathological) portless worker still needs somewhere
+        // for its control block and manifest.
+        let session = if self.systems.iter().any(|s| matches!(s.reg, Reg::Proc(_))) {
+            Some(
+                SessionDir::create(self.shm_dir.as_deref()).map_err(|e| WireError::Shm {
+                    detail: e.to_string(),
+                })?,
+            )
+        } else {
+            None
+        };
         let mut alloc = RingAlloc {
             table: RingTable { rings: Vec::new() },
             output_rings: Vec::with_capacity(self.systems.len()),
             host_input_rings: HashMap::new(),
             reg_entries: Vec::new(),
+            session,
+            ring_paths: HashMap::new(),
         };
 
         // --- One buffer per output port -----------------------------------
@@ -1485,7 +1652,16 @@ impl CoordinatorBuilder {
                 // channels are ordinary outputs here: a slot reads a producer
                 // only over an explicit edge, so the edge fan-out counts its
                 // readers exactly.
-                let ring = alloc_ring(port.delivery, port.max_size, depth, readers);
+                let ring = if shared.contains(&(sid, out_idx)) {
+                    let session = alloc.session.as_ref().expect("proc graphs have a session");
+                    let path = session.path().join(format!("{instance}.{}.ring", port.name));
+                    let ring =
+                        alloc_ring_at(&path, port.delivery, port.max_size, depth, readers)?;
+                    alloc.ring_paths.insert((sid, out_idx), path);
+                    ring
+                } else {
+                    alloc_ring(port.delivery, port.max_size, depth, readers)
+                };
                 match &port.schema {
                     PortSchema::Table { .. } => {
                         alloc
@@ -1551,7 +1727,7 @@ impl CoordinatorBuilder {
             }
         }
 
-        alloc
+        Ok(alloc)
     }
 
     /// The boot `SequenceRegistry` payload: one spec per slot, keyed by the
@@ -1651,6 +1827,13 @@ struct RingAlloc {
     output_rings: Vec<Vec<RingBuffer>>,
     host_input_rings: HashMap<(usize, usize), RingBuffer>,
     reg_entries: Vec<RegistryEntry>,
+    /// The run's shared-memory session, created lazily by the first
+    /// file-backed ring; `None` for a graph with no process systems. Moves
+    /// into the [`Coordinator`], which owns the directory's lifetime.
+    session: Option<SessionDir>,
+    /// The ring file behind each file-backed output buffer, for the worker
+    /// manifests (`(system, out_idx)` → path).
+    ring_paths: HashMap<(usize, usize), PathBuf>,
 }
 
 /// The copy-in planning product: each async snapshot input's private ring plus
@@ -1694,23 +1877,33 @@ fn freeze_registry(reg_entries: Vec<RegistryEntry>) -> Result<Arc<Registry>, Wir
     Ok(Arc::new(Registry::new(reg_entries)))
 }
 
+/// What the proc bind arm needs beyond the shared alloc products: the step
+/// deadline and the worker-executable override, both builder-scoped.
+struct ProcBindCtx {
+    step_timeout: Duration,
+    worker_exe: Option<PathBuf>,
+}
+
 /// Bind every system's ports over the allocated rings, consuming the
 /// registrations. Each arm mirrors one registration kind; the static
 /// (host-side) arm builds typed `BoundPort`s and walks them with a [`Binder`].
+/// Only the proc arm can fail (its worker spawn is the one bind-time step
+/// that leaves the process).
 fn bind_systems(
     systems: Vec<Registration>,
     cons_edges: &ConsEdges,
     alloc: &RingAlloc,
     plumbing: &mut AsyncPlumbing,
     registry: &Arc<Registry>,
-) -> BoundSystems {
+    proc_ctx: &ProcBindCtx,
+) -> Result<BoundSystems, WireError> {
     let mut cyclic: Vec<Box<dyn CyclicSlot>> = Vec::new();
     let mut pending_async: Vec<PendingAsync> = Vec::new();
     // The coordinator's own (#0) ports, wrapped by its bind arm below and
     // unwrapped after the loop (`Reg::Coordinator` is always registered first).
     let mut coord: Option<CoordinatorPorts> = None;
     for (id, registration) in systems.into_iter().enumerate() {
-        let Registration { reg, desc, .. } = registration;
+        let Registration { reg, desc, name } = registration;
         match reg {
             Reg::Coordinator => coord = Some(bind_coordinator(id, &desc, &alloc.output_rings)),
             Reg::Dl(dl) => cyclic.push(Box::new(bind_dl(
@@ -1720,6 +1913,9 @@ fn bind_systems(
                 cons_edges,
                 &alloc.output_rings,
             ))),
+            Reg::Proc(proc_reg) => cyclic.push(bind_proc(
+                id, proc_reg, &desc, name, cons_edges, alloc, proc_ctx,
+            )?),
             Reg::Slot(slot_reg) => {
                 cyclic.push(Box::new(bind_slot(id, slot_reg, &desc, cons_edges, alloc)))
             }
@@ -1786,8 +1982,9 @@ fn bind_systems(
                         launcher: r.bind(&mut binder),
                         wake_on_stop: std::mem::take(&mut plumbing.async_wakes[id]),
                     }),
-                    // The dl/slot/coordinator arms are handled by the outer match.
+                    // The dl/proc/slot/coordinator arms are handled by the outer match.
                     Reg::Dl(_) => unreachable!("dl registration bound by the outer match"),
+                    Reg::Proc(_) => unreachable!("proc registration bound by the outer match"),
                     Reg::Slot(_) => unreachable!("slot registration bound by the outer match"),
                     Reg::Coordinator => {
                         unreachable!("coordinator registration bound by the outer match")
@@ -1797,12 +1994,12 @@ fn bind_systems(
         }
     }
 
-    BoundSystems {
+    Ok(BoundSystems {
         cyclic,
         pending_async,
         // Always registered by CoordinatorBuilder::new, so the unwrap is structural.
         coord: coord.expect("coordinator #0 bound its ports"),
-    }
+    })
 }
 
 /// The coordinator's own bundle: a marker registration, not a cyclic slot (the
@@ -1891,6 +2088,83 @@ fn bind_dl(
     // `fsw_destroy`) before `rings`. The `DlSystem` handle drops right after;
     // the slot keeps its own `Arc<Library>`.
     unsafe { dl.system.make_slot(&dl.params, inputs, outputs, desc.name) }
+}
+
+/// The proc twin of [`bind_dl`]: gather the same per-port rings, but as
+/// session-dir *file paths* for the worker to attach (in the identical
+/// positional order, so the worker-side bind contract is untouched), plus
+/// host handles of the same rings for death reclamation; then write the
+/// manifest, spawn the worker, and wait for it to attach.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn bind_proc(
+    id: usize,
+    proc_reg: ProcReg,
+    desc: &SystemDescriptor,
+    name: String,
+    cons_edges: &ConsEdges,
+    alloc: &RingAlloc,
+    ctx: &ProcBindCtx,
+) -> Result<Box<dyn CyclicSlot>, WireError> {
+    use crate::proc::host::{ProcSlot, SpawnSpec};
+    let session = alloc.session.as_ref().expect("proc graphs have a session");
+    // Every ring the worker touches, as (host handle, file path): this
+    // system's own outputs, then the producer ring behind each input.
+    let mut rings: Vec<RingBuffer> = Vec::new();
+    let output_paths: Vec<PathBuf> = (0..desc.outputs.len())
+        .map(|out_idx| {
+            rings.push(alloc.output_rings[id][out_idx].clone());
+            alloc.ring_paths[&(id, out_idx)].clone()
+        })
+        .collect();
+    let input_paths: Vec<PathBuf> = (0..desc.inputs.len())
+        .map(|in_idx| {
+            let (prod, out) = cons_edges[&(id, in_idx)][0];
+            rings.push(alloc.output_rings[prod][out].clone());
+            alloc.ring_paths[&(prod, out)].clone()
+        })
+        .collect();
+    // The slot's `&'static str` identity; one leak per process system, the
+    // same rate as the dl loader's name leaks.
+    let leaked: &'static str = Box::leak(name.clone().into_boxed_str());
+    let spec = SpawnSpec {
+        instance: name.clone(),
+        artifact: proc_reg.artifact,
+        params: proc_reg.params,
+        ctl_path: session.path().join(format!("{name}.ctl")),
+        manifest_path: session.path().join(format!("{name}.manifest")),
+        input_paths,
+        output_paths,
+        rings,
+        worker_exe: ctx.worker_exe.clone(),
+        step_timeout: ctx.step_timeout,
+        name: leaked,
+    };
+    ProcSlot::spawn(spec)
+        .map(|slot| Box::new(slot) as Box<dyn CyclicSlot>)
+        .map_err(|detail| WireError::ProcSpawn {
+            system: name,
+            detail,
+        })
+}
+
+/// Without a cross-process futex there is no worker protocol; the
+/// registration is rejected cleanly at `build()`.
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn bind_proc(
+    _id: usize,
+    _proc_reg: ProcReg,
+    _desc: &SystemDescriptor,
+    name: String,
+    _cons_edges: &ConsEdges,
+    _alloc: &RingAlloc,
+    _ctx: &ProcBindCtx,
+) -> Result<Box<dyn CyclicSlot>, WireError> {
+    Err(WireError::ProcSpawn {
+        system: name,
+        detail: "process systems need a cross-process futex (Linux or macOS 14.4+); \
+                 unsupported on this target"
+            .into(),
+    })
 }
 
 /// A runtime slot: gather the same per-port regions as the dl arm, but locate
@@ -2115,6 +2389,32 @@ fn alloc_ring(
     })
 }
 
+/// The mmap sibling of [`alloc_ring`]: identical sizing, but the region is a
+/// file in the run's session directory, attachable by a worker process. An
+/// I/O failure is a build-time [`WireError::Shm`].
+fn alloc_ring_at(
+    path: &std::path::Path,
+    delivery: Delivery,
+    max_size: usize,
+    default_depth: usize,
+    max_readers: usize,
+) -> Result<RingBuffer, WireError> {
+    let depth = match delivery {
+        Delivery::Snapshot => default_depth,
+        Delivery::Log => LOG_DEPTH,
+    };
+    RingBuffer::create_mmap(
+        path,
+        Config {
+            capacity: capacity_for(max_size, depth),
+            max_readers,
+        },
+    )
+    .map_err(|e| WireError::Shm {
+        detail: format!("ring `{}`: {e}", path.display()),
+    })
+}
+
 /// Mint the single [`MsgOut`] writer over a coordinator-owned ring, the
 /// [`slot_writer`] analogue for a message channel. Called exactly once per
 /// ring at build; the region's writer claim enforces it.
@@ -2237,6 +2537,12 @@ pub struct Coordinator {
     /// Canonical ring handles; declared last so they drop after every port.
     #[allow(dead_code)]
     rings: RingTable,
+    /// The run's shared-memory session directory (`None` without process
+    /// systems). After `rings`, so the files are unmapped before the
+    /// directory is removed; the slots (and their workers) died earlier
+    /// still, in `cyclic`'s drop.
+    #[allow(dead_code)]
+    session: Option<SessionDir>,
 }
 
 impl Coordinator {
@@ -2474,6 +2780,21 @@ impl Coordinator {
     /// scratch and swaps it with `stopped` on a change, so nothing allocates
     /// per cycle.
     fn update_status(&mut self, now: Timestamp) {
+        // Host-side step timeouts (a process worker missing its ack deadline)
+        // land on coordinator health: the worker owns its system's health
+        // ring, so the host cannot report through it. At most one per slot
+        // per cycle.
+        let mut timed_out = false;
+        for slot in &mut self.cyclic {
+            if slot.drain_timeouts() > 0 {
+                self.coord_health.error("proc_step_timeout");
+                self.coord_health.log(Level::Warn, slot.name());
+                timed_out = true;
+            }
+        }
+        if timed_out {
+            self.coord_health.end_cycle(now, 0);
+        }
         self.stopped_scratch.clear();
         for slot in &self.cyclic {
             // Only a hard stop is an error-stop; a runtime slot's
