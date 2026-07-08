@@ -1737,3 +1737,63 @@ impl BuildSystem for CmdSinkInert {
         CmdSinkInert
     }
 }
+
+// ---------------------------------------------------------------------------
+// Process systems: the `process=#true` surface.
+// ---------------------------------------------------------------------------
+
+/// `process=#true` parses onto the spec, requires `artifact=`, defaults off,
+/// and the two front-ends produce the identical `Wiring`.
+#[test]
+fn process_flag_parses_and_matches_builder() {
+    let kdl = r#"
+coordinator cycle_rate=100.0
+artifact "plant" crate="adcs-plant" lib="adcs_plant" type="Plant"
+system "plant" artifact="plant" process=#true
+system "obs" artifact="plant"
+"#;
+    let wiring = parse(kdl).expect("process=#true parses");
+    assert!(wiring.systems[0].process);
+    assert!(!wiring.systems[1].process, "defaults to in-process");
+
+    let built = WiringBuilder::new()
+        .coordinator(100.0, ClockSpec::Wall)
+        .artifact("plant", "adcs-plant", "adcs_plant", "Plant")
+        .system("plant")
+        .from_artifact("plant")
+        .process()
+        .end()
+        .system("obs")
+        .from_artifact("plant")
+        .end()
+        .build();
+    assert_eq!(wiring, built, "the two front-ends agree");
+}
+
+/// `process=#true` without an artifact is rejected at parse (KDL) and at
+/// resolve (a builder-origin spec).
+#[test]
+fn process_without_artifact_is_rejected() {
+    let err = parse(
+        r#"
+coordinator cycle_rate=100.0
+system "nav" type="Nav" process=#true
+"#,
+    )
+    .expect_err("process without artifact must not parse");
+    assert!(matches!(err, LoadError::ProcessNeedsArtifact { .. }), "{err:?}");
+
+    // Builder-origin: the parse guard is bypassed, resolve catches it.
+    let wiring = WiringBuilder::new()
+        .coordinator(100.0, ClockSpec::Wall)
+        .system("src")
+        .ty("Src")
+        .process()
+        .end()
+        .build();
+    let err = match resolve(&wiring, &registry()) {
+        Ok(_) => panic!("resolve must reject process without artifact"),
+        Err(e) => e,
+    };
+    assert!(matches!(err, LoadError::ProcessNeedsArtifact { .. }), "{err:?}");
+}

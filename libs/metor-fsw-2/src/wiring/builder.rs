@@ -119,6 +119,7 @@ impl WiringBuilder {
             ty: None,
             artifact: None,
             params: ParamSource::None,
+            process: false,
         }
     }
 
@@ -314,6 +315,7 @@ pub struct SystemSpecBuilder {
     ty: Option<String>,
     artifact: Option<String>,
     params: ParamSource,
+    process: bool,
 }
 
 impl SystemSpecBuilder {
@@ -330,6 +332,15 @@ impl SystemSpecBuilder {
     /// Resolves this system by loading the named [`Artifact`] at run time.
     pub fn from_artifact(mut self, artifact_id: impl Into<String>) -> Self {
         self.artifact = Some(artifact_id.into());
+        self
+    }
+
+    /// Runs this [`from_artifact`](Self::from_artifact) system in its own
+    /// worker process instead of dlopen'ing it in-process — the builder twin
+    /// of `process=#true` (`docs/process-systems.md`). Resolve rejects the
+    /// toggle on a system without an artifact.
+    pub fn process(mut self) -> Self {
+        self.process = true;
         self
     }
 
@@ -365,6 +376,7 @@ impl SystemSpecBuilder {
             ty: self.ty,
             artifact: self.artifact,
             params: self.params,
+            process: self.process,
         });
         self.parent
     }

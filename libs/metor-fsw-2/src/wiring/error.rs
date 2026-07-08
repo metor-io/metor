@@ -68,6 +68,53 @@ pub enum LoadError {
         span: SourceSpan,
     },
 
+    #[error("`system \"{name}\"` sets `process=#true` without an `artifact=`")]
+    #[diagnostic(
+        code(fsw_wiring::process_needs_artifact),
+        help(
+            "a process system runs in a worker that loads its cdylib, so only \
+             artifact-backed systems can cross; a static-registry type cannot"
+        )
+    )]
+    ProcessNeedsArtifact {
+        name: String,
+        #[source_code]
+        src: String,
+        #[label("add `artifact=\"...\"` or drop `process`")]
+        span: SourceSpan,
+    },
+
+    #[error("`system \"{name}\"` sets `process=#true`, unsupported on this target")]
+    #[diagnostic(
+        code(fsw_wiring::process_unsupported),
+        help("process systems need a cross-process futex: Linux or macOS 14.4+")
+    )]
+    ProcessUnsupported {
+        name: String,
+        #[source_code]
+        src: String,
+        #[label("this system cannot run cross-process here")]
+        span: SourceSpan,
+    },
+
+    #[error("describe worker for `system \"{system}\"` (artifact `{artifact}`) failed: {detail}")]
+    #[diagnostic(
+        code(fsw_wiring::proc_describe),
+        help(
+            "the worker dlopens the artifact and reports its descriptor; its captured \
+             stderr is in the message above"
+        )
+    )]
+    ProcDescribe {
+        system: String,
+        artifact: String,
+        detail: String,
+        #[source_code]
+        src: String,
+        #[label("describing this system's artifact failed")]
+        span: SourceSpan,
+    },
+
     #[error("duplicate instance name `{name}`")]
     #[diagnostic(code(fsw_wiring::duplicate_instance))]
     DuplicateInstance {

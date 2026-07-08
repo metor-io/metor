@@ -97,7 +97,7 @@ pub use crate::register_system;
 
 /// Line-property keys of a `system` node that belong to the wiring surface,
 /// not the params struct.
-pub(crate) const SYSTEM_RESERVED: &[&str] = &["type", "artifact"];
+pub(crate) const SYSTEM_RESERVED: &[&str] = &["type", "artifact", "process"];
 /// Line-property keys of a slot `allow` node that belong to the wiring surface.
 pub(crate) const ALLOW_RESERVED: &[&str] = &["occupant"];
 
@@ -363,9 +363,20 @@ pub fn resolve(wiring: &Wiring, registry: &Registry) -> Result<Coordinator, Load
     // static branch defers; dl systems never carry capabilities.
     let mut deferred: Vec<&SystemSpec> = Vec::new();
     for spec in &wiring.systems {
-        let (handle, desc) = match &spec.artifact {
-            Some(artifact_id) => resolve_dl(spec, artifact_id, wiring, &mut builder)?,
-            None => {
+        let (handle, desc) = match (&spec.artifact, spec.process) {
+            (Some(artifact_id), true) => resolve_proc(spec, artifact_id, wiring, &mut builder)?,
+            (Some(artifact_id), false) => resolve_dl(spec, artifact_id, wiring, &mut builder)?,
+            (None, true) => {
+                // The KDL front-end rejects this at parse; a builder-origin
+                // spec lands here.
+                let src = system_src(spec);
+                return Err(LoadError::ProcessNeedsArtifact {
+                    name: spec.name.clone(),
+                    span: (0, src.len()).into(),
+                    src,
+                });
+            }
+            (None, false) => {
                 if registry.is_receive_all(spec.ty.as_deref()) {
                     deferred.push(spec);
                     continue;
@@ -547,24 +558,8 @@ fn open_occupant<'w>(
     src: &str,
     span: SourceSpan,
 ) -> Result<(DlSystem, Vec<u8>, &'w Artifact), LoadError> {
-    let artifact = wiring
-        .artifacts
-        .iter()
-        .find(|a| a.id == artifact_id)
-        .ok_or_else(|| LoadError::UnknownArtifact {
-            system: owner.to_string(),
-            artifact: artifact_id.to_string(),
-            src: src.to_string(),
-            span,
-        })?;
-    let path = artifact
-        .path
-        .as_ref()
-        .ok_or_else(|| LoadError::ArtifactNotBuilt {
-            artifact: artifact_id.to_string(),
-            src: src.to_string(),
-            span,
-        })?;
+    let artifact = find_built_artifact(wiring, artifact_id, owner, src, span)?;
+    let path = artifact.path.as_ref().expect("checked by find_built_artifact");
     let loaded = DlSystem::open(path).map_err(|source| LoadError::DlOpen {
         system: owner.to_string(),
         artifact: artifact_id.to_string(),
@@ -624,6 +619,102 @@ fn resolve_dl(
     let desc = loaded.descriptor().clone();
     let handle = builder.add_dl_cyclic(&spec.name, loaded, params);
     Ok((handle, desc))
+}
+
+/// Find an [`Artifact`] by id and require its built `path`, the shared front
+/// of [`open_occupant`] and [`resolve_proc`].
+fn find_built_artifact<'w>(
+    wiring: &'w Wiring,
+    artifact_id: &str,
+    owner: &str,
+    src: &str,
+    span: SourceSpan,
+) -> Result<&'w Artifact, LoadError> {
+    let artifact = wiring
+        .artifacts
+        .iter()
+        .find(|a| a.id == artifact_id)
+        .ok_or_else(|| LoadError::UnknownArtifact {
+            system: owner.to_string(),
+            artifact: artifact_id.to_string(),
+            src: src.to_string(),
+            span,
+        })?;
+    if artifact.path.is_none() {
+        return Err(LoadError::ArtifactNotBuilt {
+            artifact: artifact_id.to_string(),
+            src: src.to_string(),
+            span,
+        });
+    }
+    Ok(artifact)
+}
+
+/// Resolve a `process=#true` system (`docs/process-systems.md`): run a
+/// **describe-mode worker** over the built artifact — the host never dlopens
+/// it — decode the descriptor and `Params` schema from the worker's bytes,
+/// encode the spec's params against that schema, and register through
+/// [`CoordinatorBuilder::add_proc_cyclic`]. The run worker is spawned later,
+/// at `build()`.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn resolve_proc(
+    spec: &SystemSpec,
+    artifact_id: &str,
+    wiring: &Wiring,
+    builder: &mut CoordinatorBuilder,
+) -> Result<(SystemHandle, SystemDescriptor), LoadError> {
+    let src = system_src(spec);
+    let span: SourceSpan = (0, src.len()).into();
+    let artifact = find_built_artifact(wiring, artifact_id, &spec.name, &src, span)?;
+    // `type=` agreement, as in `resolve_dl`.
+    if let Some(ty) = &spec.ty
+        && ty != &artifact.system_type
+    {
+        return Err(LoadError::TypeMismatchesArtifact {
+            system: spec.name.clone(),
+            ty: ty.clone(),
+            artifact_type: artifact.system_type.clone(),
+            src: src.clone(),
+            span,
+        });
+    }
+    let path = artifact.path.as_ref().expect("checked by find_built_artifact");
+    let proc_describe = |detail: String| LoadError::ProcDescribe {
+        system: spec.name.clone(),
+        artifact: artifact_id.to_string(),
+        detail,
+        src: src.clone(),
+        span,
+    };
+    let bytes = crate::proc::host::describe_via_worker(None, path)
+        .map_err(|e| proc_describe(e.to_string()))?;
+    let (desc, params_schema) =
+        crate::dl::decode_descriptor_msg(&bytes).map_err(|e| proc_describe(e.to_string()))?;
+    let params: Vec<u8> = match &spec.params {
+        ParamSource::None => Vec::new(),
+        ParamSource::Postcard(bytes) => bytes.clone(),
+        ParamSource::Kdl(node_text) => {
+            encode_kdl_params(node_text, &params_schema, &spec.name, SYSTEM_RESERVED, 1)?
+        }
+    };
+    let handle = builder.add_proc_cyclic(&spec.name, desc.clone(), path.clone(), params);
+    Ok((handle, desc))
+}
+
+/// Without a cross-process futex there is no worker to describe or run.
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn resolve_proc(
+    spec: &SystemSpec,
+    _artifact_id: &str,
+    _wiring: &Wiring,
+    _builder: &mut CoordinatorBuilder,
+) -> Result<(SystemHandle, SystemDescriptor), LoadError> {
+    let src = system_src(spec);
+    Err(LoadError::ProcessUnsupported {
+        name: spec.name.clone(),
+        span: (0, src.len()).into(),
+        src,
+    })
 }
 
 /// A best-effort source snippet for a system's resolve-time errors (a

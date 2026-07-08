@@ -122,6 +122,12 @@ pub struct SystemSpec {
     pub artifact: Option<String>,
     /// Where this system's params come from.
     pub params: ParamSource,
+    /// `true` runs the artifact in its own worker process (`process=#true`,
+    /// `docs/process-systems.md`); requires `artifact`. Default `false`: a
+    /// loaded system runs in-process. A document that omits the property
+    /// deserializes unchanged.
+    #[serde(default)]
+    pub process: bool,
 }
 
 impl SystemSpec {
@@ -150,6 +156,7 @@ impl SystemSpec {
             ty: Some(ty.to_string()),
             artifact: None,
             params: ParamSource::Kdl(format!("system \"{name}\" type=\"{ty}\" addr=\"{addr}\"")),
+            process: false,
         }
     }
 }
