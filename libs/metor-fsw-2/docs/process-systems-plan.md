@@ -269,3 +269,32 @@ this one file, calling `worker_entry()` then `libtest_mimic`-style or plain sequ
 - **R5 — ring version bump:** v3 regions reject v2 attaches (and vice versa). Regions are
   ephemeral, but any long-running panel/db tooling that attaches rings directly must be rebuilt
   in the same train; check for out-of-tree `attach_raw` users before landing W2.
+
+---
+
+## Follow-on: W9 restart + W10 worker telemetry (landed 2026-07-08)
+
+- **W9 — restart.** `ProcSlot` grew a non-blocking phase machine (`Running` →
+  `Backoff` → `Attaching` → `Initing` → back to `Running`, or `Terminal` past
+  the budget), polled one phase per cycle so a respawn never stalls the loop.
+  Restart applies to `ProcessDied` *and* worker-side `Panicked` (quarantined,
+  so restartable — unlike the in-process dl path). Knobs:
+  `CoordinatorConfig::proc_max_restarts` (default 3, `0` = permanent-stop) and
+  `proc_restart_backoff` (default 500 ms). Respawn reuses the persisted
+  manifest over a recreated control block; every attempt costs one unit of
+  budget; each begun restart drains into coordinator health as `proc_restart`.
+- **W10 — telemetry.** `CoordinatorStatus` gained `worker_count` plus a
+  `FrameList<WorkerEntry, MAX_WORKERS>`: per process system the worker pid
+  (`0` between workers), restart count, and a `WorkerRunState` code
+  (Stopped=0/Restarting=1/Running=2), republished on any change (a restart's
+  new pid included). `CyclicSlot::proc_info` is the collection hook (only
+  `ProcSlot` overrides) and `Coordinator::workers()` the host-side accessor.
+- **e2e:** the death test pins `proc_max_restarts: 0` (the opt-out), and
+  `worker_restarts_then_exhausts_budget` kills the worker, proves a
+  replacement spawns and produces, kills it too past a budget of 1, and
+  asserts the terminal stop, `restarts == 1`, pid `0`, and a never-blocked
+  producer.
+- **Slots:** process mode still applies to `system` nodes only; a
+  worker-per-occupant mode for runtime slots is future work (the occupant
+  Load/Unload lifecycle would map onto spawn/kill, which the restart
+  machinery now provides the primitive for).

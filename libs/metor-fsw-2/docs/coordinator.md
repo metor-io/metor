@@ -425,15 +425,19 @@ explicit `Reset` to become `Loaded` again, not an automatic clear).
 
 ### 3.5 Surfacing stopped systems
 
-Each cycle, `update_status(now)` scans the slots and collects the currently-stopped set. When that
-set changes it:
+Each cycle, `update_status(now)` scans the slots and collects the currently-stopped set plus the
+process systems' worker facts. When either changes it:
 
 - refreshes the `CoordinatorStatus` frame (`publish_status`) — a coordinator-owned output frame
   (NAME `"coordinator"`, frame name `"coordinator_status"`) carrying a `FrameList<StoppedEntry>` of
   up to `MAX_STOPPED` (= 32) entries, each a reason code plus a fixed-capacity name buffer
-  (`STATUS_NAME_CAP` = 48); and
-- logs the change to coordinator health (an `system_stopped` error counter plus a `Level::Warn` log
-  line per stopped system, then `end_cycle`).
+  (`STATUS_NAME_CAP` = 48), and a `FrameList<WorkerEntry>` of up to `MAX_WORKERS` (= 32) entries —
+  one per process system, carrying the worker's pid (`0` between workers), restart count, and a
+  `WorkerRunState` code (Stopped=0/Restarting=1/Running=2), which is how telemetry says a system
+  runs out-of-process at all (`Coordinator::workers()` is the host-side accessor); and
+- logs a stopped-set change to coordinator health (a `system_stopped` error counter plus a
+  `Level::Warn` log line per stopped system, then `end_cycle`). Worker step timeouts and restarts
+  land there too, as `proc_step_timeout` / `proc_restart` counters.
 
 `Coordinator::stopped()` returns the live `&[StoppedSystem]` and `read_status()` reads the published
 status frame back (name + reason code), for telemetry and test inspection.
