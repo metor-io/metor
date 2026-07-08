@@ -13,8 +13,10 @@
 //! The design and its rationale live in `docs/process-systems.md`.
 
 pub(crate) mod ctl;
+pub(crate) mod worker;
 
 pub use ctl::{CtlError, CtlHost, CtlWorker, StepOutcome, WorkerCmd, WorkerState};
+pub use worker::{WORKER_ENV, WorkerManifest, worker_entry};
 
 #[cfg(test)]
 mod tests;
