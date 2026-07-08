@@ -169,6 +169,51 @@ unsafe fn resolve<'lib, T>(
     })
 }
 
+/// Load the object at `path`, check its ABI word, and collect the raw
+/// postcard [`SystemDescriptorMsg`] bytes from `fsw_describe`. The shared
+/// front of [`DlSystem::open`] and [`describe_raw`].
+fn open_and_describe(path: &OsStr) -> Result<(Library, Vec<u8>), DlError> {
+    // SAFETY: `dlopen` runs the object's initializers; a system `cdylib`
+    // has none beyond Rust's, and the path is caller-chosen. There is no
+    // safer form.
+    let lib = unsafe { Library::new(path) }.map_err(DlError::Open)?;
+
+    // --- Check the ABI word before any other call -----------------------
+    let found = {
+        // SAFETY: the export is a `fn() -> u32`.
+        let f: Symbol<AbiVersionFn> =
+            unsafe { resolve(&lib, abi::SYM_ABI_VERSION, "fsw_abi_version")? };
+        // SAFETY: a plain version read, no arguments.
+        unsafe { f() }
+    };
+    if found != FSW_ABI_VERSION {
+        return Err(DlError::VersionMismatch {
+            found,
+            expected: FSW_ABI_VERSION,
+        });
+    }
+
+    // SAFETY: the export is `fsw_describe(sink, ctx) -> i32`.
+    let describe: Symbol<DescribeFn> = unsafe { resolve(&lib, abi::SYM_DESCRIBE, "fsw_describe")? };
+    let mut buf: Vec<u8> = Vec::new();
+    // SAFETY: `collect_sink` and `&mut buf` form a matching callback
+    // pair; the shared object calls the sink with a buffer it owns for
+    // the duration of the call.
+    let rc = unsafe { describe(collect_sink, &mut buf as *mut Vec<u8> as *mut c_void) };
+    if rc != 0 {
+        return Err(DlError::Describe(rc));
+    }
+    Ok((lib, buf))
+}
+
+/// The raw describe bytes alone, for the worker's describe mode: the object
+/// is loaded, ABI-checked, described, and unloaded *in this process*, and the
+/// host decodes the bytes without ever loading the object itself
+/// (`docs/process-systems.md` §5).
+pub(crate) fn describe_raw(path: impl AsRef<OsStr>) -> Result<Vec<u8>, DlError> {
+    open_and_describe(path.as_ref()).map(|(_lib, buf)| buf)
+}
+
 impl DlSystem {
     /// Opens the artifact at `path`, resolves every `fsw_*` symbol, checks the
     /// ABI version word, and describes it into a [`SystemDescriptor`].
@@ -176,41 +221,12 @@ impl DlSystem {
     /// Any failure is a [`DlError`]; a missing or incompatible artifact never
     /// crashes the host.
     pub fn open(path: impl AsRef<OsStr>) -> Result<Self, DlError> {
-        // SAFETY: `dlopen` runs the object's initializers; a system `cdylib`
-        // has none beyond Rust's, and the path is caller-chosen. There is no
-        // safer form.
-        let lib = unsafe { Library::new(path) }.map_err(DlError::Open)?;
+        let (lib, buf) = open_and_describe(path.as_ref())?;
 
-        // --- Check the ABI word before any other call -----------------------
-        let found = {
-            // SAFETY: the export is a `fn() -> u32`.
-            let f: Symbol<AbiVersionFn> =
-                unsafe { resolve(&lib, abi::SYM_ABI_VERSION, "fsw_abi_version")? };
-            // SAFETY: a plain version read, no arguments.
-            unsafe { f() }
-        };
-        if found != FSW_ABI_VERSION {
-            return Err(DlError::VersionMismatch {
-                found,
-                expected: FSW_ABI_VERSION,
-            });
-        }
-
-        // --- Describe, decode, and reconstruct the descriptor ---------------
+        // --- Decode and reconstruct the descriptor --------------------------
         // The `Params` schema is cloned off the message before `into_descriptor`
         // consumes it, so the host can schema-encode KDL params later.
         let (descriptor, params_schema) = {
-            // SAFETY: the export is `fsw_describe(sink, ctx) -> i32`.
-            let describe: Symbol<DescribeFn> =
-                unsafe { resolve(&lib, abi::SYM_DESCRIBE, "fsw_describe")? };
-            let mut buf: Vec<u8> = Vec::new();
-            // SAFETY: `collect_sink` and `&mut buf` form a matching callback
-            // pair; the shared object calls the sink with a buffer it owns for
-            // the duration of the call.
-            let rc = unsafe { describe(collect_sink, &mut buf as *mut Vec<u8> as *mut c_void) };
-            if rc != 0 {
-                return Err(DlError::Describe(rc));
-            }
             let msg: SystemDescriptorMsg = postcard::from_bytes(&buf).map_err(DlError::Decode)?;
             let msg = reject_capabilities(msg)?;
             let params_schema = msg.params_schema.clone();
