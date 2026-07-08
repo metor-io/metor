@@ -22,7 +22,8 @@ metor-fsw = { path = "../metor-fsw", default-features = false, features = ["std"
 metor-fsw-2-macros = { path = "macros" }
 
 # channels
-metor-fsw-ring = { path = "ring", default-features = false, features = ["async"] }
+metor-fsw-ring = { path = "ring", default-features = false, features = ["async", "mmap", "futex"] }
+memmap2 = "0.9"
 
 # async
 stellarator = { path = "../stellarator" }
@@ -54,3 +55,6 @@ kdl = ["dep:kdl", "dep:miette", "dep:postcard-dyn", "dep:serde_json", "dep:clap"
 name = "metor-fsw"
 path = "src/bin/metor-fsw.rs"
 required-features = ["kdl"]
+
+[dev-dependencies]
+tempfile = "3.13"

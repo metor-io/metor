@@ -128,6 +128,11 @@ pub mod wiring;
 pub mod abi;
 pub mod dl;
 
+// Cross-process systems need a shared futex; see docs/process-systems.md §2
+// for the platform floor.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+pub mod proc;
+
 pub use dynamic::{FrameList, FrameMap, Slot};
 pub use frame::Frame;
 pub use reader::{ListReader, MapReader};
