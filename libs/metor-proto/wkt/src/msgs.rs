@@ -657,6 +657,323 @@ impl Msg for AlarmAck {
     const ID: PacketId = [224, 40];
 }
 
+/// Stable identity for a sequence channel, assigned by the control system. A channel is
+/// a slot that holds at most one loaded sequence at a time.
+pub type ChannelId = u64;
+
+/// Human-readable name of a sequence, e.g. `"deploy_solar_array"`. Sequences are
+/// referenced by name when loaded into a channel.
+pub type SequenceName = String;
+
+/// One channel slot declared by the control system: its identity, display name, and the
+/// set of sequence names that may be loaded into it.
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct SequenceChannelSpec {
+    pub id: ChannelId,
+    pub name: String,
+    pub available: Vec<SequenceName>,
+}
+
+/// Whole-registry declaration of the sequence channels, broadcast by the control system.
+/// Re-publishing replaces the registry — the latest wins. This is the configuration the
+/// sequence UI sources from the control system.
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct SequenceRegistry {
+    pub channels: Vec<SequenceChannelSpec>,
+}
+
+impl Msg for SequenceRegistry {
+    const ID: PacketId = [224, 41];
+}
+
+/// Run state of a channel's loaded sequence, as reported by the control system.
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum SequenceRunState {
+    Idle,
+    Running,
+    Stopped,
+    Aborted,
+    Completed,
+    Failed,
+}
+
+/// A single transition in a channel's lifecycle. Events arrive in order through one log,
+/// so the per-channel state machine (`Loaded` → `Started` → `Progress`* → terminal) is
+/// totally ordered.
+#[derive(Serialize, Deserialize, Debug, Clone)]
+#[serde(rename_all = "snake_case")]
+pub enum SequenceEventKind {
+    /// A sequence was loaded into the channel.
+    Loaded { name: SequenceName },
+    /// The channel's loaded sequence was cleared.
+    Unloaded,
+    Started,
+    /// The sequence made progress — sent a message, advanced a step, etc. The `detail`
+    /// becomes the channel's latest status line.
+    Progress { detail: String },
+    /// Hard-stopped (dropped). May have left the system in an unsafe state.
+    Stopped,
+    /// Commanded safe-termination ran to completion.
+    Aborted,
+    Completed,
+    Failed { reason: String },
+}
+
+/// A granular per-channel state update, broadcast by the control system (control → panel).
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct SequenceChannelEvent {
+    pub channel_id: ChannelId,
+    pub kind: SequenceEventKind,
+}
+
+impl Msg for SequenceChannelEvent {
+    const ID: PacketId = [224, 42];
+}
+
+/// An operator command on a channel, published by the panel (panel → control). The
+/// control system executes it and reports the result via [`SequenceChannelEvent`].
+#[derive(Serialize, Deserialize, Debug, Clone)]
+#[serde(rename_all = "snake_case")]
+pub enum SequenceCommandKind {
+    /// Load the named sequence into the channel.
+    Load { name: SequenceName },
+    Start,
+    /// Commanded safe-termination.
+    Abort,
+    /// Hard-stop (drop) — may leave the system unsafe.
+    Stop,
+    /// Rebuild the loaded sequence from the beginning, returning the channel to a ready
+    /// (idle) state. Only valid from a terminal `Completed`/`Aborted` state.
+    Reset,
+}
+
+/// A command targeting one channel, published by the panel.
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct SequenceCommand {
+    pub channel_id: ChannelId,
+    pub command: SequenceCommandKind,
+}
+
+impl Msg for SequenceCommand {
+    const ID: PacketId = [224, 43];
+}
+
+/// Asks the control system to re-read its sequence source(s) (disk, etc.) and re-publish
+/// an updated [`SequenceRegistry`]. Global scope. Published by the panel.
+#[derive(Serialize, Deserialize, Debug, Clone, Default)]
+pub struct ReloadSequences {}
+
+impl Msg for ReloadSequences {
+    const ID: PacketId = [224, 44];
+}
+
+/// Version of the sealed-node transfer protocol ([224,45]..[224,57]).
+/// Clients MUST handshake with [`GetDbInfo`] before sending any of these:
+/// servers that predate the handshake record unknown request messages as
+/// telemetry, so probing with anything else pollutes the remote DB.
+/// Messages added after version 1 are additionally feature-gated — see
+/// [`DbInfoResp::features`].
+pub const NODE_PROTOCOL_VERSION: u32 = 2;
+
+#[derive(Serialize, Deserialize, Debug, Clone, Copy)]
+pub struct GetDbInfo;
+
+impl Msg for GetDbInfo {
+    const ID: PacketId = [224, 45];
+}
+
+impl Request for GetDbInfo {
+    type Reply<B: IoBuf + Clone> = DbInfoResp;
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, Copy)]
+pub struct DbInfoResp {
+    pub protocol_version: u32,
+    /// Capability bits; clients gate post-version-1 requests on these.
+    /// Bit 0 was the retired envelope protocol ([224,56]/[224,57]) and
+    /// must not be reused.
+    pub features: u64,
+}
+
+impl Msg for DbInfoResp {
+    const ID: PacketId = [224, 46];
+}
+
+/// Durable summary of one sealed storage node. Defined here because it is
+/// both the storage-side seal sidecar and the wire-level manifest entry —
+/// `index_len`/`data_len` say exactly which committed bytes are claimed
+/// and `checksum` (xxh3_64 over index bytes then data bytes) lets any
+/// holder verify a transfer without trusting the source.
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SealRecord {
+    pub start_ts: Timestamp,
+    pub end_ts: Timestamp,
+    pub count: u64,
+    pub index_len: u64,
+    pub data_len: u64,
+    pub checksum: u64,
+    pub element_size: u64,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, Copy)]
+pub struct GetNodeManifest {
+    pub component_id: ComponentId,
+}
+
+impl Msg for GetNodeManifest {
+    const ID: PacketId = [224, 47];
+}
+
+impl Request for GetNodeManifest {
+    type Reply<B: IoBuf + Clone> = NodeManifestResp;
+}
+
+/// Every sealed node the server can currently serve for the component,
+/// sorted by start timestamp. The live (unsealed) head is never listed —
+/// its samples arrive via streaming instead.
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct NodeManifestResp {
+    pub component_id: ComponentId,
+    pub nodes: Vec<SealRecord>,
+}
+
+impl Msg for NodeManifestResp {
+    const ID: PacketId = [224, 48];
+}
+
+/// Ask the server to stream one sealed node's payloads as [`NodeChunk`]s
+/// (in order, index file first) followed by a [`FetchNodeDone`], all under
+/// this request's id. An [`crate::ErrorResponse`] means the node is gone
+/// (e.g. purged since the manifest was fetched).
+#[derive(Serialize, Deserialize, Debug, Clone, Copy)]
+pub struct FetchNode {
+    pub component_id: ComponentId,
+    pub start_ts: Timestamp,
+    /// Requested chunk payload size; servers clamp to sane bounds.
+    pub chunk_bytes: u32,
+}
+
+impl Msg for FetchNode {
+    const ID: PacketId = [224, 49];
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NodeFileKind {
+    Index,
+    Data,
+}
+
+/// One streamed piece of a sealed node's committed payload. Used in both
+/// directions: server→client answering [`FetchNode`], client→server
+/// uploading after an accepted [`OfferNode`].
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct NodeChunk {
+    pub component_id: ComponentId,
+    pub start_ts: Timestamp,
+    pub file: NodeFileKind,
+    pub offset: u64,
+    pub payload: Vec<u8>,
+}
+
+impl Msg for NodeChunk {
+    const ID: PacketId = [224, 50];
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, Copy)]
+pub struct FetchNodeDone {
+    pub seal: SealRecord,
+}
+
+impl Msg for FetchNodeDone {
+    const ID: PacketId = [224, 51];
+}
+
+/// Offer a sealed node for archival. The server auto-creates the
+/// component from `schema` if it has never seen it. `already_have` short
+/// circuits re-uploads by checksum.
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct OfferNode {
+    pub component_id: ComponentId,
+    pub component_name: String,
+    pub schema: Schema<Vec<u64>>,
+    pub seal: SealRecord,
+}
+
+impl Msg for OfferNode {
+    const ID: PacketId = [224, 52];
+}
+
+impl Request for OfferNode {
+    type Reply<B: IoBuf + Clone> = OfferNodeResp;
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, Copy)]
+pub struct OfferNodeResp {
+    pub accept: bool,
+    pub already_have: bool,
+}
+
+impl Msg for OfferNodeResp {
+    const ID: PacketId = [224, 53];
+}
+
+/// Sent by the uploader after the last [`NodeChunk`] of an offered node.
+/// The server verifies, persists durably (fsync), and answers with a
+/// [`NodeAck`].
+#[derive(Serialize, Deserialize, Debug, Clone, Copy)]
+pub struct PushNodeDone {
+    pub component_id: ComponentId,
+    pub start_ts: Timestamp,
+    pub checksum: u64,
+}
+
+impl Msg for PushNodeDone {
+    const ID: PacketId = [224, 54];
+}
+
+impl Request for PushNodeDone {
+    type Reply<B: IoBuf + Clone> = NodeAck;
+}
+
+/// `durable: true` is the only signal that permits the uploader to purge
+/// its local copy — it means the bytes are on the server's disk, fsynced,
+/// and checksum-verified.
+#[derive(Serialize, Deserialize, Debug, Clone, Copy)]
+pub struct NodeAck {
+    pub component_id: ComponentId,
+    pub start_ts: Timestamp,
+    pub checksum: u64,
+    pub durable: bool,
+}
+
+impl Msg for NodeAck {
+    const ID: PacketId = [224, 55];
+}
+
+/// Every message of the sealed-node transfer protocol. Servers consult
+/// this to keep stray protocol messages out of recorded telemetry; other
+/// unmatched messages (alarms, sequences, …) are telemetry by design —
+/// the msg log is their pub/sub channel.
+pub const NODE_PROTOCOL_MESSAGES: &[PacketId] = &[
+    GetDbInfo::ID,
+    DbInfoResp::ID,
+    GetNodeManifest::ID,
+    NodeManifestResp::ID,
+    FetchNode::ID,
+    NodeChunk::ID,
+    FetchNodeDone::ID,
+    OfferNode::ID,
+    OfferNodeResp::ID,
+    PushNodeDone::ID,
+    NodeAck::ID,
+    // The retired envelope protocol (GetEnvelope/EnvelopeResp). Reserved
+    // forever: an old client's stray request must stay ignored here, not
+    // get recorded as telemetry.
+    [224, 56],
+    [224, 57],
+];
+
 #[cfg(test)]
 mod alarm_tests {
     use super::*;
@@ -749,5 +1066,99 @@ mod alarm_tests {
     fn severity_orders_low_to_high() {
         assert!(Severity::Info < Severity::Warning);
         assert!(Severity::Warning < Severity::Critical);
+    }
+}
+
+#[cfg(test)]
+mod sequence_tests {
+    use super::*;
+
+    fn roundtrip<T>(value: &T) -> T
+    where
+        T: Serialize + for<'de> Deserialize<'de>,
+    {
+        let bytes = postcard::to_allocvec(value).expect("encode");
+        postcard::from_bytes(&bytes).expect("decode")
+    }
+
+    #[test]
+    fn sequence_messages_roundtrip() {
+        let registry = SequenceRegistry {
+            channels: vec![
+                SequenceChannelSpec {
+                    id: 1,
+                    name: "Deploy".into(),
+                    available: vec!["deploy_solar_array".into(), "deploy_antenna".into()],
+                },
+                SequenceChannelSpec {
+                    id: 2,
+                    name: "Attitude".into(),
+                    available: vec!["detumble".into()],
+                },
+            ],
+        };
+        let registry2 = roundtrip(&registry);
+        assert_eq!(registry.channels.len(), registry2.channels.len());
+        assert_eq!(
+            registry.channels[0].available,
+            registry2.channels[0].available
+        );
+
+        let event = SequenceChannelEvent {
+            channel_id: 1,
+            kind: SequenceEventKind::Loaded {
+                name: "deploy_solar_array".into(),
+            },
+        };
+        assert_eq!(event.channel_id, roundtrip(&event).channel_id);
+
+        let progress = SequenceChannelEvent {
+            channel_id: 1,
+            kind: SequenceEventKind::Progress {
+                detail: "panel 1 latched".into(),
+            },
+        };
+        assert!(matches!(
+            roundtrip(&progress).kind,
+            SequenceEventKind::Progress { .. }
+        ));
+
+        let command = SequenceCommand {
+            channel_id: 2,
+            command: SequenceCommandKind::Load {
+                name: "detumble".into(),
+            },
+        };
+        assert_eq!(command.channel_id, roundtrip(&command).channel_id);
+
+        let reset = SequenceCommand {
+            channel_id: 2,
+            command: SequenceCommandKind::Reset,
+        };
+        assert!(matches!(
+            roundtrip(&reset).command,
+            SequenceCommandKind::Reset
+        ));
+
+        let _ = roundtrip(&ReloadSequences {});
+    }
+
+    #[test]
+    fn sequence_packet_ids_are_unique() {
+        let ids = [
+            SequenceRegistry::ID,
+            SequenceChannelEvent::ID,
+            SequenceCommand::ID,
+            ReloadSequences::ID,
+        ];
+        for (i, a) in ids.iter().enumerate() {
+            for b in &ids[i + 1..] {
+                assert_ne!(a, b, "sequence packet ids must be unique");
+            }
+        }
+        // Distinct from the alarm ids that precede them.
+        for id in ids {
+            assert_ne!(id, AlarmAck::ID);
+        }
     }
 }

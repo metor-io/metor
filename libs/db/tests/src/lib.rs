@@ -41,6 +41,313 @@ mod tests {
         let (_client, _db) = setup_test_db().await.unwrap();
     }
 
+    /// Sequence/alarm messages have no handler arm by design — recording
+    /// them in the msg log IS their pub/sub path. The node-protocol guard
+    /// must not swallow them (it did once; the sequence view went blank).
+    #[test]
+    async fn reserved_wkt_messages_still_record_as_telemetry() {
+        let (addr, db) = setup_test_db().await.unwrap();
+        let mut client = Client::connect(addr).await.unwrap();
+        let event = SequenceChannelEvent {
+            channel_id: 3,
+            kind: SequenceEventKind::Started,
+        };
+        client.send(&event).await.0.unwrap();
+        let mut recorded = false;
+        for _ in 0..40 {
+            sleep(Duration::from_millis(50)).await;
+            recorded = db.with_state_mut(|state| {
+                state
+                    .get_or_insert_msg_log(SequenceChannelEvent::ID, &db.path)
+                    .is_ok_and(|log| log.latest().is_some())
+            });
+            if recorded {
+                break;
+            }
+        }
+        assert!(recorded, "sequence event was not recorded in the msg log");
+    }
+
+    #[test]
+    async fn peer_store_conforms() {
+        let (addr, _db) = setup_test_db().await.unwrap();
+        let store = metor_db::store::PeerStore::new(addr);
+        let scratch = std::env::temp_dir().join(format!("metor_peer_conf_{}", fastrand::u64(..)));
+        std::fs::create_dir_all(&scratch).unwrap();
+        metor_db::store::conformance::run(&store, &scratch).await;
+        std::fs::remove_dir_all(&scratch).ok();
+    }
+
+    /// History sealed on the remote before a mirror ever connects must
+    /// show up locally as fetchable remote-only coverage and hydrate on
+    /// request.
+    #[test]
+    async fn remote_db_seeds_preconnect_history() {
+        use metor_db::store::{NodeKey, NodeStore, SealedNode};
+
+        let (addr, _src_db) = setup_test_db().await.unwrap();
+
+        // Pre-connect history: one sealed node pushed into the server the
+        // same way an offloading peer would.
+        let scratch = std::env::temp_dir().join(format!("metor_seed_{}", fastrand::u64(..)));
+        std::fs::create_dir_all(&scratch).unwrap();
+        let component_id = ComponentId(4242);
+        let node_dir = scratch.join("1000");
+        let node = metor_db::time_series::TimeSeriesNode::create(&node_dir, Timestamp(1_000), 8)
+            .unwrap();
+        for i in 0..64i64 {
+            node.data.write(&(1_000 + i).to_le_bytes()).unwrap();
+            node.index
+                .write(&Timestamp(1_000 + i).to_le_bytes())
+                .unwrap();
+        }
+        let seal = metor_db::seal::seal_node(&node, &node_dir)
+            .unwrap()
+            .unwrap();
+        let node_schema = metor_proto::schema::Schema::new(PrimType::U64, [1usize]).unwrap();
+        let store = metor_db::store::PeerStore::new(addr);
+        store
+            .put(
+                NodeKey {
+                    component_id,
+                    component_name: "seed.test",
+                    schema: &node_schema,
+                    start_ts: seal.start_ts,
+                    checksum: seal.checksum,
+                },
+                SealedNode::from_node(&node, seal).unwrap(),
+            )
+            .await
+            .unwrap();
+
+        let local_dir =
+            std::env::temp_dir().join(format!("metor_db_seed_local_{}", fastrand::u64(..)));
+        let local_db = Arc::new(DB::create(local_dir).unwrap());
+        let remote = metor_db::remote::RemoteDb::new(addr);
+        let hydrator = remote.hydrator();
+        remote.spawn(local_db.clone());
+
+        let mut seeded = false;
+        for _ in 0..40 {
+            sleep(Duration::from_millis(50)).await;
+            seeded = local_db.with_state(|state| {
+                state.get_component(component_id).is_some_and(|c| {
+                    c.time_series
+                        .manifest()
+                        .span(Timestamp(1_000))
+                        .is_some_and(|span| span.seal.checksum == seal.checksum)
+                })
+            });
+            if seeded {
+                break;
+            }
+        }
+        assert!(seeded, "local db never seeded the remote manifest");
+
+        hydrator.request(component_id, Timestamp(1_000)..Timestamp(1_064));
+        let mut hydrated = false;
+        for _ in 0..40 {
+            sleep(Duration::from_millis(50)).await;
+            hydrated = local_db.with_state(|state| {
+                state.get_component(component_id).is_some_and(|c| {
+                    c.time_series
+                        .latest()
+                        .is_some_and(|latest| latest.data() == 1_063i64.to_le_bytes().as_slice())
+                })
+            });
+            if hydrated {
+                break;
+            }
+        }
+        assert!(hydrated, "seeded span never hydrated");
+        std::fs::remove_dir_all(&scratch).ok();
+    }
+
+    /// The LoD engine must derive hidden min/max companions from sealed
+    /// history, publish their metadata (which a mirror then syncs), and
+    /// keep them off the live stream — a mirror only ever receives LoD
+    /// data through manifest seeding + hydration of sealed spans.
+    #[test]
+    async fn lod_companions_derive_from_sealed_history() {
+        use metor_db::store::{NodeKey, NodeStore, SealedNode};
+
+        let (addr, db) = setup_test_db().await.unwrap();
+        let scratch = std::env::temp_dir().join(format!("metor_lod_{}", fastrand::u64(..)));
+        std::fs::create_dir_all(&scratch).unwrap();
+        let component_id = ComponentId(777);
+        let node_schema = metor_proto::schema::Schema::new(PrimType::U64, [1usize]).unwrap();
+        let store = metor_db::store::PeerStore::new(addr);
+
+        for start in [0i64, 1_000] {
+            let node_dir = scratch.join(start.to_string());
+            let node =
+                metor_db::time_series::TimeSeriesNode::create(&node_dir, Timestamp(start), 8)
+                    .unwrap();
+            for i in 0..64i64 {
+                node.data.write(&((start + i) as u64).to_le_bytes()).unwrap();
+                node.index
+                    .write(&Timestamp(start + i).to_le_bytes())
+                    .unwrap();
+            }
+            let seal = metor_db::seal::seal_node(&node, &node_dir).unwrap().unwrap();
+            store
+                .put(
+                    NodeKey {
+                        component_id,
+                        component_name: "lod.test",
+                        schema: &node_schema,
+                        start_ts: seal.start_ts,
+                        checksum: seal.checksum,
+                    },
+                    SealedNode::from_node(&node, seal).unwrap(),
+                )
+                .await
+                .unwrap();
+        }
+
+        metor_db::lod::spawn(db.clone());
+
+        // The engine derives companions from the sealed history and emits
+        // the complete buckets behind the sealed frontier.
+        let mut lod_ids: Vec<ComponentId> = Vec::new();
+        for _ in 0..40 {
+            sleep(Duration::from_millis(50)).await;
+            lod_ids = db.with_state(|state| {
+                state
+                    .component_metadata_iter()
+                    .filter(|(_, meta)| {
+                        meta.metadata
+                            .get(metor_db::lod::LOD_SOURCE_ID_KEY)
+                            .is_some_and(|v| v == &component_id.0.to_string())
+                    })
+                    .map(|(id, _)| *id)
+                    .collect()
+            });
+            let finest_has_data = lod_ids.iter().any(|id| {
+                db.with_state(|state| {
+                    state
+                        .get_component(*id)
+                        .is_some_and(|c| c.time_series.latest().is_some())
+                })
+            });
+            if finest_has_data {
+                break;
+            }
+        }
+        assert!(!lod_ids.is_empty(), "lod engine never created companions");
+
+        let (finest, bucket_us) = db.with_state(|state| {
+            let mut levels: Vec<(u64, ComponentId, i64)> = lod_ids
+                .iter()
+                .filter_map(|id| {
+                    let meta = state.get_component_metadata(*id)?;
+                    assert!(meta.is_hidden(), "lod companions must be hidden");
+                    let ratio = meta.metadata.get(metor_db::lod::LOD_RATIO_KEY)?.parse().ok()?;
+                    let bucket = meta
+                        .metadata
+                        .get(metor_db::lod::LOD_BUCKET_US_KEY)?
+                        .parse()
+                        .ok()?;
+                    Some((ratio, *id, bucket))
+                })
+                .collect();
+            levels.sort_unstable_by_key(|(ratio, ..)| *ratio);
+            let (_, id, bucket) = levels[0];
+            (state.get_component(id).cloned().unwrap(), bucket)
+        });
+        // Schema is [2, ..source shape] f32: min then max per element.
+        assert_eq!(finest.schema.prim_type, PrimType::F32);
+        assert_eq!(finest.schema.dim.as_slice(), &[2, 1]);
+
+        // The first bucket folds the first sealed node's extremes exactly.
+        let latest = finest.time_series.latest().expect("buckets emitted");
+        let slice = finest
+            .time_series
+            .get_range(Timestamp(i64::MIN)..Timestamp(i64::MAX))
+            .unwrap();
+        let node_slices: Vec<_> = slice.as_iter().collect();
+        let first = node_slices.last().unwrap();
+        let first_min = f32::from_le_bytes(first.data()[0..4].try_into().unwrap());
+        let first_max = f32::from_le_bytes(first.data()[4..8].try_into().unwrap());
+        assert_eq!(first_min, 0.0);
+        assert_eq!(first_max, 63.0);
+        // Buckets stop at the sealed frontier and stamp midpoints.
+        assert!(latest.timestamp().0 < 1_064 + bucket_us);
+
+        // A mirror syncs the hidden metadata but must not materialize the
+        // LoD component from the live stream — its data arrives only via
+        // sealed-span seeding + hydration.
+        let local_dir =
+            std::env::temp_dir().join(format!("metor_db_lod_local_{}", fastrand::u64(..)));
+        let local_db = Arc::new(DB::create(local_dir).unwrap());
+        metor_db::remote::RemoteDb::new(addr).spawn(local_db.clone());
+        let lod_id = finest.component_id;
+        let mut metadata_synced = false;
+        for _ in 0..40 {
+            sleep(Duration::from_millis(50)).await;
+            metadata_synced = local_db.with_state(|state| {
+                state
+                    .get_component_metadata(lod_id)
+                    .is_some_and(|meta| meta.is_hidden())
+            });
+            if metadata_synced {
+                break;
+            }
+        }
+        assert!(metadata_synced, "mirror never synced lod metadata");
+        assert!(
+            local_db.with_state(|state| state.get_component(lod_id).is_none()),
+            "lod component leaked onto the mirror through the live stream"
+        );
+        std::fs::remove_dir_all(&scratch).ok();
+    }
+
+    #[test]
+    async fn remote_db_mirrors_live_data() {
+        let (addr, _src_db) = setup_test_db().await.unwrap();
+        let mut producer = Client::connect(addr).await.unwrap();
+        let vtable = vtable([raw_field(
+            0,
+            16,
+            schema(PrimType::F64, &[2], component("mirror_test")),
+        )]);
+        producer
+            .send(&VTableMsg {
+                id: 2u16.to_le_bytes(),
+                vtable,
+            })
+            .await
+            .0
+            .unwrap();
+
+        let local_dir =
+            std::env::temp_dir().join(format!("metor_db_mirror_{}", fastrand::u64(..)));
+        let local_db = Arc::new(DB::create(local_dir).unwrap());
+        metor_db::remote::RemoteDb::new(addr).spawn(local_db.clone());
+        // Let the mirror connect and subscribe before data flows.
+        sleep(Duration::from_millis(300)).await;
+
+        let floats = [4.0f64, 5.0];
+        let mut pkt = LenPacket::table(2u16.to_le_bytes(), 16);
+        pkt.extend_aligned(&floats);
+        producer.send(pkt).await.0.unwrap();
+
+        let mut mirrored = false;
+        for _ in 0..40 {
+            sleep(Duration::from_millis(50)).await;
+            mirrored = local_db.with_state(|state| {
+                state
+                    .get_component(ComponentId::new("mirror_test"))
+                    .and_then(|c| c.time_series.latest())
+                    .is_some_and(|latest| latest.data() == floats.as_bytes())
+            });
+            if mirrored {
+                break;
+            }
+        }
+        assert!(mirrored, "local db never mirrored the live sample");
+    }
+
     #[test]
     async fn test_send_data() {
         let (addr, db) = setup_test_db().await.unwrap();

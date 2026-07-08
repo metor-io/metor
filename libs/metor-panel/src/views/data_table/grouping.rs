@@ -30,6 +30,7 @@ pub fn detect_groups(db: &DB) -> Vec<Group> {
     let entries: Vec<MetadataEntry> = db.with_state(|state| {
         state
             .component_metadata_iter()
+            .filter(|(_, meta)| !meta.is_hidden())
             .map(|(id, meta)| MetadataEntry {
                 id: *id,
                 name: meta.name.clone(),

@@ -17,6 +17,7 @@ eula = false
 [features]
 default = ["parquet"]
 parquet = ["dep:parquet"]
+store-object = ["dep:object_store", "dep:tokio"]
 
 [dependencies]
 # ser-de
@@ -58,6 +59,19 @@ tracing-subscriber = { version = "0.3.18", features = ["env-filter", "chrono"] }
 # rand
 fastrand = "2.2.0"
 
+# integrity
+twox-hash.version = "2.1"
+twox-hash.default-features = false
+twox-hash.features = ["xxhash3_64", "std"]
+
+# object-store backend (feature: store-object)
+object_store.version = "0.11"
+object_store.optional = true
+tokio.version = "1.3"
+tokio.optional = true
+tokio.default-features = false
+tokio.features = ["sync"]
+
 # cli
 clap.version = "4.4.18"
 clap.features = ["derive"]
@@ -78,3 +92,6 @@ parquet.optional = true
 
 # codegen
 postcard-c-codegen.path = "../postcard-c/codegen"
+
+[dev-dependencies]
+tempfile = "3.13.0"

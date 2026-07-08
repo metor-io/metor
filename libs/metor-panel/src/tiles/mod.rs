@@ -243,7 +243,22 @@ impl Member {
         cx: &mut App,
     ) -> AnyElement {
         match self {
-            Member::Pane(pane) => div().size_full().child(pane.clone()).into_any_element(),
+            Member::Pane(pane) => {
+                // Record this pane as current on any click within it. Mouse
+                // events bubble, so this fires after inner handlers (tab clicks,
+                // content interactions) without intercepting them.
+                let tg = tile_group.clone();
+                let focus_pane = pane.clone();
+                div()
+                    .size_full()
+                    .on_mouse_down(gpui::MouseButton::Left, move |_event, _window, cx| {
+                        tg.update(cx, |this, _cx| {
+                            this.focused_pane = Some(focus_pane.clone());
+                        });
+                    })
+                    .child(pane.clone())
+                    .into_any_element()
+            }
             Member::Axis(axis) => {
                 let container = match axis.axis {
                     Axis::Horizontal => div().flex().flex_row(),
@@ -416,6 +431,10 @@ pub struct TileGroup {
     root: Member,
     panes: Vec<Entity<Pane>>,
     axis_bounds: std::collections::HashMap<SplitPath, gpui::Bounds<gpui::Pixels>>,
+    /// The pane that last received a click, i.e. the "current" tile that
+    /// keyboard-driven commands (the transient chord menu) act on. Falls back
+    /// to the first pane via [`TileGroup::active_pane`] when unset or stale.
+    focused_pane: Option<Entity<Pane>>,
 }
 
 impl TileGroup {
@@ -425,9 +444,10 @@ impl TileGroup {
         cx.subscribe(&pane, Self::handle_pane_event).detach();
         let panes = vec![pane.clone()];
         Self {
-            root: Member::Pane(pane),
+            root: Member::Pane(pane.clone()),
             panes,
             axis_bounds: Default::default(),
+            focused_pane: Some(pane),
         }
     }
 
@@ -439,14 +459,30 @@ impl TileGroup {
         cx.subscribe(&pane, Self::handle_pane_event).detach();
         let panes = vec![pane.clone()];
         Self {
-            root: Member::Pane(pane),
+            root: Member::Pane(pane.clone()),
             panes,
             axis_bounds: Default::default(),
+            focused_pane: Some(pane),
         }
     }
 
     pub fn panes(&self) -> &[Entity<Pane>] {
         &self.panes
+    }
+
+    /// The "current" pane keyboard commands target: the last-clicked pane if it
+    /// still exists, otherwise the first pane. `None` only when the tree somehow
+    /// holds no panes (which never happens — the layout keeps at least one).
+    pub fn active_pane(&self, _cx: &App) -> Option<Entity<Pane>> {
+        self.focused_pane
+            .as_ref()
+            .filter(|p| {
+                self.panes
+                    .iter()
+                    .any(|q| q.entity_id() == p.entity_id())
+            })
+            .cloned()
+            .or_else(|| self.panes.first().cloned())
     }
 
     /// Split `target` along `direction`, placing `new_pane` beside it.
@@ -459,6 +495,9 @@ impl TileGroup {
     ) {
         cx.subscribe(&new_pane, Self::handle_pane_event).detach();
         self.root.split(target, &new_pane, direction);
+        // A freshly-split pane becomes the current one so a follow-up chord
+        // (e.g. "new tile") lands in the pane the user just created.
+        self.focused_pane = Some(new_pane.clone());
         self.panes.push(new_pane);
         cx.notify();
     }
@@ -477,6 +516,8 @@ impl TileGroup {
     pub fn serialize(&self, cx: &App) -> SerializedTileGroup {
         SerializedTileGroup {
             version: SUPPORTED_LAYOUT_VERSION,
+            global_time_range: crate::views::time_series::time_range::GlobalTimeRange::get(cx)
+                .to_string(),
             root: self.root.serialize(cx),
         }
     }
@@ -529,12 +570,19 @@ impl TileGroup {
         registry: &ItemRegistry,
         cx: &mut Context<Self>,
     ) -> Self {
+        // Always reset: a layout that never narrowed the global range
+        // (or predates it) must not inherit the previous layout's window.
+        crate::views::time_series::time_range::GlobalTimeRange::set(
+            cx,
+            serialized.global_time_range.parse().unwrap_or_default(),
+        );
         let mut panes = Vec::new();
         let root = Self::deserialize_member(&serialized.root, registry, &mut panes, cx);
         let mut this = Self {
             root,
             panes: Vec::new(),
             axis_bounds: Default::default(),
+            focused_pane: panes.first().cloned(),
         };
         for pane in &panes {
             cx.subscribe(pane, Self::handle_pane_event).detach();

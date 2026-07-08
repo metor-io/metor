@@ -503,10 +503,75 @@ pub mod builder {
     impl FieldBuilder {
         pub fn offset_by(self, offset: impl Into<Offset>) -> Self {
             let offset = offset.into();
+            let arg = offset_table_ops(&self.arg, offset).unwrap_or(self.arg);
             Self {
                 offset: Offset(self.offset.0 + offset.0),
                 len: self.len,
-                arg: self.arg,
+                arg,
+            }
+        }
+
+        /// Wraps this field's op chain in a timestamp op, so the field's value is
+        /// recorded with the timestamp read from `timestamp` (usually a [`raw_table`]
+        /// op pointing at a [`crate::types::Timestamp`] in the table)
+        pub fn with_timestamp(self, timestamp: Arc<OpBuilder>) -> Self {
+            Self {
+                arg: super::builder::timestamp(timestamp, self.arg),
+                ..self
+            }
+        }
+    }
+
+    /// Shifts every `Table` op in the chain by `offset`, returning `None` if the chain
+    /// contains no `Table` ops
+    ///
+    /// Table ops inside a field's op chain (e.g. a timestamp source) are relative to the
+    /// same struct as the field itself, so they shift together when the field is offset.
+    /// Untouched subtrees keep their `Arc` identity so op deduplication still applies.
+    fn offset_table_ops(op: &Arc<OpBuilder>, offset: Offset) -> Option<Arc<OpBuilder>> {
+        match op.as_ref() {
+            OpBuilder::Data { .. } => None,
+            OpBuilder::Table { offset: o, len } => Some(Arc::new(OpBuilder::Table {
+                offset: Offset(o.0 + offset.0),
+                len: *len,
+            })),
+            OpBuilder::Component { component_id } => offset_table_ops(component_id, offset)
+                .map(|component_id| Arc::new(OpBuilder::Component { component_id })),
+            OpBuilder::Schema { ty, dim, arg } => {
+                let new_ty = offset_table_ops(ty, offset);
+                let new_dim = offset_table_ops(dim, offset);
+                let new_arg = offset_table_ops(arg, offset);
+                if new_ty.is_none() && new_dim.is_none() && new_arg.is_none() {
+                    return None;
+                }
+                Some(Arc::new(OpBuilder::Schema {
+                    ty: new_ty.unwrap_or_else(|| ty.clone()),
+                    dim: new_dim.unwrap_or_else(|| dim.clone()),
+                    arg: new_arg.unwrap_or_else(|| arg.clone()),
+                }))
+            }
+            OpBuilder::Timestamp { timestamp, arg } => {
+                let new_timestamp = offset_table_ops(timestamp, offset);
+                let new_arg = offset_table_ops(arg, offset);
+                if new_timestamp.is_none() && new_arg.is_none() {
+                    return None;
+                }
+                Some(Arc::new(OpBuilder::Timestamp {
+                    timestamp: new_timestamp.unwrap_or_else(|| timestamp.clone()),
+                    arg: new_arg.unwrap_or_else(|| arg.clone()),
+                }))
+            }
+            OpBuilder::Ext { id, data, arg } => {
+                let new_data = offset_table_ops(data, offset);
+                let new_arg = offset_table_ops(arg, offset);
+                if new_data.is_none() && new_arg.is_none() {
+                    return None;
+                }
+                Some(Arc::new(OpBuilder::Ext {
+                    id: *id,
+                    data: new_data.unwrap_or_else(|| data.clone()),
+                    arg: new_arg.unwrap_or_else(|| arg.clone()),
+                }))
             }
         }
     }
@@ -638,6 +703,10 @@ pub mod builder {
     pub struct VTableBuilder {
         vtable: VTable<Vec<Op>, Vec<u8>, Vec<Field>>,
         visited: BTreeMap<usize, OpRef>,
+        // Visited ops are deduplicated by address, so they must be kept alive for the
+        // builder's lifetime - otherwise a later op allocated at a freed address would
+        // alias a stale `OpRef`
+        retained: Vec<Arc<OpBuilder>>,
     }
 
     impl VTableBuilder {
@@ -647,6 +716,7 @@ pub mod builder {
             if let Some(r) = self.visited.get(&id) {
                 return *r;
             }
+            self.retained.push(op.clone());
             let op = match op.as_ref() {
                 OpBuilder::Data { align, data } => {
                     let len = data.len() as u32;
@@ -796,5 +866,43 @@ mod tests {
         let bar = sink.f64_components.get(&ComponentId::new("bar")).unwrap();
         assert_eq!(bar.buf.as_buf(), &[5.0]);
         assert_eq!(sink.timestamp, Some(foo.timestamp));
+    }
+
+    #[test]
+    fn test_field_with_timestamp_offset() {
+        use super::builder::*;
+
+        #[derive(IntoBytes, Immutable)]
+        struct Inner {
+            timestamp: Timestamp,
+            value: f64,
+        }
+
+        #[derive(IntoBytes, Immutable)]
+        struct Outer {
+            _pad: u64,
+            inner: Inner,
+        }
+
+        // Build the field as if for `Inner`, then offset it into `Outer`; the
+        // timestamp table op embedded in the chain must shift along with the field.
+        let time = table!(Inner::timestamp);
+        let field = field!(Inner::value, schema(PrimType::F64, &[], component("value")))
+            .with_timestamp(time)
+            .offset_by(core::mem::offset_of!(Outer, inner) as u32);
+        let v = vtable([field]);
+
+        let outer = Outer {
+            _pad: 0,
+            inner: Inner {
+                timestamp: Timestamp(4242),
+                value: 7.0,
+            },
+        };
+        let mut sink = TestSink::default();
+        v.apply(outer.as_bytes(), &mut sink).unwrap().unwrap();
+        let value = sink.f64_components.get(&ComponentId::new("value")).unwrap();
+        assert_eq!(value.buf.as_buf(), &[7.0]);
+        assert_eq!(sink.timestamp, Some(Timestamp(4242)));
     }
 }

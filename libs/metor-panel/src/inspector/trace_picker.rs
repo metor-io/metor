@@ -11,16 +11,38 @@ use crate::inspector::rows::{BoolRow, InspectorRow, NavRow, RowAction, row_base}
 use crate::theme::theme;
 use crate::views::time_series::Trace;
 
+thread_local! {
+    /// Name-sorted component list cached against the DB's vtable generation.
+    /// Rebuilt only when a component is added/removed, so the many palette and
+    /// picker call sites avoid re-locking DB state and re-sorting every open.
+    /// gpui is single-threaded, so a thread-local needs no synchronization.
+    static COMPONENT_LIST_CACHE: std::cell::RefCell<Option<(u64, Arc<[(ComponentId, String)]>)>> =
+        const { std::cell::RefCell::new(None) };
+}
+
 /// Every known component sorted by name, suitable for palette display.
 pub(crate) fn list_components(db: &DB) -> Vec<(ComponentId, String)> {
-    let mut components: Vec<_> = db.with_state(|state| {
-        state
-            .component_metadata_iter()
-            .map(|(id, meta)| (*id, meta.name.clone()))
-            .collect()
+    let generation = db.vtable_gen.latest();
+    let cached = COMPONENT_LIST_CACHE.with(|cache| match &*cache.borrow() {
+        Some((cached_gen, list)) if *cached_gen == generation => Some(list.clone()),
+        _ => None,
     });
-    components.sort_by(|a, b| a.1.cmp(&b.1));
-    components
+    let list = cached.unwrap_or_else(|| {
+        let mut components: Vec<(ComponentId, String)> = db.with_state(|state| {
+            state
+                .component_metadata_iter()
+                .filter(|(_, meta)| !meta.is_hidden())
+                .map(|(id, meta)| (*id, meta.name.clone()))
+                .collect()
+        });
+        components.sort_by(|a, b| a.1.cmp(&b.1));
+        let list: Arc<[(ComponentId, String)]> = components.into();
+        COMPONENT_LIST_CACHE.with(|cache| {
+            *cache.borrow_mut() = Some((generation, list.clone()));
+        });
+        list
+    });
+    list.to_vec()
 }
 
 /// Element labels for `component_id`, derived from its schema dimension.

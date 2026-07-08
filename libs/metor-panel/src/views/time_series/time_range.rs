@@ -31,7 +31,7 @@ impl fmt::Display for Offset {
                     .to_uppercase();
                 write!(f, "-{d}")
             }
-            Offset::Fixed(ts) => write!(f, "={}", ts.0),
+            Offset::Fixed(ts) => write!(f, "={}", hifitime::Epoch::from(*ts)),
         }
     }
 }
@@ -113,17 +113,78 @@ impl TimeRangeBehavior {
     ];
 }
 
+/// Inspector rows shared by every time-range chooser: one command per
+/// [`TimeRangeBehavior::PRESETS`] entry plus a freeform text field
+/// speaking the `FromStr` grammar. Callers prepend extra rows (e.g. an
+/// "Auto" reset) and supply the setter.
+pub fn picker_rows(
+    current: gpui::SharedString,
+    set: std::sync::Arc<dyn Fn(TimeRangeBehavior, &mut gpui::Window, &mut gpui::App)>,
+) -> Vec<Box<dyn crate::inspector::rows::InspectorRow>> {
+    use std::sync::Arc;
+
+    use crate::inspector::rows::{CommandRow, InspectorRow, TextRow};
+
+    let mut rows: Vec<Box<dyn InspectorRow>> = TimeRangeBehavior::PRESETS
+        .iter()
+        .map(|(name, value)| {
+            let set = set.clone();
+            let value = *value;
+            Box::new(CommandRow::new(
+                *name,
+                Arc::new(move |window, cx| set(value, window, cx)),
+            )) as Box<dyn InspectorRow>
+        })
+        .collect();
+    rows.push(Box::new(TextRow::new(
+        gpui::SharedString::new_static("Custom"),
+        current,
+        Arc::new(move |s, window, cx| {
+            if let Ok(value) = s.parse::<TimeRangeBehavior>() {
+                set(value, window, cx);
+            }
+        }),
+    )));
+    rows
+}
+
 fn clamp_range(full: Range<Timestamp>, requested: Range<Timestamp>) -> Range<Timestamp> {
     let start = requested.start.max(full.start);
     let end = requested.end.min(full.end);
     if start >= end { full } else { start..end }
 }
 
+/// App-wide default time window. Plots whose `x_range` is `Auto` follow
+/// this; a per-plot `Custom` range wins. One narrowing gesture in the
+/// toolbar moves every plot to the working window instead of demanding
+/// per-plot edits.
+pub struct GlobalTimeRange {
+    pub behavior: TimeRangeBehavior,
+}
+
+impl gpui::Global for GlobalTimeRange {}
+
+impl GlobalTimeRange {
+    /// The current global behavior; full range until anyone narrows it.
+    pub fn get(cx: &gpui::App) -> TimeRangeBehavior {
+        cx.try_global::<Self>()
+            .map(|g| g.behavior)
+            .unwrap_or(TimeRangeBehavior::FULL)
+    }
+
+    pub fn set(cx: &mut gpui::App, behavior: TimeRangeBehavior) {
+        cx.set_global(Self { behavior });
+        cx.refresh_windows();
+    }
+}
+
 peg::parser! {
     grammar offset_parser() for str {
         rule _ = quiet!{[' ' | '\n' | '\t']*}
+        // `Display` uppercases durations ("30 S"); jiff only accepts
+        // lowercase unit designators.
         rule parse_span() -> jiff::Span
-            = str:$([_]+) {? str.parse().or(Err("invalid duration")) }
+            = str:$([_]+) {? str.to_lowercase().parse().or(Err("invalid duration")) }
 
         rule zero() -> jiff::Span
             = "0" ['s'|'m'|'h']? { jiff::Span::new() }
@@ -156,9 +217,11 @@ impl FromStr for Offset {
 }
 
 fn span_to_duration(span: jiff::Span) -> Result<Duration, jiff::Error> {
-    Ok(Duration::from_nanos(
-        span.total(jiff::Unit::Nanosecond)? as u64
-    ))
+    // Days are calendar units to jiff and normally need a reference date;
+    // ranges here are wall-clock windows, so a day is always 24 hours
+    // (and `Display` prints 24h as "1 DAY", which must parse back).
+    let total = span.total(jiff::SpanTotal::from(jiff::Unit::Nanosecond).days_are_24_hours())?;
+    Ok(Duration::from_nanos(total as u64))
 }
 
 /// Parse strings produced by `Display` plus a few ergonomic shortcuts.
@@ -211,6 +274,42 @@ mod tests {
         assert_eq!(o, Offset::Earliest(Duration::from_secs(20)));
         let o: Offset = "- 20s".parse().unwrap();
         assert_eq!(o, Offset::Latest(Duration::from_secs(20)));
+    }
+
+    /// Layout persistence stores ranges as `Display` text and reloads via
+    /// `FromStr`; every preset must survive the round trip.
+    #[test]
+    fn presets_round_trip_through_display() {
+        for (name, preset) in TimeRangeBehavior::PRESETS {
+            let text = preset.to_string();
+            let parsed: TimeRangeBehavior = text
+                .parse()
+                .unwrap_or_else(|_| panic!("{name}: {text:?} failed to parse"));
+            assert_eq!(parsed, *preset, "{name} changed across the round trip");
+        }
+    }
+
+    /// Pinned and mixed ranges persist the same way as presets; absolute
+    /// endpoints must survive Display → FromStr without drifting.
+    #[test]
+    fn fixed_and_mixed_round_trip_through_display() {
+        // Sub-millisecond endpoints catch lossy f64 Epoch conversions that
+        // millisecond-aligned values can't.
+        let pinned = TimeRangeBehavior {
+            start: Offset::Fixed(Timestamp(1_780_000_000_000_001)),
+            end: Offset::Fixed(Timestamp(1_780_000_060_123_457)),
+        };
+        let mixed = TimeRangeBehavior {
+            start: Offset::Earliest(Duration::from_secs(5)),
+            end: Offset::Latest(Duration::from_secs(10)),
+        };
+        for behavior in [pinned, mixed] {
+            let text = behavior.to_string();
+            let parsed: TimeRangeBehavior = text
+                .parse()
+                .unwrap_or_else(|_| panic!("{text:?} failed to parse"));
+            assert_eq!(parsed, behavior, "{text:?} changed across the round trip");
+        }
     }
 
     #[test]

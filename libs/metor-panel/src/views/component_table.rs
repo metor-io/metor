@@ -1,5 +1,7 @@
 use std::sync::Arc;
+use std::time::Duration;
 
+use super::lazy_pool::VisibleEntityCache;
 use super::monitor::{behavior_snapshot, edit_click};
 use super::table::{Column, ColumnSort, Table, TableDelegate};
 use super::time_series::{LinePlot, Trace};
@@ -8,11 +10,17 @@ use crate::inspector::plot_preview::shift_hover_listener;
 use crate::theme::theme;
 use crate::{ComponentStream, WalComponentStream};
 use gpui::{
-    AnyElement, App, AppContext, AsyncApp, Context, Entity, IntoElement, Pixels, SharedString,
-    Window, div, prelude::*, px,
+    AnyElement, App, AppContext, Context, Entity, IntoElement, Pixels, SharedString, Window, div,
+    prelude::*, px,
 };
 use metor_db::{Component, DB};
+use metor_proto::types::ComponentId;
 use smallvec::SmallVec;
+
+/// Live rows kept materialized in the table. Sized well above the visible row
+/// count so scrolling reuses rows, while bounding how many strip/sparkline
+/// stream tasks exist at once.
+const ROW_CACHE_CAP: usize = 256;
 
 struct ComponentRow {
     db: Arc<DB>,
@@ -89,20 +97,22 @@ impl ComponentRow {
         }
     }
 
-    fn component_id(&self) -> metor_proto::types::ComponentId {
+    fn component_id(&self) -> ComponentId {
         self.component.component_id
     }
+}
 
-    fn current_value_string(&self) -> String {
-        let Some(latest) = self.component.time_series.latest() else {
-            return String::new();
-        };
-        let buf = latest.data();
-        let Ok((_size, view)) = self.component.schema.parse_value(buf) else {
-            return String::new();
-        };
-        super::format_value(view, &self.db, self.component.component_id)
-    }
+/// Latest formatted value of a component, used as the sort key for the value
+/// column. Reads directly from the time series so sorting never needs a live
+/// row entity.
+fn current_value_string(db: &DB, component: &Component) -> String {
+    let Some(latest) = component.time_series.latest() else {
+        return String::new();
+    };
+    let Ok((_size, view)) = component.schema.parse_value(latest.data()) else {
+        return String::new();
+    };
+    super::format_value(view, db, component.component_id)
 }
 
 /// [`TableDelegate`] that lists every component with name, value, and
@@ -110,8 +120,20 @@ impl ComponentRow {
 ///
 /// Rows are regenerated whenever the DB's virtual table generation
 /// advances, so newly-registered components appear without a manual refresh.
+/// Lightweight per-component metadata. Live `ComponentRow` entities (each with
+/// a strip task and a sparkline) are materialized lazily for the visible range
+/// in `render_cell`, so the table holds only N cheap metas plus a bounded set
+/// of live rows rather than N stream subscriptions.
+struct RowMeta {
+    id: ComponentId,
+    name: SharedString,
+    component: Component,
+}
+
 pub struct ComponentTableDelegate {
-    rows: Vec<Entity<ComponentRow>>,
+    db: Arc<DB>,
+    metas: Vec<RowMeta>,
+    row_cache: VisibleEntityCache<ComponentRow>,
     _task: gpui::Task<()>,
 }
 
@@ -119,39 +141,41 @@ impl ComponentTableDelegate {
     fn spawn_watcher(db: Arc<DB>, cx: &mut Context<Table<Self>>) -> gpui::Task<()> {
         cx.spawn(async move |this, cx| {
             loop {
-                let rows = Self::build_rows(&db, cx);
+                let metas = build_metas(&db);
                 let result = this.update(cx, |this, cx| {
-                    this.delegate_mut().rows = rows;
+                    this.delegate_mut().metas = metas;
                     cx.notify();
                 });
                 if result.is_err() {
                     break;
                 }
                 db.vtable_gen.wait().await;
+                // vtable_gen bumps once per registered component; debounce so a
+                // startup burst rebuilds the row metas once instead of N times.
+                cx.background_executor()
+                    .timer(Duration::from_millis(50))
+                    .await;
             }
         })
     }
+}
 
-    fn build_rows(db: &Arc<DB>, cx: &mut AsyncApp) -> Vec<Entity<ComponentRow>> {
-        let prepared: Vec<(SharedString, Component)> = db.with_state(|state| {
-            state
-                .component_metadata_iter()
-                .filter_map(|(id, meta)| {
-                    let name = SharedString::from(meta.name.clone());
-                    let component = state.get_component(*id)?.clone();
-                    Some((name, component))
+fn build_metas(db: &Arc<DB>) -> Vec<RowMeta> {
+    db.with_state(|state| {
+        state
+            .component_metadata_iter()
+            .filter(|(_, meta)| !meta.is_hidden())
+            .filter_map(|(id, meta)| {
+                let name = SharedString::from(meta.name.clone());
+                let component = state.get_component(*id)?.clone();
+                Some(RowMeta {
+                    id: *id,
+                    name,
+                    component,
                 })
-                .collect()
-        });
-
-        prepared
-            .into_iter()
-            .filter_map(|(name, component)| {
-                let db = db.clone();
-                cx.new(|cx| ComponentRow::new(db, name, component, cx)).ok()
             })
             .collect()
-    }
+    })
 }
 
 impl TableDelegate for ComponentTableDelegate {
@@ -164,11 +188,15 @@ impl TableDelegate for ComponentTableDelegate {
     }
 
     fn rows_count(&self) -> usize {
-        self.rows.len()
+        self.metas.len()
     }
 
     fn row_height(&self) -> Pixels {
         px(50.0)
+    }
+
+    fn frame_rendered(&mut self) {
+        self.row_cache.prune();
     }
 
     fn render_cell(
@@ -179,7 +207,15 @@ impl TableDelegate for ComponentTableDelegate {
         cx: &mut Context<Table<Self>>,
     ) -> AnyElement {
         let theme = theme(cx);
-        let row = &self.rows[row_ix];
+        let (id, name, component) = {
+            let meta = &self.metas[row_ix];
+            (meta.id, meta.name.clone(), meta.component.clone())
+        };
+        let db = self.db.clone();
+        let row = self.row_cache.get_or_create(id, || {
+            cx.new(|cx| ComponentRow::new(db, name, component, cx))
+        });
+        let row = &row;
         match col_ix {
             0 => {
                 let name = row.read(cx).name.clone();
@@ -226,28 +262,25 @@ impl TableDelegate for ComponentTableDelegate {
         }
     }
 
-    fn sort_column(&mut self, col_ix: usize, sort: ColumnSort, cx: &App) {
+    fn sort_column(&mut self, col_ix: usize, sort: ColumnSort, _cx: &App) {
+        let db = self.db.clone();
         match (col_ix, sort) {
             (0, ColumnSort::Ascending) => {
-                self.rows
-                    .sort_by(|a, b| a.read(cx).name.cmp(&b.read(cx).name));
+                self.metas.sort_by(|a, b| a.name.cmp(&b.name));
             }
             (0, ColumnSort::Descending) => {
-                self.rows
-                    .sort_by(|a, b| b.read(cx).name.cmp(&a.read(cx).name));
+                self.metas.sort_by(|a, b| b.name.cmp(&a.name));
             }
             (1, ColumnSort::Ascending) => {
-                self.rows.sort_by(|a, b| {
-                    a.read(cx)
-                        .current_value_string()
-                        .cmp(&b.read(cx).current_value_string())
+                self.metas.sort_by(|a, b| {
+                    current_value_string(&db, &a.component)
+                        .cmp(&current_value_string(&db, &b.component))
                 });
             }
             (1, ColumnSort::Descending) => {
-                self.rows.sort_by(|a, b| {
-                    b.read(cx)
-                        .current_value_string()
-                        .cmp(&a.read(cx).current_value_string())
+                self.metas.sort_by(|a, b| {
+                    current_value_string(&db, &b.component)
+                        .cmp(&current_value_string(&db, &a.component))
                 });
             }
             _ => {}
@@ -262,7 +295,9 @@ pub type ComponentTable = Table<ComponentTableDelegate>;
 pub fn new_component_table(db: Arc<DB>, cx: &mut Context<ComponentTable>) -> ComponentTable {
     let task = ComponentTableDelegate::spawn_watcher(db.clone(), cx);
     let delegate = ComponentTableDelegate {
-        rows: Vec::new(),
+        db,
+        metas: Vec::new(),
+        row_cache: VisibleEntityCache::new(ROW_CACHE_CAP),
         _task: task,
     };
     Table::new(delegate)

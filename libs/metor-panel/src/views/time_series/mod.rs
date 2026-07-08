@@ -315,11 +315,16 @@ pub struct NodeBounds {
     pub max: f64,
 }
 
-/// Per-trace cache keyed by a node's `Arc::as_ptr` identity.
+/// Per-trace cache keyed by a node's first sample timestamp — the node's
+/// identity everywhere else in the DB (directory name, manifest span key,
+/// `begin_fetch`), unique per component by construction.
 ///
-/// Stable across calls because sealed nodes are never replaced. Entries for
-/// nodes that leave the component's live set are evicted on each call.
-pub type NodeBoundsCache = HashMap<usize, NodeBounds>;
+/// Not keyed by `Arc::as_ptr`: splices free node shells and reallocate
+/// same-sized ones, so a pointer can collide across frames and one node
+/// would inherit another's cached min/max. The first timestamp survives
+/// shell rebuilds (the rebuilt shell wraps the same inner value). Entries
+/// for nodes that leave the component's live set are evicted on each call.
+pub type NodeBoundsCache = HashMap<i64, NodeBounds>;
 
 /// Aggregate `(min, max)` across `indexes` over every sample in
 /// `component.time_series`, reusing `cache` so only new head-node samples
@@ -356,10 +361,14 @@ pub fn expand_value_bounds(
     let mut agg_min = f64::INFINITY;
     let mut agg_max = f64::NEG_INFINITY;
     let mut seen = false;
-    let mut live: HashSet<usize> = HashSet::new();
+    let mut live: HashSet<i64> = HashSet::new();
 
     for node in component.time_series.list.iter() {
-        let node_id = Arc::as_ptr(&node) as usize;
+        // First timestamp is the node's stable identity; an empty node
+        // caches nothing, so skip it (it can't collide a key either).
+        let Some(node_id) = node.timestamps().first().map(|t| t.0) else {
+            continue;
+        };
         live.insert(node_id);
         let current_len = node.timestamps().len();
         let entry = cache.entry(node_id).or_insert(NodeBounds {
@@ -1408,7 +1417,7 @@ impl TimeSeriesPlot {
     /// Clear every user-imposed bound so auto-fit resumes on the next frame.
     fn reset_view(&mut self, cx: &mut Context<Self>) {
         self.line_plot.update(cx, |lp, cx| {
-            lp.x_range = TimeRangeBehavior::default();
+            lp.x_range = Override::Auto;
             for axis in lp.axes.clone() {
                 axis.update(cx, |a, cx| {
                     a.y_min_override = Override::Auto;

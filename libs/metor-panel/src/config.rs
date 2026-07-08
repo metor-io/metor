@@ -28,10 +28,32 @@ pub enum FontConfig {
 }
 
 /// Root of the on-disk panel config document.
-#[derive(facet::Facet, Clone, Debug, Default)]
+///
+/// `Default` is hand-written rather than derived: the derived impl would seed
+/// `leader` with `String::default()` (empty), but the missing-file fallback in
+/// [`load`] must produce a usable leader. The `#[facet(default = …)]` attribute
+/// covers the parallel case where the field is simply absent from an older file.
+#[derive(facet::Facet, Clone, Debug)]
 pub struct PanelConfig {
     #[facet(default)]
     pub font: FontConfig,
+    /// gpui keystroke that opens the transient chord menu (e.g. `"space"`,
+    /// `"cmd-k"`).
+    #[facet(default = default_leader())]
+    pub leader: String,
+}
+
+impl Default for PanelConfig {
+    fn default() -> Self {
+        Self {
+            font: FontConfig::default(),
+            leader: default_leader(),
+        }
+    }
+}
+
+fn default_leader() -> String {
+    "space".to_string()
 }
 
 /// Resolve the config file path. Does **not** create the parent directory —
@@ -92,14 +114,27 @@ mod tests {
 
         let named = PanelConfig {
             font: FontConfig::Family("Berkeley Mono".into()),
+            ..Default::default()
         };
         assert_eq!(round_trip(&named).font, named.font);
     }
 
     #[test]
     fn empty_object_uses_field_defaults() {
-        // An older file written before `font` existed must still parse.
+        // An older file written before `font`/`leader` existed must still parse.
         let cfg: PanelConfig = facet_json::from_str("{}").expect("deserialize");
         assert_eq!(cfg.font, FontConfig::Auto);
+        assert_eq!(cfg.leader, "space");
+    }
+
+    #[test]
+    fn leader_round_trips() {
+        assert_eq!(round_trip(&PanelConfig::default()).leader, "space");
+
+        let custom = PanelConfig {
+            leader: "cmd-k".into(),
+            ..Default::default()
+        };
+        assert_eq!(round_trip(&custom).leader, "cmd-k");
     }
 }

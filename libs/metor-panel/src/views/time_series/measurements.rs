@@ -89,7 +89,10 @@ pub fn collect_samples(
     }
     let slice = component.time_series.get_range(range)?;
     let mut out: Vec<(Timestamp, f64)> = Vec::new();
-    for node in slice.as_iter() {
+    // Newest-first node order, reversed so reductions and the FFT see
+    // chronological samples.
+    let node_slices: Vec<_> = slice.as_iter().collect();
+    for node in node_slices.iter().rev() {
         let timestamps = node.timestamps();
         let data = node.data();
         let elem_size = schema.size();

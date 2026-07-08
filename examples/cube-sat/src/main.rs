@@ -1,6 +1,8 @@
 use std::{
+    cell::RefCell,
     net::SocketAddr,
     ops::Add,
+    rc::Rc,
     time::{Duration, Instant},
 };
 
@@ -11,7 +13,7 @@ use metor_proto_bbq::RxExt;
 use metor_proto_stellar::{PacketSink, PacketStream, queue::spawn_recv};
 use metor_proto_wkt::{
     AlarmCleared, AlarmDef, AlarmLimit, AlarmRaised, AlarmTarget, ComponentValue, LimitKind,
-    MsgStream, SetDbConfig, Severity, UpdateComponent,
+    MsgStream, ReloadSequences, SequenceCommand, SetDbConfig, Severity, UpdateComponent,
 };
 use nox::{
     ArrayBuf, Body, DU, Quaternion, Scalar, SpatialForce, SpatialInertia, SpatialMotion,
@@ -21,6 +23,9 @@ use rand_distr::Distribution;
 use stellarator::{io::SplitExt, net::TcpStream, rent};
 use tracing_subscriber::EnvFilter;
 use zerocopy::{Immutable, IntoBytes, KnownLayout};
+
+mod sequencer;
+use sequencer::Sequencer;
 
 const G: f64 = 6.6743e-11; // Gravitational constant
 const M: f64 = 5.972e24; // Mass of Earth
@@ -35,6 +40,11 @@ const K_0: Vec3<f64> = Vec3::from_buf([-30926.00e-9, 5817.00e-9, -2318.00e-9]);
 #[repr(C)]
 #[metor_fsw(parent = "cube_sat")]
 pub struct CubeSat {
+    /// Simulation time; every component in this table is recorded at this
+    /// timestamp instead of the db's wall-clock receive time, so the sim can
+    /// free-run faster (or slower) than real time
+    #[metor_fsw(timestamp)]
+    pub timestamp: Timestamp,
     pub sim: Sim,
     pub fsw: FSW,
 }
@@ -446,7 +456,11 @@ impl Default for CubeSat {
             tick_time: 0.0,
         };
         let control = FSW::default();
-        Self { sim, fsw: control }
+        Self {
+            timestamp: control.start_epoch,
+            sim,
+            fsw: control,
+        }
     }
 }
 
@@ -488,18 +502,30 @@ impl Sim {
     }
 }
 
-fn tick(mut cubesat: CubeSat) -> CubeSat {
+// The FSW lives behind a shared cell so sequences can command it; `tick` updates it in place
+// and returns the advanced sim. The FSW wheel-enable surface
+// (`overrides.disable_reaction_wheels`) is mirrored onto the sim's per-wheel arm gate, so both
+// operators and sequences command the wheels through FSW alone.
+fn tick(mut sim: Sim, fsw: &RefCell<FSW>) -> Sim {
     let sim_start = Instant::now();
-    cubesat.sim = cubesat.sim.update();
-    cubesat.sim = rk4::<f64, Sim, DU, _>(DT, &cubesat.sim, |sim: &Sim| -> DU { sim.du() });
-    cubesat.sim.tick_time = sim_start.elapsed().as_secs_f64();
+    sim = sim.update();
+    sim = rk4::<f64, Sim, DU, _>(DT, &sim, |sim: &Sim| -> DU { sim.du() });
+    sim.tick_time = sim_start.elapsed().as_secs_f64();
+
     let fsw_start = Instant::now();
-    cubesat.fsw = cubesat.fsw.update(&cubesat.sim.sensors);
-    cubesat
-        .sim
-        .set_reaction_wheel_torque(cubesat.fsw.control.torque_set_point);
-    cubesat.fsw.tick_time = fsw_start.elapsed().as_secs_f64();
-    cubesat
+    let next = fsw.borrow().clone().update(&sim.sensors);
+    {
+        let mut fsw = fsw.borrow_mut();
+        *fsw = next;
+        fsw.tick_time = fsw_start.elapsed().as_secs_f64();
+    }
+
+    let fsw = fsw.borrow();
+    for i in 0..sim.reaction_wheels.len() {
+        sim.reaction_wheels[i].arm = !fsw.overrides.disable_reaction_wheels[i];
+    }
+    sim.set_reaction_wheel_torque(fsw.control.torque_set_point);
+    sim
 }
 
 #[stellarator::main]
@@ -522,6 +548,17 @@ pub async fn main() -> anyhow::Result<()> {
     tx.init_world::<CubeSat>(id).await?;
     tx.send(&MsgStream {
         msg_id: UpdateComponent::ID,
+    })
+    .await
+    .0?;
+    // Receive operator sequence commands (load/start/abort/stop) and reload requests.
+    tx.send(&MsgStream {
+        msg_id: SequenceCommand::ID,
+    })
+    .await
+    .0?;
+    tx.send(&MsgStream {
+        msg_id: ReloadSequences::ID,
     })
     .await
     .0?;
@@ -583,15 +620,24 @@ pub async fn main() -> anyhow::Result<()> {
     let mut over_count = 0u8;
     let mut under_count = 0u8;
 
-    let mut cube_sat = CubeSat::default();
+    // FSW state is shared with the sequence executor; sim state stays private to this loop.
+    let CubeSat {
+        timestamp: mut sim_time,
+        mut sim,
+        fsw,
+    } = CubeSat::default();
+    let fsw = Rc::new(RefCell::new(fsw));
     // `--disarmed` brings the spacecraft up with every reaction wheel offline, so the
     // operator must arm them from the panel before attitude control takes effect.
     if std::env::args().any(|arg| arg == "--disarmed") {
-        for wheel in &mut cube_sat.sim.reaction_wheels {
-            wheel.arm = false;
-        }
+        fsw.borrow_mut().overrides.disable_reaction_wheels = [true; 3];
         println!("reaction wheels starting disarmed");
     }
+
+    // The limited futures executor: it declares the sequence channels, runs loaded sequences
+    // against the shared FSW, and reports their lifecycle back to the panel.
+    let mut sequencer = Sequencer::new(fsw.clone());
+    tx.send(&sequencer.registry()).await.0?;
 
     let mut pkt = LenPacket::new(
         metor_proto::types::PacketTy::Table,
@@ -603,34 +649,34 @@ pub async fn main() -> anyhow::Result<()> {
         while let Some(pkt) = rx.try_recv_pkt() {
             match pkt {
                 OwnedPacket::Msg(m) if m.id == UpdateComponent::ID => {
-                    println!("Received UpdateComponent message");
                     let Ok(update_component) = m.parse::<UpdateComponent>().inspect_err(|err| {
                         println!("{err:?}");
                     }) else {
                         continue;
                     };
-                    println!("Received UpdateComponent message {:?}", update_component);
+                    // Operator commands write the same shared FSW surface as sequences.
                     match &update_component.value {
                         ComponentValue::U64(value) => {
                             if update_component.id == ComponentId::new("cube_sat.fsw.mode") {
                                 let mode = value.buf.as_buf()[0];
-                                cube_sat.fsw.mode = match mode {
+                                fsw.borrow_mut().mode = match mode {
                                     0 => Mode::NadirPoint,
                                     1 => Mode::HilPoint,
                                     _ => continue,
                                 };
                             }
                         }
-                        // Operator arm/disarm of a reaction wheel from the panel.
+                        // Operator arm/disarm of a reaction wheel from the panel, expressed as
+                        // the FSW wheel-enable override (mirrored onto the sim gate each tick).
                         ComponentValue::Bool(value) => {
                             let armed = value.buf.as_buf()[0];
-                            for i in 0..cube_sat.sim.reaction_wheels.len() {
+                            for i in 0..sim.reaction_wheels.len() {
                                 if update_component.id
                                     == ComponentId::new(&format!(
                                         "cube_sat.sim.reaction_wheels.{i}.arm"
                                     ))
                                 {
-                                    cube_sat.sim.reaction_wheels[i].arm = armed;
+                                    fsw.borrow_mut().overrides.disable_reaction_wheels[i] = !armed;
                                     println!(
                                         "reaction wheel {i} {}",
                                         if armed { "armed" } else { "disarmed" }
@@ -641,14 +687,31 @@ pub async fn main() -> anyhow::Result<()> {
                         _ => {}
                     }
                 }
+                OwnedPacket::Msg(m) if m.id == SequenceCommand::ID => {
+                    let Ok(cmd) = m.parse::<SequenceCommand>().inspect_err(|err| {
+                        println!("{err:?}");
+                    }) else {
+                        continue;
+                    };
+                    sequencer.handle_command(cmd);
+                }
+                OwnedPacket::Msg(m) if m.id == ReloadSequences::ID => {
+                    // The channel set is static here; reload just re-advertises the registry.
+                    tx.send(&sequencer.registry()).await.0?;
+                }
                 _ => {}
             }
         }
-        cube_sat = tick(cube_sat);
+
+        // Poll the sequence executor once (advances sim-time, may mutate the FSW surface),
+        // then advance the dynamics + FSW for this cycle.
+        sequencer.step();
+        sim = tick(sim, &fsw);
+        sim_time += Duration::from_secs_f64(DT);
 
         // Evaluate the body-rate alarm with a two-sample debounce, then raise/clear on
         // transitions only. Y (element 1) holds the initial tumble.
-        let rate = cube_sat.sim.sensors.imu.gyro.into_buf()[1];
+        let rate = sim.sensors.imu.gyro.into_buf()[1];
         if rate.abs() > RATE_WARN {
             over_count = over_count.saturating_add(1);
             under_count = 0;
@@ -683,13 +746,24 @@ pub async fn main() -> anyhow::Result<()> {
             .0?;
         }
 
+        // Re-assemble the table from the split sim + shared FSW for the wire.
+        let cube_sat = CubeSat {
+            timestamp: sim_time,
+            sim: sim.clone(),
+            fsw: fsw.borrow().clone(),
+        };
         pkt.extend_from_slice(cube_sat.as_bytes());
         rent!(tx.send(pkt).await, pkt)?;
         pkt.clear();
 
+        // Forward any sequence lifecycle events produced this cycle to the panel.
+        for event in sequencer.drain_events() {
+            tx.send(&event).await.0?;
+        }
+
         let sleep = Duration::from_secs_f64(DT).saturating_sub(start.elapsed());
         if sleep > Duration::ZERO {
-            stellarator::sleep(sleep).await;
+          stellarator::sleep(Duration::from_micros(5)).await;
         }
     }
 }

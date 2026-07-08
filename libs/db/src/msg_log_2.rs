@@ -183,24 +183,31 @@ pub struct MsgLogSlice {
 }
 
 impl MsgLogSlice {
+    /// Per-node slices of the range, newest first. The node list's links
+    /// only run newer → older, so iteration seeds from the range's newest
+    /// node (`end`) and stops once the oldest (`start`) has been yielded —
+    /// seeding from `start` can never reach the newer nodes that hold the
+    /// rest of the range.
     pub fn as_iter(&self) -> impl Iterator<Item = MsgLogNodeSlice> + '_ {
         let iter: AtomicStackIter<MsgLogNode> =
-            AtomicStackIter::new(ArcAtomic::from(self.start.node.clone()));
-        iter.map(move |node| {
-            let start = if Arc::ptr_eq(&node, &self.start.node) {
-                self.start.index
-            } else {
-                0
-            };
+            AtomicStackIter::new(ArcAtomic::from(self.end.node.clone()));
+        let mut done = false;
+        iter.map_while(move |node| {
+            if done {
+                return None;
+            }
+            let is_start = Arc::ptr_eq(&node, &self.start.node);
+            done = is_start;
+            let start = if is_start { self.start.index } else { 0 };
             let end = if Arc::ptr_eq(&node, &self.end.node) {
                 self.end.index
             } else {
                 node.msg_count().saturating_sub(1)
             };
-            MsgLogNodeSlice {
+            Some(MsgLogNodeSlice {
                 range: start..=end,
                 node,
-            }
+            })
         })
     }
 
@@ -247,18 +254,13 @@ impl MsgLog {
             None
         };
 
-        let entries = std::fs::read_dir(path)?;
-        for entry in entries {
-            let entry = entry?;
-            let node_path = entry.path();
-            if node_path.is_dir() && node_path.file_name().unwrap_or_default() != "metadata" {
-                match MsgLogNode::open(&node_path) {
-                    Ok(node) => {
-                        list.push(node);
-                    }
-                    Err(e) => {
-                        warn!(?node_path, ?e, "failed to open msg log node");
-                    }
+        for node_path in crate::time_series_2::node_dirs_oldest_first(path)? {
+            match MsgLogNode::open(&node_path) {
+                Ok(node) => {
+                    list.push(node);
+                }
+                Err(e) => {
+                    warn!(?node_path, ?e, "failed to open msg log node");
                 }
             }
         }
@@ -333,8 +335,21 @@ impl MsgLog {
     }
 
     pub fn binary_search_nearest(&self, timestamp: Timestamp, inclusive: bool) -> Option<MsgRef> {
+        let head = self.list.head()?;
+        Self::binary_search_nearest_from(head, timestamp, inclusive)
+    }
+
+    /// Nearest-sample search seeded from a captured `head`, so
+    /// [`Self::get_range`] can run both endpoint searches over a single
+    /// spine snapshot. See `TimeSeries::binary_search_nearest_from` for
+    /// the two-snapshot race this avoids.
+    fn binary_search_nearest_from(
+        head: Arc<AtomicNode<MsgLogNode>>,
+        timestamp: Timestamp,
+        inclusive: bool,
+    ) -> Option<MsgRef> {
         let mut prev_node: Option<MsgRef> = None;
-        for node in self.list.iter() {
+        for node in AtomicStackIter::new(ArcAtomic::from(head)) {
             let timestamps = node.timestamps();
             let start = timestamps.first()?;
             let end = timestamps.last()?;
@@ -381,8 +396,11 @@ impl MsgLog {
     }
 
     pub fn get_range(&self, range: Range<Timestamp>) -> Option<MsgLogSlice> {
-        let start = self.binary_search_nearest(range.start, false)?;
-        let end = self.binary_search_nearest(range.end, true)?;
+        // One captured head for both endpoint searches; see
+        // `TimeSeries::get_range`.
+        let head = self.list.head()?;
+        let start = Self::binary_search_nearest_from(head.clone(), range.start, false)?;
+        let end = Self::binary_search_nearest_from(head, range.end, true)?;
         Some(MsgLogSlice { start, end })
     }
 

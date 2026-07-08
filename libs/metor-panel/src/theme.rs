@@ -91,6 +91,13 @@ pub struct Theme {
     pub grid_color: Hsla,
     pub axis_color: Hsla,
     pub zero_line_color: Hsla,
+    /// Translucent band over plot regions whose data is remote-only or
+    /// still downloading.
+    pub plot_gap_band: Hsla,
+    /// Alpha applied to a trace's color when it renders as a min/max
+    /// envelope (LoD buckets) instead of raw samples, so operators can
+    /// tell the two apart at a glance.
+    pub plot_envelope_alpha: f32,
 
     /// "On" color for checkboxes, switches, and traffic-light tiles. Replaces
     /// per-call-site indexing into `line_colors`.
@@ -142,6 +149,29 @@ impl Theme {
             ..self.alarm_color(severity_index)
         }
     }
+
+    /// Solid color for a sequence channel's run state (`run_state_index`: 0 = idle,
+    /// 1 = running, 2 = completed, 3 = aborted, 4 = stopped, 5 = failed). Tracks the
+    /// theme's `control_active`/`error_accent` for the running/failed poles; the
+    /// intermediate states use fixed hues that read on both light and dark themes.
+    pub fn run_state_color(&self, run_state_index: usize) -> Hsla {
+        match run_state_index {
+            1 => self.control_active,   // running
+            2 => hex(0x4090e0, 1.0),    // completed — calm blue
+            3 => hex(0xe0a030, 1.0),    // aborted — amber (commanded safe stop)
+            4 => hex(0xe06820, 1.0),    // stopped — orange (hard, possibly unsafe)
+            5 => self.error_accent,     // failed
+            _ => self.text_tertiary,    // idle / unknown
+        }
+    }
+
+    /// Low-alpha [`run_state_color`](Self::run_state_color) for swatch/row backgrounds.
+    pub fn run_state_tint(&self, run_state_index: usize) -> Hsla {
+        Hsla {
+            a: 0.12,
+            ..self.run_state_color(run_state_index)
+        }
+    }
 }
 
 /// Global wrapper that makes the active [`Theme`] addressable from any view.
@@ -174,6 +204,7 @@ pub fn all_themes() -> &'static [&'static Theme] {
         &ROSE_PINE_DAWN,
         &MAKING_SOFTWARE,
         &DEPARTURE,
+        &KINTSUGI,
     ];
     THEMES
 }
@@ -214,6 +245,8 @@ pub static DARK: Theme = Theme {
     grid_color: hex(0x2e2b28, 1.0),
     axis_color: hex(0x4d4843, 1.0),
     zero_line_color: hex(0x6b6560, 1.0),
+    plot_gap_band: hex(0x6b6560, 0.12),
+    plot_envelope_alpha: 0.55,
 
     control_active: hex(0x40b060, 1.0),
     control_active_track: hex(0x40b060, 0.7),
@@ -254,6 +287,8 @@ pub static CATPPUCCIN_MOCHA: Theme = Theme {
     grid_color: hex(0x313244, 1.0),
     axis_color: hex(0x45475a, 1.0),
     zero_line_color: hex(0x585b70, 1.0),
+    plot_gap_band: hex(0x585b70, 0.12),
+    plot_envelope_alpha: 0.55,
 
     control_active: hex(0xa6e3a1, 1.0),
     control_active_track: hex(0xa6e3a1, 0.7),
@@ -294,6 +329,8 @@ pub static CATPPUCCIN_MACCHIATO: Theme = Theme {
     grid_color: hex(0x363a4f, 1.0),
     axis_color: hex(0x494d64, 1.0),
     zero_line_color: hex(0x5b6078, 1.0),
+    plot_gap_band: hex(0x5b6078, 0.12),
+    plot_envelope_alpha: 0.55,
 
     control_active: hex(0xa6da95, 1.0),
     control_active_track: hex(0xa6da95, 0.7),
@@ -334,6 +371,8 @@ pub static CATPPUCCIN_LATTE: Theme = Theme {
     grid_color: hex(0xdce0e8, 1.0),
     axis_color: hex(0xccd0da, 1.0),
     zero_line_color: hex(0xbcc0cc, 1.0),
+    plot_gap_band: hex(0xbcc0cc, 0.12),
+    plot_envelope_alpha: 0.55,
 
     control_active: hex(0x40a02b, 1.0),
     control_active_track: hex(0x40a02b, 0.7),
@@ -374,6 +413,8 @@ pub static AYU_DARK: Theme = Theme {
     grid_color: hex(0x11151c, 1.0),
     axis_color: hex(0x1a1e28, 1.0),
     zero_line_color: hex(0x2a2e38, 1.0),
+    plot_gap_band: hex(0x2a2e38, 0.12),
+    plot_envelope_alpha: 0.55,
 
     control_active: hex(0x7fd962, 1.0),
     control_active_track: hex(0x7fd962, 0.7),
@@ -414,6 +455,8 @@ pub static EVERFOREST_DARK: Theme = Theme {
     grid_color: hex(0x3d484d, 1.0),
     axis_color: hex(0x475258, 1.0),
     zero_line_color: hex(0x56635f, 1.0),
+    plot_gap_band: hex(0x56635f, 0.12),
+    plot_envelope_alpha: 0.55,
 
     control_active: hex(0xa7c080, 1.0),
     control_active_track: hex(0xa7c080, 0.7),
@@ -454,6 +497,8 @@ pub static EVERFOREST_LIGHT: Theme = Theme {
     grid_color: hex(0xefebd4, 1.0),
     axis_color: hex(0xe6e2cc, 1.0),
     zero_line_color: hex(0xbdc3af, 1.0),
+    plot_gap_band: hex(0xbdc3af, 0.12),
+    plot_envelope_alpha: 0.55,
 
     control_active: hex(0x8da101, 1.0),
     control_active_track: hex(0x8da101, 0.7),
@@ -494,6 +539,8 @@ pub static ROSE_PINE: Theme = Theme {
     grid_color: hex(0x21202e, 1.0),
     axis_color: hex(0x403d52, 1.0),
     zero_line_color: hex(0x524f67, 1.0),
+    plot_gap_band: hex(0x524f67, 0.12),
+    plot_envelope_alpha: 0.55,
 
     control_active: hex(0x9ccfd8, 1.0),
     control_active_track: hex(0x9ccfd8, 0.7),
@@ -534,6 +581,8 @@ pub static ROSE_PINE_MOON: Theme = Theme {
     grid_color: hex(0x2a283e, 1.0),
     axis_color: hex(0x44415a, 1.0),
     zero_line_color: hex(0x56526e, 1.0),
+    plot_gap_band: hex(0x56526e, 0.12),
+    plot_envelope_alpha: 0.55,
 
     control_active: hex(0x9ccfd8, 1.0),
     control_active_track: hex(0x9ccfd8, 0.7),
@@ -574,6 +623,8 @@ pub static ROSE_PINE_DAWN: Theme = Theme {
     grid_color: hex(0xf4ede8, 1.0),
     axis_color: hex(0xdfdad9, 1.0),
     zero_line_color: hex(0xcecacd, 1.0),
+    plot_gap_band: hex(0xcecacd, 0.12),
+    plot_envelope_alpha: 0.55,
 
     control_active: hex(0x56949f, 1.0),
     control_active_track: hex(0x56949f, 0.7),
@@ -614,6 +665,8 @@ pub static MAKING_SOFTWARE: Theme = Theme {
     grid_color: hex(0xe6ebff, 1.0),
     axis_color: hex(0xb9c7fd, 1.0),
     zero_line_color: hex(0x97acff, 1.0),
+    plot_gap_band: hex(0x97acff, 0.12),
+    plot_envelope_alpha: 0.55,
 
     control_active: hex(0x1342ff, 1.0),
     control_active_track: hex(0x1342ff, 0.7),
@@ -654,10 +707,60 @@ pub static DEPARTURE: Theme = Theme {
     grid_color: hex(0x2a2018, 1.0),
     axis_color: hex(0x3a2a18, 1.0),
     zero_line_color: hex(0x5a3e20, 1.0),
+    plot_gap_band: hex(0x5a3e20, 0.12),
+    plot_envelope_alpha: 0.55,
 
     control_active: hex(0xf0a040, 1.0),
     control_active_track: hex(0xf0a040, 0.7),
     error_accent: hex(0xe05050, 1.0),
+};
+
+/// Port of the "Kintsugi" VS Code theme (github.com/ahatem/vscode-kintsugi),
+/// **Dark Flared** variant: the same warm charcoal surfaces as the standard
+/// dark theme, but with the Flared variant's hotter, earth-toned accents —
+/// terracotta, burnt orange, and golden amber — like fresh gold seams in the
+/// pottery repair it's named for. The categorical line palette leads with those
+/// warm tones, keeping a few cool anchors so series stay distinguishable.
+pub static KINTSUGI: Theme = Theme {
+    name: "Kintsugi Flared",
+
+    bg_primary: hex(0x161618, 1.0),
+    bg_secondary: hex(0x131314, 1.0),
+    bg_elevated: hex(0x292928, 1.0),
+
+    text_primary: hex(0xdddddd, 1.0),
+    text_secondary: hex(0x969b8c, 1.0),
+    text_tertiary: hex(0x75715e, 1.0),
+
+    border_primary: hex(0x2a2a28, 1.0),
+
+    selection_bg: hex(0x393b31, 1.0),
+    text_selection: hex(0x6c7a8a, 0.4),
+    drop_target: hex(0xdbad49, 0.15),
+
+    pill_bg: hex(0x20201f, 1.0),
+    pill_border: hex(0x3a3a36, 1.0),
+
+    line_color: hex(0xdbad49, 1.0),
+    line_colors: [
+        hex(0xdbad49, 1.0), // golden amber
+        hex(0x6c7a8a, 1.0), // blue
+        hex(0xa3be8c, 1.0), // sage green
+        hex(0xd66848, 1.0), // terracotta
+        hex(0xb3a3d3, 1.0), // purple
+        hex(0x678e87, 1.0), // teal
+        hex(0xe08542, 1.0), // burnt orange
+        hex(0x8fa3b3, 1.0), // slate
+    ],
+    grid_color: hex(0x1d1d1c, 1.0),
+    axis_color: hex(0x444444, 1.0),
+    zero_line_color: hex(0x5c584f, 1.0),
+    plot_gap_band: hex(0x5c584f, 0.12),
+    plot_envelope_alpha: 0.55,
+
+    control_active: hex(0xdbad49, 1.0),
+    control_active_track: hex(0xdbad49, 0.7),
+    error_accent: hex(0xd66848, 1.0),
 };
 
 /// Family name of the font bundled into the binary. This is the guaranteed
@@ -738,7 +841,9 @@ pub fn font_family(cx: &App) -> SharedString {
 /// choice survives a restart. The palette dismissal re-renders the root, which
 /// picks up the new family.
 pub fn set_font(cx: &mut App, font: FontConfig) {
-    let config = PanelConfig { font };
+    // Start from the live config so unrelated fields (e.g. `leader`) survive.
+    let mut config = cx.global::<FontSettings>().config.clone();
+    config.font = font;
     let family = resolve_font_family(cx, &config);
     if let Err(e) = config::save(&config) {
         eprintln!("save config: {e}");

@@ -73,6 +73,7 @@ async fn main() -> miette::Result<()> {
             }
             info!(?path, "starting db");
             let server = Server::new(path, addr).into_diagnostic()?;
+            metor_db::lod::spawn(server.db.clone());
             let db = stellarator::spawn(server.run());
             if let Some(lua_config) = config {
                 let args = metor_proto_cli::Args {

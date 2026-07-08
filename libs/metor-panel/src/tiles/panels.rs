@@ -16,8 +16,9 @@ use crate::views::time_series::{
 use crate::views::viewer_3d::Viewer3d;
 use crate::views::xy_plot::{XyLinePlot, XyPlot, XyTrace};
 use crate::views::{
-    AlarmView, ComponentBrowser, ComponentTable, ComponentText, DataTable, TimeSeriesPlot,
-    TrafficLight, TrafficLightGrid, new_component_browser, new_component_table, new_data_table,
+    AlarmView, ComponentBrowser, ComponentTable, ComponentText, DataTable, SequenceGrid,
+    SequenceView, TimeSeriesPlot, TrafficLight, TrafficLightGrid, new_component_browser,
+    new_component_table, new_data_table,
 };
 
 use super::item::{PaneItem, PaneItemHandle};
@@ -122,6 +123,102 @@ impl PaneItem for AlarmPanel {
 
     fn to_config(&self, _cx: &App) -> AlarmPanelConfig {
         AlarmPanelConfig::default()
+    }
+
+    fn inspectable_entity(&self) -> Option<gpui::AnyEntity> {
+        Some(self.inner.clone().into())
+    }
+}
+
+/// Persisted shape of a [`SequencePanel`]. Sequence state is global, so the only persisted
+/// bit is the view's list mode (defaulted).
+#[derive(facet::Facet, Default)]
+pub struct SequencePanelConfig {
+    pub show_history: bool,
+}
+
+/// Pane item with the detailed per-channel sequence control list.
+pub struct SequencePanel {
+    inner: Entity<SequenceView>,
+}
+
+impl SequencePanel {
+    pub fn new(_db: Arc<DB>, cx: &mut Context<Self>) -> Self {
+        let inner = cx.new(SequenceView::new);
+        Self { inner }
+    }
+
+    pub fn from_config(_cfg: SequencePanelConfig, db: Arc<DB>, cx: &mut Context<Self>) -> Self {
+        Self::new(db, cx)
+    }
+}
+
+impl Render for SequencePanel {
+    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+        div().size_full().child(self.inner.clone())
+    }
+}
+
+impl PaneItem for SequencePanel {
+    type Config = SequencePanelConfig;
+
+    fn tab_title(&self, _cx: &App) -> SharedString {
+        SharedString::new_static("Sequences")
+    }
+
+    fn serialization_key() -> &'static str {
+        "sequence"
+    }
+
+    fn to_config(&self, _cx: &App) -> SequencePanelConfig {
+        SequencePanelConfig::default()
+    }
+
+    fn inspectable_entity(&self) -> Option<gpui::AnyEntity> {
+        Some(self.inner.clone().into())
+    }
+}
+
+/// Persisted shape of a [`SequenceGridPanel`]. No per-panel config — the grid reads the
+/// global sequence store.
+#[derive(facet::Facet, Default)]
+pub struct SequenceGridPanelConfig {}
+
+/// Pane item with the compact many-channel sequence grid.
+pub struct SequenceGridPanel {
+    inner: Entity<SequenceGrid>,
+}
+
+impl SequenceGridPanel {
+    pub fn new(_db: Arc<DB>, cx: &mut Context<Self>) -> Self {
+        let inner = cx.new(SequenceGrid::new);
+        Self { inner }
+    }
+
+    pub fn from_config(_cfg: SequenceGridPanelConfig, db: Arc<DB>, cx: &mut Context<Self>) -> Self {
+        Self::new(db, cx)
+    }
+}
+
+impl Render for SequenceGridPanel {
+    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+        div().size_full().child(self.inner.clone())
+    }
+}
+
+impl PaneItem for SequenceGridPanel {
+    type Config = SequenceGridPanelConfig;
+
+    fn tab_title(&self, _cx: &App) -> SharedString {
+        SharedString::new_static("Sequence Grid")
+    }
+
+    fn serialization_key() -> &'static str {
+        "sequence_grid"
+    }
+
+    fn to_config(&self, _cx: &App) -> SequenceGridPanelConfig {
+        SequenceGridPanelConfig::default()
     }
 
     fn inspectable_entity(&self) -> Option<gpui::AnyEntity> {
@@ -491,16 +588,17 @@ impl Render for PlotPanel {
 }
 
 /// Persisted shape of a [`PlotPanel`].
-///
-/// `x_range` is intentionally absent: `TimeRangeBehavior::Offset` carries
-/// `std::time::Duration`/`Timestamp` variants that aren't `Facet` yet, so it
-/// can't round-trip through `facet-json` without a parallel config struct.
-/// Adding it is a follow-up.
 #[derive(facet::Facet, Default)]
 pub struct PlotPanelConfig {
     pub label: String,
     pub traces: Vec<TraceConfig>,
     pub custom_title: Override<String>,
+    /// Per-plot time window in `TimeRangeBehavior`'s string grammar (e.g.
+    /// `"LAST 30m"`). Stored as text because the behavior's
+    /// `Duration`/`Timestamp` internals aren't `Facet`-serializable; empty
+    /// means the plot follows the global range. Additive — old layouts
+    /// deserialize to empty.
+    pub x_range: String,
     /// Legacy single-axis bounds. Retained for back-compat: on load, when
     /// `axes` is empty these seed the primary axis; on save they mirror the
     /// primary axis so older readers still see pinned bounds.
@@ -694,6 +792,9 @@ impl PlotPanel {
         let line_plot = panel.line_plot.clone();
         line_plot.update(cx, |lp, cx| {
             lp.custom_title = cfg.custom_title.map(SharedString::from);
+            if let Ok(behavior) = cfg.x_range.parse() {
+                lp.x_range = Override::Custom(behavior);
+            }
             lp.x_time_format = cfg.x_time_format;
             lp.show_alarm_limits = !cfg.hide_alarm_limits;
             lp.show_alarm_color = !cfg.hide_alarm_color;
@@ -782,6 +883,11 @@ impl PaneItem for PlotPanel {
                 .map(|e| TraceConfig::from(e.read(cx)))
                 .collect(),
             custom_title: lp.custom_title.as_ref().map(|s| s.to_string()),
+            x_range: lp
+                .x_range
+                .as_custom()
+                .map(|b| b.to_string())
+                .unwrap_or_default(),
             y_min_override,
             y_max_override,
             axes: lp
@@ -1552,6 +1658,32 @@ pub(crate) fn new_panel_rows(
         })
     })));
 
+    rows.push(Box::new(CommandRow::new("Sequences", {
+        let db = db.clone();
+        let pane = pane.clone();
+        Arc::new(move |_window, cx| {
+            let db = db.clone();
+            pane.update(cx, |pane, cx| {
+                let item: Box<dyn PaneItemHandle> =
+                    Box::new(cx.new(|cx| SequencePanel::new(db, cx)));
+                pane.add_item(item, cx);
+            });
+        })
+    })));
+
+    rows.push(Box::new(CommandRow::new("Sequence Grid", {
+        let db = db.clone();
+        let pane = pane.clone();
+        Arc::new(move |_window, cx| {
+            let db = db.clone();
+            pane.update(cx, |pane, cx| {
+                let item: Box<dyn PaneItemHandle> =
+                    Box::new(cx.new(|cx| SequenceGridPanel::new(db, cx)));
+                pane.add_item(item, cx);
+            });
+        })
+    })));
+
     rows.push(Box::new(CommandRow::new("Node Editor", {
         let db = db.clone();
         let pane = pane.clone();
@@ -1623,6 +1755,7 @@ mod tests {
 
         let plot = PlotPanelConfig {
             label: "speed".into(),
+            x_range: "LAST 30 min".into(),
             traces: vec![TraceConfig {
                 component_id: ComponentId(3),
                 element_index: 1,
@@ -1667,13 +1800,17 @@ mod tests {
         assert!(matches!(back.y_min_override, Override::Custom(v) if (v + 10.0).abs() < 1e-9));
         assert!(matches!(back.y_max_override, Override::Auto));
         assert_eq!(back.x_time_format, TimeFormat::Utc);
+        assert_eq!(back.x_range, "LAST 30 min");
+        assert!(back.x_range.parse::<crate::views::time_series::TimeRangeBehavior>().is_ok());
 
-        // A pre-existing layout written before `x_time_format`/`axes` existed
-        // must still load, defaulting to `Relative` and no explicit axes.
+        // A pre-existing layout written before `x_time_format`/`axes`/
+        // `x_range` existed must still load, defaulting to `Relative`, no
+        // explicit axes, and a follow-global range.
         let legacy = r#"{"label":"old","traces":[],"custom_title":"Auto","y_min_override":"Auto","y_max_override":"Auto","default_measurements":[],"cursors":[],"measurement_panel":"Track"}"#;
         let back: PlotPanelConfig = facet_json::from_str(legacy).unwrap();
         assert_eq!(back.x_time_format, TimeFormat::Relative);
         assert!(back.axes.is_empty());
+        assert!(back.x_range.is_empty());
 
         let viewer = Viewer3dPanelConfig {
             models: vec![ModelConfig {

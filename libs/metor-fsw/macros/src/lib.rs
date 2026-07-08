@@ -14,6 +14,8 @@ struct Field {
     ident: Option<syn::Ident>,
     ty: syn::Type,
     component_id: Option<String>,
+    #[darling(default)]
+    timestamp: bool,
 }
 
 impl Field {
