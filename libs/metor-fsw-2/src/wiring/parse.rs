@@ -189,6 +189,18 @@ fn parse_system(
     }
     let artifact = prop_string(node, "artifact").map(str::to_string);
     let ty = prop_string(node, "type").map(str::to_string);
+    // `process=#true` runs the artifact in its own worker process.
+    let process = node
+        .get("process")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    if process && artifact.is_none() {
+        return Err(LoadError::ProcessNeedsArtifact {
+            name: name.to_string(),
+            src: src.to_string(),
+            span: node.span(),
+        });
+    }
     if ty.is_none() && artifact.is_none() {
         return Err(LoadError::MissingType {
             name: name.to_string(),
@@ -219,6 +231,7 @@ fn parse_system(
         ty,
         artifact,
         params,
+        process,
     })
 }
 

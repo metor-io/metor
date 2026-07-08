@@ -210,8 +210,22 @@ fn open_and_describe(path: &OsStr) -> Result<(Library, Vec<u8>), DlError> {
 /// is loaded, ABI-checked, described, and unloaded *in this process*, and the
 /// host decodes the bytes without ever loading the object itself
 /// (`docs/process-systems.md` §5).
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 pub(crate) fn describe_raw(path: impl AsRef<OsStr>) -> Result<Vec<u8>, DlError> {
     open_and_describe(path.as_ref()).map(|(_lib, buf)| buf)
+}
+
+/// Decode a describe payload into the host-side [`SystemDescriptor`] plus
+/// the exported `Params` schema — the shared tail of [`DlSystem::open`] and
+/// the process path's describe-worker decode, host-capability rejection
+/// included.
+pub(crate) fn decode_descriptor_msg(
+    bytes: &[u8],
+) -> Result<(SystemDescriptor, OwnedNamedType), DlError> {
+    let msg: SystemDescriptorMsg = postcard::from_bytes(bytes).map_err(DlError::Decode)?;
+    let msg = reject_capabilities(msg)?;
+    let params_schema = msg.params_schema.clone();
+    Ok((msg.into_descriptor(), params_schema))
 }
 
 impl DlSystem {
@@ -224,14 +238,9 @@ impl DlSystem {
         let (lib, buf) = open_and_describe(path.as_ref())?;
 
         // --- Decode and reconstruct the descriptor --------------------------
-        // The `Params` schema is cloned off the message before `into_descriptor`
-        // consumes it, so the host can schema-encode KDL params later.
-        let (descriptor, params_schema) = {
-            let msg: SystemDescriptorMsg = postcard::from_bytes(&buf).map_err(DlError::Decode)?;
-            let msg = reject_capabilities(msg)?;
-            let params_schema = msg.params_schema.clone();
-            (msg.into_descriptor(), params_schema)
-        };
+        // The `Params` schema rides along so the host can schema-encode KDL
+        // params later.
+        let (descriptor, params_schema) = decode_descriptor_msg(&buf)?;
 
         // --- Resolve the lifecycle surface. Each `Symbol` is dereferenced to
         // a bare fn pointer, valid as long as the `Arc<Library>` below stays
