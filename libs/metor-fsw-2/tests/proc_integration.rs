@@ -23,7 +23,7 @@ use std::process::Command;
 use metor_fsw_2::metor_proto::types::{ComponentId, Timestamp};
 use metor_fsw_2::{
     ClockMode, Coordinator, CoordinatorConfig, CyclicSystem, Frame, Input, MsgIn, Out, Output,
-    PortRef, StopReason, System, SystemHealth, SystemInput, SystemOutput,
+    PortRef, StopReason, System, SystemHealth, SystemInput, SystemOutput, WorkerRunState,
 };
 use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
 
@@ -47,6 +47,11 @@ fn main() {
     run(
         "death_reclaims_and_keeps_flowing",
         death_reclaims_and_keeps_flowing,
+        &lib_path,
+    );
+    run(
+        "worker_restarts_then_exhausts_budget",
+        worker_restarts_then_exhausts_budget,
         &lib_path,
     );
 }
@@ -213,6 +218,10 @@ fn child_pids() -> Vec<u32> {
         .collect()
 }
 
+fn kill9(pid: u32) {
+    let _ = Command::new("kill").args(["-9", &pid.to_string()]).status();
+}
+
 // ---------------------------------------------------------------------------
 // Test 1: lockstep end to end, mixed with an in-process dl twin
 // ---------------------------------------------------------------------------
@@ -255,6 +264,8 @@ fn lockstep_end_to_end(lib_path: &Path) {
 
     // build() spawns the worker and waits for it to attach.
     let mut coord = b.build().expect("build spawns and attaches the worker");
+    let spawned = child_pids();
+    assert_eq!(spawned.len(), 1, "exactly one worker child: {spawned:?}");
 
     // Taps over the worker's outputs, through the same registry as any
     // system's: the user frame, the Postcard events, and the implicit health
@@ -292,6 +303,15 @@ fn lockstep_end_to_end(lib_path: &Path) {
     });
 
     assert!(coord.stopped().is_empty(), "nothing stopped: {:?}", coord.stopped());
+    // The status surface names the worker process: the coordinator's worker
+    // list carries the process system's pid and run state (its in-process
+    // dl twin appears nowhere here).
+    let workers = coord.workers();
+    assert_eq!(workers.len(), 1, "one process system: {workers:?}");
+    assert_eq!(workers[0].name, "proc_counter");
+    assert_eq!(workers[0].pid, spawned[0], "the telemetered pid is the child's");
+    assert_eq!(workers[0].restarts, 0);
+    assert_eq!(workers[0].state, WorkerRunState::Running);
     // The worker consumed each cycle's fresh tick in lockstep, exactly like
     // its in-process dl twin.
     let out = out_view.latest().expect("worker produced tick_out");
@@ -336,6 +356,8 @@ fn death_reclaims_and_keeps_flowing(lib_path: &Path) {
         default_depth: 8,
         clock: ClockMode::Wall,
         proc_step_timeout: std::time::Duration::from_millis(50),
+        // Restart opted out: this test pins the permanent-stop semantics.
+        proc_max_restarts: 0,
         ..CoordinatorConfig::default()
     });
     let ticker = b.add_cyclic_named("ticker", Ticker { n: 0 });
@@ -384,6 +406,12 @@ fn death_reclaims_and_keeps_flowing(lib_path: &Path) {
     assert_eq!(stopped.len(), 1, "the killed worker is reported: {stopped:?}");
     assert_eq!(stopped[0].name, "proc_counter");
     assert_eq!(stopped[0].reason, StopReason::ProcessDied);
+    // ...and the worker list reflects it: no live pid, no restarts granted.
+    let workers = coord.workers();
+    assert_eq!(workers.len(), 1);
+    assert_eq!(workers[0].state, WorkerRunState::Stopped, "{workers:?}");
+    assert_eq!(workers[0].pid, 0, "no live worker behind the slot");
+    assert_eq!(workers[0].restarts, 0, "restart was opted out");
     // ...whose reader cursors were reclaimed: the producer never saw a full
     // ring (a dead pinned cursor would have surfaced as publish_dropped
     // errors on the ticker's health well within ~100 post-kill cycles).
@@ -398,4 +426,105 @@ fn death_reclaims_and_keeps_flowing(lib_path: &Path) {
     drop(coord);
     drop(ticker_health);
     assert!(child_pids().is_empty(), "the dead worker was reaped");
+}
+
+// ---------------------------------------------------------------------------
+// Test 3: restart — recover from one kill, go terminal past the budget
+// ---------------------------------------------------------------------------
+
+fn worker_restarts_then_exhausts_budget(lib_path: &Path) {
+    let desc = proc_descriptor(lib_path);
+    let mut b = Coordinator::builder(CoordinatorConfig {
+        cycle_rate: 200.0,
+        default_depth: 8,
+        clock: ClockMode::Wall,
+        proc_step_timeout: std::time::Duration::from_millis(50),
+        proc_max_restarts: 1,
+        proc_restart_backoff: std::time::Duration::from_millis(50),
+        ..CoordinatorConfig::default()
+    });
+    let ticker = b.add_cyclic_named("ticker", Ticker { n: 0 });
+    let proc_sys = b.add_proc_cyclic(
+        "proc_counter",
+        desc,
+        lib_path.to_path_buf(),
+        counter_params(),
+    );
+    b.connect(
+        PortRef::new::<TickIn>(ticker),
+        PortRef::new::<TickIn>(proc_sys),
+    )
+    .expect("ticker -> proc edge");
+    let mut coord = b.build().expect("build spawns and attaches the worker");
+    let first = child_pids();
+    assert_eq!(first.len(), 1, "exactly one worker child: {first:?}");
+    let first_pid = first[0];
+
+    // Kill the worker, wait for its replacement (the restart pipeline), let
+    // the replacement produce for a while, then kill it too — past the
+    // budget of 1, so the second death must be terminal. The join propagates
+    // the "replacement appeared" assertion, which is the recovery proof.
+    let killer = std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_millis(250));
+        kill9(first_pid);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let replacement = loop {
+            if let Some(pid) = child_pids().into_iter().find(|&p| p != first_pid) {
+                break pid;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "no replacement worker appeared after the kill"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        };
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        kill9(replacement);
+    });
+
+    let registry = coord.registry();
+    let mut ticker_health: Input<SystemHealth> = Input::new(
+        registry
+            .view(ComponentId::new("ticker.health"))
+            .expect("ticker health registered")
+            .expect("reader slot available"),
+    );
+    let mut out_view: Input<TickOut> = Input::new(
+        registry
+            .view(ComponentId::new("proc_counter.tick_out"))
+            .expect("proc output registered")
+            .expect("reader slot available"),
+    );
+
+    // 400 cycles at 200 Hz = 2 s: room for kill → backoff → respawn →
+    // re-init → produce → second kill → terminal.
+    let coord = stellarator::run(|| async move {
+        coord.run_for(400).await;
+        coord
+    });
+    killer.join().unwrap();
+
+    // Terminal: the second death exhausted the budget of one restart.
+    let stopped = coord.stopped();
+    assert_eq!(stopped.len(), 1, "terminal stop reported: {stopped:?}");
+    assert_eq!(stopped[0].reason, StopReason::ProcessDied);
+    let workers = coord.workers();
+    assert_eq!(workers.len(), 1);
+    assert_eq!(workers[0].restarts, 1, "exactly one restart was granted: {workers:?}");
+    assert_eq!(workers[0].state, WorkerRunState::Stopped);
+    assert_eq!(workers[0].pid, 0, "no live worker behind the slot");
+    // The replacement produced (any output at all proves the restarted
+    // worker re-attached the same rings and resumed the lockstep)...
+    assert!(
+        out_view.latest().expect("output flowed").get().count > 1000,
+        "the restarted worker produced"
+    );
+    // ...and both reclaims kept the producer flowing: no publish errors.
+    let health = ticker_health.latest().expect("ticker health flowed");
+    assert_eq!(health.get().errors, 0, "producer never backpressured");
+    drop(health);
+
+    drop(coord);
+    drop((ticker_health, out_view));
+    assert!(child_pids().is_empty(), "all workers reaped");
 }

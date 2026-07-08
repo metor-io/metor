@@ -255,6 +255,13 @@ impl CtlHost {
         wake::wake_all(&b.doorbell);
     }
 
+    /// The worker's current lifecycle word, without waiting. `None` for a
+    /// value outside the enum (a corrupt or foreign block). The restart
+    /// machine polls this once per cycle instead of blocking the loop.
+    pub fn state(&self) -> Option<WorkerState> {
+        WorkerState::from_raw(self.block().state.load(Acquire))
+    }
+
     /// Wait until the worker reports `want`, a failure, or the timeout.
     pub fn wait_state(&self, want: WorkerState, timeout: Duration) -> Result<(), CtlError> {
         let b = self.block();

@@ -463,10 +463,11 @@ place rather than scattered through the prose:
   blocks the loop until the worker acks or the deadline lapses; overlapping independent
   workers within a cycle, and cross-process *async* systems, are future work
   (`docs/process-systems.md` §8).
-- **Recovery from a hard stop.** A cyclic system that panics (in a `.so`) — or a process
-  system whose worker dies — is permanently stopped; there is no restart or
-  quarantine-and-resume path. A dead worker's ring roles are reclaimed, so the rest of the
-  graph keeps flowing.
+- **Recovery from a hard stop.** An in-process cyclic system that panics (in a `.so`) is
+  permanently stopped. A *process* system's worker is respawned within a configured budget
+  (`docs/process-systems.md` §6) — the quarantine-and-resume path exists only across a process
+  boundary, where a panic cannot have corrupted the host. A dead worker's ring roles are
+  reclaimed either way, so the rest of the graph keeps flowing.
 - **Per-system rates.** Every cyclic system runs every cycle; there is no rate division beyond
   the single global cycle rate (a system can still self-pace by running async).
 - **Automatic transport reconnect.** The TCP downlink connects once and stops downlinking on

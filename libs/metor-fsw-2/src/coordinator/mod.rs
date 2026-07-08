@@ -142,10 +142,19 @@ pub struct CoordinatorConfig {
     /// How long a process system's step waits for the worker's ack before the
     /// cycle moves on. A lapse with the child alive is telemetered as a
     /// `proc_step_timeout` coordinator-health error; with the child dead it
-    /// hard-stops the slot ([`StopReason::ProcessDied`]). A healthy worker
-    /// never approaches this — the wall cycle budget is usually far tighter.
-    /// Default 100 ms.
+    /// stops the slot ([`StopReason::ProcessDied`]) and, budget permitting,
+    /// begins a restart. A healthy worker never approaches this — the wall
+    /// cycle budget is usually far tighter. Default 100 ms.
     pub proc_step_timeout: Duration,
+    /// How many times a process system's worker is respawned after it dies or
+    /// its system panics, over the slot's whole life. Each restart is
+    /// telemetered (`proc_restart` on coordinator health, and the worker list
+    /// in the status frame); past the budget the stop is permanent, exactly
+    /// like an in-process panic. `0` disables restart. Default 3.
+    pub proc_max_restarts: u32,
+    /// How long a dead worker's slot waits before respawning, so a
+    /// crash-looping artifact cannot busy-spin the spawn path. Default 500 ms.
+    pub proc_restart_backoff: Duration,
 }
 
 impl Default for CoordinatorConfig {
@@ -156,6 +165,8 @@ impl Default for CoordinatorConfig {
             clock: ClockMode::Wall,
             reader_slack: READER_SLACK,
             proc_step_timeout: Duration::from_millis(100),
+            proc_max_restarts: 3,
+            proc_restart_backoff: Duration::from_millis(500),
         }
     }
 }
@@ -447,8 +458,10 @@ impl StopReason {
 /// done or hard-stopped. A static
 /// [`CyclicRunner`](crate::CyclicRunner) and a build-time
 /// [`DlSlot`](crate::dl::DlSlot) only ever inhabit `Running`/`Stopped` (once
-/// `Stopped` they are never cleared); the runtime [`SlotRunner`](slot) uses all
-/// five and recovers from a terminal state via `Load`/`Reset`.
+/// `Stopped` they are never cleared); a process slot's `Stopped` clears back
+/// to `Running` when its worker restarts (`docs/process-systems.md` §6); the
+/// runtime [`SlotRunner`](slot) uses all five and recovers from a terminal
+/// state via `Load`/`Reset`.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum SlotState {
     /// No occupant; `step` is a cheap no-op. (Runtime slots only.)
@@ -519,6 +532,67 @@ pub(crate) trait CyclicSlot {
     fn drain_timeouts(&mut self) -> u64 {
         0
     }
+    /// Worker restarts begun since last drained, folded into coordinator
+    /// health like the timeouts. Only `ProcSlot` overrides.
+    fn drain_restarts(&mut self) -> u64 {
+        0
+    }
+    /// The worker-process facts behind this slot, for the status frame's
+    /// worker list: `None` for every in-process slot, `Some` only from
+    /// `ProcSlot`.
+    fn proc_info(&self) -> Option<ProcInfo> {
+        None
+    }
+}
+
+/// One process slot's worker facts, collected each cycle from
+/// [`CyclicSlot::proc_info`] into [`Coordinator::workers`] and the status
+/// frame's worker list.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct ProcInfo {
+    /// The live worker's pid, or `0` between workers.
+    pub pid: u32,
+    /// Restarts begun over the slot's life.
+    pub restarts: u32,
+    pub state: WorkerRunState,
+}
+
+/// Where a process system's worker is in its life, as telemetered in the
+/// status frame's worker list and [`Coordinator::workers`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WorkerRunState {
+    /// Dead past the restart budget; the stop is permanent.
+    Stopped,
+    /// Dead or half-born, inside the restart pipeline.
+    Restarting,
+    /// Alive and being stepped.
+    Running,
+}
+
+impl WorkerRunState {
+    /// The wire code carried in the status frame's worker entries
+    /// (Stopped=0 / Restarting=1 / Running=2).
+    pub fn code(self) -> u8 {
+        match self {
+            WorkerRunState::Stopped => 0,
+            WorkerRunState::Restarting => 1,
+            WorkerRunState::Running => 2,
+        }
+    }
+}
+
+/// One process system's worker facts, as reported by
+/// [`Coordinator::workers`]: the instance name, the worker pid (this is how
+/// an operator learns a system runs out-of-process, and where), the restart
+/// count, and the run state. The same facts ride the status frame's
+/// `workers` list.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct WorkerStatus {
+    pub name: &'static str,
+    /// The live worker's pid, or `0` between workers.
+    pub pid: u32,
+    pub restarts: u32,
+    pub state: WorkerRunState,
 }
 
 // ---------------------------------------------------------------------------
@@ -556,8 +630,28 @@ struct StoppedEntry {
     name: [u8; STATUS_NAME_CAP],
 }
 
+/// Max process workers named in one status record.
+pub const MAX_WORKERS: usize = 32;
+
+/// One process system's worker entry in [`CoordinatorStatus`]: pid, restart
+/// count, a [`WorkerRunState`] code, and the instance name. This is where
+/// telemetry says a system runs out-of-process at all.
+#[derive(crate::AsVTable, IntoBytes, Immutable, KnownLayout, FromBytes, Clone, Copy)]
+#[repr(C)]
+struct WorkerEntry {
+    /// The live worker's pid, or `0` between workers.
+    pid: u32,
+    restarts: u32,
+    /// A [`WorkerRunState::code`].
+    state: u8,
+    len: u8,
+    _pad: [u8; 6],
+    name: [u8; STATUS_NAME_CAP],
+}
+
 /// The coordinator's own status frame: which cyclic systems have hard-stopped
-/// and why, in addition to each system's own health.
+/// and why, plus the worker behind every process system (pid, restarts, run
+/// state), in addition to each system's own health.
 #[derive(crate::Frame, IntoBytes, Immutable, KnownLayout, FromBytes)]
 #[repr(C)]
 #[metor_fsw(name = "coordinator_status")]
@@ -566,7 +660,9 @@ struct CoordinatorStatus {
     timestamp: Timestamp,
     cycle: u64,
     stopped_count: u64,
+    worker_count: u64,
     stopped: FrameList<StoppedEntry, MAX_STOPPED>,
+    workers: FrameList<WorkerEntry, MAX_WORKERS>,
 }
 
 // ---------------------------------------------------------------------------
@@ -1256,6 +1352,8 @@ impl CoordinatorBuilder {
         let proc_ctx = ProcBindCtx {
             step_timeout: config.proc_step_timeout,
             worker_exe,
+            max_restarts: config.proc_max_restarts,
+            restart_backoff: config.proc_restart_backoff,
         };
         let BoundSystems {
             cyclic,
@@ -1280,6 +1378,8 @@ impl CoordinatorBuilder {
             status_view: coord.status_view,
             stopped: Vec::new(),
             stopped_scratch: Vec::new(),
+            workers: Vec::new(),
+            workers_scratch: Vec::new(),
             cycle: 0,
             progress: Arc::new(AtomicU64::new(0)),
             registry,
@@ -1882,6 +1982,8 @@ fn freeze_registry(reg_entries: Vec<RegistryEntry>) -> Result<Arc<Registry>, Wir
 struct ProcBindCtx {
     step_timeout: Duration,
     worker_exe: Option<PathBuf>,
+    max_restarts: u32,
+    restart_backoff: Duration,
 }
 
 /// Bind every system's ports over the allocated rings, consuming the
@@ -2137,6 +2239,8 @@ fn bind_proc(
         rings,
         worker_exe: ctx.worker_exe.clone(),
         step_timeout: ctx.step_timeout,
+        max_restarts: ctx.max_restarts,
+        restart_backoff: ctx.restart_backoff,
         name: leaked,
     };
     ProcSlot::spawn(spec)
@@ -2503,6 +2607,11 @@ pub struct Coordinator {
     /// Scratch for `update_status`'s per-cycle scan, swapped with `stopped` on
     /// a change, so the hot loop never allocates.
     stopped_scratch: Vec<StoppedSystem>,
+    /// The process systems' worker facts as of the last change, mirrored into
+    /// the status frame's worker list. Empty without process systems.
+    workers: Vec<WorkerStatus>,
+    /// Scratch twin of `workers`, as for `stopped_scratch`.
+    workers_scratch: Vec<WorkerStatus>,
     cycle: u64,
     /// A shared, lock-free mirror of `cycle` that an observer outside the loop
     /// can read while `run_for` holds `&mut self`, published each cycle.
@@ -2549,6 +2658,13 @@ impl Coordinator {
     /// Start a builder.
     pub fn builder(config: CoordinatorConfig) -> CoordinatorBuilder {
         CoordinatorBuilder::new(config)
+    }
+
+    /// The process systems' worker facts (pid, restarts, run state) as of the
+    /// last change, as also published in the coordinator status frame's
+    /// worker list. Empty for a graph without process systems.
+    pub fn workers(&self) -> &[WorkerStatus] {
+        &self.workers
     }
 
     /// The cyclic systems that have hard-stopped, as also published in the
@@ -2780,22 +2896,28 @@ impl Coordinator {
     /// scratch and swaps it with `stopped` on a change, so nothing allocates
     /// per cycle.
     fn update_status(&mut self, now: Timestamp) {
-        // Host-side step timeouts (a process worker missing its ack deadline)
-        // land on coordinator health: the worker owns its system's health
-        // ring, so the host cannot report through it. At most one per slot
-        // per cycle.
-        let mut timed_out = false;
+        // Host-side worker trouble (a step missing its ack deadline, a
+        // restart beginning) lands on coordinator health: the worker owns its
+        // system's health ring, so the host cannot report through it. At most
+        // one of each per slot per cycle.
+        let mut worker_event = false;
         for slot in &mut self.cyclic {
             if slot.drain_timeouts() > 0 {
                 self.coord_health.error("proc_step_timeout");
                 self.coord_health.log(Level::Warn, slot.name());
-                timed_out = true;
+                worker_event = true;
+            }
+            if slot.drain_restarts() > 0 {
+                self.coord_health.error("proc_restart");
+                self.coord_health.log(Level::Warn, slot.name());
+                worker_event = true;
             }
         }
-        if timed_out {
+        if worker_event {
             self.coord_health.end_cycle(now, 0);
         }
         self.stopped_scratch.clear();
+        self.workers_scratch.clear();
         for slot in &self.cyclic {
             // Only a hard stop is an error-stop; a runtime slot's
             // Empty/Loaded/Done states are not (the `stop_reason` projection).
@@ -2805,18 +2927,33 @@ impl Coordinator {
                     reason,
                 });
             }
+            if let Some(info) = slot.proc_info() {
+                self.workers_scratch.push(WorkerStatus {
+                    name: slot.name(),
+                    pid: info.pid,
+                    restarts: info.restarts,
+                    state: info.state,
+                });
+            }
         }
-        if !stopped_set_changed(&self.stopped_scratch, &self.stopped) {
+        let stopped_changed = stopped_set_changed(&self.stopped_scratch, &self.stopped);
+        // Worker changes (a pid after a restart, a run-state transition) also
+        // re-publish, so the wire always names the current process.
+        let workers_changed = self.workers_scratch != self.workers;
+        if !stopped_changed && !workers_changed {
             return;
         }
         core::mem::swap(&mut self.stopped, &mut self.stopped_scratch);
+        core::mem::swap(&mut self.workers, &mut self.workers_scratch);
         self.publish_status(now);
-        for i in 0..self.stopped.len() {
-            let name = self.stopped[i].name;
-            self.coord_health.error("system_stopped");
-            self.coord_health.log(Level::Warn, name);
+        if stopped_changed {
+            for i in 0..self.stopped.len() {
+                let name = self.stopped[i].name;
+                self.coord_health.error("system_stopped");
+                self.coord_health.log(Level::Warn, name);
+            }
+            self.coord_health.end_cycle(now, 0);
         }
-        self.coord_health.end_cycle(now, 0);
     }
 
     fn publish_status(&mut self, now: Timestamp) {
@@ -2824,17 +2961,32 @@ impl Coordinator {
             timestamp: now,
             cycle: self.cycle,
             stopped_count: self.stopped.len() as u64,
+            worker_count: self.workers.len() as u64,
             stopped: FrameList::EMPTY,
+            workers: FrameList::EMPTY,
         };
         // Split borrows: the writer takes `status_out`, the closure reads
-        // `stopped`, so no intermediate entries Vec is needed.
-        let stopped = &self.stopped;
+        // `stopped`/`workers`, so no intermediate entries Vec is needed.
+        let (stopped, workers) = (&self.stopped, &self.workers);
         let _ = self.status_out.write_with(&frame, |fw| {
             fw.list(offset_of!(CoordinatorStatus, stopped), |l| {
                 for sys in stopped {
                     let (name, len) = pack_name(sys.name);
                     l.push(StoppedEntry {
                         reason: sys.reason.code(),
+                        len,
+                        _pad: [0; 6],
+                        name,
+                    });
+                }
+            });
+            fw.list(offset_of!(CoordinatorStatus, workers), |l| {
+                for w in workers {
+                    let (name, len) = pack_name(w.name);
+                    l.push(WorkerEntry {
+                        pid: w.pid,
+                        restarts: w.restarts,
+                        state: w.state.code(),
                         len,
                         _pad: [0; 6],
                         name,

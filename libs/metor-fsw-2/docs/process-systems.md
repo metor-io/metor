@@ -194,9 +194,27 @@ being hypothetical, so the ring grows the reclamation the layout already reserve
 The host detects death via `Child::try_wait` on every step timeout and at init. On death it
 SIGKILLs (belt and braces), reaps, runs `reclaim_owner` over the worker's rings (its own outputs
 plus its producers' outputs — the host knows the exact set), and marks the slot
-`Stopped { ProcessDied }` (a new `StopReason`). The stop is permanent, matching the in-process
-panic policy; restart/quarantine remains future work. The improvement over today: the rest of
-the mission keeps flowing at full rate instead of backpressuring into the dead reader.
+`Stopped { ProcessDied }` (a new `StopReason`). Either way the rest of the mission keeps flowing
+at full rate instead of backpressuring into the dead reader.
+
+**Restart.** A dead worker — or one whose system panicked, which in a worker is fully
+quarantined, unlike the in-process dl path — is respawned up to
+`CoordinatorConfig::proc_max_restarts` times (default 3; `0` restores permanent-stop), each
+attempt after a `proc_restart_backoff` delay (default 500 ms). The respawn pipeline is
+**non-blocking**: it is polled one phase per cycle (backoff → spawn → wait `Attached` → request
+init → wait `Ready`), so a restart never stalls the loop the way the initial blocking spawn at
+`build()` may. The fresh worker re-runs the same on-disk manifest — same ring files, same params
+— and its new views start at the rings' current positions, so records committed during the
+outage are skipped, not replayed. During the outage the slot reports `Stopped` (the transition
+is telemetered like any stop) and clears back to `Running` on recovery; past the budget the stop
+is terminal, like an in-process panic.
+
+**Worker telemetry.** The coordinator status frame carries a worker list beside the stopped
+list: one entry per process system with the worker's **pid** (`0` between workers), the restart
+count, and a run-state code (Stopped/Restarting/Running) — this is how telemetry says a system
+runs out-of-process at all. `Coordinator::workers()` is the host-side accessor, and each begun
+restart also bumps a `proc_restart` error (with a warn log naming the instance) on coordinator
+health, beside the `proc_step_timeout` counter.
 
 ## 7. Wiring surface
 
@@ -223,7 +241,6 @@ registration flows through the uniform validate/size/allocate passes untouched a
 - **Cyclic only, stepped serially.** Each `ProcSlot::step` blocks the loop until ack or
   deadline. Overlapping independent workers within a cycle (fan-out doorbells, join before
   dependents) is a natural follow-on once the protocol has soaked.
-- **No restart.** A dead or panicked worker is a permanent, telemetered stop.
 - **No cross-process async systems**, and therefore no per-ring shared wakes; the ring's
   `wake_word` stays reserved.
 - **Platforms:** Linux and macOS 14.4+. Windows has no shared wait-on-address; process systems

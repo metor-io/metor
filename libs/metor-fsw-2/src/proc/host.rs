@@ -16,7 +16,7 @@ use metor_fsw_ring::RingBuffer;
 use metor_proto::types::Timestamp;
 
 use crate::abi::FswStatus;
-use crate::coordinator::{CyclicSlot, SlotState, StopReason};
+use crate::coordinator::{CyclicSlot, ProcInfo, SlotState, StopReason, WorkerRunState};
 
 use super::ctl::{CtlHost, StepOutcome, WorkerState};
 use super::session::SessionDir;
@@ -142,8 +142,30 @@ pub(crate) struct SpawnSpec {
     pub worker_exe: Option<PathBuf>,
     /// Per-step ack deadline ([`CoordinatorConfig::proc_step_timeout`](crate::CoordinatorConfig)).
     pub step_timeout: Duration,
+    /// Respawn budget ([`CoordinatorConfig::proc_max_restarts`](crate::CoordinatorConfig)).
+    pub max_restarts: u32,
+    /// Delay before each respawn ([`CoordinatorConfig::proc_restart_backoff`](crate::CoordinatorConfig)).
+    pub restart_backoff: Duration,
     /// The slot identity, already leaked to `'static` by the caller.
     pub name: &'static str,
+}
+
+/// Where a process slot is in its worker's lifecycle, beyond the coarse
+/// [`SlotState`]. `Running` is the steady state; the middle three are the
+/// non-blocking restart pipeline (each polled once per cycle, so a respawn
+/// never stalls the loop the way the initial blocking spawn at `build()`
+/// may); `Terminal` is a stop past the restart budget.
+enum Phase {
+    /// A live worker being stepped.
+    Running,
+    /// Dead, reaped, reclaimed; waiting out the backoff before respawning.
+    Backoff { until: Instant },
+    /// Respawned; waiting for the fresh worker to report `Attached`.
+    Attaching { deadline: Instant },
+    /// Init requested; waiting for `Ready`, then the slot resumes.
+    Initing { deadline: Instant },
+    /// Out of restart budget; `slot_state` holds the final reason.
+    Terminal,
 }
 
 /// A running worker process behind the `CyclicSlot` interface, the process
@@ -151,10 +173,23 @@ pub(crate) struct SpawnSpec {
 /// the coordinator's init barrier, `step` rings the doorbell and waits out
 /// the ack (bounded by the step deadline), and `shutdown`/`Drop` end the
 /// child and reclaim whatever it left claimed in the shared rings.
+///
+/// # Restart
+///
+/// A worker that dies — or whose system panics, which in a worker is safely
+/// quarantined — is respawned up to `max_restarts` times over the slot's
+/// life: kill/reap/reclaim, wait out the backoff, respawn from the same
+/// on-disk manifest (same ring files, same params), and re-init. While
+/// restarting, `slot_state` reports the stop (so the outage is telemetered)
+/// and flips back to `Running` on recovery; the fresh worker's views start
+/// at the rings' current positions, so records committed during the outage
+/// are skipped, not replayed. Restarts are counted, drained into coordinator
+/// health, and carried in the status frame's worker list.
 pub(crate) struct ProcSlot {
     name: &'static str,
     ctl: CtlHost,
-    child: Child,
+    /// The live child; `None` between reap and respawn.
+    child: Option<Child>,
     /// Host handles of the worker-attached rings, for reclamation.
     rings: Vec<RingBuffer>,
     step_timeout: Duration,
@@ -162,21 +197,33 @@ pub(crate) struct ProcSlot {
     /// Steps whose ack deadline lapsed with the child still alive, since the
     /// coordinator last drained them into its health.
     timeouts: u64,
+    // --- restart machinery -------------------------------------------------
+    phase: Phase,
+    /// The resolved worker executable, respawned from the persisted manifest.
+    exe: PathBuf,
+    ctl_path: PathBuf,
+    manifest_path: PathBuf,
+    max_restarts: u32,
+    backoff: Duration,
+    /// Restarts begun over the slot's life (each spawn attempt costs one).
+    restarts: u32,
+    /// Restarts begun since the coordinator last drained them.
+    restart_events: u64,
 }
 
 impl ProcSlot {
     /// Create the control block, write the manifest, spawn the worker, and
     /// wait for `Attached`. Any failure kills the child and reports why —
-    /// `build()` maps the message into a `WireError`.
+    /// `build()` maps the message into a `WireError`. This first spawn is the
+    /// only blocking one; respawns are polled from `step`.
     pub(crate) fn spawn(spec: SpawnSpec) -> Result<Self, String> {
         let exe = resolve_worker_exe(spec.worker_exe.as_deref()).map_err(|e| e.to_string())?;
-        let ctl = CtlHost::create(&spec.ctl_path).map_err(|e| format!("control block: {e}"))?;
         let manifest = WorkerManifest::Run {
             abi_version: crate::abi::FSW_ABI_VERSION,
             instance: spec.instance,
             artifact: spec.artifact,
             params: spec.params,
-            ctl: spec.ctl_path,
+            ctl: spec.ctl_path.clone(),
             inputs: spec.input_paths,
             outputs: spec.output_paths,
         };
@@ -185,20 +232,25 @@ impl ProcSlot {
             postcard::to_allocvec(&manifest).expect("manifest encodes (postcard)"),
         )
         .map_err(|e| format!("manifest: {e}"))?;
-        let child = Command::new(&exe)
-            .env(WORKER_ENV, &spec.manifest_path)
-            .stdin(Stdio::null())
-            .spawn()
-            .map_err(|e| format!("spawn `{}`: {e}", exe.display()))?;
+        let ctl = CtlHost::create(&spec.ctl_path).map_err(|e| format!("control block: {e}"))?;
         let mut slot = ProcSlot {
             name: spec.name,
             ctl,
-            child,
+            child: None,
             rings: spec.rings,
             step_timeout: spec.step_timeout,
             slot_state: SlotState::Running,
             timeouts: 0,
+            phase: Phase::Running,
+            exe,
+            ctl_path: spec.ctl_path,
+            manifest_path: spec.manifest_path,
+            max_restarts: spec.max_restarts,
+            backoff: spec.restart_backoff,
+            restarts: 0,
+            restart_events: 0,
         };
+        slot.spawn_child().map_err(|e| format!("spawn `{}`: {e}", slot.exe.display()))?;
         if let Err(e) = slot.ctl.wait_state(WorkerState::Attached, SPAWN_TIMEOUT) {
             slot.kill_reap_reclaim();
             return Err(format!("worker never attached ({e}); {GUARD_HINT}"));
@@ -206,12 +258,36 @@ impl ProcSlot {
         Ok(slot)
     }
 
+    /// Spawn a worker from the persisted manifest over a **fresh** control
+    /// block (recreating the file resets the lifecycle to `Booting` and the
+    /// sequence words to zero, matching the fresh worker's).
+    fn spawn_child(&mut self) -> std::io::Result<()> {
+        self.ctl = CtlHost::create(&self.ctl_path).map_err(|e| match e {
+            super::ctl::CtlError::Io(io) => io,
+            other => std::io::Error::other(other.to_string()),
+        })?;
+        let child = Command::new(&self.exe)
+            .env(WORKER_ENV, &self.manifest_path)
+            .stdin(Stdio::null())
+            .spawn()?;
+        self.child = Some(child);
+        Ok(())
+    }
+
+    /// The live child's pid, or `0` between workers.
+    fn pid(&self) -> u32 {
+        self.child.as_ref().map(|c| c.id()).unwrap_or(0)
+    }
+
     /// End the child for certain and free everything it claimed: kill (a
     /// no-op if already exited), reap, then reclaim its ring roles.
     fn kill_reap_reclaim(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
-        let pid = self.child.id() as u64;
+        let Some(mut child) = self.child.take() else {
+            return;
+        };
+        let _ = child.kill();
+        let _ = child.wait();
+        let pid = child.id() as u64;
         for ring in &self.rings {
             // SAFETY: the child was reaped just above, so none of its stores
             // are in flight, and reclaiming immediately after the reap keeps
@@ -220,12 +296,53 @@ impl ProcSlot {
         }
     }
 
-    /// The child died on its own: reap it, reclaim, and hard-stop the slot.
-    fn mark_dead(&mut self) {
-        self.kill_reap_reclaim();
-        self.slot_state = SlotState::Stopped {
-            reason: StopReason::ProcessDied,
+    /// Schedule the next restart attempt, or go terminal past the budget.
+    /// Every attempt costs one unit of budget, so a worker that dies during
+    /// its own restart pipeline cannot loop for free.
+    fn schedule_restart(&mut self) {
+        self.phase = if self.restarts < self.max_restarts {
+            self.restarts += 1;
+            self.restart_events += 1;
+            Phase::Backoff {
+                until: Instant::now() + self.backoff,
+            }
+        } else {
+            Phase::Terminal
         };
+    }
+
+    /// The running worker failed (`reason` says how): end it, report the
+    /// stop, and enter the restart pipeline (budget permitting).
+    fn fail_worker(&mut self, reason: StopReason) {
+        self.kill_reap_reclaim();
+        self.slot_state = SlotState::Stopped { reason };
+        self.schedule_restart();
+    }
+
+    /// A restart attempt failed before reaching `Ready`: end the half-born
+    /// worker (it may already hold ring claims) and try again. The reported
+    /// `slot_state` keeps the original stop reason.
+    fn attempt_failed(&mut self) {
+        self.kill_reap_reclaim();
+        self.schedule_restart();
+    }
+
+    /// One non-blocking poll of a restart phase: has the worker failed, died,
+    /// or blown its `deadline`; and if none of those, has it reached `want`?
+    fn poll_worker(&mut self, want: WorkerState, deadline: Instant) -> bool {
+        match self.ctl.state() {
+            Some(WorkerState::Failed) | None => {
+                self.attempt_failed();
+                return false;
+            }
+            Some(state) if state == want => return true,
+            _ => {}
+        }
+        let exited = matches!(self.child.as_mut().map(|c| c.try_wait()), Some(Ok(Some(_))));
+        if exited || Instant::now() >= deadline {
+            self.attempt_failed();
+        }
+        false
     }
 }
 
@@ -233,50 +350,72 @@ impl CyclicSlot for ProcSlot {
     fn init(&mut self) {
         self.ctl.request(WorkerState::InitReq);
         if self.ctl.wait_state(WorkerState::Ready, INIT_TIMEOUT).is_err() {
-            self.mark_dead();
+            self.fail_worker(StopReason::ProcessDied);
         }
     }
 
     fn step(&mut self, now: Timestamp) {
-        if self.slot_state.is_stopped() {
-            return;
-        }
-        match self.ctl.step(now, self.step_timeout) {
-            // A stray `Done` folds to keep-running, as in `DlSlot::step`.
-            StepOutcome::Acked(FswStatus::Running | FswStatus::Done) => {}
-            StepOutcome::Acked(FswStatus::Panicked) => {
-                // The worker-side DlSlot already destroyed the foreign state
-                // (freeing its ring roles); the worker itself stays parked
-                // serving acks until shutdown, so teardown stays symmetric.
-                self.slot_state = SlotState::Stopped {
-                    reason: StopReason::Panicked,
-                };
-            }
-            StepOutcome::TimedOut => match self.child.try_wait() {
-                // The worker is gone; the abandoned sequence never resolves.
-                Ok(Some(_)) => self.mark_dead(),
-                // Alive but late: telemetered, and the sequence protocol
-                // self-heals (the worker serves only the newest doorbell).
-                Ok(None) | Err(_) => self.timeouts += 1,
+        match self.phase {
+            Phase::Running => match self.ctl.step(now, self.step_timeout) {
+                // A stray `Done` folds to keep-running, as in `DlSlot::step`.
+                StepOutcome::Acked(FswStatus::Running | FswStatus::Done) => {}
+                // In a worker a panic is fully quarantined (the foreign state
+                // was already destroyed on its side, freeing its ring roles),
+                // so unlike the in-process dl path it is restartable.
+                StepOutcome::Acked(FswStatus::Panicked) => {
+                    self.fail_worker(StopReason::Panicked);
+                }
+                StepOutcome::TimedOut => match self.child.as_mut().map(|c| c.try_wait()) {
+                    // The worker is gone; the abandoned sequence never resolves.
+                    Some(Ok(Some(_))) | None => self.fail_worker(StopReason::ProcessDied),
+                    // Alive but late: telemetered, and the sequence protocol
+                    // self-heals (the worker serves only the newest doorbell).
+                    Some(Ok(None)) | Some(Err(_)) => self.timeouts += 1,
+                },
             },
+            Phase::Backoff { until } => {
+                if Instant::now() < until {
+                    return;
+                }
+                match self.spawn_child() {
+                    Ok(()) => {
+                        self.phase = Phase::Attaching {
+                            deadline: Instant::now() + SPAWN_TIMEOUT,
+                        };
+                    }
+                    Err(_) => self.attempt_failed(),
+                }
+            }
+            Phase::Attaching { deadline } => {
+                if self.poll_worker(WorkerState::Attached, deadline) {
+                    self.ctl.request(WorkerState::InitReq);
+                    self.phase = Phase::Initing {
+                        deadline: Instant::now() + INIT_TIMEOUT,
+                    };
+                }
+            }
+            Phase::Initing { deadline } => {
+                if self.poll_worker(WorkerState::Ready, deadline) {
+                    // Recovered: the outage was telemetered through the
+                    // stopped set; clear it and resume stepping next cycle.
+                    self.slot_state = SlotState::Running;
+                    self.phase = Phase::Running;
+                }
+            }
+            Phase::Terminal => {}
         }
     }
 
     fn shutdown(&mut self) {
-        if matches!(
-            self.slot_state,
-            SlotState::Stopped {
-                reason: StopReason::ProcessDied
-            }
-        ) {
-            return; // already reaped and reclaimed
+        if self.child.is_none() {
+            return; // between workers, or terminal: already reaped and reclaimed
         }
         self.ctl.request(WorkerState::ShutdownReq);
         let _ = self.ctl.wait_state(WorkerState::Done, SHUTDOWN_GRACE);
         // Reap within the grace window; then end it for certain either way.
         let deadline = Instant::now() + SHUTDOWN_GRACE;
         while Instant::now() < deadline {
-            if matches!(self.child.try_wait(), Ok(Some(_))) {
+            if matches!(self.child.as_mut().map(|c| c.try_wait()), Some(Ok(Some(_)))) {
                 break;
             }
             std::thread::sleep(Duration::from_millis(5));
@@ -294,6 +433,25 @@ impl CyclicSlot for ProcSlot {
 
     fn drain_timeouts(&mut self) -> u64 {
         std::mem::take(&mut self.timeouts)
+    }
+
+    fn drain_restarts(&mut self) -> u64 {
+        std::mem::take(&mut self.restart_events)
+    }
+
+    fn proc_info(&self) -> Option<ProcInfo> {
+        let state = match self.phase {
+            Phase::Running => WorkerRunState::Running,
+            Phase::Terminal => WorkerRunState::Stopped,
+            Phase::Backoff { .. } | Phase::Attaching { .. } | Phase::Initing { .. } => {
+                WorkerRunState::Restarting
+            }
+        };
+        Some(ProcInfo {
+            pid: self.pid(),
+            restarts: self.restarts,
+            state,
+        })
     }
 }
 
