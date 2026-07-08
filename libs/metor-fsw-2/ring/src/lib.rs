@@ -40,7 +40,7 @@
 //! 0x40 ├───────────────────────────┤
 //!      │ Control (all atomics)     │ committed, high-water mark, writer claim
 //! 0x80 ├───────────────────────────┤
-//!      │ ReaderSlot × max_readers  │ one cache line each: cursor + epoch
+//!      │ ReaderSlot × max_readers  │ one cache line each: cursor + epoch + owner
 //!      ├───────────────────────────┤
 //!      │ data (capacity bytes)     │ the records
 //!      └───────────────────────────┘
@@ -127,8 +127,9 @@ const MAGIC: u32 = u32::from_ne_bytes(*b"MFR1");
 
 /// Layout version, bumped on any incompatible change. Regions are ephemeral
 /// IPC state rather than archives, so a stale region is recreated, never
-/// migrated.
-const VERSION: u16 = 2;
+/// migrated. v3 added the reader-slot `owner` tag and made the writer claim
+/// carry the claimant's process id.
+const VERSION: u16 = 3;
 
 /// The identifying metadata at the start of every region, occupying cache
 /// line 0. `init_region` writes it once before the region is published and
@@ -163,12 +164,18 @@ struct Control {
     /// Reserved for a future cross-process wake (see [`FLAG_WAKE_SHARED`]).
     #[allow(dead_code)]
     wake_word: AtomicU64,
-    /// The writer claim, where `0` means free (see [`RingBuffer::writer`]).
+    /// The writer claim: `0` means free, nonzero is the claimant's process-id
+    /// tag (see [`RingBuffer::writer`] and [`RingBuffer::reclaim_owner`]).
     writer: AtomicU64,
 }
 
-/// One reader's shared cursor and epoch, padded out to a cache line to avoid
-/// false sharing.
+/// One reader's shared cursor, epoch, and owner tag, padded out to a cache
+/// line to avoid false sharing.
+///
+/// `owner` is the claiming process's id, stamped by [`RingBuffer::view`] so
+/// [`RingBuffer::reclaim_owner`] can free what a dead process left behind. It
+/// is diagnostic state, not synchronization: only read under the reclaim
+/// contract (the owner is dead), and left stale on a free slot.
 ///
 /// `_pad` is not interior-mutable, so a shared `&ReaderSlot` freezes it. That
 /// is sound only because the pad is written exactly once, in `init_region`,
@@ -177,7 +184,8 @@ struct Control {
 struct ReaderSlot {
     cursor: AtomicU64,
     epoch: AtomicU64,
-    _pad: [u8; 48],
+    owner: AtomicU64,
+    _pad: [u8; 40],
 }
 
 /// Byte offset of the control block.
@@ -206,6 +214,16 @@ const fn arch_tag() -> u64 {
     ((0x0102_0304u32 as u64) << 32) | (core::mem::size_of::<usize>() as u64)
 }
 
+/// The tag stamped on writer and reader claims: the claiming process's id,
+/// which is how [`RingBuffer::reclaim_owner`] identifies a dead process's
+/// leftovers. Never `0` (that is the free writer claim). Pid reuse could
+/// alias two claimants across a pid wrap-around, so reclaim promptly after
+/// reaping a dead peer, before spawning replacements.
+#[inline]
+fn owner_tag() -> u64 {
+    std::process::id() as u64
+}
+
 /// Round `n` up to the next multiple of 8.
 #[inline]
 pub const fn round_up8(n: usize) -> usize {
@@ -231,8 +249,8 @@ pub const fn frame_len(payload_len: usize) -> usize {
 pub struct Config {
     /// Data-region size in bytes. **Must be a power of two.**
     pub capacity: usize,
-    /// Number of reader-table slots. Over-provision, since crashed readers
-    /// are not yet reclaimed.
+    /// Number of reader-table slots. Over-provision: a crashed reader's slot
+    /// is only freed by an explicit [`RingBuffer::reclaim_owner`].
     pub max_readers: usize,
 }
 
@@ -657,6 +675,11 @@ impl Inner {
         &self.slot(slot).epoch
     }
 
+    #[inline]
+    fn slot_owner(&self, slot: u32) -> &AtomicU64 {
+        &self.slot(slot).owner
+    }
+
     /// Pointer to byte `phys` of the data region.
     ///
     /// # Safety
@@ -914,10 +937,12 @@ impl RingBuffer {
     ) -> Result<Writer<WD, WS>, WriterClaimed> {
         // Acquire on success pairs with the Release store in `Writer::drop`
         // and `force_release_writer`, handing the region state (committed,
-        // hwm, and the data bytes) from the previous writer to this one.
+        // hwm, and the data bytes) from the previous writer to this one. The
+        // claimed value is this process's owner tag, so `reclaim_owner` can
+        // free a dead claimant's role.
         self.inner
             .writer_claim()
-            .compare_exchange(0, 1, Acquire, Relaxed)
+            .compare_exchange(0, owner_tag(), Acquire, Relaxed)
             .map_err(|_| WriterClaimed)?;
         Ok(Writer {
             inner: self.inner.clone(),
@@ -937,6 +962,44 @@ impl RingBuffer {
         // Release matches `Writer::drop`, so the next claimer's Acquire CAS
         // orders after whatever state the caller observed before reclaiming.
         self.inner.writer_claim().store(0, Release);
+    }
+
+    /// Forcibly free everything a dead process left claimed in this region:
+    /// every reader slot whose owner tag is `pid`, and the writer claim if
+    /// that process held it. A pinned dead cursor otherwise backpressures the
+    /// writer forever, so a host that detects a peer's death runs this over
+    /// each region the peer had attached.
+    ///
+    /// Freed space wakes no one (the region carries no wake state); a writer
+    /// parked on a space wake is woken by its next producer-side notify, or
+    /// the caller re-drives it.
+    ///
+    /// # Safety
+    /// The caller asserts the process identified by `pid` (its
+    /// `std::process::id()`) is dead — exited and reaped, so none of its
+    /// stores are still in flight. Reclaiming a live process's claims
+    /// re-creates the very races the claim word and reader registration
+    /// exist to prevent. Handles the dead process left behind must never be
+    /// used again. `pid` must not alias a live claimant through pid reuse;
+    /// reclaim promptly after reaping, before spawning replacements.
+    pub unsafe fn reclaim_owner(&self, pid: u64) {
+        for slot in 0..self.inner.max_readers {
+            if self.inner.slot_cursor(slot).load(Acquire) != FREE_SLOT
+                && self.inner.slot_owner(slot).load(Acquire) == pid
+            {
+                // Bump the generation before freeing, per the epoch's
+                // reclamation discipline, then free the cursor. Release
+                // pairs with the claim CAS in `view`.
+                self.inner.slot_epoch(slot).fetch_add(1, Release);
+                self.inner.slot_cursor(slot).store(FREE_SLOT, Release);
+            }
+        }
+        // Release the writer claim iff the dead process held it, matching
+        // `force_release_writer`'s ordering.
+        let _ = self
+            .inner
+            .writer_claim()
+            .compare_exchange(pid, 0, Release, Relaxed);
     }
 
     /// Register a new view, claiming a free slot in the reader table.
@@ -961,12 +1024,17 @@ impl RingBuffer {
                 .compare_exchange(FREE_SLOT, start, AcqRel, Relaxed)
                 .is_ok()
             {
-                // The epoch is a generation counter reserved for crash
-                // reclamation. It is written on every claim and never yet
-                // read. A future reclaimer must bump it before freeing the
-                // cursor, and cursor stores through a `View` would then need
-                // an epoch check first, since a plain store on a reclaimed
-                // slot would corrupt the new owner.
+                // Stamp the owner tag immediately after the claim, keeping
+                // the window in which a crash leaves the slot claimed but
+                // unattributed (unreclaimable) as small as possible.
+                self.inner.slot_owner(slot).store(owner_tag(), Release);
+                // The epoch is a generation counter for reclamation, bumped
+                // on every claim and by `reclaim_owner` before it frees a
+                // dead owner's cursor. A dead owner makes no more stores, so
+                // nothing checks it yet; a future *live* reclaimer would need
+                // `View` cursor stores to verify the epoch first, since a
+                // plain store on a reclaimed slot would corrupt the new
+                // owner.
                 self.inner.slot_epoch(slot).fetch_add(1, Release);
                 // The registration handshake described in the crate docs. The
                 // fence pairs with the one in `slowest_active_cursor`. Loop
@@ -1074,7 +1142,8 @@ unsafe fn init_region(
                 .write(ReaderSlot {
                     cursor: AtomicU64::new(FREE_SLOT),
                     epoch: AtomicU64::new(0),
-                    _pad: [0; 48],
+                    owner: AtomicU64::new(0),
+                    _pad: [0; 40],
                 });
         }
     }

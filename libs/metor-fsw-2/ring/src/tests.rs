@@ -970,3 +970,86 @@ fn concurrent_view_churn() {
     churner.join().unwrap();
     consumer.join().unwrap();
 }
+
+// ----- Owner reclamation (dead-process cleanup) -----
+
+/// Reclaiming a dead reader's pinned cursor unblocks a backpressured writer,
+/// and the freed slot is claimable by a fresh view.
+#[test]
+fn reclaim_frees_dead_reader() {
+    const DEAD_PID: u64 = 4242;
+    let rb = ring(64, 2);
+    let mut w = rb.writer(NoWake, NoWake).unwrap();
+
+    // Plant a foreign reader claim directly, as if another process
+    // registered a view at position 0 and then died: a pinned cursor with a
+    // dead owner and no local `View` object at all.
+    rb.inner.slot_cursor(0).store(0, Release);
+    rb.inner.slot_owner(0).store(DEAD_PID, Release);
+
+    // The dead cursor backpressures the writer once a lap fills.
+    while w.try_write(&[0u8; 16]).is_ok() {}
+    assert_eq!(w.try_write(&[0u8; 16]), Err(WriteError::WouldBlock));
+
+    assert_eq!(rb.reader_count(), 1);
+    // SAFETY: no process with this pid holds the slot; nothing stores through it.
+    unsafe { rb.reclaim_owner(DEAD_PID) };
+    assert_eq!(rb.reader_count(), 0, "dead cursor freed");
+
+    w.try_write(&[1u8; 16]).expect("writer unblocked");
+    // The freed slot re-registers cleanly (the handshake still converges).
+    let mut v2 = rb.view(NoWake, NoWake).unwrap();
+    w.try_write(&[2u8; 16]).unwrap();
+    let g = v2.try_read().unwrap().expect("fresh view reads new data");
+    assert_eq!(&g[..], &[2u8; 16]);
+}
+
+/// A dead writer's claim is reclaimed by owner tag, and a new writer
+/// continues the same absolute stream. The dead owner is a *foreign* pid —
+/// reclaiming one's own pid would also free this process's live views,
+/// which the reclaim contract forbids.
+#[test]
+fn reclaim_frees_dead_writer_claim() {
+    const DEAD_PID: u64 = 4242;
+    let rb = ring(256, 2);
+    let mut v = rb.view(NoWake, NoWake).unwrap();
+    {
+        let mut w = rb.writer(NoWake, NoWake).unwrap();
+        w.try_write(b"before").unwrap();
+    }
+    // Re-plant the (now free) claim as if a foreign process took it and died.
+    rb.inner.writer_claim().store(DEAD_PID, Release);
+    assert!(rb.writer(NoWake, NoWake).is_err(), "claim held by the dead");
+
+    // SAFETY: no live process holds this claim; nothing stores through it.
+    unsafe { rb.reclaim_owner(DEAD_PID) };
+    let mut w2 = rb.writer(NoWake, NoWake).unwrap();
+    w2.try_write(b"after").unwrap();
+
+    let mut buf = Vec::new();
+    assert!(v.try_read_into(&mut buf).unwrap());
+    assert_eq!(&buf[..], b"before");
+    assert!(v.try_read_into(&mut buf).unwrap());
+    assert_eq!(&buf[..], b"after");
+}
+
+/// Reclaim is scoped to the given owner tag: a reader slot and a writer
+/// claim held by some other process are untouched.
+#[test]
+fn reclaim_skips_other_owners() {
+    let rb = ring(256, 2);
+    let v = rb.view(NoWake, NoWake).unwrap();
+    // Plant a foreign owner on the view's slot (the first free one) and a
+    // foreign writer claim, as if another process held both.
+    rb.inner.slot_owner(0).store(999_999_999, Release);
+    rb.inner.writer_claim().store(999_999_999, Release);
+
+    // SAFETY: reclaim by our pid; the planted foreign tags must not match.
+    unsafe { rb.reclaim_owner(std::process::id() as u64) };
+    assert_eq!(rb.reader_count(), 1, "foreign reader survives");
+    assert!(
+        rb.writer(NoWake, NoWake).is_err(),
+        "foreign writer claim survives"
+    );
+    drop(v);
+}
