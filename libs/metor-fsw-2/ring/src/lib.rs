@@ -103,6 +103,12 @@
 //! code, run under Miri. `MIRI.md` in the crate root describes what is
 //! covered and how to run it.
 
+#[cfg(all(
+    feature = "futex",
+    any(target_os = "linux", target_os = "android", target_os = "macos")
+))]
+pub mod wake;
+
 use std::cell::UnsafeCell;
 use std::sync::Arc;
 use std::sync::atomic::{
