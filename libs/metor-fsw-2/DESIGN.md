@@ -313,12 +313,15 @@ instances of one system type never collide on the wire. See `docs/wiring.md`.
 
 ## Running systems as cdylibs
 
-A system is either **statically linked** into the host binary or compiled to a **`cdylib`
-that the host `dlopen`s** at runtime; both run in the same process and exchange data over the
-same shared-memory rings, so a dynamically-loaded system sees the identical atomics a
-statically-linked one does — no copy, no IPC. The only difference is how a system is
-constructed and how its lifecycle is invoked. (Running a system as a *separate process* is a
-natural extension the shared-memory data path is designed for, but is not yet implemented.)
+A system is **statically linked** into the host binary, compiled to a **`cdylib` that the
+host `dlopen`s** at runtime, or — the third mode — that same cdylib **driven in its own
+worker process** (`process=#true`, `docs/process-systems.md`). The first two run in one
+process and exchange data over the same shared-memory rings, so a dynamically-loaded system
+sees the identical atomics a statically-linked one does — no copy, no IPC. The only
+difference is how a system is constructed and how its lifecycle is invoked. A process system
+keeps the identical data path over mmap-backed ring files and is stepped in lockstep through
+a shared-futex doorbell; the host never loads its artifact, so every lifecycle call executes
+outside the coordinator's address space.
 
 dlopen across a stable Rust ABI is genuinely hard, which is exactly why the data path is built
 on shared-memory rings rather than passing Rust types across the boundary. Only **serialized
@@ -456,11 +459,14 @@ and `docs/message-wiring.md`.
 The design intentionally leaves several capabilities for later; they are noted here in one
 place rather than scattered through the prose:
 
-- **Cross-process systems.** Systems run statically linked or dlopen'd in one process today.
-  The shared-memory ring (with its `mmap` feature) is designed to carry the data path across
-  process boundaries, but the cross-process notification/launch mechanism is not built.
-- **Recovery from a hard stop.** A cyclic system that panics (in a `.so`) is permanently
-  stopped; there is no restart or quarantine-and-resume path.
+- **Cross-process systems are cyclic-only and stepped serially.** Each process slot's step
+  blocks the loop until the worker acks or the deadline lapses; overlapping independent
+  workers within a cycle, and cross-process *async* systems, are future work
+  (`docs/process-systems.md` §8).
+- **Recovery from a hard stop.** A cyclic system that panics (in a `.so`) — or a process
+  system whose worker dies — is permanently stopped; there is no restart or
+  quarantine-and-resume path. A dead worker's ring roles are reclaimed, so the rest of the
+  graph keeps flowing.
 - **Per-system rates.** Every cyclic system runs every cycle; there is no rate division beyond
   the single global cycle rate (a system can still self-pace by running async).
 - **Automatic transport reconnect.** The TCP downlink connects once and stops downlinking on
@@ -482,6 +488,8 @@ of each subsystem:
 - `docs/coordinator.md` — the builder, graph validation, scheduling, clocks, and lifecycle.
 - `docs/wiring.md` — the `Wiring` data model, the KDL front-end, and the Rust builder.
 - `docs/dl-open.md` — the `cdylib` C-ABI, the loader, and schema-guided params.
+- `docs/process-systems.md` — the third loading mode: a worker process driving that same
+  cdylib over mmap rings and a shared-futex step doorbell, with dead-worker reclamation.
 - `docs/telemetry.md` — the registry (frames and messages, one keyspace) and the telemetry downlink.
 - `docs/cli-runner.md` — the `metor-fsw` CLI: loading a wiring, packaging a bundle, and running a mission.
 - `docs/sequences-slots.md` — runtime-loadable slots and the `#[sequence]` author surface.

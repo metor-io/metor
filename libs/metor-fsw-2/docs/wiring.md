@@ -210,7 +210,12 @@ system "plant" type="Plant" artifact="plant" gain=5.0       // dl (references ar
   **static** system resolved through the [`Registry`]. (This property was originally spelled `lib=`
   — same as the `artifact` node's own stem property — and was hard-renamed to `artifact=` so the
   two could not be confused; there is no `lib=` alias.)
-- Every other property (anything but the reserved `type=`/`artifact=`) is a **param** (§6). A system
+- `process=#true` (optional, requires `artifact=`; [`ProcessNeedsArtifact`] otherwise) runs the
+  artifact in its **own worker process** instead of dlopen'ing it in-process
+  (`docs/process-systems.md`): resolve obtains its descriptor from a describe-mode worker, and
+  `build()` spawns the run worker. Everything else about the node — `type=` agreement, params,
+  edges — is identical to a dl system. `WiringBuilder`'s `.process()` is the Rust twin.
+- Every other property (anything but the reserved `type=`/`artifact=`/`process=`) is a **param** (§6). A system
   with any config property carries [`ParamSource::Kdl`] (its node source text, verbatim); a
   config-less system carries [`ParamSource::None`]. A repeated property or an unrecognized top-level
   node is a load error (stricter than KDL's own last-wins).

@@ -1,5 +1,13 @@
 # Implementation plan — cross-process systems
 
+> **Landed 2026-07-08**, one commit per wave, as planned. Notable in-flight
+> adjustments: only `ctl`/`worker`/`host` are target-gated (the session dir,
+> `Reg::Proc`, and the alloc passes compile everywhere, with a stub `bind_proc`
+> and a no-op `worker_entry` elsewhere); `describe_via_worker` ended up `pub`
+> (the embedder path to a descriptor without a dlopen, and what the e2e test
+> uses); and the W7 harness runs each test on its own thread because
+> `stellarator::run` consumes the thread-local executor.
+
 Design: `docs/process-systems.md`. Summary of what we build: a **shared futex** `wake` module in
 the ring crate (the `atomic-wait` crate is process-private on every platform, so we mirror its
 API over `FUTEX_WAIT` sans private flag / `os_sync_wait_on_address` SHARED), **owner-pid

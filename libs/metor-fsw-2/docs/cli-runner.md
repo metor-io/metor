@@ -196,7 +196,11 @@ metor-fsw run dist/adcs.bundle --wall --telemetry 10.0.0.2:2240
 
 ## 3. The `cli` module shape
 
-Two entry points, thin:
+Two entry points, thin. The first executable statement of `run` is
+`proc::worker_entry()`: a mission with `process=#true` systems re-executes the
+host binary as its workers, and the guard routes such a child into the worker
+loop instead of the CLI (`docs/process-systems.md` §5). For everyone else it is
+one environment-variable read.
 
 ```rust
 // src/cli/mod.rs   (#[cfg(feature = "kdl")])

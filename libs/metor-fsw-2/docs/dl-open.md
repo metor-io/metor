@@ -716,14 +716,11 @@ and the ring leave the seams open for them.
   not woken — every dl port uses `NoWake`. An async dl system would need a `.so`-side spawned
   task woken by a shared-memory wake word (the ring reserves `OFF_WAKE_WORD` / `FLAG_WAKE_SHARED`
   for this) in place of `fsw_execute`.
-- **Separate-process systems.** The model is in-process: the `.so` reconstructs rings directly
-  over the host's heap regions via `attach_raw`, so the `FswRing` handle is a bare
-  `(base, len, role)`. A cross-process variant would keep the same ports and the same
-  reconstruction logic but back each ring with an mmap region (`Backing::mmap`, via
-  `RingBuffer::create_mmap`/`attach_mmap`) the peer attaches, replacing the raw pointer in
-  `FswRing` with a region identifier (a path or fd) — a constructor swap on the erased
-  backing, not a redesign. It would also need process supervision (spawn, health-driven restart, crash-slot
-  reclamation), which is its own work.
+- ~~**Separate-process systems.**~~ Shipped: `docs/process-systems.md`. It came out exactly as
+  sketched here — the worker process `attach_mmap`s the ring files the host allocated, turns the
+  regions into the same positional `FswRing` handles, and drives an ordinary `DlSlot` through this
+  ABI unchanged; the region identifiers cross in a launch manifest, and supervision is a spawn +
+  step-doorbell + dead-owner reclamation (no restart yet).
 - **Cross-process wake.** The shared-memory wake handshake (`OFF_WAKE_WORD` / `FLAG_WAKE_SHARED`)
   the ring reserves is unimplemented; it is the prerequisite for async cross-process systems.
 - **Hot reload.** Swapping a `.so` at runtime (drain → `fsw_destroy` → reload →

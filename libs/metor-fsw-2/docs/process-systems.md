@@ -1,5 +1,9 @@
 # Design — cross-process systems
 
+> **Status: implemented** (2026-07-08). Built as planned in
+> `docs/process-systems-plan.md` W1–W8; the two deltas from this document are
+> noted inline (§5 worker-exe override, §7 builder signature).
+
 Systems currently run in one process, statically linked or dlopen'd. This design adds a third
 mode: a system running in its **own OS process**, exchanging frames with the rest of the graph
 over the same shared-memory rings. Nothing about the existing modes changes; a mission mixes all
@@ -150,8 +154,9 @@ application embedding the framework in its own binary must call it first thing i
 this is loudly documented. A missing guard (the child ran the app's main instead) surfaces as a
 clean timeout error naming the guard — at resolve for a describe run, at `build()` for a run
 worker that never reports `Attached` — and the child is killed either way.
-`CoordinatorConfig::worker_exe` overrides the executable for hosts that want a dedicated worker
-binary.
+`CoordinatorBuilder::worker_exe` (builder-scoped, so `CoordinatorConfig` stays `Copy`) overrides
+the executable for hosts that want a dedicated worker binary; `CoordinatorBuilder::shm_dir`
+overrides the session root the same way.
 
 The worker has two modes, selected by the manifest:
 
@@ -206,8 +211,9 @@ system "imu" artifact="imu-driver" process=#true sample_hz=200.0
 form the worker can reconstruct; a statically-linked worker mode is future work). Resolve runs a
 describe-mode worker (§5) instead of `DlSystem::open`, decodes the descriptor and params schema
 from its output, encodes params through the same schema-guided path as `resolve_dl`, and
-registers via a new `CoordinatorBuilder::add_proc_cyclic(name, descriptor, params_schema,
-artifact_path, params)` — no `DlSystem` handle exists for a process system. A `Reg::Proc`
+registers via a new `CoordinatorBuilder::add_proc_cyclic(name, descriptor, artifact_path,
+params)` — no `DlSystem` handle exists for a process system, and the `Params` schema stays in
+the resolver (its only consumer). A `Reg::Proc`
 registration flows through the uniform validate/size/allocate passes untouched and binds to a
 `ProcSlot` (host half) at `build()`. Process systems are cyclic-only, like dl systems.
 `WiringBuilder` gets the matching `process()` toggle on its dl-system surface.

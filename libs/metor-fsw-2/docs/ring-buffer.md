@@ -78,8 +78,8 @@ changing the wire format.
 | Offset | Size | Type  | Field                 | Notes |
 |--------|------|-------|-----------------------|-------|
 | `0x00` | 4    | `u32` | `magic`               | `b"MFR1"` read as a native `u32`; validated on attach |
-| `0x04` | 2    | `u16` | `version`             | layout version (currently `2`) |
-| `0x06` | 2    | `u16` | `flags`               | always `0` in v2; bit 0 `FLAG_WAKE_SHARED` reserved for a future shared wake word |
+| `0x04` | 2    | `u16` | `version`             | layout version (currently `3`) |
+| `0x06` | 2    | `u16` | `flags`               | always `0` in v3; bit 0 `FLAG_WAKE_SHARED` reserved for a future shared wake word |
 | `0x08` | 8    | `u64` | `capacity`            | data-region size in bytes; a power of two |
 | `0x10` | 8    | `u64` | `data_offset`         | region-relative offset of data byte 0 |
 | `0x18` | 4    | `u32` | `max_readers`         | number of slots in the reader table |
@@ -100,7 +100,7 @@ a single equality check on attach rejects an incompatible producer
 | `0x40` | 8    | `AtomicU64` | `committed`       | absolute bytes published; Release by the writer, Acquire by readers |
 | `0x48` | 8    | `AtomicU64` | `high_water_mark` | absolute end of valid data before a pending wrap gap; `HWM_NONE = u64::MAX` means no gap |
 | `0x50` | 8    | `AtomicU64` | `wake_word`       | reserved for a future cross-process futex/eventfd |
-| `0x58` | 8    | `AtomicU64` | `writer_claim`    | single-writer enforcement: `0` = free, `1` = a live `Writer` exists (§4) |
+| `0x58` | 8    | `AtomicU64` | `writer_claim`    | single-writer enforcement: `0` = free, else the claimant's process-id tag (§4) |
 | `0x60` | 32   | —           | pad               | to the next cache line |
 
 > **Version-2 layout note.** Removing the overwrite mode also removed the
@@ -110,6 +110,11 @@ a single equality check on attach rejects an incompatible producer
 > `1 → 2` so a stale mapping is rejected with `AttachError::BadVersion` —
 > regions are ephemeral IPC state, not archives, so stale dev regions are simply
 > recreated.
+>
+> **Version-3 layout note.** Cross-process systems made dead-peer cleanup real:
+> each reader slot gained an `owner` word (carved from its pad) and the writer
+> claim stores the claimant's pid instead of `1`, both stamped at claim time,
+> feeding the `unsafe fn reclaim_owner(pid)` sweep described in §7.
 
 `committed`, `high_water_mark`, and the wrap-gap mechanism are semantically
 identical to the disruptor's `WriteHead`. There is **no** in-region mutex: there
@@ -124,8 +129,9 @@ across processes anyway. The header + control block together are `HEADER_SIZE =
 | Slot offset | Size | Type        | Field    | Notes |
 |-------------|------|-------------|----------|-------|
 | `+0x00`     | 8    | `AtomicU64` | `cursor` | absolute read head, or `FREE_SLOT = u64::MAX` when unclaimed |
-| `+0x08`     | 8    | `AtomicU64` | `epoch`  | generation bumped on claim; ABA-safe reuse hook |
-| `+0x10`     | 48   | —           | pad      | to 64 B |
+| `+0x08`     | 8    | `AtomicU64` | `epoch`  | generation bumped on claim and by reclaim; ABA-safe reuse hook |
+| `+0x10`     | 8    | `AtomicU64` | `owner`  | the claiming process's id, for `reclaim_owner` (§7); diagnostic, never synchronization |
+| `+0x18`     | 40   | —           | pad      | to 64 B |
 
 ### Data region (starts at `data_offset`, length `capacity`)
 
@@ -214,13 +220,14 @@ header + 16-byte payload, already a multiple of 8 so no tail pad):
 
 There is exactly one writer per buffer (each system owns its output buffer), and
 the ring **enforces** it: `RingBuffer::writer()` CAS-claims the in-region
-`writer_claim` word (`0 → 1`, Acquire success / Relaxed failure) and returns
+`writer_claim` word (`0 →` the claimant's pid, Acquire success / Relaxed
+failure) and returns
 `Err(WriterClaimed)` if a live writer already exists — the claim lives in the
 region, so enforcement is cross-handle and cross-process. `Writer::drop` frees
 the claim with a Release store, handing the whole region state to the next
 claimer's Acquire CAS. A crashed process leaks its claim; the supervising host
-reclaims it with the `unsafe fn force_release_writer()` escape hatch (it must
-assert the claiming writer is truly gone). The writer is the sole mutator of
+reclaims it with `unsafe fn reclaim_owner(pid)` (or the blunter
+`force_release_writer()`), asserting the claiming process is truly dead. The writer is the sole mutator of
 `committed` and `high_water_mark`, and reads `committed` Relaxed.
 `Writer::try_write(bytes)`:
 
@@ -399,6 +406,16 @@ allocation, no `Arc`, no pointers, and the whole structure is addressable by
 offset — exactly what shared memory requires. The `epoch` word guards against ABA
 on slot reuse.
 
+**Dead-owner reclamation.** Every claim — reader slots and the writer word —
+is stamped with the claiming process's id, and `unsafe fn reclaim_owner(pid)`
+frees everything a dead process left behind: each matching reader slot (epoch
+bumped first, per the reserved discipline) and the writer claim if that pid
+holds it. Without it, a killed peer's pinned cursor would backpressure the
+writer forever. The safety contract is that the owner is dead (exited and
+reaped, so none of its stores race) and that `pid` does not alias a live
+claimant through pid reuse — reclaim promptly after reaping. The process-system
+host (`docs/process-systems.md` §6) is the caller.
+
 ## 8. Async wake
 
 Async systems are woken across two directions, both expressed through one trait
@@ -435,6 +452,16 @@ Implementations:
   async paths degenerate to caller-driven polling.
 - **`Notifier`** (behind the `async` feature) — backed by a `stellarator`
   `WaitQueue`, shared by clone between the writer and views for one direction.
+
+Beside the trait pair, the crate ships the **`wake` module** (behind the
+`futex` feature): free functions `wait`/`wait_timeout`/`wake_one`/`wake_all`
+over a shared `AtomicU32`, implemented as a shared-memory futex (plain
+`FUTEX_WAIT` on Linux, `os_sync_wait_on_address` + `SHARED` on macOS 14.4+).
+It is not a `WakeSource`/`WakeSink` and no ring endpoint uses it; it is the
+cross-process wake primitive the fsw-2 control block builds its step doorbell
+on (`docs/process-systems.md` §2, including why the `atomic-wait` crate —
+process-private on every platform — cannot serve). The per-ring `wake_word`
+stays reserved (§14).
 
 ## 9. Public API surface
 
@@ -689,7 +716,8 @@ live in `ring/src/tests.rs`; see `MIRI.md` for how to run.
   matching `libs/db`.
 - **Features:** `mmap` (memmap2, already in tree via `libs/db`) gates the mmap
   backing (`create_mmap`/`attach_mmap`); `async` gates the `stellarator`-backed
-  `Notifier`. The in-memory heap path and the `try_*` APIs need neither.
+  `Notifier`; `futex` gates the shared-futex `wake` module (§8). The in-memory
+  heap path and the `try_*` APIs need none of them.
 - The ring is byte-oriented: framing of `metor-proto` tables is a layer above it,
   so the crate has no `metor-proto` dependency. Keeping it standalone keeps the
   unsafe shared-memory core small and independently Miri-testable, and reusable
@@ -700,21 +728,20 @@ live in `ring/src/tests.rs`; see `MIRI.md` for how to run.
 These are not implemented; layout room is reserved so they drop in without a
 layout change:
 
-- **Cross-process wake.** In-process notification uses `Notifier`/`NoWake`. The
-  `wake_word` control slot and the `FLAG_WAKE_SHARED` flag bit reserve room for a
-  shared-memory futex/eventfd, and the `WakeSource`/`WakeSink` traits keep the
-  seam, but no cross-process notification mechanism exists. An out-of-process
-  reader polls `try_read` until one is built.
-- **Crash-slot reclamation.** A reader that crashes leaks its claimed slot —
-  and, because the ring is lossless, a leaked cursor eventually blocks the
-  writer for good. Callers over-provision `max_readers` and supervise their
-  readers. The `epoch` word and a future owner-pid/liveness sweep remain
-  available as the reclamation hook. (If ever implemented, the reclaimer must
-  bump `epoch` *before* freeing the cursor, and cursor stores through a `View`
-  must become epoch-checked — a plain Release store on a reclaimed slot would
-  corrupt the new owner's cursor.) A crashed **writer** likewise leaks the
-  `writer_claim` word; `force_release_writer` is the supervised escape hatch
-  until real cross-process liveness exists.
+- **Per-ring cross-process wake.** The `wake` module (§8) provides the
+  shared-futex primitive, but no ring *endpoint* uses it yet: the `wake_word`
+  control slot and the `FLAG_WAKE_SHARED` flag bit still reserve room for a
+  per-ring shared wake behind the `WakeSource`/`WakeSink` seam. Cyclic
+  cross-process systems don't need one (they are stepped through the fsw-2
+  control-block doorbell and poll their inputs); it becomes interesting with
+  cross-process *async* systems. Until then an out-of-process reader with no
+  doorbell polls `try_read`.
+- **Live-reader reclamation.** `reclaim_owner` (§7) handles a **dead** owner —
+  the supervised, post-reap sweep. Reclaiming a merely *unresponsive* reader
+  (owner alive, cursor stuck) remains future work: it would need cursor stores
+  through a `View` to become epoch-checked, since a plain Release store on a
+  reclaimed slot would corrupt the new owner's cursor. Callers still
+  over-provision `max_readers` and supervise their readers.
 - **Writer-death recovery.** `committed` gates readers off uncommitted bytes, so
   a dead writer simply stalls the stream. A replacement writer (after
   `force_release_writer`) resumes at `committed`: any bytes the dead writer
