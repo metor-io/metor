@@ -36,10 +36,6 @@ use crate::health::{HealthPort, SystemHealth, SystemLog};
 use crate::message::MsgTable;
 use crate::port::Output;
 
-// ---------------------------------------------------------------------------
-// Port bundles
-// ---------------------------------------------------------------------------
-
 /// The read side of a system, a struct whose fields are
 /// [`Input<F>`](crate::Input) ports. Derive with `#[derive(SystemInput)]` to
 /// generate `decls` from the fields.
@@ -236,10 +232,6 @@ pub enum ConfigureError {
     },
 }
 
-// ---------------------------------------------------------------------------
-// System traits
-// ---------------------------------------------------------------------------
-
 /// The surface every system shares: the typed input/output bundle types, the
 /// wiring name, and the once-each lifecycle hooks. Implement one of
 /// [`CyclicSystem`] or [`AsyncSystem`], both of which require this.
@@ -337,10 +329,6 @@ pub trait AsyncSystem: System {
         Self::descriptor()
     }
 }
-
-// ---------------------------------------------------------------------------
-// Cyclic driver
-// ---------------------------------------------------------------------------
 
 /// Drives a [`CyclicSystem`] on behalf of the coordinator. It owns the port
 /// bundles between cycles, times each `execute`, and publishes a health

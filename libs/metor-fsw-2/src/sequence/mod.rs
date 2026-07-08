@@ -56,10 +56,6 @@ use crate::{Frame, FrameList, Input, Out, Output, SystemDescriptor, SystemOutput
 #[cfg(test)]
 mod tests;
 
-// ---------------------------------------------------------------------------
-// The ambient clock
-// ---------------------------------------------------------------------------
-
 /// The per-cycle state shared between the driver and the sequence body.
 ///
 /// The driver refreshes `now` and `cancel` before each poll and drains
@@ -109,11 +105,6 @@ pub fn with_clock<R>(clock: &Rc<SeqClock>, f: impl FnOnce() -> R) -> R {
 pub fn current() -> Option<Rc<SeqClock>> {
     SEQ_CLOCK.with(|c| c.borrow().clone())
 }
-
-// ---------------------------------------------------------------------------
-// Outcome + the wait Step
-// ---------------------------------------------------------------------------
-
 /// How a sequence finished. The host only needs to know the future is done;
 /// the specific outcome rides in [`SequenceStatus`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -154,10 +145,6 @@ impl Step {
         matches!(self, Step::Aborted)
     }
 }
-
-// ---------------------------------------------------------------------------
-// The wait future + the free-function author API
-// ---------------------------------------------------------------------------
 
 /// A timer future driven entirely by the ambient [`SeqClock`].
 ///

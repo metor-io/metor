@@ -1,12 +1,11 @@
 //! Streams output buffers to a ground endpoint and relays ground commands
 //! back in.
 //!
-//! Two systems live here. [`TelemetrySystem`] is the downlink, an ordinary
-//! [`CyclicSystem`] registered after every other cyclic system. Its
-//! end-of-cycle `execute` frames the pending records of every tapped output
-//! buffer into one batch buffer and queues the batch for a spawned sender
-//! task, which writes it to the wire in a single send. [`UplinkSystem`] is
-//! the read twin, an [`AsyncSystem`] that owns its own connection, subscribes
+//! [`TelemetrySystem`] is the downlink, an ordinary [`CyclicSystem`] registered after every other cyclic system. At the
+//! end of the cycle `execute` frames the pending records of every tapped output
+//! buffer into one batch buffer and queues the batch for a spawned sender task.
+//!
+//!  [`UplinkSystem`] is the read side, an [`AsyncSystem`] that owns its own connection, subscribes
 //! to a configured set of message ids, and republishes each inbound `Msg`
 //! packet on an ordinary message output port, so consumers receive commands
 //! over explicit edges like any other message.
@@ -74,10 +73,6 @@ use crate::system::{
     SystemOutput,
 };
 
-// ---------------------------------------------------------------------------
-// Transport
-// ---------------------------------------------------------------------------
-
 /// A failed send or receive on the link. The first error stops the task
 /// driving the transport, while the in-cycle stage keeps running and drops.
 #[derive(Debug, thiserror::Error)]
@@ -125,8 +120,7 @@ pub trait RecvTransport {
     /// dropped. The caller recovers the buffer from the returned packet via
     /// [`OwnedPacket::into_buf`] once the payload is routed, so one buffer
     /// serves the link's whole lifetime.
-    async fn recv(&mut self, buf: Vec<u8>)
-    -> Result<OwnedPacket<Slice<Vec<u8>>>, TransportError>;
+    async fn recv(&mut self, buf: Vec<u8>) -> Result<OwnedPacket<Slice<Vec<u8>>>, TransportError>;
 
     /// Declare the message ids to subscribe to on connect. Called once before
     /// the first `recv`; the default is a no-op.
@@ -176,10 +170,16 @@ impl Transport for TcpTransport {
     ) -> Result<(), TransportError> {
         let tx = self.ensure().await?;
         let pkt = msg.into_len_packet();
-        tx.write_all(pkt.inner).await.0.map_err(TransportError::io)?;
+        tx.write_all(pkt.inner)
+            .await
+            .0
+            .map_err(TransportError::io)?;
         for m in meta {
             let pkt = (&SetComponentMetadata(m.clone())).into_len_packet();
-            tx.write_all(pkt.inner).await.0.map_err(TransportError::io)?;
+            tx.write_all(pkt.inner)
+                .await
+                .0
+                .map_err(TransportError::io)?;
         }
         Ok(())
     }
@@ -252,10 +252,7 @@ impl TcpRecvTransport {
 }
 
 impl RecvTransport for TcpRecvTransport {
-    async fn recv(
-        &mut self,
-        buf: Vec<u8>,
-    ) -> Result<OwnedPacket<Slice<Vec<u8>>>, TransportError> {
+    async fn recv(&mut self, buf: Vec<u8>) -> Result<OwnedPacket<Slice<Vec<u8>>>, TransportError> {
         let stream = self.ensure().await?;
         stream.next_grow(buf).await.map_err(TransportError::io)
     }
@@ -264,11 +261,6 @@ impl RecvTransport for TcpRecvTransport {
         self.subscribe_ids = ids.to_vec();
     }
 }
-
-// ---------------------------------------------------------------------------
-// Configuration
-// ---------------------------------------------------------------------------
-
 /// Which registry entries the downlink taps.
 #[derive(Clone, Debug)]
 pub enum TelemetryMode {
@@ -406,18 +398,10 @@ impl BuildSystem for UplinkSystem<TcpRecvTransport> {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Hand-off
-// ---------------------------------------------------------------------------
-
 /// How many cycle batches may wait for the sender before the cycle side drops
 /// new ones. The channel recycles its slots' buffers, so this also bounds the
 /// downlink's steady-state allocation.
 const BATCH_QUEUE_CAP: usize = 8;
-
-// ---------------------------------------------------------------------------
-// Uplink
-// ---------------------------------------------------------------------------
 
 /// How long one [`UplinkSystem::run`] pass sleeps once its link has dropped,
 /// so the async-run loop does not busy-spin a dead reader (teardown cancels
@@ -667,10 +651,6 @@ async fn run_sender<T: Transport>(
     }
 }
 
-// ---------------------------------------------------------------------------
-// Ports
-// ---------------------------------------------------------------------------
-
 /// The downlink's output bundle: no typed ports, just the [`AllOutputs`]
 /// receive-all field. `init` reaches the output registry through it, the
 /// receive-all capability its decl contributes earns the downlink a reader
@@ -696,10 +676,6 @@ impl BindPorts for TelemetryIn {
         TelemetryIn
     }
 }
-
-// ---------------------------------------------------------------------------
-// The downlink system
-// ---------------------------------------------------------------------------
 
 /// A read view into one tapped buffer plus the delivery axis and the [`Wire`]
 /// framing projected from the entry.
@@ -837,9 +813,6 @@ impl<T: Transport + 'static> System for TelemetrySystem<T> {
             );
         }
 
-        // One bounded channel of recycled batch buffers feeds the one sender.
-        // With no transport (an earlier `init` took it) the receiver drops
-        // here and the channel reports closed, so pushes count as drops.
         let (tx, rx) = mpsc::channel::<Vec<u8>>(BATCH_QUEUE_CAP);
         let sender = self
             .transport
@@ -852,11 +825,9 @@ impl<T: Transport + 'static> System for TelemetrySystem<T> {
         });
     }
 
-    /// Close the batch queue so the sender drains what is queued and exits
-    /// cooperatively (the drop guard cancels it regardless when the system is
-    /// dropped at teardown).
     fn shutdown(&mut self, _output: &mut Self::Output) {
         if let Some(started) = &mut self.started {
+            // closes the drop queue so the sender shutsdown
             started.tx = None;
         }
     }
@@ -896,7 +867,10 @@ impl<T: Transport + 'static> CyclicSystem for TelemetrySystem<T> {
         let Some(tx) = &started.tx else {
             return;
         };
-        let batch = &mut self.scratch;
+        let Ok(mut batch) = tx.try_send_ref() else {
+            output.health().error("telemetry.dropped");
+            return;
+        };
         for tap in &mut self.taps {
             match tap.delivery {
                 // An unchanged `committed` means no new record this cycle;
@@ -910,30 +884,16 @@ impl<T: Transport + 'static> CyclicSystem for TelemetrySystem<T> {
                     // A corrupt read (unreachable in practice) counts as
                     // nothing new.
                     if let Ok(Some(grant)) = tap.view.try_latest() {
-                        append_record(batch, &tap.wire, &grant);
+                        append_record(&mut batch, &tap.wire, &grant);
                     }
                 }
                 // Every record, in order.
                 Delivery::Log => {
                     let wire = &tap.wire;
                     let _ = crate::port::drain_view(&mut tap.view, |rec| {
-                        append_record(batch, wire, rec);
+                        append_record(&mut batch, wire, rec);
                     });
                 }
-            }
-        }
-        if batch.is_empty() {
-            return;
-        }
-        // Swap the batch into a channel slot; the recycled buffer that comes
-        // back keeps its capacity, so the next cycle frames without
-        // allocating. A full (or closed) queue drops the whole batch instead
-        // of delaying the cycle, counted once per batch.
-        match tx.try_send_ref() {
-            Ok(mut slot) => std::mem::swap(&mut *slot, batch),
-            Err(_) => {
-                batch.clear();
-                output.health().error("telemetry.dropped");
             }
         }
     }
