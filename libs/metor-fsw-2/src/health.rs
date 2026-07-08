@@ -143,6 +143,7 @@ where
     /// Kinds beyond [`MAX_ERR_KINDS`] still count toward the total but get no
     /// counter of their own.
     pub fn error(&mut self, kind: &str) {
+        eprintln!("error {kind:?}");
         self.errors += 1;
         if let Some((_, n)) = self.error_counts.iter_mut().find(|(k, _)| k == kind) {
             *n += 1;
@@ -158,8 +159,6 @@ where
             self.pending.push(LogLine::new(level, msg));
         }
     }
-
-    // ---- framework-side counter maintenance ----
 
     /// Closes a cycle by bumping `cycles`, stamping the execute duration, and
     /// publishing one health record plus any queued log lines.

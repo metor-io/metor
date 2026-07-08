@@ -1,63 +1,18 @@
-// The ADCS closed-loop mission, wired declaratively (dl-open.md §8, cli-runner.md §6).
-//
-//   plant ──sensors / gps──▶ nav ──attitude_estimate──▶ ctrl
-//     ▲                 │                                ▲ │
-//     │   gps ──────────┴────────────────────────────────┘ │
-//     │                 └──attitude_estimate──▶ mode ──mode_cmd──▶ ctrl
-//     └─────────────────── torque_cmd ────────────────────┘   (one-cycle-delayed)
-//
-// The flight software flies on the noisy `gps` measurement: nav references its sun/WMM-field
-// at the GPS position, ctrl derives its pointing-law target from it. The plant's ground-truth
-// `body` and `world` frames are emitted for telemetry (and `body` is tapped for convergence),
-// but no system consumes them.
-//
-// Three dlopen'd systems (plant/nav/ctrl), each its own cdylib built against the shared
-// `adcs-contracts`, plus a runtime sequence **slot** `mode` (sequences-slots.md §5): two
-// `#[sequence]` cdylib occupants (`adcs-commissioning` / `adcs-safe-mode`) that read nav's
-// estimate and emit a `mode_cmd` frame. The slot auto-runs `commissioning` at startup, so a
-// plain `metor-fsw run` shows the sequence stepping idle → settling → pointing while the
-// controller follows the commanded pointing law (velocity-vector). `mode_cmd` drives `ctrl`;
-// the plant propagates a real 400 km orbit so the Nadir/HIL targets are meaningful.
-// Run it with the framework runner:
-//
-//   cargo run -p adcs-fsw2 -- run examples/adcs-fsw2/mission.kdl --build            # headless sim
-//   cargo run -p adcs-fsw2 -- run examples/adcs-fsw2/mission.kdl --build --wall \
-//       --telemetry 127.0.0.1:2240                                                  # live → metor-panel
-//
-// The base document is the headless/sim config: a free-running simulated clock at the
-// 1/120 s physics step, no telemetry. The live knobs (wall clock + downlink) are CLI
-// overrides, so this file is what the convergence test consumes unmodified.
-
 coordinator cycle_rate=120.0 sim_dt=0.008333333333333333
 
-// One artifact per system cdylib. `lib=` is the library STEM; the framework decorates it
-// to the platform file name (libadcs_plant.dylib / .so / adcs_plant.dll), so this one file
-// is portable across a dev mac and a Linux flight target.
 artifact "plant" crate="adcs-plant" lib="adcs_plant" type="Plant"
 artifact "nav"   crate="adcs-nav"   lib="adcs_nav"   type="Nav"
 artifact "ctrl"  crate="adcs-ctrl"  lib="adcs_ctrl"  type="Ctrl"
 
-// The two sequence cdylibs — the allowed occupants of the `mode` slot (one #[sequence] per
-// .so, like any artifact). `type=` is the sequence name the macro exports.
+// sequences
 artifact "commissioning" crate="adcs-commissioning" lib="adcs_commissioning" type="commissioning"
 artifact "safe_mode"     crate="adcs-safe-mode"     lib="adcs_safe_mode"     type="safe_mode"
 
-// System instances. `artifact=` references the artifact id; the remaining properties are
-// the system's params, schema-encoded at resolve against the `.so`'s exported `Params`
-// schema. `type=` is optional here (the artifact's type is authoritative) but kept as
-// documentation. `disarmed=#true` brings every reaction wheel up offline (the cube-sat
-// `--disarmed` parity): the plant applies no control torque until the wheels are armed.
+// systems
 system "plant" type="Plant" artifact="plant" init_angle=0.5 init_rate=0.15 meas_sigma=0.002 seed=42 disarmed=#false
 system "nav"   type="Nav"   artifact="nav"   meas_sigma=0.02
 system "ctrl"  type="Ctrl"  artifact="ctrl"  q_weight=5.0 r_weight=8.0
 
-// The alarm engine — a framework built-in (`type="Alarms"`, docs/alarms.md), an ordinary
-// system: it watches the measured body rate through the receive-all registry tap and
-// broadcasts the wkt alarm Msgs the panel's alarm view consumes (AlarmDef at boot,
-// AlarmRaised/AlarmCleared on debounced transitions). `gyro_b` is a nox tensor — ONE
-// shaped component — so `element=1` addresses body-Y. The boot tumble (init_rate=0.15
-// about [1,1,1] ⇒ ~0.087 rad/s per axis) raises the warning immediately; the controller's
-// detumble clears it. The thresholds double as the panel's plot limit lines.
 system "alarms" type="Alarms" {
     alarm id="ADCS_RATE_HIGH" name="Body Rate High" {
         description "Measured body-Y rate exceeds the detumbled envelope"
@@ -69,12 +24,7 @@ system "alarms" type="Alarms" {
     }
 }
 
-// The runtime sequence slot. Its `input`/`output` lines declare the port contract every
-// allowed occupant is validated against; `initial ... state="running"` auto-loads + starts
-// `commissioning` at the first cycle (so `metor-fsw run` shows it execute). The `mode_cmd`
-// output now drives `ctrl` (the commanded pointing law); nav's `attitude_estimate` reader
-// is covered by READER_SLACK.
-slot "mode" {
+slot "slot" {
     input  frame="attitude_estimate"
     output frame="mode_cmd"
     allow occupant="commissioning"
@@ -86,22 +36,17 @@ connect "plant" -> "nav"  frame="sensors"
 connect "plant" -> "nav"  frame="gps"
 connect "plant" -> "ctrl" frame="gps"
 connect "nav"   -> "ctrl" frame="attitude_estimate"
-connect "nav"   -> "mode" frame="attitude_estimate"
-// Slots register after every system, so `mode` steps after `ctrl` and ctrl reads the
-// previous cycle's mode_cmd — declared explicitly (a plain backward edge is a
-// build-time StaleFrameEdge error). A one-cycle-late mode command is fine.
-connect "mode"  -> "ctrl" frame="mode_cmd" delayed=#true
+connect "nav"   -> "slot" frame="attitude_estimate"
+
+connect "slot"  -> "ctrl" frame="mode_cmd" delayed=#true
 connect "ctrl"  -> "plant" frame="torque_cmd" delayed=#true
 
-// The command plane — previously-invisible dataflow, now explicit edges (A2). The
-// uplink is a framework built-in (`type="TcpUplink"`), an ordinary system ingesting
-// panel commands off its own connection (it connects lazily; a headless run without
-// a broker just idles); the in-proc `control_handle` is the "coordinator" producer.
-// A producer with no edge here commands nothing. `msgs` is the forward set: the
-// uplink subscribes to exactly these types and mints one output port per entry.
-system "uplink" type="TcpUplink" addr="127.0.0.1:2241" {
+system "uplink" type="TcpUplink" addr="127.0.0.1:2240" {
     msgs "SequenceCommand" "AlarmAck"
 }
-connect "uplink"      -> "mode" msg="SequenceCommand"   // ground commands
-connect "coordinator" -> "mode" msg="SequenceCommand"   // in-proc control_handle
+
+system "downlink" type="TcpDownlink" addr="127.0.0.1:2240"
+
+connect "uplink"      -> "slot" msg="SequenceCommand"   // ground commands
+connect "coordinator" -> "slot" msg="SequenceCommand"   // in-proc control_handle
 connect "uplink"      -> "alarms" msg="AlarmAck"        // operator acks (gate latching alarms)

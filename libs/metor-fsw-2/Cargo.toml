@@ -12,68 +12,44 @@ authors = ["sascha@metor.io"]
 workspace = true
 
 [dependencies]
+# metor-proto
 metor-proto = { path = "../metor-proto", features = ["std"] }
-# `nox` forces `metor-proto-wkt`'s ComponentValue on via feature unification, so the
-# `nox`-gated wkt build is satisfied for this crate.
 metor-proto-wkt = { path = "../metor-proto/wkt", features = ["nox", "std"] }
-# Telemetry downlink: the TCP transport wraps `PacketSink<TcpStream>`.
 metor-proto-stellar = { path = "../metor-proto/stellar" }
+
+# fsw
 metor-fsw = { path = "../metor-fsw", default-features = false, features = ["std"] }
-metor-fsw-ring = { path = "ring", default-features = false, features = ["async"] }
 metor-fsw-2-macros = { path = "macros" }
+
+# channels
+metor-fsw-ring = { path = "ring", default-features = false, features = ["async"] }
+
+# async
 stellarator = { path = "../stellarator" }
 thingbuf = "0.1.6"
-zerocopy = { version = "0.8.2", features = ["derive"] }
 
-# The dlopen ABI: the serialized descriptor mirrors + the `Params` schema cross the
-# `.so` boundary as postcard bytes; `postcard-schema`'s owned schema form (`use-std`)
-# carries a system's `Params` schema on the descriptor.
+# serialization
 postcard = { version = "1.1", features = ["alloc"] }
 postcard-schema = { version = "0.2", features = ["derive", "use-std"] }
 serde = { version = "1.0", features = ["derive"] }
-
-# The dlopen host loader (`dl` module): `dlopen`/`dlsym` a system `.so` and resolve its
-# `fsw_*` C-ABI surface, keeping the `Library` alive for the loaded system's life.
-# Non-optional, because the dlopen ABI and loader build without the `kdl` feature.
-# `thiserror` is non-optional too — `dl::DlError` derives it.
-libloading = { version = "0.8" }
-thiserror = { version = "2.0" }
-
-# Wiring front-end (the `kdl` feature): KDL config language + span-carrying errors.
-kdl = { version = "6.3.4", optional = true }
-miette = { version = "7.0", features = ["fancy"], optional = true }
-
-# The schema-guided KDL→postcard params path for dl systems. `postcard-dyn` encodes a
-# dynamic value *guided by* the `.so`'s exported `Params` schema, producing the SAME
-# canonical postcard bytes the typed Rust builder produces — so the host never links the
-# system's `Params` type. `serde_json::Value` is the dynamic value `to_stdvec_dyn`
-# consumes. Both ride the `kdl` feature (only the resolver uses them).
 postcard-dyn = { version = "0.2", optional = true }
 serde_json = { version = "1.0", optional = true }
-
-# The `metor-fsw` CLI runner's arg parser (the `cli` module + bin). Rides the `kdl`
-# feature alongside the wiring surface it drives (`parse`/`build_artifacts`/`resolve`).
-clap = { version = "4", features = ["derive"], optional = true }
-
-# The `dl_integration` test builds the fixture cdylib and `dlopen`s it; it drives the
-# coordinator on `stellarator` and defines host-side frames (zerocopy) + params
-# (postcard) matching the fixture's.
-[dev-dependencies]
-stellarator = { path = "../stellarator" }
+kdl = { version = "6.3.4", optional = true }
 zerocopy = { version = "0.8.2", features = ["derive"] }
-postcard = { version = "1.1", features = ["alloc"] }
+
+libloading = { version = "0.8" }
+
+# errors
+miette = { version = "7.0", features = ["fancy"], optional = true }
+thiserror = { version = "2.0" }
+
+# cli
+clap = { version = "4", features = ["derive"], optional = true }
 
 [features]
 default = ["kdl"]
-# The KDL wiring loader (`wiring` module): registry, FromKdlNode derive, `load()`, the
-# `Wiring` data model + builder + resolver + build driver. The `abi`/`dl` dl-open
-# modules are not gated on this — the dlopen ABI and host loader build with
-# `--no-default-features`.
 kdl = ["dep:kdl", "dep:miette", "dep:postcard-dyn", "dep:serde_json", "dep:clap"]
 
-# The `metor-fsw` runner binary: `fn main() { metor_fsw_2::cli::main() }`. Gated on the
-# `kdl` feature (the `cli` module it calls is `kdl`-only), so `--no-default-features`
-# does not try to build a binary whose module is `#[cfg]`-ed out.
 [[bin]]
 name = "metor-fsw"
 path = "src/bin/metor-fsw.rs"
