@@ -669,8 +669,9 @@ the command bus, §1.4).
   (§6)~~ — landed with the port unification's schema-tagged `PortDescMsg` (a `.so` declares
   `MsgOut`/`MsgIn` like any port; `docs/design-port-unification.md` §7); a
   `reason` field on `SequenceStatus` so `Failed { reason }` carries detail (§5.2); a
-  guaranteed-lossless (backpressured) message ring (§2.1); transport **reconnect/backoff** for both
-  directions (v1 is drop-on-disconnect, telemetry.md §7).
+  guaranteed-lossless (backpressured) message ring (§2.1). ~~Transport **reconnect/backoff** for both
+  directions~~ — landed: both transports redial under exponential backoff, the downlink replays its
+  announces per connect, and the uplink re-subscribes (telemetry.md §7).
 
 ---
 

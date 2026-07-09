@@ -144,7 +144,7 @@ impl Transport for MockTransport {
         Ok(())
     }
 
-    async fn send(&mut self, buf: Vec<u8>) -> Result<Vec<u8>, TransportError> {
+    async fn send(&mut self, buf: Vec<u8>) -> (Result<(), TransportError>, Vec<u8>) {
         if self.inner.block {
             // Park forever; the cycle keeps running and the batch queue fills.
             std::future::pending::<()>().await;
@@ -158,7 +158,7 @@ impl Transport for MockTransport {
             rest = tail;
         }
         drop(packets);
-        Ok(buf)
+        (Ok(()), buf)
     }
 }
 
@@ -544,7 +544,8 @@ async fn message_downlink_fifo_no_coalesce() {
     drop(tx);
     let mock = MockTransport::new(false);
     let rec = mock.inner.clone();
-    let _ = stellarator::spawn(run_sender(mock, Vec::new(), rx)).await;
+    let drops = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let _ = stellarator::spawn(run_sender(mock, Vec::new(), rx, drops)).await;
 
     // No message is announced (self-describing); only the component tap would
     // announce, and we passed none.
@@ -1050,6 +1051,192 @@ fn uplink_minted_ports_are_untelemetered() {
     assert_eq!(minted[0].name, "SequenceCommand");
     assert_eq!(minted[1].id, crate::PortId::Packet(ReloadSequences::ID));
     assert_eq!(minted[2].id, crate::PortId::Packet(AlarmAck::ID));
+}
+
+/// A send failure drops exactly that batch, backs off, and re-enters the
+/// announce phase — the replay is what lets a restarted consumer decode
+/// tables again. The failed batch's buffer is recycled and the drop is
+/// counted once for `link_reconnect`.
+#[cfg(not(miri))]
+#[stellarator::test]
+async fn sender_reannounces_after_a_send_failure() {
+    use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+
+    use super::{Announce, BATCH_QUEUE_CAP, run_sender};
+
+    struct FlakyInner {
+        announces: AtomicU64,
+        sends: AtomicU64,
+        sent: Mutex<Vec<Vec<u8>>>,
+    }
+    struct FlakyTransport {
+        inner: Arc<FlakyInner>,
+    }
+    impl Transport for FlakyTransport {
+        async fn announce(
+            &mut self,
+            _msg: &VTableMsg,
+            _meta: &[ComponentMetadata],
+        ) -> Result<(), TransportError> {
+            self.inner.announces.fetch_add(1, Relaxed);
+            Ok(())
+        }
+
+        async fn send(&mut self, buf: Vec<u8>) -> (Result<(), TransportError>, Vec<u8>) {
+            // The first send fails (the link dropped mid-stream); later
+            // sends land.
+            if self.inner.sends.fetch_add(1, Relaxed) == 0 {
+                return (Err(TransportError::Disconnected), buf);
+            }
+            self.inner.sent.lock().unwrap().push(buf.clone());
+            (Ok(()), buf)
+        }
+    }
+
+    // One announced tap, so the replay is observable as a second announce.
+    let crate::PortSchema::Table { vtable, .. } = crate::PortDesc::of::<Imu>().schema else {
+        panic!("a frame port carries a Table schema");
+    };
+    let announces = vec![Announce {
+        packet_id: [7, 7],
+        vtable,
+        metadata: Vec::new(),
+    }];
+
+    // Two queued batches, then shutdown: the first is consumed by the failed
+    // send (dropped, buffer recycled), the second lands after the redial.
+    let (tx, rx) = thingbuf::mpsc::channel::<Vec<u8>>(BATCH_QUEUE_CAP);
+    tx.try_send(vec![1]).expect("queue has room");
+    tx.try_send(vec![2]).expect("queue has room");
+    drop(tx);
+
+    let inner = Arc::new(FlakyInner {
+        announces: AtomicU64::new(0),
+        sends: AtomicU64::new(0),
+        sent: Mutex::new(Vec::new()),
+    });
+    let drops = Arc::new(AtomicU64::new(0));
+    let _ = stellarator::spawn(run_sender(
+        FlakyTransport {
+            inner: inner.clone(),
+        },
+        announces,
+        rx,
+        drops.clone(),
+    ))
+    .await;
+
+    assert_eq!(
+        inner.announces.load(Relaxed),
+        2,
+        "the announce set is replayed once per connect"
+    );
+    assert_eq!(
+        *inner.sent.lock().unwrap(),
+        vec![vec![2]],
+        "the failed batch is dropped, the next one lands"
+    );
+    assert_eq!(drops.load(Relaxed), 1, "one established-connection loss");
+}
+
+/// A receive error no longer kills the uplink: the pass backs off, retries,
+/// and the next inbound msg still lands at its consumer over the wired edge.
+#[cfg(not(miri))]
+#[stellarator::test]
+async fn uplink_survives_a_recv_error() {
+    use std::cell::RefCell;
+    use std::rc::Rc;
+
+    use metor_proto::types::IntoLenPacket;
+    use metor_proto_wkt::AlarmAck;
+    use stellarator::buf::Slice;
+
+    use crate::{MsgIn, RecvTransport};
+
+    /// A script of receive outcomes: `None` fails the call, `Some` yields the
+    /// framed packet; an exhausted script fails every later call.
+    struct ScriptedRecv {
+        script: std::collections::VecDeque<Option<Vec<u8>>>,
+    }
+
+    impl RecvTransport for ScriptedRecv {
+        async fn recv(
+            &mut self,
+            _buf: Vec<u8>,
+        ) -> Result<metor_proto::types::OwnedPacket<Slice<Vec<u8>>>, TransportError> {
+            use stellarator::buf::IoBuf;
+            match self.script.pop_front() {
+                Some(Some(bytes)) => {
+                    let slice = bytes.try_slice(..).expect("non-empty packet");
+                    metor_proto::types::OwnedPacket::parse(slice)
+                        .map_err(|e| TransportError::Io(Box::new(e)))
+                }
+                _ => Err(TransportError::Disconnected),
+            }
+        }
+    }
+
+    struct AckSink {
+        seen: Rc<RefCell<Vec<AlarmAck>>>,
+    }
+
+    #[derive(SystemInput)]
+    struct AckSinkIn {
+        acks: MsgIn<AlarmAck>,
+    }
+
+    #[derive(SystemOutput)]
+    struct AckSinkOut {}
+
+    impl System for AckSink {
+        type Input = AckSinkIn;
+        type Output = Out<AckSinkOut>;
+        const NAME: &'static str = "ack_sink";
+    }
+
+    impl CyclicSystem for AckSink {
+        fn execute(&mut self, _now: Timestamp, input: &mut AckSinkIn, _o: &mut Self::Output) {
+            let seen = &self.seen;
+            input.acks.drain(|a| seen.borrow_mut().push(a));
+        }
+    }
+
+    let ack = AlarmAck {
+        def_id: "RATE_HIGH".to_string(),
+        occurrence: 1,
+        operator: "op".to_string(),
+        note: None,
+    };
+    let wire = ack.into_len_packet().inner[4..].to_vec();
+
+    // A wall clock (not simulated), so cycles keep coming in real time while
+    // the uplink sleeps out its backoff after the scripted failure.
+    let seen = Rc::new(RefCell::new(Vec::new()));
+    let mut b = Coordinator::builder(CoordinatorConfig {
+        cycle_rate: 100.0,
+        default_depth: 8,
+        ..CoordinatorConfig::default()
+    });
+    let sink = b.add_cyclic(AckSink { seen: seen.clone() });
+    let uplink = b.add_async(
+        UplinkSystem::new(ScriptedRecv {
+            script: vec![None, Some(wire)].into(),
+        })
+        .with_msg::<AlarmAck>(),
+    );
+    b.connect(
+        PortRef::msg::<AlarmAck>(uplink),
+        PortRef::msg::<AlarmAck>(sink),
+    )
+    .unwrap();
+    let mut coord = b.build().unwrap();
+
+    // ~600ms of cycles, several times the 100ms first-retry backoff.
+    coord.run_for(60).await;
+
+    let got = seen.borrow();
+    assert_eq!(got.len(), 1, "the msg after the failure still landed");
+    assert_eq!(got[0].def_id, "RATE_HIGH");
 }
 
 /// `DownlinkParams`' two optional subset lists project onto `TelemetryMode` as

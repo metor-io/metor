@@ -45,9 +45,20 @@
 //! # Connection lifecycle
 //!
 //! Both TCP transports connect lazily on first use, inside the async task that
-//! drives them, and neither reconnects. The first transport error ends the
-//! sender (or reader) while the in-cycle stage keeps running and drops.
+//! drives them, and both redial after an error: a failed connect or a dropped
+//! link is retried under exponential backoff ([`RECONNECT_MIN`] doubling to
+//! [`RECONNECT_MAX`]), so a ground endpoint that is down at boot or restarts
+//! mid-mission picks the stream back up on its own. Each downlink connect
+//! replays every tap's announce before any batch, which is what lets a
+//! restarted consumer decode tables again; each uplink connect re-sends its
+//! subscriptions. Batches and inbound msgs that arrive while the link is down
+//! are dropped, never queued — loss on the link, no delay in the cycle. A
+//! dropped downlink connection is counted on the system's health as
+//! `link_reconnect`; an uplink receive error is counted as
+//! `uplink_disconnect`.
 
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 use std::time::Duration;
 
 use metor_fsw_ring::{NoWake, View};
@@ -73,8 +84,8 @@ use crate::system::{
     SystemOutput,
 };
 
-/// A failed send or receive on the link. The first error stops the task
-/// driving the transport, while the in-cycle stage keeps running and drops.
+/// A failed send or receive on the link. The task driving the transport
+/// backs off and redials, while the in-cycle stage keeps running and drops.
 #[derive(Debug, thiserror::Error)]
 pub enum TransportError {
     /// The link is not connected (never established, or dropped).
@@ -99,21 +110,23 @@ impl TransportError {
 #[allow(async_fn_in_trait)]
 pub trait Transport {
     /// Announce one tap's schema, a `VTableMsg` followed by one
-    /// `SetComponentMetadata` per component. Sent once per tap on connect.
+    /// `SetComponentMetadata` per component. Sent once per tap on every
+    /// connect — the sender replays the full announce set after a redial.
     async fn announce(
         &mut self,
         msg: &VTableMsg,
         meta: &[ComponentMetadata],
     ) -> Result<(), TransportError>;
 
-    /// Send one batch of concatenated length-prefixed packets, returning the
-    /// buffer so its allocation can be reused for a later batch.
-    async fn send(&mut self, buf: Vec<u8>) -> Result<Vec<u8>, TransportError>;
+    /// Send one batch of concatenated length-prefixed packets. The buffer is
+    /// returned alongside the result — on failure too — so its allocation can
+    /// be recycled for a later batch either way.
+    async fn send(&mut self, buf: Vec<u8>) -> (Result<(), TransportError>, Vec<u8>);
 }
 
 /// The read twin of [`Transport`]: yields the next inbound packet off the
-/// connection. Like the sender, a reader stops on its first error; there is no
-/// reconnect.
+/// connection. An error must leave the transport ready to redial — the uplink
+/// backs off and calls `recv` again rather than going dead.
 #[allow(async_fn_in_trait)]
 pub trait RecvTransport {
     /// Receive the next packet, reading into `buf`, or an error if the link
@@ -136,7 +149,7 @@ struct TcpConn {
 }
 
 /// A [`Transport`] that streams packets over one TCP connection to a ground
-/// endpoint. On the first error the sender stops; there is no reconnect.
+/// endpoint. An error drops the connection, and the next call redials.
 pub struct TcpTransport {
     addr: std::net::SocketAddr,
     conn: Option<TcpConn>,
@@ -160,10 +173,10 @@ impl TcpTransport {
         }
         Ok(&self.conn.as_ref().expect("just connected").tx)
     }
-}
 
-impl Transport for TcpTransport {
-    async fn announce(
+    /// [`announce`](Transport::announce)'s writes, without the on-error
+    /// connection drop the trait method wraps around them.
+    async fn try_announce(
         &mut self,
         msg: &VTableMsg,
         meta: &[ComponentMetadata],
@@ -183,12 +196,36 @@ impl Transport for TcpTransport {
         }
         Ok(())
     }
+}
 
-    async fn send(&mut self, buf: Vec<u8>) -> Result<Vec<u8>, TransportError> {
-        let tx = self.ensure().await?;
+impl Transport for TcpTransport {
+    async fn announce(
+        &mut self,
+        msg: &VTableMsg,
+        meta: &[ComponentMetadata],
+    ) -> Result<(), TransportError> {
+        let res = self.try_announce(msg, meta).await;
+        // A failed write leaves the socket in an unknown state; drop it so
+        // the next call redials.
+        if res.is_err() {
+            self.conn = None;
+        }
+        res
+    }
+
+    async fn send(&mut self, buf: Vec<u8>) -> (Result<(), TransportError>, Vec<u8>) {
+        let tx = match self.ensure().await {
+            Ok(tx) => tx,
+            Err(e) => return (Err(e), buf),
+        };
         let (res, buf) = tx.write_all(buf).await;
-        res.map_err(TransportError::io)?;
-        Ok(buf)
+        match res {
+            Ok(()) => (Ok(()), buf),
+            Err(e) => {
+                self.conn = None;
+                (Err(TransportError::io(e)), buf)
+            }
+        }
     }
 }
 
@@ -198,8 +235,8 @@ impl Transport for TcpTransport {
 /// message id only to clients that
 /// sent a [`MsgStream`] for it, so without the subscription the uplink would
 /// read nothing. The write half carries the subscription and is held for the
-/// connection's lifetime; the read half yields the streamed msgs. A dropped
-/// socket fails `recv` and ends the reader; there is no reconnect.
+/// connection's lifetime; the read half yields the streamed msgs. An error
+/// drops the connection, and the next `recv` redials and re-subscribes.
 pub struct TcpRecvTransport {
     addr: std::net::SocketAddr,
     stream: Option<PacketStream<OwnedReader<TcpStream>>>,
@@ -253,8 +290,18 @@ impl TcpRecvTransport {
 
 impl RecvTransport for TcpRecvTransport {
     async fn recv(&mut self, buf: Vec<u8>) -> Result<OwnedPacket<Slice<Vec<u8>>>, TransportError> {
-        let stream = self.ensure().await?;
-        stream.next_grow(buf).await.map_err(TransportError::io)
+        let res = match self.ensure().await {
+            Ok(stream) => stream.next_grow(buf).await.map_err(TransportError::io),
+            Err(e) => Err(e),
+        };
+        // A failed connect or read leaves the socket in an unknown state;
+        // drop both halves so the next call redials (and re-subscribes,
+        // since `ensure` sends the retained subscription set on connect).
+        if res.is_err() {
+            self.stream = None;
+            self.sink = None;
+        }
+        res
     }
 
     fn subscribe(&mut self, ids: &[PacketId]) {
@@ -403,10 +450,15 @@ impl BuildSystem for UplinkSystem<TcpRecvTransport> {
 /// downlink's steady-state allocation.
 const BATCH_QUEUE_CAP: usize = 8;
 
-/// How long one [`UplinkSystem::run`] pass sleeps once its link has dropped,
-/// so the async-run loop does not busy-spin a dead reader (teardown cancels
-/// the task regardless).
-const UPLINK_IDLE: Duration = Duration::from_millis(50);
+/// The first redial delay after a transport error, doubling per consecutive
+/// failure up to [`RECONNECT_MAX`] and resetting on success. Shared by the
+/// downlink sender and the uplink reader.
+const RECONNECT_MIN: Duration = Duration::from_millis(100);
+
+/// The redial backoff cap: with the link down, a redial is attempted this
+/// often, forever — the link recovers on its own whenever the far end comes
+/// back.
+const RECONNECT_MAX: Duration = Duration::from_secs(5);
 
 /// The initial size of the uplink's recycled receive buffer. `recv` grows it
 /// past this when a packet demands, and the grown buffer is what recycles, so
@@ -484,8 +536,12 @@ impl BindPorts for UplinkIn {
 /// consumer's own drain to decode (and discard garbage) exactly as on any
 /// other message edge.
 pub struct UplinkSystem<R: RecvTransport> {
-    /// The read transport, taken to `None` on the first error; no reconnect.
-    recv: Option<R>,
+    /// The read transport. A receive error is backed off and retried — the
+    /// transport redials underneath — so the uplink survives a dropped link.
+    recv: R,
+    /// The current redial delay, doubling per consecutive receive error up to
+    /// [`RECONNECT_MAX`] and resetting to [`RECONNECT_MIN`] on success.
+    backoff: Duration,
     /// The receive buffer, lent to `recv` and recovered from each returned
     /// packet, so the link's whole lifetime reuses one allocation.
     recv_buf: Vec<u8>,
@@ -507,7 +563,8 @@ impl<R: RecvTransport> UplinkSystem<R> {
     /// params.
     pub fn new(recv: R) -> Self {
         Self {
-            recv: Some(recv),
+            recv,
+            backoff: RECONNECT_MIN,
             recv_buf: vec![0u8; UPLINK_RECV_BUF],
             subscribed: false,
             msgs: Vec::new(),
@@ -552,9 +609,9 @@ impl<R: RecvTransport + 'static> AsyncSystem for UplinkSystem<R> {
     /// buffer from the packet for the next pass. A msg outside the configured
     /// set bumps `uplink_unroutable` (the broker should only relay subscribed
     /// ids, so this signals a broker or config mismatch), a full ring bumps
-    /// `uplink_dropped`, and `Table` packets are silently ignored. The first
-    /// error drops the link for good, and later passes idle instead of
-    /// spinning.
+    /// `uplink_dropped`, and `Table` packets are silently ignored. A receive
+    /// error bumps `uplink_disconnect` and backs the pass off; the transport
+    /// redials on the next receive, so a dropped link recovers on its own.
     async fn run(&mut self, _input: &mut Self::Input, output: &mut Self::Output) {
         // Subscribe once, before the first read, to exactly the configured ids.
         if !self.subscribed {
@@ -576,17 +633,12 @@ impl<R: RecvTransport + 'static> AsyncSystem for UplinkSystem<R> {
                 health.end_cycle(Timestamp::now(), 0);
             }
             let ids: Vec<PacketId> = self.msgs.iter().map(|&(_, id)| id).collect();
-            if let Some(recv) = self.recv.as_mut() {
-                recv.subscribe(&ids);
-            }
+            self.recv.subscribe(&ids);
             self.subscribed = true;
         }
-        let Some(recv) = self.recv.as_mut() else {
-            stellarator::sleep(UPLINK_IDLE).await;
-            return;
-        };
-        match recv.recv(std::mem::take(&mut self.recv_buf)).await {
+        match self.recv.recv(std::mem::take(&mut self.recv_buf)).await {
             Ok(pkt) => {
+                self.backoff = RECONNECT_MIN;
                 // Msgs are routed; tables are ignored (the uplink is commands
                 // only). Either way the packet's backing buffer is recovered
                 // for the next receive.
@@ -607,9 +659,16 @@ impl<R: RecvTransport + 'static> AsyncSystem for UplinkSystem<R> {
                 }
                 self.recv_buf = pkt.into_buf().into_inner();
             }
-            // A dropped link (or an exhausted mock) ends the reader, like the
-            // sender.
-            Err(_) => self.recv = None,
+            // A dropped link: count it, back off, and let the next pass
+            // redial. An async system has no per-cycle driver flushing its
+            // health, so publish immediately.
+            Err(_) => {
+                let (_, health) = output.split();
+                health.error("uplink_disconnect");
+                health.end_cycle(Timestamp::now(), 0);
+                stellarator::sleep(self.backoff).await;
+                self.backoff = (self.backoff * 2).min(RECONNECT_MAX);
+            }
         }
     }
 }
@@ -622,33 +681,63 @@ struct Announce {
     metadata: Vec<ComponentMetadata>,
 }
 
-/// The async sender task: announce every table tap once, then send each
-/// queued batch until a transport error or a closed channel ends it. The
-/// cycle side is unaffected either way. A sent batch's buffer goes back into
-/// its channel slot, so the allocation is recycled instead of freed.
+/// The async sender task: announce every table tap, then send each queued
+/// batch until the closed channel ends it (shutdown). A transport error
+/// drops one batch, backs off, and re-enters the announce phase — replaying
+/// the announces is what lets a restarted consumer decode tables again. The
+/// cycle side is unaffected throughout: while the sender backs off, the
+/// queue fills and the cycle side counts `telemetry_dropped`. A sent batch's
+/// buffer goes back into its channel slot, so the allocation is recycled
+/// instead of freed.
+///
+/// `drops` counts each established-connection loss (never the retries while
+/// already down); the cycle side folds it into health as `link_reconnect`.
 async fn run_sender<T: Transport>(
     mut transport: T,
     announces: Vec<Announce>,
     rx: mpsc::Receiver<Vec<u8>>,
+    drops: Arc<AtomicU64>,
 ) {
-    for a in &announces {
-        let msg = VTableMsg {
-            id: a.packet_id,
-            vtable: a.vtable.clone(),
-        };
-        if transport.announce(&msg, &a.metadata).await.is_err() {
-            return;
+    let mut backoff = RECONNECT_MIN;
+    let mut was_up = false;
+    'link: loop {
+        for a in &announces {
+            let msg = VTableMsg {
+                id: a.packet_id,
+                vtable: a.vtable.clone(),
+            };
+            if transport.announce(&msg, &a.metadata).await.is_err() {
+                back_off(&drops, &mut was_up, &mut backoff).await;
+                continue 'link;
+            }
         }
-    }
-    // `recv_ref` parks until a batch is queued and returns `None` once the
-    // cycle side has dropped its sender and the queue is drained (shutdown).
-    while let Some(mut slot) = rx.recv_ref().await {
-        let batch = std::mem::take(&mut *slot);
-        match transport.send(batch).await {
-            Ok(buf) => *slot = buf,
-            Err(_) => return,
+        was_up = true;
+        backoff = RECONNECT_MIN;
+        // `recv_ref` parks until a batch is queued and returns `None` once the
+        // cycle side has dropped its sender and the queue is drained (shutdown).
+        while let Some(mut slot) = rx.recv_ref().await {
+            let batch = std::mem::take(&mut *slot);
+            let (res, buf) = transport.send(batch).await;
+            *slot = buf;
+            if res.is_err() {
+                back_off(&drops, &mut was_up, &mut backoff).await;
+                continue 'link;
+            }
         }
+        return;
     }
+}
+
+/// One redial delay in [`run_sender`]'s loop: count the drop when it is the
+/// loss of an established connection (not a retry while already down), sleep
+/// the current backoff, and double it toward [`RECONNECT_MAX`].
+async fn back_off(drops: &AtomicU64, was_up: &mut bool, backoff: &mut Duration) {
+    if *was_up {
+        drops.fetch_add(1, Relaxed);
+        *was_up = false;
+    }
+    stellarator::sleep(*backoff).await;
+    *backoff = (*backoff * 2).min(RECONNECT_MAX);
 }
 
 /// The downlink's output bundle: no typed ports, just the [`AllOutputs`]
@@ -702,6 +791,9 @@ struct Started {
     /// The cycle side of the batch queue; taken by `shutdown` so the channel
     /// closes and the sender drains what is queued, then exits.
     tx: Option<mpsc::Sender<Vec<u8>>>,
+    /// Established-connection losses counted by the sender task, drained into
+    /// health as `link_reconnect` each cycle.
+    drops: Arc<AtomicU64>,
     /// Holds the sender task; dropping the guard cancels the task on teardown.
     /// `None` when the transport was already taken by an earlier `init`; the
     /// taps still drain.
@@ -727,9 +819,6 @@ pub struct TelemetrySystem<T: Transport> {
     taps: Vec<Tap>,
     /// The running state `init` assembles. `None` before `init`.
     started: Option<Started>,
-    /// The batch under construction this cycle. On hand-off it is swapped for
-    /// a recycled channel buffer, so the steady state allocates nothing.
-    scratch: Vec<u8>,
 }
 
 impl<T: Transport> TelemetrySystem<T> {
@@ -741,7 +830,6 @@ impl<T: Transport> TelemetrySystem<T> {
             mode: config.mode,
             taps: Vec::new(),
             started: None,
-            scratch: Vec::new(),
         }
     }
 }
@@ -814,13 +902,14 @@ impl<T: Transport + 'static> System for TelemetrySystem<T> {
         }
 
         let (tx, rx) = mpsc::channel::<Vec<u8>>(BATCH_QUEUE_CAP);
-        let sender = self
-            .transport
-            .take()
-            .map(|transport| stellarator::spawn(run_sender(transport, announces, rx)).drop_guard());
+        let drops = Arc::new(AtomicU64::new(0));
+        let sender = self.transport.take().map(|transport| {
+            stellarator::spawn(run_sender(transport, announces, rx, drops.clone())).drop_guard()
+        });
         self.taps = taps;
         self.started = Some(Started {
             tx: Some(tx),
+            drops,
             sender,
         });
     }
@@ -864,6 +953,10 @@ impl<T: Transport + 'static> CyclicSystem for TelemetrySystem<T> {
         let Some(started) = &self.started else {
             return;
         };
+        // Fold the sender's connection losses into this cycle's health.
+        for _ in 0..started.drops.swap(0, Relaxed) {
+            output.health().error("link_reconnect");
+        }
         let Some(tx) = &started.tx else {
             return;
         };
