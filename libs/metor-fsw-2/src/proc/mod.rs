@@ -30,7 +30,7 @@ pub use ctl::{CtlError, CtlHost, CtlWorker, StepOutcome, WorkerCmd, WorkerState}
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 pub use host::{ProcError, describe_via_worker};
 #[cfg(any(target_os = "linux", target_os = "macos"))]
-pub use worker::{WORKER_ENV, WorkerManifest, worker_entry};
+pub use worker::{RunMode, WORKER_ENV, WorkerManifest, worker_entry};
 
 /// On targets without process-system support the guard is a no-op, so an
 /// application's unconditional `worker_entry()` call stays portable.

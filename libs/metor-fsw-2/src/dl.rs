@@ -384,6 +384,50 @@ impl DlSlot {
         // Untrusted word from foreign code; see the module trust boundary note.
         FswStatus::from_raw(raw)
     }
+
+    /// One sequence-mode step for the worker's run loop: like
+    /// [`execute_raw`](Self::execute_raw), but terminal statuses are
+    /// **latched** — a later call re-serves the terminal without touching the
+    /// export. That makes poll-once a worker invariant: a `Ready` future is
+    /// never polled again, however long a skewed or buggy host keeps ringing
+    /// the doorbell.
+    ///
+    /// `Done` keeps the foreign state alive (the occupant holds its ring
+    /// roles until shutdown, exactly like an in-process `Done` occupant
+    /// holding its ports until `Reset`/`Load`/`Unload`); `Panicked` destroys
+    /// it immediately, the same policy as [`step`](CyclicSlot::step).
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    pub(crate) fn step_seq(&mut self, now: Timestamp) -> FswStatus {
+        // The latch is checked before anything else: no path reaches the
+        // execute export from a terminal state.
+        match self.slot_state {
+            SlotState::Done { .. } => return FswStatus::Done,
+            SlotState::Stopped { .. } => return FswStatus::Panicked,
+            _ if self.state.is_null() => return FswStatus::Panicked,
+            _ => {}
+        }
+        let status = self.execute_raw(now);
+        match status {
+            FswStatus::Running => {}
+            // The Completed/Aborted/Failed detail rides the occupant's own
+            // SequenceStatus frame, host-side; the latch needs only the
+            // terminal.
+            FswStatus::Done => self.slot_state = SlotState::Done { outcome: 0 },
+            FswStatus::Panicked => {
+                self.slot_state = SlotState::Stopped {
+                    reason: StopReason::Panicked,
+                };
+                // Destroy the foreign state now so its non-owning ports
+                // release their ring roles; nulling keeps `shutdown` and
+                // `Drop` as no-ops afterwards.
+                // SAFETY: `state` is the live pointer, handed to destroy
+                // exactly once.
+                unsafe { (self.destroy)(self.state) };
+                self.state = core::ptr::null_mut();
+            }
+        }
+        status
+    }
 }
 
 impl CyclicSlot for DlSlot {
@@ -465,6 +509,77 @@ impl Drop for DlSlot {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A `DlSlot` over stub exports, no artifact involved: `lib` is a handle
+    /// to this very process and `state` a dangling non-null the stubs never
+    /// dereference.
+    #[cfg(all(any(target_os = "linux", target_os = "macos"), not(miri)))]
+    fn stub_slot(execute: ExecuteFn, destroy: DestroyFn) -> DlSlot {
+        unsafe extern "C" fn bind(
+            _: *mut c_void,
+            _: *const FswRing,
+            _: usize,
+            _: *const FswRing,
+            _: usize,
+        ) {
+        }
+        unsafe extern "C" fn nop(_: *mut c_void) {}
+        DlSlot {
+            lib: Arc::new(libloading::os::unix::Library::this().into()),
+            bind_init: bind,
+            execute,
+            shutdown: nop,
+            destroy,
+            state: core::ptr::NonNull::<c_void>::dangling().as_ptr(),
+            inputs: Vec::new(),
+            outputs: Vec::new(),
+            name: "stub",
+            slot_state: SlotState::Running,
+        }
+    }
+
+    /// The poll-once guard: `step_seq` latches a terminal `Done` and
+    /// re-serves it without ever reaching the execute export again.
+    #[cfg(all(any(target_os = "linux", target_os = "macos"), not(miri)))]
+    #[test]
+    fn step_seq_latches_done() {
+        use core::sync::atomic::{AtomicU32, Ordering::Relaxed};
+        static POLLS: AtomicU32 = AtomicU32::new(0);
+        unsafe extern "C" fn exec(_: *mut c_void, _: u64) -> u32 {
+            POLLS.fetch_add(1, Relaxed);
+            FswStatus::Done as u32
+        }
+        unsafe extern "C" fn nop(_: *mut c_void) {}
+        let mut slot = stub_slot(exec, nop);
+        assert_eq!(slot.step_seq(Timestamp(1)), FswStatus::Done);
+        assert_eq!(slot.step_seq(Timestamp(2)), FswStatus::Done);
+        assert_eq!(POLLS.load(Relaxed), 1, "a Ready future is never re-polled");
+        assert!(matches!(slot.slot_state, SlotState::Done { .. }));
+    }
+
+    /// `Panicked` destroys the foreign state exactly once (releasing its
+    /// ring roles, the same policy as `step`) and is re-served from the
+    /// latch; the nulled state keeps `Drop` a no-op.
+    #[cfg(all(any(target_os = "linux", target_os = "macos"), not(miri)))]
+    #[test]
+    fn step_seq_panicked_destroys_once() {
+        use core::sync::atomic::{AtomicU32, Ordering::Relaxed};
+        static POLLS: AtomicU32 = AtomicU32::new(0);
+        static DESTROYS: AtomicU32 = AtomicU32::new(0);
+        unsafe extern "C" fn exec(_: *mut c_void, _: u64) -> u32 {
+            POLLS.fetch_add(1, Relaxed);
+            FswStatus::Panicked as u32
+        }
+        unsafe extern "C" fn destroy(_: *mut c_void) {
+            DESTROYS.fetch_add(1, Relaxed);
+        }
+        let mut slot = stub_slot(exec, destroy);
+        assert_eq!(slot.step_seq(Timestamp(1)), FswStatus::Panicked);
+        assert_eq!(slot.step_seq(Timestamp(2)), FswStatus::Panicked);
+        assert_eq!(POLLS.load(Relaxed), 1);
+        drop(slot);
+        assert_eq!(DESTROYS.load(Relaxed), 1, "destroyed at the panic, not at Drop");
+    }
 
     /// A descriptor declaring a host capability is a clean load rejection,
     /// never a bind-time panic; an empty list (every real export) passes.

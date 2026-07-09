@@ -15,7 +15,9 @@
 //!   artifact, and drive an ordinary [`DlSlot`](crate::dl) through the
 //!   [`ctl`](super::ctl) lifecycle — `fsw_create` at attach, `fsw_bind_init`
 //!   on the init request, one `fsw_execute` per doorbell, and
-//!   `fsw_shutdown`/`fsw_destroy` on the shutdown request.
+//!   `fsw_shutdown`/`fsw_destroy` on the shutdown request. A [`RunMode`] on
+//!   the manifest picks the step fold: `Cyclic` for a steady-state system,
+//!   `Sequence` for a process slot's occupant.
 //!
 //! Everything downstream of the manifest reuses the dl machinery verbatim:
 //! the ring files attach as regions, regions become positional
@@ -52,6 +54,8 @@ pub enum WorkerManifest {
         /// The host's [`FSW_ABI_VERSION`]; a mismatched worker build fails
         /// cleanly before touching the artifact.
         abi_version: u32,
+        /// How the step loop folds the system's status (see [`RunMode`]).
+        mode: RunMode,
         /// The instance name (health/status identity inside the `.so`).
         instance: String,
         /// The system cdylib to load.
@@ -66,6 +70,22 @@ pub enum WorkerManifest {
         /// Output ring files, in descriptor order, this system's own.
         outputs: Vec<PathBuf>,
     },
+}
+
+/// How a run worker's step loop drives its system, selected by the manifest.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum RunMode {
+    /// A steady-state cyclic system: each doorbell is one
+    /// [`DlSlot::step`](crate::coordinator::CyclicSlot::step), and a stray
+    /// `Done` folds to keep-running exactly as it would in-process.
+    Cyclic,
+    /// A process slot's sequence occupant: each doorbell is one
+    /// [`DlSlot::step_seq`](crate::dl), whose raw status
+    /// (`Running`/`Done`/`Panicked`) crosses the ack verbatim so the
+    /// host-side runner can refine the terminal. `Done` is latched
+    /// worker-side — a `Ready` future is never polled again, whatever the
+    /// host rings.
+    Sequence,
 }
 
 /// Worker failure codes, latched via [`CtlWorker::fail`] so the host's
@@ -114,6 +134,7 @@ fn run_worker(manifest_path: &Path) -> i32 {
         WorkerManifest::Describe { artifact, out } => run_describe(&artifact, &out),
         WorkerManifest::Run {
             abi_version,
+            mode,
             instance,
             artifact,
             params,
@@ -122,6 +143,7 @@ fn run_worker(manifest_path: &Path) -> i32 {
             outputs,
         } => run_system(
             abi_version,
+            mode,
             instance,
             &artifact,
             &params,
@@ -157,8 +179,10 @@ fn run_describe(artifact: &Path, out: &Path) -> i32 {
 
 /// Run mode: attach everything, then drive the slot through the control
 /// block's lifecycle.
+#[allow(clippy::too_many_arguments)]
 fn run_system(
     abi_version: u32,
+    mode: RunMode,
     instance: String,
     artifact: &Path,
     params: &[u8],
@@ -250,16 +274,25 @@ fn run_system(
 
         let mut last = 0u32;
         while let WorkerCmd::Step { seq, now } = ctl.next(last) {
-            // `DlSlot::step` already implements the panic policy: a caught
-            // panic destroys the foreign state (releasing its ring roles)
-            // and latches the stopped slot state, and further steps
-            // early-return. The worker keeps serving (Panicked) acks until
-            // told to shut down, so teardown stays symmetric with the
-            // healthy path.
-            slot.step(now);
-            let status = match slot.state().stop_reason() {
-                Some(StopReason::Panicked) => FswStatus::Panicked,
-                _ => FswStatus::Running,
+            // Both modes implement the panic policy inside the slot: a caught
+            // panic destroys the foreign state (releasing its ring roles) and
+            // latches the stopped slot state, and further steps early-return.
+            // The worker keeps serving terminal acks until told to shut down,
+            // so teardown stays symmetric with the healthy path — a `Done`
+            // occupant likewise holds its ring roles until shutdown, and
+            // `step_seq`'s latch guarantees its `Ready` future is never
+            // polled again however long the host keeps ringing.
+            let status = match mode {
+                RunMode::Cyclic => {
+                    slot.step(now);
+                    match slot.state().stop_reason() {
+                        Some(StopReason::Panicked) => FswStatus::Panicked,
+                        _ => FswStatus::Running,
+                    }
+                }
+                // The raw status crosses the ack verbatim; the host-side
+                // runner refines `Done` with the occupant's own outcome.
+                RunMode::Sequence => slot.step_seq(now),
             };
             ctl.done(seq, status);
             last = seq;
@@ -277,7 +310,8 @@ fn run_system(
 mod tests {
     use super::*;
 
-    /// The manifest round-trips through postcard, both modes.
+    /// The manifest round-trips through postcard: describe, and a run in
+    /// each [`RunMode`].
     #[test]
     fn manifest_roundtrip() {
         for m in [
@@ -287,12 +321,23 @@ mod tests {
             },
             WorkerManifest::Run {
                 abi_version: FSW_ABI_VERSION,
+                mode: RunMode::Cyclic,
                 instance: "imu".into(),
                 artifact: PathBuf::from("/a/lib.dylib"),
                 params: vec![1, 2, 3],
                 ctl: PathBuf::from("/run/imu.ctl"),
                 inputs: vec![PathBuf::from("/run/a.ring")],
                 outputs: vec![PathBuf::from("/run/b.ring"), PathBuf::from("/run/c.ring")],
+            },
+            WorkerManifest::Run {
+                abi_version: FSW_ABI_VERSION,
+                mode: RunMode::Sequence,
+                instance: "adcs.commissioning".into(),
+                artifact: PathBuf::from("/a/seq.dylib"),
+                params: Vec::new(),
+                ctl: PathBuf::from("/run/adcs.ctl"),
+                inputs: vec![PathBuf::from("/run/a.ring"), PathBuf::from("/run/d.ring")],
+                outputs: vec![PathBuf::from("/run/e.ring")],
             },
         ] {
             let bytes = postcard::to_allocvec(&m).unwrap();
