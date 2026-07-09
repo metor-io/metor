@@ -1255,6 +1255,7 @@ impl CoordinatorBuilder {
                 initial,
                 n_occ_inputs,
                 n_occ_outputs,
+                process: false,
             }),
         )
     }
@@ -1668,17 +1669,27 @@ impl CoordinatorBuilder {
 
     /// Which output buffers cross a process boundary and must therefore be
     /// file-backed: every output of a process system, plus every output some
-    /// process system consumes over an edge. Everything else stays heap.
+    /// process system consumes over an edge. A process slot crosses only its
+    /// occupant *prefix* — the occupant's outputs and its Edge inputs'
+    /// producers — because the runner tail (the `commands` fan-in, the
+    /// self-tap, the status/events outputs) never leaves the coordinator.
+    /// Everything else stays heap.
     fn shared_outputs(&self, cons_edges: &ConsEdges) -> HashSet<(usize, usize)> {
         let mut shared = HashSet::new();
         for (sid, sys) in self.systems.iter().enumerate() {
-            if !matches!(sys.reg, Reg::Proc(_)) {
-                continue;
-            }
-            for out_idx in 0..sys.desc.outputs.len() {
+            // How much of the port lists a worker touches: all of a process
+            // system's, the occupant prefix of a process slot's.
+            let (n_outputs, n_inputs) = match &sys.reg {
+                Reg::Proc(_) => (sys.desc.outputs.len(), sys.desc.inputs.len()),
+                Reg::Slot(slot_reg) if slot_reg.process => {
+                    (slot_reg.n_occ_outputs, slot_reg.n_occ_inputs)
+                }
+                _ => continue,
+            };
+            for out_idx in 0..n_outputs {
                 shared.insert((sid, out_idx));
             }
-            for in_idx in 0..sys.desc.inputs.len() {
+            for in_idx in 0..n_inputs {
                 if let Some(producers) = cons_edges.get(&(sid, in_idx)) {
                     shared.extend(producers.iter().copied());
                 }
@@ -1716,10 +1727,13 @@ impl CoordinatorBuilder {
             .count();
         let shared = self.shared_outputs(cons_edges);
 
-        // A graph with any process system gets its session directory up
-        // front: even a (pathological) portless worker still needs somewhere
-        // for its control block and manifest.
-        let session = if self.systems.iter().any(|s| matches!(s.reg, Reg::Proc(_))) {
+        // A graph with any process system or process slot gets its session
+        // directory up front: even a (pathological) portless worker still
+        // needs somewhere for its control block and manifest.
+        let needs_session = |reg: &Reg| {
+            matches!(reg, Reg::Proc(_)) || matches!(reg, Reg::Slot(slot_reg) if slot_reg.process)
+        };
+        let session = if self.systems.iter().any(|s| needs_session(&s.reg)) {
             Some(
                 SessionDir::create(self.shm_dir.as_deref()).map_err(|e| WireError::Shm {
                     detail: e.to_string(),
@@ -1735,6 +1749,7 @@ impl CoordinatorBuilder {
             reg_entries: Vec::new(),
             session,
             ring_paths: HashMap::new(),
+            host_input_paths: HashMap::new(),
         };
 
         // --- One buffer per output port -----------------------------------
@@ -1810,7 +1825,21 @@ impl CoordinatorBuilder {
                 if port.conn != PortConn::Host {
                     continue;
                 }
-                let ring = alloc_ring(port.delivery, port.max_size, depth, 1 + slack);
+                // A process slot's control ring is the one Host-connected
+                // input that crosses outward: the writer stays host-side (the
+                // runner's cancel `Output`) while the occupant's read `View`
+                // attaches in the worker, so it is file-backed like a crossing
+                // output, path recorded for the worker manifests.
+                let ring = if matches!(&sys.reg, Reg::Slot(slot_reg) if slot_reg.process) {
+                    let session = alloc.session.as_ref().expect("proc graphs have a session");
+                    let path = session.path().join(format!("{}.{}.ring", sys.name, port.name));
+                    let ring =
+                        alloc_ring_at(&path, port.delivery, port.max_size, depth, 1 + slack)?;
+                    alloc.host_input_paths.insert((sid, in_idx), path);
+                    ring
+                } else {
+                    alloc_ring(port.delivery, port.max_size, depth, 1 + slack)
+                };
                 alloc.table.rings.push(RingEntry {
                     ring: ring.clone(),
                     frame_id: port
@@ -1934,6 +1963,11 @@ struct RingAlloc {
     /// The ring file behind each file-backed output buffer, for the worker
     /// manifests (`(system, out_idx)` → path).
     ring_paths: HashMap<(usize, usize), PathBuf>,
+    /// The ring file behind each file-backed host-connected input (a process
+    /// slot's control ring), for the worker manifests, keyed like
+    /// `host_input_rings`.
+    #[allow(dead_code)]
+    host_input_paths: HashMap<(usize, usize), PathBuf>,
 }
 
 /// The copy-in planning product: each async snapshot input's private ring plus
@@ -2288,6 +2322,7 @@ fn bind_slot(
         initial,
         n_occ_inputs,
         n_occ_outputs,
+        ..
     } = slot_reg;
     let output_rings = &alloc.output_rings;
     // The prefix/tail invariant: the occupant's ports are the prefix of each
