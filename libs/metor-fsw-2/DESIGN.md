@@ -376,7 +376,10 @@ tap scratch buffers) and pushes it into a bounded, per-tap-coalescing hand-off; 
 sender task drains it and does the awaiting I/O. The cycle never blocks on the link: a
 backed-up transport just causes newer snapshots to overwrite un-sent ones in the hand-off
 (latest-wins), bumping a `telemetry_dropped` health counter — loss on the downlink, never
-delay in the cycle. The transport is pluggable behind the `Transport` trait;
+delay in the cycle. A dropped (or never-established) connection redials under exponential
+backoff and replays every VTable announce on each connect, so a restarted ground endpoint
+picks the stream back up on its own; the uplink re-subscribes the same way. The transport is
+pluggable behind the `Transport` trait;
 `TcpTransport` is the shipped implementation (a stream to a ground link or co-located metor-db),
 with a shared-memory queue a natural future alternative. The bytes on the wire are identical
 either way, and a consumer needs only the announced VTables to parse them. See
@@ -470,8 +473,6 @@ place rather than scattered through the prose:
   reclaimed either way, so the rest of the graph keeps flowing.
 - **Per-system rates.** Every cyclic system runs every cycle; there is no rate division beyond
   the single global cycle rate (a system can still self-pace by running async).
-- **Automatic transport reconnect.** The TCP downlink connects once and stops downlinking on
-  disconnect; reconnect/backoff is future work.
 - **Shared uplink+downlink connection.** The uplink and downlink each open their own connection.
   A connection is an owned OS resource the system/ring model cannot split into independent handles
   the way it distributes ring views, so sharing one socket across two systems needs a "shared owned

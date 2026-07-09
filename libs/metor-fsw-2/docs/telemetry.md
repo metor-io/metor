@@ -285,11 +285,14 @@ HandOff
 
 ### Sender task (`run_sender`)
 
-`stellarator::spawn`ed at `init`. It first announces every tap once (§5); if any announce fails it
-exits. Then it loops: if the stop flag is set it returns; otherwise it drains the hand-off and sends
-each packet via `Transport::send`. When the hand-off is empty it parks on the wait queue until
-`pending` is set or stop is signalled. Any transport error stops downlinking — the task returns and
-the cycle is unaffected.
+`stellarator::spawn`ed at `init`. It announces every tap (§5), then loops: drain the batch queue and
+send each batch via `Transport::send`; a closed, drained queue (shutdown) ends the task. Any
+transport error — a failed connect included — drops the batch in flight, backs off (100 ms doubling
+to a 5 s cap, reset on success), and re-enters the announce phase, so every connect starts with a
+full announce replay and a restarted consumer can decode tables again. The loss of an established
+connection is counted and folded into the system's health as `link_reconnect`; the cycle is
+unaffected throughout (while the sender backs off, the queue fills and the cycle side counts
+`telemetry_dropped`).
 
 ### Drop policy
 
@@ -380,8 +383,9 @@ pub trait Transport {
 }
 ```
 
-`TransportError` is either `Disconnected` or `Io(String)` (a rendered, transport-agnostic I/O error).
-Any error stops downlinking; the in-cycle snapshot stage keeps running and simply drops.
+`TransportError` is either `Disconnected` or `Io` (a boxed, transport-agnostic I/O error). An error
+sends the sender into its backoff/redial loop; the in-cycle snapshot stage keeps running and simply
+drops.
 
 **`TcpTransport`** is the shipping transport. It holds a `SocketAddr` and an optional `TcpConn`
 (`PacketSink<OwnedWriter<TcpStream>>` plus the read half, held only to keep the socket open — replies
@@ -393,8 +397,9 @@ are not read). It connects lazily on first use inside the async sender task — 
 The system is generic over `T: Transport`. The builder/loader supplies a `TcpTransport`; the unit
 tests drive a deterministic in-memory mock against the same trait.
 
-**Lifecycle.** Connect once. On disconnect the sender task returns and stops downlinking; the in-cycle
-snapshot stage keeps running and drops (its hand-off fills) so control is unaffected.
+**Lifecycle.** Connect lazily, redial forever. An error drops the `TcpConn`, so the next call
+reconnects; the sender's backoff paces the redials and replays the announces on each connect (§4).
+The in-cycle stage keeps running and drops while the link is down, so control is unaffected.
 
 ---
 
@@ -461,8 +466,6 @@ system "telemetry" type="TcpDownlink" addr="127.0.0.1:2240" {
 - **`bbq`/SHM transport.** `metor-proto/bbq` is a local shared-memory framed queue speaking the
   identical `LenPacket` format and would be a drop-in `Transport` for a co-located consumer. Only the
   TCP transport ships; the KDL loader accepts `transport "tcp"` only.
-- **Automatic reconnect/backoff.** The TCP transport connects once and stops downlinking on
-  disconnect.
 - **Runtime late attach.** Broad access is sized for the registry consumers known at `build()`; the
   rings have no crash-slot reclamation, so a consumer attaching at runtime has no reserved slot beyond
   the static `READER_SLACK` (§2.5).
