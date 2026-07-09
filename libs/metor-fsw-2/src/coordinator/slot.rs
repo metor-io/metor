@@ -47,8 +47,25 @@
 //! ring's only writer. Events are emitted per transition rather than derived
 //! from the latest status frame, because two commands can apply in a single
 //! drain and a snapshot would lose the first.
+//!
+//! # Process mode
+//!
+//! A slot whose occupants carry an [`OccupantBacking::Artifact`] runs them
+//! **out of process** (`docs/process-slots.md`): `Load` spawns a worker
+//! instead of calling `fsw_create` — one worker per occupant Load, driven
+//! through the ctl lifecycle and torn down by kill + reclaim, the process
+//! twin of the hard-drop — and the host never dlopens the occupant
+//! artifacts. Everything above the occupant seam (commands, events, status,
+//! the progress drain, the terminal fold) is the same code as in-process;
+//! what differs is the [`Occupant`] variant behind it and one extra phase,
+//! [`SlotState::Loading`], while the spawned worker's pipeline is polled
+//! forward once per cycle.
 
 use core::mem::offset_of;
+use std::path::PathBuf;
+use std::time::Duration;
+
+use metor_fsw_ring::RingBuffer;
 
 use metor_proto::types::Timestamp;
 use metor_proto_wkt::{
@@ -58,11 +75,16 @@ use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
 
 use metor_fsw_ring::NoWake;
 
-use super::{CyclicSlot, NAME_CAP, SlotState, StopReason, pack_name};
+use super::{CyclicSlot, NAME_CAP, ProcInfo, SlotState, StopReason, WorkerRunState, pack_name};
 use crate::abi::FswStatus;
+use crate::descriptor::SystemDescriptor;
 use crate::dl::{DlSlot, DlSystem};
 use crate::message::{MsgIn, MsgOut};
 use crate::port::{Input, Output};
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+use crate::proc::StepOutcome;
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+use crate::proc::host::{LoadPoll, SeqWorker};
 use crate::sequence::{PROGRESS_MSG_CAP, ProgressLine, SequenceStatus, SlotControlIn};
 
 /// Capacity of the occupant name field in [`SlotStatus`], the shared
@@ -83,7 +105,8 @@ pub const SLOT_NAME_CAP: usize = NAME_CAP;
 pub struct SlotStatus {
     #[metor_fsw(timestamp)]
     pub timestamp: Timestamp,
-    /// The current [`SlotState::code`] (Empty=0/Loaded=1/Running=2/Done=3/Stopped=4).
+    /// The current [`SlotState::code`]
+    /// (Empty=0/Loaded=1/Running=2/Done=3/Stopped=4/Loading=5).
     pub phase: u8,
     /// Used length of `occupant`, zero when no occupant is selected.
     pub occ_len: u8,
@@ -96,14 +119,40 @@ pub struct SlotStatus {
 // Allowed / initial occupants + the registration payload
 // ---------------------------------------------------------------------------
 
-/// A candidate library a slot is allowed to load, opened and validated at
-/// build time. `Load` selects it by `name`; `system` is the already opened
-/// library, whose backing stays loaded across swaps, and `params` is the
+/// Where an [`AllowedOccupant`]'s code lives and how `Load` reaches it.
+pub enum OccupantBacking {
+    /// An opened library in this process; `Load` runs `fsw_create` over the
+    /// handle, which stays loaded across swaps.
+    Dl(DlSystem),
+    /// A built cdylib the occupant's **worker process** opens
+    /// (`docs/process-slots.md`); the host keeps only the path and never
+    /// loads the artifact itself. Slots mix backings never: `add_slot`
+    /// requires the whole allowed set on one side of the seam.
+    Artifact(PathBuf),
+}
+
+/// A candidate occupant a slot is allowed to load, validated at build time.
+/// `Load` selects it by `name`; `descriptor` is the self-description the
+/// slot's contract was derived from and validated against (a dl open or a
+/// describe worker sourced it, per the backing), and `params` is the
 /// postcard blob `fsw_create` decodes.
 pub struct AllowedOccupant {
     pub name: String,
-    pub system: DlSystem,
     pub params: Vec<u8>,
+    pub descriptor: SystemDescriptor,
+    pub backing: OccupantBacking,
+}
+
+impl AllowedOccupant {
+    /// An in-process occupant over an opened library.
+    pub fn dl(name: impl Into<String>, system: DlSystem, params: Vec<u8>) -> Self {
+        Self {
+            name: name.into(),
+            params,
+            descriptor: system.descriptor().clone(),
+            backing: OccupantBacking::Dl(system),
+        }
+    }
 }
 
 /// Names an [`AllowedOccupant`] to load at startup, so a slot comes up
@@ -160,6 +209,32 @@ pub(crate) struct SlotReg {
 // SlotRunner
 // ---------------------------------------------------------------------------
 
+/// The live occupant, one variant per backing: the dl occupant is a future
+/// polled in this process, the proc occupant a worker process driven over
+/// the ctl block. Dropping either releases everything it held — the dl
+/// occupant's `Drop` runs `fsw_destroy`, the worker's kills, reaps, and
+/// reclaims — so `None`-ing the field is the one teardown spelling for both.
+enum Occupant {
+    Dl(DlSlot),
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    Proc(SeqWorker),
+}
+
+/// The spawn ingredients a process slot keeps between Loads, gathered by the
+/// bind pass: one written manifest per allowed occupant (the rings are the
+/// slot's, so the manifests differ only in artifact and params), the shared
+/// ctl path and resolved worker executable, the host handles of every
+/// worker-attached ring (the reclaim set each worker's teardown sweeps), and
+/// the step deadline. Present exactly when the slot is process-mode.
+pub(crate) struct ProcParts {
+    /// Per-occupant manifests, indexed like the allowed set.
+    pub manifests: Vec<PathBuf>,
+    pub ctl_path: PathBuf,
+    pub exe: PathBuf,
+    pub rings: Vec<RingBuffer>,
+    pub step_timeout: Duration,
+}
+
 /// A slot runner drives one swappable position in the coordinator's schedule,
 /// creating, polling, and destroying occupants in response to runtime
 /// commands. It holds the per-port [`FswRing`](crate::abi::FswRing) templates,
@@ -204,8 +279,18 @@ pub(crate) struct SlotRunner {
     last_run_state: u8,
     /// The lifecycle state the coordinator reads through [`CyclicSlot::state`].
     state: SlotState,
-    /// The live occupant future, or `None` when empty or after a hard `Stop`.
-    slot: Option<DlSlot>,
+    /// The live occupant, or `None` when empty or after a hard `Stop`.
+    slot: Option<Occupant>,
+    /// The process-mode spawn ingredients; `None` for an in-process slot,
+    /// and the seam `proc_info` keys "is there a worker behind this slot" on.
+    proc: Option<ProcParts>,
+    /// Occupant-worker steps whose ack deadline lapsed with the worker still
+    /// alive, since the coordinator last drained them into its health.
+    timeouts: u64,
+    /// Unplanned worker deaths (pipeline failures included) over the slot's
+    /// life, telemetered in the worker list's `restarts` field: Loads are
+    /// commanded, deaths are the anomaly worth counting.
+    deaths: u32,
     /// Index of the live or last occupant in `allowed`, for `Reset` and
     /// status naming.
     selected: Option<usize>,
@@ -234,6 +319,7 @@ impl SlotRunner {
         events: MsgOut<SequenceChannelEvent>,
         seq_status: Input<SequenceStatus>,
         commands: MsgIn<SequenceCommand>,
+        proc: Option<ProcParts>,
     ) -> Self {
         Self {
             name,
@@ -249,6 +335,9 @@ impl SlotRunner {
             last_run_state: 0,
             state: SlotState::Empty,
             slot: None,
+            proc,
+            timeouts: 0,
+            deaths: 0,
             selected: None,
             last_now: Timestamp(0),
             cmd_scratch: Vec::new(),
@@ -256,24 +345,119 @@ impl SlotRunner {
         }
     }
 
-    /// Create the selected occupant over the ring templates and build its
-    /// future. The caller drops any previous occupant first.
+    /// Create the selected occupant behind the backing seam. The caller
+    /// drops any previous occupant first (for a worker that drop *is* the
+    /// kill/reap/reclaim, so the fresh occupant claims ring roles only after
+    /// the old ones were freed). The dl arm binds synchronously and lands
+    /// `Loaded`; the proc arm spawns the occupant's worker and lands
+    /// `Loading`, advanced one pipeline phase per step so a Load never
+    /// stalls the cycle loop. The `Loaded` event fires when the occupant is
+    /// actually bound — immediately here for dl, from the pipeline for proc.
     fn build_occupant(&mut self, idx: usize) {
         let occ = &self.allowed[idx];
-        // SAFETY: every template region is a coordinator-owned ring that
-        // outlives this runner (the coordinator drops runners before rings),
-        // and any previous occupant has already released its non-owning
-        // handles by dropping, so the roles are free to re-attach.
-        let mut slot = unsafe {
-            occ.system.make_slot(
-                &occ.params,
-                self.input_regions.clone(),
-                self.output_regions.clone(),
-                self.name,
-            )
+        match &occ.backing {
+            OccupantBacking::Dl(system) => {
+                // SAFETY: every template region is a coordinator-owned ring
+                // that outlives this runner (the coordinator drops runners
+                // before rings), and any previous occupant has already
+                // released its non-owning handles by dropping, so the roles
+                // are free to re-attach.
+                let mut slot = unsafe {
+                    system.make_slot(
+                        &occ.params,
+                        self.input_regions.clone(),
+                        self.output_regions.clone(),
+                        self.name,
+                    )
+                };
+                slot.init();
+                self.slot = Some(Occupant::Dl(slot));
+                self.state = SlotState::Loaded;
+                let name = self.allowed[idx].name.clone();
+                self.emit_event(SequenceEventKind::Loaded { name });
+            }
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
+            OccupantBacking::Artifact(_) => {
+                let parts = self.proc.as_ref().expect("a process slot binds its ProcParts");
+                match SeqWorker::spawn(
+                    &parts.exe,
+                    &parts.ctl_path,
+                    &parts.manifests[idx],
+                    parts.rings.clone(),
+                    parts.step_timeout,
+                ) {
+                    Ok(worker) => {
+                        self.slot = Some(Occupant::Proc(worker));
+                        self.state = SlotState::Loading;
+                    }
+                    Err(detail) => self.fail_occupant(format!("worker spawn failed: {detail}")),
+                }
+            }
+            #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+            OccupantBacking::Artifact(_) => {
+                unreachable!("build() rejects process slots on targets without a shared futex")
+            }
+        }
+    }
+
+    /// A worker failed the slot — mid-pipeline or mid-run: land the terminal
+    /// stop and tell the operator why. No auto-restart, deliberately:
+    /// re-running a sequence silently re-issues every command it already
+    /// sent, a mission-level decision, so recovery stays with the operator's
+    /// existing `Reset`/`Load`.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    fn fail_occupant(&mut self, reason: String) {
+        self.slot = None;
+        self.deaths += 1;
+        self.state = SlotState::Stopped {
+            reason: StopReason::ProcessDied,
         };
-        slot.init();
-        self.slot = Some(slot);
+        self.emit_event(SequenceEventKind::Failed { reason });
+    }
+
+    /// The load pipeline completed: the occupant is bound, which is exactly
+    /// what `Loaded` (and its event) mean in-process.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    fn occupant_bound(&mut self) {
+        self.state = SlotState::Loaded;
+        let idx = self.selected.expect("a loading slot has a selection");
+        let name = self.allowed[idx].name.clone();
+        self.emit_event(SequenceEventKind::Loaded { name });
+    }
+
+    /// Advance a proc occupant's load pipeline one phase per cycle. A
+    /// pipeline failure is the slot's terminal stop, named stage and all.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    fn poll_loading(&mut self) {
+        if !matches!(self.state, SlotState::Loading) {
+            return;
+        }
+        let Some(Occupant::Proc(worker)) = self.slot.as_mut() else {
+            return;
+        };
+        match worker.poll_load() {
+            LoadPoll::Pending => {}
+            LoadPoll::Ready => self.occupant_bound(),
+            LoadPoll::Failed { stage } => self.fail_occupant(format!("worker {stage} failed")),
+        }
+    }
+
+    /// Block out a proc occupant's initial load inside the coordinator's
+    /// init barrier — init is not cycle time, and `initial state="running"`
+    /// needs the occupant `Loaded` before its `Start` can apply. A failure
+    /// folds exactly as the polled pipeline's would.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    fn finish_initial_load(&mut self) {
+        if !matches!(self.state, SlotState::Loading) {
+            return;
+        }
+        let Some(Occupant::Proc(worker)) = self.slot.as_mut() else {
+            return;
+        };
+        match worker.wait_ready() {
+            Ok(()) => self.occupant_bound(),
+            Err(stage) => self.fail_occupant(format!("worker {stage} failed")),
+        }
     }
 
     /// Emit a [`SequenceChannelEvent`] tagged with this slot's instance name.
@@ -324,14 +508,12 @@ impl SlotRunner {
             self.emit_event(SequenceEventKind::Failed { reason });
             return;
         };
-        // Drop any terminal occupant's state before reusing the rings.
+        // Drop any terminal occupant's state before reusing the rings (for a
+        // proc occupant, that drop kills and reclaims its worker first).
         self.slot = None;
-        self.build_occupant(idx);
         self.selected = Some(idx);
-        self.state = SlotState::Loaded;
         self.last_run_state = 0;
-        let name = self.allowed[idx].name.clone();
-        self.emit_event(SequenceEventKind::Loaded { name });
+        self.build_occupant(idx);
     }
 
     /// Begin polling. Only a loaded slot with a live future starts.
@@ -342,9 +524,10 @@ impl SlotRunner {
         }
     }
 
-    /// Hard-drop the occupant's future (its `Drop` runs `fsw_destroy`,
-    /// releasing the ring roles), leaving the slot loaded with no live
-    /// future. Only a `Reset` can run it again.
+    /// Hard-drop the occupant (a dl occupant's `Drop` runs `fsw_destroy`,
+    /// releasing the ring roles; a proc occupant's kills and reclaims its
+    /// worker — a sequence has nothing graceful to lose), leaving the slot
+    /// loaded with nothing live behind it. Only a `Reset` can run it again.
     fn do_stop(&mut self) {
         if matches!(self.state, SlotState::Running) {
             self.slot = None;
@@ -376,12 +559,10 @@ impl SlotRunner {
             return; // stop a running occupant before resetting it
         }
         self.slot = None;
-        self.build_occupant(idx);
-        self.state = SlotState::Loaded;
         self.last_run_state = 0;
-        // Reset re-arms to idle, so observers see the channel back at Loaded.
-        let name = self.allowed[idx].name.clone();
-        self.emit_event(SequenceEventKind::Loaded { name });
+        // Reset re-arms to idle, so observers see the channel back at Loaded
+        // (a proc occupant re-announces it when its fresh pipeline binds).
+        self.build_occupant(idx);
     }
 
     /// Drain every occupant [`SequenceStatus`] record published since the
@@ -424,6 +605,43 @@ impl SlotRunner {
         self.emit_event(kind);
     }
 
+    /// Fold one polled status word into the slot state — the shared tail of
+    /// both backings' step. Drains what the occupant just published before
+    /// folding the terminal event, so observers see the final Progress lines
+    /// ahead of the Completed/Aborted/Failed derived from them.
+    fn fold_status(&mut self, st: FswStatus) {
+        self.drain_progress();
+        self.state = match st {
+            FswStatus::Running => SlotState::Running,
+            // The raw status word carries no outcome detail; refine the
+            // terminal Done from the run_state latched out of the occupant's
+            // status frames. A Done proc occupant's worker stays up, holding
+            // its ring roles until Reset/Load/Unload like an in-process one.
+            FswStatus::Done => {
+                self.emit_terminal_done();
+                SlotState::Done {
+                    outcome: self.last_run_state,
+                }
+            }
+            FswStatus::Panicked => {
+                // A proc occupant's worker already quarantined the panic
+                // (the foreign state was destroyed on its side, freeing its
+                // ring roles); end the worker too rather than stepping a
+                // corpse until Unload.
+                #[cfg(any(target_os = "linux", target_os = "macos"))]
+                if matches!(self.slot, Some(Occupant::Proc(_))) {
+                    self.slot = None;
+                }
+                self.emit_event(SequenceEventKind::Failed {
+                    reason: "panicked".to_string(),
+                });
+                SlotState::Stopped {
+                    reason: StopReason::Panicked,
+                }
+            }
+        };
+    }
+
     /// Publish the host-side [`SlotStatus`] frame.
     fn publish_status(&mut self, now: Timestamp) {
         let (occupant, occ_len) = match self.selected {
@@ -445,6 +663,10 @@ impl CyclicSlot for SlotRunner {
     fn init(&mut self) {
         if let Some(initial) = self.initial.take() {
             self.do_load(&initial.occupant);
+            // A proc occupant's pipeline completes inside the init barrier,
+            // so the `start` below finds it Loaded before the first cycle.
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
+            self.finish_initial_load();
             if initial.start {
                 self.do_start();
             }
@@ -464,39 +686,52 @@ impl CyclicSlot for SlotRunner {
         }
         cmds.clear();
         self.cmd_scratch = cmds;
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        self.poll_loading();
         self.publish_status(now);
-        if matches!(self.state, SlotState::Running)
-            && let Some(slot) = self.slot.as_mut()
-        {
-            let st = slot.execute_raw(now);
-            // Drain what the occupant just published before folding the
-            // terminal event, so observers see the final Progress lines ahead
-            // of the Completed/Aborted/Failed derived below.
-            self.drain_progress();
-            self.state = match st {
-                FswStatus::Running => SlotState::Running,
-                // The raw status word carries no outcome detail; refine the
-                // terminal Done from the run_state latched out of the
-                // occupant's status frames.
-                FswStatus::Done => {
-                    self.emit_terminal_done();
-                    SlotState::Done {
-                        outcome: self.last_run_state,
+        if matches!(self.state, SlotState::Running) {
+            // Poll first, fold after: the fold emits events and rewrites the
+            // state, which needs the occupant borrow released.
+            let mut status = None;
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
+            let mut worker_died = false;
+            match self.slot.as_mut() {
+                Some(Occupant::Dl(slot)) => status = Some(slot.execute_raw(now)),
+                #[cfg(any(target_os = "linux", target_os = "macos"))]
+                Some(Occupant::Proc(worker)) => match worker.step(now) {
+                    StepOutcome::Acked(st) => status = Some(st),
+                    StepOutcome::TimedOut => {
+                        if worker.child_dead() {
+                            // Gone for certain; the ack never comes.
+                            worker_died = true;
+                        } else {
+                            // Alive but late: telemetered, and the sequence
+                            // protocol self-heals (the worker serves only
+                            // the newest doorbell).
+                            self.timeouts += 1;
+                        }
                     }
-                }
-                FswStatus::Panicked => {
-                    self.emit_event(SequenceEventKind::Failed {
-                        reason: "panicked".to_string(),
-                    });
-                    SlotState::Stopped {
-                        reason: StopReason::Panicked,
-                    }
-                }
-            };
+                },
+                None => {}
+            }
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
+            if worker_died {
+                self.fail_occupant("worker died".to_string());
+            }
+            if let Some(st) = status {
+                self.fold_status(st);
+            }
         }
     }
 
     fn shutdown(&mut self) {
+        // Mission teardown is the one graceful exit a proc occupant's worker
+        // gets — shutdown request, grace window, then kill — unlike the
+        // runtime `Stop`'s immediate kill; blocking is acceptable here.
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        if let Some(Occupant::Proc(worker)) = self.slot.as_mut() {
+            worker.shutdown();
+        }
         self.slot = None;
     }
 
@@ -506,6 +741,37 @@ impl CyclicSlot for SlotRunner {
 
     fn state(&self) -> &SlotState {
         &self.state
+    }
+
+    fn drain_timeouts(&mut self) -> u64 {
+        std::mem::take(&mut self.timeouts)
+    }
+
+    fn proc_info(&self) -> Option<ProcInfo> {
+        self.proc.as_ref()?;
+        let pid = match &self.slot {
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
+            Some(Occupant::Proc(worker)) => worker.pid(),
+            _ => 0,
+        };
+        // "Half-born, inside the pipeline" describes a Loading occupant
+        // exactly, hence `Restarting`; any live worker — running, idle, or
+        // Done and holding its roles — reads `Running`, and between workers
+        // the slot reads `Stopped`. The occupant-level story (which one,
+        // what phase, the outcome) stays on `SlotStatus` and the events
+        // channel; this list answers only "is there a live process here".
+        let state = if matches!(self.state, SlotState::Loading) {
+            WorkerRunState::Restarting
+        } else if pid != 0 {
+            WorkerRunState::Running
+        } else {
+            WorkerRunState::Stopped
+        };
+        Some(ProcInfo {
+            pid,
+            restarts: self.deaths,
+            state,
+        })
     }
 }
 

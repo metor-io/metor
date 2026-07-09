@@ -143,8 +143,8 @@ pub use metor_fsw_ring::{ReadError, WriteError};
 pub use binder::{BindPorts, Binder, BoundInput, BoundPort, RingSource};
 pub use coordinator::{
     AllowedOccupant, ClockMode, Coordinator, CoordinatorBuilder, CoordinatorConfig,
-    InitialOccupant, NAME_CAP, PortRef, SLOT_NAME_CAP, SlotState, SlotStatus, StopReason,
-    StoppedSystem, SystemHandle, WireError, WorkerRunState, WorkerStatus,
+    InitialOccupant, NAME_CAP, OccupantBacking, PortRef, SLOT_NAME_CAP, SlotState, SlotStatus,
+    StopReason, StoppedSystem, SystemHandle, WireError, WorkerRunState, WorkerStatus,
 };
 
 pub use registry::{AllOutputs, EntrySchema, Registry, RegistryEntry};

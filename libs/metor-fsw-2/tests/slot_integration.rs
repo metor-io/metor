@@ -38,11 +38,7 @@ use metor_fsw_2::{
 
 /// One paramless allowed occupant.
 fn occ(name: &str, system: DlSystem) -> AllowedOccupant {
-    AllowedOccupant {
-        name: name.to_string(),
-        system,
-        params: Vec::new(),
-    }
+    AllowedOccupant::dl(name, system, Vec::new())
 }
 use stellarator::buf::{IoBuf, Slice};
 

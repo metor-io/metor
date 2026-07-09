@@ -91,7 +91,7 @@ use crate::system::{AsyncSystem, CyclicRunner, CyclicSystem, Out, System, System
 use crate::{DEFAULT_DEPTH, Frame};
 
 mod slot;
-pub use slot::{AllowedOccupant, InitialOccupant, SLOT_NAME_CAP, SlotStatus};
+pub use slot::{AllowedOccupant, InitialOccupant, OccupantBacking, SLOT_NAME_CAP, SlotStatus};
 use slot::{SlotReg, SlotRunner, slot_writer};
 
 /// The default [`CoordinatorConfig::reader_slack`].
@@ -461,8 +461,8 @@ impl StopReason {
 /// `Stopped` they are never cleared; a sequence-mode worker's `DlSlot` also
 /// latches `Done`, its poll-once guard); a process slot's `Stopped` clears
 /// back to `Running` when its worker restarts (`docs/process-systems.md`
-/// §6); the runtime [`SlotRunner`](slot) uses all five and recovers from a
-/// terminal state via `Load`/`Reset`.
+/// §6); the runtime [`SlotRunner`](slot) uses all six — `Loading` only in
+/// process mode — and recovers from a terminal state via `Load`/`Reset`.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum SlotState {
     /// No occupant; `step` is a cheap no-op. (Runtime slots only.)
@@ -471,6 +471,14 @@ pub enum SlotState {
     /// After a hard-drop `Stop` the state returns to `Loaded` with no live
     /// future. (Runtime slots only.)
     Loaded,
+    /// A process slot's occupant worker is mid-pipeline — spawn, attach,
+    /// bind/init — polled forward once per cycle, so a `Load` never stalls
+    /// the loop. Ends at `Loaded` (and its event) when the worker reports
+    /// bound, or `Stopped` on a pipeline failure. The command guards need no
+    /// new cases: `Load`/`Start`/`Stop` match none of their accepted states
+    /// here, so a command arriving mid-pipeline is ignored. (Runtime process
+    /// slots only.)
+    Loading,
     /// The slot is polled every cycle.
     Running,
     /// The occupant's future returned `Ready`. Terminal success, not an
@@ -494,7 +502,7 @@ impl SlotState {
     }
 
     /// The wire phase code published in [`SlotStatus::phase`]
-    /// (Empty=0/Loaded=1/Running=2/Done=3/Stopped=4).
+    /// (Empty=0/Loaded=1/Running=2/Done=3/Stopped=4/Loading=5).
     pub fn code(&self) -> u8 {
         match self {
             SlotState::Empty => 0,
@@ -502,6 +510,9 @@ impl SlotState {
             SlotState::Running => 2,
             SlotState::Done { .. } => 3,
             SlotState::Stopped { .. } => 4,
+            // Late to the party (codes 0-4 predate process slots), so the
+            // lifecycle order and the wire order disagree here.
+            SlotState::Loading => 5,
         }
     }
 
@@ -529,18 +540,20 @@ pub(crate) trait CyclicSlot {
     fn state(&self) -> &SlotState;
     /// Host-side step timeouts since last drained. The coordinator folds them
     /// into its own health (the worker owns the system's health ring, so a
-    /// process slot cannot report through it). Only `ProcSlot` overrides.
+    /// process slot cannot report through it). Overridden by `ProcSlot` and
+    /// the process-mode `SlotRunner`.
     fn drain_timeouts(&mut self) -> u64 {
         0
     }
     /// Worker restarts begun since last drained, folded into coordinator
-    /// health like the timeouts. Only `ProcSlot` overrides.
+    /// health like the timeouts. Only `ProcSlot` overrides: slot occupants
+    /// never auto-restart, so the runner has nothing to report here.
     fn drain_restarts(&mut self) -> u64 {
         0
     }
     /// The worker-process facts behind this slot, for the status frame's
-    /// worker list: `None` for every in-process slot, `Some` only from
-    /// `ProcSlot`.
+    /// worker list: `None` for every in-process slot, `Some` from `ProcSlot`
+    /// and the process-mode `SlotRunner`.
     fn proc_info(&self) -> Option<ProcInfo> {
         None
     }
@@ -1127,10 +1140,17 @@ impl CoordinatorBuilder {
 
     /// Register a runtime-swappable slot: a fixed position in the cyclic call
     /// chain whose occupant the host `Load`s/`Start`s/`Stop`s/`Abort`s/
-    /// `Reset`s/`Unload`s at runtime. `allowed` is the pre-opened candidate
+    /// `Reset`s/`Unload`s at runtime. `allowed` is the validated candidate
     /// set, each [`AllowedOccupant`] a sequence occupant (its `Load` name,
-    /// opened `DlSystem`, and postcard params); `initial` optionally applies
-    /// one at startup.
+    /// decoded descriptor, postcard params, and [`OccupantBacking`]);
+    /// `initial` optionally applies one at startup.
+    ///
+    /// The backing decides the slot's mode, and per-slot means all-occupants:
+    /// an all-[`Artifact`](OccupantBacking::Artifact) set makes this a
+    /// **process slot** (`docs/process-slots.md`), whose occupants run in a
+    /// worker process spawned per `Load`, with the crossing rings allocated
+    /// as session-dir files. A mixed set would let `Load` silently change
+    /// the slot's fault domain, so it is rejected.
     ///
     /// The registered descriptor is derived from the occupant descriptor by
     /// extension, not surgery. The occupant's ports form the *prefix* of each
@@ -1162,11 +1182,23 @@ impl CoordinatorBuilder {
             !allowed.is_empty(),
             "a slot needs at least one allowed occupant"
         );
-        let base = allowed[0].system.descriptor().clone();
+        // Per-slot means all-occupants: the isolation boundary is the slot's
+        // position in the cycle, and a mixed allow set would make `Load`
+        // silently change the fault domain.
+        let n_proc = allowed
+            .iter()
+            .filter(|a| matches!(a.backing, OccupantBacking::Artifact(_)))
+            .count();
+        assert!(
+            n_proc == 0 || n_proc == allowed.len(),
+            "a slot's occupants must share one backing: all in-process or all process-mode"
+        );
+        let process = n_proc == allowed.len();
+        let base = allowed[0].descriptor.clone();
         // Every allowed occupant must share the contract; the slot sizes and
         // validates to the first occupant's descriptor (mutual subset).
         for occ in &allowed[1..] {
-            let d = occ.system.descriptor();
+            let d = &occ.descriptor;
             let ports_match = |a: &[PortDesc], b: &[PortDesc]| {
                 a.len() == b.len()
                     && a.iter()
@@ -1256,7 +1288,7 @@ impl CoordinatorBuilder {
                 initial,
                 n_occ_inputs,
                 n_occ_outputs,
-                process: false,
+                process,
             }),
         )
     }
@@ -1967,7 +1999,6 @@ struct RingAlloc {
     /// The ring file behind each file-backed host-connected input (a process
     /// slot's control ring), for the worker manifests, keyed like
     /// `host_input_rings`.
-    #[allow(dead_code)]
     host_input_paths: HashMap<(usize, usize), PathBuf>,
 }
 
@@ -2053,9 +2084,9 @@ fn bind_systems(
             Reg::Proc(proc_reg) => cyclic.push(bind_proc(
                 id, proc_reg, &desc, name, cons_edges, alloc, proc_ctx,
             )?),
-            Reg::Slot(slot_reg) => {
-                cyclic.push(Box::new(bind_slot(id, slot_reg, &desc, cons_edges, alloc)))
-            }
+            Reg::Slot(slot_reg) => cyclic.push(Box::new(bind_slot(
+                id, slot_reg, &desc, cons_edges, alloc, proc_ctx,
+            )?)),
             // The static (host-side) path: build typed `BoundPort`s and
             // walk them with a `Binder`.
             reg => {
@@ -2309,22 +2340,39 @@ fn bind_proc(
 /// A runtime slot: gather the same per-port regions as the dl arm, but locate
 /// the runner's tail ports by their declared shape and hand the runner the
 /// control/status writers. No occupant is created here; only `init`/`Load`
-/// (runtime) does.
+/// (runtime) does — for a process slot that also means **no worker is
+/// spawned at build**, only the per-occupant manifests are written
+/// ([`slot_proc_parts`]).
 fn bind_slot(
     id: usize,
     slot_reg: SlotReg,
     desc: &SystemDescriptor,
     cons_edges: &ConsEdges,
     alloc: &RingAlloc,
-) -> SlotRunner {
+    proc_ctx: &ProcBindCtx,
+) -> Result<SlotRunner, WireError> {
     use crate::abi::{FswRing, ROLE_INPUT, ROLE_OUTPUT};
     let SlotReg {
         allowed,
         initial,
         n_occ_inputs,
         n_occ_outputs,
-        ..
+        process,
     } = slot_reg;
+    let proc = if process {
+        Some(slot_proc_parts(
+            id,
+            desc,
+            &allowed,
+            n_occ_inputs,
+            n_occ_outputs,
+            cons_edges,
+            alloc,
+            proc_ctx,
+        )?)
+    } else {
+        None
+    };
     let output_rings = &alloc.output_rings;
     // The prefix/tail invariant: the occupant's ports are the prefix of each
     // registered list, in the occupant descriptor's own order, so the occupant
@@ -2429,10 +2477,122 @@ fn bind_slot(
         .expect("a slot declares its Host events output");
     let events = owned_writer::<SequenceChannelEvent>(&output_rings[id][events_out_idx]);
 
-    SlotRunner::new(
+    Ok(SlotRunner::new(
         desc.name, allowed, initial, inputs, outputs, control, status_out, events, seq_status,
-        commands,
-    )
+        commands, proc,
+    ))
+}
+
+/// The proc side of the slot bind, the [`bind_proc`] twin: gather the
+/// occupant prefix's rings as session-dir *paths* in the same positional
+/// order the `FswRing` arrays use (so the worker-side bind contract is
+/// untouched), collect the host handles of the same rings for reclamation
+/// after each worker ends, and write one sequence-mode manifest per allowed
+/// occupant — the rings are the slot's, so the manifests differ only in
+/// artifact and params, and a runtime `Load` just picks one and spawns.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[allow(clippy::too_many_arguments)]
+fn slot_proc_parts(
+    id: usize,
+    desc: &SystemDescriptor,
+    allowed: &[AllowedOccupant],
+    n_occ_inputs: usize,
+    n_occ_outputs: usize,
+    cons_edges: &ConsEdges,
+    alloc: &RingAlloc,
+    ctx: &ProcBindCtx,
+) -> Result<slot::ProcParts, WireError> {
+    use crate::proc::host::resolve_worker_exe;
+    use crate::proc::worker::{RunMode, WorkerManifest};
+    let spawn_err = |detail: String| WireError::ProcSpawn {
+        system: desc.name.to_string(),
+        detail,
+    };
+    let session = alloc.session.as_ref().expect("process-slot graphs have a session");
+    // Every ring an occupant worker attaches, as (host handle, file path):
+    // the occupant prefix's own outputs, then the ring behind each prefix
+    // input (an Edge input's producer, the Host control ring's own file).
+    let mut rings: Vec<RingBuffer> = Vec::new();
+    let output_paths: Vec<PathBuf> = (0..n_occ_outputs)
+        .map(|out_idx| {
+            rings.push(alloc.output_rings[id][out_idx].clone());
+            alloc.ring_paths[&(id, out_idx)].clone()
+        })
+        .collect();
+    let input_paths: Vec<PathBuf> = (0..n_occ_inputs)
+        .map(|in_idx| match desc.inputs[in_idx].conn {
+            PortConn::Edge => {
+                let (prod, out) = cons_edges[&(id, in_idx)][0];
+                rings.push(alloc.output_rings[prod][out].clone());
+                alloc.ring_paths[&(prod, out)].clone()
+            }
+            PortConn::Host => {
+                rings.push(alloc.host_input_rings[&(id, in_idx)].clone());
+                alloc.host_input_paths[&(id, in_idx)].clone()
+            }
+            PortConn::SelfTap(_) => {
+                unreachable!("the occupant input prefix holds no self-tap")
+            }
+        })
+        .collect();
+    let exe = resolve_worker_exe(ctx.worker_exe.as_deref()).map_err(|e| spawn_err(e.to_string()))?;
+    let ctl_path = session.path().join(format!("{}.ctl", desc.name));
+    let manifests = allowed
+        .iter()
+        .map(|occ| {
+            let OccupantBacking::Artifact(artifact) = &occ.backing else {
+                unreachable!("add_slot pins a process slot's occupants to artifact backings");
+            };
+            let manifest = WorkerManifest::Run {
+                abi_version: crate::abi::FSW_ABI_VERSION,
+                mode: RunMode::Sequence,
+                // The worker-side identity is the slot's, whoever occupies it,
+                // matching the in-process `make_slot(.., self.name)`.
+                instance: desc.name.to_string(),
+                artifact: artifact.clone(),
+                params: occ.params.clone(),
+                ctl: ctl_path.clone(),
+                inputs: input_paths.clone(),
+                outputs: output_paths.clone(),
+            };
+            let path = session.path().join(format!("{}.{}.manifest", desc.name, occ.name));
+            std::fs::write(
+                &path,
+                postcard::to_allocvec(&manifest).expect("manifest encodes (postcard)"),
+            )
+            .map_err(|e| spawn_err(format!("manifest: {e}")))?;
+            Ok(path)
+        })
+        .collect::<Result<Vec<_>, WireError>>()?;
+    Ok(slot::ProcParts {
+        manifests,
+        ctl_path,
+        exe,
+        rings,
+        step_timeout: ctx.step_timeout,
+    })
+}
+
+/// Without a cross-process futex there is no worker protocol; the process
+/// slot is rejected cleanly at `build()`, like a process system.
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+#[allow(clippy::too_many_arguments)]
+fn slot_proc_parts(
+    _id: usize,
+    desc: &SystemDescriptor,
+    _allowed: &[AllowedOccupant],
+    _n_occ_inputs: usize,
+    _n_occ_outputs: usize,
+    _cons_edges: &ConsEdges,
+    _alloc: &RingAlloc,
+    _ctx: &ProcBindCtx,
+) -> Result<slot::ProcParts, WireError> {
+    Err(WireError::ProcSpawn {
+        system: desc.name.to_string(),
+        detail: "process slots need a cross-process futex (Linux or macOS 14.4+); \
+                 unsupported on this target"
+            .into(),
+    })
 }
 
 /// Find any directed cycle in the system graph (over the non-delayed edges),

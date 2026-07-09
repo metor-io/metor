@@ -576,7 +576,6 @@ enum LoadPhase {
 /// How one [`SeqWorker::poll_load`] resolved. `Failed` names the pipeline
 /// stage that died, so the runner's `Failed` event can tell the operator
 /// where.
-#[allow(dead_code)] // consumed by the slot runner's proc backing (plan W4)
 pub(crate) enum LoadPoll {
     Pending,
     Ready,
@@ -595,7 +594,6 @@ pub(crate) enum LoadPoll {
 /// it is latched (stage and all) for the runner to fold into the slot's
 /// terminal states, because re-running a sequence re-issues its side effects
 /// — an operator decision, not a supervisor default.
-#[allow(dead_code)] // consumed by the slot runner's proc backing (plan W4)
 pub(crate) struct SeqWorker {
     handle: WorkerHandle,
     /// Per-step ack deadline
@@ -604,7 +602,6 @@ pub(crate) struct SeqWorker {
     phase: LoadPhase,
 }
 
-#[allow(dead_code)] // consumed by the slot runner's proc backing (plan W4)
 impl SeqWorker {
     /// Spawn a worker for one occupant from its persisted manifest, entering
     /// the polled pipeline. Non-blocking, and nothing is killed here: tearing
