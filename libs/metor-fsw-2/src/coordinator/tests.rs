@@ -1432,3 +1432,165 @@ fn heap_only_graph_has_no_session() {
     assert!(alloc.session.is_none());
     assert!(alloc.ring_paths.is_empty());
 }
+
+// ---------------------------------------------------------------------------
+// Process slots: which of a slot's rings become session-dir files.
+// ---------------------------------------------------------------------------
+
+/// Push a slot registration shaped like `add_slot`'s derived descriptor — an
+/// Edge occupant input plus the Host [`SlotControlIn`], an occupant
+/// [`SequenceStatus`] output, then the runner tail — without opening any
+/// occupant artifact: the alloc passes under test read only the descriptor,
+/// the prefix split, and the `process` flag.
+fn push_slot_reg(
+    b: &mut crate::CoordinatorBuilder,
+    name: &'static str,
+    process: bool,
+) -> crate::SystemHandle {
+    use crate::sequence::{SequenceStatus, SlotControlIn};
+    use metor_proto_wkt::{SequenceChannelEvent, SequenceCommand};
+    let seq_status_id = crate::PortId::Component(<SequenceStatus as crate::Frame>::FRAME_ID);
+    let desc = crate::SystemDescriptor {
+        name,
+        kind: crate::SystemKind::Cyclic,
+        inputs: vec![
+            crate::PortDesc::of::<Imu>(),
+            crate::PortDesc::of::<SlotControlIn>().with_conn(crate::PortConn::Host),
+            crate::PortDesc::msg::<SequenceCommand>(),
+            crate::PortDesc::of::<SequenceStatus>()
+                .with_conn(crate::PortConn::SelfTap(seq_status_id)),
+        ],
+        outputs: vec![
+            crate::PortDesc::of::<SequenceStatus>(),
+            crate::PortDesc::of::<crate::SlotStatus>().with_conn(crate::PortConn::Host),
+            crate::PortDesc::msg_named::<SequenceChannelEvent>("sequences")
+                .with_conn(crate::PortConn::Host),
+        ],
+        capabilities: Vec::new(),
+    };
+    b.push_system(
+        desc,
+        name.to_string(),
+        super::Reg::Slot(super::slot::SlotReg {
+            allowed: Vec::new(),
+            initial: None,
+            n_occ_inputs: 2,
+            n_occ_outputs: 1,
+            process,
+        }),
+    )
+}
+
+/// A process slot's backing selection marks exactly the occupant prefix: its
+/// own outputs, the producer behind each Edge input, and the Host control
+/// ring. The runner tail — the `commands` fan-in (and so its producers), the
+/// self-tap, the [`SlotStatus`]/events outputs — sits past the prefix split
+/// and stays heap.
+#[test]
+fn process_slot_rings_are_file_backed() {
+    use metor_proto_wkt::SequenceCommand;
+    let mut b = Coordinator::builder(config());
+    let prod = b.add_cyclic(Producer::new());
+    let slot = push_slot_reg(&mut b, "seq-slot", true);
+    b.connect(PortRef::new::<Imu>(prod), PortRef::new::<Imu>(slot))
+        .unwrap();
+    b.connect(
+        PortRef::msg::<SequenceCommand>(b.coordinator_handle()),
+        PortRef::msg::<SequenceCommand>(slot),
+    )
+    .unwrap();
+
+    let cons_edges = b.resolve_edges().unwrap();
+    let shared = b.shared_outputs(&cons_edges);
+    let imu_out = b.systems[prod.id]
+        .desc
+        .outputs
+        .iter()
+        .position(|p| p.id == crate::PortId::Component(<Imu as crate::Frame>::FRAME_ID))
+        .unwrap();
+    assert!(shared.contains(&(slot.id, 0)), "occupant output crosses");
+    assert!(shared.contains(&(prod.id, imu_out)), "Edge-input producer crosses");
+    assert_eq!(
+        shared.len(),
+        2,
+        "nothing else crosses: not the tail outputs, not the command producer"
+    );
+
+    let fan_out = b.count_fan_out(&cons_edges);
+    let alloc = b.alloc_rings(&cons_edges, &fan_out).unwrap();
+    assert_eq!(
+        alloc.ring_paths.keys().copied().collect::<std::collections::HashSet<_>>(),
+        shared,
+        "one ring file per crossing buffer"
+    );
+    assert_eq!(
+        alloc.host_input_paths.keys().copied().collect::<Vec<_>>(),
+        vec![(slot.id, 1)],
+        "the Host control ring is the one file-backed input"
+    );
+    let session = alloc.session.as_ref().expect("process-slot graph has a session");
+    let session_path = session.path().to_path_buf();
+    for path in alloc.ring_paths.values().chain(alloc.host_input_paths.values()) {
+        assert!(path.exists(), "ring file {} exists", path.display());
+        assert!(path.starts_with(&session_path));
+    }
+    drop(alloc);
+    assert!(!session_path.exists(), "session dir removed on drop");
+}
+
+/// The same slot registered in-process allocates all-heap: no session
+/// directory, no output ring files, and a heap control ring.
+#[test]
+fn in_process_slot_stays_heap() {
+    let mut b = Coordinator::builder(config());
+    let prod = b.add_cyclic(Producer::new());
+    let slot = push_slot_reg(&mut b, "seq-slot", false);
+    b.connect(PortRef::new::<Imu>(prod), PortRef::new::<Imu>(slot))
+        .unwrap();
+    let cons_edges = b.resolve_edges().unwrap();
+    let fan_out = b.count_fan_out(&cons_edges);
+    let alloc = b.alloc_rings(&cons_edges, &fan_out).unwrap();
+    assert!(alloc.session.is_none());
+    assert!(alloc.ring_paths.is_empty());
+    assert!(alloc.host_input_paths.is_empty());
+    assert!(
+        alloc.host_input_rings.contains_key(&(slot.id, 1)),
+        "the control ring still exists, heap-backed"
+    );
+}
+
+/// A process system and a process slot share the one run session: every
+/// crossing file of both lands in the same directory.
+#[test]
+fn proc_and_process_slot_share_a_session() {
+    let mut b = Coordinator::builder(config());
+    let prod = b.add_cyclic(Producer::new());
+    let desc = Consumer {
+        seen: Rc::new(RefCell::new(Vec::new())),
+        drain: true,
+        init_counter: None,
+        first_exec_init: None,
+    }
+    .instance_descriptor();
+    let proc_sys = b.add_proc_cyclic("proc-cons", desc, "/nonexistent.so".into(), Vec::new());
+    b.connect(PortRef::new::<Imu>(prod), PortRef::new::<Imu>(proc_sys))
+        .unwrap();
+    let slot = push_slot_reg(&mut b, "seq-slot", true);
+    b.connect(PortRef::new::<Imu>(prod), PortRef::new::<Imu>(slot))
+        .unwrap();
+
+    let cons_edges = b.resolve_edges().unwrap();
+    let fan_out = b.count_fan_out(&cons_edges);
+    let alloc = b.alloc_rings(&cons_edges, &fan_out).unwrap();
+    let session_path = alloc
+        .session
+        .as_ref()
+        .expect("mixed graph has a session")
+        .path()
+        .to_path_buf();
+    assert!(alloc.ring_paths.contains_key(&(proc_sys.id, 0)));
+    assert!(alloc.ring_paths.contains_key(&(slot.id, 0)));
+    for path in alloc.ring_paths.values().chain(alloc.host_input_paths.values()) {
+        assert!(path.starts_with(&session_path), "{} shares the session", path.display());
+    }
+}

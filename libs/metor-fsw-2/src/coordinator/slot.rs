@@ -149,6 +149,11 @@ pub(crate) struct SlotReg {
     /// Number of leading registered outputs that belong to the occupant
     /// (its user ports plus [`SequenceStatus`]/health/log).
     pub n_occ_outputs: usize,
+    /// Run occupants out of process (`docs/process-slots.md`): the occupant
+    /// prefix's crossing rings — its outputs, its Edge inputs' producers, and
+    /// the host control ring — are allocated as session-dir files a worker
+    /// process can attach. The runner tail stays host-side either way.
+    pub process: bool,
 }
 
 // ---------------------------------------------------------------------------
