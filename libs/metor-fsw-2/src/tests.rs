@@ -302,6 +302,172 @@ fn frame_map_rejects_dot_key_at_write_time() {
     assert_eq!(res, Err(KeyError::DotInKey));
 }
 
+/// Locks the exact trailer layout of a map member: the fixed region, an
+/// 8-aligned fixed-stride entry array (header, padding to the value's
+/// alignment, value bytes), then the key pool the rebased offsets point into.
+#[test]
+fn frame_map_exact_byte_layout() {
+    use crate::dynamic::{map_stride, map_value_offset};
+
+    let frame = SysMap {
+        timestamp: Timestamp(1000),
+        processes: FrameMap::EMPTY,
+    };
+    let mut w = FrameWriter::new(&frame);
+    w.map(offset_of!(SysMap, processes), |m| {
+        m.insert(
+            "htop",
+            Process {
+                pid: 1001,
+                cpu_usage: 0.5,
+            },
+        );
+        m.insert(
+            "init",
+            Process {
+                pid: 1002,
+                cpu_usage: 0.25,
+            },
+        );
+    })
+    .unwrap();
+
+    // Process { pid: u64, cpu_usage: f64 }: the value starts right after the
+    // 8-byte header and the 24-byte entry needs no tail padding.
+    assert_eq!(map_value_offset::<Process>(), 8);
+    assert_eq!(map_stride::<Process>(), 24);
+
+    let fixed = core::mem::size_of::<SysMap>(); // 16, already 8-aligned
+    let mut want = Vec::new();
+    want.extend_from_slice(&1000i64.to_le_bytes()); // timestamp
+    want.extend_from_slice(&(fixed as u32).to_le_bytes()); // slot.trailer_off
+    want.extend_from_slice(&48u32.to_le_bytes()); // slot.byte_len = 2 * stride
+    // entry[0]: key_off -> pool start (fixed + 48), key_len 4, then the value.
+    want.extend_from_slice(&64u32.to_le_bytes());
+    want.extend_from_slice(&4u32.to_le_bytes());
+    want.extend_from_slice(&1001u64.to_le_bytes());
+    want.extend_from_slice(&0.5f64.to_le_bytes());
+    // entry[1]: key_off past "htop".
+    want.extend_from_slice(&68u32.to_le_bytes());
+    want.extend_from_slice(&4u32.to_le_bytes());
+    want.extend_from_slice(&1002u64.to_le_bytes());
+    want.extend_from_slice(&0.25f64.to_le_bytes());
+    want.extend_from_slice(b"htopinit");
+
+    assert_eq!(w.table(), &want[..]);
+}
+
+/// A rejected key rolls the whole map member back: earlier members survive,
+/// the failed member's slot stays zeroed, and the same writer can keep
+/// appending members at correct offsets afterwards.
+#[test]
+fn frame_map_key_error_rolls_the_member_back() {
+    let frame = SysBoth {
+        timestamp: Timestamp(7),
+        procs: FrameList::EMPTY,
+        hosts: FrameMap::EMPTY,
+    };
+    let mut w = FrameWriter::new(&frame);
+    w.list(offset_of!(SysBoth, procs), |l| {
+        l.push(Process {
+            pid: 1,
+            cpu_usage: 1.0,
+        });
+    });
+    let len_after_list = w.table().len();
+
+    let res = w.map(offset_of!(SysBoth, hosts), |m| {
+        m.insert(
+            "ok",
+            Process {
+                pid: 2,
+                cpu_usage: 2.0,
+            },
+        );
+        m.insert(
+            "bad.key",
+            Process {
+                pid: 3,
+                cpu_usage: 3.0,
+            },
+        );
+    });
+    assert_eq!(res, Err(KeyError::DotInKey));
+    assert_eq!(
+        w.table().len(),
+        len_after_list,
+        "the failed member's bytes are rolled back"
+    );
+
+    // A retry with valid keys lands at the same trailer position.
+    w.map(offset_of!(SysBoth, hosts), |m| {
+        m.insert(
+            "ok",
+            Process {
+                pid: 2,
+                cpu_usage: 2.0,
+            },
+        );
+    })
+    .unwrap();
+
+    let mut sink = RecSink::default();
+    SysBoth::as_vtable()
+        .apply(w.table(), &mut sink)
+        .unwrap()
+        .unwrap();
+    assert_eq!(sink.values[&ComponentId::new("procs.0.pid")], 1.0);
+    assert_eq!(sink.values[&ComponentId::new("hosts.ok.pid")], 2.0);
+    assert_eq!(sink.values.get(&ComponentId::new("hosts.bad.key.pid")), None);
+}
+
+/// Recycling the backing through `finish`/`from_scratch` produces tables
+/// byte-identical to a fresh writer's, including after a larger frame grew
+/// the buffers.
+#[test]
+fn frame_scratch_reuse_is_byte_identical() {
+    let frame = SysMap {
+        timestamp: Timestamp(1000),
+        processes: FrameMap::EMPTY,
+    };
+    let build = |w: &mut FrameWriter<SysMap>| {
+        w.map(offset_of!(SysMap, processes), |m| {
+            m.insert(
+                "htop",
+                Process {
+                    pid: 1001,
+                    cpu_usage: 0.5,
+                },
+            );
+        })
+        .unwrap();
+    };
+
+    let mut fresh = FrameWriter::new(&frame);
+    build(&mut fresh);
+    let want = fresh.table().to_vec();
+
+    // Grow the recycled backing with a bigger table first, then rebuild the
+    // small one from the same scratch.
+    let mut big = FrameWriter::from_scratch(fresh.finish(), &frame);
+    big.map(offset_of!(SysMap, processes), |m| {
+        for i in 0..8 {
+            m.insert(
+                &format!("proc_{i}"),
+                Process {
+                    pid: i,
+                    cpu_usage: 0.0,
+                },
+            );
+        }
+    })
+    .unwrap();
+
+    let mut reused = FrameWriter::from_scratch(big.finish(), &frame);
+    build(&mut reused);
+    assert_eq!(reused.table(), &want[..]);
+}
+
 // --- Nested dynamics: processes.htop.threads.0.state ---
 
 #[derive(AsVTable, IntoBytes, Immutable, KnownLayout, Clone, Copy)]
