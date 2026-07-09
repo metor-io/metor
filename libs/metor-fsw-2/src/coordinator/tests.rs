@@ -1559,6 +1559,355 @@ fn in_process_slot_stays_heap() {
     );
 }
 
+// ---------------------------------------------------------------------------
+// Process slots: the SlotRunner proc backing over a fake occupant worker.
+// ---------------------------------------------------------------------------
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+mod proc_slot {
+    //! State-machine tests for the process-mode [`SlotRunner`], driven the
+    //! way the proc unit tests drive `SeqWorker`: the ctl protocol is
+    //! address-space agnostic, so the test plays the occupant worker over
+    //! the slot's ctl file while the actually spawned child is an inert
+    //! stand-in (`/bin/sh`, exiting immediately on its null stdin).
+
+    use std::path::PathBuf;
+    use std::time::Duration;
+
+    use metor_fsw_ring::NoWake;
+    use metor_proto::types::Timestamp;
+    use metor_proto_wkt::{
+        SequenceChannelEvent, SequenceCommand, SequenceCommandKind, SequenceEventKind,
+    };
+
+    use crate::abi::FswStatus;
+    use crate::coordinator::slot::{
+        AllowedOccupant, OccupantBacking, ProcParts, SlotRunner, slot_writer,
+    };
+    use crate::coordinator::{CyclicSlot, SlotState, StopReason, WorkerRunState};
+    use crate::dynamic::FrameList;
+    use crate::message::{MsgIn, MsgOut};
+    use crate::port::{Input, Output};
+    use crate::proc::{CtlWorker, WorkerCmd, WorkerState};
+    use crate::sequence::{SequenceStatus, SlotControlIn};
+    use crate::{Delivery, SlotStatus};
+
+    /// Room enough for the runner's frames; sizing is not under test.
+    const READERS: usize = 4;
+    const DEPTH: usize = 8;
+
+    /// One allowed occupant behind an artifact backing. The runner never
+    /// opens the path, so it need not exist.
+    fn proc_occ(name: &str) -> AllowedOccupant {
+        AllowedOccupant {
+            name: name.into(),
+            params: Vec::new(),
+            descriptor: crate::SystemDescriptor {
+                name: "occ",
+                kind: crate::SystemKind::Cyclic,
+                inputs: Vec::new(),
+                outputs: Vec::new(),
+                capabilities: Vec::new(),
+            },
+            backing: OccupantBacking::Artifact(PathBuf::from("/never-opened.so")),
+        }
+    }
+
+    /// A process-mode runner over hand-allocated rings, plus the test's ends
+    /// of them: the command writer, the events and status taps, and the
+    /// occupant-side [`SequenceStatus`] writer the fake worker publishes
+    /// through.
+    struct Harness {
+        runner: SlotRunner,
+        cmds: MsgOut<SequenceCommand>,
+        events: MsgIn<SequenceChannelEvent>,
+        status: Input<SlotStatus>,
+        seq_out: Output<SequenceStatus>,
+        ctl_path: PathBuf,
+        now: i64,
+    }
+
+    fn harness(dir: &tempfile::TempDir, occupants: &[&str]) -> Harness {
+        let frame_ring = |desc: crate::PortDesc| {
+            super::super::alloc_ring(desc.delivery, desc.max_size, DEPTH, READERS)
+        };
+        let control_ring = frame_ring(crate::PortDesc::of::<SlotControlIn>());
+        let status_ring = frame_ring(crate::PortDesc::of::<SlotStatus>());
+        let seq_ring = frame_ring(crate::PortDesc::of::<SequenceStatus>());
+        let events_ring = super::super::alloc_ring(
+            Delivery::Log,
+            crate::PortDesc::msg::<SequenceChannelEvent>().max_size,
+            DEPTH,
+            READERS,
+        );
+        let cmd_ring = super::super::alloc_ring(
+            Delivery::Log,
+            crate::PortDesc::msg::<SequenceCommand>().max_size,
+            DEPTH,
+            READERS,
+        );
+
+        let ctl_path = dir.path().join("seq-slot.ctl");
+        let manifests = occupants
+            .iter()
+            .map(|occ| {
+                let path = dir.path().join(format!("seq-slot.{occ}.manifest"));
+                std::fs::write(&path, b"unread by the stand-in child").unwrap();
+                path
+            })
+            .collect();
+        let runner = SlotRunner::new(
+            "seq-slot",
+            occupants.iter().map(|o| proc_occ(o)).collect(),
+            None,
+            Vec::new(),
+            Vec::new(),
+            slot_writer::<SlotControlIn>(&control_ring),
+            slot_writer::<SlotStatus>(&status_ring),
+            super::super::owned_writer::<SequenceChannelEvent>(&events_ring),
+            Input::new(seq_ring.view(NoWake, NoWake).unwrap()),
+            MsgIn::from_views(vec![cmd_ring.view(NoWake, NoWake).unwrap()]),
+            Some(ProcParts {
+                manifests,
+                ctl_path: ctl_path.clone(),
+                exe: PathBuf::from("/bin/sh"),
+                rings: Vec::new(),
+                step_timeout: Duration::from_millis(200),
+            }),
+        );
+        Harness {
+            runner,
+            cmds: super::super::owned_writer::<SequenceCommand>(&cmd_ring),
+            events: MsgIn::from_views(vec![events_ring.view(NoWake, NoWake).unwrap()]),
+            status: Input::new(status_ring.view(NoWake, NoWake).unwrap()),
+            seq_out: slot_writer::<SequenceStatus>(&seq_ring),
+            ctl_path,
+            now: 0,
+            // The rings live on inside the ports; the harness drops them.
+        }
+    }
+
+    impl Harness {
+        fn step(&mut self) {
+            self.now += 1;
+            self.runner.step(Timestamp(self.now));
+        }
+
+        fn send(&mut self, command: SequenceCommandKind) {
+            self.cmds
+                .emit(&SequenceCommand {
+                    channel: "seq-slot".to_string(),
+                    command,
+                })
+                .unwrap();
+        }
+
+        fn drain_events(&mut self) -> Vec<SequenceEventKind> {
+            let mut out = Vec::new();
+            self.events.drain(|e| out.push(e.kind));
+            out
+        }
+
+        fn phase(&mut self) -> u8 {
+            self.status.latest().expect("status published").get().phase
+        }
+
+        fn attach_ctl(&self) -> CtlWorker {
+            CtlWorker::attach(&self.ctl_path).unwrap()
+        }
+
+        /// Drive a fresh occupant's pipeline to `Loaded` through a fake
+        /// worker, asserting the `Loading` phase on the way, and hand back
+        /// the fake's ctl end for the Running phase.
+        fn load_occupant(&mut self, name: &str) -> CtlWorker {
+            self.send(SequenceCommandKind::Load {
+                name: name.to_string(),
+            });
+            self.step();
+            assert!(matches!(self.runner.state(), SlotState::Loading));
+            let ctl = self.attach_ctl();
+            ctl.report(WorkerState::Attached);
+            self.step(); // observes Attached, requests init
+            assert!(matches!(self.runner.state(), SlotState::Loading));
+            assert!(ctl.wait_init(), "init requested, not shutdown");
+            ctl.report(WorkerState::Ready);
+            self.step();
+            assert!(matches!(self.runner.state(), SlotState::Loaded));
+            ctl
+        }
+    }
+
+    /// Load walks Empty → Loading (wire phase 5, worker `Restarting`) →
+    /// Loaded, with the `Loaded` event deferred to the bind — and the
+    /// existing command guards ignore `Start`/`Stop` mid-pipeline.
+    #[test]
+    fn load_pipeline_phases_events_and_guards() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut h = harness(&dir, &["alpha", "beta"]);
+        h.runner.init();
+        assert!(matches!(h.runner.state(), SlotState::Empty));
+
+        h.send(SequenceCommandKind::Load {
+            name: "alpha".to_string(),
+        });
+        h.step();
+        assert!(matches!(h.runner.state(), SlotState::Loading));
+        assert_eq!(h.phase(), 5);
+        assert!(h.drain_events().is_empty(), "Loaded waits for the bind");
+        let info = h.runner.proc_info().expect("process-mode slot");
+        assert_eq!(info.state, WorkerRunState::Restarting);
+        assert_ne!(info.pid, 0, "the spawned worker is telemetered");
+
+        // Commands mid-pipeline fall through the existing guards.
+        h.send(SequenceCommandKind::Start);
+        h.send(SequenceCommandKind::Stop);
+        h.step();
+        assert!(matches!(h.runner.state(), SlotState::Loading));
+        assert!(h.drain_events().is_empty());
+
+        let ctl = h.attach_ctl();
+        ctl.report(WorkerState::Attached);
+        h.step();
+        assert!(matches!(h.runner.state(), SlotState::Loading));
+        assert!(ctl.wait_init());
+        ctl.report(WorkerState::Ready);
+        h.step();
+        assert!(matches!(h.runner.state(), SlotState::Loaded));
+        assert_eq!(h.phase(), 1);
+        assert!(matches!(
+            h.drain_events().as_slice(),
+            [SequenceEventKind::Loaded { name }] if name == "alpha"
+        ));
+        let info = h.runner.proc_info().unwrap();
+        assert_eq!(info.state, WorkerRunState::Running);
+        assert_ne!(info.pid, 0);
+        assert_eq!(info.restarts, 0);
+    }
+
+    /// An acked `Done` folds through the existing terminal path: the staged
+    /// `SequenceStatus` record (published before the ack, as the occupant
+    /// would) refines the outcome, and the worker is not torn down.
+    #[test]
+    fn done_ack_folds_to_completed() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut h = harness(&dir, &["alpha"]);
+        h.runner.init();
+        let ctl = h.load_occupant("alpha");
+        h.drain_events();
+
+        h.send(SequenceCommandKind::Start);
+        // The occupant's terminal record lands before its Done ack; the
+        // fake acks the one doorbell the Running poll rings.
+        let _ = h.seq_out.write(&SequenceStatus {
+            timestamp: Timestamp(0),
+            run_state: 1,
+            _pad: [0; 7],
+            progress: FrameList::EMPTY,
+        });
+        let fake = std::thread::spawn(move || match ctl.next(0) {
+            WorkerCmd::Step { seq, .. } => ctl.done(seq, FswStatus::Done),
+            WorkerCmd::Shutdown => panic!("no shutdown was requested"),
+        });
+        h.step(); // Start applies, then the Running poll acks Done
+        fake.join().unwrap();
+        assert!(matches!(h.runner.state(), SlotState::Done { outcome: 1 }));
+        assert!(matches!(
+            h.drain_events().as_slice(),
+            [SequenceEventKind::Started, SequenceEventKind::Completed]
+        ));
+        // Done holds its worker (and so its ring roles) until Reset/Load.
+        let info = h.runner.proc_info().unwrap();
+        assert_eq!(info.state, WorkerRunState::Running);
+        assert_ne!(info.pid, 0);
+        // Terminal: the occupant is not polled again.
+        h.step();
+        assert!(matches!(h.runner.state(), SlotState::Done { outcome: 1 }));
+    }
+
+    /// A worker death while Running is terminal — `Stopped { ProcessDied }`,
+    /// a `Failed` event, no respawn — and an operator `Reset` brings a fresh
+    /// pipeline up over the same rings.
+    #[test]
+    fn death_is_terminal_and_reset_recovers() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut h = harness(&dir, &["alpha"]);
+        h.runner.init();
+        let ctl = h.load_occupant("alpha");
+        h.drain_events();
+
+        // Nothing acks (the stand-in child already exited): the step times
+        // out, the reap resolves dead, and the stop is terminal.
+        h.send(SequenceCommandKind::Start);
+        h.step();
+        assert!(matches!(
+            h.runner.state(),
+            SlotState::Stopped {
+                reason: StopReason::ProcessDied
+            }
+        ));
+        assert!(matches!(
+            h.drain_events().as_slice(),
+            [SequenceEventKind::Started, SequenceEventKind::Failed { .. }]
+        ));
+        let info = h.runner.proc_info().unwrap();
+        assert_eq!((info.pid, info.state), (0, WorkerRunState::Stopped));
+        assert_eq!(info.restarts, 1, "the death is counted");
+
+        // No respawn behind the operator's back.
+        h.step();
+        assert!(matches!(h.runner.state(), SlotState::Stopped { .. }));
+        assert_eq!(h.runner.proc_info().unwrap().pid, 0);
+
+        // Reset spawns a fresh pipeline over the same manifest and rings.
+        drop(ctl);
+        h.send(SequenceCommandKind::Reset);
+        h.step();
+        assert!(matches!(h.runner.state(), SlotState::Loading));
+        let ctl = h.attach_ctl();
+        ctl.report(WorkerState::Attached);
+        h.step();
+        assert!(ctl.wait_init());
+        ctl.report(WorkerState::Ready);
+        h.step();
+        assert!(matches!(h.runner.state(), SlotState::Loaded));
+        assert!(matches!(
+            h.drain_events().as_slice(),
+            [SequenceEventKind::Loaded { name }] if name == "alpha"
+        ));
+        let info = h.runner.proc_info().unwrap();
+        assert_eq!(info.state, WorkerRunState::Running);
+        assert_ne!(info.pid, 0);
+        assert_eq!(info.restarts, 1, "Reset is commanded, not a death");
+    }
+
+    /// A pipeline failure (the worker reports `Failed` during attach) lands
+    /// the same terminal stop, naming the stage.
+    #[test]
+    fn pipeline_failure_is_terminal() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut h = harness(&dir, &["alpha"]);
+        h.runner.init();
+        h.send(SequenceCommandKind::Load {
+            name: "alpha".to_string(),
+        });
+        h.step();
+        let ctl = h.attach_ctl();
+        ctl.fail(3);
+        h.step();
+        assert!(matches!(
+            h.runner.state(),
+            SlotState::Stopped {
+                reason: StopReason::ProcessDied
+            }
+        ));
+        assert!(matches!(
+            h.drain_events().as_slice(),
+            [SequenceEventKind::Failed { reason }] if reason.contains("attach")
+        ));
+        assert_eq!(h.runner.proc_info().unwrap().restarts, 1);
+    }
+}
+
 /// A process system and a process slot share the one run session: every
 /// crossing file of both lands in the same directory.
 #[test]

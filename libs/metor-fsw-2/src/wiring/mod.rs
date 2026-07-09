@@ -792,17 +792,13 @@ fn resolve_slot(
             &src,
             span,
         )?;
-        allowed.push(AllowedOccupant {
-            name: occ.occupant.clone(),
-            system: loaded,
-            params,
-        });
+        allowed.push(AllowedOccupant::dl(occ.occupant.clone(), loaded, params));
     }
 
     // The slot derives one shape from the allowed set, so every occupant must
     // match the first. A clean error here in place of the panic `add_slot`
     // would otherwise raise at build.
-    let base = allowed[0].system.descriptor().clone();
+    let base = allowed[0].descriptor.clone();
     let ports_match = |a: &[crate::descriptor::PortDesc], b: &[crate::descriptor::PortDesc]| {
         a.len() == b.len()
             && a.iter()
@@ -810,7 +806,7 @@ fn resolve_slot(
                 .all(|(x, y)| compatible(x, y) && compatible(y, x))
     };
     for occ in &allowed[1..] {
-        let d = occ.system.descriptor();
+        let d = &occ.descriptor;
         if !(ports_match(&d.inputs, &base.inputs) && ports_match(&d.outputs, &base.outputs)) {
             return Err(LoadError::SlotOccupantMismatch {
                 slot: slot.name.clone(),
