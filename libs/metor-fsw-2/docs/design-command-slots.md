@@ -324,7 +324,7 @@ are never forwarded unparsed):
 
 ```rust
 /// Route one received wire Msg to the declared output whose id matches.
-/// Returns false (and the uplink bumps `uplink.unroutable` health) when no port matches.
+/// Returns false (and the uplink bumps `uplink_unroutable` health) when no port matches.
 pub trait RouteMsg {
     fn route(&mut self, id: PacketId, bytes: &[u8]) -> bool;
 }
@@ -613,7 +613,7 @@ sequences`); boot `SequenceRegistry` still observed by a post-build tap; downlin
 e2e byte-compare against pre-change capture.
 
 **Uplink (P5):** routed second output (add `ReloadSequences` to a test bundle — subscribe
-ids include it, records route to it); unknown id → dropped + `uplink.unroutable` health;
+ids include it, records route to it); unknown id → dropped + `uplink_unroutable` health;
 malformed payload for a known id → dropped, link stays up.
 
 **Ground e2e (workspace):** panel↔FSW loop against a live coordinator — registry renders

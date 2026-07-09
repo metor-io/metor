@@ -449,7 +449,7 @@ async fn drop_policy_never_blocks_and_counts() {
         .0;
     assert!(
         h.errors > 0,
-        "saturated transport should have surfaced telemetry.dropped (errors={})",
+        "saturated transport should have surfaced telemetry_dropped (errors={})",
         h.errors
     );
 }

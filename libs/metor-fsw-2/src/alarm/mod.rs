@@ -607,7 +607,7 @@ impl AlarmSystem {
             if rt.enabled && head.iter().any(|o| o.enabled && o.spec.id == rt.spec.id) {
                 rt.enabled = false;
                 failures.push((
-                    "alarms.duplicate_id",
+                    "alarms_duplicate_id",
                     format!("alarm {:?}: duplicate id — disabled", rt.spec.id),
                 ));
             }
@@ -639,7 +639,7 @@ impl AlarmSystem {
                     } else {
                         rt.enabled = false;
                         failures.push((
-                            "alarms.bad_element",
+                            "alarms_bad_element",
                             format!(
                                 "alarm {:?}: element {} out of bounds for `{}` ({} elements)",
                                 rt.spec.id, rt.element, rt.spec.target.component, elements
@@ -666,7 +666,7 @@ impl AlarmSystem {
                         self.alarms[m].enabled = false;
                     }
                     failures.push((
-                        "alarms.reader_slot",
+                        "alarms_reader_slot",
                         format!(
                             "no reader slot left on `{}.{}` — raise CoordinatorConfig::reader_slack",
                             entry.instance, entry.name
@@ -686,7 +686,7 @@ impl AlarmSystem {
             if rt.enabled && !watched.contains(&m) {
                 rt.enabled = false;
                 failures.push((
-                    "alarms.unresolved_target",
+                    "alarms_unresolved_target",
                     format!(
                         "alarm {:?}: no telemetered component `{}`",
                         rt.spec.id, rt.spec.target.component

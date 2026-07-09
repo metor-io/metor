@@ -375,7 +375,7 @@ each tapped buffer's newest committed record off its ring (at most once per new 
 tap scratch buffers) and pushes it into a bounded, per-tap-coalescing hand-off; a spawned
 sender task drains it and does the awaiting I/O. The cycle never blocks on the link: a
 backed-up transport just causes newer snapshots to overwrite un-sent ones in the hand-off
-(latest-wins), bumping a `telemetry.dropped` health counter — loss on the downlink, never
+(latest-wins), bumping a `telemetry_dropped` health counter — loss on the downlink, never
 delay in the cycle. The transport is pluggable behind the `Transport` trait;
 `TcpTransport` is the shipped implementation (a stream to a ground link or co-located metor-db),
 with a shared-memory queue a natural future alternative. The bytes on the wire are identical
@@ -424,7 +424,7 @@ telemetered message channel and streams each record off-board (the message twin 
 The **uplink** is its read twin: an ordinary `AsyncSystem` (`UplinkSystem`) that owns its own
 connection, receives panel-published Msgs, and routes each by `PacketId` to whichever of its
 declared `CommandOut<M>` outputs matches (multi-output `RouteMsg` dispatch — a Msg matching no
-declared output bumps an `uplink.unroutable` health counter) — a **fully normal message producer**,
+declared output bumps an `uplink_unroutable` health counter) — a **fully normal message producer**,
 subscribing on the ground to exactly the message ids of its declared outputs. `CommandOut<M>` is not
 a distinct type: it is `pub type CommandOut<M, ...> = MsgOut<M, ...>` sugar the `SystemOutput` derive
 recognizes and lowers to an `.untelemetered()` `PortDesc` (`src/message.rs`), so inbound control is

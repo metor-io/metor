@@ -141,9 +141,15 @@ where
     /// Bumps the named error counter along with the total `errors` count.
     ///
     /// Kinds beyond [`MAX_ERR_KINDS`] still count toward the total but get no
-    /// counter of their own.
+    /// counter of their own. The kind becomes a path segment of the counter's
+    /// component (`health.error_counts.<kind>`), so it must be non-empty and
+    /// must not contain `.` — a key the map rejects would drop every counter
+    /// from the health record. Use `_` to separate words.
     pub fn error(&mut self, kind: &str) {
-        eprintln!("error {kind:?}");
+        debug_assert!(
+            !kind.is_empty() && !kind.contains('.'),
+            "error kind {kind:?} is not a valid path segment; use `_`, not `.`"
+        );
         self.errors += 1;
         if let Some((_, n)) = self.error_counts.iter_mut().find(|(k, _)| k == kind) {
             *n += 1;
@@ -179,11 +185,14 @@ where
         };
         let counts = &self.error_counts;
         let _ = self.health.write_with(&frame, |fw| {
-            let _ = fw.map(offset_of!(SystemHealth, error_counts), |m| {
+            let res = fw.map(offset_of!(SystemHealth, error_counts), |m| {
                 for (kind, n) in counts {
                     m.insert(kind, *n);
                 }
             });
+            // `error` asserts every kind is a valid path segment, so the map
+            // cannot reject a key here.
+            debug_assert!(res.is_ok(), "error kind rejected as a map key: {res:?}");
         });
     }
 
@@ -203,5 +212,106 @@ where
                 }
             });
         });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::port::{Input, buffer_capacity};
+    use metor_fsw_ring::{Config, RingBuffer};
+
+    fn port_with_readers() -> (HealthPort, Input<SystemHealth>, Input<SystemLog>) {
+        let health_ring = RingBuffer::create_in_memory(Config {
+            capacity: buffer_capacity::<SystemHealth>(8),
+            max_readers: 1,
+        });
+        let log_ring = RingBuffer::create_in_memory(Config {
+            capacity: buffer_capacity::<SystemLog>(8),
+            max_readers: 1,
+        });
+        let port = HealthPort::new(
+            Output::new(health_ring.writer(NoWake, NoWake).unwrap()),
+            Output::new(log_ring.writer(NoWake, NoWake).unwrap()),
+        );
+        let health_in = Input::new(health_ring.view(NoWake, NoWake).unwrap());
+        let log_in = Input::new(log_ring.view(NoWake, NoWake).unwrap());
+        (port, health_in, log_in)
+    }
+
+    #[test]
+    fn error_counts_land_in_the_published_frame() {
+        let (mut port, mut health_in, _log_in) = port_with_readers();
+        port.error("imu_missing");
+        port.error("imu_missing");
+        port.error("i2c_timeout");
+        port.end_cycle(Timestamp(7), 12);
+
+        let grant = health_in.latest().expect("health published");
+        let frame = grant.get();
+        assert_eq!(frame.timestamp, Timestamp(7));
+        assert_eq!(frame.cycles, 1);
+        assert_eq!(frame.errors, 3);
+        assert_eq!(frame.last_execute_micros, 12);
+        let counts = grant.map::<u64>(offset_of!(SystemHealth, error_counts));
+        assert_eq!(counts.get("imu_missing"), Some(2));
+        assert_eq!(counts.get("i2c_timeout"), Some(1));
+        assert_eq!(counts.get("absent"), None);
+    }
+
+    #[test]
+    fn kinds_past_the_cap_count_toward_the_total_only() {
+        let (mut port, mut health_in, _log_in) = port_with_readers();
+        for i in 0..MAX_ERR_KINDS + 2 {
+            port.error(&format!("kind_{i}"));
+        }
+        // A capped-out kind still folds into an existing counter.
+        port.error("kind_0");
+        port.end_cycle(Timestamp(1), 0);
+
+        let grant = health_in.latest().expect("health published");
+        assert_eq!(grant.get().errors, (MAX_ERR_KINDS + 3) as u64);
+        let counts = grant.map::<u64>(offset_of!(SystemHealth, error_counts));
+        assert_eq!(counts.len(), MAX_ERR_KINDS);
+        assert_eq!(counts.get("kind_0"), Some(2));
+        // The kinds past the cap got no counter of their own.
+        assert_eq!(counts.get(&format!("kind_{MAX_ERR_KINDS}")), None);
+    }
+
+    #[test]
+    #[cfg_attr(debug_assertions, should_panic(expected = "not a valid path segment"))]
+    fn dotted_kind_is_rejected_in_debug() {
+        let (mut port, _health_in, _log_in) = port_with_readers();
+        port.error("telemetry.dropped");
+        // In release builds the assert compiles out; nothing to check here
+        // beyond "does not corrupt the counter list", which the publish-path
+        // debug_assert covers in debug builds.
+    }
+
+    #[test]
+    fn log_lines_are_capped_and_truncated() {
+        let (mut port, _health_in, mut log_in) = port_with_readers();
+        let long = "x".repeat(LOG_MSG_CAP + 20);
+        port.log(Level::Error, &long);
+        for i in 0..MAX_LINES + 3 {
+            port.log(Level::Info, &format!("line {i}"));
+        }
+        port.end_cycle(Timestamp(3), 0);
+
+        let grant = log_in.latest().expect("log published");
+        let lines = grant.list::<LogLine>(offset_of!(SystemLog, lines));
+        assert_eq!(lines.len(), MAX_LINES);
+        let first = lines.get(0).expect("first line");
+        assert_eq!(first.level, Level::Error as u8);
+        assert_eq!(first.len as usize, LOG_MSG_CAP);
+        assert_eq!(&first.msg[..], &long.as_bytes()[..LOG_MSG_CAP]);
+    }
+
+    #[test]
+    fn quiet_cycle_publishes_health_but_no_log() {
+        let (mut port, mut health_in, mut log_in) = port_with_readers();
+        port.end_cycle(Timestamp(1), 0);
+        assert!(health_in.latest().is_some());
+        assert!(log_in.latest().is_none());
     }
 }
