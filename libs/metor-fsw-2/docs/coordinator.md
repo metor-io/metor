@@ -403,10 +403,11 @@ shared by all three, since a runtime slot's lifecycle is a strict superset of th
 one:
 
 ```rust
-pub enum StopReason { Panicked }
+pub enum StopReason { Panicked, ProcessDied }
 
 pub enum SlotState {
     Empty,              // no occupant yet (SlotRunner only)
+    Loading,             // a process slot's Load pipeline is mid-flight (SlotRunner only, wire phase 5)
     Loaded,              // occupant built, not yet polling (SlotRunner only)
     Running,             // polled every cycle — the only state CyclicRunner/DlSlot ever reach
     Done { outcome: u8 }, // the occupant's future returned Ready — terminal success (SlotRunner only)
@@ -414,14 +415,18 @@ pub enum SlotState {
 }
 ```
 
-`Panicked` — the only stop reason — is reachable only by a `.so`-backed slot (`DlSlot`, or a
-`SlotRunner` whose occupant panics inside its boundary): it returns `FswStatus::Panicked` and
-the slot hard-stops. A static `CyclicRunner` cannot produce it (a panic there unwinds the host
-directly), so a static `CyclicRunner` never actually stops; it and a `DlSlot` only ever occupy
-`Running` or `Stopped`. `Empty`/`Loaded`/`Done` are reachable only through a `SlotRunner`'s
-runtime lifecycle commands (`docs/sequences-slots.md` §3, `docs/messages.md` §4). Once
-`Stopped`, a slot is never cleared by any kind (a `SlotRunner`'s `Stopped` still needs an
-explicit `Reset` to become `Loaded` again, not an automatic clear).
+`Panicked` is reachable only by a `.so`-backed slot (`DlSlot`, or a `SlotRunner` whose occupant
+panics inside its boundary): it returns `FswStatus::Panicked` and the slot hard-stops.
+`ProcessDied` is the process twin: a worker died — or, for a process slot, failed its load
+pipeline — and its ring roles were reclaimed (`docs/process-systems.md` §6,
+`docs/process-slots.md` §7). A static `CyclicRunner` cannot produce either (a panic there
+unwinds the host directly), so a static `CyclicRunner` never actually stops; it and a `DlSlot`
+only ever occupy `Running` or `Stopped`. `Empty`/`Loading`/`Loaded`/`Done` are reachable only
+through a `SlotRunner`'s runtime lifecycle commands (`docs/sequences-slots.md` §3,
+`docs/messages.md` §4), and `Loading` only through a **process** slot's polled Load pipeline
+(`docs/process-slots.md` §4) — an in-process Load binds synchronously. Once `Stopped`, a slot
+is never cleared by any kind (a `SlotRunner`'s `Stopped` still needs an explicit `Reset` to
+become `Loaded` again, not an automatic clear).
 
 ### 3.5 Surfacing stopped systems
 
@@ -432,9 +437,12 @@ process systems' worker facts. When either changes it:
   (NAME `"coordinator"`, frame name `"coordinator_status"`) carrying a `FrameList<StoppedEntry>` of
   up to `MAX_STOPPED` (= 32) entries, each a reason code plus a fixed-capacity name buffer
   (`STATUS_NAME_CAP` = 48), and a `FrameList<WorkerEntry>` of up to `MAX_WORKERS` (= 32) entries —
-  one per process system, carrying the worker's pid (`0` between workers), restart count, and a
-  `WorkerRunState` code (Stopped=0/Restarting=1/Running=2), which is how telemetry says a system
-  runs out-of-process at all (`Coordinator::workers()` is the host-side accessor); and
+  one per process system **or process slot**, carrying the worker's pid (`0` between workers),
+  restart count, and a `WorkerRunState` code (Stopped=0/Restarting=1/Running=2), which is how
+  telemetry says a system runs out-of-process at all (`Coordinator::workers()` is the host-side
+  accessor). A process slot's entry counts unplanned occupant-worker deaths in `restarts` (its
+  Loads are commanded, not anomalies) and reports `Loading` as `Restarting`
+  (`docs/process-slots.md` §9); and
 - logs a stopped-set change to coordinator health (a `system_stopped` error counter plus a
   `Level::Warn` log line per stopped system, then `end_cycle`). Worker step timeouts and restarts
   land there too, as `proc_step_timeout` / `proc_restart` counters.

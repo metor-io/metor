@@ -1,6 +1,16 @@
 # Design — process-mode slots
 
-> **Status: proposed**
+> **Status: implemented** (2026-07-08). Built as planned in
+> `docs/process-slots-plan.md` W1–W7, with the §10 open questions resolved to
+> this document's recommendations: runtime `Stop` is kill, `Loading` is a
+> `SlotState` variant with wire code 5, and there is no auto-restart. Two
+> deltas from this text are worth calling out: the shipped runtime command
+> set has no `Unload` verb (§3's table row is aspirational — a slot returns
+> to `Empty` only at mission teardown, and `Stop`/`Reset`/`Load`-over-terminal
+> cover the runtime teardowns), and `add_slot` takes no mode flag — it
+> derives a slot's process mode from backing uniformity over the allowed set
+> (`OccupantBacking::Artifact` throughout; a mixed set is rejected, per §8's
+> per-slot-means-all-occupants rule).
 
 Runtime slots (`docs/sequences-slots.md`) load their occupants with `DlSystem::open` and run
 them in the coordinator's address space; process systems (`docs/process-systems.md`) run a

@@ -1,6 +1,18 @@
 # Implementation plan — process-mode slots
 
-> **Status: proposed**
+> **Landed 2026-07-08**, one commit per wave, as planned. Notable in-flight
+> adjustments: W3's shared core became a `WorkerHandle` struct (embedded by
+> `ProcSlot` and `SeqWorker`, its `Drop` the kill/reap/reclaim teardown) and
+> the blocking init-barrier variant is `SeqWorker::spawn` + `wait_ready`
+> rather than a separate `spawn_blocking`; W4 kept `add_slot`'s signature
+> and derives process mode from backing uniformity over the allowed set
+> (mixed sets rejected) instead of adding a parameter; W6's suite joined
+> `tests/proc_integration.rs` (one `worker_entry` harness) rather than a new
+> test target, gets its mid-run kill/abort window from a 1 ns simulated
+> clock instead of a park-forever fixture param, and the seq fixture grew a
+> load-time canary constructor for the isolation assertion. The shipped
+> command set has no `Unload` verb, so W6's unload leg is covered by the
+> occupant swap (Load over a terminal) and teardown.
 
 Design: `docs/process-slots.md`. Summary of what we build: a **sequence mode** in the worker's
 run loop (latch `FswStatus::Done`, never re-poll a `Ready` future), a host-side **`SeqWorker`**

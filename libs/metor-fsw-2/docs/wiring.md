@@ -214,7 +214,11 @@ system "plant" type="Plant" artifact="plant" gain=5.0       // dl (references ar
   artifact in its **own worker process** instead of dlopen'ing it in-process
   (`docs/process-systems.md`): resolve obtains its descriptor from a describe-mode worker, and
   `build()` spawns the run worker. Everything else about the node — `type=` agreement, params,
-  edges — is identical to a dl system. `WiringBuilder`'s `.process()` is the Rust twin.
+  edges — is identical to a dl system. `WiringBuilder`'s `.process()` is the Rust twin. The
+  same property on a `slot` node runs the slot's **occupants** out of process, one worker per
+  `Load` (`docs/process-slots.md`): resolve describes every allowed occupant via a worker (no
+  artifact requirement — occupants are always artifact-backed), and no worker exists until a
+  `Load` picks one. `SlotSpecBuilder::process()` is that surface's Rust twin.
 - Every other property (anything but the reserved `type=`/`artifact=`/`process=`) is a **param** (§6). A system
   with any config property carries [`ParamSource::Kdl`] (its node source text, verbatim); a
   config-less system carries [`ParamSource::None`]. A repeated property or an unrecognized top-level

@@ -294,7 +294,7 @@ this one file, calling `worker_entry()` then `libtest_mimic`-style or plain sequ
   replacement spawns and produces, kills it too past a budget of 1, and
   asserts the terminal stop, `restarts == 1`, pid `0`, and a never-blocked
   producer.
-- **Slots:** process mode still applies to `system` nodes only; a
-  worker-per-occupant mode for runtime slots is future work (the occupant
-  Load/Unload lifecycle would map onto spawn/kill, which the restart
-  machinery now provides the primitive for).
+- **Slots:** the worker-per-occupant mode this reserved is now built —
+  `process=#true` on a `slot` node maps the occupant Load lifecycle onto
+  spawn/kill exactly as anticipated, on these primitives
+  (`docs/process-slots.md`).
