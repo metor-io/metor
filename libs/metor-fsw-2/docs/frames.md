@@ -318,22 +318,26 @@ SysList::as_vtable().apply(table, &mut sink).unwrap().unwrap();
 
 API surface:
 
-- `FrameWriter::new(fixed: &F)` allocates a `LenPacket::table([0, 0], F::MAX_SIZE.min(1 << 16))`
-  and copies `fixed.as_bytes()` after the table base.
-- `FrameWriter::from_packet(packet, fixed)` reuses an existing `LenPacket` (cleared back to the
-  table base) instead of allocating a fresh one — the per-write pooling path used by
-  `Output::write_with` to avoid a malloc+free on every dynamic publish. The cleared buffer is
-  byte-equivalent to a fresh `LenPacket::table([0, 0], _)`.
-- `list(slot_off, build)` — `build` drives a `ListWriter<T>` (`push`, `len`, `is_empty`); the
-  writer 8-aligns, appends the element bytes, and patches the slot at `slot_off` (obtained with
-  `core::mem::offset_of!`).
-- `map(slot_off, build) -> Result<(), WriteError>` — `build` drives a `MapWriter<V>` (`insert`).
-  The writer 8-aligns, lays the entry array (each entry zeroed, `key_off`/`key_len` set, value
-  copied at `value_offset`), then appends the name pool; it patches the slot to the entry array
-  only. Keys are validated on `insert` and the first rejection is surfaced here as
-  `Err(WriteError::DotInKey | EmptyKey)`.
-- `finish() -> LenPacket` returns the backing packet; `table() -> &[u8]` returns the table bytes
-  (offset 0 at the fixed region) — feed either to `VTable::apply` or to the ring.
+- `FrameWriter::new(fixed: &F)` allocates a fresh `FrameScratch` — a
+  `LenPacket::table([0, 0], F::MAX_SIZE.min(1 << 16))` plus the map-key staging buffer — and
+  copies `fixed.as_bytes()` after the table base.
+- `FrameWriter::from_scratch(scratch, fixed)` reuses an existing `FrameScratch` (the packet
+  cleared back to the table base) instead of allocating a fresh one — the per-write pooling
+  path used by `Output::write_with` to avoid a malloc+free on every dynamic publish. The
+  cleared buffer is byte-equivalent to a fresh `LenPacket::table([0, 0], _)`.
+- `list(slot_off, build)` — `build` drives a `ListWriter<T>` (`push`, `len`, `is_empty`) that
+  appends each element's bytes straight into the trailer; the writer 8-aligns first and patches
+  the slot at `slot_off` (obtained with `core::mem::offset_of!`) with the block it measured
+  around the closure.
+- `map(slot_off, build) -> Result<(), KeyError>` — `build` drives a `MapWriter<V>` (`insert`)
+  that appends each fixed-stride entry (header, padding, value at `value_offset`) straight into
+  the trailer. Key bytes stage in the scratch buffer — the pool position is unknown until the
+  entry count is — and the headers carry pool-relative offsets that `map` rebases before
+  appending the pool; the slot delimits the entry array only. Keys are validated on `insert`;
+  the first rejection is surfaced here as `Err(KeyError::DotInKey | EmptyKey)`, rolling the
+  whole member back so the slot stays empty.
+- `finish() -> FrameScratch` hands the pooled backing back; `table() -> &[u8]` returns the
+  table bytes (offset 0 at the fixed region) — feed it to `VTable::apply` or to the ring.
 
 The static-only case needs none of this: a frame with no dynamic fields has its `#[repr(C)]`
 bytes equal to its table bytes, so it is written directly.
@@ -347,8 +351,8 @@ out.write_with(&fixed, |fw: &mut FrameWriter<F>| {          // dynamic: build tr
 })?;
 ```
 
-`write_with` keeps a reused `LenPacket` scratch buffer across calls (via `from_packet`) so a
-per-cycle dynamic publish does not reallocate.
+`write_with` keeps a reused `FrameScratch` across calls (via `from_scratch`/`finish`) so a
+per-cycle dynamic publish allocates nothing after warmup.
 
 ### 3.5 `MAX_SIZE` and buffer sizing
 

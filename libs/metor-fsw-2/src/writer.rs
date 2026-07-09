@@ -13,12 +13,22 @@
 //! | fixed region (slots patched) | pad | list elems | pad | map entries | keys |
 //! offset 0                            '------------ trailer ------------------'
 //! ```
+//!
+//! The builders write straight into the packet — a pushed list element or
+//! inserted map entry lands in the trailer as the call returns. The one thing
+//! that cannot land immediately is a map's key pool: it sits after the entry
+//! array, whose length is unknown until the build closure finishes, so key
+//! bytes stage in a small buffer and the entry headers carry pool-relative
+//! offsets that [`map`](FrameWriter::map) rebases once the pool position is
+//! known. Both the packet and that staging buffer travel together as a
+//! [`FrameScratch`], which `Output::write_with` pools per port — a
+//! steady-state publish of a dynamic frame allocates nothing.
 
 use core::marker::PhantomData;
 use core::mem::size_of;
 
 use metor_proto::types::LenPacket;
-use zerocopy::{Immutable, IntoBytes};
+use zerocopy::{FromBytes, Immutable, IntoBytes};
 
 use crate::dynamic::{MapEntryHeader, Slot, map_stride, map_value_offset};
 use crate::frame::Frame;
@@ -41,6 +51,25 @@ pub enum KeyError {
     EmptyKey,
 }
 
+/// The recycled backing a [`FrameWriter`] builds into: the table packet plus
+/// the map-key staging buffer. `Output::write_with` pools one per port and
+/// threads it through [`FrameWriter::from_scratch`]/[`FrameWriter::finish`],
+/// so the allocations converge to the largest frame written and then recycle.
+pub struct FrameScratch {
+    packet: LenPacket,
+    keys: Vec<u8>,
+}
+
+impl FrameScratch {
+    /// A fresh backing whose packet reserves `cap` bytes.
+    pub fn new(cap: usize) -> Self {
+        Self {
+            packet: LenPacket::table([0, 0], cap),
+            keys: Vec::new(),
+        }
+    }
+}
+
 /// A writer that serializes one frame `F` into a contiguous table inside a
 /// growable [`LenPacket`], fixed region first and dynamic members appended
 /// to the trailer.
@@ -48,106 +77,122 @@ pub struct FrameWriter<F> {
     packet: LenPacket,
     /// Index in `packet.inner` where the fixed region begins.
     base: usize,
+    /// Staging for the in-progress map member's key bytes; emptied back into
+    /// the trailer when the member finishes, so it holds bytes only while a
+    /// [`map`](Self::map) call runs.
+    keys: Vec<u8>,
     _f: PhantomData<F>,
 }
 
 impl<F: Frame + IntoBytes + Immutable> FrameWriter<F> {
-    /// Starts a writer, copying `fixed` in as the fixed region.
+    /// Starts a writer over fresh allocations, copying `fixed` in as the
+    /// fixed region.
     ///
     /// The dynamic slots in `fixed` must be zeroed; construct them as
     /// `FrameList::EMPTY` / `FrameMap::EMPTY`.
     pub fn new(fixed: &F) -> Self {
-        let packet = LenPacket::table([0, 0], F::MAX_SIZE.min(1 << 16));
-        Self::from_packet(packet, fixed)
+        Self::from_scratch(FrameScratch::new(F::MAX_SIZE.min(1 << 16)), fixed)
     }
 
-    /// As [`new`](Self::new), but reuses `packet`'s allocation instead of
-    /// making a fresh one, so callers can pool buffers across frames.
+    /// As [`new`](Self::new), but reuses `scratch`'s allocations instead of
+    /// making fresh ones, so callers can pool the backing across frames.
     ///
     /// The packet is cleared back to its header first, leaving it
     /// byte-equivalent to a newly constructed table packet.
-    pub fn from_packet(mut packet: LenPacket, fixed: &F) -> Self {
+    pub fn from_scratch(scratch: FrameScratch, fixed: &F) -> Self {
+        let FrameScratch { mut packet, mut keys } = scratch;
         packet.clear();
+        keys.clear();
         debug_assert_eq!(packet.inner.len(), TABLE_BASE);
         let base = packet.inner.len();
         packet.extend_from_slice(fixed.as_bytes());
         Self {
             packet,
             base,
+            keys,
             _f: PhantomData,
         }
     }
 
     /// Appends a list to the trailer and patches the slot at `slot_off`
-    /// (obtain it with `core::mem::offset_of!`).
+    /// (obtain it with `core::mem::offset_of!`). Elements land in the trailer
+    /// as they are pushed.
     pub fn list<T: IntoBytes + Immutable>(
         &mut self,
         slot_off: usize,
-        build: impl FnOnce(&mut ListWriter<T>),
+        build: impl FnOnce(&mut ListWriter<'_, T>),
     ) {
-        let mut lw = ListWriter::new();
-        build(&mut lw);
         self.align8();
         let trailer_off = self.table_len();
-        self.packet.extend_from_slice(&lw.bytes);
-        self.patch_slot(slot_off, trailer_off as u32, lw.bytes.len() as u32);
+        let mut lw = ListWriter {
+            packet: &mut self.packet,
+            count: 0,
+            _t: PhantomData,
+        };
+        build(&mut lw);
+        let byte_len = self.table_len() - trailer_off;
+        self.patch_slot(slot_off, trailer_off as u32, byte_len as u32);
     }
 
     /// Appends a map to the trailer as a fixed-stride entry array followed by
     /// a pool of key bytes, then patches the slot at `slot_off`.
     ///
-    /// Errors if any key inserted during `build` was rejected.
+    /// Errors if any key inserted during `build` was rejected, rolling the
+    /// whole member back so the slot stays empty.
     pub fn map<V: IntoBytes + Immutable>(
         &mut self,
         slot_off: usize,
-        build: impl FnOnce(&mut MapWriter<V>),
+        build: impl FnOnce(&mut MapWriter<'_, V>),
     ) -> Result<(), KeyError> {
-        let mut mw = MapWriter::new();
+        self.align8();
+        let entry_array_off = self.table_len();
+        let keys_mark = self.keys.len();
+        let mut mw = MapWriter {
+            packet: &mut self.packet,
+            keys: &mut self.keys,
+            keys_mark,
+            count: 0,
+            error: None,
+            _v: PhantomData,
+        };
         build(&mut mw);
-        if let Some(err) = mw.error {
+        let (count, error) = (mw.count, mw.error);
+        if let Some(err) = error {
+            // Roll the member back — entries out of the trailer, staged keys
+            // out of the buffer — so the slot stays zeroed, as if the call
+            // never ran.
+            self.truncate_table(entry_array_off);
+            self.keys.truncate(keys_mark);
             return Err(err);
         }
 
         let stride = map_stride::<V>() as usize;
-        let value_offset = map_value_offset::<V>() as usize;
-        let count = mw.entries.len();
-
-        self.align8();
-        let entry_array_off = self.table_len();
         let entry_array_len = count * stride;
-        // The key pool sits immediately after the entry array; each entry's
-        // `key_off` points table-absolute into it.
+        // The key pool sits immediately after the entry array. The staged
+        // headers carry pool-relative key offsets (the pool position was
+        // unknown while entries were appended); rebase them now that it is.
         let pool_off = entry_array_off + entry_array_len;
-
-        let mut pool = Vec::new();
-        let mut key_cursor = pool_off;
-        // One entry buffer, re-zeroed each iteration, rather than an
-        // allocation per entry.
-        let mut entry = vec![0u8; stride];
-        for (key, val) in &mw.entries {
-            let kb = key.as_bytes();
-            let vb = val.as_bytes();
-            entry.fill(0);
-            MapEntryHeader {
-                key_off: key_cursor as u32,
-                key_len: kb.len() as u32,
-            }
-            .write_to_prefix(&mut entry)
-            .expect("stride >= size_of::<MapEntryHeader>()");
-            entry[value_offset..value_offset + vb.len()].copy_from_slice(vb);
-            self.packet.extend_from_slice(&entry);
-            pool.extend_from_slice(kb);
-            key_cursor += kb.len();
+        for i in 0..count {
+            let at = self.base + entry_array_off + i * stride;
+            let (header, _) = MapEntryHeader::mut_from_prefix(&mut self.packet.inner[at..])
+                .expect("entry array lies inside the packet");
+            header.key_off += pool_off as u32;
         }
+
         // The slot delimits the entry array only, so `count = byte_len / stride`.
         self.patch_slot(slot_off, entry_array_off as u32, entry_array_len as u32);
-        self.packet.extend_from_slice(&pool);
+        let keys = &self.keys[keys_mark..];
+        self.packet.extend_from_slice(keys);
+        self.keys.truncate(keys_mark);
         Ok(())
     }
 
-    /// Finishes the frame, returning the backing [`LenPacket`].
-    pub fn finish(self) -> LenPacket {
-        self.packet
+    /// Finishes the frame, handing the pooled backing back to the caller.
+    pub fn finish(self) -> FrameScratch {
+        FrameScratch {
+            packet: self.packet,
+            keys: self.keys,
+        }
     }
 
     /// The raw table bytes (fixed region plus trailer), with the fixed region
@@ -166,6 +211,15 @@ impl<F: Frame + IntoBytes + Immutable> FrameWriter<F> {
         }
     }
 
+    /// Truncates the table back to `table_len` bytes, keeping the packet's
+    /// length prefix consistent (the prefix counts everything after itself).
+    fn truncate_table(&mut self, table_len: usize) {
+        let end = self.base + table_len;
+        self.packet.inner.truncate(end);
+        let len = (end - size_of::<u32>()) as u32;
+        self.packet.inner[..size_of::<u32>()].copy_from_slice(&len.to_le_bytes());
+    }
+
     fn patch_slot(&mut self, slot_off: usize, trailer_off: u32, byte_len: u32) {
         let at = self.base + slot_off;
         Slot {
@@ -177,27 +231,30 @@ impl<F: Frame + IntoBytes + Immutable> FrameWriter<F> {
     }
 }
 
-/// A staging buffer that accumulates a list's elements as raw bytes until
-/// [`FrameWriter::list`] copies them back-to-back into the trailer.
-pub struct ListWriter<T> {
-    bytes: Vec<u8>,
+/// Zero-fill `n` bytes of padding.
+fn pad_zero(packet: &mut LenPacket, mut n: usize) {
+    const ZERO: [u8; 8] = [0; 8];
+    while n > 0 {
+        let k = n.min(ZERO.len());
+        packet.extend_from_slice(&ZERO[..k]);
+        n -= k;
+    }
+}
+
+/// Appends a list's elements straight into the trailer;
+/// [`FrameWriter::list`] measures the block around the build closure and
+/// patches the slot afterwards.
+pub struct ListWriter<'a, T> {
+    packet: &'a mut LenPacket,
     count: usize,
     _t: PhantomData<T>,
 }
 
-impl<T: IntoBytes + Immutable> ListWriter<T> {
-    fn new() -> Self {
-        Self {
-            bytes: Vec::new(),
-            count: 0,
-            _t: PhantomData,
-        }
-    }
-
+impl<T: IntoBytes + Immutable> ListWriter<'_, T> {
     /// Appends one element.
     pub fn push(&mut self, elem: T) {
         debug_assert_eq!(size_of::<T>(), elem.as_bytes().len());
-        self.bytes.extend_from_slice(elem.as_bytes());
+        self.packet.extend_from_slice(elem.as_bytes());
         self.count += 1;
     }
 
@@ -211,33 +268,46 @@ impl<T: IntoBytes + Immutable> ListWriter<T> {
     }
 }
 
-/// A staging buffer that accumulates a map's entries until
-/// [`FrameWriter::map`] serializes them into the trailer.
+/// Appends a map's entries straight into the trailer as they are inserted,
+/// staging only the key bytes (their pool position is unknown until the
+/// build closure finishes).
 ///
 /// Keys are validated on insert and the first rejection is surfaced by
-/// [`FrameWriter::map`].
-pub struct MapWriter<V> {
-    entries: Vec<(String, V)>,
+/// [`FrameWriter::map`], which rolls the whole member back.
+pub struct MapWriter<'a, V> {
+    packet: &'a mut LenPacket,
+    keys: &'a mut Vec<u8>,
+    /// The staging length at member start; header key offsets are stored
+    /// relative to it until the member's pool position is known.
+    keys_mark: usize,
+    count: usize,
     error: Option<KeyError>,
+    _v: PhantomData<V>,
 }
 
-impl<V: IntoBytes + Immutable> MapWriter<V> {
-    fn new() -> Self {
-        Self {
-            entries: Vec::new(),
-            error: None,
-        }
-    }
-
+impl<V: IntoBytes + Immutable> MapWriter<'_, V> {
     /// Inserts a `(key, value)` entry, rejecting empty or `.`-containing keys.
     pub fn insert(&mut self, key: &str, value: V) {
         if let Err(e) = validate_key(key) {
             self.error.get_or_insert(e);
             return;
         }
-        // Store `V` itself and emit its bytes at serialize time, so insertion
-        // costs no allocation beyond the key.
-        self.entries.push((key.to_string(), value));
+        let kb = key.as_bytes();
+        let value_offset = map_value_offset::<V>() as usize;
+        let stride = map_stride::<V>() as usize;
+        // One fixed-stride entry: the header (with its key offset still
+        // pool-relative), padding up to the value's alignment, the value
+        // bytes, padding out to the stride.
+        let header = MapEntryHeader {
+            key_off: (self.keys.len() - self.keys_mark) as u32,
+            key_len: kb.len() as u32,
+        };
+        self.packet.extend_from_slice(header.as_bytes());
+        pad_zero(self.packet, value_offset - size_of::<MapEntryHeader>());
+        self.packet.extend_from_slice(value.as_bytes());
+        pad_zero(self.packet, stride - value_offset - size_of::<V>());
+        self.keys.extend_from_slice(kb);
+        self.count += 1;
     }
 }
 

@@ -136,7 +136,7 @@ pub mod proc;
 pub use dynamic::{FrameList, FrameMap, Slot};
 pub use frame::Frame;
 pub use reader::{ListReader, MapReader};
-pub use writer::{FrameWriter, KeyError, ListWriter, MapWriter};
+pub use writer::{FrameScratch, FrameWriter, KeyError, ListWriter, MapWriter};
 
 pub use metor_fsw_ring::{ReadError, WriteError};
 

@@ -28,7 +28,6 @@ use core::marker::PhantomData;
 use metor_fsw::Decomponentize;
 use metor_fsw_ring::{NoWake, ReadError, ReadGrant, View, WakeSink, WakeSource, Writer, frame_len};
 use metor_proto::error::Error as ProtoError;
-use metor_proto::types::LenPacket;
 use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
 
 use crate::binder::RingSource;
@@ -36,7 +35,7 @@ use crate::descriptor::{PortDecl, PortDesc};
 use crate::dynamic::Slot;
 use crate::frame::Frame;
 use crate::reader::{ListReader, MapReader};
-use crate::writer::FrameWriter;
+use crate::writer::{FrameScratch, FrameWriter};
 
 /// Default in-flight record depth for a port. Must be at least 2, since a
 /// latest-wins consumer permanently pins the newest record (see
@@ -88,10 +87,11 @@ where
     WS: WakeSink,
 {
     writer: Writer<WD, WS>,
-    /// Reused table-bytes buffer for [`write_with`](Self::write_with), so a
-    /// per-cycle publish of a dynamic frame does not allocate a fresh
-    /// `LenPacket` every call. `None` until the first such write.
-    scratch: Option<LenPacket>,
+    /// Reused table-packet + key-staging backing for
+    /// [`write_with`](Self::write_with), so a per-cycle publish of a dynamic
+    /// frame allocates nothing after warmup. `None` until the first such
+    /// write.
+    scratch: Option<FrameScratch>,
     /// Records dropped by the infallible [`publish`](Self::publish) path,
     /// collected by the runner via [`take_dropped`](Self::take_dropped).
     dropped: u64,
@@ -181,14 +181,14 @@ where
         fixed: &F,
         build: impl FnOnce(&mut FrameWriter<F>),
     ) -> Result<(), metor_fsw_ring::WriteError> {
-        let packet = self
+        let scratch = self
             .scratch
             .take()
-            .unwrap_or_else(|| LenPacket::table([0, 0], F::MAX_SIZE.min(1 << 16)));
-        let mut fw = FrameWriter::from_packet(packet, fixed);
+            .unwrap_or_else(|| FrameScratch::new(F::MAX_SIZE.min(1 << 16)));
+        let mut fw = FrameWriter::from_scratch(scratch, fixed);
         build(&mut fw);
         let res = self.writer.try_write(fw.table());
-        // Retain the (grown) buffer for the next publish.
+        // Retain the (grown) backing for the next publish.
         self.scratch = Some(fw.finish());
         res
     }
