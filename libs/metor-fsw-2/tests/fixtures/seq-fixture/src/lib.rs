@@ -14,6 +14,36 @@ use core::time::Duration;
 use metor_fsw_2::Outcome;
 use metor_fsw_2::sequence::{progress, wait};
 
+/// Load-time canary for the process-slot isolation tests: when
+/// `SEQ_FIXTURE_CANARY` names a file, mapping this object appends the loading
+/// process's pid to it, so a host can prove which address spaces ever held
+/// the artifact (a process slot's host must never appear — only its describe
+/// and run workers do). Without the env var, every in-process test's dlopen,
+/// this is a no-op.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+extern "C" fn canary() {
+    if let Ok(path) = std::env::var("SEQ_FIXTURE_CANARY") {
+        use std::io::Write;
+        if let Ok(mut f) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+        {
+            let _ = writeln!(f, "{}", std::process::id());
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+#[used]
+#[unsafe(link_section = "__DATA,__mod_init_func")]
+static CANARY: extern "C" fn() = canary;
+
+#[cfg(target_os = "linux")]
+#[used]
+#[unsafe(link_section = ".init_array")]
+static CANARY: extern "C" fn() = canary;
+
 /// Waits two simulated microseconds, completing unless aborted first.
 #[metor_fsw_2::sequence]
 async fn waiter() -> Outcome {

@@ -11,19 +11,31 @@
 //! producer and an in-process dl twin, telemetry taps on the worker's
 //! outputs (user frame, Postcard events, implicit health), clean teardown,
 //! and a SIGKILL'd worker: `StopReason::ProcessDied`, ring reclamation, and
-//! the rest of the graph flowing on.
+//! the rest of the graph flowing on. The second half covers **process-mode
+//! slots** (`docs/process-slots.md`): the polled Load pipeline and occupant
+//! swap over one ring set, worker death folding to a terminal stop with an
+//! operator `Reset` recovery, the cooperative abort crossing the process
+//! boundary, and the isolation canary proving the host never maps an
+//! occupant artifact.
 //!
-//! The fixture cdylib is `metor-fsw-2-dl-fixture`, built by a nested cargo
-//! invocation exactly as in `dl_integration.rs`; if it cannot be produced
-//! the tests skip with a message rather than fail.
+//! The fixture cdylibs are `metor-fsw-2-dl-fixture` and
+//! `metor-fsw-2-seq-fixture`, built by nested cargo invocations exactly as
+//! in `dl_integration.rs`; if one cannot be produced the tests skip with a
+//! message rather than fail.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::time::{Duration, Instant};
 
-use metor_fsw_2::metor_proto::types::{ComponentId, Timestamp};
+use metor_fsw_2::metor_proto::types::{ComponentId, Msg, Timestamp};
+use metor_fsw_2::metor_proto_wkt::{
+    SequenceChannelEvent, SequenceCommand, SequenceCommandKind, SequenceEventKind,
+};
 use metor_fsw_2::{
-    ClockMode, Coordinator, CoordinatorConfig, CyclicSystem, Frame, Input, MsgIn, Out, Output,
-    PortRef, StopReason, System, SystemHealth, SystemInput, SystemOutput, WorkerRunState,
+    AllowedOccupant, ClockMode, Coordinator, CoordinatorConfig, CyclicSystem, Frame,
+    InitialOccupant, Input, MsgIn, OccupantBacking, Out, Output, PortRef, SequenceStatus,
+    SlotStatus, StopReason, System, SystemHealth, SystemInput, SystemOutput, WorkerRunState,
+    split_record,
 };
 use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
 
@@ -31,10 +43,23 @@ fn main() {
     // The whole point of this harness: a spawned worker child never reaches
     // the tests below.
     metor_fsw_2::proc::worker_entry();
-    let Some(lib_path) = locate_fixture() else {
+    let Some(lib_path) = locate_fixture("metor-fsw-2-dl-fixture", "metor_fsw_2_dl_fixture") else {
         eprintln!("skipping proc_integration: fixture build unavailable");
         return;
     };
+    let Some(seq_lib) = locate_fixture("metor-fsw-2-seq-fixture", "metor_fsw_2_seq_fixture")
+    else {
+        eprintln!("skipping proc_integration: seq fixture build unavailable");
+        return;
+    };
+    // The isolation canary (see the seq fixture): every process that maps the
+    // occupant artifact appends its pid to this file, workers included, since
+    // they inherit the environment. Set once, before any coordinator exists,
+    // while this process is still single-threaded.
+    let canary = std::env::temp_dir().join(format!("seq-fixture-canary-{}", std::process::id()));
+    let _ = std::fs::remove_file(&canary);
+    // SAFETY: no other thread is running yet.
+    unsafe { std::env::set_var("SEQ_FIXTURE_CANARY", &canary) };
     // Each test on its own thread, sequentially: `stellarator::run` consumes
     // the thread-local executor, so one thread cannot host two runs (libtest
     // gives every #[test] its own thread for the same reason).
@@ -54,6 +79,22 @@ fn main() {
         worker_restarts_then_exhausts_budget,
         &lib_path,
     );
+    run(
+        "proc_slot_lifecycle_swap_and_isolation",
+        proc_slot_lifecycle_swap_and_isolation,
+        &seq_lib,
+    );
+    run(
+        "proc_slot_death_is_terminal_and_reset_recovers",
+        proc_slot_death_is_terminal_and_reset_recovers,
+        &seq_lib,
+    );
+    run(
+        "proc_slot_abort_crosses_the_boundary",
+        proc_slot_abort_crosses_the_boundary,
+        &seq_lib,
+    );
+    let _ = std::fs::remove_file(&canary);
 }
 
 // ---------------------------------------------------------------------------
@@ -123,8 +164,7 @@ impl CyclicSystem for Ticker {
 // Fixture build/locate (as in dl_integration.rs)
 // ---------------------------------------------------------------------------
 
-fn fixture_lib_name() -> String {
-    let stem = "metor_fsw_2_dl_fixture";
+fn fixture_lib_name(stem: &str) -> String {
     if cfg!(target_os = "macos") {
         format!("lib{stem}.dylib")
     } else if cfg!(target_os = "windows") {
@@ -134,14 +174,9 @@ fn fixture_lib_name() -> String {
     }
 }
 
-fn locate_fixture() -> Option<PathBuf> {
+fn locate_fixture(package: &str, stem: &str) -> Option<PathBuf> {
     let output = Command::new(env!("CARGO"))
-        .args([
-            "build",
-            "-p",
-            "metor-fsw-2-dl-fixture",
-            "--message-format=json",
-        ])
+        .args(["build", "-p", package, "--message-format=json"])
         .output()
         .ok()?;
     if !output.status.success() {
@@ -152,7 +187,7 @@ fn locate_fixture() -> Option<PathBuf> {
         return None;
     }
     let stdout = String::from_utf8_lossy(&output.stdout);
-    let want = fixture_lib_name();
+    let want = fixture_lib_name(stem);
     for line in stdout.lines() {
         if !line.contains("compiler-artifact") || !line.contains(&want) {
             continue;
@@ -526,5 +561,496 @@ fn worker_restarts_then_exhausts_budget(lib_path: &Path) {
 
     drop(coord);
     drop((ticker_health, out_view));
+    assert!(child_pids().is_empty(), "all workers reaped");
+}
+
+// ---------------------------------------------------------------------------
+// Process-mode slots (docs/process-slots.md)
+// ---------------------------------------------------------------------------
+
+// SlotState wire codes (SlotState::code).
+const LOADED: u8 = 1;
+const RUNNING: u8 = 2;
+const DONE: u8 = 3;
+const SLOT_STOPPED: u8 = 4;
+const LOADING: u8 = 5;
+// Terminal SequenceStatus run_state codes.
+const ABORTED: u8 = 2;
+
+/// A command addressed to the slot channel `ch`.
+fn seq_cmd(ch: &str, command: SequenceCommandKind) -> SequenceCommand {
+    SequenceCommand {
+        channel: ch.to_string(),
+        command,
+    }
+}
+
+fn seq_load(ch: &str, occupant: &str) -> SequenceCommand {
+    seq_cmd(
+        ch,
+        SequenceCommandKind::Load {
+            name: occupant.to_string(),
+        },
+    )
+}
+
+/// Drain a message ring, decoding every record as one `Msg` type.
+fn drain_msgs<M: Msg + serde::de::DeserializeOwned>(
+    view: &mut metor_fsw_2::ring::View<metor_fsw_2::ring::NoWake, metor_fsw_2::ring::NoWake>,
+) -> Vec<M> {
+    let mut out = Vec::new();
+    let mut buf = Vec::new();
+    while view
+        .try_read_into(&mut buf)
+        .expect("no lap on the message tap")
+    {
+        let (id, payload) = split_record(&buf).expect("a 2-byte-id record");
+        assert_eq!(id, M::ID, "every record on this channel carries M::ID");
+        out.push(postcard::from_bytes::<M>(payload).expect("postcard round-trip"));
+    }
+    out
+}
+
+/// Await phase `want` on the slot's status stream, appending every newly
+/// published phase to `phases` with consecutive repeats deduplicated (the
+/// frame is republished each cycle). Gives up at `deadline` and answers
+/// `false`, so a wedged run fails the driver's assertion with the collected
+/// phase walk instead of hanging the executor.
+async fn wait_phase(
+    view: &mut Input<SlotStatus>,
+    phases: &mut Vec<u8>,
+    want: u8,
+    deadline: Instant,
+) -> bool {
+    let from = phases.len();
+    loop {
+        view.drain(|f| {
+            let p = f.get().phase;
+            if phases.last() != Some(&p) {
+                phases.push(p);
+            }
+        })
+        .expect("no lap on the slot status tap");
+        if phases[from..].contains(&want) {
+            return true;
+        }
+        if Instant::now() >= deadline {
+            return false;
+        }
+        stellarator::yield_now().await;
+    }
+}
+
+/// `want` appears within `walk` in order (not necessarily adjacent).
+fn is_subsequence(walk: &[u8], want: &[u8]) -> bool {
+    let mut it = walk.iter();
+    want.iter().all(|w| it.any(|p| p == w))
+}
+
+/// A compact comparable token per event kind (`SequenceEventKind` derives no
+/// `PartialEq`).
+fn event_token(kind: &SequenceEventKind) -> String {
+    match kind {
+        SequenceEventKind::Loaded { name } => format!("loaded:{name}"),
+        SequenceEventKind::Unloaded => "unloaded".to_string(),
+        SequenceEventKind::Started => "started".to_string(),
+        SequenceEventKind::Progress { detail } => format!("progress:{detail}"),
+        SequenceEventKind::Stopped => "stopped".to_string(),
+        SequenceEventKind::Aborted => "aborted".to_string(),
+        SequenceEventKind::Completed => "completed".to_string(),
+        SequenceEventKind::Failed { reason } => format!("failed:{reason}"),
+    }
+}
+
+/// One allowed occupant behind an artifact backing, its descriptor sourced
+/// exactly as `resolve` sources it: a describe worker, never a host dlopen.
+fn artifact_occ(name: &str, seq_lib: &Path) -> AllowedOccupant {
+    let descriptor = proc_descriptor(seq_lib);
+    assert_eq!(descriptor.name, "waiter");
+    AllowedOccupant {
+        name: name.to_string(),
+        params: Vec::new(),
+        descriptor,
+        backing: OccupantBacking::Artifact(seq_lib.to_path_buf()),
+    }
+}
+
+/// A simulated clock advancing 1 ns per cycle, so the waiter fixture's 2 µs
+/// wait spans ~2000 cycles — a wide mid-run window to kill or abort into
+/// (under a wall clock it elapses within one cycle).
+fn slow_sim_config() -> CoordinatorConfig {
+    CoordinatorConfig {
+        cycle_rate: 1000.0,
+        default_depth: 8,
+        clock: ClockMode::Simulated {
+            dt: Duration::from_nanos(1),
+        },
+        proc_step_timeout: Duration::from_millis(50),
+        ..CoordinatorConfig::default()
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Slot test 1: lifecycle + occupant swap through the KDL front-end, plus the
+// isolation canary
+// ---------------------------------------------------------------------------
+
+fn proc_slot_lifecycle_swap_and_isolation(seq_lib: &Path) {
+    use metor_fsw_2::wiring::{Registry, parse, resolve};
+
+    // Two artifact ids over the one built cdylib: two allowed occupants with
+    // distinct Load names and identical contracts.
+    let kdl = r#"
+coordinator cycle_rate=500.0
+artifact "alpha" crate="metor-fsw-2-seq-fixture" lib="metor_fsw_2_seq_fixture" type="waiter"
+artifact "beta"  crate="metor-fsw-2-seq-fixture" lib="metor_fsw_2_seq_fixture" type="waiter"
+slot "adcs" process=#true {
+    allow occupant="alpha"
+    allow occupant="beta"
+}
+connect "coordinator" -> "adcs" msg="SequenceCommand"
+"#;
+    let mut wiring = parse(kdl).expect("the process-slot mission parses");
+    // `main` already built and located the fixture; fill the paths in place
+    // of the build driver.
+    for artifact in &mut wiring.artifacts {
+        artifact.path = Some(seq_lib.to_path_buf());
+    }
+    let mut coord =
+        resolve(&wiring, &Registry::new()).expect("resolve describes each occupant via a worker");
+    // Resolve ran short-lived describe workers only, and `build()` spawned
+    // nothing either: a process slot spawns one worker per Load.
+    assert!(child_pids().is_empty(), "no worker child before the first Load");
+
+    let mut slot_view: Input<SlotStatus> = Input::new(
+        coord
+            .registry()
+            .view(ComponentId::new("adcs.slot_status"))
+            .expect("slot status registered")
+            .expect("reader slot available"),
+    );
+    let mut events_view = coord
+        .registry()
+        .view(ComponentId::new("adcs.sequences"))
+        .expect("the slot events channel is registered")
+        .expect("reader slot available");
+    let mut control = coord.control_handle().expect("taken once per coordinator");
+
+    // Load alpha through the polled pipeline, run it to Done, then Load beta
+    // over the terminal — the occupant swap — and run beta to Done over the
+    // very same rings. Wall clock: the pipeline phases are real spawn+dlopen
+    // time, and the waiter's 2 µs wait elapses within a cycle.
+    let (coord, phases, pid_a, pid_b) = stellarator::run(|| async move {
+        let driver = stellarator::spawn(async move {
+            let mut phases: Vec<u8> = Vec::new();
+            let deadline = Instant::now() + Duration::from_secs(20);
+            control.emit(&seq_load("adcs", "alpha")).unwrap();
+            assert!(
+                wait_phase(&mut slot_view, &mut phases, LOADED, deadline).await,
+                "alpha's pipeline reached Loaded: {phases:?}"
+            );
+            let pid_a = *child_pids().first().expect("alpha's worker is live");
+            control.emit(&seq_cmd("adcs", SequenceCommandKind::Start)).unwrap();
+            assert!(
+                wait_phase(&mut slot_view, &mut phases, DONE, deadline).await,
+                "alpha ran to Done: {phases:?}"
+            );
+            control.emit(&seq_load("adcs", "beta")).unwrap();
+            assert!(
+                wait_phase(&mut slot_view, &mut phases, LOADED, deadline).await,
+                "beta's pipeline reached Loaded: {phases:?}"
+            );
+            let pid_b = *child_pids().first().expect("beta's worker is live");
+            control.emit(&seq_cmd("adcs", SequenceCommandKind::Start)).unwrap();
+            assert!(
+                wait_phase(&mut slot_view, &mut phases, DONE, deadline).await,
+                "beta ran to Done: {phases:?}"
+            );
+            (phases, pid_a, pid_b)
+        });
+        coord.run_for(2500).await;
+        let (phases, pid_a, pid_b) = driver.await.expect("the driver task completed");
+        (coord, phases, pid_a, pid_b)
+    });
+
+    // The phase walk shows both full cycles, each entering through the
+    // pipeline's Loading (published at least once: the Load cycle itself
+    // polls the just-spawned worker Pending before publishing).
+    assert!(
+        is_subsequence(
+            &phases,
+            &[LOADING, LOADED, RUNNING, DONE, LOADING, LOADED, RUNNING, DONE]
+        ),
+        "two Load/run cycles through the pipeline: {phases:?}"
+    );
+    // One worker per occupant Load: the swap spawned a fresh process.
+    assert_ne!(pid_a, pid_b, "beta got its own worker");
+    // The ordered event stream, both occupants: progress crossed the mmap
+    // SequenceStatus ring and each terminal folded to Completed. Kinds are
+    // rendered to tokens because `SequenceEventKind` carries no `PartialEq`.
+    let events = drain_msgs::<SequenceChannelEvent>(&mut events_view);
+    let kinds: Vec<String> = events.iter().map(|e| event_token(&e.kind)).collect();
+    let expect = |name: &str| {
+        [
+            format!("loaded:{name}"),
+            "started".to_string(),
+            "progress:waiting".to_string(),
+            "progress:done".to_string(),
+            "completed".to_string(),
+        ]
+    };
+    let expected: Vec<String> = expect("alpha").into_iter().chain(expect("beta")).collect();
+    assert_eq!(kinds, expected, "the full ordered event stream");
+    // The worker list names the slot's live process: beta's worker holds its
+    // roles through Done, and no unplanned death was counted.
+    let workers = coord.workers();
+    assert_eq!(workers.len(), 1, "{workers:?}");
+    assert_eq!(workers[0].name, "adcs");
+    assert_eq!(workers[0].pid, pid_b, "the telemetered pid is beta's worker");
+    assert_eq!(workers[0].restarts, 0, "Loads are commanded, not deaths");
+    assert_eq!(workers[0].state, WorkerRunState::Running);
+    assert!(coord.stopped().is_empty(), "Done is not a hard-stop");
+
+    // Teardown reaps beta's worker.
+    drop(coord);
+    drop(events_view);
+    assert!(child_pids().is_empty(), "no worker child survives teardown");
+
+    // The isolation canary: every process that ever mapped the occupant
+    // artifact logged its pid. The workers (describe and run) appear; this
+    // host process must not.
+    let canary = std::env::var("SEQ_FIXTURE_CANARY").expect("main set the canary path");
+    let logged = std::fs::read_to_string(&canary).expect("the canary file exists");
+    let pids: Vec<u32> = logged.lines().filter_map(|l| l.trim().parse().ok()).collect();
+    assert!(
+        !pids.contains(&std::process::id()),
+        "the host never mapped the occupant artifact: {pids:?}"
+    );
+    assert!(
+        pids.contains(&pid_a) && pids.contains(&pid_b),
+        "each occupant worker mapped the artifact: {pids:?}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Slot test 2: SIGKILL the occupant worker mid-run, recover by Reset
+// ---------------------------------------------------------------------------
+
+fn proc_slot_death_is_terminal_and_reset_recovers(seq_lib: &Path) {
+    let mut b = Coordinator::builder(slow_sim_config());
+    let slot = b.add_slot(
+        "adcs",
+        vec![artifact_occ("waiter", seq_lib)],
+        Some(InitialOccupant::loaded("waiter")),
+    );
+    b.connect(
+        PortRef::msg::<SequenceCommand>(b.coordinator_handle()),
+        PortRef::msg::<SequenceCommand>(slot),
+    )
+    .expect("the coordinator command edge connects");
+    let mut coord = b.build().expect("the process-slot graph builds");
+    // The initial occupant loads at init (inside the barrier), not at build.
+    assert!(child_pids().is_empty(), "a process slot spawns per Load, not at build");
+
+    let mut slot_view: Input<SlotStatus> = Input::new(
+        coord
+            .registry()
+            .view(ComponentId::new("adcs.slot_status"))
+            .expect("slot status registered")
+            .expect("reader slot available"),
+    );
+    let mut events_view = coord
+        .registry()
+        .view(ComponentId::new("adcs.sequences"))
+        .expect("the slot events channel is registered")
+        .expect("reader slot available");
+    let mut control = coord.control_handle().expect("taken once per coordinator");
+
+    let (coord, phases, pid, pid2) = stellarator::run(|| async move {
+        let driver = stellarator::spawn(async move {
+            let mut phases: Vec<u8> = Vec::new();
+            let deadline = Instant::now() + Duration::from_secs(20);
+            // The initial occupant loaded blocking inside the init barrier.
+            assert!(
+                wait_phase(&mut slot_view, &mut phases, LOADED, deadline).await,
+                "the initial occupant is Loaded: {phases:?}"
+            );
+            let pid = *child_pids().first().expect("the initial worker is live");
+            control.emit(&seq_cmd("adcs", SequenceCommandKind::Start)).unwrap();
+            assert!(
+                wait_phase(&mut slot_view, &mut phases, RUNNING, deadline).await,
+                "the occupant is Running: {phases:?}"
+            );
+            // `kill` blocks this thread — the single-threaded executor, and
+            // so the cycle loop — which lands the SIGKILL deterministically
+            // inside the waiter's ~2000-cycle window.
+            kill9(pid);
+            assert!(
+                wait_phase(&mut slot_view, &mut phases, SLOT_STOPPED, deadline).await,
+                "the death folded to Stopped: {phases:?}"
+            );
+            // No auto-restart: the dead worker was reaped and nothing
+            // replaced it. Recovery is the operator's Reset, which respawns
+            // through the polled pipeline.
+            assert!(
+                child_pids().is_empty(),
+                "a dead occupant worker is reaped, never respawned"
+            );
+            control.emit(&seq_cmd("adcs", SequenceCommandKind::Reset)).unwrap();
+            assert!(
+                wait_phase(&mut slot_view, &mut phases, LOADED, deadline).await,
+                "Reset brought a fresh worker to Loaded: {phases:?}"
+            );
+            let pid2 = *child_pids().first().expect("the reset worker is live");
+            control.emit(&seq_cmd("adcs", SequenceCommandKind::Start)).unwrap();
+            assert!(
+                wait_phase(&mut slot_view, &mut phases, DONE, deadline).await,
+                "the rerun completed: {phases:?}"
+            );
+            (phases, pid, pid2)
+        });
+        coord.run_for(1_000_000).await;
+        let (phases, pid, pid2) = driver.await.expect("the driver task completed");
+        (coord, phases, pid, pid2)
+    });
+
+    assert!(
+        is_subsequence(
+            &phases,
+            &[LOADED, RUNNING, SLOT_STOPPED, LOADING, LOADED, RUNNING, DONE]
+        ),
+        "death is terminal, Reset re-runs the pipeline: {phases:?}"
+    );
+    assert_ne!(pid, pid2, "Reset spawned a fresh worker");
+    // The event stream names the death and the recovery. Progress lines are
+    // not pinned here: the killed occupant's last published records may drain
+    // during the rerun's fold.
+    let events = drain_msgs::<SequenceChannelEvent>(&mut events_view);
+    let kinds: Vec<&SequenceEventKind> = events.iter().map(|e| &e.kind).collect();
+    let failed_at = kinds
+        .iter()
+        .position(|k| matches!(k, SequenceEventKind::Failed { reason } if reason.contains("worker")))
+        .unwrap_or_else(|| panic!("a Failed event names the worker death: {kinds:?}"));
+    let loads: Vec<usize> = kinds
+        .iter()
+        .enumerate()
+        .filter_map(|(i, k)| matches!(k, SequenceEventKind::Loaded { .. }).then_some(i))
+        .collect();
+    assert_eq!(loads.len(), 2, "the initial load and the Reset reload: {kinds:?}");
+    assert!(
+        loads[0] < failed_at && failed_at < loads[1],
+        "Failed sits between the two loads: {kinds:?}"
+    );
+    assert!(
+        matches!(kinds.last(), Some(SequenceEventKind::Completed)),
+        "the rerun completed: {kinds:?}"
+    );
+    // Telemetry counted the one unplanned death, and the recovered worker is
+    // the live one.
+    let workers = coord.workers();
+    assert_eq!(workers.len(), 1, "{workers:?}");
+    assert_eq!(workers[0].restarts, 1, "one unplanned death counted: {workers:?}");
+    assert_eq!(workers[0].pid, pid2);
+    assert_eq!(workers[0].state, WorkerRunState::Running);
+    // The stopped list reflects current states: the recovered slot left it.
+    assert!(coord.stopped().is_empty(), "{:?}", coord.stopped());
+
+    drop(coord);
+    drop(events_view);
+    assert!(child_pids().is_empty(), "all workers reaped");
+}
+
+// ---------------------------------------------------------------------------
+// Slot test 3: Abort crosses the process boundary
+// ---------------------------------------------------------------------------
+
+fn proc_slot_abort_crosses_the_boundary(seq_lib: &Path) {
+    let mut b = Coordinator::builder(slow_sim_config());
+    let slot = b.add_slot(
+        "adcs",
+        vec![artifact_occ("waiter", seq_lib)],
+        Some(InitialOccupant::running("waiter")),
+    );
+    b.connect(
+        PortRef::msg::<SequenceCommand>(b.coordinator_handle()),
+        PortRef::msg::<SequenceCommand>(slot),
+    )
+    .expect("the coordinator command edge connects");
+    let mut coord = b.build().expect("the process-slot graph builds");
+
+    let mut slot_view: Input<SlotStatus> = Input::new(
+        coord
+            .registry()
+            .view(ComponentId::new("adcs.slot_status"))
+            .expect("slot status registered")
+            .expect("reader slot available"),
+    );
+    let mut seq_view: Input<SequenceStatus> = Input::new(
+        coord
+            .registry()
+            .view(ComponentId::new("adcs.sequence"))
+            .expect("occupant SequenceStatus is registered")
+            .expect("reader slot available"),
+    );
+    let mut events_view = coord
+        .registry()
+        .view(ComponentId::new("adcs.sequences"))
+        .expect("the slot events channel is registered")
+        .expect("reader slot available");
+    let mut control = coord.control_handle().expect("taken once per coordinator");
+
+    let (coord, phases) = stellarator::run(|| async move {
+        let driver = stellarator::spawn(async move {
+            let mut phases: Vec<u8> = Vec::new();
+            let deadline = Instant::now() + Duration::from_secs(20);
+            assert!(
+                wait_phase(&mut slot_view, &mut phases, RUNNING, deadline).await,
+                "the initial=running occupant is Running: {phases:?}"
+            );
+            // The cancel frame is written by the host-side control writer and
+            // crosses on the mmap ring; the occupant folds it at its next
+            // wait, deep inside its ~2000-cycle window.
+            control.emit(&seq_cmd("adcs", SequenceCommandKind::Abort)).unwrap();
+            assert!(
+                wait_phase(&mut slot_view, &mut phases, DONE, deadline).await,
+                "the abort went terminal: {phases:?}"
+            );
+            phases
+        });
+        coord.run_for(500_000).await;
+        let phases = driver.await.expect("the driver task completed");
+        (coord, phases)
+    });
+
+    assert!(
+        is_subsequence(&phases, &[RUNNING, DONE]),
+        "Aborted is still terminal Done: {phases:?}"
+    );
+    // The occupant's own terminal outcome crossed back over the mmap
+    // SequenceStatus ring: the safing branch ran in the worker.
+    let mut states = Vec::new();
+    seq_view
+        .drain(|f| states.push(f.get().run_state))
+        .expect("no lap");
+    assert_eq!(
+        states.last(),
+        Some(&ABORTED),
+        "the occupant cooperatively aborted: {states:?}"
+    );
+    let events = drain_msgs::<SequenceChannelEvent>(&mut events_view);
+    let kinds: Vec<&SequenceEventKind> = events.iter().map(|e| &e.kind).collect();
+    assert!(
+        matches!(kinds.last(), Some(SequenceEventKind::Aborted)),
+        "the terminal fold is Aborted: {kinds:?}"
+    );
+    assert!(
+        kinds
+            .iter()
+            .any(|k| matches!(k, SequenceEventKind::Progress { detail } if detail == "aborted")),
+        "the safing branch's progress line arrived: {kinds:?}"
+    );
+
+    drop(coord);
+    drop(events_view);
     assert!(child_pids().is_empty(), "all workers reaped");
 }
