@@ -1738,8 +1738,9 @@ mod proc_slot {
     }
 
     /// Load walks Empty → Loading (wire phase 5, worker `Restarting`) →
-    /// Loaded, with the `Loaded` event deferred to the bind — and the
-    /// existing command guards ignore `Start`/`Stop` mid-pipeline.
+    /// Loaded, with the `Loading` event emitted at the spawn and the
+    /// `Loaded` event deferred to the bind — and the existing command
+    /// guards ignore `Start`/`Stop` mid-pipeline.
     #[test]
     fn load_pipeline_phases_events_and_guards() {
         let dir = tempfile::tempdir().unwrap();
@@ -1753,7 +1754,13 @@ mod proc_slot {
         h.step();
         assert!(matches!(h.runner.state(), SlotState::Loading));
         assert_eq!(h.phase(), 5);
-        assert!(h.drain_events().is_empty(), "Loaded waits for the bind");
+        assert!(
+            matches!(
+                h.drain_events().as_slice(),
+                [SequenceEventKind::Loading { name }] if name == "alpha"
+            ),
+            "the spawn announces Loading; Loaded waits for the bind"
+        );
         let info = h.runner.proc_info().expect("process-mode slot");
         assert_eq!(info.state, WorkerRunState::Restarting);
         assert_ne!(info.pid, 0, "the spawned worker is telemetered");
@@ -1872,7 +1879,10 @@ mod proc_slot {
         assert!(matches!(h.runner.state(), SlotState::Loaded));
         assert!(matches!(
             h.drain_events().as_slice(),
-            [SequenceEventKind::Loaded { name }] if name == "alpha"
+            [
+                SequenceEventKind::Loading { name: loading },
+                SequenceEventKind::Loaded { name },
+            ] if loading == "alpha" && name == "alpha"
         ));
         let info = h.runner.proc_info().unwrap();
         assert_eq!(info.state, WorkerRunState::Running);
@@ -1902,7 +1912,10 @@ mod proc_slot {
         ));
         assert!(matches!(
             h.drain_events().as_slice(),
-            [SequenceEventKind::Failed { reason }] if reason.contains("attach")
+            [
+                SequenceEventKind::Loading { .. },
+                SequenceEventKind::Failed { reason },
+            ] if reason.contains("attach")
         ));
         assert_eq!(h.runner.proc_info().unwrap().restarts, 1);
     }

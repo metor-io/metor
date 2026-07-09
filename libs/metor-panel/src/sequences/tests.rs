@@ -98,6 +98,64 @@ fn lifecycle_folds_into_run_state() {
 }
 
 #[test]
+fn loading_shows_the_incoming_occupant_until_loaded_resolves_it() {
+    let mut state = SequenceState::default();
+    state.apply_registry(ts(1), registry(&[("deploy", &["solar"])]));
+
+    // A process-backed load has a real window: `Loading` names the incoming sequence and
+    // holds a loading status line until the control system reports the bind as `Loaded`.
+    state.apply_event(
+        ts(2),
+        event("deploy", SequenceEventKind::Loading { name: "solar".into() }),
+    );
+    let ch = state.channel("deploy").unwrap();
+    assert_eq!(ch.loaded.as_ref().map(|s| s.as_ref()), Some("solar"));
+    assert_eq!(ch.run_state, SequenceRunState::Idle);
+    assert_eq!(
+        ch.last_message.as_ref().map(|s| s.as_ref()),
+        Some("Loading…")
+    );
+
+    state.apply_event(
+        ts(3),
+        event("deploy", SequenceEventKind::Loaded { name: "solar".into() }),
+    );
+    let ch = state.channel("deploy").unwrap();
+    assert_eq!(ch.loaded.as_ref().map(|s| s.as_ref()), Some("solar"));
+    assert_eq!(ch.run_state, SequenceRunState::Idle);
+    assert!(ch.last_message.is_none());
+}
+
+#[test]
+fn loading_over_a_terminal_state_rearms_the_channel() {
+    let mut state = SequenceState::default();
+    state.apply_registry(ts(1), registry(&[("deploy", &["solar", "antenna"])]));
+    state.apply_event(
+        ts(2),
+        event("deploy", SequenceEventKind::Loaded { name: "solar".into() }),
+    );
+    state.apply_event(ts(3), event("deploy", SequenceEventKind::Started));
+    state.apply_event(
+        ts(4),
+        event("deploy", SequenceEventKind::Failed { reason: "x".into() }),
+    );
+
+    // Loading a different sequence over the terminal swaps the shown name immediately and
+    // clears the stale terminal state, like any other event folding unconditionally.
+    state.apply_event(
+        ts(5),
+        event("deploy", SequenceEventKind::Loading { name: "antenna".into() }),
+    );
+    let ch = state.channel("deploy").unwrap();
+    assert_eq!(ch.loaded.as_ref().map(|s| s.as_ref()), Some("antenna"));
+    assert_eq!(ch.run_state, SequenceRunState::Idle);
+    assert_eq!(
+        ch.last_message.as_ref().map(|s| s.as_ref()),
+        Some("Loading…")
+    );
+}
+
+#[test]
 fn registry_update_preserves_runtime_state() {
     let mut state = SequenceState::default();
     state.apply_registry(ts(1), registry(&[("deploy", &["solar"])]));

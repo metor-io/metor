@@ -602,6 +602,7 @@ So the `SlotRunner` holds two new things: a `MsgOut` (the sequence message chann
 | Slot-side event | wkt `SequenceEventKind` / state | Source |
 |---|---|---|
 | `do_load(name)` ok | `Loaded { name }` | transition (`slot.rs:385`) |
+| process-slot `do_load`/`do_reset` spawn | `Loading { name }` — the pipeline's bind completes it with `Loaded`; in-process loads bind synchronously and skip it | transition (`slot.rs`) |
 | `do_start` | `Started` | transition (`:404`) |
 | `do_stop` (hard-drop) | `Stopped` | transition (`:413`) |
 | `do_reset(name)` | `Loaded { name }` (re-arm to idle) | transition (`:435`) |

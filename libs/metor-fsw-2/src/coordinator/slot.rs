@@ -350,9 +350,10 @@ impl SlotRunner {
     /// kill/reap/reclaim, so the fresh occupant claims ring roles only after
     /// the old ones were freed). The dl arm binds synchronously and lands
     /// `Loaded`; the proc arm spawns the occupant's worker and lands
-    /// `Loading`, advanced one pipeline phase per step so a Load never
-    /// stalls the cycle loop. The `Loaded` event fires when the occupant is
-    /// actually bound — immediately here for dl, from the pipeline for proc.
+    /// `Loading` (announced with a `Loading` event), advanced one pipeline
+    /// phase per step so a Load never stalls the cycle loop. The `Loaded`
+    /// event fires when the occupant is actually bound — immediately here
+    /// for dl, from the pipeline for proc.
     fn build_occupant(&mut self, idx: usize) {
         let occ = &self.allowed[idx];
         match &occ.backing {
@@ -389,6 +390,8 @@ impl SlotRunner {
                     Ok(worker) => {
                         self.slot = Some(Occupant::Proc(worker));
                         self.state = SlotState::Loading;
+                        let name = self.allowed[idx].name.clone();
+                        self.emit_event(SequenceEventKind::Loading { name });
                     }
                     Err(detail) => self.fail_occupant(format!("worker spawn failed: {detail}")),
                 }

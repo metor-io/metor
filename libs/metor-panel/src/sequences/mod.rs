@@ -42,10 +42,11 @@ pub struct ChannelState {
     pub name: SharedString,
     /// Sequence names that may be loaded into this channel (from the registry).
     pub available: Vec<SharedString>,
-    /// The currently loaded sequence, if any.
+    /// The currently loaded sequence — or, while a `Loading` event is pending its
+    /// `Loaded`, the one being loaded.
     pub loaded: Option<SharedString>,
     pub run_state: SequenceRunState,
-    /// The latest status line reported by a `Progress`/`Failed` event.
+    /// The latest status line reported by a `Loading`/`Progress`/`Failed` event.
     pub last_message: Option<SharedString>,
     pub updated_at: Timestamp,
 }
@@ -115,6 +116,12 @@ impl SequenceState {
         ch.updated_at = timestamp;
         let channel_name = ch.name.clone();
         let label: SharedString = match &event.kind {
+            SequenceEventKind::Loading { name } => {
+                ch.loaded = Some(name.clone().into());
+                ch.run_state = SequenceRunState::Idle;
+                ch.last_message = Some("Loading…".into());
+                format!("Loading {name}").into()
+            }
             SequenceEventKind::Loaded { name } => {
                 ch.loaded = Some(name.clone().into());
                 ch.run_state = SequenceRunState::Idle;

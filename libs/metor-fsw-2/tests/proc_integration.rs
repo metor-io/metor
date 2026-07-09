@@ -659,6 +659,7 @@ fn event_token(kind: &SequenceEventKind) -> String {
         SequenceEventKind::Aborted => "aborted".to_string(),
         SequenceEventKind::Completed => "completed".to_string(),
         SequenceEventKind::Failed { reason } => format!("failed:{reason}"),
+        SequenceEventKind::Loading { name } => format!("loading:{name}"),
     }
 }
 
@@ -785,13 +786,15 @@ connect "coordinator" -> "adcs" msg="SequenceCommand"
     );
     // One worker per occupant Load: the swap spawned a fresh process.
     assert_ne!(pid_a, pid_b, "beta got its own worker");
-    // The ordered event stream, both occupants: progress crossed the mmap
-    // SequenceStatus ring and each terminal folded to Completed. Kinds are
-    // rendered to tokens because `SequenceEventKind` carries no `PartialEq`.
+    // The ordered event stream, both occupants: each Load announces its
+    // pipeline with Loading, progress crossed the mmap SequenceStatus ring,
+    // and each terminal folded to Completed. Kinds are rendered to tokens
+    // because `SequenceEventKind` carries no `PartialEq`.
     let events = drain_msgs::<SequenceChannelEvent>(&mut events_view);
     let kinds: Vec<String> = events.iter().map(|e| event_token(&e.kind)).collect();
     let expect = |name: &str| {
         [
+            format!("loading:{name}"),
             format!("loaded:{name}"),
             "started".to_string(),
             "progress:waiting".to_string(),
