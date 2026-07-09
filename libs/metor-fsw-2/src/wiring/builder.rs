@@ -216,6 +216,7 @@ impl WiringBuilder {
                 outputs: Vec::new(),
                 allow: Vec::new(),
                 initial: None,
+                process: false,
             },
         }
     }
@@ -286,6 +287,17 @@ impl SlotSpecBuilder {
     /// Declares an output frame in the slot's port contract.
     pub fn output(mut self, frame: impl Into<String>) -> Self {
         self.spec.outputs.push(frame.into());
+        self
+    }
+
+    /// Runs every occupant of this slot in its own worker process, spawned
+    /// per `Load`, instead of dlopen'ing occupants into the coordinator — the
+    /// builder twin of `process=#true` on a `slot` node
+    /// (`docs/process-slots.md`). Per-slot means all-occupants; resolve
+    /// describes each allowed occupant through a worker, so the host never
+    /// loads their artifacts.
+    pub fn process(mut self) -> Self {
+        self.spec.process = true;
         self
     }
 

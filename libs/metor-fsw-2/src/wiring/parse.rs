@@ -246,6 +246,8 @@ fn parse_system(
 /// `occupant=` property, whether line properties or children, is that
 /// occupant's default params, captured as with a `system` node. An
 /// `initial occupant="..." state="..."` child picks the startup occupant.
+/// `process=#true` on the slot line runs every occupant out of process
+/// (`docs/process-slots.md`).
 fn parse_slot(
     node: &KdlNode,
     src: &str,
@@ -262,6 +264,13 @@ fn parse_slot(
             span: node.span(),
         });
     }
+    // `process=#true` runs every occupant in its own worker process. Unlike a
+    // `system` node it needs no artifact check: allowed occupants are always
+    // artifact-backed.
+    let process = node
+        .get("process")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
 
     let mut inputs: Vec<String> = Vec::new();
     let mut outputs: Vec<String> = Vec::new();
@@ -357,6 +366,7 @@ fn parse_slot(
         outputs,
         allow,
         initial,
+        process,
     })
 }
 

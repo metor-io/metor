@@ -216,6 +216,14 @@ pub struct SlotSpec {
     pub allow: Vec<AllowedOccupantSpec>,
     /// The occupant to apply at startup, if any.
     pub initial: Option<InitialOccupantSpec>,
+    /// `true` runs every occupant out of process (`process=#true`,
+    /// `docs/process-slots.md`): resolve describes each allowed occupant
+    /// through a worker instead of dlopening it, and every `Load` spawns a
+    /// worker over the slot's session-dir rings. Per-slot means all-occupants,
+    /// so a `Load` can never change the slot's fault domain. Default `false`;
+    /// a document that omits the property deserializes unchanged.
+    #[serde(default)]
+    pub process: bool,
 }
 
 /// One allowed occupant of a [`SlotSpec`]: an [`Artifact`] referenced by id,

@@ -55,7 +55,7 @@ use metor_proto::types::ComponentId;
 use crate::binder::BindPorts;
 use crate::coordinator::{
     AllowedOccupant, ClockMode, Coordinator, CoordinatorBuilder, CoordinatorConfig,
-    InitialOccupant, PortRef, SystemHandle, WireError,
+    InitialOccupant, OccupantBacking, PortRef, SystemHandle, WireError,
 };
 use crate::descriptor::{PortId, SystemDescriptor, compatible};
 use crate::dl::DlSystem;
@@ -733,11 +733,14 @@ fn slot_src(slot: &SlotSpec) -> String {
 
 /// Resolve a [`SlotSpec`] into a registered slot.
 ///
-/// Each allowed occupant goes through [`open_occupant`] like a dl system, and
-/// every occupant must share one port contract. The descriptor returned for
-/// the edges pass is the one read back off the builder after
-/// [`CoordinatorBuilder::add_slot`], not a raw occupant descriptor, and the
-/// declared `input`/`output` contract is validated against it.
+/// Each allowed occupant goes through [`open_occupant`] like a dl system —
+/// or, for a `process=#true` slot, through [`describe_occupants`], which
+/// sources the descriptors from describe workers so the host never dlopens
+/// any occupant artifact. Every occupant must share one port contract. The
+/// descriptor returned for the edges pass is the one read back off the
+/// builder after [`CoordinatorBuilder::add_slot`], not a raw occupant
+/// descriptor, and the declared `input`/`output` contract is validated
+/// against it.
 fn resolve_slot(
     slot: &SlotSpec,
     wiring: &Wiring,
@@ -779,21 +782,28 @@ fn resolve_slot(
 
     // Open and param-encode each allowed occupant. `occupant=` is the allow
     // node's only reserved key and there is no leading name argument, so both
-    // line-property and child-node params reach the encoder.
-    let mut allowed: Vec<AllowedOccupant> = Vec::with_capacity(slot.allow.len());
-    for occ in &slot.allow {
-        let (loaded, params, _) = open_occupant(
-            wiring,
-            &occ.occupant,
-            &slot.name,
-            &occ.params,
-            ALLOW_RESERVED,
-            0,
-            &src,
-            span,
-        )?;
-        allowed.push(AllowedOccupant::dl(occ.occupant.clone(), loaded, params));
-    }
+    // line-property and child-node params reach the encoder. A process slot
+    // takes the describe-worker path instead; the backing decides the slot's
+    // mode in `add_slot`, so the two arms may not mix.
+    let allowed: Vec<AllowedOccupant> = if slot.process {
+        describe_occupants(slot, wiring, &src, span)?
+    } else {
+        let mut allowed = Vec::with_capacity(slot.allow.len());
+        for occ in &slot.allow {
+            let (loaded, params, _) = open_occupant(
+                wiring,
+                &occ.occupant,
+                &slot.name,
+                &occ.params,
+                ALLOW_RESERVED,
+                0,
+                &src,
+                span,
+            )?;
+            allowed.push(AllowedOccupant::dl(occ.occupant.clone(), loaded, params));
+        }
+        allowed
+    };
 
     // The slot derives one shape from the allowed set, so every occupant must
     // match the first. A clean error here in place of the panic `add_slot`
@@ -877,6 +887,70 @@ fn resolve_slot(
     }
 
     Ok((handle, registered))
+}
+
+/// Resolve a process slot's allowed set (`docs/process-slots.md` §8): the
+/// [`resolve_proc`] recipe once per allowed occupant. Each occupant's built
+/// artifact is described by a short-lived **describe worker** — the host
+/// never dlopens it, at resolve or at any later `Load` — the descriptor and
+/// `Params` schema are decoded from the worker's bytes, and the occupant's
+/// KDL params are encoded against that schema exactly as the dl path
+/// encodes them. The resulting [`AllowedOccupant`]s carry
+/// [`OccupantBacking::Artifact`], which is what makes `add_slot` register
+/// the slot process-mode.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn describe_occupants(
+    slot: &SlotSpec,
+    wiring: &Wiring,
+    src: &str,
+    span: SourceSpan,
+) -> Result<Vec<AllowedOccupant>, LoadError> {
+    let mut allowed = Vec::with_capacity(slot.allow.len());
+    for occ in &slot.allow {
+        let artifact = find_built_artifact(wiring, &occ.occupant, &slot.name, src, span)?;
+        let path = artifact.path.as_ref().expect("checked by find_built_artifact");
+        let proc_describe = |detail: String| LoadError::ProcDescribe {
+            system: slot.name.clone(),
+            artifact: occ.occupant.clone(),
+            detail,
+            src: src.to_string(),
+            span,
+        };
+        let bytes = crate::proc::host::describe_via_worker(None, path)
+            .map_err(|e| proc_describe(e.to_string()))?;
+        let (descriptor, params_schema) =
+            crate::dl::decode_descriptor_msg(&bytes).map_err(|e| proc_describe(e.to_string()))?;
+        let params: Vec<u8> = match &occ.params {
+            ParamSource::None => Vec::new(),
+            ParamSource::Postcard(bytes) => bytes.clone(),
+            ParamSource::Kdl(node_text) => {
+                encode_kdl_params(node_text, &params_schema, &slot.name, ALLOW_RESERVED, 0)?
+            }
+        };
+        allowed.push(AllowedOccupant {
+            name: occ.occupant.clone(),
+            params,
+            descriptor,
+            backing: OccupantBacking::Artifact(path.clone()),
+        });
+    }
+    Ok(allowed)
+}
+
+/// Without a cross-process futex there is no worker to describe or spawn, so
+/// a process slot is rejected like a process system.
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn describe_occupants(
+    slot: &SlotSpec,
+    _wiring: &Wiring,
+    src: &str,
+    span: SourceSpan,
+) -> Result<Vec<AllowedOccupant>, LoadError> {
+    Err(LoadError::ProcessUnsupported {
+        name: slot.name.clone(),
+        src: src.to_string(),
+        span,
+    })
 }
 
 /// A best-effort source snippet for an edge's resolve-time errors.
