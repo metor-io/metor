@@ -20,6 +20,11 @@
 > dl/slot occupant's `fsw_bind_init`) on every call, which is not idempotent for dl occupants —
 > so a mission with slots is driven by a single `run_for`, with runtime commands injected via
 > `control_handle()` during that run. Making `run_for` re-entrant is a separate follow-up.
+>
+> Slots have since grown a **process mode**: `process=#true` on the `slot` node runs every
+> occupant in its own worker process, spawned per `Load`, with the same isolation rule as
+> process systems (the host never dlopens an occupant artifact). Design and rationale:
+> `docs/process-slots.md`.
 
 The cube-sat example (`examples/cube-sat/src/sequencer.rs`) has a feature `metor-fsw-2`
 does not: **sequences** — small re-entrant programs that command the spacecraft through

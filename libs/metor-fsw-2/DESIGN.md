@@ -491,6 +491,9 @@ of each subsystem:
 - `docs/dl-open.md` — the `cdylib` C-ABI, the loader, and schema-guided params.
 - `docs/process-systems.md` — the third loading mode: a worker process driving that same
   cdylib over mmap rings and a shared-futex step doorbell, with dead-worker reclamation.
+- `docs/process-slots.md` — process-mode slots (`process=#true` on a `slot`): a runtime slot
+  whose occupants run out of process, one worker spawned per `Load` and torn down by
+  kill + reclaim, composing the slots and process-systems layers.
 - `docs/telemetry.md` — the registry (frames and messages, one keyspace) and the telemetry downlink.
 - `docs/cli-runner.md` — the `metor-fsw` CLI: loading a wiring, packaging a bundle, and running a mission.
 - `docs/sequences-slots.md` — runtime-loadable slots and the `#[sequence]` author surface.
