@@ -84,7 +84,9 @@ pub enum LoadError {
         span: SourceSpan,
     },
 
-    #[error("`system \"{name}\"` sets `process=#true`, unsupported on this target")]
+    /// A `process=#true` system or slot on a target without process-worker
+    /// support. `name` is the instance name of either.
+    #[error("`{name}` sets `process=#true`, unsupported on this target")]
     #[diagnostic(
         code(fsw_wiring::process_unsupported),
         help("process systems need a cross-process futex: Linux or macOS 14.4+")
@@ -93,11 +95,14 @@ pub enum LoadError {
         name: String,
         #[source_code]
         src: String,
-        #[label("this system cannot run cross-process here")]
+        #[label("this instance cannot run cross-process here")]
         span: SourceSpan,
     },
 
-    #[error("describe worker for `system \"{system}\"` (artifact `{artifact}`) failed: {detail}")]
+    /// A resolve-time describe worker failed. `system` names the owning
+    /// `system` or `slot` instance; for a slot, `artifact` is the allowed
+    /// occupant whose describe failed.
+    #[error("describe worker for `{system}` (artifact `{artifact}`) failed: {detail}")]
     #[diagnostic(
         code(fsw_wiring::proc_describe),
         help(
@@ -111,7 +116,7 @@ pub enum LoadError {
         detail: String,
         #[source_code]
         src: String,
-        #[label("describing this system's artifact failed")]
+        #[label("describing this artifact failed")]
         span: SourceSpan,
     },
 

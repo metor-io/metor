@@ -1797,3 +1797,56 @@ system "nav" type="Nav" process=#true
     };
     assert!(matches!(err, LoadError::ProcessNeedsArtifact { .. }), "{err:?}");
 }
+
+// ---------------------------------------------------------------------------
+// Process slots: the `process=#true` surface on `slot` nodes.
+// ---------------------------------------------------------------------------
+
+/// `process=#true` on a `slot` node parses onto the spec, defaults off, and
+/// the two front-ends produce the identical `Wiring`. Resolving the slot
+/// (describe workers over the allowed set) is covered by the proc e2e suite,
+/// which can host the re-exec'd workers.
+#[test]
+fn slot_process_flag_parses_and_matches_builder() {
+    let kdl = r#"
+coordinator cycle_rate=100.0
+artifact "waiter" crate="seq-fixture" lib="seq_fixture" type="waiter"
+slot "adcs" process=#true {
+    allow occupant="waiter"
+}
+slot "bare" {
+    allow occupant="waiter"
+}
+"#;
+    let wiring = parse(kdl).expect("process=#true on a slot parses");
+    assert!(wiring.slots[0].process);
+    assert!(!wiring.slots[1].process, "defaults to in-process");
+
+    let built = WiringBuilder::new()
+        .coordinator(100.0, ClockSpec::Wall)
+        .artifact("waiter", "seq-fixture", "seq_fixture", "waiter")
+        .slot("adcs")
+        .process()
+        .allow("waiter")
+        .end()
+        .slot("bare")
+        .allow("waiter")
+        .end()
+        .build();
+    assert_eq!(wiring, built, "the two front-ends agree");
+}
+
+/// A serialized document from before the field existed deserializes with
+/// `process=false` (the serde default), so stored wirings stay readable.
+#[test]
+fn slot_spec_process_serde_defaults_off() {
+    let json = r#"{
+        "name": "adcs",
+        "inputs": [],
+        "outputs": [],
+        "allow": [],
+        "initial": null
+    }"#;
+    let spec: super::SlotSpec = serde_json::from_str(json).expect("old document deserializes");
+    assert!(!spec.process, "an omitted `process` field defaults off");
+}
