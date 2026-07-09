@@ -149,7 +149,10 @@ On the state machine and the wire: `SlotState` gains a **`Loading`** variant (ru
 only, like `Empty`/`Loaded`) with wire phase code **5** in `SlotStatus::phase` — existing codes
 0–4 are untouched. This buys the command guards for free: `do_load` accepts only
 `Empty | Done | Stopped`, `do_start` only `Loaded`, so a command arriving mid-pipeline is
-ignored by the same match arms that exist today, with no new special cases. The pipeline ends
+ignored by the same match arms that exist today, with no new special cases. The spawn emits a
+`SequenceEventKind::Loading { name }` on the sequences channel — the load window's begin, for
+consumers that fold events rather than the phase byte; in-process loads bind synchronously and
+skip it. The pipeline ends
 by setting `Loaded` and emitting the `Loaded` event (so observers see the event when the
 occupant is actually bound, exactly as in-process); a pipeline failure (spawn error, `Failed`
 report, deadline, early exit) kills/reclaims and lands `Stopped { ProcessDied }` plus a
@@ -277,7 +280,10 @@ it alive", nothing more.
 - **`Loading` as a `SlotState` variant + wire code 5.** The alternative is keeping the previous
   phase on the wire and signaling only through events. The variant is recommended (command
   guards fall out; operators see the pipeline), but it touches the `SlotStatus` wire contract
-  and the panel must learn the code.
+  and the panel must learn the code. *Resolved (the plan's R3):* the variant shipped, and the
+  panel learned the window through events, not the phase byte — the spawn emits a new
+  `SequenceEventKind::Loading { name }` that the panel's sequence UI folds (the occupant name
+  with a loading status line, resolved by the bind's `Loaded`).
 - **Opt-in auto-restart of a `Running` occupant.** §7 says operator-only; a mission whose
   sequences are idempotent may want `restart=#true` with the existing budget knobs. Deferred
   until asked for.

@@ -731,6 +731,11 @@ pub enum SequenceEventKind {
     Aborted,
     Completed,
     Failed { reason: String },
+    /// An occupant load began; the matching `Loaded` reports its completion. Emitted only
+    /// when the load has a real window (a process occupant's spawn + bind); in-process
+    /// loads complete synchronously, so consumers may see a `Loaded` with no preceding
+    /// `Loading`.
+    Loading { name: SequenceName },
 }
 
 /// A granular per-channel state update, broadcast by the control system (control → panel).
@@ -1193,6 +1198,22 @@ mod sequence_tests {
             postcard::to_allocvec(&event).unwrap(),
             // channel "adcs"; kind variant 2 (Started).
             [4, b'a', b'd', b'c', b's', 2]
+        );
+
+        let loading = SequenceChannelEvent {
+            channel: "adcs".into(),
+            kind: SequenceEventKind::Loading {
+                name: "detumble".into(),
+            },
+        };
+        assert_eq!(
+            postcard::to_allocvec(&loading).unwrap(),
+            // channel "adcs"; kind variant 8 (Loading, appended after Failed so the
+            // earlier variants keep their wire form); name "detumble" (len 8).
+            [
+                4, b'a', b'd', b'c', b's', 8, 8, b'd', b'e', b't', b'u', b'm', b'b', b'l',
+                b'e'
+            ]
         );
 
         let command = SequenceCommand {
