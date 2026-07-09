@@ -458,10 +458,11 @@ impl StopReason {
 /// done or hard-stopped. A static
 /// [`CyclicRunner`](crate::CyclicRunner) and a build-time
 /// [`DlSlot`](crate::dl::DlSlot) only ever inhabit `Running`/`Stopped` (once
-/// `Stopped` they are never cleared); a process slot's `Stopped` clears back
-/// to `Running` when its worker restarts (`docs/process-systems.md` §6); the
-/// runtime [`SlotRunner`](slot) uses all five and recovers from a terminal
-/// state via `Load`/`Reset`.
+/// `Stopped` they are never cleared; a sequence-mode worker's `DlSlot` also
+/// latches `Done`, its poll-once guard); a process slot's `Stopped` clears
+/// back to `Running` when its worker restarts (`docs/process-systems.md`
+/// §6); the runtime [`SlotRunner`](slot) uses all five and recovers from a
+/// terminal state via `Load`/`Reset`.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum SlotState {
     /// No occupant; `step` is a cheap no-op. (Runtime slots only.)

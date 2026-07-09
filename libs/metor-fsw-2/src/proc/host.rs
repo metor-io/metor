@@ -20,7 +20,7 @@ use crate::coordinator::{CyclicSlot, ProcInfo, SlotState, StopReason, WorkerRunS
 
 use super::ctl::{CtlHost, StepOutcome, WorkerState};
 use super::session::SessionDir;
-use super::worker::{WORKER_ENV, WorkerManifest};
+use super::worker::{RunMode, WORKER_ENV, WorkerManifest};
 
 /// How long a spawned worker gets to report `Attached` (it must map rings and
 /// dlopen the artifact) or a describe worker to exit. Generous: a healthy
@@ -220,6 +220,7 @@ impl ProcSlot {
         let exe = resolve_worker_exe(spec.worker_exe.as_deref()).map_err(|e| e.to_string())?;
         let manifest = WorkerManifest::Run {
             abi_version: crate::abi::FSW_ABI_VERSION,
+            mode: RunMode::Cyclic,
             instance: spec.instance,
             artifact: spec.artifact,
             params: spec.params,
