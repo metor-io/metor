@@ -148,8 +148,20 @@ async fn cmd_run(args: RunArgs) -> miette::Result<()> {
     // and shutdown. The heartbeat is a side task reading the shared progress
     // counter, since the loop holds `&mut coord` for its whole life.
     coord.run_for(cycles).await;
+
+    // A hard-stopped system is a failed run: name each one and exit non-zero,
+    // so a supervisor (or CI) sees the failure instead of a clean exit.
     let stopped = coord.stopped();
-    Ok(())
+    if stopped.is_empty() {
+        return Ok(());
+    }
+    for sys in stopped {
+        eprintln!("system `{}` stopped: {:?}", sys.name, sys.reason);
+    }
+    Err(miette::miette!(
+        "{} system(s) hard-stopped during the run",
+        stopped.len()
+    ))
 }
 
 /// Resolve `run`'s `<TARGET>` into a located [`Wiring`]. A bundle directory

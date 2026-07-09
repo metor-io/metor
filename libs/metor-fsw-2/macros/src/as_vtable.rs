@@ -68,7 +68,10 @@ pub fn as_vtable_impl(
         name,
         _group,
         _no_timestamp: _,
-    } = AsVTable::from_derive_input(input).unwrap();
+    } = match AsVTable::from_derive_input(input) {
+        Ok(parsed) => parsed,
+        Err(e) => return e.write_errors(),
+    };
     let parent = parent.or(name);
     let where_clause = &generics.where_clause;
     let impeller = quote! { #crate_name::metor_proto };
@@ -82,7 +85,12 @@ pub fn as_vtable_impl(
         ast::Data::Enum(_) => {
             let name = parent.unwrap_or_else(|| ident.to_string());
             let Some(repr_type) = extract_repr_type(&input.attrs) else {
-                panic!("repr required for enum derive");
+                return syn::Error::new_spanned(
+                    &input.ident,
+                    "deriving AsVTable on an enum requires a primitive #[repr(...)] \
+                     (the enum is carried as that scalar)",
+                )
+                .to_compile_error();
             };
             quote! {
                 impl #crate_name::AsVTable for #ident #generics #where_clause {
@@ -107,8 +115,12 @@ pub fn as_vtable_impl(
         ast::Data::Struct(fields) => {
             let mut timestamp_fields = fields.fields.iter().filter(|field| field.timestamp);
             let timestamp_field = timestamp_fields.next();
-            if timestamp_fields.next().is_some() {
-                panic!("only one field can be marked #[metor_fsw(timestamp)]");
+            if let Some(extra) = timestamp_fields.next() {
+                return syn::Error::new_spanned(
+                    &extra.ident,
+                    "only one field can be marked #[metor_fsw(timestamp)]",
+                )
+                .to_compile_error();
             }
             let timestamp_source = timestamp_field.map(|field| {
                 let ident = &field.ident;

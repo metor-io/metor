@@ -186,7 +186,7 @@ within `start()`, so `stellarator::spawn` has a runtime and the sender announces
 queued. For each registry entry that `mode.matches`, `init`:
 
 - claims one read `View` via `entry.view()`; on `Err(FullReaderTable)` it records
-  `output.health().error("telemetry.reader_slot")` and skips the tap;
+  `output.health().error("telemetry_reader_slot")` and skips the tap;
 - picks a **lane** off the entry's `Delivery` axis (Snapshot → a coalescing slot, Log → the shared
   FIFO, §4) and a **wire** framing off its `EntrySchema` (Table → announce + a sequential `PacketId`,
   Postcard → forwarded as-is, no announce);
@@ -213,7 +213,7 @@ teardown).
 
 **`execute(now)`** (end-of-cycle) drains each tap per its **lane** (§4) — `Coalesce` taps to their
 newest record, `Fifo` taps every record in order — and surfaces any drops from either lane as
-health (`telemetry.dropped` for coalesced snapshots, `telemetry.msg_dropped` for FIFO records).
+health (`telemetry_dropped` for coalesced snapshots, `telemetry_msg_dropped` for FIFO records).
 
 **`shutdown()`** sets the stop flag and wakes the sender so it exits cooperatively; the drop guard
 cancels it regardless when the system is dropped.
@@ -301,8 +301,8 @@ the hand-off is where the "never let a slow link touch the cycle" trade is made 
   drop; the Log lane drops the **oldest** queued record past its cap instead — losing history, never
   reordering the record log by dropping a newer one.
 - `execute` surfaces both in-band: it compares `HandOff.dropped_snapshots`/`dropped_logs` against
-  `last_dropped`/`last_msg_dropped` watermarks and emits `output.health().error("telemetry.dropped")`
-  / `.error("telemetry.msg_dropped")` once per newly dropped record, so loss is observable through
+  `last_dropped`/`last_msg_dropped` watermarks and emits `output.health().error("telemetry_dropped")`
+  / `.error("telemetry_msg_dropped")` once per newly dropped record, so loss is observable through
   the telemetry system's own health frame.
 
 ---
@@ -451,7 +451,7 @@ system "telemetry" type="TcpDownlink" addr="127.0.0.1:2240" {
 - `max_readers = fan_out + n_reg + READER_SLACK` sizing, `n_reg` self-derived by counting
   `ReceiveAll` capabilities across every registered descriptor.
 - `TelemetrySystem`, the two-lane (Coalesce/Fifo) drain → hand-off → async-sender split, the
-  per-lane drop policy with its `telemetry.dropped`/`telemetry.msg_dropped`/`telemetry.reader_slot`
+  per-lane drop policy with its `telemetry_dropped`/`telemetry_msg_dropped`/`telemetry_reader_slot`
   health counters, and the `Transport` trait with `TcpTransport`.
 
 ---

@@ -20,7 +20,7 @@
 //! a later cycle — so the steady state allocates nothing. When the transport
 //! backs up the queue fills, whole batches are dropped rather than delayed,
 //! and every drop is counted on the system's health output as
-//! `telemetry.dropped`.
+//! `telemetry_dropped`.
 //!
 //! # Taps and wire framing
 //!
@@ -550,9 +550,9 @@ impl<R: RecvTransport + 'static> AsyncSystem for UplinkSystem<R> {
     /// receive the next packet into the recycled buffer and forward it
     /// verbatim on the minted output whose id matches, then recover the
     /// buffer from the packet for the next pass. A msg outside the configured
-    /// set bumps `uplink.unroutable` (the broker should only relay subscribed
+    /// set bumps `uplink_unroutable` (the broker should only relay subscribed
     /// ids, so this signals a broker or config mismatch), a full ring bumps
-    /// `uplink.dropped`, and `Table` packets are silently ignored. The first
+    /// `uplink_dropped`, and `Table` packets are silently ignored. The first
     /// error drops the link for good, and later passes idle instead of
     /// spinning.
     async fn run(&mut self, _input: &mut Self::Input, output: &mut Self::Output) {
@@ -572,7 +572,7 @@ impl<R: RecvTransport + 'static> AsyncSystem for UplinkSystem<R> {
                 // One writer per configured msg is the bind contract; a
                 // mismatch means the registered descriptor and this instance
                 // diverged.
-                health.error("uplink.bind_mismatch");
+                health.error("uplink_bind_mismatch");
                 health.end_cycle(Timestamp::now(), 0);
             }
             let ids: Vec<PacketId> = self.msgs.iter().map(|&(_, id)| id).collect();
@@ -595,12 +595,12 @@ impl<R: RecvTransport + 'static> AsyncSystem for UplinkSystem<R> {
                     match self.msgs.iter().position(|&(_, id)| id == m.id) {
                         Some(idx) => {
                             if fan.write_raw(idx, m.id, &m.buf).is_err() {
-                                health.error("uplink.dropped");
+                                health.error("uplink_dropped");
                                 health.end_cycle(Timestamp::now(), 0);
                             }
                         }
                         None => {
-                            health.error("uplink.unroutable");
+                            health.error("uplink_unroutable");
                             health.end_cycle(Timestamp::now(), 0);
                         }
                     }
@@ -806,7 +806,7 @@ impl<T: Transport + 'static> System for TelemetrySystem<T> {
 
         for key in &exhausted {
             let health = output.health();
-            health.error("telemetry.reader_slot");
+            health.error("telemetry_reader_slot");
             health.log(
                 crate::health::Level::Warn,
                 &format!("no reader slot left on `{key}` — raise CoordinatorConfig::reader_slack"),
@@ -868,7 +868,7 @@ impl<T: Transport + 'static> CyclicSystem for TelemetrySystem<T> {
             return;
         };
         let Ok(mut batch) = tx.try_send_ref() else {
-            output.health().error("telemetry.dropped");
+            output.health().error("telemetry_dropped");
             return;
         };
         for tap in &mut self.taps {

@@ -259,7 +259,7 @@ Per configured alarm, at `init`:
    target components in it. `ReceiveAll` budgets exactly **+1 reader slot on every ring**, so
    the system must never claim two views on one ring; the watch table enforces that
    structurally.
-3. No match / bad element / exhausted reader table → `health().error("alarms.unresolved_target")`
+3. No match / bad element / exhausted reader table → `health().error("alarms_unresolved_target")`
    (/ `alarms.bad_element` / `alarms.reader_slot`) + a `Warn` log naming the alarm id and
    component; the alarm is disabled for the run. A duplicate alarm id likewise disables the
    later spec (`alarms.duplicate_id`) — the panel's def store and the ack path are keyed by

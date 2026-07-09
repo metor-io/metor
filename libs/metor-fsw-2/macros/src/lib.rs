@@ -53,12 +53,6 @@ struct Field {
     /// treating the field as a leaf scalar.
     #[darling(default)]
     nest: bool,
-    /// Maximum cardinality of a `FrameList`/`FrameMap` field. The const
-    /// generic on the type is the source of truth; the attribute is accepted
-    /// but unused by the derives.
-    #[darling(default)]
-    #[allow(dead_code)]
-    max: Option<usize>,
 }
 
 impl Field {
