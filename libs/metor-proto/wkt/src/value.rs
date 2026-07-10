@@ -503,6 +503,28 @@ impl ComponentValue {
     }
 }
 
+macro_rules! impl_from_val {
+    ($target_type: ident, $ty:ty) => {
+        impl<D1: nox::Dim> From<Array<$ty, D1>> for ComponentValue {
+            fn from(value: Array<$ty, D1>) -> Self {
+                ComponentValue::$target_type(value.to_dyn())
+            }
+        }
+    };
+}
+
+impl_from_val!(U8, u8);
+impl_from_val!(U16, u16);
+impl_from_val!(U32, u32);
+impl_from_val!(U64, u64);
+impl_from_val!(I8, i8);
+impl_from_val!(I16, i16);
+impl_from_val!(I32, i32);
+impl_from_val!(I64, i64);
+impl_from_val!(Bool, bool);
+impl_from_val!(F32, f32);
+impl_from_val!(F64, f64);
+
 #[derive(Debug)]
 pub enum ElementValueMut<'a> {
     U8(&'a mut u8),

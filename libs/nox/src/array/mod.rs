@@ -1550,19 +1550,19 @@ fn matmul_dims(a: &'_ [usize], b: &'_ [usize]) -> Option<([usize; 2], usize)> {
     }
 }
 
-impl<T: Field> From<T> for Array<T, ()> {
+impl<T: Elem> From<T> for Array<T, ()> {
     fn from(buf: T) -> Self {
         Array { buf }
     }
 }
 
-impl<T: Field, const D1: usize> From<[T; D1]> for Array<T, Const<D1>> {
+impl<T: Elem, const D1: usize> From<[T; D1]> for Array<T, Const<D1>> {
     fn from(buf: [T; D1]) -> Self {
         Array { buf }
     }
 }
 
-impl<T: Field, const D1: usize, const D2: usize> From<[[T; D2]; D1]>
+impl<T: Elem, const D1: usize, const D2: usize> From<[[T; D2]; D1]>
     for Array<T, (Const<D1>, Const<D2>)>
 {
     fn from(buf: [[T; D2]; D1]) -> Self {
@@ -1570,7 +1570,7 @@ impl<T: Field, const D1: usize, const D2: usize> From<[[T; D2]; D1]>
     }
 }
 
-impl<T: Field, const D1: usize, const D2: usize, const D3: usize> From<[[[T; D3]; D2]; D1]>
+impl<T: Elem, const D1: usize, const D2: usize, const D3: usize> From<[[[T; D3]; D2]; D1]>
     for Array<T, (Const<D1>, Const<D2>, Const<D3>)>
 {
     fn from(buf: [[[T; D3]; D2]; D1]) -> Self {
