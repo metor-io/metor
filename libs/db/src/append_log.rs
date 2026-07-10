@@ -2,6 +2,10 @@ use memmap2::MmapRaw;
 use zerocopy::{Immutable, IntoBytes};
 
 use crate::Error;
+#[cfg(unix)]
+use std::os::fd::AsRawFd;
+#[cfg(target_os = "windows")]
+use std::os::windows::io::AsRawHandle;
 use std::{
     fs::OpenOptions,
     io::{Seek, SeekFrom, Write as _},
@@ -101,7 +105,10 @@ impl<E: IntoBytes + Immutable> AppendLog<E> {
         }
         file.seek(SeekFrom::Start(size))?;
         file.write_all(&[0])?;
-        let map = Arc::new(memmap2::MmapRaw::map_raw(&file)?);
+        #[cfg(unix)]
+        let map = Arc::new(memmap2::MmapRaw::map_raw(file.as_raw_fd())?);
+        #[cfg(target_os = "windows")]
+        let map = Arc::new(memmap2::MmapRaw::map_raw(file.as_raw_handle())?);
         let map = Self {
             map,
             header_extra: PhantomData,
@@ -119,7 +126,10 @@ impl<E: IntoBytes + Immutable> AppendLog<E> {
 
     pub fn open(path: impl AsRef<Path>) -> Result<Self, Error> {
         let file = OpenOptions::new().write(true).read(true).open(path)?;
-        let map = Arc::new(memmap2::MmapRaw::map_raw(&file)?);
+        #[cfg(unix)]
+        let map = Arc::new(memmap2::MmapRaw::map_raw(file.as_raw_fd())?);
+        #[cfg(target_os = "windows")]
+        let map = Arc::new(memmap2::MmapRaw::map_raw(file.as_raw_handle())?);
         let map = Self {
             map,
             header_extra: PhantomData,
