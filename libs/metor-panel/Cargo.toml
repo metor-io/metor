@@ -40,6 +40,7 @@ futures-lite = "2.5.0"
 thingbuf = "0.1"
 thiserror = "2"
 tracing = "0.1"
+tracing-subscriber = { version = "0.3.18", features = ["env-filter"] }
 dirs.workspace = true
 bevy = { git = "https://github.com/bevyengine/bevy", rev = "5330b01ed6dfe8ee9ea98c97ded72e44ca336c74", default-features = false, features = [
     "std",

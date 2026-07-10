@@ -29,6 +29,7 @@ pub mod theme;
 pub mod tiles;
 pub mod transient;
 pub mod views;
+pub(crate) mod window_controls;
 
 pub use app::PanelApp;
 pub use inspector::palette::{Category, InspectionItem, ItemProvider};
