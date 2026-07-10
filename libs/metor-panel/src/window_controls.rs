@@ -53,6 +53,10 @@ pub(crate) fn window_controls(theme: &Theme, window: &Window) -> impl IntoElemen
     } else {
         Icon::Maximize
     };
+    // The mouse-up handlers are skipped on Windows: the non-client hit-test
+    // already performs min/max/close natively, and gpui replays NC mouse
+    // events into the client pipeline, so acting here too would double-fire
+    // (maximize would toggle twice and appear dead).
     div()
         .occlude()
         .flex()
@@ -62,17 +66,29 @@ pub(crate) fn window_controls(theme: &Theme, window: &Window) -> impl IntoElemen
         .child(
             caption_button("window-minimize", Icon::Subtract, WindowControlArea::Min, theme)
                 .hover(|s| s.bg(theme.bg_primary))
-                .on_mouse_up(MouseButton::Left, |_, window, _| window.minimize_window()),
+                .on_mouse_up(MouseButton::Left, |_, window, _| {
+                    if !cfg!(target_os = "windows") {
+                        window.minimize_window();
+                    }
+                }),
         )
         .child(
             caption_button("window-maximize", maximize_icon, WindowControlArea::Max, theme)
                 .hover(|s| s.bg(theme.bg_primary))
-                .on_mouse_up(MouseButton::Left, |_, window, _| window.zoom_window()),
+                .on_mouse_up(MouseButton::Left, |_, window, _| {
+                    if !cfg!(target_os = "windows") {
+                        window.zoom_window();
+                    }
+                }),
         )
         .child(
             caption_button("window-close", Icon::Close, WindowControlArea::Close, theme)
-                .hover(|s| s.bg(theme.error_accent).text_color(theme.bg_primary))
-                .on_mouse_up(MouseButton::Left, |_, window, _| window.remove_window()),
+                .hover(|s| s.bg(theme.error_accent))
+                .on_mouse_up(MouseButton::Left, |_, window, _| {
+                    if !cfg!(target_os = "windows") {
+                        window.remove_window();
+                    }
+                }),
         )
 }
 
@@ -90,8 +106,7 @@ fn caption_button(
         .justify_center()
         .w(CAPTION_BUTTON_WIDTH)
         .h_full()
-        .text_color(theme.text_secondary)
-        .child(icon.svg_inherit(14.0))
+        .child(icon.svg_color(14.0, theme.text_secondary))
 }
 
 /// Wrap the window root with Linux client-side decorations: an invisible

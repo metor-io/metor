@@ -194,7 +194,15 @@ impl TextField {
         let key = event.keystroke.key.as_str();
         let mods = &event.keystroke.modifiers;
 
-        if mods.platform {
+        // cmd on macOS, ctrl elsewhere — `platform` off-macOS is the
+        // Win/Super key, which the OS mostly reserves for itself.
+        let primary = if cfg!(target_os = "macos") {
+            mods.platform
+        } else {
+            mods.control
+        };
+
+        if primary {
             match key {
                 "a" => {
                     self.mark = 0;
