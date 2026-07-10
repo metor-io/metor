@@ -164,14 +164,6 @@ impl Icon {
             .text_color(crate::theme::DARK.text_secondary)
     }
 
-    /// Build an [`Svg`] sized in pixels that inherits the surrounding text
-    /// color, so an ancestor's hover style can recolor the glyph.
-    pub fn svg_inherit(self, size: f32) -> Svg {
-        svg()
-            .path(SharedString::from(self.asset_path()))
-            .size(px(size))
-    }
-
     /// Build an [`Svg`] sized in pixels and tinted with an explicit color.
     pub fn svg_color(self, size: f32, color: Hsla) -> Svg {
         svg()

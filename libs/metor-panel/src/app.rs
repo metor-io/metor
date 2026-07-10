@@ -621,6 +621,12 @@ impl AppRoot {
         div()
             .id("titlebar")
             .window_control_area(gpui::WindowControlArea::Drag)
+            // Occluded so a titlebar press never hovers the root's
+            // `track_focus` hitbox: gpui's focus-transfer listener calls
+            // `prevent_default()`, and the Windows backend treats a
+            // default-prevented mouse-down as handled — swallowing the
+            // WM_NCLBUTTONDOWN that starts the native caption drag.
+            .occlude()
             .bg(theme.bg_secondary)
             .border_b_1()
             .border_color(theme.border_primary)
@@ -865,8 +871,10 @@ impl PanelApp {
                 }
 
                 set_dock_icon();
+                // `secondary-` resolves to cmd on macOS and ctrl elsewhere
+                // (`cmd-` would be the Win/Super key off-macOS).
                 cx.bind_keys([
-                    KeyBinding::new("cmd-p", OpenPalette, None),
+                    KeyBinding::new("secondary-p", OpenPalette, None),
                     // The leader opens the transient chord menu. Suppressed while
                     // a text field (Inspector search, node-editor inline edit via
                     // RowList) or the menu itself holds focus, so the key still
@@ -878,8 +886,8 @@ impl PanelApp {
                     ),
                     KeyBinding::new("ctrl-tab", CycleTabForward, None),
                     KeyBinding::new("shift-ctrl-tab", CycleTabBackward, None),
-                    KeyBinding::new("cmd-l", ToggleCmdLock, None),
-                    KeyBinding::new("cmd-shift-e", OpenReviewEdits, None),
+                    KeyBinding::new("secondary-l", ToggleCmdLock, None),
+                    KeyBinding::new("secondary-shift-e", OpenReviewEdits, None),
                     // Excluded when a `RowList` is focused so editing a node's
                     // inline arg field (typing Backspace, hitting Delete) doesn't
                     // also delete the surrounding node.
