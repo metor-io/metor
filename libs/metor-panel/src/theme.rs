@@ -111,6 +111,18 @@ pub struct Theme {
 }
 
 impl Theme {
+    /// Drop shadow behind the window when Linux client-side decorations are
+    /// active. Derived rather than per-palette: translucent black reads
+    /// correctly over any compositor wallpaper.
+    pub fn window_shadow(&self) -> Hsla {
+        Hsla {
+            h: 0.,
+            s: 0.,
+            l: 0.,
+            a: 0.4,
+        }
+    }
+
     /// Semi-transparent `bg_secondary` for plot chrome strips — the legend
     /// background and the axis fills that mask GPU-frame edges straying into
     /// the chrome. Derived so it tracks whatever `bg_secondary` a theme picks.

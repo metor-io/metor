@@ -61,6 +61,10 @@ struct AppRoot {
     /// The transient chord menu, present only while open. Dropped (and focus
     /// returned to the root) once it dismisses, mirroring `inspector`.
     transient: Option<Entity<crate::transient::Transient>>,
+    /// Armed by mouse-down on the titlebar; the next mouse-move hands the
+    /// drag to the compositor via `start_window_move` (Linux — macOS and
+    /// Windows drag natively through the transparent titlebar / HTCAPTION).
+    should_move: bool,
     focus_handle: FocusHandle,
 }
 
@@ -100,6 +104,7 @@ impl AppRoot {
             pending_pane_inspector_request: None,
             pending_inspector_open: None,
             transient: None,
+            should_move: false,
             focus_handle: cx.focus_handle(),
         }
     }
@@ -376,7 +381,7 @@ impl Render for AppRoot {
 
         let theme = crate::theme::theme(cx);
         let font_family = crate::theme::font_family(cx);
-        let titlebar = self.render_titlebar(&theme, cx);
+        let titlebar = self.render_titlebar(&theme, window, cx);
 
         let mut root = div()
             .id("app-root")
@@ -406,6 +411,9 @@ impl Render for AppRoot {
             .flex()
             .flex_col()
             .size_full()
+            // Linux client-side decorations render into a transparent surface,
+            // so the root must paint its own opaque background.
+            .bg(theme.bg_primary)
             .child(titlebar)
             .child(div().flex_1().min_h_0().child(self.tiles.clone()));
 
@@ -421,7 +429,7 @@ impl Render for AppRoot {
             root = root.child(preview.inspector.clone());
         }
 
-        root
+        crate::window_controls::client_side_decorations(root, window, cx)
     }
 }
 
@@ -508,6 +516,7 @@ impl AppRoot {
     fn render_titlebar(
         &self,
         theme: &crate::theme::Theme,
+        window: &Window,
         cx: &mut Context<Self>,
     ) -> gpui::AnyElement {
         let pending = pending_edits(cx);
@@ -541,7 +550,11 @@ impl AppRoot {
                 cx.refresh_windows();
             });
 
+        // Occluded so these controls win the non-client hit-test: without it,
+        // Windows resolves clicks over the pills to the surrounding titlebar
+        // drag area (HTCAPTION) and drags the window instead of clicking.
         let mut right = div()
+            .occlude()
             .flex()
             .flex_row()
             .items_center()
@@ -606,6 +619,8 @@ impl AppRoot {
         right = right.child(lock_button);
 
         div()
+            .id("titlebar")
+            .window_control_area(gpui::WindowControlArea::Drag)
             .bg(theme.bg_secondary)
             .border_b_1()
             .border_color(theme.border_primary)
@@ -616,7 +631,50 @@ impl AppRoot {
             .flex_row()
             .items_center()
             .justify_end()
+            // Drag gesture for compositors that need an explicit hand-off:
+            // mouse-down arms, the first mouse-move starts the compositor
+            // drag. macOS drags natively via the transparent titlebar and
+            // Windows via the HTCAPTION hit-test, so these never fire there.
+            .on_mouse_down(
+                gpui::MouseButton::Left,
+                cx.listener(|this, _, _, _| this.should_move = true),
+            )
+            .on_mouse_move(cx.listener(|this, _, window, _| {
+                if this.should_move {
+                    this.should_move = false;
+                    window.start_window_move();
+                }
+            }))
+            .on_mouse_up(
+                gpui::MouseButton::Left,
+                cx.listener(|this, _, _, _| this.should_move = false),
+            )
+            .on_mouse_down_out(cx.listener(|this, _, _, _| this.should_move = false))
+            .on_click(|event, window, _| {
+                if event.click_count() == 2 {
+                    if cfg!(target_os = "macos") {
+                        window.titlebar_double_click();
+                    } else {
+                        window.zoom_window();
+                    }
+                }
+            })
+            .when(
+                matches!(
+                    window.window_decorations(),
+                    gpui::Decorations::Client { .. }
+                ) && window.window_controls().window_menu,
+                |bar| {
+                    bar.on_mouse_down(gpui::MouseButton::Right, |event, window, _| {
+                        window.show_window_menu(event.position);
+                    })
+                },
+            )
             .child(right)
+            .when(
+                crate::window_controls::needs_window_controls(window),
+                |bar| bar.child(crate::window_controls::window_controls(theme, window)),
+            )
             .into_any_element()
     }
 }
@@ -842,11 +900,19 @@ impl PanelApp {
                 cx.open_window(
                     WindowOptions {
                         window_bounds: Some(WindowBounds::Windowed(bounds)),
+                        // `appears_transparent` hides the native titlebar on
+                        // macOS (leaving the traffic lights) and on Windows
+                        // (leaving nothing — the app draws its own controls).
                         titlebar: Some(TitlebarOptions {
                             appears_transparent: true,
                             traffic_light_position: Some(point(px(12.0), px(8.0))),
                             ..Default::default()
                         }),
+                        // Linux-only: request client-side decorations; the
+                        // window root wraps itself in resize borders and a
+                        // shadow via `window_controls::client_side_decorations`.
+                        window_decorations: Some(gpui::WindowDecorations::Client),
+                        app_id: Some("metor-panel".into()),
                         ..Default::default()
                     },
                     move |_window, cx| cx.new(|cx| AppRoot::new(db, cx)),
