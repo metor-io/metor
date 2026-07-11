@@ -368,6 +368,30 @@ where
             });
         }
     }
+
+    /// Consume and decode the next pending message, or `None` when every
+    /// producer is drained. Records of other message types on a shared
+    /// channel are consumed and skipped, same as [`drain`](Self::drain).
+    pub fn try_next(&mut self) -> Option<M> {
+        for view in &mut self.views {
+            while let Ok(Some(grant)) = view.try_read() {
+                if let Some((id, payload)) = split_record(&grant)
+                    && id == M::ID
+                    && let Ok(msg) = postcard::from_bytes::<M>(payload)
+                {
+                    return Some(msg);
+                }
+            }
+        }
+        None
+    }
+
+    /// Drain as an iterator: `for cmd in cmds.drain_iter() { … }`. Each
+    /// record is consumed as the iterator yields it, so dropping the
+    /// iterator early leaves the rest pending.
+    pub fn drain_iter(&mut self) -> impl Iterator<Item = M> + '_ {
+        core::iter::from_fn(|| self.try_next())
+    }
 }
 
 impl<M, RD, RS> MsgIn<M, RD, RS>
@@ -585,6 +609,49 @@ mod tests {
         let mut again = 0;
         inbox.drain(|_| again += 1);
         assert_eq!(again, 0);
+    }
+
+    /// `try_next` consumes one message per call with the same id filtering as
+    /// `drain`, and `drain_iter` drains the remainder as an iterator.
+    #[test]
+    fn msg_in_try_next_and_drain_iter() {
+        let ring = RingBuffer::create_in_memory(Config {
+            capacity: capacity_for(MAX_MSG_BYTES, LOG_DEPTH),
+            max_readers: 4,
+        });
+        let mut inbox: MsgIn<SequenceCommand> =
+            MsgIn::new(ring.view(NoWake, NoWake).expect("slot"));
+
+        // A foreign-typed record ahead of the commands must be skipped.
+        {
+            let mut reg_out: MsgOut<SequenceRegistry> =
+                MsgOut::new(ring.writer(NoWake, NoWake).expect("first writer"));
+            reg_out
+                .emit(&SequenceRegistry { channels: vec![] })
+                .expect("emit registry");
+        }
+        let mut cmd_out: MsgOut<SequenceCommand> =
+            MsgOut::new(ring.writer(NoWake, NoWake).expect("claim freed on drop"));
+        for channel in ["a", "b", "c"] {
+            cmd_out
+                .emit(&SequenceCommand {
+                    channel: channel.to_string(),
+                    command: SequenceCommandKind::Start,
+                })
+                .expect("emit");
+        }
+
+        let first = inbox.try_next().expect("skips the registry record");
+        assert_eq!(first.channel, "a");
+
+        // Dropping a partially-consumed iterator leaves the rest pending.
+        {
+            let mut it = inbox.drain_iter();
+            assert_eq!(it.next().expect("second").channel, "b");
+        }
+        let rest: Vec<_> = inbox.drain_iter().map(|c| c.channel).collect();
+        assert_eq!(rest, vec!["c"]);
+        assert!(inbox.try_next().is_none());
     }
 
     /// `MsgFanOut::write_raw` relays an already-encoded `(id ++ payload)`
