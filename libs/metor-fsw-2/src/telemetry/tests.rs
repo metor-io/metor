@@ -6,6 +6,8 @@
 //! counter, non-coalescing message batching, and uplink subscription and
 //! routing.
 
+use std::cell::RefCell;
+use std::rc::Rc;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -159,6 +161,25 @@ impl Transport for MockTransport {
         }
         drop(packets);
         (Ok(()), buf)
+    }
+}
+
+/// A transport that never connects: every `announce` fails, so the sender task
+/// lives in its redial-backoff loop (parked in `stellarator::sleep`) for the
+/// coordinator's whole life — the no-ground-station-listening state.
+struct DeadTransport;
+
+impl Transport for DeadTransport {
+    async fn announce(
+        &mut self,
+        _msg: &VTableMsg,
+        _meta: &[ComponentMetadata],
+    ) -> Result<(), TransportError> {
+        Err(TransportError::Disconnected)
+    }
+
+    async fn send(&mut self, buf: Vec<u8>) -> (Result<(), TransportError>, Vec<u8>) {
+        (Err(TransportError::Disconnected), buf)
     }
 }
 
@@ -425,23 +446,51 @@ async fn drop_policy_never_blocks_and_counts() {
     let mock = MockTransport::new(true);
 
     let mut b = Coordinator::builder(sim_config());
-    b.add_cyclic_named("producer", Producer { n: 0.0 });
+    let prod = b.add_cyclic_named("producer", Producer { n: 0.0 });
+    // A downstream consumer of the same output telemetry taps: the saturated
+    // link must not starve it (regression: an undrained tap view stalls the
+    // producer's ring for EVERY consumer, freezing the whole mission).
+    let cons = b.add_cyclic(Consumer);
+    b.connect(PortRef::new::<Imu>(prod), PortRef::new::<Imu>(cons))
+        .unwrap();
     b.add_cyclic(TelemetrySystem::new(TelemetryConfig {
         transport: mock,
         mode: TelemetryMode::All,
     }));
     let mut coord = b.build().unwrap();
 
-    // Tap the telemetry system's own health frame to observe its error counter.
+    // Tap the telemetry system's own health frame to observe its error counter,
+    // and the consumer's output to observe fresh data flowing end-to-end.
     let registry = coord.registry();
     let mut health = registry
         .get(ComponentId::new("telemetry.health"))
         .expect("telemetry.health")
         .view()
         .expect("reader slot");
+    let nav_view = registry
+        .get(ComponentId::new("consumer.nav"))
+        .expect("consumer.nav")
+        .view()
+        .expect("reader slot");
+
+    // Sample `consumer.nav` every cycle (a held-but-idle view would itself
+    // stall the nav ring — the very failure mode under test).
+    let last_angle = Rc::new(RefCell::new(0.0f64));
+    let captured = last_angle.clone();
+    let sampler = stellarator::spawn(async move {
+        let mut nav: crate::port::Input<Nav> = crate::port::Input::new(nav_view);
+        loop {
+            stellarator::yield_now().await;
+            if let Some(n) = nav.latest() {
+                *captured.borrow_mut() = n.get().angle;
+            }
+        }
+    })
+    .drop_guard();
 
     // The cycle never blocks on the stalled link, so `run_for` completes all cycles.
     coord.run_for(50).await;
+    drop(sampler);
 
     let bytes = drain_latest(&mut health).expect("telemetry published a health frame");
     let h = SystemHealth::read_from_prefix(&bytes)
@@ -452,6 +501,42 @@ async fn drop_policy_never_blocks_and_counts() {
         "saturated transport should have surfaced telemetry_dropped (errors={})",
         h.errors
     );
+    // The consumer kept receiving fresh records through the stalled link: its
+    // final output carries the producer's last value, not an early frozen one
+    // (regression: the queue-full path once returned without draining the
+    // taps, freezing every ring at depth).
+    let angle = *last_angle.borrow();
+    assert!(
+        angle >= 49.0,
+        "consumer starved by the saturated downlink: last angle {angle}"
+    );
+}
+
+// A coordinator whose downlink never connects tears down cleanly while its
+// sender task is parked in redial backoff, and a second coordinator builds and
+// runs on the same runtime afterwards (regression: aborting the parked sender
+// at teardown corrupted the task and panicked the next run's scheduler).
+#[stellarator::test]
+async fn dead_downlink_coordinator_teardown_is_clean() {
+    for round in 0..2 {
+        let mut b = Coordinator::builder(sim_config());
+        b.add_cyclic_named("producer", Producer { n: 0.0 });
+        b.add_cyclic(TelemetrySystem::new(TelemetryConfig {
+            transport: DeadTransport,
+            mode: TelemetryMode::All,
+        }));
+        let mut coord = b.build().unwrap();
+        coord.run_for(20).await;
+        assert!(coord.stopped().is_empty(), "round {round}: no system stopped");
+        // `coord` drops here with the sender mid-backoff; the next round must
+        // build and run untouched.
+    }
+    // Outlive the aborted senders' pending backoff timers (RECONNECT_MIN and its
+    // doublings): a stale timer waking a freed task is exactly the regression.
+    stellarator::sleep(Duration::from_millis(700)).await;
+    for _ in 0..10 {
+        stellarator::yield_now().await;
+    }
 }
 
 // ---------------------------------------------------------------------------

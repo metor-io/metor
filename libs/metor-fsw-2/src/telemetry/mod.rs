@@ -957,12 +957,20 @@ impl<T: Transport + 'static> CyclicSystem for TelemetrySystem<T> {
         for _ in 0..started.drops.swap(0, Relaxed) {
             output.health().error("link_reconnect");
         }
-        let Some(tx) = &started.tx else {
-            return;
-        };
-        let Ok(mut batch) = tx.try_send_ref() else {
-            output.health().error("telemetry_dropped");
-            return;
+        // The link must never backpressure the mission. With no queue slot (the sender task
+        // parked in redial backoff, or the link slower than the cycle) the taps still drain
+        // below — records are consumed and DISCARDED (loss on the link, counted as
+        // `telemetry_dropped`), because an undrained tap view stalls its producer's ring and
+        // freezes every consumer of that output, not just telemetry.
+        let mut batch = match &started.tx {
+            Some(tx) => match tx.try_send_ref() {
+                Ok(batch) => Some(batch),
+                Err(_) => {
+                    output.health().error("telemetry_dropped");
+                    None
+                }
+            },
+            None => None,
         };
         for tap in &mut self.taps {
             match tap.delivery {
@@ -977,14 +985,19 @@ impl<T: Transport + 'static> CyclicSystem for TelemetrySystem<T> {
                     // A corrupt read (unreachable in practice) counts as
                     // nothing new.
                     if let Ok(Some(grant)) = tap.view.try_latest() {
-                        append_record(&mut batch, &tap.wire, &grant);
+                        if let Some(batch) = &mut batch {
+                            append_record(batch, &tap.wire, &grant);
+                        }
                     }
                 }
                 // Every record, in order.
                 Delivery::Log => {
                     let wire = &tap.wire;
+                    let batch = &mut batch;
                     let _ = crate::port::drain_view(&mut tap.view, |rec| {
-                        append_record(&mut batch, wire, rec);
+                        if let Some(batch) = batch.as_mut() {
+                            append_record(batch, wire, rec);
+                        }
                     });
                 }
             }
