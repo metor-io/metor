@@ -109,7 +109,9 @@ mod coordinator;
 mod descriptor;
 mod dynamic;
 mod frame;
+mod handler;
 mod message;
+mod pack;
 mod port;
 mod reader;
 mod registry;
@@ -140,7 +142,15 @@ pub use writer::{FrameScratch, FrameWriter, KeyError, ListWriter, MapWriter};
 
 pub use metor_fsw_ring::{ReadError, WriteError};
 
-pub use binder::{BindPorts, Binder, BoundInput, BoundPort, RingSource};
+pub use binder::{AnySource, BindPorts, Binder, BoundInput, BoundPort, RingSource};
+// `system` the fn (value namespace) coexists with `system` the attribute
+// macro (macro namespace) at the root: `system(nav_execute)` and
+// `#[metor_fsw_2::system]` resolve independently.
+pub use handler::{
+    AsyncSystemFn, BindCx, CycleCx, DeclSink, ExecParam, ExecParamSet, ExecuteFn, InitFn,
+    IntoOutcome, IntoPackEntry, Params, SystemDef, TaskParam, system,
+};
+pub use pack::{Driver, EntryParams, MakeError, Mount, Pack, PackEntry, Pending, StepStatus};
 pub use coordinator::{
     AllowedOccupant, ClockMode, Coordinator, CoordinatorBuilder, CoordinatorConfig,
     InitialOccupant, NAME_CAP, OccupantBacking, PortRef, SLOT_NAME_CAP, SlotState, SlotStatus,

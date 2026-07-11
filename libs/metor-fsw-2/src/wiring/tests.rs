@@ -63,7 +63,7 @@ struct NoOut {}
 // ImuDriver: a params-bearing cyclic producer of an incrementing `Imu`.
 // ---------------------------------------------------------------------------
 
-#[derive(serde::Deserialize)]
+#[derive(serde::Deserialize, postcard_schema::Schema)]
 struct ImuParams {
     #[allow(dead_code)]
     i2c_bus: i64,
@@ -1849,4 +1849,104 @@ fn slot_spec_process_serde_defaults_off() {
     }"#;
     let spec: super::SlotSpec = serde_json::from_str(json).expect("old document deserializes");
     assert!(!spec.process, "an omitted `process` field defaults off");
+}
+
+// ---------------------------------------------------------------------------
+// Packs on the static registry: register_pack makes each entry a `type=`.
+// ---------------------------------------------------------------------------
+
+static PACK_LAST_ANGLE_BITS: AtomicU64 = AtomicU64::new(0);
+
+/// A `register_pack`ed pack loads from KDL exactly like type-registered
+/// systems: entry names are `type=` keys, KDL params reach the init fn, and
+/// frames flow across the wired edge.
+#[cfg(not(miri))]
+#[stellarator::test]
+async fn register_pack_entries_load_from_kdl() {
+    #[derive(serde::Deserialize, postcard_schema::Schema)]
+    struct GainParams {
+        gain: f64,
+    }
+
+    struct SrcState {
+        n: f64,
+    }
+    fn src_execute(s: &mut SrcState, now: Timestamp, imu: &mut crate::Output<Imu>) {
+        s.n += 1.0;
+        imu.publish(&Imu {
+            timestamp: now,
+            omega: s.n,
+        });
+    }
+
+    struct GainState {
+        gain: f64,
+    }
+    fn gain_execute(
+        s: &mut GainState,
+        now: Timestamp,
+        imu: &mut crate::Input<Imu>,
+        nav: &mut crate::Output<Nav>,
+    ) {
+        if let Some(r) = imu.latest() {
+            let angle = r.omega * s.gain;
+            PACK_LAST_ANGLE_BITS.store(angle.to_bits(), Relaxed);
+            nav.publish(&Nav {
+                timestamp: now,
+                angle,
+            });
+        }
+    }
+
+    PACK_LAST_ANGLE_BITS.store(0, Relaxed);
+    let mut r = Registry::with_builtins();
+    r.register_pack(
+        crate::Pack::new()
+            .system("PkSrc", crate::system(src_execute).init(|| SrcState { n: 0.0 }))
+            .system(
+                "PkGain",
+                crate::system(gain_execute).init(|p: GainParams| GainState { gain: p.gain }),
+            )
+            // A struct-authored system rides the same pack.
+            .system_type::<ImuDriver, _>("PkImuDriver"),
+    );
+
+    let kdl = r#"
+coordinator cycle_rate=1000.0
+
+system "imu" type="PkSrc"
+system "nav" type="PkGain" gain=3.0
+system "imu2" type="PkImuDriver" i2c_bus=1 sample_hz=100.0
+
+connect "imu" -> "nav" frame="pk_imu"
+"#;
+    // The pack test frames reuse this file's `Imu`/`Nav` types, whose wiring
+    // names are "imu"/"nav"; the connect names the frame, not the type.
+    let kdl = kdl.replace("pk_imu", "imu");
+    let mut coord = load(&kdl, &r).expect("pack entries load");
+    coord.run_for(10).await;
+
+    let last = f64::from_bits(PACK_LAST_ANGLE_BITS.load(Relaxed));
+    assert!(last > 0.0, "frames crossed the edge: {last}");
+    assert_eq!(last % 3.0, 0.0, "KDL gain reached the init fn: {last}");
+}
+
+/// A stray KDL property on a paramless pack entry is a spanned load error,
+/// matching the `()`-params behavior of type-registered systems.
+#[test]
+fn pack_entry_rejects_stray_params() {
+    fn noop(_s: &mut u64, _now: Timestamp, _imu: &mut crate::Output<Imu>) {}
+
+    let mut r = Registry::new();
+    r.register_pack(crate::Pack::new().system("PkNoop", crate::system(noop)));
+
+    let kdl = r#"
+coordinator cycle_rate=1000.0
+system "x" type="PkNoop" bogus=1
+"#;
+    let Err(err) = load(kdl, &r) else {
+        panic!("stray property rejected");
+    };
+    let msg = format!("{err}");
+    assert!(msg.contains("bogus"), "names the stray key: {msg}");
 }
