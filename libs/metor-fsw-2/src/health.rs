@@ -247,12 +247,12 @@ mod tests {
         port.error("i2c_timeout");
         port.end_cycle(Timestamp(7), 12);
 
+        // Field access derefs through the grant; no `.get()` needed.
         let grant = health_in.latest().expect("health published");
-        let frame = grant.get();
-        assert_eq!(frame.timestamp, Timestamp(7));
-        assert_eq!(frame.cycles, 1);
-        assert_eq!(frame.errors, 3);
-        assert_eq!(frame.last_execute_micros, 12);
+        assert_eq!(grant.timestamp, Timestamp(7));
+        assert_eq!(grant.cycles, 1);
+        assert_eq!(grant.errors, 3);
+        assert_eq!(grant.last_execute_micros, 12);
         let counts = grant.map::<u64>(offset_of!(SystemHealth, error_counts));
         assert_eq!(counts.get("imu_missing"), Some(2));
         assert_eq!(counts.get("i2c_timeout"), Some(1));

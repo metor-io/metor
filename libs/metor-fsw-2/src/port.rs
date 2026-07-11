@@ -418,3 +418,19 @@ where
         self.as_ref().apply(sink)
     }
 }
+
+/// A grant reads as the frame itself, so field access needs no `.get()`:
+/// `input.latest()` then `record.omega`. The borrow is tied to the grant
+/// (not the record's full ring lifetime), which is what keeps the deref'd
+/// reference from outliving the pin.
+impl<F, RS> core::ops::Deref for FrameGrant<'_, F, RS>
+where
+    F: Frame + FromBytes + KnownLayout + Immutable,
+    RS: WakeSource,
+{
+    type Target = F;
+
+    fn deref(&self) -> &F {
+        self.get()
+    }
+}
