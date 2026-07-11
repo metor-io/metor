@@ -9,7 +9,9 @@
 //!
 //! 1. **Auto-run** — the slot's `initial state="running"` `commissioning` occupant runs from
 //!    the first cycle and reaches terminal `Completed` on its `SequenceStatus`, having walked
-//!    `ModeCmd` settling → pointing (its two writes; idle is the pre-write default).
+//!    its condition-based ladder: estimator warm-up (no ModeCmd — ctrl holds identity, which
+//!    already damps the boot tumble), then settling → pointing gated on the live tracking
+//!    error (detumble is skipped — the warm-up hold leaves the rate far below the enter gate).
 //! 2. **Interactive** — the same slot started **empty** and driven through
 //!    [`Coordinator::control_handle`]: `Load` → `Start` → `Abort`; the occupant folds the
 //!    cancel at its next `wait`, writes `ModeCmd::safe`, and ends `Aborted`.
@@ -39,6 +41,7 @@ const MISSION_KDL: &str = include_str!("../mission.kdl");
 const RUNNING: u8 = 0;
 const COMPLETED: u8 = 1;
 const ABORTED: u8 = 2;
+const FAILED: u8 = 3;
 
 /// Build the mission off `mission.kdl`. When `auto_run` is false the slot's `initial`
 /// occupant is cleared so the slot starts **empty** (the interactive scenario drives it by
@@ -116,12 +119,13 @@ fn commissioning_auto_runs_to_completion() {
     };
     let (seq, mode) = tap_slot(&mut coord);
 
-    // ~400 cycles ≈ 3.3 s of sim time — far more than the ~30 cycles commissioning needs
-    // (100 ms + 150 ms of `wait` at the 1/120 s step ≈ 12 + 18 cycles).
+    // ~4000 cycles ≈ 33 s of sim time (the closed_loop budget): the ladder is
+    // condition-based now — estimator warm-up (~2 s), then a real slew until the tracking
+    // error holds under the coarse gate, then the fine-pointing confirm dwell.
     let (captured, _coord) = stellarator::run(|| async move {
         let ((run_states, modes), sampler) = spawn_sampler(seq, mode);
         let sampler = sampler.drop_guard();
-        coord.run_for(400).await;
+        coord.run_for(4000).await;
         drop(sampler);
         ((run_states, modes), coord)
     });
@@ -163,8 +167,8 @@ fn interactive_load_then_abort_safes() {
 
     // `run_for` re-runs the dl systems' (non-idempotent) `init` each call, so the slot is
     // driven inside a SINGLE `run_for`: `Load` + `Start` are issued before it, and a spawned
-    // task injects the `Abort` a few cycles in — fewer than the 12 cycles the first
-    // `wait(100ms)` needs, so the occupant is still suspended at it and folds the cancel.
+    // task injects the `Abort` a few cycles in — the occupant is polling its per-cycle
+    // warm-up wait and folds the cancel at the next one.
     let captured = stellarator::run(|| async move {
         let ((run_states, modes), sampler) = spawn_sampler(seq, mode);
         let sampler = sampler.drop_guard();
@@ -266,10 +270,10 @@ fn commissioning_emits_ordered_sequence_messages() {
         .expect("the coordinator boot-registry channel is registered")
         .expect("a reader slot is available");
 
-    // The same ~400-cycle auto-run window the `commissioning_auto_runs_to_completion` test
-    // uses — far more than the ~30 cycles commissioning needs to walk to `Completed`.
+    // The same ~4000-cycle auto-run window the `commissioning_auto_runs_to_completion` test
+    // uses — enough for the condition-based ladder to walk to `Completed`.
     let coord = stellarator::run(|| async move {
-        coord.run_for(400).await;
+        coord.run_for(4000).await;
         coord
     });
 
@@ -296,29 +300,133 @@ fn commissioning_emits_ordered_sequence_messages() {
         "every event is tagged with the `mode` channel's name"
     );
     let kinds: Vec<&SequenceEventKind> = events.iter().map(|e| &e.kind).collect();
+    // The full lifecycle, every-record (no coalescing). The progress detail strings match
+    // `systems/commissioning/src/lib.rs`, enumerated once here.
+    let expected_progress = ["estimator warm-up", "coarse pointing", "pointing", "commissioned"];
     assert_eq!(
         kinds.len(),
-        6,
-        "the full commissioning lifecycle, every-record (no coalescing): {kinds:?}"
+        3 + expected_progress.len(),
+        "Loaded + Started + progress lines + Completed: {kinds:?}"
     );
     assert!(
         matches!(kinds[0], SequenceEventKind::Loaded { name } if name == "commissioning"),
         "[0] Loaded {{ commissioning }}: {kinds:?}"
     );
     assert!(matches!(kinds[1], SequenceEventKind::Started), "[1] Started: {kinds:?}");
+    for (i, expected) in expected_progress.iter().enumerate() {
+        assert!(
+            matches!(kinds[2 + i], SequenceEventKind::Progress { detail } if detail == expected),
+            "[{}] Progress {{ {expected} }}: {kinds:?}",
+            2 + i
+        );
+    }
     assert!(
-        matches!(kinds[2], SequenceEventKind::Progress { detail } if detail == "warming up"),
-        "[2] Progress {{ warming up }}: {kinds:?}"
+        matches!(kinds.last().unwrap(), SequenceEventKind::Completed),
+        "[last] Completed: {kinds:?}"
     );
-    assert!(
-        matches!(kinds[3], SequenceEventKind::Progress { detail } if detail == "reaction wheels enabled"),
-        "[3] Progress {{ reaction wheels enabled }}: {kinds:?}"
-    );
-    assert!(
-        matches!(kinds[4], SequenceEventKind::Progress { detail } if detail == "pointing"),
-        "[4] Progress {{ pointing }}: {kinds:?}"
-    );
-    assert!(matches!(kinds[5], SequenceEventKind::Completed), "[5] Completed: {kinds:?}");
 
     drop((coord, events_view, boot_view, messages));
+}
+
+// ---------------------------------------------------------------------------
+// 4. Detumble: entered when the estimated rate exceeds the (patched) gate, the
+//    wheels idle under LAW_DETUMBLE, and a phase timeout safes + Fails. The
+//    mission gate (1.0 rad/s) is deliberately never reached by the boot tumble,
+//    so this scenario patches the allow-line params — and uses the timeout path
+//    as its deterministic assertion (magnetorquer authority is far too small to
+//    finish a real detumble inside a test budget).
+// ---------------------------------------------------------------------------
+
+#[test]
+fn detumble_times_out_to_failed_with_wheels_idle() {
+    // Enter far below the ~0.1 rad/s the warm-up identity-hold leaves; time out after 2 s
+    // of sim (B-cross barely dents the rate in that window).
+    let kdl = MISSION_KDL
+        .replace("rate_detumble_enter=1.0", "rate_detumble_enter=0.01")
+        .replace("rate_detumble_exit=0.8", "rate_detumble_exit=0.005")
+        .replace("detumble_timeout_s=900.0", "detumble_timeout_s=2.0");
+    assert!(kdl != MISSION_KDL, "patch anchors present in mission.kdl");
+    let mut wiring = parse(&kdl).expect("parse the patched mission.kdl");
+    for spec in &mut wiring.systems {
+        spec.process = false;
+    }
+    if let Err(e) = build_artifacts(&mut wiring, &BuildOptions::default()) {
+        eprintln!("skipping: build_artifacts failed: {e}");
+        return;
+    }
+    let mut coord =
+        resolve(&wiring, &Registry::with_builtins()).expect("resolve the patched mission");
+    let (seq, mode) = tap_slot(&mut coord);
+    // A second mode view + the controller's torque output, for the wheels-idle assertion.
+    let (_, mode_for_torque) = tap_slot(&mut coord);
+    let torque_view: Input<adcs_contracts::TorqueCmd> = Input::new(
+        coord
+            .registry()
+            .view(ComponentId::new("ctrl.torque_cmd"))
+            .expect("ctrl.torque_cmd is registered")
+            .expect("a reader slot is available"),
+    );
+
+    // Estimator warm-up (~5 s — the identity-hold must damp the boot tumble before the
+    // q̂-delta gate settles) + the 2 s detumble timeout + margin.
+    let captured = stellarator::run(|| async move {
+        let ((run_states, modes), sampler) = spawn_sampler(seq, mode);
+        let sampler = sampler.drop_guard();
+
+        // While the commanded mode is DETUMBLE (with a few cycles of grace for the delayed
+        // mode_cmd edge into ctrl), the wheels must idle: ctrl publishes an exactly-zero
+        // torque under LAW_DETUMBLE.
+        let max_detumble_torque = Rc::new(RefCell::new(0.0f64));
+        let captured_torque = max_detumble_torque.clone();
+        let torque_sampler = stellarator::spawn(async move {
+            let (mut mode, mut torque) = (mode_for_torque, torque_view);
+            let mut current_mode = ModeCmd::IDLE;
+            let mut cycles_in_mode = 0u32;
+            loop {
+                stellarator::yield_now().await;
+                if let Some(m) = mode.latest() {
+                    let m = m.get().mode;
+                    if m == current_mode {
+                        cycles_in_mode += 1;
+                    } else {
+                        current_mode = m;
+                        cycles_in_mode = 0;
+                    }
+                }
+                let record = current_mode == ModeCmd::DETUMBLE && cycles_in_mode >= 3;
+                let _ = torque.drain(|f| {
+                    if record {
+                        let mag: f64 = f.get().torque_b.norm().into_buf();
+                        let mut max = captured_torque.borrow_mut();
+                        *max = max.max(mag);
+                    }
+                });
+            }
+        })
+        .drop_guard();
+
+        coord.run_for(1500).await;
+        drop((sampler, torque_sampler));
+        (run_states, modes, max_detumble_torque)
+    });
+    let (run_states, modes, max_detumble_torque) = captured;
+    let run_states = run_states.borrow();
+    let modes = modes.borrow();
+
+    assert_eq!(
+        run_states.last(),
+        Some(&FAILED),
+        "detumble timed out to Failed: modes {modes:?}, last run_states {:?}",
+        &run_states[run_states.len().saturating_sub(5)..]
+    );
+    assert_eq!(
+        &*modes,
+        &[ModeCmd::DETUMBLE, ModeCmd::SAFE],
+        "detumble entered, then the timeout safed: {modes:?}"
+    );
+    let max_torque = *max_detumble_torque.borrow();
+    assert!(
+        max_torque == 0.0,
+        "the wheels idled while detumbling: max |torque| = {max_torque:e}"
+    );
 }

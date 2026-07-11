@@ -8,17 +8,19 @@
 //! detumble authority).
 //!
 //! Each cycle it steps the wheels under the commanded control torque, samples the simulated
-//! sensor suite (gyro + sun + a Tesla-valued magnetometer reading the NOAA WMM field), emits
-//! the noisy `gps` measurement the flight software flies on (a Gauss-Markov position error +
-//! white velocity noise), the wheel and disturbance telemetry, the true `world` environment,
-//! and the `body` truth frame the host taps to measure convergence — then integrates the
-//! body one step (`six_dof_rk4`, body-fixed torques rotated per substep, the wheel-momentum
-//! coupling `−ω_b × h_w` evaluated per substep).
+//! sensor suite (gyro, six coarse-sun-sensor heads — dark in Earth shadow — and a
+//! Tesla-valued magnetometer reading the NOAA WMM field), emits the noisy `gps` measurement
+//! the flight software flies on (a Gauss-Markov position error + white velocity noise), the
+//! wheel and disturbance telemetry, the true `world` environment (including the
+//! illumination truth flag), and the `body` truth frame the host taps to measure
+//! convergence — then integrates the body one step (`six_dof_rk4`, body-fixed torques
+//! rotated per substep, the wheel-momentum coupling `−ω_b × h_w` evaluated per substep).
 //!
 use adcs_contracts::{
     ALTITUDE, BodyState, DT, Disturbances, EARTH_RADIUS, Gps, MASS, MU, MagneticModel, MtqCmd,
     PlantParams, Quat, RW_MOMENTUM_MAX, RW_TORQUE_MAX, ReactionWheel, Sensors, TorqueCmd, V3,
-    Wheels, World, clamp_dipole, epoch_at, inertia_diag, mag_field_eci, sun_dir_eci,
+    Wheels, World, clamp_dipole, epoch_at, in_earth_shadow, inertia_diag, mag_field_eci,
+    sun_dir_eci,
 };
 use metor_fsw_2::{Input, Output, Timestamp, system};
 use nox::{
@@ -52,6 +54,29 @@ pub const MAG_SENSOR_SIGMA: f64 = 150e-9;
 
 /// Solar radiation pressure at 1 AU (N/m²).
 pub const P_SRP: f64 = 4.56e-6;
+
+/// The six CSS head normals, one photodiode per body face in the frame's documented order
+/// `[+X, +Y, +Z, −X, −Y, −Z]` (cube-sat's arrangement). Six orthogonal 90° cones cover the
+/// full sphere, so sun availability reduces to illumination.
+const CSS_NORMALS: [[f64; 3]; 6] = [
+    [1.0, 0.0, 0.0],
+    [0.0, 1.0, 0.0],
+    [0.0, 0.0, 1.0],
+    [-1.0, 0.0, 0.0],
+    [0.0, -1.0, 0.0],
+    [0.0, 0.0, -1.0],
+];
+
+/// The noiseless CSS head readings for a true body-frame sun direction: per head the cosine
+/// response `n̂·ŝ_b`, clamped at zero (the 90° half-angle FOV) and gated by illumination —
+/// an eclipsed head reads nothing. The plant adds each head's noise floor on top.
+pub fn css_readings(sun_b: &V3, illuminated: bool) -> [f64; 6] {
+    let lit = if illuminated { 1.0 } else { 0.0 };
+    CSS_NORMALS.map(|n| {
+        let cos: f64 = V3::from_buf(n).dot(sun_b).into_buf();
+        cos.max(0.0) * lit
+    })
+}
 
 /// Wheel rotor moment of inertia (kg·m²): a 185 g disc of 5 cm diameter.
 pub const RW_MOI: f64 = 0.185 * (0.05 / 2.0) * (0.05 / 2.0) / 2.0;
@@ -146,13 +171,13 @@ impl DisturbanceTorques {
 }
 
 /// Evaluate the disturbance environment at a true state: attitude `q_b_eci`, ECI
-/// position/velocity, the sun direction, and the **un-normalized** magnetic field (Tesla).
-/// All deterministic — no RNG.
+/// position/velocity, the sun direction, the **un-normalized** magnetic field (Tesla), and
+/// whether the spacecraft is illuminated. All deterministic — no RNG.
 ///
 /// - Gravity gradient: `τ = (3μ/|r|³) · r̂_b × (I ∘ r̂_b)`.
 /// - Aero: `F = −½ρ·Cd·A·|v|·v` (co-rotating atmosphere ignored), `τ = r_cp × F_b`.
 /// - Residual dipole: `τ = m_res × B_b`.
-/// - SRP: `F = −P·A·Cr·ŝ_b`, `τ = r_cp × F_b` — always lit (no eclipse model yet).
+/// - SRP: `F = −P·A·Cr·ŝ_b`, `τ = r_cp × F_b` — zero in Earth shadow.
 pub fn disturbance_torques(
     p: &PlantParams,
     q_b_eci: &Quat,
@@ -160,6 +185,7 @@ pub fn disturbance_torques(
     vel_eci: &V3,
     sun_eci: &V3,
     mag_eci: &V3,
+    illuminated: bool,
 ) -> DisturbanceTorques {
     let q_eci_b = q_b_eci.inverse();
     let cp_offset_b = V3::from_buf(p.cp_offset_b);
@@ -174,7 +200,11 @@ pub fn disturbance_torques(
 
     let mag_b = V3::from_buf(p.m_res_b).cross(&(&q_eci_b * *mag_eci));
 
-    let srp_force_b = (&q_eci_b * sun_eci.normalize()) * (-P_SRP * p.area_srp * p.cr);
+    let srp_force_b = if illuminated {
+        (&q_eci_b * sun_eci.normalize()) * (-P_SRP * p.area_srp * p.cr)
+    } else {
+        V3::zeros()
+    };
     let srp_b = cp_offset_b.cross(&srp_force_b);
 
     DisturbanceTorques { gg_b, aero_b, mag_b, srp_b, aero_force_eci }
@@ -232,10 +262,14 @@ pub fn propagate(body: Body, tau_body_const: V3, h_w_b: V3, f_drag_eci: V3) -> B
 #[system(name = "plant", export = "export")]
 impl PlantSystem {
     pub fn new(p: PlantParams) -> Self {
-        // A 400 km circular orbit: position along +X at orbital radius, velocity along +Y at
-        // the circular-orbit speed (cube-sat `CubeSat::default`).
+        // A 400 km circular orbit, booted `init_orbit_phase` radians around it: phase zero
+        // is the classic +X position / +Y velocity (cube-sat `CubeSat::default`), and the
+        // eclipse tests crank the phase to start in Earth shadow.
         let radius = EARTH_RADIUS + ALTITUDE;
         let v_orbit = (MU / radius).sqrt();
+        let (sin_th, cos_th) = p.init_orbit_phase.sin_cos();
+        let pos0 = tensor![cos_th, sin_th, 0.0] * radius;
+        let vel0 = tensor![-sin_th, cos_th, 0.0] * v_orbit;
 
         // Start rotated `init_angle` about [1,1,1] from the (identity) reference, with a
         // small initial tumble about the same axis.
@@ -243,8 +277,8 @@ impl PlantSystem {
         let q0 = Quaternion::from_axis_angle(axis, p.init_angle);
         let omega0_world = axis.normalize() * p.init_rate;
         let body = Body {
-            pos: SpatialTransform::new(q0, tensor![1.0, 0.0, 0.0] * radius),
-            vel: SpatialMotion::new(omega0_world, tensor![0.0, v_orbit, 0.0]),
+            pos: SpatialTransform::new(q0, pos0),
+            vel: SpatialMotion::new(omega0_world, vel0),
             accel: SpatialMotion::zero(),
             inertia: SpatialInertia::new(inertia_diag(), tensor![0.0, 0.0, 0.0], MASS),
             force: SpatialForce::zero(),
@@ -273,6 +307,10 @@ impl PlantSystem {
             d.sample(&mut self.rng),
             d.sample(&mut self.rng)
         ]
+    }
+
+    fn noise1(&mut self, sigma: f64) -> f64 {
+        Normal::new(0.0, sigma).unwrap().sample(&mut self.rng)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -328,10 +366,15 @@ impl PlantSystem {
         let vel_eci = self.body.vel.linear();
         let sun_eci = sun_dir_eci(epoch);
         let mag_eci = mag_field_eci(&mut self.mag_model, epoch, &pos_eci);
-        // The sun observation is a normalized unit vector; the magnetometer reads the
-        // physical field (Tesla) — real magnetometers measure magnitude, and the desat law
-        // downstream needs |B|. Both plus sensor noise.
-        let sun_b = (q_eci_b * sun_eci).normalize() + self.noise(meas_sigma);
+        let illuminated = !in_earth_shadow(&pos_eci, &sun_eci);
+        // The six CSS heads (cosine response, FOV-clamped, dark in eclipse) each read their
+        // noise floor on top; the magnetometer reads the physical field (Tesla) — real
+        // magnetometers measure magnitude, and the desat law downstream needs |B|.
+        let sun_b_true = (q_eci_b * sun_eci).normalize();
+        let mut css = css_readings(&sun_b_true, illuminated);
+        for reading in &mut css {
+            *reading += self.noise1(meas_sigma);
+        }
         let mag_b_true = q_eci_b * mag_eci;
         let mag_b = mag_b_true + self.noise(MAG_SENSOR_SIGMA);
 
@@ -355,13 +398,14 @@ impl PlantSystem {
             &vel_eci,
             &sun_eci,
             &mag_eci,
+            illuminated,
         );
         let mtq_torque_b = clamp_dipole(dipole_b, self.params.mtq_max_dipole).cross(&mag_b_true);
 
         sensors.publish(&Sensors {
             timestamp: now,
             gyro_b,
-            sun_b,
+            css,
             mag_b,
         });
         gps.publish(&Gps {
@@ -369,11 +413,7 @@ impl PlantSystem {
             pos_eci: gps_pos_eci,
             vel_eci: gps_vel_eci,
         });
-        world.publish(&World {
-            timestamp: now,
-            sun_eci,
-            mag_eci,
-        });
+        world.publish(&World::new(now, sun_eci, mag_eci, illuminated));
         // Per-wheel telemetry — the wheels themselves, the same structs the plant integrates.
         wheels.publish(&Wheels {
             timestamp: now,
@@ -550,6 +590,7 @@ mod tests {
             cr: 1.5,
             mtq_max_dipole: MTQ_MAX_DIPOLE,
             init_wheel_h: 0.0,
+            init_orbit_phase: 0.0,
         };
         let radius = EARTH_RADIUS + ALTITUDE;
         let pos: V3 = tensor![radius, 0.0, 0.0];
@@ -560,7 +601,7 @@ mod tests {
         let epoch = adcs_contracts::mission_epoch();
         let mut model = MagneticModel::default();
         let mag = mag_field_eci(&mut model, epoch, &pos);
-        let d = disturbance_torques(&p, &q, &pos, &vel, &sun_dir_eci(epoch), &mag);
+        let d = disturbance_torques(&p, &q, &pos, &vel, &sun_dir_eci(epoch), &mag, true);
 
         let mag_of = |v: &V3| -> f64 { v.norm().into_buf() };
         let gg = mag_of(&d.gg_b);
@@ -576,6 +617,38 @@ mod tests {
         assert!(drag_along_v < 0.0, "drag force does not oppose velocity");
         let sum = d.gg_b + d.aero_b + d.mag_b + d.srp_b;
         assert!(mag_of(&(d.total_b() - sum)) == 0.0);
+
+        // In Earth shadow only SRP switches off; everything else is identical.
+        let dark = disturbance_torques(&p, &q, &pos, &vel, &sun_dir_eci(epoch), &mag, false);
+        assert!(mag_of(&dark.srp_b) == 0.0, "SRP must vanish in shadow");
+        assert!(mag_of(&(dark.gg_b - d.gg_b)) == 0.0);
+        assert!(mag_of(&(dark.aero_b - d.aero_b)) == 0.0);
+        assert!(mag_of(&(dark.mag_b - d.mag_b)) == 0.0);
+    }
+
+    /// The CSS head model: a face square to the sun reads ~1, the opposed face reads zero
+    /// (FOV clamp), an oblique sun spreads its cosine across the facing heads, and eclipse
+    /// darkens all six.
+    #[test]
+    fn css_heads_read_cosine_fov_and_eclipse() {
+        // Sun along +X: head 0 (+X) reads 1, head 3 (−X) is FOV-clamped to 0.
+        let sun_x: V3 = tensor![1.0, 0.0, 0.0];
+        let r = css_readings(&sun_x, true);
+        assert!((r[0] - 1.0).abs() < 1e-12, "+X head square to the sun: {}", r[0]);
+        assert_eq!(r[3], 0.0, "−X head is behind its FOV");
+        assert_eq!([r[1], r[2], r[4], r[5]], [0.0; 4], "perpendicular heads read zero");
+
+        // An oblique sun: the three facing heads read its direction cosines.
+        let sun: V3 = (tensor![1.0, 1.0, 1.0] as V3).normalize();
+        let r = css_readings(&sun, true);
+        let c = 1.0 / 3f64.sqrt();
+        for (i, reading) in r.iter().enumerate().take(3) {
+            assert!((reading - c).abs() < 1e-12, "head {i} cosine: {reading}");
+        }
+        assert_eq!([r[3], r[4], r[5]], [0.0; 3]);
+
+        // Eclipse: every head is dark regardless of geometry.
+        assert_eq!(css_readings(&sun, false), [0.0; 6]);
     }
 
     /// The B-cross detumble law closed on the true dynamics damps the field-perpendicular
