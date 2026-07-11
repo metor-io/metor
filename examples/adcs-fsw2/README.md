@@ -17,32 +17,42 @@ The **plant** propagates a real 400 km orbit (point-mass gravity + drag) and the
 attitude dynamics — `I·ω̇_b = τ_b − ḣ_w − ω_b × (I·ω_b + h_w)`, including the gyroscopic
 coupling of the stored reaction-wheel momentum — under the **disturbance environment** a
 small spacecraft actually lives on: gravity-gradient, aerodynamic drag about the CP–CG
-offset (the drag force also perturbs the orbit), residual magnetic dipole, and SRP (no
-eclipse model yet — always lit). Two actuators drive it: three **reaction wheels** (bearing
-friction and momentum-saturation foldback inside the dynamics, physical signed momentum,
-per-wheel arming) and three **magnetorquers** (`τ = m × B`, per-axis dipole clamp). It emits
-a simulated sensor suite (gyro with bias walk, a normalized sun observation, and a
-magnetometer reading the physical **NOAA WMM** field in Tesla), a noisy **GPS** measurement
-(a first-order Gauss-Markov position error + white velocity noise — the orbit state the
-flight software flies on), reaction-wheel and per-source **disturbance-torque** telemetry,
-the ground-truth **body** state (true attitude + body rate + ECI orbit), and the **world**
-environment — the true ECI sun direction (nox-frames' Vallado model at the mission epoch)
-and the WMM magnetic field the sensors observe.
+offset (the drag force also perturbs the orbit), residual magnetic dipole, and SRP, which
+switches off in **Earth shadow** (a cylindrical-umbra eclipse model; the boot orbit phase is
+a plant param, so a run can start in or near the ~35-minute shadow arc). Two actuators drive
+it: three **reaction wheels** (bearing friction and momentum-saturation foldback inside the
+dynamics, physical signed momentum, per-wheel arming) and three **magnetorquers**
+(`τ = m × B`, per-axis dipole clamp). It emits a simulated sensor suite (gyro with bias
+walk, a six-head **coarse sun sensor** — one cosine-response photodiode per body face, each
+FOV-clamped and dark in eclipse, publishing raw per-head readings — and a magnetometer
+reading the physical **NOAA WMM** field in Tesla), a noisy **GPS** measurement (a
+first-order Gauss-Markov position error + white velocity noise — the orbit state the flight
+software flies on), reaction-wheel and per-source **disturbance-torque** telemetry, the
+ground-truth **body** state (true attitude + body rate + ECI orbit), and the **world**
+environment — the true ECI sun direction (nox-frames' Vallado model at the mission epoch),
+the WMM magnetic field the sensors observe, and the illumination truth flag.
 
-The **nav** filter models its own inertial sun/magnetic references — the sun from the ephemeris
-at its sim-time epoch, the field from the WMM evaluated at the **GPS** position — and runs the
-MEKF (it never sees the plant's truth). The **ctrl** controller commands both actuators from
-what the FSW measures: the Yang-LQR body torque toward the **pointing law** the `mode` slot
-commands (`ModeCmd.law` — Nadir, velocity-vector/HIL, or magnetorquer-only Detumble), its
-target computed from the **GPS** orbit measurement and clamped to the wheel motor limit; and
-the magnetorquer dipole — cross-product momentum **desaturation** (`k·(h_w × B)/|B|²`, always
-on, fed by the telemetered wheel momentum and the measured field) or B-cross rate damping in
-Detumble. Both command frames close the loop back into the plant one cycle delayed.
+The **nav** filter reconstructs the sun vector from the raw CSS readings (opposed-pair
+differencing; the sun is declared lost when every head sits at its noise floor — the FSW's
+own call, from its sensor), models its own inertial references — the sun from the ephemeris
+at its sim-time epoch, the field from the WMM evaluated at the **GPS** position — and runs
+the MEKF, dropping to **magnetometer-only** through an eclipse (it never sees the plant's
+truth). The **ctrl** controller commands both actuators from what the FSW measures: the
+Yang-LQR body torque toward the **pointing law** the `mode` slot commands (`ModeCmd.law` —
+Nadir, velocity-vector/HIL, or magnetorquer-only Detumble), its target computed from the
+**GPS** orbit measurement and clamped to the wheel motor limit; and the magnetorquer dipole
+— cross-product momentum **desaturation** (`k·(h_w × B)/|B|²`, always on, fed by the
+telemetered wheel momentum and the measured field) or B-cross rate damping in Detumble. Both
+command frames close the loop back into the plant one cycle delayed.
 
-The `mode` **slot** auto-runs the `commissioning` sequence at startup, walking the spacecraft
-idle → settling → pointing as the controller drives it onto the velocity-vector target; a
-`safe_mode` sequence is the second allowed occupant (Loaded by an operator to drop to a
-nadir-pointing safe state).
+The `mode` **slot** auto-runs the `commissioning` sequence at startup — a **condition-based
+ladder**, not a script of timed waits: estimator warm-up (gated on successive q̂ deltas
+settling), an optional magnetorquer detumble (entered only above a rate the wheels shouldn't
+capture; the boot tumble is not), then coarse and fine pointing gated on the live tracking
+error to the velocity-vector target, each phase under a timeout that safes the spacecraft
+and fails the sequence. Its gates and budgets are sequence **params** on the mission's
+`allow` line. A `safe_mode` sequence is the second allowed occupant (Loaded by an operator
+to drop to a nadir-pointing safe state).
 
 ## Crate layout
 
@@ -50,9 +60,9 @@ nadir-pointing safe state).
 |---|---|---|
 | `adcs-contracts` | `contracts/` | The shared compile-time contract: the frame structs (sensors / gps / body / world / attitude_estimate / mode_cmd / torque_cmd / mtq_cmd / wheels / disturb), the per-system `Params`, and only the physics **both sides** rely on — orbital constants + inertia, the actuator envelope (wheel torque/momentum limits, torquer dipole limit), the WMM magnetic-field + sun-direction models (the plant's truth *and* nav's references), the Nadir/HIL pointing laws, and the desat/detumble magnetorquer laws. Linked by the cdylibs (and the test), **not** by the host. |
 | `adcs-plant` | `systems/plant/` | The orbiting rigid-body plant and **its** physics: the wheel dynamics (`WheelDynamics` over the shared telemetry struct — bearing friction, saturation foldback), the disturbance-torque model, the GPS/magnetometer error models, magnetorquers, and the sensor suite. A `cdylib` ending in `export_system!(PlantSystem)`. |
-| `adcs-nav` | `systems/nav/` | The MEKF filter cdylib (models its own sun/WMM-mag references at the GPS position). |
+| `adcs-nav` | `systems/nav/` | The MEKF filter cdylib: reconstructs the sun vector from the raw CSS readings (`sun_from_css`), models its own sun/WMM-mag references at the GPS position, and runs magnetometer-only through eclipses. |
 | `adcs-ctrl` | `systems/ctrl/` | The Yang-LQR + magnetorquer-law controller cdylib (selects the pointing-law target from `ModeCmd`, desaturates the wheels through the torquers). |
-| `adcs-commissioning` / `adcs-safe-mode` | `systems/commissioning/`, `systems/safe-mode/` | The `#[sequence]` occupants of the `mode` slot. |
+| `adcs-commissioning` / `adcs-safe-mode` | `systems/commissioning/`, `systems/safe-mode/` | The `#[sequence]` occupants of the `mode` slot: the condition-based commissioning ladder (params on the `allow` line) and the one-shot safing drop. |
 | `adcs-fsw2` | (this crate) | The mission **host**: builds + `dlopen`s the cdylibs and runs the coordinator. Links only `metor-fsw-2` — it is fully schema-agnostic (frames validated from serialized VTables, params encoded from each `.so`'s exported schema). |
 
 Each system crate is `crate-type = ["cdylib", "rlib"]`: the cdylib is what the host loads;
@@ -92,7 +102,9 @@ ingests.
    `plant.disturb.mtq_b` the applied magnetorquer torque), `plant.gps.pos_eci` against
    `plant.body.pos_eci` the GPS position error, and `plant.world.sun_eci` /
    `plant.world.mag_eci` the real ECI sun direction and WMM magnetic field (the magnetometer
-   `plant.sensors.mag_b` reads the same field in Tesla, body frame). The sequence view
+   `plant.sensors.mag_b` reads the same field in Tesla, body frame; `plant.sensors.css` the
+   six raw sun-sensor heads, and `plant.world.illuminated` the eclipse truth flag they go
+   dark under). The sequence view
    shows `commissioning` stepping to completion; Load/Start `safe_mode` from there to command
    nadir safing. The alarm view carries `ADCS_RATE_HIGH` (body rate) and `RW_MOMENTUM_HIGH`
    (wheel-0 stored momentum vs the saturation limit).
@@ -127,7 +139,9 @@ commanded pointing target and that the dlopen run matches the static one **bit-f
 systems, same params, same seed, just loaded vs linked). `tests/momentum.rs` preloads the
 wheels and asserts the desaturation law dumps stored momentum through the torquers while the
 mission keeps pointing (and that the `RW_MOMENTUM_HIGH` alarm's nested target path resolves
-live). `tests/sequences.rs` exercises the `mode` slot end-to-end (auto-run, interactive
+live). `tests/eclipse.rs` boots inside / just before the Earth-shadow arc (the entry phase
+is computed, not hardcoded) and asserts the CSS heads go dark, SRP switches off, and the
+magnetometer-only estimate rides through the sun loss. `tests/sequences.rs` exercises the `mode` slot end-to-end (auto-run, interactive
 Load→Start→Abort, and the downlinked sequence events); `tests/bundle.rs` checks the mission
 bundles and runs. All build real cdylibs, so they are slower than plain unit tests and are
 gated off `miri`. The physics itself is unit-tested underneath: the wheel model and

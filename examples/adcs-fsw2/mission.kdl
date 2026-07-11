@@ -24,6 +24,7 @@ system "plant" type="Plant" artifact="plant" init_angle=0.5 init_rate=0.15 meas_
     cr 1.5                      // SRP reflectivity coefficient
     mtq_max_dipole 0.2          // per-axis magnetorquer authority (A·m²)
     init_wheel_h 0.0            // per-wheel stored-momentum preload (N·m·s)
+    init_orbit_phase 0.0        // in-plane boot phase (rad) — eclipse tests start in shadow
 }
 system "nav"   type="Nav"   artifact="nav"   meas_sigma=0.02
 system "ctrl"  type="Ctrl"  artifact="ctrl"  q_weight=5.0 r_weight=8.0 k_desat=0.0005 k_detumble=0.00005
@@ -51,8 +52,16 @@ system "alarms" type="Alarms" {
 
 slot "mode" {
     input  frame="attitude_estimate"
+    input  frame="gps"              // commissioning's tracking-error gate
     output frame="mode_cmd"
-    allow occupant="commissioning"
+    // The commissioning gates/budgets ride the allow line (sequence params — spelled out in
+    // full, the dlopen occupant encoder has no serde defaults). Detumble enters only above
+    // 1.0 rad/s: capturing that tumble loads the worst wheel axis to ~38% of the momentum
+    // limit, so anything slower goes straight to the wheels.
+    allow occupant="commissioning" rate_detumble_enter=1.0 rate_detumble_exit=0.8 \
+          est_delta_rad=0.001 est_dwell_s=0.2 coarse_err_rad=0.2 coarse_dwell_s=0.5 \
+          confirm_dwell_s=1.0 warmup_timeout_s=10.0 detumble_timeout_s=900.0 \
+          settle_timeout_s=60.0 confirm_timeout_s=30.0
     allow occupant="safe_mode"
     initial occupant="commissioning" state="running"
 }
@@ -64,6 +73,7 @@ connect "plant" -> "ctrl" frame="sensors"   // measured B for the magnetorquer l
 connect "plant" -> "ctrl" frame="wheels"    // telemetered wheel momentum for desat
 connect "nav"   -> "ctrl" frame="attitude_estimate"
 connect "nav"   -> "mode" frame="attitude_estimate"
+connect "plant" -> "mode" frame="gps"
 
 connect "mode"  -> "ctrl" frame="mode_cmd" delayed=#true
 connect "ctrl"  -> "plant" frame="torque_cmd" delayed=#true

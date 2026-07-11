@@ -140,14 +140,44 @@ pub fn sun_dir_eci(epoch: Epoch) -> V3 {
     nox_frames::earth::sun_vec(epoch)
 }
 
+/// Cylindrical-umbra Earth shadow: illuminated unless the spacecraft is on the anti-sun
+/// side AND inside the shadow cylinder of radius [`EARTH_RADIUS`]. Shared by the plant (the
+/// truth the sensors and SRP live under) and the eclipse test (which scans it for the
+/// shadow-entry orbit phase).
+///
+/// Non-goals at this fidelity: the umbra cone vs. cylinder differ by under a second of a
+/// ~35-minute eclipse at 400 km, the penumbra transit is ~8 s, and the Earth is a sphere
+/// here (WGS84 flattening ~0.3%).
+pub fn in_earth_shadow(pos_eci: &V3, sun_eci: &V3) -> bool {
+    let s = sun_eci.normalize();
+    let along: f64 = pos_eci.dot(&s).into_buf();
+    if along >= 0.0 {
+        return false; // sunward hemisphere
+    }
+    let perp = *pos_eci - s * along;
+    let perp: f64 = perp.norm().into_buf();
+    perp < EARTH_RADIUS
+}
+
+// --- Coarse sun sensing ---------------------------------------------------------
+
+/// The CSS validity threshold: a head reading below this is noise floor, and when **every**
+/// head is below it the sun is lost (eclipse). Shared by nav (the FSW-side validity gate —
+/// the "intensity above threshold" logic real CSS electronics implement) and the eclipse
+/// test's assertions. The dimmest lit reading of the six-face arrangement is ≥ 1/√3 ≈ 0.577
+/// (any unit vector has a component that large), so 0.1 splits the bands by ~50σ of head
+/// noise on each side.
+pub const CSS_THRESHOLD: f64 = 0.1;
+
 // ---------------------------------------------------------------------------
 // Frames — the compile-time wire contracts
 // ---------------------------------------------------------------------------
 
 /// Simulated sensor measurements produced by the plant each cycle: the gyro rate (body
-/// frame) plus two normalized vector observations (sun + magnetometer) in the body frame.
-/// The inertial **references** for those observations are modeled by nav from the orbit
-/// state (cube-sat's `Nav::from_sensors`), not handed over here.
+/// frame), the six coarse-sun-sensor head readings, and the magnetometer field in the body
+/// frame. The inertial **references** for the vector observations are modeled by nav from
+/// the orbit state (cube-sat's `Nav::from_sensors`), not handed over here — and the sun
+/// **vector** is nav's to reconstruct from the raw CSS readings, never the plant's to leak.
 #[derive(metor_fsw_2::Frame, IntoBytes, Immutable, KnownLayout, FromBytes, Clone)]
 #[repr(C)]
 #[metor_fsw(name = "sensors")]
@@ -156,9 +186,12 @@ pub struct Sensors {
     pub timestamp: Timestamp,
     /// Measured body-frame angular rate (rad/s).
     pub gyro_b: V3,
-    /// Normalized sun observation in the body frame.
-    pub sun_b: V3,
-    /// Normalized magnetometer observation in the body frame.
+    /// The six coarse-sun-sensor head readings, one cosine-response photodiode per body
+    /// face in the order `[+X, +Y, +Z, −X, −Y, −Z]` (cube-sat's CSS arrangement): a lit
+    /// head reads `n̂·ŝ_b` (clamped at zero — a 90° half-angle FOV), a dark or eclipsed
+    /// head reads its noise floor. Validity is the FSW's call: see [`CSS_THRESHOLD`].
+    pub css: [f64; 6],
+    /// Magnetometer field observation in the body frame (Tesla).
     pub mag_b: V3,
 }
 
@@ -303,6 +336,18 @@ pub struct World {
     pub sun_eci: V3,
     /// Earth magnetic field in ECI (Tesla), the NOAA WMM at the true position/epoch.
     pub mag_eci: V3,
+    /// `1` when the spacecraft is in sunlight, `0` in Earth shadow — the truth flag the
+    /// panel plots against the estimator's sun-loss behavior.
+    pub illuminated: u8,
+    _pad: [u8; 7],
+}
+
+impl World {
+    /// The truth environment for one cycle (`_pad` keeps the `#[repr(C)]` layout
+    /// padding-free, zerocopy `IntoBytes` requires it).
+    pub fn new(timestamp: Timestamp, sun_eci: V3, mag_eci: V3, illuminated: bool) -> Self {
+        Self { timestamp, sun_eci, mag_eci, illuminated: illuminated as u8, _pad: [0; 7] }
+    }
 }
 
 /// The per-cycle disturbance-torque telemetry: each environmental source in the body frame,
@@ -366,6 +411,9 @@ impl ModeCmd {
     pub const SETTLING: u8 = 1;
     pub const POINTING: u8 = 2;
     pub const SAFE: u8 = 3;
+    /// Magnetorquer detumble: the commissioning ladder's first rung when the boot rate is
+    /// beyond what the wheels should capture.
+    pub const DETUMBLE: u8 = 4;
 
     /// The pointing-law byte values (cube-sat's `Mode::{NadirPoint, HilPoint}`).
     pub const LAW_NADIR: u8 = 0;
@@ -396,6 +444,10 @@ impl ModeCmd {
     /// Safe — the safing branch (entered on abort): nadir-pointing.
     pub const fn safe() -> Self {
         Self::at(Self::SAFE, Self::LAW_NADIR)
+    }
+    /// Detumble — magnetorquer-only rate damping (the wheels idle under `LAW_DETUMBLE`).
+    pub const fn detumble() -> Self {
+        Self::at(Self::DETUMBLE, Self::LAW_DETUMBLE)
     }
 
     /// The same command stamped with the sequence's cycle time (`sequence::now()`,
@@ -571,6 +623,12 @@ pub struct PlantParams {
     /// dump at boot. Defaults to zero.
     #[serde(default)]
     pub init_wheel_h: f64,
+    /// Initial in-plane orbit phase (rad): rotates the boot position/velocity around the
+    /// orbit, `r·(cos θ, sin θ, 0)` / `v·(−sin θ, cos θ, 0)`. Zero is the classic +X boot
+    /// (entirely sunlit for the test windows); the eclipse tests crank it to start in or
+    /// near Earth shadow. Deterministic — no RNG involved.
+    #[serde(default)]
+    pub init_orbit_phase: f64,
 }
 
 fn default_rho() -> f64 {
@@ -625,6 +683,37 @@ fn default_k_detumble() -> f64 {
     5e-5
 }
 
+/// The commissioning sequence's gates and budgets — every phase transition is
+/// condition-based, and every phase has a timeout that safes the spacecraft
+/// ([`Outcome::Failed`](metor_fsw_2::Outcome)). Spelled out in full on the mission's
+/// `allow occupant="commissioning"` line (the dlopen occupant encoder has no serde
+/// defaults), which is also how tests patch individual gates.
+#[derive(Serialize, Deserialize, Schema, Clone, Debug, PartialEq)]
+pub struct CommissioningParams {
+    /// Enter the detumble phase only above this estimated rate (rad/s). Sized by wheel
+    /// capture: absorbing 1.0 rad/s loads the worst axis to ≈38% of the momentum limit, so
+    /// anything slower goes straight to the wheels and the B-cross phase is reserved for
+    /// genuinely hot tumbles.
+    pub rate_detumble_enter: f64,
+    /// Leave detumble below this estimated rate (rad/s) — hysteresis against `enter`.
+    pub rate_detumble_exit: f64,
+    /// Estimator-settle gate: successive q̂ deltas below this (rad)…
+    pub est_delta_rad: f64,
+    /// …for this long (s) completes warm-up.
+    pub est_dwell_s: f64,
+    /// Coarse-pointing gate: tracking error to the commanded law's target below this (rad)…
+    pub coarse_err_rad: f64,
+    /// …for this long (s) advances to fine pointing.
+    pub coarse_dwell_s: f64,
+    /// Fine pointing confirms (→ `Completed`) after the error holds for this long (s).
+    pub confirm_dwell_s: f64,
+    /// Per-phase timeouts (s): expiry publishes `ModeCmd::safe` and fails the sequence.
+    pub warmup_timeout_s: f64,
+    pub detumble_timeout_s: f64,
+    pub settle_timeout_s: f64,
+    pub confirm_timeout_s: f64,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -650,6 +739,25 @@ mod tests {
                 "WMM field magnitude at 400 km should be tens of µT, got {mag} T"
             );
         }
+    }
+
+    /// The shadow cylinder from first principles: sub-solar lit, anti-solar at orbit radius
+    /// shadowed, terminator-perpendicular lit (outside the cylinder), and an anti-sun point
+    /// nudged just past one Earth radius of lateral offset lit again.
+    #[test]
+    fn earth_shadow_geometry() {
+        let sun: V3 = (tensor![0.2, -0.9, -0.4] as V3).normalize();
+        let r = EARTH_RADIUS + ALTITUDE;
+        assert!(!in_earth_shadow(&(sun * r), &sun), "sub-solar point is lit");
+        assert!(in_earth_shadow(&(sun * -r), &sun), "anti-solar point is shadowed");
+        // A direction perpendicular to the sun line: on the terminator, outside the cylinder.
+        let perp = sun.cross(&tensor![0.0, 0.0, 1.0]).normalize();
+        assert!(!in_earth_shadow(&(perp * r), &sun), "terminator point is lit");
+        // Anti-sun but laterally offset past the cylinder radius: lit.
+        let graze = (sun * -r) + perp * (EARTH_RADIUS * 1.01);
+        assert!(!in_earth_shadow(&graze, &sun), "outside the shadow cylinder is lit");
+        let inside = (sun * -r) + perp * (EARTH_RADIUS * 0.99);
+        assert!(in_earth_shadow(&inside, &sun), "inside the shadow cylinder is dark");
     }
 
     /// Both magnetorquer laws produce a torque `m × B` that opposes their regulated quantity
