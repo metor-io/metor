@@ -400,7 +400,13 @@ impl StateCell {
 
             // this task is CANCELED! can't believe some of you are still
             // following it, smh...
-            state.set(State::CANCELED, true).set(State::WOKEN, true);
+            //
+            // Note: WOKEN must NOT be set here — `TaskRef::cancel` follows up with
+            // `wake_by_ref`, whose transition bails out if WOKEN is already set. Pre-setting
+            // it silently swallowed the cancel wake, so a task parked on a resource (a timer
+            // wheel entry, a wait cell) was never re-polled to clean up: its future lived
+            // until final deallocation while the resource kept a waker into it.
+            state.set(State::CANCELED, true);
 
             true
         })

@@ -596,6 +596,21 @@ where
             // cancel culture has gone too far!
             StartPollAction::Canceled { wake_join_waker } => {
                 trace!(task.addr = ?ptr, wake_join_waker, "task canceled!");
+                // Drop the future NOW, in the scheduler's context. Its destructor releases
+                // whatever the task was parked on (a `Sleep` unlinks its timer-wheel entry,
+                // taking the timer lock) — deferring it to final deallocation leaves that
+                // resource holding a waker into this task, and the deallocation can then
+                // run *inside* the resource's own dispatch (e.g. a timer turn), where the
+                // destructor's lock acquisition would deadlock or corrupt the wheel.
+                //
+                // The assignment drops the pinned future IN PLACE (like the poll path's
+                // `*cell = Cell::Ready(..)`); `mem::replace` would move it first, tearing
+                // any intrusive node (the timer-wheel entry) off its registered address.
+                unsafe {
+                    this.as_ref().inner.with_mut(|cell| {
+                        *cell = Cell::Joined;
+                    });
+                }
                 if wake_join_waker {
                     unsafe {
                         this.as_ref().wake_join_waker();
@@ -915,7 +930,13 @@ impl<S: Schedule> Schedulable<S> {
 
             let this = non_null(ptr as *mut Self);
             match test_dbg!(this.as_ref().state().wake_by_val()) {
-                OrDrop::Drop => Self::drop_ref(this),
+                // The `wake_by_val` state transition already consumed the waker's reference
+                // and reported the count hit zero — deallocate directly. Going through
+                // `drop_ref` here would decrement a second time and underflow the count.
+                OrDrop::Drop => {
+                    let deallocate = this.as_ref().header.vtable.deallocate;
+                    deallocate(this.cast::<Header>())
+                }
                 OrDrop::Action(ScheduleAction::Enqueue) => {
                     // the task should be enqueued.
                     //
