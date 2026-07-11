@@ -57,54 +57,20 @@ pub fn inertia_diag() -> V3 {
     tensor![15204079.70002e-9, 14621352.61765e-9, 6237758.3131e-9]
 }
 
-// --- GPS error model (first-order Gauss-Markov position, white velocity) -----
-// The "good" basic GPS model (Brown & Hwang): position error is dominated by slowly-varying
-// iono/ephemeris terms, so it is exponentially correlated (a first-order Gauss-Markov process)
-// rather than white; velocity from Doppler/carrier is far less correlated, so it is white.
-// Spaceborne single-frequency SPS figures. Used by the plant to corrupt the true orbit state
-// into the `Gps` measurement the controller flies on.
-
-/// GPS position error 1-sigma per axis (m) — the Gauss-Markov steady-state.
-pub const GPS_POS_SIGMA: f64 = 5.0;
-/// GPS position-error correlation time (s) — the Gauss-Markov time constant.
-pub const GPS_TAU: f64 = 100.0;
-/// GPS velocity error 1-sigma per axis (m/s), modeled as white noise.
-pub const GPS_VEL_SIGMA: f64 = 0.05;
-
-// --- Reaction wheels ----------------------------------------------------------
-// Shared by the plant (the wheels are its actuator) and the controller (an FSW
-// that knows its actuator's limits clamps what it commands).
+// --- Actuator envelope --------------------------------------------------------
+// The limits both sides agree on: the plant enforces them in its dynamics, and an FSW that
+// knows its actuators clamps what it commands to them. The dynamics themselves (bearing
+// friction, rotor inertia, the sensor/GPS error models, the disturbance environment) are
+// simulation math and live in `adcs-plant`.
 
 /// Wheel momentum saturation limit (N·m·s) — at the limit the motor folds back to zero net
 /// torque; unloading torque always flows.
 pub const RW_MOMENTUM_MAX: f64 = 0.04;
 /// Maximum motor torque per wheel (N·m).
 pub const RW_TORQUE_MAX: f64 = 0.002;
-/// Wheel rotor moment of inertia (kg·m²): a 185 g disc of 5 cm diameter.
-pub const RW_MOI: f64 = 0.185 * (0.05 / 2.0) * (0.05 / 2.0) / 2.0;
-/// Coulomb bearing friction (N·m). The cube-sat's 5e-4 was telemetry-only; fed into the
-/// dynamics it (with its viscous partner) would cap the wheel near 40 rad/s — 17× below the
-/// ~692 rad/s saturation speed — so both coefficients are retuned to bearing-realistic values.
-pub const RW_COULOMB: f64 = 1.0e-5;
-/// Viscous bearing friction (N·m·s/rad).
-pub const RW_VISCOUS: f64 = 1.0e-7;
-/// Stiction deadband (rad/s): below this speed friction holds the wheel at rest instead of
-/// chattering across zero (`signum(0)` would otherwise apply a phantom torque at rest).
-pub const RW_STICTION_OMEGA: f64 = 1e-3;
-
-// --- Magnetorquers / magnetometer ----------------------------------------------
-
-/// Magnetometer noise 1-sigma per axis (Tesla) — the sensor reads the physical field, so its
-/// noise is physical too (~150 nT against a ~25–45 µT field at 400 km).
-pub const MAG_SENSOR_SIGMA: f64 = 150e-9;
 /// Maximum magnetorquer dipole per axis (A·m²) — at |B| ≈ 4e-5 T that is ~8e-6 N·m of
 /// authority, plenty against ~1e-7 N·m secular disturbances but far below the wheels.
 pub const MTQ_MAX_DIPOLE: f64 = 0.2;
-
-// --- Disturbance environment ----------------------------------------------------
-
-/// Solar radiation pressure at 1 AU (N/m²).
-pub const P_SRP: f64 = 4.56e-6;
 
 // --- WMM magnetic field ------------------------------------------------------
 // The true (plant, at its real position) and reference (nav, at the GPS position) Earth
@@ -175,69 +141,6 @@ pub fn sun_dir_eci(epoch: Epoch) -> V3 {
 }
 
 // ---------------------------------------------------------------------------
-// Environmental disturbance torques
-// ---------------------------------------------------------------------------
-// The body-frame torques a small spacecraft actually lives on at 400 km, evaluated at the true
-// state each cycle (all deterministic — no RNG). Owned by the contract so the plant applies
-// them and the sanity tests can probe them without a coordinator.
-
-/// The disturbance torques at one true state, plus the drag force (which also perturbs the
-/// orbit). All torques in the body frame (N·m); the force in ECI (N).
-pub struct DisturbanceTorques {
-    /// Gravity-gradient torque.
-    pub gg_b: V3,
-    /// Aerodynamic drag torque about the CP–CG offset.
-    pub aero_b: V3,
-    /// Residual-magnetic-dipole torque `m_res × B`.
-    pub mag_b: V3,
-    /// Solar-radiation-pressure torque about the CP–CG offset.
-    pub srp_b: V3,
-    /// The drag force in ECI — fed into the translational dynamics.
-    pub aero_force_eci: V3,
-}
-
-impl DisturbanceTorques {
-    /// The summed disturbance torque (excludes actuation — the MTQ torque is control).
-    pub fn total_b(&self) -> V3 {
-        self.gg_b + self.aero_b + self.mag_b + self.srp_b
-    }
-}
-
-/// Evaluate the disturbance environment at a true state: attitude `q_b_eci`, ECI
-/// position/velocity, the sun direction, and the **un-normalized** magnetic field (Tesla).
-///
-/// - Gravity gradient: `τ = (3μ/|r|³) · r̂_b × (I ∘ r̂_b)`.
-/// - Aero: `F = −½ρ·Cd·A·|v|·v` (co-rotating atmosphere ignored), `τ = r_cp × F_b`.
-/// - Residual dipole: `τ = m_res × B_b`.
-/// - SRP: `F = −P·A·Cr·ŝ_b`, `τ = r_cp × F_b` — always lit (no eclipse model yet).
-pub fn disturbance_torques(
-    p: &PlantParams,
-    q_b_eci: &Quat,
-    pos_eci: &V3,
-    vel_eci: &V3,
-    sun_eci: &V3,
-    mag_eci: &V3,
-) -> DisturbanceTorques {
-    let q_eci_b = q_b_eci.inverse();
-    let cp_offset_b = V3::from_buf(p.cp_offset_b);
-
-    let r_mag: f64 = pos_eci.norm().into_buf();
-    let r_hat_b = &q_eci_b * (pos_eci.normalize());
-    let gg_b = r_hat_b.cross(&(inertia_diag() * r_hat_b)) * (3.0 * MU / r_mag.powi(3));
-
-    let v_mag: f64 = vel_eci.norm().into_buf();
-    let aero_force_eci = *vel_eci * (-0.5 * p.rho * p.cd * p.area_aero * v_mag);
-    let aero_b = cp_offset_b.cross(&(&q_eci_b * aero_force_eci));
-
-    let mag_b = V3::from_buf(p.m_res_b).cross(&(&q_eci_b * *mag_eci));
-
-    let srp_force_b = (&q_eci_b * sun_eci.normalize()) * (-P_SRP * p.area_srp * p.cr);
-    let srp_b = cp_offset_b.cross(&srp_force_b);
-
-    DisturbanceTorques { gg_b, aero_b, mag_b, srp_b, aero_force_eci }
-}
-
-// ---------------------------------------------------------------------------
 // Frames — the compile-time wire contracts
 // ---------------------------------------------------------------------------
 
@@ -260,10 +163,10 @@ pub struct Sensors {
 }
 
 /// The **GPS** measurement: the spacecraft's inertial (ECI) position + velocity, corrupted by
-/// the GPS error model (a first-order Gauss-Markov position error + white velocity noise —
-/// [`GPS_POS_SIGMA`]/[`GPS_TAU`]/[`GPS_VEL_SIGMA`]). This is the noisy orbit state the flight
-/// software actually flies on (cube-sat's `GPS` sensor, now with noise): the controller derives
-/// its pointing-law target from it, and nav evaluates its sun/magnetic references at it.
+/// the plant's GPS error model (a first-order Gauss-Markov position error + white velocity
+/// noise). This is the noisy orbit state the flight software actually flies on (cube-sat's
+/// `GPS` sensor, now with noise): the controller derives its pointing-law target from it, and
+/// nav evaluates its sun/magnetic references at it.
 #[derive(metor_fsw_2::Frame, IntoBytes, Immutable, KnownLayout, FromBytes, Clone)]
 #[repr(C)]
 #[metor_fsw(name = "gps")]
@@ -316,9 +219,9 @@ pub struct BodyState {
 /// One body-axis-aligned reaction wheel — the plant's actuator **and** its telemetry, one and
 /// the same struct. The stored `ang_momentum` is the wheel's **physical** momentum: the motor
 /// spins the wheel *against* the commanded body torque (`ḣ = τ_motor + τ_friction`), and the
-/// torque delivered to the body is the reaction `−ḣ` — Coulomb/viscous bearing friction and
-/// the momentum-saturation foldback are inside the dynamics, not telemetry-only. A disarmed
-/// wheel applies no motor torque (the `--disarmed` / safing gate) but its bearings stay real.
+/// torque delivered to the body is the reaction `−ḣ`. This crate carries only the wire shape
+/// and the constructors; the dynamics that fill it in (bearing friction, the saturation
+/// foldback) are `adcs-plant`'s `WheelDynamics`.
 #[derive(
     metor_fsw_2::AsVTable,
     metor_fsw_2::Metadatatize,
@@ -369,54 +272,6 @@ impl ReactionWheel {
     /// Whether the wheel is armed (online).
     pub fn armed(&self) -> bool {
         self.arm != 0
-    }
-
-    /// The same wheel preloaded with `h` N·m·s of stored momentum along its axis — how the
-    /// desaturation tests/demos start with something to dump.
-    pub fn with_momentum(mut self, h: f64) -> Self {
-        self.ang_momentum = self.axis * h;
-        self.speed = h / RW_MOI;
-        self
-    }
-
-    /// Advance the wheel one step. The motor drives against the commanded body torque
-    /// (`τm = −u`, clamped to ±[`RW_TORQUE_MAX`], zero when disarmed); bearing friction
-    /// opposes the spin (Coulomb + viscous, a stiction deadband at rest, and it may stop the
-    /// wheel within a step but never reverse it); the momentum-saturation foldback pins
-    /// `|s| ≤ RW_MOMENTUM_MAX` exactly while always letting unloading torque flow. The
-    /// reaction `−ḣ·axis` is what the body receives.
-    pub fn update(&mut self) {
-        let s: f64 = self.axis.dot(&self.ang_momentum).into_buf();
-        let omega = s / RW_MOI;
-
-        let motor = if self.armed() {
-            let u: f64 = self.axis.dot(&self.torque_set_point).into_buf();
-            (-u).clamp(-RW_TORQUE_MAX, RW_TORQUE_MAX)
-        } else {
-            0.0
-        };
-
-        let friction = if omega.abs() < RW_STICTION_OMEGA {
-            0.0
-        } else {
-            let f = -RW_COULOMB * omega.signum() - RW_VISCOUS * omega;
-            // Friction may stop the wheel within the step, never push it through zero.
-            if omega > 0.0 { f.max(-s / DT) } else { f.min(-s / DT) }
-        };
-
-        let mut h_dot = motor + friction;
-        let s_next = s + h_dot * DT;
-        if s_next > RW_MOMENTUM_MAX {
-            h_dot = (RW_MOMENTUM_MAX - s) / DT;
-        } else if s_next < -RW_MOMENTUM_MAX {
-            h_dot = (-RW_MOMENTUM_MAX - s) / DT;
-        }
-
-        let s = s + h_dot * DT;
-        self.ang_momentum = self.axis * s;
-        self.speed = s / RW_MOI;
-        self.friction = friction;
-        self.torque = self.axis * -h_dot;
     }
 }
 
@@ -679,7 +534,7 @@ pub struct PlantParams {
     /// Initial body-rate magnitude, rad/s about [1,1,1].
     pub init_rate: f64,
     /// 1-sigma sensor noise (rad/s for gyro, unitless for the normalized sun vector; the
-    /// magnetometer's Tesla-valued noise is [`MAG_SENSOR_SIGMA`]).
+    /// magnetometer's Tesla-valued sigma lives with the plant's sensor model).
     pub meas_sigma: f64,
     /// RNG seed, so a run is reproducible.
     pub seed: u64,
@@ -795,108 +650,6 @@ mod tests {
                 "WMM field magnitude at 400 km should be tens of µT, got {mag} T"
             );
         }
-    }
-
-    /// Driven at the full set point, the wheel pins **exactly** at `RW_MOMENTUM_MAX` (the
-    /// foldback lands on the limit rather than snapping torque to zero early), never exceeds
-    /// it, and an unloading command flows immediately from the pinned state.
-    #[test]
-    fn rw_saturation_clamps_at_limit_and_allows_unloading() {
-        let mut w = ReactionWheel::new(tensor![1.0, 0.0, 0.0], true);
-        // A constant −X body-torque command spins the wheel up along +X.
-        w.torque_set_point = tensor![-RW_TORQUE_MAX, 0.0, 0.0];
-        let mut pinned = 0;
-        for _ in 0..5000 {
-            w.update();
-            let s: f64 = w.ang_momentum.into_buf()[0];
-            assert!(s <= RW_MOMENTUM_MAX + 1e-12, "momentum exceeded the limit: {s}");
-            if s >= RW_MOMENTUM_MAX - 1e-12 {
-                pinned += 1;
-            }
-        }
-        assert!(pinned > 0, "wheel never reached the momentum limit");
-        let t: f64 = w.torque.into_buf()[0];
-        assert!(t.abs() < 1e-12, "pinned wheel still delivered torque: {t}");
-        // Reverse the command: unloading torque must flow on the very next step.
-        w.torque_set_point = tensor![RW_TORQUE_MAX, 0.0, 0.0];
-        w.update();
-        let t: f64 = w.torque.into_buf()[0];
-        assert!(t > 1e-3, "unloading torque did not flow from saturation: {t}");
-        let s: f64 = w.ang_momentum.into_buf()[0];
-        assert!(s < RW_MOMENTUM_MAX, "momentum did not unload");
-    }
-
-    /// With no motor command, bearing friction decays a preloaded wheel monotonically, stops
-    /// it without ever pushing it through zero into counter-rotation, and holds it frozen
-    /// inside the stiction deadband (regression for the unsigned-speed `signum` friction and
-    /// the phantom torque at rest).
-    #[test]
-    fn rw_friction_decays_signed_speed() {
-        let mut w = ReactionWheel::new(tensor![0.0, 1.0, 0.0], true).with_momentum(0.001);
-        let mut prev = w.speed;
-        assert!(prev > 0.0);
-        let mut frozen = 0;
-        for _ in 0..30_000 {
-            w.update();
-            assert!(w.speed <= prev + 1e-15, "friction sped the wheel up");
-            assert!(w.speed >= 0.0, "friction counter-rotated the wheel: {}", w.speed);
-            if w.speed == prev {
-                frozen += 1;
-            } else {
-                frozen = 0;
-            }
-            prev = w.speed;
-        }
-        assert!(frozen > 100, "wheel never froze");
-        assert!(prev < RW_STICTION_OMEGA, "froze outside the deadband: {prev}");
-    }
-
-    /// The disturbance model lands each source in its expected order-of-magnitude band at a
-    /// 400 km state with honest params — a units guard (ρ, Tesla, P_SRP, torque arms), like
-    /// the WMM band test above.
-    #[test]
-    fn disturbance_torques_sane_at_400km() {
-        let p = PlantParams {
-            init_angle: 0.0,
-            init_rate: 0.0,
-            meas_sigma: 0.0,
-            seed: 0,
-            disarmed: false,
-            rho: default_rho(),
-            cd: default_cd(),
-            area_aero: default_area(),
-            cp_offset_b: default_cp_offset(),
-            m_res_b: default_m_res(),
-            area_srp: default_area(),
-            cr: default_cr(),
-            mtq_max_dipole: default_mtq_max(),
-            init_wheel_h: 0.0,
-        };
-        let radius = EARTH_RADIUS + ALTITUDE;
-        let pos: V3 = tensor![radius, 0.0, 0.0];
-        let v_orbit = (MU / radius).sqrt();
-        let vel: V3 = tensor![0.0, v_orbit, 0.0];
-        // A generic attitude so nothing sits on a principal axis or parallel to the field.
-        let q = Quat::from_axis_angle(tensor![1.0, 1.0, 1.0], 0.5);
-        let epoch = mission_epoch();
-        let mut model = MagneticModel::default();
-        let mag = mag_field_eci(&mut model, epoch, &pos);
-        let d = disturbance_torques(&p, &q, &pos, &vel, &sun_dir_eci(epoch), &mag);
-
-        let mag_of = |v: &V3| -> f64 { v.norm().into_buf() };
-        let gg = mag_of(&d.gg_b);
-        assert!((1e-10..1e-6).contains(&gg), "gravity-gradient torque out of band: {gg}");
-        let aero = mag_of(&d.aero_b);
-        assert!((1e-9..1e-5).contains(&aero), "aero torque out of band: {aero}");
-        let res = mag_of(&d.mag_b);
-        assert!((1e-10..1e-5).contains(&res), "residual-dipole torque out of band: {res}");
-        let srp = mag_of(&d.srp_b);
-        assert!((1e-11..1e-7).contains(&srp), "SRP torque out of band: {srp}");
-        // Drag opposes the velocity.
-        let drag_along_v: f64 = d.aero_force_eci.dot(&vel).into_buf();
-        assert!(drag_along_v < 0.0, "drag force does not oppose velocity");
-        let sum = d.gg_b + d.aero_b + d.mag_b + d.srp_b;
-        assert!(mag_of(&(d.total_b() - sum)) == 0.0);
     }
 
     /// Both magnetorquer laws produce a torque `m × B` that opposes their regulated quantity
