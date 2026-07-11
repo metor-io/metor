@@ -9,9 +9,24 @@ artifact "commissioning" crate="adcs-commissioning" lib="adcs_commissioning" typ
 artifact "safe_mode"     crate="adcs-safe-mode"     lib="adcs_safe_mode"     type="safe_mode"
 
 // systems
-system "plant" type="Plant" artifact="plant" init_angle=0.5 init_rate=0.15 meas_sigma=0.002 seed=42 disarmed=#false
+// The plant's disturbance/actuator environment is spelled out in full (the dlopen param
+// encoder fills the exported schema from this node — `#[serde(default)]` is a static-link
+// nicety only). Physically honest values for a ~3 kg spacecraft at 400 km: secular torques
+// ~1e-7 N·m, so wheel momentum builds over days — crank `m_res_b`/`init_wheel_h` to watch
+// desaturation work in seconds.
+system "plant" type="Plant" artifact="plant" init_angle=0.5 init_rate=0.15 meas_sigma=0.002 seed=42 disarmed=#false process=#true {
+    rho 3e-12                   // atmospheric density (kg/m³, 400 km solar-mean)
+    cd 2.2                      // drag coefficient
+    area_aero 0.03              // aero reference area (m²)
+    cp_offset_b 0.02 0.0 0.0    // CP–CG offset (m) — the drag/SRP torque arm
+    m_res_b 0.002 0.002 0.002   // residual magnetic dipole (A·m²)
+    area_srp 0.03               // SRP reference area (m²)
+    cr 1.5                      // SRP reflectivity coefficient
+    mtq_max_dipole 0.2          // per-axis magnetorquer authority (A·m²)
+    init_wheel_h 0.0            // per-wheel stored-momentum preload (N·m·s)
+}
 system "nav"   type="Nav"   artifact="nav"   meas_sigma=0.02
-system "ctrl"  type="Ctrl"  artifact="ctrl"  q_weight=5.0 r_weight=8.0
+system "ctrl"  type="Ctrl"  artifact="ctrl"  q_weight=5.0 r_weight=8.0 k_desat=0.0005 k_detumble=0.00005
 
 system "alarms" type="Alarms" {
     alarm id="ADCS_RATE_HIGH" name="Body Rate High" {
@@ -22,9 +37,19 @@ system "alarms" type="Alarms" {
         debounce 2
         hysteresis 0.005
     }
+    alarm id="RW_MOMENTUM_HIGH" name="Wheel Momentum High" {
+        description "Wheel-0 stored momentum approaching the saturation limit"
+        // The doubled `wheels` is instance + frame-field nesting: instance `plant`, frame
+        // `wheels`, field `wheels: [ReactionWheel; 3]`, wheel 0, its X-axis momentum element.
+        target component="plant.wheels.wheels.0.ang_momentum" element=0
+        warning above=0.03 below=-0.03
+        critical above=0.038 below=-0.038
+        debounce 2
+        hysteresis 0.001
+    }
 }
 
-slot "slot" {
+slot "mode" {
     input  frame="attitude_estimate"
     output frame="mode_cmd"
     allow occupant="commissioning"
@@ -35,11 +60,14 @@ slot "slot" {
 connect "plant" -> "nav"  frame="sensors"
 connect "plant" -> "nav"  frame="gps"
 connect "plant" -> "ctrl" frame="gps"
+connect "plant" -> "ctrl" frame="sensors"   // measured B for the magnetorquer laws
+connect "plant" -> "ctrl" frame="wheels"    // telemetered wheel momentum for desat
 connect "nav"   -> "ctrl" frame="attitude_estimate"
-connect "nav"   -> "slot" frame="attitude_estimate"
+connect "nav"   -> "mode" frame="attitude_estimate"
 
-connect "slot"  -> "ctrl" frame="mode_cmd" delayed=#true
+connect "mode"  -> "ctrl" frame="mode_cmd" delayed=#true
 connect "ctrl"  -> "plant" frame="torque_cmd" delayed=#true
+connect "ctrl"  -> "plant" frame="mtq_cmd" delayed=#true
 
 system "uplink" type="TcpUplink" addr="127.0.0.1:2240" {
     msgs "SequenceCommand" "AlarmAck"
@@ -47,6 +75,6 @@ system "uplink" type="TcpUplink" addr="127.0.0.1:2240" {
 
 system "downlink" type="TcpDownlink" addr="127.0.0.1:2240"
 
-connect "uplink"      -> "slot" msg="SequenceCommand"   // ground commands
-connect "coordinator" -> "slot" msg="SequenceCommand"   // in-proc control_handle
+connect "uplink"      -> "mode" msg="SequenceCommand"   // ground commands
+connect "coordinator" -> "mode" msg="SequenceCommand"   // in-proc control_handle
 connect "uplink"      -> "alarms" msg="AlarmAck"        // operator acks (gate latching alarms)

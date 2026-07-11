@@ -46,6 +46,11 @@ const ABORTED: u8 = 2;
 /// plumbing is unavailable (so the caller skips rather than fails spuriously, like `bundle`).
 fn build_mission(auto_run: bool) -> Option<Coordinator> {
     let mut wiring = parse(MISSION_KDL).expect("parse mission.kdl");
+    // Test binaries can't host a `process=#true` worker (no `worker_entry` in main) — run
+    // every system in-process, like `build_sim_coordinator`.
+    for spec in &mut wiring.systems {
+        spec.process = false;
+    }
     if let Err(e) = build_artifacts(&mut wiring, &BuildOptions::default()) {
         eprintln!("skipping: build_artifacts failed: {e}");
         return None;
