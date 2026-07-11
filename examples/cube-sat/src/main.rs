@@ -495,8 +495,9 @@ impl Sim {
 
     pub fn du(&self) -> DU {
         let gravity_force = SpatialForce::from_linear(self.gravity());
-        let rw_torque = self.reaction_wheel_torque();
-        let rw_spatial_force = SpatialForce::from_torque(rw_torque);
+        // The wheel axes are body-fixed; `from_body_force` takes a world-frame torque.
+        let rw_torque_w = self.body.pos.angular() * self.reaction_wheel_torque();
+        let rw_spatial_force = SpatialForce::from_torque(rw_torque_w);
         let force = gravity_force + rw_spatial_force;
         DU::from_body_force(&self.body, force)
     }
