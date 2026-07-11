@@ -475,8 +475,12 @@ place rather than scattered through the prose:
   the single global cycle rate (a system can still self-pace by running async).
 - **Shared uplink+downlink connection.** The uplink and downlink each open their own connection.
   A connection is an owned OS resource the system/ring model cannot split into independent handles
-  the way it distributes ring views, so sharing one socket across two systems needs a "shared owned
-  resource" abstraction that does not exist yet (`docs/messages.md` §4.5).
+  the way it distributes ring views (`docs/messages.md` §4.5). The planned **in-process** answer is
+  pack-level shared state (`docs/design-packs-authoring.md` §2.3): systems registered by one
+  `pack()` capture clones of a handle built at pack construction, so one owned socket can serve
+  both directions. Cross-process sharing stays open — a `process=#true` worker runs its own
+  `pack()` in its own address space, so the "shared owned resource" abstraction is still needed
+  there.
 
 ## Document map
 
@@ -502,5 +506,5 @@ of each subsystem:
 - `docs/message-wiring.md` — messages as first-class wired ports/edges (`MsgOut<M>`/`MsgIn<M>`, `msg=`/`connect_msg`), the `AllOutputs` receive-all capability, and the port-unification axes (schema × delivery × fan-in, plus the `PortConn` axis). The command-plane shape it originally designed is further reframed — see `docs/messages.md`'s status banner and `docs/design-command-slots.md` for what actually shipped (name-addressed commands, explicit per-slot edges, the uplink's multi-output `CommandOut` dispatch).
 - `docs/alarms.md` — the alarm engine: a shipped, ordinary system (`type="Alarms"`) evaluating KDL-declared limit alarms against any telemetered component and broadcasting the wkt alarm Msgs the panel consumes.
 - `docs/normalize-telemetry-uplink-plan.md` — how the telemetry downlink and command uplink became ordinary registry systems (`type="TcpDownlink"`/`type="TcpUplink"`), replacing the dedicated `telemetry`/`uplink` wiring surface.
-</content>
-</invoke>
+- `docs/design-packs-authoring.md` — packs (multi-system crates over one `Driver` seam and dl ABI v5), the functional author surface (`system(fn)`/`Pack::task`), pack-level shared state, and the sequence/system unification (occupant tail as a mount mode, `cycle().await`).
+- `docs/design-packs-authoring-plan.md` — the staged work packages (WP1–WP6) landing that design.
