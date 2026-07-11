@@ -6,7 +6,6 @@ use std::{
     fs::OpenOptions,
     io::{Seek, SeekFrom, Write as _},
     marker::PhantomData,
-    os::fd::AsRawFd,
     path::Path,
     slice::{self, SliceIndex},
     sync::{
@@ -14,6 +13,42 @@ use std::{
         atomic::{AtomicU64, Ordering},
     },
 };
+
+/// Mark the file sparse so extending it far past EOF leaves a hole instead of
+/// allocating the full mapped size on disk. Unix filesystems do this
+/// implicitly; NTFS allocates every cluster up to EOF unless the file carries
+/// the sparse attribute, so this must run before the file is extended.
+#[cfg(windows)]
+fn set_sparse(file: &std::fs::File) -> std::io::Result<()> {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::System::IO::DeviceIoControl;
+    use windows_sys::Win32::System::Ioctl::FSCTL_SET_SPARSE;
+
+    let mut bytes_returned = 0u32;
+    // No input buffer: FILE_SET_SPARSE_BUFFER defaults to SetSparse = TRUE.
+    let ok = unsafe {
+        DeviceIoControl(
+            file.as_raw_handle() as _,
+            FSCTL_SET_SPARSE,
+            std::ptr::null(),
+            0,
+            std::ptr::null_mut(),
+            0,
+            &mut bytes_returned,
+            std::ptr::null_mut(),
+        )
+    };
+    if ok == 0 {
+        Err(std::io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
+}
+
+#[cfg(not(windows))]
+fn set_sparse(_file: &std::fs::File) -> std::io::Result<()> {
+    Ok(())
+}
 
 /// [`AppendLog`] is a memory-mapped append-only time-series data file.
 /// It works by mapping a large amount of memory ~8g to a sparse file. The file contains a
@@ -58,9 +93,15 @@ impl<E: IntoBytes + Immutable> AppendLog<E> {
             .write(true)
             .read(true)
             .open(path)?;
+        // Sparseness is an efficiency, not a correctness requirement: on a
+        // filesystem without it (exFAT, SMB) the log still works, it just
+        // pre-allocates its full size, so warn rather than fail.
+        if let Err(e) = set_sparse(&file) {
+            tracing::warn!(%e, "failed to mark append log sparse; file will pre-allocate its full size");
+        }
         file.seek(SeekFrom::Start(size))?;
         file.write_all(&[0])?;
-        let map = Arc::new(memmap2::MmapRaw::map_raw(file.as_raw_fd())?);
+        let map = Arc::new(memmap2::MmapRaw::map_raw(&file)?);
         let map = Self {
             map,
             header_extra: PhantomData,
@@ -78,7 +119,7 @@ impl<E: IntoBytes + Immutable> AppendLog<E> {
 
     pub fn open(path: impl AsRef<Path>) -> Result<Self, Error> {
         let file = OpenOptions::new().write(true).read(true).open(path)?;
-        let map = Arc::new(memmap2::MmapRaw::map_raw(file.as_raw_fd())?);
+        let map = Arc::new(memmap2::MmapRaw::map_raw(&file)?);
         let map = Self {
             map,
             header_extra: PhantomData,
