@@ -9139,6 +9139,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "twox-hash 2.1.2",
+ "windows-sys 0.61.2",
  "zerocopy",
 ]
 
