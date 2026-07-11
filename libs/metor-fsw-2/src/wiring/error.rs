@@ -311,6 +311,20 @@ pub enum LoadError {
         span: SourceSpan,
     },
 
+    /// A pack entry's create phase failed for a non-params reason (a
+    /// moved-in state instantiated twice, a configure failure); a KDL params
+    /// failure surfaces as its own spanned error instead.
+    #[error("system `{system}` failed to create: {message}")]
+    #[diagnostic(code(fsw_wiring::pack_create))]
+    PackCreate {
+        system: String,
+        message: String,
+        #[source_code]
+        src: String,
+        #[label("this system")]
+        span: SourceSpan,
+    },
+
     #[error("`artifact` node is missing required property `{property}`")]
     #[diagnostic(code(fsw_wiring::missing_artifact_field))]
     MissingArtifactField {

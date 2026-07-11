@@ -58,6 +58,7 @@ required-features = ["kdl"]
 
 [dev-dependencies]
 tempfile = "3.13"
+trybuild = "1"
 
 # Its own main calls `proc::worker_entry()` first, so the test binary can be
 # re-executed as the worker for process systems (a libtest main cannot).

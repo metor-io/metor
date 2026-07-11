@@ -882,9 +882,22 @@ struct ProcReg {
     params: Vec<u8>,
 }
 
+/// A registered pack entry, created (params decoded, state built) at
+/// registration; the pending half binds its ports at `build()` and yields
+/// the boxed [`Driver`](crate::pack::Driver) a [`DriverSlot`] steps.
+struct PackReg {
+    pending: crate::pack::Pending,
+    /// The entry's own name, the slot's static display name (the instance
+    /// name lives on the enclosing [`Registration`], as for every kind).
+    entry_name: &'static str,
+}
+
 enum Reg {
     Cyclic(Box<dyn CyclicRegistration>),
     Async(Box<dyn AsyncRegistration>),
+    /// A pack entry, bound to a [`DriverSlot`](crate::pack::DriverSlot) at
+    /// `build()`.
+    Pack(PackReg),
     /// A dlopen'd cyclic system, bound to a [`DlSlot`](crate::dl) at `build()`.
     Dl(DlReg),
     /// A cross-process cyclic system, spawned as a worker and bound to a
@@ -1053,6 +1066,27 @@ impl CoordinatorBuilder {
         // The instance descriptor, not the static one (see `add_cyclic_named`).
         let desc = system.instance_descriptor();
         self.push_system(desc, name.into(), Reg::Async(Box::new(AsyncReg { system })))
+    }
+
+    /// Register a pack entry under an explicit instance name, running its
+    /// create phase (params decode + state construction) now so a bad config
+    /// fails at registration, not at `build()`. The bind phase runs at
+    /// `build()` over the entry's descriptor like any static system's.
+    pub fn add_pack_entry(
+        &mut self,
+        name: impl Into<String>,
+        entry: &mut crate::pack::PackEntry,
+        params: crate::pack::EntryParams<'_>,
+    ) -> Result<SystemHandle, crate::pack::MakeError> {
+        let pending = entry.create(params)?;
+        Ok(self.push_system(
+            entry.descriptor().clone(),
+            name.into(),
+            Reg::Pack(PackReg {
+                pending,
+                entry_name: entry.name(),
+            }),
+        ))
     }
 
     /// Register a dlopen'd cyclic system under an explicit instance name.
@@ -2150,6 +2184,15 @@ fn bind_systems(
                         launcher: r.bind(&mut binder),
                         wake_on_stop: std::mem::take(&mut plumbing.async_wakes[id]),
                     }),
+                    Reg::Pack(p) => {
+                        let mut src = crate::binder::AnySource::Host(&mut binder);
+                        let driver = (p.pending)(&mut src, crate::pack::Mount::Wired);
+                        cyclic.push(Box::new(crate::pack::DriverSlot {
+                            driver,
+                            name: p.entry_name,
+                            state: SlotState::Running,
+                        }));
+                    }
                     // The dl/proc/slot/coordinator arms are handled by the outer match.
                     Reg::Dl(_) => unreachable!("dl registration bound by the outer match"),
                     Reg::Proc(_) => unreachable!("proc registration bound by the outer match"),

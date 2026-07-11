@@ -165,6 +165,64 @@ pub trait RingSource {
     }
 }
 
+/// The ring sources a pack entry can be bound over, as one concrete type so
+/// the type-erased entry constructor (a boxed closure) can take it by `&mut`
+/// without giving up [`RingSource`]'s generic methods. The host [`Binder`] is
+/// the static-path variant; the dl/process paths add theirs when the pack ABI
+/// lands.
+pub enum AnySource<'a, 'b> {
+    /// The host builder's positional cursor over pre-allocated rings.
+    Host(&'a mut Binder<'b>),
+}
+
+impl RingSource for AnySource<'_, '_> {
+    fn next_output<WD, WS>(&mut self) -> (RingBuffer, WD, WS)
+    where
+        WD: WakeSource + Default + Clone + 'static,
+        WS: WakeSink + Default + Clone + 'static,
+    {
+        match self {
+            Self::Host(b) => b.next_output::<WD, WS>(),
+        }
+    }
+
+    fn next_input<RD, RS>(&mut self) -> (RingBuffer, RD, RS)
+    where
+        RD: WakeSink + Default + Clone + 'static,
+        RS: WakeSource + Default + Clone + 'static,
+    {
+        match self {
+            Self::Host(b) => b.next_input::<RD, RS>(),
+        }
+    }
+
+    fn try_next_output<WD, WS>(&mut self) -> Option<(RingBuffer, WD, WS)>
+    where
+        WD: WakeSource + Default + Clone + 'static,
+        WS: WakeSink + Default + Clone + 'static,
+    {
+        match self {
+            Self::Host(b) => b.try_next_output::<WD, WS>(),
+        }
+    }
+
+    fn next_input_fanin<RD, RS>(&mut self) -> Vec<(RingBuffer, RD, RS)>
+    where
+        RD: WakeSink + Default + Clone + 'static,
+        RS: WakeSource + Default + Clone + 'static,
+    {
+        match self {
+            Self::Host(b) => b.next_input_fanin::<RD, RS>(),
+        }
+    }
+
+    fn registry(&self) -> Arc<Registry> {
+        match self {
+            Self::Host(b) => b.registry(),
+        }
+    }
+}
+
 impl<'a> RingSource for Binder<'a> {
     fn next_output<WD, WS>(&mut self) -> (RingBuffer, WD, WS)
     where

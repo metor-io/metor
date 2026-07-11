@@ -70,7 +70,7 @@ use crate::telemetry::{TcpRecvTransport, TcpTransport, TelemetrySystem, UplinkSy
 mod build_driver;
 mod builder;
 mod bundle;
-mod de;
+pub(crate) mod de;
 mod error;
 mod kdl_params;
 mod model;
@@ -122,8 +122,10 @@ pub struct LoadCtx<'a> {
 
 /// A registered factory: parse params off `ctx.node`, construct the system,
 /// add it to the builder under `ctx.name`, and return its handle and
-/// descriptor for edge validation.
-pub type SystemFactory = fn(&mut LoadCtx) -> Result<(SystemHandle, SystemDescriptor), LoadError>;
+/// descriptor for edge validation. Boxed `Fn`, not a bare `fn`: a pack
+/// entry's factory closes over the shared entry it instantiates.
+pub type SystemFactory =
+    Box<dyn Fn(&mut LoadCtx) -> Result<(SystemHandle, SystemDescriptor), LoadError>>;
 
 /// Marker for a cyclic system's [`AddToBuilder`] impl.
 pub struct CyclicKind;
@@ -203,7 +205,23 @@ where
 /// capability.
 struct RegistryEntry {
     factory: SystemFactory,
-    descriptor: fn() -> SystemDescriptor,
+    descriptor: EntryDescriptor,
+}
+
+/// A registered type's descriptor without construction: computed on demand
+/// for a type-registered system, carried by value for a pack entry.
+enum EntryDescriptor {
+    Fn(fn() -> SystemDescriptor),
+    Value(Box<SystemDescriptor>),
+}
+
+impl EntryDescriptor {
+    fn capabilities_contain(&self, cap: crate::Capability) -> bool {
+        match self {
+            EntryDescriptor::Fn(f) => f().capabilities.contains(&cap),
+            EntryDescriptor::Value(d) => d.capabilities.contains(&cap),
+        }
+    }
 }
 
 /// The app-built map from a `type="..."` string to a system factory. It is an
@@ -268,16 +286,63 @@ impl Registry {
     /// [`AddToBuilder`] blanket impls, inferred here.
     pub fn register<S, K>(&mut self, type_name: &'static str) -> &mut Self
     where
-        S: BuildSystem + AddToBuilder<K>,
+        S: BuildSystem + AddToBuilder<K> + 'static,
         S::Params: serde::de::DeserializeOwned,
+        K: 'static,
     {
         self.factories.insert(
             type_name,
             RegistryEntry {
-                factory: factory::<S, K>,
-                descriptor: <S as AddToBuilder<K>>::descriptor,
+                factory: Box::new(factory::<S, K>),
+                descriptor: EntryDescriptor::Fn(<S as AddToBuilder<K>>::descriptor),
             },
         );
+        self
+    }
+
+    /// Register every entry of a pack under its entry name as the `type=`
+    /// key, so the same `pack()` a cdylib exports serves a statically-linked
+    /// mission. Two instances of one entry construct through the same shared
+    /// entry (a non-reloadable `.state(...)` entry rejects the second).
+    pub fn register_pack(&mut self, pack: crate::Pack) -> &mut Self {
+        use std::cell::RefCell;
+        use std::rc::Rc;
+
+        for entry in pack.into_entries() {
+            let name = entry.name();
+            let descriptor = Box::new(entry.descriptor().clone());
+            let entry = Rc::new(RefCell::new(entry));
+            let factory = Box::new(move |ctx: &mut LoadCtx| {
+                let mut entry = entry.borrow_mut();
+                let params = crate::pack::EntryParams::Kdl {
+                    node: ctx.node,
+                    src: ctx.src,
+                    name: ctx.name,
+                    msgs: ctx.msgs,
+                };
+                let handle = ctx
+                    .builder
+                    .add_pack_entry(ctx.name, &mut entry, params)
+                    .map_err(|e| match e {
+                        // The KDL decode already carries its span; unwrap it.
+                        crate::pack::MakeError::Kdl(e) => *e,
+                        other => LoadError::PackCreate {
+                            system: ctx.name.to_string(),
+                            message: other.to_string(),
+                            src: ctx.src.to_string(),
+                            span: (0, ctx.src.len()).into(),
+                        },
+                    })?;
+                Ok((handle, ctx.builder.descriptor_of(handle).clone()))
+            });
+            self.factories.insert(
+                name,
+                RegistryEntry {
+                    factory,
+                    descriptor: EntryDescriptor::Value(descriptor),
+                },
+            );
+        }
         self
     }
 
@@ -286,11 +351,8 @@ impl Registry {
     /// `false`; the systems pass reports them as [`LoadError::UnknownType`] in
     /// document order.
     fn is_receive_all(&self, ty: Option<&str>) -> bool {
-        ty.and_then(|ty| self.factories.get(ty)).is_some_and(|e| {
-            (e.descriptor)()
-                .capabilities
-                .contains(&crate::Capability::ReceiveAll)
-        })
+        ty.and_then(|ty| self.factories.get(ty))
+            .is_some_and(|e| e.descriptor.capabilities_contain(crate::Capability::ReceiveAll))
     }
 }
 
