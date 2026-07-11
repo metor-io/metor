@@ -384,7 +384,7 @@ mod tests {
     #[test]
     fn test_quat_mrp_conversion() {
         let input: Quaternion<f64, crate::ArrayRepr> =
-            Quaternion::from_axis_angle(Vector3::z_axis(), 3.14);
+            Quaternion::from_axis_angle(Vector3::z_axis(), 3.1);
         let q = Quaternion::from(&input.mrp());
         approx::assert_relative_eq!(input.0, q.0, epsilon = 1.0e-6);
     }

@@ -617,6 +617,8 @@ mod tests {
     use super::*;
 
     #[test]
+    // the expected floats are exact outputs of the multiply; one lands a ULP off SQRT_2
+    #[allow(clippy::approx_constant)]
     fn test_spatial_transform_mul() {
         let a = SpatialTransform::new(
             Quaternion::<_, ArrayRepr>::from_axis_angle(tensor![0.0, 0.0, 1.0], 45f64.to_radians()),
