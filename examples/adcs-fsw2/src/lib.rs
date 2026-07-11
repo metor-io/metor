@@ -40,6 +40,12 @@ const MISSION_KDL: &str = include_str!("../mission.kdl");
 /// `build_artifacts` → `resolve`), minus the CLI overrides — it is the test's entry point.
 pub fn build_sim_coordinator() -> anyhow::Result<Coordinator> {
     let mut wiring = parse(MISSION_KDL)?;
+    // A `process=#true` system re-execs the current binary as its worker, which only the CLI
+    // runner's `main` supports (`metor_fsw_2::proc::worker_entry`) — a test binary would hang
+    // the describe handshake. The headless/test configuration runs every system in-process.
+    for spec in &mut wiring.systems {
+        spec.process = false;
+    }
     build_artifacts(&mut wiring, &BuildOptions::default())?;
     Ok(resolve(&wiring, &Registry::with_builtins())?)
 }

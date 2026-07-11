@@ -42,6 +42,8 @@ pub const DT: f64 = 1.0 / 120.0;
 pub const G: f64 = 6.6743e-11;
 /// Mass of Earth (kg).
 pub const M: f64 = 5.972e24;
+/// Earth's gravitational parameter `G·M` (m³·s⁻²).
+pub const MU: f64 = G * M;
 /// Spacecraft mass (kg).
 pub const MASS: f64 = 2825.2 / 1000.0;
 /// Earth radius (m).
@@ -68,6 +70,41 @@ pub const GPS_POS_SIGMA: f64 = 5.0;
 pub const GPS_TAU: f64 = 100.0;
 /// GPS velocity error 1-sigma per axis (m/s), modeled as white noise.
 pub const GPS_VEL_SIGMA: f64 = 0.05;
+
+// --- Reaction wheels ----------------------------------------------------------
+// Shared by the plant (the wheels are its actuator) and the controller (an FSW
+// that knows its actuator's limits clamps what it commands).
+
+/// Wheel momentum saturation limit (N·m·s) — at the limit the motor folds back to zero net
+/// torque; unloading torque always flows.
+pub const RW_MOMENTUM_MAX: f64 = 0.04;
+/// Maximum motor torque per wheel (N·m).
+pub const RW_TORQUE_MAX: f64 = 0.002;
+/// Wheel rotor moment of inertia (kg·m²): a 185 g disc of 5 cm diameter.
+pub const RW_MOI: f64 = 0.185 * (0.05 / 2.0) * (0.05 / 2.0) / 2.0;
+/// Coulomb bearing friction (N·m). The cube-sat's 5e-4 was telemetry-only; fed into the
+/// dynamics it (with its viscous partner) would cap the wheel near 40 rad/s — 17× below the
+/// ~692 rad/s saturation speed — so both coefficients are retuned to bearing-realistic values.
+pub const RW_COULOMB: f64 = 1.0e-5;
+/// Viscous bearing friction (N·m·s/rad).
+pub const RW_VISCOUS: f64 = 1.0e-7;
+/// Stiction deadband (rad/s): below this speed friction holds the wheel at rest instead of
+/// chattering across zero (`signum(0)` would otherwise apply a phantom torque at rest).
+pub const RW_STICTION_OMEGA: f64 = 1e-3;
+
+// --- Magnetorquers / magnetometer ----------------------------------------------
+
+/// Magnetometer noise 1-sigma per axis (Tesla) — the sensor reads the physical field, so its
+/// noise is physical too (~150 nT against a ~25–45 µT field at 400 km).
+pub const MAG_SENSOR_SIGMA: f64 = 150e-9;
+/// Maximum magnetorquer dipole per axis (A·m²) — at |B| ≈ 4e-5 T that is ~8e-6 N·m of
+/// authority, plenty against ~1e-7 N·m secular disturbances but far below the wheels.
+pub const MTQ_MAX_DIPOLE: f64 = 0.2;
+
+// --- Disturbance environment ----------------------------------------------------
+
+/// Solar radiation pressure at 1 AU (N/m²).
+pub const P_SRP: f64 = 4.56e-6;
 
 // --- WMM magnetic field ------------------------------------------------------
 // The true (plant, at its real position) and reference (nav, at the GPS position) Earth
@@ -135,6 +172,69 @@ pub fn epoch_at(t_sim_s: f64) -> Epoch {
 /// nox-frames' Vallado model, replacing the fixed fake sun direction.
 pub fn sun_dir_eci(epoch: Epoch) -> V3 {
     nox_frames::earth::sun_vec(epoch)
+}
+
+// ---------------------------------------------------------------------------
+// Environmental disturbance torques
+// ---------------------------------------------------------------------------
+// The body-frame torques a small spacecraft actually lives on at 400 km, evaluated at the true
+// state each cycle (all deterministic — no RNG). Owned by the contract so the plant applies
+// them and the sanity tests can probe them without a coordinator.
+
+/// The disturbance torques at one true state, plus the drag force (which also perturbs the
+/// orbit). All torques in the body frame (N·m); the force in ECI (N).
+pub struct DisturbanceTorques {
+    /// Gravity-gradient torque.
+    pub gg_b: V3,
+    /// Aerodynamic drag torque about the CP–CG offset.
+    pub aero_b: V3,
+    /// Residual-magnetic-dipole torque `m_res × B`.
+    pub mag_b: V3,
+    /// Solar-radiation-pressure torque about the CP–CG offset.
+    pub srp_b: V3,
+    /// The drag force in ECI — fed into the translational dynamics.
+    pub aero_force_eci: V3,
+}
+
+impl DisturbanceTorques {
+    /// The summed disturbance torque (excludes actuation — the MTQ torque is control).
+    pub fn total_b(&self) -> V3 {
+        self.gg_b + self.aero_b + self.mag_b + self.srp_b
+    }
+}
+
+/// Evaluate the disturbance environment at a true state: attitude `q_b_eci`, ECI
+/// position/velocity, the sun direction, and the **un-normalized** magnetic field (Tesla).
+///
+/// - Gravity gradient: `τ = (3μ/|r|³) · r̂_b × (I ∘ r̂_b)`.
+/// - Aero: `F = −½ρ·Cd·A·|v|·v` (co-rotating atmosphere ignored), `τ = r_cp × F_b`.
+/// - Residual dipole: `τ = m_res × B_b`.
+/// - SRP: `F = −P·A·Cr·ŝ_b`, `τ = r_cp × F_b` — always lit (no eclipse model yet).
+pub fn disturbance_torques(
+    p: &PlantParams,
+    q_b_eci: &Quat,
+    pos_eci: &V3,
+    vel_eci: &V3,
+    sun_eci: &V3,
+    mag_eci: &V3,
+) -> DisturbanceTorques {
+    let q_eci_b = q_b_eci.inverse();
+    let cp_offset_b = V3::from_buf(p.cp_offset_b);
+
+    let r_mag: f64 = pos_eci.norm().into_buf();
+    let r_hat_b = &q_eci_b * (pos_eci.normalize());
+    let gg_b = r_hat_b.cross(&(inertia_diag() * r_hat_b)) * (3.0 * MU / r_mag.powi(3));
+
+    let v_mag: f64 = vel_eci.norm().into_buf();
+    let aero_force_eci = *vel_eci * (-0.5 * p.rho * p.cd * p.area_aero * v_mag);
+    let aero_b = cp_offset_b.cross(&(&q_eci_b * aero_force_eci));
+
+    let mag_b = V3::from_buf(p.m_res_b).cross(&(&q_eci_b * *mag_eci));
+
+    let srp_force_b = (&q_eci_b * sun_eci.normalize()) * (-P_SRP * p.area_srp * p.cr);
+    let srp_b = cp_offset_b.cross(&srp_force_b);
+
+    DisturbanceTorques { gg_b, aero_b, mag_b, srp_b, aero_force_eci }
 }
 
 // ---------------------------------------------------------------------------
@@ -214,9 +314,11 @@ pub struct BodyState {
 }
 
 /// One body-axis-aligned reaction wheel — the plant's actuator **and** its telemetry, one and
-/// the same struct. It integrates its stored angular momentum under the commanded set point,
-/// with Stribeck/Coulomb/viscous friction and a momentum-saturation clamp; a disarmed wheel
-/// applies no torque (the `--disarmed` / safing gate). Ported from cube-sat `ReactionWheel`.
+/// the same struct. The stored `ang_momentum` is the wheel's **physical** momentum: the motor
+/// spins the wheel *against* the commanded body torque (`ḣ = τ_motor + τ_friction`), and the
+/// torque delivered to the body is the reaction `−ḣ` — Coulomb/viscous bearing friction and
+/// the momentum-saturation foldback are inside the dynamics, not telemetry-only. A disarmed
+/// wheel applies no motor torque (the `--disarmed` / safing gate) but its bearings stay real.
 #[derive(
     metor_fsw_2::AsVTable,
     metor_fsw_2::Metadatatize,
@@ -233,15 +335,16 @@ pub struct BodyState {
 pub struct ReactionWheel {
     /// Body-frame spin axis (a unit vector; body axis i for wheel i).
     pub axis: V3,
-    /// Stored angular momentum about the spin axis (N·m·s).
+    /// The wheel's physical stored angular momentum, `s·axis` (N·m·s).
     pub ang_momentum: V3,
-    /// The commanded torque set point (the projection of the control torque onto `axis`).
+    /// The commanded torque set point (the projection of the commanded **body** torque onto
+    /// `axis` — the motor spins the wheel against it).
     pub torque_set_point: V3,
-    /// The torque actually applied this step (after saturation/clamp), N·m.
+    /// The torque delivered to the **body** this step, the reaction `−ḣ·axis` (N·m).
     pub torque: V3,
-    /// Wheel speed (rad/s).
+    /// Signed wheel speed along `axis` (rad/s).
     pub speed: f64,
-    /// Modeled friction torque (N·m) — telemetered, not fed into the dynamics (cube-sat parity).
+    /// Friction torque on the wheel this step (N·m) — inside the dynamics.
     pub friction: f64,
     /// `1` armed, `0` disarmed (offline — applies no control torque).
     pub arm: u8,
@@ -268,70 +371,52 @@ impl ReactionWheel {
         self.arm != 0
     }
 
-    fn moment_of_inertia(&self) -> f64 {
-        0.185 * (0.05 / 2.0_f64).powi(2) / 2.0
+    /// The same wheel preloaded with `h` N·m·s of stored momentum along its axis — how the
+    /// desaturation tests/demos start with something to dump.
+    pub fn with_momentum(mut self, h: f64) -> Self {
+        self.ang_momentum = self.axis * h;
+        self.speed = h / RW_MOI;
+        self
     }
 
-    fn update_speed(&mut self) {
-        let i = self.moment_of_inertia();
-        let momentum_norm: f64 = self.ang_momentum.norm().into_buf();
-        self.speed = momentum_norm / i;
-    }
-
-    /// Friction torque (the cube-sat `rw_drag`): Stribeck near zero speed, Coulomb + viscous
-    /// otherwise.
-    fn friction_torque(&self) -> f64 {
-        let static_fric = 0.0005;
-        let columb_fric = 0.0005;
-        let stribeck_coef = 0.0005;
-        let cv = 0.00005;
-        let omega_limit = 0.1;
-        let speed = self.speed;
-
-        let stribeck_torque = -(2.0 * std::f64::consts::E).sqrt()
-            * (static_fric - columb_fric)
-            * (-((speed / stribeck_coef).powi(2))).exp()
-            - columb_fric * (10.0 * speed / stribeck_coef).tanh()
-            - cv * speed;
-
-        let torque_norm: f64 = self.torque_set_point.norm().into_buf();
-        let use_stribeck =
-            speed.abs() < 0.01 * omega_limit && speed.signum() == torque_norm.signum();
-
-        if use_stribeck {
-            stribeck_torque
-        } else {
-            -columb_fric * speed.signum() - cv * speed
-        }
-    }
-
-    /// Advance the wheel one step: integrate momentum under the set point (gated by arm and
-    /// by the 0.04 momentum-saturation limit), clamp the applied torque, and update speed.
+    /// Advance the wheel one step. The motor drives against the commanded body torque
+    /// (`τm = −u`, clamped to ±[`RW_TORQUE_MAX`], zero when disarmed); bearing friction
+    /// opposes the spin (Coulomb + viscous, a stiction deadband at rest, and it may stop the
+    /// wheel within a step but never reverse it); the momentum-saturation foldback pins
+    /// `|s| ≤ RW_MOMENTUM_MAX` exactly while always letting unloading torque flow. The
+    /// reaction `−ḣ·axis` is what the body receives.
     pub fn update(&mut self) {
-        if !self.armed() {
-            self.torque = V3::zeros();
-            self.friction = self.friction_torque();
-            self.update_speed();
-            return;
-        }
+        let s: f64 = self.axis.dot(&self.ang_momentum).into_buf();
+        let omega = s / RW_MOI;
 
-        let rw_force_clamp = 0.002;
-
-        let new_ang_momentum = self.ang_momentum + self.torque_set_point * DT;
-        let new_momentum_norm: f64 = new_ang_momentum.norm().into_buf();
-        let torque = if new_momentum_norm < 0.04 {
-            self.torque_set_point
+        let motor = if self.armed() {
+            let u: f64 = self.axis.dot(&self.torque_set_point).into_buf();
+            (-u).clamp(-RW_TORQUE_MAX, RW_TORQUE_MAX)
         } else {
-            V3::zeros()
+            0.0
         };
 
-        let clamped_torque =
-            V3::from_buf(torque.into_buf().map(|t| t.clamp(-rw_force_clamp, rw_force_clamp)));
+        let friction = if omega.abs() < RW_STICTION_OMEGA {
+            0.0
+        } else {
+            let f = -RW_COULOMB * omega.signum() - RW_VISCOUS * omega;
+            // Friction may stop the wheel within the step, never push it through zero.
+            if omega > 0.0 { f.max(-s / DT) } else { f.min(-s / DT) }
+        };
 
-        self.ang_momentum = self.ang_momentum + clamped_torque * DT;
-        self.friction = self.friction_torque();
-        self.torque = clamped_torque;
-        self.update_speed();
+        let mut h_dot = motor + friction;
+        let s_next = s + h_dot * DT;
+        if s_next > RW_MOMENTUM_MAX {
+            h_dot = (RW_MOMENTUM_MAX - s) / DT;
+        } else if s_next < -RW_MOMENTUM_MAX {
+            h_dot = (-RW_MOMENTUM_MAX - s) / DT;
+        }
+
+        let s = s + h_dot * DT;
+        self.ang_momentum = self.axis * s;
+        self.speed = s / RW_MOI;
+        self.friction = friction;
+        self.torque = self.axis * -h_dot;
     }
 }
 
@@ -365,6 +450,43 @@ pub struct World {
     pub mag_eci: V3,
 }
 
+/// The per-cycle disturbance-torque telemetry: each environmental source in the body frame,
+/// their sum, and the applied magnetorquer torque (control, so excluded from `total_b` —
+/// telemetered here so the desat demo can plot authority against the environment). Truth
+/// telemetry from the plant; the flight software does not consume it.
+#[derive(metor_fsw_2::Frame, IntoBytes, Immutable, KnownLayout, FromBytes, Clone)]
+#[repr(C)]
+#[metor_fsw(name = "disturb")]
+pub struct Disturbances {
+    #[metor_fsw(timestamp)]
+    pub timestamp: Timestamp,
+    /// Gravity-gradient torque (N·m, body frame).
+    pub gg_b: V3,
+    /// Aerodynamic drag torque (N·m, body frame).
+    pub aero_b: V3,
+    /// Residual-magnetic-dipole torque (N·m, body frame).
+    pub mag_b: V3,
+    /// Solar-radiation-pressure torque (N·m, body frame).
+    pub srp_b: V3,
+    /// The applied magnetorquer torque `m × B` (N·m, body frame) — control, not disturbance.
+    pub mtq_b: V3,
+    /// The summed environmental torque (excludes `mtq_b`).
+    pub total_b: V3,
+}
+
+/// The commanded magnetorquer dipole (the second actuator back-edge into the plant, beside
+/// [`TorqueCmd`]): desaturation dumps wheel momentum through it, detumble damps body rate.
+/// The plant clamps each axis to its `mtq_max_dipole` param and applies `τ = m × B_true`.
+#[derive(metor_fsw_2::Frame, IntoBytes, Immutable, KnownLayout, FromBytes, Clone)]
+#[repr(C)]
+#[metor_fsw(name = "mtq_cmd")]
+pub struct MtqCmd {
+    #[metor_fsw(timestamp)]
+    pub timestamp: Timestamp,
+    /// Commanded magnetic dipole in the body frame (A·m²).
+    pub dipole_b: V3,
+}
+
 /// The mission-mode command a slot sequence emits each transition (sequences-slots.md §4):
 /// the discrete ADCS phase plus the active **pointing law**. Produced by the `mode` slot's
 /// occupant (`adcs-commissioning` / `adcs-safe-mode`) and consumed by the controller, which
@@ -393,6 +515,9 @@ impl ModeCmd {
     /// The pointing-law byte values (cube-sat's `Mode::{NadirPoint, HilPoint}`).
     pub const LAW_NADIR: u8 = 0;
     pub const LAW_HIL: u8 = 1;
+    /// Magnetorquer-only rate damping (B-cross): the wheels idle while the torquers bleed the
+    /// body rate. Selectable but not yet commanded by any sequence.
+    pub const LAW_DETUMBLE: u8 = 2;
 
     /// A `ModeCmd` for `mode` + `law`, with a zero timestamp (the sequence has no per-cycle
     /// `now` handle; the field is telemetry ordering only — the slot's `SequenceStatus`
@@ -477,6 +602,40 @@ pub fn target_for(law: u8, pos_eci: &V3, vel_eci: &V3) -> Quat {
 }
 
 // ---------------------------------------------------------------------------
+// Magnetorquer laws — the commanded dipole as a function of the measured state
+// ---------------------------------------------------------------------------
+
+/// `k·(x × B)/|B|²` — the shared shape of both magnetorquer laws: the resulting torque
+/// `m × B = −k·x_⊥` opposes the component of `x` perpendicular to the field (the parallel
+/// component is unreachable this instant; the orbit rotates B̂ to get at it). Returns zero
+/// when the field is degenerate.
+fn cross_dipole(k: f64, x_b: &V3, mag_b: &V3) -> V3 {
+    let b2: f64 = mag_b.dot(mag_b).into_buf();
+    if b2 < 1e-18 {
+        return V3::zeros();
+    }
+    x_b.cross(mag_b) * (k / b2)
+}
+
+/// The momentum-desaturation dipole: `m = k·(h_w × B)/|B|²` bleeds the stored wheel momentum
+/// through the torquers (`τ = −k·h_⊥`) while the attitude controller holds pointing.
+pub fn desat_dipole(k_desat: f64, h_wheels_b: &V3, mag_b: &V3) -> V3 {
+    cross_dipole(k_desat, h_wheels_b, mag_b)
+}
+
+/// The detumble dipole (gyro-based **B-cross**): `m = k·(ω × B)/|B|²` damps the body rate
+/// (`τ = −k·ω_⊥`). Equivalent to classic Ḃ-based B-dot (`Ḃ_b = −ω × B_b` for a slowly-varying
+/// inertial field) but immune to the derivative being noise-dominated at a 120 Hz sample rate.
+pub fn detumble_dipole(k_detumble: f64, omega_b: &V3, mag_b: &V3) -> V3 {
+    cross_dipole(k_detumble, omega_b, mag_b)
+}
+
+/// Per-axis dipole clamp to the torquer's authority (±`max` A·m²).
+pub fn clamp_dipole(m: V3, max: f64) -> V3 {
+    V3::from_buf(m.into_buf().map(|x| x.clamp(-max, max)))
+}
+
+// ---------------------------------------------------------------------------
 // Convergence sampling (the test reads these off the tapped truth/orbit outputs)
 // ---------------------------------------------------------------------------
 
@@ -509,14 +668,18 @@ pub fn tracking_sample(body: &BodyState, law: u8) -> (f64, f64) {
 // read the same params off `mission.kdl` (the parity test's static path).
 
 /// Plant parameters: the initial attitude/rate offset, the sensor-noise sigma, the RNG seed
-/// (so a run is reproducible), and whether the reaction wheels boot disarmed.
+/// (so a run is reproducible), whether the reaction wheels boot disarmed, and the disturbance
+/// environment. The disturbance defaults are physically honest for a ~3 kg spacecraft at
+/// 400 km (secular torques ~1e-7 N·m — days to load a wheel); tests and demos crank them so
+/// momentum management is visible in seconds.
 #[derive(Serialize, Deserialize, Schema, Clone, Debug, PartialEq)]
 pub struct PlantParams {
     /// Initial attitude offset from the target, radians about the [1,1,1] axis.
     pub init_angle: f64,
     /// Initial body-rate magnitude, rad/s about [1,1,1].
     pub init_rate: f64,
-    /// 1-sigma sensor noise (rad/s for gyro, unitless for the normalized vectors).
+    /// 1-sigma sensor noise (rad/s for gyro, unitless for the normalized sun vector; the
+    /// magnetometer's Tesla-valued noise is [`MAG_SENSOR_SIGMA`]).
     pub meas_sigma: f64,
     /// RNG seed, so a run is reproducible.
     pub seed: u64,
@@ -524,6 +687,57 @@ pub struct PlantParams {
     /// no control torque is applied until the wheels are armed. Defaults to `false`.
     #[serde(default)]
     pub disarmed: bool,
+    /// Atmospheric density (kg/m³) — ~3e-12 at 400 km, solar-mean.
+    #[serde(default = "default_rho")]
+    pub rho: f64,
+    /// Drag coefficient.
+    #[serde(default = "default_cd")]
+    pub cd: f64,
+    /// Aerodynamic reference area (m²).
+    #[serde(default = "default_area")]
+    pub area_aero: f64,
+    /// Center-of-pressure offset from the center of mass, body frame (m) — the drag/SRP
+    /// torque arm.
+    #[serde(default = "default_cp_offset")]
+    pub cp_offset_b: [f64; 3],
+    /// Residual magnetic dipole, body frame (A·m²).
+    #[serde(default = "default_m_res")]
+    pub m_res_b: [f64; 3],
+    /// SRP reference area (m²).
+    #[serde(default = "default_area")]
+    pub area_srp: f64,
+    /// SRP reflectivity coefficient (1 absorbing … 2 mirror).
+    #[serde(default = "default_cr")]
+    pub cr: f64,
+    /// Per-axis magnetorquer dipole limit (A·m²).
+    #[serde(default = "default_mtq_max")]
+    pub mtq_max_dipole: f64,
+    /// Per-wheel stored-momentum preload (N·m·s) — gives the desat demos/tests something to
+    /// dump at boot. Defaults to zero.
+    #[serde(default)]
+    pub init_wheel_h: f64,
+}
+
+fn default_rho() -> f64 {
+    3e-12
+}
+fn default_cd() -> f64 {
+    2.2
+}
+fn default_area() -> f64 {
+    0.03
+}
+fn default_cp_offset() -> [f64; 3] {
+    [0.02, 0.0, 0.0]
+}
+fn default_m_res() -> [f64; 3] {
+    [0.002, 0.002, 0.002]
+}
+fn default_cr() -> f64 {
+    1.5
+}
+fn default_mtq_max() -> f64 {
+    MTQ_MAX_DIPOLE
 }
 
 /// Navigation-filter (MEKF) parameters.
@@ -533,12 +747,27 @@ pub struct NavParams {
     pub meas_sigma: f64,
 }
 
-/// Controller (Yang-LQR) parameters.
+/// Controller (Yang-LQR + magnetorquer laws) parameters.
 #[derive(Serialize, Deserialize, Schema, Clone, Debug, PartialEq)]
 pub struct CtrlParams {
     /// LQR attitude/rate state weight (q) and control weight (r).
     pub q_weight: f64,
     pub r_weight: f64,
+    /// Momentum-desaturation gain (1/s): at |B| ≈ 4e-5 T, 5e-4 gives a ~2000 s unloading time
+    /// constant — MTQ desat is honestly slow. Zero disables desat.
+    #[serde(default = "default_k_desat")]
+    pub k_desat: f64,
+    /// B-cross detumble gain (N·m·s/rad): 5e-5 saturates the 0.2 A·m² torquer near
+    /// |ω| ≈ 0.16 rad/s and damps with an unsaturated time constant of ~300 s.
+    #[serde(default = "default_k_detumble")]
+    pub k_detumble: f64,
+}
+
+fn default_k_desat() -> f64 {
+    5e-4
+}
+fn default_k_detumble() -> f64 {
+    5e-5
 }
 
 #[cfg(test)]
@@ -566,6 +795,136 @@ mod tests {
                 "WMM field magnitude at 400 km should be tens of µT, got {mag} T"
             );
         }
+    }
+
+    /// Driven at the full set point, the wheel pins **exactly** at `RW_MOMENTUM_MAX` (the
+    /// foldback lands on the limit rather than snapping torque to zero early), never exceeds
+    /// it, and an unloading command flows immediately from the pinned state.
+    #[test]
+    fn rw_saturation_clamps_at_limit_and_allows_unloading() {
+        let mut w = ReactionWheel::new(tensor![1.0, 0.0, 0.0], true);
+        // A constant −X body-torque command spins the wheel up along +X.
+        w.torque_set_point = tensor![-RW_TORQUE_MAX, 0.0, 0.0];
+        let mut pinned = 0;
+        for _ in 0..5000 {
+            w.update();
+            let s: f64 = w.ang_momentum.into_buf()[0];
+            assert!(s <= RW_MOMENTUM_MAX + 1e-12, "momentum exceeded the limit: {s}");
+            if s >= RW_MOMENTUM_MAX - 1e-12 {
+                pinned += 1;
+            }
+        }
+        assert!(pinned > 0, "wheel never reached the momentum limit");
+        let t: f64 = w.torque.into_buf()[0];
+        assert!(t.abs() < 1e-12, "pinned wheel still delivered torque: {t}");
+        // Reverse the command: unloading torque must flow on the very next step.
+        w.torque_set_point = tensor![RW_TORQUE_MAX, 0.0, 0.0];
+        w.update();
+        let t: f64 = w.torque.into_buf()[0];
+        assert!(t > 1e-3, "unloading torque did not flow from saturation: {t}");
+        let s: f64 = w.ang_momentum.into_buf()[0];
+        assert!(s < RW_MOMENTUM_MAX, "momentum did not unload");
+    }
+
+    /// With no motor command, bearing friction decays a preloaded wheel monotonically, stops
+    /// it without ever pushing it through zero into counter-rotation, and holds it frozen
+    /// inside the stiction deadband (regression for the unsigned-speed `signum` friction and
+    /// the phantom torque at rest).
+    #[test]
+    fn rw_friction_decays_signed_speed() {
+        let mut w = ReactionWheel::new(tensor![0.0, 1.0, 0.0], true).with_momentum(0.001);
+        let mut prev = w.speed;
+        assert!(prev > 0.0);
+        let mut frozen = 0;
+        for _ in 0..30_000 {
+            w.update();
+            assert!(w.speed <= prev + 1e-15, "friction sped the wheel up");
+            assert!(w.speed >= 0.0, "friction counter-rotated the wheel: {}", w.speed);
+            if w.speed == prev {
+                frozen += 1;
+            } else {
+                frozen = 0;
+            }
+            prev = w.speed;
+        }
+        assert!(frozen > 100, "wheel never froze");
+        assert!(prev < RW_STICTION_OMEGA, "froze outside the deadband: {prev}");
+    }
+
+    /// The disturbance model lands each source in its expected order-of-magnitude band at a
+    /// 400 km state with honest params — a units guard (ρ, Tesla, P_SRP, torque arms), like
+    /// the WMM band test above.
+    #[test]
+    fn disturbance_torques_sane_at_400km() {
+        let p = PlantParams {
+            init_angle: 0.0,
+            init_rate: 0.0,
+            meas_sigma: 0.0,
+            seed: 0,
+            disarmed: false,
+            rho: default_rho(),
+            cd: default_cd(),
+            area_aero: default_area(),
+            cp_offset_b: default_cp_offset(),
+            m_res_b: default_m_res(),
+            area_srp: default_area(),
+            cr: default_cr(),
+            mtq_max_dipole: default_mtq_max(),
+            init_wheel_h: 0.0,
+        };
+        let radius = EARTH_RADIUS + ALTITUDE;
+        let pos: V3 = tensor![radius, 0.0, 0.0];
+        let v_orbit = (MU / radius).sqrt();
+        let vel: V3 = tensor![0.0, v_orbit, 0.0];
+        // A generic attitude so nothing sits on a principal axis or parallel to the field.
+        let q = Quat::from_axis_angle(tensor![1.0, 1.0, 1.0], 0.5);
+        let epoch = mission_epoch();
+        let mut model = MagneticModel::default();
+        let mag = mag_field_eci(&mut model, epoch, &pos);
+        let d = disturbance_torques(&p, &q, &pos, &vel, &sun_dir_eci(epoch), &mag);
+
+        let mag_of = |v: &V3| -> f64 { v.norm().into_buf() };
+        let gg = mag_of(&d.gg_b);
+        assert!((1e-10..1e-6).contains(&gg), "gravity-gradient torque out of band: {gg}");
+        let aero = mag_of(&d.aero_b);
+        assert!((1e-9..1e-5).contains(&aero), "aero torque out of band: {aero}");
+        let res = mag_of(&d.mag_b);
+        assert!((1e-10..1e-5).contains(&res), "residual-dipole torque out of band: {res}");
+        let srp = mag_of(&d.srp_b);
+        assert!((1e-11..1e-7).contains(&srp), "SRP torque out of band: {srp}");
+        // Drag opposes the velocity.
+        let drag_along_v: f64 = d.aero_force_eci.dot(&vel).into_buf();
+        assert!(drag_along_v < 0.0, "drag force does not oppose velocity");
+        let sum = d.gg_b + d.aero_b + d.mag_b + d.srp_b;
+        assert!(mag_of(&(d.total_b() - sum)) == 0.0);
+    }
+
+    /// Both magnetorquer laws produce a torque `m × B` that opposes their regulated quantity
+    /// (stored momentum / body rate) for generic geometry, do nothing useful for the
+    /// unreachable field-parallel component, and guard a degenerate field.
+    #[test]
+    fn dipole_laws_oppose_momentum_and_rate() {
+        let b: V3 = tensor![2e-5, -1e-5, 3e-5];
+        for x in [
+            tensor![0.01, 0.02, -0.005] as V3,
+            tensor![-1.0, 0.5, 0.25] as V3,
+            tensor![0.0, 3e-2, 0.0] as V3,
+        ] {
+            let tau = desat_dipole(0.1, &x, &b).cross(&b);
+            let along: f64 = tau.dot(&x).into_buf();
+            assert!(along < 0.0, "desat torque does not oppose momentum: {along}");
+            let tau = detumble_dipole(0.1, &x, &b).cross(&b);
+            let along: f64 = tau.dot(&x).into_buf();
+            assert!(along < 0.0, "detumble torque does not oppose rate: {along}");
+        }
+        // Field-parallel input: the cross law has no authority there.
+        let parallel = b * 2.0e3;
+        let tau = desat_dipole(0.1, &parallel, &b).cross(&b);
+        let t: f64 = tau.norm().into_buf();
+        assert!(t < 1e-12, "cross law claimed authority along B: {t}");
+        // Degenerate field guard.
+        let zero: f64 = desat_dipole(0.1, &parallel, &V3::zeros()).norm().into_buf();
+        assert_eq!(zero, 0.0);
     }
 
     /// `ecef_to_geodetic` recovers the altitude of a known orbit radius (on the equator, the

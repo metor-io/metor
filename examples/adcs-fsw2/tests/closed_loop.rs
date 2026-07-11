@@ -67,8 +67,11 @@ fn build_static() -> Coordinator {
     let mut wiring = parse(MISSION_KDL).expect("parse mission.kdl");
     build_artifacts(&mut wiring, &BuildOptions::default()).expect("build the cdylib artifacts");
     for spec in &mut wiring.systems {
-        // plant/nav/ctrl: link statically via the Registry rather than dlopen.
+        // plant/nav/ctrl: link statically via the Registry rather than dlopen. Process
+        // isolation needs an artifact to spawn, so it drops with it — in-proc static systems
+        // are the parity reference.
         spec.artifact = None;
+        spec.process = false;
     }
     let mut registry = Registry::with_builtins();
     register_system!(&mut registry, PlantSystem => "Plant");

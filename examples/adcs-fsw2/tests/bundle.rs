@@ -23,8 +23,12 @@ fn temp_bundle_dir() -> PathBuf {
 
 #[test]
 fn bundle_round_trips_and_runs() {
-    // 1. Parse + build the mission (the cdylibs land in cargo's target dir).
+    // 1. Parse + build the mission (the cdylibs land in cargo's target dir). Test binaries
+    //    can't host a `process=#true` worker (no `worker_entry` in main) — run in-process.
     let mut wiring = parse(MISSION_KDL).expect("parse mission.kdl");
+    for spec in &mut wiring.systems {
+        spec.process = false;
+    }
     if let Err(e) = build_artifacts(&mut wiring, &BuildOptions::default()) {
         // Build plumbing unavailable — skip (closed_loop covers the dlopen path directly).
         eprintln!("skipping: build_artifacts failed: {e}");
@@ -50,7 +54,12 @@ fn bundle_round_trips_and_runs() {
 
     // 3. Load the bundle back — cargo-free — and resolve it (dl systems + the
     //    built-in registry: the mission's `alarms` node is a framework static system).
-    let loaded = load_bundle(&dir).expect("load the bundle");
+    let mut loaded = load_bundle(&dir).expect("load the bundle");
+    // The bundle carries the manifest verbatim, so its `process=#true` comes back — clear it
+    // again for the in-process test resolve.
+    for spec in &mut loaded.systems {
+        spec.process = false;
+    }
     assert_eq!(loaded.artifacts.len(), wiring.artifacts.len());
     for artifact in &loaded.artifacts {
         assert!(

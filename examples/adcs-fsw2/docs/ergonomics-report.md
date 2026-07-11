@@ -184,6 +184,21 @@ Sharing one `ReactionWheel` struct as both the plant's internal state and its te
   --telemetry/--uplink` but no mission-specific flags, so the `--disarmed` parity is a
   `mission.kdl` property. Fine, but worth a generic "override any system param from the CLI"
   story (`--set plant.disarmed=#true`) for operability.
+- **Single-nested-field frames double their name in component paths** *(found in the
+  disturbances/desat pass)*. A frame `wheels` whose one field is `wheels: [ReactionWheel; 3]`
+  addresses as `plant.wheels.wheels.0.ang_momentum` — instance + frame name + field ident all
+  stack. Correct and unambiguous, but surprising when writing an alarm `target`; and since the
+  alarm engine only logs an `alarms_unresolved_target` health event on a miss, a wrong path
+  fails silently (`tests/momentum.rs` fires the alarm live as the guard).
+- **Vector-valued params work as KDL child nodes** *(same pass)*: an `[f64; 3]` params field
+  deserializes from `cp_offset_b 0.02 0.0 0.0` inside the system node's children. Worth
+  documenting as the blessed pattern next to the scalar line-property form.
+- **`#[serde(default)]` on params is static-path-only.** The dlopen encoder fills the `.so`'s
+  exported postcard schema from the KDL node and has no default information, so an omitted
+  field is a resolve error (`missing required param 'rho'`) even though the same field
+  defaults fine when a `Registry` deserializes the params for a statically-linked system.
+  Either the schema should carry defaults or the mismatch deserves a loud doc note; this
+  mission just spells every plant param out in `mission.kdl`.
 
 ---
 

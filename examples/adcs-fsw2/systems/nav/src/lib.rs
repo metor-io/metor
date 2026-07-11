@@ -72,8 +72,10 @@ impl NavSystem {
         let mag_eci = mag_field_eci(&mut self.mag_model, epoch, &gps_pos).normalize();
 
         self.state.omega = s.gyro_b;
+        // The magnetometer reads the physical field (Tesla); the MEKF's vector observation
+        // stays a unit vector, so normalize the measurement like the reference.
         self.state = self.state.clone().estimate_attitude(
-            [s.sun_b, s.mag_b],
+            [s.sun_b, s.mag_b.normalize()],
             [sun_eci, mag_eci],
             [self.sigma, self.sigma],
         );
