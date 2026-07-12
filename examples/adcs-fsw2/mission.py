@@ -5,23 +5,27 @@ systems, `mode` slot, and edges, resolving to an equivalent `Wiring`
 (`tests/equivalence.rs`). `mission.kdl` stays the committed default the CLI and
 the tracked tests read; this file is the second, evaluated front-end.
 
-    metor-fsw run examples/adcs-fsw2/mission.py --build            # headless sim
+Systems and occupants come from generated, `py.typed` pack modules
+(`metor-fsw stubgen`): importing `Plant`/`Nav`/`Ctrl` and
+`commissioning`/`safe_mode` gives pyright-checked params, ports, and frames,
+and each module's `ARTIFACT` is registered implicitly — no `m.artifact(...)`.
+Alarms and links stay on the `metor_config` builtins.
+
+    metor-fsw stubgen                                            # regenerate packs/
+    metor-fsw run examples/adcs-fsw2/mission.py --build          # headless sim
 """
 
 from metor_config import Alarm, Alarms, Mission, Target, TcpDownlink, TcpUplink, band
+from packs.adcs import Ctrl, Nav, Plant
+from packs.seqs import commissioning, safe_mode
 
 m = Mission(cycle_rate=120.0, sim_dt=1 / 120)
-
-# One pack per artifact: `adcs` entries are selected by attribute (adcs.Plant),
-# the `mode` slot's occupants by name off `seqs`.
-adcs = m.artifact("adcs", crate="adcs-systems", lib="adcs_systems")
-seqs = m.artifact("seqs", crate="adcs-sequences", lib="adcs_sequences")
 
 # The plant's disturbance/actuator environment is spelled out in full, physically
 # honest for a ~3 kg spacecraft at 400 km. `process=True` runs it in its own worker.
 plant = m.add(
     "plant",
-    adcs.Plant(
+    Plant(
         init_angle=0.5,
         init_rate=0.15,
         meas_sigma=0.002,
@@ -40,11 +44,8 @@ plant = m.add(
     ),
     process=True,
 )
-nav = m.add("nav", adcs.Nav(meas_sigma=0.02))
-ctrl = m.add(
-    "ctrl",
-    adcs.Ctrl(q_weight=5.0, r_weight=8.0, k_desat=0.0005, k_detumble=0.00005),
-)
+nav = m.add("nav", Nav(meas_sigma=0.02))
+ctrl = m.add("ctrl", Ctrl(q_weight=5.0, r_weight=8.0, k_desat=0.0005, k_detumble=0.00005))
 
 alarms = m.add(
     "alarms",
@@ -80,7 +81,7 @@ mode = m.slot(
     inputs=["attitude_estimate", "gps"],
     outputs=["mode_cmd"],
     allow=[
-        seqs.commissioning(
+        commissioning(
             rate_detumble_enter=1.0,
             rate_detumble_exit=0.8,
             est_delta_rad=0.001,
@@ -93,7 +94,7 @@ mode = m.slot(
             settle_timeout_s=60.0,
             confirm_timeout_s=30.0,
         ),
-        seqs.safe_mode(),
+        safe_mode(),
     ],
     initial="commissioning",
     initial_state="running",

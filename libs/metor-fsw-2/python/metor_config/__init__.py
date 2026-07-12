@@ -231,16 +231,22 @@ class PortRef:
 
 
 class SystemHandle:
-    """A registered system or slot; attribute access yields a :class:`PortRef`."""
+    """A registered system or slot. Attribute access yields a :class:`PortRef`
+    at runtime; the annotation is :data:`Any` because an untyped handle (a slot,
+    the coordinator, the programmatic escape hatch) has no per-port frame
+    types. A generated entry's handle is *typed* as its `System` subclass, so
+    its ports resolve against that class's annotations instead of here — that is
+    where frame checking lives."""
 
     def __init__(self, name: str):
         self.name = name
 
-    def port(self, name: str) -> PortRef:
-        """The explicit spelling of ``handle.<name>``, for generated code."""
+    def port(self, name: str) -> Any:
+        """The explicit, untyped spelling of ``handle.<name>``, for
+        programmatic generation."""
         return PortRef(self.name, name)
 
-    def __getattr__(self, name: str) -> PortRef:
+    def __getattr__(self, name: str) -> Any:
         if name.startswith("_"):
             raise AttributeError(name)
         return PortRef(self.name, name)
