@@ -160,6 +160,12 @@ impl SequenceState {
                 ch.last_message = Some(reason.clone().into());
                 format!("Failed: {reason}").into()
             }
+            SequenceEventKind::Refused { reason } => {
+                // A rejected command changed nothing; report why without
+                // disturbing the channel's actual run state.
+                ch.last_message = Some(reason.clone().into());
+                format!("Refused: {reason}").into()
+            }
         };
         let run_state = ch.run_state;
         self.push_event(SequenceLogEntry {

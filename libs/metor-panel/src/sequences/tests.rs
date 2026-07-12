@@ -97,6 +97,34 @@ fn lifecycle_folds_into_run_state() {
     );
 }
 
+/// A `Refused` event reports why a command changed nothing: it becomes the
+/// status line but never disturbs the channel's run state or loaded name.
+#[test]
+fn refused_reports_without_changing_run_state() {
+    let mut state = SequenceState::default();
+    state.apply_registry(ts(1), registry(&[("deploy", &["solar"])]));
+
+    state.apply_event(
+        ts(2),
+        event("deploy", SequenceEventKind::Loaded { name: "solar".into() }),
+    );
+    state.apply_event(ts(3), event("deploy", SequenceEventKind::Started));
+    state.apply_event(
+        ts(4),
+        event(
+            "deploy",
+            SequenceEventKind::Refused { reason: "load refused: running".into() },
+        ),
+    );
+    let ch = state.channel("deploy").unwrap();
+    assert_eq!(ch.run_state, SequenceRunState::Running);
+    assert_eq!(ch.loaded.as_ref().map(|s| s.as_ref()), Some("solar"));
+    assert_eq!(
+        ch.last_message.as_ref().map(|s| s.as_ref()),
+        Some("load refused: running")
+    );
+}
+
 #[test]
 fn loading_shows_the_incoming_occupant_until_loaded_resolves_it() {
     let mut state = SequenceState::default();

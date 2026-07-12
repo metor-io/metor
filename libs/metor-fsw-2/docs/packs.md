@@ -415,6 +415,13 @@ Occupant behavior per style:
 Everything above the occupant — the slot state machine, `Load`/`Start`/`Stop`/`Abort`/
 `Reset` commands, `SlotStatus` and the events channel — is unchanged from
 `docs/sequences-slots.md`; only the "occupants must be sequences" restriction is gone.
+Two later refinements (2026-07, `src/coordinator/slot.rs`): `Load` is legal from any
+state except a running or mid-load occupant — loading over `Loaded` swaps occupants in
+place, so an operator never needs a terminal state to change their mind — and every
+command the state machine rejects emits a `Refused` event naming the reason, so a dead
+click is diagnosable from the events channel instead of silent. The coordinator's #0
+bundle also consumes `ReloadSequences` (an ordinary edge input) and re-emits the boot
+`SequenceRegistry` on request, for consumers that connected after boot.
 
 ## 10. Process workers
 

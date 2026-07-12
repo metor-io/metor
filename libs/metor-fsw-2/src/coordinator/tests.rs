@@ -1739,8 +1739,8 @@ mod proc_slot {
 
     /// Load walks Empty → Loading (wire phase 5, worker `Restarting`) →
     /// Loaded, with the `Loading` event emitted at the spawn and the
-    /// `Loaded` event deferred to the bind — and the existing command
-    /// guards ignore `Start`/`Stop` mid-pipeline.
+    /// `Loaded` event deferred to the bind — and the command guards refuse
+    /// `Start`/`Stop` mid-pipeline with `Refused` events.
     #[test]
     fn load_pipeline_phases_events_and_guards() {
         let dir = tempfile::tempdir().unwrap();
@@ -1765,12 +1765,21 @@ mod proc_slot {
         assert_eq!(info.state, WorkerRunState::Restarting);
         assert_ne!(info.pid, 0, "the spawned worker is telemetered");
 
-        // Commands mid-pipeline fall through the existing guards.
+        // Commands mid-pipeline are refused (with events), never applied.
         h.send(SequenceCommandKind::Start);
         h.send(SequenceCommandKind::Stop);
         h.step();
         assert!(matches!(h.runner.state(), SlotState::Loading));
-        assert!(h.drain_events().is_empty());
+        assert!(
+            matches!(
+                h.drain_events().as_slice(),
+                [
+                    SequenceEventKind::Refused { reason: start },
+                    SequenceEventKind::Refused { reason: stop },
+                ] if start.contains("start refused") && stop.contains("stop refused")
+            ),
+            "mid-pipeline commands are refused loudly"
+        );
 
         let ctl = h.attach_ctl();
         ctl.report(WorkerState::Attached);

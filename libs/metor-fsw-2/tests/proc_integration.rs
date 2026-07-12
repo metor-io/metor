@@ -673,6 +673,7 @@ fn event_token(kind: &SequenceEventKind) -> String {
         SequenceEventKind::Completed => "completed".to_string(),
         SequenceEventKind::Failed { reason } => format!("failed:{reason}"),
         SequenceEventKind::Loading { name } => format!("loading:{name}"),
+        SequenceEventKind::Refused { reason } => format!("refused:{reason}"),
     }
 }
 

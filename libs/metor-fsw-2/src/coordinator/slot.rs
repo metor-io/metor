@@ -41,10 +41,13 @@
 //! [`SlotState`] tracks the phase, while the live occupant future is tracked
 //! separately in [`SlotRunner`]'s `slot` field. A `Stop` hard-drops the
 //! future and returns the state to Loaded with no future behind it, so
-//! `Start` is rejected until a `Reset` rebuilds the occupant. Every
+//! `Start` is rejected until a `Reset` rebuilds the occupant (or a `Load`
+//! replaces it — only a running or mid-load occupant blocks `Load`). Every
 //! lifecycle transition emits a [`SequenceChannelEvent`] on the slot's
 //! events channel, tagged with the slot's instance name; the runner is that
-//! ring's only writer. Events are emitted per transition rather than derived
+//! ring's only writer, and a command the state machine rejects emits a
+//! `Refused` event rather than being silently dropped, so operators never
+//! see a dead click. Events are emitted per transition rather than derived
 //! from the latest status frame, because two commands can apply in a single
 //! drain and a snapshot would lose the first.
 //!
@@ -489,16 +492,28 @@ impl SlotRunner {
         }
     }
 
-    /// Select an allowed occupant by name and build it. Legal from empty or a
-    /// terminal state only. A name outside the allowed set leaves the state
+    /// Select an allowed occupant by name and build it. Legal from any state
+    /// except a running or mid-load occupant, which must stop first —
+    /// loading over a `Loaded` slot drops the current occupant and builds
+    /// the named one. A name outside the allowed set leaves the state
     /// untouched and emits a `Failed` event naming the allowed set, so the
     /// operator sees the rejection instead of a silently stuck slot.
     fn do_load(&mut self, occupant: &str) {
-        if !matches!(
-            self.state,
-            SlotState::Empty | SlotState::Done { .. } | SlotState::Stopped { .. }
-        ) {
-            return; // a live or post-Stop Loaded slot is not re-Loadable
+        match self.state {
+            SlotState::Running => {
+                let reason = format!(
+                    "load `{occupant}` refused: an occupant is running; stop it first"
+                );
+                self.emit_event(SequenceEventKind::Refused { reason });
+                return;
+            }
+            SlotState::Loading => {
+                let reason =
+                    format!("load `{occupant}` refused: the previous load is still binding");
+                self.emit_event(SequenceEventKind::Refused { reason });
+                return;
+            }
+            _ => {}
         }
         let Some(idx) = self.allowed.iter().position(|a| a.name == occupant) else {
             let reason = format!(
@@ -512,7 +527,7 @@ impl SlotRunner {
             self.emit_event(SequenceEventKind::Failed { reason });
             return;
         };
-        // Drop any terminal occupant's state before reusing the rings (for a
+        // Drop any previous occupant's state before reusing the rings (for a
         // proc occupant, that drop kills and reclaims its worker first).
         self.slot = None;
         self.selected = Some(idx);
@@ -525,7 +540,14 @@ impl SlotRunner {
         if self.slot.is_some() && matches!(self.state, SlotState::Loaded) {
             self.state = SlotState::Running;
             self.emit_event(SequenceEventKind::Started);
+            return;
         }
+        let reason = if matches!(self.state, SlotState::Loaded) {
+            "start refused: the occupant was stopped; Reset rebuilds it".to_string()
+        } else {
+            format!("start refused: slot is {}", self.state.name())
+        };
+        self.emit_event(SequenceEventKind::Refused { reason });
     }
 
     /// Hard-drop the occupant (a dl occupant's `Drop` runs `fsw_destroy`,
@@ -537,6 +559,9 @@ impl SlotRunner {
             self.slot = None;
             self.state = SlotState::Loaded;
             self.emit_event(SequenceEventKind::Stopped);
+        } else {
+            let reason = format!("stop refused: slot is {}", self.state.name());
+            self.emit_event(SequenceEventKind::Refused { reason });
         }
     }
 
@@ -549,18 +574,25 @@ impl SlotRunner {
                 cancel: 1,
                 _pad: [0; 7],
             });
+        } else {
+            let reason = format!("abort refused: slot is {}", self.state.name());
+            self.emit_event(SequenceEventKind::Refused { reason });
         }
     }
 
     /// Rebuild the selected occupant from the beginning. Legal from a
-    /// terminal state or a post-Stop loaded slot; a running occupant must be
-    /// stopped first.
+    /// terminal state or a post-Stop loaded slot; a running or mid-load
+    /// occupant must be stopped first.
     fn do_reset(&mut self) {
         let Some(idx) = self.selected else {
+            let reason = "reset refused: nothing has been loaded".to_string();
+            self.emit_event(SequenceEventKind::Refused { reason });
             return;
         };
-        if matches!(self.state, SlotState::Running) {
-            return; // stop a running occupant before resetting it
+        if matches!(self.state, SlotState::Running | SlotState::Loading) {
+            let reason = format!("reset refused: slot is {}; stop it first", self.state.name());
+            self.emit_event(SequenceEventKind::Refused { reason });
+            return;
         }
         self.slot = None;
         self.last_run_state = 0;
