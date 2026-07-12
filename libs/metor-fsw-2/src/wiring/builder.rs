@@ -105,6 +105,7 @@ impl WiringBuilder {
             crate_name: crate_name.into(),
             cdylib: super::cdylib_file_name(lib_stem.as_ref()),
             path: None,
+            src: None,
         });
         self
     }
@@ -138,6 +139,7 @@ impl WiringBuilder {
             in_: in_.into(),
             delayed: false,
             kind: EdgeKind::Frame,
+            src: None,
         });
         self
     }
@@ -158,6 +160,7 @@ impl WiringBuilder {
             in_: in_.into(),
             delayed: true,
             kind: EdgeKind::Frame,
+            src: None,
         });
         self
     }
@@ -179,6 +182,7 @@ impl WiringBuilder {
             in_: msg,
             delayed: false,
             kind: EdgeKind::Msg,
+            src: None,
         });
         self
     }
@@ -216,6 +220,8 @@ impl WiringBuilder {
                 allow: Vec::new(),
                 initial: None,
                 process: false,
+                src: None,
+                scope: None,
             },
         }
     }
@@ -236,6 +242,7 @@ impl WiringBuilder {
             systems: self.systems,
             slots: self.slots,
             edges: self.edges,
+            scopes: Vec::new(),
         }
     }
 }
@@ -260,6 +267,7 @@ impl SlotSpecBuilder {
             occupant: occupant.into(),
             artifact: None,
             params: ParamSource::None,
+            src: None,
         });
         self
     }
@@ -274,6 +282,7 @@ impl SlotSpecBuilder {
             occupant: occupant.into(),
             artifact: Some(artifact.into()),
             params: ParamSource::None,
+            src: None,
         });
         self
     }
@@ -291,6 +300,7 @@ impl SlotSpecBuilder {
             occupant: occupant.into(),
             artifact: None,
             params: ParamSource::Postcard(bytes),
+            src: None,
         });
         self
     }
@@ -407,6 +417,8 @@ impl SystemSpecBuilder {
             artifact: self.artifact,
             params: self.params,
             process: self.process,
+            src: None,
+            scope: None,
         });
         self.parent
     }

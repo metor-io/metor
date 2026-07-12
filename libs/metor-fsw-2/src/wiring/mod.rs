@@ -83,10 +83,10 @@ pub use error::LoadError;
 pub use kdl_params::{encode_kdl_params, encode_kdl_params_with_defaults};
 pub use model::{
     AllowedOccupantSpec, Artifact, ClockSpec, CoordinatorSpec, EdgeKind, EdgeSpec, IR_VERSION,
-    InitialOccupantSpec, ParamSource, SlotInitState, SlotSpec, SystemSpec, TCP_DOWNLINK_TYPE,
-    TCP_UPLINK_TYPE, Wiring,
+    InitialOccupantSpec, ParamSource, ScopeSpec, SlotInitState, SlotSpec, SourceRef, SystemSpec,
+    TCP_DOWNLINK_TYPE, TCP_UPLINK_TYPE, Wiring,
 };
-pub use parse::{cdylib_file_name, parse};
+pub use parse::{cdylib_file_name, parse, parse_with_origin};
 
 // Re-exported so a system author only needs `metor_fsw_2::wiring`.
 pub use crate::register_system;
@@ -407,6 +407,7 @@ pub fn resolve(wiring: &Wiring, registry: &Registry) -> Result<Coordinator, Load
             expected: IR_VERSION,
         });
     }
+    check_scope_refs(wiring)?;
     let config = coordinator_config(&wiring.coordinator);
     let mut builder = Coordinator::builder(config);
 
@@ -855,18 +856,58 @@ fn resolve_proc(
     })
 }
 
+/// Range-check every scope index in the wiring — the specs' `scope` fields
+/// and the table's own `parent` links. The table is front-end metadata, so a
+/// bad index is a front-end bug, caught before any system is built.
+fn check_scope_refs(wiring: &Wiring) -> Result<(), LoadError> {
+    let len = wiring.scopes.len();
+    let check = |owner: String, index: Option<usize>| match index {
+        Some(index) if index >= len => Err(LoadError::BadScopeRef { owner, index, len }),
+        _ => Ok(()),
+    };
+    for scope in &wiring.scopes {
+        check(format!("scope `{}`", scope.path), scope.parent)?;
+    }
+    for spec in &wiring.systems {
+        check(format!("system `{}`", spec.name), spec.scope)?;
+    }
+    for slot in &wiring.slots {
+        check(format!("slot `{}`", slot.name), slot.scope)?;
+    }
+    Ok(())
+}
+
+/// The ` @ file:line:col` suffix locating a spec in its source document, or
+/// nothing for a spec with no recorded [`SourceRef`] (the Rust builder).
+fn src_anchor(src: Option<&SourceRef>) -> String {
+    match src {
+        Some(SourceRef {
+            file: Some(file),
+            line,
+            col,
+        }) => format!("  @ {file}:{line}:{col}"),
+        Some(SourceRef {
+            file: None,
+            line,
+            col,
+        }) => format!("  @ {line}:{col}"),
+        None => String::new(),
+    }
+}
+
 /// A best-effort source snippet for a system's resolve-time errors (a
-/// [`Wiring`] carries no original document text).
+/// [`Wiring`] carries no original document text, only [`SourceRef`] anchors).
 fn system_src(spec: &SystemSpec) -> String {
+    let anchor = src_anchor(spec.src.as_ref());
     match &spec.ty {
-        Some(ty) => format!("system \"{}\" type=\"{}\"", spec.name, ty),
-        None => format!("system \"{}\"", spec.name),
+        Some(ty) => format!("system \"{}\" type=\"{}\"{anchor}", spec.name, ty),
+        None => format!("system \"{}\"{anchor}", spec.name),
     }
 }
 
 /// A best-effort source snippet for a slot's resolve-time errors.
 fn slot_src(slot: &SlotSpec) -> String {
-    format!("slot \"{}\"", slot.name)
+    format!("slot \"{}\"{}", slot.name, src_anchor(slot.src.as_ref()))
 }
 
 /// Resolve a [`SlotSpec`] into a registered slot.
@@ -1206,8 +1247,12 @@ fn describe_occupants(
 fn edge_src(edge: &EdgeSpec) -> String {
     let arrow = if edge.delayed { "~>" } else { "->" };
     format!(
-        "connect \"{}\" {arrow} \"{}\" out=\"{}\" in=\"{}\"",
-        edge.from, edge.to, edge.out, edge.in_
+        "connect \"{}\" {arrow} \"{}\" out=\"{}\" in=\"{}\"{}",
+        edge.from,
+        edge.to,
+        edge.out,
+        edge.in_,
+        src_anchor(edge.src.as_ref())
     )
 }
 

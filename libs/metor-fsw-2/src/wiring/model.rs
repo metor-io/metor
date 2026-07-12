@@ -47,6 +47,39 @@ pub struct Wiring {
     pub slots: Vec<SlotSpec>,
     /// The producer-to-consumer edges.
     pub edges: Vec<EdgeSpec>,
+    /// The scope table that [`SystemSpec::scope`]/[`SlotSpec::scope`] index
+    /// into. Consumer metadata only: instance names stay flat and
+    /// collision-checked regardless. The KDL front-end leaves it empty.
+    #[serde(default)]
+    pub scopes: Vec<ScopeSpec>,
+}
+
+/// Where a spec came from in the document that declared it: an optional file
+/// name and a 1-based line and column, matching miette's rendering. One
+/// anchor for now; a stack of caller frames can be added later without
+/// breaking this shape.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct SourceRef {
+    /// The source file, when the front-end knows it
+    /// ([`parse_with_origin`](super::parse_with_origin)).
+    pub file: Option<String>,
+    /// 1-based line of the declaring node.
+    pub line: u32,
+    /// 1-based column of the declaring node.
+    pub col: u32,
+}
+
+/// One entry in [`Wiring::scopes`]: a named grouping of systems and slots,
+/// nested through `parent`. Purely descriptive — consumers reconstruct the
+/// block tree from it without parsing instance names.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct ScopeSpec {
+    /// The scope's full dotted path.
+    pub path: String,
+    /// Index of the enclosing scope in [`Wiring::scopes`], `None` at the root.
+    pub parent: Option<usize>,
+    /// Where the scope was opened.
+    pub src: Option<SourceRef>,
 }
 
 /// Registry `type=` of the built-in TCP telemetry downlink, a
@@ -110,6 +143,9 @@ pub struct Artifact {
     /// [`build_artifacts`](super::build_artifacts). `None` until built or
     /// located.
     pub path: Option<PathBuf>,
+    /// Where this artifact was declared.
+    #[serde(default)]
+    pub src: Option<SourceRef>,
 }
 
 /// One system instance. With `artifact = None` the type is resolved in the
@@ -135,6 +171,13 @@ pub struct SystemSpec {
     /// deserializes unchanged.
     #[serde(default)]
     pub process: bool,
+    /// Where this system was declared.
+    #[serde(default)]
+    pub src: Option<SourceRef>,
+    /// Index of this system's scope in [`Wiring::scopes`], `None` when
+    /// unscoped (always, for the KDL front-end).
+    #[serde(default)]
+    pub scope: Option<usize>,
 }
 
 impl SystemSpec {
@@ -164,6 +207,8 @@ impl SystemSpec {
             artifact: None,
             params: ParamSource::Kdl(format!("system \"{name}\" type=\"{ty}\" addr=\"{addr}\"")),
             process: false,
+            src: None,
+            scope: None,
         }
     }
 }
@@ -231,6 +276,13 @@ pub struct SlotSpec {
     /// a document that omits the property deserializes unchanged.
     #[serde(default)]
     pub process: bool,
+    /// Where this slot was declared.
+    #[serde(default)]
+    pub src: Option<SourceRef>,
+    /// Index of this slot's scope in [`Wiring::scopes`], `None` when
+    /// unscoped (always, for the KDL front-end).
+    #[serde(default)]
+    pub scope: Option<usize>,
 }
 
 /// One allowed occupant of a [`SlotSpec`]: a pack entry named across the
@@ -248,6 +300,9 @@ pub struct AllowedOccupantSpec {
     pub artifact: Option<String>,
     /// Where this occupant's default params come from.
     pub params: ParamSource,
+    /// Where this `allow` was declared.
+    #[serde(default)]
+    pub src: Option<SourceRef>,
 }
 
 /// The occupant a [`SlotSpec`] applies at startup: which allowed occupant, and
@@ -302,4 +357,7 @@ pub struct EdgeSpec {
     /// a frame edge.
     #[serde(default)]
     pub kind: EdgeKind,
+    /// Where this edge was declared.
+    #[serde(default)]
+    pub src: Option<SourceRef>,
 }

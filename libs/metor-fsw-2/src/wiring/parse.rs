@@ -13,6 +13,11 @@
 //! typed `Params`; a dynamically loaded system encodes it against the schema
 //! exported by its artifact. A node with no config carries
 //! [`ParamSource::None`].
+//!
+//! Each spec also records a [`SourceRef`] anchor — the declaring node's
+//! 1-based line and column, plus the document's file name when
+//! [`parse_with_origin`] is given one — so a resolve-time error can point
+//! back into the document even after the `Wiring` leaves this module.
 
 use std::collections::HashSet;
 
@@ -20,8 +25,8 @@ use kdl::{KdlDocument, KdlNode};
 
 use super::model::{
     AllowedOccupantSpec, Artifact, ClockSpec, CoordinatorSpec, EdgeKind, EdgeSpec, IR_VERSION,
-    InitialOccupantSpec, SlotInitState, SlotSpec, SystemSpec, TCP_DOWNLINK_TYPE, TCP_UPLINK_TYPE,
-    Wiring,
+    InitialOccupantSpec, SlotInitState, SlotSpec, SourceRef, SystemSpec, TCP_DOWNLINK_TYPE,
+    TCP_UPLINK_TYPE, Wiring,
 };
 use super::{ALLOW_RESERVED, LoadError, ParamSource, SYSTEM_RESERVED, de};
 
@@ -31,6 +36,12 @@ use super::{ALLOW_RESERVED, LoadError, ParamSource, SYSTEM_RESERVED, de};
 /// and `connect` nodes. Exactly one `coordinator` is required, and an unknown
 /// node name is a spanned error rather than a silent skip.
 pub fn parse(kdl: &str) -> Result<Wiring, LoadError> {
+    parse_with_origin(kdl, None)
+}
+
+/// [`parse`], recording `origin` (the document's file name) in every spec's
+/// [`SourceRef`] anchor.
+pub fn parse_with_origin(kdl: &str, origin: Option<&str>) -> Result<Wiring, LoadError> {
     let doc = kdl
         .parse::<KdlDocument>()
         .map_err(|source| LoadError::Parse {
@@ -58,10 +69,10 @@ pub fn parse(kdl: &str) -> Result<Wiring, LoadError> {
                 }
                 coordinator = Some(parse_coordinator(node, kdl)?);
             }
-            "artifact" => artifacts.push(parse_artifact(node, kdl)?),
-            "system" => systems.push(parse_system(node, kdl, &mut seen)?),
-            "slot" => slots.push(parse_slot(node, kdl, &mut seen)?),
-            "connect" => edges.push(parse_edge(node, kdl)?),
+            "artifact" => artifacts.push(parse_artifact(node, kdl, origin)?),
+            "system" => systems.push(parse_system(node, kdl, origin, &mut seen)?),
+            "slot" => slots.push(parse_slot(node, kdl, origin, &mut seen)?),
+            "connect" => edges.push(parse_edge(node, kdl, origin)?),
             // `telemetry` and `uplink` were dedicated nodes before the links
             // became ordinary registry systems. A document that still uses
             // them gets a guidance error naming the `system` spelling that
@@ -103,6 +114,7 @@ pub fn parse(kdl: &str) -> Result<Wiring, LoadError> {
         systems,
         slots,
         edges,
+        scopes: Vec::new(),
     })
 }
 
@@ -140,10 +152,31 @@ pub fn cdylib_file_name(stem: &str) -> String {
     }
 }
 
+/// The 1-based line and column of byte `offset` in `src`, matching miette's
+/// rendering of a span at that offset.
+fn line_col(src: &str, offset: usize) -> (u32, u32) {
+    let upto = &src[..offset.min(src.len())];
+    let line_start = upto.rfind('\n').map_or(0, |i| i + 1);
+    let line = upto.matches('\n').count() as u32 + 1;
+    let col = (offset - line_start) as u32 + 1;
+    (line, col)
+}
+
+/// The [`SourceRef`] anchor of a node: its line/column in `src` plus the
+/// document's file name when known.
+fn src_ref(src: &str, origin: Option<&str>, node: &KdlNode) -> Option<SourceRef> {
+    let (line, col) = line_col(src, node.span().offset());
+    Some(SourceRef {
+        file: origin.map(str::to_string),
+        line,
+        col,
+    })
+}
+
 /// Parse an `artifact "id" crate="..." lib="..."` node into an [`Artifact`].
 /// `lib=` is the bare library stem; the platform file name comes from
 /// [`cdylib_file_name`].
-fn parse_artifact(node: &KdlNode, src: &str) -> Result<Artifact, LoadError> {
+fn parse_artifact(node: &KdlNode, src: &str, origin: Option<&str>) -> Result<Artifact, LoadError> {
     let missing = |property: &'static str| LoadError::MissingArtifactField {
         property,
         src: src.to_string(),
@@ -166,6 +199,7 @@ fn parse_artifact(node: &KdlNode, src: &str) -> Result<Artifact, LoadError> {
         crate_name: crate_name.to_string(),
         cdylib: cdylib_file_name(stem),
         path: None,
+        src: src_ref(src, origin, node),
     })
 }
 
@@ -178,6 +212,7 @@ fn parse_artifact(node: &KdlNode, src: &str) -> Result<Artifact, LoadError> {
 fn parse_system(
     node: &KdlNode,
     src: &str,
+    origin: Option<&str>,
     seen: &mut HashSet<String>,
 ) -> Result<SystemSpec, LoadError> {
     let name = first_arg_string(node).ok_or_else(|| LoadError::MissingInstanceName {
@@ -240,6 +275,8 @@ fn parse_system(
         artifact,
         params,
         process,
+        src: src_ref(src, origin, node),
+        scope: None,
     })
 }
 
@@ -259,6 +296,7 @@ fn parse_system(
 fn parse_slot(
     node: &KdlNode,
     src: &str,
+    origin: Option<&str>,
     seen: &mut HashSet<String>,
 ) -> Result<SlotSpec, LoadError> {
     let name = first_arg_string(node).ok_or_else(|| LoadError::MissingInstanceName {
@@ -328,6 +366,7 @@ fn parse_slot(
                         occupant: occupant.to_string(),
                         artifact: prop_string(child, "artifact").map(str::to_string),
                         params,
+                        src: src_ref(src, origin, child),
                     });
                 }
                 "initial" => {
@@ -376,6 +415,8 @@ fn parse_slot(
         allow,
         initial,
         process,
+        src: src_ref(src, origin, node),
+        scope: None,
     })
 }
 
@@ -410,7 +451,7 @@ fn parse_coordinator(node: &KdlNode, src: &str) -> Result<CoordinatorSpec, LoadE
 /// exactly one of `frame=` (a component frame, same name on both ends) or
 /// `msg=` (a message type). The explicit `from=.. out=.. to=.. in=..` form is
 /// for frame edges whose port names differ.
-fn parse_edge(node: &KdlNode, src: &str) -> Result<EdgeSpec, LoadError> {
+fn parse_edge(node: &KdlNode, src: &str, origin: Option<&str>) -> Result<EdgeSpec, LoadError> {
     let span = node.span();
     let missing = |property: &str| LoadError::MissingEdgeField {
         property: property.to_string(),
@@ -434,6 +475,7 @@ fn parse_edge(node: &KdlNode, src: &str) -> Result<EdgeSpec, LoadError> {
             in_: in_.to_string(),
             delayed,
             kind: EdgeKind::Frame,
+            src: src_ref(src, origin, node),
         });
     }
 
@@ -463,6 +505,7 @@ fn parse_edge(node: &KdlNode, src: &str) -> Result<EdgeSpec, LoadError> {
         in_: port_name.to_string(),
         delayed,
         kind,
+        src: src_ref(src, origin, node),
     })
 }
 
