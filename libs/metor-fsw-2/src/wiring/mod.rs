@@ -87,7 +87,10 @@ pub(crate) use crate::ir as model;
 
 pub use build_driver::{BuildError, BuildOptions, build_artifacts, build_target};
 pub use builder::{SlotSpecBuilder, SystemSpecBuilder, WiringBuilder};
-pub use bundle::{BundleError, BundleMeta, PackageOptions, load_bundle, write_bundle};
+pub use bundle::{
+    BundleError, BundleMeta, METOR_EXTENSION, PackageOptions, WIRING_FILE_NAME, load_bundle,
+    unpack_metor, write_bundle,
+};
 pub use error::LoadError;
 pub use kdl_params::{encode_kdl_params, encode_kdl_params_with_defaults, encode_value_params};
 pub use model::{
