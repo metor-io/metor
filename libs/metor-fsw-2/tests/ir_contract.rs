@@ -41,6 +41,7 @@ fn maximal() -> Wiring {
             crate_name: "adcs-systems".into(),
             cdylib: "libadcs_systems.dylib".into(),
             path: None,
+            manifest_hash: None,
             src: src(3),
         }],
         systems: vec![

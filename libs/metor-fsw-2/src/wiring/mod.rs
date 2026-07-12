@@ -79,6 +79,7 @@ mod error;
 mod kdl_params;
 mod parse;
 mod py;
+mod stubgen;
 
 // The pure-data IR lives at the crate root (feature `wiring-model`) so it does
 // not require the KDL parser; the submodules here reach it as `super::model`.
@@ -96,6 +97,7 @@ pub use model::{
 };
 pub use parse::{cdylib_file_name, parse, parse_with_origin};
 pub use py::{eval_python_mission, is_python_mission};
+pub use stubgen::{StubgenError, StubgenOptions, StubgenReport, stubgen};
 
 // Re-exported so a system author only needs `metor_fsw_2::wiring`.
 pub use crate::register_system;
@@ -583,6 +585,7 @@ pub fn resolve(wiring: &Wiring, registry: &Registry) -> Result<Coordinator, Load
         });
     }
     check_scope_refs(wiring)?;
+    check_manifest_hashes(wiring)?;
     let config = coordinator_config(&wiring.coordinator);
     let mut builder = Coordinator::builder(config);
 
@@ -1173,6 +1176,40 @@ fn check_scope_refs(wiring: &Wiring) -> Result<(), LoadError> {
     }
     for slot in &wiring.slots {
         check(format!("slot `{}`", slot.name), slot.scope)?;
+    }
+    Ok(())
+}
+
+/// Enforce generated-stub freshness: for each artifact whose stub module
+/// recorded a `manifest_hash`, compare it against the live pack manifest and
+/// fail with [`LoadError::StaleStubs`] on a mismatch. Artifacts with no
+/// recorded hash (KDL front-end, hand-written `pack()` handles) or no built
+/// path yet are skipped; the dlopen path still opens them.
+fn check_manifest_hashes(wiring: &Wiring) -> Result<(), LoadError> {
+    for artifact in &wiring.artifacts {
+        let Some(recorded) = artifact.manifest_hash.as_deref() else {
+            continue;
+        };
+        let Some(path) = artifact.path.as_deref() else {
+            continue;
+        };
+        // The live manifest is the sidecar the build driver wrote (no dlopen);
+        // absent that, describe the built object in process — resolve dlopens
+        // it momentarily anyway.
+        let bytes = match crate::dl::manifest_sidecar_bytes(path) {
+            Some(bytes) => bytes,
+            None => match crate::dl::describe_raw(path) {
+                Ok(bytes) => bytes,
+                // A describe failure is not a staleness verdict; let the
+                // dlopen path surface the real load error.
+                Err(_) => continue,
+            },
+        };
+        if stubgen::manifest_hash(&bytes) != recorded {
+            return Err(LoadError::StaleStubs {
+                artifact: artifact.id.clone(),
+            });
+        }
     }
     Ok(())
 }

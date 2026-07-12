@@ -199,6 +199,7 @@ fn parse_artifact(node: &KdlNode, src: &str, origin: Option<&str>) -> Result<Art
         crate_name: crate_name.to_string(),
         cdylib: cdylib_file_name(stem),
         path: None,
+        manifest_hash: None,
         src: src_ref(src, origin, node),
     })
 }

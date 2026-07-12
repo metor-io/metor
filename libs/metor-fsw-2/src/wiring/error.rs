@@ -272,6 +272,22 @@ pub enum LoadError {
         span: SourceSpan,
     },
 
+    /// The generated stub module for this artifact was produced against a
+    /// different pack manifest than the one now built — its params, ports, or
+    /// entries have changed. Fails before any dlopen, naming the one command
+    /// that fixes it. Only the Python front-end (whose `ARTIFACT` constant
+    /// carries the recorded hash) can trigger this; the KDL front-end records
+    /// no hash and skips the check.
+    #[error(
+        "generated stubs for artifact `{artifact}` are stale (the pack manifest changed since \
+         they were generated); regenerate with `metor-fsw stubgen`"
+    )]
+    #[diagnostic(code(fsw_wiring::stale_stubs))]
+    StaleStubs {
+        /// The artifact whose recorded and live manifest hashes disagree.
+        artifact: String,
+    },
+
     #[error("artifact `{artifact}` has no resolved path (run the build driver first)")]
     #[diagnostic(code(fsw_wiring::artifact_not_built))]
     ArtifactNotBuilt {
