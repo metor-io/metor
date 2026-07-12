@@ -3,6 +3,14 @@
 > **Status: implemented** (2026-07-08). Built as planned in
 > `docs/process-systems-plan.md` W1–W8; the two deltas from this document are
 > noted inline (§5 worker-exe override, §7 builder signature).
+>
+> **Pack update (2026-07-11, `docs/packs.md`):** the single-system dl ABI this rode on
+> became the pack ABI v5. The protocol here is unchanged, but the artifact surface moved:
+> a describe worker's output bytes are now the **pack manifest** (`PackManifestMsg`, every
+> entry's descriptor), `WorkerManifest::Run` carries the pack **entry name** the worker
+> resolves after its own `DlPack::open`, and the lifecycle symbols are the `fsw_pack_*`
+> family. The prose below keeps the pre-pack names where it narrates the design; §1, §4,
+> and §5 have been updated to the shipped spellings.
 
 Systems currently run in one process, statically linked or dlopen'd. This design adds a third
 mode: a system running in its **own OS process**, exchanging frames with the rest of the graph
@@ -24,8 +32,9 @@ The design leans on properties the tree already has:
 - The dl ABI (`src/abi`) already reduces a system to serialized bytes plus `(base, len, role)`
   ring handles, binds positionally in descriptor order, and runs every wake endpoint as `NoWake`
   because cyclic systems poll their inputs each step. None of that changes: the worker process
-  runs the **same** `DlSystem::open` / `fsw_create` / `fsw_bind_init` / `fsw_execute` lifecycle
-  against the same cdylib artifact, just with regions it `attach_mmap`ed itself.
+  runs the **same** `DlPack::open` / `fsw_pack_create` / `fsw_pack_bind_init` /
+  `fsw_pack_execute` lifecycle against the same cdylib artifact, just with regions it
+  `attach_mmap`ed itself.
 - Wiring, validation, ring sizing, params encoding, the registry, and telemetry are all
   descriptor-driven and never touch the system instance. The descriptor already crosses an
   untrusted boundary as postcard bytes (`SystemDescriptorMsg`), and `into_descriptor()`
@@ -113,11 +122,12 @@ CtlBlock {
 ```
 
 Lifecycle over `state` (each transition wakes the word): host spawns the worker at `build()`
-with `state = Booting`; the worker maps everything, dlopens, runs `fsw_create`, and reports
+with `state = Booting`; the worker maps everything, dlopens, runs `fsw_pack_create`, and reports
 `Attached`. `ProcSlot::init` (the coordinator's init barrier) requests `InitReq`; the worker runs
-`fsw_bind_init` (binding claims its ring roles and runs `System::init`) and reports `Ready`.
-Shutdown is `ShutdownReq` → worker runs `fsw_shutdown`/`fsw_destroy` (releasing its ring roles),
-reports `Done`, and exits. Any worker-side failure latches `Failed` plus a status code.
+`fsw_pack_bind_init` (binding claims its ring roles and runs the driver's init) and reports
+`Ready`. Shutdown is `ShutdownReq` → worker runs `fsw_pack_shutdown`/`fsw_pack_destroy`
+(releasing its ring roles), reports `Done`, and exits. Any worker-side failure latches `Failed`
+plus a status code.
 
 Stepping, in the cycle loop (`ProcSlot::step`, keeping registration-order semantics — downstream
 systems in the same cycle see this system's outputs):
@@ -125,8 +135,8 @@ systems in the same cycle see this system's outputs):
 - **Host:** store `now` (Release rides the doorbell), increment `doorbell`, `wake_one`; then
   `wait_timeout(ack, old, deadline)` until `ack == doorbell`.
 - **Worker loop:** `wait(doorbell, last)`; on wake re-check `state` (shutdown?) and `doorbell`;
-  if new, load `now`, run one `fsw_execute` through the existing `DlSlot`, store `status`, store
-  `ack = doorbell`, `wake_one(ack)`.
+  if new, load `now`, run one `fsw_pack_execute` through the existing `DlSlot`, store `status`,
+  store `ack = doorbell`, `wake_one(ack)`.
 
 A missed deadline does **not** stop the loop: the coordinator telemeters a
 `proc_step_timeout` error on its own health (the worker owns the system's health ring, so the
@@ -161,17 +171,23 @@ overrides the session root the same way.
 The worker has two modes, selected by the manifest:
 
 - **Describe** (at resolve): the manifest names the artifact and an output file. The worker
-  dlopens the artifact, runs `fsw_describe`, writes the postcard `SystemDescriptorMsg` bytes to
-  the output file, and exits. The host decodes through the existing
-  `SystemDescriptorMsg::into_descriptor()` path — the same untrusted-bytes handling
-  `DlSystem::open` applies, just fed from a file instead of a `ByteSink`. This is what keeps the
-  host free of foreign code: it never opens the artifact itself. A describe run is bounded by a
-  timeout, and its stderr is captured into the resolve diagnostic on failure.
+  dlopens the artifact, runs `fsw_pack_describe`, writes the raw postcard **pack manifest**
+  bytes (`PackManifestMsg` — one `SystemDescriptorMsg` per entry) to the output file, and
+  exits. The host decodes through the same `decode_pack_manifest` path the dl loader uses —
+  the same untrusted-bytes handling `DlPack::open` applies, just fed from a file instead of a
+  `ByteSink`. This is what keeps the host free of foreign code: it never opens the artifact
+  itself, and one describe run covers every entry the artifact exports. A describe run is
+  bounded by a timeout, and its stderr is captured into the resolve diagnostic on failure.
 - **Run** (at `build()`): the manifest carries the ABI version, instance name, artifact path,
-  canonical params bytes, the control-file path, and the input/output ring file paths **in
-  descriptor order** — the same positional contract `bind_dl` uses. The worker maps each ring
-  file (`attach_mmap`), turns its regions into `FswRing` handles, and drives an ordinary
-  `DlSlot`; the maps outlive the slot so the dl teardown-ordering contract holds unchanged.
+  the pack **entry name** (`WorkerManifest::Run.system`, resolved by the worker's own
+  `DlPack::open(...).system(name)`), canonical params bytes, the control-file path, and the
+  input/output ring file paths **in descriptor order** — the same positional contract the
+  in-process dl bind uses. The worker maps each ring file (`attach_mmap`), turns its regions
+  into `FswRing` handles, and drives an ordinary `DlSlot`; the maps outlive the slot so the
+  dl teardown-ordering contract holds unchanged.
+
+Because each run worker executes the crate's `pack()` in its own address space, process-mode
+entries share no pack state with each other or with the host (`docs/packs.md` §4).
 
 The two spawns dlopen the artifact twice, in two different (short-lived, then long-lived)
 processes; that is deliberate — resolve can fail for unrelated reasons, and coupling a live
@@ -227,10 +243,11 @@ system "imu" artifact="imu-driver" process=#true sample_hz=200.0
 `SystemSpec` gains `process: bool` (serde-default false, so existing documents are unchanged).
 `process=#true` without `artifact=` is a resolve error (a static-registry type has no loadable
 form the worker can reconstruct; a statically-linked worker mode is future work). Resolve runs a
-describe-mode worker (§5) instead of `DlSystem::open`, decodes the descriptor and params schema
-from its output, encodes params through the same schema-guided path as `resolve_dl`, and
-registers via a new `CoordinatorBuilder::add_proc_cyclic(name, descriptor, artifact_path,
-params)` — no `DlSystem` handle exists for a process system, and the `Params` schema stays in
+describe-mode worker (§5) instead of `DlPack::open`, decodes the pack manifest and selects the
+entry (the node's `type=`, or the sole export) for its descriptor and params schema, encodes
+params through the same schema-guided path as `resolve_dl`, and registers via
+`CoordinatorBuilder::add_proc_cyclic(name, descriptor, artifact_path, system, params)` — no
+`DlSystem` handle exists for a process system, and the `Params` schema stays in
 the resolver (its only consumer). A `Reg::Proc`
 registration flows through the uniform validate/size/allocate passes untouched and binds to a
 `ProcSlot` (host half) at `build()`. Process systems are cyclic-only, like dl systems.

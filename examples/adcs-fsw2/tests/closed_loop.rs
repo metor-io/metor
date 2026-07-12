@@ -2,12 +2,12 @@
 //! spacecraft to track its commanded pointing law — **through the dlopen path**, and
 //! matching the statically-linked path bit-for-bit.
 //!
-//! Both runs resolve the **same** `mission.kdl` (so the `mode` slot's `#[sequence]`
+//! Both runs resolve the **same** `mission.kdl` (so the `mode` slot's async-fn pack
 //! occupant — always a dlopen cdylib — commissions the spacecraft identically in both), and
 //! differ in exactly one thing: whether the `plant`/`nav`/`ctrl` systems are linked
 //! statically or `dlopen`'d.
 //!
-//! 1. **static** — `mission.kdl` resolved with `plant`/`nav`/`ctrl` linked as rlibs via a
+//! 1. **static** — `mission.kdl` resolved with `plant`/`nav`/`ctrl` linked as an rlib via a
 //!    [`Registry`] (their `artifact` refs nulled so `resolve` takes the static factory);
 //!    the `mode` slot's sequences stay dlopen.
 //! 2. **dlopen** — the SAME mission, every system `dlopen`'d
@@ -24,13 +24,10 @@ use std::cell::RefCell;
 use std::rc::Rc;
 
 use adcs_contracts::{BodyState, ModeCmd, tracking_sample};
-use adcs_ctrl::CtrlSystem;
-use adcs_nav::NavSystem;
-use adcs_plant::PlantSystem;
 use metor_fsw_2::metor_proto::types::ComponentId;
 use metor_fsw_2::wiring::Registry;
 use metor_fsw_2::wiring::{build_artifacts, parse, resolve};
-use metor_fsw_2::{BuildOptions, Coordinator, Input, register_system};
+use metor_fsw_2::{BuildOptions, Coordinator, Input};
 
 /// The mission wiring document — the same file the CLI runner and the other tests read.
 const MISSION_KDL: &str = include_str!("../mission.kdl");
@@ -63,6 +60,9 @@ struct Measure {
 /// then null the three systems' `artifact` refs so `resolve` instantiates them through the
 /// [`Registry`] factory instead of `dlopen`. The slot/sequences remain dlopen in both paths,
 /// so only the systems' linkage differs.
+///
+/// The registry gets the **same** `pack()` the cdylib exports — one registration serving
+/// the static, dlopen, and process loading modes is the pack surface's whole point.
 fn build_static() -> Coordinator {
     let mut wiring = parse(MISSION_KDL).expect("parse mission.kdl");
     build_artifacts(&mut wiring, &BuildOptions::default()).expect("build the cdylib artifacts");
@@ -74,9 +74,7 @@ fn build_static() -> Coordinator {
         spec.process = false;
     }
     let mut registry = Registry::with_builtins();
-    register_system!(&mut registry, PlantSystem => "Plant");
-    register_system!(&mut registry, NavSystem => "Nav");
-    register_system!(&mut registry, CtrlSystem => "Ctrl");
+    registry.register_pack(adcs_systems::pack());
     resolve(&wiring, &registry).expect("resolve the mission with static systems")
 }
 

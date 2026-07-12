@@ -1,5 +1,7 @@
 //! The `adcs-fsw2` **mission host** — a closed-loop spacecraft attitude-determination-and-
-//! control mission whose three systems run as `dlopen`'d `cdylib`s (dl-open.md §8).
+//! control mission whose systems ride two `dlopen`'d pack `cdylib`s (dl-open.md §8;
+//! docs/design-packs-authoring.md): `adcs-systems` (plant/nav/ctrl) and `adcs-sequences`
+//! (the `mode` slot's occupants).
 //!
 //! ```text
 //!   plant ──sensors──▶ nav ──attitude_estimate──▶ ctrl
@@ -18,7 +20,7 @@
 //! ```
 //!
 //! This crate links **none** of the system crates and **not** `adcs-contracts`: the runner
-//! describes the mission as a [`Wiring`], builds + `dlopen`s the three `.so`s, and resolves
+//! describes the mission as a [`Wiring`], builds + `dlopen`s the pack `.so`s, and resolves
 //! them schema-agnostically (dl-open.md §6.3). The only library surface left here is
 //! [`build_sim_coordinator`], which the convergence test ([`tests/closed_loop.rs`]) uses to
 //! get the dlopen'd sim coordinator and compare it against a statically-linked build.
@@ -31,7 +33,7 @@ use metor_fsw_2::{BuildOptions, Coordinator};
 /// check needs no on-disk path. This is the **same** file the CLI runner reads.
 const MISSION_KDL: &str = include_str!("../mission.kdl");
 
-/// Build the three system `cdylib`s (`cargo build -p adcs-{plant,nav,ctrl}`) and `dlopen` +
+/// Build the pack `cdylib`s (`cargo build -p adcs-systems -p adcs-sequences`) and `dlopen` +
 /// resolve them into a ready-to-run [`Coordinator`], using the mission's base config (the
 /// free-running simulated clock, no telemetry) — the headless/test configuration. The build
 /// driver only recompiles crates cargo considers stale, so re-runs are incremental.

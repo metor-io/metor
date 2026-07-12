@@ -1,5 +1,5 @@
 //! The slots/sequences end-to-end gate (WP10 Wave 7): the `adcs-fsw2` mission's `mode`
-//! **slot** runs a real `#[sequence]` occupant through the full `dlopen` path, alongside the
+//! **slot** runs a real async-fn pack occupant through the full `dlopen` path, alongside the
 //! untouched plant/nav/ctrl loop.
 //!
 //! Two scenarios, both built from the SAME `mission.kdl` the CLI runner consumes (parse →

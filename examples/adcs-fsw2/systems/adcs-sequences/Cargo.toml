@@ -1,0 +1,18 @@
+[package]
+name = "adcs-sequences"
+version.workspace = true
+edition.workspace = true
+repository.workspace = true
+publish = false
+description = "The commissioning and safe-mode sequences of the adcs-fsw2 mission, one pack in one cdylib slot occupant"
+
+# A loadable shared object only: both sequence occupants are `dlopen`'d into the `mode` slot
+# from this one pack (the `allow` lines select entries by name). Unlike adcs-systems there is
+# no static-parity rlib path (a sequence is never linked statically), so no `export` feature
+# — `export_pack!`'s bare form emits the `fsw_pack_*` exports unconditionally (except tests).
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+adcs-contracts = { path = "../../contracts" }
+metor-fsw-2 = { path = "../../../../libs/metor-fsw-2" }

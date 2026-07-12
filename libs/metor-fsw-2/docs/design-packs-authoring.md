@@ -1,9 +1,20 @@
 # Packs & functional authoring (`design-packs-authoring`)
 
-Status: **design** (2026-07-11). The approved authoring-ergonomics overhaul: multi-system
-crates (**packs**), an axum-style functional author surface as the primary style, and
-sequence/system **unification** behind one `Driver` seam, with dl ABI v5 carrying it all.
-Companion plan: `docs/design-packs-authoring-plan.md`. No code rides this doc.
+> **Status: LANDED** (2026-07-11, commits `d4ef52be`/`3fbd6721`/`d103958e` — WP2/WP3/WP4).
+> The final-state doc is `docs/packs.md`; this document is the design record. Deviations
+> from the prose below, noted per-WP in `docs/design-packs-authoring-plan.md`: the erased
+> `make` split into a two-phase `create -> Pending` (fail-fast params/state, bind later);
+> there is no separate sequence registrar (`Pack::task` subsumes it — the occupant tail is
+> purely a mount property); the occupant-mount bind order puts `SequenceStatus` **last**,
+> after the entry's health/log tail (§9.2's sketch had it before); `Drops::Shared` is an
+> `Arc<AtomicU64>`, not `Rc<Cell>`; `SeqClock` survives as a type alias for `CycleClock`;
+> `#[sequence]` is a passthrough shim slated for deletion; sync occupants get
+> stop-on-cancel → terminal `Aborted`; `PackLib` is shared behind `Rc`, not `Arc`.
+
+Status when written: **design** (2026-07-11). The approved authoring-ergonomics overhaul:
+multi-system crates (**packs**), an axum-style functional author surface as the primary
+style, and sequence/system **unification** behind one `Driver` seam, with dl ABI v5
+carrying it all. Companion plan: `docs/design-packs-authoring-plan.md`.
 
 ---
 

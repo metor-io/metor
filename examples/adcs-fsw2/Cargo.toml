@@ -16,14 +16,12 @@ metor-fsw-2.path = "../../libs/metor-fsw-2"
 anyhow = "1"
 
 [dev-dependencies]
-# The convergence test links the system crates as **rlibs** (default-features = false, so
-# their `fsw_*` C-ABI symbols are excluded and three system rlibs link cleanly into one test
-# binary) for the static-vs-dlopen parity comparison, and `adcs-contracts` to decode the
+# The convergence test links the systems pack as an **rlib** (default-features = false, so
+# its `fsw_pack_*` C-ABI symbols are excluded) and registers the same `pack()` the cdylib
+# exports for the static-vs-dlopen parity comparison, plus `adcs-contracts` to decode the
 # tapped `truth` output. The runtime/dlopen path stays decoupled (dl-open.md §8).
 adcs-contracts = { path = "contracts" }
-adcs-plant = { path = "systems/plant", default-features = false }
-adcs-nav = { path = "systems/nav", default-features = false }
-adcs-ctrl = { path = "systems/ctrl", default-features = false }
+adcs-systems = { path = "systems/adcs-systems", default-features = false }
 stellarator.path = "../../libs/stellarator"
 # The downlink message-emission regression test (`tests/sequences.rs`) decodes the slot's
 # `SequenceChannelEvent`/`SequenceRegistry` records off the message ring — the same

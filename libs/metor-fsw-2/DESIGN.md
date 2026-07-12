@@ -118,9 +118,51 @@ hatch. See `docs/frames.md`.
 
 ## Systems
 
-A system encapsulates one piece of functionality. Every system implements the shared
-`System` base trait (`src/system/mod.rs`), which carries the typed input/output bundle types,
-a wiring `NAME`, and the once-each `init`/`shutdown` lifecycle hooks:
+A system encapsulates one piece of functionality. There are three ways to author one, and
+they converge on one runtime seam — a crate's **pack** (`docs/packs.md`) registers any mix
+of them, and the same `pack()` serves every loading mode (statically linked, dlopen'd, or
+run in a worker process):
+
+- **Function style** — the primary surface: a state type plus free `init`/`execute` fns,
+  the execute fn's signature *being* the port set.
+- **Async style** — one `async fn` owning its ports by value, state in locals, suspended
+  at `cycle().await` / `wait(dur).await` points and polled once per cycle. A sequence is
+  this style returning an `Outcome`; a steady-state task simply loops.
+- **Struct style** — a type with a `#[system]`-annotated impl block (or hand-written trait
+  impls), for systems whose many ports and state read better as a struct.
+
+```rust
+struct NavState { mekf: mekf::State, sigma: f64 }
+fn nav_init(p: NavParams) -> NavState { /* ... */ }
+fn nav_execute(nav: &mut NavState, now: Timestamp,
+               sensors: &mut Input<Sensors>, estimate: &mut Output<AttitudeEstimate>) {
+    let Some(s) = sensors.latest() else { return };
+    // ...
+}
+
+async fn pump(mut cmds: MsgIn<GroundCmd>, mut tm: Output<Telemetry>) {
+    loop {
+        let now = cycle().await;
+        while let Some(cmd) = cmds.try_next() { /* ... */ }
+    }
+}
+
+pub fn pack() -> Pack {
+    Pack::new()
+        .system("nav", system(nav_execute).init(nav_init))   // fn style
+        .task("pump", pump)                                  // async style
+        .system_type::<CtrlSystem, _>("ctrl")                // struct style
+}
+```
+
+Because `pack()` runs once per load, entries can capture clones of a shared handle built
+inside it — the construction point two systems sharing an owned resource (a socket, a bus)
+never had. See `docs/packs.md` for the authoring surfaces and the pack model.
+
+Underneath, the struct style spells the framework's trait contract directly (the other two
+styles lower to the same descriptors and drivers). Every struct system implements the
+shared `System` base trait (`src/system/mod.rs`), which carries the typed input/output
+bundle types, a wiring `NAME`, and the once-each `init`/`shutdown` lifecycle hooks:
 
 ```rust
 pub trait System {
@@ -325,25 +367,44 @@ outside the coordinator's address space.
 
 dlopen across a stable Rust ABI is genuinely hard, which is exactly why the data path is built
 on shared-memory rings rather than passing Rust types across the boundary. Only **serialized
-bytes** (a postcard-encoded descriptor and params blob) and **`#[repr(C)]` handles** ever
-cross the C ABI — never a `Vec`, `Arc`, or `VTable` by value. A system `cdylib` exports a
-small, versioned `extern "C"` surface (`src/abi/mod.rs`): an ABI-version word the host checks
-for equality before anything else, a `fsw_describe` that hands back the system's serialized
-`SystemDescriptor` plus its `Params` schema, and the `fsw_create` / `fsw_bind_init` /
-`fsw_execute` / `fsw_shutdown` / `fsw_destroy` lifecycle. The `export_system!` macro emits all
-of it as a one-liner per export. Every `extern "C"` body wraps its work in `catch_unwind`, so
-no unwind ever crosses the boundary (which would be undefined behavior); a caught panic is
-mapped to a clean status and hard-stops just that slot.
+bytes** (a postcard-encoded manifest and params blob) and **`#[repr(C)]` handles** ever
+cross the C ABI — never a `Vec`, `Arc`, or `VTable` by value. A `cdylib` exports one
+**pack** — any number of systems — through a small, versioned `extern "C"` surface
+(`src/abi/mod.rs`, ABI v5): an ABI-version word the host checks for equality before
+anything else; `fsw_pack_open`, which runs the crate's `pack()` once; `fsw_pack_describe`,
+which hands back the pack manifest (every entry's serialized `SystemDescriptor` plus its
+`Params` schema); the per-instance `fsw_pack_create(index, mount)` / `fsw_pack_bind_init` /
+`fsw_pack_execute` / `fsw_pack_shutdown` / `fsw_pack_destroy` lifecycle; and `fsw_pack_close`,
+which drops the pack after every instance is destroyed. The `export_pack!` macro emits all
+of it, one invocation per crate. Every `extern "C"` body wraps its work in `catch_unwind`,
+so no unwind ever crosses the boundary (which would be undefined behavior); a caught panic
+is mapped to a clean status and hard-stops just that slot.
 
-On the host side, `DlSystem::open` (`src/dl.rs`) loads the `.so`, checks the ABI word, and
-reconstructs the `SystemDescriptor` — after which a dlopen'd system is wiring-validated, sized,
-and allocated exactly like a static one. At `build()` it becomes a `DlSlot` that the
-coordinator drives as just another cyclic slot, forwarding `init`/`step`/`shutdown` across the
-ABI and handing the `.so` raw ring-region handles to attach its ports to. dlopen'd systems are
-cyclic-only. Params declared in KDL are encoded against the `.so`'s exported `Params` schema
-(the host never links the `Params` type), producing the exact same postcard bytes the typed
-`WiringBuilder` produces — so the KDL and Rust front-ends are byte-equivalent. See
-`docs/dl-open.md`.
+On the host side, `DlPack::open` (`src/dl.rs`) loads the `.so`, checks the ABI word, opens
+the pack, and decodes the manifest; `DlPack::system(name)` selects one entry — after which
+a loaded system is wiring-validated, sized, and allocated exactly like a static one. At
+`build()` it becomes a `DlSlot` that the coordinator drives as just another cyclic slot,
+forwarding `init`/`step`/`shutdown` across the ABI and handing the `.so` raw ring-region
+handles to attach its ports to. Loaded entries run on the cyclic schedule and cannot hold
+host capabilities. Params declared in KDL are encoded against the entry's exported `Params`
+schema (the host never links the `Params` type), producing the exact same postcard bytes
+the typed `WiringBuilder` produces — so the KDL and Rust front-ends are byte-equivalent.
+See `docs/packs.md` (the pack model and ABI) and `docs/dl-open.md` (the erasure boundary
+and ring-attachment machinery underneath it).
+
+## Runtime slots and sequences
+
+A **slot** is a fixed position in the cyclic call chain whose occupant the operator
+`Load`s, `Start`s, `Stop`s, `Abort`s, and `Reset`s at runtime from a build-time-validated
+allowed set (`docs/sequences-slots.md`). Any pack entry can occupy a slot: the framework's
+occupant tail — the `SlotControlIn` cancel input and the `SequenceStatus` output — is a
+property of the **mount**, appended around the entry's own ports when it is loaded into a
+slot, not something an occupant declares (`docs/packs.md` §9). A sync occupant gets
+stop-on-cancel (a terminal `Aborted`); an async occupant observes `aborted()` between
+awaits and runs its own safing branch. **Sequences** — timed, one-shot command programs —
+are simply async entries (`Pack::task`) returning an `Outcome`; `wait(dur)` and
+`cycle().await` resolve against the coordinator clock with no waker machinery, so a
+sequence is deterministic under a simulated clock.
 
 ## Telemetry downlink
 
@@ -475,12 +536,12 @@ place rather than scattered through the prose:
   the single global cycle rate (a system can still self-pace by running async).
 - **Shared uplink+downlink connection.** The uplink and downlink each open their own connection.
   A connection is an owned OS resource the system/ring model cannot split into independent handles
-  the way it distributes ring views (`docs/messages.md` §4.5). The planned **in-process** answer is
-  pack-level shared state (`docs/design-packs-authoring.md` §2.3): systems registered by one
-  `pack()` capture clones of a handle built at pack construction, so one owned socket can serve
-  both directions. Cross-process sharing stays open — a `process=#true` worker runs its own
-  `pack()` in its own address space, so the "shared owned resource" abstraction is still needed
-  there.
+  the way it distributes ring views (`docs/messages.md` §4.5). The **in-process** answer now
+  exists: pack-level shared state (`docs/packs.md` §4) — systems registered by one `pack()`
+  capture clones of a handle built at pack construction, so one owned socket can serve both
+  directions (the shipped downlink/uplink built-ins have not yet been rebuilt on it).
+  Cross-process sharing stays open — a `process=#true` worker runs its own `pack()` in its
+  own address space, so the "shared owned resource" abstraction is still needed there.
 
 ## Document map
 
@@ -490,10 +551,16 @@ of each subsystem:
 - `docs/frames.md` — frames, components, dynamic `FrameList`/`FrameMap`, the trailer layout.
 - `docs/vtable-dynamic.md` — the VTable op-set extensions for frames and dynamic data.
 - `docs/system.md` — the system trait family, typed ports, and per-system health.
+- `docs/packs.md` — packs: many systems per crate, the three authoring styles
+  (`system(fn)`/`Pack::task`/`Pack::system_type`), pack-level shared state, the pack ABI
+  (v5), the loader, and the occupant mount.
 - `docs/ring-buffer.md` — the shared-memory ring buffer and its lossless backpressure semantics.
 - `docs/coordinator.md` — the builder, graph validation, scheduling, clocks, and lifecycle.
 - `docs/wiring.md` — the `Wiring` data model, the KDL front-end, and the Rust builder.
-- `docs/dl-open.md` — the `cdylib` C-ABI, the loader, and schema-guided params.
+- `docs/dl-open.md` — the erasure boundary under the dlopen path: rings as
+  position-independent shared state, `RawBinder`/`attach_raw`, telemetry across the
+  boundary, and schema-guided params (the single-system ABI it describes is superseded by
+  the pack ABI, `docs/packs.md`).
 - `docs/process-systems.md` — the third loading mode: a worker process driving that same
   cdylib over mmap rings and a shared-futex step doorbell, with dead-worker reclamation.
 - `docs/process-slots.md` — process-mode slots (`process=#true` on a `slot`): a runtime slot
@@ -501,10 +568,12 @@ of each subsystem:
   kill + reclaim, composing the slots and process-systems layers.
 - `docs/telemetry.md` — the registry (frames and messages, one keyspace) and the telemetry downlink.
 - `docs/cli-runner.md` — the `metor-fsw` CLI: loading a wiring, packaging a bundle, and running a mission.
-- `docs/sequences-slots.md` — runtime-loadable slots and the `#[sequence]` author surface.
+- `docs/sequences-slots.md` — runtime-loadable slots: the lifecycle state machine, the
+  command plane, and ring reuse across occupant swaps (occupants are now any pack entry,
+  authored per `docs/packs.md`; the `#[sequence]` surface it designed is retired).
 - `docs/messages.md` — the message channel (a second payload kind), the telemetry uplink/downlink of messages, and the `SequenceCommand` command plane.
 - `docs/message-wiring.md` — messages as first-class wired ports/edges (`MsgOut<M>`/`MsgIn<M>`, `msg=`/`connect_msg`), the `AllOutputs` receive-all capability, and the port-unification axes (schema × delivery × fan-in, plus the `PortConn` axis). The command-plane shape it originally designed is further reframed — see `docs/messages.md`'s status banner and `docs/design-command-slots.md` for what actually shipped (name-addressed commands, explicit per-slot edges, the uplink's multi-output `CommandOut` dispatch).
 - `docs/alarms.md` — the alarm engine: a shipped, ordinary system (`type="Alarms"`) evaluating KDL-declared limit alarms against any telemetered component and broadcasting the wkt alarm Msgs the panel consumes.
 - `docs/normalize-telemetry-uplink-plan.md` — how the telemetry downlink and command uplink became ordinary registry systems (`type="TcpDownlink"`/`type="TcpUplink"`), replacing the dedicated `telemetry`/`uplink` wiring surface.
-- `docs/design-packs-authoring.md` — packs (multi-system crates over one `Driver` seam and dl ABI v5), the functional author surface (`system(fn)`/`Pack::task`), pack-level shared state, and the sequence/system unification (occupant tail as a mount mode, `cycle().await`).
-- `docs/design-packs-authoring-plan.md` — the staged work packages (WP1–WP6) landing that design.
+- `docs/design-packs-authoring.md` — the design record behind `docs/packs.md`: packs (multi-system crates over one `Driver` seam and dl ABI v5), the functional author surface (`system(fn)`/`Pack::task`), pack-level shared state, and the sequence/system unification (occupant tail as a mount mode, `cycle().await`). Landed; `docs/packs.md` is the final-state doc.
+- `docs/design-packs-authoring-plan.md` — the staged work packages (WP1–WP6) that landed that design.

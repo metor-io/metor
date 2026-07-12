@@ -1,0 +1,30 @@
+[package]
+name = "adcs-systems"
+version.workspace = true
+edition.workspace = true
+repository.workspace = true
+publish = false
+description = "The plant, nav, and ctrl systems of the adcs-fsw2 mission, one pack in one dlopen'd cdylib"
+
+# A loadable shared object (the mission host `dlopen`s the produced `lib*.so`/`lib*.dylib`)
+# AND an rlib, so the convergence test can also register the same `pack()` statically for
+# the static-vs-dlopen parity comparison (dl-open.md §8). The `export` feature gates the
+# `export_pack!` C-ABI symbols so the rlib carries none (the test links it with
+# `default-features = false`); the build driver builds the cdylib with default features
+# (export on).
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[features]
+default = ["export"]
+# Emit the `fsw_pack_*` C-ABI surface (the dlopen entry points). On for the cdylib; off for
+# the rlib the test links statically.
+export = []
+
+[dependencies]
+adcs-contracts = { path = "../../contracts" }
+metor-fsw-2 = { path = "../../../../libs/metor-fsw-2" }
+metor-fsw-adcs = { workspace = true }
+nox = { workspace = true }
+rand = "0.9"
+rand_distr = "0.5"

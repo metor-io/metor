@@ -634,7 +634,7 @@ plumbing, and adds `MsgIn` + a `"commands"` channel — no ABI, no wire, no occu
 **no new ABI symbol** — it appears as one more `FswRing` (a byte ring, role OUTPUT) in the
 occupant's output array, bound by the existing `RawBinder` (`src/abi/mod.rs:359`) as an
 ordinary `MsgOut` (rings are backing-erased — the occupant's port type is the host's). The
-`#[sequence]` descriptor would gain one output port. §5.1 makes this
+occupant entry's descriptor would gain one output port. §5.1 makes this
 unnecessary for the stated feature.
 
 ---

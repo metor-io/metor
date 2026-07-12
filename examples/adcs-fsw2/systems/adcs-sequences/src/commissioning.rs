@@ -1,7 +1,5 @@
-//! The **commissioning** sequence of the `adcs-fsw2` mission: an async fn registered in
-//! this crate's [`pack`], built as a `dlopen`-loadable `cdylib`. It is the `mode` slot's
-//! initial occupant: a **condition-based** state machine the slot polls once per cycle, walking the
-//! ladder
+//! The **commissioning** sequence: the `mode` slot's initial occupant, a **condition-based**
+//! state machine the slot polls once per cycle, walking the ladder
 //!
 //! ```text
 //! estimator warm-up ──▶ [detumble]* ──▶ coarse pointing ──▶ fine pointing ──▶ Completed
@@ -36,7 +34,7 @@ fn secs_since(t0: Timestamp) -> f64 {
 }
 
 /// Walk the commissioning ladder, gated on the live estimate + GPS orbit state.
-async fn commissioning(
+pub(crate) async fn commissioning(
     mut att: Input<AttitudeEstimate>,
     mut gps: Input<Gps>,
     Params(params): Params<CommissioningParams>,
@@ -61,7 +59,6 @@ async fn commissioning(
             return Outcome::Failed;
         }
         let Some(e) = att.latest() else { continue };
-        let e = e.get();
         let q = e.q_hat_b_eci;
         rate = e.omega_b.norm().into_buf();
         if let Some(prev) = last_q {
@@ -94,7 +91,7 @@ async fn commissioning(
                 return Outcome::Failed;
             }
             let Some(e) = att.latest() else { continue };
-            let rate: f64 = e.get().omega_b.norm().into_buf();
+            let rate: f64 = e.omega_b.norm().into_buf();
             if rate < params.rate_detumble_exit {
                 break;
             }
@@ -164,16 +161,8 @@ async fn commissioning(
 /// `target_for(LAW_HIL, gps)`, the same law/guard ctrl steers by. `None` until both an
 /// estimate and a GPS fix have arrived.
 fn tracking_error(att: &mut Input<AttitudeEstimate>, gps: &mut Input<Gps>) -> Option<f64> {
-    let q_hat = att.latest()?.get().q_hat_b_eci;
+    let q_hat = att.latest()?.q_hat_b_eci;
     let g = gps.latest()?;
-    let g = g.get();
     let target = target_for(ModeCmd::LAW_HIL, &g.pos_eci, &g.vel_eci);
     Some(q_hat.angular_distance(&target).into_buf().abs())
 }
-
-/// This crate's pack: the commissioning sequence as its sole entry, under the name the
-/// mission's slot `allow`/`initial` lines select (`occupant="commissioning"`).
-pub fn pack() -> metor_fsw_2::Pack {
-    metor_fsw_2::Pack::new().task("commissioning", commissioning)
-}
-metor_fsw_2::export_pack!(pack);

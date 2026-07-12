@@ -1,5 +1,4 @@
-//! The **controller** of the `adcs-fsw2` mission, as a `dlopen`-loadable `cdylib`
-//! (dl-open.md §3, §8). It commands both actuators:
+//! The **controller** of the `adcs-fsw2` mission. It commands both actuators:
 //!
 //! - **Reaction wheels** ([`TorqueCmd`]): the Yang-LQR body torque toward the pointing-law
 //!   target the `mode` slot commands (`ModeCmd.law` — nadir or velocity-vector/HIL), computed
@@ -12,9 +11,10 @@
 //!
 //! Before any `ModeCmd` arrives it holds the identity reference.
 //!
-//! Authored with `#[system]` (`docs/design-system-macro.md`): the port set is the `execute`
-//! signature, and the bundles/trait impls/`BuildSystem` are all generated; the `fsw_pack_*`
-//! C-ABI surface is the [`export_pack!`](metor_fsw_2::export_pack) at the bottom.
+//! Deliberately `#[system]` struct-authored (docs/design-system-macro.md) while its
+//! packmates are fn-authored: the port set is the `execute` signature, the bundles/trait
+//! impls/`BuildSystem` are generated, and the crate's [`pack`](crate::pack) lowers it in
+//! via `system_type` — the example suite keeps both authoring styles exercised.
 
 use adcs_contracts::{
     AttitudeEstimate, CtrlParams, Gps, MTQ_MAX_DIPOLE, ModeCmd, MtqCmd, RW_TORQUE_MAX, Sensors,
@@ -59,20 +59,18 @@ impl CtrlSystem {
         let Some(e) = estimate.latest() else {
             return;
         };
-        let e = e.get();
         let q_hat_b_eci = e.q_hat_b_eci;
 
         // Latch the commanded pointing law (the slot may not have written one yet).
         if let Some(m) = mode.latest() {
-            self.law = Some(m.get().law);
+            self.law = Some(m.law);
         }
 
         // What the magnetorquer laws run on: the measured field (Tesla) and the telemetered
         // wheel momentum. Either not yet arrived ⇒ zero dipole.
-        let mag_b = sensors.latest().map(|s| s.get().mag_b);
+        let mag_b = sensors.latest().map(|s| s.mag_b);
         let h_w_b = wheels.latest().map(|w| {
-            w.get()
-                .wheels
+            w.wheels
                 .iter()
                 .fold(V3::zeros(), |acc, wheel| acc + wheel.ang_momentum)
         });
@@ -93,10 +91,7 @@ impl CtrlSystem {
         // Select the target attitude from the law + the current GPS orbit measurement; identity
         // until a law and a GPS fix are both available.
         let target = match (self.law, gps.latest()) {
-            (Some(law), Some(gps)) => {
-                let gps = gps.get();
-                target_for(law, &gps.pos_eci, &gps.vel_eci)
-            }
+            (Some(law), Some(gps)) => target_for(law, &gps.pos_eci, &gps.vel_eci),
             _ => Quaternion::identity(),
         };
 
@@ -123,10 +118,3 @@ impl CtrlSystem {
         mtq.publish(&MtqCmd { timestamp: now, dipole_b });
     }
 }
-
-/// This crate's pack: the controller as its sole entry, under the name the mission's
-/// `system` nodes select (`type="Ctrl"`).
-pub fn pack() -> metor_fsw_2::Pack {
-    metor_fsw_2::Pack::new().system_type::<CtrlSystem, _>("Ctrl")
-}
-metor_fsw_2::export_pack!(pack, feature = "export");

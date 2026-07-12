@@ -6,7 +6,7 @@
 //! `Params` struct per system (the config each constructor needs, crossing `fsw_create` as
 //! canonical postcard bytes — dl-open.md §6.3).
 //!
-//! It is shared **among the cdylibs** (`adcs-plant`/`adcs-nav`/`adcs-ctrl`) and linked by
+//! It is shared **among the cdylibs** (`adcs-systems`/`adcs-sequences`) and linked by
 //! the convergence test (to decode outputs and to register the systems statically), but it
 //! is **not** linked by the mission host at runtime: the host validates frames from the
 //! serialized `VTable`s and encodes params from the exported `Params` schema, never linking
@@ -61,7 +61,7 @@ pub fn inertia_diag() -> V3 {
 // The limits both sides agree on: the plant enforces them in its dynamics, and an FSW that
 // knows its actuators clamps what it commands to them. The dynamics themselves (bearing
 // friction, rotor inertia, the sensor/GPS error models, the disturbance environment) are
-// simulation math and live in `adcs-plant`.
+// simulation math and live in `adcs-systems`' plant module.
 
 /// Wheel momentum saturation limit (N·m·s) — at the limit the motor folds back to zero net
 /// torque; unloading torque always flows.
@@ -254,7 +254,7 @@ pub struct BodyState {
 /// spins the wheel *against* the commanded body torque (`ḣ = τ_motor + τ_friction`), and the
 /// torque delivered to the body is the reaction `−ḣ`. This crate carries only the wire shape
 /// and the constructors; the dynamics that fill it in (bearing friction, the saturation
-/// foldback) are `adcs-plant`'s `WheelDynamics`.
+/// foldback) are `adcs-systems`' `WheelDynamics`.
 #[derive(
     metor_fsw_2::AsVTable,
     metor_fsw_2::Metadatatize,
@@ -389,7 +389,7 @@ pub struct MtqCmd {
 
 /// The mission-mode command a slot sequence emits each transition (sequences-slots.md §4):
 /// the discrete ADCS phase plus the active **pointing law**. Produced by the `mode` slot's
-/// occupant (`adcs-commissioning` / `adcs-safe-mode`) and consumed by the controller, which
+/// occupant (`adcs-sequences`' `commissioning` / `safe_mode`) and consumed by the controller, which
 /// selects its target attitude from `law`. `_pad` keeps the `#[repr(C)]` layout padding-free
 /// (zerocopy `IntoBytes` requires it).
 #[derive(metor_fsw_2::Frame, IntoBytes, Immutable, KnownLayout, FromBytes, Clone)]

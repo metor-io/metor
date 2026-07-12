@@ -452,32 +452,37 @@ status frame back (name + reason code), for telemetry and test inspection.
 
 ### 3.6 dlopen'd systems
 
-A system compiled as a `cdylib` is loaded by `DlSystem` (`src/dl.rs`), which opens the `.so`,
-resolves its `fsw_*` symbols, checks the ABI version word, and `fsw_describe`s it into a
-`SystemDescriptor`. From the builder's view this is the twin of `add_cyclic_named`: `add_dl_cyclic`
-pushes that reconstructed descriptor, so the **same** `compatible()`/`WireError` validation, ring
-sizing, allocation, and registry entry run over it unchanged. dlopen'd systems are cyclic-only.
+A `cdylib` exports a **pack** of systems (`docs/packs.md`) and is loaded by `DlPack::open`
+(`src/dl.rs`), which opens the `.so`, checks the ABI version word, resolves the
+`fsw_pack_*` symbols, opens the pack, and decodes its manifest into per-entry
+`SystemDescriptor`s; `DlPack::system(name)` selects one entry as a `DlSystem`. From the
+builder's view this is the twin of `add_cyclic_named`: `add_dl_cyclic` pushes that
+reconstructed descriptor, so the **same** `compatible()`/`WireError` validation, ring
+sizing, allocation, and registry entry run over it unchanged. Loaded entries run on the
+cyclic schedule.
 
 The difference is at `bind`. Instead of typed `BoundPort`s walked by a `Binder`, the coordinator
 gathers the raw ring regions the dlopen path needs — each port's `(base, len)` and role, as
 `FswRing` handles in `descriptors()` order. Outputs are this system's own buffers; inputs are
 `region()`s of the upstream producers' output buffers (the cyclic-consumer path, read directly). It
-passes them, plus the postcard `params` blob, to `DlSystem::into_slot`, which `fsw_create`s the
-state and returns a `DlSlot`. The `.so` reconstructs each ring over the host's heap region
+passes them, plus the postcard `params` blob, to `DlSystem::make_slot`, which `fsw_pack_create`s
+the entry's state and returns a `DlSlot`. The `.so` reconstructs each ring over the host's heap region
 via `attach_raw` (same process, no copy, no IPC — it sees the identical atomics the host's other
 systems do), and its `CyclicSlot::step` forwards over the ABI, mapping `FswStatus::Panicked` to
 `SlotState::Stopped { reason: Panicked }`.
 
 A permanent stop destroys the foreign state **immediately**, not at teardown: on the stop
-transition the slot calls `fsw_destroy` at once, dropping the `.so`'s raw-attached ports and
+transition the slot calls `fsw_pack_destroy` at once, dropping the `.so`'s raw-attached ports and
 freeing its reader slots — on a lossless ring a dead consumer's pinned views would otherwise
 backpressure every upstream producer forever.
 
-Teardown ordering is load-bearing: a `DlSlot`'s `Drop` calls `fsw_destroy` (idempotent — a
-no-op if the stop already destroyed the state) before its `Arc<Library>` field unloads and
-before the host `RingTable` frees the regions. The coordinator drops its `cyclic` slot vec
+Teardown ordering is load-bearing: a `DlSlot`'s `Drop` calls `fsw_pack_destroy` (idempotent — a
+no-op if the stop already destroyed the state) before its shared `Rc<PackLib>` can release,
+whose own field order closes the pack (`fsw_pack_close`) before the `Library` unloads —
+all before the host `RingTable` frees the regions. The coordinator drops its `cyclic` slot vec
 before its `rings` field (struct field order), so no raw attach outlives its region and no
-`.so` code runs after its `Library` is gone. See `dl-open.md` for the full ABI.
+`.so` code runs after its `Library` is gone. See `docs/packs.md` §6 for the full ordering
+and `dl-open.md` for the machinery underneath.
 
 ### 3.7 Single-threaded execution
 

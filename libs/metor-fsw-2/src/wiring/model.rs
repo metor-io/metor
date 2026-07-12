@@ -27,7 +27,7 @@ use serde::{Deserialize, Serialize};
 pub struct Wiring {
     /// Coordinator-wide config (cycle rate, default ring depth, clock).
     pub coordinator: CoordinatorSpec,
-    /// The shared objects this mission loads, one system type per cdylib.
+    /// The shared objects this mission loads, one pack per cdylib.
     pub artifacts: Vec<Artifact>,
     /// The system instances, either static (resolved in the
     /// [`Registry`](super::Registry)) or loaded from an [`Artifact`].

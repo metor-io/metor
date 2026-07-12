@@ -7,17 +7,20 @@
 //!
 //! The manifest selects one of two modes:
 //!
-//! - **Describe**: dlopen the artifact, run `fsw_describe`, write the raw
-//!   postcard `SystemDescriptorMsg` bytes to the output file, exit. This is
-//!   what keeps the host free of foreign code — it decodes these bytes
-//!   instead of loading the object itself.
-//! - **Run**: attach the control block and every ring file, dlopen the
-//!   artifact, and drive an ordinary [`DlSlot`](crate::dl) through the
-//!   [`ctl`](super::ctl) lifecycle — `fsw_create` at attach, `fsw_bind_init`
-//!   on the init request, one `fsw_execute` per doorbell, and
-//!   `fsw_shutdown`/`fsw_destroy` on the shutdown request. A [`RunMode`] on
-//!   the manifest picks the step fold: `Cyclic` for a steady-state system,
-//!   `Sequence` for a process slot's occupant.
+//! - **Describe**: dlopen the artifact, run `fsw_pack_describe`, write the
+//!   raw postcard pack-manifest bytes to the output file, exit. This is what
+//!   keeps the host free of foreign code — it decodes these bytes instead of
+//!   loading the object itself, and one describe covers every entry the
+//!   artifact exports.
+//! - **Run**: attach the control block and every ring file, open the pack
+//!   ([`DlPack::open`](crate::dl::DlPack), which runs the crate's `pack()` in
+//!   this process), select the manifest's entry by name, and drive an
+//!   ordinary [`DlSlot`](crate::dl) through the [`ctl`](super::ctl)
+//!   lifecycle — `fsw_pack_create` at attach, `fsw_pack_bind_init` on the
+//!   init request, one `fsw_pack_execute` per doorbell, and
+//!   `fsw_pack_shutdown`/`fsw_pack_destroy` on the shutdown request. A
+//!   [`RunMode`] on the manifest picks the step fold: `Cyclic` for a
+//!   steady-state system, `Sequence` for a process slot's occupant.
 //!
 //! Everything downstream of the manifest reuses the dl machinery verbatim:
 //! the ring files attach as regions, regions become positional
@@ -42,11 +45,11 @@ pub const WORKER_ENV: &str = "METOR_FSW_WORKER";
 /// The launch manifest the host writes for each worker spawn.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum WorkerManifest {
-    /// Describe `artifact` and write the raw descriptor bytes to `out`.
+    /// Describe `artifact` and write the raw manifest bytes to `out`.
     Describe {
-        /// The system cdylib to describe.
+        /// The pack cdylib to describe.
         artifact: PathBuf,
-        /// Where to write the postcard `SystemDescriptorMsg` bytes.
+        /// Where to write the postcard `PackManifestMsg` bytes.
         out: PathBuf,
     },
     /// Drive one system instance until told to shut down.

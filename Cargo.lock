@@ -71,14 +71,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "adcs-commissioning"
-version = "0.14.2"
-dependencies = [
- "adcs-contracts",
- "metor-fsw-2",
-]
-
-[[package]]
 name = "adcs-contracts"
 version = "0.14.2"
 dependencies = [
@@ -94,23 +86,11 @@ dependencies = [
 ]
 
 [[package]]
-name = "adcs-ctrl"
-version = "0.14.2"
-dependencies = [
- "adcs-contracts",
- "metor-fsw-2",
- "metor-fsw-adcs",
- "nox",
-]
-
-[[package]]
 name = "adcs-fsw2"
 version = "0.14.2"
 dependencies = [
  "adcs-contracts",
- "adcs-ctrl",
- "adcs-nav",
- "adcs-plant",
+ "adcs-systems",
  "anyhow",
  "metor-fsw-2",
  "postcard",
@@ -119,32 +99,23 @@ dependencies = [
 ]
 
 [[package]]
-name = "adcs-nav"
+name = "adcs-sequences"
+version = "0.14.2"
+dependencies = [
+ "adcs-contracts",
+ "metor-fsw-2",
+]
+
+[[package]]
+name = "adcs-systems"
 version = "0.14.2"
 dependencies = [
  "adcs-contracts",
  "metor-fsw-2",
  "metor-fsw-adcs",
  "nox",
-]
-
-[[package]]
-name = "adcs-plant"
-version = "0.14.2"
-dependencies = [
- "adcs-contracts",
- "metor-fsw-2",
- "nox",
  "rand 0.9.2",
  "rand_distr 0.5.1",
-]
-
-[[package]]
-name = "adcs-safe-mode"
-version = "0.14.2"
-dependencies = [
- "adcs-contracts",
- "metor-fsw-2",
 ]
 
 [[package]]

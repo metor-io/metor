@@ -21,13 +21,10 @@ use adcs_contracts::{
     ALTITUDE, AttitudeEstimate, BodyState, CSS_THRESHOLD, Disturbances, EARTH_RADIUS, Quat,
     Sensors, V3, World, in_earth_shadow, mission_epoch, sun_dir_eci,
 };
-use adcs_ctrl::CtrlSystem;
-use adcs_nav::NavSystem;
-use adcs_plant::PlantSystem;
 use metor_fsw_2::metor_proto::types::ComponentId;
 use metor_fsw_2::wiring::Registry;
 use metor_fsw_2::wiring::{build_artifacts, parse, resolve};
-use metor_fsw_2::{BuildOptions, Coordinator, Input, register_system};
+use metor_fsw_2::{BuildOptions, Coordinator, Input};
 
 const MISSION_KDL: &str = include_str!("../mission.kdl");
 
@@ -66,9 +63,7 @@ fn build_static(phase: f64) -> Option<Coordinator> {
         return None;
     }
     let mut registry = Registry::with_builtins();
-    register_system!(&mut registry, PlantSystem => "Plant");
-    register_system!(&mut registry, NavSystem => "Nav");
-    register_system!(&mut registry, CtrlSystem => "Ctrl");
+    registry.register_pack(adcs_systems::pack());
     Some(resolve(&wiring, &registry).expect("resolve the patched mission"))
 }
 

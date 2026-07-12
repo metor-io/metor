@@ -6,7 +6,13 @@
 > banner and `docs/sequences-slots.md` §3 reflect the shipped shape. **Normalization update
 > (2026-07-05):** the §2.7 `uplink { … }` node and `add_uplink` were since deleted — the uplink
 > is the `type="TcpUplink"` registry built-in, an ordinary `system` node
-> (`docs/normalize-telemetry-uplink-plan.md`); command edges are unchanged.
+> (`docs/normalize-telemetry-uplink-plan.md`); command edges are unchanged. **Pack update
+> (2026-07-11, `docs/packs.md`):** the sequence-specific pieces referenced below moved with
+> the pack unification — `#[sequence]` is a retired passthrough (occupants are pack entries,
+> `Pack::task` et al.), `artifact` nodes carry no `type=`, and the occupant's implicit
+> control/status ports are appended by the slot *mount* rather than declared by the
+> occupant's descriptor; the command plane itself (name-addressed `SequenceCommand`,
+> explicit per-slot edges, coordinator as system #0) is unchanged and still current.
 >
 > **Status (original): DESIGN (D4 of `review-fixes-plan.md`, wave 0).** Covers findings **A2**
 > (command edges become explicit dataflow), **A3** (slots stop being a third system

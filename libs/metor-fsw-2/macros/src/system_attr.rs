@@ -15,9 +15,11 @@
 //!    split the output bundle and lend each port back to the user's method in
 //!    its original parameter order,
 //! 4. `impl BuildSystem`, delegating to `fn new` when the impl has one and to
-//!    `Default` otherwise,
-//! 5. with the `export` argument, the `fsw_*` C-ABI entry points for
-//!    dynamically loaded systems, behind a `cfg` gate.
+//!    `Default` otherwise.
+//!
+//! There is no per-system export: a system reaches a cdylib through its
+//! crate's pack (`Pack::system_type` + `export_pack!`), so the only accepted
+//! argument is `name = "…"`.
 //!
 //! Every validation failure is a `syn::Error` on the narrowest offending
 //! token, and independent failures are combined so a broken signature reports
@@ -838,9 +840,9 @@ mod tests {
     }
 
     #[test]
-    fn name_and_export_args() {
+    fn name_arg_and_no_export_surface() {
         let out = expand_ok(
-            quote!(name = "navigator", export = "export"),
+            quote!(name = "navigator"),
             quote! {
                 impl NavSystem {
                     pub fn new(p: NavParams) -> Self { Self }
@@ -852,11 +854,9 @@ mod tests {
             out.contains(r#"const NAME: &'static str = "navigator";"#),
             "{out}"
         );
-        assert!(
-            out.contains(r#"#[cfg(all(feature = "export", not(test)))]"#),
-            "{out}"
-        );
-        assert!(out.contains("fsw_abi_version"), "{out}");
+        // The per-system C exports are gone with the pack ABI; a crate
+        // exports its whole pack through `export_pack!` instead.
+        assert!(!out.contains("fsw_abi_version"), "{out}");
         assert!(out.contains("type Params = NavParams;"), "{out}");
         // A port-less direction is a genuinely empty bundle.
         assert!(out.contains("pub struct __NavSystemOut {}"), "{out}");
@@ -1069,14 +1069,13 @@ mod tests {
             "{msgs:?}"
         );
 
-        // export on an async system
+        // the retired `export` arg points at the pack surface
         let msgs = expand_err(
             quote!(export),
             quote! { impl A { async fn run(&mut self) {} } },
         );
         assert!(
-            msgs.iter()
-                .any(|m| m.contains("`export` needs a cyclic system")),
+            msgs.iter().any(|m| m.contains("export_pack!")),
             "{msgs:?}"
         );
 
