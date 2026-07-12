@@ -369,6 +369,7 @@ impl SlotRunner {
                         self.input_regions.clone(),
                         self.output_regions.clone(),
                         self.name,
+                        crate::Mount::SlotOccupant,
                     )
                 };
                 slot.init();

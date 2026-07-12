@@ -77,6 +77,46 @@ where
 // Output
 // ---------------------------------------------------------------------------
 
+/// Where a port's dropped-publish count accumulates. A runner-owned port
+/// counts locally and the runner drains it with `take_dropped`; a port moved
+/// into a future counts through a cell shared with the driving wrapper,
+/// which folds it into health — the counters stay reachable either way.
+/// Only the failure path and the per-cycle drain touch it.
+pub(crate) enum Drops {
+    Local(u64),
+    Shared(std::sync::Arc<core::sync::atomic::AtomicU64>),
+}
+
+impl Drops {
+    pub(crate) fn bump(&mut self) {
+        use core::sync::atomic::Ordering::Relaxed;
+        match self {
+            Drops::Local(n) => *n += 1,
+            Drops::Shared(cell) => {
+                cell.fetch_add(1, Relaxed);
+            }
+        }
+    }
+
+    /// The local count, taken; a shared counter reports zero here (its owner
+    /// drains the cell directly).
+    pub(crate) fn take_local(&mut self) -> u64 {
+        match self {
+            Drops::Local(n) => core::mem::take(n),
+            Drops::Shared(_) => 0,
+        }
+    }
+
+    /// Switch to a shared cell, folding any local count in.
+    pub(crate) fn share(&mut self, cell: std::sync::Arc<core::sync::atomic::AtomicU64>) {
+        use core::sync::atomic::Ordering::Relaxed;
+        if let Drops::Local(n) = self {
+            cell.fetch_add(*n, Relaxed);
+        }
+        *self = Drops::Shared(cell);
+    }
+}
+
 /// An output publishes a system's frames of type `F`, wrapping the single
 /// [`Writer`] into the ring that carries them to downstream [`Input`]s.
 /// Cyclic outputs default to [`NoWake`]; async outputs pick wake endpoints
@@ -93,8 +133,9 @@ where
     /// write.
     scratch: Option<FrameScratch>,
     /// Records dropped by the infallible [`publish`](Self::publish) path,
-    /// collected by the runner via [`take_dropped`](Self::take_dropped).
-    dropped: u64,
+    /// collected by the runner via [`take_dropped`](Self::take_dropped) or a
+    /// future-owning driver's shared cell.
+    dropped: Drops,
     _f: PhantomData<F>,
 }
 
@@ -104,7 +145,7 @@ impl<F: Frame, WD: WakeSource, WS: WakeSink> Output<F, WD, WS> {
         Self {
             writer,
             scratch: None,
-            dropped: 0,
+            dropped: Drops::Local(0),
             _f: PhantomData,
         }
     }
@@ -123,7 +164,13 @@ impl<F: Frame, WD: WakeSource, WS: WakeSink> Output<F, WD, WS> {
 
     /// Take and clear the [`publish`](Self::publish) drop counter.
     pub fn take_dropped(&mut self) -> u64 {
-        core::mem::take(&mut self.dropped)
+        self.dropped.take_local()
+    }
+
+    /// Count drops through `cell` instead of locally, for a port about to
+    /// move into a future (whose driver folds the cell into health).
+    pub(crate) fn share_drops(&mut self, cell: std::sync::Arc<core::sync::atomic::AtomicU64>) {
+        self.dropped.share(cell);
     }
 }
 
@@ -161,7 +208,7 @@ where
     /// it. See the module docs for the write versus publish tradeoff.
     pub fn publish(&mut self, frame: &F) {
         if self.writer.try_write(frame.as_bytes()).is_err() {
-            self.dropped += 1;
+            self.dropped.bump();
         }
     }
 
@@ -169,7 +216,7 @@ where
     /// of returning it.
     pub fn publish_with(&mut self, fixed: &F, build: impl FnOnce(&mut FrameWriter<F>)) {
         if self.write_with(fixed, build).is_err() {
-            self.dropped += 1;
+            self.dropped.bump();
         }
     }
 

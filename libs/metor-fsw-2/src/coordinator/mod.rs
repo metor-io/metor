@@ -1274,34 +1274,41 @@ impl CoordinatorBuilder {
         // `&'static str` for the descriptor field and the `SlotRunner` identity).
         let leaked: &'static str = Box::leak(name.clone().into_boxed_str());
 
-        // --- Inputs: occupant prefix (SlotControlIn re-marked Host), runner tail ---
+        // --- Inputs: occupant prefix (entry inputs + appended cancel), runner tail ---
+        // The occupant tail is a MOUNT property, not descriptor content: any
+        // entry can occupy a slot, and the framework appends the cancel input
+        // after its own inputs here, mirrored by the occupant-mount bind on
+        // the loaded side. Host-connected: the RUNNER holds the cancel writer
+        // over a dedicated ring; the occupant reads it. Exempt from
+        // UnconnectedInput; edges are rejected.
         let mut inputs = base.inputs.clone();
-        let control = inputs
-            .iter_mut()
-            .find(|p| p.id == PortId::Component(SlotControlIn::FRAME_ID))
-            .expect("a v1 sequence occupant declares the implicit SlotControlIn input");
-        // Host-connected: the RUNNER holds the cancel writer over a dedicated
-        // ring; the occupant reads it. Exempt from UnconnectedInput; edges are
-        // rejected.
-        control.conn = PortConn::Host;
+        assert!(
+            !inputs
+                .iter()
+                .any(|p| p.id == PortId::Component(SlotControlIn::FRAME_ID)),
+            "an occupant never declares SlotControlIn itself; the mount appends it              (a pre-pack artifact must be rebuilt)"
+        );
+        inputs.push(PortDesc::of::<SlotControlIn>().with_conn(PortConn::Host));
         let n_occ_inputs = inputs.len();
         // The slot's declared command input: an ordinary fan-in message input,
         // so a producer commands this slot only over an explicit edge. Zero
         // edges is legal (an autonomy-free, wiring-frozen slot). The runner
         // drains it at the head of each step; it is never handed to the occupant.
         inputs.push(PortDesc::msg::<SequenceCommand>());
-        // The runner's read view over the occupant's own SequenceStatus output
-        // (Progress lines plus the terminal outcome): a declared self-tap, so
-        // no ring, just +1 fan-out on that output at sizing time.
+        // The runner's read view over the occupant's mount-appended
+        // SequenceStatus output (Progress lines plus the terminal outcome): a
+        // declared self-tap, so no ring, just +1 fan-out on that output at
+        // sizing time.
         let seq_status_id = PortId::Component(SequenceStatus::FRAME_ID);
-        assert!(
-            base.outputs.iter().any(|p| p.id == seq_status_id),
-            "a v1 sequence occupant publishes a SequenceStatus output"
-        );
         inputs.push(PortDesc::of::<SequenceStatus>().with_conn(PortConn::SelfTap(seq_status_id)));
 
-        // --- Outputs: occupant prefix, runner tail (both Host, registry-tapped) ---
+        // --- Outputs: occupant prefix (entry outputs + appended status), runner tail ---
         let mut outputs = base.outputs.clone();
+        assert!(
+            !outputs.iter().any(|p| p.id == seq_status_id),
+            "an occupant never declares SequenceStatus itself; the mount appends it              (a pre-pack artifact must be rebuilt)"
+        );
+        outputs.push(PortDesc::of::<SequenceStatus>());
         let n_occ_outputs = outputs.len();
         // Host-side slot telemetry: the RUNNER writes the phase/occupant frame
         // each step; tapped like any output ("<slot>.slot_status").
@@ -2305,7 +2312,7 @@ fn bind_dl(
     // the slot; the coordinator drops `cyclic` (this slot, whose `Drop` calls
     // `fsw_destroy`) before `rings`. The `DlSystem` handle drops right after;
     // the slot keeps its own `Arc<Library>`.
-    unsafe { dl.system.make_slot(&dl.params, inputs, outputs, desc.name) }
+    unsafe { dl.system.make_slot(&dl.params, inputs, outputs, desc.name, crate::Mount::Wired) }
 }
 
 /// The proc twin of [`bind_dl`]: gather the same per-port rings, but as

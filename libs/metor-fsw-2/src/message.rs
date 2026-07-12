@@ -140,8 +140,9 @@ where
     /// payload), so a per-cycle emit grows in place instead of allocating.
     scratch: Vec<u8>,
     /// Records dropped by the infallible [`publish`](Self::publish) path,
-    /// folded into health by the runner via `SystemOutput::take_dropped`.
-    dropped: u64,
+    /// folded into health by the runner via `SystemOutput::take_dropped` or a
+    /// future-owning driver's shared cell.
+    dropped: crate::port::Drops,
     _m: PhantomData<fn() -> M>,
 }
 
@@ -151,7 +152,7 @@ impl<M: Msg, WD: WakeSource, WS: WakeSink> MsgOut<M, WD, WS> {
         Self {
             writer,
             scratch: Vec::new(),
-            dropped: 0,
+            dropped: crate::port::Drops::Local(0),
             _m: PhantomData,
         }
     }
@@ -164,13 +165,19 @@ impl<M: Msg, WD: WakeSource, WS: WakeSink> MsgOut<M, WD, WS> {
     /// want to see the error use [`emit`](Self::emit).
     pub fn publish(&mut self, msg: &M) {
         if self.emit(msg).is_err() {
-            self.dropped += 1;
+            self.dropped.bump();
         }
     }
 
     /// Take and clear the [`publish`](Self::publish) drop counter.
     pub fn take_dropped(&mut self) -> u64 {
-        core::mem::take(&mut self.dropped)
+        self.dropped.take_local()
+    }
+
+    /// Count drops through `cell` instead of locally, for a port about to
+    /// move into a future (whose driver folds the cell into health).
+    pub(crate) fn share_drops(&mut self, cell: std::sync::Arc<core::sync::atomic::AtomicU64>) {
+        self.dropped.share(cell);
     }
 
     /// Emit one message as a single ring record, the 2-byte [`Msg::ID`]

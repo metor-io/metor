@@ -49,7 +49,7 @@ async fn gainer(Params(params): Params<GainerParams>, mut out: Output<GainOut>) 
 
 /// The crate's pack, referenced by `export_pack!` below.
 pub fn pack() -> Pack {
-    Pack::new().sequence("gainer", gainer)
+    Pack::new().task("gainer", gainer)
 }
 
 metor_fsw_2::export_pack!(pack);

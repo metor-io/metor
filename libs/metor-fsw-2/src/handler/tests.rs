@@ -266,3 +266,101 @@ fn bad_params_fail_at_create() {
         Err(MakeError::Postcard(_))
     ));
 }
+
+/// A wired task loops on `cycle().await`: state in locals, exactly one
+/// publish per coordinator cycle, and drops from the future-owned output
+/// (forced by a stalled broad reader) fold into its health — the counter
+/// asymmetry the ports-in-future design used to have.
+#[cfg(not(miri))]
+#[stellarator::test]
+async fn task_cycles_every_cycle_and_folds_drops() {
+    use crate::sequence::cycle;
+    use crate::{ClockMode, SystemHealth};
+    use std::time::Duration;
+
+    async fn beat(mut nav: Output<PkNav>) {
+        let mut n = 0.0;
+        loop {
+            let now = cycle().await;
+            n += 1.0;
+            nav.publish(&PkNav {
+                timestamp: now,
+                angle: n,
+            });
+        }
+    }
+
+    let seen = Rc::new(RefCell::new(Vec::new()));
+    struct WatchState {
+        seen: Rc<RefCell<Vec<f64>>>,
+    }
+    fn watch(s: &mut WatchState, nav: &mut Input<PkNav>) {
+        if let Some(r) = nav.latest()
+            && s.seen.borrow().last() != Some(&r.angle)
+        {
+            s.seen.borrow_mut().push(r.angle);
+        }
+    }
+
+    let mut pack = Pack::new()
+        .task("beat", beat)
+        .system("watch", system(watch).state(WatchState { seen: seen.clone() }));
+
+    let mut b = Coordinator::builder(CoordinatorConfig {
+        cycle_rate: 1000.0,
+        clock: ClockMode::Simulated {
+            dt: Duration::from_millis(1),
+        },
+        ..CoordinatorConfig::default()
+    });
+    let beat_h = b
+        .add_pack_entry(
+            "beat",
+            pack.entry_mut("beat").unwrap(),
+            EntryParams::Postcard(&[]),
+        )
+        .expect("create task");
+    let watch_h = b
+        .add_pack_entry(
+            "watch",
+            pack.entry_mut("watch").unwrap(),
+            EntryParams::Postcard(&[]),
+        )
+        .expect("create watcher");
+    b.connect(PortRef::new::<PkNav>(beat_h), PortRef::new::<PkNav>(watch_h))
+        .unwrap();
+    let mut coord = b.build().unwrap();
+
+    // A broad reader that never drains: its cursor pins the ring at the live
+    // edge, so once the depth is exhausted every publish drops.
+    let stalled = coord
+        .registry()
+        .view(metor_proto::types::ComponentId::new("beat.pk_nav"))
+        .expect("the task output is registered")
+        .expect("reader slot available");
+    let mut health_view: Input<SystemHealth> = Input::new(
+        coord
+            .registry()
+            .view(metor_proto::types::ComponentId::new("beat.health"))
+            .expect("health is registered")
+            .expect("reader slot available"),
+    );
+
+    coord.run_for(30).await;
+
+    // One increment per cycle reached the consumer until the ring pinned.
+    let seen = seen.borrow();
+    assert!(!seen.is_empty(), "the task published");
+    for w in seen.windows(2) {
+        assert_eq!(w[1] - w[0], 1.0, "exactly one publish per cycle: {seen:?}");
+    }
+    // The stalled reader forced drops, and they landed on the task's health
+    // through the shared cell.
+    let health = health_view.latest().expect("health published");
+    assert!(
+        health.errors > 0,
+        "future-owned drops fold into health (errors = {})",
+        health.errors
+    );
+    drop(stalled);
+}

@@ -67,7 +67,12 @@ where
         sink.outputs.push(Output::<F>::decl());
     }
     fn bind(cx: &mut BindCx) -> Self {
-        Output::bind(cx.src)
+        let mut out: Output<F> = Output::bind(cx.src);
+        // Moved into the future, so drops count through the driver's cell.
+        if let Some(cell) = &cx.drops {
+            out.share_drops(cell.clone());
+        }
+        out
     }
 }
 
@@ -91,7 +96,11 @@ where
         sink.outputs.push(MsgOut::<M>::decl());
     }
     fn bind(cx: &mut BindCx) -> Self {
-        MsgOut::bind(cx.src)
+        let mut out: MsgOut<M> = MsgOut::bind(cx.src);
+        if let Some(cell) = &cx.drops {
+            out.share_drops(cell.clone());
+        }
+        out
     }
 }
 

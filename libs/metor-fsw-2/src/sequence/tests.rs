@@ -1,8 +1,8 @@
 //! Unit tests for the sequence runtime, exercised against a hand-stepped
-//! [`SeqClock`] rather than a real coordinator. Covers the [`Wait`] future
+//! [`CycleClock`] rather than a real coordinator. Covers the [`Wait`] future
 //! (deadline resolution and cancel short-circuit), the free
-//! [`wait`]/[`progress`]/[`aborted`] author API, and a real `#[sequence]`
-//! expansion whose generated `descriptor()` shape is asserted directly.
+//! [`wait`]/[`progress`]/[`aborted`] author API, and the [`cycle`]
+//! suspension point of async-fn systems.
 
 use core::pin::Pin;
 use core::task::{Context, Poll, Waker};
@@ -12,10 +12,7 @@ use std::time::Duration;
 use metor_proto::types::Timestamp;
 
 use crate::sequence::{
-    aborted, current, progress, wait, with_clock, Outcome, SeqClock, SeqSystem, Step, Wait,
-};
-use crate::{
-    Frame, Input, Output, SequenceStatus, SlotControlIn, SystemHealth, SystemKind, SystemLog,
+    CycleClock, Step, Wait, aborted, current, cycle, progress, wait, with_clock,
 };
 
 /// Poll a [`Wait`] once with a no-op waker.
@@ -29,7 +26,7 @@ fn poll(w: &mut Wait) -> Poll<Step> {
 
 #[test]
 fn wait_elapses_at_deadline() {
-    let clock = Rc::new(SeqClock::default());
+    let clock = Rc::new(CycleClock::default());
     clock.now.set(Timestamp(0));
     with_clock(&clock, || {
         // Timestamp is in microseconds, so the deadline is now(0) + 5.
@@ -48,7 +45,7 @@ fn wait_elapses_at_deadline() {
 
 #[test]
 fn cancel_short_circuits_wait() {
-    let clock = Rc::new(SeqClock::default());
+    let clock = Rc::new(CycleClock::default());
     clock.now.set(Timestamp(0));
     with_clock(&clock, || {
         let mut w = wait(Duration::from_micros(100));
@@ -63,7 +60,7 @@ fn cancel_short_circuits_wait() {
 
 #[test]
 fn progress_and_aborted_free_fns() {
-    let clock = Rc::new(SeqClock::default());
+    let clock = Rc::new(CycleClock::default());
     with_clock(&clock, || {
         progress("warming up");
         progress(String::from("ready"));
@@ -86,7 +83,7 @@ fn progress_and_aborted_free_fns() {
 fn now_reads_the_stepped_ambient_clock() {
     // `now()` is the cycle time the clock was last refreshed with, never wall
     // time, so a sequence stamps its emitted frames deterministically.
-    let clock = Rc::new(SeqClock::default());
+    let clock = Rc::new(CycleClock::default());
     clock.now.set(Timestamp(42));
     with_clock(&clock, || {
         assert_eq!(super::now(), Timestamp(42));
@@ -100,7 +97,7 @@ fn now_reads_the_stepped_ambient_clock() {
 
 #[test]
 fn clock_is_cleared_after_with_clock() {
-    let clock = Rc::new(SeqClock::default());
+    let clock = Rc::new(CycleClock::default());
     assert!(current().is_none(), "no ambient clock outside a poll");
     with_clock(&clock, || {
         assert!(current().is_some(), "clock is ambient inside")
@@ -108,63 +105,26 @@ fn clock_is_cleared_after_with_clock() {
     assert!(current().is_none(), "ambient clock cleared on the way out");
 }
 
-// --- A real `#[sequence]` expansion ---
-//
-// The generated `descriptor()` must list the user ports plus the implicit
-// `SlotControlIn` input and the `SequenceStatus`, health, and log output tail,
-// in that order, with kind Cyclic. Existing frame types are reused for the
-// ports so the test needs no new frames. The generated C-ABI exports are
-// gated `#[cfg(not(test))]`, so this expansion cannot collide with another
-// test's exported symbols.
 
-#[crate::sequence]
-async fn demo(att: Input<SystemHealth>, mut out: Output<SystemHealth>) -> Outcome {
-    // The ports are moved into the future and used as owned values.
-    let _ = att;
-    let _ = out.write(&SystemHealth {
-        timestamp: Timestamp(0),
-        cycles: 0,
-        errors: 0,
-        last_execute_micros: 0,
-        error_counts: crate::FrameMap::EMPTY,
-    });
-    Outcome::Completed
-}
-
+/// `cycle()` arms at the current clock and resolves only once a LATER cycle
+/// polls it — never the same cycle, so a `loop { cycle().await; … }` body
+/// runs exactly once per coordinator cycle, deterministically.
 #[test]
-fn macro_descriptor_shape() {
-    let d = <__Seq_demo as SeqSystem>::descriptor();
-
-    assert_eq!(d.name, "demo", "name defaults to the fn ident");
-    assert_eq!(d.kind, SystemKind::Cyclic);
-
-    // The user `att` input, then the implicit SlotControlIn.
-    assert_eq!(d.inputs.len(), 2);
+fn cycle_resolves_on_the_next_cycle() {
+    let clock = Rc::new(CycleClock::default());
+    clock.now.set(Timestamp(10));
+    let mut fut = with_clock(&clock, cycle);
+    let mut cx = Context::from_waker(Waker::noop());
+    let mut poll = |clock: &Rc<CycleClock>, fut: &mut super::NextCycle| {
+        with_clock(clock, || {
+            core::future::Future::poll(Pin::new(fut), &mut cx)
+        })
+    };
+    assert_eq!(poll(&clock, &mut fut), Poll::Pending, "same cycle: pending");
+    clock.now.set(Timestamp(11));
     assert_eq!(
-        d.inputs[0].id.component().expect("table port"),
-        SystemHealth::FRAME_ID
-    );
-    assert_eq!(
-        d.inputs[1].id.component().expect("table port"),
-        SlotControlIn::FRAME_ID
-    );
-
-    // The user `out` output, then the status tail: SequenceStatus, health, log.
-    assert_eq!(d.outputs.len(), 4);
-    assert_eq!(
-        d.outputs[0].id.component().expect("table port"),
-        SystemHealth::FRAME_ID
-    );
-    assert_eq!(
-        d.outputs[1].id.component().expect("table port"),
-        SequenceStatus::FRAME_ID
-    );
-    assert_eq!(
-        d.outputs[2].id.component().expect("table port"),
-        SystemHealth::FRAME_ID
-    );
-    assert_eq!(
-        d.outputs[3].id.component().expect("table port"),
-        SystemLog::FRAME_ID
+        poll(&clock, &mut fut),
+        Poll::Ready(Timestamp(11)),
+        "next cycle: ready with that cycle's now"
     );
 }

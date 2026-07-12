@@ -12,12 +12,14 @@
 //! The pack registers the same body twice, as `waiter` and as `napper`, so a
 //! slot can allow two occupants with distinct Load names and identical
 //! contracts out of one artifact — the occupant-swap shape the process-slot
-//! tests drive.
+//! tests drive. A third entry, `beater`, is an ordinary cyclic system (fn
+//! style, no ports), proving a slot occupant need not be a sequence at all:
+//! the occupant tail is a mount property, so any entry can occupy a slot.
 
 use core::time::Duration;
 
 use metor_fsw_2::sequence::{progress, wait};
-use metor_fsw_2::{Outcome, Pack};
+use metor_fsw_2::{Outcome, Pack, Timestamp, system};
 
 /// Load-time canary for the process-slot isolation tests: when
 /// `SEQ_FIXTURE_CANARY` names a file, mapping this object appends the loading
@@ -60,11 +62,18 @@ async fn waiter() -> Outcome {
     Outcome::Completed
 }
 
+/// A plain cyclic system with no ports: state in the leading `&mut u64`,
+/// stepped forever until the slot cancels it.
+fn beat(count: &mut u64, _now: Timestamp) {
+    *count += 1;
+}
+
 /// The crate's pack, referenced by `export_pack!` below.
 pub fn pack() -> Pack {
     Pack::new()
-        .sequence("waiter", waiter)
-        .sequence("napper", waiter)
+        .task("waiter", waiter)
+        .task("napper", waiter)
+        .system("beater", system(beat))
 }
 
 metor_fsw_2::export_pack!(pack);

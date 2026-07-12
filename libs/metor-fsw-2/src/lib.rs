@@ -97,8 +97,8 @@
 //! The crate ships the common infrastructure as ordinary systems: the TCP
 //! telemetry downlink and command uplink ([`TelemetrySystem`],
 //! [`UplinkSystem`]), the limit-alarm engine ([`AlarmSystem`]), and the
-//! [`sequence`] runtime that turns a `#[sequence]` async fn into a loadable
-//! occupant of a coordinator slot.
+//! [`sequence`] runtime that polls async-fn systems once per cycle —
+//! `wait()`, `cycle()`, and cooperative cancellation for slot occupants.
 //!
 //! The `docs/` directory of this crate holds the detailed design documents;
 //! `DESIGN.md` is the overview.
@@ -193,9 +193,7 @@ pub use metor_fsw_2_macros::system;
 
 pub use metor_proto::types::Timestamp;
 
-pub use sequence::{
-    Outcome, Seq, SeqBound, SeqClock, SeqStatusOut, SeqSystem, SequenceStatus, SlotControlIn,
-};
+pub use sequence::{CycleClock, Outcome, Seq, SeqClock, SequenceStatus, SlotControlIn};
 
 pub use metor_fsw::path;
 pub use {metor_proto, metor_proto_wkt};

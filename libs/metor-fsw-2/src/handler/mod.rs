@@ -38,7 +38,7 @@ pub use param::{BindCx, CycleCx, DeclSink, ExecParam};
 pub use task::{AsyncSystemFn, IntoOutcome, Params, TaskParam};
 pub use tuples::{ExecParamSet, ExecuteFn};
 
-pub(crate) use driver::{FnDriver, FutureDriver, SeqDriver, bind_health_tail};
+pub(crate) use driver::{FnDriver, FutureDriver, OccupantFuture, bind_health_tail, mount_driver};
 pub(crate) use task::TaskParamsSpec;
 
 use crate::descriptor::{PortDesc, SystemDescriptor, SystemKind, split_decls};
@@ -182,8 +182,10 @@ where
             create: Box::new(move |params: EntryParams<'_>| {
                 decode_params::<()>(params)?;
                 let execute = execute.clone();
-                let pending: Pending = Box::new(move |src, _mount| {
-                    Box::new(FnDriver::bind(S::default(), execute, src))
+                let pending: Pending = Box::new(move |src, mount| {
+                    mount_driver(src, mount, move |src| {
+                        Box::new(FnDriver::bind(S::default(), execute, src))
+                    })
                 });
                 Ok(pending)
             }),
@@ -212,8 +214,11 @@ where
                 let p: G::Params = decode_params(params)?;
                 let state = init.clone().call(p);
                 let execute = execute.clone();
-                let pending: Pending =
-                    Box::new(move |src, _mount| Box::new(FnDriver::bind(state, execute, src)));
+                let pending: Pending = Box::new(move |src, mount| {
+                    mount_driver(src, mount, move |src| {
+                        Box::new(FnDriver::bind(state, execute, src))
+                    })
+                });
                 Ok(pending)
             }),
         }
@@ -239,8 +244,11 @@ where
                 decode_params::<()>(params)?;
                 let state = state.take().ok_or(MakeError::StateTaken)?;
                 let execute = execute.clone();
-                let pending: Pending =
-                    Box::new(move |src, _mount| Box::new(FnDriver::bind(state, execute, src)));
+                let pending: Pending = Box::new(move |src, mount| {
+                    mount_driver(src, mount, move |src| {
+                        Box::new(FnDriver::bind(state, execute, src))
+                    })
+                });
                 Ok(pending)
             }),
         }

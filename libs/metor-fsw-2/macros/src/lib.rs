@@ -14,8 +14,6 @@
 //!   [`#[derive(SystemOutput)]`](derive@SystemOutput) describe port bundles.
 //! - [`#[system]`](macro@system) builds a whole system from an inherent impl
 //!   block.
-//! - [`#[sequence]`](macro@sequence) turns an `async fn` into a loadable
-//!   sequence.
 //!
 //! Field and struct attributes live under `#[fsw(...)]`; the longer
 //! `#[metor_fsw(...)]` spelling is accepted as an alias.
@@ -115,19 +113,10 @@ pub fn system_output(input: TokenStream) -> TokenStream {
 }
 
 
-/// Turns an `async fn` whose parameters are `Input<T>`/`Output<T>` ports into
-/// a complete sequence, loadable at runtime from a `cdylib`.
-///
-/// The macro reads the ports off the signature and moves them into the
-/// generated future, appending the implicit `SlotControlIn` input and the
-/// `SequenceStatus`, health, and log output tail. It then emits the `fsw_*`
-/// C entry points, each delegating to an `abi::run_seq_*` helper. Because
-/// rings erase their backing type, the fn body is emitted verbatim with no
-/// injected generics.
-///
-/// `#[sequence(name = "…")]` overrides the sequence name, which defaults to
-/// the fn name. The fn may take no params, or one params argument
-/// implementing `Serialize`, `Deserialize`, and `Schema`.
+/// Retired: a sequence is a plain `async fn` registered with
+/// `Pack::task("name", the_fn)` (typed params ride a `Params<P>` wrapper
+/// argument) and exported through the crate's `export_pack!`. The attribute
+/// now emits the annotated fn unchanged and will be removed.
 #[proc_macro_attribute]
 pub fn sequence(attr: TokenStream, item: TokenStream) -> TokenStream {
     sequence::sequence(attr, item)

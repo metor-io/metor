@@ -15,21 +15,6 @@ pub fn type_head(ty: &Type) -> Option<&Ident> {
     }
 }
 
-/// The first generic type argument of the last path segment, skipping
-/// lifetimes, so `Input<'a, T>` yields `T`.
-pub fn first_type_arg(ty: &Type) -> Option<Type> {
-    if let Type::Path(p) = ty
-        && let Some(seg) = p.path.segments.last()
-        && let PathArguments::AngleBracketed(args) = &seg.arguments
-    {
-        for a in &args.args {
-            if let GenericArgument::Type(t) = a {
-                return Some(t.clone());
-            }
-        }
-    }
-    None
-}
 
 /// All generic type arguments of the last path segment. Callers use the
 /// count to reject ports with the wrong arity.

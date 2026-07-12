@@ -174,6 +174,6 @@ fn tracking_error(att: &mut Input<AttitudeEstimate>, gps: &mut Input<Gps>) -> Op
 /// This crate's pack: the commissioning sequence as its sole entry, under the name the
 /// mission's slot `allow`/`initial` lines select (`occupant="commissioning"`).
 pub fn pack() -> metor_fsw_2::Pack {
-    metor_fsw_2::Pack::new().sequence("commissioning", commissioning)
+    metor_fsw_2::Pack::new().task("commissioning", commissioning)
 }
 metor_fsw_2::export_pack!(pack);

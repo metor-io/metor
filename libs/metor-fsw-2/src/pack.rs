@@ -204,10 +204,12 @@ impl Pack {
             if let Some(msgs) = msgs {
                 system.configure(&crate::BuildCtx { msgs })?;
             }
-            let pending: Pending = Box::new(move |src, _mount| {
-                let input = <T::Input as crate::BindPorts>::bind(src);
-                let output = <crate::Out<O> as crate::BindPorts>::bind(src);
-                Box::new(RunnerDriver(crate::CyclicRunner::new(system, input, output)))
+            let pending: Pending = Box::new(move |src, mount| {
+                crate::handler::mount_driver(src, mount, move |src| {
+                    let input = <T::Input as crate::BindPorts>::bind(src);
+                    let output = <crate::Out<O> as crate::BindPorts>::bind(src);
+                    Box::new(RunnerDriver(crate::CyclicRunner::new(system, input, output)))
+                })
             });
             Ok(pending)
         });
@@ -253,83 +255,31 @@ impl Pack {
         let create: CreateFn = Box::new(move |params: EntryParams<'_>| {
             let params_any = (spec.decode)(params)?;
             let f = f.clone();
-            let pending: Pending = Box::new(move |src, _mount| {
-                let clock = std::rc::Rc::new(crate::sequence::SeqClock::default());
+            let pending: Pending = Box::new(move |src, mount| {
+                let clock = std::rc::Rc::new(crate::sequence::CycleClock::default());
+                let drops = std::sync::Arc::new(core::sync::atomic::AtomicU64::new(0));
                 let future = {
                     let mut cx = crate::handler::BindCx {
                         src,
                         params: Some(params_any),
                         clock: Some(clock.clone()),
+                        drops: Some(drops.clone()),
                     };
                     f.build(&mut cx)
                 };
                 let health = bind_health_tail(src);
-                Box::new(crate::handler::FutureDriver::new(future, clock, health))
-            });
-            Ok(pending)
-        });
-        self.entries.push(PackEntry {
-            name,
-            descriptor,
-            params_schema,
-            params_default: None,
-            reloadable: true,
-            create,
-        });
-        self
-    }
-
-    /// Register a sequence under `name`: an async-fn system carrying the
-    /// slot-occupant contract — the implicit
-    /// [`SlotControlIn`](crate::SlotControlIn) cancel input after the user
-    /// inputs and the [`SequenceStatus`](crate::sequence::SequenceStatus) +
-    /// health/log tail after the user outputs — so it can occupy a runtime
-    /// slot. The body is the same async-fn shape [`task`](Self::task) takes;
-    /// only the implicit ports differ.
-    pub fn sequence<M, F>(mut self, name: &'static str, f: F) -> Self
-    where
-        M: 'static,
-        F: crate::handler::AsyncSystemFn<M> + Clone,
-    {
-        use crate::handler::{DeclSink, TaskParamsSpec};
-        use crate::sequence::{SeqStatusOut, SlotControlIn};
-
-        let mut sink = DeclSink::default();
-        F::decls(&mut sink);
-        let spec = sink.task_params.take().unwrap_or_else(TaskParamsSpec::unit);
-        let params_schema = spec.schema;
-        let (mut inputs, _) = crate::descriptor::split_decls(std::mem::take(&mut sink.inputs));
-        let (mut outputs, _) = crate::descriptor::split_decls(std::mem::take(&mut sink.outputs));
-        inputs.push(crate::Input::<SlotControlIn>::descriptor());
-        let (tail, _) = crate::descriptor::split_decls(
-            <crate::Out<SeqStatusOut> as crate::SystemOutput>::decls(),
-        );
-        outputs.extend(tail);
-        let descriptor = SystemDescriptor {
-            name,
-            kind: crate::SystemKind::Cyclic,
-            inputs,
-            outputs,
-            capabilities: Vec::new(),
-        };
-
-        let create: CreateFn = Box::new(move |params: EntryParams<'_>| {
-            let params_any = (spec.decode)(params)?;
-            let f = f.clone();
-            let pending: Pending = Box::new(move |src, _mount| {
-                let clock = std::rc::Rc::new(crate::sequence::SeqClock::default());
-                let mut cx = crate::handler::BindCx {
-                    src,
-                    params: Some(params_any),
-                    clock: Some(clock.clone()),
-                };
-                let future = f.build(&mut cx);
-                // The occupant tail binds after the user ports, in the same
-                // order the descriptor declares: control input, then the
-                // status/health/log outputs.
-                let control = crate::Input::<SlotControlIn>::bind(cx.src);
-                let status = <crate::Out<SeqStatusOut> as crate::BindPorts>::bind(cx.src);
-                Box::new(crate::handler::SeqDriver::new(future, clock, control, status))
+                let inner = crate::handler::FutureDriver::new(future, clock, health, drops);
+                match mount {
+                    Mount::Wired => Box::new(inner) as Box<dyn Driver>,
+                    // The occupant tail binds after the entry's own ports:
+                    // the cancel input past the user inputs, the status
+                    // output past the health/log tail.
+                    Mount::SlotOccupant => {
+                        let control = crate::Input::bind(src);
+                        let status = crate::Output::bind(src);
+                        Box::new(crate::handler::OccupantFuture::new(inner, control, status))
+                    }
+                }
             });
             Ok(pending)
         });

@@ -119,7 +119,7 @@ fn test_pack() -> Pack {
     Pack::new()
         .system_type::<Counter, _>("counter")
         .system_type::<Boom, _>("boom")
-        .sequence("wait_seq", wait_seq)
+        .task("wait_seq", wait_seq)
 }
 
 /// Entry indices in [`test_pack`]'s manifest order.
@@ -736,15 +736,15 @@ fn kdl_schema_encode_nested_struct_and_vec_byte_equal() {
 }
 
 // ---------------------------------------------------------------------------
-// A sequence entry driven through the pack ABI. It has no user ports, just
-// the implicit SlotControlIn input and the SequenceStatus plus health/log
-// output tail its descriptor carries.
+// A task entry driven through the pack ABI under the slot-occupant mount:
+// the framework appends the SlotControlIn input after the entry's inputs
+// (none here) and the SequenceStatus output after its health/log tail.
 // ---------------------------------------------------------------------------
 
 #[test]
 fn seq_abi_runs_to_done() {
-    // Rings in descriptor order: input [control]; outputs [status, health,
-    // log].
+    // Rings in occupant-mount order: input [control]; outputs [health, log,
+    // status].
     let control_ring = ring_for::<SlotControlIn>(8, 1);
     let status_ring = ring_for::<SequenceStatus>(8, 1);
     let health_ring = ring_for::<SystemHealth>(8, 1);
@@ -755,15 +755,15 @@ fn seq_abi_runs_to_done() {
 
     let inputs = [handle(&control_ring, ROLE_INPUT)];
     let outputs = [
-        handle(&status_ring, ROLE_OUTPUT),
         handle(&health_ring, ROLE_OUTPUT),
         handle(&log_ring, ROLE_OUTPUT),
+        handle(&status_ring, ROLE_OUTPUT),
     ];
 
     let pack = OpenPack::new();
-    // `()` params encode to zero bytes.
+    // `()` params encode to zero bytes; mount word 1 = slot occupant.
     // SAFETY: live pack; null params with len 0 is the documented empty case.
-    let state = unsafe { run_pack_create(pack.0, WAIT_SEQ, 0, std::ptr::null(), 0) };
+    let state = unsafe { run_pack_create(pack.0, WAIT_SEQ, 1, std::ptr::null(), 0) };
     assert!(!state.is_null(), "fsw_pack_create returned state");
     // SAFETY: live state, and the handle regions outlive the future.
     unsafe {
