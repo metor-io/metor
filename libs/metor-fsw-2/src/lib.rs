@@ -155,8 +155,9 @@ pub use pack::{Driver, EntryParams, MakeError, Mount, Pack, PackEntry, Pending, 
 pub use testbench::TestBench;
 pub use coordinator::{
     AllowedOccupant, ClockMode, Coordinator, CoordinatorBuilder, CoordinatorConfig,
-    InitialOccupant, NAME_CAP, OccupantBacking, PortRef, SLOT_NAME_CAP, SlotState, SlotStatus,
-    StopReason, StoppedSystem, SystemHandle, WireError, WorkerRunState, WorkerStatus,
+    InitialOccupant, NAME_CAP, OccupantBacking, PortRef, SLOT_NAME_CAP, SlotConfigError,
+    SlotState, SlotStatus, StopReason, StoppedSystem, SystemHandle, WireError, WorkerRunState,
+    WorkerStatus,
 };
 
 pub use registry::{AllOutputs, EntrySchema, Registry, RegistryEntry};
