@@ -197,15 +197,16 @@ impl SystemSpec {
         Self::tcp_builtin(name, TCP_UPLINK_TYPE, addr)
     }
 
-    /// Both built-ins take a single `addr=` param. It is rendered as KDL node
-    /// text because static systems re-decode their params from a node at
-    /// resolve; the typed postcard path only serves loaded systems.
+    /// Both built-ins take a single `addr=` param, carried as a
+    /// [`ParamSource::Value`] tree: the static path deserializes it with
+    /// serde, so the `SocketAddr` reads from the JSON string and the params'
+    /// `#[serde(default)]` fields are honored.
     fn tcp_builtin(name: &str, ty: &str, addr: SocketAddr) -> Self {
         Self {
             name: name.to_string(),
             ty: Some(ty.to_string()),
             artifact: None,
-            params: ParamSource::Kdl(format!("system \"{name}\" type=\"{ty}\" addr=\"{addr}\"")),
+            params: ParamSource::Value(serde_json::json!({ "addr": addr.to_string() })),
             process: false,
             src: None,
             scope: None,
@@ -217,26 +218,33 @@ impl SystemSpec {
 ///
 /// At [`resolve`](super::resolve) every variant reduces to the same encodings:
 /// the canonical postcard `Params` bytes that cross `fsw_create` for a loaded
-/// system, or the KDL node the registry factory deserializes for a static one.
+/// system, or a typed `S::Params` value for a static one. Which decoder runs
+/// is decided by [`SystemSpec::artifact`], not by the variant.
+/// [`Kdl`](ParamSource::Kdl) carries the node's source text verbatim, re-run
+/// through the shared KDL params deserializer at resolve.
+/// [`Value`](ParamSource::Value) carries a plain value tree — the format an
+/// evaluated front-end emits — conformed against the object's exported
+/// `Params` schema and postcard-encoded for a loaded system, or
+/// serde-deserialized (field defaults honored) for a static one.
 /// [`Postcard`](ParamSource::Postcard) carries a `Params` value the Rust
-/// builder already encoded, exactly the bytes `fsw_create` decodes.
-/// [`Kdl`](ParamSource::Kdl) carries the node's source text verbatim so
-/// resolve can re-decode it through the shared KDL params deserializer; a
-/// static system deserializes it straight into its typed `Params` (the host
-/// links `Params`), while a loaded system schema-encodes it against the
-/// object's exported `Params` schema (the host stays schema-agnostic),
-/// producing the same bytes the `Postcard` path would. Which decoder runs is
-/// decided by [`SystemSpec::artifact`], not by the variant.
+/// builder already encoded, exactly the bytes `fsw_create` decodes; it is
+/// dl-only, since a static system has no postcard decode path.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum ParamSource {
-    /// No params. Resolves to empty postcard bytes for a loaded system, or a
-    /// minimal synthesized node for a static one.
+    /// No params. Resolves to the entry's declared defaults (or empty
+    /// postcard bytes) for a loaded system, a minimal synthesized node for a
+    /// static one.
     None,
     /// Canonical postcard `Params` bytes, the typed Rust builder path.
+    /// dl-only; the static path rejects it as
+    /// [`StaticPostcardParams`](super::LoadError::StaticPostcardParams).
     Postcard(Vec<u8>),
     /// The KDL node's source text, re-decoded at resolve (typed serde
     /// deserialize for static, schema-guided postcard encode for loaded).
     Kdl(String),
+    /// A params value tree (schema-conform + encode for loaded, serde
+    /// deserialize for static).
+    Value(serde_json::Value),
 }
 
 impl ParamSource {

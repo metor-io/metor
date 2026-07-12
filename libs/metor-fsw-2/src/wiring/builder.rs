@@ -305,6 +305,23 @@ impl SlotSpecBuilder {
         self
     }
 
+    /// Allows the named occupant with default params as a value tree, the
+    /// [`SystemSpecBuilder::params_value`] twin of
+    /// [`allow_with_params`](Self::allow_with_params).
+    pub fn allow_with_value(
+        mut self,
+        occupant: impl Into<String>,
+        value: serde_json::Value,
+    ) -> Self {
+        self.spec.allow.push(AllowedOccupantSpec {
+            occupant: occupant.into(),
+            artifact: None,
+            params: ParamSource::Value(value),
+            src: None,
+        });
+        self
+    }
+
     /// Declares an input frame in the slot's port contract. Every occupant is
     /// validated against the contract when it loads.
     pub fn input(mut self, frame: impl Into<String>) -> Self {
@@ -406,6 +423,15 @@ impl SystemSpecBuilder {
         let bytes = postcard::to_allocvec(&params)
             .expect("params postcard-encode (Serialize is infallible)");
         self.params = ParamSource::Postcard(bytes);
+        self
+    }
+
+    /// Sets the params as a value tree ([`ParamSource::Value`]), which both
+    /// system kinds accept: a static system serde-deserializes it (field
+    /// defaults honored), a loaded one schema-encodes it to the same postcard
+    /// bytes [`params`](Self::params) carries.
+    pub fn params_value(mut self, value: serde_json::Value) -> Self {
+        self.params = ParamSource::Value(value);
         self
     }
 

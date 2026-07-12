@@ -42,7 +42,10 @@
 //! the artifact's exported `Params` schema, since the host never links the
 //! occupant's `Params` type. The reserved wiring keys (`type=` and `artifact=`
 //! on `system` nodes, `occupant=` on `allow` nodes) and the leading
-//! instance-name argument never reach the params struct at all.
+//! instance-name argument never reach the params struct at all. A
+//! [`ParamSource::Value`] tree joins the same two paths one step later: serde
+//! deserialize for static (through [`StaticParams::Value`]), schema encode
+//! for loaded (through [`encode_value_params`]).
 
 use std::collections::HashMap;
 use std::time::Duration;
@@ -80,7 +83,7 @@ pub use build_driver::{BuildError, BuildOptions, build_artifacts};
 pub use builder::{SlotSpecBuilder, SystemSpecBuilder, WiringBuilder};
 pub use bundle::{BundleError, PackageOptions, load_bundle, write_bundle};
 pub use error::LoadError;
-pub use kdl_params::{encode_kdl_params, encode_kdl_params_with_defaults};
+pub use kdl_params::{encode_kdl_params, encode_kdl_params_with_defaults, encode_value_params};
 pub use model::{
     AllowedOccupantSpec, Artifact, ClockSpec, CoordinatorSpec, EdgeKind, EdgeSpec, IR_VERSION,
     InitialOccupantSpec, ParamSource, ScopeSpec, SlotInitState, SlotSpec, SourceRef, SystemSpec,
@@ -107,10 +110,8 @@ pub(crate) const ALLOW_RESERVED: &[&str] = &["occupant", "artifact"];
 
 /// Everything a factory needs and produces, erased of the concrete system type.
 pub struct LoadCtx<'a> {
-    /// The `system` node, carrying params and spans.
-    pub node: &'a KdlNode,
-    /// The full document, for `miette` source-code context.
-    pub src: &'a str,
+    /// Where the instance's params come from.
+    pub params: StaticParams<'a>,
     /// The instance name the system registers under.
     pub name: &'a str,
     /// The builder under construction.
@@ -120,10 +121,39 @@ pub struct LoadCtx<'a> {
     pub msgs: &'a MsgTable,
 }
 
-/// A registered factory: parse params off `ctx.node`, construct the system,
-/// add it to the builder under `ctx.name`, and return its handle and
-/// descriptor for edge validation. Boxed `Fn`, not a bare `fn`: a pack
-/// entry's factory closes over the shared entry it instantiates.
+/// The params surface a static-path factory decodes, the typed twin of the dl
+/// path's [`ParamSource`] reduction.
+pub enum StaticParams<'a> {
+    /// A `system` node's params surface, plus the document text its spans
+    /// index into.
+    Kdl { node: &'a KdlNode, src: &'a str },
+    /// A params value tree. `src` is the best-available diagnostic snippet
+    /// (a value tree carries no spans of its own), anchored by the spec's
+    /// [`SourceRef`] when it has one.
+    Value {
+        value: &'a serde_json::Value,
+        src: &'a str,
+    },
+    /// No params. Decodes through a synthesized minimal node, so a required
+    /// field is reported as the same missing param a param-less KDL node
+    /// raises.
+    None,
+}
+
+impl StaticParams<'_> {
+    /// The diagnostic source text, for errors outside the params surface.
+    fn diag_src(&self, name: &str) -> String {
+        match self {
+            StaticParams::Kdl { src, .. } | StaticParams::Value { src, .. } => (*src).to_string(),
+            StaticParams::None => format!("system \"{name}\""),
+        }
+    }
+}
+
+/// A registered factory: decode `ctx.params`, construct the system, add it
+/// to the builder under `ctx.name`, and return its handle and descriptor for
+/// edge validation. Boxed `Fn`, not a bare `fn`: a pack entry's factory
+/// closes over the shared entry it instantiates.
 pub type SystemFactory =
     Box<dyn Fn(&mut LoadCtx) -> Result<(SystemHandle, SystemDescriptor), LoadError>>;
 
@@ -178,26 +208,90 @@ where
     S: BuildSystem + AddToBuilder<K>,
     S::Params: serde::de::DeserializeOwned,
 {
-    let params = de::from_kdl_node::<S::Params>(ctx.node, ctx.src, ctx.name, SYSTEM_RESERVED, 1)?;
+    let params = decode_static_params::<S::Params>(&ctx.params, ctx.name)?;
     let mut system = S::new(params);
     // Resolve config references (message name tokens) against the registry
     // tables the params value cannot carry.
     system
         .configure(&BuildCtx { msgs: ctx.msgs })
         .map_err(|e| match e {
-            ConfigureError::UnknownMsg { name, available } => LoadError::UnknownMsgName {
-                system: ctx.name.to_string(),
-                msg: name,
-                available: available.join(", "),
-                src: ctx.src.to_string(),
-                span: (0, ctx.src.len()).into(),
-            },
+            ConfigureError::UnknownMsg { name, available } => {
+                let src = ctx.params.diag_src(ctx.name);
+                LoadError::UnknownMsgName {
+                    system: ctx.name.to_string(),
+                    msg: name,
+                    available: available.join(", "),
+                    span: (0, src.len()).into(),
+                    src,
+                }
+            }
         })?;
     let handle = system.add_to(ctx.name, ctx.builder);
     // Return the instance descriptor, not the static one; a system whose
     // configure step minted ports resolves edges against what this instance
     // actually carries.
     Ok((handle, ctx.builder.descriptor_of(handle).clone()))
+}
+
+/// Decode a typed `Params` off a [`StaticParams`] surface: KDL through the
+/// spanned node deserializer, a value tree through serde (unknown keys
+/// rejected), no params through a synthesized minimal node.
+fn decode_static_params<P: serde::de::DeserializeOwned>(
+    params: &StaticParams,
+    name: &str,
+) -> Result<P, LoadError> {
+    match params {
+        StaticParams::Kdl { node, src } => de::from_kdl_node(node, src, name, SYSTEM_RESERVED, 1),
+        StaticParams::Value { value, src } => decode_value_params(value, name, src),
+        StaticParams::None => {
+            let (src, doc) = synthesized_node(name);
+            de::from_kdl_node(&doc.nodes()[0], &src, name, SYSTEM_RESERVED, 1)
+        }
+    }
+}
+
+/// The minimal node a [`StaticParams::None`] surface decodes through.
+fn synthesized_node(name: &str) -> (String, KdlDocument) {
+    let src = format!("system \"{name}\"");
+    let doc = src
+        .parse::<KdlDocument>()
+        .expect("a synthesized minimal node parses");
+    (src, doc)
+}
+
+/// Deserialize a typed `Params` from a value tree.
+///
+/// Unlike the dl path's schema conformance, this is plain serde, so
+/// `#[serde(default)]` field attributes are honored. `serde_ignored` supplies
+/// the typo guard serde_json's deserializer lacks: a key no field consumed is
+/// an [`UnknownParam`](LoadError::UnknownParam), matching the KDL
+/// deserializer's behavior, and any other decode failure is a
+/// [`ValueParams`](LoadError::ValueParams) carrying serde's own message.
+pub(crate) fn decode_value_params<P: serde::de::DeserializeOwned>(
+    value: &serde_json::Value,
+    system: &str,
+    src: &str,
+) -> Result<P, LoadError> {
+    let span: SourceSpan = (0, src.len()).into();
+    let mut unknown: Option<String> = None;
+    let params = serde_ignored::deserialize(value, |path: serde_ignored::Path<'_>| {
+        unknown.get_or_insert_with(|| path.to_string());
+    })
+    .map_err(|e| LoadError::ValueParams {
+        system: system.to_string(),
+        reason: e.to_string(),
+        src: src.to_string(),
+        span,
+    })?;
+    if let Some(property) = unknown {
+        return Err(LoadError::UnknownParam {
+            property,
+            system: system.to_string(),
+            src: src.to_string(),
+            span,
+        });
+    }
+    Ok(params)
 }
 
 /// One registered type: its factory plus the static descriptor, available
@@ -314,24 +408,45 @@ impl Registry {
             let entry = Rc::new(RefCell::new(entry));
             let factory = Box::new(move |ctx: &mut LoadCtx| {
                 let mut entry = entry.borrow_mut();
-                let params = crate::pack::EntryParams::Kdl {
-                    node: ctx.node,
-                    src: ctx.src,
-                    name: ctx.name,
-                    msgs: ctx.msgs,
+                let synthesized;
+                let params = match &ctx.params {
+                    StaticParams::Kdl { node, src } => crate::pack::EntryParams::Kdl {
+                        node,
+                        src,
+                        name: ctx.name,
+                        msgs: ctx.msgs,
+                    },
+                    StaticParams::Value { value, src } => crate::pack::EntryParams::Value {
+                        value,
+                        src,
+                        name: ctx.name,
+                        msgs: ctx.msgs,
+                    },
+                    StaticParams::None => {
+                        synthesized = synthesized_node(ctx.name);
+                        crate::pack::EntryParams::Kdl {
+                            node: &synthesized.1.nodes()[0],
+                            src: &synthesized.0,
+                            name: ctx.name,
+                            msgs: ctx.msgs,
+                        }
+                    }
                 };
                 let handle = ctx
                     .builder
                     .add_pack_entry(ctx.name, &mut entry, params)
                     .map_err(|e| match e {
-                        // The KDL decode already carries its span; unwrap it.
-                        crate::pack::MakeError::Kdl(e) => *e,
-                        other => LoadError::PackCreate {
-                            system: ctx.name.to_string(),
-                            message: other.to_string(),
-                            src: ctx.src.to_string(),
-                            span: (0, ctx.src.len()).into(),
-                        },
+                        // The params decode already carries its span; unwrap it.
+                        crate::pack::MakeError::Params(e) => *e,
+                        other => {
+                            let src = ctx.params.diag_src(ctx.name);
+                            LoadError::PackCreate {
+                                system: ctx.name.to_string(),
+                                message: other.to_string(),
+                                span: (0, src.len()).into(),
+                                src,
+                            }
+                        }
                     })?;
                 Ok((handle, ctx.builder.descriptor_of(handle).clone()))
             });
@@ -544,10 +659,10 @@ pub fn resolve(wiring: &Wiring, registry: &Registry) -> Result<Coordinator, Load
 
 /// Instantiate a static system through the [`Registry`] factory.
 ///
-/// The factory deserializes params off a `system` node, so one is
-/// reconstructed from the spec: a config-less system synthesizes a minimal
-/// node, and a params-bearing one re-parses the node source text the parse
-/// stage stored in [`SystemSpec::params`].
+/// A KDL-origin spec re-parses the node source text the parse stage stored
+/// in [`SystemSpec::params`], and a config-less one synthesizes a minimal
+/// node, so both decode through the spanned node deserializer; a value-tree
+/// spec passes its params straight through as [`StaticParams::Value`].
 fn resolve_static(
     spec: &SystemSpec,
     registry: &Registry,
@@ -572,11 +687,14 @@ fn resolve_static(
             src,
         }
     })?;
-    // Typed builder params ([`ParamSource::Postcard`]) are rejected: the
-    // static path deserializes KDL, not postcard, so the bytes have no decode
-    // path and would be silently dropped, leaving the system on defaults.
-    let node_src = match &spec.params {
-        ParamSource::None => format!("system \"{}\" type=\"{}\"", spec.name, ty),
+    let node_src;
+    let doc;
+    let snippet;
+    let params = match &spec.params {
+        // Typed builder params ([`ParamSource::Postcard`]) are rejected: the
+        // static path deserializes KDL or a value tree, not postcard, so the
+        // bytes have no decode path and would be silently dropped, leaving
+        // the system on defaults.
         ParamSource::Postcard(_) => {
             let src = system_src(spec);
             return Err(LoadError::StaticPostcardParams {
@@ -586,25 +704,40 @@ fn resolve_static(
                 src,
             });
         }
-        ParamSource::Kdl(text) => text.clone(),
+        ParamSource::Value(value) => {
+            snippet = system_src(spec);
+            StaticParams::Value {
+                value,
+                src: &snippet,
+            }
+        }
+        ParamSource::None | ParamSource::Kdl(_) => {
+            node_src = match &spec.params {
+                ParamSource::Kdl(text) => text.clone(),
+                _ => format!("system \"{}\" type=\"{}\"", spec.name, ty),
+            };
+            doc = node_src
+                .parse::<KdlDocument>()
+                .map_err(|source| LoadError::Parse {
+                    source,
+                    src: node_src.clone(),
+                    span: (0, node_src.len()).into(),
+                })?;
+            let node = doc
+                .nodes()
+                .first()
+                .ok_or_else(|| LoadError::MissingInstanceName {
+                    src: node_src.clone(),
+                    span: (0, node_src.len()).into(),
+                })?;
+            StaticParams::Kdl {
+                node,
+                src: &node_src,
+            }
+        }
     };
-    let doc = node_src
-        .parse::<KdlDocument>()
-        .map_err(|source| LoadError::Parse {
-            source,
-            src: node_src.clone(),
-            span: (0, node_src.len()).into(),
-        })?;
-    let node = doc
-        .nodes()
-        .first()
-        .ok_or_else(|| LoadError::MissingInstanceName {
-            src: node_src.clone(),
-            span: (0, node_src.len()).into(),
-        })?;
     (factory.factory)(&mut LoadCtx {
-        node,
-        src: &node_src,
+        params,
         name: &spec.name,
         builder,
         msgs: &registry.msgs,
@@ -830,6 +963,7 @@ fn encode_occupant_params(
         ParamSource::Kdl(node_text) => encode_kdl_params_with_defaults(
             node_text, schema, owner, reserved, skip_args, defaults,
         )?,
+        ParamSource::Value(value) => encode_value_params(value, schema, owner, defaults)?,
     })
 }
 
