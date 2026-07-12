@@ -311,6 +311,20 @@ pub enum LoadError {
         span: SourceSpan,
     },
 
+    /// A static system's value-tree params did not deserialize as its typed
+    /// `Params`. The reason is serde's own message; a value tree carries no
+    /// document spans, so the label covers the whole diagnostic snippet.
+    #[error("system `{system}` value params did not deserialize: {reason}")]
+    #[diagnostic(code(fsw_wiring::value_params))]
+    ValueParams {
+        system: String,
+        reason: String,
+        #[source_code]
+        src: String,
+        #[label("these params")]
+        span: SourceSpan,
+    },
+
     /// A static system was given typed builder params. The static path has no
     /// postcard decoder; its registered factory deserializes params off the
     /// KDL `system` node, so the postcard bytes would be silently dropped and

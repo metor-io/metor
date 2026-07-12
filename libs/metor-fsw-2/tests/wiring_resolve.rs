@@ -309,6 +309,51 @@ connect "ticker" -> "counter" frame="tick_in"
     drop((builder_view, kdl_view, builder_coord, kdl_coord));
 }
 
+/// A `Value` params tree schema-encodes to byte-identical postcard as the
+/// equivalent KDL node and the typed value's own encoding — the IR
+/// promotion's core equivalence claim, checked against the fixture's
+/// exported schema.
+#[test]
+fn value_and_kdl_dl_params_are_byte_identical() {
+    use metor_fsw_2::wiring::{encode_kdl_params, encode_value_params};
+
+    let mut wiring = WiringBuilder::new()
+        .coordinator(200.0, ClockSpec::Simulated { dt_secs: 0.005 })
+        .artifact("counter", "metor-fsw-2-dl-fixture", fixture_lib_stem())
+        .build();
+    if let Err(e) = build_artifacts(&mut wiring, &BuildOptions::default()) {
+        eprintln!("skipping: build_artifacts failed: {e}");
+        return;
+    }
+    let dl = DlPack::open(wiring.artifacts[0].path.as_ref().unwrap())
+        .expect("open the fixture .so for its Params schema")
+        .system("DlCounter")
+        .expect("select the counter entry");
+
+    let kdl_bytes = encode_kdl_params(
+        r#"system "counter" type="DlCounter" artifact="counter" start=1000 scale=2.0"#,
+        dl.params_schema(),
+        "counter",
+        &["type", "artifact"],
+        1,
+    )
+    .expect("schema-encode KDL params");
+    let value_bytes = encode_value_params(
+        &serde_json::json!({ "start": 1000, "scale": 2.0 }),
+        dl.params_schema(),
+        "counter",
+        None,
+    )
+    .expect("schema-encode Value params");
+    let typed_bytes = postcard::to_allocvec(&CounterParams {
+        start: 1000,
+        scale: 2.0,
+    })
+    .unwrap();
+    assert_eq!(value_bytes, kdl_bytes, "one params representation, two spellings");
+    assert_eq!(value_bytes, typed_bytes, "and both match the typed encoding");
+}
+
 /// `type=` selects the pack entry a dl system instantiates. Over a
 /// multi-entry pack an omitted `type=` is a clean `PackTypeRequired` error
 /// listing the choices, and a `type=` naming no exported entry fails with

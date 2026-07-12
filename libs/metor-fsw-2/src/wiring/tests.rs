@@ -342,6 +342,7 @@ fn registry() -> Registry {
     r.register::<Sink, _>("Sink");
     r.register::<MsgSrc, _>("MsgSrc");
     r.register::<MsgSink, _>("MsgSink");
+    r.register::<ValueProbe, _>("ValueProbe");
     r
 }
 
@@ -2031,6 +2032,255 @@ system "trim2" type="Trim2"
         10.5,
         "absent config = pure defaults"
     );
+}
+
+// ---------------------------------------------------------------------------
+// ParamSource::Value: the value-tree params surface. Static systems serde-
+// deserialize it (field defaults honored, unknown keys rejected); pack
+// entries take it through the same EntryParams seam, defaults overlay
+// included.
+// ---------------------------------------------------------------------------
+
+static VALUE_PROBE_BITS: AtomicU64 = AtomicU64::new(0);
+
+/// A params struct with a required and a serde-defaulted field, to observe
+/// that both semantics survive the `Value` path end to end.
+#[derive(serde::Deserialize)]
+struct ValueProbeParams {
+    gain: f64,
+    #[serde(default)]
+    bias: f64,
+}
+
+struct ValueProbe {
+    gain: f64,
+    bias: f64,
+}
+
+impl System for ValueProbe {
+    type Input = NoIn;
+    type Output = Out<NoOut>;
+    const NAME: &'static str = "value_probe";
+}
+
+impl CyclicSystem for ValueProbe {
+    fn execute(&mut self, _now: Timestamp, _in: &mut NoIn, _o: &mut Self::Output) {
+        VALUE_PROBE_BITS.store((self.gain + self.bias).to_bits(), Relaxed);
+    }
+}
+
+impl BuildSystem for ValueProbe {
+    type Params = ValueProbeParams;
+    fn new(params: Self::Params) -> Self {
+        Self {
+            gain: params.gain,
+            bias: params.bias,
+        }
+    }
+}
+
+/// A builder-origin `Value` params tree reaches a static system's `new`,
+/// with the omitted `#[serde(default)]` field on its default.
+#[cfg(not(miri))]
+#[stellarator::test]
+async fn static_system_resolves_and_runs_from_value_params() {
+    VALUE_PROBE_BITS.store(0, Relaxed);
+    let wiring = WiringBuilder::new()
+        .coordinator(1000.0, ClockSpec::Wall)
+        .system("probe")
+        .ty("ValueProbe")
+        .params_value(serde_json::json!({ "gain": 2.25 }))
+        .end()
+        .build();
+    let mut coord = resolve(&wiring, &registry()).expect("value params resolve");
+    coord.run_for(2).await;
+    assert_eq!(
+        f64::from_bits(VALUE_PROBE_BITS.load(Relaxed)),
+        2.25,
+        "gain reached new(); bias took its serde default"
+    );
+}
+
+/// An unknown key in a `Value` tree is an `UnknownParam` (via serde_ignored),
+/// matching the KDL deserializer's typo guard, not a silent skip.
+#[test]
+fn err_value_params_unknown_key() {
+    let wiring = WiringBuilder::new()
+        .coordinator(100.0, ClockSpec::Wall)
+        .system("nav")
+        .ty("NavFilter")
+        .params_value(serde_json::json!({ "gain": 0.8, "gian": 0.5 }))
+        .end()
+        .build();
+    let err = match resolve(&wiring, &registry()) {
+        Ok(_) => panic!("expected an UnknownParam error"),
+        Err(e) => e,
+    };
+    assert!(
+        matches!(
+            err,
+            LoadError::UnknownParam { ref property, ref system, .. }
+                if property == "gian" && system == "nav"
+        ),
+        "{err:?}"
+    );
+}
+
+/// A missing required field on the `Value` path is a `ValueParams` decode
+/// error carrying serde's own message.
+#[test]
+fn err_value_params_missing_required() {
+    let wiring = WiringBuilder::new()
+        .coordinator(100.0, ClockSpec::Wall)
+        .system("nav")
+        .ty("NavFilter")
+        .params_value(serde_json::json!({}))
+        .end()
+        .build();
+    let err = match resolve(&wiring, &registry()) {
+        Ok(_) => panic!("expected a ValueParams error"),
+        Err(e) => e,
+    };
+    match err {
+        LoadError::ValueParams { system, reason, .. } => {
+            assert_eq!(system, "nav");
+            assert!(reason.contains("gain"), "names the missing field: {reason}");
+        }
+        other => panic!("expected ValueParams, got {other:?}"),
+    }
+}
+
+/// An integer outside the field's width fails the static serde path loudly.
+/// (The dl path range-checks in `conform_value`; this pins the parity.)
+#[test]
+fn err_value_params_out_of_range_int() {
+    // ImuParams.i2c_bus is i64; u64::MAX cannot narrow into it.
+    let wiring = WiringBuilder::new()
+        .coordinator(100.0, ClockSpec::Wall)
+        .system("imu")
+        .ty("ImuDriver")
+        .params_value(serde_json::json!({ "i2c_bus": u64::MAX, "sample_hz": 200.0 }))
+        .end()
+        .build();
+    let err = match resolve(&wiring, &registry()) {
+        Ok(_) => panic!("expected a ValueParams error"),
+        Err(e) => e,
+    };
+    assert!(
+        matches!(err, LoadError::ValueParams { ref system, .. } if system == "imu"),
+        "{err:?}"
+    );
+}
+
+/// The `Value` decode is plain serde: `#[serde(default = ...)]` fills an
+/// absent field and an absent `Option` reads as `None`, exactly like the KDL
+/// round-trip above.
+#[test]
+fn value_params_honor_serde_field_defaults() {
+    let value = serde_json::json!({ "count": 3, "rate": 1.5, "label": "hi" });
+    let got: RoundTrip = super::decode_value_params(&value, "params", "snippet").unwrap();
+    assert_eq!(
+        got,
+        RoundTrip {
+            count: 3,
+            rate: 1.5,
+            label: "hi".to_string(),
+            offset: None,
+            depth: 4,
+        }
+    );
+}
+
+/// A pack entry with declared defaults takes `Value` overrides through the
+/// same top-level overlay as KDL config: the spelled key replaces the
+/// default, everything else stays.
+#[cfg(not(miri))]
+#[stellarator::test]
+async fn pack_entry_defaults_overlay_value_overrides() {
+    #[derive(serde::Serialize, serde::Deserialize, postcard_schema::Schema)]
+    struct TrimParams {
+        gain: f64,
+        bias: f64,
+    }
+
+    static LAST: AtomicU64 = AtomicU64::new(0);
+    struct St {
+        gain: f64,
+        bias: f64,
+    }
+    fn emit(s: &mut St, now: Timestamp, out: &mut crate::Output<Imu>) {
+        LAST.store((s.gain + s.bias).to_bits(), Relaxed);
+        out.publish(&Imu {
+            timestamp: now,
+            omega: s.gain + s.bias,
+        });
+    }
+
+    let mut r = Registry::new();
+    r.register_pack(crate::Pack::new().system(
+        "TrimV",
+        crate::system(emit)
+            .init(|p: TrimParams| St {
+                gain: p.gain,
+                bias: p.bias,
+            })
+            .defaults(TrimParams {
+                gain: 10.0,
+                bias: 0.5,
+            }),
+    ));
+
+    let wiring = WiringBuilder::new()
+        .coordinator(1000.0, ClockSpec::Wall)
+        .system("trim")
+        .ty("TrimV")
+        .params_value(serde_json::json!({ "gain": 2.0 }))
+        .end()
+        .build();
+    let mut coord = resolve(&wiring, &r).expect("value overrides overlay the defaults");
+    coord.run_for(2).await;
+    assert_eq!(
+        f64::from_bits(LAST.load(Relaxed)),
+        2.5,
+        "override (2.0) + defaulted bias (0.5)"
+    );
+}
+
+/// The TCP built-ins' specs carry their `addr` as a `Value` tree, and the
+/// variant survives a serde round-trip of the spec.
+#[test]
+fn builtin_link_specs_carry_value_params() {
+    let spec =
+        crate::wiring::SystemSpec::tcp_downlink("telemetry", "127.0.0.1:2240".parse().unwrap());
+    match &spec.params {
+        ParamSource::Value(v) => {
+            assert_eq!(v, &serde_json::json!({ "addr": "127.0.0.1:2240" }))
+        }
+        other => panic!("expected ParamSource::Value, got {other:?}"),
+    }
+    let json = serde_json::to_string(&spec).expect("serialize");
+    let back: crate::wiring::SystemSpec = serde_json::from_str(&json).expect("deserialize");
+    assert_eq!(back, spec, "Value params round-trip");
+}
+
+/// Both built-ins resolve and run from their `Value` params: the
+/// `SocketAddr` reads from the JSON string and the subset/msgs fields fall
+/// back to their serde defaults.
+#[cfg(not(miri))]
+#[stellarator::test]
+async fn builder_telemetry_and_uplink_resolve_from_value_params() {
+    let wiring = WiringBuilder::new()
+        .coordinator(1000.0, ClockSpec::Simulated { dt_secs: 0.001 })
+        .system("imu")
+        .ty("ImuDriver")
+        .params_value(serde_json::json!({ "i2c_bus": 1, "sample_hz": 200.0 }))
+        .end()
+        .telemetry("127.0.0.1:59422".parse().unwrap())
+        .uplink("127.0.0.1:59423".parse().unwrap())
+        .build();
+    let mut coord = resolve(&wiring, &registry()).expect("builtins resolve from Value params");
+    coord.run_for(5).await;
+    assert!(coord.stopped().is_empty(), "no system hard-stopped");
 }
 
 // ---------------------------------------------------------------------------

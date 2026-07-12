@@ -1,25 +1,30 @@
-//! Schema-guided encoding of a KDL params node into postcard bytes.
+//! Schema-guided encoding of a dl system's params into postcard bytes.
 //!
 //! A dynamically loaded system's `Params` type is never linked into the host.
 //! What the host has instead is the postcard schema the shared library exports
 //! ([`DlSystem::params_schema`](crate::dl::DlSystem::params_schema)). This
-//! module walks that schema to turn a system node's KDL params into the exact
-//! bytes the `Params` struct itself would postcard-encode to, so the loaded
-//! side can decode them as its own type.
+//! module walks that schema to turn a params surface into the exact bytes the
+//! `Params` struct itself would postcard-encode to, so the loaded side can
+//! decode them as its own type.
 //!
-//! The pipeline has three steps. The shared node deserializer ([`de`]) reads
-//! the node's params surface into a dynamic [`serde_json::Value`] plus a table
-//! mapping each top-level key to its source span. [`conform_to_schema`] then
-//! checks that value against the schema, turning unknown keys, missing fields,
-//! and type mismatches into spanned [`LoadError`]s and inserting an explicit
-//! `Null` for every absent `Option` field, since postcard-dyn requires the key
-//! to be present. Finally [`postcard_dyn::to_stdvec_dyn`] emits the bytes.
+//! Two front-ends feed one tail. [`encode_kdl_params`] reads a system node's
+//! KDL params through the shared node deserializer ([`de`]) into a dynamic
+//! [`serde_json::Value`] plus a table mapping each top-level key to its
+//! source span; [`encode_value_params`] starts from a value tree directly
+//! (the [`ParamSource::Value`](super::ParamSource::Value) path), with no
+//! spans. Both then run the same [`conform_and_encode`] tail: overlay the
+//! entry's declared defaults, check the value against the schema —
+//! [`conform_to_schema`] turns unknown keys, missing fields, and type
+//! mismatches into [`LoadError`]s and inserts an explicit `Null` for every
+//! absent `Option` field, since postcard-dyn requires the key to be present —
+//! and emit the bytes with [`postcard_dyn::to_stdvec_dyn`].
 //!
 //! Two properties of the conformance walk are worth knowing. The span table
-//! covers top-level keys only, so an error inside a nested struct or sequence
-//! carries the span of the top-level property containing it. And any schema
-//! shape the walk does not model (tuples, maps, enums) passes through
-//! unchecked; if postcard-dyn cannot encode it, the failure surfaces as
+//! covers top-level keys only (and is empty for a value tree), so an error
+//! inside a nested struct or sequence carries the span of the top-level
+//! property containing it, or the whole surface. And any schema shape the
+//! walk does not model (tuples, maps, enums) passes through unchecked; if
+//! postcard-dyn cannot encode it, the failure surfaces as
 //! [`LoadError::DlParamEncode`] rather than as silently wrong bytes.
 
 use std::collections::HashMap;
@@ -82,6 +87,55 @@ pub fn encode_kdl_params_with_defaults(
         .ok_or_else(|| encode_err("the carried params text has no node".into()))?;
 
     let (value, spans) = de::params_value(node, node_text, system, reserved, skip_args)?;
+    conform_and_encode(value, schema, &spans, system, defaults, node_text, node.span())
+}
+
+/// Encodes a params value tree into the postcard bytes described by `schema`,
+/// the [`ParamSource::Value`](super::ParamSource::Value) twin of
+/// [`encode_kdl_params_with_defaults`] over the same conform-and-encode tail.
+///
+/// A value tree carries no document spans, so the rendered JSON stands in as
+/// the diagnostic source and every error anchors to the whole surface.
+pub fn encode_value_params(
+    value: &serde_json::Value,
+    schema: &OwnedNamedType,
+    system: &str,
+    defaults: Option<&[u8]>,
+) -> Result<Vec<u8>, LoadError> {
+    let src = value.to_string();
+    let span: SourceSpan = (0, src.len()).into();
+    conform_and_encode(
+        value.clone(),
+        schema,
+        &HashMap::new(),
+        system,
+        defaults,
+        &src,
+        span,
+    )
+}
+
+/// The shared encode tail: overlay the entry's declared defaults, conform
+/// the value to the schema, and emit the postcard bytes. `spans` maps
+/// top-level keys to their spans in `src` (empty for a value tree), and
+/// `node_span` is the fallback anchor for everything the table misses.
+fn conform_and_encode(
+    value: Value,
+    schema: &OwnedNamedType,
+    spans: &HashMap<String, SourceSpan>,
+    system: &str,
+    defaults: Option<&[u8]>,
+    src: &str,
+    node_span: SourceSpan,
+) -> Result<Vec<u8>, LoadError> {
+    let span: SourceSpan = (0, src.len()).into();
+    let encode_err = |reason: String| LoadError::DlParamEncode {
+        system: system.to_string(),
+        reason,
+        src: src.to_string(),
+        span,
+    };
+
     let value = match defaults {
         Some(bytes) if !bytes.is_empty() => {
             let base = postcard_dyn::from_slice_dyn(schema, bytes)
@@ -90,8 +144,8 @@ pub fn encode_kdl_params_with_defaults(
         }
         _ => value,
     };
-    let value = conform_to_schema(&schema.ty, value, &spans, system, node_text, node.span())
-        .map_err(|e| match e {
+    let value =
+        conform_to_schema(&schema.ty, value, spans, system, src, node_span).map_err(|e| match e {
             Conform::Load(err) => *err,
             Conform::Shape(reason) => encode_err(reason),
         })?;

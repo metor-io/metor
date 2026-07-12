@@ -387,6 +387,30 @@ fn slot_allow_params_resolve_and_run_b1() {
         builder_bytes,
         "child-block form byte-matches"
     );
+
+    // The value-tree spelling (`allow_with_value`) encodes to the same bytes.
+    let value_wiring = WiringBuilder::new()
+        .coordinator(
+            1000.0,
+            metor_fsw_2::ClockSpec::Simulated { dt_secs: 0.000002 },
+        )
+        .artifact("gainer", PARAM_FIXTURE_CRATE, PARAM_FIXTURE_STEM)
+        .slot("gslot")
+        .output("gain_out")
+        .allow_with_value("gainer", serde_json::json!({ "gain": 0.8 }))
+        .initial("gainer", SlotInitState::Running)
+        .end()
+        .build();
+    let value_tree = match &value_wiring.slots[0].allow[0].params {
+        ParamSource::Value(v) => v.clone(),
+        other => panic!("expected Value params from allow_with_value, got {other:?}"),
+    };
+    assert_eq!(
+        metor_fsw_2::wiring::encode_value_params(&value_tree, dl.params_schema(), "gslot", None)
+            .expect("schema-encode the allow value params"),
+        builder_bytes,
+        "value-tree form byte-matches"
+    );
     drop(dl);
 
     // (b) End to end: the resolved slot runs and the occupant publishes the

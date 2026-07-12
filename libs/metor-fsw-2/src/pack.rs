@@ -52,9 +52,10 @@ pub enum Mount {
     SlotOccupant,
 }
 
-/// The params surface an entry decodes at create, by loading mode. The
-/// postcard bytes and the KDL node produce the same value by construction
-/// (the KDL front-end encodes against the same schema).
+/// The params surface an entry decodes at create, by loading mode. Every
+/// surface produces the same value by construction: the KDL front-end and
+/// the value tree encode against the same schema the postcard bytes decode
+/// under.
 pub enum EntryParams<'a> {
     /// Canonical postcard bytes (the dl / process-worker path).
     Postcard(&'a [u8]),
@@ -68,6 +69,18 @@ pub enum EntryParams<'a> {
         name: &'a str,
         msgs: &'a crate::message::MsgTable,
     },
+    /// A params value tree (the static [`ParamSource::Value`] path). `src`
+    /// is the diagnostic snippet errors anchor on; a value tree carries no
+    /// spans of its own.
+    ///
+    /// [`ParamSource::Value`]: crate::wiring::ParamSource::Value
+    #[cfg(feature = "kdl")]
+    Value {
+        value: &'a serde_json::Value,
+        src: &'a str,
+        name: &'a str,
+        msgs: &'a crate::message::MsgTable,
+    },
 }
 
 /// A create-phase failure: bad params, or a moved-in state already taken.
@@ -76,10 +89,10 @@ pub enum MakeError {
     /// The postcard params bytes did not decode as the entry's params type.
     #[error("pack entry params did not decode: {0}")]
     Postcard(#[from] postcard::Error),
-    /// The KDL params surface did not deserialize (spans inside).
+    /// The KDL or value params surface did not deserialize (spans inside).
     #[cfg(feature = "kdl")]
     #[error(transparent)]
-    Kdl(Box<crate::wiring::LoadError>),
+    Params(Box<crate::wiring::LoadError>),
     /// A `configure` step failed to resolve a config reference.
     #[error(transparent)]
     Configure(#[from] crate::system::ConfigureError),
@@ -89,7 +102,7 @@ pub enum MakeError {
     StateTaken,
 }
 
-/// Decode an entry's typed params from either params surface.
+/// Decode an entry's typed params from any params surface.
 pub(crate) fn decode_params<P: DeserializeOwned>(params: EntryParams<'_>) -> Result<P, MakeError> {
     match params {
         EntryParams::Postcard(bytes) => Ok(postcard::from_bytes(bytes)?),
@@ -97,14 +110,19 @@ pub(crate) fn decode_params<P: DeserializeOwned>(params: EntryParams<'_>) -> Res
         EntryParams::Kdl {
             node, src, name, ..
         } => crate::wiring::de::from_kdl_node(node, src, name, crate::wiring::SYSTEM_RESERVED, 1)
-            .map_err(|e| MakeError::Kdl(Box::new(e))),
+            .map_err(|e| MakeError::Params(Box::new(e))),
+        #[cfg(feature = "kdl")]
+        EntryParams::Value {
+            value, src, name, ..
+        } => crate::wiring::decode_value_params(value, name, src)
+            .map_err(|e| MakeError::Params(Box::new(e))),
     }
 }
 
 /// Resolve an entry's params surface to complete postcard bytes when the
 /// entry declared defaults: an absent config uses the defaults verbatim, a
-/// KDL surface is schema-encoded over the decoded default base (top-level
-/// overrides), and explicit postcard bytes pass through complete.
+/// KDL or value surface is schema-encoded over the decoded default base
+/// (top-level overrides), and explicit postcard bytes pass through complete.
 pub(crate) fn resolve_defaults(
     params: EntryParams<'_>,
     defaults: &[u8],
@@ -124,7 +142,13 @@ pub(crate) fn resolve_defaults(
                 1,
                 Some(defaults),
             )
-            .map_err(|e| MakeError::Kdl(Box::new(e)))
+            .map_err(|e| MakeError::Params(Box::new(e)))
+        }
+        #[cfg(feature = "kdl")]
+        EntryParams::Value { value, name, .. } => {
+            let owned = postcard_schema::schema::owned::OwnedNamedType::from(schema);
+            crate::wiring::encode_value_params(value, &owned, name, Some(defaults))
+                .map_err(|e| MakeError::Params(Box::new(e)))
         }
     }
 }
@@ -239,7 +263,7 @@ impl Pack {
         let create: CreateFn = Box::new(move |params: EntryParams<'_>| {
             #[cfg(feature = "kdl")]
             let msgs = match &params {
-                EntryParams::Kdl { msgs, .. } => Some(*msgs),
+                EntryParams::Kdl { msgs, .. } | EntryParams::Value { msgs, .. } => Some(*msgs),
                 _ => None,
             };
             let p: T::Params = decode_params(params)?;
