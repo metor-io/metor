@@ -11,6 +11,18 @@
 > derives a slot's process mode from backing uniformity over the allowed set
 > (`OccupantBacking::Artifact` throughout; a mixed set is rejected, per §8's
 > per-slot-means-all-occupants rule).
+>
+> **Pack update (2026-07-11, `docs/packs.md`):** the single-system dl ABI this document's
+> spellings assume became the pack ABI v5, and the sequence stack was unified away. Read
+> `fsw_create`/`fsw_bind_init`/`fsw_execute`/`fsw_destroy` below as
+> `fsw_pack_create(index, mount)`/`fsw_pack_bind_init`/`fsw_pack_execute`/`fsw_pack_destroy`,
+> `DlSystem::open` as `DlPack::open` + entry selection, and `run_seq_execute`/
+> `run_seq_shutdown` as the occupant-mount `Driver` path (`docs/packs.md` §9) —
+> `DlSlot::step_seq` and the worker's `RunMode::Sequence` fold survive as described, with
+> `WorkerManifest::Run` additionally carrying the pack entry name. Occupants are no longer
+> sequence-only: any pack entry can occupy a process slot, and each occupant worker runs
+> `pack()` in its own address space (no shared pack state across the boundary). The
+> lifecycle, spawn-per-Load model, and reclamation below are otherwise as shipped.
 
 Runtime slots (`docs/sequences-slots.md`) load their occupants with `DlSystem::open` and run
 them in the coordinator's address space; process systems (`docs/process-systems.md`) run a

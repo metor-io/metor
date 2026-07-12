@@ -25,6 +25,31 @@
 > occupant in its own worker process, spawned per `Load`, with the same isolation rule as
 > process systems (the host never dlopens an occupant artifact). Design and rationale:
 > `docs/process-slots.md`.
+>
+> **Unification update (2026-07-11, the packs arc — `docs/packs.md`,
+> `docs/design-packs-authoring.md`):** the sequence *stack* this document specifies is
+> retired, and the "sequence occupants only" restriction (callout 2 above) is **lifted**:
+>
+> - The occupant tail (`SlotControlIn` cancel input; `SequenceStatus` output) is a
+>   **mount property**, not descriptor content: `add_slot` and the occupant-mount bind
+>   append it around any pack entry's own ports, so **slots accept any entry** — an async
+>   occupant keeps the cooperative `aborted()` cancel; a sync (cyclic) occupant gets
+>   stop-on-cancel with a terminal `Aborted` (`docs/packs.md` §9). An occupant that
+>   declares the tail itself is a pre-pack artifact and is rejected.
+> - `#[sequence]` (§4) is a deprecated passthrough slated for deletion. A sequence is a
+>   plain `async fn` registered with `Pack::task("name", f)`; typed params ride a
+>   `Params<P>` wrapper argument; the crate exports via `export_pack!`. The generated
+>   `SeqSystem`/`SeqBound`/`SeqStatusOut` machinery and the whole `run_seq_*` ABI family
+>   are **deleted** — occupants run behind the unified `Driver` seam
+>   (`FutureDriver`/`OccupantFuture`, `src/handler/driver.rs`).
+> - `SeqClock` survives as a type alias of `CycleClock`, and async entries gained
+>   `cycle().await` (suspend until next cycle) beside `wait`/`now`/`progress`/`aborted`.
+> - The wiring surface in §5's examples predates packs: `artifact` nodes carry no `type=`
+>   anymore, and `allow occupant="…"` takes an optional `artifact=`
+>   (`docs/packs.md` §8).
+>
+> The slot layer itself — the state machine (§2), the command plane (§3), ring reuse
+> (§2.3), telemetry (§7) — shipped as described and is still current.
 
 The cube-sat example (`examples/cube-sat/src/sequencer.rs`) has a feature `metor-fsw-2`
 does not: **sequences** — small re-entrant programs that command the spacecraft through

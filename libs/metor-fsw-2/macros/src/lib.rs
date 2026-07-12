@@ -148,10 +148,9 @@ pub fn frame(attr: TokenStream, item: TokenStream) -> TokenStream {
 ///   name) and/or `&mut HealthPort`.
 ///
 /// `#[system(name = "…")]` overrides the wiring name, which defaults to the
-/// snake_cased type ident with any `System` suffix stripped.
-/// `#[system(export)]` and `#[system(export = "feature")]` additionally emit
-/// the same `fsw_*` entry points as [`export_system!`], compiled out under
-/// `cfg(test)` and, in the second form, gated on the named cargo feature.
+/// snake_cased type ident with any `System` suffix stripped. It is the only
+/// argument: there is no per-system export — a system reaches a cdylib
+/// through its crate's pack (`Pack::system_type` + `export_pack!`).
 #[proc_macro_attribute]
 pub fn system(attr: TokenStream, item: TokenStream) -> TokenStream {
     system_attr::system_impl(attr.into(), item.into()).into()

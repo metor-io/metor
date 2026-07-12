@@ -59,17 +59,14 @@ to drop to a nadir-pointing safe state).
 | Crate | Path | Role |
 |---|---|---|
 | `adcs-contracts` | `contracts/` | The shared compile-time contract: the frame structs (sensors / gps / body / world / attitude_estimate / mode_cmd / torque_cmd / mtq_cmd / wheels / disturb), the per-system `Params`, and only the physics **both sides** rely on — orbital constants + inertia, the actuator envelope (wheel torque/momentum limits, torquer dipole limit), the WMM magnetic-field + sun-direction models (the plant's truth *and* nav's references), the Nadir/HIL pointing laws, and the desat/detumble magnetorquer laws. Linked by the cdylibs (and the test), **not** by the host. |
-| `adcs-plant` | `systems/plant/` | The orbiting rigid-body plant and **its** physics: the wheel dynamics (`WheelDynamics` over the shared telemetry struct — bearing friction, saturation foldback), the disturbance-torque model, the GPS/magnetometer error models, magnetorquers, and the sensor suite. A `cdylib` exporting a one-entry pack (`export_pack!` over `pack()`). |
-| `adcs-nav` | `systems/nav/` | The MEKF filter cdylib: reconstructs the sun vector from the raw CSS readings (`sun_from_css`), models its own sun/WMM-mag references at the GPS position, and runs magnetometer-only through eclipses. |
-| `adcs-ctrl` | `systems/ctrl/` | The Yang-LQR + magnetorquer-law controller cdylib (selects the pointing-law target from `ModeCmd`, desaturates the wheels through the torquers). |
-| `adcs-commissioning` / `adcs-safe-mode` | `systems/commissioning/`, `systems/safe-mode/` | The async-fn sequence occupants of the `mode` slot (each a one-entry pack cdylib): the condition-based commissioning ladder (params on the `allow` line) and the one-shot safing drop. |
+| `adcs-systems` | `systems/adcs-systems/` | The three cyclic systems as **one pack in one cdylib** (`fn pack()` + `export_pack!`): the orbiting rigid-body **plant** and its physics (wheel dynamics, disturbance-torque model, GPS/magnetometer error models, magnetorquers, sensor suite), the MEKF **nav** filter (`sun_from_css` reconstruction, its own sun/WMM references at the GPS position, magnetometer-only through eclipses), and the Yang-LQR + magnetorquer-law **ctrl** controller. Plant and nav are fn-authored (state struct + `init` fn + `execute` fn); ctrl deliberately stays `#[system]` struct-authored so the pack exercises both styles. |
+| `adcs-sequences` | `systems/adcs-sequences/` | Both async-fn sequence occupants of the `mode` slot as one pack cdylib: the condition-based commissioning ladder (params on the `allow` line) and the one-shot safing drop. |
 | `adcs-fsw2` | (this crate) | The mission **host**: builds + `dlopen`s the cdylibs and runs the coordinator. Links only `metor-fsw-2` — it is fully schema-agnostic (frames validated from serialized VTables, params encoded from each `.so`'s exported schema). |
 
-Each system crate is `crate-type = ["cdylib", "rlib"]`: the cdylib is what the host loads;
-the rlib lets the convergence test also link the systems statically for the parity check.
-The `export_pack!` C-ABI symbols ride an `export` feature (on by default for the cdylib,
-off when the test links the rlib) so the system rlibs link into one test binary without a
-duplicate `fsw_*` symbol clash.
+`adcs-systems` is `crate-type = ["cdylib", "rlib"]`: the cdylib is what the host loads; the
+rlib lets the convergence test register the **same** `pack()` statically for the parity
+check. The `export_pack!` C-ABI symbols ride an `export` feature (on by default for the
+cdylib, off when the test links the rlib) so the rlib carries no `fsw_pack_*` exports.
 
 ## Watch it live in metor-panel
 
@@ -132,9 +129,9 @@ ergonomics report.)
 cargo test -p adcs-fsw2     # builds the cdylibs, then asserts convergence + parity
 ```
 
-`tests/closed_loop.rs` runs the **same** `mission.kdl` two ways — `plant`/`nav`/`ctrl` linked
-statically (rlibs, resolved via a `Registry`) and the same systems `dlopen`'d from their
-cdylibs — with the `mode` slot's sequences dlopen in both. It asserts both converge onto the
+`tests/closed_loop.rs` runs the **same** `mission.kdl` two ways — `plant`/`nav`/`ctrl`
+registered statically (the rlib's `pack()` into a `Registry`) and the same pack `dlopen`'d
+from its cdylib — with the `mode` slot's sequences dlopen in both. It asserts both converge onto the
 commanded pointing target and that the dlopen run matches the static one **bit-for-bit** (same
 systems, same params, same seed, just loaded vs linked). `tests/momentum.rs` preloads the
 wheels and asserts the desaturation law dumps stored momentum through the torquers while the
@@ -144,6 +141,7 @@ is computed, not hardcoded) and asserts the CSS heads go dark, SRP switches off,
 magnetometer-only estimate rides through the sun loss. `tests/sequences.rs` exercises the `mode` slot end-to-end (auto-run, interactive
 Load→Start→Abort, and the downlinked sequence events); `tests/bundle.rs` checks the mission
 bundles and runs. All build real cdylibs, so they are slower than plain unit tests and are
-gated off `miri`. The physics itself is unit-tested underneath: the wheel model and
-disturbance magnitudes in `adcs-contracts`, and total-angular-momentum conservation + the
-detumble law against the plant's own `propagate` in `adcs-plant`.
+gated off `miri`. The physics itself is unit-tested underneath: the WMM band, shadow
+geometry, and magnetorquer laws in `adcs-contracts`, and the wheel model, disturbance
+magnitudes, total-angular-momentum conservation + the detumble law against the plant's own
+`propagate` in `adcs-systems`.

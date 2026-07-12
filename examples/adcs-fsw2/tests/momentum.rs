@@ -17,14 +17,11 @@ use std::cell::RefCell;
 use std::rc::Rc;
 
 use adcs_contracts::{BodyState, V3, Wheels};
-use adcs_ctrl::CtrlSystem;
-use adcs_nav::NavSystem;
-use adcs_plant::PlantSystem;
 use metor_fsw_2::metor_proto::types::ComponentId;
 use metor_fsw_2::metor_proto_wkt::AlarmRaised;
 use metor_fsw_2::wiring::Registry;
 use metor_fsw_2::wiring::{build_artifacts, parse, resolve};
-use metor_fsw_2::{BuildOptions, Coordinator, Input, MsgIn, register_system};
+use metor_fsw_2::{BuildOptions, Coordinator, Input, MsgIn};
 
 const MISSION_KDL: &str = include_str!("../mission.kdl");
 
@@ -66,9 +63,7 @@ fn build_static(k_desat: f64) -> Option<Coordinator> {
         spec.process = false;
     }
     let mut registry = Registry::with_builtins();
-    register_system!(&mut registry, PlantSystem => "Plant");
-    register_system!(&mut registry, NavSystem => "Nav");
-    register_system!(&mut registry, CtrlSystem => "Ctrl");
+    registry.register_pack(adcs_systems::pack());
     Some(resolve(&wiring, &registry).expect("resolve the patched mission"))
 }
 

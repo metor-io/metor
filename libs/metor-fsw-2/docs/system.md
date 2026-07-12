@@ -146,11 +146,11 @@ Two deliberately different mechanisms:
   ```
 
   `BuildSystem` is the **format-independent** half of construction and carries no KDL
-  coupling: a `cdylib` exported via `export_system!` only needs `BuildSystem` (its
-  `fsw_create` postcard-decodes `Params` and calls `new`), so the dlopen ABI does not ride
-  the `kdl` feature. The KDL static-registry path layers `RegisteredSystem` on top, adding
-  a `Params: FromKdlNode` bound via a blanket impl, so a statically-linked system is
-  registered without extra work.
+  coupling: a struct system riding a pack (`Pack::system_type`, `docs/packs.md`) only
+  needs `BuildSystem` — the entry's create phase postcard-decodes `Params` and calls
+  `new` — so the dlopen ABI does not ride the `kdl` feature. The KDL static-registry path
+  adds only a `Params: serde::de::DeserializeOwned` bound, so a statically-linked system
+  is registered without extra work.
 
 - **Streamed inputs** — IMU samples, nav estimates, commands. These flow as frames over
   rings and are read through `Self::Input` ports each `execute`/`run`.
@@ -735,33 +735,79 @@ the VTable, not by a shared Rust type**.
 - **In-process.** A `System` is a Rust value behind the trait. `execute` is a direct method
   call. Ports wrap `Writer`/`View` over the coordinator's heap-backed rings. Cyclic ports use
   `NoWake`; async ports use `Notifier`. No Rust type crosses any boundary.
-- **dlopen.** A `cdylib` is exported with the `export_system!` macro, which emits the stable C
-  entry points. Rings are backing-erased, so the same `impl System` serves the loaded
-  instance: its ports hold non-owning attaches to the host's shared-memory regions via
-  `RawBinder` and `RingBuffer::attach_raw`. The only things crossing the `.so` boundary are (a) the ring
-  regions, attached by offset, and (b) the system's params (postcard bytes decoded by
-  `fsw_create` into `BuildSystem::Params`) and `SystemDescriptor`. The Rust `System` trait is
-  the in-process realization of that same byte-described contract.
+- **dlopen.** A `cdylib` exports its crate's **pack** with the `export_pack!` macro, which
+  emits the stable C entry points (`docs/packs.md` §5). Rings are backing-erased, so the
+  same `impl System` serves the loaded instance: its ports hold non-owning attaches to the
+  host's shared-memory regions via `RawBinder` and `RingBuffer::attach_raw`. The only
+  things crossing the `.so` boundary are (a) the ring regions, attached by offset, and (b)
+  the entry's params (postcard bytes decoded in `fsw_pack_create` into
+  `BuildSystem::Params`) and the pack manifest of `SystemDescriptor`s. The Rust `System`
+  trait is the in-process realization of that same byte-described contract.
 - **Separate process.** Identical data path; the difference is triggering (a cross-process
   wake word in the ring header rather than an in-process call / `Notifier`).
 
 ---
 
-## 7. Authoring with `#[system]`
+## 7. Authoring surfaces
 
-Everything in §1-§6 is what the framework generates for you. Hand-writing it — the `Input`/`Output`
-bundle structs, `impl System`, `impl CyclicSystem`/`AsyncSystem`, `impl BuildSystem`, the `#[cfg]`'d
-`export_system!` — is ceremony derivable entirely from one method's signature. The
-`#[system]` attribute macro (`metor-fsw-2-macros`, `docs/design-system-macro.md`) reads the ports
-straight off `execute`'s (cyclic) or `run`'s (async) parameter list, in signature order, and emits
-the bundles, trait impls, and (optionally) the dl ABI exports from that one source of truth —
-exactly the model `#[sequence]` already proved for stateless sequence bodies (`docs/sequences-slots.md`
-§4).
+Everything in §1-§6 is the runtime contract; there are three ways to author a system on
+top of it, all registering through a crate's `pack()` (`docs/packs.md`) and all lowering
+to the same descriptors and ring layouts.
+
+### 7.1 Function style — `system(execute_fn)`
+
+The primary surface: a state type plus free fns, the execute fn's signature being the
+port set. No bundle structs, no trait impls:
+
+```rust
+use metor_fsw_2::{Input, Output, Pack, Timestamp, system};
+
+fn nav_init(p: NavParams) -> NavState { /* … */ }
+
+fn nav_execute(nav: &mut NavState, now: Timestamp,
+               sensors: &mut Input<Sensors>, estimate: &mut Output<AttitudeEstimate>) {
+    let Some(s) = sensors.latest() else { return };
+    estimate.publish(&AttitudeEstimate { /* … */ });
+}
+
+pub fn pack() -> Pack {
+    Pack::new().system("Nav", system(nav_execute).init(nav_init))
+}
+```
+
+The fn takes a leading `&mut State` and then only system parameters: `now: Timestamp`, a
+latched-epoch `MissionTime`, `&mut Input<T>`/`&mut Output<T>` (frame ports),
+`&mut MsgIn<M>`/`&mut MsgOut<M>` (message ports), and at most one `&mut HealthPort`.
+`.init(fn)` supplies `P -> S` construction from typed params; `.state(v)` moves a
+prebuilt (shareable) state in. See `docs/packs.md` §2.1.
+
+### 7.2 Async style — `Pack::task`
+
+One `async fn` owning its ports by value, state in locals, polled once per cycle under
+the ambient clock — the sequence model as a general system surface (`docs/packs.md`
+§2.2):
+
+```rust
+async fn pump(mut cmds: MsgIn<GroundCmd>, mut tm: Output<Telemetry>) {
+    loop {
+        let now = cycle().await;
+        while let Some(cmd) = cmds.try_next() { /* … */ }
+    }
+}
+// Pack::new().task("pump", pump)
+```
+
+### 7.3 Struct style — `#[system]`
+
+For systems whose state and many ports read better as a type. The `#[system]` attribute
+macro (`metor-fsw-2-macros`, `docs/design-system-macro.md`) reads the ports straight off
+`execute`'s (cyclic) or `run`'s (async) parameter list, in signature order, and emits the
+bundles and trait impls from that one source of truth:
 
 ```rust
 use metor_fsw_2::{Input, Output, Timestamp, system};
 
-#[system(name = "nav", export = "export")]
+#[system(name = "nav")]
 impl NavSystem {
     pub fn new(p: NavParams) -> Self { /* … */ }
 
@@ -779,23 +825,21 @@ impl NavSystem {
 }
 ```
 
-This is `examples/adcs-fsw2/systems/nav/src/lib.rs` as actually shipped — no
-`NavIn`/`NavOut` bundle structs, no `Out<>` wrapper, no `BuildSystem` impl, no `#[cfg]`'d
-`export_system!` call; `fn new` (optional; absent ⇒ `Self: Default`) drives `BuildSystem::Params`,
-and `#[system(export = "export")]` gates the `fsw_*` dl exports on the crate's own `export` feature
-(bare `#[system]` emits none — a static-link-only crate stays warning-free). Recognized parameter
-forms, by the last path segment of the type: `now: Timestamp` (the cycle timestamp, required on
-`execute`, rejected on `run`), `&mut Input<T>`/`&mut Output<T>` (frame ports), `&mut
-MsgIn<M>`/`&mut MsgOut<M>`/`&mut CommandOut<M>` (message ports), `&mut HealthPort` (optional, at
-most one). Ports must be `&mut` borrows — the generated bundles own the ports (the runner holds
-them between cycles) and lend them to each call; a system that needs something the classifier
-doesn't recognize still writes the traits by hand (§1-§6 stay the documented escape hatch, and the
-macro emits exactly what this document describes — nothing here changes because a system happens
-to be authored with it).
+No `NavIn`/`NavOut` bundle structs, no `Out<>` wrapper, no `BuildSystem` impl; `fn new`
+(optional; absent ⇒ `Self: Default`) drives `BuildSystem::Params`. The recognized
+parameter forms are the same as §7.1's (`&mut CommandOut<M>` included); ports must be
+`&mut` borrows — the generated bundles own the ports (the runner holds them between
+cycles) and lend them to each call. A system that needs something the classifier doesn't
+recognize still writes the traits by hand (§1-§6 stay the documented escape hatch, and
+the macro emits exactly what this document describes).
 
-`#[metor_fsw_2::sequence]` (`docs/sequences-slots.md` §4) shares the same signature classifier for
-stateless async sequence bodies, plus a `now()`/`Seq::now()` ambient clock so a sequence can stamp
-the frames it emits without threading `Timestamp` through by hand.
+### 7.4 Exporting
+
+A crate exports its systems to the dlopen/process world as one **pack**:
+`metor_fsw_2::export_pack!(pack)` (or `export_pack!(pack, feature = "…")` for a
+cdylib+rlib crate) emits the C ABI once per crate. There is no per-system export — the
+old `export_system!` macro and `#[system(export)]` args are gone; a struct system rides
+into the pack via `Pack::system_type::<T, _>("name")`.
 
 ---
 

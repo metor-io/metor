@@ -1,5 +1,31 @@
 # Systems as `dlopen`'d shared objects (`dl-open`)
 
+> **Status: SUPERSEDED IN PART by the pack ABI (v5)** — the single-system C surface this
+> document specifies was replaced wholesale (`docs/packs.md` §5–§6,
+> `docs/design-packs-authoring.md`). What changed:
+>
+> - **One cdylib now exports one *pack*** — any number of systems — through nine
+>   `fsw_pack_*` symbols (`open`/`describe`/`create(index, mount)`/`bind_init`/`execute`/
+>   `shutdown`/`destroy`/`close` plus the version word). The seven single-system
+>   `fsw_describe`/`fsw_create`/… symbols are **gone**, as is `export_system!`; a crate
+>   writes `pub fn pack() -> Pack` and one `export_pack!(pack)`. `FSW_ABI_VERSION` is 5.
+> - `fsw_pack_describe` ships a `PackManifestMsg` — one `SystemDescriptorMsg` per entry
+>   (that wire mirror is unchanged) plus per-entry `reloadable`/`params_default`.
+> - Host-side, `DlSystem::open` became `DlPack::open` → `DlPack::system(name)` →
+>   `DlSystem`; teardown gained one link: destroy every instance state → `fsw_pack_close`
+>   → `dlclose` → the host frees the rings.
+> - The `artifact` wiring node lost its `type=` (a pack exports many types); the `system`
+>   node's `type=` now selects the pack entry, optional when the pack exports exactly one.
+> - The parallel `run_seq_*` sequence ABI this ABI once sat beside is gone too — sequences
+>   are ordinary pack entries (`Pack::task`), and the slot-occupant shape is a *mount*
+>   property (`docs/packs.md` §9).
+>
+> Everything below the symbol surface still holds and is still the reference for it: the
+> erasure boundary, `Backing::raw`/`attach_raw`, the backing-erased system stack,
+> `RawBinder` and positional binding, the descriptor wire mirrors, schema-guided params,
+> telemetry/health across the boundary, and the safety rules. Read the symbol tables and
+> `DlSystem`/`export_system!` sections below as history.
+
 A `metor-fsw-2` system can live in a runtime-loadable **`cdylib`** that the coordinator
 `dlopen`s, instead of being statically linked into one monolithic binary. The system
 exports a small, versioned `extern "C"` surface (the `fsw_*` symbols); the host opens the

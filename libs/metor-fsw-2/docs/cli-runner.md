@@ -5,6 +5,13 @@
 > **dropped** from `build`/`package`/`run` as redundant (the incremental build driver is
 > also the only locator — §2.2/§8.3). `meta.kdl` ships `abi_version`/`profile`/`built_at_unix`
 > (schemas deferred — §8.6).
+>
+> **Pack update (2026-07-11, `docs/packs.md`):** artifacts are now **packs** — an
+> `artifact` node has no `type=` (a cdylib exports many systems; the `system` node's
+> `type=` selects the entry), `Artifact` has no `system_type` field, and the loader is
+> `DlPack::open`. The CLI verbs, the bundle format, and the flow below are otherwise
+> unchanged; §6's mission.kdl snapshot predates the example's merge into one
+> `adcs-systems` pack.
 
 `metor-fsw-2` ships its own runner: a `metor-fsw` binary and a reusable `cli` library
 module that turn a wiring KDL into a running mission. The three mission operations —
@@ -330,12 +337,12 @@ load_wiring(args):
 ```
 
 `resolve` already requires each `Artifact::path` to be `Some` (`ArtifactNotBuilt` otherwise)
-and then `DlSystem::open`s it. The bundle path fills `path` from the directory instead of from
+and then `DlPack::open`s it. The bundle path fills `path` from the directory instead of from
 cargo — the **single small framework touch** the bundle needs.
 
 ### 4.5 Relation to the `Wiring` model & the framework change
 
-`Artifact { id, crate_name, cdylib, system_type, path }` is the unit. The bundle path-fill
+`Artifact { id, crate_name, cdylib, path }` is the unit. The bundle path-fill
 sets `path` from `dir + cdylib_file_name(cdylib)`. Two minimal framework additions:
 
 1. **`cdylib_file_name(stem) -> String`** in the wiring module — the platform decoration
@@ -412,9 +419,9 @@ base/sim config; the live-vs-sim and telemetry knobs move to CLI flags):
 ```kdl
 coordinator cycle_rate=120.0 sim_dt=0.008333333333333333
 
-artifact "plant" crate="adcs-plant" lib="adcs_plant" type="Plant"
-artifact "nav"   crate="adcs-nav"   lib="adcs_nav"   type="Nav"
-artifact "ctrl"  crate="adcs-ctrl"  lib="adcs_ctrl"  type="Ctrl"
+artifact "plant" crate="adcs-plant" lib="adcs_plant"
+artifact "nav"   crate="adcs-nav"   lib="adcs_nav"
+artifact "ctrl"  crate="adcs-ctrl"  lib="adcs_ctrl"
 
 system "plant" type="Plant" artifact="plant" init_angle=0.5 init_rate=0.15 meas_sigma=0.002 seed=42
 system "nav"   type="Nav"   artifact="nav"   meas_sigma=0.02

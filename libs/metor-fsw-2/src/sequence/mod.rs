@@ -1,36 +1,33 @@
-//! The runtime a `#[sequence] async fn` compiles into.
+//! The clock and status runtime under async-fn systems and sequences.
 //!
 //! A sequence is an `async fn` whose [`Input`]/[`Output`] ports are moved into
-//! the future it becomes, owned for the future's whole life. The host polls
-//! that future once per cycle through the ABI entry points in [`crate::abi`],
-//! and everything time-shaped inside the body resolves against the host's
-//! clock rather than a timer. That makes a sequence deterministic under a
-//! simulated clock, and it makes the poll protocol simple enough to describe
-//! in one paragraph:
+//! the future it becomes, owned for the future's whole life — registered with
+//! [`Pack::task`](crate::Pack::task) like any async entry. The entry's driver
+//! polls that future once per cycle, and everything time-shaped inside the
+//! body resolves against the host's clock rather than a timer. That makes a
+//! sequence deterministic under a simulated clock, and it makes the poll
+//! protocol simple enough to describe in one paragraph:
 //!
-//! Before each poll, the driver (`abi::run_seq_execute`) refreshes the shared
-//! [`SeqClock`]. It writes the cycle's `now`, and it latches `cancel` if an
-//! abort frame arrived on the sequence's [`SlotControlIn`] input. It then
-//! installs the clock as a thread-local ambient via [`with_clock`] and polls
-//! the future synchronously. Inside the poll, the author-facing free functions
-//! [`wait`], [`now`], [`progress`], and [`aborted`] read that ambient clock;
+//! Before each poll, the driver (`handler::FutureDriver`) refreshes the shared
+//! [`CycleClock`]. It writes the cycle's `now`, and — when the entry is
+//! mounted as a slot occupant — latches `cancel` if an abort frame arrived on
+//! the mount-appended [`SlotControlIn`] input. It then installs the clock as
+//! a thread-local ambient via [`with_clock`] and polls the future
+//! synchronously. Inside the poll, the author-facing free functions [`wait`],
+//! [`now`], [`progress`], [`aborted`], and [`cycle`] read that ambient clock;
 //! a [`Wait`] future resolves by comparing its stored deadline against
-//! `SeqClock::now`, returning [`Step::Aborted`] early if `cancel` was latched.
-//! After the poll, the driver drains the accumulated progress lines and
-//! publishes a [`SequenceStatus`] record for the cycle.
+//! `CycleClock::now`, returning [`Step::Aborted`] early if `cancel` was
+//! latched. After the poll, an occupant's driver drains the accumulated
+//! progress lines and publishes a [`SequenceStatus`] record for the cycle.
 //!
-//! There is no waker machinery in any of this. A pending `Wait` simply stays
-//! pending until the next cycle's poll observes a later `now`, because the
-//! host re-polls unconditionally every cycle.
+//! There is no waker machinery in any of this. A pending [`Wait`] (or
+//! [`NextCycle`]) simply stays pending until the next cycle's poll observes a
+//! later `now`, because the host re-polls unconditionally every cycle.
 //!
-//! The `#[sequence]` macro generates an occupant type implementing
-//! [`SeqSystem`], the seam the ABI helpers are generic over. Its
-//! [`descriptor`](SeqSystem::descriptor) is the single source of truth for
-//! port order, ring sizing, and compatibility checks. Inputs are the user's
-//! inputs followed by the implicit [`SlotControlIn`]; outputs are the user's
-//! outputs followed by the [`SequenceStatus`]/health/log tail of
-//! [`SeqStatusOut`]. [`build`](SeqSystem::build) binds those same ports in
-//! that same order and hands back a [`SeqBound`].
+//! Port order, ring sizing, and compatibility come from the entry's
+//! descriptor, computed from the fn's parameter types (`crate::handler`);
+//! the [`SlotControlIn`] input and [`SequenceStatus`] output are appended by
+//! the occupant *mount*, never declared by the entry (`docs/packs.md` §9).
 //!
 //! Authors who prefer an explicit handle over the ambient free functions can
 //! take a [`Seq`] argument instead; it reads the same clock.
@@ -336,9 +333,9 @@ pub struct SequenceStatus {
     pub progress: FrameList<ProgressLine, MAX_PROGRESS>,
 }
 
-/// The implicit cancel input every sequence reserves. An abort command lands
-/// here as ordinary ring data and is folded into [`SeqClock::cancel`] at the
-/// top of the next poll.
+/// The implicit cancel input the occupant mount appends after an entry's own
+/// inputs. An abort command lands here as ordinary ring data and is folded
+/// into [`CycleClock::cancel`] at the top of the next poll.
 #[derive(Frame, IntoBytes, Immutable, KnownLayout, FromBytes)]
 #[repr(C)]
 #[metor_fsw(name = "slot_control")]

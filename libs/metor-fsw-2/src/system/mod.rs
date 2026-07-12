@@ -183,10 +183,10 @@ where
 
 /// How a concrete system is constructed from its typed params.
 ///
-/// The trait carries no config-format coupling. A shared library exported
-/// with [`export_system!`](crate::export_system) needs only `BuildSystem`;
-/// its entry point decodes `Params` from postcard bytes and calls
-/// [`new`](Self::new). The static registry adds only a
+/// The trait carries no config-format coupling. A struct system riding a
+/// pack ([`Pack::system_type`](crate::Pack::system_type)) needs only
+/// `BuildSystem`; the entry's create phase decodes `Params` from postcard
+/// bytes and calls [`new`](Self::new). The static registry adds only a
 /// `Params: serde::de::DeserializeOwned` bound, satisfied by the same derive
 /// the postcard contract already needs, so implementing `BuildSystem` alone
 /// is enough to register a system either way.

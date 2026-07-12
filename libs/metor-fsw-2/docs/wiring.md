@@ -69,7 +69,7 @@ pub struct Wiring {
     pub coordinator: CoordinatorSpec,   // cycle rate, default depth, clock
     pub artifacts:   Vec<Artifact>,     // the cdylibs this mission loads
     pub systems:     Vec<SystemSpec>,   // the system instances
-    pub slots:       Vec<SlotSpec>,     // runtime-loadable sequence slots
+    pub slots:       Vec<SlotSpec>,     // runtime-loadable slots
     pub edges:       Vec<EdgeSpec>,     // producer → consumer edges
 }
 ```
@@ -99,17 +99,19 @@ pub enum ClockSpec {
 
 ### 1.2 `Artifact`
 
-A loadable shared object — "which `.so`, and what crate it comes from". One system type per cdylib
-(the fixed `fsw_*` ABI symbols). Multiple [`SystemSpec`]s may reference one `Artifact` to instance
-that type more than once.
+A loadable shared object — "which `.so`, and what crate it comes from". Each cdylib
+exports one **pack** — any number of system types — through the fixed `fsw_pack_*` ABI
+symbols (`docs/packs.md`); a `system` node's `type=` selects an entry from the opened
+pack's manifest. Multiple [`SystemSpec`]s may reference one `Artifact` (and one entry) to
+instance it more than once; the loader opens the object once per resolve and runs the
+create phase per instance.
 
 ```rust
 pub struct Artifact {
-    pub id:          String,        // what SystemSpec::artifact references
-    pub crate_name:  String,        // cargo package, for `cargo build -p <crate_name>`
-    pub cdylib:      String,        // produced file name (libfoo.so / libfoo.dylib / foo.dll)
-    pub system_type: String,        // the single `type=` this .so's export_system! provides
-    pub path:        Option<PathBuf>, // resolved location, filled by the build driver
+    pub id:         String,        // what SystemSpec::artifact references
+    pub crate_name: String,        // cargo package, for `cargo build -p <crate_name>`
+    pub cdylib:     String,        // produced file name (libfoo.so / libfoo.dylib / foo.dll)
+    pub path:       Option<PathBuf>, // resolved location, filled by the build driver
 }
 ```
 
@@ -121,9 +123,10 @@ pub struct Artifact {
 ```rust
 pub struct SystemSpec {
     pub name:     String,           // instance name (telemetry prefix, §7)
-    pub ty:       String,           // type= key (registry key, or artifact's system_type)
-    pub artifact: Option<String>,   // Some(id) ⇒ dlopen'd; None ⇒ statically linked
+    pub ty:       Option<String>,   // type= key (registry key, or the pack entry name)
+    pub artifact: Option<String>,   // Some(id) ⇒ loaded from that pack; None ⇒ static
     pub params:   ParamSource,
+    pub process:  bool,             // run the artifact in its own worker process
 }
 
 pub enum ParamSource {
@@ -180,15 +183,18 @@ paced [`ClockSpec::Wall`] clock holding `cycle_rate`.
 ### 2.2 `artifact` (dl systems only)
 
 ```kdl
-artifact "plant" crate="adcs-plant" lib="adcs_plant" type="Plant"
+artifact "adcs" crate="adcs-systems" lib="adcs_systems"
 ```
 
-- The first (nameless) argument, `"plant"`, is the artifact **id** a `system`'s `lib=` references.
+- The first (nameless) argument, `"adcs"`, is the artifact **id** a `system`'s `artifact=`
+  references.
 - `crate=` is the cargo package the build driver compiles.
 - `lib=` is the library **stem**; the framework decorates it to the platform's produced cdylib
-  file name (`libadcs_plant.dylib`/`.so` / `adcs_plant.dll`) so one document is portable
+  file name (`libadcs_systems.dylib`/`.so` / `adcs_systems.dll`) so one document is portable
   (cli-runner.md §4.6).
-- `type=` is the single system type this `.so` exports.
+- There is **no** `type=` — a pack exports many system types, and the `system` node picks
+  the entry. The pre-pack spelling gets a pointed error ([`LoadError::ArtifactType`]:
+  "packs export many systems; name the system on the `system` node").
 
 Maps one-to-one onto [`Artifact`] (`path` filled later by the build driver). A static-only mission
 needs no `artifact` nodes.
@@ -197,15 +203,17 @@ needs no `artifact` nodes.
 
 ```kdl
 system "imu" type="ImuDriver" i2c_bus=1 sample_hz=200.0     // static
-system "plant" type="Plant" artifact="plant" gain=5.0       // dl (references artifact "plant")
+system "plant" type="Plant" artifact="adcs" gain=5.0        // loaded (references artifact "adcs")
 ```
 
 - The first (nameless) argument, `"imu"`, is the **instance name** — the unique handle the rest of
   the document refers to, and the telemetry prefix (§7). It is not the type name; two instances of
   one type get two distinct instance names. Duplicates are a [`DuplicateInstance`] error.
-- `type=` is the **registry key** (static) or must match the artifact's `system_type` (dl); it is
-  optional for a dl system (the artifact's `system_type` is authoritative and a given `type=` is
-  validated against it) but required for a static one ([`MissingType`] otherwise).
+- `type=` is the **registry key** (static) or the **pack entry name** (loaded). It is
+  required for a static system ([`MissingType`] otherwise); for a loaded one it may be
+  omitted iff the artifact's pack exports exactly one entry ([`LoadError::PackTypeRequired`]
+  otherwise, listing the choices), and an unknown entry name is a clean error listing the
+  pack's exports.
 - `artifact=` (optional) makes this a **dl** system referencing that `artifact` id; absent ⇒ a
   **static** system resolved through the [`Registry`]. (This property was originally spelled `lib=`
   — same as the `artifact` node's own stem property — and was hard-renamed to `artifact=` so the
@@ -304,16 +312,24 @@ up by string and call without naming `S` — a boxed factory `fn` pointer per co
 [`Registry`] is the map of those factories:
 
 ```rust
-pub struct Registry { /* HashMap<&'static str, SystemFactory> */ }
+pub struct Registry { /* HashMap<&'static str, RegistryEntry { factory, descriptor }> */ }
 
-pub type SystemFactory = fn(&mut LoadCtx) -> Result<(SystemHandle, SystemDescriptor), LoadError>;
+pub type SystemFactory =
+    Box<dyn Fn(&mut LoadCtx) -> Result<(SystemHandle, SystemDescriptor), LoadError>>;
 
 impl Registry {
     pub fn new() -> Self;
     pub fn register<S, K>(&mut self, type_name: &'static str) -> &mut Self
     where S: BuildSystem + AddToBuilder<K>, S::Params: serde::de::DeserializeOwned;
+    /// Every entry of a pack under its entry name as the `type=` key, so the
+    /// same `pack()` a cdylib exports serves a statically-linked mission.
+    pub fn register_pack(&mut self, pack: Pack) -> &mut Self;
 }
 ```
+
+The factory is a boxed `Fn`, not a bare `fn` pointer, because a pack entry's factory
+closes over the shared entry it instantiates (`register_pack` wraps each `PackEntry` in an
+`Rc<RefCell<_>>` and drives `CoordinatorBuilder::add_pack_entry`).
 
 The factory captures no state; given the node and the builder it does the whole
 "params → `new` → `add_*_named`" dance for one concrete type, returning the [`SystemHandle`] plus the
@@ -324,7 +340,8 @@ The factory captures no state; given the node and the builder it does the whole
 Construction is split in two:
 
 - [`BuildSystem`] (`src/system/`) is the **format-independent** contract: `type Params` + `fn new`,
-  with no KDL coupling. This is what `export_system!`/the dlopen ABI also use.
+  with no KDL coupling. This is what a pack entry's create phase (and so the dlopen ABI)
+  also uses.
 - The static factory adds only one more bound: `S::Params: serde::de::DeserializeOwned` — every
   `BuildSystem` whose `Params` derives (or hand-implements) `serde::Deserialize` can register
   statically. A dl-only system needs no `Deserialize` impl on `Params` at all (its params reach the
@@ -456,10 +473,13 @@ clean errors ([`BuildError`]`::{Spawn, CargoFailed, ArtifactNotFound}`), never a
 ### 6.2 Resolving a dl system
 
 For a dl [`SystemSpec`], [`resolve`] finds its [`Artifact`] (else [`UnknownArtifact`]), reads
-`artifact.path` (else [`ArtifactNotBuilt`]), opens the `.so` **once** with `DlSystem::open` (else
-[`DlOpen`]), resolves the params to canonical postcard bytes, and registers it via
-[`CoordinatorBuilder::add_dl_cyclic`]`(name, loaded, params)`. The same open is reused for both the
-param encode and the bound slot.
+`artifact.path` (else [`ArtifactNotBuilt`]), opens the `.so` with `DlPack::open` (else
+[`DlOpen`]) — **once per resolve**, through a cache keyed by artifact id, since reopening
+would re-run the crate's `pack()` and fork any shared state its entries captured
+(`docs/packs.md` §8) — selects the entry named by `type=` (or the pack's sole entry) as a
+`DlSystem`, resolves the params to canonical postcard bytes, and registers it via
+[`CoordinatorBuilder::add_dl_cyclic`]`(name, loaded, params)`. The same open serves the
+param encode, the bound slot, and every other system or slot occupant the artifact backs.
 
 ### 6.3 Schema-guided KDL → postcard params (the one-encoding invariant)
 
@@ -467,7 +487,7 @@ The headline property is that the **same** logical params produce **byte-identic
 whether authored in Rust or in KDL — so KDL ≡ the Rust builder on the wire.
 
 - The Rust builder's [`SystemSpecBuilder::params`]`<P: Serialize>(p)` postcard-encodes `P` into
-  [`ParamSource::Postcard`] — exactly the bytes `fsw_create` decodes.
+  [`ParamSource::Postcard`] — exactly the bytes `fsw_pack_create` decodes.
 - A KDL dl system carries [`ParamSource::Kdl`] (its node text). At resolve, [`encode_kdl_params`]
   schema-encodes it against the `.so`'s **exported** `Params` schema ([`DlSystem::params_schema`],
   an `OwnedNamedType` from `postcard-schema`) — the host never links the system's `Params` type.
@@ -529,6 +549,7 @@ registry (`src/registry.rs`) indexes each tappable buffer by its instance-qualif
 | `UnknownInstance` / `UnknownFrame` | edge endpoint resolution (§4.2) |
 | `Wire` | a `WireError` from `connect`/`build()` (§4.3) |
 | `MissingArtifactField` / `UnknownArtifact` / `ArtifactNotBuilt` / `DlOpen` | dl artifact resolution |
+| `ArtifactType` / `PackTypeRequired` / `PackSystem` / `PackCreate` / `OccupantNotReloadable` | pack surface: a legacy `artifact … type=`; a multi-entry pack with no `type=`; an unknown entry name (the choices are listed); an entry's create phase failed; a `.state(...)` entry named as a slot occupant or second instance |
 | `DlParamEncode` | dl param encoding: an un-encodable schema shape, or the dynamic postcard encoder rejected the value (§6.3) |
 
 When [`parse`] produces the [`Wiring`], every error carries the offending document span. When
@@ -547,7 +568,7 @@ are wrapped with the error's own rendered message as the snippet.
 | KDL parsing | the `kdl` crate + `metor-proto-kdl`'s hand-walk style | the wiring grammar (§2) |
 | Frame addressing | `ComponentId::new(name)` (== `Frame::FRAME_ID`); `SystemDescriptor`/`PortDesc.frame_id` | the resolver + typo guard (§4) |
 | Error reporting | `thiserror` + `miette` `Diagnostic` | `LoadError` (§8) |
-| dl ABI | `DlSystem`, `export_system!`, `fsw_*` symbols, `params_schema` | the build driver, the schema-guided KDL encoder (§6) |
+| dl ABI | `DlPack`/`DlSystem`, `export_pack!`, the `fsw_pack_*` symbols, `params_schema` | the build driver, the schema-guided KDL encoder (§6), the per-resolve pack cache |
 | System construction | `BuildSystem::new` | `Registry`, `SystemFactory`, `AddToBuilder`, the KDL `serde::Deserializer` (§3, §5) |
 | Mission description | — | the `Wiring` data model + `WiringBuilder` + `parse`/`resolve` (§0, §1) |
 

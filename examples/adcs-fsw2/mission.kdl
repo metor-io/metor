@@ -1,12 +1,9 @@
 coordinator cycle_rate=120.0 sim_dt=0.008333333333333333
 
-artifact "plant" crate="adcs-plant" lib="adcs_plant"
-artifact "nav"   crate="adcs-nav"   lib="adcs_nav"
-artifact "ctrl"  crate="adcs-ctrl"  lib="adcs_ctrl"
-
-// sequences
-artifact "commissioning" crate="adcs-commissioning" lib="adcs_commissioning"
-artifact "safe_mode"     crate="adcs-safe-mode"     lib="adcs_safe_mode"
+// One pack per artifact: the `system` nodes select entries from "adcs" by `type=`, the
+// slot `allow` lines select occupants from "seqs" by name.
+artifact "adcs" crate="adcs-systems"   lib="adcs_systems"
+artifact "seqs" crate="adcs-sequences" lib="adcs_sequences"
 
 // systems
 // The plant's disturbance/actuator environment is spelled out in full (the dlopen param
@@ -14,7 +11,7 @@ artifact "safe_mode"     crate="adcs-safe-mode"     lib="adcs_safe_mode"
 // nicety only). Physically honest values for a ~3 kg spacecraft at 400 km: secular torques
 // ~1e-7 N·m, so wheel momentum builds over days — crank `m_res_b`/`init_wheel_h` to watch
 // desaturation work in seconds.
-system "plant" type="Plant" artifact="plant" init_angle=0.5 init_rate=0.15 meas_sigma=0.002 seed=42 disarmed=#false process=#true {
+system "plant" type="Plant" artifact="adcs" init_angle=0.5 init_rate=0.15 meas_sigma=0.002 seed=42 disarmed=#false process=#true {
     rho 3e-12                   // atmospheric density (kg/m³, 400 km solar-mean)
     cd 2.2                      // drag coefficient
     area_aero 0.03              // aero reference area (m²)
@@ -26,8 +23,8 @@ system "plant" type="Plant" artifact="plant" init_angle=0.5 init_rate=0.15 meas_
     init_wheel_h 0.0            // per-wheel stored-momentum preload (N·m·s)
     init_orbit_phase 0.0        // in-plane boot phase (rad) — eclipse tests start in shadow
 }
-system "nav"   type="Nav"   artifact="nav"   meas_sigma=0.02
-system "ctrl"  type="Ctrl"  artifact="ctrl"  q_weight=5.0 r_weight=8.0 k_desat=0.0005 k_detumble=0.00005
+system "nav"   type="Nav"   artifact="adcs" meas_sigma=0.02
+system "ctrl"  type="Ctrl"  artifact="adcs" q_weight=5.0 r_weight=8.0 k_desat=0.0005 k_detumble=0.00005
 
 system "alarms" type="Alarms" {
     alarm id="ADCS_RATE_HIGH" name="Body Rate High" {
@@ -58,11 +55,11 @@ slot "mode" {
     // full, the dlopen occupant encoder has no serde defaults). Detumble enters only above
     // 1.0 rad/s: capturing that tumble loads the worst wheel axis to ~38% of the momentum
     // limit, so anything slower goes straight to the wheels.
-    allow occupant="commissioning" rate_detumble_enter=1.0 rate_detumble_exit=0.8 \
+    allow occupant="commissioning" artifact="seqs" rate_detumble_enter=1.0 rate_detumble_exit=0.8 \
           est_delta_rad=0.001 est_dwell_s=0.2 coarse_err_rad=0.2 coarse_dwell_s=0.5 \
           confirm_dwell_s=1.0 warmup_timeout_s=10.0 detumble_timeout_s=900.0 \
           settle_timeout_s=60.0 confirm_timeout_s=30.0
-    allow occupant="safe_mode"
+    allow occupant="safe_mode" artifact="seqs"
     initial occupant="commissioning" state="running"
 }
 

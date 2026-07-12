@@ -11,6 +11,13 @@
 > and impls are non-generic, and `#[sequence]` now rejects generic parameters on the fn
 > outright. See `docs/erase-backing-plan.md` and `docs/dl-open.md` §"The backing-erased system stack" for the current shape;
 > the body below is kept as history.
+>
+> **Superseded further by the pack ABI (2026-07-11, `docs/packs.md`):** the `export` /
+> `export = "feature"` attribute args (§7's emitted piece 5) were **removed** along with
+> `export_system!` — a crate exports its systems as one pack (`export_pack!`), and a
+> struct system rides in via `Pack::system_type`. `#[sequence]` is now a passthrough shim
+> slated for deletion (`Pack::task` replaced it). `#[system]` itself survives unchanged as
+> struct-state sugar, now one of three authoring styles (`docs/system.md` §7).
 
 Status: **design** (2026-07-02). Companion to `docs/review-findings.md` §4 and the
 in-flight `docs/design-port-unification.md` (§9 states exactly which emitted pieces
