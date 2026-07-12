@@ -475,7 +475,7 @@ impl Codegen {
     fn entry(&mut self, desc: &SystemDescriptorMsg, defaults: Option<&[u8]>) -> String {
         // Collect port markers first so annotations can reference them.
         for port in desc.inputs.iter().chain(desc.outputs.iter()) {
-            self.port_marker(&port.schema);
+            self.marker_name(port);
         }
         let is_class = desc
             .name
@@ -535,7 +535,7 @@ impl Codegen {
     }
 
     fn port_line(&mut self, port: &PortDescMsg, input: bool) -> String {
-        let marker = self.marker_name(&port.schema);
+        let marker = self.marker_name(port);
         let wrapper = if input {
             self.used_inport = true;
             "InPort"
@@ -564,16 +564,13 @@ impl Codegen {
         )
     }
 
-    /// Register (once) a marker class for a port schema.
-    fn port_marker(&mut self, schema: &PortSchemaMsg) {
-        let _ = self.marker_name(schema);
-    }
-
-    /// The marker class name for a port schema, generating a `Frame` subclass
-    /// for a Table port keyed by frame id (named from its metadata) and using
-    /// the shared `Msg` marker for a self-describing Postcard port.
-    fn marker_name(&mut self, schema: &PortSchemaMsg) -> String {
-        match schema {
+    /// The marker class name for a port, generating a `Frame` subclass for a
+    /// Table port keyed by frame id (named from its metadata, falling back to
+    /// the port name) and using the shared `Msg` marker for a self-describing
+    /// Postcard port. Idempotent per frame id — the first caller's name wins,
+    /// so the collection pass and the annotation pass agree.
+    fn marker_name(&mut self, port: &PortDescMsg) -> String {
+        match &port.schema {
             PortSchemaMsg::Table {
                 frame_id, metadata, ..
             } => {
@@ -581,9 +578,13 @@ impl Codegen {
                 if let Some((_, name)) = self.frame_by_id.iter().find(|(k, _)| *k == id) {
                     return name.clone();
                 }
+                // A frame prefixes its components with its own name, so their
+                // shared leading segment is the frame name; a frame that emits
+                // no component metadata (e.g. a variable-length list) falls
+                // back to the referencing port's name.
                 let base = frame_name(metadata)
                     .map(|n| pascal_case(&n))
-                    .unwrap_or_else(|| format!("Frame{id:x}"));
+                    .unwrap_or_else(|| pascal_case(&port.name));
                 let name = self.unique_name(base);
                 self.taken_names.insert(name.clone());
                 self.frames.push((name.clone(), "Frame".to_string()));
