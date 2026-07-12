@@ -125,6 +125,12 @@ pub mod health;
 // Not gated on `kdl`; sequences are an ABI/runtime feature.
 pub mod sequence;
 
+// The pure-data mission IR. Available without the KDL parser (feature
+// `wiring-model`) so an evaluated front-end can emit and re-ingest it; the
+// `kdl`-gated `wiring` module re-exports these types alongside its resolver.
+#[cfg(feature = "wiring-model")]
+pub mod ir;
+
 #[cfg(feature = "kdl")]
 pub mod wiring;
 
@@ -205,12 +211,14 @@ pub use {metor_proto, metor_proto_wkt, zerocopy};
 
 pub use dl::{DlError, DlPack, DlSystem};
 
-#[cfg(feature = "kdl")]
-pub use wiring::{
-    AllowedOccupantSpec, Artifact, BuildError, BuildOptions, BundleError, ClockSpec,
-    CoordinatorSpec, EdgeSpec, InitialOccupantSpec, PackageOptions, ParamSource, SlotInitState,
-    SlotSpec, SystemSpec, TCP_DOWNLINK_TYPE, TCP_UPLINK_TYPE, Wiring, WiringBuilder,
+#[cfg(feature = "wiring-model")]
+pub use ir::{
+    AllowedOccupantSpec, Artifact, ClockSpec, CoordinatorSpec, EdgeSpec, InitialOccupantSpec,
+    ParamSource, SlotInitState, SlotSpec, SystemSpec, TCP_DOWNLINK_TYPE, TCP_UPLINK_TYPE, Wiring,
 };
+
+#[cfg(feature = "kdl")]
+pub use wiring::{BuildError, BuildOptions, BundleError, PackageOptions, WiringBuilder};
 
 #[cfg(feature = "kdl")]
 pub mod cli;

@@ -1,15 +1,21 @@
 //! The [`Wiring`] data model, a plain serializable description of a mission.
 //!
+//! This module is the mission IR: pure data plus its serde/serde_json codec,
+//! carrying no `kdl::` types, so an evaluated front-end can emit it and the
+//! host can re-ingest it with only the `wiring-model` feature. The KDL parser
+//! and the shared resolver live under the `kdl`-gated [`wiring`](crate::wiring)
+//! module, which re-exports these types.
+//!
 //! Both front-ends produce this type. The KDL deserializer in
-//! [`parse`](super::parse) and the [`WiringBuilder`](super::WiringBuilder) each
-//! build a `Wiring`, and the one shared [`resolve`](super::resolve) consumes
-//! it, so anything one front-end can express the other can express too.
+//! `wiring::parse` and the `wiring::WiringBuilder` each build a `Wiring`, and
+//! the one shared `wiring::resolve` consumes it, so anything one front-end can
+//! express the other can express too.
 //!
 //! The specs here deliberately hold no runtime values. A [`ClockSpec`] mirrors
 //! [`ClockMode`](crate::ClockMode) with a plain `f64` in place of a `Duration`,
 //! a [`CoordinatorSpec`] mirrors [`CoordinatorConfig`](crate::CoordinatorConfig)
 //! without a clock value, and so on. Conversion into the runtime types happens
-//! in [`resolve`](super::resolve), leaving this module a pure serde data format.
+//! in `wiring::resolve`, leaving this module a pure serde data format.
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -17,15 +23,15 @@ use std::path::PathBuf;
 use serde::{Deserialize, Serialize};
 
 /// The version of the [`Wiring`] data model itself. Both front-ends stamp it
-/// and [`resolve`](super::resolve) checks it, so a serialized `Wiring` from a
+/// and [`resolve`](crate::wiring::resolve) checks it, so a serialized `Wiring` from a
 /// different-generation producer fails loudly instead of misresolving.
 pub const IR_VERSION: u32 = 1;
 
 /// A plain-data description of a complete mission, naming the systems that
 /// run, where their code and params come from, and how their ports connect.
 ///
-/// Produced by [`parse`](super::parse) or [`WiringBuilder`](super::WiringBuilder),
-/// consumed by [`resolve`](super::resolve). The telemetry downlink and the
+/// Produced by [`parse`](crate::wiring::parse) or [`WiringBuilder`](crate::wiring::WiringBuilder),
+/// consumed by [`resolve`](crate::wiring::resolve). The telemetry downlink and the
 /// command uplink appear here as ordinary systems with the built-in registry
 /// types [`TCP_DOWNLINK_TYPE`] and [`TCP_UPLINK_TYPE`], not as dedicated fields.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -39,7 +45,7 @@ pub struct Wiring {
     /// The shared objects this mission loads, one pack per cdylib.
     pub artifacts: Vec<Artifact>,
     /// The system instances, either static (resolved in the
-    /// [`Registry`](super::Registry)) or loaded from an [`Artifact`].
+    /// [`Registry`](crate::wiring::Registry)) or loaded from an [`Artifact`].
     pub systems: Vec<SystemSpec>,
     /// The runtime-loadable slots. Each connects by name like a [`SystemSpec`],
     /// but its occupant is loaded, started, and stopped at runtime from a
@@ -61,7 +67,7 @@ pub struct Wiring {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct SourceRef {
     /// The source file, when the front-end knows it
-    /// ([`parse_with_origin`](super::parse_with_origin)).
+    /// ([`parse_with_origin`](crate::wiring::parse_with_origin)).
     pub file: Option<String>,
     /// 1-based line of the declaring node.
     pub line: u32,
@@ -140,7 +146,7 @@ pub struct Artifact {
     /// `foo.dll`).
     pub cdylib: String,
     /// The resolved artifact location, filled in by
-    /// [`build_artifacts`](super::build_artifacts). `None` until built or
+    /// [`build_artifacts`](crate::wiring::build_artifacts). `None` until built or
     /// located.
     pub path: Option<PathBuf>,
     /// Where this artifact was declared.
@@ -149,7 +155,7 @@ pub struct Artifact {
 }
 
 /// One system instance. With `artifact = None` the type is resolved in the
-/// static [`Registry`](super::Registry); with `Some(id)` it is loaded from
+/// static [`Registry`](crate::wiring::Registry); with `Some(id)` it is loaded from
 /// that [`Artifact`].
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct SystemSpec {
@@ -182,7 +188,7 @@ pub struct SystemSpec {
 
 impl SystemSpec {
     /// A built-in TCP telemetry downlink instance that taps every output, the
-    /// spec pushed by [`WiringBuilder::telemetry`](super::WiringBuilder::telemetry)
+    /// spec pushed by [`WiringBuilder::telemetry`](crate::wiring::WiringBuilder::telemetry)
     /// and the CLI `--telemetry` flag. A subset tap instead declares
     /// `instances`/`frames` children on an ordinary `system` node.
     pub fn tcp_downlink(name: &str, addr: SocketAddr) -> Self {
@@ -190,7 +196,7 @@ impl SystemSpec {
     }
 
     /// A built-in TCP command uplink instance, the spec pushed by
-    /// [`WiringBuilder::uplink`](super::WiringBuilder::uplink) and the CLI
+    /// [`WiringBuilder::uplink`](crate::wiring::WiringBuilder::uplink) and the CLI
     /// `--uplink` flag. Its commands are routed by explicit edges
     /// (`connect "<name>" -> … msg="…"`).
     pub fn tcp_uplink(name: &str, addr: SocketAddr) -> Self {
@@ -216,7 +222,7 @@ impl SystemSpec {
 
 /// Where a [`SystemSpec`]'s params come from.
 ///
-/// At [`resolve`](super::resolve) every variant reduces to the same encodings:
+/// At [`resolve`](crate::wiring::resolve) every variant reduces to the same encodings:
 /// the canonical postcard `Params` bytes that cross `fsw_create` for a loaded
 /// system, or a typed `S::Params` value for a static one. Which decoder runs
 /// is decided by [`SystemSpec::artifact`], not by the variant.
@@ -237,7 +243,7 @@ pub enum ParamSource {
     None,
     /// Canonical postcard `Params` bytes, the typed Rust builder path.
     /// dl-only; the static path rejects it as
-    /// [`StaticPostcardParams`](super::LoadError::StaticPostcardParams).
+    /// [`StaticPostcardParams`](crate::wiring::LoadError::StaticPostcardParams).
     Postcard(Vec<u8>),
     /// The KDL node's source text, re-decoded at resolve (typed serde
     /// deserialize for static, schema-guided postcard encode for loaded).
@@ -258,7 +264,7 @@ impl ParamSource {
 /// occupant the host swaps at runtime.
 ///
 /// The `inputs`/`outputs` declare the user-port contract, validated at
-/// [`resolve`](super::resolve) against the descriptor every allowed occupant
+/// [`resolve`](crate::wiring::resolve) against the descriptor every allowed occupant
 /// shares. `allow` is the pre-opened candidate set, and an optional `initial`
 /// occupant is applied at startup. A slot connects by `name` exactly like a
 /// [`SystemSpec`].
@@ -272,7 +278,7 @@ pub struct SlotSpec {
     /// The declared output user-port frame names.
     pub outputs: Vec<String>,
     /// The allowed occupants, each an [`Artifact`] referenced by id. Must be
-    /// non-empty at [`resolve`](super::resolve).
+    /// non-empty at [`resolve`](crate::wiring::resolve).
     pub allow: Vec<AllowedOccupantSpec>,
     /// The occupant to apply at startup, if any.
     pub initial: Option<InitialOccupantSpec>,

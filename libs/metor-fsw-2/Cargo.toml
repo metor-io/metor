@@ -47,10 +47,14 @@ thiserror = { version = "2.0" }
 
 # cli
 clap = { version = "4", features = ["derive"], optional = true }
+tempfile = { version = "3.13", optional = true }
 
 [features]
 default = ["kdl"]
-kdl = ["dep:kdl", "dep:miette", "dep:postcard-dyn", "dep:serde_json", "dep:serde_ignored", "dep:clap"]
+# The pure-data `Wiring` IR plus its serde/serde_json codec, available without
+# the KDL parser so an evaluated front-end can emit and re-ingest the IR.
+wiring-model = ["dep:serde_json"]
+kdl = ["dep:kdl", "dep:miette", "dep:postcard-dyn", "dep:serde_ignored", "dep:clap", "dep:tempfile", "wiring-model"]
 
 [[bin]]
 name = "metor-fsw"
@@ -60,6 +64,7 @@ required-features = ["kdl"]
 [dev-dependencies]
 tempfile = "3.13"
 trybuild = "1"
+serde_json = "1.0"
 
 # Its own main calls `proc::worker_entry()` first, so the test binary can be
 # re-executed as the worker for process systems (a libtest main cannot).

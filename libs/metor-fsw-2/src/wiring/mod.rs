@@ -77,8 +77,12 @@ mod bundle;
 pub(crate) mod de;
 mod error;
 mod kdl_params;
-mod model;
 mod parse;
+mod py;
+
+// The pure-data IR lives at the crate root (feature `wiring-model`) so it does
+// not require the KDL parser; the submodules here reach it as `super::model`.
+pub(crate) use crate::ir as model;
 
 pub use build_driver::{BuildError, BuildOptions, build_artifacts};
 pub use builder::{SlotSpecBuilder, SystemSpecBuilder, WiringBuilder};
@@ -91,6 +95,7 @@ pub use model::{
     TCP_DOWNLINK_TYPE, TCP_UPLINK_TYPE, Wiring,
 };
 pub use parse::{cdylib_file_name, parse, parse_with_origin};
+pub use py::{eval_python_mission, is_python_mission};
 
 // Re-exported so a system author only needs `metor_fsw_2::wiring`.
 pub use crate::register_system;
