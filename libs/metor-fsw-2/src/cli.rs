@@ -4,8 +4,8 @@ use clap::{Args, Parser, Subcommand};
 use miette::IntoDiagnostic;
 
 use crate::wiring::{
-    BuildOptions, ClockSpec, PackageOptions, Registry, Wiring, build_artifacts, load_bundle, parse,
-    resolve, write_bundle,
+    BuildOptions, ClockSpec, PackageOptions, Registry, Wiring, build_artifacts, load_bundle,
+    parse_with_origin, resolve, write_bundle,
 };
 
 /// The fully parsed command line, produced from argv by [`run`].
@@ -102,7 +102,7 @@ pub async fn run() -> miette::Result<()> {
 /// `build`: parse the wiring, compile and locate every artifact's `.so`, print them.
 fn cmd_build(args: BuildArgs) -> miette::Result<()> {
     let text = read_file(&args.kdl)?;
-    let mut wiring = parse(&text)?;
+    let mut wiring = parse_with_origin(&text, Some(&args.kdl.to_string_lossy()))?;
     build_artifacts(&mut wiring, &build_opts(args.release, &args.cargo_arg)).into_diagnostic()?;
     for a in &wiring.artifacts {
         let path = a
@@ -117,7 +117,7 @@ fn cmd_build(args: BuildArgs) -> miette::Result<()> {
 
 fn cmd_package(args: PackageArgs) -> miette::Result<()> {
     let text = read_file(&args.kdl)?;
-    let mut wiring = parse(&text)?;
+    let mut wiring = parse_with_origin(&text, Some(&args.kdl.to_string_lossy()))?;
     build_artifacts(&mut wiring, &build_opts(args.release, &args.cargo_arg)).into_diagnostic()?;
     write_bundle(
         &wiring,
@@ -186,7 +186,7 @@ fn load_run_wiring(args: &RunArgs) -> miette::Result<Wiring> {
         ));
     }
     let text = read_file(&args.target)?;
-    let mut wiring = parse(&text)?;
+    let mut wiring = parse_with_origin(&text, Some(&args.target.to_string_lossy()))?;
     build_artifacts(&mut wiring, &build_opts(args.release, &args.cargo_arg)).into_diagnostic()?;
     Ok(wiring)
 }

@@ -36,6 +36,17 @@ pub enum LoadError {
     #[diagnostic(code(fsw_wiring::ir_version_mismatch))]
     IrVersionMismatch { found: u32, expected: u32 },
 
+    /// A scope index (a spec's `scope` or a scope's `parent`) outside the
+    /// wiring's scope table. The table is front-end metadata, so a bad index
+    /// is a front-end bug rather than a document mistake; spanless.
+    #[error("{owner} references scope index {index}, but the scope table has {len} entries")]
+    #[diagnostic(code(fsw_wiring::bad_scope_ref))]
+    BadScopeRef {
+        owner: String,
+        index: usize,
+        len: usize,
+    },
+
     #[error("missing the single `coordinator` node")]
     #[diagnostic(code(fsw_wiring::missing_coordinator))]
     MissingCoordinator,

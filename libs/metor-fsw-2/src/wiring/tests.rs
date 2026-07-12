@@ -1070,6 +1070,28 @@ slot "adcs" {
 // Wiring and resolve to an equivalent running coordinator.
 // ---------------------------------------------------------------------------
 
+/// Drop the parse-origin [`SourceRef`](crate::wiring::SourceRef) anchors so a
+/// KDL-origin `Wiring` compares structurally against its builder-origin twin
+/// (the builder records no provenance).
+fn without_src(mut w: Wiring) -> Wiring {
+    for a in &mut w.artifacts {
+        a.src = None;
+    }
+    for s in &mut w.systems {
+        s.src = None;
+    }
+    for s in &mut w.slots {
+        s.src = None;
+        for occ in &mut s.allow {
+            occ.src = None;
+        }
+    }
+    for e in &mut w.edges {
+        e.src = None;
+    }
+    w
+}
+
 /// The same graph expressed in Rust, used by both equivalence tests below.
 fn equiv_builder() -> WiringBuilder {
     WiringBuilder::new()
@@ -1096,7 +1118,8 @@ connect "a" -> "b" frame="imu"
     let from_kdl = parse(kdl).expect("parse onto the Wiring data model");
     let from_builder = equiv_builder().build();
     assert_eq!(
-        from_kdl, from_builder,
+        without_src(from_kdl),
+        from_builder,
         "the two front-ends produce equal Wiring"
     );
 }
@@ -1762,7 +1785,7 @@ system "obs" artifact="plant"
         .from_artifact("plant")
         .end()
         .build();
-    assert_eq!(wiring, built, "the two front-ends agree");
+    assert_eq!(without_src(wiring), built, "the two front-ends agree");
 }
 
 /// `process=#true` without an artifact is rejected at parse (KDL) and at
@@ -1828,7 +1851,7 @@ slot "bare" {
         .allow("waiter")
         .end()
         .build();
-    assert_eq!(wiring, built, "the two front-ends agree");
+    assert_eq!(without_src(wiring), built, "the two front-ends agree");
 }
 
 /// A serialized document from before the field existed deserializes with
@@ -2108,6 +2131,147 @@ fn bundle_meta_carries_and_checks_ir_version() {
     let err = load_bundle(&dir).expect_err("a pre-versioning bundle is refused");
     assert!(
         matches!(err, BundleError::IrMismatch { found: None, .. }),
+        "{err:?}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// SourceRef provenance: parse anchors every spec at its declaring node,
+// serde defaults keep old documents readable, and resolve errors carry the
+// anchor for parse-origin wirings only.
+// ---------------------------------------------------------------------------
+
+/// Parse fills each spec's anchor with the declaring node's 1-based
+/// line/column and the given origin file; the plain [`parse`] leaves `file`
+/// unset. The KDL front-end records no scopes.
+#[test]
+fn parse_with_origin_fills_source_anchors() {
+    let kdl = r#"coordinator cycle_rate=100.0
+artifact "plant" crate="adcs-plant" lib="adcs_plant"
+system "plant" type="Plant" artifact="plant" gain=2.0 {
+    pid p=1.0
+}
+slot "adcs" {
+    allow occupant="ctrl" artifact="plant"
+}
+connect "plant" -> "adcs" frame="imu"
+"#;
+    let wiring =
+        crate::wiring::parse_with_origin(kdl, Some("mission.kdl")).expect("parse with origin");
+
+    let at = |src: &Option<crate::wiring::SourceRef>| {
+        let src = src.as_ref().expect("parse fills the anchor");
+        (src.file.clone(), src.line, src.col)
+    };
+    let file = Some("mission.kdl".to_string());
+    assert_eq!(at(&wiring.artifacts[0].src), (file.clone(), 2, 1));
+    // A multi-line `system` node anchors at the node start.
+    assert_eq!(at(&wiring.systems[0].src), (file.clone(), 3, 1));
+    assert_eq!(at(&wiring.slots[0].src), (file.clone(), 6, 1));
+    assert_eq!(at(&wiring.slots[0].allow[0].src), (file.clone(), 7, 5));
+    assert_eq!(at(&wiring.edges[0].src), (file, 9, 1));
+    assert!(wiring.scopes.is_empty(), "the KDL front-end records no scopes");
+    assert_eq!(wiring.systems[0].scope, None);
+    assert_eq!(wiring.slots[0].scope, None);
+
+    let wiring = parse(kdl).expect("plain parse");
+    let src = wiring.systems[0].src.as_ref().expect("anchor still filled");
+    assert_eq!(src.file, None, "no origin, no file");
+    assert_eq!((src.line, src.col), (3, 1));
+}
+
+/// A `Wiring` serialized before provenance existed (no `src`/`scope`/`scopes`
+/// fields) deserializes with the defaults.
+#[test]
+fn wiring_json_without_provenance_fields_deserializes() {
+    let json = format!(
+        r#"{{
+        "ir_version": {IR_VERSION},
+        "coordinator": {{ "cycle_rate": 100.0, "default_depth": null, "clock": "Wall" }},
+        "artifacts": [{{ "id": "plant", "crate_name": "adcs-plant", "cdylib": "libadcs_plant.so", "path": null }}],
+        "systems": [{{ "name": "a", "ty": "Src", "artifact": null, "params": "None" }}],
+        "slots": [{{ "name": "adcs", "inputs": [], "outputs": [],
+                     "allow": [{{ "occupant": "ctrl", "params": "None" }}], "initial": null }}],
+        "edges": [{{ "from": "a", "out": "imu", "to": "adcs", "in_": "imu", "delayed": false }}]
+    }}"#
+    );
+    let wiring: Wiring = serde_json::from_str(&json).expect("old document deserializes");
+    assert!(wiring.scopes.is_empty());
+    assert_eq!(wiring.artifacts[0].src, None);
+    assert_eq!(wiring.systems[0].src, None);
+    assert_eq!(wiring.systems[0].scope, None);
+    assert_eq!(wiring.slots[0].src, None);
+    assert_eq!(wiring.slots[0].scope, None);
+    assert_eq!(wiring.slots[0].allow[0].src, None);
+    assert_eq!(wiring.edges[0].src, None);
+}
+
+/// A resolve failure on a parse-origin `Wiring` renders the spec's anchor in
+/// its fabricated source snippet; a builder-origin one (no anchor) renders
+/// the bare snippet, exactly as before.
+#[test]
+fn resolve_errors_carry_the_parse_anchor() {
+    let kdl = "coordinator cycle_rate=100.0\nsystem \"x\" type=\"NoSuchType\"\n";
+    let wiring = crate::wiring::parse_with_origin(kdl, Some("mission.kdl")).expect("parse");
+    let err = match resolve(&wiring, &registry()) {
+        Ok(_) => panic!("expected an UnknownType error"),
+        Err(e) => e,
+    };
+    match err {
+        LoadError::UnknownType { src, .. } => {
+            assert!(src.contains("@ mission.kdl:2:1"), "anchored snippet: {src}");
+        }
+        other => panic!("expected UnknownType, got {other:?}"),
+    }
+
+    let wiring = WiringBuilder::new()
+        .coordinator(100.0, ClockSpec::Wall)
+        .system("x")
+        .ty("NoSuchType")
+        .end()
+        .build();
+    let err = match resolve(&wiring, &registry()) {
+        Ok(_) => panic!("expected an UnknownType error"),
+        Err(e) => e,
+    };
+    match err {
+        LoadError::UnknownType { src, .. } => {
+            assert!(!src.contains('@'), "no anchor without provenance: {src}");
+        }
+        other => panic!("expected UnknownType, got {other:?}"),
+    }
+}
+
+/// A scope index outside the table is refused before any system is built,
+/// for spec `scope` fields and the table's own `parent` links alike.
+#[test]
+fn resolve_rejects_out_of_range_scope_refs() {
+    let mut wiring = equiv_builder().build();
+    wiring.systems[0].scope = Some(0);
+    let err = match resolve(&wiring, &registry()) {
+        Ok(_) => panic!("expected a BadScopeRef error"),
+        Err(e) => e,
+    };
+    match err {
+        LoadError::BadScopeRef { owner, index, len } => {
+            assert_eq!(owner, "system `a`");
+            assert_eq!((index, len), (0, 0));
+        }
+        other => panic!("expected BadScopeRef, got {other:?}"),
+    }
+
+    let mut wiring = equiv_builder().build();
+    wiring.scopes.push(crate::wiring::ScopeSpec {
+        path: "thrusters".to_string(),
+        parent: Some(3),
+        src: None,
+    });
+    let err = match resolve(&wiring, &registry()) {
+        Ok(_) => panic!("expected a BadScopeRef error"),
+        Err(e) => e,
+    };
+    assert!(
+        matches!(err, LoadError::BadScopeRef { index: 3, len: 1, .. }),
         "{err:?}"
     );
 }
