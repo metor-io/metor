@@ -4,8 +4,8 @@ use clap::{Args, Parser, Subcommand};
 use miette::IntoDiagnostic;
 
 use crate::wiring::{
-    BuildOptions, ClockSpec, PackageOptions, Registry, Wiring, build_artifacts, load_bundle,
-    parse_with_origin, resolve, write_bundle,
+    BuildOptions, ClockSpec, PackageOptions, Registry, Wiring, build_artifacts,
+    eval_python_mission, is_python_mission, load_bundle, parse_with_origin, resolve, write_bundle,
 };
 
 /// The fully parsed command line, produced from argv by [`run`].
@@ -111,10 +111,20 @@ pub async fn run() -> miette::Result<()> {
     }
 }
 
-/// `build`: parse the wiring, compile and locate every artifact's `.so`, print them.
+/// Load a source mission into a [`Wiring`], dispatched by extension: a `.py`
+/// mission is evaluated by a subprocess CPython, anything else is parsed as KDL.
+fn load_source(path: &Path) -> miette::Result<Wiring> {
+    if is_python_mission(path) {
+        eval_python_mission(path)
+    } else {
+        let text = read_file(path)?;
+        Ok(parse_with_origin(&text, Some(&path.to_string_lossy()))?)
+    }
+}
+
+/// `build`: load the wiring, compile and locate every artifact's `.so`, print them.
 fn cmd_build(args: BuildArgs) -> miette::Result<()> {
-    let text = read_file(&args.kdl)?;
-    let mut wiring = parse_with_origin(&text, Some(&args.kdl.to_string_lossy()))?;
+    let mut wiring = load_source(&args.kdl)?;
     build_artifacts(
         &mut wiring,
         &build_opts(args.release, &args.cargo_arg, args.no_manifest_sidecar),
@@ -132,6 +142,15 @@ fn cmd_build(args: BuildArgs) -> miette::Result<()> {
 }
 
 fn cmd_package(args: PackageArgs) -> miette::Result<()> {
+    // A bundle carries its mission as verbatim KDL re-parsed on load, so a `.py`
+    // mission cannot round-trip through it. The IR-carrying bundle is Phase 3;
+    // until then, evaluate the mission with `build`/`run` instead.
+    if is_python_mission(&args.kdl) {
+        return Err(miette::miette!(
+            "packaging a `.py` mission is not supported yet (the bundle manifest is \
+             verbatim KDL); use `metor-fsw build`/`run` on the `.py`, or package a `.kdl`"
+        ));
+    }
     let text = read_file(&args.kdl)?;
     let mut wiring = parse_with_origin(&text, Some(&args.kdl.to_string_lossy()))?;
     build_artifacts(
@@ -205,8 +224,7 @@ fn load_run_wiring(args: &RunArgs) -> miette::Result<Wiring> {
             args.target.display()
         ));
     }
-    let text = read_file(&args.target)?;
-    let mut wiring = parse_with_origin(&text, Some(&args.target.to_string_lossy()))?;
+    let mut wiring = load_source(&args.target)?;
     build_artifacts(
         &mut wiring,
         &build_opts(args.release, &args.cargo_arg, args.no_manifest_sidecar),
