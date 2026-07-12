@@ -60,6 +60,22 @@ pub struct Wiring {
     pub scopes: Vec<ScopeSpec>,
 }
 
+impl Wiring {
+    /// A clone with every [`Artifact::path`] cleared: the relocatable,
+    /// reproducible form of the IR. Paths point into a build tree, so they are
+    /// provenance rather than identity — [`resolve`](crate::wiring::resolve)
+    /// re-derives them on load. Stripping them is what lets the bundle's
+    /// `wiring.json` stay byte-reproducible and a `WiringManifest` describe the
+    /// same topology regardless of where it was built.
+    pub fn path_stripped(&self) -> Wiring {
+        let mut w = self.clone();
+        for artifact in &mut w.artifacts {
+            artifact.path = None;
+        }
+        w
+    }
+}
+
 /// Where a spec came from in the document that declared it: an optional file
 /// name and a 1-based line and column, matching miette's rendering. One
 /// anchor for now; a stack of caller frames can be added later without

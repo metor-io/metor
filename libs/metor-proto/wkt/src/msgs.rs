@@ -800,6 +800,30 @@ impl Msg for ReloadSequences {
     const ID: PacketId = [224, 44];
 }
 
+/// The complete mission wiring IR, broadcast by the control system at startup
+/// and re-broadcast on a [`ReloadSequences`] request — the same telemetry
+/// pub/sub pattern [`SequenceRegistry`] uses. The payload is the versioned
+/// `Wiring` serialized as JSON (the self-describing §6 wire format), so a
+/// consumer decodes the whole topology — systems, slots, edges, scopes, and
+/// source anchors — with `serde_json` and never needs bundle access. The JSON
+/// crosses the ring as a plain postcard `String`; `ir_version` rides alongside
+/// it so a consumer can gate before parsing. Because the payload carries the
+/// full graph it can exceed the default message-ring cap, so the control
+/// system sizes its `wiring` channel from the concrete payload at build.
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct WiringManifest {
+    /// The IR schema version the `ir_json` was produced against.
+    pub ir_version: u32,
+    /// The full `Wiring` IR as JSON.
+    pub ir_json: String,
+}
+
+impl Msg for WiringManifest {
+    // Next free id after the name-addressed sequence types ([224,58..60]); the
+    // sealed-node protocol owns [224,45..57] and the alarm types [224,37..40].
+    const ID: PacketId = [224, 61];
+}
+
 /// Version of the sealed-node transfer protocol ([224,45]..[224,57]).
 /// Clients MUST handshake with [`GetDbInfo`] before sending any of these:
 /// servers that predate the handshake record unknown request messages as
@@ -1274,5 +1298,42 @@ mod sequence_tests {
         assert_eq!(SequenceChannelEvent::ID, [224, 59]);
         assert_eq!(SequenceCommand::ID, [224, 60]);
         assert_eq!(ReloadSequences::ID, [224, 44]);
+    }
+}
+
+#[cfg(test)]
+mod wiring_manifest_tests {
+    use super::*;
+
+    #[test]
+    fn wiring_manifest_roundtrips() {
+        let manifest = WiringManifest {
+            ir_version: 1,
+            ir_json: r#"{"ir_version":1,"systems":[]}"#.into(),
+        };
+        let bytes = postcard::to_allocvec(&manifest).expect("encode");
+        let back: WiringManifest = postcard::from_bytes(&bytes).expect("decode");
+        assert_eq!(back.ir_version, manifest.ir_version);
+        assert_eq!(back.ir_json, manifest.ir_json);
+    }
+
+    /// The pinned id — moving it silently re-keys every persisted recording —
+    /// and its distinctness from every other assigned id in this module.
+    #[test]
+    fn wiring_manifest_id_is_pinned_and_unique() {
+        assert_eq!(WiringManifest::ID, [224, 61]);
+        for id in [
+            SequenceRegistry::ID,
+            SequenceChannelEvent::ID,
+            SequenceCommand::ID,
+            ReloadSequences::ID,
+            AlarmDef::ID,
+            AlarmRaised::ID,
+            AlarmCleared::ID,
+            AlarmAck::ID,
+        ] {
+            assert_ne!(id, WiringManifest::ID);
+        }
+        assert!(!NODE_PROTOCOL_MESSAGES.contains(&WiringManifest::ID));
     }
 }
