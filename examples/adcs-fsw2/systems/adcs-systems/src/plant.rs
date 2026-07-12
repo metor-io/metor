@@ -132,7 +132,11 @@ impl WheelDynamics for ReactionWheel {
         } else {
             let f = -RW_COULOMB * omega.signum() - RW_VISCOUS * omega;
             // Friction may stop the wheel within the step, never push it through zero.
-            if omega > 0.0 { f.max(-s / DT) } else { f.min(-s / DT) }
+            if omega > 0.0 {
+                f.max(-s / DT)
+            } else {
+                f.min(-s / DT)
+            }
         };
 
         let mut h_dot = motor + friction;
@@ -210,7 +214,13 @@ pub fn disturbance_torques(
     };
     let srp_b = cp_offset_b.cross(&srp_force_b);
 
-    DisturbanceTorques { gg_b, aero_b, mag_b, srp_b, aero_force_eci }
+    DisturbanceTorques {
+        gg_b,
+        aero_b,
+        mag_b,
+        srp_b,
+        aero_force_eci,
+    }
 }
 
 /// The rigid-body plant's state: an orbiting spacecraft whose attitude is driven by three
@@ -277,48 +287,50 @@ pub fn propagate(body: Body, tau_body_const: V3, h_w_b: V3, f_drag_eci: V3) -> B
     })
 }
 
-/// Build the plant's state from its params: a 400 km circular orbit, booted
-/// `init_orbit_phase` radians around it — phase zero is the classic +X position / +Y
-/// velocity (cube-sat `CubeSat::default`), and the eclipse tests crank the phase to start in
-/// Earth shadow — with the body rotated `init_angle` about [1,1,1] from the (identity)
-/// reference and a small initial tumble about the same axis.
-pub fn plant_init(p: PlantParams) -> PlantState {
-    let radius = EARTH_RADIUS + ALTITUDE;
-    let v_orbit = (MU / radius).sqrt();
-    let (sin_th, cos_th) = p.init_orbit_phase.sin_cos();
-    let pos0 = tensor![cos_th, sin_th, 0.0] * radius;
-    let vel0 = tensor![-sin_th, cos_th, 0.0] * v_orbit;
+impl PlantState {
+    /// Build the plant's state from its params: a 400 km circular orbit, booted
+    /// `init_orbit_phase` radians around it — phase zero is the classic +X position / +Y
+    /// velocity (cube-sat `CubeSat::default`), and the eclipse tests crank the phase to start in
+    /// Earth shadow — with the body rotated `init_angle` about [1,1,1] from the (identity)
+    /// reference and a small initial tumble about the same axis.
+    pub fn new(p: PlantParams) -> PlantState {
+        let radius = EARTH_RADIUS + ALTITUDE;
+        let v_orbit = (MU / radius).sqrt();
+        let (sin_th, cos_th) = p.init_orbit_phase.sin_cos();
+        let pos0 = tensor![cos_th, sin_th, 0.0] * radius;
+        let vel0 = tensor![-sin_th, cos_th, 0.0] * v_orbit;
 
-    let axis: V3 = tensor![1.0, 1.0, 1.0];
-    let q0 = Quaternion::from_axis_angle(axis, p.init_angle);
-    let omega0_world = axis.normalize() * p.init_rate;
-    let body = Body {
-        pos: SpatialTransform::new(q0, pos0),
-        vel: SpatialMotion::new(omega0_world, vel0),
-        accel: SpatialMotion::zero(),
-        inertia: SpatialInertia::new(inertia_diag(), tensor![0.0, 0.0, 0.0], MASS),
-        force: SpatialForce::zero(),
-    };
-    let arm = !p.disarmed;
-    PlantState {
-        body,
-        wheels: [
-            ReactionWheel::new(tensor![1.0, 0.0, 0.0], arm).with_momentum(p.init_wheel_h),
-            ReactionWheel::new(tensor![0.0, 1.0, 0.0], arm).with_momentum(p.init_wheel_h),
-            ReactionWheel::new(tensor![0.0, 0.0, 1.0], arm).with_momentum(p.init_wheel_h),
-        ],
-        bias: V3::zeros(),
-        rng: StdRng::seed_from_u64(p.seed),
-        t_sim: 0.0,
-        mag_model: MagneticModel::default(),
-        gps_pos_err: V3::zeros(),
-        params: p,
+        let axis: V3 = tensor![1.0, 1.0, 1.0];
+        let q0 = Quaternion::from_axis_angle(axis, p.init_angle);
+        let omega0_world = axis.normalize() * p.init_rate;
+        let body = Body {
+            pos: SpatialTransform::new(q0, pos0),
+            vel: SpatialMotion::new(omega0_world, vel0),
+            accel: SpatialMotion::zero(),
+            inertia: SpatialInertia::new(inertia_diag(), tensor![0.0, 0.0, 0.0], MASS),
+            force: SpatialForce::zero(),
+        };
+        let arm = !p.disarmed;
+        PlantState {
+            body,
+            wheels: [
+                ReactionWheel::new(tensor![1.0, 0.0, 0.0], arm).with_momentum(p.init_wheel_h),
+                ReactionWheel::new(tensor![0.0, 1.0, 0.0], arm).with_momentum(p.init_wheel_h),
+                ReactionWheel::new(tensor![0.0, 0.0, 1.0], arm).with_momentum(p.init_wheel_h),
+            ],
+            bias: V3::zeros(),
+            rng: StdRng::seed_from_u64(p.seed),
+            t_sim: 0.0,
+            mag_model: MagneticModel::default(),
+            gps_pos_err: V3::zeros(),
+            params: p,
+        }
     }
 }
 
 /// One plant cycle: step the wheels, sample the sensors, publish the telemetry, integrate.
 #[allow(clippy::too_many_arguments)]
-pub fn plant_execute(
+pub fn execute(
     state: &mut PlantState,
     now: Timestamp,
     torque: &mut Input<TorqueCmd>,
@@ -530,7 +542,10 @@ mod tests {
         for _ in 0..5000 {
             w.update();
             let s: f64 = w.ang_momentum.into_buf()[0];
-            assert!(s <= RW_MOMENTUM_MAX + 1e-12, "momentum exceeded the limit: {s}");
+            assert!(
+                s <= RW_MOMENTUM_MAX + 1e-12,
+                "momentum exceeded the limit: {s}"
+            );
             if s >= RW_MOMENTUM_MAX - 1e-12 {
                 pinned += 1;
             }
@@ -542,7 +557,10 @@ mod tests {
         w.torque_set_point = tensor![RW_TORQUE_MAX, 0.0, 0.0];
         w.update();
         let t: f64 = w.torque.into_buf()[0];
-        assert!(t > 1e-3, "unloading torque did not flow from saturation: {t}");
+        assert!(
+            t > 1e-3,
+            "unloading torque did not flow from saturation: {t}"
+        );
         let s: f64 = w.ang_momentum.into_buf()[0];
         assert!(s < RW_MOMENTUM_MAX, "momentum did not unload");
     }
@@ -560,7 +578,11 @@ mod tests {
         for _ in 0..30_000 {
             w.update();
             assert!(w.speed <= prev + 1e-15, "friction sped the wheel up");
-            assert!(w.speed >= 0.0, "friction counter-rotated the wheel: {}", w.speed);
+            assert!(
+                w.speed >= 0.0,
+                "friction counter-rotated the wheel: {}",
+                w.speed
+            );
             if w.speed == prev {
                 frozen += 1;
             } else {
@@ -569,7 +591,10 @@ mod tests {
             prev = w.speed;
         }
         assert!(frozen > 100, "wheel never froze");
-        assert!(prev < RW_STICTION_OMEGA, "froze outside the deadband: {prev}");
+        assert!(
+            prev < RW_STICTION_OMEGA,
+            "froze outside the deadband: {prev}"
+        );
     }
 
     /// The disturbance model lands each source in its expected order-of-magnitude band at a
@@ -608,13 +633,25 @@ mod tests {
 
         let mag_of = |v: &V3| -> f64 { v.norm().into_buf() };
         let gg = mag_of(&d.gg_b);
-        assert!((1e-10..1e-6).contains(&gg), "gravity-gradient torque out of band: {gg}");
+        assert!(
+            (1e-10..1e-6).contains(&gg),
+            "gravity-gradient torque out of band: {gg}"
+        );
         let aero = mag_of(&d.aero_b);
-        assert!((1e-9..1e-5).contains(&aero), "aero torque out of band: {aero}");
+        assert!(
+            (1e-9..1e-5).contains(&aero),
+            "aero torque out of band: {aero}"
+        );
         let res = mag_of(&d.mag_b);
-        assert!((1e-10..1e-5).contains(&res), "residual-dipole torque out of band: {res}");
+        assert!(
+            (1e-10..1e-5).contains(&res),
+            "residual-dipole torque out of band: {res}"
+        );
         let srp = mag_of(&d.srp_b);
-        assert!((1e-11..1e-7).contains(&srp), "SRP torque out of band: {srp}");
+        assert!(
+            (1e-11..1e-7).contains(&srp),
+            "SRP torque out of band: {srp}"
+        );
         // Drag opposes the velocity.
         let drag_along_v: f64 = d.aero_force_eci.dot(&vel).into_buf();
         assert!(drag_along_v < 0.0, "drag force does not oppose velocity");
@@ -637,9 +674,17 @@ mod tests {
         // Sun along +X: head 0 (+X) reads 1, head 3 (−X) is FOV-clamped to 0.
         let sun_x: V3 = tensor![1.0, 0.0, 0.0];
         let r = css_readings(&sun_x, true);
-        assert!((r[0] - 1.0).abs() < 1e-12, "+X head square to the sun: {}", r[0]);
+        assert!(
+            (r[0] - 1.0).abs() < 1e-12,
+            "+X head square to the sun: {}",
+            r[0]
+        );
         assert_eq!(r[3], 0.0, "−X head is behind its FOV");
-        assert_eq!([r[1], r[2], r[4], r[5]], [0.0; 4], "perpendicular heads read zero");
+        assert_eq!(
+            [r[1], r[2], r[4], r[5]],
+            [0.0; 4],
+            "perpendicular heads read zero"
+        );
 
         // An oblique sun: the three facing heads read its direction cosines.
         let sun: V3 = (tensor![1.0, 1.0, 1.0] as V3).normalize();
