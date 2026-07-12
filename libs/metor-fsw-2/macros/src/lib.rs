@@ -29,6 +29,7 @@ mod as_vtable;
 mod componentize;
 mod decomponentize;
 mod frame;
+mod frame_attr;
 mod metadatatize;
 mod sequence;
 mod sig;
@@ -93,7 +94,7 @@ impl Field {
 /// a frame with a single annotation. Fields are configured with
 /// `#[fsw(...)]`.
 #[proc_macro_derive(Frame, attributes(fsw, metor_fsw))]
-pub fn frame(input: TokenStream) -> TokenStream {
+pub fn frame_derive(input: TokenStream) -> TokenStream {
     frame::frame(input)
 }
 
@@ -120,6 +121,15 @@ pub fn system_output(input: TokenStream) -> TokenStream {
 #[proc_macro_attribute]
 pub fn sequence(attr: TokenStream, item: TokenStream) -> TokenStream {
     sequence::sequence(attr, item)
+}
+
+/// `#[frame(name = "...")]` expands to the full frame preamble — the
+/// `Frame` + zerocopy derive stack, `#[repr(C)]`, and the name attribute —
+/// so a frame declaration is one line instead of four. Field attributes
+/// (`#[metor_fsw(timestamp)]`) and any extra `#[derive(...)]` pass through.
+#[proc_macro_attribute]
+pub fn frame(attr: TokenStream, item: TokenStream) -> TokenStream {
+    frame_attr::frame_attr(attr, item)
 }
 
 /// Builds a complete system from a type's inherent impl block, deriving

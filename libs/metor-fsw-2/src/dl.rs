@@ -279,7 +279,6 @@ pub(crate) struct PackEntryMeta {
     pub(crate) descriptor: SystemDescriptor,
     pub(crate) params_schema: OwnedNamedType,
     pub(crate) reloadable: bool,
-    #[allow(dead_code)] // consumed when KDL default-overlay lands
     pub(crate) params_default: Option<Vec<u8>>,
 }
 
@@ -414,6 +413,7 @@ impl DlPack {
             index: index as u32,
             descriptor: meta.descriptor.clone(),
             params_schema: meta.params_schema.clone(),
+            params_default: meta.params_default.clone(),
             reloadable: meta.reloadable,
         })
     }
@@ -434,6 +434,9 @@ pub struct DlSystem {
     /// The exported `Params` schema, kept so the host can schema-encode KDL
     /// params without ever linking the `Params` type.
     params_schema: OwnedNamedType,
+    /// The entry's declared default-params blob, the base KDL config
+    /// overlays.
+    params_default: Option<Vec<u8>>,
     reloadable: bool,
 }
 
@@ -456,6 +459,11 @@ impl DlSystem {
     /// entry cannot, and so can never be a slot occupant.
     pub fn reloadable(&self) -> bool {
         self.reloadable
+    }
+
+    /// The entry's declared default-params blob, if any.
+    pub fn params_default(&self) -> Option<&[u8]> {
+        self.params_default.as_deref()
     }
 
     /// Builds a fresh [`DlSlot`] without consuming the handle. Each call runs

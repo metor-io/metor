@@ -101,6 +101,34 @@ pub(crate) fn decode_params<P: DeserializeOwned>(params: EntryParams<'_>) -> Res
     }
 }
 
+/// Resolve an entry's params surface to complete postcard bytes when the
+/// entry declared defaults: an absent config uses the defaults verbatim, a
+/// KDL surface is schema-encoded over the decoded default base (top-level
+/// overrides), and explicit postcard bytes pass through complete.
+pub(crate) fn resolve_defaults(
+    params: EntryParams<'_>,
+    defaults: &[u8],
+    schema: &'static NamedType,
+) -> Result<Vec<u8>, MakeError> {
+    match params {
+        EntryParams::Postcard(bytes) if bytes.is_empty() => Ok(defaults.to_vec()),
+        EntryParams::Postcard(bytes) => Ok(bytes.to_vec()),
+        #[cfg(feature = "kdl")]
+        EntryParams::Kdl { node, name, .. } => {
+            let owned = postcard_schema::schema::owned::OwnedNamedType::from(schema);
+            crate::wiring::encode_kdl_params_with_defaults(
+                &node.to_string(),
+                &owned,
+                name,
+                crate::wiring::SYSTEM_RESERVED,
+                1,
+                Some(defaults),
+            )
+            .map_err(|e| MakeError::Kdl(Box::new(e)))
+        }
+    }
+}
+
 /// The bind-phase half of a created entry: bind ports over the ring source
 /// (positionally, in descriptor order) and yield the runnable driver.
 pub type Pending = Box<dyn for<'a, 'b, 'c> FnOnce(&'a mut AnySource<'b, 'c>, Mount) -> Box<dyn Driver>>;
@@ -148,6 +176,25 @@ impl PackEntry {
     /// back the bind-phase [`Pending`].
     pub fn create(&mut self, params: EntryParams<'_>) -> Result<Pending, MakeError> {
         (self.create)(params)
+    }
+
+    /// Route this entry's create through [`resolve_defaults`], so its own
+    /// decode honors the declared defaults on every params surface.
+    pub(crate) fn wrap_create_with_defaults(&mut self) {
+        let defaults = self
+            .params_default
+            .clone()
+            .expect("defaults declared before wrapping");
+        let schema = self.params_schema;
+        let inner = std::mem::replace(
+            &mut self.create,
+            Box::new(|_| unreachable!("replaced below")),
+        );
+        let mut inner = inner;
+        self.create = Box::new(move |params: EntryParams<'_>| {
+            let bytes = resolve_defaults(params, &defaults, schema)?;
+            inner(EntryParams::Postcard(&bytes))
+        });
     }
 }
 
@@ -291,6 +338,32 @@ impl Pack {
             reloadable: true,
             create,
         });
+        self
+    }
+
+    /// As [`task`](Self::task), with declared default params: a config need
+    /// spell only its overrides, on every loading path. `P` must be the
+    /// task's `Params<P>` type (checked against the declared schema here).
+    pub fn task_with_defaults<M, F, P>(mut self, name: &'static str, f: F, defaults: P) -> Self
+    where
+        M: 'static,
+        F: crate::handler::AsyncSystemFn<M> + Clone,
+        P: serde::Serialize + postcard_schema::Schema,
+    {
+        self = self.task(name, f);
+        let entry = self.entries.last_mut().expect("task just pushed");
+        assert!(
+            core::ptr::eq(entry.params_schema, P::SCHEMA)
+                || postcard_schema::schema::owned::OwnedNamedType::from(entry.params_schema)
+                    == postcard_schema::schema::owned::OwnedNamedType::from(P::SCHEMA),
+            "task `{name}` declares Params<{}> but the defaults are a different type",
+            entry.params_schema.name,
+        );
+        entry.params_default = Some(
+            postcard::to_allocvec(&defaults)
+                .expect("params postcard-encode (Serialize is infallible)"),
+        );
+        entry.wrap_create_with_defaults();
         self
     }
 

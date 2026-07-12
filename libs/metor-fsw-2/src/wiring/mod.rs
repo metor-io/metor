@@ -80,7 +80,7 @@ pub use build_driver::{BuildError, BuildOptions, build_artifacts};
 pub use builder::{SlotSpecBuilder, SystemSpecBuilder, WiringBuilder};
 pub use bundle::{BundleError, PackageOptions, load_bundle, write_bundle};
 pub use error::LoadError;
-pub use kdl_params::encode_kdl_params;
+pub use kdl_params::{encode_kdl_params, encode_kdl_params_with_defaults};
 pub use model::{
     AllowedOccupantSpec, Artifact, ClockSpec, CoordinatorSpec, EdgeKind, EdgeSpec,
     InitialOccupantSpec, ParamSource, SlotInitState, SlotSpec, SystemSpec, TCP_DOWNLINK_TYPE,
@@ -679,14 +679,16 @@ fn encode_occupant_params(
     skip_args: usize,
 ) -> Result<Vec<u8>, LoadError> {
     Ok(match params {
-        ParamSource::None => Vec::new(),
+        // An absent config takes the entry's declared defaults verbatim.
+        ParamSource::None => loaded.params_default().unwrap_or_default().to_vec(),
         ParamSource::Postcard(bytes) => bytes.clone(),
-        ParamSource::Kdl(node_text) => encode_kdl_params(
+        ParamSource::Kdl(node_text) => encode_kdl_params_with_defaults(
             node_text,
             loaded.params_schema(),
             owner,
             reserved,
             skip_args,
+            loaded.params_default(),
         )?,
     })
 }
@@ -771,11 +773,16 @@ fn resolve_proc(
         crate::dl::decode_pack_manifest(&bytes).map_err(|e| proc_describe(e.to_string()))?;
     let meta = select_proc_entry(&entries, spec.ty.as_deref(), &spec.name, artifact_id, &src, span)?;
     let params: Vec<u8> = match &spec.params {
-        ParamSource::None => Vec::new(),
+        ParamSource::None => meta.params_default.clone().unwrap_or_default(),
         ParamSource::Postcard(bytes) => bytes.clone(),
-        ParamSource::Kdl(node_text) => {
-            encode_kdl_params(node_text, &meta.params_schema, &spec.name, SYSTEM_RESERVED, 1)?
-        }
+        ParamSource::Kdl(node_text) => encode_kdl_params_with_defaults(
+            node_text,
+            &meta.params_schema,
+            &spec.name,
+            SYSTEM_RESERVED,
+            1,
+            meta.params_default.as_deref(),
+        )?,
     };
     let desc = meta.descriptor.clone();
     let entry_name = desc.name.to_string();
@@ -1150,11 +1157,16 @@ fn describe_occupants(
             });
         }
         let params: Vec<u8> = match &occ.params {
-            ParamSource::None => Vec::new(),
+            ParamSource::None => meta.params_default.clone().unwrap_or_default(),
             ParamSource::Postcard(bytes) => bytes.clone(),
-            ParamSource::Kdl(node_text) => {
-                encode_kdl_params(node_text, &meta.params_schema, &slot.name, ALLOW_RESERVED, 0)?
-            }
+            ParamSource::Kdl(node_text) => encode_kdl_params_with_defaults(
+                node_text,
+                &meta.params_schema,
+                &slot.name,
+                ALLOW_RESERVED,
+                0,
+                meta.params_default.as_deref(),
+            )?,
         };
         let artifact = find_built_artifact(wiring, &artifact_id, &slot.name, src, span)?;
         let path = artifact.path.as_ref().expect("checked by find_built_artifact");

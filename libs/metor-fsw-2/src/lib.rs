@@ -117,6 +117,7 @@ mod reader;
 mod registry;
 mod system;
 mod telemetry;
+mod testbench;
 mod writer;
 
 pub mod health;
@@ -148,9 +149,10 @@ pub use binder::{AnySource, BindPorts, Binder, BoundInput, BoundPort, RingSource
 // `#[metor_fsw_2::system]` resolve independently.
 pub use handler::{
     AsyncSystemFn, BindCx, CycleCx, DeclSink, ExecParam, ExecParamSet, ExecuteFn, InitFn,
-    IntoOutcome, IntoPackEntry, Params, SystemDef, TaskParam, system,
+    IntoOutcome, IntoPackEntry, MissionTime, Params, SystemDef, TaskParam, system,
 };
 pub use pack::{Driver, EntryParams, MakeError, Mount, Pack, PackEntry, Pending, StepStatus};
+pub use testbench::TestBench;
 pub use coordinator::{
     AllowedOccupant, ClockMode, Coordinator, CoordinatorBuilder, CoordinatorConfig,
     InitialOccupant, NAME_CAP, OccupantBacking, PortRef, SLOT_NAME_CAP, SlotState, SlotStatus,
@@ -185,7 +187,7 @@ pub use system::{
 pub use metor_fsw_ring as ring;
 
 pub use metor_fsw::{AsVTable, Componentize, Decomponentize, Metadatatize};
-pub use metor_fsw_2_macros::{Frame, SystemInput, SystemOutput};
+pub use metor_fsw_2_macros::{Frame, SystemInput, SystemOutput, frame};
 
 pub use metor_fsw_2_macros::sequence;
 
@@ -196,7 +198,7 @@ pub use metor_proto::types::Timestamp;
 pub use sequence::{CycleClock, Outcome, Seq, SeqClock, SequenceStatus, SlotControlIn};
 
 pub use metor_fsw::path;
-pub use {metor_proto, metor_proto_wkt};
+pub use {metor_proto, metor_proto_wkt, zerocopy};
 
 pub use dl::{DlError, DlPack, DlSystem};
 
