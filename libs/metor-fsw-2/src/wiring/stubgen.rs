@@ -1062,7 +1062,7 @@ mod tests {
         }
     }
 
-    fn demo_manifest() -> Vec<u8> {
+    pub(super) fn demo_manifest() -> Vec<u8> {
         let blob = postcard::to_allocvec(&Demo::default()).unwrap();
         let msg = PackManifestMsg {
             systems: vec![
@@ -1113,6 +1113,21 @@ mod tests {
         // Defaults from the whole-struct blob show up as kwarg defaults.
         assert!(a.contains("count: int = 0"));
         assert!(a.contains("limit: int | None = None"));
+    }
+
+    /// One fixture, two consumers: the checked-in `python/tests/data/demo.py`
+    /// (imported by the Python suite) must be exactly what this codegen
+    /// produces. Regenerate it with the ignored `fixture_dump::write_demo_fixture`.
+    #[test]
+    fn demo_fixture_matches_checked_in() {
+        let generated =
+            render_module("demo", "demo-systems", "demo_systems", &demo_manifest()).unwrap();
+        let checked_in = include_str!("../../python/tests/data/demo.py");
+        assert_eq!(
+            generated, checked_in,
+            "codegen drifted from the checked-in fixture; rerun \
+             `cargo test -p metor-fsw-2 fixture_dump -- --ignored`"
+        );
     }
 
     #[test]
@@ -1242,5 +1257,21 @@ mod integration {
         std::fs::copy(&so, &iso_so).unwrap();
         let described = manifest_bytes("fixture", &iso_so).expect("describe fallback");
         assert_eq!(described, bytes, "describe ≡ sidecar bytes");
+    }
+}
+
+#[cfg(test)]
+mod fixture_dump {
+    //! Writes the shared demo fixture module to the Python test-data tree; run
+    //! explicitly (`--ignored`) when the codegen shape changes, then reviewed
+    //! as an ordinary diff. The golden test in `tests` keeps it honest.
+    use super::tests::demo_manifest;
+
+    #[test]
+    #[ignore = "regenerates the checked-in Python fixture; run on codegen changes"]
+    fn write_demo_fixture() {
+        let text = super::render_module("demo", "demo-systems", "demo_systems", &demo_manifest()).unwrap();
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/python/tests/data/demo.py");
+        std::fs::write(path, text).unwrap();
     }
 }

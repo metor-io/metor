@@ -23,14 +23,22 @@ use super::model::{IR_VERSION, Wiring};
 /// The `metor_config` package, embedded file-by-file so the `metor-fsw` binary
 /// carries its own recorder. Materialized to a temp dir at eval time unless
 /// `$METOR_CONFIG_PY` points at a live checkout.
-const EMBEDDED_PACKAGE: &[(&str, &str)] = &[(
-    "metor_config/__init__.py",
-    include_str!("../../python/metor_config/__init__.py"),
-)];
+const EMBEDDED_PACKAGE: &[(&str, &str)] = &[
+    (
+        "metor_config/__init__.py",
+        include_str!("../../python/metor_config/__init__.py"),
+    ),
+    // The `py.typed` marker travels too, so a materialized recorder is a typed
+    // package pyright checks against.
+    (
+        "metor_config/py.typed",
+        include_str!("../../python/metor_config/py.typed"),
+    ),
+];
 
 /// The embedded recorder's `__version__`, compared against the version the
 /// emitted IR carries. Kept in lockstep with `python/metor_config/__init__.py`.
-const EMBEDDED_METOR_CONFIG_VERSION: &str = "0.1.0";
+const EMBEDDED_METOR_CONFIG_VERSION: &str = "0.2.0";
 
 /// `true` if `path` dispatches to the Python front-end rather than the KDL one.
 pub fn is_python_mission(path: &Path) -> bool {
