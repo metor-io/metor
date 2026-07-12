@@ -455,7 +455,14 @@ impl<D: ColumnBrowserDelegate> ColumnBrowser<D> {
                     cx.stop_propagation();
                 }),
             )
-            .child(div().flex_1().overflow_hidden().child(label));
+            .child(
+                div()
+                    .flex_1()
+                    .overflow_hidden()
+                    .whitespace_nowrap()
+                    .text_ellipsis()
+                    .child(label),
+            );
 
         if !is_leaf {
             row = row.child(Icon::ChevronRight.svg(8.0));

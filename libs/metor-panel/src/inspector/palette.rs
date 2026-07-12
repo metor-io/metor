@@ -12,7 +12,7 @@ use metor_db::DB;
 
 use crate::config::FontConfig;
 use crate::inspector::OpenInspectorCallback;
-use crate::inspector::rows::{CommandRow, DefaultActionRow, InspectorRow, NavRow};
+use crate::inspector::rows::{CommandRow, DefaultActionRow, HeaderRow, InspectorRow, NavRow};
 use crate::presets;
 use crate::tiles::TileGroup;
 use crate::views::dashboard::DashboardPanel;
@@ -90,18 +90,72 @@ impl ItemRegistry {
             .collect()
     }
 
-    /// Build the row list the palette renders on open. Rows carry their
-    /// category as a tag pill.
+    /// Build the row list the palette renders on open, grouped under a
+    /// section header per [`Category`].
+    ///
+    /// Categories follow a fixed usage-frequency order ([`category_rank`])
+    /// and items sort by usage priority ([`item_rank`]) with an
+    /// alphabetical tiebreak, so the unfiltered list is deterministic
+    /// regardless of provider registration order and the most-used entries
+    /// ("New Panel") surface first. Rows still carry their category as a
+    /// tag pill, which stays useful once a query hides the headers.
     pub fn root_rows(db: &Arc<DB>, cx: &App) -> Vec<Box<dyn InspectorRow>> {
         let snapshot = Self::snapshot(cx);
-        let mut rows: Vec<Box<dyn InspectorRow>> = Vec::new();
+
+        // Providers may share a category, so merge into one group each
+        // rather than assume a single provider per category.
+        let mut groups: Vec<(Category, Vec<Box<dyn InspectorRow>>)> = Vec::new();
         for (category, items) in snapshot {
+            if items.is_empty() {
+                continue;
+            }
             let tag = category.label();
-            for item in items {
-                rows.push(item_to_row(item, db.clone(), tag.clone()));
+            let built: Vec<Box<dyn InspectorRow>> = items
+                .into_iter()
+                .map(|item| item_to_row(item, db.clone(), tag.clone()))
+                .collect();
+            match groups.iter_mut().find(|(c, _)| *c == category) {
+                Some((_, rows)) => rows.extend(built),
+                None => groups.push((category, built)),
             }
         }
+
+        for (_, rows) in groups.iter_mut() {
+            rows.sort_by_key(|r| (item_rank(r.label()), r.label().to_lowercase()));
+        }
+        groups.sort_by(|(a, _), (b, _)| category_rank(a).cmp(&category_rank(b)));
+
+        let mut rows: Vec<Box<dyn InspectorRow>> = Vec::new();
+        for (category, group) in groups {
+            rows.push(Box::new(HeaderRow::new(category.label())));
+            rows.extend(group);
+        }
         rows
+    }
+}
+
+/// Ordering key for palette section headers: built-ins by expected usage
+/// frequency (Command holds "New Panel", the most common entry point),
+/// then any custom categories alphabetically.
+fn category_rank(category: &Category) -> (u8, String) {
+    match category {
+        Category::Command => (0, String::new()),
+        Category::Panel => (1, String::new()),
+        Category::Widget => (2, String::new()),
+        Category::Custom(name) => (3, name.to_lowercase()),
+    }
+}
+
+/// Static usage priority for well-known items: lower ranks sort ahead of
+/// the alphabetical tiebreak within their category. Deliberately a fixed
+/// table, not tracked frecency — the palette order should never surprise
+/// by reshuffling between opens.
+fn item_rank(label: &str) -> u8 {
+    match label {
+        "New Panel" => 0,
+        "Plot Component" => 1,
+        "Update Component" => 2,
+        _ => u8::MAX,
     }
 }
 

@@ -1,9 +1,9 @@
 //! A Magit/emacs-transient "which-key" chord menu.
 //!
-//! Pressing the configured leader key opens this overlay: a compact panel
-//! docked to the bottom of the window showing the keys available at the current
-//! level. Each keystroke either descends into a submenu or runs a command and
-//! dismisses. It deliberately parallels the [`Inspector`](crate::inspector)
+//! Pressing the configured leader key opens this overlay: a compact rounded
+//! sheet floating above the bottom edge of the window showing the keys
+//! available at the current level. Each keystroke either descends into a
+//! submenu or runs a command and dismisses. It deliberately parallels the [`Inspector`](crate::inspector)
 //! palette — both are data-driven trees over the same command vocabulary — but
 //! is key-driven (one keypress navigates) rather than fuzzy-search-driven, so
 //! it is a separate, lighter entity rather than another inspector mode.
@@ -12,7 +12,7 @@ pub mod node;
 
 use gpui::{
     Context, FocusHandle, Focusable, IntoElement, KeyDownEvent, Render, SharedString, Window,
-    deferred, div, prelude::*, px,
+    deferred, div, prelude::*, px, relative,
 };
 
 use crate::inspector::rows::tag_pill;
@@ -27,7 +27,8 @@ struct Level {
 }
 
 /// The chord menu overlay. Owns a navigation stack over a [`ChordNode`] tree and
-/// renders the current level as a bottom-docked panel.
+/// renders the current level as a compact sheet floating above the bottom edge
+/// of the window, sized to its content.
 pub struct Transient {
     /// Display string of the leader key, shown as the leading breadcrumb.
     leader: SharedString,
@@ -138,12 +139,16 @@ impl Render for Transient {
         }
 
         // Key grid: each available key with its label, wrapping across rows.
+        // Scrolls within the sheet's height cap when a level has many keys.
         let mut grid = div()
+            .id("transient-grid")
             .flex()
             .flex_row()
             .flex_wrap()
-            .gap_x(px(20.0))
-            .gap_y(px(4.0))
+            .gap_x(px(16.0))
+            .gap_y(px(2.0))
+            .min_h_0()
+            .overflow_y_scroll()
             .text_size(px(12.0));
         for node in self.current_nodes() {
             grid = grid.child(
@@ -178,17 +183,21 @@ impl Render for Transient {
             }))
             .occlude()
             .absolute()
-            .bottom_0()
-            .left_0()
-            .right_0()
+            .bottom(px(12.0))
+            .left(px(12.0))
+            .right(px(12.0))
+            // Hug the content; the cap only kicks in for key-heavy levels,
+            // which then scroll inside the grid.
+            .max_h(relative(0.4))
             .flex()
             .flex_col()
-            .gap(px(6.0))
+            .gap(px(4.0))
             .bg(theme.bg_elevated)
-            .border_t_1()
+            .border_1()
             .border_color(theme.border_primary)
-            .px(px(12.0))
-            .py(px(8.0))
+            .rounded(px(6.0))
+            .px(px(6.0))
+            .py(px(4.0))
             .shadow_sm()
             .child(crumbs)
             .child(grid);

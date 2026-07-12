@@ -269,6 +269,19 @@ const READOUT_PAD_Y: f32 = 4.0;
 /// at the crosshair timestamp.
 type HoverRows = smallvec::SmallVec<[(Hsla, SharedString, SharedString); 4]>;
 
+/// One visible trace's nearest sample to the hover crosshair — everything
+/// the readout rows and the on-plot sample markers need, produced by the
+/// single lookup in [`TimeSeriesPlot::hover_samples`].
+struct HoverSample {
+    color: Hsla,
+    label: SharedString,
+    /// The sample's actual timestamp (not the pointer's), so the marker
+    /// lands on the data point rather than on the crosshair.
+    ts: Timestamp,
+    value: f64,
+    axis_index: usize,
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) enum AxisZone {
     Plot,
@@ -698,7 +711,12 @@ fn paint_overlay(
                 &[run],
                 None,
             );
-            let origin = point(col_right - shaped.width - px(4.0), y - label_font_size / 2.0);
+            // Right-aligned 4px clear of the axis rule; a label wider than
+            // its column pins to the pane edge instead of painting over the
+            // tile border (this canvas draws above the tile chrome).
+            let label_x =
+                (col_right - shaped.width - px(4.0)).max(outer_bounds.origin.x + px(2.0));
+            let origin = point(label_x, y - label_font_size / 2.0);
             let _ = shaped.paint(origin, label_font_size, window, cx);
         }
     }
@@ -721,7 +739,14 @@ fn paint_overlay(
             &[run],
             None,
         );
-        let origin = point(x - shaped.width / 2.0, pb.origin.y + pb.size.height + px(4.0));
+        // Centered on the tick, but a label near an edge tick is pulled
+        // inside the pane so it can't run over the tile border — the right
+        // chrome is only PADDING wide, far narrower than a time label.
+        let label_x = (x - shaped.width / 2.0).clamp(
+            outer_bounds.origin.x + px(2.0),
+            outer_bounds.origin.x + outer_bounds.size.width - shaped.width - px(2.0),
+        );
+        let origin = point(label_x, pb.origin.y + pb.size.height + px(4.0));
         let _ = shaped.paint(origin, label_font_size, window, cx);
     }
 
@@ -907,6 +932,17 @@ fn paint_cursors(
     }
 }
 
+/// Snapshot of the hover overlay's visible state, captured during canvas
+/// prepare (mirrors [`CursorPaint`]) so the paint closure stays free of
+/// entity access.
+struct HoverPaint {
+    pointer_x: Pixels,
+    /// `(ts_us, norm_y, color)` per visible trace: the nearest sample's
+    /// timestamp with its value pre-normalized to `[0,1]` against the
+    /// trace's axis, so paint maps it with a fixed `0..1` Y view.
+    markers: Vec<(f64, f64, Hsla)>,
+}
+
 /// Paint the plain-hover crosshair: one thin vertical rule at the pointer's
 /// X, clipped to the plot area.
 ///
@@ -932,6 +968,42 @@ fn paint_hover_crosshair(
     line.line_to(point(pointer_x, pb.origin.y + pb.size.height));
     if let Ok(path) = line.build() {
         window.paint_path(path, color);
+    }
+}
+
+/// Paint one dot per visible trace at the sample the hover readout reports,
+/// pinning the readout's values to the data points they describe. Same dot
+/// idiom as the measurement cursors' endpoint markers in [`paint_cursors`].
+fn paint_hover_markers(
+    outer_bounds: Bounds<Pixels>,
+    view: &PlotView,
+    markers: &[(f64, f64, Hsla)],
+    window: &mut Window,
+) {
+    if markers.is_empty() {
+        return;
+    }
+    let pb = plot_area(outer_bounds, view.axis_count());
+    // Markers carry normalized [0,1] Y, so a 0..1 Y view maps them straight
+    // to screen.
+    let view = view.x_bounds();
+    for &(ts, norm_y, color) in markers {
+        let screen = view.to_screen(pb, ts, norm_y);
+        if screen.x < pb.origin.x
+            || screen.x > pb.origin.x + pb.size.width
+            || screen.y < pb.origin.y
+            || screen.y > pb.origin.y + pb.size.height
+        {
+            continue;
+        }
+        let dot = Bounds {
+            origin: point(screen.x - px(3.0), screen.y - px(3.0)),
+            size: gpui::Size {
+                width: px(6.0),
+                height: px(6.0),
+            },
+        };
+        window.paint_quad(gpui::fill(dot, color));
     }
 }
 
@@ -1512,10 +1584,42 @@ impl TimeSeriesPlot {
         cx.notify();
     }
 
+    /// Resolve the hover crosshair against every visible trace: the pointer's
+    /// data-space X plus each trace's nearest sample (via the shared
+    /// [`LinePlot::trace_sample_at`]). The readout rows and the on-plot
+    /// sample markers are both derived from this one lookup, so the
+    /// highlighted point is always the sample the readout reports.
+    fn hover_samples(&self, cx: &gpui::App) -> Option<(f64, Vec<HoverSample>)> {
+        let pointer = self.hover?;
+        let pa = self.last_plot_area?;
+        let lp = self.line_plot.read(cx);
+        let view = lp.effective_view(cx)?;
+        let x_data = cursor::pixel_to_data_x(pointer.x, pa, view.x_bounds());
+        let ts = Timestamp(x_data as i64);
+        let mut samples = Vec::new();
+        for trace in lp.traces() {
+            let cfg = trace.read(cx);
+            if !cfg.visible {
+                continue;
+            }
+            let Some((sample_ts, value)) = lp.trace_sample_at(trace.entity_id(), ts, cx) else {
+                continue;
+            };
+            samples.push(HoverSample {
+                color: cfg.color,
+                label: cfg.label.clone(),
+                ts: sample_ts,
+                value,
+                axis_index: cfg.axis_index,
+            });
+        }
+        Some((x_data, samples))
+    }
+
     /// Build the hover readout: a native div listing each visible trace's
-    /// value at the crosshair timestamp (nearest sample, via the shared
-    /// [`LinePlot::trace_value_at`]) under a formatted time header, offset
-    /// and clamped clear of the pointer and pane edges.
+    /// value at the crosshair timestamp (via [`Self::hover_samples`]) under
+    /// a formatted time header, offset and clamped clear of the pointer and
+    /// pane edges.
     fn hover_readout(&self, cx: &Context<Self>) -> Option<gpui::AnyElement> {
         let pointer = self.hover?;
         let pa = self.last_plot_area?;
@@ -1523,8 +1627,7 @@ impl TimeSeriesPlot {
         let view = lp.effective_view(cx)?;
         let theme = crate::theme::theme(cx);
 
-        let x_data = cursor::pixel_to_data_x(pointer.x, pa, view.x_bounds());
-        let ts = Timestamp(x_data as i64);
+        let (x_data, samples) = self.hover_samples(cx)?;
         let header = format_time_label(
             x_data as i64,
             lp.data_start().unwrap_or(0.0) as i64,
@@ -1532,21 +1635,16 @@ impl TimeSeriesPlot {
             view.x_bounds().width(),
         );
 
-        let mut rows: HoverRows = smallvec::SmallVec::new();
-        for trace in lp.traces() {
-            let cfg = trace.read(cx);
-            if !cfg.visible {
-                continue;
-            }
-            let Some(value) = lp.trace_value_at(trace.entity_id(), ts, cx) else {
-                continue;
-            };
-            rows.push((
-                cfg.color,
-                cfg.label.clone(),
-                SharedString::from(format_value_label(value)),
-            ));
-        }
+        let rows: HoverRows = samples
+            .into_iter()
+            .map(|s| {
+                (
+                    s.color,
+                    s.label,
+                    SharedString::from(format_value_label(s.value)),
+                )
+            })
+            .collect();
 
         let lens: smallvec::SmallVec<[(usize, usize); 4]> = rows
             .iter()
@@ -1888,17 +1986,45 @@ impl Render for TimeSeriesPlot {
                     move |bounds, _window, cx| {
                         let mut out = None;
                         let _ = hover_weak.update(cx, |this, cx| {
-                            if let Some(pointer) = this.hover
-                                && let Some(view) = this.line_plot.read(cx).effective_view(cx)
-                            {
-                                out = Some((view, pointer.x));
-                            }
+                            let Some(pointer) = this.hover else {
+                                return;
+                            };
+                            let Some(view) = this.line_plot.read(cx).effective_view(cx) else {
+                                return;
+                            };
+                            // Same lookup as the readout box, pre-normalized
+                            // per axis the way `CursorPaint` markers are.
+                            let markers = this
+                                .hover_samples(cx)
+                                .map(|(_, samples)| {
+                                    samples
+                                        .into_iter()
+                                        .map(|s| {
+                                            let b = view.axis_bounds(s.axis_index);
+                                            let h = (b.max_y - b.min_y).max(1e-12);
+                                            (
+                                                s.ts.0 as f64,
+                                                (s.value - b.min_y) / h,
+                                                s.color,
+                                            )
+                                        })
+                                        .collect()
+                                })
+                                .unwrap_or_default();
+                            out = Some((
+                                view,
+                                HoverPaint {
+                                    pointer_x: pointer.x,
+                                    markers,
+                                },
+                            ));
                         });
                         (bounds, out)
                     },
                     move |_, (bounds, data), window, cx| {
-                        if let Some((view, x)) = data {
-                            paint_hover_crosshair(bounds, &view, x, window, cx);
+                        if let Some((view, hover)) = data {
+                            paint_hover_crosshair(bounds, &view, hover.pointer_x, window, cx);
+                            paint_hover_markers(bounds, &view, &hover.markers, window);
                         }
                     },
                 )

@@ -486,6 +486,44 @@ impl TileGroup {
             .or_else(|| self.panes.first().cloned())
     }
 
+    /// Reveal the panel of `kind` (a [`PaneItem::serialization_key`]): when one
+    /// is already open anywhere in the layout, activate its tab and make its
+    /// pane current; otherwise build a fresh item with `make` and add it as a
+    /// new tab in the active pane.
+    ///
+    /// This is the entry point for "jump to X" affordances (the titlebar alarm
+    /// summary, and any future status-bar shortcut) — unlike the palette's
+    /// explicit "New Panel" commands, revealing must not multiply tabs.
+    pub fn focus_or_open(
+        &mut self,
+        kind: &str,
+        make: impl FnOnce(&mut Context<Pane>) -> Box<dyn PaneItemHandle>,
+        cx: &mut Context<Self>,
+    ) {
+        let existing = self.panes.iter().find_map(|pane| {
+            pane.read(cx)
+                .items()
+                .iter()
+                .position(|item| item.serialization_key() == kind)
+                .map(|ix| (pane.clone(), ix))
+        });
+        match existing {
+            Some((pane, ix)) => {
+                pane.update(cx, |pane, cx| pane.activate_item(ix, cx));
+                self.focused_pane = Some(pane);
+                cx.notify();
+            }
+            None => {
+                if let Some(pane) = self.active_pane(cx) {
+                    pane.update(cx, |pane, cx| {
+                        let item = make(cx);
+                        pane.add_item(item, cx);
+                    });
+                }
+            }
+        }
+    }
+
     /// Split `target` along `direction`, placing `new_pane` beside it.
     pub fn split_pane(
         &mut self,

@@ -603,6 +603,37 @@ mod tests {
         Box::new(cx.new(|_| TestItem))
     }
 
+    #[derive(facet::Facet, Default)]
+    struct OtherItemConfig {}
+
+    struct OtherItem;
+
+    impl Render for OtherItem {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            div()
+        }
+    }
+
+    impl PaneItem for OtherItem {
+        type Config = OtherItemConfig;
+
+        fn tab_title(&self, _: &App) -> SharedString {
+            SharedString::new_static("other")
+        }
+
+        fn serialization_key() -> &'static str {
+            "other_item"
+        }
+
+        fn to_config(&self, _: &App) -> OtherItemConfig {
+            OtherItemConfig {}
+        }
+    }
+
+    fn other_item(cx: &mut App) -> Box<dyn PaneItemHandle> {
+        Box::new(cx.new(|_| OtherItem))
+    }
+
     #[test]
     fn reorder_insert_index_shifts_left_when_moving_right() {
         assert_eq!(reorder_insert_index(0, 3), 2);
@@ -622,6 +653,39 @@ mod tests {
         assert_eq!(active_after_remove(3, 3, 3), 2);
         // Removing the active tab mid-list keeps the index (now the next tab).
         assert_eq!(active_after_remove(1, 1, 3), 1);
+    }
+
+    #[gpui::test]
+    fn focus_or_open_activates_existing_tab(cx: &mut gpui::TestAppContext) {
+        let tg = cx.update(|cx| cx.new(|cx| TileGroup::new(vec![item(cx), other_item(cx)], cx)));
+        let pane = cx.read(|cx| tg.read(cx).panes()[0].clone());
+        cx.update(|cx| {
+            tg.update(cx, |tg, cx| {
+                tg.focus_or_open("other_item", |cx| other_item(cx), cx);
+            });
+        });
+        cx.read(|cx| {
+            let pane = pane.read(cx);
+            assert_eq!(pane.items().len(), 2, "no new tab when one already exists");
+            assert_eq!(pane.active_index(), 1, "existing tab becomes active");
+        });
+    }
+
+    #[gpui::test]
+    fn focus_or_open_adds_missing_panel(cx: &mut gpui::TestAppContext) {
+        let tg = cx.update(|cx| cx.new(|cx| TileGroup::new(vec![item(cx)], cx)));
+        let pane = cx.read(|cx| tg.read(cx).panes()[0].clone());
+        cx.update(|cx| {
+            tg.update(cx, |tg, cx| {
+                tg.focus_or_open("other_item", |cx| other_item(cx), cx);
+            });
+        });
+        cx.read(|cx| {
+            let pane = pane.read(cx);
+            assert_eq!(pane.items().len(), 2);
+            assert_eq!(pane.items()[1].serialization_key(), "other_item");
+            assert_eq!(pane.active_index(), 1, "new tab becomes active");
+        });
     }
 
     #[gpui::test]
