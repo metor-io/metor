@@ -589,6 +589,17 @@ pub fn resolve(wiring: &Wiring, registry: &Registry) -> Result<Coordinator, Load
     let config = coordinator_config(&wiring.coordinator);
     let mut builder = Coordinator::builder(config);
 
+    // Broadcast the full mission IR as a `WiringManifest` at startup and on
+    // reload. Serialized path-stripped so the telemetered topology matches the
+    // bundle's `wiring.json` byte-for-byte regardless of the build tree. Both
+    // front-ends land here, so the manifest flows whatever the source language.
+    let ir_json = serde_json::to_string(&wiring.path_stripped())
+        .expect("a resolvable Wiring serializes to JSON");
+    builder.set_wiring_manifest(metor_proto_wkt::WiringManifest {
+        ir_version: wiring.ir_version,
+        ir_json,
+    });
+
     // --- Systems pass: static via the Registry, dl via the loader --------
     let mut instances: HashMap<String, Instance> = HashMap::new();
     // The coordinator's own bundle joins the instance namespace up front.

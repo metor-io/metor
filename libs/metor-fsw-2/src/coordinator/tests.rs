@@ -2071,3 +2071,138 @@ fn proc_and_process_slot_share_a_session() {
         assert!(path.starts_with(&session_path), "{} shares the session", path.display());
     }
 }
+
+// ---------------------------------------------------------------------------
+// WiringManifest emission: the coordinator broadcasts the full mission IR on
+// its `wiring` channel at boot and re-fires it on a ReloadSequences request,
+// sizing the ring from the concrete payload (the IR overruns the default cap).
+// ---------------------------------------------------------------------------
+
+use metor_proto::types::Msg as _;
+use metor_proto_wkt::{ReloadSequences, WiringManifest};
+
+/// Read every record currently readable on a coordinator message channel,
+/// decoding each as a [`WiringManifest`]. The view must be claimed before the
+/// run so it sits at the ring's live edge when the boot record lands.
+#[cfg(not(miri))]
+fn drain_wiring(view: &mut metor_fsw_ring::View<metor_fsw_ring::NoWake, metor_fsw_ring::NoWake>) -> Vec<WiringManifest> {
+    let mut out = Vec::new();
+    let mut buf = Vec::new();
+    while view.try_read_into(&mut buf).expect("readable wiring ring") {
+        let (id, payload) = crate::message::split_record(&buf).expect("id-prefixed record");
+        assert_eq!(id, WiringManifest::ID, "only WiringManifest on `wiring`");
+        out.push(postcard::from_bytes(payload).expect("decode WiringManifest"));
+    }
+    out
+}
+
+#[cfg(not(miri))]
+#[stellarator::test]
+async fn wiring_manifest_emitted_at_boot() {
+    let mut b = Coordinator::builder(config());
+    b.add_cyclic(Producer::new());
+    let json = r#"{"ir_version":1,"systems":["a","b"]}"#.to_string();
+    b.set_wiring_manifest(WiringManifest {
+        ir_version: 1,
+        ir_json: json.clone(),
+    });
+    let mut coord = b.build().unwrap();
+    let registry = coord.registry();
+    let entry = registry
+        .get(metor_proto::types::ComponentId::new("coordinator.wiring"))
+        .expect("the wiring channel is registered");
+    assert!(entry.telemetered, "the manifest is recorded telemetry");
+    let mut view = entry.view().expect("reader slot");
+
+    coord.run_for(2).await;
+
+    let seen = drain_wiring(&mut view);
+    assert_eq!(seen.len(), 1, "one boot manifest");
+    assert_eq!(seen[0].ir_version, 1);
+    assert_eq!(seen[0].ir_json, json);
+}
+
+#[cfg(not(miri))]
+#[stellarator::test]
+async fn wiring_manifest_reemits_on_reload() {
+    // A producer emits one ReloadSequences on its second cycle, edged into the
+    // coordinator's reload fan-in; the manifest re-fires that cycle.
+    let mut b = Coordinator::builder(config());
+    let prod = b.add_cyclic(ReloadProducer { cycle: 0 });
+    b.connect(
+        PortRef::msg::<ReloadSequences>(prod),
+        PortRef::msg::<ReloadSequences>(b.coordinator_handle()),
+    )
+    .unwrap();
+    b.set_wiring_manifest(WiringManifest {
+        ir_version: 1,
+        ir_json: "{}".into(),
+    });
+    let mut coord = b.build().unwrap();
+    let registry = coord.registry();
+    let mut view = registry
+        .get(metor_proto::types::ComponentId::new("coordinator.wiring"))
+        .expect("wiring channel registered")
+        .view()
+        .expect("reader slot");
+
+    coord.run_for(4).await;
+
+    // Boot manifest plus one re-emit from the reload request.
+    assert_eq!(drain_wiring(&mut view).len(), 2, "boot + reload re-emit");
+}
+
+/// Emits one [`ReloadSequences`] on its second cycle, then nothing.
+struct ReloadProducer {
+    cycle: u64,
+}
+
+#[derive(SystemOutput)]
+struct ReloadOut {
+    reload: MsgOut<ReloadSequences>,
+}
+
+impl System for ReloadProducer {
+    type Input = NoIn;
+    type Output = Out<ReloadOut>;
+    const NAME: &'static str = "reload_producer";
+}
+
+impl CyclicSystem for ReloadProducer {
+    fn execute(&mut self, _now: Timestamp, _in: &mut NoIn, o: &mut Self::Output) {
+        self.cycle += 1;
+        if self.cycle == 2 {
+            let _ = o.reload.emit(&ReloadSequences {});
+        }
+    }
+}
+
+#[cfg(not(miri))]
+#[stellarator::test]
+async fn wiring_manifest_emits_oversized_payload_intact() {
+    // An IR larger than the default message cap sizes its own ring, so the boot
+    // record fits and reads back byte-for-byte — proving the cap was not the
+    // limit and nothing raised the global one.
+    let mut b = Coordinator::builder(config());
+    b.add_cyclic(Producer::new());
+    let big = "x".repeat(crate::message::MAX_MSG_BYTES + 4000);
+    let json = format!("{{\"ir_version\":1,\"blob\":\"{big}\"}}");
+    assert!(json.len() > crate::message::MAX_MSG_BYTES, "payload overruns the cap");
+    b.set_wiring_manifest(WiringManifest {
+        ir_version: 1,
+        ir_json: json.clone(),
+    });
+    let mut coord = b.build().unwrap();
+    let mut view = coord
+        .registry()
+        .get(metor_proto::types::ComponentId::new("coordinator.wiring"))
+        .expect("wiring channel registered")
+        .view()
+        .expect("reader slot");
+
+    coord.run_for(2).await;
+
+    let seen = drain_wiring(&mut view);
+    assert_eq!(seen.len(), 1, "the oversized boot manifest was emitted");
+    assert_eq!(seen[0].ir_json, json, "read back byte-for-byte, not truncated");
+}

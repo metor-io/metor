@@ -70,6 +70,7 @@ use metor_fsw_ring::{Config, NoWake, Notifier, RingBuffer, View, WakeSource, Wri
 use metor_proto::types::{ComponentId, Msg, Timestamp};
 use metor_proto_wkt::{
     ReloadSequences, SequenceChannelEvent, SequenceChannelSpec, SequenceCommand, SequenceRegistry,
+    WiringManifest,
 };
 use stellarator::sync::WaitQueue;
 use stellarator::{JoinHandle, JoinHandleDropGuard};
@@ -82,7 +83,7 @@ use crate::descriptor::{
 };
 use crate::dynamic::FrameList;
 use crate::health::{HealthPort, Level, SystemHealth, SystemLog};
-use crate::message::{LOG_DEPTH, MsgIn, MsgOut};
+use crate::message::{LOG_DEPTH, MAX_MSG_BYTES, MsgIn, MsgOut};
 use crate::port::{Input, Output, capacity_for};
 use crate::proc::session::SessionDir;
 use crate::registry::{EntrySchema, Registry, RegistryEntry};
@@ -959,6 +960,12 @@ pub struct CoordinatorBuilder {
     /// Override of the shared-memory session root; `None` picks `/dev/shm`
     /// when present, else the OS temp dir (see [`shm_dir`](Self::shm_dir)).
     shm_dir: Option<PathBuf>,
+    /// The mission IR to broadcast as a [`WiringManifest`], set by
+    /// [`set_wiring_manifest`](Self::set_wiring_manifest). `Some` adds a
+    /// `wiring` output to the coordinator #0 bundle at `build()`, sized from
+    /// the concrete payload; `None` (a builder used without a front-end)
+    /// leaves the coordinator with no wiring channel.
+    wiring_manifest: Option<WiringManifest>,
 }
 
 impl CoordinatorBuilder {
@@ -969,6 +976,7 @@ impl CoordinatorBuilder {
             edges: Vec::new(),
             worker_exe: None,
             shm_dir: None,
+            wiring_manifest: None,
         };
         // The coordinator registers itself as system #0 under the reserved
         // instance name `"coordinator"`: an ordinary declared bundle, so its
@@ -1025,6 +1033,18 @@ impl CoordinatorBuilder {
     /// `connect(PortRef::msg::<SequenceCommand>(b.coordinator_handle()), …)`.
     pub fn coordinator_handle(&self) -> SystemHandle {
         SystemHandle { id: 0 }
+    }
+
+    /// Broadcast `manifest` as a [`WiringManifest`] at startup and on reload.
+    ///
+    /// The front-end ([`resolve`](crate::wiring::resolve)) hands over the full,
+    /// path-stripped mission IR here; `build()` adds a `wiring` output to the
+    /// coordinator #0 bundle, sized from the concrete JSON payload (which for a
+    /// non-trivial mission exceeds [`MAX_MSG_BYTES`]), and the run loop emits it
+    /// on the telemetry plane — the pattern [`SequenceRegistry`] uses. Called
+    /// again, the latest manifest wins.
+    pub fn set_wiring_manifest(&mut self, manifest: WiringManifest) {
+        self.wiring_manifest = Some(manifest);
     }
 
     /// The registered descriptor of `handle`, which is what `build()`
@@ -1363,7 +1383,19 @@ impl CoordinatorBuilder {
     /// One orchestrator over named passes, each handing its product to the
     /// next: validation, edge resolution, fan-out counting, ring allocation,
     /// registry freeze, copy-in planning, bind.
-    pub fn build(self) -> Result<Coordinator, WireError> {
+    pub fn build(mut self) -> Result<Coordinator, WireError> {
+        // Add the wiring-manifest output to the coordinator #0 bundle before
+        // any pass runs, so it is sized, allocated, registered, and bound like
+        // every other port. Its ring is sized from the concrete payload — a
+        // full IR overruns the default message cap — via an overridden
+        // `max_size`; nothing raises the global cap.
+        let wiring_manifest = self.wiring_manifest.take();
+        if let Some(manifest) = &wiring_manifest {
+            let mut port = PortDesc::msg_named::<WiringManifest>("wiring");
+            port.conn = PortConn::Host;
+            port.max_size = wiring_manifest_max_size(&manifest.ir_json);
+            self.systems[0].desc.outputs.push(port);
+        }
         self.validate_cycle_rate()?;
         self.validate_receive_all_last()?;
         self.validate_slot_name_caps()?;
@@ -1418,6 +1450,9 @@ impl CoordinatorBuilder {
             seq_registry_out: coord.seq_registry_out,
             seq_registry,
             seq_registry_emitted: false,
+            wiring_out: coord.wiring_out,
+            wiring_manifest,
+            wiring_emitted: false,
             reload_in: coord.reload_in,
             started: false,
             // Declared last so the canonical ring handles drop after every port.
@@ -2018,6 +2053,9 @@ struct CoordinatorPorts {
     seq_registry_out: MsgOut<SequenceRegistry>,
     control_out: MsgOut<SequenceCommand>,
     reload_in: MsgIn<ReloadSequences>,
+    /// The `wiring` writer, present only when a front-end set a manifest (so
+    /// the #0 bundle declared the port).
+    wiring_out: Option<MsgOut<WiringManifest>>,
 }
 
 /// The bind pass product: every cyclic slot, every pending async system, and
@@ -2241,6 +2279,13 @@ fn bind_coordinator(
             })
             .unwrap_or_default(),
     );
+    // The `wiring` output exists only when a front-end set a manifest; bind
+    // its writer when the #0 bundle declared the port.
+    let wiring_out = desc
+        .outputs
+        .iter()
+        .position(|p| p.id == PortId::Packet(WiringManifest::ID))
+        .map(|idx| owned_writer::<WiringManifest>(&output_rings[id][idx]));
     CoordinatorPorts {
         health,
         status_out,
@@ -2248,6 +2293,7 @@ fn bind_coordinator(
         seq_registry_out,
         control_out,
         reload_in,
+        wiring_out,
     }
 }
 
@@ -2740,6 +2786,18 @@ fn owned_writer<M: Msg>(ring: &RingBuffer) -> MsgOut<M> {
     MsgOut::new(writer)
 }
 
+/// Worst-case record bytes for a [`WiringManifest`] carrying `ir_json`, the
+/// `max_size` the coordinator sizes the `wiring` ring from. A record is the
+/// 2-byte [`Msg::ID`] plus the postcard body: the `u32` `ir_version` (≤5-byte
+/// varint), the JSON's length prefix (≤5-byte varint), and the JSON bytes.
+/// Rounded up to a 1 KiB boundary for headroom, with the default message cap
+/// as a floor so a small mission's ring is no smaller than an ordinary one.
+fn wiring_manifest_max_size(ir_json: &str) -> usize {
+    (ir_json.len() + 12)
+        .next_multiple_of(1024)
+        .max(MAX_MSG_BYTES)
+}
+
 /// Build a postcard [`RegistryEntry`] for one message channel: the
 /// instance-qualified key `ComponentId::new("<instance>.<name>")` (the on-wire
 /// identity) over a clone of the ring, the [`registry_entry`] sibling for the
@@ -2847,6 +2905,16 @@ pub struct Coordinator {
     /// Whether the boot `SequenceRegistry` has been emitted (emit-once; the
     /// re-emit hook is [`emit_sequence_registry`](Coordinator::emit_sequence_registry)).
     seq_registry_emitted: bool,
+    /// The sole writer of the coordinator's `wiring` channel, present only when
+    /// a front-end supplied a manifest.
+    wiring_out: Option<MsgOut<WiringManifest>>,
+    /// The full mission IR to broadcast on the `wiring` channel, emitted once
+    /// at the head of [`run_for`](Coordinator::run_for) and re-fired on a
+    /// [`ReloadSequences`] request. `None` mirrors `wiring_out`.
+    wiring_manifest: Option<WiringManifest>,
+    /// Whether the [`WiringManifest`] has been emitted (emit-once; re-emitted
+    /// on reload alongside the `SequenceRegistry`).
+    wiring_emitted: bool,
     /// The [`ReloadSequences`] fan-in on the coordinator's #0 bundle, drained
     /// each cycle: any request re-emits the `SequenceRegistry`, so a consumer
     /// that connected after boot (a late-started panel) can recover the
@@ -2910,6 +2978,17 @@ impl Coordinator {
     /// rebuilt payload.
     pub fn emit_sequence_registry(&mut self) {
         let _ = self.seq_registry_out.emit(&self.seq_registry);
+    }
+
+    /// Emit the full mission IR on the coordinator's `wiring` channel — the
+    /// live/historical topology the panel graph tile consumes. A no-op when no
+    /// front-end set a manifest. Called once at the head of
+    /// [`run_for`](Self::run_for) and re-fired on a [`ReloadSequences`]
+    /// request, so a consumer that connected after boot resyncs on demand.
+    pub fn emit_wiring_manifest(&mut self) {
+        if let (Some(out), Some(manifest)) = (&mut self.wiring_out, &self.wiring_manifest) {
+            let _ = out.emit(manifest);
+        }
     }
 
     /// The writer over the coordinator's command channel: the in-proc
@@ -2986,6 +3065,13 @@ impl Coordinator {
             self.emit_sequence_registry();
             self.seq_registry_emitted = true;
         }
+        // The wiring manifest rides the same boot path: emit once before the
+        // first cycle so a tap claimed after `build()` sees the topology ahead
+        // of any live edge activity.
+        if !self.wiring_emitted {
+            self.emit_wiring_manifest();
+            self.wiring_emitted = true;
+        }
         // The Wall pacing budget. Only computed under a `Wall` clock, since
         // `cycle_rate` is documented ignored under `Simulated` and an unusable
         // rate must not panic there; under `Wall` the rate was validated at
@@ -3014,6 +3100,9 @@ impl Coordinator {
             self.reload_in.drain(|ReloadSequences {}| reload = true);
             if reload {
                 self.emit_sequence_registry();
+                // Topology does not change on reload today, but a slot-occupancy
+                // consumer that missed boot resyncs off the same one message.
+                self.emit_wiring_manifest();
             }
             // Commands are drained per-slot at the head of each `step`: a
             // slot's declared `commands` fan-in reads exactly the producers

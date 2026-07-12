@@ -1136,6 +1136,41 @@ async fn builder_wiring_resolves_and_runs() {
     assert!(coord.stopped().is_empty(), "no system hard-stopped");
 }
 
+#[cfg(not(miri))]
+#[stellarator::test]
+async fn resolve_broadcasts_the_wiring_manifest() {
+    // resolve serializes the path-stripped IR onto the coordinator's `wiring`
+    // channel; the boot record decodes back to exactly that Wiring, the
+    // contract the panel graph tile consumes off recorded telemetry.
+    use metor_proto::types::Msg as _;
+    use metor_proto_wkt::WiringManifest;
+
+    let wiring = equiv_builder().build();
+    let mut coord = resolve(&wiring, &registry()).expect("resolve the builder Wiring");
+    let mut view = coord
+        .registry()
+        .get(ComponentId::new("coordinator.wiring"))
+        .expect("the wiring channel is registered")
+        .view()
+        .expect("reader slot");
+
+    coord.run_for(2).await;
+
+    let mut buf = Vec::new();
+    assert!(view.try_read_into(&mut buf).expect("readable ring"), "boot manifest present");
+    let (id, payload) = crate::message::split_record(&buf).expect("id-prefixed record");
+    assert_eq!(id, WiringManifest::ID);
+    let manifest: WiringManifest = postcard::from_bytes(payload).expect("decode manifest");
+    assert_eq!(manifest.ir_version, wiring.ir_version);
+    let round_tripped: Wiring =
+        serde_json::from_str(&manifest.ir_json).expect("the payload is the JSON IR");
+    assert_eq!(
+        round_tripped,
+        wiring.path_stripped(),
+        "the manifest carries the resolved, path-stripped Wiring"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // A dl system declared in KDL carries its `system`-node config as
 // `ParamSource::Kdl`, schema-encoded at resolve. Resolving the `.so` itself
