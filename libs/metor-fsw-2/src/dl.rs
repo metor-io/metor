@@ -833,6 +833,8 @@ mod tests {
             outputs: Vec::new(),
             params_schema: OwnedNamedType::from(<() as postcard_schema::Schema>::SCHEMA),
             capabilities,
+            docs: None,
+            params_docs: Vec::new(),
         };
 
         assert!(reject_capabilities(mk(Vec::new())).is_ok());

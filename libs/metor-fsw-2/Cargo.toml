@@ -43,6 +43,10 @@ zerocopy = { version = "0.8.2", features = ["derive"] }
 
 libloading = { version = "0.8" }
 
+# Pack-crate-local collection of per-field params docs (ABI v6): a
+# `#[derive(ParamsDocs)]` submits entries the in-`.so` describe path collects.
+inventory = "0.3"
+
 # errors
 miette = { version = "7.0", features = ["fancy"], optional = true }
 thiserror = { version = "2.0" }

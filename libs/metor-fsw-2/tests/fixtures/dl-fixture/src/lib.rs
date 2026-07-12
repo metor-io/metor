@@ -68,7 +68,7 @@ impl NamedMsg for TickEvent {
 ///
 /// The mix of an integer and a float keeps parameter round-trip checks honest
 /// beyond a single-value encoding.
-#[derive(Serialize, Deserialize, Schema, Clone, Default, Debug, PartialEq)]
+#[derive(Serialize, Deserialize, Schema, Clone, Default, Debug, PartialEq, metor_fsw_2::ParamsDocs)]
 pub struct CounterParams {
     pub start: u64,
     pub scale: f64,

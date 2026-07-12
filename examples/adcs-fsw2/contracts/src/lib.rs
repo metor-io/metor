@@ -579,7 +579,7 @@ pub fn tracking_sample(body: &BodyState, law: u8) -> (f64, f64) {
 /// environment. The disturbance defaults are physically honest for a ~3 kg spacecraft at
 /// 400 km (secular torques ~1e-7 N·m — days to load a wheel); tests and demos crank them so
 /// momentum management is visible in seconds.
-#[derive(Serialize, Deserialize, Schema, Clone, Debug, PartialEq)]
+#[derive(Serialize, Deserialize, Schema, Clone, Debug, PartialEq, metor_fsw_2::ParamsDocs)]
 pub struct PlantParams {
     /// Initial attitude offset from the target, radians about the [1,1,1] axis.
     pub init_angle: f64,
@@ -654,14 +654,14 @@ fn default_mtq_max() -> f64 {
 }
 
 /// Navigation-filter (MEKF) parameters.
-#[derive(Serialize, Deserialize, Schema, Clone, Debug, PartialEq)]
+#[derive(Serialize, Deserialize, Schema, Clone, Debug, PartialEq, metor_fsw_2::ParamsDocs)]
 pub struct NavParams {
     /// MEKF measurement 1-sigma for the two vector observations.
     pub meas_sigma: f64,
 }
 
 /// Controller (Yang-LQR + magnetorquer laws) parameters.
-#[derive(Serialize, Deserialize, Schema, Clone, Debug, PartialEq)]
+#[derive(Serialize, Deserialize, Schema, Clone, Debug, PartialEq, metor_fsw_2::ParamsDocs)]
 pub struct CtrlParams {
     /// LQR attitude/rate state weight (q) and control weight (r).
     pub q_weight: f64,
@@ -702,7 +702,7 @@ impl Default for CtrlParams {
 /// ([`Outcome::Failed`](metor_fsw_2::Outcome)). Spelled out in full on the mission's
 /// `allow occupant="commissioning"` line (the dlopen occupant encoder has no serde
 /// defaults), which is also how tests patch individual gates.
-#[derive(Serialize, Deserialize, Schema, Clone, Debug, PartialEq)]
+#[derive(Serialize, Deserialize, Schema, Clone, Debug, PartialEq, metor_fsw_2::ParamsDocs)]
 pub struct CommissioningParams {
     /// Enter the detumble phase only above this estimated rate (rad/s). Sized by wheel
     /// capture: absorbing 1.0 rad/s loads the worst axis to ≈38% of the momentum limit, so

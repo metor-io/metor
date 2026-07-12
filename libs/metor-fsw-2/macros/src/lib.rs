@@ -31,6 +31,7 @@ mod decomponentize;
 mod frame;
 mod frame_attr;
 mod metadatatize;
+mod params_docs;
 mod sequence;
 mod sig;
 mod system;
@@ -96,6 +97,14 @@ impl Field {
 #[proc_macro_derive(Frame, attributes(fsw, metor_fsw))]
 pub fn frame_derive(input: TokenStream) -> TokenStream {
     frame::frame(input)
+}
+
+/// Derives `ParamsDocs`: submits a system's `Params` field doc comments into
+/// the crate-local params-docs collection, so `metor-fsw stubgen` can render
+/// them. Docs are optional; undocumented fields contribute nothing.
+#[proc_macro_derive(ParamsDocs)]
+pub fn params_docs_derive(input: TokenStream) -> TokenStream {
+    params_docs::params_docs(input)
 }
 
 /// Derives `SystemInput` and `BindPorts` for a bundle of input ports.
