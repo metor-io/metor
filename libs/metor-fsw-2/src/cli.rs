@@ -4,8 +4,9 @@ use clap::{Args, Parser, Subcommand};
 use miette::IntoDiagnostic;
 
 use crate::wiring::{
-    BuildOptions, ClockSpec, PackageOptions, Registry, Wiring, build_artifacts,
-    eval_python_mission, is_python_mission, load_bundle, parse_with_origin, resolve, write_bundle,
+    BuildOptions, ClockSpec, PackageOptions, Registry, StubgenOptions, Wiring, build_artifacts,
+    eval_python_mission, is_python_mission, load_bundle, parse_with_origin, resolve, stubgen,
+    write_bundle,
 };
 
 /// The fully parsed command line, produced from argv by [`run`].
@@ -29,6 +30,8 @@ enum Command {
     Package(PackageArgs),
     /// Load a wiring (a source `.kdl` with `--build`, or a bundle dir) and run it.
     Run(RunArgs),
+    /// Generate the typed Python pack modules (`packs/<id>.py`) for a mission.
+    Stubgen(StubgenArgs),
 }
 
 #[derive(Args, Debug)]
@@ -99,6 +102,27 @@ struct RunArgs {
     cycles: Option<usize>,
 }
 
+#[derive(Args, Debug)]
+struct StubgenArgs {
+    /// The mission directory whose `pyproject.toml` lists the artifacts
+    /// (default: the current directory). Stubs land in its `packs/`.
+    #[arg(default_value = ".")]
+    dir: PathBuf,
+    /// Verify the checked-in stubs are byte-identical instead of writing them
+    /// (the CI gate); exits non-zero if any are stale.
+    #[arg(long)]
+    check: bool,
+    /// Require the artifacts prebuilt (locate them without running cargo).
+    #[arg(long)]
+    no_build: bool,
+    /// Build the `--release` profile.
+    #[arg(long)]
+    release: bool,
+    /// An extra arg appended to every `cargo build` (repeatable).
+    #[arg(long = "cargo-arg", value_name = "ARG", allow_hyphen_values = true)]
+    cargo_arg: Vec<String>,
+}
+
 pub async fn run() -> miette::Result<()> {
     // Route a re-executed worker child before anything else (process
     // systems; a no-op read of one env var otherwise).
@@ -108,7 +132,30 @@ pub async fn run() -> miette::Result<()> {
         Command::Build(a) => cmd_build(a),
         Command::Package(a) => cmd_package(a),
         Command::Run(a) => cmd_run(a).await,
+        Command::Stubgen(a) => cmd_stubgen(a),
     }
+}
+
+/// `stubgen`: read the mission's `pyproject.toml`, (build and) describe each
+/// listed artifact, and write — or, with `--check`, verify — its typed pack
+/// module.
+fn cmd_stubgen(args: StubgenArgs) -> miette::Result<()> {
+    let opts = StubgenOptions {
+        mission_dir: args.dir,
+        check: args.check,
+        build: !args.no_build,
+        release: args.release,
+        cargo_args: args.cargo_arg,
+    };
+    let report = stubgen(&opts).into_diagnostic()?;
+    if opts.check {
+        println!("stubgen --check: {} module(s) up to date", report.modules.len());
+    } else {
+        for path in &report.modules {
+            println!("  wrote {}", path.display());
+        }
+    }
+    Ok(())
 }
 
 /// Load a source mission into a [`Wiring`], dispatched by extension: a `.py`

@@ -149,6 +149,14 @@ pub struct Artifact {
     /// [`build_artifacts`](crate::wiring::build_artifacts). `None` until built or
     /// located.
     pub path: Option<PathBuf>,
+    /// The `sha256:<hex>` hash of the pack manifest the generated stub module
+    /// (`metor-fsw stubgen`) was produced against, carried through from the
+    /// module's `ARTIFACT` constant. [`resolve`](crate::wiring::resolve)
+    /// compares it against the live manifest and refuses a stale stub
+    /// ([`StaleStubs`](crate::wiring::LoadError::StaleStubs)). `None` for the
+    /// KDL front-end and hand-written `pack()` handles, which skip the check.
+    #[serde(default)]
+    pub manifest_hash: Option<String>,
     /// Where this artifact was declared.
     #[serde(default)]
     pub src: Option<SourceRef>,

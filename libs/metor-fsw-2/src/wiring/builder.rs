@@ -105,6 +105,7 @@ impl WiringBuilder {
             crate_name: crate_name.into(),
             cdylib: super::cdylib_file_name(lib_stem.as_ref()),
             path: None,
+            manifest_hash: None,
             src: None,
         });
         self

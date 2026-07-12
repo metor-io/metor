@@ -435,8 +435,10 @@ mod tests {
     // the same convention as tests/dl_integration.rs.
     // -----------------------------------------------------------------------
 
+    // Shared with the dl and stubgen fixture tests: all three build and
+    // describe the same fixture pack into one target-dir sidecar.
     #[cfg(not(miri))]
-    static FIXTURE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    use crate::dl::FIXTURE_LOCK;
 
     #[cfg(not(miri))]
     fn fixture_wiring() -> Wiring {
@@ -455,7 +457,7 @@ mod tests {
     #[test]
     #[cfg(not(miri))]
     fn sidecar_matches_describe() {
-        let _guard = FIXTURE_LOCK.lock().unwrap();
+        let _guard = FIXTURE_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let mut wiring = fixture_wiring();
         if let Err(e) = build_artifacts(&mut wiring, &BuildOptions::default()) {
             eprintln!("skipping: build_artifacts failed: {e}");
@@ -488,7 +490,7 @@ mod tests {
     #[test]
     #[cfg(not(miri))]
     fn cross_divergence_is_a_hard_error() {
-        let _guard = FIXTURE_LOCK.lock().unwrap();
+        let _guard = FIXTURE_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let mut wiring = fixture_wiring();
         if let Err(e) = build_artifacts(&mut wiring, &BuildOptions::default()) {
             eprintln!("skipping: build_artifacts failed: {e}");
@@ -522,7 +524,7 @@ mod tests {
     #[test]
     #[cfg(not(miri))]
     fn sidecar_opt_out_writes_nothing() {
-        let _guard = FIXTURE_LOCK.lock().unwrap();
+        let _guard = FIXTURE_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let opts = BuildOptions {
             manifest_sidecar: false,
             ..BuildOptions::default()

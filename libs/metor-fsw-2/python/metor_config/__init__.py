@@ -305,6 +305,9 @@ class Mission:
                 "crate_name": crate,
                 "cdylib": _cdylib_file_name(lib),
                 "path": None,
+                # A hand-declared artifact carries no generated-stub hash, so
+                # the host's staleness check skips it (as it does for KDL).
+                "manifest_hash": None,
                 "src": _source_ref(),
             }
         )

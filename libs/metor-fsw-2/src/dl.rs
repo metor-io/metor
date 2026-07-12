@@ -298,6 +298,20 @@ pub(crate) fn read_manifest_sidecar(so_path: &Path) -> Option<Result<Vec<PackEnt
     Some(decode_pack_manifest(&bytes))
 }
 
+/// The raw postcard [`PackManifestMsg`] bytes of the `<so>.manifest` sidecar,
+/// if the build driver wrote one (sidecar-hash ≡ describe-hash). `None` when no
+/// sidecar sits next to the library, leaving the caller to describe it.
+#[cfg(feature = "kdl")]
+pub(crate) fn manifest_sidecar_bytes(so_path: &Path) -> Option<Vec<u8>> {
+    std::fs::read(manifest_sidecar_path(so_path)).ok()
+}
+
+/// One lock every in-crate test that builds and describes the dl fixture pack
+/// shares: they touch the same `<target>/…/<so>.manifest` sidecar, so they must
+/// serialize rather than race one build's atomic write against another's read.
+#[cfg(all(test, not(miri)))]
+pub(crate) static FIXTURE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 /// One decoded manifest entry: the reconstructed descriptor plus the entry
 /// facts the loader and wiring consume.
 pub(crate) struct PackEntryMeta {

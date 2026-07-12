@@ -9185,10 +9185,12 @@ dependencies = [
  "serde",
  "serde_ignored",
  "serde_json",
+ "sha2",
  "stellarator",
  "tempfile",
  "thingbuf",
  "thiserror 2.0.18",
+ "toml 0.8.23",
  "trybuild",
  "zerocopy",
 ]
