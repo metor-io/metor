@@ -683,6 +683,20 @@ fn default_k_detumble() -> f64 {
     5e-5
 }
 
+/// The mission's flight gains. `Ctrl` is `#[system]`-authored, so this
+/// `Default` also becomes the pack entry's declared defaults blob on the
+/// dlopen path — a `system` node may spell only its overrides.
+impl Default for CtrlParams {
+    fn default() -> Self {
+        Self {
+            q_weight: 5.0,
+            r_weight: 8.0,
+            k_desat: default_k_desat(),
+            k_detumble: default_k_detumble(),
+        }
+    }
+}
+
 /// The commissioning sequence's gates and budgets — every phase transition is
 /// condition-based, and every phase has a timeout that safes the spacecraft
 /// ([`Outcome::Failed`](metor_fsw_2::Outcome)). Spelled out in full on the mission's

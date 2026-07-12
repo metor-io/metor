@@ -246,6 +246,13 @@ impl Pack {
     /// `BuildSystem` supplies params and construction; the entry's descriptor
     /// is the type's static one, so config-minted ports and capabilities are
     /// rejected here rather than misbound later.
+    ///
+    /// A `#[system]` type whose params implement `Default + Serialize`
+    /// declares those defaults for the entry automatically (via
+    /// [`BuildSystem::params_default_blob`](crate::BuildSystem::params_default_blob)),
+    /// so a dl/pack config need spell only its overrides. A hand-written
+    /// `BuildSystem` impl declares none this way; use
+    /// [`system_type_with_defaults`](Self::system_type_with_defaults).
     pub fn system_type<T, O>(mut self, name: &'static str) -> Self
     where
         T: crate::CyclicSystem<Output = crate::Out<O>> + crate::BuildSystem + 'static,
@@ -253,45 +260,43 @@ impl Pack {
         T::Input: crate::BindPorts + 'static,
         O: crate::SystemOutput + crate::BindPorts + 'static,
     {
-        let mut descriptor = <T as crate::CyclicSystem>::descriptor();
-        assert!(
-            descriptor.capabilities.is_empty(),
-            "pack entries cannot hold capabilities (`{name}` declares one); \
-             capability systems stay on the static registry"
+        let mut entry = system_type_entry::<T, O>(name);
+        // An empty blob (unit-like params) declares no defaults, matching
+        // the empty-params guards on the decode paths.
+        if let Some(blob) =
+            <T as crate::BuildSystem>::params_default_blob().filter(|b| !b.is_empty())
+        {
+            entry.params_default = Some(blob);
+            entry.wrap_create_with_defaults();
+        }
+        self.entries.push(entry);
+        self
+    }
+
+    /// As [`system_type`](Self::system_type), with explicitly declared
+    /// default params: a config need spell only its overrides, on every
+    /// loading path. This is the surface for types the automatic hook cannot
+    /// see through — hand-written [`BuildSystem`](crate::BuildSystem) impls
+    /// and generic systems. The typed `defaults` argument is the schema
+    /// check: a defaults value of the wrong type does not compile.
+    pub fn system_type_with_defaults<T, O>(
+        mut self,
+        name: &'static str,
+        defaults: T::Params,
+    ) -> Self
+    where
+        T: crate::CyclicSystem<Output = crate::Out<O>> + crate::BuildSystem + 'static,
+        T::Params: serde::Serialize + DeserializeOwned + postcard_schema::Schema + 'static,
+        T::Input: crate::BindPorts + 'static,
+        O: crate::SystemOutput + crate::BindPorts + 'static,
+    {
+        let mut entry = system_type_entry::<T, O>(name);
+        entry.params_default = Some(
+            postcard::to_allocvec(&defaults)
+                .expect("params postcard-encode (Serialize is infallible)"),
         );
-        descriptor.name = name;
-        let create: CreateFn = Box::new(move |params: EntryParams<'_>| {
-            #[cfg(feature = "kdl")]
-            let msgs = match &params {
-                EntryParams::Kdl { msgs, .. } | EntryParams::Value { msgs, .. } => Some(*msgs),
-                _ => None,
-            };
-            let p: T::Params = decode_params(params)?;
-            let mut system = T::new(p);
-            // The host-context configure phase runs only where a message
-            // table exists (the static path); the postcard path is the dl
-            // parity path, where configure never runs.
-            #[cfg(feature = "kdl")]
-            if let Some(msgs) = msgs {
-                system.configure(&crate::BuildCtx { msgs })?;
-            }
-            let pending: Pending = Box::new(move |src, mount| {
-                crate::handler::mount_driver(src, mount, move |src| {
-                    let input = <T::Input as crate::BindPorts>::bind(src);
-                    let output = <crate::Out<O> as crate::BindPorts>::bind(src);
-                    Box::new(RunnerDriver(crate::CyclicRunner::new(system, input, output)))
-                })
-            });
-            Ok(pending)
-        });
-        self.entries.push(PackEntry {
-            name,
-            descriptor,
-            params_schema: <T::Params as postcard_schema::Schema>::SCHEMA,
-            params_default: None,
-            reloadable: true,
-            create,
-        });
+        entry.wrap_create_with_defaults();
+        self.entries.push(entry);
         self
     }
 
@@ -408,6 +413,58 @@ impl Pack {
 
     pub fn into_entries(self) -> Vec<PackEntry> {
         self.entries
+    }
+}
+
+/// The [`Pack::system_type`] entry body, shared with the explicit-defaults
+/// variant so the two differ only in where the defaults blob comes from.
+fn system_type_entry<T, O>(name: &'static str) -> PackEntry
+where
+    T: crate::CyclicSystem<Output = crate::Out<O>> + crate::BuildSystem + 'static,
+    T::Params: DeserializeOwned + postcard_schema::Schema + 'static,
+    T::Input: crate::BindPorts + 'static,
+    O: crate::SystemOutput + crate::BindPorts + 'static,
+{
+    let mut descriptor = <T as crate::CyclicSystem>::descriptor();
+    assert!(
+        descriptor.capabilities.is_empty(),
+        "pack entries cannot hold capabilities (`{name}` declares one); \
+         capability systems stay on the static registry"
+    );
+    descriptor.name = name;
+    let create: CreateFn = Box::new(move |params: EntryParams<'_>| {
+        #[cfg(feature = "kdl")]
+        let msgs = match &params {
+            EntryParams::Kdl { msgs, .. } | EntryParams::Value { msgs, .. } => Some(*msgs),
+            _ => None,
+        };
+        let p: T::Params = decode_params(params)?;
+        let mut system = T::new(p);
+        // The host-context configure phase runs only where a message
+        // table exists (the static path); the postcard path is the dl
+        // parity path, where configure never runs.
+        #[cfg(feature = "kdl")]
+        if let Some(msgs) = msgs {
+            system.configure(&crate::BuildCtx { msgs })?;
+        }
+        let pending: Pending = Box::new(move |src, mount| {
+            crate::handler::mount_driver(src, mount, move |src| {
+                let input = <T::Input as crate::BindPorts>::bind(src);
+                let output = <crate::Out<O> as crate::BindPorts>::bind(src);
+                Box::new(RunnerDriver(crate::CyclicRunner::new(
+                    system, input, output,
+                )))
+            })
+        });
+        Ok(pending)
+    });
+    PackEntry {
+        name,
+        descriptor,
+        params_schema: <T::Params as postcard_schema::Schema>::SCHEMA,
+        params_default: None,
+        reloadable: true,
+        create,
     }
 }
 

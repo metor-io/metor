@@ -622,11 +622,24 @@ fn expand(attr: TokenStream, item: TokenStream) -> Result<TokenStream, syn::Erro
     };
 
     let build_impl = match new_params {
+        // With a concrete params type in hand, the impl also answers whether
+        // that type carries defaults, via autoref specialization: the probe
+        // method resolves to the inherent `P: Default + Serialize` impl when
+        // the bounds hold and to the blanket `None` fallback when they don't.
+        // The probing happens here, at the expansion site, because a generic
+        // context would resolve against unsubstituted parameters and always
+        // fall back — which is why hand-written `BuildSystem` impls declare
+        // defaults through `Pack::system_type_with_defaults` instead.
         Some(Some(p)) => quote! {
             impl #fsw2::BuildSystem for #self_ty {
                 type Params = #p;
                 fn new(params: #p) -> Self {
                     <#self_ty>::new(params)
+                }
+                fn params_default_blob() -> ::core::option::Option<::std::vec::Vec<u8>> {
+                    use #fsw2::NoParamsDefault as _;
+                    (&#fsw2::ParamsDefaultProbe::<#p>(::core::marker::PhantomData))
+                        .probe_params_default_blob()
                 }
             }
         },
@@ -860,6 +873,45 @@ mod tests {
         assert!(out.contains("type Params = NavParams;"), "{out}");
         // A port-less direction is a genuinely empty bundle.
         assert!(out.contains("pub struct __NavSystemOut {}"), "{out}");
+    }
+
+    #[test]
+    fn params_default_probe_emission() {
+        // A typed `fn new` gets the defaults probe over its concrete params
+        // type, feeding `Pack::system_type`'s automatic entry defaults.
+        let out = expand_ok(
+            quote!(),
+            quote! {
+                impl Nav {
+                    fn new(p: NavParams) -> Self { Self }
+                    fn execute(&mut self, now: Timestamp) {}
+                }
+            },
+        );
+        assert!(out.contains("fn params_default_blob"), "{out}");
+        assert!(out.contains("ParamsDefaultProbe::<NavParams>"), "{out}");
+        assert!(
+            out.contains("use metor_fsw_2::NoParamsDefault as _;"),
+            "{out}"
+        );
+
+        // Unit-params systems (paramless `new`, or no `new` at all) keep the
+        // trait's `None` default rather than probing `()`.
+        let paramless = expand_ok(
+            quote!(),
+            quote! {
+                impl A {
+                    fn new() -> Self { Self }
+                    fn execute(&mut self, now: Timestamp) {}
+                }
+            },
+        );
+        assert!(!paramless.contains("params_default_blob"), "{paramless}");
+        let via_default = expand_ok(quote!(), minimal());
+        assert!(
+            !via_default.contains("params_default_blob"),
+            "{via_default}"
+        );
     }
 
     #[test]

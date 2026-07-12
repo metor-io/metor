@@ -112,20 +112,57 @@ impl BuildSystem for Counter {
     }
 }
 
-/// The test pack: the struct system, the panicking system, and a sequence
-/// entry — the three entry shapes the ABI drives. `run_pack_open` takes this
-/// fn exactly as `export_pack!` would reference it.
+/// Params with a non-trivial `Default`, so [`Trim`]'s `#[system]` expansion
+/// declares the entry defaults blob the pack manifest reports.
+#[derive(Serialize, Deserialize, Schema, Clone, Debug, PartialEq)]
+struct TrimParams {
+    gain: f64,
+}
+
+impl Default for TrimParams {
+    fn default() -> Self {
+        Self { gain: 2.5 }
+    }
+}
+
+/// A `#[system]`-authored entry, so the manifest tests cover the macro's
+/// automatic `params_default_blob` path next to [`Counter`]'s hand-written
+/// `BuildSystem` (which declares no defaults).
+struct Trim {
+    gain: f64,
+}
+
+#[crate::system(name = "trim")]
+impl Trim {
+    fn new(p: TrimParams) -> Self {
+        Self { gain: p.gain }
+    }
+
+    fn execute(&mut self, now: Timestamp, out: &mut Output<TickOut>) {
+        let _ = out.write(&TickOut {
+            timestamp: now,
+            count: self.gain as u64,
+        });
+    }
+}
+
+/// The test pack: the struct systems (hand-written and `#[system]`-authored),
+/// the panicking system, and a sequence entry — the entry shapes the ABI
+/// drives. `run_pack_open` takes this fn exactly as `export_pack!` would
+/// reference it.
 fn test_pack() -> Pack {
     Pack::new()
         .system_type::<Counter, _>("counter")
         .system_type::<Boom, _>("boom")
         .task("wait_seq", wait_seq)
+        .system_type::<Trim, _>("trim")
 }
 
 /// Entry indices in [`test_pack`]'s manifest order.
 const COUNTER: u32 = 0;
 const BOOM: u32 = 1;
 const WAIT_SEQ: u32 = 2;
+const TRIM: u32 = 3;
 
 /// A sequence body that waits about two sim-microseconds and completes.
 async fn wait_seq() -> Outcome {
@@ -289,9 +326,25 @@ fn abi_describe_round_trips() {
     assert_eq!(rc, 0, "fsw_pack_describe succeeded");
 
     let manifest: PackManifestMsg = postcard::from_bytes(&buf).expect("manifest decodes");
-    assert_eq!(manifest.systems.len(), 3, "one entry per pack registration");
+    assert_eq!(manifest.systems.len(), 4, "one entry per pack registration");
     assert!(manifest.systems.iter().all(|s| s.reloadable));
-    assert!(manifest.systems.iter().all(|s| s.params_default.is_none()));
+
+    // Only the `#[system]`-authored entry with `Params: Default` declares an
+    // entry defaults blob; a hand-written `BuildSystem` (Counter, despite its
+    // params deriving `Default`) and unit-params entries declare none.
+    let defaults = |i: u32| manifest.systems[i as usize].params_default.as_deref();
+    assert_eq!(defaults(COUNTER), None);
+    assert_eq!(defaults(BOOM), None);
+    assert_eq!(defaults(WAIT_SEQ), None);
+    assert_eq!(
+        defaults(TRIM),
+        Some(
+            postcard::to_allocvec(&TrimParams::default())
+                .unwrap()
+                .as_slice()
+        ),
+        "the macro's defaults probe rides the manifest"
+    );
 
     let msg = manifest.systems[COUNTER as usize].descriptor.clone();
     let desc = {
