@@ -95,6 +95,7 @@ dependencies = [
  "metor-fsw-2",
  "postcard",
  "serde",
+ "serde_json",
  "stellarator",
 ]
 
