@@ -46,75 +46,76 @@ pub struct NavState {
     t_sim: f64,
 }
 
-/// Build the filter's state from its params.
-pub fn nav_init(p: NavParams) -> NavState {
-    let state = metor_fsw_adcs::mekf::State::new(
-        tensor![0.01, 0.01, 0.01],
-        tensor![0.01, 0.01, 0.01],
-        DT,
-    );
-    NavState {
-        state,
-        sigma: p.meas_sigma,
-        mag_model: MagneticModel::default(),
-        t_sim: 0.0,
+impl NavState {
+    pub fn new(p: NavParams) -> NavState {
+        let state = metor_fsw_adcs::mekf::State::new(
+            tensor![0.01, 0.01, 0.01],
+            tensor![0.01, 0.01, 0.01],
+            DT,
+        );
+        NavState {
+            state,
+            sigma: p.meas_sigma,
+            mag_model: MagneticModel::default(),
+            t_sim: 0.0,
+        }
     }
-}
 
-/// One filter cycle: model the references, update the MEKF, publish the estimate.
-pub fn nav_execute(
-    state: &mut NavState,
-    now: Timestamp,
-    sensors: &mut Input<Sensors>,
-    gps: &mut Input<Gps>,
-    estimate: &mut Output<AttitudeEstimate>,
-) {
-    // Advance the deterministic mission clock in lockstep with the plant (every cycle,
-    // regardless of whether a sample is ready), so the reference epoch matches the epoch the
-    // plant stamped this cycle's measurement at.
-    let epoch = epoch_at(state.t_sim);
-    state.t_sim += DT;
+    /// One filter cycle: model the references, update the MEKF, publish the estimate.
+    pub fn execute(
+        state: &mut NavState,
+        now: Timestamp,
+        sensors: &mut Input<Sensors>,
+        gps: &mut Input<Gps>,
+        estimate: &mut Output<AttitudeEstimate>,
+    ) {
+        // Advance the deterministic mission clock in lockstep with the plant (every cycle,
+        // regardless of whether a sample is ready), so the reference epoch matches the epoch the
+        // plant stamped this cycle's measurement at.
+        let epoch = epoch_at(state.t_sim);
+        state.t_sim += DT;
 
-    let Some(s) = sensors.latest() else {
-        return; // no sensor sample yet
-    };
-    let s = s.clone();
-    let Some(g) = gps.latest() else {
-        return; // no GPS fix yet
-    };
-    let gps_pos: V3 = g.pos_eci;
+        let Some(s) = sensors.latest() else {
+            return; // no sensor sample yet
+        };
+        let s = s.clone();
+        let Some(g) = gps.latest() else {
+            return; // no GPS fix yet
+        };
+        let gps_pos: V3 = g.pos_eci;
 
-    // The inertial (ECI) references nav models itself from what the flight software knows:
-    // the sun direction from the ephemeris at this epoch (a unit vector), and the WMM
-    // magnetic field at the GPS position (normalized), NOT the plant's truth `world` frame.
-    let sun_eci = sun_dir_eci(epoch);
-    let mag_eci = mag_field_eci(&mut state.mag_model, epoch, &gps_pos).normalize();
+        // The inertial (ECI) references nav models itself from what the flight software knows:
+        // the sun direction from the ephemeris at this epoch (a unit vector), and the WMM
+        // magnetic field at the GPS position (normalized), NOT the plant's truth `world` frame.
+        let sun_eci = sun_dir_eci(epoch);
+        let mag_eci = mag_field_eci(&mut state.mag_model, epoch, &gps_pos).normalize();
 
-    state.state.omega = s.gyro_b;
-    // The magnetometer reads the physical field (Tesla); the MEKF's vector observations
-    // stay unit vectors, so normalize the measurement like the reference. The sun
-    // observation comes from the CSS reconstruction — when the heads are dark (eclipse)
-    // the filter updates on the magnetometer alone.
-    state.state = match sun_from_css(&s.css) {
-        Some(sun_b) => state.state.clone().estimate_attitude(
-            [sun_b, s.mag_b.normalize()],
-            [sun_eci, mag_eci],
-            [state.sigma, state.sigma],
-        ),
-        None => state.state.clone().estimate_attitude(
-            [s.mag_b.normalize()],
-            [mag_eci],
-            [state.sigma],
-        ),
-    };
-    state.state.reset_if_invalid();
+        state.state.omega = s.gyro_b;
+        // The magnetometer reads the physical field (Tesla); the MEKF's vector observations
+        // stay unit vectors, so normalize the measurement like the reference. The sun
+        // observation comes from the CSS reconstruction — when the heads are dark (eclipse)
+        // the filter updates on the magnetometer alone.
+        state.state = match sun_from_css(&s.css) {
+            Some(sun_b) => state.state.clone().estimate_attitude(
+                [sun_b, s.mag_b.normalize()],
+                [sun_eci, mag_eci],
+                [state.sigma, state.sigma],
+            ),
+            None => state.state.clone().estimate_attitude(
+                [s.mag_b.normalize()],
+                [mag_eci],
+                [state.sigma],
+            ),
+        };
+        state.state.reset_if_invalid();
 
-    estimate.publish(&AttitudeEstimate {
-        timestamp: now,
-        q_hat_b_eci: state.state.q_hat,
-        omega_b: s.gyro_b, // pass the measured body rate through to the controller
-        b_hat_b: state.state.b_hat,
-    });
+        estimate.publish(&AttitudeEstimate {
+            timestamp: now,
+            q_hat_b_eci: state.state.q_hat,
+            omega_b: s.gyro_b, // pass the measured body rate through to the controller
+            b_hat_b: state.state.b_hat,
+        });
+    }
 }
 
 #[cfg(test)]
@@ -147,7 +148,11 @@ mod tests {
         ] {
             let s = sun_from_css(&readings_for(&sun)).expect("lit readings reconstruct");
             let err: f64 = (s - sun).norm().into_buf();
-            assert!(err < 1e-12, "reconstruction error {err} for {:?}", sun.into_buf());
+            assert!(
+                err < 1e-12,
+                "reconstruction error {err} for {:?}",
+                sun.into_buf()
+            );
         }
     }
 

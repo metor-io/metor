@@ -19,12 +19,14 @@ pub use plant::{DisturbanceTorques, WheelDynamics, css_readings, disturbance_tor
 
 use metor_fsw_2::{Pack, system};
 
+use crate::{nav::NavState, plant::PlantState};
+
 /// This crate's pack: the three entries under the names the mission's `system` nodes select
 /// (`type="Plant"` / `type="Nav"` / `type="Ctrl"`).
 pub fn pack() -> Pack {
     Pack::new()
-        .system("Plant", system(plant::plant_execute).init(plant::plant_init))
-        .system("Nav", system(nav::nav_execute).init(nav::nav_init))
+        .system("Plant", system(plant::execute).init(PlantState::new))
+        .system("Nav", system(NavState::execute).init(NavState::new))
         // Deliberately struct-authored (`#[system]`), so the pack exercises both styles.
         .system_type::<CtrlSystem, _>("Ctrl")
 }
