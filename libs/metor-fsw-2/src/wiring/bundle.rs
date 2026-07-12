@@ -8,7 +8,9 @@
 //! stems rather than absolute paths; loading re-decorates each stem into this
 //! platform's file name and expects the matching `.so` next to the manifest.
 //! Since the shared objects are compiled code, a bundle is tied to the target
-//! architecture it was built for.
+//! architecture it was built for. Each `.so`'s `<cdylib>.manifest` sidecar,
+//! when the build driver produced one, is copied in alongside it (the
+//! forward-compat carrier for manifest-hash checks; unread today).
 //!
 //! The sidecar records the ABI version the bundle was built against and the
 //! wiring IR version of its manifest; [`load_bundle`] refuses any bundle
@@ -144,6 +146,13 @@ pub fn write_bundle(
             })?;
         let dst = dir.join(&artifact.cdylib);
         fs::copy(src, &dst).map_err(io_at(&dst))?;
+        // The manifest sidecar rides along when the build driver wrote one
+        // (`BuildOptions::manifest_sidecar`); a bundle without it stays valid.
+        let sidecar = crate::dl::manifest_sidecar_path(src);
+        if sidecar.exists() {
+            let sidecar_dst = crate::dl::manifest_sidecar_path(&dst);
+            fs::copy(&sidecar, &sidecar_dst).map_err(io_at(&sidecar_dst))?;
+        }
     }
 
     let mission_path = dir.join(MISSION_FILE);
