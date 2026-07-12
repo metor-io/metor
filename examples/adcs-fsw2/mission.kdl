@@ -77,7 +77,7 @@ connect "ctrl"  -> "plant" frame="torque_cmd" delayed=#true
 connect "ctrl"  -> "plant" frame="mtq_cmd" delayed=#true
 
 system "uplink" type="TcpUplink" addr="127.0.0.1:2240" {
-    msgs "SequenceCommand" "AlarmAck"
+    msgs "SequenceCommand" "AlarmAck" "ReloadSequences"
 }
 
 system "downlink" type="TcpDownlink" addr="127.0.0.1:2240"
@@ -85,3 +85,4 @@ system "downlink" type="TcpDownlink" addr="127.0.0.1:2240"
 connect "uplink"      -> "mode" msg="SequenceCommand"   // ground commands
 connect "coordinator" -> "mode" msg="SequenceCommand"   // in-proc control_handle
 connect "uplink"      -> "alarms" msg="AlarmAck"        // operator acks (gate latching alarms)
+connect "uplink"      -> "coordinator" msg="ReloadSequences" // panel Reload -> registry re-emit

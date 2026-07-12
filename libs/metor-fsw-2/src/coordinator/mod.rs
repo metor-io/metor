@@ -69,7 +69,7 @@ use std::time::{Duration, Instant};
 use metor_fsw_ring::{Config, NoWake, Notifier, RingBuffer, View, WakeSource, Writer};
 use metor_proto::types::{ComponentId, Msg, Timestamp};
 use metor_proto_wkt::{
-    SequenceChannelEvent, SequenceChannelSpec, SequenceCommand, SequenceRegistry,
+    ReloadSequences, SequenceChannelEvent, SequenceChannelSpec, SequenceCommand, SequenceRegistry,
 };
 use stellarator::sync::WaitQueue;
 use stellarator::{JoinHandle, JoinHandleDropGuard};
@@ -476,8 +476,8 @@ pub enum SlotState {
     /// the loop. Ends at `Loaded` (and its event) when the worker reports
     /// bound, or `Stopped` on a pipeline failure. The command guards need no
     /// new cases: `Load`/`Start`/`Stop` match none of their accepted states
-    /// here, so a command arriving mid-pipeline is ignored. (Runtime process
-    /// slots only.)
+    /// here, so a command arriving mid-pipeline is refused (with a `Refused`
+    /// event). (Runtime process slots only.)
     Loading,
     /// The slot is polled every cycle.
     Running,
@@ -518,6 +518,18 @@ impl SlotState {
 
     pub fn is_stopped(&self) -> bool {
         self.stop_reason().is_some()
+    }
+
+    /// The phase name used in operator-facing messages (refusal reasons).
+    pub fn name(&self) -> &'static str {
+        match self {
+            SlotState::Empty => "empty",
+            SlotState::Loaded => "loaded",
+            SlotState::Loading => "loading",
+            SlotState::Running => "running",
+            SlotState::Done { .. } => "done",
+            SlotState::Stopped { .. } => "stopped",
+        }
     }
 }
 
@@ -968,7 +980,10 @@ impl CoordinatorBuilder {
         //   explicit `"coordinator" -> <slot>` edge. Untelemetered, since
         //   inbound control is never echoed on the downlink.
         // - `sequences` carries the boot `SequenceRegistry`, telemetered so
-        //   downstream consumers can list the channels.
+        //   downstream consumers can list the channels; the `ReloadSequences`
+        //   fan-in is its request channel (an ordinary edge input, zero edges
+        //   legal), drained each cycle to re-emit the registry on demand for
+        //   consumers that missed the boot message.
         // - the `status` SelfTap is `read_status`'s view over the
         //   coordinator's own status output.
         let desc = SystemDescriptor {
@@ -978,6 +993,7 @@ impl CoordinatorBuilder {
                 PortDesc::of::<CoordinatorStatus>().with_conn(PortConn::SelfTap(
                     PortId::Component(CoordinatorStatus::FRAME_ID),
                 )),
+                PortDesc::msg::<ReloadSequences>(),
             ],
             outputs: vec![
                 PortDesc::of::<crate::SystemHealth>().with_conn(PortConn::Host),
@@ -1469,6 +1485,7 @@ impl CoordinatorBuilder {
             seq_registry_out: coord.seq_registry_out,
             seq_registry,
             seq_registry_emitted: false,
+            reload_in: coord.reload_in,
             started: false,
             // Declared last so the canonical ring handles drop after every port.
             rings: alloc.table,
@@ -2066,6 +2083,7 @@ struct CoordinatorPorts {
     status_view: Input<CoordinatorStatus>,
     seq_registry_out: MsgOut<SequenceRegistry>,
     control_out: MsgOut<SequenceCommand>,
+    reload_in: MsgIn<ReloadSequences>,
 }
 
 /// The bind pass product: every cyclic slot, every pending async system, and
@@ -2121,7 +2139,9 @@ fn bind_systems(
     for (id, registration) in systems.into_iter().enumerate() {
         let Registration { reg, desc, name } = registration;
         match reg {
-            Reg::Coordinator => coord = Some(bind_coordinator(id, &desc, &alloc.output_rings)),
+            Reg::Coordinator => {
+                coord = Some(bind_coordinator(id, &desc, cons_edges, &alloc.output_rings))
+            }
             Reg::Dl(dl) => cyclic.push(Box::new(bind_dl(
                 id,
                 dl,
@@ -2235,6 +2255,7 @@ fn bind_systems(
 fn bind_coordinator(
     id: usize,
     desc: &SystemDescriptor,
+    cons_edges: &ConsEdges,
     output_rings: &[Vec<RingBuffer>],
 ) -> CoordinatorPorts {
     let out_idx = |pid: PortId| {
@@ -2264,12 +2285,35 @@ fn bind_coordinator(
     let control_out = owned_writer::<SequenceCommand>(
         &output_rings[id][out_idx(PortId::Packet(SequenceCommand::ID))],
     );
+    // The registry-reload fan-in, shaped exactly like a slot's `commands`
+    // input: one view per producer explicitly edged into it, zero edges legal.
+    let reload_in_idx = desc
+        .inputs
+        .iter()
+        .position(|p| p.conn == PortConn::Edge && p.id == PortId::Packet(ReloadSequences::ID))
+        .expect("the coordinator #0 bundle declares its ReloadSequences input");
+    let reload_in = MsgIn::from_views(
+        cons_edges
+            .get(&(id, reload_in_idx))
+            .map(|producers| {
+                producers
+                    .iter()
+                    .map(|&(prod_id, out_idx)| {
+                        output_rings[prod_id][out_idx]
+                            .view(NoWake, NoWake)
+                            .expect("reload reader slot (edge fan-out sized)")
+                    })
+                    .collect()
+            })
+            .unwrap_or_default(),
+    );
     CoordinatorPorts {
         health,
         status_out,
         status_view,
         seq_registry_out,
         control_out,
+        reload_in,
     }
 }
 
@@ -2893,6 +2937,11 @@ pub struct Coordinator {
     /// Whether the boot `SequenceRegistry` has been emitted (emit-once; the
     /// re-emit hook is [`emit_sequence_registry`](Coordinator::emit_sequence_registry)).
     seq_registry_emitted: bool,
+    /// The [`ReloadSequences`] fan-in on the coordinator's #0 bundle, drained
+    /// each cycle: any request re-emits the `SequenceRegistry`, so a consumer
+    /// that connected after boot (a late-started panel) can recover the
+    /// channel list on demand.
+    reload_in: MsgIn<ReloadSequences>,
     /// Latched by the first [`run_for`](Coordinator::run_for): a run consumes
     /// the coordinator (spawned async systems and their transports are gone
     /// after shutdown), so a second run would silently re-init everything over
@@ -3048,6 +3097,14 @@ impl Coordinator {
                 ClockMode::Wall => Timestamp::now(),
                 ClockMode::Simulated { dt } => simulated_now(epoch, dt, k as u64),
             };
+            // A reload request re-emits the SequenceRegistry for consumers
+            // that missed the boot message; the drain coalesces a burst of
+            // requests into one emission per cycle.
+            let mut reload = false;
+            self.reload_in.drain(|ReloadSequences {}| reload = true);
+            if reload {
+                self.emit_sequence_registry();
+            }
             // Commands are drained per-slot at the head of each `step`: a
             // slot's declared `commands` fan-in reads exactly the producers
             // explicitly edged into it and filters by its instance name, so a

@@ -736,6 +736,10 @@ pub enum SequenceEventKind {
     /// loads complete synchronously, so consumers may see a `Loaded` with no preceding
     /// `Loading`.
     Loading { name: SequenceName },
+    /// A command was rejected by the channel's state machine and changed nothing —
+    /// e.g. `Load` while running, or `Start` with no live occupant. Unlike `Failed`
+    /// this is not a run-state transition; the channel stays where it was.
+    Refused { reason: String },
 }
 
 /// A granular per-channel state update, broadcast by the control system (control → panel).

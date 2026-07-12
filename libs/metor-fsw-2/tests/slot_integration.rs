@@ -436,6 +436,258 @@ fn slot_reset_reruns_from_start() {
     drop((coord, seq_view));
 }
 
+/// The last published occupant name on the slot-status frame.
+fn last_occupant(view: &mut Input<SlotStatus>) -> Option<String> {
+    let mut last = None;
+    view.drain(|f| {
+        let s = f.get();
+        last = Some(
+            core::str::from_utf8(&s.occupant[..s.occ_len as usize])
+                .expect("utf-8 occupant name")
+                .to_string(),
+        );
+    })
+    .expect("no lap");
+    last
+}
+
+/// Loading over a `Loaded` slot swaps occupants: the current occupant is
+/// dropped and the named one built, no Stop/Reset dance required. Two allow
+/// entries over the same fixture entry give the slot two distinct names.
+#[test]
+fn load_from_loaded_swaps_occupant() {
+    let Some(lib) = locate_fixture() else {
+        return;
+    };
+    let pack = DlPack::open(&lib).expect("DlPack::open the sequence .so");
+    let first = pack.system("waiter").expect("select the waiter entry");
+    let second = pack.system("waiter").expect("select the waiter entry again");
+
+    let mut b = Coordinator::builder(sim_config());
+    let slot = b.add_slot("adcs", vec![occ("first", first), occ("second", second)], None);
+    b.connect(
+        PortRef::msg::<SequenceCommand>(b.coordinator_handle()),
+        PortRef::msg::<SequenceCommand>(slot),
+    )
+    .expect("the coordinator command edge connects");
+    let mut coord = b.build().expect("the slot graph builds");
+
+    let mut slot_view: Input<SlotStatus> = Input::new(
+        coord
+            .registry()
+            .view(ComponentId::new("adcs.slot_status"))
+            .expect("slot status is registered")
+            .expect("reader slot available"),
+    );
+    let mut events_view = coord
+        .registry()
+        .view(ComponentId::new("adcs.sequences"))
+        .expect("the slot events channel is registered")
+        .expect("reader slot available");
+
+    // All three drain in one cycle: Load lands Loaded{first}, the second Load
+    // swaps to Loaded{second}, Start runs the swapped-in occupant.
+    let mut control = coord.control_handle().expect("taken once per coordinator");
+    control.emit(&load("adcs", "first")).unwrap();
+    control.emit(&load("adcs", "second")).unwrap();
+    control
+        .emit(&cmd("adcs", SequenceCommandKind::Start))
+        .unwrap();
+
+    let coord = stellarator::run(|| async move {
+        coord.run_for(4).await;
+        coord
+    });
+
+    let events = drain_msgs::<SequenceChannelEvent>(&mut events_view);
+    let kinds: Vec<&SequenceEventKind> = events.iter().map(|e| &e.kind).collect();
+    assert!(
+        matches!(kinds[0], SequenceEventKind::Loaded { name } if name == "first"),
+        "first event is Loaded {{ first }}: {kinds:?}"
+    );
+    assert!(
+        matches!(kinds[1], SequenceEventKind::Loaded { name } if name == "second"),
+        "the swap re-Loads in place: {kinds:?}"
+    );
+    assert!(
+        !kinds
+            .iter()
+            .any(|k| matches!(k, SequenceEventKind::Refused { .. })),
+        "nothing was refused: {kinds:?}"
+    );
+    assert!(
+        matches!(kinds.last().unwrap(), SequenceEventKind::Completed),
+        "the swapped-in occupant ran to Completed: {kinds:?}"
+    );
+    assert_eq!(
+        last_occupant(&mut slot_view).as_deref(),
+        Some("second"),
+        "the slot ends on the swapped-in occupant"
+    );
+
+    drop((coord, slot_view, events_view, control));
+}
+
+/// The reported wedge: run to Done, Reset (slot returns to Loaded), then Load
+/// a different occupant. Before the fix the Load was silently refused and the
+/// channel was stuck until another terminal state.
+#[test]
+fn reset_then_load_swaps_occupant() {
+    let Some(lib) = locate_fixture() else {
+        return;
+    };
+    let pack = DlPack::open(&lib).expect("DlPack::open the sequence .so");
+    let first = pack.system("waiter").expect("select the waiter entry");
+    let second = pack.system("waiter").expect("select the waiter entry again");
+
+    let mut b = Coordinator::builder(sim_config());
+    let slot = b.add_slot("adcs", vec![occ("first", first), occ("second", second)], None);
+    b.connect(
+        PortRef::msg::<SequenceCommand>(b.coordinator_handle()),
+        PortRef::msg::<SequenceCommand>(slot),
+    )
+    .expect("the coordinator command edge connects");
+    let mut coord = b.build().expect("the slot graph builds");
+
+    let mut slot_view: Input<SlotStatus> = Input::new(
+        coord
+            .registry()
+            .view(ComponentId::new("adcs.slot_status"))
+            .expect("slot status is registered")
+            .expect("reader slot available"),
+    );
+    let mut events_view = coord
+        .registry()
+        .view(ComponentId::new("adcs.sequences"))
+        .expect("the slot events channel is registered")
+        .expect("reader slot available");
+
+    // Cycles 1-3 run "first" to Done. The injector then replays the panel
+    // flow that used to wedge: Reset (Done -> Loaded), Load{second}, Start.
+    let mut control = coord.control_handle().expect("taken once per coordinator");
+    control.emit(&load("adcs", "first")).unwrap();
+    control
+        .emit(&cmd("adcs", SequenceCommandKind::Start))
+        .unwrap();
+    let progress = coord.progress();
+    let coord = stellarator::run(|| async move {
+        let injector = stellarator::spawn(async move {
+            use std::sync::atomic::Ordering::Relaxed;
+            while progress.load(Relaxed) < 3 {
+                stellarator::yield_now().await;
+            }
+            control
+                .emit(&cmd("adcs", SequenceCommandKind::Reset))
+                .unwrap();
+            control.emit(&load("adcs", "second")).unwrap();
+            control
+                .emit(&cmd("adcs", SequenceCommandKind::Start))
+                .unwrap();
+        });
+        coord.run_for(7).await;
+        let _ = injector.await;
+        coord
+    });
+
+    let events = drain_msgs::<SequenceChannelEvent>(&mut events_view);
+    let kinds: Vec<&SequenceEventKind> = events.iter().map(|e| &e.kind).collect();
+    assert!(
+        !kinds
+            .iter()
+            .any(|k| matches!(k, SequenceEventKind::Refused { .. })),
+        "the Reset -> Load flow refuses nothing: {kinds:?}"
+    );
+    assert!(
+        kinds
+            .iter()
+            .any(|k| matches!(k, SequenceEventKind::Loaded { name } if name == "second")),
+        "the post-Reset Load swapped occupants: {kinds:?}"
+    );
+    let completed = kinds
+        .iter()
+        .filter(|k| matches!(k, SequenceEventKind::Completed))
+        .count();
+    assert_eq!(completed, 2, "both occupants ran to Completed: {kinds:?}");
+    assert_eq!(
+        last_occupant(&mut slot_view).as_deref(),
+        Some("second"),
+        "the slot ends on the swapped-in occupant"
+    );
+
+    drop((coord, slot_view, events_view));
+}
+
+/// A `Load` while the occupant is running is refused — loudly, with a
+/// `Refused` event — and changes nothing.
+#[test]
+fn load_while_running_is_refused() {
+    let Some(lib) = locate_fixture() else {
+        return;
+    };
+    let pack = DlPack::open(&lib).expect("DlPack::open the sequence .so");
+    let first = pack.system("waiter").expect("select the waiter entry");
+    let second = pack.system("waiter").expect("select the waiter entry again");
+
+    let mut b = Coordinator::builder(sim_config());
+    let slot = b.add_slot("adcs", vec![occ("first", first), occ("second", second)], None);
+    b.connect(
+        PortRef::msg::<SequenceCommand>(b.coordinator_handle()),
+        PortRef::msg::<SequenceCommand>(slot),
+    )
+    .expect("the coordinator command edge connects");
+    let mut coord = b.build().expect("the slot graph builds");
+
+    let mut slot_view: Input<SlotStatus> = Input::new(
+        coord
+            .registry()
+            .view(ComponentId::new("adcs.slot_status"))
+            .expect("slot status is registered")
+            .expect("reader slot available"),
+    );
+    let mut events_view = coord
+        .registry()
+        .view(ComponentId::new("adcs.sequences"))
+        .expect("the slot events channel is registered")
+        .expect("reader slot available");
+
+    // One drain applies all three: Load{first} -> Loaded, Start -> Running,
+    // Load{second} -> refused (the occupant is live).
+    let mut control = coord.control_handle().expect("taken once per coordinator");
+    control.emit(&load("adcs", "first")).unwrap();
+    control
+        .emit(&cmd("adcs", SequenceCommandKind::Start))
+        .unwrap();
+    control.emit(&load("adcs", "second")).unwrap();
+
+    let coord = stellarator::run(|| async move {
+        coord.run_for(4).await;
+        coord
+    });
+
+    let events = drain_msgs::<SequenceChannelEvent>(&mut events_view);
+    let kinds: Vec<&SequenceEventKind> = events.iter().map(|e| &e.kind).collect();
+    assert!(
+        kinds.iter().any(|k| matches!(
+            k,
+            SequenceEventKind::Refused { reason } if reason.contains("running")
+        )),
+        "the mid-run Load was refused with a reason: {kinds:?}"
+    );
+    assert!(
+        !kinds
+            .iter()
+            .any(|k| matches!(k, SequenceEventKind::Loaded { name } if name == "second")),
+        "the refused Load loaded nothing: {kinds:?}"
+    );
+    assert_eq!(
+        last_occupant(&mut slot_view).as_deref(),
+        Some("first"),
+        "the running occupant kept the slot"
+    );
+
+    drop((coord, slot_view, events_view, control));
+}
+
 // ---------------------------------------------------------------------------
 // Sequence events and the boot registry
 // ---------------------------------------------------------------------------
@@ -653,6 +905,57 @@ fn uplink_command_loads_and_starts_same_cycle() {
     );
 
     drop((coord, slot_view));
+}
+
+/// A [`ReloadSequences`] request wired into the coordinator's #0 bundle
+/// re-emits the [`SequenceRegistry`], so a consumer that missed the one-shot
+/// boot message (a late-started panel) can recover the channel list.
+#[test]
+fn reload_request_reemits_registry() {
+    use metor_fsw_2::metor_proto_wkt::ReloadSequences;
+
+    let Some(lib) = locate_fixture() else {
+        return;
+    };
+    let loaded = open_waiter(&lib);
+
+    let mut b = Coordinator::builder(sim_config());
+    let _slot = b.add_slot("adcs", vec![occ("waiter", loaded)], None);
+    let uplink = b.add_async(
+        UplinkSystem::new(MockRecv::from_packets(vec![wire_msg(&ReloadSequences {})]))
+            .with_msg::<ReloadSequences>(),
+    );
+    b.connect(
+        PortRef::msg::<ReloadSequences>(uplink),
+        PortRef::msg::<ReloadSequences>(b.coordinator_handle()),
+    )
+    .expect("the reload edge connects to the coordinator bundle");
+    let mut coord = b.build().expect("the slot + uplink graph builds");
+
+    let mut boot_view = coord
+        .registry()
+        .view(ComponentId::new("coordinator.sequences"))
+        .expect("the coordinator registry channel is registered")
+        .expect("reader slot available");
+
+    let coord = stellarator::run(|| async move {
+        coord.run_for(6).await;
+        coord
+    });
+
+    let registries = drain_msgs::<SequenceRegistry>(&mut boot_view);
+    assert!(
+        registries.len() >= 2,
+        "boot emission plus at least one reload re-emission: {} seen",
+        registries.len()
+    );
+    for registry in &registries {
+        assert_eq!(registry.channels.len(), 1);
+        assert_eq!(registry.channels[0].name, "adcs");
+        assert_eq!(registry.channels[0].available, vec!["waiter".to_string()]);
+    }
+
+    drop((coord, boot_view));
 }
 
 // ---------------------------------------------------------------------------
