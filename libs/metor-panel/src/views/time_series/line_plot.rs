@@ -484,12 +484,19 @@ impl LinePlot {
             } else {
                 (0.0, 1.0)
             };
-            let lo = a.y_min_override.as_custom().copied().unwrap_or(auto_min);
-            let mut hi = a.y_max_override.as_custom().copied().unwrap_or(auto_max);
-            if lo >= hi {
-                hi = lo + 1.0;
-            }
-            axes.push((lo, hi));
+            let lo_override = a.y_min_override.as_custom().copied();
+            let hi_override = a.y_max_override.as_custom().copied();
+            let lo = lo_override.unwrap_or(auto_min);
+            let hi = hi_override.unwrap_or(auto_max);
+            // Auto-fit ends get edge padding so a trace riding its extreme
+            // isn't hidden under the axis rule; explicit overrides are the
+            // user's exact numbers and pass through unpadded.
+            axes.push(super::bounds::pad_auto_range(
+                lo,
+                hi,
+                lo_override.is_none(),
+                hi_override.is_none(),
+            ));
         }
         Some(PlotView {
             x: (min_x, max_x),
@@ -550,13 +557,27 @@ impl LinePlot {
     }
 
     /// Value plotted by `trace` at the sample whose timestamp is closest to
-    /// `ts` across every live node. Returns `None` when the trace's
-    /// component hasn't resolved yet, when its element index falls outside
-    /// the schema, or when the component has no samples at all.
+    /// `ts` across every live node.
     ///
     /// Used by measurement-cursor rendering (dot marker per trace) and by
     /// the Δy / Mean readouts that need a value at the cursor endpoints.
     pub fn trace_value_at(&self, trace_id: EntityId, ts: Timestamp, cx: &gpui::App) -> Option<f64> {
+        self.trace_sample_at(trace_id, ts, cx).map(|(_, v)| v)
+    }
+
+    /// The sample of `trace` whose timestamp is closest to `ts` across every
+    /// live node: its actual timestamp plus the plotted value. Returns `None`
+    /// when the trace's component hasn't resolved yet, when its element index
+    /// falls outside the schema, or when the component has no samples at all.
+    ///
+    /// The hover readout and its on-plot sample markers both consume this,
+    /// so the highlighted point is always the sample the readout reports.
+    pub fn trace_sample_at(
+        &self,
+        trace_id: EntityId,
+        ts: Timestamp,
+        cx: &gpui::App,
+    ) -> Option<(Timestamp, f64)> {
         let trace = self.traces.iter().find(|t| t.entity_id() == trace_id)?;
         let cfg = trace.read(cx);
         let component = self.tracking.get(&trace_id)?.component.as_ref()?;
@@ -580,14 +601,16 @@ impl LinePlot {
             }
         }
         let (_, node, sample_idx) = best?;
+        let sample_ts = *node.timestamps().get(sample_idx)?;
         let data = node.data.data();
         let base = sample_idx * elem_size;
         let buf = data.get(base..base + elem_size)?;
-        Some(crate::dynamic::tensor::read_f64_at(
+        let value = crate::dynamic::tensor::read_f64_at(
             buf,
             component.schema.prim_type,
             cfg.element_index,
-        ))
+        );
+        Some((sample_ts, value))
     }
 
     pub fn trace(&self, idx: usize) -> Option<&Entity<Trace>> {

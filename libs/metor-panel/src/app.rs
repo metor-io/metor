@@ -248,6 +248,38 @@ impl AppRoot {
         }
     }
 
+    /// Anchored inspector for a tab-bar right-click: the pane's own settings
+    /// plus a "New Tab" submenu reusing the palette's new-panel rows, so both
+    /// entry points create tabs through the same wizards.
+    fn open_pane_inspector(
+        &mut self,
+        pane: Entity<crate::tiles::Pane>,
+        position: Point<Pixels>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let mut rows = crate::inspector::reflect::rows_for_any_entity(
+            &pane.clone().into_any(),
+            &self.db,
+            cx,
+        )
+        .unwrap_or_default();
+        let db = self.db.clone();
+        let on_open_inspector = crate::inspector::open_inspector(cx);
+        rows.push(Box::new(crate::inspector::rows::NavRow::new(
+            "New Tab",
+            SharedString::new_static(""),
+            Box::new(move |_cx| {
+                crate::tiles::panels::new_panel_rows(
+                    db.clone(),
+                    pane.clone(),
+                    on_open_inspector.clone(),
+                )
+            }),
+        )));
+        self.open_inspector_with(rows, InspectorMode::Anchored(position), window, cx);
+    }
+
     fn handle_inspect_entity(
         &mut self,
         action: &crate::inspector::InspectEntity,
@@ -357,7 +389,7 @@ impl Render for AppRoot {
         }
 
         if let Some((pane, position)) = self.pending_pane_inspector_request.take() {
-            self.open_entity_inspector(&pane.into_any(), position, window, cx);
+            self.open_pane_inspector(pane, position, window, cx);
         }
 
         if let Some(request) = self.pending_inspector_open.take() {
@@ -490,26 +522,17 @@ impl AppRoot {
         bar.into_any_element()
     }
 
-    /// Open the alarm panel in the first pane, unless one is already open.
+    /// Reveal the alarm panel: focus the existing alarms tab wherever it lives
+    /// in the layout, opening a fresh one in the active pane only when none is
+    /// open.
     fn open_alarms(&mut self, cx: &mut Context<Self>) {
-        let panes = self.tiles.read(cx).panes().to_vec();
-        let already_open = panes.iter().any(|pane| {
-            pane.read(cx)
-                .items()
-                .iter()
-                .any(|item| item.serialization_key() == "alarm")
-        });
-        if already_open {
-            return;
-        }
-        let Some(pane) = self.tiles.read(cx).active_pane(cx) else {
-            return;
-        };
         let db = self.db.clone();
-        pane.update(cx, |pane, cx| {
-            let item: Box<dyn crate::tiles::PaneItemHandle> =
-                Box::new(cx.new(|cx| AlarmPanel::new(db, cx)));
-            pane.add_item(item, cx);
+        self.tiles.update(cx, |tiles, cx| {
+            tiles.focus_or_open(
+                <AlarmPanel as crate::tiles::PaneItem>::serialization_key(),
+                |cx| Box::new(cx.new(|cx| AlarmPanel::new(db, cx))),
+                cx,
+            );
         });
     }
 

@@ -123,14 +123,16 @@ impl Inspector {
         mode: InspectorMode,
         cx: &mut Context<Self>,
     ) -> Self {
-        Self::from_page(
+        let mut this = Self::from_page(
             InspectorPage {
                 kind: InspectorPageKind::Rows(rows),
                 label: None,
             },
             mode,
             cx,
-        )
+        );
+        this.selected_index = this.first_selectable_index();
+        this
     }
 
     /// Open the inspector on a view-hosting page rather than a row list.
@@ -208,7 +210,7 @@ impl Inspector {
             label: incoming_label,
         });
         self.search.clear();
-        self.selected_index = 0;
+        self.selected_index = self.first_selectable_index();
         cx.notify();
     }
 
@@ -219,7 +221,7 @@ impl Inspector {
                 current.label = None;
             }
             self.search.clear();
-            self.selected_index = 0;
+            self.selected_index = self.first_selectable_index();
             cx.notify();
             true
         } else {
@@ -255,6 +257,12 @@ impl Inspector {
             .iter()
             .enumerate()
             .filter_map(|(i, row)| {
+                // Section headers describe the unfiltered grouping; once a
+                // query is active the results are already narrowed, so a
+                // header (possibly now empty) only adds noise.
+                if row.is_header() {
+                    return None;
+                }
                 // Search-consuming rows (prompts / filter builders) stay
                 // pinned to the bottom so the query-as-input affordance
                 // is always reachable, even when the query doesn't
@@ -273,8 +281,27 @@ impl Inspector {
         scored.into_iter().map(|(i, _)| i).collect()
     }
 
-    fn visible_count(&self) -> usize {
-        self.filtered_indices().len()
+    /// Whether the row at visible position `vis_ix` is a non-selectable
+    /// section header. `filtered` is passed in so callers that already hold
+    /// the index list don't recompute it.
+    fn is_header_at(&self, filtered: &[usize], vis_ix: usize) -> bool {
+        let Some(rows) = self.current_rows() else {
+            return false;
+        };
+        filtered
+            .get(vis_ix)
+            .and_then(|&i| rows.get(i))
+            .is_some_and(|r| r.is_header())
+    }
+
+    /// First visible position that isn't a section header, so the initial
+    /// and post-filter selection lands on an activatable row rather than a
+    /// group label.
+    fn first_selectable_index(&self) -> usize {
+        let filtered = self.filtered_indices();
+        (0..filtered.len())
+            .find(|&vis_ix| !self.is_header_at(&filtered, vis_ix))
+            .unwrap_or(0)
     }
 
     fn activate_row(&mut self, row_idx: usize, window: &mut Window, cx: &mut Context<Self>) {
@@ -350,6 +377,9 @@ impl Inspector {
         let Some(&row_idx) = indices.get(self.selected_index) else {
             return;
         };
+        if self.is_header_at(&indices, self.selected_index) {
+            return;
+        }
         self.activate_row(row_idx, window, cx);
     }
 
@@ -426,20 +456,30 @@ impl Inspector {
                 }
             }
             "up" => {
-                if self.selected_index > 0 {
-                    self.selected_index -= 1;
-                    self.scroll_handle
-                        .scroll_to_item(self.selected_index, ScrollStrategy::Top);
+                let filtered = self.filtered_indices();
+                let mut i = self.selected_index;
+                while i > 0 {
+                    i -= 1;
+                    if !self.is_header_at(&filtered, i) {
+                        self.selected_index = i;
+                        self.scroll_handle.scroll_to_item(i, ScrollStrategy::Top);
+                        break;
+                    }
                 }
                 cx.notify();
                 return;
             }
             "down" => {
-                let total = self.visible_count();
-                if total > 0 && self.selected_index < total - 1 {
-                    self.selected_index += 1;
-                    self.scroll_handle
-                        .scroll_to_item(self.selected_index, ScrollStrategy::Bottom);
+                let filtered = self.filtered_indices();
+                let total = filtered.len();
+                let mut i = self.selected_index;
+                while i + 1 < total {
+                    i += 1;
+                    if !self.is_header_at(&filtered, i) {
+                        self.selected_index = i;
+                        self.scroll_handle.scroll_to_item(i, ScrollStrategy::Bottom);
+                        break;
+                    }
                 }
                 cx.notify();
                 return;
@@ -453,7 +493,7 @@ impl Inspector {
         }
 
         if self.search.handle_key_down(event, cx) {
-            self.selected_index = 0;
+            self.selected_index = self.first_selectable_index();
         }
     }
 
@@ -596,6 +636,10 @@ impl Inspector {
                                     )
                                     .child(div().flex_1().min_w_0().child(edit.field.element()))
                                     .into_any_element()
+                            } else if rows[row_idx].is_header() {
+                                // Headers are inert: no click-to-select, no
+                                // selection highlight.
+                                rows[row_idx].render_row(vis_ix, selected, window, cx)
                             } else {
                                 let row_element =
                                     rows[row_idx].render_row(vis_ix, selected, window, cx);

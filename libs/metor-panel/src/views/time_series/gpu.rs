@@ -1109,6 +1109,8 @@ fn plan_trace(
             upload_stride,
             lod_start,
             lod_end,
+            ext_start_idx,
+            ext_end_idx,
         ) else {
             continue;
         };
@@ -1319,6 +1321,10 @@ fn plan_min_max_trace(
 /// each bin contributes its extreme samples so peaks survive — while
 /// other sources point-sample. Uploads clamp to the shared buffer
 /// capacity instead of vanishing; a clamp flags `cache.truncated`.
+///
+/// `sample_start..sample_end` is the boundary-extended visible window in
+/// raw sample indices; the min-max path anchors its selection to those
+/// exact samples so the drawn line always runs through the plot edges.
 #[allow(clippy::too_many_arguments)]
 fn upload_pair(
     ctx: &GpuContext,
@@ -1337,6 +1343,8 @@ fn upload_pair(
     lod_stride: usize,
     lod_start: usize,
     lod_end: usize,
+    sample_start: usize,
+    sample_end: usize,
 ) -> Option<(u32, u32)> {
     if lod_end <= lod_start {
         return None;
@@ -1364,6 +1372,26 @@ fn upload_pair(
             lod_end,
             select_scratch,
         );
+        // Bin extremes rarely land on the window's boundary samples, so
+        // without explicit anchors the line stops up to a bin short of the
+        // plot edge. Prepend/append the exact boundary samples (kept in
+        // ascending order) so the edge segments exist and get GPU-clipped.
+        let elem_size = schema.size().max(1);
+        let max_sample = (data.len() / elem_size).min(y_node.full_timestamps().len());
+        if max_sample > 0 {
+            let anchor_end = (sample_end.min(max_sample)).saturating_sub(1) as u32;
+            let anchor_start = (sample_start.min(max_sample - 1)) as u32;
+            if let Some(&first) = select_scratch.first()
+                && anchor_start < first
+            {
+                select_scratch.insert(0, anchor_start);
+            }
+            if let Some(&last) = select_scratch.last()
+                && anchor_end > last
+            {
+                select_scratch.push(anchor_end);
+            }
+        }
         if select_scratch.len() > available {
             cache.truncated = true;
             select_scratch.truncate(available);
@@ -2001,6 +2029,15 @@ mod tests {
             assert!(
                 gpu.upload_x.windows(2).all(|w| w[0] <= w[1]),
                 "x values out of order for {span_secs}s"
+            );
+            // Edge coverage: the newest chunk (uploaded last) must reach the
+            // window's right boundary — decimation is required to anchor the
+            // boundary sample so lines run to the plot edge rather than
+            // stopping a bin short.
+            let last_x = *gpu.upload_x.last().unwrap() as f64;
+            assert!(
+                last_x >= span_secs - step_us as f64 * 1e-6 - 1e-6,
+                "right edge uncovered for {span_secs}s: last x {last_x}"
             );
         }
     }

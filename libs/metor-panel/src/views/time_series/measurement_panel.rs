@@ -424,11 +424,15 @@ fn measurement_row(
     label_color: Hsla,
     value_text_color: Hsla,
 ) -> impl IntoElement {
+    // `min_h`, not `h`: many traces wrap the value cells onto several
+    // lines, and a fixed height would overflow them onto the neighboring
+    // rows instead of growing the panel.
     div()
         .flex()
         .flex_row()
         .items_center()
-        .h(px(ROW_HEIGHT))
+        .min_h(px(ROW_HEIGHT))
+        .py(px(2.0))
         .px(px(PANEL_PAD))
         .gap(px(8.0))
         .text_color(value_text_color)
