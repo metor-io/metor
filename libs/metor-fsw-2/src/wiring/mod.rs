@@ -85,9 +85,9 @@ mod stubgen;
 // not require the KDL parser; the submodules here reach it as `super::model`.
 pub(crate) use crate::ir as model;
 
-pub use build_driver::{BuildError, BuildOptions, build_artifacts};
+pub use build_driver::{BuildError, BuildOptions, build_artifacts, build_target};
 pub use builder::{SlotSpecBuilder, SystemSpecBuilder, WiringBuilder};
-pub use bundle::{BundleError, PackageOptions, load_bundle, write_bundle};
+pub use bundle::{BundleError, BundleMeta, PackageOptions, load_bundle, write_bundle};
 pub use error::LoadError;
 pub use kdl_params::{encode_kdl_params, encode_kdl_params_with_defaults, encode_value_params};
 pub use model::{
@@ -96,7 +96,7 @@ pub use model::{
     TCP_DOWNLINK_TYPE, TCP_UPLINK_TYPE, Wiring,
 };
 pub use parse::{cdylib_file_name, parse, parse_with_origin};
-pub use py::{eval_python_mission, is_python_mission};
+pub use py::{eval_python_mission, is_python_mission, metor_config_version};
 pub use stubgen::{StubgenError, StubgenOptions, StubgenReport, stubgen};
 
 // Re-exported so a system author only needs `metor_fsw_2::wiring`.

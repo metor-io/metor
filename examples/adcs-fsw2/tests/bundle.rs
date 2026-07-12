@@ -1,28 +1,50 @@
-//! Bundle round-trip smoke (cli-runner.md §4): `parse` → `build_artifacts` →
-//! [`write_bundle`] to a temp dir → [`load_bundle`] → `resolve` → run a few cycles.
+//! Bundle round-trip smoke: freeze a mission to the IR bundle layout, load it
+//! back cargo-free, resolve, and run a few cycles.
 //!
-//! This exercises the **cargo-free** run path — `load_bundle` fills each artifact's path
-//! from the copied `.so` and never invokes cargo — proving a packaged mission loads and
-//! steps. Convergence/parity stays in `closed_loop.rs`; here we only assert the bundle is
-//! self-contained and runnable. Gated off `miri` (it builds + `dlopen`s real cdylibs).
+//! The bundle now carries the frozen `Wiring` IR (`wiring.json` + `meta.json`)
+//! plus the built `.so`s, not verbatim source — so a mission runs with no KDL
+//! parse and no Python on target. Two legs: the KDL mission through the IR
+//! path, and `mission.py` packaged end to end (eval → IR → bundle → run),
+//! which is the Phase 1 rejection now replaced by a real package. Convergence
+//! parity stays in `closed_loop.rs`; here we only assert the bundle is
+//! self-contained and runnable. Gated off `miri` (it builds + `dlopen`s real
+//! cdylibs).
 
 #![cfg(not(miri))]
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::process::Command;
 
-use metor_fsw_2::wiring::Registry;
-use metor_fsw_2::wiring::{build_artifacts, load_bundle, parse, resolve, write_bundle};
+use metor_fsw_2::wiring::{
+    Registry, build_artifacts, build_target, eval_python_mission, load_bundle,
+    metor_config_version, parse, resolve, write_bundle,
+};
 use metor_fsw_2::{BuildOptions, PackageOptions};
 
 const MISSION_KDL: &str = include_str!("../mission.kdl");
 
+fn mission(name: &str) -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR")).join(name)
+}
+
 /// A unique temp directory for this test's bundle (process-scoped, best-effort cleanup).
-fn temp_bundle_dir() -> PathBuf {
-    std::env::temp_dir().join(format!("adcs-fsw2-bundle-{}.bundle", std::process::id()))
+fn temp_bundle_dir(tag: &str) -> PathBuf {
+    std::env::temp_dir().join(format!("adcs-fsw2-bundle-{tag}-{}.bundle", std::process::id()))
+}
+
+fn have_python() -> bool {
+    Command::new("python3")
+        .args([
+            "-c",
+            "import sys;sys.exit(0 if sys.version_info[:2]>=(3,10) else 1)",
+        ])
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
 }
 
 #[test]
-fn bundle_round_trips_and_runs() {
+fn kdl_bundle_round_trips_and_runs() {
     // 1. Parse + build the mission (the cdylibs land in cargo's target dir). Test binaries
     //    can't host a `process=#true` worker (no `worker_entry` in main) — run in-process.
     let mut wiring = parse(MISSION_KDL).expect("parse mission.kdl");
@@ -35,15 +57,22 @@ fn bundle_round_trips_and_runs() {
         return;
     }
 
-    // 2. Package into a relocatable bundle directory.
-    let dir = temp_bundle_dir();
+    // 2. Freeze into the IR bundle: wiring.json + meta.json + the .so's, with the
+    //    source riding along as never-consumed provenance.
+    let dir = temp_bundle_dir("kdl");
     let _ = std::fs::remove_dir_all(&dir); // clear any stale run
-    write_bundle(&wiring, MISSION_KDL, &PackageOptions::default(), &dir)
-        .expect("write the bundle");
+    let opts = PackageOptions {
+        target: build_target(&[]),
+        provenance: Some(mission("mission.kdl")),
+        ..PackageOptions::default()
+    };
+    write_bundle(&wiring, &opts, &dir).expect("write the bundle");
 
-    // The bundle is self-contained: the manifest, the sidecar, and one `.so` per artifact.
-    assert!(dir.join("mission.kdl").exists(), "manifest copied in");
-    assert!(dir.join("meta.kdl").exists(), "metadata sidecar written");
+    // The bundle is the frozen IR, the JSON sidecar, the provenance copy, and one
+    // `.so` per artifact — no verbatim KDL manifest.
+    assert!(dir.join("wiring.json").exists(), "frozen IR written");
+    assert!(dir.join("meta.json").exists(), "JSON sidecar written");
+    assert!(dir.join("mission.kdl").exists(), "provenance copy rides along");
     for artifact in &wiring.artifacts {
         assert!(
             dir.join(&artifact.cdylib).exists(),
@@ -52,11 +81,8 @@ fn bundle_round_trips_and_runs() {
         );
     }
 
-    // 3. Load the bundle back — cargo-free — and resolve it (dl systems + the
-    //    built-in registry: the mission's `alarms` node is a framework static system).
+    // 3. Load the bundle back — cargo-free, no KDL parse — and resolve + run.
     let mut loaded = load_bundle(&dir).expect("load the bundle");
-    // The bundle carries the manifest verbatim, so its `process=#true` comes back — clear it
-    // again for the in-process test resolve.
     for spec in &mut loaded.systems {
         spec.process = false;
     }
@@ -68,8 +94,6 @@ fn bundle_round_trips_and_runs() {
         );
     }
     let mut coord = resolve(&loaded, &Registry::with_builtins()).expect("resolve the bundle");
-
-    // 4. The loaded mission has its three systems' outputs registered, and it steps.
     assert!(
         coord.output_instances().len() >= 3,
         "plant/nav/ctrl outputs registered from the bundle"
@@ -78,6 +102,52 @@ fn bundle_round_trips_and_runs() {
         coord.run_for(50).await;
     });
 
-    // Best-effort cleanup.
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn python_mission_packages_and_runs() {
+    // The Phase 1 rejection replaced: a `.py` mission packages through the same
+    // IR path a `.kdl` does, then runs cargo-free with no Python on the run side.
+    if !have_python() {
+        eprintln!("skipping: no python3 >= 3.10 on PATH");
+        return;
+    }
+    let mut wiring = match eval_python_mission(&mission("mission.py")) {
+        Ok(w) => w,
+        Err(e) => {
+            eprintln!("skipping: mission.py did not evaluate: {e}");
+            return;
+        }
+    };
+    for spec in &mut wiring.systems {
+        spec.process = false;
+    }
+    if let Err(e) = build_artifacts(&mut wiring, &BuildOptions::default()) {
+        eprintln!("skipping: build_artifacts failed: {e}");
+        return;
+    }
+
+    let dir = temp_bundle_dir("py");
+    let _ = std::fs::remove_dir_all(&dir);
+    let opts = PackageOptions {
+        target: build_target(&[]),
+        metor_config_version: Some(metor_config_version().to_string()),
+        provenance: Some(mission("mission.py")),
+        ..PackageOptions::default()
+    };
+    write_bundle(&wiring, &opts, &dir).expect("write the .py bundle");
+    assert!(dir.join("mission.py").exists(), "python provenance rides along");
+
+    // The run side needs no Python: load the frozen IR and run it.
+    let mut loaded = load_bundle(&dir).expect("load the .py bundle");
+    for spec in &mut loaded.systems {
+        spec.process = false;
+    }
+    let mut coord = resolve(&loaded, &Registry::with_builtins()).expect("resolve the .py bundle");
+    stellarator::run(move || async move {
+        coord.run_for(50).await;
+    });
+
     let _ = std::fs::remove_dir_all(&dir);
 }

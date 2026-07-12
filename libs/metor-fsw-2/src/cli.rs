@@ -5,8 +5,8 @@ use miette::IntoDiagnostic;
 
 use crate::wiring::{
     BuildOptions, ClockSpec, PackageOptions, Registry, StubgenOptions, Wiring, build_artifacts,
-    eval_python_mission, is_python_mission, load_bundle, parse_with_origin, resolve, stubgen,
-    write_bundle,
+    build_target, eval_python_mission, is_python_mission, load_bundle, metor_config_version,
+    parse_with_origin, resolve, stubgen, write_bundle,
 };
 
 /// The fully parsed command line, produced from argv by [`run`].
@@ -189,31 +189,25 @@ fn cmd_build(args: BuildArgs) -> miette::Result<()> {
 }
 
 fn cmd_package(args: PackageArgs) -> miette::Result<()> {
-    // A bundle carries its mission as verbatim KDL re-parsed on load, so a `.py`
-    // mission cannot round-trip through it. The IR-carrying bundle is Phase 3;
-    // until then, evaluate the mission with `build`/`run` instead.
-    if is_python_mission(&args.kdl) {
-        return Err(miette::miette!(
-            "packaging a `.py` mission is not supported yet (the bundle manifest is \
-             verbatim KDL); use `metor-fsw build`/`run` on the `.py`, or package a `.kdl`"
-        ));
-    }
-    let text = read_file(&args.kdl)?;
-    let mut wiring = parse_with_origin(&text, Some(&args.kdl.to_string_lossy()))?;
+    // Both front-ends produce a `Wiring`; the bundle freezes it as IR, so a
+    // `.py` mission packages through the same path a `.kdl` does — no Python
+    // and no KDL parser is needed to run the result.
+    let mut wiring = load_source(&args.kdl)?;
     build_artifacts(
         &mut wiring,
         &build_opts(args.release, &args.cargo_arg, args.no_manifest_sidecar),
     )
     .into_diagnostic()?;
-    write_bundle(
-        &wiring,
-        &text,
-        &PackageOptions {
-            release: args.release,
-        },
-        &args.out,
-    )
-    .into_diagnostic()?;
+    let opts = PackageOptions {
+        release: args.release,
+        target: build_target(&args.cargo_arg),
+        // The recorder version is provenance; a Python mission was evaluated by
+        // this host's embedded (or $METOR_CONFIG_PY) recorder.
+        metor_config_version: is_python_mission(&args.kdl)
+            .then(|| metor_config_version().to_string()),
+        provenance: Some(args.kdl.clone()),
+    };
+    write_bundle(&wiring, &opts, &args.out).into_diagnostic()?;
     println!(
         "packaged {} artifacts, {} systems → {}",
         wiring.artifacts.len(),

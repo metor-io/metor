@@ -45,6 +45,12 @@ pub fn is_python_mission(path: &Path) -> bool {
     path.extension().is_some_and(|e| e == "py")
 }
 
+/// The embedded `metor_config` recorder version this host evaluates Python
+/// missions with, recorded as bundle provenance.
+pub fn metor_config_version() -> &'static str {
+    EMBEDDED_METOR_CONFIG_VERSION
+}
+
 /// Evaluate a `.py` mission into a [`Wiring`].
 ///
 /// Resolves an interpreter (`$METOR_PYTHON` → `$VIRTUAL_ENV/bin/python` →
