@@ -26,9 +26,9 @@ import os
 import sys
 from contextlib import contextmanager
 from dataclasses import dataclass
-from typing import Any, Iterator
+from typing import Any, Generic, Iterator, TypeVar, cast
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"
 
 # The IR model version this recorder emits; must match `ir::IR_VERSION`.
 IR_VERSION = 1
@@ -80,6 +80,14 @@ def _json_scalar(value: Any, key: str) -> Any:
 
 def _params(kwargs: dict[str, Any]) -> dict[str, Any]:
     return {k: _json_scalar(v, k) for k, v in kwargs.items()}
+
+
+def _handle_name(handle: Any) -> str:
+    """The instance name of a routing endpoint. Endpoints are handles at
+    runtime (``add``/``slot`` returns a :class:`SystemHandle`, ``coordinator``
+    is one), but a generated entry's handle is *typed* as its spec class, so
+    the name is read dynamically."""
+    return handle.name
 
 
 def _cdylib_file_name(stem: str) -> str:
@@ -143,6 +151,75 @@ class ArtifactHandle:
 
     def __getitem__(self, entry: str) -> _EntryCallable:
         return _EntryCallable(self._id, entry)
+
+
+# ---------------------------------------------------------------------------
+# Typed core for generated packs (`metor-fsw stubgen`)
+#
+# These are the symbols the generated `packs/<id>.py` modules import. At
+# runtime they are thin: `Frame`/`Msg` are empty markers, `InPort`/`OutPort`
+# are erased generics that never get instantiated (a handle's `__getattr__`
+# returns a `PortRef`), and `System` is a `Spec` that also carries the
+# artifact it came from so `Mission.add` can auto-register it. All the typing
+# lives in the generated annotations, which pyright reads; the recorder's
+# behavior is exactly Phase 1's.
+# ---------------------------------------------------------------------------
+
+# The frame a port carries, the type variable that makes a cross-system frame
+# mismatch a pyright error at `connect`.
+F = TypeVar("F")
+
+# The spec type `Mission.add` echoes back, so a generated entry's handle keeps
+# the entry's typed port attributes.
+H = TypeVar("H", bound="Spec")
+
+
+class Frame:
+    """Base of a generated per-frame marker class (checker-only)."""
+
+
+class Msg:
+    """Marker for a self-describing (postcard) message port (checker-only)."""
+
+
+class OutPort(Generic[F]):
+    """A producer port carrying frame ``F``. Never instantiated: a handle's
+    attribute access returns a :class:`PortRef` at runtime; the annotation is
+    for the checker. The two fields mirror :class:`PortRef` so ``connect`` can
+    read them under either type."""
+
+    instance: str
+    port: str
+
+
+class InPort(Generic[F]):
+    """A consumer port carrying frame ``F`` (see :class:`OutPort`)."""
+
+    instance: str
+    port: str
+
+
+@dataclass(frozen=True)
+class Artifact:
+    """A loadable pack, as a generated module declares it in its ``ARTIFACT``
+    constant. Using an entry from the module auto-registers this on the mission
+    (:meth:`Mission.add`); ``manifest_hash`` is the staleness anchor the host
+    checks at resolve."""
+
+    id: str
+    crate: str
+    lib: str
+    manifest_hash: str | None = None
+
+
+class System(Spec):
+    """Base of a generated pack-entry class (and the occupant callables' return
+    type). Carries the declaring :class:`Artifact` so registration is implicit;
+    otherwise it is an ordinary :class:`Spec`."""
+
+    def __init__(self, entry: str, artifact: "Artifact", **params: Any):
+        super().__init__(entry, artifact.id, params)
+        self.artifact_decl = artifact
 
 
 class PortRef:
@@ -341,12 +418,52 @@ class Mission:
             raise ValueError(f"duplicate instance name {name!r}")
         self._names.add(name)
 
+    def _register_spec_artifact(self, spec: Spec) -> None:
+        """Auto-register a generated :class:`System`'s declaring artifact, so a
+        mission never has to spell ``m.artifact(...)`` for a stubbed pack."""
+        decl = getattr(spec, "artifact_decl", None)
+        if decl is not None:
+            self._register_artifact(decl)
+
+    def _register_artifact(self, decl: "Artifact") -> None:
+        """Record an :class:`Artifact`, deduped by id. A second declaration of
+        the same id must agree on crate and lib (conflicting definitions are an
+        eval-time error); a later declaration may supply the manifest hash an
+        earlier one lacked."""
+        cdylib = _cdylib_file_name(decl.lib)
+        for existing in self._artifacts:
+            if existing["id"] != decl.id:
+                continue
+            if existing["crate_name"] != decl.crate or existing["cdylib"] != cdylib:
+                raise ValueError(
+                    f"artifact {decl.id!r} is declared twice with different crate/lib"
+                )
+            if existing["manifest_hash"] is None:
+                existing["manifest_hash"] = decl.manifest_hash
+            return
+        self._artifacts.append(
+            {
+                "id": decl.id,
+                "crate_name": decl.crate,
+                "cdylib": cdylib,
+                "path": None,
+                "manifest_hash": decl.manifest_hash,
+                "src": _source_ref(),
+            }
+        )
+
     # -- systems and slots --------------------------------------------------
 
-    def add(self, name: str, spec: Spec, process: bool = False) -> SystemHandle:
-        """Register ``spec`` under ``name`` (scope-prefixed) and return its handle."""
+    def add(self, name: str, spec: H, process: bool = False) -> H:
+        """Register ``spec`` under ``name`` (scope-prefixed) and return its handle.
+
+        The return is typed as the spec's own class so a generated entry's port
+        attributes (``plant.sensors``) are checkable; at runtime it is a
+        :class:`SystemHandle` whose attribute access yields :class:`PortRef`s.
+        A generated :class:`System` also auto-registers its artifact."""
         full, scope = self._scoped(name)
         self._claim(full)
+        self._register_spec_artifact(spec)
         self._systems.append(
             {
                 "name": full,
@@ -358,7 +475,7 @@ class Mission:
                 "scope": scope,
             }
         )
-        return SystemHandle(full)
+        return cast(H, SystemHandle(full))
 
     def slot(
         self,
@@ -374,6 +491,8 @@ class Mission:
         call convention as system specs; ``initial`` names one of them."""
         full, scope = self._scoped(name)
         self._claim(full)
+        for occupant in allow:
+            self._register_spec_artifact(occupant)
         occupants = [
             {
                 "occupant": s.ty,
@@ -407,18 +526,25 @@ class Mission:
 
     # -- edges --------------------------------------------------------------
 
-    def connect(self, src: PortRef, dst: PortRef, delayed: bool = False) -> None:
-        """Record a component-frame edge from ``src`` to ``dst``."""
+    def connect(self, src: OutPort[F], dst: InPort[F], delayed: bool = False) -> None:
+        """Record a component-frame edge from ``src`` to ``dst``. The shared
+        frame parameter ``F`` makes a cross-frame connection a pyright error;
+        at runtime both ends are :class:`PortRef`s (same ``instance``/``port``
+        fields the annotations declare)."""
         self._edge(src, dst, "Frame", bool(delayed))
 
-    def route(self, src: SystemHandle, dst: SystemHandle, msg: str) -> None:
+    def route(self, src: "SystemHandle | Spec", dst: "SystemHandle | Spec", msg: str) -> None:
         """Record a message edge carrying ``msg`` from ``src`` to ``dst``. A
-        message edge is log-delivery pub/sub, so it has no ``delayed`` form."""
+        message edge is log-delivery pub/sub, so it has no ``delayed`` form.
+        Endpoints are handles (from :meth:`add`/:meth:`slot`, or
+        :attr:`coordinator`); a generated entry's handle is typed as its class
+        but is a :class:`SystemHandle` at runtime, so its ``name`` is read
+        dynamically."""
         self._edges.append(
             {
-                "from": src.name,
+                "from": _handle_name(src),
                 "out": msg,
-                "to": dst.name,
+                "to": _handle_name(dst),
                 "in_": msg,
                 "delayed": False,
                 "kind": "Msg",
@@ -426,7 +552,7 @@ class Mission:
             }
         )
 
-    def _edge(self, src: PortRef, dst: PortRef, kind: str, delayed: bool) -> None:
+    def _edge(self, src: OutPort[F], dst: InPort[F], kind: str, delayed: bool) -> None:
         self._edges.append(
             {
                 "from": src.instance,
