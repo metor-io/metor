@@ -106,6 +106,41 @@ fn kdl_bundle_round_trips_and_runs() {
 }
 
 #[test]
+fn kdl_bundle_round_trips_as_metor_archive() {
+    // The single-file `.metor` form: pack the mission into one tar, then load
+    // it back (unpacked to a temp dir) and run it cargo-free.
+    let mut wiring = parse(MISSION_KDL).expect("parse mission.kdl");
+    for spec in &mut wiring.systems {
+        spec.process = false;
+    }
+    if let Err(e) = build_artifacts(&mut wiring, &BuildOptions::default()) {
+        eprintln!("skipping: build_artifacts failed: {e}");
+        return;
+    }
+
+    let archive = std::env::temp_dir().join(format!("adcs-fsw2-{}.metor", std::process::id()));
+    let _ = std::fs::remove_file(&archive);
+    let opts = PackageOptions {
+        target: build_target(&[]),
+        ..PackageOptions::default()
+    };
+    write_bundle(&wiring, &opts, &archive).expect("write the .metor archive");
+    assert!(archive.is_file(), "single-file bundle written");
+
+    let mut loaded = load_bundle(&archive).expect("load the .metor archive");
+    for spec in &mut loaded.systems {
+        spec.process = false;
+    }
+    let mut coord = resolve(&loaded, &Registry::with_builtins()).expect("resolve the .metor bundle");
+    assert!(coord.output_instances().len() >= 3, "systems registered from the archive");
+    stellarator::run(move || async move {
+        coord.run_for(50).await;
+    });
+
+    let _ = std::fs::remove_file(&archive);
+}
+
+#[test]
 fn python_mission_packages_and_runs() {
     // The Phase 1 rejection replaced: a `.py` mission packages through the same
     // IR path a `.kdl` does, then runs cargo-free with no Python on the run side.
