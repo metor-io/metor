@@ -11,7 +11,8 @@ use metor_proto::types::{ComponentId, Timestamp};
 use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
 
 use crate::wiring::{
-    ClockSpec, LoadError, ParamSource, Registry, SlotInitState, WiringBuilder, load, parse, resolve,
+    ClockSpec, IR_VERSION, LoadError, ParamSource, Registry, SlotInitState, Wiring, WiringBuilder,
+    load, parse, resolve,
 };
 use crate::{
     AsyncSystem, BuildSystem, CyclicSystem, Input, MsgIn, MsgOut, Out, Output, System, SystemInput,
@@ -2006,5 +2007,107 @@ system "trim2" type="Trim2"
         f64::from_bits(LAST_DEFAULTED.load(Relaxed)),
         10.5,
         "absent config = pure defaults"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// The versioned IR: both front-ends stamp IR_VERSION, serde carries it as a
+// required field, resolve refuses any other value, and bundles record it.
+// ---------------------------------------------------------------------------
+
+/// A full parse-origin `Wiring` (artifact, dl and static systems, a slot, an
+/// edge) survives a JSON round-trip byte-for-byte, `ir_version` included.
+#[test]
+fn wiring_json_round_trips_with_ir_version() {
+    let kdl = r#"
+coordinator cycle_rate=100.0
+artifact "plant" crate="adcs-plant" lib="adcs_plant"
+system "plant" type="Plant" artifact="plant" gain=2.0
+system "nav" type="Src"
+slot "adcs" {
+    input frame="imu"
+    allow occupant="ctrl" artifact="plant"
+    initial occupant="ctrl" state="running"
+}
+connect "plant" -> "nav" frame="imu"
+"#;
+    let wiring = parse(kdl).expect("parse the full document");
+    assert_eq!(wiring.ir_version, IR_VERSION);
+    let json = serde_json::to_string(&wiring).expect("serialize");
+    let back: Wiring = serde_json::from_str(&json).expect("deserialize");
+    assert_eq!(back, wiring, "JSON round-trip is lossless");
+}
+
+/// A serialized `Wiring` with no `ir_version` fails to deserialize; an
+/// unversioned document must never pass as current.
+#[test]
+fn wiring_json_without_ir_version_is_rejected() {
+    let mut json = serde_json::to_value(equiv_builder().build()).expect("serialize");
+    json.as_object_mut().unwrap().remove("ir_version");
+    assert!(
+        serde_json::from_value::<Wiring>(json).is_err(),
+        "a missing version is an error, not a default"
+    );
+}
+
+#[test]
+fn resolve_rejects_ir_version_mismatch() {
+    let mut wiring = equiv_builder().build();
+    wiring.ir_version += 1;
+    let err = match resolve(&wiring, &registry()) {
+        Ok(_) => panic!("expected an IrVersionMismatch error"),
+        Err(e) => e,
+    };
+    match err {
+        LoadError::IrVersionMismatch { found, expected } => {
+            assert_eq!(found, IR_VERSION + 1);
+            assert_eq!(expected, IR_VERSION);
+        }
+        other => panic!("expected IrVersionMismatch, got {other:?}"),
+    }
+}
+
+/// `write_bundle` records `ir_version` in `meta.kdl`; `load_bundle` accepts a
+/// matching bundle and refuses a skewed or pre-versioning one.
+#[cfg(not(miri))]
+#[test]
+fn bundle_meta_carries_and_checks_ir_version() {
+    use crate::wiring::{BundleError, PackageOptions, load_bundle, write_bundle};
+
+    let kdl = "coordinator cycle_rate=100.0\n";
+    let wiring = parse(kdl).expect("parse");
+    let tmp = tempfile::tempdir().expect("temp dir");
+    let dir = tmp.path().join("mission.bundle");
+    write_bundle(&wiring, kdl, &PackageOptions::default(), &dir).expect("write the bundle");
+    let loaded = load_bundle(&dir).expect("a fresh bundle loads");
+    assert_eq!(loaded.ir_version, IR_VERSION);
+
+    let meta_path = dir.join("meta.kdl");
+    let meta = std::fs::read_to_string(&meta_path).expect("read meta.kdl");
+
+    // A skewed recorded version is refused.
+    let skewed = meta.replace(
+        &format!("ir_version {IR_VERSION}"),
+        &format!("ir_version {}", IR_VERSION + 1),
+    );
+    assert_ne!(skewed, meta, "the sidecar records ir_version");
+    std::fs::write(&meta_path, skewed).expect("tamper meta.kdl");
+    let err = load_bundle(&dir).expect_err("version skew is refused");
+    assert!(
+        matches!(err, BundleError::IrMismatch { found: Some(v), .. } if v == IR_VERSION + 1),
+        "{err:?}"
+    );
+
+    // A bundle that never recorded a version (pre-versioning) is refused too.
+    let stripped: String = meta
+        .lines()
+        .filter(|l| !l.contains("ir_version"))
+        .map(|l| format!("{l}\n"))
+        .collect();
+    std::fs::write(&meta_path, stripped).expect("strip ir_version");
+    let err = load_bundle(&dir).expect_err("a pre-versioning bundle is refused");
+    assert!(
+        matches!(err, BundleError::IrMismatch { found: None, .. }),
+        "{err:?}"
     );
 }

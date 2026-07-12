@@ -16,6 +16,11 @@ use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
+/// The version of the [`Wiring`] data model itself. Both front-ends stamp it
+/// and [`resolve`](super::resolve) checks it, so a serialized `Wiring` from a
+/// different-generation producer fails loudly instead of misresolving.
+pub const IR_VERSION: u32 = 1;
+
 /// A plain-data description of a complete mission, naming the systems that
 /// run, where their code and params come from, and how their ports connect.
 ///
@@ -25,6 +30,10 @@ use serde::{Deserialize, Serialize};
 /// types [`TCP_DOWNLINK_TYPE`] and [`TCP_UPLINK_TYPE`], not as dedicated fields.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Wiring {
+    /// The [`IR_VERSION`] this value was produced against. Deliberately not
+    /// serde-defaulted: a serialized `Wiring` with no version is an error,
+    /// not a guess.
+    pub ir_version: u32,
     /// Coordinator-wide config (cycle rate, default ring depth, clock).
     pub coordinator: CoordinatorSpec,
     /// The shared objects this mission loads, one pack per cdylib.

@@ -29,7 +29,7 @@ use std::net::SocketAddr;
 use serde::Serialize;
 
 use super::model::{
-    AllowedOccupantSpec, Artifact, ClockSpec, CoordinatorSpec, EdgeKind, EdgeSpec,
+    AllowedOccupantSpec, Artifact, ClockSpec, CoordinatorSpec, EdgeKind, EdgeSpec, IR_VERSION,
     InitialOccupantSpec, ParamSource, SlotInitState, SlotSpec, SystemSpec, Wiring,
 };
 
@@ -230,6 +230,7 @@ impl WiringBuilder {
     /// Finishes the [`Wiring`].
     pub fn build(self) -> Wiring {
         Wiring {
+            ir_version: IR_VERSION,
             coordinator: self.coordinator,
             artifacts: self.artifacts,
             systems: self.systems,
