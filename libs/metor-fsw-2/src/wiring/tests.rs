@@ -2242,6 +2242,65 @@ fn resolve_errors_carry_the_parse_anchor() {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Occupant resolution: the reloadable requirement is per-mount, not blanket.
+// ---------------------------------------------------------------------------
+
+/// A wired dl system may be non-reloadable (it is instantiated once); a slot
+/// occupant may not (it is re-instantiated on every load).
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn reloadable_is_required_for_slot_occupants_only() {
+    let meta = crate::dl::PackEntryMeta {
+        descriptor: crate::descriptor::SystemDescriptor {
+            name: "Stateful",
+            kind: crate::SystemKind::Cyclic,
+            inputs: Vec::new(),
+            outputs: Vec::new(),
+            capabilities: Vec::new(),
+        },
+        params_schema: postcard_schema::schema::owned::OwnedNamedType::from(
+            <() as postcard_schema::Schema>::SCHEMA,
+        ),
+        reloadable: false,
+        params_default: None,
+    };
+    let entries = [meta];
+    let source = super::EntrySource::Described {
+        entries: &entries,
+        artifact: "art",
+    };
+    let resolve_one = |owner: &str, require_reloadable: bool| {
+        super::resolve_occupant(
+            &source,
+            Some("Stateful"),
+            &ParamSource::None,
+            owner,
+            super::SYSTEM_RESERVED,
+            1,
+            require_reloadable,
+            "snippet",
+            (0, 0).into(),
+        )
+    };
+    assert!(
+        resolve_one("wired", false).is_ok(),
+        "a wired dl system does not require a reloadable entry"
+    );
+    let err = match resolve_one("adcs", true) {
+        Ok(_) => panic!("expected OccupantNotReloadable"),
+        Err(e) => e,
+    };
+    assert!(
+        matches!(
+            err,
+            LoadError::OccupantNotReloadable { ref slot, ref occupant, .. }
+                if slot == "adcs" && occupant == "Stateful"
+        ),
+        "{err:?}"
+    );
+}
+
 /// A scope index outside the table is refused before any system is built,
 /// for spec `scope` fields and the table's own `parent` links alike.
 #[test]
