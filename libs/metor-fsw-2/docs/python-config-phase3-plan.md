@@ -1,9 +1,14 @@
 # Phase 3 plan — IR bundles + `WiringManifest` telemetry
 
-> **Status: PLANNED.** Implements Phase 3 of `docs/design-python-config.md`
-> (§8 bundles, §9 visualization, §11 phasing). Phases 0-2 are landed (through
-> `fb938709`): manifest sidecars, the `metor_config` recorder, generated typed
-> packs with `sha256:` staleness enforcement, and ABI v6 doc strings.
+> **Status: LANDED.** Implements Phase 3 of `docs/design-python-config.md`
+> (§8 bundles, §9 visualization, §11 phasing). Phases 0-2 landed through
+> `fb938709`: manifest sidecars, the `metor_config` recorder, generated typed
+> packs with `sha256:` staleness enforcement, and ABI v6 doc strings. Phase 3
+> shipped the four milestones below: the `WiringManifest` wkt message +
+> coordinator emission (M1), the `wiring.json` + `meta.json` IR bundle with the
+> target-triple and manifest-hash checks (M2), the single-file `.metor`
+> uncompressed-tar form (M3), and the `package --check-ir` determinism gate +
+> this docs sweep (M4). The bundle format is documented in `cli-runner.md` §4.
 
 Goal: the bundle becomes the frozen, versioned IR (`wiring.json` + `meta.json`
 + `.so`s, with a target-triple check and a single-file form), so a `.py`

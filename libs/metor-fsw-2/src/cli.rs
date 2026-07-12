@@ -4,9 +4,10 @@ use clap::{Args, Parser, Subcommand};
 use miette::IntoDiagnostic;
 
 use crate::wiring::{
-    BuildOptions, ClockSpec, PackageOptions, Registry, StubgenOptions, Wiring, build_artifacts,
-    build_target, eval_python_mission, is_python_mission, load_bundle, metor_config_version,
-    parse_with_origin, resolve, stubgen, write_bundle,
+    BuildOptions, ClockSpec, METOR_EXTENSION, PackageOptions, Registry, StubgenOptions,
+    WIRING_FILE_NAME, Wiring, build_artifacts, build_target, eval_python_mission, is_python_mission,
+    load_bundle, metor_config_version, parse_with_origin, resolve, stubgen, unpack_metor,
+    write_bundle,
 };
 
 /// The fully parsed command line, produced from argv by [`run`].
@@ -53,12 +54,17 @@ struct BuildArgs {
 
 #[derive(Args, Debug)]
 struct PackageArgs {
-    /// The wiring KDL file.
-    kdl: PathBuf,
+    /// The mission source (`.py` or `.kdl`). Required unless `--check-ir`.
+    kdl: Option<PathBuf>,
     /// The bundle output: a directory (conventionally `*.bundle`), or a
     /// single-file `*.metor` archive (dispatched by the `.metor` extension).
     #[arg(short = 'o', long = "out", value_name = "OUT")]
-    out: PathBuf,
+    out: Option<PathBuf>,
+    /// Instead of packaging, re-evaluate the given bundle's provenance source
+    /// and diff the produced IR against its frozen `wiring.json`; exit non-zero
+    /// on drift (the determinism gate, runnable in CI).
+    #[arg(long = "check-ir", value_name = "BUNDLE")]
+    check_ir: Option<PathBuf>,
     /// Build the `--release` profile (default: debug).
     #[arg(long)]
     release: bool,
@@ -190,10 +196,20 @@ fn cmd_build(args: BuildArgs) -> miette::Result<()> {
 }
 
 fn cmd_package(args: PackageArgs) -> miette::Result<()> {
+    if let Some(bundle) = &args.check_ir {
+        return cmd_check_ir(bundle);
+    }
     // Both front-ends produce a `Wiring`; the bundle freezes it as IR, so a
     // `.py` mission packages through the same path a `.kdl` does — no Python
     // and no KDL parser is needed to run the result.
-    let mut wiring = load_source(&args.kdl)?;
+    let kdl = args.kdl.as_deref().ok_or_else(|| {
+        miette::miette!("`package` needs a mission source (`.py`/`.kdl`), or `--check-ir <bundle>`")
+    })?;
+    let out = args
+        .out
+        .as_deref()
+        .ok_or_else(|| miette::miette!("`package` needs an output path (`-o <out>`)"))?;
+    let mut wiring = load_source(kdl)?;
     build_artifacts(
         &mut wiring,
         &build_opts(args.release, &args.cargo_arg, args.no_manifest_sidecar),
@@ -204,20 +220,106 @@ fn cmd_package(args: PackageArgs) -> miette::Result<()> {
         target: build_target(&args.cargo_arg),
         // The recorder version is provenance; a Python mission was evaluated by
         // this host's embedded (or $METOR_CONFIG_PY) recorder.
-        metor_config_version: is_python_mission(&args.kdl)
+        metor_config_version: is_python_mission(kdl)
             .then(|| metor_config_version().to_string()),
-        provenance: Some(args.kdl.clone()),
+        provenance: Some(kdl.to_path_buf()),
         // Current time; a reproducible build pins this.
         built_at_unix: None,
     };
-    write_bundle(&wiring, &opts, &args.out).into_diagnostic()?;
+    write_bundle(&wiring, &opts, out).into_diagnostic()?;
     println!(
         "packaged {} artifacts, {} systems → {}",
         wiring.artifacts.len(),
         wiring.systems.len(),
-        args.out.display()
+        out.display()
     );
     Ok(())
+}
+
+/// `package --check-ir <bundle>`: re-evaluate the bundle's provenance source
+/// and diff the produced IR against the frozen `wiring.json`, exiting non-zero
+/// on any drift — the determinism backstop, runnable in CI.
+///
+/// Both sides are normalized before the diff: artifact `path`s are stripped
+/// (never in the frozen IR anyway) and `src` file names cleared, since the
+/// provenance copy sits at a different path than the original source, which
+/// would otherwise read as spurious drift. The line/column of every anchor is
+/// kept, so a genuine emission change is still caught.
+fn cmd_check_ir(bundle: &Path) -> miette::Result<()> {
+    // Materialize a readable directory: a `.metor` unpacks to a temp dir held
+    // for the duration of the check, a directory is read in place.
+    let _held;
+    let dir = if bundle.is_file() && bundle.extension().is_some_and(|e| e == METOR_EXTENSION) {
+        let unpacked = unpack_metor(bundle).into_diagnostic()?;
+        let path = unpacked.path().to_path_buf();
+        _held = Some(unpacked);
+        path
+    } else {
+        bundle.to_path_buf()
+    };
+
+    let frozen_text = read_file(&dir.join(WIRING_FILE_NAME))?;
+    let frozen: Wiring = serde_json::from_str(&frozen_text)
+        .map_err(|e| miette::miette!("bundle `{}` has an unreadable wiring.json: {e}", bundle.display()))?;
+
+    let source = find_provenance(&dir).ok_or_else(|| {
+        miette::miette!(
+            "bundle `{}` carries no provenance source (mission.py/.kdl); cannot --check-ir",
+            bundle.display()
+        )
+    })?;
+    let produced = load_source(&source)?;
+
+    if normalized_ir(&produced) == normalized_ir(&frozen) {
+        println!("--check-ir: {} reproduces its frozen IR", bundle.display());
+        Ok(())
+    } else {
+        Err(miette::miette!(
+            "IR drift: re-evaluating `{}` no longer reproduces the bundle's wiring.json \
+             (nondeterministic emission, or the bundle is stale) — repackage it",
+            source.display()
+        ))
+    }
+}
+
+/// The provenance source inside a bundle directory: `mission.py` preferred,
+/// then `mission.kdl`.
+fn find_provenance(dir: &Path) -> Option<PathBuf> {
+    ["mission.py", "mission.kdl"]
+        .into_iter()
+        .map(|n| dir.join(n))
+        .find(|p| p.exists())
+}
+
+/// The normalized-for-diff JSON of a `Wiring`: artifact paths stripped and
+/// every `src` file name cleared (keeping line/column), so the comparison is
+/// immune to where the source physically sat.
+fn normalized_ir(wiring: &Wiring) -> String {
+    let mut w = wiring.path_stripped();
+    let clear = |src: &mut Option<crate::wiring::SourceRef>| {
+        if let Some(s) = src {
+            s.file = None;
+        }
+    };
+    for a in &mut w.artifacts {
+        clear(&mut a.src);
+    }
+    for s in &mut w.systems {
+        clear(&mut s.src);
+    }
+    for s in &mut w.slots {
+        clear(&mut s.src);
+        for occ in &mut s.allow {
+            clear(&mut occ.src);
+        }
+    }
+    for e in &mut w.edges {
+        clear(&mut e.src);
+    }
+    for sc in &mut w.scopes {
+        clear(&mut sc.src);
+    }
+    serde_json::to_string(&w).expect("Wiring serializes to JSON")
 }
 
 async fn cmd_run(args: RunArgs) -> miette::Result<()> {
@@ -311,4 +413,47 @@ fn build_opts(release: bool, cargo_arg: &[String], no_manifest_sidecar: bool) ->
 fn read_file(path: &Path) -> miette::Result<String> {
     std::fs::read_to_string(path)
         .map_err(|e| miette::miette!("failed to read `{}`: {e}", path.display()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Normalized IR ignores the `src` file name (the provenance copy sits at a
+    /// different path than the original source), so re-parsing the same text
+    /// under a different origin is not spurious drift — but a real change is.
+    #[test]
+    fn normalized_ir_ignores_source_path_but_not_content() {
+        let kdl = "coordinator cycle_rate=100.0\nsystem \"a\" type=\"Src\"\n";
+        let frozen = parse_with_origin(kdl, Some("/build/mission.kdl")).unwrap();
+        let reparsed = parse_with_origin(kdl, Some("/tmp/bundle/mission.kdl")).unwrap();
+        assert_eq!(
+            normalized_ir(&frozen),
+            normalized_ir(&reparsed),
+            "same text, different origin path — not drift"
+        );
+
+        let changed = parse_with_origin(
+            "coordinator cycle_rate=200.0\nsystem \"a\" type=\"Src\"\n",
+            Some("/build/mission.kdl"),
+        )
+        .unwrap();
+        assert_ne!(
+            normalized_ir(&frozen),
+            normalized_ir(&changed),
+            "a real emission change is drift"
+        );
+    }
+
+    /// Provenance discovery prefers `mission.py`, then `mission.kdl`, and is
+    /// `None` when a bundle carries neither.
+    #[test]
+    fn find_provenance_prefers_python() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(find_provenance(dir.path()).is_none(), "no provenance yet");
+        std::fs::write(dir.path().join("mission.kdl"), "").unwrap();
+        assert_eq!(find_provenance(dir.path()), Some(dir.path().join("mission.kdl")));
+        std::fs::write(dir.path().join("mission.py"), "").unwrap();
+        assert_eq!(find_provenance(dir.path()), Some(dir.path().join("mission.py")));
+    }
 }

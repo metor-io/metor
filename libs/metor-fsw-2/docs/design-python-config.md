@@ -437,9 +437,12 @@ Each phase gets its own plan doc before implementation.
 - **Phase 2 — stubgen.** Manifest→module codegen, `pyproject.toml` artifact
   table, `--check` CI gate, staleness enforcement at resolve. ABI v6 doc
   strings land here if approved.
-- **Phase 3 — bundles + telemetry.** `wiring.json` bundles with target-triple
-  check and single-file form, `WiringManifest` wkt emission. Panel graph tile
-  proceeds independently against the frozen contract.
+- **Phase 3 — bundles + telemetry. LANDED.** `wiring.json` + `meta.json`
+  bundles with the target-triple check, the single-file `.metor` (uncompressed
+  tar) form, the `WiringManifest` wkt emission (full IR at boot and on reload),
+  and the `package --check-ir` determinism gate. `package mission.py` now
+  works end to end; a bundle runs cargo-free with no Python and no KDL parse.
+  Panel graph tile proceeds independently against the frozen contract.
 - **Phase 4 — migration + retirement.** `metor migrate`, KDL behind a feature
   flag, docs sweep, then deletion.
 
@@ -474,4 +477,13 @@ Open (each has a leaning, none blocks Phase 0):
    get missed in review diffs.
 4. Command-plane special case (`m.coordinator`) — keep reserved handle;
    revisit with the Rust-side model.
-5. Single-file bundle format details (tar vs zip, extension) — Phase 3.
+
+Resolved:
+
+5. Single-file bundle format (tar vs zip, extension) — **decided in Phase 3:
+   uncompressed `tar`, extension `.metor`.** Tar over zip because it is
+   streamable, order-stable for reproducible bytes, and a plain uncompressed
+   archive keeps the load path `mmap`-friendly after unpack (`.so`s do not
+   compress usefully). Stable entry order + zeroed tar timestamps make it
+   byte-reproducible; a dependency-free `ustar` reader/writer avoids a new
+   crate. See `cli-runner.md` §4.6.

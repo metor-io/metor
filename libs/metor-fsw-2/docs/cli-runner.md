@@ -61,8 +61,8 @@ The implementation lands in:
 **Non-goals (v1).**
 
 - **No static-system support in the generic binary** (empty registry; dl-only — see scope).
-- **No tar/zip.** The bundle is a plain directory. A compress step is a future convenience
-  (§4.5).
+- ~~**No tar/zip.**~~ *(Superseded by python-config Phase 3 — §4.6: an uncompressed-tar
+  `.metor` single-file form now ships alongside the directory. Still no compression.)*
 - **No cross-compilation orchestration.** `--release`/`--target` pass through to the build
   driver's `extra_args`; the CLI does not manage toolchains.
 - **No async systems** (inherited from dl-open.md — dl systems are cyclic-only).
@@ -74,10 +74,12 @@ The implementation lands in:
 ```
 metor-fsw <COMMAND>
 
-  build    <KDL>                 compile the cdylibs the wiring references
-  package  <KDL> -o <DIR>        produce a relocatable bundle directory
-  run      <TARGET>              load a wiring (source KDL or bundle) and run it
+  build    <SRC>                 compile the cdylibs the wiring references
+  package  <SRC> -o <OUT>        freeze an IR bundle (dir or .metor); --check-ir to verify
+  run      <TARGET>              load a wiring (source or bundle) and run it
 ```
+
+`<SRC>` is a mission source — a `.py` (evaluated by subprocess CPython) or a `.kdl` (parsed).
 
 ### 2.1 `build`
 
@@ -99,21 +101,25 @@ $ metor-fsw build mission.kdl
 ### 2.2 `package`
 
 ```
-metor-fsw package <KDL> -o <DIR> [--release] [--cargo-arg <ARG>]...
+metor-fsw package <SRC> -o <OUT> [--release] [--cargo-arg <ARG>]...
+metor-fsw package --check-ir <BUNDLE>
 ```
 
-Produce the relocatable bundle of §4 at `<DIR>` (created if absent; conventionally
-`*.bundle`). `package` always runs `build_artifacts` — but that driver is *also* the only
-artifact locator (it scrapes cargo's `compiler-artifact` lines, which carry the `.so` path
-even when the crate is `"fresh":true`), so on an up-to-date tree it relocates without
-recompiling. A separate `--no-build` would therefore be redundant — there is no cargo-free
-locator — so it was dropped during impl (§8.3); `package` is always self-sufficient.
+Freeze the IR bundle of §4 at `<OUT>`: a directory (conventionally `*.bundle`) or a single-file
+`*.metor` archive, dispatched by the `.metor` extension. `<SRC>` is a `.py` or `.kdl` — both
+front-ends freeze through the same path, so a Python mission packages exactly as a KDL one.
+`package` always runs `build_artifacts` — but that driver is *also* the only artifact locator
+(it scrapes cargo's `compiler-artifact` lines, which carry the `.so` path even when the crate
+is `"fresh":true`), so on an up-to-date tree it relocates without recompiling.
+
+`--check-ir <BUNDLE>` is the determinism gate (§4.5): it re-evaluates the bundle's provenance
+source, diffs the produced IR against the frozen `wiring.json`, and exits non-zero on drift.
 
 ```
-$ metor-fsw package mission.kdl -o dist/adcs.bundle
-  built 3 cdylibs, copied into dist/adcs.bundle/
-  wrote dist/adcs.bundle/mission.kdl  (3 artifacts, 3 systems, 3 edges)
-  wrote dist/adcs.bundle/meta.kdl     (abi=3, profile=debug)
+$ metor-fsw package mission.py -o dist/adcs.bundle
+  packaged 2 artifacts, 6 systems → dist/adcs.bundle
+$ metor-fsw package --check-ir dist/adcs.bundle
+  --check-ir: dist/adcs.bundle reproduces its frozen IR
 ```
 
 ### 2.3 `run`
@@ -127,17 +133,18 @@ metor-fsw run <TARGET>
     [--cycles <N>]
 ```
 
-`<TARGET>` is either a **source `.kdl` file** or a **bundle directory** (§4); `run` detects
-which (a directory, or a `*.bundle`, is a bundle). Loading differs:
+`<TARGET>` is either a **source `.py`/`.kdl` file** or a **bundle** (§4); `run` detects which
+(a directory, a `*.bundle`, or a `*.metor` is a bundle). Loading differs:
 
-- **Bundle** → read its `mission.kdl`, fill each `Artifact::path` from the bundle directory,
-  `resolve`. **Never invokes cargo.** `--build` is rejected here (nothing to build).
-- **Source KDL** → the artifacts carry no located path (the KDL names crates, not absolute
+- **Bundle** → `load_bundle`: check `meta.json` (abi/ir/target), deserialize `wiring.json`,
+  fill each `Artifact::path` from the copied `.so`, verify manifest hashes, `resolve`. **Never
+  invokes cargo, Python, or the KDL parser.** `--build` is rejected here (nothing to build).
+- **Source** → the artifacts carry no located path (the source names crates, not absolute
   paths), so `run` must locate the `.so`s, and the only locator is the cargo build driver
-  (incremental). Therefore **a source-KDL run requires `--build`** — it runs `build_artifacts`
-  (compile-if-stale + locate) then resolves. Without `--build` (and not a bundle), `run` errors
-  with guidance: `--build` to compile, or `package` then run the bundle. `--build` is thus the
-  build→run shortcut (§2.4).
+  (incremental). Therefore **a source run requires `--build`** — it evaluates the source
+  (KDL parse or Python subprocess), runs `build_artifacts` (compile-if-stale + locate), then
+  resolves. Without `--build` (and not a bundle), `run` errors with guidance: `--build` to
+  compile, or `package` then run the bundle. `--build` is thus the build→run shortcut (§2.4).
 
 **Override flags** (precedence in §7): all mutate the `Wiring` after load, before `resolve`.
 
@@ -265,96 +272,124 @@ fn cmd_run(args: RunArgs) -> miette::Result<()> {
 
 ## 4. Bundle format
 
-A bundle is a **plain directory** carrying everything `run` needs with no source tree and no
-cargo. It is **platform-specific** — it contains compiled `.so`s — so it is built for, and run
-on, one target.
+> **Phase 3 update (python-config, `docs/python-config-phase3-plan.md`):** the bundle is now
+> the **frozen, versioned IR** — `wiring.json` + a JSON `meta.json` sidecar — not verbatim KDL.
+> Both front-ends (KDL and Python) freeze through the same path, so `package mission.py` works
+> and the run path needs **no Python and no KDL parser**. A single-file `.metor` (uncompressed
+> tar) form joins the directory form, and `package --check-ir` is the determinism gate. The
+> pre-Phase-3 sections below are rewritten to match; the retired `mission.kdl` + `meta.kdl`
+> layout is refused with a clear "repackage" error (`BundleError::OldLayout`).
+
+A bundle carries everything `run` needs with no source tree and no cargo. It is
+**platform-specific** — it contains compiled `.so`s — so it is built for, and run on, one
+target, and `run` checks that target triple up front (§4.3). Two forms: a directory, or a
+single-file `.metor` archive (§4.6).
 
 ### 4.1 Layout
 
 ```
 dist/adcs.bundle/
-├── mission.kdl          # the wiring manifest (the same KDL surface parse() reads)
-├── meta.kdl             # sidecar metadata (abi version, profile, timestamp, schemas)
-├── libadcs_plant.so     # the built cdylibs, one per artifact, copied in
-├── libadcs_nav.so
-└── libadcs_ctrl.so
+├── meta.json                     # abi/ir versions, target triple, profile, timestamp,
+│                                 #   wiring.json sha256, metor_config version
+├── wiring.json                   # the frozen, versioned Wiring IR (src anchors, scopes,
+│                                 #   per-artifact manifest hashes; artifact paths stripped)
+├── libadcs_systems.so            # the built cdylibs, one per artifact, copied in
+├── libadcs_systems.so.manifest   #   + the build driver's manifest sidecar, when present
+├── libadcs_sequences.so
+├── libadcs_sequences.so.manifest
+└── mission.py | mission.kdl      # optional verbatim provenance copy — NEVER consumed on load
 ```
 
-### 4.2 `mission.kdl` — the manifest
+### 4.2 `wiring.json` — the frozen IR
 
-The manifest **is the wiring KDL** (coordinator/artifact/system/connect/telemetry — the
-existing `parse` surface), so a bundle stays human-readable and re-parseable with no new
-format. It is the source mission's KDL, essentially **verbatim**, because the artifact
-references are already relocatable:
+The manifest is the serialized [`Wiring`](../src/ir.rs) IR (`serde_json`), the same
+self-describing JSON the `WiringManifest` telemetry carries and the IR contract pins — so the
+frozen file, the emitted manifest, and a CI re-evaluation are all byte-comparable. It is
+written **path-stripped** ([`Wiring::path_stripped`]): artifact `path`s point into a build
+tree, so they are re-derived on load, and stripping them keeps a bundle relocatable and
+byte-reproducible. Source anchors and the scope table are kept — they are the panel graph
+tile's deep-link data.
 
-- Each `artifact` node names its library by **stem** (`lib="adcs_plant"`), not by an absolute
-  path. The bundle places the compiled file (`lib<stem>.so`) **next to** the manifest, so the
-  reference resolves relative to the bundle directory — the relocatability is inherent, no
-  path rewriting needed.
-- `crate=` is retained for provenance but **unused at run** (the bundle never builds).
+`package` does not need a KDL serializer: it evaluates the source (KDL parse or Python
+subprocess) to a `Wiring` exactly as `build`/`run` do, then freezes that model. A Python
+mission thus packages identically to a KDL one — the whole point of the IR bundle.
 
-So `package` does not need a KDL *serializer*: it copies the source manifest (optionally
-normalized) and the built `.so`s. (If a future front-end produces a builder-origin `Wiring`
-with no source text, `package` would serialize the model back to this KDL surface — out of
-scope for v1, which packages from a KDL source.)
+### 4.3 `meta.json` — the sidecar
 
-### 4.3 `meta.kdl` — the sidecar
+A plain-serde [`BundleMeta`](../src/wiring/bundle.rs):
 
-Metadata that is *about* the bundle rather than the wiring:
-
-```kdl
-meta {
-    abi_version 4                 // FSW_ABI_VERSION the cdylibs were built against
-    profile "release"            // build profile
-    built_at_unix 1782000000     // epoch seconds — no date-formatting dep
+```json
+{
+  "abi_version": 6,
+  "ir_version": 1,
+  "target": "aarch64-apple-darwin",
+  "profile": "debug",
+  "built_at_unix": 1783899222,
+  "ir_sha256": "sha256:fdc9…",
+  "metor_config_version": "0.2.0"
 }
 ```
 
-`abi_version` is the **load-time guard**: `run` refuses a bundle whose `abi_version` differs
-from the host `FSW_ABI_VERSION` (4 today — see `src/abi/mod.rs`'s
-version-history comment) with a clear error, before opening any `.so`. **As shipped, `meta.kdl`
-carries only these three fields** (`abi_version`/`profile`/`built_at_unix`,
-`src/wiring/bundle.rs`'s `write_bundle`) — the per-system params-schema dump sketched in an
-earlier draft of this doc was **not implemented**; `run` still opens each `.so` and reads its
-live `params_schema()` at resolve, so offline (no-`.so`) schema validation stays future work
-(§8.6).
+`load_bundle` refuses a bundle before opening any `.so` on three guards: `abi_version` ≠ host
+`FSW_ABI_VERSION`, `ir_version` ≠ host `IR_VERSION`, or `target` ≠ the host triple (a clean
+`BundleError::TargetMismatch`, replacing today's opaque dlopen failure on an arch mismatch;
+skipped only when the host triple cannot be determined). `ir_sha256` hashes the exact
+`wiring.json` bytes (excluding the `built_at_unix` timestamp, which lives in `meta.json`) —
+the determinism backstop `--check-ir` and CI diff. `metor_config_version` is Python-mission
+provenance; `profile`/`built_at_unix` are informational.
 
-### 4.4 How `run` loads a bundle vs a source KDL
+### 4.4 How `run` loads a bundle vs a source
 
 ```
-load_wiring(args):
-  if target is a bundle dir:
-      meta = parse meta.kdl;  ensure meta.abi_version == FSW_ABI_VERSION
-      wiring = parse(read "<dir>/mission.kdl")
-      for artifact in wiring.artifacts:                      # the only framework addition `run` needs
-          artifact.path = Some(dir.join(cdylib_file_name(&artifact.cdylib)))
-      return wiring                                          # NO cargo
-  else (source .kdl):
+load_run_wiring(args):
+  if target is a bundle (dir, *.bundle, or *.metor):
+      wiring = load_bundle(target)              # NO cargo, NO Python, NO KDL parse
+      # load_bundle: read meta.json → check abi/ir/target → deserialize wiring.json →
+      #   fill each artifact.path from the copied .so → verify each recorded
+      #   manifest_hash against its copied sidecar (tamper check before dlopen)
+      return wiring
+  else (source .py/.kdl):
       require args.build (else error: pass --build, or package then run the bundle)
-      wiring = parse(read target)
-      build_artifacts(&mut wiring, &opts)                    # compile-if-stale + locate
+      wiring = load_source(target)              # KDL parse or Python subprocess eval
+      build_artifacts(&mut wiring, &opts)       # compile-if-stale + locate
       return wiring
 ```
 
 `resolve` already requires each `Artifact::path` to be `Some` (`ArtifactNotBuilt` otherwise)
-and then `DlPack::open`s it. The bundle path fills `path` from the directory instead of from
-cargo — the **single small framework touch** the bundle needs.
+and then `DlPack::open`s it. `load_bundle` fills `path` from the bundle instead of from cargo.
 
-### 4.5 Relation to the `Wiring` model & the framework change
+### 4.5 The determinism gate — `package --check-ir <bundle>`
 
-`Artifact { id, crate_name, cdylib, path }` is the unit. The bundle path-fill
-sets `path` from `dir + cdylib_file_name(cdylib)`. Two minimal framework additions:
+`package --check-ir <bundle>` re-evaluates the bundle's provenance source and diffs the
+produced IR against the frozen `wiring.json`, exiting non-zero on drift — the operational
+determinism enforcement (`design-python-config.md` §2). Both sides are normalized first:
+artifact `path`s stripped and `src` **file names** cleared (the provenance copy sits at a
+different path than the original source), keeping every anchor's line/column, so a genuine
+emission change is caught while a physical-path difference is not. A KDL provenance copy is
+self-contained; a Python one re-evaluates only where its `packs/` are importable (a caveat for
+Phase 4 to smooth).
 
-1. **`cdylib_file_name(stem) -> String`** in the wiring module — the platform decoration
-   (`lib{stem}.dylib` / `lib{stem}.so` / `{stem}.dll`), moved out of the example's
-   `cdylib_name`. `build_artifacts`, `package`, and the bundle path-fill all use it.
-2. A tiny **`locate_in_dir(&mut Wiring, dir)`** helper (or inline in `cmd_run`, since
-   `Artifact` fields are `pub`) that does the path-fill above.
+### 4.6 The single-file `.metor` archive
 
-The packaging side adds `write_bundle(&Wiring, src_kdl, &opts, dir)` (copy `.so`s + emit
-`meta.kdl` + place `mission.kdl`). These live in the `wiring` module (model-adjacent), keeping
-the `cli` handlers thin orchestrators. A future tar/zip step wraps the directory and is out of
-scope.
+`package -o mission.metor` (extension-dispatched) writes the directory layout into one
+**uncompressed tar** — tar over zip because it is streamable, order-stable for reproducible
+bytes, and a plain archive keeps the load path `mmap`-friendly after unpack (`.so`s do not
+compress usefully anyway). Entry order is stable — `meta.json`, `wiring.json`, then artifacts
+sorted by id (each `.so` then its `.manifest`), then the provenance copy — and tar timestamps
+are zeroed, so identical inputs (with a pinned `built_at_unix`) produce byte-identical
+archives. A dependency-free `ustar` writer/reader lives in `src/wiring/bundle.rs`; standard
+`tar` reads the output. `load_bundle` on a `.metor` unpacks it to a temp directory (dlopen
+needs real files) that outlives the call, then loads identically.
+
+### 4.7 Relation to the `Wiring` model & the framework change
+
+`Artifact { id, crate_name, cdylib, path, manifest_hash, src }` is the unit. `load_bundle`
+sets `path` from `dir + cdylib`. `package` freezes through `write_bundle(&Wiring,
+&PackageOptions, out)`, extension-dispatched between the directory and `.metor` forms, both
+drawing from one `bundle_members` ordering so the two forms carry identical content. The
+platform decoration `cdylib_file_name(stem)` (`lib{stem}.dylib` / `.so` / `{stem}.dll`) is
+shared by `build_artifacts`, `package`, and the bundle path-fill. These live in the `wiring`
+module (model-adjacent), keeping the `cli` handlers thin orchestrators.
 
 ### 4.6 Platform naming: `lib=` becomes a stem
 

@@ -458,6 +458,18 @@ fn load_bundle_dir(dir: &Path) -> Result<Wiring, BundleError> {
     Ok(wiring)
 }
 
+/// The frozen `wiring.json` file name, for consumers that read a bundle's IR
+/// directly (the `--check-ir` determinism gate).
+pub const WIRING_FILE_NAME: &str = WIRING_FILE;
+
+/// Unpack a `.metor` archive into a fresh temp directory, writing every member
+/// as a real file so a directory-shaped consumer can proceed unchanged.
+/// Exposed for the `--check-ir` gate, which reads a bundle's `wiring.json` and
+/// provenance copy off disk.
+pub fn unpack_metor(path: &Path) -> Result<tempfile::TempDir, BundleError> {
+    unpack_archive(path)
+}
+
 /// Unpack a `.metor` archive into a fresh temp directory, writing every member
 /// as a real file so the directory loader (and dlopen) can proceed unchanged.
 fn unpack_archive(path: &Path) -> Result<tempfile::TempDir, BundleError> {
