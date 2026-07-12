@@ -29,6 +29,8 @@ pub(crate) mod worker;
 pub use ctl::{CtlError, CtlHost, CtlWorker, StepOutcome, WorkerCmd, WorkerState};
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 pub use host::{ProcError, describe_via_worker};
+#[cfg(all(any(target_os = "linux", target_os = "macos"), feature = "kdl"))]
+pub(crate) use worker::worker_guard_installed;
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 pub use worker::{RunMode, WORKER_ENV, WorkerManifest, worker_entry};
 

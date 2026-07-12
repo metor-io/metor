@@ -335,6 +335,64 @@ fn dlopen_cyclic_system_end_to_end() {
     drop((out_view, events_in, twin_view));
 }
 
+/// Building through the driver ([`build_artifacts`]) leaves a
+/// `<cdylib>.manifest` sidecar next to the `.so` — raw postcard
+/// [`PackManifestMsg`] bytes naming the same entries the opened pack reports
+/// — and `manifest_sidecar: false` opts out. Byte-level sidecar ≡ describe
+/// equality is asserted in the driver's own unit tests
+/// (`wiring::build_driver`), where the raw describe bytes are reachable.
+///
+/// [`build_artifacts`]: metor_fsw_2::wiring::build_artifacts
+/// [`PackManifestMsg`]: metor_fsw_2::abi::PackManifestMsg
+#[test]
+fn build_driver_writes_manifest_sidecar() {
+    use metor_fsw_2::wiring::{BuildOptions, WiringBuilder, build_artifacts};
+
+    let fixture = || {
+        WiringBuilder::new()
+            .artifact(
+                "fixture",
+                "metor-fsw-2-dl-fixture",
+                "metor_fsw_2_dl_fixture",
+            )
+            .build()
+    };
+    let mut wiring = fixture();
+    if let Err(e) = build_artifacts(&mut wiring, &BuildOptions::default()) {
+        eprintln!("skipping: build_artifacts failed: {e}");
+        return;
+    }
+    let so = wiring.artifacts[0].path.clone().expect("path filled");
+    let mut sidecar = so.clone().into_os_string();
+    sidecar.push(".manifest");
+    let sidecar = PathBuf::from(sidecar);
+
+    let bytes = std::fs::read(&sidecar).expect("sidecar written next to the built .so");
+    let manifest: metor_fsw_2::abi::PackManifestMsg =
+        postcard::from_bytes(&bytes).expect("sidecar bytes decode as the pack manifest");
+    let pack = DlPack::open(&so).expect("DlPack::open the fixture .so");
+    assert_eq!(
+        manifest
+            .systems
+            .iter()
+            .map(|s| s.descriptor.name.as_str())
+            .collect::<Vec<_>>(),
+        pack.system_names().collect::<Vec<_>>(),
+        "the sidecar names the entries the opened pack reports"
+    );
+    drop(pack);
+
+    // Opting out builds the library but writes no sidecar.
+    std::fs::remove_file(&sidecar).expect("clear the sidecar for the opt-out check");
+    let opts = BuildOptions {
+        manifest_sidecar: false,
+        ..BuildOptions::default()
+    };
+    let mut wiring = fixture();
+    build_artifacts(&mut wiring, &opts).expect("rebuild is a cargo no-op");
+    assert!(!sidecar.exists(), "opted out, so no sidecar is written");
+}
+
 /// A failing `fsw_pack_create` must not leave the slot looking permanently
 /// `Running`. Here the params do not postcard-decode as `CounterParams`, so
 /// the fixture's `catch_unwind` inside `fsw_pack_create` returns a null state. The

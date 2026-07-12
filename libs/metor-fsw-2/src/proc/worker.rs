@@ -106,6 +106,19 @@ pub(crate) mod fail_code {
     pub const CREATE: u32 = 4;
 }
 
+/// Whether this binary's `main` called [`worker_entry`] — that is, whether it
+/// can safely be re-executed as a worker. Consulted by the build driver's
+/// manifest-sidecar step, which prefers a describe worker but must not
+/// re-execute an unguarded binary (a libtest harness would run its tests).
+static GUARD_INSTALLED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+/// Whether [`worker_entry`] has run in this process, making worker re-exec
+/// available.
+#[cfg(feature = "kdl")]
+pub(crate) fn worker_guard_installed() -> bool {
+    GUARD_INSTALLED.load(core::sync::atomic::Ordering::Relaxed)
+}
+
 /// Route a re-executed host binary into the worker. **Call this first in
 /// `main`** of any binary that runs process systems — the `metor-fsw` CLI
 /// does; an application embedding the framework must do so itself. When
@@ -113,6 +126,7 @@ pub(crate) mod fail_code {
 /// immediately; when set, the process *is* a worker: it runs to completion
 /// and exits, never returning to the caller's `main`.
 pub fn worker_entry() {
+    GUARD_INSTALLED.store(true, core::sync::atomic::Ordering::Relaxed);
     let Some(path) = std::env::var_os(WORKER_ENV) else {
         return;
     };
