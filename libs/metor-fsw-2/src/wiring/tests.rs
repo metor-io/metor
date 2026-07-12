@@ -2034,6 +2034,142 @@ system "trim2" type="Trim2"
     );
 }
 
+/// A `system_type` entry whose `#[system]`-authored params implement
+/// `Default`: the macro's probe declares the defaults blob automatically, so
+/// a `system` node with no params runs on pure defaults and one spelling
+/// overrides merges them over the default base (top-level keys).
+#[cfg(not(miri))]
+#[stellarator::test]
+async fn system_type_macro_defaults_overlay() {
+    #[derive(serde::Serialize, serde::Deserialize, postcard_schema::Schema)]
+    struct DefProbeParams {
+        slot: u32,
+        gain: f64,
+        bias: f64,
+    }
+
+    impl Default for DefProbeParams {
+        fn default() -> Self {
+            Self {
+                slot: 0,
+                gain: 10.0,
+                bias: 0.5,
+            }
+        }
+    }
+
+    static SUMS: [AtomicU64; 2] = [AtomicU64::new(0), AtomicU64::new(0)];
+
+    struct DefProbe {
+        slot: usize,
+        sum: f64,
+    }
+
+    #[crate::system]
+    impl DefProbe {
+        fn new(p: DefProbeParams) -> Self {
+            Self {
+                slot: p.slot as usize,
+                sum: p.gain + p.bias,
+            }
+        }
+
+        fn execute(&mut self, _now: Timestamp) {
+            SUMS[self.slot].store(self.sum.to_bits(), Relaxed);
+        }
+    }
+
+    let mut r = Registry::new();
+    r.register_pack(crate::Pack::new().system_type::<DefProbe, _>("DefProbe"));
+
+    // `a` spells nothing: pure defaults. `b` overrides `slot` and `gain`;
+    // the untouched `bias` still comes from the default base.
+    let kdl = r#"
+coordinator cycle_rate=1000.0
+system "a" type="DefProbe"
+system "b" type="DefProbe" slot=1 gain=2.0
+"#;
+    let mut coord = load(kdl, &r).expect("macro-declared defaults fill absent params");
+    coord.run_for(2).await;
+    assert_eq!(
+        f64::from_bits(SUMS[0].load(Relaxed)),
+        10.5,
+        "absent config = pure defaults"
+    );
+    assert_eq!(
+        f64::from_bits(SUMS[1].load(Relaxed)),
+        2.5,
+        "override + default"
+    );
+}
+
+/// `system_type_with_defaults`: the explicit defaults surface for a
+/// hand-written `BuildSystem`, whose params-`Default` the `#[system]` macro
+/// cannot see (`ExpParams` here implements no `Default` at all).
+#[cfg(not(miri))]
+#[stellarator::test]
+async fn system_type_with_defaults_fills_absent_params() {
+    #[derive(serde::Serialize, serde::Deserialize, postcard_schema::Schema)]
+    struct ExpParams {
+        gain: f64,
+        bias: f64,
+    }
+
+    static EXP_SUM: AtomicU64 = AtomicU64::new(0);
+
+    struct ExpProbe {
+        sum: f64,
+    }
+
+    impl System for ExpProbe {
+        type Input = NoIn;
+        type Output = Out<NoOut>;
+        const NAME: &'static str = "exp_probe";
+    }
+
+    impl CyclicSystem for ExpProbe {
+        fn execute(&mut self, _now: Timestamp, _in: &mut NoIn, _o: &mut Self::Output) {
+            EXP_SUM.store(self.sum.to_bits(), Relaxed);
+        }
+    }
+
+    impl BuildSystem for ExpProbe {
+        type Params = ExpParams;
+        fn new(p: ExpParams) -> Self {
+            Self {
+                sum: p.gain + p.bias,
+            }
+        }
+    }
+
+    let defaults = ExpParams {
+        gain: 4.0,
+        bias: 0.25,
+    };
+    let mut pack = crate::Pack::new().system_type_with_defaults::<ExpProbe, _>(
+        "Exp",
+        ExpParams {
+            gain: 4.0,
+            bias: 0.25,
+        },
+    );
+    assert_eq!(
+        pack.entry_mut("Exp").unwrap().params_default(),
+        Some(postcard::to_allocvec(&defaults).unwrap().as_slice()),
+        "the declared defaults land as canonical postcard bytes"
+    );
+
+    let mut r = Registry::new();
+    r.register_pack(pack);
+    let kdl = r#"
+coordinator cycle_rate=1000.0
+system "exp" type="Exp"
+"#;
+    let mut coord = load(kdl, &r).expect("declared defaults fill the absent params");
+    coord.run_for(2).await;
+    assert_eq!(f64::from_bits(EXP_SUM.load(Relaxed)), 4.25);
+}
+
 // ---------------------------------------------------------------------------
 // ParamSource::Value: the value-tree params surface. Static systems serde-
 // deserialize it (field defaults honored, unknown keys rejected); pack

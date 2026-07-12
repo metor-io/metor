@@ -207,6 +207,50 @@ pub trait BuildSystem: Sized {
     fn configure(&mut self, _ctx: &BuildCtx) -> Result<(), ConfigureError> {
         Ok(())
     }
+
+    /// Postcard bytes of this type's default params, or `None` when it
+    /// declares none. [`Pack::system_type`](crate::Pack::system_type)
+    /// consults this to declare entry defaults on the dl/pack params path,
+    /// where a config then need spell only its overrides.
+    ///
+    /// The `#[system]` macro overrides it when the concrete params type
+    /// implements `Default + Serialize` (via [`ParamsDefaultProbe`]); a
+    /// hand-written impl or a generic system keeps this `None` default and
+    /// declares defaults explicitly through
+    /// [`Pack::system_type_with_defaults`](crate::Pack::system_type_with_defaults).
+    /// The static registry decode path is unaffected either way: it
+    /// deserializes params with serde, where `#[serde(default)]` field
+    /// attributes already apply.
+    fn params_default_blob() -> Option<Vec<u8>> {
+        None
+    }
+}
+
+/// Autoref-specialization probe behind the `#[system]` macro's
+/// [`BuildSystem::params_default_blob`] override. The macro emits a method
+/// call on `&ParamsDefaultProbe::<P>` with the concrete params type spelled
+/// at the expansion site: when `P: Default + Serialize` the inherent impl
+/// below applies and wins, otherwise resolution falls back to the blanket
+/// [`NoParamsDefault`] method and yields `None`.
+#[doc(hidden)]
+pub struct ParamsDefaultProbe<P>(pub core::marker::PhantomData<P>);
+
+/// The probe's fallback arm; see [`ParamsDefaultProbe`].
+#[doc(hidden)]
+pub trait NoParamsDefault {
+    fn probe_params_default_blob(&self) -> Option<Vec<u8>> {
+        None
+    }
+}
+
+impl<P> NoParamsDefault for ParamsDefaultProbe<P> {}
+
+impl<P: Default + serde::Serialize> ParamsDefaultProbe<P> {
+    pub fn probe_params_default_blob(&self) -> Option<Vec<u8>> {
+        let blob = postcard::to_allocvec(&P::default())
+            .expect("params postcard-encode (Serialize is infallible)");
+        Some(blob)
+    }
 }
 
 /// The host state [`BuildSystem::configure`] resolves config references

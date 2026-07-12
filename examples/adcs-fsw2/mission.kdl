@@ -6,11 +6,13 @@ artifact "adcs" crate="adcs-systems"   lib="adcs_systems"
 artifact "seqs" crate="adcs-sequences" lib="adcs_sequences"
 
 // systems
-// The plant's disturbance/actuator environment is spelled out in full (the dlopen param
-// encoder fills the exported schema from this node — `#[serde(default)]` is a static-link
-// nicety only). Physically honest values for a ~3 kg spacecraft at 400 km: secular torques
-// ~1e-7 N·m, so wheel momentum builds over days — crank `m_res_b`/`init_wheel_h` to watch
-// desaturation work in seconds.
+// The plant's disturbance/actuator environment is spelled out in full: the dlopen param
+// encoder fills the exported schema from this node over entry-declared defaults, and the
+// fn-authored Plant declares none (`#[serde(default)]` only reaches the static-link decode
+// path; Ctrl's params carry a `Default`, so its gains below are optional overrides).
+// Physically honest values for a ~3 kg spacecraft at 400 km: secular torques ~1e-7 N·m, so
+// wheel momentum builds over days — crank `m_res_b`/`init_wheel_h` to watch desaturation
+// work in seconds.
 system "plant" type="Plant" artifact="adcs" init_angle=0.5 init_rate=0.15 meas_sigma=0.002 seed=42 disarmed=#false process=#true {
     rho 3e-12                   // atmospheric density (kg/m³, 400 km solar-mean)
     cd 2.2                      // drag coefficient
