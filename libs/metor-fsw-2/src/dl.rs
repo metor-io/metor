@@ -475,21 +475,21 @@ impl DlSystem {
         inputs: Vec<FswRing>,
         outputs: Vec<FswRing>,
         name: &'static str,
+        mount: crate::Mount,
     ) -> DlSlot {
         let (ptr, len) = if params.is_empty() {
             (core::ptr::null(), 0)
         } else {
             (params.as_ptr(), params.len())
         };
-        // The mount word: every entry currently binds its own declared ports
-        // (a sequence entry carries the occupant tail in its descriptor), so
-        // the wired mount is passed unconditionally. The slot-occupant mount
-        // starts mattering when the tail becomes mount-appended.
-        const MOUNT_WIRED: u32 = 0;
+        let mount_word = match mount {
+            crate::Mount::Wired => 0,
+            crate::Mount::SlotOccupant => 1,
+        };
         // SAFETY: `ptr`/`len` name a readable byte range (or null/0); the
         // export decodes them immediately, so they need not outlive the call.
         let state = unsafe {
-            (self.fns.create)(self.lib.pack_ptr(), self.index, MOUNT_WIRED, ptr, len)
+            (self.fns.create)(self.lib.pack_ptr(), self.index, mount_word, ptr, len)
         };
         // A null state means creation failed inside the shared object (bad
         // params, a non-reloadable entry re-created, or a panic; the ABI shim

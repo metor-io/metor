@@ -49,9 +49,8 @@ use std::time::Duration;
 use metor_proto::types::Timestamp;
 use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
 
-use crate::abi::RawBinder;
 use crate::dynamic::pack_str;
-use crate::{Frame, FrameList, Input, Out, Output, SystemDescriptor, SystemOutput};
+use crate::{Frame, FrameList, Output};
 
 #[cfg(test)]
 mod tests;
@@ -63,7 +62,7 @@ mod tests;
 /// functions or a [`Seq`] handle. It is `!Send`, which is fine because a poll
 /// is synchronous and single-threaded.
 #[derive(Default)]
-pub struct SeqClock {
+pub struct CycleClock {
     /// The cycle's coordinator time, refreshed before each poll.
     pub now: Cell<Timestamp>,
     /// Set once an abort frame arrives, and never cleared.
@@ -73,7 +72,10 @@ pub struct SeqClock {
     pub progress: RefCell<Vec<String>>,
 }
 
-impl SeqClock {
+/// The pre-unification name of [`CycleClock`], kept for callers.
+pub type SeqClock = CycleClock;
+
+impl CycleClock {
     /// Take the accumulated progress lines, leaving the buffer empty.
     pub fn drain_progress(&self) -> Vec<String> {
         core::mem::take(&mut *self.progress.borrow_mut())
@@ -82,14 +84,14 @@ impl SeqClock {
 
 thread_local! {
     /// The ambient clock, live only for the duration of a poll.
-    static SEQ_CLOCK: RefCell<Option<Rc<SeqClock>>> = const { RefCell::new(None) };
+    static SEQ_CLOCK: RefCell<Option<Rc<CycleClock>>> = const { RefCell::new(None) };
 }
 
 /// Run `f` with `clock` installed as the ambient sequence clock.
 ///
 /// The clock is cleared on the way out even if `f` panics (a drop guard), so
 /// a caught panic in one poll never leaves a stale clock behind for the next.
-pub fn with_clock<R>(clock: &Rc<SeqClock>, f: impl FnOnce() -> R) -> R {
+pub fn with_clock<R>(clock: &Rc<CycleClock>, f: impl FnOnce() -> R) -> R {
     struct Clear;
     impl Drop for Clear {
         fn drop(&mut self) {
@@ -102,7 +104,7 @@ pub fn with_clock<R>(clock: &Rc<SeqClock>, f: impl FnOnce() -> R) -> R {
 }
 
 /// The ambient clock of the current poll, or `None` outside one.
-pub fn current() -> Option<Rc<SeqClock>> {
+pub fn current() -> Option<Rc<CycleClock>> {
     SEQ_CLOCK.with(|c| c.borrow().clone())
 }
 /// How a sequence finished. The host only needs to know the future is done;
@@ -212,6 +214,46 @@ pub fn aborted() -> bool {
         .get()
 }
 
+/// Suspend until the next cycle's poll, resolving with that cycle's `now`.
+///
+/// The general-system suspension point: an async-fn system holds its state
+/// in locals and writes `let now = cycle().await;` at the top of its loop.
+/// Like [`Wait`] there is no waker machinery — the driver re-polls every
+/// cycle, and the future is ready once the ambient clock has advanced past
+/// the value it was armed at. Deterministic under a simulated clock.
+///
+/// `cycle()` does not observe cancellation; a cancellable loop checks
+/// [`aborted`] after each await and runs its own safing branch.
+#[must_use = "cycle() returns a future that does nothing unless .awaited"]
+pub fn cycle() -> NextCycle {
+    NextCycle {
+        armed_at: current()
+            .expect("cycle() called outside a system poll")
+            .now
+            .get(),
+    }
+}
+
+/// The future [`cycle`] returns; resolves at the first poll whose clock has
+/// advanced past the arming cycle.
+pub struct NextCycle {
+    armed_at: Timestamp,
+}
+
+impl Future for NextCycle {
+    type Output = Timestamp;
+
+    fn poll(self: Pin<&mut Self>, _cx: &mut core::task::Context<'_>) -> Poll<Timestamp> {
+        let clock = current().expect("NextCycle polled outside a system poll");
+        let now = clock.now.get();
+        if now > self.armed_at {
+            Poll::Ready(now)
+        } else {
+            Poll::Pending
+        }
+    }
+}
+
 /// An explicit handle over the sequence clock, for authors who prefer
 /// `seq.wait(..)` to the ambient free functions. During a poll its clock is
 /// the same one the free functions read, so the two styles are equivalent.
@@ -307,64 +349,15 @@ pub struct SlotControlIn {
     pub _pad: [u8; 7],
 }
 
-/// The implicit output bundle of every sequence, wrapped in [`Out`] so the
-/// [`SequenceStatus`] port comes with the standard health and log ports.
-#[derive(SystemOutput)]
-pub struct SeqStatusOut {
-    pub status: Output<SequenceStatus>,
-}
-
-// ---------------------------------------------------------------------------
-// The SeqSystem seam the generated occupant implements
-// ---------------------------------------------------------------------------
-
-/// Everything the driver needs to run one sequence, handed back by
-/// [`SeqSystem::build`]. The future owns the user ports; alongside it ride
-/// the wrapper-owned status/health/log tail and the cancel input the driver
-/// reads each cycle.
-///
-/// TODO: because the user's output ports live inside the future, their
-/// per-port dropped-publish counters are unreachable from here, so dropped
-/// publishes cannot be folded into `health.error("publish_dropped")` the way
-/// a cyclic system's are. Fixing this means minting a shared counter cell in
-/// the generated `build` and threading a clone into each user output before
-/// the ports move into the future. Deferred, since that indirection would tax
-/// every publish on every cyclic system for a sequence-only need.
-pub struct SeqBound {
-    pub future: Pin<Box<dyn Future<Output = Outcome>>>,
-    pub status: Out<SeqStatusOut>,
-    pub control: Input<SlotControlIn>,
-}
-
-/// The interface a generated sequence occupant implements, letting the ABI
-/// helpers describe, create, and poll any sequence without knowing its
-/// concrete type.
-///
-/// [`descriptor`](SeqSystem::descriptor) is the single source of truth for
-/// port order, ring sizing, and compatibility checks. Its inputs are the
-/// user's inputs followed by [`SlotControlIn`]; its outputs are the user's
-/// outputs followed by the [`SeqStatusOut`] tail (status, health, log).
-/// [`build`](SeqSystem::build) must bind those same ports in that same order.
-pub trait SeqSystem {
-    /// The params value decoded at create time, `()` for a paramless sequence.
-    type Params;
-
-    /// The signature-derived descriptor.
-    fn descriptor() -> SystemDescriptor;
-
-    /// Bind the ports off `binder` in `descriptor()` order, move the user
-    /// ports into the future, and hand back the [`SeqBound`].
-    fn build(params: Self::Params, binder: &mut RawBinder, clock: &Rc<SeqClock>) -> SeqBound;
-}
-
 // ---------------------------------------------------------------------------
 // The per-cycle status writer
 // ---------------------------------------------------------------------------
 
 /// Publish one [`SequenceStatus`] record with the given run state and
-/// progress lines. The caller drives `out.health().end_cycle` separately.
+/// progress lines. The occupant driver drives its health `end_cycle`
+/// separately.
 pub fn publish_status(
-    out: &mut Out<SeqStatusOut>,
+    out: &mut Output<SequenceStatus>,
     now: Timestamp,
     run_state: u8,
     lines: &[String],
@@ -375,7 +368,7 @@ pub fn publish_status(
         _pad: [0; 7],
         progress: FrameList::EMPTY,
     };
-    let _ = out.status.write_with(&frame, |fw| {
+    let _ = out.write_with(&frame, |fw| {
         fw.list(offset_of!(SequenceStatus, progress), |l| {
             for line in lines {
                 l.push(ProgressLine::new(line));

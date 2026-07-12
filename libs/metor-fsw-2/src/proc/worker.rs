@@ -265,7 +265,13 @@ fn run_system(
     let name: &'static str = Box::leak(instance.into_boxed_str());
     // SAFETY: every region named in `inputs`/`outputs` is held live by the
     // `RingBuffer`s above until after the slot is dropped below.
-    let mut slot = unsafe { dl.make_slot(params, inputs, outputs, name) };
+    // A sequence-mode worker drives a slot occupant, so the entry binds the
+    // occupant tail; a cyclic worker is an ordinary wired mount.
+    let mount = match mode {
+        RunMode::Cyclic => crate::Mount::Wired,
+        RunMode::Sequence => crate::Mount::SlotOccupant,
+    };
+    let mut slot = unsafe { dl.make_slot(params, inputs, outputs, name, mount) };
     if slot.state().is_stopped() {
         return fail(fail_code::CREATE, "fsw_create panicked in the artifact".into());
     }

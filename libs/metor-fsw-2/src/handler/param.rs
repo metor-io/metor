@@ -56,6 +56,9 @@ pub struct BindCx<'a, 'b, 'c> {
     pub(crate) params: Option<Box<dyn core::any::Any>>,
     /// The entry's cycle clock, for a task fn's `Seq` handle.
     pub(crate) clock: Option<std::rc::Rc<crate::sequence::SeqClock>>,
+    /// A shared dropped-publish cell every by-value output adopts before it
+    /// moves into the future, so the driver can fold drops into health.
+    pub(crate) drops: Option<std::sync::Arc<core::sync::atomic::AtomicU64>>,
 }
 
 /// The per-cycle context parameters draw non-port items from.

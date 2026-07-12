@@ -138,14 +138,11 @@ fn open_waiter(lib: &PathBuf) -> DlSystem {
     let desc = loaded.descriptor();
     assert_eq!(desc.name, "waiter");
     assert_eq!(desc.kind, SystemKind::Cyclic);
-    // The fixture declares no user ports, so only the implicit sequence shape
-    // remains.
-    assert_eq!(
-        desc.inputs.len(),
-        1,
-        "just the implicit SlotControlIn input"
-    );
-    assert_eq!(desc.outputs.len(), 3, "SequenceStatus + health + log tail");
+    // The fixture declares no user ports, and the occupant tail is a mount
+    // property (appended at Load), not descriptor content — so the entry
+    // carries only the implicit health/log outputs.
+    assert_eq!(desc.inputs.len(), 0, "no user inputs, no descriptor tail");
+    assert_eq!(desc.outputs.len(), 2, "just the health + log tail");
     loaded
 }
 
@@ -931,9 +928,10 @@ fn command_output_with_an_edge_drives_the_slot() {
 // The slot's registered descriptor
 // ---------------------------------------------------------------------------
 
-/// The slot registers an extended occupant descriptor: the occupant's ports
-/// come first (`SlotControlIn` re-marked Host in place), followed by the runner
-/// tail of a command fan-in, a `SequenceStatus` self-tap, and the `SlotStatus`
+/// The slot registers an extended occupant descriptor: the occupant's own
+/// ports come first with the mount-appended tail (`SlotControlIn` after its
+/// inputs, `SequenceStatus` after its outputs), followed by the runner tail
+/// of a command fan-in, a `SequenceStatus` self-tap, and the `SlotStatus`
 /// and events Host outputs.
 #[test]
 fn registered_descriptor_is_the_extended_occupant_shape() {
@@ -966,13 +964,15 @@ fn registered_descriptor_is_the_extended_occupant_shape() {
 
     let outs: Vec<(&str, PortConn)> = d.outputs.iter().map(|p| (p.name, p.conn)).collect();
     assert_eq!(outs.len(), 5, "{outs:?}");
+    // The occupant prefix is the entry's own outputs (health/log tail) with
+    // the mount-appended SequenceStatus after them.
+    assert_eq!(outs[0], ("health", PortConn::Edge), "{outs:?}");
+    assert_eq!(outs[1], ("log", PortConn::Edge), "{outs:?}");
     assert_eq!(
-        outs[0],
+        outs[2],
         ("sequence", PortConn::Edge),
-        "occupant prefix: {outs:?}"
+        "mount-appended status: {outs:?}"
     );
-    assert_eq!(outs[1], ("health", PortConn::Edge), "{outs:?}");
-    assert_eq!(outs[2], ("log", PortConn::Edge), "{outs:?}");
     assert_eq!(outs[3], ("slot_status", PortConn::Host), "{outs:?}");
     // The events channel keys "<slot>.sequences" and stays telemetered.
     assert_eq!(outs[4], ("sequences", PortConn::Host), "{outs:?}");
@@ -1170,4 +1170,113 @@ fn uplink_routes_by_declared_output_and_survives_garbage() {
     );
 
     drop((coord, health));
+}
+
+// ---------------------------------------------------------------------------
+// A plain cyclic entry as a slot occupant
+// ---------------------------------------------------------------------------
+
+/// The occupant tail is a mount property, so a slot loads an ordinary cyclic
+/// entry (the fixture's fn-style `beater`). Shared plumbing for the two
+/// cyclic-occupant tests (a stellarator run is once-per-thread, so the
+/// steady phase and the abort are separate tests).
+fn open_beater_in(lib: &PathBuf) -> DlSystem {
+    let loaded = DlPack::open(lib)
+        .expect("open the fixture pack")
+        .system("beater")
+        .expect("select the cyclic entry");
+    // A cyclic entry carries no occupant tail of its own.
+    assert_eq!(loaded.descriptor().inputs.len(), 0);
+    assert_eq!(loaded.descriptor().outputs.len(), 2, "health + log only");
+    loaded
+}
+
+fn build_beater_slot(loaded: DlSystem) -> Coordinator {
+    let mut b = Coordinator::builder(sim_config());
+    let slot = b.add_slot("adcs", vec![occ("beater", loaded)], None);
+    b.connect(
+        PortRef::msg::<SequenceCommand>(b.coordinator_handle()),
+        PortRef::msg::<SequenceCommand>(slot),
+    )
+    .expect("the coordinator command edge connects");
+    b.build().expect("a cyclic occupant builds")
+}
+
+fn beater_views(coord: &Coordinator) -> (Input<SequenceStatus>, Input<SlotStatus>) {
+    let seq: Input<SequenceStatus> = Input::new(
+        coord
+            .registry()
+            .view(ComponentId::new("adcs.sequence"))
+            .expect("the mount-appended SequenceStatus is registered")
+            .expect("reader slot available"),
+    );
+    let slot: Input<SlotStatus> = Input::new(
+        coord
+            .registry()
+            .view(ComponentId::new("adcs.slot_status"))
+            .expect("slot status is registered")
+            .expect("reader slot available"),
+    );
+    (seq, slot)
+}
+
+/// Loaded and started, a cyclic occupant runs steadily: run_state 0 every
+/// step, never terminal on its own.
+#[test]
+fn cyclic_occupant_runs_steadily() {
+    let Some(lib) = locate_fixture() else {
+        return;
+    };
+    let mut coord = build_beater_slot(open_beater_in(&lib));
+    let (mut seq_view, mut slot_view) = beater_views(&coord);
+    let mut control = coord.control_handle().expect("taken once per coordinator");
+    control.emit(&load("adcs", "beater")).unwrap();
+    control
+        .emit(&cmd("adcs", SequenceCommandKind::Start))
+        .unwrap();
+    let coord = stellarator::run(|| async move {
+        coord.run_for(5).await;
+        coord
+    });
+    let states = seq_run_states(&mut seq_view);
+    assert!(!states.is_empty(), "the occupant published status");
+    assert!(
+        states.iter().all(|s| *s == 0),
+        "a cyclic occupant never completes by itself: {states:?}"
+    );
+    let phases = slot_phases(&mut slot_view);
+    assert_eq!(phases.last(), Some(&RUNNING), "still running: {phases:?}");
+    drop((coord, seq_view, slot_view, control));
+}
+
+/// An Abort latches: the occupant wrapper stops stepping the inner driver
+/// and reports a terminal `Aborted`.
+#[test]
+fn cyclic_occupant_abort_is_terminal() {
+    let Some(lib) = locate_fixture() else {
+        return;
+    };
+    let mut coord = build_beater_slot(open_beater_in(&lib));
+    let (mut seq_view, mut slot_view) = beater_views(&coord);
+    let mut control = coord.control_handle().expect("taken once per coordinator");
+    control.emit(&load("adcs", "beater")).unwrap();
+    control
+        .emit(&cmd("adcs", SequenceCommandKind::Start))
+        .unwrap();
+    control
+        .emit(&cmd("adcs", SequenceCommandKind::Abort))
+        .unwrap();
+    let coord = stellarator::run(|| async move {
+        coord.run_for(3).await;
+        coord
+    });
+    let states = seq_run_states(&mut seq_view);
+    assert_eq!(
+        states.last(),
+        Some(&ABORTED),
+        "abort is a terminal Aborted for a cyclic occupant: {states:?}"
+    );
+    let phases = slot_phases(&mut slot_view);
+    assert_eq!(phases.last(), Some(&DONE), "terminal Done: {phases:?}");
+    drop((coord, seq_view, slot_view, control));
 }

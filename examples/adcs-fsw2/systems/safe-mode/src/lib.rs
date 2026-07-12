@@ -29,6 +29,6 @@ async fn safe(
 /// This crate's pack: the safing sequence as its sole entry, under the name the mission's
 /// slot `allow` line selects (`occupant="safe_mode"`).
 pub fn pack() -> metor_fsw_2::Pack {
-    metor_fsw_2::Pack::new().sequence("safe_mode", safe)
+    metor_fsw_2::Pack::new().task("safe_mode", safe)
 }
 metor_fsw_2::export_pack!(pack);
