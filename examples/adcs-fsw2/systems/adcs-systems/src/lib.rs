@@ -31,3 +31,19 @@ pub fn pack() -> Pack {
         .system_type::<CtrlSystem, _>("Ctrl")
 }
 metor_fsw_2::export_pack!(pack, feature = "export");
+
+#[cfg(test)]
+mod tests {
+    /// `Ctrl` is `#[system]`-authored with `CtrlParams: Default`, so the pack
+    /// declares its defaults blob and a mission node may spell only overrides
+    /// (mission.kdl still spells the gains in full, exercising the other
+    /// form). The fn-authored entries declare no defaults, which is why the
+    /// plant node spells its whole environment.
+    #[test]
+    fn ctrl_entry_declares_default_params() {
+        let mut pack = super::pack();
+        assert!(pack.entry_mut("Ctrl").unwrap().params_default().is_some());
+        assert!(pack.entry_mut("Plant").unwrap().params_default().is_none());
+        assert!(pack.entry_mut("Nav").unwrap().params_default().is_none());
+    }
+}
