@@ -10,9 +10,10 @@
 //! Since the shared objects are compiled code, a bundle is tied to the target
 //! architecture it was built for.
 //!
-//! The sidecar records the ABI version the bundle was built against, and
-//! [`load_bundle`] refuses any bundle whose version differs from this host's
-//! [`FSW_ABI_VERSION`]. It also records the build profile and a timestamp for
+//! The sidecar records the ABI version the bundle was built against and the
+//! wiring IR version of its manifest; [`load_bundle`] refuses any bundle
+//! whose versions differ from this host's [`FSW_ABI_VERSION`] and
+//! [`IR_VERSION`]. It also records the build profile and a timestamp for
 //! provenance; those are informational only.
 //!
 //! [`write_bundle`] produces a bundle from a built [`Wiring`] plus the source
@@ -28,7 +29,7 @@ use thiserror::Error;
 
 use crate::abi::FSW_ABI_VERSION;
 
-use super::model::Wiring;
+use super::model::{IR_VERSION, Wiring};
 use super::parse;
 
 /// File name of the metadata sidecar within a bundle.
@@ -81,6 +82,23 @@ pub enum BundleError {
         /// The bundle's recorded ABI version.
         found: u32,
         /// The host's [`FSW_ABI_VERSION`].
+        expected: u32,
+    },
+    /// The bundle's recorded wiring IR version does not match this host's
+    /// [`IR_VERSION`]. A bundle that records no version predates IR
+    /// versioning and is rejected the same way; bundles are rebuildable.
+    #[error(
+        "bundle {} wiring IR, but this host speaks v{expected} (rebuild the bundle)",
+        match found {
+            Some(v) => format!("was built against v{v}"),
+            None => "predates the versioned".to_string(),
+        }
+    )]
+    IrMismatch {
+        /// The bundle's recorded IR version, `None` for a pre-versioning
+        /// bundle.
+        found: Option<u32>,
+        /// The host's [`IR_VERSION`].
         expected: u32,
     },
     /// The bundle's `mission.kdl` failed to parse.
@@ -139,6 +157,7 @@ pub fn write_bundle(
     let meta = format!(
         "meta {{\n    \
          abi_version {FSW_ABI_VERSION}\n    \
+         ir_version {IR_VERSION}\n    \
          profile {profile:?}\n    \
          built_at_unix {built_at_unix}\n\
          }}\n"
@@ -164,6 +183,13 @@ pub fn load_bundle(dir: &Path) -> Result<Wiring, BundleError> {
             expected: FSW_ABI_VERSION,
         });
     }
+    let ir = meta_version(&meta_text, "ir_version")?;
+    if ir != Some(IR_VERSION) {
+        return Err(BundleError::IrMismatch {
+            found: ir,
+            expected: IR_VERSION,
+        });
+    }
 
     let mission_path = dir.join(MISSION_FILE);
     let mission_text = fs::read_to_string(&mission_path).map_err(io_at(&mission_path))?;
@@ -181,8 +207,17 @@ pub fn load_bundle(dir: &Path) -> Result<Wiring, BundleError> {
     Ok(wiring)
 }
 
-/// Pull `meta.abi_version` out of a bundle's `meta.kdl`.
+/// Pull `meta.abi_version` out of a bundle's `meta.kdl`. Required: every
+/// bundle has recorded it since bundles existed.
 fn meta_abi_version(text: &str) -> Result<u32, BundleError> {
+    meta_version(text, "abi_version")?.ok_or_else(|| BundleError::BadMeta {
+        reason: "missing `abi_version`".into(),
+    })
+}
+
+/// Pull the `meta.<field>` version integer out of a bundle's `meta.kdl`,
+/// `None` when the node is absent.
+fn meta_version(text: &str, field: &str) -> Result<Option<u32>, BundleError> {
     let doc = text
         .parse::<KdlDocument>()
         .map_err(|e| BundleError::BadMeta {
@@ -198,16 +233,18 @@ fn meta_abi_version(text: &str) -> Result<u32, BundleError> {
     let children = meta.children().ok_or_else(|| BundleError::BadMeta {
         reason: "`meta` node has no children".into(),
     })?;
-    let abi = children
-        .nodes()
+    let Some(node) = children.nodes().iter().find(|n| n.name().value() == field) else {
+        return Ok(None);
+    };
+    let value = node
+        .entries()
         .iter()
-        .find(|n| n.name().value() == "abi_version")
-        .and_then(|n| n.entries().iter().find(|e| e.name().is_none()))
+        .find(|e| e.name().is_none())
         .and_then(|e| e.value().as_integer())
         .ok_or_else(|| BundleError::BadMeta {
-            reason: "missing `abi_version`".into(),
+            reason: format!("missing `{field}`"),
         })?;
-    u32::try_from(abi).map_err(|_| BundleError::BadMeta {
-        reason: format!("`abi_version` {abi} out of range"),
+    u32::try_from(value).map(Some).map_err(|_| BundleError::BadMeta {
+        reason: format!("`{field}` {value} out of range"),
     })
 }

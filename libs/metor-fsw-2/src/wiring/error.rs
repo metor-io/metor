@@ -26,6 +26,16 @@ pub enum LoadError {
         span: SourceSpan,
     },
 
+    /// A [`Wiring`](super::Wiring) stamped with a different
+    /// [`IR_VERSION`](super::IR_VERSION) than this build's. Spanless: version
+    /// skew is producer/host drift, not a mistake in the document text.
+    #[error(
+        "wiring IR version mismatch: the wiring carries v{found}, this host speaks v{expected} \
+         (regenerate the wiring)"
+    )]
+    #[diagnostic(code(fsw_wiring::ir_version_mismatch))]
+    IrVersionMismatch { found: u32, expected: u32 },
+
     #[error("missing the single `coordinator` node")]
     #[diagnostic(code(fsw_wiring::missing_coordinator))]
     MissingCoordinator,

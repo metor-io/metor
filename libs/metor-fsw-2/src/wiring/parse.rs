@@ -19,7 +19,7 @@ use std::collections::HashSet;
 use kdl::{KdlDocument, KdlNode};
 
 use super::model::{
-    AllowedOccupantSpec, Artifact, ClockSpec, CoordinatorSpec, EdgeKind, EdgeSpec,
+    AllowedOccupantSpec, Artifact, ClockSpec, CoordinatorSpec, EdgeKind, EdgeSpec, IR_VERSION,
     InitialOccupantSpec, SlotInitState, SlotSpec, SystemSpec, TCP_DOWNLINK_TYPE, TCP_UPLINK_TYPE,
     Wiring,
 };
@@ -97,6 +97,7 @@ pub fn parse(kdl: &str) -> Result<Wiring, LoadError> {
     let coordinator = coordinator.ok_or(LoadError::MissingCoordinator)?;
 
     Ok(Wiring {
+        ir_version: IR_VERSION,
         coordinator,
         artifacts,
         systems,

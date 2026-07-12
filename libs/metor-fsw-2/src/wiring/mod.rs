@@ -82,7 +82,7 @@ pub use bundle::{BundleError, PackageOptions, load_bundle, write_bundle};
 pub use error::LoadError;
 pub use kdl_params::{encode_kdl_params, encode_kdl_params_with_defaults};
 pub use model::{
-    AllowedOccupantSpec, Artifact, ClockSpec, CoordinatorSpec, EdgeKind, EdgeSpec,
+    AllowedOccupantSpec, Artifact, ClockSpec, CoordinatorSpec, EdgeKind, EdgeSpec, IR_VERSION,
     InitialOccupantSpec, ParamSource, SlotInitState, SlotSpec, SystemSpec, TCP_DOWNLINK_TYPE,
     TCP_UPLINK_TYPE, Wiring,
 };
@@ -401,6 +401,12 @@ pub fn load(kdl: &str, registry: &Registry) -> Result<Coordinator, LoadError> {
 /// resolve-time [`LoadError`]s hold a best-effort snippet rather than original
 /// document spans. The error variants are the same either way.
 pub fn resolve(wiring: &Wiring, registry: &Registry) -> Result<Coordinator, LoadError> {
+    if wiring.ir_version != IR_VERSION {
+        return Err(LoadError::IrVersionMismatch {
+            found: wiring.ir_version,
+            expected: IR_VERSION,
+        });
+    }
     let config = coordinator_config(&wiring.coordinator);
     let mut builder = Coordinator::builder(config);
 
