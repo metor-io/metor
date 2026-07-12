@@ -114,6 +114,9 @@ pub struct PackEntry {
     pub(crate) name: &'static str,
     pub(crate) descriptor: SystemDescriptor,
     pub(crate) params_schema: &'static NamedType,
+    /// Canonical postcard bytes of the entry's declared default params, the
+    /// base the KDL encoder overlays config onto. `None` until declared.
+    pub(crate) params_default: Option<Vec<u8>>,
     /// `false` for an entry whose state was moved in with `.state(...)`: it
     /// can be instantiated once, and never as a slot occupant.
     pub(crate) reloadable: bool,
@@ -131,6 +134,10 @@ impl PackEntry {
 
     pub fn params_schema(&self) -> &'static NamedType {
         self.params_schema
+    }
+
+    pub fn params_default(&self) -> Option<&[u8]> {
+        self.params_default.as_deref()
     }
 
     pub fn reloadable(&self) -> bool {
@@ -208,6 +215,7 @@ impl Pack {
             name,
             descriptor,
             params_schema: <T::Params as postcard_schema::Schema>::SCHEMA,
+            params_default: None,
             reloadable: true,
             create,
         });
@@ -264,6 +272,72 @@ impl Pack {
             name,
             descriptor,
             params_schema,
+            params_default: None,
+            reloadable: true,
+            create,
+        });
+        self
+    }
+
+    /// Register a sequence under `name`: an async-fn system carrying the
+    /// slot-occupant contract — the implicit
+    /// [`SlotControlIn`](crate::SlotControlIn) cancel input after the user
+    /// inputs and the [`SequenceStatus`](crate::sequence::SequenceStatus) +
+    /// health/log tail after the user outputs — so it can occupy a runtime
+    /// slot. The body is the same async-fn shape [`task`](Self::task) takes;
+    /// only the implicit ports differ.
+    pub fn sequence<M, F>(mut self, name: &'static str, f: F) -> Self
+    where
+        M: 'static,
+        F: crate::handler::AsyncSystemFn<M> + Clone,
+    {
+        use crate::handler::{DeclSink, TaskParamsSpec};
+        use crate::sequence::{SeqStatusOut, SlotControlIn};
+
+        let mut sink = DeclSink::default();
+        F::decls(&mut sink);
+        let spec = sink.task_params.take().unwrap_or_else(TaskParamsSpec::unit);
+        let params_schema = spec.schema;
+        let (mut inputs, _) = crate::descriptor::split_decls(std::mem::take(&mut sink.inputs));
+        let (mut outputs, _) = crate::descriptor::split_decls(std::mem::take(&mut sink.outputs));
+        inputs.push(crate::Input::<SlotControlIn>::descriptor());
+        let (tail, _) = crate::descriptor::split_decls(
+            <crate::Out<SeqStatusOut> as crate::SystemOutput>::decls(),
+        );
+        outputs.extend(tail);
+        let descriptor = SystemDescriptor {
+            name,
+            kind: crate::SystemKind::Cyclic,
+            inputs,
+            outputs,
+            capabilities: Vec::new(),
+        };
+
+        let create: CreateFn = Box::new(move |params: EntryParams<'_>| {
+            let params_any = (spec.decode)(params)?;
+            let f = f.clone();
+            let pending: Pending = Box::new(move |src, _mount| {
+                let clock = std::rc::Rc::new(crate::sequence::SeqClock::default());
+                let mut cx = crate::handler::BindCx {
+                    src,
+                    params: Some(params_any),
+                    clock: Some(clock.clone()),
+                };
+                let future = f.build(&mut cx);
+                // The occupant tail binds after the user ports, in the same
+                // order the descriptor declares: control input, then the
+                // status/health/log outputs.
+                let control = crate::Input::<SlotControlIn>::bind(cx.src);
+                let status = <crate::Out<SeqStatusOut> as crate::BindPorts>::bind(cx.src);
+                Box::new(crate::handler::SeqDriver::new(future, clock, control, status))
+            });
+            Ok(pending)
+        });
+        self.entries.push(PackEntry {
+            name,
+            descriptor,
+            params_schema,
+            params_default: None,
             reloadable: true,
             create,
         });
@@ -274,6 +348,11 @@ impl Pack {
     /// [`add_pack_entry`](crate::CoordinatorBuilder::add_pack_entry) use.
     pub fn entry_mut(&mut self, name: &str) -> Option<&mut PackEntry> {
         self.entries.iter_mut().find(|e| e.name == name)
+    }
+
+    /// The entry at manifest position `index`, the ABI's addressing.
+    pub(crate) fn entry_at_mut(&mut self, index: usize) -> Option<&mut PackEntry> {
+        self.entries.get_mut(index)
     }
 
     pub fn entries(&self) -> impl Iterator<Item = &PackEntry> {

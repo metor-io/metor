@@ -1,4 +1,4 @@
-//! A fixture crate holding one `#[sequence]`, built as a `cdylib` so a host
+//! A fixture crate holding one sequence body, built as a `cdylib` so a host
 //! test can `dlopen` the shared object and drive the sequence through a slot's
 //! lifecycle commands (load, start, stop, reset, abort).
 //!
@@ -8,11 +8,16 @@
 //! aborts it before the deadline, the wait returns early and the sequence
 //! reports `Aborted`. One sequence therefore covers both the run-to-completion
 //! and the cooperative-cancel paths.
+//!
+//! The pack registers the same body twice, as `waiter` and as `napper`, so a
+//! slot can allow two occupants with distinct Load names and identical
+//! contracts out of one artifact — the occupant-swap shape the process-slot
+//! tests drive.
 
 use core::time::Duration;
 
-use metor_fsw_2::Outcome;
 use metor_fsw_2::sequence::{progress, wait};
+use metor_fsw_2::{Outcome, Pack};
 
 /// Load-time canary for the process-slot isolation tests: when
 /// `SEQ_FIXTURE_CANARY` names a file, mapping this object appends the loading
@@ -45,7 +50,6 @@ static CANARY: extern "C" fn() = canary;
 static CANARY: extern "C" fn() = canary;
 
 /// Waits two simulated microseconds, completing unless aborted first.
-#[metor_fsw_2::sequence]
 async fn waiter() -> Outcome {
     progress("waiting");
     if wait(Duration::from_micros(2)).await.aborted() {
@@ -55,3 +59,12 @@ async fn waiter() -> Outcome {
     progress("done");
     Outcome::Completed
 }
+
+/// The crate's pack, referenced by `export_pack!` below.
+pub fn pack() -> Pack {
+    Pack::new()
+        .sequence("waiter", waiter)
+        .sequence("napper", waiter)
+}
+
+metor_fsw_2::export_pack!(pack);

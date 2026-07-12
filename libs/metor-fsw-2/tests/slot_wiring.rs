@@ -37,7 +37,7 @@ fn slot_kdl() -> String {
     format!(
         r#"
 coordinator cycle_rate=1000.0 sim_dt=0.000002
-artifact "waiter" crate="{FIXTURE_CRATE}" lib="{FIXTURE_STEM}" type="waiter"
+artifact "waiter" crate="{FIXTURE_CRATE}" lib="{FIXTURE_STEM}"
 slot "adcs" {{
     allow occupant="waiter"
     initial occupant="waiter" state="running"
@@ -118,7 +118,7 @@ fn alarms_node_before_a_slot_still_builds_and_raises() {
     let kdl = format!(
         r#"
 coordinator cycle_rate=1000.0 sim_dt=0.000002
-artifact "waiter" crate="{FIXTURE_CRATE}" lib="{FIXTURE_STEM}" type="waiter"
+artifact "waiter" crate="{FIXTURE_CRATE}" lib="{FIXTURE_STEM}"
 system "alarms" type="Alarms" {{
     alarm id="SLOT_DONE" name="Slot Done" {{
         target component="adcs.slot_status.phase"
@@ -168,7 +168,7 @@ fn slot_declared_contract_mismatch_is_a_clean_error() {
     let kdl = format!(
         r#"
 coordinator cycle_rate=1000.0 sim_dt=0.000002
-artifact "waiter" crate="{FIXTURE_CRATE}" lib="{FIXTURE_STEM}" type="waiter"
+artifact "waiter" crate="{FIXTURE_CRATE}" lib="{FIXTURE_STEM}"
 slot "adcs" {{
     input frame="nonsense"
     allow occupant="waiter"
@@ -216,7 +216,7 @@ fn unknown_runtime_load_is_rejected_with_a_failed_event() {
     let kdl = format!(
         r#"
 coordinator cycle_rate=1000.0 sim_dt=0.000002
-artifact "waiter" crate="{FIXTURE_CRATE}" lib="{FIXTURE_STEM}" type="waiter"
+artifact "waiter" crate="{FIXTURE_CRATE}" lib="{FIXTURE_STEM}"
 slot "adcs" {{
     allow occupant="waiter"
 }}
@@ -309,7 +309,7 @@ fn param_slot_kdl(allow_line: &str) -> String {
     format!(
         r#"
 coordinator cycle_rate=1000.0 sim_dt=0.000002
-artifact "gainer" crate="{PARAM_FIXTURE_CRATE}" lib="{PARAM_FIXTURE_STEM}" type="gainer"
+artifact "gainer" crate="{PARAM_FIXTURE_CRATE}" lib="{PARAM_FIXTURE_STEM}"
 slot "gslot" {{
     output frame="gain_out"
     {allow_line}
@@ -327,7 +327,7 @@ slot "gslot" {{
 #[test]
 fn slot_allow_params_resolve_and_run_b1() {
     use metor_fsw_2::wiring::encode_kdl_params;
-    use metor_fsw_2::{DlSystem, ParamSource, SlotInitState, WiringBuilder};
+    use metor_fsw_2::{DlPack, ParamSource, SlotInitState, WiringBuilder};
 
     let line_form = param_slot_kdl(r#"allow occupant="gainer" gain=0.8"#);
     let child_form = param_slot_kdl(r#"allow occupant="gainer" { gain 0.8 }"#);
@@ -358,7 +358,7 @@ fn slot_allow_params_resolve_and_run_b1() {
             1000.0,
             metor_fsw_2::ClockSpec::Simulated { dt_secs: 0.000002 },
         )
-        .artifact("gainer", PARAM_FIXTURE_CRATE, PARAM_FIXTURE_STEM, "gainer")
+        .artifact("gainer", PARAM_FIXTURE_CRATE, PARAM_FIXTURE_STEM)
         .slot("gslot")
         .output("gain_out")
         .allow_with_params("gainer", GainerParams { gain: 0.8 })
@@ -369,7 +369,10 @@ fn slot_allow_params_resolve_and_run_b1() {
         ParamSource::Postcard(b) => b.clone(),
         other => panic!("expected Postcard params from the builder, got {other:?}"),
     };
-    let dl = DlSystem::open(&so_path).expect("open the fixture .so for its Params schema");
+    let dl = DlPack::open(&so_path)
+        .expect("open the fixture .so for its Params schema")
+        .system("gainer")
+        .expect("select the gainer entry");
     let encode = |text: &str| {
         encode_kdl_params(text, dl.params_schema(), "gslot", &["occupant"], 0)
             .expect("schema-encode the allow params")

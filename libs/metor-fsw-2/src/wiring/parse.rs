@@ -139,9 +139,9 @@ pub fn cdylib_file_name(stem: &str) -> String {
     }
 }
 
-/// Parse an `artifact "id" crate="..." lib="..." type="..."` node into an
-/// [`Artifact`]. `lib=` is the bare library stem; the platform file name comes
-/// from [`cdylib_file_name`].
+/// Parse an `artifact "id" crate="..." lib="..."` node into an [`Artifact`].
+/// `lib=` is the bare library stem; the platform file name comes from
+/// [`cdylib_file_name`].
 fn parse_artifact(node: &KdlNode, src: &str) -> Result<Artifact, LoadError> {
     let missing = |property: &'static str| LoadError::MissingArtifactField {
         property,
@@ -151,12 +151,19 @@ fn parse_artifact(node: &KdlNode, src: &str) -> Result<Artifact, LoadError> {
     let id = first_arg_string(node).ok_or_else(|| missing("id"))?;
     let crate_name = prop_string(node, "crate").ok_or_else(|| missing("crate"))?;
     let stem = prop_string(node, "lib").ok_or_else(|| missing("lib"))?;
-    let system_type = prop_string(node, "type").ok_or_else(|| missing("type"))?;
+    // The pre-pack surface named the artifact's single exported type here;
+    // packs export many, so the system node picks the entry instead.
+    if prop_string(node, "type").is_some() {
+        return Err(LoadError::ArtifactType {
+            artifact: id.to_string(),
+            src: src.to_string(),
+            span: node.span(),
+        });
+    }
     Ok(Artifact {
         id: id.to_string(),
         crate_name: crate_name.to_string(),
         cdylib: cdylib_file_name(stem),
-        system_type: system_type.to_string(),
         path: None,
     })
 }
@@ -318,6 +325,7 @@ fn parse_slot(
                     };
                     allow.push(AllowedOccupantSpec {
                         occupant: occupant.to_string(),
+                        artifact: prop_string(child, "artifact").map(str::to_string),
                         params,
                     });
                 }

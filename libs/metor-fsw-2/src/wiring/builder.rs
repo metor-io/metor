@@ -9,7 +9,7 @@
 //! # #[derive(serde::Serialize)] struct PlantParams { init_angle: f64 }
 //! let wiring = WiringBuilder::new()
 //!     .coordinator(120.0, ClockSpec::Simulated { dt_secs: 1.0 / 120.0 })
-//!     .artifact("plant", "adcs-plant", "adcs_plant", "Plant")
+//!     .artifact("plant", "adcs-plant", "adcs_plant")
 //!     .system("plant").ty("Plant").from_artifact("plant")
 //!         .params(PlantParams { init_angle: 0.5 }).end()
 //!     .system("nav").ty("Nav").from_static().end()
@@ -85,26 +85,25 @@ impl WiringBuilder {
         self
     }
 
-    /// Declares a loadable [`Artifact`], one system type per cdylib.
+    /// Declares a loadable [`Artifact`], one pack (any number of system
+    /// types) per cdylib.
     ///
     /// `lib_stem` is the bare library stem (`adcs_plant`), decorated into the
     /// platform's file name (`libadcs_plant.dylib`, `libadcs_plant.so`, or
     /// `adcs_plant.dll`) via [`cdylib_file_name`](super::cdylib_file_name).
-    /// `system_type` names the system type the library exports. The
-    /// artifact's `path` starts out unset; the build driver
+    /// A `system` spec's `ty` selects the pack entry. The artifact's `path`
+    /// starts out unset; the build driver
     /// ([`build_artifacts`](super::build_artifacts)) fills it in.
     pub fn artifact(
         mut self,
         id: impl Into<String>,
         crate_name: impl Into<String>,
         lib_stem: impl AsRef<str>,
-        system_type: impl Into<String>,
     ) -> Self {
         self.artifacts.push(Artifact {
             id: id.into(),
             crate_name: crate_name.into(),
             cdylib: super::cdylib_file_name(lib_stem.as_ref()),
-            system_type: system_type.into(),
             path: None,
         });
         self
@@ -250,12 +249,29 @@ pub struct SlotSpecBuilder {
 }
 
 impl SlotSpecBuilder {
-    /// Allows the named occupant to load into this slot, with no default
-    /// params. Use [`allow_with_params`](Self::allow_with_params) to attach
-    /// typed defaults.
+    /// Allows the named pack entry to load into this slot, with no default
+    /// params; resolve searches every artifact for a unique entry of that
+    /// name. Use [`allow_from`](Self::allow_from) to name the artifact and
+    /// [`allow_with_params`](Self::allow_with_params) to attach typed
+    /// defaults.
     pub fn allow(mut self, occupant: impl Into<String>) -> Self {
         self.spec.allow.push(AllowedOccupantSpec {
             occupant: occupant.into(),
+            artifact: None,
+            params: ParamSource::None,
+        });
+        self
+    }
+
+    /// Allows the named pack entry from a specific artifact.
+    pub fn allow_from(
+        mut self,
+        occupant: impl Into<String>,
+        artifact: impl Into<String>,
+    ) -> Self {
+        self.spec.allow.push(AllowedOccupantSpec {
+            occupant: occupant.into(),
+            artifact: Some(artifact.into()),
             params: ParamSource::None,
         });
         self
@@ -272,6 +288,7 @@ impl SlotSpecBuilder {
             .expect("params postcard-encode (Serialize is infallible)");
         self.spec.allow.push(AllowedOccupantSpec {
             occupant: occupant.into(),
+            artifact: None,
             params: ParamSource::Postcard(bytes),
         });
         self

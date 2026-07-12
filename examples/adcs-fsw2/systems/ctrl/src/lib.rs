@@ -13,7 +13,8 @@
 //! Before any `ModeCmd` arrives it holds the identity reference.
 //!
 //! Authored with `#[system]` (`docs/design-system-macro.md`): the port set is the `execute`
-//! signature, and the bundles/trait impls/`BuildSystem`/`fsw_*` exports are all generated.
+//! signature, and the bundles/trait impls/`BuildSystem` are all generated; the `fsw_pack_*`
+//! C-ABI surface is the [`export_pack!`](metor_fsw_2::export_pack) at the bottom.
 
 use adcs_contracts::{
     AttitudeEstimate, CtrlParams, Gps, MTQ_MAX_DIPOLE, ModeCmd, MtqCmd, RW_TORQUE_MAX, Sensors,
@@ -30,7 +31,7 @@ pub struct CtrlSystem {
     k_detumble: f64,
 }
 
-#[system(name = "ctrl", export = "export")]
+#[system(name = "ctrl")]
 impl CtrlSystem {
     pub fn new(p: CtrlParams) -> Self {
         let q = tensor![p.q_weight, p.q_weight, p.q_weight];
@@ -122,3 +123,10 @@ impl CtrlSystem {
         mtq.publish(&MtqCmd { timestamp: now, dipole_b });
     }
 }
+
+/// This crate's pack: the controller as its sole entry, under the name the mission's
+/// `system` nodes select (`type="Ctrl"`).
+pub fn pack() -> metor_fsw_2::Pack {
+    metor_fsw_2::Pack::new().system_type::<CtrlSystem, _>("Ctrl")
+}
+metor_fsw_2::export_pack!(pack, feature = "export");

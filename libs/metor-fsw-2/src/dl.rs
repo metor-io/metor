@@ -1,15 +1,17 @@
-//! Loading and driving a system compiled as a shared object.
+//! Loading and driving pack shared objects.
 //!
-//! [`DlSystem::open`] loads a system `cdylib`, checks its ABI version word,
-//! resolves the `fsw_*` exports named by the [`abi`](crate::abi) constants, and
-//! asks `fsw_describe` for a [`SystemDescriptor`]. From there the builder
-//! treats the system like any statically linked one; wiring, validation, and
-//! ring sizing all run against the descriptor. At `build()` the coordinator
-//! binds a [`DlSlot`] in place of a typed [`CyclicRunner`](crate::CyclicRunner).
-//! The slot forwards `init`, `step`, and `shutdown` across the C ABI, handing
-//! the shared object its per-port ring regions as raw [`FswRing`] handles.
-//! Timestamps cross the ABI as the raw `Timestamp` tick, in whatever unit the
-//! coordinator's clock produces.
+//! [`DlPack::open`] loads a pack `cdylib`, checks its ABI version word,
+//! resolves the `fsw_pack_*` exports named by the [`abi`](crate::abi)
+//! constants, opens the pack (`fsw_pack_open`, which runs the crate's
+//! `pack()` once), and decodes its manifest into per-entry
+//! [`SystemDescriptor`]s. [`DlPack::system`] selects one entry as a
+//! [`DlSystem`], and from there the builder treats it like any statically
+//! linked system; wiring, validation, and ring sizing all run against the
+//! descriptor. At `build()` the coordinator binds a [`DlSlot`] in place of a
+//! typed runner. The slot forwards `init`, `step`, and `shutdown` across the
+//! C ABI, handing the shared object its per-port ring regions as raw
+//! [`FswRing`] handles. Timestamps cross the ABI as the raw `Timestamp` tick,
+//! in whatever unit the coordinator's clock produces.
 //!
 //! Everything stays in one process. The shared object attaches to the host's
 //! ring regions in place, so it reads and writes the same atomics the host's
@@ -18,22 +20,24 @@
 //! ## The trust boundary
 //!
 //! The shared object is foreign code the host does not control, so nothing it
-//! returns is trusted as a Rust value. `fsw_execute` returns a raw `u32`
+//! returns is trusted as a Rust value. `fsw_pack_execute` returns a raw `u32`
 //! rather than an [`FswStatus`], because materializing a `repr(u32)` enum from
 //! an out-of-range discriminant is immediate undefined behavior. Every call
 //! site converts through [`FswStatus::from_raw`], which folds unknown words to
-//! `Panicked`. Likewise a descriptor that fails to decode, or that declares
-//! capabilities the host cannot grant across the ABI, is a clean [`DlError`]
-//! at load time rather than a panic later.
+//! `Panicked`. Likewise a manifest that fails to decode, or an entry that
+//! declares capabilities the host cannot grant across the ABI, is a clean
+//! [`DlError`] at load time rather than a panic later.
 //!
 //! ## Teardown ordering
 //!
-//! A [`DlSlot`] owns an `Arc<Library>` and the opaque `*mut state` returned by
-//! `fsw_create`. Its [`Drop`] calls `fsw_destroy` before the `Library` can
-//! unload, because the `Arc` field drops after the `Drop` body runs, and
-//! before the host frees the ring regions, because the coordinator drops its
-//! slots before its ring table. So no non-owning ring attach outlives its
-//! region, and no shared object code runs after the object is unloaded.
+//! A [`DlSlot`] owns an `Rc<PackLib>` and the opaque `*mut state` returned by
+//! `fsw_pack_create`. Its [`Drop`] calls `fsw_pack_destroy` before the
+//! `PackLib` can drop, because the `Rc` field drops after the `Drop` body
+//! runs. `PackLib`'s own field order then closes the pack (`fsw_pack_close`)
+//! before the `Library` unloads. And the coordinator drops its slots before
+//! its ring table, so no non-owning ring attach outlives its region and no
+//! shared-object code runs after the object is unloaded:
+//! destroy states → pack_close → dlclose → rings free.
 //!
 //! A slot whose system panics is destroyed immediately rather than at
 //! teardown. A stopped system's live input views would otherwise keep holding
@@ -42,13 +46,15 @@
 use core::ffi::c_void;
 use std::ffi::OsStr;
 use std::slice;
-use std::sync::Arc;
+use std::rc::Rc;
 
 use libloading::{Library, Symbol};
 use metor_proto::types::Timestamp;
 use postcard_schema::schema::owned::OwnedNamedType;
 
-use crate::abi::{self, ByteSink, FSW_ABI_VERSION, FswRing, FswStatus, SystemDescriptorMsg};
+use crate::abi::{
+    self, ByteSink, FSW_ABI_VERSION, FswRing, FswStatus, PackManifestMsg, SystemDescriptorMsg,
+};
 use crate::coordinator::{CyclicSlot, SlotState, StopReason};
 use crate::descriptor::SystemDescriptor;
 
@@ -57,20 +63,34 @@ use crate::descriptor::SystemDescriptor;
 // ---------------------------------------------------------------------------
 
 type AbiVersionFn = unsafe extern "C" fn() -> u32;
-type DescribeFn = unsafe extern "C" fn(ByteSink, *mut c_void) -> i32;
-type CreateFn = unsafe extern "C" fn(*const u8, usize) -> *mut c_void;
+type PackOpenFn = unsafe extern "C" fn() -> *mut c_void;
+type PackDescribeFn = unsafe extern "C" fn(*mut c_void, ByteSink, *mut c_void) -> i32;
+type PackCreateFn = unsafe extern "C" fn(*mut c_void, u32, u32, *const u8, usize) -> *mut c_void;
 type BindInitFn = unsafe extern "C" fn(*mut c_void, *const FswRing, usize, *const FswRing, usize);
 // Returns the raw status word, not `FswStatus`; see the trust boundary note in
 // the module docs.
 type ExecuteFn = unsafe extern "C" fn(*mut c_void, u64) -> u32;
 type ShutdownFn = unsafe extern "C" fn(*mut c_void);
 type DestroyFn = unsafe extern "C" fn(*mut c_void);
+type PackCloseFn = unsafe extern "C" fn(*mut c_void);
+
+/// The per-instance lifecycle pointers, resolved once per load and shared by
+/// every [`DlSystem`]/[`DlSlot`] over the pack. Bare fn pointers, valid as
+/// long as the owning [`PackLib`] stays loaded.
+#[derive(Clone, Copy)]
+struct PackFns {
+    create: PackCreateFn,
+    bind_init: BindInitFn,
+    execute: ExecuteFn,
+    shutdown: ShutdownFn,
+    destroy: DestroyFn,
+}
 
 // ---------------------------------------------------------------------------
 // Errors
 // ---------------------------------------------------------------------------
 
-/// A failure loading or describing a system shared object. A bad artifact is
+/// A failure loading or describing a pack shared object. A bad artifact is
 /// always a clean error, never a crash of the host.
 #[derive(Debug, thiserror::Error)]
 pub enum DlError {
@@ -88,63 +108,81 @@ pub enum DlError {
     /// shared object was built against a different ABI and must be rebuilt.
     #[error("ABI version mismatch: .so reports {found}, host expects {expected}")]
     VersionMismatch { found: u32, expected: u32 },
-    /// `fsw_describe` returned a non-zero (failure) code.
-    #[error("fsw_describe failed with code {0}")]
+    /// `fsw_pack_open` returned null: the crate's `pack()` fn panicked.
+    #[error("fsw_pack_open failed (the pack() fn panicked)")]
+    PackOpen,
+    /// `fsw_pack_describe` returned a non-zero (failure) code.
+    #[error("fsw_pack_describe failed with code {0}")]
     Describe(i32),
-    /// The postcard-encoded [`SystemDescriptorMsg`] could not be decoded.
-    #[error("failed to decode the system descriptor: {0}")]
+    /// The postcard-encoded [`PackManifestMsg`] could not be decoded.
+    #[error("failed to decode the pack manifest: {0}")]
     Decode(#[source] postcard::Error),
-    /// The descriptor declares [`Capability`](crate::Capability)s. Capabilities
+    /// An entry declares [`Capability`](crate::Capability)s. Capabilities
     /// are granted by the host registry, which cannot cross the ABI, so a
     /// shared object declaring any is rejected at load.
     #[error(
         "shared object declares host-only capabilities {0:?}; a dlopen'd system cannot hold them"
     )]
     UnsupportedCapabilities(Vec<crate::Capability>),
+    /// The pack exports no entry under the requested name.
+    #[error("pack has no system `{name}` (exports: {})", available.join(", "))]
+    UnknownPackSystem {
+        name: String,
+        available: Vec<String>,
+    },
 }
 
 // ---------------------------------------------------------------------------
-// DlSystem, the loaded handle
+// PackLib, the opened pack + its library
 // ---------------------------------------------------------------------------
 
-/// A handle to a system shared object loaded into the host process, holding
-/// the [`Library`], the resolved lifecycle function pointers, and the
-/// [`SystemDescriptor`] the builder wires against.
-///
-/// The `Library` lives in an `Arc` shared with every [`DlSlot`] built from
-/// this handle, so the shared object stays loaded as long as any slot exists.
-/// Construct with [`DlSystem::open`], register with
-/// [`CoordinatorBuilder::add_dl_cyclic`](crate::CoordinatorBuilder::add_dl_cyclic).
-pub struct DlSystem {
-    lib: Arc<Library>,
-    descriptor: SystemDescriptor,
-    /// The exported `Params` schema, kept so the host can schema-encode KDL
-    /// params without ever linking the `Params` type.
-    params_schema: OwnedNamedType,
-    create: CreateFn,
-    bind_init: BindInitFn,
-    execute: ExecuteFn,
-    shutdown: ShutdownFn,
-    destroy: DestroyFn,
+/// Closes the pack (`fsw_pack_close`) on drop. Null-safe so a stub or a
+/// failed open drops cleanly.
+struct PackGuard {
+    ptr: *mut c_void,
+    close: Option<PackCloseFn>,
 }
 
-/// Rejects a descriptor that declares any [`Capability`](crate::Capability).
-/// Capabilities are resolved against the host registry, which cannot cross the
-/// ABI, so the load fails cleanly instead of panicking at bind time.
-fn reject_capabilities(msg: SystemDescriptorMsg) -> Result<SystemDescriptorMsg, DlError> {
-    if msg.capabilities.is_empty() {
-        Ok(msg)
-    } else {
-        Err(DlError::UnsupportedCapabilities(msg.capabilities))
+impl Drop for PackGuard {
+    fn drop(&mut self) {
+        if let Some(close) = self.close
+            && !self.ptr.is_null()
+        {
+            // SAFETY: `ptr` came from this library's `fsw_pack_open`, every
+            // instance state was destroyed by the slots dropped before this
+            // `Rc` reached zero, and the `Library` field outlives this guard
+            // (field order in `PackLib`).
+            unsafe { close(self.ptr) };
+            self.ptr = core::ptr::null_mut();
+        }
     }
 }
 
-/// The [`ByteSink`] handed to `fsw_describe`; appends the callee's bytes to
-/// the `Vec<u8>` passed as `ctx`. The shared object keeps ownership of its
+/// The loaded library and its opened pack, shared (`Rc`) by every
+/// [`DlSystem`] and [`DlSlot`] over it. Field order is drop order: the pack
+/// closes before the library unloads.
+pub(crate) struct PackLib {
+    pack: PackGuard,
+    #[allow(dead_code)]
+    lib: Library,
+}
+
+impl PackLib {
+    fn pack_ptr(&self) -> *mut c_void {
+        self.pack.ptr
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Open + describe
+// ---------------------------------------------------------------------------
+
+/// The [`ByteSink`] handed to `fsw_pack_describe`; appends the callee's bytes
+/// to the `Vec<u8>` passed as `ctx`. The shared object keeps ownership of its
 /// buffer and the host only copies, so no allocation crosses the boundary.
 extern "C" fn collect_sink(ctx: *mut c_void, buf: *const u8, len: usize) {
     // SAFETY: `open` passes `&mut Vec<u8>` as `ctx`; `buf`/`len` is the
-    // descriptor buffer the shared object owns for the duration of this call.
+    // manifest buffer the shared object owns for the duration of this call.
     let out = unsafe { &mut *(ctx as *mut Vec<u8>) };
     let bytes = unsafe { slice::from_raw_parts(buf, len) };
     out.extend_from_slice(bytes);
@@ -169,11 +207,11 @@ unsafe fn resolve<'lib, T>(
     })
 }
 
-/// Load the object at `path`, check its ABI word, and collect the raw
-/// postcard [`SystemDescriptorMsg`] bytes from `fsw_describe`. The shared
-/// front of [`DlSystem::open`] and [`describe_raw`].
-fn open_and_describe(path: &OsStr) -> Result<(Library, Vec<u8>), DlError> {
-    // SAFETY: `dlopen` runs the object's initializers; a system `cdylib`
+/// Load the object at `path`, check its ABI word, open its pack, and collect
+/// the raw postcard [`PackManifestMsg`] bytes from `fsw_pack_describe`. The
+/// shared front of [`DlPack::open`] and [`describe_raw`].
+fn open_and_describe(path: &OsStr) -> Result<(PackLib, Vec<u8>), DlError> {
+    // SAFETY: `dlopen` runs the object's initializers; a pack `cdylib`
     // has none beyond Rust's, and the path is caller-chosen. There is no
     // safer form.
     let lib = unsafe { Library::new(path) }.map_err(DlError::Open)?;
@@ -193,78 +231,213 @@ fn open_and_describe(path: &OsStr) -> Result<(Library, Vec<u8>), DlError> {
         });
     }
 
-    // SAFETY: the export is `fsw_describe(sink, ctx) -> i32`.
-    let describe: Symbol<DescribeFn> = unsafe { resolve(&lib, abi::SYM_DESCRIBE, "fsw_describe")? };
+    // --- Open the pack (runs the crate's pack() once) -------------------
+    // Resolve close first so a successful open can always be undone.
+    let close = *unsafe { resolve::<PackCloseFn>(&lib, abi::SYM_PACK_CLOSE, "fsw_pack_close")? };
+    let open = *unsafe { resolve::<PackOpenFn>(&lib, abi::SYM_PACK_OPEN, "fsw_pack_open")? };
+    // SAFETY: the export constructs the pack inside the `.so`.
+    let pack_ptr = unsafe { open() };
+    let pack_lib = PackLib {
+        pack: PackGuard {
+            ptr: pack_ptr,
+            close: Some(close),
+        },
+        lib,
+    };
+    if pack_ptr.is_null() {
+        return Err(DlError::PackOpen);
+    }
+
+    // --- Describe --------------------------------------------------------
+    // SAFETY: the export is `fsw_pack_describe(pack, sink, ctx) -> i32`.
+    let describe: Symbol<PackDescribeFn> = unsafe {
+        resolve(&pack_lib.lib, abi::SYM_PACK_DESCRIBE, "fsw_pack_describe")?
+    };
     let mut buf: Vec<u8> = Vec::new();
-    // SAFETY: `collect_sink` and `&mut buf` form a matching callback
-    // pair; the shared object calls the sink with a buffer it owns for
-    // the duration of the call.
-    let rc = unsafe { describe(collect_sink, &mut buf as *mut Vec<u8> as *mut c_void) };
+    // SAFETY: `collect_sink` and `&mut buf` form a matching callback pair;
+    // the shared object calls the sink with a buffer it owns for the call.
+    let rc = unsafe { describe(pack_lib.pack_ptr(), collect_sink, &mut buf as *mut Vec<u8> as *mut c_void) };
     if rc != 0 {
         return Err(DlError::Describe(rc));
     }
-    Ok((lib, buf))
+    Ok((pack_lib, buf))
 }
 
-/// The raw describe bytes alone, for the worker's describe mode: the object
+/// The raw manifest bytes alone, for the worker's describe mode: the object
 /// is loaded, ABI-checked, described, and unloaded *in this process*, and the
 /// host decodes the bytes without ever loading the object itself
 /// (`docs/process-systems.md` §5).
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 pub(crate) fn describe_raw(path: impl AsRef<OsStr>) -> Result<Vec<u8>, DlError> {
+    // Dropping the PackLib closes the pack and unloads the library.
     open_and_describe(path.as_ref()).map(|(_lib, buf)| buf)
 }
 
-/// Decode a describe payload into the host-side [`SystemDescriptor`] plus
-/// the exported `Params` schema — the shared tail of [`DlSystem::open`] and
-/// the process path's describe-worker decode, host-capability rejection
-/// included.
-pub(crate) fn decode_descriptor_msg(
-    bytes: &[u8],
-) -> Result<(SystemDescriptor, OwnedNamedType), DlError> {
-    let msg: SystemDescriptorMsg = postcard::from_bytes(bytes).map_err(DlError::Decode)?;
-    let msg = reject_capabilities(msg)?;
-    let params_schema = msg.params_schema.clone();
-    Ok((msg.into_descriptor(), params_schema))
+/// One decoded manifest entry: the reconstructed descriptor plus the entry
+/// facts the loader and wiring consume.
+pub(crate) struct PackEntryMeta {
+    pub(crate) descriptor: SystemDescriptor,
+    pub(crate) params_schema: OwnedNamedType,
+    pub(crate) reloadable: bool,
+    #[allow(dead_code)] // consumed when KDL default-overlay lands
+    pub(crate) params_default: Option<Vec<u8>>,
 }
 
-impl DlSystem {
-    /// Opens the artifact at `path`, resolves every `fsw_*` symbol, checks the
-    /// ABI version word, and describes it into a [`SystemDescriptor`].
+/// Decode a manifest payload into per-entry host-side descriptors — the
+/// shared tail of [`DlPack::open`] and the process path's describe-worker
+/// decode, host-capability rejection included.
+pub(crate) fn decode_pack_manifest(bytes: &[u8]) -> Result<Vec<PackEntryMeta>, DlError> {
+    let msg: PackManifestMsg = postcard::from_bytes(bytes).map_err(DlError::Decode)?;
+    msg.systems
+        .into_iter()
+        .map(|sys| {
+            let PackManifestEntry {
+                descriptor,
+                params_schema,
+            } = reject_capabilities(sys.descriptor)?;
+            Ok(PackEntryMeta {
+                descriptor,
+                params_schema,
+                reloadable: sys.reloadable,
+                params_default: sys.params_default,
+            })
+        })
+        .collect()
+}
+
+struct PackManifestEntry {
+    descriptor: SystemDescriptor,
+    params_schema: OwnedNamedType,
+}
+
+/// Rejects a descriptor that declares any [`Capability`](crate::Capability).
+/// Capabilities are resolved against the host registry, which cannot cross the
+/// ABI, so the load fails cleanly instead of panicking at bind time.
+fn reject_capabilities(msg: SystemDescriptorMsg) -> Result<PackManifestEntry, DlError> {
+    if !msg.capabilities.is_empty() {
+        return Err(DlError::UnsupportedCapabilities(msg.capabilities));
+    }
+    let params_schema = msg.params_schema.clone();
+    Ok(PackManifestEntry {
+        descriptor: msg.into_descriptor(),
+        params_schema,
+    })
+}
+
+// ---------------------------------------------------------------------------
+// DlPack + DlSystem, the loaded handles
+// ---------------------------------------------------------------------------
+
+/// A loaded pack: the shared [`PackLib`], the decoded per-entry metadata, and
+/// the resolved lifecycle pointers. [`system`](Self::system) selects one
+/// entry as a [`DlSystem`], the unit the builder registers.
+pub struct DlPack {
+    lib: Rc<PackLib>,
+    entries: Vec<PackEntryMeta>,
+    fns: PackFns,
+}
+
+impl DlPack {
+    /// Opens the artifact at `path`, checks the ABI version word, opens the
+    /// pack, resolves every `fsw_pack_*` symbol, and decodes the manifest.
     ///
     /// Any failure is a [`DlError`]; a missing or incompatible artifact never
     /// crashes the host.
     pub fn open(path: impl AsRef<OsStr>) -> Result<Self, DlError> {
-        let (lib, buf) = open_and_describe(path.as_ref())?;
+        let (pack_lib, buf) = open_and_describe(path.as_ref())?;
+        let entries = decode_pack_manifest(&buf)?;
 
-        // --- Decode and reconstruct the descriptor --------------------------
-        // The `Params` schema rides along so the host can schema-encode KDL
-        // params later.
-        let (descriptor, params_schema) = decode_descriptor_msg(&buf)?;
-
-        // --- Resolve the lifecycle surface. Each `Symbol` is dereferenced to
-        // a bare fn pointer, valid as long as the `Arc<Library>` below stays
-        // loaded. ------------------------------------------------------------
+        // --- Resolve the per-instance lifecycle surface. Each `Symbol` is
+        // dereferenced to a bare fn pointer, valid as long as the
+        // `Rc<PackLib>` below stays loaded. -----------------------------
+        let lib = &pack_lib.lib;
         // SAFETY: each export matches its generated signature.
-        let create = *unsafe { resolve::<CreateFn>(&lib, abi::SYM_CREATE, "fsw_create")? };
-        let bind_init =
-            *unsafe { resolve::<BindInitFn>(&lib, abi::SYM_BIND_INIT, "fsw_bind_init")? };
-        let execute = *unsafe { resolve::<ExecuteFn>(&lib, abi::SYM_EXECUTE, "fsw_execute")? };
-        let shutdown = *unsafe { resolve::<ShutdownFn>(&lib, abi::SYM_SHUTDOWN, "fsw_shutdown")? };
-        let destroy = *unsafe { resolve::<DestroyFn>(&lib, abi::SYM_DESTROY, "fsw_destroy")? };
+        let create =
+            *unsafe { resolve::<PackCreateFn>(lib, abi::SYM_PACK_CREATE, "fsw_pack_create")? };
+        let bind_init = *unsafe {
+            resolve::<BindInitFn>(lib, abi::SYM_PACK_BIND_INIT, "fsw_pack_bind_init")?
+        };
+        let execute =
+            *unsafe { resolve::<ExecuteFn>(lib, abi::SYM_PACK_EXECUTE, "fsw_pack_execute")? };
+        let shutdown =
+            *unsafe { resolve::<ShutdownFn>(lib, abi::SYM_PACK_SHUTDOWN, "fsw_pack_shutdown")? };
+        let destroy =
+            *unsafe { resolve::<DestroyFn>(lib, abi::SYM_PACK_DESTROY, "fsw_pack_destroy")? };
 
         Ok(Self {
-            lib: Arc::new(lib),
-            descriptor,
-            params_schema,
-            create,
-            bind_init,
-            execute,
-            shutdown,
-            destroy,
+            lib: Rc::new(pack_lib),
+            entries,
+            fns: PackFns {
+                create,
+                bind_init,
+                execute,
+                shutdown,
+                destroy,
+            },
         })
     }
 
+    /// The exported entry names, in manifest order.
+    pub fn system_names(&self) -> impl Iterator<Item = &str> {
+        self.entries.iter().map(|e| e.descriptor.name)
+    }
+
+    /// Whether the pack exports exactly one entry, in which case a `system`
+    /// node may omit `type=`.
+    pub fn sole_system(&self) -> Option<&str> {
+        match self.entries.as_slice() {
+            [only] => Some(only.descriptor.name),
+            _ => None,
+        }
+    }
+
+    /// Select the entry named `name` as a registrable [`DlSystem`]. Cheap;
+    /// the pack stays open (shared `Rc`) as long as any selection or slot
+    /// lives.
+    pub fn system(&self, name: &str) -> Result<DlSystem, DlError> {
+        let index = self
+            .entries
+            .iter()
+            .position(|e| e.descriptor.name == name)
+            .ok_or_else(|| DlError::UnknownPackSystem {
+                name: name.to_string(),
+                available: self
+                    .entries
+                    .iter()
+                    .map(|e| e.descriptor.name.to_string())
+                    .collect(),
+            })?;
+        let meta = &self.entries[index];
+        Ok(DlSystem {
+            lib: self.lib.clone(),
+            fns: self.fns,
+            index: index as u32,
+            descriptor: meta.descriptor.clone(),
+            params_schema: meta.params_schema.clone(),
+            reloadable: meta.reloadable,
+        })
+    }
+}
+
+/// One selected pack entry, loaded and ready to register: the unit
+/// [`CoordinatorBuilder::add_dl_cyclic`](crate::CoordinatorBuilder::add_dl_cyclic)
+/// and a slot's allowed-occupant list consume.
+///
+/// The [`PackLib`] lives in an `Rc` shared with every [`DlSlot`] built from
+/// this handle, so the shared object stays loaded (and the pack open) as long
+/// as any of them exists.
+pub struct DlSystem {
+    lib: Rc<PackLib>,
+    fns: PackFns,
+    index: u32,
+    descriptor: SystemDescriptor,
+    /// The exported `Params` schema, kept so the host can schema-encode KDL
+    /// params without ever linking the `Params` type.
+    params_schema: OwnedNamedType,
+    reloadable: bool,
+}
+
+impl DlSystem {
     /// The self-description the builder validates wiring against. Its ports'
     /// `announce` closures already prefix the vtable ids carried across the
     /// ABI.
@@ -279,17 +452,23 @@ impl DlSystem {
         &self.params_schema
     }
 
+    /// Whether the entry can be instantiated more than once. A `.state(...)`
+    /// entry cannot, and so can never be a slot occupant.
+    pub fn reloadable(&self) -> bool {
+        self.reloadable
+    }
+
     /// Builds a fresh [`DlSlot`] without consuming the handle. Each call runs
-    /// `fsw_create` for a new opaque state and clones the `Arc<Library>`, so
-    /// one loaded object can produce any number of slots, one per load or
-    /// reset.
+    /// `fsw_pack_create` for a new opaque state and clones the
+    /// `Rc<PackLib>`, so one loaded entry can produce any number of slots,
+    /// one per load or reset.
     ///
     /// # Safety
     /// Every region named by an `FswRing` in `inputs`/`outputs` must satisfy
     /// [`RingBuffer::attach_raw`](metor_fsw_ring::RingBuffer::attach_raw)'s
     /// contract, and must stay live until the slot's `Drop` has called
-    /// `fsw_destroy`. The coordinator guarantees this by keeping the owning
-    /// ring table alive past the slot.
+    /// `fsw_pack_destroy`. The coordinator guarantees this by keeping the
+    /// owning ring table alive past the slot.
     pub(crate) unsafe fn make_slot(
         &self,
         params: &[u8],
@@ -302,14 +481,22 @@ impl DlSystem {
         } else {
             (params.as_ptr(), params.len())
         };
+        // The mount word: every entry currently binds its own declared ports
+        // (a sequence entry carries the occupant tail in its descriptor), so
+        // the wired mount is passed unconditionally. The slot-occupant mount
+        // starts mattering when the tail becomes mount-appended.
+        const MOUNT_WIRED: u32 = 0;
         // SAFETY: `ptr`/`len` name a readable byte range (or null/0); the
         // export decodes them immediately, so they need not outlive the call.
-        let state = unsafe { (self.create)(ptr, len) };
-        // A null state means creation panicked inside the shared object (the
-        // ABI shim catches the unwind and returns null). Latch the failure
-        // now: `step` early-returns on a null state without touching
-        // `slot_state`, so a slot that started `Running` would never report a
-        // stop and the coordinator would poll a zombie forever.
+        let state = unsafe {
+            (self.fns.create)(self.lib.pack_ptr(), self.index, MOUNT_WIRED, ptr, len)
+        };
+        // A null state means creation failed inside the shared object (bad
+        // params, a non-reloadable entry re-created, or a panic; the ABI shim
+        // catches the unwind and returns null). Latch the failure now: `step`
+        // early-returns on a null state without touching `slot_state`, so a
+        // slot that started `Running` would never report a stop and the
+        // coordinator would poll a zombie forever.
         let slot_state = if state.is_null() {
             SlotState::Stopped {
                 reason: StopReason::Panicked,
@@ -319,10 +506,10 @@ impl DlSystem {
         };
         DlSlot {
             lib: self.lib.clone(),
-            bind_init: self.bind_init,
-            execute: self.execute,
-            shutdown: self.shutdown,
-            destroy: self.destroy,
+            bind_init: self.fns.bind_init,
+            execute: self.fns.execute,
+            shutdown: self.fns.shutdown,
+            destroy: self.fns.destroy,
             state,
             inputs,
             outputs,
@@ -336,24 +523,24 @@ impl DlSystem {
 // DlSlot, a dlopen'd system behind the CyclicSlot interface
 // ---------------------------------------------------------------------------
 
-/// A running instance of a loaded shared object, driven by the coordinator
+/// A running instance of a loaded pack entry, driven by the coordinator
 /// through the same `Box<dyn CyclicSlot>` interface as a statically linked
-/// [`CyclicRunner`](crate::CyclicRunner). `init` hands the shared object its
-/// per-port [`FswRing`] arrays, `step` calls `fsw_execute` and folds the
-/// returned [`FswStatus`] into the tracked [`SlotState`], and `Drop` calls
-/// `fsw_destroy` (see the module teardown note). Built by
-/// [`DlSystem::make_slot`].
+/// runner. `init` hands the shared object its per-port [`FswRing`] arrays,
+/// `step` calls `fsw_pack_execute` and folds the returned [`FswStatus`] into
+/// the tracked [`SlotState`], and `Drop` calls `fsw_pack_destroy` (see the
+/// module teardown note). Built by [`DlSystem::make_slot`].
 pub(crate) struct DlSlot {
-    /// Keeps the shared object loaded for the slot's whole life; drops after
-    /// the `Drop` body has run `fsw_destroy`.
+    /// Keeps the shared object loaded (and its pack open) for the slot's
+    /// whole life; drops after the `Drop` body has run `fsw_pack_destroy`.
     #[allow(dead_code)]
-    lib: Arc<Library>,
+    lib: Rc<PackLib>,
     bind_init: BindInitFn,
     execute: ExecuteFn,
     shutdown: ShutdownFn,
     destroy: DestroyFn,
-    /// The opaque state from `fsw_create`, owned by the shared object and
-    /// dropped by `fsw_destroy`. Nulled after destroy so `Drop` is idempotent.
+    /// The opaque state from `fsw_pack_create`, owned by the shared object
+    /// and dropped by `fsw_pack_destroy`. Nulled after destroy so `Drop` is
+    /// idempotent.
     state: *mut c_void,
     /// Input ring handles in descriptor order, viewing the upstream producers'
     /// output rings.
@@ -379,7 +566,7 @@ impl DlSlot {
         if self.state.is_null() {
             return FswStatus::Panicked;
         }
-        // SAFETY: `state` is the live, bound `fsw_create` pointer.
+        // SAFETY: `state` is the live, bound `fsw_pack_create` pointer.
         let raw = unsafe { (self.execute)(self.state, now.0 as u64) };
         // Untrusted word from foreign code; see the module trust boundary note.
         FswStatus::from_raw(raw)
@@ -435,8 +622,8 @@ impl CyclicSlot for DlSlot {
         if self.state.is_null() {
             return;
         }
-        // SAFETY: `state` is the live `fsw_create` pointer; the handle arrays
-        // name live regions the coordinator keeps alive past this slot.
+        // SAFETY: `state` is the live `fsw_pack_create` pointer; the handle
+        // arrays name live regions the coordinator keeps alive past this slot.
         unsafe {
             (self.bind_init)(
                 self.state,
@@ -452,7 +639,7 @@ impl CyclicSlot for DlSlot {
         if self.slot_state.is_stopped() || self.state.is_null() {
             return;
         }
-        // SAFETY: `state` is the live, bound `fsw_create` pointer.
+        // SAFETY: `state` is the live, bound `fsw_pack_create` pointer.
         let raw = unsafe { (self.execute)(self.state, now.0 as u64) };
         // Untrusted word from foreign code; see the module trust boundary note.
         let status = FswStatus::from_raw(raw);
@@ -482,7 +669,7 @@ impl CyclicSlot for DlSlot {
         if self.state.is_null() {
             return;
         }
-        // SAFETY: `state` is the live `fsw_create` pointer.
+        // SAFETY: `state` is the live `fsw_pack_create` pointer.
         unsafe { (self.shutdown)(self.state) };
     }
 
@@ -498,8 +685,9 @@ impl CyclicSlot for DlSlot {
 impl Drop for DlSlot {
     fn drop(&mut self) {
         if !self.state.is_null() {
-            // SAFETY: `state` is the live `fsw_create` pointer, handed to
-            // `fsw_destroy` exactly once; nulled so a double-drop is a no-op.
+            // SAFETY: `state` is the live `fsw_pack_create` pointer, handed to
+            // `fsw_pack_destroy` exactly once; nulled so a double-drop is a
+            // no-op.
             unsafe { (self.destroy)(self.state) };
             self.state = core::ptr::null_mut();
         }
@@ -511,8 +699,8 @@ mod tests {
     use super::*;
 
     /// A `DlSlot` over stub exports, no artifact involved: `lib` is a handle
-    /// to this very process and `state` a dangling non-null the stubs never
-    /// dereference.
+    /// to this very process (with no pack to close) and `state` a dangling
+    /// non-null the stubs never dereference.
     #[cfg(all(any(target_os = "linux", target_os = "macos"), not(miri)))]
     fn stub_slot(execute: ExecuteFn, destroy: DestroyFn) -> DlSlot {
         unsafe extern "C" fn bind(
@@ -525,7 +713,13 @@ mod tests {
         }
         unsafe extern "C" fn nop(_: *mut c_void) {}
         DlSlot {
-            lib: Arc::new(libloading::os::unix::Library::this().into()),
+            lib: Rc::new(PackLib {
+                pack: PackGuard {
+                    ptr: core::ptr::null_mut(),
+                    close: None,
+                },
+                lib: libloading::os::unix::Library::this().into(),
+            }),
             bind_init: bind,
             execute,
             shutdown: nop,
@@ -581,7 +775,7 @@ mod tests {
         assert_eq!(DESTROYS.load(Relaxed), 1, "destroyed at the panic, not at Drop");
     }
 
-    /// A descriptor declaring a host capability is a clean load rejection,
+    /// An entry declaring a host capability is a clean load rejection,
     /// never a bind-time panic; an empty list (every real export) passes.
     #[test]
     fn load_rejects_declared_capabilities() {
@@ -596,6 +790,7 @@ mod tests {
 
         assert!(reject_capabilities(mk(Vec::new())).is_ok());
         let err = reject_capabilities(mk(vec![crate::Capability::ReceiveAll]))
+            .map(|_| ())
             .expect_err("host-only capability rejected");
         assert!(
             matches!(&err, DlError::UnsupportedCapabilities(c) if c == &[crate::Capability::ReceiveAll]),

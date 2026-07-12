@@ -96,7 +96,8 @@ pub(crate) struct FutureDriver {
     future: core::pin::Pin<Box<dyn core::future::Future<Output = crate::sequence::Outcome>>>,
     clock: std::rc::Rc<crate::sequence::SeqClock>,
     health: HealthPort,
-    done: bool,
+    /// A finished future is never polled again; the terminal is re-served.
+    done: Option<crate::sequence::Outcome>,
 }
 
 impl FutureDriver {
@@ -109,7 +110,7 @@ impl FutureDriver {
             future,
             clock,
             health,
-            done: false,
+            done: None,
         }
     }
 }
@@ -119,8 +120,8 @@ impl Driver for FutureDriver {
 
     fn step(&mut self, now: Timestamp) -> StepStatus {
         use core::task::{Context, Poll, Waker};
-        if self.done {
-            return StepStatus::Running;
+        if let Some(outcome) = self.done {
+            return StepStatus::Done(outcome);
         }
         self.clock.now.set(now);
         let start = std::time::Instant::now();
@@ -136,10 +137,80 @@ impl Driver for FutureDriver {
         self.health.end_cycle(now, micros);
         match poll {
             Poll::Ready(outcome) => {
-                self.done = true;
+                self.done = Some(outcome);
                 StepStatus::Done(outcome)
             }
             Poll::Pending => StepStatus::Running,
+        }
+    }
+
+    fn shutdown(&mut self) {}
+}
+
+/// The driver behind a sequence entry: [`FutureDriver`]'s poll-once model
+/// plus the slot-occupant contract — the cancel latch folded from the
+/// [`SlotControlIn`](crate::SlotControlIn) input before each poll, and a
+/// [`SequenceStatus`](crate::sequence::SequenceStatus) record published after
+/// it. This is the sequence execution model behind the pack seam.
+pub(crate) struct SeqDriver {
+    future: core::pin::Pin<Box<dyn core::future::Future<Output = crate::sequence::Outcome>>>,
+    clock: std::rc::Rc<crate::sequence::SeqClock>,
+    control: crate::port::Input<crate::sequence::SlotControlIn>,
+    status: crate::Out<crate::sequence::SeqStatusOut>,
+    done: Option<crate::sequence::Outcome>,
+}
+
+impl SeqDriver {
+    pub(crate) fn new(
+        future: core::pin::Pin<Box<dyn core::future::Future<Output = crate::sequence::Outcome>>>,
+        clock: std::rc::Rc<crate::sequence::SeqClock>,
+        control: crate::port::Input<crate::sequence::SlotControlIn>,
+        status: crate::Out<crate::sequence::SeqStatusOut>,
+    ) -> Self {
+        Self {
+            future,
+            clock,
+            control,
+            status,
+            done: None,
+        }
+    }
+}
+
+impl Driver for SeqDriver {
+    fn init(&mut self) {}
+
+    fn step(&mut self, now: Timestamp) -> StepStatus {
+        use core::task::{Context, Poll, Waker};
+        if let Some(outcome) = self.done {
+            return StepStatus::Done(outcome);
+        }
+        self.clock.now.set(now);
+        // A cancel stays latched once seen, even if later control frames
+        // clear it.
+        if let Some(f) = self.control.latest()
+            && f.cancel != 0
+        {
+            self.clock.cancel.set(true);
+        }
+        let start = std::time::Instant::now();
+        let poll = crate::sequence::with_clock(&self.clock, || {
+            self.future.as_mut().poll(&mut Context::from_waker(Waker::noop()))
+        });
+        let micros = start.elapsed().as_micros() as u64;
+        let lines = self.clock.drain_progress();
+        match poll {
+            Poll::Ready(outcome) => {
+                crate::sequence::publish_status(&mut self.status, now, outcome.run_state(), &lines);
+                self.status.health().end_cycle(now, micros);
+                self.done = Some(outcome);
+                StepStatus::Done(outcome)
+            }
+            Poll::Pending => {
+                crate::sequence::publish_status(&mut self.status, now, 0, &lines);
+                self.status.health().end_cycle(now, micros);
+                StepStatus::Running
+            }
         }
     }
 

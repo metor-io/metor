@@ -1,51 +1,55 @@
-//! The C ABI a system `cdylib` exports and the host resolves at load.
+//! The C ABI a pack `cdylib` exports and the host resolves at load.
 //!
-//! A system `.so` exports a small, versioned `extern "C"` surface. Both halves
+//! A pack `.so` exports a small, versioned `extern "C"` surface. Both halves
 //! compile against this module, which defines the `repr(C)` handles ([`FswRing`],
-//! [`FswStatus`]), the serialized descriptor mirrors ([`PortDescMsg`],
-//! [`SystemDescriptorMsg`]), the symbol names the host resolves, and the generic
-//! `run_*` helpers that [`export_system!`](crate::export_system) delegates to so
-//! the generated exports stay one-liners.
+//! [`FswStatus`]), the serialized manifest mirrors ([`PackManifestMsg`],
+//! [`SystemDescriptorMsg`]), the symbol names the host resolves, and the
+//! `run_pack_*` helpers that [`export_pack!`](crate::export_pack) delegates to
+//! so the generated exports stay one-liners.
 //!
 //! The lifecycle, in call order:
 //!
 //! ```text
-//! host                              system .so
-//! ----                              ----------
-//! fsw_abi_version      ---------->  FSW_ABI_VERSION (checked for equality first)
-//! fsw_describe(sink)   ---------->  run_describe    (descriptor bytes via ByteSink)
-//! fsw_create(params)   ---------->  run_create      (opaque state pointer)
-//! fsw_bind_init(rings) ---------->  run_bind_init   (attach rings, System::init)
-//! fsw_execute(now)     --(loop)-->  run_execute     (one step, returns FswStatus)
-//! fsw_shutdown         ---------->  run_shutdown
-//! fsw_destroy          ---------->  run_destroy     (drop the state in the .so)
+//! host                                     pack .so
+//! ----                                     --------
+//! fsw_abi_version             ---------->  FSW_ABI_VERSION (checked first)
+//! fsw_pack_open               ---------->  run_pack_open      (pack() once, opaque pack)
+//! fsw_pack_describe(sink)     ---------->  run_pack_describe  (manifest bytes via ByteSink)
+//! fsw_pack_create(idx, mount) ---------->  run_pack_create    (per-instance state pointer)
+//! fsw_pack_bind_init(rings)   ---------->  run_pack_bind_init (attach rings, driver init)
+//! fsw_pack_execute(now)       --(loop)-->  run_pack_execute   (one step, FswStatus word)
+//! fsw_pack_shutdown           ---------->  run_pack_shutdown
+//! fsw_pack_destroy            ---------->  run_pack_destroy   (drop the instance state)
+//! fsw_pack_close              ---------->  run_pack_close     (drop the Pack, last)
 //! ```
+//!
+//! `create`..`destroy` repeat per instance (two `system` nodes over one entry,
+//! or a slot occupant reloaded); `open`/`close` bracket the whole load. The
+//! host guarantees every instance is destroyed before `close`, and `close`
+//! runs before the library unloads.
 //!
 //! Three rules make this sound across an otherwise unstable Rust ABI:
 //!
 //! - **Only serialized bytes and `repr(C)` handles cross the boundary.** The
-//!   descriptor and the `Params` blob are postcard bytes; everything else is a
+//!   manifest and the `Params` blob are postcard bytes; everything else is a
 //!   `(pointer, length)` pair or a plain integer. No `Vec`, `Arc`, or vtable ever
 //!   crosses by value.
-//! - **No unwind crosses `extern "C"`.** Every `run_*` helper wraps its body in
-//!   [`catch_unwind`] and converts a caught panic into a null pointer, a non-zero
-//!   `describe` code, or [`FswStatus::Panicked`]. An escaping unwind would be
-//!   undefined behavior.
-//! - **Each side frees only what it allocated.** The state box is created by
-//!   [`run_create`] and dropped by [`run_destroy`] inside the same `.so`, and
-//!   [`run_describe`] hands its bytes to a host-owned [`ByteSink`] so the host
-//!   copies rather than frees.
+//! - **No unwind crosses `extern "C"`.** Every `run_pack_*` helper wraps its body
+//!   in [`catch_unwind`] and converts a caught panic into a null pointer, a
+//!   non-zero `describe` code, or [`FswStatus::Panicked`]. An escaping unwind
+//!   would be undefined behavior.
+//! - **Each side frees only what it allocated.** The pack and instance boxes are
+//!   created and dropped inside the same `.so`, and [`run_pack_describe`] hands
+//!   its bytes to a host-owned [`ByteSink`] so the host copies rather than frees.
 //!
 //! Ports bind positionally. The host sends [`FswRing`] handles in the order the
-//! descriptor lists the ports, and [`RawBinder`] walks them in the same order on
-//! the `.so` side. Loaded systems run in-process on the cyclic schedule, so every
-//! wake endpoint is `NoWake`.
+//! entry's descriptor lists the ports, and [`RawBinder`] walks them in the same
+//! order on the `.so` side. Loaded systems run in-process on the cyclic
+//! schedule, so every wake endpoint is `NoWake`.
 
 use core::ffi::c_void;
-use core::task::{Context, Poll, Waker};
 use std::collections::HashMap;
 use std::panic::{AssertUnwindSafe, catch_unwind};
-use std::rc::Rc;
 use std::slice;
 
 use std::sync::Arc;
@@ -57,13 +61,10 @@ use metor_proto_wkt::ComponentMetadata;
 use postcard_schema::schema::owned::OwnedNamedType;
 use serde::{Deserialize, Serialize};
 
-use crate::binder::{BindPorts, RingSource};
-use crate::coordinator::{CyclicSlot, SlotState, StopReason};
+use crate::binder::RingSource;
 use crate::descriptor::{
     AnnounceFn, Delivery, FanIn, PortDesc, PortId, PortSchema, SystemDescriptor, SystemKind,
 };
-use crate::sequence::{SeqBound, SeqClock, SeqSystem, publish_status, with_clock};
-use crate::system::{BuildSystem, CyclicRunner, CyclicSystem, Out, SystemOutput};
 
 // ---------------------------------------------------------------------------
 // Version + identity
@@ -74,7 +75,11 @@ use crate::system::{BuildSystem, CyclicRunner, CyclicSystem, Out, SystemOutput};
 /// Bump this on any change to the C surface or to the `*Msg` wire structs below,
 /// once per released ABI shape. A mismatch fails the load cleanly instead of
 /// risking a crash on a stale binary.
-pub const FSW_ABI_VERSION: u32 = 4;
+///
+/// Version 5 is the pack ABI: one cdylib exports many systems through the
+/// `fsw_pack_*` surface, replacing the one-system `fsw_describe`/`fsw_create`
+/// family entirely.
+pub const FSW_ABI_VERSION: u32 = 5;
 
 // ---------------------------------------------------------------------------
 // repr(C) handles
@@ -113,11 +118,10 @@ pub enum FswStatus {
     /// A panic was caught at the boundary, or the state was never bound. The
     /// host telemeters it and hard-stops the slot.
     Panicked = 1,
-    /// A sequence occupant's future returned `Ready`, a terminal, non-error
-    /// stop. The `Completed`/`Aborted`/`Failed` detail rides the
-    /// [`SequenceStatus`](crate::sequence::SequenceStatus) frame, not this word.
-    /// Only [`run_seq_execute`] returns it; a [`CyclicRunner`]-driven system
-    /// never does.
+    /// The entry's future returned `Ready`, a terminal, non-error stop. The
+    /// `Completed`/`Aborted`/`Failed` detail rides the
+    /// [`SequenceStatus`](crate::sequence::SequenceStatus) frame, not this
+    /// word; a cyclic entry never returns it.
     Done = 2,
 }
 
@@ -141,20 +145,6 @@ impl FswStatus {
             _ => FswStatus::Panicked,
         }
     }
-
-    /// Map a runner's [`SlotState`] after a step to the FFI status.
-    fn from_slot(state: SlotState) -> Self {
-        match state {
-            // A `.so`-side runner reports a panic through `catch_unwind`, not
-            // through its `SlotState`, but the match stays total.
-            SlotState::Stopped {
-                reason: StopReason::Panicked,
-            } => FswStatus::Panicked,
-            // Only Running/Stopped occur on this side of the boundary; the other
-            // slot states are host-side bookkeeping and never cross the ABI.
-            _ => FswStatus::Running,
-        }
-    }
 }
 
 /// A byte sink is the host callback a describe export feeds its serialized
@@ -168,18 +158,27 @@ pub type ByteSink = extern "C" fn(ctx: *mut c_void, buf: *const u8, len: usize);
 
 /// `fsw_abi_version` returns the ABI word ([`FSW_ABI_VERSION`]).
 pub const SYM_ABI_VERSION: &[u8] = b"fsw_abi_version\0";
-/// `fsw_describe` sends the serialized [`SystemDescriptorMsg`] via a [`ByteSink`].
-pub const SYM_DESCRIBE: &[u8] = b"fsw_describe\0";
-/// `fsw_create` decodes `Params`, constructs the system, and boxes the state.
-pub const SYM_CREATE: &[u8] = b"fsw_create\0";
-/// `fsw_bind_init` reconstructs the typed bundles and runs `System::init`.
-pub const SYM_BIND_INIT: &[u8] = b"fsw_bind_init\0";
-/// `fsw_execute` runs one cyclic step and returns an [`FswStatus`].
-pub const SYM_EXECUTE: &[u8] = b"fsw_execute\0";
-/// `fsw_shutdown` runs `System::shutdown`.
-pub const SYM_SHUTDOWN: &[u8] = b"fsw_shutdown\0";
-/// `fsw_destroy` drops the boxed state inside the `.so`.
-pub const SYM_DESTROY: &[u8] = b"fsw_destroy\0";
+/// `fsw_pack_open` constructs the crate's [`Pack`](crate::Pack) once and
+/// returns it as an opaque pointer (null if `pack()` panicked).
+pub const SYM_PACK_OPEN: &[u8] = b"fsw_pack_open\0";
+/// `fsw_pack_describe` sends the serialized [`PackManifestMsg`] via a
+/// [`ByteSink`].
+pub const SYM_PACK_DESCRIBE: &[u8] = b"fsw_pack_describe\0";
+/// `fsw_pack_create` runs entry `index`'s create phase (decode params, build
+/// state) and boxes the opaque per-instance state.
+pub const SYM_PACK_CREATE: &[u8] = b"fsw_pack_create\0";
+/// `fsw_pack_bind_init` binds the created entry's ports over the host's ring
+/// handles and runs its init.
+pub const SYM_PACK_BIND_INIT: &[u8] = b"fsw_pack_bind_init\0";
+/// `fsw_pack_execute` runs one step and returns an [`FswStatus`] word.
+pub const SYM_PACK_EXECUTE: &[u8] = b"fsw_pack_execute\0";
+/// `fsw_pack_shutdown` runs the entry's shutdown.
+pub const SYM_PACK_SHUTDOWN: &[u8] = b"fsw_pack_shutdown\0";
+/// `fsw_pack_destroy` drops one instance's boxed state inside the `.so`.
+pub const SYM_PACK_DESTROY: &[u8] = b"fsw_pack_destroy\0";
+/// `fsw_pack_close` drops the [`Pack`](crate::Pack) itself, after every
+/// instance state has been destroyed.
+pub const SYM_PACK_CLOSE: &[u8] = b"fsw_pack_close\0";
 
 // ---------------------------------------------------------------------------
 // Serialized descriptor mirrors (postcard)
@@ -509,21 +508,51 @@ impl<'a> RingSource for RawBinder<'a> {
 }
 
 // ---------------------------------------------------------------------------
-// Opaque state + generic export helpers
+// The pack manifest (postcard)
 // ---------------------------------------------------------------------------
 
-/// The heap allocation behind the opaque state pointer, holding a cyclic
-/// system between export calls. [`run_create`] boxes it and [`run_destroy`]
-/// drops it.
+/// One pack entry's wire form: its descriptor (the same
+/// [`SystemDescriptorMsg`] a single system always shipped), whether it can be
+/// instantiated more than once, and its optional default-params blob.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct PackSystemMsg {
+    pub descriptor: SystemDescriptorMsg,
+    /// `false` for a `.state(...)` entry: one instance, never a slot occupant.
+    pub reloadable: bool,
+    /// Canonical postcard bytes of the entry's default params, when declared;
+    /// the KDL encoder overlays config onto them. Carried from day one so
+    /// adding defaults later is not another ABI version.
+    pub params_default: Option<Vec<u8>>,
+}
+
+/// The whole pack's wire form, what `fsw_pack_describe` sends: one
+/// [`PackSystemMsg`] per entry, in registration order — the order
+/// `fsw_pack_create` indexes.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct PackManifestMsg {
+    pub systems: Vec<PackSystemMsg>,
+}
+
+// ---------------------------------------------------------------------------
+// Pack export helpers
+// ---------------------------------------------------------------------------
+
+/// The heap allocation behind the opaque pack pointer: the crate's [`Pack`],
+/// constructed once by [`run_pack_open`] and dropped by [`run_pack_close`].
+struct PackHost {
+    pack: crate::Pack,
+}
+
+/// The heap allocation behind one instance's opaque state pointer.
 ///
-/// `pending` holds the constructed system until [`run_bind_init`] binds its
-/// bundles and builds the runner, type-erased to [`CyclicSlot`] so `run_execute`
-/// and `run_shutdown` need not name the output bundle type. `poisoned` latches a
-/// caught execute panic so later cycles short-circuit to
-/// [`FswStatus::Panicked`].
-struct AbiState<S> {
-    pending: Option<S>,
-    runner: Option<Box<dyn CyclicSlot>>,
+/// `pending` holds the created (params decoded, state built) but unbound
+/// entry until [`run_pack_bind_init`] binds its ports and yields the
+/// [`Driver`](crate::Driver). `poisoned` latches a caught execute panic so
+/// later cycles short-circuit to [`FswStatus::Panicked`].
+struct PackAbiState {
+    pending: Option<crate::Pending>,
+    mount: crate::Mount,
+    driver: Option<Box<dyn crate::Driver>>,
     poisoned: bool,
 }
 
@@ -554,19 +583,53 @@ unsafe fn rings_from_raw<'a>(ptr: *const FswRing, n: usize) -> &'a [FswRing] {
     }
 }
 
-/// The describe tail shared by [`run_describe`] and [`run_seq_describe`].
-/// Lowers the descriptor and `Params` schema to a [`SystemDescriptorMsg`],
-/// postcard-encodes it under [`catch_unwind`], and hands the bytes to the host
-/// [`ByteSink`]. Returns `0` on success, `-1` if anything panics.
-fn describe_common(
-    desc: impl FnOnce() -> SystemDescriptor + std::panic::UnwindSafe,
-    params_schema: OwnedNamedType,
-    sink: ByteSink,
-    ctx: *mut c_void,
-) -> i32 {
+/// The `mount` word of `fsw_pack_create`, decoded leniently: an unknown word
+/// from a foreign host folds to the ordinary wired mount.
+fn mount_from_raw(raw: u32) -> crate::Mount {
+    match raw {
+        1 => crate::Mount::SlotOccupant,
+        _ => crate::Mount::Wired,
+    }
+}
+
+/// `fsw_pack_open`: construct the crate's [`Pack`](crate::Pack) by calling
+/// its `pack()` fn once and box it. Returns null if construction panics.
+pub fn run_pack_open(pack_fn: fn() -> crate::Pack) -> *mut c_void {
     let outcome = catch_unwind(AssertUnwindSafe(|| {
-        let msg = SystemDescriptorMsg::lower(&desc(), params_schema);
-        postcard::to_allocvec(&msg).expect("descriptor encodes (postcard)")
+        Box::into_raw(Box::new(PackHost { pack: pack_fn() })) as *mut c_void
+    }));
+    outcome.unwrap_or(core::ptr::null_mut())
+}
+
+/// `fsw_pack_describe`: lower every entry into the [`PackManifestMsg`],
+/// postcard-encode it, and hand the bytes to the host [`ByteSink`]. Returns
+/// `0` on success, `-1` if the pack pointer is null or anything panics.
+///
+/// # Safety
+/// `pack` is a live pointer from [`run_pack_open`]; `sink`/`ctx` form a valid
+/// host callback, called once with a buffer the `.so` owns for the call.
+pub unsafe fn run_pack_describe(pack: *mut c_void, sink: ByteSink, ctx: *mut c_void) -> i32 {
+    if pack.is_null() {
+        return -1;
+    }
+    // SAFETY: caller asserts `pack` is a live `PackHost` from `run_pack_open`.
+    let host = unsafe { &*(pack as *mut PackHost) };
+    let outcome = catch_unwind(AssertUnwindSafe(|| {
+        let msg = PackManifestMsg {
+            systems: host
+                .pack
+                .entries()
+                .map(|e| PackSystemMsg {
+                    descriptor: SystemDescriptorMsg::lower(
+                        e.descriptor(),
+                        OwnedNamedType::from(e.params_schema()),
+                    ),
+                    reloadable: e.reloadable(),
+                    params_default: e.params_default().map(<[u8]>::to_vec),
+                })
+                .collect(),
+        };
+        postcard::to_allocvec(&msg).expect("pack manifest encodes (postcard)")
     }));
     match outcome {
         Ok(bytes) => {
@@ -577,111 +640,114 @@ fn describe_common(
     }
 }
 
-/// `fsw_create`: postcard-decode `S::Params`, construct the system via
-/// [`BuildSystem::new`], and box the unbound [`AbiState`]. Returns null if
-/// decoding or construction panics.
+/// `fsw_pack_create`: run entry `index`'s create phase — decode the postcard
+/// params, build the user state — and box the unbound instance state. Returns
+/// null for a null pack, an out-of-range index, or a create failure (bad
+/// params, a moved-in state already taken, a panic).
 ///
 /// # Safety
-/// `params`/`params_len` name a readable byte range (or `params` is null with
-/// `params_len == 0`). The returned pointer is owned by the caller and must be
-/// passed only to the other `run_*` helpers for the same `S`, then
-/// [`run_destroy`].
-pub unsafe fn run_create<S>(params: *const u8, params_len: usize) -> *mut c_void
-where
-    S: BuildSystem,
-    S::Params: for<'de> Deserialize<'de>,
-{
+/// `pack` is a live pointer from [`run_pack_open`]; `params`/`params_len`
+/// name a readable byte range (or null/0). The returned pointer is owned by
+/// the caller and passed only to the other `run_pack_*` helpers, then
+/// [`run_pack_destroy`] — all before [`run_pack_close`].
+pub unsafe fn run_pack_create(
+    pack: *mut c_void,
+    index: u32,
+    mount: u32,
+    params: *const u8,
+    params_len: usize,
+) -> *mut c_void {
+    if pack.is_null() {
+        return core::ptr::null_mut();
+    }
+    // SAFETY: caller asserts `pack` is a live `PackHost` from `run_pack_open`.
+    // Entries are `FnMut`, so creating an instance needs the mutable borrow;
+    // the host serializes pack calls (the cyclic loop is single-threaded).
+    let host = unsafe { &mut *(pack as *mut PackHost) };
     // SAFETY: caller asserts `params..params+params_len` is readable (or null/0).
     let bytes = unsafe { bytes_from_raw(params, params_len) };
     let outcome = catch_unwind(AssertUnwindSafe(|| {
-        let params: S::Params = postcard::from_bytes(bytes).expect("params decode (postcard)");
-        let system = S::new(params);
-        let state = Box::new(AbiState::<S> {
-            pending: Some(system),
-            runner: None,
+        let entry = host
+            .pack
+            .entry_at_mut(index as usize)
+            .expect("entry index in range (host resolved it from this pack's manifest)");
+        let pending = entry
+            .create(crate::EntryParams::Postcard(bytes))
+            .expect("entry create (params decode + state construction)");
+        Box::into_raw(Box::new(PackAbiState {
+            pending: Some(pending),
+            mount: mount_from_raw(mount),
+            driver: None,
             poisoned: false,
-        });
-        Box::into_raw(state) as *mut c_void
+        })) as *mut c_void
     }));
     outcome.unwrap_or(core::ptr::null_mut())
 }
 
-/// `fsw_bind_init`: reconstruct the typed bundles from the [`FswRing`] arrays
-/// via a [`RawBinder`], assemble the [`CyclicRunner`], and run `System::init`.
-/// Bind and init are fused; a caught panic leaves the runner unbound, so
-/// [`run_execute`] reports [`FswStatus::Panicked`].
+/// `fsw_pack_bind_init`: bind the created entry's ports over the host's
+/// [`FswRing`] arrays (positionally, in descriptor order, via [`RawBinder`])
+/// and run the driver's init. Bind and init are fused; a caught panic leaves
+/// the driver unbound, so [`run_pack_execute`] reports
+/// [`FswStatus::Panicked`].
 ///
 /// # Safety
-/// `state` is a live pointer from [`run_create`] for this `S`.
-/// `inputs`/`outputs` name `n_in`/`n_out` valid [`FswRing`] handles whose
-/// regions satisfy [`RingBuffer::attach_raw`]'s contract and outlive the runner
-/// (until [`run_destroy`]).
-pub unsafe fn run_bind_init<S, O>(
+/// `state` is a live pointer from [`run_pack_create`]. `inputs`/`outputs`
+/// name `n_in`/`n_out` valid [`FswRing`] handles whose regions satisfy
+/// [`RingBuffer::attach_raw`]'s contract and outlive the driver (until
+/// [`run_pack_destroy`]).
+pub unsafe fn run_pack_bind_init(
     state: *mut c_void,
     inputs: *const FswRing,
     n_in: usize,
     outputs: *const FswRing,
     n_out: usize,
-) where
-    S: CyclicSystem<Output = Out<O>> + BuildSystem + 'static,
-    // `Out<O>: BindPorts` needs `O: BindPorts` spelled out: the `Output = Out<O>`
-    // equality makes the compiler prove the blanket impl rather than elaborate
-    // the `System::Output: BindPorts` associated-type bound.
-    O: SystemOutput + BindPorts + 'static,
-{
+) {
     if state.is_null() {
         return;
     }
-    // SAFETY: caller asserts `state` is a live `AbiState<S>` from `run_create`.
-    let st = unsafe { &mut *(state as *mut AbiState<S>) };
+    // SAFETY: caller asserts `state` is a live `PackAbiState`.
+    let st = unsafe { &mut *(state as *mut PackAbiState) };
     // SAFETY: caller asserts the handle arrays are valid (or null/0).
     let (in_slice, out_slice) =
         unsafe { (rings_from_raw(inputs, n_in), rings_from_raw(outputs, n_out)) };
     let _ = catch_unwind(AssertUnwindSafe(|| {
-        // SAFETY: caller asserts each region outlives the runner (until run_destroy).
+        // SAFETY: caller asserts each region outlives the driver.
         let mut binder = unsafe { RawBinder::new(in_slice, out_slice) };
-        let input = <S::Input as BindPorts>::bind(&mut binder);
-        let output = <S::Output as BindPorts>::bind(&mut binder);
-        let system = st
+        let pending = st
             .pending
             .take()
-            .expect("fsw_create populated the system before fsw_bind_init");
-        let mut runner = CyclicRunner::new(system, input, output);
-        runner.init();
-        st.runner = Some(Box::new(runner));
+            .expect("fsw_pack_create populated the pending entry before bind");
+        let mut src = crate::AnySource::Raw(&mut binder);
+        let mut driver = pending(&mut src, st.mount);
+        driver.init();
+        st.driver = Some(driver);
     }));
 }
 
-/// `fsw_execute`: run one cyclic step and return the mapped [`FswStatus`].
-///
-/// The `now` word carries the coordinator's [`Timestamp`] tick as a raw `u64`.
-/// A caught panic latches the poison flag and returns [`FswStatus::Panicked`],
-/// as does an unbound or already-poisoned state.
+/// `fsw_pack_execute`: run one step and return the [`FswStatus`] word. A
+/// caught panic latches the poison flag and returns
+/// [`FswStatus::Panicked`], as does an unbound or already-poisoned state; a
+/// driver whose future finished reports [`FswStatus::Done`].
 ///
 /// # Safety
-/// `state` is a live pointer from [`run_create`] for this `S`.
-pub unsafe fn run_execute<S>(state: *mut c_void, now: u64) -> FswStatus
-where
-    S: BuildSystem,
-{
+/// `state` is a live pointer from [`run_pack_create`].
+pub unsafe fn run_pack_execute(state: *mut c_void, now: u64) -> FswStatus {
     if state.is_null() {
         return FswStatus::Panicked;
     }
-    // SAFETY: caller asserts `state` is a live `AbiState<S>` from `run_create`.
-    let st = unsafe { &mut *(state as *mut AbiState<S>) };
+    // SAFETY: caller asserts `state` is a live `PackAbiState`.
+    let st = unsafe { &mut *(state as *mut PackAbiState) };
     if st.poisoned {
         return FswStatus::Panicked;
     }
-    let Some(runner) = st.runner.as_mut() else {
+    let Some(driver) = st.driver.as_mut() else {
         return FswStatus::Panicked;
     };
     let now = Timestamp(now as i64);
-    let outcome = catch_unwind(AssertUnwindSafe(|| {
-        runner.step(now);
-        *runner.state()
-    }));
+    let outcome = catch_unwind(AssertUnwindSafe(|| driver.step(now)));
     match outcome {
-        Ok(slot) => FswStatus::from_slot(slot),
+        Ok(crate::StepStatus::Running) => FswStatus::Running,
+        Ok(crate::StepStatus::Done(_)) => FswStatus::Done,
         Err(_) => {
             st.poisoned = true;
             FswStatus::Panicked
@@ -689,261 +755,162 @@ where
     }
 }
 
-/// `fsw_shutdown`: run `System::shutdown` once. A panic is caught and
-/// swallowed; a poisoned or unbound state is a no-op.
+/// `fsw_pack_shutdown`: run the driver's shutdown once. A panic is caught
+/// and swallowed; a poisoned or unbound state is a no-op.
 ///
 /// # Safety
-/// `state` is a live pointer from [`run_create`] for this `S`.
-pub unsafe fn run_shutdown<S>(state: *mut c_void)
-where
-    S: BuildSystem,
-{
+/// `state` is a live pointer from [`run_pack_create`].
+pub unsafe fn run_pack_shutdown(state: *mut c_void) {
     if state.is_null() {
         return;
     }
-    // SAFETY: caller asserts `state` is a live `AbiState<S>` from `run_create`.
-    let st = unsafe { &mut *(state as *mut AbiState<S>) };
+    // SAFETY: caller asserts `state` is a live `PackAbiState`.
+    let st = unsafe { &mut *(state as *mut PackAbiState) };
     if st.poisoned {
         return;
     }
-    if let Some(runner) = st.runner.as_mut() {
-        let _ = catch_unwind(AssertUnwindSafe(|| runner.shutdown()));
+    if let Some(driver) = st.driver.as_mut() {
+        let _ = catch_unwind(AssertUnwindSafe(|| driver.shutdown()));
     }
 }
 
-/// `fsw_destroy`: drop the boxed state inside the `.so`, running `S::drop` and
-/// every port's `Drop`. Idempotent on null.
+/// `fsw_pack_destroy`: drop one instance's boxed state inside the `.so`,
+/// running the driver's drop and every port's `Drop` (releasing their ring
+/// roles). Idempotent on null.
 ///
 /// # Safety
-/// `state` is a live pointer from [`run_create`] for this `S`, not used
-/// afterward.
-pub unsafe fn run_destroy<S>(state: *mut c_void)
-where
-    S: BuildSystem,
-{
+/// `state` is a live pointer from [`run_pack_create`], not used afterward.
+pub unsafe fn run_pack_destroy(state: *mut c_void) {
     if state.is_null() {
         return;
     }
-    // SAFETY: caller asserts `state` is a live `AbiState<S>` from `run_create`,
-    // transferred here exactly once.
-    let st = unsafe { Box::from_raw(state as *mut AbiState<S>) };
+    // SAFETY: caller asserts `state` is a live `PackAbiState`, transferred
+    // here exactly once.
+    let st = unsafe { Box::from_raw(state as *mut PackAbiState) };
     let _ = catch_unwind(AssertUnwindSafe(|| drop(st)));
 }
 
-/// `fsw_describe`: lower this system's static [`SystemDescriptor`] and `Params`
-/// schema to a [`SystemDescriptorMsg`], postcard-encode it, and hand the bytes
-/// to the host [`ByteSink`]. Returns `0` on success, `-1` if anything panics.
+/// `fsw_pack_close`: drop the [`Pack`](crate::Pack). Every instance state
+/// must have been destroyed first (the host's loader guarantees the order by
+/// holding the pack open as long as any slot exists). Idempotent on null.
 ///
 /// # Safety
-/// `sink`/`ctx` form a valid host callback; `sink` is called once with a buffer
-/// the `.so` owns for the duration of the call.
-pub unsafe fn run_describe<S>(sink: ByteSink, ctx: *mut c_void) -> i32
-where
-    S: CyclicSystem + BuildSystem,
-    S::Params: postcard_schema::Schema,
-{
-    let params_schema = OwnedNamedType::from(<S::Params as postcard_schema::Schema>::SCHEMA);
-    describe_common(<S as CyclicSystem>::descriptor, params_schema, sink, ctx)
-}
-
-// ---------------------------------------------------------------------------
-// Sequence occupants
-// ---------------------------------------------------------------------------
-
-/// The heap allocation behind a sequence occupant's opaque state pointer, the
-/// future-driven twin of [`AbiState`].
-///
-/// `params` holds the decoded params until [`run_seq_bind_init`] consumes them.
-/// `bound` holds the owned future (with the user ports moved inside it) plus
-/// the wrapper-owned output tail and the cancel input, built at bind. `clock`
-/// is the per-cycle ambient [`SeqClock`], and `poisoned` latches a caught
-/// execute panic so later cycles short-circuit to [`FswStatus::Panicked`].
-struct SeqState<S: SeqSystem> {
-    params: Option<S::Params>,
-    bound: Option<SeqBound>,
-    clock: Rc<SeqClock>,
-    poisoned: bool,
-}
-
-/// `fsw_create` for a sequence: postcard-decode `S::Params` and box an unbound
-/// [`SeqState`] with a fresh [`SeqClock`] and no future yet. Returns null on
-/// panic.
-///
-/// # Safety
-/// As [`run_create`]: `params`/`params_len` name a readable byte range (or
-/// null/0); the returned pointer is owned by the caller and passed only to the
-/// other `run_seq_*` helpers for the same `S`, then [`run_seq_destroy`].
-pub unsafe fn run_seq_create<S>(params: *const u8, params_len: usize) -> *mut c_void
-where
-    S: SeqSystem,
-    S::Params: for<'de> Deserialize<'de>,
-{
-    // SAFETY: caller asserts `params..params+params_len` is readable (or null/0).
-    let bytes = unsafe { bytes_from_raw(params, params_len) };
-    let outcome = catch_unwind(AssertUnwindSafe(|| {
-        let params: S::Params = postcard::from_bytes(bytes).expect("params decode (postcard)");
-        let state = Box::new(SeqState::<S> {
-            params: Some(params),
-            bound: None,
-            clock: Rc::new(SeqClock::default()),
-            poisoned: false,
-        });
-        Box::into_raw(state) as *mut c_void
-    }));
-    outcome.unwrap_or(core::ptr::null_mut())
-}
-
-/// `fsw_bind_init` for a sequence: build a [`RawBinder`] over the host's
-/// [`FswRing`] arrays and hand it to `S::build`, which binds the ports in
-/// descriptor order. The user ports and the
-/// [`SlotControlIn`](crate::sequence::SlotControlIn) move into the future; the
-/// [`SequenceStatus`](crate::sequence::SequenceStatus) and health tail stay in
-/// the state. A caught panic leaves `bound` empty, so [`run_seq_execute`]
-/// reports [`FswStatus::Panicked`].
-///
-/// # Safety
-/// As [`run_bind_init`]: `state` is a live [`SeqState`] from
-/// [`run_seq_create`]; `inputs`/`outputs` name `n_in`/`n_out` valid [`FswRing`]
-/// handles whose regions satisfy [`RingBuffer::attach_raw`]'s contract and
-/// outlive the future (until [`run_seq_destroy`]).
-pub unsafe fn run_seq_bind_init<S>(
-    state: *mut c_void,
-    inputs: *const FswRing,
-    n_in: usize,
-    outputs: *const FswRing,
-    n_out: usize,
-) where
-    S: SeqSystem,
-{
-    if state.is_null() {
+/// `pack` is a live pointer from [`run_pack_open`], not used afterward, with
+/// no live instance states.
+pub unsafe fn run_pack_close(pack: *mut c_void) {
+    if pack.is_null() {
         return;
     }
-    // SAFETY: caller asserts `state` is a live `SeqState<S>` from `run_seq_create`.
-    let st = unsafe { &mut *(state as *mut SeqState<S>) };
-    // SAFETY: caller asserts the handle arrays are valid (or null/0).
-    let (in_slice, out_slice) =
-        unsafe { (rings_from_raw(inputs, n_in), rings_from_raw(outputs, n_out)) };
-    let _ = catch_unwind(AssertUnwindSafe(|| {
-        // SAFETY: caller asserts each region outlives the future (until run_seq_destroy).
-        let mut binder = unsafe { RawBinder::new(in_slice, out_slice) };
-        let params = st
-            .params
-            .take()
-            .expect("run_seq_create populated params before run_seq_bind_init");
-        st.bound = Some(S::build(params, &mut binder, &st.clock));
-    }));
+    // SAFETY: caller asserts `pack` is a live `PackHost`, transferred here
+    // exactly once.
+    let host = unsafe { Box::from_raw(pack as *mut PackHost) };
+    let _ = catch_unwind(AssertUnwindSafe(|| drop(host)));
 }
 
-/// `fsw_execute` for a sequence: refresh the clock, fold the latched cancel
-/// from the control input, poll the future once with `Waker::noop()` under the
-/// task-local clock, publish a
-/// [`SequenceStatus`](crate::sequence::SequenceStatus) record, and map
-/// `Ready` to [`FswStatus::Done`] and `Pending` to [`FswStatus::Running`]. A
-/// caught panic latches the poison flag and returns [`FswStatus::Panicked`],
-/// as does an unbound or already-poisoned state.
+/// Emit the nine `extern "C"` exports of the pack ABI, delegating to the
+/// `run_pack_*` helpers over the crate's `pack()` fn:
 ///
-/// # Safety
-/// `state` is a live pointer from [`run_seq_create`] for this `S`.
-pub unsafe fn run_seq_execute<S>(state: *mut c_void, now: u64) -> FswStatus
-where
-    S: SeqSystem,
-{
-    if state.is_null() {
-        return FswStatus::Panicked;
-    }
-    // SAFETY: caller asserts `state` is a live `SeqState<S>` from `run_seq_create`.
-    let st = unsafe { &mut *(state as *mut SeqState<S>) };
-    if st.poisoned {
-        return FswStatus::Panicked;
-    }
-    let Some(bound) = st.bound.as_mut() else {
-        return FswStatus::Panicked;
+/// ```ignore
+/// pub fn pack() -> Pack { Pack::new().system("nav", system(nav_execute)) }
+/// metor_fsw_2::export_pack!(pack);                          // cdylib-only crate
+/// metor_fsw_2::export_pack!(pack, feature = "export");     // cdylib + rlib recipe
+/// ```
+///
+/// One invocation per crate; the symbols are un-namespaced C names, which is
+/// exactly why a crate exports one *pack* rather than one system. The bare
+/// form gates on `not(test)` so a test build of the same crate carries no
+/// exports; the `feature =` form additionally gates on that cargo feature so
+/// the rlib a host links for tests stays symbol-free.
+#[macro_export]
+macro_rules! export_pack {
+    ($pack_fn:path) => {
+        $crate::export_pack!(@items (not(test)), $pack_fn);
     };
-    let now_ts = Timestamp(now as i64);
-    st.clock.now.set(now_ts);
-    // A cancel stays latched once seen, even if later control frames clear it.
-    if let Some(f) = bound.control.latest()
-        && f.get().cancel != 0
-    {
-        st.clock.cancel.set(true);
-    }
-    let start = std::time::Instant::now();
-    let clock = &st.clock;
-    let outcome = catch_unwind(AssertUnwindSafe(|| {
-        with_clock(clock, || {
-            bound
-                .future
-                .as_mut()
-                .poll(&mut Context::from_waker(Waker::noop()))
-        })
-    }));
-    let micros = start.elapsed().as_micros() as u64;
-    match outcome {
-        Ok(Poll::Ready(outcome)) => {
-            let lines = st.clock.drain_progress();
-            publish_status(&mut bound.status, now_ts, outcome.run_state(), &lines);
-            bound.status.health().end_cycle(now_ts, micros);
-            FswStatus::Done
-        }
-        Ok(Poll::Pending) => {
-            let lines = st.clock.drain_progress();
-            publish_status(&mut bound.status, now_ts, 0, &lines);
-            bound.status.health().end_cycle(now_ts, micros);
-            FswStatus::Running
-        }
-        Err(_) => {
-            st.poisoned = true;
-            FswStatus::Panicked
-        }
-    }
-}
+    ($pack_fn:path, feature = $feat:literal) => {
+        $crate::export_pack!(@items (all(feature = $feat, not(test))), $pack_fn);
+    };
+    (@items ($($cfg:tt)*), $pack_fn:path) => {
+        #[cfg($($cfg)*)]
+        const _: () = {
+            use $crate::abi;
+            use core::ffi::c_void;
 
-/// `fsw_shutdown` for a sequence: a no-op, since a sequence has no shutdown
-/// hook and its future is dropped at [`run_seq_destroy`]. Provided so the
-/// symbol surface stays uniform with [`export_system!`](crate::export_system).
-///
-/// # Safety
-/// `state` is a live pointer from [`run_seq_create`] for this `S` (or null).
-pub unsafe fn run_seq_shutdown<S>(state: *mut c_void)
-where
-    S: SeqSystem,
-{
-    let _ = state;
-}
+            #[unsafe(no_mangle)]
+            pub extern "C" fn fsw_abi_version() -> u32 {
+                abi::FSW_ABI_VERSION
+            }
 
-/// `fsw_destroy` for a sequence: drop the boxed [`SeqState`] inside the `.so`.
-/// Dropping the future drops the ports it owns, releasing their ring roles, and
-/// the wrapper tail and control input drop with the state. Idempotent on null.
-///
-/// # Safety
-/// `state` is a live pointer from [`run_seq_create`] for this `S`, transferred
-/// here exactly once and not used afterward.
-pub unsafe fn run_seq_destroy<S>(state: *mut c_void)
-where
-    S: SeqSystem,
-{
-    if state.is_null() {
-        return;
-    }
-    // SAFETY: caller asserts `state` is a live `SeqState<S>` from `run_seq_create`,
-    // transferred here exactly once.
-    let st = unsafe { Box::from_raw(state as *mut SeqState<S>) };
-    let _ = catch_unwind(AssertUnwindSafe(|| drop(st)));
-}
+            #[unsafe(no_mangle)]
+            pub extern "C" fn fsw_pack_open() -> *mut c_void {
+                abi::run_pack_open($pack_fn)
+            }
 
-/// `fsw_describe` for a sequence: as [`run_describe`], but over the sequence's
-/// own `S::descriptor()`.
-///
-/// # Safety
-/// As [`run_describe`]: `sink`/`ctx` form a valid host callback; `sink` is
-/// called once with a buffer the `.so` owns for the duration of the call.
-pub unsafe fn run_seq_describe<S>(sink: ByteSink, ctx: *mut c_void) -> i32
-where
-    S: SeqSystem,
-    S::Params: postcard_schema::Schema,
-{
-    let params_schema = OwnedNamedType::from(<S::Params as postcard_schema::Schema>::SCHEMA);
-    describe_common(S::descriptor, params_schema, sink, ctx)
+            #[unsafe(no_mangle)]
+            #[allow(clippy::not_unsafe_ptr_arg_deref)]
+            pub extern "C" fn fsw_pack_describe(
+                pack: *mut c_void,
+                sink: abi::ByteSink,
+                ctx: *mut c_void,
+            ) -> i32 {
+                // SAFETY: the host upholds run_pack_describe's contract.
+                unsafe { abi::run_pack_describe(pack, sink, ctx) }
+            }
+
+            #[unsafe(no_mangle)]
+            #[allow(clippy::not_unsafe_ptr_arg_deref)]
+            pub extern "C" fn fsw_pack_create(
+                pack: *mut c_void,
+                index: u32,
+                mount: u32,
+                params: *const u8,
+                params_len: usize,
+            ) -> *mut c_void {
+                // SAFETY: the host upholds run_pack_create's contract.
+                unsafe { abi::run_pack_create(pack, index, mount, params, params_len) }
+            }
+
+            #[unsafe(no_mangle)]
+            #[allow(clippy::not_unsafe_ptr_arg_deref)]
+            pub extern "C" fn fsw_pack_bind_init(
+                state: *mut c_void,
+                inputs: *const abi::FswRing,
+                n_in: usize,
+                outputs: *const abi::FswRing,
+                n_out: usize,
+            ) {
+                // SAFETY: the host upholds run_pack_bind_init's contract.
+                unsafe { abi::run_pack_bind_init(state, inputs, n_in, outputs, n_out) }
+            }
+
+            #[unsafe(no_mangle)]
+            #[allow(clippy::not_unsafe_ptr_arg_deref)]
+            pub extern "C" fn fsw_pack_execute(state: *mut c_void, now: u64) -> u32 {
+                // SAFETY: the host upholds run_pack_execute's contract.
+                (unsafe { abi::run_pack_execute(state, now) }) as u32
+            }
+
+            #[unsafe(no_mangle)]
+            #[allow(clippy::not_unsafe_ptr_arg_deref)]
+            pub extern "C" fn fsw_pack_shutdown(state: *mut c_void) {
+                // SAFETY: the host upholds run_pack_shutdown's contract.
+                unsafe { abi::run_pack_shutdown(state) }
+            }
+
+            #[unsafe(no_mangle)]
+            #[allow(clippy::not_unsafe_ptr_arg_deref)]
+            pub extern "C" fn fsw_pack_destroy(state: *mut c_void) {
+                // SAFETY: the host upholds run_pack_destroy's contract.
+                unsafe { abi::run_pack_destroy(state) }
+            }
+
+            #[unsafe(no_mangle)]
+            #[allow(clippy::not_unsafe_ptr_arg_deref)]
+            pub extern "C" fn fsw_pack_close(pack: *mut c_void) {
+                // SAFETY: the host upholds run_pack_close's contract.
+                unsafe { abi::run_pack_close(pack) }
+            }
+        };
+    };
 }
 
 #[cfg(all(test, feature = "kdl"))]

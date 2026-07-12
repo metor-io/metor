@@ -16,7 +16,6 @@
 //!   block.
 //! - [`#[sequence]`](macro@sequence) turns an `async fn` into a loadable
 //!   sequence.
-//! - [`export_system!`] hand-writes the loadable-system C entry points.
 //!
 //! Field and struct attributes live under `#[fsw(...)]`; the longer
 //! `#[metor_fsw(...)]` spelling is accepted as an alias.
@@ -31,7 +30,6 @@ use syn::Ident;
 mod as_vtable;
 mod componentize;
 mod decomponentize;
-mod export;
 mod frame;
 mod metadatatize;
 mod sequence;
@@ -116,18 +114,6 @@ pub fn system_output(input: TokenStream) -> TokenStream {
     system::system_output(input)
 }
 
-/// `export_system!(MySystem);` emits the `extern "C"` `fsw_*` entry points
-/// that make a system loadable at runtime from a `cdylib`, each body a
-/// one-liner delegating to an `abi::run_*` helper. The system's `Params`
-/// must implement `Serialize`, `Deserialize`, and `Schema` so they can cross
-/// the boundary as postcard bytes.
-///
-/// This is the hand-written form; [`#[system(export)]`](macro@system) emits
-/// the same surface for macro-authored systems.
-#[proc_macro]
-pub fn export_system(input: TokenStream) -> TokenStream {
-    export::export_system(input)
-}
 
 /// Turns an `async fn` whose parameters are `Input<T>`/`Output<T>` ports into
 /// a complete sequence, loadable at runtime from a `cdylib`.

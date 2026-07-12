@@ -1,12 +1,12 @@
 coordinator cycle_rate=120.0 sim_dt=0.008333333333333333
 
-artifact "plant" crate="adcs-plant" lib="adcs_plant" type="Plant"
-artifact "nav"   crate="adcs-nav"   lib="adcs_nav"   type="Nav"
-artifact "ctrl"  crate="adcs-ctrl"  lib="adcs_ctrl"  type="Ctrl"
+artifact "plant" crate="adcs-plant" lib="adcs_plant"
+artifact "nav"   crate="adcs-nav"   lib="adcs_nav"
+artifact "ctrl"  crate="adcs-ctrl"  lib="adcs_ctrl"
 
 // sequences
-artifact "commissioning" crate="adcs-commissioning" lib="adcs_commissioning" type="commissioning"
-artifact "safe_mode"     crate="adcs-safe-mode"     lib="adcs_safe_mode"     type="safe_mode"
+artifact "commissioning" crate="adcs-commissioning" lib="adcs_commissioning"
+artifact "safe_mode"     crate="adcs-safe-mode"     lib="adcs_safe_mode"
 
 // systems
 // The plant's disturbance/actuator environment is spelled out in full (the dlopen param

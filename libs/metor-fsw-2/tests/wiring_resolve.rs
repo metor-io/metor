@@ -15,7 +15,7 @@
 
 use metor_fsw_2::metor_proto::types::{ComponentId, Timestamp};
 use metor_fsw_2::{
-    BuildSystem, ClockSpec, CyclicSystem, DlSystem, Frame, Input, Out, Output, ParamSource, System,
+    BuildSystem, ClockSpec, CyclicSystem, DlPack, Frame, Input, Out, Output, ParamSource, System,
     SystemInput, SystemKind, SystemOutput, Wiring, WiringBuilder,
     wiring::{BuildOptions, Registry, build_artifacts, encode_kdl_params, parse, resolve},
 };
@@ -101,12 +101,7 @@ fn dl_graph_via_wiring_resolve_end_to_end() {
     // dlopen'd consumer with typed params.
     let mut wiring = WiringBuilder::new()
         .coordinator(200.0, ClockSpec::Simulated { dt_secs: 0.005 })
-        .artifact(
-            "counter",
-            "metor-fsw-2-dl-fixture",
-            fixture_lib_stem(),
-            "DlCounter",
-        )
+        .artifact("counter", "metor-fsw-2-dl-fixture", fixture_lib_stem())
         .system("ticker")
         .ty("Ticker")
         .from_static()
@@ -178,11 +173,16 @@ fn dl_graph_via_wiring_resolve_end_to_end() {
     drop(out_view);
     drop(coord);
 
-    // A fresh open of the recorded path yields the fixture's cyclic counter,
-    // so the located artifact is real.
-    let dl = metor_fsw_2::DlSystem::open(wiring.artifacts[0].path.as_ref().unwrap())
+    // A fresh open of the recorded path yields the fixture's pack, so the
+    // located artifact is real.
+    let pack = DlPack::open(wiring.artifacts[0].path.as_ref().unwrap())
         .expect("open the located .so");
-    assert_eq!(dl.descriptor().name, "dl_counter");
+    assert_eq!(
+        pack.system_names().collect::<Vec<_>>(),
+        ["DlCounter", "DlEcho"]
+    );
+    let dl = pack.system("DlCounter").expect("select the counter entry");
+    assert_eq!(dl.descriptor().name, "DlCounter");
     assert_eq!(dl.descriptor().kind, SystemKind::Cyclic);
 }
 
@@ -196,12 +196,7 @@ fn kdl_and_builder_dl_params_are_byte_identical_and_run_equal() {
     // --- Rust-builder front-end ------------------------------------------------------
     let mut builder_wiring = WiringBuilder::new()
         .coordinator(200.0, ClockSpec::Simulated { dt_secs: 0.005 })
-        .artifact(
-            "counter",
-            "metor-fsw-2-dl-fixture",
-            fixture_lib_stem(),
-            "DlCounter",
-        )
+        .artifact("counter", "metor-fsw-2-dl-fixture", fixture_lib_stem())
         .system("ticker")
         .ty("Ticker")
         .from_static()
@@ -221,7 +216,7 @@ fn kdl_and_builder_dl_params_are_byte_identical_and_run_equal() {
     let kdl = format!(
         r#"
 coordinator cycle_rate=200.0 sim_dt=0.005
-artifact "counter" crate="metor-fsw-2-dl-fixture" lib="{lib}" type="DlCounter"
+artifact "counter" crate="metor-fsw-2-dl-fixture" lib="{lib}"
 system "ticker" type="Ticker"
 system "counter" type="DlCounter" artifact="counter" start=1000 scale=2.0
 connect "ticker" -> "counter" frame="tick_in"
@@ -251,7 +246,10 @@ connect "ticker" -> "counter" frame="tick_in"
         other => panic!("KDL dl system should carry Kdl params, got {other:?}"),
     };
     let kdl_bytes = {
-        let dl = DlSystem::open(path).expect("open the fixture .so for its Params schema");
+        let dl = DlPack::open(path)
+            .expect("open the fixture .so for its Params schema")
+            .system("DlCounter")
+            .expect("select the counter entry");
         encode_kdl_params(
             &kdl_text,
             dl.params_schema(),
@@ -311,24 +309,26 @@ connect "ticker" -> "counter" frame="tick_in"
     drop((builder_view, kdl_view, builder_coord, kdl_coord));
 }
 
-/// `type=` is optional on a dl system because the artifact's exported type is
-/// authoritative; a mission without it resolves and runs, and an explicit
-/// `type=` that contradicts the artifact fails with `TypeMismatchesArtifact`.
+/// `type=` selects the pack entry a dl system instantiates. Over a
+/// multi-entry pack an omitted `type=` is a clean `PackTypeRequired` error
+/// listing the choices, and a `type=` naming no exported entry fails with
+/// `PackSystem` wrapping [`DlError::UnknownPackSystem`].
 #[test]
-fn dl_type_optional_and_validated_against_artifact() {
+fn dl_type_selects_the_pack_entry_and_unknown_type_is_rejected() {
+    use metor_fsw_2::DlError;
     use metor_fsw_2::wiring::LoadError;
 
     let kdl = format!(
         r#"
 coordinator cycle_rate=200.0 sim_dt=0.005
-artifact "counter" crate="metor-fsw-2-dl-fixture" lib="{lib}" type="DlCounter"
+artifact "counter" crate="metor-fsw-2-dl-fixture" lib="{lib}"
 system "ticker" type="Ticker"
 system "counter" artifact="counter" start=5 scale=1.0
 connect "ticker" -> "counter" frame="tick_in"
 "#,
         lib = fixture_lib_stem()
     );
-    let mut wiring = parse(&kdl).expect("type= is optional with artifact=");
+    let mut wiring = parse(&kdl).expect("type= is optional at parse with artifact=");
     assert_eq!(
         wiring.systems[1].ty, None,
         "no explicit type on the dl system"
@@ -339,29 +339,48 @@ connect "ticker" -> "counter" frame="tick_in"
         return;
     }
 
+    // The fixture pack exports two entries, so the type-less spec cannot pick
+    // one; resolve reports the choices instead of guessing.
     let mut registry = Registry::new();
     registry.register::<Ticker, _>("Ticker");
-    let coord = resolve(&wiring, &registry).expect("a type-less dl system resolves");
-    drop(coord);
-
-    // An explicit type that contradicts the artifact's exported type is rejected.
-    let mut bad = wiring.clone();
-    bad.systems[1].ty = Some("WrongType".to_string());
-    let err = match resolve(&bad, &registry) {
-        Ok(_) => panic!("expected TypeMismatchesArtifact"),
+    let err = match resolve(&wiring, &registry) {
+        Ok(_) => panic!("expected PackTypeRequired"),
         Err(e) => e,
     };
     match err {
-        LoadError::TypeMismatchesArtifact {
-            system,
-            ty,
-            artifact_type,
-            ..
+        LoadError::PackTypeRequired {
+            system, available, ..
         } => {
             assert_eq!(system, "counter");
-            assert_eq!(ty, "WrongType");
-            assert_eq!(artifact_type, "DlCounter");
+            assert_eq!(available, "DlCounter, DlEcho");
         }
-        other => panic!("expected TypeMismatchesArtifact, got {other:?}"),
+        other => panic!("expected PackTypeRequired, got {other:?}"),
     }
+
+    // A `type=` the pack does not export is rejected, naming the exports.
+    let mut bad = wiring.clone();
+    bad.systems[1].ty = Some("WrongType".to_string());
+    let err = match resolve(&bad, &registry) {
+        Ok(_) => panic!("expected PackSystem"),
+        Err(e) => e,
+    };
+    match err {
+        LoadError::PackSystem { system, source, .. } => {
+            assert_eq!(system, "counter");
+            match *source {
+                DlError::UnknownPackSystem { name, available } => {
+                    assert_eq!(name, "WrongType");
+                    assert_eq!(available, ["DlCounter", "DlEcho"]);
+                }
+                other => panic!("expected UnknownPackSystem, got {other:?}"),
+            }
+        }
+        other => panic!("expected PackSystem, got {other:?}"),
+    }
+
+    // Naming a real entry resolves and runs.
+    let mut good = wiring.clone();
+    good.systems[1].ty = Some("DlCounter".to_string());
+    let coord = resolve(&good, &registry).expect("an exported type= resolves");
+    drop(coord);
 }

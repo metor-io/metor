@@ -210,14 +210,21 @@ fn locate_fixture(package: &str, stem: &str) -> Option<PathBuf> {
 // ---------------------------------------------------------------------------
 
 /// The descriptor exactly as resolve obtains it: a describe-mode worker run
-/// (this very binary, re-executed) plus the public wire-mirror decode. The
-/// test host never dlopens the artifact for its process system.
-fn proc_descriptor(lib_path: &Path) -> metor_fsw_2::SystemDescriptor {
+/// (this very binary, re-executed) plus the public wire-mirror decode of the
+/// pack manifest, selecting the entry named `system`. The test host never
+/// dlopens the artifact for its process system.
+fn proc_descriptor(lib_path: &Path, system: &str) -> metor_fsw_2::SystemDescriptor {
     let bytes = metor_fsw_2::proc::describe_via_worker(None, lib_path)
         .expect("describe worker over the fixture");
-    let msg: metor_fsw_2::abi::SystemDescriptorMsg =
-        postcard::from_bytes(&bytes).expect("descriptor bytes decode");
-    msg.into_descriptor()
+    let manifest: metor_fsw_2::abi::PackManifestMsg =
+        postcard::from_bytes(&bytes).expect("pack manifest bytes decode");
+    manifest
+        .systems
+        .into_iter()
+        .find(|s| s.descriptor.name == system)
+        .unwrap_or_else(|| panic!("the pack exports `{system}`"))
+        .descriptor
+        .into_descriptor()
 }
 
 fn counter_params() -> Vec<u8> {
@@ -262,8 +269,8 @@ fn kill9(pid: u32) {
 // ---------------------------------------------------------------------------
 
 fn lockstep_end_to_end(lib_path: &Path) {
-    let desc = proc_descriptor(lib_path);
-    assert_eq!(desc.name, "dl_counter");
+    let desc = proc_descriptor(lib_path, "DlCounter");
+    assert_eq!(desc.name, "DlCounter");
     assert_eq!(desc.inputs.len(), 1, "one user input (tick_in)");
     assert_eq!(desc.outputs.len(), 4, "out + events + health + log");
 
@@ -282,9 +289,13 @@ fn lockstep_end_to_end(lib_path: &Path) {
         "proc_counter",
         desc,
         lib_path.to_path_buf(),
+        "DlCounter",
         counter_params(),
     );
-    let dl_twin = metor_fsw_2::DlSystem::open(lib_path).expect("dlopen the fixture in-process");
+    let dl_twin = metor_fsw_2::DlPack::open(lib_path)
+        .expect("dlopen the fixture in-process")
+        .system("DlCounter")
+        .expect("select the counter entry");
     let dl_sys = b.add_dl_cyclic("dl_obs", dl_twin, counter_params());
     b.connect(
         PortRef::new::<TickIn>(ticker),
@@ -385,7 +396,7 @@ fn lockstep_end_to_end(lib_path: &Path) {
 // ---------------------------------------------------------------------------
 
 fn death_reclaims_and_keeps_flowing(lib_path: &Path) {
-    let desc = proc_descriptor(lib_path);
+    let desc = proc_descriptor(lib_path, "DlCounter");
     let mut b = Coordinator::builder(CoordinatorConfig {
         cycle_rate: 200.0,
         default_depth: 8,
@@ -400,6 +411,7 @@ fn death_reclaims_and_keeps_flowing(lib_path: &Path) {
         "proc_counter",
         desc,
         lib_path.to_path_buf(),
+        "DlCounter",
         counter_params(),
     );
     b.connect(
@@ -468,7 +480,7 @@ fn death_reclaims_and_keeps_flowing(lib_path: &Path) {
 // ---------------------------------------------------------------------------
 
 fn worker_restarts_then_exhausts_budget(lib_path: &Path) {
-    let desc = proc_descriptor(lib_path);
+    let desc = proc_descriptor(lib_path, "DlCounter");
     let mut b = Coordinator::builder(CoordinatorConfig {
         cycle_rate: 200.0,
         default_depth: 8,
@@ -483,6 +495,7 @@ fn worker_restarts_then_exhausts_budget(lib_path: &Path) {
         "proc_counter",
         desc,
         lib_path.to_path_buf(),
+        "DlCounter",
         counter_params(),
     );
     b.connect(
@@ -665,9 +678,11 @@ fn event_token(kind: &SequenceEventKind) -> String {
 
 /// One allowed occupant behind an artifact backing, its descriptor sourced
 /// exactly as `resolve` sources it: a describe worker, never a host dlopen.
+/// The occupant name is the pack entry name; a Load spawns a worker that
+/// instantiates exactly that entry.
 fn artifact_occ(name: &str, seq_lib: &Path) -> AllowedOccupant {
-    let descriptor = proc_descriptor(seq_lib);
-    assert_eq!(descriptor.name, "waiter");
+    let descriptor = proc_descriptor(seq_lib, name);
+    assert_eq!(descriptor.name, name);
     AllowedOccupant {
         name: name.to_string(),
         params: Vec::new(),
@@ -699,15 +714,15 @@ fn slow_sim_config() -> CoordinatorConfig {
 fn proc_slot_lifecycle_swap_and_isolation(seq_lib: &Path) {
     use metor_fsw_2::wiring::{Registry, parse, resolve};
 
-    // Two artifact ids over the one built cdylib: two allowed occupants with
-    // distinct Load names and identical contracts.
+    // Two entries of the one pack (the fixture registers the same body as
+    // `waiter` and `napper`): two allowed occupants with distinct Load names
+    // and identical contracts.
     let kdl = r#"
 coordinator cycle_rate=500.0
-artifact "alpha" crate="metor-fsw-2-seq-fixture" lib="metor_fsw_2_seq_fixture" type="waiter"
-artifact "beta"  crate="metor-fsw-2-seq-fixture" lib="metor_fsw_2_seq_fixture" type="waiter"
+artifact "seqs" crate="metor-fsw-2-seq-fixture" lib="metor_fsw_2_seq_fixture"
 slot "adcs" process=#true {
-    allow occupant="alpha"
-    allow occupant="beta"
+    allow occupant="waiter"
+    allow occupant="napper"
 }
 connect "coordinator" -> "adcs" msg="SequenceCommand"
 "#;
@@ -737,35 +752,35 @@ connect "coordinator" -> "adcs" msg="SequenceCommand"
         .expect("reader slot available");
     let mut control = coord.control_handle().expect("taken once per coordinator");
 
-    // Load alpha through the polled pipeline, run it to Done, then Load beta
-    // over the terminal — the occupant swap — and run beta to Done over the
-    // very same rings. Wall clock: the pipeline phases are real spawn+dlopen
-    // time, and the waiter's 2 µs wait elapses within a cycle.
+    // Load waiter through the polled pipeline, run it to Done, then Load
+    // napper over the terminal — the occupant swap — and run it to Done over
+    // the very same rings. Wall clock: the pipeline phases are real
+    // spawn+dlopen time, and the waiter's 2 µs wait elapses within a cycle.
     let (coord, phases, pid_a, pid_b) = stellarator::run(|| async move {
         let driver = stellarator::spawn(async move {
             let mut phases: Vec<u8> = Vec::new();
             let deadline = Instant::now() + Duration::from_secs(20);
-            control.emit(&seq_load("adcs", "alpha")).unwrap();
+            control.emit(&seq_load("adcs", "waiter")).unwrap();
             assert!(
                 wait_phase(&mut slot_view, &mut phases, LOADED, deadline).await,
-                "alpha's pipeline reached Loaded: {phases:?}"
+                "waiter's pipeline reached Loaded: {phases:?}"
             );
-            let pid_a = *child_pids().first().expect("alpha's worker is live");
+            let pid_a = *child_pids().first().expect("waiter's worker is live");
             control.emit(&seq_cmd("adcs", SequenceCommandKind::Start)).unwrap();
             assert!(
                 wait_phase(&mut slot_view, &mut phases, DONE, deadline).await,
-                "alpha ran to Done: {phases:?}"
+                "waiter ran to Done: {phases:?}"
             );
-            control.emit(&seq_load("adcs", "beta")).unwrap();
+            control.emit(&seq_load("adcs", "napper")).unwrap();
             assert!(
                 wait_phase(&mut slot_view, &mut phases, LOADED, deadline).await,
-                "beta's pipeline reached Loaded: {phases:?}"
+                "napper's pipeline reached Loaded: {phases:?}"
             );
-            let pid_b = *child_pids().first().expect("beta's worker is live");
+            let pid_b = *child_pids().first().expect("napper's worker is live");
             control.emit(&seq_cmd("adcs", SequenceCommandKind::Start)).unwrap();
             assert!(
                 wait_phase(&mut slot_view, &mut phases, DONE, deadline).await,
-                "beta ran to Done: {phases:?}"
+                "napper ran to Done: {phases:?}"
             );
             (phases, pid_a, pid_b)
         });
@@ -785,7 +800,7 @@ connect "coordinator" -> "adcs" msg="SequenceCommand"
         "two Load/run cycles through the pipeline: {phases:?}"
     );
     // One worker per occupant Load: the swap spawned a fresh process.
-    assert_ne!(pid_a, pid_b, "beta got its own worker");
+    assert_ne!(pid_a, pid_b, "napper got its own worker");
     // The ordered event stream, both occupants: each Load announces its
     // pipeline with Loading, progress crossed the mmap SequenceStatus ring,
     // and each terminal folded to Completed. Kinds are rendered to tokens
@@ -802,19 +817,19 @@ connect "coordinator" -> "adcs" msg="SequenceCommand"
             "completed".to_string(),
         ]
     };
-    let expected: Vec<String> = expect("alpha").into_iter().chain(expect("beta")).collect();
+    let expected: Vec<String> = expect("waiter").into_iter().chain(expect("napper")).collect();
     assert_eq!(kinds, expected, "the full ordered event stream");
-    // The worker list names the slot's live process: beta's worker holds its
-    // roles through Done, and no unplanned death was counted.
+    // The worker list names the slot's live process: napper's worker holds
+    // its roles through Done, and no unplanned death was counted.
     let workers = coord.workers();
     assert_eq!(workers.len(), 1, "{workers:?}");
     assert_eq!(workers[0].name, "adcs");
-    assert_eq!(workers[0].pid, pid_b, "the telemetered pid is beta's worker");
+    assert_eq!(workers[0].pid, pid_b, "the telemetered pid is napper's worker");
     assert_eq!(workers[0].restarts, 0, "Loads are commanded, not deaths");
     assert_eq!(workers[0].state, WorkerRunState::Running);
     assert!(coord.stopped().is_empty(), "Done is not a hard-stop");
 
-    // Teardown reaps beta's worker.
+    // Teardown reaps napper's worker.
     drop(coord);
     drop(events_view);
     assert!(child_pids().is_empty(), "no worker child survives teardown");

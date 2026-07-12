@@ -1,15 +1,15 @@
 //! In-process tests for the exported C ABI.
 //!
-//! The `fsw_*` symbols that `export_system!` generates live in this crate, so
-//! the tests call them directly instead of loading a shared library. A plain
+//! The `run_pack_*` helpers behind `export_pack!` live in this crate, so the
+//! tests call them directly instead of loading a shared library. A plain
 //! function call still exercises everything a loaded artifact would use, from
-//! the macro expansion through `RawBinder`, `attach_raw`, the `CyclicRunner`,
-//! and descriptor serialization.
+//! the pack manifest through `RawBinder`, `attach_raw`, the entry drivers,
+//! and manifest serialization.
 //!
 //! The tests also play the host's role. They allocate heap-backed
-//! `RingBuffer`s, hand the system `(base, len, role)` handles, and read
+//! `RingBuffer`s, hand the entry `(base, len, role)` handles, and read
 //! results back through their own writers and views over the same regions the
-//! system attaches to without owning.
+//! entry attaches to without owning.
 
 use core::ffi::c_void;
 use core::ptr;
@@ -24,17 +24,14 @@ use serde::{Deserialize, Serialize};
 use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
 
 use crate::abi::{
-    FswRing, FswStatus, PortDescMsg, PortSchemaMsg, ROLE_INPUT, ROLE_OUTPUT, RawBinder,
-    SystemDescriptorMsg, run_bind_init, run_create, run_destroy, run_execute, run_seq_bind_init,
-    run_seq_create, run_seq_destroy, run_seq_execute, run_seq_shutdown, run_shutdown,
+    FswRing, FswStatus, PackManifestMsg, PortDescMsg, PortSchemaMsg, ROLE_INPUT, ROLE_OUTPUT,
+    SystemDescriptorMsg, run_pack_bind_init, run_pack_close, run_pack_create, run_pack_describe,
+    run_pack_destroy, run_pack_execute, run_pack_open, run_pack_shutdown,
 };
-use crate::binder::BindPorts;
-use crate::sequence::{
-    Outcome, SeqBound, SeqClock, SeqStatusOut, SeqSystem, SequenceStatus, SlotControlIn, wait,
-};
+use crate::sequence::{Outcome, SequenceStatus, SlotControlIn, wait};
 use crate::wiring::LoadError;
 use crate::{
-    BuildSystem, CyclicSystem, Frame, Input, Out, Output, System, SystemHealth, SystemInput,
+    BuildSystem, CyclicSystem, Frame, Input, Out, Output, Pack, System, SystemHealth, SystemInput,
     SystemKind, SystemLog, SystemOutput, buffer_capacity,
 };
 
@@ -115,10 +112,46 @@ impl BuildSystem for Counter {
     }
 }
 
-// The `no_mangle` symbols are crate-unique, so this crate can export exactly
-// one system. `Counter` takes the slot; `Boom` (below) drives the `run_*`
-// helpers directly to avoid a second, clashing export.
-crate::export_system!(Counter);
+/// The test pack: the struct system, the panicking system, and a sequence
+/// entry — the three entry shapes the ABI drives. `run_pack_open` takes this
+/// fn exactly as `export_pack!` would reference it.
+fn test_pack() -> Pack {
+    Pack::new()
+        .system_type::<Counter, _>("counter")
+        .system_type::<Boom, _>("boom")
+        .sequence("wait_seq", wait_seq)
+}
+
+/// Entry indices in [`test_pack`]'s manifest order.
+const COUNTER: u32 = 0;
+const BOOM: u32 = 1;
+const WAIT_SEQ: u32 = 2;
+
+/// A sequence body that waits about two sim-microseconds and completes.
+async fn wait_seq() -> Outcome {
+    wait(std::time::Duration::from_micros(2)).await;
+    Outcome::Completed
+}
+
+/// An opened test pack that closes itself on drop, so every test tears down
+/// even on assertion failure.
+struct OpenPack(*mut c_void);
+
+impl OpenPack {
+    fn new() -> Self {
+        let pack = run_pack_open(test_pack);
+        assert!(!pack.is_null(), "fsw_pack_open returned a pack");
+        Self(pack)
+    }
+}
+
+impl Drop for OpenPack {
+    fn drop(&mut self) {
+        // SAFETY: the pointer came from `run_pack_open` and every state was
+        // destroyed by the test body before this drop.
+        unsafe { run_pack_close(self.0) };
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Host-emulation helpers.
@@ -165,15 +198,20 @@ fn abi_lifecycle_end_to_end() {
     // emits.
     let params = postcard::to_allocvec(&CounterParams { start: 100 }).unwrap();
 
-    let state = fsw_create(params.as_ptr(), params.len());
-    assert!(!state.is_null(), "fsw_create returned state");
-    fsw_bind_init(
-        state,
-        inputs.as_ptr(),
-        inputs.len(),
-        outputs.as_ptr(),
-        outputs.len(),
-    );
+    let pack = OpenPack::new();
+    // SAFETY: live pack; the params range is readable.
+    let state = unsafe { run_pack_create(pack.0, COUNTER, 0, params.as_ptr(), params.len()) };
+    assert!(!state.is_null(), "fsw_pack_create returned state");
+    // SAFETY: live state; the handle regions outlive the driver.
+    unsafe {
+        run_pack_bind_init(
+            state,
+            inputs.as_ptr(),
+            inputs.len(),
+            outputs.as_ptr(),
+            outputs.len(),
+        )
+    };
 
     // The host writes one record through its own writer over `in_ring`; the
     // system reads it through its non-owning view over the same region.
@@ -186,7 +224,8 @@ fn abi_lifecycle_end_to_end() {
         .unwrap();
 
     // One cycle, with `now` as the host's raw timestamp tick.
-    let status = fsw_execute(state, 1000);
+    // SAFETY: live, bound state.
+    let status = unsafe { run_pack_execute(state, 1000) };
     assert_eq!(status, FswStatus::Running);
 
     // The grant borrows the view, so read inside a scope that ends before the
@@ -197,11 +236,36 @@ fn abi_lifecycle_end_to_end() {
         assert_eq!(out.get().timestamp, Timestamp(1000), "stamped with `now`");
     }
 
-    // Tear the system down before the host rings drop.
-    fsw_shutdown(state);
-    fsw_destroy(state);
+    // Tear the instance down before the pack closes and the rings drop.
+    // SAFETY: live state, destroyed exactly once, before pack close.
+    unsafe {
+        run_pack_shutdown(state);
+        run_pack_destroy(state);
+    }
 
+    drop(pack);
     drop((in_ring, out_ring, health_ring, log_ring, out_view));
+}
+
+/// An out-of-range entry index is a null state, never a crash; so is a
+/// second create of the same reloadable entry succeeding (two instances).
+#[test]
+fn pack_create_bounds_and_reuse() {
+    let pack = OpenPack::new();
+    // SAFETY: live pack; empty params.
+    let oob = unsafe { run_pack_create(pack.0, 99, 0, ptr::null(), 0) };
+    assert!(oob.is_null(), "an out-of-range index returns null");
+
+    let params = postcard::to_allocvec(&CounterParams { start: 1 }).unwrap();
+    // SAFETY: live pack; readable params ranges.
+    let a = unsafe { run_pack_create(pack.0, COUNTER, 0, params.as_ptr(), params.len()) };
+    let b = unsafe { run_pack_create(pack.0, COUNTER, 0, params.as_ptr(), params.len()) };
+    assert!(!a.is_null() && !b.is_null(), "one entry, two instances");
+    // SAFETY: live states, destroyed exactly once each, before pack close.
+    unsafe {
+        run_pack_destroy(a);
+        run_pack_destroy(b);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -218,12 +282,23 @@ extern "C" fn collect_bytes(ctx: *mut c_void, buf: *const u8, len: usize) {
 
 #[test]
 fn abi_describe_round_trips() {
+    let pack = OpenPack::new();
     let mut buf: Vec<u8> = Vec::new();
-    let rc = fsw_describe(collect_bytes, &mut buf as *mut Vec<u8> as *mut c_void);
-    assert_eq!(rc, 0, "fsw_describe succeeded");
+    // SAFETY: live pack; the sink/ctx pair matches.
+    let rc = unsafe { run_pack_describe(pack.0, collect_bytes, &mut buf as *mut Vec<u8> as *mut c_void) };
+    assert_eq!(rc, 0, "fsw_pack_describe succeeded");
 
-    let msg: SystemDescriptorMsg = postcard::from_bytes(&buf).expect("descriptor decodes");
-    let desc = <Counter as CyclicSystem>::descriptor();
+    let manifest: PackManifestMsg = postcard::from_bytes(&buf).expect("manifest decodes");
+    assert_eq!(manifest.systems.len(), 3, "one entry per pack registration");
+    assert!(manifest.systems.iter().all(|s| s.reloadable));
+    assert!(manifest.systems.iter().all(|s| s.params_default.is_none()));
+
+    let msg = manifest.systems[COUNTER as usize].descriptor.clone();
+    let desc = {
+        let mut d = <Counter as CyclicSystem>::descriptor();
+        d.name = "counter";
+        d
+    };
 
     assert_eq!(msg.name, "counter");
     assert_eq!(msg.kind, SystemKind::Cyclic);
@@ -367,11 +442,11 @@ impl BuildSystem for Boom {
     }
 }
 
-/// An `extern "C"` frame over `run_execute`, the exact shape `export_system!`
-/// generates, so the panic crosses a real C ABI frame.
+/// An `extern "C"` frame over `run_pack_execute`, the exact shape
+/// `export_pack!` generates, so the panic crosses a real C ABI frame.
 extern "C" fn boom_execute(state: *mut c_void, now: u64) -> FswStatus {
-    // SAFETY: `state` is a live `AbiState<Boom>` from `run_create`.
-    unsafe { run_execute::<Boom>(state, now) }
+    // SAFETY: `state` is a live `PackAbiState` from `run_pack_create`.
+    unsafe { run_pack_execute(state, now) }
 }
 
 #[test]
@@ -388,13 +463,14 @@ fn abi_panic_is_contained() {
         handle(&log_ring, ROLE_OUTPUT),
     ];
 
+    let pack = OpenPack::new();
     // `()` params encode to zero bytes.
-    // SAFETY: null params with len 0 is the documented empty-params case.
-    let state = unsafe { run_create::<Boom>(ptr::null(), 0) };
+    // SAFETY: live pack; null params with len 0 is the documented empty case.
+    let state = unsafe { run_pack_create(pack.0, BOOM, 0, ptr::null(), 0) };
     assert!(!state.is_null());
-    // SAFETY: live state, and the handle regions outlive the runner.
+    // SAFETY: live state, and the handle regions outlive the driver.
     unsafe {
-        run_bind_init::<Boom, _>(
+        run_pack_bind_init(
             state,
             inputs.as_ptr(),
             inputs.len(),
@@ -410,12 +486,13 @@ fn abi_panic_is_contained() {
     // A later cycle is short-circuited because the slot is poisoned.
     assert_eq!(boom_execute(state, 2), FswStatus::Panicked);
 
-    // SAFETY: live state, used once more then destroyed.
+    // SAFETY: live state, used once more then destroyed before pack close.
     unsafe {
-        run_shutdown::<Boom>(state);
-        run_destroy::<Boom>(state);
+        run_pack_shutdown(state);
+        run_pack_destroy(state);
     }
 
+    drop(pack);
     drop((in_ring, out_ring, health_ring, log_ring));
 }
 
@@ -659,55 +736,10 @@ fn kdl_schema_encode_nested_struct_and_vec_byte_equal() {
 }
 
 // ---------------------------------------------------------------------------
-// A hand-written SeqSystem driven through the run_seq_* helpers. It has no
-// user ports, just the implicit SlotControlIn input and the SequenceStatus
-// plus health/log output tail.
+// A sequence entry driven through the pack ABI. It has no user ports, just
+// the implicit SlotControlIn input and the SequenceStatus plus health/log
+// output tail its descriptor carries.
 // ---------------------------------------------------------------------------
-
-use std::rc::Rc;
-use std::time::Duration;
-
-use crate::SystemDescriptor;
-
-/// A [`SeqSystem`] whose future waits about two sim-microseconds and then
-/// returns [`Outcome::Completed`].
-struct WaitSeq;
-
-impl SeqSystem for WaitSeq {
-    type Params = ();
-
-    fn descriptor() -> SystemDescriptor {
-        // inputs = [SlotControlIn]; outputs = the Out<SeqStatusOut> tail
-        // (SequenceStatus, health, log).
-        let inputs = vec![<Input<SlotControlIn>>::descriptor()];
-        let outputs = <Out<SeqStatusOut> as SystemOutput>::port_descs();
-        SystemDescriptor {
-            name: "wait_seq",
-            kind: SystemKind::Cyclic,
-            inputs,
-            outputs,
-            capabilities: Vec::new(),
-        }
-    }
-
-    fn build(_params: (), binder: &mut RawBinder, clock: &Rc<SeqClock>) -> SeqBound {
-        let control = <Input<SlotControlIn>>::bind(binder);
-        let status = <Out<SeqStatusOut> as BindPorts>::bind(binder);
-        let _ = clock;
-        let future: std::pin::Pin<Box<dyn std::future::Future<Output = Outcome>>> =
-            Box::pin(async {
-                // The deadline is 2us past `now` at the first poll; `wait`
-                // resolves once `now` reaches it.
-                wait(Duration::from_micros(2)).await;
-                Outcome::Completed
-            });
-        SeqBound {
-            future,
-            status,
-            control,
-        }
-    }
-}
 
 #[test]
 fn seq_abi_runs_to_done() {
@@ -728,13 +760,14 @@ fn seq_abi_runs_to_done() {
         handle(&log_ring, ROLE_OUTPUT),
     ];
 
+    let pack = OpenPack::new();
     // `()` params encode to zero bytes.
-    // SAFETY: null params with len 0 is the documented empty-params case.
-    let state = unsafe { run_seq_create::<WaitSeq>(std::ptr::null(), 0) };
-    assert!(!state.is_null(), "run_seq_create returned state");
+    // SAFETY: live pack; null params with len 0 is the documented empty case.
+    let state = unsafe { run_pack_create(pack.0, WAIT_SEQ, 0, std::ptr::null(), 0) };
+    assert!(!state.is_null(), "fsw_pack_create returned state");
     // SAFETY: live state, and the handle regions outlive the future.
     unsafe {
-        run_seq_bind_init::<WaitSeq>(
+        run_pack_bind_init(
             state,
             inputs.as_ptr(),
             inputs.len(),
@@ -745,31 +778,30 @@ fn seq_abi_runs_to_done() {
 
     // At t=0 the future suspends on `wait`, so the cycle reports Running.
     // SAFETY: live, bound state.
-    assert_eq!(
-        unsafe { run_seq_execute::<WaitSeq>(state, 0) },
-        FswStatus::Running
-    );
+    assert_eq!(unsafe { run_pack_execute(state, 0) }, FswStatus::Running);
     // At t=2 the deadline has elapsed and the future completes.
     // SAFETY: live, bound state.
-    assert_eq!(
-        unsafe { run_seq_execute::<WaitSeq>(state, 2) },
-        FswStatus::Done
-    );
+    assert_eq!(unsafe { run_pack_execute(state, 2) }, FswStatus::Done);
+    // The terminal is latched; a re-poll re-serves it without touching the
+    // finished future.
+    assert_eq!(unsafe { run_pack_execute(state, 3) }, FswStatus::Done);
 
     // A terminal SequenceStatus was published on the tail.
     {
         let rec = status_view
             .latest()
             .expect("a SequenceStatus record was written");
-        assert_eq!(rec.get().run_state, Outcome::Completed.run_state());
-        assert_eq!(rec.get().timestamp, Timestamp(2));
+        assert_eq!(rec.run_state, Outcome::Completed.run_state());
+        assert_eq!(rec.timestamp, Timestamp(2));
     }
 
-    // SAFETY: live state, torn down once before the host rings drop.
+    // SAFETY: live state, torn down once before the pack closes and the
+    // host rings drop.
     unsafe {
-        run_seq_shutdown::<WaitSeq>(state);
-        run_seq_destroy::<WaitSeq>(state);
+        run_pack_shutdown(state);
+        run_pack_destroy(state);
     }
+    drop(pack);
     drop((
         control_ring,
         status_ring,

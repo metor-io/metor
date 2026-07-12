@@ -86,11 +86,11 @@
 //! clock. Graphs are wired in Rust through [`CoordinatorBuilder`], or
 //! declaratively in KDL through the [`wiring`] module (the `kdl` feature).
 //!
-//! A system can also be compiled as a `cdylib` exporting the C ABI in [`abi`]
-//! (via [`export_system!`] or `#[system(export)]`) and loaded at runtime through
-//! [`dl`]. A loaded system describes itself over the ABI and is validated and
-//! wired exactly like a statically linked one. Both modules build without the
-//! `kdl` feature.
+//! A crate's systems can also be compiled as a **pack** `cdylib` exporting
+//! the C ABI in [`abi`] (one [`export_pack!`] per crate over its `pack()` fn)
+//! and loaded at runtime through [`dl`]. A loaded pack describes every entry
+//! over the ABI, and each is validated and wired exactly like a statically
+//! linked system. Both modules build without the `kdl` feature.
 //!
 //! # Built-in systems
 //!
@@ -187,8 +187,6 @@ pub use metor_fsw_ring as ring;
 pub use metor_fsw::{AsVTable, Componentize, Decomponentize, Metadatatize};
 pub use metor_fsw_2_macros::{Frame, SystemInput, SystemOutput};
 
-pub use metor_fsw_2_macros::export_system;
-
 pub use metor_fsw_2_macros::sequence;
 
 pub use metor_fsw_2_macros::system;
@@ -202,7 +200,7 @@ pub use sequence::{
 pub use metor_fsw::path;
 pub use {metor_proto, metor_proto_wkt};
 
-pub use dl::{DlError, DlSystem};
+pub use dl::{DlError, DlPack, DlSystem};
 
 #[cfg(feature = "kdl")]
 pub use wiring::{
