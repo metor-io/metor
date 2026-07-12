@@ -52,6 +52,10 @@ const PROVENANCE_STEM: &str = "mission";
 /// bundle is rejected with a clear message instead of a confusing parse error.
 const LEGACY_META_FILE: &str = "meta.kdl";
 
+/// Extension of the single-file bundle form: an uncompressed tar of the
+/// directory layout.
+pub const METOR_EXTENSION: &str = "metor";
+
 /// The plain-serde metadata sidecar (`meta.json`) written beside a bundle's
 /// `wiring.json`. Everything here is either a compatibility gate checked at
 /// load ([`abi_version`](Self::abi_version), [`ir_version`](Self::ir_version),
@@ -99,6 +103,12 @@ pub struct PackageOptions {
     /// `mission.kdl`), never consumed on load. `None` writes no provenance
     /// copy.
     pub provenance: Option<PathBuf>,
+    /// The package timestamp recorded as `built_at_unix`; `None` uses the
+    /// current time. Pin it to make a `.metor` archive byte-reproducible for
+    /// identical inputs (the timestamp is provenance, excluded from
+    /// `ir_sha256`, but it is content, so it must be fixed for bit-exact
+    /// output).
+    pub built_at_unix: Option<u64>,
 }
 
 /// A failure from [`write_bundle`] or [`load_bundle`], ranging from plain
@@ -229,56 +239,114 @@ fn sha256_hex(bytes: &[u8]) -> String {
 /// source file verbatim when [`PackageOptions::provenance`] names one. Every
 /// artifact in `wiring` must already have a built path, otherwise this returns
 /// [`BundleError::NotBuilt`].
-pub fn write_bundle(
+pub fn write_bundle(wiring: &Wiring, opts: &PackageOptions, out: &Path) -> Result<(), BundleError> {
+    let members = bundle_members(wiring, opts)?;
+    if out.extension().is_some_and(|e| e == METOR_EXTENSION) {
+        write_archive(&members, out)
+    } else {
+        write_dir(&members, out)
+    }
+}
+
+/// One bundle member: its file name and where its bytes come from — inline
+/// (the freshly built `meta.json` / `wiring.json`) or a source file to copy
+/// (`.so`s, sidecars, the provenance source).
+enum MemberSource {
+    Inline(Vec<u8>),
+    Path(PathBuf),
+}
+
+/// The bundle's members in canonical order — `meta.json`, `wiring.json`, then
+/// each artifact's `.so` and `.manifest` sorted by artifact id, then the
+/// provenance copy. One ordering both the directory and single-file writers
+/// share, so the two forms carry identical content, and the `.metor` tar is
+/// byte-stable for identical inputs.
+fn bundle_members(
     wiring: &Wiring,
     opts: &PackageOptions,
-    dir: &Path,
-) -> Result<(), BundleError> {
-    fs::create_dir_all(dir).map_err(io_at(dir))?;
-
-    for artifact in &wiring.artifacts {
-        let src = artifact.path.as_ref().ok_or_else(|| BundleError::NotBuilt {
-            artifact: artifact.id.clone(),
-        })?;
-        let dst = dir.join(&artifact.cdylib);
-        fs::copy(src, &dst).map_err(io_at(&dst))?;
-        // The manifest sidecar rides along when the build driver wrote one; a
-        // bundle without it stays valid (the manifest-hash check is skipped).
-        let sidecar = crate::dl::manifest_sidecar_path(src);
-        if sidecar.exists() {
-            let sidecar_dst = crate::dl::manifest_sidecar_path(&dst);
-            fs::copy(&sidecar, &sidecar_dst).map_err(io_at(&sidecar_dst))?;
-        }
-    }
-
+) -> Result<Vec<(String, MemberSource)>, BundleError> {
     let json = wiring_json(wiring);
-    let wiring_path = dir.join(WIRING_FILE);
-    fs::write(&wiring_path, &json).map_err(io_at(&wiring_path))?;
-
-    let built_at_unix = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
+    let built_at_unix = opts.built_at_unix.unwrap_or_else(|| {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0)
+    });
     let meta = BundleMeta {
         abi_version: FSW_ABI_VERSION,
         ir_version: IR_VERSION,
         target: opts.target.clone(),
         profile: if opts.release { "release" } else { "debug" }.to_string(),
         built_at_unix,
-        // Hash the exact bytes written, excluding the timestamp above.
+        // Hash the exact wiring.json bytes, excluding the timestamp above.
         ir_sha256: sha256_hex(json.as_bytes()),
         metor_config_version: opts.metor_config_version.clone(),
     };
     let meta_json = serde_json::to_string_pretty(&meta).expect("BundleMeta serializes to JSON");
-    let meta_path = dir.join(META_FILE);
-    fs::write(&meta_path, meta_json).map_err(io_at(&meta_path))?;
+
+    let mut members = vec![
+        (META_FILE.to_string(), MemberSource::Inline(meta_json.into_bytes())),
+        (WIRING_FILE.to_string(), MemberSource::Inline(json.into_bytes())),
+    ];
+
+    // Artifacts sorted by id so entry order is stable regardless of the order
+    // the front-end recorded them in.
+    let mut artifacts: Vec<&super::model::Artifact> = wiring.artifacts.iter().collect();
+    artifacts.sort_by(|a, b| a.id.cmp(&b.id));
+    for artifact in artifacts {
+        let src = artifact.path.as_ref().ok_or_else(|| BundleError::NotBuilt {
+            artifact: artifact.id.clone(),
+        })?;
+        members.push((artifact.cdylib.clone(), MemberSource::Path(src.clone())));
+        // The manifest sidecar rides along when the build driver wrote one; a
+        // bundle without it stays valid (the manifest-hash check is skipped).
+        let sidecar = crate::dl::manifest_sidecar_path(src);
+        if sidecar.exists() {
+            let name = format!("{}.manifest", artifact.cdylib);
+            members.push((name, MemberSource::Path(sidecar)));
+        }
+    }
 
     if let Some(source) = &opts.provenance {
-        let name = provenance_name(source);
+        members.push((provenance_name(source), MemberSource::Path(source.clone())));
+    }
+    Ok(members)
+}
+
+/// Read a member's bytes, inline or copied from its source file.
+fn member_bytes(source: &MemberSource) -> Result<Vec<u8>, BundleError> {
+    match source {
+        MemberSource::Inline(bytes) => Ok(bytes.clone()),
+        MemberSource::Path(path) => fs::read(path).map_err(io_at(path)),
+    }
+}
+
+/// Write the members as the directory bundle layout.
+fn write_dir(members: &[(String, MemberSource)], dir: &Path) -> Result<(), BundleError> {
+    fs::create_dir_all(dir).map_err(io_at(dir))?;
+    for (name, source) in members {
         let dst = dir.join(name);
-        fs::copy(source, &dst).map_err(io_at(&dst))?;
+        match source {
+            MemberSource::Inline(bytes) => fs::write(&dst, bytes).map_err(io_at(&dst))?,
+            MemberSource::Path(src) => {
+                fs::copy(src, &dst).map_err(io_at(&dst))?;
+            }
+        }
     }
     Ok(())
+}
+
+/// Write the members as a single uncompressed `.metor` tar with zeroed entry
+/// timestamps, so identical inputs produce byte-identical archives.
+fn write_archive(members: &[(String, MemberSource)], path: &Path) -> Result<(), BundleError> {
+    let mut out = Vec::new();
+    for (name, source) in members {
+        let bytes = member_bytes(source)?;
+        tar::write_entry(&mut out, name, &bytes);
+    }
+    // Two zero blocks mark end-of-archive.
+    out.extend_from_slice(&[0u8; tar::BLOCK * 2]);
+    fs::write(path, out).map_err(io_at(path))
 }
 
 /// The provenance copy's file name: `mission.<ext>` keeping the source's
@@ -291,14 +359,33 @@ fn provenance_name(source: &Path) -> String {
     }
 }
 
-/// Read a bundle directory back into a runnable [`Wiring`].
+/// Read a bundle back into a runnable [`Wiring`], dispatched by shape: a
+/// `.metor` file is unpacked to a temp directory first, a directory is read in
+/// place.
 ///
 /// Reads `meta.json`, checks the ABI version, IR version, and target triple
 /// against this host, deserializes `wiring.json`, fills each artifact's path
 /// from the `.so` copied alongside, and verifies every recorded manifest hash
 /// against the copied sidecar. Fails before any dlopen with the matching
 /// [`BundleError`] on any mismatch.
-pub fn load_bundle(dir: &Path) -> Result<Wiring, BundleError> {
+///
+/// A `.metor` bundle unpacks to a temp directory that outlives this call (the
+/// returned `Wiring`'s artifact paths point into it, dlopened later at
+/// resolve); the OS reclaims it. A directory bundle is read where it sits.
+pub fn load_bundle(path: &Path) -> Result<Wiring, BundleError> {
+    if path.is_file() && path.extension().is_some_and(|e| e == METOR_EXTENSION) {
+        let dir = unpack_archive(path)?;
+        // Keep the unpacked files alive for the process: resolve dlopens the
+        // `.so`s after this returns. Leaking the temp dir is the cost of a
+        // cargo-free single-file run; the OS temp cleanup reclaims it.
+        let dir = dir.keep();
+        return load_bundle_dir(&dir);
+    }
+    load_bundle_dir(path)
+}
+
+/// The directory-form loader behind [`load_bundle`].
+fn load_bundle_dir(dir: &Path) -> Result<Wiring, BundleError> {
     let meta_path = dir.join(META_FILE);
     if !meta_path.exists() {
         // A pre-Phase-3 bundle is a clean, named rejection, not a missing-file
@@ -369,4 +456,116 @@ pub fn load_bundle(dir: &Path) -> Result<Wiring, BundleError> {
         artifact.path = Some(so);
     }
     Ok(wiring)
+}
+
+/// Unpack a `.metor` archive into a fresh temp directory, writing every member
+/// as a real file so the directory loader (and dlopen) can proceed unchanged.
+fn unpack_archive(path: &Path) -> Result<tempfile::TempDir, BundleError> {
+    let bytes = fs::read(path).map_err(io_at(path))?;
+    let dir = tempfile::Builder::new()
+        .prefix("metor-bundle-")
+        .tempdir()
+        .map_err(io_at(path))?;
+    let members = tar::read(&bytes).map_err(|reason| BundleError::BadMeta {
+        reason: format!("malformed `.{METOR_EXTENSION}` archive: {reason}"),
+    })?;
+    for (name, content) in members {
+        let dst = dir.path().join(&name);
+        fs::write(&dst, content).map_err(io_at(&dst))?;
+    }
+    Ok(dir)
+}
+
+/// A byte-exact, dependency-free uncompressed `ustar` reader/writer, just
+/// enough for the flat bundle layout (short names, regular files). Reproducible
+/// by construction: zeroed timestamps, ids, and mode, so identical inputs
+/// produce identical bytes.
+mod tar {
+    /// The tar block size; headers and padded payloads are multiples of it.
+    pub(super) const BLOCK: usize = 512;
+
+    /// Append one regular-file entry (`name` header + padded `data`) to `out`.
+    pub(super) fn write_entry(out: &mut Vec<u8>, name: &str, data: &[u8]) {
+        let mut header = [0u8; BLOCK];
+        let name_bytes = name.as_bytes();
+        header[..name_bytes.len()].copy_from_slice(name_bytes);
+        // mode 0644, zeroed uid/gid — all octal fields are `len-1` digits + NUL.
+        octal(&mut header, 100, 8, 0o644);
+        octal(&mut header, 108, 8, 0);
+        octal(&mut header, 116, 8, 0);
+        octal(&mut header, 124, 12, data.len() as u64);
+        octal(&mut header, 136, 12, 0); // mtime zeroed: reproducible archives
+        header[156] = b'0'; // typeflag: regular file
+        header[257..263].copy_from_slice(b"ustar\0");
+        header[263..265].copy_from_slice(b"00");
+        checksum(&mut header);
+
+        out.extend_from_slice(&header);
+        out.extend_from_slice(data);
+        let rem = data.len() % BLOCK;
+        if rem != 0 {
+            out.extend(std::iter::repeat_n(0u8, BLOCK - rem));
+        }
+    }
+
+    /// Parse every regular-file entry into `(name, bytes)`, in archive order.
+    pub(super) fn read(bytes: &[u8]) -> Result<Vec<(String, Vec<u8>)>, String> {
+        let mut out = Vec::new();
+        let mut off = 0;
+        while off + BLOCK <= bytes.len() {
+            let header = &bytes[off..off + BLOCK];
+            // A zeroed header block ends the archive.
+            if header.iter().all(|&b| b == 0) {
+                break;
+            }
+            let name = cstr(&header[..100]);
+            let size = parse_octal(&header[124..136])? as usize;
+            off += BLOCK;
+            if off + size > bytes.len() {
+                return Err(format!("entry `{name}` runs past the archive"));
+            }
+            out.push((name, bytes[off..off + size].to_vec()));
+            // Advance past the payload, rounded up to a block boundary.
+            off += size.div_ceil(BLOCK) * BLOCK;
+        }
+        Ok(out)
+    }
+
+    /// Write `value` as a right-justified `len-1`-digit octal field with a
+    /// trailing NUL at `header[at..at+len]`.
+    fn octal(header: &mut [u8; BLOCK], at: usize, len: usize, value: u64) {
+        let digits = format!("{value:0width$o}", width = len - 1);
+        header[at..at + len - 1].copy_from_slice(digits.as_bytes());
+        header[at + len - 1] = 0;
+    }
+
+    /// Fill the checksum field (offset 148, 8 bytes): the unsigned sum of every
+    /// header byte with the field itself read as spaces, stored as 6 octal
+    /// digits, a NUL, then a space (the ustar convention).
+    fn checksum(header: &mut [u8; BLOCK]) {
+        for b in &mut header[148..156] {
+            *b = b' ';
+        }
+        let sum: u32 = header.iter().map(|&b| b as u32).sum();
+        let digits = format!("{sum:06o}");
+        header[148..154].copy_from_slice(digits.as_bytes());
+        header[154] = 0;
+        header[155] = b' ';
+    }
+
+    /// A NUL-terminated (or full-width) string field as an owned `String`.
+    fn cstr(field: &[u8]) -> String {
+        let end = field.iter().position(|&b| b == 0).unwrap_or(field.len());
+        String::from_utf8_lossy(&field[..end]).into_owned()
+    }
+
+    /// Parse a NUL/space-padded octal field.
+    fn parse_octal(field: &[u8]) -> Result<u64, String> {
+        let text = cstr(field);
+        let trimmed = text.trim_matches(|c: char| c == ' ' || c == '\0');
+        if trimmed.is_empty() {
+            return Ok(0);
+        }
+        u64::from_str_radix(trimmed, 8).map_err(|_| format!("bad octal field `{trimmed}`"))
+    }
 }

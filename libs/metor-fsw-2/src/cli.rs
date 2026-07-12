@@ -55,8 +55,9 @@ struct BuildArgs {
 struct PackageArgs {
     /// The wiring KDL file.
     kdl: PathBuf,
-    /// The bundle output directory (created if absent; conventionally `*.bundle`).
-    #[arg(short = 'o', long = "out", value_name = "DIR")]
+    /// The bundle output: a directory (conventionally `*.bundle`), or a
+    /// single-file `*.metor` archive (dispatched by the `.metor` extension).
+    #[arg(short = 'o', long = "out", value_name = "OUT")]
     out: PathBuf,
     /// Build the `--release` profile (default: debug).
     #[arg(long)]
@@ -206,6 +207,8 @@ fn cmd_package(args: PackageArgs) -> miette::Result<()> {
         metor_config_version: is_python_mission(&args.kdl)
             .then(|| metor_config_version().to_string()),
         provenance: Some(args.kdl.clone()),
+        // Current time; a reproducible build pins this.
+        built_at_unix: None,
     };
     write_bundle(&wiring, &opts, &args.out).into_diagnostic()?;
     println!(
@@ -274,9 +277,10 @@ fn load_run_wiring(args: &RunArgs) -> miette::Result<Wiring> {
     Ok(wiring)
 }
 
-/// A `<TARGET>` is a bundle if it is a directory (the bundle layout) or ends in `.bundle`.
+/// A `<TARGET>` is a bundle if it is a directory (the bundle layout), ends in
+/// `.bundle`, or is a single-file `.metor` archive.
 fn is_bundle(path: &Path) -> bool {
-    path.is_dir() || path.extension().is_some_and(|e| e == "bundle")
+    path.is_dir() || path.extension().is_some_and(|e| e == "bundle" || e == "metor")
 }
 
 /// Apply `run`'s override flags onto the loaded [`Wiring`] before [`resolve`].

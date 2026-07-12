@@ -2620,6 +2620,53 @@ fn bundle_manifest_hash_checked_at_load() {
     );
 }
 
+/// The single-file `.metor` form: a pack round-trips through the tar (loads
+/// back with artifact paths filled from the unpacked temp dir), and two packs
+/// of identical inputs are byte-identical (stable order, zeroed timestamps,
+/// pinned `built_at`).
+#[cfg(not(miri))]
+#[test]
+fn metor_archive_round_trips_and_is_reproducible() {
+    use crate::wiring::{PackageOptions, load_bundle, write_bundle};
+
+    let _guard = crate::dl::FIXTURE_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let mut wiring = WiringBuilder::new()
+        .artifact("fixture", "metor-fsw-2-dl-fixture", "metor_fsw_2_dl_fixture")
+        .build();
+    if let Err(e) = crate::wiring::build_artifacts(&mut wiring, &crate::BuildOptions::default()) {
+        eprintln!("skipping: build_artifacts failed: {e}");
+        return;
+    }
+
+    let tmp = tempfile::tempdir().expect("temp dir");
+    // Pin built_at so the archive is byte-reproducible.
+    let opts = PackageOptions {
+        built_at_unix: Some(1_700_000_000),
+        ..PackageOptions::default()
+    };
+    let a = tmp.path().join("a.metor");
+    let b = tmp.path().join("b.metor");
+    write_bundle(&wiring, &opts, &a).expect("write archive a");
+    write_bundle(&wiring, &opts, &b).expect("write archive b");
+    assert_eq!(
+        std::fs::read(&a).unwrap(),
+        std::fs::read(&b).unwrap(),
+        "identical inputs produce byte-identical archives"
+    );
+
+    // Unpack and load: artifact paths point into the unpacked temp dir.
+    let loaded = load_bundle(&a).expect("the .metor bundle loads");
+    assert_eq!(loaded.artifacts.len(), 1);
+    let path = loaded.artifacts[0].path.as_deref().expect("artifact path filled");
+    assert!(path.exists(), "the unpacked .so is a real file for dlopen");
+    assert!(
+        path.file_name().and_then(|n| n.to_str()) == Some(&wiring.artifacts[0].cdylib),
+        "unpacked under the cdylib name"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // SourceRef provenance: parse anchors every spec at its declaring node,
 // serde defaults keep old documents readable, and resolve errors carry the
