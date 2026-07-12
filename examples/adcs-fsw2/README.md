@@ -68,6 +68,16 @@ rlib lets the convergence test register the **same** `pack()` statically for the
 check. The `export_pack!` C-ABI symbols ride an `export` feature (on by default for the
 cdylib, off when the test links the rlib) so the rlib carries no `fsw_pack_*` exports.
 
+## Two front-ends
+
+The mission is described two equivalent ways. `mission.kdl` is the committed default the CLI
+runner and every tracked test read. `mission.py` re-states it through the `metor_config`
+Python front-end (`libs/metor-fsw-2/python`): `metor-fsw build|run mission.py` spawns a
+subprocess CPython that evaluates the file against the recorder and emits the same `Wiring`
+IR the KDL parser produces. `tests/equivalence.rs` asserts the two resolve to equivalent
+wirings. `mission.py` needs only a stock `python3` (≥ 3.10) — no `pip install`, since the
+`metor-fsw` binary embeds the recorder.
+
 ## Watch it live in metor-panel
 
 `cargo run` first builds the system cdylibs (incremental — only changed crates recompile),

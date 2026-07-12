@@ -300,6 +300,60 @@ pub(crate) fn decode_value_params<P: serde::de::DeserializeOwned>(
     Ok(params)
 }
 
+/// The node kind a [`ParamSource::Kdl`] text came from, selecting which line
+/// properties and leading arguments belong to the wiring surface rather than
+/// the params. A `system` node reserves `type=`/`artifact=`/`process=` and
+/// leads with the instance-name argument; a slot `allow` node reserves
+/// `occupant=`/`artifact=` and has no positional.
+#[derive(Clone, Copy, Debug)]
+pub enum ParamNode {
+    /// A `system` node.
+    System,
+    /// A slot `allow` node.
+    Occupant,
+}
+
+/// Render a [`ParamSource`] as the plain JSON value tree it carries, joining
+/// the two front-ends' params to one comparable form for tooling and
+/// equivalence checks. [`ParamSource::Kdl`] is re-parsed through the shared
+/// params deserializer, [`ParamSource::Value`] is returned as-is, and
+/// [`ParamSource::None`] yields `None`. [`ParamSource::Postcard`] is the
+/// Rust-builder-only encoded form and has no schema-free value tree.
+pub fn param_value_tree(
+    params: &ParamSource,
+    node: ParamNode,
+) -> Result<Option<serde_json::Value>, LoadError> {
+    match params {
+        ParamSource::None => Ok(None),
+        ParamSource::Value(value) => Ok(Some(value.clone())),
+        ParamSource::Kdl(text) => {
+            let (reserved, skip_args) = match node {
+                ParamNode::System => (SYSTEM_RESERVED, 1),
+                ParamNode::Occupant => (ALLOW_RESERVED, 0),
+            };
+            let doc = text.parse::<KdlDocument>().map_err(|e| LoadError::Parse {
+                source: e,
+                src: text.clone(),
+                span: (0, text.len()).into(),
+            })?;
+            let node = doc.nodes().first().ok_or_else(|| LoadError::ValueParams {
+                system: "<params>".into(),
+                reason: "params text has no node".into(),
+                src: text.clone(),
+                span: (0, text.len()).into(),
+            })?;
+            let (value, _spans) = de::params_value(node, text, "<params>", reserved, skip_args)?;
+            Ok(Some(value))
+        }
+        ParamSource::Postcard(_) => Err(LoadError::StaticPostcardParams {
+            system: "<params>".into(),
+            ty: "<unknown>".into(),
+            src: String::new(),
+            span: (0, 0).into(),
+        }),
+    }
+}
+
 /// One registered type: its factory plus the static descriptor, available
 /// without constructing the system so [`resolve`] can order registrations by
 /// capability.
