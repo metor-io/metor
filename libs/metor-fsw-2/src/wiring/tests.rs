@@ -1944,3 +1944,67 @@ system "x" type="PkNoop" bogus=1
     let msg = format!("{err}");
     assert!(msg.contains("bogus"), "names the stray key: {msg}");
 }
+
+/// An entry with declared `.defaults(...)`: a KDL node spells only its
+/// overrides, an absent config takes the defaults verbatim.
+#[cfg(not(miri))]
+#[stellarator::test]
+async fn pack_entry_defaults_overlay_kdl_overrides() {
+    #[derive(serde::Serialize, serde::Deserialize, postcard_schema::Schema)]
+    struct TrimParams {
+        gain: f64,
+        bias: f64,
+    }
+
+    static LAST: AtomicU64 = AtomicU64::new(0);
+    static LAST_DEFAULTED: AtomicU64 = AtomicU64::new(0);
+    struct St {
+        gain: f64,
+        bias: f64,
+    }
+    fn emit(s: &mut St, now: Timestamp, out: &mut crate::Output<Imu>) {
+        LAST.store((s.gain + s.bias).to_bits(), Relaxed);
+        out.publish(&Imu {
+            timestamp: now,
+            omega: s.gain + s.bias,
+        });
+    }
+    fn emit2(s: &mut St, now: Timestamp, out: &mut crate::Output<Nav>) {
+        LAST_DEFAULTED.store((s.gain + s.bias).to_bits(), Relaxed);
+        out.publish(&Nav {
+            timestamp: now,
+            angle: s.gain + s.bias,
+        });
+    }
+    let init = |p: TrimParams| St {
+        gain: p.gain,
+        bias: p.bias,
+    };
+    let defaults = || TrimParams {
+        gain: 10.0,
+        bias: 0.5,
+    };
+
+    let mut r = Registry::new();
+    r.register_pack(
+        crate::Pack::new()
+            .system("Trim", crate::system(emit).init(init).defaults(defaults()))
+            .system("Trim2", crate::system(emit2).init(init).defaults(defaults())),
+    );
+
+    // `bias` is omitted: the default (0.5) fills it; `gain` overrides.
+    // The second instance has no params at all: pure defaults (10.5).
+    let kdl = r#"
+coordinator cycle_rate=1000.0
+system "trim" type="Trim" gain=2.0
+system "trim2" type="Trim2"
+"#;
+    let mut coord = load(kdl, &r).expect("defaults fill the absent fields");
+    coord.run_for(2).await;
+    assert_eq!(f64::from_bits(LAST.load(Relaxed)), 2.5, "override + default");
+    assert_eq!(
+        f64::from_bits(LAST_DEFAULTED.load(Relaxed)),
+        10.5,
+        "absent config = pure defaults"
+    );
+}

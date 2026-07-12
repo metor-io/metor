@@ -123,7 +123,7 @@ pub struct SlotStatus {
 pub enum OccupantBacking {
     /// An opened library in this process; `Load` runs `fsw_create` over the
     /// handle, which stays loaded across swaps.
-    Dl(DlSystem),
+    Dl(Box<DlSystem>),
     /// A built cdylib the occupant's **worker process** opens
     /// (`docs/process-slots.md`); the host keeps only the path and never
     /// loads the artifact itself. Slots mix backings never: `add_slot`
@@ -150,7 +150,7 @@ impl AllowedOccupant {
             name: name.into(),
             params,
             descriptor: system.descriptor().clone(),
-            backing: OccupantBacking::Dl(system),
+            backing: OccupantBacking::Dl(Box::new(system)),
         }
     }
 }

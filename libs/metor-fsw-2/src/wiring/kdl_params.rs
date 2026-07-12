@@ -46,6 +46,25 @@ pub fn encode_kdl_params(
     reserved: &'static [&'static str],
     skip_args: usize,
 ) -> Result<Vec<u8>, LoadError> {
+    encode_kdl_params_with_defaults(node_text, schema, system, reserved, skip_args, None)
+}
+
+/// As [`encode_kdl_params`], overlaying the node's params onto a decoded
+/// default-params base when the entry declared one.
+///
+/// `defaults` is the entry's canonical `Params` postcard blob (from the pack
+/// manifest or the entry itself). It decodes against the same schema into a
+/// complete params object; the node's top-level keys then replace matching
+/// fields, so a config spells only its overrides. The merge is top-level: a
+/// nested struct named in KDL replaces the default one wholesale.
+pub fn encode_kdl_params_with_defaults(
+    node_text: &str,
+    schema: &OwnedNamedType,
+    system: &str,
+    reserved: &'static [&'static str],
+    skip_args: usize,
+    defaults: Option<&[u8]>,
+) -> Result<Vec<u8>, LoadError> {
     let span: SourceSpan = (0, node_text.len()).into();
     let encode_err = |reason: String| LoadError::DlParamEncode {
         system: system.to_string(),
@@ -63,6 +82,14 @@ pub fn encode_kdl_params(
         .ok_or_else(|| encode_err("the carried params text has no node".into()))?;
 
     let (value, spans) = de::params_value(node, node_text, system, reserved, skip_args)?;
+    let value = match defaults {
+        Some(bytes) if !bytes.is_empty() => {
+            let base = postcard_dyn::from_slice_dyn(schema, bytes)
+                .map_err(|e| encode_err(format!("default params do not decode: {e:?}")))?;
+            merge_onto_defaults(base, value).map_err(encode_err)?
+        }
+        _ => value,
+    };
     let value = conform_to_schema(&schema.ty, value, &spans, system, node_text, node.span())
         .map_err(|e| match e {
             Conform::Load(err) => *err,
@@ -71,6 +98,20 @@ pub fn encode_kdl_params(
 
     postcard_dyn::to_stdvec_dyn(schema, &value)
         .map_err(|e| encode_err(format!("dynamic postcard encode failed: {e:?}")))
+}
+
+/// Overlay the config object's top-level keys onto the decoded default base.
+fn merge_onto_defaults(base: Value, config: Value) -> Result<Value, String> {
+    let Value::Object(mut base) = base else {
+        return Err(format!("default params are not an object: `{base}`"));
+    };
+    let Value::Object(config) = config else {
+        return Err(format!("expected a params object, got `{config}`"));
+    };
+    for (key, value) in config {
+        base.insert(key, value);
+    }
+    Ok(Value::Object(base))
 }
 
 /// What the schema walk reports when a value does not fit, either a spanned

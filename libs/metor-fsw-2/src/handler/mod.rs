@@ -34,7 +34,7 @@ use core::marker::PhantomData;
 use postcard_schema::Schema;
 use serde::de::DeserializeOwned;
 
-pub use param::{BindCx, CycleCx, DeclSink, ExecParam};
+pub use param::{BindCx, CycleCx, DeclSink, ExecParam, MissionTime};
 pub use task::{AsyncSystemFn, IntoOutcome, Params, TaskParam};
 pub use tuples::{ExecParamSet, ExecuteFn};
 
@@ -70,9 +70,11 @@ pub struct SystemDef<S, M, F, I> {
 /// params.
 pub struct NoInit;
 
-/// Construction from typed params via an init fn.
+/// Construction from typed params via an init fn, with optional declared
+/// defaults (canonical postcard bytes) a config only overrides.
 pub struct InitWith<G, M2> {
     init: G,
+    defaults: Option<Vec<u8>>,
     _m: PhantomData<fn() -> M2>,
 }
 
@@ -93,6 +95,7 @@ where
             execute: self.execute,
             init: InitWith {
                 init,
+                defaults: None,
                 _m: PhantomData,
             },
             _m: PhantomData,
@@ -108,6 +111,26 @@ where
             init: Prebuilt(Some(state)),
             _m: PhantomData,
         }
+    }
+}
+
+impl<S, M, F, G, M2> SystemDef<S, M, F, InitWith<G, M2>>
+where
+    F: ExecuteFn<S, M>,
+    G: InitFn<S, M2>,
+{
+    /// Declare default params: a config (KDL or an absent params blob) need
+    /// spell only its overrides, on every loading path. The value is encoded
+    /// once here; nothing requires `Default` on the params type.
+    pub fn defaults(mut self, value: G::Params) -> Self
+    where
+        G::Params: serde::Serialize,
+    {
+        self.init.defaults = Some(
+            postcard::to_allocvec(&value)
+                .expect("params postcard-encode (Serialize is infallible)"),
+        );
+        self
     }
 }
 
@@ -204,11 +227,12 @@ where
     fn into_entry(self, name: &'static str) -> PackEntry {
         let execute = self.execute;
         let init = self.init.init;
-        PackEntry {
+        let defaults = self.init.defaults;
+        let mut entry = PackEntry {
             name,
             descriptor: descriptor_for::<F::Params>(name),
             params_schema: <G::Params as Schema>::SCHEMA,
-            params_default: None,
+            params_default: defaults,
             reloadable: true,
             create: Box::new(move |params: EntryParams<'_>| {
                 let p: G::Params = decode_params(params)?;
@@ -221,7 +245,11 @@ where
                 });
                 Ok(pending)
             }),
+        };
+        if entry.params_default.is_some() {
+            entry.wrap_create_with_defaults();
         }
+        entry
     }
 }
 

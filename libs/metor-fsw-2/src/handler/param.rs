@@ -186,6 +186,46 @@ impl ExecParam for Timestamp {
     }
 }
 
+/// Mission time as an execute parameter: the cycle `now` plus the elapsed
+/// time since the entry's first cycle (the epoch is latched on first use).
+/// Replaces the hand-rolled `t_sim += DT` lockstep counters systems keep for
+/// ephemeris/epoch math; deterministic under a simulated clock because it is
+/// derived entirely from the coordinator `now`.
+#[derive(Clone, Copy, Debug)]
+pub struct MissionTime {
+    /// The coordinator's timestamp for this cycle.
+    pub now: Timestamp,
+    /// Time since this entry's first cycle.
+    pub elapsed: core::time::Duration,
+}
+
+impl MissionTime {
+    /// `elapsed` as seconds, the shape ephemeris helpers usually want.
+    pub fn elapsed_secs(&self) -> f64 {
+        self.elapsed.as_secs_f64()
+    }
+}
+
+impl ExecParam for MissionTime {
+    /// The latched first-cycle epoch.
+    type State = Option<Timestamp>;
+    type Item<'r> = MissionTime;
+
+    fn decl(_sink: &mut DeclSink) {}
+    fn bind(_cx: &mut BindCx) -> Self::State {
+        None
+    }
+    fn get<'r>(state: &'r mut Self::State, cx: &mut CycleCx<'r>) -> MissionTime {
+        let epoch = *state.get_or_insert(cx.now);
+        // Timestamps are microsecond ticks; a clock can only move forward.
+        let micros = (cx.now.0 - epoch.0).max(0) as u64;
+        MissionTime {
+            now: cx.now,
+            elapsed: core::time::Duration::from_micros(micros),
+        }
+    }
+}
+
 impl ExecParam for &mut HealthPort<NoWake, NoWake> {
     type State = ();
     type Item<'r> = &'r mut HealthPort;
