@@ -15,7 +15,7 @@ ARTIFACT = Artifact(
     id="seqs",
     crate="adcs-sequences",
     lib="adcs_sequences",
-    manifest_hash="sha256:a182b22f38142ad6a1f15b1959b0e12c1bddb4eb6f40a1b12a18b3242a9c2fd5",
+    manifest_hash="sha256:4e07fe9334431c3d5b070c4c8409f79d6f781c2a966cddaffa5cdddc26575820",
 )
 
 
@@ -53,7 +53,18 @@ def commissioning(
     settle_timeout_s: float,
     confirm_timeout_s: float,
 ) -> System:
-    """Occupant `commissioning` for a `mode`-style slot's allow set."""
+    """Occupant `commissioning` for a `mode`-style slot's allow set.
+
+    Parameters:
+        rate_detumble_enter: Enter the detumble phase only above this estimated rate (rad/s). Sized by wheel capture: absorbing 1.0 rad/s loads the worst axis to ≈38% of the momentum limit, so anything slower goes straight to the wheels and the B-cross phase is reserved for genuinely hot tumbles.
+        rate_detumble_exit: Leave detumble below this estimated rate (rad/s) — hysteresis against `enter`.
+        est_delta_rad: Estimator-settle gate: successive q̂ deltas below this (rad)…
+        est_dwell_s: …for this long (s) completes warm-up.
+        coarse_err_rad: Coarse-pointing gate: tracking error to the commanded law's target below this (rad)…
+        coarse_dwell_s: …for this long (s) advances to fine pointing.
+        confirm_dwell_s: Fine pointing confirms (→ `Completed`) after the error holds for this long (s).
+        warmup_timeout_s: Per-phase timeouts (s): expiry publishes `ModeCmd::safe` and fails the sequence.
+    """
     return System(
         "commissioning",
         ARTIFACT,

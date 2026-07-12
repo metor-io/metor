@@ -496,9 +496,14 @@ impl Codegen {
         self.used_system = true;
         let name = &desc.name;
         let mut out = format!("class {name}(System):\n");
-        out.push_str(&format!(
-            "    \"\"\"`{name}` pack entry.\"\"\"\n\n"
+        out.push_str(&docstring(
+            1,
+            &format!("`{name}` pack entry."),
+            desc.docs.as_deref(),
+            params,
+            &desc.params_docs,
         ));
+        out.push('\n');
         out.push_str(&init_signature(params));
         out.push_str(&super_init(name, params));
 
@@ -518,8 +523,15 @@ impl Codegen {
         self.used_system = true;
         let name = &desc.name;
         let sig = occupant_signature(name, params);
+        let doc = docstring(
+            1,
+            &format!("Occupant `{name}` for a `mode`-style slot's allow set."),
+            desc.docs.as_deref(),
+            params,
+            &desc.params_docs,
+        );
         let body = occupant_body(name, params);
-        format!("{sig}{body}")
+        format!("{sig}{doc}{body}")
     }
 
     /// The class-level `port: OutPort[Frame]  # …` annotation block.
@@ -810,16 +822,54 @@ fn occupant_signature(name: &str, params: &[Param]) -> String {
 
 /// The occupant callable body: build and return the spec.
 fn occupant_body(name: &str, params: &[Param]) -> String {
-    let mut out = format!("    \"\"\"Occupant `{name}` for a `mode`-style slot's allow set.\"\"\"\n");
     if params.is_empty() {
-        out.push_str(&format!("    return System(\"{name}\", ARTIFACT)\n"));
-        return out;
+        return format!("    return System(\"{name}\", ARTIFACT)\n");
     }
-    out.push_str(&format!("    return System(\n        \"{name}\",\n        ARTIFACT,\n"));
+    let mut out = format!("    return System(\n        \"{name}\",\n        ARTIFACT,\n");
     for p in params {
         out.push_str(&format!("        {}={},\n", p.name, p.name));
     }
     out.push_str("    )\n");
+    out
+}
+
+/// A `"""..."""` docstring at `indent` levels (4 spaces each): a summary line,
+/// the entry's own doc (ABI v6) if present, and a `Parameters:` list of the
+/// documented params, in signature order. pyright surfaces this on hover.
+fn docstring(
+    indent: usize,
+    summary: &str,
+    entry_doc: Option<&str>,
+    params: &[Param],
+    params_docs: &[(String, String)],
+) -> String {
+    let pad = "    ".repeat(indent);
+    let documented: Vec<(&str, &str)> = params
+        .iter()
+        .filter_map(|p| {
+            params_docs
+                .iter()
+                .find(|(name, _)| *name == p.name)
+                .map(|(_, doc)| (p.name.as_str(), doc.as_str()))
+        })
+        .collect();
+
+    // A one-liner when there is nothing extra to say.
+    if entry_doc.is_none() && documented.is_empty() {
+        return format!("{pad}\"\"\"{summary}\"\"\"\n");
+    }
+
+    let mut out = format!("{pad}\"\"\"{summary}\n");
+    if let Some(doc) = entry_doc {
+        out.push_str(&format!("\n{pad}{doc}\n"));
+    }
+    if !documented.is_empty() {
+        out.push_str(&format!("\n{pad}Parameters:\n"));
+        for (name, doc) in documented {
+            out.push_str(&format!("{pad}    {name}: {doc}\n"));
+        }
+    }
+    out.push_str(&format!("{pad}\"\"\"\n"));
     out
 }
 
@@ -1038,6 +1088,7 @@ mod tests {
             delivery: Delivery::Snapshot,
             fan_in: FanIn::One,
             telemetered,
+            docs: None,
         }
     }
 
@@ -1049,10 +1100,16 @@ mod tests {
             delivery: Delivery::Log,
             fan_in: FanIn::One,
             telemetered: false,
+            docs: None,
         }
     }
 
-    fn descriptor(name: &str, inputs: Vec<PortDescMsg>, outputs: Vec<PortDescMsg>) -> SystemDescriptorMsg {
+    fn descriptor(
+        name: &str,
+        inputs: Vec<PortDescMsg>,
+        outputs: Vec<PortDescMsg>,
+        params_docs: Vec<(String, String)>,
+    ) -> SystemDescriptorMsg {
         SystemDescriptorMsg {
             name: name.to_string(),
             kind: SystemKind::Cyclic,
@@ -1060,11 +1117,17 @@ mod tests {
             outputs,
             params_schema: demo_schema(),
             capabilities: Vec::new(),
+            docs: None,
+            params_docs,
         }
     }
 
     pub(super) fn demo_manifest() -> Vec<u8> {
         let blob = postcard::to_allocvec(&Demo::default()).unwrap();
+        let widget_docs = vec![
+            ("count".to_string(), "How many widgets to make.".to_string()),
+            ("gain".to_string(), "Loop gain (1/s), ~3e-12 at 400 km.".to_string()),
+        ];
         let msg = PackManifestMsg {
             systems: vec![
                 PackSystemMsg {
@@ -1072,6 +1135,7 @@ mod tests {
                         "Widget",
                         vec![table_port("cmd", "cmd", false)],
                         vec![table_port("sensors", "sensors", true), msg_port("events")],
+                        widget_docs,
                     ),
                     reloadable: true,
                     params_default: Some(blob),
@@ -1079,7 +1143,7 @@ mod tests {
                 PackSystemMsg {
                     descriptor: SystemDescriptorMsg {
                         params_schema: OwnedNamedType::from(<() as Schema>::SCHEMA),
-                        ..descriptor("startup", Vec::new(), vec![table_port("mode_cmd", "mode_cmd", true)])
+                        ..descriptor("startup", Vec::new(), vec![table_port("mode_cmd", "mode_cmd", true)], Vec::new())
                     },
                     reloadable: true,
                     params_default: None,

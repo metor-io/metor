@@ -136,6 +136,7 @@ pub mod wiring;
 
 pub mod abi;
 pub mod dl;
+pub mod params_docs;
 
 // Cross-process systems need a shared futex (Linux, macOS 14.4+); on other
 // targets the module reduces to a no-op `worker_entry` and `build()` rejects
@@ -193,10 +194,16 @@ pub use system::{
 #[doc(hidden)]
 pub use system::{NoParamsDefault, ParamsDefaultProbe};
 
+pub use params_docs::{ParamsDocEntry, params_docs_for};
+
+// Re-exported so `#[derive(inventory-based ParamsDocs)]` can name the crate.
+#[doc(hidden)]
+pub use inventory;
+
 pub use metor_fsw_ring as ring;
 
 pub use metor_fsw::{AsVTable, Componentize, Decomponentize, Metadatatize};
-pub use metor_fsw_2_macros::{Frame, SystemInput, SystemOutput, frame};
+pub use metor_fsw_2_macros::{Frame, ParamsDocs, SystemInput, SystemOutput, frame};
 
 pub use metor_fsw_2_macros::sequence;
 

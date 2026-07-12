@@ -15,7 +15,7 @@ ARTIFACT = Artifact(
     id="demo",
     crate="demo-systems",
     lib="demo_systems",
-    manifest_hash="sha256:795d5b7405d46b3196a73efaf525686a6b36cf57ec6a7684ea3d9075e452a31f",
+    manifest_hash="sha256:d9f364664ad6bdf6928f85ad05665ad5674fdd43adbd32751c36b4bd95b5c771",
 )
 
 
@@ -32,7 +32,12 @@ class ModeCmd(Frame):
 
 
 class Widget(System):
-    """`Widget` pack entry."""
+    """`Widget` pack entry.
+
+    Parameters:
+        count: How many widgets to make.
+        gain: Loop gain (1/s), ~3e-12 at 400 km.
+    """
 
     def __init__(
         self,

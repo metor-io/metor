@@ -15,7 +15,7 @@ ARTIFACT = Artifact(
     id="adcs",
     crate="adcs-systems",
     lib="adcs_systems",
-    manifest_hash="sha256:22fb4caa2f6dee848b25c63807899d8612af09e51c8fb856eb5c2928e38a2dfc",
+    manifest_hash="sha256:49a9fc76cd9f83b70512d51f388527ebeadbf512e323e9db2368278e6c0226b9",
 )
 
 
@@ -68,7 +68,25 @@ class ModeCmd(Frame):
 
 
 class Plant(System):
-    """`Plant` pack entry."""
+    """`Plant` pack entry.
+
+    Parameters:
+        init_angle: Initial attitude offset from the target, radians about the [1,1,1] axis.
+        init_rate: Initial body-rate magnitude, rad/s about [1,1,1].
+        meas_sigma: 1-sigma sensor noise (rad/s for gyro, unitless for the normalized sun vector; the magnetometer's Tesla-valued sigma lives with the plant's sensor model).
+        seed: RNG seed, so a run is reproducible.
+        disarmed: Bring the spacecraft up with every reaction wheel offline (the `--disarmed` parity): no control torque is applied until the wheels are armed. Defaults to `false`.
+        rho: Atmospheric density (kg/m³) — ~3e-12 at 400 km, solar-mean.
+        cd: Drag coefficient.
+        area_aero: Aerodynamic reference area (m²).
+        cp_offset_b: Center-of-pressure offset from the center of mass, body frame (m) — the drag/SRP torque arm.
+        m_res_b: Residual magnetic dipole, body frame (A·m²).
+        area_srp: SRP reference area (m²).
+        cr: SRP reflectivity coefficient (1 absorbing … 2 mirror).
+        mtq_max_dipole: Per-axis magnetorquer dipole limit (A·m²).
+        init_wheel_h: Per-wheel stored-momentum preload (N·m·s) — gives the desat demos/tests something to dump at boot. Defaults to zero.
+        init_orbit_phase: Initial in-plane orbit phase (rad): rotates the boot position/velocity around the orbit, `r·(cos θ, sin θ, 0)` / `v·(−sin θ, cos θ, 0)`. Zero is the classic +X boot (entirely sunlit for the test windows); the eclipse tests crank it to start in or near Earth shadow. Deterministic — no RNG involved.
+    """
 
     def __init__(
         self,
@@ -122,7 +140,11 @@ class Plant(System):
 
 
 class Nav(System):
-    """`Nav` pack entry."""
+    """`Nav` pack entry.
+
+    Parameters:
+        meas_sigma: MEKF measurement 1-sigma for the two vector observations.
+    """
 
     def __init__(
         self,
@@ -143,7 +165,13 @@ class Nav(System):
 
 
 class Ctrl(System):
-    """`Ctrl` pack entry."""
+    """`Ctrl` pack entry.
+
+    Parameters:
+        q_weight: LQR attitude/rate state weight (q) and control weight (r).
+        k_desat: Momentum-desaturation gain (1/s): at |B| ≈ 4e-5 T, 5e-4 gives a ~2000 s unloading time constant — MTQ desat is honestly slow. Zero disables desat.
+        k_detumble: B-cross detumble gain (N·m·s/rad): 5e-5 saturates the 0.2 A·m² torquer near |ω| ≈ 0.16 rad/s and damps with an unsaturated time constant of ~300 s.
+    """
 
     def __init__(
         self,

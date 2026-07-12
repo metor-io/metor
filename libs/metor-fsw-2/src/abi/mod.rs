@@ -78,8 +78,10 @@ use crate::descriptor::{
 ///
 /// Version 5 is the pack ABI: one cdylib exports many systems through the
 /// `fsw_pack_*` surface, replacing the one-system `fsw_describe`/`fsw_create`
-/// family entirely.
-pub const FSW_ABI_VERSION: u32 = 5;
+/// family entirely. Version 6 adds optional doc strings to the manifest (per
+/// entry, per port, and per params field) so generated stubs carry the units
+/// and prose that make params usable.
+pub const FSW_ABI_VERSION: u32 = 6;
 
 // ---------------------------------------------------------------------------
 // repr(C) handles
@@ -231,6 +233,10 @@ pub struct PortDescMsg {
     pub fan_in: FanIn,
     /// Whether the telemetry downlink taps this port.
     pub telemetered: bool,
+    /// The port's doc string (ABI v6), if the pack captured one. `None` today;
+    /// the slot is carried so a future frame-field-doc capture can fill it
+    /// without another ABI bump.
+    pub docs: Option<String>,
 }
 
 /// A descriptor message ships a system's whole self-description, name, kind,
@@ -250,6 +256,13 @@ pub struct SystemDescriptorMsg {
     /// currently host-only, so the loader rejects a non-empty list
     /// ([`DlError::UnsupportedCapabilities`](crate::dl::DlError)).
     pub capabilities: Vec<crate::Capability>,
+    /// The entry's doc string (ABI v6), if the pack captured one. `None` today
+    /// for fn/task-authored entries (their prose lives in module comments, not
+    /// on the type); the slot is carried for forward compatibility.
+    pub docs: Option<String>,
+    /// Per-field params docs (ABI v6), `(field path, doc)`, from the `Params`
+    /// type's `#[derive(ParamsDocs)]`. Empty when nothing is documented.
+    pub params_docs: Vec<(String, String)>,
 }
 
 impl PortDescMsg {
@@ -285,6 +298,9 @@ impl PortDescMsg {
             delivery: desc.delivery,
             fan_in: desc.fan_in,
             telemetered: desc.telemetered,
+            // Port docs are not captured yet; the ABI carries the slot for
+            // forward compatibility.
+            docs: None,
         }
     }
 
@@ -403,8 +419,14 @@ fn prefix_announce_vtable(vtable: &VTable, metadata: &[ComponentMetadata], prefi
 }
 
 impl SystemDescriptorMsg {
-    /// Lower a static [`SystemDescriptor`] into the wire mirror.
-    pub fn lower(desc: &SystemDescriptor, params_schema: OwnedNamedType) -> Self {
+    /// Lower a static [`SystemDescriptor`] into the wire mirror, carrying the
+    /// entry doc and per-field params docs (ABI v6) alongside.
+    pub fn lower(
+        desc: &SystemDescriptor,
+        params_schema: OwnedNamedType,
+        docs: Option<String>,
+        params_docs: Vec<(String, String)>,
+    ) -> Self {
         Self {
             name: desc.name.to_string(),
             kind: desc.kind,
@@ -412,6 +434,8 @@ impl SystemDescriptorMsg {
             outputs: desc.outputs.iter().map(PortDescMsg::lower).collect(),
             params_schema,
             capabilities: desc.capabilities.clone(),
+            docs,
+            params_docs,
         }
     }
 
@@ -619,13 +643,22 @@ pub unsafe fn run_pack_describe(pack: *mut c_void, sink: ByteSink, ctx: *mut c_v
             systems: host
                 .pack
                 .entries()
-                .map(|e| PackSystemMsg {
-                    descriptor: SystemDescriptorMsg::lower(
-                        e.descriptor(),
-                        OwnedNamedType::from(e.params_schema()),
-                    ),
-                    reloadable: e.reloadable(),
-                    params_default: e.params_default().map(<[u8]>::to_vec),
+                .map(|e| {
+                    let schema = OwnedNamedType::from(e.params_schema());
+                    // Params docs are collected from this `.so`'s own
+                    // `#[derive(ParamsDocs)]` submissions, keyed by schema name;
+                    // entry docs have no attr-capture source yet (`None`).
+                    let params_docs = crate::params_docs_for(&schema.name);
+                    PackSystemMsg {
+                        descriptor: SystemDescriptorMsg::lower(
+                            e.descriptor(),
+                            schema,
+                            None,
+                            params_docs,
+                        ),
+                        reloadable: e.reloadable(),
+                        params_default: e.params_default().map(<[u8]>::to_vec),
+                    }
                 })
                 .collect(),
         };
