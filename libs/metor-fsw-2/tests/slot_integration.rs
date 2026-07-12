@@ -183,7 +183,7 @@ fn slot_load_start_runs_to_done() {
     let loaded = open_waiter(&lib);
 
     let mut b = Coordinator::builder(sim_config());
-    let slot = b.add_slot("adcs", vec![occ("waiter", loaded)], None);
+    let slot = b.add_slot("adcs", vec![occ("waiter", loaded)], None).unwrap();
     b.connect(
         PortRef::msg::<SequenceCommand>(b.coordinator_handle()),
         PortRef::msg::<SequenceCommand>(slot),
@@ -250,7 +250,7 @@ fn slot_abort_completes_aborted() {
     let loaded = open_waiter(&lib);
 
     let mut b = Coordinator::builder(sim_config());
-    let slot = b.add_slot("adcs", vec![occ("waiter", loaded)], None);
+    let slot = b.add_slot("adcs", vec![occ("waiter", loaded)], None).unwrap();
     b.connect(
         PortRef::msg::<SequenceCommand>(b.coordinator_handle()),
         PortRef::msg::<SequenceCommand>(slot),
@@ -315,7 +315,7 @@ fn slot_stop_hard_drops_occupant() {
     let loaded = open_waiter(&lib);
 
     let mut b = Coordinator::builder(sim_config());
-    let slot = b.add_slot("adcs", vec![occ("waiter", loaded)], None);
+    let slot = b.add_slot("adcs", vec![occ("waiter", loaded)], None).unwrap();
     b.connect(
         PortRef::msg::<SequenceCommand>(b.coordinator_handle()),
         PortRef::msg::<SequenceCommand>(slot),
@@ -381,7 +381,7 @@ fn slot_reset_reruns_from_start() {
     let loaded = open_waiter(&lib);
 
     let mut b = Coordinator::builder(sim_config());
-    let slot = b.add_slot("adcs", vec![occ("waiter", loaded)], None);
+    let slot = b.add_slot("adcs", vec![occ("waiter", loaded)], None).unwrap();
     b.connect(
         PortRef::msg::<SequenceCommand>(b.coordinator_handle()),
         PortRef::msg::<SequenceCommand>(slot),
@@ -464,7 +464,7 @@ fn load_from_loaded_swaps_occupant() {
     let second = pack.system("waiter").expect("select the waiter entry again");
 
     let mut b = Coordinator::builder(sim_config());
-    let slot = b.add_slot("adcs", vec![occ("first", first), occ("second", second)], None);
+    let slot = b.add_slot("adcs", vec![occ("first", first), occ("second", second)], None).unwrap();
     b.connect(
         PortRef::msg::<SequenceCommand>(b.coordinator_handle()),
         PortRef::msg::<SequenceCommand>(slot),
@@ -541,7 +541,7 @@ fn reset_then_load_swaps_occupant() {
     let second = pack.system("waiter").expect("select the waiter entry again");
 
     let mut b = Coordinator::builder(sim_config());
-    let slot = b.add_slot("adcs", vec![occ("first", first), occ("second", second)], None);
+    let slot = b.add_slot("adcs", vec![occ("first", first), occ("second", second)], None).unwrap();
     b.connect(
         PortRef::msg::<SequenceCommand>(b.coordinator_handle()),
         PortRef::msg::<SequenceCommand>(slot),
@@ -629,7 +629,7 @@ fn load_while_running_is_refused() {
     let second = pack.system("waiter").expect("select the waiter entry again");
 
     let mut b = Coordinator::builder(sim_config());
-    let slot = b.add_slot("adcs", vec![occ("first", first), occ("second", second)], None);
+    let slot = b.add_slot("adcs", vec![occ("first", first), occ("second", second)], None).unwrap();
     b.connect(
         PortRef::msg::<SequenceCommand>(b.coordinator_handle()),
         PortRef::msg::<SequenceCommand>(slot),
@@ -721,7 +721,7 @@ fn slot_emits_ordered_sequence_events_and_boot_registry() {
     let loaded = open_waiter(&lib);
 
     let mut b = Coordinator::builder(sim_config());
-    let slot = b.add_slot("adcs", vec![occ("waiter", loaded)], None);
+    let slot = b.add_slot("adcs", vec![occ("waiter", loaded)], None).unwrap();
     b.connect(
         PortRef::msg::<SequenceCommand>(b.coordinator_handle()),
         PortRef::msg::<SequenceCommand>(slot),
@@ -851,7 +851,7 @@ fn uplink_command_loads_and_starts_same_cycle() {
 
     let mut b = Coordinator::builder(sim_config());
     // The slot starts empty; the uplink alone drives it.
-    let slot = b.add_slot("adcs", vec![occ("waiter", loaded)], None);
+    let slot = b.add_slot("adcs", vec![occ("waiter", loaded)], None).unwrap();
     let uplink = b.add_async(
         UplinkSystem::new(MockRecv::new(vec![
             SequenceCommand {
@@ -920,7 +920,7 @@ fn reload_request_reemits_registry() {
     let loaded = open_waiter(&lib);
 
     let mut b = Coordinator::builder(sim_config());
-    let _slot = b.add_slot("adcs", vec![occ("waiter", loaded)], None);
+    let _slot = b.add_slot("adcs", vec![occ("waiter", loaded)], None).unwrap();
     let uplink = b.add_async(
         UplinkSystem::new(MockRecv::from_packets(vec![wire_msg(&ReloadSequences {})]))
             .with_msg::<ReloadSequences>(),
@@ -974,7 +974,7 @@ fn slot_name_over_the_cap_is_a_build_error() {
 
     let long = "a".repeat(NAME_CAP + 1);
     let mut b = Coordinator::builder(sim_config());
-    let _slot = b.add_slot(long.clone(), vec![occ("waiter", loaded)], None);
+    let _slot = b.add_slot(long.clone(), vec![occ("waiter", loaded)], None).unwrap();
     let err = b
         .build()
         .err()
@@ -998,7 +998,7 @@ fn misaddressed_command_matches_no_slot() {
     let loaded = open_waiter(&lib);
 
     let mut b = Coordinator::builder(sim_config());
-    let slot = b.add_slot("adcs", vec![occ("waiter", loaded)], None);
+    let slot = b.add_slot("adcs", vec![occ("waiter", loaded)], None).unwrap();
     b.connect(
         PortRef::msg::<SequenceCommand>(b.coordinator_handle()),
         PortRef::msg::<SequenceCommand>(slot),
@@ -1058,7 +1058,7 @@ fn drive_adcs_of_two_slots(adcs_first: bool) {
 
     let mut b = Coordinator::builder(sim_config());
     let add = |b: &mut metor_fsw_2::CoordinatorBuilder, name: &str| {
-        let slot = b.add_slot(name, vec![occ("waiter", open_waiter(&lib))], None);
+        let slot = b.add_slot(name, vec![occ("waiter", open_waiter(&lib))], None).unwrap();
         // The one producer is edged to both slots; only the slot whose name
         // matches a command's channel acts on it, so broad fan-out is harmless.
         b.connect(
@@ -1175,7 +1175,7 @@ fn autonomy_phases(edged: bool) -> Option<Vec<u8>> {
 
     let mut b = Coordinator::builder(sim_config());
     let autonomy = b.add_cyclic(Autonomy { sent: false });
-    let slot = b.add_slot("adcs", vec![occ("waiter", loaded)], None);
+    let slot = b.add_slot("adcs", vec![occ("waiter", loaded)], None).unwrap();
     if edged {
         b.connect(
             PortRef::msg::<SequenceCommand>(autonomy),
@@ -1246,7 +1246,7 @@ fn registered_descriptor_is_the_extended_occupant_shape() {
     let loaded = open_waiter(&lib);
 
     let mut b = Coordinator::builder(sim_config());
-    let slot = b.add_slot("adcs", vec![occ("waiter", loaded)], None);
+    let slot = b.add_slot("adcs", vec![occ("waiter", loaded)], None).unwrap();
     let d = b.descriptor_of(slot);
     assert_eq!(d.name, "adcs", "registered under the slot's instance name");
 
@@ -1300,8 +1300,8 @@ fn edge_into_a_host_connected_input_is_rejected() {
     // input, so this connect must fail as a HostPort rather than bind a foreign
     // producer into a runner-held view.
     let mut b = Coordinator::builder(sim_config());
-    let a = b.add_slot("a", vec![occ("waiter", open_waiter(&lib))], None);
-    let bslot = b.add_slot("b", vec![occ("waiter", open_waiter(&lib))], None);
+    let a = b.add_slot("a", vec![occ("waiter", open_waiter(&lib))], None).unwrap();
+    let bslot = b.add_slot("b", vec![occ("waiter", open_waiter(&lib))], None).unwrap();
     b.connect(
         PortRef::new::<SeqStatusFrame>(a),
         PortRef::new::<SeqStatusFrame>(bslot),
@@ -1320,26 +1320,22 @@ fn edge_into_a_host_connected_input_is_rejected() {
 /// An initial occupant outside the allowed set is rejected as soon as the slot
 /// is added.
 #[test]
-fn builder_initial_occupant_outside_allowed_set_panics() {
-    use metor_fsw_2::InitialOccupant;
-    use std::panic::AssertUnwindSafe;
+fn builder_initial_occupant_outside_allowed_set_is_rejected() {
+    use metor_fsw_2::{InitialOccupant, SlotConfigError};
     let Some(lib) = locate_fixture() else {
         return;
     };
     let loaded = open_waiter(&lib);
 
     let mut b = Coordinator::builder(sim_config());
-    let result = std::panic::catch_unwind(AssertUnwindSafe(|| {
-        b.add_slot(
+    let err = b
+        .add_slot(
             "adcs",
             vec![occ("waiter", loaded)],
             Some(InitialOccupant::loaded("nonesuch")),
         )
-    }));
-    assert!(
-        result.is_err(),
-        "an initial occupant outside the allowed set is a build-time contract panic"
-    );
+        .expect_err("an initial occupant outside the allowed set is a registration error");
+    assert!(matches!(err, SlotConfigError::UnknownInitial { .. }), "got {err:?}");
 }
 
 // ---------------------------------------------------------------------------
@@ -1496,7 +1492,7 @@ fn open_beater_in(lib: &PathBuf) -> DlSystem {
 
 fn build_beater_slot(loaded: DlSystem) -> Coordinator {
     let mut b = Coordinator::builder(sim_config());
-    let slot = b.add_slot("adcs", vec![occ("beater", loaded)], None);
+    let slot = b.add_slot("adcs", vec![occ("beater", loaded)], None).unwrap();
     b.connect(
         PortRef::msg::<SequenceCommand>(b.coordinator_handle()),
         PortRef::msg::<SequenceCommand>(slot),

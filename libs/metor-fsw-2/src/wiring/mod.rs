@@ -58,9 +58,10 @@ use metor_proto::types::ComponentId;
 use crate::binder::BindPorts;
 use crate::coordinator::{
     AllowedOccupant, ClockMode, Coordinator, CoordinatorBuilder, CoordinatorConfig,
-    InitialOccupant, OccupantBacking, PortRef, SystemHandle, WireError,
+    InitialOccupant, OccupantBacking, PortRef, SlotConfigError, SystemHandle, WireError,
+    validate_slot_spec,
 };
-use crate::descriptor::{PortId, SystemDescriptor, compatible};
+use crate::descriptor::{PortId, SystemDescriptor};
 use crate::dl::DlSystem;
 use crate::message::MsgTable;
 use crate::system::{
@@ -1183,6 +1184,47 @@ fn occupant_artifact(
     }
 }
 
+/// Map a [`SlotConfigError`] — from the shared pure-spec validation or from
+/// [`CoordinatorBuilder::add_slot`] — onto this front-end's spanned slot
+/// diagnostics.
+fn slot_config_error(
+    err: SlotConfigError,
+    slot: &SlotSpec,
+    src: &str,
+    span: SourceSpan,
+) -> LoadError {
+    let name = slot.name.clone();
+    let src = src.to_string();
+    match err {
+        SlotConfigError::Empty => LoadError::EmptySlot {
+            slot: name,
+            src,
+            span,
+        },
+        SlotConfigError::UnknownInitial { occupant, allowed } => {
+            LoadError::UnknownInitialOccupant {
+                slot: name,
+                occupant,
+                allowed,
+                src,
+                span,
+            }
+        }
+        // A mount-reserved port is an occupant-contract defect too: the
+        // artifact predates the pack ABI and must be rebuilt.
+        SlotConfigError::OccupantMismatch { occupant, .. }
+        | SlotConfigError::ReservedPort { occupant, .. } => LoadError::SlotOccupantMismatch {
+            slot: name,
+            occupant,
+            src,
+            span,
+        },
+        SlotConfigError::MixedBacking => {
+            unreachable!("resolve_slot sources every occupant of a slot from one backing arm")
+        }
+    }
+}
+
 /// Resolve a [`SlotSpec`] into a registered slot.
 ///
 /// Each allowed occupant goes through [`resolve_occupant`] like a dl system —
@@ -1202,36 +1244,14 @@ fn resolve_slot(
     let src = slot_src(slot);
     let span: SourceSpan = (0, src.len()).into();
 
-    if slot.allow.is_empty() {
-        return Err(LoadError::EmptySlot {
-            slot: slot.name.clone(),
-            src,
-            span,
-        });
-    }
-
-    // A named `initial` occupant must be in the allowed set; a typo would
-    // otherwise boot the slot empty with no diagnostic. Pure spec validation,
-    // so it runs before any artifact is opened, and regardless of `state=`:
-    // even an `empty` initial names an occupant, and a name that matches
-    // nothing is always a mistake.
-    if let Some(init) = &slot.initial
-        && !slot.allow.iter().any(|a| a.occupant == init.occupant)
-    {
-        let allowed = slot
-            .allow
-            .iter()
-            .map(|a| a.occupant.as_str())
-            .collect::<Vec<_>>()
-            .join(", ");
-        return Err(LoadError::UnknownInitialOccupant {
-            slot: slot.name.clone(),
-            occupant: init.occupant.clone(),
-            allowed,
-            src,
-            span,
-        });
-    }
+    // Pure spec validation — a non-empty allow set, and an `initial` name
+    // inside it — runs before any artifact is opened, so a typo fails
+    // without a dlopen. It checks the `initial` regardless of `state=`: even
+    // an `empty` initial names an occupant, and a name that matches nothing
+    // is always a mistake.
+    let allow_names: Vec<&str> = slot.allow.iter().map(|a| a.occupant.as_str()).collect();
+    validate_slot_spec(&allow_names, slot.initial.as_ref().map(|i| i.occupant.as_str()))
+        .map_err(|e| slot_config_error(e, slot, &src, span))?;
 
     // Open and param-encode each allowed occupant. `occupant=` is the allow
     // node's only reserved key and there is no leading name argument, so both
@@ -1266,28 +1286,6 @@ fn resolve_slot(
         allowed
     };
 
-    // The slot derives one shape from the allowed set, so every occupant must
-    // match the first. A clean error here in place of the panic `add_slot`
-    // would otherwise raise at build.
-    let base = allowed[0].descriptor.clone();
-    let ports_match = |a: &[crate::descriptor::PortDesc], b: &[crate::descriptor::PortDesc]| {
-        a.len() == b.len()
-            && a.iter()
-                .zip(b)
-                .all(|(x, y)| compatible(x, y) && compatible(y, x))
-    };
-    for occ in &allowed[1..] {
-        let d = &occ.descriptor;
-        if !(ports_match(&d.inputs, &base.inputs) && ports_match(&d.outputs, &base.outputs)) {
-            return Err(LoadError::SlotOccupantMismatch {
-                slot: slot.name.clone(),
-                occupant: occ.name.clone(),
-                src: src.clone(),
-                span,
-            });
-        }
-    }
-
     let initial = match &slot.initial {
         None => None,
         Some(i) => match i.state {
@@ -1305,9 +1303,12 @@ fn resolve_slot(
 
     // Register the slot, then read its registered descriptor back off the
     // builder. `add_slot` is the one place the registered contract (user
-    // ports plus the slot's own command fan-in) is derived, so this front-end
-    // cannot drift from it.
-    let handle = builder.add_slot(slot.name.clone(), allowed, initial);
+    // ports plus the slot's own command fan-in) is derived — and the one
+    // place the descriptor-level checks (occupant mutual compatibility, the
+    // mount-appended ports) run — so this front-end cannot drift from it.
+    let handle = builder
+        .add_slot(slot.name.clone(), allowed, initial)
+        .map_err(|e| slot_config_error(e, slot, &src, span))?;
     let registered = builder.descriptor_of(handle).clone();
 
     // Every declared `input`/`output` frame must name an edge-connected

@@ -80,7 +80,7 @@ use metor_fsw_ring::NoWake;
 
 use super::{CyclicSlot, NAME_CAP, ProcInfo, SlotState, StopReason, WorkerRunState, pack_name};
 use crate::abi::FswStatus;
-use crate::descriptor::SystemDescriptor;
+use crate::descriptor::{PortConn, PortDesc, PortId, SystemDescriptor, SystemKind};
 use crate::dl::{DlSlot, DlSystem};
 use crate::message::{MsgIn, MsgOut};
 use crate::port::{Input, Output};
@@ -186,21 +186,191 @@ impl InitialOccupant {
     }
 }
 
+/// A slot registration `add_slot` rejected. The same contract violations a
+/// wiring front-end reports as `LoadError`s, surfaced as clean errors for the
+/// direct builder path too (a mission author's typo is not a library bug, so
+/// none of these panic).
+#[derive(Clone, Debug, PartialEq, thiserror::Error)]
+pub enum SlotConfigError {
+    #[error("a slot needs at least one allowed occupant")]
+    Empty,
+    #[error("initial occupant `{occupant}` is not in the allowed set (allowed: {allowed})")]
+    UnknownInitial {
+        occupant: String,
+        /// The comma-joined allowed occupant names, for the message.
+        allowed: String,
+    },
+    #[error(
+        "a slot's occupants must share one backing: all in-process or all process-mode \
+         (`Load` may not silently change the slot's fault domain)"
+    )]
+    MixedBacking,
+    #[error(
+        "allowed occupant `{occupant}` is incompatible with the slot contract \
+         (derived from `{base}`)"
+    )]
+    OccupantMismatch { occupant: String, base: String },
+    #[error(
+        "occupant `{occupant}` declares `{port}` itself; the mount appends it \
+         (a pre-pack artifact must be rebuilt)"
+    )]
+    ReservedPort {
+        occupant: String,
+        port: &'static str,
+    },
+}
+
+/// The pure-spec half of slot validation: a non-empty allowed set, and an
+/// `initial` name inside it. Front-ends run it before any occupant artifact
+/// is opened (a typo must fail without a dlopen), and `add_slot` runs it
+/// again for direct builder callers; the descriptor-level checks live in
+/// `add_slot` alone, next to the descriptors they need.
+pub(crate) fn validate_slot_spec(
+    allowed: &[&str],
+    initial: Option<&str>,
+) -> Result<(), SlotConfigError> {
+    if allowed.is_empty() {
+        return Err(SlotConfigError::Empty);
+    }
+    if let Some(init) = initial
+        && !allowed.contains(&init)
+    {
+        return Err(SlotConfigError::UnknownInitial {
+            occupant: init.to_string(),
+            allowed: allowed.join(", "),
+        });
+    }
+    Ok(())
+}
+
+/// A slot's registered ports as the three concepts they are, not the flat
+/// positional lists the build pass consumes:
+///
+/// - the occupant's **user ports**, in its descriptor's order;
+/// - the **mount-appended occupant tail** — the [`SlotControlIn`] cancel
+///   input and the [`SequenceStatus`] output the occupant binds after its
+///   own ports on the loaded side (a mount property, not descriptor
+///   content: any entry can occupy a slot);
+/// - the **runner tail**, which never crosses to the occupant: the
+///   `commands` fan-in and [`SequenceStatus`] self-tap inputs, the
+///   [`SlotStatus`] and `"sequences"` events outputs.
+///
+/// The first two flatten into the occupant lists here because they share a
+/// fate: both cross to the occupant, positionally, as the prefix of each
+/// registered list. [`registered`](Self::registered) flattens prefix then
+/// tail into the [`SystemDescriptor`] the build pass sees; edge resolution,
+/// registry keys, and the occupant-side positional bind ABI all consume that
+/// flattening, so its exact sequence is a compatibility surface (the
+/// `registered_slot_descriptor_snapshot` test pins it).
+pub(crate) struct SlotPorts {
+    /// The occupant's ABI prefix: its user inputs plus the mount-appended,
+    /// host-connected [`SlotControlIn`] (the runner holds the cancel writer).
+    pub occupant_inputs: Vec<PortDesc>,
+    /// The occupant's ABI prefix: its user outputs plus the mount-appended
+    /// [`SequenceStatus`].
+    pub occupant_outputs: Vec<PortDesc>,
+    /// The runner's inputs: the `commands` fan-in (an ordinary edge input, so
+    /// command wiring is ordinary message wiring) and the self-tap over the
+    /// occupant's [`SequenceStatus`] output.
+    pub tail_inputs: Vec<PortDesc>,
+    /// The runner's outputs: the [`SlotStatus`] frame and the `"sequences"`
+    /// events channel, both host-written and registry-tapped.
+    pub tail_outputs: Vec<PortDesc>,
+}
+
+impl SlotPorts {
+    /// Derive the slot's port plan from an occupant contract by extension,
+    /// not surgery: the mount tail is appended to the occupant's own ports,
+    /// then the runner tail is laid out after the prefix. Rejects an occupant
+    /// that declares a mount-appended port itself (a pre-pack artifact).
+    pub(crate) fn for_occupant(
+        base: &SystemDescriptor,
+        occupant: &str,
+    ) -> Result<Self, SlotConfigError> {
+        let control_id = PortId::Component(<SlotControlIn as crate::Frame>::FRAME_ID);
+        let seq_status_id = PortId::Component(<SequenceStatus as crate::Frame>::FRAME_ID);
+        let reserved = |port| SlotConfigError::ReservedPort {
+            occupant: occupant.to_string(),
+            port,
+        };
+        if base.inputs.iter().any(|p| p.id == control_id) {
+            return Err(reserved("SlotControlIn"));
+        }
+        if base.outputs.iter().any(|p| p.id == seq_status_id) {
+            return Err(reserved("SequenceStatus"));
+        }
+        let mut occupant_inputs = base.inputs.clone();
+        occupant_inputs.push(PortDesc::of::<SlotControlIn>().with_conn(PortConn::Host));
+        let mut occupant_outputs = base.outputs.clone();
+        occupant_outputs.push(PortDesc::of::<SequenceStatus>());
+        Ok(Self {
+            occupant_inputs,
+            occupant_outputs,
+            tail_inputs: vec![
+                PortDesc::msg::<SequenceCommand>(),
+                PortDesc::of::<SequenceStatus>().with_conn(PortConn::SelfTap(seq_status_id)),
+            ],
+            tail_outputs: vec![
+                PortDesc::of::<SlotStatus>().with_conn(PortConn::Host),
+                PortDesc::msg_named::<SequenceChannelEvent>("sequences").with_conn(PortConn::Host),
+            ],
+        })
+    }
+
+    /// Flatten the plan into the registered descriptor: occupant prefix then
+    /// runner tail, per direction. This sequence is load-bearing (see the
+    /// type docs); extend the plan, never reorder it.
+    pub(crate) fn registered(&self, name: &'static str) -> SystemDescriptor {
+        SystemDescriptor {
+            name,
+            kind: SystemKind::Cyclic,
+            inputs: self.occupant_inputs.iter().chain(&self.tail_inputs).cloned().collect(),
+            outputs: self.occupant_outputs.iter().chain(&self.tail_outputs).cloned().collect(),
+            // Sequence occupants declare wired ports only (ReceiveAll is host-only).
+            capabilities: Vec::new(),
+        }
+    }
+
+    /// Registered-input index of the mount-appended [`SlotControlIn`], the
+    /// last port of the occupant input prefix.
+    pub(crate) fn control_in_idx(&self) -> usize {
+        self.occupant_inputs.len() - 1
+    }
+
+    /// Registered-input index of the runner's `commands` fan-in, the first
+    /// tail input.
+    pub(crate) fn commands_in_idx(&self) -> usize {
+        self.occupant_inputs.len()
+    }
+
+    /// Registered-output index of the mount-appended [`SequenceStatus`], the
+    /// last port of the occupant output prefix (and the self-tap's target).
+    pub(crate) fn seq_status_out_idx(&self) -> usize {
+        self.occupant_outputs.len() - 1
+    }
+
+    /// Registered-output index of the runner's [`SlotStatus`], the first
+    /// tail output.
+    pub(crate) fn status_out_idx(&self) -> usize {
+        self.occupant_outputs.len()
+    }
+
+    /// Registered-output index of the runner's `"sequences"` events channel,
+    /// the second tail output.
+    pub(crate) fn events_out_idx(&self) -> usize {
+        self.occupant_outputs.len() + 1
+    }
+}
+
 /// A slot's configuration as recorded at registration, held until `build()`
 /// assembles the [`SlotRunner`] from it.
-///
-/// `n_occ_inputs` and `n_occ_outputs` split the registered port lists into
-/// the occupant prefix and the runner tail (see the module docs), so the
-/// bind arm maps the occupant's rings with a straight prefix walk.
 pub(crate) struct SlotReg {
     pub allowed: Vec<AllowedOccupant>,
     pub initial: Option<InitialOccupant>,
-    /// Number of leading registered inputs that belong to the occupant
-    /// (its user ports plus the host-connected [`SlotControlIn`]).
-    pub n_occ_inputs: usize,
-    /// Number of leading registered outputs that belong to the occupant
-    /// (its user ports plus [`SequenceStatus`]/health/log).
-    pub n_occ_outputs: usize,
+    /// The named port plan the registered descriptor was flattened from; the
+    /// bind arm reads the occupant/tail split and the tail-port indices off
+    /// it instead of re-deriving them by shape.
+    pub ports: SlotPorts,
     /// Run occupants out of process (`docs/process-slots.md`): the occupant
     /// prefix's crossing rings — its outputs, its Edge inputs' producers, and
     /// the host control ring — are allocated as session-dir files a worker

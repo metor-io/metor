@@ -861,7 +861,7 @@ fn proc_slot_death_is_terminal_and_reset_recovers(seq_lib: &Path) {
         "adcs",
         vec![artifact_occ("waiter", seq_lib)],
         Some(InitialOccupant::loaded("waiter")),
-    );
+    ).unwrap();
     b.connect(
         PortRef::msg::<SequenceCommand>(b.coordinator_handle()),
         PortRef::msg::<SequenceCommand>(slot),
@@ -989,7 +989,7 @@ fn proc_slot_abort_crosses_the_boundary(seq_lib: &Path) {
         "adcs",
         vec![artifact_occ("waiter", seq_lib)],
         Some(InitialOccupant::running("waiter")),
-    );
+    ).unwrap();
     b.connect(
         PortRef::msg::<SequenceCommand>(b.coordinator_handle()),
         PortRef::msg::<SequenceCommand>(slot),

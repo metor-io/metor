@@ -1447,35 +1447,21 @@ fn push_slot_reg(
     name: &'static str,
     process: bool,
 ) -> crate::SystemHandle {
-    use crate::sequence::{SequenceStatus, SlotControlIn};
-    use metor_proto_wkt::{SequenceChannelEvent, SequenceCommand};
-    let seq_status_id = crate::PortId::Component(<SequenceStatus as crate::Frame>::FRAME_ID);
-    let desc = crate::SystemDescriptor {
+    let base = crate::SystemDescriptor {
         name,
         kind: crate::SystemKind::Cyclic,
-        inputs: vec![
-            crate::PortDesc::of::<Imu>(),
-            crate::PortDesc::of::<SlotControlIn>().with_conn(crate::PortConn::Host),
-            crate::PortDesc::msg::<SequenceCommand>(),
-            crate::PortDesc::of::<SequenceStatus>()
-                .with_conn(crate::PortConn::SelfTap(seq_status_id)),
-        ],
-        outputs: vec![
-            crate::PortDesc::of::<SequenceStatus>(),
-            crate::PortDesc::of::<crate::SlotStatus>().with_conn(crate::PortConn::Host),
-            crate::PortDesc::msg_named::<SequenceChannelEvent>("sequences")
-                .with_conn(crate::PortConn::Host),
-        ],
+        inputs: vec![crate::PortDesc::of::<Imu>()],
+        outputs: Vec::new(),
         capabilities: Vec::new(),
     };
+    let ports = super::slot::SlotPorts::for_occupant(&base, "occ").unwrap();
     b.push_system(
-        desc,
+        ports.registered(name),
         name.to_string(),
         super::Reg::Slot(super::slot::SlotReg {
             allowed: Vec::new(),
             initial: None,
-            n_occ_inputs: 2,
-            n_occ_outputs: 1,
+            ports,
             process,
         }),
     )
@@ -1557,6 +1543,126 @@ fn in_process_slot_stays_heap() {
         alloc.host_input_rings.contains_key(&(slot.id, 1)),
         "the control ring still exists, heap-backed"
     );
+}
+
+// ---------------------------------------------------------------------------
+// The registered slot descriptor: add_slot's exact flattening.
+// ---------------------------------------------------------------------------
+
+/// Snapshot of the registered descriptor `add_slot` derives: the occupant's
+/// user ports, the mount-appended [`SlotControlIn`]/[`SequenceStatus`], then
+/// the runner tail, in exactly this sequence. Edge resolution, registry keys
+/// (`"<slot>.sequences"` and friends), and the occupant-side positional bind
+/// ABI all consume the flattened lists, so a change in this order or content
+/// is a keyspace/ABI change, never a refactor.
+#[test]
+fn registered_slot_descriptor_snapshot() {
+    use crate::sequence::{SequenceStatus, SlotControlIn};
+    use crate::{Frame, PortConn, PortDesc, PortId, SlotStatus};
+    use metor_proto_wkt::{ReloadSequences, SequenceChannelEvent, SequenceCommand};
+
+    let occ = crate::AllowedOccupant {
+        name: "seq".into(),
+        params: Vec::new(),
+        descriptor: crate::SystemDescriptor {
+            name: "seq",
+            kind: crate::SystemKind::Cyclic,
+            inputs: vec![PortDesc::of::<Imu>(), PortDesc::msg::<ReloadSequences>()],
+            outputs: vec![PortDesc::of::<Nav>()],
+            capabilities: Vec::new(),
+        },
+        // Never opened at registration; the path need not exist.
+        backing: crate::OccupantBacking::Artifact("occ.so".into()),
+    };
+    let mut b = Coordinator::builder(config());
+    let slot = b.add_slot("snap", vec![occ], None).expect("a valid slot registers");
+    let desc = b.descriptor_of(slot);
+
+    let seq_status_id = PortId::Component(<SequenceStatus as Frame>::FRAME_ID);
+    let got: Vec<(&str, PortId, PortConn)> =
+        desc.inputs.iter().map(|p| (p.name, p.id, p.conn)).collect();
+    assert_eq!(
+        got,
+        vec![
+            ("imu", PortId::Component(<Imu as Frame>::FRAME_ID), PortConn::Edge),
+            ("ReloadSequences", PortDesc::msg::<ReloadSequences>().id, PortConn::Edge),
+            (
+                "slot_control",
+                PortId::Component(<SlotControlIn as Frame>::FRAME_ID),
+                PortConn::Host
+            ),
+            ("SequenceCommand", PortDesc::msg::<SequenceCommand>().id, PortConn::Edge),
+            ("sequence", seq_status_id, PortConn::SelfTap(seq_status_id)),
+        ],
+        "registered input sequence: occupant user ports, mount control, runner tail"
+    );
+    let got: Vec<(&str, PortId, PortConn)> =
+        desc.outputs.iter().map(|p| (p.name, p.id, p.conn)).collect();
+    assert_eq!(
+        got,
+        vec![
+            ("nav", PortId::Component(<Nav as Frame>::FRAME_ID), PortConn::Edge),
+            ("sequence", seq_status_id, PortConn::Edge),
+            (
+                "slot_status",
+                PortId::Component(<SlotStatus as Frame>::FRAME_ID),
+                PortConn::Host
+            ),
+            ("sequences", PortDesc::msg::<SequenceChannelEvent>().id, PortConn::Host),
+        ],
+        "registered output sequence: occupant user ports, mount status, runner tail"
+    );
+}
+
+/// Every `add_slot` contract violation is a clean [`SlotConfigError`], one
+/// variant per defect. The occupants here are artifact-backed so nothing is
+/// opened; only the registration checks run.
+#[test]
+fn add_slot_rejects_contract_violations() {
+    use crate::sequence::SlotControlIn;
+    use crate::{PortDesc, SlotConfigError};
+
+    fn art_occ(name: &str, inputs: Vec<PortDesc>) -> crate::AllowedOccupant {
+        crate::AllowedOccupant {
+            name: name.into(),
+            params: Vec::new(),
+            descriptor: crate::SystemDescriptor {
+                name: "occ",
+                kind: crate::SystemKind::Cyclic,
+                inputs,
+                outputs: Vec::new(),
+                capabilities: Vec::new(),
+            },
+            backing: crate::OccupantBacking::Artifact("occ.so".into()),
+        }
+    }
+
+    let mut b = Coordinator::builder(config());
+    assert_eq!(b.add_slot("s", Vec::new(), None), Err(SlotConfigError::Empty));
+    assert!(matches!(
+        b.add_slot(
+            "s",
+            vec![art_occ("seq", Vec::new())],
+            Some(crate::InitialOccupant::loaded("nonesuch")),
+        ),
+        Err(SlotConfigError::UnknownInitial { .. })
+    ));
+    assert!(matches!(
+        b.add_slot(
+            "s",
+            vec![
+                art_occ("first", vec![PortDesc::of::<Imu>()]),
+                art_occ("second", vec![PortDesc::of::<Nav>()]),
+            ],
+            None,
+        ),
+        Err(SlotConfigError::OccupantMismatch { .. })
+    ));
+    assert!(matches!(
+        b.add_slot("s", vec![art_occ("pre-pack", vec![PortDesc::of::<SlotControlIn>()])], None),
+        Err(SlotConfigError::ReservedPort { .. })
+    ));
+    assert!(b.systems.iter().all(|s| s.name != "s"), "nothing was registered");
 }
 
 // ---------------------------------------------------------------------------

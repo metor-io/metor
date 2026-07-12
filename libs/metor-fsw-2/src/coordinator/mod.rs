@@ -91,7 +91,10 @@ use crate::system::{AsyncSystem, CyclicRunner, CyclicSystem, Out, System, System
 use crate::{DEFAULT_DEPTH, Frame};
 
 mod slot;
-pub use slot::{AllowedOccupant, InitialOccupant, OccupantBacking, SLOT_NAME_CAP, SlotStatus};
+pub(crate) use slot::validate_slot_spec;
+pub use slot::{
+    AllowedOccupant, InitialOccupant, OccupantBacking, SLOT_NAME_CAP, SlotConfigError, SlotStatus,
+};
 use slot::{SlotReg, SlotRunner, slot_writer};
 
 /// The default [`CoordinatorConfig::reader_slack`].
@@ -1219,26 +1222,25 @@ impl CoordinatorBuilder {
     /// view over the occupant's own [`SequenceStatus`] output on the input
     /// side; a [`SlotStatus`] output and the `"sequences"` events channel
     /// (both `Host`, registry-tapped) on the output side. [`SlotReg`] records
-    /// the prefix split indices, so the bind arm maps the occupant `FswRing`
+    /// the named port plan, so the bind arm maps the occupant `FswRing`
     /// arrays as a straight prefix walk and the occupant-side positional bind
     /// contract (and so the dl ABI) is untouched.
     ///
-    /// Panics on a build-time contract violation: `allowed` is empty, an
-    /// allowed occupant is not `compatible()` with the first occupant's
-    /// contract, the occupant is not a sequence shape (no trailing
-    /// `SlotControlIn` input / `SequenceStatus` output), or `initial` names an
-    /// occupant outside the allowed set. Front-ends surface the same checks as
-    /// clean errors before calling this.
+    /// Errors with a [`SlotConfigError`] on a contract violation: `allowed`
+    /// is empty, the occupants mix backings, an allowed occupant is not
+    /// `compatible()` with the first occupant's contract, an occupant
+    /// declares a mount-appended port itself, or `initial` names an occupant
+    /// outside the allowed set. Wiring front-ends run the pure-spec half of
+    /// these checks before opening any occupant artifact and map the rest
+    /// onto their own diagnostics.
     pub fn add_slot(
         &mut self,
         name: impl Into<String>,
         allowed: Vec<AllowedOccupant>,
         initial: Option<InitialOccupant>,
-    ) -> SystemHandle {
-        assert!(
-            !allowed.is_empty(),
-            "a slot needs at least one allowed occupant"
-        );
+    ) -> Result<SystemHandle, SlotConfigError> {
+        let names: Vec<&str> = allowed.iter().map(|a| a.name.as_str()).collect();
+        validate_slot_spec(&names, initial.as_ref().map(|i| i.occupant.as_str()))?;
         // Per-slot means all-occupants: the isolation boundary is the slot's
         // position in the cycle, and a mixed allow set would make `Load`
         // silently change the fault domain.
@@ -1246,14 +1248,13 @@ impl CoordinatorBuilder {
             .iter()
             .filter(|a| matches!(a.backing, OccupantBacking::Artifact(_)))
             .count();
-        assert!(
-            n_proc == 0 || n_proc == allowed.len(),
-            "a slot's occupants must share one backing: all in-process or all process-mode"
-        );
+        if n_proc != 0 && n_proc != allowed.len() {
+            return Err(SlotConfigError::MixedBacking);
+        }
         let process = n_proc == allowed.len();
-        let base = allowed[0].descriptor.clone();
         // Every allowed occupant must share the contract; the slot sizes and
         // validates to the first occupant's descriptor (mutual subset).
+        let base = &allowed[0].descriptor;
         for occ in &allowed[1..] {
             let d = &occ.descriptor;
             let ports_match = |a: &[PortDesc], b: &[PortDesc]| {
@@ -1262,99 +1263,31 @@ impl CoordinatorBuilder {
                         .zip(b)
                         .all(|(x, y)| compatible(x, y) && compatible(y, x))
             };
-            assert!(
-                ports_match(&d.inputs, &base.inputs) && ports_match(&d.outputs, &base.outputs),
-                "allowed occupant {:?} is incompatible with the slot contract \
-                 (derived from {:?})",
-                occ.name,
-                allowed[0].name
-            );
+            if !(ports_match(&d.inputs, &base.inputs) && ports_match(&d.outputs, &base.outputs)) {
+                return Err(SlotConfigError::OccupantMismatch {
+                    occupant: occ.name.clone(),
+                    base: allowed[0].name.clone(),
+                });
+            }
         }
-        // Validate the initial occupant against the allowed set at build; a
-        // typo would otherwise surface only as a runtime `Failed` event.
-        if let Some(init) = &initial {
-            assert!(
-                allowed.iter().any(|a| a.name == init.occupant),
-                "initial occupant {:?} is not in the allowed set ({})",
-                init.occupant,
-                allowed
-                    .iter()
-                    .map(|a| a.name.as_str())
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            );
-        }
+        let ports = slot::SlotPorts::for_occupant(base, &allowed[0].name)?;
 
         let name: String = name.into();
         // The registered descriptor name is the slot's instance name (a leaked
         // `&'static str` for the descriptor field and the `SlotRunner` identity).
         let leaked: &'static str = Box::leak(name.clone().into_boxed_str());
+        let registered = ports.registered(leaked);
 
-        // --- Inputs: occupant prefix (entry inputs + appended cancel), runner tail ---
-        // The occupant tail is a MOUNT property, not descriptor content: any
-        // entry can occupy a slot, and the framework appends the cancel input
-        // after its own inputs here, mirrored by the occupant-mount bind on
-        // the loaded side. Host-connected: the RUNNER holds the cancel writer
-        // over a dedicated ring; the occupant reads it. Exempt from
-        // UnconnectedInput; edges are rejected.
-        let mut inputs = base.inputs.clone();
-        assert!(
-            !inputs
-                .iter()
-                .any(|p| p.id == PortId::Component(SlotControlIn::FRAME_ID)),
-            "an occupant never declares SlotControlIn itself; the mount appends it              (a pre-pack artifact must be rebuilt)"
-        );
-        inputs.push(PortDesc::of::<SlotControlIn>().with_conn(PortConn::Host));
-        let n_occ_inputs = inputs.len();
-        // The slot's declared command input: an ordinary fan-in message input,
-        // so a producer commands this slot only over an explicit edge. Zero
-        // edges is legal (an autonomy-free, wiring-frozen slot). The runner
-        // drains it at the head of each step; it is never handed to the occupant.
-        inputs.push(PortDesc::msg::<SequenceCommand>());
-        // The runner's read view over the occupant's mount-appended
-        // SequenceStatus output (Progress lines plus the terminal outcome): a
-        // declared self-tap, so no ring, just +1 fan-out on that output at
-        // sizing time.
-        let seq_status_id = PortId::Component(SequenceStatus::FRAME_ID);
-        inputs.push(PortDesc::of::<SequenceStatus>().with_conn(PortConn::SelfTap(seq_status_id)));
-
-        // --- Outputs: occupant prefix (entry outputs + appended status), runner tail ---
-        let mut outputs = base.outputs.clone();
-        assert!(
-            !outputs.iter().any(|p| p.id == seq_status_id),
-            "an occupant never declares SequenceStatus itself; the mount appends it              (a pre-pack artifact must be rebuilt)"
-        );
-        outputs.push(PortDesc::of::<SequenceStatus>());
-        let n_occ_outputs = outputs.len();
-        // Host-side slot telemetry: the RUNNER writes the phase/occupant frame
-        // each step; tapped like any output ("<slot>.slot_status").
-        outputs.push(PortDesc::of::<SlotStatus>().with_conn(PortConn::Host));
-        // The slot's events channel: the RUNNER emits a SequenceChannelEvent
-        // per lifecycle transition; keyed "<slot>.sequences", telemetered.
-        outputs.push(
-            PortDesc::msg_named::<SequenceChannelEvent>("sequences").with_conn(PortConn::Host),
-        );
-
-        let registered = SystemDescriptor {
-            name: leaked,
-            kind: SystemKind::Cyclic,
-            inputs,
-            outputs,
-            // Sequence occupants declare wired ports only (ReceiveAll is host-only).
-            capabilities: Vec::new(),
-        };
-
-        self.push_system(
+        Ok(self.push_system(
             registered,
             name,
             Reg::Slot(SlotReg {
                 allowed,
                 initial,
-                n_occ_inputs,
-                n_occ_outputs,
+                ports,
                 process,
             }),
-        )
+        ))
     }
 
     /// Connect a producer output to a consumer input, addressed by port id.
@@ -1779,9 +1712,10 @@ impl CoordinatorBuilder {
             // system's, the occupant prefix of a process slot's.
             let (n_outputs, n_inputs) = match &sys.reg {
                 Reg::Proc(_) => (sys.desc.outputs.len(), sys.desc.inputs.len()),
-                Reg::Slot(slot_reg) if slot_reg.process => {
-                    (slot_reg.n_occ_outputs, slot_reg.n_occ_inputs)
-                }
+                Reg::Slot(slot_reg) if slot_reg.process => (
+                    slot_reg.ports.occupant_outputs.len(),
+                    slot_reg.ports.occupant_inputs.len(),
+                ),
                 _ => continue,
             };
             for out_idx in 0..n_outputs {
@@ -2457,20 +2391,14 @@ fn bind_slot(
     let SlotReg {
         allowed,
         initial,
-        n_occ_inputs,
-        n_occ_outputs,
+        ports,
         process,
     } = slot_reg;
+    let n_occ_inputs = ports.occupant_inputs.len();
+    let n_occ_outputs = ports.occupant_outputs.len();
     let proc = if process {
         Some(slot_proc_parts(
-            id,
-            desc,
-            &allowed,
-            n_occ_inputs,
-            n_occ_outputs,
-            cons_edges,
-            alloc,
-            proc_ctx,
+            id, desc, &allowed, &ports, cons_edges, alloc, proc_ctx,
         )?)
     } else {
         None
@@ -2513,22 +2441,25 @@ fn bind_slot(
         })
         .collect();
 
-    // --- The runner's tail ports, located by their declared shape --------------
+    // --- The runner's tail ports, read straight off the port plan --------------
     // Host cancel writer over the SlotControlIn input's dedicated ring.
-    let control_in_idx = desc.inputs[..n_occ_inputs]
-        .iter()
-        .position(|p| p.conn == PortConn::Host)
-        .expect("a slot declares its Host SlotControlIn input");
+    let control_in_idx = ports.control_in_idx();
+    debug_assert_eq!(
+        desc.inputs[control_in_idx].conn,
+        PortConn::Host,
+        "the port plan and the registered descriptor agree on the control input"
+    );
     let control = slot_writer::<SlotControlIn>(&alloc.host_input_rings[&(id, control_in_idx)]);
     // The slot's command fan-in: one view per producer explicitly edged into
     // the declared `commands` input (no type-keyed broadcast; zero edges is a
     // legal, command-less slot). The `SlotRunner` drains and filters by its
     // instance name each step.
-    let cmd_in_idx = desc
-        .inputs
-        .iter()
-        .position(|p| p.conn == PortConn::Edge && p.id == PortId::Packet(SequenceCommand::ID))
-        .expect("a slot's registered descriptor declares its commands input");
+    let cmd_in_idx = ports.commands_in_idx();
+    debug_assert_eq!(
+        desc.inputs[cmd_in_idx].id,
+        PortId::Packet(SequenceCommand::ID),
+        "the port plan and the registered descriptor agree on the commands input"
+    );
     let commands = MsgIn::from_views(
         cons_edges
             .get(&(id, cmd_in_idx))
@@ -2546,38 +2477,21 @@ fn bind_slot(
     );
     // The declared self-tap over the occupant's own SequenceStatus output (+1
     // fan-out counted at sizing): Progress plus outcome.
-    let seq_tap = desc
-        .inputs
-        .iter()
-        .find_map(|p| match p.conn {
-            PortConn::SelfTap(pid) => Some(pid),
-            _ => None,
-        })
-        .expect("a slot declares its SequenceStatus self-tap");
-    let seq_out_idx = desc
-        .outputs
-        .iter()
-        .position(|o| o.id == seq_tap)
-        .expect("a SelfTap names one of the slot's own outputs");
+    let seq_out_idx = ports.seq_status_out_idx();
+    debug_assert_eq!(
+        desc.outputs[seq_out_idx].id,
+        PortId::Component(SequenceStatus::FRAME_ID),
+        "the port plan and the registered descriptor agree on the self-tap target"
+    );
     let seq_status = Input::new(
         output_rings[id][seq_out_idx]
             .view(NoWake, NoWake)
             .expect("SequenceStatus self-tap reader (fan-out sized)"),
     );
-    // Host writers over the runner's declared output tail: SlotStatus plus the
+    // Host writers over the runner's output tail: SlotStatus plus the
     // "sequences" events channel (real output indices, no side allocation).
-    let status_out_idx = desc
-        .outputs
-        .iter()
-        .position(|o| o.id == PortId::Component(SlotStatus::FRAME_ID))
-        .expect("a slot declares its Host SlotStatus output");
-    let status_out = slot_writer::<SlotStatus>(&output_rings[id][status_out_idx]);
-    let events_out_idx = desc
-        .outputs
-        .iter()
-        .position(|o| o.id == PortId::Packet(SequenceChannelEvent::ID))
-        .expect("a slot declares its Host events output");
-    let events = owned_writer::<SequenceChannelEvent>(&output_rings[id][events_out_idx]);
+    let status_out = slot_writer::<SlotStatus>(&output_rings[id][ports.status_out_idx()]);
+    let events = owned_writer::<SequenceChannelEvent>(&output_rings[id][ports.events_out_idx()]);
 
     Ok(SlotRunner::new(
         desc.name, allowed, initial, inputs, outputs, control, status_out, events, seq_status,
@@ -2593,13 +2507,11 @@ fn bind_slot(
 /// occupant — the rings are the slot's, so the manifests differ only in
 /// artifact and params, and a runtime `Load` just picks one and spawns.
 #[cfg(any(target_os = "linux", target_os = "macos"))]
-#[allow(clippy::too_many_arguments)]
 fn slot_proc_parts(
     id: usize,
     desc: &SystemDescriptor,
     allowed: &[AllowedOccupant],
-    n_occ_inputs: usize,
-    n_occ_outputs: usize,
+    ports: &slot::SlotPorts,
     cons_edges: &ConsEdges,
     alloc: &RingAlloc,
     ctx: &ProcBindCtx,
@@ -2615,13 +2527,13 @@ fn slot_proc_parts(
     // the occupant prefix's own outputs, then the ring behind each prefix
     // input (an Edge input's producer, the Host control ring's own file).
     let mut rings: Vec<RingBuffer> = Vec::new();
-    let output_paths: Vec<PathBuf> = (0..n_occ_outputs)
+    let output_paths: Vec<PathBuf> = (0..ports.occupant_outputs.len())
         .map(|out_idx| {
             rings.push(alloc.output_rings[id][out_idx].clone());
             alloc.ring_paths[&(id, out_idx)].clone()
         })
         .collect();
-    let input_paths: Vec<PathBuf> = (0..n_occ_inputs)
+    let input_paths: Vec<PathBuf> = (0..ports.occupant_inputs.len())
         .map(|in_idx| match desc.inputs[in_idx].conn {
             PortConn::Edge => {
                 let (prod, out) = cons_edges[&(id, in_idx)][0];
@@ -2679,13 +2591,11 @@ fn slot_proc_parts(
 /// Without a cross-process futex there is no worker protocol; the process
 /// slot is rejected cleanly at `build()`, like a process system.
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-#[allow(clippy::too_many_arguments)]
 fn slot_proc_parts(
     _id: usize,
     desc: &SystemDescriptor,
     _allowed: &[AllowedOccupant],
-    _n_occ_inputs: usize,
-    _n_occ_outputs: usize,
+    _ports: &slot::SlotPorts,
     _cons_edges: &ConsEdges,
     _alloc: &RingAlloc,
     _ctx: &ProcBindCtx,
