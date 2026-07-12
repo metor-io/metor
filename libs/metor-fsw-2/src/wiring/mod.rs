@@ -645,57 +645,190 @@ impl PackCache {
     }
 }
 
-/// Select `entry` from an opened pack, or its sole entry when the spec named
-/// none. A multi-entry pack with no `type=` is a clean error listing the
-/// choices.
-fn select_entry(
-    pack: &crate::dl::DlPack,
+/// The two ways an artifact self-describes at resolve: a pack opened in
+/// process, or the manifest a describe worker reported for a `process=#true`
+/// system or slot (whose artifacts the host never dlopens).
+enum EntrySource<'a> {
+    Opened {
+        pack: &'a crate::dl::DlPack,
+        artifact: &'a str,
+    },
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    Described {
+        entries: &'a [crate::dl::PackEntryMeta],
+        artifact: &'a str,
+    },
+}
+
+impl EntrySource<'_> {
+    /// The exported entry names, in manifest order.
+    fn entry_names(&self) -> Vec<String> {
+        match self {
+            EntrySource::Opened { pack, .. } => pack.system_names().map(str::to_string).collect(),
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
+            EntrySource::Described { entries, .. } => entries
+                .iter()
+                .map(|e| e.descriptor.name.to_string())
+                .collect(),
+        }
+    }
+
+    /// The sole exported entry name, in which case a spec may omit `type=`.
+    fn sole_entry(&self) -> Option<&str> {
+        match self {
+            EntrySource::Opened { pack, .. } => pack.sole_system(),
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
+            EntrySource::Described { entries, .. } => match entries {
+                [only] => Some(only.descriptor.name),
+                _ => None,
+            },
+        }
+    }
+
+    /// The artifact id, for diagnostics.
+    fn artifact(&self) -> &str {
+        match self {
+            EntrySource::Opened { artifact, .. } => artifact,
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
+            EntrySource::Described { artifact, .. } => artifact,
+        }
+    }
+}
+
+/// What [`resolve_occupant`] selected for registration: the loaded handle on
+/// the dl path (the builder takes it by value), or the descriptor alone on
+/// the process path (a worker owns the code; the host keeps the shape).
+enum OccupantEntry {
+    Opened(DlSystem),
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    Described(SystemDescriptor),
+}
+
+impl OccupantEntry {
+    /// The loaded handle behind an [`EntrySource::Opened`] resolve.
+    fn opened(self) -> DlSystem {
+        match self {
+            OccupantEntry::Opened(loaded) => loaded,
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
+            OccupantEntry::Described(_) => unreachable!("selected from an opened pack"),
+        }
+    }
+
+    /// The descriptor behind an [`EntrySource::Described`] resolve.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    fn described(self) -> SystemDescriptor {
+        match self {
+            OccupantEntry::Described(desc) => desc,
+            OccupantEntry::Opened(_) => unreachable!("selected from a describe worker"),
+        }
+    }
+}
+
+/// Select `entry` from an artifact's self-description (or its sole entry
+/// when the spec named none) and encode `params` against the entry's
+/// exported `Params` schema — the one open→select→encode path behind
+/// [`resolve_dl`], [`resolve_proc`], and both of [`resolve_slot`]'s occupant
+/// loops.
+///
+/// `require_reloadable` is set only for slot occupants, which are
+/// instantiated on every load; a wired system is instantiated once, so a
+/// non-reloadable `.state(...)` entry is legal there. `owner` names the
+/// `system` or `slot` instance in diagnostics.
+#[allow(clippy::too_many_arguments)]
+fn resolve_occupant(
+    source: &EntrySource<'_>,
     entry: Option<&str>,
+    params: &ParamSource,
     owner: &str,
-    artifact_id: &str,
+    reserved: &'static [&'static str],
+    skip_args: usize,
+    require_reloadable: bool,
     src: &str,
     span: SourceSpan,
-) -> Result<DlSystem, LoadError> {
+) -> Result<(OccupantEntry, Vec<u8>), LoadError> {
     let name = match entry {
         Some(name) => name,
-        None => pack.sole_system().ok_or_else(|| LoadError::PackTypeRequired {
+        None => source.sole_entry().ok_or_else(|| LoadError::PackTypeRequired {
             system: owner.to_string(),
-            artifact: artifact_id.to_string(),
-            available: pack.system_names().collect::<Vec<_>>().join(", "),
+            artifact: source.artifact().to_string(),
+            available: source.entry_names().join(", "),
             src: src.to_string(),
             span,
         })?,
     };
-    pack.system(name).map_err(|source| LoadError::PackSystem {
+    let pack_system = |source: crate::dl::DlError| LoadError::PackSystem {
         system: owner.to_string(),
         source: Box::new(source),
         src: src.to_string(),
         span,
-    })
+    };
+    let not_reloadable = || LoadError::OccupantNotReloadable {
+        slot: owner.to_string(),
+        occupant: name.to_string(),
+        src: src.to_string(),
+        span,
+    };
+    match source {
+        EntrySource::Opened { pack, .. } => {
+            let loaded = pack.system(name).map_err(pack_system)?;
+            if require_reloadable && !loaded.reloadable() {
+                return Err(not_reloadable());
+            }
+            let params = encode_occupant_params(
+                params,
+                loaded.params_schema(),
+                loaded.params_default(),
+                owner,
+                reserved,
+                skip_args,
+            )?;
+            Ok((OccupantEntry::Opened(loaded), params))
+        }
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        EntrySource::Described { entries, .. } => {
+            let meta = entries
+                .iter()
+                .find(|e| e.descriptor.name == name)
+                .ok_or_else(|| {
+                    pack_system(crate::dl::DlError::UnknownPackSystem {
+                        name: name.to_string(),
+                        available: source.entry_names(),
+                    })
+                })?;
+            if require_reloadable && !meta.reloadable {
+                return Err(not_reloadable());
+            }
+            let params = encode_occupant_params(
+                params,
+                &meta.params_schema,
+                meta.params_default.as_deref(),
+                owner,
+                reserved,
+                skip_args,
+            )?;
+            Ok((OccupantEntry::Described(meta.descriptor.clone()), params))
+        }
+    }
 }
 
-/// Resolve a [`ParamSource`] to canonical postcard bytes against a loaded
-/// entry's exported `Params` schema. `Kdl` text is schema-encoded (the host
-/// never links the type), producing the same bytes a typed builder's
-/// `Postcard` source carries.
+/// Resolve a [`ParamSource`] to canonical postcard bytes against an entry's
+/// exported `Params` schema and declared defaults. `Kdl` text is
+/// schema-encoded (the host never links the type), producing the same bytes
+/// a typed builder's `Postcard` source carries; an absent config takes the
+/// defaults verbatim.
 fn encode_occupant_params(
-    loaded: &DlSystem,
     params: &ParamSource,
+    schema: &postcard_schema::schema::owned::OwnedNamedType,
+    defaults: Option<&[u8]>,
     owner: &str,
     reserved: &'static [&'static str],
     skip_args: usize,
 ) -> Result<Vec<u8>, LoadError> {
     Ok(match params {
-        // An absent config takes the entry's declared defaults verbatim.
-        ParamSource::None => loaded.params_default().unwrap_or_default().to_vec(),
+        ParamSource::None => defaults.unwrap_or_default().to_vec(),
         ParamSource::Postcard(bytes) => bytes.clone(),
         ParamSource::Kdl(node_text) => encode_kdl_params_with_defaults(
-            node_text,
-            loaded.params_schema(),
-            owner,
-            reserved,
-            skip_args,
-            loaded.params_default(),
+            node_text, schema, owner, reserved, skip_args, defaults,
         )?,
     })
 }
@@ -714,15 +847,29 @@ fn resolve_dl(
     let src = system_src(spec);
     let span: SourceSpan = (0, src.len()).into();
     let pack = packs.open(wiring, artifact_id, &spec.name, &src, span)?;
-    let loaded = select_entry(pack, spec.ty.as_deref(), &spec.name, artifact_id, &src, span)?;
-    let params = encode_occupant_params(&loaded, &spec.params, &spec.name, SYSTEM_RESERVED, 1)?;
+    let source = EntrySource::Opened {
+        pack,
+        artifact: artifact_id,
+    };
+    let (entry, params) = resolve_occupant(
+        &source,
+        spec.ty.as_deref(),
+        &spec.params,
+        &spec.name,
+        SYSTEM_RESERVED,
+        1,
+        false,
+        &src,
+        span,
+    )?;
+    let loaded = entry.opened();
     let desc = loaded.descriptor().clone();
     let handle = builder.add_dl_cyclic(&spec.name, loaded, params);
     Ok((handle, desc))
 }
 
 /// Find an [`Artifact`] by id and require its built `path`, the shared front
-/// of [`open_occupant`] and [`resolve_proc`].
+/// of the dl and process resolve paths.
 fn find_built_artifact<'w>(
     wiring: &'w Wiring,
     artifact_id: &str,
@@ -778,66 +925,25 @@ fn resolve_proc(
         .map_err(|e| proc_describe(e.to_string()))?;
     let entries: Vec<crate::dl::PackEntryMeta> =
         crate::dl::decode_pack_manifest(&bytes).map_err(|e| proc_describe(e.to_string()))?;
-    let meta = select_proc_entry(&entries, spec.ty.as_deref(), &spec.name, artifact_id, &src, span)?;
-    let params: Vec<u8> = match &spec.params {
-        ParamSource::None => meta.params_default.clone().unwrap_or_default(),
-        ParamSource::Postcard(bytes) => bytes.clone(),
-        ParamSource::Kdl(node_text) => encode_kdl_params_with_defaults(
-            node_text,
-            &meta.params_schema,
-            &spec.name,
-            SYSTEM_RESERVED,
-            1,
-            meta.params_default.as_deref(),
-        )?,
+    let source = EntrySource::Described {
+        entries: &entries,
+        artifact: artifact_id,
     };
-    let desc = meta.descriptor.clone();
+    let (entry, params) = resolve_occupant(
+        &source,
+        spec.ty.as_deref(),
+        &spec.params,
+        &spec.name,
+        SYSTEM_RESERVED,
+        1,
+        false,
+        &src,
+        span,
+    )?;
+    let desc = entry.described();
     let entry_name = desc.name.to_string();
     let handle = builder.add_proc_cyclic(&spec.name, desc.clone(), path.clone(), entry_name, params);
     Ok((handle, desc))
-}
-
-/// The manifest twin of [`select_entry`], over describe-worker entry
-/// metadata rather than an opened pack.
-#[cfg(any(target_os = "linux", target_os = "macos"))]
-fn select_proc_entry<'e>(
-    entries: &'e [crate::dl::PackEntryMeta],
-    entry: Option<&str>,
-    owner: &str,
-    artifact_id: &str,
-    src: &str,
-    span: SourceSpan,
-) -> Result<&'e crate::dl::PackEntryMeta, LoadError> {
-    let available = || {
-        entries
-            .iter()
-            .map(|e| e.descriptor.name.to_string())
-            .collect::<Vec<_>>()
-    };
-    match entry {
-        Some(name) => entries
-            .iter()
-            .find(|e| e.descriptor.name == name)
-            .ok_or_else(|| LoadError::PackSystem {
-                system: owner.to_string(),
-                source: Box::new(crate::dl::DlError::UnknownPackSystem {
-                    name: name.to_string(),
-                    available: available(),
-                }),
-                src: src.to_string(),
-                span,
-            }),
-        None => match entries {
-            [only] => Ok(only),
-            _ => Err(LoadError::PackTypeRequired {
-                system: owner.to_string(),
-                artifact: artifact_id.to_string(),
-                available: available().join(", "),
-                src: src.to_string(),
-                span,
-            }),
-        },
-    }
 }
 
 /// Without a cross-process futex there is no worker to describe or run.
@@ -910,16 +1016,6 @@ fn slot_src(slot: &SlotSpec) -> String {
     format!("slot \"{}\"{}", slot.name, src_anchor(slot.src.as_ref()))
 }
 
-/// Resolve a [`SlotSpec`] into a registered slot.
-///
-/// Each allowed occupant goes through [`open_occupant`] like a dl system —
-/// or, for a `process=#true` slot, through [`describe_occupants`], which
-/// sources the descriptors from describe workers so the host never dlopens
-/// any occupant artifact. Every occupant must share one port contract. The
-/// descriptor returned for the edges pass is the one read back off the
-/// builder after [`CoordinatorBuilder::add_slot`], not a raw occupant
-/// descriptor, and the declared `input`/`output` contract is validated
-/// against it.
 /// The artifact whose pack exports `occ.occupant`: the `artifact=` the allow
 /// line named, or (absent one) the unique artifact exporting an entry of
 /// that name. No match or more than one is a clean error either way.
@@ -953,6 +1049,16 @@ fn occupant_artifact(
     }
 }
 
+/// Resolve a [`SlotSpec`] into a registered slot.
+///
+/// Each allowed occupant goes through [`resolve_occupant`] like a dl system —
+/// or, for a `process=#true` slot, through [`describe_occupants`], which
+/// sources the descriptors from describe workers so the host never dlopens
+/// any occupant artifact. Every occupant must share one port contract. The
+/// descriptor returned for the edges pass is the one read back off the
+/// builder after [`CoordinatorBuilder::add_slot`], not a raw occupant
+/// descriptor, and the declared `input`/`output` contract is validated
+/// against it.
 fn resolve_slot(
     slot: &SlotSpec,
     wiring: &Wiring,
@@ -1006,19 +1112,22 @@ fn resolve_slot(
             let artifact_id =
                 occupant_artifact(wiring, packs, occ, &slot.name, &src, span)?;
             let pack = packs.open(wiring, &artifact_id, &slot.name, &src, span)?;
-            let loaded =
-                select_entry(pack, Some(&occ.occupant), &slot.name, &artifact_id, &src, span)?;
-            if !loaded.reloadable() {
-                return Err(LoadError::OccupantNotReloadable {
-                    slot: slot.name.clone(),
-                    occupant: occ.occupant.clone(),
-                    src: src.clone(),
-                    span,
-                });
-            }
-            let params =
-                encode_occupant_params(&loaded, &occ.params, &slot.name, ALLOW_RESERVED, 0)?;
-            allowed.push(AllowedOccupant::dl(occ.occupant.clone(), loaded, params));
+            let source = EntrySource::Opened {
+                pack,
+                artifact: &artifact_id,
+            };
+            let (entry, params) = resolve_occupant(
+                &source,
+                Some(&occ.occupant),
+                &occ.params,
+                &slot.name,
+                ALLOW_RESERVED,
+                0,
+                true,
+                &src,
+                span,
+            )?;
+            allowed.push(AllowedOccupant::dl(occ.occupant.clone(), entry.opened(), params));
         }
         allowed
     };
@@ -1187,40 +1296,27 @@ fn describe_occupants(
             }
         };
         describe(&mut manifests, wiring, slot, &artifact_id, src, span)?;
-        let meta = select_proc_entry(
-            &manifests[&artifact_id],
+        let source = EntrySource::Described {
+            entries: &manifests[&artifact_id],
+            artifact: &artifact_id,
+        };
+        let (entry, params) = resolve_occupant(
+            &source,
             Some(&occ.occupant),
+            &occ.params,
             &slot.name,
-            &artifact_id,
+            ALLOW_RESERVED,
+            0,
+            true,
             src,
             span,
         )?;
-        if !meta.reloadable {
-            return Err(LoadError::OccupantNotReloadable {
-                slot: slot.name.clone(),
-                occupant: occ.occupant.clone(),
-                src: src.to_string(),
-                span,
-            });
-        }
-        let params: Vec<u8> = match &occ.params {
-            ParamSource::None => meta.params_default.clone().unwrap_or_default(),
-            ParamSource::Postcard(bytes) => bytes.clone(),
-            ParamSource::Kdl(node_text) => encode_kdl_params_with_defaults(
-                node_text,
-                &meta.params_schema,
-                &slot.name,
-                ALLOW_RESERVED,
-                0,
-                meta.params_default.as_deref(),
-            )?,
-        };
         let artifact = find_built_artifact(wiring, &artifact_id, &slot.name, src, span)?;
         let path = artifact.path.as_ref().expect("checked by find_built_artifact");
         allowed.push(AllowedOccupant {
             name: occ.occupant.clone(),
             params,
-            descriptor: meta.descriptor.clone(),
+            descriptor: entry.described(),
             backing: OccupantBacking::Artifact(path.clone()),
         });
     }
