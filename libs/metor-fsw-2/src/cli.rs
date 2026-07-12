@@ -42,6 +42,10 @@ struct BuildArgs {
     /// `--cargo-arg --target --cargo-arg aarch64-unknown-linux-gnu`.
     #[arg(long = "cargo-arg", value_name = "ARG", allow_hyphen_values = true)]
     cargo_arg: Vec<String>,
+    /// Skip the `<cdylib>.manifest` sidecars, for pack crates that cannot
+    /// build for the host architecture.
+    #[arg(long)]
+    no_manifest_sidecar: bool,
 }
 
 #[derive(Args, Debug)]
@@ -57,6 +61,10 @@ struct PackageArgs {
     /// An extra arg appended to every `cargo build` (repeatable).
     #[arg(long = "cargo-arg", value_name = "ARG", allow_hyphen_values = true)]
     cargo_arg: Vec<String>,
+    /// Skip the `<cdylib>.manifest` sidecars, for pack crates that cannot
+    /// build for the host architecture.
+    #[arg(long)]
+    no_manifest_sidecar: bool,
 }
 
 #[derive(Args, Debug)]
@@ -72,6 +80,10 @@ struct RunArgs {
     /// An extra arg appended to every `cargo build` (repeatable), with `--build`.
     #[arg(long = "cargo-arg", value_name = "ARG", allow_hyphen_values = true)]
     cargo_arg: Vec<String>,
+    /// Skip the `<cdylib>.manifest` sidecars, for pack crates that cannot
+    /// build for the host architecture.
+    #[arg(long)]
+    no_manifest_sidecar: bool,
     /// Use a paced wall clock, overriding the KDL's clock.
     #[arg(long, group = "clock")]
     wall: bool,
@@ -103,7 +115,11 @@ pub async fn run() -> miette::Result<()> {
 fn cmd_build(args: BuildArgs) -> miette::Result<()> {
     let text = read_file(&args.kdl)?;
     let mut wiring = parse_with_origin(&text, Some(&args.kdl.to_string_lossy()))?;
-    build_artifacts(&mut wiring, &build_opts(args.release, &args.cargo_arg)).into_diagnostic()?;
+    build_artifacts(
+        &mut wiring,
+        &build_opts(args.release, &args.cargo_arg, args.no_manifest_sidecar),
+    )
+    .into_diagnostic()?;
     for a in &wiring.artifacts {
         let path = a
             .path
@@ -118,7 +134,11 @@ fn cmd_build(args: BuildArgs) -> miette::Result<()> {
 fn cmd_package(args: PackageArgs) -> miette::Result<()> {
     let text = read_file(&args.kdl)?;
     let mut wiring = parse_with_origin(&text, Some(&args.kdl.to_string_lossy()))?;
-    build_artifacts(&mut wiring, &build_opts(args.release, &args.cargo_arg)).into_diagnostic()?;
+    build_artifacts(
+        &mut wiring,
+        &build_opts(args.release, &args.cargo_arg, args.no_manifest_sidecar),
+    )
+    .into_diagnostic()?;
     write_bundle(
         &wiring,
         &text,
@@ -187,7 +207,11 @@ fn load_run_wiring(args: &RunArgs) -> miette::Result<Wiring> {
     }
     let text = read_file(&args.target)?;
     let mut wiring = parse_with_origin(&text, Some(&args.target.to_string_lossy()))?;
-    build_artifacts(&mut wiring, &build_opts(args.release, &args.cargo_arg)).into_diagnostic()?;
+    build_artifacts(
+        &mut wiring,
+        &build_opts(args.release, &args.cargo_arg, args.no_manifest_sidecar),
+    )
+    .into_diagnostic()?;
     Ok(wiring)
 }
 
@@ -210,11 +234,13 @@ fn apply_overrides(wiring: &mut Wiring, args: &RunArgs) -> miette::Result<()> {
     Ok(())
 }
 
-/// Build the [`BuildOptions`] from the shared `--release`/`--cargo-arg` flags.
-fn build_opts(release: bool, cargo_arg: &[String]) -> BuildOptions {
+/// Build the [`BuildOptions`] from the shared
+/// `--release`/`--cargo-arg`/`--no-manifest-sidecar` flags.
+fn build_opts(release: bool, cargo_arg: &[String], no_manifest_sidecar: bool) -> BuildOptions {
     BuildOptions {
         release,
         extra_args: cargo_arg.to_vec(),
+        manifest_sidecar: !no_manifest_sidecar,
     }
 }
 

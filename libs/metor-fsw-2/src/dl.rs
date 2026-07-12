@@ -45,8 +45,10 @@
 
 use core::ffi::c_void;
 use std::ffi::OsStr;
-use std::slice;
+#[cfg(feature = "kdl")]
+use std::path::{Path, PathBuf};
 use std::rc::Rc;
+use std::slice;
 
 use libloading::{Library, Symbol};
 use metor_proto::types::Timestamp;
@@ -263,14 +265,37 @@ fn open_and_describe(path: &OsStr) -> Result<(PackLib, Vec<u8>), DlError> {
     Ok((pack_lib, buf))
 }
 
-/// The raw manifest bytes alone, for the worker's describe mode: the object
-/// is loaded, ABI-checked, described, and unloaded *in this process*, and the
-/// host decodes the bytes without ever loading the object itself
-/// (`docs/process-systems.md` §5).
-#[cfg(any(target_os = "linux", target_os = "macos"))]
+/// The raw manifest bytes alone, for the worker's describe mode and the build
+/// driver's manifest sidecar: the object is loaded, ABI-checked, described,
+/// and unloaded *in this process*. The worker's host decodes the bytes
+/// without ever loading the object itself (`docs/process-systems.md` §5).
+#[cfg(any(target_os = "linux", target_os = "macos", feature = "kdl"))]
 pub(crate) fn describe_raw(path: impl AsRef<OsStr>) -> Result<Vec<u8>, DlError> {
     // Dropping the PackLib closes the pack and unloads the library.
     open_and_describe(path.as_ref()).map(|(_lib, buf)| buf)
+}
+
+/// The manifest sidecar path for a built pack library: `<so_path>.manifest`,
+/// the raw postcard [`PackManifestMsg`] bytes the build driver wrote next to
+/// the `.so` (`docs/wiring.md` §6.1).
+#[cfg(feature = "kdl")]
+pub(crate) fn manifest_sidecar_path(so_path: &Path) -> PathBuf {
+    let mut name = so_path.as_os_str().to_owned();
+    name.push(".manifest");
+    PathBuf::from(name)
+}
+
+/// Read and decode the manifest sidecar next to `so_path`: `None` when no
+/// sidecar exists, otherwise the decode outcome of its bytes.
+///
+/// Phase 0 verifies sidecars without consuming them.
+// TODO(python-config phase 2): switch `resolve_proc`/`describe_occupants` to
+// prefer a sidecar over spawning a describe worker.
+#[cfg(feature = "kdl")]
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) fn read_manifest_sidecar(so_path: &Path) -> Option<Result<Vec<PackEntryMeta>, DlError>> {
+    let bytes = std::fs::read(manifest_sidecar_path(so_path)).ok()?;
+    Some(decode_pack_manifest(&bytes))
 }
 
 /// One decoded manifest entry: the reconstructed descriptor plus the entry

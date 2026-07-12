@@ -470,6 +470,16 @@ so [`resolve`] can `dlopen` it. It is std-only (`std::process::Command`), idempo
 — cargo only rebuilds stale crates. [`BuildOptions`] carries `release` and `extra_args`. Failures are
 clean errors ([`BuildError`]`::{Spawn, CargoFailed, ArtifactNotFound}`), never a panic.
 
+The driver also writes a **manifest sidecar** next to each built library — `<cdylib>.manifest`, the
+raw postcard `PackManifestMsg` bytes from describing a host-runnable build — so downstream consumers
+(stubgen, cross-arch resolve; today verification only) can read the pack's self-description without
+running the artifact. Sourcing it executes the crate's `pack()` at build time, the same trust model
+as a `build.rs`. Under a cross `--target` the crate is additionally built for the host and that twin
+is described; a host build failure is a hard error, and an up-to-date sidecar already next to the
+target `.so` is compared against the host's bytes (manifests must be arch-independent). Packs that
+cannot build for the host opt out with `BuildOptions::manifest_sidecar = false` (CLI:
+`--no-manifest-sidecar`).
+
 ### 6.2 Resolving a dl system
 
 For a dl [`SystemSpec`], [`resolve`] finds its [`Artifact`] (else [`UnknownArtifact`]), reads
