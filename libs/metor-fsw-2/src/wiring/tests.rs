@@ -2511,47 +2511,111 @@ fn resolve_rejects_ir_version_mismatch() {
     }
 }
 
-/// `write_bundle` records `ir_version` in `meta.kdl`; `load_bundle` accepts a
-/// matching bundle and refuses a skewed or pre-versioning one.
+/// `write_bundle` freezes the IR to `wiring.json` and records the versions +
+/// target in `meta.json`; `load_bundle` accepts a matching bundle and refuses
+/// a skewed IR version, a target mismatch, and the retired KDL layout.
 #[cfg(not(miri))]
 #[test]
-fn bundle_meta_carries_and_checks_ir_version() {
-    use crate::wiring::{BundleError, PackageOptions, load_bundle, write_bundle};
+fn bundle_json_layout_carries_and_checks_versions() {
+    use crate::wiring::{BundleError, BundleMeta, PackageOptions, load_bundle, write_bundle};
 
     let kdl = "coordinator cycle_rate=100.0\n";
     let wiring = parse(kdl).expect("parse");
     let tmp = tempfile::tempdir().expect("temp dir");
     let dir = tmp.path().join("mission.bundle");
-    write_bundle(&wiring, kdl, &PackageOptions::default(), &dir).expect("write the bundle");
+    write_bundle(&wiring, &PackageOptions::default(), &dir).expect("write the bundle");
+
+    // The new layout: the frozen IR and the JSON sidecar, no KDL.
+    assert!(dir.join("wiring.json").exists(), "frozen IR written");
+    assert!(dir.join("meta.json").exists(), "JSON sidecar written");
+    assert!(!dir.join("mission.kdl").exists(), "no verbatim KDL manifest");
+
     let loaded = load_bundle(&dir).expect("a fresh bundle loads");
     assert_eq!(loaded.ir_version, IR_VERSION);
 
-    let meta_path = dir.join("meta.kdl");
-    let meta = std::fs::read_to_string(&meta_path).expect("read meta.kdl");
+    let meta_path = dir.join("meta.json");
+    let read_meta = || -> BundleMeta {
+        serde_json::from_str(&std::fs::read_to_string(&meta_path).unwrap()).unwrap()
+    };
+    let write_meta = |m: &BundleMeta| {
+        std::fs::write(&meta_path, serde_json::to_string_pretty(m).unwrap()).unwrap();
+    };
 
-    // A skewed recorded version is refused.
-    let skewed = meta.replace(
-        &format!("ir_version {IR_VERSION}"),
-        &format!("ir_version {}", IR_VERSION + 1),
-    );
-    assert_ne!(skewed, meta, "the sidecar records ir_version");
-    std::fs::write(&meta_path, skewed).expect("tamper meta.kdl");
+    // ir_sha256 is over the exact wiring.json bytes.
+    let meta = read_meta();
+    let json = std::fs::read(dir.join("wiring.json")).unwrap();
+    let digest = <sha2::Sha256 as sha2::Digest>::digest(&json);
+    let expected = format!("sha256:{}", digest.iter().map(|b| format!("{b:02x}")).collect::<String>());
+    assert_eq!(meta.ir_sha256, expected, "hash pins wiring.json");
+
+    // A skewed recorded IR version is refused.
+    let mut skewed = meta.clone();
+    skewed.ir_version = IR_VERSION + 1;
+    write_meta(&skewed);
     let err = load_bundle(&dir).expect_err("version skew is refused");
     assert!(
-        matches!(err, BundleError::IrMismatch { found: Some(v), .. } if v == IR_VERSION + 1),
+        matches!(err, BundleError::IrMismatch { found, .. } if found == IR_VERSION + 1),
         "{err:?}"
     );
 
-    // A bundle that never recorded a version (pre-versioning) is refused too.
-    let stripped: String = meta
-        .lines()
-        .filter(|l| !l.contains("ir_version"))
-        .map(|l| format!("{l}\n"))
-        .collect();
-    std::fs::write(&meta_path, stripped).expect("strip ir_version");
-    let err = load_bundle(&dir).expect_err("a pre-versioning bundle is refused");
+    // A foreign target triple is a clean TargetMismatch before any dlopen.
+    let mut wrong_target = meta.clone();
+    wrong_target.target = Some("sparc64-unknown-nowhere".to_string());
+    write_meta(&wrong_target);
+    let host_known = crate::wiring::build_target(&[]).is_some();
+    match load_bundle(&dir) {
+        Err(BundleError::TargetMismatch { found, .. }) => {
+            assert_eq!(found, "sparc64-unknown-nowhere");
+        }
+        // Skip only if the host triple could not be determined at all.
+        Ok(_) if !host_known => {}
+        other => panic!("expected TargetMismatch (host known: {host_known}), got {other:?}"),
+    }
+
+    // The retired layout (mission.kdl + meta.kdl) is a named rejection.
+    let old = tmp.path().join("old.bundle");
+    std::fs::create_dir_all(&old).unwrap();
+    std::fs::write(old.join("mission.kdl"), kdl).unwrap();
+    std::fs::write(old.join("meta.kdl"), "meta {}\n").unwrap();
+    assert!(matches!(load_bundle(&old), Err(BundleError::OldLayout)), "old layout refused");
+}
+
+/// A bundle whose artifact records a `manifest_hash` verifies it against the
+/// copied sidecar at load: a matching bundle loads, a tampered sidecar fails
+/// with [`BundleError::ManifestHashMismatch`] before any dlopen. Built over the
+/// dl fixture pack so a real sidecar exists.
+#[cfg(not(miri))]
+#[test]
+fn bundle_manifest_hash_checked_at_load() {
+    use crate::wiring::{BundleError, PackageOptions, load_bundle, write_bundle};
+
+    let _guard = crate::dl::FIXTURE_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let mut wiring = WiringBuilder::new()
+        .artifact("fixture", "metor-fsw-2-dl-fixture", "metor_fsw_2_dl_fixture")
+        .build();
+    if let Err(e) = crate::wiring::build_artifacts(&mut wiring, &crate::BuildOptions::default()) {
+        eprintln!("skipping: build_artifacts failed: {e}");
+        return;
+    }
+    let so = wiring.artifacts[0].path.clone().expect("path filled");
+    let sidecar_bytes = std::fs::read(crate::dl::manifest_sidecar_path(&so))
+        .expect("build driver wrote the sidecar");
+    // Record the true hash, as a generated stub module would.
+    wiring.artifacts[0].manifest_hash = Some(super::stubgen::manifest_hash(&sidecar_bytes));
+
+    let tmp = tempfile::tempdir().expect("temp dir");
+    let dir = tmp.path().join("fixture.bundle");
+    write_bundle(&wiring, &PackageOptions::default(), &dir).expect("write the bundle");
+    load_bundle(&dir).expect("a matching bundle loads (hash verified)");
+
+    // Tamper the copied sidecar: the load-time hash check now refuses it.
+    let copied_sidecar = crate::dl::manifest_sidecar_path(&dir.join(&wiring.artifacts[0].cdylib));
+    std::fs::write(&copied_sidecar, b"tampered").expect("overwrite the sidecar");
+    let err = load_bundle(&dir).expect_err("a tampered sidecar is refused");
     assert!(
-        matches!(err, BundleError::IrMismatch { found: None, .. }),
+        matches!(&err, BundleError::ManifestHashMismatch { artifact } if artifact == "fixture"),
         "{err:?}"
     );
 }

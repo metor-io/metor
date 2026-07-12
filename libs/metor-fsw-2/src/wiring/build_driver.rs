@@ -267,6 +267,22 @@ fn describe_manifest(so: &Path) -> Result<Vec<u8>, String> {
     crate::dl::describe_raw(so).map_err(|e| e.to_string())
 }
 
+/// The triple a build with `extra_args` targets, for the bundle's `meta.json`:
+/// the explicit `--target` when one is given (cross or not), else the host
+/// triple. `None` when neither can be determined (no `--target` and `cargo -vV`
+/// unavailable), in which case the bundle records no target and load skips the
+/// triple check.
+pub fn build_target(extra_args: &[String]) -> Option<String> {
+    requested_target(extra_args)
+        .map(str::to_string)
+        .or_else(host_triple)
+}
+
+/// The host triple, exposed for the bundle loader's target check.
+pub fn current_host_triple() -> Option<String> {
+    host_triple()
+}
+
 /// Whether `extra_args` requests a `--target` other than the host triple. An
 /// undeterminable host reads as cross: the sidecar is then sourced from an
 /// explicit host-arch build, which is correct either way.
@@ -278,8 +294,9 @@ fn is_cross(extra_args: &[String]) -> bool {
 }
 
 /// The `--target` triple `extra_args` carries, in either `--target <t>` or
-/// `--target=<t>` form; the last occurrence wins, matching cargo.
-fn requested_target(extra_args: &[String]) -> Option<&str> {
+/// `--target=<t>` form; the last occurrence wins, matching cargo. Shared with
+/// [`bundle`](super::bundle), which records the built triple in `meta.json`.
+pub(super) fn requested_target(extra_args: &[String]) -> Option<&str> {
     let mut target = None;
     let mut args = extra_args.iter();
     while let Some(arg) = args.next() {
@@ -307,8 +324,10 @@ fn strip_target_args(extra_args: &[String]) -> Vec<String> {
     out
 }
 
-/// The host target triple, from `cargo -vV`'s `host:` line.
-fn host_triple() -> Option<String> {
+/// The host target triple, from `cargo -vV`'s `host:` line. Shared with
+/// [`bundle`](super::bundle): packaging records it as the built triple (absent
+/// a cross `--target`) and loading compares it against the bundle's.
+pub(super) fn host_triple() -> Option<String> {
     let cargo = std::env::var("CARGO").unwrap_or_else(|_| "cargo".to_string());
     let output = Command::new(cargo).arg("-vV").output().ok()?;
     let stdout = String::from_utf8_lossy(&output.stdout);
